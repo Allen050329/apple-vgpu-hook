@@ -665,10 +665,26 @@ enum SampledSourceRequest {
     GuestRuns(crate::backend::vulkan::engine::GuestRunSource, TexelLayout),
 }
 
-/// Producer identity + generation for CPU-sourced sampled bytes. `key` is the
-/// texture's authoritative GVA (`host_gva_surfaces` keyspace) and `generation`
-/// that cache entry's generation, so equal identity implies equal bytes under
-/// the same coherence model the cache itself already relies on.
+/// Producer identity + generation for CPU-sourced sampled bytes, so that equal
+/// identity implies equal bytes under the same coherence model the producing
+/// cache already relies on.
+///
+/// `key` is namespaced by its top two bits, because four producers share one
+/// keyspace and a raw id would alias between them:
+///
+/// | bit 63 | bit 62 | producer | low bits |
+/// |---|---|---|---|
+/// | 0 | 0 | guest linear | the texture's authoritative GVA (`host_gva_surfaces`) |
+/// | 1 | 0 | type-5 view | `plane_index << 32 \| mapping_id` |
+/// | 0 | 1 | type-11 host cache | `mapping_id` (`host_surfaces`) |
+/// | 1 | 1 | type-11 guest memo | `mapping_id` (`type11_memo`) |
+///
+/// GVAs are well under 2^62, so the unflagged row cannot collide with a flagged
+/// one. `generation` comes from
+/// [`crate::model::DeviceState::next_sampled_content_generation`] for every one
+/// of them — a device-global counter, never per-entry — so a `(key, generation)`
+/// pair names one content for the life of the device and content cannot alias
+/// even if two producers did collide on a key.
 #[cfg(feature = "backend-vulkan")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct LinearSampleIdentity {
@@ -1162,17 +1178,37 @@ fn resolve_sampled_source<M: HostMemory + HostOps>(
                 // which image got bound — `runtime/census/README.md` forbids
                 // exactly that, and an all-black frame is a legal frame, so the
                 // test mistook a correct black surface for an empty one.
-                if let Some(bgra) = (!guest_replaced)
-                    .then(|| crate::runtime::surface_cache::get(state, mid, w, h))
+                if let Some((bgra, host_gen)) = (!guest_replaced)
+                    .then(|| crate::runtime::surface_cache::get_with_gen(state, mid, w, h))
                     .flatten()
                 {
                     let rgba = std::sync::Arc::new(swap_rb_channels(bgra));
+                    // The generation is the cache entry's own `host_gen`, which
+                    // every writer of `host_surfaces` re-takes from
+                    // `next_sampled_content_generation` in the same breath as it
+                    // changes the bytes — so an unchanged pair is a statement
+                    // that the frame has not moved, and the engine can bind what
+                    // it already holds instead of re-hashing 1.7 MB to find out.
+                    // See [`LinearSampleIdentity`] for the key namespace.
+                    //
+                    // The channel swap is deterministic, so it needs no
+                    // generation of its own: equal `host_gen` implies equal
+                    // `rgba`.
+                    //
+                    // A 0 generation is an entry never stored into.
+                    // `get_with_gen` already refuses those — it requires bytes —
+                    // but a false "unchanged" is the one wrong answer here that
+                    // binds a stale frame, so it is not left to that alone.
+                    let identity = (host_gen != 0).then_some(LinearSampleIdentity {
+                        key: (1u64 << 62) | mid as u64,
+                        generation: host_gen,
+                    });
                     note_type11_sample_rung("t11rung_host_cache", guest_write);
                     return Some((
                         w,
                         h,
                         mid,
-                        SampledSourceRequest::Bytes(rgba, None, TexelLayout::Rgba8),
+                        SampledSourceRequest::Bytes(rgba, identity, TexelLayout::Rgba8),
                     ));
                 }
 

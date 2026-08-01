@@ -3153,6 +3153,155 @@ fn type5_sample_uses_descriptor_surface_id_not_ref_collision() {
     );
 }
 
+/// The sampled ladder's host-cache rung must offer a content identity, and that
+/// identity must move whenever the cached frame does.
+///
+/// Both halves are load-bearing and they fail in opposite directions. With no
+/// identity at all the engine has nothing to match on and re-digests the frame
+/// on every bind — measured at 116 lookups a second over 201 MB, hashed twice
+/// each, which was 73 % of the draw's timed work. With an identity that does
+/// *not* move when the cache is rewritten, the engine binds the texture it
+/// already holds and the newer frame is never uploaded: a stale compositing
+/// layer, served silently, which is the one wrong answer this value can give.
+///
+/// The generation is asserted to equal the cache entry's own `host_gen` rather
+/// than merely "some fresh number", because that equality is the whole
+/// coherence argument — every writer of `host_surfaces` re-takes it from
+/// `next_sampled_content_generation` in the same breath as it changes the bytes.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn type11_host_cache_rung_identity_tracks_the_cached_frame() {
+    use crate::contract::endian::st32;
+    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+    use crate::runtime::decode::resource::{list_object_entry_offset, OBJECT_LIST_ENTRY_LEN};
+    use crate::runtime::gva_mem;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+
+    let dir_pfn = 2u32;
+    let root_pfn = 3u32;
+    let dir_gpa = (dir_pfn as u64) << PAGE_SHIFT_X86;
+    let root_gpa = (root_pfn as u64) << PAGE_SHIFT_X86;
+    host.map_range(dir_gpa, 0x20, 0);
+    host.map_range(root_gpa, 0x1000, 0);
+    let mut dir = [0u8; 8];
+    st32(&mut dir[DIRECTORY_ROOT_PFN as usize..], root_pfn);
+    st32(&mut dir[DIRECTORY_DEPTH as usize..], 1);
+    assert!(host.write_gpa(dir_gpa, &dir).is_ok());
+    for i in 0..3u32 {
+        let pfn = 4 + i;
+        host.map_range((pfn as u64) << PAGE_SHIFT_X86, 0x1000, 0);
+        let mut pte = [0u8; 4];
+        st32(&mut pte, pfn);
+        assert!(host.write_gpa(root_gpa + (i as u64) * 4, &pte).is_ok());
+    }
+    assert!(state.define_task(1, 0x1000, dir_pfn));
+    assert!(state.set_object_list(1, 0, 32));
+
+    let texture_ref = 2u32;
+    let surface_id = 71u32;
+    let desc_gva = 0x1000u64;
+    let mut desc = vec![0u8; objects::TYPE5_MIN_LEN];
+    st32(&mut desc[objects::TYPE5_SURFACE_ID..], surface_id);
+    assert!(
+        gva_mem::write_task_gva(&mut host, &state.tasks[1], desc_gva, &desc, PAGE_SHIFT_X86,)
+            .is_ok()
+    );
+    let list_off = list_object_entry_offset(texture_ref, 32).unwrap();
+    let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
+    let packed = (objects::OBJECT_TYPE_REF_TEXTURE as u32) | ((objects::TYPE5_MIN_LEN as u32) << 8);
+    st32(&mut list_entry, packed);
+    list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        list_off,
+        &list_entry,
+        PAGE_SHIFT_X86,
+    )
+    .is_ok());
+
+    assert!(state.map_surface(surface_id));
+    assert!(state.set_mapping_geom(surface_id, 4, 3, MTL_FORMAT_BGRA8_UNORM));
+    state.mappings.get_mut(&surface_id).unwrap().page_entries = vec![1];
+
+    // An unrelated surface, stored twice, so the device-global generation
+    // counter is past its first value before this one is stored. Without it a
+    // `generation == host_gen` assertion would also hold for any producer that
+    // hardcoded 1, and 1 is exactly what a broken one would most likely emit.
+    assert!(state.map_surface(72));
+    for _ in 0..2 {
+        crate::runtime::surface_cache::store(&mut state, 72, 2, 2, vec![7u8; 2 * 2 * 4]);
+    }
+
+    // Blue frame (BGRA), then the same surface repainted red.
+    crate::runtime::surface_cache::store(
+        &mut state,
+        surface_id,
+        4,
+        3,
+        [255u8, 0, 0, 255].repeat(4 * 3),
+    );
+
+    let resolve = |state: &mut DeviceState, host: &mut FakeHost| {
+        let (_, _, _, src) = resolve_sampled_source(state, host, 1, texture_ref, None)
+            .expect("host-cache rung must serve the stored frame");
+        let SampledSourceRequest::Bytes(bytes, identity, _) = src else {
+            panic!("cache-backed fixture unexpectedly resolved a resident target");
+        };
+        (bytes, identity)
+    };
+
+    let (first_bytes, first_id) = resolve(&mut state, &mut host);
+    let first_id = first_id.expect("the host-cache rung must offer a content identity");
+    assert_eq!(
+        first_id.key,
+        (1u64 << 62) | surface_id as u64,
+        "bit 62 alone is the type-11 host-cache namespace"
+    );
+    let stored_gen = crate::runtime::surface_cache::get_with_gen(&state, surface_id, 4, 3)
+        .expect("the frame just stored must be readable")
+        .1;
+    assert_eq!(
+        first_id.generation, stored_gen,
+        "the identity must carry the cache entry's own host_gen, not a private counter"
+    );
+
+    // Re-resolving an untouched cache must repeat the identity exactly — that
+    // repetition is what the engine reads as "these are the bytes you hold".
+    let (again_bytes, again_id) = resolve(&mut state, &mut host);
+    assert_eq!(
+        again_id,
+        Some(first_id),
+        "an untouched cache entry must keep its identity, or nothing is ever elided"
+    );
+    assert_eq!(again_bytes, first_bytes, "identity repeated but bytes moved");
+
+    // Repaint. The bytes change, so the identity must too.
+    crate::runtime::surface_cache::store(
+        &mut state,
+        surface_id,
+        4,
+        3,
+        [0u8, 0, 255, 255].repeat(4 * 3),
+    );
+    let (second_bytes, second_id) = resolve(&mut state, &mut host);
+    let second_id = second_id.expect("a rewritten cache entry is still identifiable");
+    assert_ne!(
+        second_bytes, first_bytes,
+        "fixture is not exercising the property: the repaint did not reach the sample"
+    );
+    assert_eq!(
+        second_id.key, first_id.key,
+        "the same surface must keep one key across repaints"
+    );
+    assert_ne!(
+        second_id.generation, first_id.generation,
+        "a repainted frame under an unchanged identity binds the stale texture forever"
+    );
+}
+
 /// Live Safari app-launch class: the type-4 base carries an unknown
 /// 2-byte IOSurface FourCC (`LA08`) while the type-5 descriptor carries
 /// the exact RG8 Metal view. Defaulting the base to BGRA asks for a

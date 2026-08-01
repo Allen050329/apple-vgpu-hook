@@ -184,6 +184,28 @@ pub fn get(state: &DeviceState, surface_id: u32, width: u32, height: u32) -> Opt
     get_from(&state.host_surfaces, surface_id, width, height)
 }
 
+/// [`get`], plus the generation that names these exact bytes.
+///
+/// The generation is the entry's `host_gen`, and it is a sampled-content
+/// identity rather than provenance: every writer of this map — [`store_into`],
+/// [`store_rows`] and [`cede_surface_to_resident`] — takes a fresh
+/// [`DeviceState::next_sampled_content_generation`] in the same breath as it
+/// changes the bytes, and [`forget`] removes the entry outright. So a repeated
+/// `(surface_id, generation)` pair is a statement that the bytes have not moved,
+/// which is what lets the sampled cache skip re-hashing a frame it already holds.
+///
+/// The caller is the type-11 sampled ladder's host-cache rung, which without
+/// this had no identity to offer and drove every bind through the content
+/// digest: 116 lookups a second over 201 MB, hashed twice each.
+pub fn get_with_gen(
+    state: &DeviceState,
+    surface_id: u32,
+    width: u32,
+    height: u32,
+) -> Option<(&[u8], u64)> {
+    get_from_with_gen(&state.host_surfaces, surface_id, width, height)
+}
+
 /// Cede this mapping's cached frame to the engine resident a deferred type-11
 /// render Store just pinned: the entry keeps its geometry and its `host_gen`
 /// lineage, and holds no bytes.
