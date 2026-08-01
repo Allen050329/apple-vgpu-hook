@@ -156,6 +156,28 @@ Before and after long Rust test runs, sweep orphaned test binaries:
 pkill -9 -f 'target/debug/deps/reims_vgp[u]-'
 ```
 
+### Finding State Nothing Reads
+
+Do not grep for this. `reims-vgpu` is a staticlib whose types are almost all
+`pub`, and a `pub` item in a library is reachable by definition, so rustc's
+dead-code pass never fires on it. Every hand-rolled sweep here has been either
+wrong or exhausting: a grep for `.mapping_id` matches a dozen unrelated types,
+and a grep restricted to `src/` misses the engine hooks only `tests/` calls.
+
+```sh
+scripts/dead-state/dead-state.sh --fields-only
+```
+
+This compiles a `pub`-downgraded copy of the crate in a scratch tree, which
+turns rustc's own reachability analysis back on — it understands trait impls,
+macros, cfg arms and generics, and it reads `--all-targets`, so a helper used
+only by `tests/` counts as used. The working tree is untouched.
+
+It is a report, not a gate. Three classes are legitimately unread: contract
+tables (register maps, SDK enum mirrors, wire field offsets), error variants
+only a future decode path constructs, and the `qemu/abi.rs` C surface QEMU
+calls. A field written at five sites and read at none is not one of them.
+
 ## Commit Guidelines
 
 Commit only work you wrote. Never commit third-party code or intellectual property, including Apple
