@@ -2316,12 +2316,11 @@ pub(crate) unsafe fn execute_draw_inner(
     pools.finish_entry_async(cleanup);
 
     // Dispose the ad-hoc per-draw framebuffers (MRT and/or depth) now that
-    // `finish_entry_async` has marked the slot in-flight (`in_flight > 0`): the
-    // handles route to the graveyard and are freed only once every in-flight
-    // fence — including this draw's — has retired. Disposing BEFORE this point
-    // would immediate-free them (gpu_work_open() == false, since `in_flight` is
-    // only bumped here, after submit) while the just-submitted CB still
-    // references them → GPU fault.
+    // `finish_entry_async` has marked this slot pending: the handles park in
+    // the graveyard against the slots open right now — this draw's included —
+    // and are freed once those retire. Disposing BEFORE this point would
+    // immediate-free them (this slot is not yet pending, so it is not in the
+    // open mask) while the just-submitted CB still references them → GPU fault.
     if is_mrt || (req.color_input && transient_depth.is_none()) {
         pools.dispose(
             &ctx.device,

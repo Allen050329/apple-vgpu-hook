@@ -28,7 +28,10 @@ impl ResourcePools {
             }
         }
         self.in_flight = 0;
-        self.drain_graveyard(device);
+        // Every fence above was waited (or failed on a lost device, where the
+        // handles die with the device anyway), so no slot can still be reading:
+        // release the whole graveyard regardless of what each handle waits on.
+        self.release_graveyard(device, SlotMask::MAX);
         for list in self.staging_free.values_mut() {
             for s in list.drain(..) {
                 device.destroy_buffer(s.buffer, None);

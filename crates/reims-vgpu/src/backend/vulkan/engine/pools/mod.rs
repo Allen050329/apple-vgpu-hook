@@ -140,11 +140,17 @@ pub(crate) struct ResourcePools {
     cur: usize,
     /// Submitted-but-unretired slot count. While nonzero, destroying any GPU
     /// object a prior CB may reference is unsafe — dispose() defers those
-    /// handles to `graveyard` until every in-flight fence retires.
+    /// handles to `graveyard` until the slots that could reference them retire.
     in_flight: usize,
-    /// Handles displaced (cache eviction, registry replace) while a CB was in
-    /// flight; destroyed once in_flight returns to 0.
-    graveyard: Vec<DeferredHandle>,
+    /// Handles displaced (cache eviction, registry replace) while GPU work was
+    /// open, each paired with the [`SlotMask`] of the ring slots that were open
+    /// at dispose time. A dispose site has already made the handle unreachable
+    /// (it was taken out of the cache/registry that named it), so no *later*
+    /// entry can bind it; only the entries recording or in flight at that
+    /// instant can still reference it. Clearing a slot's bit as it retires
+    /// therefore frees the handle on the last fence that could be reading it,
+    /// not on the whole ring going idle.
+    graveyard: Vec<(SlotMask, DeferredHandle)>,
     /// Resident-target recycle pool: images displaced from the identity registry
     /// (generation bump / geometry change / LRU), held by (geometry, format) for
     /// reuse instead of destroyed. Kills the per-frame `vkCreateImage`+
@@ -216,6 +222,16 @@ struct CmdSlot {
 /// a deeper ring or render-pass batching (only ~37 % of draws join a shared pass)
 /// may reclaim more.
 const RING_DEPTH: usize = 8;
+
+/// One bit per ring slot: the set of slots a deferred handle is still waiting
+/// on. Sized so the whole ring fits, which is what bounds the graveyard — a
+/// handle's mask can only name slots that existed when it was disposed, and
+/// every one of those retires within a ring wrap.
+pub(crate) type SlotMask = u32;
+const _: () = assert!(
+    RING_DEPTH <= SlotMask::BITS as usize,
+    "SlotMask must have one bit per ring slot"
+);
 
 /// A GPU object displaced while a CB may still reference it. Destroyed only
 /// once every in-flight fence has retired.
@@ -872,9 +888,6 @@ pub(crate) const STAGING_BUCKET_BINS: usize = 32;
 /// One `staging_pool` line per this many misses.
 const STAGING_MISS_EMIT_EVERY: u64 = 512;
 
-/// Graveyard size at which begin_entry force-quiesces the ring to destroy
-/// deferred handles (pure-async streak backstop).
-const GRAVEYARD_FORCE_DRAIN: usize = 256;
 /// Max draws per deferred-submit batch before `batch_slot` refuses joiners
 /// and the run flushes + reopens. Bounds GPU-idle latency and staging-slot
 /// hoarding (see `batch_slot`) while amortizing per-draw submit overhead.

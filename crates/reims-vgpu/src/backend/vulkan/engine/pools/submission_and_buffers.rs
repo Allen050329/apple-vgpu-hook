@@ -627,21 +627,36 @@ impl ResourcePools {
         self.desc_arena.free(device, sets);
     }
 
-    /// True while any recorded GPU work may still reference pool objects: a
-    /// submitted-but-unretired CB, or the open draw batch's still-recording CB
-    /// (unsubmitted, but it already references images/buffers — destroying
-    /// them before its flush would be a use-after-free at submit).
-    fn gpu_work_open(&self) -> bool {
-        self.in_flight > 0 || self.open_batch.is_some()
+    /// The ring slots whose recorded GPU work may still reference pool objects:
+    /// every submitted-but-unretired CB, plus the open draw batch's slot (its
+    /// CB is still recording, so unsubmitted, but it already references
+    /// images/buffers — destroying them before its flush would be a
+    /// use-after-free at submit). A zero mask means nothing can be reading
+    /// anything.
+    fn open_slot_mask(&self) -> SlotMask {
+        let mut mask: SlotMask = 0;
+        for (index, slot) in self.slots.iter().enumerate() {
+            if slot.pending.is_some() {
+                mask |= 1 << index;
+            }
+        }
+        if self.open_batch.is_some() {
+            // The batch records into `cur` and seals onto that same slot at
+            // flush, and every path that retires a slot flushes the batch
+            // first, so this bit cannot clear before the batch's work retires.
+            mask |= 1 << self.cur;
+        }
+        mask
     }
 
-    /// Destroy `handle` now if no CB is in flight, else park it in the
-    /// graveyard until every in-flight fence retires.
+    /// Destroy `handle` now if nothing can be reading it, else park it in the
+    /// graveyard until each slot open at this instant has retired.
     pub(crate) unsafe fn dispose(&mut self, device: &ash::Device, handle: DeferredHandle) {
-        if !self.gpu_work_open() {
+        let waiting = self.open_slot_mask();
+        if waiting == 0 {
             self.destroy_or_recycle(device, handle);
         } else {
-            self.graveyard.push(handle);
+            self.graveyard.push((waiting, handle));
         }
     }
 
@@ -762,12 +777,26 @@ impl ResourcePools {
         (admits, cap_drops)
     }
 
-    unsafe fn drain_graveyard(&mut self, device: &ash::Device) {
-        // Collect first: recycling a `RecycleSampled` handle borrows
-        // `self.sampled_free`, which conflicts with draining `self.graveyard` in
-        // place.
-        let handles: Vec<DeferredHandle> = self.graveyard.drain(..).collect();
-        for handle in handles {
+    /// Clear `retired` from every parked handle's wait mask and take out the
+    /// ones that now wait on nothing. `retired` is the bit of the slot that
+    /// just retired; teardown passes every bit.
+    ///
+    /// Taking rather than destroying in place is what lets `destroy_or_recycle`
+    /// borrow `self.sampled_free`/`self.target_free` while the graveyard is
+    /// being walked, and it is the whole decision the mask exists to make, so
+    /// it is also the seam the tests drive without a device.
+    fn take_released_graveyard(&mut self, retired: SlotMask) -> Vec<DeferredHandle> {
+        let (ready, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut self.graveyard)
+            .into_iter()
+            .map(|(mask, handle)| (mask & !retired, handle))
+            .partition(|(mask, _)| *mask == 0);
+        self.graveyard = waiting;
+        ready.into_iter().map(|(_, handle)| handle).collect()
+    }
+
+    /// Terminally handle every graveyard entry released by `retired` retiring.
+    unsafe fn release_graveyard(&mut self, device: &ash::Device, retired: SlotMask) {
+        for handle in self.take_released_graveyard(retired) {
             self.destroy_or_recycle(device, handle);
         }
     }
@@ -804,9 +833,7 @@ impl ResourcePools {
         let pending = self.slots[index].pending.take().expect("checked above");
         self.in_flight = self.in_flight.saturating_sub(1);
         self.drain_cleanup(&ctx.device, pending);
-        if !self.gpu_work_open() {
-            self.drain_graveyard(&ctx.device);
-        }
+        self.release_graveyard(&ctx.device, 1 << index);
         Ok(())
     }
 
@@ -868,13 +895,6 @@ impl ResourcePools {
             if still_running {
                 counters.ring_retire_blocks.fetch_add(1, Ordering::Relaxed);
             }
-        }
-        // Safety valve: a long pure-async streak keeps in_flight above 0 at
-        // every retire, so eviction-displaced handles could pile up. Under
-        // real workloads presents/readbacks quiesce the ring long before this
-        // fires.
-        if self.graveyard.len() >= GRAVEYARD_FORCE_DRAIN {
-            self.retire_all(ctx, counters)?;
         }
         self.cur = next;
         Ok((self.slots[next].cmd_buf, self.slots[next].fence))
@@ -1090,9 +1110,12 @@ impl ResourcePools {
         for index in 0..self.slots.len() {
             self.retire_slot(ctx, counters, index)?;
         }
-        if !self.gpu_work_open() {
-            self.drain_graveyard(&ctx.device);
-        }
+        // A slot that owed nothing retires without clearing its bit, and a
+        // batch whose submit failed leaves its opener's bit set with no fence
+        // behind it. Sweep every bit that is no longer open so a quiesce always
+        // leaves the graveyard holding only genuinely-blocked handles.
+        let still_open = self.open_slot_mask();
+        self.release_graveyard(&ctx.device, !still_open);
         Ok(())
     }
 
@@ -2498,5 +2521,137 @@ mod recycle_tests {
         let (hits, allocs, _admits, _drops) = pools.target_recycle_stats();
         assert_eq!(hits, 8, "8 steady frames each reused a recycled image");
         assert_eq!(allocs, 1, "only the cold first frame allocated");
+    }
+
+    /// A ring slot that owes cleanup, with null handles — enough for the
+    /// graveyard's mask bookkeeping, which reads only `pending.is_some()`.
+    fn pending_slot() -> CmdSlot {
+        CmdSlot {
+            cmd_buf: vk::CommandBuffer::null(),
+            fence: vk::Fence::null(),
+            pending: Some(PendingGpuCleanup {
+                dsets: Vec::new(),
+                staging: Vec::new(),
+                readback: Vec::new(),
+                sampled: Vec::new(),
+                storage_images: Vec::new(),
+                sampled_retains: Vec::new(),
+            }),
+        }
+    }
+
+    fn idle_slot() -> CmdSlot {
+        CmdSlot {
+            cmd_buf: vk::CommandBuffer::null(),
+            fence: vk::Fence::null(),
+            pending: None,
+        }
+    }
+
+    /// A dispose site has already unlinked the handle, so only the entries
+    /// recording or in flight *at that instant* can still reference it. The
+    /// handle is therefore released when those slots retire — not when the
+    /// whole ring goes idle. Device-free: drives the mask decision only.
+    #[test]
+    fn a_disposed_handle_waits_on_the_slots_open_when_it_was_disposed_and_no_others() {
+        let mut pools = ResourcePools::new();
+        pools.slots = (0..4).map(|_| idle_slot()).collect();
+        pools.slots[0] = pending_slot();
+        pools.slots[1] = pending_slot();
+
+        let waiting = pools.open_slot_mask();
+        assert_eq!(waiting, 0b0011, "slots 0 and 1 are in flight");
+        pools.graveyard.push((
+            waiting,
+            DeferredHandle::Framebuffer(vk::Framebuffer::null()),
+        ));
+
+        // A later entry claims slot 2. It began after the dispose, so it cannot
+        // have recorded a reference to the handle, and the handle must not
+        // start waiting on it.
+        pools.slots[2] = pending_slot();
+        assert!(
+            pools.take_released_graveyard(1 << 2).is_empty(),
+            "slot 2 retiring says nothing about a handle disposed before it began"
+        );
+        assert!(
+            pools.take_released_graveyard(1 << 0).is_empty(),
+            "slot 1 could still be reading it"
+        );
+        assert_eq!(
+            pools.take_released_graveyard(1 << 1).len(),
+            1,
+            "both witnesses retired: the handle is free"
+        );
+        assert!(pools.graveyard.is_empty());
+    }
+
+    /// The open draw batch records into `cur` without being submitted, so its
+    /// slot has no pending cleanup yet — but its CB already references pool
+    /// objects. Its bit must be in the mask, or a dispose during an open batch
+    /// would free something the flush is about to submit against.
+    #[test]
+    fn the_open_batch_slot_counts_as_open_even_though_it_owes_no_cleanup() {
+        let mut pools = ResourcePools::new();
+        pools.slots = (0..4).map(|_| idle_slot()).collect();
+        pools.cur = 3;
+        assert_eq!(pools.open_slot_mask(), 0, "idle ring, no batch");
+
+        pools.open_batch = Some(OpenBatch {
+            cb: vk::CommandBuffer::null(),
+            fence: vk::Fence::null(),
+            identity: TargetIdentity::Anonymous { slot: 0 },
+            width: 16,
+            height: 16,
+            bgra: false,
+            draws: 1,
+            dsets: Vec::new(),
+            sampled_retains: Vec::new(),
+        });
+        assert_eq!(pools.open_slot_mask(), 1 << 3, "the batch's own slot");
+    }
+
+    /// What `GRAVEYARD_FORCE_DRAIN` used to backstop: a pure-async streak never
+    /// lets the ring reach idle, so under a global drain the graveyard grew
+    /// until a forced full quiesce cut it down. Per-slot masks make that
+    /// structural — every slot a handle waits on retires within one ring wrap,
+    /// so the population is bounded by the disposes of one wrap with no valve.
+    #[test]
+    fn a_ring_that_never_goes_idle_still_drains_the_graveyard() {
+        let mut pools = ResourcePools::new();
+        let depth = 4;
+        pools.slots = (0..depth).map(|_| pending_slot()).collect();
+
+        let mut released = 0;
+        let mut peak = 0;
+        for step in 0..64 {
+            // Every slot but the one about to retire stays in flight, so the
+            // ring is never idle and `open_slot_mask()` is never zero.
+            let waiting = pools.open_slot_mask();
+            assert_ne!(waiting, 0, "step {step}: ring must stay busy");
+            pools.graveyard.push((
+                waiting,
+                DeferredHandle::Framebuffer(vk::Framebuffer::null()),
+            ));
+            peak = peak.max(pools.graveyard.len());
+
+            let index = step % depth;
+            pools.slots[index].pending = None;
+            released += pools.take_released_graveyard(1 << index).len();
+            pools.slots[index] = pending_slot();
+        }
+
+        // A handle disposed at step `s` waits on all `depth` slots and the
+        // retire at step `s` clears the first of them, so it frees at step
+        // `s + depth - 1`. Only the final `depth - 1` disposes are still parked.
+        assert_eq!(
+            released,
+            64 - (depth - 1),
+            "everything older than one ring wrap freed without a forced quiesce"
+        );
+        assert!(
+            peak <= depth,
+            "outstanding population is bounded by the ring depth, got {peak}"
+        );
     }
 }
