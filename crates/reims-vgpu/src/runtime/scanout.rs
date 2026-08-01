@@ -145,10 +145,11 @@ fn try_capture_from_resident(
 /// CmdDisplaySwap after wait_surface drains — before the packet stamp lets the
 /// guest recycle the mid (BH-deferred freeze captured mid-recycle partials).
 ///
-/// Guest pages ARE the surface content — the draw path's CPU writeback lands
-/// Stores in them. There is exactly one capture source.
-/// Takes no `HostOps`: with the guest-page capture path gone this reads the GPU
-/// resident and the host surface cache only — it never touches guest memory.
+/// Two sources fill the frame, and neither is guest memory: the host surface
+/// cache when an encode or clear wrote it, otherwise the GPU resident. That is
+/// why this takes no `HostOps`. A capture that can use neither fails visibly and
+/// keeps the prior retain rather than opening a third vein — see the note at the
+/// resident read for why the guest-page fallback was deleted instead of kept.
 pub fn capture_present_frame(
     state: &mut DeviceState,
     mapping_id: u32,
