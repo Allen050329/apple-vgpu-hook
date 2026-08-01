@@ -115,6 +115,33 @@ fn sync_exec_stall_proxy_fires_at_watchdog_scale_only() {
 }
 use crate::runtime::host::{FakeHost, HostActionKind};
 
+/// A display-present packet naming `mapping`.
+///
+/// The surface id goes at the offset the emitting command's trailer puts it,
+/// read from `display_txn_trailer_slots` — the same table the decoder uses, so a
+/// test cannot pin an offset the product code does not read. The payload is the
+/// command's own trailer length and nothing else, which is what the guest sends:
+/// `kb/pvg-display-contract.md` §8.1 measured every op6 payload as trailer-only.
+///
+/// Every present test built this same eight-field `Packet` by hand; only the
+/// opcode and the named mapping ever differed. The one test that does not use
+/// this is `display_txn_probe_distinguishes_trailer_only_from_prefixed_payload`,
+/// which varies the payload length on purpose.
+fn present_packet(opcode: u16, mapping: u32) -> Packet {
+    let len = display_txn_trailer_len(opcode);
+    let mut payload = vec![0u8; len];
+    let off = display_txn_trailer_slots(opcode).0 * 4;
+    payload[off..off + 4].copy_from_slice(&mapping.to_le_bytes());
+    Packet {
+        opcode,
+        stamp_count: 0,
+        total_size: PACKET_HEADER_LEN + len as u32,
+        completion_stamp: 0,
+        payload,
+        next_head: 0,
+    }
+}
+
 fn packet_bytes(opcode: u16, stamp_value: u32, payload: &[u8]) -> Vec<u8> {
     let total = PACKET_HEADER_LEN as usize + payload.len();
     let mut v = vec![0u8; total];
@@ -246,16 +273,7 @@ fn display_swap_paints_mapping_geom_not_console_fallback() {
         m.content_generation = 5;
         m.page_entries = vec![1];
     }
-    let mut payload = vec![0u8; DISPLAY_SWAP_MIN_LEN];
-    payload[DISPLAY_SWAP_MAPPING..DISPLAY_SWAP_MAPPING + 4].copy_from_slice(&3u32.to_le_bytes());
-    let pkt = Packet {
-        opcode: CHILD_OP_DISPLAY_SWAP,
-        stamp_count: 0,
-        total_size: PACKET_HEADER_LEN + DISPLAY_SWAP_MIN_LEN as u32,
-        completion_stamp: 0,
-        payload,
-        next_head: 0,
-    };
+    let pkt = present_packet(CHILD_OP_DISPLAY_SWAP, 3);
     process_child_packet(&mut state, &mut host, 4, &pkt);
     assert!(state.present.frame_flush_seen);
     assert_eq!(state.present.width, 1440);
@@ -338,22 +356,7 @@ fn clear_only_present_captures_the_surface_the_transaction_names() {
         "the named mid must be the ClearOnly case this test is about"
     );
 
-    let mut payload = vec![0u8; PRESENT_X86_MIN_LEN];
-    payload[PRESENT_X86_SURFACE_ID..PRESENT_X86_SURFACE_ID + 4]
-        .copy_from_slice(&2u32.to_le_bytes());
-    process_child_packet(
-        &mut state,
-        &mut host,
-        5,
-        &Packet {
-            opcode: CHILD_OP_PRESENT_X86,
-            stamp_count: 0,
-            total_size: PACKET_HEADER_LEN + PRESENT_X86_MIN_LEN as u32,
-            completion_stamp: 0,
-            payload,
-            next_head: 0,
-        },
-    );
+    process_child_packet(&mut state, &mut host, 5, &present_packet(CHILD_OP_PRESENT_X86, 2));
 
     assert_eq!(state.present.present_mapping, 2, "guest names mid 2");
     assert!(
@@ -529,22 +532,7 @@ fn composite_named_present_captures_the_named_member_however_far_it_lags() {
     state.present.height = h;
 
     let present_named = |state: &mut DeviceState, host: &mut FakeHost, mid: u32| {
-        let mut payload = vec![0u8; PRESENT_X86_MIN_LEN];
-        payload[PRESENT_X86_SURFACE_ID..PRESENT_X86_SURFACE_ID + 4]
-            .copy_from_slice(&mid.to_le_bytes());
-        process_child_packet(
-            state,
-            host,
-            5,
-            &Packet {
-                opcode: CHILD_OP_PRESENT_X86,
-                stamp_count: 0,
-                total_size: PACKET_HEADER_LEN + PRESENT_X86_MIN_LEN as u32,
-                completion_stamp: 0,
-                payload,
-                next_head: 0,
-            },
-        );
+        process_child_packet(state, host, 5, &present_packet(CHILD_OP_PRESENT_X86, mid));
     };
 
     // Healthy alternation: both members publish, the named member is captured.
@@ -750,17 +738,7 @@ fn composite_present_sets_frame_flush_boundary() {
     }
     state.note_surface_composite(4);
 
-    let mut payload = vec![0u8; PRESENT_X86_MIN_LEN.max(12)];
-    payload[PRESENT_X86_SURFACE_ID..PRESENT_X86_SURFACE_ID + 4]
-        .copy_from_slice(&4u32.to_le_bytes());
-    let pkt = Packet {
-        opcode: CHILD_OP_PRESENT_X86,
-        stamp_count: 0,
-        total_size: PACKET_HEADER_LEN + payload.len() as u32,
-        completion_stamp: 0,
-        payload,
-        next_head: 0,
-    };
+    let pkt = present_packet(CHILD_OP_PRESENT_X86, 4);
     process_child_packet(&mut state, &mut host, 5, &pkt);
     assert!(state.present.frame_flush_seen);
     assert_coalesced_paint_action(&host, "composite sets flush boundary");
@@ -775,16 +753,7 @@ fn display_swap_without_geom_holds_last_frame() {
     state.present.height = 1080;
     assert!(state.map_surface(9));
     // Mapped but no has_geom — do not resize/paint.
-    let mut payload = vec![0u8; DISPLAY_SWAP_MIN_LEN];
-    payload[DISPLAY_SWAP_MAPPING..DISPLAY_SWAP_MAPPING + 4].copy_from_slice(&9u32.to_le_bytes());
-    let pkt = Packet {
-        opcode: CHILD_OP_DISPLAY_SWAP,
-        stamp_count: 0,
-        total_size: PACKET_HEADER_LEN + DISPLAY_SWAP_MIN_LEN as u32,
-        completion_stamp: 0,
-        payload,
-        next_head: 0,
-    };
+    let pkt = present_packet(CHILD_OP_DISPLAY_SWAP, 9);
     process_child_packet(&mut state, &mut host, 4, &pkt);
     assert!(state.present.frame_flush_seen);
     assert_eq!(state.present.present_mapping, 9);
@@ -830,22 +799,7 @@ fn present_x86_op6_paints_surface_id_mapping() {
     let px = [0x22u8; 16];
     assert!(write_bgra8(&mut state, &mut host, 5, &px, 8, 2, 2));
 
-    let mut payload = vec![0u8; PRESENT_X86_MIN_LEN];
-    payload[PRESENT_X86_SURFACE_ID..PRESENT_X86_SURFACE_ID + 4]
-        .copy_from_slice(&5u32.to_le_bytes());
-    process_child_packet(
-        &mut state,
-        &mut host,
-        5,
-        &Packet {
-            opcode: CHILD_OP_PRESENT_X86,
-            stamp_count: 0,
-            total_size: PACKET_HEADER_LEN + PRESENT_X86_MIN_LEN as u32,
-            completion_stamp: 0,
-            payload,
-            next_head: 0,
-        },
-    );
+    process_child_packet(&mut state, &mut host, 5, &present_packet(CHILD_OP_PRESENT_X86, 5));
     assert_eq!(state.present.present_mapping, 5);
     assert!(state.present.frame_flush_seen);
     assert!(state.present.frame_valid || state.present.frame_encode_pending);
@@ -881,22 +835,7 @@ fn display_swap_unpainted_presents_counts_until_paint() {
     assert!(write_bgra8(&mut state, &mut host, 3, &px, 8, 2, 2));
 
     let swap = |state: &mut DeviceState, host: &mut FakeHost| {
-        let mut payload = vec![0u8; DISPLAY_SWAP_MIN_LEN];
-        payload[DISPLAY_SWAP_MAPPING..DISPLAY_SWAP_MAPPING + 4]
-            .copy_from_slice(&3u32.to_le_bytes());
-        process_child_packet(
-            state,
-            host,
-            4,
-            &Packet {
-                opcode: CHILD_OP_DISPLAY_SWAP,
-                stamp_count: 0,
-                total_size: PACKET_HEADER_LEN + DISPLAY_SWAP_MIN_LEN as u32,
-                completion_stamp: 0,
-                payload,
-                next_head: 0,
-            },
-        );
+        process_child_packet(state, host, 4, &present_packet(CHILD_OP_DISPLAY_SWAP, 3));
     };
 
     assert_eq!(state.present.unpainted_presents, 0);
@@ -962,21 +901,7 @@ fn display_swap_signals_present_complete_on_shared_page() {
     );
     host.put_u32(shared + DISPLAY_SHARED_PENDING, DISPLAY_ONLINE_EVENT_MASK);
 
-    let mut payload = vec![0u8; DISPLAY_SWAP_MIN_LEN];
-    payload[DISPLAY_SWAP_MAPPING..DISPLAY_SWAP_MAPPING + 4].copy_from_slice(&3u32.to_le_bytes());
-    process_child_packet(
-        &mut state,
-        &mut host,
-        4,
-        &Packet {
-            opcode: CHILD_OP_DISPLAY_SWAP,
-            stamp_count: 0,
-            total_size: PACKET_HEADER_LEN + DISPLAY_SWAP_MIN_LEN as u32,
-            completion_stamp: 0,
-            payload,
-            next_head: 0,
-        },
-    );
+    process_child_packet(&mut state, &mut host, 4, &present_packet(CHILD_OP_DISPLAY_SWAP, 3));
 
     let mut le = [0u8; 4];
     assert!(host
@@ -1264,16 +1189,7 @@ fn display_swap_encodes_at_present_after_wait_surface() {
     ];
     assert!(write_bgra8(&mut state, &mut host, 3, &px, 8, 2, 2));
     let gen = state.mappings.get(&3).unwrap().content_generation;
-    let mut payload = vec![0u8; DISPLAY_SWAP_MIN_LEN];
-    payload[DISPLAY_SWAP_MAPPING..DISPLAY_SWAP_MAPPING + 4].copy_from_slice(&3u32.to_le_bytes());
-    let pkt = Packet {
-        opcode: CHILD_OP_DISPLAY_SWAP,
-        stamp_count: 0,
-        total_size: PACKET_HEADER_LEN + DISPLAY_SWAP_MIN_LEN as u32,
-        completion_stamp: 0,
-        payload,
-        next_head: 0,
-    };
+    let pkt = present_packet(CHILD_OP_DISPLAY_SWAP, 3);
     process_child_packet(&mut state, &mut host, 4, &pkt);
     assert!(state.present.frame_flush_seen);
     assert!(
@@ -1342,21 +1258,7 @@ fn display_swap_capture_fail_keeps_prior_retain() {
 
     let swap = |state: &mut DeviceState, host: &mut FakeHost, mid: u32| {
         host.actions.clear();
-        let mut payload = vec![0u8; DISPLAY_SWAP_MIN_LEN];
-        payload[DISPLAY_SWAP_MAPPING..DISPLAY_SWAP_MAPPING + 4].copy_from_slice(&mid.to_le_bytes());
-        process_child_packet(
-            state,
-            host,
-            4,
-            &Packet {
-                opcode: CHILD_OP_DISPLAY_SWAP,
-                stamp_count: 0,
-                total_size: PACKET_HEADER_LEN + DISPLAY_SWAP_MIN_LEN as u32,
-                completion_stamp: 0,
-                payload,
-                next_head: 0,
-            },
-        );
+        process_child_packet(state, host, 4, &present_packet(CHILD_OP_DISPLAY_SWAP, mid));
     };
 
     // First swap: full dock composite retained.
@@ -1466,21 +1368,7 @@ fn display_swap_dual_mid_full_composites_both_retain() {
 
     let swap = |state: &mut DeviceState, host: &mut FakeHost, mid: u32| {
         host.actions.clear();
-        let mut payload = vec![0u8; DISPLAY_SWAP_MIN_LEN];
-        payload[DISPLAY_SWAP_MAPPING..DISPLAY_SWAP_MAPPING + 4].copy_from_slice(&mid.to_le_bytes());
-        process_child_packet(
-            state,
-            host,
-            4,
-            &Packet {
-                opcode: CHILD_OP_DISPLAY_SWAP,
-                stamp_count: 0,
-                total_size: PACKET_HEADER_LEN + DISPLAY_SWAP_MIN_LEN as u32,
-                completion_stamp: 0,
-                payload,
-                next_head: 0,
-            },
-        );
+        process_child_packet(state, host, 4, &present_packet(CHILD_OP_DISPLAY_SWAP, mid));
     };
 
     // Present mid3 full dock → +0x188.
@@ -1574,16 +1462,7 @@ fn display_swap_alternating_mappings_both_paint() {
     }
     for mid in [3u32, 4u32, 3u32] {
         host.actions.clear();
-        let mut payload = vec![0u8; DISPLAY_SWAP_MIN_LEN];
-        payload[DISPLAY_SWAP_MAPPING..DISPLAY_SWAP_MAPPING + 4].copy_from_slice(&mid.to_le_bytes());
-        let pkt = Packet {
-            opcode: CHILD_OP_DISPLAY_SWAP,
-            stamp_count: 0,
-            total_size: PACKET_HEADER_LEN + DISPLAY_SWAP_MIN_LEN as u32,
-            completion_stamp: 0,
-            payload,
-            next_head: 0,
-        };
+        let pkt = present_packet(CHILD_OP_DISPLAY_SWAP, mid);
         process_child_packet(&mut state, &mut host, 4, &pkt);
         assert!(state.present.frame_flush_seen);
         assert_eq!(state.present.present_mapping, mid);
@@ -1649,16 +1528,7 @@ fn only_display_swap_paints_after_frame_flush_seen() {
         m.content_generation = 10;
         m.page_entries = vec![(2u32 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
     }
-    let mut payload = vec![0u8; DISPLAY_SWAP_MIN_LEN];
-    payload[DISPLAY_SWAP_MAPPING..DISPLAY_SWAP_MAPPING + 4].copy_from_slice(&5u32.to_le_bytes());
-    let pkt = Packet {
-        opcode: CHILD_OP_DISPLAY_SWAP,
-        stamp_count: 0,
-        total_size: PACKET_HEADER_LEN + DISPLAY_SWAP_MIN_LEN as u32,
-        completion_stamp: 0,
-        payload,
-        next_head: 0,
-    };
+    let pkt = present_packet(CHILD_OP_DISPLAY_SWAP, 5);
     process_child_packet(&mut state, &mut host, 4, &pkt);
     assert_coalesced_paint_action(&host, "post-flush display swap");
     assert_eq!(state.present.present_mapping, 5);
