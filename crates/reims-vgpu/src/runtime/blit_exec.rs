@@ -59,6 +59,25 @@ use crate::runtime::objects;
 use crate::runtime::plan::event_sync::{Domain as FenceDomain, FenceAction};
 
 /// Cap on type-8 view → base → … chains (views of views).
+///
+/// **Not a contract limit.** Nothing in the decoded protocol bounds how deep a
+/// view chain may go, and a chain is guest-built, so `A views B views A` is
+/// expressible. `resolve_texture_backing_depth` recurses along it, which makes
+/// this a runaway/cycle guard rather than a statement about Metal: the number
+/// only has to sit above the depths a guest actually builds, and its job is to
+/// stop the recursion at all.
+///
+/// It is the minimal mechanism for that. Detecting a repeated `texture_ref`
+/// instead would mean carrying a visited set down the recursion — more state and
+/// more code to reach the same refusal.
+///
+/// Exceeding it fails closed and visibly (`tex_view_depth_cap` through [`br`]),
+/// never silently, so a guest that does build a deeper chain says so in the fail
+/// log instead of losing the copy. That line has **never appeared** across the
+/// accumulated ~60 MB log, on which the texture-to-texture blit path is
+/// exercised (`t2t_overlap` has fired there). So 4 is known not to be binding in
+/// practice, and if it ever becomes binding the log names it — raise it then,
+/// rather than pre-emptively.
 const VIEW_RESOLVE_DEPTH_CAP: u32 = 4;
 
 /// Chunk size for fill/copy host staging (bounded guest IO).
