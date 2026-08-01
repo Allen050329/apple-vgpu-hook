@@ -193,6 +193,30 @@ integration tests are separate crates, so it cannot be `#[cfg(test)]`. For
 everything else, deleting a hit means deleting its test; name the test in the
 commit so a dropped count is never silent.
 
+### Finding Measurements That Cannot Measure
+
+`dead-state.sh` answers "does anything read this?". It cannot answer "does this
+ever say anything?" — a counter with a live reader still earns nothing if the
+branch that would move it is never taken. That failure mode is invisible in the
+source: the field looks like a live counter until you count it.
+
+```sh
+scripts/constant-fields/constant-fields.sh          # defaults to the always-on log
+```
+
+This reports `key=value` fields in `/tmp/reims-vgpu-fail.log` that only ever take
+**one** value, bucketed by emitting line family. A field that never varies is
+either structurally impossible or vestigial. Its control is that it re-finds
+`gva_write gpa_match=0`, the probe `d128fc1` deleted for exactly this reason.
+
+Prefer the whole accumulated log over one boot, and drive the guest before
+believing a zero — the type-11 ladder measured 12/5/8/0 undriven against
+31 916/1 694/705/150 driven, quiet enough to talk someone into deleting a live
+rung. Triage as a report, not a gate: a standing alarm reading zero is working,
+and so is a host capability constant. The shape that convicts is a bucket
+downstream of another bucket that is *itself* always zero, or a counterfactual
+for code already deleted. See the script's README.
+
 ## Commit Guidelines
 
 Commit only work you wrote. Never commit third-party code or intellectual property, including Apple
