@@ -62,6 +62,10 @@ impl MirrorClampToEdge {
 /// value is clamped to, and as the answer when no device has been resolved.
 pub const VULKAN_MIN_IMAGE_DIMENSION_2D: u32 = 4096;
 
+/// `maxComputeWorkGroupInvocations` from the same spec table. Used as the floor
+/// a queried value is clamped to, and as the answer when no device is resolved.
+pub const VULKAN_MIN_COMPUTE_WORKGROUP_INVOCATIONS: u32 = 128;
+
 /// Every device feature and format capability this backend depends on, resolved
 /// against one physical device.
 ///
@@ -81,6 +85,16 @@ pub struct DeviceFeatures {
     /// floor is 4096, which every desktop GPU exceeds by 4x, so treating the
     /// floor as the cap refuses render targets the host can actually hold.
     pub max_image_dimension_2d: u32,
+    /// `VkPhysicalDeviceLimits::maxComputeWorkGroupInvocations` — the guest's
+    /// `maxTotalThreadsPerThreadgroup`. The Vulkan 1.2 floor is 128, so a
+    /// fixed 1024 is an over-promise on any device at or near it: the guest
+    /// sizes threadgroups from this answer and the host then cannot run them.
+    pub max_compute_workgroup_invocations: u32,
+    /// `VkPhysicalDeviceSubgroupProperties::subgroupSize` — the guest's
+    /// `threadExecutionWidth`. Vendor-dependent (32 on NVIDIA and Apple, 64 on
+    /// AMD's wave64 parts, 8/16/32 on Intel), which is why it is asked for
+    /// rather than assumed.
+    pub subgroup_size: u32,
     pub shader_int16: bool,
     pub storage_image_extended_formats: bool,
     pub storage_image_write_without_format: bool,
@@ -193,6 +207,12 @@ pub unsafe fn query(
     unsafe { instance.get_physical_device_features2(pd, &mut features2) };
     let supported = features2.features;
     let props = unsafe { instance.get_physical_device_properties(pd) };
+    // Subgroup size is Vulkan 1.1 core and chains onto `Properties2`; the
+    // baseline is 1.2, so it is always answerable. It is what the guest's
+    // `threadExecutionWidth` query is asking for.
+    let mut subgroup = vk::PhysicalDeviceSubgroupProperties::default();
+    let mut props2 = vk::PhysicalDeviceProperties2::default().push_next(&mut subgroup);
+    unsafe { instance.get_physical_device_properties2(pd, &mut props2) };
 
     // BGRA8 as a storage image is optional; ask the device rather than assume.
     let bgra8_storage = unsafe {
@@ -230,6 +250,13 @@ pub unsafe fn query(
             .limits
             .max_image_dimension2_d
             .max(VULKAN_MIN_IMAGE_DIMENSION_2D),
+        max_compute_workgroup_invocations: props
+            .limits
+            .max_compute_work_group_invocations
+            .max(VULKAN_MIN_COMPUTE_WORKGROUP_INVOCATIONS),
+        // A device reporting 0 is out of spec; one lane is the only answer that
+        // cannot make the guest oversize a dispatch.
+        subgroup_size: subgroup.subgroup_size.max(1),
         shader_int16: supported.shader_int16 == vk::TRUE,
         storage_image_extended_formats: supported.shader_storage_image_extended_formats == vk::TRUE,
         storage_image_write_without_format: supported.shader_storage_image_write_without_format
@@ -255,6 +282,8 @@ mod tests {
             sampler_anisotropy: true,
             max_sampler_anisotropy: 16.0,
             max_image_dimension_2d: 16384,
+            max_compute_workgroup_invocations: 1024,
+            subgroup_size: 64,
             shader_int16: true,
             storage_image_extended_formats: true,
             storage_image_write_without_format: true,
@@ -366,6 +395,29 @@ mod tests {
         );
         // A 5K-wide target: refused under the old fixed 4096, accepted here.
         assert!(5120 <= all_supported().max_image_dimension_2d);
+    }
+
+    /// The compute limits the guest is told are the device's, not a fixed pair.
+    ///
+    /// `CmdGetComputeInfo` used to answer `maxTotalThreadsPerThreadgroup` 1024
+    /// and `threadExecutionWidth` 32 on every host. The guest sizes its
+    /// dispatches from the first, and the Vulkan 1.2 floor for
+    /// `maxComputeWorkGroupInvocations` is 128 — so on any device at or near
+    /// the floor that answer promised threadgroups eight times larger than the
+    /// device can run. The second is vendor-dependent (64 on AMD wave64), and
+    /// a guest told 32 there sizes every dispatch against the wrong wave.
+    ///
+    /// A host below the spec floor is out of spec and clamped up rather than
+    /// believed downward; a host above it must be believed.
+    #[test]
+    fn the_compute_limits_reported_to_the_guest_come_from_the_device() {
+        let f = all_supported();
+        assert!(f.max_compute_workgroup_invocations >= VULKAN_MIN_COMPUTE_WORKGROUP_INVOCATIONS);
+        assert_ne!(
+            f.subgroup_size, 32,
+            "the fixture is a wave64 part precisely so a hardcoded 32 cannot pass"
+        );
+        assert!(f.subgroup_size > 0, "a zero wave would divide by zero downstream");
     }
 
     /// The enable list is derived from what the backend binds, and

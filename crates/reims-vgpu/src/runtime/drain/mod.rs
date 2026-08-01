@@ -406,11 +406,41 @@ fn reply_device_info<H: HostMemory + HostOps>(
     Ok(())
 }
 
-/// Conservative compute-pipeline info pairs (kb tahoe-x86 + texture-ref 29-06-26).
-/// key1 maxTotalThreadsPerThreadgroup, key3 threadExecutionWidth,
-/// key4 staticThreadgroupMemoryLength. Real values should come from pipeline
-/// reflection once metal2vulkan encode lands; zeros blocked guest MPS/compute.
-const COMPUTE_INFO_CAPS: &[(u32, u32)] = &[(1, 1024), (3, 32), (4, 0)];
+/// Wire keys of the `CmdGetComputeInfo` reply the guest reads back
+/// (kb tahoe-x86 + texture-ref 29-06-26).
+const COMPUTE_INFO_KEY_MAX_TOTAL_THREADS: u32 = 1;
+const COMPUTE_INFO_KEY_THREAD_EXECUTION_WIDTH: u32 = 3;
+const COMPUTE_INFO_KEY_STATIC_THREADGROUP_MEMORY: u32 = 4;
+
+/// What this host answers for a compute pipeline's threadgroup limits.
+///
+/// The guest sizes its dispatches from these, so an over-promise is not
+/// cosmetic: claim a `maxTotalThreadsPerThreadgroup` the host cannot run and
+/// the threadgroup the guest builds from it is one the device rejects. They
+/// used to be the fixed triple `(1, 1024), (3, 32), (4, 0)`, whose own comment
+/// called itself conservative and deferred the real values to "once
+/// metal2vulkan encode lands". That has landed, and both are device limits.
+///
+/// `staticThreadgroupMemoryLength` is a property of the *pipeline*, not the
+/// device — the threadgroup memory the kernel declares — so no device limit
+/// answers it and it stays 0 until pipeline reflection carries it.
+fn compute_info_caps() -> [(u32, u32); 3] {
+    // Apple GPUs report 1024 and 32 across every family the arm64 pathway
+    // targets, and the Metal backend serves an Apple GPU to an Apple guest.
+    #[cfg(not(feature = "backend-vulkan"))]
+    let (max_total_threads, thread_execution_width) = (1024, 32);
+    #[cfg(feature = "backend-vulkan")]
+    let (max_total_threads, thread_execution_width) =
+        crate::backend::vulkan::engine::compute_threadgroup_limits();
+    [
+        (COMPUTE_INFO_KEY_MAX_TOTAL_THREADS, max_total_threads),
+        (
+            COMPUTE_INFO_KEY_THREAD_EXECUTION_WIDTH,
+            thread_execution_width,
+        ),
+        (COMPUTE_INFO_KEY_STATIC_THREADGROUP_MEMORY, 0),
+    ]
+}
 
 /// Child `CmdGetComputeInfo` (0x3b): 24B payload
 /// `[task_id@0][pipeline_ref@4][max_key@8][count@12][reply_gva@16]`.
@@ -443,7 +473,7 @@ fn reply_compute_info<H: HostMemory + HostOps>(
         return false;
     };
     let mut wrote = 0u32;
-    for &(key, value) in COMPUTE_INFO_CAPS {
+    for (key, value) in compute_info_caps() {
         if key > max_key {
             continue;
         }

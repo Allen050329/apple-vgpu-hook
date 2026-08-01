@@ -517,6 +517,27 @@ pub fn max_render_target_dimension() -> u32 {
         .unwrap_or(crate::backend::vulkan::caps::device_features::VULKAN_MIN_IMAGE_DIMENSION_2D)
 }
 
+/// `(maxTotalThreadsPerThreadgroup, threadExecutionWidth)` for this host, as
+/// the guest's `CmdGetComputeInfo` asks for them.
+///
+/// Both are device limits, so both are queried. Before a device is resolved
+/// the answer is the Vulkan 1.2 required minimum and a single lane — the pair
+/// no dispatch can be oversized against.
+pub fn compute_threadgroup_limits() -> (u32, u32) {
+    use crate::backend::vulkan::caps::device_features::VULKAN_MIN_COMPUTE_WORKGROUP_INVOCATIONS;
+    lock_engine()
+        .owner
+        .ctx
+        .as_ref()
+        .map(|ctx| {
+            (
+                ctx.features.max_compute_workgroup_invocations,
+                ctx.features.subgroup_size,
+            )
+        })
+        .unwrap_or((VULKAN_MIN_COMPUTE_WORKGROUP_INVOCATIONS, 1))
+}
+
 /// Pin a content-ready resident render target against LRU eviction (deferred
 /// render Store — the GPU image is the only copy until flush-on-access lands
 /// it in guest pages). Returns false when the identity is absent or not

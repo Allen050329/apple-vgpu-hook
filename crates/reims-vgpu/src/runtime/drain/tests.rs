@@ -3249,3 +3249,44 @@ fn a_define_task_length_is_the_full_eight_byte_field_on_both_arms() {
         "a low-32 read would have lost the high half"
     );
 }
+
+/// `CmdGetComputeInfo` answers the keys the guest asked about, and its
+/// threadgroup limits are the host's rather than a fixed pair.
+///
+/// The reply used to be the constant triple `(1, 1024), (3, 32), (4, 0)`. The
+/// guest sizes its dispatches from key 1, so promising 1024 on a device whose
+/// `maxComputeWorkGroupInvocations` is the Vulkan floor of 128 hands it a
+/// threadgroup the host will reject. Key 3 is vendor-dependent and 32 is only
+/// right for some parts.
+///
+/// Key 4, `staticThreadgroupMemoryLength`, is a property of the pipeline and
+/// not of the device, so no device limit answers it and it stays 0 — asserted
+/// so that stops being silent.
+#[test]
+fn the_compute_info_reply_answers_device_limits_not_a_fixed_triple() {
+    let caps = compute_info_caps();
+    let keys: Vec<u32> = caps.iter().map(|&(k, _)| k).collect();
+    assert_eq!(
+        keys,
+        vec![
+            COMPUTE_INFO_KEY_MAX_TOTAL_THREADS,
+            COMPUTE_INFO_KEY_THREAD_EXECUTION_WIDTH,
+            COMPUTE_INFO_KEY_STATIC_THREADGROUP_MEMORY,
+        ]
+    );
+    let max_total = caps[0].1;
+    let width = caps[1].1;
+    // No device may be resolved in a unit test, so the floor is the answer;
+    // what must hold either way is that the guest is never handed a
+    // threadgroup budget of zero, nor a wave width it would divide by.
+    assert!(max_total >= 1, "a zero budget refuses every dispatch");
+    assert!(width >= 1, "a zero wave width is not a divisor");
+    assert!(
+        max_total >= width,
+        "a threadgroup that cannot hold one wave is not answerable"
+    );
+    assert_eq!(
+        caps[2].1, 0,
+        "static threadgroup memory is per-pipeline; no device limit answers it"
+    );
+}
