@@ -353,7 +353,7 @@ pub fn capture_present_frame(
     state.present.frame_valid = true;
     // Force the next host paint to blit +0x188. Early pre-boundary paints may
     // have latched painted_mapping/generation (live type-11 paint_mapping or
-    // paint_efi) to the same mid+gen; with encode_pending=false that made
+    // paint_efi_console) to the same mid+gen; with encode_pending=false that made
     // copy_to_bgra8 return Unchanged and left the QEMU console on frozen EFI
     // while +0x188 held logo+pill (live serial-20260715-054015:
     // present_capture rgb_nz≈6k then present_paint Unchanged only).
@@ -553,7 +553,7 @@ pub fn copy_to_bgra8<M: HostMemory + crate::runtime::host::HostOps>(
         state.present.painted_mapping = mapping_id;
         state.present.painted_generation = expected_generation;
         ScanoutCopyResult::Painted
-    } else if paint_efi(state, host, dst, dst_stride, width, height) {
+    } else if paint_efi_console(state, host, dst, dst_stride, width, height) {
         // EFI/BAR1 fallback fills the console for early verbose boot only.
         // Do **not** latch painted_mapping/generation to the product mid —
         // that made post-capture Unchanged skip +0x188 (logo/pill retain)
@@ -625,17 +625,6 @@ pub fn paint_efi_console<M: HostMemory>(
         }
     }
     true
-}
-
-fn paint_efi<M: HostMemory>(
-    state: &DeviceState,
-    host: &M,
-    dst: &mut [u8],
-    dst_stride: u32,
-    width: u32,
-    height: u32,
-) -> bool {
-    paint_efi_console(state, host, dst, dst_stride, width, height)
 }
 
 /// Why a console capture paint produced no pixels.

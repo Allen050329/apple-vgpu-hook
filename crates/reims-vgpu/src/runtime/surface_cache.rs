@@ -842,58 +842,15 @@ fn cache_levels(state: &DeviceState) -> (CacheLevel, CacheLevel, CacheLevel) {
     )
 }
 
-/// Why the GVA-keyed entries could not be served. Returns
-/// `(dead_task, no_backing)`.
-///
-/// [`cache_levels`] answers "how big"; this answers "how much of it is dead",
-/// which is the question an eviction rule has to be designed against. Splitting
-/// the two reasons matters because they imply different rules:
-///
-/// - **`dead_task`** — the entry's [`crate::model::GvaBacking`] names a task
-///   that is no longer active. A GVA is only a name in some task's page table,
-///   so once that table is gone the key cannot be matched again by anything.
-///   These are unservable by construction, and evicting them is the one rule
-///   that provably cannot take content a later sample wanted — which is the bar,
-///   given this cache is deliberately retained across Unmap for the wallpaper
-///   class.
-/// - **`no_backing`** — no backing was recorded, so this witness cannot say
-///   anything about the entry either way. Counted separately rather than folded
-///   into either side: an unknown is not a confirmed-dead, and a gauge that
-///   guessed would be the failure direction that reads as a finding.
-///
-/// A third figure used to ride along here: the bytes the recorded page lists
-/// themselves cost, ~16 KiB per 4K entry. It is gone with the lists — a gauge
-/// whose subject was its own overhead, reporting on state kept for no other
-/// reader. See [`crate::model::GvaBacking`].
-///
-/// Measure-only, like everything else here.
-fn gva_cache_staleness(state: &DeviceState) -> (u64, u64) {
-    let mut dead_task = 0;
-    let mut no_backing = 0;
-    for entry in state.host_gva_surfaces.values() {
-        let Some(backing) = entry.backing.as_ref() else {
-            no_backing += 1;
-            continue;
-        };
-        // Same liveness test `type4_pages_witness` applies before trusting a
-        // walk: present in the table AND flagged active.
-        let live = state
-            .tasks
-            .get(backing.task_id as usize)
-            .is_some_and(|t| t.active);
-        if !live {
-            dead_task += 1;
-        }
-    }
-    (dead_task, no_backing)
-}
 
 /// GVA-keyed entries whose key no longer translates to the backing the pixels
 /// were produced from. Returns `(moved, unmapped, checked)`.
 ///
-/// The successor probe to [`gva_cache_staleness`], which measured that **every**
-/// accumulated entry belongs to a live task — so task death cannot be the
-/// eviction rule, and the question moves to the backing itself.
+/// This replaced a `gva_cache_staleness` probe that counted dead-task and
+/// unbacked entries. Both of its fields read zero on every census line of
+/// every boot — 0 of 331 recorded at `model/state.rs`, and 0 across all 151
+/// lines of a later driven boot — so task death cannot be the eviction rule
+/// and the question moved to the backing itself. Do not reintroduce it.
 ///
 /// A `GVA` is only a name for whatever the owning task's page table points it at
 /// now. `GvaBacking::gpas` records what it pointed at when the pixels were
@@ -1025,7 +982,6 @@ pub fn note_cache_levels<H: HostMemory>(state: &DeviceState, host: &H) {
     {
         return;
     }
-    let (dead_task, no_backing) = gva_cache_staleness(state);
     let (moved, unmapped, checked) = gva_backing_moved(state, host);
     // `gva_cap_*` are the only running totals on this line — the eviction
     // witness accumulates for the life of the device, where every other field
@@ -1041,7 +997,6 @@ pub fn note_cache_levels<H: HostMemory>(state: &DeviceState, host: &H) {
         "host_cache_levels (levels, not per-interval) total_bytes={total} peak_bytes={peak} \
          surfaces={} surface_bytes={} surface_largest={} \
          gva={} gva_bytes={} gva_largest={} \
-         gva_dead_task={dead_task} gva_no_backing={no_backing} \
          gva_backing_moved={moved} gva_backing_unmapped={unmapped} \
          gva_backing_checked={checked} \
          gva_cap_bytes={} gva_cap_drift={cap_drift} \
@@ -1117,34 +1072,6 @@ mod tests {
         assert_eq!(checked, 3);
     }
 
-    /// The staleness split has to distinguish "provably unservable" from
-    /// "cannot tell", because only the first is safe to evict from a cache that
-    /// is deliberately retained across Unmap.
-    #[test]
-    fn the_staleness_gauge_separates_a_dead_task_from_an_unknown() {
-        use crate::model::GvaBacking;
-        let mut st = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        st.tasks[3].active = true;
-
-        // Entry with no backing recorded: unknown, not dead.
-        store_gva(&mut st, 0x1000, 2, 2, vec![0u8; 2 * 2 * 4]);
-        // Entry backed by the live task 3.
-        store_gva(&mut st, 0x2000, 2, 2, vec![0u8; 2 * 2 * 4]);
-        st.host_gva_surfaces.get_mut(&0x2000).unwrap().backing = Some(GvaBacking {
-            task_id: 3,
-            first_gpa: 0xaa000,
-        });
-        // Entry backed by task 4, which is not active.
-        store_gva(&mut st, 0x3000, 2, 2, vec![0u8; 2 * 2 * 4]);
-        st.host_gva_surfaces.get_mut(&0x3000).unwrap().backing = Some(GvaBacking {
-            task_id: 4,
-            first_gpa: 0xcc000,
-        });
-
-        let (dead_task, no_backing) = gva_cache_staleness(&st);
-        assert_eq!(dead_task, 1, "only the inactive-task entry is dead");
-        assert_eq!(no_backing, 1, "the unbacked entry is unknown, not dead");
-    }
 
     /// The gauge has to separate the two shapes a growing cache can take, or it
     /// cannot tell "many small surfaces" from "a few 4K ones" — which is the
