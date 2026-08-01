@@ -77,6 +77,63 @@ fn inc_comp_spirv() -> Option<Vec<u32>> {
     )
 }
 
+/// The one storage-image kernel every write test in this file uses:
+/// `imageStore(img, ivec2(gid.xy), vec4(1,0,0,1))` over a 1x1x1 local size,
+/// with the image's SPIR-V storage format left to the caller.
+///
+/// Six tests carried byte-identical copies of this assembly that differed only
+/// in that one token — `Rgba8` for the native-format cases, `Unknown` for the
+/// BGRA view, which SPIR-V has no storage format for. Parameterising the token
+/// is what keeps a change to the kernel from having to be made six times.
+///
+/// `compute_storage_image_r16float_if_supported` deliberately does not use this
+/// and keeps its own copy: R16f needs `OpCapability
+/// StorageImageExtendedFormats` and drops the `NonReadable` decoration, so it
+/// is a different kernel rather than a different format.
+fn storage_image_write_red_kernel(spirv_image_format: &str) -> String {
+    KERNEL_TEMPLATE.replace("{FMT}", spirv_image_format)
+}
+
+const KERNEL_TEMPLATE: &str = r#"
+               OpCapability Shader
+               OpCapability StorageImageWriteWithoutFormat
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint GLCompute %main "main" %gid %img
+               OpExecutionMode %main LocalSize 1 1 1
+               OpDecorate %gid BuiltIn GlobalInvocationId
+               OpDecorate %img DescriptorSet 0
+               OpDecorate %img Binding 0
+               OpDecorate %img NonReadable
+       %void = OpTypeVoid
+       %uint = OpTypeInt 32 0
+        %int = OpTypeInt 32 1
+      %float = OpTypeFloat 32
+     %v3uint = OpTypeVector %uint 3
+      %v2int = OpTypeVector %int 2
+    %v4float = OpTypeVector %float 4
+    %float_1 = OpConstant %float 1
+    %float_0 = OpConstant %float 0
+     %red = OpConstantComposite %v4float %float_1 %float_0 %float_0 %float_1
+%img_ty = OpTypeImage %float 2D 0 0 0 2 {FMT}
+%_ptr_img = OpTypePointer UniformConstant %img_ty
+        %img = OpVariable %_ptr_img UniformConstant
+%_ptr_Input_v3uint = OpTypePointer Input %v3uint
+        %gid = OpVariable %_ptr_Input_v3uint Input
+    %fn_type = OpTypeFunction %void
+       %main = OpFunction %void None %fn_type
+      %entry = OpLabel
+    %gid_val = OpLoad %v3uint %gid
+          %x = OpCompositeExtract %uint %gid_val 0
+          %y = OpCompositeExtract %uint %gid_val 1
+         %xi = OpBitcast %int %x
+         %yi = OpBitcast %int %y
+       %coord = OpCompositeConstruct %v2int %xi %yi
+      %img_l = OpLoad %img_ty %img
+               OpImageWrite %img_l %coord %red
+               OpReturn
+               OpFunctionEnd
+"#;
+
 fn assemble_spvasm(asm: &str, name: &str) -> Option<Vec<u32>> {
     let asm_path = std::env::temp_dir().join(format!(
         "paravirt_engine_{}_{}.spvasm",
@@ -319,45 +376,7 @@ fn compute_2d_grid_tiles_global_invocation_xy() {
 fn compute_storage_image_rgba8unorm_known_result() {
     let _g = engine_test_session();
     // Kernel: imageStore(out, ivec2(gid.xy), vec4(1,0,0,1)) for 4x4 Rgba8Unorm.
-    let spvasm = r#"
-               OpCapability Shader
-               OpCapability StorageImageWriteWithoutFormat
-               OpMemoryModel Logical GLSL450
-               OpEntryPoint GLCompute %main "main" %gid %img
-               OpExecutionMode %main LocalSize 1 1 1
-               OpDecorate %gid BuiltIn GlobalInvocationId
-               OpDecorate %img DescriptorSet 0
-               OpDecorate %img Binding 0
-               OpDecorate %img NonReadable
-       %void = OpTypeVoid
-       %uint = OpTypeInt 32 0
-        %int = OpTypeInt 32 1
-      %float = OpTypeFloat 32
-     %v3uint = OpTypeVector %uint 3
-      %v2int = OpTypeVector %int 2
-    %v4float = OpTypeVector %float 4
-    %float_1 = OpConstant %float 1
-    %float_0 = OpConstant %float 0
-     %red = OpConstantComposite %v4float %float_1 %float_0 %float_0 %float_1
-%img_ty = OpTypeImage %float 2D 0 0 0 2 Rgba8
-%_ptr_img = OpTypePointer UniformConstant %img_ty
-        %img = OpVariable %_ptr_img UniformConstant
-%_ptr_Input_v3uint = OpTypePointer Input %v3uint
-        %gid = OpVariable %_ptr_Input_v3uint Input
-    %fn_type = OpTypeFunction %void
-       %main = OpFunction %void None %fn_type
-      %entry = OpLabel
-    %gid_val = OpLoad %v3uint %gid
-          %x = OpCompositeExtract %uint %gid_val 0
-          %y = OpCompositeExtract %uint %gid_val 1
-         %xi = OpBitcast %int %x
-         %yi = OpBitcast %int %y
-       %coord = OpCompositeConstruct %v2int %xi %yi
-      %img_l = OpLoad %img_ty %img
-               OpImageWrite %img_l %coord %red
-               OpReturn
-               OpFunctionEnd
-"#;
+    let spvasm = &storage_image_write_red_kernel("Rgba8");
     let Some(words) = assemble_spvasm(spvasm, "simg_rgba8") else {
         return;
     };
@@ -501,45 +520,7 @@ fn compute_storage_image_bgra8unorm_is_not_channel_swapped() {
     // Kernel: imageStore(out, gid.xy, vec4(1,0,0,1)) into an Unknown-format
     // storage image — the only SPIR-V form compatible with a B8G8R8A8_UNORM
     // view (SPIR-V has no `Bgra8` storage format).
-    let spvasm = r#"
-               OpCapability Shader
-               OpCapability StorageImageWriteWithoutFormat
-               OpMemoryModel Logical GLSL450
-               OpEntryPoint GLCompute %main "main" %gid %img
-               OpExecutionMode %main LocalSize 1 1 1
-               OpDecorate %gid BuiltIn GlobalInvocationId
-               OpDecorate %img DescriptorSet 0
-               OpDecorate %img Binding 0
-               OpDecorate %img NonReadable
-       %void = OpTypeVoid
-       %uint = OpTypeInt 32 0
-        %int = OpTypeInt 32 1
-      %float = OpTypeFloat 32
-     %v3uint = OpTypeVector %uint 3
-      %v2int = OpTypeVector %int 2
-    %v4float = OpTypeVector %float 4
-    %float_1 = OpConstant %float 1
-    %float_0 = OpConstant %float 0
-     %red = OpConstantComposite %v4float %float_1 %float_0 %float_0 %float_1
-%img_ty = OpTypeImage %float 2D 0 0 0 2 Unknown
-%_ptr_img = OpTypePointer UniformConstant %img_ty
-        %img = OpVariable %_ptr_img UniformConstant
-%_ptr_Input_v3uint = OpTypePointer Input %v3uint
-        %gid = OpVariable %_ptr_Input_v3uint Input
-    %fn_type = OpTypeFunction %void
-       %main = OpFunction %void None %fn_type
-      %entry = OpLabel
-    %gid_val = OpLoad %v3uint %gid
-          %x = OpCompositeExtract %uint %gid_val 0
-          %y = OpCompositeExtract %uint %gid_val 1
-         %xi = OpBitcast %int %x
-         %yi = OpBitcast %int %y
-       %coord = OpCompositeConstruct %v2int %xi %yi
-      %img_l = OpLoad %img_ty %img
-               OpImageWrite %img_l %coord %red
-               OpReturn
-               OpFunctionEnd
-"#;
+    let spvasm = &storage_image_write_red_kernel("Unknown");
     let Some(words) = assemble_spvasm(spvasm, "simg_bgra8") else {
         return;
     };
@@ -603,45 +584,7 @@ fn compute_storage_image_bgra8unorm_is_not_channel_swapped() {
 fn compute_storage_image_seed_skip_and_lost_resident() {
     let _g = engine_test_session();
     // Same red-fill kernel as compute_storage_image_rgba8unorm_known_result.
-    let spvasm = r#"
-               OpCapability Shader
-               OpCapability StorageImageWriteWithoutFormat
-               OpMemoryModel Logical GLSL450
-               OpEntryPoint GLCompute %main "main" %gid %img
-               OpExecutionMode %main LocalSize 1 1 1
-               OpDecorate %gid BuiltIn GlobalInvocationId
-               OpDecorate %img DescriptorSet 0
-               OpDecorate %img Binding 0
-               OpDecorate %img NonReadable
-       %void = OpTypeVoid
-       %uint = OpTypeInt 32 0
-        %int = OpTypeInt 32 1
-      %float = OpTypeFloat 32
-     %v3uint = OpTypeVector %uint 3
-      %v2int = OpTypeVector %int 2
-    %v4float = OpTypeVector %float 4
-    %float_1 = OpConstant %float 1
-    %float_0 = OpConstant %float 0
-     %red = OpConstantComposite %v4float %float_1 %float_0 %float_0 %float_1
-%img_ty = OpTypeImage %float 2D 0 0 0 2 Rgba8
-%_ptr_img = OpTypePointer UniformConstant %img_ty
-        %img = OpVariable %_ptr_img UniformConstant
-%_ptr_Input_v3uint = OpTypePointer Input %v3uint
-        %gid = OpVariable %_ptr_Input_v3uint Input
-    %fn_type = OpTypeFunction %void
-       %main = OpFunction %void None %fn_type
-      %entry = OpLabel
-    %gid_val = OpLoad %v3uint %gid
-          %x = OpCompositeExtract %uint %gid_val 0
-          %y = OpCompositeExtract %uint %gid_val 1
-         %xi = OpBitcast %int %x
-         %yi = OpBitcast %int %y
-       %coord = OpCompositeConstruct %v2int %xi %yi
-      %img_l = OpLoad %img_ty %img
-               OpImageWrite %img_l %coord %red
-               OpReturn
-               OpFunctionEnd
-"#;
+    let spvasm = &storage_image_write_red_kernel("Rgba8");
     let Some(words) = assemble_spvasm(spvasm, "simg_seed_skip") else {
         return;
     };
@@ -724,45 +667,7 @@ fn compute_storage_image_seed_skip_and_lost_resident() {
 fn compute_storage_image_deferred_readback_and_flush_read() {
     let _g = engine_test_session();
     // Same red-fill kernel as compute_storage_image_seed_skip_and_lost_resident.
-    let spvasm = r#"
-               OpCapability Shader
-               OpCapability StorageImageWriteWithoutFormat
-               OpMemoryModel Logical GLSL450
-               OpEntryPoint GLCompute %main "main" %gid %img
-               OpExecutionMode %main LocalSize 1 1 1
-               OpDecorate %gid BuiltIn GlobalInvocationId
-               OpDecorate %img DescriptorSet 0
-               OpDecorate %img Binding 0
-               OpDecorate %img NonReadable
-       %void = OpTypeVoid
-       %uint = OpTypeInt 32 0
-        %int = OpTypeInt 32 1
-      %float = OpTypeFloat 32
-     %v3uint = OpTypeVector %uint 3
-      %v2int = OpTypeVector %int 2
-    %v4float = OpTypeVector %float 4
-    %float_1 = OpConstant %float 1
-    %float_0 = OpConstant %float 0
-     %red = OpConstantComposite %v4float %float_1 %float_0 %float_0 %float_1
-%img_ty = OpTypeImage %float 2D 0 0 0 2 Rgba8
-%_ptr_img = OpTypePointer UniformConstant %img_ty
-        %img = OpVariable %_ptr_img UniformConstant
-%_ptr_Input_v3uint = OpTypePointer Input %v3uint
-        %gid = OpVariable %_ptr_Input_v3uint Input
-    %fn_type = OpTypeFunction %void
-       %main = OpFunction %void None %fn_type
-      %entry = OpLabel
-    %gid_val = OpLoad %v3uint %gid
-          %x = OpCompositeExtract %uint %gid_val 0
-          %y = OpCompositeExtract %uint %gid_val 1
-         %xi = OpBitcast %int %x
-         %yi = OpBitcast %int %y
-       %coord = OpCompositeConstruct %v2int %xi %yi
-      %img_l = OpLoad %img_ty %img
-               OpImageWrite %img_l %coord %red
-               OpReturn
-               OpFunctionEnd
-"#;
+    let spvasm = &storage_image_write_red_kernel("Rgba8");
     let Some(words) = assemble_spvasm(spvasm, "deferred_wb_fill") else {
         return;
     };
@@ -878,45 +783,7 @@ fn compute_storage_image_deferred_readback_and_flush_read() {
 fn compute_sampled_resident_copy_and_lost_resident() {
     let _g = engine_test_session();
     // Same red-fill kernel as compute_storage_image_seed_skip_and_lost_resident.
-    let fill_spvasm = r#"
-               OpCapability Shader
-               OpCapability StorageImageWriteWithoutFormat
-               OpMemoryModel Logical GLSL450
-               OpEntryPoint GLCompute %main "main" %gid %img
-               OpExecutionMode %main LocalSize 1 1 1
-               OpDecorate %gid BuiltIn GlobalInvocationId
-               OpDecorate %img DescriptorSet 0
-               OpDecorate %img Binding 0
-               OpDecorate %img NonReadable
-       %void = OpTypeVoid
-       %uint = OpTypeInt 32 0
-        %int = OpTypeInt 32 1
-      %float = OpTypeFloat 32
-     %v3uint = OpTypeVector %uint 3
-      %v2int = OpTypeVector %int 2
-    %v4float = OpTypeVector %float 4
-    %float_1 = OpConstant %float 1
-    %float_0 = OpConstant %float 0
-     %red = OpConstantComposite %v4float %float_1 %float_0 %float_0 %float_1
-%img_ty = OpTypeImage %float 2D 0 0 0 2 Rgba8
-%_ptr_img = OpTypePointer UniformConstant %img_ty
-        %img = OpVariable %_ptr_img UniformConstant
-%_ptr_Input_v3uint = OpTypePointer Input %v3uint
-        %gid = OpVariable %_ptr_Input_v3uint Input
-    %fn_type = OpTypeFunction %void
-       %main = OpFunction %void None %fn_type
-      %entry = OpLabel
-    %gid_val = OpLoad %v3uint %gid
-          %x = OpCompositeExtract %uint %gid_val 0
-          %y = OpCompositeExtract %uint %gid_val 1
-         %xi = OpBitcast %int %x
-         %yi = OpBitcast %int %y
-       %coord = OpCompositeConstruct %v2int %xi %yi
-      %img_l = OpLoad %img_ty %img
-               OpImageWrite %img_l %coord %red
-               OpReturn
-               OpFunctionEnd
-"#;
+    let fill_spvasm = &storage_image_write_red_kernel("Rgba8");
     // Same fetch-to-buffer kernel shape as
     // compute_sampled_image_fetch_preserves_float_bits (binding 32 sampled,
     // binding 0 storage buffer, fetches texel (0,0)).
@@ -1103,45 +970,7 @@ fn compute_sampled_resident_copy_and_lost_resident() {
 fn compute_linear_resident_deferred_chain() {
     let _g = engine_test_session();
     // Same red-fill + fetch kernels as compute_sampled_resident_copy_and_lost_resident.
-    let fill_spvasm = r#"
-               OpCapability Shader
-               OpCapability StorageImageWriteWithoutFormat
-               OpMemoryModel Logical GLSL450
-               OpEntryPoint GLCompute %main "main" %gid %img
-               OpExecutionMode %main LocalSize 1 1 1
-               OpDecorate %gid BuiltIn GlobalInvocationId
-               OpDecorate %img DescriptorSet 0
-               OpDecorate %img Binding 0
-               OpDecorate %img NonReadable
-       %void = OpTypeVoid
-       %uint = OpTypeInt 32 0
-        %int = OpTypeInt 32 1
-      %float = OpTypeFloat 32
-     %v3uint = OpTypeVector %uint 3
-      %v2int = OpTypeVector %int 2
-    %v4float = OpTypeVector %float 4
-    %float_1 = OpConstant %float 1
-    %float_0 = OpConstant %float 0
-     %red = OpConstantComposite %v4float %float_1 %float_0 %float_0 %float_1
-%img_ty = OpTypeImage %float 2D 0 0 0 2 Rgba8
-%_ptr_img = OpTypePointer UniformConstant %img_ty
-        %img = OpVariable %_ptr_img UniformConstant
-%_ptr_Input_v3uint = OpTypePointer Input %v3uint
-        %gid = OpVariable %_ptr_Input_v3uint Input
-    %fn_type = OpTypeFunction %void
-       %main = OpFunction %void None %fn_type
-      %entry = OpLabel
-    %gid_val = OpLoad %v3uint %gid
-          %x = OpCompositeExtract %uint %gid_val 0
-          %y = OpCompositeExtract %uint %gid_val 1
-         %xi = OpBitcast %int %x
-         %yi = OpBitcast %int %y
-       %coord = OpCompositeConstruct %v2int %xi %yi
-      %img_l = OpLoad %img_ty %img
-               OpImageWrite %img_l %coord %red
-               OpReturn
-               OpFunctionEnd
-"#;
+    let fill_spvasm = &storage_image_write_red_kernel("Rgba8");
     let fetch_spvasm = r#"
                OpCapability Shader
                OpMemoryModel Logical GLSL450
