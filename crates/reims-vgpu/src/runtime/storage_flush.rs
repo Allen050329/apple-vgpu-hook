@@ -752,6 +752,32 @@ pub fn flush_linear_windows_before_fence<M: HostMemory + HostOps>(
 /// why Apple's device has neither this rail nor this cost. That is a backend
 /// allocation change, not a scheduling one.
 ///
+/// # What this costs, measured
+///
+/// It is the single largest cost in the device. On a driven x86 boot (Safari
+/// WebGL, 120 Hz) `flush_rails` reads `render_us=688003 render=100` with the
+/// gva, linear and storage rails all at zero: **69% of the drain worker's
+/// entire second**, against 21% for draws. `readback_split` divides each 6.9 ms
+/// flush into submit 7 µs, fence 3.04 ms, staging memcpy 0.83 ms and guest-page
+/// write 2.68 ms.
+///
+/// All of it is speculative. In the same second `mapw_fence_flush` equals
+/// `surface_flush` exactly (104 = 104), so **every flush is this fence and none
+/// is a guest demand** — [`flush_mapping_for_guest_read`], the
+/// `SynchronizeResources` path that fires when the guest actually declares a CPU
+/// read, contributes nothing while driving.
+///
+/// That is not licence to drop the writeback. The guest has been observed
+/// CPU-reading pages it never declared (the black-wallpaper fade snapshot named
+/// in [`flush_mapping_for_guest_read`]), which is why this fence exists, and
+/// after the completion stamp the pages may belong to something else entirely.
+/// "Write now or never write" is the real choice and this side of it is the safe
+/// one. What the numbers argue for is not flushing less often but not needing to
+/// flush at all — the zero-copy endgame above — with the async-readback split
+/// (release the device lock across the 3.04 ms fence wait, which currently
+/// blocks guest doorbells 105 times a second for nothing) as the step that does
+/// not require it.
+///
 /// # Ordering
 ///
 /// Render windows first in arm order, then whatever remains, and both through
