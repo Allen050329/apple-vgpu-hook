@@ -1,0 +1,120 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>probe: starting</title></head>
+<body style="margin:0;background:#111;color:#eee;font:13px monospace">
+<pre id="out">running…</pre>
+<canvas id="c" width="512" height="512" style="width:256px;height:256px"></canvas>
+<script>
+// Reports which of WebGL1 / WebGL2 / WebGPU actually come up, what renderer is
+// behind each, and how many frames a trivial animated draw sustains.
+//
+// The result is written to document.title as well as to the page, because Safari
+// exposes no debugging protocol here: AppleScript can read a document's name
+// without the "Allow JavaScript from Apple Events" setting, so the title is the
+// only channel that works in all three browsers.
+//
+// The draw loop is deliberately trivial (one clear + one triangle). It is
+// measuring the presentation path, not shader throughput; anything heavier
+// would confound "the compositor drops frames" with "the GPU is busy".
+const lines = [];
+const say = (s) => { lines.push(s); document.getElementById('out').textContent = lines.join('\n'); };
+
+function rendererOf(gl) {
+  if (!gl) return null;
+  const dbg = gl.getExtension('WEBGL_debug_renderer_info');
+  return {
+    vendor: dbg ? gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL) : gl.getParameter(gl.VENDOR),
+    renderer: dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER),
+    version: gl.getParameter(gl.VERSION),
+    maxTexture: gl.getParameter(gl.MAX_TEXTURE_SIZE),
+  };
+}
+
+const canvas = document.getElementById('c');
+const results = { webgl1: null, webgl2: null, webgpu: null, fps: null };
+
+// WebGL contexts are probed on throwaway canvases so the visible canvas stays
+// free for whichever API is used to measure frame rate.
+for (const [key, name] of [['webgl1', 'webgl'], ['webgl2', 'webgl2']]) {
+  try {
+    const t = document.createElement('canvas');
+    const gl = t.getContext(name, { failIfMajorPerformanceCaveat: false });
+    results[key] = gl ? rendererOf(gl) : 'NOT_AVAILABLE';
+  } catch (e) { results[key] = 'THREW: ' + e.message; }
+}
+say('webgl1:  ' + JSON.stringify(results.webgl1));
+say('webgl2:  ' + JSON.stringify(results.webgl2));
+
+// `failIfMajorPerformanceCaveat: true` is the direct question "is this a
+// software renderer?" — a browser that fell back to software refuses the
+// context outright rather than reporting it in a string.
+try {
+  const t = document.createElement('canvas');
+  results.noCaveat = !!t.getContext('webgl', { failIfMajorPerformanceCaveat: true });
+} catch (e) { results.noCaveat = false; }
+say('hardware(no perf caveat): ' + results.noCaveat);
+
+async function probeWebGPU() {
+  if (!navigator.gpu) return 'NO_navigator.gpu';
+  try {
+    const adapter = await navigator.gpu.requestAdapter();
+    if (!adapter) return 'NO_ADAPTER';
+    const info = adapter.info || (adapter.requestAdapterInfo ? await adapter.requestAdapterInfo() : {});
+    const dev = await adapter.requestDevice();
+    return {
+      vendor: info.vendor, architecture: info.architecture,
+      device: info.device, description: info.description,
+      hasDevice: !!dev,
+      features: dev ? [...dev.features].slice(0, 12) : [],
+    };
+  } catch (e) { return 'THREW: ' + e.message; }
+}
+
+function measureFps(seconds) {
+  return new Promise((resolve) => {
+    const gl = canvas.getContext('webgl2') || canvas.getContext('webgl');
+    let frames = 0, worst = 0, last = performance.now();
+    const t0 = last;
+    const step = () => {
+      const now = performance.now();
+      const dt = now - last; last = now;
+      if (frames > 2) worst = Math.max(worst, dt);
+      frames++;
+      if (gl) {
+        gl.viewport(0, 0, canvas.width, canvas.height);
+        gl.clearColor((frames % 60) / 60, 0.2, 0.6, 1);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+      }
+      if (now - t0 < seconds * 1000) requestAnimationFrame(step);
+      else resolve({ fps: +(frames / ((now - t0) / 1000)).toFixed(1),
+                     worst_frame_ms: +worst.toFixed(1), frames });
+    };
+    requestAnimationFrame(step);
+  });
+}
+
+(async () => {
+  results.webgpu = await probeWebGPU();
+  say('webgpu:  ' + JSON.stringify(results.webgpu));
+  results.fps = await measureFps(5);
+  say('fps:     ' + JSON.stringify(results.fps));
+  const r1 = results.webgl1 && results.webgl1.renderer ? results.webgl1.renderer : String(results.webgl1);
+  const wg = typeof results.webgpu === 'string' ? results.webgpu : 'OK';
+  document.title = 'probe: gl=' + r1 + ' | hw=' + results.noCaveat +
+                   ' | webgpu=' + wg + ' | fps=' + results.fps.fps +
+                   ' | worst=' + results.fps.worst_frame_ms + 'ms';
+  window.__probe = results;
+  // Safari exposes no debugging protocol and AppleScript automation needs a
+  // consent click, so the page posts its own result back to the server that
+  // served it. Same-origin, so no permission is involved.
+  try {
+    await fetch('/report', {
+      method: 'POST',
+      body: JSON.stringify({ ua: navigator.userAgent, results }),
+    });
+  } catch (e) { say('report failed: ' + e.message); }
+  say('DONE');
+})();
+</script>
+</body>
+</html>
