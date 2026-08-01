@@ -982,6 +982,35 @@ impl App {
             self.draw_engine_window();
             return;
         }
+        // Everything past this point is the `VkState` presenter: its own
+        // swapchain, its own blit, its own resize handling — several hundred
+        // lines that only run when `attach_engine_present` failed in
+        // `resumed()`, which is the host-without-a-working-engine case.
+        //
+        // **Measured zero.** A driven x86/Vulkan boot (Chess, Maps, the WebGL
+        // aquarium, Wikipedia, apple.com) never reached this line, while
+        // `host_window_direct_present path=engine_resident status=live` fired
+        // and the `host_window_engine_attach` decline fired zero times across
+        // two boots — the engine attaches, so this rail never draws.
+        //
+        // That is *not* a licence to delete it. It is the fallback for an
+        // attach failure, and an attach failure on a host this one has not
+        // seen would then have no presenter at all. What the reading licenses
+        // is the opposite question: if `host_window_engine_attach` can be shown
+        // never to decline on any supported host, this rail has no reason to
+        // exist. That needs a host where the engine legitimately fails.
+        //
+        // Latched — a per-redraw line would flood.
+        {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static SAID: AtomicBool = AtomicBool::new(false);
+            if !SAID.swap(true, Ordering::Relaxed) {
+                crate::observe::off(format!(
+                    "host_window_vk_presenter reason=engine_not_attached vk={}",
+                    self.vk.is_some() as u8
+                ));
+            }
+        }
         #[cfg(not(target_os = "macos"))]
         let Some(vk) = self.vk.as_mut() else {
             return;
