@@ -199,6 +199,17 @@ pub(crate) fn classify_slate(
 /// mapping the compositor has cleared but never rendered into, and the frames
 /// after a device reset. Without it those presents would show slate, which on
 /// Linux would be a blank window for the whole of early boot.
+///
+/// Measured on x86/Vulkan, and the numbers say exactly that and no more. Once
+/// the guest is compositing, `host_window_cadence` reports `direct_frac=1.00`
+/// across every sampling window of a driven Safari session — every present
+/// comes from a resident and this path carries none of them. Before that, one
+/// boot logged a single `slate_no_source` run of 358 frames with `covered=1`,
+/// which is this path holding the window through firmware boot and then handing
+/// over.
+///
+/// So it is boot-scope, not dead: a reader who deletes it because steady-state
+/// traffic is zero blanks the window for the first several hundred frames.
 #[derive(Clone, Copy, Debug)]
 pub struct WindowCpuFrame<'a> {
     pub bgra: &'a [u8],
