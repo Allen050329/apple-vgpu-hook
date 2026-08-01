@@ -1913,6 +1913,42 @@ fn the_readback_split_divides_a_round_trip_from_the_bytes_it_carried() {
     assert!(c.take_readback_split().is_none(), "the window must reset");
 }
 
+/// The offer side of the window cadence needs its own census, because the
+/// present side cannot see a frame that never arrived.
+///
+/// `host_window_cadence` reads `presents == offered` with `busy_acquire=0`, so
+/// nothing downstream drops a frame; the deficit against the host's 120 Hz is
+/// entirely in the offer rate. `publish_window_frame` has three separate ways to
+/// return without offering one, and they point at unrelated fixes — `same_key`
+/// dominating means the guest's own present cadence is the ceiling, while
+/// `fresh` near the tranche rate would mean the loss is downstream of here.
+#[test]
+fn the_window_publish_census_keeps_its_three_refusals_apart() {
+    use crate::runtime::drain::{WindowPublish, WindowPublishCensus};
+    let c = WindowPublishCensus::default();
+    assert!(
+        c.take(1_000).is_none(),
+        "a window with no publish attempt must stay silent"
+    );
+
+    c.note(WindowPublish::Fresh);
+    c.note(WindowPublish::SameKey);
+    c.note(WindowPublish::SameKey);
+    c.note(WindowPublish::SameKey);
+    c.note(WindowPublish::NoFrame);
+    let line = c.take(1_000).expect("attempts must report");
+    assert!(line.contains("fresh=1"), "{line}");
+    assert!(line.contains("same_key=3"), "{line}");
+    assert!(line.contains("no_frame=1"), "{line}");
+    // Reported even at zero: a refusal class that vanishes from the line when
+    // it stops firing is one a reader cannot tell from a class that was never
+    // compiled in, and "the window is gone" reading zero is the answer that
+    // rules out a whole branch.
+    assert!(line.contains("no_window=0"), "{line}");
+
+    assert!(c.take(1_000).is_none(), "the window must reset");
+}
+
 /// A writeback must not copy a frame in order to hand back the frame it copied.
 ///
 /// The fragmented landing path staged every row into a whole-frame buffer before

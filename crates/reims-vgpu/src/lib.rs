@@ -565,22 +565,27 @@ pub fn device_window_run_main(_id: u64) -> bool {
 /// never contends the render tranche. Latest-wins.
 #[cfg(feature = "host-window")]
 fn publish_window_frame(slot: &BoundDevice, state: &mut crate::model::DeviceState) {
+    use crate::runtime::drain::{WindowPublish, note_window_publish};
     let mut guard = slot.window.lock();
     let Some(link) = guard.as_mut() else {
         // No window consumes the capture: revert the next capture to the full
         // readback path (a torn-down window must not leave `frame_bgra` stale
         // behind an unreset `display_from_resident`).
         state.present.display_from_resident = false;
+        note_window_publish(WindowPublish::NoWindow);
         return;
     };
     let p = &state.present;
     if !p.frame_valid || p.frame_width == 0 || p.frame_height == 0 {
+        note_window_publish(WindowPublish::NoFrame);
         return;
     }
     let key = window_frame_key(p);
     if key == link.last {
+        note_window_publish(WindowPublish::SameKey);
         return;
     }
+    note_window_publish(WindowPublish::Fresh);
     // Copied out rather than held behind `p`: the branches below assign
     // `state.present.display_from_resident`, and the frame bytes are the only
     // thing that still has to be read through the borrow.

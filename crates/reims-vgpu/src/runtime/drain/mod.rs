@@ -3245,6 +3245,98 @@ impl FlushRail {
     }
 }
 
+/// Why a drain tranche did or did not hand the host window a new frame.
+///
+/// With the swapchain fixed, `host_window_cadence` reads `presents == offered`
+/// with `busy_acquire=0` — the window shows every frame it is offered and drops
+/// none. So the remaining deficit is entirely in the offer rate, which was 58/s
+/// on a host panel at 120 Hz while the drain worker completed 110–132 render
+/// flushes a second and the guest sustained ~117 fps. Something between the
+/// composite and the window is halving it, and `publish_window_frame` has four
+/// separate ways to return without publishing that the cadence census cannot see
+/// from the other side.
+///
+/// The one that matters is [`SameKey`](Self::SameKey) against
+/// [`Fresh`](Self::Fresh). A large `same_key` means the guest is presenting at
+/// the offer rate and the window is being given everything there is — the
+/// deficit would then be the guest's own present cadence, not ours. `fresh` near
+/// the tranche rate with `same_key` small would mean the opposite. Those have
+/// nothing in common as fixes, which is why this is measured before either is
+/// attempted.
+///
+/// `fresh` counts a new key **reaching** the publish, not a frame landing in the
+/// window's slot: the four ways the publish itself can still fail after that
+/// point already have their own census in
+/// [`crate::runtime::census::present_proxy::window_publish`], and duplicating
+/// them here would give two counters that could disagree.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WindowPublish {
+    /// A frame key not yet published reached the publish.
+    Fresh,
+    /// No window is attached to consume a frame.
+    NoWindow,
+    /// The device holds no valid captured frame yet.
+    NoFrame,
+    /// The captured frame is the one already published — same mapping,
+    /// generation and present epoch.
+    SameKey,
+}
+
+impl WindowPublish {
+    const ALL: [WindowPublish; 4] = [
+        WindowPublish::Fresh,
+        WindowPublish::NoWindow,
+        WindowPublish::NoFrame,
+        WindowPublish::SameKey,
+    ];
+
+    const fn index(self) -> usize {
+        match self {
+            WindowPublish::Fresh => 0,
+            WindowPublish::NoWindow => 1,
+            WindowPublish::NoFrame => 2,
+            WindowPublish::SameKey => 3,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            WindowPublish::Fresh => "fresh",
+            WindowPublish::NoWindow => "no_window",
+            WindowPublish::NoFrame => "no_frame",
+            WindowPublish::SameKey => "same_key",
+        }
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct WindowPublishCensus {
+    arms: [std::sync::atomic::AtomicU64; 4],
+}
+
+impl WindowPublishCensus {
+    fn note(&self, arm: WindowPublish) {
+        self.arms[arm.index()].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn take(&self, win_ms: u64) -> Option<String> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let counts: Vec<u64> = WindowPublish::ALL
+            .iter()
+            .map(|arm| self.arms[arm.index()].swap(0, Relaxed))
+            .collect();
+        if counts.iter().all(|&n| n == 0) {
+            return None;
+        }
+        let body: String = WindowPublish::ALL
+            .iter()
+            .zip(&counts)
+            .map(|(arm, n)| format!(" {}={n}", arm.label()))
+            .collect();
+        Some(format!("window_publish win_ms={win_ms}{body}"))
+    }
+}
+
 /// The inside of [`ReadbackPhase::Write`], which is now the largest phase of the
 /// largest rail and is three full-frame passes wearing one name.
 ///
@@ -3870,6 +3962,14 @@ static RESIDENT_ARM: std::sync::LazyLock<ResidentArmCensus> =
 static SURFACE_WRITE: std::sync::LazyLock<SurfaceWriteCensus> =
     std::sync::LazyLock::new(SurfaceWriteCensus::default);
 
+static WINDOW_PUBLISH: std::sync::LazyLock<WindowPublishCensus> =
+    std::sync::LazyLock::new(WindowPublishCensus::default);
+
+/// Record how one tranche's host-window publish attempt ended.
+pub fn note_window_publish(arm: WindowPublish) {
+    WINDOW_PUBLISH.note(arm);
+}
+
 /// Attribute `us` of one surface writeback to one of its whole-frame passes.
 pub fn note_surface_write_phase(phase: SurfaceWritePhase, us: u64) {
     SURFACE_WRITE.note(phase, us);
@@ -3913,6 +4013,11 @@ pub fn note_drain_tranche(drain_us: u64, publish_us: u64) {
         // divides `flush_rails`'s `render_us`.
         if let Some(write) = SURFACE_WRITE.take(DRAIN_DUTY.last_window_ms()) {
             crate::observe::off(write);
+        }
+        // The offer side of `host_window_cadence`, which can only see the
+        // frames that reached it.
+        if let Some(publish) = WINDOW_PUBLISH.take(DRAIN_DUTY.last_window_ms()) {
+            crate::observe::off(publish);
         }
         if let Some(routes) = take_store_routes() {
             crate::observe::off(routes);
