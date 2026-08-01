@@ -533,13 +533,48 @@ fn apply_record_inner<M: HostMemory + HostOps>(
             }
             Some(execute_dispatch(state, host, task_id, &seg.acc, cmd))
         }
-        Kind::UpdateFence | Kind::WaitFence => None,
-        // Ordered no-ops at the product one-dispatch boundary.
-        Kind::BarrierResources
-        | Kind::BarrierScope
-        | Kind::UseHeaps
-        | Kind::UseResources
-        | Kind::CompressedTextureFlush => None,
+        // Five kinds the product answers by doing nothing, each counted
+        // separately. `None` here is also what every state-accumulating record
+        // above returns, so a no-op and a drop are the same silence — and these
+        // are the records where the difference matters, because unlike a
+        // `BufferBind` they carry ordering the guest expects us to honour.
+        //
+        // The barrier group is a deliberate no-op and the reason is structural:
+        // the product submits one dispatch at a time and waits, so every
+        // resource and scope barrier the guest asks for is already implied by
+        // the boundary between two records. `UseHeaps`/`UseResources` are
+        // residency hints for a driver that pages resources; we resolve every
+        // binding per dispatch, so there is nothing for them to keep resident.
+        // These counters exist to price that argument, not to doubt it — if
+        // they are large, the per-record submit is what they are the cost of.
+        //
+        // The fence pair has no such argument and never had one; it sat in the
+        // barrier group's arm without sharing its comment. An `MTLFence` update
+        // or wait inside a compute encoder is ordering the guest stated
+        // explicitly, and nothing else in the crate handles these two kinds —
+        // `fence_exec` serves the event rail, not this one. If either counter
+        // is non-zero, that is guest-stated ordering we are discarding, and it
+        // wants a contract answer rather than another counter.
+        Kind::UpdateFence => {
+            crate::runtime::drain::note_store_route("compute_noop_update_fence");
+            None
+        }
+        Kind::WaitFence => {
+            crate::runtime::drain::note_store_route("compute_noop_wait_fence");
+            None
+        }
+        Kind::BarrierResources | Kind::BarrierScope => {
+            crate::runtime::drain::note_store_route("compute_noop_barrier");
+            None
+        }
+        Kind::UseHeaps | Kind::UseResources => {
+            crate::runtime::drain::note_store_route("compute_noop_residency_hint");
+            None
+        }
+        Kind::CompressedTextureFlush => {
+            crate::runtime::drain::note_store_route("compute_noop_compressed_flush");
+            None
+        }
         Kind::ControlStartDoWhile
         | Kind::ControlEndDoWhile
         | Kind::ControlStartWhile
