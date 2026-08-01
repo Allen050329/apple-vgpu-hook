@@ -24,6 +24,49 @@ fn m2v_draw_boundary_preserves_the_engine_vk_call_slug() {
     );
 }
 
+/// A presented colour attachment over `texture_ref` that clears to opaque
+/// black and stores — the pass shape seven bodies need so a draw resolves, and
+/// which none of them is about. The attachments that carry a real load action
+/// or clear colour stay written out.
+fn clear_black_attachment(
+    texture_ref: u32,
+) -> crate::runtime::decode::render::ColorAttachment {
+    use crate::runtime::decode::render::ColorAttachment;
+    ColorAttachment {
+        present: true,
+        texture_ref,
+        resolve_texture_ref: 0,
+        level: 0,
+        load_action: PASS_LOAD_ACTION_CLEAR,
+        store_action: PASS_STORE_ACTION_STORE,
+        clear_color: [0.0, 0.0, 0.0, 1.0],
+    }
+}
+
+/// `mrt_draw_request` for the single-RT triangle these tests resolve targets
+/// with: attachment in slot 0, no depth, three vertices of one instance,
+/// primitive type 3, first vertex 0. Five bodies passed those seven trailing
+/// literals; only `pipeline_ref` and the attachment ever varied.
+fn single_rt_draw_request<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    pipeline_ref: u32,
+    att: crate::runtime::decode::render::ColorAttachment,
+) -> Option<DrawEncodeRequest> {
+    mrt_draw_request(
+        state,
+        host,
+        1,
+        pipeline_ref,
+        &[(0u32, att)],
+        &[],
+        3,
+        1,
+        3,
+        0,
+    )
+}
+
 /// One reflection binding of `kind` at `metal_index` for the
 /// `frag_declared_unbound` guard tests. Only kind + index are load-bearing.
 #[cfg(feature = "backend-vulkan")]
@@ -2001,7 +2044,6 @@ fn mrt_draw_request_load_seed_miss_still_encodes() {
 fn mrt_draw_request_type8_view_of_type11_as_color_rt() {
     use crate::contract::endian::{st16, st32, st64};
     use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
-    use crate::runtime::decode::render::ColorAttachment;
     use crate::runtime::decode::resource::{
         list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_TEXTURE_VIEW,
         TEXTURE_VIEW_DESC_BASE_REF, TEXTURE_VIEW_DESC_LEN, TEXTURE_VIEW_DESC_LEVEL_BASE,
@@ -2059,27 +2101,8 @@ fn mrt_draw_request_type8_view_of_type11_as_color_rt() {
     list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
     write_task_gva_arm64e(&mut host, &state.tasks[1], off, &list_entry);
 
-    let att = ColorAttachment {
-        present: true,
-        texture_ref: view_ref,
-        resolve_texture_ref: 0,
-        level: 0,
-        load_action: PASS_LOAD_ACTION_CLEAR,
-        store_action: PASS_STORE_ACTION_STORE,
-        clear_color: [0.0, 0.0, 0.0, 1.0],
-    };
-    let req = mrt_draw_request(
-        &mut state,
-        &mut host,
-        1,
-        12,
-        &[(0u32, att)],
-        &[],
-        3,
-        1,
-        3,
-        0,
-    )
+    let att = clear_black_attachment(view_ref);
+    let req = single_rt_draw_request(&mut state, &mut host, 12, att)
     .expect("type-8 view of type-11 must resolve as color RT");
     assert_eq!(req.colors[0].mapping_id, 9);
     assert_eq!(req.colors[0].width, 64);
@@ -2094,7 +2117,6 @@ fn mrt_draw_request_type8_view_of_type11_as_color_rt() {
 fn mrt_draw_request_nested_type8_view_chain_to_type11() {
     use crate::contract::endian::{st16, st32, st64};
     use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
-    use crate::runtime::decode::render::ColorAttachment;
     use crate::runtime::decode::resource::{
         list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_TEXTURE_VIEW,
         TEXTURE_VIEW_DESC_BASE_REF, TEXTURE_VIEW_DESC_LEN, TEXTURE_VIEW_DESC_LEVEL_BASE,
@@ -2157,27 +2179,8 @@ fn mrt_draw_request_nested_type8_view_chain_to_type11() {
     write_type8_view(&mut host, &state, 8, 3, 0x280);
     write_type8_view(&mut host, &state, 211, 8, 0x300);
 
-    let att = ColorAttachment {
-        present: true,
-        texture_ref: 211,
-        resolve_texture_ref: 0,
-        level: 0,
-        load_action: PASS_LOAD_ACTION_CLEAR,
-        store_action: PASS_STORE_ACTION_STORE,
-        clear_color: [0.0, 0.0, 0.0, 1.0],
-    };
-    let req = mrt_draw_request(
-        &mut state,
-        &mut host,
-        1,
-        12,
-        &[(0u32, att)],
-        &[],
-        3,
-        1,
-        3,
-        0,
-    )
+    let att = clear_black_attachment(211);
+    let req = single_rt_draw_request(&mut state, &mut host, 12, att)
     .expect("nested type-8→type-8→type-11 must resolve as color RT");
     assert_eq!(req.colors[0].mapping_id, 9);
     assert_eq!(req.colors[0].width, 64);
@@ -2190,7 +2193,6 @@ fn mrt_draw_request_nested_type8_view_chain_to_type11() {
 fn mrt_draw_request_type8_swizzled_view_rejected_as_color_rt() {
     use crate::contract::endian::{st16, st32, st64};
     use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
-    use crate::runtime::decode::render::ColorAttachment;
     use crate::runtime::decode::resource::{
         list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_TEXTURE_VIEW,
         TEXTURE_VIEW_DESC_BASE_REF, TEXTURE_VIEW_DESC_LEN, TEXTURE_VIEW_DESC_LEVEL_BASE,
@@ -2242,15 +2244,7 @@ fn mrt_draw_request_type8_swizzled_view_rejected_as_color_rt() {
     list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
     write_task_gva_arm64e(&mut host, &state.tasks[1], off, &list_entry);
 
-    let att = ColorAttachment {
-        present: true,
-        texture_ref: view_ref,
-        resolve_texture_ref: 0,
-        level: 0,
-        load_action: PASS_LOAD_ACTION_CLEAR,
-        store_action: PASS_STORE_ACTION_STORE,
-        clear_color: [0.0, 0.0, 0.0, 1.0],
-    };
+    let att = clear_black_attachment(view_ref);
     assert!(
         mrt_draw_request(
             &mut state,
@@ -2276,7 +2270,6 @@ fn mrt_draw_request_type8_swizzled_view_rejected_as_color_rt() {
 fn mrt_draw_request_type2_rgba16f_as_color_rt_despite_stale_t11_latch() {
     use crate::contract::endian::{st16, st32, st64};
     use crate::contract::pixel_format::{MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_RGBA16_FLOAT};
-    use crate::runtime::decode::render::ColorAttachment;
     use crate::runtime::decode::resource::{
         list_object_entry_offset, LINEAR_DESC_HANDLE, LINEAR_DESC_SIZE, OBJECT_LIST_ENTRY_LEN,
         OBJECT_TYPE_TEXTURE, RESOURCE_PAGE_SHIFT, TEXTURE_DESC_BASE_LEN, TEXTURE_DESC_HEIGHT,
@@ -2320,27 +2313,8 @@ fn mrt_draw_request_type2_rgba16f_as_color_rt_despite_stale_t11_latch() {
     list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
     write_task_gva_arm64e(&mut host, &state.tasks[1], off, &list_entry);
 
-    let att = ColorAttachment {
-        present: true,
-        texture_ref: tex_ref,
-        resolve_texture_ref: 0,
-        level: 0,
-        load_action: PASS_LOAD_ACTION_CLEAR,
-        store_action: PASS_STORE_ACTION_STORE,
-        clear_color: [0.0, 0.0, 0.0, 1.0],
-    };
-    let req = mrt_draw_request(
-        &mut state,
-        &mut host,
-        1,
-        12,
-        &[(0u32, att)],
-        &[],
-        3,
-        1,
-        3,
-        0,
-    )
+    let att = clear_black_attachment(tex_ref);
+    let req = single_rt_draw_request(&mut state, &mut host, 12, att)
     .expect("type-2 RGBA16F RT must resolve despite stale type-11 latch");
     assert_eq!(req.colors[0].mapping_id, 0);
     assert_eq!(req.colors[0].width, w);
@@ -2362,7 +2336,6 @@ fn mrt_draw_request_type11_live_mapping_overrides_stale_latch() {
     use crate::contract::endian::{st16, st32};
     use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
-    use crate::runtime::decode::render::ColorAttachment;
     use crate::runtime::host::FakeHost;
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
@@ -2401,27 +2374,8 @@ fn mrt_draw_request_type11_live_mapping_overrides_stale_latch() {
     assert!(state.set_mapping_geom(4, 64, 32, MTL_FORMAT_BGRA8_UNORM));
     state.texture_to_mapping.insert((1, 1), 3);
 
-    let att = ColorAttachment {
-        present: true,
-        texture_ref: 1,
-        resolve_texture_ref: 0,
-        level: 0,
-        load_action: PASS_LOAD_ACTION_CLEAR,
-        store_action: PASS_STORE_ACTION_STORE,
-        clear_color: [0.0, 0.0, 0.0, 1.0],
-    };
-    let req = mrt_draw_request(
-        &mut state,
-        &mut host,
-        1,
-        12,
-        &[(0u32, att)],
-        &[],
-        3,
-        1,
-        3,
-        0,
-    )
+    let att = clear_black_attachment(1);
+    let req = single_rt_draw_request(&mut state, &mut host, 12, att)
     .expect("live type-11 RT must resolve");
     assert_eq!(
         req.colors[0].mapping_id, 4,
@@ -2435,7 +2389,6 @@ fn mrt_draw_request_type11_live_mapping_overrides_stale_latch() {
 fn mrt_draw_request_type8_nonzero_level_rejected_as_color_rt() {
     use crate::contract::endian::{st16, st32, st64};
     use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
-    use crate::runtime::decode::render::ColorAttachment;
     use crate::runtime::decode::resource::{
         list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_TEXTURE_VIEW,
         TEXTURE_VIEW_DESC_BASE_REF, TEXTURE_VIEW_DESC_LEN, TEXTURE_VIEW_DESC_LEVEL_BASE,
@@ -2485,15 +2438,7 @@ fn mrt_draw_request_type8_nonzero_level_rejected_as_color_rt() {
     list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
     write_task_gva_arm64e(&mut host, &state.tasks[1], off, &list_entry);
 
-    let att = ColorAttachment {
-        present: true,
-        texture_ref: view_ref,
-        resolve_texture_ref: 0,
-        level: 0,
-        load_action: PASS_LOAD_ACTION_CLEAR,
-        store_action: PASS_STORE_ACTION_STORE,
-        clear_color: [0.0, 0.0, 0.0, 1.0],
-    };
+    let att = clear_black_attachment(view_ref);
     assert!(
         mrt_draw_request(
             &mut state,
@@ -2520,7 +2465,6 @@ fn mrt_draw_request_type8_nonzero_level_rejected_as_color_rt() {
 fn mrt_draw_request_type8_mip_level_view_of_linear_as_color_rt() {
     use crate::contract::endian::{st16, st32, st64};
     use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
-    use crate::runtime::decode::render::ColorAttachment;
     use crate::runtime::decode::resource::{
         list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_TEXTURE,
         OBJECT_TYPE_TEXTURE_VIEW, TEXTURE_DESC_BASE_LEN, TEXTURE_DESC_LEVEL_RECORDS,
@@ -2608,27 +2552,8 @@ fn mrt_draw_request_type8_mip_level_view_of_linear_as_color_rt() {
     le[4..12].copy_from_slice(&desc_gva.to_le_bytes());
     write_task_gva_arm64e(&mut host, &state.tasks[1], off, &le);
 
-    let att = ColorAttachment {
-        present: true,
-        texture_ref: view_ref,
-        resolve_texture_ref: 0,
-        level: 0,
-        load_action: PASS_LOAD_ACTION_CLEAR,
-        store_action: PASS_STORE_ACTION_STORE,
-        clear_color: [0.0, 0.0, 0.0, 1.0],
-    };
-    let req = mrt_draw_request(
-        &mut state,
-        &mut host,
-        1,
-        12,
-        &[(0u32, att)],
-        &[],
-        3,
-        1,
-        3,
-        0,
-    )
+    let att = clear_black_attachment(view_ref);
+    let req = single_rt_draw_request(&mut state, &mut host, 12, att)
     .expect("mip-1 view of linear texture must resolve as color RT");
     let c0 = &req.colors[0];
     assert_eq!(c0.mapping_id, 0);
