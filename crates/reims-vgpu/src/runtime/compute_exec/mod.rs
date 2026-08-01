@@ -2804,6 +2804,30 @@ pub(crate) fn nested_job_from_icb_buffers(
     nested_job_from_icb_resources(staged_bufs, mtl_buffers, Vec::new(), Vec::new())
 }
 
+/// Staged compute buffers as the C ABI records the Metal encoder reads.
+///
+/// The pointers borrow `staged`, so the returned vector must not outlive it.
+/// `backing_*` stay null: a staged buffer owns its bytes, and only the
+/// indirect-argument path fills a backing allocation in afterwards.
+#[cfg(all(target_os = "macos", feature = "backend-metal"))]
+fn abi_buffers(staged: &mut [StagedBuffer]) -> Vec<crate::backend::metal::abi::ReimsVgpuBuffer> {
+    use crate::backend::metal::abi::ReimsVgpuBuffer;
+    staged
+        .iter_mut()
+        .map(|s| ReimsVgpuBuffer {
+            binding: s.bind.index,
+            data: s.bytes.as_mut_ptr(),
+            len: s.bytes.len(),
+            attribute_stride: s.bind.attribute_stride,
+            has_attribute_stride: u32::from(s.bind.has_attribute_stride),
+            reserved0: 0,
+            backing_data: std::ptr::null_mut(),
+            backing_len: 0,
+            backing_offset: 0,
+        })
+        .collect()
+}
+
 /// Deferred writeback for parent-encoder ICB inheritance (buffers + storage textures).
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 pub(crate) fn nested_job_from_icb_resources(
@@ -2827,26 +2851,12 @@ pub(crate) fn flush_nested_jobs<M: HostMemory + HostOps>(
     task_id: u32,
     jobs: &mut [NestedDispatchJob],
 ) -> ComputeStatus {
-    use crate::backend::metal::abi::{ReimsVgpuBuffer, ReimsVgpuStorageImage};
+    use crate::backend::metal::abi::ReimsVgpuStorageImage;
     use crate::backend::metal::compute::compute_writeback_from_mtl;
 
     let mut err_buf = [0i8; 256];
     for job in jobs.iter_mut() {
-        let mut reims_vgpu_bufs: Vec<ReimsVgpuBuffer> = job
-            .staged_bufs
-            .iter_mut()
-            .map(|s| ReimsVgpuBuffer {
-                binding: s.bind.index,
-                data: s.bytes.as_mut_ptr(),
-                len: s.bytes.len(),
-                attribute_stride: s.bind.attribute_stride,
-                has_attribute_stride: if s.bind.has_attribute_stride { 1 } else { 0 },
-                reserved0: 0,
-                backing_data: std::ptr::null_mut(),
-                backing_len: 0,
-                backing_offset: 0,
-            })
-            .collect();
+        let mut reims_vgpu_bufs = abi_buffers(&mut job.staged_bufs);
         let mut storage: Vec<ReimsVgpuStorageImage> = job
             .storage_tex
             .iter_mut()
@@ -4210,7 +4220,7 @@ fn execute_dispatch_metal<M: HostMemory + HostOps>(
     session: Option<&mut crate::runtime::compute_session::ComputeSession>,
 ) -> ComputeStatus {
     use crate::backend::metal::abi::{
-        ReimsVgpuBuffer, ReimsVgpuComputeImageblockDimensions, ReimsVgpuComputeSampledImage,
+        ReimsVgpuComputeImageblockDimensions, ReimsVgpuComputeSampledImage,
         ReimsVgpuComputeStageInRegion, ReimsVgpuComputeStageInRegionIndirectArguments,
         ReimsVgpuComputeTextureUsage, ReimsVgpuSampler, ReimsVgpuStorageImage,
         ReimsVgpuThreadgroupMemory, REIMS_VGPU_BINDING_SAMPLER_BASE,
@@ -4400,20 +4410,7 @@ fn execute_dispatch_metal<M: HostMemory + HostOps>(
         ));
     }
 
-    let mut reims_vgpu_bufs: Vec<ReimsVgpuBuffer> = staged_bufs
-        .iter_mut()
-        .map(|s| ReimsVgpuBuffer {
-            binding: s.bind.index,
-            data: s.bytes.as_mut_ptr(),
-            len: s.bytes.len(),
-            attribute_stride: s.bind.attribute_stride,
-            has_attribute_stride: if s.bind.has_attribute_stride { 1 } else { 0 },
-            reserved0: 0,
-            backing_data: std::ptr::null_mut(),
-            backing_len: 0,
-            backing_offset: 0,
-        })
-        .collect();
+    let mut reims_vgpu_bufs = abi_buffers(&mut staged_bufs);
 
     let mut storage: Vec<ReimsVgpuStorageImage> = Vec::new();
     let mut sampled: Vec<ReimsVgpuComputeSampledImage> = Vec::new();

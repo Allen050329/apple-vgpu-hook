@@ -137,6 +137,37 @@ struct StreamAccum {
     dropped_unbound: u32,
 }
 
+impl StreamAccum {
+    /// The stream's bind state as a `PendingDraw`, with no pipeline and no
+    /// draw call attached.
+    ///
+    /// Two things need it and must not disagree: a decoded draw, which fills
+    /// in `pipeline_ref` and `draw` on top, and an ICB execute, which inherits
+    /// the state as it stands at end of stream and supplies neither.
+    fn bind_snapshot(&self) -> PendingDraw {
+        PendingDraw {
+            indexed: self.indexed.clone(),
+            vertex_buffers: self.vertex_buffers.clone(),
+            fragment_buffers: self.fragment_buffers.clone(),
+            vertex_textures: self.vertex_textures.clone(),
+            fragment_textures: self.fragment_textures.clone(),
+            vertex_samplers: self.vertex_samplers.clone(),
+            fragment_samplers: self.fragment_samplers.clone(),
+            viewport: self.viewport,
+            scissor: self.scissor,
+            blend_color: self.blend_color,
+            cull_mode: self.cull_mode,
+            front_facing: self.front_facing,
+            depth_bias: self.depth_bias,
+            depth_stencil_ref: self.depth_stencil_ref,
+            stencil_ref: self.stencil_ref,
+            depth_attach: self.depth_attach,
+            stencil_attach: self.stencil_attach,
+            ..Default::default()
+        }
+    }
+}
+
 /// Why a decoded `RenderKind::Draw` record never became a `PendingDraw`.
 ///
 /// A serialized Metal render stream is one render pass, and every draw in it
@@ -1308,23 +1339,7 @@ fn handle_render_record<M: HostMemory + HostOps>(
                         cmd.primitive_type,
                         cmd.vertex_start,
                     ),
-                    indexed: acc.indexed.clone(),
-                    vertex_buffers: acc.vertex_buffers.clone(),
-                    fragment_buffers: acc.fragment_buffers.clone(),
-                    vertex_textures: acc.vertex_textures.clone(),
-                    fragment_textures: acc.fragment_textures.clone(),
-                    vertex_samplers: acc.vertex_samplers.clone(),
-                    fragment_samplers: acc.fragment_samplers.clone(),
-                    viewport: acc.viewport,
-                    scissor: acc.scissor,
-                    blend_color: acc.blend_color,
-                    cull_mode: acc.cull_mode,
-                    front_facing: acc.front_facing,
-                    depth_bias: acc.depth_bias,
-                    depth_stencil_ref: acc.depth_stencil_ref,
-                    stencil_ref: acc.stencil_ref,
-                    depth_attach: acc.depth_attach,
-                    stencil_attach: acc.stencil_attach,
+                    ..acc.bind_snapshot()
                 });
             }
         }
@@ -1627,59 +1642,35 @@ fn finish_stream<M: HostMemory + HostOps>(
     }
     if let Some(exec) = &acc.execute_icb {
         if !acc.color_slots.is_empty() {
-            // Pipeline optional for empty ICB; use first pass color geometry via mrt helper.
-            let pipeline = if acc.pipeline_ref != 0 {
-                acc.pipeline_ref
+            // `mrt_draw_request` gates on a non-zero pipeline ref, and an
+            // ICB-only execute has none in the stream — its PSO lives inside
+            // the filled slots — so 1 stands in and only the colour list is
+            // taken. That case also takes the default single-triangle geometry
+            // rather than the stream's last draw, because the ICB carries its
+            // own. Otherwise the last pass's geometry describes the pass this
+            // ICB runs inside.
+            let (pipeline, count, inst, prim, first) = if acc.pipeline_ref != 0 {
+                let (count, inst, prim, first) =
+                    acc.draws.last().map_or((1, 1, 3, 0), |pd| {
+                        let (count, inst, prim, first) = pd.draw;
+                        (count.max(1), inst.max(1), prim, first)
+                    });
+                (acc.pipeline_ref, count, inst, prim, first)
             } else {
-                // Still need a non-zero ref for mrt_draw_request gate — use 1 as placeholder
-                // when only ICB execute (PSO lives inside filled slots). mrt_draw_request
-                // only uses pipeline for encode_draw; for ICB we rebuild colors manually.
-                0
+                (1, 1, 1, 3, 0)
             };
-            let req = if pipeline != 0 {
-                if let Some(pd) = acc.draws.last() {
-                    let (count, inst, prim, first) = pd.draw;
-                    metal_draw::mrt_draw_request(
-                        state,
-                        host,
-                        task_id,
-                        pipeline,
-                        &acc.color_slots,
-                        &acc.clears,
-                        count.max(1),
-                        inst.max(1),
-                        prim,
-                        first,
-                    )
-                } else {
-                    metal_draw::mrt_draw_request(
-                        state,
-                        host,
-                        task_id,
-                        pipeline,
-                        &acc.color_slots,
-                        &acc.clears,
-                        1,
-                        1,
-                        3,
-                        0,
-                    )
-                }
-            } else {
-                // Build color RT list without pipeline (ICB-only execute).
-                metal_draw::mrt_draw_request(
-                    state,
-                    host,
-                    task_id,
-                    1, // unused when we only need colors
-                    &acc.color_slots,
-                    &acc.clears,
-                    1,
-                    1,
-                    3,
-                    0,
-                )
-            };
+            let req = metal_draw::mrt_draw_request(
+                state,
+                host,
+                task_id,
+                pipeline,
+                &acc.color_slots,
+                &acc.clears,
+                count,
+                inst,
+                prim,
+                first,
+            );
             if let Some(mut req) = req {
                 // ICB execute inherits stream bind state at end of stream.
                 if let Some(pd) = acc.draws.last() {
@@ -1687,26 +1678,7 @@ fn finish_stream<M: HostMemory + HostOps>(
                 } else {
                     fill_draw_binds_from_pending(
                         &mut req,
-                        &PendingDraw {
-                            vertex_buffers: acc.vertex_buffers.clone(),
-                            fragment_buffers: acc.fragment_buffers.clone(),
-                            vertex_textures: acc.vertex_textures.clone(),
-                            fragment_textures: acc.fragment_textures.clone(),
-                            vertex_samplers: acc.vertex_samplers.clone(),
-                            fragment_samplers: acc.fragment_samplers.clone(),
-                            viewport: acc.viewport,
-                            scissor: acc.scissor,
-                            indexed: acc.indexed.clone(),
-                            blend_color: acc.blend_color,
-                            cull_mode: acc.cull_mode,
-                            front_facing: acc.front_facing,
-                            depth_bias: acc.depth_bias,
-                            depth_stencil_ref: acc.depth_stencil_ref,
-                            stencil_ref: acc.stencil_ref,
-                            depth_attach: acc.depth_attach,
-                            stencil_attach: acc.stencil_attach,
-                            ..Default::default()
-                        },
+                        &acc.bind_snapshot(),
                     );
                 }
                 let (loc, len) = if exec.is_range {
@@ -1926,20 +1898,9 @@ fn finish_stream<M: HostMemory + HostOps>(
                             // Land any earlier chain image before abandoning —
                             // same as the hard-fail path below. Dropping the
                             // chain left dual-mid pages black while gen advanced.
-                            #[cfg(feature = "backend-vulkan")]
-                            if resident_chain && chain_rgba.is_none() {
-                                chain_rgba = metal_draw::read_resident_chain(state, &req);
-                            }
-                            if let Some(rgba) = chain_rgba.take() {
-                                let _ = metal_draw::writeback_chain_rgba(
-                                    state,
-                                    host,
-                                    task_id,
-                                    &acc.color_slots,
-                                    &rgba,
-                                );
-                            }
-                            dirty_color_targets(state, host, task_id, &acc.color_targets);
+                            land_chain_before_abandon(
+                                state, host, task_id, acc, &req, &mut chain_rgba, resident_chain,
+                            );
                             break;
                         }
                     }
@@ -1947,20 +1908,9 @@ fn finish_stream<M: HostMemory + HostOps>(
                         saw_nometal = true;
                         out.metal_draws_fail += 1;
                         note_draw_encode_fail(task_id, pd.pipeline_ref, st, di, draw_list.len());
-                        #[cfg(feature = "backend-vulkan")]
-                        if resident_chain && chain_rgba.is_none() {
-                            chain_rgba = metal_draw::read_resident_chain(state, &req);
-                        }
-                        if let Some(rgba) = chain_rgba.take() {
-                            let _ = metal_draw::writeback_chain_rgba(
-                                state,
-                                host,
-                                task_id,
-                                &acc.color_slots,
-                                &rgba,
-                            );
-                        }
-                        dirty_color_targets(state, host, task_id, &acc.color_targets);
+                        land_chain_before_abandon(
+                            state, host, task_id, acc, &req, &mut chain_rgba, resident_chain,
+                        );
                         break;
                     }
                     // `Ok` and the distinct clear-fallback `NoMetal` recovery
@@ -1974,20 +1924,9 @@ fn finish_stream<M: HostMemory + HostOps>(
                         // before abandoning the packet. Unified targets already
                         // landed each record in guest memory — never write the
                         // (zero) chain buffer over them.
-                        #[cfg(feature = "backend-vulkan")]
-                        if resident_chain && chain_rgba.is_none() {
-                            chain_rgba = metal_draw::read_resident_chain(state, &req);
-                        }
-                        if let Some(rgba) = chain_rgba.take() {
-                            let _ = metal_draw::writeback_chain_rgba(
-                                state,
-                                host,
-                                task_id,
-                                &acc.color_slots,
-                                &rgba,
-                            );
-                        }
-                        dirty_color_targets(state, host, task_id, &acc.color_targets);
+                        land_chain_before_abandon(
+                            state, host, task_id, acc, &req, &mut chain_rgba, resident_chain,
+                        );
                         break;
                     }
                 }
@@ -2167,6 +2106,39 @@ fn dirty_color_targets<M: HostMemory + HostOps>(
             let _ = state.mark_mapping_written(tex_ref);
         }
     }
+}
+
+/// Land the chain image this packet has produced before abandoning it.
+///
+/// Three records break a multi-draw chain: a typed terminal refusal, the
+/// `NoMetal` carrier, and an intermediate that returned no colour0. All three
+/// leave earlier GVA draws' pixels only on the engine target, and dropping
+/// them left dual-mid pages black while the content generation advanced — so
+/// the resident is read back and written out first, and the colour targets are
+/// marked written either way.
+///
+/// Unified targets already landed each record in guest memory and must never
+/// take the (zero) chain buffer over them; the one caller where that is
+/// possible gates on it.
+fn land_chain_before_abandon<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    acc: &StreamAccum,
+    req: &metal_draw::DrawEncodeRequest,
+    chain_rgba: &mut Option<Vec<u8>>,
+    resident_chain: bool,
+) {
+    #[cfg(feature = "backend-vulkan")]
+    if resident_chain && chain_rgba.is_none() {
+        *chain_rgba = metal_draw::read_resident_chain(state, req);
+    }
+    #[cfg(not(feature = "backend-vulkan"))]
+    let _ = (req, resident_chain);
+    if let Some(rgba) = chain_rgba.take() {
+        let _ = metal_draw::writeback_chain_rgba(state, host, task_id, &acc.color_slots, &rgba);
+    }
+    dirty_color_targets(state, host, task_id, &acc.color_targets);
 }
 
 fn solid_rgba(w: u32, h: u32, clear: &[f64; 4]) -> Vec<u8> {
