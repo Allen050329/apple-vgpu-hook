@@ -2704,15 +2704,17 @@ fn load_type11_rgba<M: HostMemory + HostOps>(
 /// Guest pages ARE the surface content: the CPU writeback lands Stores in them
 /// and guest CPU writes are immediately visible. There is exactly one source;
 /// no recovery ranking exists.
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+///
+/// The resolve runs *before* the geometry read, not after. A mapping can be
+/// mapped with a live `MappingInternal` and no latched W×H yet; resolving first
+/// decodes the guest device-surface descriptor and latches the geometry, so the
+/// sample succeeds instead of bailing out on `!has_geom` and dropping the bind.
 fn load_type11_mapping_rgba<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     mapping_id: u32,
     format_override: Option<u16>,
 ) -> Option<(u32, u32, Vec<u8>)> {
-    // Sampled type-11: archive render_wait_surface is surface-keyed async wait
-    // cover archive RAW; per-sample wait HOL-stalled logo under published rings.
     let _ = mapper::ensure_resolved_for_scanout(state, host, mapping_id);
     let (w, h) = {
         let m = state.mappings.get(&mapping_id)?;
@@ -4017,7 +4019,7 @@ fn load_sampled_rgba_static<M: HostMemory + HostOps>(
     }
     // Type-11 path via resolve.
     if let Some(mid) = objects::resolve_type11_ref(state, host, task_id, texture_ref) {
-        return load_type11_rgba_static(state, host, mid, None);
+        return load_type11_mapping_rgba(state, host, mid, None).map(|(_, _, r)| r);
     }
     // Type-8 view → base texture + mip + format. The view's SWIZZLE is
     // deliberately not consulted here: it is a property of the view, not of the
@@ -4035,43 +4037,9 @@ fn load_sampled_rgba_static<M: HostMemory + HostOps>(
         if level != 0 {
             return None;
         }
-        return load_type11_rgba_static(state, host, mid, fmt_override);
+        return load_type11_mapping_rgba(state, host, mid, fmt_override).map(|(_, _, r)| r);
     }
     load_linear_texture_rgba_host(state, host, task_id, tex_ref, level, fmt_override)
-}
-
-fn load_type11_rgba_static<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
-    host: &mut M,
-    mapping_id: u32,
-    format_override: Option<u16>,
-) -> Option<Vec<u8>> {
-    let (w, h) = {
-        let m = state.mappings.get(&mapping_id)?;
-        if !m.has_geom || m.width == 0 || m.height == 0 {
-            return None;
-        }
-        (m.width, m.height)
-    };
-    let base_fmt = MTL_FORMAT_BGRA8_UNORM;
-    let sample_fmt = effective_view_sample_format(base_fmt, format_override)?;
-    let stride = w.saturating_mul(RGBA8_BPP);
-    let mut raw = vec![0u8; (stride as usize).saturating_mul(h as usize)];
-    let _ = mapper::ensure_resolved_for_scanout(state, host, mapping_id);
-    if !crate::runtime::scanout::read_mapping_bgra8(state, host, mapping_id, &mut raw, stride, w, h)
-    {
-        return None;
-    }
-    let mut rgba = vec![0u8; raw.len()];
-    for y in 0..h as usize {
-        let off = y * (stride as usize);
-        let row = &raw[off..off + (w as usize) * 4];
-        let dst = &mut rgba[off..off + (w as usize) * 4];
-        if !pixel_format::convert_row_to_rgba8(sample_fmt, row, w, dst) {
-            return None;
-        }
-    }
-    Some(rgba)
 }
 
 /// Byte-exact revalidated memo for the type-11 mapping-backed guest-page sampled

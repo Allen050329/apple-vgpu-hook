@@ -4285,3 +4285,124 @@ fn a_scissored_gva_store_is_bounded_on_both_its_rails() {
         );
     }
 }
+
+/// A type-11 sample must resolve the mapping *before* it reads its geometry.
+///
+/// A mapped surface with a live `MappingInternal` can have no latched W×H yet:
+/// that geometry lives in the guest device-surface descriptor, and
+/// `mapper::resolve_mapping_backing` (reached through
+/// `ensure_resolved_for_scanout`) is the only thing that decodes it and calls
+/// `set_mapping_geom`. Reading `has_geom` first therefore returns `None` on a
+/// perfectly serviceable surface and the bind silently loses the texture.
+///
+/// The fixture carries geometry ONLY in the descriptor — nothing calls
+/// `set_mapping_geom` — so this passes with the resolve first and fails with it
+/// after the geometry read.
+#[test]
+fn type11_sample_resolves_geometry_before_reading_it() {
+    use crate::contract::endian::{st32, st64};
+    use crate::contract::iosurface_pages::{
+        DEVICE_DESC_ALLOC_SIZE, DEVICE_DESC_BPR, DEVICE_DESC_DIMS, DEVICE_DESC_LEN,
+        DEVICE_DESC_PIXEL_FORMAT, DEVICE_DESC_PLANE_COUNT, MAPPING_INTERNAL_BACKPTR,
+        MAPPING_INTERNAL_DESC_PTR, MAPPING_INTERNAL_EXPECTED_SIZE, MAPPING_INTERNAL_ID,
+        MAPPING_INTERNAL_PAGE_COUNT, MAPPING_INTERNAL_PAGE_FIELD_48,
+        MAPPING_INTERNAL_PAGE_FIELD_50, MAPPING_INTERNAL_SIZE, MAPPING_PAGE_TABLE_FROM_F48,
+        PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID,
+    };
+    use crate::runtime::host::HostMemory;
+
+    // Kernel VA base: the mapper walk refuses anything `guest_kernel_va` rejects.
+    const KVA: u64 = 0xffff_fe00_1000_0000;
+    fn put_u32(h: &mut FakeHost, kva: u64, v: u32) {
+        h.map_range(kva, 4, 0);
+        h.put_u32(kva, v);
+    }
+    fn put_u64(h: &mut FakeHost, kva: u64, v: u64) {
+        h.map_range(kva, 8, 0);
+        let _ = h.write_gpa(kva, &v.to_le_bytes());
+    }
+
+    let mid = 3u32;
+    // 64×64 BGRA8 at a packed 256-byte row is 16 KiB — exactly one arm64e guest
+    // page, so a one-entry page table covers the whole sample window.
+    let (w, h) = (64u32, 64u32);
+    let bpr = w * RGBA8_BPP;
+    let alloc = bpr * h;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let internal = KVA;
+    let mapper = KVA + 0x1000;
+    let page_obj = KVA + 0x2000;
+    let table = KVA + 0x3000;
+    let desc_kva = KVA + 0x4000;
+
+    put_u64(&mut host, internal + MAPPING_INTERNAL_BACKPTR, mapper);
+    put_u32(&mut host, internal + MAPPING_INTERNAL_ID, mid);
+    put_u32(
+        &mut host,
+        internal + MAPPING_INTERNAL_SIZE,
+        MAPPING_INTERNAL_EXPECTED_SIZE,
+    );
+    put_u64(&mut host, internal + MAPPING_INTERNAL_PAGE_FIELD_48, page_obj);
+    put_u64(&mut host, internal + MAPPING_INTERNAL_PAGE_FIELD_50, 0);
+    put_u64(&mut host, internal + MAPPING_INTERNAL_PAGE_COUNT, 1);
+    put_u64(&mut host, internal + MAPPING_INTERNAL_DESC_PTR, desc_kva);
+    put_u64(&mut host, page_obj + MAPPING_PAGE_TABLE_FROM_F48, table);
+
+    let pfn = 0x1e88c_u32;
+    let page_gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
+    put_u32(
+        &mut host,
+        table,
+        (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID,
+    );
+    // Guest pages ARE the surface content.
+    host.map_range(page_gpa, alloc as usize, 0);
+    let bgra = [0x11u8, 0x22, 0x33, 0xff].repeat((w * h) as usize);
+    host.write_gpa(page_gpa, &bgra).expect("seed guest pages");
+
+    // The device-surface descriptor is the only carrier of this surface's dims.
+    let mut desc = vec![0u8; DEVICE_DESC_LEN];
+    st32(
+        &mut desc[DEVICE_DESC_PIXEL_FORMAT..],
+        u32::from(MTL_FORMAT_BGRA8_UNORM),
+    );
+    st32(&mut desc[DEVICE_DESC_ALLOC_SIZE..], alloc);
+    // width u24 @ bit 8, height u24 @ bit 40.
+    st64(
+        &mut desc[DEVICE_DESC_DIMS..],
+        ((w as u64) << 8) | ((h as u64) << 40),
+    );
+    st32(&mut desc[DEVICE_DESC_BPR..], bpr);
+    desc[DEVICE_DESC_PLANE_COUNT] = 0;
+    host.map_range(desc_kva, DEVICE_DESC_LEN, 0);
+    host.write_gpa(desc_kva, &desc).expect("seed descriptor");
+
+    state.mapper_device_kva = mapper;
+    assert!(state.attach_mapping_internal(mid, internal));
+    {
+        let m = state.mappings.get(&mid).expect("mapping");
+        assert!(m.mapped && m.mapping_internal != 0);
+        assert!(
+            !m.has_geom,
+            "the fixture's whole point is that no geometry is latched yet"
+        );
+    }
+
+    let (gw, gh, rgba) = load_type11_mapping_rgba(&mut state, &mut host, mid, None).expect(
+        "a mapped type-11 surface whose dims are still only in the device descriptor \
+         must sample, not drop the bind",
+    );
+    assert_eq!((gw, gh), (w, h), "geometry must come from the resolve");
+    assert_eq!(rgba.len(), (w * h * RGBA8_BPP) as usize);
+    assert_eq!(
+        &rgba[..4],
+        &[0x33, 0x22, 0x11, 0xff],
+        "guest BGRA page bytes converted to tight RGBA8"
+    );
+    assert!(
+        state.mappings.get(&mid).expect("mapping").has_geom,
+        "the resolve must have latched the descriptor geometry"
+    );
+}

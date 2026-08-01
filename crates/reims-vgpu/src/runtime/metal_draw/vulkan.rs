@@ -1614,7 +1614,7 @@ fn note_type11_load_seed(
 ///    hardcoded `[0,0,0,0]` primary clear and the matching Store published that
 ///    wipe, which is a whole compositing layer going solid black.
 ///
-/// `load_type11_rgba_static` reads at the mapping's own latched geometry and
+/// `load_type11_mapping_rgba` reads at the mapping's own latched geometry and
 /// converts to RGBA8, so the length check is what confirms the pass wanted that
 /// extent — the engine rejects a seed of any other length, and the decline this
 /// falls through to carries both geometries so a mismatch is diagnosable rather
@@ -1644,7 +1644,8 @@ fn resolve_type11_load_seed<M: HostMemory + HostOps>(
         if let Some(bgra) = crate::runtime::surface_cache::get_shared(state, mapping_id, w, h) {
             Some((bgra, SeedOrder::Bgra8, Type11SeedRung::Cache))
         } else {
-            load_type11_rgba_static(state, host, mapping_id, None)
+            load_type11_mapping_rgba(state, host, mapping_id, None)
+                .map(|(_, _, r)| r)
                 .filter(|rgba| rgba.len() == (w as usize) * (h as usize) * 4)
                 .map(|rgba| {
                     (

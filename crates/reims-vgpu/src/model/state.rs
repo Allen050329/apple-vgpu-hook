@@ -1691,7 +1691,7 @@ pub struct DeviceState {
     /// ([`GUEST_LINEAR_MEMO_BYTE_CAP`]).
     pub type5_view_memo: LruBytesMemo<(u32, u32, u32, u32, u16), GuestLinearMemo>,
     /// Byte-exact revalidated memo for the type-11 mapping-backed sampled path
-    /// (`load_type11_rgba_static` — small IOSurface textures below the zero-copy
+    /// (`load_type11_mapping_rgba` — small IOSurface textures below the zero-copy
     /// floor, e.g. dock icons under magnification). Same contract as
     /// [`Self::guest_linear_memo`]: every bind re-reads the native BGRA rect;
     /// the BGRA->RGBA convert + the two per-bind allocs + the engine's content
