@@ -2796,26 +2796,6 @@ fn try_type5_sample_zero_copy<M: HostMemory + HostOps>(
     ))
 }
 
-#[cfg(feature = "backend-vulkan")]
-fn linear_sampled_memo_reuse(
-    state: &DeviceState,
-    task_id: u32,
-    texture_ref: u32,
-    gva: u64,
-    host_gen: u64,
-    width: u32,
-    height: u32,
-) -> Option<std::sync::Arc<Vec<u8>>> {
-    // Peek (no recency bump): the caller already holds an immutable borrow of
-    // `state` (the authoritative `bgra` view) across this call, so a `&mut`
-    // touch is not possible here. Recency for this memo is instead driven by
-    // inserts — each content change re-inserts and warms the entry — which is
-    // sufficient for this authoritative-cache-backed reuse fast path.
-    let m = state.linear_sampled_memo.peek(&(task_id, texture_ref))?;
-    (m.gva == gva && m.host_gen == host_gen && m.width == width && m.height == height)
-        .then(|| m.rgba.clone())
-}
-
 /// Serve a guest-CPU-produced linear texture (tight OR padded row stride)
 /// through the byte-exact revalidated memo. Every call re-reads the native
 /// guest rows (a guest write is always observed); only the swizzle/gather +
@@ -3223,77 +3203,51 @@ fn load_linear_from_host_caches<M: HostMemory + HostOps>(
     if w == 0 || h == 0 {
         return None;
     }
-    // A deferred GVA render Store at this base is the authoritative content —
-    // land it first so the cache lookup below serves fresh bytes instead of a
-    // stale (pre-Store) encode.
+    // A deferred GVA render Store at this base is the authoritative content and
+    // the guest's pages do not have it yet — land it before the readers below,
+    // which read those pages.
     if state.gva_deferred_flush.contains_key(&gva) {
         crate::runtime::storage_flush::flush_gva_exact(state, host, gva, true, "gva_sample");
     }
-    // Census only, for now: score whether this GVA still names the pages the
-    // cached bytes were produced from, and serve either way. Scored on entries
-    // this lookup would actually serve, so the counters carry their own
-    // denominator; `gvac_*` in the per-second `store_routes` line.
-    let gva_names_these_pages = !crate::runtime::surface_cache::has_gva(state, gva, w, h)
-        || note_gva_backing_verdict(
-            crate::runtime::surface_cache::revalidate_gva_backing(state, host, task_id, gva),
-            "sample",
-            task_id,
-            gva,
-            w,
-            h,
-        );
-    // ...and does it still hold what the guest has at them? The verdict above
-    // answers only the first question. Both must hold: an entry can name
-    // exactly the right pages and still be a picture the guest replaced with a
-    // CPU store, which produces no notify for the walk to see. When the host
-    // has observed a write, the entry is stale and the reader falls through to
-    // the guest's own pages below (`lin_rung_gva_bypassed`), which are
-    // authoritative. The retained-wallpaper case this cache exists for is
-    // untouched: a mapping that churns and comes back without a guest write
-    // reads the same generation and still serves.
-    let gva_content_is_current =
-        !crate::runtime::surface_cache::gva_guest_wrote_since_store(state, host, gva);
-    let serves = gva_names_these_pages && gva_content_is_current;
-    if serves {
-        // Recency for the encode cache's byte cap, charged on the confirmed
-        // serve. A wallpaper plane is stored once and sampled from here every
-        // frame, so this is what keeps it out of reach of the cap.
-        crate::runtime::surface_cache::touch_gva(state, gva, w, h);
-    }
-    if let Some((bgra, host_gen, producer_type)) = serves
-        .then(|| crate::runtime::surface_cache::get_gva_with_owner(state, gva, w, h))
-        .flatten()
-    {
-        if gva_cache_owner_allows_object_type(producer_type, entry.object_type) {
-            let identity = Some(LinearSampleIdentity {
-                key: gva,
-                generation: host_gen,
-            });
-            // Memo fast path: same authoritative entry (gva/gen/geom) means the
-            // swizzled copy is already made - reuse the Arc, skip copy+swizzle.
-            if let Some(rgba) =
-                linear_sampled_memo_reuse(state, task_id, texture_ref, gva, host_gen, w, h)
-            {
-                return Some((w, h, rgba, identity, TexelLayout::Rgba8));
-            }
-            let rgba = swap_rb_channels(bgra);
-            let rgba = std::sync::Arc::new(rgba);
-            let entry_bytes = rgba.len();
-            state.linear_sampled_memo.insert(
-                (task_id, texture_ref),
-                crate::model::LinearSampledMemo {
-                    gva,
-                    host_gen,
-                    width: w,
-                    height: h,
-                    rgba: rgba.clone(),
-                },
-                entry_bytes,
-            );
-            return Some((w, h, rgba, identity, TexelLayout::Rgba8));
-        }
-    }
-    crate::runtime::drain::note_store_route("lin_rung_gva_bypassed");
+    // The GVA encode cache used to be read here, behind two gates: does this
+    // address still name the pages the bytes were made from
+    // (`revalidate_gva_backing`), and has the guest CPU-written them since
+    // (`gva_guest_wrote_since_store`). It never once served.
+    //
+    // Not "rarely" — never, and for a structural reason. The second gate has
+    // four early returns before it reaches the host, and every call took one:
+    // over five boots, the last of them driven under Safari load, its verdicts
+    // were `no_entry` 171 711 and `no_baseline` 115 089, against `clean` 0,
+    // `wrote` 0, `unarmed` 0 and `unreadable` 0. The two sum to 286 800, which
+    // is exactly the bypass count, so the comparison the gate exists to make ran
+    // zero times.
+    //
+    // `no_baseline` is the interesting half and it is not a guest behaviour.
+    // `arm_gva_guest_write_witness` records its baseline immediately after
+    // registering the token, inside the dirty tracker's deliberate two-harvest
+    // startup window where a generation reads 0, and re-stamps only on a *later*
+    // store to the same address. The entries this cache exists for — a wallpaper
+    // plane stored once and sampled forever — get no later store, so their
+    // baseline stays 0 for the life of the boot and the gate can only answer
+    // "stale". The sibling mapping rail escapes this by re-stamping on every
+    // write (`mapper::stamp_guest_write_gen`), which is why its verdicts are
+    // live (`t11rung_resident_gw_clean` 18 350 in the same boot).
+    //
+    // So this rung was `if false` with a page-table revalidation attached, 6 917
+    // walks in that boot to reach a serve that cannot happen. The guest's own
+    // pages, read below, are authoritative and are what every one of those
+    // 286 800 samples already used.
+    //
+    // What this does NOT resolve: the cache is still live and still read, by the
+    // colour-LOAD seed paths in `try_metal2vulkan_draw` and
+    // `metal_draw::seed_color_load`. Neither consults the write witness at all,
+    // and the same boot held 397 entries over 105 MiB whose backing pages were
+    // 393/397 unmapped. Those are serving pixels for guest pages that are gone,
+    // which is the retained-wallpaper case the cache was built for and also the
+    // case nothing can currently validate. That is a contract gap, not a tuning
+    // one: it is unknown what the guest's own statement of ownership is for a
+    // surface whose pages it has unmapped.
+    //
     // A rung keyed on `texture_ref` + geometry alone used to sit here. It did not
     // validate the GVA, so it could serve one resource's pixels under another's
     // ref once the guest rebound a ref to a different descriptor at the same

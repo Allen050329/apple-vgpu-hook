@@ -1604,11 +1604,6 @@ pub struct PendingWork {
 /// its avoided re-decode/re-convert cost) survives.
 pub const GUEST_LINEAR_MEMO_BYTE_CAP: usize = 128 << 20;
 
-/// Byte cap for the authoritative-cache linear-sampled reuse memo
-/// (`linear_sampled_memo`). Bounds host RAM by real bytes rather than a raw
-/// entry count — 4K frames are ~33 MiB each, so a byte cap is the honest bound.
-pub const LINEAR_SAMPLED_MEMO_BYTE_CAP: usize = 128 << 20;
-
 /// Byte cap for the GVA-keyed type-2/3 encode cache
 /// ([`DeviceState::host_gva_surfaces`]). Same basis and same value as
 /// [`LINEAR_SAMPLED_MEMO_BYTE_CAP`], which bounds the sibling cache holding the
@@ -1733,16 +1728,6 @@ impl GvaEvictionWitness {
             self.forgotten,
         )
     }
-}
-
-/// See [`DeviceState::linear_sampled_memo`].
-#[derive(Clone, Debug)]
-pub struct LinearSampledMemo {
-    pub gva: u64,
-    pub host_gen: u64,
-    pub width: u32,
-    pub height: u32,
-    pub rgba: std::sync::Arc<Vec<u8>>,
 }
 
 /// See [`DeviceState::guest_linear_memo`].
@@ -1961,15 +1946,6 @@ pub struct DeviceState {
     /// Raw compute encode for type-2/3 textures. Retained across GVA unmap;
     /// evicted on task/object lifetime end or descriptor mismatch.
     pub host_linear_textures: BTreeMap<(u32, u32), HostLinearTexture>,
-    /// Perf memo: one swizzled RGBA copy per (gva, generation) for linear
-    /// sampled textures on the render path; repeat draws clone the Arc
-    /// instead of re-copying + re-swizzling the cache bytes. Coherence is
-    /// re-established on every lookup by matching the authoritative
-    /// [`Self::host_gva_surfaces`] entry's gva/generation/geometry - a stale
-    /// entry can never be served, only skipped. Keyed by (task_id, ref).
-    /// Byte-bounded LRU ([`LINEAR_SAMPLED_MEMO_BYTE_CAP`]): a cap crossing evicts
-    /// the coldest entries, never the whole map (no re-copy cliff).
-    pub linear_sampled_memo: LruBytesMemo<(u32, u32), LinearSampledMemo>,
     /// Perf memo for guest-CPU-produced linear textures (no host cache entry,
     /// so no producer generation exists). Coherence is re-established on
     /// every lookup by re-reading the native guest rows and comparing them
@@ -2275,7 +2251,6 @@ impl DeviceState {
             completion_stamp_seq: 0,
             gva_resident_backing: std::collections::BTreeMap::new(),
             retired_gva_windows: Vec::new(),
-            linear_sampled_memo: LruBytesMemo::new(LINEAR_SAMPLED_MEMO_BYTE_CAP),
             guest_linear_memo: LruBytesMemo::new(GUEST_LINEAR_MEMO_BYTE_CAP),
             sampled_content_gen: 0,
             guest_linear_scratch: Vec::new(),
