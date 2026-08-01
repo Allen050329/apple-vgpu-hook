@@ -686,21 +686,65 @@ impl ResourcePools {
     /// of that same draw, so the storm those comments describe is still running
     /// on this path.
     ///
-    /// One driven x86/Vulkan boot — Chess, Maps, the WebGL aquarium,
-    /// page-downs, a title-bar drag, apple.com — read `vk_alloc_sites
-    /// transient_depth=5374:21225`: 5374 `vkAllocateMemory` calls totalling
-    /// ~21 GiB, against `slab_block=41:2568` for every resident color target in
-    /// the same boot. Two orders of magnitude more allocations for the
-    /// attachment whose contents are thrown away.
+    /// Driven x86/Vulkan boots — Chess, Maps, the WebGL aquarium, page-downs, a
+    /// title-bar drag, apple.com — read `vk_alloc_sites
+    /// transient_depth=5374:21225` and, on a later build, `4623:18257`: several
+    /// thousand `vkAllocateMemory` calls totalling ~18-21 GiB, against
+    /// `slab_block=41:2568` / `70:4256` for every resident color target in the
+    /// same boot. Sixty-plus times the allocations for the attachment whose
+    /// contents are thrown away.
     ///
-    /// The shape is favourable: a depth image depends only on `(width, height,
-    /// with_stencil)` plus the device's chosen format, so a driven session has
-    /// one or two distinct configurations, not thousands. The reason to be
-    /// careful is that this engine already carries three separate recycle pools
-    /// — resident targets, sampled images, transient compute storage — and a
-    /// fourth would be more mechanism, not less. The change worth making is one
-    /// recycle discipline that the depth path also uses, not a depth pool
-    /// beside the others.
+    /// The shape looks favourable: a depth image depends only on `(width,
+    /// height, with_stencil)` plus the device's chosen format, so a driven
+    /// session has one or two distinct configurations, not thousands. That much
+    /// is now confirmed — see below. The reason to be careful is that this
+    /// engine already carries three separate recycle pools — resident targets,
+    /// sampled images, transient compute storage — and a fourth would be more
+    /// mechanism, not less. The change worth making is one recycle discipline
+    /// that the depth path also uses, not a depth pool beside the others.
+    /// [`FreePool`] is now that discipline, so joining it costs one field.
+    ///
+    /// # It was tried, and the caps are not what blocks it — the dispose cadence is
+    ///
+    /// A depth `FreePool` keyed on `(width, height, format)` was implemented and
+    /// driven on the standard x86/Vulkan workload. It is **correct** — the guest
+    /// rendered identically, which is expected: every pass that binds a depth
+    /// attachment CLEARs it (`DepthState::load` is constructed `false` at its
+    /// only site, and a guest depth LOAD is already refused fail-visibly as
+    /// `depth_load_unsupported_transient`) and declares `initial_layout:
+    /// UNDEFINED`, so a recycled slot is interchangeable with a fresh one.
+    ///
+    /// It just did not *work*. Allocations went 4623 -> 4420, about 4 %. A census
+    /// on the miss path said why:
+    ///
+    /// ```text
+    /// depth_pool_key 1024x768 fmt=130 pooled=0 hits=0   allocs=1    admits=0   cap_drops=0
+    /// depth_pool_key 300x300  fmt=130 pooled=4 hits=112 allocs=2554 admits=120 cap_drops=2545
+    /// ```
+    ///
+    /// **Two** distinct keys for the whole boot, so the geometry prediction above
+    /// holds and key diversity is not the problem. The problem is the ratio:
+    /// 2665 attachments came back and **120 were admitted while 2545 were
+    /// cap-dropped**, with the pool pinned at its per-key cap of 4 and creates
+    /// still missing 2554 times.
+    ///
+    /// That pattern is not a cap that is merely too small — it is returns
+    /// arriving in bursts. `dispose` routes a handle to the graveyard whenever
+    /// `gpu_work_open()`, and the graveyard only drains once `in_flight` reaches
+    /// zero, so a whole run of draws hands its depth attachments back at one
+    /// instant: the first few are admitted, the rest are dropped, and every
+    /// create until the next drain finds the pool empty again.
+    ///
+    /// So the next attempt must not start by raising the cap. Picking a number
+    /// that makes this reading look better is deriving a constant from an
+    /// observation, which the ground rules forbid, and it would pin one
+    /// display-sized standalone allocation per unit of whatever number is
+    /// chosen. What has to be understood first is the graveyard's drain
+    /// granularity — how many depth attachments are outstanding between two
+    /// `in_flight == 0` moments, and whether that is itself a defect. The whole
+    /// experiment is reproducible from this doc; the pool itself was reverted
+    /// rather than shipped, because a mechanism that recovers 4 % of what it was
+    /// added for is more code for no measured benefit.
     pub(crate) unsafe fn create_transient_depth(
         &mut self,
         ctx: &DeviceContext,
