@@ -222,6 +222,39 @@ driven boot** when you mean to act on a result. The accumulated log spans
 builds, so a field that is constant there may only be code that has since
 changed.
 
+### Finding Comments That Describe Deleted Code
+
+A doc link to an item that no longer exists reads exactly like one that does, so
+a reader follows it and concludes the mechanism is still there. This is not a
+formatting nit — it is the comment asserting something false about the code,
+which is what "Write Comments For The Code" forbids. Two separate dead ends in
+one session came from believing such a comment.
+
+rustdoc already finds them; nothing was reading its output.
+
+```sh
+cargo doc -p reims-vgpu --no-deps --no-default-features \
+  --features backend-vulkan,host-window 2>&1 |
+  grep -o 'unresolved link to `[^`]*`'
+```
+
+Most hits are **not** stale: an item cfg'd out on the arm being documented
+(`backend::metal` from a vulkan build) is unresolved and perfectly correct, and
+that is the majority. Keep only targets that match no `fn`/`struct`/`enum`/
+`const` anywhere in `src/` — those name something deleted. At the 628b37e sweep
+that filter cut 64 hits to 12, all twelve real.
+
+Do not `deny(rustdoc::broken_intra_doc_links)`; the cross-arm hits are load-bearing
+and would have to be silenced individually.
+
+Deleting a function is when this gets created. Its doc comment does not go with
+it if the deletion is done by hand — and a doc block with no item under it does
+not error, it silently concatenates onto the **next** item's doc. Twice in one
+session that left a real contract explanation attached to an unrelated function
+while the function it described had none. A detector for the blank-line-separated
+form finds zero crate-wide; the adjacent form is not mechanically detectable, so
+check by eye when you delete an item.
+
 ### Counting A Deduped Family Does Not Give You A Rate
 
 Fourteen log families are emitted behind `observe::first_sight`, which fires
