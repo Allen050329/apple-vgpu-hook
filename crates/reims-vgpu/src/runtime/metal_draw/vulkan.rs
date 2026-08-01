@@ -5794,6 +5794,35 @@ fn ranges_touch_window(ranges: &[(u64, u64)], base_off: u64, span_end: u64) -> b
 /// — most mappings are never armed with a guest-write token — so the currency
 /// test mostly answers "cannot vouch", but it no longer *always* does.
 ///
+/// # The whole ladder, and the inversion since
+///
+/// A later driven boot — Chess, Maps, the WebGL aquarium, page-downs, a
+/// title-bar drag, apple.com — summing `store_routes` deltas across the boot:
+///
+/// ```text
+/// t11rung_resident   7166  (76 %)   gw_clean 6552   gw_no_stamp  614
+/// t11rung_host_cache 1791  (19 %)   gw_clean  432   gw_no_stamp 1359
+/// t11rung_zero_copy   415  (4.4 %)
+/// t11rung_guest_memo   47  (0.5 %)
+/// t11rung_resident_refused 1
+/// ```
+///
+/// Two things to carry forward. **`gw_clean` and `gw_no_stamp` read the other
+/// way round on the resident rung** — 242/426 against 6552/614. Whether that is
+/// the build or the workload is not established: the two readings differ in
+/// both, and this boot drove two native apps and a WebGL page the earlier one
+/// did not. What is safe is that the paragraph above no longer describes any
+/// reading we have, so do not reason from it. The host-cache rung still reads
+/// the old way *in the same boot*, which says the two rungs are not arming
+/// guest-write tokens alike whatever the cause.
+///
+/// And **all four rungs carry traffic**. The thin ones are thin, not empty:
+/// `guest_memo` is 0.5 % of samples and `zero_copy` 4.4 %, so neither is a dead
+/// fallback that can be deleted to shorten the ladder. Deleting either loses
+/// content the guest asked for. Shortening this ladder is a question about the
+/// PVG contract — where a sampled surface's content is *supposed* to live — and
+/// not one a traffic census can settle.
+///
 /// The other six cells of the (rung × verdict) table have never fired on this
 /// pathway: `gw_no_mapping` and `gw_unreadable` on either rung, and
 /// `gw_wrote_elsewhere` on either rung. They are denominators, not dead code —
