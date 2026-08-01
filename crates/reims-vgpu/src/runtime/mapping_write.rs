@@ -419,10 +419,23 @@ pub fn write_bgra8_skipping<M: HostMemory + HostOps>(
     //
     // `row` is the *conversion* destination: when the mapping's format is
     // already BGRA8 there is nothing to convert, and staging through it copied
-    // every byte of the frame a second time. On the composite surface that is a
-    // whole extra 8 MB memcpy per flush, ~106 times a second — measured at
-    // 0.83 ms of a 2.68 ms guest-page write, against 0.83 ms for the identical
-    // number of bytes on the readback's own memcpy.
+    // every byte of the frame a second time — an extra 8 MB memcpy per flush on
+    // the composite surface, ~106 times a second.
+    //
+    // Removing it is strictly less work for identical bytes, but do not go
+    // looking for it in `readback_split`. It was landed on the prediction that
+    // `write_us` would drop by the ~0.8 ms the same byte count costs elsewhere,
+    // and a live driven boot then measured 2.79 ms per flush against 2.68 ms
+    // before — no change outside run-to-run noise. The prediction was wrong
+    // about *which* copy is expensive: `row` is a few KiB and stays in L1, so
+    // filling it is nearly free, while the copy into cold guest pages is the
+    // one that costs and is still there. `write_us` runs at ~3 GB/s against
+    // ~9 GB/s for the readback's own memcpy of the identical frame, which is
+    // the shape of a cache-cold scattered write, not of an avoidable pass.
+    //
+    // The consequence for whoever shrinks this next: the cost is bytes landing
+    // in guest RAM, so fewer bytes helps proportionally and fewer staging hops
+    // does not.
     //
     // Only sound while the row is byte-identical, which is why `tight` is
     // compared rather than assumed: `tight_row_bytes` is the format's own
