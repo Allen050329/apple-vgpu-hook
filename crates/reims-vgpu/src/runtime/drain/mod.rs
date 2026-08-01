@@ -427,6 +427,30 @@ pub fn write_stamp<H: HostMemory + HostOps>(
     }
 }
 
+/// What the GPU behind this host can execute, for the device-info keys that
+/// describe the GPU rather than the protocol.
+///
+/// The Metal backend serves an Apple GPU to an Apple guest, so the table's own
+/// values already describe the executing device and there is nothing to reduce.
+/// The Vulkan backend runs on anything from a discrete part to an iGPU at the
+/// Vulkan floor, which is exactly the case a fixed table gets wrong.
+fn device_info_limits() -> crate::model::DeviceInfoLimits {
+    #[cfg(not(feature = "backend-vulkan"))]
+    {
+        crate::model::DeviceInfoLimits {
+            max_sample_count: u32::MAX,
+            d24_stencil8: true,
+            max_threads_per_threadgroup: [u32::MAX; 3],
+            max_threadgroup_memory_bytes: u32::MAX,
+            native_fp16: true,
+        }
+    }
+    #[cfg(feature = "backend-vulkan")]
+    {
+        crate::backend::vulkan::engine::device_info_limits()
+    }
+}
+
 fn reply_device_info<H: HostMemory + HostOps>(
     host: &mut H,
     count: u32,
@@ -446,7 +470,31 @@ fn reply_device_info<H: HostMemory + HostOps>(
         ));
         return Err(MemError::BadArgs);
     }
-    let n = (DEVICE_INFO_CAPS.len() as u32).min(count).min(max_pairs);
+    let limits = device_info_limits();
+    let caps = crate::model::device_info_caps(&limits);
+    // Printed on every reply, not only when something is reduced. A host that
+    // already meets the table reduces nothing, and then silence would be
+    // indistinguishable from the derivation never having run — which is exactly
+    // the failure mode this line exists to rule out on a rig whose GPU exceeds
+    // every entry. `reduced` names what the guest was told to stop expecting.
+    let reduced: Vec<String> = caps
+        .iter()
+        .zip(DEVICE_INFO_CAPS)
+        .filter(|((_, served), (_, table))| served != table)
+        .map(|((key, served), (_, table))| format!("key{key}={served}(was {table})"))
+        .collect();
+    crate::observe::off(format!(
+        "device_info host_samples={} host_d24s8={} host_threads={}x{}x{} host_tg_mem={} host_fp16={} reduced=[{}]",
+        limits.max_sample_count,
+        u8::from(limits.d24_stencil8),
+        limits.max_threads_per_threadgroup[0],
+        limits.max_threads_per_threadgroup[1],
+        limits.max_threads_per_threadgroup[2],
+        limits.max_threadgroup_memory_bytes,
+        u8::from(limits.native_fp16),
+        reduced.join(" ")
+    ));
+    let n = (caps.len() as u32).min(count).min(max_pairs);
     // When guest asks for more than one page of pairs, still write at most a
     // page of caps + optional sentinel only if room remains.
     let write_sentinel = n < count && n.saturating_add(1) <= max_pairs;
@@ -456,7 +504,7 @@ fn reply_device_info<H: HostMemory + HostOps>(
         ));
     }
     for i in 0..n {
-        let (key, value) = DEVICE_INFO_CAPS[i as usize];
+        let (key, value) = caps[i as usize];
         let mut pair = [0u8; DEVICE_INFO_REPLY_PAIR_LEN];
         st32(&mut pair[0..4], key);
         st32(&mut pair[4..8], value);

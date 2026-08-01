@@ -320,8 +320,15 @@ mod tests {
             h.get_u32(pfn_to_gpa(reply_pfn, PAGE_SHIFT_ARM64E)),
             DEVICE_INFO_CAPS[0].0
         );
-        assert_eq!(
-            h.get_u32(pfn_to_gpa(reply_pfn, PAGE_SHIFT_ARM64E) + 4),
+        // The value is asserted as a bound, not as the table entry. The
+        // GPU-dependent keys are reduced to what the host can execute, and in a
+        // test there is no resolved device, so the answer is the backend's
+        // floor. Pinning the table entry here would pin the over-promise the
+        // reduction exists to prevent.
+        let served = h.get_u32(pfn_to_gpa(reply_pfn, PAGE_SHIFT_ARM64E) + 4);
+        assert!(
+            served >= 1 && served <= DEVICE_INFO_CAPS[0].1,
+            "served {served} must be a reduction of {}",
             DEVICE_INFO_CAPS[0].1
         );
     }

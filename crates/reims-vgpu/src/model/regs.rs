@@ -288,7 +288,72 @@ pub fn negotiate_protocol_version(requested: u32) -> u32 {
     requested.min(PROTOCOL_VERSION_MAX)
 }
 
+/// Wire keys of the device-info reply whose value is a property of the GPU that
+/// actually executes the guest's work, not of the protocol.
+///
+/// The guest driver stores the reply into a capability struct and hands it to
+/// its Metal plugin, which answers `maxThreadsPerThreadgroup`,
+/// `maxThreadgroupMemoryLength`, `supportsSampleCount:` and
+/// `isDepth24Stencil8PixelFormatSupported` straight out of it. Every one of
+/// those is an instruction to the guest about what it may build. Answering
+/// higher than the host can execute does not degrade gracefully — the guest
+/// sizes a threadgroup, declares threadgroup memory, or names a depth format,
+/// and the host then refuses the pipeline that comes back.
+pub const DEVICE_INFO_KEY_MAX_SAMPLE_COUNT: u32 = 1;
+pub const DEVICE_INFO_KEY_D24_STENCIL8: u32 = 2;
+pub const DEVICE_INFO_KEY_MAX_THREADS_W: u32 = 3;
+pub const DEVICE_INFO_KEY_MAX_THREADS_H: u32 = 4;
+pub const DEVICE_INFO_KEY_MAX_THREADS_D: u32 = 5;
+pub const DEVICE_INFO_KEY_THREADGROUP_MEMORY: u32 = 6;
+pub const DEVICE_INFO_KEY_NATIVE_FP16: u32 = 9;
+
+/// What the host GPU can actually do, for the keys above.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeviceInfoLimits {
+    pub max_sample_count: u32,
+    pub d24_stencil8: bool,
+    pub max_threads_per_threadgroup: [u32; 3],
+    pub max_threadgroup_memory_bytes: u32,
+    pub native_fp16: bool,
+}
+
+/// The device-info reply for this host, with the GPU-dependent keys reduced to
+/// what `limits` says the host can execute.
+///
+/// Reduction only. [`DEVICE_INFO_CAPS`] is the set of answers this pathway has
+/// been exercised at, so it stays the ceiling: a host that can do more is not a
+/// reason to promise the guest something no boot here has ever run, and a host
+/// that can do less must not be promised anything at all.
+pub fn device_info_caps(limits: &DeviceInfoLimits) -> Vec<(u32, u32)> {
+    DEVICE_INFO_CAPS
+        .iter()
+        .map(|&(key, value)| {
+            let host = match key {
+                DEVICE_INFO_KEY_MAX_SAMPLE_COUNT => limits.max_sample_count,
+                DEVICE_INFO_KEY_D24_STENCIL8 => u32::from(limits.d24_stencil8),
+                DEVICE_INFO_KEY_MAX_THREADS_W => limits.max_threads_per_threadgroup[0],
+                DEVICE_INFO_KEY_MAX_THREADS_H => limits.max_threads_per_threadgroup[1],
+                DEVICE_INFO_KEY_MAX_THREADS_D => limits.max_threads_per_threadgroup[2],
+                DEVICE_INFO_KEY_THREADGROUP_MEMORY => limits.max_threadgroup_memory_bytes,
+                DEVICE_INFO_KEY_NATIVE_FP16 => u32::from(limits.native_fp16),
+                _ => return (key, value),
+            };
+            (key, value.min(host))
+        })
+        .collect()
+}
+
 /// Device-info capability table (key, value) — wire ABI from live bring-up.
+///
+/// Keys 1..=17 are the ones the macOS 13.7.8 guest driver parses; its reply
+/// walker discards anything above 17 and stops at key 0. The higher keys are
+/// kept because they came from a live capture and a newer guest may read them —
+/// removing values whose meaning is not established would be trading one guess
+/// for another. `reply_device_info` writes the zero terminator, which is what
+/// stops the guest walking the rest of the page.
+///
+/// The GPU-dependent subset is not served from here directly: see
+/// [`device_info_caps`].
 pub const DEVICE_INFO_CAPS: &[(u32, u32)] = &[
     (1, 8),
     (2, 1),
@@ -387,6 +452,58 @@ pub fn stamp_slot_offset(index: u32, page_bytes: u64) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A host that can do more than the table does not raise a single answer.
+    ///
+    /// The table is the set of values this pathway has been exercised at. The
+    /// derivation exists to stop over-promising a weak host, not to start
+    /// promising a strong one something no boot here has run.
+    #[test]
+    fn a_more_capable_host_never_raises_a_device_info_answer() {
+        let generous = DeviceInfoLimits {
+            max_sample_count: 64,
+            d24_stencil8: true,
+            max_threads_per_threadgroup: [4096, 4096, 4096],
+            max_threadgroup_memory_bytes: 262_144,
+            native_fp16: true,
+        };
+        assert_eq!(device_info_caps(&generous), DEVICE_INFO_CAPS.to_vec());
+    }
+
+    /// A host at the Vulkan floor is told to the guest as the floor.
+    ///
+    /// Each of these is an instruction the guest acts on: it sizes threadgroups
+    /// from the thread maxima, declares threadgroup memory up to the limit, and
+    /// names a packed depth/stencil format if told one exists. Answering the
+    /// table's fixed values on such a host is how a guest builds work the host
+    /// then refuses.
+    #[test]
+    fn a_host_at_the_vulkan_floor_reduces_every_gpu_dependent_answer() {
+        let floor = DeviceInfoLimits {
+            max_sample_count: 1,
+            d24_stencil8: false,
+            max_threads_per_threadgroup: [128, 128, 64],
+            max_threadgroup_memory_bytes: 16384,
+            native_fp16: false,
+        };
+        let served: std::collections::BTreeMap<u32, u32> =
+            device_info_caps(&floor).into_iter().collect();
+        assert_eq!(served[&DEVICE_INFO_KEY_MAX_SAMPLE_COUNT], 1);
+        assert_eq!(served[&DEVICE_INFO_KEY_D24_STENCIL8], 0);
+        assert_eq!(served[&DEVICE_INFO_KEY_MAX_THREADS_W], 128);
+        assert_eq!(served[&DEVICE_INFO_KEY_MAX_THREADS_H], 128);
+        assert_eq!(served[&DEVICE_INFO_KEY_MAX_THREADS_D], 64);
+        assert_eq!(served[&DEVICE_INFO_KEY_THREADGROUP_MEMORY], 16384);
+        assert_eq!(served[&DEVICE_INFO_KEY_NATIVE_FP16], 0);
+
+        // Keys that describe the protocol rather than the GPU are untouched by
+        // any host: reducing the serializer version or the primitive-type mask
+        // would be answering a question the host GPU was never asked.
+        let table: std::collections::BTreeMap<u32, u32> = DEVICE_INFO_CAPS.iter().copied().collect();
+        for key in [7u32, 8, 10, 11, 12, 13, 14, 15, 16, 17] {
+            assert_eq!(served[&key], table[&key], "key {key} must not depend on host");
+        }
+    }
 
     #[test]
     fn child_register_blocks_cover_only_real_child_channels() {

@@ -517,6 +517,37 @@ pub fn max_render_target_dimension() -> u32 {
         .unwrap_or(crate::backend::vulkan::caps::device_features::VULKAN_MIN_IMAGE_DIMENSION_2D)
 }
 
+/// What this Vulkan device can execute, for the GPU-dependent half of the
+/// guest's device-info reply.
+///
+/// Before a device is resolved the answer is the Vulkan 1.2 floor rather than
+/// the reply table's own values: the served reply is only ever *reduced* by
+/// this, so a boot that answers before the device is up must not be the one
+/// that promises the most.
+pub fn device_info_limits() -> crate::model::DeviceInfoLimits {
+    use crate::backend::vulkan::caps::device_features::{
+        VULKAN_MIN_COMPUTE_SHARED_MEMORY_BYTES, VULKAN_MIN_COMPUTE_WORKGROUP_SIZE,
+    };
+    lock_engine()
+        .owner
+        .ctx
+        .as_ref()
+        .map(|ctx| crate::model::DeviceInfoLimits {
+            max_sample_count: ctx.features.max_sample_count,
+            d24_stencil8: ctx.features.d24_unorm_s8_attachment,
+            max_threads_per_threadgroup: ctx.features.max_compute_workgroup_size,
+            max_threadgroup_memory_bytes: ctx.features.max_compute_shared_memory_bytes,
+            native_fp16: ctx.features.float16,
+        })
+        .unwrap_or(crate::model::DeviceInfoLimits {
+            max_sample_count: 1,
+            d24_stencil8: false,
+            max_threads_per_threadgroup: VULKAN_MIN_COMPUTE_WORKGROUP_SIZE,
+            max_threadgroup_memory_bytes: VULKAN_MIN_COMPUTE_SHARED_MEMORY_BYTES,
+            native_fp16: false,
+        })
+}
+
 /// `(maxTotalThreadsPerThreadgroup, threadExecutionWidth)` for this host, as
 /// the guest's `CmdGetComputeInfo` asks for them.
 ///

@@ -66,6 +66,13 @@ pub const VULKAN_MIN_IMAGE_DIMENSION_2D: u32 = 4096;
 /// a queried value is clamped to, and as the answer when no device is resolved.
 pub const VULKAN_MIN_COMPUTE_WORKGROUP_INVOCATIONS: u32 = 128;
 
+/// `maxComputeWorkGroupSize` from the same spec table: 128 in x and y, 64 in z.
+pub const VULKAN_MIN_COMPUTE_WORKGROUP_SIZE: [u32; 3] = [128, 128, 64];
+
+/// `maxComputeSharedMemorySize` from the same spec table — 16 KiB, half of what
+/// the device-info table promised unconditionally.
+pub const VULKAN_MIN_COMPUTE_SHARED_MEMORY_BYTES: u32 = 16384;
+
 /// Every device feature and format capability this backend depends on, resolved
 /// against one physical device.
 ///
@@ -95,6 +102,28 @@ pub struct DeviceFeatures {
     /// AMD's wave64 parts, 8/16/32 on Intel), which is why it is asked for
     /// rather than assumed.
     pub subgroup_size: u32,
+    /// `VkPhysicalDeviceLimits::maxComputeWorkGroupSize` — the guest's
+    /// `maxThreadsPerThreadgroup` width/height/depth. Separate from
+    /// [`Self::max_compute_workgroup_invocations`], which bounds their product:
+    /// a device can allow 1024 in x and still refuse 1024x1024x64 threads.
+    pub max_compute_workgroup_size: [u32; 3],
+    /// `VkPhysicalDeviceLimits::maxComputeSharedMemorySize` — the guest's
+    /// `maxThreadgroupMemoryLength`. The Vulkan 1.2 floor is 16 KiB, so
+    /// answering a fixed 32 KiB is an over-promise on any device at the floor:
+    /// the guest builds kernels declaring that much threadgroup memory and the
+    /// host then refuses every pipeline made from them.
+    pub max_compute_shared_memory_bytes: u32,
+    /// Highest MSAA sample count usable for both colour and depth attachments
+    /// *and* for sampled images — the intersection, because the guest gets one
+    /// number and uses it for all three. Answering higher than the host can
+    /// render makes the guest build multisample targets this device cannot
+    /// create.
+    pub max_sample_count: u32,
+    /// `D24_UNORM_S8_UINT` usable as a depth/stencil attachment with optimal
+    /// tiling. Not spec-mandatory and genuinely absent on some desktop drivers,
+    /// which is why the guest is told rather than assumed: a guest that thinks
+    /// it has a packed 24/8 depth format will name one.
+    pub d24_unorm_s8_attachment: bool,
     pub shader_int16: bool,
     pub storage_image_extended_formats: bool,
     pub storage_image_write_without_format: bool,
@@ -232,6 +261,31 @@ pub unsafe fn query(
             .optimal_tiling_features
             .contains(vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR);
 
+    // The guest is handed ONE sample-count answer and uses it for colour
+    // attachments, depth attachments and sampled images alike, so the honest
+    // answer is the intersection of the three masks.
+    let sample_mask = props.limits.framebuffer_color_sample_counts
+        & props.limits.framebuffer_depth_sample_counts
+        & props.limits.sampled_image_color_sample_counts;
+    let max_sample_count = [
+        vk::SampleCountFlags::TYPE_16,
+        vk::SampleCountFlags::TYPE_8,
+        vk::SampleCountFlags::TYPE_4,
+        vk::SampleCountFlags::TYPE_2,
+    ]
+    .into_iter()
+    .find(|f| sample_mask.contains(*f))
+    .map(|f| f.as_raw())
+    // Single-sample is the only count the spec requires, and it is the one
+    // answer that cannot make the guest build a target this host refuses.
+    .unwrap_or(1);
+
+    let d24_unorm_s8_attachment = unsafe {
+        instance.get_physical_device_format_properties(pd, vk::Format::D24_UNORM_S8_UINT)
+    }
+    .optimal_tiling_features
+    .contains(vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT);
+
     // Prefer the 1.2 core feature over the extension: it needs no extension
     // string and it is the spelling the baseline guarantees exists to ask about.
     let mirror_clamp_to_edge = if supported_vulkan12.sampler_mirror_clamp_to_edge == vk::TRUE {
@@ -257,6 +311,10 @@ pub unsafe fn query(
         // A device reporting 0 is out of spec; one lane is the only answer that
         // cannot make the guest oversize a dispatch.
         subgroup_size: subgroup.subgroup_size.max(1),
+        max_compute_workgroup_size: props.limits.max_compute_work_group_size,
+        max_compute_shared_memory_bytes: props.limits.max_compute_shared_memory_size,
+        max_sample_count,
+        d24_unorm_s8_attachment,
         shader_int16: supported.shader_int16 == vk::TRUE,
         storage_image_extended_formats: supported.shader_storage_image_extended_formats == vk::TRUE,
         storage_image_write_without_format: supported.shader_storage_image_write_without_format
@@ -284,6 +342,10 @@ mod tests {
             max_image_dimension_2d: 16384,
             max_compute_workgroup_invocations: 1024,
             subgroup_size: 64,
+            max_compute_workgroup_size: [1024, 1024, 64],
+            max_compute_shared_memory_bytes: 32768,
+            max_sample_count: 8,
+            d24_unorm_s8_attachment: true,
             shader_int16: true,
             storage_image_extended_formats: true,
             storage_image_write_without_format: true,
