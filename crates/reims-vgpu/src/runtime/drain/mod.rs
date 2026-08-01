@@ -3141,8 +3141,25 @@ pub(crate) struct DrainDutyCensus {
     flush_us: std::sync::atomic::AtomicU64,
     flushes: std::sync::atomic::AtomicU64,
     max_tranche_us: std::sync::atomic::AtomicU64,
+    /// Longest single Flush in the window. `flush_us/flushes` is a mean, and a
+    /// mean cannot tell "every flush costs 7.7 ms" from "most are free and one
+    /// blocked 30 ms" — which are different defects with different fixes.
+    max_flush_us: std::sync::atomic::AtomicU64,
+    /// Tranches that held the device lock for at least one whole guest frame.
+    /// `max_tranche_us` is a max with no count, so it cannot distinguish one
+    /// 38 ms tranche from three 20 ms ones; this is that count.
+    slow_tranches: std::sync::atomic::AtomicU64,
     last_report_ms: std::sync::atomic::AtomicU64,
 }
+
+/// A tranche at or above this held the device lock for a whole guest frame.
+///
+/// Derived from the VBL cadence we actually deliver, because that *is* the
+/// budget: the vCPU blocks on the same mutex this tranche holds, so a tranche
+/// longer than one frame interval is one the guest cannot have serviced in
+/// time. Deriving it also means it tracks the refresh rate instead of becoming
+/// a stale constant beside it.
+const DRAIN_TRANCHE_SLOW_US: u64 = DISPLAY_VBL_MIN_INTERVAL_US;
 
 impl DrainDutyCensus {
     /// Count one skipped tranche (lock never taken).
@@ -3161,6 +3178,9 @@ impl DrainDutyCensus {
         };
         total.fetch_add(us, Relaxed);
         count.fetch_add(1, Relaxed);
+        if matches!(phase, DrainPhase::Flush) {
+            self.max_flush_us.fetch_max(us, Relaxed);
+        }
     }
 
     /// Accumulate one completed tranche and return the line when a report is
@@ -3173,8 +3193,11 @@ impl DrainDutyCensus {
         self.tranches.fetch_add(1, Relaxed);
         self.drain_us.fetch_add(drain_us, Relaxed);
         self.publish_us.fetch_add(publish_us, Relaxed);
-        self.max_tranche_us
-            .fetch_max(drain_us.saturating_add(publish_us), Relaxed);
+        let tranche_us = drain_us.saturating_add(publish_us);
+        self.max_tranche_us.fetch_max(tranche_us, Relaxed);
+        if tranche_us >= DRAIN_TRANCHE_SLOW_US {
+            self.slow_tranches.fetch_add(1, Relaxed);
+        }
         let last = self.last_report_ms.load(Relaxed);
         // First call arms the window; it does not report a duty against a zero
         // origin, which would divide the whole boot's idle time into one tranche.
@@ -3198,13 +3221,16 @@ impl DrainDutyCensus {
         let computes = self.computes.swap(0, Relaxed);
         let flush = self.flush_us.swap(0, Relaxed);
         let flushes = self.flushes.swap(0, Relaxed);
+        let max_flush = self.max_flush_us.swap(0, Relaxed);
+        let slow = self.slow_tranches.swap(0, Relaxed);
         let busy = drain.saturating_add(publish);
         let duty = busy as f64 / (win_ms as f64 * 1000.0);
         Some(format!(
             "drain_duty win_ms={win_ms} tranches={tranches} skipped={skipped} busy_us={busy} \
              duty={duty:.3} drain_us={drain} publish_us={publish} max_tranche_us={max} \
              draw_us={draw} draws={draws} compute_us={compute} computes={computes} \
-             flush_us={flush} flushes={flushes}"
+             flush_us={flush} flushes={flushes} max_flush_us={max_flush} \
+             slow_tranches={slow}/{tranches} slow_us={DRAIN_TRANCHE_SLOW_US}"
         ))
     }
 }

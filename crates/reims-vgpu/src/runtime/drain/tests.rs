@@ -1789,6 +1789,51 @@ fn the_drain_duty_census_reads_a_rate_over_its_window_and_splits_the_two_phases(
     );
 }
 
+/// A mean flush cost cannot name the defect; the tail can.
+///
+/// `flush_us/flushes` reads the same for "every flush costs 7.7 ms" and "most
+/// are free and one blocked 30 ms", and those are different defects with
+/// different fixes — eliminate the per-frame work, versus find the one stall.
+/// Likewise `max_tranche_us` is a max with no count, so one 38 ms tranche and
+/// three 20 ms ones are indistinguishable. Both gaps are what let a continuous
+/// per-frame cost read as an occasional hitch.
+#[test]
+fn the_drain_duty_census_separates_a_flush_tail_from_a_flush_mean() {
+    use crate::runtime::drain::{DrainDutyCensus, DrainPhase};
+    let c = DrainDutyCensus::default();
+    assert!(c.note(0, 0, 5_000).is_none(), "first call arms only");
+
+    // Nine cheap flushes and one long one: the mean is unremarkable, the tail
+    // is the whole story.
+    for _ in 0..9 {
+        c.note_phase(DrainPhase::Flush, 1_000);
+    }
+    c.note_phase(DrainPhase::Flush, 30_000);
+    // Two tranches over a frame budget and one comfortably under it.
+    c.note(30_000, 0, 5_500);
+    c.note(9_000, 0, 5_600);
+    c.note(1_000, 0, 5_700);
+    let line = c
+        .note(0, 0, 6_100)
+        .expect("a full window must report")
+        .to_string();
+
+    assert!(line.contains("max_flush_us=30000"), "{line}");
+    assert!(line.contains("flush_us=39000 flushes=10"), "{line}");
+    // Mean is 3.9 ms and would look healthy against an 8 ms budget; the tail is
+    // nearly four times the whole budget.
+    // Five tranches, not four: the call that closes the window is itself a
+    // tranche and is counted in the window it reports.
+    assert!(
+        line.contains("slow_tranches=2/5"),
+        "two of five tranches held the lock at least a frame: {line}"
+    );
+    // The threshold is derived from the delivered VBL cadence, not written
+    // down, so it tracks the refresh rate rather than aging beside it.
+    assert!(line.contains("slow_us=8333"), "{line}");
+}
+
+
 /// A guest display reinit (SETUP_SHARED_STATE while already ONLINE) that
 /// arrives *after* boot-convergence self-labels with one correlated
 /// `post_converge_display_reinit` line — the smoking gun for the intermittent

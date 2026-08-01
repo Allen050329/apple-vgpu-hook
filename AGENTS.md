@@ -202,6 +202,16 @@ about backgrounding; it fired whenever the surrounding command mentioned the
 process name. Check the log's mtime, not just its contents — a stale log from a
 previous boot reads exactly like a fresh failed one.
 
+The bracket only protects the pattern from itself. **Any other literal mention
+of the target name in the same command line is still matched**, so
+
+```sh
+pkill -f 'boot-x8[6]'; vm/boot-x86.sh ...     # still suicide
+```
+
+dies too: `boot-x8[6]` matches the `vm/boot-x86.sh` later on the same line.
+Sweep in one command and start the thing you swept for in the next.
+
 A boot must also outlive the shell that starts it, or a driver with its own
 timeout takes the VM down mid-measurement — `boot-x86.sh` traps the signal and
 kills QEMU, so the run ends looking like a guest failure:
