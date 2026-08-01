@@ -112,23 +112,63 @@ override, EGL attribute or Chrome flag can reach it, and it returns `EGL_NO_DISP
 `EGL_SUCCESS` and no message — which is why it reads as an unexplained failure. Chrome flag
 combinations are therefore not worth another session; the gate is a device capability.
 
-Which capability is now pinned down, and it is **not** a blanket "Apple pinned us to family 1".
-Measured on the live guest: `supportsFeatureSet` is **true** for `macOS_GPUFamily1_v1/v2/v3/v4`
-and false only for `macOS_GPUFamily2_v1`; `argumentBuffersSupport` is **Tier 1**. The device
-genuinely is Metal 2 — which is what its own `ioreg` reports — and `MTLGPUFamilyMac2` corresponds
-to `macOS_GPUFamily2_v1`, whose headline requirement is Tier 2 argument buffers.
+Which capability is now pinned down. Measured on the live guest: `supportsFeatureSet` is **true**
+for `macOS_GPUFamily1_v1/v2/v3/v4` and false only for `macOS_GPUFamily2_v1`;
+`argumentBuffersSupport` is **Tier 1**; `supportsFamily` is Mac1 yes, Mac2 no, Common1/2 yes,
+Common3 no.
 
-**Whether the host can raise that is an open question, not a settled no.** An earlier note in this
-file asserted a hardcoded `featureProfile` of `10000` making it host-independent; that assertion is
-**refuted** — a device pinned at 10000 could not report `macOS_GPUFamily1_v4` true. Do not repeat
-it. The live lead is that the protocol version ladder leaves `metalHeaps` off until rung 43 and
-`bufferFromIOSurface` off until rung 60 while this guest negotiates rung 4, and Tier 2 argument
-buffers are closely tied to heap support.
+**This is settled, and it is settled against us on the x86 pathway.** Two constants decide it,
+both of them compile-time immediates with no inputs:
 
-**Hardware OpenGL does not exist in the guest.** Apple's Metal plugin returns `supportsOpenGL = 0`
-unconditionally and the kext's `Info.plist` declares no `IOGLBundleName`, so the guest's only CGL
-renderer is the software one. Anything whose acceleration route is OpenGL — Firefox's compositor
-among them — has no hardware path without shipping a guest driver, which this project does not do.
+- Metal.framework's `-[_MTLDevice indirectArgumentBufferCapabilities]` returns a **literal 0**, and
+  `-[_MTLDevice argumentBuffersSupport]` reports Tier 2 only when three low bits of that value are
+  all set. Apple's paravirt plugin overrides neither, nor `supportsFamily:`, nor
+  `supportsFeatureSet:`, so a base-class literal answers. **Tier 1 is decided inside Metal itself**,
+  not by the plugin, not by the kext, and not by anything the host sends.
+- `-[AppleParavirtDevice featureProfile]` returns a **literal 10000**, and Metal's
+  `initGPUFamilySupport` switches on exactly that value to build the family vector
+  `supportsFamily:` linearly searches: 10000 pushes Common1/Common2/**Mac1**, and only 10001 pushes
+  **Mac2**.
+
+**Two earlier claims in this file were wrong in opposite directions. Do not restore either.**
+
+The first said `featureProfile = 10000` is hardcoded and host-independent. That was **right**.
+The second "refuted" it on the grounds that a device pinned at 10000 could not report
+`macOS_GPUFamily1_v4` true. That refutation is **unsound**: feature sets 10000, 10001, 10003 and
+10004 — `macOS_GPUFamily1_v1` through `v4` — all map onto the *same* `MTLGPUFamilyMac1`, and only
+`macOS_GPUFamily2_v1` (10005) needs Mac2. A device at profile 10000 reports v1–v4 true and v2_v1
+false, which is precisely what was measured. The measurement never contradicted the constant.
+
+**The rung ladder is not a route to Tier 2.** Rungs 43 and 60 move `metalHeaps` and
+`bufferFromIOSurface` in the guest's feature struct, which the plugin reads for `supportsHeaps` and
+`supportsBufferWithIOSurface`. Neither `featureProfile` nor `indirectArgumentBufferCapabilities`
+ever reads that struct. Raising the rung cannot raise the tier; drop that lead.
+
+**The live lead is the pathway, not the protocol.** The x86/PCI personality and the arm64 one load
+*different* Metal plugin bundles, named by `MetalPluginName` in each kext personality, and the two
+bundles carry different `featureProfile` immediates: the PCI one **10000** (Mac1), the arm64
+IOGPUFamily one **10001** (Mac2). If that holds, `supportsFamily:MTLGPUFamilyMac2` is **true** on
+the arm64 pathway and ANGLE's gate passes, so **Chrome's GPU acceleration is an x86-pathway defect,
+not a paravirtualization one**. That is a concrete falsifiable prediction and it is untested — no
+one has run Chrome on an arm64 guest here. Test it before building anything on it, and note that
+the arm64 plugin subclasses a different device base class, so "the bytes say 10001" is not yet
+"Chrome works".
+
+Raising the rung remains mechanically available for its own sake: the guest writes a fixed 4 to
+`GFX_REG_VERSION` and then switches on the value it **reads back**, so the host decides the
+effective rung. Apple's host only ever clamps down, so doing so is out of contract — and on the
+x86 plugin heaps are hard-disabled at source regardless (`newHeapWithDescriptor:` returns nil).
+
+**Hardware OpenGL does not exist in the guest on the x86 pathway.** The PCI personality's Metal
+plugin returns `supportsOpenGL = 0` from an unconditional literal, and the kext's `Info.plist`
+declares no `IOGLBundleName`, so the guest's only CGL renderer is the software one. Anything whose
+acceleration route is OpenGL — Firefox's compositor among them — has no hardware path there without
+shipping a guest driver, which this project does not do.
+
+Narrow this claim to x86 deliberately: in the arm64 IOGPUFamily bundle the same selector is **not**
+a literal — it forwards to the serializer's own `supportsOpenGL`. Whether that ever answers yes is
+unknown and untested. Same shape as the `featureProfile` split above, and the same warning: this
+was read out of the binaries statically and has not been confirmed on a running arm64 guest.
 
 Safari is unaffected: it uses Metal directly rather than through ANGLE, and Mac1 is sufficient for
 it. Treat Safari as the browser where browser-facing GPU goals are actually measurable.

@@ -269,8 +269,9 @@ pub const MAPPER_REQUEST_ENTRY_LEN: usize = 16;
 
 /// Highest protocol version this host implements.
 ///
-/// The guest writes the highest version *it* speaks to `GFX_REG_VERSION`, reads
-/// the register back, and switches on what it read to fill its feature struct:
+/// The guest writes a **fixed** 4 to `GFX_REG_VERSION` — not the highest
+/// version it speaks, which is 62 — then reads the register back and switches on
+/// *what it read* to fill its feature struct:
 /// object tables, the child doorbell, EFI display, heaps, buffer-from-IOSurface,
 /// the FIFO depth and the D32S8 stencil byte count. The ladder's top rung is 62;
 /// **every value above 62 falls into the guest's default arm, which turns every
@@ -279,6 +280,14 @@ pub const MAPPER_REQUEST_ENTRY_LEN: usize = 16;
 ///
 /// 62 is not a fitted constant: it is the top rung of the guest's own switch and
 /// the clamp Apple's host-side implementation applies to the same register.
+///
+/// Because the guest switches on the read-back rather than on what it wrote, the
+/// effective rung is whatever the host leaves here, and a host may legally land
+/// the guest **above** the 4 it asked for. Apple's own host does not: it clamps
+/// down and never up, so a stock guest runs at rung 4 with `metalHeaps` and
+/// `bufferFromIOSurface` off. Raising it is therefore in-mechanism but
+/// out-of-contract, and it does not reach Metal's device families — see
+/// `AGENTS.md`, "What The Guest Driver Puts Out Of Reach".
 pub const PROTOCOL_VERSION_MAX: u32 = 62;
 
 /// What this host writes back for a guest-requested protocol version.
