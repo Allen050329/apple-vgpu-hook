@@ -5335,13 +5335,23 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                                 })
                                 .flatten()
                                 .map(|b| b.to_vec());
-                            // See `seed_color_load`'s sibling count: this is the
-                            // other surviving reader of the GVA encode cache and
-                            // its serve rate is what decides whether that map,
-                            // its byte cap and its backing revalidation are worth
-                            // keeping. `names_these_pages` is already scored by
-                            // `gvac_*`; what has never been counted is how often
-                            // a lookup that passes it actually finds bytes.
+                            // Unlike the sibling in `seed_color_load`, which
+                            // serves every colour LOAD seed the device produces,
+                            // this door read **0 serve and 0 miss** over a driven
+                            // x86/Vulkan window that carried 1 558 of them — so
+                            // the enclosing `target_gva != 0` block did not
+                            // execute at all. The seed is already resolved by
+                            // then: `color_target_request` calls `seed_color_load`
+                            // while building the request, so `target_rgba8` is
+                            // supplied before this arm is consulted.
+                            //
+                            // Zero over one window is thinner evidence than the
+                            // 286 800 that convicted the sampled rung, and this
+                            // is a branch rather than a rail, so the counters
+                            // stay for one more driven boot. A second window at
+                            // 0/0 retires this whole arm, and with it the last
+                            // caller of `note_gva_backing_verdict` and
+                            // `revalidate_gva_backing`.
                             crate::runtime::drain::note_store_route(if served.is_some() {
                                 "gvac_seed_vk_serve"
                             } else {

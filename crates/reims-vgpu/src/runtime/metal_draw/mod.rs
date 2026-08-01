@@ -3965,25 +3965,31 @@ fn seed_color_load<M: HostMemory + HostOps>(
             // stored-once-sampled-forever entry warm.
             crate::runtime::surface_cache::touch_gva(state, target_gva, width, height);
         }
-        // How often this reader takes the GVA encode cache, counted apart from
-        // the texture_ref cache it falls back to. The sampled reader of the same
-        // map was deleted after its counters showed it served 0 times in 286 800
-        // attempts; this one and the sibling in `try_metal2vulkan_draw` are the
-        // two that remain, and neither has ever had a serve rate. Whether the
-        // map is worth its 128 MiB cap, its LRU and its backing revalidation
-        // turns on that number, and it is not derivable from anything logged
-        // today. Pure count; nothing reads it back.
-        let from_gva = if target_gva != 0 {
+        // This is the reader that keeps `DeviceState::host_gva_surfaces` alive,
+        // and the measurement is unambiguous. One driven x86/Vulkan boot (four
+        // Safari pages, each scrolled six times then title-bar dragged;
+        // `.agents/repros/gva-seed-serve-census.sh`) served **1 558 colour LOAD
+        // seeds from this lookup and missed 0**. `load_seed_ok_color` was 1 558
+        // in the same window, so every colour LOAD seed the device produced came
+        // from here; the other 1 462 of `load_seed_ok` are type-11 and take
+        // `resolve_type11_load_seed`.
+        //
+        // That is what a LOAD seed is worth: `MTLLoadActionLoad` says the guest
+        // is drawing onto the content already in this attachment, so a seed that
+        // is not found leaves every texel the pass does not itself draw
+        // undefined — a rectangle of a compositing layer going blank until
+        // something redraws the whole thing.
+        //
+        // So the map is load-bearing, and the deletion its cost invites is not
+        // available. Two other readers of it were removed on measurements that
+        // said the opposite (the sampled rung, 0 serves in 286 800 attempts);
+        // this one is why the map, its byte cap and its eviction policy stay.
+        let cached = if target_gva != 0 {
             crate::runtime::surface_cache::get_gva(state, target_gva, width, height)
         } else {
             None
-        };
-        crate::runtime::drain::note_store_route(if from_gva.is_some() {
-            "gvac_seed_cpu_serve"
-        } else {
-            "gvac_seed_cpu_miss"
-        });
-        let cached = from_gva.or_else(|| {
+        }
+        .or_else(|| {
             (texture_ref != 0)
                 .then(|| {
                     crate::runtime::surface_cache::get_texture(state, texture_ref, width, height)
