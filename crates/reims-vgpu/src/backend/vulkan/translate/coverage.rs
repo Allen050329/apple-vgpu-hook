@@ -1250,10 +1250,6 @@ pub const DECODE_STRUCT_EXCLUSIONS: &[(&str, &str)] = &[
         "a normalized command-stream record envelope: segment identity and byte ranges route the payload to a rail decoder",
     ),
     (
-        "resource::ObjectEntry",
-        "the outer object-table envelope: type, reference, flags, and record length route an embedded descriptor but are not descriptor state",
-    ),
-    (
         "resource::CompactTlv",
         "compact TLV framing retained by the resource decoder; its tag and offsets locate descriptor fields rather than becoming GPU state",
     ),
@@ -1633,8 +1629,8 @@ mod tests {
         );
         assert_eq!(
             (structs.len(), actual_enums.len()),
-            (44, 18),
-            "the public decode type census moved; keep the 44-struct field \
+            (43, 18),
+            "the public decode type census moved; keep the 43-struct field \
              manifest and 18-enum inventory exhaustive, then update this pin"
         );
     }

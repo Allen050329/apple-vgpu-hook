@@ -161,14 +161,6 @@ pub const MTL_INDIRECT_CMD_CONCURRENT_DISPATCH_THREADS: u32 = 1 << 6;
 pub const MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS: u32 = 1 << 7;
 pub const MTL_INDIRECT_CMD_DRAW_MESH_THREADS: u32 = 1 << 8;
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ObjectEntry {
-    pub object_type: u8,
-    pub flags: u8,
-    pub ref_: u32,
-    pub length: u32,
-}
-
 /// Compact type-7 TLV field: `[tag:u8][length:u8][value…]` after a field-count byte.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CompactTlv {
@@ -908,19 +900,6 @@ pub fn list_object_entry_offset(ref_: u32, entry_count: u32) -> Option<u64> {
         return None;
     }
     (ref_ as u64).checked_mul(OBJECT_LIST_ENTRY_LEN as u64)
-}
-
-/// Legacy planner ObjectEntry (type/flags/ref/length) — not the wire list format.
-pub fn decode_object_entry(bytes: &[u8]) -> Result<ObjectEntry, DecodeStatus> {
-    if bytes.len() < 16 {
-        return Err(DecodeStatus::ErrShort("res_object_entry_short"));
-    }
-    Ok(ObjectEntry {
-        object_type: bytes[0],
-        flags: bytes[1],
-        ref_: ld32(&bytes[4..]),
-        length: ld32(&bytes[8..]),
-    })
 }
 
 pub fn decode_buffer_descriptor(bytes: &[u8]) -> Result<BufferDescriptor, DecodeStatus> {
@@ -2598,13 +2577,7 @@ mod tests {
     }
 
     #[test]
-    fn object_entry_and_buffer() {
-        let mut e = [0u8; 16];
-        e[0] = 1;
-        st32(&mut e[4..], 3);
-        st32(&mut e[8..], 0x30);
-        let ent = decode_object_entry(&e).unwrap();
-        assert_eq!(ent.object_type, 1);
+    fn list_entry_and_buffer() {
         // Live list offset: ref * 12
         assert_eq!(list_object_entry_offset(3, 10), Some(36));
 
