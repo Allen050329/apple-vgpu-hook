@@ -800,35 +800,13 @@ fn apply_icb_compute_encoder_inheritance<M: HostMemory + HostOps>(
                 let sd = decode_sampler_descriptor(&desc_bytes).map_err(|_| {
                     ComputeStatus::MissingSampler("compute_icb_inherit_ab_sampler_decode")
                 })?;
-                let mut lod_min = sd.lod_min_clamp.to_bits();
-                let mut lod_max = sd.lod_max_clamp.to_bits();
-                let mut has_lod = 1u32;
-                if s.has_lod_clamp {
-                    lod_min = s.lod_min_bits;
-                    lod_max = s.lod_max_bits;
-                    has_lod = 1;
-                }
-                let reims_vgpu = ReimsVgpuSampler {
-                    binding: REIMS_VGPU_BINDING_SAMPLER_BASE + s.index,
-                    unnormalized: if sd.normalized_coordinates { 0 } else { 1 },
-                    min_filter: sd.min_filter,
-                    mag_filter: sd.mag_filter,
-                    mip_filter: sd.mip_filter,
-                    s_address_mode: sd.s_address,
-                    t_address_mode: sd.t_address,
-                    r_address_mode: sd.r_address,
-                    border_color: sd.border_color,
-                    compare_function: sd.compare_function,
-                    lod_min_bits: lod_min,
-                    lod_max_bits: lod_max,
-                    max_anisotropy: sd.max_anisotropy.max(1),
-                    lod_average: if sd.lod_average { 1 } else { 0 },
-                    // AB-resident samplers must support argument buffers.
-                    support_argument_buffers: 1,
-                    has_lod_clamp: has_lod,
-                    clamp_lod_min_bits: lod_min,
-                    clamp_lod_max_bits: lod_max,
-                };
+                // AB-resident samplers must support argument buffers.
+                let reims_vgpu = crate::runtime::metal_draw::sampler_record(
+                    REIMS_VGPU_BINDING_SAMPLER_BASE + s.index,
+                    &sd,
+                    s.has_lod_clamp.then_some((s.lod_min_bits, s.lod_max_bits)),
+                    true,
+                );
                 let mut err_buf = [0i8; 256];
                 let samp = make_explicit_sampler(
                     &session.device,
@@ -1036,34 +1014,12 @@ fn apply_icb_compute_encoder_inheritance<M: HostMemory + HostOps>(
                     let sd = decode_sampler_descriptor(&desc_bytes).map_err(|_| {
                         ComputeStatus::MissingSampler("compute_icb_inherit_sampler_decode")
                     })?;
-                    let mut lod_min = sd.lod_min_clamp.to_bits();
-                    let mut lod_max = sd.lod_max_clamp.to_bits();
-                    let mut has_lod = 1u32;
-                    if s.has_lod_clamp {
-                        lod_min = s.lod_min_bits;
-                        lod_max = s.lod_max_bits;
-                        has_lod = 1;
-                    }
-                    reims_vgpu_samplers.push(ReimsVgpuSampler {
-                        binding: REIMS_VGPU_BINDING_SAMPLER_BASE + s.index,
-                        unnormalized: if sd.normalized_coordinates { 0 } else { 1 },
-                        min_filter: sd.min_filter,
-                        mag_filter: sd.mag_filter,
-                        mip_filter: sd.mip_filter,
-                        s_address_mode: sd.s_address,
-                        t_address_mode: sd.t_address,
-                        r_address_mode: sd.r_address,
-                        border_color: sd.border_color,
-                        compare_function: sd.compare_function,
-                        lod_min_bits: lod_min,
-                        lod_max_bits: lod_max,
-                        max_anisotropy: sd.max_anisotropy.max(1),
-                        lod_average: if sd.lod_average { 1 } else { 0 },
-                        support_argument_buffers: if sd.support_argument_buffers { 1 } else { 0 },
-                        has_lod_clamp: has_lod,
-                        clamp_lod_min_bits: lod_min,
-                        clamp_lod_max_bits: lod_max,
-                    });
+                    reims_vgpu_samplers.push(crate::runtime::metal_draw::sampler_record(
+                        REIMS_VGPU_BINDING_SAMPLER_BASE + s.index,
+                        &sd,
+                        s.has_lod_clamp.then_some((s.lod_min_bits, s.lod_max_bits)),
+                        false,
+                    ));
                 }
                 let mut err_buf = [0i8; 256];
                 let err = (err_buf.as_mut_ptr(), err_buf.len());

@@ -2519,6 +2519,136 @@ fn default_sampler(binding: u32) -> crate::backend::metal::abi::ReimsVgpuSampler
     }
 }
 
+/// The Metal sampler ABI record for a decoded type-7 sampler descriptor.
+///
+/// One constructor for every encoder that builds this record — the render path,
+/// the direct compute path, and both ICB-inherit paths. It is an eighteen-field
+/// `repr(C)` mirror of a C struct, so a field added or reinterpreted in one
+/// copy and not the others is a silent ABI disagreement rather than a build
+/// error.
+///
+/// Two things the descriptor does not settle, and the caller does:
+///
+/// - `lod_clamp` is the clamp carried by the guest's *sampler binding* rather
+///   than by the sampler object. When present it replaces the descriptor's own
+///   clamp; the binding is the later statement.
+/// - `argument_buffers` forces `support_argument_buffers` on for a sampler that
+///   is resident in an argument buffer. That residency is a property of how the
+///   pipeline binds it, which the type-7 descriptor cannot state.
+///
+/// `has_lod_clamp` is always 1: both clamp fields are filled on every path
+/// here, from the binding when it carried one and from the descriptor
+/// otherwise. [`default_sampler`] is the one record with no clamp to describe.
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+pub(crate) fn sampler_record(
+    binding: u32,
+    sd: &crate::runtime::decode::resource::SamplerDescriptor,
+    lod_clamp: Option<(u32, u32)>,
+    argument_buffers: bool,
+) -> crate::backend::metal::abi::ReimsVgpuSampler {
+    use crate::backend::metal::abi::ReimsVgpuSampler;
+    let (lod_min, lod_max) = lod_clamp.unwrap_or((
+        sd.lod_min_clamp.to_bits(),
+        sd.lod_max_clamp.to_bits(),
+    ));
+    ReimsVgpuSampler {
+        binding,
+        unnormalized: if sd.normalized_coordinates { 0 } else { 1 },
+        min_filter: sd.min_filter,
+        mag_filter: sd.mag_filter,
+        mip_filter: sd.mip_filter,
+        s_address_mode: sd.s_address,
+        t_address_mode: sd.t_address,
+        r_address_mode: sd.r_address,
+        border_color: sd.border_color,
+        compare_function: sd.compare_function,
+        lod_min_bits: lod_min,
+        lod_max_bits: lod_max,
+        max_anisotropy: sd.max_anisotropy.max(1),
+        lod_average: if sd.lod_average { 1 } else { 0 },
+        support_argument_buffers: if argument_buffers || sd.support_argument_buffers {
+            1
+        } else {
+            0
+        },
+        has_lod_clamp: 1,
+        clamp_lod_min_bits: lod_min,
+        clamp_lod_max_bits: lod_max,
+    }
+}
+
+#[cfg(all(test, feature = "backend-metal", target_os = "macos"))]
+mod sampler_record_tests {
+    use crate::runtime::decode::resource::SamplerDescriptor;
+
+    fn descriptor() -> SamplerDescriptor {
+        SamplerDescriptor {
+            min_filter: 1,
+            mag_filter: 1,
+            mip_filter: 2,
+            s_address: 3,
+            t_address: 4,
+            r_address: 5,
+            max_anisotropy: 0,
+            lod_min_clamp: 0.25,
+            lod_max_clamp: 8.0,
+            compare_function: 6,
+            border_color: 1,
+            normalized_coordinates: true,
+            support_argument_buffers: false,
+            lod_average: true,
+        }
+    }
+
+    /// The sampler *binding*'s clamp is the later statement and replaces the
+    /// sampler object's own, in both the reported and the clamp field pair.
+    #[test]
+    fn the_binding_clamp_replaces_the_descriptor_clamp() {
+        let sd = descriptor();
+        let from_object = super::sampler_record(64, &sd, None, false);
+        assert_eq!(from_object.lod_min_bits, 0.25f32.to_bits());
+        assert_eq!(from_object.lod_max_bits, 8.0f32.to_bits());
+        assert_eq!(from_object.clamp_lod_min_bits, from_object.lod_min_bits);
+        assert_eq!(from_object.clamp_lod_max_bits, from_object.lod_max_bits);
+
+        let from_binding = super::sampler_record(64, &sd, Some((7, 9)), false);
+        assert_eq!(from_binding.lod_min_bits, 7);
+        assert_eq!(from_binding.lod_max_bits, 9);
+        assert_eq!(from_binding.clamp_lod_min_bits, 7);
+        assert_eq!(from_binding.clamp_lod_max_bits, 9);
+    }
+
+    /// Argument-buffer residency is the caller's to state and can only add
+    /// support, never withdraw what the descriptor already granted.
+    #[test]
+    fn argument_buffer_residency_only_adds_support() {
+        let mut sd = descriptor();
+        assert_eq!(
+            super::sampler_record(64, &sd, None, false).support_argument_buffers,
+            0
+        );
+        assert_eq!(
+            super::sampler_record(64, &sd, None, true).support_argument_buffers,
+            1
+        );
+        sd.support_argument_buffers = true;
+        assert_eq!(
+            super::sampler_record(64, &sd, None, false).support_argument_buffers,
+            1
+        );
+    }
+
+    /// Anisotropy of zero is not a Metal value; every encoder floored it at one
+    /// and the shared record keeps doing so.
+    #[test]
+    fn anisotropy_is_floored_at_one() {
+        let mut sd = descriptor();
+        assert_eq!(super::sampler_record(64, &sd, None, false).max_anisotropy, 1);
+        sd.max_anisotropy = 4;
+        assert_eq!(super::sampler_record(64, &sd, None, false).max_anisotropy, 4);
+    }
+}
+
 /// Fail-visible diagnosis when a bound sample ref does not materialize.
 ///
 /// Kept off the success path; only called after a sampled resolver
@@ -2812,7 +2942,7 @@ fn load_sampler<M: HostMemory + HostOps>(
     sampler_ref: u32,
     slot: u32,
 ) -> Result<crate::backend::metal::abi::ReimsVgpuSampler, MetalStateDecline> {
-    use crate::backend::metal::abi::{ReimsVgpuSampler, REIMS_VGPU_BINDING_SAMPLER_BASE};
+    use crate::backend::metal::abi::REIMS_VGPU_BINDING_SAMPLER_BASE;
     let entry = objects::lookup_list_entry(state, host, task_id, sampler_ref).ok_or(
         MetalStateDecline::SamplerEntryMissing {
             sampler_ref,
@@ -2838,26 +2968,12 @@ fn load_sampler<M: HostMemory + HostOps>(
             index: slot,
             reason,
         })?;
-    Ok(ReimsVgpuSampler {
-        binding: REIMS_VGPU_BINDING_SAMPLER_BASE + slot,
-        unnormalized: if s.normalized_coordinates { 0 } else { 1 },
-        min_filter: s.min_filter,
-        mag_filter: s.mag_filter,
-        mip_filter: s.mip_filter,
-        s_address_mode: s.s_address,
-        t_address_mode: s.t_address,
-        r_address_mode: s.r_address,
-        border_color: s.border_color,
-        compare_function: s.compare_function,
-        lod_min_bits: s.lod_min_clamp.to_bits(),
-        lod_max_bits: s.lod_max_clamp.to_bits(),
-        max_anisotropy: s.max_anisotropy.max(1),
-        lod_average: if s.lod_average { 1 } else { 0 },
-        support_argument_buffers: if s.support_argument_buffers { 1 } else { 0 },
-        has_lod_clamp: 1,
-        clamp_lod_min_bits: s.lod_min_clamp.to_bits(),
-        clamp_lod_max_bits: s.lod_max_clamp.to_bits(),
-    })
+    Ok(sampler_record(
+        REIMS_VGPU_BINDING_SAMPLER_BASE + slot,
+        &s,
+        None,
+        false,
+    ))
 }
 
 #[cfg(feature = "backend-vulkan")]
