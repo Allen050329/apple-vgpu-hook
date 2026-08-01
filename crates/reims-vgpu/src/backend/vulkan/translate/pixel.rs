@@ -341,8 +341,7 @@ pub fn storage_image(mtl: u16) -> Result<StorageImageFormat, TranslateReason> {
         pf::MTL_FORMAT_RGB9E5_FLOAT => return Ok(StorageImageFormat::Rgb9e5Ufloat),
         _ => {}
     }
-    let (selector, _bpp) =
-        pf::storage_selector(mtl).ok_or(TranslateReason::NoStorageImageFormat(mtl))?;
+    let selector = pf::storage_selector(mtl).ok_or(TranslateReason::NoStorageImageFormat(mtl))?;
     storage_image_from_selector(selector as u32)
 }
 

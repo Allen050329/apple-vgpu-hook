@@ -566,21 +566,31 @@ pub fn sampled_class(format: u16) -> Option<SampledClass> {
     })
 }
 
-pub fn storage_selector(format: u16) -> Option<(StorageImageSelector, u32)> {
+/// Which storage-image selector a Metal format maps to, or `None` for a format
+/// this host will not expose as a storage image.
+///
+/// The texel width is **not** returned. It used to be, as a second column
+/// beside each selector, and the only thing that column was ever used for was a
+/// `debug_assert_eq!` against [`bytes_per_pixel`] at three of the four call
+/// sites — the fourth discarded it. A number stated twice that nothing reads is
+/// a number that can disagree with itself in a release build, where a
+/// `debug_assert` is not compiled at all. `storage_texel_width_matches_the_pixel_table`
+/// now holds the same invariant for every `u16`, at test time, exhaustively.
+pub fn storage_selector(format: u16) -> Option<StorageImageSelector> {
     Some(match format {
-        MTL_FORMAT_R8_UNORM => (StorageImageSelector::R8Unorm, R8_BPP),
-        MTL_FORMAT_R32_UINT => (StorageImageSelector::R32Uint, R32_BPP),
-        MTL_FORMAT_RG8_UNORM => (StorageImageSelector::Rg8Unorm, RG8_BPP),
-        MTL_FORMAT_R16_FLOAT => (StorageImageSelector::R16Float, R16F_BPP),
-        MTL_FORMAT_RG16_FLOAT => (StorageImageSelector::Rg16Float, RG16F_BPP),
-        MTL_FORMAT_RGBA8_UNORM => (StorageImageSelector::Rgba8Unorm, RGBA8_BPP),
-        MTL_FORMAT_BGRA8_UNORM => (StorageImageSelector::Bgra8Unorm, BGRA8_BPP),
-        MTL_FORMAT_RGBA8_UINT => (StorageImageSelector::Rgba8Uint, RGBA8_BPP),
-        MTL_FORMAT_RGBA8_SINT => (StorageImageSelector::Rgba8Sint, RGBA8_BPP),
-        MTL_FORMAT_RGBA16_UINT => (StorageImageSelector::Rgba16Uint, RGBA16_BPP),
-        MTL_FORMAT_RGBA16_FLOAT => (StorageImageSelector::Rgba16Float, RGBA16F_BPP),
-        MTL_FORMAT_RGBA32_UINT => (StorageImageSelector::Rgba32Uint, RGBA32_BPP),
-        MTL_FORMAT_RGBA32_FLOAT => (StorageImageSelector::Rgba32Float, RGBA32F_BPP),
+        MTL_FORMAT_R8_UNORM => StorageImageSelector::R8Unorm,
+        MTL_FORMAT_R32_UINT => StorageImageSelector::R32Uint,
+        MTL_FORMAT_RG8_UNORM => StorageImageSelector::Rg8Unorm,
+        MTL_FORMAT_R16_FLOAT => StorageImageSelector::R16Float,
+        MTL_FORMAT_RG16_FLOAT => StorageImageSelector::Rg16Float,
+        MTL_FORMAT_RGBA8_UNORM => StorageImageSelector::Rgba8Unorm,
+        MTL_FORMAT_BGRA8_UNORM => StorageImageSelector::Bgra8Unorm,
+        MTL_FORMAT_RGBA8_UINT => StorageImageSelector::Rgba8Uint,
+        MTL_FORMAT_RGBA8_SINT => StorageImageSelector::Rgba8Sint,
+        MTL_FORMAT_RGBA16_UINT => StorageImageSelector::Rgba16Uint,
+        MTL_FORMAT_RGBA16_FLOAT => StorageImageSelector::Rgba16Float,
+        MTL_FORMAT_RGBA32_UINT => StorageImageSelector::Rgba32Uint,
+        MTL_FORMAT_RGBA32_FLOAT => StorageImageSelector::Rgba32Float,
         _ => return None,
     })
 }
@@ -1142,14 +1152,14 @@ mod tests {
         assert_eq!(sampled_class(MTL_FORMAT_R16_FLOAT), None);
         assert_eq!(
             storage_selector(MTL_FORMAT_R8_UNORM),
-            Some((StorageImageSelector::R8Unorm, 1))
+            Some(StorageImageSelector::R8Unorm)
         );
         assert_eq!(storage_selector(MTL_FORMAT_A8_UNORM), None);
         // R32Uint is storage-capable (specialized to the R32ui storage path);
         // its single-channel sint/float siblings are not.
         assert_eq!(
             storage_selector(MTL_FORMAT_R32_UINT),
-            Some((StorageImageSelector::R32Uint, R32_BPP))
+            Some(StorageImageSelector::R32Uint)
         );
         assert_eq!(storage_selector(MTL_FORMAT_R32_SINT), None);
         assert_eq!(storage_selector(MTL_FORMAT_R32_FLOAT), None);
@@ -1316,6 +1326,64 @@ mod tests {
         }
         let _ = f64_to_unorm8(0.5);
         let _ = f16_to_f32(0x3c00); // 1.0
+    }
+
+    /// Every storage-capable format has a texel width, and it is the width the
+    /// selector table used to carry beside it.
+    ///
+    /// This replaces three `debug_assert_eq!(selector_bpp, bpp)` at the
+    /// `compute_exec` staging call sites. Those checked the same thing, but only
+    /// for formats a running guest happened to bind, and only in a debug build —
+    /// a release build compiled them out entirely, so the disagreement they
+    /// guarded against would have shipped silently. Sweeping the whole `u16`
+    /// space costs microseconds and cannot miss an arm.
+    ///
+    /// The widths are spelled out rather than derived, because that is the point:
+    /// a change to `bytes_per_pixel` that silently redefined a storage format's
+    /// stride is exactly what the deleted column existed to catch.
+    #[test]
+    fn storage_texel_width_matches_the_pixel_table() {
+        let expected: &[(u16, u32)] = &[
+            (MTL_FORMAT_R8_UNORM, R8_BPP),
+            (MTL_FORMAT_R32_UINT, R32_BPP),
+            (MTL_FORMAT_RG8_UNORM, RG8_BPP),
+            (MTL_FORMAT_R16_FLOAT, R16F_BPP),
+            (MTL_FORMAT_RG16_FLOAT, RG16F_BPP),
+            (MTL_FORMAT_RGBA8_UNORM, RGBA8_BPP),
+            (MTL_FORMAT_BGRA8_UNORM, BGRA8_BPP),
+            (MTL_FORMAT_RGBA8_UINT, RGBA8_BPP),
+            (MTL_FORMAT_RGBA8_SINT, RGBA8_BPP),
+            (MTL_FORMAT_RGBA16_UINT, RGBA16_BPP),
+            (MTL_FORMAT_RGBA16_FLOAT, RGBA16F_BPP),
+            (MTL_FORMAT_RGBA32_UINT, RGBA32_BPP),
+            (MTL_FORMAT_RGBA32_FLOAT, RGBA32F_BPP),
+        ];
+        for (fmt, bpp) in expected {
+            assert!(
+                storage_selector(*fmt).is_some(),
+                "format {fmt:#x} lost its storage selector"
+            );
+            assert_eq!(
+                bytes_per_pixel(*fmt),
+                Some(*bpp),
+                "storage format {fmt:#x} changed texel width"
+            );
+        }
+
+        // And no arm was added to one table without the other. Exhaustive, so
+        // the two lists cannot drift apart in either direction.
+        for fmt in 0u16..=u16::MAX {
+            if storage_selector(fmt).is_some() {
+                assert!(
+                    bytes_per_pixel(fmt).is_some(),
+                    "storage-capable {fmt:#x} has no texel width"
+                );
+                assert!(
+                    expected.iter().any(|(f, _)| *f == fmt),
+                    "storage-capable {fmt:#x} is not pinned above"
+                );
+            }
+        }
     }
 
     #[test]

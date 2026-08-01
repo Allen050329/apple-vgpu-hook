@@ -1447,11 +1447,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             ));
             return Err(ComputeStatus::Unsupported("compute_heap_fmt_bytes"));
         };
-        let storage_selector =
-            pixel_format::storage_selector(format).map(|(selector, selector_bpp)| {
-                debug_assert_eq!(selector_bpp, bpp);
-                selector as u32
-            });
+        let storage_selector = pixel_format::storage_selector(format).map(|s| s as u32);
         if is_storage && storage_selector.is_none() {
             crate::observe::fail(format!(
                 "compute_stage_tex heap_fail reason=fmt_storage ref={texture_ref} heap={heap_ref} fmt={format:#x} {width}x{height}"
@@ -1738,11 +1734,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
                 return Err(ComputeStatus::Unsupported("stage_tex_fmt_bytes"));
             }
         };
-        let storage_selector =
-            pixel_format::storage_selector(stage_fmt).map(|(selector, selector_bpp)| {
-                debug_assert_eq!(selector_bpp, bpp);
-                selector as u32
-            });
+        let storage_selector = pixel_format::storage_selector(stage_fmt).map(|s| s as u32);
         if is_storage && storage_selector.is_none() {
             crate::observe::fail(format!(
                 "compute_stage_tex type11_fail reason=fmt_storage mapping={mapping_id} {width}x{height} fmt={format:#x}"
@@ -2073,11 +2065,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             format!("fmt={stage_format:#x}"),
         );
     };
-    let storage_selector =
-        pixel_format::storage_selector(stage_format).map(|(selector, selector_bpp)| {
-            debug_assert_eq!(selector_bpp, bpp);
-            selector as u32
-        });
+    let storage_selector = pixel_format::storage_selector(stage_format).map(|s| s as u32);
     if is_storage && storage_selector.is_none() {
         return linear_fail(
             ComputeStatus::Unsupported("linear_tex_fmt_storage"),

@@ -1743,10 +1743,7 @@ fn storage_format_specialization_preserves_raw_views_and_runtime_shape() {
     // storage_selector now maps 0x35, and both format bridges round-trip it.
     assert_eq!(
         pixel_format::storage_selector(pixel_format::MTL_FORMAT_R32_UINT),
-        Some((
-            pixel_format::StorageImageSelector::R32Uint,
-            pixel_format::R32_BPP
-        ))
+        Some(pixel_format::StorageImageSelector::R32Uint)
     );
     assert_eq!(
         simg_u32_to_engine_storage(pixel_format::StorageImageSelector::R32Uint as u32),
