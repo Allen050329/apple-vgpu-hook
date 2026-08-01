@@ -578,16 +578,11 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                     );
                 }
                 let (rgb_nz, max_rgb) = rgb_stats(&rgba);
-                crate::observe::fail(format!(
-                    "linux_m2v_store gva={:#x} {}x{} pipe={} ok={} rgb_nz={} max={}",
-                    c0.target_gva,
-                    c0.width,
-                    c0.height,
-                    req.pipeline_ref,
-                    gva_ok as u8,
-                    rgb_nz,
-                    max_rgb
-                ));
+                // A Store that lands is expected control flow and belongs on
+                // the census channel, not the failure one — "non-OFF lines are
+                // the failures" is the rule the whole always-on log is triaged
+                // by. Only the loss gets a failure line, and it carries the
+                // census fields so nothing has to be correlated across two.
                 crate::observe::off(format!(
                     "m2v_store_gva gva={:#x} {}x{} pipe={} tex_ref={} load={} ok={} rgb_nz={} max_rgb={} bpr={}",
                     c0.target_gva,
@@ -601,15 +596,26 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                     max_rgb,
                     c0.row_stride
                 ));
+                if !gva_ok {
+                    crate::observe::fail(format!(
+                        "linux_m2v_store lost gva={:#x} {}x{} pipe={} tex_ref={} rgb_nz={} max={} bpr={}",
+                        c0.target_gva,
+                        c0.width,
+                        c0.height,
+                        req.pipeline_ref,
+                        c0.texture_ref,
+                        rgb_nz,
+                        max_rgb,
+                        c0.row_stride
+                    ));
+                }
                 gva_ok
             } else {
+                // No target to write: the frame is lost, so this one is a
+                // failure line and there is no census twin to correlate with.
                 let (rgb_nz, max_rgb) = rgb_stats(&rgba);
                 crate::observe::fail(format!(
-                    "linux_m2v_store no_target pipe={} rgb_nz={} max={}",
-                    req.pipeline_ref, rgb_nz, max_rgb
-                ));
-                crate::observe::off(format!(
-                    "m2v_store_no_target pipe={} tex_ref={} rgb_nz={} max_rgb={}",
+                    "linux_m2v_store no_target pipe={} tex_ref={} rgb_nz={} max={}",
                     req.pipeline_ref, c0.texture_ref, rgb_nz, max_rgb
                 ));
                 false

@@ -1005,7 +1005,19 @@ fn compute_defer_readback_allowed(
 }
 
 /// Bound on mirror entries per mapping: a ping-pong canvas needs 2, planar
-/// layouts a few more; anything beyond is stale-key debris worth dropping.
+/// layouts a few more; anything beyond is assumed to be stale-key debris.
+///
+/// **The 8 is not derived, and the eviction below is the only thing standing
+/// between this map and unbounded growth.** If every stale key were already
+/// invalidated — `invalidate_storage_residency_window` runs on every overlap,
+/// and every guest-page writer calls it — no cap would be needed at all, and
+/// this would be a mechanism covering for an incomplete invalidation rather
+/// than a bound. Which of those it is has never been measured, because the
+/// eviction was silent.
+///
+/// `compute_mirror_evicted` is that measurement. Reading zero across a driven
+/// boot says the cap never binds and can go; reading non-zero says a live
+/// window is being dropped and names the mapping to go look at.
 const STORAGE_RESIDENCY_WINDOWS_PER_MAPPING: usize = 8;
 
 fn note_storage_residency_writeback(state: &mut DeviceState, texture: &StagedTexture) {
@@ -1050,6 +1062,16 @@ fn note_storage_residency_writeback(state: &mut DeviceState, texture: &StagedTex
         .take((siblings.len() + 1).saturating_sub(STORAGE_RESIDENCY_WINDOWS_PER_MAPPING))
     {
         state.compute_storage_residency.remove(victim);
+        // Dropping a mirror entry costs the next read of that window its
+        // resident and sends it back to guest pages. That is safe, but it is
+        // not free and it must not be invisible.
+        crate::observe::off(format!(
+            "compute_mirror_evicted mid={mapping_id} off={} end={} siblings={} cap={}",
+            victim.surface_offset,
+            victim.span_end,
+            siblings.len(),
+            STORAGE_RESIDENCY_WINDOWS_PER_MAPPING
+        ));
     }
     state
         .compute_storage_residency
