@@ -434,13 +434,25 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             }
             Ok(out)
         }
-        OP_SET_VERTEX_TEXTURE | OP_SET_FRAGMENT_TEXTURE => {
-            // Archive layout: [first:u32][count:u32][ ref:u32 × count ]
+        OP_SET_VERTEX_TEXTURE
+        | OP_SET_FRAGMENT_TEXTURE
+        | OP_SET_VERTEX_SAMPLER
+        | OP_SET_FRAGMENT_SAMPLER => {
+            // Archive layout: [first:u32][count:u32][ ref:u32 × count ]. All four
+            // opcodes are that one record crossed with two independent axes —
+            // which stage the refs bind to, and whether they name textures or
+            // samplers — so the record is decoded once and the axes read off the
+            // opcode.
             if payload.len() < BIND_ENTRIES {
                 return Err(DecodeStatus::ErrShort);
             }
-            out.kind = Kind::SetTexture;
-            out.stage = if opcode == OP_SET_VERTEX_TEXTURE {
+            let textures = opcode == OP_SET_VERTEX_TEXTURE || opcode == OP_SET_FRAGMENT_TEXTURE;
+            out.kind = if textures {
+                Kind::SetTexture
+            } else {
+                Kind::SetSampler
+            };
+            out.stage = if opcode == OP_SET_VERTEX_TEXTURE || opcode == OP_SET_VERTEX_SAMPLER {
                 Stage::Vertex
             } else {
                 Stage::Fragment
@@ -459,38 +471,14 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
                 let e = BIND_ENTRIES + i * REF_BIND_ENTRY_SIZE;
                 out.ref_binds.push(ld32(&payload[e..]));
             }
+            // The single-ref field the rest of the runtime reads for a one-slot
+            // bind; which of the two it is, is the same axis as `kind`.
             if let Some(&r) = out.ref_binds.first() {
-                out.texture_ref = r;
-            }
-            Ok(out)
-        }
-        OP_SET_VERTEX_SAMPLER | OP_SET_FRAGMENT_SAMPLER => {
-            // Archive layout: [first:u32][count:u32][ ref:u32 × count ]
-            if payload.len() < BIND_ENTRIES {
-                return Err(DecodeStatus::ErrShort);
-            }
-            out.kind = Kind::SetSampler;
-            out.stage = if opcode == OP_SET_VERTEX_SAMPLER {
-                Stage::Vertex
-            } else {
-                Stage::Fragment
-            };
-            out.first = ld32(&payload[BIND_FIRST..]);
-            out.count = ld32(&payload[BIND_COUNT..]);
-            if out.count == 0 || out.count > MAX_BIND_ENTRIES {
-                return Err(DecodeStatus::ErrBadLength);
-            }
-            let need = BIND_ENTRIES + (out.count as usize) * REF_BIND_ENTRY_SIZE;
-            if payload.len() < need {
-                return Err(DecodeStatus::ErrShort);
-            }
-            out.ref_binds.clear();
-            for i in 0..out.count as usize {
-                let e = BIND_ENTRIES + i * REF_BIND_ENTRY_SIZE;
-                out.ref_binds.push(ld32(&payload[e..]));
-            }
-            if let Some(&r) = out.ref_binds.first() {
-                out.sampler_ref = r;
+                if textures {
+                    out.texture_ref = r;
+                } else {
+                    out.sampler_ref = r;
+                }
             }
             Ok(out)
         }
@@ -508,7 +496,7 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             // compact draw was rejected `ErrShort` and dropped. Silently, until
             // the decode refusal was named: one fired on the first arm64 boot
             // that could report it.
-            if command_length != DRAW_COMPACT_CMD_LEN || payload.len() < DRAW_COMPACT_PAYLOAD_LEN {
+            if command_length != DRAW_COMPACT_CMD_LEN {
                 return Err(DecodeStatus::ErrBadLength);
             }
             out.kind = Kind::Draw;
@@ -555,7 +543,7 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             // u32 indexCount@8, u32 pad@0xc, u32 indexBufferOffset@0x10,
             // u32 trailing pad@0x14. Full wire record is exactly 0x20 bytes.
             const PAYLOAD_LEN: usize = 0x18;
-            if command_length != HEADER_LEN + PAYLOAD_LEN || payload.len() < PAYLOAD_LEN {
+            if command_length != HEADER_LEN + PAYLOAD_LEN {
                 return Err(DecodeStatus::ErrBadLength);
             }
             out.kind = Kind::Draw;
@@ -728,7 +716,7 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             Ok(out)
         }
         OP_EXECUTE_COMMANDS_INDIRECT => {
-            if command_length != EXECUTE_INDIRECT_CMD_LEN || payload.len() < 0x10 {
+            if command_length != EXECUTE_INDIRECT_CMD_LEN {
                 return Err(DecodeStatus::ErrBadLength);
             }
             out.kind = Kind::ExecuteCommands;
@@ -739,7 +727,7 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             Ok(out)
         }
         OP_EXECUTE_COMMANDS_RANGE => {
-            if command_length != EXECUTE_RANGE_CMD_LEN || payload.len() < 0x14 {
+            if command_length != EXECUTE_RANGE_CMD_LEN {
                 return Err(DecodeStatus::ErrBadLength);
             }
             out.kind = Kind::ExecuteCommands;

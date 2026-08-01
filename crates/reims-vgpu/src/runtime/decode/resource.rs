@@ -81,7 +81,8 @@ pub const TYPE7_OBJECT_RENDER_PIPELINE: u32 = 0x0e;
 /// Indirect command buffer create body from
 /// `PGSerializer newIndirectCommandBufferWithDescriptor:layout:maxCommandCount:options:allocator:`.
 pub const TYPE7_OBJECT_ICB: u32 = 0x36;
-pub const TYPE7_HEADER_LEN: usize = 16;
+/// End of the 16-byte type-7 header, which is also where its first TLV
+/// starts — one boundary, so one name.
 pub const TYPE7_FIRST_TLVS: usize = 16;
 /// Serialized ICB descriptor length (allocateOperationBytes 0x58).
 pub const ICB_DESC_LEN: usize = 0x58;
@@ -1401,7 +1402,7 @@ pub fn decode_render_pipeline_descriptor(
     }
     let first_tlv_end = TYPE7_FIRST_TLVS + consumed;
     if out.has_color_attachment_offset {
-        let color_abs = TYPE7_HEADER_LEN + out.color_attachment_offset as usize;
+        let color_abs = TYPE7_FIRST_TLVS + out.color_attachment_offset as usize;
         if color_abs <= declared && first_tlv_end < color_abs {
             out.vertex_attributes = parse_vertex_block(bytes, first_tlv_end, color_abs)?;
         }
