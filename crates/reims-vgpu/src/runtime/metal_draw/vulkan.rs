@@ -3443,13 +3443,19 @@ fn note_load_seed_outcome(
     //   load_seed_ok 395   ok_mapping 346   ok_color 49
     //   ok_gva_or_ref 0    lost_gva_or_ref 0    lost_<any door> 0
     //
-    // `gva_or_ref` was the suspect — it draws its seed from the two host caches
-    // the sampled ladder found nearly always empty for these spans — and it is
-    // never taken. Nor does any door lose a seed, so the earlier pooled
-    // `load_seed_lost=0` was a real zero and not a door standing idle. A lost
-    // seed turning LOAD into CLEAR is therefore NOT how a broken icon gets its
-    // empty square, and the whole rail is small besides: 395 seed resolutions
-    // across a boot that composited ten Finder windows.
+    // `gva_or_ref` was the suspect — it drew its seed from the two host caches
+    // the sampled ladder found nearly always empty for these spans — and it was
+    // never taken. It is now gone; see the LOAD arm for why it could not be.
+    // Nor does any door lose a seed, so the earlier pooled `load_seed_lost=0`
+    // was a real zero and not a door standing idle. A lost seed turning LOAD
+    // into CLEAR is therefore NOT how a broken icon gets its empty square, and
+    // the whole rail is small besides: 395 seed resolutions across a boot that
+    // composited ten Finder windows.
+    //
+    // A second driven boot (Safari page load, title-bar drag, page-down) agrees
+    // and narrows it further: ok 295 = ok_color 152 + ok_mapping 143, with
+    // `req_seed` also at 0 both ways. `req_seed` keeps its arm — nothing argues
+    // it is unreachable, only that these two workloads did not reach it.
     crate::runtime::drain::note_store_route(match (door, seeded) {
         ("color_seed", true) => "load_seed_ok_color",
         ("color_seed", false) => "load_seed_lost_color",
@@ -3457,8 +3463,6 @@ fn note_load_seed_outcome(
         ("req_seed", false) => "load_seed_lost_req",
         ("mapping", true) => "load_seed_ok_mapping",
         ("mapping", false) => "load_seed_lost_mapping",
-        ("gva_or_ref", true) => "load_seed_ok_gva_or_ref",
-        ("gva_or_ref", false) => "load_seed_lost_gva_or_ref",
         (_, true) => "load_seed_ok_other",
         (_, false) => "load_seed_lost_other",
     });
@@ -4998,32 +5002,17 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                             target_rgba8 = Some(bytes);
                             seed_order = order;
                         }
-                    } else if c0.texture_ref != 0 {
-                        seed_door = "gva_or_ref";
-                        // GVA type-2/3 Load: texture_ref encode cache (separate
-                        // from surface_id mid map). Prefer GVA key when present.
-                        // A GVA-keyed lookup of the encode cache used to sit
-                        // here, ahead of the texture_ref one below, with its own
-                        // backing revalidation. It never ran: two independent
-                        // driven x86/Vulkan windows carrying 1 558 and 637
-                        // colour LOAD seeds recorded 0 serve and 0 miss at it,
-                        // so the enclosing `target_gva != 0` test never held.
-                        //
-                        // It cannot hold. `color_target_request` calls
-                        // `seed_color_load` while building the request, and that
-                        // is where the GVA encode cache is actually read — it
-                        // served all 1 558 of the first window's colour seeds.
-                        // By the time this arm is reached the seed is already in
-                        // `req.target_seed_rgba`, so this was a second lookup of
-                        // the same map, behind a stricter gate, for a case the
-                        // first lookup had already handled.
-                        if let Some(bgra) =
-                            crate::runtime::surface_cache::get_texture(state, c0.texture_ref, w, h)
-                        {
-                            target_rgba8 = Some(std::sync::Arc::new(bgra.to_vec()));
-                            seed_order = crate::backend::vulkan::engine::SeedOrder::Bgra8;
-                        }
                     }
+                    // There is no fourth door reading the texture_ref encode
+                    // cache. `color_target_request` calls `seed_color_load`
+                    // while building the request, and that is where the encode
+                    // cache is read — it is the `color_seed` door above. A
+                    // second lookup of the same map behind a stricter gate can
+                    // only be reached when the first has already declined,
+                    // which for a cached texture it cannot. Measured across
+                    // three independently driven x86/Vulkan boots: 1 558, 395
+                    // and 295 colour LOAD seed resolutions, and 0 serves plus
+                    // 0 misses at that door in every one.
                     note_load_seed_outcome(seed_door, target_rgba8.is_some(), c0, w, h);
                 }
                 _ => {}
