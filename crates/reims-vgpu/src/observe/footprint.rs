@@ -107,7 +107,7 @@ impl Footprint {
         }
     }
 
-    fn mark(&self, rail: Rail, frame: u64) {
+    fn mark(&self, rail: Rail, frame: u64, licence: WriteLicence) {
         if frame >= MAX_FRAME {
             self.dropped.fetch_add(1, Ordering::Relaxed);
             return;
@@ -137,6 +137,10 @@ impl Footprint {
                 if rail != Rail::Mapping {
                     return;
                 }
+                // Only the mapping rail can be attributed, and it is the only
+                // one whose hits are evidence — so the licence tally has the
+                // same population as the fail lines below.
+                RETIRE_HITS_BY_LICENCE[licence as usize].fetch_add(1, Ordering::Relaxed);
                 // Latched per frame AND capped in total. Per-frame alone is not
                 // enough: a rail writing a whole 1080p surface into retired
                 // pages has ~2 000 distinct frames to report, all of them the
@@ -152,8 +156,9 @@ impl Footprint {
                     if crate::observe::first_sight("write_after_retire", frame) {
                         crate::observe::fail(format!(
                             "write_after_retire frame={frame:#x} gpa={:#x} \
-                             (the guest said these pages stopped being a \
-                             surface's, and no mapping has adopted them since)",
+                             licence={licence:?} (the guest said these pages \
+                             stopped being a surface's, and no mapping has \
+                             adopted them since)",
                             frame << FRAME_SHIFT
                         ));
                     } else {
@@ -408,6 +413,32 @@ pub enum Rail {
 static RETIRE_HITS_BY_RAIL: [AtomicU64; 3] =
     [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 
+/// Whether the guest had authorised the device to hold this mapping's bytes at
+/// the moment a [`Rail::Mapping`] write was issued.
+///
+/// The rail split above says a mapping-rail hit is the finding; this says
+/// whether the guest had ever handed us that surface. They are different
+/// questions and only the pair convicts: a write into a torn-down page for a
+/// resource the guest never licensed is this device writing memory it was never
+/// given, which is the whole class. A hit on a resource the guest *did* license
+/// is a lifetime race inside an authorised relationship — still a defect, but a
+/// different one, and one that a page-lifetime repair fixes rather than an
+/// authorisation model.
+#[derive(PartialEq, Eq, Debug, Clone, Copy)]
+pub enum WriteLicence {
+    /// The device published this mapping's pixels after the guest's last claim.
+    Licensed = 0,
+    /// The guest claimed a CPU write after the device's last publish.
+    Superseded = 1,
+    /// The guest never claimed a CPU write to this mapping.
+    Unstated = 2,
+    /// The write site did not resolve a mapping to ask about.
+    Unattributed = 3,
+}
+
+/// `write_after_retire` hits on the mapping rail, indexed by [`WriteLicence`].
+static RETIRE_HITS_BY_LICENCE: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
 /// `(mapping, raw-GVA, direct-GPA)` writes that landed in a retired frame.
 pub fn retired_hits_by_rail() -> (u64, u64, u64) {
     (
@@ -417,12 +448,30 @@ pub fn retired_hits_by_rail() -> (u64, u64, u64) {
     )
 }
 
+/// Mapping-rail retired-page hits by [`WriteLicence`], in variant order.
+pub fn retired_hits_by_licence() -> [u64; 4] {
+    let mut out = [0u64; 4];
+    for (slot, cell) in out.iter_mut().zip(RETIRE_HITS_BY_LICENCE.iter()) {
+        *slot = cell.load(Ordering::Relaxed);
+    }
+    out
+}
+
 /// Record that `len` bytes starting at guest-physical `gpa` were written.
 ///
 /// Every frame the byte range touches is marked, including a partial first and
 /// last: the question is which frames this device put bytes into, not how many
 /// bytes it put in each.
 pub fn note_written_range(rail: Rail, gpa: u64, len: u64) {
+    note_written_range_licensed(rail, gpa, len, WriteLicence::Unattributed);
+}
+
+/// [`note_written_range`] for a call site that knows which mapping it is writing
+/// and can therefore say whether the guest had licensed it.
+///
+/// A separate entry point rather than a parameter on the common one because the
+/// answer costs a map lookup, and only the mapping rail has anything to look up.
+pub fn note_written_range_licensed(rail: Rail, gpa: u64, len: u64, licence: WriteLicence) {
     if len == 0 {
         return;
     }
@@ -430,7 +479,7 @@ pub fn note_written_range(rail: Rail, gpa: u64, len: u64) {
     let last = gpa.saturating_add(len - 1) >> FRAME_SHIFT;
     let fp = &*FOOTPRINT;
     for frame in first..=last {
-        fp.mark(rail, frame);
+        fp.mark(rail, frame, licence);
     }
 }
 
@@ -643,6 +692,7 @@ pub fn census_lines(now_ms: u64) -> Vec<String> {
     let (retire_scans, retire_scan_pages) = retire_scan_counts();
     let (ff_run, ff_run_max) = ff_run_counts();
     let (war_map, war_raw, war_gpa) = retired_hits_by_rail();
+    let [war_lic, war_sup, war_unst, war_unattr] = retired_hits_by_licence();
     let mut out = vec![format!(
         "guest_write_footprint pages={pages} kib={kib} dropped={dropped} \
          frame_shift={FRAME_SHIFT} writes={calls} sampled={sampled} \
@@ -650,7 +700,9 @@ pub fn census_lines(now_ms: u64) -> Vec<String> {
          ff_bytes={bytes_all_ff} ff_run={ff_run} ff_run_max={ff_run_max} \
          ff_run_min={FF_RUN_MIN} retired={retired_frames} \
          write_after_retire={retired_hits} war_mapping={war_map} \
-         war_rawgva={war_raw} war_gpa={war_gpa} retire_scans={retire_scans} \
+         war_rawgva={war_raw} war_gpa={war_gpa} war_licensed={war_lic} \
+         war_superseded={war_sup} war_unstated={war_unst} \
+         war_unattributed={war_unattr} retire_scans={retire_scans} \
          retire_scan_pages={retire_scan_pages} (levels, not per-interval)"
     )];
 
@@ -705,6 +757,9 @@ pub(crate) fn exclusive_for_tests() -> std::sync::MutexGuard<'static, ()> {
     RETIRED.scan_pages.store(0, Ordering::Relaxed);
     RETIRED.logged.store(0, Ordering::Relaxed);
     for cell in RETIRE_HITS_BY_RAIL.iter() {
+        cell.store(0, Ordering::Relaxed);
+    }
+    for cell in RETIRE_HITS_BY_LICENCE.iter() {
         cell.store(0, Ordering::Relaxed);
     }
     for cell in [
@@ -1075,6 +1130,42 @@ mod tests {
             RETIRED.logged.load(Ordering::Relaxed) > MAX_RETIRE_LINES,
             "the counter must pass the cap so the boundary line fires exactly once"
         );
+    }
+
+    /// A retired-page hit has to say whether the guest had licensed the surface
+    /// it belonged to. That is the pair that convicts: "we wrote a torn-down
+    /// page" plus "the guest never gave us that resource" is this device writing
+    /// memory it was never handed, while the same hit on a licensed resource is
+    /// a page-lifetime race inside an authorised relationship.
+    #[test]
+    fn a_retired_hit_is_attributed_to_the_guests_licence() {
+        let _g = fresh();
+        note_pages_retired([0x40000u64, 0x41000, 0x42000], 1 << FRAME_SHIFT);
+        note_written_range_licensed(Rail::Mapping, 0x40000, 8, WriteLicence::Unstated);
+        note_written_range_licensed(Rail::Mapping, 0x41000, 8, WriteLicence::Superseded);
+        note_written_range_licensed(Rail::Mapping, 0x42000, 8, WriteLicence::Superseded);
+        let [lic, sup, unst, unattr] = retired_hits_by_licence();
+        assert_eq!((lic, sup, unst, unattr), (0, 2, 1, 0));
+    }
+
+    /// The rails that cannot name a mapping must not be attributed to one, and
+    /// must not silently borrow another rail's licence.
+    #[test]
+    fn only_the_mapping_rail_is_attributed() {
+        let _g = fresh();
+        note_pages_retired([0x50000u64], 1 << FRAME_SHIFT);
+        note_written_range(Rail::RawGva, 0x50000, 8);
+        note_written_range(Rail::Gpa, 0x50000, 8);
+        assert_eq!(retired_counts().1, 2, "both hits are counted by rail");
+        assert_eq!(
+            retired_hits_by_licence(),
+            [0, 0, 0, 0],
+            "neither rail has a mapping to attribute"
+        );
+        // The mapping rail with no licence resolved is its own bucket, not one
+        // of the three verdicts.
+        note_written_range(Rail::Mapping, 0x50000, 8);
+        assert_eq!(retired_hits_by_licence(), [0, 0, 0, 1]);
     }
 
     #[test]

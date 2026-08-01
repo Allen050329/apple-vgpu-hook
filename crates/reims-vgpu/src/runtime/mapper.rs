@@ -1892,6 +1892,9 @@ pub(crate) fn note_mapping_write_footprint(
     };
     let page_size = state.page_size();
     let page_shift = state.page_shift;
+    // Asked once per write rather than once per page: the licence is a property
+    // of the mapping, and the page loop below can cover a whole framebuffer.
+    let licence = write_licence(state, mapping_id);
     let end = off.saturating_add(len);
     let first = off / page_size;
     let last = (end - 1) / page_size;
@@ -1908,12 +1911,32 @@ pub(crate) fn note_mapping_write_footprint(
         let lo = off.max(page_lo);
         let hi = end.min(page_lo.saturating_add(page_size));
         if lo < hi {
-            crate::observe::footprint::note_written_range(
+            crate::observe::footprint::note_written_range_licensed(
                 crate::observe::footprint::Rail::Mapping,
                 gpa + (lo - page_lo),
                 hi - lo,
+                licence,
             );
         }
+    }
+}
+
+/// The guest's authorisation for this mapping, in the footprint's vocabulary.
+///
+/// The footprint records *where* a write landed and this records *whether the
+/// guest had handed us the surface* when it did. Only the pair convicts: a write
+/// into a torn-down page for a resource the guest never licensed is this device
+/// writing memory it was never given.
+pub(crate) fn write_licence(
+    state: &DeviceState,
+    mapping_id: u32,
+) -> crate::observe::footprint::WriteLicence {
+    use crate::observe::footprint::WriteLicence;
+    use crate::runtime::resource_validity::{writeback_licence, WritebackLicence};
+    match writeback_licence(state, mapping_id) {
+        WritebackLicence::Licensed => WriteLicence::Licensed,
+        WritebackLicence::Superseded => WriteLicence::Superseded,
+        WritebackLicence::Unstated => WriteLicence::Unstated,
     }
 }
 
@@ -1976,6 +1999,9 @@ pub fn write_mapping_bytes<H: HostMemory + HostOps>(
             return true;
         }
     }
+    // Read before the run loop: the licence is a property of the mapping, and
+    // the loop marks one range per packed run.
+    let licence = write_licence(state, mapping_id);
     let gpas = match mapping_page_gpas(state, host, mapping_id) {
         Some(g) => g,
         None => {
@@ -2036,10 +2062,11 @@ pub fn write_mapping_bytes<H: HostMemory + HostOps>(
         // `run_gpas[0] + host_off`. Marked per run rather than once over
         // `[off, end)` because the runs are what is contiguous; the mapping's
         // list between them is not.
-        crate::observe::footprint::note_written_range(
+        crate::observe::footprint::note_written_range_licensed(
             crate::observe::footprint::Rail::Mapping,
             run_gpas[0].saturating_add(host_off as u64),
             n as u64,
+            licence,
         );
         host.unmap_pages(ptr, total);
     }
