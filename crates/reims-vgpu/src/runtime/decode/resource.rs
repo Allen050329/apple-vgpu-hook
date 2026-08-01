@@ -140,7 +140,12 @@ pub const ICB_CMD_TYPE_DRAW_MESH_THREADS: u32 = 0x100;
 pub const ICB_BUFFER_BIND_STRIDE: usize = 0x14;
 /// Tessellation-factor table used size (u32 ref + 3×u64) at `tessellationFactorOffset`.
 pub const ICB_TESSELLATION_FACTOR_LEN: usize = 0x1c;
-/// DrawPatches args size (baseInstance ends at +0x2e).
+/// DrawPatches args size: `setupCommandLayout` allocates 0x38, and the fill IMP
+/// writes through `baseInstance` — a u64 *starting* at 0x2e, so ending at 0x36.
+/// The two bytes between are the allocation's slack, exactly as
+/// [`ICB_DRAW_INDEXED_PATCHES_ARGS_LEN`] documents for its own 0x4a/0x4c pair.
+/// (This doc used to read "baseInstance ends at +0x2e", which reads as though
+/// 0x38 were the fill extent and makes the constant look two bytes wrong.)
 pub const ICB_DRAW_PATCHES_ARGS_LEN: u32 = 0x38;
 /// DrawIndexedPatches args size (baseInstance u64 @0x42 → end 0x4a).
 /// Note: `setupCommandLayout` allocates max `0x4c` for this bit; fill IMP uses through `0x4a`.

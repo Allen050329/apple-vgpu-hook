@@ -12,13 +12,13 @@ use crate::runtime::compute_exec::{self, ComputeStatus};
 use crate::runtime::decode::blit::{self, Kind as BlitKind, OP_GENERATE_MIPMAPS};
 use crate::runtime::decode::compute::{self, Kind as ComputeKind};
 use crate::runtime::decode::event as event_decode;
+use crate::runtime::decode::fifo::{decode_exec_resource_table, ExecResourceDesc};
 use crate::runtime::decode::fifo::{
     CHILD_EXEC_INDIRECT_CMDBUF_COUNT, CHILD_EXEC_INDIRECT_CMDBUF_DESC_LEN,
     CHILD_EXEC_INDIRECT_CMDBUF_GVA, CHILD_EXEC_INDIRECT_CMDBUF_LENGTH,
     CHILD_EXEC_INDIRECT_HEADER_LEN, CHILD_EXEC_INDIRECT_RESOURCE_COUNT,
     CHILD_EXEC_INDIRECT_RESOURCE_DESC_LEN, CHILD_EXEC_INDIRECT_TASK_ID,
 };
-use crate::runtime::decode::fifo::{decode_exec_resource_table, ExecResourceDesc};
 use crate::runtime::decode::render::{
     self, decode_color_attachment, decode_depth_attachment, decode_stencil_attachment,
     ColorAttachment, DepthAttachment, Kind as RenderKind, Stage, StencilAttachment,
@@ -312,10 +312,12 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
     let page_shift = state.page_shift;
     let mut streams = Vec::with_capacity(n_cb);
     for i in 0..n_cb {
+        // `need` already pinned the whole table: i < n_cb <= cmdbuf_count, so
+        // off + DESC_LEN = cbufs_off + (i + 1) * DESC_LEN <= need <=
+        // payload.len(). The bounds check that stood here could not fire, and
+        // its `break` would have dropped every remaining command buffer with no
+        // line if it ever had.
         let off = (cbufs_off + i as u64 * CHILD_EXEC_INDIRECT_CMDBUF_DESC_LEN as u64) as usize;
-        if off + CHILD_EXEC_INDIRECT_CMDBUF_DESC_LEN as usize > payload.len() {
-            break;
-        }
         let gva = ld64(&payload[off + CHILD_EXEC_INDIRECT_CMDBUF_GVA as usize..]);
         let length = ld64(&payload[off + CHILD_EXEC_INDIRECT_CMDBUF_LENGTH as usize..]);
         if length == 0 {
@@ -630,7 +632,8 @@ fn compute_translation_inputs(stream: &[u8]) -> Vec<(u32, [u32; 3])> {
     inputs
 }
 
-/// Walk every record in one segment, handing each to `handle`.
+/// Walk every record in one segment, handing each handler its opcode and its
+/// command bytes.
 ///
 /// Lifting this out of `walk_stream`'s five near-identical arms gives the framing
 /// decoder exactly one emission site. Each arm previously swallowed its refusals
@@ -638,17 +641,21 @@ fn compute_translation_inputs(stream: &[u8]) -> Vec<(u32, [u32; 3])> {
 /// record with no line at all, and `Err(_) => break` made a truncated or
 /// self-inconsistent segment indistinguishable from `Done` — so every remaining
 /// record in that segment went unexecuted and unreported.
-fn walk_segment_records(
-    stream: &[u8],
-    seg: &stream::Segment,
-    mut handle: impl FnMut(&stream::Record),
-) {
+///
+/// Slicing here rather than in each handler is what makes the record's extent a
+/// framing property instead of five re-derivations of it. `decode_next_record`
+/// already refuses `record_len > command_end - cursor` and `validate_segment`
+/// refuses `command_end > bytes.len()`, so `bytes_offset + length` is inside
+/// `stream` by construction — the five copies of that same bounds check each
+/// had a silent `return` behind a branch none of them could take.
+fn walk_segment_records(stream: &[u8], seg: &stream::Segment, mut handle: impl FnMut(u32, &[u8])) {
     let mut cursor = 0usize;
     let mut next = decode_first_record(stream, seg, &mut cursor);
     loop {
         match next {
             Ok(rec) => {
-                handle(&rec);
+                let start = rec.bytes_offset as usize;
+                handle(rec.opcode, &stream[start..start + rec.length as usize]);
                 next = decode_next_record(stream, seg, &mut cursor);
             }
             // `Done` is end-of-segment and yields `None` here, so the normal exit
@@ -706,19 +713,19 @@ fn walk_stream<M: HostMemory + HostOps>(
         }
         match seg.type_ {
             SEGMENT_TYPE_RENDER => {
-                walk_segment_records(stream, &seg, |r| {
-                    handle_render_record(state, host, task_id, stream, r, out, acc)
+                walk_segment_records(stream, &seg, |op, cmd| {
+                    handle_render_record(state, host, task_id, op, cmd, out, acc)
                 });
             }
             SEGMENT_TYPE_BLIT => {
-                walk_segment_records(stream, &seg, |r| {
-                    handle_blit_record(state, host, task_id, stream, r)
+                walk_segment_records(stream, &seg, |op, cmd| {
+                    handle_blit_record(state, host, task_id, op, cmd)
                 });
             }
             SEGMENT_TYPE_COMPUTE => {
                 let mut compute = crate::runtime::compute_session::ComputeSegment::default();
-                walk_segment_records(stream, &seg, |r| {
-                    handle_compute_record(state, host, task_id, stream, r, out, &mut compute)
+                walk_segment_records(stream, &seg, |op, cmd| {
+                    handle_compute_record(state, host, task_id, op, cmd, out, &mut compute)
                 });
                 if let Some(st) = crate::runtime::compute_session::finish_session(
                     &mut compute.session,
@@ -739,13 +746,13 @@ fn walk_stream<M: HostMemory + HostOps>(
                 }
             }
             SEGMENT_TYPE_EVENT => {
-                walk_segment_records(stream, &seg, |r| {
-                    handle_event_record(state, task_id, stream, r)
+                walk_segment_records(stream, &seg, |_op, cmd| {
+                    handle_event_record(state, task_id, cmd)
                 });
             }
             SEGMENT_TYPE_INFO => {
-                walk_segment_records(stream, &seg, |r| {
-                    handle_info_record(state, host, task_id, stream, r)
+                walk_segment_records(stream, &seg, |op, cmd| {
+                    handle_info_record(state, host, task_id, op, cmd)
                 });
             }
             // Unreachable: `segment_disposition` already answered `Walk` for
@@ -759,18 +766,14 @@ fn handle_info_record<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &M,
     task_id: u32,
-    stream: &[u8],
-    rec: &stream::Record,
+    opcode: u32,
+    cmd_bytes: &[u8],
 ) {
     use crate::runtime::icb::{
         apply_icb_host_resource_info, decode_icb_host_resource_info, INFO_OP_ICB_HOST_RESOURCE,
     };
-    let end = (rec.bytes_offset as usize).saturating_add(rec.length as usize);
-    if end > stream.len() {
-        return;
-    }
-    let bytes = &stream[rec.bytes_offset as usize..end];
-    if rec.opcode == INFO_OP_ICB_HOST_RESOURCE {
+    let bytes = cmd_bytes;
+    if opcode == INFO_OP_ICB_HOST_RESOURCE {
         // `icb_backing_fail` was a counter with no reason beside it: an ICB
         // whose command memory never bound looked identical whether the payload
         // was malformed, the type-1 buffer was short, or the pathway has no ICB
@@ -791,18 +794,13 @@ fn handle_info_record<M: HostMemory + HostOps>(
                 crate::observe::Emit::decline("icb_backing", &e)
                     .field("task", task_id)
                     .field("len", bytes.len())
-                    .fail_once(rec.length as u64);
+                    .fail_once(bytes.len() as u64);
             }
         }
     }
 }
 
-fn handle_event_record(state: &mut DeviceState, task_id: u32, stream: &[u8], rec: &stream::Record) {
-    let end = (rec.bytes_offset as usize).saturating_add(rec.length as usize);
-    if end > stream.len() {
-        return;
-    }
-    let cmd_bytes = &stream[rec.bytes_offset as usize..end];
+fn handle_event_record(state: &mut DeviceState, task_id: u32, cmd_bytes: &[u8]) {
     let cmd = match event_decode::decode(cmd_bytes) {
         Ok(c) => c,
         Err(status) => {
@@ -852,16 +850,11 @@ fn handle_compute_record<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
-    stream: &[u8],
-    rec: &stream::Record,
+    opcode: u32,
+    cmd_bytes: &[u8],
     out: &mut ExecResult,
     seg: &mut crate::runtime::compute_session::ComputeSegment,
 ) {
-    let end = (rec.bytes_offset as usize).saturating_add(rec.length as usize);
-    if end > stream.len() {
-        return;
-    }
-    let cmd_bytes = &stream[rec.bytes_offset as usize..end];
     let cmd = match compute::decode(cmd_bytes) {
         Ok(c) => c,
         // Same silent drop as the render path above.
@@ -870,9 +863,9 @@ fn handle_compute_record<M: HostMemory + HostOps>(
                 // Latched per (reason, opcode): the guest re-encodes the same
                 // stream every frame, so an unclassified opcode would arrive
                 // once per draw. Magnitude is the encoder's fail counter's job.
-                e.field("opcode", format!("{:#x}", rec.opcode))
+                e.field("opcode", format!("{:#x}", opcode))
                     .field("len", cmd_bytes.len())
-                    .fail_once(rec.opcode as u64);
+                    .fail_once(opcode as u64);
             }
             return;
         }
@@ -970,14 +963,9 @@ fn handle_blit_record<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
-    stream: &[u8],
-    rec: &stream::Record,
+    opcode: u32,
+    cmd_bytes: &[u8],
 ) {
-    let end = (rec.bytes_offset as usize).saturating_add(rec.length as usize);
-    if end > stream.len() {
-        return;
-    }
-    let cmd_bytes = &stream[rec.bytes_offset as usize..end];
     let cmd = match blit::decode(cmd_bytes) {
         Ok(c) => c,
         // Was `Err(_) => return`: a decoded blit record dropped with no line at
@@ -986,7 +974,7 @@ fn handle_blit_record<M: HostMemory + HostOps>(
         // refused.
         Err(status) => {
             if let Some(e) = crate::observe::Emit::refusal("blit_decode", &status) {
-                e.field("opcode", format!("{:#x}", rec.opcode))
+                e.field("opcode", format!("{:#x}", opcode))
                     .field("len", cmd_bytes.len())
                     .fail();
             }
@@ -1066,7 +1054,8 @@ fn handle_blit_record<M: HostMemory + HostOps>(
         BlitKind::Unknown => {
             crate::observe::fail(format!(
                 "blit unknown opcode={:#x} len={}",
-                cmd.opcode, rec.length
+                cmd.opcode,
+                cmd_bytes.len()
             ));
         }
     }
@@ -1076,16 +1065,11 @@ fn handle_render_record<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &M,
     task_id: u32,
-    stream: &[u8],
-    rec: &stream::Record,
+    opcode: u32,
+    cmd_bytes: &[u8],
     out: &mut ExecResult,
     acc: &mut StreamAccum,
 ) {
-    let end = (rec.bytes_offset as usize).saturating_add(rec.length as usize);
-    if end > stream.len() {
-        return;
-    }
-    let cmd_bytes = &stream[rec.bytes_offset as usize..end];
     let cmd = match render::decode(cmd_bytes) {
         Ok(c) => c,
         // Was `Err(_) => return`: a malformed render command dropped with no
@@ -1096,9 +1080,9 @@ fn handle_render_record<M: HostMemory + HostOps>(
                 // Latched per (reason, opcode): the guest re-encodes the same
                 // stream every frame, so an unclassified opcode would arrive
                 // once per draw. Magnitude is the encoder's fail counter's job.
-                e.field("opcode", format!("{:#x}", rec.opcode))
+                e.field("opcode", format!("{:#x}", opcode))
                     .field("len", cmd_bytes.len())
-                    .fail_once(rec.opcode as u64);
+                    .fail_once(opcode as u64);
             }
             return;
         }
@@ -1121,7 +1105,8 @@ fn handle_render_record<M: HostMemory + HostOps>(
                 &mut acc.fragment_buffers,
                 |b| b.index,
                 |index, (buffer_ref, offset)| {
-                    (buffer_ref != 0).then_some(BufferBind {                        index,
+                    (buffer_ref != 0).then_some(BufferBind {
+                        index,
                         buffer_ref,
                         offset,
                     })
@@ -1173,9 +1158,7 @@ fn handle_render_record<M: HostMemory + HostOps>(
                             out.type11_mappings.push(texture_ref);
                         }
                     }
-                    Some(TextureBind {                        index,
-                        texture_ref,
-                    })
+                    Some(TextureBind { index, texture_ref })
                 },
             );
             out.texture_unbinds = out.texture_unbinds.saturating_add(cleared);
@@ -1189,9 +1172,7 @@ fn handle_render_record<M: HostMemory + HostOps>(
                 &mut acc.fragment_samplers,
                 |b| b.index,
                 |index, sampler_ref| {
-                    (sampler_ref != 0).then_some(SamplerBind {                        index,
-                        sampler_ref,
-                    })
+                    (sampler_ref != 0).then_some(SamplerBind { index, sampler_ref })
                 },
             );
             out.sampler_unbinds = out.sampler_unbinds.saturating_add(cleared);
@@ -1387,7 +1368,7 @@ fn handle_render_record<M: HostMemory + HostOps>(
             // tiny and boot-stable) and capture the raw wire on first sighting
             // so the layout can be decoded offline. Unknown wire stays unknown;
             // we never invent semantics for it.
-            note_unimplemented_render_opcode(cmd.opcode, rec.length, cmd_bytes, task_id, acc);
+            note_unimplemented_render_opcode(cmd.opcode, cmd_bytes, task_id, acc);
         }
         _ => {}
     }
@@ -1418,7 +1399,6 @@ static UNIMPL_OPCODE_OVERFLOW: std::sync::OnceLock<
 /// anti-flood behavior without depending on the shared always-on log file.
 fn note_unimplemented_render_opcode(
     opcode: u32,
-    length: u32,
     cmd_bytes: &[u8],
     task_id: u32,
     acc: &StreamAccum,
@@ -1448,7 +1428,7 @@ fn note_unimplemented_render_opcode(
     crate::observe::fail(format!(
         "render_unimplemented reason=accepted_without_executor task={task_id} opcode={:#x} len={} target_refs={:?} pipeline={} vbufs={} fbufs={} ftex={} hex={}",
         opcode,
-        length,
+        cmd_bytes.len(),
         acc.color_targets,
         acc.pipeline_ref,
         acc.vertex_buffers.len(),
@@ -1650,11 +1630,10 @@ fn finish_stream<M: HostMemory + HostOps>(
             // own. Otherwise the last pass's geometry describes the pass this
             // ICB runs inside.
             let (pipeline, count, inst, prim, first) = if acc.pipeline_ref != 0 {
-                let (count, inst, prim, first) =
-                    acc.draws.last().map_or((1, 1, 3, 0), |pd| {
-                        let (count, inst, prim, first) = pd.draw;
-                        (count.max(1), inst.max(1), prim, first)
-                    });
+                let (count, inst, prim, first) = acc.draws.last().map_or((1, 1, 3, 0), |pd| {
+                    let (count, inst, prim, first) = pd.draw;
+                    (count.max(1), inst.max(1), prim, first)
+                });
                 (acc.pipeline_ref, count, inst, prim, first)
             } else {
                 (1, 1, 1, 3, 0)
@@ -1676,10 +1655,7 @@ fn finish_stream<M: HostMemory + HostOps>(
                 if let Some(pd) = acc.draws.last() {
                     fill_draw_binds_from_pending(&mut req, pd);
                 } else {
-                    fill_draw_binds_from_pending(
-                        &mut req,
-                        &acc.bind_snapshot(),
-                    );
+                    fill_draw_binds_from_pending(&mut req, &acc.bind_snapshot());
                 }
                 let (loc, len) = if exec.is_range {
                     (exec.range_location, exec.range_length)
@@ -1899,7 +1875,13 @@ fn finish_stream<M: HostMemory + HostOps>(
                             // same as the hard-fail path below. Dropping the
                             // chain left dual-mid pages black while gen advanced.
                             land_chain_before_abandon(
-                                state, host, task_id, acc, &req, &mut chain_rgba, resident_chain,
+                                state,
+                                host,
+                                task_id,
+                                acc,
+                                &req,
+                                &mut chain_rgba,
+                                resident_chain,
                             );
                             break;
                         }
@@ -1909,7 +1891,13 @@ fn finish_stream<M: HostMemory + HostOps>(
                         out.metal_draws_fail += 1;
                         note_draw_encode_fail(task_id, pd.pipeline_ref, st, di, draw_list.len());
                         land_chain_before_abandon(
-                            state, host, task_id, acc, &req, &mut chain_rgba, resident_chain,
+                            state,
+                            host,
+                            task_id,
+                            acc,
+                            &req,
+                            &mut chain_rgba,
+                            resident_chain,
                         );
                         break;
                     }
@@ -1925,7 +1913,13 @@ fn finish_stream<M: HostMemory + HostOps>(
                         // landed each record in guest memory — never write the
                         // (zero) chain buffer over them.
                         land_chain_before_abandon(
-                            state, host, task_id, acc, &req, &mut chain_rgba, resident_chain,
+                            state,
+                            host,
+                            task_id,
+                            acc,
+                            &req,
+                            &mut chain_rgba,
+                            resident_chain,
                         );
                         break;
                     }
@@ -2033,10 +2027,11 @@ fn read_icb_exec_range<M: HostMemory + HostOps>(
     offset: u64,
 ) -> Option<(u64, u64)> {
     use crate::runtime::compute_exec::read_buffer_window;
+    // `read_buffer_window` returns exactly the requested 8 bytes or an error,
+    // so both reads are in range; the `try_into().ok()?` pair that used to
+    // wrap them could only ever be `Ok`.
     let raw = read_buffer_window(state, host, task_id, buffer_ref, offset, 8).ok()?;
-    let loc = u32::from_le_bytes(raw[0..4].try_into().ok()?) as u64;
-    let len = u32::from_le_bytes(raw[4..8].try_into().ok()?) as u64;
-    Some((loc, len))
+    Some((u64::from(ld32(&raw)), u64::from(ld32(&raw[4..]))))
 }
 
 /// Guest store plan for multi-draw record `di` of `draw_count` (0-based).
@@ -2424,7 +2419,10 @@ mod tests {
                 + CHILD_EXEC_INDIRECT_CMDBUF_DESC_LEN as usize
         ];
         st32(&mut payload[CHILD_EXEC_INDIRECT_TASK_ID as usize..], 3);
-        st32(&mut payload[CHILD_EXEC_INDIRECT_RESOURCE_COUNT as usize..], 1);
+        st32(
+            &mut payload[CHILD_EXEC_INDIRECT_RESOURCE_COUNT as usize..],
+            1,
+        );
         st32(&mut payload[CHILD_EXEC_INDIRECT_CMDBUF_COUNT as usize..], 1);
         let res = CHILD_EXEC_INDIRECT_HEADER_LEN as usize;
         st32(
@@ -2502,7 +2500,10 @@ mod tests {
                 + CHILD_EXEC_INDIRECT_CMDBUF_DESC_LEN as usize
         ];
         st32(&mut payload[CHILD_EXEC_INDIRECT_TASK_ID as usize..], 3);
-        st32(&mut payload[CHILD_EXEC_INDIRECT_RESOURCE_COUNT as usize..], 1);
+        st32(
+            &mut payload[CHILD_EXEC_INDIRECT_RESOURCE_COUNT as usize..],
+            1,
+        );
         st32(&mut payload[CHILD_EXEC_INDIRECT_CMDBUF_COUNT as usize..], 1);
         let res = CHILD_EXEC_INDIRECT_HEADER_LEN as usize;
         st32(
@@ -2601,7 +2602,7 @@ mod tests {
         };
         let before = sink_body().len();
         let mut handled = 0usize;
-        walk_segment_records(&stream, &seg, |_| handled += 1);
+        walk_segment_records(&stream, &seg, |_, _| handled += 1);
         let added = sink_body()[before..].to_string();
         assert_eq!(handled, 0, "the malformed segment yields no records");
         assert!(
@@ -2642,7 +2643,7 @@ mod tests {
         let segs = iter_segments(&stream).expect("a well-formed stream frames");
         let before = sink_body().len();
         let mut handled = 0usize;
-        walk_segment_records(&stream, &segs[0], |_| handled += 1);
+        walk_segment_records(&stream, &segs[0], |_, _| handled += 1);
         let added = sink_body()[before..].to_string();
         assert_eq!(handled, 1, "the one record is handed over");
         assert!(
@@ -2847,15 +2848,6 @@ mod tests {
         let mut out = ExecResult::default();
         let mut acc = StreamAccum::default();
 
-        let rec = |len: usize, opcode: u32| stream::Record {
-            segment_index: 0,
-            segment_type: 0,
-            offset: 0,
-            length: len as u32,
-            opcode,
-            bytes_offset: 0,
-        };
-
         // setVertexBuffer multi-entry: first=2 count=1 ref=9 offset=16
         // payload = first:u32 + count:u32 + {ref:u32, offset:u64}
         let mut vb = vec![0u8; HEADER_LEN + 8 + 12];
@@ -2870,8 +2862,8 @@ mod tests {
             &mut state,
             &host,
             0,
+            OP_SET_VERTEX_BUFFER,
             &vb,
-            &rec(vb.len(), OP_SET_VERTEX_BUFFER),
             &mut out,
             &mut acc,
         );
@@ -2886,8 +2878,8 @@ mod tests {
             &mut state,
             &host,
             0,
+            OP_SET_VERTEX_BUFFER,
             &vb,
-            &rec(vb.len(), OP_SET_VERTEX_BUFFER),
             &mut out,
             &mut acc,
         );
@@ -2907,8 +2899,8 @@ mod tests {
             &mut state,
             &host,
             0,
+            OP_SET_FRAGMENT_BUFFER,
             &fb,
-            &rec(fb.len(), OP_SET_FRAGMENT_BUFFER),
             &mut out,
             &mut acc,
         );
@@ -2926,8 +2918,8 @@ mod tests {
             &mut state,
             &host,
             0,
+            OP_SET_VIEWPORT,
             &vp,
-            &rec(vp.len(), OP_SET_VIEWPORT),
             &mut out,
             &mut acc,
         );
@@ -2946,23 +2938,15 @@ mod tests {
             ..Default::default()
         };
         let mut command = vec![0u8; 0x20];
-        st32(&mut command[0..], render::OP_DRAW_INDEXED_WIDE);
+        let op = render::OP_DRAW_INDEXED_WIDE;
+        st32(&mut command[0..], op);
         st32(&mut command[4..], 0x20);
         st16(&mut command[8..], 3);
         st16(&mut command[10..], 0);
         st32(&mut command[12..], 0x3e);
         st32(&mut command[16..], 6);
         st32(&mut command[24..], 0x10100);
-        let rec = stream::Record {
-            segment_index: 0,
-            segment_type: 0,
-            offset: 0,
-            length: command.len() as u32,
-            opcode: render::OP_DRAW_INDEXED_WIDE,
-            bytes_offset: 0,
-        };
-
-        handle_render_record(&mut state, &host, 1, &command, &rec, &mut out, &mut acc);
+        handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
 
         assert!(acc.saw_draw);
         assert!(out.saw_draw);
@@ -2993,23 +2977,15 @@ mod tests {
             ..Default::default()
         };
         let mut command = vec![0u8; 0x20];
-        st32(&mut command[0..], render::OP_DRAW_INDEXED_WIDE);
+        let op = render::OP_DRAW_INDEXED_WIDE;
+        st32(&mut command[0..], op);
         st32(&mut command[4..], 0x20);
         st16(&mut command[8..], 3);
         st32(&mut command[12..], 0x3e);
         st32(&mut command[16..], 6);
-        let rec = stream::Record {
-            segment_index: 0,
-            segment_type: 0,
-            offset: 0,
-            length: command.len() as u32,
-            opcode: render::OP_DRAW_INDEXED_WIDE,
-            bytes_offset: 0,
-        };
-
         let records = 71;
         for _ in 0..records {
-            handle_render_record(&mut state, &host, 1, &command, &rec, &mut out, &mut acc);
+            handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
         }
 
         assert_eq!(acc.draws.len(), records, "no draw may be truncated away");
@@ -3018,7 +2994,7 @@ mod tests {
         // With no pipeline latched the same record is the other arm: still not
         // a `PendingDraw`, but counted rather than vanishing.
         let mut unbound = StreamAccum::default();
-        handle_render_record(&mut state, &host, 1, &command, &rec, &mut out, &mut unbound);
+        handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut unbound);
         assert_eq!(unbound.dropped_unbound, 1);
         assert!(unbound.draws.is_empty());
     }
@@ -3039,29 +3015,21 @@ mod tests {
         let mut acc = StreamAccum {
             pipeline_ref: 61,
             vertex_buffers: Arc::new(vec![BufferBind {
-            index: 0,
+                index: 0,
                 buffer_ref: 9,
                 offset: 0,
             }]),
             ..Default::default()
         };
         let mut command = vec![0u8; 0x20];
-        st32(&mut command[0..], render::OP_DRAW_INDEXED_WIDE);
+        let op = render::OP_DRAW_INDEXED_WIDE;
+        st32(&mut command[0..], op);
         st32(&mut command[4..], 0x20);
         st16(&mut command[8..], 3);
         st32(&mut command[12..], 0x3e);
         st32(&mut command[16..], 6);
-        let rec = stream::Record {
-            segment_index: 0,
-            segment_type: 0,
-            offset: 0,
-            length: command.len() as u32,
-            opcode: render::OP_DRAW_INDEXED_WIDE,
-            bytes_offset: 0,
-        };
-
         for _ in 0..100 {
-            handle_render_record(&mut state, &host, 1, &command, &rec, &mut out, &mut acc);
+            handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
         }
 
         assert_eq!(acc.draws.len(), 100);
@@ -3087,27 +3055,20 @@ mod tests {
         let mut acc = StreamAccum {
             pipeline_ref: 61,
             vertex_buffers: Arc::new(vec![BufferBind {
-            index: 0,
+                index: 0,
                 buffer_ref: 9,
                 offset: 0,
             }]),
             ..Default::default()
         };
         let mut command = vec![0u8; 0x20];
-        st32(&mut command[0..], render::OP_DRAW_INDEXED_WIDE);
+        let op = render::OP_DRAW_INDEXED_WIDE;
+        st32(&mut command[0..], op);
         st32(&mut command[4..], 0x20);
         st16(&mut command[8..], 3);
         st32(&mut command[12..], 0x3e);
         st32(&mut command[16..], 6);
-        let rec = stream::Record {
-            segment_index: 0,
-            segment_type: 0,
-            offset: 0,
-            length: command.len() as u32,
-            opcode: render::OP_DRAW_INDEXED_WIDE,
-            bytes_offset: 0,
-        };
-        handle_render_record(&mut state, &host, 1, &command, &rec, &mut out, &mut acc);
+        handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
 
         apply_binds(
             &[(77u32, 0u64)],
@@ -3117,7 +3078,8 @@ mod tests {
             &mut acc.fragment_buffers,
             |b| b.index,
             |index, (buffer_ref, offset)| {
-                Some(BufferBind {                    index,
+                Some(BufferBind {
+                    index,
                     buffer_ref,
                     offset,
                 })
@@ -3146,20 +3108,10 @@ mod tests {
         };
         let task_id = 0xfeed;
         let mut command = vec![0u8; HEADER_LEN];
-        st32(&mut command[0..], render::OP_ACCEPTED_LAST);
+        let op = render::OP_ACCEPTED_LAST;
+        st32(&mut command[0..], op);
         st32(&mut command[4..], HEADER_LEN as u32);
-        let rec = stream::Record {
-            segment_index: 0,
-            segment_type: 0,
-            offset: 0,
-            length: command.len() as u32,
-            opcode: render::OP_ACCEPTED_LAST,
-            bytes_offset: 0,
-        };
-
-        handle_render_record(
-            &mut state, &host, task_id, &command, &rec, &mut out, &mut acc,
-        );
+        handle_render_record(&mut state, &host, task_id, op, &command, &mut out, &mut acc);
 
         let body = std::fs::read_to_string(crate::observe::fail_log_path())
             .expect("reims-vgpu-fail.log readable");
@@ -3188,28 +3140,24 @@ mod tests {
 
         // First sighting of an opcode emits; every repeat is deduped (no flood).
         assert!(
-            note_unimplemented_render_opcode(0x7c, 16, &wire, task, &acc),
+            note_unimplemented_render_opcode(0x7c, &wire, task, &acc),
             "first sighting must emit",
         );
         for _ in 0..24 {
             assert!(
-                !note_unimplemented_render_opcode(0x7c, 16, &wire, task, &acc),
+                !note_unimplemented_render_opcode(0x7c, &wire, task, &acc),
                 "a repeated opcode must be deduped",
             );
         }
         // A distinct opcode reports once independently of the first.
-        assert!(note_unimplemented_render_opcode(
-            0x9a, 24, &wire, task, &acc
-        ));
-        assert!(!note_unimplemented_render_opcode(
-            0x9a, 24, &wire, task, &acc
-        ));
+        assert!(note_unimplemented_render_opcode(0x9a, &wire, task, &acc));
+        assert!(!note_unimplemented_render_opcode(0x9a, &wire, task, &acc));
         // Out-of-range opcodes (decode desync) are also deduped, not flooded.
         assert!(note_unimplemented_render_opcode(
-            0x1_0001, 8, &wire, task, &acc
+            0x1_0001, &wire, task, &acc
         ));
         assert!(!note_unimplemented_render_opcode(
-            0x1_0001, 8, &wire, task, &acc
+            0x1_0001, &wire, task, &acc
         ));
 
         // The first-sighting line captured the raw wire for offline decode.
@@ -3306,15 +3254,6 @@ mod tests {
         let host = FakeHost::new();
         let mut out = ExecResult::default();
         let mut acc = StreamAccum::default();
-        let rec = |len: usize, opcode: u32| stream::Record {
-            segment_index: 0,
-            segment_type: 0,
-            offset: 0,
-            length: len as u32,
-            opcode,
-            bytes_offset: 0,
-        };
-
         let mut buffer = vec![0u8; HEADER_LEN + 8 + 12];
         st32(&mut buffer[0..], OP_SET_VERTEX_BUFFER);
         st32(&mut buffer[4..], (HEADER_LEN + 8 + 12) as u32);
@@ -3325,8 +3264,8 @@ mod tests {
             &mut state,
             &host,
             0,
+            OP_SET_VERTEX_BUFFER,
             &buffer,
-            &rec(buffer.len(), OP_SET_VERTEX_BUFFER),
             &mut out,
             &mut acc,
         );
@@ -3335,8 +3274,8 @@ mod tests {
             &mut state,
             &host,
             0,
+            OP_SET_VERTEX_BUFFER,
             &buffer,
-            &rec(buffer.len(), OP_SET_VERTEX_BUFFER),
             &mut out,
             &mut acc,
         );
@@ -3352,25 +3291,9 @@ mod tests {
             st32(&mut command[8..], 3);
             st32(&mut command[12..], 1);
             st32(&mut command[16..], bound);
-            handle_render_record(
-                &mut state,
-                &host,
-                0,
-                &command,
-                &rec(command.len(), opcode),
-                &mut out,
-                &mut acc,
-            );
+            handle_render_record(&mut state, &host, 0, opcode, &command, &mut out, &mut acc);
             st32(&mut command[16..], 0);
-            handle_render_record(
-                &mut state,
-                &host,
-                0,
-                &command,
-                &rec(command.len(), opcode),
-                &mut out,
-                &mut acc,
-            );
+            handle_render_record(&mut state, &host, 0, opcode, &command, &mut out, &mut acc);
         }
         assert!(acc.fragment_textures.is_empty());
         assert!(acc.fragment_samplers.is_empty());
@@ -3509,7 +3432,7 @@ mod tests {
             draw: (3, 1, 3, 0),
             indexed: None,
             vertex_buffers: Arc::new(vec![BufferBind {
-            index: 0,
+                index: 0,
                 buffer_ref: 1,
                 offset: 0,
             }]),
@@ -3605,7 +3528,7 @@ mod tests {
             draw: (3, 1, 3, 0),
             indexed: None,
             vertex_buffers: Arc::new(vec![BufferBind {
-            index: 0,
+                index: 0,
                 buffer_ref: 1,
                 offset: 0,
             }]),
