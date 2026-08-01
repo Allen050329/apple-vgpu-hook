@@ -80,13 +80,7 @@ impl ResourcePools {
                     .image(image)
                     .view_type(vk::ImageViewType::TYPE_2D)
                     .format(format)
-                    .subresource_range(vk::ImageSubresourceRange {
-                        aspect_mask: vk::ImageAspectFlags::COLOR,
-                        base_mip_level: 0,
-                        level_count: 1,
-                        base_array_layer: 0,
-                        layer_count: 1,
-                    }),
+                    .subresource_range(super::color_subresource_range()),
                 None,
             )
             .map_err(|e| {
@@ -449,13 +443,7 @@ impl ResourcePools {
                     .image(image)
                     .view_type(vk::ImageViewType::TYPE_2D)
                     .format(format)
-                    .subresource_range(vk::ImageSubresourceRange {
-                        aspect_mask: vk::ImageAspectFlags::COLOR,
-                        base_mip_level: 0,
-                        level_count: 1,
-                        base_array_layer: 0,
-                        layer_count: 1,
-                    }),
+                    .subresource_range(super::color_subresource_range()),
                 None,
             ) {
                 Ok(v) => v,
@@ -648,13 +636,7 @@ impl ResourcePools {
                         .image(image)
                         .view_type(vk::ImageViewType::TYPE_2D)
                         .format(format)
-                        .subresource_range(vk::ImageSubresourceRange {
-                            aspect_mask: vk::ImageAspectFlags::COLOR,
-                            base_mip_level: 0,
-                            level_count: 1,
-                            base_array_layer: 0,
-                            layer_count: 1,
-                        }),
+                        .subresource_range(super::color_subresource_range()),
                     None,
                 )
                 .map_err(|e| {

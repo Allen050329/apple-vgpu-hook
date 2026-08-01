@@ -68,6 +68,36 @@ use pools::ResourcePools;
 use std::sync::atomic::Ordering;
 use types::ComputeError;
 
+/// The colour aspect of a single-mip, single-layer image — the shape of every
+/// image this engine creates.
+///
+/// Twenty-two barriers, copies and views across the engine spelled it out
+/// longhand, and the longhand is five fields of which four are zero or one. A
+/// `level_count: 0` typed once is a barrier that covers nothing, and the shape
+/// carries nothing a reader could check it against, so the only defence is not
+/// writing it out again. Callers with a real array range or a depth aspect
+/// still spell theirs out; those are saying something.
+pub(crate) fn color_subresource_range() -> ash::vk::ImageSubresourceRange {
+    ash::vk::ImageSubresourceRange {
+        aspect_mask: ash::vk::ImageAspectFlags::COLOR,
+        base_mip_level: 0,
+        level_count: 1,
+        base_array_layer: 0,
+        layer_count: 1,
+    }
+}
+
+/// [`color_subresource_range`] as a copy's subresource selector: colour aspect,
+/// base mip, single layer.
+pub(crate) fn color_subresource_layers() -> ash::vk::ImageSubresourceLayers {
+    ash::vk::ImageSubresourceLayers {
+        aspect_mask: ash::vk::ImageAspectFlags::COLOR,
+        mip_level: 0,
+        base_array_layer: 0,
+        layer_count: 1,
+    }
+}
+
 struct EngineState {
     owner: ContextOwner,
     caches: ObjectCaches,
@@ -764,13 +794,7 @@ unsafe fn copy_image_level0_to_host(
         .old_layout(old_layout)
         .new_layout(ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
         .image(image)
-        .subresource_range(ash::vk::ImageSubresourceRange {
-            aspect_mask: ash::vk::ImageAspectFlags::COLOR,
-            base_mip_level: 0,
-            level_count: 1,
-            base_array_layer: 0,
-            layer_count: 1,
-        })];
+        .subresource_range(color_subresource_range())];
     ctx.device.cmd_pipeline_barrier(
         cb,
         ash::vk::PipelineStageFlags::ALL_COMMANDS,
@@ -781,12 +805,7 @@ unsafe fn copy_image_level0_to_host(
         &barrier,
     );
     let region = [ash::vk::BufferImageCopy::default()
-        .image_subresource(ash::vk::ImageSubresourceLayers {
-            aspect_mask: ash::vk::ImageAspectFlags::COLOR,
-            mip_level: 0,
-            base_array_layer: 0,
-            layer_count: 1,
-        })
+        .image_subresource(color_subresource_layers())
         .image_extent(ash::vk::Extent3D {
             width,
             height,

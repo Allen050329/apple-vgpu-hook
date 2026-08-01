@@ -1643,7 +1643,7 @@ pub(crate) unsafe fn execute_draw_inner(
                 .old_layout(*source_old_layout)
                 .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
                 .image(*source_image)
-                .subresource_range(color_range())];
+                .subresource_range(super::color_subresource_range())];
             ctx.device.cmd_pipeline_barrier(
                 cb,
                 src_stage,
@@ -1660,7 +1660,7 @@ pub(crate) unsafe fn execute_draw_inner(
             .old_layout(vk::ImageLayout::UNDEFINED)
             .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
             .image(image.image)
-            .subresource_range(color_range())];
+            .subresource_range(super::color_subresource_range())];
         ctx.device.cmd_pipeline_barrier(
             cb,
             vk::PipelineStageFlags::TOP_OF_PIPE,
@@ -1671,18 +1671,8 @@ pub(crate) unsafe fn execute_draw_inner(
             &barrier,
         );
         let copy = [vk::ImageCopy::default()
-            .src_subresource(vk::ImageSubresourceLayers {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                mip_level: 0,
-                base_array_layer: 0,
-                layer_count: 1,
-            })
-            .dst_subresource(vk::ImageSubresourceLayers {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                mip_level: 0,
-                base_array_layer: 0,
-                layer_count: 1,
-            })
+            .src_subresource(super::color_subresource_layers())
+            .dst_subresource(super::color_subresource_layers())
             .extent(vk::Extent3D {
                 width: image.width,
                 height: image.height,
@@ -1702,7 +1692,7 @@ pub(crate) unsafe fn execute_draw_inner(
             .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
             .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
             .image(image.image)
-            .subresource_range(color_range())];
+            .subresource_range(super::color_subresource_range())];
         ctx.device.cmd_pipeline_barrier(
             cb,
             vk::PipelineStageFlags::TRANSFER,
@@ -1724,7 +1714,7 @@ pub(crate) unsafe fn execute_draw_inner(
             .old_layout(vk::ImageLayout::UNDEFINED)
             .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
             .image(target_image)
-            .subresource_range(color_range())];
+            .subresource_range(super::color_subresource_range())];
         ctx.device.cmd_pipeline_barrier(
             cb,
             src_stage,
@@ -1735,12 +1725,7 @@ pub(crate) unsafe fn execute_draw_inner(
             &barrier,
         );
         let copy = [vk::BufferImageCopy::default()
-            .image_subresource(vk::ImageSubresourceLayers {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                mip_level: 0,
-                base_array_layer: 0,
-                layer_count: 1,
-            })
+            .image_subresource(super::color_subresource_layers())
             .image_extent(vk::Extent3D {
                 width: req.width,
                 height: req.height,
@@ -1761,7 +1746,7 @@ pub(crate) unsafe fn execute_draw_inner(
             .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
             .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
             .image(target_image)
-            .subresource_range(color_range())];
+            .subresource_range(super::color_subresource_range())];
         ctx.device.cmd_pipeline_barrier(
             cb,
             vk::PipelineStageFlags::TRANSFER,
@@ -1788,7 +1773,7 @@ pub(crate) unsafe fn execute_draw_inner(
                 .old_layout(seed_layout)
                 .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
                 .image(seed_image)
-                .subresource_range(color_range())];
+                .subresource_range(super::color_subresource_range())];
             ctx.device.cmd_pipeline_barrier(
                 cb,
                 src_stage,
@@ -1807,7 +1792,7 @@ pub(crate) unsafe fn execute_draw_inner(
             .old_layout(vk::ImageLayout::UNDEFINED)
             .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
             .image(target_image)
-            .subresource_range(color_range())];
+            .subresource_range(super::color_subresource_range())];
         ctx.device.cmd_pipeline_barrier(
             cb,
             dst_stage,
@@ -1818,18 +1803,8 @@ pub(crate) unsafe fn execute_draw_inner(
             &barrier,
         );
         let region = [vk::ImageCopy::default()
-            .src_subresource(vk::ImageSubresourceLayers {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                mip_level: 0,
-                base_array_layer: 0,
-                layer_count: 1,
-            })
-            .dst_subresource(vk::ImageSubresourceLayers {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                mip_level: 0,
-                base_array_layer: 0,
-                layer_count: 1,
-            })
+            .src_subresource(super::color_subresource_layers())
+            .dst_subresource(super::color_subresource_layers())
             .extent(vk::Extent3D {
                 width: req.width,
                 height: req.height,
@@ -1851,7 +1826,7 @@ pub(crate) unsafe fn execute_draw_inner(
             .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
             .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
             .image(target_image)
-            .subresource_range(color_range())];
+            .subresource_range(super::color_subresource_range())];
         ctx.device.cmd_pipeline_barrier(
             cb,
             vk::PipelineStageFlags::TRANSFER,
@@ -1885,7 +1860,7 @@ pub(crate) unsafe fn execute_draw_inner(
             .old_layout(old_layout)
             .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
             .image(target_image)
-            .subresource_range(color_range())];
+            .subresource_range(super::color_subresource_range())];
         ctx.device.cmd_pipeline_barrier(
             cb,
             src_stage,
@@ -1954,7 +1929,7 @@ pub(crate) unsafe fn execute_draw_inner(
             .old_layout(*old_layout)
             .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
             .image(*image)
-            .subresource_range(color_range())];
+            .subresource_range(super::color_subresource_range())];
         ctx.device.cmd_pipeline_barrier(
             cb,
             src_stage,
@@ -2042,7 +2017,7 @@ pub(crate) unsafe fn execute_draw_inner(
             .old_layout(*old_layout)
             .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
             .image(*image)
-            .subresource_range(color_range())];
+            .subresource_range(super::color_subresource_range())];
         ctx.device.cmd_pipeline_barrier(
             cb,
             src_stage,
@@ -2207,12 +2182,7 @@ pub(crate) unsafe fn execute_draw_inner(
             &[],
         );
         let region = [vk::BufferImageCopy::default()
-            .image_subresource(vk::ImageSubresourceLayers {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                mip_level: 0,
-                base_array_layer: 0,
-                layer_count: 1,
-            })
+            .image_subresource(super::color_subresource_layers())
             .image_extent(vk::Extent3D {
                 width: req.width,
                 height: req.height,
@@ -2426,16 +2396,6 @@ pub(crate) unsafe fn execute_draw_inner(
         pixels: out,
         pixels_bgra: output_bgra,
     })
-}
-
-fn color_range() -> vk::ImageSubresourceRange {
-    vk::ImageSubresourceRange {
-        aspect_mask: vk::ImageAspectFlags::COLOR,
-        base_mip_level: 0,
-        level_count: 1,
-        base_array_layer: 0,
-        layer_count: 1,
-    }
 }
 
 /// First synchronization scope for a write to *this draw's own colour target*
