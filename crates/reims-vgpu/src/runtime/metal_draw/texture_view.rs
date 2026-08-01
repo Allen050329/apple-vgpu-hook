@@ -481,32 +481,6 @@ fn load_linear_texture_rgba_host<M: HostMemory + HostOps>(
     .map(|(bytes, _)| bytes)
 }
 
-/// Like [`load_linear_texture_rgba_host`] but keeps a BGRA8 source in its
-/// native channel order (returned format [`TexelLayout::Bgra8`]) so
-/// the engine uploads it into a BGRA8 image — the sampler swizzles in hardware
-/// and the CPU never runs the per-pixel channel swap. Used by the Safari-scroll
-/// fallback hot path (`lin_guest_fb`), which is padded-stride BGRA8 glyph/tile
-/// textures. Non-BGRA8 sources still report `Rgba8` (converted as before).
-#[cfg(feature = "backend-vulkan")]
-fn load_linear_texture_native_host<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
-    host: &mut M,
-    task_id: u32,
-    texture_ref: u32,
-    level: u32,
-    format_override: Option<u16>,
-) -> Result<(Vec<u8>, TexelLayout), LinearLoadRefusal> {
-    load_linear_texture_impl(
-        state,
-        host,
-        task_id,
-        texture_ref,
-        level,
-        format_override,
-        true,
-    )
-}
-
 /// When a sampled format's guest bytes are ALREADY in the final upload order —
 /// so the loader can read padded source rows straight into the tight output
 /// with no intermediate buffer and no per-row convert — this returns the engine

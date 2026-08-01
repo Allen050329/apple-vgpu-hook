@@ -1216,23 +1216,18 @@ fn resolve_sampled_source<M: HostMemory + HostOps>(
         // cache-fallback majority) and the host-cache fallback each read the same
         // descriptor blob and run the identical `decode_texture_descriptor`; the
         // object list is immutable for the draw, so one read+decode serves both.
-        // `try_linear_sample_zero_copy` uses only the decoded descriptor;
-        // `load_linear_from_host_caches` also needs `entry.object_type` for the
-        // gva-cache owner check.
-        if let (Some(le), Some(tex)) = (
-            resolved_entry,
-            resolved_entry.and_then(|e| {
-                objects::read_descriptor(state, host, task_id, &e)
-                    .and_then(|d| decode_texture_descriptor(&d).ok())
-            }),
-        ) {
+        // Both readers take only the decoded descriptor.
+        if let Some(tex) = resolved_entry.and_then(|e| {
+            objects::read_descriptor(state, host, task_id, &e)
+                .and_then(|d| decode_texture_descriptor(&d).ok())
+        }) {
             if let Some((w, h, src)) =
                 try_linear_sample_zero_copy(state, host, task_id, texture_ref, &tex)
             {
                 return Some((w, h, 0, src));
             }
             if let Some((w, h, rgba, identity, byte_format)) =
-                load_linear_from_host_caches(state, host, task_id, texture_ref, &le, &tex)
+                load_linear_from_host_caches(state, host, task_id, texture_ref, &tex)
             {
                 return Some((
                     w,
@@ -2980,10 +2975,9 @@ fn load_linear_from_host_caches<M: HostMemory + HostOps>(
     host: &mut M,
     task_id: u32,
     texture_ref: u32,
-    entry: &ListObjectEntry,
     tex: &TextureDescriptor,
 ) -> Option<LoadedLinearSample> {
-    // The object-list entry + descriptor are resolved+decoded once by the caller
+    // The descriptor is resolved+decoded once by the caller
     // (`resolve_sampled_source`'s linear branch) and threaded in; the zero-copy
     // attempt above shares the same decode.
     let (gva, layout) = tex.level_gva(0, state.page_shift)?;
@@ -3058,51 +3052,28 @@ fn load_linear_from_host_caches<M: HostMemory + HostOps>(
         note_guest_rung_blank(state, "guest_memo", task_id, texture_ref, gva, w, h, &rgba);
         return Some((w, h, rgba, identity, byte_format));
     }
-    let (rgba, byte_format) =
-        match load_linear_texture_native_host(state, host, task_id, texture_ref, 0, None) {
-            Ok(loaded) => loaded,
-            // The reason comes from the check that refused, not from this
-            // caller. It used to read `reason=guest_load` for all fifteen of
-            // the loader's refusals, which is the caller's assumption printed
-            // at full confidence in the field a reader trusts most.
-            Err(refusal) => {
-                crate::observe::Emit::decline("linear_sample_miss", &refusal)
-                    .field("task", task_id)
-                    .field("ref", texture_ref)
-                    .field("objtype", entry.object_type)
-                    .field("gva", format!("{gva:#x}"))
-                    .field("fmt", format!("{:#x}", tex.pixel_format))
-                    .field("geom", format!("{w}x{h}"))
-                    .field("bpr", layout.row_stride)
-                    .fail();
-                return None;
-            }
-        };
-    let need = (w as usize).saturating_mul(h as usize).saturating_mul(4);
-    if rgba.len() >= need {
-        // `load_linear_texture_native_host` already returns a tight `need`-byte
-        // buffer (RGBA8, or native BGRA8 when `byte_format == Bgra8`), so
-        // `rgba.len() == need` in the common case — move it straight into the
-        // Arc instead of a redundant `rgba[..need].to_vec()` copy. This is the
-        // CONFIRMED Safari-scroll hot path (census `lin_guest_fb`), and BGRA8
-        // sources now upload native (no CPU channel swap) — the engine binds a
-        // BGRA8 image and the sampler swizzles in hardware. The slice+copy is
-        // kept only for the defensive `len > need` case (padding overshoot).
-        let arc = if rgba.len() == need {
-            std::sync::Arc::new(rgba)
-        } else {
-            std::sync::Arc::new(rgba[..need].to_vec())
-        };
-        note_guest_rung_blank(state, "guest_native", task_id, texture_ref, gva, w, h, &arc);
-        return Some((w, h, arc, None, byte_format));
-    }
-    crate::observe::fail(format!(
-        "linear_sample_miss reason=short_rgba task={task_id} ref={texture_ref} type={} gva={gva:#x} fmt={:#x} {w}x{h} bpr={} got={} need={need}",
-        entry.object_type,
-        tex.pixel_format,
-        layout.row_stride,
-        rgba.len()
-    ));
+    // There is no second guest rung under the memo, and this counter is what
+    // replaced it.
+    //
+    // One used to sit here: a full re-read through `load_linear_texture_native_host`
+    // for the case the memo declined. It never ran. `lin_rung_guest_native`
+    // fires unconditionally on entry to `note_guest_rung_blank`, and it appears
+    // nowhere in the always-on log across every boot it holds, while its
+    // `guest_memo` sibling fires in the hundreds per boot. Every `None` the memo
+    // can return is a decode, geometry, bounds or guest-read failure that the
+    // re-read hits on the same descriptor and the same pages — so it was a
+    // fallback for conditions it could not itself survive.
+    //
+    // Losing it costs the memo's silence a witness, which is why the counter
+    // takes its place rather than nothing at all. `load_linear_guest_memoized`
+    // emits on none of its refusal paths, so the deleted rung's
+    // `linear_sample_miss` decline was the only line that ever named one. A
+    // sample refused here now falls to `load_sampled_rgba_static` and, failing
+    // that, to the caller's typed `DrawPreparationDecline::TextureResolveMissing`
+    // — visible, but without the memo's own reason. `lin_rung_memo_declined`
+    // against `lin_rung_guest_memo` is the denominator that says whether that
+    // gap is worth closing; while it reads zero, there is nothing to name.
+    crate::runtime::drain::note_store_route("lin_rung_memo_declined");
     None
 }
 

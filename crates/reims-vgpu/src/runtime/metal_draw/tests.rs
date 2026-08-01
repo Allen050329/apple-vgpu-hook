@@ -3041,7 +3041,7 @@ fn guest_linear_memo_reuses_arc_and_observes_guest_writes() {
     .expect("descriptor must decode");
 
     let (w, h, rgba1, id1, fmt1) =
-        load_linear_from_host_caches(&mut state, &mut host, 1, tex_ref, &le_entry, &td)
+        load_linear_from_host_caches(&mut state, &mut host, 1, tex_ref, &td)
             .expect("guest tight linear must load");
     assert_eq!((w, h), (4, 2));
     assert_eq!(
@@ -3055,7 +3055,7 @@ fn guest_linear_memo_reuses_arc_and_observes_guest_writes() {
     assert_ne!(id1.generation, 0, "0 means no host content yet");
 
     let (_, _, rgba2, id2, _) =
-        load_linear_from_host_caches(&mut state, &mut host, 1, tex_ref, &le_entry, &td)
+        load_linear_from_host_caches(&mut state, &mut host, 1, tex_ref, &td)
             .expect("repeat load must succeed");
     assert!(
         std::sync::Arc::ptr_eq(&rgba1, &rgba2),
@@ -3067,7 +3067,7 @@ fn guest_linear_memo_reuses_arc_and_observes_guest_writes() {
     let bgra_new = [90u8, 60, 30, 255].repeat(8);
     write_task_gva_arm64e(&mut host, &state.tasks[1], texel_gva, &bgra_new);
     let (_, _, rgba3, id3, _) =
-        load_linear_from_host_caches(&mut state, &mut host, 1, tex_ref, &le_entry, &td)
+        load_linear_from_host_caches(&mut state, &mut host, 1, tex_ref, &td)
             .expect("post-write load must succeed");
     assert!(!std::sync::Arc::ptr_eq(&rgba1, &rgba3));
     assert_eq!(&rgba3[..4], &[90, 60, 30, 255], "native BGRA8, unswizzled");
@@ -3162,7 +3162,7 @@ fn padded_bgra8_memoized_uploads_native_without_swizzle() {
     .expect("descriptor must decode");
 
     let (gw, gh, rgba, identity, fmt) =
-        load_linear_from_host_caches(&mut state, &mut host, 1, tex_ref, &le_entry, &td)
+        load_linear_from_host_caches(&mut state, &mut host, 1, tex_ref, &td)
             .expect("padded BGRA8 must load via the memo");
     assert_eq!((gw, gh), (w, h));
     assert_eq!(
@@ -3187,7 +3187,7 @@ fn padded_bgra8_memoized_uploads_native_without_swizzle() {
     // A repeat bind of unchanged content reuses the memoized Arc (the whole
     // point — the engine then skips its content hash + upload).
     let (_, _, rgba2, id2, fmt2) =
-        load_linear_from_host_caches(&mut state, &mut host, 1, tex_ref, &le_entry, &td)
+        load_linear_from_host_caches(&mut state, &mut host, 1, tex_ref, &td)
             .expect("repeat padded load must succeed");
     assert!(
         std::sync::Arc::ptr_eq(&rgba, &rgba2),
