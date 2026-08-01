@@ -194,11 +194,21 @@ pub enum WritebackLicence {
 /// Pure — the counting is [`note_writeback_licence`]'s job, so a caller that
 /// only wants to attribute a write does not inflate the flush census.
 pub fn writeback_licence(state: &DeviceState, mapping_id: u32) -> WritebackLicence {
-    let validity = state
-        .mappings
-        .get(&mapping_id)
-        .map(|m| m.validity)
-        .unwrap_or_default();
+    licence_of(
+        state
+            .mappings
+            .get(&mapping_id)
+            .map(|m| m.validity)
+            .unwrap_or_default(),
+    )
+}
+
+/// [`writeback_licence`] for a caller that already holds the entry.
+///
+/// The footprint attribution runs on the mapping write path, which has just
+/// looked this mapping up; a second lookup of the same map per write buys
+/// nothing.
+pub fn licence_of(validity: ResourceValidity) -> WritebackLicence {
     if validity.host_cleared_seq == 0 {
         WritebackLicence::Unstated
     } else if validity.host_published_seq > validity.host_cleared_seq {

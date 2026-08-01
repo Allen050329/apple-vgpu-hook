@@ -1894,7 +1894,7 @@ pub(crate) fn note_mapping_write_footprint(
     let page_shift = state.page_shift;
     // Asked once per write rather than once per page: the licence is a property
     // of the mapping, and the page loop below can cover a whole framebuffer.
-    let licence = write_licence(state, mapping_id);
+    let licence = licence_from(m.validity);
     let end = off.saturating_add(len);
     let first = off / page_size;
     let last = (end - 1) / page_size;
@@ -1927,17 +1927,30 @@ pub(crate) fn note_mapping_write_footprint(
 /// guest had handed us the surface* when it did. Only the pair convicts: a write
 /// into a torn-down page for a resource the guest never licensed is this device
 /// writing memory it was never given.
-pub(crate) fn write_licence(
-    state: &DeviceState,
-    mapping_id: u32,
+fn licence_from(
+    validity: crate::model::ResourceValidity,
 ) -> crate::observe::footprint::WriteLicence {
     use crate::observe::footprint::WriteLicence;
-    use crate::runtime::resource_validity::{writeback_licence, WritebackLicence};
-    match writeback_licence(state, mapping_id) {
+    use crate::runtime::resource_validity::{licence_of, WritebackLicence};
+    match licence_of(validity) {
         WritebackLicence::Licensed => WriteLicence::Licensed,
         WritebackLicence::Superseded => WriteLicence::Superseded,
         WritebackLicence::Unstated => WriteLicence::Unstated,
     }
+}
+
+/// [`licence_from`] for a call site that holds only the mapping id.
+fn write_licence(
+    state: &DeviceState,
+    mapping_id: u32,
+) -> crate::observe::footprint::WriteLicence {
+    licence_from(
+        state
+            .mappings
+            .get(&mapping_id)
+            .map(|m| m.validity)
+            .unwrap_or_default(),
+    )
 }
 
 pub fn write_mapping_bytes<H: HostMemory + HostOps>(
