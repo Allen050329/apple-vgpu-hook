@@ -5663,6 +5663,18 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         resources.width = w;
         resources.height = h;
         resources.vertex_count = vertex_count;
+        // Attachment-count census, taken before the MRT gate rather than inside
+        // it. `build_secondary_targets` returns empty for a single-attachment
+        // draw without emitting, and every MRT counter below it therefore reads
+        // zero whether the guest issues no MRT draw at all or issues them and
+        // the producer drops them. Those are different facts and the log could
+        // not tell them apart. `mrt_draw_single` is the denominator that proves
+        // this probe runs.
+        crate::runtime::drain::note_store_route(if req.colors.len() > 1 {
+            "mrt_draw_multi"
+        } else {
+            "mrt_draw_single"
+        });
         // True MRT: render every color attachment (slot 1.. as engine secondary
         // residents) instead of dropping the shader's secondary outputs. Gated
         // on a resident primary + resolvable secondaries (empty ⇒ single-RT,
@@ -5704,6 +5716,18 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         },
                     );
                 }
+            }
+            // Second half of the census: `built` vs `dropped` separates "the
+            // guest issued an MRT draw and we render every attachment" from
+            // "it issued one and every attachment was refused", which the
+            // `mrt_drop_*` reasons alone cannot say because the whole feature
+            // is silent when no MRT draw arrives.
+            if req.colors.len() > 1 {
+                crate::runtime::drain::note_store_route(if secs.is_empty() {
+                    "mrt_secondary_dropped"
+                } else {
+                    "mrt_secondary_built"
+                });
             }
             resources.secondary_targets = secs;
         }
