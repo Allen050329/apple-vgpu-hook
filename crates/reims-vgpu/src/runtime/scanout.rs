@@ -1117,12 +1117,38 @@ pub fn note_front_buffer_writeback<M: HostMemory + crate::runtime::host::HostOps
 /// must not resize the host window. Only [`note_front_buffer_writeback`]
 /// same-geom paints and **CmdDisplaySwap** (HostAction) may change console
 /// size — matching archive same_geom + PG `modeChangeHandler` at present.
+///
+/// # Known gap: the second candidate has no contract sentence
+///
+/// This is the one resolver left on the present path that ranks two sources,
+/// and only the first of them can be justified from a decoded field:
+///
+/// - `early_front_mapping` — the last mapping the guest **composited** into
+///   (`SurfaceWriteKind::Composite`). The sentence holds: the guest composited
+///   into M, so the pre-boundary console should show M.
+/// - `present_mapping` — pre-boundary this is the last writeback of *any* kind,
+///   including a ClearOnly buffer-setup flip. There is no sentence for it. It is
+///   a fallback for "no Composite writeback has happened yet", and what the
+///   guest meant in that state is exactly what we do not know.
+///
+/// The stickiness of the first field exists to survive the second being
+/// overwritten by ClearOnly flips, which is one mechanism compensating for
+/// another. The honest fix is to stop latching a console front from a ClearOnly
+/// writeback at all, leaving one field with one meaning — but that turns the
+/// unknown case into a blank early console rather than a guessed one, and
+/// deciding whether that is acceptable needs a two-boot A/B on the early-boot
+/// console handoff (capture during the first ~20 s against a control) that has
+/// not been run. Recorded rather than patched, per the operating loop: do not
+/// fill a contract gap with a heuristic, and do not remove one blind either.
+///
+/// Note the blast radius before spending a session here: this returns `None`
+/// once `frame_flush_seen`, so everything above is early boot only.
 pub fn early_scanout_target(state: &DeviceState) -> Option<(u32, u32, u32, u32)> {
     if state.present.frame_flush_seen {
         return None;
     }
-    // Prefer sticky Composite writeback front over present_mapping (often a
-    // ClearOnly flip buffer after present_defer_boundary).
+    // Composite front first, then the last writeback of any kind — see the
+    // known-gap note above for why only the first of these is derivable.
     let candidates = [
         state.present.early_front_mapping,
         state.present.present_mapping,
