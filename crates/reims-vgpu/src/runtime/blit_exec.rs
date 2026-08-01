@@ -1062,20 +1062,7 @@ fn dest_window<M: HostMemory>(
     if gva == 0 || span == 0 {
         return None;
     }
-    let mut pages = std::collections::HashSet::new();
-    gva_mem::visit_task_gva_page_gpas(
-        host,
-        &state.tasks,
-        task_id,
-        gva,
-        span,
-        state.page_shift,
-        1,
-        &mut |gpa_page| {
-            pages.insert(gpa_page);
-            true
-        },
-    );
+    let pages = gva_mem::task_gva_page_gpa_set(host, &state.tasks, task_id, gva, span, state.page_shift);
     if pages.is_empty() {
         crate::runtime::drain::note_store_route("blit_dest_unbounded");
         return None;

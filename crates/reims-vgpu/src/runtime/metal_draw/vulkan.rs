@@ -2094,22 +2094,8 @@ fn task_gva_guest_runs<M: HostMemory + HostOps>(
         return None;
     }
     let page = state.page_size();
-    let mut gpas: Vec<u64> = Vec::new();
-    gva_mem::visit_task_gva_page_gpas(
-        host,
-        &state.tasks,
-        task_id,
-        gva,
-        span,
-        state.page_shift,
-        1,
-        &mut |gpa| {
-            gpas.push(gpa);
-            true
-        },
-    );
-    let expect = ((gva % page) + span).div_ceil(page);
-    if gpas.len() as u64 != expect {
+    let gpas = gva_mem::task_gva_page_gpas(host, &state.tasks, task_id, gva, span, state.page_shift);
+    if gpas.len() as u64 != gva_mem::pages_spanned(gva, span, page) {
         return None;
     }
     coalesce_pages_to_runs(host, &gpas, page, gva % page, span)
@@ -6501,22 +6487,9 @@ fn gva_span_alloc_generation<M: HostMemory + HostOps>(
     if span == 0 {
         return 0;
     }
-    let mut pages: std::collections::HashSet<u64> = std::collections::HashSet::new();
-    crate::runtime::gva_mem::visit_task_gva_page_gpas(
-        host,
-        &state.tasks,
-        task_id,
-        gva,
-        span,
-        state.page_shift,
-        1,
-        &mut |gpa_page| {
-            pages.insert(gpa_page);
-            true
-        },
-    );
-    let expect_pages = ((gva % state.page_size()) + span).div_ceil(state.page_size());
-    if (pages.len() as u64) < expect_pages {
+    let pages =
+        gva_mem::task_gva_page_gpa_set(host, &state.tasks, task_id, gva, span, state.page_shift);
+    if (pages.len() as u64) < gva_mem::pages_spanned(gva, span, state.page_size()) {
         return 0;
     }
     gva_page_set_hash(&pages)
@@ -7256,22 +7229,15 @@ fn arm_gva_deferred_store<M: HostMemory + HostOps>(
     // Defer-time physical page index: raw task-GVA reads aliasing these pages
     // flush first (`storage_flush::flush_intersecting_task_gva`). A span that
     // does not fully walk cannot be guarded — Store synchronously.
-    let mut pages: std::collections::HashSet<u64> = std::collections::HashSet::new();
-    crate::runtime::gva_mem::visit_task_gva_page_gpas(
+    let pages = gva_mem::task_gva_page_gpa_set(
         host,
         &state.tasks,
         req.task_id,
         gva,
         span,
         state.page_shift,
-        1,
-        &mut |gpa_page| {
-            pages.insert(gpa_page);
-            true
-        },
     );
-    let expect_pages = ((gva % state.page_size()) + span).div_ceil(state.page_size());
-    if (pages.len() as u64) < expect_pages {
+    if (pages.len() as u64) < gva_mem::pages_spanned(gva, span, state.page_size()) {
         return false;
     }
     note_gva_resident_aliasing(state, gva, c0.width, c0.height, &pages);

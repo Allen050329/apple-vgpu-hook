@@ -3600,19 +3600,13 @@ pub(crate) fn sync_store_target_pages<M: HostMemory>(
         return None;
     }
     let span = (c.row_stride as u64).checked_mul(c.height as u64)?;
-    let mut pages = std::collections::HashSet::new();
-    crate::runtime::gva_mem::visit_task_gva_page_gpas(
+    let pages = crate::runtime::gva_mem::task_gva_page_gpa_set(
         host,
         &state.tasks,
         task_id,
         c.target_gva,
         span,
         state.page_shift,
-        1,
-        &mut |gpa_page| {
-            pages.insert(gpa_page);
-            true
-        },
     );
     if pages.is_empty() {
         crate::runtime::drain::note_store_route("sync_store_unbounded");

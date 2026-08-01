@@ -488,19 +488,14 @@ pub(crate) fn deferred_pages_still_ours<M: HostMemory + HostOps>(
         return true;
     }
     let mut live = std::collections::HashSet::new();
-    crate::runtime::gva_mem::visit_task_gva_page_gpas(
+    live.extend(crate::runtime::gva_mem::task_gva_page_gpa_set(
         host,
         &state.tasks,
         task_id,
         gva,
         span,
         state.page_shift,
-        1,
-        &mut |gpa_page| {
-            live.insert(gpa_page);
-            true
-        },
-    );
+    ));
     // The property that makes the write safe is not "the same number of pages
     // came back", it is "every page this write can reach is one the window was
     // given". `write_gva_rgba8` resolves the destination per row from a fresh

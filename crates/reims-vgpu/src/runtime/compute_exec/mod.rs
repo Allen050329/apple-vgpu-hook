@@ -916,19 +916,14 @@ fn staged_span_pages<M: HostMemory>(
     if gva == 0 || span == 0 {
         return pages;
     }
-    gva_mem::visit_task_gva_page_gpas(
+    pages.extend(gva_mem::task_gva_page_gpa_set(
         host,
         &state.tasks,
         task_id,
         gva,
         span,
         state.page_shift,
-        1,
-        &mut |gpa_page| {
-            pages.insert(gpa_page);
-            true
-        },
-    );
+    ));
     pages
 }
 
@@ -3878,19 +3873,14 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
                     "compute_writeback_deferred",
                 );
                 let mut pages = std::collections::HashSet::new();
-                crate::runtime::gva_mem::visit_task_gva_page_gpas(
+                pages.extend(crate::runtime::gva_mem::task_gva_page_gpa_set(
                     host,
                     &state.tasks,
                     task_id,
                     *gva,
                     span,
                     state.page_shift,
-                    1,
-                    &mut |gpa_page| {
-                        pages.insert(gpa_page);
-                        true
-                    },
-                );
+                ));
                 let indexed = pages.len();
                 state.arm_linear_deferred_window(key, generation, pages);
                 crate::observe::off(format!(
