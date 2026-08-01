@@ -47,9 +47,15 @@ pub const OP_WAIT_FENCE: u32 = 0x19;
 pub const OP_RENDER_PASS: u32 = 0x1a;
 
 /// Live render-pass attachment layout (reims_vgpu_render_format.h).
+///
+/// The three sections are contiguous, so each record's extent is the distance to
+/// the one after it and is never written down separately: depth is
+/// `[0x00, 0x28)`, stencil is `[0x28, 0x4c)`, and the color slots run from 0x4c
+/// at `PASS_COLOR_ATTACH_STRIDE` each. A single "depth/stencil stride" constant
+/// used to state both of the first two as 0x28, which is right for depth and
+/// 4 bytes too long for stencil — that spare word is color slot 0's texture ref.
 pub const PASS_DEPTH_ATTACH_OFF: usize = 0x00;
 pub const PASS_STENCIL_ATTACH_OFF: usize = 0x28;
-pub const PASS_DEPTH_STENCIL_ATTACH_STRIDE: usize = 0x28;
 pub const PASS_COLOR_ATTACH_OFF: usize = 0x4c;
 pub const PASS_COLOR_ATTACH_STRIDE: usize = 0x3c;
 pub const PASS_ATTACH_TEXREF: usize = 0x00;
@@ -329,11 +335,10 @@ pub fn decode_color_attachment(payload: &[u8], index: usize) -> ColorAttachment 
 /// Decode the depth attachment (fixed slot @0).
 pub fn decode_depth_attachment(payload: &[u8]) -> DepthAttachment {
     let mut out = DepthAttachment::default();
-    if payload.len() < PASS_DEPTH_ATTACH_OFF + PASS_DEPTH_STENCIL_ATTACH_STRIDE {
+    if payload.len() < PASS_STENCIL_ATTACH_OFF {
         return out;
     }
-    let slot =
-        &payload[PASS_DEPTH_ATTACH_OFF..PASS_DEPTH_ATTACH_OFF + PASS_DEPTH_STENCIL_ATTACH_STRIDE];
+    let slot = &payload[PASS_DEPTH_ATTACH_OFF..PASS_STENCIL_ATTACH_OFF];
     out.texture_ref = ld32(&slot[PASS_ATTACH_TEXREF..]);
     out.resolve_texture_ref = ld32(&slot[PASS_ATTACH_RESOLVEREF..]);
     // Archive uses u16 for depth/stencil level (color uses u32).
@@ -348,11 +353,10 @@ pub fn decode_depth_attachment(payload: &[u8]) -> DepthAttachment {
 /// Decode the stencil attachment (fixed slot @0x28).
 pub fn decode_stencil_attachment(payload: &[u8]) -> StencilAttachment {
     let mut out = StencilAttachment::default();
-    if payload.len() < PASS_STENCIL_ATTACH_OFF + PASS_DEPTH_STENCIL_ATTACH_STRIDE {
+    if payload.len() < PASS_COLOR_ATTACH_OFF {
         return out;
     }
-    let slot = &payload
-        [PASS_STENCIL_ATTACH_OFF..PASS_STENCIL_ATTACH_OFF + PASS_DEPTH_STENCIL_ATTACH_STRIDE];
+    let slot = &payload[PASS_STENCIL_ATTACH_OFF..PASS_COLOR_ATTACH_OFF];
     out.texture_ref = ld32(&slot[PASS_ATTACH_TEXREF..]);
     out.resolve_texture_ref = ld32(&slot[PASS_ATTACH_RESOLVEREF..]);
     out.level = ld16(&slot[PASS_ATTACH_LEVEL..]) as u32;
@@ -979,6 +983,51 @@ mod tests {
         assert!(s.present);
         assert_eq!(s.texture_ref, 88);
         assert_eq!(s.clear_stencil, 9);
+    }
+
+    /// Each of the first two records ends where the next one begins: depth
+    /// `[0x00, 0x28)`, stencil `[0x28, 0x4c)`. A payload that carries both in
+    /// full — and not one byte of the color section — must decode both.
+    ///
+    /// A shared `PASS_DEPTH_STENCIL_ATTACH_STRIDE = 0x28` used to give the
+    /// stencil record the depth record's length, so the decoder demanded 0x50
+    /// bytes to read a 0x24-byte record and sliced 4 bytes past its end, over
+    /// color slot 0's texture ref. This payload is exactly `PASS_COLOR_ATTACH_OFF`
+    /// long, so the old guard rejected it and returned a defaulted attachment.
+    #[test]
+    fn depth_and_stencil_records_end_where_the_next_section_begins() {
+        use crate::contract::endian::{st32, st64};
+        let mut payload = vec![0u8; PASS_COLOR_ATTACH_OFF];
+        st32(
+            &mut payload[PASS_DEPTH_ATTACH_OFF + PASS_ATTACH_TEXREF..],
+            31,
+        );
+        st64(
+            &mut payload[PASS_DEPTH_ATTACH_OFF + PASS_DEPTH_ATTACH_CLEAR_DEPTH..],
+            0.25f64.to_bits(),
+        );
+        st32(
+            &mut payload[PASS_STENCIL_ATTACH_OFF + PASS_ATTACH_TEXREF..],
+            32,
+        );
+        st32(
+            &mut payload[PASS_STENCIL_ATTACH_OFF + PASS_STENCIL_ATTACH_CLEAR_STENCIL..],
+            0xfe,
+        );
+        let d = decode_depth_attachment(&payload);
+        assert!(
+            d.present,
+            "depth record is complete at {PASS_STENCIL_ATTACH_OFF} bytes"
+        );
+        assert_eq!(d.texture_ref, 31);
+        assert!((d.clear_depth - 0.25).abs() < 1e-9);
+        let s = decode_stencil_attachment(&payload);
+        assert!(
+            s.present,
+            "stencil record is complete at {PASS_COLOR_ATTACH_OFF} bytes"
+        );
+        assert_eq!(s.texture_ref, 32);
+        assert_eq!(s.clear_stencil, 0xfe);
     }
 
     #[test]
