@@ -232,9 +232,18 @@ naming any of the six API surfaces back into existence.
 This paragraph used to read "keep imports windowed; use the existing capped window resolver", which
 sent a reader after a mechanism that no longer exists to solve a problem the gate forbids solving
 that way. It is worth knowing why the temptation recurs: the render deferred-flush rail moves a
-gigabyte a second through two CPU passes that a GPU-direct write into guest pages would erase, and
-that is the single largest cost in the device. It is still not the route. Reducing the bytes, or
-making the guest's own reads observable so the writeback becomes demand-driven, are.
+gigabyte a second into guest pages, and that is the single largest cost in the device. It is still
+not the route. Reducing the bytes, or making the guest's own reads observable so the writeback
+becomes demand-driven, are.
+
+That sentence used to say **two** CPU passes. There is one. The pass that copied the mapped readback
+buffer into a `Vec` before scattering it is gone — the scatter reads the staging buffer in place
+through a lease (`engine::LeasedFrame`), measured at `readback_split map_us=0 map=120 map_max_us=0`
+on a driven boot against ~0.82 ms per flush before. What remains is `write_split land_us`, ~0.87 ms
+per 8 MB frame of cache-cold scattered writes into guest RAM, and there is no second pass left to
+remove: the only way past it is not to write the bytes at all. The rail's own doc
+(`flush_mapping_windows_before_fence`) carries the full ledger, including the four levers that are
+closed and why.
 
 ## Verification
 
