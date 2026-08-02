@@ -3199,8 +3199,16 @@ pub enum FlushRail {
 /// that volume, so the next lever is reading back less than the whole
 /// attachment, not making any one phase faster.
 ///
-/// [`Fence`](Self::Fence) is the GPU rendering the frame rather than latency to
-/// reschedule — that is measured, not assumed; see [`ResidentArmCensus`].
+/// This paragraph used to end "[`Fence`](Self::Fence) is the GPU rendering the
+/// frame rather than latency to reschedule — that is measured, not assumed",
+/// and the measurement it pointed at does not say that. What
+/// [`ResidentArmCensus`] measured is that submitting the copy *earlier* cannot
+/// help, which rules out one explanation without establishing another. Holding
+/// the host GPU at its top clock then moved the same wait from 2.55-2.83 ms to
+/// **0.40 ms** with no code change, so roughly six sevenths of it is the
+/// governor and only the last seventh is work. Read [`ResidentArmCensus`] for
+/// the table, and record the host GPU's power state beside any number taken
+/// from this phase.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ReadbackPhase {
     /// Record the copy command buffer and submit it. No GPU wait.
@@ -3208,7 +3216,12 @@ pub enum ReadbackPhase {
     /// Block on the readback fence: pure GPU round-trip latency, and the part
     /// no smaller copy can reduce.
     Fence,
-    /// Map, invalidate and memcpy the staging buffer into a host `Vec`.
+    /// Make the staging buffer readable. On the leased arm that is the
+    /// invalidate alone, because the mapping already exists for the slot's
+    /// lifetime; on the fallback arm it is map, invalidate and a whole-frame
+    /// memcpy into a host `Vec`. The two differ by ~8 MB, so this phase reads
+    /// near zero exactly when every readback in the window was leased and
+    /// climbs in proportion to the ones that were not.
     Map,
     /// Write the frame into the guest's pages (`write_bgra8_skipping`).
     Write,
