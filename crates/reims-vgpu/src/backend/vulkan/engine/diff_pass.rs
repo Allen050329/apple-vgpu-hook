@@ -389,6 +389,331 @@ pub fn changed_runs(bits: &[u32], bytes: u64) -> Vec<(u64, u64)> {
     runs
 }
 
+/// Which destination a `prev` frame is a claim about.
+///
+/// Deliberately **not** [`super::types::TargetIdentity`]. `prev` claims that the
+/// guest's pages hold a particular frame, so its identity is the mapping window
+/// a landing writes into, not the render target the pixels came out of. Two
+/// targets can land at one window, one target's identity carries a generation
+/// the guest bumps for reasons that have nothing to do with where its pixels go,
+/// and a claim keyed on the wrong one of those is a claim about the wrong bytes.
+///
+/// `texture_ref` is excluded for the same reason: it names which texture
+/// produced the frame, and the destination does not care. Including it would
+/// give two textures alternating into one window a `prev` each, so each would
+/// be invalidated by the other's landing every frame — correct, because the
+/// host-write witness would catch it, and worthless, because the rail would
+/// then pay for a comparison it can never use.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct LandingIdentity {
+    pub mapping_id: u32,
+    pub map_generation: u32,
+    pub surface_offset: u64,
+    pub surface_bpr: u32,
+    pub width: u32,
+    pub height: u32,
+    pub pixel_format: u16,
+}
+
+impl LandingIdentity {
+    /// The destination a deferred render window will land at.
+    pub fn of(key: &crate::model::ComputeStorageResidencyKey) -> Self {
+        Self {
+            mapping_id: key.mapping_id,
+            map_generation: key.map_generation,
+            surface_offset: key.surface_offset,
+            surface_bpr: key.surface_bpr,
+            width: key.width,
+            height: key.height,
+            pixel_format: key.pixel_format,
+        }
+    }
+}
+
+/// The `cur`/`prev` pair one destination compares through.
+struct RailEntry {
+    cur: ScratchBuffer,
+    prev: ScratchBuffer,
+    bytes: u64,
+    /// `prev` holds the frame this destination's guest pages hold.
+    ///
+    /// False until a landing has been acknowledged against it. The first frame
+    /// of a destination compares against a buffer nothing wrote, so it is
+    /// landed whole and only the *next* one can be narrowed.
+    seeded: bool,
+    /// Last use, on the rail's own monotonic clock. Eviction is by this.
+    used: u64,
+    /// The host-write epoch current when this destination was last
+    /// acknowledged, as the runtime's own [`crate::runtime::host_writes`] ring
+    /// counts it. The runtime asks that ring whether anything has written these
+    /// pages since, which is the half of the witness the engine cannot see.
+    stamp: u64,
+}
+
+/// Per-destination `cur`/`prev` scratch for the render writeback's difference
+/// pass.
+///
+/// Bounded in **bytes**, because that is what the pass actually spends: an
+/// entry is two whole frames of device-local memory, and a count would let a
+/// 4K destination cost sixteen times what a thumbnail does under the same
+/// bound. Eviction is least-recently-used and evicts one entry at a time —
+/// dropping the whole map, which the census does, would re-seed every live
+/// destination at once and cost a full landing each.
+#[derive(Default)]
+pub(crate) struct DiffRail {
+    entries: std::collections::HashMap<LandingIdentity, RailEntry>,
+    /// Device-local bytes currently held across all entries.
+    held: u64,
+    clock: u64,
+}
+
+/// Device-local bytes the rail may hold, given the device it is running on.
+///
+/// A sixteenth of the largest device-local heap. **That fraction is chosen, not
+/// derived, and is not offered as one**: the quantity that would size this is
+/// the number of distinct landing destinations live at once during motion, and
+/// nothing has measured it — `dr_targets_sum` is emitted per diffed readback so
+/// the next driven run states it rather than leaving it inferred from whether
+/// an eviction happened to fire. What the fraction *is* chosen against is the
+/// rest of the heap's claimants: the resident target registry, the sampled
+/// pools and the readback ring all draw on it, and a pass that competes with
+/// the images it exists to read would cost more than it collects.
+///
+/// Reading the heap rather than baking a constant is what keeps this honest on
+/// the low end of the support matrix. A discrete part and an iGPU with a small
+/// carve-out get budgets that differ by two orders of magnitude, and a constant
+/// sized for the first would evict the second's resident targets.
+fn scratch_byte_cap(ctx: &DeviceContext) -> u64 {
+    ctx.caps.memory.device_local_bytes / 16
+}
+
+impl DiffRail {
+    /// The pair this destination compares through, and whether `prev` is usable.
+    ///
+    /// `prev_offered` is the caller's answer to "do the guest's pages still hold
+    /// what we last landed there" — it covers writers this module cannot see,
+    /// and a `false` here only ever costs a full landing. `None` is returned
+    /// when the rail cannot serve the frame at all, which is always a reason to
+    /// take the undiffed readback rather than a failure.
+    unsafe fn attach(
+        &mut self,
+        ctx: &DeviceContext,
+        counters: &EngineCounters,
+        key: &LandingIdentity,
+        bytes: u64,
+        prev_offered: bool,
+    ) -> Option<(vk::Buffer, vk::Buffer, bool)> {
+        use crate::runtime::drain::note_store_route_n;
+        self.clock = self.clock.wrapping_add(1);
+        let clock = self.clock;
+
+        // A destination whose frame size changed under one identity has a pair
+        // describing a different shape, so there is nothing to compare against.
+        if self.entries.get(key).is_some_and(|e| e.bytes != bytes) {
+            self.drop_entry(&ctx.device, key);
+        }
+        if !self.entries.contains_key(key) {
+            let pair = bytes.saturating_mul(2);
+            let cap = scratch_byte_cap(ctx);
+            if pair > cap {
+                // One destination alone does not fit the budget. Nothing to
+                // evict would help, and re-asking every frame would churn.
+                note_store_route_n("dr_declined_budget", 1);
+                return None;
+            }
+            let live: Vec<(LandingIdentity, u64, u64)> = self
+                .entries
+                .iter()
+                .map(|(k, e)| (k.clone(), e.used, e.bytes.saturating_mul(2)))
+                .collect();
+            for victim in eviction_order(&live, self.held, pair, cap) {
+                self.drop_entry(&ctx.device, &victim);
+                note_store_route_n("dr_evict", 1);
+            }
+            let cur = ScratchBuffer::create(ctx, bytes, ScratchBuffer::USAGE, counters).ok()?;
+            let Ok(prev) = ScratchBuffer::create(ctx, bytes, ScratchBuffer::USAGE, counters) else {
+                cur.destroy(&ctx.device);
+                note_store_route_n("dr_declined_scratch", 1);
+                return None;
+            };
+            self.held = self.held.saturating_add(pair);
+            self.entries.insert(
+                key.clone(),
+                RailEntry {
+                    cur,
+                    prev,
+                    bytes,
+                    seeded: false,
+                    used: clock,
+                    stamp: 0,
+                },
+            );
+        }
+        let entry = self.entries.get_mut(key)?;
+        entry.used = clock;
+        // A destination the caller cannot vouch for stops being seeded rather
+        // than being asked again next frame: the frame about to be landed whole
+        // re-establishes the claim, and leaving the flag set would let a later
+        // frame compare against a `prev` the guest has since overwritten.
+        if !prev_offered {
+            entry.seeded = false;
+        }
+        Some((entry.cur.buffer, entry.prev.buffer, entry.seeded))
+    }
+
+    /// This destination's guest pages now hold what `cur` holds.
+    ///
+    /// Called only after a landing has been acknowledged, because until then
+    /// nothing establishes that the bytes reached guest RAM. The swap is what
+    /// makes this frame the next one's predecessor.
+    fn promote(&mut self, key: &LandingIdentity, stamp: u64) {
+        if let Some(entry) = self.entries.get_mut(key) {
+            std::mem::swap(&mut entry.cur, &mut entry.prev);
+            entry.seeded = true;
+            entry.stamp = stamp;
+        }
+    }
+
+    /// The host-write epoch this destination was last acknowledged at, or
+    /// `None` when there is no `prev` to ask about.
+    fn stamp(&self, key: &LandingIdentity) -> Option<u64> {
+        self.entries
+            .get(key)
+            .filter(|e| e.seeded)
+            .map(|e| e.stamp)
+    }
+
+    /// This destination's guest pages no longer hold what we last landed.
+    fn unseed(&mut self, key: &LandingIdentity) {
+        if let Some(entry) = self.entries.get_mut(key) {
+            entry.seeded = false;
+        }
+    }
+
+    unsafe fn drop_entry(&mut self, device: &ash::Device, key: &LandingIdentity) {
+        if let Some(entry) = self.entries.remove(key) {
+            self.held = self.held.saturating_sub(entry.bytes.saturating_mul(2));
+            entry.cur.destroy(device);
+            entry.prev.destroy(device);
+        }
+    }
+
+    /// Live destinations, for the counter that reports the working set.
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Release every buffer. The caller owes the in-flight rule.
+    pub(crate) unsafe fn destroy_all(&mut self, device: &ash::Device) {
+        for (_, entry) in self.entries.drain() {
+            entry.cur.destroy(device);
+            entry.prev.destroy(device);
+        }
+        self.held = 0;
+    }
+}
+
+/// The device-local pair a diffed readback compares through, resolved for one
+/// frame, plus the caches the pass needs to build its pipeline.
+pub(crate) struct DiffAttach<'a> {
+    pub cur: vk::Buffer,
+    pub prev: vk::Buffer,
+    pub plan: TileDiffPlan,
+    pub caches: &'a mut ObjectCaches,
+}
+
+/// Set up one diffed readback, or decline it.
+///
+/// Splitting the resolution from the submission is what lets the caller hold
+/// `pools` mutably for the readback while this holds the rail: everything the
+/// pass needs is reduced to two buffer handles and a plan before the command
+/// buffer is opened.
+///
+/// Answers `None` for every reason a comparison cannot be made — an odd frame
+/// size, a budget that will not hold the pair, a device that refuses the
+/// scratch — and each of those is a reason to take the plain readback, not a
+/// failure. Also answers the second element `false` when `prev` holds nothing
+/// yet, which the caller must read as "this frame lands whole".
+pub(crate) unsafe fn attach_for_readback(
+    ctx: &DeviceContext,
+    counters: &EngineCounters,
+    rail: &mut DiffRail,
+    key: &LandingIdentity,
+    rb_size: u64,
+    prev_offered: bool,
+) -> Option<(vk::Buffer, vk::Buffer, TileDiffPlan, bool)> {
+    use crate::runtime::drain::note_store_route_n;
+    let Some(plan) = TileDiffPlan::for_bytes(rb_size, ctx.max_compute_work_group_count_x) else {
+        note_store_route_n("dr_declined_geometry", 1);
+        return None;
+    };
+    let (cur, prev, seeded) = rail.attach(ctx, counters, key, rb_size, prev_offered)?;
+    note_store_route_n("dr_targets_sum", rail.len() as u64);
+    Some((cur, prev, plan, seeded))
+}
+
+/// Which entries must go before `need` more bytes fit under `cap`.
+///
+/// Least-recently-used first, and no further than necessary — a rail asked for
+/// one more destination evicts one, not the map. Dropping everything is what
+/// the census does, and it costs a full landing for every live destination at
+/// once; the census can afford that because it is a probe and the rail cannot.
+///
+/// Returned as a list rather than evicted in place because the buffers an entry
+/// holds are the part that needs a device and the *choice* of entry is the part
+/// that can be wrong. `live` is `(key, last use, bytes the pair holds)`.
+fn eviction_order(
+    live: &[(LandingIdentity, u64, u64)],
+    held: u64,
+    need: u64,
+    cap: u64,
+) -> Vec<LandingIdentity> {
+    let mut order: Vec<&(LandingIdentity, u64, u64)> = live.iter().collect();
+    order.sort_by_key(|(_, used, _)| *used);
+    let mut freed = 0u64;
+    let mut out = Vec::new();
+    for (key, _, bytes) in order {
+        if held.saturating_sub(freed).saturating_add(need) <= cap {
+            break;
+        }
+        freed = freed.saturating_add(*bytes);
+        out.push(key.clone());
+    }
+    out
+}
+
+/// Record what one comparison found, so the rail's saving is a measured
+/// quantity rather than an inferred one.
+///
+/// `dr_tiles_changed / dr_tiles` is the fraction of the writeback this rail
+/// still sends. It is the same quantity the census counts under
+/// `REIMS_VGPU_PROBE_TILE_DIFF_CENSUS`, but taken on the product path and over
+/// the frames actually landed, so a boot can be read for it without the census
+/// probe's extra submission deforming the timings.
+pub(crate) fn note_diff_result(bits: &[u32], bytes: u64) {
+    use crate::runtime::drain::note_store_route_n;
+    let tiles = (bytes.div_ceil(4) as u32).div_ceil(TILE_DIFF_WORDS_PER_TILE);
+    let changed: u32 = bits.iter().map(|w| w.count_ones()).sum();
+    note_store_route_n("dr_frames", 1);
+    note_store_route_n("dr_tiles", u64::from(tiles));
+    note_store_route_n("dr_tiles_changed", u64::from(changed.min(tiles)));
+}
+
+/// Promote a destination's `cur` to `prev` after its landing was acknowledged.
+pub(crate) fn promote(rail: &mut DiffRail, key: &LandingIdentity, stamp: u64) {
+    rail.promote(key, stamp);
+}
+
+/// The host-write epoch a destination's `prev` was established at.
+pub(crate) fn prev_stamp(rail: &DiffRail, key: &LandingIdentity) -> Option<u64> {
+    rail.stamp(key)
+}
+
+/// Withdraw a destination's `prev`, because its guest pages no longer hold it.
+pub(crate) fn unseed(rail: &mut DiffRail, key: &LandingIdentity) {
+    rail.unseed(key);
+}
+
 /// Is the tile-difference census probe on for this boot?
 ///
 /// Off by default, and it must stay that way: the census copies a second whole
@@ -903,6 +1228,86 @@ unsafe fn probe_tile_diff_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn landing(mapping_id: u32) -> LandingIdentity {
+        LandingIdentity {
+            mapping_id,
+            map_generation: 1,
+            surface_offset: 0,
+            surface_bpr: 7680,
+            width: 1920,
+            height: 1080,
+            pixel_format: 0x50,
+        }
+    }
+
+    /// The destination is the guest window a landing writes into, so which
+    /// texture produced the frame must not enter the identity: two textures
+    /// alternating into one window would each get a `prev` the other's landing
+    /// invalidates, and the rail would pay for comparisons it can never use.
+    #[test]
+    fn the_landing_identity_is_the_destination_and_not_the_source() {
+        let mut key = crate::model::ComputeStorageResidencyKey {
+            mapping_id: 9,
+            map_generation: 3,
+            surface_offset: 4096,
+            surface_bpr: 7680,
+            span_end: 1 << 24,
+            width: 1920,
+            height: 1080,
+            pixel_format: 0x50,
+            texture_ref: 11,
+        };
+        let a = LandingIdentity::of(&key);
+        key.texture_ref = 12;
+        // `span_end` is a hull over the same window, so it is destination
+        // geometry the identity already names through offset and pitch.
+        key.span_end = 1 << 25;
+        assert_eq!(a, LandingIdentity::of(&key));
+        // Anything that moves where the pixels land is a different destination.
+        key.map_generation = 4;
+        assert_ne!(a, LandingIdentity::of(&key));
+    }
+
+    /// A rail asked for one more destination evicts one, not the map.
+    #[test]
+    fn eviction_takes_the_least_recently_used_and_stops_when_it_fits() {
+        const PAIR: u64 = 16;
+        let live = [
+            (landing(1), 30u64, PAIR),
+            (landing(2), 10, PAIR),
+            (landing(3), 20, PAIR),
+        ];
+        // Room already: nothing goes.
+        assert!(eviction_order(&live, 3 * PAIR, 0, 4 * PAIR).is_empty());
+        // One pair short: exactly the oldest goes.
+        assert_eq!(
+            eviction_order(&live, 3 * PAIR, PAIR, 3 * PAIR),
+            vec![landing(2)]
+        );
+        // Two pairs short: the two oldest, in age order, and no more.
+        assert_eq!(
+            eviction_order(&live, 3 * PAIR, 2 * PAIR, 3 * PAIR),
+            vec![landing(2), landing(3)]
+        );
+        // A request that cannot fit even an empty rail evicts everything it
+        // has rather than looping; the caller declines above this.
+        assert_eq!(eviction_order(&live, 3 * PAIR, 99 * PAIR, PAIR).len(), 3);
+    }
+
+    /// Entries of different sizes free different amounts, so the loop must stop
+    /// on bytes freed and not on a count.
+    #[test]
+    fn eviction_counts_bytes_rather_than_entries() {
+        let live = [(landing(1), 1u64, 64u64), (landing(2), 2, 8)];
+        // Evicting the oldest alone frees 64, which is enough for a 32-byte
+        // pair under a 40-byte cap.
+        assert_eq!(eviction_order(&live, 72, 32, 40), vec![landing(1)]);
+        // Reverse the ages and the small one goes first but does not suffice,
+        // so the large one follows.
+        let live = [(landing(1), 2u64, 64u64), (landing(2), 1, 8)];
+        assert_eq!(eviction_order(&live, 72, 32, 40), vec![landing(2), landing(1)]);
+    }
 
     /// A frame that is not a whole number of words is declined rather than
     /// truncated. `rb_size / 4` on a 3-bytes-per-texel format would leave the
