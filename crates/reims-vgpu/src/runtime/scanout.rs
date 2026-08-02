@@ -183,9 +183,15 @@ pub fn capture_present_frame(
     // (the fullscreen-video slowdown class). Skip it on those presents; the cheap
     // protocol-structural a/b guard still runs on every light present.
     //
-    // Never taken where the window owns its swapchain and uploads CPU pixels —
-    // every non-macOS host — because `display_from_resident` only becomes true
-    // after a resident publish succeeds.
+    // This is the steady state on the x86/Vulkan host too, not a macOS-only
+    // handoff: `publish_window_frame` hands the window the resident whenever the
+    // engine's own device can present to the surface, and the host window then
+    // reads it directly instead of uploading CPU pixels. A driven boot of that
+    // pathway reads `capture_sampling full=1 light=1023` — one full capture for
+    // the whole boot, every present after it resident-carried. Only a present no
+    // resident carries (firmware framebuffer, a mapping cleared but never
+    // rendered into, the frames after a device reset) falls back to the readback
+    // below.
     //
     // The full-frame readback has EXACTLY ONE reason to exist: the DISPLAY needs
     // CPU pixels because no resident is carrying the frame, and the window will

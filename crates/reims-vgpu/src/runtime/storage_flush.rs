@@ -767,16 +767,50 @@ pub fn flush_linear_windows_before_fence<M: HostMemory + HostOps>(
 /// `SynchronizeResources` path that fires when the guest actually declares a CPU
 /// read, contributes nothing while driving.
 ///
-/// That is not licence to drop the writeback. The guest has been observed
-/// CPU-reading pages it never declared (the black-wallpaper fade snapshot named
-/// in [`flush_mapping_for_guest_read`]), which is why this fence exists, and
-/// after the completion stamp the pages may belong to something else entirely.
-/// "Write now or never write" is the real choice and this side of it is the safe
-/// one. What the numbers argue for is not flushing less often but not needing to
-/// flush at all — the zero-copy endgame above — with the async-readback split
-/// (release the device lock across the 3.04 ms fence wait, which currently
-/// blocks guest doorbells 105 times a second for nothing) as the step that does
-/// not require it.
+/// Nothing reads what it produces, either. `RenderFlushWitness` marks each of
+/// the two copies a flush lands — the mapping's guest pages and its host surface
+/// cache entry — and clears the mark when a host reader takes that copy, so the
+/// next flush of the same mapping reports what became of the previous one. A
+/// 30 s driven Safari probe scored 3766 landings:
+///
+/// ```text
+/// render_flush_cache_used      15    render_flush_cache_unread   3751
+/// render_flush_pages_used      26    render_flush_pages_unread   3740
+/// ```
+///
+/// **0.4% of the cache copies and 0.7% of the guest-page writes are read by
+/// anything in the device before the next flush replaces them.** That is not
+/// surprising once stated: every device-side reader of these bytes sits below a
+/// rung that prefers the GPU resident (`t11rung_resident`, the LOAD elision, the
+/// window's resident-carried present), and the resident is exactly what the
+/// flush is a copy of. The readers only fall through to a copy when there is no
+/// resident to read — and then there was nothing to write back either.
+///
+/// That is still not licence to drop the writeback, and the witness says so
+/// itself: it can only see readers *inside* the device. The guest CPU loads
+/// these pages with no device operation at all and has been observed doing it
+/// without declaring it (the black-wallpaper fade snapshot named in
+/// [`flush_mapping_for_guest_read`]), which is why this fence exists, and after
+/// the completion stamp the pages may belong to something else entirely. So the
+/// 99% is a bound on what a *cheaper* rail could save, not a licence to delete
+/// this one: "write now or never write" is the real choice and this side of it
+/// is the safe one.
+///
+/// What the pair of numbers argues for is not flushing less often but not
+/// needing to flush at all. Two routes remain, and the witness rules out a third:
+///
+/// - The zero-copy endgame above — a resident whose image memory *is* the guest
+///   pages. Available only where the host GPU can address host memory.
+/// - Making the undeclared guest read observable, so the writeback becomes
+///   demand-driven everywhere rather than only on `SynchronizeResources`. That
+///   is what would make the rail's cost proportional to its 0.7% of consumed
+///   work on a discrete host too.
+/// - **Not** "flush only the mappings whose copies get read": which flushes were
+///   wasted is knowable only in hindsight, and a mapping whose pages are read
+///   while stale has already served wrong pixels.
+///
+/// The async-readback split (release the device lock across the fence wait) is
+/// the step that does not require any of them.
 ///
 /// # Ordering
 ///
