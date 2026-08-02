@@ -90,6 +90,34 @@ The gate has to come first because the witness cannot tell those two apart on
 its own: a wedged page and a device that lost a layer both leave `VIOLET`
 missing, and only one of them is this device's fault.
 
+## The third mistake, and the one the code now catches by itself
+
+A Firefox run reported seven regions corrupted in nineteen consecutive captures.
+The frame showed a **"make Firefox your default browser" sheet**, and macOS draws
+a sheet by dimming the window behind it. Every measured colour was its declared
+colour times 0.5 to the last bit — `RED` 224→111, `YELLOW` 240→120, the near-black
+16→8 alike.
+
+What makes this worth detecting mechanically rather than by eye is which regions
+*passed*. Halved `BG` and halved `GREEN` are exactly equidistant from their own
+palette entry and from `BLACK`, so the nearest-entry tie-break let them through.
+A uniform dim therefore reports as a **partial**, entirely plausible-looking
+corruption — seven of eleven regions, stable across captures, which is precisely
+what a real intermittent bug would not look like but a reader might accept.
+
+So the run now fits a single scale `k` across every region by least squares. A
+tight fit at `k < 0.9` means the whole frame is attenuated, which is a state of
+the guest's screen and not a loss in this device: the capture is discarded with
+`ATTENUATED`, and a run that is mostly attenuated exits `2`. On the frame above
+that fit gives `k = 0.4996` with a worst residual of `3.0/255`. Losing one region
+to black instead gives a worst residual of `187`, so the guard cannot swallow a
+real local loss — which is the whole reason it is a fit and not a tolerance.
+
+The sheet itself is now prevented (`browser.shell.checkDefaultBrowser=false`) and
+any other one is dismissed with two Escapes before the fullscreen chord — a sheet
+swallows that chord too, which is why the run stayed windowed for all twenty
+captures.
+
 ## The mistake this probe made first, kept because it will recur
 
 The first run reported all six patches and two backgrounds wrong, identically,

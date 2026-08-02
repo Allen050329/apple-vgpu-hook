@@ -67,6 +67,16 @@ say() { echo "web-content-probe: $*"; }
 ssh -o ConnectTimeout=8 -o BatchMode=yes "$GUEST" true 2>/dev/null || {
   say "no guest at $GUEST" >&2; exit 2; }
 
+# Firefox asks to be made the default browser on first launch, and macOS draws
+# that question as a sheet, which dims the window behind it — every declared
+# colour then measures at half and the run reports the page as corrupt. Turning
+# the question off is setup, not a workaround for a device bug.
+[ "$BROWSER" = firefox ] && ssh -o BatchMode=yes "$GUEST" '
+for p in "$HOME/Library/Application Support/Firefox/Profiles/"*/; do
+  [ -d "$p" ] || continue
+  printf %s\\n "user_pref(\"browser.shell.checkDefaultBrowser\", false);" >"$p/user.js"
+done' >/dev/null 2>&1 || true
+
 scp -q "$SERVER" "$SCRIPT_DIR/content-probe.html" "$GUEST:/tmp/"
 ssh -o BatchMode=yes "$GUEST" "pkill -f probe_server.py >/dev/null 2>&1 || true
 pkill -f '$APP' >/dev/null 2>&1 || true
@@ -76,6 +86,13 @@ nohup python3 /tmp/probe_server.py $PORT /tmp/content-probe.html /tmp/content-pr
 sleep 2
 open -a '$APP' '$URL'
 sleep 6
+# Dismiss whatever sheet the browser opened on us before reaching for the
+# keyboard, because a sheet swallows the fullscreen chord too — the Firefox run
+# that found this was still windowed for all twenty captures.
+osascript -e 'tell application \"System Events\" to key code 53' >/dev/null 2>&1 || true
+sleep 1
+osascript -e 'tell application \"System Events\" to key code 53' >/dev/null 2>&1 || true
+sleep 1
 # Fullscreen so the viewport is the display and the page's screen-space
 # rectangles need no chrome model. Done after load: entering fullscreen fires a
 # resize, and the page re-declares its layout on resize.
@@ -158,6 +175,7 @@ say "beat advancing ($b0 -> $b1), churn=$CHURN"
 
 fails=0
 stalls=0
+dimmed=0
 prev_beat=$b1
 for i in $(seq 1 "$CAPTURES"); do
   refresh_layout || { say "capture $i: no fresh layout" >&2; continue; }
@@ -205,6 +223,7 @@ for name, x, y, w, h, *_ in specs:
     iw2, ih2 = max(1, pw - 2 * max(1, pw // 6)), max(1, ph - 2 * max(1, ph // 6))
     args.append((name, ix, iy, iw2, ih2))
 bad = []
+measured = []
 for (name, x, y, w, h), spec in zip(args, specs):
     r = subprocess.run(["magick", png, "-crop", f"{w}x{h}+{x}+{y}", "+repage",
                         "-format", "%[fx:mean.r*255] %[fx:mean.g*255] %[fx:mean.b*255]",
@@ -214,13 +233,57 @@ for (name, x, y, w, h), spec in zip(args, specs):
     except ValueError:
         bad.append(f"{name}=UNREADABLE")
         continue
+    # Kept alongside the verdict so the uniform-scale fit below can be taken
+    # over every region, including the ones that classified correctly.
     got = min(PALETTE, key=lambda k: sum((a - b) ** 2 for a, b in zip(PALETTE[k], (mr, mg, mb))))
     want = min(PALETTE, key=lambda k: sum((a - b) ** 2 for a, b in zip(PALETTE[k], spec[5:8])))
+    measured.append((name, (mr, mg, mb), spec[5:8]))
     if got != want:
         bad.append(f"{name}: declared {want} measured {got} rgb=({mr:.0f},{mg:.0f},{mb:.0f})")
-print("; ".join(bad))
+
+# Is the whole frame a uniform multiple of what was declared?
+#
+# The README's standing lesson is that a disagreement affecting every region at
+# once is the oracle's fault, not the device's, because a real compositing loss
+# is local. This is that lesson as code, and it earned its place immediately: a
+# Firefox run reported seven regions corrupted in nineteen consecutive captures,
+# and the frame showed a "make Firefox your default browser" sheet, which macOS
+# draws by dimming the window behind it. Every measured colour was its declared
+# colour times 0.5, to the last bit — RED 224->111, YELLOW 240->120, the near
+# black 16->8 alike.
+#
+# The two regions that did *not* report were the coincidence that makes this
+# worth detecting rather than eyeballing: halved BG and halved GREEN are exactly
+# equidistant from their own entry and from BLACK, so the tie-break passed them.
+# A uniform dim can therefore report as a partial, plausible-looking corruption.
+#
+# So: fit one scale k across every region by least squares, and if the fit is
+# tight the frame is globally attenuated. That is a state of the guest's screen,
+# not a loss in this device, and no verdict taken through it means anything.
+num = sum(m[i] * s[i] for _, m, s in measured for i in range(3))
+den = sum(s[i] * s[i] for _, _, s in measured for i in range(3))
+k = num / den if den else 1.0
+resid = max((abs(m[i] - k * s[i]) for _, m, s in measured for i in range(3)), default=0.0)
+# 8 of 255 is under one part in thirty, well inside the 96-unit palette
+# separation, so this cannot swallow a real per-region loss: a region that went
+# black or white is nowhere near k times its declaration for the k the rest of
+# the frame fits.
+if bad and resid <= 8.0 and k < 0.9:
+    print(f"ATTENUATED {k:.3f} {resid:.1f}")
+else:
+    print("; ".join(bad))
 PY
 )
+  case "$bad" in
+    ATTENUATED*)
+      set -- $bad
+      say "capture $i: the whole frame measures ${2} times what the page declared \
+(worst residual ${3}/255) — the guest's screen is dimmed, most likely a modal \
+sheet over the window. Not a device loss; no verdict from this frame." >&2
+      [ -n "$KEEP" ] && say "  frame kept at $png"
+      dimmed=$((dimmed + 1))
+      sleep 1; continue ;;
+  esac
   if [ -n "$bad" ]; then
     fails=$((fails + 1))
     say "capture $i: $bad"
@@ -230,13 +293,14 @@ PY
 done
 
 ssh -o BatchMode=yes "$GUEST" "pkill -f probe_server.py; pkill -f '$APP'" >/dev/null 2>&1 || true
-say "$CAPTURES captures ($stalls not counted, page not repainting), \
+say "$CAPTURES captures ($stalls not counted, page not repainting; \
+$dimmed not counted, screen dimmed), \
 $fails with a region that did not measure its declared colour"
-# More stalled than counted means the run measured mostly a frozen page. Report
-# that as a setup failure: a clean verdict from it would be the same lie the
-# beat gate exists to stop.
-if [ "$stalls" -gt $((CAPTURES / 2)) ]; then
-  say "over half the captures were taken on a frozen page — no verdict" >&2
+# Mostly frozen or mostly dimmed means the run measured something other than
+# what it was pointed at. Report that as a setup failure: a clean verdict from
+# it would be the same lie the beat gate exists to stop.
+if [ $((stalls + dimmed)) -gt $((CAPTURES / 2)) ]; then
+  say "over half the captures were unusable ($stalls frozen, $dimmed dimmed) — no verdict" >&2
   exit 2
 fi
 [ "$fails" -eq 0 ] || exit 1
