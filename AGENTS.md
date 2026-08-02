@@ -889,6 +889,70 @@ inside that the eight full-screen writebacks (2.26 GB/s, `write_split frag=272
 bytes=2256076800` in one second against 34 published frames) are ~20 ms of it.
 Do not spend another session on cadence.
 
+### What the writeback is worth, measured by not doing it
+
+The ~20 ms above is an *attribution* — the parts sum to the whole. Whether
+removing the rail returns its share is a different claim, and it is the one the
+read-witness route is priced on, so
+`REIMS_VGPU_PROBE_NO_RENDER_WRITEBACK=1` exists to ask. It drops every
+mapping-keyed render window at the fence instead of landing it. **A boot with
+it set is incorrect** — the guest is told its render completed while its pages
+hold the previous frame — and frame rate is the only number such a boot can
+support. The screen stays correct, which is why the experiment is possible at
+all: the host window presents from the engine resident (`direct_frac=1.00`), so
+it never reads the pages being withheld.
+
+One representative second from each, same guest image, same stressor, host GPU
+at P8/180 MHz throughout:
+
+| | control | counterfactual #1 | counterfactual #2 |
+|---|---|---|---|
+| `window_publish fresh` — guest frames/s | 34 | **98** | 34 |
+| `host_window_cadence present_hz` | 17.4 | **68.6** | 16.4 |
+| `drain_duty duty` | 0.97 | **0.77** | 0.97 |
+| `tranches` | 43 | **237** | 39 |
+| `mapw_fence_flush` — composites | 296 | 800 | 280 |
+| composites per guest frame | 8.7 | 8.2 | 8.2 |
+| `draws` | 2270 | 6102 | 2150 |
+| draws per guest frame | 67 | 62 | 63 |
+| `flush_us` | 760 ms | **122 ms** | **70 ms** |
+| `draw_us`/draw | 103 µs | 97 µs | **421 µs** |
+
+Read the per-frame rows first: **the guest asks for the same work in all three
+— 8.2 composites and ~63 draws per frame.** So this is the same workload run at
+different speeds, not three different workloads.
+
+**Counterfactual #1 is the reading that matters. Removing the writeback ran the
+identical workload at 2.9x the guest frame rate and 3.9x the displayed one,
+with the drain worker no longer saturated** (`duty` 0.77, so it had capacity
+left over) and the tranche count up 5.5x, which is also what un-bunched the
+publishes and let the window loop see 68 of them instead of 17. Per-draw cost
+was unchanged, so nothing was traded away for it.
+
+**Counterfactual #2, on the same boot minutes later, gave the whole thing
+back**, and how it did is the finding to carry. `flush_us` stayed collapsed —
+70 ms — but `draw_us`/draw went from 97 µs to **421 µs**, and the store routes
+say why: 54 `t11rung_resident_refused` with `gw_rail_t11_kb=437400`, i.e. 54
+type-11 binds refused their resident and gathered **8 MB each** out of guest
+RAM. The control has `gw_rail_t11=114` at 0.9 MB each and **zero** refusals;
+counterfactual #1 has no type-11 gather at all.
+
+That refusal is `guest_replaced` — the guest CPU-wrote the surface's pages —
+and it is an artefact of the experiment being wrong rather than a property of a
+correct demand-driven rail: with our frame never landed, the pages drift into
+holding neither our pixels nor a full guest frame, and the drift compounds over
+a boot. But it is exactly the hazard a demand-driven rail would hit if it got
+the witness wrong, and it converts a 2.26 GB/s writeback into an 8 MB-per-bind
+gather. **So the design requirement, stated before anyone builds it: skipping a
+writeback must keep the guest-write witness and the type-11 resident rung
+sound. A rail that only stops writing has been measured, and it is a wash.**
+
+Two things this does not establish. It is one boot and two runs, and the causal
+story for #2 is the leading explanation rather than a proven one. And 98 fps is
+not 120: even with the largest cost in the device removed outright, this
+workload does not reach goal 6's number, so the writeback is necessary but not
+obviously sufficient.
+
 Two cautions before building on any of it. The stressor moves the window through
 the accessibility API, not a pointer drag: `CGEventPost` is silently discarded
 here because the posting process is not trusted for Accessibility and TCC.db

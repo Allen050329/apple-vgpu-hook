@@ -903,6 +903,41 @@ pub fn flush_linear_windows_before_fence<M: HostMemory + HostOps>(
 /// - Punching a page out loses whatever the guest had put there, so the content
 ///   to fill with has to be captured before the punch, not after.
 ///
+/// ## What the rail is worth, and the second-order cost of not doing it
+///
+/// [`render_writeback_counterfactual`] answers the question this ledger could
+/// not: the ~20 ms of a 30 ms guest frame above is an attribution, and removing
+/// the rail is a different claim. Measured on one settled x86/PCI guest, same
+/// workload, host GPU at P8 throughout, one representative second each — the
+/// guest asks for 8.2 composites and ~63 draws per frame in **all three**, so
+/// these are one workload at three speeds:
+///
+/// ```text
+///                     control     no-writeback #1   no-writeback #2
+/// guest frames/s         34            98                34
+/// present_hz             17.4          68.6              16.4
+/// duty                    0.97          0.77              0.97
+/// flush_us              760 ms        122 ms             70 ms
+/// draw_us per draw      103 us         97 us            421 us
+/// ```
+///
+/// **#1 is the price: 2.9x the guest frame rate and 3.9x the displayed one, at
+/// unchanged per-draw cost, with the worker no longer saturated.** So the rail
+/// is the cap, and the read-witness route is worth its cost.
+///
+/// **#2 gave it all back, and that is the warning.** `flush_us` stayed
+/// collapsed while `draw_us` per draw quadrupled: 54 `t11rung_resident_refused`
+/// with `gw_rail_t11_kb=437400` — binds that refused their resident on
+/// `guest_replaced` and gathered 8 MB each out of guest RAM. The control has
+/// zero such refusals and gathers 0.9 MB a bind.
+///
+/// The counterfactual provokes that by being wrong — pages left holding neither
+/// our frame nor a whole guest one — so it is not what a correct rail would do.
+/// It is what a correct rail would do *if it got the witness wrong*, and the
+/// exchange rate is terrible: a 2.26 GB/s writeback for an 8 MB-per-bind
+/// gather. **Skipping a writeback has to keep the guest-write witness and the
+/// type-11 resident rung sound. Only stopping the write is a wash.**
+///
 /// ## Which pages to register, and where the route stops
 ///
 /// A `userfaultfd` registration only traps accesses made through the VMA it was
