@@ -34,7 +34,22 @@
 <style>
   html, body { margin: 0; padding: 0; overflow: hidden; }
   body { background: #202080; }
-  .patch { position: absolute; }
+  /* Fixed, not absolute: churn mode scrolls, and a declared region that moves
+     with the scroll would be reported as corruption by a probe that measures
+     it where it was declared. Fixed patches are the invariant the churn is
+     allowed to disturb everything around. */
+  .patch { position: fixed; }
+  /* Inset to the patch band, matching the page's own margins. The background
+     samples live in those margins and measure the body fill, so a churn child
+     landing on one would be read as the background having changed colour — a
+     false positive manufactured by the probe. Confined here, the churn instead
+     runs directly *behind* the declared patches, which is the more interesting
+     place for it. */
+  #churn {
+    position: fixed; inset: 18% 10%; overflow: auto; z-index: 0;
+    pointer-events: none; contain: strict;
+  }
+  .patch, #status { z-index: 5; }
   #status {
     position: absolute; left: 0; bottom: 0; font: 12px monospace;
     color: #fff; background: #000; padding: 2px 6px; z-index: 10;
@@ -63,7 +78,12 @@ const COLS = 3, ROWS = 2;
 const regions = [];
 
 function build() {
+  // Re-declaring rebuilds the page, which takes the churn container with it —
+  // so it is put back here rather than only at startup. Without this the churn
+  // stops one second in and every later capture measures a static page while
+  // the run reports itself as churning.
   document.body.innerHTML = '<div id="status"></div>';
+  buildChurn();
   const W = window.innerWidth, H = window.innerHeight;
   // Patches occupy the middle band, leaving generous margins of background on
   // every side. Those margins are what the background regions measure, and they
@@ -139,6 +159,28 @@ const params = new URLSearchParams(location.search);
 // changes, so every capture is checkable against the same declaration.
 const beatMs = Number(params.get('beat') || 250);
 
+// Churn: make the compositor build and tear down layers between captures.
+//
+// A static page measured 60 captures and 600 region checks clean, which says
+// the common case is sound and says nothing about the bug — "the background
+// disappears" is reported during real browsing, which is scrolling, layer
+// promotion and demotion, and elements arriving and leaving. So churn mode
+// reproduces that class of work *around* the declared regions while the
+// declared regions themselves are `position: fixed` and must not change. Any
+// mismatch is then a loss the churn caused, not content that moved.
+//
+// Declared above `declare()` because `build()` recreates the churn container
+// and `declare()` runs immediately: with `const churn` below, that first call
+// hits the temporal dead zone and the page dies before it declares anything.
+const churn = params.get('churn') !== '0';
+let churnBox = null;
+function buildChurn() {
+  if (!churn) return;
+  churnBox = document.createElement('div');
+  churnBox.id = 'churn';
+  document.body.insertBefore(churnBox, document.body.firstChild);
+}
+
 // Republished on a timer rather than only at load and on resize. The host reads
 // the newest record before each capture, so a window that has been moved,
 // resized or fullscreened is described by the record the host is about to use
@@ -164,6 +206,26 @@ setInterval(() => {
   for (const d of document.querySelectorAll('.patch')) {
     d.style.outline = (n % 2) ? '1px solid rgba(0,0,0,0)' : 'none';
   }
+  if (!churnBox) return;
+  // Replace the whole churn subtree each beat: every child is a new layer
+  // candidate and every removal destroys one. `will-change: transform` on half
+  // of them forces actual promotion rather than leaving it to a heuristic.
+  churnBox.textContent = '';
+  const W = window.innerWidth, H = window.innerHeight;
+  for (let i = 0; i < 24; i++) {
+    const d = document.createElement('div');
+    d.style.position = 'absolute';
+    d.style.left = ((i * 137 + n * 31) % W) + 'px';
+    d.style.top = ((i * 89 + n * 17) % (H * 2)) + 'px';
+    d.style.width = '160px';
+    d.style.height = '120px';
+    d.style.background = `hsl(${(i * 37 + n * 11) % 360} 60% 45%)`;
+    if (i % 2) d.style.willChange = 'transform';
+    d.style.transform = `translateZ(0) rotate(${(n + i) % 7}deg)`;
+    churnBox.appendChild(d);
+  }
+  // Scroll the churn container, which the fixed patches must be immune to.
+  churnBox.scrollTop = (n * 53) % Math.max(1, H);
 }, beatMs);
 </script>
 </body>
