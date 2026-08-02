@@ -165,6 +165,36 @@ declares no `IOGLBundleName`, so the guest's only CGL renderer is the software o
 acceleration route is OpenGL — Firefox's compositor among them — has no hardware path there without
 shipping a guest driver, which this project does not do.
 
+**This one is now confirmed live, from Firefox's own words, and it settles three goals at once.**
+Firefox 153 on the guest (macOS 13.7.8, x86/PCI pathway), launched with `MOZ_LOG='WebGL:5,gfx:5'`,
+prints exactly three graphics failures and nothing else:
+
+```text
+[GFX1-]: Failed GL context creation for WebRender: 0x0
+[GFX1-]: Failed to connect WebRenderBridgeChild. isParent=true
+[GFX1-]: Fallback WR to SW-WR
+```
+
+Firefox's compositor on macOS is WebRender over a **CGL** context; there is no Metal WebRender
+backend on that platform. No context means SW-WR, and SW-WR means the same probe that reports
+Safari at `WebGL 1.0` + `WebGL 2.0` on `Apple GPU` reports Firefox at `webgl1: NOT_AVAILABLE`,
+`webgl2: NOT_AVAILABLE`. So on x86:
+
+- **Firefox GPU acceleration** is the `supportsOpenGL = 0` literal, not a device defect.
+- **Firefox WebGL** is the same literal — WebGL needs the GL context that failed to create.
+- **Jumpy video in Firefox** is downstream of it: the whole compositor is on the CPU.
+
+Do not spend a session on Firefox flags, `gfx.webrender.*` prefs, or `MOZ_*` overrides. None of
+them can supply a renderer the guest does not have. Firefox's rAF still reads ~123 fps because
+SW-WR paces fine on an idle page; frame rate is not the symptom to measure here, and a good rAF
+number from Firefox says nothing about whether the GPU is involved.
+
+**Safari WebGPU is not reachable on this guest either, and it is not our doing.** Safari 16.6 on
+macOS 13.7.8 exposes no `navigator.gpu`, and it stays absent after setting every spelling of the
+experimental flag (`WebGPUEnabled`, `ExperimentalWebGPUEnabled`, `WebKitWebGPUEnabled`,
+`WebKitExperimentalWebGPUEnabled`). WebGPU is not compiled into that release. Any WebGPU goal on
+this guest image is blocked on the guest's browser versions, not on the device.
+
 Narrow this claim to x86 deliberately: in the arm64 IOGPUFamily bundle the same selector is **not**
 a literal — it forwards to the serializer's own `supportsOpenGL`. Whether that ever answers yes is
 unknown and untested. Same shape as the `featureProfile` split above, and the same warning: this
