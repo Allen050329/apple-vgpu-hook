@@ -389,6 +389,320 @@ pub fn changed_runs(bits: &[u32], bytes: u64) -> Vec<(u64, u64)> {
     runs
 }
 
+/// Is the tile-difference census probe on for this boot?
+///
+/// Off by default, and it must stay that way: the census copies a second whole
+/// frame into device-local memory and runs the pass on its own submission, per
+/// readback. That is the price of a *complete* count rather than a sample, and
+/// it is not a price the product should pay to measure itself.
+pub(crate) fn census_requested() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(u8::MAX);
+    match STATE.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let on = matches!(
+                std::env::var_os("REIMS_VGPU_PROBE_TILE_DIFF_CENSUS").as_deref(),
+                Some(v) if !v.is_empty() && v != "0"
+            );
+            STATE.store(u8::from(on), Ordering::Relaxed);
+            if on {
+                crate::observe::fail(
+                    "PROBE tile_diff_census=on reason=REIMS_VGPU_PROBE_TILE_DIFF_CENSUS — \
+                     every resident target readback runs a second submission that copies \
+                     the frame again and diffs it. Screen output is unaffected and timing \
+                     numbers from this boot are not comparable to a boot without it.",
+                );
+            }
+            on
+        }
+    }
+}
+
+/// The `cur`/`prev` pair the census keeps for one render target.
+struct CensusEntry {
+    cur: ScratchBuffer,
+    prev: ScratchBuffer,
+    bytes: u64,
+    /// False until a second frame of this target has been seen, so the first is
+    /// not counted as "every tile changed" against a `prev` holding nothing.
+    seeded: bool,
+}
+
+/// Per-target scratch for the tile-difference census.
+///
+/// Bounded by target count rather than by bytes, because each entry is two
+/// whole frames of device-local memory and an unbounded map on a guest that
+/// cycles render targets would exhaust VRAM rather than degrade.
+#[derive(Default)]
+pub(crate) struct DiffCensus {
+    entries: std::collections::HashMap<super::types::TargetIdentity, CensusEntry>,
+    /// The shader's `out`, shared by every target and never read.
+    ///
+    /// One buffer rather than one per target: the census wants the bitmap, and
+    /// `out` exists only because the shader writes it. Device-local, so the
+    /// probe does not pay the bus crossing that the eventual rail exists to
+    /// decline — which would be measuring the thing it is trying to avoid.
+    sink: Option<ScratchBuffer>,
+    sink_bytes: u64,
+}
+
+/// Targets the census holds scratch for at once.
+///
+/// A driven drag composites ~8 surfaces per guest frame, so this covers the
+/// observed working set and bounds the probe at 16 frames of device-local
+/// memory. Overflow drops the whole map rather than evicting: this is a probe,
+/// and an LRU here would be a mechanism nothing in the product needs.
+const MAX_CENSUS_TARGETS: usize = 8;
+
+impl DiffCensus {
+    /// Release every buffer. The caller owes the in-flight rule.
+    pub(crate) unsafe fn destroy_all(&mut self, device: &ash::Device) {
+        for (_, entry) in self.entries.drain() {
+            entry.cur.destroy(device);
+            entry.prev.destroy(device);
+        }
+        if let Some(sink) = self.sink.take() {
+            sink.destroy(device);
+        }
+        self.sink_bytes = 0;
+    }
+}
+
+/// Count how many of this frame's tiles differ from the frame before it.
+///
+/// Runs on its own submission after the readback rather than inside it, so a
+/// boot with the probe off is byte-identical on the hot path — and a boot with
+/// it on cannot be read for timing, which the announcement says.
+///
+/// What it answers is the question [`crate::runtime::land_redundancy`] can only
+/// sample: over *every* landing rather than one in 64, and per target rather
+/// than pooled, how much of a composited frame is already what the frame before
+/// it was. That per-surface split is the measurement the tile rail's saving was
+/// only ever bounded to a factor without.
+///
+/// Declines quietly and often — an odd frame size, a device that refuses the
+/// scratch, a target whose geometry just changed. A census is never worth
+/// failing a readback for, so every path returns `()` and names its decline.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a probe that re-describes the readback it follows"
+)]
+pub(crate) unsafe fn census_target(
+    ctx: &DeviceContext,
+    caches: &mut ObjectCaches,
+    pools: &mut ResourcePools,
+    counters: &EngineCounters,
+    census: &mut DiffCensus,
+    identity: &super::types::TargetIdentity,
+    image: vk::Image,
+    width: u32,
+    height: u32,
+    rb_size: u64,
+) {
+    use crate::runtime::drain::note_store_route_n;
+
+    let Some(plan) = TileDiffPlan::for_bytes(rb_size, ctx.max_compute_work_group_count_x) else {
+        note_store_route_n("tdc_declined_geometry", 1);
+        return;
+    };
+
+    // A geometry change under one identity means the pair describes a different
+    // frame shape, so there is nothing to compare against.
+    if census.entries.get(identity).is_some_and(|e| e.bytes != rb_size) {
+        if let Some(e) = census.entries.remove(identity) {
+            e.cur.destroy(&ctx.device);
+            e.prev.destroy(&ctx.device);
+        }
+    }
+    if census.sink_bytes < rb_size {
+        if let Some(old) = census.sink.take() {
+            old.destroy(&ctx.device);
+        }
+        let Ok(sink) = ScratchBuffer::create(ctx, rb_size, ScratchBuffer::USAGE, counters) else {
+            note_store_route_n("tdc_declined_scratch", 1);
+            census.sink_bytes = 0;
+            return;
+        };
+        census.sink = Some(sink);
+        census.sink_bytes = rb_size;
+    }
+    if !census.entries.contains_key(identity) {
+        if census.entries.len() >= MAX_CENSUS_TARGETS {
+            note_store_route_n("tdc_overflow", 1);
+            for (_, e) in census.entries.drain() {
+                e.cur.destroy(&ctx.device);
+                e.prev.destroy(&ctx.device);
+            }
+        }
+        let Ok(cur) = ScratchBuffer::create(ctx, rb_size, ScratchBuffer::USAGE, counters) else {
+            note_store_route_n("tdc_declined_scratch", 1);
+            return;
+        };
+        let Ok(prev) = ScratchBuffer::create(ctx, rb_size, ScratchBuffer::USAGE, counters) else {
+            cur.destroy(&ctx.device);
+            note_store_route_n("tdc_declined_scratch", 1);
+            return;
+        };
+        census.entries.insert(
+            identity.clone(),
+            CensusEntry {
+                cur,
+                prev,
+                bytes: rb_size,
+                seeded: false,
+            },
+        );
+    }
+
+    let (Some(entry), Some(sink)) = (census.entries.get(identity), census.sink.as_ref()) else {
+        return;
+    };
+    let bits = match census_submit(
+        ctx,
+        caches,
+        pools,
+        counters,
+        image,
+        width,
+        height,
+        [entry.cur.buffer, entry.prev.buffer, sink.buffer],
+        plan,
+    ) {
+        Ok(bits) => bits,
+        Err(_) => {
+            note_store_route_n("tdc_declined_submit", 1);
+            return;
+        }
+    };
+
+    let tiles = plan.words.div_ceil(TILE_DIFF_WORDS_PER_TILE);
+    let changed: u32 = bits.iter().map(|w| w.count_ones()).sum();
+    if let Some(e) = census.entries.get_mut(identity) {
+        if std::mem::replace(&mut e.seeded, true) {
+            note_store_route_n("tdc_frames", 1);
+            note_store_route_n("tdc_tiles", u64::from(tiles));
+            note_store_route_n("tdc_tiles_changed", u64::from(changed.min(tiles)));
+        } else {
+            // The first frame of a target diffs against a buffer nothing wrote,
+            // so its answer is noise. Counted so a run that is all seeds — a
+            // guest cycling identities faster than it reuses them — reads as
+            // one rather than as a suspiciously high change rate.
+            note_store_route_n("tdc_seed", 1);
+        }
+        // This frame becomes the next one's predecessor.
+        std::mem::swap(&mut e.cur, &mut e.prev);
+    }
+}
+
+/// Copy the target into `cur`, run the pass, and read the bitmap back.
+///
+/// `cur_prev_out` is `[cur, prev, out]`. The fourth binding is not among them:
+/// the bitmap slot is acquired here, because it is the only output that leaves
+/// this function and its size comes from `plan`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one submission assembled from the readback's own arguments"
+)]
+unsafe fn census_submit(
+    ctx: &DeviceContext,
+    caches: &mut ObjectCaches,
+    pools: &mut ResourcePools,
+    counters: &EngineCounters,
+    image: vk::Image,
+    width: u32,
+    height: u32,
+    cur_prev_out: [vk::Buffer; 3],
+    plan: TileDiffPlan,
+) -> Result<Vec<u32>, DrawError> {
+    let [cur, prev, out] = cur_prev_out;
+    let (cb, fence) = pools.begin_entry(ctx, counters)?;
+    let bits = pools.acquire_readback_extra(ctx, plan.bits_bytes(), counters)?;
+    ctx.device
+        .reset_command_buffer(cb, vk::CommandBufferResetFlags::empty())
+        .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ReadbackResetCb, e)))?;
+    ctx.device
+        .begin_command_buffer(
+            cb,
+            &vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+        )
+        .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ReadbackBeginCb, e)))?;
+    // The readback this follows left the image in TRANSFER_SRC_OPTIMAL, so the
+    // transition half is a no-op and the dependency half is the point — exactly
+    // as it is for the readback's own barrier.
+    let barrier = [vk::ImageMemoryBarrier::default()
+        .src_access_mask(vk::AccessFlags::TRANSFER_READ)
+        .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+        .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+        .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+        .image(image)
+        .subresource_range(super::color_subresource_range())];
+    ctx.device.cmd_pipeline_barrier(
+        cb,
+        vk::PipelineStageFlags::ALL_COMMANDS,
+        vk::PipelineStageFlags::TRANSFER,
+        vk::DependencyFlags::empty(),
+        &[],
+        &[],
+        &barrier,
+    );
+    let region = [vk::BufferImageCopy::default()
+        .image_subresource(super::color_subresource_layers())
+        .image_extent(vk::Extent3D {
+            width,
+            height,
+            depth: 1,
+        })];
+    ctx.device.cmd_copy_image_to_buffer(
+        cb,
+        image,
+        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+        cur,
+        &region,
+    );
+    let (dset, dset_pool) = record_tile_diff(
+        ctx,
+        caches,
+        pools,
+        counters,
+        cb,
+        &TileDiffBuffers {
+            cur,
+            prev,
+            out,
+            bits: bits.buffer,
+        },
+        plan,
+    )?;
+    ctx.device
+        .end_command_buffer(cb)
+        .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ReadbackEndCb, e)))?;
+    let cbs = [cb];
+    ctx.device
+        .queue_submit(
+            ctx.queue(),
+            &[vk::SubmitInfo::default().command_buffers(&cbs)],
+            fence,
+        )
+        .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ReadbackSubmit, e)))?;
+    pools.wait_entry_fence(ctx, counters, fence)?;
+    let bytes = super::pools::read_back_slot(
+        ctx,
+        &bits,
+        plan.bits_bytes(),
+        VkOp::ReadbackMap,
+        VkOp::ReadbackInvalidate,
+    )?;
+    let cleanup = pools.seal_entry(vec![(dset, dset_pool)], Vec::new());
+    pools.finish_entry_async(cleanup);
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect())
+}
+
 /// What [`probe_tile_diff`] read back off the device.
 pub struct TileDiffProbe {
     /// The whole `out` slot, `cur.len()` bytes, seeded with
