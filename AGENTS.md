@@ -221,8 +221,20 @@ The Vulkan backend must support all four memory/DMA cells:
 Vulkan 1.2 is the baseline. Anything above Vulkan 1.2 must have a fallback or a capability-gated
 path. Gate on capabilities, not vendor names, driver names, or API-version assumptions.
 
-Host-pointer imports must stay windowed. Do not import the whole guest RAM VMA for GPU DMA; it pins
-host RAM. Use the existing capped window resolver.
+**Host-pointer imports are not windowed any more — they are forbidden.** `VK_EXT_external_memory_host`
+must never be asked for. Importing a host pointer over guest RAM gives the host GPU write access to
+the guest VM's memory, and that is a property of the mechanism rather than of how much of it is
+used, so the bound is "never requested" and not any budget. The resolver, its window budget, the
+scatter pool and both present entry points are all deleted, and
+`observe::gate::the_host_pointer_import_extension_is_never_requested` fails the build for source
+naming any of the six API surfaces back into existence.
+
+This paragraph used to read "keep imports windowed; use the existing capped window resolver", which
+sent a reader after a mechanism that no longer exists to solve a problem the gate forbids solving
+that way. It is worth knowing why the temptation recurs: the render deferred-flush rail moves a
+gigabyte a second through two CPU passes that a GPU-direct write into guest pages would erase, and
+that is the single largest cost in the device. It is still not the route. Reducing the bytes, or
+making the guest's own reads observable so the writeback becomes demand-driven, are.
 
 ## Verification
 

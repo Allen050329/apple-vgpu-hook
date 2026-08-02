@@ -3473,11 +3473,13 @@ enum M2vDrawSpan {
 /// and a return, which is what makes it safe to leave on permanently.
 ///
 /// Reachability is not uniform and must be read that way. `import` requires the
-/// engine to have enabled a host-pointer import, which
-/// [`crate::backend::vulkan::engine::external_memory_host_available`] now always
-/// refuses, and `rgba_not_import` is its complement's complement — with
-/// `import_allowed` always false, `type11_cpu_store_fallback_allowed` is always
-/// true and that arm cannot be entered. Both are kept as call sites so their
+/// engine to have enabled a host-pointer import, and there is no longer any code
+/// that could: the whole `VK_EXT_external_memory_host` subsystem is deleted and
+/// `observe::gate::the_host_pointer_import_extension_is_never_requested` fails
+/// the build of any source that names it back into existence. So `import` is
+/// unreachable, and `rgba_not_import` is its complement's complement — with the
+/// import never allowed, `type11_cpu_store_fallback_allowed` is always true and
+/// that arm cannot be entered either. Both are kept as call sites so their
 /// absence is a *denominator* against the routes that do fire, not an
 /// acquittal; if either ever appears, the extension came back.
 /// The first-appearance line answers "is this route reachable" and cannot answer
