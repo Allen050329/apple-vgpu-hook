@@ -4299,6 +4299,9 @@ pub fn note_drain_tranche(drain_us: u64, publish_us: u64) {
         if let Some(publish) = WINDOW_PUBLISH.take(DRAIN_DUTY.last_window_ms()) {
             crate::observe::off(publish);
         }
+        // Under `window_publish`, which says how many frames were offered but
+        // not why fewer reached the screen.
+        emit_engine_lock(DRAIN_DUTY.last_window_ms());
         if let Some(routes) = take_store_routes() {
             crate::observe::off(routes);
         }
@@ -4560,6 +4563,24 @@ fn emit_draw_phase() {}
 
 #[cfg(not(feature = "backend-vulkan"))]
 fn emit_engine_delta() {}
+
+/// The engine mutex's wait and hold time over the same window, split by which
+/// thread class asked for it.
+///
+/// Emitted beside `window_publish` because it divides the gap that line opens:
+/// `window_publish fresh` is what the device offered the window and
+/// `host_window_cadence presents` is what reached the screen, and when the two
+/// disagree the first candidate is that the window thread could not have the
+/// engine while the worker held it.
+#[cfg(feature = "backend-vulkan")]
+fn emit_engine_lock(win_ms: u64) {
+    if let Some(line) = crate::backend::vulkan::engine::take_engine_lock_census(win_ms) {
+        crate::observe::off(line);
+    }
+}
+
+#[cfg(not(feature = "backend-vulkan"))]
+fn emit_engine_lock(_win_ms: u64) {}
 
 /// Count a drain wake-up that returned before taking the device lock.
 pub fn note_drain_skipped() {
