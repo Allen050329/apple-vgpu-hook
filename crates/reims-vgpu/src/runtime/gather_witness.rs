@@ -276,13 +276,20 @@ pub enum GatherVerdict {
     /// Generation still, bytes moved. The witness is unsound for this window:
     /// something wrote these pages without the bitmap seeing it.
     ///
-    /// `host_wrote` says whether this device wrote pixel bytes into guest RAM
-    /// anywhere since the previous bind — the one writer the bitmap is defined
-    /// not to see. True points at a host rail that a cache would have to
-    /// invalidate on; false leaves only a guest store landing inside a single
-    /// harvest interval, which is the granularity of the mechanism rather than a
-    /// missing writer.
-    CleanDiff { host_wrote: bool },
+    /// The two flags are what each candidate invalidation rule would have
+    /// concluded, and each one reading quiet here is that rule being unsound.
+    /// `host_wrote` false means this device wrote nowhere at all and the bytes
+    /// moved anyway, which leaves only a guest store the bitmap did not see.
+    /// `scoped_wrote` false means it wrote nothing that could have reached this
+    /// window — the narrower claim, and the one a per-mapping rule rests on.
+    ///
+    /// The global count moves for every write including the scoped ones, so
+    /// `!host_wrote` implies `!scoped_wrote`: the scoped rule's unsound set
+    /// contains the global rule's.
+    CleanDiff {
+        host_wrote: bool,
+        scoped_wrote: bool,
+    },
     /// Generation moved, bytes still — a skip the witness gives up, not an error.
     MovedSame,
     /// Generation moved, bytes moved — a re-gather that had to happen.
@@ -353,10 +360,15 @@ pub fn note_gather<M: crate::runtime::host::HostOps>(
                 note_store_route_n("gw_hit_scoped_kb", span / 1024);
             }
         }
-        GatherVerdict::CleanDiff { host_wrote: true } => {
-            note_store_route("gw_clean_diff_host_wrote")
-        }
-        GatherVerdict::CleanDiff { host_wrote: false } => note_store_route("gw_clean_diff"),
+        // Three names rather than one, because they condemn different rules.
+        GatherVerdict::CleanDiff {
+            host_wrote: false, ..
+        } => note_store_route("gw_clean_diff"),
+        GatherVerdict::CleanDiff {
+            scoped_wrote: false,
+            ..
+        } => note_store_route("gw_clean_diff_scoped_quiet"),
+        GatherVerdict::CleanDiff { .. } => note_store_route("gw_clean_diff_host_wrote"),
         GatherVerdict::MovedSame => note_store_route("gw_moved_same"),
         GatherVerdict::MovedDiff => note_store_route("gw_moved_diff"),
     }
@@ -444,6 +456,7 @@ fn observe<M: crate::runtime::host::HostOps>(
             },
             (true, false) => GatherVerdict::CleanDiff {
                 host_wrote: host_seq != entry.host_seq,
+                scoped_wrote: scoped_seq != entry.scoped_seq,
             },
             (false, true) => GatherVerdict::MovedSame,
             (false, false) => GatherVerdict::MovedDiff,
@@ -488,13 +501,24 @@ mod tests {
         runs: &'a [GuestRun],
         host_seq: u64,
     ) -> GatherWindow<'a> {
+        at_seqs(gpas, runs, host_seq, host_seq)
+    }
+
+    /// The same, with the two host-write counts set independently — which is how
+    /// a write to some *other* mapping looks.
+    fn at_seqs<'a>(
+        gpas: &'a [u64],
+        runs: &'a [GuestRun],
+        host_seq: u64,
+        scoped_seq: u64,
+    ) -> GatherWindow<'a> {
         GatherWindow {
             gpas,
             runs,
             span: PAGE as u64,
             page_size: PAGE,
             host_seq,
-            scoped_seq: host_seq,
+            scoped_seq,
         }
     }
 
@@ -594,9 +618,41 @@ mod tests {
         buf[7] ^= 0xff;
         assert_eq!(
             observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs)),
-            GatherVerdict::CleanDiff { host_wrote: false },
+            GatherVerdict::CleanDiff {
+                host_wrote: false,
+                scoped_wrote: false
+            },
             "no host write moved the sequence, so this is a guest store the \
              bitmap did not see"
+        );
+    }
+
+    /// The cell that would condemn a per-mapping invalidation rule: this device
+    /// wrote *somewhere*, but nothing that could have reached this window, and
+    /// the bytes moved anyway.
+    ///
+    /// A scoped rule reads that as quiet and serves the stale copy. It is a
+    /// distinct finding from the global cell — a global rule would have
+    /// invalidated here and been right — so the two are counted apart rather
+    /// than folded into one "unsound" number that cannot say which rule to build.
+    #[test]
+    fn bytes_moving_while_only_another_mapping_was_written_condemns_the_scoped_rule() {
+        let mut host = crate::runtime::host::FakeHost::new();
+        let mut w = GatherWitness::default();
+        let mut buf = vec![0xa5u8; PAGE];
+        let runs = [run_over(&buf)];
+        assert_eq!(
+            observe(&mut w, &mut host, KEY, at_seqs(&GPAS, &runs, 1, 1)),
+            GatherVerdict::Rearmed
+        );
+        // The global count moves; this mapping's does not.
+        buf[9] ^= 0xff;
+        assert_eq!(
+            observe(&mut w, &mut host, KEY, at_seqs(&GPAS, &runs, 2, 1)),
+            GatherVerdict::CleanDiff {
+                host_wrote: true,
+                scoped_wrote: false
+            }
         );
     }
 
