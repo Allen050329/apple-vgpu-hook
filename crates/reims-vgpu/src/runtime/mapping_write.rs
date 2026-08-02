@@ -13,6 +13,147 @@ use crate::model::{DeviceState, MappingEntry, MAX_SCANOUT_DIM};
 use crate::runtime::host::{HostMemory, HostOps};
 use crate::runtime::mapper;
 
+/// Why one render writeback did not land its frame in the guest's pages.
+///
+/// [`write_bgra8_inner`] has sixteen refusal sites and used to answer all of them
+/// with a bare `false`, which its caller rendered as a single
+/// `deferred_flush_lost reason=write_refused`. That is the defect the decline
+/// vocabulary exists to prevent: the composite surface is the largest frame this
+/// device moves, and a reader watching that slug fire could tell that the
+/// wallpaper had been dropped but not whether the mapping had gone, its geometry
+/// had moved under the armed window, the page walk had refused, or the source
+/// buffer was short. Those have four different fixes.
+///
+/// One variant per check, carrying the values that decide it. The class currently
+/// reads **zero across every accumulated boot log**, so this is an instrument for
+/// a failure that is not happening rather than a repair for one that is — which is
+/// exactly when it is cheap to install and exactly when nobody remembers to.
+#[derive(Debug)]
+pub enum SurfaceWriteRefusal {
+    /// A zero or over-large rect. `MAX_SCANOUT_DIM` is the bound.
+    Geometry { width: u32, height: u32 },
+    /// The source's row pitch cannot hold `width` BGRA8 texels.
+    SourceStride { src_stride: u32, width: u32 },
+    /// No such mapping. The surface went away between the arm and the landing.
+    MappingAbsent,
+    /// The mapping is unmapped or has no page list, so there is nowhere to write.
+    MappingNotResident,
+    /// **The mapping's latched geometry is not the geometry of the frame being
+    /// landed.** A deferred window carries the rect it was armed with, and a
+    /// wallpaper or appearance change re-publishes the surface at another one.
+    /// Landing the old frame at the new pitch would skew it, so it is refused.
+    GeometryMoved {
+        latched_width: u32,
+        latched_height: u32,
+        frame_width: u32,
+        frame_height: u32,
+    },
+    /// The sample window could not be resolved from the surface descriptor.
+    WindowUnresolved { width: u32, height: u32, format: u16 },
+    /// The page walk refused to vouch for the mapping's page list.
+    PagesNotOurs,
+    /// The format has no packed row length, so there is no rect to write.
+    FormatRowLength { format: u16 },
+    /// The source buffer ends before the row this write is up to.
+    SourceShort { need: usize, have: usize, row: u32 },
+    /// A row would not convert into the mapping's pixel format.
+    RowConvert { format: u16, row: u32 },
+    /// The staged frame's extent overflowed, so the rows do not describe a buffer.
+    FrameExtent { bpr: usize, height: u32 },
+    /// The staged frame ends before the row being placed in it.
+    StagedShort { need: usize, have: usize, row: u32 },
+    /// The mapper refused to write a run of the frame into the guest's pages.
+    MapperWrite { lo: u64, len: usize },
+}
+
+impl crate::observe::decline::Decline for SurfaceWriteRefusal {
+    fn slug(&self) -> &'static str {
+        match self {
+            Self::Geometry { .. } => "surface_write_geometry",
+            Self::SourceStride { .. } => "surface_write_source_stride",
+            Self::MappingAbsent => "surface_write_mapping_absent",
+            Self::MappingNotResident => "surface_write_mapping_not_resident",
+            Self::GeometryMoved { .. } => "surface_write_geometry_moved",
+            Self::WindowUnresolved { .. } => "surface_write_window_unresolved",
+            Self::PagesNotOurs => "surface_write_pages_not_ours",
+            Self::FormatRowLength { .. } => "surface_write_format_row_length",
+            Self::SourceShort { .. } => "surface_write_source_short",
+            Self::RowConvert { .. } => "surface_write_row_convert",
+            Self::FrameExtent { .. } => "surface_write_frame_extent",
+            Self::StagedShort { .. } => "surface_write_staged_short",
+            Self::MapperWrite { .. } => "surface_write_mapper_write",
+        }
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        match self {
+            Self::Geometry { width, height } => vec![
+                ("geom", format!("{width}x{height}")),
+                ("max", MAX_SCANOUT_DIM.to_string()),
+            ],
+            Self::SourceStride { src_stride, width } => vec![
+                ("src_stride", src_stride.to_string()),
+                ("need", (width.saturating_mul(RGBA8_BPP)).to_string()),
+            ],
+            Self::MappingAbsent | Self::MappingNotResident | Self::PagesNotOurs => Vec::new(),
+            Self::GeometryMoved {
+                latched_width,
+                latched_height,
+                frame_width,
+                frame_height,
+            } => vec![
+                ("latched", format!("{latched_width}x{latched_height}")),
+                ("frame", format!("{frame_width}x{frame_height}")),
+            ],
+            Self::WindowUnresolved {
+                width,
+                height,
+                format,
+            } => vec![
+                ("geom", format!("{width}x{height}")),
+                ("fmt", format!("{format:#x}")),
+            ],
+            Self::FormatRowLength { format } => vec![("fmt", format!("{format:#x}"))],
+            Self::SourceShort { need, have, row } => vec![
+                ("need", need.to_string()),
+                ("have", have.to_string()),
+                ("row", row.to_string()),
+            ],
+            Self::RowConvert { format, row } => vec![
+                ("fmt", format!("{format:#x}")),
+                ("row", row.to_string()),
+            ],
+            Self::FrameExtent { bpr, height } => vec![
+                ("bpr", bpr.to_string()),
+                ("height", height.to_string()),
+            ],
+            Self::StagedShort { need, have, row } => vec![
+                ("need", need.to_string()),
+                ("have", have.to_string()),
+                ("row", row.to_string()),
+            ],
+            Self::MapperWrite { lo, len } => {
+                vec![("lo", format!("{lo:#x}")), ("len", len.to_string())]
+            }
+        }
+    }
+}
+
+/// Report one writeback refusal and answer `false` for the caller to return.
+///
+/// Latched per `(check, mapping)`: a surface whose geometry has moved refuses
+/// every frame until something re-arms it, and the second line says nothing the
+/// first did not. The route beside it carries the magnitude, which is what
+/// [`crate::observe::emit::Emit::fail_once`]'s contract asks for.
+fn refuse(mapping_id: u32, why: SurfaceWriteRefusal) -> bool {
+    use crate::observe::decline::Decline;
+    crate::runtime::drain::note_store_route(why.slug());
+    crate::observe::emit::Emit::decline("surface_write", &why)
+        .field("mid", mapping_id)
+        .fail_once(u64::from(mapping_id));
+    false
+}
+
 /// Resolve sample window for a type-11 texture binding on a mapping.
 ///
 /// Prefers the guest `sIOSurfaceDeviceDescriptor` when cached: single-plane
@@ -552,27 +693,40 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
     height: u32,
     skip: SkipRanges<'_>,
 ) -> bool {
-    if width == 0
-        || height == 0
-        || width > MAX_SCANOUT_DIM
-        || height > MAX_SCANOUT_DIM
-        || src_stride < width.saturating_mul(RGBA8_BPP)
-    {
-        return false;
+    if width == 0 || height == 0 || width > MAX_SCANOUT_DIM || height > MAX_SCANOUT_DIM {
+        return refuse(mapping_id, SurfaceWriteRefusal::Geometry { width, height });
+    }
+    if src_stride < width.saturating_mul(RGBA8_BPP) {
+        return refuse(mapping_id, SurfaceWriteRefusal::SourceStride { src_stride, width });
     }
     let Some(m) = state.mappings.get(&mapping_id) else {
-        return false;
+        return refuse(mapping_id, SurfaceWriteRefusal::MappingAbsent);
     };
     if !m.mapped || m.page_entries.is_empty() {
-        return false;
+        return refuse(mapping_id, SurfaceWriteRefusal::MappingNotResident);
     }
     let (mw, mh, format) = mapping_write_geometry(m, width, height);
     if mw != width || mh != height {
-        return false;
+        return refuse(
+            mapping_id,
+            SurfaceWriteRefusal::GeometryMoved {
+                latched_width: mw,
+                latched_height: mh,
+                frame_width: width,
+                frame_height: height,
+            },
+        );
     }
     let Some((base_off, bpr_u32, span_end)) = type11_sample_window(m, mapping_id, mw, mh, format)
     else {
-        return false;
+        return refuse(
+            mapping_id,
+            SurfaceWriteRefusal::WindowUnresolved {
+                width: mw,
+                height: mh,
+                format,
+            },
+        );
     };
     // Deferred-writeback flush-on-access: land pending resident content in
     // these pages before touching them.
@@ -580,11 +734,11 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
     // Taken after the flush, because the flush can invalidate this mapping, and
     // once for the whole frame, because the loop below writes a row at a time.
     let Some(vouched) = vouch_for_write(state, host, mapping_id, "bgra8") else {
-        return false;
+        return refuse(mapping_id, SurfaceWriteRefusal::PagesNotOurs);
     };
     let bpr = bpr_u32 as usize;
     let Some(tight) = pixel_format::tight_row_bytes(mw, format) else {
-        return false;
+        return refuse(mapping_id, SurfaceWriteRefusal::FormatRowLength { format });
     };
     let tight = tight as usize;
 
@@ -642,18 +796,27 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
             let src_off = (y as usize) * (src_stride as usize);
             let src_row_len = (mw as usize) * (RGBA8_BPP as usize);
             if src_off + src_row_len > src.len() {
-                return false;
+                return refuse(
+                    mapping_id,
+                    SurfaceWriteRefusal::SourceShort {
+                        need: src_off + src_row_len,
+                        have: src.len(),
+                        row: y,
+                    },
+                );
             }
             let src_row = &src[src_off..src_off + src_row_len];
             let row_bytes: &[u8] = if direct_rows {
                 &src_row[..tight]
             } else {
                 if let Some(ref mut rgba_row) = rgba {
-                    if !convert_row_to_rgba8(MTL_FORMAT_BGRA8_UNORM, src_row, mw, rgba_row) {
-                        return false;
-                    }
-                    if !convert_rgba8_to_row(format, rgba_row, mw, &mut row) {
-                        return false;
+                    if !convert_row_to_rgba8(MTL_FORMAT_BGRA8_UNORM, src_row, mw, rgba_row)
+                        || !convert_rgba8_to_row(format, rgba_row, mw, &mut row)
+                    {
+                        return refuse(
+                            mapping_id,
+                            SurfaceWriteRefusal::RowConvert { format, row: y },
+                        );
                     }
                 } else {
                     let n = src_row_len.min(row.len());
@@ -691,7 +854,10 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
             .and_then(|rows| bpr.checked_mul(rows))
             .and_then(|prefix| prefix.checked_add(tight))
         else {
-            return false;
+            return refuse(
+                mapping_id,
+                SurfaceWriteRefusal::FrameExtent { bpr, height: mh },
+            );
         };
         // The staged buffer is `src` itself whenever the layout it would be
         // built into is the layout `src` already has: no conversion (the rows go
@@ -719,18 +885,27 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
                 let src_off = (y as usize) * (src_stride as usize);
                 let src_row_len = (mw as usize) * (RGBA8_BPP as usize);
                 if src_off + src_row_len > src.len() {
-                    return false;
+                    return refuse(
+                        mapping_id,
+                        SurfaceWriteRefusal::SourceShort {
+                            need: src_off + src_row_len,
+                            have: src.len(),
+                            row: y,
+                        },
+                    );
                 }
                 let src_row = &src[src_off..src_off + src_row_len];
                 let row_bytes: &[u8] = if direct_rows {
                     &src_row[..tight]
                 } else {
                     if let Some(ref mut rgba_row) = rgba {
-                        if !convert_row_to_rgba8(MTL_FORMAT_BGRA8_UNORM, src_row, mw, rgba_row) {
-                            return false;
-                        }
-                        if !convert_rgba8_to_row(format, rgba_row, mw, &mut row) {
-                            return false;
+                        if !convert_row_to_rgba8(MTL_FORMAT_BGRA8_UNORM, src_row, mw, rgba_row)
+                            || !convert_rgba8_to_row(format, rgba_row, mw, &mut row)
+                        {
+                            return refuse(
+                                mapping_id,
+                                SurfaceWriteRefusal::RowConvert { format, row: y },
+                            );
                         }
                     } else {
                         let n = src_row_len.min(row.len());
@@ -740,7 +915,14 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
                 };
                 let dst_off = (y as usize).saturating_mul(bpr);
                 if dst_off + tight > frame.len() {
-                    return false;
+                    return refuse(
+                        mapping_id,
+                        SurfaceWriteRefusal::StagedShort {
+                            need: dst_off + tight,
+                            have: frame.len(),
+                            row: y,
+                        },
+                    );
                 }
                 frame[dst_off..dst_off + tight].copy_from_slice(&row_bytes[..tight]);
             }
@@ -766,7 +948,7 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
                 &frame[within..within + len],
                 &vouched,
             ) {
-                return false;
+                return refuse(mapping_id, SurfaceWriteRefusal::MapperWrite { lo, len });
             }
         }
         note_surface_write_phase(
@@ -1883,6 +2065,74 @@ mod tests {
     /// The read half is the other half of the contract: reads share the same
     /// mapping walk, and a read that moved the record would make every reader
     /// re-fetch on account of a reader.
+    /// A dropped writeback must say which check dropped it.
+    ///
+    /// The composite surface is the largest frame this device moves, and losing
+    /// one is a wrong picture that then persists. Sixteen refusal sites used to
+    /// answer with a bare `false` that the caller rendered as one
+    /// `reason=write_refused`, so a reader could tell that the frame had been
+    /// dropped and nothing else.
+    ///
+    /// `GeometryMoved` is the one this test drives because it is the one a
+    /// deferred window can reach without anything being broken: the frame is
+    /// armed at one rect and the surface is re-published at another — which is
+    /// what an appearance change or a wallpaper switch does. Asserting the
+    /// *specific* route is the whole point; asserting `!ok` would pass with every
+    /// site sharing a slug again.
+    #[test]
+    fn a_writeback_refused_because_the_geometry_moved_says_so_by_name() {
+        use crate::model::PAGE_SHIFT_X86;
+        const PAGE: u64 = 1 << PAGE_SHIFT_X86;
+
+        let mut state = DeviceState::new(DeviceId(3), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+        let base_pfn = 0x40u32;
+        host.map_range((base_pfn as u64) << PAGE_SHIFT_X86, 8 * PAGE as usize, 0x55);
+        state.map_surface(4);
+        state.attach_mapping_internal(4, 0);
+        let m = state.mappings.get_mut(&4).unwrap();
+        m.mapping_internal = 1;
+        m.page_entries = (0..4)
+            .map(|i| ((base_pfn + i) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID)
+            .collect();
+        // Latched at 64x64; the frame below is armed at 32x32, as a window armed
+        // before a re-publish would be.
+        assert!(state.set_mapping_geom(4, 64, 64, MTL_FORMAT_BGRA8_UNORM));
+
+        // Deltas, not absolutes: the route counters are process-global and every
+        // other test in this binary shares them, so a sibling reading nonzero
+        // says nothing about this write.
+        const SIBLINGS: [&str; 3] = [
+            "surface_write_mapping_absent",
+            "surface_write_pages_not_ours",
+            "surface_write_source_short",
+        ];
+        let before = crate::runtime::drain::store_route_count("surface_write_geometry_moved");
+        let before_siblings: Vec<u64> = SIBLINGS
+            .iter()
+            .map(|r| crate::runtime::drain::store_route_count(r))
+            .collect();
+
+        let frame = vec![0xAAu8; 32 * 32 * 4];
+        assert!(
+            !write_bgra8(&mut state, &mut host, 4, &frame, 32 * 4, 32, 32),
+            "a frame whose rect is not the surface's must not land"
+        );
+        assert_eq!(
+            crate::runtime::drain::store_route_count("surface_write_geometry_moved"),
+            before + 1,
+            "the writeback was dropped without naming the check that dropped it"
+        );
+        // And no sibling check moved, or the slug is not discriminating.
+        for (route, was) in SIBLINGS.iter().zip(before_siblings) {
+            assert_eq!(
+                crate::runtime::drain::store_route_count(route),
+                was,
+                "{route} fired for a geometry mismatch"
+            );
+        }
+    }
+
     #[test]
     fn writing_guest_pages_moves_the_host_write_record_and_reading_them_does_not() {
         use crate::model::PAGE_SHIFT_X86;
