@@ -186,10 +186,22 @@
 //! **Both readings are therefore biased samples of a mixed population, and the
 //! per-leg stride fixes only half of it.** It stops one hook perturbing
 //! another's sampling, which is what made the defect visible; it does not make
-//! either number a population estimate, because the mapping leg still mixes
-//! surfaces whose redundancy differs by tens of points. Re-measure before
-//! resting a design on 86 % or on 99 %. A per-surface split is what would
-//! actually answer it.
+//! any of them a population estimate, because the mapping leg still mixes
+//! surfaces whose redundancy differs by tens of points.
+//!
+//! Six driven runs at tile granularity, in the order taken:
+//!
+//! ```text
+//! 86.1   89.9   91.8   90.75   99.60   78.20      (medians, per run)
+//! ```
+//!
+//! The last is the first run with the corrected stride, and it is the *lowest*
+//! of the six — so the fix removed a known bias without converging the answer.
+//! **Quote a range: roughly 70 – 99 %, worst observed second 68 %.** That is
+//! enough to justify the GPU pass, since even the worst second declines ~68 %
+//! of both costs, and not enough to predict its saving to better than a factor.
+//! Splitting the audit per surface is the first move for anyone who needs it
+//! tighter.
 //!
 //! The two legs are reported on separate lines ([`Leg`]) because they are
 //! separate rails with separate arm and flush paths, and one blended fraction

@@ -1038,11 +1038,25 @@ landings sampled. A fixed stride over a stream one source dominates 130:1
 aliases onto a different phase of the other's cycle.
 
 The stride is now per leg, which stops one hook perturbing another's sampling
-but does **not** make either number a population estimate. What the whole set of
-runs supports is "most of these bytes are already there, somewhere between 86 %
-and 99 % at tile granularity" — which is enough to justify building the GPU
-pass and not enough to predict its saving to better than a factor. A per-surface
-split is what would answer it; nobody has built one.
+but does **not** make the number a population estimate. Six driven runs at tile
+granularity, in the order taken:
+
+```text
+86.1   89.9   91.8   90.75   99.60   78.20      (medians, per run)
+```
+
+The last is the first run with the corrected per-leg stride, and it is the
+*lowest* of the six — so the fix did not converge the answer, it just removed
+one known bias. The spread is run-to-run over a heterogeneous population that a
+1-in-64 stride samples at ~4 landings a second out of ~288.
+
+**What this supports is a range, not a figure: roughly 70 – 99 % of the
+writeback's bytes are already at the destination, worst observed second 68 %.**
+That is enough to justify building the GPU pass — even the worst second declines
+~68 % of a 300 ms/s copy and a 209 ms/s scatter — and not enough to predict its
+saving to better than a factor. A per-surface split is what would answer it;
+nobody has built one, and it is the right first move for anyone who needs the
+number tighter.
 
 **Probed twice on that boot, and the second run is higher**: fine 86.2 – 95.6 %
 (median 89.9) over eleven seconds, pages 54.0 – 81.8 % (median 61.1). So the
