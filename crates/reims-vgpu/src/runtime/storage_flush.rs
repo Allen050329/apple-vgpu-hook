@@ -972,6 +972,42 @@ pub fn flush_linear_windows_before_fence<M: HostMemory + HostOps>(
 /// this problem: KVM indexes it by physical address, so a write through any
 /// alias is seen.
 ///
+/// ## `userfaultfd` needs a privilege QEMU does not have
+///
+/// Measured on the development host (Linux 7.1.3), as the user QEMU runs as:
+///
+/// ```text
+/// userfaultfd(0)                    -> EPERM   /proc/sys/vm/unprivileged_userfaultfd = 0
+/// userfaultfd(UFFD_USER_MODE_ONLY)  -> ok
+/// ```
+///
+/// The mode that is available is the one that cannot do the job.
+/// `UFFD_USER_MODE_ONLY` exists to stop an unprivileged process trapping
+/// **kernel-mode** faults, and a vCPU touching a missing guest page is exactly
+/// that: KVM takes the EPT violation and resolves the HVA through
+/// `get_user_pages`, in kernel context. (Creatability is measured; that
+/// user-mode-only misses the vCPU is the flag's documented purpose and has not
+/// been tested here.) A full `userfaultfd` needs `CAP_SYS_PTRACE` on the QEMU
+/// binary or `vm.unprivileged_userfaultfd=1`, both of them root changes on the
+/// host running the VM.
+///
+/// That is not fatal, but it decides the shape: the witness cannot be a rail
+/// this device silently enables. It is opt-in and it fails visibly when the
+/// host will not grant it.
+///
+/// **The privilege-free alternative is KVM's own, and it is worth costing
+/// before assuming uffd.** Deleting the memslot that covers a surface's pages
+/// makes guest accesses to them exit to userspace as MMIO — a supported KVM
+/// path, no capability, and it reports direction, which uffd MISSING mode does
+/// not without reading the fault flags. It is far too slow for a rail (an exit
+/// per access against 2 M accesses in a full-frame read) but that does not
+/// matter for a counter: un-protect on the first fault, which is all the
+/// question "did anything read this landing" needs. What it costs instead is
+/// memslot churn — splitting the RAM slot around an 8 MB surface is three
+/// `KVM_SET_USER_MEMORY_REGION` calls and a VM-wide EPT flush per arm — which
+/// at an [`crate::runtime::gather_witness::AUDIT_STRIDE`]-shaped sample rate is
+/// a handful a second. Neither mechanism has been built.
+///
 /// # Ordering
 ///
 /// Render windows first in arm order, then whatever remains, and both through
