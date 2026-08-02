@@ -703,6 +703,20 @@ that filter cut 64 hits to 12, all twelve real.
 Do not `deny(rustdoc::broken_intra_doc_links)`; the cross-arm hits are load-bearing
 and would have to be silenced individually.
 
+**A third class is neither stale nor cross-arm, and it looks exactly like the
+first.** A bare `` [`Item`] `` inside a module's own `//!` block does not
+resolve here even when the item is `pub` in that very module — `[`Walk`]`,
+`[`AUDIT_STRIDE`]` and `[`FINE_TILE`]` were all reported against the modules
+that define them. The same shorthand in a `///` doc on an item resolves fine, so
+a file can have both spellings and only one of them warns. rustdoc reports these
+with **no `-->` file:line at all**, which is the tell; a cross-arm hit has one.
+
+The fix is the full path — `` [`crate::runtime::land_redundancy::Walk`] `` —
+not deleting the link, and it is worth doing rather than triaging past: three of
+these were sitting in the report as permanent noise that a reader has to
+re-triage every sweep. Verify with `comm` against a before-list rather than by
+eye; the report is 60-odd lines and a new hit does not stand out in it.
+
 Deleting a function is when this gets created. Its doc comment does not go with
 it if the deletion is done by hand — and a doc block with no item under it does
 not error, it silently concatenates onto the **next** item's doc. Twice in one

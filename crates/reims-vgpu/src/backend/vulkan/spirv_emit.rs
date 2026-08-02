@@ -4,9 +4,10 @@
 //!
 //! Every SPIR-V module in this device so far came from the guest: AIR through
 //! `metal2vulkan`, then patched in place by [`crate::runtime::spirv_bind`] and
-//! [`crate::runtime::spirv_layout`]. Both of those walk and edit an existing
-//! word stream; neither can synthesise one. The engine has never had a shader of
-//! its own.
+//! its private peer `runtime::spirv_layout` — named rather than linked, because
+//! that module is not public and a link to it resolves nowhere. Both walk and
+//! edit an existing word stream; neither can synthesise one. The engine has
+//! never had a shader of its own.
 //!
 //! It needs one for the render writeback. That rail moves 2.26 GB/s into guest
 //! RAM and 93-98% of the bytes are already at the destination, measured per

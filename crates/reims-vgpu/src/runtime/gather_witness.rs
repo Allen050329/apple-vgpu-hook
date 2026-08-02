@@ -50,7 +50,8 @@
 //!
 //! Running it on every bind would defeat the cache it licensed — a skipped
 //! gather that still reads every byte to fold them has moved the cost, not
-//! removed it. So the fold runs once per [`AUDIT_STRIDE`] binds of a window and
+//! removed it. So the fold runs once per
+//! [`crate::runtime::gather_witness::AUDIT_STRIDE`] binds of a window and
 //! its verdict is a standing alarm rather than an input:
 //!
 //! | route | meaning |

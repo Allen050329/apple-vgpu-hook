@@ -46,14 +46,16 @@
 //!
 //! # What this measures, and what it is not
 //!
-//! It is a counter, not a rail. On one write in [`AUDIT_STRIDE`] it compares the
+//! It is a counter, not a rail. On one write in
+//! [`crate::runtime::land_redundancy::AUDIT_STRIDE`] it compares the
 //! bytes about to be stored against the bytes already in the guest's pages and
 //! reports how many matched, at two granularities, because the granularity is
 //! what decides which rail is worth building:
 //!
 //! - **`page`** — the guest page. The unit a CPU-side skip would work in, and
 //!   the unit the write witness above is page-exact in.
-//! - **`fine`** — [`FINE_TILE`] bytes, 64 BGRA8 texels. The unit a GPU-side
+//! - **`fine`** — [`crate::runtime::land_redundancy::FINE_TILE`] bytes, 64 BGRA8
+//!   texels. The unit a GPU-side
 //!   compaction would work in. That is the only route at the 310 ms of copy,
 //!   because a CPU compare happens after the bytes have already crossed the
 //!   bus — and, per the refutation below, it turned out to be the only route at
@@ -223,7 +225,7 @@
 //! no frame-sized shadow of the previous landing, no compaction — and the second
 //! is not collected by anything short of the whole tile apparatus.
 //!
-//! [`Walk`] answers it. Each audited walk is bucketed by its own
+//! [`crate::runtime::land_redundancy::Walk`] answers it. Each audited walk is bucketed by its own
 //! `same_fine / fine`, and its bytes are charged to the bucket as well as to the
 //! window, so the shape of the distribution is reported beside its mean:
 //!
@@ -286,7 +288,8 @@
 //! a third of the audit's budget to answer a question nobody can act on. The
 //! page total is derived from the fine one instead of walking the range twice,
 //! which is exact because every guest page size this runs on is a whole multiple
-//! of [`FINE_TILE`] and both are aligned in the same space.
+//! of [`crate::runtime::land_redundancy::FINE_TILE`] and both are aligned in the
+//! same space.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
