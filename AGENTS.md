@@ -203,6 +203,34 @@ was read out of the binaries statically and has not been confirmed on a running 
 Safari is unaffected: it uses Metal directly rather than through ANGLE, and Mac1 is sufficient for
 it. Treat Safari as the browser where browser-facing GPU goals are actually measurable.
 
+**There is no hardware video decode in the guest, for any codec, and this device is not the reason
+— it is not a codec device at all.** Measured on the live x86/PCI guest (macOS 13.7.8):
+
+```text
+VTIsHardwareDecodeSupported(H264) False   (HEVC, VP9, AV1 all False)
+kextstat  | grep -iE 'avd|videotoolbox|codec|h264'   -> nothing
+ioreg -l  | grep -iE 'AppleAVD|AppleVXD|IOVideoDecode|AppleH264'  -> nothing
+```
+
+`system_profiler` reports the GPU normally beside it (`Apple Paravirtualized Graphics Device`,
+`Metal 2`, 1920x1080 @ 120 Hz), so this is not a device that failed to attach — VideoToolbox has no
+codec hardware to bind to, because nothing in this stack exposes one. Our QEMU device is a GPU: no
+codec BAR, no codec protocol, no VideoToolbox forwarding. There is nothing on the host side that
+could answer even if the guest asked.
+
+Two things follow. **Goal 4 (ffmpeg GPU acceleration) is blocked on a device that does not exist**,
+not on a defect in this one — and note ffmpeg is not installed in the guest image either, so the
+symptom was never reproducible there in the first place. And **every browser's video decode runs on
+the CPU**, which is a second and independent cause of jumpy playback alongside Firefox's
+`supportsOpenGL = 0` compositor fallback. Unlike that one it applies to Safari too, so "Safari is
+the browser where GPU goals are measurable" does not extend to video.
+
+What is **not** established, and is the thing to check before anyone builds on this: whether
+Apple's own paravirt stack offers a codec path we are simply not implementing. If it does, there is
+a protocol here to decode; if it does not, hardware video in this guest needs a new device and a
+guest driver for it, which this project does not ship. Nothing has looked, and guessing either way
+would be exactly the broad claim the next paragraph warns about.
+
 Verify claims of this kind against the binaries before adding one, and say which constant decides
 it. "The guest cannot do X" is exactly the sort of broad claim `Keep Claims Narrow` is about.
 
