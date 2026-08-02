@@ -1498,6 +1498,10 @@ pub(crate) unsafe fn execute_draw_inner(
                 // runs are guest RAM. `TRANSFER_DST` came off the scratch usage
                 // with it — nothing on the device writes this buffer any more.
                 pools.write_staging_from_runs(ctx, &scratch, &src.runs, src.total_len)?;
+                // The only arm of this loop that moves bytes, and until now the
+                // only one that reported nothing — which is what let the whole
+                // of `acquire_sampled` sit unattributed.
+                counters.note_sampled_gather(src.total_len);
                 sampled.push(PreparedSampled::GuestGather {
                     binding: resource.binding,
                     image: img,

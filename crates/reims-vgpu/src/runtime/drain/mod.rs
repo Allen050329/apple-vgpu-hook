@@ -4258,6 +4258,9 @@ pub fn note_drain_tranche(drain_us: u64, publish_us: u64) {
 ///   miss is a driver compile rather than a lookup.
 /// - `sampled_reuploads` — re-staging texture content a cache hit should have
 ///   kept.
+/// - `sampled_gathers` / `sampled_gather_bytes` — sampled binds served by
+///   gathering scattered guest pages into staging. The sampled loop's only
+///   byte-moving arm, and the last one of that loop to report itself.
 /// - `ring_retire_blocks` / `target_evicts` — the engine waiting on itself.
 ///
 /// One line per second, one atomic load per field. Emitted from the same window
@@ -4338,7 +4341,8 @@ fn emit_engine_delta() {
          shader_misses={} pass_misses={} layout_misses={} sampler_misses={} \
          sampled_cache_hits={} sampled_identity_hits={} sampled_cache_hit_bytes={} \
          sampled_cache_misses={} sampled_reuploads={} \
-         sampled_reupload_bytes={} seed_uploads={} seed_upload_bytes={} \
+         sampled_reupload_bytes={} sampled_gathers={} sampled_gather_bytes={} \
+         seed_uploads={} seed_upload_bytes={} \
          ring_retire_blocks={} target_evicts={} desc_pool_grow={} gen_mismatch={}",
         d.creates,
         d.allocs,
@@ -4362,6 +4366,8 @@ fn emit_engine_delta() {
         d.sampled_cache_misses,
         d.sampled_reuploads,
         d.sampled_reupload_bytes,
+        d.sampled_gathers,
+        d.sampled_gather_bytes,
         d.seed_uploads,
         d.seed_upload_bytes,
         d.ring_retire_blocks,
