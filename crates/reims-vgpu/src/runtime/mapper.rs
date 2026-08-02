@@ -1983,42 +1983,6 @@ impl RunCopy<'_> {
         }
     }
 
-    /// Run the write through [`crate::runtime::land_redundancy`]'s tile rail,
-    /// which stores only the tiles the destination does not already hold.
-    ///
-    /// Returns false for the read direction, so the caller falls through to the
-    /// plain copy: the rail only has meaning where there is a destination whose
-    /// current bytes could already be right.
-    ///
-    /// # Safety
-    ///
-    /// Same contract as [`Self::apply`], plus the destination must be readable
-    /// over the range — which it is, being the memory about to be written.
-    unsafe fn apply_write_by_tile(
-        &self,
-        map_off: u64,
-        host_ptr: usize,
-        host_off: usize,
-        buf_off: usize,
-        n: usize,
-        page_size: u64,
-    ) -> bool {
-        let Some(buf) = self.write_src() else {
-            return false;
-        };
-        // SAFETY: the caller's contract covers exactly this range in both
-        // directions.
-        unsafe {
-            crate::runtime::land_redundancy::write_skipping_identical(
-                map_off,
-                (host_ptr as *mut u8).add(host_off),
-                &buf[buf_off..buf_off + n],
-                page_size,
-            );
-        }
-        true
-    }
-
     /// Move `n` bytes between the caller's buffer at `buf_off` and the mapped
     /// host range at `host_off`.
     ///
@@ -2078,15 +2042,10 @@ fn copy_mapping_runs<H: HostMemory + HostOps>(
         // witness. The read direction shares this walk and writes nothing.
         state.note_host_wrote_mapping(mapping_id);
     }
-    // The tile rail compares every range it stores, so it counts exactly and the
-    // sampled audit would be a second pass measuring what the rail already
-    // reported. Only one of the two runs.
-    let by_tile = copy.is_write() && crate::runtime::land_redundancy::tile_skip_enabled();
     // Decided once for the walk so an audited landing is compared whole. See
     // [`crate::runtime::land_redundancy::audit_due`] for why a per-run stride
     // would describe no frame in particular.
-    let audit =
-        !by_tile && copy.is_write() && crate::runtime::land_redundancy::audit_due();
+    let audit = copy.is_write() && crate::runtime::land_redundancy::audit_due();
     let page_size = state.page_size();
     let len = copy.len();
     let need_end = off.saturating_add(len as u64);
@@ -2097,14 +2056,8 @@ fn copy_mapping_runs<H: HostMemory + HostOps>(
                 // SAFETY: same range the copy below is about to write.
                 unsafe { copy.audit(off, ptr, off as usize, 0, len, page_size) };
             }
-            // SAFETY: the view covers `need_end`, checked directly above, in
-            // both directions.
-            let by_tile = by_tile
-                && unsafe { copy.apply_write_by_tile(off, ptr, off as usize, 0, len, page_size) };
-            if !by_tile {
-                // SAFETY: the view covers `need_end`, checked directly above.
-                unsafe { copy.apply(ptr, off as usize, 0, len) };
-            }
+            // SAFETY: the view covers `need_end`, checked directly above.
+            unsafe { copy.apply(ptr, off as usize, 0, len) };
             if copy.is_write() {
                 note_mapping_write_footprint(state, mapping_id, off, len as u64);
             }
@@ -2161,13 +2114,8 @@ fn copy_mapping_runs<H: HostMemory + HostOps>(
             unsafe { copy.audit(copy_lo, ptr, host_off, buf_off, n, page_size) };
         }
         // SAFETY: the map covers `total`, and `host_off + n <= total` and
-        // `buf_off + n <= len` were both just checked, in both directions.
-        let by_tile = by_tile
-            && unsafe { copy.apply_write_by_tile(copy_lo, ptr, host_off, buf_off, n, page_size) };
-        if !by_tile {
-            // SAFETY: as above.
-            unsafe { copy.apply(ptr, host_off, buf_off, n) };
-        }
+        // `buf_off + n <= len` were both just checked.
+        unsafe { copy.apply(ptr, host_off, buf_off, n) };
         if copy.is_write() {
             // Packed run, so the `n` bytes at `host_off` are the `n` bytes at
             // `run_gpas[0] + host_off`. Marked per run rather than once over

@@ -4538,17 +4538,8 @@ fn emit_land_redundancy() {
     };
     crate::observe::off(format!(
         "land_redundancy audits={} calls={} runs={} bytes={} pages={} same_pages={} \
-         fine={} same_fine={} railed={} stored={}",
-        w.audits,
-        w.calls,
-        w.runs,
-        w.bytes,
-        w.pages,
-        w.same_pages,
-        w.fine,
-        w.same_fine,
-        w.railed,
-        w.stored,
+         fine={} same_fine={}",
+        w.audits, w.calls, w.runs, w.bytes, w.pages, w.same_pages, w.fine, w.same_fine,
     ));
 }
 

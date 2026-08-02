@@ -1043,21 +1043,49 @@ because the wallpaper under a moving window does not change because the window
 moved. Declared damage and content change are different quantities and only one
 of them is worth anything.
 
-**The gap between the two rows is the finding, not the 86 %.** Against the same
-second (`busy_us=975666`, `gpu_us=300144`, `land_us=209176`):
+The gap between the two rows decides which unit a rail should work in. A
+page-granular one leaves half the redundancy on the table and a row-granular one
+would find almost none, so when a skip is being considered the granularity is
+not an implementation detail, it is the size of the prize.
 
-- A **page-granular CPU skip** declines 43 % of the CPU stores and nothing at
-  all of the GPU copy — the bytes have crossed the bus by the time a CPU compare
-  can run. Worth ~5 % of the worker's second.
-- A **tile-granular GPU compaction** declines 86 % of *both*: ~258 ms of copy,
-  and ~180 ms of scatter that needs no compare because the pass already said
-  which tiles moved. **~45 % of a saturated second**, against the ~73 % the whole
-  writeback costs.
+**The CPU rail this licensed was built, and it is refuted. Do not build it
+again.** Compare each tile in the scatter, store only the runs that differ.
+Measured on one settled x86/PCI guest with the same stressor:
 
-So a coarse measurement would have priced this at a third of its value and
-priced it on the smaller of the two costs. That is the general shape: when a
-skip is being considered the granularity is not an implementation detail, it is
-the size of the prize.
+| run | tile rail | bytes declined | `land_us` per landing |
+|---|---|---|---|
+| drag1 | off | — | med **744** (732 – 760) |
+| drag2 | off | — | med **769** (737 – 788) |
+| drag4 | on | 91.6 – 91.8 % | med **802** (791 – 956) |
+
+**Declining 92 % of the stores made the scatter slower**, and the ranges do not
+overlap. The cause is worth carrying past this device: **a full-cache-line store
+does not read its destination.** The hardware elides the read-for-ownership, so
+a store that gets declined never cost a read in the first place, and the compare
+adds a whole 8 MB read of guest RAM the eager path never paid. What it saves is
+DRAM write bandwidth, and `land_us` is not bound by that.
+
+The run did confirm the audit to the decimal — `same_fine` 91.6/91.8/91.8 %
+against bytes actually declined 91.6/91.8/91.8 % — so the measurement and the
+mechanism agree and it is the mechanism's *economics* that were wrong. That is
+the general trap: a redundancy fraction is not a saving, because it says nothing
+about what the work it would skip actually costs.
+
+**What survives is the number the GPU pass is priced on.** The failure is the
+compare, not the skipping, and the same run separates them. A full landing is
+744 µs = read `src` + write `dst`; a scatter handed its changed-tile set from
+outside reads and writes only 8 % of that:
+
+```text
+0.082 * 744 us = ~61 us per landing, saving ~683 us
+683 us * 272 landings/s = ~186 ms/s of a ~990 ms busy second
+```
+
+So a **GPU-side pass is the only route, and now for two reasons rather than
+one.** It is the only thing that can decline the copy across the bus — 78 % of
+the readback fence — *and* the only way to get the scatter's own 186 ms/s,
+because the CPU cannot derive the tile set for less than the saving is worth.
+Both halves need the same bitmap and neither is reachable without it.
 
 The skip is an **identity, not a heuristic** — not writing a byte that already
 holds the value being written leaves memory in the same state — so it needs no
