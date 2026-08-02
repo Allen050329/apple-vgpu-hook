@@ -1558,3 +1558,83 @@ fn emitted_tile_diff_indexes_a_folded_grid_and_stops_at_its_bound() {
     // The change is in the partial third tile, which is tile index 2.
     assert_eq!(read(tile_diff_binding::BITS), vec![1 << 2]);
 }
+
+/// The difference pass through the plumbing the writeback rail will use.
+///
+/// [`emitted_tile_diff_carries_changed_tiles_whole`] proves the *shader*
+/// against the generic compute harness, which uploads every binding as a
+/// host-visible staging buffer. The rail does not: `cur` and `prev` are
+/// device-local scratch this device allocates itself, `out` and `bits` are
+/// recycled readback slots, and the descriptors are written by hand rather
+/// than by `execute_compute_inner`. Everything in that gap — the readback
+/// pool's new `STORAGE_BUFFER` usage, the device-local memory type, the two
+/// pipeline barriers, the binding order — is untested by the shader test and
+/// is what this covers.
+///
+/// The sentinel is written into `out` by a `vkCmdFillBuffer` inside the same
+/// command buffer rather than by a host write, because a readback slot is not
+/// host-writable in the direction that would need.
+#[test]
+fn diff_pass_declines_unchanged_tiles_through_the_real_bindings() {
+    use reims_vgpu::backend::vulkan::engine::diff_pass;
+
+    let _g = engine_test_session();
+    // Three rows of a 64-pixel-wide BGRA surface: 48 tiles, so the bitmap is
+    // two words and a tile past bit 31 is exercised.
+    const TILES: usize = 48;
+    const TILE_BYTES: usize = 256;
+    const SENTINEL: u32 = 0xDEAD_BEEF;
+    let bytes = TILES * TILE_BYTES;
+
+    let prev: Vec<u8> = (0..bytes).map(|i| (i % 251) as u8).collect();
+    let mut cur = prev.clone();
+    // One byte in tile 5, one in tile 33 (second bitmap word), and the whole
+    // of tile 47 (the last one).
+    cur[5 * TILE_BYTES + 3] ^= 0xFF;
+    cur[33 * TILE_BYTES + 200] ^= 0xFF;
+    for b in &mut cur[47 * TILE_BYTES..48 * TILE_BYTES] {
+        *b ^= 0xFF;
+    }
+    let changed = [5usize, 33, 47];
+
+    let probe = match diff_pass::probe_tile_diff(&cur, &prev, SENTINEL) {
+        Ok(p) => p,
+        Err(e) => {
+            let msg = format!("{e:?}");
+            if skip_if_no_gpu(&msg) {
+                return;
+            }
+            panic!("diff pass refused: {msg}");
+        }
+    };
+
+    assert_eq!(probe.out.len(), bytes);
+    assert_eq!(probe.bits.len(), 2, "48 tiles is two bitmap words");
+    assert_eq!(probe.bits[0], 1 << 5, "first bitmap word");
+    assert_eq!(probe.bits[1], (1 << (33 - 32)) | (1 << (47 - 32)), "second");
+
+    let sentinel_bytes = SENTINEL.to_le_bytes();
+    for tile in 0..TILES {
+        let range = tile * TILE_BYTES..(tile + 1) * TILE_BYTES;
+        if changed.contains(&tile) {
+            // Whole tile, not only the byte that differs: tile 5 changed in one
+            // byte of 256 and all 256 must have crossed.
+            assert_eq!(&probe.out[range.clone()], &cur[range], "tile {tile}");
+        } else {
+            assert!(
+                probe.out[range].chunks_exact(4).all(|w| w == sentinel_bytes),
+                "tile {tile} was written and did not change",
+            );
+        }
+    }
+
+    // And the bitmap reads back as the byte runs the scatter will walk.
+    assert_eq!(
+        diff_pass::changed_runs(&probe.bits, bytes as u64),
+        vec![
+            (5 * TILE_BYTES as u64, TILE_BYTES as u64),
+            (33 * TILE_BYTES as u64, TILE_BYTES as u64),
+            (47 * TILE_BYTES as u64, TILE_BYTES as u64),
+        ],
+    );
+}

@@ -13,6 +13,7 @@ mod compute_validation;
 mod context;
 mod counters;
 mod desc_arena;
+pub mod diff_pass;
 mod device_lost;
 mod digest;
 mod draw_execution;

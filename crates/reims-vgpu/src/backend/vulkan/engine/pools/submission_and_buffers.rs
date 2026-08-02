@@ -1519,7 +1519,18 @@ impl ResourcePools {
         }
     }
 
-    /// Create one `TRANSFER_DST` host-visible buffer of exactly `bucket` bytes.
+    /// Create one host-visible buffer of exactly `bucket` bytes, usable as a
+    /// transfer destination and as a storage buffer.
+    ///
+    /// `STORAGE_BUFFER` is here for the render writeback's difference pass,
+    /// which writes its output straight into a readback slot rather than
+    /// copying a whole frame into one. It is unconditional rather than a second
+    /// kind of slot because the pool is bucketed by size and shared by every
+    /// rail, so two kinds would have to be bucketed separately and a slot
+    /// acquired for a copy could not be handed to a dispatch. The flag costs a
+    /// `memory_type_bits` that may be narrower; the type is chosen from the
+    /// bits this buffer actually reports, so a device that excluded a type here
+    /// would pick another rather than mis-bind.
     ///
     /// The two readback acquires differ only in where they stash the slot and in
     /// which `VkOp`/`AllocSite` names each step, so the Vulkan sequence lives
@@ -1545,7 +1556,10 @@ impl ResourcePools {
             .create_buffer(
                 &vk::BufferCreateInfo::default()
                     .size(bucket)
-                    .usage(vk::BufferUsageFlags::TRANSFER_DST)
+                    .usage(
+                        vk::BufferUsageFlags::TRANSFER_DST
+                            | vk::BufferUsageFlags::STORAGE_BUFFER,
+                    )
                     .sharing_mode(vk::SharingMode::EXCLUSIVE),
                 None,
             )
