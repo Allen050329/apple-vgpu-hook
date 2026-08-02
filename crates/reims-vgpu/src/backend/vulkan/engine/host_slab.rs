@@ -96,14 +96,17 @@ const HOST_SMALL_CLASS_MAX: u64 = 128 << 10;
 /// by count — the whole small working set in one block, at ~2 ms to allocate.
 const HOST_SMALL_SLAB_SIZE: u64 = 2 << 20;
 
-/// Fully-empty shared blocks kept resident rather than freed on release.
+/// Fully-empty shared blocks per size class that a *settled idle* keeps rather
+/// than returning to the driver.
 ///
 /// One, not [`super::slab`]'s two: a block here is host RAM held from the guest
 /// (shared guest RAM on an iGPU), and unlike the image slab the pool in front of
 /// this one already absorbs steady-state churn at a 99.6 % hit rate — a carve
 /// only reaches this allocator when that pool missed. So the spare exists to
-/// stop a single empty↔full cycle re-paying a block, and no more.
-const HOST_SLAB_KEEP_EMPTY: usize = 1;
+/// stop the first composite after idle re-paying a block allocation, and no
+/// more. Mid-session retention is not this number's business: nothing is freed
+/// until idle settles.
+pub(crate) const HOST_SLAB_IDLE_KEEP_EMPTY: usize = 1;
 
 /// The size classes only segregate anything while these hold, and a later edit
 /// to one constant that breaks one of them would show up as fragmentation
@@ -331,7 +334,7 @@ impl HostSlabPool {
         // claim of this module in one line.
         crate::observe::off(format!(
             "host_slab ev=alloc size={block_size} dedicated={} small={} block_allocs={} \
-             block_frees={} sub_allocs={} sub_frees={} resident_mb={} live_mb={} violations={}",
+             block_frees={} sub_allocs={} sub_frees={} resident_mb={} live_kb={} violations={}",
             dedicated as u8,
             small as u8,
             self.block_allocs,
@@ -339,7 +342,7 @@ impl HostSlabPool {
             self.sub_allocs,
             self.sub_frees,
             self.resident_bytes() >> 20,
-            self.live_bytes() >> 20,
+            self.live_bytes() >> 10,
             self.invariant_violations,
         ));
         Ok(HostSlabToken {
@@ -383,15 +386,14 @@ impl HostSlabPool {
             // A corrupt release poisoned the block; leak it (already logged).
             return;
         }
-        if empty {
-            if dedicated {
-                // A dedicated block exists for one oversized carve and can never
-                // host another; holding it as a spare would just be a leak with
-                // a nicer name.
-                self.free_block(device, idx);
-            } else {
-                self.trim_empty_blocks(device, HOST_SLAB_KEEP_EMPTY);
-            }
+        // A dedicated block exists for one oversized carve and can never host
+        // another, so holding it would be a leak with a nicer name. A shared
+        // block that empties is *not* freed here: emptying is what a working set
+        // crossing a block boundary does several times a minute, and freeing on
+        // it costs a full block allocation to cross back. Returning shared
+        // blocks is the settled-idle drain's job ([`Self::trim_empty_blocks`]).
+        if empty && dedicated {
+            self.free_block(device, idx);
         }
     }
 
@@ -422,26 +424,34 @@ impl HostSlabPool {
         self.block_frees += 1;
         crate::observe::off(format!(
             "host_slab ev=free block_allocs={} block_frees={} sub_allocs={} sub_frees={} \
-             resident_mb={} live_mb={}",
+             resident_mb={} live_kb={}",
             self.block_allocs,
             self.block_frees,
             self.sub_allocs,
             self.sub_frees,
             self.resident_bytes() >> 20,
-            self.live_bytes() >> 20,
+            self.live_bytes() >> 10,
         ));
     }
 
     /// Free fully-empty shared blocks beyond `keep` spares per size class,
     /// returning the count freed.
     ///
-    /// Called from [`Self::release`] rather than from the idle drain, and the
-    /// difference from [`super::slab::SlabPool`] is worth stating: that one
-    /// *retains* on release and needs an idle sweep to give the retained blocks
-    /// back later. This one settles to its policy on every release, and a block
-    /// can only become empty by a release, so there is nothing left for an idle
-    /// pass to find.
-    unsafe fn trim_empty_blocks(&mut self, device: &ash::Device, keep: usize) -> usize {
+    /// Called only from the *settled* idle drain, never from a release, and
+    /// that gate is the whole policy. Measured on the boot that first ran this
+    /// allocator, freeing on the release that empties a block cost 13 block
+    /// allocations against 10 frees in five minutes — the working set crossing
+    /// [`HOST_SLAB_SIZE`] and back — and each of those allocations is a 20-30 ms
+    /// stall under the engine lock (`staging_write_slow kind=acquire us=30734`).
+    /// So a shared block is held for as long as the workload is live and
+    /// returned once idle settles, which is the same trade
+    /// `SETTLED_PASSES_FOR_BUFFER_TRIM` already makes for the buffer pools it
+    /// feeds, and for the same reason.
+    pub(crate) unsafe fn trim_empty_blocks(
+        &mut self,
+        device: &ash::Device,
+        keep: usize,
+    ) -> usize {
         let victims = self.empty_block_victims(keep);
         let mut freed = 0;
         for idx in victims {
@@ -530,6 +540,69 @@ impl HostSlabPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Emptying a shared block does not free it; only a settled-idle trim does.
+    ///
+    /// This is the policy the first live run of this allocator bought. Freeing
+    /// on the release that empties a block read `block_allocs=13` against
+    /// `block_frees=10` in five minutes — a working set crossing
+    /// [`HOST_SLAB_SIZE`] and back — and every one of those ten re-crossings is
+    /// a 20-30 ms `vkAllocateMemory` under the engine lock, which is precisely
+    /// the stall this module exists to remove. So the empty↔full cycle must cost
+    /// nothing, and the trim must still be able to give the block back.
+    #[test]
+    fn an_emptied_block_is_kept_for_reuse_until_idle_trims_it() {
+        crate::observe::redirect_logs_for_tests();
+        let mut ctx = match unsafe { DeviceContext::create() } {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("SKIP host slab reuse: no device ({e})");
+                return;
+            }
+        };
+        let counters = EngineCounters::default();
+        let mut pool = HostSlabPool::new();
+        // Half a large block: big enough to be large-class, small enough that
+        // two fit, so a second carve after the release can only mean reuse.
+        let req = vk::MemoryRequirements {
+            size: HOST_SLAB_SIZE / 2,
+            alignment: 256,
+            memory_type_bits: u32::MAX,
+        };
+
+        let first = match unsafe { pool.acquire(&ctx, &req, &counters) } {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("SKIP host slab reuse: no upload memory ({e:?})");
+                unsafe { ctx.destroy() };
+                return;
+            }
+        };
+        assert_eq!(pool.block_allocs, 1, "the first carve needs one block");
+
+        unsafe { pool.release(&ctx.device, first) };
+        assert_eq!(
+            pool.block_frees, 0,
+            "an emptied shared block was freed on release; the next carve pays \
+             a full vkAllocateMemory to undo that"
+        );
+
+        let second = unsafe { pool.acquire(&ctx, &req, &counters) }.expect("reuse the kept block");
+        assert_eq!(
+            pool.block_allocs, 1,
+            "the kept block was not reused — crossing a block boundary and back \
+             still costs an allocation"
+        );
+
+        // And the trim still reclaims it once nothing is carved from it.
+        unsafe { pool.release(&ctx.device, second) };
+        let freed = unsafe { pool.trim_empty_blocks(&ctx.device, 0) };
+        assert_eq!(freed, 1, "a settled idle must be able to give the block back");
+        assert_eq!(pool.resident_bytes(), 0, "the block is still resident");
+
+        unsafe { pool.destroy_all(&ctx.device) };
+        unsafe { ctx.destroy() };
+    }
 
     /// A block with no live carves and one spare already retained is surplus;
     /// the first `keep` are not. Mirrors what the idle drain asks for.

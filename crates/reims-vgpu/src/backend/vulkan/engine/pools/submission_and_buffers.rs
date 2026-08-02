@@ -169,12 +169,18 @@ impl ResourcePools {
                 release_buffer_slot(device, &mut self.host_slab, slot);
                 buf_trimmed += 1;
             }
-            // No separate block sweep: `release_buffer_slot` returned each
-            // slot's carve above, and the upload slab settles to its
-            // spare-per-class policy on every release. What a settled idle
-            // retains here is those spares — tens of MiB against the ~177 MiB
-            // of frozen staging this trim was written for — and they are what
-            // stops the first composite after idle re-allocating a block.
+            // Returning the carves above is what lets an upload block empty;
+            // this is where the emptied blocks go back. It belongs here and not
+            // in the release that empties a block, because a live workload
+            // crosses a block boundary and back several times a minute and
+            // re-crossing costs a whole block allocation (20-30 ms under this
+            // lock). The settled gate is the same one the buffer pools are
+            // under, so what is retained mid-session is bounded by the live
+            // working set, and what a quiet desktop keeps is one spare block per
+            // size class — tens of MiB against the ~177 MiB of frozen staging
+            // this trim was written for.
+            self.host_slab
+                .trim_empty_blocks(device, HOST_SLAB_IDLE_KEEP_EMPTY);
             // The standalone (non-slab) compute-storage recycle pool re-allocs via
             // a full `vkAllocateMemory` on the next dispatch — like the buffer
             // pools above and unlike the slab-backed image pools (cheap

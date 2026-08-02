@@ -11,8 +11,8 @@ use std::time::Instant;
 
 use super::compute_execution::ComputeExecutionDecline;
 use super::context::{DeviceContext, FENCE_TIMEOUT_NS};
-use super::host_slab::HostSlabToken;
 use super::counters::EngineCounters;
+use super::host_slab::{HostSlabToken, HOST_SLAB_IDLE_KEEP_EMPTY};
 use super::desc_arena::{DescriptorArena, DESC_BLOCK_MAX_SETS};
 use super::device_lost::{DeviceLostDecline, DeviceLostOp};
 use super::types::{DrawError, StorageImageFormat, TargetIdentity};
