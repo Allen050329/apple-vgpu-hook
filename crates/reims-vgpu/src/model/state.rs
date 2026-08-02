@@ -190,6 +190,30 @@ pub struct GfxRegs {
     /// Fault interrupt status (0x102c), host-set, guest-read (not r2c). Same
     /// lock-free read rail (the guest ISR reads it right after 0x1018).
     pub interrupt_fault: Arc<AtomicU32>,
+    /// Child channels rung since the drain last folded them in (0x1020/0x1028).
+    ///
+    /// The lock-free *write* rail, and the only one: every other register the
+    /// guest writes finds the device lock free, while this doorbell was
+    /// measured queueing about a hundred times a second and applying up to
+    /// 45 ms late (`gfx_doorbell_delay off_0x1020`). It queued because
+    /// `device_gfx_write` takes the device lock with `try_lock` and the drain
+    /// worker holds that lock for its whole tranche, so the delay is the
+    /// tranche — `max_age_us` tracks `max_tranche_us` to within 3 %.
+    ///
+    /// A doorbell is the one register that can be taken this way, because it
+    /// carries no state the decode depends on: its whole effect is to say a
+    /// child channel has work. So the guest's ring ORs a bit here without any
+    /// lock, and [`crate::runtime::drain::fold_rung_child_doorbells`] moves it
+    /// into `active_child_mask` / `pending.child_mask` — including *inside* the
+    /// channel loop, so a channel rung mid-tranche is served by that tranche
+    /// rather than the next one.
+    ///
+    /// Bit `n` is channel `n`; bit 0 is unused because channel 0 is the main
+    /// FIFO, which has its own register.
+    ///
+    /// The `Arc` is shared with the device registry slot and survives reset,
+    /// like the three above.
+    pub child_doorbell_rung: Arc<AtomicU32>,
     pub efi_display: u32,
     pub efi_mode_select: u32,
     pub efi_fb_start: u64,
@@ -215,6 +239,7 @@ impl Default for GfxRegs {
             interrupt_status_disp: Arc::new(AtomicU32::new(0)),
             interrupt_status_gpu: Arc::new(AtomicU32::new(0)),
             interrupt_fault: Arc::new(AtomicU32::new(0)),
+            child_doorbell_rung: Arc::new(AtomicU32::new(0)),
             efi_display: 0,
             efi_mode_select: 0,
             efi_fb_start: 0,
@@ -2352,15 +2377,20 @@ impl DeviceState {
         let intr_gpu = Arc::clone(&self.gfx.interrupt_status_gpu);
         let intr_fault = Arc::clone(&self.gfx.interrupt_fault);
         let fifo_read = Arc::clone(&self.gfx.fifo_read);
+        let child_rung = Arc::clone(&self.gfx.child_doorbell_rung);
         intr_disp.store(0, Ordering::Release);
         intr_gpu.store(0, Ordering::Release);
         intr_fault.store(0, Ordering::Release);
         fifo_read.store(0, Ordering::Release);
+        // Cleared as well as kept: a reset drops every channel, so a bit rung
+        // before it names a channel that no longer exists.
+        child_rung.store(0, Ordering::Release);
         *self = Self::new(id, page_shift);
         self.gfx.interrupt_status_disp = intr_disp;
         self.gfx.interrupt_status_gpu = intr_gpu;
         self.gfx.interrupt_fault = intr_fault;
         self.gfx.fifo_read = fifo_read;
+        self.gfx.child_doorbell_rung = child_rung;
     }
 
     /// Queue the engine-unpin for a dying linear cache entry that still owns a

@@ -3948,6 +3948,8 @@ pub(crate) struct DoorbellCensus {
     /// Queued writes whose apply was late by at least a whole frame interval.
     frame_late: std::sync::atomic::AtomicU64,
     direct: std::sync::atomic::AtomicU64,
+    /// Rings served without asking for the device lock at all.
+    lock_free: std::sync::atomic::AtomicU64,
     /// Which registers are actually being deferred: offset -> (count, max age).
     ///
     /// A lock on a census, which the atomics next door exist to avoid — and it
@@ -3968,6 +3970,20 @@ impl DoorbellCensus {
     pub(crate) fn note_direct(&self, now_ms: impl FnOnce() -> u64) -> Option<String> {
         let prior = self
             .direct
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if !prior.is_multiple_of(UNCONTENDED_POLL) {
+            return None;
+        }
+        self.maybe_report(now_ms())
+    }
+
+    /// Count one ring taken with no device lock asked for.
+    ///
+    /// Polled on the same one-in-[`UNCONTENDED_POLL`] rule as `note_direct`,
+    /// and for the same reason: this is the hot MMIO path.
+    pub(crate) fn note_lock_free(&self, now_ms: impl FnOnce() -> u64) -> Option<String> {
+        let prior = self
+            .lock_free
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if !prior.is_multiple_of(UNCONTENDED_POLL) {
             return None;
@@ -4010,6 +4026,7 @@ impl DoorbellCensus {
         let max = self.max_age_us.swap(0, Relaxed);
         let late = self.frame_late.swap(0, Relaxed);
         let direct = self.direct.swap(0, Relaxed);
+        let lockfree = self.lock_free.swap(0, Relaxed);
         // Descending by count, capped, and the cap is reported rather than
         // silently applied: a register that misses the list because three others
         // out-counted it must not read as a register that never deferred.
@@ -4025,8 +4042,8 @@ impl DoorbellCensus {
         }
         Some(format!(
             "gfx_doorbell_delay win_ms={win_ms} queued={queued} direct={direct} \
-             age_us={total} max_age_us={max} frame_late={late} slow_us={DRAIN_TRANCHE_SLOW_US} \
-             offsets={distinct} shown={}{body}",
+             lockfree={lockfree} age_us={total} max_age_us={max} frame_late={late} \
+             slow_us={DRAIN_TRANCHE_SLOW_US} offsets={distinct} shown={}{body}",
             distinct.min(DOORBELL_OFFSETS_REPORTED)
         ))
     }
@@ -4043,6 +4060,19 @@ const DOORBELL_OFFSETS_REPORTED: usize = 4;
 
 static DOORBELL: std::sync::LazyLock<DoorbellCensus> =
     std::sync::LazyLock::new(DoorbellCensus::default);
+
+/// Count one child doorbell taken on the vCPU thread with no device lock at all.
+///
+/// Distinct from [`note_doorbell_direct`], which counts a write that *took* the
+/// lock and found it free. This one never asks, so it can neither queue nor
+/// contend — and the pair is what says so: `lockfree` rising while `queued`
+/// falls to zero is the register leaving the contended path, whereas `queued`
+/// staying up would mean something is still routing it through `gfx_ingress`.
+pub fn note_doorbell_lock_free() {
+    if let Some(line) = DOORBELL.note_lock_free(|| crate::observe::elapsed_ms() as u64) {
+        crate::observe::off(line);
+    }
+}
 
 /// Count one doorbell applied on the vCPU thread without queueing.
 pub fn note_doorbell_direct() {
@@ -4830,6 +4860,40 @@ pub fn publish_stranded_fifos<H: HostMemory + HostOps>(
 /// because "apply it sooner" is only safe for registers whose effect is to
 /// publish more work, and unsafe for any the decode below depends on not
 /// changing mid-tranche.
+/// How many times one tranche will pick up newly rung child channels.
+///
+/// Not a time budget and not a work budget — a bound on how many times the
+/// drain will go back for doorbells that arrived while it was running. Three
+/// covers the measured shape: `gfx_doorbell_delay` reads about a hundred rings
+/// a second against tranches of tens of milliseconds, so at most a handful of
+/// channels are rung during any one pass and a channel already served is
+/// excluded from the refill. The cap exists so a guest that rings continuously
+/// cannot hold the device lock indefinitely, not because any run has needed it.
+const CHILD_DOORBELL_REFILLS: u32 = 3;
+
+/// Move child channels the guest rang lock-free into the drain's pending mask.
+///
+/// The guest's doorbell write does not take the device lock — see
+/// [`crate::model::GfxRegs::child_doorbell_rung`] for why that register can be
+/// taken that way and no other can. This is where the bits become work.
+///
+/// `active_child_mask` is set as well as `pending.child_mask`, because that is
+/// what the locked handler in `runtime::mmio` does for the same register and the
+/// two must not disagree: `publish_stranded_fifos` re-publishes from
+/// `active_child_mask`, so a channel that only ever rang lock-free would be
+/// invisible to the stranded-FIFO rescue.
+pub(crate) fn fold_rung_child_doorbells(state: &mut DeviceState) {
+    let rung = state
+        .gfx
+        .child_doorbell_rung
+        .swap(0, std::sync::atomic::Ordering::AcqRel);
+    if rung == 0 {
+        return;
+    }
+    state.active_child_mask |= rung;
+    state.pending.child_mask |= rung;
+}
+
 pub fn drain_pending<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut H) {
     // A queued present action is part of the ordered device timeline. QEMU
     // cannot paint it while this worker owns the device lock, so later worker
@@ -4867,25 +4931,56 @@ pub fn drain_pending<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mu
     if state.pending.main_drain {
         drain_main_fifo(state, host);
     }
-    let mask = state.pending.child_mask;
+    fold_rung_child_doorbells(state);
+    let mut mask = state.pending.child_mask;
     state.pending.child_mask = 0;
-    let mut remaining = mask;
-    for ch in 1..MAX_CHANNELS as u32 {
-        let bit = 1u32 << ch;
-        if mask & bit != 0 {
-            remaining &= !bit;
-            drain_child_fifo(state, host, ch);
-            if state.translation_deferred_mask != 0 {
-                state.pending.child_mask |= remaining | state.translation_deferred_mask;
-                note_translation_order_hold(state, remaining);
-                return;
-            }
-            if state.pending.host_action_yield {
-                state.pending.child_mask |= remaining;
-                return;
+    // Channels this pass has already run, so a refill cannot re-run one.
+    let mut served = 0u32;
+    // Bounded refills. Each pass picks up channels the guest rang *while the
+    // previous pass was running, under the device lock it could not take* —
+    // which is the whole point, and is why the doorbell was worth making
+    // lock-free. Serving them here rather than next tranche is what turns a
+    // ring into work that starts now.
+    //
+    // Bounded because the guest can ring faster than this drains, and an
+    // unbounded refill would hold the device lock for as long as it kept
+    // ringing. Leaving the remainder is safe here in a way it was NOT for the
+    // reverted tranche budget: that one returned with `child_mask` set and
+    // nothing to re-arm it, and froze a boot for 29 s. Every bit that arrives
+    // here arrives with its own `schedule_bh` already rung by the vCPU, so the
+    // worker is guaranteed another wakeup for whatever this pass leaves.
+    for _ in 0..CHILD_DOORBELL_REFILLS {
+        let mut remaining = mask;
+        for ch in 1..MAX_CHANNELS as u32 {
+            let bit = 1u32 << ch;
+            if mask & bit != 0 {
+                remaining &= !bit;
+                served |= bit;
+                drain_child_fifo(state, host, ch);
+                if state.translation_deferred_mask != 0 {
+                    state.pending.child_mask |= remaining | state.translation_deferred_mask;
+                    note_translation_order_hold(state, remaining);
+                    return;
+                }
+                if state.pending.host_action_yield {
+                    state.pending.child_mask |= remaining;
+                    return;
+                }
             }
         }
+        fold_rung_child_doorbells(state);
+        // Only channels this pass has not already run: a channel rung again
+        // while its own drain was in flight has had that work seen, and
+        // re-running it here would spin on one busy channel while the others
+        // wait.
+        mask = std::mem::take(&mut state.pending.child_mask) & !served;
+        if mask == 0 {
+            break;
+        }
+        note_store_route("child_doorbell_refill");
     }
+    // Whatever the refill cap left, handed back to the next wakeup.
+    state.pending.child_mask |= mask;
     if state.pending.iosfc {
         drain_iosfc(state, host);
     }

@@ -219,6 +219,9 @@ struct BoundDevice {
     /// 0x1014/0x1018 must observe live bits mid-drain, never a stale cache.
     intr_disp: Arc<AtomicU32>,
     intr_gpu: Arc<AtomicU32>,
+    /// Child channels the guest has rung, OR'd from the vCPU thread with no
+    /// device lock; see [`model::GfxRegs::child_doorbell_rung`].
+    child_doorbell_rung: Arc<AtomicU32>,
     /// Lock-free clone of the fault status (0x102c) — the ISR's third read.
     intr_fault: Arc<AtomicU32>,
     /// Lock-free clone of the main-FIFO consumer counter (0x100c): the guest
@@ -322,6 +325,12 @@ fn lock_for_drain(slot: &BoundDevice) -> parking_lot::MutexGuard<'_, DeviceInner
         apply_gfx_write(&mut inner, slot, write);
     }
     drop(ingress);
+    // Here rather than only inside `drain_pending`, because this is the one
+    // point every entry to the drain passes through. `device_drain` returns
+    // before `drain_pending` when the device has no host ops, and
+    // `publish_stranded_fifos` re-publishes from `active_child_mask` — a ring
+    // left unfolded would be invisible to both.
+    runtime::drain::fold_rung_child_doorbells(&mut inner.device.state);
     inner
 }
 
@@ -353,6 +362,7 @@ pub fn device_create(ops: Option<ReimsVgpuHostOps>, page_shift: u32) -> Option<u
     let dev = Device::new(DeviceId(id), backend, page_shift);
     let intr_disp = Arc::clone(&dev.state.gfx.interrupt_status_disp);
     let intr_gpu = Arc::clone(&dev.state.gfx.interrupt_status_gpu);
+    let child_doorbell_rung = Arc::clone(&dev.state.gfx.child_doorbell_rung);
     let intr_fault = Arc::clone(&dev.state.gfx.interrupt_fault);
     let fifo_read_live = Arc::clone(&dev.state.gfx.fifo_read);
     DEVICES.lock().insert(
@@ -368,6 +378,7 @@ pub fn device_create(ops: Option<ReimsVgpuHostOps>, page_shift: u32) -> Option<u
             prompt_actions: Mutex::new(VecDeque::new()),
             intr_disp,
             intr_gpu,
+            child_doorbell_rung,
             intr_fault,
             fifo_read_live,
             present_action_pending: AtomicBool::new(false),
@@ -938,6 +949,33 @@ pub fn device_gfx_write(id: u64, offset: u64, data: u64, size: u32) -> bool {
             slot.intr_gpu.fetch_and(!(data as u32), Ordering::AcqRel);
             return true;
         }
+        // The child doorbell, which measurement says is the *entire* queueing
+        // stall on this pathway: `gfx_doorbell_delay` reads `offsets=1` on
+        // every window that queued anything, ~100 rings a second applied up to
+        // 45 ms late, and that delay is the drain tranche the write could not
+        // take the lock through.
+        //
+        // It is the one register that can be served this way, because it
+        // carries no state the decode depends on — its effect is to say a
+        // channel has work. `fold_rung_child_doorbells` turns the bit into
+        // `active_child_mask` / `pending.child_mask`, which is exactly what the
+        // locked handler in `runtime::mmio` does for the same register.
+        //
+        // The channel-number check mirrors that handler rather than trusting
+        // the guest: a value outside the channel range names no channel, and
+        // shifting by it would be undefined. An out-of-range ring is dropped
+        // here as it is there, and deliberately still schedules nothing.
+        if offset == model::GFX_REG_CHILD_DOORBELL || offset == model::GFX_REG_CHILD_REPLAY_DOORBELL
+        {
+            let channel = data as u32;
+            if channel >= 1 && (channel as usize) < model::MAX_CHANNELS {
+                slot.child_doorbell_rung
+                    .fetch_or(1u32 << channel, Ordering::AcqRel);
+                runtime::drain::note_doorbell_lock_free();
+                schedule_device(&slot);
+            }
+            return true;
+        }
     }
     let mut write = QueuedGfxWrite {
         offset,
@@ -1112,6 +1150,10 @@ pub fn device_poll(id: u64) -> bool {
     };
     let DeviceInner { device, actions } = &mut *d;
     let mut host = QemuHost::new(&ops, actions, &slot.prompt_actions);
+    // Before the rescue reads `active_child_mask`, which is the mask a
+    // lock-free ring lands in only once folded. Without this the Dekker rescue
+    // could not see the very channels the doorbell rail is responsible for.
+    runtime::drain::fold_rung_child_doorbells(&mut device.state);
     runtime::drain::publish_stranded_fifos(&mut device.state, &mut host);
     runtime::drain::try_display_online(&mut device.state, &mut host);
     // After ONLINE, pulse VBL so the guest compositor has a display time base
@@ -1704,10 +1746,21 @@ mod tests {
     }
 
     /// Regression proxy for the IPI-timeout class: a doorbell arriving while
-    /// the render worker owns device state queues without waiting for that
-    /// state lock, then is applied by the next ordered drain.
+    /// the render worker owns device state never waits for that state lock.
+    ///
+    /// It used to queue, and the queue is what this asserted. That was the
+    /// weaker half of the guarantee: the guest's store retired, but the work it
+    /// rang for did not start until the worker's tranche ended, measured at up
+    /// to 45 ms and about a hundred rings a second
+    /// (`gfx_doorbell_delay off_0x1020`, which read `offsets=1` — this register
+    /// was the entire queueing stall on the PCI pathway). The ring is now taken
+    /// with no device lock asked for at all, so `gfx_ingress` must stay empty.
+    ///
+    /// Both halves are asserted. An empty ingress alone would also be what a
+    /// dropped doorbell looks like, so the bit has to be shown arriving and then
+    /// shown becoming a pending channel.
     #[test]
-    fn gfx_mmio_queues_while_render_worker_owns_device() {
+    fn a_child_doorbell_never_queues_behind_the_render_worker() {
         let id = device_create(None, PAGE_SHIFT_ARM64E).expect("create");
         let slot = device_slot(id).expect("device");
         let inner = slot.inner.lock();
@@ -1718,14 +1771,63 @@ mod tests {
             4,
             crate::model::MMIO_U32,
         ));
-        assert_eq!(slot.gfx_ingress.lock().len(), 1);
+        assert_eq!(
+            slot.gfx_ingress.lock().len(),
+            0,
+            "the ring must not queue behind a held device lock"
+        );
+        assert_ne!(
+            slot.child_doorbell_rung.load(Ordering::Acquire) & (1 << 4),
+            0,
+            "and must be recorded, or an empty queue is just a lost doorbell"
+        );
         drop(inner);
 
         assert!(device_drain(id));
         let inner = slot.inner.lock();
-        assert_eq!(slot.gfx_ingress.lock().len(), 0);
-        assert_ne!(inner.device.state.pending.child_mask & (1 << 4), 0);
+        assert_ne!(
+            inner.device.state.pending.child_mask & (1 << 4),
+            0,
+            "the fold must turn the ring into pending work"
+        );
+        assert_ne!(
+            inner.device.state.active_child_mask & (1 << 4),
+            0,
+            "and into an active channel, or the stranded-FIFO rescue cannot see it"
+        );
+        assert_eq!(
+            inner.device.state.gfx.child_doorbell_rung.load(Ordering::Acquire),
+            0,
+            "the fold consumes the bit rather than replaying it every drain"
+        );
         drop(inner);
+        assert!(device_destroy(id));
+    }
+
+    /// A ring naming no channel is dropped, not shifted by.
+    ///
+    /// `1u32 << channel` is undefined past the word, and the locked handler in
+    /// `runtime::mmio` has always range-checked before shifting. The lock-free
+    /// path is a second implementation of that same guard, so it gets its own
+    /// assertion rather than inheriting the first one's.
+    #[test]
+    fn a_child_doorbell_outside_the_channel_range_rings_nothing() {
+        let id = device_create(None, PAGE_SHIFT_ARM64E).expect("create");
+        let slot = device_slot(id).expect("device");
+        for channel in [0u64, crate::model::MAX_CHANNELS as u64, 0xffff_ffff] {
+            assert!(device_gfx_write(
+                id,
+                crate::model::GFX_REG_CHILD_DOORBELL,
+                channel,
+                crate::model::MMIO_U32,
+            ));
+        }
+        assert_eq!(
+            slot.child_doorbell_rung.load(Ordering::Acquire),
+            0,
+            "channel 0 is the main FIFO and the rest name nothing"
+        );
+        assert_eq!(slot.gfx_ingress.lock().len(), 0, "and none of them queue");
         assert!(device_destroy(id));
     }
 
