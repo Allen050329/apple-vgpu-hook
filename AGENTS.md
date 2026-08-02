@@ -741,6 +741,36 @@ The shape generalises past this one script. When a visual bug report arrives,
 ask what the guest *intended* before asking what the device did; if there is no
 way to read the intent, building one is the fix-enabling work, not a detour.
 
+`scripts/web-content-probe/` is the same shape for goal 8: the page declares a
+palette and its screen rectangles, the host classifies measured means to the
+nearest palette entry, and a lost fill reports as `WHITE` or `BLACK` by name.
+Under layer churn — a subtree of 24 rotated, half-promoted, scrolling children
+rebuilt every 250 ms behind `position: fixed` patches — **goal 8 has not
+reproduced**: Safari 8 captures and Firefox 12 captures, every region correct, on
+a settled x86/PCI guest. That is a small sample against a bug reported as
+occasional, so it bounds nothing; what it establishes is that the ordinary
+compositing path is sound under churn.
+
+**Both of that probe's earlier results were worthless, for opposite reasons, and
+both failure modes are general.** The first churning run reported clean on a page
+whose repaint timer reached the screen with nothing — the churn used viewport
+coordinates inside a `contain: strict` container that clipped them away, so the
+"stressor" was a static page. The next run reported seven of eleven regions
+corrupt in nineteen consecutive captures, and the cause was a macOS sheet dimming
+the window: every colour measured exactly half, and the regions that *passed*
+passed only because halved `BG` and halved `GREEN` are equidistant from their own
+palette entry and from `BLACK`.
+
+So a probe has to witness two things besides its verdict, and this one now does.
+**That its stressor ran**: the page publishes a beat counter, the host refuses to
+start unless it advances, and one churn child (`CHURN_WITNESS`) is declared and
+checked like a patch. **That the frame it measured was the frame it meant to**: a
+least-squares fit of a single scale across all regions, where a tight fit below
+0.9 is a global dim and the capture is discarded, because a real loss is local —
+measured 0.4996 at worst residual 3/255 for the sheet, against residual 187 when
+one region is lost to black. Neither guard is specific to this probe, and a
+"clean" run from an instrument carrying neither is not evidence.
+
 ## Commit Guidelines
 
 Commit only work you wrote. Never commit third-party code or intellectual property, including Apple
