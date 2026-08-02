@@ -871,8 +871,31 @@ pub fn flush_mapping_windows_before_fence<M: HostMemory + HostOps>(
     //
     // What is left is volume. These 116 flushes are 116 whole 1920x1080 frames,
     // 962 MB/s, read back for ~62 presented frames; every phase in
-    // `ReadbackPhase` is proportional to it. Moving fewer bytes, or moving them
-    // without a CPU pass, is the only lever this census leaves open.
+    // `ReadbackPhase` is proportional to it.
+    //
+    // **Reading back less than the whole attachment is measured, and it is not a
+    // lever.** The guest supplies a damage rect and this device carries it
+    // verbatim (`OP_SET_SCISSOR` -> `req.scissor`), so a damage-limited
+    // writeback would be the decoded contract rather than a guess — but
+    // `note_store_damage_coverage` reads `store_damage_texels /
+    // store_attach_texels` at **99.34%** on a driven probe, with half the Stores
+    // carrying no scissor at all and the other half one that spans the
+    // attachment. Partial scissors belong to the small draws *inside* a pass;
+    // the Store that ends a full-screen composite declares the full screen. The
+    // whole rect is worth 0.66%.
+    //
+    // Moving the bytes without a CPU pass is closed too, and by policy rather
+    // than by measurement: it needs `VK_EXT_external_memory_host`, which
+    // `observe::gate::the_host_pointer_import_extension_is_never_requested`
+    // forbids because importing a host pointer over guest RAM gives the host GPU
+    // write access to guest memory.
+    //
+    // What is left is not doing it. Every landing is speculative
+    // (`mapw_fence_flush == surface_flush`) and 99% of what it lands is read by
+    // nothing (`RenderFlushWitness`), so the writeback survives on exactly one
+    // case: a guest CPU read that was never declared. Making *that* observable
+    // is the remaining route, and it is a hypervisor-side change rather than a
+    // device-side one.
     crate::runtime::drain::note_store_route("mapw_fence_pass");
     // Snapshot first: landing one window consumes its overlapping siblings
     // through the fixpoint, so iterating the live map would borrow it across a

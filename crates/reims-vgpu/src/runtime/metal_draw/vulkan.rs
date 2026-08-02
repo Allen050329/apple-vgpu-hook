@@ -6266,8 +6266,34 @@ fn arm_surface_deferred_store_with<M: HostMemory + HostOps>(
 /// would describe neither.
 ///
 /// A rate, not a refusal: a full-coverage Store is entirely ordinary.
-#[cfg(feature = "backend-vulkan")]
-fn note_store_damage_coverage(req: &DrawEncodeRequest, width: u32, height: u32) {
+///
+/// # Read, and the answer closes the lever
+///
+/// A 30 s driven Safari probe on the x86/PCI/Vulkan pathway:
+///
+/// ```text
+/// store_damage_full            1891
+/// store_damage_unscissored     1881
+/// store_damage_le10pct           32
+/// store_damage_texels    7766070272
+/// store_attach_texels    7817714977
+/// ```
+///
+/// **99.34% of the texels a Store arms are texels it covers.** Half the Stores
+/// carry no scissor at all and the other half carry one that spans the whole
+/// attachment; the 32 small ones are 0.8% of the population and 0.66% of the
+/// area. A damage-limited writeback would save two thirds of one percent.
+///
+/// So the guess this measurement existed to test is wrong, and it was a
+/// reasonable guess: 35% of *all* draws are scissored, and a compositor that
+/// repaints only what changed is exactly what one expects behind that number.
+/// It does not carry to the Store. The partial scissors belong to the many
+/// small draws *inside* a pass — an icon, a glyph run, a window's own layer —
+/// while the Store that ends a full-screen composite declares the full screen.
+///
+/// Keep the census on. It is four counters a second, it is the denominator for
+/// any future claim that the flush rail could move fewer bytes, and if the
+/// guest's compositing strategy ever changes this is where it would show.
     let Some((route, covered, attach)) = store_damage_bucket(req.scissor, width, height) else {
         return;
     };
