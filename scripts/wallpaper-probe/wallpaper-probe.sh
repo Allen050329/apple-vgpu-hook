@@ -72,11 +72,17 @@ ssh -o ConnectTimeout=8 -o BatchMode=yes "$GUEST" true 2>/dev/null || {
 
 # Read the screen from the guest rather than assuming it: the probe image has to
 # be exactly the desktop's size or macOS scales it and every bar boundary moves.
-BOUNDS=$(osa 'tell application "Finder" to get bounds of window of desktop' || true)
-SCR_W=$(echo "$BOUNDS" | awk -F', *' '{print $3}')
-SCR_H=$(echo "$BOUNDS" | awk -F', *' '{print $4}')
+#
+# Not from Finder. `tell application "Finder" to get bounds of window of desktop`
+# is the obvious spelling and it answers `AppleEvent timed out (-1712)` on this
+# guest, which as a first step reads like the guest being wedged rather than like
+# one scripting target being unavailable.
+RES=$(ssh -o BatchMode=yes "$GUEST" \
+  "system_profiler SPDisplaysDataType 2>/dev/null | grep -m1 -i 'Resolution:'" || true)
+SCR_W=$(echo "$RES" | sed -n 's/.*Resolution: *\([0-9]*\) *x *\([0-9]*\).*/\1/p')
+SCR_H=$(echo "$RES" | sed -n 's/.*Resolution: *\([0-9]*\) *x *\([0-9]*\).*/\2/p')
 case "${SCR_W:-}${SCR_H:-}" in
-  ''|*[!0-9]*) say "could not read the desktop size from the guest (got '$BOUNDS')" >&2; exit 2 ;;
+  ''|*[!0-9]*) say "could not read the desktop size from the guest (got '$RES')" >&2; exit 2 ;;
 esac
 say "guest desktop ${SCR_W}x${SCR_H}, $((${#PATTERN})) bars of $((SCR_W * 100 / ${#PATTERN}))/100 px"
 
