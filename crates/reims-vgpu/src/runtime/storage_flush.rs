@@ -341,6 +341,15 @@ pub fn flush_mapping_for_guest_read<M: HostMemory + HostOps>(
     mapping_id: u32,
 ) -> (bool, u32) {
     crate::runtime::drain::note_store_route("guest_read_declared");
+    // Does the declaration name a surface the eager rail actually writes back?
+    // `guest_read_dry` cannot say — the fence always empties the windows first,
+    // so every declaration is dry either way. This split can, and it is the
+    // number that decides whether the writeback could be demand-driven at all.
+    crate::runtime::drain::note_store_route(if state.fence_flushed_mappings.contains(&mapping_id) {
+        "guest_read_on_flushed_mid"
+    } else {
+        "guest_read_on_other_mid"
+    });
     let keyed = state
         .compute_deferred_flush
         .keys()
@@ -992,6 +1001,7 @@ pub fn flush_mapping_windows_before_fence<M: HostMemory + HostOps>(
             continue;
         }
         crate::runtime::drain::note_store_route("mapw_fence_flush");
+        state.fence_flushed_mappings.insert(key.mapping_id);
         flush_intersecting(
             state,
             host,
@@ -4296,6 +4306,60 @@ mod tests {
             crate::runtime::drain::store_route_count("guest_read_landed") - landed,
             0,
             "nothing armed lands nothing"
+        );
+    }
+
+    /// A declaration is attributed by whether the fence rail has ever written
+    /// back that mapping, and the two arms must be exclusive.
+    ///
+    /// This is the split that decides whether the eager writeback could become
+    /// demand-driven, and it is the one `guest_read_dry` cannot make — the fence
+    /// empties the windows before any declaration arrives, so a declaration on a
+    /// surface the fence just wrote and one on an unrelated surface look
+    /// identical from the dry count. A mis-wired split here would read as "the
+    /// guest declares on surfaces we never write back" and close a month of work
+    /// the wrong way, so both arms are driven through the same fixture.
+    #[test]
+    fn a_declaration_is_attributed_to_whether_the_fence_writes_that_mapping() {
+        use crate::runtime::host::FakeHost;
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+        for mid in [7u32, 9u32] {
+            let m = state.mappings.entry(mid).or_default();
+            m.mapped = true;
+            m.page_entries = vec![(0x2000u32 << 2) | 1];
+        }
+
+        let other0 = crate::runtime::drain::store_route_count("guest_read_on_other_mid");
+        let flushed0 = crate::runtime::drain::store_route_count("guest_read_on_flushed_mid");
+
+        // Nothing has been written back yet: both mappings are "other".
+        super::flush_mapping_for_guest_read(&mut state, &mut host, 9);
+        assert_eq!(
+            crate::runtime::drain::store_route_count("guest_read_on_other_mid") - other0,
+            1,
+            "a mapping the fence never wrote is not a flushed mid"
+        );
+        assert_eq!(
+            crate::runtime::drain::store_route_count("guest_read_on_flushed_mid") - flushed0,
+            0,
+            "nothing has been fence-flushed yet"
+        );
+
+        // Once the fence has landed a window on 9, a declaration on 9 counts as
+        // covered and one on 7 still does not.
+        state.fence_flushed_mappings.insert(9);
+        super::flush_mapping_for_guest_read(&mut state, &mut host, 9);
+        super::flush_mapping_for_guest_read(&mut state, &mut host, 7);
+        assert_eq!(
+            crate::runtime::drain::store_route_count("guest_read_on_flushed_mid") - flushed0,
+            1,
+            "a declaration on a fence-written mapping must count as covered"
+        );
+        assert_eq!(
+            crate::runtime::drain::store_route_count("guest_read_on_other_mid") - other0,
+            2,
+            "the arms must be exclusive — every call lands in exactly one"
         );
     }
 

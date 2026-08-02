@@ -1822,6 +1822,18 @@ pub struct DeviceState {
     /// change costs one spurious no-op flush call, never a wrong flush — the
     /// windows map stays the single flush authority.
     pub deferred_alias_pages: DeferredWindows<u32, std::collections::HashSet<u64>>,
+    /// Mapping ids the fence-bound writeback has landed a render window on,
+    /// for one measurement and nothing else: does the guest declare its CPU
+    /// reads on the same surfaces this device writes back eagerly?
+    ///
+    /// That question gates whether the writeback could become demand-driven,
+    /// and the `guest_read_dry` count alone cannot answer it — the fence always
+    /// runs first, so every declaration is dry whether or not it names a
+    /// surface the fence just wrote. Comparing the declaration's mapping
+    /// against this set can. Bounded by the number of mappings that ever carry
+    /// a render window, which is single digits on a driven desktop; nothing
+    /// reads it to make a flush decision.
+    pub fence_flushed_mappings: std::collections::BTreeSet<u32>,
     /// Per-mid last write **command class** (ClearOnly vs Composite) — present path.
     pub surface_write_kind: BTreeMap<u32, SurfaceWriteKind>,
     pub present: PresentState,
@@ -2007,6 +2019,7 @@ impl DeviceState {
             host_linear_textures: BTreeMap::new(),
             compute_storage_residency: BTreeMap::new(),
             compute_deferred_flush: BTreeMap::new(),
+            fence_flushed_mappings: std::collections::BTreeSet::new(),
             surface_deferred_seq: 0,
             deferred_alias_pages: DeferredWindows::new(),
             surface_write_kind: BTreeMap::new(),

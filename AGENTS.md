@@ -713,6 +713,34 @@ one where a rate is available at all. For the other thirteen the occurrence rate
 is not measured, and "the counts are stable across boots" is a statement about
 distinct instances only.
 
+### A Screenshot Cannot Say Who Dropped The Pixels
+
+Several open goals are reported as screenshots: web content whose background
+disappears, a logout window missing its buttons, a wallpaper shifted with a black
+band. A screenshot shows that something is not on screen. It cannot show whether
+the guest declined to draw it or whether this device lost it on the way, and
+those are different bugs with different owners. Staring at the image does not
+separate them on the tenth look either.
+
+Two independent observations of the same frame do. The guest's accessibility API
+reports what it believes it drew and at what rectangles — that reads the guest's
+own view hierarchy, upstream of everything here — and the host capture is then
+measured at exactly those rectangles.
+
+```sh
+scripts/modal-button-probe/modal-button-probe.sh -n 20 --appearance alternate --keep /tmp/mbp
+```
+
+Exits 1 on any button the guest declared and the frame does not show. It
+currently finds none: 20 trials alternating dark and light, 40 button checks, all
+drawn. So it is the instrument, not a result — and note it summons the **log-out**
+modal, which is scriptable and dismissable, not the Control-Power one the bug
+report names. Read its README before quoting a result from it.
+
+The shape generalises past this one script. When a visual bug report arrives,
+ask what the guest *intended* before asking what the device did; if there is no
+way to read the intent, building one is the fix-enabling work, not a detour.
+
 ## Commit Guidelines
 
 Commit only work you wrote. Never commit third-party code or intellectual property, including Apple
