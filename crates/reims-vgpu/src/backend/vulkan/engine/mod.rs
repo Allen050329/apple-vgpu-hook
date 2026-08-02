@@ -825,6 +825,35 @@ enum ReadbackResult {
     Leased { token: u64, ptr: usize, len: usize },
 }
 
+/// Returns an unhanded-on readback lease when its scope exits.
+///
+/// The lease is taken before the first of six fallible Vulkan calls, so there
+/// are six early returns between checking it out and having anything to give it
+/// to. A lease dropped on one of those paths is not a correctness fault on any
+/// read — nothing is borrowing it — but it strands the slot for the process
+/// lifetime and makes every later teardown wait out its whole quiesce budget,
+/// which presents as a hang rather than as a leak. One guard covers all six.
+struct ReadbackLeaseGuard(Option<(u64, usize)>);
+
+impl ReadbackLeaseGuard {
+    fn new(lease: Option<(u64, usize)>) -> Self {
+        Self(lease)
+    }
+
+    /// Take the lease out, so the caller owns the obligation from here on.
+    fn disarm(&mut self) -> Option<(u64, usize)> {
+        self.0.take()
+    }
+}
+
+impl Drop for ReadbackLeaseGuard {
+    fn drop(&mut self) {
+        if let Some((token, _)) = self.0.take() {
+            pools::return_readback_lease(token);
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 unsafe fn copy_image_level0_to_host(
     ctx: &context::DeviceContext,
@@ -879,8 +908,35 @@ unsafe fn copy_image_level0_to_host_delivered(
     delivery: ReadbackDelivery,
 ) -> Result<ReadbackResult, DrawError> {
     let submit_started = std::time::Instant::now();
-    let readback = pools.acquire_readback(ctx, rb_size, counters)?;
+    // The slot is claimed *after* the entry, and the order is load-bearing.
+    //
+    // `begin_entry` submits any open draw batch first, and that flush runs
+    // `seal_entry`, which moves whatever is in `readback_live` into the
+    // **batch's** pending cleanup. A slot acquired before it therefore ends up
+    // owned by a ring entry that has nothing to do with the copy about to fill
+    // it, and is returned to the free list when the batch's fence signals —
+    // which is a fence submitted *earlier* than this copy's. Nothing between
+    // this function's submit and its own fence wait can retire a ring slot, so
+    // that never actually handed the buffer out from under a live copy, but it
+    // was one interleaved `begin_entry` away from doing so.
+    //
+    // For the leasing path it was not latent at all: the lease found
+    // `readback_live` already empty and silently declined on exactly the busy
+    // frames the rail exists for. A live boot read `render_flush_copied`
+    // outnumbering `render_flush_leased` 5:1 on a host whose readback memory is
+    // cached, which is the only symptom that mis-ordering has.
     let (cb, fence) = pools.begin_entry(ctx, counters)?;
+    let readback = pools.acquire_readback(ctx, rb_size, counters)?;
+    // Before this function's own `seal_entry`, for the same reason: that call
+    // would move the slot into this entry's cleanup and hand it back to
+    // `readback_free` when the entry retires, under a borrow still reading it.
+    // A leased slot belongs to no ring entry — the copy's fence is waited below
+    // and the lease is returned explicitly.
+    let mut lease = ReadbackLeaseGuard::new(if delivery == ReadbackDelivery::Lease {
+        pools.lease_readback()
+    } else {
+        None
+    });
     ctx.device
         .reset_command_buffer(cb, ash::vk::CommandBufferResetFlags::empty())
         .map_err(|e| DrawError::VkCall(VkCall::new(ops.reset_cb, e)))?;
@@ -952,16 +1008,6 @@ unsafe fn copy_image_level0_to_host_delivered(
     ctx.device
         .queue_submit(queue, &[si], fence)
         .map_err(|e| DrawError::VkCall(VkCall::new(ops.submit, e)))?;
-    // Before `seal_entry`, which is what would otherwise move this slot into
-    // the submitted entry's pending cleanup and hand it back to `readback_free`
-    // when that entry retires — under a borrow that is still reading it.
-    //
-    // A lease that cannot be taken (an unmapped slot) is not an error: the
-    // delivery falls back to the copy below, which is what every other caller
-    // of this function does anyway.
-    let lease = (delivery == ReadbackDelivery::Lease)
-        .then(|| pools.lease_readback())
-        .flatten();
     let cleanup = pools.seal_entry(Vec::new(), Vec::new());
     pools.finish_entry_async(cleanup);
     // Split three ways rather than timed as a whole: the submit and the copy
@@ -973,21 +1019,13 @@ unsafe fn copy_image_level0_to_host_delivered(
         submit_started.elapsed().as_micros() as u64,
     );
     let fence_started = std::time::Instant::now();
-    if let Err(e) = pools.wait_entry_fence(ctx, counters, fence) {
-        // The lease is out at this point, so every exit from here on owes a
-        // return. Leaving one behind strands the slot for the process lifetime
-        // and makes the next teardown wait out its whole quiesce budget.
-        if let Some((token, _)) = lease {
-            pools::return_readback_lease(token);
-        }
-        return Err(e);
-    }
+    pools.wait_entry_fence(ctx, counters, fence)?;
     note_readback_phase(
         ReadbackPhase::Fence,
         fence_started.elapsed().as_micros() as u64,
     );
     let map_started = std::time::Instant::now();
-    let out = match lease {
+    let out = match lease.disarm() {
         // The mapping is already established for the slot's lifetime, so all
         // this owes is the invalidate a non-coherent readback owes any reader.
         // What `ReadbackPhase::Map` measures on this arm is therefore that call

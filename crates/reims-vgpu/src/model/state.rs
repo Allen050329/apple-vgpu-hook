@@ -511,8 +511,20 @@ pub struct RenderFlushWitness {
     /// A render flush has landed this mapping at least once, so the two flags
     /// below describe a real flush rather than a mapping that never had one.
     pub landed: bool,
+    /// The flush stored a host surface cache copy, so `cache_unread` below is
+    /// a statement about a copy that exists.
+    ///
+    /// A flush whose frame was borrowed from the engine's readback buffer
+    /// stores no cache copy at all — it drops the entry instead, because the
+    /// memory holding the frame goes back to the pool
+    /// ([`crate::runtime::mapping_write::write_bgra8_uncached`]). Scoring one
+    /// of those as an unread cache copy would report a copy that was never
+    /// made, and `render_flush_cache_unread` is exactly the number a future
+    /// reader would use to decide whether the cache leg is worth keeping. So
+    /// the leg is only counted where there is a leg.
+    pub cache_stored: bool,
     /// No host-side reader has taken the host surface cache copy since the
-    /// flush stored it.
+    /// flush stored it. Meaningful only where `cache_stored`.
     pub cache_unread: bool,
     /// No host-side reader has gathered the guest pages since the flush wrote
     /// them.

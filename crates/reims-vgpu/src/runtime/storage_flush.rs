@@ -907,30 +907,56 @@ pub fn flush_mapping_windows_before_fence<M: HostMemory + HostOps>(
     // is the remaining route, and it is a hypervisor-side change rather than a
     // device-side one.
     //
-    // # One device-side step is still available, and it is not on that list
+    // # One of the two CPU passes over the result is gone; the other is the floor
     //
-    // The four closed levers are all about the readback. The *number of CPU
-    // passes over the result* is a separate cost and a reducible one. A flush
-    // makes two: `readback_split map_us` copies the mapped staging buffer into
-    // a `Vec<u8>`, then `write_split land_us` scatters that Vec into guest
-    // pages — about 0.82 ms and 1.06 ms per 8 MB frame, together ~250 ms of a
-    // loaded second, as large as the fence.
+    // The four closed levers above are all about the readback. The *number of
+    // CPU passes over its result* was a separate cost, and it was reducible.
     //
-    // The first pass exists only so the host surface cache can hold an
-    // `Arc<Vec<u8>>`, and `render_flush_cache_used` says 0.4% of those entries
-    // are ever read. Scattering straight out of the mapped readback buffer
-    // would delete it. What that needs is a borrow that outlives the engine
-    // lock: the mapped pointer stays valid until `vkUnmapMemory`, so only the
-    // pool's recycling of the slot has to be held off, not the lock — a
-    // checked-out flag on the readback slot and a guard that returns it. Do
-    // *not* simply hold the engine lock across the scatter; the host window's
-    // present path takes it, and adding a millisecond per flush at this rate
-    // would move the stall onto the window instead of removing it.
+    // A flush used to make two passes over ~8 MB: `readback_split map_us` copied
+    // the mapped staging buffer into a `Vec<u8>`, then `write_split land_us`
+    // scattered that Vec into guest pages — about 0.82 ms and 1.06 ms per frame,
+    // together ~250 ms of a loaded second, as large as the fence. The first
+    // existed only so the host surface cache could hold an `Arc<Vec<u8>>`, and
+    // `render_flush_cache_used` prices that entry at 0.4 %.
     //
-    // The cache entry must then be **invalidated**, not left behind. A reader
-    // that hits a stale entry is served an old frame with no witness saying so,
-    // which is the goal-8 shape. Falling through to the guest pages this flush
-    // just wrote is correct by construction.
+    // It is deleted. `read_target_leased` lends the staging buffer through
+    // [`crate::backend::vulkan::engine::LeasedFrame` ] and the scatter reads it
+    // in place. Measured on a driven x86/PCI boot, three consecutive one-second
+    // windows at 120 flushes each:
+    //
+    // ```text
+    // readback_split  map_us=0 map=120 map_max_us=0
+    // write_split     stage_us=0 stage=0 land_us=104832 land=120 cache_us=0
+    // store_routes    render_flush_leased=120 surface_flush=120
+    // ```
+    //
+    // `map_max_us=0` is the part worth keeping: not an average that rounded
+    // down, but no single flush in 360 spending a microsecond there. What the
+    // phase still times on that arm is the `vkInvalidateMappedMemoryRanges` a
+    // non-coherent readback owes, and this host's readback memory is coherent.
+    //
+    // Two things make the borrow sound and both are load-bearing. The slot is
+    // taken out of every list that could hand it to a GPU copy — including the
+    // ring entry's pending cleanup, which is why the lease is claimed before
+    // `seal_entry` — and the holder takes no engine lock, which is why
+    // `flush_render_one` runs `flush_windows_under_bgra8_write` *before* it
+    // acquires the frame rather than letting the writeback's own
+    // `flush_intersecting` read another resident from inside the borrow. Do
+    // *not* simply hold the engine lock across the scatter instead: the host
+    // window's present path takes it, and adding a millisecond per flush at this
+    // rate would move the stall onto the window.
+    //
+    // The cache entry is **invalidated**, not left behind. A reader that hits a
+    // stale entry is served an old frame with no witness saying so, which is the
+    // corruption shape the fence binding exists to close. Falling through to the
+    // guest pages this flush just wrote is correct by construction, and the boot
+    // above logged zero `present_capture FAIL` and zero `deferred_flush_lost` on
+    // the leased rail.
+    //
+    // What is left is the floor. `land_us` is 0.87 ms per frame at ~1 GB/s of
+    // cache-cold scattered writes into guest RAM, and there is no second pass to
+    // remove — the only way past it is not to write the bytes at all, which is
+    // the demand-driven route named above.
     crate::runtime::drain::note_store_route("mapw_fence_pass");
     // Snapshot first: landing one window consumes its overlapping siblings
     // through the fixpoint, so iterating the live map would borrow it across a
@@ -990,6 +1016,7 @@ pub fn note_render_flush_pages_read(state: &mut DeviceState, mapping_id: u32) {
 pub(crate) fn note_render_flush_landed(
     state: &mut DeviceState,
     mapping_id: u32,
+    cache_stored: bool,
 ) -> Option<crate::model::RenderFlushWitness> {
     use crate::runtime::drain::note_store_route;
     let now_us = crate::observe::elapsed_us();
@@ -998,7 +1025,8 @@ pub(crate) fn note_render_flush_landed(
         &mut m.render_flush,
         crate::model::RenderFlushWitness {
             landed: true,
-            cache_unread: true,
+            cache_stored,
+            cache_unread: cache_stored,
             pages_unread: true,
             landed_us: now_us,
         },
@@ -1014,11 +1042,16 @@ pub(crate) fn note_render_flush_landed(
         1000..=8332 => "render_flush_age_sub_frame",
         _ => "render_flush_age_frame_plus",
     });
-    note_store_route(if prior.cache_unread {
-        "render_flush_cache_unread"
-    } else {
-        "render_flush_cache_used"
-    });
+    // Only where the previous flush actually stored one. A borrowed-frame flush
+    // publishes nothing to the cache, and counting its absent copy as unread
+    // would inflate the very number that prices the cache leg.
+    if prior.cache_stored {
+        note_store_route(if prior.cache_unread {
+            "render_flush_cache_unread"
+        } else {
+            "render_flush_cache_used"
+        });
+    }
     note_store_route(if prior.pages_unread {
         "render_flush_pages_unread"
     } else {
@@ -2166,6 +2199,12 @@ fn flush_render_one<M: HostMemory + HostOps>(
         crate::runtime::drain::ReadbackPhase::Write,
         write_started.elapsed().as_micros() as u64,
     );
+    // Whether this flush left a host surface cache copy behind, which decides
+    // whether the witness has a cache leg to score at all. Two writebacks leave
+    // none: a borrowed frame drops the entry because the memory holding it goes
+    // back to the pool, and a skipping write drops it because the guest's own
+    // stores are in the pages and no host-side copy is their content any more.
+    let cache_stored = matches!(&frame, FlushFrame::Owned(_)) && preserve.is_empty();
     // End the lease before anything below reaches the engine again — the
     // resident re-stamp does. A holder that blocks on the engine lock while a
     // teardown is waiting for exactly this lease is the deadlock `LeasedFrame`
@@ -2207,9 +2246,9 @@ fn flush_render_one<M: HostMemory + HostOps>(
                 crate::backend::vulkan::engine::stamp_resident_content_epoch(&identity, epoch);
             }
         }
-        // Both copies this flush just made are unread until something reads
-        // them; whatever was left of the previous flush's is scored now.
-        let _ = note_render_flush_landed(state, key.mapping_id);
+        // Every copy this flush just made is unread until something reads it;
+        // whatever was left of the previous flush's is scored now.
+        let _ = note_render_flush_landed(state, key.mapping_id, cache_stored);
     }
     crate::runtime::drain::note_drain_phase(
         crate::runtime::drain::DrainPhase::Flush(crate::runtime::drain::FlushRail::Render),
@@ -2566,7 +2605,7 @@ mod render_flush_witness_tests {
     #[test]
     fn the_first_landing_of_a_mapping_scores_nothing() {
         let mut state = state_with_mapping(7);
-        assert_eq!(note_render_flush_landed(&mut state, 7), None);
+        assert_eq!(note_render_flush_landed(&mut state, 7, true), None);
         let w = state.mappings[&7].render_flush;
         assert_eq!(
             (w.landed, w.cache_unread, w.pages_unread),
@@ -2580,10 +2619,10 @@ mod render_flush_witness_tests {
     #[test]
     fn a_landing_stamps_the_time_it_landed() {
         let mut state = state_with_mapping(7);
-        note_render_flush_landed(&mut state, 7);
+        note_render_flush_landed(&mut state, 7, true);
         let first = state.mappings[&7].render_flush.landed_us;
         assert!(first > 0, "landing must stamp a live clock reading");
-        note_render_flush_landed(&mut state, 7);
+        note_render_flush_landed(&mut state, 7, true);
         assert!(
             state.mappings[&7].render_flush.landed_us >= first,
             "each landing re-stamps"
@@ -2595,8 +2634,8 @@ mod render_flush_witness_tests {
     #[test]
     fn a_landing_nothing_read_scores_both_legs_unread() {
         let mut state = state_with_mapping(7);
-        note_render_flush_landed(&mut state, 7);
-        let scored = note_render_flush_landed(&mut state, 7).expect("second landing scores");
+        note_render_flush_landed(&mut state, 7, true);
+        let scored = note_render_flush_landed(&mut state, 7, true).expect("second landing scores");
         assert!(scored.cache_unread && scored.pages_unread);
     }
 
@@ -2606,16 +2645,51 @@ mod render_flush_witness_tests {
     #[test]
     fn each_leg_is_cleared_only_by_its_own_reader() {
         let mut state = state_with_mapping(7);
-        note_render_flush_landed(&mut state, 7);
+        note_render_flush_landed(&mut state, 7, true);
         note_render_flush_cache_read(&mut state, 7);
-        let scored = note_render_flush_landed(&mut state, 7).expect("second landing scores");
+        let scored = note_render_flush_landed(&mut state, 7, true).expect("second landing scores");
         assert!(!scored.cache_unread, "cache read must clear the cache leg");
         assert!(scored.pages_unread, "cache read must not clear the pages leg");
 
         note_render_flush_pages_read(&mut state, 7);
-        let scored = note_render_flush_landed(&mut state, 7).expect("third landing scores");
+        let scored = note_render_flush_landed(&mut state, 7, true).expect("third landing scores");
         assert!(!scored.pages_unread, "pages read must clear the pages leg");
         assert!(scored.cache_unread, "pages read must not clear the cache leg");
+    }
+
+    /// A flush that stored no cache copy has no cache leg to score.
+    ///
+    /// `render_flush_cache_unread` is the number a future reader would use to
+    /// decide whether the cache leg is worth keeping, and a borrowed-frame flush
+    /// stores nothing — it drops the entry, because the memory holding its frame
+    /// goes straight back to the readback pool. Arming the leg anyway would
+    /// report a copy that was never made, once per flush, at the rate the guest
+    /// paints: a counter that looks like a measurement and is an artefact.
+    ///
+    /// The pages leg is asserted alongside it, because it is the one that stays
+    /// meaningful and the two must not be conflated.
+    #[test]
+    fn a_flush_that_stored_no_cache_copy_arms_no_cache_leg() {
+        let mut state = state_with_mapping(7);
+        note_render_flush_landed(&mut state, 7, false);
+        let w = state.mappings[&7].render_flush;
+        assert!(!w.cache_stored, "no copy was stored");
+        assert!(
+            !w.cache_unread,
+            "an absent copy must not be armed as an unread one"
+        );
+        assert!(w.pages_unread, "the guest pages were still written");
+
+        // And the scoring of the previous landing skips the leg rather than
+        // reporting it either way.
+        let scored = note_render_flush_landed(&mut state, 7, true).expect("second landing scores");
+        assert!(!scored.cache_stored);
+
+        // A stored copy still scores normally, so the gate narrows the count
+        // rather than silencing it.
+        note_render_flush_cache_read(&mut state, 7);
+        let scored = note_render_flush_landed(&mut state, 7, true).expect("third landing scores");
+        assert!(scored.cache_stored && !scored.cache_unread);
     }
 
     /// A read attributed to a mapping the mapper no longer holds is dropped
@@ -2627,7 +2701,7 @@ mod render_flush_witness_tests {
         note_render_flush_cache_read(&mut state, 9);
         note_render_flush_pages_read(&mut state, 9);
         assert!(!state.mappings.contains_key(&9));
-        assert_eq!(note_render_flush_landed(&mut state, 9), None);
+        assert_eq!(note_render_flush_landed(&mut state, 9, true), None);
     }
 }
 
