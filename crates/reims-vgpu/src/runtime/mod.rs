@@ -19,6 +19,10 @@ pub mod drain;
 pub mod exec;
 /// Product-path event + encoder fence sync (event/blit/compute/render domains).
 pub mod fence_exec;
+/// Is the hypervisor's guest-write generation a sound cache key for the
+/// zero-copy sampled gathers? Measurement, not policy.
+#[cfg(feature = "backend-vulkan")]
+pub mod gather_witness;
 /// Guest-physical control-plane writes via HostOps map_pages.
 pub mod gpa_map;
 /// Task GVA → guest RAM reads.

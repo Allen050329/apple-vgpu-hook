@@ -1739,6 +1739,12 @@ pub struct DeviceState {
     /// ([`GUEST_LINEAR_MEMO_BYTE_CAP`]): a cap crossing evicts the least-recently
     /// -used entries down to a low-water mark, never bulk-clearing the hot set.
     pub guest_linear_memo: LruBytesMemo<(u32, u64, u32, u32, u16), GuestLinearMemo>,
+    /// Whether the hypervisor's guest-write generation would be a sound "these
+    /// texels did not change" key for the zero-copy sampled gathers, measured
+    /// against the bytes themselves. See
+    /// [`crate::runtime::gather_witness`] — it selects no behaviour.
+    #[cfg(feature = "backend-vulkan")]
+    pub gather_witness: crate::runtime::gather_witness::GatherWitness,
     /// Monotonic source for every sampled-content generation this device
     /// hands the engine. Read only through
     /// [`DeviceState::next_sampled_content_generation`].
@@ -2015,6 +2021,8 @@ impl DeviceState {
             gva_resident_backing: std::collections::BTreeMap::new(),
             retired_gva_windows: Vec::new(),
             guest_linear_memo: LruBytesMemo::new(GUEST_LINEAR_MEMO_BYTE_CAP),
+            #[cfg(feature = "backend-vulkan")]
+            gather_witness: crate::runtime::gather_witness::GatherWitness::default(),
             sampled_content_gen: 0,
             guest_linear_scratch: Vec::new(),
             type5_view_memo: LruBytesMemo::new(GUEST_LINEAR_MEMO_BYTE_CAP),

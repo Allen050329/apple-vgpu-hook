@@ -2078,20 +2078,24 @@ fn guest_run_alias_available<M: HostOps>(host: &M) -> bool {
     false
 }
 
-/// Walk `span` bytes of `task_id`'s GVA space from `gva` and return the
-/// packed guest-RAM runs covering it (GPA-contiguous stretches coalesced and
-/// mapped to stable host pointers). `None` when any page is unmapped or the
-/// mapping is incomplete. Shared by the sampled and buffer zero-copy rails;
-/// callers must land intersecting deferred stores first and verify import
-/// coverage per run.
+/// Walk `span` bytes of `task_id`'s GVA space from `gva` and return the guest
+/// pages covering it alongside the packed guest-RAM runs over them
+/// (GPA-contiguous stretches coalesced and mapped to stable host pointers).
+/// `None` when any page is unmapped or the mapping is incomplete. Shared by the
+/// sampled and buffer zero-copy rails; callers must land intersecting deferred
+/// stores first and verify import coverage per run.
+///
+/// The page list rides out with the runs because a caller that wants to say
+/// anything about the window's *contents* over time needs the pages, not the
+/// host pointers: guest-write tracking is registered per page set.
 #[cfg(feature = "backend-vulkan")]
-fn task_gva_guest_runs<M: HostMemory + HostOps>(
+fn task_gva_guest_run_window<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &mut M,
     task_id: u32,
     gva: u64,
     span: u64,
-) -> Option<Vec<crate::backend::vulkan::engine::GuestRun>> {
+) -> Option<(Vec<u64>, Vec<crate::backend::vulkan::engine::GuestRun>)> {
     if !guest_run_alias_available(host) {
         return None;
     }
@@ -2100,7 +2104,21 @@ fn task_gva_guest_runs<M: HostMemory + HostOps>(
     if gpas.len() as u64 != gva_mem::pages_spanned(gva, span, page) {
         return None;
     }
-    coalesce_pages_to_runs(host, &gpas, page, gva % page, span)
+    let runs = coalesce_pages_to_runs(host, &gpas, page, gva % page, span)?;
+    Some((gpas, runs))
+}
+
+/// [`task_gva_guest_run_window`] for callers with nothing to say about the
+/// window's page set.
+#[cfg(feature = "backend-vulkan")]
+fn task_gva_guest_runs<M: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &mut M,
+    task_id: u32,
+    gva: u64,
+    span: u64,
+) -> Option<Vec<crate::backend::vulkan::engine::GuestRun>> {
+    task_gva_guest_run_window(state, host, task_id, gva, span).map(|(_, runs)| runs)
 }
 
 /// Coalesce GPA-contiguous stretches of `window` into packed host-VA runs
@@ -2172,7 +2190,9 @@ fn strided_window_extent(w: u32, h: u32, bpp: u64, bpr: u64) -> Option<(u64, u32
 }
 
 /// Gather `span` bytes from `base_off` into mapping `mid`'s guest pages as host
-/// runs, landing any deferred writeback that aliases them first.
+/// runs, landing any deferred writeback that aliases them first. Returns the
+/// window's own page list beside the runs, for the same reason
+/// [`task_gva_guest_run_window`] does.
 ///
 /// Shared by the type-11 and type-5 sampled rails, which reach the same pages
 /// through different window math. The flush is the coherence rule the CPU
@@ -2185,7 +2205,7 @@ fn mapping_window_guest_runs<M: HostMemory + HostOps>(
     mid: u32,
     base_off: u64,
     span: u64,
-) -> Option<Vec<crate::backend::vulkan::engine::GuestRun>> {
+) -> Option<(Vec<u64>, Vec<crate::backend::vulkan::engine::GuestRun>)> {
     if !guest_run_alias_available(host) {
         return None;
     }
@@ -2199,7 +2219,8 @@ fn mapping_window_guest_runs<M: HostMemory + HostOps>(
     let head_off = base_off % page;
     let need_pages = (head_off + span).div_ceil(page) as usize;
     let window = gpas.get(first_page..first_page + need_pages)?;
-    coalesce_pages_to_runs(host, window, page, head_off, span)
+    let runs = coalesce_pages_to_runs(host, window, page, head_off, span)?;
+    Some((window.to_vec(), runs))
 }
 
 
@@ -2366,7 +2387,20 @@ fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
     // flush completes before this draw's submit).
     crate::runtime::storage_flush::flush_intersecting_task_gva(state, host, task_id, gva, span);
     // Fixed per-texture window: the walk covers exactly the bound span.
-    let runs = task_gva_guest_runs(state, host, task_id, gva, span)?;
+    let (gpas, runs) = task_gva_guest_run_window(state, host, task_id, gva, span)?;
+    let page = state.page_size() as usize;
+    crate::runtime::gather_witness::note_gather(
+        &mut state.gather_witness,
+        host,
+        crate::runtime::gather_witness::GatherRail::Linear,
+        crate::runtime::gather_witness::GatherKey::TaskGva { task_id, gva },
+        crate::runtime::gather_witness::GatherWindow {
+            gpas: &gpas,
+            runs: &runs,
+            span,
+            page_size: page,
+        },
+    );
     Some((
         w,
         h,
@@ -2431,7 +2465,20 @@ fn try_type11_sample_zero_copy<M: HostMemory + HostOps>(
     if span < ZERO_COPY_SAMPLED_MIN_BYTES {
         return None;
     }
-    let runs = mapping_window_guest_runs(state, host, mid, base_off, span)?;
+    let (gpas, runs) = mapping_window_guest_runs(state, host, mid, base_off, span)?;
+    let page = state.page_size() as usize;
+    crate::runtime::gather_witness::note_gather(
+        &mut state.gather_witness,
+        host,
+        crate::runtime::gather_witness::GatherRail::Type11,
+        crate::runtime::gather_witness::GatherKey::Mapping { mid, base_off },
+        crate::runtime::gather_witness::GatherWindow {
+            gpas: &gpas,
+            runs: &runs,
+            span,
+            page_size: page,
+        },
+    );
     Some(SampledSourceRequest::GuestRuns(
         engine::GuestRunSource {
             runs: std::sync::Arc::new(runs),
@@ -2504,7 +2551,20 @@ fn try_type5_sample_zero_copy<M: HostMemory + HostOps>(
     if span < ZERO_COPY_SAMPLED_MIN_BYTES {
         return None;
     }
-    let runs = mapping_window_guest_runs(state, host, mid, base_off, span)?;
+    let (gpas, runs) = mapping_window_guest_runs(state, host, mid, base_off, span)?;
+    let page = state.page_size() as usize;
+    crate::runtime::gather_witness::note_gather(
+        &mut state.gather_witness,
+        host,
+        crate::runtime::gather_witness::GatherRail::Type5,
+        crate::runtime::gather_witness::GatherKey::Mapping { mid, base_off },
+        crate::runtime::gather_witness::GatherWindow {
+            gpas: &gpas,
+            runs: &runs,
+            span,
+            page_size: page,
+        },
+    );
     Some(SampledSourceRequest::GuestRuns(
         engine::GuestRunSource {
             runs: std::sync::Arc::new(runs),
