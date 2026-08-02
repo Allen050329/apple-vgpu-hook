@@ -1,0 +1,169 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>reims content probe</title>
+<!--
+  Declares a page whose correct appearance is a fact the host can check.
+
+  Goal 8 is "web content is occasionally corrupted in Firefox and Safari —
+  background disappearing, subtle bugs, not all-white". A screenshot of a real
+  page cannot be checked against anything, because nothing says what it should
+  have looked like. So this page is built to say so: a fixed palette of widely
+  separated, fully opaque colours in known regions, and a POST back to the probe
+  server naming each region's rectangle and the colour it is supposed to be.
+
+  The host then measures those rectangles in its own capture. That makes the
+  comparison intent-versus-result rather than eyeball-versus-memory, which is
+  the same shape that made modal-button-probe able to answer anything.
+
+  Design constraints, each for a reason:
+
+  - The page goes fullscreen-sized and reports rectangles in *screen* pixels, so
+    the host never has to model browser chrome. It reads window.screenX/screenY
+    and the inner/outer difference rather than assuming a toolbar height.
+  - Colours are separated far enough that the host can classify a measured mean
+    to the nearest palette entry instead of applying a tolerance. WHITE and
+    BLACK are in the palette on purpose: "the background turned white" is then a
+    named verdict rather than a threshold miss.
+  - The background is a large region of one colour, because that is the thing
+    the bug report says disappears.
+  - Everything is a plain opaque div. No gradients, no blend modes, no
+    transforms: the point is to detect a compositing loss, not to exercise one
+    particular path into it. A patch that renders wrong here is wrong for a
+    reason that would be much harder to see in real content.
+-->
+<style>
+  html, body { margin: 0; padding: 0; overflow: hidden; }
+  body { background: #202080; }
+  .patch { position: absolute; }
+  #status {
+    position: absolute; left: 0; bottom: 0; font: 12px monospace;
+    color: #fff; background: #000; padding: 2px 6px; z-index: 10;
+  }
+</style>
+<body>
+<div id="status">probe starting…</div>
+<script>
+// Widely separated, fully opaque. WHITE and BLACK are palette members so a
+// region that loses its fill classifies as one of them by name.
+const PALETTE = {
+  BG:      [0x20, 0x20, 0x80],
+  RED:     [0xe0, 0x10, 0x10],
+  GREEN:   [0x10, 0xc0, 0x30],
+  YELLOW:  [0xf0, 0xe0, 0x10],
+  MAGENTA: [0xd0, 0x10, 0xd0],
+  CYAN:    [0x10, 0xd0, 0xe0],
+  ORANGE:  [0xf0, 0x80, 0x10],
+  WHITE:   [0xff, 0xff, 0xff],
+  BLACK:   [0x00, 0x00, 0x00],
+};
+const NAMES = ['RED', 'GREEN', 'YELLOW', 'MAGENTA', 'CYAN', 'ORANGE'];
+const hex = c => '#' + c.map(v => v.toString(16).padStart(2, '0')).join('');
+
+const COLS = 3, ROWS = 2;
+const regions = [];
+
+function build() {
+  document.body.innerHTML = '<div id="status"></div>';
+  const W = window.innerWidth, H = window.innerHeight;
+  // Patches occupy the middle band, leaving generous margins of background on
+  // every side. Those margins are what the background regions measure, and they
+  // have to be wide enough that a downscaled capture still samples only them.
+  const padX = Math.floor(W * 0.10), padY = Math.floor(H * 0.18);
+  const cw = Math.floor((W - 2 * padX) / COLS), ch = Math.floor((H - 2 * padY) / ROWS);
+  const gap = Math.floor(Math.min(cw, ch) * 0.12);
+  regions.length = 0;
+  for (let r = 0; r < ROWS; r++) {
+    for (let c = 0; c < COLS; c++) {
+      const name = NAMES[r * COLS + c];
+      const d = document.createElement('div');
+      d.className = 'patch';
+      d.style.left = (padX + c * cw + gap) + 'px';
+      d.style.top = (padY + r * ch + gap) + 'px';
+      d.style.width = (cw - 2 * gap) + 'px';
+      d.style.height = (ch - 2 * gap) + 'px';
+      d.style.background = hex(PALETTE[name]);
+      d.dataset.name = name;
+      document.body.appendChild(d);
+    }
+  }
+  // Background samples: the four margins. Named BG_* so a failure says which
+  // part of the background went, which is what "shifted 10% to the left" would
+  // look like from here.
+  const m = Math.floor(Math.min(padX, padY) * 0.5);
+  const bg = [
+    ['BG_LEFT',   0,          Math.floor(H / 2) - m, m * 2, m * 2],
+    ['BG_RIGHT',  W - m * 2,  Math.floor(H / 2) - m, m * 2, m * 2],
+    ['BG_TOP',    Math.floor(W / 2) - m, 0,          m * 2, m * 2],
+    ['BG_BOTTOM', Math.floor(W / 2) - m, H - m * 2,  m * 2, m * 2],
+  ];
+
+  // Screen-space origin of the viewport, read rather than assumed: the host
+  // must not have to model this browser's chrome height.
+  //
+  // These four metrics do not update atomically. Measured during Safari's
+  // fullscreen transition, `innerWidth` had already become 1920 while
+  // `outerWidth` was still 1854, which put the origin at (-33, -184) and shifted
+  // every declared rectangle a whole grid row off the content. A declaration
+  // taken there is not a wrong reading of the screen, it is a reading of a
+  // window that no longer exists — so `declare()` refuses it rather than
+  // publishing it, and the next tick republishes once the metrics agree.
+  const ox = window.screenX + (window.outerWidth - window.innerWidth) / 2;
+  const oy = window.screenY + (window.outerHeight - window.innerHeight);
+  if (ox < 0 || oy < 0 ||
+      window.outerWidth < window.innerWidth ||
+      window.outerHeight < window.innerHeight ||
+      ox + W > screen.width || oy + H > screen.height) {
+    return null;
+  }
+  const out = [];
+  for (const d of document.querySelectorAll('.patch')) {
+    const r = d.getBoundingClientRect();
+    out.push({ name: d.dataset.name, expect: PALETTE[d.dataset.name],
+               x: Math.round(ox + r.left), y: Math.round(oy + r.top),
+               w: Math.round(r.width), h: Math.round(r.height) });
+  }
+  for (const [name, x, y, w, h] of bg) {
+    out.push({ name, expect: PALETTE.BG,
+               x: Math.round(ox + x), y: Math.round(oy + y), w, h });
+  }
+  return out;
+}
+
+function post(body) {
+  return fetch('/', { method: 'POST', body: JSON.stringify(body) }).catch(() => {});
+}
+
+const params = new URLSearchParams(location.search);
+// Repainting on a cadence is what gives the "occasional" bug chances to happen
+// while the host is capturing. The patches keep their colours; only a counter
+// changes, so every capture is checkable against the same declaration.
+const beatMs = Number(params.get('beat') || 250);
+
+// Republished on a timer rather than only at load and on resize. The host reads
+// the newest record before each capture, so a window that has been moved,
+// resized or fullscreened is described by the record the host is about to use
+// — and a declaration refused mid-transition is simply replaced a second later
+// instead of stranding the run on stale rectangles.
+function declare() {
+  const regions = build();
+  if (!regions) return;
+  post({ kind: 'layout', t: Date.now(), screen: { w: screen.width, h: screen.height },
+         dpr: window.devicePixelRatio, viewport: [window.innerWidth, window.innerHeight],
+         regions });
+}
+declare();
+setInterval(declare, 1000);
+
+let n = 0;
+setInterval(() => {
+  n++;
+  const s = document.getElementById('status');
+  if (s) s.textContent = 'probe beat ' + n;
+  // Touch every patch so the compositor has real work each beat, without
+  // changing any declared colour.
+  for (const d of document.querySelectorAll('.patch')) {
+    d.style.outline = (n % 2) ? '1px solid rgba(0,0,0,0)' : 'none';
+  }
+}, beatMs);
+</script>
+</body>
