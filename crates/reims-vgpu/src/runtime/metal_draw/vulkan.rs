@@ -1179,26 +1179,38 @@ fn resolve_sampled_source<M: HostMemory + HostOps>(
                 // exactly that, and an all-black frame is a legal frame, so the
                 // test mistook a correct black surface for an empty one.
                 if let Some((bgra, host_gen)) = (!guest_replaced)
-                    .then(|| crate::runtime::surface_cache::get_with_gen(state, mid, w, h))
+                    .then(|| crate::runtime::surface_cache::get_shared_with_gen(state, mid, w, h))
                     .flatten()
                 {
-                    let rgba = std::sync::Arc::new(swap_rb_channels(bgra));
+                    // Uploaded in the order the cache already holds. This rung's
+                    // bytes are BGRA8 by construction — it is a type-4 scanout
+                    // cache — and `B8G8R8A8_UNORM` is a Vulkan-mandatory sampled
+                    // format with linear filtering, so declaring the layout costs
+                    // nothing and the hardware reads the channels the guest
+                    // stored. What stood here rebuilt the whole frame into RGBA8
+                    // first: a 1.7 MB allocation plus a full read+write pass on
+                    // every bind, ~116 binds a second live, to reach bytes the
+                    // sampler could already address. The linear rail reached the
+                    // same conclusion (`linear_native_upload_format(.., true)`).
+                    //
+                    // The view swizzle applied at bind is a *logical* channel
+                    // remap from the guest descriptor and composes with the
+                    // physical format rather than substituting for it, so this
+                    // does not double-swap.
+                    //
                     // The generation is the cache entry's own `host_gen`, which
                     // every writer of `host_surfaces` re-takes from
                     // `next_sampled_content_generation` in the same breath as it
                     // changes the bytes — so an unchanged pair is a statement
                     // that the frame has not moved, and the engine can bind what
-                    // it already holds instead of re-hashing 1.7 MB to find out.
-                    // See [`LinearSampleIdentity`] for the key namespace.
-                    //
-                    // The channel swap is deterministic, so it needs no
-                    // generation of its own: equal `host_gen` implies equal
-                    // `rgba`.
+                    // it already holds instead of re-digesting 1.7 MB to find
+                    // out. See [`LinearSampleIdentity`] for the key namespace.
                     //
                     // A 0 generation is an entry never stored into.
-                    // `get_with_gen` already refuses those — it requires bytes —
-                    // but a false "unchanged" is the one wrong answer here that
-                    // binds a stale frame, so it is not left to that alone.
+                    // `get_shared_with_gen` already refuses those — it requires
+                    // bytes — but a false "unchanged" is the one wrong answer
+                    // here that binds a stale frame, so it is not left to that
+                    // alone.
                     let identity = (host_gen != 0).then_some(LinearSampleIdentity {
                         key: (1u64 << 62) | mid as u64,
                         generation: host_gen,
@@ -1208,7 +1220,7 @@ fn resolve_sampled_source<M: HostMemory + HostOps>(
                         w,
                         h,
                         mid,
-                        SampledSourceRequest::Bytes(rgba, identity, TexelLayout::Rgba8),
+                        SampledSourceRequest::Bytes(bgra, identity, TexelLayout::Bgra8),
                     ));
                 }
 
@@ -4279,12 +4291,11 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     (rw, rh, src)
                 };
                 let mut bytes_identity = None;
-                // Byte layout of a CPU-origin bind. Default RGBA8; a native
-                // single/dual-channel plane keeps its footprint. The RGBA8-shaped
-                // diagnostics below (nz/alpha/center-row, empty-layer proxy) only make
-                // sense for 4-byte texels, so they run only on the RGBA8 layout — a
-                // native luma/chroma plane skips them. The host spelling is applied
-                // once, where the engine resource is built.
+                // Byte layout of a CPU-origin bind. Default RGBA8; a source that
+                // already holds its bytes in an uploadable order keeps them —
+                // BGRA8 from the type-4 scanout cache, a native single/dual-channel
+                // video plane — and the host spelling is applied once, where the
+                // engine resource is built (`vk_texel_layout` below).
                 let mut sampled_format = TexelLayout::Rgba8;
                 let source = match loaded {
                     SampledSourceRequest::Bytes(rgba, identity, byte_format) => {

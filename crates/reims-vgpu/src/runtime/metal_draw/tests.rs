@@ -3120,10 +3120,17 @@ fn type5_sample_uses_descriptor_surface_id_not_ref_collision() {
         resolve_sampled_source(&mut state, &mut host, 1, texture_ref, None)
             .expect("type-5 descriptor surface must sample");
     assert_eq!((width, height, sampled_mid), (4, 3, surface_id));
-    let SampledSourceRequest::Bytes(sampled, _, _) = sampled else {
+    let SampledSourceRequest::Bytes(sampled, _, layout) = sampled else {
         panic!("cache-backed fixture unexpectedly resolved a resident target");
     };
-    assert_eq!(&sampled[..4], &[0, 0, 255, 255]);
+    // The host-cache rung uploads the scanout cache's BGRA8 verbatim, so this is
+    // surface 71's stored pixel unswapped. It stays the discriminant this test
+    // exists for: the colliding ref 2 holds [0,0,255,255], so reading the wrong
+    // surface still fails here. Asserting the layout beside the bytes is what
+    // keeps the pair honest — bytes alone would also pass if the layout drifted
+    // to RGBA8 and every sampled frame came out channel-swapped.
+    assert_eq!(layout, TexelLayout::Bgra8);
+    assert_eq!(&sampled[..4], &[255, 0, 0, 255]);
 
     // Regression guard for the resolve-once optimization
     // (SAMPLED-BIND-RESOLVE-ONCE): threading the caller-resolved object-list
@@ -3247,20 +3254,43 @@ fn type11_host_cache_rung_identity_tracks_the_cached_frame() {
     let resolve = |state: &mut DeviceState, host: &mut FakeHost| {
         let (_, _, _, src) = resolve_sampled_source(state, host, 1, texture_ref, None)
             .expect("host-cache rung must serve the stored frame");
-        let SampledSourceRequest::Bytes(bytes, identity, _) = src else {
+        let SampledSourceRequest::Bytes(bytes, identity, layout) = src else {
             panic!("cache-backed fixture unexpectedly resolved a resident target");
         };
+        // The cache holds BGRA8 and the upload declares BGRA8, so the bytes go
+        // up untouched. Asserting the pair together is the point: either one
+        // alone permits the channel-swapped frame that the other rules out.
+        assert_eq!(
+            layout,
+            TexelLayout::Bgra8,
+            "the scanout cache's bytes are BGRA8; declaring RGBA8 samples R and B swapped"
+        );
         (bytes, identity)
     };
 
     let (first_bytes, first_id) = resolve(&mut state, &mut host);
     let first_id = first_id.expect("the host-cache rung must offer a content identity");
     assert_eq!(
+        &first_bytes[..4],
+        &[255u8, 0, 0, 255],
+        "the stored BGRA bytes must reach the engine verbatim, not channel-swapped"
+    );
+    assert!(
+        std::sync::Arc::ptr_eq(
+            &first_bytes,
+            &crate::runtime::surface_cache::get_shared_with_gen(&state, surface_id, 4, 3)
+                .expect("stored")
+                .0
+        ),
+        "the rung must hand over the cache's own allocation; a fresh Vec here is \
+         the full-frame copy this rail exists to avoid"
+    );
+    assert_eq!(
         first_id.key,
         (1u64 << 62) | surface_id as u64,
         "bit 62 alone is the type-11 host-cache namespace"
     );
-    let stored_gen = crate::runtime::surface_cache::get_with_gen(&state, surface_id, 4, 3)
+    let stored_gen = crate::runtime::surface_cache::get_shared_with_gen(&state, surface_id, 4, 3)
         .expect("the frame just stored must be readable")
         .1;
     assert_eq!(

@@ -184,7 +184,7 @@ pub fn get(state: &DeviceState, surface_id: u32, width: u32, height: u32) -> Opt
     get_from(&state.host_surfaces, surface_id, width, height)
 }
 
-/// [`get`], plus the generation that names these exact bytes.
+/// [`get_shared`], plus the generation that names these exact bytes.
 ///
 /// The generation is the entry's `host_gen`, and it is a sampled-content
 /// identity rather than provenance: every writer of this map — [`store_into`],
@@ -196,14 +196,21 @@ pub fn get(state: &DeviceState, surface_id: u32, width: u32, height: u32) -> Opt
 ///
 /// The caller is the type-11 sampled ladder's host-cache rung, which without
 /// this had no identity to offer and drove every bind through the content
-/// digest: 116 lookups a second over 201 MB, hashed twice each.
-pub fn get_with_gen(
+/// digest: 116 lookups a second over 201 MB, hashed twice each. It takes the
+/// frame as a handle rather than a slice because it hands the bytes to the
+/// engine, which outlives the borrow of `state` — so the rung costs a refcount
+/// and not a full-frame copy.
+pub fn get_shared_with_gen(
     state: &DeviceState,
     surface_id: u32,
     width: u32,
     height: u32,
-) -> Option<(&[u8], u64)> {
-    get_from_with_gen(&state.host_surfaces, surface_id, width, height)
+) -> Option<(std::sync::Arc<Vec<u8>>, u64)> {
+    let (_, host_gen) = get_from_with_gen(&state.host_surfaces, surface_id, width, height)?;
+    // Deliberately delegated rather than reimplemented: `get_shared` owns the
+    // rule for a stored buffer carrying slop past `width * height * 4`, and a
+    // second copy of that rule here could drift from it.
+    Some((get_shared(state, surface_id, width, height)?, host_gen))
 }
 
 /// Cede this mapping's cached frame to the engine resident a deferred type-11
