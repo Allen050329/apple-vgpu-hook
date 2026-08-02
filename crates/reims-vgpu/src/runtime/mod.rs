@@ -7,6 +7,9 @@
 pub mod blit_exec;
 /// Always-on proxies and censuses, one per measured bug class.
 pub mod census;
+/// Where a draw chain's wall clock goes on the runtime side of the engine
+/// boundary, which is 82% of it.
+pub mod chain_phase;
 /// Product-path compute bind/dispatch (pipeline + buffers + direct dispatch).
 pub mod compute_exec;
 /// Multi-record compute encoder session (control-flow SPI + ICB execute).

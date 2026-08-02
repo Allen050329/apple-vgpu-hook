@@ -68,6 +68,12 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
     // ever reaches the pipeline scissor rect, never the Store extent.
     _force_full_store: bool,
 ) -> (EncodeStatus, Option<Vec<u8>>) {
+    // Charges this chain to one phase at a time all the way down, including the
+    // parts of it that live inside `try_metal2vulkan_draw`. Held here rather
+    // than there because the Store routing below the engine is on the same
+    // clock: `drain_duty`'s `draw_us` brackets exactly this function, and the
+    // whole reading is that the phases sum to it.
+    let _phase = crate::runtime::chain_phase::ChainTimer::start();
     let colors: Vec<ColorRtRequest> = req.colors.clone();
     let Some((pass_w, pass_h)) = colors.first().map(|c0| (c0.width, c0.height)) else {
         return (EncodeStatus::BadArgs("draw_vk_no_color_target"), None);
@@ -3919,6 +3925,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
     // Only the final record of a portability render-pass chain reads back CPU
     // pixels; used by the resident-chain rail below (harmless on other paths).
     let _ = &writeback_guest;
+    crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Pipeline);
     // Name the color0 GVA target's allocation before anything can render into
     // it, and once: the pinned Store identity, the cross-pass Load identity and
     // the deferred window's stored copy are all keyed on this value, and two
@@ -4021,7 +4028,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         ));
     }
 
-    // setup_us: SPIR-V words, reloc, guest binds, seed, engine DrawRequest assembly.
+    crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Binds);
 
     // SPIR-V words for the engine, shared from the translation cache (Arc — no
     // per-draw materialization; fragment reloc variants are cached per shader).
@@ -4289,6 +4296,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             }
             fetch0
         };
+        crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Sampled);
         // Sampled textures + samplers (metal2vulkan bands: textures 32+N, samplers 64+M).
         // Texture and sampler **indices are independent** (live logo SPIR-V: image
         // binding 35 = texture(3), sampler binding 64 = sampler(0)). Pairing
@@ -4606,6 +4614,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 );
             }
         }
+        crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Seed);
         // Color load seed: CLEAR → solid; LOAD → guest/host seed when present.
         // `seed_order` names what is in those bytes; the engine folds any needed
         // R/B exchange into its copy into the mapped staging span rather than
@@ -4808,6 +4817,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 _ => {}
             }
         }
+        crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Assemble);
         let mut resources = crate::backend::vulkan::engine::DrawRequest {
             // Honor the guest's face-culling state, its winding, and its
             // primitive type. All three come from `translate::raster`, and all
@@ -5399,7 +5409,13 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // `DrawReason` refusal, an interim `_untyped`) propagates unchanged so
         // the boundary below names the engine's specific check as the primary
         // `reason=` rather than flattening it into a `vk_engine: {e}` blob.
+        crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Engine);
         let out = crate::backend::vulkan::engine::execute_draw_request(&resources)?;
+        // Everything from here to the end of the chain is Store routing, and the
+        // `?` above deliberately leaves a declined draw charged to `engine`:
+        // where it declined is the engine's own typed reason to report, not this
+        // census's.
+        crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Store);
         // RGB nonzero (ignore alpha) so black+alpha is not mistaken for content.
         // Resident/import path uses skip_readback → empty `out.pixels` is **expected**
         // and must not be read as "GPU drew black" (use import_content res_rgb_nz).

@@ -4256,6 +4256,13 @@ pub fn note_drain_tranche(drain_us: u64, publish_us: u64) {
             crate::observe::off(line);
         }
         emit_engine_delta();
+        // After `emit_engine_delta`, which emits `draw_phase`: the two divide
+        // against each other and reading them in the other order invites
+        // treating the engine's twelve phases as the whole draw, which is the
+        // misreading this line exists to correct. Not gated on the backend —
+        // the timer is runtime-side and the Metal arm can adopt it without a
+        // second census.
+        emit_chain_phase();
     }
 }
 
@@ -4424,6 +4431,37 @@ fn emit_engine_delta() {
         d.gen_mismatch,
     ));
     emit_draw_phase();
+}
+
+/// The split of `drain_duty`'s `draw_us` that actually covers it, over the same
+/// window.
+///
+/// `draw_phase` divides the engine and `chain_phase` divides everything around
+/// it, so this line is emitted immediately after that one and the two are read
+/// together: `chain_phase`'s `engine_us` must equal `draw_phase`'s twelve
+/// summed, and `chain_phase`'s eight must equal `drain_duty`'s `draw_us`.
+/// Whatever `draw_phase` does not account for is the other seven bars here, and
+/// on the boot that motivated this line that was 82% of the draw.
+///
+/// Silent when no chain ran, so an idle desktop costs nothing.
+fn emit_chain_phase() {
+    let Some(w) = crate::runtime::chain_phase::take_window() else {
+        return;
+    };
+    crate::observe::off(format!(
+        "chain_phase chains={} prep_us={} pipeline_us={} binds_us={} sampled_us={} \
+         seed_us={} assemble_us={} engine_us={} store_us={} max_us={}",
+        w.chains,
+        w.prep_us,
+        w.pipeline_us,
+        w.binds_us,
+        w.sampled_us,
+        w.seed_us,
+        w.assemble_us,
+        w.engine_us,
+        w.store_us,
+        w.max_us,
+    ));
 }
 
 /// The split of `drain_duty`'s `draw_us`, over the same window.
