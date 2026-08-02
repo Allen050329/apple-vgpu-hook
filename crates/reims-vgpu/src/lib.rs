@@ -293,7 +293,10 @@ fn publish_present_boundary(slot: &BoundDevice, frame_flush_seen: bool) {
 
 fn apply_gfx_write(inner: &mut DeviceInner, slot: &BoundDevice, write: QueuedGfxWrite) {
     match write.queued_at {
-        Some(at) => runtime::drain::note_doorbell_queued(at.elapsed().as_micros() as u64),
+        Some(at) => runtime::drain::note_doorbell_queued(
+            write.offset,
+            at.elapsed().as_micros() as u64,
+        ),
         None => runtime::drain::note_doorbell_direct(),
     }
     if let Some(ops) = slot.ops {

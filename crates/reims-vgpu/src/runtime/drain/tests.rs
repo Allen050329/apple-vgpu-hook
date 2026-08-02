@@ -2361,7 +2361,10 @@ fn the_vcpu_lock_census_reports_the_blocked_side_and_separates_free_acquisitions
 fn the_doorbell_census_separates_a_deferred_apply_from_a_direct_one() {
     use crate::runtime::drain::{DoorbellCensus, UNCONTENDED_POLL};
     let c = DoorbellCensus::default();
-    assert!(c.note_queued(1, 5_000).is_none(), "first call arms only");
+    assert!(
+        c.note_queued(0x100c, 1, 5_000).is_none(),
+        "first call arms only"
+    );
 
     for _ in 0..300 {
         assert!(
@@ -2370,16 +2373,28 @@ fn the_doorbell_census_separates_a_deferred_apply_from_a_direct_one() {
         );
     }
     // Two delays the guest would never notice, one that costs it a whole frame.
-    c.note_queued(120, 5_100);
-    c.note_queued(700, 5_200);
-    c.note_queued(43_000, 5_300);
-    let line = c.note_queued(80, 6_100).expect("a full window must report");
+    c.note_queued(0x100c, 120, 5_100);
+    c.note_queued(0x1020, 700, 5_200);
+    c.note_queued(0x100c, 43_000, 5_300);
+    let line = c
+        .note_queued(0x100c, 80, 6_100)
+        .expect("a full window must report");
 
     assert!(line.contains("queued=5"), "{line}");
     assert!(line.contains("direct=300"), "{line}");
     assert!(line.contains("age_us=43901"), "{line}");
     assert!(line.contains("max_age_us=43000"), "{line}");
     assert!(line.contains("frame_late=1"), "{line}");
+
+    // Which registers deferred, and how badly — the whole point of the
+    // breakdown is that "half the doorbells queue" does not say whether one
+    // register is responsible or every one of them is.
+    assert!(line.contains("offsets=2 shown=2"), "{line}");
+    assert!(
+        line.contains("off_0x100c=4/43000"),
+        "the busiest register must lead, with its own worst age: {line}"
+    );
+    assert!(line.contains("off_0x1020=1/700"), "{line}");
 
     // And a window that only ever applied directly still reports, so "nothing
     // was ever deferred" and "no MMIO reached this device" stay distinguishable.

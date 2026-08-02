@@ -3875,6 +3875,40 @@ impl VcpuLockCensus {
 /// is load-bearing for the same reason `uncontended` is next door: `queued=0`
 /// with a large `direct` is a working doorbell path, while both at zero is no
 /// traffic at all.
+///
+/// # The delay is the tranche, and that is measured rather than inferred
+///
+/// The paragraph above said the cost was "up to a whole tranche". It is the
+/// tranche, to within the measurement's own noise. Three windows of one driven
+/// x86/PCI boot, each pairing this census against `drain_duty` at the same `t=`:
+///
+/// ```text
+/// max_tranche_us  42563   42117   105308
+/// max_age_us      41711   40627   103619
+/// ```
+///
+/// Two consequences, and the second is the one that redirects the search.
+///
+/// **The rate is not marginal.** The same windows read `queued=71 direct=69`
+/// and `queued=67 direct=74` — about half of the guest's register writes miss
+/// the lock — with `age_us/queued` at 28.9 ms mean and `frame_late` 63 of 71.
+/// Nine in ten deferred doorbells start their work more than a frame after the
+/// guest was told the store retired.
+///
+/// **Lowering `duty` does not fix it.** The fourth window of the same run read
+/// `duty=0.147` with `max_age_us=103619`: the worker was idle for 85 % of that
+/// second and still held the guest's next submission for a tenth of it. A
+/// doorbell does not wait for the device to be *busy*, it waits for the device
+/// to be *holding the lock*, and one long tranche in an otherwise empty second
+/// costs exactly as much as a full one. So the flush rail's cost and this stall
+/// are separate problems that happen to share a cause, and the fix for one is
+/// not the fix for the other.
+///
+/// What that leaves is the observation that a queued write does not need the
+/// drain to stop — it needs its register applied, which costs microseconds and
+/// adds work rather than interrupting any. `queued_offsets` is here to say which
+/// registers those actually are, because "apply it sooner" is only safe for
+/// registers whose effect is to publish more work.
 #[derive(Default)]
 pub(crate) struct DoorbellCensus {
     queued: std::sync::atomic::AtomicU64,
@@ -3883,6 +3917,14 @@ pub(crate) struct DoorbellCensus {
     /// Queued writes whose apply was late by at least a whole frame interval.
     frame_late: std::sync::atomic::AtomicU64,
     direct: std::sync::atomic::AtomicU64,
+    /// Which registers are actually being deferred: offset -> (count, max age).
+    ///
+    /// A lock on a census, which the atomics next door exist to avoid — and it
+    /// is only reached on the *queued* path, which this census measures at ~70 a
+    /// second against a `direct` path that never touches it. The alternative was
+    /// a fixed offset table, which would have to be kept in step with the
+    /// register map by hand and would silently drop whatever it did not list.
+    queued_offsets: parking_lot::Mutex<std::collections::BTreeMap<u64, (u64, u64)>>,
     last_report_ms: std::sync::atomic::AtomicU64,
 }
 
@@ -3902,14 +3944,20 @@ impl DoorbellCensus {
         self.maybe_report(now_ms())
     }
 
-    /// Record the queue age of one applied doorbell.
-    pub(crate) fn note_queued(&self, age_us: u64, now_ms: u64) -> Option<String> {
+    /// Record the queue age of one applied doorbell, and which register it was.
+    pub(crate) fn note_queued(&self, offset: u64, age_us: u64, now_ms: u64) -> Option<String> {
         use std::sync::atomic::Ordering::Relaxed;
         self.queued.fetch_add(1, Relaxed);
         self.age_us.fetch_add(age_us, Relaxed);
         self.max_age_us.fetch_max(age_us, Relaxed);
         if age_us >= DRAIN_TRANCHE_SLOW_US {
             self.frame_late.fetch_add(1, Relaxed);
+        }
+        {
+            let mut by_offset = self.queued_offsets.lock();
+            let slot = by_offset.entry(offset).or_insert((0, 0));
+            slot.0 += 1;
+            slot.1 = slot.1.max(age_us);
         }
         self.maybe_report(now_ms)
     }
@@ -3931,12 +3979,36 @@ impl DoorbellCensus {
         let max = self.max_age_us.swap(0, Relaxed);
         let late = self.frame_late.swap(0, Relaxed);
         let direct = self.direct.swap(0, Relaxed);
+        // Descending by count, capped, and the cap is reported rather than
+        // silently applied: a register that misses the list because three others
+        // out-counted it must not read as a register that never deferred.
+        let mut offsets: Vec<(u64, (u64, u64))> =
+            std::mem::take(&mut *self.queued_offsets.lock())
+                .into_iter()
+                .collect();
+        offsets.sort_by_key(|(off, (count, _))| (std::cmp::Reverse(*count), *off));
+        let distinct = offsets.len();
+        let mut body = String::new();
+        for (off, (count, max_us)) in offsets.iter().take(DOORBELL_OFFSETS_REPORTED) {
+            body.push_str(&format!(" off_{off:#x}={count}/{max_us}"));
+        }
         Some(format!(
             "gfx_doorbell_delay win_ms={win_ms} queued={queued} direct={direct} \
-             age_us={total} max_age_us={max} frame_late={late} slow_us={DRAIN_TRANCHE_SLOW_US}"
+             age_us={total} max_age_us={max} frame_late={late} slow_us={DRAIN_TRANCHE_SLOW_US} \
+             offsets={distinct} shown={}{body}",
+            distinct.min(DOORBELL_OFFSETS_REPORTED)
         ))
     }
 }
+
+/// How many deferred register offsets `gfx_doorbell_delay` names per window.
+///
+/// The line has to stay one line, and the question it answers — "which
+/// registers are being held back" — is answered by the head of the
+/// distribution: a register deferring twice a second is not what costs a frame.
+/// `offsets=` states how many distinct ones there were, so a truncated tail is
+/// visible rather than implied.
+const DOORBELL_OFFSETS_REPORTED: usize = 4;
 
 static DOORBELL: std::sync::LazyLock<DoorbellCensus> =
     std::sync::LazyLock::new(DoorbellCensus::default);
@@ -3949,8 +4021,8 @@ pub fn note_doorbell_direct() {
 }
 
 /// Record how long one doorbell sat in `gfx_ingress` before being applied.
-pub fn note_doorbell_queued(age_us: u64) {
-    if let Some(line) = DOORBELL.note_queued(age_us, crate::observe::elapsed_ms() as u64) {
+pub fn note_doorbell_queued(offset: u64, age_us: u64) {
+    if let Some(line) = DOORBELL.note_queued(offset, age_us, crate::observe::elapsed_ms() as u64) {
         crate::observe::off(line);
     }
 }
@@ -4703,6 +4775,30 @@ pub fn publish_stranded_fifos<H: HostMemory + HostOps>(
 ///
 /// The cost is inside the render flush, not in the scheduling around it. See
 /// [`crate::runtime::storage_flush::flush_mapping_windows_before_fence`].
+///
+/// # What that refutation does *not* cover, and the measurement that separates them
+///
+/// Read as "the doorbell delay is the flush rail's cost, so shrink the flush",
+/// the paragraph above overstates itself, and [`DoorbellCensus`] now says by how
+/// much. `max_age_us` tracks `max_tranche_us` to within 3 % across a driven
+/// boot — 41711/42563, 40627/42117, 103619/105308 — and one of those windows
+/// read `duty=0.147`. The worker was idle for 85 % of that second and still held
+/// the guest's next submission for a tenth of it, because a doorbell does not
+/// wait for the device to be *busy*, it waits for the device to be *holding the
+/// lock*. A tranche whose work halves still costs a doorbell half a tranche.
+///
+/// The thing that was tried and reverted was **pausing** this function: return
+/// early on a budget, requeue the rest. That is what made the delay worse and
+/// what introduced the 29 s freeze, and it stays refuted.
+///
+/// A queued write does not need this to pause. It needs its register applied,
+/// which costs microseconds and *adds* available work rather than interrupting
+/// any — and the queue is drained today only by `lock_for_drain`, once, before
+/// the tranche starts. Nothing has measured which registers are in it; the
+/// `off_*` breakdown on `gfx_doorbell_delay` is there to answer that first,
+/// because "apply it sooner" is only safe for registers whose effect is to
+/// publish more work, and unsafe for any the decode below depends on not
+/// changing mid-tranche.
 pub fn drain_pending<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut H) {
     // A queued present action is part of the ordered device timeline. QEMU
     // cannot paint it while this worker owns the device lock, so later worker
