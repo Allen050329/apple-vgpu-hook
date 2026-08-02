@@ -473,7 +473,7 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::contract::endian::{st16, st32, st64};
+    use crate::contract::endian::{st32, st64};
 
     fn hdr(opcode: u32, len: u32) -> Vec<u8> {
         let mut v = vec![0u8; len as usize];
@@ -614,6 +614,5 @@ mod tests {
                 let _ = decode(&v);
             }
         }
-        let _ = st16;
     }
 }

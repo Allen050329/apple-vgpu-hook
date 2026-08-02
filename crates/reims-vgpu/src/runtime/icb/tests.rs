@@ -3956,7 +3956,6 @@ fn fill_compute_barrier_and_tg_memory_execute() {
     st32(&mut bdesc[8..], 3);
     put_object(&mut host, &state, 7, OBJECT_TYPE_BUFFER, 0x180, &bdesc);
 
-    let layout = compute_icb_layout(1, 1);
     fill_compute(
         &state,
         &host,
@@ -3973,7 +3972,6 @@ fn fill_compute_barrier_and_tg_memory_execute() {
         },
     )
     .expect("fill with barrier+tg");
-    let _ = layout;
 
     let mut session = ComputeSession::open(0).expect("session");
     let cmd = execute_icb_command(9, 0, 1);

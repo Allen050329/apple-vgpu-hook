@@ -3674,26 +3674,28 @@ mod tests {
     /// host chain memory (archive DrawJob single completion writeback).
     #[test]
     fn multi_draw_store_plan_matches_archive_drawjob_writeback() {
-        // N independent single-draw packets: each stores, none force_full.
-        for n in 1..8 {
-            let (wb, full) = multi_draw_store_plan(1, 0);
-            assert!(wb, "single-draw packet always stores");
-            assert!(
-                !full,
-                "single-draw never force_full (scissor-local allowed)"
-            );
-            let _ = n;
-        }
-        // One multi-draw packet of 5: only di==4 stores, and force_full.
-        let n = 5usize;
-        for di in 0..n {
-            let (wb, full) = multi_draw_store_plan(n, di);
-            if di + 1 == n {
-                assert!(wb && full, "final multi-draw record: writeback+force_full");
-            } else {
-                assert!(!wb && !full, "intermediate multi-draw: host-chain only");
+        // Every packet size and every record within it. The whole contract is two
+        // predicates over (draw_count, di), so stating it over a range costs
+        // nothing and covers the boundary at draw_count == 1, where force_full
+        // flips — which one packet of five does not reach.
+        for n in 1..8usize {
+            for di in 0..n {
+                let (wb, full) = multi_draw_store_plan(n, di);
+                let last = di + 1 == n;
+                assert_eq!(wb, last, "writeback is the last record only (n={n} di={di})");
+                assert_eq!(
+                    full,
+                    last && n > 1,
+                    "force_full on the last record of a multi-draw packet only \
+                     (n={n} di={di}); a single-draw packet may keep a local scissor"
+                );
             }
         }
+        assert_eq!(
+            multi_draw_store_plan(0, 0),
+            (false, false),
+            "an empty packet writes nothing back"
+        );
     }
 
     #[test]
