@@ -1,63 +1,71 @@
-//! Is the hypervisor's guest-write generation a sound "these texels did not
-//! change" witness for the zero-copy sampled gathers?
+//! Which sampled windows the engine may bind without reading a byte of guest RAM.
 //!
 //! The three zero-copy sampled producers ([`super::metal_draw::vulkan`]'s
 //! linear, type-11 and type-5 rails) hand the engine a
 //! [`crate::backend::vulkan::engine::SampledSource::GuestRuns`], and the engine's
 //! only byte-moving arm gathers the whole window out of guest RAM into a staging
-//! buffer on every single bind. That arm has no content cache — measured on a
-//! driven x86/PCI boot at 360 gathers and **842.4 MB per second**, both figures
-//! repeating to the digit across eight consecutive windows, which is the shape of
-//! the same unchanged content being re-read every frame rather than of a working
-//! set that moves.
+//! buffer. That arm had no content cache — measured on a driven x86/PCI boot at
+//! 360 gathers and **842.4 MB per second**, both figures repeating to the digit
+//! across eight consecutive windows, which is the shape of the same unchanged
+//! content being re-read every frame rather than of a working set that moves.
 //!
-//! The obvious fix is a cache keyed on a witness that says the guest has not
-//! written those pages since the last gather, and the hypervisor dirty bitmap
-//! ([`crate::runtime::host::HostOps::guest_write_gen`]) is the only witness for a
-//! guest CPU store. But a *false* "unwritten" serves stale pixels, which is a
-//! wrong frame that then persists — the failure mode that turned the screen black
-//! once already. So the witness is measured before anything is built on it, and
-//! this module is that measurement.
+//! This module is the cache's witness: it answers "nothing has written these
+//! pages since the gather that filled the retained image", and issues a
+//! [`GatheredIdentity`] the engine binds on with no compare at all. A *false*
+//! answer serves stale pixels, which is a wrong frame that then persists — the
+//! failure mode that turned the screen black once already.
 //!
-//! # What it measures
+//! # The witness takes two halves
 //!
-//! For each distinct sampled window it arms its own tracking token over exactly
-//! the pages the gather reads, and on every later bind of that window it records
-//! two independent answers:
+//! Neither half alone is sound, because they cover disjoint writers:
 //!
-//! - the **generation**: did the hypervisor observe a guest store into these
-//!   pages since the previous bind?
-//! - the **content**: did the bytes actually change, by a full fold over the
-//!   window?
+//! - the **generation** ([`crate::runtime::host::HostOps::guest_write_gen`], the
+//!   hypervisor dirty bitmap) witnesses guest CPU stores, and is defined not to
+//!   see writes this device makes;
+//! - the **page-exact host-write record**
+//!   ([`crate::runtime::host_writes::HostWrites`]) witnesses this device's own
+//!   writes into exactly these pages.
 //!
-//! Crossing them gives a 2x2 whose cells are the whole result, reported through
-//! [`crate::runtime::drain::note_store_route`]:
+//! Both quiet is [`GatherVerdict::Vouched`]: the generation the entry already
+//! holds survives, and the gather is skipped. Anything else spends a fresh
+//! generation, and the engine's `(key, generation)` lookup misses, so the bytes
+//! are read.
+//!
+//! Verdicts, through [`crate::runtime::drain::note_store_route`]:
 //!
 //! | route | meaning |
 //! |---|---|
-//! | `gw_clean_same` | generation still, bytes still — a gather a cache would skip |
-//! | `gw_clean_diff` | **generation still, bytes moved** — the witness is unsound |
-//! | `gw_moved_same` | generation moved, bytes still — a missed skip, not an error |
-//! | `gw_moved_diff` | generation moved, bytes moved — a real re-gather |
+//! | `gw_vouched` / `gw_vouched_kb` | both halves quiet — the gather is skipped |
+//! | `gw_refused_guest_store` | the hypervisor saw a guest store into the pages |
+//! | `gw_refused_host_write` | this device wrote pages of this window |
 //! | `gw_unarmed` | no token, or a generation not yet readable — no answer |
 //! | `gw_rearm` | the window's page set changed, so nothing to compare against |
 //!
-//! `gw_clean_diff` is the cell that decides it. A nonzero count means some writer
-//! reaches these pages without the bitmap seeing it — the device's own deferred
-//! writeback into guest RAM is the obvious candidate — and names the hole that
-//! must be closed before a cache can key on this. A zero across a driven boot is
-//! what licenses building one.
+//! # The content fold is now an audit, not the decision
 //!
-//! `gw_clean_same_kb` accumulates the bytes the `gw_clean_same` cell would not
-//! have moved, so the payoff is measured in the same units as the cost.
+//! A full fold over the window is what *established* the rule above: crossed
+//! against the two halves it produced the cell "vouched, and the bytes moved
+//! anyway", which condemned three candidate rules in turn before the surviving
+//! one read zero across four driven boots.
 //!
-//! # What it costs
+//! Running it on every bind would defeat the cache it licensed — a skipped
+//! gather that still reads every byte to fold them has moved the cost, not
+//! removed it. So the fold runs once per [`AUDIT_STRIDE`] binds of a window and
+//! its verdict is a standing alarm rather than an input:
 //!
-//! One extra cold read of every gathered window, because the content fold has to
-//! see every byte — a sampled hash could miss exactly the change `gw_clean_diff`
-//! exists to catch. The fold is a word-wise mix rather than a cryptographic
-//! digest so the pass runs at memory speed; it defends against incidental change,
-//! which is the only kind on offer here.
+//! | route | meaning |
+//! |---|---|
+//! | `gw_audit_ok` | folded under a vouch, and the bytes were where it said |
+//! | `gw_audit_unsound` | **folded under a vouch, and the bytes had moved** |
+//! | `gw_audit_seed` | folded with no trustworthy predecessor to compare against |
+//! | `gw_audit_kb` | bytes the audit read — the whole remaining cost of the fold |
+//!
+//! `gw_audit_unsound` is the one that matters, and it is not only counted: it
+//! fails through the always-on log with the window that broke, and drops the
+//! vouched generation so the next bind re-gathers. Both holes found while
+//! building this witness — a per-mapping rule whose pages aliased, and a writer
+//! outside the host-write record — fired tens to hundreds of times per boot, so
+//! sampling costs the alarm latency and not its reach.
 
 use std::collections::BTreeMap;
 
@@ -136,6 +144,15 @@ impl GatherKey {
         }
         h
     }
+
+    /// Whitespace-free rendering for the always-on log, which is parsed by
+    /// splitting on spaces.
+    fn log_token(self) -> String {
+        match self {
+            Self::TaskGva { task_id, gva } => format!("gva:{task_id}:{gva:#x}"),
+            Self::Mapping { mid, base_off } => format!("map:{mid}:{base_off:#x}"),
+        }
+    }
 }
 
 /// What the last bind of one window observed.
@@ -150,17 +167,22 @@ struct Entry {
     token: u64,
     /// Generation read at the previous bind; 0 means "was not readable".
     gen: u64,
-    /// Content fold over the window at the previous bind.
+    /// Content fold from the last audit of this window.
     fold: u128,
-    /// [`crate::model::DeviceState::host_guest_write_seq`] at the previous bind,
-    /// so a content change can be attributed to this device's own writes rather
-    /// than to a guest store the bitmap missed.
-    host_seq: u64,
-    /// The same, narrowed to writes that could have landed in *this* window's
-    /// mapping (see `DeviceState::host_wrote_mapping_seq`). The global count
-    /// moves whenever any surface anywhere is written, so the two together say
-    /// how much of the global count's invalidation is other people's work.
-    scoped_seq: u64,
+    /// Whether `fold` still describes the window's bytes.
+    ///
+    /// True from the audit that recorded it for as long as every bind since was
+    /// [`GatherVerdict::Vouched`] — which is the claim the audit exists to check,
+    /// so comparing across that run is exactly the right comparison and a longer
+    /// run is a stronger one. A bind the witness refused may have changed the
+    /// bytes with nothing reading them, and clears it.
+    fold_valid: bool,
+    /// Binds of this window since its last audit, against [`AUDIT_STRIDE`].
+    ///
+    /// Per window rather than device-wide: a global stride would audit whichever
+    /// window happened to land on the multiple and could starve a busy one
+    /// indefinitely, where the alarm's whole job is bounded latency per window.
+    binds_since_fold: u32,
     /// `HostWrites::epoch` at the previous bind, against which the page-exact
     /// question "did this device write any of *these pages* since" is asked.
     pages_epoch: u64,
@@ -198,6 +220,22 @@ pub struct GatherWitness {
 /// dropping the map: a full drop costs a `gw_rearm` for every live window at once,
 /// which is precisely the population whose answers are wanted.
 const MAX_TRACKED_WINDOWS: usize = 256;
+
+/// Binds of one window between content audits.
+///
+/// The fold no longer decides a skip, so its only remaining job is to catch the
+/// witness going unsound — and that is a systematic fault rather than a one-off.
+/// Both holes found while building this witness repeated tens to hundreds of
+/// times per boot, so an audit that sees one bind in `AUDIT_STRIDE` still sees
+/// them within seconds.
+///
+/// The value is the two bounds meeting. A window re-presented at frame rate
+/// binds about sixty times a second, so sixty-four bounds the alarm at roughly a
+/// second of stale pixels; and one bind in sixty-four is 1.6% of the gathered
+/// bytes, about 13 MB/s against the 842 MB/s rail this cache was built to
+/// remove. Both the latency and the cost degrade smoothly, so neither edge is
+/// fitted to an observation.
+pub const AUDIT_STRIDE: u32 = 64;
 
 impl GatherWitness {
     /// Release every tracking token this witness armed.
@@ -281,18 +319,21 @@ unsafe fn fold_runs(runs: &[crate::backend::vulkan::engine::GuestRun], span: u64
     ((a as u128) << 64) | b as u128
 }
 
-/// Every host-write count one bind is judged against.
+/// This device's own answer for one bind: did *we* write these pages?
 ///
 /// Gathered before the witness is touched, because the page-exact question needs
 /// the epoch recorded at the previous bind and the ring that answers it is read
 /// through the same device state the witness lives in.
+///
+/// Two coarser counts used to be asked here beside it — the device-global host
+/// write sequence and a per-mapping share of it — scoring the two candidate
+/// invalidation rules that lost. The global rule invalidates a texture because
+/// an unrelated scanout was composited; the per-mapping one read fifteen stale
+/// binds a minute, because guest pages are reachable under more than one mapping
+/// id. Neither is a rule this device could use, so neither is a count it still
+/// takes.
 #[derive(Clone, Copy, Debug)]
 struct HostWriteCounts {
-    /// `DeviceState::host_guest_write_seq` — moves for every host write anywhere.
-    global: u64,
-    /// `DeviceState::host_wrote_mapping_seq` for this window's mapping, or the
-    /// global count where it has none.
-    scoped: u64,
     /// `HostWrites::epoch()` now, to be recorded for the next bind to ask against.
     pages_epoch: u64,
     /// Whether this device wrote any of this window's pages since the previous
@@ -314,14 +355,9 @@ pub struct GatherWindow<'a> {
     pub span: u64,
     /// Guest page size the `gpas` are expressed in.
     pub page_size: usize,
-    /// The mapping this window lives in, where it has one. A task-GVA window
-    /// does not, and nothing narrower than the global host-write count can be
-    /// assumed quiet for it.
-    pub mapping: Option<u32>,
 }
 
-/// What one bind of a window observed, crossing the hypervisor's answer with the
-/// bytes'.
+/// What the two halves of the witness said about one bind of a window.
 ///
 /// Returned rather than only counted so a test can drive the witness against a
 /// host whose writes it controls, and so the census emission is one place instead
@@ -332,56 +368,77 @@ pub enum GatherVerdict {
     /// compare against; the entry now holds this bind's answers.
     Rearmed,
     /// No readable generation on one side of the comparison, so the hypervisor
-    /// says nothing. The fold answer still stands on its own.
-    Unarmed { fold_same: bool },
-    /// Generation still, bytes still — a gather a cache keyed on this witness
-    /// would skip, correctly.
+    /// half says nothing at all. Fail closed: nothing is vouched for.
+    Unarmed,
+    /// Both halves quiet — no guest store into the pages, and no write by this
+    /// device either. The gather is skippable and the entry keeps its generation.
+    Vouched,
+    /// At least one half saw a write. The generation is spent and the bytes are
+    /// read.
     ///
-    /// The two flags score the two invalidation rules a cache could use against
-    /// the host writes the bitmap cannot see. `global_quiet` is the rule "this
-    /// device wrote nothing anywhere"; `scoped_quiet` is "wrote nothing that
-    /// could have reached this window". Both are sound; scoped is strictly
-    /// larger, and the gap between them is how much of the global rule's
-    /// invalidation is other surfaces' work.
-    CleanSame {
-        global_quiet: bool,
-        scoped_quiet: bool,
-        pages_quiet: bool,
+    /// Both flags can be set at once, and are counted apart because they name
+    /// different work: a guest store is the guest repainting, while a write by
+    /// this device is our own writeback landing in pages a sampler also reads.
+    Refused {
+        /// The hypervisor observed a guest store into these pages.
+        guest_wrote: bool,
+        /// This device wrote at least one of these pages.
+        host_wrote_pages: bool,
     },
-    /// Generation still, bytes moved. The witness is unsound for this window:
-    /// something wrote these pages without the bitmap seeing it.
-    ///
-    /// The two flags are what each candidate invalidation rule would have
-    /// concluded, and each one reading quiet here is that rule being unsound.
-    /// `host_wrote` false means this device wrote nowhere at all and the bytes
-    /// moved anyway, which leaves only a guest store the bitmap did not see.
-    /// `scoped_wrote` false means it wrote nothing that could have reached this
-    /// window — the narrower claim, and the one a per-mapping rule rests on.
-    ///
-    /// The global count moves for every write including the scoped ones, so
-    /// `!host_wrote` implies `!scoped_wrote`: the scoped rule's unsound set
-    /// contains the global rule's.
-    CleanDiff {
-        host_wrote: bool,
-        scoped_wrote: bool,
-        pages_wrote: bool,
-    },
-    /// Generation moved, bytes still — a skip the witness gives up, not an error.
-    MovedSame,
-    /// Generation moved, bytes moved — a re-gather that had to happen.
-    MovedDiff,
 }
 
-impl GatherVerdict {
-    /// Did the window's bytes stay put, where that is known?
-    ///
-    /// `None` for [`Self::Rearmed`], which has no previous bind to compare with.
-    fn fold_same(self) -> Option<bool> {
+/// What the content fold said, on the binds where it ran.
+///
+/// The fold is the audit of [`GatherVerdict::Vouched`], not an input to it —
+/// see [`AUDIT_STRIDE`] for why it runs on one bind in sixty-four rather than
+/// all of them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ContentAudit {
+    /// Not due this bind: no byte of the window was read.
+    Skipped,
+    /// Folded, but with no fold to compare against that a run of vouches
+    /// vouches for. This bind only records one.
+    Seeded,
+    /// Folded under a vouch, and the bytes are where the vouch said they were.
+    Agreed,
+    /// Folded under a vouch, and the bytes had moved. Some writer reaches these
+    /// guest pages without either half of the witness seeing it, so every gather
+    /// skipped since the last audit bound a stale image.
+    Disagreed,
+}
+
+/// One bind's two answers: what the witness decided, and what the audit found.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct GatherObservation {
+    /// The decision, from the two witness halves alone.
+    pub verdict: GatherVerdict,
+    /// The check on it, on the binds where the fold ran.
+    pub audit: ContentAudit,
+}
+
+/// The one way this witness can be wrong.
+#[derive(Clone, Copy, Debug)]
+pub enum GatherWitnessFault {
+    /// Both halves vouched for a window and the content audit found its bytes
+    /// moved. Names the window so the writer can be hunted, and the bind count
+    /// so the number of stale frames served is bounded rather than guessed.
+    VouchedBytesMoved { key: GatherKey, span: u64, binds: u32 },
+}
+
+impl crate::observe::decline::Decline for GatherWitnessFault {
+    fn slug(&self) -> &'static str {
         match self {
-            Self::Rearmed => None,
-            Self::Unarmed { fold_same } => Some(fold_same),
-            Self::CleanSame { .. } | Self::MovedSame => Some(true),
-            Self::CleanDiff { .. } | Self::MovedDiff => Some(false),
+            Self::VouchedBytesMoved { .. } => "gather_witness_vouched_bytes_moved",
+        }
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        match self {
+            Self::VouchedBytesMoved { key, span, binds } => vec![
+                ("window", key.log_token()),
+                ("span", span.to_string()),
+                ("binds", binds.to_string()),
+            ],
         }
     }
 }
@@ -407,16 +464,11 @@ pub fn note_gather<M: crate::runtime::host::HostOps>(
     note_store_route(rail_count);
     note_store_route_n(rail_kb, span / 1024);
 
-    // Every count this bind is judged against, taken before the witness is
-    // touched: the page-exact answer needs the epoch recorded at the *previous*
-    // bind, which is inside the witness, and the ring that answers it is read
-    // through the same device state.
+    // This device's own answer, taken before the witness is touched: the
+    // page-exact question needs the epoch recorded at the *previous* bind, which
+    // is inside the witness, and the ring that answers it is read through the
+    // same device state.
     let counts = HostWriteCounts {
-        global: state.host_guest_write_seq,
-        scoped: match window.mapping {
-            Some(mid) => state.host_wrote_mapping_seq(mid),
-            None => state.host_guest_write_seq,
-        },
         pages_epoch: state.host_writes.epoch(),
         pages_wrote: state
             .gather_witness
@@ -428,65 +480,51 @@ pub fn note_gather<M: crate::runtime::host::HostOps>(
     // to vouch for the previous one. An unspent generation is not a leak: the
     // counter's whole contract is that a value is issued once and never again.
     let fresh = state.next_sampled_content_generation();
-    let verdict = observe(&mut state.gather_witness, host, key, window, counts, fresh);
+    let seen = observe(&mut state.gather_witness, host, key, window, counts, fresh);
 
-    // The fold answer on its own, independent of whether a token was armed: this
-    // is the ceiling on what *any* content cache could skip, and unlike the
-    // cross-tab below it is available for every re-presented window.
-    match verdict.fold_same() {
-        Some(true) => {
-            note_store_route("gw_fold_same");
-            note_store_route_n("gw_fold_same_kb", span / 1024);
-        }
-        Some(false) => note_store_route("gw_fold_diff"),
-        None => {}
-    }
-    match verdict {
+    match seen.verdict {
         GatherVerdict::Rearmed => note_store_route("gw_rearm"),
-        GatherVerdict::Unarmed { .. } => note_store_route("gw_unarmed"),
-        GatherVerdict::CleanSame {
-            global_quiet,
-            scoped_quiet,
-            pages_quiet,
+        GatherVerdict::Unarmed => note_store_route("gw_unarmed"),
+        GatherVerdict::Vouched => {
+            note_store_route("gw_vouched");
+            note_store_route_n("gw_vouched_kb", span / 1024);
+        }
+        GatherVerdict::Refused {
+            guest_wrote,
+            host_wrote_pages,
         } => {
-            note_store_route("gw_clean_same");
-            note_store_route_n("gw_clean_same_kb", span / 1024);
-            if global_quiet {
-                note_store_route("gw_hit_global");
-                note_store_route_n("gw_hit_global_kb", span / 1024);
+            if guest_wrote {
+                note_store_route("gw_refused_guest_store");
             }
-            if scoped_quiet {
-                note_store_route("gw_hit_scoped");
-                note_store_route_n("gw_hit_scoped_kb", span / 1024);
-            }
-            if pages_quiet {
-                note_store_route("gw_hit_pages");
-                note_store_route_n("gw_hit_pages_kb", span / 1024);
+            if host_wrote_pages {
+                note_store_route("gw_refused_host_write");
             }
         }
-        // One name per rule condemned, and they nest: a rule that saw nothing
-        // implies every narrower rule saw nothing too. `gw_clean_diff_pages_quiet`
-        // is the one that decides whether a page-exact cache can be built.
-        GatherVerdict::CleanDiff {
-            host_wrote,
-            scoped_wrote,
-            pages_wrote,
-        } => {
-            if !host_wrote {
-                note_store_route("gw_clean_diff");
-            }
-            if !scoped_wrote {
-                note_store_route("gw_clean_diff_scoped_quiet");
-            }
-            if !pages_wrote {
-                note_store_route("gw_clean_diff_pages_quiet");
-            }
-            if host_wrote && scoped_wrote && pages_wrote {
-                note_store_route("gw_clean_diff_host_wrote");
-            }
+    }
+    // `gw_audit_kb` is every byte the fold still reads, so the cost of keeping
+    // the alarm is reported in the same units as the gathers it saves.
+    if !matches!(seen.audit, ContentAudit::Skipped) {
+        note_store_route_n("gw_audit_kb", span / 1024);
+    }
+    match seen.audit {
+        ContentAudit::Skipped => {}
+        ContentAudit::Seeded => note_store_route("gw_audit_seed"),
+        ContentAudit::Agreed => note_store_route("gw_audit_ok"),
+        ContentAudit::Disagreed => {
+            note_store_route("gw_audit_unsound");
+            // Once per window: a writer escaping both halves escapes them on
+            // every bind, and the second line says nothing the first did not.
+            // The count above carries the magnitude.
+            crate::observe::emit::Emit::decline(
+                "gather_witness",
+                &GatherWitnessFault::VouchedBytesMoved {
+                    key,
+                    span,
+                    binds: AUDIT_STRIDE,
+                },
+            )
+            .fail_once(key.content_key());
         }
-        GatherVerdict::MovedSame => note_store_route("gw_moved_same"),
-        GatherVerdict::MovedDiff => note_store_route("gw_moved_diff"),
     }
     state
         .gather_witness
@@ -511,8 +549,8 @@ pub struct GatheredIdentity {
     pub generation: u64,
 }
 
-/// The witness itself: fold the window, compare both answers against the last
-/// bind of the same window, and leave the entry describing this one.
+/// The witness itself: ask both halves about the last bind of the same window,
+/// audit the answer on the stride, and leave the entry describing this bind.
 fn observe<M: crate::runtime::host::HostOps>(
     witness: &mut GatherWitness,
     host: &mut M,
@@ -520,24 +558,17 @@ fn observe<M: crate::runtime::host::HostOps>(
     window: GatherWindow<'_>,
     counts: HostWriteCounts,
     fresh_generation: u64,
-) -> GatherVerdict {
+) -> GatherObservation {
     let GatherWindow {
         gpas,
         runs,
         span,
         page_size,
-        mapping: _,
     } = window;
     let HostWriteCounts {
-        global: host_seq,
-        scoped: scoped_seq,
         pages_epoch,
         pages_wrote,
     } = counts;
-
-    // SAFETY: `runs` describe the window this draw is about to gather from, so
-    // their pointers are live here for the same reason they are live there.
-    let fold = unsafe { fold_runs(runs, span) };
 
     witness.binds = witness.binds.wrapping_add(1);
     while witness.entries.len() >= MAX_TRACKED_WINDOWS && !witness.entries.contains_key(&key) {
@@ -568,22 +599,27 @@ fn observe<M: crate::runtime::host::HostOps>(
                 span,
                 token,
                 gen,
-                fold,
-                host_seq,
-                scoped_seq,
+                // A re-point gathers unconditionally, so folding here would buy
+                // nothing the first audit does not: the stride seeds one before
+                // there is any vouch for it to check.
+                fold: 0,
+                fold_valid: false,
+                binds_since_fold: 0,
                 pages_epoch,
                 last_seen: witness.binds,
                 generation: fresh_generation,
             },
         );
-        return GatherVerdict::Rearmed;
+        return GatherObservation {
+            verdict: GatherVerdict::Rearmed,
+            audit: ContentAudit::Skipped,
+        };
     }
 
     let entry = witness
         .entries
         .get_mut(&key)
         .expect("the stale branch above returns for every absent key");
-    let fold_same = fold == entry.fold;
     let gen = if entry.token == 0 {
         0
     } else {
@@ -593,39 +629,56 @@ fn observe<M: crate::runtime::host::HostOps>(
     // was released with its pages, or has not survived the two harvests the
     // dirty adapter needs before it can answer at all.
     let verdict = if gen == 0 || entry.gen == 0 {
-        GatherVerdict::Unarmed { fold_same }
+        GatherVerdict::Unarmed
+    } else if gen == entry.gen && pages_wrote == Some(false) {
+        // `pages_wrote == None` cannot happen beside a live entry, and reading a
+        // missing answer as quiet would vouch on the strength of not having
+        // asked.
+        GatherVerdict::Vouched
     } else {
-        match (gen == entry.gen, fold_same) {
-            (true, true) => GatherVerdict::CleanSame {
-                global_quiet: host_seq == entry.host_seq,
-                scoped_quiet: scoped_seq == entry.scoped_seq,
-                // `None` cannot happen beside a live entry, and answering it
-                // "quiet" would vouch on the strength of a missing answer.
-                pages_quiet: pages_wrote == Some(false),
-            },
-            (true, false) => GatherVerdict::CleanDiff {
-                host_wrote: host_seq != entry.host_seq,
-                scoped_wrote: scoped_seq != entry.scoped_seq,
-                pages_wrote: pages_wrote != Some(false),
-            },
-            (false, true) => GatherVerdict::MovedSame,
-            (false, false) => GatherVerdict::MovedDiff,
+        GatherVerdict::Refused {
+            guest_wrote: gen != entry.gen,
+            host_wrote_pages: pages_wrote != Some(false),
         }
     };
-    // Keep the generation only where both halves of the witness vouch for the
-    // bytes. Every other verdict — including the ones where the fold happens to
-    // agree — replaces it, because the fold is a measurement this cache will not
-    // have once the gather it measures is skipped.
-    if !matches!(verdict, GatherVerdict::CleanSame { pages_quiet: true, .. }) {
+    let vouched = matches!(verdict, GatherVerdict::Vouched);
+
+    let audit = if entry.binds_since_fold >= AUDIT_STRIDE {
+        // SAFETY: `runs` describe the window this draw is about to gather from,
+        // so their pointers are live here for the same reason they are live
+        // there. On a vouched bind the gather will be skipped, but the runs were
+        // resolved by the same producer in the same call and name the same
+        // pages, which the entry's page set is checked against above.
+        let fold = unsafe { fold_runs(runs, span) };
+        let audit = match (vouched && entry.fold_valid, fold == entry.fold) {
+            (false, _) => ContentAudit::Seeded,
+            (true, true) => ContentAudit::Agreed,
+            (true, false) => ContentAudit::Disagreed,
+        };
+        entry.fold = fold;
+        entry.fold_valid = true;
+        entry.binds_since_fold = 0;
+        audit
+    } else {
+        entry.binds_since_fold += 1;
+        // A bind the witness refused may have moved the bytes with nothing
+        // reading them, which is precisely when the stored fold stops describing
+        // the window.
+        entry.fold_valid &= vouched;
+        ContentAudit::Skipped
+    };
+
+    // Keep the generation only where both halves vouch for the bytes *and* the
+    // audit did not just catch them out. A `Disagreed` audit is not only an
+    // alarm: the vouch it refutes is live, so dropping the generation here is
+    // what stops the next bind serving the stale image again.
+    if !vouched || matches!(audit, ContentAudit::Disagreed) {
         entry.generation = fresh_generation;
     }
     entry.gen = gen;
-    entry.fold = fold;
-    entry.host_seq = host_seq;
-    entry.scoped_seq = scoped_seq;
     entry.pages_epoch = pages_epoch;
     entry.last_seen = witness.binds;
-    verdict
+    GatherObservation { verdict, audit }
 }
 
 
@@ -649,24 +702,61 @@ mod tests {
             runs,
             span: PAGE as u64,
             page_size: PAGE,
-            mapping: None,
         }
     }
 
-    /// Nothing written at any scope since the previous bind.
+    /// This device wrote none of the window's pages since the previous bind.
     const QUIET: HostWriteCounts = HostWriteCounts {
-        global: 1,
-        scoped: 1,
         pages_epoch: 1,
         pages_wrote: Some(false),
     };
 
-    /// A window that saw no host write at any scope.
-    const HOST_QUIET: GatherVerdict = GatherVerdict::CleanSame {
-        global_quiet: true,
-        scoped_quiet: true,
-        pages_quiet: true,
-    };
+    /// One bind, discarding the audit — for the tests that are about the verdict.
+    fn verdict<M: crate::runtime::host::HostOps>(
+        w: &mut GatherWitness,
+        host: &mut M,
+        window: GatherWindow<'_>,
+        counts: HostWriteCounts,
+        gen: u64,
+    ) -> GatherVerdict {
+        observe(w, host, KEY, window, counts, gen).verdict
+    }
+
+    /// Bind `n` times with nothing writing anything, returning the last
+    /// observation.
+    fn bind_quietly<M: crate::runtime::host::HostOps>(
+        w: &mut GatherWitness,
+        host: &mut M,
+        gpas: &[u64],
+        runs: &[GuestRun],
+        n: u32,
+    ) -> GatherObservation {
+        let mut last = None;
+        for _ in 0..n {
+            last = Some(observe(w, host, KEY, one_page(gpas, runs), QUIET, next_gen()));
+        }
+        last.expect("bind_quietly is never called with n == 0")
+    }
+
+    /// Bind quietly until the audit next runs, and return that bind.
+    ///
+    /// Spelled as "until it fires" rather than as a bind count so the tests say
+    /// what they mean and do not encode the stride's off-by-ones — the exact
+    /// bind an audit lands on is [`AUDIT_STRIDE`]'s business, not theirs.
+    fn bind_to_next_audit<M: crate::runtime::host::HostOps>(
+        w: &mut GatherWitness,
+        host: &mut M,
+        gpas: &[u64],
+        runs: &[GuestRun],
+    ) -> GatherObservation {
+        for _ in 0..=2 * AUDIT_STRIDE {
+            let seen = observe(w, host, KEY, one_page(gpas, runs), QUIET, next_gen());
+            if seen.audit != ContentAudit::Skipped {
+                return seen;
+            }
+        }
+        panic!("no audit within two strides, so the fold is never reached at all");
+    }
 
     /// A generation that has never been issued before, as the device's own
     /// counter promises.
@@ -717,11 +807,9 @@ mod tests {
     /// The generation is the whole product of this witness, and its contract is
     /// that it survives exactly as long as the bytes it names.
     ///
-    /// Held while both halves vouch, and replaced by *every* other verdict —
-    /// including one where the fold happens to agree. The fold is a measurement
-    /// this cache will not have once the gather it measures is skipped, so a
-    /// generation kept on the strength of it would be kept on evidence that is
-    /// about to stop existing.
+    /// Held while both halves vouch, and replaced by every other verdict — the
+    /// bytes being unchanged is not the question, because a bind where either
+    /// half saw a write is a bind whose bytes nothing has vouched for.
     #[test]
     fn the_vouched_generation_outlives_a_quiet_bind_and_no_other_kind() {
         let mut host = crate::runtime::host::FakeHost::new();
@@ -736,8 +824,8 @@ mod tests {
         observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs), QUIET, 11);
         assert_eq!(w.vouched_identity(&KEY), Some(10));
 
-        // A host write into the pages, with the bytes unchanged. The fold agrees
-        // and it is not enough.
+        // A host write into the pages, with the bytes unchanged. Unchanged is
+        // not enough: this device wrote them, so nothing vouches for them.
         observe(
             &mut w,
             &mut host,
@@ -763,130 +851,136 @@ mod tests {
     }
 
     /// A window whose bytes and pages both stand still, bound twice: the whole
-    /// point of the exercise, and the cell whose count says what a cache would
-    /// save.
+    /// point of the exercise, and the verdict whose count says what the cache
+    /// saves.
     #[test]
-    fn a_window_nothing_writes_reads_clean_and_unchanged_on_the_second_bind() {
+    fn a_window_nothing_writes_is_vouched_for_on_the_second_bind() {
         let mut host = crate::runtime::host::FakeHost::new();
         let mut w = GatherWitness::default();
         let buf = vec![0xa5u8; PAGE];
         let runs = [run_over(&buf)];
         assert_eq!(
-            observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs), QUIET, next_gen()),
+            verdict(&mut w, &mut host, one_page(&GPAS, &runs), QUIET, next_gen()),
             GatherVerdict::Rearmed,
             "first sight has nothing to compare against"
         );
         assert_eq!(
-            observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs), QUIET, next_gen()),
-            HOST_QUIET
+            verdict(&mut w, &mut host, one_page(&GPAS, &runs), QUIET, next_gen()),
+            GatherVerdict::Vouched
         );
     }
 
-    /// The hypervisor saw the store, and so did the fold. Both halves agree, which
-    /// is what a sound witness looks like on content that really moved.
+    /// The hypervisor half saw the store, so the vouch is refused and the bytes
+    /// are read — which is what a sound witness looks like on content that really
+    /// moved.
     #[test]
-    fn a_guest_store_into_the_window_moves_the_generation_and_the_fold_together() {
+    fn a_guest_store_into_the_window_refuses_the_vouch() {
         let mut host = crate::runtime::host::FakeHost::new();
         let mut w = GatherWitness::default();
         let mut buf = vec![0xa5u8; PAGE];
         let runs = [run_over(&buf)];
         assert_eq!(
-            observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs), QUIET, next_gen()),
+            verdict(&mut w, &mut host, one_page(&GPAS, &runs), QUIET, next_gen()),
             GatherVerdict::Rearmed
         );
         buf[100] ^= 0xff;
         host.guest_wrote_page(GPAS[0]);
         assert_eq!(
-            observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs), QUIET, next_gen()),
-            GatherVerdict::MovedDiff
-        );
-    }
-
-    /// The unsound cell, produced deliberately: bytes changed under a page the
-    /// hypervisor never saw written. This is the shape a host-side writer into
-    /// guest RAM would make, and the reason the probe exists — so if a driven boot
-    /// ever reports `gw_clean_diff`, this test says what that means.
-    #[test]
-    fn bytes_that_move_without_the_hypervisor_seeing_it_read_as_clean_and_different() {
-        let mut host = crate::runtime::host::FakeHost::new();
-        let mut w = GatherWitness::default();
-        let mut buf = vec![0xa5u8; PAGE];
-        let runs = [run_over(&buf)];
-        assert_eq!(
-            observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs), QUIET, next_gen()),
-            GatherVerdict::Rearmed
-        );
-        // No `guest_wrote_page`: the bytes move with the bitmap none the wiser.
-        buf[7] ^= 0xff;
-        assert_eq!(
-            observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs), QUIET, next_gen()),
-            GatherVerdict::CleanDiff {
-                host_wrote: false,
-                scoped_wrote: false,
-                pages_wrote: false
-            },
-            "no host write moved the sequence, so this is a guest store the \
-             bitmap did not see"
-        );
-    }
-
-    /// The cell that would condemn a per-mapping invalidation rule: this device
-    /// wrote *somewhere*, but nothing that could have reached this window, and
-    /// the bytes moved anyway.
-    ///
-    /// A scoped rule reads that as quiet and serves the stale copy. It is a
-    /// distinct finding from the global cell — a global rule would have
-    /// invalidated here and been right — so the two are counted apart rather
-    /// than folded into one "unsound" number that cannot say which rule to build.
-    #[test]
-    fn bytes_moving_while_only_another_mapping_was_written_condemns_the_scoped_rule() {
-        let mut host = crate::runtime::host::FakeHost::new();
-        let mut w = GatherWitness::default();
-        let mut buf = vec![0xa5u8; PAGE];
-        let runs = [run_over(&buf)];
-        assert_eq!(
-            observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs), QUIET, next_gen()),
-            GatherVerdict::Rearmed
-        );
-        // The global count moves; this mapping's does not.
-        buf[9] ^= 0xff;
-        assert_eq!(
-            observe(
-                &mut w,
-                &mut host,
-                KEY,
-                one_page(&GPAS, &runs),
-                HostWriteCounts {
-                    global: 2,
-                    ..QUIET
-                },
-                next_gen()
-            ),
-            GatherVerdict::CleanDiff {
-                host_wrote: true,
-                scoped_wrote: false,
-                pages_wrote: false
+            verdict(&mut w, &mut host, one_page(&GPAS, &runs), QUIET, next_gen()),
+            GatherVerdict::Refused {
+                guest_wrote: true,
+                host_wrote_pages: false
             }
         );
     }
 
-    /// A host that cannot observe guest writes must never produce a clean verdict,
-    /// however still the bytes are. Fail closed: `Unarmed` carries the fold answer
-    /// for the census and vouches for nothing.
+    /// The whole point of moving the fold onto a stride: a vouched bind reads no
+    /// byte of the window at all.
+    ///
+    /// [`ContentAudit::Skipped`] *is* that statement — it is returned only where
+    /// `fold_runs` was not called — so this is the test that would fail if the
+    /// fold went back on the per-bind path, and the reason the audit's outcome is
+    /// reported rather than kept inside the function.
     #[test]
-    fn a_host_that_cannot_watch_guest_writes_never_reads_clean() {
+    fn a_vouched_bind_before_the_stride_reads_none_of_the_window() {
+        let mut host = crate::runtime::host::FakeHost::new();
+        let mut w = GatherWitness::default();
+        let buf = vec![0xa5u8; PAGE];
+        let runs = [run_over(&buf)];
+        // The rearm, then every bind up to but not including the audit.
+        let last = bind_quietly(&mut w, &mut host, &GPAS, &runs, AUDIT_STRIDE + 1);
+        assert_eq!(last.verdict, GatherVerdict::Vouched);
+        assert_eq!(
+            last.audit,
+            ContentAudit::Skipped,
+            "a bind inside the stride folded the window anyway"
+        );
+        // And the one that lands on the stride does fold, with nothing to compare
+        // against yet.
+        let due = bind_to_next_audit(&mut w, &mut host, &GPAS, &runs);
+        assert_eq!(due.audit, ContentAudit::Seeded);
+        // Which then gives the next audit something to check.
+        let checked = bind_to_next_audit(&mut w, &mut host, &GPAS, &runs);
+        assert_eq!(checked.audit, ContentAudit::Agreed);
+    }
+
+    /// The unsound case, produced deliberately: bytes changed under pages neither
+    /// half of the witness saw written. This is the shape a host-side writer into
+    /// guest RAM makes, and it is what the audit exists to catch — so if a driven
+    /// boot ever reports `gw_audit_unsound`, this test says what that means.
+    ///
+    /// The audit is a repair as well as an alarm: the generation it refutes is
+    /// live, so it must not survive the bind that caught it.
+    #[test]
+    fn bytes_moving_under_a_vouch_are_caught_by_the_audit_and_cost_the_generation() {
+        let mut host = crate::runtime::host::FakeHost::new();
+        let mut w = GatherWitness::default();
+        let mut buf = vec![0xa5u8; PAGE];
+        let runs = [run_over(&buf)];
+        // Rearm, then seed a fold the next audit can compare against.
+        bind_quietly(&mut w, &mut host, &GPAS, &runs, 1);
+        assert_eq!(
+            bind_to_next_audit(&mut w, &mut host, &GPAS, &runs).audit,
+            ContentAudit::Seeded
+        );
+        let vouched_gen = w
+            .vouched_identity(&KEY)
+            .expect("a vouched window has a generation");
+
+        // No `guest_wrote_page` and no host write recorded: the bytes move with
+        // both halves of the witness none the wiser.
+        buf[7] ^= 0xff;
+        let caught = bind_to_next_audit(&mut w, &mut host, &GPAS, &runs);
+        assert_eq!(
+            caught.verdict,
+            GatherVerdict::Vouched,
+            "the witness is what is being caught out, so it must still be vouching"
+        );
+        assert_eq!(caught.audit, ContentAudit::Disagreed);
+        assert_ne!(
+            w.vouched_identity(&KEY),
+            Some(vouched_gen),
+            "the refuted generation survived the audit that refuted it, so the \
+             next bind serves the stale image again"
+        );
+    }
+
+    /// A host that cannot observe guest writes must never vouch, however still
+    /// the bytes are. Fail closed: half a witness is not a witness.
+    #[test]
+    fn a_host_that_cannot_watch_guest_writes_never_vouches() {
         let mut host = crate::runtime::host::FakeHost::new();
         host.guest_writes_unobservable = true;
         let mut w = GatherWitness::default();
         let buf = vec![0xa5u8; PAGE];
         let runs = [run_over(&buf)];
         assert_eq!(
-            observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs), QUIET, next_gen()),
+            verdict(&mut w, &mut host, one_page(&GPAS, &runs), QUIET, next_gen()),
             GatherVerdict::Rearmed
         );
         assert_eq!(
-            observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs), QUIET, next_gen()),
-            GatherVerdict::Unarmed { fold_same: true }
+            verdict(&mut w, &mut host, one_page(&GPAS, &runs), QUIET, next_gen()),
+            GatherVerdict::Unarmed
         );
     }
 
@@ -900,17 +994,55 @@ mod tests {
         let runs = [run_over(&buf)];
         let moved = [9 * PAGE as u64];
         assert_eq!(
-            observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs), QUIET, next_gen()),
+            verdict(&mut w, &mut host, one_page(&GPAS, &runs), QUIET, next_gen()),
             GatherVerdict::Rearmed
         );
         assert_eq!(
-            observe(&mut w, &mut host, KEY, one_page(&moved, &runs), QUIET, next_gen()),
+            verdict(&mut w, &mut host, one_page(&moved, &runs), QUIET, next_gen()),
             GatherVerdict::Rearmed,
             "same key, different pages: nothing to compare"
         );
         assert_eq!(
-            observe(&mut w, &mut host, KEY, one_page(&moved, &runs), QUIET, next_gen()),
-            HOST_QUIET
+            verdict(&mut w, &mut host, one_page(&moved, &runs), QUIET, next_gen()),
+            GatherVerdict::Vouched
+        );
+    }
+
+    /// A refused bind between two audits invalidates the stored fold, because it
+    /// may have moved the bytes with nothing reading them.
+    ///
+    /// Without this the next audit would compare against a fold from before a
+    /// legitimate repaint and report `gw_audit_unsound` for a witness that was
+    /// right — an alarm that cries wolf is worse than no alarm, since the whole
+    /// value of this one is that a nonzero count means something.
+    #[test]
+    fn a_refused_bind_between_audits_does_not_leave_a_false_alarm_behind() {
+        let mut host = crate::runtime::host::FakeHost::new();
+        let mut w = GatherWitness::default();
+        let mut buf = vec![0xa5u8; PAGE];
+        let runs = [run_over(&buf)];
+        // Rearm, seed a fold, and reach a vouched steady state.
+        bind_quietly(&mut w, &mut host, &GPAS, &runs, 1);
+        assert_eq!(
+            bind_to_next_audit(&mut w, &mut host, &GPAS, &runs).audit,
+            ContentAudit::Seeded
+        );
+
+        // A guest store the hypervisor *does* see, repainting the window. The
+        // gather happens, so nothing is stale — but the stored fold is now from
+        // before the repaint.
+        buf[11] ^= 0xff;
+        host.guest_wrote_page(GPAS[0]);
+        assert!(matches!(
+            observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs), QUIET, next_gen()).verdict,
+            GatherVerdict::Refused { .. }
+        ));
+
+        let next = bind_to_next_audit(&mut w, &mut host, &GPAS, &runs);
+        assert_eq!(
+            next.audit,
+            ContentAudit::Seeded,
+            "the audit compared against a fold from before a repaint it knew about"
         );
     }
 

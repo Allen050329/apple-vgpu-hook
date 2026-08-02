@@ -2423,9 +2423,6 @@ fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
             runs: &runs,
             span,
             page_size: page,
-            // A task-GVA window names no mapping, so nothing narrower than the
-            // global host-write count can be assumed quiet for it.
-            mapping: None,
         },
     );
     Some((
@@ -2505,7 +2502,6 @@ fn try_type11_sample_zero_copy<M: HostMemory + HostOps>(
             runs: &runs,
             span,
             page_size: page,
-            mapping: Some(mid),
         },
     );
     Some(SampledSourceRequest::GuestRuns(
@@ -2593,7 +2589,6 @@ fn try_type5_sample_zero_copy<M: HostMemory + HostOps>(
             runs: &runs,
             span,
             page_size: page,
-            mapping: Some(mid),
         },
     );
     Some(SampledSourceRequest::GuestRuns(

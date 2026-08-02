@@ -313,8 +313,8 @@ Skipping those gathers needs a witness for "these bytes did not change", and the
 measured answer is that **it takes two**, because they cover disjoint writers:
 
 - The hypervisor dirty bitmap (`HostOps::guest_write_gen`) witnesses guest CPU
-  stores. Measured sound: `gw_clean_diff` — bytes moved with no writer of any
-  kind seen — is **0** across four driven boots.
+  stores. Measured sound: bytes moved with no writer of any kind seen is **0**
+  across four driven boots.
 - `DeviceState::host_writes` witnesses this device's own writes, which the bitmap
   is defined not to see. It has to be **page-exact**: a per-mapping count was
   tried and read 15 stale binds a minute, because guest pages are reachable under
@@ -322,6 +322,21 @@ measured answer is that **it takes two**, because they cover disjoint writers:
 
 With both halves in place the rail caches: measured live at **5852 gathers skipped
 against 4167 taken and 75.8 % of its bytes never read**, screen correct.
+
+**A skip that still folds the window is not a skip, and that is how the first
+version shipped.** The content fold that scored the rules above ran on every bind,
+including the ones the cache served, so the bytes were still read — the copy was
+gone and the cold read was not. The fold is now an audit on one bind in
+`gather_witness::AUDIT_STRIDE`, and the decision is the two witness halves alone.
+Its counterexample cell `gw_audit_unsound` is a standing alarm that also drops the
+generation it refutes, so a witness that goes unsound self-heals within a stride
+instead of serving a stale image forever. The counters that scored the two losing
+rules (`gw_clean_*`, `gw_hit_global`, `gw_hit_scoped`) are gone with them; a doc
+citing those names is describing a measurement, not a log you can grep.
+
+The general shape is worth carrying: **when a measurement licenses a mechanism,
+check whether the measurement is still on the hot path afterwards.** Here it was
+the entire remaining cost of the thing being optimised.
 
 Getting the second one complete took two passes, and the lesson generalises. A
 hand-picked list of writer call sites missed `gva_view::map_fresh_span_within`,

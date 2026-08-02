@@ -6,26 +6,39 @@
 //!
 //! # Why pages and not mappings
 //!
-//! A per-mapping count was measured first and it leaks. One driven boot read
-//! `gw_clean_diff_scoped_quiet = 15`: fifteen binds where the sampled window's
-//! own mapping had not been written, the guest had not written, and the bytes
-//! moved anyway. Guest pages are reachable under more than one mapping id —
-//! `deferred_alias_pages` is the rail built for exactly that — so "mapping 12 was
-//! not written" is not "these pages were not written", and a cache keyed on the
-//! former serves stale pixels fifteen times a minute.
+//! Three candidate rules were scored against a full content fold before this one
+//! was built, each by its own census counter. Those counters are gone with the
+//! rules they scored — [`super::gather_witness`] takes only the page-exact answer
+//! now — so the names below are what the readings were called at the time and are
+//! not greppable in a current log.
 //!
-//! The same boot read `gw_clean_diff = 0`: a *global* count, which moves for every
-//! write anywhere, had no counterexample, because it moves for every write
-//! including the ones a narrower rule fails to attribute.
+//! A per-mapping count was measured first and it leaks. One driven boot read
+//! fifteen binds where the sampled window's own mapping had not been written, the
+//! guest had not written, and the bytes moved anyway. Guest pages are reachable
+//! under more than one mapping id — `deferred_alias_pages` is the rail built for
+//! exactly that — so "mapping 12 was not written" is not "these pages were not
+//! written", and a cache keyed on the former serves stale pixels fifteen times a
+//! minute.
+//!
+//! The same boot read zero counterexamples for a *global* count, which moves for
+//! every write anywhere — because it moves for every write including the ones a
+//! narrower rule fails to attribute. Sound, and it invalidates a texture because
+//! an unrelated scanout was composited.
 //!
 //! # Where it stands
 //!
 //! Once every writer records here — which took a second pass, because
 //! `map_fresh_span_within`'s callers write through a raw alias and were invisible
-//! to a hand-picked list of call sites — a driven boot reads
-//! **`gw_clean_diff_pages_quiet = 0`**, alongside zero for both wider rules. Of
-//! the binds where the guest was quiet and the bytes were identical, this rule
-//! serves 93 %; the rest are windows whose page set had just moved.
+//! to a hand-picked list of call sites — a driven boot reads **zero** binds where
+//! the page-exact rule vouched and the bytes had moved, alongside zero for both
+//! wider rules. Of the binds where the guest was quiet and the bytes were
+//! identical, this rule serves 93 %; the rest are windows whose page set had just
+//! moved.
+//!
+//! That measurement is what the fold is still there for. It runs on one bind in
+//! [`super::gather_witness::AUDIT_STRIDE`] rather than all of them, and its
+//! counterexample cell is `gw_audit_unsound`: a standing alarm on the rule this
+//! module exists to make sound, rather than the per-bind decision it began as.
 //!
 //! What that licenses is a cache over the zero-copy sampled gathers, valid iff
 //! the hypervisor's guest generation has not moved **and** this says the pages
