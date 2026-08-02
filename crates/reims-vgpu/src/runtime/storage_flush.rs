@@ -981,34 +981,48 @@ pub fn flush_mapping_windows_before_fence<M: HostMemory + HostOps>(
     // forbids because importing a host pointer over guest RAM gives the host GPU
     // write access to guest memory.
     //
-    // Flushing *fewer times* was closed by the same witness, and **that closure
-    // does not hold on every workload.** It was reached from two driven WebGL
-    // probes where [`crate::model::RenderFlushWitness::landed_us`] bucketed
-    // `render_flush_age_sub_ms` at **0** against 3079 and 3090 at `_frame_plus`
-    // — nothing rewritten inside a millisecond, so the 99% nobody reads was one
-    // full-screen composite per displayed frame at exactly the rate the guest
-    // paints, and superseding across fence boundaries would have had nothing to
-    // collapse.
+    // Flushing *fewer times* is closed as well, and by the same witness.
+    // [`crate::model::RenderFlushWitness::landed_us`] buckets how long each
+    // landing survived before the next replaced it, and across two driven
+    // probes `render_flush_age_sub_ms` is **0** against 3079 and 3090 at
+    // `_frame_plus`. Nothing is ever rewritten inside a millisecond, so the 99%
+    // nobody reads is not one surface written repeatedly inside a burst — it is
+    // one full-screen composite per displayed frame, landed once each, at
+    // exactly the rate the guest paints. Superseding windows across fence
+    // boundaries would have nothing to collapse.
     //
-    // A window-move workload says the opposite, and the difference is the whole
-    // lever. Moving a 1000x640 Safari window at ~115 Hz
-    // (`scripts/window-drag-probe`), per second:
+    // **A window-move workload does not reopen that, and it is worth recording
+    // why not, because the numbers look at first as though it does.** Moving a
+    // 1000x640 Safari window at ~115 Hz (`scripts/window-drag-probe`), per
+    // second, against an idle control on the same guest of zero draws and zero
+    // flushes at `duty` 0.001:
     //
     // ```text
     // surface_flush 212   render_flush_age_sub_frame 139   _frame_plus 73
     // write_split   frag=212  bytes=1758412800  (8 294 400 each: 1920x1080x4)
-    // host_window_cadence presents=11 offered=11
+    // host_window_cadence presents=11 offered=11   drain_duty duty=0.98
     // render_flush_pages_used 0-5    render_flush_pages_unread 212
     // guest_read_declared 3
     // ```
     //
-    // **Two hundred and twelve full-frame writebacks — 1.76 GB/s — to present
-    // eleven frames**, with two thirds of them landing a window younger than one
-    // frame. The guest is painting far faster than the device presents, so most
-    // of those landings are superseded before anything could read them, which is
-    // exactly the collapse the WebGL measurement found nothing of. Whatever is
-    // built here must be measured on a *moving-window* workload as well as a
-    // WebGL one; one number closed this lever and the other reopens it.
+    // Two thirds of landings are replaced inside a frame here, where the WebGL
+    // probe had 97% surviving one. But the bucket that means "collapsible" is
+    // `_sub_ms` — a burst rewriting one surface inside a single drain tranche,
+    // which no fence boundary separated and nothing could have observed between
+    // — and it is **still absent**. What moved is `_sub_frame`: landings 1 to
+    // 8.33 ms apart, each its own composite behind its own fence. Every one of
+    // those fences entitles the guest to the bytes, so collapsing them is the
+    // undeclared-read question again and not a separate lever.
+    //
+    // What the workload *does* establish is the size of the problem, which is
+    // larger than the WebGL figure suggested: **212 full-frame writebacks and
+    // 1.76 GB/s to put eleven frames on the screen**, with the worker at 0.98
+    // duty. The device keeps up with 212 fences a second and presents 11, so
+    // roughly 200 composites per second are written back to guest RAM and never
+    // displayed. Whether that ratio is the guest asking or this device
+    // presenting too little is not answered by any counter here, and it is the
+    // question to take next — `validity_wb_unstated=180` against
+    // `validity_wb_licensed=32` in the same second is where to start.
     //
     // What is left is not doing it. Every landing is speculative
     // (`mapw_fence_flush == surface_flush`) and 99% of what it lands is read by

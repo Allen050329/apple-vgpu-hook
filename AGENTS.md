@@ -801,6 +801,17 @@ cost `flush_mapping_windows_before_fence` documents, now seen dominating a
 window-move workload rather than a WebGL one. A single tranche blocks the worker
 for ~130 ms, fifteen frames at 120 Hz.
 
+The device keeps up with 212 fences a second and presents 11, so **roughly 200
+full-frame composites a second are written back to guest RAM and never
+displayed**. Do not read that as a superseding opportunity: the bucket that
+means collapsible is `render_flush_age_sub_ms` (a burst rewriting one surface
+inside one drain tranche, no fence between) and it is **still 0** here. What
+grew is `_sub_frame`, landings 1-8.33 ms apart, each its own composite behind
+its own fence — and every fence entitles the guest to the bytes, so collapsing
+them is the undeclared-read question and not a separate lever. This paragraph
+exists because the first write-up of this measurement claimed the lever had
+reopened, and it had not.
+
 Two cautions before building on it. The stressor moves the window through the
 accessibility API, not a pointer drag: `CGEventPost` is silently discarded here
 because the posting process is not trusted for Accessibility and TCC.db cannot be
