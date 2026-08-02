@@ -10,9 +10,12 @@
 //! guest window, then re-establishes the residency mirror so chained seed
 //! skips keep working.
 //!
-//! Guest CPU accesses that never cross our host paths cannot be intercepted —
-//! the same accepted exposure as resident render targets under
-//! `skip_readback`. Choke points: `mapping_write` read/write entries,
+//! Guest CPU accesses that never cross our host paths cannot be intercepted by
+//! anything in this device — the same accepted exposure as resident render
+//! targets under `skip_readback`. That is a statement about the device and not
+//! about what is possible; `flush_mapping_windows_before_fence` records what a
+//! hypervisor-level witness for them would take, and why it has to be a
+//! measurement before it is a mechanism. Choke points: `mapping_write` read/write entries,
 //! `mapper::read/write_mapping_bytes`, and the drain unmap/ReplacePhysical
 //! sites (which drop-with-fail instead of writing through recycled pages).
 
@@ -845,6 +848,60 @@ pub fn flush_linear_windows_before_fence<M: HostMemory + HostOps>(
 ///
 /// The async-readback split (release the device lock across the fence wait) is
 /// the step that does not require any of them.
+///
+/// # What witnessing the undeclared read would take
+///
+/// The second route is the one that pays on every host, so it is worth being
+/// exact about why it is not simply the write witness turned around.
+///
+/// [`crate::runtime::gather_witness`] skips a gather when two halves agree that
+/// nothing wrote a page set: [`HostOps::guest_write_gen`] over the hypervisor
+/// dirty bitmap for guest CPU stores, and [`crate::runtime::host_writes`] for
+/// this device's own writes, which the bitmap is defined not to see. Neither
+/// half has a reading counterpart and no third one can be added, because **a
+/// read leaves no trace anywhere**. A dirty bitmap is a record of stores; a page
+/// the guest loaded and a page it never touched are the same bits in it. That is
+/// a property of the hardware, not a gap in the shim.
+///
+/// The only way a load becomes observable is to make it fault, which means the
+/// page must not be present in the guest's mapping when the load happens. On
+/// Linux that is `userfaultfd`: register the pages, punch them out, and the
+/// access traps to a handler that supplies the bytes before the vCPU resumes.
+/// QEMU already runs this combination for post-copy migration, so KVM taking a
+/// uffd fault on guest RAM is settled behaviour rather than a research question
+/// — but note what is being borrowed. Post-copy fills a page once and is done;
+/// this rail would re-arm the same pages every frame, so the per-fault cost and
+/// the arm/disarm cost are on the hot path in a way they never are there.
+///
+/// **The first build of this should be a counter, not a rail, and the reason is
+/// in the numbers above rather than in caution.** The measured case for
+/// demand-driving is an upper bound on waste, not a measurement of demand: 0.7%
+/// of guest-page writes are read by a device reader and 4.2% of landings are
+/// declared by `SynchronizeResources`, and neither can see an undeclared guest
+/// load. The undeclared load is known to exist — the black-wallpaper fade
+/// snapshot named in [`flush_mapping_for_guest_read`] is one — but its *rate*
+/// has never been measured, and the entire value of the route depends on it. So
+/// arm a sample of windows (the [`crate::runtime::gather_witness::AUDIT_STRIDE`]
+/// shape is the precedent), still write the bytes, still fill correct content on
+/// fault, and count faults against landings. That answers "how often does the
+/// guest read what nobody declared" for a fraction of one rail's cost, and it is
+/// the number that decides whether the fast path is worth building at all.
+///
+/// Three hazards, recorded because each one turns the result into a wrong one
+/// rather than a noisy one:
+///
+/// - A fault is not a *read*. `UFFDIO_REGISTER_MODE_MISSING` traps the first
+///   access of either kind, so a fault count is an upper bound that includes the
+///   guest's own stores — which happen on 73% of these windows, per
+///   `render_flush_over_guest_write` above. Separating them needs the fault's
+///   `UFFD_PAGEFAULT_FLAG_WRITE`, and a rail that ignores it will conclude the
+///   guest reads everything.
+/// - Arming a page this device is about to write itself is a fault this rail
+///   caused, and `observe::gate`'s `MAP_PAGES_SITES` is the authority
+///   on which code writes guest RAM — not a grep, which has already missed
+///   `gva_view::map_fresh_span_within` once.
+/// - Punching a page out loses whatever the guest had put there, so the content
+///   to fill with has to be captured before the punch, not after.
 ///
 /// # Ordering
 ///
