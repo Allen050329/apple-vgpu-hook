@@ -1979,6 +1979,41 @@ impl RunCopy<'_> {
     }
 }
 
+/// The parts of `[lo, hi)` a selection covers, ascending.
+///
+/// `None` selects the window whole. `Some(&[])` selects **nothing**, which is
+/// why this is an `Option` rather than "empty means everything": a caller
+/// handing over the ranges a difference pass found changed has an empty list
+/// exactly when the frame is entirely redundant, and reading that as "write it
+/// all" would turn the cheapest landing into the most expensive one.
+///
+/// `ranges` is ascending and disjoint. The first candidate is found by binary
+/// search rather than by walking from the front, so a caller with thousands of
+/// runs — which a 256-byte-tile bitmap over an 8 MB frame is — costs
+/// `O(log n)` per query instead of `O(n)`. Nothing here assumes successive
+/// queries ascend, so a caller may probe windows in any order.
+fn selected_within(
+    ranges: Option<&[(u64, u64)]>,
+    lo: u64,
+    hi: u64,
+) -> impl Iterator<Item = (u64, u64)> + '_ {
+    let whole = ranges.is_none();
+    let list: &[(u64, u64)] = ranges.unwrap_or(&[]);
+    let start = list.partition_point(|&(_, e)| e <= lo);
+    std::iter::once((lo, hi))
+        .filter(move |_| whole && lo < hi)
+        .chain(
+            list[start..]
+                .iter()
+                .take_while(move |&&(s, _)| s < hi)
+                .filter_map(move |&(s, e)| {
+                    let a = s.max(lo);
+                    let b = e.min(hi);
+                    (a < b).then_some((a, b))
+                }),
+        )
+}
+
 /// Copy `[off, off+len)` between a caller buffer and the mapping's guest pages.
 ///
 /// One packed contig view when the mapping has one that covers the range;
@@ -1990,6 +2025,13 @@ impl RunCopy<'_> {
 /// to exist once per direction. One of those directions is the guest-corruption
 /// rail, so a bound corrected on the read copy and not the write copy would
 /// have been silent — and the two are otherwise identical.
+///
+/// `only` narrows what is moved without narrowing what is *resolved*: the page
+/// list, its packed runs and the imports are worked out for `[off, off+len)`
+/// whole, and each mapped run then moves only the parts of itself the selection
+/// names. That is the whole reason it is a parameter rather than a loop in the
+/// caller — resolving the page list per run costs `O(pages)` each time, so a
+/// caller looping over a thousand runs pays it a thousand times.
 ///
 /// `site` names the caller in the refusal lines. Every failure here loses the
 /// caller's bytes, so all four are named; the read direction used to return a
@@ -2003,6 +2045,7 @@ fn copy_mapping_runs<H: HostMemory + HostOps>(
     mapping_id: u32,
     off: u64,
     mut copy: RunCopy<'_>,
+    only: Option<&[(u64, u64)]>,
     site: &str,
 ) -> bool {
     if copy.is_write() {
@@ -2024,22 +2067,30 @@ fn copy_mapping_runs<H: HostMemory + HostOps>(
     // Fast path: one packed view covering the whole range.
     if let Some((ptr, view_len)) = ensure_contig_view(state, host, mapping_id) {
         if (view_len as u64) >= need_end && (off as usize) + len <= view_len {
-            if let (Some(walk), Some(buf)) = (audit.as_mut(), copy.write_src()) {
-                // SAFETY: exactly the range `apply` is about to write below,
-                // and the audit only reads it.
-                unsafe {
-                    walk.note_write(
-                        off,
-                        (ptr as *const u8).add(off as usize),
-                        &buf[..len],
-                        page_size,
-                    );
+            // Collected before the loop because the audit and the copy both
+            // borrow `copy`, and the selection borrows nothing either owns.
+            let spans: Vec<(u64, u64)> = selected_within(only, off, need_end).collect();
+            for (lo, hi) in spans {
+                let buf_off = (lo - off) as usize;
+                let n = (hi - lo) as usize;
+                if let (Some(walk), Some(buf)) = (audit.as_mut(), copy.write_src()) {
+                    // SAFETY: exactly the range `apply` is about to write below,
+                    // and the audit only reads it.
+                    unsafe {
+                        walk.note_write(
+                            lo,
+                            (ptr as *const u8).add(lo as usize),
+                            &buf[buf_off..buf_off + n],
+                            page_size,
+                        );
+                    }
                 }
-            }
-            // SAFETY: the view covers `need_end`, checked directly above.
-            unsafe { copy.apply(ptr, off as usize, 0, len) };
-            if copy.is_write() {
-                note_mapping_write_footprint(state, mapping_id, off, len as u64);
+                // SAFETY: the view covers `need_end`, checked directly above,
+                // and `[lo, hi)` is within `[off, need_end)` by construction.
+                unsafe { copy.apply(ptr, lo as usize, buf_off, n) };
+                if copy.is_write() {
+                    note_mapping_write_footprint(state, mapping_id, lo, n as u64);
+                }
             }
             return true;
         }
@@ -2089,31 +2140,43 @@ fn copy_mapping_runs<H: HostMemory + HostOps>(
             ));
             return false;
         }
-        if let (Some(walk), Some(buf)) = (audit.as_mut(), copy.write_src()) {
-            // SAFETY: exactly the range `apply` is about to write below, whose
-            // bounds were checked directly above; the audit only reads it.
-            unsafe {
-                walk.note_write(
-                    copy_lo,
-                    (ptr as *const u8).add(host_off),
-                    &buf[buf_off..buf_off + n],
-                    page_size,
+        // The selection is applied *inside* the mapped run, so a run the
+        // selection touches nowhere still costs its import — and a run it
+        // touches in twenty places costs only one. Splitting the import per
+        // selected span instead would map and unmap the same pages repeatedly.
+        let spans: Vec<(u64, u64)> = selected_within(only, copy_lo, copy_hi).collect();
+        for (sel_lo, sel_hi) in spans {
+            let buf_off = (sel_lo - off) as usize;
+            let host_off = (sel_lo - run_mlo) as usize;
+            let n = (sel_hi - sel_lo) as usize;
+            if let (Some(walk), Some(buf)) = (audit.as_mut(), copy.write_src()) {
+                // SAFETY: exactly the range `apply` is about to write below,
+                // whose bounds are within the window checked directly above;
+                // the audit only reads it.
+                unsafe {
+                    walk.note_write(
+                        sel_lo,
+                        (ptr as *const u8).add(host_off),
+                        &buf[buf_off..buf_off + n],
+                        page_size,
+                    );
+                }
+            }
+            // SAFETY: the map covers `total`, and `host_off + n <= total` and
+            // `buf_off + n <= len` were both just checked for the enclosing
+            // window, which `[sel_lo, sel_hi)` is inside.
+            unsafe { copy.apply(ptr, host_off, buf_off, n) };
+            if copy.is_write() {
+                // Packed run, so the `n` bytes at `host_off` are the `n` bytes
+                // at `run_gpas[0] + host_off`. Marked per span rather than once
+                // over the whole range because the runs are what is contiguous;
+                // the mapping's list between them is not.
+                crate::observe::footprint::note_written_range(
+                    crate::observe::footprint::Rail::Mapping,
+                    run_gpas[0].saturating_add(host_off as u64),
+                    n as u64,
                 );
             }
-        }
-        // SAFETY: the map covers `total`, and `host_off + n <= total` and
-        // `buf_off + n <= len` were both just checked.
-        unsafe { copy.apply(ptr, host_off, buf_off, n) };
-        if copy.is_write() {
-            // Packed run, so the `n` bytes at `host_off` are the `n` bytes at
-            // `run_gpas[0] + host_off`. Marked per run rather than once over
-            // the whole range because the runs are what is contiguous; the
-            // mapping's list between them is not.
-            crate::observe::footprint::note_written_range(
-                crate::observe::footprint::Rail::Mapping,
-                run_gpas[0].saturating_add(host_off as u64),
-                n as u64,
-            );
         }
         host.unmap_pages(ptr, total);
     }
@@ -2143,6 +2206,34 @@ pub fn write_mapping_bytes<H: HostMemory + HostOps>(
     mapping_id: u32,
     off: u64,
     buf: &[u8],
+    vouched: &PagesVouched,
+) -> bool {
+    write_mapping_bytes_only(state, host, mapping_id, off, buf, None, vouched)
+}
+
+/// [`write_mapping_bytes`], storing only the parts of `buf` that `only` names.
+///
+/// `only` is in the same mapping-linear space as `off`, ascending and disjoint;
+/// `None` stores the buffer whole. Everything the write owes before the first
+/// byte moves — the deferred-writeback flush, the residency invalidation, the
+/// re-check of `vouched` and the payload sample — is owed once for the span
+/// `buf` covers and is done once here, whatever the selection turns out to
+/// name. That is what makes this different from calling the whole-buffer form
+/// once per run: `flush_intersecting` alone re-scans the deferred windows, and
+/// the walk below re-resolves the mapping's page list, so a thousand-run frame
+/// through the loop shape pays both a thousand times.
+///
+/// A selection that names nothing still does the prologue. It has to: the
+/// pages are about to be declared current with `buf` by the caller's
+/// `mark_mapping_written`, and a pending deferred window left unflushed under
+/// them would land afterwards and put an older frame on top.
+pub fn write_mapping_bytes_only<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+    mapping_id: u32,
+    off: u64,
+    buf: &[u8],
+    only: Option<&[(u64, u64)]>,
     vouched: &PagesVouched,
 ) -> bool {
     if buf.is_empty() {
@@ -2180,7 +2271,15 @@ pub fn write_mapping_bytes<H: HostMemory + HostOps>(
     // Sampled payload shape, taken once for the call rather than per run, so a
     // fragmented write and a packed one of the same bytes count the same.
     crate::observe::footprint::note_written_payload(buf);
-    copy_mapping_runs(state, host, mapping_id, off, RunCopy::Write(buf), "mapping_write")
+    copy_mapping_runs(
+        state,
+        host,
+        mapping_id,
+        off,
+        RunCopy::Write(buf),
+        only,
+        "mapping_write",
+    )
 }
 
 /// Read mapping linear `[off, off+buf.len())` via packed map_pages runs.
@@ -2203,7 +2302,15 @@ pub fn read_mapping_bytes<H: HostMemory + HostOps>(
         off,
         off.saturating_add(buf.len() as u64),
     );
-    copy_mapping_runs(state, host, mapping_id, off, RunCopy::Read(buf), "mapping_read")
+    copy_mapping_runs(
+        state,
+        host,
+        mapping_id,
+        off,
+        RunCopy::Read(buf),
+        None,
+        "mapping_read",
+    )
 }
 
 /// Report a per-run host-pointer import that took at least a millisecond.
@@ -2986,6 +3093,56 @@ mod revalidate_tests {
 
 #[cfg(test)]
 mod tests {
+    use super::selected_within;
+
+    fn sel(ranges: Option<&[(u64, u64)]>, lo: u64, hi: u64) -> Vec<(u64, u64)> {
+        selected_within(ranges, lo, hi).collect()
+    }
+
+    /// `None` is the whole window and `Some(&[])` is none of it. The two must
+    /// never collapse: a difference pass whose frame is entirely redundant
+    /// hands over an empty list, and reading that as "everything" would make
+    /// the cheapest landing the most expensive one.
+    #[test]
+    fn an_absent_selection_and_an_empty_one_are_opposites() {
+        assert_eq!(sel(None, 10, 20), vec![(10, 20)]);
+        assert_eq!(sel(Some(&[]), 10, 20), vec![]);
+        // An empty window selects nothing either way.
+        assert_eq!(sel(None, 10, 10), vec![]);
+    }
+
+    /// Each selected range is clipped to the window, and ranges wholly outside
+    /// it contribute nothing.
+    #[test]
+    fn a_selection_is_clipped_to_the_window() {
+        let ranges = [(0u64, 8u64), (16, 24), (32, 40)];
+        assert_eq!(sel(Some(&ranges), 4, 20), vec![(4, 8), (16, 20)]);
+        assert_eq!(sel(Some(&ranges), 8, 16), vec![]);
+        assert_eq!(sel(Some(&ranges), 0, 64), vec![(0, 8), (16, 24), (32, 40)]);
+        assert_eq!(sel(Some(&ranges), 40, 64), vec![]);
+        // A window inside one range yields exactly that window.
+        assert_eq!(sel(Some(&ranges), 18, 22), vec![(18, 22)]);
+    }
+
+    /// The binary search must land on the first range whose *end* is past the
+    /// window start, not the first whose start is. A range straddling the
+    /// window's left edge is the case a `start >= lo` search silently drops,
+    /// and dropping it loses guest pixels rather than failing.
+    #[test]
+    fn a_range_straddling_the_window_start_is_not_skipped() {
+        let ranges = [(0u64, 100u64), (200, 300)];
+        assert_eq!(sel(Some(&ranges), 50, 250), vec![(50, 100), (200, 250)]);
+    }
+
+    /// Queries need not ascend — the walk re-finds its start each time — so a
+    /// caller may probe page runs in whatever order its page list gives them.
+    #[test]
+    fn windows_may_be_queried_out_of_order() {
+        let ranges = [(0u64, 8u64), (16, 24), (32, 40)];
+        assert_eq!(sel(Some(&ranges), 32, 40), vec![(32, 40)]);
+        assert_eq!(sel(Some(&ranges), 0, 8), vec![(0, 8)]);
+        assert_eq!(sel(Some(&ranges), 16, 24), vec![(16, 24)]);
+    }
 
     /// A type-4 surface can be re-pointed by the guest with no packet at all,
     /// and this is the only thing that can see it.
