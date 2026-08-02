@@ -1398,6 +1398,32 @@ impl ResourcePools {
     /// `ptr` — a read-modify-write in place would fault the write-combined
     /// case into a far slower path.
     ///
+    /// One store per pixel, not four. The exchange used to be four separate
+    /// one-byte stores into the mapped span; reading and writing whole
+    /// `[u8; 4]` pixels keeps the "never load from `ptr`" property — a store of
+    /// a whole element is not a read-modify-write — while giving the compiler
+    /// an aligned 32-bit move it can widen.
+    ///
+    /// **That was done on a hypothesis and the hypothesis was wrong, so do not
+    /// read a speedup into it.** `draw_phase`'s `stage_us` divided by
+    /// `engine_delta`'s `seed_upload_bytes` reads ~1.1 GB/s against 5.2-8.8 GB/s
+    /// for `write_staging_from_runs`, which does the same job into the same
+    /// memory class with a plain `copy_nonoverlapping`, and this loop looked
+    /// like the difference. It is not: `stage_us` also carries vertex, index and
+    /// storage staging, so that ratio is a rate for a mixture.
+    ///
+    /// `swap_rb_us` / `swap_rb_kb` time this write and nothing else, and they
+    /// acquit it. Live x86/PCI, six windows: **6.1, 6.4, 7.1, 8.0, 8.6 and
+    /// 10.5 GB/s**, against `stage_us` shares of **0 % in every driven window
+    /// and 5-15 % in the sparse ones** — including a window whose worst draw was
+    /// 35.7 ms and whose swizzle was 5 % of its staging. Whatever holds
+    /// `stage_us`, it is not this.
+    ///
+    /// What the rewrite is worth is the test below: the exchange is the part
+    /// that can be silently wrong (every seeded LOAD composites with red and
+    /// blue swapped), and before this it lived in pointer arithmetic no test
+    /// could reach.
+    ///
     /// A trailing partial pixel (`len % 4 != 0`) is copied through unswizzled;
     /// a seed is always whole RGBA8 pixels, so the remainder is empty in
     /// practice and this only keeps the mapped span fully defined.
@@ -1414,22 +1440,26 @@ impl ResourcePools {
                 std::ptr::write_bytes(ptr, 0, size as usize);
                 return Ok(());
             }
-            let whole = rgba.len() / 4 * 4;
-            for i in (0..whole).step_by(4) {
-                let px = rgba.as_ptr().add(i);
-                let dst = ptr.add(i);
-                *dst = *px.add(2);
-                *dst.add(1) = *px.add(1);
-                *dst.add(2) = *px;
-                *dst.add(3) = *px.add(3);
-            }
-            if whole < rgba.len() {
-                std::ptr::copy_nonoverlapping(
-                    rgba.as_ptr().add(whole),
-                    ptr.add(whole),
-                    rgba.len() - whole,
-                );
-            }
+            // The mapped span is at least `rgba.len()` and is exclusively ours
+            // for the duration of this call, so a slice over it is sound. It
+            // exists so the transformation can be a plain function with a test
+            // rather than pointer arithmetic no test can reach.
+            //
+            // Timed on its own, because `draw_phase`'s `stage_us` also carries
+            // vertex, index and storage staging: dividing that by
+            // `seed_upload_bytes` gives a rate contaminated by whatever else the
+            // draw staged, which is enough to see the seed path is slow and not
+            // enough to say what limits it. `swap_rb_us` against `swap_rb_kb` is
+            // this write and nothing else, so it can be read against the memcpy
+            // rate `write_staging_from_runs` gets into the same memory class and
+            // convict either the loop or the memory.
+            let started = std::time::Instant::now();
+            exchange_rb_into(rgba, std::slice::from_raw_parts_mut(ptr, rgba.len()));
+            crate::runtime::drain::note_store_route_us(
+                "swap_rb_us",
+                started.elapsed().as_micros() as u64,
+            );
+            crate::runtime::drain::note_store_route_n("swap_rb_kb", (rgba.len() / 1024) as u64);
         }
         Ok(())
     }
@@ -2821,5 +2851,76 @@ mod recycle_tests {
             peak <= depth,
             "outstanding population is bounded by the ring depth, got {peak}"
         );
+    }
+}
+
+/// Copy `src` into `dst` with the R and B channels of every whole RGBA8 pixel
+/// exchanged, writing each destination byte exactly once.
+///
+/// Split out of [`Pools::write_staging_swap_rb`] so the transformation has a
+/// test: that method's destination is a mapped Vulkan allocation, so nothing
+/// about it is reachable from a unit test, and the exchange is the part that can
+/// be wrong. `dst` is written and never read, which is what keeps the
+/// write-combined case off a read-modify-write path — see the caller for the
+/// measurement that motivated writing whole pixels instead of single bytes.
+///
+/// A trailing partial pixel is copied through unexchanged. Bytes of `dst` past
+/// `src.len()` are left alone; the caller owns whatever the mapped span needs
+/// beyond the source.
+pub(crate) fn exchange_rb_into(src: &[u8], dst: &mut [u8]) {
+    let n = src.len().min(dst.len());
+    let whole = n / 4 * 4;
+    for (s, d) in src[..whole].chunks_exact(4).zip(dst[..whole].chunks_exact_mut(4)) {
+        d.copy_from_slice(&[s[2], s[1], s[0], s[3]]);
+    }
+    dst[whole..n].copy_from_slice(&src[whole..n]);
+}
+
+#[cfg(test)]
+mod exchange_rb_tests {
+    use super::exchange_rb_into;
+
+    /// The exchange is what the caller's correctness rests on: get it wrong and
+    /// every seeded LOAD composites with red and blue swapped.
+    #[test]
+    fn whole_pixels_swap_red_and_blue_and_leave_green_and_alpha() {
+        let src = [1u8, 2, 3, 4, 250, 251, 252, 253];
+        let mut dst = [0u8; 8];
+        exchange_rb_into(&src, &mut dst);
+        assert_eq!(dst, [3, 2, 1, 4, 252, 251, 250, 253]);
+    }
+
+    /// It is an involution, which is why one function serves both directions:
+    /// a semantic-RGBA seed into a BGRA attachment and a guest-scanout-order
+    /// seed into an RGBA target.
+    #[test]
+    fn exchanging_twice_is_the_identity() {
+        let src: Vec<u8> = (0u8..=255).collect();
+        let mut once = vec![0u8; src.len()];
+        let mut twice = vec![0u8; src.len()];
+        exchange_rb_into(&src, &mut once);
+        exchange_rb_into(&once, &mut twice);
+        assert_eq!(twice, src);
+    }
+
+    /// A trailing partial pixel goes through unexchanged rather than being
+    /// dropped, so the mapped span is fully defined even for a length the
+    /// caller says cannot occur.
+    #[test]
+    fn a_trailing_partial_pixel_is_copied_through() {
+        let src = [9u8, 8, 7, 6, 5, 4];
+        let mut dst = [0u8; 6];
+        exchange_rb_into(&src, &mut dst);
+        assert_eq!(dst, [7, 8, 9, 6, 5, 4]);
+    }
+
+    /// The copy is bounded by the shorter of the two, so a destination shorter
+    /// than the source cannot walk off the end of the mapped span.
+    #[test]
+    fn a_short_destination_bounds_the_copy() {
+        let src = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        let mut dst = [0u8; 4];
+        exchange_rb_into(&src, &mut dst);
+        assert_eq!(dst, [3, 2, 1, 4]);
     }
 }
