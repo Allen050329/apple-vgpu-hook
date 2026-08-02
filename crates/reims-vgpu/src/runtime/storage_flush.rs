@@ -941,6 +941,41 @@ pub fn flush_mapping_windows_before_fence<M: HostMemory + HostOps>(
     // is the remaining route, and it is a hypervisor-side change rather than a
     // device-side one.
     //
+    // ## How much of it lands for nobody, and why declarations cannot replace it
+    //
+    // That paragraph rested on one witness, which sees only *device* readers.
+    // The guest's own declared reads are now counted too
+    // ([`flush_mapping_for_guest_read`]), so both consumers can be bounded at
+    // once. One driven x86/PCI boot, three Safari probes, summed over its
+    // `store_routes` windows:
+    //
+    // ```text
+    // mapw_fence_flush           8051   windows landed
+    // render_flush_pages_used     187   landings a device reader consumed  (2.3%)
+    // render_flush_pages_unread  7774
+    // guest_read_declared         778   guest declarations of a CPU read
+    // guest_read_on_flushed_mid   339   of those, on a mapping this rail writes (4.2% of landings)
+    // guest_read_on_other_mid     439
+    // ```
+    //
+    // So **at most ~6.5 % of the writeback has a witnessed consumer**, and the
+    // two sets may overlap, so that is a ceiling rather than a total. Ninety-odd
+    // per cent of the largest cost in this device lands for a consumer nobody
+    // has ever observed. That is the case for building the read witness.
+    //
+    // It is also the case against the cheap version of it. Declarations cover
+    // 4.2 % of landings, so **dropping the eager rail and relying on op 0x35
+    // would lose the other 95 %** — the tripwire is required, not an
+    // optimisation on top of the declarations. And the two rates do not move
+    // together: an earlier, lighter boot read 1035 declarations against 3379
+    // landings (0.31 each) where this one reads 778 against 8051 (0.10), so the
+    // flush rate scales with rendering and the declaration rate does not. The
+    // gap widens exactly when the cost matters most.
+    //
+    // Note also `guest_read_dry` is 778 of 778 on both boots. That is expected
+    // and is not evidence of anything: this fence empties every window before
+    // any declaration can arrive, so a declaration can never land one.
+    //
     // # One of the two CPU passes over the result is gone; the other is the floor
     //
     // The four closed levers above are all about the readback. The *number of
