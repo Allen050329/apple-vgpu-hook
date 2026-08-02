@@ -56,6 +56,37 @@ impl ResourcePools {
             device.destroy_buffer(s.buffer, None);
             device.free_memory(s.memory, None);
         }
+        // Leased slots are the one class here whose memory a live borrow may
+        // still be reading, and freeing it unmaps that borrow's pointer — a
+        // read after this line is a fault, not a stale pixel. So wait for the
+        // holders rather than for a fence: `readback_leases_outstanding` moves
+        // with the holder, and a holder never blocks on the engine lock while
+        // it holds a lease, so it always makes progress and this always
+        // terminates.
+        //
+        // The bound exists because a teardown that hangs is worse than one that
+        // races: it is generous against a scatter that takes ~1 ms, and expiry
+        // is reported rather than assumed away.
+        let lease_deadline = std::time::Instant::now() + LEASE_QUIESCE;
+        while readback_leases_outstanding() != 0 {
+            if std::time::Instant::now() >= lease_deadline {
+                crate::observe::Emit::decline(
+                    "vk_pools_destroy",
+                    &ReadbackLeaseQuiesceExpired {
+                        outstanding: readback_leases_outstanding(),
+                        waited_ms: LEASE_QUIESCE.as_millis() as u64,
+                    },
+                )
+                .fail_once(0);
+                break;
+            }
+            std::thread::yield_now();
+        }
+        self.reclaim_returned_readback_leases();
+        for l in self.readback_leased.drain(..) {
+            device.destroy_buffer(l.slot.buffer, None);
+            device.free_memory(l.slot.memory, None);
+        }
         // Sampled / target / registry images are slab-backed: destroy the image
         // + view handles here, but their memory belongs to shared blocks freed
         // once by `self.slab.destroy_all(device)` at the end — never a per-image
@@ -117,5 +148,38 @@ impl ResourcePools {
             self.cmd_pool = vk::CommandPool::null();
         }
         self.initialized = false;
+    }
+}
+
+/// How long [`ResourcePools::destroy_all`] waits for readback-lease holders.
+///
+/// A lease spans one scatter of one frame into guest pages — measured at
+/// ~1 ms for a 1920x1080 composite — so this is three orders of magnitude of
+/// headroom, not a tuned number. It is a liveness bound on a wait that should
+/// never actually reach it, and reaching it is reported.
+const LEASE_QUIESCE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// A teardown gave up waiting for a readback lease to come back.
+///
+/// Nothing here is recoverable and nothing is retried: the destroy proceeds, so
+/// a holder that wakes afterwards reads memory the device no longer owns. That
+/// makes this the report of a broken invariant rather than of a degraded
+/// result — a lease is only ever held across code that takes no engine lock, so
+/// a holder that has not returned in half a second is one that acquired the
+/// lock anyway or died holding it.
+struct ReadbackLeaseQuiesceExpired {
+    outstanding: usize,
+    waited_ms: u64,
+}
+
+impl crate::observe::Decline for ReadbackLeaseQuiesceExpired {
+    fn slug(&self) -> &'static str {
+        "readback_lease_quiesce_expired"
+    }
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("outstanding", self.outstanding.to_string()),
+            ("waited_ms", self.waited_ms.to_string()),
+        ]
     }
 }

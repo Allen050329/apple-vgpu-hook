@@ -20,6 +20,7 @@ impl ResourcePools {
             readback_free: HashMap::new(),
             readback_live: None,
             readback_multi_live: Vec::new(),
+            readback_leased: Vec::new(),
             sampled_free: FreePool::new(SAMPLED_FREE_CAP_PER_KEY, SAMPLED_FREE_CAP_TOTAL),
             sampled_live: Vec::new(),
             sampled_cache: Vec::new(),
@@ -1348,6 +1349,10 @@ impl ResourcePools {
             // `MemoryClass::Upload` requires HOST_COHERENT, so a staging write
             // needs no flush and the persistent mapping above is sound.
             coherent: true,
+            // Read rather than asserted: `MemoryClass::Upload` says nothing
+            // about caching, and nothing on the staging path reads this field —
+            // it is the readback slots that decide anything on it.
+            cached: ctx.mapped_memory_kind(mt).cached,
         };
         self.staging_live.push(slot);
         self.note_staging_miss(bucket, miss_started.elapsed().as_micros() as u64);
@@ -1491,6 +1496,10 @@ impl ResourcePools {
     /// here once. The names stay per-caller: `vk_pools_alloc_readback` and
     /// `vk_pools_alloc_readback_extra` are different exhaustion sites, and a
     /// shared slug could not say which pool ran out.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one VkOp per fallible Vulkan call, so an exhaustion names its own site"
+    )]
     unsafe fn create_readback_buffer(
         ctx: &DeviceContext,
         bucket: u64,
@@ -1499,6 +1508,7 @@ impl ResourcePools {
         create_op: VkOp,
         alloc_op: VkOp,
         bind_op: VkOp,
+        map_op: VkOp,
     ) -> Result<BufferSlot, DrawError> {
         let buffer = ctx
             .device
@@ -1540,12 +1550,35 @@ impl ResourcePools {
             })?;
         let kind = ctx.mapped_memory_kind(mt);
         note_readback_memory(ctx, mt, req.memory_type_bits, kind);
+        // Map once, for the slot's lifetime, exactly as the staging pool does
+        // and for one extra reason beyond saving the map/unmap round-trip pair.
+        //
+        // A readback slot can be *leased*: handed to a reader that consumes the
+        // mapping after the engine lock is dropped (`lease_readback`). Returning
+        // such a lease must not need the device, because the thread that ends it
+        // may be racing a teardown that holds the engine lock and is waiting for
+        // exactly this lease to come back. A slot that owns its mapping for life
+        // makes the return pure bookkeeping — no `vkUnmapMemory`, so no lock, so
+        // no cycle.
+        //
+        // Non-coherent readback memory is still invalidated per read
+        // (`read_back_slot`); a persistent mapping does not change what a read
+        // owes, only how many times the mapping is established.
+        let mapped = ctx
+            .device
+            .map_memory(memory, 0, bucket, vk::MemoryMapFlags::empty())
+            .map_err(|e| {
+                ctx.device.destroy_buffer(buffer, None);
+                ctx.device.free_memory(memory, None);
+                DrawError::VkCall(VkCall::new(map_op, e))
+            })? as usize;
         Ok(BufferSlot {
             buffer,
             memory,
             size: bucket,
-            mapped: 0,
+            mapped,
             coherent: kind.coherent,
+            cached: kind.cached,
         })
     }
 
@@ -1555,6 +1588,10 @@ impl ResourcePools {
         size: u64,
         counters: &EngineCounters,
     ) -> Result<BufferSlot, DrawError> {
+        // Every acquire, so a returned lease is back in circulation by the next
+        // readback rather than after an arbitrary delay. This is the only
+        // engine-locked point the return path can rely on running.
+        self.reclaim_returned_readback_leases();
         let bucket = Self::bucket(size.max(4));
         if let Some(list) = self.readback_free.get_mut(&bucket) {
             if let Some(slot) = list.pop() {
@@ -1570,9 +1607,73 @@ impl ResourcePools {
             VkOp::PoolsCreateReadback,
             VkOp::PoolsAllocReadback,
             VkOp::PoolsBindReadback,
+            VkOp::PoolsMapReadback,
         )?;
         self.readback_live = Some(slot);
         Ok(slot)
+    }
+
+    /// Check the live readback slot out of the pool, for a reader that will go
+    /// on consuming its mapping after the engine lock is dropped.
+    ///
+    /// Returns the lease token and the slot's host address, or `None` when
+    /// there is no live slot to lease. The caller owes exactly one
+    /// [`return_readback_lease`] for a token it is handed; until that
+    /// arrives the slot is in no free list, no live list and no ring entry's
+    /// pending cleanup, so nothing can hand it to a GPU copy underneath the
+    /// borrow.
+    ///
+    /// Must be called before [`Self::seal_entry`], which is what would
+    /// otherwise move the slot into the submitted entry's cleanup.
+    pub(crate) fn lease_readback(&mut self) -> Option<(u64, usize)> {
+        let slot = self.readback_live.take()?;
+        // Two refusals, and both send the caller to the copying path rather
+        // than to a failure.
+        //
+        // A slot maps for life, so `mapped == 0` should not occur; leasing one
+        // anyway would mean establishing a mapping here, which is a device call
+        // the return path could not undo without the engine lock.
+        //
+        // Uncached memory is the one that matters in practice. The lease exists
+        // to let a consumer read the mapping in place, and an uncached mapping
+        // reads at roughly a tenth of memcpy speed
+        // (`readback_memory_not_cached`). Paying that rate once on a linear
+        // memcpy and then consuming a cached `Vec` beats paying it on every row
+        // of a scattered walk, so where the cached type was unavailable the
+        // copy is genuinely the faster shape and the lease declines.
+        if slot.mapped == 0 || !slot.cached {
+            self.readback_live = Some(slot);
+            return None;
+        }
+        let token = NEXT_READBACK_LEASE_TOKEN.fetch_add(1, Ordering::Relaxed);
+        // Before the slot leaves the pool: the counter is what a teardown reads
+        // to decide whether a borrow is live, and it must never see the slot
+        // gone while the count still says nobody has it.
+        READBACK_LEASES_OUT.fetch_add(1, Ordering::AcqRel);
+        let mapped = slot.mapped;
+        self.readback_leased.push(LeasedReadback { token, slot });
+        Some((token, mapped))
+    }
+
+    /// Take back every lease whose holder has finished and return its slot to
+    /// the free list.
+    ///
+    /// Cheap and unconditional: the returned-token channel is empty on all but
+    /// the calls that follow a lease, and a lease that is still out is simply
+    /// not in the drained set.
+    pub(crate) fn reclaim_returned_readback_leases(&mut self) {
+        let returned = std::mem::take(&mut *RETURNED_READBACK_LEASES.lock());
+        for token in returned {
+            let Some(index) = self.readback_leased.iter().position(|l| l.token == token) else {
+                // A teardown collected the leases while this token was in
+                // flight, so there is no slot left to give back. The handles
+                // died with the device; dropping the token is the whole of it.
+                continue;
+            };
+            let slot = self.readback_leased.remove(index).slot;
+            let bucket = Self::bucket(slot.size);
+            self.readback_free.entry(bucket).or_default().push(slot);
+        }
     }
 
     pub(crate) fn recycle_readback(&mut self) {
@@ -1608,6 +1709,7 @@ impl ResourcePools {
             VkOp::PoolsCreateReadbackExtra,
             VkOp::PoolsAllocReadbackExtra,
             VkOp::PoolsBindReadbackExtra,
+            VkOp::PoolsMapReadbackExtra,
         )?;
         self.readback_multi_live.push(slot);
         Ok(slot)

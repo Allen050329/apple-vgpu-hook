@@ -359,7 +359,15 @@ pub fn write_bgra8_skipping<M: HostMemory + HostOps>(
     skip: SkipRanges<'_>,
 ) -> bool {
     write_bgra8_inner(
-        state, host, mapping_id, src, None, src_stride, width, height, skip,
+        state,
+        host,
+        mapping_id,
+        src,
+        CacheOutcome::Publish(None),
+        src_stride,
+        width,
+        height,
+        skip,
     )
 }
 
@@ -399,12 +407,127 @@ pub fn write_bgra8_owned<M: HostMemory + HostOps>(
         host,
         mapping_id,
         src.as_slice(),
-        Some(src),
+        CacheOutcome::Publish(Some(src)),
         src_stride,
         width,
         height,
         skip,
     )
+}
+
+/// [`write_bgra8_skipping`] for a caller whose frame is about to stop existing.
+///
+/// The other writers end by publishing the frame to
+/// [`crate::runtime::surface_cache`], which is nearly free when the caller
+/// already owns an `Arc` and a whole-frame copy when it does not. A caller
+/// holding borrowed bytes — the deferred render flush reading a resident
+/// through `engine::LeasedFrame`, which is a Vulkan staging buffer it gives
+/// back a moment later — would pay that copy purely to fill a cache entry, and
+/// `render_flush_cache_used` prices those entries at 0.4 %: 15 reads against
+/// 3751 that nothing touched before the next flush replaced them.
+///
+/// So this writer drops the entry instead of refreshing it, and dropping is the
+/// only correct alternative. Leaving the previous frame behind would serve a
+/// later reader an old frame with nothing saying so, which is the stale-tile
+/// class the fence binding exists to close. Every reader that misses falls
+/// through to a source that does hold this frame — the surface's own guest
+/// pages, which this write has just landed, or the resident it came out of —
+/// so the miss costs a slower route to the same pixels and never wrong ones.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the geometry the frame is in, plus the ranges its owner may not overwrite"
+)]
+pub fn write_bgra8_uncached<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+    src: &[u8],
+    src_stride: u32,
+    width: u32,
+    height: u32,
+    skip: SkipRanges<'_>,
+) -> bool {
+    write_bgra8_inner(
+        state,
+        host,
+        mapping_id,
+        src,
+        CacheOutcome::Invalidate,
+        src_stride,
+        width,
+        height,
+        skip,
+    )
+}
+
+/// Land every deferred window overlapping the sample window a BGRA8 writeback
+/// of this mapping would cover.
+///
+/// The same flush [`write_bgra8_uncached`] and its siblings make on their own
+/// behalf, exposed so a caller can make it *before* it acquires the bytes it
+/// intends to write.
+///
+/// `write_bgra8_uncached`'s frame is borrowed from the engine's readback buffer
+/// under a lease, and a lease holder must not re-enter the engine: a teardown
+/// waiting for that lease to come back holds the engine lock, so a holder that
+/// asks for it stalls until the teardown's quiesce budget expires and then
+/// reads freed memory. A deferred flush reached from inside the write is
+/// exactly such a re-entry — `flush_render_one` reads a resident. Running the
+/// flush first leaves the writer's own call nothing to find, because nothing
+/// between the two arms a window: only a guest Store does, and no guest command
+/// is decoded inside a writeback.
+///
+/// Answers false for a geometry that has no sample window, which is the same
+/// geometry the writeback itself would refuse.
+pub fn flush_windows_under_bgra8_write<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+    width: u32,
+    height: u32,
+) -> bool {
+    let Some(m) = state.mappings.get(&mapping_id) else {
+        return false;
+    };
+    let (mw, mh, format) = mapping_write_geometry(m, width, height);
+    let Some((base_off, _, span_end)) = type11_sample_window(m, mapping_id, mw, mh, format) else {
+        return false;
+    };
+    crate::runtime::storage_flush::flush_intersecting(state, host, mapping_id, base_off, span_end);
+    true
+}
+
+/// The geometry and pixel format a writeback to this mapping must land in.
+///
+/// A mapping that has declared its own (`has_geom`) owns the answer, and a
+/// zero format there means BGRA8; one that has not takes the caller's geometry.
+/// Factored out because the writeback and the pre-flush above must resolve it
+/// identically — a pre-flush computed at a different extent than the write
+/// would leave exactly the windows the write is about to land on.
+fn mapping_write_geometry(m: &MappingEntry, width: u32, height: u32) -> (u32, u32, u16) {
+    if m.has_geom {
+        (
+            m.width,
+            m.height,
+            if m.format != 0 {
+                m.format
+            } else {
+                MTL_FORMAT_BGRA8_UNORM
+            },
+        )
+    } else {
+        (width, height, MTL_FORMAT_BGRA8_UNORM)
+    }
+}
+
+/// What a writeback leaves in the host surface cache when it is done.
+enum CacheOutcome<'a> {
+    /// Publish this frame as the mapping's entry, sharing the caller's
+    /// allocation when it is one the cache's contract allows sharing.
+    Publish(Option<&'a std::sync::Arc<Vec<u8>>>),
+    /// Drop the mapping's entry. For a caller that cannot leave the cache
+    /// naming its frame, because the memory holding it is about to be reused.
+    Invalidate,
 }
 
 #[allow(
@@ -417,7 +540,7 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
     host: &mut M,
     mapping_id: u32,
     src: &[u8],
-    shared: Option<&std::sync::Arc<Vec<u8>>>,
+    cache: CacheOutcome<'_>,
     src_stride: u32,
     width: u32,
     height: u32,
@@ -437,19 +560,7 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
     if !m.mapped || m.page_entries.is_empty() {
         return false;
     }
-    let (mw, mh, format) = if m.has_geom {
-        (
-            m.width,
-            m.height,
-            if m.format != 0 {
-                m.format
-            } else {
-                MTL_FORMAT_BGRA8_UNORM
-            },
-        )
-    } else {
-        (width, height, MTL_FORMAT_BGRA8_UNORM)
-    };
+    let (mw, mh, format) = mapping_write_geometry(m, width, height);
     if mw != width || mh != height {
         return false;
     }
@@ -710,15 +821,20 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
     let tight_frame = (mw as usize)
         .saturating_mul(mh as usize)
         .saturating_mul(RGBA8_BPP as usize);
-    match shared.filter(|owner| {
-        src_stride == mw.saturating_mul(RGBA8_BPP)
-            && owner.len() >= tight_frame
-            && std::ptr::eq(owner.as_ptr(), src.as_ptr())
-    }) {
-        Some(owner) => {
-            crate::runtime::surface_cache::store_shared(state, mapping_id, mw, mh, owner.clone())
-        }
-        None => crate::runtime::surface_cache::store_rows(state, mapping_id, mw, mh, src, src_stride),
+    match cache {
+        CacheOutcome::Invalidate => crate::runtime::surface_cache::forget(state, mapping_id),
+        CacheOutcome::Publish(shared) => match shared.filter(|owner| {
+            src_stride == mw.saturating_mul(RGBA8_BPP)
+                && owner.len() >= tight_frame
+                && std::ptr::eq(owner.as_ptr(), src.as_ptr())
+        }) {
+            Some(owner) => {
+                crate::runtime::surface_cache::store_shared(state, mapping_id, mw, mh, owner.clone())
+            }
+            None => {
+                crate::runtime::surface_cache::store_rows(state, mapping_id, mw, mh, src, src_stride)
+            }
+        },
     }
     note_surface_write_phase(
         SurfaceWritePhase::Cache,
@@ -771,19 +887,7 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
     if !m.mapped || m.page_entries.is_empty() {
         return false;
     }
-    let (mw, mh, format) = if m.has_geom {
-        (
-            m.width,
-            m.height,
-            if m.format != 0 {
-                m.format
-            } else {
-                MTL_FORMAT_BGRA8_UNORM
-            },
-        )
-    } else {
-        (width, height, MTL_FORMAT_BGRA8_UNORM)
-    };
+    let (mw, mh, format) = mapping_write_geometry(m, width, height);
     if mw != width || mh != height {
         return false;
     }

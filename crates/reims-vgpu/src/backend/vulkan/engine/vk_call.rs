@@ -179,12 +179,16 @@ pub enum VkOp {
     PoolsAllocReadback,
     /// `vkBindBufferMemory` for a readback slot.
     PoolsBindReadback,
+    /// `vkMapMemory` of a readback slot, for the slot's whole lifetime.
+    PoolsMapReadback,
     /// `vkCreateBuffer` for the secondary ("extra") readback slot.
     PoolsCreateReadbackExtra,
     /// `vkAllocateMemory` for the extra readback slot.
     PoolsAllocReadbackExtra,
     /// `vkBindBufferMemory` for the extra readback slot.
     PoolsBindReadbackExtra,
+    /// `vkMapMemory` of an extra readback slot, for the slot's whole lifetime.
+    PoolsMapReadbackExtra,
 
     // ---- pools/mod.rs — the target / sampled / storage / registry / MRT-
     //      secondary / depth image + view + framebuffer allocation rails ----
@@ -388,9 +392,11 @@ impl Decline for VkCall {
             VkOp::PoolsCreateReadback => "vk_pools_create_readback",
             VkOp::PoolsAllocReadback => "vk_pools_alloc_readback",
             VkOp::PoolsBindReadback => "vk_pools_bind_readback",
+            VkOp::PoolsMapReadback => "vk_pools_map_readback",
             VkOp::PoolsCreateReadbackExtra => "vk_pools_create_readback_extra",
             VkOp::PoolsAllocReadbackExtra => "vk_pools_alloc_readback_extra",
             VkOp::PoolsBindReadbackExtra => "vk_pools_bind_readback_extra",
+            VkOp::PoolsMapReadbackExtra => "vk_pools_map_readback_extra",
 
             VkOp::PoolsCreateTargetImage => "vk_pools_create_target_image",
             VkOp::PoolsBindTarget => "vk_pools_bind_target",
@@ -539,9 +545,11 @@ mod tests {
         VkOp::PoolsCreateReadback,
         VkOp::PoolsAllocReadback,
         VkOp::PoolsBindReadback,
+        VkOp::PoolsMapReadback,
         VkOp::PoolsCreateReadbackExtra,
         VkOp::PoolsAllocReadbackExtra,
         VkOp::PoolsBindReadbackExtra,
+        VkOp::PoolsMapReadbackExtra,
         VkOp::PoolsCreateTargetImage,
         VkOp::PoolsBindTarget,
         VkOp::PoolsCreateTargetView,

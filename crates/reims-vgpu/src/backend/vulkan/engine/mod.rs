@@ -805,6 +805,26 @@ struct ReadbackOps {
 /// image already sat in TRANSFER_SRC_OPTIMAL — which is every readback that
 /// follows a render pass, because that is the layout a pass resolves its
 /// primary to. The barrier is unconditional now.
+/// Where a readback's bytes end up: copied out into a `Vec`, or left in the
+/// staging buffer for the caller to consume through a lease.
+///
+/// The copy is what the callers that keep their frame need — a `Vec` outlives
+/// everything and belongs to nobody. The lease is for the one caller that
+/// consumes the frame once and immediately: it hands the bytes straight on and
+/// then has no use for them, so copying 8 MB to own them for a millisecond is
+/// pure cost. See [`LeasedFrame`].
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ReadbackDelivery {
+    Copy,
+    Lease,
+}
+
+/// The result of a readback in whichever of the two forms was asked for.
+enum ReadbackResult {
+    Copied(Vec<u8>),
+    Leased { token: u64, ptr: usize, len: usize },
+}
+
 #[allow(clippy::too_many_arguments)]
 unsafe fn copy_image_level0_to_host(
     ctx: &context::DeviceContext,
@@ -818,6 +838,46 @@ unsafe fn copy_image_level0_to_host(
     rb_size: u64,
     ops: ReadbackOps,
 ) -> Result<Vec<u8>, DrawError> {
+    match copy_image_level0_to_host_delivered(
+        ctx,
+        pools,
+        counters,
+        image,
+        old_layout,
+        src_access,
+        width,
+        height,
+        rb_size,
+        ops,
+        ReadbackDelivery::Copy,
+    )? {
+        ReadbackResult::Copied(bytes) => Ok(bytes),
+        // Unreachable by construction — `Copy` was asked for one line above —
+        // and stated as a decline rather than a panic because this rail runs on
+        // the drain worker, where a panic takes the device down.
+        ReadbackResult::Leased { token, .. } => {
+            pools::return_readback_lease(token);
+            Err(DrawError::TargetRead(
+                reason::TargetReadDecline::NoReadyContent,
+            ))
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn copy_image_level0_to_host_delivered(
+    ctx: &context::DeviceContext,
+    pools: &mut pools::ResourcePools,
+    counters: &EngineCounters,
+    image: ash::vk::Image,
+    old_layout: ash::vk::ImageLayout,
+    src_access: ash::vk::AccessFlags,
+    width: u32,
+    height: u32,
+    rb_size: u64,
+    ops: ReadbackOps,
+    delivery: ReadbackDelivery,
+) -> Result<ReadbackResult, DrawError> {
     let submit_started = std::time::Instant::now();
     let readback = pools.acquire_readback(ctx, rb_size, counters)?;
     let (cb, fence) = pools.begin_entry(ctx, counters)?;
@@ -892,6 +952,16 @@ unsafe fn copy_image_level0_to_host(
     ctx.device
         .queue_submit(queue, &[si], fence)
         .map_err(|e| DrawError::VkCall(VkCall::new(ops.submit, e)))?;
+    // Before `seal_entry`, which is what would otherwise move this slot into
+    // the submitted entry's pending cleanup and hand it back to `readback_free`
+    // when that entry retires — under a borrow that is still reading it.
+    //
+    // A lease that cannot be taken (an unmapped slot) is not an error: the
+    // delivery falls back to the copy below, which is what every other caller
+    // of this function does anyway.
+    let lease = (delivery == ReadbackDelivery::Lease)
+        .then(|| pools.lease_readback())
+        .flatten();
     let cleanup = pools.seal_entry(Vec::new(), Vec::new());
     pools.finish_entry_async(cleanup);
     // Split three ways rather than timed as a whole: the submit and the copy
@@ -903,13 +973,43 @@ unsafe fn copy_image_level0_to_host(
         submit_started.elapsed().as_micros() as u64,
     );
     let fence_started = std::time::Instant::now();
-    pools.wait_entry_fence(ctx, counters, fence)?;
+    if let Err(e) = pools.wait_entry_fence(ctx, counters, fence) {
+        // The lease is out at this point, so every exit from here on owes a
+        // return. Leaving one behind strands the slot for the process lifetime
+        // and makes the next teardown wait out its whole quiesce budget.
+        if let Some((token, _)) = lease {
+            pools::return_readback_lease(token);
+        }
+        return Err(e);
+    }
     note_readback_phase(
         ReadbackPhase::Fence,
         fence_started.elapsed().as_micros() as u64,
     );
     let map_started = std::time::Instant::now();
-    let out = pools::read_back_slot(ctx, &readback, rb_size, ops.map, ops.invalidate);
+    let out = match lease {
+        // The mapping is already established for the slot's lifetime, so all
+        // this owes is the invalidate a non-coherent readback owes any reader.
+        // What `ReadbackPhase::Map` measures on this arm is therefore that call
+        // alone: the whole-frame memcpy the other arm pays is what the lease
+        // exists to delete, and the phase reading near zero is how you tell it
+        // happened.
+        Some((token, ptr)) => {
+            match pools::invalidate_slot_for_read(ctx, &readback, ops.invalidate) {
+                Ok(()) => Ok(ReadbackResult::Leased {
+                    token,
+                    ptr,
+                    len: rb_size as usize,
+                }),
+                Err(e) => {
+                    pools::return_readback_lease(token);
+                    Err(e)
+                }
+            }
+        }
+        None => pools::read_back_slot(ctx, &readback, rb_size, ops.map, ops.invalidate)
+            .map(ReadbackResult::Copied),
+    };
     note_readback_phase(ReadbackPhase::Map, map_started.elapsed().as_micros() as u64);
     out
 }
@@ -957,6 +1057,179 @@ impl TargetReadback {
     }
 }
 
+/// A resident target's frame, still in the Vulkan readback buffer it was copied
+/// into, borrowed rather than copied out.
+///
+/// # Why this exists
+///
+/// The deferred render flush reads a resident back and immediately scatters the
+/// result into the guest's pages. Copying the staging buffer into a `Vec` first
+/// is a second whole-frame pass over ~8 MB — `readback_split map_us`, about
+/// 0.8 ms of a 6.9 ms flush, roughly a hundred times a second on a driven
+/// desktop — and the `Vec` is dropped a millisecond later. This hands the
+/// scatter the mapped bytes directly and the pass is gone.
+///
+/// # Why it is sound
+///
+/// The mapping stays valid until the memory is freed, so the borrow needs
+/// exactly one thing held off: the pool giving the slot to something that would
+/// write it. `lease_readback` takes the slot out of every list that could —
+/// free, live, and the submitted entry's pending cleanup — and only the `Drop`
+/// below puts it back. A teardown, which frees the memory and so would unmap
+/// the pointer under a live borrow, waits for outstanding leases first.
+///
+/// # What a holder may not do
+///
+/// **Take the engine lock.** A teardown waiting out the quiesce budget holds
+/// it, so a holder that blocks on it deadlocks until that budget expires and
+/// then reads freed memory. The whole point of consuming the frame here is that
+/// the engine is *not* locked while an 8 MB scatter runs; a holder that needs
+/// the engine should end the lease first. Ending it is device-free and cannot
+/// block on anything the holder owns.
+pub struct LeasedFrame {
+    token: u64,
+    ptr: usize,
+    len: usize,
+    /// BGRA8 when true, semantic RGBA8 otherwise. Reported by the registry slot
+    /// the bytes were copied out of, for the same reason
+    /// [`TargetReadback::bgra`] is.
+    pub bgra: bool,
+}
+
+impl LeasedFrame {
+    /// The frame, in whatever channel order [`Self::bgra`] reports.
+    pub fn bytes(&self) -> &[u8] {
+        // SAFETY: `ptr` is the host address of a `HOST_VISIBLE` mapping
+        // established for the slot's lifetime and covering at least `len`
+        // bytes, and the slot is leased — so it is in no pool list, no GPU
+        // command references it, and teardown cannot free it while this lease
+        // is outstanding.
+        unsafe { std::slice::from_raw_parts(self.ptr as *const u8, self.len) }
+    }
+}
+
+impl Drop for LeasedFrame {
+    fn drop(&mut self) {
+        pools::return_readback_lease(self.token);
+    }
+}
+
+/// Read a resident target back and keep the bytes in the staging buffer.
+///
+/// The borrowing form of [`read_target`], for a caller that consumes the frame
+/// once and has no use for it afterwards. Answers `None` for a frame that
+/// cannot be consumed in place, and every `None` is a reason to take the
+/// copying path rather than a failure:
+///
+/// - **Uncached readback memory.** The mapping then reads at roughly a tenth of
+///   memcpy speed, and a row-by-row consumer would pay that rate on every row
+///   instead of once on the linear pass the copy makes. `MemoryClass::Readback`
+///   asks for `HOST_CACHED` first and usually gets it; where it does not, the
+///   copy is the cheaper shape. This is the capability gate, and it is on the
+///   property rather than on any driver name.
+/// - **No mapping to lend**, which a readback slot always has and so should not
+///   occur; the fallback keeps it from mattering if it ever does.
+pub fn read_target_leased(identity: &TargetIdentity) -> Result<Option<LeasedFrame>, DrawError> {
+    let mut guard = lock_engine();
+    let EngineState {
+        ref mut owner,
+        ref mut pools,
+        ref counters,
+        ..
+    } = &mut *guard;
+    let ctx = owner.ensure(counters)?;
+    unsafe { pools.ensure_init(ctx, counters)? };
+    let snap = resident_read_snapshot(pools, identity)?;
+    let rb_size = (snap.width as u64) * (snap.height as u64) * 4;
+    unsafe {
+        let delivered = copy_image_level0_to_host_delivered(
+            ctx,
+            pools,
+            counters,
+            snap.image,
+            snap.layout,
+            RESIDENT_READ_SRC_ACCESS,
+            snap.width,
+            snap.height,
+            rb_size,
+            target_readback_ops(),
+            ReadbackDelivery::Lease,
+        )?;
+        pools.registry_set_layout(identity, ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+        counters.note_target_read(rb_size);
+        Ok(match delivered {
+            ReadbackResult::Leased { token, ptr, len } => Some(LeasedFrame {
+                token,
+                ptr,
+                len,
+                bgra: snap.bgra,
+            }),
+            // The slot had no mapping to lend, so the readback fell back to a
+            // copy. Drop it and let the caller take its own copying path rather
+            // than hand back a `Vec` this signature has no room for; that costs
+            // one extra readback on a path that should never run.
+            ReadbackResult::Copied(_) => None,
+        })
+    }
+}
+
+/// The `srcAccessMask` a resident color target's readback must drain.
+const RESIDENT_READ_SRC_ACCESS: ash::vk::AccessFlags = ash::vk::AccessFlags::from_raw(
+    ash::vk::AccessFlags::COLOR_ATTACHMENT_WRITE.as_raw()
+        | ash::vk::AccessFlags::TRANSFER_WRITE.as_raw()
+        | ash::vk::AccessFlags::SHADER_WRITE.as_raw(),
+);
+
+/// The per-call `VkOp` names for a resident target readback.
+///
+/// One set shared by the copying and leasing entry points because they are the
+/// same six Vulkan calls on the same rail; splitting the slugs would claim a
+/// distinction the failure does not have.
+fn target_readback_ops() -> ReadbackOps {
+    ReadbackOps {
+        reset_cb: VkOp::ReadbackResetCb,
+        begin_cb: VkOp::ReadbackBeginCb,
+        end_cb: VkOp::ReadbackEndCb,
+        submit: VkOp::ReadbackSubmit,
+        map: VkOp::ReadbackMap,
+        invalidate: VkOp::ReadbackInvalidate,
+    }
+}
+
+/// What a resident target's readback copies, and the channel order it is in.
+struct ResidentReadSnapshot {
+    image: ash::vk::Image,
+    width: u32,
+    height: u32,
+    layout: ash::vk::ImageLayout,
+    bgra: bool,
+}
+
+/// The registry slot's copy geometry, or the typed reason it cannot be read.
+///
+/// Shared by both readback entry points so that "is this target readable" is
+/// decided once and answered with one vocabulary.
+fn resident_read_snapshot(
+    pools: &pools::ResourcePools,
+    identity: &TargetIdentity,
+) -> Result<ResidentReadSnapshot, DrawError> {
+    let slot = pools.registry_get(identity).ok_or(DrawError::TargetRead(
+        reason::TargetReadDecline::UnknownIdentity,
+    ))?;
+    if !slot.content_ready {
+        return Err(DrawError::TargetRead(
+            reason::TargetReadDecline::NoReadyContent,
+        ));
+    }
+    Ok(ResidentReadSnapshot {
+        image: slot.image,
+        width: slot.width,
+        height: slot.height,
+        layout: slot.layout,
+        bgra: slot.bgra,
+    })
+}
+
 fn read_target_inner(identity: &TargetIdentity) -> Result<TargetReadback, DrawError> {
     let mut guard = lock_engine();
     let EngineState {
@@ -967,45 +1240,27 @@ fn read_target_inner(identity: &TargetIdentity) -> Result<TargetReadback, DrawEr
     } = &mut *guard;
     let ctx = owner.ensure(counters)?;
     unsafe { pools.ensure_init(ctx, counters)? };
-    let slot = pools.registry_get(identity).ok_or(DrawError::TargetRead(
-        reason::TargetReadDecline::UnknownIdentity,
-    ))?;
-    if !slot.content_ready {
-        return Err(DrawError::TargetRead(
-            reason::TargetReadDecline::NoReadyContent,
-        ));
-    }
-    let width = slot.width;
-    let height = slot.height;
-    let image = slot.image;
-    let old_layout = slot.layout;
-    let bgra = slot.bgra;
-    let rb_size = (width as u64) * (height as u64) * 4;
+    let snap = resident_read_snapshot(pools, identity)?;
+    let rb_size = (snap.width as u64) * (snap.height as u64) * 4;
     unsafe {
         let out = copy_image_level0_to_host(
             ctx,
             pools,
             counters,
-            image,
-            old_layout,
-            ash::vk::AccessFlags::COLOR_ATTACHMENT_WRITE
-                | ash::vk::AccessFlags::TRANSFER_WRITE
-                | ash::vk::AccessFlags::SHADER_WRITE,
-            width,
-            height,
+            snap.image,
+            snap.layout,
+            RESIDENT_READ_SRC_ACCESS,
+            snap.width,
+            snap.height,
             rb_size,
-            ReadbackOps {
-                reset_cb: VkOp::ReadbackResetCb,
-                begin_cb: VkOp::ReadbackBeginCb,
-                end_cb: VkOp::ReadbackEndCb,
-                submit: VkOp::ReadbackSubmit,
-                map: VkOp::ReadbackMap,
-                invalidate: VkOp::ReadbackInvalidate,
-            },
+            target_readback_ops(),
         )?;
         pools.registry_set_layout(identity, ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
         counters.note_target_read(rb_size);
-        Ok(TargetReadback { pixels: out, bgra })
+        Ok(TargetReadback {
+            pixels: out,
+            bgra: snap.bgra,
+        })
     }
 }
 

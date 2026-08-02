@@ -2099,6 +2099,74 @@ fn an_owned_writeback_publishes_its_frame_to_the_cache_without_copying_it() {
     assert!(repacked.iter().all(|&b| b == 0x5A), "and must be correct");
 }
 
+/// A writeback whose frame is borrowed must drop the cache entry, not keep it.
+///
+/// `write_bgra8_uncached` exists for the deferred render flush, whose frame is
+/// the engine's readback staging buffer under a lease: it goes back to the pool
+/// a moment later, so nothing host-side may still be naming it. The frame is
+/// landed in the guest's pages either way, and the only question this settles is
+/// what the cache holds afterwards.
+///
+/// Leaving the previous entry behind is the failure. A reader that hits one is
+/// served a whole frame that is one or more paints old, with nothing in the log
+/// saying so — a stale compositing layer, which is the corruption class this
+/// device is chasing rather than a performance detail. Dropping it sends every
+/// reader to the guest pages this write has just filled, which is correct by
+/// construction.
+///
+/// Both halves are asserted from a *populated* starting state, because an
+/// assertion that the cache is empty is vacuous against a cache that was never
+/// filled.
+#[test]
+fn a_borrowed_writeback_drops_the_cache_entry_rather_than_leaving_it_stale() {
+    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::runtime::mapping_write::{write_bgra8_owned, write_bgra8_uncached};
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let (w, h) = (64u32, 16u32);
+    let stride = w * 4;
+    let need = (stride as usize) * (h as usize);
+    let pfn = 0x4A0u32;
+    host.map_range((pfn as u64) << PAGE_SHIFT_ARM64E, 0x8000, 0);
+    assert!(state.map_surface(9));
+    {
+        let m = state.mappings.get_mut(&9).unwrap();
+        m.mapped = true;
+        m.mapping_internal = 9;
+        m.page_entries = vec![(pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+    }
+    assert!(state.set_mapping_geom(9, w, h, MTL_FORMAT_BGRA8_UNORM));
+
+    // An owning writeback first, so there is an entry to be left behind.
+    let first = std::sync::Arc::new(vec![0x11u8; need]);
+    assert!(write_bgra8_owned(
+        &mut state, &mut host, 9, &first, stride, w, h, &[]
+    ));
+    assert!(
+        crate::runtime::surface_cache::get(&state, 9, w, h).is_some(),
+        "the owning writeback must publish, or this test proves nothing"
+    );
+
+    let second: Vec<u8> = (0..need).map(|i| (i % 241) as u8).collect();
+    assert!(write_bgra8_uncached(
+        &mut state, &mut host, 9, &second, stride, w, h, &[]
+    ));
+
+    assert!(
+        crate::runtime::surface_cache::get(&state, 9, w, h).is_none(),
+        "a borrowed frame must not be left named by a cache entry, and the \
+         previous frame must not be left standing in its place"
+    );
+    // And the obligation the writeback actually owes: the bytes are in the
+    // guest's pages, which is where every reader that now misses will look.
+    let mut landed = vec![0u8; need];
+    host.read_gpa((pfn as u64) << PAGE_SHIFT_ARM64E, &mut landed)
+        .expect("the mapping's pages must be readable");
+    assert_eq!(landed, second, "the borrowed frame must have landed");
+}
+
 /// A cache entry that is replaced every frame must not be reallocated every
 /// frame.
 ///

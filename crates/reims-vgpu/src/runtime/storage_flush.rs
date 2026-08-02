@@ -1996,15 +1996,47 @@ fn flush_render_one<M: HostMemory + HostOps>(
     // Set when the frame below came *out of* a resident image, so the write can
     // hand the currency witness back to it. See the re-stamp after the write.
     let mut flushed_from_resident: Option<crate::backend::vulkan::engine::TargetIdentity> = None;
+    // Land anything already armed over these pages *before* the frame is
+    // acquired, not inside the write that follows.
+    //
+    // `write_bgra8_*` makes this call itself, and for the copying arms that is
+    // where it belongs. The leased arm cannot afford it there: its frame is
+    // borrowed from the engine's readback buffer, and a flush reached from
+    // inside the write would read another resident — re-entering the engine
+    // under a live lease, which is the one thing a holder may not do. Running it
+    // here leaves the writer's own call nothing to find, because the only thing
+    // that arms a window is a guest Store and no guest command is decoded inside
+    // a writeback.
+    //
+    // Unconditional rather than gated on the arm taken below, so both arms reach
+    // the write through the same state. A no-op on all but the rare mapping
+    // carrying a second window.
+    crate::runtime::mapping_write::flush_windows_under_bgra8_write(
+        state,
+        host,
+        key.mapping_id,
+        key.width,
+        key.height,
+    );
     // Owned rather than borrowed, and shared rather than owned outright: the
     // writeback's tail publishes this frame to the surface cache, and a cache
     // entry stores its frame behind an `Arc` precisely so that it and a window
     // can name one allocation. Handing the frame down as an `Arc` therefore ends
     // in one `Arc` clone where a borrow ended in a whole-frame copy — 1.21 ms of
     // memcpy per flush on the composite, about 100 times a second. `Owned`
-    // already has one to clone; `Resident` wraps the readback it just took.
-    let frame: std::sync::Arc<Vec<u8>> = match source {
-        crate::model::RenderWindowSource::Owned(bytes) => bytes.clone(),
+    // already has one to clone.
+    //
+    // `Resident` does not go that way any more. It reads the resident back and
+    // then *borrows* the staging buffer the readback landed in, because it has
+    // no use for the frame after the scatter: owning it means one whole-frame
+    // memcpy (`readback_split map_us`, ~0.82 ms of a 6.9 ms flush) whose only
+    // consumer beyond the scatter is the host surface cache, and
+    // `render_flush_cache_used` prices that consumer at 0.4 %. See
+    // [`crate::backend::vulkan::engine::LeasedFrame`] for what the borrow costs
+    // and [`crate::runtime::mapping_write::write_bgra8_uncached`] for what
+    // happens to the cache entry instead.
+    let frame: FlushFrame = match source {
+        crate::model::RenderWindowSource::Owned(bytes) => FlushFrame::Owned(bytes.clone()),
         crate::model::RenderWindowSource::Resident { epoch } => {
             use crate::backend::vulkan::engine::ResidentContent;
             // The close of the interval `note_resident_window_armed` opened at
@@ -2045,16 +2077,54 @@ fn flush_render_one<M: HostMemory + HostOps>(
                 ));
                 return false;
             }
-            match crate::backend::vulkan::engine::read_target(&identity) {
-                Ok(rb) => {
+            // Borrow first, and only where the borrow needs no transformation.
+            //
+            // The writer below is declared in guest scanout order, so a resident
+            // reporting semantic RGBA8 owes an R/B exchange before its bytes can
+            // land — which is a whole-frame pass, and a pass over the staging
+            // buffer at that. `into_bgra8` on an owned copy is the existing home
+            // for it, so a non-BGRA resident takes the copying arm rather than
+            // teaching the lease to rewrite memory it does not own. A `Surface`
+            // resident is BGRA and that is the composite rail this rail's cost
+            // lives on; reading the reported order rather than asserting one is
+            // what keeps a future format change from landing R and B exchanged
+            // in guest memory.
+            match crate::backend::vulkan::engine::read_target_leased(&identity) {
+                Ok(Some(leased)) if leased.bgra => {
                     crate::backend::vulkan::engine::unpin_resident_target(&identity);
                     flushed_from_resident = Some(identity);
-                    // `into_bgra8`, not the raw bytes: a `Surface` resident is BGRA
-                    // so this is a no-op, and the writer below is declared in
-                    // scanout order. Reading the reported order rather than
-                    // asserting one is what keeps a future format change from
-                    // landing R and B exchanged in guest memory.
-                    std::sync::Arc::new(rb.into_bgra8())
+                    crate::runtime::drain::note_store_route("render_flush_leased");
+                    FlushFrame::Leased(leased)
+                }
+                // Either the pool declined the lease (uncached readback memory,
+                // where reading the mapping in place is the *slower* shape) or
+                // the resident is not in scanout order. Both take the copy, and
+                // the leased frame — if there is one — is dropped first so its
+                // slot is back in the pool before the second readback asks for
+                // one.
+                Ok(leased) => {
+                    drop(leased);
+                    crate::runtime::drain::note_store_route("render_flush_copied");
+                    match crate::backend::vulkan::engine::read_target(&identity) {
+                        Ok(rb) => {
+                            crate::backend::vulkan::engine::unpin_resident_target(&identity);
+                            flushed_from_resident = Some(identity);
+                            FlushFrame::Owned(std::sync::Arc::new(rb.into_bgra8()))
+                        }
+                        Err(e) => {
+                            crate::backend::vulkan::engine::unpin_resident_target(&identity);
+                            crate::observe::fail(format!(
+                                "deferred_flush_lost kind=render mapping={} {}x{} fmt={:#x} \
+                                 gen={} reason=resident_read err={e}",
+                                key.mapping_id,
+                                key.width,
+                                key.height,
+                                key.pixel_format,
+                                key.map_generation
+                            ));
+                            return false;
+                        }
+                    }
                 }
                 Err(e) => {
                     crate::backend::vulkan::engine::unpin_resident_target(&identity);
@@ -2070,20 +2140,38 @@ fn flush_render_one<M: HostMemory + HostOps>(
     };
     let preserve = render_flush_guest_written_ranges(state, host, key);
     let write_started = std::time::Instant::now();
-    let ok = crate::runtime::mapping_write::write_bgra8_owned(
-        state,
-        host,
-        key.mapping_id,
-        &frame,
-        key.width.saturating_mul(4),
-        key.width,
-        key.height,
-        &preserve,
-    );
+    let ok = match &frame {
+        FlushFrame::Owned(bytes) => crate::runtime::mapping_write::write_bgra8_owned(
+            state,
+            host,
+            key.mapping_id,
+            bytes,
+            key.width.saturating_mul(4),
+            key.width,
+            key.height,
+            &preserve,
+        ),
+        FlushFrame::Leased(leased) => crate::runtime::mapping_write::write_bgra8_uncached(
+            state,
+            host,
+            key.mapping_id,
+            leased.bytes(),
+            key.width.saturating_mul(4),
+            key.width,
+            key.height,
+            &preserve,
+        ),
+    };
     crate::runtime::drain::note_readback_phase(
         crate::runtime::drain::ReadbackPhase::Write,
         write_started.elapsed().as_micros() as u64,
     );
+    // End the lease before anything below reaches the engine again — the
+    // resident re-stamp does. A holder that blocks on the engine lock while a
+    // teardown is waiting for exactly this lease is the deadlock `LeasedFrame`
+    // forbids, and the frame has no reader left after the write in any case.
+    let frame_len = frame.len();
+    drop(frame);
     if !ok {
         crate::observe::fail(format!(
             "deferred_flush_lost kind=render mapping={} {}x{} fmt={:#x} gen={} reason=write_refused",
@@ -2134,10 +2222,33 @@ fn flush_render_one<M: HostMemory + HostOps>(
         key.height,
         key.pixel_format,
         ok as u8,
-        frame.len(),
+        frame_len,
         started.elapsed().as_micros()
     ));
     ok
+}
+
+/// Where a landing render window's frame lives while it is being written.
+///
+/// The two differ in what the writeback may leave behind. `Owned` names an
+/// allocation that outlives the flush, so the host surface cache can hold it for
+/// a refcount; `Leased` names the engine's readback staging buffer, which goes
+/// back to the pool a moment later and therefore cannot be what a cache entry
+/// points at. See [`crate::runtime::mapping_write::write_bgra8_uncached`].
+#[cfg(feature = "backend-vulkan")]
+enum FlushFrame {
+    Owned(std::sync::Arc<Vec<u8>>),
+    Leased(crate::backend::vulkan::engine::LeasedFrame),
+}
+
+#[cfg(feature = "backend-vulkan")]
+impl FlushFrame {
+    fn len(&self) -> usize {
+        match self {
+            FlushFrame::Owned(bytes) => bytes.len(),
+            FlushFrame::Leased(leased) => leased.bytes().len(),
+        }
+    }
 }
 
 #[cfg(not(feature = "backend-vulkan"))]

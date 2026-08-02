@@ -53,6 +53,16 @@ pub(crate) struct BufferSlot {
     /// touches the mapping, so the slot states the property rather than leaving
     /// each reader to re-derive it from the type index.
     pub coherent: bool,
+    /// Whether `memory`'s type carries `HOST_CACHED`.
+    ///
+    /// The other half of what `MemoryClass::Readback` asks for, and recorded for
+    /// the same reason as `coherent`: it decides whether a reader may consume
+    /// the mapping in place or must stream it out first. An uncached mapping
+    /// reads at roughly a tenth of memcpy speed (`ReadbackMemoryDegrade` prices
+    /// it at 460 MB/s on a live iGPU), and a scattered row-by-row consumer of
+    /// one would pay that rate on every row rather than once on a linear pass.
+    /// So the choice is a capability question, and the slot answers it.
+    pub cached: bool,
 }
 
 pub(crate) struct TargetSlot {
@@ -60,6 +70,57 @@ pub(crate) struct TargetSlot {
     pub memory: vk::DeviceMemory,
     pub view: vk::ImageView,
     pub framebuffer: vk::Framebuffer,
+}
+
+/// A readback slot checked out of the pool, and the token its holder returns.
+pub(crate) struct LeasedReadback {
+    pub token: u64,
+    pub slot: BufferSlot,
+}
+
+/// Tokens of leases whose holder has finished with the mapping.
+///
+/// Its own lock rather than a field of [`ResourcePools`], and that is the whole
+/// point of the channel. Ending a lease must never need the engine lock: the
+/// thread that ends one may be racing a teardown that already holds that lock
+/// and is waiting for this very lease to come back, and a return path that
+/// asked for the lock would close the cycle. So a holder drops a token here and
+/// walks away; the next engine-locked pool operation collects it
+/// ([`ResourcePools::reclaim_returned_readback_leases`]).
+///
+/// Nothing under this lock ever takes another, which is what keeps it a leaf.
+static RETURNED_READBACK_LEASES: parking_lot::Mutex<Vec<u64>> = parking_lot::Mutex::new(Vec::new());
+
+/// Leases handed out and not yet returned, readable without any lock.
+///
+/// A teardown that is about to `vkFreeMemory` a leased slot has to know whether
+/// a borrow of its mapping is still live, and it cannot ask `readback_leased`
+/// for that — a token sitting in [`RETURNED_READBACK_LEASES`] is a lease whose
+/// holder is gone but whose slot has not been collected yet. This counter moves
+/// with the *holder*, so zero means no pointer is outstanding.
+static READBACK_LEASES_OUT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Distinct token per lease, so a return can name the slot it is giving back
+/// without carrying a Vulkan handle across the lock boundary.
+static NEXT_READBACK_LEASE_TOKEN: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+/// End the lease `token` names: the holder is done reading its mapping.
+///
+/// Device-free by construction — a readback slot owns its mapping for life, so
+/// there is no `vkUnmapMemory` owed and nothing here needs the engine.
+pub(crate) fn return_readback_lease(token: u64) {
+    RETURNED_READBACK_LEASES.lock().push(token);
+    // After the token is queued, never before: a teardown that observes zero
+    // must be able to conclude the slot is collectable, and a decrement ahead
+    // of the push would let it observe zero with the token still in flight.
+    READBACK_LEASES_OUT.fetch_sub(1, Ordering::AcqRel);
+}
+
+/// Whether any lease holder is still reading a readback mapping.
+pub(crate) fn readback_leases_outstanding() -> usize {
+    READBACK_LEASES_OUT.load(Ordering::Acquire)
 }
 
 pub(crate) struct ResourcePools {
@@ -84,6 +145,15 @@ pub(crate) struct ResourcePools {
     readback_live: Option<BufferSlot>,
     /// Extra live readbacks (compute multi-image / multi-buffer).
     readback_multi_live: Vec<BufferSlot>,
+    /// Readback slots handed to a reader that is consuming their mapping with
+    /// the engine unlocked; see [`ResourcePools::lease_readback`].
+    ///
+    /// Deliberately in none of the three lists above. A leased slot must not
+    /// reach a ring entry's `PendingGpuCleanup` (which would return it to
+    /// `readback_free` when that entry retires) and must not be handed to a
+    /// second acquire, because either one lets a GPU copy overwrite bytes a
+    /// live borrow is still reading.
+    readback_leased: Vec<LeasedReadback>,
     /// Transient sampled-image pool, keyed by exact image and view geometry.
     sampled_free: FreePool<SampledKey, SampledSlot>,
     sampled_live: Vec<SampledSlot>,
@@ -1260,24 +1330,49 @@ pub(super) unsafe fn read_back_slot(
             ctx.device.unmap_memory(slot.memory);
         }
     };
-    if !slot.coherent {
-        let range = vk::MappedMemoryRange::default()
-            .memory(slot.memory)
-            .offset(0)
-            .size(vk::WHOLE_SIZE);
-        if let Err(e) = ctx.device.invalidate_mapped_memory_ranges(&[range]) {
-            release(ctx);
-            return Err(DrawError::VkCall(VkCall::new(invalidate_op, e)));
-        }
+    if let Err(e) = invalidate_slot_for_read(ctx, slot, invalidate_op) {
+        release(ctx);
+        return Err(e);
     }
     let out = super::exec_compute::copy_mapped_output(ptr, len as usize);
     release(ctx);
     Ok(out)
 }
 
+/// Make the GPU's writes to `slot` visible to a host read of its mapping.
+///
+/// A no-op on coherent memory and a `vkInvalidateMappedMemoryRanges` otherwise;
+/// [`BufferSlot::coherent`] is what decides, because `MemoryClass::Readback`
+/// ranks `HOST_CACHED` above coherence and several drivers expose no type
+/// carrying both.
+///
+/// Shared by the two ways a readback is consumed — copied out through
+/// [`read_back_slot`], or read in place through a lease — so that the rule for
+/// when the invalidate is owed lives in one place. A leased read owes it just
+/// as much as a copied one does; the only thing the lease changes is what
+/// happens *after* the bytes become visible.
+pub(super) unsafe fn invalidate_slot_for_read(
+    ctx: &DeviceContext,
+    slot: &BufferSlot,
+    invalidate_op: VkOp,
+) -> Result<(), DrawError> {
+    if slot.coherent {
+        return Ok(());
+    }
+    let range = vk::MappedMemoryRange::default()
+        .memory(slot.memory)
+        .offset(0)
+        .size(vk::WHOLE_SIZE);
+    ctx.device
+        .invalidate_mapped_memory_ranges(&[range])
+        .map_err(|e| DrawError::VkCall(VkCall::new(invalidate_op, e)))
+}
+
 #[cfg(test)]
 mod staging_mapping_tests {
-    use super::{DeviceContext, ResourcePools};
+    use super::{
+        readback_leases_outstanding, return_readback_lease, DeviceContext, ResourcePools,
+    };
     use crate::backend::vulkan::engine::counters::EngineCounters;
     use ash::vk;
 
@@ -1325,6 +1420,88 @@ mod staging_mapping_tests {
         );
 
         pools.recycle_staging();
+        unsafe { pools.destroy_all(&ctx.device) };
+        unsafe { ctx.destroy() };
+    }
+
+    /// A leased readback slot is reachable by nothing else until it is returned.
+    ///
+    /// The lease exists so the deferred render flush can scatter straight out of
+    /// the staging buffer instead of copying it into a `Vec` first, and the only
+    /// thing that makes that sound is exclusivity: while the borrow is live the
+    /// slot must be in no free list, so no second acquire can hand it to a GPU
+    /// copy that overwrites the bytes being read.
+    ///
+    /// Both halves are asserted, and the second is the one that would rot
+    /// silently. A lease that is never given back is not a correctness bug on
+    /// the read — it strands the slot for the process lifetime and makes every
+    /// later teardown wait out its whole quiesce budget, which reads as a hang
+    /// rather than as a leak.
+    #[test]
+    fn a_leased_readback_slot_leaves_the_pool_and_comes_back() {
+        crate::observe::redirect_logs_for_tests();
+        let mut ctx = match unsafe { DeviceContext::create() } {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("SKIP readback lease: no device ({e})");
+                return;
+            }
+        };
+        let counters = EngineCounters::default();
+        let mut pools = ResourcePools::new();
+
+        let slot = unsafe { pools.acquire_readback(&ctx, 4096, &counters) }
+            .expect("a 4 KiB readback slot must be available");
+        assert_ne!(
+            slot.mapped, 0,
+            "a readback slot maps for life, or a lease could not return \
+             without the device"
+        );
+        if !slot.cached {
+            // The gate is the point of the field: where the cached type was
+            // unavailable the lease declines and the copy is the faster shape.
+            assert!(
+                pools.lease_readback().is_none(),
+                "an uncached slot must not be leased"
+            );
+            unsafe { pools.destroy_all(&ctx.device) };
+            unsafe { ctx.destroy() };
+            return;
+        }
+
+        let (token, ptr) = pools.lease_readback().expect("a mapped cached slot leases");
+        assert_eq!(ptr, slot.mapped, "the lease must lend the slot's mapping");
+        assert_eq!(
+            readback_leases_outstanding(),
+            1,
+            "a teardown reads this to decide whether a borrow is live"
+        );
+        // The exclusivity claim, stated as the thing that would break it: a
+        // second acquire must not be able to reach the leased slot.
+        let other = unsafe { pools.acquire_readback(&ctx, 4096, &counters) }
+            .expect("a second readback slot must be available");
+        assert_ne!(
+            other.buffer, slot.buffer,
+            "the leased slot was handed out again under a live borrow"
+        );
+
+        return_readback_lease(token);
+        assert_eq!(
+            readback_leases_outstanding(),
+            0,
+            "the borrow is over the moment the holder says so"
+        );
+        // Returned, then collected: the two are deliberately separate, because
+        // the return may not take the engine lock and the collection needs it.
+        pools.reclaim_returned_readback_leases();
+        let back = unsafe { pools.acquire_readback(&ctx, 4096, &counters) }
+            .expect("the returned slot must be reusable");
+        assert!(
+            back.buffer == slot.buffer || back.buffer == other.buffer,
+            "a returned lease must rejoin the free list rather than leak"
+        );
+
+        pools.recycle_readback();
         unsafe { pools.destroy_all(&ctx.device) };
         unsafe { ctx.destroy() };
     }
