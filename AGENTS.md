@@ -1010,6 +1010,38 @@ test it. And 98 fps is not 120: even with the largest cost in the device
 removed outright, this workload does not reach goal 6's number, so the
 writeback is necessary but not obviously sufficient.
 
+### The tier behind it, so it does not have to be re-derived
+
+Run 4 left the worker at `duty` 0.77 with 62 draws a frame at ~97 µs, so the
+draw path becomes the ceiling next. It costs the **same per draw with the
+writeback on or off** (control 103 µs, counterfactual 97 µs), so the control's
+own numbers price it. Per draw, from `chain_phase` over one control second of
+2270 draws:
+
+```text
+binds    23.5 us        engine   50.4 us  ->  stage           25.2 us
+sampled   7.7 us                              sampled_upload  11.1 us
+store    11.0 us                              record           3.8 us
+pipeline  4.2 us                              pipeline         3.3 us
+prep      1.9 us                              prep             1.7 us
+```
+
+`binds_us` and `draw_phase`'s `stage_us` are the two big ones and are within a
+microsecond of each other. **Neither is divided any further**, and `binds_us`
+in particular covers the whole of `load_buffer_content` for every vertex and
+fragment buffer plus attribute preparation — several distinct costs under one
+column. Dividing it is the "measure before fixing" step for this tier.
+
+The arithmetic that says whether the tier matters: 120 fps is 8.33 ms, run 4
+achieved 10.2 ms, and draws are 6.0 ms of that. So goal 6 needs about **2 ms a
+frame out of the draw path** on top of the writeback — roughly a third of it,
+or two thirds of either big column. Not obviously reachable, and not obviously
+out of reach.
+
+One dead end already checked: `BufferContent::Bytes` is an `Arc<Vec<u8>>`, so
+the per-attribute `content.clone()` inside the binds phase is a refcount bump,
+not a copy.
+
 Two cautions before building on any of it. The stressor moves the window through
 the accessibility API, not a pointer drag: `CGEventPost` is silently discarded
 here because the posting process is not trusted for Accessibility and TCC.db
