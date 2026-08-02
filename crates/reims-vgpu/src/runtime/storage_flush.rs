@@ -1117,6 +1117,7 @@ pub fn flush_mapping_windows_before_fence<M: HostMemory + HostOps>(
     // remove — the only way past it is not to write the bytes at all, which is
     // the demand-driven route named above.
     crate::runtime::drain::note_store_route("mapw_fence_pass");
+    let counterfactual = render_writeback_counterfactual();
     // Snapshot first: landing one window consumes its overlapping siblings
     // through the fixpoint, so iterating the live map would borrow it across a
     // mutation. A key already consumed by an earlier pass is skipped rather than
@@ -1127,6 +1128,11 @@ pub fn flush_mapping_windows_before_fence<M: HostMemory + HostOps>(
         }
         crate::runtime::drain::note_store_route("mapw_fence_flush");
         state.fence_flushed_mappings.insert(key.mapping_id);
+        if counterfactual {
+            state.compute_deferred_flush.remove(&key);
+            crate::runtime::drain::note_store_route("mapw_fence_counterfactual");
+            continue;
+        }
         flush_intersecting(
             state,
             host,
@@ -1134,6 +1140,67 @@ pub fn flush_mapping_windows_before_fence<M: HostMemory + HostOps>(
             key.surface_offset,
             key.span_end,
         );
+    }
+}
+
+/// Whether this boot is measuring what the render writeback is worth by not
+/// doing it.
+///
+/// The ledger above prices the rail by attribution: the parts sum to the whole,
+/// so ~8 full-screen writebacks at 2.48 ms each account for ~20 ms of a 30 ms
+/// guest frame. **That is not the same claim as "removing it returns 20 ms."**
+/// The worker is a serial pipeline against a guest that blocks on its
+/// completion stamps, so the return could be larger (the guest gets its
+/// stamps sooner and pipelines further ahead) or smaller (whatever the rail was
+/// hiding becomes the new floor). Nothing in the ledger separates those, and
+/// the read-witness route it points at is weeks of hypervisor work priced
+/// entirely off the attribution.
+///
+/// So this exists to price it before anyone spends that. Setting
+/// `REIMS_VGPU_PROBE_NO_RENDER_WRITEBACK=1` drops every mapping-keyed render
+/// window at the fence instead of landing it, which skips both the GPU readback
+/// and the CPU scatter — the whole rail, not a slice of it.
+///
+/// **A boot with this set is incorrect and must never be one anything is
+/// claimed from except the frame rate.** The guest is told its render completed
+/// while its own pages still hold the previous frame, so any guest CPU read of
+/// a render target sees stale pixels; that is precisely the case the rail
+/// exists for. It announces itself once through the always-on failure path so a
+/// counterfactual boot's log can never be mistaken for a normal one, and it is
+/// read once per process rather than per fence.
+/// The env value's meaning, split out from the process latch so both answers
+/// are testable in one process.
+///
+/// Exactly `1` turns it on. A rail that also accepted `0`, `false` or an empty
+/// string as "set" would silently run a correctness-breaking build for anyone
+/// who exported the variable to turn it *off*, which is the shape of switch
+/// this project has been burned by before.
+fn counterfactual_requested(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|value| value == "1")
+}
+
+fn render_writeback_counterfactual() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(u8::MAX);
+    match STATE.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let on = counterfactual_requested(
+                std::env::var_os("REIMS_VGPU_PROBE_NO_RENDER_WRITEBACK").as_deref(),
+            );
+            STATE.store(u8::from(on), Ordering::Relaxed);
+            if on {
+                crate::observe::fail(
+                    "PROBE render_writeback_counterfactual=on reason=\
+                     REIMS_VGPU_PROBE_NO_RENDER_WRITEBACK — every mapping-keyed render \
+                     window is dropped at the fence. Guest CPU reads of render targets \
+                     see stale pixels. Frame rate is the only number this boot can \
+                     support.",
+                );
+            }
+            on
+        }
     }
 }
 
@@ -2862,6 +2929,38 @@ mod render_flush_witness_tests {
         note_render_flush_pages_read(&mut state, 9);
         assert!(!state.mappings.contains_key(&9));
         assert_eq!(note_render_flush_landed(&mut state, 9, true), None);
+    }
+}
+
+#[cfg(test)]
+mod counterfactual_tests {
+    use super::counterfactual_requested;
+    use std::ffi::OsStr;
+
+    /// Unset is off. This is the only reading that matters for every boot that
+    /// is not the experiment, and the experiment breaks guest correctness.
+    #[test]
+    fn an_unset_variable_leaves_the_rail_alone() {
+        assert!(!counterfactual_requested(None));
+    }
+
+    /// Exactly `1` turns it on.
+    #[test]
+    fn the_documented_value_turns_it_on() {
+        assert!(counterfactual_requested(Some(OsStr::new("1"))));
+    }
+
+    /// Every other value is off, `0` and `false` most of all. A switch that
+    /// read "set at all" would run the incorrect build for anyone who exported
+    /// the variable in order to disable it.
+    #[test]
+    fn every_other_value_including_the_off_spellings_is_off() {
+        for value in ["", "0", "false", "no", "off", "2", "yes", "true", " 1"] {
+            assert!(
+                !counterfactual_requested(Some(OsStr::new(value))),
+                "{value:?} must not arm the counterfactual"
+            );
+        }
     }
 }
 
