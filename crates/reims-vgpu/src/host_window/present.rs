@@ -691,6 +691,85 @@ struct App {
     /// Outstanding guest-driven native resize, kept only for the fail-visible
     /// `native_resize_not_applied` alarm — never a presentation gate.
     pending_guest_resize: Option<PendingGuestResize>,
+    /// What this event loop actually did, per second. See [`LoopCensus`].
+    loop_census: LoopCensus,
+}
+
+/// How often the window's event loop looked for a guest frame, and what it
+/// found when it did.
+///
+/// `host_window_cadence` counts presents, and a present only happens when the
+/// loop both ran and found a new `Frame::seq`. Those are two different failures
+/// with the same symptom: a loop that ticks 500 times a second and finds
+/// nothing new is a still screen, while a loop that ticks 17 times against 34
+/// published frames is dropping half of them before any Vulkan call is reached.
+/// Nothing separated them — `window_publish fresh` is counted on the drain
+/// worker and `presents` inside the presenter, with the loop between them
+/// unmeasured.
+///
+/// The counters are plain fields rather than atomics because every one of them
+/// is touched only by the thread that owns the loop.
+#[derive(Debug)]
+struct LoopCensus {
+    window_started: std::time::Instant,
+    /// `about_to_wait` entries: how often the loop woke at all.
+    ticks: u64,
+    /// Ticks that asked the platform for a redraw, which is capped by
+    /// [`ENGINE_WINDOW_REDRAW_POLL`] rather than by the tick rate.
+    redraws_asked: u64,
+    /// `RedrawRequested` deliveries. A gap between this and `redraws_asked` is
+    /// the platform coalescing or delaying them, which the loop cannot see any
+    /// other way.
+    draws: u64,
+    /// Draws that found `Frame::seq` unchanged and presented nothing. Expected
+    /// to dominate on a still screen.
+    draws_stale: u64,
+    /// Draws held because a guest mode change is being applied to the native
+    /// window.
+    draws_held: u64,
+    /// Draws that reached the presenter with a new frame.
+    draws_fresh: u64,
+}
+
+impl LoopCensus {
+    fn new() -> Self {
+        Self {
+            window_started: std::time::Instant::now(),
+            ticks: 0,
+            redraws_asked: 0,
+            draws: 0,
+            draws_stale: 0,
+            draws_held: 0,
+            draws_fresh: 0,
+        }
+    }
+
+    /// Emit and reset once a second, counting this tick first.
+    ///
+    /// Called from `about_to_wait`, which runs on every loop wake — so the
+    /// window closes on the first tick after a second has passed rather than on
+    /// a timer of its own, and a loop that has stopped waking emits nothing at
+    /// all. That silence is the reading: a missing `host_window_loop` line
+    /// means the event loop is not running.
+    fn tick(&mut self) {
+        self.ticks += 1;
+        let elapsed = self.window_started.elapsed();
+        if elapsed < std::time::Duration::from_secs(1) {
+            return;
+        }
+        crate::observe::off(format!(
+            "host_window_loop win_ms={} ticks={} redraws_asked={} draws={} \
+             draws_fresh={} draws_stale={} draws_held={}",
+            elapsed.as_millis(),
+            self.ticks,
+            self.redraws_asked,
+            self.draws,
+            self.draws_fresh,
+            self.draws_stale,
+            self.draws_held,
+        ));
+        *self = Self::new();
+    }
 }
 
 impl ApplicationHandler for App {
@@ -846,6 +925,7 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::RedrawRequested => {
+                self.loop_census.draws += 1;
                 self.draw();
             }
             _ => {}
@@ -872,6 +952,7 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.loop_census.tick();
         // The device sets `stop` on VM teardown. The loop wakes at least once
         // per [`ENGINE_WINDOW_REDRAW_POLL`], so the request is picked up within
         // one poll — then the loop exits and `VkState::drop` tears the window's
@@ -905,6 +986,7 @@ impl ApplicationHandler for App {
             let now = std::time::Instant::now();
             if now >= self.next_engine_redraw {
                 window.request_redraw();
+                self.loop_census.redraws_asked += 1;
                 self.next_engine_redraw = now + ENGINE_WINDOW_REDRAW_POLL;
             }
             event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
@@ -940,6 +1022,7 @@ impl App {
             engine_redraw_required: true,
             guest_extent: None,
             pending_guest_resize: None,
+            loop_census: LoopCensus::new(),
         }
     }
 
@@ -1024,8 +1107,14 @@ impl App {
                 self.engine_redraw_required,
                 incoming_seq,
             ) {
+                self.loop_census.draws_stale += 1;
                 return;
             }
+            // Counted on both rails so `draws_fresh + draws_stale + draws_held`
+            // sums to `draws` whichever presenter is driving. A boot where they
+            // do not sum is one where a fourth disposition was added without a
+            // counter.
+            self.loop_census.draws_fresh += 1;
             match unsafe { vk.present(frame.as_deref()) } {
                 Ok(()) => {
                     self.last_engine_seq = incoming_seq;
@@ -1054,6 +1143,7 @@ impl App {
             // new-geometry frame into the outgoing swapchain — at boot the
             // next guest present can be seconds away, which would pin that
             // interim frame on screen.
+            self.loop_census.draws_held += 1;
             return;
         }
         let incoming_seq = frame.as_ref().map(|frame| frame.seq);
@@ -1062,8 +1152,10 @@ impl App {
             self.engine_redraw_required,
             incoming_seq,
         ) {
+            self.loop_census.draws_stale += 1;
             return;
         }
+        self.loop_census.draws_fresh += 1;
         let result = crate::backend::vulkan::engine::window_present_frame(
             frame.as_ref().and_then(|frame| frame.resident.as_ref()),
             frame.as_deref().map(window_cpu_frame),
@@ -2051,6 +2143,57 @@ impl Drop for VkState {
             self.surface_loader.destroy_surface(self.surface, None);
             self.instance.destroy_instance(None);
         }
+    }
+}
+
+#[cfg(test)]
+mod loop_census_tests {
+    use super::*;
+
+    /// A loop that has run for less than its window emits nothing and keeps
+    /// counting. Emitting on every tick would be one line per 2 ms poll.
+    #[test]
+    fn a_partial_window_accumulates_rather_than_emitting() {
+        let mut census = LoopCensus::new();
+        census.tick();
+        census.tick();
+        assert_eq!(census.ticks, 2);
+        assert!(census.window_started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    /// The window closes on the first tick past a second, and resets so the
+    /// next line is a rate rather than a running total.
+    #[test]
+    fn a_closed_window_resets_every_counter() {
+        let mut census = LoopCensus::new();
+        census.draws = 9;
+        census.draws_fresh = 4;
+        census.draws_stale = 5;
+        census.redraws_asked = 7;
+        census.window_started = std::time::Instant::now() - std::time::Duration::from_millis(1100);
+        census.tick();
+        assert_eq!(census.ticks, 0);
+        assert_eq!(census.draws, 0);
+        assert_eq!(census.draws_fresh, 0);
+        assert_eq!(census.draws_stale, 0);
+        assert_eq!(census.redraws_asked, 0);
+        assert!(census.window_started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    /// The three dispositions divide `draws` exactly. A draw that reached the
+    /// loop and moved none of them is a fourth outcome nobody named, which is
+    /// the shape of a frame this device drops with no line saying so.
+    #[test]
+    fn the_dispositions_sum_to_the_draws() {
+        let mut census = LoopCensus::new();
+        census.draws = 12;
+        census.draws_fresh = 5;
+        census.draws_stale = 6;
+        census.draws_held = 1;
+        assert_eq!(
+            census.draws,
+            census.draws_fresh + census.draws_stale + census.draws_held
+        );
     }
 }
 

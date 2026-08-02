@@ -812,14 +812,65 @@ them is the undeclared-read question and not a separate lever. This paragraph
 exists because the first write-up of this measurement claimed the lever had
 reopened, and it had not.
 
-Two cautions before building on it. The stressor moves the window through the
-accessibility API, not a pointer drag: `CGEventPost` is silently discarded here
-because the posting process is not trusted for Accessibility and TCC.db cannot be
-written (no passwordless sudo, SIP Filesystem Protections on) — measured as 1800
-events posted at exactly 120.0 Hz with the window not moving one pixel, which is
-why the harness refuses a verdict unless the window moved. And nothing in these
-numbers separates "the guest asked for this much work" from "the device does more
-than it was asked"; 48 flushes per presented frame is the question that does.
+That paragraph used to end "nothing in these numbers separates *the guest asked
+for this much work* from *the device does more than it was asked*". **Reading
+the rest of the same log separates them, and the answer is the guest.** Three
+families nobody had put beside each other:
+
+| what it reads | what it removes |
+|---|---|
+| `display_vbl window_hz=120.0` throughout the drag | the guest is not pacing slowly for want of a time base |
+| `THRASH present_action_starvation` — **zero** in the whole accumulated log | `MAX_UNPAINTED_PRESENTS` is not holding the guest at the FIFO head |
+| `window_publish fresh + same_key == drain_duty tranches`, every window (19+28=47, 23+14=37, 22+8=30) | the publish rate is the tranche rate *by construction* |
+
+That identity is not a coincidence: `publish_window_frame` runs once per drain
+tranche, after `device.drain` returns, so the device samples its own finished
+frame at the tranche boundary and nowhere else. `fresh` is therefore the count
+of distinct frames offered to the window, and it reads **fewer than
+`tranches`** — so it is not an undersample of a faster guest.
+
+So the guest completes ~20 frames a second on that boot, and 233/20 is **~12
+full-screen composites per frame** — its layer tree, not work this device
+invented. Execution is sync-per-packet, which makes the guest's frame time our
+per-packet cost: 12 render flushes at 3.03 ms (`flush_rails render_us=499575
+render=165`) plus ~120 draws at 136 µs is **~53 ms, and 1000/53 is 19**, which
+matches `fresh`. **Goal 6 is not a presentation-cadence bug. The guest is
+serialized behind this device's writeback rail**, and the ~200 composites a
+second that never reach the screen are the other 11 of each 12. The lever is
+the one `flush_mapping_windows_before_fence` names.
+
+**One link in that chain is separately broken, and the first guess at it was
+wrong.** Two 15-second runs on one settled x86/PCI guest, host GPU at P8:
+
+```text
+window_publish fresh   med 34/s      (fresh+same_key == tranches, every second)
+host_window_cadence    present_hz med 16.8 / 17.0,  busy_fence=0 busy_acquire=0
+engine_lock  window=17  window_blocked med 0-1   window_wait_us med 0-440
+             worker=12 796  worker_hold_us med 488 000  worker_hold_max_us 4 600
+```
+
+Half the frames this device offers never reach the screen. The obvious
+candidate was the shared `ENGINE` mutex — `window_present_frame` takes the same
+lock the drain worker holds through its readback fences — and `engine_lock` was
+built to test it. **It is refuted.** The worker acquires that lock ~12 800
+times a second and holds it for half of every second, but the window thread
+asks for it only 17 times and is blocked on it for **0.04 % of a second**. The
+window is not waiting for the engine.
+
+What that leaves is the loop itself: `about_to_wait` polls every 2 ms
+(`ENGINE_WINDOW_REDRAW_POLL`), so 34 publishes a second cannot be coalesced
+into 17 presents unless the loop is running far slower than it asks to.
+`host_window_loop` counts that directly — ticks, redraws asked, redraws
+delivered, and each draw's disposition — and is the next reading to take.
+
+Two cautions before building on any of it. The stressor moves the window through
+the accessibility API, not a pointer drag: `CGEventPost` is silently discarded
+here because the posting process is not trusted for Accessibility and TCC.db
+cannot be written (no passwordless sudo, SIP Filesystem Protections on) —
+measured as 1800 events posted at exactly 120.0 Hz with the window not moving
+one pixel, which is why the harness refuses a verdict unless the window moved.
+And the 53 ms arithmetic above is an attribution, not a controlled experiment:
+it says the parts sum to the whole, not that removing one part returns its share.
 
 Ask the guest for the desktop size with `system_profiler SPDisplaysDataType`, not
 with Finder: `tell application "Finder" to get bounds of window of desktop`

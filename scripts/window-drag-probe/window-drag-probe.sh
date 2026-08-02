@@ -227,6 +227,8 @@ pub = rows("window_publish", ["fresh", "same_key"])
 lock = rows("engine_lock", ["window", "window_blocked", "window_wait_us",
                             "window_wait_max_us", "worker_hold_us",
                             "worker_hold_max_us"])
+wl = rows("host_window_loop", ["ticks", "redraws_asked", "draws",
+                               "draws_fresh", "draws_stale"])
 
 print("host_window_cadence — frames this device put out")
 show("present_hz", [r["present_hz"] for r in cad], " Hz")
@@ -249,6 +251,12 @@ print("window_publish — frames offered, sampled once per drain tranche")
 show("fresh", [r["fresh"] for r in pub], "/s")
 show("fresh+same_key", [r["fresh"] + r["same_key"] for r in pub])
 show("tranches", [r["tranches"] for r in duty])
+print("host_window_loop — how often the window loop looked, and what it found")
+show("ticks", [r["ticks"] for r in wl])
+show("redraws_asked", [r["redraws_asked"] for r in wl])
+show("draws", [r["draws"] for r in wl])
+show("draws_fresh", [r["draws_fresh"] for r in wl])
+show("draws_stale", [r["draws_stale"] for r in wl])
 print("engine_lock — the window thread against the worker's hold")
 show("window acquires", [r["window"] for r in lock])
 show("window blocked", [r["window_blocked"] for r in lock])
