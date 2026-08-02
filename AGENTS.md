@@ -225,11 +225,48 @@ the CPU**, which is a second and independent cause of jumpy playback alongside F
 `supportsOpenGL = 0` compositor fallback. Unlike that one it applies to Safari too, so "Safari is
 the browser where GPU goals are measurable" does not extend to video.
 
-What is **not** established, and is the thing to check before anyone builds on this: whether
-Apple's own paravirt stack offers a codec path we are simply not implementing. If it does, there is
-a protocol here to decode; if it does not, hardware video in this guest needs a new device and a
-guest driver for it, which this project does not ship. Nothing has looked, and guessing either way
-would be exactly the broad claim the next paragraph warns about.
+**That paragraph used to end by saying hardware video here would need a new device *and a guest
+driver for it, which this project does not ship*. The second half is wrong, and it is the half that
+made goal 4 look impossible.** Apple ships the guest driver, and it is installed on this image right
+now. The check the paragraph asked for has since been run, and Apple's paravirt stack does have a
+codec path:
+
+- `AppleVideoToolboxParavirtualization.kext` is present in the guest under
+  `/System/Library/Extensions/`. It is a *separate* kext from the GPU one.
+- Its driver personality is `AppleVideoToolboxParavirtualizationDriver` over provider
+  `AppleVirtIOTransport`, with `IOUserClientClass` `AppleVideoToolboxParavirtualizationUserClient`,
+  matching `IOVirtIOPrimaryMatch = 0x1a03106b`. A second personality binds `AppleVirtIOPCITransport`
+  to `IOPCIDevice` on `IOPCIPrimaryMatch = 0x1a03106b`, so the whole path hangs off **one PCI ID:
+  vendor 0x106b, device 0x1a03**.
+- It declares dependencies on `AppleParavirtIOSurface` and `IOSurface`, so decoded frames are meant
+  to land in IOSurfaces shared with the graphics stack rather than being copied out.
+- It is **not** attached to the GPU's PCI ID or to either GPU personality, and it is not part of the
+  x86-vs-arm64 plugin split that decides `featureProfile`. It is its own VirtIO device on both
+  pathways, so unlike Chrome's Tier 2 gate this one is not an x86-only defect.
+
+Confirmed on the live x86 guest, and this is the part that matters: the kext is **installed and not
+loaded** — `kmutil showloaded` matches it zero times. It never matches because nothing on our bus
+presents `106b:1a03`. So the reason `VTIsHardwareDecodeSupported` answers False for every codec is
+not that the guest lacks a driver. It is that **the host does not expose the device that driver
+binds to**, which is a host-side gap of exactly the kind this project already fills for the GPU.
+
+Goal 4 is therefore **not** blocked on "a device that does not exist". It is blocked on a device
+nobody has written. Keep the scope of that honest, because it is a long way from here to working
+decode:
+
+- **Established**: the attach contract above — the ID, the transport, the user client, the IOSurface
+  dependency, and that the driver is present and idle on a running guest.
+- **Not established**: the wire protocol. Nothing has decoded the VirtIO queue layout, the command
+  set, codec negotiation, or the surface handoff, and none of that can be guessed. Nor has it been
+  shown that a host-side decoder (VideoToolbox on macOS hosts, VAAPI or Vulkan Video on Linux) can
+  satisfy whatever that protocol asks for.
+- Presenting `106b:1a03` and then answering nothing would make the guest *load* a driver onto a
+  device that does not work, which is worse than the current state. Do not present the ID until
+  there is something behind it.
+
+The measurements above still stand as a description of the symptom: with no such device, every
+browser's video decode is on the CPU, and that remains a second, independent cause of jumpy playback
+which also applies to Safari.
 
 Verify claims of this kind against the binaries before adding one, and say which constant decides
 it. "The guest cannot do X" is exactly the sort of broad claim `Keep Claims Narrow` is about.
