@@ -1876,14 +1876,15 @@ mod tests {
     /// The bitmap witnesses guest CPU stores. Everything this device puts into
     /// the same pages is invisible to it, so a reader holding "the guest has not
     /// written since I looked" would keep serving a copy that *we* superseded.
-    /// `host_guest_write_seq` is the only thing that separates the two, and a
-    /// writer that forgets to move it is silent in exactly the way that matters.
+    /// `DeviceState::host_writes` is the only thing that separates the two, and a
+    /// writer that forgets to record there is silent in exactly the way that
+    /// matters.
     ///
     /// The read half is the other half of the contract: reads share the same
-    /// mapping walk, and a read that bumped the counter would make every reader
+    /// mapping walk, and a read that moved the record would make every reader
     /// re-fetch on account of a reader.
     #[test]
-    fn writing_guest_pages_moves_the_host_write_sequence_and_reading_them_does_not() {
+    fn writing_guest_pages_moves_the_host_write_record_and_reading_them_does_not() {
         use crate::model::PAGE_SHIFT_X86;
         const PAGE: u64 = 1 << PAGE_SHIFT_X86;
         const W: u32 = 64;
@@ -1903,22 +1904,24 @@ mod tests {
         m.page_entries = entries;
         assert!(state.set_mapping_geom(4, W, H, MTL_FORMAT_BGRA8_UNORM));
 
-        let before = state.host_guest_write_seq;
+        let before = state.host_writes.epoch();
         let frame = vec![0xAAu8; (W * H * 4) as usize];
         assert!(write_bgra8(&mut state, &mut host, 4, &frame, W * 4, W, H));
-        assert!(
-            state.host_guest_write_seq > before,
+        assert_ne!(
+            state.host_writes.epoch(),
+            before,
             "a write into the guest's pages went unannounced"
         );
 
-        let after_write = state.host_guest_write_seq;
+        let after_write = state.host_writes.epoch();
         let mut out = vec![0u8; (W * H * 4) as usize];
         assert!(crate::runtime::mapper::read_mapping_bytes(
             &mut state, &mut host, 4, 0, &mut out
         ));
         assert_eq!(
-            state.host_guest_write_seq, after_write,
-            "a read moved the write sequence, so every reader now invalidates every reader"
+            state.host_writes.epoch(),
+            after_write,
+            "a read moved the write record, so every reader now invalidates every reader"
         );
     }
 
