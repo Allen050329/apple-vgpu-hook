@@ -121,6 +121,11 @@ struct Entry {
     /// so a content change can be attributed to this device's own writes rather
     /// than to a guest store the bitmap missed.
     host_seq: u64,
+    /// The same, narrowed to writes that could have landed in *this* window's
+    /// mapping (see `DeviceState::host_wrote_mapping_seq`). The global count
+    /// moves whenever any surface anywhere is written, so the two together say
+    /// how much of the global count's invalidation is other people's work.
+    scoped_seq: u64,
     /// Bind ordinal of the last sight of this window, for LRU eviction.
     last_seen: u64,
 }
@@ -236,6 +241,9 @@ pub struct GatherWindow<'a> {
     pub page_size: usize,
     /// [`crate::model::DeviceState::host_guest_write_seq`] as of this bind.
     pub host_seq: u64,
+    /// `DeviceState::host_wrote_mapping_seq` for this window's mapping, or the
+    /// global count where the window names no mapping.
+    pub scoped_seq: u64,
 }
 
 /// What one bind of a window observed, crossing the hypervisor's answer with the
@@ -254,7 +262,17 @@ pub enum GatherVerdict {
     Unarmed { fold_same: bool },
     /// Generation still, bytes still — a gather a cache keyed on this witness
     /// would skip, correctly.
-    CleanSame,
+    ///
+    /// The two flags score the two invalidation rules a cache could use against
+    /// the host writes the bitmap cannot see. `global_quiet` is the rule "this
+    /// device wrote nothing anywhere"; `scoped_quiet` is "wrote nothing that
+    /// could have reached this window". Both are sound; scoped is strictly
+    /// larger, and the gap between them is how much of the global rule's
+    /// invalidation is other surfaces' work.
+    CleanSame {
+        global_quiet: bool,
+        scoped_quiet: bool,
+    },
     /// Generation still, bytes moved. The witness is unsound for this window:
     /// something wrote these pages without the bitmap seeing it.
     ///
@@ -279,7 +297,7 @@ impl GatherVerdict {
         match self {
             Self::Rearmed => None,
             Self::Unarmed { fold_same } => Some(fold_same),
-            Self::CleanSame | Self::MovedSame => Some(true),
+            Self::CleanSame { .. } | Self::MovedSame => Some(true),
             Self::CleanDiff { .. } | Self::MovedDiff => Some(false),
         }
     }
@@ -320,9 +338,20 @@ pub fn note_gather<M: crate::runtime::host::HostOps>(
     match verdict {
         GatherVerdict::Rearmed => note_store_route("gw_rearm"),
         GatherVerdict::Unarmed { .. } => note_store_route("gw_unarmed"),
-        GatherVerdict::CleanSame => {
+        GatherVerdict::CleanSame {
+            global_quiet,
+            scoped_quiet,
+        } => {
             note_store_route("gw_clean_same");
             note_store_route_n("gw_clean_same_kb", span / 1024);
+            if global_quiet {
+                note_store_route("gw_hit_global");
+                note_store_route_n("gw_hit_global_kb", span / 1024);
+            }
+            if scoped_quiet {
+                note_store_route("gw_hit_scoped");
+                note_store_route_n("gw_hit_scoped_kb", span / 1024);
+            }
         }
         GatherVerdict::CleanDiff { host_wrote: true } => {
             note_store_route("gw_clean_diff_host_wrote")
@@ -347,6 +376,7 @@ fn observe<M: crate::runtime::host::HostOps>(
         span,
         page_size,
         host_seq,
+        scoped_seq,
     } = window;
 
     // SAFETY: `runs` describe the window this draw is about to gather from, so
@@ -384,6 +414,7 @@ fn observe<M: crate::runtime::host::HostOps>(
                 gen,
                 fold,
                 host_seq,
+                scoped_seq,
                 last_seen: witness.binds,
             },
         );
@@ -407,7 +438,10 @@ fn observe<M: crate::runtime::host::HostOps>(
         GatherVerdict::Unarmed { fold_same }
     } else {
         match (gen == entry.gen, fold_same) {
-            (true, true) => GatherVerdict::CleanSame,
+            (true, true) => GatherVerdict::CleanSame {
+                global_quiet: host_seq == entry.host_seq,
+                scoped_quiet: scoped_seq == entry.scoped_seq,
+            },
             (true, false) => GatherVerdict::CleanDiff {
                 host_wrote: host_seq != entry.host_seq,
             },
@@ -418,6 +452,7 @@ fn observe<M: crate::runtime::host::HostOps>(
     entry.gen = gen;
     entry.fold = fold;
     entry.host_seq = host_seq;
+    entry.scoped_seq = scoped_seq;
     entry.last_seen = witness.binds;
     verdict
 }
@@ -441,6 +476,12 @@ mod tests {
         host_wrote_since(gpas, runs, 0)
     }
 
+    /// A window that saw no host write at either scope.
+    const HOST_QUIET: GatherVerdict = GatherVerdict::CleanSame {
+        global_quiet: true,
+        scoped_quiet: true,
+    };
+
     /// The same window, presented as of host-write sequence `host_seq`.
     fn host_wrote_since<'a>(
         gpas: &'a [u64],
@@ -453,6 +494,7 @@ mod tests {
             span: PAGE as u64,
             page_size: PAGE,
             host_seq,
+            scoped_seq: host_seq,
         }
     }
 
@@ -510,7 +552,7 @@ mod tests {
         );
         assert_eq!(
             observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs)),
-            GatherVerdict::CleanSame
+            HOST_QUIET
         );
     }
 
@@ -598,7 +640,7 @@ mod tests {
         );
         assert_eq!(
             observe(&mut w, &mut host, KEY, one_page(&moved, &runs)),
-            GatherVerdict::CleanSame
+            HOST_QUIET
         );
     }
 

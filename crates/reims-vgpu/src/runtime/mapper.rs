@@ -1980,7 +1980,7 @@ fn copy_mapping_runs<H: HostMemory + HostOps>(
     if copy.is_write() {
         // Puts bytes into guest pages the hypervisor's dirty bitmap cannot
         // witness. The read direction shares this walk and writes nothing.
-        state.note_host_wrote_guest_ram();
+        state.note_host_wrote_mapping(mapping_id);
     }
     let len = copy.len();
     let need_end = off.saturating_add(len as u64);

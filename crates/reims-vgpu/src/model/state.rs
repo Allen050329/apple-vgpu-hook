@@ -1776,6 +1776,21 @@ pub struct DeviceState {
     /// concludes "we may have written", re-reads, and pays a copy. Under-counting
     /// vouches for a stale one. See [`Self::note_host_wrote_guest_ram`].
     pub host_guest_write_seq: u64,
+    /// The part of [`Self::host_guest_write_seq`] contributed by writers that
+    /// cannot name the mapping they landed in.
+    ///
+    /// The raw task-GVA writers reach guest pages through a page-table walk, and
+    /// those pages can belong to any mapping — `deferred_alias_pages` exists
+    /// precisely because they do. So a reader scoped to one mapping still has to
+    /// assume every unscoped write might have been its own.
+    pub host_unscoped_write_seq: u64,
+    /// Per-mapping share of [`Self::host_guest_write_seq`]: how many times this
+    /// device wrote bytes into *this* mapping's pages.
+    ///
+    /// A reader watching one surface wants this and not the global count, which
+    /// moves whenever any surface anywhere is written. See
+    /// [`Self::host_wrote_mapping_seq`] for the sum a reader must actually use.
+    pub host_wrote_mapping: std::collections::BTreeMap<u32, u64>,
     /// Reusable native-row read buffer for the guest-linear memo path.
     pub guest_linear_scratch: Vec<u8>,
     /// Byte-exact revalidated memo for type-5 serialized texture views
@@ -2038,6 +2053,8 @@ impl DeviceState {
             gather_witness: crate::runtime::gather_witness::GatherWitness::default(),
             sampled_content_gen: 0,
             host_guest_write_seq: 0,
+            host_unscoped_write_seq: 0,
+            host_wrote_mapping: std::collections::BTreeMap::new(),
             guest_linear_scratch: Vec::new(),
             type5_view_memo: LruBytesMemo::new(GUEST_LINEAR_MEMO_BYTE_CAP),
             type11_memo: LruBytesMemo::new(GUEST_LINEAR_MEMO_BYTE_CAP),
@@ -3143,6 +3160,29 @@ impl DeviceState {
     /// that did not change. The opposite error hands out a stale copy.
     pub fn note_host_wrote_guest_ram(&mut self) {
         self.host_guest_write_seq = self.host_guest_write_seq.wrapping_add(1);
+        self.host_unscoped_write_seq = self.host_unscoped_write_seq.wrapping_add(1);
+    }
+
+    /// The same, for a writer that knows which mapping's pages it is landing in.
+    ///
+    /// Scoping matters because the global count moves for every surface in the
+    /// system: a reader watching one texture would re-read it because an
+    /// unrelated scanout was composited.
+    pub fn note_host_wrote_mapping(&mut self, mapping_id: u32) {
+        self.host_guest_write_seq = self.host_guest_write_seq.wrapping_add(1);
+        let e = self.host_wrote_mapping.entry(mapping_id).or_default();
+        *e = e.wrapping_add(1);
+    }
+
+    /// How much host writing one mapping has seen, counting the writes that
+    /// could not say which mapping they were for.
+    ///
+    /// The sum, not the per-mapping count: an unscoped write may have landed
+    /// anywhere, so a reader that ignored it could vouch for pages this device
+    /// had just overwritten.
+    pub fn host_wrote_mapping_seq(&self, mapping_id: u32) -> u64 {
+        self.host_unscoped_write_seq
+            .wrapping_add(self.host_wrote_mapping.get(&mapping_id).copied().unwrap_or(0))
     }
 
     /// Issue a sampled-content generation that has never been issued before.
@@ -3441,6 +3481,45 @@ mod fail_vocabulary_tests {
         assert!(!state.set_mapping_geom(1, 0, 64, 0x50));
         assert!(!state.set_mapping_geom(1, 64, 0, 0x50));
         assert!(!state.mappings.contains_key(&1));
+    }
+
+    /// A reader watching one surface must be told about writes that could have
+    /// reached it, and about no others.
+    ///
+    /// Both halves are load-bearing in opposite directions. If a write to some
+    /// other mapping moved this one's count, a cache would re-read a texture
+    /// because an unrelated scanout was composited — correct, and worthless. If
+    /// an *unscoped* write did not move it, a cache could vouch for pages the raw
+    /// task-GVA writers had just overwritten, because those reach guest pages
+    /// through a page-table walk and can land in any mapping at all.
+    #[test]
+    fn a_mappings_host_write_count_hears_its_own_writes_and_the_unscoped_ones_only() {
+        let mut state = DeviceState::new(DeviceId(1), crate::model::PAGE_SHIFT_X86);
+        let quiet = state.host_wrote_mapping_seq(7);
+
+        state.note_host_wrote_mapping(9);
+        assert_eq!(
+            state.host_wrote_mapping_seq(7),
+            quiet,
+            "another mapping's write moved this one's count"
+        );
+        assert_ne!(state.host_wrote_mapping_seq(9), quiet);
+
+        let before_own = state.host_wrote_mapping_seq(7);
+        state.note_host_wrote_mapping(7);
+        assert_ne!(state.host_wrote_mapping_seq(7), before_own);
+
+        let before_unscoped = state.host_wrote_mapping_seq(7);
+        state.note_host_wrote_guest_ram();
+        assert_ne!(
+            state.host_wrote_mapping_seq(7),
+            before_unscoped,
+            "a write that could not name its mapping must be assumed to be this one's"
+        );
+
+        // The global count hears all three, which is what the unscoped rail and
+        // the task-GVA windows have to use.
+        assert_eq!(state.host_guest_write_seq, 3);
     }
 
 }

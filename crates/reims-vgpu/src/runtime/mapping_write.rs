@@ -558,7 +558,7 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
     // hypervisor's dirty bitmap will not witness a single one of them. Counted
     // here rather than at each committed copy so a refusal further down costs a
     // spurious bump instead of a missing one.
-    state.note_host_wrote_guest_ram();
+    state.note_host_wrote_mapping(mapping_id);
     let Some(m) = state.mappings.get(&mapping_id) else {
         return false;
     };
@@ -890,7 +890,7 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
     // hypervisor's dirty bitmap will not witness a single one of them. Counted
     // here rather than at each committed copy so a refusal further down costs a
     // spurious bump instead of a missing one.
-    state.note_host_wrote_guest_ram();
+    state.note_host_wrote_mapping(mapping_id);
     let Some(m) = state.mappings.get(&mapping_id) else {
         return false;
     };
@@ -1083,7 +1083,7 @@ pub fn write_raw_rows<M: HostMemory + HostOps>(
     // hypervisor's dirty bitmap will not witness a single one of them. Counted
     // here rather than at each committed copy so a refusal further down costs a
     // spurious bump instead of a missing one.
-    state.note_host_wrote_guest_ram();
+    state.note_host_wrote_mapping(mapping_id);
     let Some(m) = state.mappings.get(&mapping_id) else {
         return false;
     };
@@ -1547,7 +1547,7 @@ fn write_rect_raw_at_impl<M: HostMemory + HostOps>(
     // hypervisor's dirty bitmap will not witness a single one of them. Counted
     // here rather than at each committed copy so a refusal further down costs a
     // spurious bump instead of a missing one.
-    state.note_host_wrote_guest_ram();
+    state.note_host_wrote_mapping(mapping_id);
     let Some(m) = state.mappings.get(&mapping_id) else {
         return false;
     };
