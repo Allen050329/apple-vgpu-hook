@@ -511,6 +511,24 @@ Report rAF beside the device-side counters, which do not share this bimodality:
 `readback_split`. Those reproduce across boots and are what a performance claim
 should rest on; rAF is the corroborating number, not the evidence.
 
+**For anything about frames reaching the screen, `present_hz` alone is not a
+result — read the chain.** Four families divide it and each one has been the
+suspect at some point:
+
+| line | what it answers |
+|---|---|
+| `window_publish fresh` / `same_key` | how many distinct frames the device offered. `fresh + same_key == drain_duty tranches` always, because `publish_window_frame` runs once per tranche |
+| `host_window_loop` | the window thread's own ticks, the redraws it asked for, the redraws the platform delivered, and each draw's disposition |
+| `engine_lock` | wait and hold on the one `ENGINE` mutex, split into the drain worker and the window thread |
+| `host_window_cadence` | what actually reached the swapchain, with `busy_fence` / `busy_acquire` |
+
+The counterfactual switch belongs with them. Setting
+`REIMS_VGPU_PROBE_NO_RENDER_WRITEBACK=1` on a boot drops every mapping-keyed
+render window at the fence, which prices the writeback rail by removing it.
+**Such a boot is incorrect and frame rate is the only number it can support**;
+it announces itself once as `PROBE render_writeback_counterfactual=on`, so
+check for that line before trusting anything else in a log.
+
 **Record the host GPU's clock and power state beside any GPU-timing number, or
 you are measuring the governor.** This is the same class of error as probing an
 unsettled guest, and it is larger. Measured on one boot, one build, one driven
