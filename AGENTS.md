@@ -1118,7 +1118,17 @@ the real rail:
   every overflow drops the whole map and re-seeds — which is where all 39 of
   that run's seeds came from. So the live working set is above 8 surfaces. At
   two frames of device-local memory per surface, the real rail's equivalent
-  bound is a VRAM decision, not a bookkeeping one, and 8 is already too low.
+  bound is a VRAM decision, not a bookkeeping one, and 8 was already too low.
+
+  The 8 came from reading "~8 composites per guest frame" as a surface count.
+  It is not one: that figure counts **flushes**, several of which are the same
+  surface flushed again, and the population a scratch pool bounds is *distinct
+  identities*. Nothing had measured that quantity. The bound is now 16 — one
+  doubling, not a derivation — and `tdc_targets_sum` reports the live map size
+  accumulated per censused readback, so the working set is
+  `tdc_targets_sum / (tdc_frames + tdc_seed)` and the next run states it
+  instead of leaving it inferred from whether an overflow fired. **That number
+  has not been read yet**; the runs above predate the counter.
 
 **The redundancy is spread across every landing, not concentrated in a few, and
 that decides which build.** A mean cannot tell *seven wholly-unchanged surfaces

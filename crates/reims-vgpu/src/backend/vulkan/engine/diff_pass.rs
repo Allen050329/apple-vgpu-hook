@@ -450,11 +450,24 @@ pub(crate) struct DiffCensus {
 
 /// Targets the census holds scratch for at once.
 ///
-/// A driven drag composites ~8 surfaces per guest frame, so this covers the
-/// observed working set and bounds the probe at 16 frames of device-local
-/// memory. Overflow drops the whole map rather than evicting: this is a probe,
-/// and an LRU here would be a mechanism nothing in the product needs.
-const MAX_CENSUS_TARGETS: usize = 8;
+/// Overflow drops the whole map rather than evicting: this is a probe, and an
+/// LRU here would be a mechanism nothing in the product needs.
+///
+/// The first value was 8, reasoned from "a driven drag composites ~8 surfaces
+/// per guest frame". That reasoning was wrong in a way worth recording: the
+/// composites-per-frame figure counts *flushes*, several of which are the same
+/// surface flushed again, while the population this bounds is distinct
+/// identities — a different quantity that nothing had measured. The live run
+/// read `tdc_overflow` 5 times in 11 seconds against that bound, and every
+/// overflow re-seeds the whole map, which accounted for all 39 of that run's
+/// seeds.
+///
+/// 16 is not a derived number either, and is not offered as one: it is one
+/// doubling, bounding the probe at 32 frames of device-local memory.
+/// `tdc_targets` is what replaces the guess — it reports the live map size, so
+/// the next run states the working set rather than leaving it inferred from
+/// whether an overflow happened to fire.
+const MAX_CENSUS_TARGETS: usize = 16;
 
 impl DiffCensus {
     /// Release every buffer. The caller owes the in-flight rule.
@@ -579,6 +592,13 @@ pub(crate) unsafe fn census_target(
 
     let tiles = plan.words.div_ceil(TILE_DIFF_WORDS_PER_TILE);
     let changed: u32 = bits.iter().map(|w| w.count_ones()).sum();
+    // A **sum**, because `note_store_route_n` only ever adds: this is the live
+    // map size accumulated once per censused readback, so the population is
+    // `tdc_targets_sum / (tdc_frames + tdc_seed)` and the name says so. Emitted
+    // as a sum rather than a high-water mark because a mark that only grew
+    // could not fall when the guest settles, and the question is whether
+    // `MAX_CENSUS_TARGETS` binds *during the motion*.
+    note_store_route_n("tdc_targets_sum", census.entries.len() as u64);
     if let Some(e) = census.entries.get_mut(identity) {
         if std::mem::replace(&mut e.seeded, true) {
             note_store_route_n("tdc_frames", 1);
