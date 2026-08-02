@@ -122,7 +122,12 @@ esac
 # style and clear of the traffic lights, which sit at the left.
 GX=$((WX + WW / 2))
 GY=$((WY + 14))
-say "motion=$MOTION on $APP window 1 at ($GX,$GY) for ${SECONDS_RUN}s at ${HZ} Hz"
+if [ "$MOTION" = drag ]; then
+  say "motion=drag on $APP window 1 at ($GX,$GY) for ${SECONDS_RUN}s at ${HZ} Hz"
+else
+  say "motion=reposition on $APP window 1 for ${SECONDS_RUN}s (--hz does not \
+apply: System Events sets the rate, and the run reports what it achieved)"
+fi
 
 # Mark the fail log so only lines the drag produced are read. Byte offset rather
 # than a timestamp: the log's `t=` is device time and this shell's clock is not.
@@ -132,14 +137,16 @@ if [ "$MOTION" = drag ]; then
   ssh -o BatchMode=yes "$GUEST" \
     "/tmp/reims-drag $GX $GY $SECONDS_RUN $HZ 180 90" >"$WORK/drag.json" 2>"$WORK/drag.err" &
 else
-  # Steps rather than seconds: the accessibility route cannot pace itself, so
-  # the harness asks for a step count and times the result.
+  # The accessibility route cannot pace itself — each `set position` is a
+  # synchronous round trip through System Events — so it runs for the duration
+  # and reports the rate it achieved. `--hz` has no meaning here and the harness
+  # says so above rather than appearing to honour it.
   ssh -o BatchMode=yes "$GUEST" \
     "python3 -c \"
 import subprocess, time, json
 t0 = time.time()
 r = subprocess.run(['osascript', '/tmp/reims-reposition.applescript',
-                    '$APP', '$GX', '$WY', '$((SECONDS_RUN * HZ))', '180', '90'],
+                    '$APP', '$GX', '$WY', '$SECONDS_RUN', '180', '90'],
                    capture_output=True, text=True)
 el = time.time() - t0
 n = int((r.stdout or '0').strip() or 0)

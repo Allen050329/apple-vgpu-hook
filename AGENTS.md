@@ -782,6 +782,34 @@ back, guest asked each time which picture it believes is set); every band read
 `shift=0 lost=0`, and the kept frame was read to confirm the barcode really was
 the full-screen wallpaper. Six trials bound nothing about an occasional bug.
 
+`scripts/window-drag-probe/` is goal 6's first instrument, and its first result
+is the largest open number in this file. Moving a 1000x640 Safari window at
+~115 Hz for fifteen seconds, twice, on a settled x86/PCI guest:
+
+```text
+present_hz med 10.7    duty med 0.98    max_tranche_us med ~130 000
+flush_us 641 ms of one 1095 ms second, across 523 flushes
+draws 2351, flushes 523, presents 11 (offered 11) in that second
+```
+
+The idle control on the same guest — Safari open, no motion — is `duty=0.001`,
+`max_tranche_us=8`, **zero** draws and flushes, so all of the above is the
+motion. The device is busy for essentially the whole second and produces eleven
+frames, `offered` equals `presents` so it is not dropping frames it made, and
+**about two thirds of the worker's second is the deferred writeback rail** — the
+cost `flush_mapping_windows_before_fence` documents, now seen dominating a
+window-move workload rather than a WebGL one. A single tranche blocks the worker
+for ~130 ms, fifteen frames at 120 Hz.
+
+Two cautions before building on it. The stressor moves the window through the
+accessibility API, not a pointer drag: `CGEventPost` is silently discarded here
+because the posting process is not trusted for Accessibility and TCC.db cannot be
+written (no passwordless sudo, SIP Filesystem Protections on) — measured as 1800
+events posted at exactly 120.0 Hz with the window not moving one pixel, which is
+why the harness refuses a verdict unless the window moved. And nothing in these
+numbers separates "the guest asked for this much work" from "the device does more
+than it was asked"; 48 flushes per presented frame is the question that does.
+
 Ask the guest for the desktop size with `system_profiler SPDisplaysDataType`, not
 with Finder: `tell application "Finder" to get bounds of window of desktop`
 answers `AppleEvent timed out (-1712)` here, which reads like a wedged guest

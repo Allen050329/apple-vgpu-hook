@@ -86,6 +86,32 @@ Read carefully, because the interesting parts are not the headline:
 - 2351 draws and 523 flushes for 11 presented frames is ~48 flushes per frame,
   which is the number worth explaining next.
 
+## The control, and the defect it found
+
+Reproduced on a second run of the same boot: `present_hz` med 10.65, `duty` 0.98,
+`max_tranche_us` med 135112, 14/14 seconds below 100 Hz. So it is stable, not a
+one-off.
+
+The idle baseline — same guest, Safari open, no motion, 15 s — is the other half
+of the claim:
+
+```text
+drain_duty win_ms=1002 tranches=249 busy_us=613 duty=0.001 max_tranche_us=8
+  draw_us=0 draws=0 flush_us=0 flushes=0 slow_tranches=0/249
+```
+
+Zero draws, zero flushes, `duty` 0.001, worst tranche 8 µs. **The entire cost
+above is caused by the motion; none of it is a standing cost of the device.**
+
+Taking that control is also what exposed a defect in this harness. The first
+attempt at it asked for "15 s at 12 Hz", and the reposition motion took `--hz`
+as a step *count*: it ran 180 moves flat out and finished in 1.9 s, then
+reported the counters as though they covered the intended fifteen seconds. The
+loop is now duration-based, and `--hz` is documented as applying to `--motion
+drag` only — System Events sets the rate here and the run reports what it
+achieved. A knob that appears to be honoured and is not is worse than one that
+is absent.
+
 **What this does not establish.** The reposition stressor is synthetic and may
 provoke more damage per move than a hand-driven drag; these numbers bound the
 device under *this* workload, not under a user's drag. Nothing here separates
