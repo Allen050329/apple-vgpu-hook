@@ -4531,16 +4531,27 @@ fn emit_bind_phase() {
 /// from the declared damage rect, which is already measured at 99.34% of the
 /// attachment and worth nothing.
 ///
-/// Silent when nothing was audited, so an idle desktop costs no line.
+/// One line per writeback leg that compared anything — `store_routes` counts
+/// the two apart at `mapw_fence_flush` and `gvaw_fence_flush`, and one blended
+/// fraction over both would describe neither. A leg that measured nothing emits
+/// nothing, so an idle desktop costs no line and a zero always means "measured
+/// and not redundant" rather than "not measured".
 fn emit_land_redundancy() {
-    let Some(w) = crate::runtime::land_redundancy::take_window() else {
-        return;
-    };
-    crate::observe::off(format!(
-        "land_redundancy audits={} calls={} runs={} bytes={} pages={} same_pages={} \
-         fine={} same_fine={}",
-        w.audits, w.calls, w.runs, w.bytes, w.pages, w.same_pages, w.fine, w.same_fine,
-    ));
+    for (leg, w) in crate::runtime::land_redundancy::take_window() {
+        crate::observe::off(format!(
+            "land_redundancy leg={} audits={} calls={} runs={} bytes={} pages={} \
+             same_pages={} fine={} same_fine={}",
+            leg.label(),
+            w.audits,
+            w.calls,
+            w.runs,
+            w.bytes,
+            w.pages,
+            w.same_pages,
+            w.fine,
+            w.same_fine,
+        ));
+    }
 }
 
 fn emit_chain_phase() {

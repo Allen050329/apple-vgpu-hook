@@ -129,26 +129,34 @@
 //! than the saving is worth. Both halves need the same bitmap and neither is
 //! reachable without it.
 //!
-//! # What it does not cover
+//! # Which writers it covers, and the one it does not
 //!
-//! The audit hangs off [`crate::runtime::mapper`]'s `copy_mapping_runs`, which
-//! is one of the guest-RAM writers [`crate::observe::gate`]'s `MAP_PAGES_SITES`
-//! classifies and **not** all of them. Two are outside it:
+//! The numbers above were taken through a single hook on
+//! [`crate::runtime::mapper`]'s `copy_mapping_runs`, which is one of the
+//! guest-RAM writers [`crate::observe::gate`]'s `MAP_PAGES_SITES` classifies and
+//! not all of them. Two more now have their own hook, and reading the table
+//! rather than grepping is what found them:
 //!
-//! - `mapping_write`'s BGRA row writers take a contig view through
-//!   `contig_for_write` and poke rows into it without reaching the mapper at
-//!   all. `write_split` reports which path a landing took: the boot above reads
-//!   `contig=0 frag=272`, so every landing in it was audited, but a host whose
-//!   mappings are host-contiguous would report `contig=N frag=0` and this line
-//!   would go silent rather than wrong.
-//! - The raw task-GVA rails in `gva_view`. `store_routes` reads
-//!   `gvaw_fence_flush=432` beside `mapw_fence_flush=288`, so that leg is not
-//!   small — but it is also not the leg
-//!   `REIMS_VGPU_PROBE_NO_RENDER_WRITEBACK` dropped to measure 2.9x, which is
-//!   the mapping-keyed one this covers.
+//! - `mapping_write`'s BGRA row writers poke rows into a contig view and reach
+//!   the mapper not at all. The boot above read `write_split contig=0 frag=272`,
+//!   so it happened to miss nothing — but on a host whose mappings are
+//!   host-contiguous the same build would have reported `contig=N frag=0` and
+//!   this line would have gone **silent rather than wrong**, which is the harder
+//!   failure to notice.
+//! - `metal_draw::write_gva_rgba8_within`, the raw task-GVA leg.
+//!   `store_routes` reads `gvaw_fence_flush=432` against `mapw_fence_flush=288`
+//!   on a driven drag second, so it is the *larger* of the two by flush count
+//!   and had never been measured at all.
 //!
-//! Read a fraction here as "of the mapping-keyed landings that took the run
-//! path", and read `write_split contig`/`frag` beside it before generalising.
+//! The two legs are reported on separate lines ([`Leg`]) because they are
+//! separate rails with separate arm and flush paths, and one blended fraction
+//! over both would describe neither. Note which leg a number came from before
+//! carrying it: only the mapping one is what
+//! `REIMS_VGPU_PROBE_NO_RENDER_WRITEBACK` dropped to measure 2.9x.
+//!
+//! Still uncovered: `gva_view::write_span_multi` and the `FreshSpan` writers in
+//! `compute_exec`. Neither is on the render writeback's fence path, which is
+//! what this measures.
 //!
 //! Partial chunks at the ends of a compared range are counted in `bytes` and in
 //! neither chunk total, so a chunk count is always of whole chunks.
@@ -190,23 +198,56 @@ pub const FINE_TILE: usize = 256;
 static STRIDE_TICK: AtomicU64 = AtomicU64::new(0);
 static CALLS: AtomicU64 = AtomicU64::new(0);
 static AUDITS: AtomicU64 = AtomicU64::new(0);
-static RUNS: AtomicU64 = AtomicU64::new(0);
-static BYTES: AtomicU64 = AtomicU64::new(0);
-static PAGES: AtomicU64 = AtomicU64::new(0);
-static SAME_PAGES: AtomicU64 = AtomicU64::new(0);
-static FINE: AtomicU64 = AtomicU64::new(0);
-static SAME_FINE: AtomicU64 = AtomicU64::new(0);
 
-/// One window of the audit, as taken by the per-second census.
+/// Which writeback leg a compared range belongs to.
+///
+/// The two are separate rails with separate arm and flush paths, and
+/// `store_routes` counts them apart (`mapw_fence_flush` against
+/// `gvaw_fence_flush`, 288 against 432 on a driven drag second). One blended
+/// fraction over both would be a number describing neither, and a rail is built
+/// against one leg at a time.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Leg {
+    /// The mapping-keyed rail: `mapper::copy_mapping_runs` and
+    /// `mapping_write`'s contig row writers. The leg
+    /// `REIMS_VGPU_PROBE_NO_RENDER_WRITEBACK` drops to measure 2.9x.
+    Mapping = 0,
+    /// The raw task-GVA rail: `metal_draw::write_gva_rgba8_within` through a
+    /// fresh span. Never measured before this counter existed.
+    Gva = 1,
+}
+
+impl Leg {
+    const ALL: [Self; 2] = [Self::Mapping, Self::Gva];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Mapping => "mapping",
+            Self::Gva => "gva",
+        }
+    }
+}
+
+const LEGS: usize = 2;
+
+static RUNS: [AtomicU64; LEGS] = [const { AtomicU64::new(0) }; LEGS];
+static BYTES: [AtomicU64; LEGS] = [const { AtomicU64::new(0) }; LEGS];
+static PAGES: [AtomicU64; LEGS] = [const { AtomicU64::new(0) }; LEGS];
+static SAME_PAGES: [AtomicU64; LEGS] = [const { AtomicU64::new(0) }; LEGS];
+static FINE: [AtomicU64; LEGS] = [const { AtomicU64::new(0) }; LEGS];
+static SAME_FINE: [AtomicU64; LEGS] = [const { AtomicU64::new(0) }; LEGS];
+
+/// One leg's window of the audit, as taken by the per-second census.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct LandRedundancyWindow {
-    /// Walks audited, against `calls` offered. One walk is one landing's worth
-    /// of writes, so this is a count of frames sampled.
+    /// Walks audited, against `calls` offered, across **both** legs — the
+    /// stride is one sequence over every writer, so these two cannot be
+    /// attributed to a leg and are the same on each line.
     pub audits: u64,
     pub calls: u64,
-    /// Contiguous ranges compared across those walks. A fragmented landing is
-    /// hundreds of runs of one frame, so this is not a second frame count —
-    /// keeping it separate is what stops the two being read as one.
+    /// Contiguous ranges compared in this leg. A fragmented landing is hundreds
+    /// of runs of one frame, so this is not a second frame count — keeping it
+    /// separate is what stops the two being read as one.
     pub runs: u64,
     pub bytes: u64,
     pub pages: u64,
@@ -215,23 +256,31 @@ pub struct LandRedundancyWindow {
     pub same_fine: u64,
 }
 
-/// Take and clear the window. `None` when nothing was audited, so an idle
-/// second costs no line.
-pub fn take_window() -> Option<LandRedundancyWindow> {
-    let w = LandRedundancyWindow {
-        audits: AUDITS.swap(0, Ordering::Relaxed),
-        calls: CALLS.swap(0, Ordering::Relaxed),
-        runs: RUNS.swap(0, Ordering::Relaxed),
-        bytes: BYTES.swap(0, Ordering::Relaxed),
-        pages: PAGES.swap(0, Ordering::Relaxed),
-        same_pages: SAME_PAGES.swap(0, Ordering::Relaxed),
-        fine: FINE.swap(0, Ordering::Relaxed),
-        same_fine: SAME_FINE.swap(0, Ordering::Relaxed),
-    };
-    // Gated on ranges compared rather than on walks admitted: a walk that was
-    // due and then wrote nothing has no fraction to report, and a line of zeros
-    // reads as "nothing was redundant".
-    (w.runs > 0).then_some(w)
+/// Take and clear the window, one entry per leg that compared anything.
+///
+/// A leg with no ranges is left out rather than emitted as zeros: a line of
+/// zeros reads as "nothing was redundant" when it means "nothing was measured",
+/// and the two call for opposite conclusions.
+pub fn take_window() -> Vec<(Leg, LandRedundancyWindow)> {
+    let audits = AUDITS.swap(0, Ordering::Relaxed);
+    let calls = CALLS.swap(0, Ordering::Relaxed);
+    Leg::ALL
+        .into_iter()
+        .filter_map(|leg| {
+            let i = leg as usize;
+            let w = LandRedundancyWindow {
+                audits,
+                calls,
+                runs: RUNS[i].swap(0, Ordering::Relaxed),
+                bytes: BYTES[i].swap(0, Ordering::Relaxed),
+                pages: PAGES[i].swap(0, Ordering::Relaxed),
+                same_pages: SAME_PAGES[i].swap(0, Ordering::Relaxed),
+                fine: FINE[i].swap(0, Ordering::Relaxed),
+                same_fine: SAME_FINE[i].swap(0, Ordering::Relaxed),
+            };
+            (w.runs > 0).then_some((leg, w))
+        })
+        .collect()
 }
 
 /// Whether this write is the one in [`AUDIT_STRIDE`] that gets compared.
@@ -263,19 +312,20 @@ pub fn audit_due() -> bool {
 ///
 /// `dst` must be readable for `src.len()` bytes. Every caller is about to write
 /// exactly that range through the same pointer.
-pub unsafe fn note_write(map_off: u64, dst: *const u8, src: &[u8], page_size: u64) {
+pub unsafe fn note_write(leg: Leg, map_off: u64, dst: *const u8, src: &[u8], page_size: u64) {
     if src.is_empty() {
         return;
     }
     // SAFETY: the caller guarantees `dst` is readable for `src.len()`.
     let dst = unsafe { std::slice::from_raw_parts(dst, src.len()) };
-    RUNS.fetch_add(1, Ordering::Relaxed);
-    BYTES.fetch_add(src.len() as u64, Ordering::Relaxed);
+    let i = leg as usize;
+    RUNS[i].fetch_add(1, Ordering::Relaxed);
+    BYTES[i].fetch_add(src.len() as u64, Ordering::Relaxed);
     let tally = compare(map_off, src, dst, page_size);
-    PAGES.fetch_add(tally.pages, Ordering::Relaxed);
-    SAME_PAGES.fetch_add(tally.same_pages, Ordering::Relaxed);
-    FINE.fetch_add(tally.fine, Ordering::Relaxed);
-    SAME_FINE.fetch_add(tally.same_fine, Ordering::Relaxed);
+    PAGES[i].fetch_add(tally.pages, Ordering::Relaxed);
+    SAME_PAGES[i].fetch_add(tally.same_pages, Ordering::Relaxed);
+    FINE[i].fetch_add(tally.fine, Ordering::Relaxed);
+    SAME_FINE[i].fetch_add(tally.same_fine, Ordering::Relaxed);
 }
 
 /// What one compared range contributed, before it reaches the atomics.
@@ -356,6 +406,14 @@ mod tests {
 
     const PAGE: u64 = 4096;
 
+    /// The single leg a test exercised, so a test reads one window rather than
+    /// indexing a vector whose length is the assertion.
+    fn only_leg() -> Option<LandRedundancyWindow> {
+        let mut legs = take_window();
+        assert!(legs.len() <= 1, "a test touched both legs: {legs:?}");
+        legs.pop().map(|(_, w)| w)
+    }
+
     fn reset() {
         let _ = take_window();
         CALLS.store(0, Ordering::Relaxed);
@@ -367,7 +425,7 @@ mod tests {
     #[test]
     fn a_window_with_no_audit_is_none() {
         reset();
-        assert!(take_window().is_none());
+        assert!(take_window().is_empty());
     }
 
     /// Identical content reports every byte and every chunk matched. This is the
@@ -378,8 +436,8 @@ mod tests {
         reset();
         let src = vec![0xABu8; 3 * PAGE as usize];
         let dst = src.clone();
-        unsafe { note_write(0, dst.as_ptr(), &src, PAGE) };
-        let w = take_window().expect("one audit");
+        unsafe { note_write(Leg::Mapping, 0, dst.as_ptr(), &src, PAGE) };
+        let w = only_leg().expect("one audit");
         assert_eq!(w.bytes, 3 * PAGE, "{w:?}");
         assert_eq!(w.pages, 3, "{w:?}");
         assert_eq!(w.same_pages, 3, "{w:?}");
@@ -396,8 +454,8 @@ mod tests {
         let src = vec![0u8; 2 * PAGE as usize];
         let mut dst = src.clone();
         dst[PAGE as usize + 10] = 1;
-        unsafe { note_write(0, dst.as_ptr(), &src, PAGE) };
-        let w = take_window().expect("one audit");
+        unsafe { note_write(Leg::Mapping, 0, dst.as_ptr(), &src, PAGE) };
+        let w = only_leg().expect("one audit");
         assert_eq!((w.pages, w.same_pages), (2, 1), "{w:?}");
         let fine = 2 * PAGE / FINE_TILE as u64;
         assert_eq!((w.fine, w.same_fine), (fine, fine - 1), "{w:?}");
@@ -413,8 +471,8 @@ mod tests {
         let dst = src.clone();
         // Starts 1 KiB into a page: pages 1 and 2 of the range are whole, the
         // head and the tail are not.
-        unsafe { note_write(PAGE + 1024, dst.as_ptr(), &src, PAGE) };
-        let w = take_window().expect("one audit");
+        unsafe { note_write(Leg::Mapping, PAGE + 1024, dst.as_ptr(), &src, PAGE) };
+        let w = only_leg().expect("one audit");
         assert_eq!(w.pages, 1, "{w:?}");
         assert_eq!(w.same_pages, 1, "{w:?}");
         assert_eq!(w.bytes, 2 * PAGE, "{w:?}");
@@ -427,8 +485,8 @@ mod tests {
         reset();
         let src = [1u8; 64];
         let dst = [2u8; 64];
-        unsafe { note_write(PAGE - 32, dst.as_ptr(), &src, PAGE) };
-        let w = take_window().expect("one audit");
+        unsafe { note_write(Leg::Mapping, PAGE - 32, dst.as_ptr(), &src, PAGE) };
+        let w = only_leg().expect("one audit");
         assert_eq!((w.pages, w.fine), (0, 0), "{w:?}");
         assert_eq!(w.bytes, 64, "{w:?}");
     }
@@ -445,8 +503,8 @@ mod tests {
         // page 3. Pages 1 and 2 are untouched and must survive.
         dst[PAGE as usize - 1] = 9;
         dst[3 * PAGE as usize] = 9;
-        unsafe { note_write(0, dst.as_ptr(), &src, PAGE) };
-        let w = take_window().expect("one audit");
+        unsafe { note_write(Leg::Mapping, 0, dst.as_ptr(), &src, PAGE) };
+        let w = only_leg().expect("one audit");
         assert_eq!((w.pages, w.same_pages), (4, 2), "{w:?}");
         let fine = 4 * PAGE / FINE_TILE as u64;
         assert_eq!((w.fine, w.same_fine), (fine, fine - 2), "{w:?}");
@@ -460,10 +518,51 @@ mod tests {
         reset();
         let src = vec![0u8; 4 * PAGE as usize];
         let dst = src.clone();
-        unsafe { note_write(0, dst.as_ptr(), &src, FINE_TILE as u64 + 1) };
-        let w = take_window().expect("one audit");
+        unsafe { note_write(Leg::Mapping, 0, dst.as_ptr(), &src, FINE_TILE as u64 + 1) };
+        let w = only_leg().expect("one audit");
         assert_eq!((w.pages, w.same_pages), (0, 0), "{w:?}");
         assert!(w.fine > 0, "{w:?}");
+    }
+
+    /// The two legs are tallied apart and emitted apart. They are separate
+    /// rails at separate rates — `gvaw_fence_flush=432` against
+    /// `mapw_fence_flush=288` on a driven second — so a blended fraction would
+    /// be a number describing neither, weighted by whichever leg happened to
+    /// write more bytes.
+    #[test]
+    fn the_two_legs_are_never_blended() {
+        reset();
+        let src = vec![0u8; 4 * PAGE as usize];
+        let same = src.clone();
+        let mut differs = src.clone();
+        for b in differs.iter_mut() {
+            *b = 1;
+        }
+        unsafe { note_write(Leg::Mapping, 0, same.as_ptr(), &src, PAGE) };
+        unsafe { note_write(Leg::Gva, 0, differs.as_ptr(), &src, PAGE) };
+        let legs = take_window();
+        assert_eq!(legs.len(), 2, "{legs:?}");
+        let get = |want: Leg| legs.iter().find(|(l, _)| *l == want).expect("leg").1;
+        let (m, g) = (get(Leg::Mapping), get(Leg::Gva));
+        assert_eq!(m.same_fine, m.fine, "the mapping leg was wholly redundant");
+        assert_eq!(g.same_fine, 0, "the gva leg matched nothing");
+        assert_eq!(m.runs, 1, "{m:?}");
+        assert_eq!(g.runs, 1, "{g:?}");
+    }
+
+    /// A leg that measured nothing emits nothing. A row of zeros reads as
+    /// "measured and not redundant", which is the opposite conclusion from
+    /// "not measured", and both legs are hooked on paths a given host may never
+    /// take.
+    #[test]
+    fn a_leg_that_measured_nothing_is_left_out() {
+        reset();
+        let src = [7u8; FINE_TILE];
+        let dst = src;
+        unsafe { note_write(Leg::Gva, 0, dst.as_ptr(), &src, PAGE) };
+        let legs = take_window();
+        assert_eq!(legs.len(), 1, "{legs:?}");
+        assert_eq!(legs[0].0, Leg::Gva);
     }
 
     /// One write in `AUDIT_STRIDE` is compared, and `calls` records the rest so
@@ -509,9 +608,9 @@ mod tests {
         let src = [3u8; FINE_TILE * 2];
         let dst = src;
         for run in 0..4u64 {
-            unsafe { note_write(run * FINE_TILE as u64 * 2, dst.as_ptr(), &src, PAGE) };
+            unsafe { note_write(Leg::Mapping, run * FINE_TILE as u64 * 2, dst.as_ptr(), &src, PAGE) };
         }
-        let w = take_window().expect("one audited walk");
+        let w = only_leg().expect("one audited walk");
         assert_eq!((w.audits, w.runs), (1, 4), "{w:?}");
         assert_eq!(w.bytes, 4 * 2 * FINE_TILE as u64, "{w:?}");
     }

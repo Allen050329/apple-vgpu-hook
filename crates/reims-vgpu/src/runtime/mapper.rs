@@ -1975,6 +1975,7 @@ impl RunCopy<'_> {
         // audit only reads it.
         unsafe {
             crate::runtime::land_redundancy::note_write(
+                crate::runtime::land_redundancy::Leg::Mapping,
                 map_off,
                 (host_ptr as *const u8).add(host_off),
                 &buf[buf_off..buf_off + n],

@@ -789,6 +789,14 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
     // Fast path: one packed view, poke rows in place.
     if let Some((ptr, _)) = contig_for_write(state, host, mapping_id, span_end, &vouched, src) {
         note_surface_write_path(true, frame_bytes);
+        // Taken once for the frame so an audited landing is compared whole,
+        // then charged per row segment. This path reaches
+        // `mapper::write_mapping_bytes` not at all — it pokes rows straight
+        // into a contig view — so without its own hook the audit goes silent
+        // on any host whose mappings are host-contiguous, and `write_split`'s
+        // `contig`/`frag` is the only thing that would say so.
+        let audit = crate::runtime::land_redundancy::audit_due();
+        let page_size = state.page_size();
         let land_started = std::time::Instant::now();
         // SAFETY: contig covers span_end; revalidated in ensure_contig_view.
         let base = unsafe { (ptr as *mut u8).add(base_off as usize) };
@@ -831,6 +839,21 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
                 let within = (lo - row_off) as usize;
                 let len = (hi - lo) as usize;
                 let dst = unsafe { base.add((y as usize).saturating_mul(bpr) + within) };
+                if audit {
+                    // `lo` is already the segment's mapping-linear offset, which
+                    // is the space the tiles align in.
+                    //
+                    // SAFETY: as below, and the audit only reads the range.
+                    unsafe {
+                        crate::runtime::land_redundancy::note_write(
+                            crate::runtime::land_redundancy::Leg::Mapping,
+                            lo,
+                            dst,
+                            &row_bytes[within..within + len],
+                            page_size,
+                        );
+                    }
+                }
                 // SAFETY: `within + len <= tight <= row_bytes.len()`, and the
                 // view covers span_end which is at or past this row's last byte.
                 unsafe {

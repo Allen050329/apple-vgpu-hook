@@ -194,7 +194,14 @@ import re, statistics, sys
 text = open(sys.argv[1], errors="replace").read()
 
 
-def rows(family, keys):
+def rows(family, keys, leg_of=False):
+    """Rows of `family` carrying every key in `keys`.
+
+    A line missing any key is dropped rather than half-read, which is why a
+    reader that asks for a field the build no longer emits sees "(no samples)"
+    for the whole family. `leg_of` additionally carries the line's `leg=` label
+    through, for families emitted once per leg.
+    """
     out = []
     for line in text.splitlines():
         if f" {family} " not in f" {line} ":
@@ -204,8 +211,14 @@ def rows(family, keys):
             m = re.search(rf"\b{k}=([0-9.]+)", line)
             if m:
                 got[k] = float(m.group(1))
-        if len(got) == len(keys):
-            out.append(got)
+        if len(got) != len(keys):
+            continue
+        if leg_of:
+            m = re.search(r"\bleg=(\w+)", line)
+            if not m:
+                continue
+            got["leg"] = m.group(1)
+        out.append(got)
     return out
 
 
@@ -231,8 +244,11 @@ wl = rows("host_window_loop", ["ticks", "redraws_asked", "draws",
                                "draws_fresh", "draws_stale"])
 bp = rows("bind_phase", ["binds", "vertex_us", "fragment_us", "attrs_us"])
 cp = rows("chain_phase", ["chains", "binds_us"])
-lr = rows("land_redundancy", ["audits", "calls", "runs", "bytes", "pages",
-                              "same_pages", "fine", "same_fine"])
+# One line per writeback leg, so they are read apart. `mapping` is the leg the
+# no-writeback counterfactual dropped to measure 2.9x; `gva` is the larger of
+# the two by flush count and was unmeasured until it had its own hook.
+lr_all = rows("land_redundancy", ["runs", "bytes", "pages", "same_pages",
+                                  "fine", "same_fine"], leg_of=True)
 ws = rows("write_split", ["bytes", "land_us", "land"])
 
 print("host_window_cadence — frames this device put out")
@@ -254,11 +270,13 @@ show("fence_us/fence", [r["fence_us"] / r["fence"] for r in rb if r["fence"]], "
 # every row — expect the fine fraction to be much the larger of the two.
 print("write_split / land_redundancy — bytes moved, and how many were already there")
 show("MB/s written", [r["bytes"] / 1e6 for r in ws], " MB")
-show("same_pages %", [100.0 * r["same_pages"] / r["pages"] for r in lr if r["pages"]], " %")
-show("same_fine %", [100.0 * r["same_fine"] / r["fine"] for r in lr if r["fine"]], " %")
-show("audited MB", [r["bytes"] / 1e6 for r in lr], " MB")
-show("landings audited", [r["audits"] for r in lr])
-show("landings offered", [r["calls"] for r in lr])
+for leg in ("mapping", "gva"):
+    lr = [r for r in lr_all if r["leg"] == leg]
+    show(f"{leg}: same_pages %",
+         [100.0 * r["same_pages"] / r["pages"] for r in lr if r["pages"]], " %")
+    show(f"{leg}: same_fine %",
+         [100.0 * r["same_fine"] / r["fine"] for r in lr if r["fine"]], " %")
+    show(f"{leg}: audited MB", [r["bytes"] / 1e6 for r in lr], " MB")
 
 # The per-landing CPU scatter cost the redundancy above is a claim about. It is
 # reported here rather than left to a reader because a CPU tile-skipping rail
