@@ -229,6 +229,8 @@ lock = rows("engine_lock", ["window", "window_blocked", "window_wait_us",
                             "worker_hold_max_us"])
 wl = rows("host_window_loop", ["ticks", "redraws_asked", "draws",
                                "draws_fresh", "draws_stale"])
+bp = rows("bind_phase", ["binds", "vertex_us", "fragment_us", "attrs_us"])
+cp = rows("chain_phase", ["chains", "binds_us"])
 
 print("host_window_cadence — frames this device put out")
 show("present_hz", [r["present_hz"] for r in cad], " Hz")
@@ -247,6 +249,14 @@ show("fence_us/fence", [r["fence_us"] / r["fence"] for r in rb if r["fence"]], "
 # the first thing to explain. `fresh` is then what this device offered the
 # window, and `present_hz` what reached the screen; `engine_lock` says whether
 # the difference is the window thread blocked on the mutex the worker holds.
+# The draw path is what caps this device once the writeback is accounted for,
+# and `binds_us` is its largest column. These three divide it; they are not
+# claimed to sum to it.
+print("bind_phase — inside chain_phase's binds_us, per draw")
+show("vertex_us/bind", [r["vertex_us"] / r["binds"] for r in bp if r["binds"]], " us")
+show("fragment_us/bind", [r["fragment_us"] / r["binds"] for r in bp if r["binds"]], " us")
+show("attrs_us/bind", [r["attrs_us"] / r["binds"] for r in bp if r["binds"]], " us")
+show("binds_us/chain", [r["binds_us"] / r["chains"] for r in cp if r["chains"]], " us")
 print("window_publish — frames offered, sampled once per drain tranche")
 show("fresh", [r["fresh"] for r in pub], "/s")
 show("fresh+same_key", [r["fresh"] + r["same_key"] for r in pub])
