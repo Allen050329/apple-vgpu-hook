@@ -1992,7 +1992,7 @@ impl RunCopy<'_> {
 /// runs — which a 256-byte-tile bitmap over an 8 MB frame is — costs
 /// `O(log n)` per query instead of `O(n)`. Nothing here assumes successive
 /// queries ascend, so a caller may probe windows in any order.
-fn selected_within(
+pub(crate) fn selected_within(
     ranges: Option<&[(u64, u64)]>,
     lo: u64,
     hi: u64,
