@@ -4500,6 +4500,22 @@ fn emit_engine_delta() {
 /// on the boot that motivated this line that was 82% of the draw.
 ///
 /// Silent when no chain ran, so an idle desktop costs nothing.
+/// The split of `chain_phase`'s `binds_us`, over the same window.
+///
+/// Emitted immediately after it, in the same relationship `draw_phase` has to
+/// `engine_us`: divide the three against the column above. They are not claimed
+/// to sum to it — see [`crate::runtime::bind_phase`] for why a computed
+/// remainder was left out.
+fn emit_bind_phase() {
+    let Some(w) = crate::runtime::bind_phase::take_window() else {
+        return;
+    };
+    crate::observe::off(format!(
+        "bind_phase binds={} vertex_us={} fragment_us={} attrs_us={}",
+        w.binds, w.vertex_us, w.fragment_us, w.attrs_us,
+    ));
+}
+
 fn emit_chain_phase() {
     let Some(w) = crate::runtime::chain_phase::take_window() else {
         return;
@@ -4518,6 +4534,9 @@ fn emit_chain_phase() {
         w.store_us,
         w.max_us,
     ));
+    // Under `chain_phase`, dividing its largest column the same way
+    // `draw_phase` divides its `engine_us`.
+    emit_bind_phase();
 }
 
 /// The split of `drain_duty`'s `draw_us`, over the same window.

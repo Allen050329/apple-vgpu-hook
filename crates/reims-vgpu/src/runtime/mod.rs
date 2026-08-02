@@ -3,6 +3,8 @@
 //! Drain FIFOs, parse wire (using [`crate::contract`]), resolve memory, plan
 //! ops, update [`crate::model`] state. No GPU API calls here.
 
+/// The split of [`chain_phase`]'s largest column, `binds_us`.
+pub mod bind_phase;
 /// Product-path blit fill/copy execution against guest GVA.
 pub mod blit_exec;
 /// Always-on proxies and censuses, one per measured bug class.

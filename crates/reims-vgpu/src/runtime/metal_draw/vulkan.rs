@@ -4029,6 +4029,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
     }
 
     crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Binds);
+    crate::runtime::bind_phase::note_bind();
 
     // SPIR-V words for the engine, shared from the translation cache (Arc — no
     // per-draw materialization; fragment reloc variants are cached per shader).
@@ -4056,6 +4057,12 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             .map(|a| a.buffer_index)
             .collect();
         let mut vtx_storage: Vec<(u32, crate::backend::vulkan::engine::BufferContent)> = Vec::new();
+        // The three `bind_phase` spans below divide `chain_phase`'s `binds_us`,
+        // which is this draw path's largest column and covered three costs with
+        // one number. Each is a lexical scope so an early `return Err` charges
+        // the span it left from rather than losing the time.
+        let vertex_span =
+            crate::runtime::bind_phase::Span::open(crate::runtime::bind_phase::Part::VertexLoad);
         for b in &req.vertex_buffers {
             if b.index >= MAX_BIND_SLOTS || b.buffer_ref == 0 {
                 continue;
@@ -4074,8 +4081,11 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             };
             vtx_storage.push((b.index, content));
         }
+        drop(vertex_span);
         let mut frag_storage: Vec<(u32, crate::backend::vulkan::engine::BufferContent)> =
             Vec::new();
+        let fragment_span =
+            crate::runtime::bind_phase::Span::open(crate::runtime::bind_phase::Part::FragmentLoad);
         for b in &req.fragment_buffers {
             if b.index >= MAX_BIND_SLOTS || b.buffer_ref == 0 {
                 continue;
@@ -4093,9 +4103,12 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             };
             frag_storage.push((b.index, content));
         }
+        drop(fragment_span);
         // Stage-in attributes from pipeline vertex block + bound buffer bytes.
         let mut attrs: Vec<crate::backend::vulkan::engine::VertexAttributeResource> = Vec::new();
         let mut stage_in_bufs: std::collections::BTreeSet<u32> = Default::default();
+        let attrs_span =
+            crate::runtime::bind_phase::Span::open(crate::runtime::bind_phase::Part::Attrs);
         for a in &pd.vertex_attributes {
             if a.format == 0 || a.stride == 0 {
                 continue;
@@ -4138,6 +4151,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 content,
             });
         }
+        drop(attrs_span);
 
         // Fragment/vertex buffer index collision → relocate fragment SPIR-V buffers.
         let vtx_idx: std::collections::BTreeSet<u32> =
