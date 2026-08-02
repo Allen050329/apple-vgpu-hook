@@ -938,6 +938,12 @@ pub fn flush_linear_windows_before_fence<M: HostMemory + HostOps>(
 /// gather. **Skipping a writeback has to keep the guest-write witness and the
 /// type-11 resident rung sound. Only stopping the write is a wash.**
 ///
+/// Six runs over three boots, `fresh` against `t11rung_resident_refused`:
+/// control 34 / 36 / 37 with no refusal in any of them, counterfactual **99**
+/// on its first drag with none, then 35 and 38 with 54 and 49. The control does
+/// not decay across runs and its own first drag reads 37, so "the first drag
+/// after a boot is fast" is not the explanation.
+///
 /// ## Which pages to register, and where the route stops
 ///
 /// A `userfaultfd` registration only traps accesses made through the VMA it was

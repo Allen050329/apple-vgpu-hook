@@ -941,17 +941,37 @@ That refusal is `guest_replaced` — the guest CPU-wrote the surface's pages —
 and it is an artefact of the experiment being wrong rather than a property of a
 correct demand-driven rail: with our frame never landed, the pages drift into
 holding neither our pixels nor a full guest frame, and the drift compounds over
-a boot. But it is exactly the hazard a demand-driven rail would hit if it got
-the witness wrong, and it converts a 2.26 GB/s writeback into an 8 MB-per-bind
-gather. **So the design requirement, stated before anyone builds it: skipping a
-writeback must keep the guest-write witness and the type-11 resident rung
-sound. A rail that only stops writing has been measured, and it is a wash.**
+a boot.
 
-Two things this does not establish. It is one boot and two runs, and the causal
-story for #2 is the leading explanation rather than a proven one. And 98 fps is
-not 120: even with the largest cost in the device removed outright, this
-workload does not reach goal 6's number, so the writeback is necessary but not
-obviously sufficient.
+Six runs across three boots put that beyond a single-run story, and they also
+supply the control the comparison needs:
+
+| run | boot | writeback | `t11rung_resident_refused` | `fresh` |
+|---|---|---|---|---|
+| 1 | A, first drag | on | — | 34 |
+| 2 | A, second drag | on | — | 36 |
+| 3 | B, first drag | on | — | 37 |
+| 4 | C, **first drag** | **off** | — | **99** |
+| 5 | C, second drag | off | 54 | 35 |
+| 6 | C, third drag | off | 49 | 38 |
+
+**The control does not degrade across runs** — 34, 36, 37, no refusal in any of
+them — so "the first drag after a boot is fast" is not the explanation; run 3
+is a first drag and reads 37. The refusals appear only with the writeback off,
+only after its first run, and exactly where the gain disappears.
+
+The hazard is what a demand-driven rail would hit **if it got the witness
+wrong**, and the exchange rate is ruinous: a 2.26 GB/s writeback traded for an
+8 MB-per-bind gather. **So the design requirement, stated before anyone builds
+it: skipping a writeback must keep the guest-write witness and the type-11
+resident rung sound. A rail that only stops writing has been measured, and it
+is a wash.**
+
+Two things this does not establish. The causal story for runs 5 and 6 is a
+correlation across six runs, not a proven mechanism — nothing was changed to
+test it. And 98 fps is not 120: even with the largest cost in the device
+removed outright, this workload does not reach goal 6's number, so the
+writeback is necessary but not obviously sufficient.
 
 Two cautions before building on any of it. The stressor moves the window through
 the accessibility API, not a pointer drag: `CGEventPost` is silently discarded
