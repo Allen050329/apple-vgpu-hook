@@ -82,6 +82,8 @@ const OP_ACCESS_CHAIN: u16 = 65;
 const OP_DECORATE: u16 = 71;
 const OP_MEMBER_DECORATE: u16 = 72;
 const OP_COMPOSITE_EXTRACT: u16 = 81;
+const OP_I_ADD: u16 = 128;
+const OP_I_MUL: u16 = 132;
 const OP_U_DIV: u16 = 134;
 const OP_SHIFT_RIGHT_LOGICAL: u16 = 194;
 const OP_SHIFT_LEFT_LOGICAL: u16 = 196;
@@ -370,6 +372,14 @@ impl Builder {
         self.body(OP_I_NOT_EQUAL, bool_ty, &[a, b])
     }
 
+    pub fn i_add(&mut self, ty: Id, a: Id, b: Id) -> Id {
+        self.body(OP_I_ADD, ty, &[a, b])
+    }
+
+    pub fn i_mul(&mut self, ty: Id, a: Id, b: Id) -> Id {
+        self.body(OP_I_MUL, ty, &[a, b])
+    }
+
     pub fn u_div(&mut self, ty: Id, a: Id, b: Id) -> Id {
         self.body(OP_U_DIV, ty, &[a, b])
     }
@@ -459,7 +469,7 @@ pub mod tile_diff_binding {
 /// Emit the render writeback's difference pass.
 ///
 /// ```text
-/// uint w = gl_GlobalInvocationID.x;
+/// uint w = gl_GlobalInvocationID.y * words_per_row + gl_GlobalInvocationID.x;
 /// if (w < words) {
 ///     uint c = cur[w];
 ///     if (c != prev[w]) {
@@ -489,12 +499,32 @@ pub mod tile_diff_binding {
 /// uniform block would need a fourth buffer to fill every frame. Frame sizes on
 /// a running guest are a handful, and the modules are small.
 ///
+/// # Why the grid is two-dimensional
+///
+/// One invocation per word at 1920x1080 is 2 073 600 invocations, which at
+/// [`TILE_DIFF_LOCAL_SIZE`] is 32 400 workgroups — under Vulkan's guaranteed
+/// `maxComputeWorkGroupCount[0]` of 65 535. At 3840x2160 it is **129 600**, over
+/// it, and a device that offers only the guaranteed minimum would reject the
+/// dispatch. So the word index is `y * words_per_row + x` and
+/// [`tile_diff_grid`] folds the excess into the second axis, which carries the
+/// same guarantee. Neighbouring `x` still read neighbouring words, so nothing
+/// about coalescing changes.
+///
+/// A grid-stride loop would also have fixed it and was not chosen: it needs a
+/// structured loop with a phi in a hand-rolled emitter, against one multiply
+/// and one add here.
+///
 /// `out` is *not* written where the words match. The destination buffer
 /// therefore holds a sparse frame — the bytes of whichever landing last wrote
 /// each region — and only the tiles whose bit is set may be read from it. That
 /// is the whole point: the words that are not written are the bytes that never
 /// cross the bus.
-pub fn tile_diff(words: u32, words_per_tile: u32) -> Vec<u32> {
+///
+/// `words_per_row` must be the one [`tile_diff_grid`] returns for the same
+/// `words`, or the invocations address the wrong words. The two are separate
+/// arguments rather than one call because the module is cached on its words and
+/// the grid is not.
+pub fn tile_diff(words: u32, words_per_tile: u32, words_per_row: u32) -> Vec<u32> {
     let mut b = Builder::new();
     b.capability(CAPABILITY_SHADER);
     b.memory_model(ADDRESSING_LOGICAL, MEMORY_MODEL_GLSL450);
@@ -509,6 +539,7 @@ pub fn tile_diff(words: u32, words_per_tile: u32) -> Vec<u32> {
     let c_one = b.constant_u32(uint, 1);
     let c_words = b.constant_u32(uint, words);
     let c_wpt = b.constant_u32(uint, words_per_tile);
+    let c_wpr = b.constant_u32(uint, words_per_row);
     let c_five = b.constant_u32(uint, 5);
     let c_31 = b.constant_u32(uint, 31);
     let c_scope = b.constant_u32(uint, SCOPE_DEVICE);
@@ -570,7 +601,10 @@ pub fn tile_diff(words: u32, words_per_tile: u32) -> Vec<u32> {
 
     b.label(entry);
     let gid_v = b.load(v3uint, gid);
-    let w = b.composite_extract(uint, gid_v, 0);
+    let gid_x = b.composite_extract(uint, gid_v, 0);
+    let gid_y = b.composite_extract(uint, gid_v, 1);
+    let row_base = b.i_mul(uint, gid_y, c_wpr);
+    let w = b.i_add(uint, row_base, gid_x);
     let lt = b.u_less_than(bool_ty, w, c_words);
     b.selection_merge(merge_outer);
     b.branch_conditional(lt, in_range, merge_outer);
@@ -605,9 +639,38 @@ pub fn tile_diff(words: u32, words_per_tile: u32) -> Vec<u32> {
     b.finish()
 }
 
-/// How many workgroups [`tile_diff`] needs for `words` words.
-pub fn tile_diff_groups(words: u32) -> u32 {
-    words.div_ceil(TILE_DIFF_LOCAL_SIZE)
+/// Vulkan's guaranteed floor for `maxComputeWorkGroupCount` on every axis.
+///
+/// A device may report more and most do. This is what one is *required* to
+/// offer, and it is what [`tile_diff_grid`] falls back to so that a caller which
+/// cannot read the limit still produces a legal dispatch.
+pub const MIN_GUARANTEED_WORKGROUPS_PER_AXIS: u32 = 65_535;
+
+/// The dispatch for `words` words, and the row width the module must be emitted
+/// with.
+///
+/// Returns `([x, y, z], words_per_row)`. Pass `words_per_row` to [`tile_diff`];
+/// the two disagree silently if they come from different `words`, which is why
+/// this returns both rather than leaving the caller to derive one.
+///
+/// `max_groups_x` is the device's `maxComputeWorkGroupCount[0]`. It is an
+/// argument rather than a constant because gating on a capability is not the
+/// same as assuming the floor: a device that reports 2^31 should get a flat
+/// one-row dispatch, and one that reports exactly the floor must still work.
+///
+/// The last row is partial whenever `words` is not a multiple of
+/// `words_per_row`; the shader's own `w < words` guard is what stops those
+/// invocations, and it is tested against a bound that is not a whole workgroup.
+pub fn tile_diff_grid(words: u32, max_groups_x: u32) -> ([u32; 3], u32) {
+    let groups = words.div_ceil(TILE_DIFF_LOCAL_SIZE).max(1);
+    let cap = max_groups_x.max(1);
+    if groups <= cap {
+        // One row: `words_per_row` is the whole dispatch, so `y` is always 0
+        // and the index reduces to `x`.
+        return ([groups, 1, 1], groups * TILE_DIFF_LOCAL_SIZE);
+    }
+    let groups_y = groups.div_ceil(cap);
+    ([cap, groups_y, 1], cap * TILE_DIFF_LOCAL_SIZE)
 }
 
 #[cfg(test)]
@@ -619,6 +682,13 @@ mod tests {
     /// This is the emitter's own reader, and it is deliberately not the
     /// patchers': it must fail on a stream those would skip past, because a
     /// truncated final instruction is exactly the bug an emitter has.
+    /// Emit for `words` with the row width the default grid would use, so no
+    /// test can pair a module with a `words_per_row` no dispatch would produce.
+    fn tile_diff_for(words: u32, words_per_tile: u32) -> Vec<u32> {
+        let (_, per_row) = tile_diff_grid(words, MIN_GUARANTEED_WORKGROUPS_PER_AXIS);
+        tile_diff(words, words_per_tile, per_row)
+    }
+
     fn instructions(words: &[u32]) -> Vec<(u16, Vec<u32>)> {
         let mut out = Vec::new();
         let mut i = 5;
@@ -634,7 +704,7 @@ mod tests {
 
     #[test]
     fn the_header_says_what_it_is() {
-        let m = tile_diff(1024, 64);
+        let m = tile_diff_for(1024, 64);
         assert_eq!(m[0], MAGIC);
         assert_eq!(m[1], VERSION_1_0);
         assert_eq!(m[4], 0, "schema");
@@ -663,7 +733,7 @@ mod tests {
     /// the emitter bug this catches and a disassembler reports as garbage.
     #[test]
     fn every_instruction_fits_and_the_stream_ends_exactly() {
-        let m = tile_diff(2_073_600, 64);
+        let m = tile_diff_for(2_073_600, 64);
         let ins = instructions(&m);
         assert!(!ins.is_empty());
         assert_eq!(ins.last().map(|(op, _)| *op), Some(OP_FUNCTION_END));
@@ -674,7 +744,7 @@ mod tests {
     /// reports it as a layout error rather than pointing at the instruction.
     #[test]
     fn the_sections_are_in_logical_layout_order() {
-        let m = tile_diff(1024, 64);
+        let m = tile_diff_for(1024, 64);
         let order: Vec<u16> = instructions(&m).into_iter().map(|(op, _)| op).collect();
         let first = |op: u16| order.iter().position(|&o| o == op).unwrap_or(usize::MAX);
         assert!(first(OP_CAPABILITY) < first(OP_MEMORY_MODEL));
@@ -691,7 +761,7 @@ mod tests {
     /// its bound out of a constant rather than a push constant.
     #[test]
     fn the_bindings_are_set_zero_and_distinct() {
-        let m = tile_diff(4096, 64);
+        let m = tile_diff_for(4096, 64);
         let mut bindings: Vec<u32> = instructions(&m)
             .iter()
             .filter(|(op, ops)| *op == OP_DECORATE && ops.get(1) == Some(&DECORATION_BINDING))
@@ -707,13 +777,42 @@ mod tests {
         assert_eq!(sets, vec![0; 4]);
     }
 
+    /// A dispatch that would need more workgroups than one axis guarantees is
+    /// folded onto the second axis, and the row width the module is emitted
+    /// with matches it.
+    ///
+    /// 1920x1080 is 32 400 workgroups and fits; 3840x2160 is 129 600 and does
+    /// not. A device reporting exactly the guaranteed floor would reject the
+    /// flat dispatch, and this is the case nothing else here covers.
+    #[test]
+    fn a_grid_too_wide_for_one_axis_folds_onto_the_second() {
+        const CAP: u32 = MIN_GUARANTEED_WORKGROUPS_PER_AXIS;
+        let hd = 1920 * 1080;
+        assert_eq!(tile_diff_grid(hd, CAP), ([32_400, 1, 1], 32_400 * 64));
+
+        let uhd = 3840 * 2160;
+        let ([x, y, z], per_row) = tile_diff_grid(uhd, CAP);
+        assert_eq!((x, z), (CAP, 1));
+        assert_eq!(per_row, CAP * TILE_DIFF_LOCAL_SIZE);
+        assert!(x <= CAP && y <= CAP, "still over the limit: {x}x{y}");
+        // Every word is covered, and the overshoot is under one row.
+        let covered = (x as u64) * (y as u64) * u64::from(TILE_DIFF_LOCAL_SIZE);
+        assert!(covered >= u64::from(uhd), "{covered} < {uhd}");
+        assert!(covered - u64::from(uhd) < u64::from(per_row), "more than one wasted row");
+
+        // A device that reports more than it must gets the flat dispatch.
+        assert_eq!(tile_diff_grid(uhd, 1 << 20).0[1], 1);
+        // And one word still dispatches something.
+        assert_eq!(tile_diff_grid(1, CAP).0, [1, 1, 1]);
+    }
+
     /// The word bound reaches the module as a constant, so a caller that emits
     /// for a different frame size gets a different module rather than the same
     /// one with the wrong bound.
     #[test]
     fn the_word_bound_is_baked_in() {
         let has = |words: u32, want: u32| {
-            instructions(&tile_diff(words, 64))
+            instructions(&tile_diff_for(words, 64))
                 .iter()
                 .any(|(op, ops)| *op == OP_CONSTANT && ops.get(2) == Some(&want))
         };
@@ -728,7 +827,7 @@ mod tests {
     /// rather than as whichever earlier binding happened to hold a 1.
     #[test]
     fn a_repeated_constant_is_emitted_once() {
-        let m = tile_diff(4096, 64);
+        let m = tile_diff_for(4096, 64);
         let mut values: Vec<u32> = instructions(&m)
             .iter()
             .filter(|(op, _)| *op == OP_CONSTANT)
@@ -766,8 +865,10 @@ mod tests {
             return;
         };
         assert!(out.status.success(), "spirv-val --version failed");
-        for (words, wpt) in [(2_073_600u32, 64u32), (4096, 64), (1, 64)] {
-            let m = tile_diff(words, wpt);
+        // The 4K case is the one the two-dimensional grid exists for: it needs
+        // 129 600 workgroups, twice the guaranteed per-axis limit.
+        for (words, wpt) in [(2_073_600u32, 64u32), (8_294_400, 64), (4096, 64), (1, 64)] {
+            let m = tile_diff_for(words, wpt);
             let path = std::env::temp_dir().join(format!("reims-tile-diff-{words}-{wpt}.spv"));
             let mut f = std::fs::File::create(&path).expect("write the module");
             for w in &m {

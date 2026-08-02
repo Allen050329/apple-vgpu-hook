@@ -1366,6 +1366,9 @@ fn emitted_tile_diff_marks_only_changed_tiles() {
 
     // `prev` is what the guest's pages hold; `cur` is the frame just rendered.
     // One word differs in tile 1 and two in tile 3; tiles 0 and 2 are untouched.
+    let (grid, per_row) =
+        spirv_emit::tile_diff_grid(words, spirv_emit::MIN_GUARANTEED_WORKGROUPS_PER_AXIS);
+    assert_eq!(grid, [4, 1, 1], "this case is meant to be a flat dispatch");
     let prev: Vec<u32> = (0..words).collect();
     let mut cur = prev.clone();
     cur[WORDS_PER_TILE as usize + 7] = 0xA1A1_A1A1;
@@ -1378,9 +1381,9 @@ fn emitted_tile_diff_marks_only_changed_tiles() {
     let le = |v: &[u32]| -> Vec<u8> { v.iter().flat_map(|w| w.to_le_bytes()).collect() };
 
     let req = ComputeRequest {
-        spirv: spirv_emit::tile_diff(words, WORDS_PER_TILE),
+        spirv: spirv_emit::tile_diff(words, WORDS_PER_TILE, per_row),
         entry: "main".into(),
-        grid: [spirv_emit::tile_diff_groups(words), 1, 1],
+        grid,
         storage_buffers: vec![
             ComputeBufferResource {
                 binding: tile_diff_binding::CUR,
@@ -1443,4 +1446,94 @@ fn emitted_tile_diff_marks_only_changed_tiles() {
         "tile bits {:#010x}",
         got_bits[0]
     );
+}
+
+/// A folded grid indexes the right words, and a bound that is not a whole
+/// number of workgroups stops there.
+///
+/// `tile_diff_groups` rounds up, so the last workgroup runs invocations past
+/// the end of every buffer. The shader's `w < words` guard is the only thing
+/// between those and a read of unallocated storage, and a guard that is off by
+/// one is invisible in the passing case — the extra words would land in the
+/// tail of an over-sized allocation and the answer would still look right.
+/// Here the buffers are sized to exactly `words`, so an out-of-bounds access is
+/// a fault or a wrong answer rather than a silent success.
+///
+/// The tile count is not a whole number either: the last tile is partial, and
+/// its bit must still be reachable.
+#[test]
+fn emitted_tile_diff_indexes_a_folded_grid_and_stops_at_its_bound() {
+    use reims_vgpu::backend::vulkan::spirv_emit::{self, tile_diff_binding};
+
+    let _g = engine_test_session();
+    const WORDS_PER_TILE: u32 = 64;
+    // Two whole tiles and a third of 5 words, and 133 is not a multiple of 64
+    // so the dispatch rounds up to three workgroups covering 192.
+    let words = 2 * WORDS_PER_TILE + 5;
+    // Deliberately narrow, so the last of the three workgroups is reached
+    // through the second grid axis rather than the first: the partial bound and
+    // the folded grid are the two guards, and they are tested together because
+    // an index computed as `y * per_row + x` is where they interact.
+    let (grid, per_row) = spirv_emit::tile_diff_grid(words, 2);
+    assert_eq!((grid, per_row), ([2, 2, 1], 128));
+
+    let prev: Vec<u32> = (0..words).map(|i| i * 7).collect();
+    let mut cur = prev.clone();
+    // The very last word, which only the rounded-up workgroup reaches.
+    cur[(words - 1) as usize] = 0xFEED_FACE;
+
+    const UNTOUCHED: u32 = 0xDEAD_BEEF;
+    let le = |v: &[u32]| -> Vec<u8> { v.iter().flat_map(|w| w.to_le_bytes()).collect() };
+    let req = ComputeRequest {
+        spirv: spirv_emit::tile_diff(words, WORDS_PER_TILE, per_row),
+        entry: "main".into(),
+        grid,
+        storage_buffers: vec![
+            ComputeBufferResource {
+                binding: tile_diff_binding::CUR,
+                bytes: le(&cur),
+                writable: false,
+            },
+            ComputeBufferResource {
+                binding: tile_diff_binding::PREV,
+                bytes: le(&prev),
+                writable: false,
+            },
+            ComputeBufferResource {
+                binding: tile_diff_binding::OUT,
+                bytes: le(&vec![UNTOUCHED; words as usize]),
+                writable: true,
+            },
+            ComputeBufferResource {
+                binding: tile_diff_binding::BITS,
+                bytes: le(&[0u32]),
+                writable: true,
+            },
+        ],
+        sampled_images: vec![],
+        samplers: vec![],
+        storage_images: vec![],
+    };
+    let Some(out) = engine_or_skip("tile_diff_partial", &req) else {
+        return;
+    };
+    let read = |binding: u32| -> Vec<u32> {
+        out.buffers
+            .iter()
+            .find(|b| b.binding == binding)
+            .unwrap_or_else(|| panic!("binding {binding} did not come back"))
+            .bytes
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    };
+    let got_out = read(tile_diff_binding::OUT);
+    assert_eq!(got_out.len(), words as usize);
+    assert_eq!(got_out[(words - 1) as usize], 0xFEED_FACE);
+    assert!(
+        got_out[..(words - 1) as usize].iter().all(|&w| w == UNTOUCHED),
+        "a matching word was written",
+    );
+    // The change is in the partial third tile, which is tile index 2.
+    assert_eq!(read(tile_diff_binding::BITS), vec![1 << 2]);
 }
