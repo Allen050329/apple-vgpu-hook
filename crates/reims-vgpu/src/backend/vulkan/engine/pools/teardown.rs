@@ -34,27 +34,22 @@ impl ResourcePools {
         self.release_graveyard(device, SlotMask::MAX);
         for list in self.staging_free.values_mut() {
             for s in list.drain(..) {
-                device.destroy_buffer(s.buffer, None);
-                device.free_memory(s.memory, None);
+                release_buffer_slot(device, &mut self.host_slab, s);
             }
         }
         for s in self.staging_live.drain(..) {
-            device.destroy_buffer(s.buffer, None);
-            device.free_memory(s.memory, None);
+            release_buffer_slot(device, &mut self.host_slab, s);
         }
         for list in self.readback_free.values_mut() {
             for s in list.drain(..) {
-                device.destroy_buffer(s.buffer, None);
-                device.free_memory(s.memory, None);
+                release_buffer_slot(device, &mut self.host_slab, s);
             }
         }
         if let Some(s) = self.readback_live.take() {
-            device.destroy_buffer(s.buffer, None);
-            device.free_memory(s.memory, None);
+            release_buffer_slot(device, &mut self.host_slab, s);
         }
         for s in self.readback_multi_live.drain(..) {
-            device.destroy_buffer(s.buffer, None);
-            device.free_memory(s.memory, None);
+            release_buffer_slot(device, &mut self.host_slab, s);
         }
         // Leased slots are the one class here whose memory a live borrow may
         // still be reading, and freeing it unmaps that borrow's pointer — a
@@ -84,8 +79,7 @@ impl ResourcePools {
         }
         self.reclaim_returned_readback_leases();
         for l in self.readback_leased.drain(..) {
-            device.destroy_buffer(l.slot.buffer, None);
-            device.free_memory(l.slot.memory, None);
+            release_buffer_slot(device, &mut self.host_slab, l.slot);
         }
         // Sampled / target / registry images are slab-backed: destroy the image
         // + view handles here, but their memory belongs to shared blocks freed
@@ -138,6 +132,10 @@ impl ResourcePools {
         self.registry_order.clear();
         // Free every slab block now that all slab-backed images are destroyed.
         self.slab.destroy_all(device);
+        // Same for the HOST_VISIBLE upload blocks: every staging buffer bound
+        // into one was destroyed above, so nothing can still reference the
+        // block mappings this drops.
+        self.host_slab.destroy_all(device);
         for slot in self.slots.drain(..) {
             device.destroy_fence(slot.fence, None);
         }

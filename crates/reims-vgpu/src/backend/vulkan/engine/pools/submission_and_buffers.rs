@@ -46,6 +46,7 @@ impl ResourcePools {
             target_free: FreePool::new(TARGET_FREE_CAP_PER_KEY, TARGET_FREE_CAP_TOTAL),
             open_batch: None,
             slab: super::slab::SlabPool::new(),
+            host_slab: super::host_slab::HostSlabPool::new(),
             initialized: false,
         }
     }
@@ -158,18 +159,22 @@ impl ResourcePools {
                 let Some(slot) = pop_largest_pool_entry(&mut self.staging_free) else {
                     break;
                 };
-                device.destroy_buffer(slot.buffer, None);
-                device.free_memory(slot.memory, None);
+                release_buffer_slot(device, &mut self.host_slab, slot);
                 buf_trimmed += 1;
             }
             while buf_trimmed < max {
                 let Some(slot) = pop_largest_pool_entry(&mut self.readback_free) else {
                     break;
                 };
-                device.destroy_buffer(slot.buffer, None);
-                device.free_memory(slot.memory, None);
+                release_buffer_slot(device, &mut self.host_slab, slot);
                 buf_trimmed += 1;
             }
+            // No separate block sweep: `release_buffer_slot` returned each
+            // slot's carve above, and the upload slab settles to its
+            // spare-per-class policy on every release. What a settled idle
+            // retains here is those spares — tens of MiB against the ~177 MiB
+            // of frozen staging this trim was written for — and they are what
+            // stops the first composite after idle re-allocating a block.
             // The standalone (non-slab) compute-storage recycle pool re-allocs via
             // a full `vkAllocateMemory` on the next dispatch — like the buffer
             // pools above and unlike the slab-backed image pools (cheap
@@ -1306,42 +1311,35 @@ impl ResourcePools {
                     memory_type_bits: req.memory_type_bits,
                 })
             })?;
-        let memory = allocate_memory_timed(
-            ctx,
-            &vk::MemoryAllocateInfo::default()
-                .allocation_size(req.size)
-                .memory_type_index(mt),
-            AllocSite::Staging,
-        )
-        .map_err(|e| {
-            ctx.device.destroy_buffer(buffer, None);
-            DrawError::VkCall(VkCall::new(VkOp::PoolsAllocStaging, e))
-        })?;
-        counters.note_alloc();
+        // Carve out of a shared HOST_VISIBLE block rather than allocating one
+        // memory object per buffer. The block is allocated and mapped once; a
+        // miss here is a create + carve + bind, which is what turns the ~0.4 ms
+        // floor every miss used to pay into a handful of block allocations for
+        // the whole boot. The slab picks the same `MemoryClass::Upload` type
+        // `mt` resolves to and records it on the block, so a carve only ever
+        // lands in a block this bind can legally use; `mt` stays here because
+        // the slot still has to report that type's caching.
+        let token = self
+            .host_slab
+            .acquire(ctx, &req, counters)
+            .inspect_err(|_| ctx.device.destroy_buffer(buffer, None))?;
         ctx.device
-            .bind_buffer_memory(buffer, memory, 0)
+            .bind_buffer_memory(buffer, token.memory, token.offset())
             .map_err(|e| {
-                ctx.device.free_memory(memory, None);
+                self.host_slab.release(&ctx.device, token);
                 ctx.device.destroy_buffer(buffer, None);
                 DrawError::VkCall(VkCall::new(VkOp::PoolsBindStaging, e))
             })?;
-        // Map once, for the slot's lifetime. Every write went through a
-        // vkMapMemory/vkUnmapMemory pair, two driver round trips per buffer bind
-        // and ~92 000 binds per 202 outlier tranches; the pool's whole point is
-        // that the allocation outlives the bind, and so can its mapping.
-        let mapped = ctx
-            .device
-            .map_memory(memory, 0, bucket, vk::MemoryMapFlags::empty())
-            .map_err(|e| {
-                ctx.device.destroy_buffer(buffer, None);
-                ctx.device.free_memory(memory, None);
-                DrawError::VkCall(VkCall::new(VkOp::PoolsMapStaging, e))
-            })? as usize;
         let slot = BufferSlot {
             buffer,
-            memory,
+            memory: token.memory,
             size: bucket,
-            mapped,
+            // The block's mapping covers every carve in it, so a slot's host
+            // address is a pointer into it. Nothing maps or unmaps per slot;
+            // the pool's whole point is that the allocation outlives the bind,
+            // and now so does the mapping of the block behind it.
+            mapped: token.mapped,
+            backing: BufferBacking::HostSlab(token),
             // `MemoryClass::Upload` requires HOST_COHERENT, so a staging write
             // needs no flush and the persistent mapping above is sound.
             coherent: true,
@@ -1603,6 +1601,13 @@ impl ResourcePools {
             memory,
             size: bucket,
             mapped,
+            // Readback slots keep their own memory object. They are few (tens
+            // a boot against the staging pool's ~1 500), individually large,
+            // and of a different memory class — so the block-suballocation
+            // argument that carries the staging pool does not carry here, while
+            // the lease path's "this memory is mine alone" is easier to hold
+            // when it is true.
+            backing: BufferBacking::Dedicated,
             coherent: kind.coherent,
             cached: kind.cached,
         })

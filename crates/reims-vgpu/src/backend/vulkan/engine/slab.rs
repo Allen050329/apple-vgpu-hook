@@ -171,7 +171,12 @@ impl BlockPlan {
     /// list. This turns a double release or corrupt token into a typed leak
     /// instead of inserting an overlapping range and only noticing after the
     /// allocator has already poisoned itself.
-    fn release_preflight(&self, block: u32, start: u64, size: u64) -> Result<(), SlabDecline> {
+    pub(crate) fn release_preflight(
+        &self,
+        block: u32,
+        start: u64,
+        size: u64,
+    ) -> Result<(), SlabDecline> {
         if size == 0 {
             return Err(SlabDecline::ReleaseZeroSize {
                 block,

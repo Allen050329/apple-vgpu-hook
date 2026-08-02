@@ -22,6 +22,7 @@ mod draw_validation;
 mod exec;
 mod exec_compute;
 mod facade_decline;
+mod host_slab;
 pub mod init_decline;
 mod pools;
 pub mod reason;

@@ -11,6 +11,7 @@ use std::time::Instant;
 
 use super::compute_execution::ComputeExecutionDecline;
 use super::context::{DeviceContext, FENCE_TIMEOUT_NS};
+use super::host_slab::HostSlabToken;
 use super::counters::EngineCounters;
 use super::desc_arena::{DescriptorArena, DESC_BLOCK_MAX_SETS};
 use super::device_lost::{DeviceLostDecline, DeviceLostOp};
@@ -63,6 +64,49 @@ pub(crate) struct BufferSlot {
     /// one would pay that rate on every row rather than once on a linear pass.
     /// So the choice is a capability question, and the slot answers it.
     pub cached: bool,
+    /// Where `memory` came from, and therefore how the slot is given back.
+    pub backing: BufferBacking,
+}
+
+/// Where a [`BufferSlot`]'s device memory came from.
+///
+/// The distinction exists because the two are freed differently and getting it
+/// wrong is not a leak but a double free: a slab-backed slot's `memory` is
+/// shared with every other carve in its block.
+#[derive(Clone, Copy)]
+pub(crate) enum BufferBacking {
+    /// The slot owns `memory` outright; releasing it is `vkFreeMemory`.
+    ///
+    /// The readback pools are all of this kind, and one more thing rests on it
+    /// than the free path: [`invalidate_slot_for_read`] names the slot's whole
+    /// memory object from offset 0, which is the slot's own bytes only while
+    /// this holds. Sub-allocating a readback slot would have to narrow that
+    /// range to the carve first.
+    Dedicated,
+    /// The slot holds a sub-range of a shared HOST_VISIBLE block; releasing it
+    /// returns the range to [`super::host_slab::HostSlabPool`] and must never
+    /// call `vkFreeMemory`.
+    HostSlab(HostSlabToken),
+}
+
+/// Give a buffer slot back: destroy its handle, then release its memory by
+/// whichever route its backing says.
+///
+/// A free function rather than a `ResourcePools` method so a caller iterating
+/// one pool field can still hand the slab the `&mut` it needs.
+///
+/// # Safety
+/// No in-flight command buffer may still reference `slot.buffer`.
+pub(crate) unsafe fn release_buffer_slot(
+    device: &ash::Device,
+    host_slab: &mut super::host_slab::HostSlabPool,
+    slot: BufferSlot,
+) {
+    device.destroy_buffer(slot.buffer, None);
+    match slot.backing {
+        BufferBacking::Dedicated => device.free_memory(slot.memory, None),
+        BufferBacking::HostSlab(token) => host_slab.release(device, token),
+    }
 }
 
 pub(crate) struct TargetSlot {
@@ -241,6 +285,12 @@ pub(crate) struct ResourcePools {
     /// `vk::Image` handle, so the free path routes through it with just the
     /// image.
     slab: super::slab::SlabPool,
+    /// Offset suballocator for the HOST_VISIBLE upload blocks every staging
+    /// buffer is carved from. Same reason as `slab` one field up, against a
+    /// different measurement: a staging miss cost ~0.4-0.6 ms of
+    /// `vkAllocateMemory` whatever its size, and the pool takes ~1 500 of them
+    /// a boot, clustered on the first composite after idle.
+    host_slab: super::host_slab::HostSlabPool,
     initialized: bool,
 }
 
@@ -1031,7 +1081,15 @@ pub(crate) enum AllocSite {
     /// guest never asked for MRT, rather than asking and being degraded.
     MrtSecondary,
     TransientDepth,
-    Staging,
+    /// A HOST_VISIBLE upload block, not one staging buffer.
+    ///
+    /// Every staging bind is a sub-allocation out of one of these
+    /// ([`super::host_slab`]), so this counts blocks: a boot that once read
+    /// `staging=242:134:273` (count:MiB:ms) should read a single-digit count
+    /// here. The name changed with the meaning deliberately — a reader
+    /// comparing a new `staging_block` figure against an old `staging` one
+    /// would be comparing block allocations against buffer allocations.
+    StagingBlock,
     Readback,
     ReadbackMulti,
     SlabBlock,
@@ -1045,7 +1103,7 @@ impl AllocSite {
             AllocSite::StorageImage => 0,
             AllocSite::MrtSecondary => 1,
             AllocSite::TransientDepth => 2,
-            AllocSite::Staging => 3,
+            AllocSite::StagingBlock => 3,
             AllocSite::Readback => 4,
             AllocSite::ReadbackMulti => 5,
             AllocSite::SlabBlock => 6,
@@ -1057,7 +1115,7 @@ const ALLOC_SITE_NAMES: [&str; ALLOC_SITE_N] = [
     "storage_image",
     "mrt_secondary",
     "transient_depth",
-    "staging",
+    "staging_block",
     "readback",
     "readback_multi",
     "slab_block",
@@ -1459,6 +1517,121 @@ mod staging_mapping_tests {
             again.mapped, first.mapped,
             "a recycled slot lost its mapping and would map per write again"
         );
+
+        pools.recycle_staging();
+        unsafe { pools.destroy_all(&ctx.device) };
+        unsafe { ctx.destroy() };
+    }
+
+    /// A cold burst of staging acquires costs a handful of `vkAllocateMemory`,
+    /// not one per acquire.
+    ///
+    /// This is the whole claim of [`super::super::host_slab`]. The staging pool
+    /// hits ~99.6 % of the time, so what it costs is decided by its misses, and
+    /// a miss used to be a full allocation — measured at a ~0.4-0.6 ms floor
+    /// whatever the size (a 64-byte miss read 421 us). Every acquire below is a
+    /// cold miss: distinct buckets, nothing recycled between them. Before
+    /// suballocation each one allocated, so this delta was exactly `acquires`;
+    /// now the same burst fits a small number of blocks.
+    ///
+    /// The bound is on the *count*, not on the identity of the blocks, because
+    /// the split between size classes is a tuning decision and the point of the
+    /// test is that the count does not track the acquire count.
+    #[test]
+    fn a_cold_staging_burst_allocates_blocks_not_buffers() {
+        crate::observe::redirect_logs_for_tests();
+        let mut ctx = match unsafe { DeviceContext::create() } {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("SKIP staging burst: no device ({e})");
+                return;
+            }
+        };
+        let counters = EngineCounters::default();
+        let mut pools = ResourcePools::new();
+        let usage = vk::BufferUsageFlags::VERTEX_BUFFER;
+
+        // Two passes over eleven distinct buckets from 64 B to 64 KiB. The
+        // second pass re-requests each bucket while the first pass's slot is
+        // still live, so nothing can be served from the free list and all 22
+        // are genuine misses.
+        let mut acquires = 0usize;
+        for _ in 0..2 {
+            let mut size = 64u64;
+            while size <= 64 << 10 {
+                unsafe { pools.acquire_staging(&ctx, size, usage, &counters) }
+                    .expect("staging slot");
+                acquires += 1;
+                size <<= 1;
+            }
+        }
+        assert_eq!(acquires, 22, "the burst must be the size this test claims");
+
+        let allocs = counters.snapshot().allocs;
+        assert!(
+            allocs < acquires as u64,
+            "a cold staging burst allocated {allocs} memory objects for \
+             {acquires} acquires — one per acquire means the suballocator is \
+             not in the path"
+        );
+        assert!(
+            allocs <= 4,
+            "{acquires} acquires totalling under 256 KiB took {allocs} blocks; \
+             the size classes are fragmenting rather than packing"
+        );
+
+        pools.recycle_staging();
+        unsafe { pools.destroy_all(&ctx.device) };
+        unsafe { ctx.destroy() };
+    }
+
+    /// Two staging slots carved from one block address disjoint bytes.
+    ///
+    /// The failure this guards is the one suballocation introduces and nothing
+    /// else in the suite would see: two slots that share a `VkDeviceMemory` but
+    /// whose host pointers or bind offsets collide read back each other's
+    /// payload, which downstream looks like corrupted geometry rather than like
+    /// an allocator bug. Asserted on both halves — the mapping the CPU writes
+    /// through, and the `VkBuffer` the GPU reads through — because a correct
+    /// `mapped` with a wrong bind offset aliases only on the GPU side.
+    #[test]
+    fn two_carves_from_one_block_do_not_alias() {
+        crate::observe::redirect_logs_for_tests();
+        let mut ctx = match unsafe { DeviceContext::create() } {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("SKIP staging aliasing: no device ({e})");
+                return;
+            }
+        };
+        let counters = EngineCounters::default();
+        let mut pools = ResourcePools::new();
+        let usage = vk::BufferUsageFlags::VERTEX_BUFFER;
+
+        let a = unsafe { pools.acquire_staging(&ctx, 4096, usage, &counters) }.expect("slot a");
+        let b = unsafe { pools.acquire_staging(&ctx, 4096, usage, &counters) }.expect("slot b");
+        assert_ne!(a.buffer, b.buffer, "two live acquires must be two buffers");
+
+        let pa: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+        let pb: Vec<u8> = (0..4096u32).map(|i| ((i % 251) ^ 0xff) as u8).collect();
+        unsafe { pools.write_staging(&ctx, &a, &pa) }.expect("write a");
+        unsafe { pools.write_staging(&ctx, &b, &pb) }.expect("write b");
+
+        let seen_a = unsafe { std::slice::from_raw_parts(a.mapped as *const u8, pa.len()) };
+        let seen_b = unsafe { std::slice::from_raw_parts(b.mapped as *const u8, pb.len()) };
+        assert_eq!(seen_a, &pa[..], "slot a's mapping was overwritten by slot b");
+        assert_eq!(seen_b, &pb[..], "slot b's mapping was overwritten by slot a");
+
+        // Same memory object is expected and fine; the same *bytes* are not.
+        if a.memory == b.memory {
+            let (oa, ob) = (a.mapped, b.mapped);
+            assert!(
+                oa + pa.len() <= ob || ob + pb.len() <= oa,
+                "two carves of one block overlap: {oa:#x}+{} vs {ob:#x}+{}",
+                pa.len(),
+                pb.len()
+            );
+        }
 
         pools.recycle_staging();
         unsafe { pools.destroy_all(&ctx.device) };
