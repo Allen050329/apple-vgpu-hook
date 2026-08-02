@@ -301,6 +301,32 @@ gigabyte a second into guest pages, and that is the single largest cost in the d
 not the route. Reducing the bytes, or making the guest's own reads observable so the writeback
 becomes demand-driven, are.
 
+**There are two GB/s-scale CPU rails in this device, not one.** The other is the
+zero-copy sampled gather: `SampledSource::GuestRuns` copies its whole window out of
+guest RAM into a staging buffer on every bind, with no content cache, measured at
+360 gathers and **842 MB a second** on a driven x86/PCI boot and repeating to the
+digit across consecutive windows — the shape of unchanged content re-read every
+frame. Both the task-GVA linear rail and the mapping-backed type-11 rail
+contribute; the type-5 video rail is idle unless something is playing.
+
+Skipping those gathers needs a witness for "these bytes did not change", and the
+measured answer is that **it takes two**, because they cover disjoint writers:
+
+- The hypervisor dirty bitmap (`HostOps::guest_write_gen`) witnesses guest CPU
+  stores. Measured sound: `gw_clean_diff` — bytes moved with no writer of any
+  kind seen — is **0** across four driven boots.
+- `DeviceState::host_writes` witnesses this device's own writes, which the bitmap
+  is defined not to see. It has to be **page-exact**: a per-mapping count was
+  tried and read 15 stale binds a minute, because guest pages are reachable under
+  more than one mapping id, which is what `deferred_alias_pages` exists for.
+
+Getting the second one complete took two passes, and the lesson generalises. A
+hand-picked list of writer call sites missed `gva_view::map_fresh_span_within`,
+whose callers write through a raw alias — the same hole `observe::gate`'s
+`MAP_PAGES_SITES` was built after the footprint rail fell into it. **That table is
+the authority on which code writes guest RAM; a new rail that needs the set should
+read it rather than grep.**
+
 That sentence used to say **two** CPU passes. There is one. The pass that copied the mapped readback
 buffer into a `Vec` before scattering it is gone — the scatter reads the staging buffer in place
 through a lease (`engine::LeasedFrame`), measured at `readback_split map_us=0 map=120 map_max_us=0`

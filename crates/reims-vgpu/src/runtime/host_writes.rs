@@ -15,10 +15,22 @@
 //! former serves stale pixels fifteen times a minute.
 //!
 //! The same boot read `gw_clean_diff = 0`: a *global* count, which moves for every
-//! write anywhere, has no counterexample. So the choice is not between sound and
-//! unsound; it is between a sound rule that invalidates a texture because an
-//! unrelated scanout was composited (measured at 6.5 % of gathered bytes served)
-//! and a sound rule that answers about the pages actually read (26 %).
+//! write anywhere, had no counterexample, because it moves for every write
+//! including the ones a narrower rule fails to attribute.
+//!
+//! # Where it stands
+//!
+//! Once every writer records here — which took a second pass, because
+//! `map_fresh_span_within`'s callers write through a raw alias and were invisible
+//! to a hand-picked list of call sites — a driven boot reads
+//! **`gw_clean_diff_pages_quiet = 0`**, alongside zero for both wider rules. Of
+//! the binds where the guest was quiet and the bytes were identical, this rule
+//! serves 93 %; the rest are windows whose page set had just moved.
+//!
+//! What that licenses is a cache over the zero-copy sampled gathers, valid iff
+//! the hypervisor's guest generation has not moved **and** this says the pages
+//! were not written. Neither half is sufficient alone and the measurements above
+//! are what say so, rather than an argument that they ought to be.
 //!
 //! # Shape
 //!
