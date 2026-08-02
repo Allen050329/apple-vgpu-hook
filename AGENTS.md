@@ -432,7 +432,27 @@ setsid nohup vm/boot-x86.sh --device reims-vgpu-pci --testing >/tmp/boot.log 2>&
 
 Then poll `ssh macos-vm true` until it answers, and abort the wait if
 `pgrep -f 'qemu-system-x86_6[4]'` stops matching — otherwise a boot that died
-early is indistinguishable from one still coming up.
+early is indistinguishable from one still coming up. Give that poll a grace
+period before it concludes the boot is dead: `boot-x86.sh` rebuilds the
+staticlib, relinks QEMU and reverts the snapshot before QEMU exists at all, so a
+`pgrep` in the first ~30 seconds reports "QEMU GONE" for a boot that has not
+started yet.
+
+**A `--testing` boot kills itself after `TESTING_TIMEOUT` (default 420 s) and
+that is a budget you can spend before you measure.** The kill is the wedge
+verdict — the script does a QMP register capture and reverts — so it reads in
+`/tmp/boot.log` as a `Killed`/`terminating on signal 15` and in the guest as SSH
+suddenly refusing, which looks exactly like the workload crashing the VM. Seven
+minutes is not much: settling the guest can take four, and two 20-second probes
+with their launch overhead take another two. Plan the run to fit, or raise it:
+
+```sh
+TESTING_TIMEOUT=1200 setsid nohup vm/boot-x86.sh --device reims-vgpu-pci --testing ...
+```
+
+Check `drain_duty` at the tail of the fail log before concluding a workload
+killed the guest: `duty=0.001 draws=0` for the seconds leading up to the exit is
+an idle, healthy device being torn down on schedule.
 
 **SSH answering is not the guest being ready, and the difference is not
 subtle.** sshd comes up well before the desktop settles, and a frame-pacing
