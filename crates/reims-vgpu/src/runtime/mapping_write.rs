@@ -795,7 +795,9 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
         // into a contig view — so without its own hook the audit goes silent
         // on any host whose mappings are host-contiguous, and `write_split`'s
         // `contig`/`frag` is the only thing that would say so.
-        let audit = crate::runtime::land_redundancy::audit_due();
+        let audit = crate::runtime::land_redundancy::audit_due(
+        crate::runtime::land_redundancy::Leg::Mapping,
+    );
         let page_size = state.page_size();
         let land_started = std::time::Instant::now();
         // SAFETY: contig covers span_end; revalidated in ensure_contig_view.

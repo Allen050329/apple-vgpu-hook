@@ -802,7 +802,9 @@ fn write_span_multi<H: HostMemory + HostOps>(
     // does not — and on a driven x86/PCI drag it is almost always here, which
     // is why hooking only the packed half reported the leg at 7 runs a second
     // against `gvaw_fence_flush=444`.
-    let audit = crate::runtime::land_redundancy::audit_due();
+    let audit = crate::runtime::land_redundancy::audit_due(
+        crate::runtime::land_redundancy::Leg::Gva,
+    );
     crate::runtime::mapper::flush_retired_views(state, host);
     let span_page_base = gva & !(page_size - 1);
     let end = gva.saturating_add(length);

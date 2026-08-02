@@ -2046,7 +2046,9 @@ fn copy_mapping_runs<H: HostMemory + HostOps>(
     // Decided once for the walk so an audited landing is compared whole. See
     // [`crate::runtime::land_redundancy::audit_due`] for why a per-run stride
     // would describe no frame in particular.
-    let audit = copy.is_write() && crate::runtime::land_redundancy::audit_due();
+    let audit = copy.is_write() && crate::runtime::land_redundancy::audit_due(
+        crate::runtime::land_redundancy::Leg::Mapping,
+    );
     let page_size = state.page_size();
     let len = copy.len();
     let need_end = off.saturating_add(len as u64);

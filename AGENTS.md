@@ -1025,6 +1025,25 @@ drag, five landings a second audited over fourteen consecutive seconds:
 
 The idle desktop reads 2025/2025 pages identical, so the idle case is total.
 
+**⚠ Both rows are biased samples and the bias is measured, so do not rest a
+design on the exact figure.** The audit takes one write in 64 from a stream of
+~8.5 composites per guest frame whose redundancy differs by tens of points —
+static layer surfaces are near-totally redundant, the final composite is not —
+so *which* of the 8.5 the stride lands on is most of the answer. This was found
+the hard way: adding a second hook, on a writer firing 37 000 times a second
+against the mapping leg's ~290, moved the **mapping** leg's own reading from
+`same_fine` 90.75 % / `same_pages` 51.78 % to **99.60 % / 97.85 %** — same
+stressor, same guest, comparable motion, `duty` 0.97 both, the same number of
+landings sampled. A fixed stride over a stream one source dominates 130:1
+aliases onto a different phase of the other's cycle.
+
+The stride is now per leg, which stops one hook perturbing another's sampling
+but does **not** make either number a population estimate. What the whole set of
+runs supports is "most of these bytes are already there, somewhere between 86 %
+and 99 % at tile granularity" — which is enough to justify building the GPU
+pass and not enough to predict its saving to better than a factor. A per-surface
+split is what would answer it; nobody has built one.
+
 **Probed twice on that boot, and the second run is higher**: fine 86.2 – 95.6 %
 (median 89.9) over eleven seconds, pages 54.0 – 81.8 % (median 61.1). So the
 first run's 86 % is the conservative reading, and the two rows do not move

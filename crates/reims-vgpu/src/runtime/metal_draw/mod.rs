@@ -3731,7 +3731,9 @@ pub(crate) fn write_gva_rgba8_within<M: HostMemory + HostOps>(
         // `store_routes` reads at `gvaw_fence_flush` against the mapping-keyed
         // `mapw_fence_flush` beside it; without this hook the audit reports on
         // only one of the two writeback legs.
-        let audit = crate::runtime::land_redundancy::audit_due();
+        let audit = crate::runtime::land_redundancy::audit_due(
+        crate::runtime::land_redundancy::Leg::Gva,
+    );
         let page_size = state.page_size();
         let mut res = Ok(());
         for y in 0..height as usize {

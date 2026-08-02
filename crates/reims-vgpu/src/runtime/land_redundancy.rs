@@ -155,12 +155,41 @@
 //!   against those 444 flushes, which reads as "this leg moves nothing"
 //!   when it meant "this hook is not where the bytes go".
 //!
-//! The sampling unit differs between the two legs and the fractions are still
-//! comparable. A mapping walk is a landing, so its stride samples whole frames;
-//! a `write_span_multi` call is one row, so the GVA leg's stride samples rows
-//! scattered across many windows. For a *fraction* over many samples that is
-//! fine — it is an unbiased estimate either way. It is not fine for any claim
-//! about a particular frame, and only the mapping leg can support one.
+//! The sampling unit differs between the two legs. A mapping walk is a
+//! landing, so its stride samples whole frames; a `write_span_multi` call is one
+//! row, so the GVA leg samples rows scattered across many windows. For a
+//! fraction over many samples both are unbiased; neither the GVA leg nor a
+//! blend of the two can support a claim about a particular frame.
+//!
+//! # The stride is per leg, and it had to be — the shared one aliased
+//!
+//! Each leg keeps its own `STRIDE_TICK`, `CALLS` and `AUDITS`. That is not
+//! tidiness. The first version shared one tick across every writer, and adding
+//! the GVA hook — which fires **37 000 times a second** against the mapping
+//! leg's ~290 — moved the mapping leg's own answer:
+//!
+//! ```text
+//! run     hooks           mapping same_fine   mapping same_pages   landings audited
+//! drag5   mapping only    med 90.75 %         med 51.78 %          4
+//! drag6   + gva           med 99.60 %         med 97.85 %          5
+//! ```
+//!
+//! Same stressor, same guest, comparable motion (1853 against 1655
+//! repositions), `duty` 0.97 both, the same number of landings sampled — and a
+//! nine-point move in the answer. A fixed stride over a stream one source
+//! dominates 130:1 stops landing where it used to: it aliases onto whichever
+//! phase of the other source's cycle the arithmetic happens to select. The
+//! guest emits ~8.5 composites per frame and they are not alike — static layer
+//! surfaces are near-totally redundant while the final composite is not — so
+//! *which* of the 8.5 the stride picks is most of the answer.
+//!
+//! **Both readings are therefore biased samples of a mixed population, and the
+//! per-leg stride fixes only half of it.** It stops one hook perturbing
+//! another's sampling, which is what made the defect visible; it does not make
+//! either number a population estimate, because the mapping leg still mixes
+//! surfaces whose redundancy differs by tens of points. Re-measure before
+//! resting a design on 86 % or on 99 %. A per-surface split is what would
+//! actually answer it.
 //!
 //! The two legs are reported on separate lines ([`Leg`]) because they are
 //! separate rails with separate arm and flush paths, and one blended fraction
@@ -202,17 +231,6 @@ pub const AUDIT_STRIDE: u64 = 64;
 /// cache line this runs on, so a fine chunk never straddles one.
 pub const FINE_TILE: usize = 256;
 
-/// Free-running, and deliberately **not** cleared by [`take_window`].
-///
-/// The stride is a property of the write stream, not of the reporting window. A
-/// counter the census zeroed would restart the stride every second, so the first
-/// write after each window boundary would be due — which on an idle desktop
-/// landing four windows a second means auditing all four, and on a driven one
-/// silently changes the sample rate with the load.
-static STRIDE_TICK: AtomicU64 = AtomicU64::new(0);
-static CALLS: AtomicU64 = AtomicU64::new(0);
-static AUDITS: AtomicU64 = AtomicU64::new(0);
-
 /// Which writeback leg a compared range belongs to.
 ///
 /// The two are separate rails with separate arm and flush paths, and
@@ -244,6 +262,20 @@ impl Leg {
 
 const LEGS: usize = 2;
 
+/// Free-running per leg, and deliberately **not** cleared by [`take_window`].
+///
+/// Two independent reasons, both of them measured defects rather than taste.
+/// The stride is a property of the write stream and not of the reporting
+/// window: a counter the census zeroed would restart it every second, making
+/// the first write after each boundary due — all four landings on an idle
+/// desktop, and a rate that moves with the load on a driven one. And it is per
+/// leg because one shared tick let the 37 000-a-second GVA writer alias the
+/// ~290-a-second mapping writer's sample onto a different set of surfaces,
+/// moving that leg's reported redundancy nine points with no change to the
+/// workload. See the module doc.
+static STRIDE_TICK: [AtomicU64; LEGS] = [const { AtomicU64::new(0) }; LEGS];
+static CALLS: [AtomicU64; LEGS] = [const { AtomicU64::new(0) }; LEGS];
+static AUDITS: [AtomicU64; LEGS] = [const { AtomicU64::new(0) }; LEGS];
 static RUNS: [AtomicU64; LEGS] = [const { AtomicU64::new(0) }; LEGS];
 static BYTES: [AtomicU64; LEGS] = [const { AtomicU64::new(0) }; LEGS];
 static PAGES: [AtomicU64; LEGS] = [const { AtomicU64::new(0) }; LEGS];
@@ -254,9 +286,9 @@ static SAME_FINE: [AtomicU64; LEGS] = [const { AtomicU64::new(0) }; LEGS];
 /// One leg's window of the audit, as taken by the per-second census.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct LandRedundancyWindow {
-    /// Walks audited, against `calls` offered, across **both** legs — the
-    /// stride is one sequence over every writer, so these two cannot be
-    /// attributed to a leg and are the same on each line.
+    /// Walks audited against walks offered, **for this leg only**. The stride
+    /// is per leg because a shared one let a 37 000-a-second writer move a
+    /// 290-a-second writer's answer by nine points; see the module doc.
     pub audits: u64,
     pub calls: u64,
     /// Contiguous ranges compared in this leg. A fragmented landing is hundreds
@@ -276,15 +308,13 @@ pub struct LandRedundancyWindow {
 /// zeros reads as "nothing was redundant" when it means "nothing was measured",
 /// and the two call for opposite conclusions.
 pub fn take_window() -> Vec<(Leg, LandRedundancyWindow)> {
-    let audits = AUDITS.swap(0, Ordering::Relaxed);
-    let calls = CALLS.swap(0, Ordering::Relaxed);
     Leg::ALL
         .into_iter()
         .filter_map(|leg| {
             let i = leg as usize;
             let w = LandRedundancyWindow {
-                audits,
-                calls,
+                audits: AUDITS[i].swap(0, Ordering::Relaxed),
+                calls: CALLS[i].swap(0, Ordering::Relaxed),
                 runs: RUNS[i].swap(0, Ordering::Relaxed),
                 bytes: BYTES[i].swap(0, Ordering::Relaxed),
                 pages: PAGES[i].swap(0, Ordering::Relaxed),
@@ -303,13 +333,14 @@ pub fn take_window() -> Vec<(Leg, LandRedundancyWindow)> {
 /// whole and the fraction it reports is a fraction of a frame. A per-run stride
 /// would sample scattered pieces of different landings and report their mean as
 /// though it described one.
-pub fn audit_due() -> bool {
-    CALLS.fetch_add(1, Ordering::Relaxed);
-    let due = STRIDE_TICK
+pub fn audit_due(leg: Leg) -> bool {
+    let i = leg as usize;
+    CALLS[i].fetch_add(1, Ordering::Relaxed);
+    let due = STRIDE_TICK[i]
         .fetch_add(1, Ordering::Relaxed)
         .is_multiple_of(AUDIT_STRIDE);
     if due {
-        AUDITS.fetch_add(1, Ordering::Relaxed);
+        AUDITS[i].fetch_add(1, Ordering::Relaxed);
     }
     due
 }
@@ -430,9 +461,11 @@ mod tests {
 
     fn reset() {
         let _ = take_window();
-        CALLS.store(0, Ordering::Relaxed);
-        AUDITS.store(0, Ordering::Relaxed);
-        STRIDE_TICK.store(0, Ordering::Relaxed);
+        for i in 0..LEGS {
+            CALLS[i].store(0, Ordering::Relaxed);
+            AUDITS[i].store(0, Ordering::Relaxed);
+            STRIDE_TICK[i].store(0, Ordering::Relaxed);
+        }
     }
 
     /// An idle second emits nothing rather than a row of zeros.
@@ -586,7 +619,7 @@ mod tests {
         reset();
         let mut due = 0;
         for _ in 0..(AUDIT_STRIDE * 3) {
-            due += u64::from(audit_due());
+            due += u64::from(audit_due(Leg::Mapping));
         }
         assert_eq!(due, 3);
     }
@@ -601,15 +634,15 @@ mod tests {
         // Tick 0 is due, then half a stride of ticks that are not, then a
         // census, then the rest of the stride: the next due write must still be
         // tick `AUDIT_STRIDE` and not the first one after the boundary.
-        assert!(audit_due(), "the stride's first tick is due");
+        assert!(audit_due(Leg::Mapping), "the stride's first tick is due");
         for _ in 1..(AUDIT_STRIDE / 2) {
-            assert!(!audit_due());
+            assert!(!audit_due(Leg::Mapping));
         }
         let _ = take_window();
         for _ in (AUDIT_STRIDE / 2)..AUDIT_STRIDE {
-            assert!(!audit_due(), "the window boundary made a write due");
+            assert!(!audit_due(Leg::Mapping), "the window boundary made a write due");
         }
-        assert!(audit_due(), "the stride's own tick did not come due");
+        assert!(audit_due(Leg::Mapping), "the stride's own tick did not come due");
     }
 
     /// `audits` counts walks and `runs` counts the ranges inside them. A
@@ -618,7 +651,7 @@ mod tests {
     #[test]
     fn walks_and_the_runs_inside_them_are_counted_apart() {
         reset();
-        assert!(audit_due());
+        assert!(audit_due(Leg::Mapping));
         let src = [3u8; FINE_TILE * 2];
         let dst = src;
         for run in 0..4u64 {
