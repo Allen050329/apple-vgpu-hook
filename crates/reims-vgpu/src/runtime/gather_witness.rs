@@ -126,6 +126,9 @@ struct Entry {
     /// moves whenever any surface anywhere is written, so the two together say
     /// how much of the global count's invalidation is other people's work.
     scoped_seq: u64,
+    /// `HostWrites::epoch` at the previous bind, against which the page-exact
+    /// question "did this device write any of *these pages* since" is asked.
+    pages_epoch: u64,
     /// Bind ordinal of the last sight of this window, for LRU eviction.
     last_seen: u64,
 }
@@ -165,6 +168,11 @@ impl GatherWitness {
             }
         }
         self.entries.clear();
+    }
+
+    /// The host-write epoch recorded at the previous bind of `key`, if any.
+    fn previous_pages_epoch(&self, key: &GatherKey) -> Option<u64> {
+        self.entries.get(key).map(|entry| entry.pages_epoch)
     }
 
     /// Drop the least recently bound window, releasing its token.
@@ -225,6 +233,25 @@ unsafe fn fold_runs(runs: &[crate::backend::vulkan::engine::GuestRun], span: u64
     ((a as u128) << 64) | b as u128
 }
 
+/// Every host-write count one bind is judged against.
+///
+/// Gathered before the witness is touched, because the page-exact question needs
+/// the epoch recorded at the previous bind and the ring that answers it is read
+/// through the same device state the witness lives in.
+#[derive(Clone, Copy, Debug)]
+struct HostWriteCounts {
+    /// `DeviceState::host_guest_write_seq` — moves for every host write anywhere.
+    global: u64,
+    /// `DeviceState::host_wrote_mapping_seq` for this window's mapping, or the
+    /// global count where it has none.
+    scoped: u64,
+    /// `HostWrites::epoch()` now, to be recorded for the next bind to ask against.
+    pages_epoch: u64,
+    /// Whether this device wrote any of this window's pages since the previous
+    /// bind. `None` when there is no previous bind to ask about.
+    pages_wrote: Option<bool>,
+}
+
 /// The resolved window one gather will read.
 ///
 /// The pages and the host spans over them are both needed and neither implies
@@ -239,11 +266,10 @@ pub struct GatherWindow<'a> {
     pub span: u64,
     /// Guest page size the `gpas` are expressed in.
     pub page_size: usize,
-    /// [`crate::model::DeviceState::host_guest_write_seq`] as of this bind.
-    pub host_seq: u64,
-    /// `DeviceState::host_wrote_mapping_seq` for this window's mapping, or the
-    /// global count where the window names no mapping.
-    pub scoped_seq: u64,
+    /// The mapping this window lives in, where it has one. A task-GVA window
+    /// does not, and nothing narrower than the global host-write count can be
+    /// assumed quiet for it.
+    pub mapping: Option<u32>,
 }
 
 /// What one bind of a window observed, crossing the hypervisor's answer with the
@@ -272,6 +298,7 @@ pub enum GatherVerdict {
     CleanSame {
         global_quiet: bool,
         scoped_quiet: bool,
+        pages_quiet: bool,
     },
     /// Generation still, bytes moved. The witness is unsound for this window:
     /// something wrote these pages without the bitmap seeing it.
@@ -289,6 +316,7 @@ pub enum GatherVerdict {
     CleanDiff {
         host_wrote: bool,
         scoped_wrote: bool,
+        pages_wrote: bool,
     },
     /// Generation moved, bytes still — a skip the witness gives up, not an error.
     MovedSame,
@@ -316,7 +344,7 @@ impl GatherVerdict {
 /// Called from the producers with the window already resolved, so it adds a
 /// page-set compare and one content fold and changes no behaviour.
 pub fn note_gather<M: crate::runtime::host::HostOps>(
-    witness: &mut GatherWitness,
+    state: &mut crate::model::DeviceState,
     host: &mut M,
     rail: GatherRail,
     key: GatherKey,
@@ -329,7 +357,23 @@ pub fn note_gather<M: crate::runtime::host::HostOps>(
     note_store_route(rail_count);
     note_store_route_n(rail_kb, span / 1024);
 
-    let verdict = observe(witness, host, key, window);
+    // Every count this bind is judged against, taken before the witness is
+    // touched: the page-exact answer needs the epoch recorded at the *previous*
+    // bind, which is inside the witness, and the ring that answers it is read
+    // through the same device state.
+    let counts = HostWriteCounts {
+        global: state.host_guest_write_seq,
+        scoped: match window.mapping {
+            Some(mid) => state.host_wrote_mapping_seq(mid),
+            None => state.host_guest_write_seq,
+        },
+        pages_epoch: state.host_writes.epoch(),
+        pages_wrote: state
+            .gather_witness
+            .previous_pages_epoch(&key)
+            .map(|since| state.host_writes.wrote_any_since(state, since, window.gpas)),
+    };
+    let verdict = observe(&mut state.gather_witness, host, key, window, counts);
 
     // The fold answer on its own, independent of whether a token was armed: this
     // is the ceiling on what *any* content cache could skip, and unlike the
@@ -348,6 +392,7 @@ pub fn note_gather<M: crate::runtime::host::HostOps>(
         GatherVerdict::CleanSame {
             global_quiet,
             scoped_quiet,
+            pages_quiet,
         } => {
             note_store_route("gw_clean_same");
             note_store_route_n("gw_clean_same_kb", span / 1024);
@@ -359,16 +404,32 @@ pub fn note_gather<M: crate::runtime::host::HostOps>(
                 note_store_route("gw_hit_scoped");
                 note_store_route_n("gw_hit_scoped_kb", span / 1024);
             }
+            if pages_quiet {
+                note_store_route("gw_hit_pages");
+                note_store_route_n("gw_hit_pages_kb", span / 1024);
+            }
         }
-        // Three names rather than one, because they condemn different rules.
+        // One name per rule condemned, and they nest: a rule that saw nothing
+        // implies every narrower rule saw nothing too. `gw_clean_diff_pages_quiet`
+        // is the one that decides whether a page-exact cache can be built.
         GatherVerdict::CleanDiff {
-            host_wrote: false, ..
-        } => note_store_route("gw_clean_diff"),
-        GatherVerdict::CleanDiff {
-            scoped_wrote: false,
-            ..
-        } => note_store_route("gw_clean_diff_scoped_quiet"),
-        GatherVerdict::CleanDiff { .. } => note_store_route("gw_clean_diff_host_wrote"),
+            host_wrote,
+            scoped_wrote,
+            pages_wrote,
+        } => {
+            if !host_wrote {
+                note_store_route("gw_clean_diff");
+            }
+            if !scoped_wrote {
+                note_store_route("gw_clean_diff_scoped_quiet");
+            }
+            if !pages_wrote {
+                note_store_route("gw_clean_diff_pages_quiet");
+            }
+            if host_wrote && scoped_wrote && pages_wrote {
+                note_store_route("gw_clean_diff_host_wrote");
+            }
+        }
         GatherVerdict::MovedSame => note_store_route("gw_moved_same"),
         GatherVerdict::MovedDiff => note_store_route("gw_moved_diff"),
     }
@@ -381,15 +442,21 @@ fn observe<M: crate::runtime::host::HostOps>(
     host: &mut M,
     key: GatherKey,
     window: GatherWindow<'_>,
+    counts: HostWriteCounts,
 ) -> GatherVerdict {
     let GatherWindow {
         gpas,
         runs,
         span,
         page_size,
-        host_seq,
-        scoped_seq,
+        mapping: _,
     } = window;
+    let HostWriteCounts {
+        global: host_seq,
+        scoped: scoped_seq,
+        pages_epoch,
+        pages_wrote,
+    } = counts;
 
     // SAFETY: `runs` describe the window this draw is about to gather from, so
     // their pointers are live here for the same reason they are live there.
@@ -427,6 +494,7 @@ fn observe<M: crate::runtime::host::HostOps>(
                 fold,
                 host_seq,
                 scoped_seq,
+                pages_epoch,
                 last_seen: witness.binds,
             },
         );
@@ -453,10 +521,14 @@ fn observe<M: crate::runtime::host::HostOps>(
             (true, true) => GatherVerdict::CleanSame {
                 global_quiet: host_seq == entry.host_seq,
                 scoped_quiet: scoped_seq == entry.scoped_seq,
+                // `None` cannot happen beside a live entry, and answering it
+                // "quiet" would vouch on the strength of a missing answer.
+                pages_quiet: pages_wrote == Some(false),
             },
             (true, false) => GatherVerdict::CleanDiff {
                 host_wrote: host_seq != entry.host_seq,
                 scoped_wrote: scoped_seq != entry.scoped_seq,
+                pages_wrote: pages_wrote != Some(false),
             },
             (false, true) => GatherVerdict::MovedSame,
             (false, false) => GatherVerdict::MovedDiff,
@@ -466,6 +538,7 @@ fn observe<M: crate::runtime::host::HostOps>(
     entry.fold = fold;
     entry.host_seq = host_seq;
     entry.scoped_seq = scoped_seq;
+    entry.pages_epoch = pages_epoch;
     entry.last_seen = witness.binds;
     verdict
 }
@@ -483,44 +556,32 @@ mod tests {
     const PAGE: usize = 4096;
     const GPAS: [u64; 1] = [8 * PAGE as u64];
 
-    /// A one-page window over `runs`, at `gpas`, with no host write since the
-    /// device started.
+    /// A one-page window over `runs`, at `gpas`, judged against a device that has
+    /// written nothing.
     fn one_page<'a>(gpas: &'a [u64], runs: &'a [GuestRun]) -> GatherWindow<'a> {
-        host_wrote_since(gpas, runs, 0)
-    }
-
-    /// A window that saw no host write at either scope.
-    const HOST_QUIET: GatherVerdict = GatherVerdict::CleanSame {
-        global_quiet: true,
-        scoped_quiet: true,
-    };
-
-    /// The same window, presented as of host-write sequence `host_seq`.
-    fn host_wrote_since<'a>(
-        gpas: &'a [u64],
-        runs: &'a [GuestRun],
-        host_seq: u64,
-    ) -> GatherWindow<'a> {
-        at_seqs(gpas, runs, host_seq, host_seq)
-    }
-
-    /// The same, with the two host-write counts set independently — which is how
-    /// a write to some *other* mapping looks.
-    fn at_seqs<'a>(
-        gpas: &'a [u64],
-        runs: &'a [GuestRun],
-        host_seq: u64,
-        scoped_seq: u64,
-    ) -> GatherWindow<'a> {
         GatherWindow {
             gpas,
             runs,
             span: PAGE as u64,
             page_size: PAGE,
-            host_seq,
-            scoped_seq,
+            mapping: None,
         }
     }
+
+    /// Nothing written at any scope since the previous bind.
+    const QUIET: HostWriteCounts = HostWriteCounts {
+        global: 1,
+        scoped: 1,
+        pages_epoch: 1,
+        pages_wrote: Some(false),
+    };
+
+    /// A window that saw no host write at any scope.
+    const HOST_QUIET: GatherVerdict = GatherVerdict::CleanSame {
+        global_quiet: true,
+        scoped_quiet: true,
+        pages_quiet: true,
+    };
 
     fn run_over(buf: &[u8]) -> GuestRun {
         GuestRun {
@@ -570,12 +631,12 @@ mod tests {
         let buf = vec![0xa5u8; PAGE];
         let runs = [run_over(&buf)];
         assert_eq!(
-            observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs)),
+            observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs), QUIET),
             GatherVerdict::Rearmed,
             "first sight has nothing to compare against"
         );
         assert_eq!(
-            observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs)),
+            observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs), QUIET),
             HOST_QUIET
         );
     }
@@ -589,13 +650,13 @@ mod tests {
         let mut buf = vec![0xa5u8; PAGE];
         let runs = [run_over(&buf)];
         assert_eq!(
-            observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs)),
+            observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs), QUIET),
             GatherVerdict::Rearmed
         );
         buf[100] ^= 0xff;
         host.guest_wrote_page(GPAS[0]);
         assert_eq!(
-            observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs)),
+            observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs), QUIET),
             GatherVerdict::MovedDiff
         );
     }
@@ -611,16 +672,17 @@ mod tests {
         let mut buf = vec![0xa5u8; PAGE];
         let runs = [run_over(&buf)];
         assert_eq!(
-            observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs)),
+            observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs), QUIET),
             GatherVerdict::Rearmed
         );
         // No `guest_wrote_page`: the bytes move with the bitmap none the wiser.
         buf[7] ^= 0xff;
         assert_eq!(
-            observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs)),
+            observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs), QUIET),
             GatherVerdict::CleanDiff {
                 host_wrote: false,
-                scoped_wrote: false
+                scoped_wrote: false,
+                pages_wrote: false
             },
             "no host write moved the sequence, so this is a guest store the \
              bitmap did not see"
@@ -642,16 +704,26 @@ mod tests {
         let mut buf = vec![0xa5u8; PAGE];
         let runs = [run_over(&buf)];
         assert_eq!(
-            observe(&mut w, &mut host, KEY, at_seqs(&GPAS, &runs, 1, 1)),
+            observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs), QUIET),
             GatherVerdict::Rearmed
         );
         // The global count moves; this mapping's does not.
         buf[9] ^= 0xff;
         assert_eq!(
-            observe(&mut w, &mut host, KEY, at_seqs(&GPAS, &runs, 2, 1)),
+            observe(
+                &mut w,
+                &mut host,
+                KEY,
+                one_page(&GPAS, &runs),
+                HostWriteCounts {
+                    global: 2,
+                    ..QUIET
+                }
+            ),
             GatherVerdict::CleanDiff {
                 host_wrote: true,
-                scoped_wrote: false
+                scoped_wrote: false,
+                pages_wrote: false
             }
         );
     }
@@ -667,11 +739,11 @@ mod tests {
         let buf = vec![0xa5u8; PAGE];
         let runs = [run_over(&buf)];
         assert_eq!(
-            observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs)),
+            observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs), QUIET),
             GatherVerdict::Rearmed
         );
         assert_eq!(
-            observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs)),
+            observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs), QUIET),
             GatherVerdict::Unarmed { fold_same: true }
         );
     }
@@ -686,16 +758,16 @@ mod tests {
         let runs = [run_over(&buf)];
         let moved = [9 * PAGE as u64];
         assert_eq!(
-            observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs)),
+            observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs), QUIET),
             GatherVerdict::Rearmed
         );
         assert_eq!(
-            observe(&mut w, &mut host, KEY, one_page(&moved, &runs)),
+            observe(&mut w, &mut host, KEY, one_page(&moved, &runs), QUIET),
             GatherVerdict::Rearmed,
             "same key, different pages: nothing to compare"
         );
         assert_eq!(
-            observe(&mut w, &mut host, KEY, one_page(&moved, &runs)),
+            observe(&mut w, &mut host, KEY, one_page(&moved, &runs), QUIET),
             HOST_QUIET
         );
     }

@@ -2389,12 +2389,8 @@ fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
     // Fixed per-texture window: the walk covers exactly the bound span.
     let (gpas, runs) = task_gva_guest_run_window(state, host, task_id, gva, span)?;
     let page = state.page_size() as usize;
-    let host_seq = state.host_guest_write_seq;
-    // A task-GVA window names no mapping, so nothing narrower than the global
-    // count can be assumed quiet for it.
-    let scoped_seq = host_seq;
     crate::runtime::gather_witness::note_gather(
-        &mut state.gather_witness,
+        state,
         host,
         crate::runtime::gather_witness::GatherRail::Linear,
         crate::runtime::gather_witness::GatherKey::TaskGva { task_id, gva },
@@ -2403,8 +2399,9 @@ fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
             runs: &runs,
             span,
             page_size: page,
-            host_seq,
-            scoped_seq,
+            // A task-GVA window names no mapping, so nothing narrower than the
+            // global host-write count can be assumed quiet for it.
+            mapping: None,
         },
     );
     Some((
@@ -2473,10 +2470,8 @@ fn try_type11_sample_zero_copy<M: HostMemory + HostOps>(
     }
     let (gpas, runs) = mapping_window_guest_runs(state, host, mid, base_off, span)?;
     let page = state.page_size() as usize;
-    let host_seq = state.host_guest_write_seq;
-    let scoped_seq = state.host_wrote_mapping_seq(mid);
     crate::runtime::gather_witness::note_gather(
-        &mut state.gather_witness,
+        state,
         host,
         crate::runtime::gather_witness::GatherRail::Type11,
         crate::runtime::gather_witness::GatherKey::Mapping { mid, base_off },
@@ -2485,8 +2480,7 @@ fn try_type11_sample_zero_copy<M: HostMemory + HostOps>(
             runs: &runs,
             span,
             page_size: page,
-            host_seq,
-            scoped_seq,
+            mapping: Some(mid),
         },
     );
     Some(SampledSourceRequest::GuestRuns(
@@ -2563,10 +2557,8 @@ fn try_type5_sample_zero_copy<M: HostMemory + HostOps>(
     }
     let (gpas, runs) = mapping_window_guest_runs(state, host, mid, base_off, span)?;
     let page = state.page_size() as usize;
-    let host_seq = state.host_guest_write_seq;
-    let scoped_seq = state.host_wrote_mapping_seq(mid);
     crate::runtime::gather_witness::note_gather(
-        &mut state.gather_witness,
+        state,
         host,
         crate::runtime::gather_witness::GatherRail::Type5,
         crate::runtime::gather_witness::GatherKey::Mapping { mid, base_off },
@@ -2575,8 +2567,7 @@ fn try_type5_sample_zero_copy<M: HostMemory + HostOps>(
             runs: &runs,
             span,
             page_size: page,
-            host_seq,
-            scoped_seq,
+            mapping: Some(mid),
         },
     );
     Some(SampledSourceRequest::GuestRuns(

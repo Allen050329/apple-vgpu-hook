@@ -32,6 +32,9 @@ pub mod gva_view;
 /// CmdHeapTextureSizeAndAlign wire decode + host requirement query.
 pub mod heap_query;
 pub mod host;
+/// Which guest pages this device has written, and when — the half of the
+/// guest-write witness the hypervisor's dirty bitmap cannot supply.
+pub mod host_writes;
 /// Type-7 ICB (0x36) materialization, host command fills, execute writeback.
 pub mod icb;
 

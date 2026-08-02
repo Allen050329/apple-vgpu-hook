@@ -1791,6 +1791,11 @@ pub struct DeviceState {
     /// moves whenever any surface anywhere is written. See
     /// [`Self::host_wrote_mapping_seq`] for the sum a reader must actually use.
     pub host_wrote_mapping: std::collections::BTreeMap<u32, u64>,
+    /// Which guest pages this device has written, and when. The page-exact form
+    /// of the two counts above, and the one a reader should use: guest pages are
+    /// reachable under more than one mapping id, so a per-mapping count says
+    /// nothing about the pages themselves. See [`crate::runtime::host_writes`].
+    pub host_writes: crate::runtime::host_writes::HostWrites,
     /// Reusable native-row read buffer for the guest-linear memo path.
     pub guest_linear_scratch: Vec<u8>,
     /// Byte-exact revalidated memo for type-5 serialized texture views
@@ -2055,6 +2060,7 @@ impl DeviceState {
             host_guest_write_seq: 0,
             host_unscoped_write_seq: 0,
             host_wrote_mapping: std::collections::BTreeMap::new(),
+            host_writes: crate::runtime::host_writes::HostWrites::default(),
             guest_linear_scratch: Vec::new(),
             type5_view_memo: LruBytesMemo::new(GUEST_LINEAR_MEMO_BYTE_CAP),
             type11_memo: LruBytesMemo::new(GUEST_LINEAR_MEMO_BYTE_CAP),
@@ -3161,6 +3167,15 @@ impl DeviceState {
     pub fn note_host_wrote_guest_ram(&mut self) {
         self.host_guest_write_seq = self.host_guest_write_seq.wrapping_add(1);
         self.host_unscoped_write_seq = self.host_unscoped_write_seq.wrapping_add(1);
+        self.host_writes.note_unknown();
+    }
+
+    /// The same, for a writer that walked the guest page tables and so knows
+    /// exactly which pages it landed in even though it names no mapping.
+    pub fn note_host_wrote_pages(&mut self, pages: Vec<u64>) {
+        self.host_guest_write_seq = self.host_guest_write_seq.wrapping_add(1);
+        self.host_unscoped_write_seq = self.host_unscoped_write_seq.wrapping_add(1);
+        self.host_writes.note_pages(pages);
     }
 
     /// The same, for a writer that knows which mapping's pages it is landing in.
@@ -3172,6 +3187,15 @@ impl DeviceState {
         self.host_guest_write_seq = self.host_guest_write_seq.wrapping_add(1);
         let e = self.host_wrote_mapping.entry(mapping_id).or_default();
         *e = e.wrapping_add(1);
+        // A mapping with no page list cannot have its write ruled out later, so
+        // it is recorded as an unnamed one rather than as an empty page set.
+        match self.mappings.get(&mapping_id) {
+            Some(m) if !m.page_entries.is_empty() => {
+                let generation = m.map_generation;
+                self.host_writes.note_mapping(mapping_id, generation);
+            }
+            _ => self.host_writes.note_unknown(),
+        }
     }
 
     /// How much host writing one mapping has seen, counting the writes that
