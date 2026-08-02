@@ -1010,6 +1010,64 @@ test it. And 98 fps is not 120: even with the largest cost in the device
 removed outright, this workload does not reach goal 6's number, so the
 writeback is necessary but not obviously sufficient.
 
+### 86% of what the writeback writes is already in the page
+
+The ledger says removing bytes from that rail is worth ~1:1. It never asked how
+many of the bytes were needed. `scripts/window-drag-probe` now reports
+`land_redundancy`, which on one write in 64 compares the bytes about to be
+stored against the bytes already at the destination. Settled x86/PCI, Safari
+drag, five landings a second audited over fourteen consecutive seconds:
+
+| granularity | median already identical | range |
+|---|---|---|
+| 256-byte tile | **86.1 %** | 83.9 – 90.0 |
+| 4 KiB guest page | 43.1 % | 35.9 – 49.3 |
+
+The idle desktop reads 2025/2025 pages identical, so the idle case is total.
+
+**Do not confuse this with the damage rect, which is separately measured and
+separately dead.** `note_store_damage_coverage` reads the guest's declared
+`store_damage_texels / store_attach_texels` at **99.34 %** — the Store that ends
+a full-screen composite declares the full screen, and the whole declared rect is
+worth 0.66 %. The guest is not lying: it really does re-composite the whole
+desktop. It just produces, for most of it, the bytes that were already there,
+because the wallpaper under a moving window does not change because the window
+moved. Declared damage and content change are different quantities and only one
+of them is worth anything.
+
+**The gap between the two rows is the finding, not the 86 %.** Against the same
+second (`busy_us=975666`, `gpu_us=300144`, `land_us=209176`):
+
+- A **page-granular CPU skip** declines 43 % of the CPU stores and nothing at
+  all of the GPU copy — the bytes have crossed the bus by the time a CPU compare
+  can run. Worth ~5 % of the worker's second.
+- A **tile-granular GPU compaction** declines 86 % of *both*: ~258 ms of copy,
+  and ~180 ms of scatter that needs no compare because the pass already said
+  which tiles moved. **~45 % of a saturated second**, against the ~73 % the whole
+  writeback costs.
+
+So a coarse measurement would have priced this at a third of its value and
+priced it on the smaller of the two costs. That is the general shape: when a
+skip is being considered the granularity is not an implementation detail, it is
+the size of the prize.
+
+The skip is an **identity, not a heuristic** — not writing a byte that already
+holds the value being written leaves memory in the same state — so it needs no
+rect, no witness and no guess. It also satisfies the requirement the
+counterfactual left behind: pages always hold the frame the landing would have
+put there, so the type-11 resident rung and `gather_witness`'s subtraction of
+this device's own page-exact write record both see exactly what an eager landing
+would have left. That is what `REIMS_VGPU_PROBE_NO_RENDER_WRITEBACK` could not
+say, and why it was a wash.
+
+Two limits on the number. It covers the **mapping-keyed** leg that took the
+fragmented path — `write_split contig=0 frag=272` on that boot, so all of it
+there, but a host with contiguous mappings would take `mapping_write`'s row
+writers instead and the line would go silent rather than wrong. And
+`store_routes` reads `gvaw_fence_flush=432` beside `mapw_fence_flush=288`, so
+the raw task-GVA leg is not small and is not covered; it is also not the leg the
+counterfactual dropped to measure 2.9x.
+
 ### The tier behind it, so it does not have to be re-derived
 
 Run 4 left the worker at `duty` 0.77 with 62 draws a frame at ~97 µs, so the
@@ -1027,10 +1085,21 @@ prep      1.9 us                              prep             1.7 us
 ```
 
 `binds_us` and `draw_phase`'s `stage_us` are the two big ones and are within a
-microsecond of each other. **Neither is divided any further**, and `binds_us`
-in particular covers the whole of `load_buffer_content` for every vertex and
-fragment buffer plus attribute preparation — several distinct costs under one
-column. Dividing it is the "measure before fixing" step for this tier.
+microsecond of each other.
+
+**`binds_us` is now divided, and there is no fourth cost hiding in it.**
+`bind_phase` reads, on a driven drag second of 2546 draws:
+
+```text
+vertex_us 13.32   fragment_us 8.26   attrs_us 0.00   -> 21.6 of binds_us 23.15
+```
+
+93 % accounted, and the attribute walk — one of the three fixes the split was
+built to tell apart — is **zero**. So the whole column is `load_buffer_content`
+over vertex and fragment buffers, and the remaining 1.5 µs is the two shader
+`Arc` clones and the `BTreeSet` the phase also builds. Whatever is done here is
+done inside that one function; nothing else in the phase is worth looking at.
+`draw_phase`'s `stage_us` is still undivided.
 
 The arithmetic that says whether the tier matters: 120 fps is 8.33 ms, run 4
 achieved 10.2 ms, and draws are 6.0 ms of that. So goal 6 needs about **2 ms a

@@ -63,6 +63,59 @@
 //! each row untouched. Reporting one granularity would have answered the wrong
 //! question in either direction, which is why both are here.
 //!
+//! # What it measured, and what that is worth
+//!
+//! Settled x86/PCI guest, `window-drag-probe --seconds 15` moving a 1000x640
+//! Safari window, host GPU at its own clock. Five landings a second audited over
+//! fourteen consecutive seconds:
+//!
+//! ```text
+//! fine  (256 B)   85.1  85.1  86.1  85.7  85.1  87.6  85.5  86.5  90.0  85.3
+//!                 83.9  87.0  89.8  86.3      median 86.1%
+//! page  (4 KiB)   43.6  38.6  45.0  44.3  39.5  39.0  39.9  45.1  45.9  35.9
+//!                 36.2  49.0  49.3  43.1      median 43.1%
+//! ```
+//!
+//! **86% of what this rail writes is already in the page**, and it is stable to
+//! a few points across every second of the drag. The undriven desktop reads
+//! 2025/2025 pages identical, so the idle case is total.
+//!
+//! The gap between the two rows is the whole reason both are reported, and it
+//! decides which rail is worth building. Against the same second's
+//! `drain_duty busy_us=975666`:
+//!
+//! - A **page-granular CPU skip** declines 43% of the stores in `write_split`'s
+//!   `land_us=209176`, and nothing at all of `readback_split`'s
+//!   `gpu_us=300144`, because the bytes have already crossed the bus by then.
+//! - A **tile-granular GPU compaction** declines 86% of *both*: ~258 ms of copy
+//!   and, since the pass also says which tiles moved, ~180 ms of scatter that no
+//!   longer needs a compare to skip. That is ~45% of a saturated worker's
+//!   second, against the ~73% the whole writeback costs.
+//!
+//! So the coarse number would have priced the opportunity at a third of what it
+//! is, and priced it on the smaller of the two costs.
+//!
+//! # What it does not cover
+//!
+//! The audit hangs off [`crate::runtime::mapper`]'s `copy_mapping_runs`, which
+//! is one of the guest-RAM writers [`crate::observe::gate`]'s `MAP_PAGES_SITES`
+//! classifies and **not** all of them. Two are outside it:
+//!
+//! - `mapping_write`'s BGRA row writers take a contig view through
+//!   `contig_for_write` and poke rows into it without reaching the mapper at
+//!   all. `write_split` reports which path a landing took: the boot above reads
+//!   `contig=0 frag=272`, so every landing in it was audited, but a host whose
+//!   mappings are host-contiguous would report `contig=N frag=0` and this line
+//!   would go silent rather than wrong.
+//! - The raw task-GVA rails in `gva_view`. `store_routes` reads
+//!   `gvaw_fence_flush=432` beside `mapw_fence_flush=288`, so that leg is not
+//!   small — but it is also not the leg
+//!   `REIMS_VGPU_PROBE_NO_RENDER_WRITEBACK` dropped to measure 2.9x, which is
+//!   the mapping-keyed one this covers.
+//!
+//! Read a fraction here as "of the mapping-keyed landings that took the run
+//! path", and read `write_split contig`/`frag` beside it before generalising.
+//!
 //! Partial chunks at the ends of a compared range are counted in `bytes` and in
 //! neither chunk total, so a chunk count is always of whole chunks.
 //!
