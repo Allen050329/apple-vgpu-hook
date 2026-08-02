@@ -1058,6 +1058,32 @@ saving to better than a factor. A per-surface split is what would answer it;
 nobody has built one, and it is the right first move for anyone who needs the
 number tighter.
 
+**The redundancy is spread across every landing, not concentrated in a few, and
+that decides which build.** A mean cannot tell *seven wholly-unchanged surfaces
+beside one wholly-changed one* from *eight surfaces each 87 % unchanged*; both
+read 87 %, and only the first is collected by hashing each landing and declining
+it entire — no tile bitmap, no per-target shadow of the previous frame, no
+compaction. `land_redundancy` now buckets each audited landing by its **own**
+`same_fine/fine` and charges its bytes to the bucket. Two 15-second drags on one
+settled x86/PCI guest, 114 audited landings on the mapping leg:
+
+```text
+        landings  whole  over_90  over_50  under_50   whole bytes   same_fine
+drag1      61       10      49       2        0          16.4 %       97.60 %
+drag2      53        2      32      19        0           3.8 %       92.61 %
+```
+
+**Declining whole landings collects 4 – 16 % of the bytes; tile compaction
+collects 93 – 98 %.** A factor of six to twenty-four, so the cheap build is not
+a first step toward the expensive one — it is a different and much smaller
+thing. Do not spend a session on a landing-granular hash-and-skip.
+
+`under_50` reading **zero** across all 114 is the second finding: every landing
+is at least half already-correct and most are over nine tenths, so a tile pass
+collects near-uniformly and there is no worst-case landing to design around.
+Both are shapes, not point estimates — the window mean still moved 97.6 → 92.6
+between two runs minutes apart, while the shape did not.
+
 **Probed twice on that boot, and the second run is higher**: fine 86.2 – 95.6 %
 (median 89.9) over eleven seconds, pages 54.0 – 81.8 % (median 61.1). So the
 first run's 86 % is the conservative reading, and the two rows do not move

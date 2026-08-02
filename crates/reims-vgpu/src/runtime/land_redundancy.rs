@@ -235,6 +235,42 @@
 //! Buckets sum to `audits` less any walk that compared no whole tile, which is
 //! why they are reported beside it rather than instead of it.
 //!
+//! # It is spread, and that refutes the cheap build
+//!
+//! Two 15-second drags on one settled x86/PCI guest, 114 audited landings on
+//! the mapping leg:
+//!
+//! ```text
+//!         landings  whole  over_90  over_50  under_50   whole bytes   same_fine
+//! drag1      61       10      49       2        0          16.4 %       97.60 %
+//! drag2      53        2      32      19        0           3.8 %       92.61 %
+//! ```
+//!
+//! **Almost no landing is wholly redundant, and no landing is under half.**
+//! Declining whole landings — a hash, a four-byte readback, no tile bitmap and
+//! no per-target shadow of the previous frame — would collect **4 – 16 %** of
+//! the bytes. Tile compaction collects **93 – 98 %**. That is a factor of six to
+//! twenty-four between the cheap build and the expensive one, so the cheap one
+//! is not a first step towards the other; it is a different, much smaller thing.
+//!
+//! The `under_50` column reading **zero** across all 114 is the second finding.
+//! Every landing this rail carries is at least half already-correct and most are
+//! over nine tenths, so a tile pass would collect near-uniformly rather than
+//! well on some frames and not at all on others. There is no worst-case landing
+//! to design around.
+//!
+//! Both are shapes of a distribution rather than point estimates: 114 landings
+//! out of ~7800 is a 1.5 % sample, and the window mean still moved 97.6 → 92.6
+//! between two runs minutes apart. The *shape* did not — `whole` is rare and
+//! `under_50` is empty in both.
+//!
+//! The GVA leg's shape is the opposite and does not transfer, because its walk
+//! is a row rather than a landing. It reads `whole` 122-579 against `under_50`
+//! 0-449 and nothing in between, and its rows are ~250 bytes — one fine tile —
+//! so "the walk" and "the tile" are the same unit there and the buckets can only
+//! say matched or not. That leg is ~0.4 % of the writeback's bytes and is not
+//! what any of this is priced on.
+//!
 //! `whole` is at tile granularity, so a walk whose only differing bytes are in a
 //! partial chunk at one end lands in it. A landing-granular rail would have to
 //! compare those bytes too; on the frame-sized, tile-aligned landings this leg
