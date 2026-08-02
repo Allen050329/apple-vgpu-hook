@@ -857,11 +857,37 @@ times a second and holds it for half of every second, but the window thread
 asks for it only 17 times and is blocked on it for **0.04 % of a second**. The
 window is not waiting for the engine.
 
-What that leaves is the loop itself: `about_to_wait` polls every 2 ms
-(`ENGINE_WINDOW_REDRAW_POLL`), so 34 publishes a second cannot be coalesced
-into 17 presents unless the loop is running far slower than it asks to.
-`host_window_loop` counts that directly — ticks, redraws asked, redraws
-delivered, and each draw's disposition — and is the next reading to take.
+**The loop is not it either, and that finishes the presentation path.**
+`host_window_loop` counts the window thread's own ticks, the redraws it asked
+for, the redraws the platform delivered, and each draw's disposition. Driven,
+on the same workload:
+
+```text
+host_window_loop ticks=1014 redraws_asked=498 draws=498 draws_fresh=19 draws_stale=479
+window_publish   fresh=36    host_window_cadence presents=19
+```
+
+The loop wakes ~1000 times a second under load, exactly as it does idle
+(`ticks=998 draws=499 draws_stale=499` with the desktop still), and **every
+redraw it asks for is delivered** — `redraws_asked == draws` to the unit, so
+nothing is coalescing or delaying them. It polls 500 times a second and finds a
+new `Frame::seq` only 17-19 times against 34-36 publishes.
+
+A 500 Hz sampler can only miss half of 34 events if they arrive in pairs closer
+together than 2 ms. So **the publishes are bursty, and the burst is the drain
+worker's tranche shape**: `max_tranche_us` med 87 ms with `slow_tranches` 17 of
+38, one long tranche producing nothing visible and then several short ones
+publishing back to back. Latest-wins collapses each pair, correctly — the first
+of a pair was superseded before any display could have shown it.
+
+So there is no frame to recover here. **Every stage of the presentation path is
+now measured and healthy** — VBL at 120 Hz, backpressure never engaged, publish
+keeping up with the tranche rate, the event loop at 500 Hz with no dropped
+redraws, the engine lock uncontended, `busy_fence` and `busy_acquire` zero.
+Goal 6 is entirely the ~30 ms this device charges the guest per frame, and
+inside that the eight full-screen writebacks (2.26 GB/s, `write_split frag=272
+bytes=2256076800` in one second against 34 published frames) are ~20 ms of it.
+Do not spend another session on cadence.
 
 Two cautions before building on any of it. The stressor moves the window through
 the accessibility API, not a pointer drag: `CGEventPost` is silently discarded
