@@ -761,6 +761,32 @@ the window: every colour measured exactly half, and the regions that *passed*
 passed only because halved `BG` and halved `GREEN` are equidistant from their own
 palette entry and from `BLACK`.
 
+`scripts/wallpaper-probe/` does the same for goal 10, and it gets a stronger
+declaration than either of the others because it **supplies the wallpaper**: 64
+vertical bars in two colours in a fixed aperiodic pattern, decoded out of the
+host capture at three vertical bands. Three bands rather than one because the
+distinction that names the owner is invisible in a screenshot —
+
+| what the bands say | what it means |
+|---|---|
+| same shift in all three | uniform origin offset |
+| shift growing down the screen | row stride mismatch, and the difference gives the error |
+| no shift, bars lost at an edge | clipped, not moved |
+| every bar lost in every band | desktop covered — not a result |
+
+Verified against synthetic frames: a 192 px left slide reads `-6/-6/-6`, and a
+shear from 0 to 240 px reads `-2/-4/-6`. Those two are the same screenshot to the
+eye. **Goal 10 did not reproduce in 6 live trials** driven by its own reported
+trigger (appearance flipped, desktop passed through a system dynamic picture and
+back, guest asked each time which picture it believes is set); every band read
+`shift=0 lost=0`, and the kept frame was read to confirm the barcode really was
+the full-screen wallpaper. Six trials bound nothing about an occasional bug.
+
+Ask the guest for the desktop size with `system_profiler SPDisplaysDataType`, not
+with Finder: `tell application "Finder" to get bounds of window of desktop`
+answers `AppleEvent timed out (-1712)` here, which reads like a wedged guest
+rather than like one unavailable scripting target.
+
 So a probe has to witness two things besides its verdict, and this one now does.
 **That its stressor ran**: the page publishes a beat counter, the host refuses to
 start unless it advances, and one churn child (`CHURN_WITNESS`) is declared and
