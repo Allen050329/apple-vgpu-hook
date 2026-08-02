@@ -855,10 +855,24 @@ pub fn flush_mapping_windows_before_fence<M: HostMemory + HostOps>(
     // is the same finding from the other side and is why submitting at arm time
     // was refuted: there is no interval to hide the wait in.
     //
+    // A narrower version of that idea is *also* refuted, and it is worth naming
+    // separately because it is not obviously the same one. At the moment
+    // `arm_surface_resident_store` runs, the engine's draw batch is still open
+    // and recording, and the render target is already in `TRANSFER_SRC_OPTIMAL`
+    // — so the copy could be appended to the render's OWN command buffer rather
+    // than submitted as a second one, which the "submit a separate CB earlier"
+    // refutation above does not cover. It still does not pay. The second submit
+    // costs ~10 us of the ~1.5 ms `fence_us`; `begin_entry` already flushes the
+    // open batch without waiting on it, so the GPU runs render and copy
+    // back-to-back and one wait covers both. There is no second pipeline drain
+    // to save. Worse, arming is not flushing: an icon workload measured 49 706
+    // arms against 12 343 flushes, so recording the copy at arm time would pay a
+    // full-frame DMA for four windows in five that nothing ever reads.
+    //
     // What is left is volume. These 116 flushes are 116 whole 1920x1080 frames,
     // 962 MB/s, read back for ~62 presented frames; every phase in
-    // `ReadbackPhase` is proportional to it. Reading back less than the whole
-    // attachment is the only lever this census leaves open.
+    // `ReadbackPhase` is proportional to it. Moving fewer bytes, or moving them
+    // without a CPU pass, is the only lever this census leaves open.
     crate::runtime::drain::note_store_route("mapw_fence_pass");
     // Snapshot first: landing one window consumes its overlapping siblings
     // through the fixpoint, so iterating the live map would borrow it across a
