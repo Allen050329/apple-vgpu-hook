@@ -845,6 +845,65 @@ pub fn flush_mapping_windows_before_fence<M: HostMemory + HostOps>(
     }
 }
 
+/// Mark the host surface cache copy of `mapping_id` as taken by a host reader.
+///
+/// Called beside every mapping-keyed read of [`crate::runtime::surface_cache`],
+/// which is the leg [`flush_render_one`] stores through. Unknown mappings are
+/// ignored: a cache entry outlives its mapping, and a read of one says nothing
+/// about a flush there is no longer an entry to attribute it to.
+pub fn note_render_flush_cache_read(state: &mut DeviceState, mapping_id: u32) {
+    if let Some(m) = state.mappings.get_mut(&mapping_id) {
+        m.render_flush.cache_unread = false;
+    }
+}
+
+/// Mark this mapping's guest pages as gathered by a host reader — the other leg
+/// [`flush_render_one`] writes.
+pub fn note_render_flush_pages_read(state: &mut DeviceState, mapping_id: u32) {
+    if let Some(m) = state.mappings.get_mut(&mapping_id) {
+        m.render_flush.pages_unread = false;
+    }
+}
+
+/// Report what read the previous landed flush of this mapping, then arm the
+/// witness for the one landing now.
+///
+/// The pair of counts per leg is what makes the flush's cost answerable:
+/// `render_flush_cache_used` / `render_flush_cache_unread`, and the `pages_`
+/// pair beside them, divide a gigabyte a second of readback into the part
+/// something asked for and the part nothing did. A mapping whose first flush is
+/// landing now is not counted, so an arriving surface is never scored as unread
+/// work.
+pub(crate) fn note_render_flush_landed(
+    state: &mut DeviceState,
+    mapping_id: u32,
+) -> Option<crate::model::RenderFlushWitness> {
+    use crate::runtime::drain::note_store_route;
+    let m = state.mappings.get_mut(&mapping_id)?;
+    let prior = std::mem::replace(
+        &mut m.render_flush,
+        crate::model::RenderFlushWitness {
+            landed: true,
+            cache_unread: true,
+            pages_unread: true,
+        },
+    );
+    if !prior.landed {
+        return None;
+    }
+    note_store_route(if prior.cache_unread {
+        "render_flush_cache_unread"
+    } else {
+        "render_flush_cache_used"
+    });
+    note_store_route(if prior.pages_unread {
+        "render_flush_pages_unread"
+    } else {
+        "render_flush_pages_used"
+    });
+    Some(prior)
+}
+
 /// Metal-direct builds never arm mapping-keyed windows — nothing to land.
 #[cfg(not(feature = "backend-vulkan"))]
 pub fn flush_mapping_windows_before_fence<M: HostMemory + HostOps>(
@@ -1937,6 +1996,9 @@ fn flush_render_one<M: HostMemory + HostOps>(
                 crate::backend::vulkan::engine::stamp_resident_content_epoch(&identity, epoch);
             }
         }
+        // Both copies this flush just made are unread until something reads
+        // them; whatever was left of the previous flush's is scored now.
+        let _ = note_render_flush_landed(state, key.mapping_id);
     }
     crate::runtime::drain::note_drain_phase(
         crate::runtime::drain::DrainPhase::Flush(crate::runtime::drain::FlushRail::Render),
@@ -2243,6 +2305,82 @@ pub(crate) fn owner_slug(owner: &crate::model::DeferredOwner) -> &'static str {
     match owner {
         crate::model::DeferredOwner::Storage { .. } => "compute",
         crate::model::DeferredOwner::Render { .. } => "render",
+    }
+}
+
+#[cfg(test)]
+mod render_flush_witness_tests {
+    use super::{
+        note_render_flush_cache_read, note_render_flush_landed, note_render_flush_pages_read,
+    };
+    use crate::model::{DeviceId, DeviceState, MappingEntry, PAGE_SHIFT_X86, RenderFlushWitness};
+
+    fn state_with_mapping(mid: u32) -> DeviceState {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        state.mappings.insert(
+            mid,
+            MappingEntry {
+                mapped: true,
+                ..Default::default()
+            },
+        );
+        state
+    }
+
+    /// Nothing to score on the first landing: a surface that has only just
+    /// arrived has no previous flush whose copies anything could have read.
+    #[test]
+    fn the_first_landing_of_a_mapping_scores_nothing() {
+        let mut state = state_with_mapping(7);
+        assert_eq!(note_render_flush_landed(&mut state, 7), None);
+        assert_eq!(
+            state.mappings[&7].render_flush,
+            RenderFlushWitness {
+                landed: true,
+                cache_unread: true,
+                pages_unread: true,
+            }
+        );
+    }
+
+    /// The whole point of the witness: a flush neither leg was read from is
+    /// reported as unread, which is what says the readback bought nothing.
+    #[test]
+    fn a_landing_nothing_read_scores_both_legs_unread() {
+        let mut state = state_with_mapping(7);
+        note_render_flush_landed(&mut state, 7);
+        let scored = note_render_flush_landed(&mut state, 7).expect("second landing scores");
+        assert!(scored.cache_unread && scored.pages_unread);
+    }
+
+    /// Each reader clears only the copy it took. A cache hit must not excuse
+    /// the guest-page write, or a flush whose pages nothing reads would be
+    /// scored as consumed and the write leg would look owed when it is not.
+    #[test]
+    fn each_leg_is_cleared_only_by_its_own_reader() {
+        let mut state = state_with_mapping(7);
+        note_render_flush_landed(&mut state, 7);
+        note_render_flush_cache_read(&mut state, 7);
+        let scored = note_render_flush_landed(&mut state, 7).expect("second landing scores");
+        assert!(!scored.cache_unread, "cache read must clear the cache leg");
+        assert!(scored.pages_unread, "cache read must not clear the pages leg");
+
+        note_render_flush_pages_read(&mut state, 7);
+        let scored = note_render_flush_landed(&mut state, 7).expect("third landing scores");
+        assert!(!scored.pages_unread, "pages read must clear the pages leg");
+        assert!(scored.cache_unread, "pages read must not clear the cache leg");
+    }
+
+    /// A read attributed to a mapping the mapper no longer holds is dropped
+    /// rather than resurrecting an entry: the cache outlives its mapping, so a
+    /// late read of a stale entry must not create mapping state.
+    #[test]
+    fn a_read_of_an_unknown_mapping_creates_nothing() {
+        let mut state = state_with_mapping(7);
+        note_render_flush_cache_read(&mut state, 9);
+        note_render_flush_pages_read(&mut state, 9);
+        assert!(!state.mappings.contains_key(&9));
+        assert_eq!(note_render_flush_landed(&mut state, 9), None);
     }
 }
 

@@ -1216,6 +1216,7 @@ fn resolve_sampled_source<M: HostMemory + HostOps>(
                         generation: host_gen,
                     });
                     note_type11_sample_rung("t11rung_host_cache", guest_write);
+                    crate::runtime::storage_flush::note_render_flush_cache_read(state, mid);
                     return Some((
                         w,
                         h,
@@ -1232,6 +1233,7 @@ fn resolve_sampled_source<M: HostMemory + HostOps>(
                 // same pixels — so it stays quiet, like the type-2/3 rail's.
                 if let Some(src) = try_type11_sample_zero_copy(state, host, mid, w, h) {
                     note_type11_sample_rung("t11rung_zero_copy", guest_write);
+                    crate::runtime::storage_flush::note_render_flush_pages_read(state, mid);
                     return Some((w, h, mid, src));
                 }
                 // The memo skips the convert/alloc on unchanged content and
@@ -1239,6 +1241,7 @@ fn resolve_sampled_source<M: HostMemory + HostOps>(
                 // its census (T11Memo hit / T11Guest fill) is emitted internally.
                 if let Some((rgba, identity)) = load_type11_rgba_memoized(state, host, mid) {
                     note_type11_sample_rung("t11rung_guest_memo", guest_write);
+                    crate::runtime::storage_flush::note_render_flush_pages_read(state, mid);
                     return Some((
                         w,
                         h,
@@ -1726,6 +1729,15 @@ fn resolve_type11_load_seed<M: HostMemory + HostOps>(
                 })
         };
     note_type11_load_seed(state, mapping_id, w, h, served.as_ref().map(|s| s.2));
+    match served.as_ref().map(|s| s.2) {
+        Some(Type11SeedRung::Cache) => {
+            crate::runtime::storage_flush::note_render_flush_cache_read(state, mapping_id)
+        }
+        Some(Type11SeedRung::GuestPages) => {
+            crate::runtime::storage_flush::note_render_flush_pages_read(state, mapping_id)
+        }
+        _ => {}
+    }
     served.map(|(bytes, order, _)| (bytes, order))
 }
 

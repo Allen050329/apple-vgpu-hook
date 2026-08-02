@@ -2480,6 +2480,11 @@ fn process_child_packet<H: HostMemory + HostOps>(
                                 );
                             flush_ok &= ok;
                             flushed = flushed.saturating_add(n);
+                            // The declaration itself is the read witness: the
+                            // guest CPU load that follows leaves no trace the
+                            // device can see, so a flush landed for a declared
+                            // read must not be scored as unread.
+                            crate::runtime::storage_flush::note_render_flush_pages_read(state, oid);
                         }
                         let oid = cmd.object_ids.first().copied().unwrap_or(0);
                         // Count into the always-on teardown-churn proxy; the

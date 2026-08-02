@@ -493,6 +493,32 @@ pub struct ResourceValidity {
     pub host_published_seq: u64,
 }
 
+/// Whether anything has read the copies the last landed render flush made.
+///
+/// A render flush lands one frame in two places: the mapping's guest pages and
+/// the host surface cache. It is armed by a Store and landed by the next fence
+/// with no reader having asked for either copy, so "is this flush owed at all"
+/// is a question about consumers, and nothing measured it. Each leg is marked
+/// unread when a flush lands it, and cleared by the first host-side reader of
+/// that leg, so the *next* flush of the same mapping can report whether the
+/// previous one was consumed.
+///
+/// `pages_unread` staying set does not prove nothing read the pages. The guest
+/// CPU can load them with no device operation at all and leaves no trace here.
+/// It proves only that no reader inside the device took them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RenderFlushWitness {
+    /// A render flush has landed this mapping at least once, so the two flags
+    /// below describe a real flush rather than a mapping that never had one.
+    pub landed: bool,
+    /// No host-side reader has taken the host surface cache copy since the
+    /// flush stored it.
+    pub cache_unread: bool,
+    /// No host-side reader has gathered the guest pages since the flush wrote
+    /// them.
+    pub pages_unread: bool,
+}
+
 /// IOSurface mapper registry entry keyed by mapping_id.
 #[derive(Clone, Debug, Default)]
 pub struct MappingEntry {
@@ -531,6 +557,10 @@ pub struct MappingEntry {
     /// skip its CPU seed entirely. Never read to decide *what* to present or
     /// draw — only whether a known-equal upload can be elided.
     pub surface_content_epoch: u32,
+    /// Who has read what the last landed render flush of this mapping wrote.
+    /// See [`RenderFlushWitness`]; reported by
+    /// [`crate::runtime::storage_flush::note_render_flush_landed`].
+    pub render_flush: RenderFlushWitness,
     /// Bumped whenever the guest page list / map lifetime changes (MAP, UNMAP,
     /// ReplacePhysical, MappingInternal reattach, page-table refresh that
     /// changes PFNs). Used as [`TargetIdentity`] generation for resident

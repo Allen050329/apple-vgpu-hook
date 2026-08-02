@@ -18,7 +18,8 @@ pub use state::{
     GVA_EVICTION_WITNESS_KEYS,
     IosfcRegs, LinearDeferredEntry, MapperCapture, MappingEntry,
     PacketFault,
-    PendingWork, PresentBacking, PresentState, RenderWindowSource, ResourceValidity,
+    PendingWork, PresentBacking, PresentState, RenderFlushWitness, RenderWindowSource,
+    ResourceValidity,
     SurfaceWriteKind,
     TaskEntry, Type4Walk,
 };

@@ -255,6 +255,9 @@ pub fn capture_present_frame(
     } else {
         false
     };
+    if from_host_cache {
+        crate::runtime::storage_flush::note_render_flush_cache_read(state, mapping_id);
+    }
     // Resident-direct capture — the ONLY GPU-content capture source.
     //
     // The proxies need the finished frame's BYTES; they do not need those bytes
