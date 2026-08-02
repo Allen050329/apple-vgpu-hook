@@ -320,6 +320,9 @@ measured answer is that **it takes two**, because they cover disjoint writers:
   tried and read 15 stale binds a minute, because guest pages are reachable under
   more than one mapping id, which is what `deferred_alias_pages` exists for.
 
+With both halves in place the rail caches: measured live at **5852 gathers skipped
+against 4167 taken and 75.8 % of its bytes never read**, screen correct.
+
 Getting the second one complete took two passes, and the lesson generalises. A
 hand-picked list of writer call sites missed `gva_view::map_fresh_span_within`,
 whose callers write through a raw alias — the same hole `observe::gate`'s

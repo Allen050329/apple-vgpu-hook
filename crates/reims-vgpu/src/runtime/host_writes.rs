@@ -32,6 +32,11 @@
 //! were not written. Neither half is sufficient alone and the measurements above
 //! are what say so, rather than an argument that they ought to be.
 //!
+//! Built and measured live on a driven x86/PCI boot: **5852 gathers skipped
+//! against 4167 taken, 14.25 GB not read against 4.56 GB read — 75.8 % of the
+//! rail's bytes gone** — with all three unsound cells still zero and a Wikipedia
+//! page rendering correctly under scroll.
+//!
 //! # Shape
 //!
 //! A ring of recent writes rather than a per-page map. A per-page map costs the
