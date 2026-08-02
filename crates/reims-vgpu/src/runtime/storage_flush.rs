@@ -890,6 +890,16 @@ pub fn flush_mapping_windows_before_fence<M: HostMemory + HostOps>(
     // forbids because importing a host pointer over guest RAM gives the host GPU
     // write access to guest memory.
     //
+    // Flushing *fewer times* is closed as well, and by the same witness.
+    // [`crate::model::RenderFlushWitness::landed_us`] buckets how long each
+    // landing survived before the next replaced it, and across two driven
+    // probes `render_flush_age_sub_ms` is **0** against 3079 and 3090 at
+    // `_frame_plus`. Nothing is ever rewritten inside a millisecond, so the 99%
+    // nobody reads is not one surface written repeatedly inside a burst — it is
+    // one full-screen composite per displayed frame, landed once each, at
+    // exactly the rate the guest paints. Superseding windows across fence
+    // boundaries would have nothing to collapse.
+    //
     // What is left is not doing it. Every landing is speculative
     // (`mapw_fence_flush == surface_flush`) and 99% of what it lands is read by
     // nothing (`RenderFlushWitness`), so the writeback survives on exactly one

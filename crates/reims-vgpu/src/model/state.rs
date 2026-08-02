@@ -527,6 +527,34 @@ pub struct RenderFlushWitness {
     /// is work no fence boundary separated and nothing could have observed
     /// between. The two have the same `pages_unread` and completely different
     /// consequences, so the age is what tells them apart.
+    ///
+    /// # Read, and it is the first shape
+    ///
+    /// Two 25 s driven Safari probes on one x86/PCI/Vulkan boot, 121.0 and
+    /// 123.4 fps:
+    ///
+    /// ```text
+    /// render_flush_age_sub_ms         0        0
+    /// render_flush_age_sub_frame     94       92
+    /// render_flush_age_frame_plus  3079     3090
+    /// ```
+    ///
+    /// **No flush is ever replaced inside a millisecond, and 97% survive a
+    /// whole frame.** So the 99% that nothing reads are not redundant writes of
+    /// one surface inside a burst — they are one full-screen composite per
+    /// displayed frame, written back once each, at exactly the rate the guest
+    /// paints. Superseding windows across fence boundaries has nothing to
+    /// collapse, and the rail is at its floor for the rate it is asked to run
+    /// at.
+    ///
+    /// That also reframes the 116 ms drain tranche carrying 19 flushes: those
+    /// are nineteen *frames* of backlog drained at once, not nineteen writes of
+    /// one frame. The worker fell behind and caught up. At `duty` 0.85 it has
+    /// almost no headroom to absorb anything, so a hitch is the flush rail's
+    /// cost showing up as latency rather than a separate defect — and the only
+    /// remaining route to that cost is the one
+    /// [`crate::runtime::storage_flush::flush_mapping_windows_before_fence`]
+    /// names: making the undeclared guest read observable.
     pub landed_us: u64,
 }
 
