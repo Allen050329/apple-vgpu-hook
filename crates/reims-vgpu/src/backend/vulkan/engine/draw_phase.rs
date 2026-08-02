@@ -30,6 +30,7 @@
 //! | `stage_pass` | there | the primary render pass is resolved |
 //! | `acquire` | there | the render target, its framebuffer and any transient depth are held |
 //! | `acquire_sampled` | there | every sampled image the draw binds is held |
+//! | `acquire_readback` | there | this draw's readback buffer is held |
 //! | `descriptors` | there | the descriptor set is written |
 //! | `record` | there | the CB is ended |
 //! | `submit` | there | `queue_submit` returns |
@@ -43,10 +44,11 @@
 //! with bytes; `pipeline` is driver compiles; `descriptors` is pool pressure.
 //! Each has a different fix and one bar cannot choose between them.
 //!
-//! # Why `acquire` is two numbers and not one
+//! # Why `acquire` is three numbers and not one
 //!
-//! `acquire` used to cover both the render target and the sampled images, and
-//! its description here said it "scales with churn" — meaning
+//! `acquire` used to cover the render target, the sampled images and the
+//! draw's readback buffer, and its description here said it "scales with
+//! churn" — meaning
 //! `vkCreateImage`/`vkAllocateMemory`/slab. On a driven x86/Vulkan boot that
 //! description sent a reader after the wrong cost, so the phase was split where
 //! the two populations meet.
@@ -68,10 +70,26 @@
 //! `target_evicts=0` and every `*_misses` counter at 0. `registry_ensure`'s hit
 //! arm is a `HashMap` get and a touch, which cannot be 85 us.
 //!
-//! That leaves the sampled loop, which is the rest of the phase and runs once
-//! per bound texture per draw. Splitting it out is what distinguishes "the
-//! target was expensive to hold" from "the textures were", and the two have
-//! nothing in common but their position — the same argument that split `setup`.
+//! That leaves the rest of the phase, and splitting it is what distinguishes
+//! "the target was expensive to hold" from "the textures were" — the same
+//! argument that split `setup`.
+//!
+//! **The first split's reading settled the target half and nothing else.** On a
+//! driven x86/Vulkan boot, five consecutive one-second windows at ~660 draws
+//! read `acquire_us` 0, 0, 0, 0, 52 against `acquire_sampled_us` 66798, 66579,
+//! 63803, 67030, 64430. So holding the render target, its framebuffer and its
+//! depth costs *nothing* — the churn reading is refuted outright, not merely
+//! doubted — and the entire ~100 us per draw is downstream of it.
+//!
+//! That reading is also what forced the third number. The block after the
+//! sampled loop ends with `acquire_readback`, which holds a `width * height * 4`
+//! buffer — 8.3 MB at 1920x1080 — once per draw that reads back. Leaving it
+//! inside `acquire_sampled` would have charged an 8 MB buffer acquisition to
+//! "sampled textures" and invited exactly the misreading this section exists to
+//! correct, so it gets its own slot. The two are separated by what fixes them:
+//! `acquire_sampled` is per bound texture and is attacked by binding fewer or
+//! caching better, `acquire_readback` is per full-frame buffer and is attacked
+//! by not reading back.
 //!
 //! A draw that returns early — a decline, a batched deferred submit, a
 //! `skip_readback` target — charges its remainder to whichever phase was open,
@@ -109,14 +127,15 @@ pub(crate) enum Phase {
     StagePass = 3,
     Acquire = 4,
     AcquireSampled = 5,
-    Descriptors = 6,
-    Record = 7,
-    Submit = 8,
-    Wait = 9,
-    Readback = 10,
+    AcquireReadback = 6,
+    Descriptors = 7,
+    Record = 8,
+    Submit = 9,
+    Wait = 10,
+    Readback = 11,
 }
 
-const PHASES: usize = 11;
+const PHASES: usize = 12;
 
 static ACC: [AtomicU64; PHASES] = [const { AtomicU64::new(0) }; PHASES];
 static DRAWS: AtomicU64 = AtomicU64::new(0);
@@ -133,6 +152,7 @@ pub struct DrawPhaseWindow {
     pub stage_pass_us: u64,
     pub acquire_us: u64,
     pub acquire_sampled_us: u64,
+    pub acquire_readback_us: u64,
     pub descriptors_us: u64,
     pub record_us: u64,
     pub submit_us: u64,
@@ -154,6 +174,7 @@ pub fn take_window() -> Option<DrawPhaseWindow> {
         stage_pass_us: ACC[Phase::StagePass as usize].swap(0, Ordering::Relaxed),
         acquire_us: ACC[Phase::Acquire as usize].swap(0, Ordering::Relaxed),
         acquire_sampled_us: ACC[Phase::AcquireSampled as usize].swap(0, Ordering::Relaxed),
+        acquire_readback_us: ACC[Phase::AcquireReadback as usize].swap(0, Ordering::Relaxed),
         descriptors_us: ACC[Phase::Descriptors as usize].swap(0, Ordering::Relaxed),
         record_us: ACC[Phase::Record as usize].swap(0, Ordering::Relaxed),
         submit_us: ACC[Phase::Submit as usize].swap(0, Ordering::Relaxed),
@@ -236,14 +257,16 @@ impl Drop for DrawTimer {
         };
         crate::observe::off(format!(
             "draw_stall us={total} prep_us={} pipeline_us={} stage_us={} stage_pass_us={} \
-             acquire_us={} acquire_sampled_us={} descriptors_us={} record_us={} submit_us={} \
-             wait_us={} readback_us={} geom={w}x{h} readback_bytes={} exit={:?}{latched}",
+             acquire_us={} acquire_sampled_us={} acquire_readback_us={} descriptors_us={} \
+             record_us={} submit_us={} wait_us={} readback_us={} geom={w}x{h} \
+             readback_bytes={} exit={:?}{latched}",
             self.us[Phase::Prep as usize],
             self.us[Phase::Pipeline as usize],
             self.us[Phase::Stage as usize],
             self.us[Phase::StagePass as usize],
             self.us[Phase::Acquire as usize],
             self.us[Phase::AcquireSampled as usize],
+            self.us[Phase::AcquireReadback as usize],
             self.us[Phase::Descriptors as usize],
             self.us[Phase::Record as usize],
             self.us[Phase::Submit as usize],
@@ -311,7 +334,7 @@ mod tests {
         }
         let w = take_window().expect("a dropped timer counts a draw");
         assert_eq!(w.draws, 1);
-        // The sleep landed, so the two slots are genuinely being compared.
+        // The sleep landed, so the three slots are genuinely being compared.
         assert!(
             w.acquire_sampled_us >= 2_000,
             "sampled loop lost its own time: {w:?}"
@@ -321,6 +344,12 @@ mod tests {
         assert_eq!(
             w.acquire_us, 0,
             "target acquisition charged time the sampled loop spent: {w:?}"
+        );
+        // Nor may the readback buffer, which is the slot the sampled loop's own
+        // time would land in if the two were re-pooled the other way.
+        assert_eq!(
+            w.acquire_readback_us, 0,
+            "readback acquisition charged time the sampled loop spent: {w:?}"
         );
         // Every later phase stays clean, so the tail did not simply spill.
         assert_eq!(w.descriptors_us, 0);

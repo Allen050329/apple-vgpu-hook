@@ -1508,6 +1508,7 @@ pub(crate) unsafe fn execute_draw_inner(
         }
     }
 
+    phase.enter(super::draw_phase::Phase::AcquireReadback);
     let rb_size = (req.width as u64) * (req.height as u64) * 4;
     let do_readback = !req.skip_readback;
     phase.note_target(req.width, req.height, if do_readback { rb_size } else { 0 });
