@@ -1341,3 +1341,106 @@ fn compute_storage_image_r16float_if_supported() {
         }
     }
 }
+
+/// The engine's own emitted shader, run on a real device against known input.
+///
+/// [`reims_vgpu::backend::vulkan::spirv_emit`] is the first SPIR-V this device
+/// writes rather than translates, and `spirv-val` accepting a module says only
+/// that it is well-formed. This says it computes the right answer: which words
+/// reach the output buffer, which do not, and which tile bits are set — the
+/// three things the render writeback's difference pass will be trusted for.
+///
+/// It also exercises the dialect choice. The module spells storage buffers the
+/// SPIR-V 1.0 way (a `BufferBlock` struct in `Uniform`) while every other
+/// kernel in this file uses `StorageBuffer`, so a driver or an engine-side
+/// validation that only accepted the newer spelling fails here and nowhere
+/// else.
+#[test]
+fn emitted_tile_diff_marks_only_changed_tiles() {
+    use reims_vgpu::backend::vulkan::spirv_emit::{self, tile_diff_binding};
+
+    let _g = engine_test_session();
+    const WORDS_PER_TILE: u32 = 64;
+    const TILES: u32 = 4;
+    let words = WORDS_PER_TILE * TILES;
+
+    // `prev` is what the guest's pages hold; `cur` is the frame just rendered.
+    // One word differs in tile 1 and two in tile 3; tiles 0 and 2 are untouched.
+    let prev: Vec<u32> = (0..words).collect();
+    let mut cur = prev.clone();
+    cur[WORDS_PER_TILE as usize + 7] = 0xA1A1_A1A1;
+    cur[3 * WORDS_PER_TILE as usize] = 0xB2B2_B2B2;
+    cur[3 * WORDS_PER_TILE as usize + 63] = 0xC3C3_C3C3;
+
+    // A sentinel the shader never writes, so "left alone" is distinguishable
+    // from "written with the same value it already had".
+    const UNTOUCHED: u32 = 0xDEAD_BEEF;
+    let le = |v: &[u32]| -> Vec<u8> { v.iter().flat_map(|w| w.to_le_bytes()).collect() };
+
+    let req = ComputeRequest {
+        spirv: spirv_emit::tile_diff(words, WORDS_PER_TILE),
+        entry: "main".into(),
+        grid: [spirv_emit::tile_diff_groups(words), 1, 1],
+        storage_buffers: vec![
+            ComputeBufferResource {
+                binding: tile_diff_binding::CUR,
+                bytes: le(&cur),
+                writable: false,
+            },
+            ComputeBufferResource {
+                binding: tile_diff_binding::PREV,
+                bytes: le(&prev),
+                writable: false,
+            },
+            ComputeBufferResource {
+                binding: tile_diff_binding::OUT,
+                bytes: le(&vec![UNTOUCHED; words as usize]),
+                writable: true,
+            },
+            ComputeBufferResource {
+                binding: tile_diff_binding::BITS,
+                bytes: le(&[0u32]),
+                writable: true,
+            },
+        ],
+        sampled_images: vec![],
+        samplers: vec![],
+        storage_images: vec![],
+    };
+    let Some(out) = engine_or_skip("tile_diff", &req) else {
+        return;
+    };
+
+    let read = |binding: u32| -> Vec<u32> {
+        out.buffers
+            .iter()
+            .find(|b| b.binding == binding)
+            .unwrap_or_else(|| panic!("binding {binding} did not come back"))
+            .bytes
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    };
+
+    let got_out = read(tile_diff_binding::OUT);
+    assert_eq!(got_out.len(), words as usize);
+    for (i, (&got, &want)) in got_out.iter().zip(cur.iter()).enumerate() {
+        let changed = cur[i] != prev[i];
+        if changed {
+            assert_eq!(got, want, "word {i} differed and was not carried across");
+        } else {
+            assert_eq!(got, UNTOUCHED, "word {i} matched and was written anyway");
+        }
+    }
+
+    // Bits are per tile, not per word: tile 3 differed in two words and is one
+    // bit, and the tiles either side of a changed one are not swept in with it.
+    let got_bits = read(tile_diff_binding::BITS);
+    assert_eq!(got_bits.len(), 1);
+    assert_eq!(
+        got_bits[0],
+        (1 << 1) | (1 << 3),
+        "tile bits {:#010x}",
+        got_bits[0]
+    );
+}

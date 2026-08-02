@@ -19,6 +19,7 @@
 
 pub mod caps;
 pub mod engine;
+pub mod spirv_emit;
 pub mod translate;
 
 use crate::backend::Backend;
