@@ -72,7 +72,9 @@
 //!   written.** Slots are recycled through a free pool shared with other rails;
 //!   with tiles declined, a slot holds whichever earlier tenant's bytes were
 //!   there. Only the tiles whose bit is set may be read, and every consumer of
-//!   a readback slot has to agree on that before this ships.
+//!   a readback slot has to agree on that before this ships. The shader holds
+//!   up its end of that at exactly tile granularity — a set tile is stored
+//!   whole, matching words included — which is why the tile is the workgroup.
 //! - **The tile bitmap must not be converted into the scatter's `SkipRanges`.**
 //!   That list is scanned from its start for every row segment, which is fine
 //!   for the handful of guest-written ranges it carries today and quadratic for
@@ -128,8 +130,10 @@ const OP_U_DIV: u16 = 134;
 const OP_SHIFT_RIGHT_LOGICAL: u16 = 194;
 const OP_SHIFT_LEFT_LOGICAL: u16 = 196;
 const OP_BITWISE_AND: u16 = 199;
+const OP_I_EQUAL: u16 = 170;
 const OP_I_NOT_EQUAL: u16 = 171;
 const OP_U_LESS_THAN: u16 = 176;
+const OP_CONTROL_BARRIER: u16 = 224;
 const OP_ATOMIC_OR: u16 = 241;
 const OP_LABEL: u16 = 248;
 const OP_BRANCH: u16 = 249;
@@ -146,6 +150,7 @@ const EXEC_MODE_LOCAL_SIZE: u32 = 17;
 
 const STORAGE_UNIFORM: u32 = 2;
 const STORAGE_INPUT: u32 = 1;
+const STORAGE_WORKGROUP: u32 = 4;
 
 const DECORATION_BUFFER_BLOCK: u32 = 3;
 const DECORATION_ARRAY_STRIDE: u32 = 6;
@@ -155,20 +160,34 @@ const DECORATION_DESCRIPTOR_SET: u32 = 34;
 const DECORATION_OFFSET: u32 = 35;
 
 const BUILT_IN_GLOBAL_INVOCATION_ID: u32 = 28;
+const BUILT_IN_LOCAL_INVOCATION_INDEX: u32 = 29;
 
 const FUNCTION_CONTROL_NONE: u32 = 0;
 const SELECTION_CONTROL_NONE: u32 = 0;
 
 /// `Device` scope: the atomic is visible to every invocation on the device.
 ///
-/// Workgroup scope would not do. Tile bits are packed 32 to a word, so two
-/// invocations in *different* workgroups can target the same word — the tile a
-/// word belongs to is decided by its address, not by its dispatch.
+/// Workgroup scope would not do for the tile bitmap. Bits are packed 32 to a
+/// word, so 32 consecutive tiles — and therefore 32 different workgroups —
+/// target the same word.
 const SCOPE_DEVICE: u32 = 1;
+
+/// `Workgroup` scope, for the shared "did any word in this tile differ" flag
+/// and for the two barriers that make it readable.
+const SCOPE_WORKGROUP: u32 = 2;
 
 /// `None` — relaxed. The result is read only after the queue fence this
 /// dispatch was submitted behind, which orders it against every reader.
 const SEMANTICS_RELAXED: u32 = 0;
+
+/// `AcquireRelease | WorkgroupMemory`, the semantics a barrier over shared
+/// memory needs.
+///
+/// The storage-class bit is not decoration: without `WorkgroupMemory` the
+/// barrier orders execution but not the shared variable's memory, so the flag
+/// one invocation set is not guaranteed visible to the invocation that reads it
+/// on the other side.
+const SEMANTICS_WORKGROUP_ACQ_REL: u32 = 0x8 | 0x100;
 
 /// A SPIR-V id.
 pub type Id = u32;
@@ -408,6 +427,10 @@ impl Builder {
         self.body(OP_U_LESS_THAN, bool_ty, &[a, b])
     }
 
+    pub fn i_equal(&mut self, bool_ty: Id, a: Id, b: Id) -> Id {
+        self.body(OP_I_EQUAL, bool_ty, &[a, b])
+    }
+
     pub fn i_not_equal(&mut self, bool_ty: Id, a: Id, b: Id) -> Id {
         self.body(OP_I_NOT_EQUAL, bool_ty, &[a, b])
     }
@@ -438,6 +461,23 @@ impl Builder {
 
     pub fn atomic_or(&mut self, ty: Id, ptr: Id, scope: Id, semantics: Id, value: Id) -> Id {
         self.body(OP_ATOMIC_OR, ty, &[ptr, scope, semantics, value])
+    }
+
+    /// A barrier over both execution and memory.
+    ///
+    /// Must be reached by every invocation of the workgroup or by none: a
+    /// barrier inside divergent control flow is undefined behaviour, not a
+    /// slow path. Every call below sits at the top level of `main`, between
+    /// two merge blocks, which is what makes that checkable by reading.
+    ///
+    /// The scopes are ids of constants rather than literals — SPIR-V spells
+    /// them as `<id>` because a scope can be a specialisation constant.
+    pub fn control_barrier(&mut self, exec_scope: Id, mem_scope: Id, semantics: Id) {
+        instruction(
+            &mut self.functions,
+            OP_CONTROL_BARRIER,
+            &[exec_scope, mem_scope, semantics],
+        );
     }
 
     /// Declare where a structured selection rejoins. Required before every
@@ -486,13 +526,20 @@ impl Builder {
     }
 }
 
-/// How many invocations one workgroup of [`tile_diff`] runs.
+/// Words per tile, which is also [`tile_diff`]'s workgroup size.
 ///
-/// One invocation per 32-bit word, so a workgroup covers 256 bytes — one
-/// [`crate::runtime::land_redundancy::FINE_TILE`]. That is not a coincidence
-/// worth relying on and the shader does not: it derives the tile from the word
-/// address, so the two can be changed independently.
-pub const TILE_DIFF_LOCAL_SIZE: u32 = 64;
+/// One invocation per 32-bit word and one workgroup per tile, so a workgroup
+/// covers 256 bytes — one [`crate::runtime::land_redundancy::FINE_TILE`], the
+/// granularity the writeback's redundancy was measured at.
+///
+/// The two being equal is load-bearing rather than incidental. The shader
+/// decides a whole tile from a flag its workgroup shares, so the tile *is* the
+/// workgroup; see [`tile_diff`]'s "Why the tile is the workgroup". A caller may
+/// pass a different value, and it must be a legal workgroup size on the device:
+/// Vulkan guarantees `maxComputeWorkGroupInvocations` of at least 128 and
+/// `maxComputeWorkGroupSize[0]` of at least 128, so 64 needs no capability
+/// check and 256 would.
+pub const TILE_DIFF_WORDS_PER_TILE: u32 = 64;
 
 /// Descriptor set 0 bindings [`tile_diff`] expects, in order.
 pub mod tile_diff_binding {
@@ -500,7 +547,7 @@ pub mod tile_diff_binding {
     pub const CUR: u32 = 0;
     /// The frame the guest's pages already hold. Read only.
     pub const PREV: u32 = 1;
-    /// Host-visible, and written only where `cur` and `prev` differ.
+    /// Host-visible, and written only for the tiles whose bit is set.
     pub const OUT: u32 = 2;
     /// One bit per tile, set when any word in that tile differed.
     pub const BITS: u32 = 3;
@@ -509,27 +556,60 @@ pub mod tile_diff_binding {
 /// Emit the render writeback's difference pass.
 ///
 /// ```text
+/// shared uint any_differed;                    // one per workgroup, one per tile
+///
 /// uint w = gl_GlobalInvocationID.y * words_per_row + gl_GlobalInvocationID.x;
-/// if (w < words) {
-///     uint c = cur[w];
-///     if (c != prev[w]) {
-///         out[w] = c;
+/// if (gl_LocalInvocationIndex == 0) { any_differed = 0; }
+/// barrier();
+/// if (w < words && cur[w] != prev[w]) { atomicOr(any_differed, 1u); }
+/// barrier();
+/// if (any_differed != 0 && w < words) {
+///     out[w] = cur[w];
+///     if (gl_LocalInvocationIndex == 0) {
 ///         uint tile = w / words_per_tile;
 ///         atomicOr(bits[tile >> 5], 1u << (tile & 31));
 ///     }
 /// }
 /// ```
 ///
+/// # Why the tile is the workgroup
+///
+/// The bit and the bytes have to agree, and the consumer reads at tile
+/// granularity: it copies a tile out of `out` when the tile's bit is set. So
+/// every word of a set tile must have been written, including the words that
+/// matched. Deciding per word and *storing* per word does not deliver that —
+/// it leaves the matching words of a changed tile holding whatever the recycled
+/// readback slot held, and the scatter lands that at the guest. Making the
+/// workgroup the tile is what closes it: the comparison is still one invocation
+/// per word, the *decision* is shared across the workgroup, and the store is
+/// then all-or-nothing over exactly the region the bit describes.
+///
+/// The two barriers are the price. They are cheap here — a workgroup is one or
+/// two hardware subgroups on every part this runs on — and they buy a store
+/// pattern that is 64 contiguous words per participating workgroup rather than
+/// a scatter of single words, which is the shape a write-combining path across
+/// the bus wants anyway.
+///
+/// Both barriers sit at the top level of `main`, between merge blocks, so every
+/// invocation reaches both. A barrier under `if (w < words)` would be reached
+/// by only part of the last workgroup, which is undefined behaviour.
+///
 /// # Why one invocation per word rather than per tile
 ///
-/// A tile is 64 words. One invocation per tile would have each invocation walk
-/// 64 consecutive words, so neighbouring invocations would read addresses 256
-/// bytes apart and every load would be its own memory transaction. One
-/// invocation per word has neighbouring invocations read neighbouring words,
-/// which is the access pattern the hardware coalesces. The cost is that the
-/// tile's bit is set by whichever of its words differed — possibly several,
-/// possibly none — and `OpAtomicOr` is idempotent, so a duplicate is free and a
-/// race is not possible. Roughly 8% of words differ, so the atomics are sparse.
+/// One invocation per tile would have each invocation walk 64 consecutive
+/// words, so neighbouring invocations would read addresses 256 bytes apart and
+/// every load would be its own memory transaction. One invocation per word has
+/// neighbouring invocations read neighbouring words, which is the access
+/// pattern the hardware coalesces.
+///
+/// # Why the bit is set by one invocation
+///
+/// `OpAtomicOr` is idempotent, so all 64 could set it and the answer would be
+/// the same. Restricting it to local index 0 turns 64 device-scope atomics on
+/// one cache line into one. That invocation is also the one whose word is
+/// lowest in the tile, so `w / words_per_tile` reads the tile the workgroup
+/// covers exactly — and if it is out of range then so is the whole workgroup,
+/// which cannot then have set the shared flag.
 ///
 /// # Why `words` is baked in rather than pushed
 ///
@@ -542,7 +622,7 @@ pub mod tile_diff_binding {
 /// # Why the grid is two-dimensional
 ///
 /// One invocation per word at 1920x1080 is 2 073 600 invocations, which at
-/// [`TILE_DIFF_LOCAL_SIZE`] is 32 400 workgroups — under Vulkan's guaranteed
+/// [`TILE_DIFF_WORDS_PER_TILE`] is 32 400 workgroups — under Vulkan's guaranteed
 /// `maxComputeWorkGroupCount[0]` of 65 535. At 3840x2160 it is **129 600**, over
 /// it, and a device that offers only the guaranteed minimum would reject the
 /// dispatch. So the word index is `y * words_per_row + x` and
@@ -554,17 +634,27 @@ pub mod tile_diff_binding {
 /// structured loop with a phi in a hand-rolled emitter, against one multiply
 /// and one add here.
 ///
-/// `out` is *not* written where the words match. The destination buffer
-/// therefore holds a sparse frame — the bytes of whichever landing last wrote
-/// each region — and only the tiles whose bit is set may be read from it. That
-/// is the whole point: the words that are not written are the bytes that never
-/// cross the bus.
+/// `out` is *not* written for tiles whose words all match. The destination
+/// buffer therefore holds a sparse frame — elsewhere, the bytes of whichever
+/// landing last wrote that region — and only the tiles whose bit is set may be
+/// read from it. That is the whole point: the tiles that are not written are
+/// the bytes that never cross the bus.
+///
+/// # Panics
 ///
 /// `words_per_row` must be the one [`tile_diff_grid`] returns for the same
-/// `words`, or the invocations address the wrong words. The two are separate
-/// arguments rather than one call because the module is cached on its words and
-/// the grid is not.
+/// `words` and `words_per_tile`, or the invocations address the wrong words.
+/// The two are separate arguments rather than one call because the module is
+/// cached on its words and the grid is not, so the one relation that makes the
+/// folded index land on a tile boundary — `words_per_row` a whole number of
+/// tiles — is asserted here rather than assumed.
 pub fn tile_diff(words: u32, words_per_tile: u32, words_per_row: u32) -> Vec<u32> {
+    assert!(words_per_tile > 0, "a tile of no words");
+    assert!(
+        words_per_row.is_multiple_of(words_per_tile),
+        "words_per_row {words_per_row} is not a whole number of {words_per_tile}-word tiles, \
+         so a workgroup on the second grid axis would straddle two tiles",
+    );
     let mut b = Builder::new();
     b.capability(CAPABILITY_SHADER);
     b.memory_model(ADDRESSING_LOGICAL, MEMORY_MODEL_GLSL450);
@@ -583,12 +673,29 @@ pub fn tile_diff(words: u32, words_per_tile: u32, words_per_row: u32) -> Vec<u32
     let c_five = b.constant_u32(uint, 5);
     let c_31 = b.constant_u32(uint, 31);
     let c_scope = b.constant_u32(uint, SCOPE_DEVICE);
+    let c_wg_scope = b.constant_u32(uint, SCOPE_WORKGROUP);
     let c_semantics = b.constant_u32(uint, SEMANTICS_RELAXED);
+    let c_wg_semantics = b.constant_u32(uint, SEMANTICS_WORKGROUP_ACQ_REL);
 
     let ptr_in_v3uint = b.type_pointer(STORAGE_INPUT, v3uint);
     let gid = b.global_variable(ptr_in_v3uint, STORAGE_INPUT);
     b.name(gid, "gl_GlobalInvocationID");
     b.decorate(gid, DECORATION_BUILT_IN, &[BUILT_IN_GLOBAL_INVOCATION_ID]);
+
+    // The local index rather than `gl_GlobalInvocationID.x % words_per_tile`:
+    // the modulo is only equal to it because the row width is a whole number of
+    // tiles, and asking the builtin does not depend on that holding.
+    let ptr_in_uint = b.type_pointer(STORAGE_INPUT, uint);
+    let lii = b.global_variable(ptr_in_uint, STORAGE_INPUT);
+    b.name(lii, "gl_LocalInvocationIndex");
+    b.decorate(lii, DECORATION_BUILT_IN, &[BUILT_IN_LOCAL_INVOCATION_INDEX]);
+
+    // The workgroup's shared verdict for its tile. SPIR-V 1.0 has no
+    // initializer for a `Workgroup` variable — that needs 1.3 — so it is zeroed
+    // by one invocation behind a barrier instead.
+    let ptr_wg_uint = b.type_pointer(STORAGE_WORKGROUP, uint);
+    let any_differed = b.global_variable(ptr_wg_uint, STORAGE_WORKGROUP);
+    b.name(any_differed, "any_differed");
 
     // One struct type shared by all four buffers: `struct { uint data[]; }`.
     // SPIR-V allows one aggregate type to back several variables, and the
@@ -624,55 +731,106 @@ pub fn tile_diff(words: u32, words_per_tile: u32, words_per_row: u32) -> Vec<u32
 
     let main = b.function(void, fn_void);
     b.name(main, "main");
-    b.entry_point(EXEC_MODEL_GLCOMPUTE, main, "main", &[gid]);
-    b.execution_mode(
-        main,
-        EXEC_MODE_LOCAL_SIZE,
-        &[TILE_DIFF_LOCAL_SIZE, 1, 1],
-    );
+    b.entry_point(EXEC_MODEL_GLCOMPUTE, main, "main", &[gid, lii]);
+    b.execution_mode(main, EXEC_MODE_LOCAL_SIZE, &[words_per_tile, 1, 1]);
 
     // Labels are allocated up front because a branch names its target before
     // the target's `OpLabel` is emitted.
     let entry = b.id();
-    let in_range = b.id();
-    let differs = b.id();
-    let merge_inner = b.id();
-    let merge_outer = b.id();
+    let l_init = b.id();
+    let m_init = b.id();
+    let l_compare = b.id();
+    let l_differs = b.id();
+    let m_differs = b.id();
+    let m_compare = b.id();
+    let l_tile_changed = b.id();
+    let l_store = b.id();
+    let l_set_bit = b.id();
+    let m_set_bit = b.id();
+    let m_store = b.id();
+    let m_tile_changed = b.id();
 
+    // Everything the later blocks branch on is computed here, in the one block
+    // that dominates all of them.
     b.label(entry);
     let gid_v = b.load(v3uint, gid);
     let gid_x = b.composite_extract(uint, gid_v, 0);
     let gid_y = b.composite_extract(uint, gid_v, 1);
     let row_base = b.i_mul(uint, gid_y, c_wpr);
     let w = b.i_add(uint, row_base, gid_x);
-    let lt = b.u_less_than(bool_ty, w, c_words);
-    b.selection_merge(merge_outer);
-    b.branch_conditional(lt, in_range, merge_outer);
+    let in_range = b.u_less_than(bool_ty, w, c_words);
+    let local = b.load(uint, lii);
+    let is_first = b.i_equal(bool_ty, local, c_zero);
+    b.selection_merge(m_init);
+    b.branch_conditional(is_first, l_init, m_init);
 
-    b.label(in_range);
+    b.label(l_init);
+    b.store(any_differed, c_zero);
+    b.branch(m_init);
+
+    // Barrier one: the zero is visible before anyone can OR into it.
+    b.label(m_init);
+    b.control_barrier(c_wg_scope, c_wg_scope, c_wg_semantics);
+    b.selection_merge(m_compare);
+    b.branch_conditional(in_range, l_compare, m_compare);
+
+    b.label(l_compare);
     let p_cur = b.access_chain(ptr_uint, cur, &[c_zero, w]);
     let cur_w = b.load(uint, p_cur);
     let p_prev = b.access_chain(ptr_uint, prev, &[c_zero, w]);
     let prev_w = b.load(uint, p_prev);
     let ne = b.i_not_equal(bool_ty, cur_w, prev_w);
-    b.selection_merge(merge_inner);
-    b.branch_conditional(ne, differs, merge_inner);
+    b.selection_merge(m_differs);
+    b.branch_conditional(ne, l_differs, m_differs);
 
-    b.label(differs);
+    b.label(l_differs);
+    let _ = b.atomic_or(uint, any_differed, c_wg_scope, c_semantics, c_one);
+    b.branch(m_differs);
+
+    b.label(m_differs);
+    b.branch(m_compare);
+
+    // Barrier two: every OR has happened before the flag is read.
+    b.label(m_compare);
+    b.control_barrier(c_wg_scope, c_wg_scope, c_wg_semantics);
+    let verdict = b.load(uint, any_differed);
+    let tile_changed = b.i_not_equal(bool_ty, verdict, c_zero);
+    b.selection_merge(m_tile_changed);
+    b.branch_conditional(tile_changed, l_tile_changed, m_tile_changed);
+
+    // The tile is being carried, so every word of it is stored — including the
+    // ones that matched. A consumer reading a set tile out of `out` gets the
+    // whole tile, which is what makes the bitmap usable at tile granularity.
+    b.label(l_tile_changed);
+    b.selection_merge(m_store);
+    b.branch_conditional(in_range, l_store, m_store);
+
+    b.label(l_store);
+    // Reloaded rather than reused from `l_compare`: that block does not
+    // dominate this one, so its result is not in scope here.
+    let p_cur_again = b.access_chain(ptr_uint, cur, &[c_zero, w]);
+    let carried = b.load(uint, p_cur_again);
     let p_out = b.access_chain(ptr_uint, out, &[c_zero, w]);
-    b.store(p_out, cur_w);
+    b.store(p_out, carried);
+    b.selection_merge(m_set_bit);
+    b.branch_conditional(is_first, l_set_bit, m_set_bit);
+
+    b.label(l_set_bit);
     let tile = b.u_div(uint, w, c_wpt);
     let bit_word = b.shift_right_logical(uint, tile, c_five);
     let bit_index = b.bitwise_and(uint, tile, c_31);
     let mask = b.shift_left_logical(uint, c_one, bit_index);
     let p_bit = b.access_chain(ptr_uint, bits, &[c_zero, bit_word]);
     let _ = b.atomic_or(uint, p_bit, c_scope, c_semantics, mask);
-    b.branch(merge_inner);
+    b.branch(m_set_bit);
 
-    b.label(merge_inner);
-    b.branch(merge_outer);
+    b.label(m_set_bit);
+    b.branch(m_store);
 
-    b.label(merge_outer);
+    b.label(m_store);
+    b.branch(m_tile_changed);
+
+    b.label(m_tile_changed);
     b.ret();
     b.function_end();
 
@@ -689,28 +847,34 @@ pub const MIN_GUARANTEED_WORKGROUPS_PER_AXIS: u32 = 65_535;
 /// The dispatch for `words` words, and the row width the module must be emitted
 /// with.
 ///
-/// Returns `([x, y, z], words_per_row)`. Pass `words_per_row` to [`tile_diff`];
-/// the two disagree silently if they come from different `words`, which is why
-/// this returns both rather than leaving the caller to derive one.
+/// Returns `([x, y, z], words_per_row)`. Pass `words_per_tile` and
+/// `words_per_row` to [`tile_diff`]; the three disagree silently if they come
+/// from different `words`, which is why this returns the row width rather than
+/// leaving the caller to derive one.
+///
+/// One workgroup per tile, because [`tile_diff`] decides a whole tile from a
+/// flag its workgroup shares. `words_per_row` is therefore always a whole
+/// number of tiles, which is what [`tile_diff`] asserts.
 ///
 /// `max_groups_x` is the device's `maxComputeWorkGroupCount[0]`. It is an
 /// argument rather than a constant because gating on a capability is not the
 /// same as assuming the floor: a device that reports 2^31 should get a flat
 /// one-row dispatch, and one that reports exactly the floor must still work.
 ///
-/// The last row is partial whenever `words` is not a multiple of
-/// `words_per_row`; the shader's own `w < words` guard is what stops those
+/// The last workgroup is partial whenever `words` is not a multiple of
+/// `words_per_tile`; the shader's own `w < words` guard is what stops those
 /// invocations, and it is tested against a bound that is not a whole workgroup.
-pub fn tile_diff_grid(words: u32, max_groups_x: u32) -> ([u32; 3], u32) {
-    let groups = words.div_ceil(TILE_DIFF_LOCAL_SIZE).max(1);
+pub fn tile_diff_grid(words: u32, words_per_tile: u32, max_groups_x: u32) -> ([u32; 3], u32) {
+    assert!(words_per_tile > 0, "a tile of no words");
+    let groups = words.div_ceil(words_per_tile).max(1);
     let cap = max_groups_x.max(1);
     if groups <= cap {
         // One row: `words_per_row` is the whole dispatch, so `y` is always 0
         // and the index reduces to `x`.
-        return ([groups, 1, 1], groups * TILE_DIFF_LOCAL_SIZE);
+        return ([groups, 1, 1], groups * words_per_tile);
     }
     let groups_y = groups.div_ceil(cap);
-    ([cap, groups_y, 1], cap * TILE_DIFF_LOCAL_SIZE)
+    ([cap, groups_y, 1], cap * words_per_tile)
 }
 
 #[cfg(test)]
@@ -725,7 +889,8 @@ mod tests {
     /// Emit for `words` with the row width the default grid would use, so no
     /// test can pair a module with a `words_per_row` no dispatch would produce.
     fn tile_diff_for(words: u32, words_per_tile: u32) -> Vec<u32> {
-        let (_, per_row) = tile_diff_grid(words, MIN_GUARANTEED_WORKGROUPS_PER_AXIS);
+        let (_, per_row) =
+            tile_diff_grid(words, words_per_tile, MIN_GUARANTEED_WORKGROUPS_PER_AXIS);
         tile_diff(words, words_per_tile, per_row)
     }
 
@@ -828,22 +993,23 @@ mod tests {
     fn a_grid_too_wide_for_one_axis_folds_onto_the_second() {
         const CAP: u32 = MIN_GUARANTEED_WORKGROUPS_PER_AXIS;
         let hd = 1920 * 1080;
-        assert_eq!(tile_diff_grid(hd, CAP), ([32_400, 1, 1], 32_400 * 64));
+        const WPT: u32 = TILE_DIFF_WORDS_PER_TILE;
+        assert_eq!(tile_diff_grid(hd, WPT, CAP), ([32_400, 1, 1], 32_400 * 64));
 
         let uhd = 3840 * 2160;
-        let ([x, y, z], per_row) = tile_diff_grid(uhd, CAP);
+        let ([x, y, z], per_row) = tile_diff_grid(uhd, WPT, CAP);
         assert_eq!((x, z), (CAP, 1));
-        assert_eq!(per_row, CAP * TILE_DIFF_LOCAL_SIZE);
+        assert_eq!(per_row, CAP * WPT);
         assert!(x <= CAP && y <= CAP, "still over the limit: {x}x{y}");
         // Every word is covered, and the overshoot is under one row.
-        let covered = (x as u64) * (y as u64) * u64::from(TILE_DIFF_LOCAL_SIZE);
+        let covered = (x as u64) * (y as u64) * u64::from(WPT);
         assert!(covered >= u64::from(uhd), "{covered} < {uhd}");
         assert!(covered - u64::from(uhd) < u64::from(per_row), "more than one wasted row");
 
         // A device that reports more than it must gets the flat dispatch.
-        assert_eq!(tile_diff_grid(uhd, 1 << 20).0[1], 1);
+        assert_eq!(tile_diff_grid(uhd, WPT, 1 << 20).0[1], 1);
         // And one word still dispatches something.
-        assert_eq!(tile_diff_grid(1, CAP).0, [1, 1, 1]);
+        assert_eq!(tile_diff_grid(1, WPT, CAP).0, [1, 1, 1]);
     }
 
     /// The word bound reaches the module as a constant, so a caller that emits
@@ -882,6 +1048,74 @@ mod tests {
         // that does not dedup has two of each.
         assert!(values.contains(&SCOPE_DEVICE));
         assert!(values.contains(&SEMANTICS_RELAXED));
+    }
+
+    /// The workgroup is the tile, which is the whole reason a tile can be
+    /// carried whole. A local size that drifted from `words_per_tile` would
+    /// leave the shared verdict covering a fraction of the tile it stores, and
+    /// the module would still validate.
+    #[test]
+    fn the_workgroup_is_one_tile() {
+        for wpt in [1u32, 4, 64, 128] {
+            let m = tile_diff_for(4096, wpt);
+            let sizes: Vec<Vec<u32>> = instructions(&m)
+                .into_iter()
+                .filter(|(op, ops)| {
+                    *op == OP_EXECUTION_MODE && ops.get(1) == Some(&EXEC_MODE_LOCAL_SIZE)
+                })
+                .map(|(_, ops)| ops[2..].to_vec())
+                .collect();
+            assert_eq!(sizes, vec![vec![wpt, 1, 1]], "local size for wpt={wpt}");
+        }
+    }
+
+    /// Both barriers are in blocks every invocation reaches.
+    ///
+    /// A barrier under a condition only part of the workgroup satisfies is
+    /// undefined behaviour rather than a slow path, and the last workgroup of
+    /// a partial dispatch is exactly where that would bite: `w < words` is
+    /// false for some of its invocations and true for others. Every barrier
+    /// here must therefore sit in a *merge* block — the one place a structured
+    /// selection guarantees all paths have rejoined.
+    ///
+    /// Checked structurally rather than by reading, because moving a barrier
+    /// one block earlier still validates and still passes on hardware that
+    /// happens to run the workgroup in lockstep.
+    #[test]
+    fn every_barrier_is_in_a_merge_block() {
+        let m = tile_diff_for(4096, 64);
+        let ins = instructions(&m);
+        let merges: std::collections::BTreeSet<u32> = ins
+            .iter()
+            .filter(|(op, _)| *op == OP_SELECTION_MERGE)
+            .map(|(_, ops)| ops[0])
+            .collect();
+        let mut block = None;
+        let mut barriers = 0;
+        for (op, ops) in &ins {
+            match *op {
+                OP_LABEL => block = Some(ops[0]),
+                OP_CONTROL_BARRIER => {
+                    barriers += 1;
+                    let b = block.expect("a barrier outside any block");
+                    assert!(merges.contains(&b), "barrier in non-merge block %{b}");
+                    assert_eq!(ops[0], ops[1], "execution and memory scope differ");
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(barriers, 2, "the zeroing barrier and the verdict barrier");
+    }
+
+    /// A row width that is not a whole number of tiles is refused rather than
+    /// emitted. Folding onto the second axis adds `words_per_row` to the index,
+    /// so a row width that is not tile-aligned puts a workgroup astride two
+    /// tiles: its invocations would share one verdict across both, and the bit
+    /// its first invocation sets would name only one of them.
+    #[test]
+    #[should_panic(expected = "not a whole number of")]
+    fn a_row_width_that_is_not_whole_tiles_is_refused() {
+        tile_diff(4096, 64, 100);
     }
 
     /// A string literal is NUL-terminated and NUL-padded to a whole word, which

@@ -1355,8 +1355,16 @@ fn compute_storage_image_r16float_if_supported() {
 /// kernel in this file uses `StorageBuffer`, so a driver or an engine-side
 /// validation that only accepted the newer spelling fails here and nowhere
 /// else.
+///
+/// The output is asserted at **tile** granularity, which is the contract the
+/// consumer needs and not the one a word-by-word reading of the shader
+/// suggests. A changed tile is carried whole — including the words inside it
+/// that matched — because the scatter copies a whole tile when it sees the
+/// bit. A shader that stored only the differing words would pass a per-word
+/// assertion and hand the guest a tile with the readback slot's previous
+/// tenant in the gaps.
 #[test]
-fn emitted_tile_diff_marks_only_changed_tiles() {
+fn emitted_tile_diff_carries_changed_tiles_whole() {
     use reims_vgpu::backend::vulkan::spirv_emit::{self, tile_diff_binding};
 
     let _g = engine_test_session();
@@ -1366,8 +1374,11 @@ fn emitted_tile_diff_marks_only_changed_tiles() {
 
     // `prev` is what the guest's pages hold; `cur` is the frame just rendered.
     // One word differs in tile 1 and two in tile 3; tiles 0 and 2 are untouched.
-    let (grid, per_row) =
-        spirv_emit::tile_diff_grid(words, spirv_emit::MIN_GUARANTEED_WORKGROUPS_PER_AXIS);
+    let (grid, per_row) = spirv_emit::tile_diff_grid(
+        words,
+        WORDS_PER_TILE,
+        spirv_emit::MIN_GUARANTEED_WORKGROUPS_PER_AXIS,
+    );
     assert_eq!(grid, [4, 1, 1], "this case is meant to be a flat dispatch");
     let prev: Vec<u32> = (0..words).collect();
     let mut cur = prev.clone();
@@ -1428,11 +1439,17 @@ fn emitted_tile_diff_marks_only_changed_tiles() {
     let got_out = read(tile_diff_binding::OUT);
     assert_eq!(got_out.len(), words as usize);
     for (i, (&got, &want)) in got_out.iter().zip(cur.iter()).enumerate() {
-        let changed = cur[i] != prev[i];
-        if changed {
-            assert_eq!(got, want, "word {i} differed and was not carried across");
+        let tile = i / WORDS_PER_TILE as usize;
+        let tile_changed = (tile * WORDS_PER_TILE as usize..)
+            .take(WORDS_PER_TILE as usize)
+            .any(|j| cur[j] != prev[j]);
+        if tile_changed {
+            // Every word of the tile, not only the ones that differ: word 64
+            // matches `prev` and must still be carried, because it shares a
+            // tile with word 71 which does not.
+            assert_eq!(got, want, "word {i} is in a changed tile and was not carried");
         } else {
-            assert_eq!(got, UNTOUCHED, "word {i} matched and was written anyway");
+            assert_eq!(got, UNTOUCHED, "word {i}'s tile matched and was written anyway");
         }
     }
 
@@ -1474,7 +1491,7 @@ fn emitted_tile_diff_indexes_a_folded_grid_and_stops_at_its_bound() {
     // through the second grid axis rather than the first: the partial bound and
     // the folded grid are the two guards, and they are tested together because
     // an index computed as `y * per_row + x` is where they interact.
-    let (grid, per_row) = spirv_emit::tile_diff_grid(words, 2);
+    let (grid, per_row) = spirv_emit::tile_diff_grid(words, WORDS_PER_TILE, 2);
     assert_eq!((grid, per_row), ([2, 2, 1], 128));
 
     let prev: Vec<u32> = (0..words).map(|i| i * 7).collect();
@@ -1529,10 +1546,14 @@ fn emitted_tile_diff_indexes_a_folded_grid_and_stops_at_its_bound() {
     };
     let got_out = read(tile_diff_binding::OUT);
     assert_eq!(got_out.len(), words as usize);
-    assert_eq!(got_out[(words - 1) as usize], 0xFEED_FACE);
+    // The partial third tile is carried whole, and "whole" stops at `words`
+    // rather than running to the end of the workgroup: the last tile is five
+    // words, not sixty-four, and the guard is the only thing that says so.
+    let last_tile = (2 * WORDS_PER_TILE) as usize;
+    assert_eq!(&got_out[last_tile..], &cur[last_tile..], "the partial tile");
     assert!(
-        got_out[..(words - 1) as usize].iter().all(|&w| w == UNTOUCHED),
-        "a matching word was written",
+        got_out[..last_tile].iter().all(|&w| w == UNTOUCHED),
+        "a tile whose words all matched was written",
     );
     // The change is in the partial third tile, which is tile index 2.
     assert_eq!(read(tile_diff_binding::BITS), vec![1 << 2]);
