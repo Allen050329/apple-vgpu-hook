@@ -14,16 +14,20 @@
 # whether a wrong pixel is this device's fault.
 #
 # Usage:
-#   scripts/web-content-probe/web-content-probe.sh [-n CAPTURES] [--browser safari|chrome|firefox] [--keep DIR]
+#   scripts/web-content-probe/web-content-probe.sh [-n CAPTURES]
+#     [--browser safari|chrome|firefox] [--churn 0|1] [--keep DIR]
 #
 # Exits 0 when every declared region measured its declared colour in every
-# capture, 1 on any mismatch, 2 on a setup failure.
+# capture, 1 on any mismatch, 2 on a setup failure — which includes the page's
+# repaint beat not advancing, because a static page reports clean and means
+# nothing.
 set -euo pipefail
 # ImageMagick prints statistics with a '.', and awk must read them the same way.
 export LC_ALL=C
 
 CAPTURES=20
 BROWSER=safari
+CHURN=1
 KEEP=""
 GUEST="${GUEST:-macos-vm}"
 PORT="${PROBE_PORT:-8997}"
@@ -36,8 +40,9 @@ while [ $# -gt 0 ]; do
   case "$1" in
     -n|--captures) CAPTURES="$2"; shift 2 ;;
     --browser) BROWSER="$2"; shift 2 ;;
+    --churn) CHURN="$2"; shift 2 ;;
     --keep) KEEP="$2"; shift 2 ;;
-    -h|--help) sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'; exit 0 ;;
+    -h|--help) sed -n '2,24p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'; exit 0 ;;
     *) echo "web-content-probe: unknown argument $1" >&2; exit 2 ;;
   esac
 done
@@ -48,6 +53,11 @@ case "$BROWSER" in
   firefox) APP="Firefox" ;;
   *) echo "web-content-probe: unknown browser $BROWSER" >&2; exit 2 ;;
 esac
+case "$CHURN" in
+  0|1) ;;
+  *) echo "web-content-probe: --churn takes 0 or 1" >&2; exit 2 ;;
+esac
+URL="http://127.0.0.1:$PORT/?churn=$CHURN"
 
 WORK="${KEEP:-$(mktemp -d)}"
 mkdir -p "$WORK"
@@ -64,7 +74,7 @@ sleep 2
 nohup python3 /tmp/probe_server.py $PORT /tmp/content-probe.html /tmp/content-probe.json \
   >/tmp/content-probe-server.log 2>&1 &
 sleep 2
-open -a '$APP' 'http://127.0.0.1:$PORT/'
+open -a '$APP' '$URL'
 sleep 6
 # Fullscreen so the viewport is the display and the page's screen-space
 # rectangles need no chrome model. Done after load: entering fullscreen fires a
@@ -99,11 +109,16 @@ if last is None:
     sys.exit("no layout record")
 with open(sys.argv[2], "w") as f:
     f.write(f"SCREEN {last['screen']['w']} {last['screen']['h']}\n")
+    # The page's beat counter, carried so the host can tell a stalled page from
+    # a dropped frame. Absent from records written by an older copy of the page.
+    f.write(f"BEAT {last.get('beat', -1)}\n")
     for r in last["regions"]:
         e = r["expect"]
         f.write(f"R {r['name']} {r['x']} {r['y']} {r['w']} {r['h']} {e[0]} {e[1]} {e[2]}\n")
 PY
 }
+
+beat_now() { awk '/^BEAT /{print $2; exit}' "$WORK/regions.txt"; }
 
 refresh_layout || {
   say "the page never declared a layout — see /tmp/content-probe-server.log in the guest" >&2
@@ -113,9 +128,48 @@ refresh_layout || {
 read -r _ SCR_W SCR_H < <(grep -m1 '^SCREEN ' "$WORK/regions.txt")
 say "guest screen ${SCR_W}x${SCR_H}, $(grep -c '^R ' "$WORK/regions.txt") declared regions"
 
+# The page repaints on a beat, and everything this probe is looking for happens
+# because of that repaint. A run whose beat never ran is a run of a static page,
+# and it reports itself clean — that is exactly what the first churning run did:
+# six captures, zero mismatches, and retained frames with no churn and no beat
+# counter in them.
+#
+# So establish that the beat is advancing before believing any verdict, and call
+# a stalled page a setup failure rather than a result. `CHURN_WITNESS` fails the
+# same way a dropped patch does, and without this gate a wedged page would be
+# indistinguishable from this device losing a layer.
+b0=$(beat_now); sleep 3; refresh_layout || true; b1=$(beat_now)
+if [ "$b0" = "-1" ]; then
+  say "the page did not report a beat — guest is running an older content-probe.html" >&2
+  ssh -o BatchMode=yes "$GUEST" "pkill -f probe_server.py; pkill -f '$APP'" >/dev/null 2>&1 || true
+  exit 2
+fi
+if [ "$b1" -le "$b0" ]; then
+  say "the page's beat is stalled at $b0 after 3s — nothing is repainting, so no verdict is meaningful" >&2
+  ssh -o BatchMode=yes "$GUEST" "pkill -f probe_server.py; pkill -f '$APP'" >/dev/null 2>&1 || true
+  exit 2
+fi
+if [ "$CHURN" = 1 ] && ! grep -q '^R CHURN_WITNESS ' "$WORK/regions.txt"; then
+  say "churn is on but the page declared no CHURN_WITNESS — the churn container never built" >&2
+  ssh -o BatchMode=yes "$GUEST" "pkill -f probe_server.py; pkill -f '$APP'" >/dev/null 2>&1 || true
+  exit 2
+fi
+say "beat advancing ($b0 -> $b1), churn=$CHURN"
+
 fails=0
+stalls=0
+prev_beat=$b1
 for i in $(seq 1 "$CAPTURES"); do
   refresh_layout || { say "capture $i: no fresh layout" >&2; continue; }
+  # A capture taken while the page is not repainting says nothing about this
+  # device, so it is neither a pass nor a failure.
+  this_beat=$(beat_now)
+  if [ "$this_beat" -le "$prev_beat" ]; then
+    stalls=$((stalls + 1)); prev_beat=$this_beat
+    say "capture $i: page beat stalled at $this_beat, not counted"
+    sleep 1; continue
+  fi
+  prev_beat=$this_beat
   png="$WORK/cap-$i.png"
   "$SHOT" -o "$png" >/dev/null 2>&1 || { say "capture $i failed" >&2; continue; }
   IMG_W=$(identify -format '%w' "$png")
@@ -133,7 +187,8 @@ sx, sy = int(iw) / int(sw), int(ih) / int(sh)
 PALETTE = {
     "BG": (0x20, 0x20, 0x80), "RED": (0xe0, 0x10, 0x10), "GREEN": (0x10, 0xc0, 0x30),
     "YELLOW": (0xf0, 0xe0, 0x10), "MAGENTA": (0xd0, 0x10, 0xd0), "CYAN": (0x10, 0xd0, 0xe0),
-    "ORANGE": (0xf0, 0x80, 0x10), "WHITE": (0xff, 0xff, 0xff), "BLACK": (0x00, 0x00, 0x00),
+    "ORANGE": (0xf0, 0x80, 0x10), "VIOLET": (0x70, 0x10, 0xe0),
+    "WHITE": (0xff, 0xff, 0xff), "BLACK": (0x00, 0x00, 0x00),
 }
 specs = []
 for line in open(regions_path):
@@ -175,6 +230,14 @@ PY
 done
 
 ssh -o BatchMode=yes "$GUEST" "pkill -f probe_server.py; pkill -f '$APP'" >/dev/null 2>&1 || true
-say "$CAPTURES captures, $fails with a region that did not measure its declared colour"
+say "$CAPTURES captures ($stalls not counted, page not repainting), \
+$fails with a region that did not measure its declared colour"
+# More stalled than counted means the run measured mostly a frozen page. Report
+# that as a setup failure: a clean verdict from it would be the same lie the
+# beat gate exists to stop.
+if [ "$stalls" -gt $((CAPTURES / 2)) ]; then
+  say "over half the captures were taken on a frozen page — no verdict" >&2
+  exit 2
+fi
 [ "$fails" -eq 0 ] || exit 1
 exit 0

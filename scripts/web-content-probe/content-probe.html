@@ -50,6 +50,10 @@
     pointer-events: none; contain: strict;
   }
   .patch, #status { z-index: 5; }
+  /* Above the other churn children so a randomly placed one cannot cover it,
+     but still inside the churn container's stacking context and so still
+     below the patches. */
+  #witness { z-index: 1; }
   #status {
     position: absolute; left: 0; bottom: 0; font: 12px monospace;
     color: #fff; background: #000; padding: 2px 6px; z-index: 10;
@@ -68,6 +72,10 @@ const PALETTE = {
   MAGENTA: [0xd0, 0x10, 0xd0],
   CYAN:    [0x10, 0xd0, 0xe0],
   ORANGE:  [0xf0, 0x80, 0x10],
+  // The churn witness. Separated from every other entry by at least as much as
+  // the closest existing pair (YELLOW/ORANGE), so it costs the classifier
+  // nothing to carry.
+  VIOLET:  [0x70, 0x10, 0xe0],
   WHITE:   [0xff, 0xff, 0xff],
   BLACK:   [0x00, 0x00, 0x00],
 };
@@ -83,7 +91,6 @@ function build() {
   // stops one second in and every later capture measures a static page while
   // the run reports itself as churning.
   document.body.innerHTML = '<div id="status"></div>';
-  buildChurn();
   const W = window.innerWidth, H = window.innerHeight;
   // Patches occupy the middle band, leaving generous margins of background on
   // every side. Those margins are what the background regions measure, and they
@@ -91,6 +98,10 @@ function build() {
   const padX = Math.floor(W * 0.10), padY = Math.floor(H * 0.18);
   const cw = Math.floor((W - 2 * padX) / COLS), ch = Math.floor((H - 2 * padY) / ROWS);
   const gap = Math.floor(Math.min(cw, ch) * 0.12);
+  // Published before the churn container is built, because the witness inside
+  // it is positioned from this geometry.
+  grid = { padX, padY, cw, ch, gap };
+  buildChurn();
   regions.length = 0;
   for (let r = 0; r < ROWS; r++) {
     for (let c = 0; c < COLS; c++) {
@@ -146,6 +157,13 @@ function build() {
     out.push({ name, expect: PALETTE.BG,
                x: Math.round(ox + x), y: Math.round(oy + y), w, h });
   }
+  const wit = document.getElementById('witness');
+  if (wit) {
+    const r = wit.getBoundingClientRect();
+    out.push({ name: 'CHURN_WITNESS', expect: PALETTE.VIOLET,
+               x: Math.round(ox + r.left), y: Math.round(oy + r.top),
+               w: Math.round(r.width), h: Math.round(r.height) });
+  }
   return out;
 }
 
@@ -174,11 +192,57 @@ const beatMs = Number(params.get('beat') || 250);
 // hits the temporal dead zone and the page dies before it declares anything.
 const churn = params.get('churn') !== '0';
 let churnBox = null;
+let grid = null;
 function buildChurn() {
   if (!churn) return;
   churnBox = document.createElement('div');
   churnBox.id = 'churn';
   document.body.insertBefore(churnBox, document.body.firstChild);
+  placeWitness();
+}
+
+// The churn's own witness, and the reason it exists is a run that reported
+// itself clean while the stressor produced nothing at all.
+//
+// The first churning run passed six captures with zero mismatches, and the
+// retained frames showed no churn children and no beat counter — the whole beat
+// timer's output was missing, so the run was six captures of a static page
+// wearing a churning run's label. Nothing in the verdict could say so, because
+// the churn is deliberately not among the checked regions: it moves, and a
+// moving region measured at a fixed rectangle is a false positive generator.
+//
+// So one churn child is made stationary and declared. It is created and
+// destroyed with the rest of them every beat, so it is a real churn child and
+// not a bystander; it sits at the crossing of the grid's centre gaps, where no
+// patch can occlude it; and its `top` compensates for the container's scroll so
+// its screen rectangle is the one `declare()` published. If the beat stops, the
+// witness stops being drawn and the checked region reads BG instead of VIOLET.
+//
+// A missing witness is therefore reported by the same channel as a missing
+// patch — which is why the host has to establish that the beat is *running*
+// before it believes any verdict. A wedged page and a dropped frame look
+// identical here, and only one of them is this device's fault.
+function placeWitness() {
+  if (!churnBox || !grid) return;
+  const { padX, padY, cw, ch, gap } = grid;
+  // The gap between column 0 and column 1 spans 2*gap horizontally; likewise
+  // between row 0 and row 1 vertically. Their crossing is patch-free by
+  // construction, whatever the viewport is.
+  const inset = 6, side = Math.max(8, 2 * gap - 2 * inset);
+  const vx = padX + cw - gap + inset, vy = padY + ch - gap + inset;
+  const box = churnBox.getBoundingClientRect();
+  const w = document.createElement('div');
+  w.id = 'witness';
+  w.style.position = 'absolute';
+  // Offsets are relative to the container's padding box, and its scroll
+  // position is added back so the witness holds still while the churn behind it
+  // scrolls.
+  w.style.left = (vx - box.left) + 'px';
+  w.style.top = (vy - box.top + churnBox.scrollTop) + 'px';
+  w.style.width = side + 'px';
+  w.style.height = side + 'px';
+  w.style.background = hex(PALETTE.VIOLET);
+  churnBox.appendChild(w);
 }
 
 // Republished on a timer rather than only at load and on resize. The host reads
@@ -186,17 +250,25 @@ function buildChurn() {
 // resized or fullscreened is described by the record the host is about to use
 // — and a declaration refused mid-transition is simply replaced a second later
 // instead of stranding the run on stale rectangles.
+//
+// `beat` rides along because a stalled page and a dropped frame are
+// indistinguishable in the pixels. The host gates on this advancing before it
+// treats any mismatch as the device's fault.
 function declare() {
   const regions = build();
   if (!regions) return;
   post({ kind: 'layout', t: Date.now(), screen: { w: screen.width, h: screen.height },
          dpr: window.devicePixelRatio, viewport: [window.innerWidth, window.innerHeight],
-         regions });
+         churn, beat: n, regions });
 }
+
+// Declared before `declare()` runs: `declare` reads it, and a `let` below the
+// call would put the first invocation in the temporal dead zone and kill the
+// page before it publishes anything.
+let n = 0;
 declare();
 setInterval(declare, 1000);
 
-let n = 0;
 setInterval(() => {
   n++;
   const s = document.getElementById('status');
@@ -211,7 +283,14 @@ setInterval(() => {
   // candidate and every removal destroys one. `will-change: transform` on half
   // of them forces actual promotion rather than leaving it to a heuristic.
   churnBox.textContent = '';
-  const W = window.innerWidth, H = window.innerHeight;
+  // Spread across the container's own box, not the viewport's. `contain: strict`
+  // clips this container to a band inset 10%/18%, so viewport-sized coordinates
+  // put a fifth of the children outside it horizontally and most of them outside
+  // it vertically — clipped children are not composited, and churn a compositor
+  // culls is not stress. Twice the box height vertically so the scroll below has
+  // somewhere to travel.
+  const box = churnBox.getBoundingClientRect();
+  const W = Math.max(1, Math.round(box.width)), H = Math.max(1, Math.round(box.height));
   for (let i = 0; i < 24; i++) {
     const d = document.createElement('div');
     d.style.position = 'absolute';
@@ -226,6 +305,8 @@ setInterval(() => {
   }
   // Scroll the churn container, which the fixed patches must be immune to.
   churnBox.scrollTop = (n * 53) % Math.max(1, H);
+  // After the scroll, so the witness can compensate for where it settled.
+  placeWitness();
 }, beatMs);
 </script>
 </body>

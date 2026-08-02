@@ -24,7 +24,8 @@ this device's fault.
 ## Usage
 
 ```sh
-scripts/web-content-probe/web-content-probe.sh [-n CAPTURES] [--browser safari|chrome|firefox] [--keep DIR]
+scripts/web-content-probe/web-content-probe.sh [-n CAPTURES] \
+  [--browser safari|chrome|firefox] [--churn 0|1] [--keep DIR]
 ```
 
 Needs a running guest reachable as `macos-vm` and a host QEMU window the KDE
@@ -32,6 +33,23 @@ screenshot script can capture. Exit `0` when every declared region measured its
 declared colour in every capture, `1` on any mismatch, `2` on setup failure.
 `--keep DIR` retains every frame and the layout records — do that whenever you
 expect a failure, because the frame is the evidence.
+
+## Churn, and why it witnesses itself
+
+A static page is not the reported bug. "The background disappears" is reported
+during real browsing — scrolling, layer promotion and demotion, elements
+arriving and leaving — so `--churn 1` (the default) rebuilds a subtree of 24
+rotated, half-promoted, scrolling children *behind* the declared patches every
+beat. The patches are `position: fixed` and must be immune to all of it, so any
+mismatch is a loss the churn caused rather than content that moved.
+
+The churn itself is not checked region-by-region: it moves, and a moving region
+measured at a fixed rectangle manufactures failures. But **one** churn child is:
+`CHURN_WITNESS`, a `VIOLET` square placed at the crossing of the grid's centre
+gaps, where no patch can occlude it, with its `top` compensating for the
+container's scroll so its screen rectangle is the one the page published. It is
+created and destroyed with the other 24 every beat, so it is a real churn child
+rather than a bystander.
 
 ## How the verdict is reached
 
@@ -44,6 +62,33 @@ answerable without naming a distance that counts as close.
 
 Each rectangle is inset by a sixth before measuring, so a one-pixel rounding
 error in the 720p downscale cannot pull a neighbouring colour into the mean.
+
+## The second mistake, which is the opposite of the first
+
+The first churning run passed: six captures, zero mismatches. The retained
+frames show **no churn children and no beat counter** — the whole output of the
+repaint timer was missing, so it was six captures of a static page wearing a
+churning run's label, and the verdict could not say so. The same page renders
+churn correctly in a host browser, so this is about what the run could observe,
+not about the page.
+
+Where the first mistake was *the oracle disagreeing with a correct frame*, this
+one is *the oracle agreeing with a frame that proves nothing*. A clean result
+from a stressor that never ran is worth less than a failure, because it gets
+recorded as evidence.
+
+Two things now stop it, and they have to be in this order:
+
+1. The page publishes its beat counter with every layout record, and the host
+   **refuses to run** unless it advances (exit `2`, "the page's beat is
+   stalled"). A capture whose beat did not move since the last one is not
+   counted either way.
+2. `CHURN_WITNESS` above, so a churn that is running but not reaching the screen
+   fails the ordinary verdict.
+
+The gate has to come first because the witness cannot tell those two apart on
+its own: a wedged page and a device that lost a layer both leave `VIOLET`
+missing, and only one of them is this device's fault.
 
 ## The mistake this probe made first, kept because it will recur
 
