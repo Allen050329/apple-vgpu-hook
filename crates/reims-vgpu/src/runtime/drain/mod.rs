@@ -3940,6 +3940,32 @@ impl VcpuLockCensus {
 /// it re-read is the un-refuted half of the budget experiment — that one
 /// returned early and left `child_mask` set with nothing to re-arm it, and froze
 /// a boot for 29 s; adding to the mask and continuing has no such gap.
+///
+/// # The residual is one other register, and it is *not* the same case
+///
+/// With `0x1020` served lock-free, two driven boots read 25 and 30 deferred
+/// writes across their entire runs, against 348 in four windows before. All but
+/// one are `0x1008` (`GFX_REG_FIFO_WRITTEN`), at roughly one a window with ages
+/// of 3-28 ms; the odd one is `0x1220` once at boot.
+///
+/// `0x1008` looks like the obvious next application of the same trick, and
+/// superficially it is even tidier: `fifo_read` is already an `Arc<AtomicU32>`
+/// read lock-free in the other direction, so the producer counter would just be
+/// its mirror. It is not tidier, and the difference is not about the register.
+///
+/// A doorbell only names work. `fifo_written` **bounds a loop**:
+/// `drain_main_fifo` runs until `fifo_read` catches it, and today that comparand
+/// cannot move mid-tranche because the guest's write needs the device lock. Make
+/// it live and the loop follows a producer free to keep writing, so a guest
+/// submitting steadily holds the device lock indefinitely — a hang, traded for a
+/// delay that is now about one write per ten seconds. The refill above is
+/// bounded precisely because it has the same hazard; a live comparand has
+/// nowhere to put a bound without snapshotting, and a snapshot is what the
+/// current code already is.
+///
+/// So the remaining 1 % is left where it is, deliberately. If it is ever worth
+/// taking, the shape is a snapshot re-taken at a bounded number of points, not a
+/// live read.
 #[derive(Default)]
 pub(crate) struct DoorbellCensus {
     queued: std::sync::atomic::AtomicU64,
