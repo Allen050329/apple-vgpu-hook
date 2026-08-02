@@ -980,6 +980,13 @@ pub fn note_render_flush_pages_read(state: &mut DeviceState, mapping_id: u32) {
 /// something asked for and the part nothing did. A mapping whose first flush is
 /// landing now is not counted, so an arriving surface is never scored as unread
 /// work.
+///
+/// Only where the rail exists. A Metal-direct build never arms a mapping-keyed
+/// window — `flush_mapping_windows_before_fence` is a no-op there — so there is
+/// no landing to score, and the two readers above stay unconditional only
+/// because clearing a flag that was never set costs nothing and keeps the
+/// scanout and sampled rungs free of a cfg.
+#[cfg(feature = "backend-vulkan")]
 pub(crate) fn note_render_flush_landed(
     state: &mut DeviceState,
     mapping_id: u32,
@@ -2424,7 +2431,7 @@ pub(crate) fn owner_slug(owner: &crate::model::DeferredOwner) -> &'static str {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "backend-vulkan"))]
 mod render_flush_witness_tests {
     use super::{
         note_render_flush_cache_read, note_render_flush_landed, note_render_flush_pages_read,
