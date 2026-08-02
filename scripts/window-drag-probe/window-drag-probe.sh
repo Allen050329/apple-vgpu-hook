@@ -221,8 +221,12 @@ def show(label, vals, unit=""):
 
 cad = rows("host_window_cadence", ["present_hz", "offered_hz", "window_ms"])
 duty = rows("drain_duty", ["duty", "draw_us", "draws", "flush_us", "flushes",
-                           "max_tranche_us"])
+                           "max_tranche_us", "tranches"])
 rb = rows("readback_split", ["fence_us", "fence"])
+pub = rows("window_publish", ["fresh", "same_key"])
+lock = rows("engine_lock", ["window", "window_blocked", "window_wait_us",
+                            "window_wait_max_us", "worker_hold_us",
+                            "worker_hold_max_us"])
 
 print("host_window_cadence — frames this device put out")
 show("present_hz", [r["present_hz"] for r in cad], " Hz")
@@ -234,6 +238,24 @@ show("draw_us/draw", [r["draw_us"] / r["draws"] for r in duty if r["draws"]], " 
 show("flush_us/flush", [r["flush_us"] / r["flushes"] for r in duty if r["flushes"]], " us")
 print("readback_split — the device's GPU cost")
 show("fence_us/fence", [r["fence_us"] / r["fence"] for r in rb if r["fence"]], " us")
+
+# The delivery chain between the composite and the screen, which the three
+# families above do not cover. `publish_window_frame` runs once per drain
+# tranche, so `fresh + same_key` must equal `tranches` — a pair that does not is
+# the first thing to explain. `fresh` is then what this device offered the
+# window, and `present_hz` what reached the screen; `engine_lock` says whether
+# the difference is the window thread blocked on the mutex the worker holds.
+print("window_publish — frames offered, sampled once per drain tranche")
+show("fresh", [r["fresh"] for r in pub], "/s")
+show("fresh+same_key", [r["fresh"] + r["same_key"] for r in pub])
+show("tranches", [r["tranches"] for r in duty])
+print("engine_lock — the window thread against the worker's hold")
+show("window acquires", [r["window"] for r in lock])
+show("window blocked", [r["window_blocked"] for r in lock])
+show("window wait_us", [r["window_wait_us"] for r in lock], " us")
+show("window wait_max_us", [r["window_wait_max_us"] for r in lock], " us")
+show("worker hold_us", [r["worker_hold_us"] for r in lock], " us")
+show("worker hold_max_us", [r["worker_hold_max_us"] for r in lock], " us")
 
 # The pacing claim goal 6 is about, stated as the counters see it rather than as
 # a mean. A "stable 120" that spends a second at 60 is not stable, and a median
