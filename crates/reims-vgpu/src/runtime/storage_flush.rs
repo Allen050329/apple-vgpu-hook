@@ -906,6 +906,31 @@ pub fn flush_mapping_windows_before_fence<M: HostMemory + HostOps>(
     // case: a guest CPU read that was never declared. Making *that* observable
     // is the remaining route, and it is a hypervisor-side change rather than a
     // device-side one.
+    //
+    // # One device-side step is still available, and it is not on that list
+    //
+    // The four closed levers are all about the readback. The *number of CPU
+    // passes over the result* is a separate cost and a reducible one. A flush
+    // makes two: `readback_split map_us` copies the mapped staging buffer into
+    // a `Vec<u8>`, then `write_split land_us` scatters that Vec into guest
+    // pages — about 0.82 ms and 1.06 ms per 8 MB frame, together ~250 ms of a
+    // loaded second, as large as the fence.
+    //
+    // The first pass exists only so the host surface cache can hold an
+    // `Arc<Vec<u8>>`, and `render_flush_cache_used` says 0.4% of those entries
+    // are ever read. Scattering straight out of the mapped readback buffer
+    // would delete it. What that needs is a borrow that outlives the engine
+    // lock: the mapped pointer stays valid until `vkUnmapMemory`, so only the
+    // pool's recycling of the slot has to be held off, not the lock — a
+    // checked-out flag on the readback slot and a guard that returns it. Do
+    // *not* simply hold the engine lock across the scatter; the host window's
+    // present path takes it, and adding a millisecond per flush at this rate
+    // would move the stall onto the window instead of removing it.
+    //
+    // The cache entry must then be **invalidated**, not left behind. A reader
+    // that hits a stale entry is served an old frame with no witness saying so,
+    // which is the goal-8 shape. Falling through to the guest pages this flush
+    // just wrote is correct by construction.
     crate::runtime::drain::note_store_route("mapw_fence_pass");
     // Snapshot first: landing one window consumes its overlapping siblings
     // through the fixpoint, so iterating the live map would borrow it across a
