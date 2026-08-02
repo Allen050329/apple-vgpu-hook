@@ -117,12 +117,20 @@ struct Entry {
     gen: u64,
     /// Content fold over the window at the previous bind.
     fold: u128,
+    /// [`crate::model::DeviceState::host_guest_write_seq`] at the previous bind,
+    /// so a content change can be attributed to this device's own writes rather
+    /// than to a guest store the bitmap missed.
+    host_seq: u64,
+    /// Bind ordinal of the last sight of this window, for LRU eviction.
+    last_seen: u64,
 }
 
 /// Per-device witness state: one entry per sampled window seen.
 #[derive(Default, Debug)]
 pub struct GatherWitness {
     entries: BTreeMap<GatherKey, Entry>,
+    /// Monotonic bind ordinal, stamped into [`Entry::last_seen`].
+    binds: u64,
 }
 
 /// Upper bound on tracked windows.
@@ -134,9 +142,11 @@ pub struct GatherWitness {
 /// distinct sampled keys, so this sits just above the observed working set rather
 /// than wherever memory would run out.
 ///
-/// On overflow the whole map is dropped rather than an LRU victim chosen: this is
-/// a measurement, and the cost of restarting it is a handful of `gw_rearm` counts.
-const MAX_TRACKED_WINDOWS: usize = 128;
+/// The first driven boot hit the cap twice during a hard scroll, so the working
+/// set does reach it. Overflow evicts the least recently bound window rather than
+/// dropping the map: a full drop costs a `gw_rearm` for every live window at once,
+/// which is precisely the population whose answers are wanted.
+const MAX_TRACKED_WINDOWS: usize = 256;
 
 impl GatherWitness {
     /// Release every tracking token this witness armed.
@@ -150,6 +160,23 @@ impl GatherWitness {
             }
         }
         self.entries.clear();
+    }
+
+    /// Drop the least recently bound window, releasing its token.
+    fn evict_oldest<M: crate::runtime::host::HostOps>(&mut self, host: &mut M) {
+        let Some(victim) = self
+            .entries
+            .iter()
+            .min_by_key(|(_, entry)| entry.last_seen)
+            .map(|(key, _)| *key)
+        else {
+            return;
+        };
+        if let Some(entry) = self.entries.remove(&victim) {
+            if entry.token != 0 {
+                host.untrack_guest_writes(entry.token);
+            }
+        }
     }
 }
 
@@ -207,6 +234,8 @@ pub struct GatherWindow<'a> {
     pub span: u64,
     /// Guest page size the `gpas` are expressed in.
     pub page_size: usize,
+    /// [`crate::model::DeviceState::host_guest_write_seq`] as of this bind.
+    pub host_seq: u64,
 }
 
 /// What one bind of a window observed, crossing the hypervisor's answer with the
@@ -228,7 +257,14 @@ pub enum GatherVerdict {
     CleanSame,
     /// Generation still, bytes moved. The witness is unsound for this window:
     /// something wrote these pages without the bitmap seeing it.
-    CleanDiff,
+    ///
+    /// `host_wrote` says whether this device wrote pixel bytes into guest RAM
+    /// anywhere since the previous bind — the one writer the bitmap is defined
+    /// not to see. True points at a host rail that a cache would have to
+    /// invalidate on; false leaves only a guest store landing inside a single
+    /// harvest interval, which is the granularity of the mechanism rather than a
+    /// missing writer.
+    CleanDiff { host_wrote: bool },
     /// Generation moved, bytes still — a skip the witness gives up, not an error.
     MovedSame,
     /// Generation moved, bytes moved — a re-gather that had to happen.
@@ -244,7 +280,7 @@ impl GatherVerdict {
             Self::Rearmed => None,
             Self::Unarmed { fold_same } => Some(fold_same),
             Self::CleanSame | Self::MovedSame => Some(true),
-            Self::CleanDiff | Self::MovedDiff => Some(false),
+            Self::CleanDiff { .. } | Self::MovedDiff => Some(false),
         }
     }
 }
@@ -288,7 +324,10 @@ pub fn note_gather<M: crate::runtime::host::HostOps>(
             note_store_route("gw_clean_same");
             note_store_route_n("gw_clean_same_kb", span / 1024);
         }
-        GatherVerdict::CleanDiff => note_store_route("gw_clean_diff"),
+        GatherVerdict::CleanDiff { host_wrote: true } => {
+            note_store_route("gw_clean_diff_host_wrote")
+        }
+        GatherVerdict::CleanDiff { host_wrote: false } => note_store_route("gw_clean_diff"),
         GatherVerdict::MovedSame => note_store_route("gw_moved_same"),
         GatherVerdict::MovedDiff => note_store_route("gw_moved_diff"),
     }
@@ -307,15 +346,17 @@ fn observe<M: crate::runtime::host::HostOps>(
         runs,
         span,
         page_size,
+        host_seq,
     } = window;
 
     // SAFETY: `runs` describe the window this draw is about to gather from, so
     // their pointers are live here for the same reason they are live there.
     let fold = unsafe { fold_runs(runs, span) };
 
-    if witness.entries.len() >= MAX_TRACKED_WINDOWS && !witness.entries.contains_key(&key) {
+    witness.binds = witness.binds.wrapping_add(1);
+    while witness.entries.len() >= MAX_TRACKED_WINDOWS && !witness.entries.contains_key(&key) {
         crate::runtime::drain::note_store_route("gw_window_overflow");
-        witness.release(host);
+        witness.evict_oldest(host);
     }
 
     let stale = match witness.entries.get(&key) {
@@ -342,6 +383,8 @@ fn observe<M: crate::runtime::host::HostOps>(
                 token,
                 gen,
                 fold,
+                host_seq,
+                last_seen: witness.binds,
             },
         );
         return GatherVerdict::Rearmed;
@@ -365,13 +408,17 @@ fn observe<M: crate::runtime::host::HostOps>(
     } else {
         match (gen == entry.gen, fold_same) {
             (true, true) => GatherVerdict::CleanSame,
-            (true, false) => GatherVerdict::CleanDiff,
+            (true, false) => GatherVerdict::CleanDiff {
+                host_wrote: host_seq != entry.host_seq,
+            },
             (false, true) => GatherVerdict::MovedSame,
             (false, false) => GatherVerdict::MovedDiff,
         }
     };
     entry.gen = gen;
     entry.fold = fold;
+    entry.host_seq = host_seq;
+    entry.last_seen = witness.binds;
     verdict
 }
 
@@ -388,13 +435,24 @@ mod tests {
     const PAGE: usize = 4096;
     const GPAS: [u64; 1] = [8 * PAGE as u64];
 
-    /// A one-page window over `runs`, at `gpas`.
+    /// A one-page window over `runs`, at `gpas`, with no host write since the
+    /// device started.
     fn one_page<'a>(gpas: &'a [u64], runs: &'a [GuestRun]) -> GatherWindow<'a> {
+        host_wrote_since(gpas, runs, 0)
+    }
+
+    /// The same window, presented as of host-write sequence `host_seq`.
+    fn host_wrote_since<'a>(
+        gpas: &'a [u64],
+        runs: &'a [GuestRun],
+        host_seq: u64,
+    ) -> GatherWindow<'a> {
         GatherWindow {
             gpas,
             runs,
             span: PAGE as u64,
             page_size: PAGE,
+            host_seq,
         }
     }
 
@@ -494,7 +552,9 @@ mod tests {
         buf[7] ^= 0xff;
         assert_eq!(
             observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs)),
-            GatherVerdict::CleanDiff
+            GatherVerdict::CleanDiff { host_wrote: false },
+            "no host write moved the sequence, so this is a guest store the \
+             bitmap did not see"
         );
     }
 

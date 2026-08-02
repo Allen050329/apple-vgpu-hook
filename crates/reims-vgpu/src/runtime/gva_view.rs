@@ -763,6 +763,10 @@ fn write_span_multi<H: HostMemory + HostOps>(
     buf: &[u8],
     allowed: WindowPages<'_>,
 ) -> Result<(), MemError> {
+    // Puts bytes into guest pages the hypervisor's dirty bitmap cannot witness.
+    // Counted before the walk so a refusal costs a spurious bump, never a
+    // missing one.
+    state.note_host_wrote_guest_ram();
     let length = buf.len() as u64;
     let page_shift = state.page_shift;
     let page_size = state.page_size();

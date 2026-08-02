@@ -2389,6 +2389,7 @@ fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
     // Fixed per-texture window: the walk covers exactly the bound span.
     let (gpas, runs) = task_gva_guest_run_window(state, host, task_id, gva, span)?;
     let page = state.page_size() as usize;
+    let host_seq = state.host_guest_write_seq;
     crate::runtime::gather_witness::note_gather(
         &mut state.gather_witness,
         host,
@@ -2399,6 +2400,7 @@ fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
             runs: &runs,
             span,
             page_size: page,
+            host_seq,
         },
     );
     Some((
@@ -2467,6 +2469,7 @@ fn try_type11_sample_zero_copy<M: HostMemory + HostOps>(
     }
     let (gpas, runs) = mapping_window_guest_runs(state, host, mid, base_off, span)?;
     let page = state.page_size() as usize;
+    let host_seq = state.host_guest_write_seq;
     crate::runtime::gather_witness::note_gather(
         &mut state.gather_witness,
         host,
@@ -2477,6 +2480,7 @@ fn try_type11_sample_zero_copy<M: HostMemory + HostOps>(
             runs: &runs,
             span,
             page_size: page,
+            host_seq,
         },
     );
     Some(SampledSourceRequest::GuestRuns(
@@ -2553,6 +2557,7 @@ fn try_type5_sample_zero_copy<M: HostMemory + HostOps>(
     }
     let (gpas, runs) = mapping_window_guest_runs(state, host, mid, base_off, span)?;
     let page = state.page_size() as usize;
+    let host_seq = state.host_guest_write_seq;
     crate::runtime::gather_witness::note_gather(
         &mut state.gather_witness,
         host,
@@ -2563,6 +2568,7 @@ fn try_type5_sample_zero_copy<M: HostMemory + HostOps>(
             runs: &runs,
             span,
             page_size: page,
+            host_seq,
         },
     );
     Some(SampledSourceRequest::GuestRuns(

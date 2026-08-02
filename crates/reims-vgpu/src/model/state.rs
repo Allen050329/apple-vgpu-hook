@@ -1763,6 +1763,19 @@ pub struct DeviceState {
     /// `evict_gva` re-creates it on every deferred GVA render Store arm. One
     /// boot's audit caught `(0xa4c000, 1)` naming two different 64x64 icons.
     pub sampled_content_gen: u64,
+    /// How many times this device has written pixel bytes into guest RAM.
+    ///
+    /// The hypervisor dirty bitmap witnesses guest CPU stores and nothing else,
+    /// so a host-side write into the same pages is invisible to it — a copy
+    /// vouched for by "the guest did not write" can still be stale because *we*
+    /// wrote. This counts the writes that could do that, so a reader comparing
+    /// two points in time can tell "nobody wrote" from "we wrote".
+    ///
+    /// Bumped at every entry that *may* write, rather than at each committed
+    /// copy. Over-counting is the safe direction: a reader comparing two points
+    /// concludes "we may have written", re-reads, and pays a copy. Under-counting
+    /// vouches for a stale one. See [`Self::note_host_wrote_guest_ram`].
+    pub host_guest_write_seq: u64,
     /// Reusable native-row read buffer for the guest-linear memo path.
     pub guest_linear_scratch: Vec<u8>,
     /// Byte-exact revalidated memo for type-5 serialized texture views
@@ -2024,6 +2037,7 @@ impl DeviceState {
             #[cfg(feature = "backend-vulkan")]
             gather_witness: crate::runtime::gather_witness::GatherWitness::default(),
             sampled_content_gen: 0,
+            host_guest_write_seq: 0,
             guest_linear_scratch: Vec::new(),
             type5_view_memo: LruBytesMemo::new(GUEST_LINEAR_MEMO_BYTE_CAP),
             type11_memo: LruBytesMemo::new(GUEST_LINEAR_MEMO_BYTE_CAP),
@@ -3114,6 +3128,21 @@ impl DeviceState {
         e.height = height;
         e.format = format;
         true
+    }
+
+    /// Record that this device is about to write pixel bytes into guest RAM.
+    ///
+    /// Called from every host-side writer, including the ones that reach guest
+    /// pages through a raw task-GVA walk and never name a mapping. The
+    /// hypervisor's dirty bitmap cannot see any of them — it witnesses guest CPU
+    /// stores only — so without this a reader has no way to tell "nobody wrote
+    /// these pages" from "we wrote them ourselves".
+    ///
+    /// Deliberately called before the write rather than after it succeeds: a
+    /// refused write costs a spurious bump, which makes a reader re-read bytes
+    /// that did not change. The opposite error hands out a stale copy.
+    pub fn note_host_wrote_guest_ram(&mut self) {
+        self.host_guest_write_seq = self.host_guest_write_seq.wrapping_add(1);
     }
 
     /// Issue a sampled-content generation that has never been issued before.

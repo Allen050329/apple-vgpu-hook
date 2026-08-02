@@ -1977,6 +1977,11 @@ fn copy_mapping_runs<H: HostMemory + HostOps>(
     mut copy: RunCopy<'_>,
     site: &str,
 ) -> bool {
+    if copy.is_write() {
+        // Puts bytes into guest pages the hypervisor's dirty bitmap cannot
+        // witness. The read direction shares this walk and writes nothing.
+        state.note_host_wrote_guest_ram();
+    }
     let len = copy.len();
     let need_end = off.saturating_add(len as u64);
     // Fast path: one packed view covering the whole range.
