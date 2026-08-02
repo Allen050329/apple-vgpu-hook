@@ -3546,12 +3546,39 @@ impl SurfaceWriteCensus {
 /// - Any measurement of GPU-side latency here must record the host GPU's clock
 ///   and power state beside it, or it is a measurement of the governor. A number
 ///   taken at P5 against one taken at P0 is a 6x artefact with no code in it.
-/// - **This device is latency-bound on a GPU that is usually downclocked, not
-///   throughput-bound.** Removing a whole GPU round trip is therefore worth
-///   about six times what the flat GPU cost suggests, while removing bytes is
-///   worth what it always was. The deferred-flush ledger in
+/// - The second consequence used to read "**this device is latency-bound on a
+///   GPU that is usually downclocked, not throughput-bound**", and concluded
+///   that removing a whole GPU round trip is worth about six times the flat GPU
+///   cost while removing bytes is worth what it always was. **That does not
+///   follow from the table above, and it is now measured false.** The premise is
+///   that the wait shrinks with clock — and a copy moving 8 MB shrinks with
+///   clock just as much as a latency does. The reading could not tell them
+///   apart, and it picked one.
+///
+/// `readback_split`'s `bar_us` and `gpu_us` are the device's own timestamps
+/// either side of the copy, and they settle it. Driven one-second windows on an
+/// x86/PCI boot with the host GPU at P5:
+///
+/// ```text
+/// fence 2.549 ms   copy 2.286 ms (89.7%)   draw-wait 0.0010 ms   ask 0.262 ms
+/// fence 1.906 ms   copy 1.710 ms (89.7%)   draw-wait 0.0010 ms   ask 0.195 ms
+/// fence 1.474 ms   copy 1.296 ms (87.9%)   draw-wait 0.0010 ms   ask 0.177 ms
+/// ```
+///
+/// **87-91% of the fence wait is the copy executing.** 0.05% is the draw batch
+/// it waits on — so the composite render is effectively free and the readback is
+/// the device's whole GPU cost — and ~0.19 ms is the cost of asking. The copy
+/// moves 8.29 MB at 3.6-6.4 GB/s in that power state. Two things follow, and
+/// both are the opposite of what the old wording argued:
+///
+/// - **Removing bytes is worth ~1:1 against 90% of the largest cost in the
+///   device.** The four levers the deferred-flush ledger in
 ///   [`crate::runtime::storage_flush::flush_mapping_windows_before_fence`] prices
-///   all four of its closed levers in bytes.
+///   in bytes are the ones that would pay, and they were not being weighed
+///   against the right number.
+/// - **Removing the second submission is worth the other ~11%** — a stable
+///   0.18-0.26 ms per readback, and no more. That prices a step left queued as a
+///   top item on the grounds that "round trips *are* the cost". They are not.
 ///
 /// `multi` is not noise to be averaged away. The age of "the arm" is a single
 /// number only when exactly one window was armed since the last flush; a window
@@ -3640,6 +3667,15 @@ pub(crate) struct DrainDutyCensus {
     rb_us: [std::sync::atomic::AtomicU64; 4],
     rb_count: [std::sync::atomic::AtomicU64; 4],
     rb_max_us: [std::sync::atomic::AtomicU64; 4],
+    /// GPU-side execution of the readback command buffer, from the device's own
+    /// timestamp queries, split at the barrier. `rb_bar_us` is the copy command
+    /// buffer waiting for the draw batch ahead of it to finish; `rb_gpu_us` is
+    /// the copy itself. Together they divide [`ReadbackPhase::Fence`], which is
+    /// CPU wall clock and cannot tell either from the cost of asking.
+    rb_bar_us: std::sync::atomic::AtomicU64,
+    rb_gpu_us: std::sync::atomic::AtomicU64,
+    rb_gpu_count: std::sync::atomic::AtomicU64,
+    rb_gpu_max_us: std::sync::atomic::AtomicU64,
     /// The window length `note` last reported, so `take_flush_rails` states the
     /// same denominator instead of deriving a second one.
     last_win_ms: std::sync::atomic::AtomicU64,
@@ -3730,7 +3766,24 @@ impl DrainDutyCensus {
             let label = phase.label();
             body.push_str(&format!(" {label}_us={us} {label}={n} {label}_max_us={max}"));
         }
+        let bar_us = self.rb_bar_us.swap(0, Relaxed);
+        let gpu_us = self.rb_gpu_us.swap(0, Relaxed);
+        let gpu = self.rb_gpu_count.swap(0, Relaxed);
+        let gpu_max_us = self.rb_gpu_max_us.swap(0, Relaxed);
+        body.push_str(&format!(
+            " bar_us={bar_us} gpu_us={gpu_us} gpu={gpu} gpu_max_us={gpu_max_us}"
+        ));
         any.then(|| format!("readback_split win_ms={win_ms}{body}"))
+    }
+
+    /// Record one readback command buffer's two GPU-side spans: `barrier_us`
+    /// waiting for the draws, then `copy_us` moving the frame.
+    fn note_readback_gpu(&self, barrier_us: u64, copy_us: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.rb_bar_us.fetch_add(barrier_us, Relaxed);
+        self.rb_gpu_us.fetch_add(copy_us, Relaxed);
+        self.rb_gpu_count.fetch_add(1, Relaxed);
+        self.rb_gpu_max_us.fetch_max(copy_us, Relaxed);
     }
 
     /// The window length [`Self::note`] last reported over, so a census emitted
@@ -4519,6 +4572,20 @@ pub fn note_drain_phase(phase: DrainPhase, started: std::time::Instant) {
 /// Attribute one slice of a render-rail flush to the part of it that was spent.
 pub fn note_readback_phase(phase: ReadbackPhase, us: u64) {
     DRAIN_DUTY.note_readback(phase, us);
+}
+
+/// Record the two GPU-side spans of one readback command buffer, read from its
+/// own timestamp queries after the fence signalled.
+///
+/// Reported as `readback_split bar_us`/`gpu_us` beside `fence_us`, which they
+/// divide. `fence_us` is CPU wall clock across `vkWaitForFences` and therefore
+/// contains three different things with three different fixes: the draw batch
+/// still executing (`bar_us`, the copy's barrier waiting on it), the copy
+/// itself (`gpu_us`), and the cost of asking (the remainder). Both spans are
+/// deltas between two points on the GPU's own timeline, so no clock correlation
+/// is involved and the subtraction is exact.
+pub fn note_readback_gpu_us(barrier_us: u64, copy_us: u64) {
+    DRAIN_DUTY.note_readback_gpu(barrier_us, copy_us);
 }
 
 /// Count one guest-Store routing decision, by route name.

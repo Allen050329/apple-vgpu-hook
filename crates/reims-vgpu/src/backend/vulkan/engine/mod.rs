@@ -956,6 +956,26 @@ unsafe fn copy_image_level0_to_host_delivered(
     // rail that publishes composited pixels to the guest with no ordering
     // against the draws that produced them.
     //
+    // Before the barrier, so slot 0 stamps the GPU's own clock at the instant it
+    // begins this command buffer rather than after it has already waited for the
+    // draws. The reset must be recorded into the same command buffer: a query
+    // pool's results are undefined until reset, and resetting on the host needs
+    // `hostQueryReset`, which is a Vulkan 1.2 feature this device does not ask
+    // for.
+    if let Some(probe) = ctx.timestamps.as_ref() {
+        ctx.device.cmd_reset_query_pool(
+            cb,
+            probe.pool,
+            0,
+            context::TimestampProbe::SLOTS,
+        );
+        ctx.device.cmd_write_timestamp(
+            cb,
+            ash::vk::PipelineStageFlags::TOP_OF_PIPE,
+            probe.pool,
+            0,
+        );
+    }
     // Nothing else supplies it. Queue submission order starts command buffers
     // in order; it does not finish them in order, and it is not a memory
     // dependency. A render pass's implicit final subpass dependency carries
@@ -985,6 +1005,16 @@ unsafe fn copy_image_level0_to_host_delivered(
         &[],
         &barrier,
     );
+    // Between the barrier and the copy, at the stage the barrier releases into.
+    // A queue starts command buffers in order but does not finish them in order,
+    // so slot 0 can be stamped while the draw batch is still running and the
+    // span from it to the end of the copy contains both. This slot is what
+    // separates them: everything before it has reached TRANSFER, which after the
+    // barrier means the draws are done.
+    if let Some(probe) = ctx.timestamps.as_ref() {
+        ctx.device
+            .cmd_write_timestamp(cb, ash::vk::PipelineStageFlags::TRANSFER, probe.pool, 1);
+    }
     let region = [ash::vk::BufferImageCopy::default()
         .image_subresource(color_subresource_layers())
         .image_extent(ash::vk::Extent3D {
@@ -999,6 +1029,14 @@ unsafe fn copy_image_level0_to_host_delivered(
         readback.buffer,
         &region,
     );
+    if let Some(probe) = ctx.timestamps.as_ref() {
+        ctx.device.cmd_write_timestamp(
+            cb,
+            ash::vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+            probe.pool,
+            2,
+        );
+    }
     ctx.device
         .end_command_buffer(cb)
         .map_err(|e| DrawError::VkCall(VkCall::new(ops.end_cb, e)))?;
@@ -1024,6 +1062,38 @@ unsafe fn copy_image_level0_to_host_delivered(
         ReadbackPhase::Fence,
         fence_started.elapsed().as_micros() as u64,
     );
+    // Read against the fence that just signalled, so both queries are available
+    // and this cannot block. It divides `fence_us`: what is left after the GPU's
+    // own execution of this command buffer is the draw batch ahead of it plus
+    // the cost of asking, and only the first of those is work this device could
+    // make cheaper.
+    if let Some(probe) = ctx.timestamps.as_ref() {
+        let mut ticks = [0u64; context::TimestampProbe::SLOTS as usize];
+        match ctx.device.get_query_pool_results(
+            probe.pool,
+            0,
+            &mut ticks,
+            ash::vk::QueryResultFlags::TYPE_64,
+        ) {
+            // In f64, not integer ticks-times-period: `timestampPeriod` is a
+            // float and drivers do report values below 1 ns (a counter faster
+            // than 1 GHz), which an integer multiply would truncate to zero and
+            // report as "the GPU did nothing".
+            Ok(()) => {
+                let us = |from: usize, to: usize| {
+                    (ticks[to].saturating_sub(ticks[from]) as f64
+                        * probe.ns_per_tick.max(0.0) as f64
+                        / 1_000.0) as u64
+                };
+                crate::runtime::drain::note_readback_gpu_us(us(0, 1), us(1, 2));
+            }
+            Err(e) => crate::observe::Emit::decline(
+                "vk_timestamp_read",
+                &VkCall::new(VkOp::ContextGetQueryPoolResults, e),
+            )
+            .fail_once(0),
+        }
+    }
     let map_started = std::time::Instant::now();
     let out = match lease.disarm() {
         // The mapping is already established for the slot's lifetime, so all

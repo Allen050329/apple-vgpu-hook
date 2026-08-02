@@ -519,16 +519,42 @@ Two things follow, and the second decides what is worth building:
 
 - A performance comparison between two builds is void unless both were taken in
   the same power state. Nothing in the boot scripts pins it.
-- **This device is latency-bound on a usually-downclocked GPU, not
-  throughput-bound.** Removing a whole GPU round trip is worth about six times
-  what the flat GPU cost suggests; removing bytes is worth what it always was.
-  The deferred-flush ledger prices all four of its closed levers in bytes, which
-  is why none of them looked like enough.
+- The second bullet used to read "**this device is latency-bound on a
+  usually-downclocked GPU, not throughput-bound** — removing a whole GPU round
+  trip is worth about six times what the flat GPU cost suggests; removing bytes
+  is worth what it always was." **Do not restore it. It does not follow from the
+  table above and it is now measured false.** The premise is that the wait
+  shrinks with clock, and a copy that moves 8 MB shrinks with clock exactly as
+  much as a latency does. The table could not tell them apart; the bullet picked
+  one, and it picked wrong.
+
+**What the wait actually is, measured.** `readback_split` now carries `bar_us`
+and `gpu_us`, written by the device's own timestamp queries either side of the
+copy inside the readback command buffer — GPU-timeline deltas, so no clock
+correlation is involved. Driven one-second windows, x86/PCI, host GPU at P5:
+
+```text
+fence 2.549 ms   copy 2.286 ms (89.7%)   draw-wait 0.0010 ms   ask 0.262 ms
+fence 1.906 ms   copy 1.710 ms (89.7%)   draw-wait 0.0010 ms   ask 0.195 ms
+fence 1.474 ms   copy 1.296 ms (87.9%)   draw-wait 0.0010 ms   ask 0.177 ms
+```
+
+**87-91 % of the fence wait is the copy executing**, moving 8.29 MB at
+3.6-6.4 GB/s in that power state. The draw batch it waits on is **0.05 %** — so
+the composite render is effectively free and the readback is this device's entire
+GPU cost. The remaining ~0.19 ms is the cost of asking. So:
+
+- **Removing bytes is worth ~1:1 against 90 % of the largest cost in the
+  device.** The deferred-flush ledger's four levers are priced in bytes and that
+  is the right currency; they were being weighed against a wrong number.
+- **Removing the second submission is worth the other ~11 %** — 0.18-0.26 ms per
+  readback, stable, and no more. Do not spend a session merging the readback into
+  the draw batch's submission expecting a frame back.
 
 It also reframes the reports behind goal 11 (poor performance on iGPUs and older
-GPUs). Those parts have the same governors and less headroom, so a device whose
-frame cost is dominated by one blocking round trip per frame degrades on them
-faster than its own work would predict.
+GPUs). Those parts have the same governors and less headroom, and a device whose
+frame cost is dominated by dragging a whole framebuffer back across the bus every
+frame degrades on them faster than its own work would predict.
 
 ### Finding State Nothing Reads
 

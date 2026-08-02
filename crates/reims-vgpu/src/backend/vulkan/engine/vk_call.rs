@@ -89,6 +89,10 @@ pub enum VkOp {
 
     /// `vkGetPipelineCacheData` before persisting a grown pipeline cache.
     ContextPipelineCacheGetData,
+    /// `vkCreateQueryPool` for the readback's two-slot timestamp probe.
+    ContextCreateQueryPool,
+    /// `vkGetQueryPoolResults` reading that probe after its fence signalled.
+    ContextGetQueryPoolResults,
 
     // ---- desc_arena.rs — the per-frame descriptor-set arena ----
     /// `vkCreateDescriptorPool` for the arena's pool.
@@ -347,6 +351,8 @@ impl Decline for VkCall {
             VkOp::CachesCreateComputePipelines => "vk_caches_create_compute_pipelines",
 
             VkOp::ContextPipelineCacheGetData => "vk_context_pipeline_cache_get_data",
+            VkOp::ContextCreateQueryPool => "vk_context_create_query_pool",
+            VkOp::ContextGetQueryPoolResults => "vk_context_get_query_pool_results",
 
             VkOp::DescArenaCreatePool => "vk_desc_arena_create_pool",
             VkOp::DescArenaAllocSets => "vk_desc_arena_alloc_sets",
@@ -508,6 +514,8 @@ mod tests {
         VkOp::CachesCreateGraphicsPipelines,
         VkOp::CachesCreateComputePipelines,
         VkOp::ContextPipelineCacheGetData,
+        VkOp::ContextCreateQueryPool,
+        VkOp::ContextGetQueryPoolResults,
         VkOp::DescArenaCreatePool,
         VkOp::DescArenaAllocSets,
         VkOp::DescArenaAllocSetsGrown,
