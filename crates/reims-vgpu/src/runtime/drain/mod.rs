@@ -4536,11 +4536,26 @@ fn emit_bind_phase() {
 /// fraction over both would describe neither. A leg that measured nothing emits
 /// nothing, so an idle desktop costs no line and a zero always means "measured
 /// and not redundant" rather than "not measured".
+///
+/// The `whole=`/`over_90=` tail is each audited walk placed by its *own*
+/// redundancy, with the bytes it carried beside it. `same_fine` is a mean over
+/// the window, and a mean cannot separate a few wholly-unchanged landings from
+/// every landing being mostly unchanged — the first is collected by a
+/// landing-granular skip and the second only by tile compaction.
+///
+/// Walks and bytes are separate `key=value` fields rather than one packed pair
+/// because every reader of this log — the drag probe's parser and
+/// `constant-fields.sh` among them — reads a field as a single number.
 fn emit_land_redundancy() {
     for (leg, w) in crate::runtime::land_redundancy::take_window() {
+        let buckets = w
+            .buckets()
+            .map(|(label, walks, bytes)| format!("{label}={walks} {label}_bytes={bytes}"))
+            .collect::<Vec<_>>()
+            .join(" ");
         crate::observe::off(format!(
             "land_redundancy leg={} audits={} calls={} runs={} bytes={} pages={} \
-             same_pages={} fine={} same_fine={}",
+             same_pages={} fine={} same_fine={} {buckets}",
             leg.label(),
             w.audits,
             w.calls,

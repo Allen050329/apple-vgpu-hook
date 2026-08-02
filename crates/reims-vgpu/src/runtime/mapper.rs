@@ -1951,39 +1951,6 @@ impl RunCopy<'_> {
         }
     }
 
-    /// Charge one copy's worth of already-correct bytes to
-    /// [`crate::runtime::land_redundancy`], with the same arguments the copy
-    /// itself is about to run with.
-    ///
-    /// # Safety
-    ///
-    /// Same contract as [`Self::apply`]: `host_ptr` must be a live mapping of at
-    /// least `host_off + n` bytes and `buf_off + n` must be within the buffer.
-    unsafe fn audit(
-        &self,
-        map_off: u64,
-        host_ptr: usize,
-        host_off: usize,
-        buf_off: usize,
-        n: usize,
-        page_size: u64,
-    ) {
-        let Some(buf) = self.write_src() else {
-            return;
-        };
-        // SAFETY: the caller's contract covers exactly this range, and the
-        // audit only reads it.
-        unsafe {
-            crate::runtime::land_redundancy::note_write(
-                crate::runtime::land_redundancy::Leg::Mapping,
-                map_off,
-                (host_ptr as *const u8).add(host_off),
-                &buf[buf_off..buf_off + n],
-                page_size,
-            );
-        }
-    }
-
     /// Move `n` bytes between the caller's buffer at `buf_off` and the mapped
     /// host range at `host_off`.
     ///
@@ -2043,21 +2010,31 @@ fn copy_mapping_runs<H: HostMemory + HostOps>(
         // witness. The read direction shares this walk and writes nothing.
         state.note_host_wrote_mapping(mapping_id);
     }
-    // Decided once for the walk so an audited landing is compared whole. See
-    // [`crate::runtime::land_redundancy::audit_due`] for why a per-run stride
-    // would describe no frame in particular.
-    let audit = copy.is_write() && crate::runtime::land_redundancy::audit_due(
-        crate::runtime::land_redundancy::Leg::Mapping,
-    );
+    // Taken once for the walk so an audited landing is compared whole, and held
+    // so its runs are tallied together and the landing is bucketed by its own
+    // redundancy. See [`crate::runtime::land_redundancy::begin_audit`] for why a
+    // per-run stride would describe no frame in particular.
+    let mut audit = copy
+        .is_write()
+        .then(|| crate::runtime::land_redundancy::begin_audit(crate::runtime::land_redundancy::Leg::Mapping))
+        .flatten();
     let page_size = state.page_size();
     let len = copy.len();
     let need_end = off.saturating_add(len as u64);
     // Fast path: one packed view covering the whole range.
     if let Some((ptr, view_len)) = ensure_contig_view(state, host, mapping_id) {
         if (view_len as u64) >= need_end && (off as usize) + len <= view_len {
-            if audit {
-                // SAFETY: same range the copy below is about to write.
-                unsafe { copy.audit(off, ptr, off as usize, 0, len, page_size) };
+            if let (Some(walk), Some(buf)) = (audit.as_mut(), copy.write_src()) {
+                // SAFETY: exactly the range `apply` is about to write below,
+                // and the audit only reads it.
+                unsafe {
+                    walk.note_write(
+                        off,
+                        (ptr as *const u8).add(off as usize),
+                        &buf[..len],
+                        page_size,
+                    );
+                }
             }
             // SAFETY: the view covers `need_end`, checked directly above.
             unsafe { copy.apply(ptr, off as usize, 0, len) };
@@ -2112,9 +2089,17 @@ fn copy_mapping_runs<H: HostMemory + HostOps>(
             ));
             return false;
         }
-        if audit {
-            // SAFETY: same range the copy below is about to write.
-            unsafe { copy.audit(copy_lo, ptr, host_off, buf_off, n, page_size) };
+        if let (Some(walk), Some(buf)) = (audit.as_mut(), copy.write_src()) {
+            // SAFETY: exactly the range `apply` is about to write below, whose
+            // bounds were checked directly above; the audit only reads it.
+            unsafe {
+                walk.note_write(
+                    copy_lo,
+                    (ptr as *const u8).add(host_off),
+                    &buf[buf_off..buf_off + n],
+                    page_size,
+                );
+            }
         }
         // SAFETY: the map covers `total`, and `host_off + n <= total` and
         // `buf_off + n <= len` were both just checked.

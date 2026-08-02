@@ -802,9 +802,8 @@ fn write_span_multi<H: HostMemory + HostOps>(
     // does not — and on a driven x86/PCI drag it is almost always here, which
     // is why hooking only the packed half reported the leg at 7 runs a second
     // against `gvaw_fence_flush=444`.
-    let audit = crate::runtime::land_redundancy::audit_due(
-        crate::runtime::land_redundancy::Leg::Gva,
-    );
+    let mut audit =
+        crate::runtime::land_redundancy::begin_audit(crate::runtime::land_redundancy::Leg::Gva);
     crate::runtime::mapper::flush_retired_views(state, host);
     let span_page_base = gva & !(page_size - 1);
     let end = gva.saturating_add(length);
@@ -829,15 +828,14 @@ fn write_span_multi<H: HostMemory + HostOps>(
             host.unmap_pages(ptr, total);
             return Err(MemError::RunOutOfRange);
         }
-        if audit {
+        if let Some(walk) = audit.as_mut() {
             // Aligned in guest-virtual space, which is where a rail could
             // decline a unit — `copy_lo` is this run's own GVA.
             //
             // SAFETY: as below; the audit only reads the range about to be
             // written.
             unsafe {
-                crate::runtime::land_redundancy::note_write(
-                    crate::runtime::land_redundancy::Leg::Gva,
+                walk.note_write(
                     copy_lo,
                     (ptr as *const u8).add(host_off),
                     &buf[buf_off..buf_off + n],

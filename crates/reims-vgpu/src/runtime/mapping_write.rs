@@ -795,9 +795,9 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
         // into a contig view — so without its own hook the audit goes silent
         // on any host whose mappings are host-contiguous, and `write_split`'s
         // `contig`/`frag` is the only thing that would say so.
-        let audit = crate::runtime::land_redundancy::audit_due(
-        crate::runtime::land_redundancy::Leg::Mapping,
-    );
+        let mut audit = crate::runtime::land_redundancy::begin_audit(
+            crate::runtime::land_redundancy::Leg::Mapping,
+        );
         let page_size = state.page_size();
         let land_started = std::time::Instant::now();
         // SAFETY: contig covers span_end; revalidated in ensure_contig_view.
@@ -841,19 +841,13 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
                 let within = (lo - row_off) as usize;
                 let len = (hi - lo) as usize;
                 let dst = unsafe { base.add((y as usize).saturating_mul(bpr) + within) };
-                if audit {
+                if let Some(walk) = audit.as_mut() {
                     // `lo` is already the segment's mapping-linear offset, which
                     // is the space the tiles align in.
                     //
                     // SAFETY: as below, and the audit only reads the range.
                     unsafe {
-                        crate::runtime::land_redundancy::note_write(
-                            crate::runtime::land_redundancy::Leg::Mapping,
-                            lo,
-                            dst,
-                            &row_bytes[within..within + len],
-                            page_size,
-                        );
+                        walk.note_write(lo, dst, &row_bytes[within..within + len], page_size);
                     }
                 }
                 // SAFETY: `within + len <= tight <= row_bytes.len()`, and the

@@ -248,7 +248,10 @@ cp = rows("chain_phase", ["chains", "binds_us"])
 # no-writeback counterfactual dropped to measure 2.9x; `gva` is the larger of
 # the two by flush count and was unmeasured until it had its own hook.
 lr_all = rows("land_redundancy", ["runs", "bytes", "pages", "same_pages",
-                                  "fine", "same_fine"], leg_of=True)
+                                  "fine", "same_fine",
+                                  "whole", "whole_bytes",
+                                  "over_90", "over_50", "under_50"],
+              leg_of=True)
 ws = rows("write_split", ["bytes", "land_us", "land"])
 
 print("host_window_cadence — frames this device put out")
@@ -277,6 +280,16 @@ for leg in ("mapping", "gva"):
     show(f"{leg}: same_fine %",
          [100.0 * r["same_fine"] / r["fine"] for r in lr if r["fine"]], " %")
     show(f"{leg}: audited MB", [r["bytes"] / 1e6 for r in lr], " MB")
+    # The shape of the distribution behind that mean, which is what decides
+    # which rail is worth building. `whole %` is the share of audited *bytes*
+    # in landings where every tile matched — what declining whole landings
+    # would collect, needing only a hash and no tile bitmap. If it is small
+    # while `same_fine %` is large the redundancy is spread across every
+    # landing, and only tile compaction collects it.
+    show(f"{leg}: whole-walk %",
+         [100.0 * r["whole_bytes"] / r["bytes"] for r in lr if r["bytes"]], " %")
+    for b in ("whole", "over_90", "over_50", "under_50"):
+        show(f"{leg}:   {b} walks", [r[b] for r in lr])
 
 # The per-landing CPU scatter cost the redundancy above is a claim about. It is
 # reported here rather than left to a reader because a CPU tile-skipping rail
