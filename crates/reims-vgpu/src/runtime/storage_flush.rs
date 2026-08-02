@@ -316,11 +316,31 @@ pub fn flush_intersecting_task_gva<M: HostMemory + HostOps>(
 /// linear task-GVA windows never name a mapping, so they flush when their
 /// defer-time page index aliases the mapping's physical pages. Returns
 /// `(all_ok, windows_flushed)`.
+///
+/// # What its counters can and cannot answer
+///
+/// `guest_read_declared` counts every call, `guest_read_landed` every window one
+/// lands, and `guest_read_dry` the calls that found nothing armed. They exist
+/// because this is the only place the guest tells us it is about to read, and
+/// until now nothing counted it — so "how often does the guest declare?" had no
+/// answer, and the eager fence-bound writeback
+/// ([`flush_mapping_windows_before_fence`]) was being weighed against an unknown.
+///
+/// Read them with the order of events in mind. The fence flush runs first and
+/// empties the windows, so `guest_read_dry` dominating is the *expected* reading
+/// and does **not** show the declaration would have been too late — it shows the
+/// fence got there first, which it always does. What the pair does bound is the
+/// declaration *rate*: `guest_read_declared` against the composite rate says
+/// whether the guest declares once per frame it reads, rarely, or never. A rate
+/// far below the flush rate means most flushes land for nobody, which is the
+/// case the demand-driven route is for; a rate close to it means the eager rail
+/// is doing work the guest would have asked for anyway.
 pub fn flush_mapping_for_guest_read<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     mapping_id: u32,
 ) -> (bool, u32) {
+    crate::runtime::drain::note_store_route("guest_read_declared");
     let keyed = state
         .compute_deferred_flush
         .keys()
@@ -364,6 +384,11 @@ pub fn flush_mapping_for_guest_read<M: HostMemory + HostOps>(
                 }
             }
         }
+    }
+    if flushed == 0 {
+        crate::runtime::drain::note_store_route("guest_read_dry");
+    } else {
+        crate::runtime::drain::note_store_route_n("guest_read_landed", u64::from(flushed));
     }
     (ok, flushed)
 }
@@ -4199,11 +4224,79 @@ mod tests {
             gva_entry(1, 4, 4, &[0x3000u64 << PAGE_SHIFT_X86]),
         );
 
+        let declared = crate::runtime::drain::store_route_count("guest_read_declared");
+        let landed = crate::runtime::drain::store_route_count("guest_read_landed");
+        let dry = crate::runtime::drain::store_route_count("guest_read_dry");
+
         let (ok, flushed) = super::flush_mapping_for_guest_read(&mut state, &mut host, 9);
         assert!(!ok, "engine-less flush reports the loss");
         assert_eq!(flushed, 1, "exactly the aliased GVA window");
         assert!(!state.gva_deferred_flush.contains_key(&0x9000_0000));
         assert!(state.gva_deferred_flush.contains_key(&0x9100_0000));
+
+        // The declaration rate is the number the demand-driven writeback design
+        // turns on, and until these counters existed nothing measured it. Assert
+        // them here rather than trusting the wiring: `guest_read_landed` must
+        // agree with the returned count, and the dry counter must stay put on a
+        // call that landed something — a route on the wrong side of that branch
+        // would read as "the guest never declares" and close the question the
+        // wrong way. Deltas, not absolutes: the census window is process-wide
+        // and other tests share it.
+        assert_eq!(
+            crate::runtime::drain::store_route_count("guest_read_declared") - declared,
+            1,
+            "every call must count as a declaration"
+        );
+        assert_eq!(
+            crate::runtime::drain::store_route_count("guest_read_landed") - landed,
+            u64::from(flushed),
+            "landed must count windows, not calls"
+        );
+        assert_eq!(
+            crate::runtime::drain::store_route_count("guest_read_dry") - dry,
+            0,
+            "a call that landed a window is not dry"
+        );
+    }
+
+    /// A declaration that finds nothing armed counts as dry and lands nothing.
+    ///
+    /// The complement of the case above, and the one that will dominate live:
+    /// the fence-bound writeback runs first and empties the windows, so most
+    /// declarations arrive to an empty set. That reading is only interpretable
+    /// if "dry" is known to mean *nothing was armed* rather than *the counter
+    /// never fired*, which is what this pins.
+    #[test]
+    fn guest_read_flush_with_nothing_armed_counts_as_dry() {
+        use crate::runtime::host::FakeHost;
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+        let m = state.mappings.entry(9).or_default();
+        m.mapped = true;
+        m.page_entries = vec![(0x2000u32 << 2) | 1];
+
+        let declared = crate::runtime::drain::store_route_count("guest_read_declared");
+        let landed = crate::runtime::drain::store_route_count("guest_read_landed");
+        let dry = crate::runtime::drain::store_route_count("guest_read_dry");
+
+        let (ok, flushed) = super::flush_mapping_for_guest_read(&mut state, &mut host, 9);
+        assert!(ok, "nothing armed is not a failure");
+        assert_eq!(flushed, 0, "nothing armed lands nothing");
+        assert_eq!(
+            crate::runtime::drain::store_route_count("guest_read_declared") - declared,
+            1,
+            "a dry call is still a declaration"
+        );
+        assert_eq!(
+            crate::runtime::drain::store_route_count("guest_read_dry") - dry,
+            1,
+            "nothing armed must count as dry"
+        );
+        assert_eq!(
+            crate::runtime::drain::store_route_count("guest_read_landed") - landed,
+            0,
+            "nothing armed lands nothing"
+        );
     }
 
     /// Page drift must distinguish the cases it exists to separate, and now
