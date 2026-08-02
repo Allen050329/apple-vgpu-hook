@@ -232,8 +232,7 @@ wl = rows("host_window_loop", ["ticks", "redraws_asked", "draws",
 bp = rows("bind_phase", ["binds", "vertex_us", "fragment_us", "attrs_us"])
 cp = rows("chain_phase", ["chains", "binds_us"])
 lr = rows("land_redundancy", ["audits", "calls", "runs", "bytes", "pages",
-                              "same_pages", "fine", "same_fine", "railed",
-                              "stored"])
+                              "same_pages", "fine", "same_fine"])
 ws = rows("write_split", ["bytes", "land_us", "land"])
 
 print("host_window_cadence — frames this device put out")
@@ -261,20 +260,13 @@ show("audited MB", [r["bytes"] / 1e6 for r in lr], " MB")
 show("landings audited", [r["audits"] for r in lr])
 show("landings offered", [r["calls"] for r in lr])
 
-# The rail, when a boot has REIMS_VGPU_TILE_SKIP=1 set. `railed` counts ranges
-# that went through the tile compare instead of the sampled audit, and `stored`
-# what it actually put in guest RAM out of their `bytes`. `stored == bytes`
-# means REIMS_VGPU_PROBE_NO_TILE_SKIP is also set, which is the control arm —
-# a correct boot that gives the saving back so both sides can be read against
-# one power state. `land_us/land` is the number the rail is trying to move, and
-# it is a CPU cost, so it does not share `fence_us`'s dependence on the host
-# GPU's clock.
-railed = [r for r in lr if r["railed"]]
-if railed:
-    print("land_redundancy — the tile rail, when REIMS_VGPU_TILE_SKIP=1")
-    show("stored % of bytes", [100.0 * r["stored"] / r["bytes"] for r in railed
-                               if r["bytes"]], " %")
-    show("ranges railed", [r["railed"] for r in railed])
+# The per-landing CPU scatter cost the redundancy above is a claim about. It is
+# reported here rather than left to a reader because a CPU tile-skipping rail
+# was built against these fractions and made it *worse* — 744/769 us per landing
+# without it against 802 with it, while declining 92 % of the bytes — since a
+# full-cache-line store never reads its destination and the compare adds a read
+# the eager path never paid. Unlike `fence_us` above, this is a CPU cost and so
+# does not depend on the host GPU's power state.
 show("land_us/land", [r["land_us"] / r["land"] for r in ws if r["land"]], " us")
 
 # The delivery chain between the composite and the screen, which the three
