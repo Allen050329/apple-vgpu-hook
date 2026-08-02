@@ -1514,6 +1514,15 @@ pub(crate) unsafe fn execute_draw_inner(
                     resource.swizzle,
                     counters,
                 )?;
+                // Everything from here to the end of this arm moves bytes;
+                // everything above it in `AcquireSampled` decides which image
+                // to move them into. The split is what separates "the driver
+                // made 21 objects" from "the CPU copied 8.9 MB", and those are
+                // the two candidates for a cold sampled bind. The phase is
+                // re-entered per texture, which is correct — `enter`
+                // accumulates, so a draw binding several gathers charges each
+                // half of each bind to its own bar.
+                phase.enter(super::draw_phase::Phase::SampledUpload);
                 let scratch = pools.acquire_staging(
                     ctx,
                     src.total_len,
@@ -1542,6 +1551,8 @@ pub(crate) unsafe fn execute_draw_inner(
                     row_length_texels: src.row_length_texels,
                     gathered_len: src.total_len as usize,
                 });
+                // Back to the deciding half for the next texture in the loop.
+                phase.enter(super::draw_phase::Phase::AcquireSampled);
             }
         }
     }

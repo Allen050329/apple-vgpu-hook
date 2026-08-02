@@ -4533,7 +4533,8 @@ fn emit_draw_phase() {
     };
     crate::observe::off(format!(
         "draw_phase draws={} prep_us={} pipeline_us={} stage_us={} stage_pass_us={} \
-         acquire_us={} acquire_sampled_us={} acquire_readback_us={} descriptors_us={} \
+         acquire_us={} acquire_sampled_us={} sampled_upload_us={} acquire_readback_us={} \
+         descriptors_us={} \
          record_us={} submit_us={} wait_us={} readback_us={} max_us={} stalls={}",
         w.draws,
         w.prep_us,
@@ -4542,6 +4543,7 @@ fn emit_draw_phase() {
         w.stage_pass_us,
         w.acquire_us,
         w.acquire_sampled_us,
+        w.sampled_upload_us,
         w.acquire_readback_us,
         w.descriptors_us,
         w.record_us,

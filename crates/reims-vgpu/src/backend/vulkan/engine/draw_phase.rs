@@ -29,7 +29,8 @@
 //! | `stage` | there | vertex/index/storage/seed bytes are in staging |
 //! | `stage_pass` | there | the primary render pass is resolved |
 //! | `acquire` | there | the render target, its framebuffer and any transient depth are held |
-//! | `acquire_sampled` | there | every sampled image the draw binds is held |
+//! | `acquire_sampled` | there | every sampled image the draw binds is *decided and created* |
+//! | `sampled_upload` | inside it | the staging buffer is held and the guest bytes are gathered into it |
 //! | `acquire_readback` | there | this draw's readback buffer is held |
 //! | `descriptors` | there | the descriptor set is written |
 //! | `record` | there | the CB is ended |
@@ -107,8 +108,10 @@
 //!
 //! # What the sampled loop's own cost is *not*
 //!
-//! This is where the trail currently ends, and the eliminations are worth
-//! keeping because they are what makes the remaining candidate stark. In those
+//! The eliminations below are worth keeping because they are what makes the
+//! remaining candidate stark, but read them as being about the **driven**
+//! regime — see "and none of it holds when the guest is quiet" at the end. In
+//! those
 //! same windows `sampled_gpu_binds`, `sampled_cache_misses`, `sampled_reuploads`
 //! and `sampled_cache_hits` are **all 0**, and only `sampled_identity_hits`
 //! (420/s) moves. So:
@@ -163,6 +166,40 @@
 //! that the same witness covers these run lists, which are task-GVA spans rather
 //! than mapping ids; that is the first thing to check before building on this.
 //!
+//! # And none of it holds when the guest is quiet
+//!
+//! Everything above is one regime. The same phase behaves completely differently
+//! in the other, and the difference is where this device's hitches live.
+//! Measured on one x86/PCI boot, a driven second against a near-idle one:
+//!
+//! ```text
+//!             draws  acquire_sampled_us  gathers  gather_MB  creates  us/draw
+//! driven        660               32399      175      558.4        0      ~49
+//! near-idle       9               19233        5        8.9       21    ~2137
+//! ```
+//!
+//! One of those nine draws held **19.2 ms** on its own (`max_us=19475`). Read as
+//! bytes that is 0.46 GB/s against 17.2 GB/s driven — 37x apart for the same
+//! memcpy, which is not a thing a memcpy does. The arithmetic was wrong, and it
+//! was wrong because this phase pooled two populations:
+//! `counters.note_sampled_gather` brackets `write_staging_from_runs` alone,
+//! while `acquire_sampled_us` also contained `acquire_sampled`'s
+//! `vkCreateImage` + `vkAllocateMemory` + `vkCreateImageView` and
+//! `acquire_staging`'s `vkCreateBuffer` + `vkAllocateMemory` + `vkMapMemory`.
+//! With `creates=21` over nine draws, the second population is not a rounding
+//! error there — while in the driven windows it is exactly zero, which is why
+//! the eliminations above were sound for that regime and silently wrong for
+//! this one.
+//!
+//! `sampled_upload` is that split: it opens at `acquire_staging` and closes
+//! after the gather, so `acquire_sampled` keeps the deciding and creating half
+//! and `sampled_upload` gets the byte-moving half. `acquire_sampled_us` staying
+//! large with `sampled_upload_us` small convicts object creation on a cold bind;
+//! the other way round convicts the gather.
+//!
+//! The doc for the split above used to say the trail ended here. It ended
+//! because one bar was two things.
+//!
 //! Do not reach for `zc_buffer_gathered` to close this. It is bumped in
 //! `try_buffer_zero_copy_resolved` while the *request* is built, covers buffers
 //! rather than sampled images, and is therefore not this phase — it was checked
@@ -204,15 +241,16 @@ pub(crate) enum Phase {
     StagePass = 3,
     Acquire = 4,
     AcquireSampled = 5,
-    AcquireReadback = 6,
-    Descriptors = 7,
-    Record = 8,
-    Submit = 9,
-    Wait = 10,
-    Readback = 11,
+    SampledUpload = 6,
+    AcquireReadback = 7,
+    Descriptors = 8,
+    Record = 9,
+    Submit = 10,
+    Wait = 11,
+    Readback = 12,
 }
 
-const PHASES: usize = 12;
+const PHASES: usize = 13;
 
 static ACC: [AtomicU64; PHASES] = [const { AtomicU64::new(0) }; PHASES];
 static DRAWS: AtomicU64 = AtomicU64::new(0);
@@ -229,6 +267,7 @@ pub struct DrawPhaseWindow {
     pub stage_pass_us: u64,
     pub acquire_us: u64,
     pub acquire_sampled_us: u64,
+    pub sampled_upload_us: u64,
     pub acquire_readback_us: u64,
     pub descriptors_us: u64,
     pub record_us: u64,
@@ -251,6 +290,7 @@ pub fn take_window() -> Option<DrawPhaseWindow> {
         stage_pass_us: ACC[Phase::StagePass as usize].swap(0, Ordering::Relaxed),
         acquire_us: ACC[Phase::Acquire as usize].swap(0, Ordering::Relaxed),
         acquire_sampled_us: ACC[Phase::AcquireSampled as usize].swap(0, Ordering::Relaxed),
+        sampled_upload_us: ACC[Phase::SampledUpload as usize].swap(0, Ordering::Relaxed),
         acquire_readback_us: ACC[Phase::AcquireReadback as usize].swap(0, Ordering::Relaxed),
         descriptors_us: ACC[Phase::Descriptors as usize].swap(0, Ordering::Relaxed),
         record_us: ACC[Phase::Record as usize].swap(0, Ordering::Relaxed),
@@ -334,7 +374,8 @@ impl Drop for DrawTimer {
         };
         crate::observe::off(format!(
             "draw_stall us={total} prep_us={} pipeline_us={} stage_us={} stage_pass_us={} \
-             acquire_us={} acquire_sampled_us={} acquire_readback_us={} descriptors_us={} \
+             acquire_us={} acquire_sampled_us={} sampled_upload_us={} acquire_readback_us={} \
+             descriptors_us={} \
              record_us={} submit_us={} wait_us={} readback_us={} geom={w}x{h} \
              readback_bytes={} exit={:?}{latched}",
             self.us[Phase::Prep as usize],
@@ -343,6 +384,7 @@ impl Drop for DrawTimer {
             self.us[Phase::StagePass as usize],
             self.us[Phase::Acquire as usize],
             self.us[Phase::AcquireSampled as usize],
+            self.us[Phase::SampledUpload as usize],
             self.us[Phase::AcquireReadback as usize],
             self.us[Phase::Descriptors as usize],
             self.us[Phase::Record as usize],
