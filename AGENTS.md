@@ -293,6 +293,34 @@ A pacing number taken from an unsettled guest is not a slow result, it is a
 result about something else, and it will read as a catastrophic regression in
 whatever change happens to be in the tree.
 
+**Load settling is necessary and it is not sufficient. Probe twice.** Safari rAF
+here is bimodal at ~59 fps and ~118 fps with nothing between them, and both
+states occur on one unchanged binary within one boot. Four probes of the same
+build over six minutes read **59.5, 117.3, 119.0, 120.0** — the low one being the
+first probe after login — while `system_profiler` reported the display at
+`1920 x 1080 @ 120.00Hz` throughout. So 59 is half-rate pacing, not a mode
+change. The long-frame share falls with it (1.10%, 1.15%, 0.63%, 0.04%), so the
+guest keeps improving well after the load average stops moving. A `load < 1.0`
+gate does not separate the two: two boots that passed it
+(1 user, 2-3 minutes up, load 0.93 and 0.99) still read 58.9 and 59.1 on their
+first probe.
+
+A *single* rAF figure therefore cannot support a claim about a code change in
+either direction. This is not hypothetical — it produced a 118.9-vs-59.1 split
+across two builds that read exactly like a 2x regression, and the "regressing"
+change re-probed on the same boot at **117.3**. Four boots were spent before
+re-probing rather than rebooting settled it.
+
+```sh
+# Probe at least twice on one boot; use the later reading, and say which.
+for r in 1 2 3; do PROBE_SECONDS=20 scripts/browser-probe/web-gpu-probe.sh safari; sleep 20; done
+```
+
+Report rAF beside the device-side counters, which do not share this bimodality:
+`drain_duty` (`duty`, `draw_us`, `flush_us`), `draw_phase`, `flush_rails`,
+`readback_split`. Those reproduce across boots and are what a performance claim
+should rest on; rAF is the corroborating number, not the evidence.
+
 ### Finding State Nothing Reads
 
 Do not grep for this. `reims-vgpu` is a staticlib whose types are almost all

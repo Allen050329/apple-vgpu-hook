@@ -3170,14 +3170,32 @@ pub enum FlushRail {
 /// only in a commit body. [`Write`](Self::Write) turned out to be the largest
 /// phase and to be three whole-frame passes sharing one counter — see
 /// [`SurfaceWritePhase`], which divides it again. Removing the two that were not
-/// the guest's bytes took the render flush from **7.98 ms to 3.95 ms** and the
-/// guest's own Safari `requestAnimationFrame` from **59.1 fps to 119.2 fps**
-/// (two independent boots), with the drain worker's duty falling from 0.915 to
-/// ~0.72 and its worst tranche from 46.5 ms to 18.5 ms.
+/// the guest's bytes took the render flush from **7.98 ms to 3.95 ms**, with the
+/// drain worker's duty falling from 0.915 to ~0.72 and its worst tranche from
+/// 46.5 ms to 18.5 ms. Those are device-side numbers and they reproduce: this
+/// rail now measures 3.86 ms per flush.
 ///
-/// The phase left holding the flush is [`Fence`](Self::Fence), and it is the
-/// GPU rendering the frame rather than latency to reschedule — that is measured,
-/// not assumed; see [`ResidentArmCensus`].
+/// **A Safari `requestAnimationFrame` figure was also attributed to that change
+/// — "59.1 fps to 119.2 fps" — and that attribution does not hold.** rAF on this
+/// pathway is bimodal at ~59 and ~118 with nothing in between, and *both* states
+/// occur on one build within one boot: probing the same unchanged binary four
+/// times in six minutes read 59.5, 117.3, 119.0 and 120.0, the low one being the
+/// first probe after login. A single rAF number therefore cannot attribute
+/// anything to a code change, in either direction — it nearly caused this rail's
+/// BGRA8 upload change to be reverted as a regression when re-probing the same
+/// build returned 117.3. Pair rAF with the device-side counters above, and see
+/// `AGENTS.md` for the probe rule.
+///
+/// The phase left holding the flush is [`Fence`](Self::Fence) at ~45%, with
+/// [`Write`](Self::Write) ~28% and [`Map`](Self::Map) ~22% — 94% of `flush_us`
+/// accounted. What the rail moves is the headline: 116 flushes a second, each a
+/// whole 1920x1080 frame, is **962 MB/s** read back from the GPU and landed in
+/// guest pages, for ~62 presented frames. Every phase here is proportional to
+/// that volume, so the next lever is reading back less than the whole
+/// attachment, not making any one phase faster.
+///
+/// [`Fence`](Self::Fence) is the GPU rendering the frame rather than latency to
+/// reschedule — that is measured, not assumed; see [`ResidentArmCensus`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ReadbackPhase {
     /// Record the copy command buffer and submit it. No GPU wait.
