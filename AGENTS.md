@@ -1068,9 +1068,57 @@ one known bias. The spread is run-to-run over a heterogeneous population that a
 writeback's bytes are already at the destination, worst observed second 68 %.**
 That is enough to justify building the GPU pass — even the worst second declines
 ~68 % of a 300 ms/s copy and a 209 ms/s scatter — and not enough to predict its
-saving to better than a factor. A per-surface split is what would answer it;
-nobody has built one, and it is the right first move for anyone who needs the
-number tighter.
+saving to better than a factor.
+
+### The census that closed that range: 92 %, counted rather than sampled
+
+That paragraph used to end by asking for a per-surface split, and saying nobody
+had built one. It is built and run. `REIMS_VGPU_PROBE_TILE_DIFF_CENSUS=1` runs
+the GPU difference pass (`backend::vulkan::engine::diff_pass`) over **every**
+resident-target readback, keyed per `TargetIdentity`, and counts the 256-byte
+tiles that differ from the previous frame of that same surface. Two driven
+Safari window drags (`--motion reposition`, the default and the weaker one) on
+one settled x86/PCI guest:
+
+```text
+run 1   3011 frames    97 214 840 tiles    8 002 871 changed   8.23 %
+run 2   2940 frames    94 716 416 tiles    7 499 751 changed   7.92 %
+        0 declines in either run
+```
+
+**About 92 % of a composited frame is already what the frame before it was**,
+and that is a complete count over the drag rather than one landing in 64. It
+reproduces across runs to 0.3 points and within a run per second: twelve of
+nineteen seconds of run 1 fall between 8.2 % and 9.2 % changed, one at 1.4 %,
+two at 25.5 %. The undriven desktop before the drag is near-total — 108 counted
+frames moved `tdc_tiles_changed` by 44 tiles.
+
+So the sampled range 78 – 99 % and this 92 % agree, and the sample was not
+biased so much as *noisy*. **Use 92 % where the older text says "a factor".**
+
+Four things this does not say, and the last is load-bearing for anyone sizing
+the real rail:
+
+- **It is not a timing result.** The census runs its own submission per
+  readback — a second whole-frame device-local copy, a dispatch and a fence —
+  so `fence_us`, `duty` and `present_hz` from such a boot are not comparable to
+  anything. It announces itself once as `PROBE tile_diff_census=on`; check for
+  that line before trusting a number from a log. That said `window_publish
+  fresh` read med 34/s and `land_us/land` med 763 µs here, both in line with
+  the control runs above, so the probe did not visibly deform what it measured.
+- **It measures frame-to-frame change, not change against the guest's pages.**
+  `prev` is the previous frame of the same identity. The two coincide only
+  while the eager writeback keeps landing every frame — which it does on this
+  boot, and which is exactly why the measurement is taken before the rail is
+  changed rather than after.
+- **It covers the mapping-keyed leg only** (`read_target_leased`). The raw
+  task-GVA leg reads `gvaw_fence_flush=432` against `mapw_fence_flush=288` and
+  is not censused, so this is not a statement about all of the writeback.
+- `tdc_overflow` fired 5 times in run 1 against a bound of **8** targets, and
+  every overflow drops the whole map and re-seeds — which is where all 39 of
+  that run's seeds came from. So the live working set is above 8 surfaces. At
+  two frames of device-local memory per surface, the real rail's equivalent
+  bound is a VRAM decision, not a bookkeeping one, and 8 is already too low.
 
 **The redundancy is spread across every landing, not concentrated in a few, and
 that decides which build.** A mean cannot tell *seven wholly-unchanged surfaces
