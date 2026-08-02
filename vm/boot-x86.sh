@@ -483,33 +483,21 @@ if [ -n "${REIMS_VGPU_WINDOW:-}" ]; then
       echo "boot-x86.sh:   direct_frac) is MEANINGLESS on this boot." >&2
     fi
   fi
-  # A display connection that works is not the same as one whose pacing is ours,
-  # and this warning does not cover the difference.
+  # This once warned that host-window pacing was pinned at exactly 20.0 Hz
+  # against `offered=51` with `busy_acquire=330`, and that FIFO->MAILBOX had not
+  # moved it. That is fixed and the reasoning behind it was wrong, so the warning
+  # is gone rather than softened.
   #
-  # Measured on a boot with a live Wayland socket: `presents=20` per second
-  # exactly, against `offered=51` and `busy_acquire=330`. Switching the swapchain
-  # from FIFO to MAILBOX did not move it — `host_window_swapchain` confirms
-  # `present_mode=mailbox images=3` was granted — and a present mode cannot
-  # explain a rate it does not change. So the 20.0 Hz ceiling is the presentation
-  # engine releasing images at that cadence, not this device pacing them.
+  # The swapchain was being created with a literal FIFO while the census line
+  # printed the *chosen* MAILBOX, so "MAILBOX was granted and did not help" was
+  # never a measurement of MAILBOX. One value now carries both the census field
+  # and the call argument, and the ceiling went with it.
   #
-  # What it is remains open, and two innocent explanations are already ruled out.
-  # The host panel was in a 120 Hz mode at the time, so 20 Hz is a six-fold
-  # deficit rather than the display's own rate. And KWin reported the window
-  # `minimized=false active=<itself>`, so it was focused and visible — do not
-  # repeat the "occluded surface" story as though it were established.
-  #
-  # Untested leads, in order: the swapchain is 1921x1079 while the window on
-  # screen was 1011x596 on a 3840x2400 output, so every present is a compositor
-  # rescale; and `busy_fence` stays near zero while `busy_acquire` is ~330/s,
-  # which puts the stall in image release rather than in our own queue.
-  #
-  # The practical rule is unchanged: treat a suspiciously round `present_hz` on
-  # an agent-driven boot as the host's number until it has been reproduced on a
-  # seat with a human watching the window.
-  echo "boot-x86.sh: NOTE — host-window pacing here may be the host's, not ours." >&2
-  echo "boot-x86.sh:   A measured boot pinned presents at exactly 20.0 Hz against" >&2
-  echo "boot-x86.sh:   offered=51, unchanged by FIFO->MAILBOX. Cause not settled." >&2
+  # Current: `present_hz == offered_hz` exactly, `busy_acquire=0`,
+  # `direct_frac=1.00` — the window presents every frame it is offered, measured
+  # up to 71.6 Hz. Whatever bounds the frame rate now is upstream of this window,
+  # so do not go looking for it here.
+  :
 else
   REIMS_VGPU_DISPLAY="${REIMS_VGPU_DISPLAY:-gtk}"
 fi
