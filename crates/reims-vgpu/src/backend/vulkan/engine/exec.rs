@@ -98,9 +98,13 @@ enum PreparedSampled {
         layers: u32,
     },
     /// Guest gather: the CPU packs the texel bytes out of the guest runs into a
-    /// pooled scratch, then one buffer→image copy uploads it. No owned CPU byte
-    /// buffer exists, so the content cache is bypassed and the slot is never
-    /// retained — that is what still separates this from [`Self::Upload`].
+    /// pooled scratch, then one buffer→image copy uploads it.
+    ///
+    /// No owned CPU byte buffer exists, so nothing can fingerprint this content.
+    /// The slot is still retained when the producer vouched for an identity —
+    /// see [`super::types::SampledSource::GuestRuns`] — and the next bind of the
+    /// same window under the same generation binds it back through
+    /// `find_sampled_by_identity` without gathering at all.
     ///
     /// The gather used to happen on the device, out of per-run host-pointer
     /// imports of the guest pages, which is why the scratch carried
@@ -111,6 +115,8 @@ enum PreparedSampled {
         scratch: BufferSlot,
         /// `bufferRowLength` for the buffer→image copy (0 = tight rows).
         row_length_texels: u32,
+        /// Bytes gathered, for the cache's byte-cap accounting.
+        gathered_len: usize,
     },
     Cached {
         binding: u32,
@@ -1468,6 +1474,33 @@ pub(crate) unsafe fn execute_draw_inner(
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             SampledSource::GuestRuns(src) => {
+                // The producer vouches for this identity only when both halves
+                // of the guest-write witness say the window's bytes cannot have
+                // moved since the gather that filled the retained image: no
+                // guest store into the pages, and no write by this device
+                // either. So the retained image is bound with nothing read and
+                // nothing compared — which is the whole point, since reading
+                // the bytes to compare them is the cost being removed.
+                if let Some(image) = pools.find_gathered_sampled(
+                    resource.width,
+                    resource.height,
+                    resource.layers,
+                    resource.volume,
+                    resource.cube,
+                    resource.arrayed,
+                    resource.one_dim,
+                    resource.format,
+                    resource.swizzle,
+                    resource.identity,
+                    counters,
+                ) {
+                    counters.note_sampled_gather_skipped(src.total_len);
+                    sampled.push(PreparedSampled::Cached {
+                        binding: resource.binding,
+                        image,
+                    });
+                    continue;
+                }
                 let img = pools.acquire_sampled(
                     ctx,
                     resource.width,
@@ -1507,6 +1540,7 @@ pub(crate) unsafe fn execute_draw_inner(
                     image: img,
                     scratch,
                     row_length_texels: src.row_length_texels,
+                    gathered_len: src.total_len as usize,
                 });
             }
         }
@@ -2253,22 +2287,44 @@ pub(crate) unsafe fn execute_draw_inner(
             pools.registry_mark_ready_at(identity, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
         }
     }
-    let mut sampled_retains: Vec<(
-        vk::Image,
-        std::sync::Arc<Vec<u8>>,
-        Option<super::types::SampledContentIdentity>,
-    )> = Vec::new();
-    for image in &sampled {
-        let PreparedSampled::Upload { binding, image, .. } = image else {
-            continue;
-        };
-        if let Some((SampledSource::Bytes(bytes), identity)) = req
-            .sampled_images
-            .iter()
-            .find(|resource| resource.binding == *binding)
-            .map(|resource| (&resource.source, resource.identity))
-        {
-            sampled_retains.push((image.image, bytes.clone(), identity));
+    let mut sampled_retains: Vec<super::pools::SampledRetain> = Vec::new();
+    for prepared in &sampled {
+        match prepared {
+            PreparedSampled::Upload { binding, image, .. } => {
+                if let Some((SampledSource::Bytes(bytes), identity)) = req
+                    .sampled_images
+                    .iter()
+                    .find(|resource| resource.binding == *binding)
+                    .map(|resource| (&resource.source, resource.identity))
+                {
+                    sampled_retains.push(super::pools::SampledRetain {
+                        image: image.image,
+                        content: super::pools::SampledRetainContent::Bytes(bytes.clone()),
+                        identity,
+                    });
+                }
+            }
+            // A gather with no vouched identity is dropped by the admit, which
+            // is where that decision belongs: an entry nothing can name is
+            // unreachable weight in a capped cache.
+            PreparedSampled::GuestGather {
+                binding,
+                image,
+                gathered_len,
+                ..
+            } => {
+                let identity = req
+                    .sampled_images
+                    .iter()
+                    .find(|resource| resource.binding == *binding)
+                    .and_then(|resource| resource.identity);
+                sampled_retains.push(super::pools::SampledRetain {
+                    image: image.image,
+                    content: super::pools::SampledRetainContent::Gathered { len: *gathered_len },
+                    identity,
+                });
+            }
+            _ => {}
         }
     }
     for image in &sampled {

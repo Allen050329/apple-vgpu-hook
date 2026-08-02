@@ -198,6 +198,13 @@ engine_counters! {
         /// it. See `draw_phase`'s "What the sampled loop's own cost is *not*".
         sampled_gathers,
         sampled_gather_bytes,
+        /// Sampled binds that would have gathered and did not, because both
+        /// halves of the guest-write witness vouched that the retained image's
+        /// bytes could not have moved. Bytes = the gather that did not happen,
+        /// so `sampled_gather_bytes + sampled_gather_skip_bytes` is what this
+        /// rail would cost with no cache.
+        sampled_gather_skips,
+        sampled_gather_skip_bytes,
         sampled_cache_hits,
         sampled_identity_hits,
         sampled_cache_hit_bytes,
@@ -309,6 +316,12 @@ impl EngineCounters {
             .fetch_add(bytes, Ordering::Relaxed);
     }
 
+    pub fn note_sampled_gather_skipped(&self, bytes: u64) {
+        self.sampled_gather_skips.fetch_add(1, Ordering::Relaxed);
+        self.sampled_gather_skip_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+    }
+
     pub fn note_compute_sampled_upload(&self, bytes: u64) {
         self.compute_sampled_uploads.fetch_add(1, Ordering::Relaxed);
         self.compute_sampled_upload_bytes
@@ -355,6 +368,7 @@ mod tests {
         counters.note_readback(4096);
         counters.note_seed_upload(1024);
         counters.note_sampled_gather(2048);
+        counters.note_sampled_gather_skipped(512);
 
         let snapshot = counters.snapshot();
         assert_eq!(snapshot.creates, 1);
@@ -371,6 +385,15 @@ mod tests {
         assert_eq!(
             (snapshot.sampled_gathers, snapshot.sampled_gather_bytes),
             (1, 2048)
+        );
+        // And the gathers that did not happen, whose bytes are the other half of
+        // what this rail would cost with no cache.
+        assert_eq!(
+            (
+                snapshot.sampled_gather_skips,
+                snapshot.sampled_gather_skip_bytes
+            ),
+            (1, 512)
         );
     }
 

@@ -662,7 +662,15 @@ enum SampledSourceRequest {
     /// Zero-copy guest gather: the engine copies the texel bytes from
     /// imported guest RAM inside the draw CB — no CPU read, no memo, no
     /// hash. Carries the native texel layout the image is created with.
-    GuestRuns(crate::backend::vulkan::engine::GuestRunSource, TexelLayout),
+    /// Guest-RAM runs the engine gathers from, the byte layout of those texels,
+    /// and — when both halves of the guest-write witness vouch for them — the
+    /// identity that lets the engine bind a retained image instead of gathering
+    /// at all (see [`crate::runtime::gather_witness`]).
+    GuestRuns(
+        crate::backend::vulkan::engine::GuestRunSource,
+        TexelLayout,
+        Option<LinearSampleIdentity>,
+    ),
 }
 
 /// Producer identity + generation for CPU-sourced sampled bytes, so that equal
@@ -690,6 +698,22 @@ enum SampledSourceRequest {
 struct LinearSampleIdentity {
     key: u64,
     generation: u64,
+}
+
+#[cfg(feature = "backend-vulkan")]
+impl From<crate::runtime::gather_witness::GatheredIdentity> for LinearSampleIdentity {
+    /// The zero-copy gather rail's key is a hash of the window's name rather
+    /// than a bit-namespaced id like the four rows above, so it can collide with
+    /// any of them. That is harmless for the same reason the table's last
+    /// paragraph gives: the generation comes from the one device-global counter,
+    /// which issues a value once and never again, so a `(key, generation)` pair
+    /// names one content even when two producers agree on a key.
+    fn from(id: crate::runtime::gather_witness::GatheredIdentity) -> Self {
+        Self {
+            key: id.key,
+            generation: id.generation,
+        }
+    }
 }
 
 #[cfg(feature = "backend-vulkan")]
@@ -2389,7 +2413,7 @@ fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
     // Fixed per-texture window: the walk covers exactly the bound span.
     let (gpas, runs) = task_gva_guest_run_window(state, host, task_id, gva, span)?;
     let page = state.page_size() as usize;
-    crate::runtime::gather_witness::note_gather(
+    let vouched = crate::runtime::gather_witness::note_gather(
         state,
         host,
         crate::runtime::gather_witness::GatherRail::Linear,
@@ -2414,6 +2438,7 @@ fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
                 row_length_texels,
             },
             native,
+            vouched.map(LinearSampleIdentity::from),
         ),
     ))
 }
@@ -2470,7 +2495,7 @@ fn try_type11_sample_zero_copy<M: HostMemory + HostOps>(
     }
     let (gpas, runs) = mapping_window_guest_runs(state, host, mid, base_off, span)?;
     let page = state.page_size() as usize;
-    crate::runtime::gather_witness::note_gather(
+    let vouched = crate::runtime::gather_witness::note_gather(
         state,
         host,
         crate::runtime::gather_witness::GatherRail::Type11,
@@ -2490,6 +2515,7 @@ fn try_type11_sample_zero_copy<M: HostMemory + HostOps>(
             row_length_texels,
         },
         native,
+        vouched.map(LinearSampleIdentity::from),
     ))
 }
 
@@ -2557,7 +2583,7 @@ fn try_type5_sample_zero_copy<M: HostMemory + HostOps>(
     }
     let (gpas, runs) = mapping_window_guest_runs(state, host, mid, base_off, span)?;
     let page = state.page_size() as usize;
-    crate::runtime::gather_witness::note_gather(
+    let vouched = crate::runtime::gather_witness::note_gather(
         state,
         host,
         crate::runtime::gather_witness::GatherRail::Type5,
@@ -2577,6 +2603,7 @@ fn try_type5_sample_zero_copy<M: HostMemory + HostOps>(
             row_length_texels,
         },
         native,
+        vouched.map(LinearSampleIdentity::from),
     ))
 }
 
@@ -4398,8 +4425,9 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         }
                         crate::backend::vulkan::engine::SampledSource::Target(identity)
                     }
-                    SampledSourceRequest::GuestRuns(src, native) => {
+                    SampledSourceRequest::GuestRuns(src, native, identity) => {
                         sampled_format = native;
+                        bytes_identity = identity;
                         crate::backend::vulkan::engine::SampledSource::GuestRuns(src)
                     }
                 };

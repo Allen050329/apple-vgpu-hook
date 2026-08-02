@@ -259,11 +259,7 @@ pub(crate) struct OpenBatch {
     /// Per-draw descriptor sets paired with the arena block they were allocated
     /// from, so the flush-time free routes each set to its owning pool.
     dsets: Vec<(vk::DescriptorSet, vk::DescriptorPool)>,
-    sampled_retains: Vec<(
-        vk::Image,
-        std::sync::Arc<Vec<u8>>,
-        Option<crate::backend::vulkan::engine::SampledContentIdentity>,
-    )>,
+    sampled_retains: Vec<SampledRetain>,
 }
 
 /// One in-flight ring slot: a primary CB, its fence (created unsignaled;
@@ -397,11 +393,7 @@ pub(crate) struct PendingGpuCleanup {
     readback: Vec<BufferSlot>,
     sampled: Vec<SampledSlot>,
     storage_images: Vec<StorageImageSlot>,
-    sampled_retains: Vec<(
-        vk::Image,
-        std::sync::Arc<Vec<u8>>,
-        Option<crate::backend::vulkan::engine::SampledContentIdentity>,
-    )>,
+    sampled_retains: Vec<SampledRetain>,
 }
 
 pub(crate) struct SampledSlot {
@@ -475,12 +467,41 @@ impl SampledSlot {
     }
 }
 
-struct ResidentSampledSlot {
-    slot: SampledSlot,
-    /// 128-bit fingerprint of the retained content (see [`sampled_content_hash`]).
+/// How a retained sampled image can be recognised again.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum SampledFingerprint {
+    /// 128-bit digest of the retained content (see [`sampled_content_hash`]).
     /// This *is* the match key on the content-fallback path — no byte copy is
     /// kept, so a hit binds the retained image without a full-frame `memcmp`.
-    content_hash: u128,
+    Content(u128),
+    /// No digest exists, because the content was gathered straight from guest
+    /// RAM into a staging buffer and never materialised as CPU bytes. Such an
+    /// entry is reachable only through its producer identity, which is the whole
+    /// point: hashing it would mean reading the bytes this entry exists to avoid
+    /// reading. It must never match a content search, or a CPU-sourced bind
+    /// could pick up an image whose bytes nobody has compared.
+    Gathered,
+}
+
+/// One sampled image a retired submission owes the content cache.
+pub(crate) struct SampledRetain {
+    pub(crate) image: vk::Image,
+    /// The bytes to fingerprint, where the source had any. A guest gather has
+    /// none, and carries only how many it moved so the cache's byte cap still
+    /// accounts for it.
+    pub(crate) content: SampledRetainContent,
+    pub(crate) identity: Option<crate::backend::vulkan::engine::SampledContentIdentity>,
+}
+
+/// What a retained slot's content was, for the two kinds of source.
+pub(crate) enum SampledRetainContent {
+    Bytes(std::sync::Arc<Vec<u8>>),
+    Gathered { len: usize },
+}
+
+struct ResidentSampledSlot {
+    slot: SampledSlot,
+    fingerprint: SampledFingerprint,
     /// Byte length of the content this slot was admitted with, kept only for the
     /// LRU byte-cap accounting (the bytes themselves are not retained).
     content_len: usize,

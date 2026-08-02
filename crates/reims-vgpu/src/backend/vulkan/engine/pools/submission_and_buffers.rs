@@ -908,11 +908,7 @@ impl ResourcePools {
     pub(crate) fn seal_entry(
         &mut self,
         dsets: Vec<(vk::DescriptorSet, vk::DescriptorPool)>,
-        sampled_retains: Vec<(
-            vk::Image,
-            std::sync::Arc<Vec<u8>>,
-            Option<crate::backend::vulkan::engine::SampledContentIdentity>,
-        )>,
+        sampled_retains: Vec<SampledRetain>,
     ) -> PendingGpuCleanup {
         let mut readback: Vec<BufferSlot> = self.readback_live.take().into_iter().collect();
         readback.append(&mut self.readback_multi_live);
@@ -985,11 +981,7 @@ impl ResourcePools {
         height: u32,
         bgra: bool,
         dset: Option<(vk::DescriptorSet, vk::DescriptorPool)>,
-        sampled_retains: Vec<(
-            vk::Image,
-            std::sync::Arc<Vec<u8>>,
-            Option<crate::backend::vulkan::engine::SampledContentIdentity>,
-        )>,
+        sampled_retains: Vec<SampledRetain>,
         counters: &EngineCounters,
     ) {
         match self.open_batch.as_mut() {
@@ -1129,10 +1121,14 @@ impl ResourcePools {
         // Cache admissions first (they move slots into the cache and may evict
         // images — deferred via dispose() while others are in flight), then
         // recycle what remains.
-        for (image, content, identity) in pending.sampled_retains.drain(..) {
-            if let Some(index) = pending.sampled.iter().position(|slot| slot.image == image) {
+        for retain in pending.sampled_retains.drain(..) {
+            if let Some(index) = pending
+                .sampled
+                .iter()
+                .position(|slot| slot.image == retain.image)
+            {
                 let slot = pending.sampled.remove(index);
-                self.admit_sampled_slot(device, slot, &content, identity);
+                self.admit_sampled_slot(device, slot, &retain.content, retain.identity);
             }
         }
         for slot in pending.staging.drain(..) {
@@ -1983,6 +1979,69 @@ impl ResourcePools {
         Ok(handles)
     }
 
+    /// Bind a retained image on producer identity alone — same key, same
+    /// generation means the same bytes under the producer's coherence model, so
+    /// nothing is hashed and nothing compared.
+    ///
+    /// The only way to reach a `Gathered` entry, whose bytes were never on the
+    /// CPU to be digested.
+    fn find_sampled_by_identity(
+        &mut self,
+        key: SampledKey,
+        identity: Option<crate::backend::vulkan::engine::SampledContentIdentity>,
+    ) -> Option<SampledSlot> {
+        let id = identity?;
+        let index = self
+            .sampled_cache
+            .iter()
+            .position(|entry| entry.slot.key() == key && entry.identity == Some(id))?;
+        let mut entry = self.sampled_cache.remove(index);
+        entry.last_touch_ms = self.idle_clock_ms;
+        let handles = entry.slot.handles();
+        self.sampled_cache.push(entry);
+        Some(handles)
+    }
+
+    /// The guest-gather rail's lookup: the complete image key, and identity as
+    /// the only content evidence there is.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "mirrors the complete image key, as its content-bearing sibling does"
+    )]
+    pub(crate) fn find_gathered_sampled(
+        &mut self,
+        width: u32,
+        height: u32,
+        layers: u32,
+        volume: bool,
+        cube: bool,
+        arrayed: bool,
+        one_dim: bool,
+        format: ash::vk::Format,
+        swizzle: crate::contract::pixel_format::SwizzlePlan,
+        identity: Option<crate::backend::vulkan::engine::SampledContentIdentity>,
+        counters: &EngineCounters,
+    ) -> Option<SampledSlot> {
+        let handles = self.find_sampled_by_identity(
+            SampledKey {
+                width,
+                height,
+                layers,
+                volume,
+                cube,
+                arrayed,
+                one_dim,
+                format,
+                swizzle,
+            },
+            identity,
+        )?;
+        counters
+            .sampled_identity_hits
+            .fetch_add(1, Ordering::Relaxed);
+        Some(handles)
+    }
+
     #[allow(
         clippy::too_many_arguments,
         reason = "sampled-cache lookup mirrors the complete image and content key"
@@ -2013,34 +2072,21 @@ impl ResourcePools {
             format,
             swizzle,
         };
-        // Identity fast path: same producer key + generation means the bytes
-        // are unchanged by the producer's coherence model — bind the retained
-        // image without hashing or comparing content.
-        if let Some(id) = identity {
-            if let Some(index) = self
-                .sampled_cache
-                .iter()
-                .position(|entry| entry.slot.key() == key && entry.identity == Some(id))
-            {
-                let mut entry = self.sampled_cache.remove(index);
-                entry.last_touch_ms = self.idle_clock_ms;
-                let handles = entry.slot.handles();
-                self.sampled_cache.push(entry);
-                counters
-                    .sampled_identity_hits
-                    .fetch_add(1, Ordering::Relaxed);
-                return Some(handles);
-            }
+        if let Some(handles) = self.find_sampled_by_identity(key, identity) {
+            counters
+                .sampled_identity_hits
+                .fetch_add(1, Ordering::Relaxed);
+            return Some(handles);
         }
         let content_hash = sampled_content_hash(content);
         // 128-bit fingerprint match binds the retained image directly — the
         // former full-frame `entry.content == content` compare (a cold DRAM
         // read of the retained copy on every hit) is dropped in favour of the
         // wider digest.
-        let found = self
-            .sampled_cache
-            .iter()
-            .position(|entry| entry.slot.key() == key && entry.content_hash == content_hash);
+        let found = self.sampled_cache.iter().position(|entry| {
+            entry.slot.key() == key
+                && entry.fingerprint == SampledFingerprint::Content(content_hash)
+        });
         let Some(index) = found else {
             counters
                 .sampled_cache_misses
@@ -2071,31 +2117,51 @@ impl ResourcePools {
         &mut self,
         device: &ash::Device,
         slot: SampledSlot,
-        content: &std::sync::Arc<Vec<u8>>,
+        content: &SampledRetainContent,
         identity: Option<crate::backend::vulkan::engine::SampledContentIdentity>,
     ) {
-        if content.len() > SAMPLED_CACHE_BYTE_CAP {
+        let (fingerprint, content_len) = match content {
+            SampledRetainContent::Bytes(bytes) => (
+                SampledFingerprint::Content(sampled_content_hash(bytes)),
+                bytes.len(),
+            ),
+            // Nothing hashed the bytes, so nothing can recognise this image by
+            // them. An entry with no identity to be found under would be
+            // unreachable dead weight in a capped cache, so it is not admitted.
+            SampledRetainContent::Gathered { len } => {
+                if identity.is_none() {
+                    self.sampled_live.push(slot);
+                    return;
+                }
+                (SampledFingerprint::Gathered, *len)
+            }
+        };
+        if content_len > SAMPLED_CACHE_BYTE_CAP {
             self.sampled_live.push(slot);
             return;
         }
-        let content_hash = sampled_content_hash(content);
-        if let Some(existing) = self
-            .sampled_cache
-            .iter_mut()
-            .find(|entry| entry.slot.key() == slot.key() && entry.content_hash == content_hash)
-        {
+        // Deduplication is by fingerprint, and `Gathered` entries are equal to
+        // each other under it, so they dedupe by identity instead — two windows
+        // that gathered different pixels must not collapse into one image.
+        let duplicate = self.sampled_cache.iter_mut().find(|entry| {
+            entry.slot.key() == slot.key()
+                && entry.fingerprint == fingerprint
+                && (fingerprint != SampledFingerprint::Gathered
+                    || entry.identity == identity)
+        });
+        if let Some(existing) = duplicate {
             if identity.is_some() {
                 existing.identity = identity;
             }
             self.sampled_live.push(slot);
             return;
         }
-        self.sampled_cache_bytes = self.sampled_cache_bytes.saturating_add(content.len());
+        self.sampled_cache_bytes = self.sampled_cache_bytes.saturating_add(content_len);
         let touch = self.idle_clock_ms;
         self.sampled_cache.push(ResidentSampledSlot {
             slot,
-            content_hash,
-            content_len: content.len(),
+            fingerprint,
+            content_len,
             identity,
             last_touch_ms: touch,
         });
@@ -2402,7 +2468,7 @@ mod recycle_tests {
             pools.sampled_cache_bytes = pools.sampled_cache_bytes.saturating_add(len);
             pools.sampled_cache.push(ResidentSampledSlot {
                 slot: null_slot(w, h),
-                content_hash: ((w as u128) << 64) | h as u128,
+                fingerprint: SampledFingerprint::Content(((w as u128) << 64) | h as u128),
                 content_len: len,
                 identity: None,
                 last_touch_ms: touch,

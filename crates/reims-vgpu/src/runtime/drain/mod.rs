@@ -4342,6 +4342,7 @@ fn emit_engine_delta() {
          sampled_cache_hits={} sampled_identity_hits={} sampled_cache_hit_bytes={} \
          sampled_cache_misses={} sampled_reuploads={} \
          sampled_reupload_bytes={} sampled_gathers={} sampled_gather_bytes={} \
+         sampled_gather_skips={} sampled_gather_skip_bytes={} \
          seed_uploads={} seed_upload_bytes={} \
          ring_retire_blocks={} target_evicts={} desc_pool_grow={} gen_mismatch={}",
         d.creates,
@@ -4368,6 +4369,8 @@ fn emit_engine_delta() {
         d.sampled_reupload_bytes,
         d.sampled_gathers,
         d.sampled_gather_bytes,
+        d.sampled_gather_skips,
+        d.sampled_gather_skip_bytes,
         d.seed_uploads,
         d.seed_upload_bytes,
         d.ring_retire_blocks,

@@ -103,6 +103,41 @@ pub enum GatherKey {
     Mapping { mid: u32, base_off: u64 },
 }
 
+impl GatherKey {
+    /// A 64-bit name for this window in the device-wide sampled-identity
+    /// keyspace.
+    ///
+    /// Collisions across the two shapes, or with any other producer's keys, are
+    /// harmless and do not need to be designed out: the engine matches on
+    /// `(key, generation)` and generations come from one device-global counter
+    /// that issues each value once and never again. The key only has to be
+    /// *stable* for one window, so that a window's own binds find each other.
+    pub fn content_key(self) -> u64 {
+        // FNV-1a over the discriminant and fields. A hash rather than a packing
+        // because both shapes carry more than 64 bits.
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut eat = |v: u64| {
+            for b in v.to_le_bytes() {
+                h ^= b as u64;
+                h = h.wrapping_mul(0x100_0000_01b3);
+            }
+        };
+        match self {
+            Self::TaskGva { task_id, gva } => {
+                eat(1);
+                eat(task_id as u64);
+                eat(gva);
+            }
+            Self::Mapping { mid, base_off } => {
+                eat(2);
+                eat(mid as u64);
+                eat(base_off);
+            }
+        }
+        h
+    }
+}
+
 /// What the last bind of one window observed.
 #[derive(Clone, Debug)]
 struct Entry {
@@ -131,6 +166,14 @@ struct Entry {
     pages_epoch: u64,
     /// Bind ordinal of the last sight of this window, for LRU eviction.
     last_seen: u64,
+    /// Sampled-content generation currently vouched for these bytes.
+    ///
+    /// Held across binds for as long as both halves of the witness say the bytes
+    /// cannot have changed, and replaced the moment either says otherwise. The
+    /// engine's sampled cache binds a retained image on `(key, generation)` with
+    /// no compare at all, so a generation that outlives its content by one bind
+    /// is a wrong picture that then persists.
+    generation: u64,
 }
 
 /// Per-device witness state: one entry per sampled window seen.
@@ -168,6 +211,11 @@ impl GatherWitness {
             }
         }
         self.entries.clear();
+    }
+
+    /// The generation currently vouched for `key`'s bytes.
+    fn vouched_identity(&self, key: &GatherKey) -> Option<u64> {
+        self.entries.get(key).map(|entry| entry.generation)
     }
 
     /// The host-write epoch recorded at the previous bind of `key`, if any.
@@ -343,13 +391,15 @@ impl GatherVerdict {
 ///
 /// Called from the producers with the window already resolved, so it adds a
 /// page-set compare and one content fold and changes no behaviour.
+#[must_use = "the identity is what lets the engine skip the gather; dropping it \
+              silently keeps the copy"]
 pub fn note_gather<M: crate::runtime::host::HostOps>(
     state: &mut crate::model::DeviceState,
     host: &mut M,
     rail: GatherRail,
     key: GatherKey,
     window: GatherWindow<'_>,
-) {
+) -> Option<GatheredIdentity> {
     use crate::runtime::drain::{note_store_route, note_store_route_n};
 
     let span = window.span;
@@ -373,7 +423,12 @@ pub fn note_gather<M: crate::runtime::host::HostOps>(
             .previous_pages_epoch(&key)
             .map(|since| state.host_writes.wrote_any_since(state, since, window.gpas)),
     };
-    let verdict = observe(&mut state.gather_witness, host, key, window, counts);
+    // A generation is issued from the device-global counter and never reused, so
+    // it is taken before the witness runs and spent only if the witness refuses
+    // to vouch for the previous one. An unspent generation is not a leak: the
+    // counter's whole contract is that a value is issued once and never again.
+    let fresh = state.next_sampled_content_generation();
+    let verdict = observe(&mut state.gather_witness, host, key, window, counts, fresh);
 
     // The fold answer on its own, independent of whether a token was armed: this
     // is the ceiling on what *any* content cache could skip, and unlike the
@@ -433,6 +488,27 @@ pub fn note_gather<M: crate::runtime::host::HostOps>(
         GatherVerdict::MovedSame => note_store_route("gw_moved_same"),
         GatherVerdict::MovedDiff => note_store_route("gw_moved_diff"),
     }
+    state
+        .gather_witness
+        .vouched_identity(&key)
+        .map(|generation| GatheredIdentity {
+            key: key.content_key(),
+            generation,
+        })
+}
+
+/// What the engine may bind a retained image on without looking at a byte.
+///
+/// Only produced when both halves of the witness agree the window's bytes cannot
+/// have moved since the gather that filled that image: the hypervisor saw no
+/// guest store into the pages, and this device wrote none of them either.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GatheredIdentity {
+    /// Stable name for the window, in the device-wide sampled-identity keyspace.
+    pub key: u64,
+    /// Generation vouched for these bytes, from
+    /// `DeviceState::next_sampled_content_generation`.
+    pub generation: u64,
 }
 
 /// The witness itself: fold the window, compare both answers against the last
@@ -443,6 +519,7 @@ fn observe<M: crate::runtime::host::HostOps>(
     key: GatherKey,
     window: GatherWindow<'_>,
     counts: HostWriteCounts,
+    fresh_generation: u64,
 ) -> GatherVerdict {
     let GatherWindow {
         gpas,
@@ -496,6 +573,7 @@ fn observe<M: crate::runtime::host::HostOps>(
                 scoped_seq,
                 pages_epoch,
                 last_seen: witness.binds,
+                generation: fresh_generation,
             },
         );
         return GatherVerdict::Rearmed;
@@ -534,6 +612,13 @@ fn observe<M: crate::runtime::host::HostOps>(
             (false, false) => GatherVerdict::MovedDiff,
         }
     };
+    // Keep the generation only where both halves of the witness vouch for the
+    // bytes. Every other verdict — including the ones where the fold happens to
+    // agree — replaces it, because the fold is a measurement this cache will not
+    // have once the gather it measures is skipped.
+    if !matches!(verdict, GatherVerdict::CleanSame { pages_quiet: true, .. }) {
+        entry.generation = fresh_generation;
+    }
     entry.gen = gen;
     entry.fold = fold;
     entry.host_seq = host_seq;
@@ -583,6 +668,14 @@ mod tests {
         pages_quiet: true,
     };
 
+    /// A generation that has never been issued before, as the device's own
+    /// counter promises.
+    fn next_gen() -> u64 {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(1);
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    }
+
     fn run_over(buf: &[u8]) -> GuestRun {
         GuestRun {
             host_ptr: buf.as_ptr() as usize,
@@ -621,6 +714,54 @@ mod tests {
         );
     }
 
+    /// The generation is the whole product of this witness, and its contract is
+    /// that it survives exactly as long as the bytes it names.
+    ///
+    /// Held while both halves vouch, and replaced by *every* other verdict —
+    /// including one where the fold happens to agree. The fold is a measurement
+    /// this cache will not have once the gather it measures is skipped, so a
+    /// generation kept on the strength of it would be kept on evidence that is
+    /// about to stop existing.
+    #[test]
+    fn the_vouched_generation_outlives_a_quiet_bind_and_no_other_kind() {
+        let mut host = crate::runtime::host::FakeHost::new();
+        let mut w = GatherWitness::default();
+        let mut buf = vec![0xa5u8; PAGE];
+        let runs = [run_over(&buf)];
+
+        observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs), QUIET, 10);
+        assert_eq!(w.vouched_identity(&KEY), Some(10));
+
+        // Quiet at both halves: the same bytes, so the same generation.
+        observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs), QUIET, 11);
+        assert_eq!(w.vouched_identity(&KEY), Some(10));
+
+        // A host write into the pages, with the bytes unchanged. The fold agrees
+        // and it is not enough.
+        observe(
+            &mut w,
+            &mut host,
+            KEY,
+            one_page(&GPAS, &runs),
+            HostWriteCounts {
+                pages_wrote: Some(true),
+                ..QUIET
+            },
+            12,
+        );
+        assert_eq!(
+            w.vouched_identity(&KEY),
+            Some(12),
+            "a generation survived a write to its own pages"
+        );
+
+        // A guest store, likewise.
+        buf[3] ^= 0xff;
+        host.guest_wrote_page(GPAS[0]);
+        observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs), QUIET, 13);
+        assert_eq!(w.vouched_identity(&KEY), Some(13));
+    }
+
     /// A window whose bytes and pages both stand still, bound twice: the whole
     /// point of the exercise, and the cell whose count says what a cache would
     /// save.
@@ -631,12 +772,12 @@ mod tests {
         let buf = vec![0xa5u8; PAGE];
         let runs = [run_over(&buf)];
         assert_eq!(
-            observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs), QUIET),
+            observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs), QUIET, next_gen()),
             GatherVerdict::Rearmed,
             "first sight has nothing to compare against"
         );
         assert_eq!(
-            observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs), QUIET),
+            observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs), QUIET, next_gen()),
             HOST_QUIET
         );
     }
@@ -650,13 +791,13 @@ mod tests {
         let mut buf = vec![0xa5u8; PAGE];
         let runs = [run_over(&buf)];
         assert_eq!(
-            observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs), QUIET),
+            observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs), QUIET, next_gen()),
             GatherVerdict::Rearmed
         );
         buf[100] ^= 0xff;
         host.guest_wrote_page(GPAS[0]);
         assert_eq!(
-            observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs), QUIET),
+            observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs), QUIET, next_gen()),
             GatherVerdict::MovedDiff
         );
     }
@@ -672,13 +813,13 @@ mod tests {
         let mut buf = vec![0xa5u8; PAGE];
         let runs = [run_over(&buf)];
         assert_eq!(
-            observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs), QUIET),
+            observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs), QUIET, next_gen()),
             GatherVerdict::Rearmed
         );
         // No `guest_wrote_page`: the bytes move with the bitmap none the wiser.
         buf[7] ^= 0xff;
         assert_eq!(
-            observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs), QUIET),
+            observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs), QUIET, next_gen()),
             GatherVerdict::CleanDiff {
                 host_wrote: false,
                 scoped_wrote: false,
@@ -704,7 +845,7 @@ mod tests {
         let mut buf = vec![0xa5u8; PAGE];
         let runs = [run_over(&buf)];
         assert_eq!(
-            observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs), QUIET),
+            observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs), QUIET, next_gen()),
             GatherVerdict::Rearmed
         );
         // The global count moves; this mapping's does not.
@@ -718,7 +859,8 @@ mod tests {
                 HostWriteCounts {
                     global: 2,
                     ..QUIET
-                }
+                },
+                next_gen()
             ),
             GatherVerdict::CleanDiff {
                 host_wrote: true,
@@ -739,11 +881,11 @@ mod tests {
         let buf = vec![0xa5u8; PAGE];
         let runs = [run_over(&buf)];
         assert_eq!(
-            observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs), QUIET),
+            observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs), QUIET, next_gen()),
             GatherVerdict::Rearmed
         );
         assert_eq!(
-            observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs), QUIET),
+            observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs), QUIET, next_gen()),
             GatherVerdict::Unarmed { fold_same: true }
         );
     }
@@ -758,16 +900,16 @@ mod tests {
         let runs = [run_over(&buf)];
         let moved = [9 * PAGE as u64];
         assert_eq!(
-            observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs), QUIET),
+            observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs), QUIET, next_gen()),
             GatherVerdict::Rearmed
         );
         assert_eq!(
-            observe(&mut w, &mut host, KEY, one_page(&moved, &runs), QUIET),
+            observe(&mut w, &mut host, KEY, one_page(&moved, &runs), QUIET, next_gen()),
             GatherVerdict::Rearmed,
             "same key, different pages: nothing to compare"
         );
         assert_eq!(
-            observe(&mut w, &mut host, KEY, one_page(&moved, &runs), QUIET),
+            observe(&mut w, &mut host, KEY, one_page(&moved, &runs), QUIET, next_gen()),
             HOST_QUIET
         );
     }
