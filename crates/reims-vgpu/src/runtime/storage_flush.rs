@@ -950,6 +950,7 @@ pub(crate) fn note_render_flush_landed(
     mapping_id: u32,
 ) -> Option<crate::model::RenderFlushWitness> {
     use crate::runtime::drain::note_store_route;
+    let now_us = crate::observe::elapsed_us();
     let m = state.mappings.get_mut(&mapping_id)?;
     let prior = std::mem::replace(
         &mut m.render_flush,
@@ -957,11 +958,20 @@ pub(crate) fn note_render_flush_landed(
             landed: true,
             cache_unread: true,
             pages_unread: true,
+            landed_us: now_us,
         },
     );
     if !prior.landed {
         return None;
     }
+    // How long the flush being replaced survived. Bucketed against the VBL
+    // interval, because that is what separates "the compositor repainted"
+    // from "this surface was written twice inside one drain tranche".
+    note_store_route(match now_us.saturating_sub(prior.landed_us) {
+        0..=999 => "render_flush_age_sub_ms",
+        1000..=8332 => "render_flush_age_sub_frame",
+        _ => "render_flush_age_frame_plus",
+    });
     note_store_route(if prior.cache_unread {
         "render_flush_cache_unread"
     } else {
@@ -2384,7 +2394,7 @@ mod render_flush_witness_tests {
     use super::{
         note_render_flush_cache_read, note_render_flush_landed, note_render_flush_pages_read,
     };
-    use crate::model::{DeviceId, DeviceState, MappingEntry, PAGE_SHIFT_X86, RenderFlushWitness};
+    use crate::model::{DeviceId, DeviceState, MappingEntry, PAGE_SHIFT_X86};
 
     fn state_with_mapping(mid: u32) -> DeviceState {
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
@@ -2404,13 +2414,26 @@ mod render_flush_witness_tests {
     fn the_first_landing_of_a_mapping_scores_nothing() {
         let mut state = state_with_mapping(7);
         assert_eq!(note_render_flush_landed(&mut state, 7), None);
+        let w = state.mappings[&7].render_flush;
         assert_eq!(
-            state.mappings[&7].render_flush,
-            RenderFlushWitness {
-                landed: true,
-                cache_unread: true,
-                pages_unread: true,
-            }
+            (w.landed, w.cache_unread, w.pages_unread),
+            (true, true, true)
+        );
+    }
+
+    /// The age is stamped from the landing, not left at the `Default` zero: a
+    /// zero stamp would score every second landing as a frame-plus survivor and
+    /// hide exactly the burst case the bucket exists to find.
+    #[test]
+    fn a_landing_stamps_the_time_it_landed() {
+        let mut state = state_with_mapping(7);
+        note_render_flush_landed(&mut state, 7);
+        let first = state.mappings[&7].render_flush.landed_us;
+        assert!(first > 0, "landing must stamp a live clock reading");
+        note_render_flush_landed(&mut state, 7);
+        assert!(
+            state.mappings[&7].render_flush.landed_us >= first,
+            "each landing re-stamps"
         );
     }
 

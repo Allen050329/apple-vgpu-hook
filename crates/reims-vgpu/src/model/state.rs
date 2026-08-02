@@ -517,6 +517,17 @@ pub struct RenderFlushWitness {
     /// No host-side reader has gathered the guest pages since the flush wrote
     /// them.
     pub pages_unread: bool,
+    /// `observe::elapsed_us` when the flush landed, so the next one can say how
+    /// long its predecessor survived.
+    ///
+    /// An unread flush replaced a whole frame later is the compositor
+    /// repainting, and is the rate the rail is designed for. An unread flush
+    /// replaced in under a millisecond is a *burst* superseding itself — the
+    /// same surface written and rewritten inside one drain tranche — and that
+    /// is work no fence boundary separated and nothing could have observed
+    /// between. The two have the same `pages_unread` and completely different
+    /// consequences, so the age is what tells them apart.
+    pub landed_us: u64,
 }
 
 /// IOSurface mapper registry entry keyed by mapping_id.
