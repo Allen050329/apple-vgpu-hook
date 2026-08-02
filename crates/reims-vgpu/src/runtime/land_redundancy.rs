@@ -127,7 +127,33 @@
 //! which is exact because every guest page size this runs on is a whole multiple
 //! of [`FINE_TILE`] and both are aligned in the same space.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+//! # The rail this licenses, and why it is opt-in
+//!
+//! [`write_skipping_identical`] is the mechanism the audit above prices: it
+//! compares each aligned tile against the destination and stores only the runs
+//! that differ, coalescing consecutive differing tiles so a partial landing is
+//! still a small number of large `memcpy`s rather than 32 400 tiny ones.
+//!
+//! It is behind `REIMS_VGPU_TILE_SKIP=1` and **not** on by default, because the
+//! audit does not predict its own saving. A skipped store costs a read of the
+//! destination that the store's read-for-ownership would have paid anyway, so
+//! the saving is the store traffic and the dirty writeback, not the whole
+//! store — and the fraction of `land_us` that is, is a property of this host's
+//! memory system rather than of the 86 %. The counterfactual
+//! `REIMS_VGPU_PROBE_NO_TILE_SKIP=1` keeps the compare and every counter and
+//! stores anyway, so one boot can measure both sides against one power state,
+//! which is the comparison `AGENTS.md` says is otherwise void.
+//!
+//! Unlike `REIMS_VGPU_PROBE_NO_RENDER_WRITEBACK`, **neither setting is
+//! incorrect.** All three configurations leave guest memory in the same state;
+//! they differ only in how many stores it took to get there.
+//!
+//! The scatter this builds is also the half a GPU-side compaction needs. Such a
+//! pass would supply the changed-tile set instead of the CPU deriving it, and
+//! would then also decline the copy across the bus — which the CPU compare
+//! cannot, because by the time it runs the bytes have already crossed.
+
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
 /// Audit one write in this many.
 ///
@@ -162,6 +188,47 @@ static PAGES: AtomicU64 = AtomicU64::new(0);
 static SAME_PAGES: AtomicU64 = AtomicU64::new(0);
 static FINE: AtomicU64 = AtomicU64::new(0);
 static SAME_FINE: AtomicU64 = AtomicU64::new(0);
+static STORED: AtomicU64 = AtomicU64::new(0);
+static RAILED: AtomicU64 = AtomicU64::new(0);
+
+/// Whether this boot lets the rail decline stores, and whether it stores anyway.
+///
+/// Two independent latches rather than one tri-state, because they answer
+/// different questions and a reader of the log needs to see both: the first says
+/// the rail ran at all, the second says its saving was deliberately given back.
+/// Each is read once per process.
+fn env_latch(name: &str, state: &AtomicU8) -> bool {
+    match state.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            // Exactly `1`, for the reason `render_writeback_counterfactual`
+            // records: a switch that also accepted `0` or `false` as "set" runs
+            // the opposite of what anyone exporting it to turn the thing off
+            // intended.
+            let on = std::env::var_os(name).is_some_and(|v| v == "1");
+            state.store(u8::from(on), Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// Whether the tile rail may decline a store. Off by default; see the module
+/// doc for why the audit does not predict its own saving.
+pub fn tile_skip_enabled() -> bool {
+    static STATE: AtomicU8 = AtomicU8::new(u8::MAX);
+    env_latch("REIMS_VGPU_TILE_SKIP", &STATE)
+}
+
+/// Whether the rail compares and counts but stores every tile anyway.
+///
+/// The control arm, and it is a *correct* boot: it lands exactly the bytes the
+/// eager path lands. It exists so both sides can be measured on one boot in one
+/// host GPU power state.
+fn tile_skip_counterfactual() -> bool {
+    static STATE: AtomicU8 = AtomicU8::new(u8::MAX);
+    env_latch("REIMS_VGPU_PROBE_NO_TILE_SKIP", &STATE)
+}
 
 /// One window of the audit, as taken by the per-second census.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -179,6 +246,12 @@ pub struct LandRedundancyWindow {
     pub same_pages: u64,
     pub fine: u64,
     pub same_fine: u64,
+    /// Ranges that went through the rail rather than the sampled audit, and the
+    /// bytes it actually stored out of their `bytes`. Under the counterfactual
+    /// `stored` equals `bytes`, which is how a control boot announces itself in
+    /// the line rather than only in the environment.
+    pub railed: u64,
+    pub stored: u64,
 }
 
 /// Take and clear the window. `None` when nothing was audited, so an idle
@@ -193,6 +266,8 @@ pub fn take_window() -> Option<LandRedundancyWindow> {
         same_pages: SAME_PAGES.swap(0, Ordering::Relaxed),
         fine: FINE.swap(0, Ordering::Relaxed),
         same_fine: SAME_FINE.swap(0, Ordering::Relaxed),
+        railed: RAILED.swap(0, Ordering::Relaxed),
+        stored: STORED.swap(0, Ordering::Relaxed),
     };
     // Gated on ranges compared rather than on walks admitted: a walk that was
     // due and then wrote nothing has no fraction to report, and a line of zeros
@@ -242,6 +317,96 @@ pub unsafe fn note_write(map_off: u64, dst: *const u8, src: &[u8], page_size: u6
     SAME_PAGES.fetch_add(tally.same_pages, Ordering::Relaxed);
     FINE.fetch_add(tally.fine, Ordering::Relaxed);
     SAME_FINE.fetch_add(tally.same_fine, Ordering::Relaxed);
+}
+
+/// Store `src` at `dst`, declining the aligned tiles that already hold exactly
+/// those bytes, and charge what was compared and what was stored to the window.
+///
+/// Returns the bytes actually stored. Consecutive differing tiles are coalesced
+/// into one `copy_nonoverlapping`, so the common shape — a vertical band of
+/// change crossing every row — costs one large store per row rather than one per
+/// tile. The head and tail bytes outside the first and last aligned tile are
+/// always stored: they are not a unit this can decline, and leaving them would
+/// lose bytes rather than save them.
+///
+/// # Safety
+///
+/// `dst` must be valid for reads **and** writes for `src.len()` bytes. Every
+/// caller is about to write exactly that range through the same pointer; the
+/// extra requirement over a plain store is the read, which is what the compare
+/// needs.
+pub unsafe fn write_skipping_identical(
+    map_off: u64,
+    dst: *mut u8,
+    src: &[u8],
+    page_size: u64,
+) -> u64 {
+    if src.is_empty() {
+        return 0;
+    }
+    RUNS.fetch_add(1, Ordering::Relaxed);
+    RAILED.fetch_add(1, Ordering::Relaxed);
+    BYTES.fetch_add(src.len() as u64, Ordering::Relaxed);
+    // The tally is taken before anything is stored, so it describes the frame
+    // the guest's pages held rather than the one being put there. The borrow is
+    // scoped to this statement: no reference to the destination may outlive a
+    // store into its own range.
+    //
+    // SAFETY: the caller guarantees `dst` is readable for `src.len()` bytes.
+    let tally = {
+        let dst_read = unsafe { std::slice::from_raw_parts(dst as *const u8, src.len()) };
+        compare(map_off, src, dst_read, page_size)
+    };
+    let store_everything = tile_skip_counterfactual();
+    let fine = FINE_TILE as u64;
+    let head = usize::try_from(map_off.next_multiple_of(fine) - map_off)
+        .unwrap_or(src.len())
+        .min(src.len());
+    let tail_start = head + ((src.len() - head) / FINE_TILE) * FINE_TILE;
+    let mut stored = 0u64;
+    // SAFETY: `at + len <= src.len()` at every call below, and the caller
+    // guarantees `dst` is writable for that whole length. `src` is the readback
+    // staging buffer and `dst` is guest RAM, which never alias.
+    let mut store = |at: usize, len: usize| {
+        if len == 0 {
+            return;
+        }
+        unsafe { std::ptr::copy_nonoverlapping(src.as_ptr().add(at), dst.add(at), len) };
+        stored += len as u64;
+    };
+    store(0, head);
+    store(tail_start, src.len() - tail_start);
+    // One pass over the whole tiles, emitting a store per maximal run of
+    // differing ones. `run_start` is where the current run began, or `None`
+    // between runs. Each tile's destination is borrowed for the length of its
+    // own comparison and released before the store that follows, which covers
+    // only tiles already compared.
+    let mut run_start: Option<usize> = None;
+    let mut at = head;
+    while at < tail_start {
+        // SAFETY: `at + FINE_TILE <= tail_start <= src.len()`.
+        let same = !store_everything
+            && src[at..at + FINE_TILE]
+                == *unsafe { std::slice::from_raw_parts(dst.add(at) as *const u8, FINE_TILE) };
+        match (same, run_start) {
+            (false, None) => run_start = Some(at),
+            (true, Some(from)) => {
+                store(from, at - from);
+                run_start = None;
+            }
+            _ => {}
+        }
+        at += FINE_TILE;
+    }
+    if let Some(from) = run_start {
+        store(from, tail_start - from);
+    }
+    PAGES.fetch_add(tally.pages, Ordering::Relaxed);
+    SAME_PAGES.fetch_add(tally.same_pages, Ordering::Relaxed);
+    FINE.fetch_add(tally.fine, Ordering::Relaxed);
+    SAME_FINE.fetch_add(tally.same_fine, Ordering::Relaxed);
+    STORED.fetch_add(stored, Ordering::Relaxed);
+    stored
 }
 
 /// What one compared range contributed, before it reaches the atomics.
@@ -430,6 +595,103 @@ mod tests {
         let w = take_window().expect("one audit");
         assert_eq!((w.pages, w.same_pages), (0, 0), "{w:?}");
         assert!(w.fine > 0, "{w:?}");
+    }
+
+    /// The rail's whole justification: whatever it declines to store, the
+    /// destination ends up holding exactly the bytes a plain copy would have
+    /// left. Every other test here is about how *many* stores it took.
+    #[test]
+    fn the_destination_ends_identical_to_what_a_plain_copy_would_leave() {
+        reset();
+        let len = 8 * PAGE as usize + 133;
+        let mut src = vec![0u8; len];
+        let mut dst = vec![0u8; len];
+        // A destination that already agrees in wide stretches and differs in
+        // scattered runs, plus a head and tail outside any aligned tile.
+        for (i, b) in src.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        dst.copy_from_slice(&src);
+        for i in [0usize, 5, 900, 901, 4097, 4098, 20_000, len - 1] {
+            dst[i] ^= 0xFF;
+        }
+        let expected = src.clone();
+        let stored = unsafe { write_skipping_identical(3 * PAGE + 64, dst.as_mut_ptr(), &src, PAGE) };
+        assert_eq!(dst, expected, "the rail left the destination different");
+        assert!(stored > 0 && stored < len as u64, "stored={stored} of {len}");
+    }
+
+    /// A destination that already holds the frame costs no store at all beyond
+    /// the unaligned head and tail, which are not a unit the rail can decline.
+    #[test]
+    fn an_identical_destination_stores_only_the_unaligned_ends() {
+        reset();
+        let src = vec![0x5Au8; 4 * PAGE as usize];
+        let mut dst = src.clone();
+        let stored = unsafe { write_skipping_identical(0, dst.as_mut_ptr(), &src, PAGE) };
+        assert_eq!(stored, 0, "an aligned identical frame stored bytes");
+        let w = take_window().expect("the rail reports");
+        assert_eq!((w.railed, w.stored), (1, 0), "{w:?}");
+        assert_eq!(w.same_fine, w.fine, "{w:?}");
+    }
+
+    /// Consecutive differing tiles are stored as one run. Without coalescing a
+    /// vertical band of change crossing every row would be one `memcpy` per
+    /// tile, which is the shape this rail exists to avoid producing.
+    #[test]
+    fn consecutive_differing_tiles_are_stored_as_one_run() {
+        reset();
+        let src = vec![1u8; 16 * FINE_TILE];
+        let mut dst = vec![1u8; 16 * FINE_TILE];
+        // Tiles 4..=9 differ, the rest match.
+        for b in dst[4 * FINE_TILE..10 * FINE_TILE].iter_mut() {
+            *b = 2;
+        }
+        let stored = unsafe { write_skipping_identical(0, dst.as_mut_ptr(), &src, PAGE) };
+        assert_eq!(stored, 6 * FINE_TILE as u64, "{stored}");
+        assert_eq!(dst, src);
+    }
+
+    /// The counterfactual stores every byte and still reports the same
+    /// comparison, so a boot can measure both sides against one power state.
+    /// It is a correct configuration, not a broken one: the destination is the
+    /// same either way.
+    #[test]
+    fn the_counterfactual_stores_everything_and_still_counts() {
+        reset();
+        let src = vec![9u8; 2 * PAGE as usize];
+        let mut dst = src.clone();
+        // Exercised through the same walk the latch guards; the latch itself is
+        // process-wide, so this asserts the shape the two arms share rather
+        // than flipping it.
+        let stored = unsafe { write_skipping_identical(0, dst.as_mut_ptr(), &src, PAGE) };
+        let w = take_window().expect("the rail reports");
+        let all = 2 * PAGE;
+        assert_eq!(w.bytes, all, "{w:?}");
+        assert_eq!(w.same_fine, w.fine, "{w:?}");
+        assert_eq!(
+            stored,
+            if tile_skip_counterfactual() { all } else { 0 },
+            "the latch and the store count disagree"
+        );
+    }
+
+    /// Neither latch is on unless its variable is exactly `1`. A switch that
+    /// accepted `0` would run the opposite of what exporting it to turn the
+    /// rail off intends.
+    #[test]
+    fn a_latch_needs_exactly_one() {
+        for v in ["0", "", "false", "true", "01"] {
+            let state = AtomicU8::new(u8::MAX);
+            unsafe { std::env::set_var("REIMS_VGPU_TILE_SKIP_LATCH_TEST", v) };
+            assert!(
+                !env_latch("REIMS_VGPU_TILE_SKIP_LATCH_TEST", &state),
+                "{v:?} turned the latch on"
+            );
+        }
+        let state = AtomicU8::new(u8::MAX);
+        unsafe { std::env::set_var("REIMS_VGPU_TILE_SKIP_LATCH_TEST", "1") };
+        assert!(env_latch("REIMS_VGPU_TILE_SKIP_LATCH_TEST", &state));
     }
 
     /// One write in `AUDIT_STRIDE` is compared, and `calls` records the rest so
