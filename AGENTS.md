@@ -362,6 +362,16 @@ across two builds that read exactly like a 2x regression, and the "regressing"
 change re-probed on the same boot at **117.3**. Four boots were spent before
 re-probing rather than rebooting settled it.
 
+**Three probes are not enough either, and the low one is not always first.** A
+later session read **119.7, 121.3, 122.1** on one boot and **59.6, 60.8, 64.2**
+on the boot before it — three probes each, consistent within each boot, and it
+looked exactly like a 2x improvement from the one change between them. A third
+boot on the *same* binary then read **119.3, 59.6, 119.3**. The low mode arrived
+second, so neither "use the later reading" nor "three agreeing probes" survives;
+what the guest latches is stable for minutes at a time and independent of the
+build. Take the device-side counters as the result and rAF as decoration, and if
+you must cite rAF, cite every probe you took rather than a summary of them.
+
 ```sh
 # Probe at least twice on one boot; use the later reading, and say which.
 for r in 1 2 3; do PROBE_SECONDS=20 scripts/browser-probe/web-gpu-probe.sh safari; sleep 20; done
