@@ -60,5 +60,13 @@ Do not cut on the report alone. Read the emitting code. These are all fine:
   one boot.
 - **A support-matrix cell** selected by a host *capability* rather than by the
   workload, per `AGENTS.md`.
+- **One cell of a partition, where the constant value is the measurement.**
+  `land_redundancy`'s `under_50=0` says no render-writeback landing is under
+  half already-correct — the finding that licensed a GPU tile pass over a
+  landing-granular skip. It is single-valued on every driven second measured,
+  and the four buckets partition the whole range, so there is no field it would
+  be traded for: deleting it deletes the result. This class is the hardest of
+  the five to spot, because the field looks exactly like a vestigial counter and
+  the value it holds is the one a vestigial counter holds.
 
 The report points at code; it does not convict it.

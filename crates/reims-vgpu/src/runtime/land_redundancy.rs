@@ -255,6 +255,14 @@
 //! twenty-four between the cheap build and the expensive one, so the cheap one
 //! is not a first step towards the other; it is a different, much smaller thing.
 //!
+//! **`under_50` is single-valued on a driven boot, and it is not a dead field.**
+//! `constant-fields.sh` reports a `key=value` that only ever takes one value,
+//! and this one takes only `0` on every driven second measured so far. That
+//! reading *is* the result — it says no landing is under half redundant — and
+//! the bucket it would be traded for does not exist, because the four partition
+//! the range. Deleting it would delete the finding. A window with no motion at
+//! all is where a non-zero could come from, and nobody has driven one that way.
+//!
 //! The `under_50` column reading **zero** across all 114 is the second finding.
 //! Every landing this rail carries is at least half already-correct and most are
 //! over nine tenths, so a tile pass would collect near-uniformly rather than
