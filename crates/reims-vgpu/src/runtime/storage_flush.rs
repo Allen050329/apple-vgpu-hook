@@ -903,6 +903,34 @@ pub fn flush_linear_windows_before_fence<M: HostMemory + HostOps>(
 /// - Punching a page out loses whatever the guest had put there, so the content
 ///   to fill with has to be captured before the punch, not after.
 ///
+/// ## Which pages to register, and where the route stops
+///
+/// A `userfaultfd` registration only traps accesses made through the VMA it was
+/// registered on, so "register the pages" has to mean the VMA KVM's memslot
+/// `userspace_addr` points at, and not some second alias of the same physical
+/// memory. [`crate::runtime::host::HostOps::map_pages`] is the crate's only
+/// handle on a host VA for guest pages, and the two shims answer differently:
+///
+/// - **x86/PCI is the pathway this works on.** Its shim never allocates: it
+///   translates and hands back `memory_region_get_ram_ptr(mr) + xlat`, which is
+///   QEMU's own RAMBlock pointer, and answers `map_pages_stable = 1` for exactly
+///   that reason. `vm/boot-x86.sh` passes plain `-m` with no memory backend
+///   object, so guest RAM is a conventional anonymous mapping — the case uffd
+///   handles best. A registration on that range does trap the vCPU.
+/// - **arm64/MMIO cannot take this route at all**, for two independent reasons.
+///   Its shim answers `map_pages_stable = 0` because a page list that is not
+///   host-contiguous gets a packed `mach_vm_remap` view — a second alias, which
+///   a fault registration on the RAMBlock would not cover and which would not
+///   itself trap the vCPU. And its host is macOS, which has no `userfaultfd`.
+///
+/// So the read witness is a **Linux-host mechanism**, and shipping it would
+/// leave the arm64/macOS pathway on the eager rail with no equivalent. That is
+/// not a reason to skip it — x86 is where the cost was measured — but it is a
+/// reason not to write it as though it were the general answer, and a reason
+/// the eager rail cannot be deleted behind it. The dirty bitmap does not have
+/// this problem: KVM indexes it by physical address, so a write through any
+/// alias is seen.
+///
 /// # Ordering
 ///
 /// Render windows first in arm order, then whatever remains, and both through
