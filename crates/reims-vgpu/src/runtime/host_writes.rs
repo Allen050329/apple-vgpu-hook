@@ -8,7 +8,7 @@
 //!
 //! Three candidate rules were scored against a full content fold before this one
 //! was built, each by its own census counter. Those counters are gone with the
-//! rules they scored — [`super::gather_witness`] takes only the page-exact answer
+//! rules they scored — [`crate::runtime::gather_witness`] takes only the page-exact answer
 //! now — so the names below are what the readings were called at the time and are
 //! not greppable in a current log.
 //!
@@ -36,7 +36,7 @@
 //! moved.
 //!
 //! That measurement is what the fold is still there for. It runs on one bind in
-//! [`super::gather_witness::AUDIT_STRIDE`] rather than all of them, and its
+//! [`crate::runtime::gather_witness::AUDIT_STRIDE`] rather than all of them, and its
 //! counterexample cell is `gw_audit_unsound`: a standing alarm on the rule this
 //! module exists to make sound, rather than the per-bind decision it began as.
 //!
