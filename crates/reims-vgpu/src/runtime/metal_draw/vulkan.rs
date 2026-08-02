@@ -6245,6 +6245,75 @@ fn arm_surface_deferred_store_with<M: HostMemory + HostOps>(
 /// draw's `target_identity` — so the slot pinned and stamped is the slot the draw
 /// rendered into. Deriving it a second way here is how a pin ends up protecting
 /// an image the frame is not in.
+/// Census: how much of the attachment does the Store that arms a window
+/// actually touch?
+///
+/// The render deferred-flush rail reads back and scatters the **whole**
+/// attachment for every window it lands — a gigabyte a second on a driven
+/// 1080p boot, of which `RenderFlushWitness` measures 99% as read by nothing.
+/// The rail's own note says the remaining lever is moving fewer bytes, and the
+/// guest already supplies the rect that would say which: `OP_SET_SCISSOR` is
+/// decoded verbatim into `req.scissor` and, as `note_draw_coverage` records, a
+/// partial scissor is the compositor's damage rect carried faithfully — this
+/// device computes, clamps and derives nothing from it.
+///
+/// So the question this answers is whether a damage-limited writeback could pay
+/// on the composite rail specifically. `draw_scissor_partial` already says 35%
+/// of *all* draws are scissored, but that is every draw on every target; the
+/// Stores that arm a window are a different population and could easily be the
+/// full-screen ones. Bucketed by coverage rather than summed, because a mean
+/// over a bimodal population (full-screen composites plus small damage rects)
+/// would describe neither.
+///
+/// A rate, not a refusal: a full-coverage Store is entirely ordinary.
+#[cfg(feature = "backend-vulkan")]
+fn note_store_damage_coverage(req: &DrawEncodeRequest, width: u32, height: u32) {
+    let Some((route, covered, attach)) = store_damage_bucket(req.scissor, width, height) else {
+        return;
+    };
+    crate::runtime::drain::note_store_route(route);
+    // The saving a damage-limited writeback would make is the area, so carry it
+    // as texels too: the bucket says how the population splits, this pair says
+    // what the split is worth.
+    crate::runtime::drain::note_store_route_n("store_damage_texels", covered);
+    crate::runtime::drain::note_store_route_n("store_attach_texels", attach);
+}
+
+/// The arithmetic behind [`note_store_damage_coverage`]: which bucket a Store's
+/// scissor falls in, and the covered/attachment texel pair behind it.
+///
+/// `None` for a degenerate attachment, which has no coverage to report.
+#[cfg(feature = "backend-vulkan")]
+fn store_damage_bucket(
+    scissor: Option<(u32, u32, u32, u32)>,
+    width: u32,
+    height: u32,
+) -> Option<(&'static str, u64, u64)> {
+    let attach = u64::from(width).saturating_mul(u64::from(height));
+    if attach == 0 {
+        return None;
+    }
+    let Some((x, y, sw, sh)) = scissor else {
+        // No scissor is the whole attachment by declaration, and it is the
+        // arm's default: counting it keeps the buckets a partition rather than
+        // a filtered view of the scissored minority.
+        return Some(("store_damage_unscissored", attach, attach));
+    };
+    // Clamped to the attachment: a scissor may legally exceed it, and an
+    // unclamped product would report over 100% coverage.
+    let w = sw.min(width.saturating_sub(x.min(width)));
+    let h = sh.min(height.saturating_sub(y.min(height)));
+    let covered = u64::from(w).saturating_mul(u64::from(h));
+    let route = match covered.saturating_mul(100) / attach {
+        0..=9 => "store_damage_le10pct",
+        10..=24 => "store_damage_le25pct",
+        25..=49 => "store_damage_le50pct",
+        50..=89 => "store_damage_le90pct",
+        _ => "store_damage_full",
+    };
+    Some((route, covered, attach))
+}
+
 #[cfg(feature = "backend-vulkan")]
 fn arm_surface_resident_store<M: HostMemory + HostOps>(
     state: &mut DeviceState,
@@ -6284,6 +6353,7 @@ fn arm_surface_resident_store<M: HostMemory + HostOps>(
         .fail_once(u64::from(mapping_id));
         return None;
     }
+    note_store_damage_coverage(req, width, height);
     if !crate::backend::vulkan::engine::pin_resident_target(&identity) {
         crate::observe::Emit::decline(
             "surface_resident_arm",
@@ -7905,5 +7975,58 @@ mod vulkan_split_tests {
             gen_a,
             "two allocations at one secondary address must not share one image"
         );
+    }
+}
+
+#[cfg(all(test, feature = "backend-vulkan"))]
+mod store_damage_tests {
+    use super::store_damage_bucket;
+
+    /// The bucket is a partition, not a filter: an unscissored Store is the
+    /// whole attachment by declaration and has to be counted, or the census
+    /// reads as though every Store were a small damage rect.
+    #[test]
+    fn an_unscissored_store_counts_as_the_whole_attachment() {
+        assert_eq!(
+            store_damage_bucket(None, 1920, 1080),
+            Some(("store_damage_unscissored", 1920 * 1080, 1920 * 1080))
+        );
+    }
+
+    /// The whole point of the measurement: a compositor damage rect must land
+    /// in a small bucket and carry its own area, since that area is what a
+    /// damage-limited writeback would save.
+    #[test]
+    fn a_small_damage_rect_lands_in_the_small_bucket_with_its_area() {
+        let (route, covered, attach) =
+            store_damage_bucket(Some((100, 100, 192, 108)), 1920, 1080).expect("live attachment");
+        assert_eq!(route, "store_damage_le10pct");
+        assert_eq!(covered, 192 * 108);
+        assert_eq!(attach, 1920 * 1080);
+    }
+
+    /// A scissor may legally exceed the attachment. Unclamped it would report
+    /// over 100% coverage and inflate `store_damage_texels` past
+    /// `store_attach_texels`, which would make the ratio the census exists to
+    /// produce meaningless.
+    #[test]
+    fn a_scissor_larger_than_the_attachment_is_clamped_to_it() {
+        let (route, covered, attach) =
+            store_damage_bucket(Some((0, 0, 4096, 4096)), 1920, 1080).expect("live attachment");
+        assert_eq!(route, "store_damage_full");
+        assert_eq!(covered, attach);
+
+        // Offset past the edge leaves nothing, rather than wrapping.
+        let (route, covered, _) =
+            store_damage_bucket(Some((1920, 1080, 64, 64)), 1920, 1080).expect("live attachment");
+        assert_eq!(route, "store_damage_le10pct");
+        assert_eq!(covered, 0);
+    }
+
+    /// A degenerate attachment has no coverage to report and must not divide.
+    #[test]
+    fn a_zero_attachment_reports_nothing() {
+        assert_eq!(store_damage_bucket(Some((0, 0, 8, 8)), 0, 1080), None);
+        assert_eq!(store_damage_bucket(None, 1920, 0), None);
     }
 }
