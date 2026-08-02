@@ -1338,6 +1338,7 @@ pub(crate) unsafe fn execute_draw_inner(
 
     // Resolve sampled images only after ensuring the render target so registry
     // capacity eviction cannot destroy an image already selected for this draw.
+    phase.enter(super::draw_phase::Phase::AcquireSampled);
     let mut sampled = Vec::new();
     for resource in &req.sampled_images {
         match &resource.source {

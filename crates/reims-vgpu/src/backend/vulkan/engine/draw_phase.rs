@@ -28,7 +28,8 @@
 //! | `pipeline` | there | shaders, layout, pass and pipeline are resolved |
 //! | `stage` | there | vertex/index/storage/seed bytes are in staging |
 //! | `stage_pass` | there | the primary render pass is resolved |
-//! | `acquire` | there | target, sampled and readback images are held |
+//! | `acquire` | there | the render target, its framebuffer and any transient depth are held |
+//! | `acquire_sampled` | there | every sampled image the draw binds is held |
 //! | `descriptors` | there | the descriptor set is written |
 //! | `record` | there | the CB is ended |
 //! | `submit` | there | `queue_submit` returns |
@@ -39,9 +40,38 @@
 //! that one number came out at 37% of all draw time while `record` — encoding
 //! the actual commands — came out at 1%, and the four have nothing in common
 //! but their position. `stage` is host memcpy into mapped staging and scales
-//! with bytes; `acquire` is `vkCreateImage`/`vkAllocateMemory`/slab and scales
-//! with churn; `pipeline` is driver compiles; `descriptors` is pool pressure.
+//! with bytes; `pipeline` is driver compiles; `descriptors` is pool pressure.
 //! Each has a different fix and one bar cannot choose between them.
+//!
+//! # Why `acquire` is two numbers and not one
+//!
+//! `acquire` used to cover both the render target and the sampled images, and
+//! its description here said it "scales with churn" — meaning
+//! `vkCreateImage`/`vkAllocateMemory`/slab. On a driven x86/Vulkan boot that
+//! description sent a reader after the wrong cost, so the phase was split where
+//! the two populations meet.
+//!
+//! What convicted the churn reading is a regression of the two counters against
+//! each other across 32 driven one-second windows. If `acquire` were creates,
+//! `acquire_us / creates` would be flat; it is not, and it moves the wrong way:
+//!
+//! ```text
+//! draws   acquire_us   creates   us/create   us/draw
+//!   980        81715        96         851      83.4
+//!   118        17205       168         102     145.8
+//! ```
+//!
+//! The window with **more** creates and an eighth of the draws spent a fifth of
+//! the time. Across all 32 windows `us/create` ranges 402-1141 while `us/draw`
+//! holds 73-146, so the phase is paid per draw, not per creation — and it is
+//! paid on the cache-*hit* path, because those windows report `gen_mismatch=0`,
+//! `target_evicts=0` and every `*_misses` counter at 0. `registry_ensure`'s hit
+//! arm is a `HashMap` get and a touch, which cannot be 85 us.
+//!
+//! That leaves the sampled loop, which is the rest of the phase and runs once
+//! per bound texture per draw. Splitting it out is what distinguishes "the
+//! target was expensive to hold" from "the textures were", and the two have
+//! nothing in common but their position — the same argument that split `setup`.
 //!
 //! A draw that returns early — a decline, a batched deferred submit, a
 //! `skip_readback` target — charges its remainder to whichever phase was open,
@@ -78,14 +108,15 @@ pub(crate) enum Phase {
     Stage = 2,
     StagePass = 3,
     Acquire = 4,
-    Descriptors = 5,
-    Record = 6,
-    Submit = 7,
-    Wait = 8,
-    Readback = 9,
+    AcquireSampled = 5,
+    Descriptors = 6,
+    Record = 7,
+    Submit = 8,
+    Wait = 9,
+    Readback = 10,
 }
 
-const PHASES: usize = 10;
+const PHASES: usize = 11;
 
 static ACC: [AtomicU64; PHASES] = [const { AtomicU64::new(0) }; PHASES];
 static DRAWS: AtomicU64 = AtomicU64::new(0);
@@ -101,6 +132,7 @@ pub struct DrawPhaseWindow {
     pub stage_us: u64,
     pub stage_pass_us: u64,
     pub acquire_us: u64,
+    pub acquire_sampled_us: u64,
     pub descriptors_us: u64,
     pub record_us: u64,
     pub submit_us: u64,
@@ -121,6 +153,7 @@ pub fn take_window() -> Option<DrawPhaseWindow> {
         stage_us: ACC[Phase::Stage as usize].swap(0, Ordering::Relaxed),
         stage_pass_us: ACC[Phase::StagePass as usize].swap(0, Ordering::Relaxed),
         acquire_us: ACC[Phase::Acquire as usize].swap(0, Ordering::Relaxed),
+        acquire_sampled_us: ACC[Phase::AcquireSampled as usize].swap(0, Ordering::Relaxed),
         descriptors_us: ACC[Phase::Descriptors as usize].swap(0, Ordering::Relaxed),
         record_us: ACC[Phase::Record as usize].swap(0, Ordering::Relaxed),
         submit_us: ACC[Phase::Submit as usize].swap(0, Ordering::Relaxed),
@@ -203,13 +236,14 @@ impl Drop for DrawTimer {
         };
         crate::observe::off(format!(
             "draw_stall us={total} prep_us={} pipeline_us={} stage_us={} stage_pass_us={} \
-             acquire_us={} descriptors_us={} record_us={} submit_us={} wait_us={} \
-             readback_us={} geom={w}x{h} readback_bytes={} exit={:?}{latched}",
+             acquire_us={} acquire_sampled_us={} descriptors_us={} record_us={} submit_us={} \
+             wait_us={} readback_us={} geom={w}x{h} readback_bytes={} exit={:?}{latched}",
             self.us[Phase::Prep as usize],
             self.us[Phase::Pipeline as usize],
             self.us[Phase::Stage as usize],
             self.us[Phase::StagePass as usize],
             self.us[Phase::Acquire as usize],
+            self.us[Phase::AcquireSampled as usize],
             self.us[Phase::Descriptors as usize],
             self.us[Phase::Record as usize],
             self.us[Phase::Submit as usize],
@@ -244,6 +278,54 @@ mod tests {
         // inheriting the tail.
         assert_eq!(w.readback_us, 0);
         assert_eq!(w.submit_us, 0);
+    }
+
+    /// Holding the render target and holding the sampled images are separate
+    /// accumulators, so a draw that spends its time in the sampled loop cannot
+    /// be read as an expensive target.
+    ///
+    /// This is the whole point of the split: the pooled number said "acquire"
+    /// and was read as `vkCreateImage` churn, when the per-draw regression said
+    /// it could not be. Re-pooling the two would restore exactly that ambiguity.
+    ///
+    /// The failure this actually guards is a **readout** mis-wiring —
+    /// `acquire_sampled_us` taken from `ACC[Phase::Acquire]` — which compiles,
+    /// and which reads as a sampled loop that costs nothing. Verified by making
+    /// that edit: the assertion below fires. A duplicate discriminant is *not*
+    /// what this covers, because rustc rejects it (E0081) before the test runs.
+    #[test]
+    fn the_sampled_loop_is_charged_apart_from_the_target() {
+        // The phases themselves take nanoseconds, so without a measurable sleep
+        // every slot reads 0 and the assertions below would pass under a slot
+        // collision too. The sleep is what gives the test its power: it is spent
+        // entirely inside the sampled loop, so only that slot may carry it.
+        const SAMPLED_SLEEP: std::time::Duration = std::time::Duration::from_millis(4);
+        let _ = take_window();
+        {
+            let mut t = DrawTimer::start();
+            t.enter(Phase::Acquire);
+            t.enter(Phase::AcquireSampled);
+            std::thread::sleep(SAMPLED_SLEEP);
+            // Dropped with the sampled loop open, as a decline on a texture
+            // that cannot be resolved would leave it.
+        }
+        let w = take_window().expect("a dropped timer counts a draw");
+        assert_eq!(w.draws, 1);
+        // The sleep landed, so the two slots are genuinely being compared.
+        assert!(
+            w.acquire_sampled_us >= 2_000,
+            "sampled loop lost its own time: {w:?}"
+        );
+        // The remainder belongs to the phase that was open. `Acquire` closed
+        // when the sampled loop opened, so it must not have absorbed it.
+        assert_eq!(
+            w.acquire_us, 0,
+            "target acquisition charged time the sampled loop spent: {w:?}"
+        );
+        // Every later phase stays clean, so the tail did not simply spill.
+        assert_eq!(w.descriptors_us, 0);
+        assert_eq!(w.record_us, 0);
+        assert_eq!(w.readback_us, 0);
     }
 
     /// An idle second must produce no line at all: the census divides against
