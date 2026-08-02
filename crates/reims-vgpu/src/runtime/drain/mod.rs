@@ -3909,6 +3909,37 @@ impl VcpuLockCensus {
 /// adds work rather than interrupting any. `queued_offsets` is here to say which
 /// registers those actually are, because "apply it sooner" is only safe for
 /// registers whose effect is to publish more work.
+///
+/// # It is one register, and it is the one that only publishes work
+///
+/// `offsets=1` on every window of a driven boot that queued anything, with no
+/// exceptions:
+///
+/// ```text
+/// queued=106 direct=434  off_0x1020=106/25246
+/// queued=92  direct=426  off_0x1020=92/20589
+/// queued=110 direct=436  off_0x1020=110/25296
+/// queued=40  direct=291  off_0x1020=40/45487
+/// ```
+///
+/// `0x1020` is [`crate::model::GFX_REG_CHILD_DOORBELL`]. Every other register
+/// the guest writes finds the lock free; the entire stall is one doorbell, rung
+/// about a hundred times a second and applied up to 45 ms later.
+///
+/// That is the best case the paragraph above could have hoped for. A doorbell
+/// carries no state the decode depends on — its whole effect is to say a child
+/// channel has work — so there is nothing about it that has to be ordered
+/// against a tranche in flight, and picking it up mid-tranche only lengthens the
+/// work list. The two registers already served lock-free
+/// (`GFX_REG_INTR_STATUS_DISP` / `_GPU`) are lock-free for exactly this reason.
+///
+/// Note the shape of the remaining risk, which is not this census's to answer:
+/// recording the doorbell sooner is not the same as *acting* on it sooner. A bit
+/// set in an atomic while `drain_pending` is midway through its channel loop
+/// still waits for the next tranche unless that loop re-reads the mask. Making
+/// it re-read is the un-refuted half of the budget experiment — that one
+/// returned early and left `child_mask` set with nothing to re-arm it, and froze
+/// a boot for 29 s; adding to the mask and continuing has no such gap.
 #[derive(Default)]
 pub(crate) struct DoorbellCensus {
     queued: std::sync::atomic::AtomicU64,
