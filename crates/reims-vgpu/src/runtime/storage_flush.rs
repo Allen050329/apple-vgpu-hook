@@ -806,10 +806,25 @@ pub fn flush_mapping_windows_before_fence<M: HostMemory + HostOps>(
     // per-window rates and read 104/s whether that is 104 fences of one window
     // or 52 of two.
     //
-    // It decides the cost of submitting each window's readback at arm time
-    // instead of at the fence: that trades the fence's blocking wait for a
-    // staging buffer held per armed window, so a concurrency of one is nearly
-    // free and a concurrency near `SURFACE_DEFERRED_WINDOW_CAP` (16) is 133 MB.
+    // **Measured, and the answer is one.** A driven x86/PCI second reads
+    // `mapw_fence_pass=116 mapw_fence_flush=116 surface_resident=116
+    // surface_flush=116` — all four equal, on three consecutive windows. So the
+    // concurrency is exactly 1: every armed window is landed by the very next
+    // fence, and no fence ever lands two.
+    //
+    // Two things follow, and both are negative results worth keeping. Batching
+    // the readbacks — one submit and one fence for N windows — cannot pay,
+    // because N is 1. And the deferral saves no readback at all: arming and
+    // flushing are the same rate, so it only moves the readback from the Store
+    // to the fence a moment later. That is consistent with `ResidentArmCensus`
+    // measuring a mean arm-to-flush age of 351 us against a 2.6 ms fence, which
+    // is the same finding from the other side and is why submitting at arm time
+    // was refuted: there is no interval to hide the wait in.
+    //
+    // What is left is volume. These 116 flushes are 116 whole 1920x1080 frames,
+    // 962 MB/s, read back for ~62 presented frames; every phase in
+    // `ReadbackPhase` is proportional to it. Reading back less than the whole
+    // attachment is the only lever this census leaves open.
     crate::runtime::drain::note_store_route("mapw_fence_pass");
     // Snapshot first: landing one window consumes its overlapping siblings
     // through the fixpoint, so iterating the live map would borrow it across a
