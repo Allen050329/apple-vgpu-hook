@@ -1025,6 +1025,14 @@ drag, five landings a second audited over fourteen consecutive seconds:
 
 The idle desktop reads 2025/2025 pages identical, so the idle case is total.
 
+**Probed twice on that boot, and the second run is higher**: fine 86.2 – 95.6 %
+(median 89.9) over eleven seconds, pages 54.0 – 81.8 % (median 61.1). So the
+first run's 86 % is the conservative reading, and the two rows do not move
+together — the page fraction swung 43 → 61 between runs while the tile fraction
+moved 86 → 90. **The tile number is the one a design should rest on**; the page
+number depends on where in the screen the motion happens to be and is much the
+noisier of the two.
+
 **Do not confuse this with the damage rect, which is separately measured and
 separately dead.** `note_store_damage_coverage` reads the guest's declared
 `store_damage_texels / store_attach_texels` at **99.34 %** — the Store that ends
