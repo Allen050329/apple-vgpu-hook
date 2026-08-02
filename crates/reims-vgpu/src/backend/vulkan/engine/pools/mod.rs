@@ -1067,6 +1067,17 @@ static ALLOC_SITE_COUNT: [std::sync::atomic::AtomicU64; ALLOC_SITE_N] =
     [const { std::sync::atomic::AtomicU64::new(0) }; ALLOC_SITE_N];
 static ALLOC_SITE_BYTES: [std::sync::atomic::AtomicU64; ALLOC_SITE_N] =
     [const { std::sync::atomic::AtomicU64::new(0) }; ALLOC_SITE_N];
+/// Wall clock inside `vkAllocateMemory` itself, per site.
+///
+/// The function that fills these has been called `allocate_memory_timed` since
+/// it was written and timed nothing: it counted allocations and summed their
+/// bytes. That mattered once the count became a suspect. On a near-idle x86/PCI
+/// window `draw_phase` reads `stage_us=14114` over four draws with
+/// `seed_upload_bytes=0.01 MB` and `allocs=14` — 14 ms of staging with no bytes
+/// to stage — which points at the allocation and cannot price it. This is the
+/// price.
+static ALLOC_SITE_US: [std::sync::atomic::AtomicU64; ALLOC_SITE_N] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; ALLOC_SITE_N];
 /// Allocations since the last emit; one line per this many, so the rate is
 /// self-clocked and an idle boot stays silent.
 static ALLOC_WINDOW_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1077,10 +1088,13 @@ pub(crate) unsafe fn allocate_memory_timed(
     info: &vk::MemoryAllocateInfo<'_>,
     site: AllocSite,
 ) -> Result<vk::DeviceMemory, vk::Result> {
+    let started = std::time::Instant::now();
     let result = ctx.device.allocate_memory(info, None);
+    let us = started.elapsed().as_micros() as u64;
     let i = site.idx();
     ALLOC_SITE_COUNT[i].fetch_add(1, Ordering::Relaxed);
     ALLOC_SITE_BYTES[i].fetch_add(info.allocation_size, Ordering::Relaxed);
+    ALLOC_SITE_US[i].fetch_add(us, Ordering::Relaxed);
     if ALLOC_WINDOW_COUNT.fetch_add(1, Ordering::Relaxed) + 1 >= ALLOC_WINDOW_EMIT_COUNT {
         ALLOC_WINDOW_COUNT.store(0, Ordering::Relaxed);
         emit_alloc_site_census();
@@ -1088,16 +1102,22 @@ pub(crate) unsafe fn allocate_memory_timed(
     result
 }
 
-/// Cumulative per-site allocation census: `count:mebibytes`.
+/// Cumulative per-site allocation census: `count:mebibytes:milliseconds`.
+///
+/// All three are cumulative for the boot, so a reader takes deltas between two
+/// lines. The third is what says whether an allocation is a bookkeeping call or
+/// a stall: divided by the count it is the per-allocation cost, and divided by
+/// the mebibytes it says whether that cost is the kernel providing pages.
 fn emit_alloc_site_census() {
     use std::fmt::Write as _;
     let mut line = String::from("vk_alloc_sites");
     for (i, name) in ALLOC_SITE_NAMES.iter().enumerate() {
         let _ = write!(
             line,
-            " {name}={}:{}",
+            " {name}={}:{}:{}",
             ALLOC_SITE_COUNT[i].load(Ordering::Relaxed),
             ALLOC_SITE_BYTES[i].load(Ordering::Relaxed) >> 20,
+            ALLOC_SITE_US[i].load(Ordering::Relaxed) / 1000,
         );
     }
     crate::observe::off(line);

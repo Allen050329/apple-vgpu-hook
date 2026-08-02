@@ -793,7 +793,33 @@ impl DeviceContext {
     /// Returns `None` only when no type in `type_bits` carries the class's
     /// *required* flags — the caller must then decline with a named reason.
     pub(crate) fn memory_type_for(&self, type_bits: u32, class: MemoryClass) -> Option<u32> {
-        self.memory_type_with(type_bits, &self.caps.memory_request(class))
+        let picked = self.memory_type_with(type_bits, &self.caps.memory_request(class));
+        // Once per class per boot. What a class *asks* for is in
+        // `MemoryTopology::request` and readable from source; what it *gets* is
+        // not, because it depends on this device's memory-type table, and the
+        // two answers have very different costs. `vk_alloc_sites` prices
+        // `MemoryClass::Upload` at 2.54 ms per MiB allocated against 0.48 for
+        // `Readback` and 0.018 for the device-local slab, and a difference that
+        // size is a difference in which heap the pick landed in. Naming the
+        // index and its flags is what turns that from an inference into a
+        // reading.
+        if let Some(i) = picked {
+            // Keyed on the class and the index together, so a device whose
+            // table makes the pick differ between call sites says so instead of
+            // latching the first answer for the boot.
+            let key = ((class as u64) << 32) | i as u64;
+            if crate::observe::first_sight("vk_memory_type_pick", key) {
+                let t = self.memory_properties.memory_types[i as usize];
+                crate::observe::off(format!(
+                    "vk_memory_type_pick class={class:?} index={i} heap={} flags={:?} \
+                     heap_bytes={}",
+                    t.heap_index,
+                    t.property_flags,
+                    self.memory_properties.memory_heaps[t.heap_index as usize].size,
+                ));
+            }
+        }
+        picked
     }
 
     /// Escape hatch for a caller that has already built a [`MemoryRequest`]
