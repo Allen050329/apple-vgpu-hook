@@ -53,10 +53,22 @@
 //! `vkAllocateMemory` was first caught in.
 //!
 //! What remains is priced honestly by the same census: the buckets that still
-//! cost something (`8388608:2252`) are the misses that landed on a new block, so
-//! the residual *is* the block allocations and nothing else. Blocks churned 13
-//! allocations against 10 frees over five minutes, which is the working set
-//! crossing [`HOST_SLAB_SIZE`] rather than a leak.
+//! cost something are the misses that landed on a new block, so the residual
+//! *is* the block allocations and nothing else. That is what
+//! [`HOST_SLAB_IDLE_KEEP_EMPTY`]'s trim gate then went after — three driven
+//! boots, compared at the common miss count of 1 024 so no scaling is involved:
+//!
+//! ```text
+//!                                misses    total    mean   >20 ms stalls
+//! pre-change                       1024   776 ms   758 us              50
+//! suballocated, free-on-empty      1024   186 ms   182 us               5
+//! suballocated, idle-trim only     1024   124 ms   121 us               1
+//! ```
+//!
+//! The last column is `staging_write_slow kind=acquire`, and it is the one that
+//! is felt: a >20 ms acquire under the engine lock is a dropped frame. The
+//! single survivor is at `t=18454` — the first large block of the boot, which
+//! nothing can avoid. `violations=0` across all three.
 
 use ash::vk;
 
