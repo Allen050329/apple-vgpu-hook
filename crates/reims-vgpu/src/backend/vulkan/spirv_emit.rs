@@ -38,6 +38,46 @@
 //! control-flow graph, and no optimiser. Adding a feature here means adding the
 //! instructions that feature needs, deliberately.
 //!
+//! # What wiring [`tile_diff`] into the readback has to satisfy
+//!
+//! Nothing calls it yet. These are the constraints an integration must meet,
+//! each read out of the code rather than assumed, and each one large enough
+//! that finding it late would cost a rebuild:
+//!
+//! - **`prev` must hold what the guest's pages hold, so it cannot be promoted
+//!   at the readback.** The shader's answer is only sound if `prev` is the
+//!   bytes already at the destination. `copy_image_level0_to_host_delivered`
+//!   does not know whether its output reached guest RAM: `read_target_leased`
+//!   can return `None` and send the caller down another path, and a `Copied`
+//!   result can be dropped. A readback whose bytes are discarded would leave
+//!   `prev` describing a frame the guest never received, and every later
+//!   landing would decline bytes the pages do not have. Promotion belongs at
+//!   the landing site, behind an acknowledgement that the scatter ran.
+//! - **Guest CPU writes invalidate `prev` too.** The scatter preserves ranges
+//!   the guest wrote (`mapping_write::write_bgra8_skipping`'s skip list), so
+//!   after such a landing the pages differ from our frame exactly there.
+//!   Invalidating `prev` wholesale is sound and costs one full landing;
+//!   a per-tile force set is the refinement, not the starting point.
+//! - **Three rails share that function** — `read_target_leased`,
+//!   `read_target_inner` and `read_resident_storage` — so scratch buffers keyed
+//!   only by byte size would alias a 1920x1080 BGRA target against a
+//!   same-sized compute storage-image flush. Key by identity.
+//! - **`rb_size` is not always a multiple of four.** The storage-image rail
+//!   computes it from `bytes_per_texel()`, and formats narrower than 4 bytes
+//!   exist, so `words = rb_size / 4` would truncate and leave a tail undiffed.
+//! - **The readback buffer is created `TRANSFER_DST` only** and must gain
+//!   `STORAGE_BUFFER` usage before it can be bound as binding
+//!   [`tile_diff_binding::OUT`].
+//! - **A sparse `out` breaks the assumption that a readback slot is fully
+//!   written.** Slots are recycled through a free pool shared with other rails;
+//!   with tiles declined, a slot holds whichever earlier tenant's bytes were
+//!   there. Only the tiles whose bit is set may be read, and every consumer of
+//!   a readback slot has to agree on that before this ships.
+//! - **The tile bitmap must not be converted into the scatter's `SkipRanges`.**
+//!   That list is scanned from its start for every row segment, which is fine
+//!   for the handful of guest-written ranges it carries today and quadratic for
+//!   a bitmap's thousands. The scatter should iterate set tiles directly.
+//!
 //! # Which dialect, and why the old one
 //!
 //! Modules are emitted as **SPIR-V 1.0** with storage buffers spelled the 1.0
