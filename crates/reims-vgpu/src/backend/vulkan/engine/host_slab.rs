@@ -31,6 +31,32 @@
 //! staging slot carries its own token, where an image is looked up by handle.
 //! What they genuinely share is the free-list core, and that is what is shared:
 //! [`BlockPlan`].
+//!
+//! # What it measured
+//!
+//! Driven x86/PCI boot, against the same `staging_pool` census line at the same
+//! miss count (1 536) from a boot before this module existed — so the two are
+//! directly comparable rather than scaled:
+//!
+//! ```text
+//!              misses   total     mean    64 B   256 KiB   16 MiB
+//! before         1536   1231 ms   801 us  421 us   644 us  4802 us
+//! after          1536    198 ms   129 us    0 us    50 us     5 us
+//! ```
+//!
+//! Six times less total, and the shape of the win is the point: the floor is
+//! gone. The 256 KiB bucket is 920 of those 1 536 misses and fell 13-fold; the
+//! sub-4 KiB buckets round to zero. `vk_alloc_sites` read `staging_block=9:130`
+//! (count:MiB) where the same census before read `staging=242:134` — the same
+//! bytes through 9 allocations instead of 242. `draw_phase stage_us` per draw in
+//! a driven window read 55 us against the 3 525 us/draw of the cold window that
+//! `vkAllocateMemory` was first caught in.
+//!
+//! What remains is priced honestly by the same census: the buckets that still
+//! cost something (`8388608:2252`) are the misses that landed on a new block, so
+//! the residual *is* the block allocations and nothing else. Blocks churned 13
+//! allocations against 10 frees over five minutes, which is the working set
+//! crossing [`HOST_SLAB_SIZE`] rather than a leak.
 
 use ash::vk;
 
