@@ -143,10 +143,24 @@
 //!   host-contiguous the same build would have reported `contig=N frag=0` and
 //!   this line would have gone **silent rather than wrong**, which is the harder
 //!   failure to notice.
-//! - `metal_draw::write_gva_rgba8_within`, the raw task-GVA leg.
-//!   `store_routes` reads `gvaw_fence_flush=432` against `mapw_fence_flush=288`
-//!   on a driven drag second, so it is the *larger* of the two by flush count
-//!   and had never been measured at all.
+//! - The raw task-GVA leg, which `store_routes` reads at
+//!   `gvaw_fence_flush=444` against `mapw_fence_flush=288` on a driven drag
+//!   second — the *larger* of the two by flush count, and never measured at
+//!   all until now. It needs **two** hooks, and the first cut had only one:
+//!   `metal_draw::write_gva_rgba8_within` writes rows through a packed
+//!   `map_fresh_span_within` when the span resolves and falls to
+//!   `gva_view::write_span_multi` a row at a time when it does not, and on a
+//!   driven boot it is almost always the latter. With only the packed half
+//!   hooked the leg reported **7 runs and 2268 bytes in a whole second**
+//!   against those 444 flushes, which reads as "this leg moves nothing"
+//!   when it meant "this hook is not where the bytes go".
+//!
+//! The sampling unit differs between the two legs and the fractions are still
+//! comparable. A mapping walk is a landing, so its stride samples whole frames;
+//! a `write_span_multi` call is one row, so the GVA leg's stride samples rows
+//! scattered across many windows. For a *fraction* over many samples that is
+//! fine — it is an unbiased estimate either way. It is not fine for any claim
+//! about a particular frame, and only the mapping leg can support one.
 //!
 //! The two legs are reported on separate lines ([`Leg`]) because they are
 //! separate rails with separate arm and flush paths, and one blended fraction
