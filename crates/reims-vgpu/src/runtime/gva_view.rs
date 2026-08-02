@@ -709,6 +709,12 @@ pub fn map_fresh_span_within<H: HostMemory + HostOps>(
         gpas[0].saturating_add(off as u64),
         length,
     );
+    // Same reasoning as the footprint mark above, for the other reader of these
+    // writes: what this hands back is a writable alias of guest pages, and every
+    // caller of it writes. Recorded on the acquisition rather than in each caller
+    // because that is where the resolved page list exists, and because a new
+    // caller then inherits the record instead of having to remember it.
+    state.note_host_wrote_pages(gpas.clone());
     Some(FreshSpan {
         // SAFETY: map_pages returned `map_len` mapped bytes at `ptr_base`.
         ptr: unsafe { (ptr_base as *mut u8).add(off) },

@@ -2258,10 +2258,6 @@ fn write_linear_texture_bulk<M: HostMemory + HostOps>(
     bytes: &[u8],
     allowed: crate::runtime::gva_view::WindowPages<'_>,
 ) -> bool {
-    // Puts bytes into guest pages the hypervisor's dirty bitmap cannot witness.
-    // Counted before the walk so a refusal costs a spurious bump, never a
-    // missing one.
-    state.note_host_wrote_guest_ram();
     if height == 0 || tight == 0 || bytes.len() < (height as usize).saturating_mul(tight) {
         return false;
     }

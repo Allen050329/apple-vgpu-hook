@@ -221,6 +221,12 @@ fn contig_for_write<H: HostMemory + HostOps>(
     // over-marking can only turn a miss into a hit. Under-marking would
     // manufacture the clean "we never wrote there" the set must never invent.
     mapper::note_mapping_write_footprint(state, mapping_id, 0, span_end);
+    // The other reader of these writes, and for the same reason: the hypervisor's
+    // dirty bitmap witnesses guest stores only, so a copy vouched for by "the
+    // guest has not written" is stale the moment this rail runs. Recorded beside
+    // the footprint mark rather than in each caller, so the two cannot drift and
+    // a new caller inherits both.
+    state.note_host_wrote_mapping(mapping_id);
     // And the payload census, for the same reason and with the same blind spot
     // if it is left out. The peer rails sample once per call in
     // `mapper::write_mapping_bytes` and `gva_view::write_gva_bytes`; this file
@@ -554,11 +560,6 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
     {
         return false;
     }
-    // Everything below this point may put bytes into the guest's pages, and the
-    // hypervisor's dirty bitmap will not witness a single one of them. Counted
-    // here rather than at each committed copy so a refusal further down costs a
-    // spurious bump instead of a missing one.
-    state.note_host_wrote_mapping(mapping_id);
     let Some(m) = state.mappings.get(&mapping_id) else {
         return false;
     };
@@ -886,11 +887,6 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
             return false;
         }
     }
-    // Everything below this point may put bytes into the guest's pages, and the
-    // hypervisor's dirty bitmap will not witness a single one of them. Counted
-    // here rather than at each committed copy so a refusal further down costs a
-    // spurious bump instead of a missing one.
-    state.note_host_wrote_mapping(mapping_id);
     let Some(m) = state.mappings.get(&mapping_id) else {
         return false;
     };
@@ -1079,11 +1075,6 @@ pub fn write_raw_rows<M: HostMemory + HostOps>(
     // Deferred-writeback flush-on-access (coarse: whole mapping — this entry
     // resolves its window only later and is off the hot compute path).
     crate::runtime::storage_flush::flush_intersecting(state, host, mapping_id, 0, u64::MAX);
-    // Everything below this point may put bytes into the guest's pages, and the
-    // hypervisor's dirty bitmap will not witness a single one of them. Counted
-    // here rather than at each committed copy so a refusal further down costs a
-    // spurious bump instead of a missing one.
-    state.note_host_wrote_mapping(mapping_id);
     let Some(m) = state.mappings.get(&mapping_id) else {
         return false;
     };
@@ -1543,11 +1534,6 @@ fn write_rect_raw_at_impl<M: HostMemory + HostOps>(
     {
         return false;
     }
-    // Everything below this point may put bytes into the guest's pages, and the
-    // hypervisor's dirty bitmap will not witness a single one of them. Counted
-    // here rather than at each committed copy so a refusal further down costs a
-    // spurious bump instead of a missing one.
-    state.note_host_wrote_mapping(mapping_id);
     let Some(m) = state.mappings.get(&mapping_id) else {
         return false;
     };
