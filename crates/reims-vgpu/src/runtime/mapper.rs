@@ -1455,6 +1455,15 @@ pub fn ensure_guest_write_token<H: HostOps>(
         // The list moved underneath the token. Everything recorded against it
         // describes pages this surface may no longer own, so the Store stamp
         // goes with it.
+        //
+        // Counted because retiring a token reopens its two-harvest arming
+        // window, and everything downstream of an unarmed token falls back to
+        // the whole-surface answer: the type-11 LOAD elision refuses with
+        // `t11_gw_ref_no_stamp` and the draw pays a full-frame seed read plus a
+        // full-frame staging upload. `t11_gw_unarmed` says the window was open;
+        // this says whether it keeps being reopened, which separates "the token
+        // is warming up once" from "the page list churns and it never warms up".
+        crate::runtime::drain::note_store_route("gw_token_retired");
         let e = state.mappings.get_mut(&mapping_id)?;
         let stale = std::mem::replace(&mut e.guest_write_token, 0);
         e.guest_write_token_gen = 0;
@@ -1581,18 +1590,28 @@ pub(crate) fn mapping_guest_write_verdict<M: HostOps>(
     };
     // The dominant disjunct is the first, and the reason is the shim's arming
     // window rather than anything about this mapping. `reims_vgpu_dirty_track`
-    // sets `arm_at = harvests + 2`, and `reims_vgpu_dirty_harvest` pins
+    // sets `arm_at = harvests + 1`, and `reims_vgpu_dirty_harvest` pins
     // `s->gen = 0` until `harvests >= arm_at`; `HostOps::guest_write_gen` maps
     // that 0 to `None`, so `stamp_guest_write_gen` records 0 and counts
-    // `t11_gw_unarmed`. Every Store landing inside a token's first two harvests
+    // `t11_gw_unarmed`. Every Store landing inside a token's arming window
     // therefore stamps 0, and every LOAD against that stamp lands here.
     //
-    // That window is per *token*, not per boot: `ensure_guest_write_token`
-    // retires the token and builds a new one whenever `guest_write_token_gen`
-    // has fallen behind `map_generation`, so a mapping whose page list churns
-    // re-enters the window each time. It is the structural explanation for
-    // `t11_gw_ref_no_stamp` running far ahead of `t11_gw_ref_moved` — the
-    // refusals are this device's own startup cost, repeated, not guest writes.
+    // That window is per *token*, not per boot, and it is entered two ways. A
+    // brand new mapping enters it once. `ensure_guest_write_token` also retires
+    // a token and builds a new one whenever `guest_write_token_gen` has fallen
+    // behind `map_generation`, so a mapping whose page list churns re-enters it
+    // each time — counted as `gw_token_retired`, and measured at **0 per second
+    // across a driven x86/PCI boot**, so on this pathway churn is not how the
+    // window is reached and new surfaces are.
+    //
+    // It is the structural explanation for `t11_gw_ref_no_stamp` running far
+    // ahead of `t11_gw_ref_moved` — the refusals are this device's own startup
+    // cost, repeated, not guest writes. What it costs is measured: the window
+    // is counted in harvests, harvests are driven by guest doorbells, and a
+    // draw that lands in it pays a whole-frame seed read plus a whole-frame
+    // staging upload. On a near-idle desktop `chain_phase` reads 12-65 ms per
+    // draw with `seed_us` and the engine's `stage_us` holding it, against
+    // 0.2 ms per draw driven, which is the hitch class goals 5 and 6 name.
     if m.guest_write_gen_at_store == 0
         // Subsumed by the stamp test above rather than independent: every writer
         // that zeroes the token zeroes the stamp in the same breath
