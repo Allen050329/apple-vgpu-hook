@@ -15,29 +15,45 @@
 #   drain_duty           duty, draw_us, flush_us — what the drain worker spent
 #   readback_split       fence_us, bar_us, gpu_us
 #
-# The drag is a real Quartz event stream (`drag.py`), not an accessibility
-# reposition, because a pointer held across a title bar and a window teleported
-# by the AX API do not take the same path through the window server.
+# Two motions, and the difference is not cosmetic. `--motion drag` posts a real
+# Quartz pointer stream (`drag.c`), which is what goal 6 names; a pointer held
+# across a title bar and a window teleported by the AX API do not take the same
+# path through the window server. But `CGEventPost` to the HID tap is silently
+# discarded for a process that is not trusted for Accessibility, and that trust
+# cannot be arranged on this guest — no passwordless sudo, and SIP's Filesystem
+# Protections leave TCC.db unwritable. So `--motion reposition` (the default)
+# moves the window through System Events, which *is* trusted. It measures a
+# large window moving at ~100 Hz with everything behind it recomposited, and it
+# omits whatever the window server does specifically for a drag session.
 #
-# `drag.py` reports what it actually posted. A drag posted at 40 Hz cannot show
-# a 120 Hz device, so a run whose posted rate fell short says so instead of
-# reporting the device as slow — the standing lesson from
-# `scripts/web-content-probe`, whose first clean verdict came from a stressor
-# that produced nothing.
+# Either way the motion reports what it actually did, and the harness samples
+# the window's real position mid-run and refuses a verdict if it never moved.
+# Both guards exist because a stressor that produces nothing reports the idle
+# device's counters as this device's ceiling — which is how
+# `scripts/web-content-probe` once passed a static page off as a churn test, and
+# is exactly what the drag mode does here.
 #
 # Usage:
 #   scripts/window-drag-probe/window-drag-probe.sh [--seconds N] [--hz N]
-#                                                  [--app "Safari"] [--keep DIR]
+#     [--app "Safari"] [--motion drag|reposition] [--keep DIR]
 #
-# Exits 0 when the drag was posted at the requested rate and the counters were
-# collected, 2 on a setup failure. It does not fail on a slow device: this is an
-# instrument, and the number it prints is the result.
+# Exits 0 when the motion ran and the counters were collected, 2 on a setup
+# failure — which includes the window never moving. It does not fail on a slow
+# device: this is an instrument, and the number it prints is the result.
 set -euo pipefail
 export LC_ALL=C
 
 SECONDS_RUN=15
 HZ=120
 APP="Safari"
+# `drag` posts a real pointer drag and is what goal 6 is about; it needs the
+# posting process to be trusted for Accessibility, which cannot be arranged on
+# this guest (no passwordless sudo, SIP Filesystem Protections on, so TCC.db is
+# unwritable). Its events are then silently discarded and the window never
+# moves — which the harness detects rather than reporting the idle device.
+# `reposition` moves the window through System Events, which is trusted. It is a
+# weaker stressor and the default only because it is the one that runs.
+MOTION=reposition
 KEEP=""
 GUEST="${GUEST:-macos-vm}"
 FAILLOG="${REIMS_FAIL_LOG:-/tmp/reims-vgpu-fail.log}"
@@ -48,8 +64,9 @@ while [ $# -gt 0 ]; do
     --seconds) SECONDS_RUN="$2"; shift 2 ;;
     --hz) HZ="$2"; shift 2 ;;
     --app) APP="$2"; shift 2 ;;
+    --motion) MOTION="$2"; shift 2 ;;
     --keep) KEEP="$2"; shift 2 ;;
-    -h|--help) sed -n '2,30p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'; exit 0 ;;
+    -h|--help) sed -n '2,38p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'; exit 0 ;;
     *) echo "window-drag-probe: unknown argument $1" >&2; exit 2 ;;
   esac
 done
@@ -64,7 +81,22 @@ ssh -o ConnectTimeout=8 -o BatchMode=yes "$GUEST" true 2>/dev/null || {
   say "no guest at $GUEST" >&2; exit 2; }
 [ -f "$FAILLOG" ] || { say "no fail log at $FAILLOG — is a boot running?" >&2; exit 2; }
 
-scp -q "$SCRIPT_DIR/drag.py" "$GUEST:/tmp/reims-drag.py"
+# Built on the guest, not shipped: nothing here commits or copies a binary.
+# C rather than the obvious Python because the guest's /usr/bin/python3 (3.9.6,
+# Command Line Tools) has no PyObjC, so `import Quartz` fails, while clang and
+# the ApplicationServices headers are present.
+case "$MOTION" in
+  drag)
+    scp -q "$SCRIPT_DIR/drag.c" "$GUEST:/tmp/reims-drag.c"
+    ssh -o BatchMode=yes "$GUEST" \
+      'clang -O2 -o /tmp/reims-drag /tmp/reims-drag.c -framework ApplicationServices -lm' \
+      2>"$WORK/build.err" || {
+      say "could not build the drag poster on the guest:" >&2
+      sed 's/^/  /' "$WORK/build.err" >&2; exit 2; } ;;
+  reposition)
+    scp -q "$SCRIPT_DIR/reposition.applescript" "$GUEST:/tmp/reims-reposition.applescript" ;;
+  *) say "--motion takes drag or reposition" >&2; exit 2 ;;
+esac
 
 # A window that fills the screen leaves the compositor almost nothing to
 # recomposite behind it, and one that is tiny damages almost nothing. Half the
@@ -90,18 +122,56 @@ esac
 # style and clear of the traffic lights, which sit at the left.
 GX=$((WX + WW / 2))
 GY=$((WY + 14))
-say "dragging $APP's title bar at ($GX,$GY) for ${SECONDS_RUN}s at ${HZ} Hz"
+say "motion=$MOTION on $APP window 1 at ($GX,$GY) for ${SECONDS_RUN}s at ${HZ} Hz"
 
 # Mark the fail log so only lines the drag produced are read. Byte offset rather
 # than a timestamp: the log's `t=` is device time and this shell's clock is not.
 OFF=$(stat -c %s "$FAILLOG")
 
-DRAG=$(ssh -o BatchMode=yes "$GUEST" \
-  "/usr/bin/python3 /tmp/reims-drag.py $GX $GY $SECONDS_RUN $HZ 180 90" 2>"$WORK/drag.err") || {
-  say "the drag did not run — see $WORK/drag.err:" >&2; sed 's/^/  /' "$WORK/drag.err" >&2; exit 2; }
+if [ "$MOTION" = drag ]; then
+  ssh -o BatchMode=yes "$GUEST" \
+    "/tmp/reims-drag $GX $GY $SECONDS_RUN $HZ 180 90" >"$WORK/drag.json" 2>"$WORK/drag.err" &
+else
+  # Steps rather than seconds: the accessibility route cannot pace itself, so
+  # the harness asks for a step count and times the result.
+  ssh -o BatchMode=yes "$GUEST" \
+    "python3 -c \"
+import subprocess, time, json
+t0 = time.time()
+r = subprocess.run(['osascript', '/tmp/reims-reposition.applescript',
+                    '$APP', '$GX', '$WY', '$((SECONDS_RUN * HZ))', '180', '90'],
+                   capture_output=True, text=True)
+el = time.time() - t0
+n = int((r.stdout or '0').strip() or 0)
+print(json.dumps({'posted': n, 'elapsed': round(el, 3),
+                  'posted_hz': round(n / el, 1) if el else 0.0,
+                  'late': 0, 'worst_late_s': 0.0, 'stderr': r.stderr[-200:]}))
+\"" >"$WORK/drag.json" 2>"$WORK/drag.err" &
+fi
+DRAG_PID=$!
+
+# Posting an event is not moving a window. `CGEventPost` to the HID tap is
+# silently dropped for a process that is not trusted for Accessibility, and a
+# run where every event went nowhere reports the idle device's counters as the
+# device's ceiling — which is exactly the shape of failure that made a static
+# page pass as a churn test this morning. So sample the window's real position
+# mid-drag and require it to have left where it started.
+sleep 3
+MID=$(osa "tell application \"System Events\" to tell process \"$APP\" to get position of window 1" || true)
+wait "$DRAG_PID" || {
+  say "the drag did not run — see $WORK/drag.err:" >&2
+  sed 's/^/  /' "$WORK/drag.err" >&2; exit 2; }
+DRAG=$(cat "$WORK/drag.json")
 
 tail -c "+$((OFF + 1))" "$FAILLOG" >"$WORK/window.log"
 say "drag: $DRAG"
+say "window at start ($WX,$WY), mid-drag ($MID)"
+if [ "$MID" = "$WX, $WY" ] || [ -z "$MID" ]; then
+  say "the window never moved — the events were posted but not delivered, most \
+likely because the posting process is not trusted for Accessibility. The counters \
+below would be an idle device's, not a dragging one's." >&2
+  exit 2
+fi
 
 posted_hz=$(echo "$DRAG" | python3 -c 'import json,sys; print(json.load(sys.stdin)["posted_hz"])')
 # Short of the ask by more than a fifth and the drag, not the device, is the
