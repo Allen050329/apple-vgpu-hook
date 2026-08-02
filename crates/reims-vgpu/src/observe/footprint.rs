@@ -452,6 +452,13 @@ const PAYLOAD_SAMPLE_EVERY: u64 = 64;
 /// write that could have produced the smaller of them put at least 256
 /// consecutive `0xff` bytes into guest RAM. The number is that element size, not
 /// a threshold picked to fit an observation.
+/// Emitted as `ff_run_counted_from`, not `ff_run_min`. It was the latter, next
+/// to the measured `ff_run_max`, and the pair reads as a range that was
+/// observed — `min 256, max 4953`. It is not: 256 is the floor below which a
+/// run is not looked for at all, so no observation of it exists. A field whose
+/// name says "measurement" and whose value is a compile-time constant is the
+/// shape `scripts/constant-fields/constant-fields.sh` reports, and it is the
+/// one shape on that report that is fixed by renaming rather than by deleting.
 const FF_RUN_MIN: usize = 256;
 
 struct PayloadCensus {
@@ -618,7 +625,7 @@ pub fn census_lines(now_ms: u64) -> Vec<String> {
         "guest_write_footprint pages={pages} kib={kib} dropped={dropped} \
          frame_shift={FRAME_SHIFT} writes={calls} sampled={sampled} \
          samp_bytes={bytes_sampled} ff_run={ff_run} ff_run_max={ff_run_max} \
-         ff_run_min={FF_RUN_MIN} retired={retired_frames} \
+         ff_run_counted_from={FF_RUN_MIN} retired={retired_frames} \
          write_after_retire={retired_hits} war_mapping={war_map} \
          war_rawgva={war_raw} war_gpa={war_gpa} retire_scans={retire_scans} \
          retire_scan_pages={retire_scan_pages} (levels, not per-interval)"
