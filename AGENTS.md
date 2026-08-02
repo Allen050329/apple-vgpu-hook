@@ -491,6 +491,45 @@ Report rAF beside the device-side counters, which do not share this bimodality:
 `readback_split`. Those reproduce across boots and are what a performance claim
 should rest on; rAF is the corroborating number, not the evidence.
 
+**Record the host GPU's clock and power state beside any GPU-timing number, or
+you are measuring the governor.** This is the same class of error as probing an
+unsettled guest, and it is larger. Measured on one boot, one build, one driven
+probe, with the only difference a synthetic load holding the host GPU at its top
+clock:
+
+| | host GPU at its own clock | held at top clock |
+|---|---|---|
+| `readback_split` `fence_us`/`fence` | 2.55 - 2.83 ms | **0.40 ms** |
+| total fence time per second | 265 - 341 ms | **35 ms** |
+| `drain_duty` `flush_us`/`flushes` | 4.0 ms | **0.83 - 1.75 ms** |
+| Safari rAF long frames / worst frame | 7 (0.39 %) / 42 ms | **0 / 21 ms** |
+
+On the measured host the GPU sat at P5, 800-1450 MHz of a 3090 MHz part, at
+33-37 % reported utilisation, and dropped to P8/180 MHz the moment the guest went
+quiet. So six sevenths of the fence wait was clock, not work, and the device's
+real GPU cost per composited frame is about **0.40 ms**. The governor is behaving
+correctly for what it sees: this workload submits ~0.4 ms of work per frame and
+then blocks, which is a few per cent occupancy.
+
+```sh
+nvidia-smi --query-gpu=clocks.sm,clocks.max.sm,utilization.gpu,pstate --format=csv
+```
+
+Two things follow, and the second decides what is worth building:
+
+- A performance comparison between two builds is void unless both were taken in
+  the same power state. Nothing in the boot scripts pins it.
+- **This device is latency-bound on a usually-downclocked GPU, not
+  throughput-bound.** Removing a whole GPU round trip is worth about six times
+  what the flat GPU cost suggests; removing bytes is worth what it always was.
+  The deferred-flush ledger prices all four of its closed levers in bytes, which
+  is why none of them looked like enough.
+
+It also reframes the reports behind goal 11 (poor performance on iGPUs and older
+GPUs). Those parts have the same governors and less headroom, so a device whose
+frame cost is dominated by one blocking round trip per frame degrades on them
+faster than its own work would predict.
+
 ### Finding State Nothing Reads
 
 Do not grep for this. `reims-vgpu` is a staticlib whose types are almost all

@@ -3501,12 +3501,44 @@ impl SurfaceWriteCensus {
 /// wait, for a deferred readback slot and a second fence lifetime in the path
 /// that publishes composited pixels.
 ///
-/// What that also settles is *what the fence wait is*. It is not scheduling
+/// What that also settles is *what the fence wait is not*. It is not scheduling
 /// latency with slack to reclaim: the arm and the flush are 351 µs apart inside
 /// one tranche, so the draws that produce the composite are still executing when
 /// the copy is submitted, and the copy queues behind them however early it is
-/// sent. The 2.6 ms is the GPU rendering the frame. Only cheaper draws, or not
-/// holding the device lock across the wait, can move it.
+/// sent. Submitting earlier cannot help.
+///
+/// This paragraph used to continue "the 2.6 ms is the GPU rendering the frame.
+/// Only cheaper draws can move it", and that inference does not follow from the
+/// premise. Waiting on the GPU says the GPU is slow; it does not say the work is
+/// large. **Measured, and it is not the work.** Same boot, same build, same
+/// driven probe, with the only difference a synthetic load holding the host GPU
+/// at its top clock instead of letting it choose:
+///
+/// | | host GPU at its own clock (P5, 800-1450 MHz) | held at P0, 2820 MHz |
+/// |---|---|---|
+/// | `fence_us`/`fence` | 2.55 - 2.83 ms | **0.40 ms** |
+/// | total fence time per second | 265 - 341 ms | **35 ms** |
+/// | `flush_us`/`flushes` | 4.0 ms | **0.83 - 1.75 ms** |
+/// | Safari rAF long frames | 7 (0.39 %) | **0** |
+/// | Safari rAF worst frame | 42 ms | **21 ms** |
+///
+/// So roughly six sevenths of the wait was the host GPU running at a third of
+/// its clock or less, and the device's actual GPU cost per composited frame is
+/// about **0.40 ms**. The governor is not misbehaving: this workload submits
+/// ~0.4 ms of work per frame and then blocks, which reads as a few per cent
+/// occupancy, and a few per cent occupancy is what a low clock is for.
+///
+/// Two consequences, and the second is the one that changes what to build:
+///
+/// - Any measurement of GPU-side latency here must record the host GPU's clock
+///   and power state beside it, or it is a measurement of the governor. A number
+///   taken at P5 against one taken at P0 is a 6x artefact with no code in it.
+/// - **This device is latency-bound on a GPU that is usually downclocked, not
+///   throughput-bound.** Removing a whole GPU round trip is therefore worth
+///   about six times what the flat GPU cost suggests, while removing bytes is
+///   worth what it always was. The deferred-flush ledger in
+///   [`crate::runtime::storage_flush::flush_mapping_windows_before_fence`] prices
+///   all four of its closed levers in bytes.
 ///
 /// `multi` is not noise to be averaged away. The age of "the arm" is a single
 /// number only when exactly one window was armed since the last flush; a window
