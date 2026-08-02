@@ -944,6 +944,16 @@ pub fn flush_linear_windows_before_fence<M: HostMemory + HostOps>(
 /// not decay across runs and its own first drag reads 37, so "the first drag
 /// after a boot is fast" is not the explanation.
 ///
+/// The chain is named by counters, not inferred. `gw_refused_guest_store=121`
+/// and `type11_seed_guest_wrote=86` appear in the degraded run and in neither
+/// the control nor the fast counterfactual, and `gw_vouched` — 40 windows in
+/// the control — is **absent from both counterfactual runs**. That last one is
+/// the mechanism: [`crate::runtime::gather_witness`] subtracts this device's own
+/// page-exact write record to tell its stores from the guest's, and a rail that
+/// never lands never writes that record. Once real guest stores accumulate with
+/// nothing to re-baseline against, the witness assumes the worst and the
+/// type-11 rung above it follows.
+///
 /// ## Which pages to register, and where the route stops
 ///
 /// A `userfaultfd` registration only traps accesses made through the VMA it was

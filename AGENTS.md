@@ -978,6 +978,25 @@ them — so "the first drag after a boot is fast" is not the explanation; run 3
 is a first drag and reads 37. The refusals appear only with the writeback off,
 only after its first run, and exactly where the gain disappears.
 
+The chain from the missing writeback to the 8 MB gather is named by counters
+rather than inferred. Three that appear in the degraded run and in **neither**
+the control nor the fast counterfactual:
+
+```text
+gw_refused_guest_store=121     the gather witness refused to vouch: a store it
+                               could not attribute to this device
+type11_seed_guest_wrote=86     the seed path concluded the guest wrote the surface
+t11rung_resident_refused=54    the resident was refused, and 8 MB gathered instead
+```
+
+and one that appears only in the control: `gw_vouched=40
+gw_vouched_kb=9920`. **Neither counterfactual run vouches a single window** —
+that is the direct consequence of never landing, since the device's own
+page-exact write record is what the witness subtracts to tell its stores from
+the guest's. Once real guest CPU stores accumulate with no device write to
+re-baseline against, the witness has to assume the worst, and the type-11 rung
+above it does the same.
+
 The hazard is what a demand-driven rail would hit **if it got the witness
 wrong**, and the exchange rate is ruinous: a 2.26 GB/s writeback traded for an
 8 MB-per-bind gather. **So the design requirement, stated before anyone builds
