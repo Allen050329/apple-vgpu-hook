@@ -44,6 +44,8 @@ pub mod host_writes;
 pub mod icb;
 
 pub mod input;
+/// How much of a render writeback the guest's pages already hold.
+pub mod land_redundancy;
 /// Process-global metal2vulkan SPIR-V cache (AIR content hash → SPIR-V).
 pub mod m2v_cache;
 /// IOSurface mapper capture + page-table resolve.

@@ -231,6 +231,9 @@ wl = rows("host_window_loop", ["ticks", "redraws_asked", "draws",
                                "draws_fresh", "draws_stale"])
 bp = rows("bind_phase", ["binds", "vertex_us", "fragment_us", "attrs_us"])
 cp = rows("chain_phase", ["chains", "binds_us"])
+lr = rows("land_redundancy", ["audits", "bytes", "pages", "same_pages",
+                              "fine", "same_fine"])
+ws = rows("write_split", ["bytes"])
 
 print("host_window_cadence — frames this device put out")
 show("present_hz", [r["present_hz"] for r in cad], " Hz")
@@ -242,6 +245,18 @@ show("draw_us/draw", [r["draw_us"] / r["draws"] for r in duty if r["draws"]], " 
 show("flush_us/flush", [r["flush_us"] / r["flushes"] for r in duty if r["flushes"]], " us")
 print("readback_split — the device's GPU cost")
 show("fence_us/fence", [r["fence_us"] / r["fence"] for r in rb if r["fence"]], " us")
+
+# What the writeback moved, and how much of it the destination already held.
+# The two granularities answer different questions and are not interchangeable:
+# `same_pages` is what a CPU-side skip could decline, `same_fine` what a
+# GPU-side compaction could leave out of the copy that is 78% of the fence
+# above. A sideways window move changes a vertical band, so it touches nearly
+# every row — expect the fine fraction to be much the larger of the two.
+print("write_split / land_redundancy — bytes moved, and how many were already there")
+show("MB/s written", [r["bytes"] / 1e6 for r in ws], " MB")
+show("same_pages %", [100.0 * r["same_pages"] / r["pages"] for r in lr if r["pages"]], " %")
+show("same_fine %", [100.0 * r["same_fine"] / r["fine"] for r in lr if r["fine"]], " %")
+show("audited MB", [r["bytes"] / 1e6 for r in lr], " MB")
 
 # The delivery chain between the composite and the screen, which the three
 # families above do not cover. `publish_window_frame` runs once per drain

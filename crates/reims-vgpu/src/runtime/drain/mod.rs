@@ -4319,6 +4319,10 @@ pub fn note_drain_tranche(drain_us: u64, publish_us: u64) {
         // the timer is runtime-side and the Metal arm can adopt it without a
         // second census.
         emit_chain_phase();
+        // Under the write and readback splits, which price the writeback in
+        // bytes and in fence time; this says how many of those bytes the
+        // destination already held.
+        emit_land_redundancy();
     }
 }
 
@@ -4500,6 +4504,7 @@ fn emit_engine_delta() {
 /// on the boot that motivated this line that was 82% of the draw.
 ///
 /// Silent when no chain ran, so an idle desktop costs nothing.
+///
 /// The split of `chain_phase`'s `binds_us`, over the same window.
 ///
 /// Emitted immediately after it, in the same relationship `draw_phase` has to
@@ -4513,6 +4518,28 @@ fn emit_bind_phase() {
     crate::observe::off(format!(
         "bind_phase binds={} vertex_us={} fragment_us={} attrs_us={}",
         w.binds, w.vertex_us, w.fragment_us, w.attrs_us,
+    ));
+}
+
+/// How much of the render writeback's bytes the guest's pages already held,
+/// over a sample of the window's landings.
+///
+/// Read beside `write_split`, which says how many bytes were stored, and
+/// `readback_split`'s `gpu_us`, which says what carrying them across the bus
+/// cost. This says how many of them the destination already had — see
+/// [`crate::runtime::land_redundancy`] for why that is a different question
+/// from the declared damage rect, which is already measured at 99.34% of the
+/// attachment and worth nothing.
+///
+/// Silent when nothing was audited, so an idle desktop costs no line.
+fn emit_land_redundancy() {
+    let Some(w) = crate::runtime::land_redundancy::take_window() else {
+        return;
+    };
+    crate::observe::off(format!(
+        "land_redundancy audits={} calls={} bytes={} pages={} same_pages={} \
+         fine={} same_fine={}",
+        w.audits, w.calls, w.bytes, w.pages, w.same_pages, w.fine, w.same_fine,
     ));
 }
 

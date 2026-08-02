@@ -1942,6 +1942,47 @@ impl RunCopy<'_> {
         matches!(self, Self::Write(_))
     }
 
+    /// The bytes a write direction is about to store, for the audit that
+    /// compares them against what the guest's pages already hold.
+    fn write_src(&self) -> Option<&[u8]> {
+        match self {
+            Self::Write(buf) => Some(buf),
+            Self::Read(_) => None,
+        }
+    }
+
+    /// Charge one copy's worth of already-correct bytes to
+    /// [`crate::runtime::land_redundancy`], with the same arguments the copy
+    /// itself is about to run with.
+    ///
+    /// # Safety
+    ///
+    /// Same contract as [`Self::apply`]: `host_ptr` must be a live mapping of at
+    /// least `host_off + n` bytes and `buf_off + n` must be within the buffer.
+    unsafe fn audit(
+        &self,
+        map_off: u64,
+        host_ptr: usize,
+        host_off: usize,
+        buf_off: usize,
+        n: usize,
+        page_size: u64,
+    ) {
+        let Some(buf) = self.write_src() else {
+            return;
+        };
+        // SAFETY: the caller's contract covers exactly this range, and the
+        // audit only reads it.
+        unsafe {
+            crate::runtime::land_redundancy::note_write(
+                map_off,
+                (host_ptr as *const u8).add(host_off),
+                &buf[buf_off..buf_off + n],
+                page_size,
+            );
+        }
+    }
+
     /// Move `n` bytes between the caller's buffer at `buf_off` and the mapped
     /// host range at `host_off`.
     ///
@@ -2001,11 +2042,20 @@ fn copy_mapping_runs<H: HostMemory + HostOps>(
         // witness. The read direction shares this walk and writes nothing.
         state.note_host_wrote_mapping(mapping_id);
     }
+    // Decided once for the walk so an audited landing is compared whole. See
+    // [`crate::runtime::land_redundancy::audit_due`] for why a per-run stride
+    // would describe no frame in particular.
+    let audit = copy.is_write() && crate::runtime::land_redundancy::audit_due();
+    let page_size = state.page_size();
     let len = copy.len();
     let need_end = off.saturating_add(len as u64);
     // Fast path: one packed view covering the whole range.
     if let Some((ptr, view_len)) = ensure_contig_view(state, host, mapping_id) {
         if (view_len as u64) >= need_end && (off as usize) + len <= view_len {
+            if audit {
+                // SAFETY: same range the copy below is about to write.
+                unsafe { copy.audit(off, ptr, off as usize, 0, len, page_size) };
+            }
             // SAFETY: the view covers `need_end`, checked directly above.
             unsafe { copy.apply(ptr, off as usize, 0, len) };
             if copy.is_write() {
@@ -2020,7 +2070,6 @@ fn copy_mapping_runs<H: HostMemory + HostOps>(
         ));
         return false;
     };
-    let page_size = state.page_size();
     let page_sz = page_size as usize;
     let span_end = (gpas.len() as u64).saturating_mul(page_size);
     if need_end > span_end {
@@ -2059,6 +2108,10 @@ fn copy_mapping_runs<H: HostMemory + HostOps>(
                  buf_off={buf_off:#x} n={n:#x} total={total:#x} len={len:#x}"
             ));
             return false;
+        }
+        if audit {
+            // SAFETY: same range the copy below is about to write.
+            unsafe { copy.audit(copy_lo, ptr, host_off, buf_off, n, page_size) };
         }
         // SAFETY: the map covers `total`, and `host_off + n <= total` and
         // `buf_off + n <= len` were both just checked.
