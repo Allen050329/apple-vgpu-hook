@@ -91,6 +91,48 @@
 //! caching better, `acquire_readback` is per full-frame buffer and is attacked
 //! by not reading back.
 //!
+//! **The three-way reading settles it.** Five consecutive one-second windows at
+//! 660 draws on a driven x86/PCI boot:
+//!
+//! ```text
+//! acquire_us              5      1      0      0   3026
+//! acquire_sampled_us  43572  43585  43276  43128  43916
+//! acquire_readback_us     0      0      0      0      0
+//! ```
+//!
+//! Both neighbours are zero and the sampled loop is the whole of it — ~66 us
+//! per draw. `acquire_readback` reading a flat 0 is consistent with
+//! `engine_delta allocs=0`: `create_readback_buffer` bumps `note_alloc`, so a
+//! zero there proves the readback pool always hits and the acquire is a pop.
+//!
+//! # What the sampled loop's own cost is *not*
+//!
+//! This is where the trail currently ends, and the eliminations are worth
+//! keeping because they are what makes the remaining candidate stark. In those
+//! same windows `sampled_gpu_binds`, `sampled_cache_misses`, `sampled_reuploads`
+//! and `sampled_cache_hits` are **all 0**, and only `sampled_identity_hits`
+//! (420/s) moves. So:
+//!
+//! - The `SampledSource::Target` arm is never taken — it is the only writer of
+//!   `sampled_gpu_binds`.
+//! - No bind uploads or re-uploads bytes; the `Bytes` arm always hits cache.
+//! - The hit it takes is `find_cached_sampled`'s identity fast path, which
+//!   scans a `SAMPLED_CACHE_CAP`-bounded list of **64** entries and moves one to
+//!   the back. That cannot be the ~100 us per bind the arithmetic demands.
+//!
+//! What is left is `SampledSource::GuestRuns`, and the reason it was invisible
+//! is that **it increments no counter of its own**. That arm calls
+//! `acquire_sampled`, then `acquire_staging`, then `write_staging_from_runs` —
+//! a real memcpy gather out of scattered guest RAM into mapped staging, once
+//! per bind. Every other arm reports itself; the one that moves bytes does not.
+//! Counting it is the next step, and until it is counted no split of the 43 ms
+//! between "gather" and "everything else" is established here.
+//!
+//! Do not reach for `zc_buffer_gathered` to close this. It is bumped in
+//! `try_buffer_zero_copy_resolved` while the *request* is built, covers buffers
+//! rather than sampled images, and is therefore not this phase — it was checked
+//! and rejected for exactly that reason.
+//!
 //! A draw that returns early — a decline, a batched deferred submit, a
 //! `skip_readback` target — charges its remainder to whichever phase was open,
 //! because [`DrawTimer`] commits from `Drop`. That is deliberate: an exit is not
