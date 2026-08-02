@@ -6294,6 +6294,8 @@ fn arm_surface_deferred_store_with<M: HostMemory + HostOps>(
 /// Keep the census on. It is four counters a second, it is the denominator for
 /// any future claim that the flush rail could move fewer bytes, and if the
 /// guest's compositing strategy ever changes this is where it would show.
+#[cfg(feature = "backend-vulkan")]
+fn note_store_damage_coverage(req: &DrawEncodeRequest, width: u32, height: u32) {
     let Some((route, covered, attach)) = store_damage_bucket(req.scissor, width, height) else {
         return;
     };
