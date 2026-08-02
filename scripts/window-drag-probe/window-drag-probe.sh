@@ -231,8 +231,8 @@ wl = rows("host_window_loop", ["ticks", "redraws_asked", "draws",
                                "draws_fresh", "draws_stale"])
 bp = rows("bind_phase", ["binds", "vertex_us", "fragment_us", "attrs_us"])
 cp = rows("chain_phase", ["chains", "binds_us"])
-lr = rows("land_redundancy", ["audits", "bytes", "pages", "same_pages",
-                              "fine", "same_fine"])
+lr = rows("land_redundancy", ["audits", "calls", "runs", "bytes", "pages",
+                              "same_pages", "fine", "same_fine"])
 ws = rows("write_split", ["bytes"])
 
 print("host_window_cadence — frames this device put out")
@@ -257,6 +257,8 @@ show("MB/s written", [r["bytes"] / 1e6 for r in ws], " MB")
 show("same_pages %", [100.0 * r["same_pages"] / r["pages"] for r in lr if r["pages"]], " %")
 show("same_fine %", [100.0 * r["same_fine"] / r["fine"] for r in lr if r["fine"]], " %")
 show("audited MB", [r["bytes"] / 1e6 for r in lr], " MB")
+show("landings audited", [r["audits"] for r in lr])
+show("landings offered", [r["calls"] for r in lr])
 
 # The delivery chain between the composite and the screen, which the three
 # families above do not cover. `publish_window_frame` runs once per drain

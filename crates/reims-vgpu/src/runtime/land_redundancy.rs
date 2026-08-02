@@ -93,8 +93,17 @@ pub const AUDIT_STRIDE: u64 = 64;
 /// cache line this runs on, so a fine chunk never straddles one.
 pub const FINE_TILE: usize = 256;
 
+/// Free-running, and deliberately **not** cleared by [`take_window`].
+///
+/// The stride is a property of the write stream, not of the reporting window. A
+/// counter the census zeroed would restart the stride every second, so the first
+/// write after each window boundary would be due — which on an idle desktop
+/// landing four windows a second means auditing all four, and on a driven one
+/// silently changes the sample rate with the load.
+static STRIDE_TICK: AtomicU64 = AtomicU64::new(0);
 static CALLS: AtomicU64 = AtomicU64::new(0);
 static AUDITS: AtomicU64 = AtomicU64::new(0);
+static RUNS: AtomicU64 = AtomicU64::new(0);
 static BYTES: AtomicU64 = AtomicU64::new(0);
 static PAGES: AtomicU64 = AtomicU64::new(0);
 static SAME_PAGES: AtomicU64 = AtomicU64::new(0);
@@ -104,9 +113,14 @@ static SAME_FINE: AtomicU64 = AtomicU64::new(0);
 /// One window of the audit, as taken by the per-second census.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct LandRedundancyWindow {
-    /// Writes that reached the compare, against `calls` offered.
+    /// Walks audited, against `calls` offered. One walk is one landing's worth
+    /// of writes, so this is a count of frames sampled.
     pub audits: u64,
     pub calls: u64,
+    /// Contiguous ranges compared across those walks. A fragmented landing is
+    /// hundreds of runs of one frame, so this is not a second frame count —
+    /// keeping it separate is what stops the two being read as one.
+    pub runs: u64,
     pub bytes: u64,
     pub pages: u64,
     pub same_pages: u64,
@@ -117,17 +131,20 @@ pub struct LandRedundancyWindow {
 /// Take and clear the window. `None` when nothing was audited, so an idle
 /// second costs no line.
 pub fn take_window() -> Option<LandRedundancyWindow> {
-    let audits = AUDITS.swap(0, Ordering::Relaxed);
     let w = LandRedundancyWindow {
-        audits,
+        audits: AUDITS.swap(0, Ordering::Relaxed),
         calls: CALLS.swap(0, Ordering::Relaxed),
+        runs: RUNS.swap(0, Ordering::Relaxed),
         bytes: BYTES.swap(0, Ordering::Relaxed),
         pages: PAGES.swap(0, Ordering::Relaxed),
         same_pages: SAME_PAGES.swap(0, Ordering::Relaxed),
         fine: FINE.swap(0, Ordering::Relaxed),
         same_fine: SAME_FINE.swap(0, Ordering::Relaxed),
     };
-    (audits > 0).then_some(w)
+    // Gated on ranges compared rather than on walks admitted: a walk that was
+    // due and then wrote nothing has no fraction to report, and a line of zeros
+    // reads as "nothing was redundant".
+    (w.runs > 0).then_some(w)
 }
 
 /// Whether this write is the one in [`AUDIT_STRIDE`] that gets compared.
@@ -137,9 +154,14 @@ pub fn take_window() -> Option<LandRedundancyWindow> {
 /// would sample scattered pieces of different landings and report their mean as
 /// though it described one.
 pub fn audit_due() -> bool {
-    CALLS
+    CALLS.fetch_add(1, Ordering::Relaxed);
+    let due = STRIDE_TICK
         .fetch_add(1, Ordering::Relaxed)
-        .is_multiple_of(AUDIT_STRIDE)
+        .is_multiple_of(AUDIT_STRIDE);
+    if due {
+        AUDITS.fetch_add(1, Ordering::Relaxed);
+    }
+    due
 }
 
 /// Compare `src` against the `src.len()` bytes at `dst` and charge the match to
@@ -160,7 +182,7 @@ pub unsafe fn note_write(map_off: u64, dst: *const u8, src: &[u8], page_size: u6
     }
     // SAFETY: the caller guarantees `dst` is readable for `src.len()`.
     let dst = unsafe { std::slice::from_raw_parts(dst, src.len()) };
-    AUDITS.fetch_add(1, Ordering::Relaxed);
+    RUNS.fetch_add(1, Ordering::Relaxed);
     BYTES.fetch_add(src.len() as u64, Ordering::Relaxed);
     let tally = compare(map_off, src, dst, page_size);
     PAGES.fetch_add(tally.pages, Ordering::Relaxed);
@@ -250,6 +272,8 @@ mod tests {
     fn reset() {
         let _ = take_window();
         CALLS.store(0, Ordering::Relaxed);
+        AUDITS.store(0, Ordering::Relaxed);
+        STRIDE_TICK.store(0, Ordering::Relaxed);
     }
 
     /// An idle second emits nothing rather than a row of zeros.
@@ -365,5 +389,43 @@ mod tests {
             due += u64::from(audit_due());
         }
         assert_eq!(due, 3);
+    }
+
+    /// The stride survives the census taking its window. It is a property of the
+    /// write stream, and a counter the census zeroed would make every window's
+    /// first write due — which on an idle desktop is every landing, and on a
+    /// driven one is a sample rate that moves with the load.
+    #[test]
+    fn taking_the_window_does_not_restart_the_stride() {
+        reset();
+        // Tick 0 is due, then half a stride of ticks that are not, then a
+        // census, then the rest of the stride: the next due write must still be
+        // tick `AUDIT_STRIDE` and not the first one after the boundary.
+        assert!(audit_due(), "the stride's first tick is due");
+        for _ in 1..(AUDIT_STRIDE / 2) {
+            assert!(!audit_due());
+        }
+        let _ = take_window();
+        for _ in (AUDIT_STRIDE / 2)..AUDIT_STRIDE {
+            assert!(!audit_due(), "the window boundary made a write due");
+        }
+        assert!(audit_due(), "the stride's own tick did not come due");
+    }
+
+    /// `audits` counts walks and `runs` counts the ranges inside them. A
+    /// fragmented landing is hundreds of runs of one frame, so reporting one
+    /// number for both would read as hundreds of frames sampled a second.
+    #[test]
+    fn walks_and_the_runs_inside_them_are_counted_apart() {
+        reset();
+        assert!(audit_due());
+        let src = [3u8; FINE_TILE * 2];
+        let dst = src;
+        for run in 0..4u64 {
+            unsafe { note_write(run * FINE_TILE as u64 * 2, dst.as_ptr(), &src, PAGE) };
+        }
+        let w = take_window().expect("one audited walk");
+        assert_eq!((w.audits, w.runs), (1, 4), "{w:?}");
+        assert_eq!(w.bytes, 4 * 2 * FINE_TILE as u64, "{w:?}");
     }
 }
