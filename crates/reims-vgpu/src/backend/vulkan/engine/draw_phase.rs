@@ -121,12 +121,47 @@
 //!   the back. That cannot be the ~100 us per bind the arithmetic demands.
 //!
 //! What is left is `SampledSource::GuestRuns`, and the reason it was invisible
-//! is that **it increments no counter of its own**. That arm calls
+//! is that it incremented no counter of its own. That arm calls
 //! `acquire_sampled`, then `acquire_staging`, then `write_staging_from_runs` —
 //! a real memcpy gather out of scattered guest RAM into mapped staging, once
-//! per bind. Every other arm reports itself; the one that moves bytes does not.
-//! Counting it is the next step, and until it is counted no split of the 43 ms
-//! between "gather" and "everything else" is established here.
+//! per bind. Every other arm reported itself; the one that moves bytes did not.
+//!
+//! # It is the gather, and the gather is a second gigabyte-per-second rail
+//!
+//! `sampled_gathers` / `sampled_gather_bytes` closed it. Eight consecutive
+//! one-second windows at 660 draws on a driven x86/PCI boot:
+//!
+//! ```text
+//! acquire_sampled_us  72710  61495  66565  64560  65432  68702  61644  65713
+//! sampled_gathers       360    360    360    360    360    360    360    360
+//! sampled_gather_MB   842.4  842.4  842.4  842.4  842.4  842.4  842.4  842.4
+//! us per gather         202    171    185    179    182    191    171    183
+//! ```
+//!
+//! 360 gathers a second at ~180 us each is ~65 ms, which is the phase total.
+//! The gather is not part of the cost; it is the cost, and nothing else in the
+//! sampled loop is measurable beside it.
+//!
+//! The bytes are the finding. **842 MB/s of guest memory read into staging, at
+//! 2.34 MB per bind**, every second, for a Safari page that is only animating.
+//! `AGENTS.md` calls the render deferred-flush writeback "the single largest
+//! cost in the device" at ~1 GB/s into guest pages; this is a second rail of
+//! the same order running the other way, and it was undocumented because the
+//! arm that drives it was uncounted.
+//!
+//! Note what the constancy says: 360 and 842.4 MB repeat to the digit across
+//! all eight windows, so this is the *same* content re-gathered every frame
+//! rather than a changing working set. The gather path has no content cache at
+//! all — `find_cached_sampled` serves the `Bytes` arm (420 identity hits a
+//! second in these same windows) and nothing serves this one.
+//!
+//! That makes the repair shape clear, and it is a shape this tree has already
+//! used: a gather may be skipped when the guest has not written the source
+//! pages since the last one, which is what `guest_write_gen` /
+//! `mapping_guest_write_verdict` answer for the type-11 seed elision — the rung
+//! that took `type11_seed_uploaded` from 242 to 23. It is *not* established here
+//! that the same witness covers these run lists, which are task-GVA spans rather
+//! than mapping ids; that is the first thing to check before building on this.
 //!
 //! Do not reach for `zc_buffer_gathered` to close this. It is bumped in
 //! `try_buffer_zero_copy_resolved` while the *request* is built, covers buffers
