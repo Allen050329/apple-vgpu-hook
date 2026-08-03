@@ -40,6 +40,14 @@ use crate::runtime::mapper::{mapping_guest_write_verdict, GuestWriteVerdict};
 use crate::runtime::mapping_write;
 use crate::runtime::objects;
 
+// The Vulkan half of this path. Gated once here rather than per item, and
+// re-exported flat so callers keep naming its items
+// `crate::runtime::metal_draw::<name>`.
+#[cfg(feature = "backend-vulkan")]
+mod vulkan;
+#[cfg(feature = "backend-vulkan")]
+pub use vulkan::*;
+
 /// Upper bound on a single buffer materialization (pathological pooled allocs).
 /// Metal buffer/texture bind **index** cap (`REIMS_VGPU_METAL_MAX_BUFFERS`) — API slot
 /// count, not a byte-size budget. Resource byte sizes follow the guest
@@ -3165,7 +3173,112 @@ pub(crate) fn load_vulkan_sampler<M: HostMemory + HostOps>(
     vulkan_sampler_resource(sampler_ref, binding, &sampler)
 }
 
-include!("vulkan.rs");
+/// Metal-direct builds never arm GVA windows — nothing to supersede.
+#[cfg(not(feature = "backend-vulkan"))]
+pub(crate) fn supersede_gva_window<M: HostMemory + HostOps>(
+    _state: &mut DeviceState,
+    _host: &mut M,
+    _gva: u64,
+    _width: u32,
+    _height: u32,
+    _by: &str,
+) {
+}
+
+/// Store encode RGBA8 into **texture_ref** host cache as BGRA (not surface_id).
+#[cfg(test)]
+fn host_cache_store_rgba8(
+    state: &mut DeviceState,
+    texture_ref: u32,
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+) {
+    if texture_ref == 0 || width == 0 || height == 0 {
+        return;
+    }
+    let need = (width as usize)
+        .saturating_mul(height as usize)
+        .saturating_mul(4);
+    if rgba.len() < need {
+        return;
+    }
+    let bgra = swap_rb_channels(&rgba[..need]);
+    crate::runtime::surface_cache::store_texture(state, texture_ref, width, height, bgra);
+}
+
+/// Advance the guest-visible publish milestones for a type-11 Store whose
+/// pixels have landed in the mapping's guest pages.
+///
+/// Route-independent: the synchronous `cpu_portability` Store calls it inline,
+/// and the deferred render rail calls it from the flush that finally performs
+/// the same write (`storage_flush::flush_render_one`). Both have just proved
+/// the same thing — `write_rgba8_image_changed` verified geometry and landed a
+/// complete frame — and without it the `present_unbacked` gate is structurally
+/// dead on whichever route skips it, because no mapping's `dense_frame_seq`
+/// would advance.
+pub(crate) fn publish_surface_store<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+    width: u32,
+    height: u32,
+    format: u16,
+) {
+    state.note_surface_composite(mapping_id);
+    state.note_dense_frame_published(mapping_id, width, height);
+    crate::runtime::scanout::note_front_buffer_writeback(
+        state, host, mapping_id, width, height, format,
+    );
+}
+
+pub fn writeback_chain_rgba<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    color_slots: &[(u32, crate::runtime::decode::render::ColorAttachment)],
+    rgba: &[u8],
+) -> bool {
+    if color_slots.is_empty() || rgba.is_empty() {
+        return false;
+    }
+    let Some((_, att)) = color_slots.first() else {
+        return false;
+    };
+    if att.texture_ref == 0 {
+        return false;
+    }
+    let Some((mapping_id, gva, w, h, bpr, fmt)) =
+        lookup_render_target(state, host, task_id, att.texture_ref)
+    else {
+        return false;
+    };
+    let need = (w as usize).saturating_mul(h as usize).saturating_mul(4);
+    if rgba.len() < need {
+        return false;
+    }
+    if gva != 0 {
+        supersede_gva_window(state, host, gva, w, h, "chain_land");
+        return write_gva_rgba8(state, host, task_id, gva, w, h, bpr, fmt, rgba).is_ok();
+    }
+    if mapping_id == 0 {
+        return false;
+    }
+    // An abandoned portability chain must still preserve the last successful
+    // record. This is an error recovery rail, not normal product behavior: land
+    // the resident readback into the type-11 mapping, publish the Composite
+    // Store, and keep the degradation fail-visible.
+    crate::observe::fail(format!(
+        "writeback_chain_rgba reason=resident_chain_abandoned_cpu_recovery \
+         mid={mapping_id} {w}x{h} fmt={fmt:#x}"
+    ));
+    let wrote = mapping_write::write_rgba8_image_changed(state, host, mapping_id, rgba, None, w, h);
+    if wrote {
+        publish_surface_store(state, host, mapping_id, w, h, fmt);
+    }
+    wrote
+}
+
 include!("metal_icb.rs");
 /// Archive `apple_pv_gpu_lookup_render_target`: type-11 first, else type-2/3 GVA.
 ///

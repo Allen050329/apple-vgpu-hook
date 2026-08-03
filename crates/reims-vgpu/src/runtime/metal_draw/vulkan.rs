@@ -1,10 +1,20 @@
+//! Vulkan-backend half of the [`super`] draw encode path: sampled-source
+//! resolution, zero-copy load paths, metal2vulkan draw submission, and the
+//! deferred GVA/surface store windows.
+//!
+//! The whole module is gated on `backend-vulkan` at its declaration in
+//! [`super`], which also re-exports these items flat so callers keep addressing
+//! them as `crate::runtime::metal_draw::<name>`. `use super::*` pulls in the
+//! parent's imports, which this half shares.
+
+use super::*;
+
 /// Vulkan image shape for a reflected Metal sampled-image dimensionality.
 ///
 /// The engine caps array layers at 1 (a single-layer array is still a distinct
 /// descriptor type from a plain 2D image), so array shapes report `layers = 1`
 /// and a genuinely multi-layer source declines on its byte length rather than
 /// binding a truncated array.
-#[cfg(feature = "backend-vulkan")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SampledImageShape {
     arrayed: bool,
@@ -18,7 +28,6 @@ struct SampledImageShape {
 /// shape the sampled-draw path builds. `None` is a shape the path cannot yet
 /// express (`Cube` / `CubeArray`); the caller declines it by name so the gap
 /// stays visible instead of binding the wrong view type.
-#[cfg(feature = "backend-vulkan")]
 fn sampled_image_shape(
     kind: crate::runtime::spirv_bind::SampledImageKind,
 ) -> Option<SampledImageShape> {
@@ -40,7 +49,6 @@ fn sampled_image_shape(
     })
 }
 
-#[cfg(feature = "backend-vulkan")]
 pub fn encode_draw_and_writeback<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -56,7 +64,6 @@ pub fn encode_draw_and_writeback<M: HostMemory + HostOps>(
 /// encode** and return color0 for chaining — returning `NoMetal` when
 /// `!writeback_guest` aborted every multi-draw stream after the first
 /// record (live `draw_fail_clear_fallback nometal=1` on clear+draw packets).
-#[cfg(feature = "backend-vulkan")]
 pub fn encode_draw_chain<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -653,8 +660,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
 }
 
 /// Sampled texture source + geometry for an engine draw.
-#[cfg(feature = "backend-vulkan")]
-enum SampledSourceRequest {
+pub(super) enum SampledSourceRequest {
     /// Shared texel bytes + optional producer identity (see
     /// [`LinearSampleIdentity`]) + the byte layout of those texels; the Arc lets
     /// memoized repeat binds skip the per-draw copy and the engine skip
@@ -699,14 +705,12 @@ enum SampledSourceRequest {
 /// of them — a device-global counter, never per-entry — so a `(key, generation)`
 /// pair names one content for the life of the device and content cannot alias
 /// even if two producers did collide on a key.
-#[cfg(feature = "backend-vulkan")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct LinearSampleIdentity {
-    key: u64,
-    generation: u64,
+pub(super) struct LinearSampleIdentity {
+    pub(super) key: u64,
+    pub(super) generation: u64,
 }
 
-#[cfg(feature = "backend-vulkan")]
 impl From<crate::runtime::gather_witness::GatheredIdentity> for LinearSampleIdentity {
     /// The zero-copy gather rail's key is a hash of the window's name rather
     /// than a bit-namespaced id like the four rows above, so it can collide with
@@ -722,7 +726,6 @@ impl From<crate::runtime::gather_witness::GatheredIdentity> for LinearSampleIden
     }
 }
 
-#[cfg(feature = "backend-vulkan")]
 type LoadedType5View = (
     u32,
     u32,
@@ -730,7 +733,6 @@ type LoadedType5View = (
     LinearSampleIdentity,
     TexelLayout,
 );
-#[cfg(feature = "backend-vulkan")]
 type LoadedLinearSample = (
     u32,
     u32,
@@ -746,9 +748,8 @@ type LoadedLinearSample = (
 /// carry the prior draw in `target_seed_rgba`; reloading guest pages here would
 /// expose the pre-pass image to the shader even though attachment Load sees the
 /// chained image.
-#[cfg(feature = "backend-vulkan")]
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum AttachmentAliasSample<'a> {
+pub(super) enum AttachmentAliasSample<'a> {
     Clear([f64; 4]),
     Seed(&'a [u8]),
     /// Records 2+ of a resident GVA chain: the prior record's content lives
@@ -757,8 +758,7 @@ enum AttachmentAliasSample<'a> {
     ResidentChain,
 }
 
-#[cfg(feature = "backend-vulkan")]
-fn fragment_attachment_alias_sample<'a>(
+pub(super) fn fragment_attachment_alias_sample<'a>(
     req: &'a DrawEncodeRequest,
     texture_index: u32,
     texture_ref: u32,
@@ -804,8 +804,7 @@ fn fragment_attachment_alias_sample<'a>(
 /// geometry equals the window geometry, and the same storage-family gate that
 /// would let the post-flush cache layer serve this object type accepts it. Any
 /// mismatch must land the window (flush path) instead.
-#[cfg(feature = "backend-vulkan")]
-fn deferred_gva_sample_eligible(
+pub(super) fn deferred_gva_sample_eligible(
     win: &crate::model::GvaDeferredEntry,
     desc_width: u32,
     desc_height: u32,
@@ -826,7 +825,6 @@ fn deferred_gva_sample_eligible(
 /// gate would accept the layer. Mismatches fall through to the flush path.
 /// The window stays armed: the contract Store still lands on first guest
 /// access, and the resident stays authoritative for further samples.
-#[cfg(feature = "backend-vulkan")]
 fn try_sample_deferred_gva<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -943,8 +941,7 @@ fn try_sample_deferred_gva<M: HostMemory + HostOps>(
 ///   both page-reading rungs, so nothing below would have corrected it. Two
 ///   uncorrected stale binds on a repainted surface is the "renders correctly
 ///   for a few frames, then stays corrupted" report.
-#[cfg(feature = "backend-vulkan")]
-fn resolve_sampled_source<M: HostMemory + HostOps>(
+pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
@@ -1367,9 +1364,8 @@ fn resolve_sampled_source<M: HostMemory + HostOps>(
     ))
 }
 
-#[cfg(feature = "backend-vulkan")]
 #[inline]
-fn type5_view_requires_materialization(
+pub(super) fn type5_view_requires_materialization(
     base_has_geom: bool,
     base_width: u32,
     base_height: u32,
@@ -1386,7 +1382,6 @@ fn type5_view_requires_materialization(
 
 /// The decoded device-surface fields a failed sample-window derivation dumps
 /// for diagnosis: `(width, height, pixel_format, bytes_per_row, alloc_size)`.
-#[cfg(feature = "backend-vulkan")]
 type SampleWindowDesc = (u32, u32, u32, u32, u32);
 
 /// Why the type-5 serialized-view loader refused to materialize a plane.
@@ -1401,9 +1396,8 @@ type SampleWindowDesc = (u32, u32, u32, u32, u32);
 /// migration recorded as still sharing the word. The `type5_view_` prefix keeps
 /// `grep reason=type5_view_…` answerable against the copy path that shares the
 /// surface.
-#[cfg(feature = "backend-vulkan")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Type5ViewDecline {
+pub(super) enum Type5ViewDecline {
     /// The serialized view is volumetric; only `depth == 1` planes materialize.
     UnsupportedDepth { depth: u32 },
     /// The mapping's page table is not resident for scanout.
@@ -1451,7 +1445,6 @@ enum Type5ViewDecline {
     Convert { row: usize, bpp: u32 },
 }
 
-#[cfg(feature = "backend-vulkan")]
 impl crate::observe::Decline for Type5ViewDecline {
     fn slug(&self) -> &'static str {
         match self {
@@ -1550,7 +1543,6 @@ impl crate::observe::Decline for Type5ViewDecline {
 /// always-on channel. Measured on one x86/Vulkan boot before the guest-pages rung
 /// existed: **121 distinct (mapping, geometry) wipes** in ~170 s, four of them at
 /// the full 1920x1080 composite extent, against 0 in the idle phase.
-#[cfg(feature = "backend-vulkan")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Type11SeedDecline {
     /// The cache holds no entry for this mapping id and the mapping's own pages
@@ -1584,7 +1576,6 @@ enum Type11SeedDecline {
     CededToResident,
 }
 
-#[cfg(feature = "backend-vulkan")]
 impl crate::observe::Decline for Type11SeedDecline {
     fn slug(&self) -> &'static str {
         match self {
@@ -1604,7 +1595,6 @@ impl crate::observe::Decline for Type11SeedDecline {
 
 /// Which rung of the type-11 `LOAD` seed ladder produced the attachment's prior
 /// contents.
-#[cfg(feature = "backend-vulkan")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Type11SeedRung {
     /// The host render cache held this mapping at exactly this geometry.
@@ -1613,7 +1603,6 @@ enum Type11SeedRung {
     GuestPages,
 }
 
-#[cfg(feature = "backend-vulkan")]
 impl Type11SeedRung {
     fn name(self) -> &'static str {
         match self {
@@ -1641,7 +1630,6 @@ impl Type11SeedRung {
 /// The mapping's own latched geometry and generation ride along on every arm:
 /// `want == mapgeom` is the condition under which the guest-pages rung can serve
 /// at all, so the pair says whether a miss was recoverable.
-#[cfg(feature = "backend-vulkan")]
 fn note_type11_load_seed(
     state: &DeviceState,
     mapping_id: u32,
@@ -1731,7 +1719,6 @@ fn note_type11_load_seed(
 ///
 /// `None` means the guest's LOAD could not be honoured at all, and
 /// [`note_type11_load_seed`] has already said which check refused.
-#[cfg(feature = "backend-vulkan")]
 fn resolve_type11_load_seed<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -1781,8 +1768,7 @@ fn resolve_type11_load_seed<M: HostMemory + HostOps>(
 /// bind re-reads the native plane window so a guest write is always observed;
 /// conversion, allocation, and — via the returned content identity — the
 /// engine upload are skipped when the bytes are unchanged.
-#[cfg(feature = "backend-vulkan")]
-fn load_type5_view_rgba<M: HostMemory + HostOps>(
+pub(super) fn load_type5_view_rgba<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
@@ -2035,8 +2021,7 @@ fn load_type5_view_rgba<M: HostMemory + HostOps>(
 /// The floor is also the *only* thing that has ever declined the type-11
 /// gather: over 1 051 sampled declines it was 100% of them, which is why the
 /// rail no longer carries a reason enum to distinguish the rest.
-#[cfg(feature = "backend-vulkan")]
-const ZERO_COPY_SAMPLED_MIN_BYTES: u64 = 64 * 1024;
+pub(super) const ZERO_COPY_SAMPLED_MIN_BYTES: u64 = 64 * 1024;
 
 /// Zero-copy floor for draw-time vertex/storage buffer binds. Performance
 /// threshold only — never a correctness gate; below it the bind takes the CPU
@@ -2071,8 +2056,7 @@ const ZERO_COPY_SAMPLED_MIN_BYTES: u64 = 64 * 1024;
 /// above zero beats no floor on this workload; it does not say this is the best
 /// one. A sweep would settle that, and until one is run the value is a guess
 /// whose direction has evidence and whose magnitude does not.
-#[cfg(feature = "backend-vulkan")]
-const ZERO_COPY_BUFFER_MIN_BYTES: u64 = 16 * 1024;
+pub(super) const ZERO_COPY_BUFFER_MIN_BYTES: u64 = 16 * 1024;
 
 /// Does this host promise a guest-page alias that stays valid indefinitely?
 ///
@@ -2093,7 +2077,6 @@ const ZERO_COPY_BUFFER_MIN_BYTES: u64 = 16 * 1024;
 /// released on `unmap_pages` rather than retained until teardown, the shim
 /// answers 0. The x86 PCI shim never allocates — it refuses anything that is
 /// not a packed host-contiguous run — so it still answers 1.
-#[cfg(feature = "backend-vulkan")]
 fn guest_run_alias_available<M: HostOps>(host: &M) -> bool {
     if host.map_pages_stable() {
         return true;
@@ -2118,7 +2101,6 @@ fn guest_run_alias_available<M: HostOps>(host: &M) -> bool {
 /// The page list rides out with the runs because a caller that wants to say
 /// anything about the window's *contents* over time needs the pages, not the
 /// host pointers: guest-write tracking is registered per page set.
-#[cfg(feature = "backend-vulkan")]
 fn task_gva_guest_run_window<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &mut M,
@@ -2140,8 +2122,7 @@ fn task_gva_guest_run_window<M: HostMemory + HostOps>(
 
 /// [`task_gva_guest_run_window`] for callers with nothing to say about the
 /// window's page set.
-#[cfg(feature = "backend-vulkan")]
-fn task_gva_guest_runs<M: HostMemory + HostOps>(
+pub(super) fn task_gva_guest_runs<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &mut M,
     task_id: u32,
@@ -2162,7 +2143,6 @@ fn task_gva_guest_runs<M: HostMemory + HostOps>(
 /// `None` if any stretch fails to import, or if the window runs out before
 /// `span` — a partial gather would hand the GPU a short buffer, which is a
 /// wrong frame rather than a slow one.
-#[cfg(feature = "backend-vulkan")]
 fn coalesce_pages_to_runs<M: HostOps>(
     host: &mut M,
     window: &[u64],
@@ -2202,8 +2182,7 @@ fn coalesce_pages_to_runs<M: HostOps>(
 /// a byte-granular stride has no representation. Padded strides otherwise ride
 /// the same rail. The extent stops after the last row's texels because trailing
 /// padding may not be mapped.
-#[cfg(feature = "backend-vulkan")]
-fn strided_window_extent(w: u32, h: u32, bpp: u64, bpr: u64) -> Option<(u64, u32)> {
+pub(super) fn strided_window_extent(w: u32, h: u32, bpp: u64, bpr: u64) -> Option<(u64, u32)> {
     let tight = (w as u64).checked_mul(bpp)?;
     if bpr < tight || bpp == 0 || !bpr.is_multiple_of(bpp) {
         return None;
@@ -2228,7 +2207,6 @@ fn strided_window_extent(w: u32, h: u32, bpp: u64, bpr: u64) -> Option<(u64, u32
 /// through different window math. The flush is the coherence rule the CPU
 /// loaders obey: a resident-authoritative window covering this mapping must
 /// land before the GPU reads, or the gather sees the pre-Store bytes.
-#[cfg(feature = "backend-vulkan")]
 fn mapping_window_guest_runs<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -2266,7 +2244,6 @@ fn mapping_window_guest_runs<M: HostMemory + HostOps>(
 /// the buffer zero-copy floor and every page walkable into mappable runs.
 /// Deferred stores intersecting the span are landed first, exactly like the
 /// CPU path.
-#[cfg(feature = "backend-vulkan")]
 fn try_buffer_zero_copy_resolved<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -2314,7 +2291,6 @@ fn try_buffer_zero_copy_resolved<M: HostMemory + HostOps>(
 /// eligible, else the CPU staging read. `allow_zero_copy` is false for
 /// buffers feeding Constant-step attributes (the engine prepends a CPU
 /// base-instance prefix to those).
-#[cfg(feature = "backend-vulkan")]
 fn load_buffer_content<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -2349,7 +2325,6 @@ fn load_buffer_content<M: HostMemory + HostOps>(
 /// texel layout Vulkan samples identically (BGRA8/RGBA8 UNORM), tight rows,
 /// window inside the allocation, span ≥ the zero-copy floor, every page
 /// walkable, and packed-contiguous runs mappable.
-#[cfg(feature = "backend-vulkan")]
 fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -2453,8 +2428,7 @@ fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
 /// the resident is not authoritative. Mirrors `paint_mapping`'s window math
 /// (`type11_sample_window`) and its flush-on-access rule; any gate miss
 /// falls back to the CPU byte path.
-#[cfg(feature = "backend-vulkan")]
-fn try_type11_sample_zero_copy<M: HostMemory + HostOps>(
+pub(super) fn try_type11_sample_zero_copy<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     mid: u32,
@@ -2530,7 +2504,6 @@ fn try_type11_sample_zero_copy<M: HostMemory + HostOps>(
 /// Mirrors `try_type11_sample_zero_copy`'s page coalescing over the plane
 /// window from `type5_sample_window` (which carries the wire plane index +
 /// biplanar offset); any gate miss falls back to the CPU byte path.
-#[cfg(feature = "backend-vulkan")]
 fn try_type5_sample_zero_copy<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -2627,7 +2600,6 @@ fn try_type5_sample_zero_copy<M: HostMemory + HostOps>(
 /// format; every other format converts to RGBA8 per row. Shared by the
 /// guest-linear memo's miss-fill so its padded and tight branches agree
 /// byte-for-byte with the direct loader.
-#[cfg(feature = "backend-vulkan")]
 fn native_scratch_to_upload(
     scratch: &[u8],
     w: u32,
@@ -2691,7 +2663,6 @@ fn native_scratch_to_upload(
 /// That is measured, not asserted, and it is why the surviving Finder icon
 /// class is not a wrong-bytes defect on this rung: the bytes served are the
 /// bytes at the address the guest named, checked afresh each time.
-#[cfg(feature = "backend-vulkan")]
 #[allow(clippy::too_many_arguments)]
 fn load_linear_guest_memoized<M: HostMemory + HostOps>(
     state: &mut DeviceState,
@@ -3013,7 +2984,6 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
 /// What it does establish is that the "0"s above cannot be reasoned from as
 /// though the class had stopped happening. On the general workload it happens
 /// roughly three hundred times a boot.
-#[cfg(feature = "backend-vulkan")]
 #[allow(
     clippy::too_many_arguments,
     reason = "the census line carries the identity of the sample it scored"
@@ -3065,8 +3035,7 @@ fn note_guest_rung_blank(
     }
 }
 
-#[cfg(feature = "backend-vulkan")]
-fn load_linear_from_host_caches<M: HostMemory + HostOps>(
+pub(super) fn load_linear_from_host_caches<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
@@ -3145,8 +3114,7 @@ fn load_linear_from_host_caches<M: HostMemory + HostOps>(
 /// The Vulkan rail writes back only color attachment 0, so this narrows
 /// [`sync_store_target_pages`] to that record and to the case where this record
 /// owns guest writeback at all.
-#[cfg(feature = "backend-vulkan")]
-fn sync_store_allowed_pages<M: HostMemory>(
+pub(super) fn sync_store_allowed_pages<M: HostMemory>(
     state: &DeviceState,
     host: &M,
     task_id: u32,
@@ -3216,7 +3184,6 @@ fn sync_store_allowed_pages<M: HostMemory>(
 /// every LOAD, with the 237 GB left saved. One driven boot after it landed
 /// measured `type11_seed_elided` 283 against `type11_seed_uploaded` 23, so the
 /// reuse survived the soundness.
-#[cfg(feature = "backend-vulkan")]
 fn note_type11_elision_extent(w: u32, h: u32) {
     let texels = (w as u64).saturating_mul(h as u64);
     crate::runtime::drain::note_store_route(match texels {
@@ -3286,7 +3253,6 @@ fn note_type11_elision_extent(w: u32, h: u32) {
 /// trace in a census this large will not be found by adding another counter to
 /// these rails; the next instrument has to observe surface *content* across the
 /// transition, not the routes taken to produce it.
-#[cfg(feature = "backend-vulkan")]
 #[allow(
     clippy::too_many_arguments,
     reason = "the census joins the scissor rect, the target, and how the attachment was loaded"
@@ -3348,7 +3314,6 @@ fn note_draw_coverage(
 /// `chain_load_from_target` (the resident target already carries the chain) is
 /// a different arm and never reaches here: it is a seed that does not need
 /// uploading, not a seed that is missing.
-#[cfg(feature = "backend-vulkan")]
 fn note_load_seed_outcome(
     door: &'static str,
     seeded: bool,
@@ -3409,7 +3374,6 @@ fn note_load_seed_outcome(
     }
 }
 
-#[cfg(feature = "backend-vulkan")]
 #[inline]
 fn gva_cache_linear_texture_type(object_type: u8) -> bool {
     matches!(
@@ -3422,9 +3386,8 @@ fn gva_cache_linear_texture_type(object_type: u8) -> bool {
 /// wrappers may alias the same GVA allocation, so a matching GVA+geometry cache
 /// entry can serve either tag. Other nonzero object-type transitions remain
 /// separate resource classes and fall through to current ref/guest backing.
-#[cfg(feature = "backend-vulkan")]
 #[inline]
-fn gva_cache_owner_allows_object_type(producer_type: u8, current_type: u8) -> bool {
+pub(super) fn gva_cache_owner_allows_object_type(producer_type: u8, current_type: u8) -> bool {
     producer_type == 0
         || current_type == 0
         || producer_type == current_type
@@ -3438,7 +3401,6 @@ fn gva_cache_owner_allows_object_type(producer_type: u8, current_type: u8) -> bo
 /// records the pages it resolves to so a later sample can tell whether the
 /// address still names this allocation, and asks the host to watch them so a
 /// later sample can also tell whether the guest has since rewritten it.
-#[cfg(feature = "backend-vulkan")]
 #[allow(
     clippy::too_many_arguments,
     reason = "the cache identity mirrors the object, GVA, texture geometry, and guest backing"
@@ -3488,30 +3450,7 @@ pub(crate) fn host_cache_store_gva_layer<M: HostMemory + HostOps>(
     }
 }
 
-/// Store encode RGBA8 into **texture_ref** host cache as BGRA (not surface_id).
-#[cfg(test)]
-fn host_cache_store_rgba8(
-    state: &mut DeviceState,
-    texture_ref: u32,
-    width: u32,
-    height: u32,
-    rgba: &[u8],
-) {
-    if texture_ref == 0 || width == 0 || height == 0 {
-        return;
-    }
-    let need = (width as usize)
-        .saturating_mul(height as usize)
-        .saturating_mul(4);
-    if rgba.len() < need {
-        return;
-    }
-    let bgra = swap_rb_channels(&rgba[..need]);
-    crate::runtime::surface_cache::store_texture(state, texture_ref, width, height, bgra);
-}
-
 /// Result of a Linux metal2vulkan draw.
-#[cfg(feature = "backend-vulkan")]
 enum M2vDrawSpan {
     /// No drawable color0 geom.
     None,
@@ -3585,13 +3524,11 @@ enum M2vDrawSpan {
 /// `return`s out of its own middle on the deferred route — the measurement that
 /// matters most — and a hand-closed bracket there records nothing while looking
 /// exactly like one that does. Reporting on `Drop` makes every exit pay.
-#[cfg(feature = "backend-vulkan")]
 struct StoreCostSpan {
     name: &'static str,
     started: std::time::Instant,
 }
 
-#[cfg(feature = "backend-vulkan")]
 impl StoreCostSpan {
     fn new(name: &'static str) -> Self {
         Self {
@@ -3601,7 +3538,6 @@ impl StoreCostSpan {
     }
 }
 
-#[cfg(feature = "backend-vulkan")]
 impl Drop for StoreCostSpan {
     fn drop(&mut self) {
         crate::runtime::drain::note_store_route_us(
@@ -3652,7 +3588,6 @@ impl Drop for StoreCostSpan {
 /// host GPU class to another, and this is exactly that boundary. Measuring these
 /// four needs a host whose quirk set turns deferral off, or one where the pin
 /// refuses — not another boot here.
-#[cfg(feature = "backend-vulkan")]
 fn note_type11_store_route(route: &'static str) {
     use std::sync::Mutex;
     static SEEN: Mutex<Option<std::collections::BTreeSet<&'static str>>> = Mutex::new(None);
@@ -3666,31 +3601,6 @@ fn note_type11_store_route(route: &'static str) {
     crate::observe::fail(format!("type11_store_route route={route}"));
 }
 
-/// Advance the guest-visible publish milestones for a type-11 Store whose
-/// pixels have landed in the mapping's guest pages.
-///
-/// Route-independent: the synchronous `cpu_portability` Store calls it inline,
-/// and the deferred render rail calls it from the flush that finally performs
-/// the same write (`storage_flush::flush_render_one`). Both have just proved
-/// the same thing — `write_rgba8_image_changed` verified geometry and landed a
-/// complete frame — and without it the `present_unbacked` gate is structurally
-/// dead on whichever route skips it, because no mapping's `dense_frame_seq`
-/// would advance.
-pub(crate) fn publish_surface_store<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
-    host: &mut M,
-    mapping_id: u32,
-    width: u32,
-    height: u32,
-    format: u16,
-) {
-    state.note_surface_composite(mapping_id);
-    state.note_dense_frame_published(mapping_id, width, height);
-    crate::runtime::scanout::note_front_buffer_writeback(
-        state, host, mapping_id, width, height, format,
-    );
-}
-
 /// Build the engine's secondary MRT attachments (slot 1..) from a draw's color
 /// list. Empty result ⇒ the classic single-RT path (no regression). A fragment
 /// shader that writes `location` 1.. has those outputs rendered rather than
@@ -3701,12 +3611,11 @@ pub(crate) fn publish_surface_store<M: HostMemory + HostOps>(
 /// than a guessed attachment: requires a resident primary, contiguous slots
 /// (0,1,2,… matching the shader's `location`s), matching framebuffer geometry,
 /// a known color-renderable format, and a resolvable identity.
-#[cfg(feature = "backend-vulkan")]
 #[allow(
     clippy::too_many_arguments,
     reason = "every argument is a distinct wire-derived input to the attachment set"
 )]
-fn build_secondary_targets<M: HostMemory + HostOps>(
+pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &mut M,
     task_id: u32,
@@ -3886,8 +3795,7 @@ fn build_secondary_targets<M: HostMemory + HostOps>(
 /// (revalidate + strided host ptr) on backends that can keep guest-visible
 /// content resident. Portability-subset devices take the synchronous CPU
 /// writeback path so guest pages remain authoritative across device recreates.
-#[cfg(feature = "backend-vulkan")]
-fn prepare_vertex_attribute_format(
+pub(super) fn prepare_vertex_attribute_format(
     attribute: &crate::runtime::decode::resource::VertexAttribute,
 ) -> Result<crate::backend::vulkan::engine::VertexAttributeFormat, DrawPreparationDecline> {
     translate::vertex::attribute_format(attribute.format).map_err(|reason| {
@@ -3900,8 +3808,7 @@ fn prepare_vertex_attribute_format(
     })
 }
 
-#[cfg(feature = "backend-vulkan")]
-fn prepare_vertex_step_function(
+pub(super) fn prepare_vertex_step_function(
     attribute: &crate::runtime::decode::resource::VertexAttribute,
 ) -> Result<crate::backend::vulkan::engine::VertexStepFunction, DrawPreparationDecline> {
     translate::vertex::step_function(attribute.has_step_function, attribute.step_function).map_err(
@@ -3913,7 +3820,6 @@ fn prepare_vertex_step_function(
     )
 }
 
-#[cfg(feature = "backend-vulkan")]
 fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -5504,8 +5410,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
 /// type-2/3 targets use the GVA identity below. Unlike deferred writeback, this
 /// lifetime is safe on portability-subset devices because the final record
 /// materializes guest bytes before the packet completes.
-#[cfg(feature = "backend-vulkan")]
-fn render_chain_identity(
+pub(super) fn render_chain_identity(
     state: &DeviceState,
     req: &DrawEncodeRequest,
 ) -> Option<crate::backend::vulkan::engine::TargetIdentity> {
@@ -5553,8 +5458,7 @@ fn render_chain_identity(
 /// [`render_chain_identity`] — and the intermediates already render into that
 /// resident under `skip_readback` with `LoadOp::LoadFromTarget`. The last record
 /// differs only in what happens *after* the draw.
-#[cfg(feature = "backend-vulkan")]
-fn type11_store_identity(
+pub(super) fn type11_store_identity(
     state: &DeviceState,
     req: &DrawEncodeRequest,
     writeback_guest: bool,
@@ -5589,7 +5493,6 @@ fn type11_store_identity(
 /// `!writeback_guest` intermediate, and the composite-Store rail claims it for the
 /// last record. So the condition here is the same one those blocks share, asked
 /// once.
-#[cfg(feature = "backend-vulkan")]
 fn type11_render_identity(
     state: &DeviceState,
     req: &DrawEncodeRequest,
@@ -5605,7 +5508,6 @@ fn type11_render_identity(
 /// it must be a LOAD, and no explicit seed may already have been selected for
 /// it by RT provenance. Separate from the currency question so the two counters
 /// on the branch below divide candidates, not all draws.
-#[cfg(feature = "backend-vulkan")]
 fn type11_load_is_a_seed_candidate(c0: &ColorRtRequest) -> bool {
     c0.load_action == PASS_LOAD_ACTION_LOAD && c0.target_seed_rgba.is_none()
 }
@@ -5624,8 +5526,7 @@ fn type11_load_is_a_seed_candidate(c0: &ColorRtRequest) -> bool {
 /// a rescheduling with a GPU round trip added: `surface_flush / surface_resident`
 /// = 1369/1373 on one boot. Structure rather than a test, because a unit test on
 /// the resolver passes whatever the call site then decides to pass it.
-#[cfg(feature = "backend-vulkan")]
-fn type11_load_currency_query(
+pub(super) fn type11_load_currency_query(
     state: &DeviceState,
     req: &DrawEncodeRequest,
 ) -> Option<(crate::backend::vulkan::engine::TargetIdentity, Option<u32>)> {
@@ -5673,8 +5574,7 @@ fn type11_load_currency_query(
 /// surface it has just asked the GPU to render into, and — unlike the epoch-only
 /// rail this replaced — the very next guest write moves the generation again and
 /// clears it.
-#[cfg(feature = "backend-vulkan")]
-fn type11_guest_wrote_since_store<M: HostOps>(
+pub(super) fn type11_guest_wrote_since_store<M: HostOps>(
     state: &DeviceState,
     host: &M,
     mapping_id: u32,
@@ -5713,14 +5613,12 @@ fn type11_guest_wrote_since_store<M: HostOps>(
 /// the guest; on the boot that first measured the ladder it was 14 092 of 14 396
 /// cache binds, so refusing on it would turn the rung off on the strength of a
 /// rail that was never armed.
-#[cfg(feature = "backend-vulkan")]
 fn guest_wrote_allocation(verdict: GuestWriteVerdict) -> bool {
     matches!(verdict, GuestWriteVerdict::Wrote)
 }
 
 /// Where the guest's writes since the stamping Store landed, relative to the
 /// pixel window a sampled bind reads.
-#[cfg(feature = "backend-vulkan")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum GuestWriteSite {
     /// At least one written page overlaps the sampled window, so every
@@ -5752,7 +5650,6 @@ enum GuestWriteSite {
 /// mapping does not own — is [`GuestWriteSite::Unknown`], which the caller
 /// treats as [`GuestWriteSite::Pixels`]. Serving a stale copy is a wrong frame
 /// that is then held; re-reading the guest's pages costs a copy.
-#[cfg(feature = "backend-vulkan")]
 fn guest_write_site<M: HostOps>(
     state: &DeviceState,
     host: &M,
@@ -5812,7 +5709,6 @@ fn guest_write_site<M: HostOps>(
 ///
 /// Returns whether the merge landed. On `false` the caller has a surface whose
 /// halves are still split and must say so rather than bind either one.
-#[cfg(feature = "backend-vulkan")]
 fn merge_guest_writes_into_pages<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -5863,7 +5759,6 @@ fn merge_guest_writes_into_pages<M: HostMemory + HostOps>(
 ///
 /// Half-open on both sides: a range that abuts the window without entering it
 /// is the padding page after the last row, not the last row.
-#[cfg(feature = "backend-vulkan")]
 fn ranges_touch_window(ranges: &[(u64, u64)], base_off: u64, span_end: u64) -> bool {
     ranges
         .iter()
@@ -5949,7 +5844,6 @@ fn ranges_touch_window(ranges: &[(u64, u64)], base_off: u64, span_end: u64) -> b
 /// `gw_wrote_elsewhere` on either rung. They are denominators, not dead code —
 /// their being empty is what says a served copy is never a copy the hypervisor
 /// actively contradicted.
-#[cfg(feature = "backend-vulkan")]
 fn note_type11_sample_rung(rung: &'static str, guest_write: GuestWriteVerdict) {
     crate::runtime::drain::note_store_route(rung);
     if let Some(gw) = sample_rung_gw_route(rung, guest_write) {
@@ -5959,7 +5853,6 @@ fn note_type11_sample_rung(rung: &'static str, guest_write: GuestWriteVerdict) {
 
 /// The census column for a rung's guest-write verdict, or `None` for a rung the
 /// verdict says nothing about.
-#[cfg(feature = "backend-vulkan")]
 fn sample_rung_gw_route(rung: &str, guest_write: GuestWriteVerdict) -> Option<&'static str> {
     Some(match (rung, guest_write) {
         ("t11rung_resident", GuestWriteVerdict::Clean) => "t11rung_resident_gw_clean",
@@ -5989,7 +5882,6 @@ fn sample_rung_gw_route(rung: &str, guest_write: GuestWriteVerdict) -> Option<&'
 /// mapping has no entry" and "this image was never stamped" as agreement and
 /// load undefined memory as though it were the guest's prior frame. That is
 /// precisely the black-layer class. Absence on either side is a refusal.
-#[cfg(feature = "backend-vulkan")]
 fn type11_resident_is_current(mapping_epoch: Option<u32>, resident_epoch: Option<u32>) -> bool {
     mapping_epoch.is_some() && mapping_epoch == resident_epoch
 }
@@ -6011,7 +5903,6 @@ fn type11_resident_is_current(mapping_epoch: Option<u32>, resident_epoch: Option
 /// device operation. Registration happens here rather than at mapping resolve
 /// because this is the first moment the device has a host-side copy whose reuse
 /// would depend on the answer.
-#[cfg(feature = "backend-vulkan")]
 fn stamp_type11_resident<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -6035,7 +5926,6 @@ fn stamp_type11_resident<M: HostMemory + HostOps>(
 /// golden-ratio constant (2^64 / phi rounded to odd), used here only to spread
 /// page GPAs — which are dense multiples of the page size, so their low bits are
 /// all zero — across the whole word before the XOR fold.
-#[cfg(feature = "backend-vulkan")]
 fn gva_page_set_hash(pages: &std::collections::HashSet<u64>) -> u64 {
     let mut hash: u64 = 0;
     for p in pages {
@@ -6065,7 +5955,6 @@ fn gva_page_set_hash(pages: &std::collections::HashSet<u64>) -> u64 {
 /// only *miss* the registry lookup, which costs a CPU seed and never produces
 /// wrong pixels. Sharing a slot is the wrong-content direction, so every
 /// ambiguity here resolves toward the miss.
-#[cfg(feature = "backend-vulkan")]
 fn gva_alloc_generation<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &mut M,
@@ -6097,7 +5986,6 @@ fn gva_alloc_generation<M: HostMemory + HostOps>(
 ///
 /// A short walk yields 0. An incomplete walk names no allocation, and hashing the
 /// pages that happened to resolve would be an identity the guest never had.
-#[cfg(feature = "backend-vulkan")]
 fn gva_span_alloc_generation<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &mut M,
@@ -6132,7 +6020,6 @@ fn gva_span_alloc_generation<M: HostMemory + HostOps>(
 /// guest recycles names. Without it the registry keys this resident on
 /// `(gva, width, height)` alone, and the cross-pass resident Load below hands a
 /// new allocation the previous one's pixels as its prior content.
-#[cfg(feature = "backend-vulkan")]
 pub(crate) fn gva_chain_identity(
     req: &DrawEncodeRequest,
 ) -> Option<crate::backend::vulkan::engine::TargetIdentity> {
@@ -6155,7 +6042,6 @@ pub(crate) fn gva_chain_identity(
 /// Read an abandoned resident render-pass chain so the exec loop can land the
 /// last good record's pixels (`writeback_chain_rgba`). Every failure is
 /// fail-visible; the guest keeps its pre-pass bytes on loss.
-#[cfg(feature = "backend-vulkan")]
 pub(crate) fn read_resident_chain(state: &DeviceState, req: &DrawEncodeRequest) -> Option<Vec<u8>> {
     let identity = render_chain_identity(state, req)?;
     match crate::backend::vulkan::engine::read_target(&identity) {
@@ -6198,7 +6084,6 @@ pub(crate) fn read_resident_chain(state: &DeviceState, req: &DrawEncodeRequest) 
 ///
 /// If it ever does bind, each forced landing says so as
 /// `gva_deferred_flush ... trigger=window_cap`.
-#[cfg(feature = "backend-vulkan")]
 const GVA_DEFERRED_WINDOW_CAP: usize = 16;
 
 /// Bound on live type-11 render windows. Each one pins a display-sized target
@@ -6213,7 +6098,6 @@ const GVA_DEFERRED_WINDOW_CAP: usize = 16;
 /// note on `GVA_DEFERRED_WINDOW_CAP` for why, and for what would change the
 /// answer. If it ever does bind, `evict_render_windows_to_cap` emits
 /// `surface_window_cap_evicted`.
-#[cfg(feature = "backend-vulkan")]
 const SURFACE_DEFERRED_WINDOW_CAP: usize = 16;
 
 /// Defer gate for a type-11 (surface) render Store.
@@ -6226,7 +6110,6 @@ const SURFACE_DEFERRED_WINDOW_CAP: usize = 16;
 /// comes from it. A window with no range would be armed and then never found
 /// by a reader, which is the silent-stale-read failure this rail exists to
 /// avoid.
-#[cfg(feature = "backend-vulkan")]
 fn surface_store_defer_eligible(
     state: &DeviceState,
     req: &DrawEncodeRequest,
@@ -6279,7 +6162,6 @@ fn surface_store_defer_eligible(
 /// guest-page reader drains this window through the `flush_intersecting` choke
 /// point it already calls — no new trigger sites, and no way to cover one rail
 /// and miss the other.
-#[cfg(feature = "backend-vulkan")]
 #[allow(
     clippy::too_many_arguments,
     reason = "the arm names the frame it is deferring and the geometry it was drawn at"
@@ -6410,7 +6292,6 @@ fn arm_surface_deferred_store_with<M: HostMemory + HostOps>(
 /// Keep the census on. It is four counters a second, it is the denominator for
 /// any future claim that the flush rail could move fewer bytes, and if the
 /// guest's compositing strategy ever changes this is where it would show.
-#[cfg(feature = "backend-vulkan")]
 fn note_store_damage_coverage(req: &DrawEncodeRequest, width: u32, height: u32) {
     let Some((route, covered, attach)) = store_damage_bucket(req.scissor, width, height) else {
         return;
@@ -6427,7 +6308,6 @@ fn note_store_damage_coverage(req: &DrawEncodeRequest, width: u32, height: u32) 
 /// scissor falls in, and the covered/attachment texel pair behind it.
 ///
 /// `None` for a degenerate attachment, which has no coverage to report.
-#[cfg(feature = "backend-vulkan")]
 fn store_damage_bucket(
     scissor: Option<(u32, u32, u32, u32)>,
     width: u32,
@@ -6458,7 +6338,6 @@ fn store_damage_bucket(
     Some((route, covered, attach))
 }
 
-#[cfg(feature = "backend-vulkan")]
 fn arm_surface_resident_store<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -6580,7 +6459,6 @@ fn arm_surface_resident_store<M: HostMemory + HostOps>(
 /// acquisitions — and a single `reason=arm_failed` would name none of them. Every
 /// arm is recoverable and none of them loses guest work, so these are declines and
 /// not losses.
-#[cfg(feature = "backend-vulkan")]
 enum SurfaceResidentArmDecline {
     PinRefused,
     NoEpoch { epoch: u32 },
@@ -6593,7 +6471,6 @@ enum SurfaceResidentArmDecline {
     IdentitySplit,
 }
 
-#[cfg(feature = "backend-vulkan")]
 impl crate::observe::Decline for SurfaceResidentArmDecline {
     fn slug(&self) -> &'static str {
         match self {
@@ -6621,7 +6498,6 @@ impl crate::observe::Decline for SurfaceResidentArmDecline {
 /// against, with nothing stale left inside it — and a rail that reimplemented one
 /// of them slightly differently is how one kind of window ends up covered by a
 /// trigger the other kind misses.
-#[cfg(feature = "backend-vulkan")]
 fn prepare_surface_deferred_window<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -6679,7 +6555,6 @@ fn prepare_surface_deferred_window<M: HostMemory + HostOps>(
 /// writes guest pages and republishes this mapping's one cache entry. Each rail
 /// therefore calls [`evict_render_windows_to_cap`] where its own last write is,
 /// and the two orders differ — which is exactly why this function cannot own it.
-#[cfg(feature = "backend-vulkan")]
 fn finish_surface_deferred_window(
     state: &mut DeviceState,
     req: &DrawEncodeRequest,
@@ -6715,7 +6590,6 @@ fn finish_surface_deferred_window(
 }
 
 /// Live [`crate::model::DeferredOwner::Render`] windows, for the population cap.
-#[cfg(feature = "backend-vulkan")]
 fn render_window_count(state: &DeviceState) -> usize {
     state
         .compute_deferred_flush
@@ -6740,7 +6614,6 @@ fn render_window_count(state: &DeviceState) -> usize {
 ///
 /// The order is taken once and walked. Re-deriving "the oldest" after a refusal
 /// returns the same stuck window forever, which is the bug this replaced.
-#[cfg(feature = "backend-vulkan")]
 fn evict_render_windows_to_cap<M: HostMemory + HostOps>(state: &mut DeviceState, host: &mut M) {
     for (mid, lo, hi) in render_windows_oldest_first(state) {
         let before = render_window_count(state);
@@ -6774,7 +6647,6 @@ fn evict_render_windows_to_cap<M: HostMemory + HostOps>(state: &mut DeviceState,
 /// window now owns the frame it deferred that is a full framebuffer per stuck
 /// key — the "~260 stale residents pinned for the guest lifetime" shape. Step
 /// over it instead.
-#[cfg(feature = "backend-vulkan")]
 fn render_windows_oldest_first(state: &DeviceState) -> Vec<(u32, u64, u64)> {
     let mut live: Vec<(u64, u32, u64, u64)> = state
         .compute_deferred_flush
@@ -6798,7 +6670,6 @@ fn render_windows_oldest_first(state: &DeviceState) -> Vec<(u32, u64, u64)> {
 /// fence wait on the stamp path. All gates are protocol-shape checks (never
 /// content): the flush must be able to replay the sync `write_gva_rgba8`
 /// exactly — identity geometry == c0 geometry, convertible format, sane BPR.
-#[cfg(feature = "backend-vulkan")]
 fn gva_store_defer_eligible(req: &DrawEncodeRequest) -> bool {
     let Some(c0) = req.colors.first() else {
         return false;
@@ -6821,7 +6692,6 @@ fn gva_store_defer_eligible(req: &DrawEncodeRequest) -> bool {
 /// fully covers the window; its bytes were never observable without a flush,
 /// which would have taken it); different geometry lands the old identity
 /// first, preserving the sync serialization (old bytes, then new bytes).
-#[cfg(feature = "backend-vulkan")]
 pub(crate) fn supersede_gva_window<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -6848,18 +6718,6 @@ pub(crate) fn supersede_gva_window<M: HostMemory + HostOps>(
     } else {
         crate::runtime::storage_flush::flush_gva_exact(state, host, gva, true, by);
     }
-}
-
-/// Metal-direct builds never arm GVA windows — nothing to supersede.
-#[cfg(not(feature = "backend-vulkan"))]
-pub(crate) fn supersede_gva_window<M: HostMemory + HostOps>(
-    _state: &mut DeviceState,
-    _host: &mut M,
-    _gva: u64,
-    _width: u32,
-    _height: u32,
-    _by: &str,
-) {
 }
 
 /// How often does a GVA render target's address change hands between arms?
@@ -6912,7 +6770,6 @@ pub(crate) fn supersede_gva_window<M: HostMemory + HostOps>(
 ///
 /// Scoring anything on this class therefore needs boots, not rounds. A change
 /// that is measured on one boot has measured the latch, not the change.
-#[cfg(feature = "backend-vulkan")]
 fn note_gva_resident_aliasing(
     state: &mut DeviceState,
     gva: u64,
@@ -6958,7 +6815,6 @@ fn note_gva_resident_aliasing(
 /// Returns `false` when a gate fails (unwalkable span, pin refusal) — the
 /// caller then lands the Store synchronously from a resident readback, and
 /// the sync site's supersede handling covers any older window at this GVA.
-#[cfg(feature = "backend-vulkan")]
 fn arm_gva_deferred_store<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -7059,53 +6915,6 @@ fn arm_gva_deferred_store<M: HostMemory + HostOps>(
         state.gva_deferred_flush.len()
     ));
     true
-}
-
-pub fn writeback_chain_rgba<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
-    host: &mut M,
-    task_id: u32,
-    color_slots: &[(u32, crate::runtime::decode::render::ColorAttachment)],
-    rgba: &[u8],
-) -> bool {
-    if color_slots.is_empty() || rgba.is_empty() {
-        return false;
-    }
-    let Some((_, att)) = color_slots.first() else {
-        return false;
-    };
-    if att.texture_ref == 0 {
-        return false;
-    }
-    let Some((mapping_id, gva, w, h, bpr, fmt)) =
-        lookup_render_target(state, host, task_id, att.texture_ref)
-    else {
-        return false;
-    };
-    let need = (w as usize).saturating_mul(h as usize).saturating_mul(4);
-    if rgba.len() < need {
-        return false;
-    }
-    if gva != 0 {
-        supersede_gva_window(state, host, gva, w, h, "chain_land");
-        return write_gva_rgba8(state, host, task_id, gva, w, h, bpr, fmt, rgba).is_ok();
-    }
-    if mapping_id == 0 {
-        return false;
-    }
-    // An abandoned portability chain must still preserve the last successful
-    // record. This is an error recovery rail, not normal product behavior: land
-    // the resident readback into the type-11 mapping, publish the Composite
-    // Store, and keep the degradation fail-visible.
-    crate::observe::fail(format!(
-        "writeback_chain_rgba reason=resident_chain_abandoned_cpu_recovery \
-         mid={mapping_id} {w}x{h} fmt={fmt:#x}"
-    ));
-    let wrote = mapping_write::write_rgba8_image_changed(state, host, mapping_id, rgba, None, w, h);
-    if wrote {
-        publish_surface_store(state, host, mapping_id, w, h, fmt);
-    }
-    wrote
 }
 
 #[cfg(all(test, feature = "backend-vulkan"))]
