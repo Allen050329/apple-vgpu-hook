@@ -576,7 +576,14 @@ fn raster_or_default<T, E>(
 /// (e.g. a whole 3D scene requesting depth LOAD, or every draw of one pipeline
 /// carrying the same out-of-contract raster value) logs once, not per draw.
 /// Returns true the first time a given key is seen.
-#[cfg(feature = "backend-vulkan")]
+///
+/// Backend-agnostic on purpose: both encode arms degrade, so both need the same
+/// dedupe. While this was Vulkan-only the Metal arm had no way to report a
+/// degradation without flooding per draw, and reported none.
+#[cfg(any(
+    feature = "backend-vulkan",
+    all(feature = "backend-metal", target_os = "macos")
+))]
 fn degrade_log_first(pipeline_ref: u32, slug: &'static str) -> bool {
     use std::collections::HashSet;
     use std::sync::Mutex;
@@ -1590,7 +1597,6 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
             if mid != 0 {
                 let _ = mapper::ensure_resolved_for_scanout(state, host, mid);
             }
-            let mut load_act = da.load_action;
             match da.load_action {
                 x if x == PASS_LOAD_ACTION_CLEAR => {
                     fill_depth32(&mut buf, da.clear_depth as f32);
@@ -1614,9 +1620,24 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
                         )
                     };
                     if !ok {
-                        // Soft seed with clear_depth when guest pages are not ready.
+                        // The guest asked to load prior depth and this device
+                        // could not read it, so the pass runs against clear
+                        // values instead: depth tests decide against content the
+                        // guest never wrote. The load action deliberately stays
+                        // LOAD — the seeded buffer *is* what Metal loads, so
+                        // switching it to CLEAR would describe the same bytes
+                        // twice — but the substitution is a loss of guest state
+                        // and says so. The Vulkan arm reports the same class
+                        // through `shader_state_degraded`; this one did not.
                         fill_depth32(&mut buf, da.clear_depth as f32);
-                        load_act = PASS_LOAD_ACTION_LOAD;
+                        if degrade_log_first(req.pipeline_ref, "depth_load_readback_failed") {
+                            crate::observe::fail(format!(
+                                "shader_state_degraded reason=depth_load_readback_failed \
+                                 pipe={} task={} ds_ref={} mid={mid} {width}x{height} \
+                                 (guest depth unreadable; pass seeded with clear_depth)",
+                                req.pipeline_ref, req.task_id, da.texture_ref
+                            ));
+                        }
                     }
                 }
                 _ => {}
@@ -1626,7 +1647,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
             depth_mapping_id = mid;
             depth_attach_api = Some(ReimsVgpuDepthAttachment {
                 pixel_format: REIMS_VGPU_MTL_PIXEL_FORMAT_DEPTH32_FLOAT,
-                load_action: map_load_action(req.pipeline_ref, load_act),
+                load_action: map_load_action(req.pipeline_ref, da.load_action),
                 store_action: map_store_action(da.store_action),
                 clear_depth: da.clear_depth,
                 data: data_ptr,
@@ -1653,7 +1674,6 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
             if mid != 0 {
                 let _ = mapper::ensure_resolved_for_scanout(state, host, mid);
             }
-            let mut load_act = sa.load_action;
             match sa.load_action {
                 x if x == PASS_LOAD_ACTION_CLEAR => {
                     buf.fill(sa.clear_stencil as u8);
@@ -1677,8 +1697,19 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
                         )
                     };
                     if !ok {
+                        // Same substitution and the same loss as the depth arm
+                        // above: the guest's stencil contents are replaced by
+                        // clear_stencil, so every stencil test in the pass reads
+                        // state the guest never wrote.
                         buf.fill(sa.clear_stencil as u8);
-                        load_act = PASS_LOAD_ACTION_LOAD;
+                        if degrade_log_first(req.pipeline_ref, "stencil_load_readback_failed") {
+                            crate::observe::fail(format!(
+                                "shader_state_degraded reason=stencil_load_readback_failed \
+                                 pipe={} task={} ds_ref={} mid={mid} {width}x{height} \
+                                 (guest stencil unreadable; pass seeded with clear_stencil)",
+                                req.pipeline_ref, req.task_id, sa.texture_ref
+                            ));
+                        }
                     }
                 }
                 _ => {}
@@ -1688,7 +1719,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
             stencil_mapping_id = mid;
             stencil_attach_api = Some(ReimsVgpuStencilAttachment {
                 pixel_format: REIMS_VGPU_MTL_PIXEL_FORMAT_STENCIL8,
-                load_action: map_load_action(req.pipeline_ref, load_act),
+                load_action: map_load_action(req.pipeline_ref, sa.load_action),
                 store_action: map_store_action(sa.store_action),
                 clear_stencil: sa.clear_stencil,
                 data: data_ptr,

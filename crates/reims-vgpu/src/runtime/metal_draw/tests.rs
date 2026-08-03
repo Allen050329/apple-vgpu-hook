@@ -4528,3 +4528,36 @@ fn a_type5_render_target_view_is_scored_against_the_base_it_resolves_through() {
         "an undecoded record must not be scored as agreement"
     );
 }
+
+/// The degradation dedupe is keyed by `(pipeline_ref, slug)`, and both encode
+/// arms depend on that being true.
+///
+/// It is what makes a per-draw degradation reportable at all: the depth and
+/// stencil LOAD substitutions sit inside the draw path, so without a first-only
+/// gate the only two options are a flood or the silence the Metal arm had. The
+/// key has to separate slugs as well as pipelines, or one degradation would
+/// mask a different one on the same pipeline — which is the case the Metal arm
+/// hits, since its depth and stencil substitutions can both fire on one pass.
+#[cfg(any(
+    feature = "backend-vulkan",
+    all(feature = "backend-metal", target_os = "macos")
+))]
+#[test]
+fn a_degradation_reports_once_per_pipeline_and_slug() {
+    // Pipeline refs local to this test so a sibling cannot consume the first
+    // fire out from under it — the dedupe set is process-wide by design.
+    let (a, b) = (0x5eed_0001, 0x5eed_0002);
+    assert!(degrade_log_first(a, "depth_load_readback_failed"));
+    assert!(
+        !degrade_log_first(a, "depth_load_readback_failed"),
+        "a repeat of the same degradation on the same pipeline must stay quiet"
+    );
+    assert!(
+        degrade_log_first(a, "stencil_load_readback_failed"),
+        "a different degradation on the same pipeline is a different report"
+    );
+    assert!(
+        degrade_log_first(b, "depth_load_readback_failed"),
+        "the same degradation on a different pipeline is a different report"
+    );
+}
