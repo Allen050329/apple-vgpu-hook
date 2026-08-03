@@ -41,6 +41,23 @@ C and Objective-C in the QEMU path exist to connect QEMU to Rust. Keep product l
 `crates/reims-vgpu`: protocol interpretation, resource state, scheduling, GPU encode, present model,
 backend policy, and performance behavior belong in Rust.
 
+A shim that calls two queries and branches on the pair has reconstructed a rule, which is the same
+violation as writing one. Export the answer, not the inputs — and delete the inputs, because a shim
+that can still assemble its own answer eventually will.
+
+Anything crossing the boundary lives twice, once in Rust and once in
+`crates/reims-vgpu/include/reims_vgpu_qemu_abi.h`, and nothing in the toolchain compares the two:
+Rust does not include the header and the shims do not read Rust. Every constant that crosses gets a
+test, using `qemu::abi::header_define` — see `the_abi_header_agrees_on_the_version`,
+`..._on_the_scanout_bound` and `..._on_the_console_feed_kinds`. Add one with any new shared
+constant; a drift here is a bug on exactly one pathway.
+
+Verifying a shim change needs the pathway that runs it. The default
+`vm/boot-x86.sh` config sets `REIMS_VGPU_WINDOW=1`, so QEMU takes `-display none` and **never calls
+`gfx_update`** — a boot like that does not exercise `fb_update` or `apply_scanout` at all. Use
+`REIMS_VGPU_WINDOW=0` for those, and A/B against a stashed baseline: that console renders black on
+both arms, so a screenshot only means something next to the baseline's.
+
 ### Never Fail Silently
 
 If a decoded guest command is rejected, dropped, degraded, unsupported, or mis-executed, make the
