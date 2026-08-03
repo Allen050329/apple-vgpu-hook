@@ -1679,15 +1679,16 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             Some(rec) => {
                 mapping_write::type5_sample_window(m, rec.plane_index, width, height, stage_fmt)
                     .map(|(offset, bpr, end, from_device)| {
-                        // Invent always produces a packed window at offset 0 —
-                        // plane 0's bytes. Reaching it after the wire named a
-                        // different plane is a guaranteed wrong bind, so it
-                        // cannot stay quiet just because it returned a window.
-                        if !from_device && rec.plane_index != 0 {
-                            crate::observe::fail(format!(
-                                "compute_stage_tex plane_invent mapping={mapping_id} plane={} {width}x{height} fmt={stage_fmt:#x} offset={offset} bpr={bpr}",
-                                rec.plane_index
-                            ));
+                        if !from_device {
+                            mapping_write::note_type5_plane_invent(
+                                mapping_id,
+                                rec.plane_index,
+                                width,
+                                height,
+                                stage_fmt,
+                                (offset, bpr),
+                                "compute_stage_tex",
+                            );
                         }
                         (offset, bpr, end)
                     })

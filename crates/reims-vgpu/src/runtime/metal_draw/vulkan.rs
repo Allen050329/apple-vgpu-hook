@@ -1838,6 +1838,20 @@ pub(super) fn load_type5_view_rgba<M: HostMemory + HostOps>(
             from_device,
         )
     };
+    // This path binds whatever window came back, invented or not — the per-bind
+    // `invent=` echo below is behind `REIMS_VGPU_DRAW_LOG`, so on a normal boot a
+    // wrong-plane bind here would be silent.
+    if !from_device {
+        mapping_write::note_type5_plane_invent(
+            mapping_id,
+            view.plane_index,
+            view.width,
+            view.height,
+            view.pixel_format,
+            (base_off, surface_bpr),
+            "type5_draw_view",
+        );
+    }
     let page_bytes = (pages_n as u64).saturating_mul(1u64 << state.page_shift);
     if page_bytes < span_end {
         return fail(Type5ViewDecline::Span {

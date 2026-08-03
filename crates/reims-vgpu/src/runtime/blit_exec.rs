@@ -699,10 +699,16 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
     // blit path previously dropped every one as `tex_wrong_type` (~99/six-app
     // launch, all object_type=5), so a blit COPY from a video/biplanar plane
     // or a row-byte-equivalent reinterpretation view (e.g. RGBA32Uint over
-    // BGRA8) never landed. Resolve it exactly like type-11 but using the
-    // decoded VIEW geometry/format: `type11_sample_window` matches the actual
-    // plane record by geometry+bpe (or a packed row-compatible reinterpretation)
-    // and fail-closes when it cannot, so this never invents a plane window.
+    // BGRA8) never landed.
+    //
+    // Resolve it with the view's own geometry, format **and plane index**. The
+    // plane is on the wire here (record `+0x20`) and must be used: it is the
+    // whole difference between this and type-11, whose window resolves the plane
+    // by matching geometry and bytes-per-element and so cannot tell two planes
+    // that share both apart. A biplanar COPY names exactly such a pair, so this
+    // is the path where dropping the index lands. `type5_sample_window` states
+    // the case and `note_type5_plane_invent` reports the one way it can still go
+    // wrong.
     if entry.object_type == objects::OBJECT_TYPE_REF_TEXTURE {
         if level != 0 || slice != 0 {
             return Err(br(BlitStatus::Unsupported, "t5_level_slice"));
@@ -738,11 +744,22 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
         let Some(bpp) = pixel_format::bytes_per_pixel(format) else {
             return Err(br(BlitStatus::Unsupported, "t5_fmt_bpp"));
         };
-        let Some((surface_offset, surface_bpr, span_end)) =
-            mapping_write::type11_sample_window(m, sid, view.width, view.height, format)
+        let Some((surface_offset, surface_bpr, span_end, from_device)) =
+            mapping_write::type5_sample_window(m, view.plane_index, view.width, view.height, format)
         else {
             return Err(br(BlitStatus::Bounds, "t5_sample_window"));
         };
+        if !from_device {
+            mapping_write::note_type5_plane_invent(
+                sid,
+                view.plane_index,
+                view.width,
+                view.height,
+                format,
+                (surface_offset, surface_bpr),
+                "blit_texture",
+            );
+        }
         return Ok(TextureBacking::Type11(Type11Texture {
             mapping_id: sid,
             width: view.width,
@@ -3464,6 +3481,127 @@ mod tests {
         );
         let e = objects::lookup_list_entry(state, host, 1, obj_ref).expect("type5 entry");
         assert_eq!(e.object_type, objects::OBJECT_TYPE_REF_TEXTURE);
+    }
+
+    /// A blit source must read the plane the wire named, and the only shape that
+    /// can prove it is two planes that share geometry and bytes-per-element.
+    ///
+    /// This branch resolved type-5 views through `type11_sample_window`, which
+    /// takes no plane index and picks a plane by matching width, height and bpe.
+    /// On the v0a8 shape the live apple.com hero produces — Y and alpha both R8
+    /// at the luma geometry — that scan matches *two* records, takes neither, and
+    /// returns the invented packed window: plane 0's bytes at offset 0. So a COPY
+    /// from the alpha plane silently read luma, the copy succeeded, and nothing
+    /// downstream could tell.
+    ///
+    /// The fixture is that shape at a size that fits one page. Plane 2 is byte-
+    /// identical in geometry to plane 0 and differs only in offset, so an
+    /// assertion on the offset is exactly the assertion that the index was used.
+    #[test]
+    fn a_type5_blit_source_reads_the_plane_the_wire_named() {
+        use crate::contract::endian::st64;
+        use crate::contract::iosurface_pages::{
+            DEVICE_DESC_ALLOC_SIZE, DEVICE_DESC_LEN, DEVICE_DESC_PLANES, DEVICE_DESC_PLANE_COUNT,
+            DEVICE_PLANE_BPE, DEVICE_PLANE_BPR, DEVICE_PLANE_DESC_LEN, DEVICE_PLANE_DIMS,
+            DEVICE_PLANE_OFFSET, DEVICE_PLANE_SIZE,
+        };
+        use crate::contract::pixel_format::{MTL_FORMAT_R8_UNORM, MTL_FORMAT_RG8_UNORM};
+        // Device-plane dims word: width u24@1, height u24@5 (`decode_device_plane`).
+        let pack_plane_dims =
+            |w: u32, h: u32| ((w as u64 & 0xffffff) << 8) | ((h as u64 & 0xffffff) << 40);
+
+        let (mut host, mut state) = blit_device();
+        let (mapping_id, obj_ref) = (34u32, 12u32);
+        let (w, h) = (8u32, 4u32);
+        // Plane 2 is the alpha plane: same 8x4 R8 as plane 0, different offset.
+        const ALPHA_OFFSET: u32 = 128;
+        install_type5(
+            &mut host,
+            &mut state,
+            obj_ref,
+            mapping_id,
+            0x30,
+            MTL_FORMAT_R8_UNORM,
+            w,
+            h,
+        );
+        set_type5_record_plane(&mut host, &state, obj_ref, 2);
+
+        let mut desc = vec![0u8; DEVICE_DESC_LEN];
+        st32(&mut desc[DEVICE_DESC_ALLOC_SIZE..], 0x1000);
+        desc[DEVICE_DESC_PLANE_COUNT] = 3;
+        // (offset, size, width, height, bpr, bpe)
+        let planes = [
+            (0u32, 32u32, 8u32, 4u32, 8u32, 1u16),
+            (64, 16, 4, 2, 8, 2),
+            (ALPHA_OFFSET, 32, 8, 4, 8, 1),
+        ];
+        for (i, (off, size, pw, ph, bpr, bpe)) in planes.iter().enumerate() {
+            let base = DEVICE_DESC_PLANES + i * DEVICE_PLANE_DESC_LEN;
+            st32(&mut desc[base + DEVICE_PLANE_OFFSET..], *off);
+            st32(&mut desc[base + DEVICE_PLANE_SIZE..], *size);
+            st64(
+                &mut desc[base + DEVICE_PLANE_DIMS..],
+                pack_plane_dims(*pw, *ph),
+            );
+            st32(&mut desc[base + DEVICE_PLANE_BPR..], *bpr);
+            st16(&mut desc[base + DEVICE_PLANE_BPE..], *bpe);
+        }
+        state
+            .mappings
+            .get_mut(&mapping_id)
+            .expect("mapping")
+            .device_desc = desc;
+
+        // The scan is genuinely ambiguous on this descriptor: without the index
+        // it lands on the invent, which is what this test exists to exclude.
+        let ambiguous = {
+            let m = state.mappings.get(&mapping_id).unwrap();
+            mapping_write::type11_sample_window(m, mapping_id, w, h, MTL_FORMAT_R8_UNORM)
+        };
+        assert_eq!(
+            ambiguous.map(|(off, _, _)| off),
+            Some(0),
+            "fixture must be ambiguous by geometry, or it proves nothing"
+        );
+        // Sanity: plane 1 is a different geometry, so the ambiguity is between
+        // planes 0 and 2 specifically and not a descriptor that resolves nothing.
+        let uv = {
+            let m = state.mappings.get(&mapping_id).unwrap();
+            mapping_write::type5_sample_window(m, 1, 4, 2, MTL_FORMAT_RG8_UNORM)
+        };
+        assert_eq!(uv.map(|(off, _, _, dev)| (off, dev)), Some((64, true)));
+
+        let backing = resolve_texture_backing(&mut state, &mut host, 1, obj_ref, 0, 0)
+            .expect("type-5 blit source must resolve");
+        match backing {
+            TextureBacking::Type11(t) => assert_eq!(
+                t.surface_offset, ALPHA_OFFSET as u64,
+                "the wire named plane 2; offset 0 is plane 0's invented window"
+            ),
+            TextureBacking::Linear(_) => panic!("expected Type11 backing, got Linear"),
+        }
+    }
+
+    /// Overwrite the plane index in an installed type-5 record.
+    ///
+    /// `install_type5` leaves it 0 (the field sits past the fields it writes and
+    /// the blob is zeroed), which is the one value that cannot distinguish a
+    /// used index from a dropped one.
+    fn set_type5_record_plane(host: &mut FakeHost, state: &DeviceState, obj_ref: u32, plane: u32) {
+        let off = objects::TYPE5_ARG_RECORD + objects::TYPE5_RECORD_PLANE;
+        let desc_gva = 0x180u64 + (obj_ref as u64) * 0x40;
+        let mut word = [0u8; 4];
+        st32(&mut word, plane);
+        write_task_gva_arm64e(host, &state.tasks[1], desc_gva + off as u64, &word);
+        let entry = objects::lookup_list_entry(state, host, 1, obj_ref).expect("type5 entry");
+        let desc = objects::read_descriptor(state, host, 1, &entry).expect("type5 desc");
+        assert_eq!(
+            objects::decode_type5_texture_view(&desc)
+                .expect("view")
+                .plane_index,
+            plane
+        );
     }
 
     /// Regression guard for the type-5 RefTexture blit-source branch

@@ -219,6 +219,21 @@ pub fn type11_sample_window(
 /// carries the IOSurface plane index on the wire (type-5 record `+0x20`).
 /// The index names the device plane record directly; same-geometry planes
 /// (v0a8 Y plane 0 vs alpha plane 2) are indistinguishable by geometry scan.
+///
+/// Every type-5 consumer must come through here rather than through
+/// [`type11_sample_window`], and the distinction is not cosmetic: type-11's
+/// window resolves the plane by matching width, height and bytes-per-element,
+/// and on a surface whose planes share all three (v0a8 Y and alpha are both R8
+/// at the luma geometry) the scan matches two, takes neither, and returns the
+/// invented packed window — plane 0's bytes at offset 0. Handing a type-5 view's
+/// geometry to it therefore reads the *luma* plane for a bind the wire said was
+/// alpha, and the geometry scan cannot detect that by construction.
+///
+/// The `from_device` flag it returns is the caller's obligation, not a detail:
+/// `false` means the descriptor resolved no plane and the window is the invented
+/// packed one over plane 0. A caller that then *binds* that window while the wire
+/// named a non-zero plane has bound the wrong plane, and must say so through
+/// [`note_type5_plane_invent`].
 pub fn type5_sample_window(
     m: &MappingEntry,
     plane_index: u32,
@@ -232,6 +247,44 @@ pub fn type5_sample_window(
         None
     };
     sample_window_prefer_device(desc, Some(plane_index), format, width, height)
+}
+
+/// Report a type-5 bind that fell through to the invented packed window after
+/// the wire named a plane.
+///
+/// The invent is always plane 0's bytes at offset 0, so this is a guaranteed
+/// wrong bind — the window came back, the copy succeeds, and nothing else in the
+/// device will ever say the pixels are the wrong plane's. That makes it a
+/// failure line rather than a census.
+///
+/// Owned here rather than written out at each consumer because there are three
+/// of them (compute staging, blit texture backing, the CPU type-5 draw load) and
+/// the blit one was added after a spell resolving type-5 views through
+/// [`type11_sample_window`], which drops the wire plane index entirely and so
+/// could not have reported anything. `site` is what tells the three apart.
+///
+/// Call it only where the window is bound. The zero-copy sampled path checks
+/// `from_device` and refuses the invent, falling through to the CPU load that
+/// does bind it; reporting at both would double-count one bind.
+pub fn note_type5_plane_invent(
+    mapping_id: u32,
+    plane_index: u32,
+    width: u32,
+    height: u32,
+    format: u16,
+    window: (u64, u32),
+    site: &str,
+) {
+    if plane_index == 0 {
+        return;
+    }
+    let (offset, bpr) = window;
+    crate::observe::fail(format!(
+        "plane_invent site={site} mapping={mapping_id} plane={plane_index} \
+         {width}x{height} fmt={format:#x} offset={offset} bpr={bpr} \
+         (the wire named a plane and the device descriptor did not resolve one, \
+         so this window is plane 0 packed)"
+    ));
 }
 
 /// Revalidate + packed contig host view covering at least `span_end` bytes.
