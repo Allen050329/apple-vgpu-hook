@@ -947,6 +947,46 @@ inside that the eight full-screen writebacks (2.26 GB/s, `write_split frag=272
 bytes=2256076800` in one second against 34 published frames) are ~20 ms of it.
 Do not spend another session on cadence.
 
+### The guest's own validity quad will not tell you which writebacks to skip
+
+The recurring idea is that the protocol already states resource ownership, so
+the guest must be telling us which of those ~200 undisplayed composites a second
+it actually wants. `resource_validity` consumes exactly that statement — a
+four-field quad from `CmdInvalidateResources` (`0x34`) and from the resource
+table inside every `EXEC_INDIRECT2` — and `writeback_refused` already gates both
+flush rails on it. **The measurement that decides the idea needs no new code:
+`validity_wb_licensed` / `_unstated` / `_superseded` are emitted per landing and
+sum exactly to `mapw_fence_flush`.**
+
+Two full visual-gate windows on a settled x86/PCI guest, Safari compositing:
+
+```text
+run   licensed   unstated   superseded   mapw_fence_flush
+ A       2442       5203            0         7645
+ B       1941       5668            0         7609
+```
+
+**The sets do diverge, and hugely — 68-74 % of every window landed at a fence is
+one the guest never made a statement about.** That is the divergence the idea
+predicts. It is also useless, and the direction is the whole point:
+
+- The quad says who wrote a resource *last*, not who is about to *read* it.
+  `Unstated` means the guest has never claimed a CPU write, so there is nothing
+  to order our publish against — it is the absence of a claim, not a statement
+  that the bytes are unwanted.
+- **Refusing an `Unstated` landing has been tried and it turns a compositing
+  layer black.** `writeback_refused`'s own doc records the boot that cost. The
+  safe reading of "the guest never claimed a write" is to deliver the frame.
+- `superseded` reading **0** in both windows is the other half: the exec table's
+  `clear_host_valid` already drops a mapping's pending windows when it arrives,
+  so the case where the guest genuinely does own the pages is handled upstream
+  and never reaches a flush.
+
+So the quad is fully consumed, its refusal path is sound, and there is no
+unclaimed saving in it. A demand-driven writeback needs a witness for *reads*,
+which nothing in this protocol supplies. Do not spend a session re-deriving this
+from the decode side.
+
 ### What the writeback is worth, measured by not doing it
 
 The ~20 ms above is an *attribution* — the parts sum to the whole. Whether
