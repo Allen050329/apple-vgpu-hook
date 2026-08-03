@@ -3240,6 +3240,56 @@ fn note_draw_coverage(
         Some(PASS_LOAD_ACTION_DONT_CARE) => "draw_partial_dontcare",
         _ => "draw_partial_load_unknown",
     });
+    // How much of the surface this draw's scissor actually covers.
+    //
+    // The deferred render flush copies the whole attachment on every landing,
+    // and that copy is the largest single cost in the device. Whether the
+    // guest's own scissors could bound it turns on a number nothing measures:
+    // if a partial draw typically covers most of the surface, the union over a
+    // pass is near-total and there is nothing to win, and the far more invasive
+    // per-pass union accumulator need never be built. These buckets answer that
+    // cheaply, from inputs this function already has.
+    //
+    // Per draw, so it bounds the union from below rather than giving it: a pass
+    // is ~3 draws, so a union is at most the sum of its members and at least the
+    // largest. Both bounds come from this distribution.
+    //
+    // Read on a clean driven x86/Vulkan boot (30 s Safari drag, two web-content
+    // probe runs), over 65 397 partial draws against 67 729 full-coverage ones:
+    //
+    // ```text
+    // draw_scissor_area_lt1    18 167   27.8 %
+    // draw_scissor_area_le5    14 353   21.9 %   (cumulative <=5 %:  49.7 %)
+    // draw_scissor_area_le10      513    0.8 %
+    // draw_scissor_area_le25    9 029   13.8 %   (cumulative <=25 %: 64.3 %)
+    // draw_scissor_area_le50   23 101   35.3 %
+    // draw_scissor_area_gt50      234    0.4 %
+    // ```
+    //
+    // The idea is not dead: essentially nothing (0.4 %) covers more than half
+    // the surface, and two thirds cover a quarter or less. But it is not
+    // confirmed either, and the reason is the *other* counter — **51 % of all
+    // draws are full-coverage**, and a pass containing one has a union of 100 %
+    // and saves nothing. Whether that matters turns entirely on whether full
+    // and partial draws mix within a pass or segregate into whole passes, which
+    // a per-draw census cannot see.
+    //
+    // So the next measurement is the per-pass union itself, and it is worth the
+    // plumbing this census was written to avoid paying blind. Take it at the
+    // arm point rather than at the flush: the fraction a pass drew is known
+    // when the window is armed, and asking there needs no state that has to
+    // survive until the deferred landing.
+    let area = (sw as u64).saturating_mul(sh as u64);
+    let full = (target_w as u64).saturating_mul(target_h as u64);
+    let pct = area.saturating_mul(100) / full.max(1);
+    crate::runtime::drain::note_store_route(match pct {
+        0 => "draw_scissor_area_lt1",
+        1..=5 => "draw_scissor_area_le5",
+        6..=10 => "draw_scissor_area_le10",
+        11..=25 => "draw_scissor_area_le25",
+        26..=50 => "draw_scissor_area_le50",
+        _ => "draw_scissor_area_gt50",
+    });
 }
 
 /// Score a `MTLLoadActionLoad` colour attachment against whether a seed was
@@ -6848,6 +6898,49 @@ mod vulkan_split_tests {
             store_route_count("lin_rung_blank_with_host_entry"),
             blanks + 1
         );
+    }
+
+    /// The scissor-area buckets must score the fraction, not the extent.
+    ///
+    /// The whole point of the census is comparing a draw against the surface it
+    /// draws into, so the same rect on a small target and a large one belong in
+    /// different buckets. A version that bucketed raw pixel area would answer a
+    /// question nobody asked and read plausibly while doing it.
+    #[test]
+    fn scissor_area_buckets_score_the_fraction_of_the_target() {
+        use crate::runtime::drain::store_route_count;
+        // 1000x1000 target: the rect's area in pixels IS its percentage.
+        let cases = [
+            (10u32, 10u32, "draw_scissor_area_lt1"),    // 0.01 %, rounds to 0
+            (100, 100, "draw_scissor_area_le5"),        // exactly 1 %, so not the sub-1 bucket
+            (200, 200, "draw_scissor_area_le5"),       // 4 %
+            (300, 300, "draw_scissor_area_le10"),      // 9 %
+            (500, 500, "draw_scissor_area_le25"),      // 25 %
+            (700, 700, "draw_scissor_area_le50"),      // 49 %
+            (800, 800, "draw_scissor_area_gt50"),      // 64 %
+        ];
+        for (sw, sh, slug) in cases {
+            let before = store_route_count(slug);
+            note_draw_coverage(0, 0, sw, sh, 1000, 1000, None, false, false);
+            assert_eq!(
+                store_route_count(slug),
+                before + 1,
+                "{sw}x{sh} of 1000x1000 belongs in {slug}"
+            );
+        }
+
+        // The same rect against a target it fully covers is not a partial draw
+        // at all, so it takes the `covers` early return and reaches no bucket.
+        let before = store_route_count("draw_scissor_area_gt50");
+        note_draw_coverage(0, 0, 800, 800, 800, 800, None, false, false);
+        assert_eq!(
+            store_route_count("draw_scissor_area_gt50"),
+            before,
+            "a full-coverage draw is counted by draw_scissor_full, not bucketed"
+        );
+
+        // A degenerate target must not divide by zero.
+        note_draw_coverage(0, 0, 4, 4, 0, 0, None, false, false);
     }
 
     /// A blank guest read is only a loss if the cache holds pixels to lose.
