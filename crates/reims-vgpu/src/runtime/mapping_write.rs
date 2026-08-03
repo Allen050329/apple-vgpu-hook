@@ -1743,22 +1743,31 @@ fn write_rect_raw_at_impl<M: HostMemory + HostOps>(
     }
     let rb = row_bytes as usize;
     let bpr = surface_bpr as usize;
+    // The destination bound, before the branch, because all three arms below
+    // write guest memory and only two of them used to check it. The per-row
+    // fragmented arm went through `mapper::write_mapping_bytes`, which bounds
+    // against the *whole mapping's* page span and not this plane's window, so an
+    // over-tall rect landed in whatever follows the window — on a multi-plane
+    // IOSurface that is the next plane's pixels — and said nothing.
+    //
+    // `rect_extent_end` is the shared expression for exactly this reason: its own
+    // doc records that the read and write sides disagreed while each computed it
+    // separately. A third caller computing its own variant is how that happens
+    // again, so the bound is taken once here and the arms carry none of their own.
+    // A correctly-sized writeback satisfies it exactly (a dense tight write gives
+    // `write_end == span_end`), so this drops ONLY a genuine overrun — named,
+    // never silent.
+    let write_end = rect_extent_end(base_off, origin_y, height, bpr, x_off, rb);
+    if write_end > span_end {
+        crate::observe::fail(format!(
+            "mapping_write fail reason=writeback_overrun mid={mapping_id} base_off={base_off} origin_y={origin_y} height={height} bpr={surface_bpr} x_off={x_off} rb={rb} write_end={write_end} span_end={span_end}"
+        ));
+        return false;
+    }
     let Some(vouched) = vouch_for_write(state, host, mapping_id, "rect_raw") else {
         return false;
     };
     if let Some((ptr, _)) = contig_for_write(state, host, mapping_id, span_end, &vouched, src) {
-        // The fragmented full-plane branch below already rejects on the same bound
-        // (`frame_end > span_end`); enforce it here too so the contig fast paths
-        // can never overrun. A correctly-sized writeback satisfies this exactly
-        // (dense tight write: `write_end == span_end`), so it drops ONLY a genuine
-        // overrun — named, never silent.
-        let write_end = rect_extent_end(base_off, origin_y, height, bpr, x_off, rb);
-        if write_end > span_end {
-            crate::observe::fail(format!(
-                "mapping_write fail reason=writeback_overrun mid={mapping_id} base_off={base_off} origin_y={origin_y} height={height} bpr={surface_bpr} x_off={x_off} rb={rb} write_end={write_end} span_end={span_end}"
-            ));
-            return false;
-        }
         // SAFETY: contig covers span_end, and write_end ≤ span_end (checked).
         let base = unsafe { (ptr as *mut u8).add(base_off as usize) };
         if x_off == 0 && rb == bpr && src_stride as usize == rb {
@@ -1798,10 +1807,11 @@ fn write_rect_raw_at_impl<M: HostMemory + HostOps>(
             Some(v) => v,
             None => return false,
         };
-        let Some(frame_end) = base_off.checked_add(frame_len as u64) else {
-            return false;
-        };
-        if frame_end > span_end {
+        // No `frame_end > span_end` here: this arm used to take its own variant
+        // of the bound, computed without `x_off` and so looser than the one
+        // `rect_extent_end` gives above. The overflow check on `frame_len` stays
+        // because it guards the allocation on the next lines.
+        if base_off.checked_add(frame_len as u64).is_none() {
             return false;
         }
         // With no physical row padding, the engine's tight result is already
@@ -1902,6 +1912,75 @@ mod tests {
     /// Every row must land at its own offset, with content that can tell rows
     /// apart.
     ///
+    /// A rect taller than the window it names is refused on **both** storage
+    /// shapes, and writes nothing past the window.
+    ///
+    /// `write_rect_raw_at_impl` has three arms that all write guest memory, and
+    /// the bound used to be on two of them. The per-row fragmented arm reached
+    /// `mapper::write_mapping_bytes`, which bounds against the whole mapping's
+    /// page span rather than this plane's window, so an over-tall rect landed in
+    /// whatever follows the window — on a multi-plane IOSurface, the next plane's
+    /// pixels — with no fail line. The packed arm refused the same call.
+    ///
+    /// So the loop over `packed` is the test: an assertion on one shape alone
+    /// passed throughout, which is how the hole survived. `span_end` is set short
+    /// of the mapping's real extent on purpose, because that gap is exactly the
+    /// region the unbounded arm wrote into and the bounded one did not.
+    #[test]
+    fn a_rect_taller_than_its_window_is_refused_on_both_storage_shapes() {
+        use crate::model::PAGE_SHIFT_X86;
+        const PAGE: u64 = 1 << PAGE_SHIFT_X86;
+        const W: u32 = 16;
+        const BPR: u32 = W * 4;
+
+        for packed in [true, false] {
+            let mut state = DeviceState::new(DeviceId(3), PAGE_SHIFT_X86);
+            let mut host = FakeHost::new();
+            host.strict_linux_map = !packed;
+            let base_pfn = 0x60u32;
+            host.map_range((base_pfn as u64) << PAGE_SHIFT_X86, 4 * PAGE as usize, 0xee);
+            let order: Vec<u32> = if packed { (0..4).collect() } else { vec![3, 2, 1, 0] };
+            let entries: Vec<u32> = order
+                .iter()
+                .map(|i| ((base_pfn + i) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID)
+                .collect();
+            state.map_surface(5);
+            state.attach_mapping_internal(5, 0);
+            let m = state.mappings.get_mut(&5).unwrap();
+            m.mapping_internal = 1;
+            m.page_entries = entries;
+
+            // The window is one page: 64 rows of 64 bytes. The rect asks for 80.
+            let span_end = PAGE;
+            let rows = (PAGE / BPR as u64) as u32;
+            let over = rows + 16;
+            let src = vec![0x5au8; (over as usize) * BPR as usize];
+
+            assert!(
+                !write_rect_raw_at(
+                    &mut state, &mut host, 5, 0, BPR, span_end, 0, 0, W, over, 4, &src, BPR,
+                ),
+                "packed={packed}: a rect past the window's last row must be refused"
+            );
+
+            // The bytes after the window still hold the fill the mapping was
+            // seeded with, on both shapes.
+            let mut after = [0u8; 16];
+            assert!(mapper::read_mapping_bytes(
+                &mut state,
+                &mut host,
+                5,
+                span_end,
+                &mut after
+            ));
+            assert_eq!(
+                after,
+                [0xeeu8; 16],
+                "packed={packed}: the refused rect must not have written past the window"
+            );
+        }
+    }
+
     /// The skip test below fills the frame with one repeated byte, so it proves
     /// which *pages* were written and nothing at all about which row went
     /// where: a writeback that repeated row 0 sixty-four times, or that shifted
