@@ -79,6 +79,8 @@ use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
+use crate::observe::phase_clock::{charge_ns, to_us};
+
 /// Phase slots, in the order a draw chain passes through them.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Phase {
@@ -94,9 +96,13 @@ pub enum Phase {
 
 const PHASES: usize = 8;
 
+/// Nanoseconds, per [`crate::observe::phase_clock`]. `prep_us` and
+/// `pipeline_us` are a couple of microseconds across a whole chain, so their
+/// constituent spans sit under the microsecond a truncating accumulator can
+/// see.
 static ACC: [AtomicU64; PHASES] = [const { AtomicU64::new(0) }; PHASES];
 static CHAINS: AtomicU64 = AtomicU64::new(0);
-static MAX_US: AtomicU64 = AtomicU64::new(0);
+static MAX_NS: AtomicU64 = AtomicU64::new(0);
 
 thread_local! {
     /// The phase currently being charged on this thread, and when it opened.
@@ -125,16 +131,16 @@ pub struct ChainPhaseWindow {
 pub fn take_window() -> Option<ChainPhaseWindow> {
     let chains = CHAINS.swap(0, Ordering::Relaxed);
     let w = ChainPhaseWindow {
-        prep_us: ACC[Phase::Prep as usize].swap(0, Ordering::Relaxed),
-        pipeline_us: ACC[Phase::Pipeline as usize].swap(0, Ordering::Relaxed),
-        binds_us: ACC[Phase::Binds as usize].swap(0, Ordering::Relaxed),
-        sampled_us: ACC[Phase::Sampled as usize].swap(0, Ordering::Relaxed),
-        seed_us: ACC[Phase::Seed as usize].swap(0, Ordering::Relaxed),
-        assemble_us: ACC[Phase::Assemble as usize].swap(0, Ordering::Relaxed),
-        engine_us: ACC[Phase::Engine as usize].swap(0, Ordering::Relaxed),
-        store_us: ACC[Phase::Store as usize].swap(0, Ordering::Relaxed),
+        prep_us: to_us(ACC[Phase::Prep as usize].swap(0, Ordering::Relaxed)),
+        pipeline_us: to_us(ACC[Phase::Pipeline as usize].swap(0, Ordering::Relaxed)),
+        binds_us: to_us(ACC[Phase::Binds as usize].swap(0, Ordering::Relaxed)),
+        sampled_us: to_us(ACC[Phase::Sampled as usize].swap(0, Ordering::Relaxed)),
+        seed_us: to_us(ACC[Phase::Seed as usize].swap(0, Ordering::Relaxed)),
+        assemble_us: to_us(ACC[Phase::Assemble as usize].swap(0, Ordering::Relaxed)),
+        engine_us: to_us(ACC[Phase::Engine as usize].swap(0, Ordering::Relaxed)),
+        store_us: to_us(ACC[Phase::Store as usize].swap(0, Ordering::Relaxed)),
         chains,
-        max_us: MAX_US.swap(0, Ordering::Relaxed),
+        max_us: to_us(MAX_NS.swap(0, Ordering::Relaxed)),
     };
     (chains > 0).then_some(w)
 }
@@ -145,7 +151,7 @@ pub fn enter(next: Phase) {
         let now = Instant::now();
         if let Some((phase, since)) = open.get() {
             ACC[phase as usize].fetch_add(
-                now.saturating_duration_since(since).as_micros() as u64,
+                charge_ns(now.saturating_duration_since(since)),
                 Ordering::Relaxed,
             );
             open.set(Some((next, now)));
@@ -187,15 +193,15 @@ impl Drop for ChainTimer {
         OPEN.with(|open| {
             if let Some((phase, since)) = open.get() {
                 ACC[phase as usize].fetch_add(
-                    now.saturating_duration_since(since).as_micros() as u64,
+                    charge_ns(now.saturating_duration_since(since)),
                     Ordering::Relaxed,
                 );
             }
             open.set(self.outer.map(|(phase, _)| (phase, now)));
         });
-        let total = now.saturating_duration_since(self.started).as_micros() as u64;
+        let total = charge_ns(now.saturating_duration_since(self.started));
         CHAINS.fetch_add(1, Ordering::Relaxed);
-        MAX_US.fetch_max(total, Ordering::Relaxed);
+        MAX_NS.fetch_max(total, Ordering::Relaxed);
     }
 }
 

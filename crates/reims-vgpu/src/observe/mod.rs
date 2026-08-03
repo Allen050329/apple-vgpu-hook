@@ -46,6 +46,7 @@ pub mod emit;
 pub mod footprint;
 #[cfg(test)]
 mod gate;
+pub mod phase_clock;
 pub mod sink;
 
 /// Re-exported so call sites write `crate::observe::decline_display!(..)`

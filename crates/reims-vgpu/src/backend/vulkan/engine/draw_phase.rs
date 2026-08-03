@@ -222,10 +222,13 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
+use crate::observe::phase_clock::{charge_ns, to_us};
+
 /// A draw at or above this is a stall rather than a slow frame: at 60 Hz it has
 /// already cost six frames, and the guest's compositor blocks on the same lock
-/// for the duration. Reported individually with its phase split.
-const STALL_US: u64 = 100_000;
+/// for the duration. Reported individually with its phase split. Nanoseconds,
+/// like the accumulator it is compared against; 100 ms.
+const STALL_NS: u64 = 100_000_000;
 
 /// Cap on individual stall reports per boot. The aggregate below keeps counting
 /// after this; only the per-event lines stop, so a pathological boot cannot
@@ -252,9 +255,12 @@ pub(crate) enum Phase {
 
 const PHASES: usize = 13;
 
+/// Nanoseconds, per [`crate::observe::phase_clock`]. `prep_us` and
+/// `pipeline_us` are single-digit microseconds over a whole draw, so the spans
+/// inside them are well under what a microsecond accumulator can resolve.
 static ACC: [AtomicU64; PHASES] = [const { AtomicU64::new(0) }; PHASES];
 static DRAWS: AtomicU64 = AtomicU64::new(0);
-static MAX_US: AtomicU64 = AtomicU64::new(0);
+static MAX_NS: AtomicU64 = AtomicU64::new(0);
 static STALLS: AtomicU64 = AtomicU64::new(0);
 static STALL_LINES: AtomicU64 = AtomicU64::new(0);
 
@@ -284,21 +290,21 @@ pub struct DrawPhaseWindow {
 pub fn take_window() -> Option<DrawPhaseWindow> {
     let draws = DRAWS.swap(0, Ordering::Relaxed);
     let w = DrawPhaseWindow {
-        prep_us: ACC[Phase::Prep as usize].swap(0, Ordering::Relaxed),
-        pipeline_us: ACC[Phase::Pipeline as usize].swap(0, Ordering::Relaxed),
-        stage_us: ACC[Phase::Stage as usize].swap(0, Ordering::Relaxed),
-        stage_pass_us: ACC[Phase::StagePass as usize].swap(0, Ordering::Relaxed),
-        acquire_us: ACC[Phase::Acquire as usize].swap(0, Ordering::Relaxed),
-        acquire_sampled_us: ACC[Phase::AcquireSampled as usize].swap(0, Ordering::Relaxed),
-        sampled_upload_us: ACC[Phase::SampledUpload as usize].swap(0, Ordering::Relaxed),
-        acquire_readback_us: ACC[Phase::AcquireReadback as usize].swap(0, Ordering::Relaxed),
-        descriptors_us: ACC[Phase::Descriptors as usize].swap(0, Ordering::Relaxed),
-        record_us: ACC[Phase::Record as usize].swap(0, Ordering::Relaxed),
-        submit_us: ACC[Phase::Submit as usize].swap(0, Ordering::Relaxed),
-        wait_us: ACC[Phase::Wait as usize].swap(0, Ordering::Relaxed),
-        readback_us: ACC[Phase::Readback as usize].swap(0, Ordering::Relaxed),
+        prep_us: to_us(ACC[Phase::Prep as usize].swap(0, Ordering::Relaxed)),
+        pipeline_us: to_us(ACC[Phase::Pipeline as usize].swap(0, Ordering::Relaxed)),
+        stage_us: to_us(ACC[Phase::Stage as usize].swap(0, Ordering::Relaxed)),
+        stage_pass_us: to_us(ACC[Phase::StagePass as usize].swap(0, Ordering::Relaxed)),
+        acquire_us: to_us(ACC[Phase::Acquire as usize].swap(0, Ordering::Relaxed)),
+        acquire_sampled_us: to_us(ACC[Phase::AcquireSampled as usize].swap(0, Ordering::Relaxed)),
+        sampled_upload_us: to_us(ACC[Phase::SampledUpload as usize].swap(0, Ordering::Relaxed)),
+        acquire_readback_us: to_us(ACC[Phase::AcquireReadback as usize].swap(0, Ordering::Relaxed)),
+        descriptors_us: to_us(ACC[Phase::Descriptors as usize].swap(0, Ordering::Relaxed)),
+        record_us: to_us(ACC[Phase::Record as usize].swap(0, Ordering::Relaxed)),
+        submit_us: to_us(ACC[Phase::Submit as usize].swap(0, Ordering::Relaxed)),
+        wait_us: to_us(ACC[Phase::Wait as usize].swap(0, Ordering::Relaxed)),
+        readback_us: to_us(ACC[Phase::Readback as usize].swap(0, Ordering::Relaxed)),
         draws,
-        max_us: MAX_US.swap(0, Ordering::Relaxed),
+        max_us: to_us(MAX_NS.swap(0, Ordering::Relaxed)),
         stalls: STALLS.swap(0, Ordering::Relaxed),
     };
     (draws > 0).then_some(w)
@@ -313,7 +319,7 @@ pub(crate) struct DrawTimer {
     started: Instant,
     last: Instant,
     open: Phase,
-    us: [u64; PHASES],
+    ns: [u64; PHASES],
     /// Set once the draw knows what it is drawing, so a stall report can say
     /// what was on screen rather than only how long it took.
     geom: (u32, u32),
@@ -327,7 +333,7 @@ impl DrawTimer {
             started: now,
             last: now,
             open: Phase::Prep,
-            us: [0; PHASES],
+            ns: [0; PHASES],
             geom: (0, 0),
             readback_bytes: 0,
         }
@@ -336,7 +342,7 @@ impl DrawTimer {
     /// Close the open phase and open `next`.
     pub(crate) fn enter(&mut self, next: Phase) {
         let now = Instant::now();
-        self.us[self.open as usize] += now.duration_since(self.last).as_micros() as u64;
+        self.ns[self.open as usize] += charge_ns(now.duration_since(self.last));
         self.last = now;
         self.open = next;
     }
@@ -351,14 +357,14 @@ impl DrawTimer {
 impl Drop for DrawTimer {
     fn drop(&mut self) {
         let now = Instant::now();
-        self.us[self.open as usize] += now.duration_since(self.last).as_micros() as u64;
-        let total = now.duration_since(self.started).as_micros() as u64;
+        self.ns[self.open as usize] += charge_ns(now.duration_since(self.last));
+        let total = charge_ns(now.duration_since(self.started));
         for (slot, acc) in ACC.iter().enumerate() {
-            acc.fetch_add(self.us[slot], Ordering::Relaxed);
+            acc.fetch_add(self.ns[slot], Ordering::Relaxed);
         }
         DRAWS.fetch_add(1, Ordering::Relaxed);
-        MAX_US.fetch_max(total, Ordering::Relaxed);
-        if total < STALL_US {
+        MAX_NS.fetch_max(total, Ordering::Relaxed);
+        if total < STALL_NS {
             return;
         }
         STALLS.fetch_add(1, Ordering::Relaxed);
@@ -378,19 +384,19 @@ impl Drop for DrawTimer {
              descriptors_us={} \
              record_us={} submit_us={} wait_us={} readback_us={} geom={w}x{h} \
              readback_bytes={} exit={:?}{latched}",
-            self.us[Phase::Prep as usize],
-            self.us[Phase::Pipeline as usize],
-            self.us[Phase::Stage as usize],
-            self.us[Phase::StagePass as usize],
-            self.us[Phase::Acquire as usize],
-            self.us[Phase::AcquireSampled as usize],
-            self.us[Phase::SampledUpload as usize],
-            self.us[Phase::AcquireReadback as usize],
-            self.us[Phase::Descriptors as usize],
-            self.us[Phase::Record as usize],
-            self.us[Phase::Submit as usize],
-            self.us[Phase::Wait as usize],
-            self.us[Phase::Readback as usize],
+            to_us(self.ns[Phase::Prep as usize]),
+            to_us(self.ns[Phase::Pipeline as usize]),
+            to_us(self.ns[Phase::Stage as usize]),
+            to_us(self.ns[Phase::StagePass as usize]),
+            to_us(self.ns[Phase::Acquire as usize]),
+            to_us(self.ns[Phase::AcquireSampled as usize]),
+            to_us(self.ns[Phase::SampledUpload as usize]),
+            to_us(self.ns[Phase::AcquireReadback as usize]),
+            to_us(self.ns[Phase::Descriptors as usize]),
+            to_us(self.ns[Phase::Record as usize]),
+            to_us(self.ns[Phase::Submit as usize]),
+            to_us(self.ns[Phase::Wait as usize]),
+            to_us(self.ns[Phase::Readback as usize]),
             self.readback_bytes,
             self.open,
         ));

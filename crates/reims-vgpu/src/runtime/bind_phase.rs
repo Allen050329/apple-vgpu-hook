@@ -29,6 +29,8 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
+use crate::observe::phase_clock::{charge_ns, to_us};
+
 /// The parts of the bind phase that are worth telling apart.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Part {
@@ -42,6 +44,9 @@ pub enum Part {
 
 const PARTS: usize = 3;
 
+/// Nanoseconds, per [`crate::observe::phase_clock`]. The attribute walk is the
+/// reason: it is sub-microsecond per draw at tens of thousands of draws a
+/// second, so a microsecond accumulator reported it as free.
 static ACC: [AtomicU64; PARTS] = [const { AtomicU64::new(0) }; PARTS];
 static BINDS: AtomicU64 = AtomicU64::new(0);
 
@@ -60,9 +65,9 @@ pub struct BindPhaseWindow {
 pub fn take_window() -> Option<BindPhaseWindow> {
     let binds = BINDS.swap(0, Ordering::Relaxed);
     let w = BindPhaseWindow {
-        vertex_us: ACC[Part::VertexLoad as usize].swap(0, Ordering::Relaxed),
-        fragment_us: ACC[Part::FragmentLoad as usize].swap(0, Ordering::Relaxed),
-        attrs_us: ACC[Part::Attrs as usize].swap(0, Ordering::Relaxed),
+        vertex_us: to_us(ACC[Part::VertexLoad as usize].swap(0, Ordering::Relaxed)),
+        fragment_us: to_us(ACC[Part::FragmentLoad as usize].swap(0, Ordering::Relaxed)),
+        attrs_us: to_us(ACC[Part::Attrs as usize].swap(0, Ordering::Relaxed)),
         binds,
     };
     (binds > 0).then_some(w)
@@ -100,10 +105,7 @@ impl Span {
 
 impl Drop for Span {
     fn drop(&mut self) {
-        ACC[self.part as usize].fetch_add(
-            self.started.elapsed().as_micros() as u64,
-            Ordering::Relaxed,
-        );
+        ACC[self.part as usize].fetch_add(charge_ns(self.started.elapsed()), Ordering::Relaxed);
     }
 }
 
@@ -152,6 +154,29 @@ mod tests {
         }
         let w = take_window().expect("binds were noted");
         assert_eq!(w.binds, 2);
+    }
+
+    /// A large population of sub-microsecond spans has to sum to something.
+    /// This is the shape the attribute walk is, and it is the whole reason
+    /// [`crate::observe::phase_clock`] exists: an empty span here is a pair of
+    /// `Instant::now()` calls, which a microsecond-truncating accumulator
+    /// charges exactly zero.
+    ///
+    /// The threshold is measured rather than guessed. Nanosecond accumulation
+    /// reads 302-308 µs over three runs (~15 ns a span); truncating
+    /// accumulation reads 3, from the handful of spans a scheduling hiccup
+    /// pushed over a microsecond. 100 sits a factor of three below the true
+    /// reading and thirty above the false one, and load can only raise the
+    /// true reading.
+    #[test]
+    fn twenty_thousand_sub_microsecond_spans_are_not_free() {
+        let _ = take_window();
+        for _ in 0..20_000 {
+            note_bind();
+            let _s = Span::open(Part::Attrs);
+        }
+        let w = take_window().expect("binds were noted");
+        assert!(w.attrs_us > 100, "{w:?}");
     }
 
     /// Taking the window resets it, so the line is a rate and not a running

@@ -1254,19 +1254,28 @@ prep      1.9 us                              prep             1.7 us
 `binds_us` and `draw_phase`'s `stage_us` are the two big ones and are within a
 microsecond of each other.
 
-**`binds_us` is now divided, and there is no fourth cost hiding in it.**
-`bind_phase` reads, on a driven drag second of 2546 draws:
+**`binds_us` is divided, but the division that was published is not evidence and
+has to be re-taken.** `bind_phase` read, on a driven drag second of 2546 draws:
 
 ```text
 vertex_us 13.32   fragment_us 8.26   attrs_us 0.00   -> 21.6 of binds_us 23.15
 ```
 
-93 % accounted, and the attribute walk — one of the three fixes the split was
-built to tell apart — is **zero**. So the whole column is `load_buffer_content`
-over vertex and fragment buffers, and the remaining 1.5 µs is the two shader
-`Arc` clones and the `BTreeSet` the phase also builds. Whatever is done here is
-done inside that one function; nothing else in the phase is worth looking at.
-`draw_phase`'s `stage_us` is still undivided.
+That was written up as "93 % accounted, and the attribute walk is **zero**".
+**Both halves rest on a truncating accumulator and neither survives it.** Every
+phase census here charged `Duration::as_micros`, which rounds a 700 ns span down
+to nothing — see `observe::phase_clock` — so a part whose per-item cost is
+sub-microsecond reads zero however often it runs, and a remainder computed
+against it reads as though the expensive parts were the whole cost. `attrs_us`
+reading `0`, `3`, `23`, `10`, `0`, `0` across consecutive windows is that floor,
+not a free attribute walk. The censuses now accumulate nanoseconds and divide
+once at the window boundary; the numbers above predate the fix.
+
+What still stands is the shape of the question: `load_buffer_content` over
+vertex and fragment buffers is a large part of the column, and whether the
+attribute walk is a third cost or a rounding error is **open** until the split is
+read again on the fixed accumulator. `draw_phase`'s `stage_us` is still
+undivided.
 
 The arithmetic that says whether the tier matters: 120 fps is 8.33 ms, run 4
 achieved 10.2 ms, and draws are 6.0 ms of that. So goal 6 needs about **2 ms a
