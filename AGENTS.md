@@ -178,6 +178,30 @@ already been run to exhaustion; re-running one costs hours and has so far return
   copy forms are distinguished by exact length rather than magnitude, variable-length records
   bounds-check before access, and every overflow path names its own `ErrBadLength` slug. Spend the
   next fidelity hour on `resource.rs` and the descriptor formats, not on re-reading these six.
+- **The consumer side has now been swept too, and the vein there is *divergence between two arms
+  that consume one wire form*.** `blit_exec`, `drain`, `exec`, `compute_exec`, `compute_session` and
+  `metal_draw` (~30 000 lines, the clusters the earlier oracle sweep did not reach) were audited for
+  the same shapes. Almost no classic oracles came back — no poison/sentinel checks, no retry loops,
+  no PFN plausibility test, no magnitude-based format selection, and the one thing that looks like a
+  resolve ladder (the four-rung type-11 sampled path) is four distinct sources with a traffic census,
+  not one source reinterpreted. What *did* come back was five real bugs, and four of them are the
+  same shape: **two consumers of one decoded record, one of which contradicts a rule the other one
+  states in a comment.** A nil compute bind entry did not unbind while `exec::apply_binds` did and
+  `ExecResult::buffer_unbinds` said it must; a Metal colour slot borrowed slot 0's blend state while
+  the Vulkan arm's comment named that exact line as inventing state; seven root FIFO arms dropped a
+  short packet silently while the child arm of one of the same opcodes already reported it; two row
+  loops skipped the `dest_window` bound six sibling call sites take. When auditing here, diff the two
+  arms against each other rather than reading either alone — and grep the *other* arm's comments,
+  because in three of these four the correct rule was already written down next to the wrong code.
+- **The per-dispatch compute stall watchdog is priced, and it is not worth rewriting.**
+  `spawn_compute_engine_stall_watchdog` spawns a thread and clones the SPIR-V on *every* compute
+  dispatch, then sleeps 2 s. At the measured peak of 124 computes/s that is ~250 live sleeping
+  threads and 124 spawns/s for a probe that has never fired (0 hits across a driven boot, and no
+  `/tmp/reims-vgpu-compute-stall-*` dump has ever been written). It reads like obvious bloat. It is
+  ~0.25% of one core and a few MB of RSS — three orders of magnitude below the flush rail above —
+  and it is a healthy-zero hang alarm for backend calls a Vulkan fence timeout cannot bound. Collapsing
+  it to one long-lived thread plus an in-flight registry is correct but buys almost nothing; do the
+  flush rail first.
 - **The two C shims are not 2 200 duplicated lines.** `reims-vgpu-pci.c` and `reims-vgpu-mmio.c` look
   like near-copies and are read that way by every fresh sweep. What is actually shared is already in
   `reims-vgpu-shim.c`, and the rest is blocked by that header's own stated rule — bus-specific trace
@@ -287,6 +311,27 @@ essentially nothing.
 content. So a slow verdict from this probe points **upstream**: drain, decode, draw. It does not
 implicate `host_window/present.rs`, `backend/vulkan/engine/window_present.rs`, or the surface-cache
 present path, and measuring those again to explain a low Hz number is measuring the wrong end.
+
+### Upstream is the flush rail, and it is bytes
+
+The three candidates that verdict leaves — drain, decode, draw — are not equal, and the driven log
+already settles it. In the busiest window `drain_duty` reads `flush_us=732687` of `drain_us=995063`
+against `draw_us=225287`: **73% of the device's entire time budget is writeback, 3.2× draw.**
+`compute_us` is 0. `flush_rails` puts essentially all of it on the render rail (`render_us=717130`
+over 304 flushes; gva, linear and storage rails are ~0).
+
+Do not then read `readback_split`'s `fence_us` as latency. `gpu_us`/`bar_us` are GPU timestamps
+taken *inside* that fence: `fence_us=410022` with `gpu_us=324787` and `bar_us=729` means 79% of the
+fence is the readback command buffer's own copy and the barrier waiting on the draw batch is one
+microsecond per fence. Adding `write_us=290863` and `map_us`, the rail is **86% bytes, 13% latency**.
+720 fences that second each copied a whole surface to produce 11-17 fresh frames.
+
+So the lever is bounding *what* a flush copies, not scheduling it differently, and it is not blocked
+on a host that can address guest memory the way the zero-copy endgame is. `flush_render_one`'s doc
+carries the full reading, including the separate measurement that 99.3% of what the rail writes is
+never read by anything in the device before the next flush replaces it. Note also that a
+tile-difference delivery path was built and deleted whole in `6df980c` for being reached by nothing
+— read that commit before rebuilding it.
 
 For Rust changes, run the relevant native tests serially from the repo root:
 
