@@ -2371,17 +2371,14 @@ pub fn decode_icb_descriptor(
     let max_kernel_tg = bytes[ICB_DESC_MAX_KERNEL_TG_BINDS] as u16;
     let max_object_tg = bytes[ICB_DESC_MAX_OBJECT_TG_BINDS] as u16;
     let flags = ld16(&bytes[ICB_DESC_FLAGS..]);
-    let compute_only = command_types
-        & (MTL_INDIRECT_CMD_CONCURRENT_DISPATCH | MTL_INDIRECT_CMD_CONCURRENT_DISPATCH_THREADS)
-        != 0
-        && command_types
-            & (MTL_INDIRECT_CMD_DRAW
-                | MTL_INDIRECT_CMD_DRAW_INDEXED
-                | (1 << 2)
-                | (1 << 3)
-                | (1 << 7)
-                | (1 << 8))
-            == 0;
+    // `maxFragmentBufferBindCount` is reported as the guest wrote it at +0x0d.
+    // It used to be forced to 0 whenever `command_types` named a dispatch and no
+    // draw, on the reading that the guest "meant" a compute-only buffer. That is
+    // an inference about intent overriding a field the descriptor states
+    // outright, and it was silent — a decoded value was discarded with nothing
+    // recorded. The command layout at +0x1c independently carries
+    // `fragment_buffer_bind_offset`, so nothing downstream needs the count to be
+    // re-derived from the command mask.
     // Create body packs maxKernel at +0x0e (third bind-count byte).
     let max_kernel = max_kernel_byte;
     let layout =
@@ -2389,7 +2386,7 @@ pub fn decode_icb_descriptor(
     Ok(IndirectCommandBufferDescriptor {
         command_types,
         max_vertex_buffer_bind_count: max_vertex,
-        max_fragment_buffer_bind_count: if compute_only { 0 } else { max_fragment },
+        max_fragment_buffer_bind_count: max_fragment,
         max_kernel_buffer_bind_count: max_kernel,
         max_object_buffer_bind_count: max_object,
         max_mesh_buffer_bind_count: max_mesh,
@@ -2512,6 +2509,44 @@ mod tests {
         assert_eq!(icb.max_command_count, 8);
         assert!(!icb.inherit_buffers);
         assert!(!icb.inherit_pipeline_state);
+    }
+
+    /// A dispatch-only `command_types` does not license discarding the
+    /// fragment bind count the descriptor states.
+    ///
+    /// The decoder used to zero `max_fragment_buffer_bind_count` whenever the
+    /// command mask named a dispatch and no draw. That is an inference about
+    /// what the guest meant, overriding a byte the guest wrote at +0x0d, and it
+    /// was silent — so a descriptor built by a guest that reserves fragment
+    /// binds on a buffer it happens to fill with dispatches had the reservation
+    /// dropped with nothing recorded. Metal is handed this count directly
+    /// (`icb::materialize`), so the drop is guest-visible.
+    #[test]
+    fn a_dispatch_only_command_mask_keeps_the_stated_fragment_bind_count() {
+        let mut b = [0u8; ICB_DESC_LEN];
+        st32(&mut b[0..], TYPE7_OBJECT_ICB);
+        st32(&mut b[4..], ICB_DESC_LEN as u32);
+        // Dispatch bits only — no draw bit anywhere in the mask.
+        st32(
+            &mut b[8..],
+            MTL_INDIRECT_CMD_CONCURRENT_DISPATCH | MTL_INDIRECT_CMD_CONCURRENT_DISPATCH_THREADS,
+        );
+        b[ICB_DESC_MAX_VERTEX_BINDS] = 0;
+        b[ICB_DESC_MAX_FRAGMENT_BINDS] = 6;
+        b[ICB_DESC_MAX_KERNEL_BINDS] = 4;
+        st16(&mut b[ICB_DESC_FLAGS..], 0);
+        let layout = compute_only_icb_layout(4);
+        b[ICB_DESC_LAYOUT..ICB_DESC_LAYOUT + ICB_LAYOUT_LEN]
+            .copy_from_slice(&encode_icb_command_layout(&layout));
+        st32(&mut b[ICB_DESC_MAX_COMMAND_COUNT..], 8);
+        st32(&mut b[ICB_DESC_OPTIONS..], 0);
+
+        let icb = decode_icb_descriptor(&b).unwrap();
+        assert_eq!(
+            icb.max_fragment_buffer_bind_count, 6,
+            "the wire byte at +0x0d is the answer, not the command mask"
+        );
+        assert_eq!(icb.max_kernel_buffer_bind_count, 4);
         assert_eq!(icb.layout.command_size, layout.command_size);
         assert_eq!(icb.layout.kernel_buffer_bind_offset, 0x64);
         match decode_type7_descriptor(&b).unwrap() {

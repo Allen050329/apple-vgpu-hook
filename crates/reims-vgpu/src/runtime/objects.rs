@@ -307,10 +307,18 @@ pub fn iosurface_pixel_format_to_mtl(pixel_format: u32) -> u16 {
     if iosurface_fourcc_is_biplanar(pixel_format) {
         return 0;
     }
-    // Already a small MTLPixelFormat ordinal (type-11 path).
-    if pixel_format <= 0x200 {
-        return pixel_format as u16;
-    }
+    // No pass-through for small values. This used to return `pixel_format as
+    // u16` for anything at or below 0x200, on the reading that such a value was
+    // "already an MTLPixelFormat ordinal". That decided which *encoding* a field
+    // was in from the field's magnitude, and the caller already knows: every
+    // caller here passes a type-4 `pixelFormat` (+0x0c), which is an IOSurface
+    // OSType — a four-character code, so never below 0x20202020. The type-11 and
+    // type-5 rails carry their MTL ordinal in a `u16` field of their own and do
+    // not route through this function.
+    //
+    // The magnitude test was also wrong at its own boundary: MTLPixelFormat
+    // BGRA10_XR is 552 (0x228) and its three siblings are 553-555, so a 10-bit
+    // XR surface passed 0x200 and fell into the FourCC match below regardless.
     match pixel_format {
         // 'BGRA' / 'ARGB' (kb: ARGB fourcc → BGRA8Unorm 0x50 for render targets)
         0x4247_5241 | 0x4152_4742 => MTL_FORMAT_BGRA8_UNORM,
@@ -1390,6 +1398,29 @@ mod tests {
         assert!(iosurface_fourcc_is_biplanar(IOSURFACE_FOURCC_420F));
         // Unknown FourCC must not invent BGRA.
         assert_eq!(iosurface_pixel_format_to_mtl(0xdead_beef), 0);
+    }
+
+    /// A small value is not an MTLPixelFormat ordinal in disguise.
+    ///
+    /// The converter used to return `pixel_format as u16` for anything at or
+    /// below 0x200, deciding which encoding the field was in from how big the
+    /// number was. Every caller passes a type-4 `pixelFormat` (+0x0c), which is
+    /// an IOSurface OSType and therefore never below `'    '` (0x20202020), so
+    /// a small value arriving here is a bad read — and passing it through
+    /// published a format the guest never named. Fail closed instead, which is
+    /// what this function already does for every FourCC it does not know.
+    #[test]
+    fn a_small_value_is_not_read_as_an_mtl_ordinal() {
+        // 0x50 is MTLPixelFormatBGRA8Unorm. As a type-4 OSType it is nonsense,
+        // and the old magnitude test would have handed it back as a format.
+        assert_eq!(iosurface_pixel_format_to_mtl(0x50), 0);
+        assert_eq!(iosurface_pixel_format_to_mtl(0x200), 0);
+        // Known FourCCs are unaffected — this is the boundary the old test sat
+        // on, not a narrowing of what the converter accepts.
+        assert_eq!(
+            iosurface_pixel_format_to_mtl(0x4247_5241),
+            crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM
+        );
     }
 
     #[test]
