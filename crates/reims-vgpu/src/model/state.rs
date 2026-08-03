@@ -1575,37 +1575,16 @@ pub struct GuestLinearMemo {
     pub generation: u64,
 }
 
-/// Per-drain-tranche timing accumulator (diagnostic only — never gates behavior).
-///
-/// A drain tranche runs on QEMU's main-loop BH and holds the device lock for its
-/// whole duration; a long tranche both delays completion stamps (guest present
-/// stalls) and blocks QEMU's main loop (delayed host display refresh). The
-/// opaque `drain_tranche_us` outlier is attributed here so a hitch can be read as
-/// compile/convert/wait/readback-bound without fragile per-draw log correlation.
-/// Counters for the zero-copy flush signature memo (`zc_flush_*`), whose only
-/// observable effect is a skipped re-read.
-///
-/// These name product behavior, not cost: a memo that stops hitting silently
-/// doubles the work per bind. The tests for that path assert on these.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct MemoCounters {
-    /// Deferred windows a flush-signature check found already landed.
-    pub zc_flush_hits: u64,
-    /// Binds the signature memo answered without walking the window map.
-    pub zc_flush_skip: u64,
-    /// Memo answers invalidated by an intervening arm/disarm.
-    pub zc_flush_stale: u64,
-}
-
-/// A map of deferred writeback windows whose page sets feed the union index
-/// [`DeviceState::deferred_page_refs`].
+/// A map of deferred writeback windows — pixels this device still owes guest
+/// RAM, keyed by the rail that armed them.
 ///
 /// Read-only outside this module: [`Deref`](std::ops::Deref) exposes the whole
 /// `BTreeMap` read API, and there is deliberately **no** `DerefMut`, so the
-/// inner map can only be mutated where the paired refcount update lives. That
-/// is what makes the union index exact by construction — a site that armed or
-/// disarmed a window without touching the index would not compile, so nothing
-/// has to sample the index at runtime and repair it.
+/// inner map can only be mutated through the arm/disarm methods below. Arming
+/// stamps a window with the fence generation it was armed under and disarming
+/// hands the page set back to the caller that is about to write those pages;
+/// a site that inserted or removed a window directly would skip both, so the
+/// type refuses to let it compile.
 #[derive(Debug)]
 pub struct DeferredWindows<K, V>(BTreeMap<K, V>);
 
@@ -1928,40 +1907,9 @@ pub struct DeviceState {
     /// the runtime lands these **cache-only** (no guest write) and unpins
     /// (`storage_flush::retire_gva_windows`).
     pub retired_gva_windows: Vec<(u64, GvaDeferredEntry)>,
-    /// Content-memo hit/miss/stale counters. See [`MemoCounters`].
-    pub tranche: MemoCounters,
     /// Total stale views the reuse verify caught (fail-logged as
     /// `gva_view_stale`; the view self-heals via retire + rebuild).
     pub view_stale_reads: u64,
-    /// Draw-time buffer-bind coherence-flush no-intersection memo. Maps a
-    /// full-walked `(task_id, gva, span)` bind to `(validated_signature,
-    /// gpa_pages)`: the deferred-index signature the walk ran at, and the exact
-    /// guest physical pages the bind's span resolved to.
-    /// `storage_flush::flush_intersecting_task_gva` skips its per-page task-PT
-    /// walk when the signature is unchanged, and on a signature change re-checks
-    /// the cached `gpa_pages` against the current deferred windows **without a PT
-    /// walk** (the FFI page translate is the expensive part) — only a real
-    /// intersection falls back to the full walk. The pages stay valid until the
-    /// task PT remaps the gva range, which is where the entry is invalidated.
-    /// A 1-in-64 sampled full walk ([`flush_verify_ctr`])
-    /// self-heals a missed PT remap. Only fully-probed spans are cached (a
-    /// strided walk's page set is incomplete, so it is never stored).
-    pub flush_nohit_memo: std::collections::HashMap<(u32, u64, u64), (u64, Vec<u64>)>,
-    pub flush_verify_ctr: u64,
-    /// Refcounted union of every live deferred window's physical page GPAs — the
-    /// fast index behind [`deferred_pages_intersect`]. Maintained incrementally
-    /// at window arm/disarm (only the changed window's pages are touched, never
-    /// a 24k-page rebuild), so the per-bind recheck is `bind_pages` O(1) lookups
-    /// into ONE map instead of the old O(bind_pages × num_windows) scan over
-    /// every window's HashSet — the dominant `zc_flush` cost. Refcounts (not a
-    /// plain set) because windows share physical pages; a page leaves the index
-    /// only when its last window disarms.
-    ///
-    /// Exactness is a property of the type, not of a repair pass: the three
-    /// source maps are [`DeferredWindows`], which hands out no mutable access
-    /// outside this module, so every arm and disarm necessarily runs through the
-    /// method that also moves the refcount here.
-    deferred_page_refs: std::collections::HashMap<u64, u32>,
 }
 
 /// Domain tag for ch-event segment events (matches event_sync::Domain::Event).
@@ -2055,109 +2003,22 @@ impl DeviceState {
             type11_memo: LruBytesMemo::new(GUEST_LINEAR_MEMO_BYTE_CAP),
             type11_memo_scratch: Vec::new(),
             gva_host_views: Vec::new(),
-            tranche: MemoCounters::default(),
             view_stale_reads: 0,
-            flush_nohit_memo: std::collections::HashMap::new(),
-            flush_verify_ctr: 0,
-            deferred_page_refs: std::collections::HashMap::new(),
         }
     }
 
-    /// Cheap structural signature of the three deferred-writeback indices that
-    /// [`crate::runtime::storage_flush::flush_intersecting_task_gva`] consults.
-    /// `O(deferred entries)` (tiny), NOT `O(pages)` — `HashSet::len` is `O(1)`.
-    /// Changes with overwhelming probability on any add/remove/re-arm; a same-
-    /// signature content change is caught by the flush's 1-in-64 sampled walk.
-    pub fn deferred_flush_signature(&self) -> u64 {
-        const P: u64 = 0x100000001b3;
-        let mut s: u64 = self.deferred_alias_pages.len() as u64;
-        for (mid, pages) in &self.deferred_alias_pages {
-            s = s
-                .wrapping_mul(P)
-                .wrapping_add(*mid as u64)
-                .wrapping_add((pages.len() as u64) << 20);
-        }
-        s = s
-            .wrapping_mul(P)
-            .wrapping_add(self.linear_deferred_flush.len() as u64);
-        for (key, entry) in &self.linear_deferred_flush {
-            s = s
-                .wrapping_mul(P)
-                .wrapping_add(key.texture_ref as u64)
-                .wrapping_add((key.map_generation as u64) << 12)
-                .wrapping_add((entry.generation as u64) << 28)
-                .wrapping_add((entry.pages.len() as u64) << 44);
-        }
-        s = s
-            .wrapping_mul(P)
-            .wrapping_add(self.gva_deferred_flush.len() as u64);
-        for (gva, entry) in &self.gva_deferred_flush {
-            s = s
-                .wrapping_mul(P)
-                .wrapping_add(*gva)
-                .wrapping_add(entry.armed_seq << 8);
-        }
-        s
-    }
-
-    /// True if any of `gpa_pages` (a bind's resolved physical pages) falls in a
-    /// live deferred-writeback window. Same membership test as the flush walk's
-    /// visitor, but over already-resolved pages — no task page-table walk. Used
-    /// to re-validate a `flush_nohit_memo` entry after a deferred-signature
-    /// change without paying the per-page FFI translate again.
-    ///
-    /// O(`gpa_pages`) lookups into the refcounted [`deferred_page_refs`] index,
-    /// not the old O(`gpa_pages` × num_windows) scan over every window's set.
-    pub fn deferred_pages_intersect(&self, gpa_pages: &[u64]) -> bool {
-        gpa_pages
-            .iter()
-            .any(|p| self.deferred_page_refs.contains_key(p))
-    }
-
-    /// Add one reference to each of `pages` in the deferred-union index.
-    fn deferred_ref_add_pages(&mut self, pages: &std::collections::HashSet<u64>) {
-        for &p in pages {
-            *self.deferred_page_refs.entry(p).or_insert(0) += 1;
-        }
-    }
-
-    /// Drop one reference from each of `pages`; a page leaves the index when its
-    /// last referencing window disarms.
-    fn deferred_ref_sub_pages(&mut self, pages: &std::collections::HashSet<u64>) {
-        for &p in pages {
-            if let Some(c) = self.deferred_page_refs.get_mut(&p) {
-                *c -= 1;
-                if *c == 0 {
-                    self.deferred_page_refs.remove(&p);
-                }
-            }
-        }
-    }
-
-    /// Arm (or re-arm) a deferred GVA render-Store window, keeping the union
-    /// index in sync (re-arm subtracts the superseded page set first).
+    /// Arm (or re-arm) a deferred GVA render-Store window.
     pub fn arm_gva_deferred_window(&mut self, gva: u64, entry: GvaDeferredEntry) {
-        if let Some(old) = self.gva_deferred_flush.get(&gva) {
-            let old = old.pages.clone();
-            self.deferred_ref_sub_pages(&old);
-        }
-        self.deferred_ref_add_pages(&entry.pages);
         self.gva_deferred_flush.0.insert(gva, entry);
     }
 
-    /// Arm (or re-arm) a linear compute-storage deferred window, keeping the
-    /// union index in sync.
+    /// Arm (or re-arm) a linear compute-storage deferred window.
     pub fn arm_linear_deferred_window(
         &mut self,
         key: ComputeStorageResidencyKey,
         generation: u32,
         pages: std::collections::HashSet<u64>,
     ) {
-        if let Some(old) = self.linear_deferred_flush.get(&key) {
-            let old = old.pages.clone();
-            self.deferred_ref_sub_pages(&old);
-        }
-        self.deferred_ref_add_pages(&pages);
         let armed_stamp_seq = self.completion_stamp_seq;
         self.linear_deferred_flush.0.insert(
             key,
@@ -2169,8 +2030,7 @@ impl DeviceState {
         );
     }
 
-    /// Disarm a linear compute-storage deferred window, keeping the union index
-    /// in sync.
+    /// Disarm a linear compute-storage deferred window.
     ///
     /// Returns the whole window, so a caller about to write those guest pages
     /// can check they still belong to this window (see
@@ -2187,7 +2047,6 @@ impl DeviceState {
         key: &ComputeStorageResidencyKey,
     ) -> Option<LinearDeferredEntry> {
         let entry = self.linear_deferred_flush.0.remove(key)?;
-        self.deferred_ref_sub_pages(&entry.pages);
         Some(entry)
     }
 
@@ -2249,7 +2108,6 @@ impl DeviceState {
         views.extend(self.gva_host_views.drain(..).filter_map(|view| {
             (view.ptr != 0 && view.ptr_len != 0).then_some((view.ptr, view.ptr_len))
         }));
-        self.flush_nohit_memo.clear();
         views
     }
 
@@ -2512,7 +2370,6 @@ impl DeviceState {
             .collect();
         for gva in doomed {
             if let Some(entry) = self.gva_deferred_flush.0.remove(&gva) {
-                self.deferred_ref_sub_pages(&entry.pages);
                 self.retired_gva_windows.push((gva, entry));
             }
         }
@@ -2521,7 +2378,6 @@ impl DeviceState {
     /// Take the deferred GVA window at exactly `gva`, if any.
     pub fn take_gva_deferred_window(&mut self, gva: u64) -> Option<GvaDeferredEntry> {
         let entry = self.gva_deferred_flush.0.remove(&gva)?;
-        self.deferred_ref_sub_pages(&entry.pages);
         Some(entry)
     }
 
@@ -2533,7 +2389,6 @@ impl DeviceState {
             .min_by_key(|(_, e)| e.armed_seq)
             .map(|(&gva, _)| gva)?;
         let entry = self.gva_deferred_flush.0.remove(&gva)?;
-        self.deferred_ref_sub_pages(&entry.pages);
         Some((gva, entry))
     }
 
@@ -2553,8 +2408,7 @@ impl DeviceState {
         true
     }
 
-    /// Retire every GVA HostOps view registered under `task_id`, plus the two
-    /// memos that carry the same invalidation contract.
+    /// Retire every GVA HostOps view registered under `task_id`.
     ///
     /// Both entry points that end a task's page table — `define_task` on a
     /// redefine and `delete_task` on teardown — owe exactly this: the views hold
@@ -2574,7 +2428,6 @@ impl DeviceState {
                 i += 1;
             }
         }
-        self.flush_nohit_memo.retain(|&(t, _, _), _| t != task_id);
     }
 
     /// PVG `CmdDeleteTask` (op `0x20`): drop task directory + object list entries.
@@ -2758,16 +2611,9 @@ impl DeviceState {
             .filter_map(|&e| crate::contract::iosurface_pages::entry_gpa_shift(e, page_shift))
             .map(|gpa| gpa & !(page - 1))
             .collect();
-        // Re-index: drop the superseded page set's refs before adding the fresh
-        // one so the union index tracks exactly the live pages.
-        if let Some(old) = self.deferred_alias_pages.get(&mapping_id) {
-            let old = old.clone();
-            self.deferred_ref_sub_pages(&old);
-        }
         if set.is_empty() {
             self.deferred_alias_pages.0.remove(&mapping_id);
         } else {
-            self.deferred_ref_add_pages(&set);
             self.deferred_alias_pages.0.insert(mapping_id, set);
         }
     }
@@ -2780,9 +2626,7 @@ impl DeviceState {
             .keys()
             .any(|k| k.mapping_id == mapping_id);
         if !live {
-            if let Some(old) = self.deferred_alias_pages.0.remove(&mapping_id) {
-                self.deferred_ref_sub_pages(&old);
-            }
+            self.deferred_alias_pages.0.remove(&mapping_id);
         }
     }
 
@@ -2823,9 +2667,7 @@ impl DeviceState {
     pub fn condemn_surface_backing(&mut self, mapping_id: u32) -> bool {
         self.forget_compositor_mapping(mapping_id);
         self.host_surfaces.remove(&mapping_id);
-        if let Some(old) = self.deferred_alias_pages.0.remove(&mapping_id) {
-            self.deferred_ref_sub_pages(&old);
-        }
+        self.deferred_alias_pages.0.remove(&mapping_id);
         let Some(e) = self.mappings.get_mut(&mapping_id) else {
             return false;
         };

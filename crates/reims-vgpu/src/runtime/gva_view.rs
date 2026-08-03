@@ -108,13 +108,6 @@ pub fn retire_gva_views_overlapping(
             i += 1;
         }
     }
-    // The flush no-intersection memo is keyed by the same (task, gva, span) and
-    // caches a PT-dependent walk result — drop entries whose gva range this
-    // remap invalidates (else a bind could skip the flush after its pages moved
-    // under a live deferred window). The 1-in-64 sampled walk is only a backstop.
-    state
-        .flush_nohit_memo
-        .retain(|&(t, g, s), _| !(task_matches(t, task_id) && ranges_overlap(g, s, gva, length)));
     // The GVA-keyed encode cache survives this deliberately — a mapping that
     // churns and comes back must not black out the wallpaper — and its entries
     // used to be marked "suspect" here so the next reader would re-walk and

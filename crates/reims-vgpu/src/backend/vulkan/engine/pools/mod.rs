@@ -331,8 +331,10 @@ struct CmdSlot {
 /// the draw path blocked in `begin_entry` ~61 µs/draw on slot N+1's fence — the
 /// CPU outran the 3-deep GPU pipeline under Safari fast-scroll. Deepening the ring
 /// lets the CPU stay ahead so the GPU stays fed: verified `retire_wait` 61 → 17
-/// µs/draw, `present_hz` ~40 → ~50, correctness clean (residue byte-flat,
-/// zc_flush_stale = rmemo_stale = mid_sw = 0). It was submit/fence-bubble-bound,
+/// µs/draw, `present_hz` ~40 → ~50, correctness clean (residue byte-flat, and
+/// every staleness counter of the day reading zero — those three counters have
+/// since been removed with the caches they measured, so do not go looking for
+/// them). It was submit/fence-bubble-bound,
 /// not GPU-compute-bound. Cost is 8 command buffers + fences + up to 8 slots'
 /// pooled staging live at once — bounded, pooled. `retire_wait` still ~17 µs, so
 /// a deeper ring or render-pass batching (only ~37 % of draws join a shared pass)
