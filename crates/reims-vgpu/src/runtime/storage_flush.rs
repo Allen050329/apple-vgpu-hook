@@ -1749,13 +1749,33 @@ pub fn flush_linear_one<M: HostMemory + HostOps>(
                 return false;
             }
         };
-    crate::runtime::surface_cache::materialize_linear_resident(
+    // The `skip_drift` arm below refuses the guest write and calls that
+    // lossless, on the grounds that the cache entry holds the frame. That is
+    // true only if this call landed it, so a failure here has to reach the log:
+    // otherwise the two together drop a frame with no record, which is the
+    // whole loss this rail exists to avoid. `Superseded` is the exception —
+    // a newer defer already owns the entry, so there is no frame to keep.
+    let cached = crate::runtime::surface_cache::materialize_linear_resident(
         state,
         task_id,
         texture_ref,
         generation,
         &bytes,
     );
+    if let Err(decline) = &cached {
+        if !matches!(
+            decline,
+            crate::runtime::surface_cache::LinearMaterializeDecline::Superseded { .. }
+        ) {
+            crate::observe::Emit::decline("linear_materialize_lost", decline)
+                .field("task", task_id)
+                .field("ref", texture_ref)
+                .field("geom", format!("{}x{}", key.width, key.height))
+                .field("fmt", format!("{:#x}", key.pixel_format))
+                .field("gen", generation)
+                .fail();
+        }
+    }
     let tight = (key.width as usize).saturating_mul(texel as usize);
 
     // Same hazard, same answer as the GVA rail: this window was armed against a
@@ -1763,9 +1783,10 @@ pub fn flush_linear_one<M: HostMemory + HostOps>(
     // guest has since re-pointed sends a compute-storage image into whatever
     // owns those pages now. Observed on this rail as guest heap corruption — a
     // `pmap_page_protect` kernel panic and userspace SIGSEGVs inside libmalloc's
-    // own page bookkeeping. The cache entry keeps the authoritative bytes
-    // (`materialize_linear_resident` ran above), so refusing loses nothing
-    // renderable.
+    // own page bookkeeping. Refusing is lossless *when* the cache entry kept
+    // the authoritative bytes, which is exactly `cached.is_ok()` — the refusal
+    // and the store are one claim, so the emit above is what makes the pair
+    // honest rather than the comment that used to state it unconditionally.
     let still_ours = match &armed_pages {
         // `span_end` is a length (`row_stride * height`) for a linear key, not
         // an end address — and the arm site walks `(surface_offset, span_end)`
