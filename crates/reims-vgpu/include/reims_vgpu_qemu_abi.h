@@ -334,12 +334,11 @@ int reims_vgpu_qemu_scanout_copy(uint64_t handle, uint32_t mapping_id, uint8_t *
  * 0x1228 stride), contract path for boot.efi / kernel console after it leaves
  * BAR1 linear GOP (serial: "console relocated to 0x…").
  *
- * REIMS_VGPU_QEMU_OK: out_gpa and out_stride filled; copy into dst succeeds.
+ * REIMS_VGPU_QEMU_OK: copy into dst succeeds.
  * REIMS_VGPU_QEMU_EMPTY: efi_fb_start == 0 — C should fall back to BAR1 GOP RAM.
  */
 int reims_vgpu_qemu_efi_console_copy(uint64_t handle, uint8_t *dst, uint32_t dst_stride,
-                              uint32_t width, uint32_t height, uint64_t *out_gpa,
-                              uint32_t *out_stride);
+                              uint32_t width, uint32_t height);
 
 typedef struct ReimsVgpuCursorGlyphInfo {
     uint32_t width;

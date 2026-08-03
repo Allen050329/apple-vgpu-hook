@@ -4264,16 +4264,6 @@ fn load_sampled_rgba_static<M: HostMemory + HostOps>(
     load_linear_texture_rgba_host(state, host, task_id, tex_ref, level, fmt_override)
 }
 
-/// Byte-exact revalidated memo for the type-11 mapping-backed guest-page sampled
-/// path. Same contract as [`load_linear_guest_memoized`] / the type-5 view memo:
-/// re-read the native BGRA rect every bind (a guest CPU write is always
-/// observed — neither `map_generation` nor `content_generation` tracks in-place
-/// guest writes), memcmp against the memo, and on an unchanged hit return the
-/// cached RGBA `Arc` + a namespaced content identity so BOTH the CPU convert/
-/// alloc AND the engine's content hash + GPU upload are skipped. A dock-
-/// magnification burst re-binds the same static icons ~1000×, so this collapses
-/// the `t11_guest` CPU copies that saturate the serial drain worker (the
-/// dock-hover whole-VM freeze). Returns `(rgba, identity)`.
 /// Size a recycled scratch buffer to `span` for a `filled`-byte rect, without
 /// re-zeroing the rect.
 ///
@@ -4294,6 +4284,16 @@ fn prepare_memo_scratch(scratch: &mut Vec<u8>, span: usize, filled: usize) {
     scratch[filled..].fill(0);
 }
 
+/// Byte-exact revalidated memo for the type-11 mapping-backed guest-page sampled
+/// path. Same contract as [`load_linear_guest_memoized`] / the type-5 view memo:
+/// re-read the native BGRA rect every bind (a guest CPU write is always
+/// observed — neither `map_generation` nor `content_generation` tracks in-place
+/// guest writes), memcmp against the memo, and on an unchanged hit return the
+/// cached RGBA `Arc` + a namespaced content identity so BOTH the CPU convert/
+/// alloc AND the engine's content hash + GPU upload are skipped. A dock-
+/// magnification burst re-binds the same static icons ~1000×, so this collapses
+/// the `t11_guest` CPU copies that saturate the serial drain worker (the
+/// dock-hover whole-VM freeze). Returns `(rgba, identity)`.
 #[cfg(feature = "backend-vulkan")]
 fn load_type11_rgba_memoized<M: HostMemory + HostOps>(
     state: &mut DeviceState,

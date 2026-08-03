@@ -520,7 +520,7 @@ pub unsafe extern "C" fn reims_vgpu_qemu_present_boundary_seen(
 /// REIMS_VGPU_QEMU_OK when efi_fb_start is programmed and GPA read succeeds.
 /// REIMS_VGPU_QEMU_EMPTY when efi_fb_start == 0 (C falls back to BAR1 GOP RAM).
 ///
-/// SAFETY: `dst` valid for dst_stride*height; out pointers non-null when OK expected.
+/// SAFETY: `dst` valid for dst_stride*height.
 #[no_mangle]
 pub unsafe extern "C" fn reims_vgpu_qemu_efi_console_copy(
     handle: u64,
@@ -528,8 +528,6 @@ pub unsafe extern "C" fn reims_vgpu_qemu_efi_console_copy(
     dst_stride: u32,
     width: u32,
     height: u32,
-    out_gpa: *mut u64,
-    out_stride: *mut u32,
 ) -> c_int {
     unwind_safe(
         || {
@@ -541,21 +539,10 @@ pub unsafe extern "C" fn reims_vgpu_qemu_efi_console_copy(
                 return REIMS_VGPU_QEMU_ERR_ARGS;
             }
             let buf = unsafe { slice::from_raw_parts_mut(dst, len) };
-            match device_efi_console_copy(handle, buf, dst_stride, width, height) {
-                Some((gpa, stride)) => {
-                    if !out_gpa.is_null() {
-                        unsafe {
-                            *out_gpa = gpa;
-                        }
-                    }
-                    if !out_stride.is_null() {
-                        unsafe {
-                            *out_stride = stride;
-                        }
-                    }
-                    REIMS_VGPU_QEMU_OK
-                }
-                None => REIMS_VGPU_QEMU_EMPTY,
+            if device_efi_console_copy(handle, buf, dst_stride, width, height) {
+                REIMS_VGPU_QEMU_OK
+            } else {
+                REIMS_VGPU_QEMU_EMPTY
             }
         },
         REIMS_VGPU_QEMU_ERR_PANIC,

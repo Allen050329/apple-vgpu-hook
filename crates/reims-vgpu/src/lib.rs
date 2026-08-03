@@ -1324,34 +1324,29 @@ pub fn host_console_uses_bar1(frame_flush_seen: bool, early_front_latched: bool)
 
 /// Copy guest EFI console FB (programmed at 0x1210) into a host BGRA8 surface.
 ///
-/// Returns `None` if no efi_fb_start or GPA read fails — C uses BAR1 then.
+/// `false` if no efi_fb_start or GPA read fails — C uses BAR1 then.
 pub fn device_efi_console_copy(
     id: u64,
     dst: &mut [u8],
     dst_stride: u32,
     width: u32,
     height: u32,
-) -> Option<(u64, u32)> {
-    let slot = device_slot(id)?;
-    let mut d = slot.inner.try_lock()?;
-    let gpa = d.device.state.gfx.efi_fb_start;
-    if gpa == 0 {
-        return None;
+) -> bool {
+    let Some(slot) = device_slot(id) else {
+        return false;
+    };
+    let Some(mut d) = slot.inner.try_lock() else {
+        return false;
+    };
+    if d.device.state.gfx.efi_fb_start == 0 {
+        return false;
     }
-    if let Some(ops) = slot.ops {
-        let DeviceInner { device, actions } = &mut *d;
-        let host = QemuHost::new(&ops, actions, &slot.prompt_actions);
-        if runtime::scanout::paint_efi_console(&device.state, &host, dst, dst_stride, width, height)
-        {
-            let stride = if device.state.gfx.efi_fb_stride != 0 {
-                device.state.gfx.efi_fb_stride
-            } else {
-                crate::model::EFI_BOOT_WIDTH.saturating_mul(4)
-            };
-            return Some((gpa, stride));
-        }
-    }
-    None
+    let Some(ops) = slot.ops else {
+        return false;
+    };
+    let DeviceInner { device, actions } = &mut *d;
+    let host = QemuHost::new(&ops, actions, &slot.prompt_actions);
+    runtime::scanout::paint_efi_console(&device.state, &host, dst, dst_stride, width, height)
 }
 
 /// Fill a host BGRA8 framebuffer from the named guest mapping (or EFI FB).
