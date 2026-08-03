@@ -1467,6 +1467,29 @@ fn backing_matches_latched_geom(m: &MappingEntry, surf: &Type4Surface) -> bool {
         && m.format == latched_mapping_format(surf)
 }
 
+/// The order [`resolve_type4_surface_ex`] probes task object lists in: task 0,
+/// then the cached owner hint, then every other task once.
+///
+/// An iterator rather than a materialised list. The order is unchanged, but
+/// building it as a `Vec` allocated 257 elements on every call, and this runs
+/// from `ensure_surface_for_present` on every present for every resident
+/// mapping — thousands of times a boot to read element 0 and stop.
+///
+/// A hint of 0, or one outside the task id space, contributes nothing: 0 is
+/// already first, and an out-of-range id would be skipped by the liveness test
+/// at the probe anyway, so admitting it here would only cost the `!= hint`
+/// filter its meaning.
+fn type4_probe_order(hint: u32) -> impl Iterator<Item = u32> {
+    let hint = if hint != 0 && (hint as usize) < MAX_TASKS {
+        hint
+    } else {
+        0
+    };
+    std::iter::once(0)
+        .chain(Some(hint).filter(|&h| h != 0))
+        .chain((1..MAX_TASKS as u32).filter(move |&tid| tid != hint))
+}
+
 /// Take `task_id` as the owner of `surface_id` and report the search's exposure.
 fn win_type4_search<M: HostMemory>(
     state: &mut DeviceState,
@@ -1503,24 +1526,18 @@ fn resolve_type4_surface_ex<M: HostMemory>(
     // nothing on the path that matters — every successful resolve measured has
     // stopped on the first probe — and they are what makes `type4_claimants` able
     // to say a second task claims the id at all.
+    //
+    // Built as an iterator rather than a `Vec`. The order is the same one, but
+    // materialising it allocated a 257-element vector on every call, and this is
+    // called from `ensure_surface_for_present` on every present for every
+    // resident mapping — thousands of times a boot to read element 0 and stop.
     let hint = state
         .mappings
         .get(&surface_id)
         .map(|m| m.owner_task_hint)
         .unwrap_or(0);
-    let mut order: Vec<u32> = Vec::with_capacity(MAX_TASKS + 1);
-    order.push(0);
-    if hint != 0 && (hint as usize) < MAX_TASKS {
-        order.push(hint);
-    }
-    for tid in 1..MAX_TASKS as u32 {
-        if tid == hint {
-            continue;
-        }
-        order.push(tid);
-    }
 
-    for task_id in order {
+    for task_id in type4_probe_order(hint) {
         if task_id as usize >= state.tasks.len() {
             continue;
         }
@@ -2897,6 +2914,46 @@ mod tests {
         assert_eq!(device_desc_format_to_mtl(IOSURFACE_FOURCC_420F), 0);
         assert_eq!(device_desc_format_to_mtl(0x5A5A_5A5A), 0);
         assert_eq!(device_desc_format_to_mtl(0), 0);
+    }
+
+    /// The type-4 probe order must visit task 0 first, the hint next, and every
+    /// other task exactly once.
+    ///
+    /// It is the thing that makes the search terminate on the first probe for
+    /// every surface this device has ever resolved, so its shape is the whole
+    /// cost of the search. Two properties are load-bearing and neither is
+    /// obvious from the iterator chain: no task may be probed **twice** (a
+    /// duplicate is a wasted guest read on the hot present path, and with a
+    /// misbehaving hint it would be 256 of them), and no task may be **missed**
+    /// (a missed one is a surface that cannot be found at all).
+    #[test]
+    fn the_type4_probe_order_visits_task_zero_first_and_every_task_once() {
+        use std::collections::HashSet;
+
+        for hint in [0u32, 1, 7, MAX_TASKS as u32 - 1] {
+            let order: Vec<u32> = type4_probe_order(hint).collect();
+            assert_eq!(order[0], 0, "task 0 leads for hint {hint}");
+            if hint != 0 {
+                assert_eq!(order[1], hint, "the hint is probed second");
+            }
+            assert_eq!(
+                order.len(),
+                MAX_TASKS,
+                "every task exactly once, no duplicate for hint {hint}"
+            );
+            let seen: HashSet<u32> = order.iter().copied().collect();
+            assert_eq!(seen.len(), MAX_TASKS);
+            assert!((0..MAX_TASKS as u32).all(|t| seen.contains(&t)));
+        }
+
+        // A hint outside the id space must not add a probe or lose one. It
+        // cannot be found, so admitting it would cost a wasted read and — worse
+        // — leave the `!= hint` filter matching nothing real.
+        for bad in [MAX_TASKS as u32, u32::MAX] {
+            let order: Vec<u32> = type4_probe_order(bad).collect();
+            assert_eq!(order.len(), MAX_TASKS);
+            assert_eq!(order, type4_probe_order(0).collect::<Vec<_>>());
+        }
     }
 
     #[test]
