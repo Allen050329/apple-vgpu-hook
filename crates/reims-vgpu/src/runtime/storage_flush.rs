@@ -179,6 +179,7 @@ pub fn flush_intersecting_task_gva<M: HostMemory + HostOps>(
         } else if vsig == sig {
             // Deferred set unchanged since the walk — still non-intersecting.
             state.tranche.zc_flush_skip = state.tranche.zc_flush_skip.saturating_add(1);
+            crate::runtime::drain::note_store_route("zc_memo_skip");
             return;
         } else {
             // Signature changed: re-check the cached pages against the current
@@ -188,6 +189,7 @@ pub fn flush_intersecting_task_gva<M: HostMemory + HostOps>(
             if !isect {
                 state.flush_nohit_memo.insert(memo_key, (sig, pages));
                 state.tranche.zc_flush_skip = state.tranche.zc_flush_skip.saturating_add(1);
+                crate::runtime::drain::note_store_route("zc_memo_recheck");
                 return;
             }
             // A window now covers this bind — drop the entry and full-walk to
@@ -195,6 +197,11 @@ pub fn flush_intersecting_task_gva<M: HostMemory + HostOps>(
             state.flush_nohit_memo.remove(&memo_key);
         }
     }
+    // The walk the memo exists to avoid. Counting it beside the two skip routes
+    // is what makes the memo's payoff readable on a live boot: the three fields
+    // are the whole cost model, and the memo earns its ~560 lines only while
+    // `zc_memo_skip + zc_memo_recheck` dominates `zc_memo_walk`.
+    crate::runtime::drain::note_store_route("zc_memo_walk");
     let page = state.page_size();
     let n_pages = crate::runtime::gva_mem::pages_spanned(gva, span, page);
     let mut hits: Vec<u32> = Vec::new();
