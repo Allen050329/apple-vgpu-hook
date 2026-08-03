@@ -3048,12 +3048,20 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
 /// talked past. The loss this section is named for is **31 occurrences a boot**,
 /// not three hundred.
 ///
-/// **Where those 31 sit is now settled, and it is not an aliasing hazard.**
-/// `backing=Same` on every distinct span: the key still translates to the page
-/// the encode was stored over, so the guest did not hand the address on and the
-/// cache entry is not the stale one. The device rendered these spans, cached
-/// them, and the guest's own pages read zero anyway — a coherence loss on the
-/// GVA writeback rail, upstream of this rung.
+/// **Where those 31 sit is not an aliasing hazard.** `backing=Same` on every
+/// distinct span: the key still translates to the page the encode was stored
+/// over, so the guest did not hand the address on and the cache entry is not the
+/// stale one.
+///
+/// **They are not all loss, and the count that said they were could not tell.**
+/// The reading above concluded "the device rendered these spans, cached them,
+/// and the guest's own pages read zero anyway", but the test behind it asked
+/// only whether the cache *held* the span, never whether it held any pixels. A
+/// span the device cleared and cached blank gives a blank guest read off blank
+/// pages with nothing lost, and `draw_partial_clear` runs in the thousands.
+/// `lin_rung_blank_host_agrees` against `lin_rung_blank_host_content` splits
+/// them: only the latter is a coherence loss on the GVA writeback rail upstream
+/// of this rung, and only it needs repairing.
 ///
 /// **What this does not license.** Serving the cache on the whole rung — making
 /// the order match [`crate::runtime::metal_draw::seed_color_load`]'s stated rule,
@@ -3076,13 +3084,19 @@ fn note_guest_rung_blank<H: HostMemory>(
     texture_ref: u32,
     span: (u64, u32, u32),
     rgba: &[u8],
+    byte_format: TexelLayout,
 ) {
     let (gva, w, h) = span;
     crate::runtime::drain::note_store_route("lin_rung_guest_memo");
     // The denominator for the loss below: every serve off the guest's pages for
     // a span the cache also holds, whatever came back. Taken before the blank
     // test so the blank ones are a subset of a population, not a bare count.
-    let host_entry = crate::runtime::surface_cache::has_gva(state, gva, w, h);
+    //
+    // The bytes, not just the presence: a blank guest read only means pixels
+    // were lost if the cache holds pixels to lose. `has_gva` cannot tell the two
+    // apart, so it counted "we cached a blank frame" as loss.
+    let host_bytes = crate::runtime::surface_cache::get_gva(state, gva, w, h);
+    let host_entry = host_bytes.is_some();
     if host_entry {
         crate::runtime::drain::note_store_route("lin_rung_host_entry");
     }
@@ -3103,10 +3117,20 @@ fn note_guest_rung_blank<H: HostMemory>(
             "lin_rung_guest_blank task={task_id} ref={texture_ref} gva={gva:#x} {w}x{h}"
         ));
     }
-    if !host_entry {
+    let Some(host_bytes) = host_bytes else {
         return;
-    }
+    };
     crate::runtime::drain::note_store_route("lin_rung_blank_with_host_entry");
+    // Which of the two cases this span is. A cache entry that is itself all
+    // zeroes agrees with the guest's pages, so nothing was lost and there is
+    // nothing upstream to repair; only a cache entry holding content while the
+    // guest alias reads zero is a coherence loss.
+    let host_blank = host_bytes.iter().all(|&b| b == 0);
+    crate::runtime::drain::note_store_route(if host_blank {
+        "lin_rung_blank_host_agrees"
+    } else {
+        "lin_rung_blank_host_content"
+    });
     if crate::observe::first_sight(
         "lin_rung_blank_with_host_entry",
         gva ^ ((w as u64) << 32) ^ h as u64,
@@ -3116,11 +3140,14 @@ fn note_guest_rung_blank<H: HostMemory>(
         let backing = crate::runtime::surface_cache::gva_backing_state(state, host, gva);
         crate::observe::fail(format!(
             "lin_rung_blank_with_host_entry task={task_id} ref={texture_ref} \
-             gva={gva:#x} {w}x{h} bytes={} backing={backing:?} (guest alias is zero and \
-             the host cache has this span; backing=Same means the cache entry is still \
-             over these pages, Moved/Unmapped means the address was handed on and the \
-             cache entry is the stale one)",
-            rgba.len()
+             gva={gva:#x} {w}x{h} bytes={} fmt={byte_format:?} host_blank={} \
+             backing={backing:?} (guest alias is zero and the host cache has this span; \
+             host_blank=true means the cache agrees and nothing was lost, false means \
+             the cache holds content this read did not return; backing=Same means the \
+             cache entry is still over these pages, Moved/Unmapped means the address \
+             was handed on and the cache entry is the stale one)",
+            rgba.len(),
+            u8::from(host_blank)
         ));
     }
 }
@@ -3179,7 +3206,15 @@ pub(super) fn load_linear_from_host_caches<M: HostMemory + HostOps>(
     if let Some((rgba, identity, byte_format)) =
         load_linear_guest_memoized(state, host, task_id, tex, gva, w, h)
     {
-        note_guest_rung_blank(state, host, task_id, texture_ref, (gva, w, h), &rgba);
+        note_guest_rung_blank(
+            state,
+            host,
+            task_id,
+            texture_ref,
+            (gva, w, h),
+            &rgba,
+            byte_format,
+        );
         return Some((w, h, rgba, identity, byte_format));
     }
     // There is deliberately no second guest rung under the memo. One used to
@@ -6951,7 +6986,15 @@ mod vulkan_split_tests {
         // Content came back: the cache holds the span, so this is one more
         // fall-through to guest pages over a cached span, and no loss.
         let content = vec![1u8; (w * h * 4) as usize];
-        note_guest_rung_blank(&state, &host, 1, 9, (gva, w, h), &content);
+        note_guest_rung_blank(
+            &state,
+            &host,
+            1,
+            9,
+            (gva, w, h),
+            &content,
+            TexelLayout::Rgba8,
+        );
         assert_eq!(
             store_route_count("lin_rung_host_entry"),
             entries + 1,
@@ -6966,7 +7009,7 @@ mod vulkan_split_tests {
         // All zeroes over the same cached span: the loss, and still a member of
         // the population it is a subset of.
         let blank = vec![0u8; (w * h * 4) as usize];
-        note_guest_rung_blank(&state, &host, 1, 9, (gva, w, h), &blank);
+        note_guest_rung_blank(&state, &host, 1, 9, (gva, w, h), &blank, TexelLayout::Rgba8);
         assert_eq!(store_route_count("lin_rung_host_entry"), entries + 2);
         assert_eq!(
             store_route_count("lin_rung_blank_with_host_entry"),
@@ -6975,11 +7018,111 @@ mod vulkan_split_tests {
 
         // No cache entry for the span: a blank serve here is the other class
         // ("we do not have the pixels at all") and must reach neither counter.
-        note_guest_rung_blank(&state, &host, 1, 9, (gva + 0x10_0000, w, h), &blank);
+        note_guest_rung_blank(
+            &state,
+            &host,
+            1,
+            9,
+            (gva + 0x10_0000, w, h),
+            &blank,
+            TexelLayout::Rgba8,
+        );
         assert_eq!(store_route_count("lin_rung_host_entry"), entries + 2);
         assert_eq!(
             store_route_count("lin_rung_blank_with_host_entry"),
             blanks + 1
+        );
+    }
+
+    /// A blank guest read is only a loss if the cache holds pixels to lose.
+    ///
+    /// `lin_rung_blank_with_host_entry` tested that the cache *held* the span
+    /// and reported every hit as a coherence loss. It could not distinguish a
+    /// span the device cleared and cached blank — where the guest's pages
+    /// agreeing with a blank cache is both rails telling the truth — from one
+    /// where the cache holds content the guest alias failed to return. Only the
+    /// second is a defect, so the two must land in different counters while both
+    /// stay inside the population counter above.
+    #[test]
+    fn a_blank_serve_is_split_by_whether_the_cached_entry_holds_pixels() {
+        use crate::runtime::drain::store_route_count;
+        let mut state = DeviceState::new(DeviceId(0), PAGE_SHIFT_X86);
+        let host = FakeHost::new();
+        let (w, h) = (4u32, 4u32);
+        let blank = vec![0u8; (w * h * 4) as usize];
+
+        // A span the device cached with content, read back blank: the loss.
+        let content_gva = 0x50_0000u64;
+        crate::runtime::surface_cache::store_gva_owned(
+            &mut state,
+            content_gva,
+            w,
+            h,
+            vec![0x7f; (w * h * 4) as usize],
+            0,
+            None,
+        );
+        // A span the device cached blank, read back blank: the two rails agree.
+        let blank_gva = 0x60_0000u64;
+        crate::runtime::surface_cache::store_gva_owned(
+            &mut state,
+            blank_gva,
+            w,
+            h,
+            vec![0u8; (w * h * 4) as usize],
+            0,
+            None,
+        );
+
+        let agrees = store_route_count("lin_rung_blank_host_agrees");
+        let lost = store_route_count("lin_rung_blank_host_content");
+        let population = store_route_count("lin_rung_blank_with_host_entry");
+
+        note_guest_rung_blank(
+            &state,
+            &host,
+            1,
+            9,
+            (content_gva, w, h),
+            &blank,
+            TexelLayout::Rgba8,
+        );
+        assert_eq!(
+            store_route_count("lin_rung_blank_host_content"),
+            lost + 1,
+            "the cache holds pixels this read did not return: a real loss"
+        );
+        assert_eq!(
+            store_route_count("lin_rung_blank_host_agrees"),
+            agrees,
+            "a content-bearing cache entry is not agreement"
+        );
+
+        note_guest_rung_blank(
+            &state,
+            &host,
+            1,
+            9,
+            (blank_gva, w, h),
+            &blank,
+            TexelLayout::Rgba8,
+        );
+        assert_eq!(
+            store_route_count("lin_rung_blank_host_agrees"),
+            agrees + 1,
+            "a blank cache entry over blank guest pages loses nothing"
+        );
+        assert_eq!(
+            store_route_count("lin_rung_blank_host_content"),
+            lost + 1,
+            "agreement must not be counted as loss"
+        );
+
+        // Both remain members of the population they subset.
+        assert_eq!(
+            store_route_count("lin_rung_blank_with_host_entry"),
+            population + 2,
+            "the split partitions the population rather than replacing it"
         );
     }
 
