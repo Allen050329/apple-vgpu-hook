@@ -1,0 +1,113 @@
+# runtime-dead
+
+Which reims-vgpu functions compile, link, are reachable, and the guest protocol
+still never takes.
+
+`scripts/dead-state` answers a different question — what nothing *references* —
+and its intersection report has been empty for a while. AGENTS.md names the
+remaining lever as runtime-dead code, and says `/tmp/reims-vgpu-fail.log` was the
+only ground truth for it. The log is a poor instrument for this: every decoder in
+`decode/` is silent on success, so absence of a line proves nothing, and the only
+usable never-fired signal was the 85-name `store_routes` counter set. That set
+has been audited to exhaustion.
+
+This measures the whole crate instead, at function granularity, from one boot.
+
+## Running it
+
+```sh
+scripts/runtime-dead/runtime-dead.sh              # ~10 min
+scripts/runtime-dead/runtime-dead.sh --seconds 40 --app Safari
+```
+
+Needs `llvm-profdata`, `llvm-cov`, and a `libclang_rt.profile-x86_64.a` whose
+LLVM major matches `rustc --version --verbose`. Outputs land in
+`/tmp/reims-vgpu-runtime-dead/`:
+
+| file | what |
+|---|---|
+| `by-file.txt` | per-file region/function/line coverage |
+| `never-ran.txt` | every function whose counter stayed at zero, tab-separated `path<TAB>mangled` |
+| `drive.log` | the drag probe's verdict, so you can see the boot was actually driven |
+
+## How it works, and the three things that bite
+
+**The profile runtime is linked by hand.** Building the staticlib with
+`-C instrument-coverage` gets you `__llvm_prf_*` sections and nothing that writes
+them: rustc bundles `profiler_builtins` into a *final artifact*, and this
+staticlib is not one — QEMU links it. So `hw/display/meson.build` names
+compiler-rt's `libclang_rt.profile-x86_64.a` when `REIMS_VGPU_COVERAGE` is set,
+`--whole-archive` because no instrumented object references it and the linker
+drops every member otherwise.
+
+**`RUSTFLAGS` must be scoped to the host triple.** A bare `RUSTFLAGS` also
+reaches the `x86_64-unknown-uefi` option ROM, which has no `profiler_builtins`
+for its target; the ROM build fails and the boot never starts. Use
+`CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS`.
+
+**QEMU has to exit, not be killed.** The counters are written by an atexit hook,
+so SIGKILL loses the run. The script sends SIGTERM and waits. Continuous mode
+(`LLVM_PROFILE_FILE=...%c...`) would survive a kill but needs runtime counter
+relocation, which this toolchain does not build — it silently produces a 0-byte
+file, which is how you will notice.
+
+Also note the boot script re-runs `qemu-build` itself, so the instrumentation
+env has to be exported for the *boot*, not just for a build beforehand.
+Otherwise the boot quietly relinks a clean QEMU over your instrumented one.
+
+## Reading it: a zero is a question, not a verdict
+
+This is the part that matters. The measurement is cheap and the conclusion is
+not. Every reduction sweep in this repo that went looking for "code nothing
+runs" came back with contract fidelity, and this instrument finds *more* of that
+class, not less.
+
+`runtime/icb/mod.rs` reads 0.00% — all 22 functions. That is the correct
+reading, and `runtime/icb/` is explicitly not a deletion; `runtime/exec.rs`
+prices it and AGENTS.md records five boots behind that call. The instrument
+agreeing with a conclusion already reached the expensive way is the reason to
+trust it, not a reason to act on it.
+
+Legitimate reasons a function reads zero:
+
+1. **It is a decline, and nothing failed.** `backend/vulkan/engine/draw_preparation.rs`
+   is 0% across all 9 functions because no draw ever failed preparation. A
+   never-firing decline is the healthy state; deleting it is deleting the alarm.
+2. **It is a real Apple opcode this workload does not issue.** An audit of all 85
+   `store_routes` names found 39 that never fire and none reducible. Deleting a
+   decoded-but-untaken arm loses guest work silently the first time a guest takes
+   it.
+3. **The workload was one 25-second Safari drag.** Window compositing is not
+   resize, is not video, is not a mode change, is not sleep/wake, is not a second
+   display. Cold here means "this run did not ask", full stop.
+4. **It is an error or allocation-failure path.**
+5. **It belongs to the other pathway.** This run is x86 / 12-bit page shift /
+   Vulkan. `backend-metal` is cfg'd out of the build entirely, so it does not
+   appear at all — but page-geometry and attach-specific paths do, and read cold.
+
+The test to apply before deleting: **name the guest action that would take this
+path.** If you can name it, the path is contract fidelity and stays. If you
+cannot, you have a candidate — and a candidate still needs the ordinary
+justification, because "I could not think of one" is not a measurement.
+
+One artifact to know about: generics and closures get one entry per
+instantiation, so a mangled name reading zero may be one monomorphization of a
+function that ran under another. Check the demangled name against
+`by-file.txt`'s per-file numbers before concluding a whole function is cold.
+
+## Baseline
+
+First run, `7a7ffec` + the console-paint verdict, x86 / Vulkan / host-window,
+driven with `--seconds 25 --app Safari` (496 draws/s median, 11 fresh, so the
+device was compositing rather than idle):
+
+```
+crates/reims-vgpu/src   2826 functions   1066 never ran   (62.3% ran)
+regions 56.77%   functions 64.78%   lines 56.42%
+```
+
+Files at 0.00% function coverage: `runtime/icb/mod.rs`, `runtime/fence_exec.rs`,
+`runtime/mipmap.rs`, `runtime/heap_query.rs`, `runtime/plan/event_sync.rs`,
+`backend/vulkan/engine/draw_preparation.rs`.
+
+None of those six were deleted on the strength of this number.

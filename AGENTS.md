@@ -171,8 +171,20 @@ already been run to exhaustion; re-running one costs hours and has so far return
   guest takes it.
 
 The remaining reduction lever is runtime-dead code — paths that compile and are reachable but that
-the protocol never takes — and `dead-state` cannot see that class. `/tmp/reims-vgpu-fail.log` is the
-only ground truth for it, and it is untracked and disappears.
+the protocol never takes — and `dead-state` cannot see that class. `scripts/runtime-dead` is the
+instrument: it builds the staticlib with `-C instrument-coverage`, boots x86, drives the guest, and
+reports every function whose counter stayed at zero. One boot, whole crate, function granularity.
+It replaces reading `/tmp/reims-vgpu-fail.log` for this, which was never good at it — every decoder
+in `decode/` is silent on success, so absence of a line proves nothing.
+
+**Its output is a map, not a kill list.** First run: 1 066 of 2 826 functions never ran on a driven
+boot. `runtime/icb/mod.rs` reads 0.00%, which is the correct reading and is already priced as *not*
+a deletion — the instrument agreeing with a conclusion reached the expensive way is why to trust it,
+not a reason to act. Six files read 0.00% and none were deleted on the strength of it. The reasons a
+zero is legitimate — a decline that healthily never fired, a real Apple opcode this workload does
+not issue, a path the one driven workload never asked for, an error path, the other pathway's
+geometry — are in `scripts/runtime-dead/README.md`, with the test to apply: **name the guest action
+that would take this path.** If you can name it, it is contract fidelity and it stays.
 
 ### Reading the fail log
 
