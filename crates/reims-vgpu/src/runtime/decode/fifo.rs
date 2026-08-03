@@ -29,6 +29,10 @@ pub const CHILD_RESOURCE_LIST_HEADER_LEN: u32 = 8;
 pub const CHILD_INVALIDATE_RECORD_LEN: u32 = 8;
 /// Per-object record on Synchronize: `{object_id u32}` only (no validity ops).
 pub const CHILD_SYNCHRONIZE_RECORD_LEN: u32 = 4;
+/// CmdReplacePhysical (`0x3c`): a fixed `{task_id, object_id}` pair, no list.
+pub const CHILD_REPLACE_PHYSICAL_TASK_ID: u32 = 0x00;
+pub const CHILD_REPLACE_PHYSICAL_OBJECT_ID: u32 = 0x04;
+pub const CHILD_REPLACE_PHYSICAL_LEN: u32 = 8;
 /// Hardcoded pageon second dword from `pageBacking` (LE bytes `01 00 00 01`).
 ///
 /// Not a free-form bitfield. PVG host `invalidateResources:` treats the four
@@ -187,6 +191,13 @@ pub struct InvalidateResourcesCommand {
     pub records: Vec<InvalidateResourceRecord>,
 }
 
+/// FIFO CmdReplacePhysical (0x3c) payload — `{task_id, object_id}`, 8 bytes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReplacePhysicalCommand {
+    pub task_id: u32,
+    pub object_id: u32,
+}
+
 /// FIFO CmdSynchronizeResources (0x35) payload (RE synchronizeForUnwire + live plen=12).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SynchronizeResourcesCommand {
@@ -301,6 +312,26 @@ pub fn decode_exec_resource_table(payload: &[u8]) -> Option<Vec<ExecResourceDesc
         off += CHILD_EXEC_INDIRECT_RESOURCE_DESC_LEN as usize;
     }
     Some(descs)
+}
+
+/// Decode CmdReplacePhysical (`0x3c`): `{task_id, object_id}`, 8 bytes.
+///
+/// The guest emits this once per attached resource at the tail of a re-commit
+/// into the GPU page table — that is, after the range was released, its pages
+/// were wired to different host frames, and the new PFNs were written back at
+/// the *same* GPU-VA. It therefore carries no address of its own: the GVA is
+/// unchanged, and only the translation behind it moved.
+///
+/// `task_id` is a plain slot id, as the other resource-list commands carry it,
+/// and not the doubled `DefineTask2` word.
+pub fn decode_replace_physical(payload: &[u8]) -> Option<ReplacePhysicalCommand> {
+    if payload.len() < CHILD_REPLACE_PHYSICAL_LEN as usize {
+        return None;
+    }
+    Some(ReplacePhysicalCommand {
+        task_id: ld32(&payload[CHILD_REPLACE_PHYSICAL_TASK_ID as usize..]),
+        object_id: ld32(&payload[CHILD_REPLACE_PHYSICAL_OBJECT_ID as usize..]),
+    })
 }
 
 /// Decode CmdSynchronizeResources: header `{task_id, count}` + `count × {object_id}`.

@@ -414,26 +414,80 @@ fn delete_task_root_clears_active_task() {
     );
 }
 
-/// CmdReplacePhysical (0x3c) is stamp-complete bookkeeping — not UnknownChildOpcode.
+/// CmdReplacePhysical (0x3c) is the guest saying a cached page list is stale.
+///
+/// It must drop that list rather than stamp and forget it. The surface id, the
+/// geometry and the GPU-VA are all unchanged across the re-commit, so a device
+/// that ignores this packet has no other way to learn the pages moved — which
+/// is what `mapping_page_drift`'s "no packet said so" was reporting.
 #[test]
-fn replace_physical_is_accepted_not_unknown() {
+fn replace_physical_drops_the_cached_page_list() {
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
+    state.map_surface(7);
+    {
+        let m = state.mappings.get_mut(&7).unwrap();
+        m.mapped = true;
+        m.page_entries = vec![0x11, 0x22, 0x33];
+    }
+    let generation_before = state.mappings.get(&7).unwrap().map_generation;
+
+    let mut payload = vec![0u8; 8];
+    payload[4..8].copy_from_slice(&7u32.to_le_bytes()); // {task 0, object 7}
     let pkt = Packet {
         opcode: CHILD_OP_REPLACE_PHYSICAL,
         stamp_count: 0,
         total_size: PACKET_HEADER_LEN + 8,
         completion_stamp: 0,
-        payload: vec![0u8; 8], // {taskID, objectID} placeholder
+        payload,
         next_head: 0,
     };
     process_child_packet(&mut state, &mut host, 2, &pkt);
+
     assert!(
         !state
             .fails
             .iter()
             .any(|e| matches!(e, FailEvent::UnknownChildOpcode { opcode: 0x3c, .. })),
         "0x3c must not flood UnknownChildOpcode"
+    );
+    let m = state.mappings.get(&7).unwrap();
+    assert!(
+        m.page_entries.is_empty(),
+        "the announced re-point must drop the stale page list"
+    );
+    assert_ne!(
+        m.map_generation, generation_before,
+        "dropping the list must bump the incarnation, which is what retires the \
+         type-4 walk latch and any state keyed on it"
+    );
+}
+
+/// A short 0x3c is a lost invalidation, not a no-op: the device would keep
+/// writing through pages the guest has re-pointed. It must be named, and it
+/// must not silently drop a list it could not identify.
+#[test]
+fn a_short_replace_physical_is_reported_and_drops_nothing() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    state.map_surface(7);
+    {
+        let m = state.mappings.get_mut(&7).unwrap();
+        m.mapped = true;
+        m.page_entries = vec![0x11];
+    }
+    let pkt = Packet {
+        opcode: CHILD_OP_REPLACE_PHYSICAL,
+        stamp_count: 0,
+        total_size: PACKET_HEADER_LEN + 4,
+        completion_stamp: 0,
+        payload: vec![0u8; 4],
+        next_head: 0,
+    };
+    process_child_packet(&mut state, &mut host, 2, &pkt);
+    assert!(
+        !state.mappings.get(&7).unwrap().page_entries.is_empty(),
+        "a packet too short to name an object must not invalidate one"
     );
 }
 

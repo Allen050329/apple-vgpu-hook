@@ -1168,6 +1168,43 @@ fn record_type4_owner(state: &mut DeviceState, surface_id: u32, task_id: u32) {
     }
 }
 
+/// Apply `CmdReplacePhysical` (`0x3c`): the guest re-pointed this resource's
+/// GPU-VA range at different physical pages.
+///
+/// The packet is the announcement, and it is the only one there is. The guest
+/// releases the range, rewires the pages, re-commits the *same* GPU-VA with the
+/// new PFNs, and then emits one of these per attached resource. Nothing else on
+/// the wire says the translation moved — GVA, surface id, geometry and length
+/// are all unchanged — so a cached GPA list not dropped here stays trusted while
+/// naming pages that now back something else.
+///
+/// Dropping the list is the whole action. It bumps `map_generation`, which is
+/// what retires the [`crate::model::Type4Walk`] latch and the resident/deferred
+/// state keyed on that incarnation, and the next resolve re-walks the page table
+/// the guest has already rewritten.
+///
+/// `object_id` is the resource's host id. A type-11 texture registers under
+/// `(task, ref)`; a type-4 surface *is* its mapping id. Both are tried, in that
+/// order, and which one answered is counted so the split stays legible.
+pub fn replace_physical(state: &mut DeviceState, task_id: u32, object_id: u32) {
+    let (mapping_id, kind) = match state.texture_to_mapping.get(&(task_id, object_id)) {
+        Some(&mid) => (mid, "type11"),
+        None => (object_id, "type4"),
+    };
+    let had = state.invalidate_mapping_pages(mapping_id);
+    crate::runtime::drain::note_store_route(if had {
+        "replace_physical_dropped"
+    } else {
+        "replace_physical_nothing_cached"
+    });
+    if had {
+        crate::observe::off(format!(
+            "replace_physical task={task_id} object={object_id} mid={mapping_id} kind={kind} \
+             (guest re-pointed the backing; cached page list dropped)"
+        ));
+    }
+}
+
 /// The task whose object list produced this surface's type-4 entries, or `None`
 /// when no task-scoped resolve has claimed it yet.
 ///

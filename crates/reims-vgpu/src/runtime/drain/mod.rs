@@ -2182,6 +2182,24 @@ fn process_child_packet<H: HostMemory + HostOps>(
         crate::runtime::decode::fifo::CHILD_OP_CONFIG_40 => {
             let _ = reply_heap_texture_size_and_align(state, host, &packet.payload);
         }
+        // The one packet that says a cached page list has gone stale. It used to
+        // sit in the stamp-and-forget family below, which is why
+        // `mapping_page_drift` could report "the guest re-pointed this surface
+        // and no packet said so" — the packet arrived and was discarded.
+        CHILD_OP_REPLACE_PHYSICAL => {
+            if !packet_short(
+                "replace_physical",
+                Some(channel_id),
+                packet.payload.len(),
+                crate::runtime::decode::fifo::CHILD_REPLACE_PHYSICAL_LEN as usize,
+            ) {
+                if let Some(cmd) =
+                    crate::runtime::decode::fifo::decode_replace_physical(&packet.payload)
+                {
+                    crate::runtime::objects::replace_physical(state, cmd.task_id, cmd.object_id);
+                }
+            }
+        }
         // PVG bookkeeping family: accept + stamp (already below). Full PT/map
         // semantics land with metal2vulkan encode; until then fail-visible
         // UnknownChildOpcode flooded /tmp/reims-vgpu-fail and hid draw telemetry.
@@ -2189,8 +2207,7 @@ fn process_child_packet<H: HostMemory + HostOps>(
         | CHILD_OP_MAP_MEMORY2
         | CHILD_OP_INVALIDATE_RESOURCES
         | CHILD_OP_SYNCHRONIZE_RESOURCES
-        | CHILD_OP_DELETE_IOSURFACE_BACKING2
-        | CHILD_OP_REPLACE_PHYSICAL => {
+        | CHILD_OP_DELETE_IOSURFACE_BACKING2 => {
             // Stamp-complete for PT wire (no invent). Unmap/Map retire
             // gva_host_views; verbose-gated map_probe census for stage Unmapped.
             //
@@ -2199,7 +2216,6 @@ fn process_child_packet<H: HostMemory + HostOps>(
             let plen = packet.payload.len();
             let name = match packet.opcode {
                 CHILD_OP_MAP_MEMORY2 => "MapMemory2",
-                CHILD_OP_REPLACE_PHYSICAL => "ReplacePhysical",
                 CHILD_OP_UNMAP_MEMORY => "UnmapMemory",
                 CHILD_OP_INVALIDATE_RESOURCES => "InvalidateResources",
                 CHILD_OP_SYNCHRONIZE_RESOURCES => "SynchronizeResources",
