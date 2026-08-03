@@ -966,6 +966,16 @@ pub fn decode_texture_descriptor(bytes: &[u8]) -> Result<TextureDescriptor, Deco
         1
     };
     if out.has_width && out.has_height {
+        // `size` is the level's *allocated* span, not the bytes a reader
+        // touches. The two differ by the padding after the final row, and the
+        // difference is load-bearing in both directions: `blit_exec` compares
+        // this field for equality against `row_stride * height * depth` to tell
+        // a single-slice allocation from an array one, so the padded form is the
+        // one that can match — while the same function charges a *read* through
+        // `TextureLevelLayout::slice_read_span`, whose doc records that using
+        // the padded form as a bound refuses allocations the guest sized
+        // correctly. Do not "fix" this to `read_span`; levels 1.. take `size`
+        // from the wire at `TEXTURE_LEVEL_SIZE` and mean the same padded span.
         let l0_size = if out.used_size != 0 {
             out.used_size as u64
         } else if out.has_row_stride && out.height > 0 {
