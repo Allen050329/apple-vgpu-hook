@@ -273,6 +273,21 @@ That produces real window-server compositing — a measured 499 draws/s at drain
 0 draws/s idle. The probe refuses a verdict if the window never moved, so a run that produced no
 motion cannot be mistaken for a slow device.
 
+### The probe's Hz verdict is upstream of the present path, not in it
+
+`seconds below 100 Hz: 23/23` reads like the host window is dropping frames. It is not. Across a
+driven boot's 36 `host_window_cadence` windows, **35 have `presents == offered` with `busy=0`**, and
+the one exception still presented all 19 frames it was offered (`busy_fence=2`). `direct_frac` is
+1.00 throughout. The window presents every frame it is handed, immediately, and stalls on
+essentially nothing.
+
+`present_hz` therefore tracks `offered_hz` exactly, and both measure what the guest and the drain
+*produced* — 17-35 fresh frames a second while the compositor ran at 496 draws/s, of which
+`draws_fresh` is 11-17 and the rest are the loop correctly declining to re-present unchanged
+content. So a slow verdict from this probe points **upstream**: drain, decode, draw. It does not
+implicate `host_window/present.rs`, `backend/vulkan/engine/window_present.rs`, or the surface-cache
+present path, and measuring those again to explain a low Hz number is measuring the wrong end.
+
 For Rust changes, run the relevant native tests serially from the repo root:
 
 ```sh
