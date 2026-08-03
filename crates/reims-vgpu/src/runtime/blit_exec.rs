@@ -749,6 +749,15 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
         else {
             return Err(br(BlitStatus::Bounds, "t5_sample_window"));
         };
+        // Whether this arm runs at all, and on which side of the plane
+        // resolution. Without it a change to the window this arm resolves cannot
+        // be attributed: an unchanged screen and an arm that never executed look
+        // identical, and so do a repaired blit and a blit that never happened.
+        crate::runtime::drain::note_store_route(if from_device {
+            "blit_t5_plane_device"
+        } else {
+            "blit_t5_plane_invent"
+        });
         if !from_device {
             mapping_write::note_type5_plane_invent(
                 sid,
