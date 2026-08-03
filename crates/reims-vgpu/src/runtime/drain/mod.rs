@@ -3199,6 +3199,20 @@ pub enum FlushRail {
 /// that volume, so the next lever is reading back less than the whole
 /// attachment, not making any one phase faster.
 ///
+/// The obvious form of that lever does not pay, and the number is recorded here
+/// so it is not re-derived. The guest already supplies a damage rect —
+/// `OP_SET_SCISSOR`, decoded verbatim into `req.scissor` — so a writeback could
+/// land only the scissored region. A 30 s driven Safari probe on the
+/// x86/PCI/Vulkan pathway bucketed every window-arming Store by the fraction of
+/// its attachment the scissor covered: **99.34% of the texels a Store arms are
+/// texels it covers**. Half the Stores carry no scissor at all and the other
+/// half carry one spanning the whole attachment; the small ones were 0.8% of the
+/// population and 0.66% of the area. The 35% of *all* draws that are scissored
+/// are the small draws *inside* a pass — an icon, a glyph run, a window's own
+/// layer — while the Store that ends a full-screen composite declares the full
+/// screen. Reading back less has to find its evidence somewhere other than the
+/// guest's scissor.
+///
 /// This paragraph used to end "[`Fence`](Self::Fence) is the GPU rendering the
 /// frame rather than latency to reschedule — that is measured, not assumed",
 /// and the measurement it pointed at does not say that. What
