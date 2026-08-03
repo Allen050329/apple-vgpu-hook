@@ -169,6 +169,15 @@ already been run to exhaustion; re-running one costs hours and has so far return
   alarm, where a firing *is* the bug (23 of them, all drift/unbounded/unwitnessed detectors). None
   were reducible. Deleting a decoded-but-untaken arm loses guest work silently the first time a
   guest takes it.
+- **The decode fidelity vein is `resource.rs`, not `decode/` generally.** Four real decoder bugs
+  landed recently — a field overridden from a command mask, a format chosen by magnitude, a value
+  read from the wrong record when the preferred one was unreachable, an unconditional `has_` flag —
+  and every one was in `decode/resource.rs`. The other six decoders (`render`, `compute`, `blit`,
+  `fifo`, `stream`, `event`, ~3 750 lines) were then audited for those same four shapes plus silent
+  drops, and came back clean: `has_*` flags are conditional on the read that sets them, draw and
+  copy forms are distinguished by exact length rather than magnitude, variable-length records
+  bounds-check before access, and every overflow path names its own `ErrBadLength` slug. Spend the
+  next fidelity hour on `resource.rs` and the descriptor formats, not on re-reading these six.
 - **The two C shims are not 2 200 duplicated lines.** `reims-vgpu-pci.c` and `reims-vgpu-mmio.c` look
   like near-copies and are read that way by every fresh sweep. What is actually shared is already in
   `reims-vgpu-shim.c`, and the rest is blocked by that header's own stated rule — bus-specific trace
