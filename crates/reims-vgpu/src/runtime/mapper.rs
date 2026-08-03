@@ -624,15 +624,21 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
         // *distinct footprints* rather than by resolve rate — a mapping
         // re-resolved every frame to the same pages logs once.
         if let Some((lo, hi)) = entry_gpa_span(&plan.entries, page_shift) {
-            let key = (u64::from(mapping_id) << 40) ^ (lo >> page_shift) ^ (hi << 20);
-            if crate::observe::first_sight("mapping_gpa_span", key) {
-                // `src=mapper` against the type-4 adoption site's `src=type4`.
-                // The field existed and only one of the two set it, so it named
-                // a distinction the log could not express: every
-                // `mapping_gpa_span` line in a boot read `src=type4`, and this
-                // emitter's silence was invisible rather than reported. The
-                // silence is the interesting part — on x86 this site has stayed
-                // quiet for whole boots while the type-4 one carried every span.
+            let key = span_first_sight_key(mapping_id, lo, hi, page_shift);
+            if crate::observe::first_sight(SPAN_SEEN_MAPPER, key) {
+                // `src=mapper` against the type-4 adoption site's `src=type4`,
+                // which says which path a surface's page list arrived through.
+                //
+                // Read that field with the latch in mind: until the two sites
+                // were given separate `first_sight` namespaces they shared one,
+                // and on identical keys, so the type-4 site claimed every
+                // footprint it reached first and this one was suppressed for
+                // that footprint permanently. Every `mapping_gpa_span` line in
+                // an x86 boot read `src=type4`, which was taken as evidence that
+                // the page list arrives at the type-4 site — but the latch could
+                // not have produced any other reading. Whether this site is
+                // genuinely quiet is now an open question again, and a driven
+                // boot is what answers it.
                 crate::observe::off(format!(
                     "mapping_gpa_span mid={mapping_id} gen={} pages={} src=mapper \
                      prev_pages={prev_pages} \
@@ -887,6 +893,37 @@ pub(crate) fn entry_gpa_span(entries: &[u32], page_shift: u32) -> Option<(u64, u
         }
     }
     (lo != u64::MAX).then_some((lo, hi))
+}
+
+/// `first_sight` namespace for the mapper's own adoption span line.
+///
+/// Separate from [`SPAN_SEEN_TYPE4`] on purpose, and the separation is the
+/// point. Both emitters print `mapping_gpa_span`, both dedup on
+/// [`span_first_sight_key`], and the key is built from the same three values at
+/// both — mapping id, span low, span high. Sharing one namespace therefore made
+/// them share one latch: whichever site reached a given footprint first claimed
+/// it, and the other could never report that footprint at all.
+///
+/// That is not a harmless overlap, because the two lines are read against each
+/// other. `src=` exists to say which adoption path a surface's page list
+/// arrived through, and the type-4 site wins the race in practice, so the
+/// mapper's silence was manufactured by the latch rather than observed. Two
+/// namespaces make each site's silence its own evidence.
+pub(crate) const SPAN_SEEN_MAPPER: &str = "mapping_gpa_span_mapper";
+
+/// `first_sight` namespace for the type-4 adoption span line. See
+/// [`SPAN_SEEN_MAPPER`] for why the two are not one.
+pub(crate) const SPAN_SEEN_TYPE4: &str = "mapping_gpa_span_type4";
+
+/// Dedup discriminant for a `mapping_gpa_span` line: the footprint identity.
+///
+/// Keyed on the span rather than on the resolve, so a mapping re-resolved every
+/// frame to the same pages logs once while a mapping that moves logs again.
+/// Shared by both emitters so the two cannot drift apart on what counts as the
+/// same footprint — they are compared against each other, which only means
+/// anything if they agree on the identity.
+pub(crate) fn span_first_sight_key(mapping_id: u32, lo: u64, hi: u64, page_shift: u32) -> u64 {
+    (u64::from(mapping_id) << 40) ^ (lo >> page_shift) ^ (hi << 20)
 }
 
 /// Incarnation decision when adopting a freshly resolved page plan into a
@@ -3640,15 +3677,27 @@ mod tests {
         assert!(!seen(9, "mapper_capture_request_type_mismatch"));
     }
 
-    #[test]
-    fn resolve_builds_page_entries() {
+    /// A mapping id 3 whose internal object resolves to exactly one valid page,
+    /// attached and ready for `resolve_mapping_backing`.
+    ///
+    /// Shared by the two span tests so they build the footprint the same way.
+    ///
+    /// `pfn` is a parameter rather than a constant because the emitters dedup
+    /// through `observe::first_sight`, whose latch is process-global and so is
+    /// shared by every test in the binary. Two tests resolving the same page
+    /// would compute the same [`span_first_sight_key`], and whichever ran first
+    /// would silence the other's line — the very coupling these tests exist to
+    /// check, reappearing between the tests themselves. Distinct PFNs keep each
+    /// test's latch its own whatever the run order.
+    ///
+    /// Returns `(state, host, page_gpa)`.
+    fn span_fixture(pfn: u32) -> (DeviceState, FakeHost, u64) {
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         let mut host = FakeHost::new();
         let internal = KVA;
         let mapper = KVA + 0x1000;
         let page_obj = KVA + 0x2000;
         let table = KVA + 0x3000;
-        let pfn = 0x1e88c_u32;
         let page_gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
 
         put_u64(&mut host, internal + MAPPING_INTERNAL_BACKPTR, mapper);
@@ -3686,6 +3735,14 @@ mod tests {
 
         state.mapper_device_kva = mapper;
         assert!(state.attach_mapping_internal(3, internal));
+        (state, host, page_gpa)
+    }
+
+    #[test]
+    fn resolve_builds_page_entries() {
+        let pfn = 0x1e88c_u32;
+        let (mut state, host, _page_gpa) = span_fixture(pfn);
+        let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
         // The adopted page list is what bounds every mapping-rail guest write,
         // so a successful resolve must report its guest-physical footprint. An
         // earlier cut of `mapping_gpa_span` keyed on `pages_changed` and was
@@ -3704,6 +3761,51 @@ mod tests {
         );
         // The page number is what a guest panic prints (`pmap_page_protect()
         // ... pn=0x...`), so it has to be readable without arithmetic.
+        assert!(
+            span.contains(&format!("pn_lo={pfn:#x}")),
+            "span must name the adopted PFN as a page number, got {span:?}"
+        );
+    }
+
+    /// The type-4 adoption site must not be able to silence this one.
+    ///
+    /// Both emitters print `mapping_gpa_span` and both dedup on
+    /// [`span_first_sight_key`], which is built from the mapping id and the span
+    /// alone — so for any footprint both sites reach, they compute the *same*
+    /// key. While they also shared one `first_sight` namespace, whichever
+    /// arrived first claimed that footprint and the other went permanently
+    /// quiet for it. The type-4 site wins in practice, so `src=type4` on every
+    /// line in a boot was a property of the latch, not a finding about where
+    /// page lists arrive.
+    ///
+    /// This claims the footprint under the type-4 namespace first and then
+    /// requires the mapper's line anyway. With one shared namespace the claim
+    /// below swallows it and `cap.one("OFF")` finds nothing to return.
+    #[test]
+    fn the_type4_span_latch_does_not_suppress_the_mapper_span() {
+        // A PFN of this test's own, so the sibling span test's latch — claimed
+        // under the same namespace on whichever of the two runs first — cannot
+        // decide this one.
+        let pfn = 0x2c4d1_u32;
+        let (mut state, host, page_gpa) = span_fixture(pfn);
+
+        // The fixture's single page is both ends of the span. Same discriminant
+        // the emitter will compute, taken from the shared helper so this cannot
+        // drift from the site it is guarding.
+        let key = span_first_sight_key(3, page_gpa, page_gpa, state.page_shift);
+        assert!(
+            crate::observe::first_sight(SPAN_SEEN_TYPE4, key),
+            "the type-4 latch must be unclaimed at the start of this test"
+        );
+
+        let cap = crate::observe::sink::FailCapture::start();
+        assert!(resolve_mapping_backing(&mut state, &host, 3));
+        let span = cap.one("OFF");
+        assert!(
+            span.contains("mapping_gpa_span mid=3") && span.contains("src=mapper"),
+            "the mapper's own adoption must report its footprint even after the \
+             type-4 site has claimed the same one, got {span:?}"
+        );
         assert!(
             span.contains(&format!("pn_lo={pfn:#x}")),
             "span must name the adopted PFN as a page number, got {span:?}"

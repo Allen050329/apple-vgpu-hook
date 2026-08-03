@@ -973,10 +973,16 @@ fn apply_type4_backing<M: HostMemory>(
             // had just called the SAME incarnation.
         }
         // The guest-physical footprint this incarnation authorises us to write.
-        // See `mapper::entry_gpa_span`; this is the type-4 adoption site and, on
-        // a live x86 boot, the one that actually runs — the mapper's own
-        // adoption stayed silent for whole boots while surfaces plainly had
-        // 2040 pages each, because the page list arrives here.
+        // See `mapper::entry_gpa_span`; this is the type-4 adoption site, and it
+        // is the one that carried every span in the x86 log.
+        //
+        // That reading used to be stated as "the page list arrives here, the
+        // mapper's own adoption stays silent". It could not have come out any
+        // other way: both sites deduped through one `first_sight` namespace on
+        // the same key, so this site claimed each footprint it reached first and
+        // silenced its peer for that footprint. The namespaces are now
+        // `mapper::SPAN_SEEN_TYPE4` and `SPAN_SEEN_MAPPER`, so each site's
+        // silence is its own.
         //
         // No `changed=` field, though `changed` is in scope and the mapper's
         // peer emitter prints its own. Here it could only ever be 1: the dedup
@@ -987,8 +993,9 @@ fn apply_type4_backing<M: HostMemory>(
         // `changed` true. The mapper's copy is not in that position — its
         // reprieve path can repopulate an emptied entry list with no change.
         if let Some((lo, hi)) = crate::runtime::mapper::entry_gpa_span(&entries, state_page_shift) {
-            let key = (u64::from(surface_id) << 40) ^ (lo >> state_page_shift) ^ (hi << 20);
-            if crate::observe::first_sight("mapping_gpa_span", key) {
+            let key =
+                crate::runtime::mapper::span_first_sight_key(surface_id, lo, hi, state_page_shift);
+            if crate::observe::first_sight(crate::runtime::mapper::SPAN_SEEN_TYPE4, key) {
                 crate::observe::off(format!(
                     "mapping_gpa_span mid={surface_id} gen={} pages={} src=type4 \
                      lo={lo:#x} hi={:#x} pn_lo={:#x} pn_hi={:#x}",
