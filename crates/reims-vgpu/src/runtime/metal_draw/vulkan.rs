@@ -3009,6 +3009,49 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
 /// against `lin_rung_blank_with_host_entry` gives the class a denominator it has
 /// never had — how often this rung falls through to guest pages for a span the
 /// cache holds, blank or not.
+///
+/// ## Both instruments have now been read, and the class is much smaller than
+/// this section assumed
+///
+/// One driven x86/Vulkan boot — 40 s Safari window drag plus the web-content
+/// probe's 20 captures, all 11 declared regions measuring their colour — summed
+/// over its `store_routes` windows:
+///
+/// ```text
+/// lin_rung_guest_memo             85669   sampled serves off the guest's pages
+/// lin_rung_host_entry             20164   …of which the cache also held the span (23.5 %)
+/// lin_rung_guest_blank             1919   …that came back all zeroes (2.2 %)
+/// lin_rung_blank_with_host_entry     31   …of those, with a host entry (1.6 % of blanks)
+///
+/// 13 distinct fail lines, backing=Same on every one
+/// ```
+///
+/// Two corrections to everything above.
+///
+/// **The dominant blank class is still "we do not have the pixels at all".**
+/// 98.4 % of blank samples have no cache entry for the span, which is what the
+/// older 3 379-against-0 reading said and what the "300 a boot" paragraph then
+/// talked past. The loss this section is named for is **31 occurrences a boot**,
+/// not three hundred.
+///
+/// **Where those 31 sit is now settled, and it is not an aliasing hazard.**
+/// `backing=Same` on every distinct span: the key still translates to the page
+/// the encode was stored over, so the guest did not hand the address on and the
+/// cache entry is not the stale one. The device rendered these spans, cached
+/// them, and the guest's own pages read zero anyway — a coherence loss on the
+/// GVA writeback rail, upstream of this rung.
+///
+/// **What this does not license.** Serving the cache on the whole rung — making
+/// the order match [`crate::runtime::metal_draw::seed_color_load`]'s stated rule,
+/// "exact target GVA is the strongest identity … Guest memory is last" — would
+/// change 20 164 serves to repair 31, and the two rails are not the same case:
+/// the seed's entry is for an attachment the pass is about to draw *onto*, while
+/// a sampled span may be guest-CPU-produced between the encode and the sample
+/// with nothing here able to witness it. Serving the cache only when the sample
+/// came back blank is not available either — that is selecting on content, which
+/// this project does not do. So the 31 stay reported and unrepaired, and the
+/// place to repair them is whatever leaves a `backing=Same` span reading zero.
+///
 /// `span` is `(gva, width, height)` — the GVA cache's key, taken as one value
 /// because every lookup below needs all three and none of them means anything
 /// apart.
