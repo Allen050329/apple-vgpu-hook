@@ -3313,6 +3313,80 @@ pub fn encode_icb_execute_and_writeback<M: HostMemory + HostOps>(
     EncodeStatus::NoMetal("icb_exec_no_metal_build")
 }
 
+/// The colour render target's base format, counting the case where the mapping
+/// has none.
+///
+/// `m.format == 0` is not "unset", it is a decoded refusal:
+/// [`objects::apply_type4_backing`] stores 0 for a multi-plane surface and for a
+/// single-plane one whose FourCC it does not know, and says why — "stage/paint
+/// must not invent BGRA". [`objects::iosurface_pixel_format_to_mtl`] repeats it
+/// twice more, and the compute staging path honours it, declining with typed
+/// `multiplane` / `fmt_unknown` reasons.
+///
+/// This resolve does invent BGRA8, on both of its arms. That is the divergence,
+/// and it is not repaired here because refusing instead would drop a colour
+/// attachment — a whole compositing layer going black — on a class nothing has
+/// yet counted. `rt_base_fmt_invent` is that count. While it reads zero the
+/// invent is unreachable and can go; a non-zero reading is a surface the compute
+/// path refuses and this one renders into as BGRA8, and *then* the two arms have
+/// to be made to agree deliberately rather than by deletion.
+fn rt_base_format(format: u16, mapping_id: u32, site: &str) -> u16 {
+    if format != 0 {
+        return format;
+    }
+    crate::runtime::drain::note_store_route("rt_base_fmt_invent");
+    if crate::observe::first_sight("rt_base_fmt_invent", mapping_id as u64) {
+        crate::observe::fail(format!(
+            "rt_base_fmt_invent site={site} mapping={mapping_id} \
+             (the mapping's format is the decoder's multi-plane / unknown-FourCC \
+             refusal and this resolve renders into it as BGRA8 anyway)"
+        ));
+    }
+    MTL_FORMAT_BGRA8_UNORM
+}
+
+/// Report a type-5 colour attachment whose view record disagrees with the base
+/// mapping it is resolved through.
+///
+/// This resolve reads only `surfaceID@0` out of a type-5 descriptor and takes
+/// geometry and format from the mapping. [`objects::decode_type5_texture_view`]'s
+/// own contract forbids that — "callers must not replace it with base mapping
+/// geometry merely because the surface itself is otherwise stageable" — and the
+/// live case it names is real: the BGRA8 desktop target is also exposed as a
+/// row-byte-equivalent quarter-width RGBA32Uint view. Every other type-5
+/// consumer binds the view's own geometry.
+///
+/// It is harmless exactly while view == base, so the question is how often that
+/// holds for a *render target* specifically, which nothing has measured.
+/// `rt_type5_view_differs` against `rt_type5_view_same` answers it. Reported
+/// rather than repaired: taking the view's geometry here changes what every
+/// type-5 colour attachment renders into, and that is not a change to make on an
+/// unmeasured population.
+fn note_rt_type5_view(
+    view: Option<objects::Type5TextureView>,
+    surface_id: u32,
+    base: (u32, u32, u16),
+) {
+    let Some(view) = view else {
+        crate::runtime::drain::note_store_route("rt_type5_view_undecoded");
+        return;
+    };
+    let (base_w, base_h, base_fmt) = base;
+    if view.width == base_w && view.height == base_h && view.pixel_format == base_fmt {
+        crate::runtime::drain::note_store_route("rt_type5_view_same");
+        return;
+    }
+    crate::runtime::drain::note_store_route("rt_type5_view_differs");
+    if crate::observe::first_sight("rt_type5_view_differs", surface_id as u64) {
+        crate::observe::fail(format!(
+            "rt_type5_view_differs sid={surface_id} view={}x{} fmt={:#x} plane={} \
+             base={base_w}x{base_h} fmt={base_fmt:#x} (the colour attachment is \
+             resolved with the base mapping's geometry, not the view's)",
+            view.width, view.height, view.pixel_format, view.plane_index
+        ));
+    }
+}
+
 /// Archive `apple_pv_gpu_lookup_render_target`: type-11 first, else type-2/3 GVA.
 ///
 /// Wallpaper/background intermediates are type-2/3 guest-VA; type-11-only resolve
@@ -3400,11 +3474,7 @@ fn lookup_render_target<M: HostMemory + HostOps>(
         let _ = mapper::ensure_resolved_for_scanout(state, host, mapping_id);
         if let Some(m) = state.mappings.get(&mapping_id) {
             if m.has_geom && m.width > 0 && m.height > 0 {
-                let base_fmt = if m.format != 0 {
-                    m.format
-                } else {
-                    MTL_FORMAT_BGRA8_UNORM
-                };
+                let base_fmt = rt_base_format(m.format, mapping_id, "type11");
                 let fmt =
                     effective_view_sample_format(base_fmt, view_fmt_override).unwrap_or(base_fmt);
                 if pixel_format::render_target_bpp(fmt).is_some() {
@@ -3423,6 +3493,7 @@ fn lookup_render_target<M: HostMemory + HostOps>(
     // mids — guest pages stay empty and dual-mid thrash paints black.
     // Type-4: object-list index is surface_id. Type-5 RefTextureHandle: surfaceID@0
     // (allocateRefTextureHandle) — product color RTs are type-5 wrapping type-4.
+    let mut type5_view: Option<objects::Type5TextureView> = None;
     let type4_sid = if live_type == Some(objects::OBJECT_TYPE_SURFACE) {
         Some(resolved_ref)
     } else if live_type == Some(objects::OBJECT_TYPE_REF_TEXTURE) {
@@ -3435,6 +3506,7 @@ fn lookup_render_target<M: HostMemory + HostOps>(
         if sid == 0 {
             return None;
         }
+        type5_view = objects::decode_type5_texture_view(&desc);
         Some(sid)
     } else {
         None
@@ -3458,11 +3530,11 @@ fn lookup_render_target<M: HostMemory + HostOps>(
             ));
             return None;
         }
-        let base_fmt = if m.format != 0 {
-            m.format
-        } else {
-            MTL_FORMAT_BGRA8_UNORM
-        };
+        let (base_w, base_h, base_raw_fmt) = (m.width, m.height, m.format);
+        if live_type == Some(objects::OBJECT_TYPE_REF_TEXTURE) {
+            note_rt_type5_view(type5_view, surface_id, (base_w, base_h, base_raw_fmt));
+        }
+        let base_fmt = rt_base_format(base_raw_fmt, surface_id, "type4");
         let fmt = effective_view_sample_format(base_fmt, view_fmt_override).unwrap_or(base_fmt);
         pixel_format::render_target_bpp(fmt)?;
         // mapping_id = surface_id; no linear GVA.

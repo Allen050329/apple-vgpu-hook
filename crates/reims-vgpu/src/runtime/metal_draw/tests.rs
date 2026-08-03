@@ -4449,3 +4449,80 @@ fn type11_sample_resolves_geometry_before_reading_it() {
         "the resolve must have latched the descriptor geometry"
     );
 }
+
+/// The format-0 invent must be counted every time it is taken, and never when
+/// it is not.
+///
+/// `m.format == 0` is the type-4 decoder's refusal — multi-plane, or a FourCC it
+/// does not know — and it says in three places that callers must not invent
+/// BGRA from it. This resolve does, on both its arms. The counter is what will
+/// decide whether that invent is reachable at all; a counter that fires on
+/// ordinary formats, or stays quiet on the refusal, would answer the wrong
+/// question and the answer would look the same either way.
+#[test]
+fn the_render_target_format_invent_counts_exactly_the_refusals() {
+    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::runtime::drain::store_route_count;
+
+    let before = store_route_count("rt_base_fmt_invent");
+    // A format the decoder resolved is passed through untouched and uncounted.
+    assert_eq!(
+        super::rt_base_format(MTL_FORMAT_BGRA8_UNORM, 11, "t"),
+        MTL_FORMAT_BGRA8_UNORM
+    );
+    assert_eq!(store_route_count("rt_base_fmt_invent"), before);
+    // The refusal is what gets invented over, and it is counted per occurrence
+    // (not per mapping — the fail line is deduped, the counter is not).
+    assert_eq!(super::rt_base_format(0, 11, "t"), MTL_FORMAT_BGRA8_UNORM);
+    assert_eq!(super::rt_base_format(0, 12, "t"), MTL_FORMAT_BGRA8_UNORM);
+    assert_eq!(store_route_count("rt_base_fmt_invent"), before + 2);
+}
+
+/// A type-5 colour attachment must be scored on whether its view agrees with
+/// the base mapping, and "no view decoded" must not read as agreement.
+///
+/// The resolve takes geometry from the base mapping either way, so the counter
+/// is the only thing that can say whether that is lossless. Folding an
+/// undecoded record into `same` would report the ambiguous case as the healthy
+/// one, which is the failure mode that makes a census worthless.
+#[test]
+fn a_type5_render_target_view_is_scored_against_the_base_it_resolves_through() {
+    use crate::runtime::drain::store_route_count;
+    use crate::runtime::objects::Type5TextureView;
+
+    let base = (64u32, 32u32, 0x50u16);
+    let view = |w, h, fmt| {
+        Some(Type5TextureView {
+            pixel_format: fmt,
+            width: w,
+            height: h,
+            depth: 1,
+            plane_index: 0,
+        })
+    };
+    let (same0, diff0, und0) = (
+        store_route_count("rt_type5_view_same"),
+        store_route_count("rt_type5_view_differs"),
+        store_route_count("rt_type5_view_undecoded"),
+    );
+
+    super::note_rt_type5_view(view(64, 32, 0x50), 5, base);
+    assert_eq!(store_route_count("rt_type5_view_same"), same0 + 1);
+
+    // The live case the contract names: a row-byte-equivalent reinterpretation
+    // at a different width and format over the same bytes.
+    super::note_rt_type5_view(view(16, 32, 0x73), 6, base);
+    assert_eq!(store_route_count("rt_type5_view_differs"), diff0 + 1);
+    // Geometry alone is not the test — a format-only view is still a different
+    // view, and it is the one this resolve would silently render as BGRA8.
+    super::note_rt_type5_view(view(64, 32, 0x73), 7, base);
+    assert_eq!(store_route_count("rt_type5_view_differs"), diff0 + 2);
+
+    super::note_rt_type5_view(None, 8, base);
+    assert_eq!(store_route_count("rt_type5_view_undecoded"), und0 + 1);
+    assert_eq!(
+        store_route_count("rt_type5_view_same"),
+        same0 + 1,
+        "an undecoded record must not be scored as agreement"
+    );
+}
