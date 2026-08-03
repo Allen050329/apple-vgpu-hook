@@ -1069,24 +1069,6 @@ unsafe fn msg_send_release(obj: *mut objc::runtime::Object) {
     let _: () = msg_send![obj, release];
 }
 
-// MTLRegion helper — metal crate may not expose new_2d.
-trait RegionExt {
-    fn new_2d(x: u64, y: u64, w: u64, h: u64) -> Self;
-}
-
-impl RegionExt for MTLRegion {
-    fn new_2d(x: u64, y: u64, w: u64, h: u64) -> Self {
-        MTLRegion {
-            origin: MTLOrigin { x, y, z: 0 },
-            size: MTLSize {
-                width: w,
-                height: h,
-                depth: 1,
-            },
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

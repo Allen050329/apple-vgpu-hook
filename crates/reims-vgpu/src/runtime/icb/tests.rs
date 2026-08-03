@@ -3934,7 +3934,6 @@ fn decode_encode_barrier_and_threadgroup_memory() {
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn fill_compute_barrier_and_tg_memory_execute() {
     use crate::runtime::compute_session::ComputeSession;
-    use crate::runtime::decode::resource::compute_icb_layout;
 
     let (_guard, mtlb, mut host, mut state) = mul3add1_fixture();
 

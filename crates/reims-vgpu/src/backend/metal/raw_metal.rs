@@ -11,14 +11,12 @@ use objc::runtime::{Object, BOOL, NO, YES};
 use objc::{msg_send, sel, sel_impl};
 
 // SDK MTLTessellation* enums (not fully exposed by metal-0.33).
-pub const MTL_TESSELLATION_PARTITION_POW2: NSUInteger = 0;
 pub const MTL_TESSELLATION_PARTITION_INTEGER: NSUInteger = 1;
 pub const MTL_TESSELLATION_FACTOR_STEP_CONSTANT: NSUInteger = 0;
 pub const MTL_TESSELLATION_FACTOR_FORMAT_HALF: NSUInteger = 0;
 pub const MTL_WINDING_CLOCKWISE: NSUInteger = 0;
 pub const MTL_TESSELLATION_CONTROL_POINT_INDEX_NONE: NSUInteger = 0;
 pub const MTL_TESSELLATION_CONTROL_POINT_INDEX_UINT16: NSUInteger = 1;
-pub const MTL_TESSELLATION_CONTROL_POINT_INDEX_UINT32: NSUInteger = 2;
 
 /// Configure tessellation fields on `MTLRenderPipelineDescriptor` for ICB
 /// `drawPatches` / `drawIndexedPatches` (metal-0.33 leaves these as TODOs).
@@ -222,13 +220,10 @@ pub fn icb_set_object_buffer(
     }
 }
 
-/// SDK `MTLFunctionType` values not fully exposed by metal-0.33.
-pub const MTL_FUNCTION_TYPE_VERTEX: NSUInteger = 1;
-pub const MTL_FUNCTION_TYPE_FRAGMENT: NSUInteger = 2;
-pub const MTL_FUNCTION_TYPE_KERNEL: NSUInteger = 3;
-/// macOS 13+ mesh shader function.
+/// SDK `MTLFunctionType` for a macOS 13+ mesh shader function; metal-0.33
+/// omits it.
 pub const MTL_FUNCTION_TYPE_MESH: NSUInteger = 7;
-/// macOS 13+ object shader function.
+/// SDK `MTLFunctionType` for a macOS 13+ object shader function.
 pub const MTL_FUNCTION_TYPE_OBJECT: NSUInteger = 8;
 
 /// `functionType` on `MTLFunction` (raw NSUInteger; metal-0.33 omits Mesh/Object).

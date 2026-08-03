@@ -2491,7 +2491,7 @@ pub fn resolve_metal_icb<M: HostMemory + HostOps>(
 
 /// Clone writeback slots for a cached ICB into a session nested job (after execute).
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-pub fn export_icb_writeback_job(
+pub(crate) fn export_icb_writeback_job(
     task_id: u32,
     icb_ref: u32,
 ) -> Option<crate::runtime::compute_exec::NestedDispatchJob> {
