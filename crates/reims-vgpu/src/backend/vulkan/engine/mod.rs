@@ -13,7 +13,6 @@ mod compute_validation;
 mod context;
 mod counters;
 mod desc_arena;
-pub mod diff_pass;
 mod device_lost;
 mod digest;
 mod draw_execution;
@@ -106,9 +105,6 @@ struct EngineState {
     caches: ObjectCaches,
     pools: ResourcePools,
     counters: EngineCounters,
-    /// Per-destination `cur`/`prev` scratch for the render writeback's
-    /// difference pass.
-    diff_rail: diff_pass::DiffRail,
     #[cfg(feature = "host-window")]
     window_presenter: Option<window_present::WindowPresenter>,
 }
@@ -120,7 +116,6 @@ impl EngineState {
             caches: ObjectCaches::new(),
             pools: ResourcePools::new(),
             counters: EngineCounters::default(),
-            diff_rail: diff_pass::DiffRail::default(),
             #[cfg(feature = "host-window")]
             window_presenter: None,
         }
@@ -133,7 +128,6 @@ impl EngineState {
                 if let Some(mut presenter) = self.window_presenter.take() {
                     presenter.destroy(ctx, Some(&mut self.pools));
                 }
-                self.diff_rail.destroy_all(&ctx.device);
                 self.caches.destroy_all(&ctx.device);
                 self.pools.destroy_all(&ctx.device);
             }
@@ -142,7 +136,6 @@ impl EngineState {
         }
         self.pools = ResourcePools::new();
         self.caches = ObjectCaches::new();
-        self.diff_rail = diff_pass::DiffRail::default();
     }
 }
 
@@ -1074,10 +1067,7 @@ unsafe fn copy_image_level0_to_host(
         rb_size,
         ops,
         ReadbackDelivery::Copy,
-        None,
-    )?
-    .0
-    {
+    )? {
         ReadbackResult::Copied(bytes) => Ok(bytes),
         // Unreachable by construction — `Copy` was asked for one line above —
         // and stated as a decline rather than a panic because this rail runs on
@@ -1093,7 +1083,7 @@ unsafe fn copy_image_level0_to_host(
 
 #[allow(
     clippy::too_many_arguments,
-    reason = "the image, how to read it, where to deliver it, and what to compare it against"
+    reason = "the image, how to read it, and where to deliver it"
 )]
 unsafe fn copy_image_level0_to_host_delivered(
     ctx: &context::DeviceContext,
@@ -1107,8 +1097,7 @@ unsafe fn copy_image_level0_to_host_delivered(
     rb_size: u64,
     ops: ReadbackOps,
     delivery: ReadbackDelivery,
-    diff: Option<diff_pass::DiffAttach<'_>>,
-) -> Result<(ReadbackResult, Option<Vec<u32>>), DrawError> {
+) -> Result<ReadbackResult, DrawError> {
     let submit_started = std::time::Instant::now();
     // The slot is claimed *after* the entry, and the order is load-bearing.
     //
@@ -1133,11 +1122,6 @@ unsafe fn copy_image_level0_to_host_delivered(
     // above: every readback slot this submission owns must be claimed after
     // `begin_entry`, or it ends up owned by whatever ring entry the flush
     // inside `begin_entry` happened to seal.
-    let diff_bits_bytes = diff.as_ref().map_or(0, |d| d.plan.bits_bytes());
-    let bits = match diff.as_ref() {
-        Some(_) => Some(pools.acquire_readback_extra(ctx, diff_bits_bytes, counters)?),
-        None => None,
-    };
     // Before this function's own `seal_entry`, for the same reason: that call
     // would move the slot into this entry's cleanup and hand it back to
     // `readback_free` when the entry retires, under a borrow still reading it.
@@ -1242,36 +1226,9 @@ unsafe fn copy_image_level0_to_host_delivered(
         cb,
         image,
         ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-        diff.as_ref().map_or(readback.buffer, |d| d.cur),
+        readback.buffer,
         &region,
     );
-    // Recorded before the closing timestamp, so `gpu_us` prices the comparison
-    // as part of the readback rather than leaving it out of the only figure
-    // this rail is measured by.
-    let mut diff_cleanup: Vec<(ash::vk::DescriptorSet, ash::vk::DescriptorPool)> = Vec::new();
-    if let (Some(d), Some(bits)) = (diff, bits.as_ref()) {
-        let diff_pass::DiffAttach {
-            cur,
-            prev,
-            plan,
-            caches,
-        } = d;
-        let recorded = diff_pass::record_tile_diff(
-            ctx,
-            caches,
-            pools,
-            counters,
-            cb,
-            &diff_pass::TileDiffBuffers {
-                cur,
-                prev,
-                out: readback.buffer,
-                bits: bits.buffer,
-            },
-            plan,
-        )?;
-        diff_cleanup.push(recorded);
-    }
     if let Some(probe) = ctx.timestamps.as_ref() {
         ctx.device.cmd_write_timestamp(
             cb,
@@ -1289,7 +1246,7 @@ unsafe fn copy_image_level0_to_host_delivered(
     ctx.device
         .queue_submit(queue, &[si], fence)
         .map_err(|e| DrawError::VkCall(VkCall::new(ops.submit, e)))?;
-    let cleanup = pools.seal_entry(diff_cleanup, Vec::new());
+    let cleanup = pools.seal_entry(Vec::new(), Vec::new());
     pools.finish_entry_async(cleanup);
     // Split three ways rather than timed as a whole: the submit and the copy
     // scale with the surface, the fence does not scale with anything we control,
@@ -1362,29 +1319,7 @@ unsafe fn copy_image_level0_to_host_delivered(
             .map(ReadbackResult::Copied),
     };
     note_readback_phase(ReadbackPhase::Map, map_started.elapsed().as_micros() as u64);
-    // The bitmap is a few kilobytes against the frame's megabytes — 4 KiB for a
-    // 1080p frame — so it is copied out rather than leased. It is also read
-    // unconditionally when it was asked for, including on the error paths
-    // above, so its slot is not left holding a lease nobody returns.
-    let changed = match bits {
-        Some(slot) => {
-            let words = pools::read_back_slot(
-                ctx,
-                &slot,
-                diff_bits_bytes,
-                ops.map,
-                ops.invalidate,
-            )?;
-            Some(
-                words
-                    .chunks_exact(4)
-                    .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                    .collect(),
-            )
-        }
-        None => None,
-    };
-    out.map(|delivered| (delivered, changed))
+    out
 }
 
 /// A resident target's pixels plus the physical channel order they came out in.
@@ -1503,69 +1438,11 @@ impl Drop for LeasedFrame {
 /// - **No mapping to lend**, which a readback slot always has and so should not
 ///   occur; the fallback keeps it from mattering if it ever does.
 pub fn read_target_leased(identity: &TargetIdentity) -> Result<Option<LeasedFrame>, DrawError> {
-    Ok(read_target_leased_diffed(identity, None)?.map(|d| d.lease))
-}
-
-/// A leased frame plus which of its bytes the difference pass actually wrote.
-pub struct DiffedFrame {
-    pub lease: LeasedFrame,
-    /// Byte ranges of the frame that differ from what the destination holds,
-    /// ascending and disjoint. `None` when the whole frame is valid — no
-    /// comparison was asked for, or one was and `prev` held nothing to compare
-    /// against — and `Some(&[])` when the frame is identical to what is already
-    /// there, which is the cheapest correct landing rather than an error.
-    ///
-    /// Outside these ranges the lease holds whatever the recycled readback slot
-    /// held before. A consumer that reads them anyway lands a previous tenant's
-    /// bytes in guest RAM.
-    pub changed: Option<Vec<(u64, u64)>>,
-}
-
-/// [`read_target_leased`], comparing the frame against what the destination is
-/// believed to hold and delivering only the tiles that differ.
-///
-/// `compare` names the landing destination and the caller's answer to "do the
-/// guest's pages still hold what we last landed there". `None` asks for the
-/// plain readback. Both a declined comparison and an unseeded destination come
-/// back as `changed: None`, so a caller never has to distinguish "not compared"
-/// from "compared and everything differs" — both mean land the frame whole.
-///
-/// **The comparison is a claim about the destination, and this call does not
-/// establish it.** `prev` becomes this frame only when
-/// [`promote_diffed_landing`] is called, which the caller owes after the bytes
-/// have reached guest RAM and not before: a landing that was refused, or one
-/// whose frame never left the readback slot, leaves the guest's pages holding
-/// the frame before it, and promoting there would make the *next* comparison
-/// answer about a frame that was never landed.
-///
-/// # No caller passes `Some` yet, so the rail is dormant
-///
-/// The only call site is [`read_target_leased`], which passes `None`. Every
-/// consequence follows from that and should be read before believing a boot
-/// log: `diff_pass::attach_for_readback` is never reached, so the tile-diff
-/// shader never runs on the product path, `changed` is always `None`, and
-/// `diff_pass::note_diff_result` — and with it `dr_frames`, `dr_tiles` and
-/// `dr_tiles_changed` — is never emitted. The three functions the contract
-/// above says the caller owes ([`promote_diffed_landing`],
-/// [`diffed_prev_stamp`], [`withdraw_diffed_landing`]) have no callers either.
-///
-/// This is staged work, not an orphan: the pass is exercised end to end through
-/// the real bindings by `diff_pass::probe_tile_diff` and
-/// `tests/vk_engine_compute.rs`. What is missing is the writeback-side consumer
-/// that would pass `Some`, hold the returned ranges, and promote after the
-/// bytes land. Until it exists, no measurement of this rail can come from a
-/// product boot, because none of it executes in one.
-pub fn read_target_leased_diffed(
-    identity: &TargetIdentity,
-    compare: Option<(&diff_pass::LandingIdentity, bool)>,
-) -> Result<Option<DiffedFrame>, DrawError> {
     let mut guard = lock_engine();
     let EngineState {
         ref mut owner,
-        ref mut caches,
         ref mut pools,
         ref counters,
-        ref mut diff_rail,
         ..
     } = &mut *guard;
     let ctx = owner.ensure(counters)?;
@@ -1573,15 +1450,7 @@ pub fn read_target_leased_diffed(
     let snap = resident_read_snapshot(pools, identity)?;
     let rb_size = (snap.width as u64) * (snap.height as u64) * 4;
     unsafe {
-        // Resolved before the command buffer is opened, because the rail and
-        // the readback both want `pools`, and reducing the rail's answer to two
-        // buffer handles and a plan is what keeps the two borrows apart.
-        let attached = compare
-            .filter(|_| ctx.compute_capable)
-            .and_then(|(key, prev_offered)| {
-                diff_pass::attach_for_readback(ctx, counters, diff_rail, key, rb_size, prev_offered)
-            });
-        let (delivered, bits) = copy_image_level0_to_host_delivered(
+        let delivered = copy_image_level0_to_host_delivered(
             ctx,
             pools,
             counters,
@@ -1593,34 +1462,15 @@ pub fn read_target_leased_diffed(
             rb_size,
             target_readback_ops(),
             ReadbackDelivery::Lease,
-            attached.map(|(cur, prev, plan, _)| diff_pass::DiffAttach {
-                cur,
-                prev,
-                plan,
-                caches,
-            }),
         )?;
         pools.registry_set_layout(identity, ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
         counters.note_target_read(rb_size);
-        // A bitmap produced against an unseeded `prev` describes a comparison
-        // with a buffer nothing wrote, so it is discarded rather than trusted:
-        // the frame lands whole and seeds the destination.
-        let changed = match (bits, attached.map(|(_, _, _, seeded)| seeded)) {
-            (Some(words), Some(true)) => {
-                diff_pass::note_diff_result(&words, rb_size);
-                Some(diff_pass::changed_runs(&words, rb_size))
-            }
-            _ => None,
-        };
         Ok(match delivered {
-            ReadbackResult::Leased { token, ptr, len } => Some(DiffedFrame {
-                lease: LeasedFrame {
-                    token,
-                    ptr,
-                    len,
-                    bgra: snap.bgra,
-                },
-                changed,
+            ReadbackResult::Leased { token, ptr, len } => Some(LeasedFrame {
+                token,
+                ptr,
+                len,
+                bgra: snap.bgra,
             }),
             // The slot had no mapping to lend, so the readback fell back to a
             // copy. Drop it and let the caller take its own copying path rather
@@ -1629,37 +1479,6 @@ pub fn read_target_leased_diffed(
             ReadbackResult::Copied(_) => None,
         })
     }
-}
-
-/// The guest's pages for `key` now hold the frame the last diffed readback
-/// delivered, so the next comparison may be made against it.
-///
-/// Owed by the caller of [`read_target_leased_diffed`] after — and only after —
-/// its landing was acknowledged. See that function for why the engine cannot
-/// decide this for itself.
-pub fn promote_diffed_landing(key: &diff_pass::LandingIdentity, host_write_epoch: u64) {
-    let mut guard = lock_engine();
-    diff_pass::promote(&mut guard.diff_rail, key, host_write_epoch);
-}
-
-/// The host-write epoch `key`'s `prev` was established at, or `None` when there
-/// is no `prev` to ask about.
-///
-/// The runtime asks its own write ring whether anything has touched the
-/// destination's pages since this epoch. That is the half of the witness the
-/// engine cannot see — it knows what *it* copied, not what any other rail
-/// scattered into the same guest pages — so the two are deliberately split
-/// across the boundary rather than guessed at on either side.
-pub fn diffed_prev_stamp(key: &diff_pass::LandingIdentity) -> Option<u64> {
-    let guard = lock_engine();
-    diff_pass::prev_stamp(&guard.diff_rail, key)
-}
-
-/// The guest's pages for `key` no longer hold what was last landed there, so
-/// the next frame must land whole.
-pub fn withdraw_diffed_landing(key: &diff_pass::LandingIdentity) {
-    let mut guard = lock_engine();
-    diff_pass::unseed(&mut guard.diff_rail, key);
 }
 
 /// The `srcAccessMask` a resident color target's readback must drain.

@@ -1123,11 +1123,9 @@ pub(crate) enum AllocSite {
     Readback,
     ReadbackMulti,
     SlabBlock,
-    /// A device-local `cur`/`prev` buffer for the writeback difference pass.
-    DiffScratch,
 }
 
-const ALLOC_SITE_N: usize = 8;
+const ALLOC_SITE_N: usize = 7;
 
 impl AllocSite {
     const fn idx(self) -> usize {
@@ -1139,7 +1137,6 @@ impl AllocSite {
             AllocSite::Readback => 4,
             AllocSite::ReadbackMulti => 5,
             AllocSite::SlabBlock => 6,
-            AllocSite::DiffScratch => 7,
         }
     }
 }
@@ -1152,7 +1149,6 @@ const ALLOC_SITE_NAMES: [&str; ALLOC_SITE_N] = [
     "readback",
     "readback_multi",
     "slab_block",
-    "diff_scratch",
 ];
 
 static ALLOC_SITE_COUNT: [std::sync::atomic::AtomicU64; ALLOC_SITE_N] =

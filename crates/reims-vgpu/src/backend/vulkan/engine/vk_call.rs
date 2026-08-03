@@ -219,11 +219,8 @@ pub enum VkOp {
     /// `vkCreateImageView` for a storage image.
     PoolsCreateStorageImageView,
     /// `vkCreateBuffer` for a writeback difference-pass scratch buffer.
-    PoolsCreateDiffScratch,
     /// `vkAllocateMemory` for a difference-pass scratch buffer.
-    PoolsAllocDiffScratch,
     /// `vkBindBufferMemory` for a difference-pass scratch buffer.
-    PoolsBindDiffScratch,
     /// `vkCreateFramebuffer` for a resident-registry target.
     PoolsCreateRegistryFramebuffer,
     /// `vkCreateImage` for a resident-registry target.
@@ -421,9 +418,6 @@ impl Decline for VkCall {
             VkOp::PoolsAllocStorageImage => "vk_pools_alloc_storage_image",
             VkOp::PoolsBindStorageImage => "vk_pools_bind_storage_image",
             VkOp::PoolsCreateStorageImageView => "vk_pools_create_storage_image_view",
-            VkOp::PoolsCreateDiffScratch => "vk_pools_create_diff_scratch",
-            VkOp::PoolsAllocDiffScratch => "vk_pools_alloc_diff_scratch",
-            VkOp::PoolsBindDiffScratch => "vk_pools_bind_diff_scratch",
             VkOp::PoolsCreateRegistryFramebuffer => "vk_pools_create_registry_framebuffer",
             VkOp::PoolsCreateRegistryTarget => "vk_pools_create_registry_target",
             VkOp::PoolsBindRegistryTarget => "vk_pools_bind_registry_target",
@@ -578,9 +572,6 @@ mod tests {
         VkOp::PoolsAllocStorageImage,
         VkOp::PoolsBindStorageImage,
         VkOp::PoolsCreateStorageImageView,
-        VkOp::PoolsCreateDiffScratch,
-        VkOp::PoolsAllocDiffScratch,
-        VkOp::PoolsBindDiffScratch,
         VkOp::PoolsCreateRegistryFramebuffer,
         VkOp::PoolsCreateRegistryTarget,
         VkOp::PoolsBindRegistryTarget,
