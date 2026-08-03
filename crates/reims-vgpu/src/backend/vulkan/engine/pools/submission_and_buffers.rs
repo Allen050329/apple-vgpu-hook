@@ -2220,9 +2220,19 @@ impl ResourcePools {
             identity,
             last_touch_ms: touch,
         });
+        // Which of the two caps is doing the evicting decides whether a later
+        // miss is a capacity eviction or content the cache has never held.
+        // `sampled_cache_misses` cannot tell them apart — a miss is only the
+        // absence of a (key, fingerprint) entry, and the two causes look
+        // identical from there. Both routes reading zero says every miss is
+        // content, and then raising either cap buys nothing.
         while self.sampled_cache.len() > SAMPLED_CACHE_CAP
             || self.sampled_cache_bytes > SAMPLED_CACHE_BYTE_CAP
         {
+            if let Some(route) = sampled_evict_route(self.sampled_cache.len(), self.sampled_cache_bytes)
+            {
+                crate::runtime::drain::note_store_route(route);
+            }
             let evicted = self.sampled_cache.remove(0);
             self.sampled_cache_bytes = self.sampled_cache_bytes.saturating_sub(evicted.content_len);
             // Recycle rather than destroy: a content-changing sampled input
@@ -2302,6 +2312,65 @@ fn note_readback_memory(
         .field("coherent", u8::from(kind.coherent))
         .field("topology", topology)
         .off();
+    }
+}
+
+/// Which cap is over budget, given the exact-content cache's size after an
+/// admission. `None` when neither is, which is the caller's loop condition and
+/// so unreachable from it — it exists so this decision is testable without a
+/// device.
+///
+/// The count cap is reported in preference to the byte cap when both are over,
+/// because a count-capped cache at three orders of magnitude under its byte cap
+/// is the shape the sampled rail was measured in and the one that would make
+/// raising `SAMPLED_CACHE_CAP` worth anything.
+fn sampled_evict_route(len: usize, bytes: usize) -> Option<&'static str> {
+    if len > SAMPLED_CACHE_CAP {
+        Some("sampled_evict_count_cap")
+    } else if bytes > SAMPLED_CACHE_BYTE_CAP {
+        Some("sampled_evict_byte_cap")
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod evict_route_tests {
+    use super::*;
+
+    #[test]
+    fn a_cache_inside_both_caps_evicts_for_neither_reason() {
+        assert_eq!(sampled_evict_route(SAMPLED_CACHE_CAP, 0), None);
+        assert_eq!(
+            sampled_evict_route(SAMPLED_CACHE_CAP, SAMPLED_CACHE_BYTE_CAP),
+            None
+        );
+    }
+
+    #[test]
+    fn one_entry_over_the_count_cap_names_the_count_cap() {
+        assert_eq!(
+            sampled_evict_route(SAMPLED_CACHE_CAP + 1, 0),
+            Some("sampled_evict_count_cap")
+        );
+    }
+
+    #[test]
+    fn one_byte_over_the_byte_cap_names_the_byte_cap() {
+        assert_eq!(
+            sampled_evict_route(1, SAMPLED_CACHE_BYTE_CAP + 1),
+            Some("sampled_evict_byte_cap")
+        );
+    }
+
+    /// Both over is the count cap, so the two routes partition the evictions
+    /// and their sum is the eviction count rather than exceeding it.
+    #[test]
+    fn over_both_caps_is_charged_once_to_the_count_cap() {
+        assert_eq!(
+            sampled_evict_route(SAMPLED_CACHE_CAP + 1, SAMPLED_CACHE_BYTE_CAP + 1),
+            Some("sampled_evict_count_cap")
+        );
     }
 }
 
