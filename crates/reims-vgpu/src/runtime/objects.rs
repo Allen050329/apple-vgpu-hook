@@ -154,13 +154,31 @@ pub const OBJECT_TYPE_REF_TEXTURE: u8 = 5;
 /// Type-5 RefTexture descriptor (RE `allocateRefTextureHandle` + Metal
 /// `initWithDevice:descriptor:iosurface:plane:field:`):
 /// - `surfaceID@0` = `IOSurface::getSurfaceID()` = type-4 heap object id / mid
-/// - `field@4` = device-side field dword (not plane index)
+/// - `ownerTask@4` = the task whose object list holds that surface
 /// - `args@8..` = **serialized texture args** length `desc_len-8` (MTLTextureDescriptor
 ///   stream for the **plane** view; plane is applied guest-side before serialize)
 ///
 /// See [[reims-vgpu-resource-paging]] type-5 section.
 pub const TYPE5_SURFACE_ID: usize = 0x00;
-pub const TYPE5_FIELD: usize = 0x04;
+/// The task the guest names as the surface's owner, and the answer to the
+/// question [`resolve_type4_surface_ex`]'s search is asking.
+///
+/// This field used to be documented as a "device-side field dword", i.e. as
+/// opaque. It is not. `allocateRefTextureHandle` writes it from the *accelerator's*
+/// task rather than from its own — the same field the type-4 registration path
+/// reads its heap out of — so a type-5 view carries the id of the task whose
+/// object list holds the surface it references, not the id of the task that
+/// created the view. Those differ by construction: an IOSurface backing is
+/// registered in the accelerator's kernel task, while the view is registered in
+/// the calling client's, which is why threading the *naming* task into type-4
+/// resolution regresses the boot (`AGENTS.md` records that dead end).
+///
+/// The kernel task's id is an immediate 0 and index 0 is reserved out of the
+/// 256-entry task id allocator before any client task exists, so every value
+/// seen here is expected to be 0 — which is why the search's "task 0 first" probe
+/// order works, and why it is a decoded fact rather than a lucky constant.
+/// [`note_type5_owner_task`] is the standing check on that.
+pub const TYPE5_OWNER_TASK: usize = 0x04;
 pub const TYPE5_ARGS: usize = 0x08;
 pub const TYPE5_MIN_LEN: usize = 0x08;
 
@@ -220,6 +238,39 @@ pub struct Type5TextureView {
     pub plane_index: u32,
 }
 
+/// Report the owner task a type-5 descriptor names, once per distinct value.
+///
+/// Every type-4 surface this device has resolved lived in task 0 — measured
+/// (`type4_claimants`: `claims=1 winner=0` on every surface id of two driven
+/// boots) and structural, since the guest registers IOSurface backings in the
+/// accelerator's kernel task whose id is a hardcoded 0. [`TYPE5_OWNER_TASK`] is
+/// the guest saying the same thing on the wire, so this reads 0 forever and
+/// stays on the quiet channel.
+///
+/// A non-zero value is the one reading that matters, and it is a failure line
+/// because two things would follow from it at once: the type-4 search's "task 0
+/// first" probe order is no longer the guest's answer, and the field's decoded
+/// meaning is wrong. `first_sight` is keyed on the value alone, so the whole
+/// boot costs one line whichever way it goes.
+fn note_type5_owner_task(desc: &[u8]) {
+    let Some(bytes) = desc.get(TYPE5_OWNER_TASK..TYPE5_OWNER_TASK + 4) else {
+        return;
+    };
+    let task = ld32(bytes);
+    if !crate::observe::first_sight("type5_owner_task", task as u64) {
+        return;
+    }
+    let line = format!("type5_owner_task task={task}");
+    if task == 0 {
+        crate::observe::off(line);
+    } else {
+        crate::observe::fail(format!(
+            "{line} (a type-5 view names a surface owner other than the kernel task; \
+             the type-4 search probes task 0 first on the reading that this is always 0)"
+        ));
+    }
+}
+
 /// Decode the serialized texture-view record from a full type-5 descriptor.
 ///
 /// Fail-closed: `None` unless the record tag matches and geometry is sane
@@ -227,6 +278,7 @@ pub struct Type5TextureView {
 /// over the IOSurface bytes; callers must not replace it with base mapping
 /// geometry merely because the surface itself is otherwise stageable.
 pub fn decode_type5_texture_view(desc: &[u8]) -> Option<Type5TextureView> {
+    note_type5_owner_task(desc);
     if desc.len() < TYPE5_ARG_RECORD + TYPE5_RECORD_MIN_LEN {
         return None;
     }
@@ -1334,10 +1386,21 @@ fn resolve_type4_surface_ex<M: HostMemory>(
     if surface_id == 0 || surface_id as usize >= MAX_MAPPINGS {
         return false;
     }
-    // Task probe order: task 0 (kernel/global — historical type-4 home) first,
-    // then the cached owner-task hint (so a hot present-path re-scan
-    // short-circuits on the owning task instead of walking all 256 slots),
-    // then the remaining tasks.
+    // Task probe order: task 0 first, then the cached owner-task hint (so a hot
+    // present-path re-scan short-circuits on the owning task instead of walking
+    // all 256 slots), then the remaining tasks.
+    //
+    // Task 0 leads because the guest says so, not because it is where surfaces
+    // have happened to be. A type-5 view carries the owning task at
+    // [`TYPE5_OWNER_TASK`] and it is the accelerator's kernel task, whose id is a
+    // hardcoded 0 and whose slot the task-id allocator reserves before any client
+    // task exists. `note_type5_owner_task` fails loudly if that ever reads
+    // otherwise.
+    //
+    // The remaining 255 probes are not dead weight on that reading. They cost
+    // nothing on the path that matters — every successful resolve measured has
+    // stopped on the first probe — and they are what makes `type4_claimants` able
+    // to say a second task claims the id at all.
     let hint = state
         .mappings
         .get(&surface_id)
@@ -2452,6 +2515,36 @@ mod tests {
         assert_eq!(rec.pixel_format, 0x0a);
         assert_eq!((rec.width, rec.height, rec.depth), (946, 350, 1));
         assert_eq!(rec.plane_index, 2);
+    }
+
+    /// The owner-task census must read the dword the guest wrote, and must be
+    /// able to tell 0 from anything else.
+    ///
+    /// A census whose extraction is wrong reports 0 forever whatever the wire
+    /// says, and 0 is the answer this device already assumes — so the failing
+    /// case would be indistinguishable from the healthy one, which is the whole
+    /// point of having it. Pinning the offset against a descriptor whose *other*
+    /// leading dword is non-zero is what makes an off-by-four visible.
+    #[test]
+    fn the_type5_owner_task_is_read_from_its_own_dword() {
+        let mut desc = [0u8; TYPE5_MIN_LEN];
+        st32(&mut desc[TYPE5_SURFACE_ID..], 0xabcd);
+        assert_eq!(
+            ld32(&desc[TYPE5_OWNER_TASK..]),
+            0,
+            "the surface id must not be read as the owner task"
+        );
+        st32(&mut desc[TYPE5_OWNER_TASK..], 7);
+        assert_eq!(ld32(&desc[TYPE5_OWNER_TASK..]), 7);
+        assert_eq!(
+            ld32(&desc[TYPE5_SURFACE_ID..]),
+            0xabcd,
+            "writing the owner task must not disturb the surface id"
+        );
+        // Both fields sit inside the minimum descriptor — the array above is
+        // exactly `TYPE5_MIN_LEN` and indexing it proves that — so the census can
+        // never be silently skipped on a well-formed record.
+        assert_eq!(TYPE5_OWNER_TASK, TYPE5_SURFACE_ID + 4);
     }
 
     #[test]

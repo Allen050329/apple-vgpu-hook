@@ -1453,11 +1453,13 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
                         // ensure failure surfaces downstream as `MissingTexture` (the
                         // mapping lookup below misses), so no always-on line is lost.
                         if crate::observe::draw_log_enabled() {
-                            let field = if desc.len() >= objects::TYPE5_FIELD + 4 {
-                                ld32(&desc[objects::TYPE5_FIELD..])
-                            } else {
-                                0
-                            };
+                            // The owner task the view names. `note_type5_owner_task`
+                            // is the always-on check on its value; this echo carries
+                            // it beside the descriptor it came out of.
+                            let owner_task = desc
+                                .get(objects::TYPE5_OWNER_TASK..objects::TYPE5_OWNER_TASK + 4)
+                                .map(ld32)
+                                .unwrap_or(0);
                             let args_n = desc.len().saturating_sub(objects::TYPE5_ARGS);
                             let mut args_hex = String::new();
                             if args_n > 0 {
@@ -1472,7 +1474,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
                                 }
                             }
                             crate::observe::line(format!(
-                                "compute_stage_tex type5 ref={texture_ref} sid={sid} ensure={} field={field:#x} desc_len={} args_n={args_n} args_hex={args_hex}",
+                                "compute_stage_tex type5 ref={texture_ref} sid={sid} ensure={} owner_task={owner_task} desc_len={} args_n={args_n} args_hex={args_hex}",
                                 ok as u8,
                                 desc.len(),
                             ));
