@@ -323,6 +323,28 @@ already been run to exhaustion; re-running one costs hours and has so far return
   path returns early and skips the shared `invalidate_storage_residency_window`, but its own guard
   requires `frame_len == span_end - base_off` and `write_mapping_bytes` invalidates `[off, off+len)`
   internally — the same window. That one has been checked; it is correct.
+- **A healthy zero can also be an address-space error, and that class is worth one grep.** The
+  divergence vein produced a new shape: an alarm that reads zero forever because it compares two
+  addresses that do not compare. `first_control_page_collision` rejects a surface whose backing
+  pages alias a control structure, and five of its six regions are guest-physical by construction —
+  but the sixth shifted `task.object_list_pfn`, which `objects::lookup_list_entry` builds, names
+  `entry_gva` and reads through `gva_mem::read_task_gva_by_id`. `gva_mem`'s own doc states the rule
+  it broke ("a GVA has no meaning apart from the page table it is resolved against"), which is the
+  same "the comment that settles it is on the callee" trap as `c99fe05`. Both directions were
+  wrong: a real alias was undetectable, and a surface whose *physical* page happened to equal that
+  *virtual* number was rejected and its guest work lost — and the coincidence is not remote,
+  because tasks put their object lists in low pages. It also strided at 16 where
+  `OBJECT_LIST_ENTRY_LEN` is 12. **The generalisable check is cheap: for any predicate mixing
+  fields, confirm every operand is in the same address space, by tracing each to its writer and to
+  one other consumer.** A field named `*_pfn` does not settle it; `object_list_pfn` is a virtual
+  one. This has now been run over that function and its five survivors are clean; the rest of the
+  crate has not been swept for it.
+- **The blank-sample loss class is closed — it was never a loss.** `lin_rung_blank_with_host_entry`
+  read 22 a boot with `lin_rung_blank_host_agrees` 22 and `lin_rung_blank_host_content` **0**: every
+  occurrence is a span the device CLEARed, cached blank, and read back blank off pages that are also
+  blank. The counter that called it loss tested only whether the cache *held* the span, never
+  whether it held pixels. Do not reopen this on the old "31 a boot" or "300 a boot" readings; the
+  live alarm is `lin_rung_blank_host_content`, and it is a healthy zero.
 - **The per-dispatch compute stall watchdog is priced, and it is not worth rewriting.**
   `spawn_compute_engine_stall_watchdog` spawns a thread and clones the SPIR-V on *every* compute
   dispatch, then sleeps 2 s. At the measured peak of 124 computes/s that is ~250 live sleeping
