@@ -3,6 +3,9 @@
 //! Production: QEMU C offers HostOps callbacks; Rust enqueues HostActions for a
 //! QEMU BH. Tests: [`FakeHost`] owns an in-memory GPA space and action log.
 
+/// Only [`FakeHost`]'s sparse byte store, X-register fixtures and guest-write
+/// sets use this, and all three are test-gated.
+#[cfg(test)]
 use std::collections::BTreeMap;
 
 /// Guest-physical memory access error.
@@ -451,7 +454,7 @@ pub const GUEST_PAGE_SIZE_ARM64E: usize = 1usize << crate::contract::gva::PAGE_S
 /// mach VM aliasing for FakeHost views — the same mechanism the QEMU shim
 /// uses in production (`mach_vm_remap` of guest RAM), exercised for real in
 /// unit tests so view coherence is tested, not simulated.
-#[cfg(target_os = "macos")]
+#[cfg(all(test, target_os = "macos"))]
 mod mach_vm {
     #[allow(non_upper_case_globals)]
     extern "C" {
@@ -478,6 +481,7 @@ mod mach_vm {
     pub const VM_INHERIT_NONE: u32 = 2;
 }
 
+#[cfg(test)]
 /// A real, 16KiB-aligned memory block backing a GPA range in [`FakeHost`].
 #[derive(Debug)]
 struct RealRange {
@@ -487,6 +491,7 @@ struct RealRange {
     alloc_len: usize,
 }
 
+#[cfg(test)]
 /// Combined host for unit tests: GPA store + action log + BH flag.
 ///
 /// GPA ranges are backed by real page-aligned host memory so
@@ -552,6 +557,7 @@ pub struct FakeHost {
     pub guest_write_startup_window: bool,
 }
 
+#[cfg(test)]
 /// One [`HostOps::track_guest_writes`] registration in [`FakeHost`].
 ///
 /// The product host learns of a write from the hypervisor's dirty bitmap; the
@@ -571,6 +577,7 @@ struct GuestWriteSet {
     page_gen: Vec<u64>,
 }
 
+#[cfg(test)]
 /// A guest page-table edit that fires from inside a device guest read.
 ///
 /// The corruption class this harness exists to test is defined by something the
@@ -599,6 +606,7 @@ pub struct Rewire {
     pub bytes: Vec<u8>,
 }
 
+#[cfg(test)]
 /// Contiguous bounce for [`FakeHost::map_pages`] on non-macOS (sparse GPA store).
 #[derive(Debug)]
 struct BounceView {
@@ -609,6 +617,7 @@ struct BounceView {
     page_sz: usize,
 }
 
+#[cfg(test)]
 impl Drop for FakeHost {
     fn drop(&mut self) {
         #[cfg(target_os = "macos")]
@@ -643,6 +652,7 @@ impl Drop for FakeHost {
     }
 }
 
+#[cfg(test)]
 impl FakeHost {
     pub fn new() -> Self {
         Self::default()
@@ -848,6 +858,7 @@ impl FakeHost {
     }
 }
 
+#[cfg(test)]
 impl FakeHost {
     /// If `addr` is in a live bounce view, return `(bounce_base, offset, max_contig)`.
     fn bounce_slot(&self, addr: u64) -> Option<(usize, usize, usize)> {
@@ -864,6 +875,7 @@ impl FakeHost {
     }
 }
 
+#[cfg(test)]
 impl HostMemory for FakeHost {
     fn read_gpa(&self, gpa: u64, buf: &mut [u8]) -> Result<(), MemError> {
         if buf.is_empty() {
@@ -942,6 +954,7 @@ impl HostMemory for FakeHost {
     }
 }
 
+#[cfg(test)]
 impl HostOps for FakeHost {
     fn mono_ns(&self) -> u64 {
         self.mono_ns
