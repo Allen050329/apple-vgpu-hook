@@ -973,18 +973,22 @@ pub(crate) struct StagedTexture {
     pub height: u32,
     pub bytes: Vec<u8>,
     pub is_storage: bool,
+    #[cfg(feature = "backend-vulkan")]
     residency: Option<ComputeStorageResidencyCandidate>,
     /// Stage-time guest read skipped (resident generation verified); `bytes`
     /// is a zero placeholder the engine must never seed.
+    #[cfg(feature = "backend-vulkan")]
     seed_skipped: bool,
     /// Sampled input whose window the engine already holds GPU-resident (a
     /// prior dispatch's storage output at this generation): the guest read was
     /// skipped, `bytes` is a zero placeholder, and the engine must seed the
     /// sampled image by copy-on-sample from the resident (never the bytes).
+    #[cfg(feature = "backend-vulkan")]
     sample_resident: Option<(crate::model::ComputeStorageResidencyKey, u32)>,
     writeback: TextureWriteback,
 }
 
+#[cfg(feature = "backend-vulkan")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ComputeStorageResidencyCandidate {
     key: crate::model::ComputeStorageResidencyKey,
@@ -996,6 +1000,7 @@ struct ComputeStorageResidencyCandidate {
 /// point), which is only a safe authority when the device grants
 /// `deferred_gpu_only_content` — portability-subset (MoltenVK) devices must
 /// write guest pages synchronously instead.
+#[cfg(feature = "backend-vulkan")]
 fn compute_defer_readback_allowed(
     deferred_gpu_only_content: bool,
     has_residency: bool,
@@ -1031,8 +1036,10 @@ fn compute_defer_readback_allowed(
 /// canvas this doc predicted needs 2, so the shape of the guess is confirmed
 /// while the number is not: 8 is 4x the observed high-water mark, and nothing
 /// has yet produced the "planar layouts a few more" case that chose it.
+#[cfg(feature = "backend-vulkan")]
 const STORAGE_RESIDENCY_WINDOWS_PER_MAPPING: usize = 8;
 
+#[cfg(feature = "backend-vulkan")]
 fn note_storage_residency_writeback(state: &mut DeviceState, texture: &StagedTexture) {
     let Some(candidate) = texture.residency else {
         return;
@@ -1091,6 +1098,7 @@ fn note_storage_residency_writeback(state: &mut DeviceState, texture: &StagedTex
         .insert(candidate.key, generation);
 }
 
+#[cfg(feature = "backend-vulkan")]
 fn next_mapping_content_generation(current: u32) -> u32 {
     let next = current.wrapping_add(1);
     if next == 0 {
@@ -1105,6 +1113,7 @@ fn next_mapping_content_generation(current: u32) -> u32 {
 /// `write_only` is intentionally still seeded: access alone does not prove a
 /// dispatch overwrites every texel. The proxy makes that retained transfer
 /// cost visible while preserving partial-write semantics.
+#[cfg(feature = "backend-vulkan")]
 fn log_storage_image_access(pipe: u32, binding: u32, access: &str, bytes: u64) {
     crate::observe::off(format!(
         "compute_linux storage_access pipe={pipe} bind={binding} access={access} seed=1 bytes={bytes}"
@@ -1340,6 +1349,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             ));
             return Err(ComputeStatus::Unsupported("compute_heap_host_len"));
         };
+        #[cfg(feature = "backend-vulkan")]
         let key = crate::model::ComputeStorageResidencyKey::heap(
             task_id,
             texture_ref,
@@ -1371,7 +1381,10 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
                 },
             };
         #[cfg(not(feature = "backend-vulkan"))]
-        let (seed_generation, seed_skipped, sample_resident) = (0, false, None);
+        let (seed_generation, sample_resident): (
+            u32,
+            Option<(crate::model::ComputeStorageResidencyKey, u32)>,
+        ) = (0, None);
         crate::observe::off(format!(
             "compute_stage_tex heap_ok ref={texture_ref} heap={heap_ref} fmt={format:#x} {width}x{height} storage={} seed_gen={seed_generation} resident_sample={} use_offset={} offset={offset:#x}",
             is_storage as u8,
@@ -1386,11 +1399,14 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             height,
             bytes: vec![0; need],
             is_storage,
+            #[cfg(feature = "backend-vulkan")]
             residency: is_storage.then_some(ComputeStorageResidencyCandidate {
                 key,
                 seed_generation,
             }),
+            #[cfg(feature = "backend-vulkan")]
             seed_skipped,
+            #[cfg(feature = "backend-vulkan")]
             sample_resident,
             writeback: TextureWriteback::None,
         });
@@ -1624,11 +1640,9 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             .ok_or(ComputeStatus::MissingTexture(
                 "compute_stage_tex_mapping_gone",
             ))?;
+        #[cfg(feature = "backend-vulkan")]
         let map_generation = m.map_generation;
-        #[cfg_attr(
-            not(feature = "backend-vulkan"),
-            allow(unused_mut, reason = "the Vulkan resident-skip block below assigns it")
-        )]
+        #[cfg(feature = "backend-vulkan")]
         let mut seed_generation = m.content_generation;
         let pages_n = m.page_entries.len();
         // Wire type-4 `length` (page-aligned getResidentSize), stashed as device_desc.alloc_size.
@@ -1712,6 +1726,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             ));
             return Err(ComputeStatus::GuestIo("compute_stage_tex_type11_span"));
         }
+        #[cfg(feature = "backend-vulkan")]
         let residency_key = crate::model::ComputeStorageResidencyKey {
             mapping_id,
             map_generation,
@@ -1764,7 +1779,10 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             None => (false, None),
         };
         #[cfg(not(feature = "backend-vulkan"))]
-        let (seed_skipped, sample_resident) = (false, None);
+        let (seed_skipped, sample_resident): (
+            bool,
+            Option<(crate::model::ComputeStorageResidencyKey, u32)>,
+        ) = (false, None);
         let mut bytes = vec![0u8; need];
         if !seed_skipped
             && sample_resident.is_none()
@@ -1818,11 +1836,14 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             height,
             bytes,
             is_storage,
+            #[cfg(feature = "backend-vulkan")]
             residency: is_storage.then_some(ComputeStorageResidencyCandidate {
                 key: residency_key,
                 seed_generation,
             }),
+            #[cfg(feature = "backend-vulkan")]
             seed_skipped,
+            #[cfg(feature = "backend-vulkan")]
             sample_resident,
             writeback,
         });
@@ -2004,7 +2025,10 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
         _ => (false, 0u32, None),
     };
     #[cfg(not(feature = "backend-vulkan"))]
-    let (seed_skipped, sample_resident) = (false, None);
+    let (seed_skipped, sample_resident): (
+        bool,
+        Option<(crate::model::ComputeStorageResidencyKey, u32)>,
+    ) = (false, None);
     #[cfg(feature = "backend-vulkan")]
     if let Some((key, resident_gen, None)) = resident {
             // A bytes consumer (format-mismatched view, non-vulkan reuse):
@@ -2139,13 +2163,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
     // mapped at writeback time (the sync path would have written guest
     // pages), the deferred-writeback arm records a flush obligation with a
     // defer-time page index so aliased raw-GVA readers land it first.
-    #[cfg_attr(
-        not(feature = "backend-vulkan"),
-        allow(
-            unused_mut,
-            reason = "the Vulkan storage-residency block below assigns it"
-        )
-    )]
+    #[cfg(feature = "backend-vulkan")]
     let mut residency = None;
     #[cfg(feature = "backend-vulkan")]
     if is_storage {
@@ -2175,8 +2193,11 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
         height: h,
         bytes,
         is_storage,
+        #[cfg(feature = "backend-vulkan")]
         residency,
+        #[cfg(feature = "backend-vulkan")]
         seed_skipped,
+        #[cfg(feature = "backend-vulkan")]
         sample_resident,
         writeback,
     })
@@ -3733,6 +3754,7 @@ fn spawn_compute_engine_stall_watchdog(
     done
 }
 
+#[cfg(feature = "backend-vulkan")]
 fn spirv_words_le(bytes: &[u8]) -> Result<Vec<u32>, ComputeSpirvDecline> {
     const HEADER_LEN: usize = 20;
     const WORD_ALIGNMENT: usize = 4;

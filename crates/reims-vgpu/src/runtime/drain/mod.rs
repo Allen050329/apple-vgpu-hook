@@ -4622,9 +4622,6 @@ fn emit_stage_phase() {
 }
 
 #[cfg(not(feature = "backend-vulkan"))]
-fn emit_draw_phase() {}
-
-#[cfg(not(feature = "backend-vulkan"))]
 fn emit_engine_delta() {}
 
 /// The engine mutex's wait and hold time over the same window, split by which

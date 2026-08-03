@@ -22,6 +22,7 @@ use crate::runtime::gva_mem;
 use crate::runtime::gva_mem::write_task_gva_arm64e;
 use crate::runtime::host::FakeHost;
 
+#[cfg(feature = "backend-vulkan")]
 #[test]
 fn spirv_word_parser_splits_short_header_from_misalignment() {
     assert_eq!(
@@ -66,6 +67,7 @@ fn compute_spirv_declines_are_distinct_and_log_safe() {
     }
 }
 
+#[cfg(feature = "backend-vulkan")]
 #[test]
 fn compute_defer_readback_follows_gpu_only_content_gate() {
     assert!(
@@ -1198,6 +1200,7 @@ fn stage_texture_linear_ref_does_not_collide_with_surface_mid() {
     }
 }
 
+#[cfg(feature = "backend-vulkan")]
 #[test]
 fn stage_heap_texture_uses_host_only_residency_identity() {
     use crate::contract::pixel_format::{StorageImageSelector, MTL_FORMAT_RGBA32_FLOAT};
@@ -1266,6 +1269,7 @@ fn stage_heap_texture_uses_host_only_residency_identity() {
     assert_eq!(residency.seed_generation, 0);
 }
 
+#[cfg(feature = "backend-vulkan")]
 /// UnmapMemory removes the guest page-table alias, not the discrete
 /// type-2/3 texture body. Compute writeback must retain raw output, mirror
 /// normalized color for render sampling, and complete without attempting
@@ -1463,6 +1467,7 @@ fn incomplete_compute_engine_call_fires_stall_proxy() {
     let _ = std::fs::remove_file(format!("{base}.txt"));
 }
 
+#[cfg(feature = "backend-vulkan")]
 #[test]
 fn storage_access_proxy_names_writeonly_seed_cost() {
     let pipe = 0xd000_0000 | (std::process::id() & 0x0fff_ffff);
