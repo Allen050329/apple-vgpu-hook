@@ -1176,7 +1176,7 @@ fn handle_render_record<M: HostMemory + HostOps>(
                         if !out.type11_mappings.contains(&m) {
                             out.type11_mappings.push(m);
                         }
-                    } else if objects::resolve_type4_surface(state, host, texture_ref) {
+                    } else if objects::resolve_type4_surface_in_task(state, host, task_id, texture_ref) {
                         // x86 type-4: object ref is surface_id / mapping_id.
                         if !out.type11_mappings.contains(&texture_ref) {
                             out.type11_mappings.push(texture_ref);
@@ -1283,7 +1283,7 @@ fn handle_render_record<M: HostMemory + HostOps>(
                         if !out.type11_mappings.contains(&m) {
                             out.type11_mappings.push(m);
                         }
-                    } else if objects::resolve_type4_surface(state, host, att.texture_ref)
+                    } else if objects::resolve_type4_surface_in_task(state, host, task_id, att.texture_ref)
                         && !out.type11_mappings.contains(&att.texture_ref)
                     {
                         out.type11_mappings.push(att.texture_ref);
@@ -2256,7 +2256,7 @@ fn dirty_color_targets<M: HostMemory + HostOps>(
             // The guest pages are the only copy of a type-11 surface, so there
             // is no mirror to drop — only bump gen for scanout skips.
             let _ = state.mark_mapping_written(mid);
-        } else if objects::resolve_type4_surface(state, host, tex_ref) {
+        } else if objects::resolve_type4_surface_in_task(state, host, task_id, tex_ref) {
             let _ = state.mark_mapping_written(tex_ref);
         }
     }
@@ -3699,7 +3699,7 @@ mod tests {
         st32(&mut desc[0x20..], 64);
         let _ = host.write_gpa(data_gpa + 0x80, &desc);
 
-        assert!(objects::resolve_type4_surface(&mut state, &host, 5));
+        assert!(objects::resolve_type4_surface_in_task(&mut state, &host, 1, 5));
         let mut out = ExecResult::default();
         let mut acc = StreamAccum::default();
         acc.clears.push(ColorAttachment {
@@ -3851,7 +3851,7 @@ mod tests {
         st32(&mut desc[0x1c..], 16);
         st32(&mut desc[0x20..], 64);
         let _ = host.write_gpa(data_gpa + 0x80, &desc);
-        assert!(objects::resolve_type4_surface(&mut state, &host, 5));
+        assert!(objects::resolve_type4_surface_in_task(&mut state, &host, 1, 5));
 
         let mut out = ExecResult::default();
         let mut acc = StreamAccum::default();

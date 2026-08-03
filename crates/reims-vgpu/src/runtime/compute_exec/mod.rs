@@ -1443,7 +1443,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
                         stage_ref = sid;
                         from_type5 = true;
                         type5_record = objects::decode_type5_texture_view(&desc);
-                        let ok = objects::ensure_surface_for_present(state, host, sid);
+                        let ok = objects::ensure_surface_for_present(state, host, Some(task_id), sid);
                         // Per-bind type-5 descriptor RE census (args@+8 holds the
                         // serialized plane texture; product stage uses mapping geom
                         // only today). This is measurement, not a failure — it fired
@@ -1483,7 +1483,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
         } else if entry.object_type == objects::OBJECT_TYPE_SURFACE {
             // Direct type-4 surface bind (same id space as present mids).
             from_type4_direct = true;
-            let _ = objects::ensure_surface_for_present(state, host, stage_ref);
+            let _ = objects::ensure_surface_for_present(state, host, Some(task_id), stage_ref);
         }
     }
 
