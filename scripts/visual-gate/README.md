@@ -66,9 +66,28 @@ never the accumulated log, which spans builds.
 | `THRASH present_action_starvation` | zero across the whole accumulated log to date; a first occurrence is a real change |
 | `tdc_overflow` | census target map overflowed and re-seeded — only meaningful when the census probe is on |
 
-Any non-zero reading is a gate failure, not a note. Two of these are standing
-alarms that currently read zero; a zero is the working state, so do not delete
-them for being constant.
+Each class is held to the budget `baseline.tsv` records for it, and every class
+that fired is named in the verdict line whether or not it was inside budget — so
+a `PASS` reading `deferred_flush_lost=2/4` is never mistaken for nothing lost.
+Two of these are standing alarms that read zero across the whole accumulated
+log; a zero is the working state, so do not delete them for being constant.
+
+**Zero is the default, and four of the six keep it. Two do not, and the first
+full run on unmodified HEAD is what said so.** The plan that specified this gate
+asserted all six read zero. `deferred_flush_lost` and `mapping_page_drift` read
+1 and then 2 over two consecutive full windows of one x86/PCI boot, five over
+the boot as a whole. Every event is the same pair — the guest re-points a
+24-pixel-tall strip (1877x24 at 1920 wide: the menu bar) with no packet saying
+so, the cached page list disagrees with a fresh walk, and the render is dropped
+rather than landed at stale GPAs. Refusing that write is correct; not re-landing
+it at the new translation is an open defect, and it predates this gate.
+
+A non-zero budget is an admission about the device, not a setting. It does not
+belong in that file without a measurement and a reason beside it, and it is
+never raised to make a run pass — only when a boot of the *unmodified* tree
+exceeds it, saying in the commit which boot. A class with no row at all is
+budgeted zero, so a forgotten row fails strict rather than leaving the class
+unwatched.
 
 `counter-budget.sh` does the parsing and `self-test.sh` tests it against
 synthetic log text with no guest, no QEMU and no GPU. That split is deliberate:

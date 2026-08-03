@@ -40,6 +40,12 @@ FAILLOG="${REIMS_VGPU_FAIL_LOG:-/tmp/reims-vgpu-fail.log}"
 # the signal; the 1-minute load average is.
 SETTLE_LOAD="${SETTLE_LOAD:-1.0}"
 SETTLE_TIMEOUT="${SETTLE_TIMEOUT:-420}"
+# And the load average is not a signal either until the guest has been up longer
+# than the average's own window. Measured on a fresh boot here: 40 s up reading
+# 1.28, 65 s up reading 1.09 — a figure averaging over more time than the
+# machine has existed, still climbing as the desktop loads. Guests that have
+# settled read 0.93-0.99 at two to three minutes up.
+SETTLE_MIN_UPTIME="${SETTLE_MIN_UPTIME:-180}"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -69,23 +75,32 @@ qemu_alive() { pgrep -f 'qemu-system-x86_6[4]' >/dev/null 2>&1; }
 
 qemu_alive || { say "no QEMU running — boot the pathway first" >&2; exit 2; }
 
-say "waiting for the guest to settle (1-minute load under $SETTLE_LOAD, up to ${SETTLE_TIMEOUT}s)"
+say "waiting for the guest to settle (up ${SETTLE_MIN_UPTIME}s, 1-minute load under $SETTLE_LOAD, giving up after ${SETTLE_TIMEOUT}s)"
 settled=0
 deadline=$((SECONDS + SETTLE_TIMEOUT))
 while [ "$SECONDS" -lt "$deadline" ]; do
   qemu_alive || { say "QEMU exited while waiting for the guest" >&2; exit 2; }
+  # Not from `uptime`, which spells its own age "40 secs", "1 min" and "1:23" by
+  # turns. `kern.boottime` reports one integer in every state.
+  up=$(ssh -o ConnectTimeout=8 -o BatchMode=yes "$GUEST" \
+       'echo "$(date +%s) $(sysctl -n kern.boottime)" | awk "{print \$1 - (\$5+0)}"' 2>/dev/null)
   # macOS `uptime` ends with "load averages: 1.23 1.45 1.67"; the 1-minute
   # figure is the first of the three, which is $(NF-2).
   load=$(ssh -o ConnectTimeout=8 -o BatchMode=yes "$GUEST" uptime 2>/dev/null \
          | awk '{print $(NF-2)}' | tr -d ',')
-  if [ -n "$load" ] && awk -v l="$load" -v t="$SETTLE_LOAD" 'BEGIN{exit !(l+0 < t+0)}'; then
-    say "guest settled at load $load"
+  if [ -n "$up" ] && [ -n "$load" ] \
+     && [ "$up" -ge "$SETTLE_MIN_UPTIME" ] \
+     && awk -v l="$load" -v t="$SETTLE_LOAD" 'BEGIN{exit !(l+0 < t+0)}'; then
+    say "guest settled: up ${up}s at load $load"
     settled=1
     break
   fi
   sleep 10
 done
-[ "$settled" = 1 ] || { say "guest never settled (last load '${load:-unreachable}')" >&2; exit 2; }
+[ "$settled" = 1 ] || {
+  say "guest never settled (up '${up:-unreachable}s', last load '${load:-unreachable}')" >&2
+  exit 2
+}
 
 # The power state is not a verdict input — the gate answers correct-or-not, and
 # frame rate is bimodal here regardless. It is recorded because a log read later
@@ -107,7 +122,8 @@ OFF=0
 # Every probe runs even when an earlier one fails: which probe fails is the
 # diagnostic. `set -e` is off for exactly these three lines.
 run_probe() {
-  local name="$1" log="$WORK/$name.log"; shift
+  local name="$1"; shift
+  local log="$WORK/$name.log"
   say "running $name"
   set +e
   "$@" >"$log" 2>&1
@@ -146,10 +162,10 @@ else
   : >"$WINDOW"
 fi
 
-# The six silent-loss classes. Any non-zero reading over the gate's own window
-# is a gate failure, not a note. Two of them are standing alarms that read zero
-# across the whole accumulated log to date — a zero is the working state, and a
-# first occurrence is the result.
+# The six silent-loss classes, each held to the budget `baseline.tsv` records
+# for it. Zero is the default and four of them keep it; the two that do not
+# carry their measurement and their argument in that file, because a non-zero
+# budget is an admission about the device rather than a setting.
 #
 # The parsing lives in its own script so `self-test.sh` can exercise it against
 # synthetic log text without a boot: a parser that matches nothing prints the
@@ -164,12 +180,16 @@ set -e
 
 probe_fails=$(awk -F'\t' '$2 == 1' "$WORK/verdicts" | wc -l)
 probe_setup=$(awk -F'\t' '$2 != 0 && $2 != 1' "$WORK/verdicts" | wc -l)
-hot=$(awk -F'\t' '$2 > 0 {printf "%s=%s ", $1, $2}' "$WORK/counters")
-hot=${hot% }
+# Every class that fired is named in the verdict whether or not it was inside
+# its budget, so a `PASS` is never read as "nothing was lost".
+seen=$(awk -F'\t' '$2 > 0 {printf "%s=%s/%s ", $1, $2, $3}' "$WORK/counters")
+seen=${seen% }
+over=$(awk -F'\t' '$2 > $3 {printf "%s=%s>%s ", $1, $2, $3}' "$WORK/counters")
+over=${over% }
 
 bytes=$(stat -c %s "$WINDOW")
 summary="$MODE mode, $(awk -F'\t' '$2 == 0' "$WORK/verdicts" | wc -l)/3 probes green"
-summary="$summary, counters over ${bytes} B of fail log: ${hot:-all zero}"
+summary="$summary, counters over ${bytes} B of fail log: ${seen:-all zero}"
 
 if [ "$probe_setup" -gt 0 ]; then
   say "SETUP-FAILED — $summary"
@@ -177,9 +197,10 @@ if [ "$probe_setup" -gt 0 ]; then
   exit 2
 fi
 
-if [ "$probe_fails" -gt 0 ] || [ -n "$hot" ]; then
+if [ "$probe_fails" -gt 0 ] || [ "$budget_rc" != 0 ]; then
   say "FAIL — $summary"
   awk -F'\t' '$2 == 1 {printf "visual-gate:   %s: %s\n", $1, $3}' "$WORK/verdicts"
+  [ -z "$over" ] || say "  over budget: $over"
   exit 1
 fi
 
