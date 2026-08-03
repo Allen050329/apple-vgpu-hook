@@ -87,14 +87,25 @@ pub fn read_mapping_bgra8<M: HostMemory + crate::runtime::host::HostOps>(
 
 /// Always-on census of the capture readback-elision ratio (never silent):
 /// `full` = readback + proxy scan ran; `light` = the window is carrying the frame
-/// from the engine resident, readback skipped. Deduped to one line per 1024 total
-/// captures (a line every ~8 s at 120 Hz), so it confirms the elision engages
-/// without flooding the fail view.
+/// from the engine resident, readback skipped.
+///
+/// Emitted at power-of-two capture counts rather than at a fixed interval. The
+/// interval this used to carry was one line per 1024 captures, sized as "a line
+/// every ~8 s at 120 Hz" — but a capture is one accepted DisplaySwap, not one
+/// vblank, and a driven boot records 63 of them across 423 s. At that rate the
+/// first line landed somewhere past the half-hour mark, so a census documented as
+/// always-on emitted nothing on any boot anyone has run, and a regression in the
+/// elision it measures would have gone unread.
+///
+/// Power-of-two spacing fixes both ends at once: the ratio is readable from the
+/// first capture onward, and the line count is bounded by log2 of the capture
+/// count — about twenty lines per boot even if the rate rises by orders of
+/// magnitude, so there is no interval to re-tune when it does.
 fn maybe_log_capture_sampling(state: &DeviceState) {
     let full = state.present.full_captures;
     let light = state.present.light_captures;
     let total = full.wrapping_add(light);
-    if total != 0 && total.is_multiple_of(1024) {
+    if total != 0 && total.is_power_of_two() {
         crate::observe::off(format!("capture_sampling full={full} light={light}"));
     }
 }
