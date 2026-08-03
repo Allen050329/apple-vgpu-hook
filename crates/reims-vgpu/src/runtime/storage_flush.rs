@@ -665,6 +665,31 @@ pub fn flush_linear_windows_before_fence<M: HostMemory + HostOps>(
 /// `deferred_flush_clobber` is 8 975 lines of that boot's fail log — the largest
 /// self-declared loss of guest work anywhere in it.
 ///
+/// **Those are the numbers that motivated the fence, not current ones.** A
+/// driven x86/Vulkan boot on today's binary — 30 s Safari window drag plus two
+/// web-content probe runs — reads:
+///
+/// ```text
+/// surface_resident               23 196
+/// surface_flush                  23 196
+/// render_flush_over_guest_write     152    0.66 % of windows, was 73 %
+/// rendw_stamp_outlived                0    was 12 343
+/// ```
+///
+/// `rendw_stamp_outlived` going to zero is the structural half: no window is
+/// landing after `write_stamp` any more, which is the ordering statement this
+/// rail can actually make, and the doc below names its non-zero as the defect
+/// to watch. The clobber rate falling with it is what that predicts.
+///
+/// Do not read the two tables as one experiment. The 73 % boot was a heavier
+/// and much more guest-CPU-composited workload (Mission Control, Spotlight,
+/// Finder recomposite rounds) over 300 s, so workload and binary are
+/// confounded and the ratio between them is not a measured improvement. What
+/// the second table does establish is that **the clobber class is no longer the
+/// largest loss in the log on the workload this project drives**, and that
+/// bounding what a flush copies is now motivated by its byte cost rather than
+/// by this correctness hazard.
+///
 /// [`render_flush_guest_written_ranges`] states why the obvious repair —
 /// preserve the pages the guest wrote — is not available: `page_gen[p]` is
 /// stamped at the *harvest* that saw page `p` dirty, not at the write, so the
