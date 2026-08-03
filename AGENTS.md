@@ -193,6 +193,25 @@ already been run to exhaustion; re-running one costs hours and has so far return
   loops skipped the `dest_window` bound six sibling call sites take. When auditing here, diff the two
   arms against each other rather than reading either alone — and grep the *other* arm's comments,
   because in three of these four the correct rule was already written down next to the wrong code.
+- **The one remaining oracle-shaped thing is in the mapper, and only an Apple host can settle it.**
+  `contract/iosurface_pages::build_table_plan` reaches the IOSurface page table through *two*
+  candidate chases — `MappingInternal` field `+0x48` then `+0xb8`, and field `+0x50` then `+0x28` —
+  builds a candidate from each field that holds a kernel VA, and returns the entries of whichever
+  candidate `read_table_entries` parses first. Read cold that is the classic "try both, keep the one
+  that works" ladder, and `MapperMem::read` beside it picks `read_kva` vs `read_gpa` by testing the
+  address against the kernel-VA ranges rather than by knowing which space the field is in.
+  **Do not change either from an x86 host.** This whole rail is arm64-only: it is entered from
+  `mapper::capture_at_producer`, which needs `HostOps::read_xreg`, and the x86 PCI shim returns -1
+  for that unconditionally (`reims_vgpu_pci_read_xreg`, "no arm xreg handoff"). Nothing here
+  executes on the x86/Vulkan pathway, so no boot on this host can measure it and no x86 evidence can
+  justify touching it.
+  It also may not be a ladder at all. The two-candidate branch only *chooses* when both fields hold
+  kernel VAs at once; if exactly one is ever populated, this is two layouts handled side by side and
+  is fine as written. Settling it needs one arm64 boot and two counts: how often both fields are
+  populated, and — when they are — whether candidate `+0x48` ever fails where `+0x50` then succeeds.
+  If that pair never happens, delete the fallback and keep the field test. If it does, the
+  discriminator is a real contract gap and the fix is to find the field that selects between them,
+  not to keep parsing both.
 - **The x86 GVA page-table walk is exactly conformant; do not re-audit it.** `contract/gva.rs` and
   `contract/gva_resolve.rs` were checked field by field against the contract and every constant
   holds: a PTE is 4 bytes, the PFN is bits `[30:0]` raw (`PTE_PFN_MASK`), bit 31 is a flag, the
