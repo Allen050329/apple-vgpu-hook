@@ -2604,8 +2604,8 @@ fn claim_display_vbl_long_stall_resyncs_without_burst() {
 
 /// After online is acked, a stale ONLINE bit (bit2) left in pending is
 /// suppressed by the present/VBL signalers instead of re-delivered — else the
-/// guest re-runs process_online → connectionChange → boot-progress overlay
-/// (x86 RE 2026-07-17). The signaler still records `stale_online_pending`
+/// guest re-runs process_online → connectionChange → boot-progress overlay.
+/// The signaler still records `stale_online_pending`
 /// (measure + fix together). Pre-ack the bit is preserved (see the present
 /// completion test) — the suppression is gated strictly on `online_acked`.
 #[test]

@@ -9,7 +9,7 @@
 
 use crate::contract::endian::{ld32, st16, st32};
 
-// --- child opcodes and record layout (static RE of the PVG command table) ---
+// --- child opcodes and record layout, as the PVG command table numbers them ---
 
 /// PVG table: CmdUnmapMemory (not map — MapMemory2 is `0x39`).
 pub const CHILD_OP_UNMAP_MEMORY: u16 = 0x22;
@@ -21,7 +21,7 @@ pub const CHILD_OP_SYNCHRONIZE_RESOURCES: u16 = 0x35;
 pub const CHILD_OP_MAP_MEMORY2: u16 = 0x39;
 pub const CHILD_OP_CONFIG_40: u16 = 0x40;
 
-/// CmdInvalidateResources / CmdSynchronizeResources shared header (RE pageBacking).
+/// CmdInvalidateResources / CmdSynchronizeResources shared header.
 pub const CHILD_RESOURCE_LIST_TASK_ID: u32 = 0x00;
 pub const CHILD_RESOURCE_LIST_COUNT: u32 = 0x04;
 pub const CHILD_RESOURCE_LIST_HEADER_LEN: u32 = 8;
@@ -59,11 +59,9 @@ pub const CHILD_EXEC_INDIRECT_CMDBUF_LENGTH: u32 = 0x08;
 
 /// Per-resource descriptor offsets inside the EXEC_INDIRECT2 resource table.
 ///
-/// RE of `AppleParavirtCommandQueue::writeInvalidates(AppleParavirtSegmentResourceList*,
-/// AppleParavirtCommandAllocator&)`: one 24-byte record per live list entry,
-/// `{object_id u32}` followed by the same four validity-op bytes a
-/// `CmdInvalidateResources` record carries, then 16 trailing bytes this kext
-/// build zeroes.
+/// The queue writes one 24-byte record per live list entry: `{object_id u32}`
+/// followed by the same four validity-op bytes a `CmdInvalidateResources`
+/// record carries, then 16 trailing bytes it zeroes.
 pub const CHILD_EXEC_RESOURCE_OBJECT_ID: u32 = 0x00;
 pub const CHILD_EXEC_RESOURCE_VALIDITY_OPS: u32 = 0x04;
 pub const CHILD_EXEC_RESOURCE_TAIL: u32 = 0x08;

@@ -16,7 +16,7 @@
 //!
 //! Type-7 tag `0x36` materializes a host `MTLIndirectCommandBuffer` (cached per
 //! task/ref). Command fills use the host Metal fill API in
-//! [`crate::runtime::icb`] — stream fill opcodes are not RE'd yet. Execute
+//! [`crate::runtime::icb`] — the stream carries no fill opcodes. Execute
 //! applies **parent-encoder inheritance** from stream [`ComputeAccum`] (Metal:
 //! buffers when `inheritBuffers`, pipeline when `inheritPipelineState`; textures/
 //! samplers are never recordable into classic `MTLIndirectComputeCommand` and

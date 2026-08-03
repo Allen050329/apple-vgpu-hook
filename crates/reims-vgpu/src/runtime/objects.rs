@@ -513,8 +513,8 @@ pub fn decode_type4_surface(desc: &[u8]) -> Option<Type4Surface> {
 
 /// Build `sIOSurfaceDeviceDescriptor` geometry from type-4 wire (no invent).
 ///
-/// Multi-plane: plane records from type-4 planes; sample path selects by geometry
-///. Single-plane: surface-level fields only
+/// Multi-plane: plane records from type-4 planes; sample path selects by
+/// geometry. Single-plane: surface-level fields only
 /// (`plane_count==0` path in `sample_window_prefer_device`).
 fn synthesize_device_desc_from_type4(surf: &Type4Surface) -> Vec<u8> {
     let mut device_desc = vec![0u8; DEVICE_DESC_LEN];

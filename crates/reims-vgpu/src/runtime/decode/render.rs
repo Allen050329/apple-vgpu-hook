@@ -807,8 +807,8 @@ mod tests {
     /// `alloc(1, 8)`, so wire sz `0x10` and an 8-byte payload of
     /// `u32 primitiveType · u16 vertexStart · u16 vertexCount`.
     ///
-    /// These payload bytes are the contract's, from the RE'd encoder plus the
-    /// checked-in corpus record: `03 00 00 00 00 00 06 00` = triangle list,
+    /// These payload bytes are the contract's, from the encoder's field order
+    /// plus the checked-in corpus record: `03 00 00 00 00 00 06 00` = triangle list,
     /// vertexStart 0, vertexCount 6.
     ///
     /// This is the test that fails without the fix. The old fixture was a

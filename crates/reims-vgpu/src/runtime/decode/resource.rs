@@ -90,7 +90,7 @@ pub const ICB_DESC_TAG: usize = 0;
 pub const ICB_DESC_DECLARED_LEN: usize = 4;
 pub const ICB_DESC_COMMAND_TYPES: usize = 8;
 /// Per-stage max bind counts are single bytes (PGSerializer create body).
-/// Host RE 2026-07-12 `newIndirectCommandBufferWithDescriptor:…` strb order:
+/// `newIndirectCommandBufferWithDescriptor:…` strb order:
 /// +0xc vertex · +0xd fragment · +0xe kernel · +0xf object · +0x10 mesh ·
 /// +0x11 kernelTG · +0x12 objectTG.
 pub const ICB_DESC_MAX_VERTEX_BINDS: usize = 0x0c; // u8
@@ -109,12 +109,12 @@ pub const ICB_DESC_FLAGS: usize = 0x16; // u16 feature flags
 /// Bytes per ICB kernel-threadgroup-memory length slot (`u64` length at index).
 pub const ICB_TG_MEMORY_STRIDE: usize = 8;
 /// Bytes per ICB attribute-stride table entry (`u64` stride at buffer index).
-/// Host RE 2026-07-12: `setKernelBuffer:offset:attributeStride:atIndex:` /
+/// `setKernelBuffer:offset:attributeStride:atIndex:` and
 /// `setVertexBuffer:offset:attributeStride:atIndex:` store at
 /// `attributeStrideOffset + index*8`.
 pub const ICB_ATTRIBUTE_STRIDE_ENTRY_SIZE: usize = 8;
-/// Flags at +0x16 from create: bit0 = inheritPipelineState, bit1 = inheritBuffers
-/// (selrefs on host AppleParavirtGPUMetalIOGPUFamily; setupCommandLayout order).
+/// Flags at +0x16 from create, in the order the command layout sets them up:
+/// bit0 = inheritPipelineState, bit1 = inheritBuffers.
 pub const ICB_FLAG_INHERIT_PIPELINE_STATE: u16 = 1 << 0;
 pub const ICB_FLAG_INHERIT_BUFFERS: u16 = 1 << 1;
 /// Embedded ICB command layout (52 B) at +0x1c in the create body.
@@ -125,14 +125,14 @@ pub const ICB_DESC_OPTIONS: usize = 0x54;
 /// Command-type values written by PGSerializerIndirect*Command fills.
 pub const ICB_CMD_TYPE_DRAW: u32 = 0x1;
 pub const ICB_CMD_TYPE_DRAW_INDEXED: u32 = 0x2;
-/// Host RE 2026-07-12: `drawPatches` stores wire type `4`.
+/// `drawPatches` stores wire type `4`.
 pub const ICB_CMD_TYPE_DRAW_PATCHES: u32 = 0x4;
-/// Host RE 2026-07-12: `drawIndexedPatches` stores wire type `8`.
+/// `drawIndexedPatches` stores wire type `8`.
 pub const ICB_CMD_TYPE_DRAW_INDEXED_PATCHES: u32 = 0x8;
 pub const ICB_CMD_TYPE_CONCURRENT_DISPATCH_THREADGROUPS: u32 = 0x20;
 pub const ICB_CMD_TYPE_CONCURRENT_DISPATCH_THREADS: u32 = 0x40;
 /// Wire command type = SDK bit value (same pattern as Draw/Patches).
-/// Host RE 2026-07-12 `setupCommandLayout:` uses `1<<7` / `1<<8` for mesh args size.
+/// `setupCommandLayout:` uses `1<<7` / `1<<8` for mesh args size.
 /// Fill IMPs are stubs; type value follows the bit-pattern convention.
 pub const ICB_CMD_TYPE_DRAW_MESH_THREADGROUPS: u32 = 0x80;
 pub const ICB_CMD_TYPE_DRAW_MESH_THREADS: u32 = 0x100;
@@ -155,7 +155,7 @@ pub const ICB_DRAW_PATCHES_ARGS_LEN: u32 = 0x38;
 /// Note: `setupCommandLayout` allocates max `0x4c` for this bit; fill IMP uses through `0x4a`.
 pub const ICB_DRAW_INDEXED_PATCHES_ARGS_LEN: u32 = 0x4a;
 /// Mesh drawMeshThreadgroups / drawMeshThreads args size.
-/// Host RE 2026-07-12 `setupCommandLayout:`: both mesh create bits take **0x48** —
+/// `setupCommandLayout:`: both mesh create bits take **0x48** —
 /// three `MTLSize` (3×u64 each) matching Metal SPI
 /// `MTLIndirectDrawMesh{Threadgroups,Threads}Arguments` field order:
 /// grid / threadsPerGrid @0, object TG @0x18, mesh TG @0x30.
@@ -589,7 +589,7 @@ pub const HEAP_TEXTURE_USE_OFFSET: usize = 48;
 pub const HEAP_TEXTURE_OFFSET: usize = 52;
 // Opcode 9 is NOT a view: it is a buffer-backed texture (`newTextureWithBuffer:
 // descriptor:offset:bytesPerRow:`) serialized by `-[PGSerializer newTextureWith
-// Buffer:...]` (static-RE 2026-07-17, AppleParavirtGPUMetal literal 0x4000000009).
+// Buffer:...]`.
 // It shares only the type-8 object tag + 16-byte header (opcode@0, len@4,
 // self-ref@8, source-ref@0xc); the source ref @0xc is a BUFFER, not a texture,
 // and the body is {u64 offset, u64 bytesPerRow, 32-byte embedded MTLTextureDescriptor}.
@@ -799,8 +799,8 @@ pub const DEPTH_STENCIL_BACK_STENCIL_ENABLED: u32 = 1 << 5;
 
 /// Per-command-slot layout offsets inside the ICB backing buffer.
 ///
-/// Type encoding from `AppleParavirtIndirectCommandBuffer._commandLayout`
-/// (host RE 2026-07-11). Embedded at create-body `+0x1c` (52 bytes).
+/// Type encoding from `AppleParavirtIndirectCommandBuffer._commandLayout`,
+/// embedded at create-body `+0x1c` (52 bytes).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct IcbCommandLayout {
     pub command_type_offset: u16,
@@ -1818,9 +1818,9 @@ pub struct BufferTextureDescriptor {
     pub array_length: u16,
 }
 
-/// Decode the opcode-9 (buffer-backed texture) type-8 descriptor. Layout is
-/// static-RE'd from `AppleParavirtGPUMetal`'s
-/// `newTextureWithBuffer:descriptor:offset:bytesPerRow:allocator:` (2026-07-17).
+/// Decode the opcode-9 (buffer-backed texture) type-8 descriptor — the
+/// serialized form of
+/// `newTextureWithBuffer:descriptor:offset:bytesPerRow:allocator:`.
 pub fn decode_buffer_texture_descriptor(
     bytes: &[u8],
 ) -> Result<BufferTextureDescriptor, DecodeStatus> {
@@ -2105,7 +2105,7 @@ pub fn encode_icb_command_layout(layout: &IcbCommandLayout) -> [u8; ICB_LAYOUT_L
 
 /// Render-only layout for Draw / DrawIndexed / patches / mesh, no inherit.
 ///
-/// Host RE `setupCommandLayout:` (pipeline `0x60`): bind tables in order
+/// `setupCommandLayout:` (pipeline `0x60`): bind tables in order
 /// vertex → fragment → **object → mesh** → kernel, each `count × 0x14`, then
 /// attribute-stride table (`maxVertex × 8` when dynamic stride), object-TG
 /// lengths, kernel-TG lengths, then args.
@@ -2274,7 +2274,7 @@ pub fn compute_only_icb_layout(max_kernel: u16) -> IcbCommandLayout {
 
 /// Compute ICB layout with optional TG-memory table and attribute-stride table.
 ///
-/// Host RE 2026-07-12 `setupCommandLayout:` order after kernel binds:
+/// `setupCommandLayout:` order after kernel binds:
 /// 1. `max_kernel × 8` attribute-stride u64s at `attributeStrideOffset`
 /// 2. `max_kernel_tg × 8` TG-memory length u64s at `threadgroupMemoryLengthOffset`
 /// 3. dispatch args. Barrier is u32 at `barrierOffset` (typically 4).

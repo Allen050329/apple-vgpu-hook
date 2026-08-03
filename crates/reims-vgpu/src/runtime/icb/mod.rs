@@ -10,8 +10,8 @@
 //!
 //! ## Command fills — buffer-backed, not stream opcodes
 //!
-//! RE of `AppleParavirtGPUMetalIOGPUFamily` (2026-07-11): there is **no** Reims VGPU
-//! compute-stream opcode for `indirectComputeCommandAtIndex` fills. Guest CPU
+//! There is **no** Reims VGPU compute-stream opcode for
+//! `indirectComputeCommandAtIndex` fills. Guest CPU
 //! writes into an ICB backing buffer via
 //! `PGSerializerIndirectComputeCommand` (setPSO / setKernelBuffer /
 //! concurrentDispatch*). Command slots use the layout from create:
@@ -239,7 +239,7 @@ impl IcbRenderBufferBind {
 }
 
 /// Tessellation-factor buffer recorded at layout `tessellationFactorOffset`.
-/// Host RE 2026-07-12: u32 ref@0 · u64 va@4 · u64 gpuva@0xc · u64 instanceStride@0x14.
+/// u32 ref@0 · u64 va@4 · u64 gpuva@0xc · u64 instanceStride@0x14.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct IcbTessellationFactor {
     pub buffer_ref: u32,
@@ -314,8 +314,8 @@ pub enum IcbRenderDraw {
 /// Wire: three MTLSize as 3×u64 each at `commandArgumentsOffset`, total
 /// [`ICB_DRAW_MESH_ARGS_LEN`] (`0x48` from host `setupCommandLayout`). Field
 /// order matches Metal SPI `MTLIndirectDrawMesh*Arguments` — grid @0, object TG
-/// @0x18, mesh TG @0x30. Fill IMPs are stubs; layout is RE'd from
-/// setupCommandLayout + concurrent-dispatch packing + SPI field order.
+/// @0x18, mesh TG @0x30. Fill IMPs are stubs; the layout follows
+/// `setupCommandLayout` + concurrent-dispatch packing + SPI field order.
 ///
 /// `drawMeshThreads` (`0x100`) and `drawMeshThreadgroups` (`0x80`) write byte-
 /// identical records; the only difference is what the first MTLSize counts,
@@ -481,7 +481,7 @@ pub fn decode_compute_command_slot(
     }
 
     // Barrier: u32 at barrierOffset (setBarrier writes 1, clearBarrier writes 0).
-    // Host RE 2026-07-12 PGSerializerIndirectComputeCommand setBarrier/clearBarrier.
+    // PGSerializerIndirectComputeCommand setBarrier/clearBarrier.
     let mut barrier = false;
     if layout.barrier_offset != 0 {
         let bo = layout.barrier_offset as usize;
@@ -674,7 +674,7 @@ pub fn decode_render_command_slot(
             }
         }
         ICB_CMD_TYPE_DRAW_PATCHES => {
-            // Host RE: u16 controlPoints@0, u64 patchStart@2, u64 patchCount@0xa,
+            // u16 controlPoints@0, u64 patchStart@2, u64 patchCount@0xa,
             // u32 patchIndexRef@0x12, u64 va@0x16, u64 gpuva@0x1e,
             // u64 instanceCount@0x26, u64 baseInstance@0x2e.
             if args + ICB_DRAW_PATCHES_ARGS_LEN as usize > slot.len() {
@@ -696,7 +696,7 @@ pub fn decode_render_command_slot(
             }
         }
         ICB_CMD_TYPE_DRAW_INDEXED_PATCHES => {
-            // Host RE: like DrawPatches through patchIndex, then
+            // like DrawPatches through patchIndex, then
             // u32 controlPointIndexRef@0x26, u64 va@0x2a, u64 gpuva@0x32,
             // u64 instanceCount@0x3a, u64 baseInstance@0x42.
             if args + ICB_DRAW_INDEXED_PATCHES_ARGS_LEN as usize > slot.len() {
@@ -1297,7 +1297,6 @@ pub fn resolve_metal_icb<M: HostMemory + HostOps>(
 ///
 /// Full wire record length `0x18` (8 B header + 16 B payload). Payload:
 /// `icb_ref:u32 @0`, `buffer_ref:u32 @4`, `gpu_address:u64 @8`.
-/// Host RE 2026-07-11 AppleParavirtGPUMetalIOGPUFamily.
 pub const INFO_OP_ICB_HOST_RESOURCE: u32 = 0x1d1;
 pub const INFO_OP_ICB_HOST_RESOURCE_RECORD_LEN: u32 = 0x18;
 pub const INFO_OP_ICB_HOST_RESOURCE_PAYLOAD_LEN: usize = 0x10;
