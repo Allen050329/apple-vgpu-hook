@@ -48,6 +48,21 @@ mod vulkan;
 #[cfg(feature = "backend-vulkan")]
 pub use vulkan::*;
 
+// The Metal ICB execute half of this path. Gated once here rather than per
+// item, and re-exported flat for the same reason as `vulkan`. The
+// `backend-vulkan` arm of `encode_icb_execute_and_writeback` is the one item
+// the file carried that this gate does not describe, so it stays below.
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+mod metal_icb;
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+pub use metal_icb::*;
+
+// Type-8 texture-view resolution and linear texture loads. Backend-independent,
+// so the module carries no gate of its own; the two items inside it that are
+// arm- or test-specific keep theirs.
+mod texture_view;
+pub(crate) use texture_view::*;
+
 /// Upper bound on a single buffer materialization (pathological pooled allocs).
 /// Metal buffer/texture bind **index** cap (`REIMS_VGPU_METAL_MAX_BUFFERS`) — API slot
 /// count, not a byte-size budget. Resource byte sizes follow the guest
@@ -3279,7 +3294,19 @@ pub fn writeback_chain_rgba<M: HostMemory + HostOps>(
     wrote
 }
 
-include!("metal_icb.rs");
+/// Builds without a Metal encode path have no host ICB to execute.
+#[cfg(feature = "backend-vulkan")]
+pub fn encode_icb_execute_and_writeback<M: HostMemory + HostOps>(
+    _state: &mut DeviceState,
+    _host: &mut M,
+    _req: &DrawEncodeRequest,
+    _icb_ref: u32,
+    _range_location: u64,
+    _range_length: u64,
+) -> EncodeStatus {
+    EncodeStatus::NoMetal("icb_exec_no_metal_build")
+}
+
 /// Archive `apple_pv_gpu_lookup_render_target`: type-11 first, else type-2/3 GVA.
 ///
 /// Wallpaper/background intermediates are type-2/3 guest-VA; type-11-only resolve
@@ -4359,7 +4386,6 @@ fn load_type11_rgba_memoized<M: HostMemory + HostOps>(
     ))
 }
 
-include!("texture_view.rs");
 #[cfg(test)]
 mod tests;
 

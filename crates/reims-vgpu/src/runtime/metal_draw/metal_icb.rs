@@ -1,7 +1,16 @@
-/// Execute a host ICB on a render encoder over the request's color RTs.
-///
+//! Execute a host ICB on a render encoder over the request's color RTs:
+//! parent-encoder inheritance, the Metal execute itself, and color writeback.
+//!
+//! The whole module is gated on `all(backend-metal, target_os = "macos")` at
+//! its declaration in [`super`], which also re-exports these items flat so
+//! callers keep addressing them as `crate::runtime::metal_draw::<name>`. The
+//! `backend-vulkan` arm of `encode_icb_execute_and_writeback` is a stub that
+//! lives in [`super`], since it is the other half of the same entry point.
+//! `use super::*` pulls in the parent's imports, which this module shares.
+
+use super::*;
+
 /// Retained Metal objects for the duration of one ICB execute command buffer.
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
 #[derive(Default)]
 struct IcbEncoderKeepAlive {
     buffers: Vec<metal::Buffer>,
@@ -16,9 +25,8 @@ struct IcbEncoderKeepAlive {
 /// descriptor, command-memory, and command-fill failures. These checks happen
 /// later, while applying the decoded draw stream to the parent encoder, and
 /// carry the bind/pipeline values needed to diagnose the rejected execute.
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum MetalIcbInheritanceDecline {
+pub(super) enum MetalIcbInheritanceDecline {
     CullModeUnsupported {
         value: u32,
     },
@@ -113,7 +121,6 @@ enum MetalIcbInheritanceDecline {
     },
 }
 
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
 impl crate::observe::Decline for MetalIcbInheritanceDecline {
     fn slug(&self) -> &'static str {
         match self {
@@ -272,7 +279,6 @@ impl crate::observe::Decline for MetalIcbInheritanceDecline {
 /// - **Vertex/fragment buffers** are used when the ICB was created with
 ///   `inheritBuffers=true`.
 /// - **Pipeline** is used when created with `inheritPipelineState=true`.
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn apply_icb_encoder_inheritance<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -662,7 +668,6 @@ fn apply_icb_encoder_inheritance<M: HostMemory + HostOps>(
 ///
 /// Latched per `(reason, icb_ref)`: the guest re-submits the same ICB every
 /// frame, so an unlatched line would be one per frame per refusal.
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn render_icb_declined(
     e: crate::runtime::icb::IcbStatus,
     task_id: u32,
@@ -694,7 +699,6 @@ fn render_icb_declined(
 /// Before execute, applies parent-encoder inheritance from [`DrawEncodeRequest`]
 /// (viewport, scissor, buffers when `inheritBuffers`, textures/samplers, and
 /// pipeline when `inheritPipelineState`).
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
 pub fn encode_icb_execute_and_writeback<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -917,19 +921,7 @@ pub fn encode_icb_execute_and_writeback<M: HostMemory + HostOps>(
     EncodeStatus::Ok
 }
 
-#[cfg(feature = "backend-vulkan")]
-pub fn encode_icb_execute_and_writeback<M: HostMemory + HostOps>(
-    _state: &mut DeviceState,
-    _host: &mut M,
-    _req: &DrawEncodeRequest,
-    _icb_ref: u32,
-    _range_location: u64,
-    _range_length: u64,
-) -> EncodeStatus {
-    EncodeStatus::NoMetal("icb_exec_no_metal_build")
-}
-
-#[cfg(all(test, feature = "backend-metal", target_os = "macos"))]
+#[cfg(test)]
 mod metal_icb_split_tests {
     use super::*;
 

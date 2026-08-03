@@ -1,3 +1,15 @@
+//! Type-8 texture-view chain resolution and the CPU linear-texture loads that
+//! consume it: swizzle application, native upload-format selection, and the
+//! tight-row RGBA/BGRA readers shared by the sample and seed paths.
+//!
+//! Backend-independent, so [`super`] declares this module ungated and
+//! re-exports its items flat — callers keep addressing them as
+//! `crate::runtime::metal_draw::<name>`. The two items that really are arm- or
+//! test-specific carry their own cfg. `use super::*` pulls in the parent's
+//! imports, which this module shares.
+
+use super::*;
+
 /// Type-8 view resolution for sample/seed paths.
 #[derive(Clone, Debug)]
 pub(crate) struct ViewResolve {
@@ -306,7 +318,7 @@ pub(crate) fn resolve_texture_view_reasoned<M: HostMemory + HostOps>(
 /// the chain exceeds the max depth without a non-view base, a base ref is zero,
 /// or swizzle selectors are malformed. See [`resolve_texture_view_reasoned`] for
 /// the specific reason on the fail path.
-fn resolve_texture_view<M: HostMemory + HostOps>(
+pub(super) fn resolve_texture_view<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &M,
     task_id: u32,
@@ -340,7 +352,7 @@ pub(crate) fn effective_view_sample_format(base_fmt: u16, view_fmt: Option<u16>)
 /// Metal-direct pathway still needs it, so it reports itself rather than being
 /// deleted.
 #[cfg(any(test, all(feature = "backend-metal", target_os = "macos")))]
-fn apply_view_swizzle_rgba8(
+pub(super) fn apply_view_swizzle_rgba8(
     rgba: &mut [u8],
     plan: Option<&pixel_format::SwizzlePlan>,
     texture_ref: u32,
@@ -460,7 +472,7 @@ impl crate::observe::Decline for LinearLoadRefusal {
     }
 }
 
-fn load_linear_texture_rgba_host<M: HostMemory + HostOps>(
+pub(super) fn load_linear_texture_rgba_host<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
@@ -488,7 +500,7 @@ fn load_linear_texture_rgba_host<M: HostMemory + HostOps>(
 /// `BGRA8` qualifies only when the caller opts into a native BGRA8 upload
 /// (`native_bgra8`), otherwise it must be swapped to RGBA8. Every other format
 /// needs a real convert pass and returns `None`.
-fn linear_native_upload_format(sample_format: u16, native_bgra8: bool) -> Option<TexelLayout> {
+pub(super) fn linear_native_upload_format(sample_format: u16, native_bgra8: bool) -> Option<TexelLayout> {
     use pixel_format::SampledClass;
     // The decode contract's sampled class is the one rule for "which 8-bit
     // channel order is this"; it folds each sRGB format onto its linear
@@ -653,7 +665,7 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
     Ok((rgba, TexelLayout::Rgba8))
 }
 
-fn load_tight_linear_rgba_with<F>(
+pub(super) fn load_tight_linear_rgba_with<F>(
     width: u32,
     height: u32,
     sample_format: u16,
