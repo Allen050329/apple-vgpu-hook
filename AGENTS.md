@@ -102,6 +102,38 @@ State exactly what you verified. A single green boot does not prove an entire cl
 claims such as "zero-copy everywhere" or "no fallback remains" require an audit of every place that
 could falsify them.
 
+## Where Code Reduction Stands
+
+Read this before opening a broad "what can be deleted" sweep. Each line below is a search that has
+already been run to exhaustion; re-running one costs hours and has so far returned nothing.
+
+- **Compile-dead items: swept.** `scripts/dead-state/dead-state.sh` is the instrument, and its
+  intersection report is empty. Its one remaining lead is the ~45 items dead on the Metal arm
+  (`--keep`, `hits.metal`) — those are **not** deletions. A shared census that Metal never calls is
+  more likely an observability gap on a first-class pathway than dead code, and a `cfg` would cement
+  it invisibly against Never Fail Silently. Deciding needs an Apple host.
+- **Heuristics and fallbacks: none of substance left.** What reads like a fallback is a device
+  capability query (depth/vertex format, memory topology), a real two-path strategy, or a comment
+  recording a heuristic that was already measured and removed. Do not "discover" the latter and
+  delete the explanation.
+- **Censuses are not bloat.** The phase censuses (`chain_phase`, `bind_phase`, `draw_phase`,
+  `stage_phase`) are ~55 lines of code each under their docs, they reconcile against each other by
+  construction, and they are how "slow" gets diagnosed. A never-firing *decline* is a quiet failure
+  path, which is the healthy state — not a dead branch.
+- **Structural unification has been costed and rejected twice.** The three sampled rails (linear,
+  type-11, type-5) differ in wire source, stride handling and bounds, not in naming; the two
+  memoized loaders differ in read, conversion, census and return type. In `backend/vulkan`, merging
+  the keyed caches loses per-key bucketing and negative caching, and a shared barrier helper puts a
+  stage/access-mask bug in both the graphics and compute paths at once. The measured savings were
+  tens of lines each. Do not re-derive this.
+- **A zero hit rate on one pathway is not a dead cache.** `gva_view`'s `view_reuse` reads 0 on
+  x86/Vulkan because a 12-bit page shift fragments nearly every span. A 14-bit shift covers the same
+  span in a quarter of the pages. The module documents this at its own reuse site.
+
+The remaining reduction lever is runtime-dead code — paths that compile and are reachable but that
+the protocol never takes — and `dead-state` cannot see that class. `/tmp/reims-vgpu-fail.log` is the
+only ground truth for it, and it is untracked and disappears.
+
 ## Support Matrix
 
 arm64 and x86 are both first-class. Metal and Vulkan are both first-class where the host supports
