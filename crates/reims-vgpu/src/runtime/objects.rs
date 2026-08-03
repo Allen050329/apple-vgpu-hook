@@ -382,6 +382,38 @@ pub fn mapping_is_multiplanar(m: &MappingEntry) -> bool {
     false
 }
 
+/// The device descriptor's `pixelFormat` word as a Metal format.
+///
+/// That field carries **two** encodings and always has. On x86 this device
+/// synthesizes the descriptor and [`synthesize_device_desc_from_type4`] writes
+/// the MTL ordinal for a known single-plane surface and the raw OSType FourCC
+/// otherwise. On arm64 the descriptor is the guest's own and the field holds
+/// whatever `getPixelFormat()` returned, which is a FourCC for media surfaces.
+///
+/// The arm64 mapper used to read it as `raw as u16` — a silent narrowing, and
+/// wrong by the rule [`iosurface_pixel_format_to_mtl`] states about this exact
+/// operation: `'BGRA'` truncates to `0x5241`, which is not a Metal format, so
+/// `bytes_per_pixel` refuses it, every sample window refuses, and every render
+/// target on that mapping resolves to nothing. The x86 arm meanwhile read the
+/// same conceptual field as a FourCC. Two consumers, one field, two encodings
+/// assumed — and the truncation is the arm that loses guest work silently.
+///
+/// The two encodings are disjoint, and the test between them is not a
+/// plausibility one. An MTLPixelFormat is an enum ordinal, and the descriptor's
+/// own per-plane format fields are 16 bits wide, so an ordinal fits in 16 bits by
+/// construction. An OSType is four character bytes, none of them zero, so it
+/// cannot. A value that does not fit therefore *cannot* be an ordinal and goes
+/// through the FourCC table; a value that does fit is the ordinal it is.
+///
+/// Unknown FourCCs and multi-plane OSTypes come back 0 — the same fail-closed
+/// refusal the type-4 path latches, never an invented BGRA8.
+pub fn device_desc_format_to_mtl(raw: u32) -> u16 {
+    if raw <= u16::MAX as u32 {
+        return raw as u16;
+    }
+    iosurface_pixel_format_to_mtl(raw)
+}
+
 /// Map IOSurface OSType FourCC (or MTL raw) to a **single-plane** MTL pixel format.
 ///
 /// Live x86 type-4 carries IOSurface `pixelFormat` as a FourCC (e.g. `'BGRA'` =
@@ -2815,6 +2847,56 @@ mod tests {
         surf.planes[0].offset = 0;
         let zero = synthesize_device_desc_from_type4(&surf);
         assert_eq!(decode_device_surface(&zero).expect("desc").base_offset, 0);
+    }
+
+    /// The device descriptor's format word must survive both of the encodings
+    /// it is written in.
+    ///
+    /// The x86 synthesizer writes an MTL ordinal for a known single-plane
+    /// surface and the raw OSType otherwise; the arm64 mapper reads the guest's
+    /// own descriptor, where media surfaces carry a FourCC. Narrowing with
+    /// `as u16` is correct for one of those and destroys the other — `'BGRA'`
+    /// becomes `0x5241`, which no format table accepts, so the mapping ends up
+    /// with a format that refuses every sample window and every render target.
+    #[test]
+    fn the_device_descriptor_format_word_survives_both_of_its_encodings() {
+        use crate::contract::pixel_format::{
+            bytes_per_pixel, MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_RGBA16_FLOAT,
+        };
+
+        const BGRA_FOURCC: u32 = 0x4247_5241;
+
+        // The failure the narrowing produced, stated as the thing not to return.
+        assert!(
+            bytes_per_pixel((BGRA_FOURCC & 0xffff) as u16).is_none(),
+            "the truncation's output is not a format, which is why it was a bug"
+        );
+        assert_eq!(
+            device_desc_format_to_mtl(BGRA_FOURCC),
+            MTL_FORMAT_BGRA8_UNORM
+        );
+
+        // An ordinal fits in the descriptor's own 16-bit format fields and is
+        // passed through as itself — including one above the old 0x200
+        // magnitude boundary, which is why the test is width and not size.
+        assert_eq!(
+            device_desc_format_to_mtl(MTL_FORMAT_BGRA8_UNORM as u32),
+            MTL_FORMAT_BGRA8_UNORM
+        );
+        assert_eq!(
+            device_desc_format_to_mtl(MTL_FORMAT_RGBA16_FLOAT as u32),
+            MTL_FORMAT_RGBA16_FLOAT
+        );
+        // MTLPixelFormatBGRA10_XR is 552, above the 0x200 boundary an earlier
+        // magnitude test used and which `iosurface_pixel_format_to_mtl` records
+        // as having been wrong for exactly this format. It still fits in 16
+        // bits, so the width test carries it where a size test did not.
+        assert_eq!(device_desc_format_to_mtl(552), 552);
+
+        // Fail closed, not BGRA8: a multi-plane OSType and an unknown one.
+        assert_eq!(device_desc_format_to_mtl(IOSURFACE_FOURCC_420F), 0);
+        assert_eq!(device_desc_format_to_mtl(0x5A5A_5A5A), 0);
+        assert_eq!(device_desc_format_to_mtl(0), 0);
     }
 
     #[test]

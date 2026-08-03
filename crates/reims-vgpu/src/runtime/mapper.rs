@@ -472,7 +472,14 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
                     if surf.width > 0 && surf.height > 0 {
                         width = surf.width;
                         height = surf.height;
-                        format = (surf.pixel_format & 0xffff) as u16;
+                        // Not `as u16`: this field carries an MTL ordinal or
+                        // an OSType FourCC depending on who wrote the
+                        // descriptor, and narrowing a FourCC produces a format
+                        // nothing in the device accepts. See
+                        // `objects::device_desc_format_to_mtl`.
+                        format = crate::runtime::objects::device_desc_format_to_mtl(
+                            surf.pixel_format,
+                        );
                         if let Some((_, _, end, _)) =
                             sample_window_prefer_device(Some(&desc), None, format, width, height)
                         {
