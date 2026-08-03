@@ -1273,16 +1273,6 @@ pub struct SampledContentIdentity {
     pub generation: u64,
 }
 
-/// Draw completion ticket (D4): submit done; pixels materialize only via
-/// [`crate::backend::vulkan::engine::read_target`] at protocol boundaries.
-#[derive(Debug, Default, Clone)]
-pub struct DrawTicket {
-    /// Identity of the color target written by the draw (if residency used).
-    pub target: Option<TargetIdentity>,
-    /// Optional oracle-mode pixels when readback was requested with the draw.
-    pub pixels: Option<Vec<u8>>,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

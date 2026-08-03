@@ -272,10 +272,6 @@ enum BlitSource {
 /// Vulkan objects tear down before the join returns.
 pub type StopFlag = Arc<AtomicBool>;
 
-/// Set after the native window and all of its Vulkan objects have torn down.
-/// QEMU's backend teardown waits for this before destroying shared GPU state.
-pub type ExitedFlag = Arc<AtomicBool>;
-
 /// Errors from bringing up or running the window.
 ///
 /// One variant per distinct check, so each names itself in `/tmp/reims-vgpu-fail.log`

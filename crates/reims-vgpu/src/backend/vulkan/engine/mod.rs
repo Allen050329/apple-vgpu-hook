@@ -50,7 +50,7 @@ pub use types::{
     BlendFactor, BlendOp, BlendStateResource, BufferContent, ColorWriteMask, ComputeBufferOutput,
     ComputeBufferResource, ComputeOutput, ComputeRequest, ComputeResidentSampleBind,
     ComputeSampledImageResource, ComputeStorageImageResource, ComputeStorageResidency, CullMode,
-    DepthState, DrawError, DrawOutput, DrawRequest, DrawTicket, GuestRun, GuestRunSource,
+    DepthState, DrawError, DrawOutput, DrawRequest, GuestRun, GuestRunSource,
     IndexType, IndexedDrawResource, PrimitiveTopology, SampledContentIdentity,
     SampledImageResource, SampledSource, SamplerAddressMode, SamplerBorderColor,
     SamplerCompareFunction, SamplerFilter, SamplerMipFilter, SamplerResource, ScissorResource,

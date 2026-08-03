@@ -71,7 +71,6 @@ pub enum StorageImageSelector {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SampledClass {
-    Unsupported = 0,
     A8Unorm,
     R8Unorm,
     Rg8Unorm,
