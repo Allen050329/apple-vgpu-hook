@@ -198,6 +198,52 @@ pub(crate) struct VertexDivisorCapabilities {
     pub max_divisor: u32,
 }
 
+/// GPU-side timing for the composite readback: how long the GPU spent executing
+/// the copy command buffer, as distinct from how long the CPU spent waiting for
+/// it.
+///
+/// `readback_split fence_us` measures wall clock between `vkQueueSubmit` and
+/// `vkWaitForFences` returning. That interval contains three different things
+/// with three different fixes — the draw batch still executing, the copy
+/// executing, and the cost of asking (queue scheduling, the GPU leaving a
+/// low-power state, and the CPU's own wake from the fence's signal) — and no
+/// number in this device separated them. It matters which, because
+/// `ResidentArmCensus` established that holding the host GPU at its top clock
+/// moves that same wall clock from 2.55-2.83 ms to 0.40 ms, six sevenths of it
+/// with no code change. Six sevenths being the governor is consistent with two
+/// opposite readings: the GPU doing the same work slower, or the GPU spending
+/// most of the interval not working at all.
+///
+/// A timestamp written at the top of the copy command buffer and another at its
+/// bottom answers it directly and without correlating two clocks: the delta is
+/// GPU ticks between two points in the GPU's own timeline, and
+/// `timestampPeriod` scales it to nanoseconds. If the copy's execution is a
+/// small fraction of `fence_us`, the rest is the batch and the asking, and
+/// making the copy cheaper cannot pay.
+///
+/// Two queries are enough because the readback is serialized: the caller waits
+/// on this copy's fence before it can start another, so the pool is never read
+/// while a second submission is writing it.
+pub(crate) struct TimestampProbe {
+    /// Slot 0 is written at `TOP_OF_PIPE` before the barrier, slot 1 at
+    /// `TRANSFER` immediately after it, slot 2 at `BOTTOM_OF_PIPE` after the
+    /// copy. [`Self::SLOTS`] is the count the pool is created with and the count
+    /// the command buffer resets; a mismatch reads as a silent zero rather than
+    /// as an error, which is how the two-slot first version shipped and measured
+    /// nothing.
+    pub pool: vk::QueryPool,
+    /// `VkPhysicalDeviceLimits::timestampPeriod` — nanoseconds per tick.
+    pub ns_per_tick: f32,
+}
+
+impl TimestampProbe {
+    /// How many queries the pool holds, the command buffer resets, and the read
+    /// asks for. One constant because the three must agree: created with two
+    /// while the command buffer wrote three, the reads failed and the census
+    /// printed zeros that read exactly like "the GPU did no work".
+    pub const SLOTS: u32 = 3;
+}
+
 pub(crate) struct DeviceContext {
     pub _entry: ash::Entry,
     pub instance: ash::Instance,
@@ -244,6 +290,23 @@ pub(crate) struct DeviceContext {
     /// this device (D32_SFLOAT_S8_UINT preferred, D24_UNORM_S8_UINT fallback).
     /// Used only by the stencil-test path; depth-only uses D32_SFLOAT.
     pub depth_stencil_format: vk::Format,
+    /// A two-slot timestamp query pool for the composite readback, and the tick
+    /// length that turns its delta into wall clock. `None` when this queue
+    /// family reports `timestampValidBits == 0` or the device reports a
+    /// `timestampPeriod` of zero, both of which Vulkan permits.
+    ///
+    /// This exists to answer one question the rest of the device cannot:
+    /// `readback_split fence_us` is wall clock spent blocked, and a blocked
+    /// caller cannot tell GPU work from the latency of asking. See
+    /// [`TimestampProbe`].
+    pub timestamps: Option<TimestampProbe>,
+    /// `VkPhysicalDeviceLimits::maxComputeWorkGroupCount[0]`.
+    ///
+    /// Read from the device rather than assumed. Vulkan guarantees only 65 535
+    /// per axis, which a 4K frame's one-workgroup-per-tile dispatch exceeds, so
+    /// the difference pass folds onto the second axis when it has to — and a
+    /// device that reports far more should not pay for a fold it does not need.
+    pub max_compute_work_group_count_x: u32,
     /// On-disk VkPipelineCache blob for this device (keyed by
     /// pipelineCacheUUID), or None when persistence is unavailable.
     pub pipeline_cache_path: Option<std::path::PathBuf>,
@@ -529,6 +592,33 @@ impl DeviceContext {
             .create_device(pd, &dci, None)
             .map_err(|result| DrawError::Init(InitDecline::CreateDevice { result }))?;
         let props = instance.get_physical_device_properties(pd);
+        // Both halves are capability answers, not assumptions: Vulkan permits a
+        // queue family to support no timestamps at all, and permits
+        // `timestampPeriod` to be any positive float. A device that says either
+        // gets no probe and the census reports zero rather than a wrong number.
+        let timestamps = (qfs[gq as usize].timestamp_valid_bits > 0
+            && props.limits.timestamp_period > 0.0)
+            .then(|| {
+                let ci = vk::QueryPoolCreateInfo::default()
+                    .query_type(vk::QueryType::TIMESTAMP)
+                    .query_count(TimestampProbe::SLOTS);
+                device
+                    .create_query_pool(&ci, None)
+                    .map(|pool| TimestampProbe {
+                        pool,
+                        ns_per_tick: props.limits.timestamp_period,
+                    })
+                    .map_err(|e| {
+                        crate::observe::Emit::decline(
+                            "vk_timestamp_pool",
+                            &VkCall::new(VkOp::ContextCreateQueryPool, e),
+                        )
+                        .fail_once(0);
+                    })
+                    .ok()
+            })
+            .flatten();
+        let max_compute_work_group_count_x = props.limits.max_compute_work_group_count[0];
         let memory_properties = instance.get_physical_device_memory_properties(pd);
         let caps = HostGpuCaps {
             memory: classify_memory(&memory_properties),
@@ -598,6 +688,7 @@ impl DeviceContext {
             pipeline_cache_path.display()
         ));
         Ok(Self {
+            max_compute_work_group_count_x,
             _entry: entry,
             instance,
             pd,
@@ -615,6 +706,7 @@ impl DeviceContext {
             sampler_anisotropy: features.sampler_anisotropy,
             features,
             depth_stencil_format,
+            timestamps,
             pipeline_cache_path: Some(pipeline_cache_path),
             pipeline_cache_saved_len: AtomicUsize::new(initial_len),
             #[cfg(feature = "host-window")]
@@ -690,6 +782,9 @@ impl DeviceContext {
     }
 
     pub(crate) unsafe fn destroy(&mut self) {
+        if let Some(probe) = self.timestamps.take() {
+            self.device.destroy_query_pool(probe.pool, None);
+        }
         self.device
             .destroy_pipeline_cache(self.pipeline_cache, None);
         self.device.destroy_device(None);
@@ -707,7 +802,33 @@ impl DeviceContext {
     /// Returns `None` only when no type in `type_bits` carries the class's
     /// *required* flags — the caller must then decline with a named reason.
     pub(crate) fn memory_type_for(&self, type_bits: u32, class: MemoryClass) -> Option<u32> {
-        self.memory_type_with(type_bits, &self.caps.memory_request(class))
+        let picked = self.memory_type_with(type_bits, &self.caps.memory_request(class));
+        // Once per class per boot. What a class *asks* for is in
+        // `MemoryTopology::request` and readable from source; what it *gets* is
+        // not, because it depends on this device's memory-type table, and the
+        // two answers have very different costs. `vk_alloc_sites` prices
+        // `MemoryClass::Upload` at 2.54 ms per MiB allocated against 0.48 for
+        // `Readback` and 0.018 for the device-local slab, and a difference that
+        // size is a difference in which heap the pick landed in. Naming the
+        // index and its flags is what turns that from an inference into a
+        // reading.
+        if let Some(i) = picked {
+            // Keyed on the class and the index together, so a device whose
+            // table makes the pick differ between call sites says so instead of
+            // latching the first answer for the boot.
+            let key = ((class as u64) << 32) | i as u64;
+            if crate::observe::first_sight("vk_memory_type_pick", key) {
+                let t = self.memory_properties.memory_types[i as usize];
+                crate::observe::off(format!(
+                    "vk_memory_type_pick class={class:?} index={i} heap={} flags={:?} \
+                     heap_bytes={}",
+                    t.heap_index,
+                    t.property_flags,
+                    self.memory_properties.memory_heaps[t.heap_index as usize].size,
+                ));
+            }
+        }
+        picked
     }
 
     /// Escape hatch for a caller that has already built a [`MemoryRequest`]

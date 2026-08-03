@@ -30,6 +30,17 @@ use std::slice;
 
 /// Bump when breaking the C shim contract.
 ///
+/// v13 adds `guest_written_pages` on [`ReimsVgpuHostOps`]: the per-page form of
+/// v12's generation. A whole-set generation is enough to decide whether to reuse
+/// a host-side copy, and not enough to decide what to write back — a deferred
+/// writeback that discards its frame because one page moved loses the Store, and
+/// one that writes the whole frame anyway loses the guest's own store.
+/// v12 adds the guest-write tracking triple on [`ReimsVgpuHostOps`]:
+/// `track_guest_writes`, `untrack_guest_writes`, `guest_write_gen`. A surface's
+/// pages are plain guest RAM and the guest CPU stores into them with no device
+/// operation, so no counter this crate keeps can witness such a store and every
+/// host-side copy of those pages is stale from that instant with nothing to say
+/// so. The hypervisor's dirty bitmap is the only witness; these are the door.
 /// v11 adds `reims_vgpu_qemu_window_run_main`, which lets the Darwin MMIO shim make the
 /// AppKit-owned winit loop QEMU's process-main UI entry.
 /// v9 adds the host-window lifecycle + early framebuffer: `reims_vgpu_qemu_window_stop`
@@ -40,7 +51,7 @@ use std::slice;
 /// [[host-window]]). The symbol is always present; when the staticlib was built
 /// without the `host-window` feature it returns `REIMS_VGPU_QEMU_ERR_STATE` so the C
 /// shim falls back to QEMU's own display.
-pub const REIMS_VGPU_QEMU_ABI_VERSION: u32 = 11;
+pub const REIMS_VGPU_QEMU_ABI_VERSION: u32 = 13;
 
 #[repr(C)]
 pub struct ReimsVgpuQemuCreateInfo {

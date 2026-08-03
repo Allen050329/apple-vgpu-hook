@@ -7,7 +7,7 @@
 //! from the pinned public `metal2vulkan` crate.
 //!
 //! The [`Backend`] trait carries only guest-lifetime reset; the live draw seam
-//! is `runtime/metal_draw::try_metal2vulkan_draw` → [`engine::execute_draw`].
+//! is `runtime/metal_draw::try_metal2vulkan_draw` → [`engine::execute_draw_request`].
 //!
 //! [`caps`] classifies the bound host GPU into the four-cell support matrix
 //! (unified/discrete memory × has/has-no DMA) that every path here must keep
@@ -19,6 +19,7 @@
 
 pub mod caps;
 pub mod engine;
+pub mod spirv_emit;
 pub mod translate;
 
 use crate::backend::Backend;

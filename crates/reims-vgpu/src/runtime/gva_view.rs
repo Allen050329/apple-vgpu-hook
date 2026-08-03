@@ -36,7 +36,7 @@ fn fragmented_span_key(task_id: u32, gva: u64, pages: usize, runs: usize) -> u64
 
 /// True if half-open ranges `[a, a+la)` and `[b, b+lb)` overlap.
 #[inline]
-pub fn ranges_overlap(a: u64, la: u64, b: u64, lb: u64) -> bool {
+fn ranges_overlap(a: u64, la: u64, b: u64, lb: u64) -> bool {
     if la == 0 || lb == 0 {
         return false;
     }
@@ -79,7 +79,10 @@ pub(crate) fn task_matches(view_task: u32, wire_task: u32) -> bool {
 /// Retire every registered GVA view that overlaps `[gva, gva+length)` under `task_id`.
 ///
 /// Pushes `(ptr, ptr_len)` into `retired_views` for [`mapper::flush_retired_views`].
-/// Does **not** touch `host_gva_surfaces` (encode content retained across Unmap).
+/// Does **not** evict `host_gva_surfaces` (encode content is retained across
+/// Unmap — a mapping that churns and comes back must not black out the
+/// wallpaper); it marks the overlapping entries suspect instead, so the next
+/// reader re-walks and finds out whether the GVA still names the same pages.
 ///
 /// Returns the number of views retired. Always-on proxy when `n > 0` is logged by caller.
 pub fn retire_gva_views_overlapping(
@@ -105,10 +108,6 @@ pub fn retire_gva_views_overlapping(
             i += 1;
         }
     }
-    // The draw-time guest-run memo aliases the same task PT — same lifecycle.
-    state.guest_run_memo.retain(|e| {
-        !(task_matches(e.task_id, task_id) && ranges_overlap(e.gva, e.length, gva, length))
-    });
     // The flush no-intersection memo is keyed by the same (task, gva, span) and
     // caches a PT-dependent walk result — drop entries whose gva range this
     // remap invalidates (else a bind could skip the flush after its pages moved
@@ -116,11 +115,24 @@ pub fn retire_gva_views_overlapping(
     state
         .flush_nohit_memo
         .retain(|&(t, g, s), _| !(task_matches(t, task_id) && ranges_overlap(g, s, gva, length)));
+    // The GVA-keyed encode cache survives this deliberately — a mapping that
+    // churns and comes back must not black out the wallpaper — and its entries
+    // used to be marked "suspect" here so the next reader would re-walk and
+    // prove the address still named the same allocation. Nothing does that
+    // re-walk any more: the only reader that asked for the proof never ran, so
+    // the mark, the flag and the revalidation went with it.
+    //
+    // What that leaves open is stated where the cache lives: a remap can leave
+    // the same virtual address naming a different allocation, and nothing on
+    // this rail can currently tell. It is a contract question — what the guest's
+    // statement of ownership is for a surface whose pages it has re-pointed —
+    // and `gva_backing_moved` in the `cache_levels` line still counts how often
+    // the condition arises.
     n
 }
 
 /// Find a covering view for `task_id` + `[gva, gva+length)` if one is registered.
-pub fn find_covering_view(
+fn find_covering_view(
     state: &DeviceState,
     task_id: u32,
     gva: u64,
@@ -351,9 +363,9 @@ pub fn contig_run_count(gpas: &[u64], page_size: u64) -> usize {
 /// Walks the task page table (PPNs already installed by the guest before MapMemory2),
 /// then [`HostOps::map_pages`]. Returns `(ptr, host_len)`. On Linux, map_pages requires
 /// a **packed** sequential host-VA run — fragmented GVA spans return `None` here;
-/// use [`write_span`] / [`read_span`] which multi-import maximal runs. Does not invent
+/// use [`write_span_within`] / [`read_span`] which multi-import maximal runs. Does not invent
 /// PTEs.
-pub fn ensure_gva_view<H: HostMemory + HostOps>(
+fn ensure_gva_view<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut H,
     task_id: u32,
@@ -366,16 +378,34 @@ pub fn ensure_gva_view<H: HostMemory + HostOps>(
     if let Some(v) = find_covering_view(state, task_id, gva, length) {
         let (vptr, vlen) = (v.ptr, v.ptr_len);
         let view = v.clone();
-        // Sampled staleness verify (1-in-32 reuses): re-translate the view's
-        // first/last leaf and compare GPAs. A guest PT rewire the Unmap/Map2
-        // notifies missed (or that raced ahead of the FIFO) makes the cached
-        // view alias pages the guest already recycled — reads through it see
-        // freshly zeroed memory (the black-tile class). A mismatch retires
-        // the view fail-visibly and rebuilds fresh below.
-        state.view_verify_ctr = state.view_verify_ctr.wrapping_add(1);
-        if !state.view_verify_ctr.is_multiple_of(32) || view_gpas_current(host, state, &view) {
+        // Staleness verify, on EVERY reuse: re-translate the view's first/last
+        // leaf and compare GPAs. A guest PT rewire that the Unmap/Map2 notifies
+        // missed (or that raced ahead of the FIFO) makes the cached view alias
+        // pages the guest already recycled — reads through it see freshly
+        // zeroed memory, which is the black-tile class. A mismatch retires the
+        // view fail-visibly and rebuilds fresh below.
+        //
+        // This used to run on 1 reuse in 32, which meant a view known to be
+        // stale was still handed back for the other 31 — the check could only
+        // ever bound how long wrong bytes were served, not prevent them. A
+        // sampling rate on a correctness test is a guess about how often the
+        // guest rewires under us, and we have no such number from the contract.
+        // Two leaf walks is also far cheaper than the full-span walk the cache
+        // exists to avoid, so verifying always is what the cache can afford.
+        //
+        // What the rate is NOT justified by is x86/Vulkan traffic: `view_reuse`
+        // measured 0 across five driven boots there, because guest spans on a
+        // 12-bit page shift are essentially always fragmented (476
+        // `gva_view_fragmented` refusals in one driven session) and a fragmented
+        // span is never registered. The cache has a zero hit rate on that rail,
+        // so nothing here is on its hot path either way. Do not read that as the
+        // module being idle in general — a 14-bit page shift covers the same
+        // span in a quarter of the pages and can plausibly hit.
+        crate::runtime::drain::note_store_route("view_reuse");
+        if view_gpas_current(host, state, &view) {
             return Some((vptr, vlen));
         }
+        crate::runtime::drain::note_store_route("view_stale");
         state.view_stale_reads = state.view_stale_reads.saturating_add(1);
         let n = state.view_stale_reads;
         if n == 1 || n.is_multiple_of(256) {
@@ -413,7 +443,7 @@ pub fn ensure_gva_view<H: HostMemory + HostOps>(
     }
     // Full-span packed view only (single map_pages). Fragmented → None, and
     // asking `map_pages` for a view it cannot build is not a failure to log:
-    // `write_span` / `read_span` import the maximal runs instead.
+    // `write_span_within` / `read_span` import the maximal runs instead.
     let runs = contig_run_count(&gpas, state.page_size());
     if runs != 1 {
         if crate::observe::first_sight(
@@ -437,7 +467,6 @@ pub fn ensure_gva_view<H: HostMemory + HostOps>(
         ptr,
         ptr_len,
         first_gpa: gpas.first().copied().unwrap_or(0),
-        last_gpa: gpas.last().copied().unwrap_or(0),
     });
     Some((ptr, ptr_len))
 }
@@ -461,20 +490,29 @@ fn view_gpas_current<H: HostMemory>(
     let page_shift = state.page_shift;
     let page = 1u64 << page_shift;
     let first_page = v.gva & !(page - 1);
-    match collect_span_gpas(host, task, first_page, 1, page_shift) {
-        Ok(g) if g.first() == Some(&v.first_gpa) => {}
-        _ => return false,
-    }
-    if v.last_gpa != 0 {
-        let last_page = v.gva.saturating_add(v.length).saturating_sub(1) & !(page - 1);
-        if last_page != first_page {
-            match collect_span_gpas(host, task, last_page, 1, page_shift) {
-                Ok(g) if g.first() == Some(&v.last_gpa) => {}
-                _ => return false,
-            }
-        }
-    }
-    true
+    let span = (v.gva - first_page).saturating_add(v.length);
+    let Ok(gpas) = collect_span_gpas(host, task, first_page, span, page_shift) else {
+        return false;
+    };
+    // Every page, not the first and the last.
+    //
+    // Checking the ends was checking the two pages a partial remap is least
+    // likely to move: the guest recycles allocations, and an allocation that
+    // keeps its head and tail while its middle goes elsewhere passes an
+    // ends-only check while the view aliases somebody else's memory for every
+    // read through the middle of it.
+    //
+    // It costs nothing extra to be exhaustive here. `ensure_gva_view` only ever
+    // registers a span whose GPAs form ONE contiguous run — a fragmented span
+    // is refused before `map_pages` — so "unchanged" is fully determined by the
+    // first GPA and the page count, with no per-view GPA list to store. And the
+    // ends-only form already paid for two page-table walks; this is one walk
+    // over the span with the level cache warm for all of it.
+    gpas.len() == v.ptr_len >> page_shift
+        && gpas
+            .iter()
+            .enumerate()
+            .all(|(i, &g)| g == v.first_gpa.wrapping_add((i as u64).wrapping_mul(page)))
 }
 
 /// Always-on line when views are retired (proxy for Unmap/Map teardown).
@@ -539,22 +577,48 @@ pub fn host_ptr_for_span<H: HostMemory + HostOps>(
 /// it lands in whatever now owns those host pages (guest heap corruption:
 /// the 2026-07-19 WindowServer SIGSEGV class). Every write walks the PT at
 /// write time: packed spans map once, fragmented spans multi-import per run.
-pub fn write_span<H: HostMemory + HostOps>(
+/// Pages a deferred write is allowed to reach, or `None` for a write whose
+/// authorisation is the command that issued it.
+pub type WindowPages<'a> = Option<&'a std::collections::HashSet<u64>>;
+
+/// Every page of a resolved span is one the caller may write.
+///
+/// The check belongs beside the walk rather than in the caller because the walk
+/// that authorises has to be the walk that writes. A caller that walks, checks,
+/// and then calls a writer which walks again has proved something about a page
+/// table it is no longer using: between the two walks the guest can re-point
+/// the range, and the second walk — the one whose answer the bytes actually go
+/// to — was never checked. Passing the set down means there is only one walk
+/// and its result is both the authorisation and the destination.
+///
+/// `gpas` are page bases ([`collect_span_gpas`] masks them), so no masking is
+/// needed here.
+fn span_within_window(gpas: &[u64], allowed: WindowPages<'_>) -> bool {
+    match allowed {
+        None => true,
+        Some(pages) => gpas.iter().all(|g| pages.contains(g)),
+    }
+}
+
+/// Write `buf` into guest `[gva, gva+buf.len())`, bounded to the pages a
+/// deferred window was armed on.
+pub fn write_span_within<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut H,
     task_id: u32,
     gva: u64,
     buf: &[u8],
+    allowed: WindowPages<'_>,
 ) -> Result<(), MemError> {
     if buf.is_empty() {
         return Ok(());
     }
-    write_span_multi(state, host, task_id, gva, buf)
+    write_span_multi(state, host, task_id, gva, buf, allowed)
 }
 
 /// Ephemeral fresh-walk host mapping of `[gva, gva+length)` for guest writes.
 ///
-/// Same write-freshness rule as [`write_span`]: walks the task PT at call
+/// Same write-freshness rule as [`write_span_within`]: walks the task PT at call
 /// time and maps the packed span without consulting or registering
 /// `gva_host_views`. The caller must release it with [`unmap_fresh_span`]
 /// (product Linux unmap is a no-op alias; Darwin unmaps a real region).
@@ -569,13 +633,18 @@ pub struct FreshSpan {
     map_len: usize,
 }
 
-/// Build a [`FreshSpan`] over `[gva, gva+length)` — fresh PT walk, packed map.
-pub fn map_fresh_span<H: HostMemory + HostOps>(
+/// Build a [`FreshSpan`] over `[gva, gva+length)` — fresh PT walk, packed map,
+/// bounded to the pages a deferred window was armed on.
+///
+/// See [`span_within_window`]: the check sits on this walk because this walk is
+/// what the returned pointer aliases.
+pub fn map_fresh_span_within<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut H,
     task_id: u32,
     gva: u64,
     length: u64,
+    allowed: WindowPages<'_>,
 ) -> Option<FreshSpan> {
     if gva == 0 || length == 0 {
         return None;
@@ -585,6 +654,9 @@ pub fn map_fresh_span<H: HostMemory + HostOps>(
         let (_tid, task) = resolve_task_for_walk(&state.tasks, task_id)?;
         collect_span_gpas(host, task, gva, length, page_shift).ok()?
     };
+    if !span_within_window(&gpas, allowed) {
+        return None;
+    }
     if gpas.iter().any(|&g| !host.is_ram_gpa(g)) {
         return None;
     }
@@ -594,7 +666,7 @@ pub fn map_fresh_span<H: HostMemory + HostOps>(
     // view. Asking anyway spends an FFI call to be refused, and the refusal
     // lands in the always-on failure log as `qemu_map_pages_callback_failed`.
     // Decline here — quietly — so the caller takes its documented per-run
-    // multi-import fallback (the rgba8 store / `write_span`). A genuine
+    // multi-import fallback (the rgba8 store / `write_span_within`). A genuine
     // `map_pages` refusal over a *packed* list below stays fail-visible. Mirrors
     // the same pre-check `ensure_gva_view` already applies.
     let runs = contig_run_count(&gpas, page_size);
@@ -604,7 +676,7 @@ pub fn map_fresh_span<H: HostMemory + HostOps>(
             fragmented_span_key(task_id, gva, gpas.len(), runs),
         ) {
             crate::observe::off(format!(
-                "gva_view_fragmented task={task_id} gva={gva:#x} pages={} runs={runs} (map_fresh_span)",
+                "gva_view_fragmented task={task_id} gva={gva:#x} pages={} runs={runs} (map_fresh_span_within)",
                 gpas.len(),
             ));
         }
@@ -619,6 +691,30 @@ pub fn map_fresh_span<H: HostMemory + HostOps>(
         host.unmap_pages(ptr_base, map_len);
         return None;
     }
+    // Recorded here, on the requested `[gva, gva+length)`, because the bytes go
+    // through the returned pointer in a caller this function never sees. That
+    // makes it the one hook in the set that records an *intent* rather than a
+    // completed copy: a caller that takes the span and writes less than it asked
+    // for leaves frames marked that no byte reached.
+    //
+    // This is the safe direction and only this direction. Over-marking can only
+    // turn a miss into a hit, and a hit is the weak verdict — it never asserts
+    // the device wrote somewhere it did not, it only declines to exonerate. The
+    // mirror — under-marking a real write — would manufacture the clean "we
+    // never wrote there" that this whole set exists to be trusted for.
+    //
+    // The span is contiguous in guest-physical space: `runs != 1` returned above.
+    crate::observe::footprint::note_written_range(
+        crate::observe::footprint::Rail::RawGva,
+        gpas[0].saturating_add(off as u64),
+        length,
+    );
+    // Same reasoning as the footprint mark above, for the other reader of these
+    // writes: what this hands back is a writable alias of guest pages, and every
+    // caller of it writes. Recorded on the acquisition rather than in each caller
+    // because that is where the resolved page list exists, and because a new
+    // caller then inherits the record instead of having to remember it.
+    state.note_host_wrote_pages(gpas.clone());
     Some(FreshSpan {
         // SAFETY: map_pages returned `map_len` mapped bytes at `ptr_base`.
         ptr: unsafe { (ptr_base as *mut u8).add(off) },
@@ -628,7 +724,7 @@ pub fn map_fresh_span<H: HostMemory + HostOps>(
     })
 }
 
-/// Release a [`map_fresh_span`] mapping.
+/// Release a [`map_fresh_span_within`] mapping.
 pub fn unmap_fresh_span<H: HostOps>(host: &mut H, span: FreshSpan) {
     host.unmap_pages(span.map_base, span.map_len);
 }
@@ -671,6 +767,7 @@ fn write_span_multi<H: HostMemory + HostOps>(
     task_id: u32,
     gva: u64,
     buf: &[u8],
+    allowed: WindowPages<'_>,
 ) -> Result<(), MemError> {
     let length = buf.len() as u64;
     let page_shift = state.page_shift;
@@ -682,6 +779,14 @@ fn write_span_multi<H: HostMemory + HostOps>(
         };
         collect_span_gpas(host, task, gva, length, page_shift)?
     };
+    // Puts bytes into guest pages the hypervisor's dirty bitmap cannot witness.
+    // Recorded here, after the walk that names them and before any of them is
+    // written, so a refusal below costs a spurious invalidation rather than a
+    // missing one.
+    state.note_host_wrote_pages(gpas.clone());
+    if !span_within_window(&gpas, allowed) {
+        return Err(MemError::WriteOutsideWindow);
+    }
     if gpas.iter().any(|&g| !host.is_ram_gpa(g)) {
         return Err(MemError::NotRam);
     }
@@ -689,6 +794,16 @@ fn write_span_multi<H: HostMemory + HostOps>(
     if runs.is_empty() {
         return Err(MemError::BadArgs);
     }
+    // Once for the call, not per run: see the mapping rail's peer.
+    crate::observe::footprint::note_written_payload(buf);
+    // The fragmented half of the raw-GVA writeback leg.
+    // `metal_draw::write_gva_rgba8_within` takes the packed half when
+    // `map_fresh_span_within` resolves and lands here a row at a time when it
+    // does not — and on a driven x86/PCI drag it is almost always here, which
+    // is why hooking only the packed half reported the leg at 7 runs a second
+    // against `gvaw_fence_flush=444`.
+    let mut audit =
+        crate::runtime::land_redundancy::begin_audit(crate::runtime::land_redundancy::Leg::Gva);
     crate::runtime::mapper::flush_retired_views(state, host);
     let span_page_base = gva & !(page_size - 1);
     let end = gva.saturating_add(length);
@@ -713,6 +828,21 @@ fn write_span_multi<H: HostMemory + HostOps>(
             host.unmap_pages(ptr, total);
             return Err(MemError::RunOutOfRange);
         }
+        if let Some(walk) = audit.as_mut() {
+            // Aligned in guest-virtual space, which is where a rail could
+            // decline a unit — `copy_lo` is this run's own GVA.
+            //
+            // SAFETY: as below; the audit only reads the range about to be
+            // written.
+            unsafe {
+                walk.note_write(
+                    copy_lo,
+                    (ptr as *const u8).add(host_off),
+                    &buf[buf_off..buf_off + n],
+                    page_size,
+                );
+            }
+        }
         // SAFETY: map_pages packed `total` bytes; host_off+n in range.
         unsafe {
             std::ptr::copy_nonoverlapping(
@@ -721,6 +851,14 @@ fn write_span_multi<H: HostMemory + HostOps>(
                 n,
             );
         }
+        // A run is packed by construction, so the `n` bytes at `host_off` are
+        // the `n` bytes at `run_gpas[0] + host_off` in guest-physical space —
+        // the exact destination, not the run's hull.
+        crate::observe::footprint::note_written_range(
+            crate::observe::footprint::Rail::RawGva,
+            run_gpas[0].saturating_add(host_off as u64),
+            n as u64,
+        );
         host.unmap_pages(ptr, total);
     }
     Ok(())
@@ -951,6 +1089,83 @@ mod tests {
         );
     }
 
+    /// A cached view's reuse verify has to check every page it aliases, not the
+    /// two a partial remap is least likely to move.
+    ///
+    /// The guest recycles allocations. One that keeps its head and its tail
+    /// while its middle goes somewhere else passes an ends-only check forever,
+    /// and every read through the middle of that view returns another owner's
+    /// bytes -- freshly zeroed memory, if the guest has not filled them yet,
+    /// which is a blank tile on screen rather than a crash.
+    ///
+    /// The view here is three pages so it HAS a middle. Moving only the middle
+    /// page is the exact case the ends-only form could not see.
+    #[test]
+    fn a_view_reuse_verify_checks_every_page_it_aliases() {
+        let page_shift = PAGE_SHIFT_X86;
+        let page = 1u64 << page_shift;
+        let mut host = FakeHost::new();
+        let dir_gpa = 2u64 << page_shift;
+        let root_gpa = 3u64 << page_shift;
+        host.map_range(dir_gpa, page as usize, 0);
+        host.map_range(root_gpa, page as usize, 0);
+        // Virtual page i maps to frame 4+i; the view is virtual pages 1..4, so
+        // frames 5,6,7. Frame 9 is the allocation the guest moves to. Virtual
+        // page 0 is left out of the view because gva 0 is not a view address.
+        for pfn in [4u64, 5, 6, 7, 9] {
+            host.map_range(pfn << page_shift, page as usize, 0);
+        }
+        let mut d = [0u8; 8];
+        st32(&mut d[DIRECTORY_ROOT_PFN as usize..], 3);
+        st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
+        host.write_gpa(dir_gpa, &d).unwrap();
+        let mut pte = [0u8; 4];
+        for i in 0..4u32 {
+            st32(&mut pte, 4 + i);
+            host.write_gpa(root_gpa + (i as u64) * 4, &pte).unwrap();
+        }
+        let mut state = state_x86();
+        assert!(state.define_task(1, page, 2));
+
+        let (ptr, ptr_len) = ensure_gva_view(&mut state, &mut host, 1, page, 3 * page)
+            .expect("three packed pages map as one view");
+        assert_eq!(ptr_len as u64, 3 * page);
+        let view = crate::model::GvaHostView {
+            task_id: 1,
+            gva: page,
+            length: 3 * page,
+            ptr,
+            ptr_len,
+            first_gpa: 5 << page_shift,
+        };
+        assert!(
+            view_gpas_current(&host, &state, &view),
+            "nothing has moved yet"
+        );
+
+        // The guest re-points the MIDDLE page only -- virtual page 2, frame 6.
+        // Head and tail are untouched, which is all an ends-only check looked
+        // at.
+        st32(&mut pte, 9);
+        host.write_gpa(root_gpa + 8, &pte).unwrap();
+        assert!(
+            !view_gpas_current(&host, &state, &view),
+            "the view now aliases frame 9 for its middle page and called itself current"
+        );
+
+        // A page dropping out of the walk is a change too: the view keeps
+        // aliasing three frames whatever the page table says.
+        st32(&mut pte, 6);
+        host.write_gpa(root_gpa + 8, &pte).unwrap();
+        assert!(view_gpas_current(&host, &state, &view), "restored");
+        st32(&mut pte, 0);
+        host.write_gpa(root_gpa + 12, &pte).unwrap();
+        assert!(
+            !view_gpas_current(&host, &state, &view),
+            "the last page no longer resolves and the view still spans it"
+        );
+    }
+
     #[test]
     fn ranges_overlap_basic() {
         assert!(ranges_overlap(0x1000, 0x1000, 0x1800, 0x1000));
@@ -1038,6 +1253,106 @@ mod tests {
         (host, root_gpa, data0, data1, page)
     }
 
+    /// The raw-GVA rail's writes reach `observe::footprint`, at the guest
+    /// physical address the walk resolved and nowhere else.
+    ///
+    /// The rail's whole shape is that the destination is not knowable from the
+    /// call — it is whatever the task's page table says at write time — so the
+    /// footprint has to be marked from the *resolved* GPA. Marking from the GVA
+    /// instead would be the same substitution the type-4 identity guard exists
+    /// to refuse, and it would fill the set with addresses in low guest RAM,
+    /// which is exactly where the panic census's victims live. Every such frame
+    /// would then read as a hit.
+    #[test]
+    fn a_raw_gva_write_marks_the_resolved_gpa_and_not_the_virtual_address() {
+        use crate::observe::footprint;
+
+        let _fp = footprint::exclusive_for_tests();
+        let (mut host, _root_gpa, data0, data1, page) = pt_fixture(PAGE_SHIFT_X86);
+        let mut state = state_x86();
+        assert!(state.define_task(1, page, 2));
+
+        let gva = 0x100u64;
+        write_span_within(&mut state, &mut host, 1, gva, &[0x7Eu8; 64], None).expect("the walk resolves");
+
+        assert!(
+            footprint::wrote_gpa(data0),
+            "the frame the page table named must be marked"
+        );
+        assert!(
+            !footprint::wrote_gpa(gva),
+            "the guest VIRTUAL address is not a physical frame; marking it would \
+             put low guest RAM — where the panic census's victims live — into the \
+             set on every write"
+        );
+        assert!(
+            !footprint::wrote_gpa(data1),
+            "the page the guest did not point at is not ours"
+        );
+        assert_eq!(footprint::counts(), (1, 0));
+    }
+
+    /// A deferred write is bounded by the pages it was armed on, and the bound
+    /// is enforced by the same walk that produces the destination.
+    ///
+    /// The scenario is the one the guest actually produces: a window armed on
+    /// `data0`, and by flush time the guest has re-pointed that GVA at `data1`.
+    /// A guard that walked separately and then called an unbounded writer would
+    /// have to win a race against the guest's own vCPUs to catch this; a bound
+    /// carried into the walk cannot lose it, because there is only one walk.
+    ///
+    /// Both writers are covered — `write_span_within` for the fragmented
+    /// per-row path, `map_fresh_span_within` for the packed one — because
+    /// which of the two a real Store takes depends on how the guest happened to
+    /// lay the pages out, and a bound present on only one of them is a bound
+    /// that holds on some machines.
+    #[test]
+    fn a_deferred_write_cannot_reach_a_page_its_window_was_not_armed_on() {
+        let page_shift = PAGE_SHIFT_X86;
+        let (mut host, root_gpa, data0, data1, page) = pt_fixture(page_shift);
+        let mut state = state_x86();
+        assert!(state.define_task(1, page, 2));
+        let armed: std::collections::HashSet<u64> = [data0].into_iter().collect();
+
+        // Control: while the GVA still resolves inside the window, the write
+        // lands. A bound that refused everything would silently blank the guest.
+        assert!(
+            write_span_within(&mut state, &mut host, 1, 8, &[0xaa; 4], Some(&armed)).is_ok(),
+            "a window writing its own page must still write"
+        );
+        let mut back = [0u8; 4];
+        host.read_gpa(data0 + 8, &mut back).unwrap();
+        assert_eq!(back, [0xaa; 4]);
+        assert!(map_fresh_span_within(&mut state, &mut host, 1, 8, 16, Some(&armed)).is_some());
+
+        // The guest re-points the range. Nothing about the walk is unhealthy —
+        // it resolves, it is RAM, it is current. It is simply not ours.
+        let mut pte = [0u8; 4];
+        st32(&mut pte, 10);
+        host.write_gpa(root_gpa, &pte).unwrap();
+
+        assert_eq!(
+            write_span_within(&mut state, &mut host, 1, 8, &[0xbb; 4], Some(&armed)),
+            Err(crate::runtime::host::MemError::WriteOutsideWindow),
+            "a re-pointed range is another owner's memory, not this window's"
+        );
+        assert!(
+            map_fresh_span_within(&mut state, &mut host, 1, 8, 16, Some(&armed)).is_none(),
+            "the packed path must carry the same bound as the per-row path"
+        );
+        host.read_gpa(data1 + 8, &mut back).unwrap();
+        assert_eq!(back, [0u8; 4], "the new owner's page must be untouched");
+
+        // Unbounded callers are unaffected: a synchronous Store's authorisation
+        // is the page table at the moment it runs, and it passes `None`.
+        assert!(
+            write_span_within(&mut state, &mut host, 1, 8, &[0xbb; 4], None).is_ok(),
+            "an unbounded write must keep following the live page table"
+        );
+        host.read_gpa(data1 + 8, &mut back).unwrap();
+        assert_eq!(back, [0xbb; 4]);
+    }
+
     /// Read the always-on log from `from` to the end.
     fn log_tail(from: usize) -> String {
         let body = std::fs::read_to_string(crate::observe::fail_log_path()).unwrap_or_default();
@@ -1074,7 +1389,6 @@ mod tests {
             ptr: 0x4000,
             ptr_len: 0x1000,
             first_gpa: 0,
-            last_gpa: 0,
         });
 
         let before = log_mark();
@@ -1116,7 +1430,7 @@ mod tests {
         assert!(state.define_task(4, page, 2));
         assert!(state.define_task(9, page, 2));
         let before = log_mark();
-        assert!(write_span(&mut state, &mut host, 9, 8, &[1, 2, 3, 4]).is_ok());
+        assert!(write_span_within(&mut state, &mut host, 9, 8, &[1, 2, 3, 4], None).is_ok());
         let tail = log_tail(before);
         let line = tail
             .lines()
@@ -1150,7 +1464,7 @@ mod tests {
         let mut state = state_x86();
         assert!(state.define_task(4, page, 2));
         let before = log_mark();
-        let err = write_span(&mut state, &mut host, 9, 8, &[1, 2, 3, 4])
+        let err = write_span_within(&mut state, &mut host, 9, 8, &[1, 2, 3, 4], None)
             .expect_err("slot 9 is not live, so this write has no address space");
         assert_eq!(err, MemError::NoSuchTask);
         let tail = log_tail(before);
@@ -1170,7 +1484,7 @@ mod tests {
         let mut state = state_x86();
         assert!(state.define_task(1, page, 2));
         let gva = 8u64;
-        assert!(write_span(&mut state, &mut host, 1, gva, &[1, 2, 3, 4]).is_ok());
+        assert!(write_span_within(&mut state, &mut host, 1, gva, &[1, 2, 3, 4], None).is_ok());
         let mut back = [0u8; 4];
         host.read_gpa(data0 + gva, &mut back).unwrap();
         assert_eq!(back, [1, 2, 3, 4]);
@@ -1183,7 +1497,7 @@ mod tests {
         st32(&mut pte, 10);
         host.write_gpa(root_gpa, &pte).unwrap();
 
-        assert!(write_span(&mut state, &mut host, 1, gva, &[5, 6, 7, 8]).is_ok());
+        assert!(write_span_within(&mut state, &mut host, 1, gva, &[5, 6, 7, 8], None).is_ok());
         host.read_gpa(data1 + gva, &mut back).unwrap();
         assert_eq!(back, [5, 6, 7, 8], "write must follow the live PT");
         host.read_gpa(data0 + gva, &mut back).unwrap();
@@ -1273,12 +1587,13 @@ mod tests {
         let mut state = state_x86();
         assert!(state.define_task(1, page, 2));
         assert!(
-            write_span(
+            write_span_within(
                 &mut state,
                 &mut host,
                 1,
                 page - 4,
-                &[1, 2, 3, 4, 5, 6, 7, 8]
+                &[1, 2, 3, 4, 5, 6, 7, 8],
+                None
             )
             .is_ok(),
             "the multi-import path exists to write a gapped span"
@@ -1308,7 +1623,7 @@ mod tests {
 
         let before = host.map_pages_calls;
         assert!(
-            map_fresh_span(&mut state, &mut host, 1, page - 4, 8).is_none(),
+            map_fresh_span_within(&mut state, &mut host, 1, page - 4, 8, None).is_none(),
             "a gapped span has no packed whole-span view"
         );
         assert_eq!(
@@ -1318,7 +1633,7 @@ mod tests {
 
         // The packed case still goes to the host and still resolves.
         let before = host.map_pages_calls;
-        let s = map_fresh_span(&mut state, &mut host, 1, 8, 4).expect("packed span maps");
+        let s = map_fresh_span_within(&mut state, &mut host, 1, 8, 4, None).expect("packed span maps");
         assert!(s.avail >= 4);
         unmap_fresh_span(&mut host, s);
         assert_eq!(host.map_pages_calls, before + 1);
@@ -1333,7 +1648,7 @@ mod tests {
         let mut state = state_x86();
         assert!(state.define_task(1, page, 2));
         let gva = 8u64;
-        let s = map_fresh_span(&mut state, &mut host, 1, gva, 16).unwrap();
+        let s = map_fresh_span_within(&mut state, &mut host, 1, gva, 16, None).unwrap();
         assert!(s.avail >= 16);
         // SAFETY: map_fresh_span guarantees ≥16 writable bytes at ptr.
         unsafe { std::ptr::copy_nonoverlapping([0xaau8; 4].as_ptr(), s.ptr, 4) };
@@ -1345,7 +1660,7 @@ mod tests {
         let mut pte = [0u8; 4];
         st32(&mut pte, 10);
         host.write_gpa(root_gpa, &pte).unwrap();
-        let s = map_fresh_span(&mut state, &mut host, 1, gva, 16).unwrap();
+        let s = map_fresh_span_within(&mut state, &mut host, 1, gva, 16, None).unwrap();
         // SAFETY: as above.
         unsafe { std::ptr::copy_nonoverlapping([0xbbu8; 4].as_ptr(), s.ptr, 4) };
         unmap_fresh_span(&mut host, s);
@@ -1355,8 +1670,9 @@ mod tests {
         assert_eq!(back, [0xaa; 4], "old page must not see the second write");
     }
 
-    /// The 1-in-32 sampled reuse verify catches a PT rewire under a cached
-    /// view, retires it, and rebuilds fresh; unsampled reuses stay cheap.
+    /// Every reuse verifies, so a PT rewire under a cached view is caught on
+    /// the FIRST read after it happens — the view is retired and rebuilt, and
+    /// no read is ever served through the stale mapping.
     #[test]
     fn stale_covering_view_detected_and_rebuilt() {
         let page_shift = PAGE_SHIFT_X86;
@@ -1373,15 +1689,11 @@ mod tests {
         st32(&mut pte, 10);
         host.write_gpa(root_gpa, &pte).unwrap();
 
-        // Unsampled reuse still returns the cached view (sampling contract).
-        state.view_verify_ctr = 0;
-        let (p1, _) = ensure_gva_view(&mut state, &mut host, 1, gva, 16).unwrap();
-        assert_eq!(p1, p0);
-        assert_eq!(state.view_stale_reads, 0);
-
-        // Sampled reuse (ctr hits a multiple of 32) detects, retires, rebuilds.
-        state.view_verify_ctr = 31;
+        // The very next reuse detects, retires, and rebuilds. Under the old
+        // 1-in-32 gate this same call returned `p0` — the stale mapping — and
+        // left `view_stale_reads` at 0.
         let (p2, _) = ensure_gva_view(&mut state, &mut host, 1, gva, 16).unwrap();
+        assert_ne!(p2, p0, "a stale view must never be handed back");
         assert_eq!(state.view_stale_reads, 1);
         assert_eq!(state.gva_host_views.len(), 1);
         assert_eq!(state.gva_host_views[0].first_gpa, data1);

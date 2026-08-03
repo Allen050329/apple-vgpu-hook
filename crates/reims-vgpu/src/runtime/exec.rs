@@ -12,6 +12,7 @@ use crate::runtime::compute_exec::{self, ComputeStatus};
 use crate::runtime::decode::blit::{self, Kind as BlitKind, OP_GENERATE_MIPMAPS};
 use crate::runtime::decode::compute::{self, Kind as ComputeKind};
 use crate::runtime::decode::event as event_decode;
+use crate::runtime::decode::fifo::{decode_exec_resource_table, ExecResourceDesc};
 use crate::runtime::decode::fifo::{
     CHILD_EXEC_INDIRECT_CMDBUF_COUNT, CHILD_EXEC_INDIRECT_CMDBUF_DESC_LEN,
     CHILD_EXEC_INDIRECT_CMDBUF_GVA, CHILD_EXEC_INDIRECT_CMDBUF_LENGTH,
@@ -40,9 +41,25 @@ use crate::runtime::mipmap::{self, MipmapStatus};
 use crate::runtime::objects;
 use crate::runtime::plan::event_sync::{Domain as FenceDomain, FenceAction};
 use crate::runtime::task_slot::{resolve_task_word, TaskWordSite};
+use std::sync::Arc;
 
 /// Max descriptors per ExecIndirect2 (wire table size), not a byte budget.
 const MAX_CMDBUFS: usize = 16;
+
+/// One stage's bind table as a draw sees it.
+///
+/// `Arc` rather than a plain `Vec` because a render stream's draws share their
+/// bind state: the guest sets a table once and then issues many draws against
+/// it, so snapshotting per draw copied the same entries over and over. The
+/// accumulator mutates through [`Arc::make_mut`], which copies only when a
+/// snapshot is actually outstanding — so a stream that binds once and draws 400
+/// times allocates one table and 400 pointers.
+///
+/// That is what makes an unbounded draw list affordable, and an unbounded draw
+/// list is what the protocol requires: the guest emits as many records as its
+/// encoder recorded and every one of them contributes to the same attachment
+/// set. See [`StreamDrawDrop`].
+type BindTable<T> = Arc<Vec<T>>;
 
 /// Pending render-pass ICB execute (range form or indirect range buffer).
 #[derive(Clone, Debug, Default)]
@@ -67,12 +84,12 @@ struct PendingDraw {
     /// (count, instance, prim, first_vertex)
     draw: (u32, u32, u32, u32),
     indexed: Option<IndexedDrawInfo>,
-    vertex_buffers: Vec<BufferBind>,
-    fragment_buffers: Vec<BufferBind>,
-    vertex_textures: Vec<TextureBind>,
-    fragment_textures: Vec<TextureBind>,
-    vertex_samplers: Vec<SamplerBind>,
-    fragment_samplers: Vec<SamplerBind>,
+    vertex_buffers: BindTable<BufferBind>,
+    fragment_buffers: BindTable<BufferBind>,
+    vertex_textures: BindTable<TextureBind>,
+    fragment_textures: BindTable<TextureBind>,
+    vertex_samplers: BindTable<SamplerBind>,
+    fragment_samplers: BindTable<SamplerBind>,
     viewport: Option<[f64; 6]>,
     scissor: Option<(u32, u32, u32, u32)>,
     blend_color: Option<[f32; 4]>,
@@ -98,12 +115,12 @@ struct StreamAccum {
     saw_draw: bool,
     /// Last render ICB execute (`0x14`/`0x15`) in this stream.
     execute_icb: Option<RenderIcbExecute>,
-    vertex_buffers: Vec<BufferBind>,
-    fragment_buffers: Vec<BufferBind>,
-    vertex_textures: Vec<TextureBind>,
-    fragment_textures: Vec<TextureBind>,
-    vertex_samplers: Vec<SamplerBind>,
-    fragment_samplers: Vec<SamplerBind>,
+    vertex_buffers: BindTable<BufferBind>,
+    fragment_buffers: BindTable<BufferBind>,
+    vertex_textures: BindTable<TextureBind>,
+    fragment_textures: BindTable<TextureBind>,
+    vertex_samplers: BindTable<SamplerBind>,
+    fragment_samplers: BindTable<SamplerBind>,
     viewport: Option<[f64; 6]>,
     scissor: Option<(u32, u32, u32, u32)>,
     indexed: Option<IndexedDrawInfo>,
@@ -115,10 +132,84 @@ struct StreamAccum {
     stencil_ref: Option<(u32, u32)>,
     depth_attach: Option<DepthAttachment>,
     stencil_attach: Option<StencilAttachment>,
+    /// Draw records this stream decoded but did not keep. See
+    /// [`StreamDrawDrop`]; reported once per stream by [`note_stream_draw_drops`].
+    dropped_unbound: u32,
 }
 
-/// Cap multi-draw records per stream (archive REIMS_VGPU_MAX_DRAWS_PER_JOB order).
-const MAX_DRAWS_PER_STREAM: usize = 64;
+impl StreamAccum {
+    /// The stream's bind state as a `PendingDraw`, with no pipeline and no
+    /// draw call attached.
+    ///
+    /// Two things need it and must not disagree: a decoded draw, which fills
+    /// in `pipeline_ref` and `draw` on top, and an ICB execute, which inherits
+    /// the state as it stands at end of stream and supplies neither.
+    fn bind_snapshot(&self) -> PendingDraw {
+        PendingDraw {
+            indexed: self.indexed.clone(),
+            vertex_buffers: self.vertex_buffers.clone(),
+            fragment_buffers: self.fragment_buffers.clone(),
+            vertex_textures: self.vertex_textures.clone(),
+            fragment_textures: self.fragment_textures.clone(),
+            vertex_samplers: self.vertex_samplers.clone(),
+            fragment_samplers: self.fragment_samplers.clone(),
+            viewport: self.viewport,
+            scissor: self.scissor,
+            blend_color: self.blend_color,
+            cull_mode: self.cull_mode,
+            front_facing: self.front_facing,
+            depth_bias: self.depth_bias,
+            depth_stencil_ref: self.depth_stencil_ref,
+            stencil_ref: self.stencil_ref,
+            depth_attach: self.depth_attach,
+            stencil_attach: self.stencil_attach,
+            ..Default::default()
+        }
+    }
+}
+
+/// Why a decoded `RenderKind::Draw` record never became a `PendingDraw`.
+///
+/// A serialized Metal render stream is one render pass, and every draw in it
+/// contributes to one attachment set. Dropping any of them leaves the pixels
+/// that draw would have written as whatever the earlier records put there —
+/// which, for a compositor doing per-element damage draws, is a rectangle of
+/// the target holding the wrong picture and holding it until the next full
+/// redraw.
+///
+/// There used to be a second arm here: a `MAX_DRAWS_PER_STREAM = 64` ceiling
+/// that truncated the list inside a bare `if` with no `else`. It is gone. The
+/// number was this crate's, not the protocol's — its comment named an archive
+/// environment variable rather than a wire field — and a live boot found streams
+/// pressing right against it (8013 streams at 33–63 draws, two truncated, one
+/// losing four draws). What bounds the list now is the stream itself: a draw
+/// record has a minimum encoded length, so the record count cannot exceed the
+/// stream bytes this crate already holds in memory, and [`BindTable`] keeps the
+/// per-record cost at one pointer per stage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StreamDrawDrop {
+    /// The record arrived with no pipeline bound or a zero primitive count.
+    ///
+    /// Either a genuinely empty draw — legal, and nothing is lost — or a
+    /// `SetPipeline` this decoder failed to latch, which is a lost draw. The
+    /// count is what separates the two: a rate that tracks the draw rate is the
+    /// second reading, an occasional one is the first.
+    Unbound { dropped: u32 },
+}
+
+impl crate::observe::Decline for StreamDrawDrop {
+    fn slug(&self) -> &'static str {
+        match self {
+            Self::Unbound { .. } => "stream_draw_dropped_unbound",
+        }
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        match self {
+            Self::Unbound { dropped } => vec![("dropped", dropped.to_string())],
+        }
+    }
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct ExecResult {
@@ -129,7 +220,6 @@ pub struct ExecResult {
     pub deferred: bool,
     pub texture_refs: Vec<u32>,
     pub type11_mappings: Vec<u32>,
-    pub color_targets: Vec<u32>,
     pub saw_draw: bool,
     pub clears_applied: u32,
     pub metal_draws_ok: u32,
@@ -206,14 +296,28 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
         return out;
     }
 
+    // The guest declares, per resource this submission touches, who owns the
+    // authoritative bytes afterwards. `need` above already proved the table fits,
+    // so a refusal here means the header and the decoder disagree about the
+    // layout — which is a fail line, never a silent empty table.
+    let resource_descs = decode_exec_resource_table(payload).unwrap_or_else(|| {
+        crate::observe::fail(format!(
+            "exec_res_table decode_fail task={task_id} res={resource_count} plen={}",
+            payload.len()
+        ));
+        Vec::new()
+    });
+
     let n_cb = (cmdbuf_count as usize).min(MAX_CMDBUFS);
     let page_shift = state.page_shift;
     let mut streams = Vec::with_capacity(n_cb);
     for i in 0..n_cb {
+        // `need` already pinned the whole table: i < n_cb <= cmdbuf_count, so
+        // off + DESC_LEN = cbufs_off + (i + 1) * DESC_LEN <= need <=
+        // payload.len(). The bounds check that stood here could not fire, and
+        // its `break` would have dropped every remaining command buffer with no
+        // line if it ever had.
         let off = (cbufs_off + i as u64 * CHILD_EXEC_INDIRECT_CMDBUF_DESC_LEN as u64) as usize;
-        if off + CHILD_EXEC_INDIRECT_CMDBUF_DESC_LEN as usize > payload.len() {
-            break;
-        }
         let gva = ld64(&payload[off + CHILD_EXEC_INDIRECT_CMDBUF_GVA as usize..]);
         let length = ld64(&payload[off + CHILD_EXEC_INDIRECT_CMDBUF_LENGTH as usize..]);
         if length == 0 {
@@ -262,6 +366,13 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
         return out;
     }
 
+    // Before any of this submission's work runs. Each record states what was
+    // true of its resource *before* the submission, so a pending window holding
+    // pixels the guest has since overwritten has to go now — landing it later
+    // would replace the guest's own bytes with a frame the guest has declared
+    // stale.
+    consume_resource_table(state, task_id, &resource_descs);
+
     for stream in streams {
         let mut acc = StreamAccum::default();
         walk_stream(state, host, task_id, &stream, &mut out, &mut acc);
@@ -269,6 +380,101 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
     }
     out.total_us = elapsed_us(exec_started);
     out
+}
+
+/// Apply every record of one submission's resource table.
+///
+/// The table is the guest's own statement about who owns each resource's
+/// authoritative bytes, and `clear_host_valid` is its consume-once notification
+/// that it CPU-wrote one — delivered here and nowhere else.
+///
+/// # What "did not apply" means, in two kinds
+///
+/// The table's ids are the **task's object-ref space**, not the mapping space.
+/// Measured over one boot's 6 823 records: 72 % are live object refs, 20 % are
+/// mappings, 19 % resolve nowhere, and `texture_to_mapping` answered for exactly
+/// none. So most records name resources that have no surface state to apply a
+/// validity quad to — buffers, heaps, pipelines — and that is the protocol
+/// working, not a loss.
+///
+/// The two are therefore counted apart. `validity_no_surface` is the expected
+/// majority; `validity_unknown_object` is a record naming an id no registry has
+/// heard of. Merging them would bury the second under the first at roughly four
+/// to one.
+///
+/// `validity_unknown_object` is **not** by itself a defect either, and a reader
+/// scoring it needs to know why: `DeviceState::objects` is populated lazily, by
+/// `objects::resolve_type11_ref` and `resolve_type4_surface_ex` at the moment a
+/// decoded command names a ref. A resource the guest has created in its own
+/// object list but has not yet named in an executed stream is absent from the
+/// set by construction. The table names the submission's whole residency list,
+/// which is a superset of what its command buffers reference. What *would* be
+/// the finding is this count staying high for ids that later do execute.
+///
+/// # What `set_host_valid` means, and how that is known
+///
+/// It licenses exactly the resources the submission stores into. That was an
+/// inference from IOAccel resource-list usage until a census correlated the two
+/// sides over one driven boot: of 19 135 stores, **zero** landed on a resource
+/// the table had not licensed, and the records that both license a resource and
+/// name a mapping this device holds (1 382 vs 1 380 licensed-and-stored) are the
+/// render targets. `clear_host_valid` is the other direction and arrives 15 423
+/// times in the same boot — one per guest CPU write, never resent.
+///
+/// The census that measured it is gone; a correlation with no counter-examples
+/// over 19 135 trials is a finding, not a thing to keep re-deriving per frame.
+fn consume_resource_table(state: &mut DeviceState, task_id: u32, descs: &[ExecResourceDesc]) {
+    use crate::runtime::resource_validity::{apply, ValiditySite};
+    let mut no_surface = 0u32;
+    let mut unknown = 0u32;
+    for d in descs {
+        if d.tail_nonzero_bytes() > 0 {
+            crate::observe::Emit::decline("exec_res_table", &ResourceTableDecline::TailPopulated)
+                .field("task", task_id)
+                .field("object", d.object_id)
+                .field("tail_nz", d.tail_nonzero_bytes())
+                .fail_once(0);
+        }
+        let outcome = apply(state, task_id, d.object_id, d.ops, ValiditySite::ExecTable);
+        if !outcome.missed {
+            continue;
+        }
+        if state.objects.contains(&(task_id, d.object_id)) {
+            no_surface = no_surface.saturating_add(1);
+        } else {
+            unknown = unknown.saturating_add(1);
+        }
+    }
+    // Rate-summarised on the per-second store-route window: this is the hottest
+    // opcode in the device and a per-record line would bury the fail view.
+    crate::runtime::drain::note_store_route_n("validity_no_surface", no_surface as u64);
+    crate::runtime::drain::note_store_route_n("validity_unknown_object", unknown as u64);
+}
+
+/// The one part of an `EXEC_INDIRECT2` resource-table record this device cannot
+/// act on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResourceTableDecline {
+    /// A record set one of the trailing 16 bytes, whose meaning is unrecovered.
+    ///
+    /// Zero across 84 868 records on the Ventura 13.7.8 x86 build, so ignoring
+    /// them costs nothing *there*. A build that starts using them is a statement
+    /// this device is discarding, which is why it raises a line rather than
+    /// passing unread — once per boot, because the field is a property of the
+    /// guest build and not of the record that happened to carry it first.
+    TailPopulated,
+}
+
+impl crate::observe::Decline for ResourceTableDecline {
+    fn slug(&self) -> &'static str {
+        match self {
+            Self::TailPopulated => "exec_res_tail_populated",
+        }
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        Vec::new()
+    }
 }
 
 fn elapsed_us(started: std::time::Instant) -> u64 {
@@ -426,7 +632,8 @@ fn compute_translation_inputs(stream: &[u8]) -> Vec<(u32, [u32; 3])> {
     inputs
 }
 
-/// Walk every record in one segment, handing each to `handle`.
+/// Walk every record in one segment, handing each handler its opcode and its
+/// command bytes.
 ///
 /// Lifting this out of `walk_stream`'s five near-identical arms gives the framing
 /// decoder exactly one emission site. Each arm previously swallowed its refusals
@@ -434,17 +641,21 @@ fn compute_translation_inputs(stream: &[u8]) -> Vec<(u32, [u32; 3])> {
 /// record with no line at all, and `Err(_) => break` made a truncated or
 /// self-inconsistent segment indistinguishable from `Done` — so every remaining
 /// record in that segment went unexecuted and unreported.
-fn walk_segment_records(
-    stream: &[u8],
-    seg: &stream::Segment,
-    mut handle: impl FnMut(&stream::Record),
-) {
+///
+/// Slicing here rather than in each handler is what makes the record's extent a
+/// framing property instead of five re-derivations of it. `decode_next_record`
+/// already refuses `record_len > command_end - cursor` and `validate_segment`
+/// refuses `command_end > bytes.len()`, so `bytes_offset + length` is inside
+/// `stream` by construction — the five copies of that same bounds check each
+/// had a silent `return` behind a branch none of them could take.
+fn walk_segment_records(stream: &[u8], seg: &stream::Segment, mut handle: impl FnMut(u32, &[u8])) {
     let mut cursor = 0usize;
     let mut next = decode_first_record(stream, seg, &mut cursor);
     loop {
         match next {
             Ok(rec) => {
-                handle(&rec);
+                let start = rec.bytes_offset as usize;
+                handle(rec.opcode, &stream[start..start + rec.length as usize]);
                 next = decode_next_record(stream, seg, &mut cursor);
             }
             // `Done` is end-of-segment and yields `None` here, so the normal exit
@@ -502,19 +713,19 @@ fn walk_stream<M: HostMemory + HostOps>(
         }
         match seg.type_ {
             SEGMENT_TYPE_RENDER => {
-                walk_segment_records(stream, &seg, |r| {
-                    handle_render_record(state, host, task_id, stream, r, out, acc)
+                walk_segment_records(stream, &seg, |op, cmd| {
+                    handle_render_record(state, host, task_id, op, cmd, out, acc)
                 });
             }
             SEGMENT_TYPE_BLIT => {
-                walk_segment_records(stream, &seg, |r| {
-                    handle_blit_record(state, host, task_id, stream, r)
+                walk_segment_records(stream, &seg, |op, cmd| {
+                    handle_blit_record(state, host, task_id, op, cmd)
                 });
             }
             SEGMENT_TYPE_COMPUTE => {
                 let mut compute = crate::runtime::compute_session::ComputeSegment::default();
-                walk_segment_records(stream, &seg, |r| {
-                    handle_compute_record(state, host, task_id, stream, r, out, &mut compute)
+                walk_segment_records(stream, &seg, |op, cmd| {
+                    handle_compute_record(state, host, task_id, op, cmd, out, &mut compute)
                 });
                 if let Some(st) = crate::runtime::compute_session::finish_session(
                     &mut compute.session,
@@ -535,13 +746,13 @@ fn walk_stream<M: HostMemory + HostOps>(
                 }
             }
             SEGMENT_TYPE_EVENT => {
-                walk_segment_records(stream, &seg, |r| {
-                    handle_event_record(state, task_id, stream, r)
+                walk_segment_records(stream, &seg, |_op, cmd| {
+                    handle_event_record(state, task_id, cmd)
                 });
             }
             SEGMENT_TYPE_INFO => {
-                walk_segment_records(stream, &seg, |r| {
-                    handle_info_record(state, host, task_id, stream, r)
+                walk_segment_records(stream, &seg, |op, cmd| {
+                    handle_info_record(state, host, task_id, op, cmd)
                 });
             }
             // Unreachable: `segment_disposition` already answered `Walk` for
@@ -555,18 +766,14 @@ fn handle_info_record<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &M,
     task_id: u32,
-    stream: &[u8],
-    rec: &stream::Record,
+    opcode: u32,
+    cmd_bytes: &[u8],
 ) {
     use crate::runtime::icb::{
         apply_icb_host_resource_info, decode_icb_host_resource_info, INFO_OP_ICB_HOST_RESOURCE,
     };
-    let end = (rec.bytes_offset as usize).saturating_add(rec.length as usize);
-    if end > stream.len() {
-        return;
-    }
-    let bytes = &stream[rec.bytes_offset as usize..end];
-    if rec.opcode == INFO_OP_ICB_HOST_RESOURCE {
+    let bytes = cmd_bytes;
+    if opcode == INFO_OP_ICB_HOST_RESOURCE {
         // `icb_backing_fail` was a counter with no reason beside it: an ICB
         // whose command memory never bound looked identical whether the payload
         // was malformed, the type-1 buffer was short, or the pathway has no ICB
@@ -587,18 +794,13 @@ fn handle_info_record<M: HostMemory + HostOps>(
                 crate::observe::Emit::decline("icb_backing", &e)
                     .field("task", task_id)
                     .field("len", bytes.len())
-                    .fail_once(rec.length as u64);
+                    .fail_once(bytes.len() as u64);
             }
         }
     }
 }
 
-fn handle_event_record(state: &mut DeviceState, task_id: u32, stream: &[u8], rec: &stream::Record) {
-    let end = (rec.bytes_offset as usize).saturating_add(rec.length as usize);
-    if end > stream.len() {
-        return;
-    }
-    let cmd_bytes = &stream[rec.bytes_offset as usize..end];
+fn handle_event_record(state: &mut DeviceState, task_id: u32, cmd_bytes: &[u8]) {
     let cmd = match event_decode::decode(cmd_bytes) {
         Ok(c) => c,
         Err(status) => {
@@ -648,16 +850,11 @@ fn handle_compute_record<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
-    stream: &[u8],
-    rec: &stream::Record,
+    opcode: u32,
+    cmd_bytes: &[u8],
     out: &mut ExecResult,
     seg: &mut crate::runtime::compute_session::ComputeSegment,
 ) {
-    let end = (rec.bytes_offset as usize).saturating_add(rec.length as usize);
-    if end > stream.len() {
-        return;
-    }
-    let cmd_bytes = &stream[rec.bytes_offset as usize..end];
     let cmd = match compute::decode(cmd_bytes) {
         Ok(c) => c,
         // Same silent drop as the render path above.
@@ -666,9 +863,9 @@ fn handle_compute_record<M: HostMemory + HostOps>(
                 // Latched per (reason, opcode): the guest re-encodes the same
                 // stream every frame, so an unclassified opcode would arrive
                 // once per draw. Magnitude is the encoder's fail counter's job.
-                e.field("opcode", format!("{:#x}", rec.opcode))
+                e.field("opcode", format!("{:#x}", opcode))
                     .field("len", cmd_bytes.len())
-                    .fail_once(rec.opcode as u64);
+                    .fail_once(opcode as u64);
             }
             return;
         }
@@ -732,6 +929,12 @@ fn handle_compute_record<M: HostMemory + HostOps>(
         | ComputeKind::ControlStartIf
         | ComputeKind::ControlStartElse
         | ComputeKind::ControlEndIf => {
+            // Denominator in front of the call, for the same reason as
+            // `icb_exec_seen`: `compute_control_fail` only ever reaches the
+            // always-on sink on a packet that already failed, so a control
+            // record that works is unobservable and the rail reads as dead
+            // whether it is dead or perfect.
+            crate::runtime::drain::note_store_route("compute_ctrl_seen");
             let pipeline_ref = seg.acc.pipeline_ref;
             match compute_exec::apply_record(state, host, task_id, &cmd, seg) {
                 None | Some(ComputeStatus::Ok) => {}
@@ -742,6 +945,7 @@ fn handle_compute_record<M: HostMemory + HostOps>(
             }
         }
         ComputeKind::ExecuteCommandsInBuffer | ComputeKind::ExecuteCommandsInBufferIndirect => {
+            crate::runtime::drain::note_store_route("compute_icb_seen");
             let pipeline_ref = seg.acc.pipeline_ref;
             match compute_exec::apply_record(state, host, task_id, &cmd, seg) {
                 None | Some(ComputeStatus::Ok) => {}
@@ -759,14 +963,9 @@ fn handle_blit_record<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
-    stream: &[u8],
-    rec: &stream::Record,
+    opcode: u32,
+    cmd_bytes: &[u8],
 ) {
-    let end = (rec.bytes_offset as usize).saturating_add(rec.length as usize);
-    if end > stream.len() {
-        return;
-    }
-    let cmd_bytes = &stream[rec.bytes_offset as usize..end];
     let cmd = match blit::decode(cmd_bytes) {
         Ok(c) => c,
         // Was `Err(_) => return`: a decoded blit record dropped with no line at
@@ -775,7 +974,7 @@ fn handle_blit_record<M: HostMemory + HostOps>(
         // refused.
         Err(status) => {
             if let Some(e) = crate::observe::Emit::refusal("blit_decode", &status) {
-                e.field("opcode", format!("{:#x}", rec.opcode))
+                e.field("opcode", format!("{:#x}", opcode))
                     .field("len", cmd_bytes.len())
                     .fail();
             }
@@ -855,7 +1054,8 @@ fn handle_blit_record<M: HostMemory + HostOps>(
         BlitKind::Unknown => {
             crate::observe::fail(format!(
                 "blit unknown opcode={:#x} len={}",
-                cmd.opcode, rec.length
+                cmd.opcode,
+                cmd_bytes.len()
             ));
         }
     }
@@ -865,16 +1065,11 @@ fn handle_render_record<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &M,
     task_id: u32,
-    stream: &[u8],
-    rec: &stream::Record,
+    opcode: u32,
+    cmd_bytes: &[u8],
     out: &mut ExecResult,
     acc: &mut StreamAccum,
 ) {
-    let end = (rec.bytes_offset as usize).saturating_add(rec.length as usize);
-    if end > stream.len() {
-        return;
-    }
-    let cmd_bytes = &stream[rec.bytes_offset as usize..end];
     let cmd = match render::decode(cmd_bytes) {
         Ok(c) => c,
         // Was `Err(_) => return`: a malformed render command dropped with no
@@ -885,9 +1080,9 @@ fn handle_render_record<M: HostMemory + HostOps>(
                 // Latched per (reason, opcode): the guest re-encodes the same
                 // stream every frame, so an unclassified opcode would arrive
                 // once per draw. Magnitude is the encoder's fail counter's job.
-                e.field("opcode", format!("{:#x}", rec.opcode))
+                e.field("opcode", format!("{:#x}", opcode))
                     .field("len", cmd_bytes.len())
-                    .fail_once(rec.opcode as u64);
+                    .fail_once(opcode as u64);
             }
             return;
         }
@@ -902,42 +1097,33 @@ fn handle_render_record<M: HostMemory + HostOps>(
             // sets `cmd.buffer_ref` from `buffer_binds.first()`, so a decoded
             // SetBuffer always carries at least one entry and there is no
             // single-entry wire form to fall back to.
-            for (i, &(buffer_ref, offset)) in cmd.buffer_binds.iter().enumerate() {
-                let index = cmd.first.saturating_add(i as u32);
-                if index >= MAX_BIND_SLOTS {
-                    break;
-                }
-                if buffer_ref == 0 {
-                    match cmd.stage {
-                        Stage::Vertex => acc.vertex_buffers.retain(|b| b.index != index),
-                        Stage::Fragment => acc.fragment_buffers.retain(|b| b.index != index),
-                        _ => {}
-                    }
-                    out.buffer_unbinds = out.buffer_unbinds.saturating_add(1);
-                    continue;
-                }
-                let bind = BufferBind {
-                    stage: cmd.stage,
-                    index,
-                    buffer_ref,
-                    offset,
-                };
-                match cmd.stage {
-                    Stage::Vertex => upsert_buffer(&mut acc.vertex_buffers, bind),
-                    Stage::Fragment => upsert_buffer(&mut acc.fragment_buffers, bind),
-                    _ => {}
-                }
-            }
+            let cleared = apply_binds(
+                &cmd.buffer_binds,
+                cmd.first,
+                cmd.stage,
+                &mut acc.vertex_buffers,
+                &mut acc.fragment_buffers,
+                |b| b.index,
+                |index, (buffer_ref, offset)| {
+                    (buffer_ref != 0).then_some(BufferBind {
+                        index,
+                        buffer_ref,
+                        offset,
+                    })
+                },
+            );
+            out.buffer_unbinds = out.buffer_unbinds.saturating_add(cleared);
         }
         RenderKind::SetBufferOffset => {
             // Archive apply_buffer_offset: update offset on an already-bound slot.
             if cmd.first < MAX_BIND_SLOTS {
                 let list = match cmd.stage {
-                    Stage::Vertex => &mut acc.vertex_buffers,
-                    Stage::Fragment => &mut acc.fragment_buffers,
-                    _ => {
-                        return;
-                    }
+                    Stage::Vertex => Arc::make_mut(&mut acc.vertex_buffers),
+                    Stage::Fragment => Arc::make_mut(&mut acc.fragment_buffers),
+                    // An offset update names a slot in a table; with no stage
+                    // there is no table, and inventing one would move somebody
+                    // else's binding.
+                    Stage::Unknown => return,
                 };
                 if let Some(b) = list.iter_mut().find(|b| b.index == cmd.first) {
                     b.offset = cmd.buffer_offset;
@@ -947,72 +1133,49 @@ fn handle_render_record<M: HostMemory + HostOps>(
         RenderKind::SetTexture => {
             // As for SetBuffer: `ref_binds` is never empty on a decoded record,
             // and the clone the removed fallback needed went with it.
-            for (i, &texture_ref) in cmd.ref_binds.iter().enumerate() {
-                let index = cmd.first.saturating_add(i as u32);
-                if index >= MAX_BIND_SLOTS {
-                    break;
-                }
-                if texture_ref == 0 {
-                    match cmd.stage {
-                        Stage::Vertex => acc.vertex_textures.retain(|b| b.index != index),
-                        Stage::Fragment => acc.fragment_textures.retain(|b| b.index != index),
-                        _ => {}
+            let cleared = apply_binds(
+                &cmd.ref_binds,
+                cmd.first,
+                cmd.stage,
+                &mut acc.vertex_textures,
+                &mut acc.fragment_textures,
+                |b| b.index,
+                |index, texture_ref| {
+                    if texture_ref == 0 {
+                        return None;
                     }
-                    out.texture_unbinds = out.texture_unbinds.saturating_add(1);
-                    continue;
-                }
-                if !out.texture_refs.contains(&texture_ref) {
-                    out.texture_refs.push(texture_ref);
-                }
-                let bind = TextureBind {
-                    stage: cmd.stage,
-                    index,
-                    texture_ref,
-                };
-                match cmd.stage {
-                    Stage::Vertex => upsert_texture(&mut acc.vertex_textures, bind),
-                    Stage::Fragment => upsert_texture(&mut acc.fragment_textures, bind),
-                    _ => {}
-                }
-                if let Some(m) = objects::resolve_type11_ref(state, host, task_id, texture_ref) {
-                    if !out.type11_mappings.contains(&m) {
-                        out.type11_mappings.push(m);
+                    if !out.texture_refs.contains(&texture_ref) {
+                        out.texture_refs.push(texture_ref);
                     }
-                } else if objects::resolve_type4_surface(state, host, texture_ref) {
-                    // x86 type-4: object ref is surface_id / mapping_id.
-                    if !out.type11_mappings.contains(&texture_ref) {
-                        out.type11_mappings.push(texture_ref);
+                    if let Some(m) = objects::resolve_type11_ref(state, host, task_id, texture_ref)
+                    {
+                        if !out.type11_mappings.contains(&m) {
+                            out.type11_mappings.push(m);
+                        }
+                    } else if objects::resolve_type4_surface(state, host, texture_ref) {
+                        // x86 type-4: object ref is surface_id / mapping_id.
+                        if !out.type11_mappings.contains(&texture_ref) {
+                            out.type11_mappings.push(texture_ref);
+                        }
                     }
-                }
-            }
+                    Some(TextureBind { index, texture_ref })
+                },
+            );
+            out.texture_unbinds = out.texture_unbinds.saturating_add(cleared);
         }
         RenderKind::SetSampler => {
-            let refs = &cmd.ref_binds;
-            for (i, &sampler_ref) in refs.iter().enumerate() {
-                let index = cmd.first.saturating_add(i as u32);
-                if index >= MAX_BIND_SLOTS {
-                    break;
-                }
-                if sampler_ref == 0 {
-                    match cmd.stage {
-                        Stage::Vertex => acc.vertex_samplers.retain(|b| b.index != index),
-                        Stage::Fragment => acc.fragment_samplers.retain(|b| b.index != index),
-                        _ => {}
-                    }
-                    out.sampler_unbinds = out.sampler_unbinds.saturating_add(1);
-                    continue;
-                }
-                let bind = SamplerBind {
-                    stage: cmd.stage,
-                    index,
-                    sampler_ref,
-                };
-                match cmd.stage {
-                    Stage::Vertex => upsert_sampler(&mut acc.vertex_samplers, bind),
-                    Stage::Fragment => upsert_sampler(&mut acc.fragment_samplers, bind),
-                    _ => {}
-                }
-            }
+            let cleared = apply_binds(
+                &cmd.ref_binds,
+                cmd.first,
+                cmd.stage,
+                &mut acc.vertex_samplers,
+                &mut acc.fragment_samplers,
+                |b| b.index,
+                |index, sampler_ref| {
+                    (sampler_ref != 0).then_some(SamplerBind { index, sampler_ref })
+                },
+            );
+            out.sampler_unbinds = out.sampler_unbinds.saturating_add(cleared);
         }
         RenderKind::SetViewport => {
             acc.viewport = Some(cmd.viewport);
@@ -1065,9 +1228,6 @@ fn handle_render_record<M: HostMemory + HostOps>(
                     } else if let Some(entry) = acc.color_slots.iter_mut().find(|(s, _)| *s == slot)
                     {
                         entry.1 = att;
-                    }
-                    if !out.color_targets.contains(&att.texture_ref) {
-                        out.color_targets.push(att.texture_ref);
                     }
                     if !acc.color_targets.contains(&att.texture_ref) {
                         acc.color_targets.push(att.texture_ref);
@@ -1149,7 +1309,9 @@ fn handle_render_record<M: HostMemory + HostOps>(
                 acc.indexed = None;
             }
             // Snapshot bind state for this draw (archive multi-draw job).
-            if acc.draws.len() < MAX_DRAWS_PER_STREAM && acc.pipeline_ref != 0 && count > 0 {
+            if acc.pipeline_ref == 0 || count == 0 {
+                acc.dropped_unbound = acc.dropped_unbound.saturating_add(1);
+            } else {
                 acc.draws.push(PendingDraw {
                     pipeline_ref: acc.pipeline_ref,
                     draw: (
@@ -1158,23 +1320,7 @@ fn handle_render_record<M: HostMemory + HostOps>(
                         cmd.primitive_type,
                         cmd.vertex_start,
                     ),
-                    indexed: acc.indexed.clone(),
-                    vertex_buffers: acc.vertex_buffers.clone(),
-                    fragment_buffers: acc.fragment_buffers.clone(),
-                    vertex_textures: acc.vertex_textures.clone(),
-                    fragment_textures: acc.fragment_textures.clone(),
-                    vertex_samplers: acc.vertex_samplers.clone(),
-                    fragment_samplers: acc.fragment_samplers.clone(),
-                    viewport: acc.viewport,
-                    scissor: acc.scissor,
-                    blend_color: acc.blend_color,
-                    cull_mode: acc.cull_mode,
-                    front_facing: acc.front_facing,
-                    depth_bias: acc.depth_bias,
-                    depth_stencil_ref: acc.depth_stencil_ref,
-                    stencil_ref: acc.stencil_ref,
-                    depth_attach: acc.depth_attach,
-                    stencil_attach: acc.stencil_attach,
+                    ..acc.bind_snapshot()
                 });
             }
         }
@@ -1222,7 +1368,7 @@ fn handle_render_record<M: HostMemory + HostOps>(
             // tiny and boot-stable) and capture the raw wire on first sighting
             // so the layout can be decoded offline. Unknown wire stays unknown;
             // we never invent semantics for it.
-            note_unimplemented_render_opcode(cmd.opcode, rec.length, cmd_bytes, task_id, acc);
+            note_unimplemented_render_opcode(cmd.opcode, cmd_bytes, task_id, acc);
         }
         _ => {}
     }
@@ -1253,7 +1399,6 @@ static UNIMPL_OPCODE_OVERFLOW: std::sync::OnceLock<
 /// anti-flood behavior without depending on the shared always-on log file.
 fn note_unimplemented_render_opcode(
     opcode: u32,
-    length: u32,
     cmd_bytes: &[u8],
     task_id: u32,
     acc: &StreamAccum,
@@ -1283,7 +1428,7 @@ fn note_unimplemented_render_opcode(
     crate::observe::fail(format!(
         "render_unimplemented reason=accepted_without_executor task={task_id} opcode={:#x} len={} target_refs={:?} pipeline={} vbufs={} fbufs={} ftex={} hex={}",
         opcode,
-        length,
+        cmd_bytes.len(),
         acc.color_targets,
         acc.pipeline_ref,
         acc.vertex_buffers.len(),
@@ -1313,27 +1458,105 @@ fn reset_unimplemented_opcode_dedup_for_test() {
     }
 }
 
-fn upsert_buffer(list: &mut Vec<BufferBind>, bind: BufferBind) {
-    if let Some(slot) = list.iter_mut().find(|b| b.index == bind.index) {
-        *slot = bind;
-    } else {
-        list.push(bind);
+/// Apply one `Set{Buffer,Texture,Sampler}` record to a stage's bind table.
+///
+/// All three carry the same wire form: `count` consecutive slots starting at
+/// `first`, where a zero object ref clears the slot it names and any other ref
+/// replaces whatever occupied it. Slots at or past [`MAX_BIND_SLOTS`] are
+/// outside the encoder's table and end the walk. Only the vertex and fragment
+/// stages have tables here; a record for any other stage still counts its
+/// clears, because a slot the guest cleared is cleared whether or not we model
+/// the table it lived in.
+///
+/// `make` builds the bind for a live slot and returns `None` for the zero ref,
+/// which keeps the ref field's name — and any side registration, such as the
+/// texture arm's type-11 mapping list — with the caller. The clear count comes
+/// back as a return value rather than through an `&mut` counter so `make` can
+/// hold the rest of `ExecResult`.
+fn apply_binds<T: Copy, B: Clone>(
+    entries: &[T],
+    first: u32,
+    stage: Stage,
+    vertex: &mut BindTable<B>,
+    fragment: &mut BindTable<B>,
+    slot: impl Fn(&B) -> u32,
+    mut make: impl FnMut(u32, T) -> Option<B>,
+) -> u32 {
+    let mut cleared = 0u32;
+    for (i, entry) in entries.iter().copied().enumerate() {
+        let index = first.saturating_add(i as u32);
+        if index >= MAX_BIND_SLOTS {
+            break;
+        }
+        let bind = make(index, entry);
+        let list = match stage {
+            Stage::Vertex => Arc::make_mut(vertex),
+            Stage::Fragment => Arc::make_mut(fragment),
+            // No table to bind into, but a slot the guest cleared is still
+            // cleared: the count is what the record said, not what we modelled.
+            Stage::Unknown => {
+                cleared = cleared.saturating_add(bind.is_none() as u32);
+                continue;
+            }
+        };
+        let Some(bind) = bind else {
+            list.retain(|b| slot(b) != index);
+            cleared = cleared.saturating_add(1);
+            continue;
+        };
+        match list.iter_mut().find(|b| slot(b) == index) {
+            Some(occupant) => *occupant = bind,
+            None => list.push(bind),
+        }
     }
+    cleared
 }
 
-fn upsert_texture(list: &mut Vec<TextureBind>, bind: TextureBind) {
-    if let Some(slot) = list.iter_mut().find(|b| b.index == bind.index) {
-        *slot = bind;
-    } else {
-        list.push(bind);
+/// Report what this stream's draw list cost, and anything it lost building it.
+///
+/// The distribution stays after the cap is gone, because it is now the only
+/// thing that prices the decision to keep every record: it says how long a real
+/// render stream is, and therefore what an unbounded list actually costs. The
+/// boot that removed the cap read 118 307 streams as 39 913 single-draw, 55 306
+/// at 2–4, 14 579 at 9–16 and 8013 at 33–63, with two above 64 — a tail that
+/// exists and a body that does not.
+///
+/// Buckets rather than a mean because the question is about that tail: one
+/// 400-draw compositor stream among thousands of 2-draw ones is exactly the case
+/// that matters and is exactly what a mean hides. The two buckets above the old
+/// ceiling are what say whether removing it changed which streams complete.
+fn note_stream_draw_drops(task_id: u32, acc: &StreamAccum) {
+    let kept = acc.draws.len();
+    if kept == 0 && acc.dropped_unbound == 0 {
+        return;
     }
-}
-
-fn upsert_sampler(list: &mut Vec<SamplerBind>, bind: SamplerBind) {
-    if let Some(slot) = list.iter_mut().find(|b| b.index == bind.index) {
-        *slot = bind;
-    } else {
-        list.push(bind);
+    crate::runtime::drain::note_store_route(match kept {
+        0 => "stream_draws_0",
+        1 => "stream_draws_1",
+        2..=4 => "stream_draws_2_4",
+        5..=8 => "stream_draws_5_8",
+        9..=16 => "stream_draws_9_16",
+        17..=32 => "stream_draws_17_32",
+        33..=63 => "stream_draws_33_63",
+        64..=255 => "stream_draws_64_255",
+        _ => "stream_draws_over_255",
+    });
+    // Latched on the *magnitude* of the loss, not on the task: the same stream
+    // shape recurs every frame, so a per-task key would print once and hide a
+    // loss that grew, while a bucket key prints again when it gets worse.
+    if acc.dropped_unbound > 0 {
+        let d = StreamDrawDrop::Unbound {
+            dropped: acc.dropped_unbound,
+        };
+        if crate::observe::first_sight(
+            crate::observe::Decline::slug(&d),
+            u64::from(acc.dropped_unbound.next_power_of_two()),
+        ) {
+            crate::observe::Emit::decline("stream_draw", &d)
+                .field("task", task_id)
+                .field("kept", kept)
+                .fail();
+        }
     }
 }
 
@@ -1344,6 +1567,7 @@ fn finish_stream<M: HostMemory + HostOps>(
     out: &mut ExecResult,
     acc: &StreamAccum,
 ) {
+    note_stream_draw_drops(task_id, acc);
     // Archive ApplePVGPUDrawJob: clear/load seed is private initial_rgba for the
     // async job; guest pages are written once at completion. Apply clear-to-guest
     // only for clear-only streams (no draws). When draws run, CLEAR is the Metal
@@ -1359,89 +1583,79 @@ fn finish_stream<M: HostMemory + HostOps>(
     }
 
     // Render ICB execute (`0x14`/`0x15`) — open pass over color slots and run ICB.
+    // Counted in FRONT of every gate below, because the only always-on report
+    // of this rail (`exec_summary`'s `icb_ok`/`icb_fail`) is emitted solely for
+    // packets that already failed, so an ICB that succeeds is invisible there
+    // and the whole rail reads as "never runs". This says how often the decoded
+    // stream asks for one at all, which is the denominator `runtime/icb`
+    // (2818 product lines) has never had.
+    //
+    // # Measured absent on three driven x86 / Vulkan boots
+    //
+    // The third is the one that carries the weight, because the first two were
+    // compositing-only and could not tell "the guest does not use ICB" from
+    // "this workload never reaches Metal":
+    //
+    //   1. Wikipedia + apple.com + System Settings, three title-bar drags.
+    //   2. apple.com, four page-downs.
+    //   3. Chess (SceneKit 3D) + Maps + the WebGL aquarium rendering live —
+    //      **66 512 draws** and 74.9 ms of `compute_us` across the boot.
+    //
+    // `icb_exec_seen`, `compute_icb_seen` and `compute_ctrl_seen` are all absent
+    // from every one. Across the whole accumulated fail log the subsystem has
+    // never emitted a line of its own either (every "icb" string in it is a
+    // field *name* on an `exec_summary` line).
+    //
+    // **This is still not a licence to delete `runtime/icb`, and the precedent
+    // that settles it is `ffe31d4`**: `mrt_draw_multi` also measured zero, and
+    // that session kept MRT *rendering* because it is decoded contract, cutting
+    // only the speculative sampling side-map built around it.
+    // `ExecuteCommandsInBuffer` is likewise a real Metal opcode in the decoded
+    // stream — a guest that issues one against a decoder we deleted loses work
+    // silently, which is the one outcome the ground rules forbid outright. What
+    // the reading does license is scrutiny of any layer built *around* the
+    // decode on speculation rather than on decoded fields.
+    //
+    // arm64 is unmeasured; these are x86 / Vulkan readings only.
+    if acc.execute_icb.is_some() {
+        crate::runtime::drain::note_store_route("icb_exec_seen");
+    }
     if let Some(exec) = &acc.execute_icb {
         if !acc.color_slots.is_empty() {
-            // Pipeline optional for empty ICB; use first pass color geometry via mrt helper.
-            let pipeline = if acc.pipeline_ref != 0 {
-                acc.pipeline_ref
-            } else {
-                // Still need a non-zero ref for mrt_draw_request gate — use 1 as placeholder
-                // when only ICB execute (PSO lives inside filled slots). mrt_draw_request
-                // only uses pipeline for encode_draw; for ICB we rebuild colors manually.
-                0
-            };
-            let req = if pipeline != 0 {
-                if let Some(pd) = acc.draws.last() {
+            // `mrt_draw_request` gates on a non-zero pipeline ref, and an
+            // ICB-only execute has none in the stream — its PSO lives inside
+            // the filled slots — so 1 stands in and only the colour list is
+            // taken. That case also takes the default single-triangle geometry
+            // rather than the stream's last draw, because the ICB carries its
+            // own. Otherwise the last pass's geometry describes the pass this
+            // ICB runs inside.
+            let (pipeline, count, inst, prim, first) = if acc.pipeline_ref != 0 {
+                let (count, inst, prim, first) = acc.draws.last().map_or((1, 1, 3, 0), |pd| {
                     let (count, inst, prim, first) = pd.draw;
-                    metal_draw::mrt_draw_request(
-                        state,
-                        host,
-                        task_id,
-                        pipeline,
-                        &acc.color_slots,
-                        &acc.clears,
-                        count.max(1),
-                        inst.max(1),
-                        prim,
-                        first,
-                    )
-                } else {
-                    metal_draw::mrt_draw_request(
-                        state,
-                        host,
-                        task_id,
-                        pipeline,
-                        &acc.color_slots,
-                        &acc.clears,
-                        1,
-                        1,
-                        3,
-                        0,
-                    )
-                }
+                    (count.max(1), inst.max(1), prim, first)
+                });
+                (acc.pipeline_ref, count, inst, prim, first)
             } else {
-                // Build color RT list without pipeline (ICB-only execute).
-                metal_draw::mrt_draw_request(
-                    state,
-                    host,
-                    task_id,
-                    1, // unused when we only need colors
-                    &acc.color_slots,
-                    &acc.clears,
-                    1,
-                    1,
-                    3,
-                    0,
-                )
+                (1, 1, 1, 3, 0)
             };
+            let req = metal_draw::mrt_draw_request(
+                state,
+                host,
+                task_id,
+                pipeline,
+                &acc.color_slots,
+                &acc.clears,
+                count,
+                inst,
+                prim,
+                first,
+            );
             if let Some(mut req) = req {
                 // ICB execute inherits stream bind state at end of stream.
                 if let Some(pd) = acc.draws.last() {
                     fill_draw_binds_from_pending(&mut req, pd);
                 } else {
-                    fill_draw_binds_from_pending(
-                        &mut req,
-                        &PendingDraw {
-                            vertex_buffers: acc.vertex_buffers.clone(),
-                            fragment_buffers: acc.fragment_buffers.clone(),
-                            vertex_textures: acc.vertex_textures.clone(),
-                            fragment_textures: acc.fragment_textures.clone(),
-                            vertex_samplers: acc.vertex_samplers.clone(),
-                            fragment_samplers: acc.fragment_samplers.clone(),
-                            viewport: acc.viewport,
-                            scissor: acc.scissor,
-                            indexed: acc.indexed.clone(),
-                            blend_color: acc.blend_color,
-                            cull_mode: acc.cull_mode,
-                            front_facing: acc.front_facing,
-                            depth_bias: acc.depth_bias,
-                            depth_stencil_ref: acc.depth_stencil_ref,
-                            stencil_ref: acc.stencil_ref,
-                            depth_attach: acc.depth_attach,
-                            stencil_attach: acc.stencil_attach,
-                            ..Default::default()
-                        },
-                    );
+                    fill_draw_binds_from_pending(&mut req, &acc.bind_snapshot());
                 }
                 let (loc, len) = if exec.is_range {
                     (exec.range_location, exec.range_length)
@@ -1476,7 +1690,10 @@ fn finish_stream<M: HostMemory + HostOps>(
                     loc,
                     len,
                 ) {
-                    EncodeStatus::Ok => out.render_icb_ok += 1,
+                    EncodeStatus::Ok => {
+                        crate::runtime::drain::note_store_route("icb_exec_ok");
+                        out.render_icb_ok += 1;
+                    }
                     st => {
                         out.render_icb_fail += 1;
                         // Was `st={st:?}` — the variant, Debug-rendered, with no
@@ -1654,23 +1871,34 @@ fn finish_stream<M: HostMemory + HostOps>(
                         // break so we do not composite later draws on a missing seed.
                         out.metal_draws_ok += 1;
                         if !do_writeback && !unified {
+                            // Every draw after this one is dropped, so say so.
+                            // The two sibling break arms below report through
+                            // `note_draw_encode_fail`; this one encoded `Ok` and
+                            // so has no `EncodeStatus` to carry a reason, which
+                            // is exactly how it stayed silent while losing the
+                            // rest of the packet.
+                            crate::observe::Emit::decline(
+                                "draw_chain_abandon",
+                                &ChainAbandonDecline {
+                                    index: di,
+                                    total: draw_list.len(),
+                                    pipeline_ref: pd.pipeline_ref,
+                                },
+                            )
+                            .field("task", task_id)
+                            .fail_once(pd.pipeline_ref as u64);
                             // Land any earlier chain image before abandoning —
                             // same as the hard-fail path below. Dropping the
                             // chain left dual-mid pages black while gen advanced.
-                            #[cfg(feature = "backend-vulkan")]
-                            if resident_chain && chain_rgba.is_none() {
-                                chain_rgba = metal_draw::read_resident_chain(state, &req);
-                            }
-                            if let Some(rgba) = chain_rgba.take() {
-                                let _ = metal_draw::writeback_chain_rgba(
-                                    state,
-                                    host,
-                                    task_id,
-                                    &acc.color_slots,
-                                    &rgba,
-                                );
-                            }
-                            dirty_color_targets(state, host, task_id, &acc.color_targets);
+                            land_chain_before_abandon(
+                                state,
+                                host,
+                                task_id,
+                                acc,
+                                &req,
+                                &mut chain_rgba,
+                                resident_chain,
+                            );
                             break;
                         }
                     }
@@ -1678,20 +1906,15 @@ fn finish_stream<M: HostMemory + HostOps>(
                         saw_nometal = true;
                         out.metal_draws_fail += 1;
                         note_draw_encode_fail(task_id, pd.pipeline_ref, st, di, draw_list.len());
-                        #[cfg(feature = "backend-vulkan")]
-                        if resident_chain && chain_rgba.is_none() {
-                            chain_rgba = metal_draw::read_resident_chain(state, &req);
-                        }
-                        if let Some(rgba) = chain_rgba.take() {
-                            let _ = metal_draw::writeback_chain_rgba(
-                                state,
-                                host,
-                                task_id,
-                                &acc.color_slots,
-                                &rgba,
-                            );
-                        }
-                        dirty_color_targets(state, host, task_id, &acc.color_targets);
+                        land_chain_before_abandon(
+                            state,
+                            host,
+                            task_id,
+                            acc,
+                            &req,
+                            &mut chain_rgba,
+                            resident_chain,
+                        );
                         break;
                     }
                     // `Ok` and the distinct clear-fallback `NoMetal` recovery
@@ -1705,20 +1928,15 @@ fn finish_stream<M: HostMemory + HostOps>(
                         // before abandoning the packet. Unified targets already
                         // landed each record in guest memory — never write the
                         // (zero) chain buffer over them.
-                        #[cfg(feature = "backend-vulkan")]
-                        if resident_chain && chain_rgba.is_none() {
-                            chain_rgba = metal_draw::read_resident_chain(state, &req);
-                        }
-                        if let Some(rgba) = chain_rgba.take() {
-                            let _ = metal_draw::writeback_chain_rgba(
-                                state,
-                                host,
-                                task_id,
-                                &acc.color_slots,
-                                &rgba,
-                            );
-                        }
-                        dirty_color_targets(state, host, task_id, &acc.color_targets);
+                        land_chain_before_abandon(
+                            state,
+                            host,
+                            task_id,
+                            acc,
+                            &req,
+                            &mut chain_rgba,
+                            resident_chain,
+                        );
                         break;
                     }
                 }
@@ -1745,6 +1963,38 @@ fn finish_stream<M: HostMemory + HostOps>(
         }
     }
 }
+
+/// Why a draw list stopped early while every draw in it had encoded `Ok`.
+///
+/// This is the one abandon path that no counter can see. `metal_draws_fail`
+/// stays 0, so `packet_failed` is false and even the packet-level
+/// `exec_indirect2` line is suppressed; the draws after this point are dropped
+/// with the packet still reported as successful.
+#[derive(Debug)]
+struct ChainAbandonDecline {
+    /// Index of the record that returned no chain image, and the list length.
+    /// A break at 0 of 8 loses a whole composite; a break at 7 of 8 loses one
+    /// draw, and the two are not the same defect.
+    index: usize,
+    total: usize,
+    pipeline_ref: u32,
+}
+
+impl crate::observe::Decline for ChainAbandonDecline {
+    fn slug(&self) -> &'static str {
+        "draw_chain_abandoned_without_color0"
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("di", format!("{}/{}", self.index, self.total)),
+            ("lost", (self.total - self.index - 1).to_string()),
+            ("pipe", self.pipeline_ref.to_string()),
+        ]
+    }
+}
+
+crate::observe::decline_display!(ChainAbandonDecline);
 
 /// One-shot (per `pipeline_ref` x reason) always-on line for a failed draw
 /// encode. `exec_indirect2 draws_fail=N` collapses every cause into one
@@ -1798,11 +2048,6 @@ fn render_pass_attachment_template(
         .collect();
     metal_draw::DrawEncodeRequest {
         task_id: first.task_id,
-        color_texture_ref: first.color_texture_ref,
-        mapping_id: first.mapping_id,
-        width: first.width,
-        height: first.height,
-        format: first.format,
         colors,
         ..Default::default()
     }
@@ -1830,10 +2075,11 @@ fn read_icb_exec_range<M: HostMemory + HostOps>(
     offset: u64,
 ) -> Option<(u64, u64)> {
     use crate::runtime::compute_exec::read_buffer_window;
+    // `read_buffer_window` returns exactly the requested 8 bytes or an error,
+    // so both reads are in range; the `try_into().ok()?` pair that used to
+    // wrap them could only ever be `Ok`.
     let raw = read_buffer_window(state, host, task_id, buffer_ref, offset, 8).ok()?;
-    let loc = u32::from_le_bytes(raw[0..4].try_into().ok()?) as u64;
-    let len = u32::from_le_bytes(raw[4..8].try_into().ok()?) as u64;
-    Some((loc, len))
+    Some((u64::from(ld32(&raw)), u64::from(ld32(&raw[4..]))))
 }
 
 /// Guest store plan for multi-draw record `di` of `draw_count` (0-based).
@@ -1869,12 +2115,12 @@ fn multi_draw_chain_source(resident_chain: bool, cpu_chain_ready: bool) -> Multi
 }
 
 fn fill_draw_binds_from_pending(req: &mut metal_draw::DrawEncodeRequest, pd: &PendingDraw) {
-    req.vertex_buffers = pd.vertex_buffers.clone();
-    req.fragment_buffers = pd.fragment_buffers.clone();
-    req.vertex_textures = pd.vertex_textures.clone();
-    req.fragment_textures = pd.fragment_textures.clone();
-    req.vertex_samplers = pd.vertex_samplers.clone();
-    req.fragment_samplers = pd.fragment_samplers.clone();
+    req.vertex_buffers = pd.vertex_buffers.as_ref().clone();
+    req.fragment_buffers = pd.fragment_buffers.as_ref().clone();
+    req.vertex_textures = pd.vertex_textures.as_ref().clone();
+    req.fragment_textures = pd.fragment_textures.as_ref().clone();
+    req.vertex_samplers = pd.vertex_samplers.as_ref().clone();
+    req.fragment_samplers = pd.fragment_samplers.as_ref().clone();
     req.viewport = pd.viewport;
     req.scissor = pd.scissor;
     req.indexed = pd.indexed.clone();
@@ -1903,6 +2149,39 @@ fn dirty_color_targets<M: HostMemory + HostOps>(
             let _ = state.mark_mapping_written(tex_ref);
         }
     }
+}
+
+/// Land the chain image this packet has produced before abandoning it.
+///
+/// Three records break a multi-draw chain: a typed terminal refusal, the
+/// `NoMetal` carrier, and an intermediate that returned no colour0. All three
+/// leave earlier GVA draws' pixels only on the engine target, and dropping
+/// them left dual-mid pages black while the content generation advanced — so
+/// the resident is read back and written out first, and the colour targets are
+/// marked written either way.
+///
+/// Unified targets already landed each record in guest memory and must never
+/// take the (zero) chain buffer over them; the one caller where that is
+/// possible gates on it.
+fn land_chain_before_abandon<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    acc: &StreamAccum,
+    req: &metal_draw::DrawEncodeRequest,
+    chain_rgba: &mut Option<Vec<u8>>,
+    resident_chain: bool,
+) {
+    #[cfg(feature = "backend-vulkan")]
+    if resident_chain && chain_rgba.is_none() {
+        *chain_rgba = metal_draw::read_resident_chain(state, req);
+    }
+    #[cfg(not(feature = "backend-vulkan"))]
+    let _ = (req, resident_chain);
+    if let Some(rgba) = chain_rgba.take() {
+        let _ = metal_draw::writeback_chain_rgba(state, host, task_id, &acc.color_slots, &rgba);
+    }
+    dirty_color_targets(state, host, task_id, &acc.color_targets);
 }
 
 fn solid_rgba(w: u32, h: u32, clear: &[f64; 4]) -> Vec<u8> {
@@ -2018,6 +2297,42 @@ mod tests {
     };
     use crate::runtime::host::FakeHost;
 
+    /// The abandon line must say how much guest work it dropped.
+    ///
+    /// This break was silent, and the counter that would have caught it
+    /// (`metal_draws_fail`) stays 0 on this path because the draw encoded
+    /// `Ok` — so `packet_failed` is false and the packet-level line is
+    /// suppressed too. The whole value of the line is the amount lost:
+    /// breaking at 0 of 8 drops a whole composite, breaking at 7 of 8 drops
+    /// one draw, and `di` alone does not distinguish them at a glance.
+    #[test]
+    fn chain_abandon_reports_how_many_draws_were_lost() {
+        let render = |index, total| {
+            crate::observe::Emit::decline(
+                "draw_chain_abandon",
+                &ChainAbandonDecline {
+                    index,
+                    total,
+                    pipeline_ref: 0x41,
+                },
+            )
+            .render()
+        };
+
+        let first_of_eight = render(0, 8);
+        assert!(
+            first_of_eight.contains("reason=draw_chain_abandoned_without_color0"),
+            "{first_of_eight}"
+        );
+        assert!(first_of_eight.contains("di=0/8"), "{first_of_eight}");
+        assert!(first_of_eight.contains("lost=7"), "{first_of_eight}");
+        assert!(first_of_eight.contains("pipe=65"), "{first_of_eight}");
+
+        // The last record of a list abandons nothing after it. Reporting a
+        // loss here would send a reader hunting for draws that never existed.
+        assert!(render(7, 8).contains("lost=0"), "{}", render(7, 8));
+    }
+
     #[test]
     fn short_payload_noop() {
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
@@ -2063,6 +2378,235 @@ mod tests {
         );
         assert_eq!(r.streams_loaded, 0);
         assert!(!r.saw_draw);
+    }
+
+    /// Bytes `+0x08..0x18` of a resource-table record are zero on every build
+    /// this project has measured, and their meaning is unrecovered. A guest that
+    /// starts setting them is telling this device something it cannot act on, so
+    /// the record must raise a line rather than pass unread.
+    ///
+    /// The record with the populated tail is second, and the first is clean: a
+    /// check that fired on the *table* rather than the record would pass this
+    /// too, so the assertion names the object id.
+    #[test]
+    fn a_resource_record_that_populates_its_unrecovered_tail_says_so() {
+        use crate::runtime::decode::fifo::{
+            CHILD_EXEC_RESOURCE_OBJECT_ID, CHILD_EXEC_RESOURCE_TAIL,
+            CHILD_EXEC_RESOURCE_VALIDITY_OPS,
+        };
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+        assert!(state.define_task(3, 0x1_0000, 2), "slot 3 must be live");
+
+        const N_RES: u32 = 2;
+        let table_len = N_RES as usize * CHILD_EXEC_INDIRECT_RESOURCE_DESC_LEN as usize;
+        let mut payload = vec![
+            0u8;
+            CHILD_EXEC_INDIRECT_HEADER_LEN as usize
+                + table_len
+                + CHILD_EXEC_INDIRECT_CMDBUF_DESC_LEN as usize
+        ];
+        st32(&mut payload[CHILD_EXEC_INDIRECT_TASK_ID as usize..], 3);
+        st32(
+            &mut payload[CHILD_EXEC_INDIRECT_RESOURCE_COUNT as usize..],
+            N_RES,
+        );
+        st32(&mut payload[CHILD_EXEC_INDIRECT_CMDBUF_COUNT as usize..], 1);
+        for (i, id) in [0x40u32, 0x41].into_iter().enumerate() {
+            let off = CHILD_EXEC_INDIRECT_HEADER_LEN as usize
+                + i * CHILD_EXEC_INDIRECT_RESOURCE_DESC_LEN as usize;
+            st32(
+                &mut payload[off + CHILD_EXEC_RESOURCE_OBJECT_ID as usize..],
+                id,
+            );
+            st32(
+                &mut payload[off + CHILD_EXEC_RESOURCE_VALIDITY_OPS as usize..],
+                0x0000_0001,
+            );
+        }
+        // One byte, in the last record, at the far end of the tail: the widest
+        // gap between "the decoder read the tail" and "the decoder read a dword
+        // it already had".
+        let last = CHILD_EXEC_INDIRECT_HEADER_LEN as usize
+            + CHILD_EXEC_INDIRECT_RESOURCE_DESC_LEN as usize;
+        payload[last + CHILD_EXEC_RESOURCE_TAIL as usize + 15] = 0xa5;
+
+        let cb = CHILD_EXEC_INDIRECT_HEADER_LEN as usize + table_len;
+        st64(
+            &mut payload[cb + CHILD_EXEC_INDIRECT_CMDBUF_GVA as usize..],
+            0xdead_0000,
+        );
+        st64(
+            &mut payload[cb + CHILD_EXEC_INDIRECT_CMDBUF_LENGTH as usize..],
+            64,
+        );
+
+        let cap = crate::observe::sink::FailCapture::start();
+        let r = process_exec_indirect2(&mut state, &mut host, &payload);
+        assert_eq!(r.task_id, 3);
+        assert_eq!(r.streams_loaded, 0, "no page table backs the cmdbuf gva");
+        let line = cap.one("exec_res_table");
+        assert!(line.contains("reason=exec_res_tail_populated"), "{line}");
+        assert!(line.contains(" object=65 "), "{line}");
+        assert!(line.contains(" tail_nz=1"), "{line}");
+    }
+
+    /// A submission whose table says the guest CPU-wrote a resource must not
+    /// leave that resource's deferred window armed.
+    ///
+    /// The window holds pixels the device rendered *before* the guest's write.
+    /// Landing it afterwards replaces the guest's own bytes with a frame the
+    /// guest has just declared stale — a full-extent clobber that no timing rail
+    /// can prevent, because the question is not when the window lands but
+    /// whether it may land at all.
+    #[test]
+    fn a_submission_that_says_the_guest_wrote_a_resource_drops_its_pending_window() {
+        use crate::runtime::decode::fifo::{
+            CHILD_EXEC_RESOURCE_OBJECT_ID, CHILD_EXEC_RESOURCE_VALIDITY_OPS,
+        };
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+        assert!(state.define_task(3, 0x1_0000, 2), "slot 3 must be live");
+        const MAPPING: u32 = 0x40;
+        state.mappings.entry(MAPPING).or_default().mapped = true;
+        let key = crate::model::ComputeStorageResidencyKey {
+            mapping_id: MAPPING,
+            map_generation: 0,
+            surface_offset: 0,
+            surface_bpr: 64 * 4,
+            span_end: 64 * 64 * 4,
+            width: 64,
+            height: 64,
+            pixel_format: 0x50,
+            texture_ref: 0,
+        };
+        state.compute_deferred_flush.insert(
+            key,
+            crate::model::DeferredOwner::Render {
+                armed_seq: 0,
+                armed_stamp_seq: 0,
+                source: crate::model::RenderWindowSource::Owned(std::sync::Arc::new(vec![
+                    0u8;
+                    64 * 64
+                        * 4
+                ])),
+            },
+        );
+        assert_eq!(state.deferred_flush_window_count(MAPPING), 1);
+        let gen_before = state.mappings[&MAPPING].content_generation;
+
+        // One resource record: clear_host_valid, no command buffers to run.
+        let mut payload = vec![
+            0u8;
+            CHILD_EXEC_INDIRECT_HEADER_LEN as usize
+                + CHILD_EXEC_INDIRECT_RESOURCE_DESC_LEN as usize
+                + CHILD_EXEC_INDIRECT_CMDBUF_DESC_LEN as usize
+        ];
+        st32(&mut payload[CHILD_EXEC_INDIRECT_TASK_ID as usize..], 3);
+        st32(
+            &mut payload[CHILD_EXEC_INDIRECT_RESOURCE_COUNT as usize..],
+            1,
+        );
+        st32(&mut payload[CHILD_EXEC_INDIRECT_CMDBUF_COUNT as usize..], 1);
+        let res = CHILD_EXEC_INDIRECT_HEADER_LEN as usize;
+        st32(
+            &mut payload[res + CHILD_EXEC_RESOURCE_OBJECT_ID as usize..],
+            MAPPING,
+        );
+        st32(
+            &mut payload[res + CHILD_EXEC_RESOURCE_VALIDITY_OPS as usize..],
+            0x0000_0001,
+        );
+        let cb = res + CHILD_EXEC_INDIRECT_RESOURCE_DESC_LEN as usize;
+        st64(
+            &mut payload[cb + CHILD_EXEC_INDIRECT_CMDBUF_GVA as usize..],
+            0xdead_0000,
+        );
+        st64(
+            &mut payload[cb + CHILD_EXEC_INDIRECT_CMDBUF_LENGTH as usize..],
+            64,
+        );
+
+        process_exec_indirect2(&mut state, &mut host, &payload);
+        assert_eq!(
+            state.deferred_flush_window_count(MAPPING),
+            0,
+            "the guest said its own bytes are newer than ours; the window must go"
+        );
+        assert_eq!(
+            state.mappings[&MAPPING].content_generation,
+            gen_before + 1,
+            "the next read must re-take the guest pages"
+        );
+        let validity = state.mappings[&MAPPING].validity;
+        assert!(validity.host_stated && !validity.host_valid);
+    }
+
+    /// The mirror of the case above: a licence to write is not a reason to throw
+    /// away the frame the device already produced.
+    #[test]
+    fn a_submission_that_only_licenses_a_resource_keeps_its_pending_window() {
+        use crate::runtime::decode::fifo::{
+            CHILD_EXEC_RESOURCE_OBJECT_ID, CHILD_EXEC_RESOURCE_VALIDITY_OPS,
+        };
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+        assert!(state.define_task(3, 0x1_0000, 2));
+        const MAPPING: u32 = 0x41;
+        state.mappings.entry(MAPPING).or_default().mapped = true;
+        state.compute_deferred_flush.insert(
+            crate::model::ComputeStorageResidencyKey {
+                mapping_id: MAPPING,
+                map_generation: 0,
+                surface_offset: 0,
+                surface_bpr: 64 * 4,
+                span_end: 64 * 64 * 4,
+                width: 64,
+                height: 64,
+                pixel_format: 0x50,
+                texture_ref: 0,
+            },
+            crate::model::DeferredOwner::Render {
+                armed_seq: 0,
+                armed_stamp_seq: 0,
+                source: crate::model::RenderWindowSource::Owned(std::sync::Arc::new(vec![
+                    0u8;
+                    64 * 64
+                        * 4
+                ])),
+            },
+        );
+
+        let mut payload = vec![
+            0u8;
+            CHILD_EXEC_INDIRECT_HEADER_LEN as usize
+                + CHILD_EXEC_INDIRECT_RESOURCE_DESC_LEN as usize
+                + CHILD_EXEC_INDIRECT_CMDBUF_DESC_LEN as usize
+        ];
+        st32(&mut payload[CHILD_EXEC_INDIRECT_TASK_ID as usize..], 3);
+        st32(
+            &mut payload[CHILD_EXEC_INDIRECT_RESOURCE_COUNT as usize..],
+            1,
+        );
+        st32(&mut payload[CHILD_EXEC_INDIRECT_CMDBUF_COUNT as usize..], 1);
+        let res = CHILD_EXEC_INDIRECT_HEADER_LEN as usize;
+        st32(
+            &mut payload[res + CHILD_EXEC_RESOURCE_OBJECT_ID as usize..],
+            MAPPING,
+        );
+        st32(
+            &mut payload[res + CHILD_EXEC_RESOURCE_VALIDITY_OPS as usize..],
+            0x0000_0100,
+        );
+        let cb = res + CHILD_EXEC_INDIRECT_RESOURCE_DESC_LEN as usize;
+        st64(
+            &mut payload[cb + CHILD_EXEC_INDIRECT_CMDBUF_LENGTH as usize..],
+            64,
+        );
+
+        process_exec_indirect2(&mut state, &mut host, &payload);
+        assert_eq!(state.deferred_flush_window_count(MAPPING), 1);
+        assert!(state.mappings[&MAPPING].validity.host_valid);
     }
 
     /// One segment header whose declared length runs `overshoot` bytes past the
@@ -2142,7 +2686,7 @@ mod tests {
         };
         let before = sink_body().len();
         let mut handled = 0usize;
-        walk_segment_records(&stream, &seg, |_| handled += 1);
+        walk_segment_records(&stream, &seg, |_, _| handled += 1);
         let added = sink_body()[before..].to_string();
         assert_eq!(handled, 0, "the malformed segment yields no records");
         assert!(
@@ -2183,7 +2727,7 @@ mod tests {
         let segs = iter_segments(&stream).expect("a well-formed stream frames");
         let before = sink_body().len();
         let mut handled = 0usize;
-        walk_segment_records(&stream, &segs[0], |_| handled += 1);
+        walk_segment_records(&stream, &segs[0], |_, _| handled += 1);
         let added = sink_body()[before..].to_string();
         assert_eq!(handled, 1, "the one record is handed over");
         assert!(
@@ -2388,15 +2932,6 @@ mod tests {
         let mut out = ExecResult::default();
         let mut acc = StreamAccum::default();
 
-        let rec = |len: usize, opcode: u32| stream::Record {
-            segment_index: 0,
-            segment_type: 0,
-            offset: 0,
-            length: len as u32,
-            opcode,
-            bytes_offset: 0,
-        };
-
         // setVertexBuffer multi-entry: first=2 count=1 ref=9 offset=16
         // payload = first:u32 + count:u32 + {ref:u32, offset:u64}
         let mut vb = vec![0u8; HEADER_LEN + 8 + 12];
@@ -2411,8 +2946,8 @@ mod tests {
             &mut state,
             &host,
             0,
+            OP_SET_VERTEX_BUFFER,
             &vb,
-            &rec(vb.len(), OP_SET_VERTEX_BUFFER),
             &mut out,
             &mut acc,
         );
@@ -2427,8 +2962,8 @@ mod tests {
             &mut state,
             &host,
             0,
+            OP_SET_VERTEX_BUFFER,
             &vb,
-            &rec(vb.len(), OP_SET_VERTEX_BUFFER),
             &mut out,
             &mut acc,
         );
@@ -2448,8 +2983,8 @@ mod tests {
             &mut state,
             &host,
             0,
+            OP_SET_FRAGMENT_BUFFER,
             &fb,
-            &rec(fb.len(), OP_SET_FRAGMENT_BUFFER),
             &mut out,
             &mut acc,
         );
@@ -2467,8 +3002,8 @@ mod tests {
             &mut state,
             &host,
             0,
+            OP_SET_VIEWPORT,
             &vp,
-            &rec(vp.len(), OP_SET_VIEWPORT),
             &mut out,
             &mut acc,
         );
@@ -2487,23 +3022,15 @@ mod tests {
             ..Default::default()
         };
         let mut command = vec![0u8; 0x20];
-        st32(&mut command[0..], render::OP_DRAW_INDEXED_WIDE);
+        let op = render::OP_DRAW_INDEXED_WIDE;
+        st32(&mut command[0..], op);
         st32(&mut command[4..], 0x20);
         st16(&mut command[8..], 3);
         st16(&mut command[10..], 0);
         st32(&mut command[12..], 0x3e);
         st32(&mut command[16..], 6);
         st32(&mut command[24..], 0x10100);
-        let rec = stream::Record {
-            segment_index: 0,
-            segment_type: 0,
-            offset: 0,
-            length: command.len() as u32,
-            opcode: render::OP_DRAW_INDEXED_WIDE,
-            bytes_offset: 0,
-        };
-
-        handle_render_record(&mut state, &host, 1, &command, &rec, &mut out, &mut acc);
+        handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
 
         assert!(acc.saw_draw);
         assert!(out.saw_draw);
@@ -2514,6 +3041,140 @@ mod tests {
         assert_eq!(indexed.index_count, 6);
         assert_eq!(indexed.index_buffer_offset, 0x10100);
         assert_eq!(acc.draws[0].draw, (6, 1, 3, 0));
+    }
+
+    /// Every decoded draw in a stream reaches the draw list.
+    ///
+    /// `MAX_DRAWS_PER_STREAM = 64` truncated `acc.draws` inside a bare `if` with
+    /// no `else`, so a compositor stream with more records than that lost every
+    /// draw past the 64th with nothing on any channel — no counter, no line, and
+    /// an `ExecResult` describing the truncated list as a fully executed pass.
+    /// 71 is chosen to straddle that old ceiling: this test fails on the capped
+    /// code at exactly 64.
+    #[test]
+    fn every_decoded_draw_in_a_stream_reaches_the_draw_list() {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let host = FakeHost::new();
+        let mut out = ExecResult::default();
+        let mut acc = StreamAccum {
+            pipeline_ref: 61,
+            ..Default::default()
+        };
+        let mut command = vec![0u8; 0x20];
+        let op = render::OP_DRAW_INDEXED_WIDE;
+        st32(&mut command[0..], op);
+        st32(&mut command[4..], 0x20);
+        st16(&mut command[8..], 3);
+        st32(&mut command[12..], 0x3e);
+        st32(&mut command[16..], 6);
+        let records = 71;
+        for _ in 0..records {
+            handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
+        }
+
+        assert_eq!(acc.draws.len(), records, "no draw may be truncated away");
+        assert_eq!(acc.dropped_unbound, 0, "all of these had a pipeline bound");
+
+        // With no pipeline latched the same record is the other arm: still not
+        // a `PendingDraw`, but counted rather than vanishing.
+        let mut unbound = StreamAccum::default();
+        handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut unbound);
+        assert_eq!(unbound.dropped_unbound, 1);
+        assert!(unbound.draws.is_empty());
+    }
+
+    /// A stream that binds once and draws many times must not copy its bind
+    /// tables per draw.
+    ///
+    /// This is the property that makes an unbounded draw list affordable, and
+    /// therefore the property the cap's removal rests on. It is asserted by
+    /// pointer identity because that is the only thing that distinguishes a
+    /// shared table from an equal copy — `assert_eq!` on the contents passes
+    /// either way, which is exactly how a regression here would hide.
+    #[test]
+    fn draws_sharing_a_bind_table_share_its_allocation() {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let host = FakeHost::new();
+        let mut out = ExecResult::default();
+        let mut acc = StreamAccum {
+            pipeline_ref: 61,
+            vertex_buffers: Arc::new(vec![BufferBind {
+                index: 0,
+                buffer_ref: 9,
+                offset: 0,
+            }]),
+            ..Default::default()
+        };
+        let mut command = vec![0u8; 0x20];
+        let op = render::OP_DRAW_INDEXED_WIDE;
+        st32(&mut command[0..], op);
+        st32(&mut command[4..], 0x20);
+        st16(&mut command[8..], 3);
+        st32(&mut command[12..], 0x3e);
+        st32(&mut command[16..], 6);
+        for _ in 0..100 {
+            handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
+        }
+
+        assert_eq!(acc.draws.len(), 100);
+        for (i, pd) in acc.draws.iter().enumerate() {
+            assert!(
+                Arc::ptr_eq(&pd.vertex_buffers, &acc.vertex_buffers),
+                "draw {i} copied a bind table nothing had changed"
+            );
+        }
+    }
+
+    /// A bind that changes after a draw must not reach back into that draw.
+    ///
+    /// The other half of the copy-on-write contract: sharing is only safe if a
+    /// later mutation forks. `Arc::make_mut` is what does that, and a mutation
+    /// site that reached the `Vec` some other way would silently rewrite a
+    /// snapshot the guest already committed to.
+    #[test]
+    fn a_bind_after_a_draw_does_not_rewrite_that_draws_snapshot() {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let host = FakeHost::new();
+        let mut out = ExecResult::default();
+        let mut acc = StreamAccum {
+            pipeline_ref: 61,
+            vertex_buffers: Arc::new(vec![BufferBind {
+                index: 0,
+                buffer_ref: 9,
+                offset: 0,
+            }]),
+            ..Default::default()
+        };
+        let mut command = vec![0u8; 0x20];
+        let op = render::OP_DRAW_INDEXED_WIDE;
+        st32(&mut command[0..], op);
+        st32(&mut command[4..], 0x20);
+        st16(&mut command[8..], 3);
+        st32(&mut command[12..], 0x3e);
+        st32(&mut command[16..], 6);
+        handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
+
+        apply_binds(
+            &[(77u32, 0u64)],
+            0,
+            Stage::Vertex,
+            &mut acc.vertex_buffers,
+            &mut acc.fragment_buffers,
+            |b| b.index,
+            |index, (buffer_ref, offset)| {
+                Some(BufferBind {
+                    index,
+                    buffer_ref,
+                    offset,
+                })
+            },
+        );
+
+        assert_eq!(
+            acc.draws[0].vertex_buffers[0].buffer_ref, 9,
+            "the committed draw kept the buffer it was encoded with"
+        );
+        assert_eq!(acc.vertex_buffers[0].buffer_ref, 77);
     }
 
     #[test]
@@ -2531,20 +3192,10 @@ mod tests {
         };
         let task_id = 0xfeed;
         let mut command = vec![0u8; HEADER_LEN];
-        st32(&mut command[0..], render::OP_ACCEPTED_LAST);
+        let op = render::OP_ACCEPTED_LAST;
+        st32(&mut command[0..], op);
         st32(&mut command[4..], HEADER_LEN as u32);
-        let rec = stream::Record {
-            segment_index: 0,
-            segment_type: 0,
-            offset: 0,
-            length: command.len() as u32,
-            opcode: render::OP_ACCEPTED_LAST,
-            bytes_offset: 0,
-        };
-
-        handle_render_record(
-            &mut state, &host, task_id, &command, &rec, &mut out, &mut acc,
-        );
+        handle_render_record(&mut state, &host, task_id, op, &command, &mut out, &mut acc);
 
         let body = std::fs::read_to_string(crate::observe::fail_log_path())
             .expect("reims-vgpu-fail.log readable");
@@ -2573,28 +3224,24 @@ mod tests {
 
         // First sighting of an opcode emits; every repeat is deduped (no flood).
         assert!(
-            note_unimplemented_render_opcode(0x7c, 16, &wire, task, &acc),
+            note_unimplemented_render_opcode(0x7c, &wire, task, &acc),
             "first sighting must emit",
         );
         for _ in 0..24 {
             assert!(
-                !note_unimplemented_render_opcode(0x7c, 16, &wire, task, &acc),
+                !note_unimplemented_render_opcode(0x7c, &wire, task, &acc),
                 "a repeated opcode must be deduped",
             );
         }
         // A distinct opcode reports once independently of the first.
-        assert!(note_unimplemented_render_opcode(
-            0x9a, 24, &wire, task, &acc
-        ));
-        assert!(!note_unimplemented_render_opcode(
-            0x9a, 24, &wire, task, &acc
-        ));
+        assert!(note_unimplemented_render_opcode(0x9a, &wire, task, &acc));
+        assert!(!note_unimplemented_render_opcode(0x9a, &wire, task, &acc));
         // Out-of-range opcodes (decode desync) are also deduped, not flooded.
         assert!(note_unimplemented_render_opcode(
-            0x1_0001, 8, &wire, task, &acc
+            0x1_0001, &wire, task, &acc
         ));
         assert!(!note_unimplemented_render_opcode(
-            0x1_0001, 8, &wire, task, &acc
+            0x1_0001, &wire, task, &acc
         ));
 
         // The first-sighting line captured the raw wire for offline decode.
@@ -2691,15 +3338,6 @@ mod tests {
         let host = FakeHost::new();
         let mut out = ExecResult::default();
         let mut acc = StreamAccum::default();
-        let rec = |len: usize, opcode: u32| stream::Record {
-            segment_index: 0,
-            segment_type: 0,
-            offset: 0,
-            length: len as u32,
-            opcode,
-            bytes_offset: 0,
-        };
-
         let mut buffer = vec![0u8; HEADER_LEN + 8 + 12];
         st32(&mut buffer[0..], OP_SET_VERTEX_BUFFER);
         st32(&mut buffer[4..], (HEADER_LEN + 8 + 12) as u32);
@@ -2710,8 +3348,8 @@ mod tests {
             &mut state,
             &host,
             0,
+            OP_SET_VERTEX_BUFFER,
             &buffer,
-            &rec(buffer.len(), OP_SET_VERTEX_BUFFER),
             &mut out,
             &mut acc,
         );
@@ -2720,8 +3358,8 @@ mod tests {
             &mut state,
             &host,
             0,
+            OP_SET_VERTEX_BUFFER,
             &buffer,
-            &rec(buffer.len(), OP_SET_VERTEX_BUFFER),
             &mut out,
             &mut acc,
         );
@@ -2737,25 +3375,9 @@ mod tests {
             st32(&mut command[8..], 3);
             st32(&mut command[12..], 1);
             st32(&mut command[16..], bound);
-            handle_render_record(
-                &mut state,
-                &host,
-                0,
-                &command,
-                &rec(command.len(), opcode),
-                &mut out,
-                &mut acc,
-            );
+            handle_render_record(&mut state, &host, 0, opcode, &command, &mut out, &mut acc);
             st32(&mut command[16..], 0);
-            handle_render_record(
-                &mut state,
-                &host,
-                0,
-                &command,
-                &rec(command.len(), opcode),
-                &mut out,
-                &mut acc,
-            );
+            handle_render_record(&mut state, &host, 0, opcode, &command, &mut out, &mut acc);
         }
         assert!(acc.fragment_textures.is_empty());
         assert!(acc.fragment_samplers.is_empty());
@@ -2776,7 +3398,7 @@ mod tests {
         let mut host = FakeHost::new();
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         state.page_shift = PAGE_SHIFT_X86;
-        // Identity-backed surface pages at pfn 0x40 (one 4K page enough for 16×16).
+        // Surface pages at pfn 0x40 (one 4K page is enough for 16×16).
         let page = 0x40u64 << PAGE_SHIFT_X86;
         host.map_range(page, 0x2000, 0);
         // Task directory so object-list GVA reads work.
@@ -2792,6 +3414,11 @@ mod tests {
         let _ = host.write_gpa(dir_gpa, &d);
         st32(&mut d[..4], 4);
         let _ = host.write_gpa(root_gpa, &d[..4]);
+        // Map the backing GVA page onto the surface pages. The device refuses a
+        // backing it cannot translate rather than reusing the GVA as a GPA, so
+        // the task's page table has to carry this the way a guest's does.
+        st32(&mut d[..4], 0x40);
+        let _ = host.write_gpa(root_gpa + 0x40 * 4, &d[..4]);
         assert!(state.define_task(1, 0x1000, 2));
         assert!(state.set_object_list(1, 0, 8));
         // Type-4 at surface_id=5.
@@ -2888,17 +3515,16 @@ mod tests {
             pipeline_ref: 1,
             draw: (3, 1, 3, 0),
             indexed: None,
-            vertex_buffers: vec![BufferBind {
-                stage: Stage::Vertex,
+            vertex_buffers: Arc::new(vec![BufferBind {
                 index: 0,
                 buffer_ref: 1,
                 offset: 0,
-            }],
-            fragment_buffers: Vec::new(),
-            vertex_textures: Vec::new(),
-            fragment_textures: Vec::new(),
-            vertex_samplers: Vec::new(),
-            fragment_samplers: Vec::new(),
+            }]),
+            fragment_buffers: Arc::default(),
+            vertex_textures: Arc::default(),
+            fragment_textures: Arc::default(),
+            vertex_samplers: Arc::default(),
+            fragment_samplers: Arc::default(),
             viewport: None,
             scissor: None,
             blend_color: None,
@@ -2944,6 +3570,9 @@ mod tests {
         let _ = host.write_gpa(dir_gpa, &d);
         st32(&mut d[..4], 4);
         let _ = host.write_gpa(root_gpa, &d[..4]);
+        // As above: the backing GVA has to translate, not be assumed identity.
+        st32(&mut d[..4], 0x50);
+        let _ = host.write_gpa(root_gpa + 0x50 * 4, &d[..4]);
         assert!(state.define_task(1, 0x1000, 2));
         assert!(state.set_object_list(1, 0, 8));
         let mut entry = [0u8; 12];
@@ -2982,17 +3611,16 @@ mod tests {
             pipeline_ref: 7,
             draw: (3, 1, 3, 0),
             indexed: None,
-            vertex_buffers: vec![BufferBind {
-                stage: Stage::Vertex,
+            vertex_buffers: Arc::new(vec![BufferBind {
                 index: 0,
                 buffer_ref: 1,
                 offset: 0,
-            }],
-            fragment_buffers: Vec::new(),
-            vertex_textures: Vec::new(),
-            fragment_textures: Vec::new(),
-            vertex_samplers: Vec::new(),
-            fragment_samplers: Vec::new(),
+            }]),
+            fragment_buffers: Arc::default(),
+            vertex_textures: Arc::default(),
+            fragment_textures: Arc::default(),
+            vertex_samplers: Arc::default(),
+            fragment_samplers: Arc::default(),
             viewport: None,
             scissor: None,
             blend_color: None,
@@ -3046,26 +3674,28 @@ mod tests {
     /// host chain memory (archive DrawJob single completion writeback).
     #[test]
     fn multi_draw_store_plan_matches_archive_drawjob_writeback() {
-        // N independent single-draw packets: each stores, none force_full.
-        for n in 1..8 {
-            let (wb, full) = multi_draw_store_plan(1, 0);
-            assert!(wb, "single-draw packet always stores");
-            assert!(
-                !full,
-                "single-draw never force_full (scissor-local allowed)"
-            );
-            let _ = n;
-        }
-        // One multi-draw packet of 5: only di==4 stores, and force_full.
-        let n = 5usize;
-        for di in 0..n {
-            let (wb, full) = multi_draw_store_plan(n, di);
-            if di + 1 == n {
-                assert!(wb && full, "final multi-draw record: writeback+force_full");
-            } else {
-                assert!(!wb && !full, "intermediate multi-draw: host-chain only");
+        // Every packet size and every record within it. The whole contract is two
+        // predicates over (draw_count, di), so stating it over a range costs
+        // nothing and covers the boundary at draw_count == 1, where force_full
+        // flips — which one packet of five does not reach.
+        for n in 1..8usize {
+            for di in 0..n {
+                let (wb, full) = multi_draw_store_plan(n, di);
+                let last = di + 1 == n;
+                assert_eq!(wb, last, "writeback is the last record only (n={n} di={di})");
+                assert_eq!(
+                    full,
+                    last && n > 1,
+                    "force_full on the last record of a multi-draw packet only \
+                     (n={n} di={di}); a single-draw packet may keep a local scissor"
+                );
             }
         }
+        assert_eq!(
+            multi_draw_store_plan(0, 0),
+            (false, false),
+            "an empty packet writes nothing back"
+        );
     }
 
     #[test]
@@ -3089,15 +3719,9 @@ mod tests {
         let first = metal_draw::DrawEncodeRequest {
             task_id: 1,
             pipeline_ref: 7,
-            color_texture_ref: 11,
-            mapping_id: 3,
-            width: 1920,
-            height: 1080,
-            format: 0x50,
             vertex_count: 3,
             instance_count: 1,
             primitive_type: 3,
-            target_seed_rgba: Some(vec![0xaa; 16]),
             colors: vec![metal_draw::ColorRtRequest {
                 slot: 0,
                 texture_ref: 11,
@@ -3115,11 +3739,13 @@ mod tests {
             ..Default::default()
         };
         let template = render_pass_attachment_template(&first);
-        assert!(template.target_seed_rgba.is_none());
         assert!(template.colors[0].target_seed_rgba.is_none());
         assert_eq!(template.colors[0].load_action, PASS_LOAD_ACTION_LOAD);
         assert_eq!(template.colors[0].mapping_id, 3);
-        assert_eq!((template.width, template.height), (1920, 1080));
+        assert_eq!(
+            (template.colors[0].width, template.colors[0].height),
+            (1920, 1080)
+        );
 
         let draw = PendingDraw {
             pipeline_ref: 42,
@@ -3139,7 +3765,6 @@ mod tests {
         );
         assert_eq!(req.colors.len(), 1);
         assert_eq!(req.colors[0].mapping_id, 3);
-        assert_eq!(first.target_seed_rgba.as_ref().map(Vec::len), Some(16));
         assert_eq!(
             first.colors[0].target_seed_rgba.as_ref().map(Vec::len),
             Some(16)

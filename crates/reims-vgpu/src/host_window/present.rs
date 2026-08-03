@@ -48,9 +48,10 @@ use crate::runtime::host::HostAction;
 const ENGINE_WINDOW_REDRAW_POLL: std::time::Duration = std::time::Duration::from_millis(2);
 /// How long a guest-driven native resize request may stay unmatched by a
 /// winit `Resized` event before the always-on alarm names it. Live requests
-/// apply within single-digit milliseconds; one second means AppKit refused or
-/// clamped the size and the window is presenting letterboxed instead.
-#[cfg(target_os = "macos")]
+/// apply within single-digit milliseconds; one second means the window system
+/// refused or clamped the size and the window is presenting letterboxed
+/// instead. A tiling or fullscreen Wayland/X11 compositor refuses by policy, so
+/// on those hosts this alarm is the expected steady state rather than a fault.
 const GUEST_RESIZE_WARN_AFTER: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Window creation parameters.
@@ -143,11 +144,45 @@ fn needs_engine_present(
     redraw_required || presented != incoming
 }
 
+/// The absolute pointer event a window position becomes: `(x, y, width,
+/// height)` for [`HostAction::input_pointer_move`], whose consumer scales `x`
+/// against `width` (`min_in = 0`, `max_in = dim`).
+///
+/// Both presenters aspect-fit the guest frame into the drawable, so a window
+/// position is proportional to a guest position only *inside* the viewport — in
+/// a letterbox bar it is not over the guest surface at all. Reporting raw
+/// window coordinates therefore offsets and rescales every event by the bar
+/// size, which is the regression [`super::viewport`]'s module docs record as
+/// rolled back. It survived on non-macOS hosts because this mapping was
+/// `cfg`-gated to macOS while the presenter's `aspect_fit` never was, so the
+/// two halves of "presentation and pointer move as one unit" were compiled for
+/// different platforms.
+///
+/// Before the first guest frame there is no guest extent to map into, so the
+/// full-window space is forwarded unchanged.
+fn pointer_report(
+    position: (f64, f64),
+    window: (u32, u32),
+    guest: Option<(u32, u32)>,
+) -> (u32, u32, u32, u32) {
+    match guest {
+        Some(guest) => {
+            let (x, y) = super::viewport::pointer_to_guest(position, window, guest);
+            (x, y, guest.0, guest.1)
+        }
+        None => (
+            position.0.max(0.0) as u32,
+            position.1.max(0.0) as u32,
+            window.0,
+            window.1,
+        ),
+    }
+}
+
 /// Whether a newly observed guest frame geometry should request a native
 /// content resize: only on a geometry change, and only when the window does
 /// not already match. User-driven host resizing stays untouched until the
 /// guest picks another mode.
-#[cfg(target_os = "macos")]
 fn guest_resize_request(
     observed: Option<(u32, u32)>,
     incoming: (u32, u32),
@@ -156,13 +191,56 @@ fn guest_resize_request(
     observed != Some(incoming) && incoming != window
 }
 
-/// A guest-driven native resize not yet confirmed by a matching `Resized`
-/// event. While it is outstanding the window holds its previous drawable
-/// (guest boot presents are seconds apart, so a mismatched interim present
-/// would stay on screen that long); the hold is bounded by
-/// [`GUEST_RESIZE_WARN_AFTER`], after which the request is dropped with a
-/// fail-visible line and presentation resumes letterboxed.
-#[cfg(target_os = "macos")]
+/// How a `Resized` event answers an outstanding guest-driven request, or
+/// `None` when there is nothing outstanding to answer.
+///
+/// **Any `Resized` settles the hold, matching or not.** What the window is
+/// waiting for is the window system to answer, not to obey: `request_inner_size`
+/// is a request, and a compositor is free to adjust it for decorations, screen
+/// bounds or a fractional scale round-trip. An exact-match test reads every such
+/// answer as silence and holds until the alarm.
+///
+/// Measured on x86/Linux, one boot, driving the guest through its four modes —
+/// the applied size differs from the request on three of four, never by more
+/// than a pixel, and never in a fixed direction:
+///
+/// ```text
+/// requested 1920x1080 -> 1921x1079      requested 3840x2160 -> 3840x2160
+/// requested 1440x1080 -> 1440x1079      requested 1280x1024 -> 1281x1024
+/// ```
+///
+/// Under the old exact-match rule those three logged
+/// `native_resize_not_applied` — a fail-visible line saying the resize never
+/// happened, about a window that had resized — and each held *all* presentation
+/// for the full second the alarm takes, because [`App::draw_engine_window`]
+/// returns early while a request is outstanding. So a guest mode change froze
+/// the display for a second and then claimed it had been refused.
+///
+/// The alarm still has a job, and it is now the case it was written for: a
+/// window system that ignores the request entirely emits no `Resized` at all
+/// (tiling or fullscreen by policy), so nothing calls this and the hold times
+/// out.
+fn guest_resize_settled(
+    pending: Option<(u32, u32)>,
+    applied: (u32, u32),
+) -> Option<&'static str> {
+    let target = pending?;
+    Some(if target == applied {
+        "applied"
+    } else {
+        // The window system answered with a geometry of its own choosing. The
+        // presenter aspect-fits into it and the pointer maps through the same
+        // viewport, so this is a complete outcome and not a degraded one.
+        "adjusted"
+    })
+}
+
+/// A guest-driven native resize not yet confirmed by a `Resized` event. While
+/// it is outstanding the window holds its previous drawable (guest boot
+/// presents are seconds apart, so a mismatched interim present would stay on
+/// screen that long); the hold is bounded by [`GUEST_RESIZE_WARN_AFTER`], after
+/// which the request is dropped with a fail-visible line and presentation
+/// resumes letterboxed.
 struct PendingGuestResize {
     target: (u32, u32),
     requested_at: std::time::Instant,
@@ -467,27 +545,7 @@ pub fn run(
     stop: StopFlag,
 ) -> Result<(), WindowError> {
     let event_loop = build_event_loop()?;
-    let mut app = App {
-        config,
-        on_input,
-        frames,
-        stop,
-        closed_sent: false,
-        window: None,
-        vk: None,
-        cursor: (0, 0),
-        engine_attached: false,
-        first_engine_present_logged: false,
-        first_engine_guest_logged: false,
-        engine_error_logged: false,
-        next_engine_redraw: std::time::Instant::now(),
-        last_engine_seq: None,
-        engine_redraw_required: true,
-        #[cfg(target_os = "macos")]
-        guest_extent: None,
-        #[cfg(target_os = "macos")]
-        pending_guest_resize: None,
-    };
+    let mut app = App::new(config, on_input, frames, stop);
     event_loop
         .run_app(&mut app)
         .map_err(|e| WindowError::RunApp(e.to_string()))
@@ -532,25 +590,7 @@ pub fn start_main_thread(
             };
         }
         let event_loop = build_event_loop()?;
-        let app = App {
-            config,
-            on_input,
-            frames,
-            stop,
-            closed_sent: false,
-            window: None,
-            vk: None,
-            cursor: (0, 0),
-            engine_attached: false,
-            first_engine_present_logged: false,
-            first_engine_guest_logged: false,
-            engine_error_logged: false,
-            next_engine_redraw: std::time::Instant::now(),
-            last_engine_seq: None,
-            engine_redraw_required: true,
-            guest_extent: None,
-            pending_guest_resize: None,
-        };
+        let app = App::new(config, on_input, frames, stop);
         *slot = Some(MainThreadWindow {
             id,
             event_loop,
@@ -647,12 +687,89 @@ struct App {
     /// Last guest DisplaySwap geometry the window observed. Drives the
     /// once-per-mode-change native resize request and the pointer-to-guest
     /// viewport transform ([`super::viewport`]).
-    #[cfg(target_os = "macos")]
     guest_extent: Option<(u32, u32)>,
     /// Outstanding guest-driven native resize, kept only for the fail-visible
     /// `native_resize_not_applied` alarm — never a presentation gate.
-    #[cfg(target_os = "macos")]
     pending_guest_resize: Option<PendingGuestResize>,
+    /// What this event loop actually did, per second. See [`LoopCensus`].
+    loop_census: LoopCensus,
+}
+
+/// How often the window's event loop looked for a guest frame, and what it
+/// found when it did.
+///
+/// `host_window_cadence` counts presents, and a present only happens when the
+/// loop both ran and found a new `Frame::seq`. Those are two different failures
+/// with the same symptom: a loop that ticks 500 times a second and finds
+/// nothing new is a still screen, while a loop that ticks 17 times against 34
+/// published frames is dropping half of them before any Vulkan call is reached.
+/// Nothing separated them — `window_publish fresh` is counted on the drain
+/// worker and `presents` inside the presenter, with the loop between them
+/// unmeasured.
+///
+/// The counters are plain fields rather than atomics because every one of them
+/// is touched only by the thread that owns the loop.
+#[derive(Debug)]
+struct LoopCensus {
+    window_started: std::time::Instant,
+    /// `about_to_wait` entries: how often the loop woke at all.
+    ticks: u64,
+    /// Ticks that asked the platform for a redraw, which is capped by
+    /// [`ENGINE_WINDOW_REDRAW_POLL`] rather than by the tick rate.
+    redraws_asked: u64,
+    /// `RedrawRequested` deliveries. A gap between this and `redraws_asked` is
+    /// the platform coalescing or delaying them, which the loop cannot see any
+    /// other way.
+    draws: u64,
+    /// Draws that found `Frame::seq` unchanged and presented nothing. Expected
+    /// to dominate on a still screen.
+    draws_stale: u64,
+    /// Draws held because a guest mode change is being applied to the native
+    /// window.
+    draws_held: u64,
+    /// Draws that reached the presenter with a new frame.
+    draws_fresh: u64,
+}
+
+impl LoopCensus {
+    fn new() -> Self {
+        Self {
+            window_started: std::time::Instant::now(),
+            ticks: 0,
+            redraws_asked: 0,
+            draws: 0,
+            draws_stale: 0,
+            draws_held: 0,
+            draws_fresh: 0,
+        }
+    }
+
+    /// Emit and reset once a second, counting this tick first.
+    ///
+    /// Called from `about_to_wait`, which runs on every loop wake — so the
+    /// window closes on the first tick after a second has passed rather than on
+    /// a timer of its own, and a loop that has stopped waking emits nothing at
+    /// all. That silence is the reading: a missing `host_window_loop` line
+    /// means the event loop is not running.
+    fn tick(&mut self) {
+        self.ticks += 1;
+        let elapsed = self.window_started.elapsed();
+        if elapsed < std::time::Duration::from_secs(1) {
+            return;
+        }
+        crate::observe::off(format!(
+            "host_window_loop win_ms={} ticks={} redraws_asked={} draws={} \
+             draws_fresh={} draws_stale={} draws_held={}",
+            elapsed.as_millis(),
+            self.ticks,
+            self.redraws_asked,
+            self.draws,
+            self.draws_fresh,
+            self.draws_stale,
+            self.draws_held,
+        ));
+        *self = Self::new();
+    }
 }
 
 impl ApplicationHandler for App {
@@ -771,7 +888,6 @@ impl ApplicationHandler for App {
                 let applied = (size.width.max(1), size.height.max(1));
                 if self.engine_attached {
                     crate::backend::vulkan::engine::window_present_resize(applied.0, applied.1);
-                    #[cfg(target_os = "macos")]
                     self.note_guest_resize_applied(applied);
                 } else {
                     #[cfg(not(target_os = "macos"))]
@@ -809,6 +925,7 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::RedrawRequested => {
+                self.loop_census.draws += 1;
                 self.draw();
             }
             _ => {}
@@ -835,6 +952,7 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.loop_census.tick();
         // The device sets `stop` on VM teardown. The loop wakes at least once
         // per [`ENGINE_WINDOW_REDRAW_POLL`], so the request is picked up within
         // one poll — then the loop exits and `VkState::drop` tears the window's
@@ -850,18 +968,6 @@ impl ApplicationHandler for App {
         // while the guest was producing 4.5-8 frames/s. FIFO does not throttle
         // it, and every one of those presents produced the picture already on
         // screen.
-        #[cfg(not(target_os = "macos"))]
-        if let Some(window) = self.window.as_ref() {
-            let now = std::time::Instant::now();
-            if now >= self.next_engine_redraw {
-                window.request_redraw();
-                self.next_engine_redraw = now + ENGINE_WINDOW_REDRAW_POLL;
-            }
-            event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
-                self.next_engine_redraw,
-            ));
-        }
-        #[cfg(target_os = "macos")]
         if let Some(window) = self.window.as_ref() {
             if let Some(pending) = self.pending_guest_resize.as_ref() {
                 if pending.requested_at.elapsed() >= GUEST_RESIZE_WARN_AFTER {
@@ -880,6 +986,7 @@ impl ApplicationHandler for App {
             let now = std::time::Instant::now();
             if now >= self.next_engine_redraw {
                 window.request_redraw();
+                self.loop_census.redraws_asked += 1;
                 self.next_engine_redraw = now + ENGINE_WINDOW_REDRAW_POLL;
             }
             event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
@@ -890,6 +997,35 @@ impl ApplicationHandler for App {
 }
 
 impl App {
+    /// A window that has not opened yet.
+    ///
+    /// Both entry points build one — [`run`] on the calling thread and
+    /// `start_main_thread` on macOS's main thread — and every field but the
+    /// four they are given is fixed. Written out at each site, a field added
+    /// to the struct could be initialised in one and missed in the other.
+    fn new(config: WindowConfig, on_input: InputSink, frames: FrameSlot, stop: StopFlag) -> Self {
+        Self {
+            config,
+            on_input,
+            frames,
+            stop,
+            closed_sent: false,
+            window: None,
+            vk: None,
+            cursor: (0, 0),
+            engine_attached: false,
+            first_engine_present_logged: false,
+            first_engine_guest_logged: false,
+            engine_error_logged: false,
+            next_engine_redraw: std::time::Instant::now(),
+            last_engine_seq: None,
+            engine_redraw_required: true,
+            guest_extent: None,
+            pending_guest_resize: None,
+            loop_census: LoopCensus::new(),
+        }
+    }
+
     fn request_shutdown(&mut self) {
         if !self.closed_sent {
             (self.on_input)(HostAction::window_closed());
@@ -912,34 +1048,51 @@ impl App {
             .unwrap_or((self.config.width, self.config.height))
     }
 
-    /// Emit an absolute pointer move. On macOS with a known guest geometry the
+    /// Emit an absolute pointer move. Once a guest geometry is known the
     /// position maps through the presenter's aspect-fit viewport into guest
     /// pixels, so display placement and pointer translation move as one unit;
-    /// otherwise the full-window coordinate space is forwarded unchanged.
+    /// before the first frame the full-window space is forwarded unchanged.
+    /// See [`pointer_report`], which holds the decision and its tests.
     fn pointer_move(&mut self, position: (f64, f64)) {
-        let (w, h) = self.surface_dims();
-        #[cfg(target_os = "macos")]
-        if let Some(guest) = self.guest_extent {
-            let mapped = super::viewport::pointer_to_guest(position, (w, h), guest);
-            self.cursor = mapped;
-            (self.on_input)(HostAction::input_pointer_move(
-                mapped.0, mapped.1, guest.0, guest.1,
-            ));
-            return;
-        }
-        self.cursor = (position.0.max(0.0) as u32, position.1.max(0.0) as u32);
-        (self.on_input)(HostAction::input_pointer_move(
-            self.cursor.0,
-            self.cursor.1,
-            w,
-            h,
-        ));
+        let (x, y, width, height) =
+            pointer_report(position, self.surface_dims(), self.guest_extent);
+        self.cursor = (x, y);
+        (self.on_input)(HostAction::input_pointer_move(x, y, width, height));
     }
 
     fn draw(&mut self) {
         if self.engine_attached {
             self.draw_engine_window();
             return;
+        }
+        // Everything past this point is the `VkState` presenter: its own
+        // swapchain, its own blit, its own resize handling — several hundred
+        // lines that only run when `attach_engine_present` failed in
+        // `resumed()`, which is the host-without-a-working-engine case.
+        //
+        // **Measured zero.** A driven x86/Vulkan boot (Chess, Maps, the WebGL
+        // aquarium, Wikipedia, apple.com) never reached this line, while
+        // `host_window_direct_present path=engine_resident status=live` fired
+        // and the `host_window_engine_attach` decline fired zero times across
+        // two boots — the engine attaches, so this rail never draws.
+        //
+        // That is *not* a licence to delete it. It is the fallback for an
+        // attach failure, and an attach failure on a host this one has not
+        // seen would then have no presenter at all. What the reading licenses
+        // is the opposite question: if `host_window_engine_attach` can be shown
+        // never to decline on any supported host, this rail has no reason to
+        // exist. That needs a host where the engine legitimately fails.
+        //
+        // Latched — a per-redraw line would flood.
+        {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static SAID: AtomicBool = AtomicBool::new(false);
+            if !SAID.swap(true, Ordering::Relaxed) {
+                crate::observe::off(format!(
+                    "host_window_vk_presenter reason=engine_not_attached vk={}",
+                    self.vk.is_some() as u8
+                ));
+            }
         }
         #[cfg(not(target_os = "macos"))]
         let Some(vk) = self.vk.as_mut() else {
@@ -954,8 +1107,14 @@ impl App {
                 self.engine_redraw_required,
                 incoming_seq,
             ) {
+                self.loop_census.draws_stale += 1;
                 return;
             }
+            // Counted on both rails so `draws_fresh + draws_stale + draws_held`
+            // sums to `draws` whichever presenter is driving. A boot where they
+            // do not sum is one where a fourth disposition was added without a
+            // counter.
+            self.loop_census.draws_fresh += 1;
             match unsafe { vk.present(frame.as_deref()) } {
                 Ok(()) => {
                     self.last_engine_seq = incoming_seq;
@@ -976,9 +1135,7 @@ impl App {
 
     fn draw_engine_window(&mut self) {
         let frame = self.frames.lock().ok().and_then(|guard| guard.clone());
-        #[cfg(target_os = "macos")]
         self.request_guest_geometry(frame.as_deref());
-        #[cfg(target_os = "macos")]
         if self.pending_guest_resize.is_some() {
             // A guest mode change is being applied to the native window
             // (normally single-digit milliseconds; bounded by the 1 s alarm).
@@ -986,6 +1143,7 @@ impl App {
             // new-geometry frame into the outgoing swapchain — at boot the
             // next guest present can be seconds away, which would pin that
             // interim frame on screen.
+            self.loop_census.draws_held += 1;
             return;
         }
         let incoming_seq = frame.as_ref().map(|frame| frame.seq);
@@ -994,8 +1152,10 @@ impl App {
             self.engine_redraw_required,
             incoming_seq,
         ) {
+            self.loop_census.draws_stale += 1;
             return;
         }
+        self.loop_census.draws_fresh += 1;
         let result = crate::backend::vulkan::engine::window_present_frame(
             frame.as_ref().and_then(|frame| frame.resident.as_ref()),
             frame.as_deref().map(window_cpu_frame),
@@ -1055,7 +1215,13 @@ impl App {
     /// compositor resident — never a content heuristic. Presentation does not
     /// wait: until the resize applies, frames letterbox into the current
     /// drawable and pointer input maps through the same viewport.
-    #[cfg(target_os = "macos")]
+    ///
+    /// Called only from [`Self::draw_engine_window`], which is the presenter
+    /// that aspect-fits. The window's own `VkState` fallback stretches to fill
+    /// instead, and leaves `guest_extent` `None` so [`pointer_report`] forwards
+    /// full-window coordinates — the mapping that rail's blit actually implies.
+    /// Calling this from that rail would pair a viewport-mapped pointer with a
+    /// stretched picture, which is the same split this fixes, mirrored.
     fn request_guest_geometry(&mut self, frame: Option<&Frame>) {
         let Some(frame) = frame else { return };
         let incoming = (frame.width.max(1), frame.height.max(1));
@@ -1091,21 +1257,21 @@ impl App {
         }
     }
 
-    /// Clear the outstanding guest resize once the window system confirms the
-    /// exact target geometry (via `Resized` or a synchronous apply).
-    #[cfg(target_os = "macos")]
+    /// Clear the outstanding guest resize once the window system has answered
+    /// it (via `Resized` or a synchronous apply). See [`guest_resize_settled`]
+    /// for why any answer settles it, including one that adjusted the size.
     fn note_guest_resize_applied(&mut self, applied: (u32, u32)) {
-        if self
-            .pending_guest_resize
-            .as_ref()
-            .is_some_and(|pending| pending.target == applied)
-        {
-            crate::observe::off(format!(
-                "host_window_guest_resize status=applied width={} height={}",
-                applied.0, applied.1
-            ));
-            self.pending_guest_resize = None;
-        }
+        let target = self.pending_guest_resize.as_ref().map(|p| p.target);
+        let Some(status) = guest_resize_settled(target, applied) else {
+            return;
+        };
+        let requested = target.unwrap_or(applied);
+        crate::observe::off(format!(
+            "host_window_guest_resize status={status} width={} height={} \
+             requested={}x{}",
+            applied.0, applied.1, requested.0, requested.1
+        ));
+        self.pending_guest_resize = None;
     }
 }
 
@@ -1981,6 +2147,57 @@ impl Drop for VkState {
 }
 
 #[cfg(test)]
+mod loop_census_tests {
+    use super::*;
+
+    /// A loop that has run for less than its window emits nothing and keeps
+    /// counting. Emitting on every tick would be one line per 2 ms poll.
+    #[test]
+    fn a_partial_window_accumulates_rather_than_emitting() {
+        let mut census = LoopCensus::new();
+        census.tick();
+        census.tick();
+        assert_eq!(census.ticks, 2);
+        assert!(census.window_started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    /// The window closes on the first tick past a second, and resets so the
+    /// next line is a rate rather than a running total.
+    #[test]
+    fn a_closed_window_resets_every_counter() {
+        let mut census = LoopCensus::new();
+        census.draws = 9;
+        census.draws_fresh = 4;
+        census.draws_stale = 5;
+        census.redraws_asked = 7;
+        census.window_started = std::time::Instant::now() - std::time::Duration::from_millis(1100);
+        census.tick();
+        assert_eq!(census.ticks, 0);
+        assert_eq!(census.draws, 0);
+        assert_eq!(census.draws_fresh, 0);
+        assert_eq!(census.draws_stale, 0);
+        assert_eq!(census.redraws_asked, 0);
+        assert!(census.window_started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    /// The three dispositions divide `draws` exactly. A draw that reached the
+    /// loop and moved none of them is a fourth outcome nobody named, which is
+    /// the shape of a frame this device drops with no line saying so.
+    #[test]
+    fn the_dispositions_sum_to_the_draws() {
+        let mut census = LoopCensus::new();
+        census.draws = 12;
+        census.draws_fresh = 5;
+        census.draws_stale = 6;
+        census.draws_held = 1;
+        assert_eq!(
+            census.draws,
+            census.draws_fresh + census.draws_stale + census.draws_held
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -2165,7 +2382,6 @@ mod tests {
         assert!(needs_staging_upload(Some(7), 8));
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn engine_present_gate_submits_new_frames_and_forced_redraws_only() {
         assert!(needs_engine_present(None, true, None));
@@ -2174,7 +2390,6 @@ mod tests {
         assert!(needs_engine_present(Some(7), true, Some(7)));
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn guest_geometry_change_requests_one_matching_native_resize() {
         // First frame at the window's own size: no request.
@@ -2197,6 +2412,91 @@ mod tests {
             (1440, 1080),
             (1440, 1080)
         ));
+    }
+
+    /// The presenter's `aspect_fit` is not platform-gated, so the pointer
+    /// mapping must not be either. Before the fix this branch was
+    /// `#[cfg(target_os = "macos")]` while the letterbox that makes it
+    /// necessary was compiled everywhere, so on x86/Linux every click landed
+    /// offset by the bar and scaled by the wrong ratio.
+    #[test]
+    fn a_letterboxed_pointer_maps_through_the_viewport_not_the_window() {
+        // 4:3 guest in a 16:9 window: 240 px pillarbox bars either side.
+        let guest = (1440, 1080);
+        let window = (1920, 1080);
+
+        // The viewport's left edge is guest x=0 — not window x=0.
+        assert_eq!(pointer_report((240.0, 0.0), window, Some(guest)), (0, 0, 1440, 1080));
+        // Window centre is guest centre.
+        assert_eq!(
+            pointer_report((960.0, 540.0), window, Some(guest)),
+            (720, 540, 1440, 1080)
+        );
+
+        // The regression this guards: reporting raw window coordinates against
+        // the window extent. At the viewport's left edge that said "x=240 of
+        // 1920" where the truth is "x=0 of 1440" — a 240 px error, and the
+        // reported extent was the window's, so the consumer rescaled it too.
+        let raw = (240u32, 0u32, window.0, window.1);
+        assert_ne!(pointer_report((240.0, 0.0), window, Some(guest)), raw);
+    }
+
+    /// No guest frame yet ⇒ no viewport to map through, and the window's own
+    /// `VkState` fallback stretches rather than letterboxing. Both are the
+    /// full-window identity, which is what keeps that rail's pointer and its
+    /// blit in agreement.
+    #[test]
+    fn without_a_guest_extent_the_full_window_space_is_forwarded() {
+        assert_eq!(
+            pointer_report((100.0, 200.0), (1920, 1080), None),
+            (100, 200, 1920, 1080)
+        );
+        // Negative positions (pointer dragged off the window) clamp to origin.
+        assert_eq!(
+            pointer_report((-5.0, -1.0), (1920, 1080), None),
+            (0, 0, 1920, 1080)
+        );
+    }
+
+    /// A guest and window of the same aspect have no bars, so the mapping is a
+    /// pure scale — the 4K-into-1080p-window case the x86 rig actually runs.
+    #[test]
+    fn a_matching_aspect_scales_without_offsetting() {
+        assert_eq!(
+            pointer_report((960.0, 540.0), (1920, 1080), Some((3840, 2160))),
+            (1920, 1080, 3840, 2160)
+        );
+    }
+
+    /// The measured x86/Linux answers. Three of the guest's four modes come
+    /// back adjusted by a pixel; under the old exact-match rule each of those
+    /// held all presentation for a second and then logged
+    /// `native_resize_not_applied` about a window that had in fact resized.
+    #[test]
+    fn a_window_system_that_adjusts_the_size_still_settles_the_hold() {
+        for (requested, applied) in [
+            ((1920, 1080), (1921, 1079)),
+            ((1440, 1080), (1440, 1079)),
+            ((1280, 1024), (1281, 1024)),
+        ] {
+            assert_eq!(
+                guest_resize_settled(Some(requested), applied),
+                Some("adjusted"),
+                "{requested:?} -> {applied:?} must settle the hold"
+            );
+        }
+        // The one that landed exactly is still reported as such.
+        assert_eq!(
+            guest_resize_settled(Some((3840, 2160)), (3840, 2160)),
+            Some("applied")
+        );
+    }
+
+    /// A `Resized` with nothing outstanding is a user drag, not an answer, and
+    /// must not synthesise a resize line.
+    #[test]
+    fn a_resize_with_nothing_pending_is_not_an_answer() {
+        assert_eq!(guest_resize_settled(None, (1920, 1080)), None);
     }
 
     #[test]

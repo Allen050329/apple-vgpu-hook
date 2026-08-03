@@ -23,13 +23,16 @@ use crate::contract::endian::{st16, st32}; // ICB layout fixture encoder only
 /// constructed anywhere in the crate** — they existed only as arms of a
 /// `decode_status_name` helper that itself had no callers — so they are gone
 /// and this is a [`crate::observe::Decline`], not a `Refusal`.
+///
+/// `ErrBadLength` went the same way. Every length disagreement this decoder can
+/// see is a read that ran off the end, and all three sites of the compact-TLV
+/// walk already say so with their own slug (`res_tlv_offset_past_end`,
+/// `res_tlv_header_short`, `res_tlv_value_short`). A second class for the same
+/// condition would only split one check's census across two names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DecodeStatus {
     /// The blob is shorter than the field being read.
     ErrShort(&'static str),
-    /// A declared length disagrees with the buffer, or a TLV walk does not land
-    /// exactly on the end.
-    ErrBadLength(&'static str),
     /// An object-list type tag this host has no contract for.
     ErrUnknownType(&'static str),
     /// A well-formed blob whose tag/opcode names a variant the decoder does not
@@ -40,10 +43,7 @@ pub enum DecodeStatus {
 impl crate::observe::Decline for DecodeStatus {
     fn slug(&self) -> &'static str {
         match self {
-            Self::ErrShort(s)
-            | Self::ErrBadLength(s)
-            | Self::ErrUnknownType(s)
-            | Self::ErrUnsupported(s) => s,
+            Self::ErrShort(s) | Self::ErrUnknownType(s) | Self::ErrUnsupported(s) => s,
         }
     }
 
@@ -52,7 +52,6 @@ impl crate::observe::Decline for DecodeStatus {
             "class",
             match self {
                 Self::ErrShort(_) => "short",
-                Self::ErrBadLength(_) => "bad_length",
                 Self::ErrUnknownType(_) => "unknown_type",
                 Self::ErrUnsupported(_) => "unsupported",
             }
@@ -62,20 +61,10 @@ impl crate::observe::Decline for DecodeStatus {
 }
 
 /// Live object-list type tags (`reims_vgpu_resource_decode.h` / arm contract).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-pub enum ObjectType {
-    Buffer = 1,
-    Texture = 2,
-    /// Same geometry prefix as type-2 (WindowServer composite/glyph sources).
-    TextureVariant = 3,
-    Function = 6,
-    /// Type-7 container: sampler / depth-stencil / render|compute pipeline.
-    Type7 = 7,
-    TextureView = 8,
-    IOSurfaceTexture = 11,
-}
-
+///
+/// Type 3 carries the same geometry prefix as type 2 (WindowServer composite
+/// and glyph sources); type 7 is the container for sampler, depth-stencil and
+/// render/compute pipeline descriptors.
 pub const OBJECT_TYPE_BUFFER: u8 = 1;
 pub const OBJECT_TYPE_TEXTURE: u8 = 2;
 pub const OBJECT_TYPE_TEXTURE_VARIANT: u8 = 3;
@@ -92,7 +81,8 @@ pub const TYPE7_OBJECT_RENDER_PIPELINE: u32 = 0x0e;
 /// Indirect command buffer create body from
 /// `PGSerializer newIndirectCommandBufferWithDescriptor:layout:maxCommandCount:options:allocator:`.
 pub const TYPE7_OBJECT_ICB: u32 = 0x36;
-pub const TYPE7_HEADER_LEN: usize = 16;
+/// End of the 16-byte type-7 header, which is also where its first TLV
+/// starts — one boundary, so one name.
 pub const TYPE7_FIRST_TLVS: usize = 16;
 /// Serialized ICB descriptor length (allocateOperationBytes 0x58).
 pub const ICB_DESC_LEN: usize = 0x58;
@@ -150,7 +140,16 @@ pub const ICB_CMD_TYPE_DRAW_MESH_THREADS: u32 = 0x100;
 pub const ICB_BUFFER_BIND_STRIDE: usize = 0x14;
 /// Tessellation-factor table used size (u32 ref + 3×u64) at `tessellationFactorOffset`.
 pub const ICB_TESSELLATION_FACTOR_LEN: usize = 0x1c;
-/// DrawPatches args size (baseInstance ends at +0x2e).
+/// Concurrent-dispatch args size: two `MTLSize`, grid then threadgroup, at
+/// 3xu64 each — 2 * 3 * 8 = 0x30. Matches the `ConcurrentDispatch` bit's
+/// allocation in host RE `setupCommandLayout:`.
+pub const ICB_CONCURRENT_DISPATCH_ARGS_LEN: usize = 0x30;
+/// DrawPatches args size: `setupCommandLayout` allocates 0x38, and the fill IMP
+/// writes through `baseInstance` — a u64 *starting* at 0x2e, so ending at 0x36.
+/// The two bytes between are the allocation's slack, exactly as
+/// [`ICB_DRAW_INDEXED_PATCHES_ARGS_LEN`] documents for its own 0x4a/0x4c pair.
+/// (This doc used to read "baseInstance ends at +0x2e", which reads as though
+/// 0x38 were the fill extent and makes the constant look two bytes wrong.)
 pub const ICB_DRAW_PATCHES_ARGS_LEN: u32 = 0x38;
 /// DrawIndexedPatches args size (baseInstance u64 @0x42 → end 0x4a).
 /// Note: `setupCommandLayout` allocates max `0x4c` for this bit; fill IMP uses through `0x4a`.
@@ -171,37 +170,6 @@ pub const MTL_INDIRECT_CMD_CONCURRENT_DISPATCH_THREADS: u32 = 1 << 6;
 /// Mesh create bits (SDK). Wire args size from setupCommandLayout; fill IMPs stubbed.
 pub const MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS: u32 = 1 << 7;
 pub const MTL_INDIRECT_CMD_DRAW_MESH_THREADS: u32 = 1 << 8;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DescriptorKind {
-    Unknown = 0,
-    Buffer,
-    Texture,
-    Sampler,
-    Function,
-    RenderPipeline,
-    ComputePipeline,
-    DepthStencil,
-    TextureView,
-    IOSurfaceTexture,
-    IndirectCommandBuffer,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ProducerCoverage {
-    Unknown = 0,
-    Emitted,
-    Rejected,
-    HostOnly,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ObjectEntry {
-    pub object_type: u8,
-    pub flags: u8,
-    pub ref_: u32,
-    pub length: u32,
-}
 
 /// Compact type-7 TLV field: `[tag:u8][length:u8][value…]` after a field-count byte.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -440,11 +408,6 @@ impl ColorWriteMask {
     pub fn bits(self) -> u32 {
         self.bits
     }
-
-    /// Whether every channel is written, i.e. whether the mask is inert.
-    pub fn is_all(self) -> bool {
-        self.bits == MTL_COLOR_WRITE_MASK_ALL
-    }
 }
 
 /// One pipeline color-attachment entry (format + blend) from the type-7 color section.
@@ -465,9 +428,6 @@ pub struct PipelineColorAttachment {
     /// alone, so this cannot ride inside the blend state.
     pub write_mask: ColorWriteMask,
 }
-
-/// Color-attachment[0] blend + format (compat alias for first entry).
-pub type PipelineColorAttachment0 = PipelineColorAttachment;
 
 /// Decoded type-7 render pipeline (functions + optional stage-in attrs).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -883,6 +843,14 @@ pub struct IndirectCommandBufferDescriptor {
     pub layout: IcbCommandLayout,
 }
 
+/// One decoded object-list descriptor.
+///
+/// There is deliberately no `Unknown`: an object type this host has no contract
+/// for is [`DecodeStatus::ErrUnknownType`], and a type-7 subtype it does not
+/// implement is [`DecodeStatus::ErrUnsupported`]. Both name the check that
+/// refused. An `Unknown` variant would let the same condition arrive as a
+/// successful decode carrying nothing, which every consumer would then have to
+/// re-refuse without knowing why.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Descriptor {
     Buffer(BufferDescriptor),
@@ -901,7 +869,6 @@ pub enum Descriptor {
         height: u32,
     },
     IndirectCommandBuffer(IndirectCommandBufferDescriptor),
-    Unknown,
 }
 
 /// Live Reims VGPU object-list entry size (kb + reims-vgpu-resource-format).
@@ -938,19 +905,6 @@ pub fn list_object_entry_offset(ref_: u32, entry_count: u32) -> Option<u64> {
         return None;
     }
     (ref_ as u64).checked_mul(OBJECT_LIST_ENTRY_LEN as u64)
-}
-
-/// Legacy planner ObjectEntry (type/flags/ref/length) — not the wire list format.
-pub fn decode_object_entry(bytes: &[u8]) -> Result<ObjectEntry, DecodeStatus> {
-    if bytes.len() < 16 {
-        return Err(DecodeStatus::ErrShort("res_object_entry_short"));
-    }
-    Ok(ObjectEntry {
-        object_type: bytes[0],
-        flags: bytes[1],
-        ref_: ld32(&bytes[4..]),
-        length: ld32(&bytes[8..]),
-    })
 }
 
 pub fn decode_buffer_descriptor(bytes: &[u8]) -> Result<BufferDescriptor, DecodeStatus> {
@@ -1456,7 +1410,7 @@ pub fn decode_render_pipeline_descriptor(
     }
     let first_tlv_end = TYPE7_FIRST_TLVS + consumed;
     if out.has_color_attachment_offset {
-        let color_abs = TYPE7_HEADER_LEN + out.color_attachment_offset as usize;
+        let color_abs = TYPE7_FIRST_TLVS + out.color_attachment_offset as usize;
         if color_abs <= declared && first_tlv_end < color_abs {
             out.vertex_attributes = parse_vertex_block(bytes, first_tlv_end, color_abs)?;
         }
@@ -1695,18 +1649,93 @@ fn parse_one_color_entry(
     out
 }
 
+/// A color-attachment section that named more entries than it delivered.
+///
+/// The section is `[count:u32][entry_offset:u32 × count]`, each offset relative
+/// to the section start. `count` above [`MAX_COLOR_ATTACHMENTS`], an offset word
+/// running past the descriptor, or an entry offset resolving outside it, all
+/// mean the same thing: the pixel format and blend state the guest serialized
+/// for a slot never reaches the pipeline, and that slot silently takes
+/// `parse_one_color_entry`'s defaults — opaque `ONE`/`ZERO`, blending off.
+///
+/// Named because the alternative is indistinguishable downstream from a guest
+/// that declared fewer attachments, which is the shape a wrong blend or a
+/// missing render target would arrive in.
+struct ColorAttachTableTruncated {
+    /// `None` when the section header itself did not fit, so the count was never
+    /// readable and an unknown number of attachments were lost.
+    declared: Option<usize>,
+    decoded: usize,
+}
+
+impl crate::observe::Decline for ColorAttachTableTruncated {
+    fn slug(&self) -> &'static str {
+        "color_attachment_table_truncated"
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        vec![
+            (
+                "declared",
+                self.declared
+                    .map_or_else(|| "unreadable".to_string(), |d| d.to_string()),
+            ),
+            ("decoded", self.decoded.to_string()),
+        ]
+    }
+}
+
+/// Report a color-attachment table that lost entries. Deduped per distinct
+/// (declared, decoded) pair — a malformed descriptor replayed every frame would
+/// otherwise flood the log with one line per draw.
+fn note_color_table_truncated(
+    declared: Option<usize>,
+    decoded: usize,
+    section_off: usize,
+    len: usize,
+) {
+    let disc = ((declared.unwrap_or(usize::MAX) as u64) << 32) | decoded as u64;
+    if !crate::observe::first_sight("color_attachment_table_truncated", disc) {
+        return;
+    }
+    crate::observe::Emit::decline(
+        "type7_color_attach",
+        &ColorAttachTableTruncated { declared, decoded },
+    )
+    .field("section_off", section_off)
+    .field("desc_len", len)
+    .fail();
+}
+
+/// `MTLRenderPipelineDescriptor.colorAttachments` is an eight-slot array, so a
+/// section naming more than eight is malformed rather than something we chose
+/// not to read. Same bound as `render::PASS_MAX_COLOR_ATTACHMENTS`, stated here
+/// because this is the pipeline-descriptor side of the same Metal limit.
+const MAX_COLOR_ATTACHMENTS: usize = 8;
+
 /// Parse all color-attachment entries (slot = entry index in the section).
+///
+/// `section_off == 0` is the descriptor saying it has no color section at all —
+/// expected control flow, and quiet. Every other early exit is a loss and says
+/// so through [`ColorAttachTableTruncated`].
 pub fn parse_color_attachments(
     bytes: &[u8],
     len: usize,
     section_off: usize,
 ) -> Vec<PipelineColorAttachment> {
     let mut out = Vec::new();
-    if section_off == 0 || section_off + 8 > len {
+    if section_off == 0 {
         return out;
     }
-    let count = ld32(&bytes[section_off..]) as usize;
-    for i in 0..count.min(8) {
+    // The header is the count plus the first entry's offset word. A section the
+    // descriptor cannot contain loses an unreadable number of attachments, which
+    // the count mismatch below cannot see, so it is reported here.
+    if section_off + 8 > len {
+        note_color_table_truncated(None, 0, section_off, len);
+        return out;
+    }
+    let declared = ld32(&bytes[section_off..]) as usize;
+    for i in 0..declared.min(MAX_COLOR_ATTACHMENTS) {
         let offloc = section_off + 4 + i * 4;
         if offloc + 4 > len {
             break;
@@ -1717,6 +1746,9 @@ pub fn parse_color_attachments(
             _ => break,
         };
         out.push(parse_one_color_entry(bytes, len, entry, i as u32));
+    }
+    if out.len() != declared {
+        note_color_table_truncated(Some(declared), out.len(), section_off, len);
     }
     out
 }
@@ -2628,13 +2660,7 @@ mod tests {
     }
 
     #[test]
-    fn object_entry_and_buffer() {
-        let mut e = [0u8; 16];
-        e[0] = 1;
-        st32(&mut e[4..], 3);
-        st32(&mut e[8..], 0x30);
-        let ent = decode_object_entry(&e).unwrap();
-        assert_eq!(ent.object_type, 1);
+    fn list_entry_and_buffer() {
         // Live list offset: ref * 12
         assert_eq!(list_object_entry_offset(3, 10), Some(36));
 
@@ -2866,6 +2892,51 @@ mod tests {
         assert_eq!(all.len(), 1);
     }
 
+    /// A section that declares three attachments and delivers one is a pipeline
+    /// whose other two slots take opaque `ONE`/`ZERO` defaults, which downstream
+    /// cannot tell from a guest that declared one. The loss has to say so.
+    ///
+    /// The entry offset for slot 1 points past the descriptor, so the walk stops
+    /// after slot 0 — the same `break` the truncated-offset-word and
+    /// out-of-range-entry cases take.
+    #[test]
+    fn a_colour_attachment_table_that_loses_entries_says_how_many() {
+        use crate::contract::endian::st32;
+        use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+        let off = 16usize;
+        // Header (count + 3 offset words) then one entry: one tag, 6 bytes.
+        let mut buf = vec![0u8; off + 4 + 3 * 4 + 1 + 6];
+        st32(&mut buf[off..], 3);
+        st32(&mut buf[off + 4..], 16); // slot 0: entry at off+16, in range
+        st32(&mut buf[off + 8..], 0xffff); // slot 1: resolves past the descriptor
+        st32(&mut buf[off + 12..], 0xffff); // slot 2: never reached
+        let entry = off + 16;
+        buf[entry] = 1;
+        buf[entry + 1] = COLOR_ATTACHMENT_TAG_PIXEL_FORMAT;
+        buf[entry + 2] = 4;
+        st32(&mut buf[entry + 3..], MTL_FORMAT_BGRA8_UNORM as u32);
+
+        let cap = crate::observe::FailCapture::start();
+        let all = parse_color_attachments(&buf, buf.len(), off);
+        let lines = cap.lines();
+        assert_eq!(all.len(), 1, "only slot 0's entry is in range");
+
+        let truncated: Vec<&String> = lines
+            .iter()
+            .filter(|l| l.contains("reason=color_attachment_table_truncated"))
+            .collect();
+        assert_eq!(
+            truncated.len(),
+            1,
+            "one decline for the truncated table: {lines:?}"
+        );
+        assert!(
+            truncated[0].contains("declared=3") && truncated[0].contains("decoded=1"),
+            "the decline names how many were promised and how many arrived: {}",
+            truncated[0]
+        );
+    }
+
     /// A colour-attachment field this decoder does not read is guest intent
     /// dropped, and the shape line beside it is what makes a boot with *no*
     /// drops readable as a measurement rather than as silence.
@@ -2962,14 +3033,14 @@ mod tests {
             masked.first().map(|c| c.write_mask),
             Some(ColorWriteMask::new(MTL_COLOR_WRITE_MASK_ALPHA).unwrap())
         );
-        assert!(!masked[0].write_mask.is_all());
+        assert_ne!(masked[0].write_mask.bits, MTL_COLOR_WRITE_MASK_ALL);
 
         // Same entry with the tag dropped: `all`, not `none`. This is the arm
         // a derived `Default` on a bare `u32` would have made a black
         // attachment, and every pipeline in the tree takes it.
         buf[entry] = 1;
         let plain = parse_color_attachments(&buf, buf.len(), off);
-        assert!(plain[0].write_mask.is_all());
+        assert_eq!(plain[0].write_mask.bits, MTL_COLOR_WRITE_MASK_ALL);
         assert_eq!(plain[0].write_mask, ColorWriteMask::default());
     }
 
@@ -2993,7 +3064,7 @@ mod tests {
         let cap = crate::observe::FailCapture::start();
         let all = parse_color_attachments(&buf, buf.len(), off);
         assert!(
-            all[0].write_mask.is_all(),
+            all[0].write_mask.bits == MTL_COLOR_WRITE_MASK_ALL,
             "a refused mask leaves the attachment writing every channel, \
              which is the pre-decode behaviour rather than a new failure"
         );

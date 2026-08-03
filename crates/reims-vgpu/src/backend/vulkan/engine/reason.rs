@@ -30,7 +30,6 @@ use crate::observe::Decline;
 pub enum DrawReason {
     /// More than one viewport/scissor in a draw. Metal's multi-viewport
     /// rasterization is not modelled.
-    MultiViewportArray { count: usize },
     /// A resident target bound as a sampled image must be a plain 2D image;
     /// arrayed and volume residents have no bind path.
     ResidentSampledNot2d { binding: u32 },
@@ -91,6 +90,8 @@ pub enum DrawReason {
     NoDeviceLocalMemoryForMrtSecondary { memory_type_bits: u32 },
     /// No device-local memory type for a depth attachment image.
     NoDeviceLocalMemoryForDepth { memory_type_bits: u32 },
+    /// No device-local memory type for the writeback difference pass's scratch.
+    NoDeviceLocalMemoryForDiffScratch { memory_type_bits: u32 },
     /// `VK_KHR_swapchain` is not enabled on the engine device.
     SwapchainUnavailable,
     /// The engine's queue family cannot present to the host window's surface.
@@ -109,7 +110,6 @@ impl crate::observe::Decline for DrawReason {
     /// check, never shared.
     fn slug(&self) -> &'static str {
         match self {
-            Self::MultiViewportArray { .. } => "multi_viewport_array",
             Self::ResidentSampledNot2d { .. } => "resident_sampled_not_2d",
             Self::GuestRunSampledNot2d { .. } => "guest_run_sampled_not_2d",
             Self::SecondaryAttachmentCap { .. } => "secondary_attachment_cap",
@@ -135,6 +135,9 @@ impl crate::observe::Decline for DrawReason {
                 "no_device_local_memory_for_mrt_secondary"
             }
             Self::NoDeviceLocalMemoryForDepth { .. } => "no_device_local_memory_for_depth",
+            Self::NoDeviceLocalMemoryForDiffScratch { .. } => {
+                "no_device_local_memory_for_diff_scratch"
+            }
             Self::SwapchainUnavailable => "swapchain_unavailable",
             Self::QueueCannotPresent { .. } => "queue_cannot_present",
             Self::SwapchainLacksTransferDst => "swapchain_lacks_transfer_dst",
@@ -151,7 +154,6 @@ impl std::fmt::Display for DrawReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "reason={}", self.slug())?;
         match self {
-            Self::MultiViewportArray { count } => write!(f, " count={count}"),
             Self::ResidentSampledNot2d { binding } | Self::GuestRunSampledNot2d { binding } => {
                 write!(f, " binding={binding}")
             }
@@ -169,7 +171,8 @@ impl std::fmt::Display for DrawReason {
             | Self::NoDeviceLocalMemoryForStorageImage { memory_type_bits }
             | Self::NoDeviceLocalMemoryForSlab { memory_type_bits }
             | Self::NoDeviceLocalMemoryForMrtSecondary { memory_type_bits }
-            | Self::NoDeviceLocalMemoryForDepth { memory_type_bits } => {
+            | Self::NoDeviceLocalMemoryForDepth { memory_type_bits }
+            | Self::NoDeviceLocalMemoryForDiffScratch { memory_type_bits } => {
                 write!(f, " memory_type_bits={memory_type_bits:#x}")
             }
             Self::QueueCannotPresent { queue_family } => write!(f, " queue_family={queue_family}"),
@@ -223,7 +226,6 @@ mod tests {
     use super::*;
 
     const ALL: &[DrawReason] = &[
-        DrawReason::MultiViewportArray { count: 0 },
         DrawReason::ResidentSampledNot2d { binding: 0 },
         DrawReason::GuestRunSampledNot2d { binding: 0 },
         DrawReason::SecondaryAttachmentCap {

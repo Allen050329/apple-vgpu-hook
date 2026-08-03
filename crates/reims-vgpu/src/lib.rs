@@ -120,6 +120,13 @@ struct QueuedGfxWrite {
     offset: u64,
     data: u64,
     size: u32,
+    /// When the vCPU published this write, or `None` when it was applied
+    /// straight through without ever entering the queue.
+    ///
+    /// The guest's store retires the moment this is pushed, so the guest cannot
+    /// see the delay; the age measured against this stamp is the only place the
+    /// deferral becomes visible. See [`crate::runtime::drain::DoorbellCensus`].
+    queued_at: Option<std::time::Instant>,
 }
 
 /// Link to a running host-owned presentation window ([[host-window]]).
@@ -212,6 +219,9 @@ struct BoundDevice {
     /// 0x1014/0x1018 must observe live bits mid-drain, never a stale cache.
     intr_disp: Arc<AtomicU32>,
     intr_gpu: Arc<AtomicU32>,
+    /// Child channels the guest has rung, OR'd from the vCPU thread with no
+    /// device lock; see [`model::GfxRegs::child_doorbell_rung`].
+    child_doorbell_rung: Arc<AtomicU32>,
     /// Lock-free clone of the fault status (0x102c) — the ISR's third read.
     intr_fault: Arc<AtomicU32>,
     /// Lock-free clone of the main-FIFO consumer counter (0x100c): the guest
@@ -239,7 +249,7 @@ struct BoundDevice {
     /// Wall-clock ms of the last VBL claimed by either the locked or contended
     /// poll path. One shared limiter keeps guest pacing independent of which
     /// path happens to win the device lock.
-    vbl_last_ms: AtomicU64,
+    vbl_last_us: AtomicU64,
     /// QEMU HostOps (GPA / clock / schedule worker). None in pure unit tests.
     ops: Option<ReimsVgpuHostOps>,
     /// Host-owned presentation window ([[host-window]]), once
@@ -285,8 +295,15 @@ fn publish_present_boundary(slot: &BoundDevice, frame_flush_seen: bool) {
 }
 
 fn apply_gfx_write(inner: &mut DeviceInner, slot: &BoundDevice, write: QueuedGfxWrite) {
+    match write.queued_at {
+        Some(at) => runtime::drain::note_doorbell_queued(
+            write.offset,
+            at.elapsed().as_micros() as u64,
+        ),
+        None => runtime::drain::note_doorbell_direct(),
+    }
     if let Some(ops) = slot.ops {
-        let mut host = QemuHost::with_prompt(&ops, &mut inner.actions, &slot.prompt_actions);
+        let mut host = QemuHost::new(&ops, &mut inner.actions, &slot.prompt_actions);
         inner
             .device
             .gfx_write(&mut host, write.offset, write.data, write.size);
@@ -308,6 +325,12 @@ fn lock_for_drain(slot: &BoundDevice) -> parking_lot::MutexGuard<'_, DeviceInner
         apply_gfx_write(&mut inner, slot, write);
     }
     drop(ingress);
+    // Here rather than only inside `drain_pending`, because this is the one
+    // point every entry to the drain passes through. `device_drain` returns
+    // before `drain_pending` when the device has no host ops, and
+    // `publish_stranded_fifos` re-publishes from `active_child_mask` — a ring
+    // left unfolded would be invisible to both.
+    runtime::drain::fold_rung_child_doorbells(&mut inner.device.state);
     inner
 }
 
@@ -339,6 +362,7 @@ pub fn device_create(ops: Option<ReimsVgpuHostOps>, page_shift: u32) -> Option<u
     let dev = Device::new(DeviceId(id), backend, page_shift);
     let intr_disp = Arc::clone(&dev.state.gfx.interrupt_status_disp);
     let intr_gpu = Arc::clone(&dev.state.gfx.interrupt_status_gpu);
+    let child_doorbell_rung = Arc::clone(&dev.state.gfx.child_doorbell_rung);
     let intr_fault = Arc::clone(&dev.state.gfx.interrupt_fault);
     let fifo_read_live = Arc::clone(&dev.state.gfx.fifo_read);
     DEVICES.lock().insert(
@@ -354,6 +378,7 @@ pub fn device_create(ops: Option<ReimsVgpuHostOps>, page_shift: u32) -> Option<u
             prompt_actions: Mutex::new(VecDeque::new()),
             intr_disp,
             intr_gpu,
+            child_doorbell_rung,
             intr_fault,
             fifo_read_live,
             present_action_pending: AtomicBool::new(false),
@@ -362,7 +387,7 @@ pub fn device_create(ops: Option<ReimsVgpuHostOps>, page_shift: u32) -> Option<u
             vbl_shared_gpa: AtomicU64::new(0),
             vbl_display_index: AtomicU32::new(0),
             vbl_online: AtomicBool::new(false),
-            vbl_last_ms: AtomicU64::new(0),
+            vbl_last_us: AtomicU64::new(0),
             ops,
             #[cfg(feature = "host-window")]
             window: Mutex::new(None),
@@ -391,7 +416,7 @@ pub fn device_reset(id: u64) -> bool {
         let boundary = state.present.frame_flush_seen;
         let views = if let Some(ops) = slot.ops {
             let DeviceInner { device, actions } = &mut *d;
-            let mut host = QemuHost::with_prompt(&ops, actions, &slot.prompt_actions);
+            let mut host = QemuHost::new(&ops, actions, &slot.prompt_actions);
             device.reset_with_host(&mut host)
         } else {
             d.device.reset();
@@ -554,22 +579,27 @@ pub fn device_window_run_main(_id: u64) -> bool {
 /// never contends the render tranche. Latest-wins.
 #[cfg(feature = "host-window")]
 fn publish_window_frame(slot: &BoundDevice, state: &mut crate::model::DeviceState) {
+    use crate::runtime::drain::{WindowPublish, note_window_publish};
     let mut guard = slot.window.lock();
     let Some(link) = guard.as_mut() else {
         // No window consumes the capture: revert the next capture to the full
         // readback path (a torn-down window must not leave `frame_bgra` stale
         // behind an unreset `display_from_resident`).
         state.present.display_from_resident = false;
+        note_window_publish(WindowPublish::NoWindow);
         return;
     };
     let p = &state.present;
     if !p.frame_valid || p.frame_width == 0 || p.frame_height == 0 {
+        note_window_publish(WindowPublish::NoFrame);
         return;
     }
     let key = window_frame_key(p);
     if key == link.last {
+        note_window_publish(WindowPublish::SameKey);
         return;
     }
+    note_window_publish(WindowPublish::Fresh);
     // Copied out rather than held behind `p`: the branches below assign
     // `state.present.display_from_resident`, and the frame bytes are the only
     // thing that still has to be read through the borrow.
@@ -604,7 +634,7 @@ fn publish_window_frame(slot: &BoundDevice, state: &mut crate::model::DeviceStat
         let resident_source = crate::backend::vulkan::engine::WindowPresentSource {
             width,
             height,
-            candidates: vec![present_identity],
+            identity: present_identity,
         };
         let published = window_write_frame(link, width, height, Vec::new(), Some(resident_source));
         crate::runtime::census::present_proxy::window_publish::note(published);
@@ -919,8 +949,40 @@ pub fn device_gfx_write(id: u64, offset: u64, data: u64, size: u32) -> bool {
             slot.intr_gpu.fetch_and(!(data as u32), Ordering::AcqRel);
             return true;
         }
+        // The child doorbell, which measurement says is the *entire* queueing
+        // stall on this pathway: `gfx_doorbell_delay` reads `offsets=1` on
+        // every window that queued anything, ~100 rings a second applied up to
+        // 45 ms late, and that delay is the drain tranche the write could not
+        // take the lock through.
+        //
+        // It is the one register that can be served this way, because it
+        // carries no state the decode depends on — its effect is to say a
+        // channel has work. `fold_rung_child_doorbells` turns the bit into
+        // `active_child_mask` / `pending.child_mask`, which is exactly what the
+        // locked handler in `runtime::mmio` does for the same register.
+        //
+        // The channel-number check mirrors that handler rather than trusting
+        // the guest: a value outside the channel range names no channel, and
+        // shifting by it would be undefined. An out-of-range ring is dropped
+        // here as it is there, and deliberately still schedules nothing.
+        if offset == model::GFX_REG_CHILD_DOORBELL || offset == model::GFX_REG_CHILD_REPLAY_DOORBELL
+        {
+            let channel = data as u32;
+            if channel >= 1 && (channel as usize) < model::MAX_CHANNELS {
+                slot.child_doorbell_rung
+                    .fetch_or(1u32 << channel, Ordering::AcqRel);
+                runtime::drain::note_doorbell_lock_free();
+                schedule_device(&slot);
+            }
+            return true;
+        }
     }
-    let write = QueuedGfxWrite { offset, data, size };
+    let mut write = QueuedGfxWrite {
+        offset,
+        data,
+        size,
+        queued_at: None,
+    };
     let mut ingress = slot.gfx_ingress.lock();
     if ingress.is_empty() {
         if let Some(mut inner) = slot.inner.try_lock() {
@@ -928,15 +990,39 @@ pub fn device_gfx_write(id: u64, offset: u64, data: u64, size: u32) -> bool {
             return true;
         }
     }
+    // Stamped only on the path that actually defers, so the direct path pays no
+    // clock read at all.
+    write.queued_at = Some(std::time::Instant::now());
     ingress.push_back(write);
     drop(ingress);
     schedule_device(&slot);
     true
 }
 
+/// Take the device lock from the vCPU thread, measuring the wait.
+///
+/// The guest's MMIO access is stopped for exactly as long as this blocks, and
+/// the drain worker holds this same lock across a full-surface readback. Every
+/// other figure about that stall is taken from the holder's side, which makes
+/// the step to "the guest missed a frame" an inference; this measures it where
+/// it is actually paid.
+///
+/// The uncontended path takes `try_lock` and never reads the clock, so a fast
+/// access pays nothing for the instrument.
+fn lock_device_for_vcpu(slot: &BoundDevice) -> impl std::ops::DerefMut<Target = DeviceInner> + '_ {
+    if let Some(guard) = slot.inner.try_lock() {
+        runtime::drain::note_vcpu_lock_free();
+        return guard;
+    }
+    let waited = std::time::Instant::now();
+    let guard = slot.inner.lock();
+    runtime::drain::note_vcpu_lock_wait(waited.elapsed().as_micros() as u64);
+    guard
+}
+
 pub fn device_iosfc_read(id: u64, offset: u64, size: u32) -> Option<u64> {
     let slot = device_slot(id)?;
-    let d = slot.inner.lock();
+    let d = lock_device_for_vcpu(&slot);
     Some(d.device.iosfc_read(offset, size))
 }
 
@@ -944,10 +1030,10 @@ pub fn device_iosfc_write(id: u64, offset: u64, data: u64, size: u32) -> bool {
     let Some(slot) = device_slot(id) else {
         return false;
     };
-    let mut d = slot.inner.lock();
+    let mut d = lock_device_for_vcpu(&slot);
     if let Some(ops) = slot.ops {
         let DeviceInner { device, actions } = &mut *d;
-        let mut host = QemuHost::with_prompt(&ops, actions, &slot.prompt_actions);
+        let mut host = QemuHost::new(&ops, actions, &slot.prompt_actions);
         device.iosfc_write(&mut host, offset, data, size);
     } else {
         let mut host = NullHost;
@@ -974,7 +1060,7 @@ pub fn device_drain(id: u64) -> bool {
         return true;
     };
     let DeviceInner { device, actions } = &mut *d;
-    let mut host = QemuHost::with_prompt(&ops, actions, &slot.prompt_actions);
+    let mut host = QemuHost::new(&ops, actions, &slot.prompt_actions);
     // Presentation-path selector for this tranche: with a live host window the
     // drain publishes frames + self-acks; without one every present must
     // enqueue the CPU `ScanoutUpdate` and the ack belongs to the console paint
@@ -1005,6 +1091,9 @@ pub fn device_drain(id: u64) -> bool {
     #[cfg(feature = "host-window")]
     publish_window_frame(&slot, &mut device.state);
     runtime::drain::note_drain_tranche(drain_us, publish_started.elapsed().as_micros() as u64);
+    // Same one-second cadence, so the cache trend lines up row-for-row with
+    // `store_routes` and `drain_duty`. Measure-only; see `note_cache_levels`.
+    runtime::surface_cache::note_cache_levels(&device.state, &host);
     // The present-completion ack, re-homed off the QEMU paint — ONLY while the
     // host window is the display. With the window live no per-present
     // `ScanoutUpdate` is enqueued, so `device_scanout_copy` — the only other
@@ -1060,12 +1149,16 @@ pub fn device_poll(id: u64) -> bool {
         return true;
     };
     let DeviceInner { device, actions } = &mut *d;
-    let mut host = QemuHost::with_prompt(&ops, actions, &slot.prompt_actions);
+    let mut host = QemuHost::new(&ops, actions, &slot.prompt_actions);
+    // Before the rescue reads `active_child_mask`, which is the mask a
+    // lock-free ring lands in only once folded. Without this the Dekker rescue
+    // could not see the very channels the doorbell rail is responsible for.
+    runtime::drain::fold_rung_child_doorbells(&mut device.state);
     runtime::drain::publish_stranded_fifos(&mut device.state, &mut host);
     runtime::drain::try_display_online(&mut device.state, &mut host);
     // After ONLINE, pulse VBL so the guest compositor has a display time base
     //. Missing VBL → clear-only dual-mid present thrash.
-    runtime::drain::signal_display_vbl(&mut device.state, &mut host, &slot.vbl_last_ms);
+    runtime::drain::signal_display_vbl(&mut device.state, &mut host, &slot.vbl_last_us);
     // Republish the lock-free VBL snapshot for the contended fast path above.
     // These change only at online-ack/reinit, but publishing every poll keeps
     // the snapshot fresh with no extra synchronization on the rare-change path.
@@ -1077,8 +1170,8 @@ pub fn device_poll(id: u64) -> bool {
         .store(device.state.display.online_acked, Ordering::Release);
     // Census both source polls and the independently time-gated VBL rate.
     // Drive the resident idle-drain off the poll heartbeat, which ticks even when
-    // the guest stops compositing (a static page → `present_import used_hz=0` →
-    // no publishes). A publish-clocked drain froze there, pinning a burst's ~260
+    // the guest stops compositing (a static page means no publishes at all).
+    // A publish-clocked drain froze there, pinning a burst's ~260
     // stale residents (~516 MiB) for the guest lifetime; the wall clock keeps
     // advancing and returns VRAM to baseline. The presented target is kept alive
     // by identity so it is never reclaimed from under the display. The engine
@@ -1138,13 +1231,13 @@ fn vbl_contended_pulse(slot: &BoundDevice) {
     // Both poll paths share one limiter, so both have to report into one census
     // or the delivered rate reads low by whatever share of polls found the
     // device lock contended.
-    if !runtime::drain::claim_display_vbl(&slot.vbl_last_ms, now) {
+    if !runtime::drain::claim_display_vbl(&slot.vbl_last_us, crate::observe::elapsed_us()) {
         runtime::drain::note_vbl(runtime::drain::VBL_NOT_CLAIMED, now);
         return;
     }
     runtime::drain::note_vbl(runtime::drain::VBL_DELIVERED, now);
     let mut scratch = VecDeque::new();
-    let mut host = QemuHost::with_prompt(&ops, &mut scratch, &slot.prompt_actions);
+    let mut host = QemuHost::new(&ops, &mut scratch, &slot.prompt_actions);
     let mut buf = [0u8; 4];
     if host
         .read_gpa(gpa + model::DISPLAY_SHARED_PENDING, &mut buf)
@@ -1247,7 +1340,7 @@ pub fn device_efi_console_copy(
     }
     if let Some(ops) = slot.ops {
         let DeviceInner { device, actions } = &mut *d;
-        let host = QemuHost::with_prompt(&ops, actions, &slot.prompt_actions);
+        let host = QemuHost::new(&ops, actions, &slot.prompt_actions);
         if runtime::scanout::paint_efi_console(&device.state, &host, dst, dst_stride, width, height)
         {
             let stride = if device.state.gfx.efi_fb_stride != 0 {
@@ -1293,7 +1386,7 @@ pub fn device_scanout_copy(
     };
     if let Some(ops) = slot.ops {
         let DeviceInner { device, actions } = &mut *d;
-        let mut host = QemuHost::with_prompt(&ops, actions, &slot.prompt_actions);
+        let mut host = QemuHost::new(&ops, actions, &slot.prompt_actions);
         // `frame_encode_pending` also means a valid +0x188 snapshot was just
         // installed and must be blitted once. `copy_to_bgra8` distinguishes
         // that case from capture-fail retry without draining guest commands in
@@ -1435,24 +1528,6 @@ mod tests {
     use super::*;
     use crate::model::PAGE_SHIFT_ARM64E;
 
-    fn null_host_ops() -> ReimsVgpuHostOps {
-        ReimsVgpuHostOps {
-            abi_version: crate::qemu::abi::REIMS_VGPU_QEMU_ABI_VERSION,
-            struct_size: std::mem::size_of::<ReimsVgpuHostOps>() as u32,
-            ctx: std::ptr::null_mut(),
-            read_gpa: None,
-            write_gpa: None,
-            mono_ns: None,
-            schedule_bh: None,
-            read_kva: None,
-            read_xreg: None,
-            map_pages: None,
-            unmap_pages: None,
-            map_pages_stable: 0,
-            is_ram_gpa: None,
-            notify_actions: None,
-        }
-    }
 
     #[test]
     fn lifecycle() {
@@ -1576,7 +1651,8 @@ mod tests {
     }
 
     /// The interrupt-status atomics stay wired to the same slot across reset
-    /// (GfxRegs::reset must preserve the shared Arcs, only zeroing values).
+    /// ([`model::DeviceState::reset`] must preserve the shared `Arc`s and only
+    /// zero the values they hold).
     #[test]
     fn intr_status_atomics_survive_reset() {
         let id = device_create(None, PAGE_SHIFT_ARM64E).expect("create");
@@ -1670,10 +1746,21 @@ mod tests {
     }
 
     /// Regression proxy for the IPI-timeout class: a doorbell arriving while
-    /// the render worker owns device state queues without waiting for that
-    /// state lock, then is applied by the next ordered drain.
+    /// the render worker owns device state never waits for that state lock.
+    ///
+    /// It used to queue, and the queue is what this asserted. That was the
+    /// weaker half of the guarantee: the guest's store retired, but the work it
+    /// rang for did not start until the worker's tranche ended, measured at up
+    /// to 45 ms and about a hundred rings a second
+    /// (`gfx_doorbell_delay off_0x1020`, which read `offsets=1` — this register
+    /// was the entire queueing stall on the PCI pathway). The ring is now taken
+    /// with no device lock asked for at all, so `gfx_ingress` must stay empty.
+    ///
+    /// Both halves are asserted. An empty ingress alone would also be what a
+    /// dropped doorbell looks like, so the bit has to be shown arriving and then
+    /// shown becoming a pending channel.
     #[test]
-    fn gfx_mmio_queues_while_render_worker_owns_device() {
+    fn a_child_doorbell_never_queues_behind_the_render_worker() {
         let id = device_create(None, PAGE_SHIFT_ARM64E).expect("create");
         let slot = device_slot(id).expect("device");
         let inner = slot.inner.lock();
@@ -1684,14 +1771,63 @@ mod tests {
             4,
             crate::model::MMIO_U32,
         ));
-        assert_eq!(slot.gfx_ingress.lock().len(), 1);
+        assert_eq!(
+            slot.gfx_ingress.lock().len(),
+            0,
+            "the ring must not queue behind a held device lock"
+        );
+        assert_ne!(
+            slot.child_doorbell_rung.load(Ordering::Acquire) & (1 << 4),
+            0,
+            "and must be recorded, or an empty queue is just a lost doorbell"
+        );
         drop(inner);
 
         assert!(device_drain(id));
         let inner = slot.inner.lock();
-        assert_eq!(slot.gfx_ingress.lock().len(), 0);
-        assert_ne!(inner.device.state.pending.child_mask & (1 << 4), 0);
+        assert_ne!(
+            inner.device.state.pending.child_mask & (1 << 4),
+            0,
+            "the fold must turn the ring into pending work"
+        );
+        assert_ne!(
+            inner.device.state.active_child_mask & (1 << 4),
+            0,
+            "and into an active channel, or the stranded-FIFO rescue cannot see it"
+        );
+        assert_eq!(
+            inner.device.state.gfx.child_doorbell_rung.load(Ordering::Acquire),
+            0,
+            "the fold consumes the bit rather than replaying it every drain"
+        );
         drop(inner);
+        assert!(device_destroy(id));
+    }
+
+    /// A ring naming no channel is dropped, not shifted by.
+    ///
+    /// `1u32 << channel` is undefined past the word, and the locked handler in
+    /// `runtime::mmio` has always range-checked before shifting. The lock-free
+    /// path is a second implementation of that same guard, so it gets its own
+    /// assertion rather than inheriting the first one's.
+    #[test]
+    fn a_child_doorbell_outside_the_channel_range_rings_nothing() {
+        let id = device_create(None, PAGE_SHIFT_ARM64E).expect("create");
+        let slot = device_slot(id).expect("device");
+        for channel in [0u64, crate::model::MAX_CHANNELS as u64, 0xffff_ffff] {
+            assert!(device_gfx_write(
+                id,
+                crate::model::GFX_REG_CHILD_DOORBELL,
+                channel,
+                crate::model::MMIO_U32,
+            ));
+        }
+        assert_eq!(
+            slot.child_doorbell_rung.load(Ordering::Acquire),
+            0,
+            "channel 0 is the main FIFO and the rest name nothing"
+        );
+        assert_eq!(slot.gfx_ingress.lock().len(), 0, "and none of them queue");
         assert!(device_destroy(id));
     }
 
@@ -1702,7 +1838,7 @@ mod tests {
         // production present path no longer depends on it: `device_drain` acks
         // each present itself after publishing to the host window, since no
         // per-present `ScanoutUpdate` is enqueued for QEMU to apply.
-        let id = device_create(Some(null_host_ops()), PAGE_SHIFT_ARM64E).expect("create");
+        let id = device_create(Some(ReimsVgpuHostOps::null()), PAGE_SHIFT_ARM64E).expect("create");
         let slot = device_slot(id).expect("device");
         {
             let mut inner = slot.inner.lock();
@@ -1721,6 +1857,7 @@ mod tests {
             offset: crate::model::GFX_REG_CHILD_DOORBELL,
             data: 4,
             size: crate::model::MMIO_U32,
+            queued_at: Some(std::time::Instant::now()),
         });
 
         assert!(device_drain(id));

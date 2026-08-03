@@ -151,10 +151,6 @@ engine_counters! {
         /// image (copy-on-sample) — bytes are the elided host upload size.
         compute_sampled_resident_copies,
         compute_sampled_resident_copy_bytes,
-        /// Subset of the resident copies that crossed vk formats through the
-        /// image→buffer→image byte-reinterpret hop (row-byte-identical views).
-        compute_sampled_reinterpret_copies,
-        compute_sampled_reinterpret_copy_bytes,
         /// Compute storage images whose post-dispatch readback was deferred —
         /// the pinned resident stays authoritative; bytes are the elided
         /// device→host readback size (the CPU writeback of the same size is
@@ -193,6 +189,22 @@ engine_counters! {
         seed_gpu_copy_bytes,
         sampled_reuploads,
         sampled_reupload_bytes,
+        /// Sampled binds served by gathering scattered guest pages into staging
+        /// (`SampledSource::GuestRuns`), and the bytes those gathers moved.
+        ///
+        /// Every other arm of the sampled loop already reported itself and this
+        /// one did not, which is how `acquire_sampled` came to be measured at
+        /// the whole of a draw's acquire cost with no counter accounting for
+        /// it. See `draw_phase`'s "What the sampled loop's own cost is *not*".
+        sampled_gathers,
+        sampled_gather_bytes,
+        /// Sampled binds that would have gathered and did not, because both
+        /// halves of the guest-write witness vouched that the retained image's
+        /// bytes could not have moved. Bytes = the gather that did not happen,
+        /// so `sampled_gather_bytes + sampled_gather_skip_bytes` is what this
+        /// rail would cost with no cache.
+        sampled_gather_skips,
+        sampled_gather_skip_bytes,
         sampled_cache_hits,
         sampled_identity_hits,
         sampled_cache_hit_bytes,
@@ -298,6 +310,18 @@ impl EngineCounters {
             .fetch_add(bytes, Ordering::Relaxed);
     }
 
+    pub fn note_sampled_gather(&self, bytes: u64) {
+        self.sampled_gathers.fetch_add(1, Ordering::Relaxed);
+        self.sampled_gather_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub fn note_sampled_gather_skipped(&self, bytes: u64) {
+        self.sampled_gather_skips.fetch_add(1, Ordering::Relaxed);
+        self.sampled_gather_skip_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+    }
+
     pub fn note_compute_sampled_upload(&self, bytes: u64) {
         self.compute_sampled_uploads.fetch_add(1, Ordering::Relaxed);
         self.compute_sampled_upload_bytes
@@ -315,13 +339,6 @@ impl EngineCounters {
         self.compute_sampled_resident_copies
             .fetch_add(1, Ordering::Relaxed);
         self.compute_sampled_resident_copy_bytes
-            .fetch_add(bytes, Ordering::Relaxed);
-    }
-
-    pub fn note_compute_sampled_reinterpret_copy(&self, bytes: u64) {
-        self.compute_sampled_reinterpret_copies
-            .fetch_add(1, Ordering::Relaxed);
-        self.compute_sampled_reinterpret_copy_bytes
             .fetch_add(bytes, Ordering::Relaxed);
     }
 
@@ -350,6 +367,8 @@ mod tests {
         counters.note_alloc();
         counters.note_readback(4096);
         counters.note_seed_upload(1024);
+        counters.note_sampled_gather(2048);
+        counters.note_sampled_gather_skipped(512);
 
         let snapshot = counters.snapshot();
         assert_eq!(snapshot.creates, 1);
@@ -358,6 +377,23 @@ mod tests {
         assert_eq!(
             (snapshot.seed_uploads, snapshot.seed_upload_bytes),
             (1, 1024)
+        );
+        // The gather is the sampled loop's only byte-moving arm, and it went
+        // uncounted long enough to hide the whole of `acquire_sampled`. Pairing
+        // it here keeps the event and its bytes from drifting apart the way a
+        // count-only counter would.
+        assert_eq!(
+            (snapshot.sampled_gathers, snapshot.sampled_gather_bytes),
+            (1, 2048)
+        );
+        // And the gathers that did not happen, whose bytes are the other half of
+        // what this rail would cost with no cache.
+        assert_eq!(
+            (
+                snapshot.sampled_gather_skips,
+                snapshot.sampled_gather_skip_bytes
+            ),
+            (1, 512)
         );
     }
 

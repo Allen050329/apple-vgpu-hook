@@ -41,6 +41,20 @@ RUN_DIR="${RUN_DIR:-$DISKS_DIR/run}"
 # In-tree QEMU is rebuilt every boot unless QEMU_BIN is overridden. The boot
 # script still builds both Rust products first so stale host code and stale GOP
 # ROMs do not survive a launch.
+#
+# Overriding QEMU_BIN is how a multi-boot batch pins one arm while the Rust tree
+# is edited. Two constraints on what may be pinned, both learned by losing runs
+# to them:
+#
+# - Keep the pinned copy inside `vendor/qemu/build/`. QEMU finds its firmware
+#   through /proc/self/exe -> `<exedir>/qemu-bundle/usr/local/share/qemu`, so a
+#   copy in /tmp prints this script's normal header and then dies on
+#   `failed to find romfile "efi-virtio.rom"` — a boot that looks started.
+# - Keep `qemu-system-x86_64` in the filename. Every VM sweep in this repo and
+#   in the repro scripts matches that pattern. A pin named anything else
+#   survives the sweep, keeps hostfwd 2222, and the next boot fails to bind and
+#   exits — after which the scoring script talks to the *pinned* guest and
+#   reports a clean run of the wrong binary.
 QEMU_BIN_DEFAULT="$REPO_ROOT/vendor/qemu/build/qemu-system-x86_64"
 QEMU_BIN="${QEMU_BIN:-$QEMU_BIN_DEFAULT}"
 REIMS_VGPU_EFI_ROM_SCRIPT="$REPO_ROOT/crates/reims-vgpu-efi/scripts/reims-vgpu-efi-rom/reims-vgpu-efi-rom.sh"
@@ -438,11 +452,52 @@ if [ -n "${REIMS_VGPU_WINDOW:-}" ]; then
   # session values (only when absent) and export them. XAUTHORITY carries a
   # per-login random suffix; override any of these in the environment if yours
   # differ (e.g. a different seat, DISPLAY, or Wayland socket).
-  : "${XDG_RUNTIME_DIR:=/run/user/1000}"
+  : "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"
   : "${WAYLAND_DISPLAY:=wayland-0}"
   : "${DISPLAY:=:0}"
-  : "${XAUTHORITY:=/run/user/1000/xauth_Kmhxwx}"
-  export XDG_RUNTIME_DIR WAYLAND_DISPLAY DISPLAY XAUTHORITY
+  # XAUTHORITY's suffix is a per-login random string, so it cannot be written
+  # down: a hardcoded one goes stale at the next login and then points at a file
+  # that does not exist. Discover the newest cookie in the runtime dir instead.
+  if [ -z "${XAUTHORITY:-}" ]; then
+    for _xauth in $(ls -t "$XDG_RUNTIME_DIR"/xauth_* 2>/dev/null); do
+      XAUTHORITY="$_xauth"
+      break
+    done
+  fi
+  export XDG_RUNTIME_DIR WAYLAND_DISPLAY DISPLAY
+  [ -n "${XAUTHORITY:-}" ] && export XAUTHORITY
+
+  # A window with no display server still opens, still says "first frame
+  # presented", and still fills the log with `host_window_cadence` — at a
+  # present rate governed by nothing consuming the images. That reads exactly
+  # like a pacing defect in this device. Measuring it once already produced a
+  # peak of 33 Hz against a guest that believed it was drawing 119, so say so
+  # here rather than letting a later reader believe the number.
+  if command -v xdpyinfo >/dev/null 2>&1 && ! xdpyinfo >/dev/null 2>&1; then
+    if [ ! -S "$XDG_RUNTIME_DIR/${WAYLAND_DISPLAY:-wayland-0}" ]; then
+      echo "boot-x86.sh: WARNING — no usable display connection." >&2
+      echo "boot-x86.sh:   DISPLAY=$DISPLAY XAUTHORITY=${XAUTHORITY:-unset}" >&2
+      echo "boot-x86.sh:   The host window will open with nothing consuming it." >&2
+      echo "boot-x86.sh:   Guest-side measurements stay valid; every host-window" >&2
+      echo "boot-x86.sh:   number (host_window_cadence present_hz, busy_acquire," >&2
+      echo "boot-x86.sh:   direct_frac) is MEANINGLESS on this boot." >&2
+    fi
+  fi
+  # This once warned that host-window pacing was pinned at exactly 20.0 Hz
+  # against `offered=51` with `busy_acquire=330`, and that FIFO->MAILBOX had not
+  # moved it. That is fixed and the reasoning behind it was wrong, so the warning
+  # is gone rather than softened.
+  #
+  # The swapchain was being created with a literal FIFO while the census line
+  # printed the *chosen* MAILBOX, so "MAILBOX was granted and did not help" was
+  # never a measurement of MAILBOX. One value now carries both the census field
+  # and the call argument, and the ceiling went with it.
+  #
+  # Current: `present_hz == offered_hz` exactly, `busy_acquire=0`,
+  # `direct_frac=1.00` — the window presents every frame it is offered, measured
+  # up to 71.6 Hz. Whatever bounds the frame rate now is upstream of this window,
+  # so do not go looking for it here.
+  :
 else
   REIMS_VGPU_DISPLAY="${REIMS_VGPU_DISPLAY:-gtk}"
 fi
@@ -535,15 +590,90 @@ capture_then_revert() {
 QEMU_PID=$!
 trap 'capture_then_revert signal; exit 130' INT TERM
 
+# A boot that boot.efi aborted is not a wedge, and it must not be scored as one.
+#
+# Observed shape, twice: QEMU stays alive, the guest never issues a single GPU
+# command, the host window shows the macOS boot-failure graphic, and the fail log
+# fills with nothing but `host_window_cadence`. That is indistinguishable from a
+# device hang by every signal an agent normally reads, and one session lost 53
+# minutes to it before anyone opened the serial log. The serial log says it
+# plainly:
+#
+#   AAPL: #[EB.MM.AKMR|!] Err(0xE) <- EB.M.BAPr2 2 2 50271 0x700000
+#   AAPL: #[EB.B.MN|!]    Err(0xE) <- EB.MM.AKMR
+#   AAPL: #[EB|STOP] 0x15
+#   OC: Boot failed - Aborted
+#
+# boot.efi could not get the contiguous kernel region it asks for at a fixed
+# guest-physical address, so it stopped before loading the kernel. Nothing after
+# that point is a reading about this device.
+#
+# Detect it and exit distinctly (125), so a batch can retry the boot instead of
+# waiting out TESTING_TIMEOUT and then treating the sample as data.
+BOOT_ABORT_RE='#\[EB\|STOP\]|Boot failed - Aborted'
+
+# A guest KERNEL PANIC is the loudest result this rig can produce and it was, for
+# months, the quietest. `-action reboot=shutdown` turns the panic reboot into a
+# QEMU exit, so the boot script reported "qemu exited", the drive script reported
+# "VM IS GONE", and nothing anywhere said the word panic. The evidence was on disk
+# the whole time — `vm/disks/run/serial-*.log` is never cleaned, and a sweep of
+# 547 of them found 11 panics (2.0 %) whose reasons are a corruption census:
+#
+#   [kalloc.type.var6.6144]: element modified after free (val:0xffffffffffffffff)
+#   [kalloc.type.var3.256]:  element modified after free (val:0xffffffffffffffff)
+#   pmap_page_protect() pmap=... pn=... vaddr=...            (x2)
+#   Kernel trap at 0xffffffffffffffff  (an indirect call through a clobbered
+#                                       ifnet function pointer)
+#   "hitting assertion" @AppleParavirtPageTable.cpp:200
+#
+# The two `element modified after free` reports are the important ones: the
+# kernel's own poison check found a whole freed element (256 B and 6144 B) filled
+# with 0xFF from offset 0. That is not a stray pointer, it is a bulk write of
+# opaque white pixels into memory the guest kernel had already freed — the
+# kernel-side face of the write-after-fence class `311cb11` repaired.
+#
+# So say it at the moment it happens, and exit 126 so a batch can tell a panic
+# from a firmware abort (125), a wedge (124) and a clean exit.
+PANIC_RE='Debugger called: <panic>'
+PANIC_KEEP_DIR="${PANIC_KEEP_DIR:-/tmp/reims-vgpu-panics}"
+
 elapsed=0
 while kill -0 "$QEMU_PID" 2>/dev/null; do
   if [ "$elapsed" -ge "$TESTING_TIMEOUT" ]; then
     capture_then_revert "timeout ${TESTING_TIMEOUT}s — wedge verdict"
     exit 124
   fi
+  if [ -s "$SERIAL_LOG" ] && grep -qE "$BOOT_ABORT_RE" "$SERIAL_LOG" 2>/dev/null; then
+    echo "boot-x86.sh: GUEST FIRMWARE ABORTED THE BOOT — the kernel never loaded."
+    grep -E "$BOOT_ABORT_RE|EB\.MM\.AKMR|EB\.B\.MN" "$SERIAL_LOG" 2>/dev/null | tail -5
+    echo "boot-x86.sh: no measurement from this boot is about the device. Retry it."
+    capture_then_revert "boot.efi aborted — firmware boot failure, not a device wedge"
+    exit 125
+  fi
+  if [ -s "$SERIAL_LOG" ] && grep -qF "$PANIC_RE" "$SERIAL_LOG" 2>/dev/null; then
+    echo "boot-x86.sh: GUEST KERNEL PANIC."
+    grep -A2 -F "$PANIC_RE" "$SERIAL_LOG" 2>/dev/null | head -6
+    mkdir -p "$PANIC_KEEP_DIR"
+    cp -f "$SERIAL_LOG" "$PANIC_KEEP_DIR/$(basename "$SERIAL_LOG")" 2>/dev/null || true
+    echo "boot-x86.sh: serial log kept at $PANIC_KEEP_DIR/$(basename "$SERIAL_LOG")"
+    capture_then_revert "guest kernel panic"
+    exit 126
+  fi
   sleep 5
   elapsed=$((elapsed + 5))
 done
 
 wait "$QEMU_PID" 2>/dev/null || true
+# QEMU exiting on its own is normally a guest shutdown, but `-action
+# reboot=shutdown` makes a panic reboot look identical. Check before saying
+# nothing happened.
+if [ -s "$SERIAL_LOG" ] && grep -qF "$PANIC_RE" "$SERIAL_LOG" 2>/dev/null; then
+  echo "boot-x86.sh: GUEST KERNEL PANIC (qemu exited on the panic reboot)."
+  grep -A2 -F "$PANIC_RE" "$SERIAL_LOG" 2>/dev/null | head -6
+  mkdir -p "$PANIC_KEEP_DIR"
+  cp -f "$SERIAL_LOG" "$PANIC_KEEP_DIR/$(basename "$SERIAL_LOG")" 2>/dev/null || true
+  echo "boot-x86.sh: serial log kept at $PANIC_KEEP_DIR/$(basename "$SERIAL_LOG")"
+  capture_then_revert "guest kernel panic"
+  exit 126
+fi
 capture_then_revert "qemu exited"

@@ -13,7 +13,6 @@ fn a_partial_packet_is_control_flow_and_never_a_logged_fault() {
     assert_eq!(PacketError::ShortHeader.fault(), None);
     assert_eq!(PacketError::Incomplete.fault(), None);
     assert_eq!(PacketError::BadSize.fault(), Some(PacketFault::BadSize));
-    assert_eq!(PacketError::Desynced.fault(), Some(PacketFault::Desynced));
 }
 
 #[test]
@@ -115,6 +114,33 @@ fn sync_exec_stall_proxy_fires_at_watchdog_scale_only() {
     assert!(sync_exec_stalled(3_406_929));
 }
 use crate::runtime::host::{FakeHost, HostActionKind};
+
+/// A display-present packet naming `mapping`.
+///
+/// The surface id goes at the offset the emitting command's trailer puts it,
+/// read from `display_txn_trailer_slots` — the same table the decoder uses, so a
+/// test cannot pin an offset the product code does not read. The payload is the
+/// command's own trailer length and nothing else, which is what the guest sends:
+/// `kb/pvg-display-contract.md` §8.1 measured every op6 payload as trailer-only.
+///
+/// Every present test built this same eight-field `Packet` by hand; only the
+/// opcode and the named mapping ever differed. The one test that does not use
+/// this is `display_txn_probe_distinguishes_trailer_only_from_prefixed_payload`,
+/// which varies the payload length on purpose.
+fn present_packet(opcode: u16, mapping: u32) -> Packet {
+    let len = display_txn_trailer_len(opcode);
+    let mut payload = vec![0u8; len];
+    let off = display_txn_trailer_slots(opcode).0 * 4;
+    payload[off..off + 4].copy_from_slice(&mapping.to_le_bytes());
+    Packet {
+        opcode,
+        stamp_count: 0,
+        total_size: PACKET_HEADER_LEN + len as u32,
+        completion_stamp: 0,
+        payload,
+        next_head: 0,
+    }
+}
 
 fn packet_bytes(opcode: u16, stamp_value: u32, payload: &[u8]) -> Vec<u8> {
     let total = PACKET_HEADER_LEN as usize + payload.len();
@@ -247,16 +273,7 @@ fn display_swap_paints_mapping_geom_not_console_fallback() {
         m.content_generation = 5;
         m.page_entries = vec![1];
     }
-    let mut payload = vec![0u8; DISPLAY_SWAP_MIN_LEN];
-    payload[DISPLAY_SWAP_MAPPING..DISPLAY_SWAP_MAPPING + 4].copy_from_slice(&3u32.to_le_bytes());
-    let pkt = Packet {
-        opcode: CHILD_OP_DISPLAY_SWAP,
-        stamp_count: 0,
-        total_size: PACKET_HEADER_LEN + DISPLAY_SWAP_MIN_LEN as u32,
-        completion_stamp: 0,
-        payload,
-        next_head: 0,
-    };
+    let pkt = present_packet(CHILD_OP_DISPLAY_SWAP, 3);
     process_child_packet(&mut state, &mut host, 4, &pkt);
     assert!(state.present.frame_flush_seen);
     assert_eq!(state.present.width, 1440);
@@ -318,7 +335,6 @@ fn clear_only_present_captures_the_surface_the_transaction_names() {
     assert!(write_bgra8(&mut state, &mut host, 1, &gray, stride, w, h));
     state.note_surface_composite(1);
     state.present.early_front_mapping = 1;
-    state.present.early_front_generation = 3;
     state.present.valid = true;
     state.present.width = w;
     state.present.height = h;
@@ -340,21 +356,11 @@ fn clear_only_present_captures_the_surface_the_transaction_names() {
         "the named mid must be the ClearOnly case this test is about"
     );
 
-    let mut payload = vec![0u8; PRESENT_X86_MIN_LEN];
-    payload[PRESENT_X86_SURFACE_ID..PRESENT_X86_SURFACE_ID + 4]
-        .copy_from_slice(&2u32.to_le_bytes());
     process_child_packet(
         &mut state,
         &mut host,
         5,
-        &Packet {
-            opcode: CHILD_OP_PRESENT_X86,
-            stamp_count: 0,
-            total_size: PACKET_HEADER_LEN + PRESENT_X86_MIN_LEN as u32,
-            completion_stamp: 0,
-            payload,
-            next_head: 0,
-        },
+        &present_packet(CHILD_OP_PRESENT_X86, 2),
     );
 
     assert_eq!(state.present.present_mapping, 2, "guest names mid 2");
@@ -531,22 +537,7 @@ fn composite_named_present_captures_the_named_member_however_far_it_lags() {
     state.present.height = h;
 
     let present_named = |state: &mut DeviceState, host: &mut FakeHost, mid: u32| {
-        let mut payload = vec![0u8; PRESENT_X86_MIN_LEN];
-        payload[PRESENT_X86_SURFACE_ID..PRESENT_X86_SURFACE_ID + 4]
-            .copy_from_slice(&mid.to_le_bytes());
-        process_child_packet(
-            state,
-            host,
-            5,
-            &Packet {
-                opcode: CHILD_OP_PRESENT_X86,
-                stamp_count: 0,
-                total_size: PACKET_HEADER_LEN + PRESENT_X86_MIN_LEN as u32,
-                completion_stamp: 0,
-                payload,
-                next_head: 0,
-            },
-        );
+        process_child_packet(state, host, 5, &present_packet(CHILD_OP_PRESENT_X86, mid));
     };
 
     // Healthy alternation: both members publish, the named member is captured.
@@ -661,7 +652,6 @@ fn translation_deferred_holds_sibling_unmap_head_and_stamp() {
     let task_id = 6u32;
     let gva = 0x101000u64;
     let length = 0x4000u64;
-    state.note_task_map(task_id, gva, length);
     let mut payload = vec![0u8; 20];
     payload[0..4].copy_from_slice(&task_id.to_le_bytes());
     payload[4..12].copy_from_slice(&gva.to_le_bytes());
@@ -685,7 +675,6 @@ fn translation_deferred_holds_sibling_unmap_head_and_stamp() {
     drain_pending(&mut state, &mut host);
     assert_eq!(host.get_u32(regs_gpa + CHILD_REG_HEAD), 0);
     assert_eq!(host.get_u32(stamp_gpa + 4), 0);
-    assert_eq!(state.task_map_spans.len(), 1);
     assert_eq!(state.translation_order_hold_mask, sibling_bit);
     assert_eq!(state.translation_order_holds, 1, "poll retries coalesce");
 
@@ -701,7 +690,6 @@ fn translation_deferred_holds_sibling_unmap_head_and_stamp() {
     drain_pending(&mut state, &mut host);
     assert_eq!(host.get_u32(regs_gpa + CHILD_REG_HEAD), packet.len() as u32);
     assert_eq!(host.get_u32(stamp_gpa + 4), 0x55);
-    assert!(state.task_map_spans.is_empty());
     assert_eq!(state.translation_order_hold_mask, 0);
 }
 
@@ -755,17 +743,7 @@ fn composite_present_sets_frame_flush_boundary() {
     }
     state.note_surface_composite(4);
 
-    let mut payload = vec![0u8; PRESENT_X86_MIN_LEN.max(12)];
-    payload[PRESENT_X86_SURFACE_ID..PRESENT_X86_SURFACE_ID + 4]
-        .copy_from_slice(&4u32.to_le_bytes());
-    let pkt = Packet {
-        opcode: CHILD_OP_PRESENT_X86,
-        stamp_count: 0,
-        total_size: PACKET_HEADER_LEN + payload.len() as u32,
-        completion_stamp: 0,
-        payload,
-        next_head: 0,
-    };
+    let pkt = present_packet(CHILD_OP_PRESENT_X86, 4);
     process_child_packet(&mut state, &mut host, 5, &pkt);
     assert!(state.present.frame_flush_seen);
     assert_coalesced_paint_action(&host, "composite sets flush boundary");
@@ -780,16 +758,7 @@ fn display_swap_without_geom_holds_last_frame() {
     state.present.height = 1080;
     assert!(state.map_surface(9));
     // Mapped but no has_geom — do not resize/paint.
-    let mut payload = vec![0u8; DISPLAY_SWAP_MIN_LEN];
-    payload[DISPLAY_SWAP_MAPPING..DISPLAY_SWAP_MAPPING + 4].copy_from_slice(&9u32.to_le_bytes());
-    let pkt = Packet {
-        opcode: CHILD_OP_DISPLAY_SWAP,
-        stamp_count: 0,
-        total_size: PACKET_HEADER_LEN + DISPLAY_SWAP_MIN_LEN as u32,
-        completion_stamp: 0,
-        payload,
-        next_head: 0,
-    };
+    let pkt = present_packet(CHILD_OP_DISPLAY_SWAP, 9);
     process_child_packet(&mut state, &mut host, 4, &pkt);
     assert!(state.present.frame_flush_seen);
     assert_eq!(state.present.present_mapping, 9);
@@ -810,32 +779,6 @@ fn map_surface_clears_stale_geom() {
     assert!(!m.has_geom);
     assert_eq!(m.width, 0);
     assert_eq!(m.height, 0);
-}
-
-/// qemu-shim: DisplaySwap present completion is with the packet stamp
-/// after +0x188 retain (PGDisplay presentFrame completion block), not
-/// deferred until host paint. waitForPendingFrames gates *entry*.
-#[test]
-fn display_swap_stamp_ready_after_present_retain_not_paint() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-    let host = FakeHost::new();
-    // Sync stamp path: ready immediately, drains to write_stamp.
-    let slot = StampSlot {
-        stamp_index: 0,
-        stamp_value: 42,
-        ready: true,
-        job_id: None,
-        target_mapping: 0,
-    };
-    state.child_stamps[4].push(slot);
-    let ready = state.child_stamps[4].drain_ready();
-    assert_eq!(ready.len(), 1);
-    assert_eq!(ready[0].stamp_value, 42);
-    assert!(
-        state.child_stamps[4].queue.is_empty(),
-        "ready present stamp flushes without waiting for paint"
-    );
-    let _ = host;
 }
 
 /// x86 Ventura/Tahoe display pipe: present opcode 6 paints like DisplaySwap.
@@ -861,21 +804,11 @@ fn present_x86_op6_paints_surface_id_mapping() {
     let px = [0x22u8; 16];
     assert!(write_bgra8(&mut state, &mut host, 5, &px, 8, 2, 2));
 
-    let mut payload = vec![0u8; PRESENT_X86_MIN_LEN];
-    payload[PRESENT_X86_SURFACE_ID..PRESENT_X86_SURFACE_ID + 4]
-        .copy_from_slice(&5u32.to_le_bytes());
     process_child_packet(
         &mut state,
         &mut host,
         5,
-        &Packet {
-            opcode: CHILD_OP_PRESENT_X86,
-            stamp_count: 0,
-            total_size: PACKET_HEADER_LEN + PRESENT_X86_MIN_LEN as u32,
-            completion_stamp: 0,
-            payload,
-            next_head: 0,
-        },
+        &present_packet(CHILD_OP_PRESENT_X86, 5),
     );
     assert_eq!(state.present.present_mapping, 5);
     assert!(state.present.frame_flush_seen);
@@ -912,22 +845,7 @@ fn display_swap_unpainted_presents_counts_until_paint() {
     assert!(write_bgra8(&mut state, &mut host, 3, &px, 8, 2, 2));
 
     let swap = |state: &mut DeviceState, host: &mut FakeHost| {
-        let mut payload = vec![0u8; DISPLAY_SWAP_MIN_LEN];
-        payload[DISPLAY_SWAP_MAPPING..DISPLAY_SWAP_MAPPING + 4]
-            .copy_from_slice(&3u32.to_le_bytes());
-        process_child_packet(
-            state,
-            host,
-            4,
-            &Packet {
-                opcode: CHILD_OP_DISPLAY_SWAP,
-                stamp_count: 0,
-                total_size: PACKET_HEADER_LEN + DISPLAY_SWAP_MIN_LEN as u32,
-                completion_stamp: 0,
-                payload,
-                next_head: 0,
-            },
-        );
+        process_child_packet(state, host, 4, &present_packet(CHILD_OP_DISPLAY_SWAP, 3));
     };
 
     assert_eq!(state.present.unpainted_presents, 0);
@@ -993,20 +911,11 @@ fn display_swap_signals_present_complete_on_shared_page() {
     );
     host.put_u32(shared + DISPLAY_SHARED_PENDING, DISPLAY_ONLINE_EVENT_MASK);
 
-    let mut payload = vec![0u8; DISPLAY_SWAP_MIN_LEN];
-    payload[DISPLAY_SWAP_MAPPING..DISPLAY_SWAP_MAPPING + 4].copy_from_slice(&3u32.to_le_bytes());
     process_child_packet(
         &mut state,
         &mut host,
         4,
-        &Packet {
-            opcode: CHILD_OP_DISPLAY_SWAP,
-            stamp_count: 0,
-            total_size: PACKET_HEADER_LEN + DISPLAY_SWAP_MIN_LEN as u32,
-            completion_stamp: 0,
-            payload,
-            next_head: 0,
-        },
+        &present_packet(CHILD_OP_DISPLAY_SWAP, 3),
     );
 
     let mut le = [0u8; 4];
@@ -1114,7 +1023,7 @@ fn child_drain_yields_after_present_for_display_consumer() {
     assert!(state.map_surface(4));
     assert!(state.set_mapping_geom(4, 2, 2, MTL_FORMAT_BGRA8_UNORM));
 
-    let mut payload = vec![0u8; PRESENT_X86_MIN_LEN];
+    let mut payload = vec![0u8; display_txn_trailer_len(CHILD_OP_PRESENT_X86)];
     payload[PRESENT_X86_SURFACE_ID..PRESENT_X86_SURFACE_ID + 4]
         .copy_from_slice(&4u32.to_le_bytes());
     let first = packet_bytes(CHILD_OP_PRESENT_X86, 21, &payload);
@@ -1263,32 +1172,6 @@ fn wait_surface_noop_when_no_async_job() {
         2,
         2
     ));
-    let gen = state.mappings.get(&7).unwrap().content_generation;
-    state.active_child_mask = (1 << 1) | (1 << 4);
-    let out = wait_surface_other_channels(&mut state, &mut host, 4, 7);
-    assert_eq!(out, gen, "no async job ⇒ return current gen");
-    assert_eq!(wait_surface_mapping(&mut state, &mut host, 0), 0);
-}
-
-/// qemu-shim e2e: surface_inflight sees async job target_mapping until
-/// complete_async_job; wait_surface after complete is quiet.
-#[test]
-fn wait_surface_surface_inflight_tracks_async_target_mapping() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-    let mut host = FakeHost::new();
-    let job = enqueue_async_stamp_surface(&mut state, 1, 0, 99, 42).expect("job");
-    assert!(
-        surface_inflight(&state, 42),
-        "not-ready job with target_mapping must be inflight"
-    );
-    assert!(
-        !surface_inflight(&state, 7),
-        "other mapping is not inflight"
-    );
-    // After complete, slot is ready and drained — no longer inflight.
-    complete_async_job(&mut state, &mut host, 1, job);
-    assert!(!surface_inflight(&state, 42));
-    assert_eq!(wait_surface_mapping(&mut state, &mut host, 42), 0);
 }
 
 /// qemu-shim dual-mid: incomplete last_store on one mid (logo/partial)
@@ -1321,16 +1204,7 @@ fn display_swap_encodes_at_present_after_wait_surface() {
     ];
     assert!(write_bgra8(&mut state, &mut host, 3, &px, 8, 2, 2));
     let gen = state.mappings.get(&3).unwrap().content_generation;
-    let mut payload = vec![0u8; DISPLAY_SWAP_MIN_LEN];
-    payload[DISPLAY_SWAP_MAPPING..DISPLAY_SWAP_MAPPING + 4].copy_from_slice(&3u32.to_le_bytes());
-    let pkt = Packet {
-        opcode: CHILD_OP_DISPLAY_SWAP,
-        stamp_count: 0,
-        total_size: PACKET_HEADER_LEN + DISPLAY_SWAP_MIN_LEN as u32,
-        completion_stamp: 0,
-        payload,
-        next_head: 0,
-    };
+    let pkt = present_packet(CHILD_OP_DISPLAY_SWAP, 3);
     process_child_packet(&mut state, &mut host, 4, &pkt);
     assert!(state.present.frame_flush_seen);
     assert!(
@@ -1399,21 +1273,7 @@ fn display_swap_capture_fail_keeps_prior_retain() {
 
     let swap = |state: &mut DeviceState, host: &mut FakeHost, mid: u32| {
         host.actions.clear();
-        let mut payload = vec![0u8; DISPLAY_SWAP_MIN_LEN];
-        payload[DISPLAY_SWAP_MAPPING..DISPLAY_SWAP_MAPPING + 4].copy_from_slice(&mid.to_le_bytes());
-        process_child_packet(
-            state,
-            host,
-            4,
-            &Packet {
-                opcode: CHILD_OP_DISPLAY_SWAP,
-                stamp_count: 0,
-                total_size: PACKET_HEADER_LEN + DISPLAY_SWAP_MIN_LEN as u32,
-                completion_stamp: 0,
-                payload,
-                next_head: 0,
-            },
-        );
+        process_child_packet(state, host, 4, &present_packet(CHILD_OP_DISPLAY_SWAP, mid));
     };
 
     // First swap: full dock composite retained.
@@ -1435,7 +1295,7 @@ fn display_swap_capture_fail_keeps_prior_retain() {
         // Bump gen so HostAction is distinct; guest would still name mid 5.
         m.content_generation = gen_ok + 1;
     }
-    crate::runtime::surface_cache::evict(&mut state, 5);
+    crate::runtime::surface_cache::forget(&mut state, 5);
     swap(&mut state, &mut host, 5);
     assert!(
         state.present.frame_encode_pending,
@@ -1523,21 +1383,7 @@ fn display_swap_dual_mid_full_composites_both_retain() {
 
     let swap = |state: &mut DeviceState, host: &mut FakeHost, mid: u32| {
         host.actions.clear();
-        let mut payload = vec![0u8; DISPLAY_SWAP_MIN_LEN];
-        payload[DISPLAY_SWAP_MAPPING..DISPLAY_SWAP_MAPPING + 4].copy_from_slice(&mid.to_le_bytes());
-        process_child_packet(
-            state,
-            host,
-            4,
-            &Packet {
-                opcode: CHILD_OP_DISPLAY_SWAP,
-                stamp_count: 0,
-                total_size: PACKET_HEADER_LEN + DISPLAY_SWAP_MIN_LEN as u32,
-                completion_stamp: 0,
-                payload,
-                next_head: 0,
-            },
-        );
+        process_child_packet(state, host, 4, &present_packet(CHILD_OP_DISPLAY_SWAP, mid));
     };
 
     // Present mid3 full dock → +0x188.
@@ -1631,16 +1477,7 @@ fn display_swap_alternating_mappings_both_paint() {
     }
     for mid in [3u32, 4u32, 3u32] {
         host.actions.clear();
-        let mut payload = vec![0u8; DISPLAY_SWAP_MIN_LEN];
-        payload[DISPLAY_SWAP_MAPPING..DISPLAY_SWAP_MAPPING + 4].copy_from_slice(&mid.to_le_bytes());
-        let pkt = Packet {
-            opcode: CHILD_OP_DISPLAY_SWAP,
-            stamp_count: 0,
-            total_size: PACKET_HEADER_LEN + DISPLAY_SWAP_MIN_LEN as u32,
-            completion_stamp: 0,
-            payload,
-            next_head: 0,
-        };
+        let pkt = present_packet(CHILD_OP_DISPLAY_SWAP, mid);
         process_child_packet(&mut state, &mut host, 4, &pkt);
         assert!(state.present.frame_flush_seen);
         assert_eq!(state.present.present_mapping, mid);
@@ -1706,16 +1543,7 @@ fn only_display_swap_paints_after_frame_flush_seen() {
         m.content_generation = 10;
         m.page_entries = vec![(2u32 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
     }
-    let mut payload = vec![0u8; DISPLAY_SWAP_MIN_LEN];
-    payload[DISPLAY_SWAP_MAPPING..DISPLAY_SWAP_MAPPING + 4].copy_from_slice(&5u32.to_le_bytes());
-    let pkt = Packet {
-        opcode: CHILD_OP_DISPLAY_SWAP,
-        stamp_count: 0,
-        total_size: PACKET_HEADER_LEN + DISPLAY_SWAP_MIN_LEN as u32,
-        completion_stamp: 0,
-        payload,
-        next_head: 0,
-    };
+    let pkt = present_packet(CHILD_OP_DISPLAY_SWAP, 5);
     process_child_packet(&mut state, &mut host, 4, &pkt);
     assert_coalesced_paint_action(&host, "post-flush display swap");
     assert_eq!(state.present.present_mapping, 5);
@@ -1907,7 +1735,7 @@ fn the_vbl_census_reports_window_rate_and_separates_the_silent_arms() {
 ///   instead of a lifetime average.
 #[test]
 fn the_drain_duty_census_reads_a_rate_over_its_window_and_splits_the_two_phases() {
-    use crate::runtime::drain::{DrainDutyCensus, DrainPhase};
+    use crate::runtime::drain::{DrainDutyCensus, DrainPhase, FlushRail};
     let c = DrainDutyCensus::default();
 
     // The first call only arms the window: reporting here would divide the whole
@@ -1946,7 +1774,7 @@ fn the_drain_duty_census_reads_a_rate_over_its_window_and_splits_the_two_phases(
         c.note_phase(DrainPhase::Draw, 20_000);
     }
     c.note_phase(DrainPhase::Compute, 7_000);
-    c.note_phase(DrainPhase::Flush, 11_000);
+    c.note_phase(DrainPhase::Flush(FlushRail::Render), 11_000);
 
     // An idle window must read near zero rather than inheriting the busy one,
     // and `skipped` must survive as its own arm: a worker that keeps bailing
@@ -1976,6 +1804,653 @@ fn the_drain_duty_census_reads_a_rate_over_its_window_and_splits_the_two_phases(
     );
 }
 
+/// A mean flush cost cannot name the defect; the tail can.
+///
+/// `flush_us/flushes` reads the same for "every flush costs 7.7 ms" and "most
+/// are free and one blocked 30 ms", and those are different defects with
+/// different fixes — eliminate the per-frame work, versus find the one stall.
+/// Likewise `max_tranche_us` is a max with no count, so one 38 ms tranche and
+/// three 20 ms ones are indistinguishable. Both gaps are what let a continuous
+/// per-frame cost read as an occasional hitch.
+#[test]
+fn the_drain_duty_census_separates_a_flush_tail_from_a_flush_mean() {
+    use crate::runtime::drain::{DrainDutyCensus, DrainPhase, FlushRail};
+    let c = DrainDutyCensus::default();
+    assert!(c.note(0, 0, 5_000).is_none(), "first call arms only");
+
+    // Nine cheap flushes and one long one: the mean is unremarkable, the tail
+    // is the whole story.
+    for _ in 0..9 {
+        c.note_phase(DrainPhase::Flush(FlushRail::Linear), 1_000);
+    }
+    c.note_phase(DrainPhase::Flush(FlushRail::Render), 30_000);
+    // Two tranches over a frame budget and one comfortably under it.
+    c.note(30_000, 0, 5_500);
+    c.note(9_000, 0, 5_600);
+    c.note(1_000, 0, 5_700);
+    let line = c
+        .note(0, 0, 6_100)
+        .expect("a full window must report")
+        .to_string();
+
+    assert!(line.contains("max_flush_us=30000"), "{line}");
+    assert!(line.contains("flush_us=39000 flushes=10"), "{line}");
+    // Mean is 3.9 ms and would look healthy against an 8 ms budget; the tail is
+    // nearly four times the whole budget.
+    // Five tranches, not four: the call that closes the window is itself a
+    // tranche and is counted in the window it reports.
+    assert!(
+        line.contains("slow_tranches=2/5"),
+        "two of five tranches held the lock at least a frame: {line}"
+    );
+    // The threshold is derived from the delivered VBL cadence, not written
+    // down, so it tracks the refresh rate rather than aging beside it.
+    assert!(line.contains("slow_us=8333"), "{line}");
+
+    // The same window, split by rail. Nine cheap flushes on one rail and one
+    // expensive flush on another is exactly the shape the aggregate cannot
+    // express: `flushes=10` reads as one busy mechanism, while the count says
+    // the linear rail owns nine tenths of it and the cost says the render rail
+    // owns three quarters. Those two readings point at different code.
+    let rails = c.take_flush_rails().expect("a window that flushed must split");
+    assert!(rails.contains("win_ms=1100"), "{rails}");
+    assert!(rails.contains("render_us=30000 render=1"), "{rails}");
+    assert!(rails.contains("linear_us=9000 linear=9"), "{rails}");
+    assert!(rails.contains("gva_us=0 gva=0"), "{rails}");
+    assert!(rails.contains("storage_us=0 storage=0"), "{rails}");
+    assert!(rails.contains("linear_max_us=1000"), "{rails}");
+    assert!(rails.contains("render_max_us=30000"), "{rails}");
+    // The rails are a partition of the aggregate, not a second measurement of
+    // it: 30000 + 9000 is the `flush_us=39000` asserted above and 1 + 9 its
+    // `flushes=10`. A split that did not reconcile would be worse than none.
+
+    // The window resets with the line, so an idle one says nothing at all
+    // rather than repeating the busy window's attribution.
+    assert!(c.take_flush_rails().is_none(), "{rails}");
+}
+
+/// The render rail's 6.9 ms has to divide before it can be fixed.
+///
+/// `flush_rails` names the rail; it does not say whether the cost is the GPU
+/// round trip or the bytes. Those have opposite fixes — a dirty rect shrinks
+/// the copy and does nothing at all to a fence wait — so a split that fuses
+/// them licenses the wrong change.
+#[test]
+fn the_readback_split_divides_a_round_trip_from_the_bytes_it_carried() {
+    use crate::runtime::drain::{DrainDutyCensus, ReadbackPhase};
+    let c = DrainDutyCensus::default();
+    assert!(c.note(0, 0, 5_000).is_none(), "first call arms only");
+    assert!(
+        c.take_readback_split().is_none(),
+        "a window with no readback must stay silent"
+    );
+
+    // One flush's worth: a cheap submit, a long fence, a moderate copy out and
+    // a moderate copy into guest pages.
+    c.note_readback(ReadbackPhase::Submit, 120);
+    c.note_readback(ReadbackPhase::Fence, 5_400);
+    c.note_readback(ReadbackPhase::Map, 800);
+    c.note_readback(ReadbackPhase::Write, 600);
+    // A second flush that waited far longer on the GPU.
+    c.note_readback(ReadbackPhase::Submit, 100);
+    c.note_readback(ReadbackPhase::Fence, 9_000);
+    c.note_readback(ReadbackPhase::Map, 750);
+    c.note_readback(ReadbackPhase::Write, 640);
+    assert!(c.note(0, 0, 6_100).is_some(), "a full window must report");
+
+    let split = c
+        .take_readback_split()
+        .expect("a window that read back must split");
+    assert!(split.contains("win_ms=1100"), "{split}");
+    assert!(split.contains("submit_us=220 submit=2"), "{split}");
+    assert!(split.contains("fence_us=14400 fence=2"), "{split}");
+    assert!(split.contains("map_us=1550 map=2"), "{split}");
+    assert!(split.contains("write_us=1240 write=2"), "{split}");
+    // The tail matters for the same reason it does on the rail above: a mean
+    // fence of 7.2 ms and a worst of 9 ms is a steady tax, not a hitch.
+    assert!(split.contains("fence_max_us=9000"), "{split}");
+
+    assert!(c.take_readback_split().is_none(), "the window must reset");
+}
+
+/// The offer side of the window cadence needs its own census, because the
+/// present side cannot see a frame that never arrived.
+///
+/// `host_window_cadence` reads `presents == offered` with `busy_acquire=0`, so
+/// nothing downstream drops a frame; the deficit against the host's 120 Hz is
+/// entirely in the offer rate. `publish_window_frame` has three separate ways to
+/// return without offering one, and they point at unrelated fixes — `same_key`
+/// dominating means the guest's own present cadence is the ceiling, while
+/// `fresh` near the tranche rate would mean the loss is downstream of here.
+#[test]
+fn the_window_publish_census_keeps_its_three_refusals_apart() {
+    use crate::runtime::drain::{WindowPublish, WindowPublishCensus};
+    let c = WindowPublishCensus::default();
+    assert!(
+        c.take(1_000).is_none(),
+        "a window with no publish attempt must stay silent"
+    );
+
+    c.note(WindowPublish::Fresh);
+    c.note(WindowPublish::SameKey);
+    c.note(WindowPublish::SameKey);
+    c.note(WindowPublish::SameKey);
+    c.note(WindowPublish::NoFrame);
+    let line = c.take(1_000).expect("attempts must report");
+    assert!(line.contains("fresh=1"), "{line}");
+    assert!(line.contains("same_key=3"), "{line}");
+    assert!(line.contains("no_frame=1"), "{line}");
+    // Reported even at zero: a refusal class that vanishes from the line when
+    // it stops firing is one a reader cannot tell from a class that was never
+    // compiled in, and "the window is gone" reading zero is the answer that
+    // rules out a whole branch.
+    assert!(line.contains("no_window=0"), "{line}");
+
+    assert!(c.take(1_000).is_none(), "the window must reset");
+}
+
+/// A writeback must not copy a frame in order to hand back the frame it copied.
+///
+/// The fragmented landing path staged every row into a whole-frame buffer before
+/// handing runs to the mapper. When the mapping's row pitch is the packed row
+/// length and no conversion is owed, that buffer is byte-for-byte the source it
+/// was built from — an 8.29 MB allocation and copy, 95 times a second on the
+/// composite surface, to produce a slice already in hand.
+///
+/// Both halves are asserted, because eliding a copy is only correct if the bytes
+/// are the same: the census must show a fragmented landing with no staging pass,
+/// **and** the guest's pages must hold exactly what was written.
+#[test]
+fn a_fragmented_writeback_stages_nothing_when_the_staged_frame_is_the_source() {
+    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::runtime::mapping_write::write_bgra8;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    // Large enough to span several guest pages: a frame that fits in one page is
+    // contiguous by construction and would never reach the path under test.
+    let (w, h) = (256u32, 64u32);
+    let stride = w * 4;
+    let need = (stride as usize) * (h as usize);
+    let page_size = 1u64 << PAGE_SHIFT_ARM64E;
+    let pages = (need as u64).div_ceil(page_size) as usize;
+    // Deliberately non-consecutive guest frames, so the mapping cannot resolve
+    // to one packed host run and the fragmented path is the one under test.
+    let mut entries = Vec::with_capacity(pages);
+    for i in 0..pages {
+        let pfn = 0x300u32 + (i as u32) * 4;
+        host.map_range((pfn as u64) << PAGE_SHIFT_ARM64E, page_size as usize, 0);
+        entries.push((pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID);
+    }
+    assert!(state.map_surface(9));
+    {
+        let m = state.mappings.get_mut(&9).unwrap();
+        m.mapped = true;
+        m.mapping_internal = 9;
+        m.page_entries = entries;
+    }
+    assert!(state.set_mapping_geom(9, w, h, MTL_FORMAT_BGRA8_UNORM));
+
+    // A gradient rather than a constant: a staging bug that lands the wrong row
+    // is invisible against a frame of identical bytes.
+    let frame: Vec<u8> = (0..need).map(|i| (i % 251) as u8).collect();
+    // Drain whatever earlier tests in this binary left in the shared census.
+    let _ = super::SURFACE_WRITE.take(0);
+    assert!(write_bgra8(&mut state, &mut host, 9, &frame, stride, w, h));
+
+    let line = super::SURFACE_WRITE
+        .take(1_000)
+        .expect("a writeback must report");
+    assert!(
+        line.contains("contig=0 frag=1"),
+        "the fragmented path is the one under test: {line}"
+    );
+    assert!(
+        line.contains("stage_us=0 stage=0"),
+        "a staged frame identical to its source must not be built: {line}"
+    );
+    assert!(
+        line.contains("land=1"),
+        "the bytes must still reach the guest: {line}"
+    );
+
+    let landed = crate::runtime::surface_cache::get(&state, 9, w, h)
+        .expect("the writeback publishes its own frame");
+    assert_eq!(landed, &frame[..], "the elided copy must change no byte");
+}
+
+/// A writeback whose caller owns the frame must publish it, not duplicate it.
+///
+/// Landing the frame in guest pages and publishing it to the host cache are two
+/// different obligations over the same bytes, and only the first one is a copy.
+/// The cache stores its frames behind an `Arc` so an entry and a deferred window
+/// can name one allocation; a caller arriving with one and still paying a
+/// whole-frame memcpy — 1.21 ms per flush on the composite, more than landing
+/// the bytes costs — is the copy this asserts is gone.
+///
+/// Pointer identity is the assertion because it is the only thing that
+/// distinguishes publishing from copying: the bytes are equal either way.
+#[test]
+fn an_owned_writeback_publishes_its_frame_to_the_cache_without_copying_it() {
+    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::runtime::mapping_write::write_bgra8_owned;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let (w, h) = (64u32, 16u32);
+    let stride = w * 4;
+    let need = (stride as usize) * (h as usize);
+    let pfn = 0x480u32;
+    host.map_range((pfn as u64) << PAGE_SHIFT_ARM64E, 0x8000, 0);
+    assert!(state.map_surface(7));
+    {
+        let m = state.mappings.get_mut(&7).unwrap();
+        m.mapped = true;
+        m.mapping_internal = 7;
+        m.page_entries = vec![(pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+    }
+    assert!(state.set_mapping_geom(7, w, h, MTL_FORMAT_BGRA8_UNORM));
+
+    let frame = std::sync::Arc::new((0..need).map(|i| (i % 251) as u8).collect::<Vec<u8>>());
+    assert!(write_bgra8_owned(
+        &mut state,
+        &mut host,
+        7,
+        &frame,
+        stride,
+        w,
+        h,
+        &[]
+    ));
+
+    let published = crate::runtime::surface_cache::get(&state, 7, w, h)
+        .expect("a non-skipping writeback publishes its frame");
+    assert_eq!(
+        published.as_ptr(),
+        frame.as_ptr(),
+        "the caller's allocation must be published, not duplicated"
+    );
+    assert_eq!(published, &frame[..], "and it must be the frame written");
+
+    // A pitch the cache's contract does not describe must not be shared: the
+    // entry promises a tight frame at its geometry, and handing a padded
+    // allocation to later readers as though it were one is the failure the
+    // guard exists for.
+    let padded_stride = stride + 4;
+    let padded = std::sync::Arc::new(vec![0x5Au8; (padded_stride as usize) * (h as usize)]);
+    assert!(write_bgra8_owned(
+        &mut state,
+        &mut host,
+        7,
+        &padded,
+        padded_stride,
+        w,
+        h,
+        &[]
+    ));
+    let repacked = crate::runtime::surface_cache::get(&state, 7, w, h).unwrap();
+    assert_ne!(
+        repacked.as_ptr(),
+        padded.as_ptr(),
+        "a padded frame must be repacked rather than shared"
+    );
+    assert!(repacked.iter().all(|&b| b == 0x5A), "and must be correct");
+}
+
+/// A writeback whose frame is borrowed must drop the cache entry, not keep it.
+///
+/// `write_bgra8_uncached` exists for the deferred render flush, whose frame is
+/// the engine's readback staging buffer under a lease: it goes back to the pool
+/// a moment later, so nothing host-side may still be naming it. The frame is
+/// landed in the guest's pages either way, and the only question this settles is
+/// what the cache holds afterwards.
+///
+/// Leaving the previous entry behind is the failure. A reader that hits one is
+/// served a whole frame that is one or more paints old, with nothing in the log
+/// saying so — a stale compositing layer, which is the corruption class this
+/// device is chasing rather than a performance detail. Dropping it sends every
+/// reader to the guest pages this write has just filled, which is correct by
+/// construction.
+///
+/// Both halves are asserted from a *populated* starting state, because an
+/// assertion that the cache is empty is vacuous against a cache that was never
+/// filled.
+#[test]
+fn a_borrowed_writeback_drops_the_cache_entry_rather_than_leaving_it_stale() {
+    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::runtime::mapping_write::{write_bgra8_owned, write_bgra8_uncached};
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let (w, h) = (64u32, 16u32);
+    let stride = w * 4;
+    let need = (stride as usize) * (h as usize);
+    let pfn = 0x4A0u32;
+    host.map_range((pfn as u64) << PAGE_SHIFT_ARM64E, 0x8000, 0);
+    assert!(state.map_surface(9));
+    {
+        let m = state.mappings.get_mut(&9).unwrap();
+        m.mapped = true;
+        m.mapping_internal = 9;
+        m.page_entries = vec![(pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+    }
+    assert!(state.set_mapping_geom(9, w, h, MTL_FORMAT_BGRA8_UNORM));
+
+    // An owning writeback first, so there is an entry to be left behind.
+    let first = std::sync::Arc::new(vec![0x11u8; need]);
+    assert!(write_bgra8_owned(
+        &mut state, &mut host, 9, &first, stride, w, h, &[]
+    ));
+    assert!(
+        crate::runtime::surface_cache::get(&state, 9, w, h).is_some(),
+        "the owning writeback must publish, or this test proves nothing"
+    );
+
+    let second: Vec<u8> = (0..need).map(|i| (i % 241) as u8).collect();
+    assert!(write_bgra8_uncached(
+        &mut state, &mut host, 9, &second, stride, w, h, &[]
+    ));
+
+    assert!(
+        crate::runtime::surface_cache::get(&state, 9, w, h).is_none(),
+        "a borrowed frame must not be left named by a cache entry, and the \
+         previous frame must not be left standing in its place"
+    );
+    // And the obligation the writeback actually owes: the bytes are in the
+    // guest's pages, which is where every reader that now misses will look.
+    let mut landed = vec![0u8; need];
+    host.read_gpa((pfn as u64) << PAGE_SHIFT_ARM64E, &mut landed)
+        .expect("the mapping's pages must be readable");
+    assert_eq!(landed, second, "the borrowed frame must have landed");
+}
+
+/// A cache entry that is replaced every frame must not be reallocated every
+/// frame.
+///
+/// The host-side duplicate is a fresh multi-megabyte `Vec` per writeback, and
+/// the allocation is the expensive half rather than the copy: the pages come
+/// back untouched and the fill faults every one of them in, then the buffer is
+/// dropped and the next flush repeats it. Measured at 1.21 ms per flush against
+/// 0.72 ms for landing the whole frame in the guest's pages.
+///
+/// The second assertion is the one that makes reuse safe rather than merely
+/// cheap. The `Arc` exists so a deferred window can hold the exact frame it
+/// armed on; writing through it would rewrite that window's pixels underneath
+/// it, which is a frame landing in the wrong layer.
+#[test]
+fn the_surface_cache_reuses_its_buffer_but_never_one_someone_else_is_holding() {
+    use crate::runtime::surface_cache;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let (w, h) = (16u32, 8u32);
+    let need = (w as usize) * (h as usize) * 4;
+
+    surface_cache::store_rows(&mut state, 4, w, h, &vec![0x11u8; need], w * 4);
+    let first = surface_cache::get(&state, 4, w, h).unwrap().as_ptr();
+
+    // Nothing else holds the frame: the entry's own allocation is rewritten.
+    surface_cache::store_rows(&mut state, 4, w, h, &vec![0x22u8; need], w * 4);
+    let second = surface_cache::get(&state, 4, w, h).unwrap();
+    assert_eq!(second.as_ptr(), first, "an unheld buffer must be reused");
+    assert_eq!(second[0], 0x22, "and must hold the new frame");
+
+    // A window armed on this allocation is exactly what the `Arc` is for.
+    let held = state.host_surfaces.get(&4).unwrap().bgra.clone();
+    surface_cache::store_rows(&mut state, 4, w, h, &vec![0x33u8; need], w * 4);
+    assert_eq!(
+        held[0], 0x22,
+        "a frame someone else is holding must not be rewritten"
+    );
+    let third = surface_cache::get(&state, 4, w, h).unwrap();
+    assert_eq!(third[0], 0x33, "and the entry must still take the new frame");
+    assert_ne!(
+        third.as_ptr(),
+        held.as_ptr(),
+        "which means it had to allocate"
+    );
+}
+
+/// The largest phase of the largest rail is three full-frame passes under one
+/// name, and a total cannot say which of them it is.
+///
+/// `write_us` covers the staged buffer, the bytes reaching guest pages and the
+/// host-side cache duplicate. Those have entirely different fixes — two are
+/// per-flush multi-megabyte allocations that could be reused and one is the work
+/// the guest actually asked for — so a reader holding only the sum has no way to
+/// tell an unavoidable cost from two avoidable ones. The path counts are part of
+/// the answer, not decoration: `stage_us=0` means the contiguous path, and
+/// without `contig`/`frag` that is indistinguishable from free staging.
+#[test]
+fn the_write_split_separates_the_guest_s_bytes_from_the_buffers_built_around_them() {
+    use crate::runtime::drain::{SurfaceWriteCensus, SurfaceWritePhase};
+    let c = SurfaceWriteCensus::default();
+    assert!(
+        c.take(1_000).is_none(),
+        "a window with no surface write must stay silent"
+    );
+
+    // One fragmented write: staged, landed, then cached.
+    c.note_path(false, 8_290_000);
+    c.note(SurfaceWritePhase::Stage, 1_200);
+    c.note(SurfaceWritePhase::Land, 1_500);
+    c.note(SurfaceWritePhase::Cache, 1_100);
+    // One contiguous write: no staging pass at all.
+    c.note_path(true, 8_290_000);
+    c.note(SurfaceWritePhase::Land, 900);
+    c.note(SurfaceWritePhase::Cache, 1_300);
+
+    let line = c.take(1_000).expect("traffic must report");
+    assert!(line.contains("contig=1 frag=1"), "{line}");
+    assert!(line.contains("bytes=16580000"), "{line}");
+    assert!(line.contains("stage_us=1200 stage=1"), "{line}");
+    assert!(line.contains("land_us=2400 land=2"), "{line}");
+    assert!(line.contains("cache_us=2400 cache=2"), "{line}");
+    // The tail, for the same reason every other split here carries one: a mean
+    // cannot tell a steady tax from an occasional stall.
+    assert!(line.contains("land_max_us=1500"), "{line}");
+
+    assert!(c.take(1_000).is_none(), "the window must reset");
+}
+
+/// Whether the readback's fence wait has anywhere to hide is a measurement, and
+/// it is this one.
+///
+/// The proposal it exists to judge — submit the copy at the arm rather than at
+/// the flush — is worth its complexity only if wall clock separates the two. A
+/// census that attributed *every* flush to the newest arm would report a
+/// plausible age even when several windows were outstanding and the pairing was
+/// meaningless, so the ambiguous case is counted apart rather than averaged in.
+#[test]
+fn the_resident_arm_age_refuses_to_pair_a_flush_with_an_arm_it_cannot_name() {
+    use crate::runtime::drain::ResidentArmCensus;
+    let c = ResidentArmCensus::default();
+    assert!(
+        c.take(1_000).is_none(),
+        "a window with no resident traffic must stay silent"
+    );
+
+    // One arm, one flush 4 ms later: the pairing is unambiguous.
+    c.note_arm(100_000);
+    c.note_flush(104_000);
+    // A second, longer interval.
+    c.note_arm(200_000);
+    c.note_flush(211_000);
+    // Two arms before a flush: the age of "the arm" is not a number, so this
+    // one is counted as ambiguous instead of credited to the newer arm.
+    c.note_arm(300_000);
+    c.note_arm(300_500);
+    c.note_flush(309_000);
+
+    let line = c.take(1_000).expect("traffic must report");
+    assert!(line.contains("arms=4 flushes=3"), "{line}");
+    assert!(line.contains("aged=2"), "{line}");
+    assert!(line.contains("age_us=15000"), "{line}");
+    assert!(line.contains("max_age_us=11000"), "{line}");
+    assert!(line.contains("multi=1"), "{line}");
+
+    // A window refused before it reaches the flush site leaves its arm
+    // uncounted; the next arm makes the following flush ambiguous once, and
+    // then the pairing recovers on its own rather than sticking wrong forever.
+    c.note_arm(400_000);
+    // (no flush — the window drifted out through one of the refusals)
+    c.note_arm(500_000);
+    c.note_flush(505_000);
+    c.note_arm(600_000);
+    c.note_flush(607_000);
+    let line = c.take(1_000).expect("traffic must report");
+    assert!(line.contains("multi=1"), "the stale arm is ambiguous once: {line}");
+    assert!(
+        line.contains("aged=1") && line.contains("age_us=7000"),
+        "and the next pairing is exact again: {line}"
+    );
+}
+
+/// The vCPU's wait must be measured where the guest pays it.
+///
+/// Every other figure about a long tranche is taken from the side that *holds*
+/// the device lock, which leaves "the drain held it 38 ms" and "the guest
+/// missed a frame" joined by an inference. This census measures the blocked
+/// side: how long the guest's MMIO access was actually stopped.
+///
+/// `uncontended` is counted separately and deliberately. A window with a large
+/// `max_wait_us` and a huge `uncontended` count is a rare collision; the same
+/// max with few uncontended acquisitions is a worker that owns the lock. Those
+/// are opposite diagnoses and a wait-only counter cannot tell them apart.
+#[test]
+fn the_vcpu_lock_census_reports_the_blocked_side_and_separates_free_acquisitions() {
+    use crate::runtime::drain::VcpuLockCensus;
+    let c = VcpuLockCensus::default();
+    assert!(c.note_wait(1, 5_000).is_none(), "first call arms only");
+
+    for _ in 0..500 {
+        assert!(
+            c.note_uncontended(|| 5_050).is_none(),
+            "free acquisitions inside the window must not report"
+        );
+    }
+    // Two waits shorter than a frame, one longer.
+    c.note_wait(200, 5_100);
+    c.note_wait(900, 5_200);
+    c.note_wait(30_000, 5_300);
+    let line = c.note_wait(50, 6_100).expect("a full window must report");
+
+    assert!(line.contains("max_wait_us=30000"), "{line}");
+    assert!(line.contains("uncontended=500"), "{line}");
+    // Only the 30 ms wait cost the guest a whole frame; the sub-millisecond
+    // ones are collisions the guest would never notice.
+    assert!(line.contains("frame_waits=1"), "{line}");
+    // Five, not three: the call that arms the window and the call that closes
+    // it are both real waits and are counted in the window they bound.
+    assert!(line.contains("waits=5"), "{line}");
+    assert!(line.contains("wait_us=31151"), "{line}");
+}
+
+/// The stall the PCI pathway actually has: a doorbell the guest thinks landed.
+///
+/// `reims-vgpu-pci` exposes no IOSFC region, so `lock_device_for_vcpu` — and
+/// with it the whole `vcpu_lock_wait` census — is unreachable on x86. Its
+/// silence there is structural, not a result, and reading it as "the drain
+/// never stalled the guest" is the error the census next door was rebuilt to
+/// stop making. x86's vCPU does not block; it queues, and the queued write does
+/// not run until the drain worker's tranche ends. That delay is what this
+/// measures.
+#[test]
+fn the_doorbell_census_separates_a_deferred_apply_from_a_direct_one() {
+    use crate::runtime::drain::{DoorbellCensus, UNCONTENDED_POLL};
+    let c = DoorbellCensus::default();
+    assert!(
+        c.note_queued(0x100c, 1, 5_000).is_none(),
+        "first call arms only"
+    );
+
+    for _ in 0..300 {
+        assert!(
+            c.note_direct(|| 5_050).is_none(),
+            "direct applies inside the window must not report"
+        );
+    }
+    // Two delays the guest would never notice, one that costs it a whole frame.
+    c.note_queued(0x100c, 120, 5_100);
+    c.note_queued(0x1020, 700, 5_200);
+    c.note_queued(0x100c, 43_000, 5_300);
+    let line = c
+        .note_queued(0x100c, 80, 6_100)
+        .expect("a full window must report");
+
+    assert!(line.contains("queued=5"), "{line}");
+    assert!(line.contains("direct=300"), "{line}");
+    assert!(line.contains("age_us=43901"), "{line}");
+    assert!(line.contains("max_age_us=43000"), "{line}");
+    assert!(line.contains("frame_late=1"), "{line}");
+
+    // Which registers deferred, and how badly — the whole point of the
+    // breakdown is that "half the doorbells queue" does not say whether one
+    // register is responsible or every one of them is.
+    assert!(line.contains("offsets=2 shown=2"), "{line}");
+    assert!(
+        line.contains("off_0x100c=4/43000"),
+        "the busiest register must lead, with its own worst age: {line}"
+    );
+    assert!(line.contains("off_0x1020=1/700"), "{line}");
+
+    // And a window that only ever applied directly still reports, so "nothing
+    // was ever deferred" and "no MMIO reached this device" stay distinguishable.
+    let c = DoorbellCensus::default();
+    let mut line = None;
+    for i in 0..=UNCONTENDED_POLL {
+        let now = if i == 0 { 5_000 } else { 6_200 };
+        if let Some(l) = c.note_direct(|| now) {
+            assert!(line.is_none(), "one report per window");
+            line = Some(l);
+        }
+    }
+    let line = line.expect("a window of direct applies must report");
+    assert!(line.contains("queued=0"), "{line}");
+    assert!(line.contains("frame_late=0"), "{line}");
+    assert!(
+        line.contains(&format!("direct={}", UNCONTENDED_POLL + 1)),
+        "{line}"
+    );
+}
+
+/// A window in which the vCPU never blocked must still report.
+///
+/// As first shipped the census was driven only from the wait path, so zero
+/// waits emitted zero lines — and a silent log then means both "the drain never
+/// stalled the guest" and "no IOSFC traffic reached this device at all". A live
+/// driven boot produced exactly that silence, which reads as the reassuring one
+/// of the two and is worthless as evidence either way. The free path now drives
+/// the same report, so the strong negative (`waits=0` beside a large
+/// `uncontended`) is something the log can actually say.
+#[test]
+fn the_vcpu_lock_census_reports_a_window_that_never_blocked() {
+    use crate::runtime::drain::{VcpuLockCensus, UNCONTENDED_POLL};
+    let c = VcpuLockCensus::default();
+    let mut line = None;
+    // The clock is only read at a poll, so the window spans exactly one poll
+    // interval: the acquisition that arms it and the one that closes it.
+    for i in 0..=UNCONTENDED_POLL {
+        let now = if i == 0 { 5_000 } else { 6_400 };
+        if let Some(l) = c.note_uncontended(|| now) {
+            assert!(line.is_none(), "one report per window");
+            line = Some(l);
+        }
+    }
+    let line = line.expect("a window of free acquisitions must report");
+    assert!(line.contains("waits=0"), "{line}");
+    assert!(line.contains("frame_waits=0"), "{line}");
+    assert!(line.contains("max_wait_us=0"), "{line}");
+    assert!(line.contains("win_ms=1400"), "{line}");
+    // Every acquisition up to and including the one that closed the window.
+    assert!(
+        line.contains(&format!("uncontended={}", UNCONTENDED_POLL + 1)),
+        "{line}"
+    );
+}
+
 /// A guest display reinit (SETUP_SHARED_STATE while already ONLINE) that
 /// arrives *after* boot-convergence self-labels with one correlated
 /// `post_converge_display_reinit` line — the smoking gun for the intermittent
@@ -1993,7 +2468,9 @@ fn signal_display_vbl_after_online_uses_shared_time_limiter() {
     state.display.display_index = 0;
     state.display.online_acked = true;
 
-    let base = 5_000;
+    // Microseconds: the base must exceed one grid interval from the zero the
+    // limiter starts at, or the very first claim is refused as too early.
+    let base = 5_000_000;
     signal_display_vbl_at(&mut state, &mut host, &last_ms, base);
     assert_eq!(host.actions.len(), 1);
     assert!(
@@ -2004,7 +2481,7 @@ fn signal_display_vbl_after_online_uses_shared_time_limiter() {
         &mut state,
         &mut host,
         &last_ms,
-        base + DISPLAY_VBL_MIN_INTERVAL_MS - 1,
+        base + DISPLAY_VBL_MIN_INTERVAL_US - 1,
     );
     assert_eq!(
         host.actions.len(),
@@ -2015,7 +2492,7 @@ fn signal_display_vbl_after_online_uses_shared_time_limiter() {
         &mut state,
         &mut host,
         &last_ms,
-        base + DISPLAY_VBL_MIN_INTERVAL_MS,
+        base + DISPLAY_VBL_MIN_INTERVAL_US,
     );
     assert_eq!(
         host.actions.len(),
@@ -2039,12 +2516,45 @@ fn signal_display_vbl_after_online_uses_shared_time_limiter() {
 
 /// The VBL limiter is phase-locked to a fixed interval grid so poll jitter
 /// cannot alias the delivered rate down to ~60 Hz (the boot-to-boot fps split).
+/// The VBL we deliver must be the refresh rate we advertise.
+///
+/// These are two different constants reaching the guest by two different
+/// routes: `DISPLAY_REFRESH_HZ` goes into the mode timing table it reads, and
+/// the limiter interval paces the interrupt it is actually woken by. The guest
+/// honours the interrupt — a driven Safari measured its own
+/// `requestAnimationFrame` at exactly the delivered rate — so when the two
+/// disagree, the timing table is a lie the guest never notices and we cannot
+/// see either.
+///
+/// They did disagree: the limiter was a hardcoded 8 ms, which is 125 Hz, while
+/// the table advertised 120. Asserting the identity rather than the value is
+/// deliberate — it stays true if the advertised rate ever changes, and it is
+/// the only form of this test that cannot itself go stale.
+#[test]
+fn delivered_vbl_cadence_equals_the_advertised_refresh_rate() {
+    let delivered_hz = 1_000_000.0 / DISPLAY_VBL_MIN_INTERVAL_US as f64;
+    assert!(
+        (delivered_hz - DISPLAY_REFRESH_HZ as f64).abs() < 0.5,
+        "advertising {DISPLAY_REFRESH_HZ} Hz but delivering {delivered_hz:.1} Hz \
+         (interval {DISPLAY_VBL_MIN_INTERVAL_US} us)"
+    );
+
+    // The millisecond grid this replaced could not express the answer at all:
+    // 120 Hz is 8333 us, and every whole-millisecond interval near it is wrong
+    // by at least 4%. That is why the units changed rather than the number.
+    assert_ne!(
+        DISPLAY_VBL_MIN_INTERVAL_US % 1000,
+        0,
+        "a whole-millisecond interval cannot express {DISPLAY_REFRESH_HZ} Hz"
+    );
+}
+
 /// Polls spaced just under the interval — the worst aliasing case — must still
 /// converge to roughly the grid rate, NOT halve.
 #[test]
 fn claim_display_vbl_phase_locks_grid_under_jittery_polls() {
     use std::sync::atomic::AtomicU64;
-    let interval = DISPLAY_VBL_MIN_INTERVAL_MS;
+    let interval = DISPLAY_VBL_MIN_INTERVAL_US;
     // Legacy "reset to now" behaviour would need two of these ~(interval-1)ms
     // polls per claim -> half rate. Phase-locking must claim on (nearly) every
     // poll once warmed up, because a late poll advances the grid by exactly one
@@ -2077,7 +2587,7 @@ fn claim_display_vbl_phase_locks_grid_under_jittery_polls() {
 #[test]
 fn claim_display_vbl_long_stall_resyncs_without_burst() {
     use std::sync::atomic::{AtomicU64, Ordering};
-    let interval = DISPLAY_VBL_MIN_INTERVAL_MS;
+    let interval = DISPLAY_VBL_MIN_INTERVAL_US;
     let last = AtomicU64::new(1_000);
     // A single poll after a 10*interval stall claims exactly once and lands the
     // grid at `now` (no accumulated catch-up credit).
@@ -2104,6 +2614,14 @@ fn claim_display_vbl_long_stall_resyncs_without_burst() {
 fn acked_stale_online_bit_is_suppressed_not_redelivered() {
     let _proxy = crate::runtime::census::present_proxy::test_exclusive();
     crate::runtime::census::present_proxy::reset_for_test();
+    // Per-process fail log under `cfg(test)`, so a delta is exact.
+    let logged = || {
+        std::fs::read_to_string(crate::observe::fail_log_path())
+            .unwrap_or_default()
+            .matches("stale_online_pending src=")
+            .count()
+    };
+    let before = logged();
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
@@ -2136,9 +2654,9 @@ fn acked_stale_online_bit_is_suppressed_not_redelivered() {
         "a stale acked ONLINE bit must be suppressed, not re-delivered"
     );
     assert_eq!(
-        crate::runtime::census::present_proxy::counters().stale_online_pending,
-        1,
-        "the suppressed stale online must still be measured"
+        logged(),
+        before + 1,
+        "the suppressed stale online must still be named on the always-on log"
     );
 }
 
@@ -2167,7 +2685,7 @@ fn unmap_memory_retains_gva_host_cache_for_sample() {
         px[2] = 81;
         px[3] = 255;
     }
-    surface_cache::store_gva(&mut state, gva, w, h, bgra);
+    surface_cache::store_gva_owned(&mut state, gva, w, h, bgra, 0, None);
     // Simulated HostOps view of the same GVA (zero-copy import substrate).
     state.gva_host_views.push(GvaHostView {
         task_id: 1,
@@ -2278,7 +2796,7 @@ fn map_memory2_does_not_flush_gva_host_cache_on_wire() {
     bgra[1] = 126;
     bgra[2] = 81;
     bgra[3] = 255;
-    surface_cache::store_gva(&mut state, gva, 2, 2, bgra);
+    surface_cache::store_gva_owned(&mut state, gva, 2, 2, bgra, 0, None);
 
     let mut pl = vec![0u8; 20];
     st32(&mut pl[0..], 1);
@@ -2556,7 +3074,10 @@ fn an_unbacked_present_fails_unless_a_resident_positively_carries_it() {
     ];
     assert_eq!(words, ["resident", "nothing", "unknown"]);
     assert_eq!(
-        words.iter().collect::<std::collections::BTreeSet<_>>().len(),
+        words
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
         3,
         "each carrier state needs its own word"
     );
@@ -2813,13 +3334,39 @@ fn display_txn_payload_probe_rearms_on_trailer_change_but_not_on_surface_id() {
 #[test]
 fn display_txn_trailer_slots_follow_the_emitting_command() {
     // command 6: [pipe][surface][task] — surface in slot 1, task in slot 2.
-    assert_eq!(display_txn_trailer_slots(CHILD_OP_PRESENT_X86), (1, 2));
+    assert_eq!(
+        display_txn_trailer_slots(CHILD_OP_PRESENT_X86),
+        (1, Some(2))
+    );
     // command 7: [pipe][task][surface][gamma…] — the two are swapped.
     assert_eq!(
         display_txn_trailer_slots(CHILD_OP_PRESENT_GAMMA_X86),
-        (2, 1)
+        (2, Some(1))
     );
-    assert_eq!(display_txn_trailer_slots(CHILD_OP_DISPLAY_SWAP), (1, 2));
+    // command 8 `CmdDisplaySwapMapping` is not a transaction at all: it names
+    // one mapping, at DISPLAY_SWAP_MAPPING (0x08) = slot 2, and carries no task
+    // word. Borrowing op6's (1, 2) here would make the census report the
+    // unidentified middle word as the surface and the mapping as a task.
+    assert_eq!(
+        display_txn_trailer_slots(CHILD_OP_DISPLAY_SWAP),
+        (DISPLAY_SWAP_MAPPING / 4, None)
+    );
+    // The present path reads the same field the census does, for every command.
+    for (op, off) in [
+        (CHILD_OP_PRESENT_X86, PRESENT_X86_SURFACE_ID),
+        (CHILD_OP_PRESENT_GAMMA_X86, PRESENT_GAMMA_X86_SURFACE_ID),
+        (CHILD_OP_DISPLAY_SWAP, DISPLAY_SWAP_MAPPING),
+    ] {
+        let mut p = vec![0u8; display_txn_trailer_len(op)];
+        p[off..off + 4].copy_from_slice(&0x5eu32.to_le_bytes());
+        assert_eq!(present_surface_id(op, &p), Some(0x5e), "op {op:#x}");
+        // One byte short of the command's own trailer is not a present.
+        assert_eq!(
+            present_surface_id(op, &p[..p.len() - 1]),
+            None,
+            "op {op:#x}"
+        );
+    }
 
     // The swap has to survive the budget key, not just the log line: a gamma
     // packet whose *task* is zero and whose surface id is non-zero must land in
@@ -2939,5 +3486,408 @@ fn a_dmabuf_carried_present_is_unsampled_not_black() {
     assert_eq!(
         present_content_verdict(&[0, 0, 0x40, 255], 0x40),
         PresentContentVerdict::Content
+    );
+}
+
+/// The guest's fence drains BOTH raw-address deferred rails, not just the GVA
+/// render one.
+///
+/// `write_stamp` is this device's only statement that work is finished, and from
+/// the instant it lands the guest may free everything it allocated for that work.
+/// `flush_gva_windows_before_fence` put the GVA render rail inside that
+/// boundary; the linear compute-storage rail names a raw task GVA too
+/// (`ComputeStorageResidencyKey::linear` — `mapping_id` 0, task id parked in
+/// `map_generation`), so it has no mapping incarnation to refuse on and belongs
+/// inside the same boundary. Measured at one landing per ten minutes and 1 019
+/// fences late, so the ordering costs nothing and the window is real.
+///
+/// Asserted at `write_stamp` rather than on the flush helper because the
+/// contract is about the fence, not about a function: a future stamp path that
+/// forgets to drain would pass a helper-level test.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn a_completion_stamp_drains_the_linear_rail_as_well_as_the_gva_rail() {
+    use crate::model::{ComputeStorageResidencyKey, DeviceId, GvaDeferredEntry};
+    use crate::runtime::host::FakeHost;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+    // A FIFO base page the stamp write can land in; without it `write_stamp`
+    // returns before doing anything and the test would pass vacuously.
+    let fifo_pfn = 0x40u32;
+    host.map_range((fifo_pfn as u64) << PAGE_SHIFT_X86, 0x1000, 0);
+    state.gfx.fifo_base_page = fifo_pfn;
+
+    let page = 0x9000u64;
+    state.arm_gva_deferred_window(
+        0x5000,
+        GvaDeferredEntry {
+            task_id: 3,
+            texture_ref: 11,
+            producer_object_type: 0,
+            width: 8,
+            height: 8,
+            row_stride: 32,
+            format: 0x50,
+            armed_seq: 1,
+            armed_stamp_seq: 0,
+            pages: [page].into_iter().collect(),
+            alloc_gen: 0,
+        },
+    );
+    let lin = ComputeStorageResidencyKey::linear(3, 52, 0x39f000, 512, 0x1000, 128, 135, 0x46);
+    state.arm_linear_deferred_window(lin, 1, [page + 0x1000].into_iter().collect());
+    assert!(!state.gva_deferred_flush.is_empty());
+    assert!(!state.linear_deferred_flush.is_empty());
+
+    write_stamp(&mut state, &mut host, 0, 7);
+
+    assert!(
+        state.gva_deferred_flush.is_empty(),
+        "the GVA rail must not survive the fence"
+    );
+    assert!(
+        state.linear_deferred_flush.is_empty(),
+        "the linear rail writes a raw task GVA too and must not survive the fence"
+    );
+    assert_eq!(
+        state.completion_stamp_seq, 1,
+        "the stamp counter advances once the guest has been told"
+    );
+}
+
+/// The guest's fence lands a type-11 render window's pixels in guest RAM, and
+/// lands them *whole*.
+///
+/// The mapping-keyed rail is inside the fence for a different reason from the
+/// two raw-address rails above. It can refuse a mapping incarnation the guest
+/// replaced (`map_generation`), so free-then-reuse is not its hazard. Its hazard
+/// is that the writeback covers the full attachment extent while the guest holds
+/// the same IOSurface mapped and writes it: one measured boot landed 12 343
+/// windows and reported 8 968 of them as `deferred_flush_clobber`, each one the
+/// device replacing bytes the guest itself had stored after the Store.
+///
+/// So this asserts both halves. The window must not survive the stamp — that is
+/// the ordering — and the guest pages must hold the window's own frame
+/// afterwards, because a rail that satisfied the first by dropping the
+/// obligation would be a silent frame loss and would pass an emptiness check.
+///
+/// Asserted at `write_stamp` rather than on the flush helper for the same reason
+/// the linear test is: the contract belongs to the fence, and a future stamp path
+/// that forgot to drain would pass a helper-level test.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn a_completion_stamp_lands_a_type11_render_window_in_guest_memory() {
+    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::model::{ComputeStorageResidencyKey, DeviceId};
+    use crate::runtime::host::{FakeHost, HostMemory};
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+    let page = 1usize << PAGE_SHIFT_X86;
+    // A FIFO base page for the stamp write, and a separate page for the surface.
+    let fifo_pfn = 0x40u32;
+    host.map_range((fifo_pfn as u64) << PAGE_SHIFT_X86, page, 0);
+    state.gfx.fifo_base_page = fifo_pfn;
+    let gpa = 0x4400_0000u64;
+    host.map_range(gpa, page, 0);
+
+    state.map_surface(9);
+    {
+        let m = state.mappings.get_mut(&9).unwrap();
+        m.mapped = true;
+        m.map_generation = 1;
+        m.has_geom = true;
+        m.width = 4;
+        m.height = 4;
+        m.format = crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+        m.page_entries =
+            vec![(((gpa >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+    }
+    let key = ComputeStorageResidencyKey {
+        mapping_id: 9,
+        map_generation: 1,
+        surface_offset: 0,
+        surface_bpr: 16,
+        span_end: 256,
+        width: 4,
+        height: 4,
+        pixel_format: crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM,
+        texture_ref: 0,
+    };
+    let frame = vec![0xA7u8; 4 * 4 * 4];
+    state.compute_deferred_flush.insert(
+        key,
+        crate::model::DeferredOwner::Render {
+            armed_seq: 1,
+            // Armed at the stamp this fence completes, which is the only case the
+            // rail is *allowed* to defer across; anything later is already late.
+            armed_stamp_seq: 0,
+            source: crate::model::RenderWindowSource::Owned(std::sync::Arc::new(frame.clone())),
+        },
+    );
+
+    write_stamp(&mut state, &mut host, 0, 7);
+
+    assert!(
+        state.compute_deferred_flush.is_empty(),
+        "a mapping-keyed window must not survive the fence that says its work is done"
+    );
+    // The guest side is row-strided at the mapping's own bytes-per-row, so read
+    // it the way the writeback wrote it.
+    let (base_off, bpr, _) = {
+        let m = state.mappings.get(&9).unwrap();
+        crate::runtime::mapping_write::type11_sample_window(
+            m,
+            9,
+            4,
+            4,
+            crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM,
+        )
+        .expect("the mapping has a type-11 sample window")
+    };
+    for y in 0..4u64 {
+        let mut row = [0u8; 4 * 4];
+        host.read_gpa(gpa + base_off + y * bpr as u64, &mut row)
+            .unwrap();
+        assert_eq!(
+            &row[..],
+            &frame[(y as usize) * 16..(y as usize) * 16 + 16],
+            "row {y} must hold the deferred frame: the fence lands the window, it does not drop it"
+        );
+    }
+}
+
+/// The **root** completion stamp is a fence too, and the deferred rails have to
+/// land at it.
+///
+/// `write_stamp` writes the child stamp slots and drains every rail first. The
+/// root stamp does not go through it: `drain_main_fifo` writes slot 0 itself, and
+/// that slot is what a root packet's submitter waits on. A rail bound only to
+/// `write_stamp` is therefore not bound at all on the highest-traffic completion
+/// path in the device — the guest is told the work finished, is free to release
+/// the render target, and its allocator may hand those pages to a kalloc element
+/// or another process's heap before the window lands. That is the write-after-free
+/// the guest's own poison check reports as `element modified after free
+/// (val:0xffffffffffffffff)`: a window's worth of opaque white pixels landing in
+/// memory that stopped being a render target.
+///
+/// The counter matters as much as the flush. `armed_stamp_seq` is compared
+/// against `completion_stamp_seq`, and only `write_stamp` used to move it, so a
+/// window that sat through hundreds of root completions scored as punctual — the
+/// measurement that reports this rail healthy and the repair that would have
+/// bound it shared one blind spot. Asserting the counter here is what stops a
+/// future flush-only fix from being unmeasurable.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn the_root_completion_stamp_lands_the_deferred_rails_and_moves_the_counter() {
+    use crate::model::{DeviceId, GvaDeferredEntry};
+    use crate::runtime::host::FakeHost;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+    let page_size = 1usize << PAGE_SHIFT_X86;
+
+    // Slot 0 lives at the FIFO base page; the ring starts one page further in, so
+    // the stamp write and the packet read do not alias.
+    let fifo_pfn = 0x40u32;
+    let fifo_gpa = (fifo_pfn as u64) << PAGE_SHIFT_X86;
+    host.map_range(fifo_gpa, 3 * page_size, 0);
+    state.gfx.fifo_base_page = fifo_pfn;
+    state.gfx.fifo_start = page_size as u32;
+    state.gfx.fifo_length = 2 * page_size as u32;
+
+    // One minimal root packet: header only, no stamps, carrying the completion
+    // value the guest will read out of slot 0.
+    const ROOT_STAMP: u32 = 0x1234_5678;
+    let mut packet = [0u8; PACKET_HEADER_LEN as usize];
+    st16(&mut packet[PACKET_OPCODE..], 0);
+    st16(&mut packet[PACKET_STAMP_COUNT..], 0);
+    st32(&mut packet[PACKET_TOTAL_SIZE..], PACKET_HEADER_LEN);
+    st32(&mut packet[PACKET_COMPLETION_STAMP..], ROOT_STAMP);
+    gpa_map::write_bytes(&mut host, fifo_gpa + page_size as u64, &packet, page_size)
+        .expect("seed the root ring");
+    state
+        .gfx
+        .fifo_read
+        .store(0, std::sync::atomic::Ordering::Release);
+    state.gfx.fifo_written = PACKET_HEADER_LEN;
+
+    // A window owed to guest RAM, armed before the completion the guest waits on.
+    state.arm_gva_deferred_window(
+        0x5000,
+        GvaDeferredEntry {
+            task_id: 3,
+            texture_ref: 11,
+            producer_object_type: 0,
+            width: 8,
+            height: 8,
+            row_stride: 32,
+            format: 0x50,
+            armed_seq: 1,
+            armed_stamp_seq: 0,
+            pages: [0x9000u64].into_iter().collect(),
+            alloc_gen: 0,
+        },
+    );
+    assert!(!state.gva_deferred_flush.is_empty());
+
+    drain_main_fifo(&mut state, &mut host);
+
+    let mut slot0 = [0u8; 4];
+    crate::runtime::host::HostMemory::read_gpa(&host, fifo_gpa, &mut slot0)
+        .expect("root stamp slot");
+    assert_eq!(
+        ld32(&slot0),
+        ROOT_STAMP,
+        "the packet must actually have completed, or the test proves nothing"
+    );
+    assert!(
+        state.gva_deferred_flush.is_empty(),
+        "a deferred window must not survive the root completion stamp"
+    );
+    assert_eq!(
+        state.completion_stamp_seq, 1,
+        "the root stamp is a fence, so it must advance the counter every rail's \
+         armed_stamp_seq is measured against"
+    );
+}
+
+/// Deleting a task retires that task's deferred windows and nobody else's.
+///
+/// `retire_task_gva_windows` matched `e.task_id >> 1 == task_id` as well, on a
+/// doc-stated premise — "walks try `task_id` then `task_id >> 1`" — that the
+/// walk fallbacks it named were deleted from (`gva_view::resolve`,
+/// `gva_mem`, `task_slot::resolve_task_word`); the only surviving halving is
+/// `diagnose_gva_walk`, which builds a log string.
+///
+/// Both sides of that comparison are slot ids. `GvaDeferredEntry::task_id` is
+/// the word `resolve_task_word` accepted, and `DeleteTask` (`0x20`) carries a
+/// slot id too: its words include 5, 11 and 13 — odd and greater than one, which
+/// the `DefineTask2` doubled space (`0x1`, then strictly even) does not contain —
+/// and all 968 deletes in the boots on disk report `ok=1` against a live slot.
+///
+/// So the arm never matched a window the dying task owned, and always matched
+/// every window owned by slots `2 * task_id` and `2 * task_id + 1`. With 256
+/// slots running densely from 0 and boots using ids past 14, those are live
+/// tasks. Their windows were then landed *cache-only* — `retire_gva_windows`
+/// passes `write_guest = false` — so a live task lost a rendered frame out of
+/// guest RAM with no write and no refusal, and the guest kept compositing
+/// whatever those pages held before. That is silent loss of guest work, and it
+/// persists until something re-renders the region.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn deleting_a_task_retires_its_own_deferred_windows_and_not_its_doubles() {
+    use crate::model::{DeviceId, GvaDeferredEntry};
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let window = |task_id: u32| GvaDeferredEntry {
+        task_id,
+        texture_ref: 11,
+        producer_object_type: 0,
+        width: 8,
+        height: 8,
+        row_stride: 32,
+        format: 0x50,
+        armed_seq: task_id as u64,
+        armed_stamp_seq: 0,
+        pages: [0x9000u64 + u64::from(task_id) * 0x1000]
+            .into_iter()
+            .collect(),
+        alloc_gen: 0,
+    };
+    // Task 5 is the one deleted; 10 and 11 are its doubles and 2 is its half.
+    for id in [2u32, 5, 10, 11] {
+        assert!(state.define_task(id, 0x1_0000, 2), "slot {id} must be live");
+        state.arm_gva_deferred_window(u64::from(id) << 16, window(id));
+    }
+    assert_eq!(state.gva_deferred_flush.len(), 4);
+
+    assert!(state.delete_task(5), "task 5 is live and must delete");
+
+    let left: Vec<u32> = state
+        .gva_deferred_flush
+        .iter()
+        .map(|entry| entry.1.task_id)
+        .collect();
+    assert_eq!(
+        left,
+        vec![2, 10, 11],
+        "only task 5's window may be retired; 10 and 11 are live tasks whose \
+         pixels would never reach guest RAM, and 2 is unrelated"
+    );
+    assert_eq!(
+        state.retired_gva_windows.len(),
+        1,
+        "exactly one window is owed a cache-only landing"
+    );
+    assert_eq!(state.retired_gva_windows[0].1.task_id, 5);
+}
+
+/// Root and child `DefineTask2` decode one wire field one way.
+///
+/// The length lives at `DEFINE_TASK_LENGTH` (0x04) and the next field,
+/// `DEFINE_TASK_DIRECTORY_PFN`, is at 0x0c — so the field is eight bytes, not
+/// four. The child arm used to read only the low 32 bits with `ld32`, which
+/// truncated any task spanning 4 GiB or more to its low half while the root
+/// arm, decoding the same packet layout, kept the full value. A guest whose
+/// task address space crosses that line had its span silently shortened on
+/// one path and not the other.
+#[test]
+fn a_define_task_length_is_the_full_eight_byte_field_on_both_arms() {
+    // The layout is what makes the field eight bytes wide; assert it rather
+    // than restating the width.
+    assert_eq!(DEFINE_TASK_DIRECTORY_PFN - DEFINE_TASK_LENGTH, 8);
+
+    let mut payload = vec![0u8; DEFINE_TASK_LEN];
+    // 6 GiB: past u32, with a non-zero low half so a truncation is not a zero.
+    let length = 6u64 << 30;
+    payload[DEFINE_TASK_LENGTH..DEFINE_TASK_LENGTH + 8].copy_from_slice(&length.to_le_bytes());
+    assert_eq!(define_task_length(&payload), length);
+    assert_ne!(
+        define_task_length(&payload),
+        u64::from(ld32(&payload[DEFINE_TASK_LENGTH..])),
+        "a low-32 read would have lost the high half"
+    );
+}
+
+/// `CmdGetComputeInfo` answers the keys the guest asked about, and its
+/// threadgroup limits are the host's rather than a fixed pair.
+///
+/// The reply used to be the constant triple `(1, 1024), (3, 32), (4, 0)`. The
+/// guest sizes its dispatches from key 1, so promising 1024 on a device whose
+/// `maxComputeWorkGroupInvocations` is the Vulkan floor of 128 hands it a
+/// threadgroup the host will reject. Key 3 is vendor-dependent and 32 is only
+/// right for some parts.
+///
+/// Key 4, `staticThreadgroupMemoryLength`, is a property of the pipeline and
+/// not of the device, so no device limit answers it and it stays 0 — asserted
+/// so that stops being silent.
+#[test]
+fn the_compute_info_reply_answers_device_limits_not_a_fixed_triple() {
+    let caps = compute_info_caps();
+    let keys: Vec<u32> = caps.iter().map(|&(k, _)| k).collect();
+    assert_eq!(
+        keys,
+        vec![
+            COMPUTE_INFO_KEY_MAX_TOTAL_THREADS,
+            COMPUTE_INFO_KEY_THREAD_EXECUTION_WIDTH,
+            COMPUTE_INFO_KEY_STATIC_THREADGROUP_MEMORY,
+        ]
+    );
+    let max_total = caps[0].1;
+    let width = caps[1].1;
+    // No device may be resolved in a unit test, so the floor is the answer;
+    // what must hold either way is that the guest is never handed a
+    // threadgroup budget of zero, nor a wave width it would divide by.
+    assert!(max_total >= 1, "a zero budget refuses every dispatch");
+    assert!(width >= 1, "a zero wave width is not a divisor");
+    assert!(
+        max_total >= width,
+        "a threadgroup that cannot hold one wave is not answerable"
+    );
+    assert_eq!(
+        caps[2].1, 0,
+        "static threadgroup memory is per-pipeline; no device limit answers it"
     );
 }

@@ -259,14 +259,24 @@ pub enum BufferAccess {
     AmbiguousBinding,
 }
 
-/// Reflect whether a storage-buffer descriptor can be written by the module.
+/// The one descriptor variable declaring `wanted_binding` in `storage_class`,
+/// with the module's id bound.
 ///
-/// Pointer provenance follows the SPIR-V operations that can preserve a buffer
-/// pointer (`AccessChain`, `CopyObject`, `Select`, and `Phi`). Stores, copy
-/// destinations, and atomics make the binding writable. Pointer calls/returns
-/// fail closed as unknown; this deliberately avoids inferring mutability from
-/// debug names, guest object ids, or corpus-specific function names.
-pub fn buffer_access(words: &[u32], wanted_binding: u32) -> Option<BufferAccess> {
+/// `OpDecorate Binding` and `OpVariable` are the only two declarations either
+/// provenance question in this module needs, and both ask for exactly one
+/// match: two variables sharing a binding means neither can be reflected, which
+/// is `Root::Ambiguous`.
+///
+/// `None` is a module this reflector cannot parse at all — a header shorter
+/// than `HEADER_WORDS`, a zero id bound, an instruction whose word count is
+/// zero or runs past the end, or no variable on that binding. Every one of
+/// those must fail closed rather than reflect a guess.
+enum Root {
+    One { id: usize, bound: usize },
+    Ambiguous,
+}
+
+fn descriptor_root(words: &[u32], wanted_binding: u32, storage_class: u32) -> Option<Root> {
     let bound = *words.get(3)? as usize;
     if words.len() < HEADER_WORDS || bound == 0 {
         return None;
@@ -275,9 +285,8 @@ pub fn buffer_access(words: &[u32], wanted_binding: u32) -> Option<BufferAccess>
     let mut storage = vec![None; bound];
     let mut i = HEADER_WORDS;
     while i < words.len() {
-        let word0 = words[i];
-        let word_count = (word0 >> 16) as usize;
-        let opcode = (word0 & 0xffff) as u16;
+        let word_count = (words[i] >> 16) as usize;
+        let opcode = (words[i] & 0xffff) as u16;
         if word_count == 0 || i + word_count > words.len() {
             return None;
         }
@@ -299,46 +308,57 @@ pub fn buffer_access(words: &[u32], wanted_binding: u32) -> Option<BufferAccess>
         i += word_count;
     }
     let mut roots = bindings.iter().enumerate().filter_map(|(id, binding)| {
-        (*binding == Some(wanted_binding) && storage[id] == Some(STORAGE_CLASS_STORAGE_BUFFER))
-            .then_some(id)
+        (*binding == Some(wanted_binding) && storage[id] == Some(storage_class)).then_some(id)
     });
-    let root = roots.next()?;
-    if roots.next().is_some() {
-        return Some(BufferAccess::AmbiguousBinding);
-    }
+    let id = roots.next()?;
+    Some(if roots.next().is_some() {
+        Root::Ambiguous
+    } else {
+        Root::One { id, bound }
+    })
+}
 
+/// Mark every id whose value derives from an already-marked id, to a fixpoint.
+///
+/// Both provenance questions here have the same shape — seed a set of ids, then
+/// re-walk the instruction stream marking any result built from a marked
+/// operand, until a pass changes nothing — and differ only in which opcodes
+/// propagate. `propagates` is that difference: given an instruction, it answers
+/// whether that instruction's result derives from something already marked.
+///
+/// The opcodes handled here are the ones that merge or rename an SSA value
+/// without regard to what kind of value it is: `OpCopyObject` renames,
+/// `OpSelect` and `OpPhi` merge. Provenance flows through all three for a
+/// pointer and for an image alike, so they are not the caller's business.
+///
+/// The `word_count >= 3` guard is what makes a result id exist to mark; an
+/// instruction shorter than that has no result operand.
+fn propagate_derived(
+    words: &[u32],
+    bound: usize,
+    seed: Option<usize>,
+    propagates: impl Fn(u16, usize, usize, &[bool]) -> bool,
+) -> Vec<bool> {
     let mut derived = vec![false; bound];
-    derived[root] = true;
+    if let Some(root) = seed {
+        derived[root] = true;
+    }
     loop {
         let mut changed = false;
         let mut i = HEADER_WORDS;
         while i < words.len() {
             let word_count = (words[i] >> 16) as usize;
             let opcode = (words[i] & 0xffff) as u16;
+            let marked = |id: u32| derived.get(id as usize).copied() == Some(true);
             let result_from = match opcode {
-                OP_ACCESS_CHAIN
-                | OP_IN_BOUNDS_ACCESS_CHAIN
-                | OP_PTR_ACCESS_CHAIN
-                | OP_IN_BOUNDS_PTR_ACCESS_CHAIN
-                    if word_count >= 4 =>
-                {
-                    derived.get(words[i + 3] as usize).copied() == Some(true)
+                OP_COPY_OBJECT if word_count >= 4 => marked(words[i + 3]),
+                OP_SELECT if word_count >= 6 => {
+                    marked(words[i + 4]) || marked(words[i + 5])
                 }
-                OP_COPY_OBJECT
-                | OP_PTR_CAST_TO_GENERIC
-                | OP_GENERIC_CAST_TO_PTR
-                | OP_GENERIC_CAST_TO_PTR_EXPLICIT
-                    if word_count >= 4 =>
-                {
-                    derived.get(words[i + 3] as usize).copied() == Some(true)
-                }
-                OP_SELECT if word_count >= 6 => [words[i + 4], words[i + 5]]
-                    .iter()
-                    .any(|id| derived.get(*id as usize).copied() == Some(true)),
                 OP_PHI if word_count >= 5 => (i + 3..i + word_count)
                     .step_by(2)
-                    .any(|at| derived.get(words[at] as usize).copied() == Some(true)),
-                _ => false,
+                    .any(|at| marked(words[at])),
+                _ => propagates(opcode, word_count, i, &derived),
             };
             if result_from && word_count >= 3 {
                 let result = words[i + 2] as usize;
@@ -353,6 +373,46 @@ pub fn buffer_access(words: &[u32], wanted_binding: u32) -> Option<BufferAccess>
             break;
         }
     }
+    derived
+}
+
+/// Reflect whether a storage-buffer descriptor can be written by the module.
+///
+/// Pointer provenance follows the SPIR-V operations that can preserve a buffer
+/// pointer (`AccessChain`, `CopyObject`, `Select`, and `Phi`). Stores, copy
+/// destinations, and atomics make the binding writable. Pointer calls/returns
+/// fail closed as unknown; this deliberately avoids inferring mutability from
+/// debug names, guest object ids, or corpus-specific function names.
+///
+/// The root pointer is seeded directly, which is safe here only because the
+/// escape scan below enumerates the opcodes it cares about. `storage_image_access`
+/// cannot seed its root for exactly that reason — see the note there.
+pub fn buffer_access(words: &[u32], wanted_binding: u32) -> Option<BufferAccess> {
+    let (root, bound) =
+        match descriptor_root(words, wanted_binding, STORAGE_CLASS_STORAGE_BUFFER)? {
+            Root::One { id, bound } => (id, bound),
+            Root::Ambiguous => return Some(BufferAccess::AmbiguousBinding),
+        };
+
+    let derived = propagate_derived(words, bound, Some(root), |opcode, word_count, i, derived| {
+        let marked = |id: u32| derived.get(id as usize).copied() == Some(true);
+        match opcode {
+            // Both families take the base pointer at operand 3 and yield another
+            // pointer to the same buffer.
+            OP_ACCESS_CHAIN
+            | OP_IN_BOUNDS_ACCESS_CHAIN
+            | OP_PTR_ACCESS_CHAIN
+            | OP_IN_BOUNDS_PTR_ACCESS_CHAIN
+            | OP_PTR_CAST_TO_GENERIC
+            | OP_GENERIC_CAST_TO_PTR
+            | OP_GENERIC_CAST_TO_PTR_EXPLICIT
+                if word_count >= 4 =>
+            {
+                marked(words[i + 3])
+            }
+            _ => false,
+        }
+    });
 
     let is_derived = |id: u32| derived.get(id as usize).copied() == Some(true);
     let mut unknown = false;
@@ -418,79 +478,23 @@ pub fn buffer_access(words: &[u32], wanted_binding: u32) -> Option<BufferAccess>
 /// operations that preserve identity. `OpImageRead` and `OpImageWrite` then
 /// provide the content-access contract. Queries do not consume texels;
 /// pointer/image escapes fail closed as [`StorageImageAccess::Unknown`].
+/// The tracked set is image *values*, so the root variable is deliberately not
+/// seeded: `OpLoad` from it is what produces the first image value. Seeding the
+/// variable id would also be unsound here, because the escape scan below ends in
+/// a catch-all — `OpDecorate root Binding N` and `OpEntryPoint`'s interface list
+/// both name the variable, and either would then read as an escape and force
+/// every storage image to `Unknown`. `buffer_access` seeds its root only because
+/// its scan enumerates instead.
 pub fn storage_image_access(words: &[u32], wanted_binding: u32) -> Option<StorageImageAccess> {
-    let bound = *words.get(3)? as usize;
-    if words.len() < HEADER_WORDS || bound == 0 {
-        return None;
-    }
-    let mut bindings = vec![None; bound];
-    let mut storage = vec![None; bound];
-    let mut i = HEADER_WORDS;
-    while i < words.len() {
-        let word_count = (words[i] >> 16) as usize;
-        let opcode = (words[i] & 0xffff) as u16;
-        if word_count == 0 || i + word_count > words.len() {
-            return None;
-        }
-        match opcode {
-            OP_DECORATE if word_count >= 4 && words[i + 2] == DECORATION_BINDING => {
-                let id = words[i + 1] as usize;
-                if id < bound {
-                    bindings[id] = Some(words[i + 3]);
-                }
-            }
-            OP_VARIABLE if word_count >= 4 => {
-                let id = words[i + 2] as usize;
-                if id < bound {
-                    storage[id] = Some(words[i + 3]);
-                }
-            }
-            _ => {}
-        }
-        i += word_count;
-    }
-    let mut roots = bindings.iter().enumerate().filter_map(|(id, binding)| {
-        (*binding == Some(wanted_binding) && storage[id] == Some(STORAGE_CLASS_UNIFORM_CONSTANT))
-            .then_some(id)
-    });
-    let root = roots.next()?;
-    if roots.next().is_some() {
-        return Some(StorageImageAccess::AmbiguousBinding);
-    }
+    let (root, bound) =
+        match descriptor_root(words, wanted_binding, STORAGE_CLASS_UNIFORM_CONSTANT)? {
+            Root::One { id, bound } => (id, bound),
+            Root::Ambiguous => return Some(StorageImageAccess::AmbiguousBinding),
+        };
 
-    let mut derived = vec![false; bound];
-    loop {
-        let mut changed = false;
-        let mut i = HEADER_WORDS;
-        while i < words.len() {
-            let word_count = (words[i] >> 16) as usize;
-            let opcode = (words[i] & 0xffff) as u16;
-            let result_from = match opcode {
-                OP_LOAD if word_count >= 4 => words[i + 3] as usize == root,
-                OP_COPY_OBJECT if word_count >= 4 => {
-                    derived.get(words[i + 3] as usize).copied() == Some(true)
-                }
-                OP_SELECT if word_count >= 6 => [words[i + 4], words[i + 5]]
-                    .iter()
-                    .any(|id| derived.get(*id as usize).copied() == Some(true)),
-                OP_PHI if word_count >= 5 => (i + 3..i + word_count)
-                    .step_by(2)
-                    .any(|at| derived.get(words[at] as usize).copied() == Some(true)),
-                _ => false,
-            };
-            if result_from && word_count >= 3 {
-                let result = words[i + 2] as usize;
-                if result < bound && !derived[result] {
-                    derived[result] = true;
-                    changed = true;
-                }
-            }
-            i += word_count;
-        }
-        if !changed {
-            break;
-        }
-    }
+    let derived = propagate_derived(words, bound, None, |opcode, word_count, i, _derived| {
+        opcode == OP_LOAD && word_count >= 4 && words[i + 3] as usize == root
+    });
 
     let is_derived = |id: u32| derived.get(id as usize).copied() == Some(true);
     let mut read = false;
@@ -996,16 +1000,6 @@ fn texture_shape_for_binding(reflection: &ShaderReflection, binding: u32) -> Opt
     })
 }
 
-/// Read the texture dimensionality for descriptor `binding` from the translator's
-/// reflection — the single source of truth. `binding` is the un-relocated
-/// descriptor number (`TEXTURE_BINDING_BASE + metal_index`).
-pub fn sampled_image_kind_from_reflection(
-    reflection: &ShaderReflection,
-    binding: u32,
-) -> Option<SampledImageKind> {
-    sampled_image_kind_from_shape(texture_shape_for_binding(reflection, binding)?)
-}
-
 /// How reflection describes descriptor `binding` for the sampled render path.
 /// Lets the call site log a genuine gap fail-visibly while staying silent on the
 /// expected "bound but not sampled by this shader" case.
@@ -1032,21 +1026,57 @@ pub fn reflected_sampled_kind(reflection: &ShaderReflection, binding: u32) -> Re
     }
 }
 
-/// Sampled-vs-storage class for descriptor `binding` from the translator's
-/// reflection: a `writable` (write/read_write) texture is a storage image, a
-/// read/sample texture is sampled. The declared Metal qualifier is authoritative,
-/// so this is exact at translate time (never `Unknown`). `None` when reflection
-/// carries no texture shape for the binding (an unbound/unused descriptor).
-pub fn image_access_from_reflection(
+/// How the compute rail must treat texture descriptor `binding`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReflectedComputeTexture {
+    /// Reflection lists no texture shape here. Metal permits binding a texture
+    /// the shader never samples or writes, so this is expected control flow —
+    /// the caller stages nothing and invents no access semantics for it.
+    Absent,
+    /// A single-layer, non-multisampled 2D texture, carrying its
+    /// sampled-vs-storage class. This is the only shape the compute rail can
+    /// stage: a binding comes from one type-11 plane window or one linear GVA
+    /// level, both flat `width × height` rectangles.
+    Plain2d(ImageAccess),
+    /// The shader declares a shape with a slice, depth, or sample axis the
+    /// compute rail has no staged source for. `axis` names it for the fail log.
+    UnstageableShape { axis: &'static str },
+}
+
+/// Classify texture descriptor `binding` for the compute rail from the
+/// translator's reflection.
+///
+/// Sampled-vs-storage comes from the declared Metal access qualifier
+/// (`TextureShape.writable`), which is exact at translate time — there is no
+/// `Unknown`. The shape axis comes from the same decoded `OpTypeImage`, and
+/// the rail refuses anything it would otherwise stage as 2D behind the
+/// shader's back: binding a `TYPE_2D` view to a SPIR-V image declared
+/// `2DArray`/`3D`/`1D`/`Cube`/`Buffer`/multisampled is a descriptor-type
+/// mismatch, not a degraded render.
+pub fn reflected_compute_texture(
     reflection: &ShaderReflection,
     binding: u32,
-) -> Option<ImageAccess> {
-    let shape = texture_shape_for_binding(reflection, binding)?;
-    Some(if shape.writable {
-        ImageAccess::Storage
-    } else {
-        ImageAccess::Sampled
-    })
+) -> ReflectedComputeTexture {
+    let Some(shape) = texture_shape_for_binding(reflection, binding) else {
+        return ReflectedComputeTexture::Absent;
+    };
+    let axis = match shape.dimension {
+        TextureDimension::D1 => Some("dim_1d"),
+        TextureDimension::D3 => Some("dim_3d"),
+        TextureDimension::Cube => Some("dim_cube"),
+        TextureDimension::Buffer => Some("dim_buffer"),
+        TextureDimension::D2 if shape.arrayed => Some("arrayed"),
+        TextureDimension::D2 if shape.multisampled => Some("multisampled"),
+        TextureDimension::D2 => None,
+    };
+    match axis {
+        Some(axis) => ReflectedComputeTexture::UnstageableShape { axis },
+        None => ReflectedComputeTexture::Plain2d(if shape.writable {
+            ImageAccess::Storage
+        } else {
+            ImageAccess::Sampled
+        }),
+    }
 }
 
 /// Validate that the translator's reflection is internally well-formed, once per
@@ -1390,8 +1420,8 @@ mod tests {
             r.bindings
                 .push(texture_binding(bind, shape(dim, arrayed, false)));
             assert_eq!(
-                sampled_image_kind_from_reflection(&r, bind),
-                want,
+                reflected_sampled_kind(&r, bind),
+                want.map_or(ReflectedSampledKind::Unsupported, ReflectedSampledKind::Kind),
                 "dim={dim:?} arrayed={arrayed}"
             );
         }
@@ -1409,22 +1439,70 @@ mod tests {
             shape(TextureDimension::D2, false, true),
         ));
         assert_eq!(
-            image_access_from_reflection(&r, sampled),
-            Some(ImageAccess::Sampled)
+            reflected_compute_texture(&r, sampled),
+            ReflectedComputeTexture::Plain2d(ImageAccess::Sampled)
         );
         assert_eq!(
-            image_access_from_reflection(&r, storage),
-            Some(ImageAccess::Storage)
+            reflected_compute_texture(&r, storage),
+            ReflectedComputeTexture::Plain2d(ImageAccess::Storage)
         );
-        // A binding reflection does not carry => None (the walk's miss).
+        // A binding reflection does not carry => Absent (the walk's miss).
         assert_eq!(
-            image_access_from_reflection(&r, TEXTURE_BINDING_BASE + 9),
-            None
+            reflected_compute_texture(&r, TEXTURE_BINDING_BASE + 9),
+            ReflectedComputeTexture::Absent
         );
+        // Absent, not Unsupported: the binding is not in the reflection at all,
+        // and only `reflected_sampled_kind` can tell those apart.
         assert_eq!(
-            sampled_image_kind_from_reflection(&r, TEXTURE_BINDING_BASE + 9),
-            None
+            reflected_sampled_kind(&r, TEXTURE_BINDING_BASE + 9),
+            ReflectedSampledKind::Absent
         );
+    }
+
+    /// The compute rail stages one flat `width × height` rectangle per texture
+    /// binding, so every declared shape with a slice, depth, or sample axis must
+    /// come back named rather than collapsing into the plain-2D arm — binding a
+    /// `TYPE_2D` view to an image the shader declared otherwise is a
+    /// descriptor-type mismatch, not a degraded render.
+    #[test]
+    fn every_unstageable_compute_texture_shape_names_its_axis() {
+        let bind = TEXTURE_BINDING_BASE + 4;
+        let unstageable = [
+            (TextureDimension::D1, false, false, "dim_1d"),
+            (TextureDimension::D1, true, false, "dim_1d"),
+            (TextureDimension::D3, false, false, "dim_3d"),
+            (TextureDimension::Cube, false, false, "dim_cube"),
+            (TextureDimension::Cube, true, false, "dim_cube"),
+            (TextureDimension::Buffer, false, false, "dim_buffer"),
+            (TextureDimension::D2, true, false, "arrayed"),
+            (TextureDimension::D2, false, true, "multisampled"),
+        ];
+        for (dimension, arrayed, multisampled, axis) in unstageable {
+            for writable in [false, true] {
+                let mut r = empty_reflection(ShaderStage::Kernel);
+                let mut s = shape(dimension, arrayed, writable);
+                s.multisampled = multisampled;
+                r.bindings.push(texture_binding(bind, s));
+                assert_eq!(
+                    reflected_compute_texture(&r, bind),
+                    ReflectedComputeTexture::UnstageableShape { axis },
+                    "dim={dimension:?} arrayed={arrayed} ms={multisampled} writable={writable}"
+                );
+            }
+        }
+
+        // The one stageable shape, both access classes, is not swept up by it.
+        for (writable, want) in [(false, ImageAccess::Sampled), (true, ImageAccess::Storage)] {
+            let mut r = empty_reflection(ShaderStage::Kernel);
+            r.bindings.push(texture_binding(
+                bind,
+                shape(TextureDimension::D2, false, writable),
+            ));
+            assert_eq!(
+                reflected_compute_texture(&r, bind),
+                ReflectedComputeTexture::Plain2d(want)
+            );
+        }
     }
 
     #[test]
@@ -1664,6 +1742,59 @@ mod tests {
         assert_eq!(
             storage_image_access(&words, 34),
             Some(StorageImageAccess::AmbiguousBinding)
+        );
+    }
+
+    /// The two reflectors share `propagate_derived` but seed it differently, and
+    /// the difference is not cosmetic.
+    ///
+    /// `buffer_access` tracks pointers and seeds the descriptor variable itself;
+    /// its escape scan enumerates the opcodes it cares about, so naming the
+    /// variable elsewhere is harmless. `storage_image_access` tracks image
+    /// *values* and must not seed the variable, because its escape scan ends in a
+    /// catch-all that treats any instruction mentioning a tracked id as an
+    /// escape. `OpDecorate` names the variable in every real module, so a seeded
+    /// root would make every storage image reflect `Unknown` — silently, and in
+    /// the direction that looks like caution.
+    ///
+    /// This module is the ordinary read/write case plus the `OpEntryPoint`
+    /// interface list, which is the second place a variable id appears.
+    #[test]
+    fn storage_image_root_is_not_seeded_so_naming_the_variable_is_not_an_escape() {
+        let mut words = vec![0x0723_0203, 0x0001_0000, 0, 6, 0];
+        words.extend([
+            (9u32 << 16) | OP_TYPE_IMAGE as u32,
+            1,
+            99,
+            1,
+            0,
+            0,
+            0,
+            2,
+            32,
+        ]);
+        words.extend([
+            (4u32 << 16) | OP_TYPE_POINTER as u32,
+            2,
+            STORAGE_CLASS_UNIFORM_CONSTANT,
+            1,
+        ]);
+        words.extend([
+            (4u32 << 16) | OP_VARIABLE as u32,
+            2,
+            3,
+            STORAGE_CLASS_UNIFORM_CONSTANT,
+        ]);
+        words.extend([(4u32 << 16) | OP_DECORATE as u32, 3, DECORATION_BINDING, 34]);
+        // OpEntryPoint's interface list names every module-scope variable.
+        words.extend([(5u32 << 16) | 15u32, 5, 100, 0, 3]);
+        words.extend([(4u32 << 16) | OP_LOAD as u32, 1, 4, 3]);
+        words.extend([(5u32 << 16) | OP_IMAGE_READ as u32, 92, 5, 4, 90]);
+        words.extend([(4u32 << 16) | OP_IMAGE_WRITE as u32, 4, 90, 91]);
+        assert_eq!(
+            storage_image_access(&words, 34),
+            Some(StorageImageAccess::ReadWrite),
+            "the variable being decorated and listed as an interface is not an escape"
         );
     }
 

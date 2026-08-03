@@ -13,6 +13,154 @@ use crate::model::{DeviceState, MappingEntry, MAX_SCANOUT_DIM};
 use crate::runtime::host::{HostMemory, HostOps};
 use crate::runtime::mapper;
 
+/// Why one render writeback did not land its frame in the guest's pages.
+///
+/// [`write_bgra8_inner`] has sixteen refusal sites and used to answer all of them
+/// with a bare `false`, which its caller rendered as a single
+/// `deferred_flush_lost reason=write_refused`. That is the defect the decline
+/// vocabulary exists to prevent: the composite surface is the largest frame this
+/// device moves, and a reader watching that slug fire could tell that the
+/// wallpaper had been dropped but not whether the mapping had gone, its geometry
+/// had moved under the armed window, the page walk had refused, or the source
+/// buffer was short. Those have four different fixes.
+///
+/// One variant per check, carrying the values that decide it. The class currently
+/// reads **zero across every accumulated boot log**, so this is an instrument for
+/// a failure that is not happening rather than a repair for one that is — which is
+/// exactly when it is cheap to install and exactly when nobody remembers to.
+#[derive(Debug)]
+pub enum SurfaceWriteRefusal {
+    /// A zero or over-large rect. `MAX_SCANOUT_DIM` is the bound.
+    Geometry { width: u32, height: u32 },
+    /// The source's row pitch cannot hold `width` BGRA8 texels.
+    SourceStride { src_stride: u32, width: u32 },
+    /// No such mapping. The surface went away between the arm and the landing.
+    MappingAbsent,
+    /// The mapping is unmapped or has no page list, so there is nowhere to write.
+    MappingNotResident,
+    /// **The mapping's latched geometry is not the geometry of the frame being
+    /// landed.** A deferred window carries the rect it was armed with, and a
+    /// wallpaper or appearance change re-publishes the surface at another one.
+    /// Landing the old frame at the new pitch would skew it, so it is refused.
+    GeometryMoved {
+        latched_width: u32,
+        latched_height: u32,
+        frame_width: u32,
+        frame_height: u32,
+    },
+    /// The sample window could not be resolved from the surface descriptor.
+    WindowUnresolved { width: u32, height: u32, format: u16 },
+    /// The page walk refused to vouch for the mapping's page list.
+    PagesNotOurs,
+    /// The format has no packed row length, so there is no rect to write.
+    FormatRowLength { format: u16 },
+    /// The source buffer ends before the row this write is up to.
+    SourceShort { need: usize, have: usize, row: u32 },
+    /// A row would not convert into the mapping's pixel format.
+    RowConvert { format: u16, row: u32 },
+    /// The staged frame's extent overflowed, so the rows do not describe a buffer.
+    FrameExtent { bpr: usize, height: u32 },
+    /// The staged frame ends before the row being placed in it.
+    StagedShort { need: usize, have: usize, row: u32 },
+    /// The mapper refused to write a run of the frame into the guest's pages.
+    MapperWrite { lo: u64, len: usize },
+    /// A partial frame was offered to a caller that publishes to the host
+    /// surface cache. The cache stores whatever `src` holds, and a frame
+    /// narrowed to its changed runs holds nothing at all outside them, so
+    /// publishing it would seed later reads from uninitialised memory.
+    PartialFramePublished { runs: usize },
+}
+
+impl crate::observe::decline::Decline for SurfaceWriteRefusal {
+    fn slug(&self) -> &'static str {
+        match self {
+            Self::Geometry { .. } => "surface_write_geometry",
+            Self::SourceStride { .. } => "surface_write_source_stride",
+            Self::MappingAbsent => "surface_write_mapping_absent",
+            Self::MappingNotResident => "surface_write_mapping_not_resident",
+            Self::GeometryMoved { .. } => "surface_write_geometry_moved",
+            Self::WindowUnresolved { .. } => "surface_write_window_unresolved",
+            Self::PagesNotOurs => "surface_write_pages_not_ours",
+            Self::FormatRowLength { .. } => "surface_write_format_row_length",
+            Self::SourceShort { .. } => "surface_write_source_short",
+            Self::RowConvert { .. } => "surface_write_row_convert",
+            Self::FrameExtent { .. } => "surface_write_frame_extent",
+            Self::StagedShort { .. } => "surface_write_staged_short",
+            Self::MapperWrite { .. } => "surface_write_mapper_write",
+            Self::PartialFramePublished { .. } => "surface_write_partial_frame_published",
+        }
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        match self {
+            Self::Geometry { width, height } => vec![
+                ("geom", format!("{width}x{height}")),
+                ("max", MAX_SCANOUT_DIM.to_string()),
+            ],
+            Self::SourceStride { src_stride, width } => vec![
+                ("src_stride", src_stride.to_string()),
+                ("need", (width.saturating_mul(RGBA8_BPP)).to_string()),
+            ],
+            Self::MappingAbsent | Self::MappingNotResident | Self::PagesNotOurs => Vec::new(),
+            Self::GeometryMoved {
+                latched_width,
+                latched_height,
+                frame_width,
+                frame_height,
+            } => vec![
+                ("latched", format!("{latched_width}x{latched_height}")),
+                ("frame", format!("{frame_width}x{frame_height}")),
+            ],
+            Self::WindowUnresolved {
+                width,
+                height,
+                format,
+            } => vec![
+                ("geom", format!("{width}x{height}")),
+                ("fmt", format!("{format:#x}")),
+            ],
+            Self::FormatRowLength { format } => vec![("fmt", format!("{format:#x}"))],
+            Self::SourceShort { need, have, row } => vec![
+                ("need", need.to_string()),
+                ("have", have.to_string()),
+                ("row", row.to_string()),
+            ],
+            Self::RowConvert { format, row } => vec![
+                ("fmt", format!("{format:#x}")),
+                ("row", row.to_string()),
+            ],
+            Self::FrameExtent { bpr, height } => vec![
+                ("bpr", bpr.to_string()),
+                ("height", height.to_string()),
+            ],
+            Self::StagedShort { need, have, row } => vec![
+                ("need", need.to_string()),
+                ("have", have.to_string()),
+                ("row", row.to_string()),
+            ],
+            Self::MapperWrite { lo, len } => {
+                vec![("lo", format!("{lo:#x}")), ("len", len.to_string())]
+            }
+            Self::PartialFramePublished { runs } => vec![("runs", runs.to_string())],
+        }
+    }
+}
+
+/// Report one writeback refusal and answer `false` for the caller to return.
+///
+/// Latched per `(check, mapping)`: a surface whose geometry has moved refuses
+/// every frame until something re-arms it, and the second line says nothing the
+/// first did not. The route beside it carries the magnitude, which is what
+/// [`crate::observe::emit::Emit::fail_once`]'s contract asks for.
+fn refuse(mapping_id: u32, why: SurfaceWriteRefusal) -> bool {
+    use crate::observe::decline::Decline;
+    crate::runtime::drain::note_store_route(why.slug());
+    crate::observe::emit::Emit::decline("surface_write", &why)
+        .field("mid", mapping_id)
+        .fail_once(u64::from(mapping_id));
+    false
+}
+
 /// Resolve sample window for a type-11 texture binding on a mapping.
 ///
 /// Prefers the guest `sIOSurfaceDeviceDescriptor` when cached: single-plane
@@ -113,6 +261,136 @@ fn contig_for_span<H: HostMemory + HostOps>(
     Some((ptr, len))
 }
 
+/// Take the write proof at the head of a writer, naming the rail that wanted it.
+///
+/// [`mapper::vouch_mapping_pages_verdict`] already fail-logs *why* a walk refused, with
+/// the page and both translations. This adds the one fact that line cannot
+/// carry: which writer was about to use the list. Four rails write through
+/// `page_entries` and they fail for different reasons at different rates, so a
+/// single undifferentiated refusal total would not say which one to read next.
+///
+/// # Measured: this rail carries the traffic and none of the drift
+///
+/// One 300 s crash-hunt boot, x86 / Vulkan: `mapw_pages_vouched` 29 002,
+/// `mapw_pages_refused` **0**, while the deferred flush rail on the same boot
+/// scored `mapping_pages_ours` 25 741 and `mapping_pages_drifted` 9. So these
+/// four writers do more writing than the flush rail does, and on this workload
+/// not one of them found a contradicted list. The guard here is currently inert;
+/// say so rather than counting it as the repair.
+///
+/// The split is not noise, and the reason is structural: a *deferred* frame is
+/// armed at one time and landed at another, and the interval is precisely the
+/// window in which the guest can re-point the surface underneath it. These
+/// writers vouch and write in the same breath, so their window is nearly zero.
+/// **Deferral is the exposure.** That predicts the measurement rather than
+/// explaining it after the fact, and it says where to look next: shortening the
+/// arm-to-land interval should move `mapping_pages_drifted`, and nothing else
+/// here should.
+///
+/// The drift rate is also not stable boot to boot — 22 on the preceding boot, 9
+/// on this one, same workload — so a single boot cannot score it and neither can
+/// a pair.
+fn vouch_for_write<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+    writer: &'static str,
+) -> Option<mapper::PagesVouched> {
+    let (verdict, vouched) = mapper::vouch_mapping_pages_verdict(state, host, mapping_id);
+    match verdict {
+        mapper::PagesVerdict::Ours => {
+            crate::runtime::drain::note_store_route("mapw_pages_vouched");
+        }
+        // The write proceeds exactly as for `Ours`; only the counter differs.
+        // `mapw_pages_vouched` used to carry both, so its companion zero
+        // (`mapw_pages_refused`) could not distinguish a guard that passed from
+        // one that was never armed. Read the two together: `vouched` is the
+        // guard's coverage and `unwitnessed` is the hole in it.
+        mapper::PagesVerdict::Unwitnessed(why) => {
+            crate::runtime::drain::note_store_route("mapw_pages_unwitnessed");
+            crate::runtime::drain::note_store_route(match why {
+                "no_walk" => "mapw_unwit_no_walk",
+                "walk_superseded" => "mapw_unwit_superseded",
+                "no_pages" => "mapw_unwit_no_pages",
+                _ => "mapw_unwit_no_mapping",
+            });
+        }
+        mapper::PagesVerdict::Drifted => {
+            crate::observe::fail(format!(
+                "mapping_write fail reason=pages_not_vouched mid={mapping_id} writer={writer}"
+            ));
+            crate::runtime::drain::note_store_route("mapw_pages_refused");
+        }
+    }
+    vouched
+}
+
+/// [`contig_for_span`] for a caller that is about to write through the pointer.
+///
+/// The view `ensure_contig_view` hands back is a live `mach_vm_remap` of guest
+/// PFNs, cached on the mapping and returned again on every later call. Its own
+/// doc states the contract — "always revalidate first so a cached contig never
+/// aliases PFNs after ReplacePhysical / guest recycle" — but the revalidation it
+/// names cannot deliver that for a type-4 surface: with no `MappingInternal` it
+/// re-resolves nothing and answers "resolvable" on a non-empty list alone. So a
+/// writer holding this pointer is holding whatever those PFNs became, and a
+/// full white frame poked through it is the `0xff`-filled freed guest heap the
+/// crash census reads back.
+///
+/// Reads keep [`contig_for_span`]: a read through a drifted view returns another
+/// process's bytes, which is a wrong picture and not a corrupted guest, and the
+/// two losses want separate slugs.
+fn contig_for_write<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+    mapping_id: u32,
+    span_end: u64,
+    vouched: &mapper::PagesVouched,
+    src: &[u8],
+) -> Option<(usize, usize)> {
+    if !vouched.covers(state, mapping_id) {
+        crate::observe::fail(format!(
+            "mapping_write contig mid={mapping_id} reason=vouch_stale need={span_end} \
+             (the page list was cleared or replaced between the walk and this write)"
+        ));
+        return None;
+    }
+    let view = contig_for_span(state, host, mapping_id, span_end)?;
+    // Every raw-pointer write in this file goes through here, and none of them
+    // goes through `mapper::write_mapping_bytes` — they poke rows straight into
+    // the view. So this is where those writes enter `observe::footprint`, and
+    // without it the *largest* guest-write rail in the device would be missing
+    // from a set whose whole use is answering "did we write there?".
+    //
+    // Marked over `[0, span_end)` because that is the extent this function
+    // guarantees and the callers' row offsets are not visible here. That
+    // over-marks the pages before a rect's first row — the surface's own pages,
+    // never anyone else's, since the marking walks this mapping's page list — and
+    // over-marking can only turn a miss into a hit. Under-marking would
+    // manufacture the clean "we never wrote there" the set must never invent.
+    mapper::note_mapping_write_footprint(state, mapping_id, 0, span_end);
+    // The other reader of these writes, and for the same reason: the hypervisor's
+    // dirty bitmap witnesses guest stores only, so a copy vouched for by "the
+    // guest has not written" is stale the moment this rail runs. Recorded beside
+    // the footprint mark rather than in each caller, so the two cannot drift and
+    // a new caller inherits both.
+    state.note_host_wrote_mapping(mapping_id);
+    // And the payload census, for the same reason and with the same blind spot
+    // if it is left out. The peer rails sample once per call in
+    // `mapper::write_mapping_bytes` and `gva_view::write_gva_bytes`; this file
+    // reaches neither, so without this the census reporting "no white payload in
+    // any sample" would be reporting it about every rail except the one carrying
+    // the pixels.
+    //
+    // `src` is the whole source image, and a partial write — skip ranges, a
+    // changed-span pass — puts only some of it in guest RAM. That over-reports,
+    // and the direction is deliberate: over-reporting a white run makes the
+    // payload a *weaker* discriminator, while under-reporting would manufacture
+    // the "we do not write white" that would clear this device on no evidence.
+    crate::observe::footprint::note_written_payload(src);
+    Some(view)
+}
+
 /// One past the last mapping byte a rect transfer touches: the last texel of its
 /// last row, at `bpr` pitch, `x_off` bytes into the row.
 ///
@@ -143,6 +421,126 @@ fn rect_extent_end(
         .saturating_add(rb as u64)
 }
 
+/// Mapping byte ranges a writeback must leave alone, ascending and disjoint.
+///
+/// Offsets are from the mapping's page 0, the same space `base_off`/`span_end`
+/// are in, so a caller holding guest *page* addresses converts once with
+/// [`crate::runtime::mapper::mapping_offsets_of_pages`] and everything below
+/// stays in one coordinate system.
+pub type SkipRanges<'a> = &'a [(u64, u64)];
+
+/// The sub-ranges of `[start, end)` that are not covered by `skip`.
+///
+/// `skip` is ascending and disjoint, so one forward walk answers it. Kept
+/// separate from the two writers below because they lay their bytes out
+/// differently — one pokes a host view in place, the other stages a frame and
+/// hands runs to the mapper — and the only thing they must agree on is *which
+/// bytes are excluded*. Two open-coded walks would be two chances to disagree.
+fn unskipped(start: u64, end: u64, skip: SkipRanges<'_>) -> Vec<(u64, u64)> {
+    if skip.is_empty() {
+        return if start < end {
+            vec![(start, end)]
+        } else {
+            vec![]
+        };
+    }
+    let mut out = Vec::new();
+    let mut cur = start;
+    for &(s, e) in skip {
+        if e <= cur {
+            continue;
+        }
+        if s >= end {
+            break;
+        }
+        if s > cur {
+            out.push((cur, s.min(end)));
+        }
+        cur = cur.max(e);
+        if cur >= end {
+            return out;
+        }
+    }
+    if cur < end {
+        out.push((cur, end));
+    }
+    out
+}
+
+/// Byte ranges of a **tightly packed** frame, ascending and disjoint.
+///
+/// The unit the render writeback's difference pass answers in: the frame it
+/// compared has `tight` bytes per row and no inter-row padding, which is not
+/// the space `SkipRanges` is in. [`tight_runs_to_mapping`] is the only crossing
+/// between the two.
+pub type ChangedRuns<'a> = &'a [(u64, u64)];
+
+/// Place tightly-packed frame ranges at their mapping-linear destinations.
+///
+/// Frame byte `s` belongs to row `s / tight` at `s % tight` into it, and that
+/// row starts at `base_off + row * bpr`. When `bpr` and `tight` agree the whole
+/// frame is one linear shift and neighbouring rows come back merged; when they
+/// do not, a run crossing a row boundary becomes one range per row it touches,
+/// because the padding between rows is outside the texture contract and may
+/// belong to another guest allocation.
+///
+/// Runs past the frame's last row are dropped rather than wrapped: a bitmap is
+/// a whole number of tiles and the last tile of a frame is usually partial, so
+/// its bits name bytes the frame does not have.
+fn tight_runs_to_mapping(
+    runs: ChangedRuns<'_>,
+    base_off: u64,
+    bpr: u64,
+    tight: u64,
+    height: u64,
+) -> Vec<(u64, u64)> {
+    let frame = tight.saturating_mul(height);
+    let mut out: Vec<(u64, u64)> = Vec::new();
+    for &(start, end) in runs {
+        let mut cur = start.min(frame);
+        let end = end.min(frame);
+        while cur < end {
+            let row = cur / tight;
+            let seg_end = end.min((row + 1).saturating_mul(tight));
+            let lo = base_off
+                .saturating_add(row.saturating_mul(bpr))
+                .saturating_add(cur - row.saturating_mul(tight));
+            let hi = lo.saturating_add(seg_end - cur);
+            match out.last_mut() {
+                Some(last) if last.1 == lo => last.1 = hi,
+                _ => out.push((lo, hi)),
+            }
+            cur = seg_end;
+        }
+    }
+    out
+}
+
+/// The parts of `[lo, hi)` this write should store: what `changed` selects,
+/// less what `skip` excludes.
+///
+/// The two narrowings are unrelated and both are subtractions from the same
+/// window, so they compose rather than choose. `changed` says the destination
+/// already holds these bytes; `skip` says the destination holds bytes the guest
+/// wrote and this device must not replace. Nothing requires one to imply the
+/// other.
+fn writable_spans(
+    changed: Option<&[(u64, u64)]>,
+    skip: SkipRanges<'_>,
+    lo: u64,
+    hi: u64,
+) -> Vec<(u64, u64)> {
+    let mut out = Vec::new();
+    for (a, b) in mapper::selected_within(changed, lo, hi) {
+        if skip.is_empty() {
+            out.push((a, b));
+        } else {
+            out.extend(unskipped(a, b, skip));
+        }
+    }
+    out
+}
+
 /// Write a tight BGRA8 image into the mapping's guest pages.
 ///
 /// Packed contig HostOps view when possible; else multi-import maximal packed
@@ -159,21 +557,224 @@ pub fn write_bgra8<M: HostMemory + HostOps>(
     width: u32,
     height: u32,
 ) -> bool {
-    if width == 0
-        || height == 0
-        || width > MAX_SCANOUT_DIM
-        || height > MAX_SCANOUT_DIM
-        || src_stride < width.saturating_mul(RGBA8_BPP)
-    {
-        return false;
-    }
+    write_bgra8_skipping(state, host, mapping_id, src, src_stride, width, height, &[])
+}
+
+/// [`write_bgra8`], leaving `skip` untouched.
+///
+/// A deferred writeback holds a frame the device rendered and lands it in the
+/// guest's pages later. If the guest CPU wrote some of those pages in between,
+/// writing the whole frame loses the guest's stores and dropping the frame loses
+/// the device's; `skip` is how the caller expresses the third answer, one page
+/// at a time, from the hypervisor's own per-page report.
+///
+/// Everything else is unchanged, deliberately — including the cache refresh and
+/// the epoch bump at the tail. The frame *is* what the device rendered, and the
+/// host-side copies of it stay that; what `skip` decides is only which of those
+/// bytes the guest's own memory is allowed to keep instead.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the geometry the frame is in, plus the ranges its owner may not overwrite"
+)]
+pub fn write_bgra8_skipping<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+    src: &[u8],
+    src_stride: u32,
+    width: u32,
+    height: u32,
+    skip: SkipRanges<'_>,
+) -> bool {
+    write_bgra8_inner(
+        state,
+        host,
+        mapping_id,
+        src,
+        CacheOutcome::Publish(None),
+        src_stride,
+        width,
+        height,
+        skip,
+        None,
+    )
+}
+
+/// [`write_bgra8_skipping`] for a caller that owns its frame behind an `Arc`.
+///
+/// The tail of every non-skipping writeback publishes the frame to
+/// [`crate::runtime::surface_cache`], and a caller holding only a borrow has to
+/// build a second whole-frame buffer for it to keep. On the 8.29 MB composite
+/// that copy costs 1.21 ms about 100 times a second — more than landing the same
+/// bytes in the guest's own pages does. The cache already stores its frames
+/// behind an `Arc` so that an entry and a deferred window can name one
+/// allocation, so a caller that arrives holding one can publish it rather than
+/// duplicate it.
+///
+/// The sharing conditions are checked rather than assumed, because the cache's
+/// contract is a tight BGRA8 frame at the entry's geometry and an allocation that
+/// is not one would be handed to every later reader as though it were: the
+/// pointer has to be the one the rest of this write read from, the pitch has to
+/// be the packed row length, and the allocation has to cover the whole frame.
+/// Anything else takes the copying publish.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the geometry the frame is in, plus the ranges its owner may not overwrite"
+)]
+pub fn write_bgra8_owned<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+    src: &std::sync::Arc<Vec<u8>>,
+    src_stride: u32,
+    width: u32,
+    height: u32,
+    skip: SkipRanges<'_>,
+) -> bool {
+    write_bgra8_inner(
+        state,
+        host,
+        mapping_id,
+        src.as_slice(),
+        CacheOutcome::Publish(Some(src)),
+        src_stride,
+        width,
+        height,
+        skip,
+        None,
+    )
+}
+
+/// [`write_bgra8_skipping`] for a caller whose frame is about to stop existing.
+///
+/// The other writers end by publishing the frame to
+/// [`crate::runtime::surface_cache`], which is nearly free when the caller
+/// already owns an `Arc` and a whole-frame copy when it does not. A caller
+/// holding borrowed bytes — the deferred render flush reading a resident
+/// through `engine::LeasedFrame`, which is a Vulkan staging buffer it gives
+/// back a moment later — would pay that copy purely to fill a cache entry, and
+/// `render_flush_cache_used` prices those entries at 0.4 %: 15 reads against
+/// 3751 that nothing touched before the next flush replaced them.
+///
+/// So this writer drops the entry instead of refreshing it, and dropping is the
+/// only correct alternative. Leaving the previous frame behind would serve a
+/// later reader an old frame with nothing saying so, which is the stale-tile
+/// class the fence binding exists to close. Every reader that misses falls
+/// through to a source that does hold this frame — the surface's own guest
+/// pages, which this write has just landed, or the resident it came out of —
+/// so the miss costs a slower route to the same pixels and never wrong ones.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the geometry the frame is in, plus the ranges its owner may not overwrite"
+)]
+pub fn write_bgra8_uncached<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+    src: &[u8],
+    src_stride: u32,
+    width: u32,
+    height: u32,
+    skip: SkipRanges<'_>,
+) -> bool {
+    write_bgra8_uncached_changed(
+        state, host, mapping_id, src, src_stride, width, height, skip, None,
+    )
+}
+
+/// [`write_bgra8_uncached`], storing only the frame ranges `changed` names.
+///
+/// `changed` is in the frame's own tightly-packed byte space — `width * 4` per
+/// row, no padding — which is what the render writeback's difference pass
+/// answers in. `None` stores the frame whole; `Some(&[])` stores none of it,
+/// which is the correct landing for a frame identical to the one already in the
+/// guest's pages.
+///
+/// Storing a subset is sound because not writing a byte that already holds the
+/// value being written is an identity: the pages end holding exactly what an
+/// eager landing would have left, so `mark_mapping_written`, the guest-write
+/// stamp and every later reader see what they would have seen. What the caller
+/// owes is that the ranges really are the only ones that differ — a claim about
+/// the destination, not about the frame, and one this function cannot check.
+///
+/// Only the uncached form takes it. The publishing forms hand `src` to
+/// [`crate::runtime::surface_cache`], which would then serve the bytes outside
+/// the runs to later readers, and outside the runs there are no bytes.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the geometry the frame is in, plus the two independent narrowings of it"
+)]
+pub fn write_bgra8_uncached_changed<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+    src: &[u8],
+    src_stride: u32,
+    width: u32,
+    height: u32,
+    skip: SkipRanges<'_>,
+    changed: Option<ChangedRuns<'_>>,
+) -> bool {
+    write_bgra8_inner(
+        state,
+        host,
+        mapping_id,
+        src,
+        CacheOutcome::Invalidate,
+        src_stride,
+        width,
+        height,
+        skip,
+        changed,
+    )
+}
+
+/// Land every deferred window overlapping the sample window a BGRA8 writeback
+/// of this mapping would cover.
+///
+/// The same flush [`write_bgra8_uncached`] and its siblings make on their own
+/// behalf, exposed so a caller can make it *before* it acquires the bytes it
+/// intends to write.
+///
+/// `write_bgra8_uncached`'s frame is borrowed from the engine's readback buffer
+/// under a lease, and a lease holder must not re-enter the engine: a teardown
+/// waiting for that lease to come back holds the engine lock, so a holder that
+/// asks for it stalls until the teardown's quiesce budget expires and then
+/// reads freed memory. A deferred flush reached from inside the write is
+/// exactly such a re-entry — `flush_render_one` reads a resident. Running the
+/// flush first leaves the writer's own call nothing to find, because nothing
+/// between the two arms a window: only a guest Store does, and no guest command
+/// is decoded inside a writeback.
+///
+/// Answers false for a geometry that has no sample window, which is the same
+/// geometry the writeback itself would refuse.
+pub fn flush_windows_under_bgra8_write<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+    width: u32,
+    height: u32,
+) -> bool {
     let Some(m) = state.mappings.get(&mapping_id) else {
         return false;
     };
-    if !m.mapped || m.page_entries.is_empty() {
+    let (mw, mh, format) = mapping_write_geometry(m, width, height);
+    let Some((base_off, _, span_end)) = type11_sample_window(m, mapping_id, mw, mh, format) else {
         return false;
-    }
-    let (mw, mh, format) = if m.has_geom {
+    };
+    crate::runtime::storage_flush::flush_intersecting(state, host, mapping_id, base_off, span_end);
+    true
+}
+
+/// The geometry and pixel format a writeback to this mapping must land in.
+///
+/// A mapping that has declared its own (`has_geom`) owns the answer, and a
+/// zero format there means BGRA8; one that has not takes the caller's geometry.
+/// Factored out because the writeback and the pre-flush above must resolve it
+/// identically — a pre-flush computed at a different extent than the write
+/// would leave exactly the windows the write is about to land on.
+fn mapping_write_geometry(m: &MappingEntry, width: u32, height: u32) -> (u32, u32, u16) {
+    if m.has_geom {
         (
             m.width,
             m.height,
@@ -185,20 +786,92 @@ pub fn write_bgra8<M: HostMemory + HostOps>(
         )
     } else {
         (width, height, MTL_FORMAT_BGRA8_UNORM)
+    }
+}
+
+/// What a writeback leaves in the host surface cache when it is done.
+enum CacheOutcome<'a> {
+    /// Publish this frame as the mapping's entry, sharing the caller's
+    /// allocation when it is one the cache's contract allows sharing.
+    Publish(Option<&'a std::sync::Arc<Vec<u8>>>),
+    /// Drop the mapping's entry. For a caller that cannot leave the cache
+    /// naming its frame, because the memory holding it is about to be reused.
+    Invalidate,
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the geometry the frame is in, its owner when it has one, plus the \
+              ranges that owner may not overwrite"
+)]
+fn write_bgra8_inner<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+    src: &[u8],
+    cache: CacheOutcome<'_>,
+    src_stride: u32,
+    width: u32,
+    height: u32,
+    skip: SkipRanges<'_>,
+    changed: Option<ChangedRuns<'_>>,
+) -> bool {
+    // A narrowed frame holds nothing outside its runs, and the cache stores
+    // whatever `src` holds, so the two are incompatible by construction rather
+    // than by convention. Refused rather than asserted: this is reachable only
+    // from a caller that has not been written yet, and a refusal names it.
+    if let (Some(runs), CacheOutcome::Publish(_)) = (changed, &cache) {
+        return refuse(
+            mapping_id,
+            SurfaceWriteRefusal::PartialFramePublished { runs: runs.len() },
+        );
+    }
+    if width == 0 || height == 0 || width > MAX_SCANOUT_DIM || height > MAX_SCANOUT_DIM {
+        return refuse(mapping_id, SurfaceWriteRefusal::Geometry { width, height });
+    }
+    if src_stride < width.saturating_mul(RGBA8_BPP) {
+        return refuse(mapping_id, SurfaceWriteRefusal::SourceStride { src_stride, width });
+    }
+    let Some(m) = state.mappings.get(&mapping_id) else {
+        return refuse(mapping_id, SurfaceWriteRefusal::MappingAbsent);
     };
+    if !m.mapped || m.page_entries.is_empty() {
+        return refuse(mapping_id, SurfaceWriteRefusal::MappingNotResident);
+    }
+    let (mw, mh, format) = mapping_write_geometry(m, width, height);
     if mw != width || mh != height {
-        return false;
+        return refuse(
+            mapping_id,
+            SurfaceWriteRefusal::GeometryMoved {
+                latched_width: mw,
+                latched_height: mh,
+                frame_width: width,
+                frame_height: height,
+            },
+        );
     }
     let Some((base_off, bpr_u32, span_end)) = type11_sample_window(m, mapping_id, mw, mh, format)
     else {
-        return false;
+        return refuse(
+            mapping_id,
+            SurfaceWriteRefusal::WindowUnresolved {
+                width: mw,
+                height: mh,
+                format,
+            },
+        );
     };
     // Deferred-writeback flush-on-access: land pending resident content in
     // these pages before touching them.
     crate::runtime::storage_flush::flush_intersecting(state, host, mapping_id, base_off, span_end);
+    // Taken after the flush, because the flush can invalidate this mapping, and
+    // once for the whole frame, because the loop below writes a row at a time.
+    let Some(vouched) = vouch_for_write(state, host, mapping_id, "bgra8") else {
+        return refuse(mapping_id, SurfaceWriteRefusal::PagesNotOurs);
+    };
     let bpr = bpr_u32 as usize;
     let Some(tight) = pixel_format::tight_row_bytes(mw, format) else {
-        return false;
+        return refuse(mapping_id, SurfaceWriteRefusal::FormatRowLength { format });
     };
     let tight = tight as usize;
 
@@ -210,35 +883,132 @@ pub fn write_bgra8<M: HostMemory + HostOps>(
     } else {
         Some(vec![0u8; (mw as usize) * (RGBA8_BPP as usize)])
     };
+    // Whether a row can go straight from `src` to the guest without passing
+    // through `row`.
+    //
+    // `row` is the *conversion* destination: when the mapping's format is
+    // already BGRA8 there is nothing to convert, and staging through it copied
+    // every byte of the frame a second time — an extra 8 MB memcpy per flush on
+    // the composite surface, ~106 times a second.
+    //
+    // Removing it is strictly less work for identical bytes, but do not go
+    // looking for it in `readback_split`. It was landed on the prediction that
+    // `write_us` would drop by the ~0.8 ms the same byte count costs elsewhere,
+    // and a live driven boot then measured 2.79 ms per flush against 2.68 ms
+    // before — no change outside run-to-run noise. The prediction was wrong
+    // about *which* copy is expensive: `row` is a few KiB and stays in L1, so
+    // filling it is nearly free, while the copy into cold guest pages is the
+    // one that costs and is still there. `write_us` runs at ~3 GB/s against
+    // ~9 GB/s for the readback's own memcpy of the identical frame, which is
+    // the shape of a cache-cold scattered write, not of an avoidable pass.
+    //
+    // The consequence for whoever shrinks this next: the cost is bytes landing
+    // in guest RAM, so fewer bytes helps proportionally and fewer staging hops
+    // does not.
+    //
+    // Only sound while the row is byte-identical, which is why `tight` is
+    // compared rather than assumed: `tight_row_bytes` is the format's own
+    // packed row length, and if it ever disagrees with the source's `mw * 4`
+    // the staged path still runs. That also keeps `row`'s reuse across rows
+    // safe — a short source row would otherwise leave the previous row's bytes
+    // in its tail.
+    let direct_rows = rgba.is_none() && tight == (mw as usize) * (RGBA8_BPP as usize);
+
+    // Once for the frame, before either path: the difference pass answers in
+    // the frame's own tightly-packed space and everything below is in mapping
+    // offsets, so the crossing happens exactly here.
+    let changed_map = changed
+        .map(|runs| tight_runs_to_mapping(runs, base_off, bpr as u64, tight as u64, mh as u64));
+    let changed_map = changed_map.as_deref();
+
+    use crate::runtime::drain::{
+        SurfaceWritePhase, note_surface_write_path, note_surface_write_phase,
+    };
+    let frame_bytes = (mh as u64).saturating_mul(tight as u64);
 
     // Fast path: one packed view, poke rows in place.
-    if let Some((ptr, _)) = contig_for_span(state, host, mapping_id, span_end) {
+    if let Some((ptr, _)) = contig_for_write(state, host, mapping_id, span_end, &vouched, src) {
+        note_surface_write_path(true, frame_bytes);
+        // Taken once for the frame so an audited landing is compared whole,
+        // then charged per row segment. This path reaches
+        // `mapper::write_mapping_bytes` not at all — it pokes rows straight
+        // into a contig view — so without its own hook the audit goes silent
+        // on any host whose mappings are host-contiguous, and `write_split`'s
+        // `contig`/`frag` is the only thing that would say so.
+        let mut audit = crate::runtime::land_redundancy::begin_audit(
+            crate::runtime::land_redundancy::Leg::Mapping,
+        );
+        let page_size = state.page_size();
+        let land_started = std::time::Instant::now();
         // SAFETY: contig covers span_end; revalidated in ensure_contig_view.
         let base = unsafe { (ptr as *mut u8).add(base_off as usize) };
         for y in 0..mh {
             let src_off = (y as usize) * (src_stride as usize);
             let src_row_len = (mw as usize) * (RGBA8_BPP as usize);
             if src_off + src_row_len > src.len() {
-                return false;
+                return refuse(
+                    mapping_id,
+                    SurfaceWriteRefusal::SourceShort {
+                        need: src_off + src_row_len,
+                        have: src.len(),
+                        row: y,
+                    },
+                );
             }
             let src_row = &src[src_off..src_off + src_row_len];
-            if let Some(ref mut rgba_row) = rgba {
-                if !convert_row_to_rgba8(MTL_FORMAT_BGRA8_UNORM, src_row, mw, rgba_row) {
-                    return false;
-                }
-                if !convert_rgba8_to_row(format, rgba_row, mw, &mut row) {
-                    return false;
-                }
+            let row_bytes: &[u8] = if direct_rows {
+                &src_row[..tight]
             } else {
-                let n = src_row_len.min(row.len());
-                row[..n].copy_from_slice(&src_row[..n]);
-            }
-            let dst = unsafe { base.add((y as usize).saturating_mul(bpr)) };
-            unsafe {
-                std::ptr::copy_nonoverlapping(row.as_ptr(), dst, tight);
+                if let Some(ref mut rgba_row) = rgba {
+                    if !convert_row_to_rgba8(MTL_FORMAT_BGRA8_UNORM, src_row, mw, rgba_row)
+                        || !convert_rgba8_to_row(format, rgba_row, mw, &mut row)
+                    {
+                        return refuse(
+                            mapping_id,
+                            SurfaceWriteRefusal::RowConvert { format, row: y },
+                        );
+                    }
+                } else {
+                    let n = src_row_len.min(row.len());
+                    row[..n].copy_from_slice(&src_row[..n]);
+                }
+                &row
+            };
+            // The row's destination in mapping-offset space, so the skip list —
+            // which is in that space — is subtracted before any pointer exists.
+            let row_off = base_off.saturating_add((y as u64).saturating_mul(bpr as u64));
+            for (lo, hi) in writable_spans(
+                changed_map,
+                skip,
+                row_off,
+                row_off.saturating_add(tight as u64),
+            ) {
+                let within = (lo - row_off) as usize;
+                let len = (hi - lo) as usize;
+                let dst = unsafe { base.add((y as usize).saturating_mul(bpr) + within) };
+                if let Some(walk) = audit.as_mut() {
+                    // `lo` is already the segment's mapping-linear offset, which
+                    // is the space the tiles align in.
+                    //
+                    // SAFETY: as below, and the audit only reads the range.
+                    unsafe {
+                        walk.note_write(lo, dst, &row_bytes[within..within + len], page_size);
+                    }
+                }
+                // SAFETY: `within + len <= tight <= row_bytes.len()`, and the
+                // view covers span_end which is at or past this row's last byte.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(row_bytes.as_ptr().add(within), dst, len);
+                }
             }
         }
+        note_surface_write_phase(
+            SurfaceWritePhase::Land,
+            land_started.elapsed().as_micros() as u64,
+        );
     } else {
+        note_surface_write_path(false, frame_bytes);
+        let stage_started = std::time::Instant::now();
         // Fragmented: stage native rows then multi-import (one map_pages pass set).
         // The sample window ends at the final row's last texel, not at
         // `bpr * height`; padding after the final row is outside the texture
@@ -248,49 +1018,203 @@ pub fn write_bgra8<M: HostMemory + HostOps>(
             .and_then(|rows| bpr.checked_mul(rows))
             .and_then(|prefix| prefix.checked_add(tight))
         else {
-            return false;
+            return refuse(
+                mapping_id,
+                SurfaceWriteRefusal::FrameExtent { bpr, height: mh },
+            );
         };
-        let mut frame = vec![0u8; frame_len];
-        for y in 0..mh {
-            let src_off = (y as usize) * (src_stride as usize);
-            let src_row_len = (mw as usize) * (RGBA8_BPP as usize);
-            if src_off + src_row_len > src.len() {
-                return false;
-            }
-            let src_row = &src[src_off..src_off + src_row_len];
-            if let Some(ref mut rgba_row) = rgba {
-                if !convert_row_to_rgba8(MTL_FORMAT_BGRA8_UNORM, src_row, mw, rgba_row) {
-                    return false;
+        // The staged buffer is `src` itself whenever the layout it would be
+        // built into is the layout `src` already has: no conversion (the rows go
+        // through untouched), the mapping's row pitch equal to the packed row
+        // length (so there is no inter-row padding to zero-fill), and a source
+        // pitch equal to it too (so the rows are already consecutive). Under all
+        // three, byte `i` of the staged frame is byte `i` of `src` for every
+        // `i < frame_len`, and building it copies 8 MB to produce a slice we are
+        // holding.
+        //
+        // Each condition is load-bearing rather than defensive. Drop the pitch
+        // equality and the gaps between rows — which the guest's allocator may
+        // have given to something else — stop being zeroed and start carrying
+        // whatever `src` has at those offsets. Drop `direct_rows` and the rows
+        // are supposed to be converted on the way through.
+        let staged: std::borrow::Cow<'_, [u8]> = if direct_rows
+            && bpr == tight
+            && src_stride as usize == tight
+            && src.len() >= frame_len
+        {
+            std::borrow::Cow::Borrowed(&src[..frame_len])
+        } else {
+            let mut frame = vec![0u8; frame_len];
+            for y in 0..mh {
+                let src_off = (y as usize) * (src_stride as usize);
+                let src_row_len = (mw as usize) * (RGBA8_BPP as usize);
+                if src_off + src_row_len > src.len() {
+                    return refuse(
+                        mapping_id,
+                        SurfaceWriteRefusal::SourceShort {
+                            need: src_off + src_row_len,
+                            have: src.len(),
+                            row: y,
+                        },
+                    );
                 }
-                if !convert_rgba8_to_row(format, rgba_row, mw, &mut row) {
-                    return false;
+                let src_row = &src[src_off..src_off + src_row_len];
+                let row_bytes: &[u8] = if direct_rows {
+                    &src_row[..tight]
+                } else {
+                    if let Some(ref mut rgba_row) = rgba {
+                        if !convert_row_to_rgba8(MTL_FORMAT_BGRA8_UNORM, src_row, mw, rgba_row)
+                            || !convert_rgba8_to_row(format, rgba_row, mw, &mut row)
+                        {
+                            return refuse(
+                                mapping_id,
+                                SurfaceWriteRefusal::RowConvert { format, row: y },
+                            );
+                        }
+                    } else {
+                        let n = src_row_len.min(row.len());
+                        row[..n].copy_from_slice(&src_row[..n]);
+                    }
+                    &row
+                };
+                let dst_off = (y as usize).saturating_mul(bpr);
+                if dst_off + tight > frame.len() {
+                    return refuse(
+                        mapping_id,
+                        SurfaceWriteRefusal::StagedShort {
+                            need: dst_off + tight,
+                            have: frame.len(),
+                            row: y,
+                        },
+                    );
                 }
-            } else {
-                let n = src_row_len.min(row.len());
-                row[..n].copy_from_slice(&src_row[..n]);
+                frame[dst_off..dst_off + tight].copy_from_slice(&row_bytes[..tight]);
             }
-            let dst_off = (y as usize).saturating_mul(bpr);
-            if dst_off + tight > frame.len() {
-                return false;
-            }
-            frame[dst_off..dst_off + tight].copy_from_slice(&row[..tight]);
+            note_surface_write_phase(
+                SurfaceWritePhase::Stage,
+                stage_started.elapsed().as_micros() as u64,
+            );
+            std::borrow::Cow::Owned(frame)
+        };
+        let frame: &[u8] = staged.as_ref();
+        let land_started = std::time::Instant::now();
+        // One call for the whole frame, carrying the runs it should store.
+        //
+        // This used to be one call per surviving run, which is fine for the
+        // handful of ranges a guest-write skip list carries and ruinous for the
+        // thousands a difference bitmap does: every call re-runs
+        // `flush_intersecting` over the deferred windows and re-resolves the
+        // mapping's page list, both `O(pages)`. The selection now travels into
+        // the walk, so the resolution happens once and each imported page run
+        // moves only the parts of itself the runs name.
+        let runs = writable_spans(
+            changed_map,
+            skip,
+            base_off,
+            base_off.saturating_add(frame.len() as u64),
+        );
+        if !mapper::write_mapping_bytes_only(
+            state,
+            host,
+            mapping_id,
+            base_off,
+            frame,
+            Some(&runs),
+            &vouched,
+        ) {
+            return refuse(
+                mapping_id,
+                SurfaceWriteRefusal::MapperWrite {
+                    lo: base_off,
+                    len: frame.len(),
+                },
+            );
         }
-        if !mapper::write_mapping_bytes(state, host, mapping_id, base_off, &frame) {
-            return false;
-        }
+        note_surface_write_phase(
+            SurfaceWritePhase::Land,
+            land_started.elapsed().as_micros() as u64,
+        );
     }
     state.invalidate_storage_residency_window(mapping_id, base_off, span_end);
     let _ = state.mark_mapping_written(mapping_id);
-    let mut cache = vec![0u8; (mw as usize).saturating_mul(mh as usize).saturating_mul(4)];
-    let row_src = width.saturating_mul(RGBA8_BPP) as usize;
-    for y in 0..mh as usize {
-        let so = y * (src_stride as usize);
-        let doff = y * row_src;
-        if so + row_src <= src.len() && doff + row_src <= cache.len() {
-            cache[doff..doff + row_src].copy_from_slice(&src[so..so + row_src]);
-        }
+    if !skip.is_empty() {
+        // A skipping write leaves the guest's pages holding `src` everywhere
+        // except the ranges the guest itself owns, so the pages are now the only
+        // complete copy of this surface and no host-side copy of `src` is its
+        // content any more. Both of them have to be told so.
+        //
+        // The byte cache would answer the type-11 LOAD seed, which prefers it
+        // over the surface's own pages, and hand back exactly the bytes the
+        // guest's stores were preserved *from*.
+        crate::runtime::surface_cache::forget(state, mapping_id);
+        // The resident `src` was read out of does not have the guest's stores
+        // either, but it is NOT retired here: it is also the source other
+        // deferred windows on the same identity are still going to flush from,
+        // and withdrawing its content mid-drain loses their frames outright
+        // (`chain_resident_land_fail reason=read_target`, `deferred_flush_lost
+        // reason=resident_epoch_drift live=None`, both on 1920x1080 scanout
+        // surfaces — measured, and a black screen).
+        //
+        // What disqualifies it instead is the `mark_mapping_written` above,
+        // which advances `surface_content_epoch` past the resident's stamp. Both
+        // rails that would bind a resident in place of this surface compare that
+        // pair — the attachment LOAD elision always did, and the sampled ladder's
+        // resident rung now does too. The caller that produced `src` must
+        // therefore not hand the stamp back after a skipping write; see
+        // `storage_flush::flush_render_one`.
+        //
+        // The guest-write stamp is re-taken, because the device has *adopted*
+        // the guest's stores: they are in the pages it just wrote around.
+        //
+        // Withholding it was the defect this rail shipped with. The stamp is the
+        // `since` every later `guest_written_pages` call is asked against, and
+        // `page_gen` records the harvest that last saw each page written, never
+        // resetting per consumer. So a stamp that does not move makes the skip
+        // set grow monotonically: one full CPU repaint of a window marks every
+        // page of it, and from then on every deferred flush of that surface
+        // skips the entire extent and the device's composite never reaches guest
+        // memory again. Measured live as a desktop that goes black and stays
+        // black, at `render_flush_preserved_guest_write` ~65 a second, on a boot
+        // whose sampled resident rung was gated off — so it was this rail and
+        // not that one.
+        //
+        // It is honest as well as necessary: the stamp says "no host-side copy
+        // is known stale relative to these pages", and after the two retirements
+        // above there is no host-side copy at all.
+        crate::runtime::mapper::stamp_guest_write_gen(state, host, mapping_id);
+        return true;
     }
-    crate::runtime::surface_cache::store(state, mapping_id, mw, mh, cache);
+    let cache_started = std::time::Instant::now();
+    let tight_frame = (mw as usize)
+        .saturating_mul(mh as usize)
+        .saturating_mul(RGBA8_BPP as usize);
+    match cache {
+        CacheOutcome::Invalidate => crate::runtime::surface_cache::forget(state, mapping_id),
+        CacheOutcome::Publish(shared) => match shared.filter(|owner| {
+            src_stride == mw.saturating_mul(RGBA8_BPP)
+                && owner.len() >= tight_frame
+                && std::ptr::eq(owner.as_ptr(), src.as_ptr())
+        }) {
+            Some(owner) => {
+                crate::runtime::surface_cache::store_shared(state, mapping_id, mw, mh, owner.clone())
+            }
+            None => {
+                crate::runtime::surface_cache::store_rows(state, mapping_id, mw, mh, src, src_stride)
+            }
+        },
+    }
+    note_surface_write_phase(
+        SurfaceWritePhase::Cache,
+        cache_started.elapsed().as_micros() as u64,
+    );
+    // This write just made the host copy and the guest pages agree, so it is the
+    // moment the copy's currency can be pinned. Nothing else arms this mapping:
+    // the type-4 sampled ladder's first census read `gw_no_stamp` 14 092 against
+    // `gw_clean` 0 because only the Vulkan Store rails ever stamped, and the
+    // copy that rung serves is written here. Unstamped, the reader cannot tell a
+    // surface the guest has rewritten from one it has not, and must assume the
+    // worst on every bind.
+    crate::runtime::mapper::stamp_guest_write_gen(state, host, mapping_id);
     true
 }
 
@@ -330,19 +1254,7 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
     if !m.mapped || m.page_entries.is_empty() {
         return false;
     }
-    let (mw, mh, format) = if m.has_geom {
-        (
-            m.width,
-            m.height,
-            if m.format != 0 {
-                m.format
-            } else {
-                MTL_FORMAT_BGRA8_UNORM
-            },
-        )
-    } else {
-        (width, height, MTL_FORMAT_BGRA8_UNORM)
-    };
+    let (mw, mh, format) = mapping_write_geometry(m, width, height);
     if mw != width || mh != height {
         return false;
     }
@@ -358,7 +1270,12 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
     let tight = tight as usize;
     let mut native = vec![0u8; tight];
     let mut seed_native = vec![0u8; tight];
-    let contig = contig_for_span(state, host, mapping_id, span_end);
+    // One proof for the whole image: the changed-span loop below writes each
+    // differing row separately, and the walk is a translation per page.
+    let Some(vouched) = vouch_for_write(state, host, mapping_id, "rgba8_changed") else {
+        return false;
+    };
+    let contig = contig_for_write(state, host, mapping_id, span_end, &vouched, rgba);
     // SAFETY: when Some, contig covers span_end.
     let base = contig.map(|(ptr, _)| unsafe { (ptr as *mut u8).add(base_off as usize) });
     for y in 0..mh as usize {
@@ -430,11 +1347,13 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
                     mapping_id,
                     row_moff.saturating_add(start as u64),
                     &native[start..x],
+                    &vouched,
                 ) {
                     return false;
                 }
             }
-        } else if !mapper::write_mapping_bytes(state, host, mapping_id, row_moff, &native) {
+        } else if !mapper::write_mapping_bytes(state, host, mapping_id, row_moff, &native, &vouched)
+        {
             return false;
         }
     }
@@ -456,6 +1375,14 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
         }
     }
     crate::runtime::surface_cache::store(state, mapping_id, mw, mh, cache);
+    // This write just made the host copy and the guest pages agree, so it is the
+    // moment the copy's currency can be pinned. Nothing else arms this mapping:
+    // the type-4 sampled ladder's first census read `gw_no_stamp` 14 092 against
+    // `gw_clean` 0 because only the Vulkan Store rails ever stamped, and the
+    // copy that rung serves is written here. Unstamped, the reader cannot tell a
+    // surface the guest has rewritten from one it has not, and must assume the
+    // worst on every bind.
+    crate::runtime::mapper::stamp_guest_write_gen(state, host, mapping_id);
     true
 }
 
@@ -520,7 +1447,10 @@ pub fn write_raw_rows<M: HostMemory + HostOps>(
     }
     let span_end = (row_bytes as u64).saturating_mul(height as u64);
     let rb = row_bytes as usize;
-    if let Some((ptr, _)) = contig_for_span(state, host, mapping_id, span_end) {
+    let Some(vouched) = vouch_for_write(state, host, mapping_id, "raw_rows") else {
+        return false;
+    };
+    if let Some((ptr, _)) = contig_for_write(state, host, mapping_id, span_end, &vouched, src) {
         // SAFETY: contig covers span_end from offset 0.
         let base = ptr as *mut u8;
         for y in 0..height as usize {
@@ -540,6 +1470,7 @@ pub fn write_raw_rows<M: HostMemory + HostOps>(
                 mapping_id,
                 moff,
                 &src[src_off..src_off + rb],
+                &vouched,
             ) {
                 return false;
             }
@@ -621,6 +1552,40 @@ pub fn read_raw_rows<M: HostMemory + HostOps>(
     true
 }
 
+/// Resolve the window a mapping's own latched geometry names, for a rectangle
+/// addressed in that geometry rather than in an explicit plane window.
+///
+/// The resolution [`read_rect_raw`] and [`write_rect_raw`] share: the latched
+/// format (BGRA8 when the mapping never declared one), the plane window
+/// [`type11_sample_window`] decodes for it, and the texel size. Returns
+/// `(base_offset, bytes_per_row, span_end, bytes_per_texel)`, or `None` when
+/// the mapping is gone, carries no latched geometry, has no decodable window,
+/// has an unknown format, or the rectangle leaves the surface.
+fn mapping_geom_window(
+    state: &DeviceState,
+    mapping_id: u32,
+    origin_x: u32,
+    origin_y: u32,
+    width: u32,
+    height: u32,
+) -> Option<(u64, u32, u64, u32)> {
+    let m = state.mappings.get(&mapping_id)?;
+    if !m.has_geom {
+        return None;
+    }
+    let format = if m.format != 0 {
+        m.format
+    } else {
+        MTL_FORMAT_BGRA8_UNORM
+    };
+    let (base_off, bpr, span_end) = type11_sample_window(m, mapping_id, m.width, m.height, format)?;
+    let bpp = pixel_format::bytes_per_pixel(format)?;
+    if origin_x.saturating_add(width) > m.width || origin_y.saturating_add(height) > m.height {
+        return None;
+    }
+    Some((base_off, bpr, span_end, bpp))
+}
+
 /// Read a rectangular texel region from a mapped type-11 IOSurface.
 /// Contig HostOps view when possible; else multi-import.
 #[allow(
@@ -639,28 +1604,11 @@ pub fn read_rect_raw<M: HostMemory + HostOps>(
     dst: &mut [u8],
     dst_stride: u32,
 ) -> bool {
-    let Some(m) = state.mappings.get(&mapping_id) else {
-        return false;
-    };
-    if !m.has_geom {
-        return false;
-    }
-    let format = if m.format != 0 {
-        m.format
-    } else {
-        MTL_FORMAT_BGRA8_UNORM
-    };
-    let Some((base_off, bpr, span_end)) =
-        type11_sample_window(m, mapping_id, m.width, m.height, format)
+    let Some((base_off, bpr, span_end, bpp)) =
+        mapping_geom_window(state, mapping_id, origin_x, origin_y, width, height)
     else {
         return false;
     };
-    let Some(bpp) = pixel_format::bytes_per_pixel(format) else {
-        return false;
-    };
-    if origin_x.saturating_add(width) > m.width || origin_y.saturating_add(height) > m.height {
-        return false;
-    }
     read_rect_raw_at(
         state, host, mapping_id, base_off, bpr, span_end, origin_x, origin_y, width, height, bpp,
         dst, dst_stride,
@@ -839,28 +1787,11 @@ pub fn write_rect_raw<M: HostMemory + HostOps>(
     src: &[u8],
     src_stride: u32,
 ) -> bool {
-    let Some(m) = state.mappings.get(&mapping_id) else {
-        return false;
-    };
-    if !m.has_geom {
-        return false;
-    }
-    let format = if m.format != 0 {
-        m.format
-    } else {
-        MTL_FORMAT_BGRA8_UNORM
-    };
-    let Some((base_off, bpr, span_end)) =
-        type11_sample_window(m, mapping_id, m.width, m.height, format)
+    let Some((base_off, bpr, span_end, bpp)) =
+        mapping_geom_window(state, mapping_id, origin_x, origin_y, width, height)
     else {
         return false;
     };
-    let Some(bpp) = pixel_format::bytes_per_pixel(format) else {
-        return false;
-    };
-    if origin_x.saturating_add(width) > m.width || origin_y.saturating_add(height) > m.height {
-        return false;
-    }
     write_rect_raw_at(
         state, host, mapping_id, base_off, bpr, span_end, origin_x, origin_y, width, height, bpp,
         src, src_stride,
@@ -986,7 +1917,10 @@ fn write_rect_raw_at_impl<M: HostMemory + HostOps>(
     }
     let rb = row_bytes as usize;
     let bpr = surface_bpr as usize;
-    if let Some((ptr, _)) = contig_for_span(state, host, mapping_id, span_end) {
+    let Some(vouched) = vouch_for_write(state, host, mapping_id, "rect_raw") else {
+        return false;
+    };
+    if let Some((ptr, _)) = contig_for_write(state, host, mapping_id, span_end, &vouched, src) {
         // The fragmented full-plane branch below already rejects on the same bound
         // (`frame_end > span_end`); enforce it here too so the contig fast paths
         // can never overrun. A correctly-sized writeback satisfies this exactly
@@ -1059,7 +1993,14 @@ fn write_rect_raw_at_impl<M: HostMemory + HostOps>(
             crate::observe::off(format!(
                 "mapping_write full_tight_direct mid={mapping_id} bytes={frame_len} bpr={surface_bpr} rows={height}"
             ));
-            if !mapper::write_mapping_bytes(state, host, mapping_id, base_off, &src[..frame_len]) {
+            if !mapper::write_mapping_bytes(
+                state,
+                host,
+                mapping_id,
+                base_off,
+                &src[..frame_len],
+                &vouched,
+            ) {
                 return false;
             }
             let _ = state.mark_mapping_written(mapping_id);
@@ -1076,7 +2017,7 @@ fn write_rect_raw_at_impl<M: HostMemory + HostOps>(
             }
             frame[dst_off..dst_off + rb].copy_from_slice(&src[src_off..src_off + rb]);
         }
-        if !mapper::write_mapping_bytes(state, host, mapping_id, base_off, &frame) {
+        if !mapper::write_mapping_bytes(state, host, mapping_id, base_off, &frame, &vouched) {
             return false;
         }
     } else {
@@ -1091,6 +2032,7 @@ fn write_rect_raw_at_impl<M: HostMemory + HostOps>(
                 mapping_id,
                 moff,
                 &src[src_off..src_off + rb],
+                &vouched,
             ) {
                 return false;
             }
@@ -1108,6 +2050,589 @@ mod tests {
     use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
     use crate::model::{DeviceId, PAGE_SHIFT_ARM64E};
     use crate::runtime::host::FakeHost;
+
+    /// The gap walk is what both writeback paths subtract their skipped ranges
+    /// with, so it is tested on its own: an off-by-one here is a row of pixels
+    /// written into a page the guest owns, or a row of the guest's own bytes
+    /// overwritten, and neither is visible in a frame until much later.
+    #[test]
+    fn unskipped_returns_exactly_the_bytes_no_range_covers() {
+        assert_eq!(unskipped(0, 10, &[]), vec![(0, 10)]);
+        assert_eq!(unskipped(10, 10, &[]), vec![]);
+        // Interior, leading, trailing, and total cover.
+        assert_eq!(unskipped(0, 10, &[(4, 6)]), vec![(0, 4), (6, 10)]);
+        assert_eq!(unskipped(0, 10, &[(0, 4)]), vec![(4, 10)]);
+        assert_eq!(unskipped(0, 10, &[(6, 10)]), vec![(0, 6)]);
+        assert_eq!(unskipped(0, 10, &[(0, 10)]), vec![]);
+        // Ranges outside the window contribute nothing, on either side.
+        assert_eq!(unskipped(10, 20, &[(0, 5), (30, 40)]), vec![(10, 20)]);
+        // Partial overlap at both ends, and several ranges in one window.
+        assert_eq!(
+            unskipped(10, 30, &[(5, 12), (16, 18), (28, 35)]),
+            vec![(12, 16), (18, 28)]
+        );
+    }
+
+    /// The frame the difference pass compares is tightly packed and the guest's
+    /// rows are `bpr` apart, so this is the only crossing between the two
+    /// spaces and an error in it lands pixels at the wrong offset.
+    #[test]
+    fn tight_runs_reach_their_rows_and_merge_only_when_the_pitches_agree() {
+        // Pitches agree: the frame is one linear shift and rows merge, so a run
+        // crossing three rows is one range rather than three.
+        assert_eq!(
+            tight_runs_to_mapping(&[(300, 800)], 4096, 256, 256, 64),
+            vec![(4096 + 300, 4096 + 800)]
+        );
+        // Pitches differ: the same run is one range per row it touches, and the
+        // padding between rows is never named.
+        assert_eq!(
+            tight_runs_to_mapping(&[(300, 800)], 0, 512, 256, 64),
+            vec![(512 + 44, 512 + 256), (1024, 1024 + 256), (1536, 1536 + 32)]
+        );
+        // A run inside one row stays one range under either pitch.
+        assert_eq!(
+            tight_runs_to_mapping(&[(260, 300)], 0, 512, 256, 64),
+            vec![(512 + 4, 512 + 44)]
+        );
+        // The last tile of a frame is usually partial, so a bitmap names bytes
+        // past the final row. They are dropped, not wrapped onto row 0.
+        assert_eq!(
+            tight_runs_to_mapping(&[(200, 400)], 0, 256, 256, 1),
+            vec![(200, 256)]
+        );
+        assert_eq!(tight_runs_to_mapping(&[(300, 400)], 0, 256, 256, 1), vec![]);
+        // Disjoint runs stay disjoint; adjacent ones merge.
+        assert_eq!(
+            tight_runs_to_mapping(&[(0, 16), (16, 32), (64, 80)], 0, 256, 256, 4),
+            vec![(0, 32), (64, 80)]
+        );
+    }
+
+    /// The two narrowings are independent and both subtract.
+    #[test]
+    fn a_changed_selection_and_a_skip_list_compose() {
+        assert_eq!(writable_spans(None, &[], 0, 100), vec![(0, 100)]);
+        assert_eq!(writable_spans(Some(&[]), &[], 0, 100), vec![]);
+        assert_eq!(
+            writable_spans(Some(&[(10, 40)]), &[], 0, 100),
+            vec![(10, 40)]
+        );
+        // The skip list cuts a hole in what the selection named.
+        assert_eq!(
+            writable_spans(Some(&[(10, 40)]), &[(20, 25)], 0, 100),
+            vec![(10, 20), (25, 40)]
+        );
+        // A skip covering the whole selection leaves nothing.
+        assert_eq!(writable_spans(Some(&[(10, 40)]), &[(0, 50)], 0, 100), vec![]);
+    }
+
+    /// A writeback given a change set stores those bytes and leaves every other
+    /// byte of the surface exactly as it found it.
+    ///
+    /// Both storage shapes, because they place bytes by different means — the
+    /// packed one pokes a host view through a raw pointer, the fragmented one
+    /// hands the runs to the mapper's page walk — and a selection honoured by
+    /// one and not the other corrupts only whichever guest allocation happens
+    /// to be scattered.
+    #[test]
+    fn a_changed_run_writeback_stores_only_the_bytes_it_names() {
+        use crate::model::PAGE_SHIFT_X86;
+        const PAGE: u64 = 1 << PAGE_SHIFT_X86;
+        const W: u32 = 64;
+        const H: u32 = 64;
+        // Crosses two page boundaries and starts and ends mid-row, so a walk
+        // that only ever splits on one of the two gets it wrong.
+        const RUN: (u64, u64) = (300, 9000);
+
+        for packed in [true, false] {
+            let mut state = DeviceState::new(DeviceId(2), PAGE_SHIFT_X86);
+            let mut host = FakeHost::new();
+            host.strict_linux_map = !packed;
+            let base_pfn = 0x40u32;
+            host.map_range((base_pfn as u64) << PAGE_SHIFT_X86, 8 * PAGE as usize, 0x55);
+            let order: Vec<u32> = if packed {
+                (0..4).collect()
+            } else {
+                vec![3, 2, 1, 0]
+            };
+            let entries: Vec<u32> = order
+                .iter()
+                .map(|i| ((base_pfn + i) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID)
+                .collect();
+            state.map_surface(4);
+            state.attach_mapping_internal(4, 0);
+            let m = state.mappings.get_mut(&4).unwrap();
+            m.mapping_internal = 1;
+            m.page_entries = entries;
+            assert!(state.set_mapping_geom(4, W, H, MTL_FORMAT_BGRA8_UNORM));
+
+            let frame = vec![0xAAu8; (W * H * 4) as usize];
+            assert!(write_bgra8_uncached_changed(
+                &mut state,
+                &mut host,
+                4,
+                &frame,
+                W * 4,
+                W,
+                H,
+                &[],
+                Some(&[RUN]),
+            ));
+
+            let read = |off: u64| -> u8 {
+                let gpa = ((base_pfn as u64 + order[(off / PAGE) as usize] as u64)
+                    << PAGE_SHIFT_X86)
+                    + (off % PAGE);
+                let mut got = [0u8; 1];
+                host.read_gpa(gpa, &mut got).unwrap();
+                got[0]
+            };
+            for off in 0..(W * H * 4) as u64 {
+                let want = if off >= RUN.0 && off < RUN.1 {
+                    0xAA
+                } else {
+                    0x55
+                };
+                assert_eq!(
+                    read(off),
+                    want,
+                    "packed={packed} byte {off} of a run-limited writeback"
+                );
+            }
+        }
+    }
+
+    /// A frame identical to the one already in the guest's pages names no runs,
+    /// and that is the cheapest correct landing rather than a refusal: nothing
+    /// is stored, and the write still succeeds so its caller goes on to stamp
+    /// the pages as current.
+    #[test]
+    fn an_empty_change_set_stores_nothing_and_still_succeeds() {
+        use crate::model::PAGE_SHIFT_X86;
+        const PAGE: u64 = 1 << PAGE_SHIFT_X86;
+        const W: u32 = 64;
+        const H: u32 = 64;
+
+        for packed in [true, false] {
+            let mut state = DeviceState::new(DeviceId(2), PAGE_SHIFT_X86);
+            let mut host = FakeHost::new();
+            host.strict_linux_map = !packed;
+            let base_pfn = 0x40u32;
+            host.map_range((base_pfn as u64) << PAGE_SHIFT_X86, 8 * PAGE as usize, 0x55);
+            let entries: Vec<u32> = (0..4)
+                .map(|i| ((base_pfn + i) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID)
+                .collect();
+            state.map_surface(4);
+            state.attach_mapping_internal(4, 0);
+            let m = state.mappings.get_mut(&4).unwrap();
+            m.mapping_internal = 1;
+            m.page_entries = entries;
+            assert!(state.set_mapping_geom(4, W, H, MTL_FORMAT_BGRA8_UNORM));
+
+            let frame = vec![0xAAu8; (W * H * 4) as usize];
+            assert!(write_bgra8_uncached_changed(
+                &mut state,
+                &mut host,
+                4,
+                &frame,
+                W * 4,
+                W,
+                H,
+                &[],
+                Some(&[]),
+            ));
+            for page in 0..4u64 {
+                let mut got = [0u8; 4];
+                host.read_gpa((base_pfn as u64 + page) << PAGE_SHIFT_X86, &mut got)
+                    .unwrap();
+                assert_eq!(got, [0x55; 4], "packed={packed} page {page} was touched");
+            }
+        }
+    }
+
+    /// A narrowed frame holds nothing outside its runs, so a writer that would
+    /// hand it to the host surface cache is refused rather than allowed to seed
+    /// later readers from bytes that were never written.
+    #[test]
+    fn a_partial_frame_is_refused_by_a_publishing_writer() {
+        use crate::model::PAGE_SHIFT_X86;
+        let mut state = DeviceState::new(DeviceId(2), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+        assert!(!write_bgra8_inner(
+            &mut state,
+            &mut host,
+            4,
+            &[0u8; 64],
+            CacheOutcome::Publish(None),
+            16,
+            4,
+            4,
+            &[],
+            Some(&[(0, 16)]),
+        ));
+    }
+
+    /// Every row must land at its own offset, with content that can tell rows
+    /// apart.
+    ///
+    /// The skip test below fills the frame with one repeated byte, so it proves
+    /// which *pages* were written and nothing at all about which row went
+    /// where: a writeback that repeated row 0 sixty-four times, or that shifted
+    /// every row by one, passes it unchanged. That is not hypothetical — a
+    /// BGRA8 row no longer passes through the conversion scratch buffer on its
+    /// way to the guest, so the source offset, the tight row length and the
+    /// destination stride are now read from three places that used to be two.
+    ///
+    /// Both storage shapes, because they place rows by different means, and a
+    /// non-BGRA format so the staged path is exercised beside the direct one.
+    #[test]
+    fn a_writeback_lands_every_row_at_its_own_offset() {
+        use crate::model::PAGE_SHIFT_X86;
+        const PAGE: u64 = 1 << PAGE_SHIFT_X86;
+        const W: u32 = 64;
+        const H: u32 = 64;
+        const BPR: usize = (W * 4) as usize;
+
+        for packed in [true, false] {
+            for format in [MTL_FORMAT_BGRA8_UNORM, pixel_format::MTL_FORMAT_RGBA8_UNORM] {
+                let mut state = DeviceState::new(DeviceId(2), PAGE_SHIFT_X86);
+                let mut host = FakeHost::new();
+                host.strict_linux_map = !packed;
+                let base_pfn = 0x40u32;
+                host.map_range((base_pfn as u64) << PAGE_SHIFT_X86, 8 * PAGE as usize, 0);
+                let order: Vec<u32> = if packed {
+                    (0..4).collect()
+                } else {
+                    vec![3, 2, 1, 0]
+                };
+                let entries: Vec<u32> = order
+                    .iter()
+                    .map(|i| ((base_pfn + i) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID)
+                    .collect();
+                state.map_surface(4);
+                state.attach_mapping_internal(4, 0);
+                let m = state.mappings.get_mut(&4).unwrap();
+                m.mapping_internal = 1;
+                m.page_entries = entries;
+                assert!(state.set_mapping_geom(4, W, H, format));
+
+                // Row y is filled with the byte y in every channel, so a row
+                // that lands at the wrong offset is visible as the wrong value
+                // and a duplicated row is visible as a repeat. Channel order
+                // does not matter to that, which is what lets one frame test
+                // both formats.
+                let mut frame = vec![0u8; (W * H * 4) as usize];
+                for y in 0..H as usize {
+                    frame[y * BPR..(y + 1) * BPR].fill(y as u8);
+                }
+                assert!(write_bgra8_skipping(
+                    &mut state, &mut host, 4, &frame, W * 4, W, H, &[]
+                ));
+
+                for y in 0..H as usize {
+                    // Which guest page this row's first byte lives in, and where
+                    // in it, walking the same page list the mapping declares.
+                    let off = y * BPR;
+                    let gpa = ((base_pfn as u64 + order[off / PAGE as usize] as u64)
+                        << PAGE_SHIFT_X86)
+                        + (off as u64 % PAGE);
+                    let mut got = [0u8; 4];
+                    host.read_gpa(gpa, &mut got).unwrap();
+                    assert!(
+                        got.iter().all(|b| *b == y as u8),
+                        "packed={packed} fmt={format:#x} row {y} must read {y:#x}, got {got:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A writeback told to skip a page leaves that page exactly as the guest
+    /// left it, writes every other page, and stops claiming the frame is the
+    /// mapping's content.
+    ///
+    /// Both storage shapes are exercised, because they place bytes by different
+    /// means — the packed one pokes a host view through a raw pointer, the
+    /// fragmented one stages a frame and hands runs to the mapper — and a skip
+    /// honoured by one and not the other is a defect that only appears on
+    /// whichever guest allocation happens to be scattered.
+    ///
+    /// Dropping the host cache at the tail is half the test: it would otherwise
+    /// answer the type-11 LOAD seed with the very bytes the guest's stores were
+    /// preserved from.
+    #[test]
+    fn a_skipping_writeback_leaves_the_guest_its_own_pages() {
+        use crate::model::PAGE_SHIFT_X86;
+        const PAGE: u64 = 1 << PAGE_SHIFT_X86;
+        // 64x64 BGRA8 is 256 bytes a row, 16 KiB in four x86 pages.
+        const W: u32 = 64;
+        const H: u32 = 64;
+
+        for packed in [true, false] {
+            let mut state = DeviceState::new(DeviceId(2), PAGE_SHIFT_X86);
+            let mut host = FakeHost::new();
+            host.strict_linux_map = !packed;
+            let base_pfn = 0x40u32;
+            host.map_range((base_pfn as u64) << PAGE_SHIFT_X86, 8 * PAGE as usize, 0x55);
+            // Reversed page order is a fragmented list to `map_pages`; the same
+            // four pages either way, so the guest bytes are comparable.
+            let order: Vec<u32> = if packed {
+                (0..4).collect()
+            } else {
+                vec![3, 2, 1, 0]
+            };
+            let entries: Vec<u32> = order
+                .iter()
+                .map(|i| ((base_pfn + i) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID)
+                .collect();
+            state.map_surface(4);
+            state.attach_mapping_internal(4, 0);
+            let m = state.mappings.get_mut(&4).unwrap();
+            m.mapping_internal = 1;
+            m.page_entries = entries;
+            assert!(state.set_mapping_geom(4, W, H, MTL_FORMAT_BGRA8_UNORM));
+            crate::runtime::surface_cache::store(
+                &mut state,
+                4,
+                W,
+                H,
+                vec![0u8; (W * H * 4) as usize],
+            );
+
+            let frame = vec![0xAAu8; (W * H * 4) as usize];
+            // Page 2 of the surface, in mapping-offset space.
+            let skip = [(2 * PAGE, 3 * PAGE)];
+            assert!(write_bgra8_skipping(
+                &mut state,
+                &mut host,
+                4,
+                &frame,
+                W * 4,
+                W,
+                H,
+                &skip
+            ));
+
+            for page in 0..4u64 {
+                let gpa = (base_pfn as u64 + order[page as usize] as u64) << PAGE_SHIFT_X86;
+                let mut got = [0u8; 8];
+                host.read_gpa(gpa, &mut got).unwrap();
+                let want = if page == 2 { 0x55 } else { 0xAA };
+                assert!(
+                    got.iter().all(|b| *b == want),
+                    "packed={packed} surface page {page} must read {want:#x}, got {got:?}"
+                );
+            }
+            assert!(
+                crate::runtime::surface_cache::get(&state, 4, W, H).is_none(),
+                "packed={packed}: the cache must stop answering for a mapping the frame no longer describes"
+            );
+        }
+    }
+
+    /// A host write into guest RAM must announce itself, because the hypervisor's
+    /// dirty bitmap is defined not to see it.
+    ///
+    /// The bitmap witnesses guest CPU stores. Everything this device puts into
+    /// the same pages is invisible to it, so a reader holding "the guest has not
+    /// written since I looked" would keep serving a copy that *we* superseded.
+    /// `DeviceState::host_writes` is the only thing that separates the two, and a
+    /// writer that forgets to record there is silent in exactly the way that
+    /// matters.
+    ///
+    /// The read half is the other half of the contract: reads share the same
+    /// mapping walk, and a read that moved the record would make every reader
+    /// re-fetch on account of a reader.
+    /// A dropped writeback must say which check dropped it.
+    ///
+    /// The composite surface is the largest frame this device moves, and losing
+    /// one is a wrong picture that then persists. Sixteen refusal sites used to
+    /// answer with a bare `false` that the caller rendered as one
+    /// `reason=write_refused`, so a reader could tell that the frame had been
+    /// dropped and nothing else.
+    ///
+    /// `GeometryMoved` is the one this test drives because it is the one a
+    /// deferred window can reach without anything being broken: the frame is
+    /// armed at one rect and the surface is re-published at another — which is
+    /// what an appearance change or a wallpaper switch does. Asserting the
+    /// *specific* route is the whole point; asserting `!ok` would pass with every
+    /// site sharing a slug again.
+    #[test]
+    fn a_writeback_refused_because_the_geometry_moved_says_so_by_name() {
+        use crate::model::PAGE_SHIFT_X86;
+        const PAGE: u64 = 1 << PAGE_SHIFT_X86;
+
+        let mut state = DeviceState::new(DeviceId(3), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+        let base_pfn = 0x40u32;
+        host.map_range((base_pfn as u64) << PAGE_SHIFT_X86, 8 * PAGE as usize, 0x55);
+        state.map_surface(4);
+        state.attach_mapping_internal(4, 0);
+        let m = state.mappings.get_mut(&4).unwrap();
+        m.mapping_internal = 1;
+        m.page_entries = (0..4)
+            .map(|i| ((base_pfn + i) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID)
+            .collect();
+        // Latched at 64x64; the frame below is armed at 32x32, as a window armed
+        // before a re-publish would be.
+        assert!(state.set_mapping_geom(4, 64, 64, MTL_FORMAT_BGRA8_UNORM));
+
+        // Deltas, not absolutes: the route counters are process-global and every
+        // other test in this binary shares them, so a sibling reading nonzero
+        // says nothing about this write.
+        const SIBLINGS: [&str; 3] = [
+            "surface_write_mapping_absent",
+            "surface_write_pages_not_ours",
+            "surface_write_source_short",
+        ];
+        let before = crate::runtime::drain::store_route_count("surface_write_geometry_moved");
+        let before_siblings: Vec<u64> = SIBLINGS
+            .iter()
+            .map(|r| crate::runtime::drain::store_route_count(r))
+            .collect();
+
+        let frame = vec![0xAAu8; 32 * 32 * 4];
+        assert!(
+            !write_bgra8(&mut state, &mut host, 4, &frame, 32 * 4, 32, 32),
+            "a frame whose rect is not the surface's must not land"
+        );
+        assert_eq!(
+            crate::runtime::drain::store_route_count("surface_write_geometry_moved"),
+            before + 1,
+            "the writeback was dropped without naming the check that dropped it"
+        );
+        // And no sibling check moved, or the slug is not discriminating.
+        for (route, was) in SIBLINGS.iter().zip(before_siblings) {
+            assert_eq!(
+                crate::runtime::drain::store_route_count(route),
+                was,
+                "{route} fired for a geometry mismatch"
+            );
+        }
+    }
+
+    #[test]
+    fn writing_guest_pages_moves_the_host_write_record_and_reading_them_does_not() {
+        use crate::model::PAGE_SHIFT_X86;
+        const PAGE: u64 = 1 << PAGE_SHIFT_X86;
+        const W: u32 = 64;
+        const H: u32 = 64;
+
+        let mut state = DeviceState::new(DeviceId(3), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+        let base_pfn = 0x40u32;
+        host.map_range((base_pfn as u64) << PAGE_SHIFT_X86, 8 * PAGE as usize, 0x55);
+        let entries: Vec<u32> = (0..4)
+            .map(|i| ((base_pfn + i) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID)
+            .collect();
+        state.map_surface(4);
+        state.attach_mapping_internal(4, 0);
+        let m = state.mappings.get_mut(&4).unwrap();
+        m.mapping_internal = 1;
+        m.page_entries = entries;
+        assert!(state.set_mapping_geom(4, W, H, MTL_FORMAT_BGRA8_UNORM));
+
+        let before = state.host_writes.epoch();
+        let frame = vec![0xAAu8; (W * H * 4) as usize];
+        assert!(write_bgra8(&mut state, &mut host, 4, &frame, W * 4, W, H));
+        assert_ne!(
+            state.host_writes.epoch(),
+            before,
+            "a write into the guest's pages went unannounced"
+        );
+
+        let after_write = state.host_writes.epoch();
+        let mut out = vec![0u8; (W * H * 4) as usize];
+        assert!(crate::runtime::mapper::read_mapping_bytes(
+            &mut state, &mut host, 4, 0, &mut out
+        ));
+        assert_eq!(
+            state.host_writes.epoch(),
+            after_write,
+            "a read moved the write record, so every reader now invalidates every reader"
+        );
+    }
+
+    /// A skipping write must re-take the guest-write stamp, or the set of pages
+    /// it skips grows monotonically until it covers the whole surface and the
+    /// device's composite never reaches guest memory again.
+    ///
+    /// `since` for every later `guest_written_pages` call is this stamp, and the
+    /// host's `page_gen` records the harvest that last saw each page written and
+    /// never resets per consumer. So a stamp that does not move keeps naming
+    /// every page the guest has *ever* written since it was taken. One full CPU
+    /// repaint of a window marks all of them, and from then on each deferred
+    /// flush of that surface skips the entire extent.
+    ///
+    /// That is what this rail shipped with, and it is a desktop that goes black
+    /// and stays black — reproduced live at `render_flush_preserved_guest_write`
+    /// ~65 a second on a boot with the sampled resident rung gated off, which is
+    /// what placed it here rather than there.
+    ///
+    /// The stamp is honest because of what runs beside it: the byte cache is
+    /// dropped and the resident's content claim withdrawn, so when it says "no
+    /// host-side copy is known stale relative to these pages" there is no
+    /// host-side copy at all.
+    #[test]
+    fn a_skipping_writeback_re_takes_the_stamp_so_the_skip_set_cannot_only_grow() {
+        use crate::model::PAGE_SHIFT_X86;
+        const PAGE: u64 = 1 << PAGE_SHIFT_X86;
+        const W: u32 = 64;
+        const H: u32 = 64;
+
+        let mut state = DeviceState::new(DeviceId(3), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+        let base_pfn = 0x40u32;
+        host.map_range((base_pfn as u64) << PAGE_SHIFT_X86, 8 * PAGE as usize, 0x55);
+        let entries: Vec<u32> = (0..4)
+            .map(|i| ((base_pfn + i) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID)
+            .collect();
+        state.map_surface(4);
+        state.attach_mapping_internal(4, 0);
+        let m = state.mappings.get_mut(&4).unwrap();
+        m.mapping_internal = 1;
+        m.page_entries = entries;
+        assert!(state.set_mapping_geom(4, W, H, MTL_FORMAT_BGRA8_UNORM));
+
+        // A Store arms the witness, then the guest paints page 2 of the surface.
+        crate::runtime::mapper::stamp_guest_write_gen(&mut state, &mut host, 4);
+        let token = state.mappings[&4].guest_write_token;
+        assert_ne!(token, 0, "the fake host must be able to watch these pages");
+        host.guest_wrote_page((base_pfn as u64 + 2) << PAGE_SHIFT_X86);
+
+        let stamped_before = state.mappings[&4].guest_write_gen_at_store;
+        assert!(
+            !host
+                .guest_written_pages(token, stamped_before)
+                .unwrap()
+                .is_empty(),
+            "the guest's write must be visible against the stamp the flush would use"
+        );
+
+        let frame = vec![0xAAu8; (W * H * 4) as usize];
+        assert!(write_bgra8_skipping(
+            &mut state,
+            &mut host,
+            4,
+            &frame,
+            W * 4,
+            W,
+            H,
+            &[(2 * PAGE, 3 * PAGE)]
+        ));
+
+        let stamped_after = state.mappings[&4].guest_write_gen_at_store;
+        assert_ne!(
+            stamped_after, 0,
+            "a skipping write that leaves the stamp at 0 makes every later flush skip everything"
+        );
+        assert_eq!(
+            host.guest_written_pages(token, stamped_after),
+            Some(Vec::new()),
+            "the write the device just honoured must not be named again by the next flush"
+        );
+    }
 
     #[test]
     fn write_bumps_generation() {
@@ -1127,6 +2652,60 @@ mod tests {
         // 2x2 BGRA, stride 8
         assert!(write_bgra8(&mut state, &mut host, 3, &src, 8, 2, 2));
         assert_eq!(state.mappings.get(&3).unwrap().content_generation, 1);
+    }
+
+    /// The write that makes the host copy authoritative must also arm the
+    /// witness for it.
+    ///
+    /// This function writes the guest pages and then stores the host render
+    /// cache, so at this instant the two agree — the one moment the copy's
+    /// currency can be pinned. Nothing else armed it: the type-4 sampled
+    /// ladder's first census read `t11rung_host_cache_gw_no_stamp` 14 092
+    /// against `gw_clean` 0, because only the Vulkan Store rails ever stamped
+    /// while the copy that rung serves is written here. Unstamped, the reader
+    /// cannot tell a surface the guest has rewritten from one it has not, and
+    /// has to assume the worst on every bind.
+    #[test]
+    fn a_host_cache_write_arms_the_guest_write_witness_for_the_copy() {
+        use crate::runtime::host::HostOps;
+
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut host = FakeHost::new();
+        let pfn = 0x30u32;
+        let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
+        host.map_range(gpa, 0x4000, 0);
+        let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
+        state.map_surface(11);
+        state.attach_mapping_internal(11, 0);
+        let m = state.mappings.get_mut(&11).unwrap();
+        m.mapping_internal = 1;
+        m.page_entries = vec![entry];
+        assert!(state.set_mapping_geom(11, 2, 2, MTL_FORMAT_BGRA8_UNORM));
+
+        assert_eq!(
+            state.mappings[&11].guest_write_token, 0,
+            "nothing has armed this mapping yet"
+        );
+        let src = [0x11u8, 0x22, 0x33, 0x44, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert!(write_bgra8(&mut state, &mut host, 11, &src, 8, 2, 2));
+
+        let token = state.mappings[&11].guest_write_token;
+        assert_ne!(token, 0, "the store must register the pages it copied");
+        assert_eq!(
+            host.guest_write_gen(token),
+            Some(state.mappings[&11].guest_write_gen_at_store),
+            "the recorded generation must be the one the copy is current as of"
+        );
+
+        // A guest CPU store into the surface, with no device operation: the
+        // recorded generation no longer matches, which is exactly what the
+        // sampled ladder reads to refuse the copy.
+        host.guest_wrote_page(gpa);
+        assert_ne!(
+            host.guest_write_gen(token),
+            Some(state.mappings[&11].guest_write_gen_at_store),
+            "a guest write must move the host's generation away from the stamp"
+        );
     }
 
     /// A guest write drops only the storage-residency mirror windows it
@@ -1161,11 +2740,141 @@ mod tests {
         let survivor = window(1024, 1088);
         state.compute_storage_residency.insert(hit, 5);
         state.compute_storage_residency.insert(survivor, 5);
+        let vouched = mapper::vouch_mapping_pages_verdict(&mut state, &host, 7)
+            .1
+            .expect("no walk to contradict");
         assert!(mapper::write_mapping_bytes(
-            &mut state, &mut host, 7, 16, &[0u8; 32]
+            &mut state, &mut host, 7, 16, &[0u8; 32], &vouched
         ));
         assert!(!state.compute_storage_residency.contains_key(&hit));
         assert!(state.compute_storage_residency.contains_key(&survivor));
+    }
+
+    /// A direct type-11 writeback must not land in a page the guest re-pointed
+    /// away, and this asserts it in the currency of the bug: the bytes of the
+    /// page the surface moved to.
+    ///
+    /// The page-drift witness shipped with exactly one caller — the deferred
+    /// render flush — so this rail, which writes a full frame of pixels through
+    /// `MappingEntry::page_entries`, was unguarded. The crash reports are the
+    /// receipt: WindowServer aborting in `small_free_list_remove_ptr_no_clear`,
+    /// and guest-kernel kalloc poison finding whole freed elements filled with
+    /// `0xff` from offset 0 — opaque white BGRA in memory already handed to
+    /// somebody else.
+    ///
+    /// So the fixture recycles a page the way the guest does: adopt a list walked
+    /// through a live task page table, write a frame (which must land), re-point
+    /// the PTE with no packet — nothing bumps `map_generation`, which is the
+    /// whole defect — and require the second write to refuse. `data1` stands for
+    /// whatever the guest gave those pages to next, seeded with a pattern rather
+    /// than zeroes so "refused" and "wrote zeroes" cannot be confused.
+    #[test]
+    fn a_repointed_surface_refuses_the_write_and_leaves_the_new_owner_alone() {
+        use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+        use crate::model::{Type4Walk, PAGE_SHIFT_X86};
+
+        let page = 1u64 << PAGE_SHIFT_X86;
+        let mut host = FakeHost::new();
+        let dir_gpa = 2u64 << PAGE_SHIFT_X86;
+        let root_gpa = 3u64 << PAGE_SHIFT_X86;
+        let data0 = 4u64 << PAGE_SHIFT_X86;
+        let data1 = 10u64 << PAGE_SHIFT_X86;
+        host.map_range(dir_gpa, page as usize, 0);
+        host.map_range(root_gpa, page as usize, 0);
+        host.map_range(data0, page as usize, 0);
+        host.map_range(data1, page as usize, 0);
+
+        let st32 = |b: &mut [u8], v: u32| b[..4].copy_from_slice(&v.to_le_bytes());
+        let mut d = [0u8; 8];
+        st32(&mut d[DIRECTORY_ROOT_PFN as usize..], 3);
+        st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
+        host.write_gpa(dir_gpa, &d).unwrap();
+        let mut pte = [0u8; 4];
+        st32(&mut pte, (data0 >> PAGE_SHIFT_X86) as u32);
+        host.write_gpa(root_gpa, &pte).unwrap();
+
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        assert!(state.define_task(1, page, 2));
+        let mid = 6;
+        state.map_surface(mid);
+        {
+            let m = state.mappings.get_mut(&mid).unwrap();
+            m.mapped = true;
+            m.page_entries = vec![
+                (((data0 >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID,
+            ];
+            m.type4_walk = Some(Type4Walk {
+                task_id: 1,
+                backing_pfn: 0,
+                map_generation: m.map_generation,
+            });
+        }
+
+        // A tight 8x4 BGRA8 frame of opaque white — the payload the crash census
+        // reads back out of freed guest memory.
+        let (w, h) = (8u32, 4u32);
+        let frame = vec![0xffu8; (w * h * RGBA8_BPP) as usize];
+        let stride = w * RGBA8_BPP;
+        assert!(
+            write_bgra8(&mut state, &mut host, mid, &frame, stride, w, h),
+            "the list was just walked from this page table, so the frame lands"
+        );
+        let mut landed = [0u8; 16];
+        host.read_gpa(data0, &mut landed).unwrap();
+        assert_eq!(landed, [0xffu8; 16], "the first frame reached data0");
+
+        // Now the guest reclaims that page and hands it to something else, which
+        // writes its own bytes there — a malloc small-zone region, say, whose
+        // free-list pointers live *inside* the freed blocks. `0x5a` stands for
+        // them. This is the step the crash reports are about: the corruption
+        // lands in the page the surface *left*, not the one it moved to, because
+        // the device's cached contig view is a `mach_vm_remap` of the old PFNs
+        // and keeps resolving there.
+        host.write_gpa(data0, &[0x5au8; 16]).unwrap();
+
+        // And the surface is re-pointed. No MapMemory2, no UnmapMemory, no
+        // ReplacePhysical — nothing on the wire, so nothing bumps the
+        // incarnation.
+        let generation_before = state.mappings.get(&mid).unwrap().map_generation;
+        st32(&mut pte, (data1 >> PAGE_SHIFT_X86) as u32);
+        host.write_gpa(root_gpa, &pte).unwrap();
+        assert_eq!(
+            state.mappings.get(&mid).unwrap().map_generation,
+            generation_before,
+            "no packet arrived, so nothing bumped the incarnation"
+        );
+
+        let refused = !write_bgra8(&mut state, &mut host, mid, &frame, stride, w, h);
+        // The memory assertion comes first deliberately. A return value is this
+        // crate's opinion about what it did; `data0` is what the guest will
+        // actually find in its heap, and that is the claim the crash reports
+        // dispute. Asserting the opinion first would let a rail that returns
+        // false *after* writing pass the stronger half unread.
+        let mut recycled = [0u8; 16];
+        host.read_gpa(data0, &mut recycled).unwrap();
+        assert_eq!(
+            recycled, [0x5au8; 16],
+            "the page the guest took away must still hold its new owner's bytes \
+             — this is the guest heap corruption the whole goal is about"
+        );
+        assert!(
+            refused,
+            "and the caller is told, so a lost frame is never read as a landed one"
+        );
+
+        // Refusing once is not enough: `page_entries` is what every later reader
+        // and writer resolves through, so a list a fresh walk has contradicted
+        // has to stop being believed rather than be skipped once.
+        assert!(
+            state.mappings.get(&mid).unwrap().page_entries.is_empty(),
+            "the contradicted list is dropped, so the next bind re-resolves"
+        );
+        assert_ne!(
+            state.mappings.get(&mid).unwrap().map_generation,
+            generation_before,
+            "and every window still armed against the old incarnation refuses \
+             on the map_generation check it already had"
+        );
     }
 
     /// compute_writeback_amplification: fragmented texture writeback imports
@@ -1211,6 +2920,61 @@ mod tests {
         ));
         assert_eq!(row, [0x2a; 16]);
         assert_eq!(calls_after_write, 2);
+    }
+
+    /// The BGRA row writers reach `observe::footprint`.
+    ///
+    /// This is the rail the first cut of the footprint's completeness gate
+    /// missed, and it is the biggest one in the device. These writers never call
+    /// `mapper::write_mapping_bytes` and never call `HostOps::map_pages`: they
+    /// take a contig view through `contig_for_write` and poke rows straight into
+    /// it. A gate that scanned for `map_pages` callers therefore scored this
+    /// file as reaching guest RAM by no mechanism at all — which was true of the
+    /// needle and false of the file.
+    ///
+    /// A missing mark here would have left the footprint empty of nearly every
+    /// pixel this device writes, and an empty set answers "we never wrote there"
+    /// to every panic it is asked about.
+    #[test]
+    fn a_bgra_row_write_marks_the_footprint_through_its_contig_view() {
+        use crate::model::PAGE_SHIFT_X86;
+        use crate::observe::footprint;
+
+        let _fp = footprint::exclusive_for_tests();
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+        let page = 1u64 << PAGE_SHIFT_X86;
+        // Adjacent so the contig view packs — this is the path production takes.
+        let gpa0 = 0x5000_0000u64;
+        host.map_range(gpa0, 2 * page as usize, 0);
+        let mid = 12u32;
+        state.map_surface(mid);
+        {
+            let m = state.mappings.get_mut(&mid).unwrap();
+            m.mapped = true;
+            m.mapping_internal = 1;
+            m.page_entries = vec![
+                (((gpa0 >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID,
+                ((((gpa0 + page) >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT)
+                    | PAGE_ENTRY_VALID,
+            ];
+        }
+        assert!(state.set_mapping_geom(mid, 2, 2, MTL_FORMAT_BGRA8_UNORM));
+        assert!(
+            mapper::ensure_contig_view(&mut state, &mut host, mid).is_some(),
+            "the fixture must take the contig path or it tests the other rail"
+        );
+        let src = [0xFFu8; 16];
+        assert!(write_bgra8(&mut state, &mut host, mid, &src, 8, 2, 2));
+
+        assert!(
+            footprint::wrote_gpa(gpa0),
+            "the surface's first frame must be in the set"
+        );
+        assert!(
+            !footprint::wrote_gpa(gpa0 + 8 * page),
+            "and nothing beyond the surface"
+        );
     }
 
     /// Linux product: non-packed page list still lands BGRA via multi-import.
@@ -1842,6 +3606,7 @@ mod tests {
             },
             crate::model::DeferredOwner::Render {
                 armed_seq: 1,
+                armed_stamp_seq: 0,
                 source: crate::model::RenderWindowSource::Owned(std::sync::Arc::new(frame.clone())),
             },
         );

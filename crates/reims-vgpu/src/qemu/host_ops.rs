@@ -68,6 +68,37 @@ pub struct ReimsVgpuHostOps {
     /// teardown. Nothing imports guest pages now, `unmap_pages` on that shim
     /// really deallocates, and the flag is back to the narrow claim above.
     pub map_pages_stable: c_int,
+    /// Register `count` page-aligned GPAs as one guest-write-tracked set and
+    /// return a non-zero opaque token, or 0 when the host has no dirty bitmap.
+    /// Mutates QEMU MemoryRegion logging state, so the shim may only do the
+    /// enabling part with the BQL held — see the C side for how it defers.
+    pub track_guest_writes: Option<
+        unsafe extern "C" fn(
+            ctx: *mut c_void,
+            gpas: *const u64,
+            count: usize,
+            page_size: usize,
+        ) -> u64,
+    >,
+    /// Release a token from `track_guest_writes`.
+    pub untrack_guest_writes: Option<unsafe extern "C" fn(ctx: *mut c_void, token: u64)>,
+    /// Monotonic count of host observations that some page of the token's set
+    /// was written; 0 for an unknown or not-yet-armed token. Safe from any
+    /// thread.
+    pub guest_write_gen: Option<unsafe extern "C" fn(ctx: *mut c_void, token: u64) -> u64>,
+    /// Page-aligned GPAs of the token's set written since `since_gen`, into
+    /// `out`, returning how many — or -1 for every case where the answer is not
+    /// knowable and the caller must assume the whole set was written. Safe from
+    /// any thread.
+    pub guest_written_pages: Option<
+        unsafe extern "C" fn(
+            ctx: *mut c_void,
+            token: u64,
+            since_gen: u64,
+            out: *mut u64,
+            max: usize,
+        ) -> i64,
+    >,
 }
 
 // SAFETY: QEMU keeps the table valid for the device lifetime; callbacks only
@@ -75,6 +106,39 @@ pub struct ReimsVgpuHostOps {
 // pointers and never move the C context.
 unsafe impl Send for ReimsVgpuHostOps {}
 unsafe impl Sync for ReimsVgpuHostOps {}
+
+#[cfg(test)]
+impl ReimsVgpuHostOps {
+    /// A correctly-versioned table with every callback absent.
+    ///
+    /// Tests that exercise the missing-callback declines start here and fill in
+    /// only the callback under test. It lives beside the struct because it
+    /// names every field: two test modules each kept an identical copy of this
+    /// list, so a new field in the C ABI had to be written out in three places
+    /// that agreed.
+    pub(crate) fn null() -> Self {
+        Self {
+            abi_version: crate::qemu::abi::REIMS_VGPU_QEMU_ABI_VERSION,
+            struct_size: std::mem::size_of::<Self>() as u32,
+            ctx: std::ptr::null_mut(),
+            read_gpa: None,
+            write_gpa: None,
+            mono_ns: None,
+            schedule_bh: None,
+            read_kva: None,
+            read_xreg: None,
+            map_pages: None,
+            unmap_pages: None,
+            map_pages_stable: 0,
+            track_guest_writes: None,
+            untrack_guest_writes: None,
+            guest_write_gen: None,
+            guest_written_pages: None,
+            is_ram_gpa: None,
+            notify_actions: None,
+        }
+    }
+}
 
 /// Failures in the QEMU service adapter that cannot ride a fallible HostOps
 /// return value.
@@ -227,22 +291,20 @@ impl From<HostAction> for ReimsVgpuHostAction {
 ///   the slot-level queue and `notify_actions`-scheduled immediately, so a
 ///   guest ISR sees its stamp-completion MSI while the drain worker is still
 ///   rendering later packets (ack fast / render async).
+///
+/// Both rails are always present. There was a second constructor that left
+/// `prompt` unset, so that `enqueue` fell through to the single lock-owning
+/// queue; no product site ever called it, which made the `None` arm — and the
+/// "IRQ pulses wait for the drain tranche" behaviour behind it — reachable
+/// only from the test written to describe it.
 pub struct QemuHost<'a> {
     ops: &'a ReimsVgpuHostOps,
     actions: &'a mut VecDeque<HostAction>,
-    prompt: Option<&'a parking_lot::Mutex<VecDeque<HostAction>>>,
+    prompt: &'a parking_lot::Mutex<VecDeque<HostAction>>,
 }
 
 impl<'a> QemuHost<'a> {
-    pub fn new(ops: &'a ReimsVgpuHostOps, actions: &'a mut VecDeque<HostAction>) -> Self {
-        Self {
-            ops,
-            actions,
-            prompt: None,
-        }
-    }
-
-    pub fn with_prompt(
+    pub fn new(
         ops: &'a ReimsVgpuHostOps,
         actions: &'a mut VecDeque<HostAction>,
         prompt: &'a parking_lot::Mutex<VecDeque<HostAction>>,
@@ -250,7 +312,7 @@ impl<'a> QemuHost<'a> {
         Self {
             ops,
             actions,
-            prompt: Some(prompt),
+            prompt,
         }
     }
 
@@ -312,6 +374,16 @@ impl HostMemory for QemuHost<'_> {
         // SAFETY: QEMU owns ctx; buf is valid for len.
         let rc = unsafe { f(self.ops.ctx, gpa, buf.as_ptr(), buf.len()) };
         if rc == 0 {
+            // The only `HostMemory::write_gpa` that reaches real guest RAM, so
+            // it is where that whole funnel is recorded. `FakeHost` deliberately
+            // does not mark: a fixture's writes are not this device's, and
+            // counting them would put test addresses in a set whose entire
+            // purpose is to be compared against a live guest's panic.
+            crate::observe::footprint::note_written_range(
+                crate::observe::footprint::Rail::Gpa,
+                gpa,
+                buf.len() as u64,
+            );
             Ok(())
         } else {
             Err(Self::callback_decline(
@@ -340,44 +412,43 @@ impl HostOps for QemuHost<'_> {
         // Prompt rail: IRQ pulses and cursor moves carry no device state and
         // must not wait for the drain tranche to finish. Push to the slot
         // queue (poppable without the device lock) and wake the delivery BH.
-        if let Some(prompt) = self.prompt {
-            match action.kind {
-                HostActionKind::IrqGfxPulse | HostActionKind::IrqIosfcPulse => {
-                    let mut q = prompt.lock();
-                    // Coalesce: an undelivered pulse of the same kind already
-                    // covers this one (status bits accumulate in the r2c regs).
-                    if !q.iter().any(|a| a.kind == action.kind) {
-                        q.push_back(action);
-                    }
-                    drop(q);
-                    self.notify_actions();
-                    return;
-                }
-                HostActionKind::CursorUpdate => {
-                    let mut q = prompt.lock();
-                    q.retain(|a| a.kind != HostActionKind::CursorUpdate);
+        let prompt = self.prompt;
+        match action.kind {
+            HostActionKind::IrqGfxPulse | HostActionKind::IrqIosfcPulse => {
+                let mut q = prompt.lock();
+                // Coalesce: an undelivered pulse of the same kind already
+                // covers this one (status bits accumulate in the r2c regs).
+                if !q.iter().any(|a| a.kind == action.kind) {
                     q.push_back(action);
-                    drop(q);
-                    self.notify_actions();
-                    return;
                 }
-                HostActionKind::InputKey
-                | HostActionKind::InputPointerMove
-                | HostActionKind::InputPointerButton
-                | HostActionKind::WindowClosed => {
-                    // Host-window input + the window-closed signal: ordered and
-                    // lossless. Unlike cursor moves and IRQ pulses these must NOT
-                    // coalesce — a dropped key-up sticks a modifier, a reordered
-                    // move+click lands the click at the wrong spot, and a dropped
-                    // WindowClosed would leave the VM running headless. Push in
-                    // arrival order and wake the delivery BH so the guest (or the
-                    // shutdown path) sees it without waiting for a drain tranche.
-                    prompt.lock().push_back(action);
-                    self.notify_actions();
-                    return;
-                }
-                _ => {}
+                drop(q);
+                self.notify_actions();
+                return;
             }
+            HostActionKind::CursorUpdate => {
+                let mut q = prompt.lock();
+                q.retain(|a| a.kind != HostActionKind::CursorUpdate);
+                q.push_back(action);
+                drop(q);
+                self.notify_actions();
+                return;
+            }
+            HostActionKind::InputKey
+            | HostActionKind::InputPointerMove
+            | HostActionKind::InputPointerButton
+            | HostActionKind::WindowClosed => {
+                // Host-window input + the window-closed signal: ordered and
+                // lossless. Unlike cursor moves and IRQ pulses these must NOT
+                // coalesce — a dropped key-up sticks a modifier, a reordered
+                // move+click lands the click at the wrong spot, and a dropped
+                // WindowClosed would leave the VM running headless. Push in
+                // arrival order and wake the delivery BH so the guest (or the
+                // shutdown path) sees it without waiting for a drain tranche.
+                prompt.lock().push_back(action);
+                self.notify_actions();
+                return;
+            }
+            _ => {}
         }
         // apple-gfx new_frame_handler_bh: drop frames when guest gets too far
         // ahead of encode (pending_frames >= 2). Product: coalesce pending
@@ -515,6 +586,69 @@ impl HostOps for QemuHost<'_> {
             None => true,
         }
     }
+
+    fn track_guest_writes(&mut self, gpas: &[u64], page_size: usize) -> Option<u64> {
+        if gpas.is_empty() || page_size == 0 {
+            return None;
+        }
+        let f = self.ops.track_guest_writes?;
+        // SAFETY: QEMU owns ctx; the slice outlives the call and the shim
+        // copies the page list before returning.
+        let token = unsafe { f(self.ops.ctx, gpas.as_ptr(), gpas.len(), page_size) };
+        // A shim that cannot track answers 0 rather than failing. Not a
+        // decline: "this host has no dirty bitmap" is a capability, and every
+        // consumer already has to handle it on the fixture hosts.
+        (token != 0).then_some(token)
+    }
+
+    fn untrack_guest_writes(&mut self, token: u64) {
+        if token == 0 {
+            return;
+        }
+        if let Some(f) = self.ops.untrack_guest_writes {
+            // SAFETY: token came from a successful track_guest_writes.
+            unsafe { f(self.ops.ctx, token) }
+        }
+    }
+
+    fn guest_write_gen(&self, token: u64) -> Option<u64> {
+        if token == 0 {
+            return None;
+        }
+        let f = self.ops.guest_write_gen?;
+        // SAFETY: QEMU owns ctx; the shim answers from its own lock.
+        let gen_ = unsafe { f(self.ops.ctx, token) };
+        // 0 is the shim's "unknown token, or not yet armed" answer. Reading it
+        // as a generation would let two pre-arm checks agree and vouch for a
+        // resident nothing has ever validated.
+        (gen_ != 0).then_some(gen_)
+    }
+
+    fn guest_written_pages(&self, token: u64, since_gen: u64) -> Option<Vec<u64>> {
+        if token == 0 || since_gen == 0 {
+            return None;
+        }
+        let f = self.ops.guest_written_pages?;
+        // The shim refuses rather than truncating, so the buffer has to be able
+        // to hold a whole surface's page list. A display-sized BGRA8 surface is
+        // ~2 000 x86 pages; the cap is a few times that so a larger one still
+        // gets an exact answer, and a set beyond it declines into "assume the
+        // whole surface was written" rather than into a short list.
+        const MAX_PAGES: usize = 16 * 1024;
+        let mut out = vec![0u64; MAX_PAGES];
+        // SAFETY: QEMU owns ctx; `out` is writable for MAX_PAGES u64s for the
+        // duration of the call, and the shim writes at most `max` of them.
+        let n = unsafe { f(self.ops.ctx, token, since_gen, out.as_mut_ptr(), MAX_PAGES) };
+        if n < 0 {
+            return None;
+        }
+        let n = usize::try_from(n).ok()?;
+        if n > MAX_PAGES {
+            return None;
+        }
+        out.truncate(n);
+        Some(out)
+    }
 }
 
 /// Host used when no QEMU ops table is bound (unit tests / headless create).
@@ -595,31 +729,13 @@ mod tests {
         0
     }
 
-    fn null_ops() -> ReimsVgpuHostOps {
-        ReimsVgpuHostOps {
-            abi_version: crate::qemu::abi::REIMS_VGPU_QEMU_ABI_VERSION,
-            struct_size: std::mem::size_of::<ReimsVgpuHostOps>() as u32,
-            ctx: std::ptr::null_mut(),
-            read_gpa: None,
-            write_gpa: None,
-            mono_ns: None,
-            schedule_bh: None,
-            read_kva: None,
-            read_xreg: None,
-            map_pages: None,
-            unmap_pages: None,
-            map_pages_stable: 0,
-            is_ram_gpa: None,
-            notify_actions: None,
-        }
-    }
 
     #[test]
     fn enqueue_routes_prompt_kinds_to_prompt_queue() {
-        let ops = null_ops();
+        let ops = ReimsVgpuHostOps::null();
         let mut actions = VecDeque::new();
         let prompt = parking_lot::Mutex::new(VecDeque::new());
-        let mut host = QemuHost::with_prompt(&ops, &mut actions, &prompt);
+        let mut host = QemuHost::new(&ops, &mut actions, &prompt);
 
         host.enqueue(HA::irq_gfx());
         host.enqueue(HA::irq_gfx()); // coalesced: one undelivered pulse covers both
@@ -640,20 +756,11 @@ mod tests {
     }
 
     #[test]
-    fn enqueue_without_prompt_keeps_legacy_single_queue() {
-        let ops = null_ops();
-        let mut actions = VecDeque::new();
-        let mut host = QemuHost::new(&ops, &mut actions);
-        host.enqueue(HA::irq_gfx());
-        host.enqueue(HA::scanout_gen(1, 640, 480, 1));
-        assert_eq!(actions.len(), 2);
-    }
-
-    #[test]
     fn missing_qemu_memory_callbacks_are_exact() {
-        let ops = null_ops();
+        let ops = ReimsVgpuHostOps::null();
         let mut actions = VecDeque::new();
-        let mut host = QemuHost::new(&ops, &mut actions);
+        let prompt = parking_lot::Mutex::new(VecDeque::new());
+        let mut host = QemuHost::new(&ops, &mut actions, &prompt);
         assert_eq!(
             host.read_gpa(0x1000, &mut [0; 1]),
             Err(MemError::QemuReadGpaCallbackMissing)
@@ -674,13 +781,14 @@ mod tests {
 
     #[test]
     fn qemu_callback_return_codes_keep_their_operation_and_value() {
-        let mut ops = null_ops();
+        let mut ops = ReimsVgpuHostOps::null();
         ops.read_gpa = Some(fail_read_gpa);
         ops.write_gpa = Some(fail_write_gpa);
         ops.read_kva = Some(no_cpu_read_kva);
         ops.read_xreg = Some(fail_read_xreg);
         let mut actions = VecDeque::new();
-        let mut host = QemuHost::new(&ops, &mut actions);
+        let prompt = parking_lot::Mutex::new(VecDeque::new());
+        let mut host = QemuHost::new(&ops, &mut actions, &prompt);
         assert_eq!(
             host.read_gpa(0x1000, &mut [0; 1]),
             Err(MemError::QemuReadGpaCallbackFailed(-7))
@@ -763,17 +871,20 @@ mod tests {
 
     #[test]
     fn map_pages_distinguishes_missing_failed_and_null_callbacks() {
-        let mut ops = null_ops();
+        let mut ops = ReimsVgpuHostOps::null();
         let mut actions = VecDeque::new();
-        let mut host = QemuHost::new(&ops, &mut actions);
+        let prompt = parking_lot::Mutex::new(VecDeque::new());
+        let mut host = QemuHost::new(&ops, &mut actions, &prompt);
         assert_eq!(host.map_pages(&[0x4000], 0x4000), None);
 
         ops.map_pages = Some(fail_map_pages);
-        let mut host = QemuHost::new(&ops, &mut actions);
+        let prompt = parking_lot::Mutex::new(VecDeque::new());
+        let mut host = QemuHost::new(&ops, &mut actions, &prompt);
         assert_eq!(host.map_pages(&[0x8000], 0x4000), None);
 
         ops.map_pages = Some(null_map_pages);
-        let mut host = QemuHost::new(&ops, &mut actions);
+        let prompt = parking_lot::Mutex::new(VecDeque::new());
+        let mut host = QemuHost::new(&ops, &mut actions, &prompt);
         assert_eq!(host.map_pages(&[0xc000], 0x4000), None);
     }
 

@@ -295,11 +295,10 @@ fn latch_key(task_id: u32, other: u32, loc: &std::panic::Location<'_>) -> u64 {
 /// Product GVA write: HostOps `map_pages` only (no `write_gpa` walk).
 ///
 /// Full-span packed view when possible; otherwise **multi-import** maximal
-/// packed GPA runs ([`crate::runtime::gva_view::write_span`]). Fails closed when
-/// any page is unmapped or a run cannot be mapped. When the task has recorded
-/// MapMemory2 spans, the write must lie inside one span (`outside_map`).
-/// Always-on: `gva_write fail reason=…`, carrying the check `write_span`
-/// actually refused on rather than a reason chosen here.
+/// packed GPA runs ([`crate::runtime::gva_view::write_span_within`]). Fails closed when
+/// any page is unmapped or a run cannot be mapped — that walk is the whole
+/// bound on this write. Always-on: `gva_write fail reason=…`, carrying the
+/// check `write_span` actually refused on rather than a reason chosen here.
 ///
 /// `#[track_caller]` so the always-on lines can name **which** of the fifteen
 /// product call sites issued the write. The reason and the writer were both
@@ -307,96 +306,6 @@ fn latch_key(task_id: u32, other: u32, loc: &std::panic::Location<'_>) -> u64 {
 /// and a length, and finding the code that produced them meant guessing from
 /// the size. Reading `Location::caller()` keeps that a reading — the callee
 /// asks who called it, rather than each caller passing a label it chose.
-/// How many pages of a refused write actually resolve, and under whose tables.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct WriteGateProbe {
-    /// Pages of the refused span this probe examined (see the cap below).
-    pub pages: u64,
-    /// Of those, how many the **writing** task's page tables resolve.
-    pub named_mapped: u64,
-    /// How many the first declaring task in `owners` resolves, or 0 when the
-    /// range is declared by nobody.
-    pub owner_mapped: u64,
-    /// Whether every examined page resolves under **both** the writing task and
-    /// the first declaring owner, to the **same** guest physical page.
-    ///
-    /// This is the reading that separates two very different worlds behind the
-    /// same `named_mapped == owner_mapped == pages`. Two tasks resolving a range
-    /// says only that both address spaces have *something* there; it does not
-    /// say they have the *same* thing. If the GPAs agree, the declaring task's
-    /// `MapMemory2` and the writing task's usage name one physical buffer — a
-    /// shared allocation reached through two page tables — and a declaration
-    /// over those pages is transferable. If they disagree, the writing task has
-    /// its own private memory at that address and honouring the neighbour's
-    /// declaration would write a framebuffer into somebody's heap, which is
-    /// precisely the corruption class the gate exists for.
-    ///
-    /// **Fail-closed by construction**: false unless both walks returned exactly
-    /// `pages` entries and every pair matched. A hole in either walk — an
-    /// unmapped page in the middle of the range — is a disagreement, not a
-    /// shortened comparison.
-    pub gpa_match: bool,
-}
-
-/// Upper bound on the pages [`probe_write_gate_pages`] walks.
-///
-/// Not a protocol value: it bounds the cost of a diagnostic that runs on a
-/// refusal path, where the span is whatever the caller happened to hand in. The
-/// largest refusal this rail has produced is a single 64 KiB blit row, 16 pages
-/// at a 12-bit shift, so this covers the observed cases by ~32x while keeping a
-/// pathological span from turning one refusal into a long walk. A truncated
-/// probe still reads correctly because `pages` is the denominator the line
-/// prints — it says how many were examined, never how many exist.
-const WRITE_GATE_PROBE_PAGE_CAP: u64 = 512;
-
-/// Walk a refused span under the writing task, and under whichever task declared
-/// it, reporting how many pages each resolves.
-///
-/// Read-only: [`visit_task_gva_page_gpas`] calls its visitor only on
-/// `ResolveStatus::Ok`, so counting visits counts resolved pages and an unmapped
-/// page is simply never offered.
-fn probe_write_gate_pages<H: HostMemory>(
-    state: &crate::model::DeviceState,
-    host: &H,
-    task_id: u32,
-    gva: u64,
-    len: u64,
-    owners: &[u32],
-) -> WriteGateProbe {
-    let shift = state.page_shift;
-    let page = 1u64 << shift;
-    let first = gva & !(page - 1);
-    let last = gva.saturating_add(len.saturating_sub(1)) & !(page - 1);
-    let spanned = ((last - first) >> shift).saturating_add(1);
-    let pages = spanned.min(WRITE_GATE_PROBE_PAGE_CAP);
-    let span = pages << shift;
-    // Collect rather than count, because the two questions this answers need
-    // different reductions of the same walk: how many pages resolve, and whether
-    // they resolve to the same physical pages. The walk is bounded by
-    // `WRITE_GATE_PROBE_PAGE_CAP`, so the vector is too.
-    let gpas_for = |who: u32| -> Vec<u64> {
-        let mut out = Vec::with_capacity(pages as usize);
-        visit_task_gva_page_gpas(host, &state.tasks, who, first, span, shift, 1, &mut |gpa| {
-            out.push(gpa);
-            true
-        });
-        out
-    };
-    let named = gpas_for(task_id);
-    let owned = owners.first().copied().map(gpas_for).unwrap_or_default();
-    WriteGateProbe {
-        pages,
-        named_mapped: named.len() as u64,
-        owner_mapped: owned.len() as u64,
-        // `visit_task_gva_page_gpas` calls its visitor only on a successful
-        // translate, so a short vector means the walk had a hole and the entries
-        // after it no longer line up with the page they came from. Requiring
-        // both to be exactly `pages` long is what makes the elementwise compare
-        // a compare of the same page rather than of the same index.
-        gpa_match: named.len() as u64 == pages && owned == named,
-    }
-}
-
 /// Whether any page of `[gva, gva+span)` resolves under `task_id`'s tables.
 ///
 /// Separates "there is nowhere to put this" from "putting it there went wrong",
@@ -428,69 +337,6 @@ pub fn any_task_gva_page_resolves<M: HostMemory>(
     found
 }
 
-/// Report a host→guest write to a range the writing task has not notified, and
-/// return without refusing it.
-///
-/// Every rail that writes guest pages calls this before doing so, so the one
-/// event has one line whatever produced it — `via` names the rail. A previous
-/// arrangement had six sites each deciding for themselves what "outside the map"
-/// meant and three of them silently dropping the write; a contract split across
-/// six sites is only as good as the predicate they share.
-///
-/// See [`crate::model::WriteGate`] for why this reports rather than refuses. In
-/// short: `MapMemory2` is a notification the guest sends *after* installing the
-/// PTEs and using the memory, so it cannot authorise anything, and the check
-/// that does bound the write is the page-table walk each writer performs.
-///
-/// Costs two page walks and a span scan, so it does them **once per distinct
-/// range** — `note_undeclared_write` is the dedup, and it also holds the range
-/// for the confirming `write_gate_late_map`.
-pub fn report_undeclared_write<H: HostMemory>(
-    state: &mut crate::model::DeviceState,
-    host: &H,
-    task_id: u32,
-    gva: u64,
-    len: u64,
-    via: &'static str,
-) -> crate::model::WriteGate {
-    let gate = state.gva_write_gate(task_id, gva, len);
-    if gate != crate::model::WriteGate::Undeclared
-        || !state.note_undeclared_write(task_id, gva, len, via)
-    {
-        return gate;
-    }
-    // `owners` is every task whose notified span covers this range. Kept because
-    // it is free, and read narrowly: it compares GVAs across address spaces, so
-    // it names a virtual-address coincidence unless `gpa_match` says the
-    // physical pages agree too. On the live rail it never has.
-    let owners = state.tasks_covering(gva, len);
-    let probe = probe_write_gate_pages(state, host, task_id, gva, len, &owners);
-    // Where the range sits relative to the spans this task notified for
-    // *itself*, which is the only registry the gate consulted.
-    let own = state.task_span_readout(task_id, gva, len, state.page_shift);
-    crate::observe::Emit::decline("gva_write", &gate)
-        .field("task", task_id)
-        .field("gva", format!("{gva:#x}"))
-        .field("len", format!("{len:#x}"))
-        .field("owners", format!("{owners:?}"))
-        .field("own", own.own)
-        .field("pages", probe.pages)
-        .field("named_mapped", probe.named_mapped)
-        .field("owner_mapped", probe.owner_mapped)
-        .field("gpa_match", u8::from(probe.gpa_match))
-        .field("own_union", own.union)
-        .field("own_lo", format!("{:#x}", own.lo))
-        .field("own_hi", format!("{:#x}", own.hi))
-        .field(
-            "own_gap",
-            own.nearest_gap
-                .map_or_else(|| "none".to_string(), |g| format!("{g:#x}")),
-        )
-        .field("via", via)
-        .off();
-    gate
-}
-
 #[track_caller]
 pub fn write_task_gva_product<H: HostMemory + crate::runtime::host::HostOps>(
     state: &mut crate::model::DeviceState,
@@ -499,54 +345,46 @@ pub fn write_task_gva_product<H: HostMemory + crate::runtime::host::HostOps>(
     gva: u64,
     buf: &[u8],
 ) -> Result<(), MemError> {
+    write_task_gva_product_within(state, host, task_id, gva, buf, None)
+}
+
+/// [`write_task_gva_product`] bounded to the guest pages a deferred window was
+/// armed on.
+///
+/// `allowed` is `None` for every writer whose authorisation is the command it
+/// is executing. It is `Some` only where the write is landing content that was
+/// captured earlier against a page set, which is the one case where the live
+/// page table answers a different question from the one that matters.
+#[track_caller]
+pub fn write_task_gva_product_within<H: HostMemory + crate::runtime::host::HostOps>(
+    state: &mut crate::model::DeviceState,
+    host: &mut H,
+    task_id: u32,
+    gva: u64,
+    buf: &[u8],
+    allowed: crate::runtime::gva_view::WindowPages<'_>,
+) -> Result<(), MemError> {
     if buf.is_empty() {
         return Ok(());
     }
     let via = via_caller();
-    let gate = report_undeclared_write(state, host, task_id, gva, buf.len() as u64, "gva_write");
-    // Latched per (task, caller). `no_spans` means this task has notified
-    // nothing at all, which is a different reading from a range outside what it
-    // has notified: the first is an ordering fact about a task that has not
-    // started declaring yet, the second a range within a task that has.
-    // `delete_task` clears the registry, so a write arriving after a teardown
-    // also lands here.
-    if gate == crate::model::WriteGate::NoSpans {
-        use crate::observe::Decline;
-        // The caller is part of the identity, not decoration. The same arm
-        // reached from two sites is two findings, and a latch keyed on the task
-        // alone would show whichever ran first and hide the other for the whole
-        // process.
-        if crate::observe::first_sight(
-            gate.slug(),
-            latch_key(task_id, 0, std::panic::Location::caller()),
-        ) {
-            crate::observe::Emit::decline("gva_write_gate", &gate)
-                .field("task", task_id)
-                .field("gva", format!("{gva:#x}"))
-                .field("len", format!("{:#x}", buf.len()))
-                .field(
-                    "owners",
-                    format!("{:?}", state.tasks_covering(gva, buf.len() as u64)),
-                )
-                .field("spans", state.task_map_span_count())
-                .field("via", via)
-                .fail();
-        }
-    }
-    let Err(err) = crate::runtime::gva_view::write_span(state, host, task_id, gva, buf) else {
+    let Err(err) =
+        crate::runtime::gva_view::write_span_within(state, host, task_id, gva, buf, allowed)
+    else {
         return Ok(());
     };
     crate::observe::Emit::decline("gva_write", &err)
         .field("task", task_id)
         .field("gva", format!("{gva:#x}"))
         .field("len", format!("{:#x}", buf.len()))
+        .field("via", via)
         .fail();
     Err(err)
 }
 
 /// Resolve pages of `[gva, gva + span)` under the task the guest named — the
 /// same selection as [`read_task_gva_by_id`] and
-/// [`crate::runtime::gva_view::write_span`]'s resolver — and call `visit` with
+/// [`crate::runtime::gva_view::write_span_within`]'s resolver — and call `visit` with
 /// each page-aligned GPA. Stops early when `visit` returns `false`.
 /// `stride_pages` visits every Nth page plus always the last (1 = every page);
 /// callers trade probe density against walk cost.
@@ -590,6 +428,95 @@ pub fn visit_task_gva_page_gpas<M: HostMemory>(
     stride_pages: u64,
     visit: &mut dyn FnMut(u64) -> bool,
 ) {
+    visit_task_gva_pages(
+        host,
+        tasks,
+        task_id,
+        gva,
+        span,
+        page_shift,
+        stride_pages,
+        &mut |gpa| match gpa {
+            Some(gpa) => visit(gpa),
+            None => true,
+        },
+    );
+}
+
+/// How many guest pages `[gva, gva+span)` touches, given `page_size`.
+///
+/// The `gva % page_size` term is the whole content: a span that starts
+/// mid-page reaches one page further than its length alone implies. Callers
+/// compare a walk's result against this to decide whether the *whole* span
+/// resolved, and getting it wrong reads as "fully covered" for exactly the
+/// windows that straddle a page boundary — which is most of them.
+pub fn pages_spanned(gva: u64, span: u64, page_size: u64) -> u64 {
+    ((gva % page_size) + span).div_ceil(page_size)
+}
+
+/// The resolved page GPAs of `[gva, gva+span)` under `task_id`'s page table, in
+/// GVA order, with unresolved pages dropped.
+///
+/// The ordered form, for callers that walk the result as a window —
+/// neighbouring entries differing by exactly one page is what lets a gather
+/// coalesce them. Compare `len()` against [`pages_spanned`] to learn whether
+/// anything was dropped.
+pub fn task_gva_page_gpas<M: HostMemory>(
+    host: &M,
+    tasks: &[TaskEntry],
+    task_id: u32,
+    gva: u64,
+    span: u64,
+    page_shift: u32,
+) -> Vec<u64> {
+    let mut out = Vec::new();
+    visit_task_gva_page_gpas(host, tasks, task_id, gva, span, page_shift, 1, &mut |gpa| {
+        out.push(gpa);
+        true
+    });
+    out
+}
+
+/// The distinct page GPAs of `[gva, gva+span)` under `task_id`'s page table.
+///
+/// The set form, for callers that only ask "is this page one of mine?" — the
+/// deferred-window page indexes and the blit/Store destination bounds. Order
+/// is not preserved and repeats collapse, so `len()` is a lower bound on the
+/// pages walked; that is what every caller compares against [`pages_spanned`].
+pub fn task_gva_page_gpa_set<M: HostMemory>(
+    host: &M,
+    tasks: &[TaskEntry],
+    task_id: u32,
+    gva: u64,
+    span: u64,
+    page_shift: u32,
+) -> std::collections::HashSet<u64> {
+    let mut out = std::collections::HashSet::new();
+    visit_task_gva_page_gpas(host, tasks, task_id, gva, span, page_shift, 1, &mut |gpa| {
+        out.insert(gpa);
+        true
+    });
+    out
+}
+
+/// Shared page-table walk behind [`visit_task_gva_page_gpas`]: one root read and
+/// one walk cache for the whole range, visiting every `stride_pages`-th page
+/// plus the exact last page. Reports an unresolved page as `None` rather than
+/// dropping it, which is what a caller recording *which* pages it read needs.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the visitor API exposes task, span, page geometry, and callback state explicitly"
+)]
+fn visit_task_gva_pages<M: HostMemory>(
+    host: &M,
+    tasks: &[TaskEntry],
+    task_id: u32,
+    gva: u64,
+    span: u64,
+    page_shift: u32,
+    stride_pages: u64,
+    visit: &mut dyn FnMut(Option<u64>) -> bool,
+) {
     if span == 0 || stride_pages == 0 {
         return;
     }
@@ -625,7 +552,8 @@ pub fn visit_task_gva_page_gpas<M: HostMemory>(
             cur,
             Some(&mut cache),
         );
-        if t.status == ResolveStatus::Ok && !visit(t.gpa & !(page - 1)) {
+        let resolved = (t.status == ResolveStatus::Ok).then(|| t.gpa & !(page - 1));
+        if !visit(resolved) {
             return;
         }
         if cur == last {
@@ -793,6 +721,31 @@ mod tests {
     use super::*;
     use crate::contract::endian::st32;
     use crate::observe::Decline;
+
+    /// A span's page count is decided by where it *starts*, not only by how long
+    /// it is.
+    ///
+    /// Four rails compare a walk's page count against this to decide whether the
+    /// whole span resolved. Drop the offset term and a window that straddles a
+    /// page boundary — which is most of them, since a texture row rarely starts
+    /// page-aligned — reports fully covered while missing its last page. The
+    /// gather then hands the GPU a short buffer, which is a wrong frame.
+    #[test]
+    fn pages_spanned_counts_the_page_the_offset_pushes_a_span_into() {
+        const PAGE: u64 = 4096;
+        // Page-aligned: exactly what the length implies.
+        assert_eq!(pages_spanned(0, PAGE, PAGE), 1);
+        assert_eq!(pages_spanned(PAGE * 7, PAGE * 3, PAGE), 3);
+        // Offset by one byte: the same length now reaches one page further.
+        assert_eq!(pages_spanned(1, PAGE, PAGE), 2);
+        assert_eq!(pages_spanned(PAGE * 7 + 1, PAGE * 3, PAGE), 4);
+        // A span wholly inside one page stays at one, wherever it starts.
+        assert_eq!(pages_spanned(PAGE - 1, 1, PAGE), 1);
+        // …and one byte longer crosses.
+        assert_eq!(pages_spanned(PAGE - 1, 2, PAGE), 2);
+        // The arm64 pathway's 16 KiB pages take the same rule.
+        assert_eq!(pages_spanned(16384 * 3 + 5, 16384, 16384), 2);
+    }
 
     /// The collapse this migration ended: nineteen distinct checks — the walk's
     /// fifteen plus four of its own — all answered `MemError::Unmapped`, and
@@ -973,167 +926,38 @@ mod tests {
         assert!(geometry_for_page_shift(PAGE_SHIFT_ARM64E).is_some());
     }
 
-    /// A write to a range the guest has not notified yet **lands**, and the
-    /// range is on the record so a later `MapMemory2` can confirm it.
+    /// What a task may write is what its own page table maps, and nothing else.
     ///
-    /// This is the regression test for the notification race. The guest
-    /// allocates, installs its own PTEs, uploads, and notifies afterwards —
-    /// measured at 0-29 ms after the write, with the notified base and length
-    /// equal to the upload's — so refusing here discarded a 192 KiB texture
-    /// upload, a 518 KiB linear flush and six glyph-atlas writebacks per boot.
-    /// See [`crate::model::WriteGate`].
+    /// The guest allocates, installs its own PTEs, uploads, and only afterwards
+    /// notifies the range with `MapMemory2` — measured at 0-29 ms after the
+    /// write. So a notification cannot authorise anything, and the walk this
+    /// writer performs at write time is the whole bound. Both halves are
+    /// asserted here because a writer that lands everything and a writer that
+    /// refuses everything each satisfy one of them alone.
     #[test]
-    fn a_write_the_guest_has_not_notified_yet_still_lands() {
+    fn the_page_table_is_the_only_bound_on_a_product_gva_write() {
         use crate::model::PAGE_SHIFT_ARM64E;
         let mut host = crate::runtime::host::FakeHost::new();
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         // Task 1's own page tables map GVA 0.. onto four data pages.
         define_task_pages_arm64e(&mut host, &mut state, 0x100, 4);
         let page = 1u64 << PAGE_SHIFT_ARM64E;
-        // …and it has notified a range that does not include them, so the gate
-        // classifies the write as `Undeclared` rather than falling through the
-        // permissive `NoSpans` arm. Without this the test would pass whatever
-        // the gate did.
-        state.note_task_map(1, 64 * page, page);
-        // GVA `page` rather than 0: `note_task_map` treats a zero base as a
-        // sentinel and ignores it, so confirming at 0 could never fire.
-        assert_eq!(
-            state.gva_write_gate(1, page, 4),
-            crate::model::WriteGate::Undeclared
-        );
 
         assert!(
             write_task_gva_product(&mut state, &mut host, 1, page, &[1, 2, 3, 4]).is_ok(),
-            "the range is mapped for the writing task, so the notification not \
-             having arrived must not discard the write"
-        );
-        assert_eq!(
-            state.undeclared_writes.len(),
-            1,
-            "and the write is on the record, not silent"
+            "the range is mapped for the writing task, so the write lands \
+             whatever the guest has or has not notified"
         );
 
-        // The bound that does hold: a GVA outside this task's page tables. The
-        // gate reports the same `Undeclared` for it, so the two cases are told
-        // apart by the page-table walk in the writer and by nothing else.
         // Inside the task's one-level table but with a zero PTE — the fixture
         // installs four data pages, so index 10 resolves to nothing. Chosen
         // over an index past the end of the table because a one-level walk masks
         // its index to the entry count and `4096 * page` aliases index 0, which
         // would have made this assertion pass for the wrong reason.
-        assert_eq!(
-            state.gva_write_gate(1, 10 * page, 4),
-            crate::model::WriteGate::Undeclared
-        );
         assert!(
             write_task_gva_product(&mut state, &mut host, 1, 10 * page, &[1, 2, 3, 4]).is_err(),
             "unmapped for this task, so the writer fails closed"
         );
-
-        // Both attempts are on the record — the refused one too, since it is a
-        // write we tried to make outside anything the guest declared and that is
-        // the corruption shape, whether or not it landed.
-        assert_eq!(state.undeclared_writes.len(), 2);
-
-        // A later notification covering the first range confirms *that* one and
-        // leaves the other standing. A blanket clear would make the confirming
-        // half unable to say which write it vouched for.
-        state.note_task_map(1, page, 3 * page);
-        assert_eq!(state.undeclared_writes.len(), 1);
-        assert_eq!(state.undeclared_writes[0].gva, 10 * page);
-        assert_eq!(
-            state.gva_write_gate(1, page, 4),
-            crate::model::WriteGate::Exact
-        );
-    }
-
-    /// The gate's four answers must be distinguishable, because three of them
-    /// are "allowed" and only one of those is a bounds check that happened.
-    ///
-    /// `gva_write_allowed` collapsed all of this to a `bool` and the caller
-    /// supplied the word `mem_outside_map` on the refusal — the shape
-    /// `AGENTS.md` calls out. A census built on the `bool` could not tell a
-    /// covered write from one permitted because the registry was empty, which
-    /// is exactly the state `delete_task` leaves behind.
-    #[test]
-    fn the_write_gate_names_which_arm_permitted_the_write() {
-        use crate::model::WriteGate;
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-        assert!(state.define_task(6, 0x1_0000, 2));
-
-        // Nothing recorded for task 6 or its aliases: allowed by default, and
-        // that is not a bounds check.
-        assert_eq!(
-            state.gva_write_gate(6, 0x2000, 0x100),
-            WriteGate::NoSpans,
-            "an empty registry is a gate that did not run, not a gate that passed"
-        );
-
-        // An exact span covers it.
-        state.note_task_map(6, 0x2000, 0x1000);
-        assert_eq!(state.gva_write_gate(6, 0x2000, 0x100), WriteGate::Exact);
-
-        // Spans exist for this task but none covers the range.
-        assert_eq!(
-            state.gva_write_gate(6, 0x9000, 0x100),
-            WriteGate::Undeclared
-        );
-
-        // A span recorded by task 3 does not authorise a write by task 6, even
-        // though `6 >> 1 == 3`. That halving is the wire-word relation
-        // `runtime::task_slot` refuted; the write that follows this gate walks
-        // task 6's page tables regardless, so accepting task 3's map would put
-        // the authorisation and the destination in different address spaces.
-        let mut other = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-        assert!(other.define_task(3, 0x1_0000, 2));
-        other.note_task_map(3, 0x4000, 0x1000);
-        assert_eq!(
-            other.gva_write_gate(6, 0x4000, 0x100),
-            WriteGate::NoSpans,
-            "task 6 declared nothing; task 3's span is not task 6's authorisation"
-        );
-        // …and once task 6 has a registry of its own, the same range is a
-        // refusal rather than a permissive default.
-        other.note_task_map(6, 0x9000, 0x1000);
-        assert_eq!(
-            other.gva_write_gate(6, 0x4000, 0x100),
-            WriteGate::Undeclared
-        );
-        other.note_task_map(6, 0x4000, 0x1000);
-        assert_eq!(other.gva_write_gate(6, 0x4000, 0x100), WriteGate::Exact);
-    }
-
-    /// The unfiltered owner scan sees what the gate does not, and it does not
-    /// change what the gate decides.
-    ///
-    /// The gate searches task 11's own spans and nothing else, so the range is
-    /// refused — and the log line must still be able to say that *other* tasks
-    /// held a covering span, including ones unrelated by halving. Without that
-    /// readout, "the covering owner is always `task >> 1`" would be true by
-    /// construction on every boot.
-    #[test]
-    fn the_owner_readout_sees_covering_tasks_the_gate_never_considered() {
-        use crate::model::WriteGate;
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-        assert!(state.define_task(11, 0x1_0000, 2));
-        state.note_task_map(11, 0xc000, 0x1000);
-        state.note_task_map(5, 0x8000, 0x1000);
-        state.note_task_map(9, 0x4000, 0x1000);
-        state.note_task_map(4, 0x4000, 0x1000);
-
-        assert_eq!(
-            state.gva_write_gate(11, 0x4000, 0x100),
-            WriteGate::Undeclared,
-            "the gate's decision must not move because a readout was added"
-        );
-        assert_eq!(
-            state.tasks_covering(0x4000, 0x100),
-            vec![4, 9],
-            "both covering owners, ascending, and neither is 11 >> 1"
-        );
-        assert_eq!(state.task_map_span_count(), 4);
-        // A zero-length write covers nothing, matching the gate's own early out.
-        assert!(state.tasks_covering(0x4000, 0).is_empty());
     }
 
     /// The `via=` field must name the **caller**, not `gva_mem.rs` itself, or it
@@ -1165,7 +989,7 @@ mod tests {
     /// given `(arm, task, by)` is silent for the life of the process — the same
     /// per-process latching hazard that has already misread one census.
     #[test]
-    fn the_write_gate_latch_key_separates_call_sites() {
+    fn the_refusal_latch_key_separates_call_sites() {
         #[track_caller]
         fn key(task: u32, other: u32) -> u64 {
             latch_key(task, other, std::panic::Location::caller())
@@ -1347,305 +1171,4 @@ mod tests {
         assert_eq!(err, MemError::NoSuchTask);
     }
 
-    /// No span filed by any task other than the writer can authorise a write.
-    ///
-    /// This is the removed alias arm, stated as a property over the whole task
-    /// table rather than one example. The gate used to accept a span filed
-    /// under `task >> 1`, so a write by task 1 landed inside task 0's 64 MB map
-    /// and was permitted — while `gva_view::resolve_task_for_walk` resolved the
-    /// destination through task 1's page tables, which never halves. Measured
-    /// on the x86/Vulkan rail the permissive arm fired from
-    /// `compute_exec` and `blit_exec`, and the guest reported it as
-    /// WindowServer aborting inside `malloc_zone_error` — its own heap written
-    /// through by a surface store that had been authorised against a different
-    /// address space.
-    #[test]
-    fn only_the_writing_tasks_own_spans_authorise_a_write() {
-        use crate::model::WriteGate;
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-        assert!(state.define_task(1, 0x1_0000, 2));
-        // Task 0 declares a span that swallows the address the measured
-        // aliased writes used.
-        state.note_task_map(0, 0x101000, 0x400_0000);
-
-        // Every other task is refused inside it, whatever its numeric relation
-        // to task 0 — the halving was never an ownership relation.
-        for task_id in 1..64u32 {
-            assert_ne!(
-                state.gva_write_gate(task_id, 0x1ada000, 0x10000),
-                WriteGate::Exact,
-                "task {task_id} has no span of its own and must not inherit task 0's"
-            );
-            assert!(
-                state.gva_write_gate(task_id, 0x1ada000, 0x10000)
-                    == crate::model::WriteGate::Undeclared
-                    || state.task_own_span_count(task_id) == 0,
-                "only the no-registry default may permit, and only while it holds"
-            );
-        }
-
-        // The readout still sees who does hold the covering span, so a refusal
-        // says whether the range is unmapped or mapped by someone else.
-        assert_eq!(state.tasks_covering(0x1ada000, 0x10000), vec![0]);
-
-        // Once the writer files its own non-covering span the default is gone
-        // and the same range is a hard refusal.
-        state.note_task_map(1, 0x9f9000, 0x20000);
-        assert_eq!(
-            state.gva_write_gate(1, 0x1ada000, 0x10000),
-            WriteGate::Undeclared
-        );
-        assert_eq!(state.task_own_span_count(1), 1);
-        assert_eq!(
-            state.task_own_span_count(0),
-            1,
-            "counts are per task, not total"
-        );
-    }
-
-    /// A refusal has to say whether the range was reachable, because `owners`
-    /// alone cannot tell an over-strict gate from a bad address.
-    ///
-    /// `owners` reports who *declared* the range. It says nothing about whose
-    /// page tables *resolve* it, and those are the two readings the refusal has
-    /// to be told apart by. On the live rail this is the open question behind
-    /// five dropped 64 KiB `OP_COPY_BUFFER_TO_TEXTURE` uploads a boot:
-    /// `task=1 gva=0x1ada000 len=0x10000 owners=[0] own=4` — with the log's
-    /// `map_memory2_key` lines confirming task 0 declared `0x101000 +0x4000000`
-    /// and task 1 declared `0x9f9000 +0x20000`, and `define_task` confirming the
-    /// two hold **different** `dir=` roots, so they are genuinely separate
-    /// address spaces.
-    ///
-    /// `named_mapped == pages` means the range IS mapped for the writing task,
-    /// so `task_map_spans` is not a complete authorization set and the gate is
-    /// dropping guest work that would have landed. `named_mapped == 0` means the
-    /// write could never have landed anyway (`write_span` fails closed on an
-    /// unmapped page) and the gate costs nothing. Both must be distinguishable
-    /// or the line is unreadable.
-    #[test]
-    fn a_refused_write_reports_whether_the_range_resolves_under_the_writer() {
-        use crate::model::PAGE_SHIFT_ARM64E;
-        let mut host = crate::runtime::host::FakeHost::new();
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        // Task 1 gets a page table mapping its first 4 pages from GVA 0.
-        define_task_pages_arm64e(&mut host, &mut state, 0x100, 4);
-        let page = 1u64 << PAGE_SHIFT_ARM64E;
-
-        // Mapped for the writer, and declared by somebody else: the over-strict
-        // reading. Every page the probe examines resolves under task 1.
-        let mapped = super::probe_write_gate_pages(&state, &host, 1, 0, 2 * page, &[0]);
-        assert_eq!(mapped.pages, 2);
-        assert_eq!(
-            mapped.named_mapped, 2,
-            "task 1's own tables resolve this range, so refusing it drops a write \
-             that would have landed"
-        );
-        assert_eq!(
-            mapped.owner_mapped, 0,
-            "task 0 has no page table here, so the declaring task cannot reach it either"
-        );
-
-        // Past the end of task 1's table: the write could never have landed, so
-        // the gate loses nothing and the question is upstream.
-        let unmapped = super::probe_write_gate_pages(&state, &host, 1, 64 * page, 2 * page, &[0]);
-        assert_eq!(unmapped.pages, 2);
-        assert_eq!(
-            unmapped.named_mapped, 0,
-            "nothing resolves, so a refusal here costs no guest work"
-        );
-
-        // The two readings must not render the same, or the line cannot be acted
-        // on either way.
-        assert_ne!(mapped.named_mapped, unmapped.named_mapped);
-
-        // The cap bounds the walk without lying about it: `pages` is the
-        // denominator printed, so a truncated probe still reads correctly.
-        let huge = super::probe_write_gate_pages(&state, &host, 1, 0, u32::MAX as u64, &[]);
-        assert_eq!(huge.pages, super::WRITE_GATE_PROBE_PAGE_CAP);
-        assert_eq!(
-            huge.owner_mapped, 0,
-            "no declaring task means no owner column, not a panic"
-        );
-    }
-
-    /// Give `task_id` its own directory mapping `pages` pages from GVA 0 onto
-    /// `data_base_pfn..`, so two tasks can be pointed at the same physical pages
-    /// or at different ones with everything else held.
-    ///
-    /// Deliberately separate from [`define_task_pages_arm64e`], which fixes the
-    /// directory and root PFN and has 51 callers; a second task needs its own
-    /// tables or the two are the same address space and the comparison is
-    /// vacuous.
-    fn define_second_task_pages_arm64e(
-        host: &mut crate::runtime::host::FakeHost,
-        state: &mut DeviceState,
-        task_id: u32,
-        dir_pfn: u32,
-        root_pfn: u32,
-        data_base_pfn: u32,
-        pages: u32,
-    ) {
-        use crate::contract::endian::st32;
-        use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
-        use crate::model::PAGE_SHIFT_ARM64E;
-        let dir_gpa = (dir_pfn as u64) << PAGE_SHIFT_ARM64E;
-        let root_gpa = (root_pfn as u64) << PAGE_SHIFT_ARM64E;
-        host.map_range(dir_gpa, 0x20, 0);
-        host.map_range(root_gpa, 0x4000, 0);
-        let mut d = [0u8; 8];
-        st32(&mut d[DIRECTORY_ROOT_PFN as usize..], root_pfn);
-        st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
-        let _ = host.write_gpa(dir_gpa, &d);
-        for i in 0..pages {
-            let pfn = data_base_pfn + i;
-            host.map_range((pfn as u64) << PAGE_SHIFT_ARM64E, 0x4000, 0);
-            let mut pte = [0u8; 4];
-            st32(&mut pte, pfn);
-            let _ = host.write_gpa(root_gpa + (i as u64) * 4, &pte);
-        }
-        assert!(state.define_task(task_id, 0x1000, dir_pfn));
-    }
-
-    /// Two tasks resolving a range is not two tasks resolving the *same* range,
-    /// and the refusal line cannot be acted on until it says which.
-    ///
-    /// On the live rail every refused write comes back `named_mapped ==
-    /// owner_mapped == pages`, which reads as "the declaring task and the writing
-    /// task are looking at one shared buffer". It is equally consistent with the
-    /// writing task having its own private heap at that address — and those two
-    /// call for opposite fixes: the first says the declaration transfers and the
-    /// gate is over-strict, the second says honouring the neighbour's declaration
-    /// would write into a heap, which is the corruption class the gate exists
-    /// for. Only the physical pages tell them apart.
-    #[test]
-    fn a_refusal_says_whether_the_two_tasks_share_the_physical_pages() {
-        use crate::model::PAGE_SHIFT_ARM64E;
-        let page = 1u64 << PAGE_SHIFT_ARM64E;
-
-        // Aliased: task 2's tables land on the very pages task 1's do.
-        let mut host = crate::runtime::host::FakeHost::new();
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        define_task_pages_arm64e(&mut host, &mut state, 0x100, 4);
-        define_second_task_pages_arm64e(&mut host, &mut state, 2, 8, 9, 0x100, 4);
-        let shared = super::probe_write_gate_pages(&state, &host, 1, 0, 2 * page, &[2]);
-        assert_eq!(
-            (shared.pages, shared.named_mapped, shared.owner_mapped),
-            (2, 2, 2)
-        );
-        assert!(
-            shared.gpa_match,
-            "both tasks translate these GVAs to the same GPAs, so the declaration \
-             names the buffer this write targets"
-        );
-
-        // Private: same GVAs, same page counts, different physical memory. Every
-        // column the line carried before this one is identical to the aliased
-        // case above, which is what makes that reading unsafe on its own.
-        let mut host = crate::runtime::host::FakeHost::new();
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        define_task_pages_arm64e(&mut host, &mut state, 0x100, 4);
-        define_second_task_pages_arm64e(&mut host, &mut state, 2, 8, 9, 0x200, 4);
-        let private = super::probe_write_gate_pages(&state, &host, 1, 0, 2 * page, &[2]);
-        assert_eq!(
-            (private.pages, private.named_mapped, private.owner_mapped),
-            (shared.pages, shared.named_mapped, shared.owner_mapped),
-            "the counts cannot separate these two, which is the whole point"
-        );
-        assert!(
-            !private.gpa_match,
-            "task 2 declared a range that resolves to its own pages, so its \
-             declaration says nothing about where this write would land"
-        );
-
-        // A hole under either walk is a disagreement, not a shortened compare:
-        // page 5 is past task 2's four-page table, so the owner walk returns one
-        // entry for a two-page span and the indices no longer name the same page.
-        let mut host = crate::runtime::host::FakeHost::new();
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        define_task_pages_arm64e(&mut host, &mut state, 0x100, 8);
-        define_second_task_pages_arm64e(&mut host, &mut state, 2, 8, 9, 0x100, 4);
-        let ragged = super::probe_write_gate_pages(&state, &host, 1, 3 * page, 2 * page, &[2]);
-        assert_eq!(
-            (ragged.pages, ragged.named_mapped, ragged.owner_mapped),
-            (2, 2, 1)
-        );
-        assert!(
-            !ragged.gpa_match,
-            "fail closed: a walk that skipped a page cannot be compared elementwise"
-        );
-
-        // No declaring task means nothing to compare against, not a match by
-        // default — the empty owner vector must not equal a full named one.
-        let orphan = super::probe_write_gate_pages(&state, &host, 1, 0, 2 * page, &[]);
-        assert!(
-            !orphan.gpa_match,
-            "no owner is not agreement with the owner"
-        );
-
-        // Both walks short by the *same* pages: two aliased four-page tables,
-        // probed across the end of both. Vector equality alone reads "agreed",
-        // because the two walks skip the hole in step and the entries that
-        // survive do match. `pages` is 2 and only one was examined, so that
-        // agreement covers half the range, and the length guard is the only
-        // thing that notices. The equality test cannot reach this arm.
-        let mut host = crate::runtime::host::FakeHost::new();
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        define_task_pages_arm64e(&mut host, &mut state, 0x100, 4);
-        define_second_task_pages_arm64e(&mut host, &mut state, 2, 8, 9, 0x100, 4);
-        let overrun = super::probe_write_gate_pages(&state, &host, 1, 3 * page, 2 * page, &[2]);
-        assert_eq!(
-            (overrun.pages, overrun.named_mapped, overrun.owner_mapped),
-            (2, 1, 1),
-            "one page inside both tables and one past the end of both"
-        );
-        assert!(
-            !overrun.gpa_match,
-            "the two walks agree on the one page they both resolved and neither \
-             resolved the other, so agreement here covers half the range"
-        );
-    }
-
-    /// `no_spans` names what the gate searched, not what the registry holds, so
-    /// the line has to carry the total or it reads as "the registry is empty".
-    #[test]
-    fn a_populated_registry_can_still_answer_no_spans() {
-        use crate::model::WriteGate;
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-        assert!(state.define_task(11, 0x1_0000, 2));
-        state.note_task_map(7, 0x4000, 0x1000);
-        assert_eq!(
-            state.gva_write_gate(11, 0x4000, 0x100),
-            WriteGate::NoSpans,
-            "nothing filed by 11 or 5, so the bounds check did not run"
-        );
-        assert_eq!(
-            state.task_map_span_count(),
-            1,
-            "yet the registry is not empty"
-        );
-        assert_eq!(state.tasks_covering(0x4000, 0x100), vec![7]);
-    }
-
-    /// The only inputs the deleted clause ever added were `u32` wraparound, and
-    /// on those it failed **open**.
-    ///
-    /// `0x8000_0001 << 1` wraps to `2`, so a span filed by task `0x8000_0001`
-    /// used to authorise a write by task 2 — arithmetic overflow presented as an
-    /// ownership relation. Task 2 has spans of its own here and none covers the
-    /// range, so the correct answer is the refusal `Outside`; the old predicate
-    /// returned `Aliased` and let the write through.
-    #[test]
-    fn a_span_owned_by_a_wrapping_id_no_longer_authorises_another_tasks_write() {
-        use crate::model::WriteGate;
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-        assert!(state.define_task(2, 0x1_0000, 2));
-        state.note_task_map(2, 0x8000, 0x1000);
-        state.note_task_map(0x8000_0001, 0x4000, 0x1000);
-        assert_eq!(0x8000_0001u32 << 1, 2, "the wrap this test is about");
-        assert_eq!(
-            state.gva_write_gate(2, 0x4000, 0x100),
-            WriteGate::Undeclared,
-            "a wrapped id is not an alias, and task 2's own spans do not cover this"
-        );
-    }
 }

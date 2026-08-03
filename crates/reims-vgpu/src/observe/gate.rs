@@ -47,6 +47,57 @@ fn rust_files(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
+/// [`rust_files`] minus the files that are **entirely** test code.
+///
+/// [`production_source`] strips `mod tests { … }` *blocks*, which is the whole
+/// story for a file that mixes the two. It is no story at all for
+/// `runtime/*/tests.rs`, four of which exist here: each is declared
+/// `#[cfg(test)] mod tests;` by its parent, so nothing inside the file itself
+/// marks it, and every scan that called `production_source` on one was reading
+/// a test fixture as shipped code.
+///
+/// Found by the unbounded-raw-GVA-write gate, which flagged
+/// `runtime/compute_exec/tests.rs` as an unjustified writer on its first run.
+/// The test module is *declared* by the parent, so that is where this looks —
+/// a filename rule would be a guess, and would also miss a test-only module
+/// named anything else.
+fn production_files(root: &Path) -> Vec<PathBuf> {
+    rust_files(root)
+        .into_iter()
+        .filter(|p| !declared_cfg_test(p))
+        .collect()
+}
+
+/// Whether this file's own module declaration in its parent is `#[cfg(test)]`.
+fn declared_cfg_test(path: &Path) -> bool {
+    let Some(stem) = path.file_stem().map(|s| s.to_string_lossy().into_owned()) else {
+        return false;
+    };
+    // `dir/name.rs` is declared by `dir/mod.rs`; `dir/mod.rs` is declared by the
+    // grandparent as `mod dir;`, which is not a case this needs.
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    let Ok(src) = std::fs::read_to_string(parent.join("mod.rs")) else {
+        return false;
+    };
+    let decl = format!("mod {stem};");
+    let mut cfg_test_pending = false;
+    for line in src.lines() {
+        let t = line.trim();
+        if t == decl {
+            return cfg_test_pending;
+        }
+        // Attributes stack, and anything else between resets the run.
+        if t.starts_with("#[") {
+            cfg_test_pending |= t == "#[cfg(test)]";
+        } else if !t.is_empty() && !t.starts_with("//") {
+            cfg_test_pending = false;
+        }
+    }
+    false
+}
+
 /// Repo-relative path with forward slashes, for stable messages.
 fn rel(path: &Path, root: &Path) -> String {
     path.strip_prefix(root)
@@ -170,7 +221,13 @@ fn mask_comments_and_literals(src: &str) -> Vec<u8> {
             }
             State::String if bytes[i] == b'\\' && i + 1 < bytes.len() => {
                 masked[i] = b' ';
-                masked[i + 1] = b' ';
+                // The escaped byte may be the newline of a `\`-continued
+                // literal, which this crate writes in almost every multi-line
+                // fail message. Blanking it merges two source lines into one
+                // and every line number after it in the file is wrong.
+                if bytes[i + 1] != b'\n' {
+                    masked[i + 1] = b' ';
+                }
                 i += 2;
                 State::String
             }
@@ -204,7 +261,9 @@ fn mask_comments_and_literals(src: &str) -> Vec<u8> {
             }
             State::Char if bytes[i] == b'\\' && i + 1 < bytes.len() => {
                 masked[i] = b' ';
-                masked[i + 1] = b' ';
+                if bytes[i + 1] != b'\n' {
+                    masked[i + 1] = b' ';
+                }
                 i += 2;
                 State::Char
             }
@@ -223,6 +282,33 @@ fn mask_comments_and_literals(src: &str) -> Vec<u8> {
         };
     }
     masked
+}
+
+/// The mask must be line-preserving, because gates report line numbers off it.
+///
+/// The case that broke it is the one this crate writes most: a fail message
+/// continued across lines with a trailing `\`. The escape branch blanked both
+/// bytes, and when the second was the newline the masked text had one fewer
+/// line than the source — so every gate reading masked lines was, from that
+/// point in the file onward, describing the wrong line. It also silently
+/// merged the following line's braces into the string's line, which is how a
+/// brace-depth scan can conclude a function has already ended.
+#[test]
+fn the_mask_keeps_every_line_including_escaped_newlines() {
+    let src = "let a = \"one \\\n     two\";\nfn f() {\n}\n";
+    let masked = mask_comments_and_literals(src);
+    let masked = String::from_utf8(masked).expect("mask is byte-for-byte");
+    assert_eq!(
+        masked.lines().count(),
+        src.lines().count(),
+        "mask dropped a line:\n{masked:?}"
+    );
+    assert_eq!(masked.len(), src.len(), "mask is not byte-for-byte");
+    for (m, s) in masked.lines().zip(src.lines()) {
+        assert_eq!(m.len(), s.len(), "line lengths diverged");
+    }
+    // And the literal really is masked, not merely preserved.
+    assert!(!masked.contains("two"));
 }
 
 /// Byte offsets of `Result<Success, String>` spellings in Rust code.
@@ -428,6 +514,141 @@ fn metal_no_copy_buffers_alias_host_memory_and_nothing_else() {
     );
 }
 
+/// Every field of `PresentState` is read by something.
+///
+/// `PresentState` is the present path's bookkeeping, and the operating loop
+/// ranks "fewer pieces of state that must agree" above "fewer lines". It
+/// already carries five separate mapping ids — `present_mapping`,
+/// `painted_mapping`, `host_mapping`, `frame_mapping`, `early_front_mapping` —
+/// each meaning something slightly different, and a sixth (`mapping_id`) sat
+/// there for a long time being assigned at five sites and read by nothing. A
+/// write-only field on this struct is worse than dead weight: it reads like a
+/// sixth meaning that some other rail must be kept consistent with, so every
+/// author who touches the present path pays to understand it.
+///
+/// A field counts as read if `present.<name>` appears in production source in a
+/// position that is not the left side of a plain `=`. Compound assignment,
+/// comparison, method call, or use as a value all count, so this cannot flag a
+/// field that is genuinely read; it can only miss one, which is the right way
+/// round for a source assertion.
+///
+/// The `present.` prefix is load-bearing and the first version of this test did
+/// not have it. Every access to this struct spells it — `state.present.x`,
+/// `d.state.present.x`, and `present.x` inside `window_frame_key`, whose
+/// parameter is named `present`. Matching bare `.<name>` instead looks
+/// equivalent and is not: field names here are ordinary words, and `.mapping_id`
+/// alone matches `MappingEntry`, `ComputeStorageResidencyKey` and a dozen other
+/// types, so the scan reported every field as read and passed against a tree
+/// with a known write-only field in it. Re-check that this test can still fail
+/// before trusting a green run from it.
+#[test]
+fn no_present_state_field_is_write_only() {
+    let root = crate_src();
+    let state_src = std::fs::read_to_string(root.join("model/state.rs")).expect("read state.rs");
+    let decl = block_after(&state_src, "pub struct PresentState {").expect("PresentState struct");
+    let fields: Vec<String> = decl
+        .lines()
+        .filter_map(|l| {
+            let l = l.trim();
+            let rest = l.strip_prefix("pub ")?;
+            let name = rest.split(':').next()?.trim();
+            name.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+                .then(|| name.to_string())
+        })
+        .collect();
+    assert!(
+        fields.len() > 20,
+        "PresentState field scan found only {} fields; the struct or the parse moved",
+        fields.len()
+    );
+
+    let mut body = String::new();
+    for path in production_files(&root) {
+        let Ok(src) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        body.push_str(&production_source(&String::from_utf8_lossy(
+            &mask_comments_and_literals(&src),
+        )));
+        body.push('\n');
+    }
+
+    let write_only: Vec<&String> = fields
+        .iter()
+        .filter(|name| {
+            let needle = format!("present.{name}");
+            !body.lines().any(|line| {
+                let Some(at) = line.find(&needle) else {
+                    return false;
+                };
+                let after = line[at + needle.len()..].trim_start();
+                // A bare `= …` is the one use that is not a read. `==` and the
+                // compound forms (`+=`, `|=`, …) both leave a non-`=` byte
+                // before the space-stripped `=`, so check the raw tail.
+                let raw = &line[at + needle.len()..];
+                let assign = raw.trim_start().starts_with('=') && !after.starts_with("==");
+                let boundary = raw
+                    .chars()
+                    .next()
+                    .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_');
+                boundary && !assign
+            })
+        })
+        .collect();
+
+    assert!(
+        write_only.is_empty(),
+        "PresentState fields written but never read: {write_only:?}. Delete them, \
+         or if one is about to gain a reader, land the reader in the same change."
+    );
+}
+
+/// One place decides whether an engine resident may stand in for a guest read.
+///
+/// The three staging rails in `stage_texture_raw` — heap, type-11 mapping, and
+/// linear GVA — each hold a residency mirror and each must agree with the engine
+/// before skipping the guest read that would otherwise seed or sample the
+/// window. They once carried three byte-for-byte copies of that agreement, and a
+/// copy that drifts serves stale or wrongly-formatted content with no visible
+/// failure. `resident_serve` is the only production caller of the engine's two
+/// residency queries, with no licensed peer: every rail asks the same question
+/// about the same key it looked the mirror up under, and matches on format
+/// equality rather than on row bytes.
+#[test]
+fn the_engine_residency_agreement_is_decided_in_one_place() {
+    const ENGINE: &str = "backend/vulkan/engine";
+    let root = crate_src();
+    let mut sites = Vec::new();
+    for path in production_files(&root) {
+        let name = rel(&path, &root);
+        if name.starts_with(ENGINE) {
+            continue;
+        }
+        let src = std::fs::read_to_string(&path).expect("read Rust source");
+        let masked = production_source(&String::from_utf8_lossy(&mask_comments_and_literals(&src)));
+        for needle in [
+            "compute_resident_storage_generation(",
+            "compute_resident_sample_source(",
+        ] {
+            let n = masked.matches(needle).count();
+            if n > 0 {
+                sites.push(format!("{name} calls {needle} {n}x"));
+            }
+        }
+    }
+    sites.sort();
+    assert_eq!(
+        sites,
+        vec![
+            "runtime/compute_exec/mod.rs calls compute_resident_sample_source( 1x".to_string(),
+            "runtime/compute_exec/mod.rs calls compute_resident_storage_generation( 1x".to_string(),
+        ],
+        "the mirror-vs-engine residency agreement moved or was copied; it \
+         belongs in compute_exec::resident_serve and nowhere else"
+    );
+}
+
 /// Free-text `Result` errors cannot return. A typed decline may preserve an
 /// external driver's prose as a field, but the error carrier itself must remain
 /// exhaustively matchable and registered.
@@ -618,7 +839,7 @@ fn production_source(src: &str) -> String {
 fn declared_slugs() -> Vec<(String, String)> {
     let root = crate_src();
     let mut out = Vec::new();
-    for path in rust_files(&root) {
+    for path in production_files(&root) {
         let Ok(raw) = std::fs::read_to_string(&path) else {
             continue;
         };
@@ -973,8 +1194,269 @@ fn no_error_enum_carries_a_payload_free_unsupported() {
     );
 }
 
-/// The scanner must actually walk the crate; a broken walk would make every
-/// scan above vacuously green.
+/// What a `#[cfg(…)]` attribute line says about one feature, or `None` when it
+/// names no feature at all (`target_os` alone, `test`).
+///
+/// `#[cfg(all(feature = "backend-metal", target_os = "macos"))]` reads as a
+/// positive gate on `backend-metal`, which is what it is: the item is absent
+/// without that feature. `sole` distinguishes it from the bare
+/// `#[cfg(feature = "backend-metal")]`, because only the bare form is
+/// *redundant* under an enclosing gate on the same feature — the `all` form
+/// still carries the `target_os` test.
+struct CfgFeature {
+    name: String,
+    positive: bool,
+    sole: bool,
+}
+
+fn cfg_attr_feature(attr: &str) -> Option<CfgFeature> {
+    const KEY: &str = "feature = \"";
+    let at = attr.find(KEY)?;
+    let name: String = attr[at + KEY.len()..]
+        .chars()
+        .take_while(|c| *c != '"')
+        .collect();
+    if name.is_empty() {
+        return None;
+    }
+    let positive = !attr[..at].ends_with("not(");
+    let sole = attr == format!("#[cfg(feature = \"{name}\")]");
+    Some(CfgFeature {
+        name,
+        positive,
+        sole,
+    })
+}
+
+/// What is wrong with a `cfg` attribute nested under a gate on its own feature.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum NestedCfg {
+    /// `#[cfg(not(feature = "F"))]` under `#[cfg(feature = "F")]`. No feature
+    /// combination compiles it.
+    Dead,
+    /// `#[cfg(feature = "F")]` under `#[cfg(feature = "F")]`. Compiles exactly
+    /// as if it were absent, and reads as if the scope were conditional.
+    Redundant,
+}
+
+/// Every `cfg` attribute in `src` that re-tests a feature an enclosing item has
+/// already gated on, as `(1-based line, feature, what is wrong)`.
+///
+/// A [`NestedCfg::Dead`] block cannot be compiled by any feature combination:
+/// reaching it requires `F` on, and it asks for `F` off. Rust says nothing,
+/// because the tokens are discarded before name resolution — which is how a
+/// dead arm in `try_metal2vulkan_draw` came to reference four locals that do
+/// not exist. [`NestedCfg::Redundant`] is the harmless twin, worth removing
+/// because a reader cannot tell the two apart without walking outward.
+///
+/// Brace depth is counted on [`mask_comments_and_literals`] output, so the
+/// `{}` in a `format!` string cannot desynchronise it; attribute *text* is read
+/// off the raw line, because masking blanks the feature name out of the
+/// attribute's own string literal. A line the mask reduced to blanks was
+/// entirely comment and is skipped, which is what keeps prose quoting the
+/// forbidden shape — including this doc comment — from registering.
+///
+/// One shape is deliberately not handled: a `cfg` attribute broken across
+/// several lines. rustfmt keeps these on one line and the crate has none.
+fn nested_feature_cfgs(src: &str) -> Vec<(usize, String, NestedCfg)> {
+    let masked = mask_comments_and_literals(src);
+    let masked = String::from_utf8_lossy(&masked);
+    // (depth the gate's body sits at, feature, positive)
+    let mut gates: Vec<(i32, String, bool)> = Vec::new();
+    let mut pending: Option<(String, bool)> = None;
+    let mut depth = 0i32;
+    let mut parens = 0i32;
+    let mut found = Vec::new();
+
+    for (i, (raw, masked_line)) in src.lines().zip(masked.lines()).enumerate() {
+        if masked_line.trim().is_empty() {
+            continue;
+        }
+        let count = |c: u8| masked_line.bytes().filter(|b| *b == c).count() as i32;
+        let (opens, closes) = (count(b'{'), count(b'}'));
+        let trimmed = raw.trim();
+
+        if trimmed.starts_with("#[cfg(") {
+            if let Some(cfg) = cfg_attr_feature(trimmed) {
+                let under_own_feature = gates
+                    .iter()
+                    .any(|(_, gated_on, pos)| *pos && *gated_on == cfg.name);
+                if under_own_feature {
+                    if !cfg.positive {
+                        found.push((i + 1, cfg.name.clone(), NestedCfg::Dead));
+                    } else if cfg.sole {
+                        found.push((i + 1, cfg.name.clone(), NestedCfg::Redundant));
+                    }
+                }
+                pending = Some((cfg.name, cfg.positive));
+            }
+            continue;
+        }
+
+        // The attributed item. A body opens a scope the gate governs; a `use`,
+        // a `let` or a body-less item consumes the attribute where it ends.
+        // Neither may be decided while a parameter list is still open: a
+        // generic `fn` signature runs for many lines, each ending in a comma
+        // and opening no brace, and reading any of them as the whole item is
+        // how this scanner first reported the crate clean while two dead arms
+        // sat inside such functions.
+        // Measured at end of line, not start: the line that closes a parameter
+        // list is the same line that opens the body.
+        parens += count(b'(') - count(b')');
+        if parens == 0 {
+            if opens > closes {
+                if let Some((feature, positive)) = pending.take() {
+                    gates.push((depth + 1, feature, positive));
+                }
+            } else if trimmed.ends_with(';') || trimmed.ends_with(',') {
+                pending = None;
+            }
+        }
+        depth += opens - closes;
+        gates.retain(|(body_depth, _, _)| *body_depth <= depth);
+    }
+    found
+}
+
+/// A `cfg` that re-tests the feature its own enclosing item already gates on is
+/// either code no build compiles, or a condition that is not one. Neither is
+/// something a compiler will mention.
+#[test]
+fn no_cfg_re_tests_the_feature_its_enclosing_item_already_gates_on() {
+    let root = crate_src();
+    let mut findings = Vec::new();
+    for path in rust_files(&root) {
+        let Ok(src) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for (line, feature, kind) in nested_feature_cfgs(&src) {
+            let what = match kind {
+                NestedCfg::Dead => {
+                    format!("#[cfg(not(feature = \"{feature}\"))] — never compiles")
+                }
+                NestedCfg::Redundant => {
+                    format!("#[cfg(feature = \"{feature}\")] — already implied")
+                }
+            };
+            findings.push(format!("{}:{line} — {what}", rel(&path, &root)));
+        }
+    }
+    assert!(
+        findings.is_empty(),
+        "cfg attributes nested under a gate on their own feature — delete them:\n  {}",
+        findings.join("\n  ")
+    );
+}
+
+/// The scanner must separate the two shapes that look alike in a grep: sibling
+/// stubs, which are the correct way to write a per-feature pair, and a negation
+/// nested inside its own feature, which is dead. A scanner that failed to tell
+/// them apart would either flag every stub in the crate or flag nothing.
+#[test]
+fn the_nested_cfg_scanner_reads_bodies_and_not_siblings() {
+    let siblings = r#"
+#[cfg(feature = "vk")]
+fn f() -> bool {
+    true
+}
+#[cfg(not(feature = "vk"))]
+fn f() -> bool {
+    false
+}
+"#;
+    assert!(
+        nested_feature_cfgs(siblings).is_empty(),
+        "sibling stubs are the correct pattern"
+    );
+
+    let nested = r#"
+#[cfg(feature = "vk")]
+fn f() -> bool {
+    #[cfg(not(feature = "vk"))]
+    {
+        false
+    }
+}
+"#;
+    assert_eq!(
+        nested_feature_cfgs(nested),
+        vec![(4, String::from("vk"), NestedCfg::Dead)]
+    );
+
+    // A different feature nested inside is a real combination, not dead.
+    let other = r#"
+#[cfg(feature = "vk")]
+fn f() -> bool {
+    #[cfg(not(feature = "window"))]
+    {
+        false
+    }
+}
+"#;
+    assert!(nested_feature_cfgs(other).is_empty());
+
+    // The gate must close with its item: a negation *after* the body is a
+    // sibling even when it is only one line further on.
+    let after = r#"
+#[cfg(feature = "vk")]
+fn f() {
+    let s = "}{";
+}
+#[cfg(not(feature = "vk"))]
+fn f() {}
+"#;
+    assert!(
+        nested_feature_cfgs(after).is_empty(),
+        "a brace inside a string literal must not hold the gate open"
+    );
+
+    // The shape both dead arms in this crate actually had: the gated item is a
+    // generic `fn` whose signature runs for several lines before its body
+    // opens. Missing this reported the crate clean.
+    let multiline_signature = r#"
+#[cfg(feature = "vk")]
+fn f<M: HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+) -> Result<(), Error> {
+    #[cfg(not(feature = "vk"))]
+    {
+        return Err(Error);
+    }
+}
+"#;
+    assert_eq!(
+        nested_feature_cfgs(multiline_signature),
+        vec![(7, String::from("vk"), NestedCfg::Dead)]
+    );
+
+    // Prose quoting the shape is not the shape.
+    let prose = r#"
+#[cfg(feature = "vk")]
+fn f() {
+    // #[cfg(not(feature = "vk"))]
+    let x = 1;
+}
+"#;
+    assert!(nested_feature_cfgs(prose).is_empty());
+
+    // A bare re-test of the enclosing feature is redundant; the same feature
+    // carrying an extra condition is not.
+    let repeated = r#"
+#[cfg(feature = "vk")]
+fn f() {
+    #[cfg(feature = "vk")]
+    let a = 1;
+    #[cfg(all(feature = "vk", target_os = "macos"))]
+    let b = 2;
+}
+"#;
+    assert_eq!(
+        nested_feature_cfgs(repeated),
+        vec![(4, String::from("vk"), NestedCfg::Redundant)]
+    );
+}
+
 #[test]
 fn the_scanner_walks_the_whole_crate() {
     let files = rust_files(&crate_src());
@@ -996,6 +1478,62 @@ fn the_scanner_walks_the_whole_crate() {
     }
 }
 
+/// The production filter must actually drop the test-only files, and must not
+/// drop anything else.
+///
+/// Both directions matter and they fail in opposite ways. If
+/// [`declared_cfg_test`] silently returned `false` — a renamed `mod.rs`, an
+/// attribute written differently — the filter would be vacuous and every gate
+/// would go back to reading `runtime/*/tests.rs` as shipped code, which is the
+/// bug it was added for. If it returned `true` too readily it would hide real
+/// production files from every scan above, which is the direction that reads as
+/// a pass.
+#[test]
+fn the_production_filter_drops_test_only_files_and_nothing_else() {
+    let root = crate_src();
+    let all: Vec<String> = rust_files(&root).iter().map(|p| rel(p, &root)).collect();
+    let production: Vec<String> = production_files(&root)
+        .iter()
+        .map(|p| rel(p, &root))
+        .collect();
+
+    // Eight files in this crate are entirely test code, declared `#[cfg(test)]
+    // mod x;` by their parent. Every one was being read as shipped source by
+    // the three scans above — including this file, which is itself
+    // `#[cfg(test)] mod gate;` and whose tables name the very symbols those
+    // scans forbid.
+    let mut dropped: Vec<&String> = all.iter().filter(|p| !production.contains(p)).collect();
+    dropped.sort();
+    assert_eq!(
+        dropped,
+        [
+            "backend/vulkan/caps/gate.rs",
+            "backend/vulkan/translate/coverage.rs",
+            "backend/vulkan/translate/gate.rs",
+            "observe/gate.rs",
+            "runtime/compute_exec/tests.rs",
+            "runtime/drain/tests.rs",
+            "runtime/icb/tests.rs",
+            "runtime/metal_draw/tests.rs",
+        ]
+        .iter()
+        .collect::<Vec<_>>(),
+        "the set of test-only files changed; a new one must be dropped from the \
+         production scans and a removed one must not be listed here"
+    );
+    // And the production files those live beside are still scanned.
+    for expect in [
+        "runtime/drain/mod.rs",
+        "runtime/mipmap.rs",
+        "observe/mod.rs",
+    ] {
+        assert!(
+            production.iter().any(|p| p == expect),
+            "the filter dropped production file {expect}"
+        );
+    }
+}
+
 /// A row exempting a type must name a file that exists and say why. An exemption
 /// pointing at a moved or deleted file excuses nothing and hides the next one.
 #[test]
@@ -1012,4 +1550,532 @@ fn every_permanent_exemption_names_a_live_file_and_a_reason() {
             "{file} no longer defines {enum_name}; drop the exemption"
         );
     }
+}
+
+/// Every way production code gets a host pointer that aliases guest RAM, so the
+/// scan below cannot be fooled by a file that writes guest memory without ever
+/// naming `map_pages`.
+///
+/// The first cut of this gate listed only `map_pages` callers and **had exactly
+/// that hole**. `runtime/mapping_write.rs` takes its pointer from
+/// `mapper::ensure_contig_view` through two local wrappers and pokes BGRA rows
+/// straight into it — the largest guest-write rail in the device — and the gate
+/// scored the file as having no `map_pages` call at all, which is true and
+/// irrelevant. It passed, and the footprint was missing that whole rail.
+///
+/// So the needle is the *pointer*, not one of its sources. Anything that hands
+/// back a writable alias belongs here.
+///
+/// Needles are matched as plain substrings, so one that is a suffix of another
+/// name over-counts. `"map_fresh_span("` was such a needle: it matched every
+/// `unmap_fresh_span(` too, which is the *release* of a span and acquires
+/// nothing. Three files carried a count inflated by their release calls. A
+/// needle here must name an acquisition and nothing else.
+const GUEST_RAM_POINTER_SOURCES: &[&str] = &[
+    ".map_pages(",
+    "ensure_contig_view(",
+    "map_fresh_span_within(",
+    "contig_for_span(",
+    "contig_for_write(",
+];
+
+/// Every production site that obtains a host pointer over guest RAM, and whether
+/// it writes through it.
+///
+/// A host pointer over guest pages is one of the two ways this device can put
+/// bytes in the guest — the other being `HostMemory::write_gpa`, which has a
+/// single production implementation and is marked there. Every site here that
+/// writes must also mark `observe::footprint`, or that write's frames are
+/// missing from the set a guest panic is scored against. **The missing mark is
+/// the dangerous direction**: it produces a "this device never wrote that page"
+/// that is false, which is an exoneration nobody can tell from a real one.
+///
+/// So the classification is the point of the row, and the count is what stops a
+/// new call appearing inside an already-listed file without anyone deciding
+/// which kind it is.
+/// How a site's writes reach `observe::footprint`, or why they need not.
+#[derive(PartialEq, Eq, Debug, Clone, Copy)]
+enum Marks {
+    /// Writes guest RAM and marks the footprint in this file.
+    Here,
+    /// Writes guest RAM, but the pointer source it calls marks on its behalf.
+    /// Correct and preferable — one marking site serves every caller — so this
+    /// file must *not* mark again or the frames are counted twice.
+    BySource,
+    /// Takes a guest-RAM pointer only to copy out of it.
+    ReadOnly,
+}
+
+const MAP_PAGES_SITES: &[(&str, usize, Marks, &str)] = &[
+    (
+        "runtime/gpa_map.rs",
+        1,
+        Marks::Here,
+        "control-plane writes (stamp, DeviceInfo, display shared, child HEAD) \
+         map the covering pages and poke bytes; marked on the exact byte range \
+         after the copy",
+    ),
+    (
+        "runtime/gva_view.rs",
+        4,
+        Marks::Here,
+        "the raw-GVA rails, and the pointer source for the two files below. \
+         `write_span_multi` marks each packed run's exact destination; \
+         `map_fresh_span_within` marks the span it is about to hand to a caller \
+         that writes through the pointer. The read paths (`read_span_multi`, \
+         `host_ptr_for_span`) reach guest RAM only to copy out of it",
+    ),
+    (
+        "runtime/mapper.rs",
+        3,
+        Marks::Here,
+        "the mapping-keyed rails. Both directions share one walk, \
+         `copy_mapping_runs`, which marks through the mapping's own page list — \
+         a scatter, so never over the span's hull — on both the contiguous-view \
+         fast path and the per-run slow path, and only when the direction is a \
+         write. Was 5 sites while the write and read walks were separate copies \
+         of the same arithmetic",
+    ),
+    (
+        "runtime/mapping_write.rs",
+        8,
+        Marks::Here,
+        "the BGRA row writers, and the largest guest-write rail in the device. \
+         They take a contig view through `contig_for_write` and poke rows \
+         straight into it, reaching `mapper::write_mapping_bytes` not at all — \
+         which is exactly how the first cut of this gate missed them. \
+         `contig_for_write` marks for all of them",
+    ),
+    (
+        "runtime/metal_draw/mod.rs",
+        2,
+        Marks::BySource,
+        "`write_gva_rgba8_within` and its peer write rows through a `FreshSpan`; \
+         `gva_view::map_fresh_span_within` marks the span when it resolves it",
+    ),
+    (
+        "runtime/compute_exec/mod.rs",
+        1,
+        Marks::BySource,
+        "`write_linear_texture_bulk` writes rows through a `FreshSpan`; marked by \
+         `gva_view::map_fresh_span_within` as above",
+    ),
+    (
+        "runtime/metal_draw/vulkan.rs",
+        1,
+        Marks::ReadOnly,
+        "`coalesce_pages_to_runs` — the single import for every guest-pages \
+         rail (`task_gva_guest_runs` for task-GVA windows, \
+         `mapping_window_guest_runs` for the type-11 and type-5 mapping \
+         windows). It builds `engine::GuestRun` spans the engine reads *out \
+         of* — vertex, storage and sampled sources uploaded to the GPU. \
+         Nothing writes back through them, and the GPU cannot: \
+         `the_host_pointer_import_extension_is_never_requested` holds that the \
+         one extension which would let it is never requested",
+    ),
+    (
+        "runtime/scanout.rs",
+        1,
+        Marks::ReadOnly,
+        "screen capture reads the scanout surface out of its contig view; it \
+         puts nothing back",
+    ),
+];
+
+/// A `map_pages` caller that writes guest RAM must record where.
+///
+/// See [`MAP_PAGES_SITES`]. This is the mechanism behind the completeness claim
+/// `observe::footprint` makes: the footprint can only be trusted as evidence
+/// about a guest panic if the set of rails feeding it is closed, and "we
+/// remembered to hook the new one" is not a mechanism.
+#[test]
+fn every_map_pages_caller_is_classified_and_the_writers_mark_the_footprint() {
+    let root = crate_src();
+    let mut found: std::collections::BTreeMap<String, usize> = Default::default();
+    let mut marks: std::collections::BTreeSet<String> = Default::default();
+    for path in production_files(&root) {
+        let src = std::fs::read_to_string(&path).expect("read Rust source");
+        let production = production_source(&src);
+        let masked = mask_comments_and_literals(&production);
+        let text: String = masked.iter().copied().map(char::from).collect();
+        let rel_path = rel(&path, &root);
+        for line in text.lines() {
+            // A definition is not a caller: `fn ensure_contig_view(` would
+            // otherwise score the function that *is* the pointer source as a
+            // site that consumes one.
+            let is_definition = line.trim_start().starts_with("fn ")
+                || line.trim_start().starts_with("pub fn ")
+                || line.trim_start().starts_with("pub(crate) fn ");
+            if !is_definition
+                && GUEST_RAM_POINTER_SOURCES
+                    .iter()
+                    .any(|needle| line.contains(needle))
+            {
+                *found.entry(rel_path.clone()).or_default() += 1;
+            }
+            // `note_mapping_write_footprint` is the mapper's helper that resolves
+            // a write's frames through a mapping's scatter page list and marks
+            // them. It is a mark, so a file calling it is a marking file; leaving
+            // it off this list would fail a rail that does record its writes.
+            // Two spellings, because there are two markers. `note_written_range`
+            // is the direct one; `note_mapping_write_footprint` resolves a
+            // write's frames through a mapping's scatter page list first, which
+            // is what keeps a fragmented surface from claiming the frames
+            // between its pages. There was a third accepted spelling,
+            // `footprint::note_written_pages`, and no product rail ever called
+            // it — a gate that accepts a call nothing makes can license a file
+            // it never should.
+            if !is_definition
+                && (line.contains("footprint::note_written_range(")
+                    || line.contains("note_mapping_write_footprint("))
+            {
+                marks.insert(rel_path.clone());
+            }
+        }
+    }
+
+    let expected: std::collections::BTreeMap<String, usize> = MAP_PAGES_SITES
+        .iter()
+        .map(|(file, n, _, _)| ((*file).to_string(), *n))
+        .collect();
+    assert_eq!(
+        found, expected,
+        "the set of `map_pages` callers changed. Each one aliases guest RAM \
+         writably, so a new entry has to be classified in MAP_PAGES_SITES as a \
+         writer (and then mark observe::footprint) or as a reader (and say why \
+         nothing writes back through it)."
+    );
+
+    for (file, _, how, why) in MAP_PAGES_SITES {
+        assert!(!why.is_empty(), "{file}: classify it, do not just list it");
+        assert!(
+            root.join(file).exists(),
+            "{file} no longer exists; drop the row"
+        );
+        assert_eq!(
+            marks.contains(*file),
+            *how == Marks::Here,
+            "{file}: classified {how:?}, but the file {} mark observe::footprint. \
+             A writing rail that marks nowhere leaves its frames out of the set, \
+             and the resulting `pn` miss reads exactly like a real exoneration; a \
+             `BySource` rail that also marks here counts its frames twice.",
+            if marks.contains(*file) {
+                "does"
+            } else {
+                "does not"
+            }
+        );
+    }
+}
+
+/// Whether a guest-RAM writer feeds the **payload** census, and why.
+///
+/// A separate axis from [`Marks`], because they are separate instruments over
+/// the same rails and a file can satisfy one and not the other. That is not
+/// hypothetical: `runtime/mapping_write.rs` marked the footprint through
+/// `contig_for_write` and sampled no payload at all, so the first live payload
+/// readings were taken from a census blind to the rail carrying nearly every
+/// pixel — the identical shape to the footprint gap that keying on `map_pages`
+/// alone once produced, one instrument later.
+#[derive(PartialEq, Eq, Debug, Clone, Copy)]
+enum Payload {
+    /// Calls `note_written_payload` with the source buffer.
+    Sampled,
+    /// Deliberately not sampled, for the reason in the row.
+    Skipped,
+}
+
+/// Every guest-RAM writer, and whether the payload census sees it.
+///
+/// Read-only sites are absent by construction: they put no bytes in guest RAM,
+/// so there is no payload of theirs to shape. The test below derives the writer
+/// set from [`MAP_PAGES_SITES`] rather than repeating it, so a new writing rail
+/// cannot be added to one table and forgotten in this one.
+const PAYLOAD_CENSUS_SITES: &[(&str, Payload, &str)] = &[
+    (
+        "runtime/gpa_map.rs",
+        Payload::Skipped,
+        "control-plane writes — a completion stamp, DeviceInfo, the child HEAD. \
+         Tens of bytes each and orders of magnitude more frequent than a frame, \
+         so sampling them would spend the 1-in-64 budget on writes that cannot \
+         carry a 256-byte run and starve the census of the pixel writes it \
+         exists to shape. They are still in the footprint, which is what \
+         answers where the bytes went",
+    ),
+    (
+        "runtime/gva_view.rs",
+        Payload::Sampled,
+        "`write_gva_bytes` samples once for the call, before the per-run copies",
+    ),
+    (
+        "runtime/mapper.rs",
+        Payload::Sampled,
+        "`write_mapping_bytes` samples once for the call, before either the \
+         contiguous fast path or the per-run slow path",
+    ),
+    (
+        "runtime/mapping_write.rs",
+        Payload::Sampled,
+        "`contig_for_write` samples the source image for all four row writers, \
+         the same funnel that marks their footprint",
+    ),
+    (
+        "runtime/metal_draw/mod.rs",
+        Payload::Sampled,
+        "`write_gva_rgba8_within` and `write_gva_rgba8_rect` sample the RGBA8 \
+         source once each after the fresh walk resolves. Not `BySource` like \
+         their footprint: `map_fresh_span_within` resolves a span and never sees \
+         a buffer, so there is nothing for it to sample on their behalf",
+    ),
+    (
+        "runtime/compute_exec/mod.rs",
+        Payload::Sampled,
+        "`write_linear_texture_bulk` samples its source rows once for the call, \
+         for the same reason",
+    ),
+];
+
+/// Every rail that writes guest RAM either feeds the payload census or says why
+/// it does not.
+///
+/// The footprint answers *where* this device wrote; the payload census answers
+/// *what*, and the panic evidence needs both — a victim full of `0xff` is only
+/// attributable if this device is known to write, or not to write, long `0xff`
+/// runs. A rail missing from the census makes its zero mean less than it reads.
+#[test]
+fn every_guest_ram_writer_is_classified_for_the_payload_census() {
+    let root = crate_src();
+    let mut samples: std::collections::BTreeSet<String> = Default::default();
+    for path in production_files(&root) {
+        let src = std::fs::read_to_string(&path).expect("read Rust source");
+        let production = production_source(&src);
+        let masked = mask_comments_and_literals(&production);
+        let text: String = masked.iter().copied().map(char::from).collect();
+        for line in text.lines() {
+            let is_definition = line.trim_start().starts_with("fn ")
+                || line.trim_start().starts_with("pub fn ")
+                || line.trim_start().starts_with("pub(crate) fn ");
+            if !is_definition && line.contains("note_written_payload(") {
+                samples.insert(rel(&path, &root));
+            }
+        }
+    }
+
+    // The writers, taken from the footprint table so the two cannot drift.
+    let writers: std::collections::BTreeSet<&str> = MAP_PAGES_SITES
+        .iter()
+        .filter(|(_, _, how, _)| *how != Marks::ReadOnly)
+        .map(|(file, ..)| *file)
+        .collect();
+    let classified: std::collections::BTreeSet<&str> = PAYLOAD_CENSUS_SITES
+        .iter()
+        .map(|(file, ..)| *file)
+        .collect();
+    assert_eq!(
+        writers, classified,
+        "every rail that puts bytes in guest RAM needs a payload-census verdict. \
+         A new writer that is only in MAP_PAGES_SITES is in the footprint and \
+         invisible to the census, which is how a payload reading of zero came \
+         to be reported about a device whose largest rail was never scanned."
+    );
+
+    for (file, how, why) in PAYLOAD_CENSUS_SITES {
+        assert!(!why.is_empty(), "{file}: classify it, do not just list it");
+        assert_eq!(
+            samples.contains(*file),
+            *how == Payload::Sampled,
+            "{file}: classified {how:?}, but the file {} call \
+             footprint::note_written_payload.",
+            if samples.contains(*file) {
+                "does"
+            } else {
+                "does not"
+            }
+        );
+    }
+}
+
+/// The other funnel: `HostMemory::write_gpa` reaches guest RAM without
+/// `map_pages` at all, so the footprint has to be marked in the one production
+/// implementation of it.
+///
+/// `FakeHost`'s implementation deliberately does not mark, for the reason its
+/// [`MAP_PAGES_SITES`] row gives, so this asserts the QEMU side specifically
+/// rather than counting implementations.
+#[test]
+fn the_real_write_gpa_marks_the_footprint() {
+    let src = std::fs::read_to_string(crate_src().join("qemu/host_ops.rs"))
+        .expect("read the QEMU host shim");
+    let production = production_source(&src);
+    let masked = mask_comments_and_literals(&production);
+    let text: String = masked.iter().copied().map(char::from).collect();
+    let body = text
+        .split("fn write_gpa(")
+        .nth(1)
+        .expect("QemuHost still implements write_gpa");
+    // Bounded to the function: the next `fn ` starts the following method, and
+    // a mark that had drifted out of `write_gpa` into a neighbour would
+    // otherwise satisfy a whole-file search while recording nothing.
+    let body = body.split("\n    fn ").next().unwrap_or(body);
+    assert!(
+        body.contains("footprint::note_written_range("),
+        "QemuHost::write_gpa must record the frames it writes. It is one of the \
+         two ways this device reaches guest RAM, and the whole of the \
+         control-plane traffic goes through it."
+    );
+}
+
+/// Product raw-GVA writes that are deliberately **not** bounded to an armed
+/// page set, each with the authorisation that makes it sound.
+///
+/// `write_task_gva_product_within(.., allowed)` restricts a write to the guest
+/// pages a deferred window was armed on. The bare `write_task_gva_product` has
+/// no such bound, so every use of it needs a different reason to be writing
+/// where it is — and the reason is always the same shape here: the write is
+/// **synchronous with the command that named the address**, so the guest cannot
+/// have freed it in between. A deferred rail cannot say that, which is exactly
+/// why it carries an armed set.
+///
+/// The count is part of the row so this debt cannot grow silently: a new
+/// unbounded write in one of these files fails the test even though the file is
+/// already listed.
+const UNBOUNDED_RAW_GVA_WRITES: &[(&str, usize, &str)] = &[
+    (
+        "runtime/drain/mod.rs",
+        3,
+        "GetComputeInfo and the texture-requirement query write their reply into \
+         the `reply_gva` the request packet itself carries, while that packet is \
+         being executed. There is no interval in which the guest could have \
+         handed the address to something else",
+    ),
+    (
+        "runtime/mipmap.rs",
+        1,
+        "mipmap generation writes rows into the destination texture's own GVA \
+         during the command that asked for them; the texture is live for the \
+         duration of its own command",
+    ),
+    (
+        "runtime/blit_exec.rs",
+        1,
+        "the type-2 staging blit writes destination rows at the GVA the blit \
+         command names, synchronously inside that blit. Every other write on \
+         this rail IS bounded (`_within(.., allowed)`), which is what makes this \
+         one worth naming rather than assuming",
+    ),
+];
+
+/// A raw-GVA write with no armed page set has to be a deliberate, named choice.
+///
+/// This is the write-after-free class's blast radius, so the question "which
+/// writes can reach guest RAM without a page set bounding them?" must have an
+/// answer that survives review. It has been re-derived by hand in at least
+/// three sessions — each time reaching the same two or three sites, each time
+/// from scratch, and one handoff ends with "don't re-chase these", which is not
+/// a mechanism. This is the mechanism.
+///
+/// Bounded writes go through `write_task_gva_product_within` with an `allowed`
+/// set and are not counted here; the bare call is. Adding one fails this test
+/// until it is listed with a reason, and removing one fails it too, so the
+/// table cannot drift out of date in either direction.
+#[test]
+fn every_unbounded_raw_gva_write_is_named_and_justified() {
+    let root = crate_src();
+    let mut found: std::collections::BTreeMap<String, usize> = Default::default();
+    for path in production_files(&root) {
+        let src = std::fs::read_to_string(&path).expect("read Rust source");
+        // Test modules are stripped: a fixture writing through the product
+        // helper is exercising it, not shipping an unbounded write.
+        let production = production_source(&src);
+        let masked = mask_comments_and_literals(&production);
+        let text: String = masked.iter().copied().map(char::from).collect();
+        let rel_path = rel(&path, &root);
+        for line in text.lines() {
+            // The open paren immediately after the name is what separates the
+            // unbounded call from `write_task_gva_product_within(`, which is a
+            // strict prefix of it and would otherwise be counted as unbounded —
+            // scoring the bounded rail as the hazard.
+            if !line.contains("write_task_gva_product(") {
+                continue;
+            }
+            // Its own definition and the one-line forwarder that supplies
+            // `None` are the implementation, not a caller.
+            if rel_path == "runtime/gva_mem.rs" {
+                continue;
+            }
+            *found.entry(rel_path.clone()).or_default() += 1;
+        }
+    }
+
+    let expected: std::collections::BTreeMap<String, usize> = UNBOUNDED_RAW_GVA_WRITES
+        .iter()
+        .map(|(file, n, _)| ((*file).to_string(), *n))
+        .collect();
+    assert_eq!(
+        found, expected,
+        "unbounded raw-GVA writes changed. Every one of these can write guest \
+         RAM with no armed page set bounding it, so a new entry needs a stated \
+         authorisation in UNBOUNDED_RAW_GVA_WRITES (and a removed one needs the \
+         row dropped). Bounded writes use write_task_gva_product_within(.., \
+         allowed) and are not counted."
+    );
+    for (file, _, why) in UNBOUNDED_RAW_GVA_WRITES {
+        assert!(!why.is_empty(), "{file}: an unbounded write must say why");
+        assert!(
+            root.join(file).exists(),
+            "{file} no longer exists; drop the row"
+        );
+    }
+}
+
+/// The page-drift witness has exactly one production caller, so the policy and
+/// its control knob cannot be bypassed by adding a rail.
+///
+/// `mapper::type4_pages_witness` answers *whether* a mapping's cached page
+/// list still names the guest memory it was walked from — and, since it reports
+/// `Unwitnessed` apart from `Verified`, whether it was in a position to know.
+/// `mapper::mapping_pages_verdict` decides what the device does about the
+/// answer: count it, and — when it refuses — invalidate the list rather than
+/// skip one write. Those are separable
+/// and a caller that reaches past the second to the first gets the question
+/// without any of the answer.
+///
+/// That is not hypothetical. The witness shipped in `1b6e423` with one caller,
+/// the deferred render flush, while the four direct writers in `mapping_write`
+/// wrote through the same `page_entries` unchecked; the crash class this crate
+/// is chasing lived in that gap for a release. Reviewing "did the new rail
+/// remember to call the check?" is exactly the question nobody asked, so it is
+/// asked here instead, once, by the compiler's test runner.
+///
+/// A new rail that genuinely needs the raw witness should call
+/// `mapping_pages_verdict` and match on the outcome. If it truly cannot, this
+/// test is the place to record why.
+#[test]
+fn the_page_drift_witness_is_only_consulted_through_the_policy() {
+    let root = crate_src();
+    let mut callers = Vec::new();
+    for path in production_files(&root) {
+        let src = std::fs::read_to_string(&path).expect("read Rust source");
+        let production = production_source(&src);
+        let masked = mask_comments_and_literals(&production);
+        let text: String = masked.iter().copied().map(char::from).collect();
+        for (index, line) in text.lines().enumerate() {
+            if !line.contains("type4_pages_witness") {
+                continue;
+            }
+            // Its own definition, and the one function allowed to ask it.
+            if line.contains("pub fn type4_pages_witness") {
+                continue;
+            }
+            callers.push(format!("{}:{}", rel(&path, &root), index + 1));
+        }
+    }
+    assert_eq!(
+        callers.len(),
+        1,
+        "the page-drift witness must be reached only through \
+         mapper::mapping_pages_verdict, which is what counts the outcome and \
+         invalidates a contradicted list. Callers found:\n  {}",
+        callers.join("\n  ")
+    );
 }

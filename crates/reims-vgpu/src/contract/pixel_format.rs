@@ -1,6 +1,5 @@
 //! Metal pixel-format helpers (port of `host/utils/reims-vgpu-pixel-format`).
 
-use crate::contract::checked_mul_u64;
 use crate::contract::endian::{ld16, st16};
 
 pub const COMPONENT_COUNT: usize = 4;
@@ -21,8 +20,6 @@ pub const RGBA16F_BPP: u32 = RGBA16_BPP;
 pub const RGBA32_BPP: u32 = 16;
 pub const RGBA32F_BPP: u32 = RGBA32_BPP;
 pub const R32_BPP: u32 = 4;
-
-pub const IOSURFACE_ROW_ALIGNMENT: u32 = 128;
 
 // MTLPixelFormat values (Metal.framework Headers/MTLPixelFormat.h).
 pub const MTL_FORMAT_A8_UNORM: u16 = 0x01;
@@ -148,24 +145,6 @@ impl TexelLayout {
     pub fn is_four_byte_color(self) -> bool {
         matches!(self, Self::Rgba8 | Self::Bgra8)
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u32)]
-pub enum RenderTargetClass {
-    Unsupported = 0,
-    /// Stable C ABI ordinals: 1=BGRA8, 2=RGBA16F (bring-up compositor set).
-    Bgra8Unorm = 1,
-    Rgba16Float = 2,
-    /// App/intermediate Metal color RTs (Metal color-renderable; not heuristics).
-    Rgba8Unorm = 3,
-    Rgba8UnormSrgb = 4,
-    Bgra8UnormSrgb = 5,
-    /// Two-channel float16 color RT (Metal color-renderable). Used as the
-    /// secondary MRT mask/coverage slot of vibrancy UI tiles (Control Center,
-    /// widgets). The GPU pass is 8-bit UNORM like every other target; the R/G
-    /// channels round-trip through the f16 LUT at guest writeback/seed.
-    Rg16Float = 6,
 }
 
 #[repr(u8)]
@@ -587,41 +566,55 @@ pub fn sampled_class(format: u16) -> Option<SampledClass> {
     })
 }
 
-pub fn storage_selector(format: u16) -> Option<(StorageImageSelector, u32)> {
+/// Which storage-image selector a Metal format maps to, or `None` for a format
+/// this host will not expose as a storage image.
+///
+/// The texel width is **not** returned. It used to be, as a second column
+/// beside each selector, and the only thing that column was ever used for was a
+/// `debug_assert_eq!` against [`bytes_per_pixel`] at three of the four call
+/// sites — the fourth discarded it. A number stated twice that nothing reads is
+/// a number that can disagree with itself in a release build, where a
+/// `debug_assert` is not compiled at all. `storage_texel_width_matches_the_pixel_table`
+/// now holds the same invariant for every `u16`, at test time, exhaustively.
+pub fn storage_selector(format: u16) -> Option<StorageImageSelector> {
     Some(match format {
-        MTL_FORMAT_R8_UNORM => (StorageImageSelector::R8Unorm, R8_BPP),
-        MTL_FORMAT_R32_UINT => (StorageImageSelector::R32Uint, R32_BPP),
-        MTL_FORMAT_RG8_UNORM => (StorageImageSelector::Rg8Unorm, RG8_BPP),
-        MTL_FORMAT_R16_FLOAT => (StorageImageSelector::R16Float, R16F_BPP),
-        MTL_FORMAT_RG16_FLOAT => (StorageImageSelector::Rg16Float, RG16F_BPP),
-        MTL_FORMAT_RGBA8_UNORM => (StorageImageSelector::Rgba8Unorm, RGBA8_BPP),
-        MTL_FORMAT_BGRA8_UNORM => (StorageImageSelector::Bgra8Unorm, BGRA8_BPP),
-        MTL_FORMAT_RGBA8_UINT => (StorageImageSelector::Rgba8Uint, RGBA8_BPP),
-        MTL_FORMAT_RGBA8_SINT => (StorageImageSelector::Rgba8Sint, RGBA8_BPP),
-        MTL_FORMAT_RGBA16_UINT => (StorageImageSelector::Rgba16Uint, RGBA16_BPP),
-        MTL_FORMAT_RGBA16_FLOAT => (StorageImageSelector::Rgba16Float, RGBA16F_BPP),
-        MTL_FORMAT_RGBA32_UINT => (StorageImageSelector::Rgba32Uint, RGBA32_BPP),
-        MTL_FORMAT_RGBA32_FLOAT => (StorageImageSelector::Rgba32Float, RGBA32F_BPP),
+        MTL_FORMAT_R8_UNORM => StorageImageSelector::R8Unorm,
+        MTL_FORMAT_R32_UINT => StorageImageSelector::R32Uint,
+        MTL_FORMAT_RG8_UNORM => StorageImageSelector::Rg8Unorm,
+        MTL_FORMAT_R16_FLOAT => StorageImageSelector::R16Float,
+        MTL_FORMAT_RG16_FLOAT => StorageImageSelector::Rg16Float,
+        MTL_FORMAT_RGBA8_UNORM => StorageImageSelector::Rgba8Unorm,
+        MTL_FORMAT_BGRA8_UNORM => StorageImageSelector::Bgra8Unorm,
+        MTL_FORMAT_RGBA8_UINT => StorageImageSelector::Rgba8Uint,
+        MTL_FORMAT_RGBA8_SINT => StorageImageSelector::Rgba8Sint,
+        MTL_FORMAT_RGBA16_UINT => StorageImageSelector::Rgba16Uint,
+        MTL_FORMAT_RGBA16_FLOAT => StorageImageSelector::Rgba16Float,
+        MTL_FORMAT_RGBA32_UINT => StorageImageSelector::Rgba32Uint,
+        MTL_FORMAT_RGBA32_FLOAT => StorageImageSelector::Rgba32Float,
         _ => return None,
     })
 }
 
-pub fn render_target_class(format: u16) -> Option<(RenderTargetClass, u32)> {
-    Some(match format {
-        // Metal color-renderable 8-bit + float16 family. sRGB variants share
-        // storage bpp with their unorm counterparts (Metal texture view rules).
-        MTL_FORMAT_RGBA8_UNORM => (RenderTargetClass::Rgba8Unorm, RGBA8_BPP),
-        MTL_FORMAT_RGBA8_UNORM_SRGB => (RenderTargetClass::Rgba8UnormSrgb, RGBA8_BPP),
-        MTL_FORMAT_BGRA8_UNORM => (RenderTargetClass::Bgra8Unorm, BGRA8_BPP),
-        MTL_FORMAT_BGRA8_UNORM_SRGB => (RenderTargetClass::Bgra8UnormSrgb, BGRA8_BPP),
-        MTL_FORMAT_RGBA16_FLOAT => (RenderTargetClass::Rgba16Float, RGBA16F_BPP),
-        MTL_FORMAT_RG16_FLOAT => (RenderTargetClass::Rg16Float, RG16F_BPP),
-        _ => return None,
-    })
-}
-
+/// Storage bytes per texel of a format this host will render into, or `None`
+/// for one it will not.
+///
+/// The match arms *are* the renderable set — the answer to "may a colour
+/// attachment be this format" is `.is_some()`, which is how
+/// `runtime/metal_draw` asks it. There used to be a `RenderTargetClass` enum
+/// returned alongside the width, one variant per arm below; every caller
+/// discarded it, so it named the same six formats a second time and could
+/// disagree with this list without anything noticing.
+///
+/// sRGB variants share storage bpp with their unorm counterparts (Metal texture
+/// view rules).
 pub fn render_target_bpp(format: u16) -> Option<u32> {
-    render_target_class(format).map(|(_, bpp)| bpp)
+    Some(match format {
+        MTL_FORMAT_RGBA8_UNORM | MTL_FORMAT_RGBA8_UNORM_SRGB => RGBA8_BPP,
+        MTL_FORMAT_BGRA8_UNORM | MTL_FORMAT_BGRA8_UNORM_SRGB => BGRA8_BPP,
+        MTL_FORMAT_RGBA16_FLOAT => RGBA16F_BPP,
+        MTL_FORMAT_RG16_FLOAT => RG16F_BPP,
+        _ => return None,
+    })
 }
 
 pub fn tight_row_bytes(width: u32, format: u16) -> Option<u32> {
@@ -630,25 +623,6 @@ pub fn tight_row_bytes(width: u32, format: u16) -> Option<u32> {
     }
     let bpp = bytes_per_pixel(format)?;
     width.checked_mul(bpp)
-}
-
-pub fn iosurface_row_bytes(width: u32, format: u16) -> Option<u32> {
-    if width == 0 {
-        return None;
-    }
-    let (_, bpp) = render_target_class(format)?;
-    let row = checked_mul_u64(width as u64, bpp as u64)?;
-    let rem = row % IOSURFACE_ROW_ALIGNMENT as u64;
-    let row = if rem != 0 {
-        row.checked_add(IOSURFACE_ROW_ALIGNMENT as u64 - rem)?
-    } else {
-        row
-    };
-    if row > u32::MAX as u64 {
-        None
-    } else {
-        Some(row as u32)
-    }
 }
 
 pub fn swizzle_identity() -> SwizzlePlan {
@@ -1156,10 +1130,16 @@ mod tests {
             sampled_class(MTL_FORMAT_BGRA8_UNORM_SRGB),
             sampled_class(MTL_FORMAT_BGRA8_UNORM)
         );
-        // The render-target classes do NOT fold — they keep the qualifier.
-        assert_ne!(
-            render_target_class(MTL_FORMAT_RGBA8_UNORM_SRGB),
-            render_target_class(MTL_FORMAT_RGBA8_UNORM)
+        // The render-target rail does NOT fold the qualifier, and `is_srgb` is
+        // where it is kept. `render_target_bpp` deliberately cannot say: a
+        // storage width is the same eight bits either way, and the enum that
+        // used to carry both the width and an sRGB-qualified variant name was
+        // read by nobody, so the qualifier only ever came from here.
+        assert!(is_srgb(MTL_FORMAT_RGBA8_UNORM_SRGB) != is_srgb(MTL_FORMAT_RGBA8_UNORM));
+        assert_eq!(
+            render_target_bpp(MTL_FORMAT_RGBA8_UNORM_SRGB),
+            render_target_bpp(MTL_FORMAT_RGBA8_UNORM),
+            "the sRGB qualifier does not change how wide a texel is"
         );
     }
 
@@ -1172,44 +1152,44 @@ mod tests {
         assert_eq!(sampled_class(MTL_FORMAT_R16_FLOAT), None);
         assert_eq!(
             storage_selector(MTL_FORMAT_R8_UNORM),
-            Some((StorageImageSelector::R8Unorm, 1))
+            Some(StorageImageSelector::R8Unorm)
         );
         assert_eq!(storage_selector(MTL_FORMAT_A8_UNORM), None);
         // R32Uint is storage-capable (specialized to the R32ui storage path);
         // its single-channel sint/float siblings are not.
         assert_eq!(
             storage_selector(MTL_FORMAT_R32_UINT),
-            Some((StorageImageSelector::R32Uint, R32_BPP))
+            Some(StorageImageSelector::R32Uint)
         );
         assert_eq!(storage_selector(MTL_FORMAT_R32_SINT), None);
         assert_eq!(storage_selector(MTL_FORMAT_R32_FLOAT), None);
         assert_eq!(
-            render_target_class(MTL_FORMAT_BGRA8_UNORM),
-            Some((RenderTargetClass::Bgra8Unorm, 4))
+            render_target_bpp(MTL_FORMAT_BGRA8_UNORM),
+            Some(4)
         );
         assert_eq!(
-            render_target_class(MTL_FORMAT_RGBA8_UNORM),
-            Some((RenderTargetClass::Rgba8Unorm, 4))
+            render_target_bpp(MTL_FORMAT_RGBA8_UNORM),
+            Some(4)
         );
         assert_eq!(
-            render_target_class(MTL_FORMAT_RGBA8_UNORM_SRGB),
-            Some((RenderTargetClass::Rgba8UnormSrgb, 4))
+            render_target_bpp(MTL_FORMAT_RGBA8_UNORM_SRGB),
+            Some(4)
         );
         assert_eq!(
-            render_target_class(MTL_FORMAT_BGRA8_UNORM_SRGB),
-            Some((RenderTargetClass::Bgra8UnormSrgb, 4))
+            render_target_bpp(MTL_FORMAT_BGRA8_UNORM_SRGB),
+            Some(4)
         );
         assert_eq!(
-            render_target_class(MTL_FORMAT_RGBA16_FLOAT),
-            Some((RenderTargetClass::Rgba16Float, 8))
+            render_target_bpp(MTL_FORMAT_RGBA16_FLOAT),
+            Some(8)
         );
         assert_eq!(
-            render_target_class(MTL_FORMAT_RG16_FLOAT),
-            Some((RenderTargetClass::Rg16Float, 4))
+            render_target_bpp(MTL_FORMAT_RG16_FLOAT),
+            Some(4)
         );
         // Integer / non-color formats stay fail-closed.
-        assert_eq!(render_target_class(MTL_FORMAT_RGBA8_UINT), None);
-        assert_eq!(render_target_class(MTL_FORMAT_R8_UNORM), None);
+        assert_eq!(render_target_bpp(MTL_FORMAT_RGBA8_UINT), None);
+        assert_eq!(render_target_bpp(MTL_FORMAT_R8_UNORM), None);
     }
 
     /// RG16Float MRT slots (vibrancy UI tile masks) must admit as color RTs so
@@ -1289,18 +1269,21 @@ mod tests {
         }
     }
 
+    /// The 128-byte-aligned IOSurface row lives in
+    /// [`crate::contract::iosurface_pages::sample_window`], which is the one the
+    /// mapper rail reads. A second `iosurface_row_bytes` here computed the same
+    /// rule from its own copy of the alignment and served nothing but this test.
     #[test]
     fn rows_and_image_size() {
-        assert_eq!(iosurface_row_bytes(200, MTL_FORMAT_BGRA8_UNORM), Some(896));
-        assert_eq!(iosurface_row_bytes(64, MTL_FORMAT_BGRA8_UNORM), Some(256));
-        assert_eq!(iosurface_row_bytes(250, MTL_FORMAT_BGRA8_UNORM), Some(1024));
-        assert_eq!(
-            iosurface_row_bytes(200, MTL_FORMAT_RGBA16_FLOAT),
-            Some(1664)
-        );
-        assert_eq!(iosurface_row_bytes(0, MTL_FORMAT_BGRA8_UNORM), None);
+        use crate::contract::iosurface_pages::sample_window;
+        let bpr = |w, fmt| sample_window(0, fmt, w, 1).map(|(_, bpr, _)| bpr);
+        assert_eq!(bpr(200, MTL_FORMAT_BGRA8_UNORM), Some(896));
+        assert_eq!(bpr(64, MTL_FORMAT_BGRA8_UNORM), Some(256));
+        assert_eq!(bpr(250, MTL_FORMAT_BGRA8_UNORM), Some(1024));
+        assert_eq!(bpr(200, MTL_FORMAT_RGBA16_FLOAT), Some(1664));
+        assert_eq!(bpr(0, MTL_FORMAT_BGRA8_UNORM), None);
         // Same 4 Bpp packing as BGRA8 → same 128 B aligned row for w=200.
-        assert_eq!(iosurface_row_bytes(200, MTL_FORMAT_RGBA8_UNORM), Some(896));
+        assert_eq!(bpr(200, MTL_FORMAT_RGBA8_UNORM), Some(896));
         assert_eq!(tight_row_bytes(200, MTL_FORMAT_BGRA8_UNORM), Some(800));
     }
 
@@ -1345,6 +1328,64 @@ mod tests {
         let _ = f16_to_f32(0x3c00); // 1.0
     }
 
+    /// Every storage-capable format has a texel width, and it is the width the
+    /// selector table used to carry beside it.
+    ///
+    /// This replaces three `debug_assert_eq!(selector_bpp, bpp)` at the
+    /// `compute_exec` staging call sites. Those checked the same thing, but only
+    /// for formats a running guest happened to bind, and only in a debug build —
+    /// a release build compiled them out entirely, so the disagreement they
+    /// guarded against would have shipped silently. Sweeping the whole `u16`
+    /// space costs microseconds and cannot miss an arm.
+    ///
+    /// The widths are spelled out rather than derived, because that is the point:
+    /// a change to `bytes_per_pixel` that silently redefined a storage format's
+    /// stride is exactly what the deleted column existed to catch.
+    #[test]
+    fn storage_texel_width_matches_the_pixel_table() {
+        let expected: &[(u16, u32)] = &[
+            (MTL_FORMAT_R8_UNORM, R8_BPP),
+            (MTL_FORMAT_R32_UINT, R32_BPP),
+            (MTL_FORMAT_RG8_UNORM, RG8_BPP),
+            (MTL_FORMAT_R16_FLOAT, R16F_BPP),
+            (MTL_FORMAT_RG16_FLOAT, RG16F_BPP),
+            (MTL_FORMAT_RGBA8_UNORM, RGBA8_BPP),
+            (MTL_FORMAT_BGRA8_UNORM, BGRA8_BPP),
+            (MTL_FORMAT_RGBA8_UINT, RGBA8_BPP),
+            (MTL_FORMAT_RGBA8_SINT, RGBA8_BPP),
+            (MTL_FORMAT_RGBA16_UINT, RGBA16_BPP),
+            (MTL_FORMAT_RGBA16_FLOAT, RGBA16F_BPP),
+            (MTL_FORMAT_RGBA32_UINT, RGBA32_BPP),
+            (MTL_FORMAT_RGBA32_FLOAT, RGBA32F_BPP),
+        ];
+        for (fmt, bpp) in expected {
+            assert!(
+                storage_selector(*fmt).is_some(),
+                "format {fmt:#x} lost its storage selector"
+            );
+            assert_eq!(
+                bytes_per_pixel(*fmt),
+                Some(*bpp),
+                "storage format {fmt:#x} changed texel width"
+            );
+        }
+
+        // And no arm was added to one table without the other. Exhaustive, so
+        // the two lists cannot drift apart in either direction.
+        for fmt in 0u16..=u16::MAX {
+            if storage_selector(fmt).is_some() {
+                assert!(
+                    bytes_per_pixel(fmt).is_some(),
+                    "storage-capable {fmt:#x} has no texel width"
+                );
+                assert!(
+                    expected.iter().any(|(f, _)| *f == fmt),
+                    "storage-capable {fmt:#x} is not pinned above"
+                );
+            }
+        }
+    }
+
     #[test]
     fn unsupported_fail_closed() {
         // Unknown formats fail closed. Depth/stencil families have bpp for blit
@@ -1353,7 +1394,7 @@ mod tests {
             assert!(bytes_per_pixel(fmt).is_none());
             assert!(sampled_class(fmt).is_none());
             assert!(storage_selector(fmt).is_none());
-            assert!(render_target_class(fmt).is_none());
+            assert!(render_target_bpp(fmt).is_none());
             assert!(texel_to_rgba8(fmt, &[0; 16]).is_none());
         }
         for fmt in [
@@ -1365,7 +1406,7 @@ mod tests {
             assert!(bytes_per_pixel(fmt).is_some());
             assert!(sampled_class(fmt).is_none());
             assert!(storage_selector(fmt).is_none());
-            assert!(render_target_class(fmt).is_none());
+            assert!(render_target_bpp(fmt).is_none());
             assert!(texel_to_rgba8(fmt, &[0; 16]).is_none());
         }
     }

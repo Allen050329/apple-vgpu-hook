@@ -43,8 +43,10 @@
 
 pub mod decline;
 pub mod emit;
+pub mod footprint;
 #[cfg(test)]
 mod gate;
+pub mod phase_clock;
 pub mod sink;
 
 /// Re-exported so call sites write `crate::observe::decline_display!(..)`
@@ -57,13 +59,12 @@ pub use emit::{first_sight, state_changed, Emit};
 // rather than `observe::sink::fail(…)`. `sink` stays public for the gate and
 // for readers who want the machinery.
 pub use sink::{
-    bgra_present_stats, bgra_present_stats_scalar, bgra_rgb_stats, content_probe_enabled,
-    content_summary, fail, line, nonzero_stats, off, redirect_logs_for_tests, rgba_rgb_stats,
-    sampled_cache_disabled,
+    bgra_present_stats, bgra_present_stats_scalar, bgra_rgb_stats, fail, line, nonzero_stats, off,
+    redirect_logs_for_tests, rgba_rgb_stats,
 };
-pub(crate) use sink::{draw_log_enabled, elapsed_ms};
+pub(crate) use sink::{draw_log_enabled, elapsed_ms, elapsed_us};
 
 // Path accessors and the line matcher exist so tests can assert against the
 // real sink rather than a mock; production never reads them back.
 #[cfg(test)]
-pub(crate) use sink::{fail_log_path, line_is, FailCapture};
+pub(crate) use sink::{fail_log_path, FailCapture};

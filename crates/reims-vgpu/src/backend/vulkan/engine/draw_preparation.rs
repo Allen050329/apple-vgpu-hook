@@ -130,12 +130,6 @@ pub enum DrawPreparationDecline {
         binding: u32,
         descriptor_len: usize,
     },
-    SamplerDescriptorBadLength {
-        sampler_ref: u32,
-        binding: u32,
-        descriptor_len: usize,
-        declared_len: Option<u32>,
-    },
     SamplerDescriptorUnknownType {
         sampler_ref: u32,
         binding: u32,
@@ -262,7 +256,6 @@ impl Decline for DrawPreparationDecline {
             Self::SamplerObjectType { .. } => "draw_prepare_sampler_object_type",
             Self::SamplerDescriptorMissing { .. } => "draw_prepare_sampler_descriptor_missing",
             Self::SamplerDescriptorShort { .. } => "draw_prepare_sampler_descriptor_short",
-            Self::SamplerDescriptorBadLength { .. } => "draw_prepare_sampler_descriptor_bad_length",
             Self::SamplerDescriptorUnknownType { .. } => {
                 "draw_prepare_sampler_descriptor_unknown_type"
             }
@@ -492,20 +485,6 @@ impl Decline for DrawPreparationDecline {
                 ("sampler_ref", sampler_ref.to_string()),
                 ("binding", binding.to_string()),
                 ("descriptor_len", descriptor_len.to_string()),
-            ],
-            Self::SamplerDescriptorBadLength {
-                sampler_ref,
-                binding,
-                descriptor_len,
-                declared_len,
-            } => vec![
-                ("sampler_ref", sampler_ref.to_string()),
-                ("binding", binding.to_string()),
-                ("descriptor_len", descriptor_len.to_string()),
-                (
-                    "declared_len",
-                    declared_len.map_or_else(|| "none".into(), |value| value.to_string()),
-                ),
             ],
             Self::SamplerDescriptorUnknownType {
                 sampler_ref,
@@ -764,12 +743,6 @@ mod tests {
                 binding: 64,
                 descriptor_len: 3,
             },
-            DrawPreparationDecline::SamplerDescriptorBadLength {
-                sampler_ref: 5,
-                binding: 64,
-                descriptor_len: 32,
-                declared_len: Some(64),
-            },
             DrawPreparationDecline::SamplerDescriptorUnknownType {
                 sampler_ref: 5,
                 binding: 64,
@@ -870,7 +843,7 @@ mod tests {
         slugs.sort_unstable();
         let before = slugs.len();
         slugs.dedup();
-        assert_eq!(before, 41, "the draw-preparation reason census moved");
+        assert_eq!(before, 40, "the draw-preparation reason census moved");
         assert_eq!(before, slugs.len(), "duplicate draw-preparation slug");
     }
 

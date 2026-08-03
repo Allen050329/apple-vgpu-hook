@@ -7,7 +7,8 @@
 //! `Short3` occupies six bytes *because* it is three 16-bit components, which is
 //! also why it is `R16G16B16_UINT`. Held in two separate matches they drift —
 //! one arm gets fixed, the other keeps the old answer, and the mismatch surfaces
-//! as a stride bug in a shader nobody is looking at. [`LAYOUT`] states both once.
+//! as a stride bug in a shader nobody is looking at. [`vertex_layout`] states
+//! both once.
 //!
 //! # The signedness ABI
 //!

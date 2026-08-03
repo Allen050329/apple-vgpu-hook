@@ -54,6 +54,23 @@ pub fn write_bytes<H: HostMemory + HostOps>(
     unsafe {
         std::ptr::copy_nonoverlapping(buf.as_ptr(), (ptr as *mut u8).add(off), buf.len());
     }
+    // After the copy, not before: the footprint is the set of frames this
+    // device *wrote*, and every refusal above returns without writing one.
+    //
+    // The peer rails also record here into `DeviceState::host_writes`, so a
+    // reader can tell "the guest did not write these pages" from "nobody did".
+    // This one does not, because it never takes a `DeviceState` — every caller is
+    // the control plane in `runtime::drain` (completion stamps, DeviceInfo, the
+    // display shared page, child FIFO HEAD), writing pages the device was handed
+    // by the register handshake rather than any surface's backing. A sampled
+    // window covering one of them would mean the guest was sampling its own
+    // doorbell region. That is the whole of the justification, and it is the one
+    // guest-write rail outside that account.
+    crate::observe::footprint::note_written_range(
+        crate::observe::footprint::Rail::Gpa,
+        gpa,
+        buf.len() as u64,
+    );
     host.unmap_pages(ptr, total);
     Ok(())
 }

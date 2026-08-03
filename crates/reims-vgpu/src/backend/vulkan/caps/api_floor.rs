@@ -3,10 +3,19 @@
 //! Every host this backend supports runs **Vulkan 1.2**, and the engine
 //! requires nothing above 1.2 core on any pathway. A device below
 //! [`MIN_SUPPORTED_API`] is **declined by name**, not silently degraded:
-//! decoding the guest Metal stream needs descriptor indexing, 8- and 16-bit
-//! storage, and `shaderOutputViewportIndex`, all of which are Vulkan 1.2 core.
-//! Vulkan 1.1 cannot express the command stream, so pretending otherwise would
-//! fail later and further from the cause.
+//! decoding the guest Metal stream needs 8-bit storage and
+//! `shaderOutputViewportIndex`, both of which are Vulkan 1.2 core and both of
+//! which `caps::device_features` queries and enables. Vulkan 1.1 cannot express
+//! the command stream, so pretending otherwise would fail later and further
+//! from the cause.
+//!
+//! This paragraph used to name four requirements. Two of them — descriptor
+//! indexing and timeline semaphores — appear nowhere in the crate: not queried,
+//! not enabled, not used. A floor justified by capabilities nothing reaches for
+//! is a floor nobody can re-derive, and the two that are real are enough on
+//! their own. Timeline semaphores are worth knowing about for the opposite
+//! reason: they are 1.2 core and therefore already inside this floor, so
+//! adopting them needs no new gate.
 //!
 //! # There is deliberately no `ApiFloor` tier enum
 //!
@@ -29,8 +38,8 @@
 use ash::vk;
 
 /// Lowest device `apiVersion` the engine will bind. Below this the guest Metal
-/// command stream cannot be expressed (Vulkan 1.2 core: descriptor indexing,
-/// 8/16-bit storage, `shaderOutputViewportIndex`, timeline semaphores).
+/// command stream cannot be expressed (Vulkan 1.2 core: 8-bit storage,
+/// `shaderOutputViewportIndex`).
 pub const MIN_SUPPORTED_API: u32 = vk::API_VERSION_1_2;
 
 /// Ceiling for the version the **instance** requests. This is a loader

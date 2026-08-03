@@ -138,9 +138,9 @@ impl ComputeSession {
             };
             use metal::MTLResourceOptions;
 
-            let mut stage_cond = |this: &mut Self,
-                                  buffer_ref: u32,
-                                  offset: u64|
+            let stage_cond = |this: &mut Self,
+                              buffer_ref: u32,
+                              offset: u64|
              -> Result<(metal::Buffer, u64), ComputeStatus> {
                 let end = offset.checked_add(4).ok_or(ComputeStatus::MissingBuffer(
                     "compute_control_cond_offset_overflow",
@@ -544,7 +544,7 @@ fn apply_icb_compute_encoder_inheritance<M: HostMemory + HostOps>(
     };
     use crate::backend::metal::runtime::new_buffer_from_host;
     use crate::backend::metal::samplers::make_explicit_sampler;
-    use crate::backend::metal::util::image_len;
+    use crate::backend::metal::util::{image_len, valid_buffer_binding};
     use crate::contract::endian::ld32;
     use crate::runtime::compute_exec::{
         load_compute_pipeline, load_mtlb, nested_job_from_icb_resources, stage_buffer,
@@ -586,6 +586,29 @@ fn apply_icb_compute_encoder_inheritance<M: HostMemory + HostOps>(
             if b.buffer_ref == 0 {
                 continue;
             }
+            // Metal's kernel buffer argument table has
+            // `REIMS_VGPU_METAL_MAX_BUFFERS` entries, and
+            // `setBuffer:offset:atIndex:` past the end raises an out-of-range
+            // exception — which aborts the process instead of declining, so the
+            // bound has to be checked before the call and not after. `b.index`
+            // comes from the decoded stream, so nothing upstream constrains it.
+            //
+            // The three sibling bind paths all gate on this limit already: direct
+            // compute through `valid_buffer_binding`, and both render paths
+            // (direct draw and ICB inheritance) through `MAX_BIND_SLOTS`, which is
+            // the same 31. This path had no device-limit gate at all — only the
+            // descriptor check below, which the guest disables outright by leaving
+            // `max_kernel_buffer_bind_count` at 0.
+            if !valid_buffer_binding(b.index) {
+                return Err(ComputeStatus::Unsupported(
+                    "icb_inherit_buffer_binding_out_of_range",
+                ));
+            }
+            // Narrower than the device limit and separate from it: the guest's own
+            // declared per-command bind count for this ICB. Kept as it stands —
+            // whether `maxKernelBufferBindCount` is meant to bound *parent-encoder*
+            // binds under `inheritBuffers`, as opposed to binds recorded into an
+            // ICB command, is not settled from the decoded fields.
             if desc.max_kernel_buffer_bind_count > 0
                 && b.index as u64 >= desc.max_kernel_buffer_bind_count as u64
             {
@@ -734,14 +757,12 @@ fn apply_icb_compute_encoder_inheritance<M: HostMemory + HostOps>(
                         depth: 1,
                     },
                 };
-                unsafe {
-                    tex.replace_region(
-                        region,
-                        0,
-                        staged.bytes.as_ptr() as *const _,
-                        (staged.width as u64) * (bpp as u64),
-                    );
-                }
+                tex.replace_region(
+                    region,
+                    0,
+                    staged.bytes.as_ptr() as *const _,
+                    (staged.width as u64) * (bpp as u64),
+                );
                 // Residency for resources referenced through the AB.
                 let res_usage = if is_storage {
                     MTLResourceUsage::Write | MTLResourceUsage::Read
@@ -779,35 +800,13 @@ fn apply_icb_compute_encoder_inheritance<M: HostMemory + HostOps>(
                 let sd = decode_sampler_descriptor(&desc_bytes).map_err(|_| {
                     ComputeStatus::MissingSampler("compute_icb_inherit_ab_sampler_decode")
                 })?;
-                let mut lod_min = sd.lod_min_clamp.to_bits();
-                let mut lod_max = sd.lod_max_clamp.to_bits();
-                let mut has_lod = 1u32;
-                if s.has_lod_clamp {
-                    lod_min = s.lod_min_bits;
-                    lod_max = s.lod_max_bits;
-                    has_lod = 1;
-                }
-                let reims_vgpu = ReimsVgpuSampler {
-                    binding: REIMS_VGPU_BINDING_SAMPLER_BASE + s.index,
-                    unnormalized: if sd.normalized_coordinates { 0 } else { 1 },
-                    min_filter: sd.min_filter,
-                    mag_filter: sd.mag_filter,
-                    mip_filter: sd.mip_filter,
-                    s_address_mode: sd.s_address,
-                    t_address_mode: sd.t_address,
-                    r_address_mode: sd.r_address,
-                    border_color: sd.border_color,
-                    compare_function: sd.compare_function,
-                    lod_min_bits: lod_min,
-                    lod_max_bits: lod_max,
-                    max_anisotropy: sd.max_anisotropy.max(1),
-                    lod_average: if sd.lod_average { 1 } else { 0 },
-                    // AB-resident samplers must support argument buffers.
-                    support_argument_buffers: 1,
-                    has_lod_clamp: has_lod,
-                    clamp_lod_min_bits: lod_min,
-                    clamp_lod_max_bits: lod_max,
-                };
+                // AB-resident samplers must support argument buffers.
+                let reims_vgpu = crate::runtime::metal_draw::sampler_record(
+                    REIMS_VGPU_BINDING_SAMPLER_BASE + s.index,
+                    &sd,
+                    s.has_lod_clamp.then_some((s.lod_min_bits, s.lod_max_bits)),
+                    true,
+                );
                 let mut err_buf = [0i8; 256];
                 let samp = make_explicit_sampler(
                     &session.device,
@@ -1015,34 +1014,12 @@ fn apply_icb_compute_encoder_inheritance<M: HostMemory + HostOps>(
                     let sd = decode_sampler_descriptor(&desc_bytes).map_err(|_| {
                         ComputeStatus::MissingSampler("compute_icb_inherit_sampler_decode")
                     })?;
-                    let mut lod_min = sd.lod_min_clamp.to_bits();
-                    let mut lod_max = sd.lod_max_clamp.to_bits();
-                    let mut has_lod = 1u32;
-                    if s.has_lod_clamp {
-                        lod_min = s.lod_min_bits;
-                        lod_max = s.lod_max_bits;
-                        has_lod = 1;
-                    }
-                    reims_vgpu_samplers.push(ReimsVgpuSampler {
-                        binding: REIMS_VGPU_BINDING_SAMPLER_BASE + s.index,
-                        unnormalized: if sd.normalized_coordinates { 0 } else { 1 },
-                        min_filter: sd.min_filter,
-                        mag_filter: sd.mag_filter,
-                        mip_filter: sd.mip_filter,
-                        s_address_mode: sd.s_address,
-                        t_address_mode: sd.t_address,
-                        r_address_mode: sd.r_address,
-                        border_color: sd.border_color,
-                        compare_function: sd.compare_function,
-                        lod_min_bits: lod_min,
-                        lod_max_bits: lod_max,
-                        max_anisotropy: sd.max_anisotropy.max(1),
-                        lod_average: if sd.lod_average { 1 } else { 0 },
-                        support_argument_buffers: if sd.support_argument_buffers { 1 } else { 0 },
-                        has_lod_clamp: has_lod,
-                        clamp_lod_min_bits: lod_min,
-                        clamp_lod_max_bits: lod_max,
-                    });
+                    reims_vgpu_samplers.push(crate::runtime::metal_draw::sampler_record(
+                        REIMS_VGPU_BINDING_SAMPLER_BASE + s.index,
+                        &sd,
+                        s.has_lod_clamp.then_some((s.lod_min_bits, s.lod_max_bits)),
+                        false,
+                    ));
                 }
                 let mut err_buf = [0i8; 256];
                 let err = (err_buf.as_mut_ptr(), err_buf.len());
@@ -1088,8 +1065,6 @@ mod tests {
     use super::*;
     #[cfg(all(feature = "backend-metal", target_os = "macos"))]
     use crate::contract::endian::{st32, st64};
-    #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     use crate::model::{DeviceId, PAGE_SHIFT_ARM64E};
     #[cfg(all(feature = "backend-metal", target_os = "macos"))]
     use crate::runtime::decode::resource::{

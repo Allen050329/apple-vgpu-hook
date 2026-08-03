@@ -47,10 +47,6 @@ pub enum DrawValidationDecline {
         actual: usize,
         expected: usize,
     },
-    LoadSeedLength {
-        actual: usize,
-        expected: usize,
-    },
     SeedMissingTargetIdentity,
     SeedConflictsCpuSeed,
     SeedConflictsLoadFromTarget,
@@ -190,7 +186,6 @@ impl Decline for DrawValidationDecline {
             Self::NonPositiveViewport { .. } => "vk_draw_validate_non_positive_viewport",
             Self::NonFiniteBlendConstants => "vk_draw_validate_non_finite_blend_constants",
             Self::TargetSeedLength { .. } => "vk_draw_validate_target_seed_length",
-            Self::LoadSeedLength { .. } => "vk_draw_validate_load_seed_length",
             Self::SeedMissingTargetIdentity => "vk_draw_validate_seed_missing_target_identity",
             Self::SeedConflictsCpuSeed => "vk_draw_validate_seed_conflicts_cpu_seed",
             Self::SeedConflictsLoadFromTarget => "vk_draw_validate_seed_conflicts_load_from_target",
@@ -281,7 +276,6 @@ impl Decline for DrawValidationDecline {
                 ("height", f32::from_bits(*height_bits).to_string()),
             ],
             Self::TargetSeedLength { actual, expected }
-            | Self::LoadSeedLength { actual, expected }
             | Self::IndexBytesShort { actual, expected } => vec![
                 ("actual", actual.to_string()),
                 ("expected", expected.to_string()),
@@ -480,10 +474,6 @@ mod tests {
                 actual: 3,
                 expected: 4,
             },
-            DrawValidationDecline::LoadSeedLength {
-                actual: 3,
-                expected: 4,
-            },
             DrawValidationDecline::SeedMissingTargetIdentity,
             DrawValidationDecline::SeedConflictsCpuSeed,
             DrawValidationDecline::SeedConflictsLoadFromTarget,
@@ -598,7 +588,7 @@ mod tests {
         slugs.sort_unstable();
         let before = slugs.len();
         slugs.dedup();
-        assert_eq!(before, 44, "the validator's reason census moved");
+        assert_eq!(before, 43, "the validator's reason census moved");
         assert_eq!(before, slugs.len(), "duplicate draw-validation slug");
     }
 

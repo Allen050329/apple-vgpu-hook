@@ -8,7 +8,7 @@
 //! | Proxy | Meaning |
 //! | --- | --- |
 //! | `stale_online_pending` | A post-ack display IRQ raised with the shared-page ONLINE bit still pending |
-//! | `secondary_mrt_drop` / `mrt_mask_bind_miss` | A multi-RT draw degraded to single-RT, or a rendered mask failed to bind at sample time |
+//! | `secondary_mrt_drop` | A multi-RT draw degraded to single-RT |
 //! | `empty_sample` | A resolved fragment/vertex sample whose payload was all-zero |
 //!
 //! [`window_publish`] emits one line per window and stays silent while its
@@ -27,12 +27,15 @@ struct ThrashState {
     /// pass-through class). Bounded by the small set of
     /// (reason, geometry) combinations a boot produces.
     secondary_mrt_drop_seen: std::collections::BTreeSet<(u8, u32, u32)>,
-    /// Post-**ack** display IRQs raised while the shared-page ONLINE bit (bit2)
-    /// was still pending — the guest re-reads it and re-runs `process_online` →
-    /// `connectionChange` → boot-progress overlay rebuild (x86 RE 2026-07-17).
-    /// The host-driven strobe source the RE named ("re-signals bit2 every frame").
-    stale_online_pending: u64,
     /// Latch so the (per-VBL, ~60 Hz) stale-online line fires once per boot.
+    ///
+    /// A post-**ack** display IRQ raised while the shared-page ONLINE bit (bit2)
+    /// was still pending makes the guest re-read it and re-run `process_online`
+    /// → `connectionChange` → boot-progress overlay rebuild (x86 RE 2026-07-17)
+    /// — the host-driven strobe source the RE named ("re-signals bit2 every
+    /// frame"). This is a first-occurrence alarm, not a rate: the line says the
+    /// class happened at all, which is the whole question, and it has never
+    /// fired on any recorded boot.
     stale_online_logged: bool,
 }
 
@@ -68,8 +71,7 @@ impl crate::observe::Decline for MrtDrop {
 }
 
 impl MrtDrop {
-    /// Compact stable code for the dedup key. Disjoint from [`MaskBindMiss`]'s
-    /// because both share one dedup set.
+    /// Compact stable code for the dedup key.
     fn code(self) -> u8 {
         match self {
             Self::NonContiguousSlot => 1,
@@ -81,45 +83,10 @@ impl MrtDrop {
     }
 }
 
-/// Why a sample that matched a rendered MRT mask failed to bind it.
-///
-/// The sample side of [`MrtDrop`]. Both used to answer `geometry_mismatch` —
-/// one string for two different checks in two different proxies, so a grep for
-/// it could not tell a dropped render from a failed sample. They are now
-/// distinct slugs; that collision is what registering the census vocabulary
-/// found.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MaskBindMiss {
-    /// The mask resident's geometry differs from the sample's.
-    GeometryMismatch,
-    /// The mask resident is not content-ready.
-    ResidentNotReady,
-}
-
-impl crate::observe::Decline for MaskBindMiss {
-    fn slug(&self) -> &'static str {
-        match self {
-            Self::GeometryMismatch => "mask_bind_geometry_mismatch",
-            Self::ResidentNotReady => "mask_bind_resident_not_ready",
-        }
-    }
-}
-
-impl MaskBindMiss {
-    /// Dedup code, disjoint from [`MrtDrop::code`] — the two share one set.
-    fn code(self) -> u8 {
-        match self {
-            Self::GeometryMismatch => 10,
-            Self::ResidentNotReady => 11,
-        }
-    }
-}
-
 impl ThrashState {
     const fn new() -> Self {
         Self {
             secondary_mrt_drop_seen: std::collections::BTreeSet::new(),
-            stale_online_pending: 0,
             stale_online_logged: false,
         }
     }
@@ -157,29 +124,6 @@ pub fn note_secondary_mrt_drop(reason: MrtDrop, width: u32, height: u32) {
     // machine-readable line is worth more here than a sentence the reader can
     // get from the slug.
     observe::Emit::decline("secondary_mrt_drop", &reason)
-        .field("geom", format!("{width}x{height}"))
-        .fail();
-}
-
-/// Sibling of [`note_secondary_mrt_drop`] for the SAMPLE side: a draw sampled a
-/// texture whose GVA matches a mask this frame rendered as an MRT secondary (so it
-/// IS the vibrancy coverage-mask sample), but the bind failed — geometry mismatch
-/// or the secondary resident was not content-ready — so the material falls through
-/// to the host-cache / guest-pages path and its alpha modulation may read a stale
-/// or zero mask (the see-through frosted-material class).
-/// Fires only when the sampled GVA is a KNOWN rendered mask (never on ordinary
-/// texture samples), deduped on `(reason, w, h)`. Runs on the render/drain worker.
-/// Measure-only. Shares the `secondary_mrt_drop_seen` dedup set (disjoint codes).
-pub fn note_mrt_mask_bind_miss(reason: MaskBindMiss, width: u32, height: u32) {
-    let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
-    if !st
-        .secondary_mrt_drop_seen
-        .insert((reason.code(), width, height))
-    {
-        return;
-    }
-    drop(st);
-    observe::Emit::decline("mrt_mask_bind_miss", &reason)
         .field("geom", format!("{width}x{height}"))
         .fail();
 }
@@ -287,9 +231,8 @@ pub mod window_publish {
     /// Why the host window published nothing for a frame it was asked to show.
     ///
     /// One variant today, and a type rather than a literal because bare
-    /// `resident_not_ready` is one grep away from the MRT mask rail's
-    /// `mask_bind_resident_not_ready` — a different subsystem answering a
-    /// same-sounding question. A second drop cause gets its own variant here.
+    /// `resident_not_ready` is a question several subsystems answer; the slug
+    /// says which one. A second drop cause gets its own variant here.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum WindowPublishDrop {
         /// The engine had no content-ready resident to hand the window.
@@ -373,37 +316,22 @@ pub mod window_publish {
     }
 }
 
-/// Snapshot counters (tests / external poll).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ThrashCounters {
-    /// Post-converge display IRQs raised with the ONLINE bit still pending.
-    pub stale_online_pending: u64,
-}
-
 /// Record that a post-ack display IRQ (`src` = vbl|present) was raised while the
 /// shared-page ONLINE bit (bit2) was still pending — meaning the guest will
 /// re-dispatch `process_online` → `connectionChange` and re-composite the
 /// boot-progress overlay (x86 RE 2026-07-17: the host-driven strobe source).
-/// Counts every occurrence; emits an always-on `stale_online_pending` line only
-/// the **first** time per boot (VBL runs ~60 Hz — a per-call line would flood).
-/// Measure-only; never gates the IRQ.
+///
+/// Emits an always-on line the **first** time per boot and stays silent
+/// afterwards: VBL runs ~60 Hz, so a per-call line would flood. Measure-only;
+/// never gates the IRQ.
 pub fn note_stale_online_pending(src: &str, pending: u32) {
     let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
-    st.stale_online_pending = st.stale_online_pending.saturating_add(1);
     if !st.stale_online_logged {
         st.stale_online_logged = true;
-        let n = st.stale_online_pending;
         drop(st);
         observe::fail(format!(
-            "stale_online_pending src={src} pending={pending:#x} count={n}"
+            "stale_online_pending src={src} pending={pending:#x}"
         ));
-    }
-}
-
-pub fn counters() -> ThrashCounters {
-    let st = STATE.lock().unwrap_or_else(|e| e.into_inner());
-    ThrashCounters {
-        stale_online_pending: st.stale_online_pending,
     }
 }
 
@@ -424,74 +352,40 @@ mod tests {
         test_exclusive()
     }
 
-    /// `note_stale_online_pending` counts every post-converge stale-ONLINE IRQ but
-    /// logs its always-on line only once per boot (VBL is ~60 Hz — a per-call line
-    /// would flood). The count keeps climbing after the latched line.
+    /// `note_stale_online_pending` names the class the first time it happens and
+    /// stays silent afterwards: VBL is ~60 Hz, so a per-call line would flood.
+    ///
+    /// The latch is the whole mechanism, so the log is the only place to assert
+    /// it — which is also the only place production ever reads it from.
     #[test]
-    fn stale_online_pending_counts_all_logs_once() {
+    fn stale_online_pending_logs_once_per_boot() {
         let _g = test_lock();
         reset_for_test();
         use crate::model::DISPLAY_ONLINE_EVENT_MASK;
+        // The fail log does not exist until something logs, and under
+        // `cfg(test)` it is per-process — so a delta over this test's own calls
+        // is exact.
+        let count = || {
+            std::fs::read_to_string(observe::fail_log_path())
+                .unwrap_or_default()
+                .matches("stale_online_pending src=")
+                .count()
+        };
+        let before = count();
         note_stale_online_pending("vbl", DISPLAY_ONLINE_EVENT_MASK);
-        note_stale_online_pending("vbl", DISPLAY_ONLINE_EVENT_MASK);
-        note_stale_online_pending("present", DISPLAY_ONLINE_EVENT_MASK);
+        let after_first = count();
         assert_eq!(
-            counters().stale_online_pending,
-            3,
-            "every stale-online IRQ must be counted"
-        );
-        let log = std::fs::read_to_string(observe::fail_log_path()).expect("fail log");
-        assert!(
-            log.contains("stale_online_pending src=vbl pending=0x4 count=1"),
+            after_first,
+            before + 1,
             "first stale-online must log the always-on line"
         );
-    }
-
-    /// The sample side and the render side of the MRT-mask class had one name
-    /// between them.
-    ///
-    /// Both `note_secondary_mrt_drop` and `note_mrt_mask_bind_miss` were called
-    /// with the bare string `"geometry_mismatch"`, so a `grep reason=` for it
-    /// could not tell a dropped multi-RT render from a mask sample that failed to
-    /// bind — two different checks in two different proxies. Crate-wide
-    /// uniqueness is the gate; this names the pair the gate is protecting.
-    #[test]
-    fn the_render_and_sample_sides_of_the_mask_class_have_different_names() {
-        use crate::observe::Decline as _;
-        assert_ne!(
-            MrtDrop::GeometryMismatch.slug(),
-            MaskBindMiss::GeometryMismatch.slug()
-        );
-        assert!(MrtDrop::GeometryMismatch.slug().starts_with("mrt_drop_"));
-        assert!(MaskBindMiss::GeometryMismatch
-            .slug()
-            .starts_with("mask_bind_"));
-        // The dedup codes must stay disjoint too: both proxies share one set, so
-        // a collision there would silence one of them per geometry.
-        assert_ne!(
-            MrtDrop::GeometryMismatch.code(),
-            MaskBindMiss::GeometryMismatch.code()
-        );
-        let mrt: Vec<u8> = [
-            MrtDrop::NonContiguousSlot,
-            MrtDrop::GeometryMismatch,
-            MrtDrop::UnknownFormat,
-            MrtDrop::NoIdentity,
-            MrtDrop::AliasesPrimary,
-        ]
-        .iter()
-        .map(|r| r.code())
-        .collect();
-        let mask: Vec<u8> = [
-            MaskBindMiss::GeometryMismatch,
-            MaskBindMiss::ResidentNotReady,
-        ]
-        .iter()
-        .map(|r| r.code())
-        .collect();
+        note_stale_online_pending("vbl", DISPLAY_ONLINE_EVENT_MASK);
+        note_stale_online_pending("present", DISPLAY_ONLINE_EVENT_MASK);
+        assert_eq!(count(), after_first, "later IRQs must not re-log");
+        let log = std::fs::read_to_string(observe::fail_log_path()).expect("fail log");
         assert!(
-            mrt.iter().all(|c| !mask.contains(c)),
-            "dedup codes overlap: {mrt:?} vs {mask:?}"
+            log.contains("stale_online_pending src=vbl pending=0x4"),
+            "the line must name the source and the pending mask"
         );
     }
 

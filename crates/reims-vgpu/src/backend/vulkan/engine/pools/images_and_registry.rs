@@ -5,53 +5,29 @@ impl ResourcePools {
         key: StorageImageKey,
         counters: &EngineCounters,
     ) -> Result<StorageImageSlot, DrawError> {
-        if let Some(list) = self.storage_image_free.get_mut(&key) {
-            if let Some(slot) = list.pop() {
-                self.storage_image_live.push(StorageImageSlot {
-                    image: slot.image,
-                    memory: slot.memory,
-                    view: slot.view,
-                    key: slot.key,
-                    array_layers: slot.array_layers,
-                    extent_depth: slot.extent_depth,
-                });
-                return Ok(slot);
-            }
+        if let Some(slot) = self.storage_image_free.take(&key) {
+            self.storage_image_live.push(StorageImageSlot {
+                image: slot.image,
+                memory: slot.memory,
+                view: slot.view,
+                key: slot.key,
+            });
+            return Ok(slot);
         }
         let format = key.format.vk_format();
-        let image_type = if key.one_dim {
-            vk::ImageType::TYPE_1D
-        } else if key.volume {
-            vk::ImageType::TYPE_3D
-        } else {
-            vk::ImageType::TYPE_2D
-        };
-        let view_type = if key.one_dim && key.arrayed {
-            vk::ImageViewType::TYPE_1D_ARRAY
-        } else if key.one_dim {
-            vk::ImageViewType::TYPE_1D
-        } else if key.volume {
-            vk::ImageViewType::TYPE_3D
-        } else if key.arrayed {
-            vk::ImageViewType::TYPE_2D_ARRAY
-        } else {
-            vk::ImageViewType::TYPE_2D
-        };
-        let extent_depth = if key.volume { key.layers } else { 1 };
-        let array_layers = if key.volume { 1 } else { key.layers.max(1) };
         let image = ctx
             .device
             .create_image(
                 &vk::ImageCreateInfo::default()
-                    .image_type(image_type)
+                    .image_type(vk::ImageType::TYPE_2D)
                     .format(format)
                     .extent(vk::Extent3D {
                         width: key.width.max(1),
                         height: key.height.max(1),
-                        depth: extent_depth,
+                        depth: 1,
                     })
                     .mip_levels(1)
-                    .array_layers(array_layers)
+                    .array_layers(1)
                     .samples(vk::SampleCountFlags::TYPE_1)
                     .tiling(vk::ImageTiling::OPTIMAL)
                     .usage(if key.sampled_only {
@@ -100,15 +76,9 @@ impl ResourcePools {
             .create_image_view(
                 &vk::ImageViewCreateInfo::default()
                     .image(image)
-                    .view_type(view_type)
+                    .view_type(vk::ImageViewType::TYPE_2D)
                     .format(format)
-                    .subresource_range(vk::ImageSubresourceRange {
-                        aspect_mask: vk::ImageAspectFlags::COLOR,
-                        base_mip_level: 0,
-                        level_count: 1,
-                        base_array_layer: 0,
-                        layer_count: array_layers,
-                    }),
+                    .subresource_range(super::color_subresource_range()),
                 None,
             )
             .map_err(|e| {
@@ -122,26 +92,14 @@ impl ResourcePools {
             memory,
             view,
             key,
-            array_layers,
-            extent_depth,
         };
-        self.storage_image_live.push(StorageImageSlot {
-            image: slot.image,
-            memory: slot.memory,
-            view: slot.view,
-            key: slot.key,
-            array_layers: slot.array_layers,
-            extent_depth: slot.extent_depth,
-        });
+        self.storage_image_live.push(slot);
         Ok(slot)
     }
 
     pub(crate) fn recycle_storage_images(&mut self) {
         for slot in self.storage_image_live.drain(..) {
-            self.storage_image_free
-                .entry(slot.key)
-                .or_default()
-                .push(slot);
+            self.storage_image_free.push_uncapped(slot.key, slot);
         }
     }
 
@@ -222,11 +180,7 @@ impl ResourcePools {
                 identity,
                 width: key.width,
                 height: key.height,
-                layers: key.layers,
                 format: key.format,
-                one_dim: key.one_dim,
-                arrayed: key.arrayed,
-                volume: key.volume,
             })
         })?;
         debug_assert_eq!(live.image, slot.image);
@@ -484,13 +438,7 @@ impl ResourcePools {
                     .image(image)
                     .view_type(vk::ImageViewType::TYPE_2D)
                     .format(format)
-                    .subresource_range(vk::ImageSubresourceRange {
-                        aspect_mask: vk::ImageAspectFlags::COLOR,
-                        base_mip_level: 0,
-                        level_count: 1,
-                        base_array_layer: 0,
-                        layer_count: 1,
-                    }),
+                    .subresource_range(super::color_subresource_range()),
                 None,
             ) {
                 Ok(v) => v,
@@ -662,7 +610,7 @@ impl ResourcePools {
                 &vk::MemoryAllocateInfo::default()
                     .allocation_size(ireq.size)
                     .memory_type_index(imt),
-                AllocSite::ResidentColor,
+                AllocSite::MrtSecondary,
             )
             .map_err(|e| {
                 ctx.device.destroy_image(image, None);
@@ -683,13 +631,7 @@ impl ResourcePools {
                         .image(image)
                         .view_type(vk::ImageViewType::TYPE_2D)
                         .format(format)
-                        .subresource_range(vk::ImageSubresourceRange {
-                            aspect_mask: vk::ImageAspectFlags::COLOR,
-                            base_mip_level: 0,
-                            level_count: 1,
-                            base_array_layer: 0,
-                            layer_count: 1,
-                        }),
+                        .subresource_range(super::color_subresource_range()),
                     None,
                 )
                 .map_err(|e| {
@@ -725,14 +667,46 @@ impl ResourcePools {
         Ok((image, view))
     }
 
-    /// Build an ad-hoc MRT framebuffer over `views` (primary slot 0 + secondary
-    /// slots 1..) under `render_pass`. Not cached — the caller disposes it via
-    /// `dispose(Framebuffer)` after the draw is sealed onto the ring slot.
     /// Allocate a transient D32_SFLOAT depth attachment (image + memory + view)
     /// sized to `width`x`height`. The caller owns it for exactly one draw and
     /// must dispose it deferred (`DeferredHandle::Image`) after submit — the CB
     /// still references it until its fence signals. Depth is never read back, so
     /// no TRANSFER_SRC usage.
+    ///
+    /// # It does not recycle, and on this pathway it never runs
+    ///
+    /// Every sibling allocator here reuses before allocating; this one does not.
+    /// `exec.rs` creates one per draw that carries depth state and disposes it at
+    /// the end of that same draw. That was once by far the largest allocator in
+    /// the engine: driven boots read `vk_alloc_sites transient_depth=5374:21225`
+    /// and later `4623:18257` — thousands of `vkAllocateMemory` calls totalling
+    /// ~18-21 GiB, against `slab_block=41:2568` for every resident colour target
+    /// in the same boot. A depth [`FreePool`] was built against exactly that,
+    /// measured at a 4 % improvement, and reverted as more code for no benefit.
+    ///
+    /// **A driven boot on the current build allocates zero.** x86/Vulkan,
+    /// measured across all 126 `vk_alloc_sites` census windows spanning the boot
+    /// (Safari page loads and page-downs, a title-bar drag, a wallpaper drag,
+    /// Chess, the WebGL aquarium, then `killall` teardown): every window read
+    /// `transient_depth=0:0`. The zero is not a broken probe — the counter is the
+    /// `allocate_memory` wrapper's, keyed [`AllocSite::TransientDepth`], and
+    /// `slab_block` and `staging` moved by thousands in the same lines.
+    ///
+    /// Nothing was refused on the way, either: zero `shader_state_degraded`, zero
+    /// `depth_compare_unmapped`, zero `depth_load_unsupported_transient` in the
+    /// whole log. So the guest is not asking for depth and being turned away — it
+    /// is not asking. `resources.depth` is set only where the guest's
+    /// depth-stencil descriptor decodes with a mapped compare, and no draw we
+    /// executed carried one. The likely reading, NOT measured, is that a 3D
+    /// application's depth work happens before its surface reaches our stream and
+    /// what we execute is the compositor's 2D layer work.
+    ///
+    /// So do not build the depth pool. The premise it was queued against — a
+    /// per-draw allocation storm — does not reproduce, and a fourth recycle pool
+    /// would be more mechanism guarding nothing. `vk_alloc_sites transient_depth`
+    /// is the number that would say a future workload changed this; until it is
+    /// nonzero there is nothing here to recycle.
+    ///
     pub(crate) unsafe fn create_transient_depth(
         &mut self,
         ctx: &DeviceContext,
@@ -832,6 +806,9 @@ impl ResourcePools {
         Ok((image, memory, view))
     }
 
+    /// Build an ad-hoc MRT framebuffer over `views` (primary slot 0 + secondary
+    /// slots 1..) under `render_pass`. Not cached — the caller disposes it via
+    /// `dispose(Framebuffer)` after the draw is sealed onto the ring slot.
     pub(crate) unsafe fn create_mrt_framebuffer(
         &mut self,
         ctx: &DeviceContext,

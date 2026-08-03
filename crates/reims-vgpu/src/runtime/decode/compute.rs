@@ -68,10 +68,13 @@ const EXECUTE_INDIRECT_LEN: usize = 0x18;
 const EMPTY_LEN: usize = HEADER_LEN;
 const PIPELINE_LEN: usize = HEADER_LEN + 4;
 
+/// Why the compute decoder refused a command.
+///
+/// No `Ok` and no `ErrArgs`, for the reason recorded on `blit::DecodeStatus`:
+/// success is the result's own `Ok`, and a bad argument here is a payload
+/// shorter than the field, which `ErrShort` already names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DecodeStatus {
-    Ok,
-    ErrArgs,
     ErrShort,
     ErrUnknownOpcode,
     ErrUnsupportedOpcode,
@@ -86,8 +89,6 @@ impl crate::observe::Refusal for DecodeStatus {
     /// from any other's.
     fn refusal(&self) -> Option<&'static str> {
         Some(match self {
-            Self::Ok => return None,
-            Self::ErrArgs => "compute_decode_args",
             Self::ErrShort => "compute_decode_short",
             Self::ErrUnknownOpcode => "compute_decode_unknown_opcode",
             Self::ErrUnsupportedOpcode => "compute_decode_unsupported_opcode",
@@ -410,7 +411,11 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             }
             Ok(out)
         }
-        OP_SET_SAMPLERS => {
+        OP_SET_SAMPLERS | OP_SET_TEXTURES => {
+            // One record — [first:u32][count:u32][ ref:u32 × count ] — landing in
+            // whichever binding list the opcode names. Sampler entries carry LOD
+            // clamps this form does not set (`OP_SET_SAMPLERS_LOD` is the form
+            // that does), so they take their defaults.
             if command_length < BIND_BASE {
                 return Err(DecodeStatus::ErrShort);
             }
@@ -421,35 +426,24 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             if !var_len(command_length, BIND_BASE, count, REF_SIZE) {
                 return Err(DecodeStatus::ErrShort);
             }
-            out.kind = Kind::SamplerBind;
+            let samplers = opcode == OP_SET_SAMPLERS;
+            out.kind = if samplers {
+                Kind::SamplerBind
+            } else {
+                Kind::TextureBind
+            };
             out.first = ld32(&payload[0..]);
             out.count = count;
             for i in 0..count as usize {
-                out.samplers.push(SamplerBinding {
-                    ref_: ld32(&payload[8 + i * REF_SIZE..]),
-                    ..Default::default()
-                });
-            }
-            Ok(out)
-        }
-        OP_SET_TEXTURES => {
-            if command_length < BIND_BASE {
-                return Err(DecodeStatus::ErrShort);
-            }
-            let count = ld32(&payload[4..]);
-            if count as usize > MAX_BIND_ENTRIES {
-                return Err(DecodeStatus::ErrTooManyBindings);
-            }
-            if !var_len(command_length, BIND_BASE, count, REF_SIZE) {
-                return Err(DecodeStatus::ErrShort);
-            }
-            out.kind = Kind::TextureBind;
-            out.first = ld32(&payload[0..]);
-            out.count = count;
-            for i in 0..count as usize {
-                out.textures.push(RefBinding {
-                    ref_: ld32(&payload[8 + i * REF_SIZE..]),
-                });
+                let ref_ = ld32(&payload[8 + i * REF_SIZE..]);
+                if samplers {
+                    out.samplers.push(SamplerBinding {
+                        ref_,
+                        ..Default::default()
+                    });
+                } else {
+                    out.textures.push(RefBinding { ref_ });
+                }
             }
             Ok(out)
         }
@@ -682,16 +676,14 @@ mod tests {
     /// work. Each check names itself now, `Ok` still produces nothing, and the
     /// prefix keeps them apart from the six sibling `DecodeStatus` enums.
     #[test]
-    fn every_compute_decode_failure_but_ok_names_its_own_check() {
+    fn every_compute_decode_failure_names_its_own_check() {
         use crate::observe::Refusal;
         const ERRS: &[DecodeStatus] = &[
-            DecodeStatus::ErrArgs,
             DecodeStatus::ErrShort,
             DecodeStatus::ErrUnknownOpcode,
             DecodeStatus::ErrUnsupportedOpcode,
             DecodeStatus::ErrTooManyBindings,
         ];
-        assert_eq!(DecodeStatus::Ok.refusal(), None, "Ok is not a refusal");
         let mut slugs: Vec<&str> = ERRS.iter().filter_map(|s| s.refusal()).collect();
         assert_eq!(slugs.len(), ERRS.len(), "every error variant refuses");
         assert!(slugs.iter().all(|s| s.starts_with("compute_decode_")));

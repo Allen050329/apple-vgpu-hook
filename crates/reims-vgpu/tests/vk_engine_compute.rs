@@ -77,6 +77,127 @@ fn inc_comp_spirv() -> Option<Vec<u32>> {
     )
 }
 
+/// The one storage-image kernel every write test in this file uses:
+/// `imageStore(img, ivec2(gid.xy), vec4(1,0,0,1))` over a 1x1x1 local size,
+/// with the image's SPIR-V storage format left to the caller.
+///
+/// Six tests carried byte-identical copies of this assembly that differed only
+/// in that one token — `Rgba8` for the native-format cases, `Unknown` for the
+/// BGRA view, which SPIR-V has no storage format for. Parameterising the token
+/// is what keeps a change to the kernel from having to be made six times.
+///
+/// `compute_storage_image_r16float_if_supported` deliberately does not use this
+/// and keeps its own copy: R16f needs `OpCapability
+/// StorageImageExtendedFormats` and drops the `NonReadable` decoration, so it
+/// is a different kernel rather than a different format.
+/// The sampled-image fetch kernel: read texel (0,0) of a combined sampled image
+/// at descriptor 0/binding 0 and write it to the storage buffer at binding 1.
+///
+/// Three tests used byte-identical copies of this — 2587 characters each, not
+/// one token apart. It is one fixture, so it is one constant.
+const SAMPLED_IMAGE_FETCH_KERNEL: &str = r#"
+               OpCapability Shader
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint GLCompute %main "main" %gid %out %image_var
+               OpExecutionMode %main LocalSize 1 1 1
+               OpDecorate %gid BuiltIn GlobalInvocationId
+               OpDecorate %out DescriptorSet 0
+               OpDecorate %out Binding 0
+               OpDecorate %image_var DescriptorSet 0
+               OpDecorate %image_var Binding 32
+               OpDecorate %Out Block
+               OpMemberDecorate %Out 0 Offset 0
+               OpDecorate %OutWords ArrayStride 4
+       %void = OpTypeVoid
+       %uint = OpTypeInt 32 0
+      %float = OpTypeFloat 32
+     %v3uint = OpTypeVector %uint 3
+     %v2uint = OpTypeVector %uint 2
+     %v4uint = OpTypeVector %uint 4
+    %v4float = OpTypeVector %float 4
+     %uint_0 = OpConstant %uint 0
+     %uint_1 = OpConstant %uint 1
+     %uint_2 = OpConstant %uint 2
+     %uint_3 = OpConstant %uint 3
+   %OutWords = OpTypeRuntimeArray %uint
+        %Out = OpTypeStruct %OutWords
+%_ptr_StorageBuffer_Out = OpTypePointer StorageBuffer %Out
+%_ptr_StorageBuffer_uint = OpTypePointer StorageBuffer %uint
+        %out = OpVariable %_ptr_StorageBuffer_Out StorageBuffer
+      %Image = OpTypeImage %float 2D 0 0 0 1 Unknown
+%_ptr_UniformConstant_Image = OpTypePointer UniformConstant %Image
+  %image_var = OpVariable %_ptr_UniformConstant_Image UniformConstant
+%_ptr_Input_v3uint = OpTypePointer Input %v3uint
+        %gid = OpVariable %_ptr_Input_v3uint Input
+    %fn_type = OpTypeFunction %void
+       %main = OpFunction %void None %fn_type
+      %entry = OpLabel
+    %gid_val = OpLoad %v3uint %gid
+          %x = OpCompositeExtract %uint %gid_val 0
+      %coord = OpCompositeConstruct %v2uint %x %uint_0
+    %image_v = OpLoad %Image %image_var
+      %texel = OpImageFetch %v4float %image_v %coord Lod %uint_0
+       %bits = OpBitcast %v4uint %texel
+      %lane0 = OpCompositeExtract %uint %bits 0
+      %lane1 = OpCompositeExtract %uint %bits 1
+      %lane2 = OpCompositeExtract %uint %bits 2
+      %lane3 = OpCompositeExtract %uint %bits 3
+       %ptr0 = OpAccessChain %_ptr_StorageBuffer_uint %out %uint_0 %uint_0
+               OpStore %ptr0 %lane0
+       %ptr1 = OpAccessChain %_ptr_StorageBuffer_uint %out %uint_0 %uint_1
+               OpStore %ptr1 %lane1
+       %ptr2 = OpAccessChain %_ptr_StorageBuffer_uint %out %uint_0 %uint_2
+               OpStore %ptr2 %lane2
+       %ptr3 = OpAccessChain %_ptr_StorageBuffer_uint %out %uint_0 %uint_3
+               OpStore %ptr3 %lane3
+               OpReturn
+               OpFunctionEnd
+"#;
+
+fn storage_image_write_red_kernel(spirv_image_format: &str) -> String {
+    KERNEL_TEMPLATE.replace("{FMT}", spirv_image_format)
+}
+
+const KERNEL_TEMPLATE: &str = r#"
+               OpCapability Shader
+               OpCapability StorageImageWriteWithoutFormat
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint GLCompute %main "main" %gid %img
+               OpExecutionMode %main LocalSize 1 1 1
+               OpDecorate %gid BuiltIn GlobalInvocationId
+               OpDecorate %img DescriptorSet 0
+               OpDecorate %img Binding 0
+               OpDecorate %img NonReadable
+       %void = OpTypeVoid
+       %uint = OpTypeInt 32 0
+        %int = OpTypeInt 32 1
+      %float = OpTypeFloat 32
+     %v3uint = OpTypeVector %uint 3
+      %v2int = OpTypeVector %int 2
+    %v4float = OpTypeVector %float 4
+    %float_1 = OpConstant %float 1
+    %float_0 = OpConstant %float 0
+     %red = OpConstantComposite %v4float %float_1 %float_0 %float_0 %float_1
+%img_ty = OpTypeImage %float 2D 0 0 0 2 {FMT}
+%_ptr_img = OpTypePointer UniformConstant %img_ty
+        %img = OpVariable %_ptr_img UniformConstant
+%_ptr_Input_v3uint = OpTypePointer Input %v3uint
+        %gid = OpVariable %_ptr_Input_v3uint Input
+    %fn_type = OpTypeFunction %void
+       %main = OpFunction %void None %fn_type
+      %entry = OpLabel
+    %gid_val = OpLoad %v3uint %gid
+          %x = OpCompositeExtract %uint %gid_val 0
+          %y = OpCompositeExtract %uint %gid_val 1
+         %xi = OpBitcast %int %x
+         %yi = OpBitcast %int %y
+       %coord = OpCompositeConstruct %v2int %xi %yi
+      %img_l = OpLoad %img_ty %img
+               OpImageWrite %img_l %coord %red
+               OpReturn
+               OpFunctionEnd
+"#;
+
 fn assemble_spvasm(asm: &str, name: &str) -> Option<Vec<u32>> {
     let asm_path = std::env::temp_dir().join(format!(
         "paravirt_engine_{}_{}.spvasm",
@@ -319,45 +440,7 @@ fn compute_2d_grid_tiles_global_invocation_xy() {
 fn compute_storage_image_rgba8unorm_known_result() {
     let _g = engine_test_session();
     // Kernel: imageStore(out, ivec2(gid.xy), vec4(1,0,0,1)) for 4x4 Rgba8Unorm.
-    let spvasm = r#"
-               OpCapability Shader
-               OpCapability StorageImageWriteWithoutFormat
-               OpMemoryModel Logical GLSL450
-               OpEntryPoint GLCompute %main "main" %gid %img
-               OpExecutionMode %main LocalSize 1 1 1
-               OpDecorate %gid BuiltIn GlobalInvocationId
-               OpDecorate %img DescriptorSet 0
-               OpDecorate %img Binding 0
-               OpDecorate %img NonReadable
-       %void = OpTypeVoid
-       %uint = OpTypeInt 32 0
-        %int = OpTypeInt 32 1
-      %float = OpTypeFloat 32
-     %v3uint = OpTypeVector %uint 3
-      %v2int = OpTypeVector %int 2
-    %v4float = OpTypeVector %float 4
-    %float_1 = OpConstant %float 1
-    %float_0 = OpConstant %float 0
-     %red = OpConstantComposite %v4float %float_1 %float_0 %float_0 %float_1
-%img_ty = OpTypeImage %float 2D 0 0 0 2 Rgba8
-%_ptr_img = OpTypePointer UniformConstant %img_ty
-        %img = OpVariable %_ptr_img UniformConstant
-%_ptr_Input_v3uint = OpTypePointer Input %v3uint
-        %gid = OpVariable %_ptr_Input_v3uint Input
-    %fn_type = OpTypeFunction %void
-       %main = OpFunction %void None %fn_type
-      %entry = OpLabel
-    %gid_val = OpLoad %v3uint %gid
-          %x = OpCompositeExtract %uint %gid_val 0
-          %y = OpCompositeExtract %uint %gid_val 1
-         %xi = OpBitcast %int %x
-         %yi = OpBitcast %int %y
-       %coord = OpCompositeConstruct %v2int %xi %yi
-      %img_l = OpLoad %img_ty %img
-               OpImageWrite %img_l %coord %red
-               OpReturn
-               OpFunctionEnd
-"#;
+    let spvasm = &storage_image_write_red_kernel("Rgba8");
     let Some(words) = assemble_spvasm(spvasm, "simg_rgba8") else {
         return;
     };
@@ -387,10 +470,6 @@ fn compute_storage_image_rgba8unorm_known_result() {
             format: StorageImageFormat::Rgba8Unorm,
             width: w,
             height: h,
-            layers: 1,
-            one_dim: false,
-            arrayed: false,
-            volume: false,
             bytes: seed.clone(),
             residency: Some(ComputeStorageResidency {
                 identity,
@@ -431,10 +510,6 @@ fn compute_storage_image_rgba8unorm_known_result() {
             format: StorageImageFormat::Rgba8Unorm,
             width: w,
             height: h,
-            layers: 1,
-            one_dim: false,
-            arrayed: false,
-            volume: false,
             bytes: resident_seed.clone(),
             residency: Some(ComputeStorageResidency {
                 identity,
@@ -467,10 +542,6 @@ fn compute_storage_image_rgba8unorm_known_result() {
             format: StorageImageFormat::Rgba8Unorm,
             width: w,
             height: h,
-            layers: 1,
-            one_dim: false,
-            arrayed: false,
-            volume: false,
             bytes: seed.clone(),
             residency: Some(ComputeStorageResidency {
                 identity,
@@ -513,45 +584,7 @@ fn compute_storage_image_bgra8unorm_is_not_channel_swapped() {
     // Kernel: imageStore(out, gid.xy, vec4(1,0,0,1)) into an Unknown-format
     // storage image — the only SPIR-V form compatible with a B8G8R8A8_UNORM
     // view (SPIR-V has no `Bgra8` storage format).
-    let spvasm = r#"
-               OpCapability Shader
-               OpCapability StorageImageWriteWithoutFormat
-               OpMemoryModel Logical GLSL450
-               OpEntryPoint GLCompute %main "main" %gid %img
-               OpExecutionMode %main LocalSize 1 1 1
-               OpDecorate %gid BuiltIn GlobalInvocationId
-               OpDecorate %img DescriptorSet 0
-               OpDecorate %img Binding 0
-               OpDecorate %img NonReadable
-       %void = OpTypeVoid
-       %uint = OpTypeInt 32 0
-        %int = OpTypeInt 32 1
-      %float = OpTypeFloat 32
-     %v3uint = OpTypeVector %uint 3
-      %v2int = OpTypeVector %int 2
-    %v4float = OpTypeVector %float 4
-    %float_1 = OpConstant %float 1
-    %float_0 = OpConstant %float 0
-     %red = OpConstantComposite %v4float %float_1 %float_0 %float_0 %float_1
-%img_ty = OpTypeImage %float 2D 0 0 0 2 Unknown
-%_ptr_img = OpTypePointer UniformConstant %img_ty
-        %img = OpVariable %_ptr_img UniformConstant
-%_ptr_Input_v3uint = OpTypePointer Input %v3uint
-        %gid = OpVariable %_ptr_Input_v3uint Input
-    %fn_type = OpTypeFunction %void
-       %main = OpFunction %void None %fn_type
-      %entry = OpLabel
-    %gid_val = OpLoad %v3uint %gid
-          %x = OpCompositeExtract %uint %gid_val 0
-          %y = OpCompositeExtract %uint %gid_val 1
-         %xi = OpBitcast %int %x
-         %yi = OpBitcast %int %y
-       %coord = OpCompositeConstruct %v2int %xi %yi
-      %img_l = OpLoad %img_ty %img
-               OpImageWrite %img_l %coord %red
-               OpReturn
-               OpFunctionEnd
-"#;
+    let spvasm = &storage_image_write_red_kernel("Unknown");
     let Some(words) = assemble_spvasm(spvasm, "simg_bgra8") else {
         return;
     };
@@ -582,10 +615,6 @@ fn compute_storage_image_bgra8unorm_is_not_channel_swapped() {
             format: StorageImageFormat::Bgra8Unorm,
             width: w,
             height: h,
-            layers: 1,
-            one_dim: false,
-            arrayed: false,
-            volume: false,
             bytes: seed,
             residency: Some(ComputeStorageResidency {
                 identity,
@@ -619,45 +648,7 @@ fn compute_storage_image_bgra8unorm_is_not_channel_swapped() {
 fn compute_storage_image_seed_skip_and_lost_resident() {
     let _g = engine_test_session();
     // Same red-fill kernel as compute_storage_image_rgba8unorm_known_result.
-    let spvasm = r#"
-               OpCapability Shader
-               OpCapability StorageImageWriteWithoutFormat
-               OpMemoryModel Logical GLSL450
-               OpEntryPoint GLCompute %main "main" %gid %img
-               OpExecutionMode %main LocalSize 1 1 1
-               OpDecorate %gid BuiltIn GlobalInvocationId
-               OpDecorate %img DescriptorSet 0
-               OpDecorate %img Binding 0
-               OpDecorate %img NonReadable
-       %void = OpTypeVoid
-       %uint = OpTypeInt 32 0
-        %int = OpTypeInt 32 1
-      %float = OpTypeFloat 32
-     %v3uint = OpTypeVector %uint 3
-      %v2int = OpTypeVector %int 2
-    %v4float = OpTypeVector %float 4
-    %float_1 = OpConstant %float 1
-    %float_0 = OpConstant %float 0
-     %red = OpConstantComposite %v4float %float_1 %float_0 %float_0 %float_1
-%img_ty = OpTypeImage %float 2D 0 0 0 2 Rgba8
-%_ptr_img = OpTypePointer UniformConstant %img_ty
-        %img = OpVariable %_ptr_img UniformConstant
-%_ptr_Input_v3uint = OpTypePointer Input %v3uint
-        %gid = OpVariable %_ptr_Input_v3uint Input
-    %fn_type = OpTypeFunction %void
-       %main = OpFunction %void None %fn_type
-      %entry = OpLabel
-    %gid_val = OpLoad %v3uint %gid
-          %x = OpCompositeExtract %uint %gid_val 0
-          %y = OpCompositeExtract %uint %gid_val 1
-         %xi = OpBitcast %int %x
-         %yi = OpBitcast %int %y
-       %coord = OpCompositeConstruct %v2int %xi %yi
-      %img_l = OpLoad %img_ty %img
-               OpImageWrite %img_l %coord %red
-               OpReturn
-               OpFunctionEnd
-"#;
+    let spvasm = &storage_image_write_red_kernel("Rgba8");
     let Some(words) = assemble_spvasm(spvasm, "simg_seed_skip") else {
         return;
     };
@@ -687,10 +678,6 @@ fn compute_storage_image_seed_skip_and_lost_resident() {
                 format: StorageImageFormat::Rgba8Unorm,
                 width: w,
                 height: h,
-                layers: 1,
-                one_dim: false,
-                arrayed: false,
-                volume: false,
                 bytes: vec![0u8; (w * h * 4) as usize],
                 residency: Some(ComputeStorageResidency {
                     identity,
@@ -744,45 +731,7 @@ fn compute_storage_image_seed_skip_and_lost_resident() {
 fn compute_storage_image_deferred_readback_and_flush_read() {
     let _g = engine_test_session();
     // Same red-fill kernel as compute_storage_image_seed_skip_and_lost_resident.
-    let spvasm = r#"
-               OpCapability Shader
-               OpCapability StorageImageWriteWithoutFormat
-               OpMemoryModel Logical GLSL450
-               OpEntryPoint GLCompute %main "main" %gid %img
-               OpExecutionMode %main LocalSize 1 1 1
-               OpDecorate %gid BuiltIn GlobalInvocationId
-               OpDecorate %img DescriptorSet 0
-               OpDecorate %img Binding 0
-               OpDecorate %img NonReadable
-       %void = OpTypeVoid
-       %uint = OpTypeInt 32 0
-        %int = OpTypeInt 32 1
-      %float = OpTypeFloat 32
-     %v3uint = OpTypeVector %uint 3
-      %v2int = OpTypeVector %int 2
-    %v4float = OpTypeVector %float 4
-    %float_1 = OpConstant %float 1
-    %float_0 = OpConstant %float 0
-     %red = OpConstantComposite %v4float %float_1 %float_0 %float_0 %float_1
-%img_ty = OpTypeImage %float 2D 0 0 0 2 Rgba8
-%_ptr_img = OpTypePointer UniformConstant %img_ty
-        %img = OpVariable %_ptr_img UniformConstant
-%_ptr_Input_v3uint = OpTypePointer Input %v3uint
-        %gid = OpVariable %_ptr_Input_v3uint Input
-    %fn_type = OpTypeFunction %void
-       %main = OpFunction %void None %fn_type
-      %entry = OpLabel
-    %gid_val = OpLoad %v3uint %gid
-          %x = OpCompositeExtract %uint %gid_val 0
-          %y = OpCompositeExtract %uint %gid_val 1
-         %xi = OpBitcast %int %x
-         %yi = OpBitcast %int %y
-       %coord = OpCompositeConstruct %v2int %xi %yi
-      %img_l = OpLoad %img_ty %img
-               OpImageWrite %img_l %coord %red
-               OpReturn
-               OpFunctionEnd
-"#;
+    let spvasm = &storage_image_write_red_kernel("Rgba8");
     let Some(words) = assemble_spvasm(spvasm, "deferred_wb_fill") else {
         return;
     };
@@ -811,10 +760,6 @@ fn compute_storage_image_deferred_readback_and_flush_read() {
             format: StorageImageFormat::Rgba8Unorm,
             width: w,
             height: h,
-            layers: 1,
-            one_dim: false,
-            arrayed: false,
-            volume: false,
             bytes: vec![0u8; (w * h * 4) as usize],
             residency: Some(ComputeStorageResidency {
                 identity,
@@ -902,106 +847,11 @@ fn compute_storage_image_deferred_readback_and_flush_read() {
 fn compute_sampled_resident_copy_and_lost_resident() {
     let _g = engine_test_session();
     // Same red-fill kernel as compute_storage_image_seed_skip_and_lost_resident.
-    let fill_spvasm = r#"
-               OpCapability Shader
-               OpCapability StorageImageWriteWithoutFormat
-               OpMemoryModel Logical GLSL450
-               OpEntryPoint GLCompute %main "main" %gid %img
-               OpExecutionMode %main LocalSize 1 1 1
-               OpDecorate %gid BuiltIn GlobalInvocationId
-               OpDecorate %img DescriptorSet 0
-               OpDecorate %img Binding 0
-               OpDecorate %img NonReadable
-       %void = OpTypeVoid
-       %uint = OpTypeInt 32 0
-        %int = OpTypeInt 32 1
-      %float = OpTypeFloat 32
-     %v3uint = OpTypeVector %uint 3
-      %v2int = OpTypeVector %int 2
-    %v4float = OpTypeVector %float 4
-    %float_1 = OpConstant %float 1
-    %float_0 = OpConstant %float 0
-     %red = OpConstantComposite %v4float %float_1 %float_0 %float_0 %float_1
-%img_ty = OpTypeImage %float 2D 0 0 0 2 Rgba8
-%_ptr_img = OpTypePointer UniformConstant %img_ty
-        %img = OpVariable %_ptr_img UniformConstant
-%_ptr_Input_v3uint = OpTypePointer Input %v3uint
-        %gid = OpVariable %_ptr_Input_v3uint Input
-    %fn_type = OpTypeFunction %void
-       %main = OpFunction %void None %fn_type
-      %entry = OpLabel
-    %gid_val = OpLoad %v3uint %gid
-          %x = OpCompositeExtract %uint %gid_val 0
-          %y = OpCompositeExtract %uint %gid_val 1
-         %xi = OpBitcast %int %x
-         %yi = OpBitcast %int %y
-       %coord = OpCompositeConstruct %v2int %xi %yi
-      %img_l = OpLoad %img_ty %img
-               OpImageWrite %img_l %coord %red
-               OpReturn
-               OpFunctionEnd
-"#;
+    let fill_spvasm = &storage_image_write_red_kernel("Rgba8");
     // Same fetch-to-buffer kernel shape as
     // compute_sampled_image_fetch_preserves_float_bits (binding 32 sampled,
     // binding 0 storage buffer, fetches texel (0,0)).
-    let fetch_spvasm = r#"
-               OpCapability Shader
-               OpMemoryModel Logical GLSL450
-               OpEntryPoint GLCompute %main "main" %gid %out %image_var
-               OpExecutionMode %main LocalSize 1 1 1
-               OpDecorate %gid BuiltIn GlobalInvocationId
-               OpDecorate %out DescriptorSet 0
-               OpDecorate %out Binding 0
-               OpDecorate %image_var DescriptorSet 0
-               OpDecorate %image_var Binding 32
-               OpDecorate %Out Block
-               OpMemberDecorate %Out 0 Offset 0
-               OpDecorate %OutWords ArrayStride 4
-       %void = OpTypeVoid
-       %uint = OpTypeInt 32 0
-      %float = OpTypeFloat 32
-     %v3uint = OpTypeVector %uint 3
-     %v2uint = OpTypeVector %uint 2
-     %v4uint = OpTypeVector %uint 4
-    %v4float = OpTypeVector %float 4
-     %uint_0 = OpConstant %uint 0
-     %uint_1 = OpConstant %uint 1
-     %uint_2 = OpConstant %uint 2
-     %uint_3 = OpConstant %uint 3
-   %OutWords = OpTypeRuntimeArray %uint
-        %Out = OpTypeStruct %OutWords
-%_ptr_StorageBuffer_Out = OpTypePointer StorageBuffer %Out
-%_ptr_StorageBuffer_uint = OpTypePointer StorageBuffer %uint
-        %out = OpVariable %_ptr_StorageBuffer_Out StorageBuffer
-      %Image = OpTypeImage %float 2D 0 0 0 1 Unknown
-%_ptr_UniformConstant_Image = OpTypePointer UniformConstant %Image
-  %image_var = OpVariable %_ptr_UniformConstant_Image UniformConstant
-%_ptr_Input_v3uint = OpTypePointer Input %v3uint
-        %gid = OpVariable %_ptr_Input_v3uint Input
-    %fn_type = OpTypeFunction %void
-       %main = OpFunction %void None %fn_type
-      %entry = OpLabel
-    %gid_val = OpLoad %v3uint %gid
-          %x = OpCompositeExtract %uint %gid_val 0
-      %coord = OpCompositeConstruct %v2uint %x %uint_0
-    %image_v = OpLoad %Image %image_var
-      %texel = OpImageFetch %v4float %image_v %coord Lod %uint_0
-       %bits = OpBitcast %v4uint %texel
-      %lane0 = OpCompositeExtract %uint %bits 0
-      %lane1 = OpCompositeExtract %uint %bits 1
-      %lane2 = OpCompositeExtract %uint %bits 2
-      %lane3 = OpCompositeExtract %uint %bits 3
-       %ptr0 = OpAccessChain %_ptr_StorageBuffer_uint %out %uint_0 %uint_0
-               OpStore %ptr0 %lane0
-       %ptr1 = OpAccessChain %_ptr_StorageBuffer_uint %out %uint_0 %uint_1
-               OpStore %ptr1 %lane1
-       %ptr2 = OpAccessChain %_ptr_StorageBuffer_uint %out %uint_0 %uint_2
-               OpStore %ptr2 %lane2
-       %ptr3 = OpAccessChain %_ptr_StorageBuffer_uint %out %uint_0 %uint_3
-               OpStore %ptr3 %lane3
-               OpReturn
-               OpFunctionEnd
-"#;
+    let fetch_spvasm = SAMPLED_IMAGE_FETCH_KERNEL;
     let Some(fill_words) = assemble_spvasm(fill_spvasm, "resident_sample_fill") else {
         return;
     };
@@ -1034,10 +884,6 @@ fn compute_sampled_resident_copy_and_lost_resident() {
             format: StorageImageFormat::Rgba8Unorm,
             width: w,
             height: h,
-            layers: 1,
-            one_dim: false,
-            arrayed: false,
-            volume: false,
             bytes: vec![0u8; (w * h * 4) as usize],
             residency: Some(ComputeStorageResidency {
                 identity,
@@ -1067,10 +913,6 @@ fn compute_sampled_resident_copy_and_lost_resident() {
             format: StorageImageFormat::Rgba8Unorm,
             width: w,
             height: h,
-            layers: 1,
-            one_dim: false,
-            arrayed: false,
-            volume: false,
             bytes: vec![0u8; (w * h * 4) as usize],
             resident_bind: Some(ComputeResidentSampleBind {
                 identity,
@@ -1125,232 +967,6 @@ fn compute_sampled_resident_copy_and_lost_resident() {
     );
 }
 
-/// Byte-reinterpret copy-on-sample (the live 1928-wide BGRA8 fade view of the
-/// resident 482-wide Rgba32Uint blur window): a sampled input whose vk format
-/// and width differ from the resident but whose rows are byte-identical (equal
-/// row bytes, equal height) is seeded through the engine's image→buffer→image
-/// hop — no host upload. A height mismatch stays a visible shape loss.
-#[test]
-fn compute_sampled_resident_reinterpret_copy() {
-    let _g = engine_test_session();
-    // Same red-fill kernel as compute_sampled_resident_copy_and_lost_resident.
-    let fill_spvasm = r#"
-               OpCapability Shader
-               OpCapability StorageImageWriteWithoutFormat
-               OpMemoryModel Logical GLSL450
-               OpEntryPoint GLCompute %main "main" %gid %img
-               OpExecutionMode %main LocalSize 1 1 1
-               OpDecorate %gid BuiltIn GlobalInvocationId
-               OpDecorate %img DescriptorSet 0
-               OpDecorate %img Binding 0
-               OpDecorate %img NonReadable
-       %void = OpTypeVoid
-       %uint = OpTypeInt 32 0
-        %int = OpTypeInt 32 1
-      %float = OpTypeFloat 32
-     %v3uint = OpTypeVector %uint 3
-      %v2int = OpTypeVector %int 2
-    %v4float = OpTypeVector %float 4
-    %float_1 = OpConstant %float 1
-    %float_0 = OpConstant %float 0
-     %red = OpConstantComposite %v4float %float_1 %float_0 %float_0 %float_1
-%img_ty = OpTypeImage %float 2D 0 0 0 2 Rgba8
-%_ptr_img = OpTypePointer UniformConstant %img_ty
-        %img = OpVariable %_ptr_img UniformConstant
-%_ptr_Input_v3uint = OpTypePointer Input %v3uint
-        %gid = OpVariable %_ptr_Input_v3uint Input
-    %fn_type = OpTypeFunction %void
-       %main = OpFunction %void None %fn_type
-      %entry = OpLabel
-    %gid_val = OpLoad %v3uint %gid
-          %x = OpCompositeExtract %uint %gid_val 0
-          %y = OpCompositeExtract %uint %gid_val 1
-         %xi = OpBitcast %int %x
-         %yi = OpBitcast %int %y
-       %coord = OpCompositeConstruct %v2int %xi %yi
-      %img_l = OpLoad %img_ty %img
-               OpImageWrite %img_l %coord %red
-               OpReturn
-               OpFunctionEnd
-"#;
-    // Uint fetch: reads texel (0, gid.y) of the reinterpreted Rgba32Uint view
-    // and stores the 4 lanes at out[gid.y*4..].
-    let fetch_spvasm = r#"
-               OpCapability Shader
-               OpMemoryModel Logical GLSL450
-               OpEntryPoint GLCompute %main "main" %gid %out %image_var
-               OpExecutionMode %main LocalSize 1 1 1
-               OpDecorate %gid BuiltIn GlobalInvocationId
-               OpDecorate %out DescriptorSet 0
-               OpDecorate %out Binding 0
-               OpDecorate %image_var DescriptorSet 0
-               OpDecorate %image_var Binding 32
-               OpDecorate %Out Block
-               OpMemberDecorate %Out 0 Offset 0
-               OpDecorate %OutWords ArrayStride 4
-       %void = OpTypeVoid
-       %uint = OpTypeInt 32 0
-     %v3uint = OpTypeVector %uint 3
-     %v2uint = OpTypeVector %uint 2
-     %v4uint = OpTypeVector %uint 4
-     %uint_0 = OpConstant %uint 0
-     %uint_1 = OpConstant %uint 1
-     %uint_2 = OpConstant %uint 2
-     %uint_3 = OpConstant %uint 3
-     %uint_4 = OpConstant %uint 4
-   %OutWords = OpTypeRuntimeArray %uint
-        %Out = OpTypeStruct %OutWords
-%_ptr_StorageBuffer_Out = OpTypePointer StorageBuffer %Out
-%_ptr_StorageBuffer_uint = OpTypePointer StorageBuffer %uint
-        %out = OpVariable %_ptr_StorageBuffer_Out StorageBuffer
-      %Image = OpTypeImage %uint 2D 0 0 0 1 Unknown
-%_ptr_UniformConstant_Image = OpTypePointer UniformConstant %Image
-  %image_var = OpVariable %_ptr_UniformConstant_Image UniformConstant
-%_ptr_Input_v3uint = OpTypePointer Input %v3uint
-        %gid = OpVariable %_ptr_Input_v3uint Input
-    %fn_type = OpTypeFunction %void
-       %main = OpFunction %void None %fn_type
-      %entry = OpLabel
-    %gid_val = OpLoad %v3uint %gid
-          %y = OpCompositeExtract %uint %gid_val 1
-      %coord = OpCompositeConstruct %v2uint %uint_0 %y
-    %image_v = OpLoad %Image %image_var
-      %texel = OpImageFetch %v4uint %image_v %coord Lod %uint_0
-      %lane0 = OpCompositeExtract %uint %texel 0
-      %lane1 = OpCompositeExtract %uint %texel 1
-      %lane2 = OpCompositeExtract %uint %texel 2
-      %lane3 = OpCompositeExtract %uint %texel 3
-       %base = OpIMul %uint %y %uint_4
-         %i1 = OpIAdd %uint %base %uint_1
-         %i2 = OpIAdd %uint %base %uint_2
-         %i3 = OpIAdd %uint %base %uint_3
-       %ptr0 = OpAccessChain %_ptr_StorageBuffer_uint %out %uint_0 %base
-               OpStore %ptr0 %lane0
-       %ptr1 = OpAccessChain %_ptr_StorageBuffer_uint %out %uint_0 %i1
-               OpStore %ptr1 %lane1
-       %ptr2 = OpAccessChain %_ptr_StorageBuffer_uint %out %uint_0 %i2
-               OpStore %ptr2 %lane2
-       %ptr3 = OpAccessChain %_ptr_StorageBuffer_uint %out %uint_0 %i3
-               OpStore %ptr3 %lane3
-               OpReturn
-               OpFunctionEnd
-"#;
-    let Some(fill_words) = assemble_spvasm(fill_spvasm, "reinterpret_fill") else {
-        return;
-    };
-    let Some(fetch_words) = assemble_spvasm(fetch_spvasm, "reinterpret_fetch") else {
-        return;
-    };
-    let w = 4u32;
-    let h = 4u32;
-    let identity = ComputeStorageResidencyKey {
-        mapping_id: 94,
-        map_generation: 1,
-        surface_offset: 0,
-        surface_bpr: w * 4,
-        span_end: (w * h * 4) as u64,
-        width: w,
-        height: h,
-        pixel_format: 0x46,
-        texture_ref: 0,
-    };
-    let fill_req = ComputeRequest {
-        spirv: fill_words,
-        entry: "main".into(),
-        grid: [w, h, 1],
-        storage_buffers: vec![],
-        sampled_images: vec![],
-        samplers: vec![],
-        storage_images: vec![ComputeStorageImageResource {
-            binding: 0,
-            format: StorageImageFormat::Rgba8Unorm,
-            width: w,
-            height: h,
-            layers: 1,
-            one_dim: false,
-            arrayed: false,
-            volume: false,
-            bytes: vec![0u8; (w * h * 4) as usize],
-            residency: Some(ComputeStorageResidency {
-                identity,
-                seed_generation: 1,
-                output_generation: 2,
-            }),
-            seed_skipped: false,
-            defer_readback: false,
-        }],
-    };
-    let Some(fill) = engine_or_skip("reinterpret_fill", &fill_req) else {
-        return;
-    };
-    assert!(fill.images[0].chunks_exact(4).all(|p| p[0] >= 254));
-
-    // Reinterpreted view: 1x4 Rgba32Uint over the 4x4 Rgba8Unorm resident —
-    // equal 16-byte rows, equal height, different vk format and width.
-    let make_fetch = |view_h: u32| ComputeRequest {
-        spirv: fetch_words.clone(),
-        entry: "main".into(),
-        grid: [1, view_h, 1],
-        storage_buffers: vec![ComputeBufferResource {
-            binding: 0,
-            bytes: vec![0; (view_h * 16) as usize],
-            writable: true,
-        }],
-        sampled_images: vec![ComputeSampledImageResource {
-            binding: 32,
-            format: StorageImageFormat::Rgba32Uint,
-            width: 1,
-            height: view_h,
-            layers: 1,
-            one_dim: false,
-            arrayed: false,
-            volume: false,
-            bytes: vec![0u8; (view_h * 16) as usize],
-            resident_bind: Some(ComputeResidentSampleBind {
-                identity,
-                generation: 2,
-            }),
-        }],
-        samplers: vec![],
-        storage_images: vec![],
-    };
-
-    engine::reset_draw_counters();
-    let hit = engine::execute_compute_request(&make_fetch(h)).expect("reinterpret sample hit");
-    let got: Vec<u32> = hit.buffers[0]
-        .bytes
-        .chunks_exact(4)
-        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect();
-    // Each red Rgba8Unorm texel [255,0,0,255] reinterprets to 0xFF0000FF; a
-    // 16-byte row is 4 identical uint lanes, one row per view texel.
-    assert_eq!(
-        got,
-        vec![0xFF0000FFu32; (h * 4) as usize],
-        "every reinterpreted lane must be the packed red texel"
-    );
-    let snap = engine::counter_snapshot();
-    assert_eq!(snap.compute_sampled_uploads, 0);
-    assert_eq!(snap.compute_sampled_upload_bytes, 0);
-    assert_eq!(snap.compute_sampled_resident_copies, 1);
-    assert_eq!(snap.compute_sampled_resident_copy_bytes, (w * h * 4) as u64);
-    assert_eq!(snap.compute_sampled_reinterpret_copies, 1);
-    assert_eq!(
-        snap.compute_sampled_reinterpret_copy_bytes,
-        (w * h * 4) as u64
-    );
-
-    // Equal row bytes but a different height is NOT byte-compatible — visible
-    // shape loss, placeholder never uploads.
-    let err = engine::execute_compute_request(&make_fetch(2))
-        .expect_err("height mismatch must stay a shape loss");
-    assert!(
-        err.to_string()
-            .contains("vk_compute_exec_resident_sample_byte_shape_mismatch"),
-        "unexpected error: {err}"
-    );
-}
-
 /// Linear-window residency chain (the live fade blur-pyramid class): a
 /// deferred storage dispatch under a **linear** identity
 /// (`ComputeStorageResidencyKey::linear`, mapping_id == 0) skips readback and
@@ -1361,103 +977,8 @@ fn compute_sampled_resident_reinterpret_copy() {
 fn compute_linear_resident_deferred_chain() {
     let _g = engine_test_session();
     // Same red-fill + fetch kernels as compute_sampled_resident_copy_and_lost_resident.
-    let fill_spvasm = r#"
-               OpCapability Shader
-               OpCapability StorageImageWriteWithoutFormat
-               OpMemoryModel Logical GLSL450
-               OpEntryPoint GLCompute %main "main" %gid %img
-               OpExecutionMode %main LocalSize 1 1 1
-               OpDecorate %gid BuiltIn GlobalInvocationId
-               OpDecorate %img DescriptorSet 0
-               OpDecorate %img Binding 0
-               OpDecorate %img NonReadable
-       %void = OpTypeVoid
-       %uint = OpTypeInt 32 0
-        %int = OpTypeInt 32 1
-      %float = OpTypeFloat 32
-     %v3uint = OpTypeVector %uint 3
-      %v2int = OpTypeVector %int 2
-    %v4float = OpTypeVector %float 4
-    %float_1 = OpConstant %float 1
-    %float_0 = OpConstant %float 0
-     %red = OpConstantComposite %v4float %float_1 %float_0 %float_0 %float_1
-%img_ty = OpTypeImage %float 2D 0 0 0 2 Rgba8
-%_ptr_img = OpTypePointer UniformConstant %img_ty
-        %img = OpVariable %_ptr_img UniformConstant
-%_ptr_Input_v3uint = OpTypePointer Input %v3uint
-        %gid = OpVariable %_ptr_Input_v3uint Input
-    %fn_type = OpTypeFunction %void
-       %main = OpFunction %void None %fn_type
-      %entry = OpLabel
-    %gid_val = OpLoad %v3uint %gid
-          %x = OpCompositeExtract %uint %gid_val 0
-          %y = OpCompositeExtract %uint %gid_val 1
-         %xi = OpBitcast %int %x
-         %yi = OpBitcast %int %y
-       %coord = OpCompositeConstruct %v2int %xi %yi
-      %img_l = OpLoad %img_ty %img
-               OpImageWrite %img_l %coord %red
-               OpReturn
-               OpFunctionEnd
-"#;
-    let fetch_spvasm = r#"
-               OpCapability Shader
-               OpMemoryModel Logical GLSL450
-               OpEntryPoint GLCompute %main "main" %gid %out %image_var
-               OpExecutionMode %main LocalSize 1 1 1
-               OpDecorate %gid BuiltIn GlobalInvocationId
-               OpDecorate %out DescriptorSet 0
-               OpDecorate %out Binding 0
-               OpDecorate %image_var DescriptorSet 0
-               OpDecorate %image_var Binding 32
-               OpDecorate %Out Block
-               OpMemberDecorate %Out 0 Offset 0
-               OpDecorate %OutWords ArrayStride 4
-       %void = OpTypeVoid
-       %uint = OpTypeInt 32 0
-      %float = OpTypeFloat 32
-     %v3uint = OpTypeVector %uint 3
-     %v2uint = OpTypeVector %uint 2
-     %v4uint = OpTypeVector %uint 4
-    %v4float = OpTypeVector %float 4
-     %uint_0 = OpConstant %uint 0
-     %uint_1 = OpConstant %uint 1
-     %uint_2 = OpConstant %uint 2
-     %uint_3 = OpConstant %uint 3
-   %OutWords = OpTypeRuntimeArray %uint
-        %Out = OpTypeStruct %OutWords
-%_ptr_StorageBuffer_Out = OpTypePointer StorageBuffer %Out
-%_ptr_StorageBuffer_uint = OpTypePointer StorageBuffer %uint
-        %out = OpVariable %_ptr_StorageBuffer_Out StorageBuffer
-      %Image = OpTypeImage %float 2D 0 0 0 1 Unknown
-%_ptr_UniformConstant_Image = OpTypePointer UniformConstant %Image
-  %image_var = OpVariable %_ptr_UniformConstant_Image UniformConstant
-%_ptr_Input_v3uint = OpTypePointer Input %v3uint
-        %gid = OpVariable %_ptr_Input_v3uint Input
-    %fn_type = OpTypeFunction %void
-       %main = OpFunction %void None %fn_type
-      %entry = OpLabel
-    %gid_val = OpLoad %v3uint %gid
-          %x = OpCompositeExtract %uint %gid_val 0
-      %coord = OpCompositeConstruct %v2uint %x %uint_0
-    %image_v = OpLoad %Image %image_var
-      %texel = OpImageFetch %v4float %image_v %coord Lod %uint_0
-       %bits = OpBitcast %v4uint %texel
-      %lane0 = OpCompositeExtract %uint %bits 0
-      %lane1 = OpCompositeExtract %uint %bits 1
-      %lane2 = OpCompositeExtract %uint %bits 2
-      %lane3 = OpCompositeExtract %uint %bits 3
-       %ptr0 = OpAccessChain %_ptr_StorageBuffer_uint %out %uint_0 %uint_0
-               OpStore %ptr0 %lane0
-       %ptr1 = OpAccessChain %_ptr_StorageBuffer_uint %out %uint_0 %uint_1
-               OpStore %ptr1 %lane1
-       %ptr2 = OpAccessChain %_ptr_StorageBuffer_uint %out %uint_0 %uint_2
-               OpStore %ptr2 %lane2
-       %ptr3 = OpAccessChain %_ptr_StorageBuffer_uint %out %uint_0 %uint_3
-               OpStore %ptr3 %lane3
-               OpReturn
-               OpFunctionEnd
-"#;
+    let fill_spvasm = &storage_image_write_red_kernel("Rgba8");
+    let fetch_spvasm = SAMPLED_IMAGE_FETCH_KERNEL;
     let Some(fill_words) = assemble_spvasm(fill_spvasm, "linear_resident_fill") else {
         return;
     };
@@ -1481,10 +1002,6 @@ fn compute_linear_resident_deferred_chain() {
             format: StorageImageFormat::Rgba8Unorm,
             width: w,
             height: h,
-            layers: 1,
-            one_dim: false,
-            arrayed: false,
-            volume: false,
             bytes: vec![0u8; (w * h * 4) as usize],
             residency: Some(ComputeStorageResidency {
                 identity,
@@ -1528,10 +1045,6 @@ fn compute_linear_resident_deferred_chain() {
             format: StorageImageFormat::Rgba8Unorm,
             width: w,
             height: h,
-            layers: 1,
-            one_dim: false,
-            arrayed: false,
-            volume: false,
             bytes: vec![0u8; (w * h * 4) as usize],
             resident_bind: Some(ComputeResidentSampleBind {
                 identity,
@@ -1576,64 +1089,7 @@ fn compute_linear_resident_deferred_chain() {
 #[test]
 fn compute_sampled_image_fetch_preserves_float_bits() {
     let _g = engine_test_session();
-    let spvasm = r#"
-               OpCapability Shader
-               OpMemoryModel Logical GLSL450
-               OpEntryPoint GLCompute %main "main" %gid %out %image_var
-               OpExecutionMode %main LocalSize 1 1 1
-               OpDecorate %gid BuiltIn GlobalInvocationId
-               OpDecorate %out DescriptorSet 0
-               OpDecorate %out Binding 0
-               OpDecorate %image_var DescriptorSet 0
-               OpDecorate %image_var Binding 32
-               OpDecorate %Out Block
-               OpMemberDecorate %Out 0 Offset 0
-               OpDecorate %OutWords ArrayStride 4
-       %void = OpTypeVoid
-       %uint = OpTypeInt 32 0
-      %float = OpTypeFloat 32
-     %v3uint = OpTypeVector %uint 3
-     %v2uint = OpTypeVector %uint 2
-     %v4uint = OpTypeVector %uint 4
-    %v4float = OpTypeVector %float 4
-     %uint_0 = OpConstant %uint 0
-     %uint_1 = OpConstant %uint 1
-     %uint_2 = OpConstant %uint 2
-     %uint_3 = OpConstant %uint 3
-   %OutWords = OpTypeRuntimeArray %uint
-        %Out = OpTypeStruct %OutWords
-%_ptr_StorageBuffer_Out = OpTypePointer StorageBuffer %Out
-%_ptr_StorageBuffer_uint = OpTypePointer StorageBuffer %uint
-        %out = OpVariable %_ptr_StorageBuffer_Out StorageBuffer
-      %Image = OpTypeImage %float 2D 0 0 0 1 Unknown
-%_ptr_UniformConstant_Image = OpTypePointer UniformConstant %Image
-  %image_var = OpVariable %_ptr_UniformConstant_Image UniformConstant
-%_ptr_Input_v3uint = OpTypePointer Input %v3uint
-        %gid = OpVariable %_ptr_Input_v3uint Input
-    %fn_type = OpTypeFunction %void
-       %main = OpFunction %void None %fn_type
-      %entry = OpLabel
-    %gid_val = OpLoad %v3uint %gid
-          %x = OpCompositeExtract %uint %gid_val 0
-      %coord = OpCompositeConstruct %v2uint %x %uint_0
-    %image_v = OpLoad %Image %image_var
-      %texel = OpImageFetch %v4float %image_v %coord Lod %uint_0
-       %bits = OpBitcast %v4uint %texel
-      %lane0 = OpCompositeExtract %uint %bits 0
-      %lane1 = OpCompositeExtract %uint %bits 1
-      %lane2 = OpCompositeExtract %uint %bits 2
-      %lane3 = OpCompositeExtract %uint %bits 3
-       %ptr0 = OpAccessChain %_ptr_StorageBuffer_uint %out %uint_0 %uint_0
-               OpStore %ptr0 %lane0
-       %ptr1 = OpAccessChain %_ptr_StorageBuffer_uint %out %uint_0 %uint_1
-               OpStore %ptr1 %lane1
-       %ptr2 = OpAccessChain %_ptr_StorageBuffer_uint %out %uint_0 %uint_2
-               OpStore %ptr2 %lane2
-       %ptr3 = OpAccessChain %_ptr_StorageBuffer_uint %out %uint_0 %uint_3
-               OpStore %ptr3 %lane3
-               OpReturn
-               OpFunctionEnd
-"#;
+    let spvasm = SAMPLED_IMAGE_FETCH_KERNEL;
     let Some(words) = assemble_spvasm(spvasm, "sampled_image") else {
         return;
     };
@@ -1656,10 +1112,6 @@ fn compute_sampled_image_fetch_preserves_float_bits() {
             format: StorageImageFormat::Rgba32Float,
             width: 1,
             height: 1,
-            layers: 1,
-            one_dim: false,
-            arrayed: false,
-            volume: false,
             bytes,
             resident_bind: None,
         }],
@@ -1868,10 +1320,6 @@ fn compute_storage_image_r16float_if_supported() {
             format: StorageImageFormat::R16Float,
             width: 2,
             height: 2,
-            layers: 1,
-            one_dim: false,
-            arrayed: false,
-            volume: false,
             bytes: seed,
             residency: None,
             seed_skipped: false,
@@ -1892,4 +1340,301 @@ fn compute_storage_image_r16float_if_supported() {
             }
         }
     }
+}
+
+/// The engine's own emitted shader, run on a real device against known input.
+///
+/// [`reims_vgpu::backend::vulkan::spirv_emit`] is the first SPIR-V this device
+/// writes rather than translates, and `spirv-val` accepting a module says only
+/// that it is well-formed. This says it computes the right answer: which words
+/// reach the output buffer, which do not, and which tile bits are set — the
+/// three things the render writeback's difference pass will be trusted for.
+///
+/// It also exercises the dialect choice. The module spells storage buffers the
+/// SPIR-V 1.0 way (a `BufferBlock` struct in `Uniform`) while every other
+/// kernel in this file uses `StorageBuffer`, so a driver or an engine-side
+/// validation that only accepted the newer spelling fails here and nowhere
+/// else.
+///
+/// The output is asserted at **tile** granularity, which is the contract the
+/// consumer needs and not the one a word-by-word reading of the shader
+/// suggests. A changed tile is carried whole — including the words inside it
+/// that matched — because the scatter copies a whole tile when it sees the
+/// bit. A shader that stored only the differing words would pass a per-word
+/// assertion and hand the guest a tile with the readback slot's previous
+/// tenant in the gaps.
+#[test]
+fn emitted_tile_diff_carries_changed_tiles_whole() {
+    use reims_vgpu::backend::vulkan::spirv_emit::{self, tile_diff_binding};
+
+    let _g = engine_test_session();
+    const WORDS_PER_TILE: u32 = 64;
+    const TILES: u32 = 4;
+    let words = WORDS_PER_TILE * TILES;
+
+    // `prev` is what the guest's pages hold; `cur` is the frame just rendered.
+    // One word differs in tile 1 and two in tile 3; tiles 0 and 2 are untouched.
+    let (grid, per_row) = spirv_emit::tile_diff_grid(
+        words,
+        WORDS_PER_TILE,
+        spirv_emit::MIN_GUARANTEED_WORKGROUPS_PER_AXIS,
+    );
+    assert_eq!(grid, [4, 1, 1], "this case is meant to be a flat dispatch");
+    let prev: Vec<u32> = (0..words).collect();
+    let mut cur = prev.clone();
+    cur[WORDS_PER_TILE as usize + 7] = 0xA1A1_A1A1;
+    cur[3 * WORDS_PER_TILE as usize] = 0xB2B2_B2B2;
+    cur[3 * WORDS_PER_TILE as usize + 63] = 0xC3C3_C3C3;
+
+    // A sentinel the shader never writes, so "left alone" is distinguishable
+    // from "written with the same value it already had".
+    const UNTOUCHED: u32 = 0xDEAD_BEEF;
+    let le = |v: &[u32]| -> Vec<u8> { v.iter().flat_map(|w| w.to_le_bytes()).collect() };
+
+    let req = ComputeRequest {
+        spirv: spirv_emit::tile_diff(words, WORDS_PER_TILE, per_row),
+        entry: "main".into(),
+        grid,
+        storage_buffers: vec![
+            ComputeBufferResource {
+                binding: tile_diff_binding::CUR,
+                bytes: le(&cur),
+                writable: false,
+            },
+            ComputeBufferResource {
+                binding: tile_diff_binding::PREV,
+                bytes: le(&prev),
+                writable: false,
+            },
+            ComputeBufferResource {
+                binding: tile_diff_binding::OUT,
+                bytes: le(&vec![UNTOUCHED; words as usize]),
+                writable: true,
+            },
+            ComputeBufferResource {
+                binding: tile_diff_binding::BITS,
+                bytes: le(&[0u32]),
+                writable: true,
+            },
+        ],
+        sampled_images: vec![],
+        samplers: vec![],
+        storage_images: vec![],
+    };
+    let Some(out) = engine_or_skip("tile_diff", &req) else {
+        return;
+    };
+
+    let read = |binding: u32| -> Vec<u32> {
+        out.buffers
+            .iter()
+            .find(|b| b.binding == binding)
+            .unwrap_or_else(|| panic!("binding {binding} did not come back"))
+            .bytes
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    };
+
+    let got_out = read(tile_diff_binding::OUT);
+    assert_eq!(got_out.len(), words as usize);
+    for (i, (&got, &want)) in got_out.iter().zip(cur.iter()).enumerate() {
+        let tile = i / WORDS_PER_TILE as usize;
+        let tile_changed = (tile * WORDS_PER_TILE as usize..)
+            .take(WORDS_PER_TILE as usize)
+            .any(|j| cur[j] != prev[j]);
+        if tile_changed {
+            // Every word of the tile, not only the ones that differ: word 64
+            // matches `prev` and must still be carried, because it shares a
+            // tile with word 71 which does not.
+            assert_eq!(got, want, "word {i} is in a changed tile and was not carried");
+        } else {
+            assert_eq!(got, UNTOUCHED, "word {i}'s tile matched and was written anyway");
+        }
+    }
+
+    // Bits are per tile, not per word: tile 3 differed in two words and is one
+    // bit, and the tiles either side of a changed one are not swept in with it.
+    let got_bits = read(tile_diff_binding::BITS);
+    assert_eq!(got_bits.len(), 1);
+    assert_eq!(
+        got_bits[0],
+        (1 << 1) | (1 << 3),
+        "tile bits {:#010x}",
+        got_bits[0]
+    );
+}
+
+/// A folded grid indexes the right words, and a bound that is not a whole
+/// number of workgroups stops there.
+///
+/// `tile_diff_groups` rounds up, so the last workgroup runs invocations past
+/// the end of every buffer. The shader's `w < words` guard is the only thing
+/// between those and a read of unallocated storage, and a guard that is off by
+/// one is invisible in the passing case — the extra words would land in the
+/// tail of an over-sized allocation and the answer would still look right.
+/// Here the buffers are sized to exactly `words`, so an out-of-bounds access is
+/// a fault or a wrong answer rather than a silent success.
+///
+/// The tile count is not a whole number either: the last tile is partial, and
+/// its bit must still be reachable.
+#[test]
+fn emitted_tile_diff_indexes_a_folded_grid_and_stops_at_its_bound() {
+    use reims_vgpu::backend::vulkan::spirv_emit::{self, tile_diff_binding};
+
+    let _g = engine_test_session();
+    const WORDS_PER_TILE: u32 = 64;
+    // Two whole tiles and a third of 5 words, and 133 is not a multiple of 64
+    // so the dispatch rounds up to three workgroups covering 192.
+    let words = 2 * WORDS_PER_TILE + 5;
+    // Deliberately narrow, so the last of the three workgroups is reached
+    // through the second grid axis rather than the first: the partial bound and
+    // the folded grid are the two guards, and they are tested together because
+    // an index computed as `y * per_row + x` is where they interact.
+    let (grid, per_row) = spirv_emit::tile_diff_grid(words, WORDS_PER_TILE, 2);
+    assert_eq!((grid, per_row), ([2, 2, 1], 128));
+
+    let prev: Vec<u32> = (0..words).map(|i| i * 7).collect();
+    let mut cur = prev.clone();
+    // The very last word, which only the rounded-up workgroup reaches.
+    cur[(words - 1) as usize] = 0xFEED_FACE;
+
+    const UNTOUCHED: u32 = 0xDEAD_BEEF;
+    let le = |v: &[u32]| -> Vec<u8> { v.iter().flat_map(|w| w.to_le_bytes()).collect() };
+    let req = ComputeRequest {
+        spirv: spirv_emit::tile_diff(words, WORDS_PER_TILE, per_row),
+        entry: "main".into(),
+        grid,
+        storage_buffers: vec![
+            ComputeBufferResource {
+                binding: tile_diff_binding::CUR,
+                bytes: le(&cur),
+                writable: false,
+            },
+            ComputeBufferResource {
+                binding: tile_diff_binding::PREV,
+                bytes: le(&prev),
+                writable: false,
+            },
+            ComputeBufferResource {
+                binding: tile_diff_binding::OUT,
+                bytes: le(&vec![UNTOUCHED; words as usize]),
+                writable: true,
+            },
+            ComputeBufferResource {
+                binding: tile_diff_binding::BITS,
+                bytes: le(&[0u32]),
+                writable: true,
+            },
+        ],
+        sampled_images: vec![],
+        samplers: vec![],
+        storage_images: vec![],
+    };
+    let Some(out) = engine_or_skip("tile_diff_partial", &req) else {
+        return;
+    };
+    let read = |binding: u32| -> Vec<u32> {
+        out.buffers
+            .iter()
+            .find(|b| b.binding == binding)
+            .unwrap_or_else(|| panic!("binding {binding} did not come back"))
+            .bytes
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    };
+    let got_out = read(tile_diff_binding::OUT);
+    assert_eq!(got_out.len(), words as usize);
+    // The partial third tile is carried whole, and "whole" stops at `words`
+    // rather than running to the end of the workgroup: the last tile is five
+    // words, not sixty-four, and the guard is the only thing that says so.
+    let last_tile = (2 * WORDS_PER_TILE) as usize;
+    assert_eq!(&got_out[last_tile..], &cur[last_tile..], "the partial tile");
+    assert!(
+        got_out[..last_tile].iter().all(|&w| w == UNTOUCHED),
+        "a tile whose words all matched was written",
+    );
+    // The change is in the partial third tile, which is tile index 2.
+    assert_eq!(read(tile_diff_binding::BITS), vec![1 << 2]);
+}
+
+/// The difference pass through the plumbing the writeback rail will use.
+///
+/// [`emitted_tile_diff_carries_changed_tiles_whole`] proves the *shader*
+/// against the generic compute harness, which uploads every binding as a
+/// host-visible staging buffer. The rail does not: `cur` and `prev` are
+/// device-local scratch this device allocates itself, `out` and `bits` are
+/// recycled readback slots, and the descriptors are written by hand rather
+/// than by `execute_compute_inner`. Everything in that gap — the readback
+/// pool's new `STORAGE_BUFFER` usage, the device-local memory type, the two
+/// pipeline barriers, the binding order — is untested by the shader test and
+/// is what this covers.
+///
+/// The sentinel is written into `out` by a `vkCmdFillBuffer` inside the same
+/// command buffer rather than by a host write, because a readback slot is not
+/// host-writable in the direction that would need.
+#[test]
+fn diff_pass_declines_unchanged_tiles_through_the_real_bindings() {
+    use reims_vgpu::backend::vulkan::engine::diff_pass;
+
+    let _g = engine_test_session();
+    // Three rows of a 64-pixel-wide BGRA surface: 48 tiles, so the bitmap is
+    // two words and a tile past bit 31 is exercised.
+    const TILES: usize = 48;
+    const TILE_BYTES: usize = 256;
+    const SENTINEL: u32 = 0xDEAD_BEEF;
+    let bytes = TILES * TILE_BYTES;
+
+    let prev: Vec<u8> = (0..bytes).map(|i| (i % 251) as u8).collect();
+    let mut cur = prev.clone();
+    // One byte in tile 5, one in tile 33 (second bitmap word), and the whole
+    // of tile 47 (the last one).
+    cur[5 * TILE_BYTES + 3] ^= 0xFF;
+    cur[33 * TILE_BYTES + 200] ^= 0xFF;
+    for b in &mut cur[47 * TILE_BYTES..48 * TILE_BYTES] {
+        *b ^= 0xFF;
+    }
+    let changed = [5usize, 33, 47];
+
+    let probe = match diff_pass::probe_tile_diff(&cur, &prev, SENTINEL) {
+        Ok(p) => p,
+        Err(e) => {
+            let msg = format!("{e:?}");
+            if skip_if_no_gpu(&msg) {
+                return;
+            }
+            panic!("diff pass refused: {msg}");
+        }
+    };
+
+    assert_eq!(probe.out.len(), bytes);
+    assert_eq!(probe.bits.len(), 2, "48 tiles is two bitmap words");
+    assert_eq!(probe.bits[0], 1 << 5, "first bitmap word");
+    assert_eq!(probe.bits[1], (1 << (33 - 32)) | (1 << (47 - 32)), "second");
+
+    let sentinel_bytes = SENTINEL.to_le_bytes();
+    for tile in 0..TILES {
+        let range = tile * TILE_BYTES..(tile + 1) * TILE_BYTES;
+        if changed.contains(&tile) {
+            // Whole tile, not only the byte that differs: tile 5 changed in one
+            // byte of 256 and all 256 must have crossed.
+            assert_eq!(&probe.out[range.clone()], &cur[range], "tile {tile}");
+        } else {
+            assert!(
+                probe.out[range].chunks_exact(4).all(|w| w == sentinel_bytes),
+                "tile {tile} was written and did not change",
+            );
+        }
+    }
+
+    // And the bitmap reads back as the byte runs the scatter will walk.
+    assert_eq!(
+        diff_pass::changed_runs(&probe.bits, bytes as u64),
+        vec![
+            (5 * TILE_BYTES as u64, TILE_BYTES as u64),
+            (33 * TILE_BYTES as u64, TILE_BYTES as u64),
+            (47 * TILE_BYTES as u64, TILE_BYTES as u64),
+        ],
+    );
 }

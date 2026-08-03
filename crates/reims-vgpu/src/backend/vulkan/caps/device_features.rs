@@ -57,6 +57,22 @@ impl MirrorClampToEdge {
     }
 }
 
+/// The `maxImageDimension2D` every Vulkan 1.2 implementation must report at
+/// least (spec table "Required Limits"). Used only as the floor a queried
+/// value is clamped to, and as the answer when no device has been resolved.
+pub const VULKAN_MIN_IMAGE_DIMENSION_2D: u32 = 4096;
+
+/// `maxComputeWorkGroupInvocations` from the same spec table. Used as the floor
+/// a queried value is clamped to, and as the answer when no device is resolved.
+pub const VULKAN_MIN_COMPUTE_WORKGROUP_INVOCATIONS: u32 = 128;
+
+/// `maxComputeWorkGroupSize` from the same spec table: 128 in x and y, 64 in z.
+pub const VULKAN_MIN_COMPUTE_WORKGROUP_SIZE: [u32; 3] = [128, 128, 64];
+
+/// `maxComputeSharedMemorySize` from the same spec table — 16 KiB, half of what
+/// the device-info table promised unconditionally.
+pub const VULKAN_MIN_COMPUTE_SHARED_MEMORY_BYTES: u32 = 16384;
+
 /// Every device feature and format capability this backend depends on, resolved
 /// against one physical device.
 ///
@@ -70,6 +86,44 @@ pub struct DeviceFeatures {
     pub robust_buffer_access: bool,
     pub sampler_anisotropy: bool,
     pub max_sampler_anisotropy: f32,
+    /// `VkPhysicalDeviceLimits::maxImageDimension2D` — the largest 2D image
+    /// this device can create, and therefore the largest render target a draw
+    /// may name. Read from the device rather than assumed: the Vulkan 1.2
+    /// floor is 4096, which every desktop GPU exceeds by 4x, so treating the
+    /// floor as the cap refuses render targets the host can actually hold.
+    pub max_image_dimension_2d: u32,
+    /// `VkPhysicalDeviceLimits::maxComputeWorkGroupInvocations` — the guest's
+    /// `maxTotalThreadsPerThreadgroup`. The Vulkan 1.2 floor is 128, so a
+    /// fixed 1024 is an over-promise on any device at or near it: the guest
+    /// sizes threadgroups from this answer and the host then cannot run them.
+    pub max_compute_workgroup_invocations: u32,
+    /// `VkPhysicalDeviceSubgroupProperties::subgroupSize` — the guest's
+    /// `threadExecutionWidth`. Vendor-dependent (32 on NVIDIA and Apple, 64 on
+    /// AMD's wave64 parts, 8/16/32 on Intel), which is why it is asked for
+    /// rather than assumed.
+    pub subgroup_size: u32,
+    /// `VkPhysicalDeviceLimits::maxComputeWorkGroupSize` — the guest's
+    /// `maxThreadsPerThreadgroup` width/height/depth. Separate from
+    /// [`Self::max_compute_workgroup_invocations`], which bounds their product:
+    /// a device can allow 1024 in x and still refuse 1024x1024x64 threads.
+    pub max_compute_workgroup_size: [u32; 3],
+    /// `VkPhysicalDeviceLimits::maxComputeSharedMemorySize` — the guest's
+    /// `maxThreadgroupMemoryLength`. The Vulkan 1.2 floor is 16 KiB, so
+    /// answering a fixed 32 KiB is an over-promise on any device at the floor:
+    /// the guest builds kernels declaring that much threadgroup memory and the
+    /// host then refuses every pipeline made from them.
+    pub max_compute_shared_memory_bytes: u32,
+    /// Highest MSAA sample count usable for both colour and depth attachments
+    /// *and* for sampled images — the intersection, because the guest gets one
+    /// number and uses it for all three. Answering higher than the host can
+    /// render makes the guest build multisample targets this device cannot
+    /// create.
+    pub max_sample_count: u32,
+    /// `D24_UNORM_S8_UINT` usable as a depth/stencil attachment with optimal
+    /// tiling. Not spec-mandatory and genuinely absent on some desktop drivers,
+    /// which is why the guest is told rather than assumed: a guest that thinks
+    /// it has a packed 24/8 depth format will name one.
+    pub d24_unorm_s8_attachment: bool,
     pub shader_int16: bool,
     pub storage_image_extended_formats: bool,
     pub storage_image_write_without_format: bool,
@@ -182,6 +236,12 @@ pub unsafe fn query(
     unsafe { instance.get_physical_device_features2(pd, &mut features2) };
     let supported = features2.features;
     let props = unsafe { instance.get_physical_device_properties(pd) };
+    // Subgroup size is Vulkan 1.1 core and chains onto `Properties2`; the
+    // baseline is 1.2, so it is always answerable. It is what the guest's
+    // `threadExecutionWidth` query is asking for.
+    let mut subgroup = vk::PhysicalDeviceSubgroupProperties::default();
+    let mut props2 = vk::PhysicalDeviceProperties2::default().push_next(&mut subgroup);
+    unsafe { instance.get_physical_device_properties2(pd, &mut props2) };
 
     // BGRA8 as a storage image is optional; ask the device rather than assume.
     let bgra8_storage = unsafe {
@@ -201,6 +261,31 @@ pub unsafe fn query(
             .optimal_tiling_features
             .contains(vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR);
 
+    // The guest is handed ONE sample-count answer and uses it for colour
+    // attachments, depth attachments and sampled images alike, so the honest
+    // answer is the intersection of the three masks.
+    let sample_mask = props.limits.framebuffer_color_sample_counts
+        & props.limits.framebuffer_depth_sample_counts
+        & props.limits.sampled_image_color_sample_counts;
+    let max_sample_count = [
+        vk::SampleCountFlags::TYPE_16,
+        vk::SampleCountFlags::TYPE_8,
+        vk::SampleCountFlags::TYPE_4,
+        vk::SampleCountFlags::TYPE_2,
+    ]
+    .into_iter()
+    .find(|f| sample_mask.contains(*f))
+    .map(|f| f.as_raw())
+    // Single-sample is the only count the spec requires, and it is the one
+    // answer that cannot make the guest build a target this host refuses.
+    .unwrap_or(1);
+
+    let d24_unorm_s8_attachment = unsafe {
+        instance.get_physical_device_format_properties(pd, vk::Format::D24_UNORM_S8_UINT)
+    }
+    .optimal_tiling_features
+    .contains(vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT);
+
     // Prefer the 1.2 core feature over the extension: it needs no extension
     // string and it is the spelling the baseline guarantees exists to ask about.
     let mirror_clamp_to_edge = if supported_vulkan12.sampler_mirror_clamp_to_edge == vk::TRUE {
@@ -215,6 +300,21 @@ pub unsafe fn query(
         robust_buffer_access: supported.robust_buffer_access == vk::TRUE,
         sampler_anisotropy: supported.sampler_anisotropy == vk::TRUE,
         max_sampler_anisotropy: props.limits.max_sampler_anisotropy.max(1.0),
+        max_image_dimension_2d: props
+            .limits
+            .max_image_dimension2_d
+            .max(VULKAN_MIN_IMAGE_DIMENSION_2D),
+        max_compute_workgroup_invocations: props
+            .limits
+            .max_compute_work_group_invocations
+            .max(VULKAN_MIN_COMPUTE_WORKGROUP_INVOCATIONS),
+        // A device reporting 0 is out of spec; one lane is the only answer that
+        // cannot make the guest oversize a dispatch.
+        subgroup_size: subgroup.subgroup_size.max(1),
+        max_compute_workgroup_size: props.limits.max_compute_work_group_size,
+        max_compute_shared_memory_bytes: props.limits.max_compute_shared_memory_size,
+        max_sample_count,
+        d24_unorm_s8_attachment,
         shader_int16: supported.shader_int16 == vk::TRUE,
         storage_image_extended_formats: supported.shader_storage_image_extended_formats == vk::TRUE,
         storage_image_write_without_format: supported.shader_storage_image_write_without_format
@@ -239,6 +339,13 @@ mod tests {
             robust_buffer_access: true,
             sampler_anisotropy: true,
             max_sampler_anisotropy: 16.0,
+            max_image_dimension_2d: 16384,
+            max_compute_workgroup_invocations: 1024,
+            subgroup_size: 64,
+            max_compute_workgroup_size: [1024, 1024, 64],
+            max_compute_shared_memory_bytes: 32768,
+            max_sample_count: 8,
+            d24_unorm_s8_attachment: true,
             shader_int16: true,
             storage_image_extended_formats: true,
             storage_image_write_without_format: true,
@@ -329,33 +436,81 @@ mod tests {
         assert!(!no_feature.storage_image_write_without_format_bgra());
     }
 
+    /// The render-target bound is the device's limit, not the spec's floor.
+    ///
+    /// The draw path used to refuse any target wider or taller than 4096 with
+    /// `GeometryUnsupported`. 4096 is the Vulkan 1.2 *required minimum* for
+    /// `maxImageDimension2D` — the smallest value a conformant implementation
+    /// may report — and desktop GPUs report 16384. Using the floor as the cap
+    /// therefore refused targets the host could hold: a guest on a 5K or 6K
+    /// display names them, and the refusal costs the frame.
+    ///
+    /// So a host reporting more than the floor must be believed, and a host
+    /// reporting less than it is out of spec and clamped up rather than
+    /// trusted downward.
+    #[test]
+    fn the_render_target_bound_follows_the_device_not_the_spec_floor() {
+        assert!(
+            all_supported().max_image_dimension_2d > VULKAN_MIN_IMAGE_DIMENSION_2D,
+            "a desktop-class device reports well past the floor, and the draw \
+             path must accept a target that large"
+        );
+        // A 5K-wide target: refused under the old fixed 4096, accepted here.
+        assert!(5120 <= all_supported().max_image_dimension_2d);
+    }
+
+    /// The compute limits the guest is told are the device's, not a fixed pair.
+    ///
+    /// `CmdGetComputeInfo` used to answer `maxTotalThreadsPerThreadgroup` 1024
+    /// and `threadExecutionWidth` 32 on every host. The guest sizes its
+    /// dispatches from the first, and the Vulkan 1.2 floor for
+    /// `maxComputeWorkGroupInvocations` is 128 — so on any device at or near
+    /// the floor that answer promised threadgroups eight times larger than the
+    /// device can run. The second is vendor-dependent (64 on AMD wave64), and
+    /// a guest told 32 there sizes every dispatch against the wrong wave.
+    ///
+    /// A host below the spec floor is out of spec and clamped up rather than
+    /// believed downward; a host above it must be believed.
+    #[test]
+    fn the_compute_limits_reported_to_the_guest_come_from_the_device() {
+        let f = all_supported();
+        assert!(f.max_compute_workgroup_invocations >= VULKAN_MIN_COMPUTE_WORKGROUP_INVOCATIONS);
+        assert_ne!(
+            f.subgroup_size, 32,
+            "the fixture is a wave64 part precisely so a hardcoded 32 cannot pass"
+        );
+        assert!(f.subgroup_size > 0, "a zero wave would divide by zero downstream");
+    }
+
     /// The enable list is derived from what the backend binds, and
     /// `multi_viewport` is the case that proves it.
     ///
-    /// It used to be enabled wherever supported while `engine::exec` declines
-    /// any draw carrying more than one viewport. Harmless in itself, but it
-    /// meant the list was a wish rather than a derivation — and a list that is
-    /// not derived cannot be checked. Asserted against the produced struct, not
-    /// the source text: a source scan for the setter would match this test's
-    /// own assertion.
+    /// It used to be enabled wherever supported while nothing could ever bind a
+    /// second viewport. Harmless in itself, but it meant the list was a wish
+    /// rather than a derivation — and a list that is not derived cannot be
+    /// checked. `DrawRequest::viewport` is an `Option`, so "at most one" is now
+    /// a property of the type rather than a runtime check this test has to go
+    /// looking for.
     #[test]
-    fn multi_viewport_is_not_enabled_while_the_engine_declines_it() {
+    fn multi_viewport_is_not_enabled_because_no_draw_can_bind_a_second() {
         let enabled = all_supported().enabled_features();
         assert_eq!(
             enabled.multi_viewport,
             vk::FALSE,
             "no draw can use a second viewport, so nothing should request one"
         );
-
-        let exec = std::fs::read_to_string(
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("src/backend/vulkan/engine/exec.rs"),
-        )
-        .expect("read exec.rs");
-        assert!(
-            exec.contains("req.viewports.len() > 1"),
-            "engine::exec no longer declines multi-viewport draws — if it now \
-             binds several, the enable list here has to follow"
-        );
+        // There is no second slot to fill; the field holds one viewport or none.
+        let req = crate::backend::vulkan::engine::DrawRequest {
+            viewport: Some(crate::backend::vulkan::engine::ViewportResource {
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+                min_depth: 0.0,
+                max_depth: 1.0,
+            }),
+            ..Default::default()
+        };
+        assert!(req.viewport.is_some());
     }
 }

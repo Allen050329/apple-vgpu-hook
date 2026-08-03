@@ -10,9 +10,12 @@
 //! guest window, then re-establishes the residency mirror so chained seed
 //! skips keep working.
 //!
-//! Guest CPU accesses that never cross our host paths cannot be intercepted —
-//! the same accepted exposure as resident render targets under
-//! `skip_readback`. Choke points: `mapping_write` read/write entries,
+//! Guest CPU accesses that never cross our host paths cannot be intercepted by
+//! anything in this device — the same accepted exposure as resident render
+//! targets under `skip_readback`. That is a statement about the device and not
+//! about what is possible; `flush_mapping_windows_before_fence` records what a
+//! hypervisor-level witness for them would take, and why it has to be a
+//! measurement before it is a mechanism. Choke points: `mapping_write` read/write entries,
 //! `mapper::read/write_mapping_bytes`, and the drain unmap/ReplacePhysical
 //! sites (which drop-with-fail instead of writing through recycled pages).
 
@@ -193,7 +196,7 @@ pub fn flush_intersecting_task_gva<M: HostMemory + HostOps>(
         }
     }
     let page = state.page_size();
-    let n_pages = ((gva % page) + span).div_ceil(page);
+    let n_pages = crate::runtime::gva_mem::pages_spanned(gva, span, page);
     let mut hits: Vec<u32> = Vec::new();
     let mut linear_hits: Vec<(crate::model::ComputeStorageResidencyKey, u32)> = Vec::new();
     let mut gva_hits: Vec<u64> = Vec::new();
@@ -224,9 +227,10 @@ pub fn flush_intersecting_task_gva<M: HostMemory + HostOps>(
                         hits.push(mid);
                     }
                 }
-                for (key, (generation, pages)) in linear_index.iter() {
-                    if pages.contains(&gpa_page) && !linear_hits.iter().any(|(k, _)| k == key) {
-                        linear_hits.push((*key, *generation));
+                for (key, entry) in linear_index.iter() {
+                    if entry.pages.contains(&gpa_page) && !linear_hits.iter().any(|(k, _)| k == key)
+                    {
+                        linear_hits.push((*key, entry.generation));
                     }
                 }
                 for (&window_gva, entry) in gva_index.iter() {
@@ -315,11 +319,40 @@ pub fn flush_intersecting_task_gva<M: HostMemory + HostOps>(
 /// linear task-GVA windows never name a mapping, so they flush when their
 /// defer-time page index aliases the mapping's physical pages. Returns
 /// `(all_ok, windows_flushed)`.
+///
+/// # What its counters can and cannot answer
+///
+/// `guest_read_declared` counts every call, `guest_read_landed` every window one
+/// lands, and `guest_read_dry` the calls that found nothing armed. They exist
+/// because this is the only place the guest tells us it is about to read, and
+/// until now nothing counted it — so "how often does the guest declare?" had no
+/// answer, and the eager fence-bound writeback
+/// ([`flush_mapping_windows_before_fence`]) was being weighed against an unknown.
+///
+/// Read them with the order of events in mind. The fence flush runs first and
+/// empties the windows, so `guest_read_dry` dominating is the *expected* reading
+/// and does **not** show the declaration would have been too late — it shows the
+/// fence got there first, which it always does. What the pair does bound is the
+/// declaration *rate*: `guest_read_declared` against the composite rate says
+/// whether the guest declares once per frame it reads, rarely, or never. A rate
+/// far below the flush rate means most flushes land for nobody, which is the
+/// case the demand-driven route is for; a rate close to it means the eager rail
+/// is doing work the guest would have asked for anyway.
 pub fn flush_mapping_for_guest_read<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     mapping_id: u32,
 ) -> (bool, u32) {
+    crate::runtime::drain::note_store_route("guest_read_declared");
+    // Does the declaration name a surface the eager rail actually writes back?
+    // `guest_read_dry` cannot say — the fence always empties the windows first,
+    // so every declaration is dry either way. This split can, and it is the
+    // number that decides whether the writeback could be demand-driven at all.
+    crate::runtime::drain::note_store_route(if state.fence_flushed_mappings.contains(&mapping_id) {
+        "guest_read_on_flushed_mid"
+    } else {
+        "guest_read_on_other_mid"
+    });
     let keyed = state
         .compute_deferred_flush
         .keys()
@@ -344,8 +377,8 @@ pub fn flush_mapping_for_guest_read<M: HostMemory + HostOps>(
                 let hits: Vec<(crate::model::ComputeStorageResidencyKey, u32)> = state
                     .linear_deferred_flush
                     .iter()
-                    .filter(|(_, (_, window_pages))| !window_pages.is_disjoint(&pages))
-                    .map(|(key, (generation, _))| (*key, *generation))
+                    .filter(|(_, entry)| !entry.pages.is_disjoint(&pages))
+                    .map(|(key, entry)| (*key, entry.generation))
                     .collect();
                 for (key, generation) in hits {
                     ok &= flush_linear_one(state, host, &key, generation);
@@ -363,6 +396,11 @@ pub fn flush_mapping_for_guest_read<M: HostMemory + HostOps>(
                 }
             }
         }
+    }
+    if flushed == 0 {
+        crate::runtime::drain::note_store_route("guest_read_dry");
+    } else {
+        crate::runtime::drain::note_store_route_n("guest_read_landed", u64::from(flushed));
     }
     (ok, flushed)
 }
@@ -425,12 +463,13 @@ pub fn flush_gva_exact<M: HostMemory + HostOps>(
 /// content either way — `host_cache_store_gva_layer` runs unconditionally — so
 /// nothing renderable is lost by refusing.
 #[cfg(feature = "backend-vulkan")]
-fn window_pages_still_ours<M: HostMemory + HostOps>(
+pub(crate) fn window_pages_still_ours<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &M,
     gva: u64,
     entry: &crate::model::GvaDeferredEntry,
     trigger: &str,
+    outcome: &str,
 ) -> bool {
     deferred_pages_still_ours(
         state,
@@ -440,6 +479,7 @@ fn window_pages_still_ours<M: HostMemory + HostOps>(
         entry.span(),
         &entry.pages,
         &format!("{}x{} trigger={trigger}", entry.width, entry.height),
+        outcome,
     )
 }
 
@@ -452,9 +492,20 @@ fn window_pages_still_ours<M: HostMemory + HostOps>(
 /// hazard with no check at all while the GVA rail had one, purely because the
 /// check lived inside the GVA-shaped function.
 ///
-/// Returns `true` when the window may still be written to guest RAM.
+/// Returns `true` when the window still names the pages it was armed on.
+///
+/// `outcome` names what the caller gives up when this answers `false`, because
+/// the question has two consumers that lose different things. A flush asks it
+/// to keep a write off somebody else's pages (`guest=refused`). The cross-pass
+/// resident Load asks it to keep somebody else's pixels from being loaded as
+/// this draw's own prior content (`resident=refused`) — the same drift, read
+/// from the other side. One hardcoded outcome word would make one line a lie.
 #[cfg(feature = "backend-vulkan")]
-fn deferred_pages_still_ours<M: HostMemory + HostOps>(
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the drift question names the window, its armed pages, and what the caller loses"
+)]
+pub(crate) fn deferred_pages_still_ours<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &M,
     task_id: u32,
@@ -462,41 +513,1147 @@ fn deferred_pages_still_ours<M: HostMemory + HostOps>(
     span: u64,
     armed: &std::collections::HashSet<u64>,
     what: &str,
+    outcome: &str,
 ) -> bool {
+    // Same accounting the mapping rail carries: this function has three ways to
+    // return `true` and only one of them checked anything, so a boot reporting
+    // no drift on this rail could not say whether the guard had passed or had
+    // nothing to pass on. Counted, never gated — every write that landed before
+    // still lands.
     if span == 0 || armed.is_empty() {
+        crate::runtime::drain::note_store_route("defw_unwit_no_armed");
         return true;
     }
     let mut live = std::collections::HashSet::new();
-    crate::runtime::gva_mem::visit_task_gva_page_gpas(
+    live.extend(crate::runtime::gva_mem::task_gva_page_gpa_set(
         host,
         &state.tasks,
         task_id,
         gva,
         span,
         state.page_shift,
-        1,
-        &mut |gpa_page| {
-            live.insert(gpa_page);
-            true
-        },
-    );
-    // An empty or short walk is the teardown case the writers name precisely;
-    // deciding it here too would take it away from the reason that fits it, and
-    // those paths already land cache-only.
-    if live.len() < armed.len() {
+    ));
+    // The property that makes the write safe is not "the same number of pages
+    // came back", it is "every page this write can reach is one the window was
+    // given". `write_gva_rgba8` resolves the destination per row from a fresh
+    // walk, so the pages it can reach are exactly the ones this walk resolves —
+    // and a page of `live` that is not in `armed` is a page some other owner
+    // holds now.
+    //
+    // A subset is the benign teardown case: the guest dropped part of the range
+    // and the rest is still ours, so the rows that still resolve land in our own
+    // pages and the rest fail per-row on their own terms. That is what the
+    // length test was reaching for, and it is not what it tested — `live` can be
+    // shorter than `armed` while containing pages that were never ours, because
+    // pages can disappear and reappear pointing somewhere else in the same walk.
+    // The strictly-shorter arm returned "still ours" for that case, which is the
+    // one arrangement of this range that corrupts another owner's memory.
+    if live.iter().all(|p| armed.contains(p)) {
+        // `all` over an EMPTY set is true, and that is not a verification: it
+        // means the walk resolved no page of this window at all, so there was
+        // nothing to compare against `armed`. Harmless — `write_gva_rgba8`
+        // resolves per row from the same walk, so no row lands either — but it
+        // must not be counted as the guard having agreed, which is exactly the
+        // conflation that made the mapping rail's `refused = 0` unreadable.
+        crate::runtime::drain::note_store_route(if live.is_empty() {
+            "defw_unwit_no_live"
+        } else {
+            "defw_pages_verified"
+        });
         return true;
     }
-    if live == *armed {
-        return true;
-    }
+    crate::runtime::drain::note_store_route("defw_pages_drifted");
     crate::observe::fail(format!(
         "deferred_window_page_drift gva={gva:#x} task={task_id} {what} \
-         armed_pages={} live_pages={} moved={} guest=refused",
+         armed_pages={} live_pages={} moved={} foreign={} {outcome}",
         armed.len(),
         live.len(),
-        armed.difference(&live).count()
+        armed.difference(&live).count(),
+        live.difference(armed).count()
     ));
     false
+}
+
+/// Land every armed GVA render-Store window, because the guest is about to be
+/// told the work is finished.
+///
+/// This is the deferral rail's contract with the guest, and it is the one thing
+/// [`deferred_pages_still_ours`] cannot substitute for. A completion stamp is
+/// this device's only statement that a render is done; from the instant it lands
+/// the guest may free the target, and its own allocator may hand those pages to
+/// anything at all without touching a page table — so no later walk, page-set
+/// comparison or content test can tell the memory apart from the target it used
+/// to be. The only sound moment to write a render's bytes into guest RAM is
+/// before the fence that claims they are already there.
+///
+/// Apple's device needs no equivalent because it has no equivalent window: the
+/// render target *is* the guest allocation, so completion and "the bytes are in
+/// guest memory" are the same event. This is that invariant restated for a rail
+/// that has to copy.
+///
+/// What the deferral still buys is everything inside one fence: a chain of
+/// passes rendering into the same target reuses the registry resident, and
+/// `supersede_gva_window` still drops a window the same submission re-renders.
+/// What it stops buying is survival across the fence, which was never the
+/// device's to sell.
+#[cfg(feature = "backend-vulkan")]
+pub fn flush_gva_windows_before_fence<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+) {
+    if state.gva_deferred_flush.is_empty() {
+        return;
+    }
+    // Oldest-first, so windows land in the order they were rendered: a later
+    // Store at an address the guest recycled within one submission must not be
+    // overwritten by the earlier one.
+    while let Some((gva, entry)) = state.take_oldest_gva_deferred_window() {
+        crate::runtime::drain::note_store_route("gvaw_fence_flush");
+        let _ = flush_gva_one(state, host, gva, &entry, true, "fence");
+    }
+}
+
+/// Metal-direct builds never arm GVA windows — nothing to land at the fence.
+#[cfg(not(feature = "backend-vulkan"))]
+pub fn flush_gva_windows_before_fence<M: HostMemory + HostOps>(
+    _state: &mut DeviceState,
+    _host: &mut M,
+) {
+}
+
+/// Land every armed linear compute-storage window, for the same reason and under
+/// the same contract as [`flush_gva_windows_before_fence`].
+///
+/// This rail writes a raw task GVA. `ComputeStorageResidencyKey::linear` sets
+/// `mapping_id` to 0 and stores the *task id* in `map_generation`, so there is no
+/// mapping incarnation to compare and no lifecycle notify anywhere in the wire
+/// format — exactly the position the GVA render rail is in, and exactly why
+/// `6bc2220` could clear `flush_render_one` and `flush_storage_one` on
+/// `map_generation` drift and could not clear this one.
+///
+/// # Measured before it was repaired
+///
+/// One x86/Vulkan boot on the crash-hunt workload (Safari on three compositing
+/// pages, Finder windows, then 600 s of Mission Control ×71, Spotlight ×71,
+/// window drags ×142):
+///
+/// ```text
+/// linw_stamp_same       0
+/// linw_stamp_outlived   1     task=5 ref=52 gva=0x39f000 128x135 stamps=1019
+/// ```
+///
+/// Both halves matter. The rail is late whenever it lands at all — the one
+/// landing in ten minutes came 1 019 fences after the guest was told the work was
+/// done. And it lands almost never, which is what makes the repair free: the
+/// objection that stopped the fence repair from being applied to the render rail
+/// was the cost of writing back full-screen frames ~98 % of which nothing reads,
+/// and there is no such cost here. One window per ten minutes is not a writeback
+/// budget.
+///
+/// A rate this low cannot on its own convict this rail of any guest crash, and no
+/// such claim is made. What it does mean is that the correct behaviour is also
+/// the cheap one, so there is nothing to trade.
+#[cfg(feature = "backend-vulkan")]
+pub fn flush_linear_windows_before_fence<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+) {
+    if state.linear_deferred_flush.is_empty() {
+        return;
+    }
+    // Snapshot the keys first: `flush_linear_one` disarms its own window and may
+    // flush others through the cache paths below it, so iterating the live map
+    // would borrow it across a mutation. A key whose window is gone by the time
+    // it comes up disarms to `None` and the flush is a no-op on the guest.
+    let armed: Vec<(crate::model::ComputeStorageResidencyKey, u32)> = state
+        .linear_deferred_flush
+        .iter()
+        .map(|(key, entry)| (*key, entry.generation))
+        .collect();
+    for (key, generation) in armed {
+        if !state.linear_deferred_flush.contains_key(&key) {
+            continue;
+        }
+        crate::runtime::drain::note_store_route("linw_fence_flush");
+        let _ = flush_linear_one(state, host, &key, generation);
+    }
+}
+
+/// Metal-direct builds never arm linear windows — nothing to land at the fence.
+#[cfg(not(feature = "backend-vulkan"))]
+pub fn flush_linear_windows_before_fence<M: HostMemory + HostOps>(
+    _state: &mut DeviceState,
+    _host: &mut M,
+) {
+}
+
+/// Land every armed mapping-keyed window — type-11 render Stores and compute
+/// storage alike — because the guest is about to be told the work is finished.
+///
+/// This is the last of the four deferred rails to be bound to the fence, and it
+/// is bound for a *different* reason from the other three, which is why it was
+/// measured first rather than assumed.
+///
+/// # The other three rails were bound because they could not name their memory
+///
+/// A `GvaDeferredEntry` and a `ComputeStorageResidencyKey::linear` name a raw
+/// address, so a guest that frees the allocation and reuses the pages leaves the
+/// window pointing at somebody else's memory with nothing to refuse on. That is
+/// not this rail's position: [`flush_render_one`] and [`flush_storage_one`]
+/// compare the mapping's live `map_generation` against `key.map_generation` and
+/// refuse before reading, and `map_generation` moves on exactly the events that
+/// let a guest reuse an IOSurface's storage. [`note_mapping_window_against_fence`]
+/// records that argument in full and still holds.
+///
+/// # This rail is bound because the guest is entitled to the bytes at the fence
+///
+/// A completion stamp is this device's statement that the render is finished. A
+/// guest that has been told so may map the IOSurface and read it — CoreGraphics
+/// reading back a layer, a damage forward-copy from the previous buffer, any
+/// CPU-side compositing step — and it reads *guest RAM*, through its own
+/// mapping, without crossing a single host path this device can intercept.
+/// `flush_intersecting` covers every reader that goes through us and there is no
+/// mechanism that covers the ones that do not.
+///
+/// So a deferred window is a bet that nothing reads those pages before we land
+/// them, and when the bet loses the guest composites the *pre-Store* bytes: a
+/// region of the surface holding whatever was there one frame ago, or nothing at
+/// all. That is a stale rectangle in an otherwise correct frame, and it is
+/// indistinguishable from the corruption classes this device is chasing.
+///
+/// Apple's device does not take that bet and does not need to. Its render target
+/// *is* the guest allocation, so "the render is complete" and "the bytes are in
+/// guest memory" are one event. This is that invariant restated for a rail that
+/// has to copy: the copy happens before the statement, not after it.
+///
+/// # And because it clobbers writes the guest itself made
+///
+/// A deferred window promises to replay a Store later, and that is only a replay
+/// while nothing else writes those pages in between. The guest *is* something
+/// else: it maps the same IOSurface and does inter-buffer damage forward-copies
+/// and CoreGraphics blits into it. The writeback covers the full attachment
+/// extent, so every such guest store inside the deferral interval is gone when
+/// the window lands. One x86/Vulkan boot on the icon workload (Safari + Finder,
+/// 300 s of Mission Control ×41 / Spotlight ×41 / window drags ×82, then four
+/// Finder recomposite rounds) measured that directly:
+///
+/// ```text
+/// surface_resident               49 706
+/// surface_flush                  12 343    windows that landed
+/// render_flush_over_guest_write   8 968    of those, 73 % clobbered guest bytes
+/// rendw_stamp_outlived           12 343    every one landed after the fence
+/// storw_stamp_outlived              101
+/// ```
+///
+/// `deferred_flush_clobber` is 8 975 lines of that boot's fail log — the largest
+/// self-declared loss of guest work anywhere in it.
+///
+/// [`render_flush_guest_written_ranges`] states why the obvious repair —
+/// preserve the pages the guest wrote — is not available: `page_gen[p]` is
+/// stamped at the *harvest* that saw page `p` dirty, not at the write, so the
+/// witness cannot say whether a store happened before or after the Store this
+/// window defers. Preserving on it withheld the device's own frames and turned
+/// the screen black (`13ae46d`, 0 of 14 rounds).
+///
+/// The fence deletes the question rather than answering it. A window that lands
+/// before [`crate::runtime::drain::write_stamp`] covers only the interval a
+/// synchronous Store would itself have covered, so there is no interval left in
+/// which a guest write can be both after the Store and before the writeback.
+/// Nothing has to be preserved because nothing is clobbered.
+///
+/// # What the deferral still buys, and what it stops buying
+///
+/// Everything inside one fence survives: a chain of passes into the same surface
+/// still reuses one resident, and `supersede_covered_render_windows` still drops
+/// a window a later Store in the same submission fully covers. What it stops
+/// buying is survival *across* the fence, and that is where this rail's cost is,
+/// because unlike the linear rail it is not free.
+///
+/// `arm_surface_resident_store` exists to skip the whole-framebuffer GPU→host
+/// readback entirely on the ~86 % of windows nothing ever flushes — `draw_phase`
+/// prices that skip at 565 ms per second of wall clock. Landing every window at
+/// its fence pays a readback for each: `surface_resident 49 706` against
+/// `surface_flush 12 343` bounds it at 4× the current landings. That is the trade
+/// this binding makes, and it is a trade rather than a regression only if the
+/// measurement says so, and `present_hz` and `draw_us` were read both ways to
+/// settle it.
+///
+/// The GVA rail's binding was expected to cost frame rate and paid back instead
+/// (5.9 → 9.5 Hz, `draw_us` 524 ms → 156 ms), because the unbounded rail spent
+/// its time in oldest-first `window_cap` eviction storms holding residents pinned
+/// across hundreds of frames. `evict_render_windows_to_cap` is the same shape and
+/// may go the same way, but that is a prediction and not a reading.
+///
+/// The endgame removes the trade rather than choosing a side of it: a resident
+/// whose image memory *is* the guest pages has nothing to write back, which is
+/// why Apple's device has neither this rail nor this cost. That is a backend
+/// allocation change, not a scheduling one.
+///
+/// # What this costs, measured
+///
+/// It is the single largest cost in the device. On a driven x86 boot (Safari
+/// WebGL, 120 Hz) `flush_rails` reads `render_us=688003 render=100` with the
+/// gva, linear and storage rails all at zero: **69% of the drain worker's
+/// entire second**, against 21% for draws. `readback_split` divides each 6.9 ms
+/// flush into submit 7 µs, fence 3.04 ms, staging memcpy 0.83 ms and guest-page
+/// write 2.68 ms.
+///
+/// All of it is speculative. In the same second `mapw_fence_flush` equals
+/// `surface_flush` exactly (104 = 104), so **every flush is this fence and none
+/// is a guest demand** — [`flush_mapping_for_guest_read`], the
+/// `SynchronizeResources` path that fires when the guest actually declares a CPU
+/// read, contributes nothing while driving.
+///
+/// Nothing reads what it produces, either. `RenderFlushWitness` marks each of
+/// the two copies a flush lands — the mapping's guest pages and its host surface
+/// cache entry — and clears the mark when a host reader takes that copy, so the
+/// next flush of the same mapping reports what became of the previous one. A
+/// 30 s driven Safari probe scored 3766 landings:
+///
+/// ```text
+/// render_flush_cache_used      15    render_flush_cache_unread   3751
+/// render_flush_pages_used      26    render_flush_pages_unread   3740
+/// ```
+///
+/// **0.4% of the cache copies and 0.7% of the guest-page writes are read by
+/// anything in the device before the next flush replaces them.** That is not
+/// surprising once stated: every device-side reader of these bytes sits below a
+/// rung that prefers the GPU resident (`t11rung_resident`, the LOAD elision, the
+/// window's resident-carried present), and the resident is exactly what the
+/// flush is a copy of. The readers only fall through to a copy when there is no
+/// resident to read — and then there was nothing to write back either.
+///
+/// That is still not licence to drop the writeback, and the witness says so
+/// itself: it can only see readers *inside* the device. The guest CPU loads
+/// these pages with no device operation at all and has been observed doing it
+/// without declaring it (the black-wallpaper fade snapshot named in
+/// [`flush_mapping_for_guest_read`]), which is why this fence exists, and after
+/// the completion stamp the pages may belong to something else entirely. So the
+/// 99% is a bound on what a *cheaper* rail could save, not a licence to delete
+/// this one: "write now or never write" is the real choice and this side of it
+/// is the safe one.
+///
+/// What the pair of numbers argues for is not flushing less often but not
+/// needing to flush at all. Two routes remain, and the witness rules out a third:
+///
+/// - The zero-copy endgame above — a resident whose image memory *is* the guest
+///   pages. Available only where the host GPU can address host memory.
+/// - Making the undeclared guest read observable, so the writeback becomes
+///   demand-driven everywhere rather than only on `SynchronizeResources`. That
+///   is what would make the rail's cost proportional to its 0.7% of consumed
+///   work on a discrete host too.
+/// - **Not** "flush only the mappings whose copies get read": which flushes were
+///   wasted is knowable only in hindsight, and a mapping whose pages are read
+///   while stale has already served wrong pixels.
+///
+/// The async-readback split (release the device lock across the fence wait) is
+/// the step that does not require any of them.
+///
+/// # What witnessing the undeclared read would take
+///
+/// The second route is the one that pays on every host, so it is worth being
+/// exact about why it is not simply the write witness turned around.
+///
+/// [`crate::runtime::gather_witness`] skips a gather when two halves agree that
+/// nothing wrote a page set: [`HostOps::guest_write_gen`] over the hypervisor
+/// dirty bitmap for guest CPU stores, and [`crate::runtime::host_writes`] for
+/// this device's own writes, which the bitmap is defined not to see. Neither
+/// half has a reading counterpart and no third one can be added, because **a
+/// read leaves no trace anywhere**. A dirty bitmap is a record of stores; a page
+/// the guest loaded and a page it never touched are the same bits in it. That is
+/// a property of the hardware, not a gap in the shim.
+///
+/// The only way a load becomes observable is to make it fault, which means the
+/// page must not be present in the guest's mapping when the load happens. On
+/// Linux that is `userfaultfd`: register the pages, punch them out, and the
+/// access traps to a handler that supplies the bytes before the vCPU resumes.
+/// QEMU already runs this combination for post-copy migration, so KVM taking a
+/// uffd fault on guest RAM is settled behaviour rather than a research question
+/// — but note what is being borrowed. Post-copy fills a page once and is done;
+/// this rail would re-arm the same pages every frame, so the per-fault cost and
+/// the arm/disarm cost are on the hot path in a way they never are there.
+///
+/// **The first build of this should be a counter, not a rail, and the reason is
+/// in the numbers above rather than in caution.** The measured case for
+/// demand-driving is an upper bound on waste, not a measurement of demand: 0.7%
+/// of guest-page writes are read by a device reader and 4.2% of landings are
+/// declared by `SynchronizeResources`, and neither can see an undeclared guest
+/// load. The undeclared load is known to exist — the black-wallpaper fade
+/// snapshot named in [`flush_mapping_for_guest_read`] is one — but its *rate*
+/// has never been measured, and the entire value of the route depends on it. So
+/// arm a sample of windows (the [`crate::runtime::gather_witness::AUDIT_STRIDE`]
+/// shape is the precedent), still write the bytes, still fill correct content on
+/// fault, and count faults against landings. That answers "how often does the
+/// guest read what nobody declared" for a fraction of one rail's cost, and it is
+/// the number that decides whether the fast path is worth building at all.
+///
+/// Three hazards, recorded because each one turns the result into a wrong one
+/// rather than a noisy one:
+///
+/// - A fault is not a *read*. `UFFDIO_REGISTER_MODE_MISSING` traps the first
+///   access of either kind, so a fault count is an upper bound that includes the
+///   guest's own stores — which happen on 73% of these windows, per
+///   `render_flush_over_guest_write` above. Separating them needs the fault's
+///   `UFFD_PAGEFAULT_FLAG_WRITE`, and a rail that ignores it will conclude the
+///   guest reads everything.
+/// - Arming a page this device is about to write itself is a fault this rail
+///   caused, and `observe::gate`'s `MAP_PAGES_SITES` is the authority
+///   on which code writes guest RAM — not a grep, which has already missed
+///   `gva_view::map_fresh_span_within` once.
+/// - Punching a page out loses whatever the guest had put there, so the content
+///   to fill with has to be captured before the punch, not after.
+///
+/// ## What the rail is worth, and the second-order cost of not doing it
+///
+/// [`render_writeback_counterfactual`] answers the question this ledger could
+/// not: the ~20 ms of a 30 ms guest frame above is an attribution, and removing
+/// the rail is a different claim. Measured on one settled x86/PCI guest, same
+/// workload, host GPU at P8 throughout, one representative second each — the
+/// guest asks for 8.2 composites and ~63 draws per frame in **all three**, so
+/// these are one workload at three speeds:
+///
+/// ```text
+///                     control     no-writeback #1   no-writeback #2
+/// guest frames/s         34            98                34
+/// present_hz             17.4          68.6              16.4
+/// duty                    0.97          0.77              0.97
+/// flush_us              760 ms        122 ms             70 ms
+/// draw_us per draw      103 us         97 us            421 us
+/// ```
+///
+/// **#1 is the price: 2.9x the guest frame rate and 3.9x the displayed one, at
+/// unchanged per-draw cost, with the worker no longer saturated.** So the rail
+/// is the cap, and the read-witness route is worth its cost.
+///
+/// **#2 gave it all back, and that is the warning.** `flush_us` stayed
+/// collapsed while `draw_us` per draw quadrupled: 54 `t11rung_resident_refused`
+/// with `gw_rail_t11_kb=437400` — binds that refused their resident on
+/// `guest_replaced` and gathered 8 MB each out of guest RAM. The control has
+/// zero such refusals and gathers 0.9 MB a bind.
+///
+/// The counterfactual provokes that by being wrong — pages left holding neither
+/// our frame nor a whole guest one — so it is not what a correct rail would do.
+/// It is what a correct rail would do *if it got the witness wrong*, and the
+/// exchange rate is terrible: a 2.26 GB/s writeback for an 8 MB-per-bind
+/// gather. **Skipping a writeback has to keep the guest-write witness and the
+/// type-11 resident rung sound. Only stopping the write is a wash.**
+///
+/// Six runs over three boots, `fresh` against `t11rung_resident_refused`:
+/// control 34 / 36 / 37 with no refusal in any of them, counterfactual **99**
+/// on its first drag with none, then 35 and 38 with 54 and 49. The control does
+/// not decay across runs and its own first drag reads 37, so "the first drag
+/// after a boot is fast" is not the explanation.
+///
+/// The chain is named by counters, not inferred. `gw_refused_guest_store=121`
+/// and `type11_seed_guest_wrote=86` appear in the degraded run and in neither
+/// the control nor the fast counterfactual, and `gw_vouched` — 40 windows in
+/// the control — is **absent from both counterfactual runs**. That last one is
+/// the mechanism: [`crate::runtime::gather_witness`] subtracts this device's own
+/// page-exact write record to tell its stores from the guest's, and a rail that
+/// never lands never writes that record. Once real guest stores accumulate with
+/// nothing to re-baseline against, the witness assumes the worst and the
+/// type-11 rung above it follows.
+///
+/// ## Which pages to register, and where the route stops
+///
+/// A `userfaultfd` registration only traps accesses made through the VMA it was
+/// registered on, so "register the pages" has to mean the VMA KVM's memslot
+/// `userspace_addr` points at, and not some second alias of the same physical
+/// memory. [`crate::runtime::host::HostOps::map_pages`] is the crate's only
+/// handle on a host VA for guest pages, and the two shims answer differently:
+///
+/// - **x86/PCI is the pathway this works on.** Its shim never allocates: it
+///   translates and hands back `memory_region_get_ram_ptr(mr) + xlat`, which is
+///   QEMU's own RAMBlock pointer, and answers `map_pages_stable = 1` for exactly
+///   that reason. `vm/boot-x86.sh` passes plain `-m` with no memory backend
+///   object, so guest RAM is a conventional anonymous mapping — the case uffd
+///   handles best. A registration on that range does trap the vCPU.
+/// - **arm64/MMIO cannot take this route at all**, for two independent reasons.
+///   Its shim answers `map_pages_stable = 0` because a page list that is not
+///   host-contiguous gets a packed `mach_vm_remap` view — a second alias, which
+///   a fault registration on the RAMBlock would not cover and which would not
+///   itself trap the vCPU. And its host is macOS, which has no `userfaultfd`.
+///
+/// So the read witness is a **Linux-host mechanism**, and shipping it would
+/// leave the arm64/macOS pathway on the eager rail with no equivalent. That is
+/// not a reason to skip it — x86 is where the cost was measured — but it is a
+/// reason not to write it as though it were the general answer, and a reason
+/// the eager rail cannot be deleted behind it. The dirty bitmap does not have
+/// this problem: KVM indexes it by physical address, so a write through any
+/// alias is seen.
+///
+/// ## `userfaultfd` needs a privilege QEMU does not have
+///
+/// Measured on the development host (Linux 7.1.3), as the user QEMU runs as:
+///
+/// ```text
+/// userfaultfd(0)                    -> EPERM   /proc/sys/vm/unprivileged_userfaultfd = 0
+/// userfaultfd(UFFD_USER_MODE_ONLY)  -> ok
+/// ```
+///
+/// The mode that is available is the one that cannot do the job.
+/// `UFFD_USER_MODE_ONLY` exists to stop an unprivileged process trapping
+/// **kernel-mode** faults, and a vCPU touching a missing guest page is exactly
+/// that: KVM takes the EPT violation and resolves the HVA through
+/// `get_user_pages`, in kernel context. (Creatability is measured; that
+/// user-mode-only misses the vCPU is the flag's documented purpose and has not
+/// been tested here.) A full `userfaultfd` needs `CAP_SYS_PTRACE` on the QEMU
+/// binary or `vm.unprivileged_userfaultfd=1`, both of them root changes on the
+/// host running the VM.
+///
+/// That is not fatal, but it decides the shape: the witness cannot be a rail
+/// this device silently enables. It is opt-in and it fails visibly when the
+/// host will not grant it.
+///
+/// **The privilege-free alternative is KVM's own, and it is worth costing
+/// before assuming uffd.** Deleting the memslot that covers a surface's pages
+/// makes guest accesses to them exit to userspace as MMIO — a supported KVM
+/// path, no capability, and it reports direction, which uffd MISSING mode does
+/// not without reading the fault flags. It is far too slow for a rail (an exit
+/// per access against 2 M accesses in a full-frame read) but that does not
+/// matter for a counter: un-protect on the first fault, which is all the
+/// question "did anything read this landing" needs. What it costs instead is
+/// memslot churn — splitting the RAM slot around an 8 MB surface is three
+/// `KVM_SET_USER_MEMORY_REGION` calls and a VM-wide EPT flush per arm — which
+/// at an [`crate::runtime::gather_witness::AUDIT_STRIDE`]-shaped sample rate is
+/// a handful a second. Neither mechanism has been built.
+///
+/// # Ordering
+///
+/// Render windows first in arm order, then whatever remains, and both through
+/// [`flush_intersecting`] rather than by taking entries directly. That choke
+/// point runs the fixpoint that drags in every sibling overlapping the same guest
+/// bytes, so windows that overlap land together in one pass whatever order this
+/// loop reaches them in — the ordering here decides only which *disjoint* window
+/// goes first, and disjoint windows cannot overwrite each other.
+///
+/// A window may legitimately survive: `flush_intersecting` holds every window on
+/// a condemned backing so `mapper::resolve` can settle whether the delete named
+/// this incarnation. That hold is the existing contract and the fence does not
+/// override it — such a window is not owed to guest RAM until the resolve says
+/// the memory is still ours.
+#[cfg(feature = "backend-vulkan")]
+pub fn flush_mapping_windows_before_fence<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+) {
+    if state.compute_deferred_flush.is_empty() {
+        return;
+    }
+    // Once per fence that has anything to land, against `mapw_fence_flush`'s
+    // once per window. The ratio is how many windows are armed at the same
+    // time, which `surface_resident` and `surface_flush` cannot say — both are
+    // per-window rates and read 104/s whether that is 104 fences of one window
+    // or 52 of two.
+    //
+    // **Measured, and the answer is one.** A driven x86/PCI second reads
+    // `mapw_fence_pass=116 mapw_fence_flush=116 surface_resident=116
+    // surface_flush=116` — all four equal, on three consecutive windows. So the
+    // concurrency is exactly 1: every armed window is landed by the very next
+    // fence, and no fence ever lands two.
+    //
+    // Two things follow, and both are negative results worth keeping. Batching
+    // the readbacks — one submit and one fence for N windows — cannot pay,
+    // because N is 1. And the deferral saves no readback at all: arming and
+    // flushing are the same rate, so it only moves the readback from the Store
+    // to the fence a moment later. That is consistent with `ResidentArmCensus`
+    // measuring a mean arm-to-flush age of 351 us against a 2.6 ms fence, which
+    // is the same finding from the other side and is why submitting at arm time
+    // was refuted: there is no interval to hide the wait in.
+    //
+    // A narrower version of that idea is *also* refuted, and it is worth naming
+    // separately because it is not obviously the same one. At the moment
+    // `arm_surface_resident_store` runs, the engine's draw batch is still open
+    // and recording, and the render target is already in `TRANSFER_SRC_OPTIMAL`
+    // — so the copy could be appended to the render's OWN command buffer rather
+    // than submitted as a second one, which the "submit a separate CB earlier"
+    // refutation above does not cover. It still does not pay. The second submit
+    // costs ~10 us of the ~1.5 ms `fence_us`; `begin_entry` already flushes the
+    // open batch without waiting on it, so the GPU runs render and copy
+    // back-to-back and one wait covers both. There is no second pipeline drain
+    // to save. Worse, arming is not flushing: an icon workload measured 49 706
+    // arms against 12 343 flushes, so recording the copy at arm time would pay a
+    // full-frame DMA for four windows in five that nothing ever reads.
+    //
+    // What is left is volume. These 116 flushes are 116 whole 1920x1080 frames,
+    // 962 MB/s, read back for ~62 presented frames; every phase in
+    // `ReadbackPhase` is proportional to it.
+    //
+    // **Reading back less than the whole attachment is measured, and it is not a
+    // lever.** The guest supplies a damage rect and this device carries it
+    // verbatim (`OP_SET_SCISSOR` -> `req.scissor`), so a damage-limited
+    // writeback would be the decoded contract rather than a guess — but
+    // `note_store_damage_coverage` reads `store_damage_texels /
+    // store_attach_texels` at **99.34%** on a driven probe, with half the Stores
+    // carrying no scissor at all and the other half one that spans the
+    // attachment. Partial scissors belong to the small draws *inside* a pass;
+    // the Store that ends a full-screen composite declares the full screen. The
+    // whole rect is worth 0.66%.
+    //
+    // Moving the bytes without a CPU pass is closed too, and by policy rather
+    // than by measurement: it needs `VK_EXT_external_memory_host`, which
+    // `observe::gate::the_host_pointer_import_extension_is_never_requested`
+    // forbids because importing a host pointer over guest RAM gives the host GPU
+    // write access to guest memory.
+    //
+    // Flushing *fewer times* is closed as well, and by the same witness.
+    // [`crate::model::RenderFlushWitness::landed_us`] buckets how long each
+    // landing survived before the next replaced it, and across two driven
+    // probes `render_flush_age_sub_ms` is **0** against 3079 and 3090 at
+    // `_frame_plus`. Nothing is ever rewritten inside a millisecond, so the 99%
+    // nobody reads is not one surface written repeatedly inside a burst — it is
+    // one full-screen composite per displayed frame, landed once each, at
+    // exactly the rate the guest paints. Superseding windows across fence
+    // boundaries would have nothing to collapse.
+    //
+    // **A window-move workload does not reopen that, and it is worth recording
+    // why not, because the numbers look at first as though it does.** Moving a
+    // 1000x640 Safari window at ~115 Hz (`scripts/window-drag-probe`), per
+    // second, against an idle control on the same guest of zero draws and zero
+    // flushes at `duty` 0.001:
+    //
+    // ```text
+    // surface_flush 212   render_flush_age_sub_frame 139   _frame_plus 73
+    // write_split   frag=212  bytes=1758412800  (8 294 400 each: 1920x1080x4)
+    // host_window_cadence presents=11 offered=11   drain_duty duty=0.98
+    // render_flush_pages_used 0-5    render_flush_pages_unread 212
+    // guest_read_declared 3
+    // ```
+    //
+    // Two thirds of landings are replaced inside a frame here, where the WebGL
+    // probe had 97% surviving one. But the bucket that means "collapsible" is
+    // `_sub_ms` — a burst rewriting one surface inside a single drain tranche,
+    // which no fence boundary separated and nothing could have observed between
+    // — and it is **still absent**. What moved is `_sub_frame`: landings 1 to
+    // 8.33 ms apart, each its own composite behind its own fence. Every one of
+    // those fences entitles the guest to the bytes, so collapsing them is the
+    // undeclared-read question again and not a separate lever.
+    //
+    // What the workload *does* establish is the size of the problem, which is
+    // larger than the WebGL figure suggested: **212 full-frame writebacks and
+    // 1.76 GB/s to put eleven frames on the screen**, with the worker at 0.98
+    // duty. The device keeps up with 212 fences a second and presents 11, so
+    // roughly 200 composites per second are written back to guest RAM and never
+    // displayed. Whether that ratio is the guest asking or this device
+    // presenting too little is not answered by any counter here, and it is the
+    // question to take next — `validity_wb_unstated=180` against
+    // `validity_wb_licensed=32` in the same second is where to start.
+    //
+    // What is left is not doing it. Every landing is speculative
+    // (`mapw_fence_flush == surface_flush`) and 99% of what it lands is read by
+    // nothing (`RenderFlushWitness`), so the writeback survives on exactly one
+    // case: a guest CPU read that was never declared. Making *that* observable
+    // is the remaining route, and it is a hypervisor-side change rather than a
+    // device-side one.
+    //
+    // ## How much of it lands for nobody, and why declarations cannot replace it
+    //
+    // That paragraph rested on one witness, which sees only *device* readers.
+    // The guest's own declared reads are now counted too
+    // ([`flush_mapping_for_guest_read`]), so both consumers can be bounded at
+    // once. One driven x86/PCI boot, three Safari probes, summed over its
+    // `store_routes` windows:
+    //
+    // ```text
+    // mapw_fence_flush           8051   windows landed
+    // render_flush_pages_used     187   landings a device reader consumed  (2.3%)
+    // render_flush_pages_unread  7774
+    // guest_read_declared         778   guest declarations of a CPU read
+    // guest_read_on_flushed_mid   339   of those, on a mapping this rail writes (4.2% of landings)
+    // guest_read_on_other_mid     439
+    // ```
+    //
+    // So **at most ~6.5 % of the writeback has a witnessed consumer**, and the
+    // two sets may overlap, so that is a ceiling rather than a total. Ninety-odd
+    // per cent of the largest cost in this device lands for a consumer nobody
+    // has ever observed. That is the case for building the read witness.
+    //
+    // It is also the case against the cheap version of it. Declarations cover
+    // 4.2 % of landings, so **dropping the eager rail and relying on op 0x35
+    // would lose the other 95 %** — the tripwire is required, not an
+    // optimisation on top of the declarations. And the two rates do not move
+    // together: an earlier, lighter boot read 1035 declarations against 3379
+    // landings (0.31 each) where this one reads 778 against 8051 (0.10), so the
+    // flush rate scales with rendering and the declaration rate does not. The
+    // gap widens exactly when the cost matters most.
+    //
+    // Note also `guest_read_dry` is 778 of 778 on both boots. That is expected
+    // and is not evidence of anything: this fence empties every window before
+    // any declaration can arrive, so a declaration can never land one.
+    //
+    // # One of the two CPU passes over the result is gone; the other is the floor
+    //
+    // The four closed levers above are all about the readback. The *number of
+    // CPU passes over its result* was a separate cost, and it was reducible.
+    //
+    // A flush used to make two passes over ~8 MB: `readback_split map_us` copied
+    // the mapped staging buffer into a `Vec<u8>`, then `write_split land_us`
+    // scattered that Vec into guest pages — about 0.82 ms and 1.06 ms per frame,
+    // together ~250 ms of a loaded second, as large as the fence. The first
+    // existed only so the host surface cache could hold an `Arc<Vec<u8>>`, and
+    // `render_flush_cache_used` prices that entry at 0.4 %.
+    //
+    // It is deleted. `read_target_leased` lends the staging buffer through
+    // [`crate::backend::vulkan::engine::LeasedFrame` ] and the scatter reads it
+    // in place. Measured on a driven x86/PCI boot, three consecutive one-second
+    // windows at 120 flushes each:
+    //
+    // ```text
+    // readback_split  map_us=0 map=120 map_max_us=0
+    // write_split     stage_us=0 stage=0 land_us=104832 land=120 cache_us=0
+    // store_routes    render_flush_leased=120 surface_flush=120
+    // ```
+    //
+    // `map_max_us=0` is the part worth keeping: not an average that rounded
+    // down, but no single flush in 360 spending a microsecond there. What the
+    // phase still times on that arm is the `vkInvalidateMappedMemoryRanges` a
+    // non-coherent readback owes, and this host's readback memory is coherent.
+    //
+    // Two things make the borrow sound and both are load-bearing. The slot is
+    // taken out of every list that could hand it to a GPU copy — including the
+    // ring entry's pending cleanup, which is why the lease is claimed before
+    // `seal_entry` — and the holder takes no engine lock, which is why
+    // `flush_render_one` runs `flush_windows_under_bgra8_write` *before* it
+    // acquires the frame rather than letting the writeback's own
+    // `flush_intersecting` read another resident from inside the borrow. Do
+    // *not* simply hold the engine lock across the scatter instead: the host
+    // window's present path takes it, and adding a millisecond per flush at this
+    // rate would move the stall onto the window.
+    //
+    // The cache entry is **invalidated**, not left behind. A reader that hits a
+    // stale entry is served an old frame with no witness saying so, which is the
+    // corruption shape the fence binding exists to close. Falling through to the
+    // guest pages this flush just wrote is correct by construction, and the boot
+    // above logged zero `present_capture FAIL` and zero `deferred_flush_lost` on
+    // the leased rail.
+    //
+    // What is left is the floor. `land_us` is 0.87 ms per frame at ~1 GB/s of
+    // cache-cold scattered writes into guest RAM, and there is no second pass to
+    // remove — the only way past it is not to write the bytes at all, which is
+    // the demand-driven route named above.
+    crate::runtime::drain::note_store_route("mapw_fence_pass");
+    let counterfactual = render_writeback_counterfactual();
+    // Snapshot first: landing one window consumes its overlapping siblings
+    // through the fixpoint, so iterating the live map would borrow it across a
+    // mutation. A key already consumed by an earlier pass is skipped rather than
+    // re-flushed.
+    for key in mapping_windows_fence_order(state) {
+        if !state.compute_deferred_flush.contains_key(&key) {
+            continue;
+        }
+        crate::runtime::drain::note_store_route("mapw_fence_flush");
+        state.fence_flushed_mappings.insert(key.mapping_id);
+        if counterfactual {
+            state.compute_deferred_flush.remove(&key);
+            crate::runtime::drain::note_store_route("mapw_fence_counterfactual");
+            continue;
+        }
+        flush_intersecting(
+            state,
+            host,
+            key.mapping_id,
+            key.surface_offset,
+            key.span_end,
+        );
+    }
+}
+
+/// Whether this boot is measuring what the render writeback is worth by not
+/// doing it.
+///
+/// The ledger above prices the rail by attribution: the parts sum to the whole,
+/// so ~8 full-screen writebacks at 2.48 ms each account for ~20 ms of a 30 ms
+/// guest frame. **That is not the same claim as "removing it returns 20 ms."**
+/// The worker is a serial pipeline against a guest that blocks on its
+/// completion stamps, so the return could be larger (the guest gets its
+/// stamps sooner and pipelines further ahead) or smaller (whatever the rail was
+/// hiding becomes the new floor). Nothing in the ledger separates those, and
+/// the read-witness route it points at is weeks of hypervisor work priced
+/// entirely off the attribution.
+///
+/// So this exists to price it before anyone spends that. Setting
+/// `REIMS_VGPU_PROBE_NO_RENDER_WRITEBACK=1` drops every mapping-keyed render
+/// window at the fence instead of landing it, which skips both the GPU readback
+/// and the CPU scatter — the whole rail, not a slice of it.
+///
+/// **A boot with this set is incorrect and must never be one anything is
+/// claimed from except the frame rate.** The guest is told its render completed
+/// while its own pages still hold the previous frame, so any guest CPU read of
+/// a render target sees stale pixels; that is precisely the case the rail
+/// exists for. It announces itself once through the always-on failure path so a
+/// counterfactual boot's log can never be mistaken for a normal one, and it is
+/// read once per process rather than per fence.
+/// The env value's meaning, split out from the process latch so both answers
+/// are testable in one process.
+///
+/// Exactly `1` turns it on. A rail that also accepted `0`, `false` or an empty
+/// string as "set" would silently run a correctness-breaking build for anyone
+/// who exported the variable to turn it *off*, which is the shape of switch
+/// this project has been burned by before.
+fn counterfactual_requested(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|value| value == "1")
+}
+
+fn render_writeback_counterfactual() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(u8::MAX);
+    match STATE.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let on = counterfactual_requested(
+                std::env::var_os("REIMS_VGPU_PROBE_NO_RENDER_WRITEBACK").as_deref(),
+            );
+            STATE.store(u8::from(on), Ordering::Relaxed);
+            if on {
+                crate::observe::fail(
+                    "PROBE render_writeback_counterfactual=on reason=\
+                     REIMS_VGPU_PROBE_NO_RENDER_WRITEBACK — every mapping-keyed render \
+                     window is dropped at the fence. Guest CPU reads of render targets \
+                     see stale pixels. Frame rate is the only number this boot can \
+                     support.",
+                );
+            }
+            on
+        }
+    }
+}
+
+/// Mark the host surface cache copy of `mapping_id` as taken by a host reader.
+///
+/// Called beside every mapping-keyed read of [`crate::runtime::surface_cache`],
+/// which is the leg [`flush_render_one`] stores through. Unknown mappings are
+/// ignored: a cache entry outlives its mapping, and a read of one says nothing
+/// about a flush there is no longer an entry to attribute it to.
+pub fn note_render_flush_cache_read(state: &mut DeviceState, mapping_id: u32) {
+    if let Some(m) = state.mappings.get_mut(&mapping_id) {
+        m.render_flush.cache_unread = false;
+    }
+}
+
+/// Mark this mapping's guest pages as gathered by a host reader — the other leg
+/// [`flush_render_one`] writes.
+pub fn note_render_flush_pages_read(state: &mut DeviceState, mapping_id: u32) {
+    if let Some(m) = state.mappings.get_mut(&mapping_id) {
+        m.render_flush.pages_unread = false;
+    }
+}
+
+/// Report what read the previous landed flush of this mapping, then arm the
+/// witness for the one landing now.
+///
+/// The pair of counts per leg is what makes the flush's cost answerable:
+/// `render_flush_cache_used` / `render_flush_cache_unread`, and the `pages_`
+/// pair beside them, divide a gigabyte a second of readback into the part
+/// something asked for and the part nothing did. A mapping whose first flush is
+/// landing now is not counted, so an arriving surface is never scored as unread
+/// work.
+///
+/// Only where the rail exists. A Metal-direct build never arms a mapping-keyed
+/// window — `flush_mapping_windows_before_fence` is a no-op there — so there is
+/// no landing to score, and the two readers above stay unconditional only
+/// because clearing a flag that was never set costs nothing and keeps the
+/// scanout and sampled rungs free of a cfg.
+#[cfg(feature = "backend-vulkan")]
+pub(crate) fn note_render_flush_landed(
+    state: &mut DeviceState,
+    mapping_id: u32,
+    cache_stored: bool,
+) -> Option<crate::model::RenderFlushWitness> {
+    use crate::runtime::drain::note_store_route;
+    let now_us = crate::observe::elapsed_us();
+    let m = state.mappings.get_mut(&mapping_id)?;
+    let prior = std::mem::replace(
+        &mut m.render_flush,
+        crate::model::RenderFlushWitness {
+            landed: true,
+            cache_stored,
+            cache_unread: cache_stored,
+            pages_unread: true,
+            landed_us: now_us,
+        },
+    );
+    if !prior.landed {
+        return None;
+    }
+    // How long the flush being replaced survived. Bucketed against the VBL
+    // interval, because that is what separates "the compositor repainted"
+    // from "this surface was written twice inside one drain tranche".
+    note_store_route(match now_us.saturating_sub(prior.landed_us) {
+        0..=999 => "render_flush_age_sub_ms",
+        1000..=8332 => "render_flush_age_sub_frame",
+        _ => "render_flush_age_frame_plus",
+    });
+    // Only where the previous flush actually stored one. A borrowed-frame flush
+    // publishes nothing to the cache, and counting its absent copy as unread
+    // would inflate the very number that prices the cache leg.
+    if prior.cache_stored {
+        note_store_route(if prior.cache_unread {
+            "render_flush_cache_unread"
+        } else {
+            "render_flush_cache_used"
+        });
+    }
+    note_store_route(if prior.pages_unread {
+        "render_flush_pages_unread"
+    } else {
+        "render_flush_pages_used"
+    });
+    Some(prior)
+}
+
+/// Metal-direct builds never arm mapping-keyed windows — nothing to land.
+#[cfg(not(feature = "backend-vulkan"))]
+pub fn flush_mapping_windows_before_fence<M: HostMemory + HostOps>(
+    _state: &mut DeviceState,
+    _host: &mut M,
+) {
+}
+
+/// Land every deferred rail. Call this immediately before any word that tells the
+/// guest work has finished.
+///
+/// There is more than one such word. The child stamp slots go through
+/// [`crate::runtime::drain::write_stamp`], but the *root* completion stamp is
+/// written straight into slot 0 by the main FIFO drain, and it is the one the
+/// guest's root packets wait on. A rail bound only to the child path is not bound:
+/// the guest may free a render target the moment the root stamp moves, and its
+/// allocator may hand those pages to anything — a kalloc element, another
+/// process's heap — which no later check can tell from the target they used to be.
+///
+/// So the binding belongs to "the guest is about to be told", not to one of the
+/// two writers that tell it. Every caller of this function is such a site, and a
+/// new completion word is a new caller.
+///
+/// Each rail early-returns when nothing is armed, so the common case — a root
+/// packet completing with no deferred window outstanding — costs three map
+/// emptiness checks.
+pub fn flush_all_windows_before_fence<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+) {
+    // The two address-named rails carry the free-then-reuse hazard: they name raw
+    // guest addresses with no mapping incarnation to refuse on, so nothing but
+    // this ordering keeps them off memory the guest has reclaimed.
+    flush_gva_windows_before_fence(state, host);
+    flush_linear_windows_before_fence(state, host);
+    // The mapping-keyed rails can refuse a replaced incarnation, so they are here
+    // for the other hazard: a deferred writeback covers the whole attachment
+    // extent while the guest writes the same IOSurface, and landing inside the
+    // fence leaves no interval for that to happen in.
+    flush_mapping_windows_before_fence(state, host);
+}
+
+/// The order [`flush_mapping_windows_before_fence`] lands windows in: render
+/// windows oldest-first by `armed_seq`, then every other window.
+///
+/// Only the render rail carries an arm sequence, and only the render rail can
+/// hold several live windows on one mapping at once (different planes, different
+/// geometries at the same offset). Compute storage windows are keyed by the
+/// dispatch span that produced them and are appended in key order, which is the
+/// order every other flush trigger has always used.
+#[cfg(feature = "backend-vulkan")]
+fn mapping_windows_fence_order(
+    state: &DeviceState,
+) -> Vec<crate::model::ComputeStorageResidencyKey> {
+    let mut render: Vec<(u64, crate::model::ComputeStorageResidencyKey)> = Vec::new();
+    let mut rest: Vec<crate::model::ComputeStorageResidencyKey> = Vec::new();
+    for (key, owner) in &state.compute_deferred_flush {
+        match owner {
+            crate::model::DeferredOwner::Render { armed_seq, .. } => {
+                render.push((*armed_seq, *key))
+            }
+            crate::model::DeferredOwner::Storage { .. } => rest.push(*key),
+        }
+    }
+    render.sort_unstable_by_key(|(seq, _)| *seq);
+    render.into_iter().map(|(_, key)| key).chain(rest).collect()
+}
+
+/// Score a deferred window about to write guest RAM against the guest's fence.
+///
+/// [`crate::runtime::drain::write_stamp`] is the only thing this device says to
+/// the guest about whether work is finished. Once it has moved, the guest is
+/// entitled to free everything it allocated for that work — and the guest's own
+/// allocator is then free to hand those pages to anything, without touching a
+/// page table. So a window armed at stamp N and landed at stamp N+k, k > 0, is a
+/// write to memory the guest was told it could reclaim k fences ago.
+///
+/// [`deferred_pages_still_ours`] cannot see this. It asks whether the GVA still
+/// resolves to the pages the window was armed on, and free-then-reuse inside one
+/// process preserves the translation exactly. That is why the guard landed and
+/// the WindowServer `small_free_list_remove_ptr_no_clear` aborts continued.
+///
+/// The counters carry their own denominator — `gvaw_stamp_same` against
+/// `gvaw_stamp_outlived` in the per-second `store_routes` line.
+///
+/// # Measured, and it is not a tail
+///
+/// One x86/Vulkan boot driving the workload the user's report names (Safari on
+/// three compositing-heavy pages, Finder windows, then 600 s of Mission Control
+/// ×71, Spotlight ×71 and window drags ×142 — every one of them a window-list
+/// capture compositing a backdrop blur, which is the frame the report crashed
+/// in):
+///
+/// ```text
+/// gvaw_stamp_same       0
+/// gvaw_stamp_outlived 810
+/// ```
+///
+/// **Zero.** Not a minority, not a tail: every deferred GVA window that wrote
+/// guest RAM on that boot wrote it after the guest had been fenced. The elapsed
+/// stamp counts say how far after — over 227 latched spans, median 133 fences,
+/// p90 1 099, max 1 601. The guest was told this work had finished 133 times
+/// over before the device put the bytes in its memory.
+///
+/// The trigger breakdown says why: 215 of 227 land under `window_cap`, the
+/// oldest-first eviction that runs when `GVA_DEFERRED_WINDOW_CAP` is reached. So
+/// the rail's normal exit is not a flush anything asked for; it is a window
+/// sitting until the cap pushes it out, hundreds of fences past the point the
+/// guest was free to reclaim it.
+///
+/// And the geometry names the second defect as well as the first. The largest
+/// single population is **64x64, 65 of 227** — a folder icon exactly, the same
+/// geometry the surviving Finder icon class corrupts at. The icons that come out
+/// wrong are the windows written into guest memory long after the guest was told
+/// they were done.
+///
+/// No userspace crash fired during those 600 s, so this boot does not by itself
+/// convict the rail of the WindowServer abort. What it establishes is that the
+/// hazard is not rare, not a corner, and not something a page-set guard can see.
+///
+/// # After the repair, on the same harness
+///
+/// [`flush_gva_windows_before_fence`] inverts it completely:
+///
+/// ```text
+///                      before repair   after repair
+/// gvaw_stamp_same                  0         54 932
+/// gvaw_stamp_outlived            810              0
+/// ```
+///
+/// Every landing is now inside the fence that completes it, and
+/// `gvaw_fence_flush` equals `gva_deferred` exactly — every window armed is a
+/// window landed at the next stamp, which is the whole of the deferral the
+/// contract permits.
+///
+/// The cost was expected to be a frame-rate loss and was the opposite. Same
+/// harness, same 600 s drive, mean over ~510 one-second windows:
+///
+/// ```text
+///                 before repair   after repair
+/// present_hz                5.9            9.5
+/// draw_us              523 895        156 294
+/// ```
+///
+/// Two boots are not a benchmark and load varies, but the direction is not
+/// subtle and it has a mechanism: 215 of 227 landings used to come out under
+/// `window_cap`, so the old rail spent its time in oldest-first eviction storms
+/// while holding residents pinned across hundreds of frames. Landing at the
+/// fence keeps the window set nearly empty and the pin churn with it.
+///
+/// The crash itself is still unscored. `.agents/repros/crash-hunt.sh` has never
+/// fired the abort in either arm, so it gates the census and not the class.
+#[cfg(feature = "backend-vulkan")]
+fn note_window_outlived_its_stamp(
+    state: &DeviceState,
+    gva: u64,
+    entry: &crate::model::GvaDeferredEntry,
+    trigger: &str,
+) {
+    let elapsed = state
+        .completion_stamp_seq
+        .wrapping_sub(entry.armed_stamp_seq);
+    if elapsed == 0 {
+        crate::runtime::drain::note_store_route("gvaw_stamp_same");
+        return;
+    }
+    crate::runtime::drain::note_store_route("gvaw_stamp_outlived");
+    // Identity, latched per span+trigger: the count says how often, and this
+    // says which windows and which door they came through. A rail that only
+    // ever outlives its stamp under one trigger is a different repair from one
+    // that does it everywhere.
+    if crate::observe::first_sight(
+        "gva_window_outlived_stamp",
+        gva ^ ((entry.width as u64) << 32) ^ entry.height as u64,
+    ) {
+        crate::observe::fail(format!(
+            "gva_window_outlived_stamp gva={gva:#x} task={} {}x{} trigger={trigger} \
+             stamps={elapsed} (guest was fenced before these bytes were written)",
+            entry.task_id, entry.width, entry.height
+        ));
+    }
+}
+
+/// Score a deferred **linear compute-storage** landing against the guest's fence.
+///
+/// [`note_window_outlived_its_stamp`] is the same reading for the GVA render
+/// rail, and the hazard is identical because the identity is identical: a
+/// `ComputeStorageResidencyKey::linear` names a task and an address
+/// (`mapping_id` 0, `map_generation` carrying the task id), so nothing the guest
+/// does to reclaim the memory reaches this rail as a notification.
+///
+/// That distinction is why `6bc2220` cleared the other two deferred rails and
+/// cannot clear this one. `flush_render_one` and `flush_storage_one` refuse on
+/// `map_generation` drift, and `map_generation` moves on exactly the events that
+/// let a guest reuse an IOSurface's storage. This rail has no such generation to
+/// compare — [`deferred_pages_still_ours`] is its only guard, and free-then-reuse
+/// inside one process preserves the translation the guard reads.
+///
+/// The rail's own flush already records what that costs when it goes wrong:
+/// a `pmap_page_protect` kernel panic and userspace SIGSEGVs inside libmalloc's
+/// page bookkeeping. What was missing is how often the landing is late at all,
+/// which is what `linw_stamp_same` against `linw_stamp_outlived` says.
+#[cfg(feature = "backend-vulkan")]
+fn note_linear_window_outlived_its_stamp(
+    state: &DeviceState,
+    key: &crate::model::ComputeStorageResidencyKey,
+    window: &crate::model::LinearDeferredEntry,
+) {
+    let elapsed = state
+        .completion_stamp_seq
+        .wrapping_sub(window.armed_stamp_seq);
+    if elapsed == 0 {
+        crate::runtime::drain::note_store_route("linw_stamp_same");
+        return;
+    }
+    crate::runtime::drain::note_store_route("linw_stamp_outlived");
+    if crate::observe::first_sight(
+        "linear_window_outlived_stamp",
+        key.surface_offset ^ ((key.width as u64) << 32) ^ key.height as u64,
+    ) {
+        crate::observe::fail(format!(
+            "linear_window_outlived_stamp task={} ref={} gva={:#x} {}x{} stamps={elapsed} \
+             (guest was fenced before these bytes were written)",
+            key.map_generation, key.texture_ref, key.surface_offset, key.width, key.height
+        ));
+    }
+}
+
+/// Engine-resident identity a deferred GVA window is holding pinned.
+///
+/// Rebuilt from the window's own fields — including the
+/// [`crate::model::GvaDeferredEntry::alloc_gen`] the arming draw resolved —
+/// rather than from a fresh page walk. The window exists because the guest may
+/// hand the address to another allocation before the flush runs; a walk taken
+/// now would name that allocation, the registry lookup would miss the slot this
+/// window pinned, and the deferred frame would be lost instead of landing.
+///
+/// Single spelling for every consumer that starts from a window
+/// ([`flush_gva_one`], `metal_draw::vulkan::supersede_gva_window`,
+/// `metal_draw::vulkan::try_sample_deferred_gva`) so the three cannot drift
+/// apart from the producer or from each other.
+#[cfg(feature = "backend-vulkan")]
+pub fn gva_window_identity(
+    gva: u64,
+    entry: &crate::model::GvaDeferredEntry,
+) -> crate::backend::vulkan::engine::TargetIdentity {
+    crate::backend::vulkan::engine::TargetIdentity::Gva {
+        gva,
+        width: entry.width,
+        height: entry.height,
+        generation: entry.alloc_gen,
+    }
 }
 
 /// Land a taken deferred GVA render-Store window: engine resident target →
@@ -513,14 +1670,8 @@ pub fn flush_gva_one<M: HostMemory + HostOps>(
     guest_write: bool,
     trigger: &str,
 ) -> bool {
-    use crate::backend::vulkan::engine::TargetIdentity;
     let started = std::time::Instant::now();
-    let identity = TargetIdentity::Gva {
-        gva,
-        width: entry.width,
-        height: entry.height,
-        generation: 0,
-    };
+    let identity = gva_window_identity(gva, entry);
     // `into_rgba8` rather than the raw bytes: a GVA resident is RGBA today, so
     // this is a no-op, but the writer below (`write_gva_rgba8`) is declared in
     // semantic RGBA and the readback states its own order. Asserting the order
@@ -539,29 +1690,19 @@ pub fn flush_gva_one<M: HostMemory + HostOps>(
     crate::backend::vulkan::engine::unpin_resident_target(&identity);
     let mut guest = "skip";
     if guest_write {
-        // Reported, not skipped. This used to be `skip_uncovered`, which dropped
-        // the whole deferred window — a full compositing layer — whenever the
-        // guest had not yet notified the allocation, and it fired on live boots
-        // for 240x135 and 320x512 surfaces. `MapMemory2` arrives after the guest
-        // has installed the PTEs and used the memory; see `WriteGate`.
-        crate::runtime::gva_mem::report_undeclared_write(
-            state,
-            host,
-            entry.task_id,
-            gva,
-            entry.span(),
-            "gva_deferred_flush",
-        );
+        note_window_outlived_its_stamp(state, gva, entry, trigger);
     }
-    if guest_write && !window_pages_still_ours(state, host, gva, entry, trigger) {
+    if guest_write && !window_pages_still_ours(state, host, gva, entry, trigger, "guest=refused") {
         // The window's pages moved under us. Cache-only: see
         // `window_pages_still_ours` for why writing here lands in another
-        // owner's memory. This is the check that actually protects the write —
-        // it walks every page of the window against the pages it was armed on,
-        // which no scan of a notification log can substitute for.
+        // owner's memory. This is the REPORT — it walks every page of the window
+        // against the pages it was armed on and names the event with counts a
+        // reader can score. The BOUND is `Some(&entry.pages)` below, which the
+        // writer's own walk enforces; a decision taken before a second walk is
+        // a decision about a page table the bytes do not go through.
         guest = "skip_drift";
     } else if guest_write {
-        guest = match crate::runtime::metal_draw::write_gva_rgba8(
+        guest = match crate::runtime::metal_draw::write_gva_rgba8_within(
             state,
             host,
             entry.task_id,
@@ -571,6 +1712,7 @@ pub fn flush_gva_one<M: HostMemory + HostOps>(
             entry.row_stride,
             entry.format,
             &rgba,
+            Some(&entry.pages),
         ) {
             Ok(()) => "written",
             // The guest already tore this window down and its Unmap notify has
@@ -599,6 +1741,8 @@ pub fn flush_gva_one<M: HostMemory + HostOps>(
     }
     crate::runtime::metal_draw::host_cache_store_gva_layer(
         state,
+        host,
+        entry.task_id,
         entry.texture_ref,
         entry.producer_object_type,
         gva,
@@ -610,7 +1754,10 @@ pub fn flush_gva_one<M: HostMemory + HostOps>(
     // outcomes that are not — a refused write, and a window whose span the guest
     // had already torn down — each emit their own typed line above, so the
     // always-on view keeps the losses and drops the running commentary.
-    crate::runtime::drain::note_drain_phase(crate::runtime::drain::DrainPhase::Flush, started);
+    crate::runtime::drain::note_drain_phase(
+        crate::runtime::drain::DrainPhase::Flush(crate::runtime::drain::FlushRail::Gva),
+        started,
+    );
     crate::observe::line(format!(
         "gva_deferred_flush gva={gva:#x} {}x{} fmt={:#x} guest={guest} trigger={trigger} bytes={} us={}",
         entry.width,
@@ -666,10 +1813,14 @@ pub fn flush_linear_one<M: HostMemory + HostOps>(
     key: &crate::model::ComputeStorageResidencyKey,
     generation: u32,
 ) -> bool {
-    let armed_pages = state.disarm_linear_deferred_window(key);
+    let window = state.disarm_linear_deferred_window(key);
+    let armed_pages = window.as_ref().map(|w| w.pages.clone());
     let task_id = key.map_generation;
     let texture_ref = key.texture_ref;
     let started = std::time::Instant::now();
+    if let Some(window) = window.as_ref() {
+        note_linear_window_outlived_its_stamp(state, key, window);
+    }
     let (bytes, texel) =
         match crate::backend::vulkan::engine::read_resident_storage(key, generation) {
             Ok(v) => v,
@@ -723,6 +1874,7 @@ pub fn flush_linear_one<M: HostMemory + HostOps>(
                 "{}x{} trigger=linear_flush ref={texture_ref}",
                 key.width, key.height
             ),
+            "guest=refused",
         ),
         None => true,
     };
@@ -731,19 +1883,12 @@ pub fn flush_linear_one<M: HostMemory + HostOps>(
     let guest = if !still_ours {
         "skip_drift"
     } else {
-        // `skip_uncovered` used to live on this branch and discarded the whole
-        // linear writeback — up to 1.3 MiB of texture — when the guest had not
-        // yet notified the allocation. Reported and written now; see
-        // `report_undeclared_write`.
-        crate::runtime::gva_mem::report_undeclared_write(
-            state,
-            host,
-            task_id,
-            key.surface_offset,
-            key.span_end,
-            "linear_deferred_flush",
-        );
-        match crate::runtime::compute_exec::write_linear_guest(
+        // Same bound as the GVA rail: the armed page set travels into the
+        // writer's own walk, so the decision `still_ours` reached above cannot be
+        // invalidated by the guest between that walk and this one. `None` here
+        // would be a window with no armed pages, which is a window this rail
+        // never bounded in the first place.
+        match crate::runtime::compute_exec::write_linear_guest_within(
             state,
             host,
             task_id,
@@ -753,6 +1898,7 @@ pub fn flush_linear_one<M: HostMemory + HostOps>(
             key.height,
             &bytes,
             &format!("flush ref={texture_ref}"),
+            armed_pages.as_ref(),
         ) {
             crate::runtime::compute_exec::LinearWrite::Written => "written",
             // Nothing resolves at this GVA, so there is no guest memory to land
@@ -764,7 +1910,10 @@ pub fn flush_linear_one<M: HostMemory + HostOps>(
             crate::runtime::compute_exec::LinearWrite::Failed => "write_fail",
         }
     };
-    crate::runtime::drain::note_drain_phase(crate::runtime::drain::DrainPhase::Flush, started);
+    crate::runtime::drain::note_drain_phase(
+        crate::runtime::drain::DrainPhase::Flush(crate::runtime::drain::FlushRail::Linear),
+        started,
+    );
     crate::observe::off(format!(
         "linear_deferred_flush task={task_id} ref={texture_ref} {}x{} fmt={:#x} gen={generation} guest={guest} bytes={} us={}",
         key.width,
@@ -834,12 +1983,173 @@ fn flush_one<M: HostMemory + HostOps>(
     key: &crate::model::ComputeStorageResidencyKey,
     owner: crate::model::DeferredOwner,
 ) -> bool {
+    note_mapping_window_against_fence(state, key, &owner);
     match owner {
-        crate::model::DeferredOwner::Storage { generation } => {
-            flush_storage_one(state, host, key, generation)
-        }
+        crate::model::DeferredOwner::Storage {
+            generation,
+            armed_stamp_seq: _,
+        } => flush_storage_one(state, host, key, generation),
         crate::model::DeferredOwner::Render { source, .. } => {
             flush_render_one(state, host, key, &source)
+        }
+    }
+}
+
+/// Score a mapping-keyed deferred window against the guest's fence, exactly as
+/// [`note_window_outlived_its_stamp`] scores the GVA rail.
+///
+/// Counted at the flush dispatcher rather than at each writer, so the two rails
+/// share one denominator; whether a landing actually reached guest RAM is what
+/// the existing `deferred_flush_*` lines already say.
+///
+/// # What this counter did NOT settle, and what did
+///
+/// The reading that made this rail worth measuring separately still stands. One
+/// 14-round x86/Vulkan icon boot:
+///
+/// ```text
+/// rendw_stamp_same    0     rendw_stamp_outlived 1088
+/// storw_stamp_same    0     storw_stamp_outlived   24
+/// elapsed over 217 latched spans: min 1, p50 66, p90 2551, max 17086
+/// ```
+///
+/// Read as a counter that looks exactly like the GVA rail's 810-of-810, and it
+/// does not mean the same thing. **The counter is not the hazard.** Outliving
+/// the fence corrupts memory only if the guest can repurpose that memory without
+/// the device finding out, and on these rails it cannot:
+///
+/// - [`flush_render_one`] and [`flush_storage_one`] both compare the mapping's
+///   live `map_generation` against `key.map_generation` and refuse with
+///   `deferred_flush_lost reason=map_generation_drift` before reading anything.
+/// - `map_generation` is bumped by exactly the events that let the guest reuse
+///   an IOSurface's storage — MAP, UNMAP, `ReplacePhysical`, MappingInternal
+///   reattach, any page-table refresh that changes PFNs.
+/// - A `DeleteIOSurfaceBacking2` that has not yet resolved leaves the backing
+///   *condemned*, and [`flush_intersecting`] refuses to take those windows at
+///   all.
+///
+/// So these windows name a specific mapping incarnation, and a guest that frees
+/// the storage invalidates the name. That is precisely the allocation identity
+/// the GVA rail did not have and could not be given: a type-2/3 target is a
+/// texture handle shifted into an address, with no lifecycle notify anywhere in
+/// the wire format, so `deferred_pages_still_ours` was the only guard available
+/// and page identity survives free-then-reuse.
+///
+/// This rail is nonetheless bound to the fence now
+/// ([`flush_mapping_windows_before_fence`]) — for the *other* hazard, which this
+/// counter cannot see and `render_flush_over_guest_write` can: the guest holds
+/// the same IOSurface mapped and writes it, and a full-extent writeback landing
+/// later replaces what it wrote. 8 968 of 12 343 landings on one measured boot.
+/// The free-then-reuse argument above is untouched by that and is still the
+/// reason this rail needed its own evidence instead of the GVA rail's.
+///
+/// These counters stay as the standing check on the `map_generation` guard, and
+/// as the reading of how much deferral the binding actually removed: with the
+/// fence drain wired, `rendw_stamp_same` should carry the traffic and
+/// `rendw_stamp_outlived` should fall to the windows a condemned backing holds.
+fn note_mapping_window_against_fence(
+    state: &DeviceState,
+    key: &crate::model::ComputeStorageResidencyKey,
+    owner: &crate::model::DeferredOwner,
+) {
+    let rail = match owner {
+        crate::model::DeferredOwner::Storage { .. } => "storage",
+        crate::model::DeferredOwner::Render { .. } => "render",
+    };
+    let elapsed = state
+        .completion_stamp_seq
+        .wrapping_sub(owner.armed_stamp_seq());
+    if elapsed == 0 {
+        crate::runtime::drain::note_store_route(match rail {
+            "storage" => "storw_stamp_same",
+            _ => "rendw_stamp_same",
+        });
+        return;
+    }
+    crate::runtime::drain::note_store_route(match rail {
+        "storage" => "storw_stamp_outlived",
+        _ => "rendw_stamp_outlived",
+    });
+    if crate::observe::first_sight(
+        "mapping_window_outlived_stamp",
+        u64::from(key.mapping_id) ^ ((key.width as u64) << 32) ^ key.height as u64,
+    ) {
+        crate::observe::fail(format!(
+            "mapping_window_outlived_stamp rail={rail} mapping={} {}x{} stamps={elapsed} \
+             (guest was fenced before these bytes were written)",
+            key.mapping_id, key.width, key.height
+        ));
+    }
+}
+
+/// Whether the mapping's cached page list still names the guest memory it was
+/// walked from, counted so a boot carries the rate and gated so an arm and its
+/// control stay one binary apart.
+///
+/// The check is [`crate::runtime::mapper::type4_pages_witness`]; this is the
+/// deferred rails' use of it, and it is the missing half of a guarantee the
+/// raw-GVA rails already have. `gva_view::write_span` re-walks the task page
+/// table at write time and fails closed, stating outright that a write through a
+/// cached view "lands in whatever now owns those host pages (guest heap
+/// corruption: the 2026-07-19 WindowServer SIGSEGV class)". The mapping-keyed
+/// rails write through `MappingEntry::page_entries`, which for a type-4 surface
+/// nothing re-walks between the resolve that filled it and the flush that uses
+/// it.
+///
+/// That is the shape of every crash this device is chasing. The user's report is
+/// WindowServer aborting inside `small_free_list_remove_ptr_no_clear` under an
+/// allocation made by `AppleParavirtGPUMetal`, and the guest kernel's own poison
+/// check found freed elements "filled with 0xFF from offset 0" — opaque white
+/// pixels in memory the guest had already reclaimed. The twelve guest panics on
+/// disk hit apfs, airportd, tccd, a HID driver and WindowServer, which is not a
+/// bug in one path but a device writing where it no longer has title.
+///
+/// # Drift refuses this write and stops the list being believed again
+///
+/// Refusing the one window is not enough. The list is what every later reader
+/// and writer of this mapping resolves through, so leaving it in place means the
+/// next flush asks the same question and the next present serves pixels read
+/// through the same wrong pages. `invalidate_mapping_pages` clears it and bumps
+/// `map_generation`, which retires the contiguous view and the guest-write token
+/// with it, and every window still armed against the old incarnation then
+/// refuses on the `map_generation` check it already has.
+///
+/// Self-healing rather than terminal: the next type-4 bind re-resolves the
+/// surface from the object list and adopts a fresh plan, which is the path that
+/// would have discovered this eventually anyway. An actively-drawn surface
+/// recovers on its next bind; an idle one stays unresolvable, which is the
+/// correct state for a mapping this device can no longer name.
+///
+/// Deliberately NOT a forced `resolve_type4_surface` here. That would be the
+/// more informative answer — it re-runs the object search and could say whether
+/// the surface merely moved or is gone — but it goes through `map_surface`,
+/// which clears `has_geom`, the geometry and `surface_content_epoch` before the
+/// adoption restores them. Running that from inside a flush puts a mapping
+/// through a destructive half-state while a writeback is in progress, to answer
+/// a question the next bind answers for free.
+#[cfg(feature = "backend-vulkan")]
+fn mapping_pages_still_ours<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+) -> bool {
+    use crate::runtime::mapper::PagesVerdict;
+    match crate::runtime::mapper::mapping_pages_verdict(state, host, mapping_id) {
+        PagesVerdict::Ours => {
+            crate::runtime::drain::note_store_route("mapping_pages_ours");
+            true
+        }
+        // Lands exactly as `Ours` does; counted apart because it is not the
+        // same claim. `mapping_pages_ours` used to include every flush this
+        // witness had nothing to say about, so the ratio it appeared to give
+        // against `mapping_pages_drifted` was not the guard's hit rate.
+        PagesVerdict::Unwitnessed(_) => {
+            crate::runtime::drain::note_store_route("mapping_pages_unwitnessed");
+            true
+        }
+        PagesVerdict::Drifted => {
+            crate::runtime::drain::note_store_route("mapping_pages_drifted");
+            false
         }
     }
 }
@@ -870,7 +2180,7 @@ fn flush_one<M: HostMemory + HostOps>(
 /// generation drift before it reads anything, so the rebuild is always for the
 /// generation the arm pinned.
 #[cfg(feature = "backend-vulkan")]
-fn render_window_identity(
+pub fn render_window_identity(
     key: &crate::model::ComputeStorageResidencyKey,
 ) -> crate::backend::vulkan::engine::TargetIdentity {
     crate::backend::vulkan::engine::TargetIdentity::Surface {
@@ -879,6 +2189,76 @@ fn render_window_identity(
         height: key.height,
         generation: key.map_generation as u64,
     }
+}
+
+/// Report what a landing window is about to overwrite, and preserve none of it.
+///
+/// A deferred window promises to replay a synchronous Store later, and that is
+/// only a replay while nothing else writes the pages in between. The writeback
+/// covers the whole attachment extent, so a guest CPU store into any page of it
+/// — an inter-buffer damage forward-copy, a CoreGraphics blit into the same
+/// IOSurface — is gone the moment this window lands. Nothing else in the flush
+/// can see that: `map_generation` covers a rebind, `resident_content_epoch`
+/// covers a later device draw, and neither is a witness for the surface's own
+/// owner. One 14-round composite boot measured `render_flush_over_guest_write`
+/// at 68 of every 99 `surface_flush`es.
+///
+/// This rail did preserve those pages, and it must not, because the witness it
+/// would preserve them on cannot answer the question it is being asked.
+///
+/// `page_gen[p]` is stamped with the generation at the *harvest* that saw page
+/// `p` dirty, not at the write. `reims_vgpu_dirty_harvest` returns early when
+/// nothing has read a generation since the last one, and does not clear the
+/// bitmap when it does, so a guest store can sit unharvested across a Store and
+/// be attributed to the generation of a harvest that ran after it. Every such
+/// page is then "written since the Store" when the device's own render
+/// superseded it, and preserving it withholds the frame from guest memory.
+///
+/// Bisected on the live rail, x86 / Vulkan, four `icon-composite` rounds each,
+/// one binary per arm:
+///
+/// ```text
+/// 22a3346  preserve absent   3 of 4 rounds clean, desktop paints
+/// 8178caa  preserve absent   2 of 4 rounds clean, desktop paints
+/// 13ae46d  preserve present  0 of 14 rounds, screen black, 19 Hz
+/// ```
+///
+/// So the answer this rail reaches for is the right one and the evidence it
+/// would reach for it on is not sound. A full-extent landing that reports what
+/// it replaced is strictly better than a partial one that silently withholds the
+/// device's frame.
+///
+/// The ordering repair is what actually removes the loss, and it is upstream of
+/// this question rather than an answer to it:
+/// [`flush_mapping_windows_before_fence`] lands every armed window before the
+/// guest is told the work is done, so the interval in which a guest store can be
+/// both after the Store and before the writeback does not exist. Nothing needs
+/// preserving because nothing is clobbered, and this function becomes the
+/// standing check on that — a `render_flush_over_guest_write` after the binding
+/// names a window that landed outside the fence anyway, which is a defect and
+/// not a cost.
+///
+/// [`crate::runtime::mapping_write::write_bgra8_skipping`] and
+/// `HostOps::guest_written_pages` stay: the sampled ladder's merge uses both,
+/// and it errs the other way — it keeps both halves rather than choosing.
+#[cfg(feature = "backend-vulkan")]
+fn render_flush_guest_written_ranges<M: HostOps>(
+    state: &DeviceState,
+    host: &M,
+    key: &crate::model::ComputeStorageResidencyKey,
+) -> Vec<(u64, u64)> {
+    use crate::runtime::mapper::{mapping_guest_write_verdict, GuestWriteVerdict};
+    if mapping_guest_write_verdict(state, host, key.mapping_id) != GuestWriteVerdict::Wrote {
+        return Vec::new();
+    }
+    crate::runtime::drain::note_store_route("render_flush_over_guest_write");
+    crate::observe::fail(format!(
+        "deferred_flush_clobber kind=render mapping={} {}x{} fmt={:#x} gen={} \
+         (the guest wrote pages of this surface after the Store this window defers; \
+         the full-extent writeback replaces them)",
+        key.mapping_id, key.width, key.height, key.pixel_format, key.map_generation
+    ));
+    Vec::new()
 }
 
 #[cfg(feature = "backend-vulkan")]
@@ -892,13 +2272,35 @@ fn flush_render_one<M: HostMemory + HostOps>(
     // Counted on the same one-line-per-second census as the Store routes, so a
     // boot reads `surface_deferred=N surface_flush=M` on one line.
     //
-    // That ratio is the only thing that separates a deferral from a
-    // rescheduling, and nothing else can report it: a reader draining every
-    // window every frame arms and flushes at identical rates and is
-    // indistinguishable from a working rail by arm count alone. M << N is the
-    // win; M ≈ N means some guest-page reader is asking for these bytes anyway
-    // and the next question is which one.
+    // That ratio used to be the only thing separating a deferral from a
+    // rescheduling: a reader draining every window every frame arms and flushes
+    // at identical rates and is indistinguishable from a working rail by arm
+    // count alone, so M << N was the win and M ≈ N meant some guest-page reader
+    // was asking for these bytes anyway.
+    //
+    // `flush_mapping_windows_before_fence` changes what the ratio means, and a
+    // census read on the old rule would draw the wrong conclusion from it. Every
+    // armed window now lands at the next completion stamp by design, so M ≈ N is
+    // the *intended* state and says nothing about guest-page readers. What the
+    // deferral still buys is coalescing inside one fence — a chain of passes into
+    // one surface, and the supersede of a window a later Store in the same
+    // submission fully covers — so the quantity to read is `surface_resident`
+    // against `surface_flush` in one second, not the lifetime ratio.
     crate::runtime::drain::note_store_route("surface_flush");
+    // Whether this writeback is owed at all, before any question about where it
+    // would land. The guard below asks "are these still our pages"; this asks
+    // the prior question the guest itself answers on every submission — has it
+    // since declared its own bytes newer than the frame this window holds.
+    if crate::runtime::resource_validity::writeback_refused(state, key.mapping_id) {
+        release_window_pin_for_key(key, source);
+        crate::observe::fail(format!(
+            "deferred_flush_lost kind=render mapping={} {}x{} fmt={:#x} gen={} \
+             reason=host_copy_superseded (the guest declared its own pages \
+             authoritative after the Store this window defers)",
+            key.mapping_id, key.width, key.height, key.pixel_format, key.map_generation
+        ));
+        return false;
+    }
     // Recycled-pages guard, identical in intent to the compute rail's below and
     // to the GVA rail's `deferred_pages_still_ours`: a mapping rebound since
     // arm time (ReplacePhysical, unmap/remap) points at pages this window's
@@ -916,8 +2318,33 @@ fn flush_render_one<M: HostMemory + HostOps>(
         // lifetime. That is the "~260 stale residents (~516 MiB)" shape, and this
         // drift is not rare: one in 85 s on a driven boot.
         release_window_pin_for_key(key, source);
+        // Counted, not just logged. The three resident-mismatch refusals below
+        // have carried census routes since they were split apart; these two
+        // drift refusals did not, and they are the ones that lose a painted
+        // tile. `flush_intersecting` has already TAKEN this window out of
+        // `compute_deferred_flush`, and `flush_mapping_windows_before_fence`
+        // returns `()`, so the fence advances and nothing re-arms the
+        // obligation: the pixels land nowhere, permanently.
+        //
+        // That is the Goal 3 event, and until now a census could not count it.
+        // `mapping_pages_drifted` is not a substitute — it is incremented inside
+        // `mapping_pages_still_ours`, which several callers reach, so it counts
+        // refusals rather than lost tiles.
+        crate::runtime::drain::note_store_route("rendflush_gen_drift");
         crate::observe::fail(format!(
             "deferred_flush_lost kind=render mapping={} {}x{} fmt={:#x} gen={} reason=map_generation_drift current={current:?}",
+            key.mapping_id, key.width, key.height, key.pixel_format, key.map_generation
+        ));
+        return false;
+    }
+    // `map_generation` is the guest's *declared* incarnation, and a type-4
+    // surface can be re-pointed with nothing declared at all. See
+    // `mapping_pages_still_ours`.
+    if !mapping_pages_still_ours(state, host, key.mapping_id) {
+        release_window_pin_for_key(key, source);
+        crate::runtime::drain::note_store_route("rendflush_page_drift");
+        crate::observe::fail(format!(
+            "deferred_flush_lost kind=render mapping={} {}x{} fmt={:#x} gen={} reason=mapping_page_drift",
             key.mapping_id, key.width, key.height, key.pixel_format, key.map_generation
         ));
         return false;
@@ -944,32 +2371,135 @@ fn flush_render_one<M: HostMemory + HostOps>(
     // Set when the frame below came *out of* a resident image, so the write can
     // hand the currency witness back to it. See the re-stamp after the write.
     let mut flushed_from_resident: Option<crate::backend::vulkan::engine::TargetIdentity> = None;
-    let frame: std::borrow::Cow<'_, [u8]> = match source {
-        crate::model::RenderWindowSource::Owned(bytes) => {
-            std::borrow::Cow::Borrowed(bytes.as_slice())
-        }
+    // Land anything already armed over these pages *before* the frame is
+    // acquired, not inside the write that follows.
+    //
+    // `write_bgra8_*` makes this call itself, and for the copying arms that is
+    // where it belongs. The leased arm cannot afford it there: its frame is
+    // borrowed from the engine's readback buffer, and a flush reached from
+    // inside the write would read another resident — re-entering the engine
+    // under a live lease, which is the one thing a holder may not do. Running it
+    // here leaves the writer's own call nothing to find, because the only thing
+    // that arms a window is a guest Store and no guest command is decoded inside
+    // a writeback.
+    //
+    // Unconditional rather than gated on the arm taken below, so both arms reach
+    // the write through the same state. A no-op on all but the rare mapping
+    // carrying a second window.
+    crate::runtime::mapping_write::flush_windows_under_bgra8_write(
+        state,
+        host,
+        key.mapping_id,
+        key.width,
+        key.height,
+    );
+    // Owned rather than borrowed, and shared rather than owned outright: the
+    // writeback's tail publishes this frame to the surface cache, and a cache
+    // entry stores its frame behind an `Arc` precisely so that it and a window
+    // can name one allocation. Handing the frame down as an `Arc` therefore ends
+    // in one `Arc` clone where a borrow ended in a whole-frame copy — 1.21 ms of
+    // memcpy per flush on the composite, about 100 times a second. `Owned`
+    // already has one to clone.
+    //
+    // `Resident` does not go that way any more. It reads the resident back and
+    // then *borrows* the staging buffer the readback landed in, because it has
+    // no use for the frame after the scatter: owning it means one whole-frame
+    // memcpy (`readback_split map_us`, ~0.82 ms of a 6.9 ms flush) whose only
+    // consumer beyond the scatter is the host surface cache, and
+    // `render_flush_cache_used` prices that consumer at 0.4 %. See
+    // [`crate::backend::vulkan::engine::LeasedFrame`] for what the borrow costs
+    // and [`crate::runtime::mapping_write::write_bgra8_uncached`] for what
+    // happens to the cache entry instead.
+    let frame: FlushFrame = match source {
+        crate::model::RenderWindowSource::Owned(bytes) => FlushFrame::Owned(bytes.clone()),
         crate::model::RenderWindowSource::Resident { epoch } => {
+            use crate::backend::vulkan::engine::ResidentContent;
+            // The close of the interval `note_resident_window_armed` opened at
+            // the Store. Taken before the epoch check, not after: a window that
+            // the check refuses still consumed the arm, and leaving it counted
+            // would make every later flush look like it had two outstanding.
+            crate::runtime::drain::note_resident_window_flushed();
             let identity = render_window_identity(key);
-            let live = crate::backend::vulkan::engine::resident_content_epoch(&identity);
-            if live != Some(*epoch) {
+            // Three outcomes, not two, and the third used to hide inside the
+            // second. `resident_content_epoch` answers `None` both for a slot a
+            // later draw un-stamped — expected traffic, the newer pass owns the
+            // surface now — and for a slot that is not there at all, which
+            // cannot happen to a pinned identity unless the arm and the flush
+            // spell that identity differently. One measured boot lost ~150
+            // frames here, `live=None` on every one of them, and nothing in the
+            // log could say which kind they were. See `engine::ResidentContent`.
+            let live = crate::backend::vulkan::engine::resident_content_state(&identity);
+            if live != ResidentContent::Epoch(*epoch) {
                 crate::backend::vulkan::engine::unpin_resident_target(&identity);
+                let (reason, route) = match live {
+                    ResidentContent::Absent => (
+                        "resident_absent (a pinned slot cannot be evicted, so the arm \
+                         and the flush name this target differently)",
+                        "rendflush_resident_absent",
+                    ),
+                    ResidentContent::Unstamped => (
+                        "resident_epoch_cleared (a draw landed on this surface after \
+                         the Store this window defers)",
+                        "rendflush_epoch_cleared",
+                    ),
+                    ResidentContent::Epoch(_) => ("resident_epoch_drift", "rendflush_epoch_drift"),
+                };
+                crate::runtime::drain::note_store_route(route);
                 crate::observe::fail(format!(
                     "deferred_flush_lost kind=render mapping={} {}x{} fmt={:#x} gen={} \
-                     reason=resident_epoch_drift want={epoch} live={live:?}",
+                     reason={reason} want={epoch} live={live:?}",
                     key.mapping_id, key.width, key.height, key.pixel_format, key.map_generation
                 ));
                 return false;
             }
-            match crate::backend::vulkan::engine::read_target(&identity) {
-                Ok(rb) => {
+            // Borrow first, and only where the borrow needs no transformation.
+            //
+            // The writer below is declared in guest scanout order, so a resident
+            // reporting semantic RGBA8 owes an R/B exchange before its bytes can
+            // land — which is a whole-frame pass, and a pass over the staging
+            // buffer at that. `into_bgra8` on an owned copy is the existing home
+            // for it, so a non-BGRA resident takes the copying arm rather than
+            // teaching the lease to rewrite memory it does not own. A `Surface`
+            // resident is BGRA and that is the composite rail this rail's cost
+            // lives on; reading the reported order rather than asserting one is
+            // what keeps a future format change from landing R and B exchanged
+            // in guest memory.
+            match crate::backend::vulkan::engine::read_target_leased(&identity) {
+                Ok(Some(leased)) if leased.bgra => {
                     crate::backend::vulkan::engine::unpin_resident_target(&identity);
                     flushed_from_resident = Some(identity);
-                    // `into_bgra8`, not the raw bytes: a `Surface` resident is BGRA
-                    // so this is a no-op, and the writer below is declared in
-                    // scanout order. Reading the reported order rather than
-                    // asserting one is what keeps a future format change from
-                    // landing R and B exchanged in guest memory.
-                    std::borrow::Cow::Owned(rb.into_bgra8())
+                    crate::runtime::drain::note_store_route("render_flush_leased");
+                    FlushFrame::Leased(leased)
+                }
+                // Either the pool declined the lease (uncached readback memory,
+                // where reading the mapping in place is the *slower* shape) or
+                // the resident is not in scanout order. Both take the copy, and
+                // the leased frame — if there is one — is dropped first so its
+                // slot is back in the pool before the second readback asks for
+                // one.
+                Ok(leased) => {
+                    drop(leased);
+                    crate::runtime::drain::note_store_route("render_flush_copied");
+                    match crate::backend::vulkan::engine::read_target(&identity) {
+                        Ok(rb) => {
+                            crate::backend::vulkan::engine::unpin_resident_target(&identity);
+                            flushed_from_resident = Some(identity);
+                            FlushFrame::Owned(std::sync::Arc::new(rb.into_bgra8()))
+                        }
+                        Err(e) => {
+                            crate::backend::vulkan::engine::unpin_resident_target(&identity);
+                            crate::observe::fail(format!(
+                                "deferred_flush_lost kind=render mapping={} {}x{} fmt={:#x} \
+                                 gen={} reason=resident_read err={e}",
+                                key.mapping_id,
+                                key.width,
+                                key.height,
+                                key.pixel_format,
+                                key.map_generation
+                            ));
+                            return false;
+                        }
+                    }
                 }
                 Err(e) => {
                     crate::backend::vulkan::engine::unpin_resident_target(&identity);
@@ -983,16 +2513,46 @@ fn flush_render_one<M: HostMemory + HostOps>(
             }
         }
     };
-    let bgra: &[u8] = frame.as_ref();
-    let ok = crate::runtime::mapping_write::write_bgra8(
-        state,
-        host,
-        key.mapping_id,
-        bgra,
-        key.width.saturating_mul(4),
-        key.width,
-        key.height,
+    let preserve = render_flush_guest_written_ranges(state, host, key);
+    let write_started = std::time::Instant::now();
+    let ok = match &frame {
+        FlushFrame::Owned(bytes) => crate::runtime::mapping_write::write_bgra8_owned(
+            state,
+            host,
+            key.mapping_id,
+            bytes,
+            key.width.saturating_mul(4),
+            key.width,
+            key.height,
+            &preserve,
+        ),
+        FlushFrame::Leased(leased) => crate::runtime::mapping_write::write_bgra8_uncached(
+            state,
+            host,
+            key.mapping_id,
+            leased.bytes(),
+            key.width.saturating_mul(4),
+            key.width,
+            key.height,
+            &preserve,
+        ),
+    };
+    crate::runtime::drain::note_readback_phase(
+        crate::runtime::drain::ReadbackPhase::Write,
+        write_started.elapsed().as_micros() as u64,
     );
+    // Whether this flush left a host surface cache copy behind, which decides
+    // whether the witness has a cache leg to score at all. Two writebacks leave
+    // none: a borrowed frame drops the entry because the memory holding it goes
+    // back to the pool, and a skipping write drops it because the guest's own
+    // stores are in the pages and no host-side copy is their content any more.
+    let cache_stored = matches!(&frame, FlushFrame::Owned(_)) && preserve.is_empty();
+    // End the lease before anything below reaches the engine again — the
+    // resident re-stamp does. A holder that blocks on the engine lock while a
+    // teardown is waiting for exactly this lease is the deadlock `LeasedFrame`
+    // forbids, and the frame has no reader left after the write in any case.
+    let frame_len = frame.len();
+    drop(frame);
     if !ok {
         crate::observe::fail(format!(
             "deferred_flush_lost kind=render mapping={} {}x{} fmt={:#x} gen={} reason=write_refused",
@@ -1028,8 +2588,14 @@ fn flush_render_one<M: HostMemory + HostOps>(
                 crate::backend::vulkan::engine::stamp_resident_content_epoch(&identity, epoch);
             }
         }
+        // Every copy this flush just made is unread until something reads it;
+        // whatever was left of the previous flush's is scored now.
+        let _ = note_render_flush_landed(state, key.mapping_id, cache_stored);
     }
-    crate::runtime::drain::note_drain_phase(crate::runtime::drain::DrainPhase::Flush, started);
+    crate::runtime::drain::note_drain_phase(
+        crate::runtime::drain::DrainPhase::Flush(crate::runtime::drain::FlushRail::Render),
+        started,
+    );
     crate::observe::line(format!(
         "render_deferred_flush mapping={} {}x{} fmt={:#x} ok={} bytes={} us={}",
         key.mapping_id,
@@ -1037,10 +2603,33 @@ fn flush_render_one<M: HostMemory + HostOps>(
         key.height,
         key.pixel_format,
         ok as u8,
-        bgra.len(),
+        frame_len,
         started.elapsed().as_micros()
     ));
     ok
+}
+
+/// Where a landing render window's frame lives while it is being written.
+///
+/// The two differ in what the writeback may leave behind. `Owned` names an
+/// allocation that outlives the flush, so the host surface cache can hold it for
+/// a refcount; `Leased` names the engine's readback staging buffer, which goes
+/// back to the pool a moment later and therefore cannot be what a cache entry
+/// points at. See [`crate::runtime::mapping_write::write_bgra8_uncached`].
+#[cfg(feature = "backend-vulkan")]
+enum FlushFrame {
+    Owned(std::sync::Arc<Vec<u8>>),
+    Leased(crate::backend::vulkan::engine::LeasedFrame),
+}
+
+#[cfg(feature = "backend-vulkan")]
+impl FlushFrame {
+    fn len(&self) -> usize {
+        match self {
+            FlushFrame::Owned(bytes) => bytes.len(),
+            FlushFrame::Leased(leased) => leased.bytes().len(),
+        }
+    }
 }
 
 #[cfg(not(feature = "backend-vulkan"))]
@@ -1048,7 +2637,7 @@ fn flush_render_one<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     _host: &mut M,
     key: &crate::model::ComputeStorageResidencyKey,
-    _bgra: &[u8],
+    _source: &crate::model::RenderWindowSource,
 ) -> bool {
     // No engine ⇒ nothing can have deferred; drop the obligation fail-visibly.
     let _ = state;
@@ -1080,6 +2669,17 @@ fn flush_storage_one<M: HostMemory + HostOps>(
     // Same recycled-pages guard as the render flush: a surface window whose
     // defer-time map_generation no longer matches must not write through the
     // rewired pages.
+    // Same prior question as the render rail: is this writeback owed at all.
+    if crate::runtime::resource_validity::writeback_refused(state, key.mapping_id) {
+        crate::backend::vulkan::engine::unpin_resident_storage(key);
+        crate::observe::fail(format!(
+            "deferred_flush_lost kind=compute mapping={} {}x{} fmt={:#x} gen={} \
+             content_gen={generation} reason=host_copy_superseded (the guest declared \
+             its own pages authoritative after the dispatch this window defers)",
+            key.mapping_id, key.width, key.height, key.pixel_format, key.map_generation
+        ));
+        return false;
+    }
     let current = state
         .mappings
         .get(&key.mapping_id)
@@ -1088,6 +2688,14 @@ fn flush_storage_one<M: HostMemory + HostOps>(
         crate::backend::vulkan::engine::unpin_resident_storage(key);
         crate::observe::fail(format!(
             "deferred_flush_lost kind=compute mapping={} {}x{} fmt={:#x} gen={} content_gen={generation} reason=map_generation_drift current={current:?}",
+            key.mapping_id, key.width, key.height, key.pixel_format, key.map_generation
+        ));
+        return false;
+    }
+    if !mapping_pages_still_ours(state, host, key.mapping_id) {
+        crate::backend::vulkan::engine::unpin_resident_storage(key);
+        crate::observe::fail(format!(
+            "deferred_flush_lost kind=compute mapping={} {}x{} fmt={:#x} gen={} content_gen={generation} reason=mapping_page_drift",
             key.mapping_id, key.width, key.height, key.pixel_format, key.map_generation
         ));
         return false;
@@ -1119,16 +2727,6 @@ fn flush_storage_one<M: HostMemory + HostOps>(
         return false;
     }
     let tight = key.width.saturating_mul(texel);
-    if crate::observe::content_probe_enabled() {
-        crate::observe::off(format!(
-            "compute_content stage=flush_out mapping={} {}x{} fmt={:#x} gen={generation} {}",
-            key.mapping_id,
-            key.width,
-            key.height,
-            key.pixel_format,
-            crate::observe::content_summary(&bytes, texel, key.width, key.height),
-        ));
-    }
     if !crate::runtime::mapping_write::write_full_rect_raw_at(
         state,
         host,
@@ -1157,7 +2755,10 @@ fn flush_storage_one<M: HostMemory + HostOps>(
     // re-establish the mirror entry the write's own invalidation dropped so
     // chained seed skips stay live.
     state.compute_storage_residency.insert(*key, generation);
-    crate::runtime::drain::note_drain_phase(crate::runtime::drain::DrainPhase::Flush, started);
+    crate::runtime::drain::note_drain_phase(
+        crate::runtime::drain::DrainPhase::Flush(crate::runtime::drain::FlushRail::Storage),
+        started,
+    );
     crate::observe::off(format!(
         "compute_deferred_flush mapping={} {}x{} fmt={:#x} gen={generation} bytes={} us={}",
         key.mapping_id,
@@ -1322,6 +2923,162 @@ pub(crate) fn owner_slug(owner: &crate::model::DeferredOwner) -> &'static str {
     }
 }
 
+#[cfg(all(test, feature = "backend-vulkan"))]
+mod render_flush_witness_tests {
+    use super::{
+        note_render_flush_cache_read, note_render_flush_landed, note_render_flush_pages_read,
+    };
+    use crate::model::{DeviceId, DeviceState, MappingEntry, PAGE_SHIFT_X86};
+
+    fn state_with_mapping(mid: u32) -> DeviceState {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        state.mappings.insert(
+            mid,
+            MappingEntry {
+                mapped: true,
+                ..Default::default()
+            },
+        );
+        state
+    }
+
+    /// Nothing to score on the first landing: a surface that has only just
+    /// arrived has no previous flush whose copies anything could have read.
+    #[test]
+    fn the_first_landing_of_a_mapping_scores_nothing() {
+        let mut state = state_with_mapping(7);
+        assert_eq!(note_render_flush_landed(&mut state, 7, true), None);
+        let w = state.mappings[&7].render_flush;
+        assert_eq!(
+            (w.landed, w.cache_unread, w.pages_unread),
+            (true, true, true)
+        );
+    }
+
+    /// The age is stamped from the landing, not left at the `Default` zero: a
+    /// zero stamp would score every second landing as a frame-plus survivor and
+    /// hide exactly the burst case the bucket exists to find.
+    #[test]
+    fn a_landing_stamps_the_time_it_landed() {
+        let mut state = state_with_mapping(7);
+        note_render_flush_landed(&mut state, 7, true);
+        let first = state.mappings[&7].render_flush.landed_us;
+        assert!(first > 0, "landing must stamp a live clock reading");
+        note_render_flush_landed(&mut state, 7, true);
+        assert!(
+            state.mappings[&7].render_flush.landed_us >= first,
+            "each landing re-stamps"
+        );
+    }
+
+    /// The whole point of the witness: a flush neither leg was read from is
+    /// reported as unread, which is what says the readback bought nothing.
+    #[test]
+    fn a_landing_nothing_read_scores_both_legs_unread() {
+        let mut state = state_with_mapping(7);
+        note_render_flush_landed(&mut state, 7, true);
+        let scored = note_render_flush_landed(&mut state, 7, true).expect("second landing scores");
+        assert!(scored.cache_unread && scored.pages_unread);
+    }
+
+    /// Each reader clears only the copy it took. A cache hit must not excuse
+    /// the guest-page write, or a flush whose pages nothing reads would be
+    /// scored as consumed and the write leg would look owed when it is not.
+    #[test]
+    fn each_leg_is_cleared_only_by_its_own_reader() {
+        let mut state = state_with_mapping(7);
+        note_render_flush_landed(&mut state, 7, true);
+        note_render_flush_cache_read(&mut state, 7);
+        let scored = note_render_flush_landed(&mut state, 7, true).expect("second landing scores");
+        assert!(!scored.cache_unread, "cache read must clear the cache leg");
+        assert!(scored.pages_unread, "cache read must not clear the pages leg");
+
+        note_render_flush_pages_read(&mut state, 7);
+        let scored = note_render_flush_landed(&mut state, 7, true).expect("third landing scores");
+        assert!(!scored.pages_unread, "pages read must clear the pages leg");
+        assert!(scored.cache_unread, "pages read must not clear the cache leg");
+    }
+
+    /// A flush that stored no cache copy has no cache leg to score.
+    ///
+    /// `render_flush_cache_unread` is the number a future reader would use to
+    /// decide whether the cache leg is worth keeping, and a borrowed-frame flush
+    /// stores nothing — it drops the entry, because the memory holding its frame
+    /// goes straight back to the readback pool. Arming the leg anyway would
+    /// report a copy that was never made, once per flush, at the rate the guest
+    /// paints: a counter that looks like a measurement and is an artefact.
+    ///
+    /// The pages leg is asserted alongside it, because it is the one that stays
+    /// meaningful and the two must not be conflated.
+    #[test]
+    fn a_flush_that_stored_no_cache_copy_arms_no_cache_leg() {
+        let mut state = state_with_mapping(7);
+        note_render_flush_landed(&mut state, 7, false);
+        let w = state.mappings[&7].render_flush;
+        assert!(!w.cache_stored, "no copy was stored");
+        assert!(
+            !w.cache_unread,
+            "an absent copy must not be armed as an unread one"
+        );
+        assert!(w.pages_unread, "the guest pages were still written");
+
+        // And the scoring of the previous landing skips the leg rather than
+        // reporting it either way.
+        let scored = note_render_flush_landed(&mut state, 7, true).expect("second landing scores");
+        assert!(!scored.cache_stored);
+
+        // A stored copy still scores normally, so the gate narrows the count
+        // rather than silencing it.
+        note_render_flush_cache_read(&mut state, 7);
+        let scored = note_render_flush_landed(&mut state, 7, true).expect("third landing scores");
+        assert!(scored.cache_stored && !scored.cache_unread);
+    }
+
+    /// A read attributed to a mapping the mapper no longer holds is dropped
+    /// rather than resurrecting an entry: the cache outlives its mapping, so a
+    /// late read of a stale entry must not create mapping state.
+    #[test]
+    fn a_read_of_an_unknown_mapping_creates_nothing() {
+        let mut state = state_with_mapping(7);
+        note_render_flush_cache_read(&mut state, 9);
+        note_render_flush_pages_read(&mut state, 9);
+        assert!(!state.mappings.contains_key(&9));
+        assert_eq!(note_render_flush_landed(&mut state, 9, true), None);
+    }
+}
+
+#[cfg(test)]
+mod counterfactual_tests {
+    use super::counterfactual_requested;
+    use std::ffi::OsStr;
+
+    /// Unset is off. This is the only reading that matters for every boot that
+    /// is not the experiment, and the experiment breaks guest correctness.
+    #[test]
+    fn an_unset_variable_leaves_the_rail_alone() {
+        assert!(!counterfactual_requested(None));
+    }
+
+    /// Exactly `1` turns it on.
+    #[test]
+    fn the_documented_value_turns_it_on() {
+        assert!(counterfactual_requested(Some(OsStr::new("1"))));
+    }
+
+    /// Every other value is off, `0` and `false` most of all. A switch that
+    /// read "set at all" would run the incorrect build for anyone who exported
+    /// the variable in order to disable it.
+    #[test]
+    fn every_other_value_including_the_off_spellings_is_off() {
+        for value in ["", "0", "false", "no", "off", "2", "yes", "true", " 1"] {
+            assert!(
+                !counterfactual_requested(Some(OsStr::new(value))),
+                "{value:?} must not arm the counterfactual"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::model::{ComputeStorageResidencyKey, DeviceId, DeviceState, PAGE_SHIFT_X86};
@@ -1345,6 +3102,7 @@ mod tests {
     fn render_owner(armed_seq: u64) -> crate::model::DeferredOwner {
         crate::model::DeferredOwner::Render {
             armed_seq,
+            armed_stamp_seq: 0,
             source: crate::model::RenderWindowSource::Owned(std::sync::Arc::new(vec![
                 0u8;
                 4 * 4 * 4
@@ -1443,7 +3201,10 @@ mod tests {
         m.map_generation = 5;
         state.compute_deferred_flush.insert(
             key(9, 0, 256),
-            crate::model::DeferredOwner::Storage { generation: 3 },
+            crate::model::DeferredOwner::Storage {
+                generation: 3,
+                armed_stamp_seq: 0,
+            },
         );
         let cap = crate::observe::FailCapture::start();
         assert!(!super::flush_intersecting(
@@ -1502,6 +3263,9 @@ mod tests {
         state
             .compute_deferred_flush
             .insert(key(9, 0, 256), render_owner(1));
+        // Route counts are process-global and this suite runs serially, so take
+        // a baseline rather than assuming this is the first window to drift.
+        let before_gen_drift = crate::runtime::drain::store_route_count("rendflush_gen_drift");
         let cap = crate::observe::FailCapture::start();
         assert!(
             !super::flush_intersecting(&mut state, &mut host, 9, 0, u64::MAX),
@@ -1520,6 +3284,159 @@ mod tests {
             state.compute_deferred_flush.is_empty(),
             "the trigger must consume the window it took"
         );
+        // A lost tile has to be countable, not just loggable. The window is gone
+        // from `compute_deferred_flush` (asserted just above) and nothing
+        // re-arms it, so this is a permanent loss of painted pixels — the Goal 3
+        // event — and a census that cannot count it cannot score an arm against
+        // it.
+        //
+        // `mapping_pages_drifted` is not a substitute: it is incremented inside
+        // `mapping_pages_still_ours`, which more than one caller reaches, so it
+        // counts refusals rather than lost tiles.
+        assert_eq!(
+            crate::runtime::drain::store_route_count("rendflush_gen_drift"),
+            before_gen_drift + 1,
+            "the generation-drift loss must be counted on the store-route census"
+        );
+    }
+
+    /// The other drift refusal, and the one a live boot actually takes.
+    ///
+    /// `map_generation` drift is the guest's *declared* rebind; page drift is a
+    /// type-4 surface re-pointed with nothing declared, which is the shape
+    /// traced end to end on a control boot — a 1225x512 WebKit tile whose
+    /// backing was fabricated at its own GVA, then refused when the live walk
+    /// disagreed. Both refusals are correct and both lose the tile, so both have
+    /// to be countable apart; testing only the sibling would leave the branch a
+    /// live boot exercises uncovered.
+    #[test]
+    fn a_render_window_over_repointed_pages_is_refused_and_counted() {
+        use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+        use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+        use crate::model::Type4Walk;
+        use crate::runtime::host::{FakeHost, HostMemory};
+
+        const BACKING_PFN: u32 = 9;
+        let page = 1u64 << PAGE_SHIFT_X86;
+        let mut host = FakeHost::new();
+        let dir_gpa = 2u64 << PAGE_SHIFT_X86;
+        let root_gpa = 3u64 << PAGE_SHIFT_X86;
+        let data0 = 4u64 << PAGE_SHIFT_X86;
+        for gpa in [dir_gpa, root_gpa, data0] {
+            host.map_range(gpa, page as usize, 0);
+        }
+        let st32 = |b: &mut [u8], v: u32| b[..4].copy_from_slice(&v.to_le_bytes());
+        let mut d = [0u8; 8];
+        st32(&mut d[DIRECTORY_ROOT_PFN as usize..], 3);
+        st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
+        host.write_gpa(dir_gpa, &d).unwrap();
+        // Depth-1 table: the live translation of GVA page 9 is `data0`.
+        let mut pte = [0u8; 4];
+        st32(&mut pte, (data0 >> PAGE_SHIFT_X86) as u32);
+        host.write_gpa(root_gpa + u64::from(BACKING_PFN) * 4, &pte)
+            .unwrap();
+
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        assert!(state.define_task(1, page, 2));
+        {
+            let m = state.mappings.entry(9).or_default();
+            m.mapped = true;
+            // The generation still matches the window's, so this test cannot
+            // pass through the sibling's branch: the only thing wrong is where
+            // the cached entry points.
+            m.map_generation = 1;
+            m.page_entries = vec![(0x77u32 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+            m.type4_walk = Some(Type4Walk {
+                task_id: 1,
+                backing_pfn: BACKING_PFN,
+                map_generation: 1,
+            });
+        }
+        state
+            .compute_deferred_flush
+            .insert(key(9, 0, 256), render_owner(1));
+        let before = crate::runtime::drain::store_route_count("rendflush_page_drift");
+        let cap = crate::observe::FailCapture::start();
+        assert!(
+            !super::flush_intersecting(&mut state, &mut host, 9, 0, u64::MAX),
+            "a window whose pages moved must report the loss"
+        );
+        let line = cap.one("deferred_flush_lost");
+        assert!(
+            line.contains("kind=render") && line.contains("reason=mapping_page_drift"),
+            "the re-pointed pages must be the stated refusal, not the generation: {line}"
+        );
+        assert!(
+            state.compute_deferred_flush.is_empty(),
+            "the trigger consumes the window it took, so the obligation is gone"
+        );
+        assert_eq!(
+            crate::runtime::drain::store_route_count("rendflush_page_drift"),
+            before + 1,
+            "the page-drift loss must be counted on the store-route census"
+        );
+    }
+
+    /// A window landing over pages the guest wrote preserves nothing and says
+    /// so; one landing over untouched pages preserves nothing and stays quiet.
+    ///
+    /// Both halves are the test. The report has to be keyed on the guest write
+    /// and not on the landing — the writeback runs on every landing and the
+    /// interesting population is the subset the guest also wrote — so the
+    /// untouched arm is what makes the reporting arm mean anything.
+    ///
+    /// This test asserted the opposite of its first half until the rail was
+    /// bisected on live boots: the preserving behaviour turned the screen black
+    /// (0 of 14 rounds, against 3 of 4 and 2 of 4 clean on the two commits
+    /// before it), because `page_gen` is stamped at the harvest and not at the
+    /// write, so a store the device's own render superseded can still be named
+    /// "written since the Store". See
+    /// [`super::render_flush_guest_written_ranges`].
+    #[cfg(feature = "backend-vulkan")]
+    #[test]
+    fn a_render_window_landing_over_guest_writes_reports_them_and_preserves_nothing() {
+        use crate::runtime::host::{FakeHost, HostOps};
+        let page = 1u64 << PAGE_SHIFT_X86;
+        for guest_wrote in [false, true] {
+            let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+            let mut host = FakeHost::new();
+            let token = host
+                .track_guest_writes(&[page], 1usize << PAGE_SHIFT_X86)
+                .unwrap();
+            let stamped = host.guest_write_gen(token).unwrap();
+            let m = state.mappings.entry(9).or_default();
+            m.mapped = true;
+            m.map_generation = 1;
+            // The one tracked page IS this surface's page 0, so the report the
+            // host gives back has somewhere in the mapping to land.
+            let pfn = (page >> PAGE_SHIFT_X86) as u32;
+            m.page_entries = vec![
+                (pfn << crate::contract::iosurface_pages::PAGE_ENTRY_PFN_SHIFT)
+                    | crate::contract::iosurface_pages::PAGE_ENTRY_VALID,
+            ];
+            m.guest_write_token = token;
+            m.guest_write_token_gen = 1;
+            m.guest_write_gen_at_store = stamped;
+            if guest_wrote {
+                host.guest_wrote_page(page);
+            }
+            let cap = crate::observe::FailCapture::start();
+            let preserve = super::render_flush_guest_written_ranges(&state, &host, &key(9, 0, 256));
+            let clobbers: Vec<String> = cap
+                .lines()
+                .into_iter()
+                .filter(|l| l.split_whitespace().next() == Some("deferred_flush_clobber"))
+                .collect();
+            assert!(
+                preserve.is_empty(),
+                "guest_wrote={guest_wrote}: the landing writes its whole extent, always"
+            );
+            assert_eq!(
+                clobbers.len(),
+                usize::from(guest_wrote),
+                "guest_wrote={guest_wrote} must decide whether the loss is reported: {clobbers:?}"
+            );
+        }
     }
 
     /// A `Resident` window whose resident no longer vouches for the frame
@@ -1534,11 +3451,16 @@ mod tests {
     /// writing then lands that other layer's pixels in these pages, which is the
     /// black/torn-layer class rather than a merely stale frame.
     ///
-    /// No engine is initialized here, so `resident_content_epoch` answers `None`
-    /// for the reconstructed identity, which is the same reading an evicted slot
-    /// produces and the one this arm must fail closed on. The assertion that
-    /// matters is the *guest memory*: a decline that still wrote would pass a
-    /// log-only check.
+    /// No engine is initialized here, so the registry has no slot at the
+    /// reconstructed identity at all, and the refusal this asserts is therefore
+    /// `resident_absent` rather than `resident_epoch_cleared`. Those two used to
+    /// be one `reason=resident_epoch_drift` with `live=None`, and separating
+    /// them is what `engine::ResidentContent` exists for: an un-stamped slot is
+    /// expected traffic, a missing one cannot happen to a pinned identity and
+    /// means the arm and the flush name the target differently.
+    ///
+    /// The assertion that matters either way is the *guest memory*: a decline
+    /// that still wrote would pass a log-only check.
     #[test]
     fn a_resident_window_that_cannot_be_vouched_for_declines_without_writing() {
         use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
@@ -1568,6 +3490,7 @@ mod tests {
             key(9, 0, 256),
             crate::model::DeferredOwner::Render {
                 armed_seq: 1,
+                armed_stamp_seq: 0,
                 source: crate::model::RenderWindowSource::Resident { epoch: 7 },
             },
         );
@@ -1579,9 +3502,10 @@ mod tests {
         let line = cap.one("deferred_flush_lost");
         assert!(
             line.contains("kind=render")
-                && line.contains("reason=resident_epoch_drift")
+                && line.contains("reason=resident_absent")
                 && line.contains("want=7"),
-            "the epoch witness must be the stated refusal, with the value it wanted: {line}"
+            "the epoch witness must be the stated refusal, naming which kind of \
+             absence it was and the value it wanted: {line}"
         );
         let mut after = [0u8; 256];
         host.read_gpa(gpa, &mut after).unwrap();
@@ -1606,6 +3530,7 @@ mod tests {
     /// key. If those two spellings ever disagree the pin protects one image while
     /// the flush reads another: the frame is silently the wrong one, and no
     /// assertion in the crate is watching for it because both lookups *succeed*.
+    #[cfg(feature = "backend-vulkan")]
     #[test]
     fn a_render_windows_key_rebuilds_the_identity_the_draw_rendered_into() {
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
@@ -1660,6 +3585,7 @@ mod tests {
             key(9, 0, 256),
             crate::model::DeferredOwner::Render {
                 armed_seq: 1,
+                armed_stamp_seq: 0,
                 source: crate::model::RenderWindowSource::Owned(std::sync::Arc::new(frame.clone())),
             },
         );
@@ -1717,6 +3643,7 @@ mod tests {
     /// entry with a bare `remove` leaves `deferred_alias_pages` holding page
     /// refs for a mapping with no windows left, and the raw-GVA sampling guard
     /// then walks pages nothing defers on.
+    #[cfg(feature = "backend-vulkan")]
     #[test]
     fn a_superseded_render_window_is_dropped_and_releases_its_alias_pages() {
         use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
@@ -1760,6 +3687,7 @@ mod tests {
     /// the release named: it has to be rebuilt from the superseded window's own
     /// key, since a covered sibling may carry a different geometry over the same
     /// guest range.
+    #[cfg(feature = "backend-vulkan")]
     #[test]
     fn superseding_a_resident_window_releases_the_pin_it_held() {
         use crate::backend::vulkan::engine::TargetIdentity;
@@ -1770,6 +3698,7 @@ mod tests {
             k,
             crate::model::DeferredOwner::Render {
                 armed_seq: 1,
+                armed_stamp_seq: 0,
                 source: crate::model::RenderWindowSource::Resident { epoch: 11 },
             },
         );
@@ -1803,6 +3732,7 @@ mod tests {
     /// Superseding one window must not disturb a sibling covering a different
     /// guest range on the same mapping — that one holds bytes the new Store does
     /// not write, and dropping it would lose them.
+    #[cfg(feature = "backend-vulkan")]
     #[test]
     fn superseding_one_window_leaves_a_disjoint_sibling_armed() {
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
@@ -1842,7 +3772,10 @@ mod tests {
             .insert(key(9, 0, 256), render_owner(7));
         state.compute_deferred_flush.insert(
             key(9, 256, 512),
-            crate::model::DeferredOwner::Storage { generation: 3 },
+            crate::model::DeferredOwner::Storage {
+                generation: 3,
+                armed_stamp_seq: 0,
+            },
         );
         let cap = crate::observe::FailCapture::start();
         super::drop_windows(&mut state, 9, "unit");
@@ -1882,9 +3815,13 @@ mod tests {
             m.map_generation = 2;
             m.page_entries = vec![(0x300 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
         }
-        state
-            .compute_deferred_flush
-            .insert(k, crate::model::DeferredOwner::Storage { generation: 3 });
+        state.compute_deferred_flush.insert(
+            k,
+            crate::model::DeferredOwner::Storage {
+                generation: 3,
+                armed_stamp_seq: 0,
+            },
+        );
         // The guest deletes the backing; the window is kept for the fingerprint
         // decision and the page list moves to `condemned_entries`.
         assert!(state.condemn_surface_backing(9));
@@ -1897,6 +3834,75 @@ mod tests {
         );
     }
 
+    /// A window whose mapping the guest has since declared it owns must not
+    /// land, and the refusal must name itself.
+    ///
+    /// The window's frame is what the device rendered *before* the guest's CPU
+    /// write. Landing it replaces the guest's own bytes over the full attachment
+    /// extent with a copy the guest has already said is stale. Every other guard
+    /// on this path asks where the bytes would land; this one asks whether they
+    /// are owed at all, which is why it runs first.
+    #[test]
+    fn a_window_the_guest_superseded_is_refused_by_name() {
+        use crate::runtime::host::FakeHost;
+        use crate::runtime::resource_validity::{apply, ValiditySite};
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+        let k = key(9, 0, 4096);
+        let m = state.mappings.entry(9).or_default();
+        m.mapped = true;
+        m.map_generation = k.map_generation;
+        state.compute_deferred_flush.insert(
+            k,
+            crate::model::DeferredOwner::Render {
+                armed_seq: 0,
+                armed_stamp_seq: 0,
+                source: crate::model::RenderWindowSource::Owned(std::sync::Arc::new(vec![
+                    0u8;
+                    4096
+                ])),
+            },
+        );
+        // The device published this surface's pixels, and the guest then claimed
+        // a CPU write to it — so the guest's bytes are the newer ones.
+        state.note_surface_content_published(9);
+        apply(
+            &mut state,
+            0,
+            9,
+            crate::runtime::decode::fifo::InvalidateValidityOps {
+                clear_host_valid: 1,
+                set_host_valid: 0,
+                clear_guest_valid: 0,
+                set_guest_valid: 0,
+            },
+            ValiditySite::ExecTable,
+        );
+        // The claim also drops the window, which is the repair upstream of this
+        // gate; re-arm it so the gate itself is what this exercises.
+        state.compute_deferred_flush.insert(
+            k,
+            crate::model::DeferredOwner::Render {
+                armed_seq: 0,
+                armed_stamp_seq: 0,
+                source: crate::model::RenderWindowSource::Owned(std::sync::Arc::new(vec![
+                    0u8;
+                    4096
+                ])),
+            },
+        );
+
+        let cap = crate::observe::FailCapture::start();
+        let ok = super::flush_intersecting(&mut state, &mut host, 9, 0, u64::MAX);
+        assert!(!ok, "a refused writeback is a reported loss, not a success");
+        let line = cap.one("deferred_flush_lost");
+        assert!(
+            line.contains("reason=host_copy_superseded"),
+            "the refusal must name itself: {line}"
+        );
+        assert!(state.compute_deferred_flush.is_empty());
+    }
+
     #[test]
     fn flush_intersecting_takes_windows_and_reports_loss() {
         use crate::runtime::host::FakeHost;
@@ -1906,7 +3912,10 @@ mod tests {
         // (fail-visible loss), remove the window, and return false.
         state.compute_deferred_flush.insert(
             key(9, 0, 4096),
-            crate::model::DeferredOwner::Storage { generation: 3 },
+            crate::model::DeferredOwner::Storage {
+                generation: 3,
+                armed_stamp_seq: 0,
+            },
         );
         let ok = super::flush_intersecting(&mut state, &mut host, 9, 0, u64::MAX);
         assert!(!ok, "lost window must report failure");
@@ -1917,7 +3926,10 @@ mod tests {
         // Disjoint mapping id: untouched.
         state.compute_deferred_flush.insert(
             key(10, 0, 4096),
-            crate::model::DeferredOwner::Storage { generation: 3 },
+            crate::model::DeferredOwner::Storage {
+                generation: 3,
+                armed_stamp_seq: 0,
+            },
         );
         assert!(super::flush_intersecting(
             &mut state,
@@ -1971,11 +3983,17 @@ mod tests {
         let ckey = |mapping_id: u32| key(mapping_id, 0, 0x1000);
         state.compute_deferred_flush.insert(
             ckey(9),
-            crate::model::DeferredOwner::Storage { generation: 3 },
+            crate::model::DeferredOwner::Storage {
+                generation: 3,
+                armed_stamp_seq: 0,
+            },
         );
         state.compute_deferred_flush.insert(
             ckey(10),
-            crate::model::DeferredOwner::Storage { generation: 3 },
+            crate::model::DeferredOwner::Storage {
+                generation: 3,
+                armed_stamp_seq: 0,
+            },
         );
         // Product defer sites index pages at defer time.
         state.index_deferred_alias_pages(9);
@@ -2020,12 +4038,18 @@ mod tests {
         }
         state.compute_deferred_flush.insert(
             key(9, 0, 256),
-            crate::model::DeferredOwner::Storage { generation: 3 },
+            crate::model::DeferredOwner::Storage {
+                generation: 3,
+                armed_stamp_seq: 0,
+            },
         );
         let disjoint = key(10, 0, 0x1000);
         state.compute_deferred_flush.insert(
             disjoint,
-            crate::model::DeferredOwner::Storage { generation: 3 },
+            crate::model::DeferredOwner::Storage {
+                generation: 3,
+                armed_stamp_seq: 0,
+            },
         );
         // Linear windows never name the mapping: one aliases mapping 9's
         // physical page, one sits on a disjoint page.
@@ -2077,7 +4101,9 @@ mod tests {
             row_stride: w * 4,
             format: 0x46,
             armed_seq: 0,
+            armed_stamp_seq: 0,
             pages: pages.iter().copied().collect(),
+            alloc_gen: 0,
         }
     }
 
@@ -2092,8 +4118,8 @@ mod tests {
         for pages in state.deferred_alias_pages.values() {
             live.extend(pages.iter().copied());
         }
-        for (_, pages) in state.linear_deferred_flush.values() {
-            live.extend(pages.iter().copied());
+        for entry in state.linear_deferred_flush.values() {
+            live.extend(entry.pages.iter().copied());
         }
         for entry in state.gva_deferred_flush.values() {
             live.extend(entry.pages.iter().copied());
@@ -2172,7 +4198,9 @@ mod tests {
         assert_index_matches_windows(&state, &seen);
         // Disarm both remaining windows: index empties.
         assert_eq!(
-            state.disarm_linear_deferred_window(&lin),
+            state
+                .disarm_linear_deferred_window(&lin)
+                .map(|window| window.pages),
             Some([p(0xF)].into_iter().collect()),
             "disarm returns the pages the window was armed against"
         );
@@ -2181,6 +4209,44 @@ mod tests {
             assert!(!state.deferred_pages_intersect(&[page]));
         }
         assert_index_matches_windows(&state, &seen);
+    }
+
+    /// A linear compute-storage window records the fence it was armed under, and
+    /// a re-arm records the fence it was re-armed under.
+    ///
+    /// This rail writes a raw task GVA with no mapping incarnation to name, so
+    /// the only thing that can say a landing is late is the stamp counter at arm
+    /// time. Without it every linear landing is unscoreable, which is the state
+    /// `6bc2220` left it in while clearing the two rails that *do* carry an
+    /// allocation identity.
+    #[test]
+    fn a_linear_window_records_the_fence_it_was_armed_under() {
+        use crate::model::{ComputeStorageResidencyKey, DeviceState, PAGE_SHIFT_X86};
+        let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
+        let p = |pfn: u64| pfn << PAGE_SHIFT_X86;
+        let key = ComputeStorageResidencyKey::linear(1, 7, 0x4000, 256, 0x1000, 64, 64, 0x46);
+
+        state.completion_stamp_seq = 41;
+        state.arm_linear_deferred_window(key, 1, [p(0xA)].into_iter().collect());
+        assert_eq!(
+            state
+                .linear_deferred_flush
+                .get(&key)
+                .unwrap()
+                .armed_stamp_seq,
+            41,
+            "the window must carry the fence it was armed under"
+        );
+
+        // The guest is fenced twice, then the same key re-arms: the window is a
+        // NEW obligation and must be scored against the new fence, not the one
+        // its predecessor was armed under.
+        state.completion_stamp_seq = 43;
+        state.arm_linear_deferred_window(key, 2, [p(0xB)].into_iter().collect());
+        let window = state.disarm_linear_deferred_window(&key).unwrap();
+        assert_eq!(window.armed_stamp_seq, 43, "a re-arm re-stamps the window");
+        assert_eq!(window.generation, 2);
+        assert_eq!(window.pages, [p(0xB)].into_iter().collect());
     }
 
     /// A raw task-GVA span aliasing a deferred GVA render-Store window's
@@ -2507,11 +4573,133 @@ mod tests {
             gva_entry(1, 4, 4, &[0x3000u64 << PAGE_SHIFT_X86]),
         );
 
+        let declared = crate::runtime::drain::store_route_count("guest_read_declared");
+        let landed = crate::runtime::drain::store_route_count("guest_read_landed");
+        let dry = crate::runtime::drain::store_route_count("guest_read_dry");
+
         let (ok, flushed) = super::flush_mapping_for_guest_read(&mut state, &mut host, 9);
         assert!(!ok, "engine-less flush reports the loss");
         assert_eq!(flushed, 1, "exactly the aliased GVA window");
         assert!(!state.gva_deferred_flush.contains_key(&0x9000_0000));
         assert!(state.gva_deferred_flush.contains_key(&0x9100_0000));
+
+        // The declaration rate is the number the demand-driven writeback design
+        // turns on, and until these counters existed nothing measured it. Assert
+        // them here rather than trusting the wiring: `guest_read_landed` must
+        // agree with the returned count, and the dry counter must stay put on a
+        // call that landed something — a route on the wrong side of that branch
+        // would read as "the guest never declares" and close the question the
+        // wrong way. Deltas, not absolutes: the census window is process-wide
+        // and other tests share it.
+        assert_eq!(
+            crate::runtime::drain::store_route_count("guest_read_declared") - declared,
+            1,
+            "every call must count as a declaration"
+        );
+        assert_eq!(
+            crate::runtime::drain::store_route_count("guest_read_landed") - landed,
+            u64::from(flushed),
+            "landed must count windows, not calls"
+        );
+        assert_eq!(
+            crate::runtime::drain::store_route_count("guest_read_dry") - dry,
+            0,
+            "a call that landed a window is not dry"
+        );
+    }
+
+    /// A declaration that finds nothing armed counts as dry and lands nothing.
+    ///
+    /// The complement of the case above, and the one that will dominate live:
+    /// the fence-bound writeback runs first and empties the windows, so most
+    /// declarations arrive to an empty set. That reading is only interpretable
+    /// if "dry" is known to mean *nothing was armed* rather than *the counter
+    /// never fired*, which is what this pins.
+    #[test]
+    fn guest_read_flush_with_nothing_armed_counts_as_dry() {
+        use crate::runtime::host::FakeHost;
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+        let m = state.mappings.entry(9).or_default();
+        m.mapped = true;
+        m.page_entries = vec![(0x2000u32 << 2) | 1];
+
+        let declared = crate::runtime::drain::store_route_count("guest_read_declared");
+        let landed = crate::runtime::drain::store_route_count("guest_read_landed");
+        let dry = crate::runtime::drain::store_route_count("guest_read_dry");
+
+        let (ok, flushed) = super::flush_mapping_for_guest_read(&mut state, &mut host, 9);
+        assert!(ok, "nothing armed is not a failure");
+        assert_eq!(flushed, 0, "nothing armed lands nothing");
+        assert_eq!(
+            crate::runtime::drain::store_route_count("guest_read_declared") - declared,
+            1,
+            "a dry call is still a declaration"
+        );
+        assert_eq!(
+            crate::runtime::drain::store_route_count("guest_read_dry") - dry,
+            1,
+            "nothing armed must count as dry"
+        );
+        assert_eq!(
+            crate::runtime::drain::store_route_count("guest_read_landed") - landed,
+            0,
+            "nothing armed lands nothing"
+        );
+    }
+
+    /// A declaration is attributed by whether the fence rail has ever written
+    /// back that mapping, and the two arms must be exclusive.
+    ///
+    /// This is the split that decides whether the eager writeback could become
+    /// demand-driven, and it is the one `guest_read_dry` cannot make — the fence
+    /// empties the windows before any declaration arrives, so a declaration on a
+    /// surface the fence just wrote and one on an unrelated surface look
+    /// identical from the dry count. A mis-wired split here would read as "the
+    /// guest declares on surfaces we never write back" and close a month of work
+    /// the wrong way, so both arms are driven through the same fixture.
+    #[test]
+    fn a_declaration_is_attributed_to_whether_the_fence_writes_that_mapping() {
+        use crate::runtime::host::FakeHost;
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+        for mid in [7u32, 9u32] {
+            let m = state.mappings.entry(mid).or_default();
+            m.mapped = true;
+            m.page_entries = vec![(0x2000u32 << 2) | 1];
+        }
+
+        let other0 = crate::runtime::drain::store_route_count("guest_read_on_other_mid");
+        let flushed0 = crate::runtime::drain::store_route_count("guest_read_on_flushed_mid");
+
+        // Nothing has been written back yet: both mappings are "other".
+        super::flush_mapping_for_guest_read(&mut state, &mut host, 9);
+        assert_eq!(
+            crate::runtime::drain::store_route_count("guest_read_on_other_mid") - other0,
+            1,
+            "a mapping the fence never wrote is not a flushed mid"
+        );
+        assert_eq!(
+            crate::runtime::drain::store_route_count("guest_read_on_flushed_mid") - flushed0,
+            0,
+            "nothing has been fence-flushed yet"
+        );
+
+        // Once the fence has landed a window on 9, a declaration on 9 counts as
+        // covered and one on 7 still does not.
+        state.fence_flushed_mappings.insert(9);
+        super::flush_mapping_for_guest_read(&mut state, &mut host, 9);
+        super::flush_mapping_for_guest_read(&mut state, &mut host, 7);
+        assert_eq!(
+            crate::runtime::drain::store_route_count("guest_read_on_flushed_mid") - flushed0,
+            1,
+            "a declaration on a fence-written mapping must count as covered"
+        );
+        assert_eq!(
+            crate::runtime::drain::store_route_count("guest_read_on_other_mid") - other0,
+            2,
+            "the arms must be exclusive — every call lands in exactly one"
+        );
     }
 
     /// Page drift must distinguish the cases it exists to separate, and now
@@ -2528,6 +4716,231 @@ mod tests {
     /// claims. Logging drift while still writing is exactly what this used to
     /// do, and the guest heap corruption that allowed — WindowServer aborting in
     /// `small_free_list_remove_ptr_no_clear` — is why it decides now.
+    /// The mapping-keyed rails get the same reading as the GVA rail, per rail,
+    /// so a boot can say whether `map_generation` in the key is already enough
+    /// to make deferral here safe — rather than the two being assumed alike.
+    #[test]
+    fn each_mapping_rail_is_scored_against_the_fence_under_its_own_name() {
+        use crate::runtime::drain::store_route_count;
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let k = key(7, 0, 256);
+
+        let render = render_owner(1);
+        let storage = crate::model::DeferredOwner::Storage {
+            generation: 3,
+            armed_stamp_seq: 0,
+        };
+
+        // Inside the fence: neither rail may be reported.
+        let before = [
+            store_route_count("rendw_stamp_outlived"),
+            store_route_count("storw_stamp_outlived"),
+        ];
+        super::note_mapping_window_against_fence(&state, &k, &render);
+        super::note_mapping_window_against_fence(&state, &k, &storage);
+        assert_eq!(
+            [
+                store_route_count("rendw_stamp_outlived"),
+                store_route_count("storw_stamp_outlived")
+            ],
+            before,
+            "a window landed inside its own fence is the safe case on both rails"
+        );
+
+        // Past the fence: each rail reports under its own counter, so a boot can
+        // tell a render-Store window from a compute-storage one.
+        state.completion_stamp_seq = 5;
+        super::note_mapping_window_against_fence(&state, &k, &render);
+        assert_eq!(
+            [
+                store_route_count("rendw_stamp_outlived"),
+                store_route_count("storw_stamp_outlived")
+            ],
+            [before[0] + 1, before[1]],
+            "the render rail must not be counted under the storage rail's name"
+        );
+        super::note_mapping_window_against_fence(&state, &k, &storage);
+        assert_eq!(
+            [
+                store_route_count("rendw_stamp_outlived"),
+                store_route_count("storw_stamp_outlived")
+            ],
+            [before[0] + 1, before[1] + 1],
+            "and the storage rail must not be counted under the render rail's"
+        );
+    }
+
+    /// The window and the resident it pinned must be the same slot, and the two
+    /// spellings that name it must agree by construction.
+    ///
+    /// `arm_surface_resident_store` pins `render_chain_identity`;
+    /// `flush_render_one` rebuilds `render_window_identity` from
+    /// `key.width`/`key.height`. Both now read color0's declared geometry —
+    /// the draw request has only that one — so the geometry axis is closed by
+    /// construction rather than by this check. It was not: the arm's spelling
+    /// preferred a whole-request pass extent, and a record whose extent
+    /// differed from its attachment produced two different
+    /// `TargetIdentity::Surface` values. The arm pinned one slot, the flush
+    /// looked up another, `registry_get` missed, and the frame was lost —
+    /// reported as `live=Absent` — while the pin leaked, because eviction skips
+    /// pinned slots by design. One measured boot lost ~135 frames at 1920x1080
+    /// with `live=None`, the whole desktop compositing layer keeping pre-Store
+    /// bytes in guest memory.
+    ///
+    /// The first two assertions hold that closure: with one geometry the two
+    /// spellings are the same value, and a different extent is a different slot
+    /// that must never be pinned on a window's behalf. The third is the axis
+    /// still live at runtime, and the reason the equality check stays.
+    #[cfg(feature = "backend-vulkan")]
+    #[test]
+    fn a_window_and_the_resident_it_pins_cannot_be_named_at_two_geometries() {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let k = key(7, 0, 256);
+        state.map_surface(k.mapping_id);
+        state
+            .mappings
+            .get_mut(&k.mapping_id)
+            .unwrap()
+            .map_generation = k.map_generation;
+        let from_key = super::render_window_identity(&k);
+
+        // The spelling the arm uses, when the pass extent equals the attachment
+        // and the mapping still carries the incarnation the key was built at.
+        assert_eq!(
+            from_key,
+            crate::runtime::present_identity::surface_identity(
+                &state,
+                k.mapping_id,
+                k.width,
+                k.height
+            ),
+            "with one geometry the two spellings must be the same value, or the \
+             rail is broken for every window rather than only the split ones"
+        );
+
+        // And when it does not. This is the value the arm would have pinned for
+        // a record whose pass extent is larger than its color0 attachment; the
+        // flush cannot find it from the key, which is why the arm refuses.
+        assert_ne!(
+            from_key,
+            crate::runtime::present_identity::surface_identity(
+                &state,
+                k.mapping_id,
+                k.width + 1,
+                k.height
+            ),
+            "geometry is part of the resident's shape, so a pass-extent identity \
+             is a different slot and must not be pinned on a window's behalf"
+        );
+
+        // Generation is the second axis, and it is the one that can move
+        // *inside* the arm. `arm_surface_resident_store` takes the identity from
+        // the live mapping before it builds the key, and the step between them —
+        // `prepare_surface_deferred_window` — lands intersecting windows, whose
+        // writeback re-resolves the mapping and can bump `map_generation`. The
+        // arm would then pin the pre-bump slot and hand the window a post-bump
+        // key. Same miss, same lost frame, same leaked pin.
+        crate::model::DeviceState::bump_map_generation(
+            state.mappings.get_mut(&k.mapping_id).unwrap(),
+        );
+        assert_ne!(
+            from_key,
+            crate::runtime::present_identity::surface_identity(
+                &state,
+                k.mapping_id,
+                k.width,
+                k.height
+            ),
+            "a generation that moved during the arm names a different slot, and \
+             the equality check is what stops the window being armed across it"
+        );
+    }
+
+    /// A completion stamp is the guest's licence to free everything it allocated
+    /// for the work being completed, so the stamp must leave nothing owed to
+    /// guest RAM. Asserted through [`crate::runtime::drain::write_stamp`] itself
+    /// rather than against the helper, because the claim that matters is the
+    /// wiring: a helper nothing calls at the fence is the bug this fixes.
+    #[cfg(feature = "backend-vulkan")]
+    #[test]
+    fn a_completion_stamp_leaves_no_window_still_owing_guest_ram() {
+        use crate::runtime::host::FakeHost;
+        let page = 1u64 << PAGE_SHIFT_X86;
+        let mut host = FakeHost::new();
+        let stamp_pfn = 9u32;
+        host.map_range(u64::from(stamp_pfn) << PAGE_SHIFT_X86, page as usize, 0);
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        state.gfx.fifo_base_page = stamp_pfn;
+
+        state.arm_gva_deferred_window(0x1000, gva_entry(1, 4, 4, &[]));
+        state.arm_gva_deferred_window(0x2000, gva_entry(1, 4, 4, &[]));
+        assert_eq!(state.gva_deferred_flush.len(), 2, "two windows armed");
+
+        crate::runtime::drain::write_stamp(&mut state, &mut host, 1, 0x55);
+
+        assert!(
+            state.gva_deferred_flush.is_empty(),
+            "the guest may free every one of these targets the instant it reads \
+             the stamp, so none of them may still be waiting to be written"
+        );
+        assert_eq!(
+            state.completion_stamp_seq, 1,
+            "the fence the windows are measured against must have moved"
+        );
+    }
+
+    /// The guest's fence is the only thing that separates a deferred write from
+    /// a write into somebody else's allocation, and the page-set guard cannot
+    /// see it: free-then-reuse inside one process leaves the translation
+    /// identical, so `deferred_pages_still_ours` says yes to exactly the window
+    /// that corrupts the guest heap.
+    ///
+    /// Both directions are asserted. A census that fires on every landing is as
+    /// useless as one that never fires — the whole point is that it separates
+    /// the windows landed inside their own fence from the ones that outlived it.
+    #[cfg(feature = "backend-vulkan")]
+    #[test]
+    fn a_window_landed_after_its_fence_is_counted_apart_from_one_landed_inside_it() {
+        use crate::runtime::drain::store_route_count;
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+
+        // Negative control: armed and landed under the same stamp. The guest
+        // has not been told this render finished, so it cannot have freed the
+        // target, and the write is the one the Store promised.
+        let mut inside = gva_entry(1, 4, 4, &[]);
+        inside.armed_stamp_seq = state.completion_stamp_seq;
+        let same_before = store_route_count("gvaw_stamp_same");
+        let outlived_before = store_route_count("gvaw_stamp_outlived");
+        super::note_window_outlived_its_stamp(&state, 0x1000, &inside, "rearm");
+        assert_eq!(
+            store_route_count("gvaw_stamp_same"),
+            same_before + 1,
+            "a window landed inside its own fence is the safe case and must be counted as one"
+        );
+        assert_eq!(
+            store_route_count("gvaw_stamp_outlived"),
+            outlived_before,
+            "a guard that fires on every landing cannot price the repair"
+        );
+
+        // Positive control: the same window, landed after the guest was fenced.
+        state.completion_stamp_seq = state.completion_stamp_seq.wrapping_add(3);
+        let same_before = store_route_count("gvaw_stamp_same");
+        super::note_window_outlived_its_stamp(&state, 0x1000, &inside, "gva_alias");
+        assert_eq!(
+            store_route_count("gvaw_stamp_outlived"),
+            outlived_before + 1,
+            "a window whose stamp moved before it landed writes memory the guest was \
+             told it could reclaim, and that is the class the page-set guard is blind to"
+        );
+        assert_eq!(
+            store_route_count("gvaw_stamp_same"),
+            same_before,
+            "the two outcomes must not both be counted for one landing"
+        );
+    }
+
+    #[cfg(feature = "backend-vulkan")]
     #[test]
     fn window_page_drift_refuses_the_guest_write_and_is_silent_without_it() {
         use crate::contract::endian::st32;
@@ -2574,6 +4987,7 @@ mod tests {
                 0,
                 &gva_entry(1, 4, 4, &[data0]),
                 "gva_alias",
+                "guest=refused",
             ),
             "an unmoved window must stay writable — a guard that refuses every \
              flush means the guest never sees a Store"
@@ -2593,10 +5007,166 @@ mod tests {
                 0,
                 &gva_entry(1, 4, 4, &[9 * page]),
                 "gva_alias",
+                "guest=refused",
             ),
             "a window whose pages moved must be refused, not merely reported"
         );
         assert_eq!(drift_lines(at), 1, "a window whose pages moved must report");
+
+        // A window armed on TWO pages whose range now resolves ONE page, and
+        // that page is not one of the two. This is the arrangement a guest
+        // produces by releasing a GPU allocation and letting part of the virtual
+        // range be re-pointed: fewer pages come back, and what does come back
+        // belongs to somebody else.
+        //
+        // A guard keyed on page COUNT reads this as "shorter walk, therefore
+        // teardown, therefore nothing to protect" and permits it, and the writer
+        // then lands rows in `data0` — which this window never owned. Keyed on
+        // membership it is refused, which is what the guest's own crash reports
+        // say has to happen.
+        let at = mark();
+        assert!(
+            !super::window_pages_still_ours(
+                &state,
+                &host,
+                0,
+                &gva_entry(1, 4, 4, &[7 * page, 8 * page]),
+                "clear_store",
+                "guest=refused",
+            ),
+            "a short walk that resolves a page the window was never armed on is \
+             not a teardown — it is a write into another owner's pages"
+        );
+        assert_eq!(
+            drift_lines(at),
+            1,
+            "the refusal must be visible; a silent one cannot be scored"
+        );
+
+        // The benign half of the same shape: fewer pages come back, and every
+        // one of them is still ours. Refusing this would drop live Stores whose
+        // destination never moved, so the guard must not simply require equal
+        // sets.
+        let at = mark();
+        assert!(
+            super::window_pages_still_ours(
+                &state,
+                &host,
+                0,
+                &gva_entry(1, 4, 4, &[data0, 8 * page]),
+                "clear_store",
+                "guest=refused",
+            ),
+            "a walk that came back short but entirely inside the armed pages is \
+             the teardown case, and its rows land in this window's own memory"
+        );
+        assert_eq!(drift_lines(at), 0, "a subset walk must stay quiet");
+    }
+
+    /// The same window, asked by the reader instead of the writer.
+    ///
+    /// The cross-pass resident Load in `encode_draw_chain` trusts a GVA resident
+    /// as a draw's *prior content*, gated on a deferred window existing at the
+    /// address with matching geometry — conditions a different allocation
+    /// reusing the address satisfies exactly. The flush path had refused that
+    /// drift since it was written; the read path did not ask, which left the two
+    /// sides of one window disagreeing about whether it still belonged to its
+    /// name.
+    ///
+    /// What this pins is that the reader gets the same verdict *and its own
+    /// outcome word*. A drift line is the only record either consumer leaves,
+    /// and `guest=refused` on a line emitted by a Load would say guest memory
+    /// was protected when what was actually refused was a stale picture.
+    #[cfg(feature = "backend-vulkan")]
+    #[test]
+    fn the_resident_load_reader_gets_the_same_drift_verdict_under_its_own_name() {
+        use crate::contract::endian::st32;
+        use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+        use crate::runtime::host::{FakeHost, HostMemory};
+        let page = 1u64 << PAGE_SHIFT_X86;
+        let mut host = FakeHost::new();
+        let (dir_gpa, root_gpa, data0) = (2 * page, 3 * page, 4 * page);
+        for gpa in [dir_gpa, root_gpa, data0] {
+            host.map_range(gpa, page as usize, 0);
+        }
+        let mut d = [0u8; 8];
+        st32(&mut d[DIRECTORY_ROOT_PFN as usize..], 3);
+        st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
+        host.write_gpa(dir_gpa, &d).unwrap();
+        let mut pte = [0u8; 4];
+        st32(&mut pte, 4);
+        host.write_gpa(root_gpa, &pte).unwrap();
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        assert!(state.define_task(1, page, 2));
+
+        crate::observe::redirect_logs_for_tests();
+        let tail = |from: usize| -> String {
+            std::fs::read_to_string(crate::observe::fail_log_path())
+                .unwrap_or_default()
+                .get(from..)
+                .unwrap_or_default()
+                .lines()
+                .filter(|l| l.starts_with("deferred_window_page_drift "))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let mark = || {
+            std::fs::read_to_string(crate::observe::fail_log_path())
+                .unwrap_or_default()
+                .len()
+        };
+
+        // The address still names the pages the window was armed on, so the
+        // resident behind it is this allocation's own prior frame and the Load
+        // may take it. Refusing here would cost a seed on every chained pass.
+        let at = mark();
+        assert!(
+            super::window_pages_still_ours(
+                &state,
+                &host,
+                0,
+                &gva_entry(1, 4, 4, &[data0]),
+                "xpass_load",
+                "resident=refused",
+            ),
+            "an unmoved window's resident is the draw's own prior content"
+        );
+        assert_eq!(
+            tail(at),
+            "",
+            "an unmoved window must be quiet on both sides"
+        );
+
+        // The guest handed this address to a different allocation. The resident
+        // still exists, still has the geometry, and still reports content_ready
+        // — every gate the Load had before this check. It holds the previous
+        // allocation's pixels.
+        let at = mark();
+        assert!(
+            !super::window_pages_still_ours(
+                &state,
+                &host,
+                0,
+                &gva_entry(1, 4, 4, &[9 * page]),
+                "xpass_load",
+                "resident=refused",
+            ),
+            "a reallocated address must not load the previous owner's pixels as \
+             this draw's prior content"
+        );
+        let line = tail(at);
+        assert!(
+            line.contains("trigger=xpass_load"),
+            "the line must name the reader that asked: {line}"
+        );
+        assert!(
+            line.contains("resident=refused"),
+            "the reader refuses a resident, not a guest write: {line}"
+        );
+        assert!(
+            !line.contains("guest=refused"),
+            "a Load must not claim it protected guest memory: {line}"
+        );
     }
 
     /// The linear compute-storage rail gets the same drift decision as the GVA
@@ -2612,6 +5182,7 @@ mod tests {
     /// would permit, and the positive control below would fail — which is the
     /// point of siting it at a nonzero offset rather than at GVA 0, where both
     /// readings coincide.
+    #[cfg(feature = "backend-vulkan")]
     #[test]
     fn a_linear_window_whose_pages_moved_is_refused_and_reads_its_span_as_a_length() {
         use crate::contract::endian::st32;
@@ -2664,6 +5235,7 @@ mod tests {
                 span,
                 &[data1].into_iter().collect(),
                 "8x8 trigger=linear_flush ref=5",
+                "guest=refused",
             ),
             "an unmoved linear window must stay writable — a guard that refuses \
              every flush means the guest never sees a compute Store"
@@ -2686,6 +5258,7 @@ mod tests {
                 span,
                 &[9 * page].into_iter().collect(),
                 "8x8 trigger=linear_flush ref=5",
+                "guest=refused",
             ),
             "a linear window whose pages moved must be refused — and a zero-length \
              walk from misreading span_end as an end address would permit it"
@@ -2694,6 +5267,61 @@ mod tests {
             drift_lines(at),
             1,
             "a linear window whose pages moved must report"
+        );
+
+        // A walk that resolves NOTHING also returns "still ours", because
+        // `all` over an empty set is true — and that is not the guard agreeing,
+        // it is the guard having nothing to compare. Counted apart, or this
+        // rail's "no drift" reads as a verification it never made.
+        use crate::runtime::drain::store_route_count;
+        let verified_before = store_route_count("defw_pages_verified");
+        let unwit_before = store_route_count("defw_unwit_no_live");
+        let at = mark();
+        assert!(
+            super::deferred_pages_still_ours(
+                &state,
+                &host,
+                1,
+                // Page index 3: inside the root page, but its PTE was never
+                // written, so it is zero and translates to nothing. An index
+                // past the root page's own extent would instead read whatever
+                // GPA follows it, which is a different (and resolvable) thing.
+                3 * page,
+                span,
+                &[data1].into_iter().collect(),
+                "8x8 trigger=linear_flush ref=5",
+                "guest=refused",
+            ),
+            "an unresolvable window is not drift — no row can land through it"
+        );
+        assert_eq!(drift_lines(at), 0, "and it is not reported as drift");
+        assert_eq!(
+            store_route_count("defw_unwit_no_live"),
+            unwit_before + 1,
+            "it must be counted as unwitnessed"
+        );
+        assert_eq!(
+            store_route_count("defw_pages_verified"),
+            verified_before,
+            "and must NOT be counted as a verification"
+        );
+
+        // An empty armed set is the other unchecked exit, and it is its own slug
+        // because it is a different gap.
+        let no_armed_before = store_route_count("defw_unwit_no_armed");
+        assert!(super::deferred_pages_still_ours(
+            &state,
+            &host,
+            1,
+            offset,
+            span,
+            &std::collections::HashSet::new(),
+            "8x8 trigger=linear_flush ref=5",
+            "guest=refused",
+        ));
+        assert_eq!(
+            store_route_count("defw_unwit_no_armed"),
+            no_armed_before + 1
         );
     }
 
@@ -2743,15 +5371,24 @@ mod tests {
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
         state.compute_deferred_flush.insert(
             key(7, 0, 256),
-            crate::model::DeferredOwner::Storage { generation: 3 },
+            crate::model::DeferredOwner::Storage {
+                generation: 3,
+                armed_stamp_seq: 0,
+            },
         );
         state.compute_deferred_flush.insert(
             key(7, 256, 512),
-            crate::model::DeferredOwner::Storage { generation: 4 },
+            crate::model::DeferredOwner::Storage {
+                generation: 4,
+                armed_stamp_seq: 0,
+            },
         );
         state.compute_deferred_flush.insert(
             key(8, 0, 256),
-            crate::model::DeferredOwner::Storage { generation: 5 },
+            crate::model::DeferredOwner::Storage {
+                generation: 5,
+                armed_stamp_seq: 0,
+            },
         );
 
         // Disjoint range takes nothing.

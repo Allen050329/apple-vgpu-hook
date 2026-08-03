@@ -1,7 +1,7 @@
 //! Device-owned state: registers, rings, tasks, mapper, present, fail log.
 
 use crate::model::{GFX_MMIO_SIZE, LruBytesMemo, MAX_CHANNELS, MAX_MAPPINGS, MAX_TASKS};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -27,8 +27,6 @@ pub enum PacketFault {
     DesyncedHeadTail,
     /// `total_size` outside `[header, ring]`, or short of its stamp list.
     BadSize,
-    /// The decoder classified the ring position as desynced.
-    Desynced,
     /// Guest read failed: root packet header.
     RootHeaderRead,
     /// Guest read failed: root packet snapshot.
@@ -56,7 +54,6 @@ impl PacketFault {
         match self {
             Self::DesyncedHeadTail => "packet_desynced_head_tail",
             Self::BadSize => "packet_bad_size",
-            Self::Desynced => "packet_desynced",
             Self::RootHeaderRead => "packet_root_header_read",
             Self::RootSnapRead => "packet_root_snap_read",
             Self::RootStampWriteback => "packet_root_stamp_writeback",
@@ -111,8 +108,13 @@ pub enum FailEvent {
         channel: u32,
         fault: ExecFault,
     },
+    /// A gfx-window access whose width is neither 32 nor 64 bits.
+    ///
+    /// Only the gfx rail can raise this. The iosfc window's handlers mask the
+    /// read to the requested width and ignore the width on write, so there is
+    /// no size they refuse — which is why this carries no window discriminator:
+    /// a field with one reachable value tells the log's reader nothing.
     BadMmioAccess {
-        window: MmioWindow,
         offset: u64,
         size: u32,
     },
@@ -155,30 +157,12 @@ impl crate::observe::Decline for FailEvent {
                 vec![("ch", channel.to_string()), ("head", head.to_string())]
             }
             Self::UnsupportedExec { channel, .. } => vec![("ch", channel.to_string())],
-            Self::BadMmioAccess {
-                window,
-                offset,
-                size,
-            } => vec![
-                (
-                    "window",
-                    match window {
-                        MmioWindow::Gfx => "gfx",
-                        MmioWindow::Iosfc => "iosfc",
-                    }
-                    .to_string(),
-                ),
+            Self::BadMmioAccess { offset, size } => vec![
                 ("offset", format!("{offset:#x}")),
                 ("size", size.to_string()),
             ],
         }
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MmioWindow {
-    Gfx,
-    Iosfc,
 }
 
 /// Gfx named registers + sparse backing for unnamed offsets.
@@ -206,6 +190,30 @@ pub struct GfxRegs {
     /// Fault interrupt status (0x102c), host-set, guest-read (not r2c). Same
     /// lock-free read rail (the guest ISR reads it right after 0x1018).
     pub interrupt_fault: Arc<AtomicU32>,
+    /// Child channels rung since the drain last folded them in (0x1020/0x1028).
+    ///
+    /// The lock-free *write* rail, and the only one: every other register the
+    /// guest writes finds the device lock free, while this doorbell was
+    /// measured queueing about a hundred times a second and applying up to
+    /// 45 ms late (`gfx_doorbell_delay off_0x1020`). It queued because
+    /// `device_gfx_write` takes the device lock with `try_lock` and the drain
+    /// worker holds that lock for its whole tranche, so the delay is the
+    /// tranche — `max_age_us` tracks `max_tranche_us` to within 3 %.
+    ///
+    /// A doorbell is the one register that can be taken this way, because it
+    /// carries no state the decode depends on: its whole effect is to say a
+    /// child channel has work. So the guest's ring ORs a bit here without any
+    /// lock, and [`crate::runtime::drain::fold_rung_child_doorbells`] moves it
+    /// into `active_child_mask` / `pending.child_mask` — including *inside* the
+    /// channel loop, so a channel rung mid-tranche is served by that tranche
+    /// rather than the next one.
+    ///
+    /// Bit `n` is channel `n`; bit 0 is unused because channel 0 is the main
+    /// FIFO, which has its own register.
+    ///
+    /// The `Arc` is shared with the device registry slot and survives reset,
+    /// like the three above.
+    pub child_doorbell_rung: Arc<AtomicU32>,
     pub efi_display: u32,
     pub efi_mode_select: u32,
     pub efi_fb_start: u64,
@@ -231,6 +239,7 @@ impl Default for GfxRegs {
             interrupt_status_disp: Arc::new(AtomicU32::new(0)),
             interrupt_status_gpu: Arc::new(AtomicU32::new(0)),
             interrupt_fault: Arc::new(AtomicU32::new(0)),
+            child_doorbell_rung: Arc::new(AtomicU32::new(0)),
             efi_display: 0,
             efi_mode_select: 0,
             efi_fb_start: 0,
@@ -244,26 +253,6 @@ impl Default for GfxRegs {
 }
 
 impl GfxRegs {
-    pub fn reset(&mut self) {
-        // Preserve the shared interrupt-status atomics: the registry slot holds
-        // clones for lock-free ISR reads; replacing them would detach that rail.
-        let disp = Arc::clone(&self.interrupt_status_disp);
-        let gpu = Arc::clone(&self.interrupt_status_gpu);
-        let fault = Arc::clone(&self.interrupt_fault);
-        let fifo_read = Arc::clone(&self.fifo_read);
-        disp.store(0, Ordering::Release);
-        gpu.store(0, Ordering::Release);
-        fault.store(0, Ordering::Release);
-        fifo_read.store(0, Ordering::Release);
-        *self = Self {
-            interrupt_status_disp: disp,
-            interrupt_status_gpu: gpu,
-            interrupt_fault: fault,
-            fifo_read,
-            ..Self::default()
-        };
-    }
-
     pub fn sparse_get(&self, offset: u64) -> u32 {
         let idx = (offset / 4) as u32;
         self.sparse.get(&idx).copied().unwrap_or(0)
@@ -285,12 +274,6 @@ pub struct IosfcRegs {
     pub consumer: u32,
 }
 
-impl IosfcRegs {
-    pub fn reset(&mut self) {
-        *self = Self::default();
-    }
-}
-
 /// Per-channel child ring cache (page list decoded from base_pfn).
 #[derive(Clone, Debug, Default)]
 pub struct ChannelRing {
@@ -298,60 +281,6 @@ pub struct ChannelRing {
     pub base_pfn: u32,
     pub length: u32,
     pub page_gpas: Vec<u64>,
-}
-
-/// Ordered completion stamp slot (submission order per channel).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct StampSlot {
-    pub stamp_index: u32,
-    pub stamp_value: u32,
-    /// False while an async job owns this slot.
-    pub ready: bool,
-    /// Deferred job id (opaque); None = sync stamp.
-    pub job_id: Option<u64>,
-    /// Type-11 color/write target for async draw/compute jobs (`0` = none).
-    /// Archive `ApplePVGPUDrawJob.mapping_id` / compute image mapping — used by
-    /// `render_wait_surface` / product `surface_inflight` only.
-    pub target_mapping: u32,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct ChannelStamps {
-    pub queue: VecDeque<StampSlot>,
-}
-
-impl ChannelStamps {
-    pub fn reset(&mut self) {
-        self.queue.clear();
-    }
-
-    /// Enqueue a stamp. Fires immediately only if ready and queue was empty of pending.
-    pub fn push(&mut self, slot: StampSlot) {
-        self.queue.push_back(slot);
-    }
-
-    /// Mark the first slot with `job_id` ready.
-    pub fn mark_ready(&mut self, job_id: u64) -> bool {
-        for s in self.queue.iter_mut() {
-            if s.job_id == Some(job_id) {
-                s.ready = true;
-                return true;
-            }
-        }
-        false
-    }
-
-    /// Pop all leading ready slots (in order).
-    pub fn drain_ready(&mut self) -> Vec<StampSlot> {
-        let mut out = Vec::new();
-        while let Some(front) = self.queue.front() {
-            if !front.ready {
-                break;
-            }
-            out.push(self.queue.pop_front().unwrap());
-        }
-        out
-    }
 }
 
 /// Task directory / object-list ownership.
@@ -362,126 +291,6 @@ pub struct TaskEntry {
     pub directory_pfn: u32,
     pub object_list_pfn: u32,
     pub object_list_count: u32,
-}
-
-/// How the range a host→guest write targets stands against the `MapMemory2`
-/// spans the writing task has notified **so far**.
-///
-/// This is a reading of a notification log, and deliberately not an
-/// authorization. `MapMemory2` mutates nothing on our side — the guest has
-/// already installed the PTEs by the time the packet reaches us, which is what
-/// `drain`'s "Map notify: PTEs already live" comment records — and the FIFO
-/// carrying it is ordered against nothing that *uses* the memory. Measured on
-/// one x86/Vulkan boot: the guest allocates a 192 KiB texture backing at
-/// `0x1ada000`, uploads it with three `OP_COPY_BUFFER_TO_TEXTURE` commands, and
-/// notifies `0x1ada000 +0x30000` — the exact base, the exact length — **29 ms
-/// later**. Two of the five cases that boot notified within the same
-/// millisecond as the write.
-///
-/// So `Undeclared` is a statement about a race, not about bounds, and treating
-/// it as a refusal dropped whole textures. What a task may write is what its
-/// page table maps, which every writer here re-walks at write time and fails
-/// closed on (`gva_view::write_span`, `map_fresh_span`) — the same guarantee
-/// the hardware gives, and the only one the wire defines.
-///
-/// Returned rather than collapsed to a `bool` so the always-on line names the
-/// arm that decided instead of the caller's assumption about it: a reason the
-/// caller writes is not a reading, and that collapse regrows wherever a
-/// `-> bool` crosses a module boundary.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WriteGate {
-    /// A span recorded for this exact task covers the whole range.
-    Exact,
-    /// This task has notified nothing at all. `delete_task` calls
-    /// `clear_task_map_spans`, so a write arriving after a teardown lands here.
-    NoSpans,
-    /// Spans exist for this task and none covers the range — the notification
-    /// for this allocation has not arrived yet, or never will. Reported, not
-    /// refused; see the type doc.
-    Undeclared,
-}
-
-impl crate::observe::Decline for WriteGate {
-    fn slug(&self) -> &'static str {
-        match self {
-            Self::Exact => "write_gate_exact",
-            Self::NoSpans => "write_gate_no_spans",
-            Self::Undeclared => "write_gate_undeclared",
-        }
-    }
-}
-
-/// A range written while [`DeviceState::gva_write_gate`] said `Undeclared`,
-/// held until a later MapMemory2 covers it or the ring evicts it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct UndeclaredWrite {
-    pub task_id: u32,
-    pub gva: u64,
-    pub len: u64,
-    /// `observe::elapsed_ms` at the write, so the report can carry how long the
-    /// notification took to arrive rather than only that it did.
-    pub at_ms: u64,
-    /// Which rail wrote it, for the eviction alarm — the write itself is
-    /// reported at the site, but the alarm fires far away and has to say where
-    /// its subject came from.
-    pub via: &'static str,
-}
-
-/// How many outstanding undeclared ranges [`DeviceState::undeclared_writes`]
-/// keeps.
-///
-/// Not a protocol value. On the boot this was measured on, every entry retired
-/// within 29 ms and at most a handful were ever outstanding, so a ring this
-/// size never evicts in healthy operation — which is what makes an eviction
-/// worth an alarm rather than a shrug.
-pub const UNDECLARED_WRITE_RING: usize = 32;
-
-/// Where a refused write sits relative to the spans its own task declared.
-///
-/// See [`DeviceState::task_span_readout`] for what each combination means. All
-/// four fields are readings of the span registry at the instant of the refusal;
-/// nothing branches on them.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct TaskSpanReadout {
-    /// Pages the refused range touches.
-    pub pages: u64,
-    /// Of those, how many the **union** of the task's own spans covers.
-    pub union: u64,
-    /// How many spans the task filed for itself.
-    pub own: u64,
-    /// Lowest GVA any of those spans starts at.
-    pub lo: u64,
-    /// Highest GVA any of them ends at.
-    pub hi: u64,
-    /// Bytes from the refused range to the nearest own span, `Some(0)` when one
-    /// overlaps without covering, `None` when the task filed nothing.
-    pub nearest_gap: Option<u64>,
-}
-
-impl TaskSpanReadout {
-    /// Whether `gva` falls within `[lo, hi)`, the extent of everything the task
-    /// declared.
-    ///
-    /// This is what tells a *hole* between two declarations apart from a range
-    /// in a region the task never declared anything in, and both come back
-    /// `union == 0`. `own == 0` is neither: a task that filed nothing has no
-    /// extent, and `lo == hi == 0` must not read as "everything is outside it"
-    /// by arithmetic accident.
-    pub fn gva_inside_extent(&self, gva: u64) -> bool {
-        self.own > 0 && gva >= self.lo && gva < self.hi
-    }
-}
-
-/// Guest-declared MapMemory2 span (notify-only; no host PTE invent).
-///
-/// Used to fail-closed product GVA writes outside any recorded map when the
-/// task has received at least one MapMemory2 (audit: cap write length against
-/// known map range). Empty registry for a task ⇒ no cap (fixtures / pre-map).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct TaskMapSpan {
-    pub task_id: u32,
-    pub gva: u64,
-    pub length: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -580,19 +389,6 @@ impl StateMutationDecline {
     }
 }
 
-impl TaskMapSpan {
-    /// True if half-open `[gva, gva+len)` is fully inside this span.
-    #[inline]
-    pub fn covers(&self, gva: u64, len: u64) -> bool {
-        if self.length == 0 || len == 0 {
-            return false;
-        }
-        let end = gva.saturating_add(len);
-        let span_end = self.gva.saturating_add(self.length);
-        gva >= self.gva && end <= span_end
-    }
-}
-
 impl TaskEntry {
     /// A task the guest has defined but not yet given an object list.
     ///
@@ -631,6 +427,174 @@ pub struct MapperCapture {
     pub mapping_internal: u64,
 }
 
+/// The guest page table and GPU-VA base a mapping's [`MappingEntry::
+/// page_entries`] were walked from, when the list came from a type-4 surface
+/// plan.
+///
+/// Latched at the one site that assigns those entries so the two cannot drift
+/// apart. It exists so a later reader can *repeat* the walk without repeating
+/// the search: `resolve_type4_surface_ex` finds the surface object by probing up
+/// to 256 task object lists, and that cost is why the page list is cached rather
+/// than re-derived. The walk itself is cheap — one page-table translation per
+/// page — and it is the only thing that can say whether the cached list still
+/// names the guest's memory.
+/// It carries the [`MappingEntry::map_generation`] it was latched at, and a
+/// reader must check that before trusting it. Six sites clear or replace
+/// `page_entries` and every one of them bumps the generation, so a carried-over
+/// walk is unusable by construction rather than by every future writer
+/// remembering to retire a second field — the same rule
+/// [`MappingEntry::guest_write_token_gen`] states for the same reason.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Type4Walk {
+    /// Task whose page table translated the backing pages.
+    pub task_id: u32,
+    /// `getGPUVirtualAddress() >> page_shift` of the surface backing — page `i`
+    /// of the list is `(backing_pfn + i) << page_shift` in that task.
+    pub backing_pfn: u32,
+    /// `map_generation` of the list this walk produced.
+    pub map_generation: u32,
+}
+
+/// Who owns a resource's authoritative bytes, as the guest last stated it and as
+/// the device last produced them.
+///
+/// The bools start `false` because nothing has been said yet, and "nothing has
+/// been said" is a third state that neither `true` nor `false` can carry on its
+/// own: a resource the guest has never named in a validity quad must not be
+/// treated as having been declared stale on either side. `host_stated` and
+/// `guest_stated` record whether the corresponding bit is a statement or a
+/// default.
+///
+/// # Why the two sequence numbers, and not just `host_valid`
+///
+/// `host_valid` alone is a latch, and a latch is wrong here. The guest's
+/// `clear_host_valid` says "my CPU write is newer than your last frame **as of
+/// this submission**". It is not a standing property of the resource: the moment
+/// the device renders into that surface again, the device's frame is the newer
+/// one, and a writeback that reads a latched `host_valid == false` would refuse
+/// to deliver it — forever, since nothing in the protocol re-affirms a resource
+/// the guest is no longer writing.
+///
+/// One measured boot showed exactly that: 2 415 refused writebacks concentrated
+/// on three surfaces (1 800 on one 1240x400 layer, 502 on the 1920x1080 root),
+/// which is one `clear_host_valid` each latching every later frame away.
+///
+/// So the comparison is a happens-before between the guest's last claim and the
+/// device's last publish, both stamped from [`DeviceState::next_validity_seq`].
+/// Causal, not a heuristic: whoever wrote last owns the bytes.
+///
+/// # What the four bools are for, now that the seqs decide
+///
+/// They are the **record** of what the guest said, and nothing reads them to
+/// decide anything. That is deliberate, and not the same as dropping them: the
+/// guest emits four distinct ops and this is where all four land, so a boot can
+/// be asked what it was told and not only what was done about it.
+///
+/// `set_host_valid` in particular drives nothing, because the device has a
+/// strictly better witness for the same fact — its own publish, made when it
+/// happens rather than one submission ahead. One boot measured the two agreeing
+/// on 19 135 of 19 135 stores. Keeping the guest's version as a second input to
+/// the same decision would be two spellings of one value with a way to disagree.
+///
+/// `guest_valid` / `guest_stated` are the only home for `clear_guest_valid` and
+/// `set_guest_valid`, which live traffic barely uses (17 and 0 in a measured
+/// boot).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ResourceValidity {
+    /// The device's copy holds the authoritative bytes.
+    pub host_valid: bool,
+    /// The guest's own pages hold the authoritative bytes.
+    pub guest_valid: bool,
+    /// The guest has set or cleared `host_valid` at least once.
+    pub host_stated: bool,
+    /// The guest has set or cleared `guest_valid` at least once.
+    pub guest_stated: bool,
+    /// Sequence at the guest's last `clear_host_valid` for this resource.
+    /// Zero means the guest has never claimed a CPU write to it.
+    pub host_cleared_seq: u64,
+    /// Sequence at the device's last publication of newer pixels for this
+    /// resource — a deferred Store's content publish, or a write of its guest
+    /// pages.
+    pub host_published_seq: u64,
+}
+
+/// Whether anything has read the copies the last landed render flush made.
+///
+/// A render flush lands one frame in two places: the mapping's guest pages and
+/// the host surface cache. It is armed by a Store and landed by the next fence
+/// with no reader having asked for either copy, so "is this flush owed at all"
+/// is a question about consumers, and nothing measured it. Each leg is marked
+/// unread when a flush lands it, and cleared by the first host-side reader of
+/// that leg, so the *next* flush of the same mapping can report whether the
+/// previous one was consumed.
+///
+/// `pages_unread` staying set does not prove nothing read the pages. The guest
+/// CPU can load them with no device operation at all and leaves no trace here.
+/// It proves only that no reader inside the device took them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RenderFlushWitness {
+    /// A render flush has landed this mapping at least once, so the two flags
+    /// below describe a real flush rather than a mapping that never had one.
+    pub landed: bool,
+    /// The flush stored a host surface cache copy, so `cache_unread` below is
+    /// a statement about a copy that exists.
+    ///
+    /// A flush whose frame was borrowed from the engine's readback buffer
+    /// stores no cache copy at all — it drops the entry instead, because the
+    /// memory holding the frame goes back to the pool
+    /// ([`crate::runtime::mapping_write::write_bgra8_uncached`]). Scoring one
+    /// of those as an unread cache copy would report a copy that was never
+    /// made, and `render_flush_cache_unread` is exactly the number a future
+    /// reader would use to decide whether the cache leg is worth keeping. So
+    /// the leg is only counted where there is a leg.
+    pub cache_stored: bool,
+    /// No host-side reader has taken the host surface cache copy since the
+    /// flush stored it. Meaningful only where `cache_stored`.
+    pub cache_unread: bool,
+    /// No host-side reader has gathered the guest pages since the flush wrote
+    /// them.
+    pub pages_unread: bool,
+    /// `observe::elapsed_us` when the flush landed, so the next one can say how
+    /// long its predecessor survived.
+    ///
+    /// An unread flush replaced a whole frame later is the compositor
+    /// repainting, and is the rate the rail is designed for. An unread flush
+    /// replaced in under a millisecond is a *burst* superseding itself — the
+    /// same surface written and rewritten inside one drain tranche — and that
+    /// is work no fence boundary separated and nothing could have observed
+    /// between. The two have the same `pages_unread` and completely different
+    /// consequences, so the age is what tells them apart.
+    ///
+    /// # Read, and it is the first shape
+    ///
+    /// Two 25 s driven Safari probes on one x86/PCI/Vulkan boot, 121.0 and
+    /// 123.4 fps:
+    ///
+    /// ```text
+    /// render_flush_age_sub_ms         0        0
+    /// render_flush_age_sub_frame     94       92
+    /// render_flush_age_frame_plus  3079     3090
+    /// ```
+    ///
+    /// **No flush is ever replaced inside a millisecond, and 97% survive a
+    /// whole frame.** So the 99% that nothing reads are not redundant writes of
+    /// one surface inside a burst — they are one full-screen composite per
+    /// displayed frame, written back once each, at exactly the rate the guest
+    /// paints. Superseding windows across fence boundaries has nothing to
+    /// collapse, and the rail is at its floor for the rate it is asked to run
+    /// at.
+    ///
+    /// That also reframes the 116 ms drain tranche carrying 19 flushes: those
+    /// are nineteen *frames* of backlog drained at once, not nineteen writes of
+    /// one frame. The worker fell behind and caught up. At `duty` 0.85 it has
+    /// almost no headroom to absorb anything, so a hitch is the flush rail's
+    /// cost showing up as latency rather than a separate defect — and the only
+    /// remaining route to that cost is the one
+    /// [`crate::runtime::storage_flush::flush_mapping_windows_before_fence`]
+    /// names: making the undeclared guest read observable.
+    pub landed_us: u64,
+}
+
 /// IOSurface mapper registry entry keyed by mapping_id.
 #[derive(Clone, Debug, Default)]
 pub struct MappingEntry {
@@ -640,6 +604,13 @@ pub struct MappingEntry {
     pub height: u32,
     pub format: u16,
     pub content_generation: u32,
+    /// What the guest has said about who owns this resource's authoritative
+    /// bytes, driven by the two producers of the validity quad: the per-resource
+    /// table in every `EXEC_INDIRECT2` payload, and `CmdInvalidateResources`.
+    ///
+    /// The host framework carries the matching pair as `PGResource._hostValid` /
+    /// `._guestValid`, set through `setIsHostValid:` / `setIsGuestValid:`.
+    pub validity: ResourceValidity,
     /// Epoch of this mapping's *surface content* in the sense a type-11 render
     /// LOAD needs: it advances whenever the pixels that Load would seed from
     /// could have changed, wherever they live.
@@ -662,6 +633,10 @@ pub struct MappingEntry {
     /// skip its CPU seed entirely. Never read to decide *what* to present or
     /// draw — only whether a known-equal upload can be elided.
     pub surface_content_epoch: u32,
+    /// Who has read what the last landed render flush of this mapping wrote.
+    /// See [`RenderFlushWitness`]; reported by
+    /// [`crate::runtime::storage_flush::note_render_flush_landed`].
+    pub render_flush: RenderFlushWitness,
     /// Bumped whenever the guest page list / map lifetime changes (MAP, UNMAP,
     /// ReplacePhysical, MappingInternal reattach, page-table refresh that
     /// changes PFNs). Used as [`TargetIdentity`] generation for resident
@@ -705,6 +680,42 @@ pub struct MappingEntry {
     /// re-collected the whole page-GPA vector and re-scanned it only to reach
     /// the answer it reached last time.
     pub contig_fragmented_gen: Option<u32>,
+    /// Live [`crate::runtime::host::HostOps::track_guest_writes`] token for the
+    /// page list in [`Self::page_entries`], or 0 when the host cannot observe
+    /// guest writes (or none has been asked for yet).
+    ///
+    /// Retired next to [`Self::contig_ptr`] and for the same reason: both name
+    /// the page list as it stood, so anything that changes the list invalidates
+    /// both. A token that outlived its list would report writes to pages this
+    /// surface no longer owns and miss writes to the ones it does.
+    pub guest_write_token: u64,
+    /// [`Self::map_generation`] the token above was built for.
+    ///
+    /// The lifecycle mutators retire the token eagerly, but they are not the
+    /// only writers of [`Self::page_entries`]: the mapper's plan adoption and
+    /// the type-4 page refresh both replace the list in place, and both retired
+    /// the contiguous view while leaving the token behind — a token naming
+    /// pages the surface no longer owns, which is the one thing it must never
+    /// be. Rather than add a third and a fourth site to remember,
+    /// `map_generation` is the key: every writer of the list already bumps it
+    /// exactly when the list changes, so a token whose generation does not
+    /// match is unusable by construction, and the eager retirement is left as
+    /// what it should have been — a way to free host state promptly rather than
+    /// the thing correctness rests on.
+    pub guest_write_token_gen: u32,
+    /// [`crate::runtime::host::HostOps::guest_write_gen`] as it stood when this
+    /// mapping's pixels were last published by a device Store.
+    ///
+    /// The other half of the type-11 seed currency test.
+    /// [`Self::surface_content_epoch`] can only witness writers inside this
+    /// crate — every caller of `mark_mapping_written` is one — and a surface's
+    /// pages are plain guest RAM the guest CPU stores into with no device
+    /// operation at all. This is what sees that store.
+    ///
+    /// 0 means no Store has stamped it, or the host could not answer, and
+    /// never compares equal to a live generation (the host's first readable
+    /// generation is 1).
+    pub guest_write_gen_at_store: u64,
     /// Task id that last owned this surface as a type-4 `OBJECT_TYPE_SURFACE`
     /// object (0 = no non-trivial hint; task 0 is always probed first anyway).
     /// `resolve_type4_surface_ex` probes this task right after task 0 so a
@@ -712,6 +723,15 @@ pub struct MappingEntry {
     /// task slots. Purely a search-order hint — a stale/wrong value only costs
     /// one extra probe before the full-table fallback re-finds the owner.
     pub owner_task_hint: u32,
+    /// How [`Self::page_entries`] were derived, when they came from a type-4
+    /// surface plan — see [`Type4Walk`]. `None` for every other source, and for
+    /// a mapping whose list has been invalidated.
+    ///
+    /// Distinct from [`Self::owner_task_hint`], which is a *search* hint and is
+    /// allowed to be wrong. This is a statement about the list that is in the
+    /// entry right now: repeat this walk and you must get these entries back, or
+    /// the guest has moved the surface underneath us without saying so.
+    pub type4_walk: Option<Type4Walk>,
 }
 
 /// Exact protocol-backed compute storage-image view eligible for residency.
@@ -873,7 +893,10 @@ pub enum DeferredOwner {
     /// `ComputeStorageResidencyKey`, read with
     /// `engine::read_resident_storage(key, generation)`. The generation is the
     /// resident's **content** generation, unrelated to `key.map_generation`.
-    Storage { generation: u32 },
+    Storage {
+        generation: u32,
+        armed_stamp_seq: u64,
+    },
     /// Type-11 render Store rail: the window **owns the frame it deferred**,
     /// tight BGRA8 at `key.width x key.height`, shared with the
     /// [`crate::runtime::surface_cache`] entry that was stored from the same
@@ -901,8 +924,33 @@ pub enum DeferredOwner {
     /// pixel read dispatches.
     Render {
         armed_seq: u64,
+        armed_stamp_seq: u64,
         source: RenderWindowSource,
     },
+}
+
+impl DeferredOwner {
+    /// [`DeviceState::completion_stamp_seq`] when this window was armed.
+    ///
+    /// Both rails carry it for the same reason [`GvaDeferredEntry::
+    /// armed_stamp_seq`] does: a window that lands after the guest was fenced
+    /// writes memory the guest was already entitled to reclaim, and no check
+    /// taken after the fence can tell that memory apart from the target it used
+    /// to be. Unlike the GVA rail, these windows are keyed by a
+    /// `ComputeStorageResidencyKey` that carries `map_generation`, so the flush
+    /// can already refuse a mapping incarnation the guest replaced — which is
+    /// why this rail is measured before it is changed rather than assumed to
+    /// share the GVA rail's verdict.
+    pub fn armed_stamp_seq(&self) -> u64 {
+        match self {
+            Self::Storage {
+                armed_stamp_seq, ..
+            }
+            | Self::Render {
+                armed_stamp_seq, ..
+            } => *armed_stamp_seq,
+        }
+    }
 }
 
 /// Where a [`DeferredOwner::Render`] window's frame lives.
@@ -930,7 +978,7 @@ pub enum RenderWindowSource {
 
 /// Everything a later flush needs to land a deferred **GVA render Store**
 /// (type-2/3 color0 with `target_gva != 0`): the engine resident
-/// `TargetIdentity::Gva { gva, width, height, generation: 0 }` holds the
+/// `TargetIdentity::Gva { gva, width, height, generation: alloc_gen }` holds the
 /// authoritative pixels; guest pages + `host_gva_surfaces` are stale until a
 /// flush lands them. One window per `gva` — a newer Store at the same GVA
 /// supersedes (same geometry) or flushes (different geometry) the older one.
@@ -948,8 +996,63 @@ pub struct GvaDeferredEntry {
     pub format: u16,
     /// Arm order for oldest-first flush when the window cap is hit.
     pub armed_seq: u64,
+    /// [`DeviceState::completion_stamp_seq`] when this window was armed.
+    ///
+    /// The window's `pages` guard asks whether the GVA still resolves to the
+    /// pages it was armed on. That question is blind to the hazard this field
+    /// names: a guest that frees the render target and lets its own allocator
+    /// hand the same pages to something else keeps the translation identical, so
+    /// the guard passes and the flush writes pixels over whatever moved in. The
+    /// guest is entitled to do that from the moment it is stamped, so a landing
+    /// whose stamp counter has moved is a write the guest never agreed to.
+    pub armed_stamp_seq: u64,
     /// Defer-time physical page GPAs of the guest window — raw task-GVA reads
     /// aliasing these flush first (`storage_flush::flush_intersecting_task_gva`).
+    pub pages: std::collections::HashSet<u64>,
+    /// `generation` of the engine resident this window pinned — the page-set
+    /// hash the arming draw resolved (`DrawEncodeRequest::gva_alloc_gen`).
+    ///
+    /// Stored rather than recomputed. The window exists precisely because the
+    /// address may be handed to another allocation before the flush runs, and a
+    /// walk taken then would name *that* allocation: the registry lookup would
+    /// miss the slot this window is holding pinned, and the frame would be lost
+    /// to a `deferred_flush_lost` instead of landing. Every consumer that
+    /// rebuilds the identity from a window reads this field.
+    pub alloc_gen: u64,
+}
+
+/// Everything a later flush needs to land a deferred **linear compute-storage
+/// Store** (`ComputeStorageResidencyKey::linear` — a raw task GVA, `mapping_id`
+/// 0). The engine resident holds the authoritative pixels;
+/// `storage_flush::flush_linear_one` lands them into guest pages and
+/// `host_linear_textures`.
+///
+/// This window names an *address under a task*, exactly like
+/// [`GvaDeferredEntry`], and for the same reason: a type-2/3 linear texture has
+/// no mapping incarnation to name and the wire format carries no lifecycle
+/// notify for one. The mapping-keyed rails
+/// (`storage_flush::flush_render_one`/`flush_storage_one`) can refuse on
+/// `map_generation` drift because the guest must MAP/UNMAP/ReplacePhysical to
+/// reclaim an IOSurface's storage; nothing of the sort exists here, which is why
+/// this entry carries the same fence stamp the GVA rail carries.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LinearDeferredEntry {
+    /// Engine resident generation the window pinned — `read_resident_storage`'s
+    /// second argument, and the only thing that distinguishes two residents at
+    /// one key.
+    pub generation: u32,
+    /// [`DeviceState::completion_stamp_seq`] when this window was armed.
+    ///
+    /// Same hazard, same reading as [`GvaDeferredEntry::armed_stamp_seq`]: after
+    /// the stamp the guest may free this texture's memory and its own allocator
+    /// may hand those pages to anything without touching a page table, so
+    /// `storage_flush::deferred_pages_still_ours` still passes and the flush
+    /// writes a compute-storage image over whatever moved in.
+    pub armed_stamp_seq: u64,
+    /// Defer-time physical page GPAs of the guest window — raw task-GVA reads
+    /// aliasing these flush first
+    /// (`storage_flush::flush_intersecting_task_gva`), and the writer's own walk
+    /// is bounded to them.
     pub pages: std::collections::HashSet<u64>,
 }
 
@@ -980,11 +1083,46 @@ pub struct GvaHostView {
     pub ptr: usize,
     /// Host view length in bytes (`gpas.len() * page_size`).
     pub ptr_len: usize,
-    /// Leaf GPA of the first/last page at build time — the sampled reuse
-    /// verify re-translates these and retires the view on mismatch (stale
-    /// cached-view read class). `0` = unverifiable (fixtures), skip.
+    /// Leaf GPA of the view's first page at build time.
+    ///
+    /// A registered view is always ONE contiguous run of guest frames —
+    /// `ensure_gva_view` refuses a fragmented span before mapping it — so this
+    /// plus `ptr_len` is the whole GPA list, and the reuse verify re-walks the
+    /// span and compares every page against it. `0` = unverifiable (fixtures),
+    /// skip.
     pub first_gpa: u64,
-    pub last_gpa: u64,
+}
+
+/// Which guest pages a GVA-keyed encode was stored against.
+///
+/// [`DeviceState::host_gva_surfaces`] is keyed by guest **virtual** address, and
+/// a GVA is only a name for whatever the guest's page table points it at right
+/// now. The guest recycles those names hard — the deferred-window drift census
+/// routinely reports every page of a GVA moving between arm and flush — so
+/// "same gva, same geometry" does not mean "same allocation". This records the
+/// physical backing the pixels were produced from, so a later lookup can tell a
+/// mapping that churned and came back (the retained wallpaper class) from a name
+/// the guest handed to a different resource.
+///
+/// The first page, not the whole list. This held a dense `Vec<u64>` — one slot
+/// per guest page, holes included, so a permutation could not read as the same
+/// mapping — and the store walked the entire span to fill it. Nothing ever read
+/// past element 0. `surface_cache::gva_backing_state`, the one consumer that
+/// decides anything, compares the first page and says so in its own doc; the
+/// only reader of `len()` was the gauge reporting how many bytes the lists cost,
+/// which is a measurement of its own overhead. `span` had no reader at all.
+///
+/// So the store now takes one `translate_task_gva`, exactly the call the check
+/// makes, and a 4K entry costs one walk instead of ~2 025. Producer and consumer
+/// ask the identical question, which is the property the dense list was reaching
+/// for and did not have.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GvaBacking {
+    /// Task whose page table the walk used.
+    pub task_id: u32,
+    /// Page-aligned leaf GPA of the span's first page when the pixels were
+    /// stored.
+    pub first_gpa: u64,
 }
 
 /// Host-owned BGRA8 frame for a surface_id (Linux/Vulkan render-cache, §8.5).
@@ -1011,6 +1149,37 @@ pub struct HostSurface {
     /// Decoded object type that produced a GVA-keyed type-2/3 encode. Zero for
     /// surface/ref caches and for stores that did not record an owner.
     pub producer_object_type: u8,
+    /// Recency stamp for the GVA cache's byte cap
+    /// ([`GVA_ENCODE_CACHE_BYTE_CAP`]), from
+    /// [`DeviceState::next_gva_touch`]. Bumped on store **and on every
+    /// confirmed hit**, which is the half that matters: a wallpaper plane is
+    /// stored once and sampled forever, so a stamp advanced only by stores
+    /// would make the most-wanted entry in the map look like the coldest.
+    /// Unused (and left at 0) by the surface_id and texture_ref caches, which
+    /// have no cap.
+    pub last_touch: u64,
+    /// Guest pages these bytes were produced from, for GVA-keyed entries.
+    /// `None` on the surface_id/texture_ref caches (their key is not a guest
+    /// virtual address) and on any GVA store whose walk did not resolve.
+    pub backing: Option<GvaBacking>,
+    // No guest-CPU-write witness sits here, and that is a known gap rather
+    // than an omission. `surface_cache::gva_backing_state` answers whether this
+    // GVA still *names* these pages; nothing answers whether the guest CPU
+    // *wrote* them.
+    // A guest store into pages that never moved produces no notify, no verdict
+    // and no device operation, so this entry can keep serving bytes the guest
+    // has already replaced.
+    //
+    // A `track_guest_writes` token used to sit here for exactly that. It could
+    // never answer: its baseline was latched immediately after the token was
+    // registered, inside the dirty tracker's two-harvest startup window where a
+    // generation reads 0, and was re-latched only by a later store to the same
+    // address. The entries this cache exists for are stored once and sampled
+    // forever, so their baseline stayed 0 for the boot. Over five boots the
+    // comparison it existed to make ran zero times. Anything reinstating it has
+    // to fix that first: re-read the baseline until it is non-zero, the way
+    // `mapper::stamp_guest_write_gen` gets it right on the mapping rail by
+    // re-stamping on every write.
 }
 
 /// Raw type-2/3 texture content retained by the discrete backend.
@@ -1034,41 +1203,12 @@ pub struct HostLinearTexture {
     pub resident_gen: u32,
 }
 
-/// Which sub-path `paint_mapping` used to fill the present frame.
-///
-/// Measure-only provenance for the per-present `paint_us` cost: a deferred-Store
-/// flush reuse and a cold fragmented guest-page read are indistinguishable from
-/// `capture_present_frame` (both leave `from_host_cache == false`), yet the reuse
-/// is a cheap memcpy of an in-hand readback while the cold read is the ~12 ms/
-/// present fragmented multi-import. Collapsing both to `src=guest_pages` hid that
-/// the fast path already covers the overwhelming majority of captures.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum PaintSrc {
-    /// No `paint_mapping` provenance recorded (host_cache path, or not yet run).
-    #[default]
-    None,
-    /// Reused the byte-identical readback the deferred Store flush just scattered
-    /// into the guest pages during this capture's own `flush_intersecting`.
-    ReuseStore,
-    /// Read straight out of the GPU resident (`read_resident_bgra`) with **no**
-    /// guest-page scatter — the oracle frame source. Nothing is owed to the
-    /// guest pages by this read: a type-11 Store writes them on its own path
-    /// (`mapping_write::write_rgba8_image_changed`).
-    Resident,
-    /// Contiguous HostOps view read (packed mapping — one host span).
-    GuestPagesContig,
-    /// Multi-import fragmented guest-page read (the cold ~12 ms/present path).
-    GuestPagesFragmented,
-}
-
 /// Present / scanout model state.
 #[derive(Clone, Debug, Default)]
 pub struct PresentState {
     pub valid: bool,
-    pub mapping_id: u32,
     pub width: u32,
     pub height: u32,
-    pub bpr: u32,
     /// Content generation observed at last DisplaySwap enqueue.
     pub generation: u32,
     /// A host-owned presentation window is live (device_drain refreshes this
@@ -1094,7 +1234,6 @@ pub struct PresentState {
     /// ClearOnly mid 2/3 while Stores land on Composite mid 1/4/5, and naming
     /// the peer there is what makes that split visible in a boot log.
     pub early_front_mapping: u32,
-    pub early_front_generation: u32,
     /// Present/scanout evidence: mapping → latest geometry it was displayed
     /// at (a `capture_present_frame` action or a retained-frame re-show). The
     /// decoded display transaction naming this surface as plane 0 is the only
@@ -1168,8 +1307,6 @@ pub struct PresentState {
     pub backpressure_hold_head: u32,
     /// Always-on diagnostic counter for distinct pending-frames hold episodes.
     pub backpressure_hold_count: u64,
-    /// Sub-path the most recent `paint_mapping` used (measure-only provenance).
-    pub last_paint_src: PaintSrc,
     /// Recycled scratch for the present-capture frame buffer.
     ///
     /// `capture_present_frame` previously did `vec![0u8; need]` on **every**
@@ -1278,19 +1415,148 @@ pub struct PendingWork {
 /// its avoided re-decode/re-convert cost) survives.
 pub const GUEST_LINEAR_MEMO_BYTE_CAP: usize = 128 << 20;
 
-/// Byte cap for the authoritative-cache linear-sampled reuse memo
-/// (`linear_sampled_memo`). Bounds host RAM by real bytes rather than a raw
-/// entry count — 4K frames are ~33 MiB each, so a byte cap is the honest bound.
-pub const LINEAR_SAMPLED_MEMO_BYTE_CAP: usize = 128 << 20;
+/// Byte cap for the GVA-keyed type-2/3 encode cache
+/// ([`DeviceState::host_gva_surfaces`]). Same basis and same value as
+/// [`GUEST_LINEAR_MEMO_BYTE_CAP`], which bounds the sibling cache holding the
+/// same class of content.
+///
+/// A byte cap rather than an entry count for the reason that constant already
+/// states, measured here directly: one 60-resize boot read `gva_largest =
+/// 33 423 360` — a 3840x2176x4 frame, the 4K geometry with its height padded to
+/// a multiple of 64 — while the map's 305 entries totalled 291 MB. Entry count
+/// cannot tell those apart; the same 305 entries would be ~10 GB if every one
+/// had been 4K.
+///
+/// # Why this cache needs a cap at all
+///
+/// It is keyed by guest **virtual** address and the store does
+/// `.entry(gva).or_default()`, so a new geometry at the same GVA replaces and
+/// costs nothing — growth is entirely from *new* GVAs. Every resolution change
+/// has the guest allocate its surfaces at fresh addresses, and until this cap
+/// nothing anywhere dropped the abandoned ones. Measured over 60 guest-driven
+/// resolution changes: 26 entries to 354, **strictly monotonic across all 27
+/// census samples**, never once decreasing, while the set of entries a lookup
+/// could still be served from stayed at ~13.
+///
+/// # Why LRU, and not a staleness rule
+///
+/// The two staleness rules this cache offers both fail, and the measurements
+/// that killed them are worth keeping next to the constant:
+///
+/// - **Dead-task eviction** reclaims nothing. `gva_dead_task` read **0 of 331**
+///   accumulated entries — the compositor survives every resize and simply
+///   allocates new addresses, so every abandoned entry belongs to a task that
+///   is still alive.
+/// - **Evicting what no longer translates would black out the wallpaper.** This
+///   cache is deliberately retained across Unmap — nothing on the Unmap path
+///   touches it — so "the guest unmapped this VA" is the *normal* state of
+///   exactly the content the cache exists to hold: at idle, before any resize,
+///   14 of 27 entries were already unmapped, and a later driven boot read 105
+///   of 138. Only [`crate::runtime::surface_cache::GvaBackingState::Moved`]
+///   carries positive evidence that an address belongs to someone else.
+///
+/// Recency is neither. It is a resource bound, and its safety property is the
+/// one those rules lack: [`crate::model::LruBytesMemo`]'s header already names
+/// this exact case — an entry read every frame but never rewritten (a wallpaper
+/// plane) is touched on every hit, so it is the *hottest* thing in the map and
+/// can never be the victim. Eviction reaches only entries nothing has looked at.
+pub const GVA_ENCODE_CACHE_BYTE_CAP: usize = 128 << 20;
 
-/// See [`DeviceState::linear_sampled_memo`].
-#[derive(Clone, Debug)]
-pub struct LinearSampledMemo {
-    pub gva: u64,
-    pub host_gen: u64,
-    pub width: u32,
-    pub height: u32,
-    pub rgba: std::sync::Arc<Vec<u8>>,
+/// How many evicted keys [`GvaEvictionWitness`] remembers.
+///
+/// A diagnostic ring, so the bound is a choice about how much history to keep,
+/// not a device contract. Sized above the ~305 evictions a 4-minute 60-resize
+/// drive produces so that run is covered exactly; a longer boot overflows it,
+/// and the overflow is *reported* (`forgotten`) rather than silently dropping
+/// the count, because an under-reported harm figure is the failure direction
+/// that reads as a pass.
+pub const GVA_EVICTION_WITNESS_KEYS: usize = 4096;
+
+/// Did evicting for the byte cap cost a lookup that would otherwise have hit?
+///
+/// The cap is the first rule that ever removes a live task's content from
+/// [`DeviceState::host_gva_surfaces`], so its cost must be countable rather
+/// than argued. This remembers the exact `(gva, width, height)` of each evicted
+/// entry and counts the later lookups that missed on one — a miss on a key the
+/// cap dropped is precisely the harm, and nothing else is.
+///
+/// Read `wanted` only together with `evicted`: zero harm and zero evictions is
+/// a cap that never engaged, not a cap that engaged safely, and the two must
+/// not be confused.
+///
+/// # The reading, x86/Vulkan, 40 boots
+///
+/// `evicted=186  wanted=0  forgotten=0`, taken as the per-boot maxima of
+/// `host_cache_levels gva_cap_*` over a 59 MB always-on log. The cap **has**
+/// engaged, so this is the safe-engagement case its own rule above asks for and
+/// not the never-engaged one. `forgotten=0` matters as much as `wanted=0`: the
+/// ring never overflowed, so `wanted` is an exact count and not a lower bound.
+///
+/// That is the whole question this struct exists to answer, and it is answered.
+/// Keep it anyway — it is the standing alarm on a policy `AGENTS.md` treats as a
+/// smell (an eviction rule over storage that may hold the only copy of guest
+/// content), it costs one `BTreeSet` insert per eviction and there have been
+/// 186, and the reading is a property of this workload rather than of the code.
+/// A future session that finds `wanted > 0` is looking at a real regression.
+///
+/// Corrects a standing claim that this cap "never evicts". It does.
+#[derive(Debug, Default)]
+pub struct GvaEvictionWitness {
+    /// Evicted identities still remembered, for the miss test.
+    keys: std::collections::BTreeSet<(u64, u32, u32)>,
+    /// Same identities in eviction order, so the ring drops the oldest.
+    order: std::collections::VecDeque<(u64, u32, u32)>,
+    /// Entries the byte cap has evicted. The denominator.
+    pub evicted: u64,
+    /// Lookups that missed on an identity the cap had evicted. The harm.
+    pub wanted: std::sync::atomic::AtomicU64,
+    /// Identities dropped from the ring before they could be tested. Each one
+    /// is a lookup `wanted` can no longer notice, so a nonzero value makes
+    /// `wanted` a lower bound.
+    pub forgotten: u64,
+}
+
+impl GvaEvictionWitness {
+    /// Record that the cap evicted this identity.
+    pub fn note_evicted(&mut self, gva: u64, width: u32, height: u32) {
+        self.evicted += 1;
+        let key = (gva, width, height);
+        if self.keys.insert(key) {
+            self.order.push_back(key);
+        }
+        while self.order.len() > GVA_EVICTION_WITNESS_KEYS {
+            if let Some(old) = self.order.pop_front() {
+                self.keys.remove(&old);
+                self.forgotten += 1;
+            }
+        }
+    }
+
+    /// A lookup missed. Count it if the cap is why. Takes `&self` because every
+    /// GVA-cache read path holds a shared borrow of the device state.
+    pub fn note_miss(&self, gva: u64, width: u32, height: u32) {
+        if self.keys.contains(&(gva, width, height)) {
+            self.wanted
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// A store re-populated this identity, so a later miss on it is no longer
+    /// attributable to the cap.
+    pub fn note_restored(&mut self, gva: u64, width: u32, height: u32) {
+        if self.keys.remove(&(gva, width, height)) {
+            self.order.retain(|k| *k != (gva, width, height));
+        }
+    }
+
+    /// `(evicted, wanted, forgotten)` for the census line.
+    pub fn counts(&self) -> (u64, u64, u64) {
+        (
+            self.evicted,
+            self.wanted.load(std::sync::atomic::Ordering::Relaxed),
+            self.forgotten,
+        )
+    }
 }
 
 /// See [`DeviceState::guest_linear_memo`].
@@ -1316,50 +1582,19 @@ pub struct GuestLinearMemo {
 /// stalls) and blocks QEMU's main loop (delayed host display refresh). The
 /// opaque `drain_tranche_us` outlier is attributed here so a hitch can be read as
 /// compile/convert/wait/readback-bound without fragile per-draw log correlation.
-/// Counters for the two content memos whose only observable effect is a
-/// skipped re-read: the guest-run signature memo (`run_memo_*`) and the
-/// zero-copy flush signature memo (`zc_flush_*`).
+/// Counters for the zero-copy flush signature memo (`zc_flush_*`), whose only
+/// observable effect is a skipped re-read.
 ///
 /// These name product behavior, not cost: a memo that stops hitting silently
-/// doubles the work per bind, and `stale` is the memo serving bytes the guest
-/// has since rewritten. The tests for both paths assert on these.
+/// doubles the work per bind. The tests for that path assert on these.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct MemoCounters {
-    pub run_memo_hit: u64,
-    pub run_memo_miss: u64,
-    pub run_memo_stale: u64,
     /// Deferred windows a flush-signature check found already landed.
     pub zc_flush_hits: u64,
     /// Binds the signature memo answered without walking the window map.
     pub zc_flush_skip: u64,
     /// Memo answers invalidated by an intervening arm/disarm.
     pub zc_flush_stale: u64,
-}
-
-/// One host-VA run of a memoized guest span (model mirror of the engine's
-/// `GuestRun` so [`DeviceState`] stays backend-independent).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct GuestRunSpan {
-    pub host_ptr: usize,
-    pub len: u64,
-}
-
-/// Memoized task-GVA→host-run resolution for draw-time zero-copy binds.
-///
-/// The per-draw page-table walk (`task_gva_guest_runs`) was the dominant
-/// setup cost (~68 µs/draw under Safari scroll — walking ~60 PT leaves per
-/// 260 KB buffer bind, ~5 binds/draw). The resolved runs are stable until the
-/// guest changes the task page table, so they carry **exactly the
-/// `gva_host_views` invalidation contract**: retired on UnmapMemory /
-/// MapMemory2 overlap, task redefine, and task delete. Entries own no OS
-/// resources (product-Linux `map_pages` is a RAMBlock alias), so retirement
-/// is a plain drop.
-#[derive(Debug, Clone)]
-pub struct GuestRunMemoEntry {
-    pub task_id: u32,
-    pub gva: u64,
-    pub length: u64,
-    pub runs: Arc<Vec<GuestRunSpan>>,
 }
 
 /// A map of deferred writeback windows whose page sets feed the union index
@@ -1404,7 +1639,6 @@ pub struct DeviceState {
     pub page_shift: u32,
     pub gfx: GfxRegs,
     pub iosfc: IosfcRegs,
-    pub is_tahoe: bool,
     pub active_child_mask: u32,
     /// Child channels whose head `EXEC_INDIRECT2` packet is held while an
     /// immutable AIR translation is still loading. The packet head and stamp
@@ -1427,24 +1661,9 @@ pub struct DeviceState {
     pub present_translation_hold_mask: u32,
     pub pending: PendingWork,
     pub child_rings: [ChannelRing; MAX_CHANNELS],
-    pub child_stamps: [ChannelStamps; MAX_CHANNELS],
     pub tasks: [TaskEntry; MAX_TASKS],
     /// Count of MapMemory2/UnmapMemory packets (measure census).
     pub map_family_events: u64,
-    /// Live MapMemory2 spans per task (wire notify ranges). Cleared on Unmap /
-    /// delete_task / redefine. Product GVA writes check coverage when non-empty.
-    pub task_map_spans: Vec<TaskMapSpan>,
-    /// Ranges written while undeclared, kept so a later MapMemory2 covering one
-    /// can confirm it.
-    ///
-    /// The write site cannot distinguish "the guest never declares this memory"
-    /// from "the guest declares it, and the write raced ahead of the
-    /// notification". An event count there cannot separate them either, because
-    /// the evidence for the second arrives *after* the event — the same shape as
-    /// "an event count is not a state", with the state living in the future
-    /// rather than the past. `write_gate_late_map` is the confirming half;
-    /// `write_gate_never_declared`, emitted on eviction, is the alarming one.
-    pub undeclared_writes: Vec<UndeclaredWrite>,
     /// Live object refs per task, as `(task_id, ref)`.
     ///
     /// Membership only — deliberately carries no descriptor payload. Every
@@ -1469,19 +1688,47 @@ pub struct DeviceState {
     pub host_texture_surfaces: BTreeMap<u32, HostSurface>,
     /// Same type-2/3 encode content keyed by target GVA — survives texture_ref
     /// rebinding / small-atlas overwrite of the ref slot.
+    ///
+    /// Bounded by [`GVA_ENCODE_CACHE_BYTE_CAP`] with least-recently-*used*
+    /// eviction; see that constant for why recency and not staleness. Growth is
+    /// entirely from new GVAs — a store at an existing key replaces in place.
     pub host_gva_surfaces: BTreeMap<u64, HostSurface>,
+    /// Monotonic recency counter behind [`HostSurface::last_touch`].
+    pub gva_touch_seq: u64,
+    /// Monotonic ordering counter behind [`ResourceValidity::host_cleared_seq`]
+    /// and `host_published_seq`. See [`Self::next_validity_seq`].
+    pub validity_seq: u64,
+    /// Running sum of `host_gva_surfaces[*].bgra.len()`, so the byte cap can be
+    /// tested without an O(n) pass over the map on every store.
+    ///
+    /// The same running total [`crate::model::LruBytesMemo`] keeps, for the same
+    /// reason: enforcement runs on the store path, which is the draw path, and
+    /// re-summing a map the cap allows to hold thousands of small entries would
+    /// put that walk in front of every encode.
+    ///
+    /// Maintained at exactly the two sites that change a byte count —
+    /// `store_gva_owned` and `evict_gva`; the other `get_mut` reachers touch
+    /// backing, tokens and recency, never `bgra`. Because a running total is a
+    /// second source of truth, the per-second census recomputes the real sum it
+    /// was already computing for `gva_bytes` and reports the difference as
+    /// `gva_cap_drift`: a nonzero value means a new mutation site was added
+    /// without updating this, which is a bug that would otherwise be invisible
+    /// until the cap silently stopped bounding anything.
+    pub gva_cache_bytes: usize,
+    /// The bound [`crate::runtime::surface_cache::enforce_gva_cache_cap`]
+    /// holds [`Self::host_gva_surfaces`] to, always
+    /// [`GVA_ENCODE_CACHE_BYTE_CAP`] in production.
+    ///
+    /// A field rather than the constant read directly so the eviction policy is
+    /// testable: at 128 MiB a test that wanted to cross the cap would have to
+    /// allocate 128 MiB of pixels, so the policy would go untested and only the
+    /// arithmetic around it would not. Nothing in the device writes this.
+    pub gva_cache_byte_cap: usize,
+    /// What [`GVA_ENCODE_CACHE_BYTE_CAP`] cost, measured rather than assumed.
+    pub gva_eviction_witness: GvaEvictionWitness,
     /// Raw compute encode for type-2/3 textures. Retained across GVA unmap;
     /// evicted on task/object lifetime end or descriptor mismatch.
     pub host_linear_textures: BTreeMap<(u32, u32), HostLinearTexture>,
-    /// Perf memo: one swizzled RGBA copy per (gva, generation) for linear
-    /// sampled textures on the render path; repeat draws clone the Arc
-    /// instead of re-copying + re-swizzling the cache bytes. Coherence is
-    /// re-established on every lookup by matching the authoritative
-    /// [`Self::host_gva_surfaces`] entry's gva/generation/geometry - a stale
-    /// entry can never be served, only skipped. Keyed by (task_id, ref).
-    /// Byte-bounded LRU ([`LINEAR_SAMPLED_MEMO_BYTE_CAP`]): a cap crossing evicts
-    /// the coldest entries, never the whole map (no re-copy cliff).
-    pub linear_sampled_memo: LruBytesMemo<(u32, u32), LinearSampledMemo>,
     /// Perf memo for guest-CPU-produced linear textures (no host cache entry,
     /// so no producer generation exists). Coherence is re-established on
     /// every lookup by re-reading the native guest rows and comparing them
@@ -1492,6 +1739,12 @@ pub struct DeviceState {
     /// ([`GUEST_LINEAR_MEMO_BYTE_CAP`]): a cap crossing evicts the least-recently
     /// -used entries down to a low-water mark, never bulk-clearing the hot set.
     pub guest_linear_memo: LruBytesMemo<(u32, u64, u32, u32, u16), GuestLinearMemo>,
+    /// Whether the hypervisor's guest-write generation would be a sound "these
+    /// texels did not change" key for the zero-copy sampled gathers, measured
+    /// against the bytes themselves. See
+    /// [`crate::runtime::gather_witness`] — it selects no behaviour.
+    #[cfg(feature = "backend-vulkan")]
+    pub gather_witness: crate::runtime::gather_witness::GatherWitness,
     /// Monotonic source for every sampled-content generation this device
     /// hands the engine. Read only through
     /// [`DeviceState::next_sampled_content_generation`].
@@ -1510,6 +1763,18 @@ pub struct DeviceState {
     /// `evict_gva` re-creates it on every deferred GVA render Store arm. One
     /// boot's audit caught `(0xa4c000, 1)` naming two different 64x64 icons.
     pub sampled_content_gen: u64,
+    /// Which guest pages this device has written, and when.
+    ///
+    /// The hypervisor dirty bitmap witnesses guest CPU stores and nothing else,
+    /// so a host-side write into the same pages is invisible to it — a copy
+    /// vouched for by "the guest did not write" can still be stale because *we*
+    /// wrote. This is the record that separates the two, and it is page-exact
+    /// because nothing coarser is sound: guest pages are reachable under more
+    /// than one mapping id, so a per-mapping count says nothing about the pages
+    /// themselves, and a device-global one invalidates a texture because an
+    /// unrelated scanout was composited. Both coarser counts were built, measured
+    /// and removed; [`crate::runtime::host_writes`] carries the readings.
+    pub host_writes: crate::runtime::host_writes::HostWrites,
     /// Reusable native-row read buffer for the guest-linear memo path.
     pub guest_linear_scratch: Vec<u8>,
     /// Byte-exact revalidated memo for type-5 serialized texture views
@@ -1521,7 +1786,7 @@ pub struct DeviceState {
     /// ([`GUEST_LINEAR_MEMO_BYTE_CAP`]).
     pub type5_view_memo: LruBytesMemo<(u32, u32, u32, u32, u16), GuestLinearMemo>,
     /// Byte-exact revalidated memo for the type-11 mapping-backed sampled path
-    /// (`load_type11_rgba_static` — small IOSurface textures below the zero-copy
+    /// (`load_type11_mapping_rgba` — small IOSurface textures below the zero-copy
     /// floor, e.g. dock icons under magnification). Same contract as
     /// [`Self::guest_linear_memo`]: every bind re-reads the native BGRA rect;
     /// the BGRA->RGBA convert + the two per-bind allocs + the engine's content
@@ -1557,14 +1822,29 @@ pub struct DeviceState {
     /// change costs one spurious no-op flush call, never a wrong flush — the
     /// windows map stays the single flush authority.
     pub deferred_alias_pages: DeferredWindows<u32, std::collections::HashSet<u64>>,
+    /// Mapping ids the fence-bound writeback has landed a render window on,
+    /// for one measurement and nothing else: does the guest declare its CPU
+    /// reads on the same surfaces this device writes back eagerly?
+    ///
+    /// That question gates whether the writeback could become demand-driven,
+    /// and the `guest_read_dry` count alone cannot answer it — the fence always
+    /// runs first, so every declaration is dry whether or not it names a
+    /// surface the fence just wrote. Comparing the declaration's mapping
+    /// against this set can. Bounded by the number of mappings that ever carry
+    /// a render window, which is single digits on a driven desktop; nothing
+    /// reads it to make a flush decision.
+    pub fence_flushed_mappings: std::collections::BTreeSet<u32>,
     /// Per-mid last write **command class** (ClearOnly vs Composite) — present path.
     pub surface_write_kind: BTreeMap<u32, SurfaceWriteKind>,
     pub present: PresentState,
     pub cursor: CursorState,
     pub display: DisplayHandshake,
+    /// Every `FailEvent` also reached the always-on log through `record_fail`;
+    /// this vec is only how an in-crate test reads them back. It is
+    /// `#[cfg(test)]` because in a product boot nothing ever read it, so it grew
+    /// for the life of the guest holding the one copy of nothing.
+    #[cfg(test)]
     pub fails: Vec<FailEvent>,
-    /// Next async job id for ordered stamps.
-    pub next_job_id: u64,
     /// Last successful directed mapper capture (consumed on matching MAP/UNMAP).
     pub mapper_capture: Option<MapperCapture>,
     /// Cached IOSurfaceParavirtMapperDevice KVA from capture.
@@ -1589,6 +1869,11 @@ pub struct DeviceState {
     /// these via `HostOps::unmap_pages` after dropping the Metal objects that
     /// alias them (`mapper::flush_retired_views`).
     pub retired_views: Vec<(usize, usize)>,
+    /// Guest-write tokens whose page list is gone, awaiting release through
+    /// `HostOps::untrack_guest_writes`. Drained by
+    /// `mapper::flush_retired_views` alongside `retired_views`, for the same
+    /// reason: both are host-side state this crate cannot free itself.
+    pub retired_guest_write_tokens: Vec<u64>,
     /// Task-GVA HostOps views (zero-copy import substrate). Dropped on
     /// overlapping UnmapMemory/MapMemory2; flushed via `retired_views`.
     pub gva_host_views: Vec<GvaHostView>,
@@ -1603,8 +1888,7 @@ pub struct DeviceState {
     /// resident into the cache entry and guest pages first
     /// (`storage_flush::flush_intersecting_task_gva`). Cache-only-shaped
     /// windows never enter — their sync path never wrote guest pages either.
-    pub linear_deferred_flush:
-        DeferredWindows<ComputeStorageResidencyKey, (u32, std::collections::HashSet<u64>)>,
+    pub linear_deferred_flush: DeferredWindows<ComputeStorageResidencyKey, LinearDeferredEntry>,
     /// Deferred GVA render-Store windows (type-2/3 color0, `target_gva != 0`)
     /// whose guest bytes + `host_gva_surfaces` encode the superseded sync path
     /// WOULD have written. The engine resident `TargetIdentity::Gva` is the
@@ -1612,39 +1896,41 @@ pub struct DeviceState {
     pub gva_deferred_flush: DeferredWindows<u64, GvaDeferredEntry>,
     /// Monotonic arm counter for [`Self::gva_deferred_flush`] oldest-first cap.
     pub gva_deferred_seq: u64,
-    /// GVAs rendered this guest lifetime as an **MRT secondary attachment**
-    /// (e.g. the vibrancy RG16Float coverage mask) → its (width, height). The
-    /// producer records the identity + geometry here; a later draw sampling a
-    /// type-2/3 texture at the same GVA binds the engine resident directly
-    /// (`TargetIdentity::Gva{gva,w,h,0}`) instead of reading zero. Coherent by
-    /// construction: only GVAs we actively rendered as secondaries are eligible,
-    /// and the geometry must match the sampler's descriptor. Cleared at guest
-    /// reset with the rest of the lifetime state.
-    pub mrt_secondary_gvas: std::collections::HashMap<u64, (u32, u32)>,
+    /// GVA render target → a hash of the guest physical pages its engine
+    /// resident was last armed over.
+    ///
+    /// The census behind `gvares_*`: how hard the guest recycles a render
+    /// target's address. The page list behind a GVA is the allocation's identity
+    /// — same pages means literally the same memory — so a second arm at the
+    /// same address and geometry with a *different* hash is a second allocation
+    /// at a name the first one still holds.
+    ///
+    /// The same hash is the `generation` of the resident's registry key
+    /// (`TargetIdentity::Gva`), so those arms now get their own GPU image rather
+    /// than inheriting the previous allocation's pixels. This map is what says
+    /// how often that separation is doing work, and it is deliberately
+    /// independent of the key: a census that reads the thing it is scoring
+    /// cannot report the day the two stop agreeing.
+    ///
+    /// Kept as a hash rather than the page list because this is a census, and
+    /// the question is only whether two arms disagree.
+    pub gva_resident_backing: std::collections::BTreeMap<u64, (u32, u32, u64)>,
+    /// Completion stamps written to the guest this device lifetime.
+    ///
+    /// A stamp is the guest's fence: [`crate::runtime::drain::write_stamp`] puts
+    /// the value in the FIFO page and raises the GPU IRQ, and from that instant
+    /// the guest is entitled to treat the work as finished and reclaim anything
+    /// it allocated for it. Counting stamps gives every deferred window an
+    /// answer to the one question its page-set guard cannot ask: was the guest
+    /// told this render was done before we wrote its bytes?
+    pub completion_stamp_seq: u64,
     /// GVA windows whose task died (`delete_task`) — the GVA walk is gone, so
     /// the runtime lands these **cache-only** (no guest write) and unpins
     /// (`storage_flush::retire_gva_windows`).
     pub retired_gva_windows: Vec<(u64, GvaDeferredEntry)>,
-    /// Mappings presented (CmdDisplaySwap capture) since our last LOAD draw
-    /// into them. The present declares the guest pages the finished frame and
-    /// the guest may CPU-write them afterwards (inter-buffer damage
-    /// forward-copy — no device command, no 0x35), so the first LOAD draw
-    /// after a mapping's own present seeds from guest pages instead of
-    /// chaining the resident (dual-mid strobe class). Consumed at the type-11
-    /// Load seed decision (`metal_draw::resolve_type11_load_choice`).
-    pub presented_needs_guest_seed: std::collections::BTreeSet<u32>,
     /// Content-memo hit/miss/stale counters. See [`MemoCounters`].
     pub tranche: MemoCounters,
-    /// Draw-time zero-copy run memo. See [`GuestRunMemoEntry`] for the
-    /// invalidation contract (mirrors `gva_host_views` exactly). A `VecDeque`
-    /// so the FIFO cap evict is an O(1) `pop_front` rather than a `Vec`
-    /// `remove(0)` that shifts all `GUEST_RUN_MEMO_CAP` (512) entries on every
-    /// miss once full.
-    pub guest_run_memo: std::collections::VecDeque<GuestRunMemoEntry>,
-    /// Covering-view reuse counter — drives the 1-in-32 sampled staleness
-    /// verify in `ensure_gva_view` (stale cached-view read class).
-    pub view_verify_ctr: u64,
-    /// Total stale views the sampled verify caught (fail-logged as
+    /// Total stale views the reuse verify caught (fail-logged as
     /// `gva_view_stale`; the view self-heals via retire + rebuild).
     pub view_stale_reads: u64,
     /// Draw-time buffer-bind coherence-flush no-intersection memo. Maps a
@@ -1656,8 +1942,8 @@ pub struct DeviceState {
     /// the cached `gpa_pages` against the current deferred windows **without a PT
     /// walk** (the FFI page translate is the expensive part) — only a real
     /// intersection falls back to the full walk. The pages stay valid until the
-    /// task PT remaps the gva range, which invalidates the entry exactly where
-    /// `guest_run_memo` is. A 1-in-64 sampled full walk ([`flush_verify_ctr`])
+    /// task PT remaps the gva range, which is where the entry is invalidated.
+    /// A 1-in-64 sampled full walk ([`flush_verify_ctr`])
     /// self-heals a missed PT remap. Only fully-probed spans are cached (a
     /// strided walk's page set is incomplete, so it is never stored).
     pub flush_nohit_memo: std::collections::HashMap<(u32, u64, u64), (u64, Vec<u64>)>,
@@ -1709,7 +1995,6 @@ impl DeviceState {
             page_shift,
             gfx: GfxRegs::default(),
             iosfc: IosfcRegs::default(),
-            is_tahoe: false,
             active_child_mask: 0,
             translation_deferred_mask: 0,
             translation_order_hold_mask: 0,
@@ -1718,20 +2003,23 @@ impl DeviceState {
             present_translation_hold_mask: 0,
             pending: PendingWork::default(),
             child_rings: std::array::from_fn(|_| ChannelRing::default()),
-            child_stamps: std::array::from_fn(|_| ChannelStamps::default()),
             tasks: std::array::from_fn(|_| TaskEntry::default()),
             map_family_events: 0,
-            task_map_spans: Vec::new(),
-            undeclared_writes: Vec::new(),
             objects: std::collections::BTreeSet::new(),
             texture_to_mapping: BTreeMap::new(),
             mappings: BTreeMap::new(),
             host_surfaces: BTreeMap::new(),
             host_texture_surfaces: BTreeMap::new(),
             host_gva_surfaces: BTreeMap::new(),
+            gva_touch_seq: 0,
+            validity_seq: 0,
+            gva_cache_bytes: 0,
+            gva_cache_byte_cap: GVA_ENCODE_CACHE_BYTE_CAP,
+            gva_eviction_witness: GvaEvictionWitness::default(),
             host_linear_textures: BTreeMap::new(),
             compute_storage_residency: BTreeMap::new(),
             compute_deferred_flush: BTreeMap::new(),
+            fence_flushed_mappings: std::collections::BTreeSet::new(),
             surface_deferred_seq: 0,
             deferred_alias_pages: DeferredWindows::new(),
             surface_write_kind: BTreeMap::new(),
@@ -1743,30 +2031,31 @@ impl DeviceState {
             mapper_capture: None,
             mapper_device_kva: 0,
             display: DisplayHandshake::default(),
+            #[cfg(test)]
             fails: Vec::new(),
-            next_job_id: 1,
             fence_generations: BTreeMap::new(),
             draining_channel: 0,
             draining_mask: 0,
             retired_views: Vec::new(),
+            retired_guest_write_tokens: Vec::new(),
             retired_linear_residents: Vec::new(),
             linear_deferred_flush: DeferredWindows::new(),
             gva_deferred_flush: DeferredWindows::new(),
-            mrt_secondary_gvas: std::collections::HashMap::new(),
             gva_deferred_seq: 0,
+            completion_stamp_seq: 0,
+            gva_resident_backing: std::collections::BTreeMap::new(),
             retired_gva_windows: Vec::new(),
-            linear_sampled_memo: LruBytesMemo::new(LINEAR_SAMPLED_MEMO_BYTE_CAP),
             guest_linear_memo: LruBytesMemo::new(GUEST_LINEAR_MEMO_BYTE_CAP),
+            #[cfg(feature = "backend-vulkan")]
+            gather_witness: crate::runtime::gather_witness::GatherWitness::default(),
             sampled_content_gen: 0,
+            host_writes: crate::runtime::host_writes::HostWrites::default(),
             guest_linear_scratch: Vec::new(),
             type5_view_memo: LruBytesMemo::new(GUEST_LINEAR_MEMO_BYTE_CAP),
             type11_memo: LruBytesMemo::new(GUEST_LINEAR_MEMO_BYTE_CAP),
             type11_memo_scratch: Vec::new(),
-            presented_needs_guest_seed: std::collections::BTreeSet::new(),
             gva_host_views: Vec::new(),
             tranche: MemoCounters::default(),
-            guest_run_memo: std::collections::VecDeque::new(),
-            view_verify_ctr: 0,
             view_stale_reads: 0,
             flush_nohit_memo: std::collections::HashMap::new(),
             flush_verify_ctr: 0,
@@ -1791,13 +2080,13 @@ impl DeviceState {
         s = s
             .wrapping_mul(P)
             .wrapping_add(self.linear_deferred_flush.len() as u64);
-        for (key, (generation, pages)) in &self.linear_deferred_flush {
+        for (key, entry) in &self.linear_deferred_flush {
             s = s
                 .wrapping_mul(P)
                 .wrapping_add(key.texture_ref as u64)
                 .wrapping_add((key.map_generation as u64) << 12)
-                .wrapping_add((*generation as u64) << 28)
-                .wrapping_add((pages.len() as u64) << 44);
+                .wrapping_add((entry.generation as u64) << 28)
+                .wrapping_add((entry.pages.len() as u64) << 44);
         }
         s = s
             .wrapping_mul(P)
@@ -1864,34 +2153,42 @@ impl DeviceState {
         generation: u32,
         pages: std::collections::HashSet<u64>,
     ) {
-        if let Some((_, old)) = self.linear_deferred_flush.get(&key) {
-            let old = old.clone();
+        if let Some(old) = self.linear_deferred_flush.get(&key) {
+            let old = old.pages.clone();
             self.deferred_ref_sub_pages(&old);
         }
         self.deferred_ref_add_pages(&pages);
-        self.linear_deferred_flush
-            .0
-            .insert(key, (generation, pages));
+        let armed_stamp_seq = self.completion_stamp_seq;
+        self.linear_deferred_flush.0.insert(
+            key,
+            LinearDeferredEntry {
+                generation,
+                armed_stamp_seq,
+                pages,
+            },
+        );
     }
 
     /// Disarm a linear compute-storage deferred window, keeping the union index
     /// in sync.
     ///
-    /// Returns the page set the window was armed against, so a caller about to
-    /// write those guest pages can check they still belong to this window (see
-    /// `runtime::storage_flush::deferred_pages_still_ours`). This used to return
-    /// a bare `bool` and drop the pages on the floor, which left the flush with
-    /// no way to tell that the guest had re-pointed the span since defer time —
-    /// the same hazard the GVA rail already guards. `Some` still means "an entry
-    /// was present", so the presence test is unchanged for callers that only
-    /// want that.
+    /// Returns the whole window, so a caller about to write those guest pages
+    /// can check they still belong to this window (see
+    /// `runtime::storage_flush::deferred_pages_still_ours`) and can score the
+    /// landing against the fence the window was armed under
+    /// ([`LinearDeferredEntry::armed_stamp_seq`]). This used to return a bare
+    /// `bool` and drop the pages on the floor, which left the flush with no way
+    /// to tell that the guest had re-pointed the span since defer time — the
+    /// same hazard the GVA rail already guards. `Some` still means "an entry was
+    /// present", so the presence test is unchanged for callers that only want
+    /// that.
     pub fn disarm_linear_deferred_window(
         &mut self,
         key: &ComputeStorageResidencyKey,
-    ) -> Option<std::collections::HashSet<u64>> {
-        let (_, pages) = self.linear_deferred_flush.0.remove(key)?;
-        self.deferred_ref_sub_pages(&pages);
-        Some(pages)
+    ) -> Option<LinearDeferredEntry> {
+        let entry = self.linear_deferred_flush.0.remove(key)?;
+        self.deferred_ref_sub_pages(&entry.pages);
+        Some(entry)
     }
 
     /// Detach `e`'s contiguous view for later unmap (page table changed).
@@ -1906,6 +2203,20 @@ impl DeviceState {
         Some(v)
     }
 
+    /// Detach the guest-write token, returning it for release through
+    /// [`crate::runtime::host::HostOps::untrack_guest_writes`].
+    ///
+    /// Called wherever [`Self::take_mapping_view`] is: the token and the view
+    /// both name the page list as it stood, so a change to the list retires
+    /// both. Also clears the Store stamp — a generation recorded against a
+    /// released token cannot vouch for anything, and leaving it would let a
+    /// re-tracked set's first readable generation coincide with it.
+    fn take_guest_write_token(e: &mut MappingEntry) -> u64 {
+        e.guest_write_gen_at_store = 0;
+        e.guest_write_token_gen = 0;
+        std::mem::replace(&mut e.guest_write_token, 0)
+    }
+
     /// Detach every HostOps mapping owned by the current guest lifetime.
     ///
     /// Device reset is a lifetime boundary even when QEMU itself remains alive.
@@ -1913,15 +2224,24 @@ impl DeviceState {
     /// then release them through the bound HostOps implementation.
     pub fn take_all_host_views(&mut self) -> Vec<(usize, usize)> {
         let mut views = std::mem::take(&mut self.retired_views);
+        let mut tokens = std::mem::take(&mut self.retired_guest_write_tokens);
         for mapping in self.mappings.values_mut() {
             if let Some(view) = Self::take_mapping_view(mapping) {
                 views.push(view);
             }
+            let token = Self::take_guest_write_token(mapping);
+            if token != 0 {
+                tokens.push(token);
+            }
         }
+        // Back onto the retired list rather than out through the return value:
+        // the caller's contract is "invalidate backend aliases, then release
+        // views", and a token release is neither. `flush_retired_views` drains
+        // both, and a device reset always runs it.
+        self.retired_guest_write_tokens = tokens;
         views.extend(self.gva_host_views.drain(..).filter_map(|view| {
             (view.ptr != 0 && view.ptr_len != 0).then_some((view.ptr, view.ptr_len))
         }));
-        self.guest_run_memo.clear();
         self.flush_nohit_memo.clear();
         views
     }
@@ -2056,16 +2376,6 @@ impl DeviceState {
         // Same rule for the presented-seq witness: a recycled id must not
         // compare its first present against a predecessor's seq.
         self.present.presented_dense_seq.remove(&mapping_id);
-        // Prune the present-boundary seed flag too. It marks "this mid was just
-        // presented, so its next LOAD re-seeds from the front" — a per-lifetime
-        // signal that MUST NOT survive a teardown. Left stale, a recycled
-        // mapping_id (a new, logically-unrelated surface reusing this id after
-        // DeleteIOSurfaceBacking2) would have its FIRST LOAD draw consume this
-        // flag, take the present-boundary seed path, and bleed the CURRENT
-        // retained front frame (a different surface's pixels at +0x188) over its
-        // own ready resident — the "background/window content doesn't clear
-        // cleanly" residue class.
-        self.presented_needs_guest_seed.remove(&mapping_id);
     }
 
     /// Last write class for present keep-prior decisions.
@@ -2101,21 +2411,20 @@ impl DeviceState {
         let intr_gpu = Arc::clone(&self.gfx.interrupt_status_gpu);
         let intr_fault = Arc::clone(&self.gfx.interrupt_fault);
         let fifo_read = Arc::clone(&self.gfx.fifo_read);
+        let child_rung = Arc::clone(&self.gfx.child_doorbell_rung);
         intr_disp.store(0, Ordering::Release);
         intr_gpu.store(0, Ordering::Release);
         intr_fault.store(0, Ordering::Release);
         fifo_read.store(0, Ordering::Release);
+        // Cleared as well as kept: a reset drops every channel, so a bit rung
+        // before it names a channel that no longer exists.
+        child_rung.store(0, Ordering::Release);
         *self = Self::new(id, page_shift);
         self.gfx.interrupt_status_disp = intr_disp;
         self.gfx.interrupt_status_gpu = intr_gpu;
         self.gfx.interrupt_fault = intr_fault;
         self.gfx.fifo_read = fifo_read;
-    }
-
-    pub fn alloc_job_id(&mut self) -> u64 {
-        let id = self.next_job_id;
-        self.next_job_id = self.next_job_id.saturating_add(1);
-        id
+        self.gfx.child_doorbell_rung = child_rung;
     }
 
     /// Queue the engine-unpin for a dying linear cache entry that still owns a
@@ -2157,15 +2466,41 @@ impl DeviceState {
         }
     }
 
-    /// Deferred GVA render-Store windows lose their GVA walk with the task
-    /// (walks try `task_id` then `task_id >> 1`) — hand them to the runtime
-    /// for a cache-only landing (`storage_flush::retire_gva_windows`); never
-    /// write guest pages from teardown.
+    /// Deferred GVA render-Store windows lose their GVA walk with the task —
+    /// hand them to the runtime for a cache-only landing
+    /// (`storage_flush::retire_gva_windows`); never write guest pages from
+    /// teardown.
+    ///
+    /// Only this task's windows. Both sides of the comparison are slot ids:
+    /// `GvaDeferredEntry::task_id` is the word `task_slot::resolve_task_word`
+    /// accepted, and `DeleteTask` (`0x20`) carries a slot id too — its words
+    /// include `5`, `11` and `13`, odd and greater than one, which the
+    /// `DefineTask2` doubled space (`0x1`, then strictly even) does not contain,
+    /// and all 968 deletes measured across the boots on disk report `ok=1`
+    /// against a live slot.
+    ///
+    /// So a `task_id >> 1` arm here matched no window this task owns and did
+    /// match every window owned by slots `2 * task_id` and `2 * task_id + 1`.
+    /// Slots run densely from 0 out of [`MAX_TASKS`] = 256, and boots use ids
+    /// well past 14, so those are live tasks: deleting task 5 retired tasks 10
+    /// and 11's pending frames. Cache-only landing writes no guest pages, so the
+    /// effect was a live task silently losing rendered pixels out of guest RAM
+    /// and the guest compositing whatever those pages held before.
+    ///
+    /// Do not widen this back for symmetry with
+    /// [`crate::runtime::gva_view::task_matches`], which deliberately keeps an
+    /// aliased arm at its own overlap-retire site. The two are not the same
+    /// shape, and copying that pattern here without the asymmetry is how this
+    /// arrived. A *view* is a cached translation, so retiring one that did not
+    /// need retiring costs a re-walk and nothing else. A *window* is pixels this
+    /// device owes guest RAM, and retiring one lands it cache-only — the bytes
+    /// never reach the guest and nothing re-derives them. Widening is
+    /// conservative for the first and lossy for the second.
     fn retire_task_gva_windows(&mut self, task_id: u32) {
         let doomed: Vec<u64> = self
             .gva_deferred_flush
             .iter()
-            .filter(|(_, e)| e.task_id == task_id || e.task_id >> 1 == task_id)
+            .filter(|(_, e)| e.task_id == task_id)
             .map(|(&gva, _)| gva)
             .collect();
         for gva in doomed {
@@ -2205,7 +2540,6 @@ impl DeviceState {
         self.retire_task_linear_residents(task_id);
         self.retire_task_gva_windows(task_id);
         self.host_linear_textures.retain(|&(t, _), _| t != task_id);
-        self.clear_task_map_spans(task_id);
         // New directory ⇒ old GVA HostOps views alias the wrong PT — retire.
         self.retire_task_gva_views(task_id);
         self.tasks[task_id as usize] = TaskEntry::define(length, directory_pfn);
@@ -2233,327 +2567,7 @@ impl DeviceState {
                 i += 1;
             }
         }
-        self.guest_run_memo.retain(|e| e.task_id != task_id);
         self.flush_nohit_memo.retain(|&(t, _, _), _| t != task_id);
-    }
-
-    /// Record a MapMemory2 span (guest already installed PTEs; notify only).
-    pub fn note_task_map(&mut self, task_id: u32, gva: u64, length: u64) {
-        if gva == 0 || length == 0 {
-            return;
-        }
-        // Replace exact duplicate; keep other spans.
-        self.task_map_spans
-            .retain(|s| !(s.task_id == task_id && s.gva == gva && s.length == length));
-        self.task_map_spans.push(TaskMapSpan {
-            task_id,
-            gva,
-            length,
-        });
-        self.confirm_undeclared_writes(task_id, gva, length);
-    }
-
-    /// Say so when a MapMemory2 covers a range already written while undeclared.
-    ///
-    /// This is the confirming half of the permit. The write site cannot see a
-    /// notification that has not arrived, so "the guest does declare this and we
-    /// were merely early" is only sayable from the map side, and it is the
-    /// evidence that permitting was right rather than a hope.
-    fn confirm_undeclared_writes(&mut self, task_id: u32, gva: u64, length: u64) {
-        if self.undeclared_writes.is_empty() {
-            return;
-        }
-        let span = TaskMapSpan {
-            task_id,
-            gva,
-            length,
-        };
-        let now = crate::observe::elapsed_ms() as u64;
-        let mut landed: Vec<UndeclaredWrite> = Vec::new();
-        self.undeclared_writes.retain(|r| {
-            if r.task_id != task_id || !span.covers(r.gva, r.len) {
-                return true;
-            }
-            landed.push(*r);
-            false
-        });
-        for r in landed {
-            let late_ms = now.saturating_sub(r.at_ms);
-            crate::observe::off(format!(
-                "write_gate_late_map task={} gva={:#x} len={:#x} via={} \
-                 span_gva={gva:#x} span_len={length:#x} late_ms={late_ms}",
-                r.task_id, r.gva, r.len, r.via
-            ));
-        }
-    }
-
-    /// Hold a range written while undeclared, for
-    /// [`Self::confirm_undeclared_writes`]. Returns whether it was newly
-    /// recorded.
-    ///
-    /// The write proceeds — see [`WriteGate`] for why a notification cannot
-    /// authorise anything — but a host→guest write outside everything the guest
-    /// has told us about is the shape the open memory-corruption signature would
-    /// take, so it goes on the record with the rail that issued it. Callers emit
-    /// their own line and use the return value to do so **once per distinct
-    /// range**: a per-row writer touching the same bytes every frame would
-    /// otherwise flood the log and evict older, different findings out of the
-    /// ring, and the readouts worth printing alongside cost a page walk.
-    pub fn note_undeclared_write(
-        &mut self,
-        task_id: u32,
-        gva: u64,
-        len: u64,
-        via: &'static str,
-    ) -> bool {
-        if len == 0 {
-            return false;
-        }
-        let end = gva.saturating_add(len);
-        // Coalesce rather than dedup on the exact range. Several rails write one
-        // region a row at a time — `copy_region` walks `dst_row_stride`, the
-        // linear fallback walks `row_stride` — so an exact-match dedup would
-        // record 135 entries for one 135-row texture, flood the log and evict
-        // every older finding. Overlapping or touching ranges are one region and
-        // one finding; merging them also makes the confirming MapMemory2 prove
-        // coverage of the whole region rather than of its first row.
-        for r in &mut self.undeclared_writes {
-            if r.task_id != task_id || r.via != via {
-                continue;
-            }
-            let r_end = r.gva.saturating_add(r.len);
-            if gva > r_end || end < r.gva {
-                continue;
-            }
-            let lo = r.gva.min(gva);
-            r.len = r_end.max(end).saturating_sub(lo);
-            r.gva = lo;
-            return false;
-        }
-        // Evicting an entry means no MapMemory2 ever covered it. That is the
-        // reading this whole pair exists to make legible, and it is the one that
-        // cannot be taken at the write site: it is knowable only by outliving
-        // the notification that should have arrived. Healthy operation retires
-        // every entry in tens of milliseconds and never gets here.
-        //
-        // Latched per (task, rail): a run that is genuinely writing memory the
-        // guest never declares would otherwise emit this at the rate it writes,
-        // and the second line adds nothing the first did not say.
-        if self.undeclared_writes.len() >= UNDECLARED_WRITE_RING {
-            let old = self.undeclared_writes.remove(0);
-            if crate::observe::first_sight(
-                "write_gate_never_declared",
-                (u64::from(old.task_id) << 32) ^ old.via.len() as u64 ^ old.via.as_ptr() as u64,
-            ) {
-                let age_ms = (crate::observe::elapsed_ms() as u64).saturating_sub(old.at_ms);
-                crate::observe::fail(format!(
-                    "write_gate_never_declared task={} gva={:#x} len={:#x} via={} age_ms={age_ms} \
-                     outstanding={UNDECLARED_WRITE_RING}",
-                    old.task_id, old.gva, old.len, old.via
-                ));
-            }
-        }
-        self.undeclared_writes.push(UndeclaredWrite {
-            task_id,
-            gva,
-            len,
-            at_ms: crate::observe::elapsed_ms() as u64,
-            via,
-        });
-        true
-    }
-
-    /// Drop MapMemory2 spans overlapping Unmap `[gva, gva+length)`.
-    pub fn note_task_unmap(&mut self, task_id: u32, gva: u64, length: u64) {
-        if gva == 0 || length == 0 {
-            return;
-        }
-        let end = gva.saturating_add(length);
-        self.task_map_spans.retain(|s| {
-            if s.task_id != task_id {
-                return true;
-            }
-            let s_end = s.gva.saturating_add(s.length);
-            // Keep spans that do not overlap the unmap range.
-            !(s.gva < end && gva < s_end)
-        });
-    }
-
-    pub fn clear_task_map_spans(&mut self, task_id: u32) {
-        self.task_map_spans.retain(|s| s.task_id != task_id);
-    }
-
-    /// Classify `[gva, gva+len)` against the MapMemory2 spans this task has
-    /// notified so far. **A reading, not a permission** — see [`WriteGate`].
-    ///
-    /// Callers report `Undeclared` through
-    /// [`Self::note_undeclared_write`] and proceed. The check that actually
-    /// bounds a host→guest write is the page-table walk every writer performs
-    /// at write time, which fails closed on an unmapped page; this one says
-    /// whether the guest has got round to telling us about the allocation yet,
-    /// and the answer is routinely "not yet".
-    pub fn gva_write_gate(&self, task_id: u32, gva: u64, len: u64) -> WriteGate {
-        if len == 0 {
-            return WriteGate::Exact;
-        }
-        // Spans filed by `task_id` and nothing else. This used to also accept a
-        // span filed under `task_id >> 1`, which is the wire-word halving that
-        // `runtime::task_slot` already refuted and removed from the command
-        // resolvers: `MapMemory2` files spans under slot ids (`0x5`, `0x7`,
-        // `0x9`), which the `DefineTask2` wire space does not contain, so
-        // halving a slot id names a **different task**. The gate was therefore
-        // authorising a write with a different task's map — and the write that
-        // followed walked the *named* task's page tables, because
-        // `gva_view::resolve_task_for_walk` never halves. Authorisation and
-        // destination came from two different address spaces.
-        let mut saw_any = false;
-        for s in &self.task_map_spans {
-            if s.task_id != task_id {
-                continue;
-            }
-            saw_any = true;
-            if s.covers(gva, len) {
-                return WriteGate::Exact;
-            }
-        }
-        if saw_any {
-            WriteGate::Undeclared
-        } else {
-            WriteGate::NoSpans
-        }
-    }
-
-    /// Every task id holding a span that covers `[gva, gva+len)`, ascending and
-    /// deduplicated. **Readout only** — [`Self::gva_write_gate`] does not call
-    /// this and nothing may branch on it.
-    ///
-    /// This exists because the gate cannot answer it. The gate considers spans
-    /// filed under the writing task and no other, which is the whole point of
-    /// it; what a refusal leaves unknown is whether some *other* task declared
-    /// this range, and the only way to see that is to look without the filter.
-    /// A refused write whose `owners` names one specific other task every time
-    /// is a decode question about which key space that opcode's word is in — it
-    /// is not licence to write through the named task's page tables anyway,
-    /// which is what the removed alias arm did.
-    ///
-    /// Ambiguity is a property of the registry at the instant of the write, so
-    /// it is read from the registry rather than counted from map/unmap events: a
-    /// count of registrations would say how many spans were filed, never which
-    /// of them authorise this particular range right now.
-    pub fn tasks_covering(&self, gva: u64, len: u64) -> Vec<u32> {
-        if len == 0 {
-            return Vec::new();
-        }
-        let mut owners: Vec<u32> = self
-            .task_map_spans
-            .iter()
-            .filter(|s| s.covers(gva, len))
-            .map(|s| s.task_id)
-            .collect();
-        owners.sort_unstable();
-        owners.dedup();
-        owners
-    }
-
-    /// How many MapMemory2 spans the registry holds in total, across all tasks.
-    ///
-    /// Pairs with [`WriteGate::NoSpans`], whose name overstates what it saw: it
-    /// means "no span for this task or its one alias", which is not the same as
-    /// an empty registry, and only one of those two is "the gate did not run".
-    pub fn task_map_span_count(&self) -> usize {
-        self.task_map_spans.len()
-    }
-
-    /// How many spans `task_id` has filed of its own, ignoring every other task.
-    ///
-    /// Separates the two things [`WriteGate::Aliased`] currently collapses. If
-    /// the writing task has registered nothing, the honest reading is that its
-    /// bounds check did not run and a neighbour's span was found by the alias
-    /// search — an ordering fact. If it has spans and none covers, the range is
-    /// one the guest never mapped for it — a bounds fact. Neither is visible
-    /// from the arm alone, and they call for opposite fixes.
-    pub fn task_own_span_count(&self, task_id: u32) -> usize {
-        self.task_map_spans
-            .iter()
-            .filter(|s| s.task_id == task_id)
-            .count()
-    }
-
-    /// Where a refused range sits relative to the spans the writing task filed
-    /// **for itself**, at page granularity.
-    ///
-    /// The refusal already says the range is not covered by one span. That is
-    /// consistent with at least three different defects and the fix differs for
-    /// each, so the line has to say which:
-    ///
-    /// - `union == pages` — every page *is* declared, just not by a single
-    ///   span, and [`Self::gva_write_gate`]'s one-span rule is the whole bug.
-    /// - `union == 0` and the range sits outside `[lo, hi)` — the task uses an
-    ///   allocation regime it never declares, so `task_map_spans` is not an
-    ///   authorization set at all and no relaxation of the rule can help.
-    /// - `union == 0` inside `[lo, hi)` — a hole between declared spans, which
-    ///   points at [`Self::note_task_unmap`] dropping more than it should, or a
-    ///   map we never recorded.
-    ///
-    /// Counted per page rather than per byte because that is the granularity
-    /// the guest's own page tables and every walk in this crate work in, and a
-    /// partial page cannot be authorised separately from the page holding it.
-    pub fn task_span_readout(
-        &self,
-        task_id: u32,
-        gva: u64,
-        len: u64,
-        page_shift: u32,
-    ) -> TaskSpanReadout {
-        let mut out = TaskSpanReadout::default();
-        if len == 0 {
-            return out;
-        }
-        let page = 1u64 << page_shift;
-        let first = gva & !(page - 1);
-        let last = gva.saturating_add(len - 1) & !(page - 1);
-        out.pages = ((last - first) >> page_shift).saturating_add(1);
-        let end = gva.saturating_add(len);
-        for s in self.task_map_spans.iter().filter(|s| s.task_id == task_id) {
-            let s_end = s.gva.saturating_add(s.length);
-            out.lo = if out.own == 0 {
-                s.gva
-            } else {
-                out.lo.min(s.gva)
-            };
-            out.hi = out.hi.max(s_end);
-            out.own += 1;
-            // Distance to the nearest declared span, 0 when one overlaps at all.
-            // An overlapping-but-not-covering span is a different finding from a
-            // range that lands nowhere near anything the task declared, and the
-            // single-span rule renders both as `Outside`.
-            let gap = if s.gva < end && gva < s_end {
-                0
-            } else if s.gva >= end {
-                s.gva - end
-            } else {
-                gva - s_end
-            };
-            out.nearest_gap = Some(out.nearest_gap.map_or(gap, |g: u64| g.min(gap)));
-        }
-        // Second pass: page coverage by the union. Separate from the extent scan
-        // above because a page is covered by *any* span, so it cannot be decided
-        // while still walking them.
-        let mut cur = first;
-        loop {
-            let covered = self
-                .task_map_spans
-                .iter()
-                .any(|s| s.task_id == task_id && s.covers(cur, page));
-            if covered {
-                out.union += 1;
-            }
-            if cur == last {
-                break;
-            }
-            cur += page;
-        }
-        out
     }
 
     /// PVG `CmdDeleteTask` (op `0x20`): drop task directory + object list entries.
@@ -2570,7 +2584,6 @@ impl DeviceState {
         self.retire_task_linear_residents(task_id);
         self.retire_task_gva_windows(task_id);
         self.host_linear_textures.retain(|&(t, _), _| t != task_id);
-        self.clear_task_map_spans(task_id);
         // Clear texture→mapping latches for this task.
         let doomed_refs: Vec<u32> = self
             .texture_to_mapping
@@ -2659,6 +2672,19 @@ impl DeviceState {
         self.compute_storage_residency.retain(|key, _| {
             key.mapping_id != mapping_id || key.span_end <= lo || key.surface_offset >= hi
         });
+    }
+
+    /// How many deferred windows this mapping currently owes.
+    ///
+    /// Read before a drop so the drop can be counted: `drop_windows` reports
+    /// each window it takes on the fail path but returns nothing, and a rail
+    /// that needs to know whether it dropped anything must not re-derive the
+    /// answer from the log.
+    pub fn deferred_flush_window_count(&self, mapping_id: u32) -> u32 {
+        self.compute_deferred_flush
+            .keys()
+            .filter(|key| key.mapping_id == mapping_id)
+            .count() as u32
     }
 
     /// Remove one deferred window by exact key, pruning the alias index with it.
@@ -2768,8 +2794,12 @@ impl DeviceState {
         e.condemned_entries = None;
         Self::bump_map_generation(e);
         let retired = Self::take_mapping_view(e);
+        let retired_token = Self::take_guest_write_token(e);
         if let Some(v) = retired {
             self.retired_views.push(v);
+        }
+        if retired_token != 0 {
+            self.retired_guest_write_tokens.push(retired_token);
         }
         had
     }
@@ -2798,8 +2828,12 @@ impl DeviceState {
         e.condemned_entries = Some(std::mem::take(&mut e.page_entries));
         e.page_table_kva = 0;
         let retired = Self::take_mapping_view(e);
+        let retired_token = Self::take_guest_write_token(e);
         if let Some(v) = retired {
             self.retired_views.push(v);
+        }
+        if retired_token != 0 {
+            self.retired_guest_write_tokens.push(retired_token);
         }
         true
     }
@@ -2844,8 +2878,12 @@ impl DeviceState {
         e.height = 0;
         e.format = 0;
         let retired = Self::take_mapping_view(e);
+        let retired_token = Self::take_guest_write_token(e);
         if let Some(v) = retired {
             self.retired_views.push(v);
+        }
+        if retired_token != 0 {
+            self.retired_guest_write_tokens.push(retired_token);
         }
         // Fresh MAP: prior host-cache for this surface_id is stale, and so is
         // any present evidence — the slot may hold a NEW surface.
@@ -2859,11 +2897,116 @@ impl DeviceState {
         true
     }
 
+    /// Tell [`crate::observe::footprint`] that a mapping's pages have stopped
+    /// being a surface's, so a later write into them is reportable.
+    ///
+    /// Only the guest's own Unmap calls this. The device's internal
+    /// invalidations — a resolve that failed, a condemned list awaiting a
+    /// fingerprint compare — are *this device* deciding it no longer trusts a
+    /// list, not the guest saying the memory is no longer a surface's, and the
+    /// reprieve path can hand the same list straight back. Retiring on those
+    /// would flag the reprieve's own legitimate writes, and a detector whose
+    /// first finding is its own bookkeeping gets switched off before it ever
+    /// reports a real one.
+    ///
+    /// Frames another live mapping still names are excluded: two mappings can
+    /// alias the same guest pages, and the survivor's writes are not a defect.
+    ///
+    /// # The condemned list is part of the doomed set, and reading only
+    /// `page_entries` made this dead code
+    ///
+    /// Both routes into [`Self::unmap_surface`] from a guest teardown arrive
+    /// with `page_entries` already **empty**, because the list was moved into
+    /// `condemned_entries` by the step before:
+    ///
+    /// - `DeleteIOSurfaceBacking2` first calls [`Self::condemn_surface_backing`],
+    ///   which does exactly that move. A second delete with no resolve between
+    ///   then takes the `mapping_backing_condemned` branch to `unmap_surface` —
+    ///   where the only list is the condemned one.
+    /// - The same delete falls through to `unmap_surface` directly when
+    ///   `condemn_surface_backing` returns `false`, and it returns `false`
+    ///   *precisely when* `page_entries` is empty.
+    /// - [`Self::map_surface`] moves the list the same way, so a fresh MAP
+    ///   followed by an Unmap is the third case.
+    ///
+    /// So an `is_empty()` bail on `page_entries` alone could never retire a page
+    /// on the delete path. Measured: a 600 s driven boot reported
+    /// `retire_scans=0`, which made its `write_after_retire=0` UNMEASURED rather
+    /// than clean — the failure direction this project's rules call out, a
+    /// detector reading zero because it never ran.
+    ///
+    /// Retiring the condemned list *here* is not the same as retiring at
+    /// condemn time, which would be wrong for the reason above: at condemn the
+    /// reprieve can still hand the list straight back. By the time this runs the
+    /// guest has said the backing is gone and no resolve has re-adopted it —
+    /// `resolve_mapping_backing` takes `condemned_entries` and calls
+    /// `note_pages_authorized` on whatever it adopts, so a reprieved list is
+    /// un-retired through the ordinary adoption path before it can be written.
+    ///
+    /// Other mappings' condemned lists count as still-held for the same reason,
+    /// in the conservative direction: a slot awaiting its fingerprint compare
+    /// may be reprieved, and its writes would then be legitimate.
+    fn note_mapping_pages_retired(&self, mapping_id: u32) {
+        let Some(doomed) = self.mappings.get(&mapping_id) else {
+            return;
+        };
+        let mut going: Vec<u32> = doomed.page_entries.clone();
+        going.extend_from_slice(doomed.condemned_entries.as_deref().unwrap_or(&[]));
+        self.retire_pages_no_live_mapping_holds(&going, Some(mapping_id));
+    }
+
+    /// Retire every page in `going` that no still-live mapping names.
+    ///
+    /// `skip` is the mapping whose own lists are the doomed ones and must not
+    /// therefore count as holding them. Pass `None` when the pages are being
+    /// abandoned by a mapping that is *still live under a new backing* — a
+    /// superseded incarnation — because there the mapping's current
+    /// `page_entries` are the new plan, and a page carried over into it is
+    /// genuinely still a surface's and must be kept out of the retired set.
+    ///
+    /// Other mappings' *condemned* lists count as held, deliberately in the
+    /// conservative direction: a slot awaiting its fingerprint compare may be
+    /// reprieved, and its writes would then be legitimate.
+    pub(crate) fn retire_pages_no_live_mapping_holds(&self, going: &[u32], skip: Option<u32>) {
+        if going.is_empty() {
+            return;
+        }
+        let shift = self.page_shift;
+        let gpas_of = |entries: &[u32]| -> Vec<u64> {
+            entries
+                .iter()
+                .filter_map(|&e| crate::contract::iosurface_pages::entry_gpa_shift(e, shift))
+                .collect()
+        };
+        let mut still_held: std::collections::HashSet<u64> = Default::default();
+        let mut walked = 0u64;
+        for (&other, m) in self.mappings.iter() {
+            if Some(other) == skip {
+                continue;
+            }
+            let condemned = m.condemned_entries.as_deref().unwrap_or(&[]);
+            walked += (m.page_entries.len() + condemned.len()) as u64;
+            still_held.extend(gpas_of(&m.page_entries));
+            still_held.extend(gpas_of(condemned));
+        }
+        // Reported rather than assumed small. This runs on the drain worker,
+        // which `drain_duty` already shows at 0.93-0.99, and the alias exclusion
+        // costs one pass over everything currently mapped per retire.
+        crate::observe::footprint::note_retire_scan(walked);
+        let retiring: Vec<u64> = gpas_of(going)
+            .into_iter()
+            .filter(|g| !still_held.contains(g))
+            .collect();
+        crate::observe::footprint::note_pages_retired(retiring, self.page_size());
+    }
+
     pub fn unmap_surface(&mut self, mapping_id: u32) -> bool {
         if mapping_id as usize >= MAX_MAPPINGS {
             StateMutationDecline::UnmapSurfaceIdRange { mapping_id }.emit(u64::from(mapping_id));
             return false;
         }
+        // Before the list is cleared, while the pages are still nameable.
+        self.note_mapping_pages_retired(mapping_id);
         self.forget_compositor_mapping(mapping_id);
         if let Some(e) = self.mappings.get_mut(&mapping_id) {
             e.mapped = false;
@@ -2878,8 +3021,12 @@ impl DeviceState {
             e.height = 0;
             e.format = 0;
             let retired = Self::take_mapping_view(e);
+            let retired_token = Self::take_guest_write_token(e);
             if let Some(v) = retired {
                 self.retired_views.push(v);
+            }
+            if retired_token != 0 {
+                self.retired_guest_write_tokens.push(retired_token);
             }
             self.host_surfaces.remove(&mapping_id);
             true
@@ -2922,8 +3069,12 @@ impl DeviceState {
         e.height = 0;
         e.format = 0;
         let retired = Self::take_mapping_view(e);
+        let retired_token = Self::take_guest_write_token(e);
         if let Some(v) = retired {
             self.retired_views.push(v);
+        }
+        if retired_token != 0 {
+            self.retired_guest_write_tokens.push(retired_token);
         }
         // New MappingInternal ⇒ new surface, and the `bump_map_generation`
         // above is what retires the stale present evidence: it is stamped with
@@ -2991,6 +3142,40 @@ impl DeviceState {
         true
     }
 
+    /// Record that this device is about to write pixel bytes into guest RAM.
+    ///
+    /// Called from every host-side writer, including the ones that reach guest
+    /// pages through a raw task-GVA walk and never name a mapping. The
+    /// hypervisor's dirty bitmap cannot see any of them — it witnesses guest CPU
+    /// stores only — so without this a reader has no way to tell "nobody wrote
+    /// these pages" from "we wrote them ourselves".
+    ///
+    /// Deliberately called before the write rather than after it succeeds: a
+    /// refused write costs a spurious bump, which makes a reader re-read bytes
+    /// that did not change. The opposite error hands out a stale copy.
+    pub fn note_host_wrote_guest_ram(&mut self) {
+        self.host_writes.note_unknown();
+    }
+
+    /// The same, for a writer that walked the guest page tables and so knows
+    /// exactly which pages it landed in even though it names no mapping.
+    pub fn note_host_wrote_pages(&mut self, pages: Vec<u64>) {
+        self.host_writes.note_pages(pages);
+    }
+
+    /// The same, for a writer that knows which mapping's pages it is landing in.
+    pub fn note_host_wrote_mapping(&mut self, mapping_id: u32) {
+        // A mapping with no page list cannot have its write ruled out later, so
+        // it is recorded as an unnamed one rather than as an empty page set.
+        match self.mappings.get(&mapping_id) {
+            Some(m) if !m.page_entries.is_empty() => {
+                let generation = m.map_generation;
+                self.host_writes.note_mapping(mapping_id, generation);
+            }
+            _ => self.host_writes.note_unknown(),
+        }
+    }
+
     /// Issue a sampled-content generation that has never been issued before.
     ///
     /// Every producer of a sampled-content identity must take its generation
@@ -3007,12 +3192,25 @@ impl DeviceState {
         self.sampled_content_gen
     }
 
+    /// Issue the next recency stamp for [`HostSurface::last_touch`].
+    ///
+    /// Strictly increasing, so the smallest stamp in
+    /// [`Self::host_gva_surfaces`] is always the coldest entry and the byte cap
+    /// needs no other ordering. Saturating rather than wrapping: a wrap would
+    /// make one ancient entry look like the newest and pin it forever, and at
+    /// one stamp per lookup `u64::MAX` is not reachable by any real session.
+    pub fn next_gva_touch(&mut self) -> u64 {
+        self.gva_touch_seq = self.gva_touch_seq.saturating_add(1);
+        self.gva_touch_seq
+    }
+
     /// Bump content generation after a write into the mapping (0 never skips).
     ///
     /// Also advances [`MappingEntry::surface_content_epoch`], so every one of
     /// this crate's guest-page writers keeps that epoch closed for free — the
     /// completeness property the type-11 `LoadFromTarget` gate rests on.
     pub fn mark_mapping_written(&mut self, mapping_id: u32) -> u32 {
+        let seq = self.next_validity_seq();
         let Some(m) = self.mappings.get_mut(&mapping_id) else {
             return 0;
         };
@@ -3021,7 +3219,20 @@ impl DeviceState {
             m.content_generation = 1;
         }
         m.surface_content_epoch = Self::next_epoch(m.surface_content_epoch);
+        m.validity.host_published_seq = seq;
         m.content_generation
+    }
+
+    /// Next value of the device-wide ordering counter behind
+    /// [`ResourceValidity::host_cleared_seq`] / `host_published_seq`.
+    ///
+    /// One counter for both sides on purpose: the only question either stamp is
+    /// ever asked is which of the two happened last, and two counters cannot
+    /// answer that. Starts at 1 so a stamp is always distinguishable from the
+    /// `0` default that means "this never happened".
+    pub fn next_validity_seq(&mut self) -> u64 {
+        self.validity_seq = self.validity_seq.saturating_add(1);
+        self.validity_seq
     }
 
     /// Advance [`MappingEntry::surface_content_epoch`] for a publish that
@@ -3031,10 +3242,14 @@ impl DeviceState {
     /// resident that holds those pixels in the same breath; the two must not be
     /// separable, or the stamp records a currency that already moved.
     pub fn note_surface_content_published(&mut self, mapping_id: u32) -> u32 {
+        let seq = self.next_validity_seq();
         let Some(m) = self.mappings.get_mut(&mapping_id) else {
             return 0;
         };
         m.surface_content_epoch = Self::next_epoch(m.surface_content_epoch);
+        // The pixels this publishes are newer than anything the guest claimed
+        // before now, which is what a deferred writeback later has to know.
+        m.validity.host_published_seq = seq;
         m.surface_content_epoch
     }
 
@@ -3059,6 +3274,7 @@ impl DeviceState {
         // "bad-packet-size", head: 4096 }`, which is neither `reason=<slug>` nor
         // greppable by the vocabulary every other subsystem uses.
         crate::observe::Emit::decline("fail_event", &ev).fail();
+        #[cfg(test)]
         self.fails.push(ev);
     }
 }
@@ -3093,7 +3309,6 @@ mod fail_vocabulary_tests {
         );
         assert_eq!(
             FailEvent::BadMmioAccess {
-                window: MmioWindow::Gfx,
                 offset: 0x1000,
                 size: 2
             }
@@ -3165,16 +3380,15 @@ mod fail_vocabulary_tests {
         assert_eq!(child, "fail_event reason=packet_bad_size ch=2 head=4096");
     }
 
-    /// Thirteen distinct malformed-packet checks used to be thirteen hyphenated
-    /// string literals passed by hand. They are now variants, and no two may
-    /// answer with the same slug — otherwise a child tail read and a child head
-    /// writeback look identical in the log.
+    /// The malformed-packet checks used to be hyphenated string literals passed
+    /// by hand. They are now variants, and no two may answer with the same slug
+    /// — otherwise a child tail read and a child head writeback look identical
+    /// in the log.
     #[test]
-    fn the_thirteen_packet_faults_all_differ() {
+    fn the_packet_faults_all_differ() {
         const ALL: &[PacketFault] = &[
             PacketFault::DesyncedHeadTail,
             PacketFault::BadSize,
-            PacketFault::Desynced,
             PacketFault::RootHeaderRead,
             PacketFault::RootSnapRead,
             PacketFault::RootStampWriteback,
@@ -3260,122 +3474,25 @@ mod fail_vocabulary_tests {
         assert!(!state.mappings.contains_key(&1));
     }
 
-    /// `Outside` is one word for at least three defects, and each wants a
-    /// different fix. The readout has to separate them or the refusal is a dead
-    /// end — which is where the live rail has been sitting.
+    /// Every one of the three entry points must reach the record, whatever it can
+    /// say about where it wrote.
+    ///
+    /// The record's own tests cover what each shape then *answers*; this covers
+    /// that a writer announcing itself is heard at all, which is the half that
+    /// lives here.
     #[test]
-    fn a_refused_range_is_placed_against_the_tasks_own_spans() {
-        const SH: u32 = crate::model::PAGE_SHIFT_X86;
-        let page = 1u64 << SH;
-        let mut state = DeviceState::new(DeviceId(1), SH);
-
-        // Two adjacent declarations and a write straddling the seam. Neither
-        // span covers it, so the gate refuses — and every page is declared.
-        state.note_task_map(1, 0x10000, 2 * page);
-        state.note_task_map(1, 0x12000, 2 * page);
-        assert_eq!(
-            state.gva_write_gate(1, 0x11000, 2 * page),
-            WriteGate::Undeclared
-        );
-        let seam = state.task_span_readout(1, 0x11000, 2 * page, SH);
-        assert_eq!(
-            (seam.pages, seam.union),
-            (2, 2),
-            "the union declares every page, so the one-span rule is the refusal"
-        );
-        assert_eq!(
-            seam.nearest_gap,
-            Some(0),
-            "a span overlaps without covering"
-        );
-
-        // Far outside anything the task declared: no relaxation of the covering
-        // rule reaches this, and the two must not render alike.
-        let away = state.task_span_readout(1, 0x900000, page, SH);
-        assert_eq!((away.pages, away.union), (1, 0));
-        assert_eq!((away.lo, away.hi), (0x10000, 0x14000));
-        assert_eq!(
-            away.nearest_gap,
-            Some(0x900000 - 0x14000),
-            "distance to the nearest declaration, not merely that there is none"
-        );
-        assert_ne!(seam.union, away.union);
-
-        // A hole *between* declarations, inside the extent: same `union == 0` as
-        // the far case, told apart by sitting within `[lo, hi)`.
-        let mut state = DeviceState::new(DeviceId(1), SH);
-        state.note_task_map(1, 0x10000, page);
-        state.note_task_map(1, 0x12000, page);
-        let hole = state.task_span_readout(1, 0x11000, page, SH);
-        assert_eq!((hole.pages, hole.union, hole.own), (1, 0, 2));
-        assert!(
-            hole.gva_inside_extent(0x11000),
-            "inside the declared extent is what separates a hole from a foreign range"
-        );
-
-        // A task that filed nothing has no nearest span — not a gap of zero,
-        // which is what an overlap reports.
-        let none = state.task_span_readout(9, 0x11000, page, SH);
-        assert_eq!((none.own, none.union), (0, 0));
-        assert_eq!(none.nearest_gap, None);
-    }
-
-    /// A refusal cannot see a declaration that has not arrived yet, so the two
-    /// halves have to be joined from the map side.
-    #[test]
-    fn a_later_map_covering_a_refused_range_retires_it() {
-        const SH: u32 = crate::model::PAGE_SHIFT_X86;
-        let page = 1u64 << SH;
-        let mut state = DeviceState::new(DeviceId(1), SH);
-        state.note_undeclared_write(1, 0x20000, page, "test");
-
-        // A map that does not cover it, and one for another task, both leave the
-        // record standing — otherwise absence would stop meaning "never
-        // declared".
-        state.note_task_map(1, 0x30000, page);
-        state.note_task_map(2, 0x20000, page);
-        assert_eq!(state.undeclared_writes.len(), 1);
-
-        // Partial cover is not cover: the write needed all of it.
-        state.note_task_map(1, 0x20000, page / 2);
-        assert_eq!(state.undeclared_writes.len(), 1);
-
-        state.note_task_map(1, 0x1f000, 4 * page);
-        assert!(
-            state.undeclared_writes.is_empty(),
-            "a covering span retires the record, which is what emits the report"
-        );
-
-        // A per-row caller re-refusing the same bytes must not evict older,
-        // different findings out of the ring.
-        let mut state = DeviceState::new(DeviceId(1), SH);
-        for _ in 0..(UNDECLARED_WRITE_RING * 4) {
-            state.note_undeclared_write(1, 0x20000, page, "test");
+    fn every_host_write_entry_point_reaches_the_page_record() {
+        let mut state = DeviceState::new(DeviceId(1), crate::model::PAGE_SHIFT_X86);
+        let mut epoch = state.host_writes.epoch();
+        for announce in [
+            &mut DeviceState::note_host_wrote_guest_ram as &mut dyn FnMut(&mut DeviceState),
+            &mut |s: &mut DeviceState| s.note_host_wrote_pages(vec![0x1000]),
+            &mut |s: &mut DeviceState| s.note_host_wrote_mapping(7),
+        ] {
+            announce(&mut state);
+            let now = state.host_writes.epoch();
+            assert_ne!(now, epoch, "a host write into guest RAM went unannounced");
+            epoch = now;
         }
-        assert_eq!(state.undeclared_writes.len(), 1);
-        // Adjacent ranges coalesce into one region rather than filling the ring
-        // — that is what keeps a row-at-a-time writer from evicting every other
-        // finding, and it is why the cap has to be exercised with gaps.
-        let mut state = DeviceState::new(DeviceId(1), SH);
-        for i in 0..(UNDECLARED_WRITE_RING as u64 * 2) {
-            state.note_undeclared_write(1, 0x40000 + i * page, page, "test");
-        }
-        assert_eq!(
-            state.undeclared_writes.len(),
-            1,
-            "one contiguous region, however many calls describe it"
-        );
-        assert_eq!(state.undeclared_writes[0].gva, 0x40000);
-        assert_eq!(
-            state.undeclared_writes[0].len,
-            page * UNDECLARED_WRITE_RING as u64 * 2
-        );
-
-        // Separated by a gap, they are distinct findings and the cap holds.
-        let mut state = DeviceState::new(DeviceId(1), SH);
-        for i in 0..(UNDECLARED_WRITE_RING as u64 * 2) {
-            state.note_undeclared_write(1, 0x100000 + i * 4 * page, page, "test");
-        }
-        assert_eq!(state.undeclared_writes.len(), UNDECLARED_WRITE_RING);
     }
 }

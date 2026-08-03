@@ -7,7 +7,7 @@
 //!
 //! | Prefix | Meaning |
 //! | --- | --- |
-//! | `OFF present_op6/7/8` | Display present packet (channel, surface/mapping id, stamp) |
+//! | `OFF present_txn` | Display present packet (`op` 6/7/8, channel, surface id, task) |
 //! | `OFF present_black` | max_rgb==0 after capture (console will stay black) |
 //! | `OFF present_paint` | HostAction paint / Unchanged |
 //! | `OFF host_cache_store` | Discrete-GPU host surface cache write |
@@ -82,11 +82,20 @@ pub(crate) fn draw_log_enabled() -> bool {
 /// window their counters on the same process-monotonic clock that stamps every
 /// line — no second time base to reconcile against `t=`.
 pub(crate) fn elapsed_ms() -> u128 {
-    static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    T0.get_or_init(std::time::Instant::now)
-        .elapsed()
-        .as_millis()
+    T0.get_or_init(std::time::Instant::now).elapsed().as_millis()
 }
+
+/// The same process-monotonic clock in microseconds.
+///
+/// Millisecond resolution cannot express every cadence we owe the guest: a
+/// 120 Hz frame is 8333 µs, and rounding it to 8 ms delivers 125 Hz. Paths that
+/// pace something the guest measures need this one; `t=` stamps stay in
+/// milliseconds so line-class censuses keep working.
+pub(crate) fn elapsed_us() -> u64 {
+    T0.get_or_init(std::time::Instant::now).elapsed().as_micros() as u64
+}
+
+static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 
 /// Sink paths. Test runs write per-process files instead of the product
 /// `/tmp/reims-vgpu-fail.log`: `cargo test` runs on the same machine as live product
@@ -181,7 +190,7 @@ fn emit(sink: Sink, msg: &str) {
 /// `log_flood_detected` line per window per runaway prefix, so a regression that
 /// reintroduces a flood is named on the very boot it lands instead of silently
 /// drowning real failures. Legitimate always-on lines are self-clocked windowed
-/// summaries (`teardown_churn`, `present_import`) well under the threshold.
+/// summaries (`drain_duty`, `store_routes`) well under the threshold.
 const FLOOD_WINDOW_MS: u128 = 1000;
 const FLOOD_THRESHOLD_PER_WINDOW: u64 = 1000;
 
@@ -405,14 +414,6 @@ impl Drop for FailCapture {
     }
 }
 
-/// Test predicate: `line` is exactly `marker` plus the always-appended
-/// trailing ` t=<ms>` field (see [`elapsed_ms`]).
-#[cfg(test)]
-pub(crate) fn line_is(line: &str, marker: &str) -> bool {
-    line.strip_prefix(marker)
-        .is_some_and(|rest| rest.is_empty() || rest.starts_with(" t="))
-}
-
 pub fn line(msg: impl AsRef<str>) {
     if !enabled() {
         return;
@@ -432,127 +433,6 @@ pub fn fail(msg: impl AsRef<str>) {
 #[inline]
 pub fn off(msg: impl AsRef<str>) {
     fail(format!("OFF {}", msg.as_ref()));
-}
-
-/// Whether the temporary guest-visible-content probe (`REIMS_VGPU_CONTENT_PROBE=1`)
-/// is active.
-///
-/// The probe walks a whole frame, so it is off by default and must be read
-/// *before* building any summary — see [`content_summary`].
-pub fn content_probe_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var_os("REIMS_VGPU_CONTENT_PROBE")
-            .map(|v| v == "1")
-            .unwrap_or(false)
-    })
-}
-
-/// Bisection knob (`REIMS_VGPU_SAMPLED_CACHE_OFF=1`): force every sampled bind
-/// to miss the engine's retained-image cache and re-upload the producer's bytes.
-///
-/// The cache is the one place a draw binds pixels that were resolved for some
-/// *earlier* draw, so it is the seam that separates "the wrong bytes were
-/// chosen" from "the right bytes were chosen and the wrong image was bound".
-/// Nothing else can bisect there: the retained `VkImage` has no CPU mirror to
-/// compare against, and a boot with the cache off answers the question by
-/// construction rather than by a correlation.
-///
-/// This costs one upload per bind — it is a diagnostic arm, never a product
-/// configuration, and a boot that sets it must not be read for frame rate.
-pub fn sampled_cache_disabled() -> bool {
-    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *OFF.get_or_init(|| {
-        std::env::var_os("REIMS_VGPU_SAMPLED_CACHE_OFF")
-            .map(|v| v == "1")
-            .unwrap_or(false)
-    })
-}
-
-/// Summarise a tightly packed `texel`-byte-per-pixel image so a *wrong* image
-/// identifies itself in the log without a screen-to-mapping join.
-///
-/// The discriminating field is `distinct`: a correct icon carries hundreds of
-/// distinct texels, and every corruption shape this was written for — a solid
-/// square, a solid bar, a cleared region — collapses to one. `px0` then names
-/// which colour it collapsed to, and `hash` lets the same image be recognised
-/// at two stages. Counting stops at [`DISTINCT_CAP`] so the cost is bounded on
-/// a display-sized frame rather than proportional to its palette.
-///
-/// `quad` reports nonzero texels per screen quadrant (`nw/ne/sw/se`), because a
-/// scalar count cannot see *where* the content is. The shape this exists to
-/// catch is an icon rendering shrunken into the top-left of its quad with the
-/// rest transparent — a whole-image `nz` reads that as "some content, looks
-/// plausible", while `quad` reads it as everything in `nw` and nothing
-/// elsewhere.
-///
-/// Caller must gate on [`content_probe_enabled`].
-///
-/// Cost is bounded at [`SAMPLE_CAP`] texels by a uniform 2-D subsample, not
-/// proportional to the buffer: this probe runs on the same path that flushes
-/// 1920x1080 composites ~200 times a second, and a whole-frame walk there would
-/// slow the device enough to stop reproducing a load-dependent defect. The
-/// subsample is 2-D rather than linear precisely so `quad` keeps its meaning.
-/// `stride` is reported so `nz` reads as the sample it is.
-///
-/// `buf` must be tightly packed at `width * texel` bytes per row.
-pub fn content_summary(buf: &[u8], texel: u32, width: u32, height: u32) -> String {
-    /// Enough to separate "one colour" from "an image" — the question this
-    /// probe asks — without building a palette of a 1920x1080 frame.
-    const DISTINCT_CAP: usize = 64;
-    /// ~16k texels is a full-precision walk of any icon-scale surface and a
-    /// 1/128 sample of a display-sized one.
-    const SAMPLE_CAP: usize = 16384;
-    let texel = texel.max(1) as usize;
-    let texels = buf.len() / texel;
-    let (w, h) = (width as usize, height as usize);
-    if w == 0 || h == 0 || w * h * texel > buf.len() {
-        return format!("texels={texels} geom_mismatch=1 buf={}", buf.len());
-    }
-    // Smallest uniform 2-D step that brings the sample under the cap. Integer
-    // search rather than a sqrt so the bound is exact for every shape.
-    let mut stride = 1usize;
-    while w.div_ceil(stride) * h.div_ceil(stride) > SAMPLE_CAP {
-        stride += 1;
-    }
-    let mut distinct: Vec<&[u8]> = Vec::with_capacity(DISTINCT_CAP);
-    let mut nz = 0usize;
-    let mut sampled = 0usize;
-    let mut quad = [0usize; 4];
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for y in (0..h).step_by(stride) {
-        for x in (0..w).step_by(stride) {
-            let off = (y * w + x) * texel;
-            let px = &buf[off..off + texel];
-            sampled += 1;
-            for &b in px {
-                hash ^= b as u64;
-                hash = hash.wrapping_mul(0x1000_0000_01b3);
-            }
-            if px.iter().any(|&b| b != 0) {
-                nz += 1;
-                quad[usize::from(x >= w / 2) + 2 * usize::from(y >= h / 2)] += 1;
-            }
-            if distinct.len() < DISTINCT_CAP && !distinct.contains(&px) {
-                distinct.push(px);
-            }
-        }
-    }
-    let px0: String = buf
-        .iter()
-        .take(texel)
-        .map(|b| format!("{b:02x}"))
-        .collect::<Vec<_>>()
-        .join("");
-    let capped = if distinct.len() >= DISTINCT_CAP { "+" } else { "" };
-    format!(
-        "texels={texels} stride={stride} sampled={sampled} distinct={}{capped} nz={nz} quad={}/{}/{}/{} px0={px0} hash={hash:016x}",
-        distinct.len(),
-        quad[0],
-        quad[1],
-        quad[2],
-        quad[3],
-    )
 }
 
 /// Count nonzero **bytes** and max sample in a tightly packed image buffer.
@@ -766,7 +646,6 @@ pub fn rgba_rgb_stats(rgba: &[u8]) -> (usize, u8, [u8; 4]) {
     (rgb_nz, max_rgb, px0)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -837,7 +716,6 @@ mod tests {
         // The dispatched entry must equal the scalar reference on this arch too.
         assert_eq!(fused, bgra_present_stats_scalar(&frame));
     }
-
 
     #[test]
     fn bgra_present_stats_byte_exact_with_sse2() {
@@ -933,82 +811,5 @@ mod tests {
         let (rgb_nz, max_rgb, _) = bgra_rgb_stats(&bgra);
         assert_eq!(rgb_nz, 1);
         assert_eq!(max_rgb, 100);
-    }
-
-    /// The one property the content probe exists for: a solid fill and a real
-    /// image must not read alike, at icon scale, with no sampling in the way.
-    #[test]
-    fn a_solid_fill_and_an_image_differ_in_the_distinct_count() {
-        let solid = [0xffu8, 0x00, 0x00, 0xff].repeat(66 * 66);
-        let s = content_summary(&solid, 4, 66, 66);
-        assert!(s.contains(" stride=1 "), "icon scale must not sample: {s}");
-        assert!(s.contains(" distinct=1 "), "solid fill is one colour: {s}");
-        assert!(s.contains(" px0=ff0000ff "), "px0 names the colour: {s}");
-
-        let image: Vec<u8> = (0..66u32 * 66)
-            .flat_map(|i| [(i % 251) as u8, (i % 241) as u8, (i % 239) as u8, 0xff])
-            .collect();
-        let g = content_summary(&image, 4, 66, 66);
-        assert!(g.contains(" distinct=64+ "), "an image is many colours: {g}");
-        assert_ne!(
-            s.split(" hash=").nth(1),
-            g.split(" hash=").nth(1),
-            "distinct content must not share a hash"
-        );
-    }
-
-    /// The shape `quad` exists for: an image shrunken into the top-left of its
-    /// allocated extent has an unremarkable whole-image `nz` and is only
-    /// separable by where the content sits.
-    #[test]
-    fn a_shrunken_top_left_image_is_visible_only_in_the_quadrants() {
-        let (w, h) = (64usize, 64usize);
-        let mut buf = vec![0u8; w * h * 4];
-        for y in 0..h / 4 {
-            for x in 0..w / 4 {
-                buf[(y * w + x) * 4..][..4].copy_from_slice(&[0x40, 0x80, 0xc0, 0xff]);
-            }
-        }
-        let s = content_summary(&buf, 4, w as u32, h as u32);
-        assert!(s.contains(" nz=256 "), "a scalar count looks ordinary: {s}");
-        assert!(
-            s.contains(" quad=256/0/0/0 "),
-            "all content must land in nw: {s}"
-        );
-
-        // The same texel count spread over the whole extent is the healthy
-        // shape, and must not read alike.
-        let mut spread = vec![0u8; w * h * 4];
-        for i in (0..w * h).step_by(16) {
-            spread[i * 4..][..4].copy_from_slice(&[0x40, 0x80, 0xc0, 0xff]);
-        }
-        let g = content_summary(&spread, 4, w as u32, h as u32);
-        assert!(g.contains(" nz=256 "), "same scalar count: {g}");
-        assert!(g.contains(" quad=64/64/64/64 "), "evenly spread: {g}");
-    }
-
-    /// A geometry that does not describe the buffer must say so rather than
-    /// index past the end or report a quadrant split it cannot support.
-    #[test]
-    fn a_geometry_that_overruns_the_buffer_is_named_not_indexed() {
-        let buf = vec![0u8; 64 * 4];
-        let s = content_summary(&buf, 4, 64, 64);
-        assert!(s.contains("geom_mismatch=1"), "{s}");
-    }
-
-    /// The probe runs on the 1920x1080 flush path, so its cost must be capped
-    /// by striding rather than growing with the frame.
-    #[test]
-    fn a_display_sized_frame_is_sampled_not_walked() {
-        let frame = vec![0u8; 1920 * 1080 * 4];
-        let s = content_summary(&frame, 4, 1920, 1080);
-        assert!(s.starts_with("texels=2073600 "), "{s}");
-        let sampled: usize = s
-            .split(" sampled=")
-            .nth(1)
-            .and_then(|r| r.split(' ').next())
-            .and_then(|v| v.parse().ok())
-            .expect("sampled field");
-        assert!(sampled <= 16384, "cost must stay bounded, got {sampled}");
     }
 }

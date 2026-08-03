@@ -52,11 +52,14 @@ pub enum ScanoutCopyResult {
     Failed,
 }
 
-#[cfg(feature = "backend-vulkan")]
 /// Read mapping pages into `dst` without updating present/paint generation.
 ///
 /// Used by draw bind materialization (sampled type-11 textures). Returns true
 /// when geometry and page table produced a full image.
+///
+/// Backend-agnostic on purpose: it resolves and scatters guest pages and
+/// touches no engine, and the Metal arm's `load_type11_mapping_rgba` needs it
+/// for the same reason the Vulkan arm does.
 pub fn read_mapping_bgra8<M: HostMemory + crate::runtime::host::HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -99,8 +102,8 @@ fn maybe_log_capture_sampling(state: &DeviceState) {
 /// Fill `buf` from the mapping's GPU resident, without any guest-page scatter.
 ///
 /// Returns whether the resident supplied the whole frame. On `true` `buf` holds
-/// tight BGRA8 and `last_paint_src` is [`crate::model::PaintSrc::Resident`]; on
-/// `false` `buf` is untouched and the caller takes the guest-page path. A miss
+/// tight BGRA8; on `false` `buf` is untouched and the capture fails
+/// (keep-prior) — there is no guest-page path left for the caller to take. A miss
 /// is an expected steady-state condition (cold mid / no resident yet), so it is
 /// counted in the `capture_source` census rather than logged per present.
 #[cfg(feature = "backend-vulkan")]
@@ -120,7 +123,6 @@ fn try_capture_from_resident(
     debug_assert_eq!(bgra.len(), need);
     // Move (not copy) the readback in; the untouched scratch returns to the pool.
     state.present.capture_scratch = std::mem::replace(buf, bgra);
-    state.present.last_paint_src = crate::model::PaintSrc::Resident;
     true
 }
 
@@ -143,10 +145,11 @@ fn try_capture_from_resident(
 /// CmdDisplaySwap after wait_surface drains — before the packet stamp lets the
 /// guest recycle the mid (BH-deferred freeze captured mid-recycle partials).
 ///
-/// Guest pages ARE the surface content — the draw path's CPU writeback lands
-/// Stores in them. There is exactly one capture source.
-/// Takes no `HostOps`: with the guest-page capture path gone this reads the GPU
-/// resident and the host surface cache only — it never touches guest memory.
+/// Two sources fill the frame, and neither is guest memory: the host surface
+/// cache when an encode or clear wrote it, otherwise the GPU resident. That is
+/// why this takes no `HostOps`. A capture that can use neither fails visibly and
+/// keeps the prior retain rather than opening a third vein — see the note at the
+/// resident read for why the guest-page fallback was deleted instead of kept.
 pub fn capture_present_frame(
     state: &mut DeviceState,
     mapping_id: u32,
@@ -180,9 +183,15 @@ pub fn capture_present_frame(
     // (the fullscreen-video slowdown class). Skip it on those presents; the cheap
     // protocol-structural a/b guard still runs on every light present.
     //
-    // Never taken where the window owns its swapchain and uploads CPU pixels —
-    // every non-macOS host — because `display_from_resident` only becomes true
-    // after a resident publish succeeds.
+    // This is the steady state on the x86/Vulkan host too, not a macOS-only
+    // handoff: `publish_window_frame` hands the window the resident whenever the
+    // engine's own device can present to the surface, and the host window then
+    // reads it directly instead of uploading CPU pixels. A driven boot of that
+    // pathway reads `capture_sampling full=1 light=1023` — one full capture for
+    // the whole boot, every present after it resident-carried. Only a present no
+    // resident carries (firmware framebuffer, a mapping cleared but never
+    // rendered into, the frames after a device reset) falls back to the readback
+    // below.
     //
     // The full-frame readback has EXACTLY ONE reason to exist: the DISPLAY needs
     // CPU pixels because no resident is carrying the frame, and the window will
@@ -221,9 +230,6 @@ pub fn capture_present_frame(
         state.present.frame_valid = true;
         // First host paint after a present blits +0x188 (mirror the full path).
         state.present.frame_encode_pending = true;
-        // The present declares this mapping's pages the finished frame; the first
-        // LOAD draw after must re-seed from guest pages (dual-mid strobe class).
-        state.presented_needs_guest_seed.insert(mapping_id);
         state.present.light_captures = state.present.light_captures.wrapping_add(1);
         maybe_log_capture_sampling(state);
         return true;
@@ -244,7 +250,9 @@ pub fn capture_present_frame(
     buf.clear();
     buf.resize(need, 0);
     // Prefer host render-cache when encode/clear wrote it (Linux discrete GPU
-    // path — kb tahoe-x86-host-reims_vgpu §8.5). Fall back to guest type-4 pages.
+    // path — kb tahoe-x86-host-reims_vgpu §8.5); otherwise the resident below.
+    // There is no guest-page fallback any more — see the note at the resident
+    // capture for why it was deleted rather than kept as a second vein.
     let from_host_cache = if let Some(cached) =
         crate::runtime::surface_cache::get(state, mapping_id, width, height)
     {
@@ -253,6 +261,9 @@ pub fn capture_present_frame(
     } else {
         false
     };
+    if from_host_cache {
+        crate::runtime::storage_flush::note_render_flush_cache_read(state, mapping_id);
+    }
     // Resident-direct capture — the ONLY GPU-content capture source.
     //
     // The proxies need the finished frame's BYTES; they do not need those bytes
@@ -289,49 +300,36 @@ pub fn capture_present_frame(
         state.present.capture_scratch = buf;
         return false;
     }
-    let from_last_store = from_host_cache;
-    // Accurate present-capture provenance. `from_host_cache` reports the type-4
-    // surface_cache hit; when it misses, `paint_mapping` records which of its
-    // sub-paths actually filled the frame so the `paint_us` cost is attributable
-    // (a deferred-flush reuse is cheap; a cold fragmented read is the ~12 ms path).
+    // Capture provenance, and there are only two sources to name: the type-4
+    // surface_cache hit, or the resident. Reaching here with `!from_host_cache`
+    // means `try_capture_from_resident` returned true above, and it returns true
+    // and there is no third source. This used to read a `last_paint_src`
+    // provenance field through a five-arm match whose other four arms named
+    // `paint_mapping` sub-paths — left over from when this function had a
+    // guest-page capture fallback. It no longer calls `paint_mapping` at all, so
+    // those arms had become a way for one call path's state to be reported as
+    // another's provenance. The field is gone with them.
     let src = if from_host_cache {
         "host_cache"
     } else {
-        match state.present.last_paint_src {
-            crate::model::PaintSrc::Resident => "resident",
-            crate::model::PaintSrc::ReuseStore => "reuse_store",
-            crate::model::PaintSrc::GuestPagesContig => "guest_pages_contig",
-            crate::model::PaintSrc::GuestPagesFragmented => "guest_pages_frag",
-            crate::model::PaintSrc::None => "guest_pages",
-        }
+        "resident"
     };
-    // The occupancy scan and the three lines it fed are diagnostic: each is an
-    // O(w*h) walk of the just-captured 8 MiB frame on the present drain, under
-    // the device lock, and the `peers` field walks every same-geometry host
-    // surface on top of that. The always-on alarm for a black console is
-    // `present_black`, which does its own scan at the drain boundary where the
-    // verdict is acted on.
+    // The occupancy scan is diagnostic: an O(w*h) walk of the just-captured
+    // 8 MiB frame, on the present drain and under the device lock. The
+    // always-on alarm for a black console is `present_black`, which does its
+    // own scan at the drain boundary where the verdict is acted on.
+    //
+    // A `peers` field used to ride along here, walking every same-geometry host
+    // surface — another O(w*h) each — and admitting one when its non-zero pixel
+    // count passed 10 000. That number had no derivation, and "which peer looks
+    // like it has real content" is a rule about observed content rather than
+    // about the contract. It is gone rather than re-tuned: a peer below the
+    // threshold was invisible, so the field could not answer the question it
+    // looked like it was answering.
     if crate::observe::draw_log_enabled() {
         let (nz, maxb, rgb_nz, max_rgb, px0) = crate::observe::bgra_present_stats(&buf);
-        let mut peers = String::new();
-        for (&mid, e) in state.host_surfaces.iter() {
-            if mid == mapping_id || e.width != width || e.height != height || e.bgra.is_empty() {
-                continue;
-            }
-            let (pnz, pmax, _) = crate::observe::bgra_rgb_stats(&e.bgra);
-            if pmax > 0 && pnz > 10_000 {
-                if !peers.is_empty() {
-                    peers.push(',');
-                }
-                peers.push_str(&format!(
-                    "mid{mid}:rgb_nz={pnz}:max_rgb={pmax}:hgen={}",
-                    e.host_gen
-                ));
-            }
-        }
         crate::observe::line(format!(
-            "present_capture mid={mapping_id} {width}x{height} gen={generation} src={src} last_store={} host_cache={} rgb_nz={rgb_nz} max_rgb={max_rgb} byte_nz={nz} byte_max={maxb} px0=[{},{},{},{}] present_mapping={} frame_mapping={} frame_flush={} peers=[{peers}]",
-            from_last_store as u8,
+            "present_capture mid={mapping_id} {width}x{height} gen={generation} src={src} host_cache={} rgb_nz={rgb_nz} max_rgb={max_rgb} byte_nz={nz} byte_max={maxb} px0=[{},{},{},{}] present_mapping={} frame_mapping={} frame_flush={}",
             from_host_cache as u8,
             px0[0],
             px0[1],
@@ -351,14 +349,9 @@ pub fn capture_present_frame(
     state.present.frame_height = height;
     state.present.frame_generation = generation;
     state.present.frame_valid = true;
-    // The present declares this mapping's guest pages the finished frame; the
-    // guest may CPU-write them next (inter-buffer damage forward-copy). The
-    // first LOAD draw after this present must re-seed from guest pages
-    // instead of chaining the resident (dual-mid strobe class).
-    state.presented_needs_guest_seed.insert(mapping_id);
     // Force the next host paint to blit +0x188. Early pre-boundary paints may
     // have latched painted_mapping/generation (live type-11 paint_mapping or
-    // paint_efi) to the same mid+gen; with encode_pending=false that made
+    // paint_efi_console) to the same mid+gen; with encode_pending=false that made
     // copy_to_bgra8 return Unchanged and left the QEMU console on frozen EFI
     // while +0x188 held logo+pill (live serial-20260715-054015:
     // present_capture rgb_nz≈6k then present_paint Unchanged only).
@@ -468,7 +461,7 @@ pub fn copy_to_bgra8<M: HostMemory + crate::runtime::host::HostOps>(
             // (nothing below consumes the stats), so gate the whole block behind
             // REIMS_VGPU_DRAW_LOG: a normal boot pays neither the scan nor the flood.
             // The always-on present rate/occupancy signal lives in the
-            // present_proxy summary + `present_import`.
+            // `present_proxy` summary.
             if crate::observe::draw_log_enabled() {
                 let (nz, maxb, rgb_nz, max_rgb, px0) =
                     crate::observe::bgra_present_stats(&state.present.frame_bgra);
@@ -482,7 +475,6 @@ pub fn copy_to_bgra8<M: HostMemory + crate::runtime::host::HostOps>(
                 ));
             }
             state.present.valid = true;
-            state.present.mapping_id = shown_mid;
             state.present.width = width;
             state.present.height = height;
             state.present.generation = shown_gen;
@@ -553,21 +545,19 @@ pub fn copy_to_bgra8<M: HostMemory + crate::runtime::host::HostOps>(
             mapping_id, width, height, expected_generation, nz, maxb
         ));
         state.present.valid = true;
-        state.present.mapping_id = mapping_id;
         state.present.width = width;
         state.present.height = height;
         state.present.generation = expected_generation;
         state.present.painted_mapping = mapping_id;
         state.present.painted_generation = expected_generation;
         ScanoutCopyResult::Painted
-    } else if paint_efi(state, host, dst, dst_stride, width, height) {
+    } else if paint_efi_console(state, host, dst, dst_stride, width, height) {
         // EFI/BAR1 fallback fills the console for early verbose boot only.
         // Do **not** latch painted_mapping/generation to the product mid —
         // that made post-capture Unchanged skip +0x188 (logo/pill retain)
         // while the console still held EFI text.
         crate::observe::line(format!("scanout paint_efi ok {}x{}", width, height));
         state.present.valid = true;
-        state.present.mapping_id = mapping_id;
         state.present.width = width;
         state.present.height = height;
         state.present.generation = expected_generation;
@@ -601,7 +591,10 @@ pub fn paint_efi_console<M: HostMemory>(
     if fb == 0 {
         return false;
     }
-    // Use programmed EFI dims when they match the surface request, else skip.
+    // The console is only ever the mode this device advertised: EFI_MODE_COUNT
+    // is 1, so a request for any other geometry is not this framebuffer and the
+    // caller must fall back. Note these are the ADVERTISED dims, not programmed
+    // ones — the stride below is the only part the guest gets to set.
     let efi_w = EFI_BOOT_WIDTH;
     let efi_h = EFI_BOOT_HEIGHT;
     if width != efi_w || height != efi_h {
@@ -630,17 +623,6 @@ pub fn paint_efi_console<M: HostMemory>(
         }
     }
     true
-}
-
-fn paint_efi<M: HostMemory>(
-    state: &DeviceState,
-    host: &M,
-    dst: &mut [u8],
-    dst_stride: u32,
-    width: u32,
-    height: u32,
-) -> bool {
-    paint_efi_console(state, host, dst, dst_stride, width, height)
 }
 
 /// Why a console capture paint produced no pixels.
@@ -902,14 +884,6 @@ fn paint_mapping<M: HostMemory + crate::runtime::host::HostOps>(
         None
     };
 
-    // Measure-only provenance: a contiguous host-span read vs the cold fragmented
-    // multi-import (the ~12 ms/present path). `base` is Some only for a packed view.
-    state.present.last_paint_src = if base.is_some() {
-        crate::model::PaintSrc::GuestPagesContig
-    } else {
-        crate::model::PaintSrc::GuestPagesFragmented
-    };
-
     let mut src_row = vec![0u8; tight as usize];
     let mut rgba_row = if format == MTL_FORMAT_BGRA8_UNORM
         || format == pixel_format::MTL_FORMAT_BGRA8_UNORM_SRGB
@@ -1054,7 +1028,6 @@ pub fn note_front_buffer_writeback<M: HostMemory + crate::runtime::host::HostOps
             // on the `front_wb` / `present_order_hold` lines. Always update
             // here so a later writeback into the same mid refreshes the gen.
             state.present.early_front_mapping = mapping_id;
-            state.present.early_front_generation = gen;
         }
         return;
     }
@@ -1087,7 +1060,6 @@ pub fn note_front_buffer_writeback<M: HostMemory + crate::runtime::host::HostOps
     // is sequential; our async HostAction queue needs the latch here).
     state.present.present_mapping = mapping_id;
     state.present.valid = true;
-    state.present.mapping_id = mapping_id;
     state.present.width = paint_w;
     state.present.height = paint_h;
     state.present.generation = gen;
@@ -1099,7 +1071,6 @@ pub fn note_front_buffer_writeback<M: HostMemory + crate::runtime::host::HostOps
         crate::model::SurfaceWriteKind::Composite
     ) {
         state.present.early_front_mapping = mapping_id;
-        state.present.early_front_generation = gen;
     }
 
     crate::observe::line(format!(
@@ -1119,60 +1090,63 @@ pub fn note_front_buffer_writeback<M: HostMemory + crate::runtime::host::HostOps
 /// must not resize the host window. Only [`note_front_buffer_writeback`]
 /// same-geom paints and **CmdDisplaySwap** (HostAction) may change console
 /// size — matching archive same_geom + PG `modeChangeHandler` at present.
+///
+/// # One source, and it is the guest's own statement
+///
+/// The pre-boundary console shows `early_front_mapping`: the mapping the guest
+/// most recently **composited** into (`SurfaceWriteKind::Composite`). That is a
+/// decoded fact with a sentence — the guest composited into M, so the console
+/// should show M — and it is the only source here.
+///
+/// This used to rank a second candidate, `present_mapping`, which pre-boundary
+/// is the last writeback of *any* kind including a ClearOnly buffer-setup flip.
+/// It had no sentence; it stood in for "no Composite writeback has happened
+/// yet", which is a state whose meaning we do not know. Two instrumented x86 /
+/// Vulkan boots settled it: across 8 952 pre-boundary calls the composite front
+/// served 7 times and the fallback served **zero**, because in every one of the
+/// 8 952 calls where the composite front was unset the fallback was unset too.
+/// It never once had a value to contribute. The counters also never recorded a
+/// composite front rejected for ClearOnly, format, geometry or dimensions — the
+/// case the fallback and the first field's stickiness were both built for did
+/// not occur.
+///
+/// Blast radius, for whoever revisits this: it returns `None` once
+/// `frame_flush_seen`, so all of it is early boot only.
 pub fn early_scanout_target(state: &DeviceState) -> Option<(u32, u32, u32, u32)> {
     if state.present.frame_flush_seen {
         return None;
     }
-    // Prefer sticky Composite writeback front over present_mapping (often a
-    // ClearOnly flip buffer after present_defer_boundary).
-    let candidates = [
-        state.present.early_front_mapping,
-        state.present.present_mapping,
-    ];
-    for mapping_id in candidates {
-        if mapping_id == 0 {
-            continue;
-        }
-        // ClearOnly init without retain: skip (would feed solid black).
-        match state.surface_write_kind(mapping_id) {
-            crate::model::SurfaceWriteKind::ClearOnly if !state.present.frame_valid => {
-                continue;
-            }
-            _ => {}
-        }
-        let Some(m) = state.mappings.get(&mapping_id) else {
-            continue;
-        };
-        if !m.mapped {
-            continue;
-        }
-        if m.format != 0 && !is_front_buffer_format(m.format) {
-            continue;
-        }
-        let (w, h) = present_dims(state, mapping_id);
-        if w == 0 || h == 0 {
-            continue;
-        }
-        if state.present.valid
-            && state.present.width > 0
-            && state.present.height > 0
-            && (w != state.present.width || h != state.present.height)
-        {
-            continue;
-        }
-        let gen = if mapping_id == state.present.early_front_mapping
-            && state.present.early_front_generation != 0
-        {
-            state
-                .present
-                .early_front_generation
-                .max(m.content_generation)
-        } else {
-            m.content_generation
-        };
-        return Some((mapping_id, w, h, gen));
+    let mapping_id = state.present.early_front_mapping;
+    if mapping_id == 0 {
+        return None;
     }
-    None
+    // ClearOnly init without retain: refuse (would feed solid black).
+    if matches!(
+        state.surface_write_kind(mapping_id),
+        crate::model::SurfaceWriteKind::ClearOnly
+    ) && !state.present.frame_valid
+    {
+        return None;
+    }
+    let m = state.mappings.get(&mapping_id)?;
+    if !m.mapped {
+        return None;
+    }
+    if m.format != 0 && !is_front_buffer_format(m.format) {
+        return None;
+    }
+    let (w, h) = present_dims(state, mapping_id);
+    if w == 0 || h == 0 {
+        return None;
+    }
+    if state.present.valid
+        && state.present.width > 0
+        && state.present.height > 0
+        && (w != state.present.width || h != state.present.height)
+    {
+        return None;
+    }
+    Some((mapping_id, w, h, m.content_generation))
 }
 
 #[cfg(test)]
@@ -1404,7 +1378,7 @@ mod tests {
         state.present.valid = true;
         state.present.width = 1920;
         state.present.height = 1080;
-        state.present.present_mapping = 5;
+        state.present.early_front_mapping = 5;
         assert!(state.map_surface(5));
         {
             let m = state.mappings.get_mut(&5).unwrap();
@@ -1415,8 +1389,8 @@ mod tests {
             m.format = MTL_FORMAT_RGBA16_FLOAT;
             m.content_generation = 9;
         }
-        // present_mapping points at new mode FB, but early gfx_update must not
-        // resize — DisplaySwap owns modeChangeHandler sizeInPixels.
+        // The composite front points at a new mode FB, but early gfx_update
+        // must not resize — DisplaySwap owns modeChangeHandler sizeInPixels.
         assert!(early_scanout_target(&state).is_none());
 
         // Same geom re-pull still allowed.
@@ -1436,7 +1410,7 @@ mod tests {
         state.present.valid = true;
         state.present.width = 1920;
         state.present.height = 1080;
-        state.present.present_mapping = 2;
+        state.present.early_front_mapping = 2;
         state.present.frame_flush_seen = false;
         state.present.frame_valid = false;
         assert!(state.map_surface(2));
@@ -1457,6 +1431,52 @@ mod tests {
         let t = early_scanout_target(&state).expect("composite early target");
         assert_eq!(t.0, 2);
         assert_eq!((t.1, t.2), (1920, 1080));
+    }
+
+    /// `present_mapping` alone is not a console front, however good it looks.
+    ///
+    /// Mid 7 here is faultless by every other measure the resolver applies —
+    /// mapped, page-backed, a front-buffer format, console geometry, and
+    /// composited rather than cleared. The one thing it is not is the mapping
+    /// the guest most recently composited into, and that is the whole contract:
+    /// only `early_front_mapping` names the pre-boundary console. Ranking
+    /// `present_mapping` behind it, which is what this used to do, served the
+    /// last writeback of *any* kind with no sentence saying the guest meant it.
+    #[test]
+    fn early_scanout_ignores_a_present_mapping_that_is_not_the_composite_front() {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        state.present.valid = true;
+        state.present.width = 1920;
+        state.present.height = 1080;
+        state.present.frame_flush_seen = false;
+        state.present.frame_valid = false;
+        assert!(state.map_surface(7));
+        {
+            let m = state.mappings.get_mut(&7).unwrap();
+            m.mapped = true;
+            m.has_geom = true;
+            m.width = 1920;
+            m.height = 1080;
+            m.format = MTL_FORMAT_BGRA8_UNORM;
+            m.content_generation = 4;
+            m.page_entries = vec![1];
+        }
+        state.note_surface_composite(7);
+        state.present.present_mapping = 7;
+        state.present.early_front_mapping = 0;
+        assert!(
+            early_scanout_target(&state).is_none(),
+            "the last writeback of any kind is not a statement that the guest \
+             composited into it"
+        );
+
+        // Naming it as the composited front is what licenses it.
+        state.present.early_front_mapping = 7;
+        assert_eq!(
+            early_scanout_target(&state),
+            Some((7, 1920, 1080, 4)),
+            "the composited front serves, at the mapping's own content generation"
+        );
     }
 
     /// Sticky early_front survives ClearOnly present_mapping thrash.
@@ -1482,7 +1502,6 @@ mod tests {
         }
         state.note_surface_composite(1);
         state.present.early_front_mapping = 1;
-        state.present.early_front_generation = 5;
         // Guest ClearOnly flip mid overwrites present_mapping (buffer setup).
         assert!(state.map_surface(2));
         {
@@ -1512,7 +1531,6 @@ mod tests {
         state.present.frame_flush_seen = true;
         state.present.present_mapping = 3;
         state.present.host_mapping = 3;
-        state.present.mapping_id = 3;
         state.present.valid = true;
         state.present.width = 1440;
         state.present.height = 1080;
@@ -1585,11 +1603,13 @@ mod tests {
             "fragmented paint must multi-import, not not_contig"
         );
         assert_eq!(&dst[..], &frame[..]);
-        // Provenance: a non-contiguous page list is the cold fragmented read path,
-        // not a deferred-flush reuse — the `src=` on the capture line must say so.
-        assert_eq!(
-            state.present.last_paint_src,
-            crate::model::PaintSrc::GuestPagesFragmented
+        // The fixture must still be fragmented, or this stops testing the
+        // multi-import path and silently passes through the packed-view branch.
+        // Asserted on the thing `paint_mapping` actually branches on, rather than
+        // on a provenance field it used to set as a side effect.
+        assert!(
+            crate::runtime::mapper::ensure_contig_view(&mut state, &mut host, mid).is_none(),
+            "fixture stopped being fragmented"
         );
     }
 
@@ -1903,7 +1923,7 @@ mod tests {
             let m = state.mappings.get_mut(&mid).unwrap();
             m.page_entries.clear();
         }
-        crate::runtime::surface_cache::evict(&mut state, mid);
+        crate::runtime::surface_cache::forget(&mut state, mid);
         assert!(!capture_present_frame(&mut state, mid, 2, 2, gen + 1));
     }
 
@@ -2281,41 +2301,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    /// Regression: the present-boundary seed flag `presented_needs_guest_seed`
-    /// (inserted on every capture) MUST be pruned when a mapping is torn down, so
-    /// a recycled mapping_id (a new, unrelated surface reusing the id after
-    /// DeleteIOSurfaceBacking2) does not have its FIRST LOAD draw consume a stale
-    /// flag and bleed the current retained front frame over its own resident —
-    /// the "background does not clear cleanly" residue class. Both teardown
-    /// hooks (`unmap_surface`, `condemn_surface_backing`) route through
-    /// `forget_compositor_mapping`.
-    #[test]
-    fn present_boundary_seed_flag_is_pruned_on_teardown() {
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        let (torn, kept) = (5u32, 6u32);
-        // Both mids were presented (flag set), as a capture would.
-        state.presented_needs_guest_seed.insert(torn);
-        state.presented_needs_guest_seed.insert(kept);
-
-        // Tearing down `torn` prunes only its flag.
-        state.unmap_surface(torn);
-        assert!(
-            !state.presented_needs_guest_seed.contains(&torn),
-            "teardown must prune the present-boundary seed flag (stale-recycle bleed)"
-        );
-        assert!(
-            state.presented_needs_guest_seed.contains(&kept),
-            "an unrelated mid's flag must be untouched"
-        );
-
-        // The condemn (DeleteIOSurfaceBacking2) path prunes it too.
-        state.condemn_surface_backing(kept);
-        assert!(
-            !state.presented_needs_guest_seed.contains(&kept),
-            "condemn_surface_backing must also prune the present-boundary seed flag"
-        );
     }
 
     /// The display transaction names one surface, and that surface alone is the

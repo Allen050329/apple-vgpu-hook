@@ -5,7 +5,6 @@ use crate::contract::pixel_format;
 use crate::contract::{align_up_u64, checked_add_u64, checked_mul_u64};
 
 pub const U32_SIZE: usize = 4;
-pub const U64_SIZE: usize = 8;
 
 /// Minimum typed type-11 object-list descriptor length (geometry prefix).
 /// Live blobs are often longer (0x38/0x58) with an unused/constant tail.
@@ -53,14 +52,6 @@ pub const DEVICE_DESC_BPE: usize = 0x20;
 pub const DEVICE_DESC_PLANE_COUNT: usize = 0x24;
 pub const DEVICE_DESC_PLANES: usize = 0x40;
 
-/// Arm64e page shift/size — fixtures and C ABI defaults that still assume arm.
-/// Product paths must use `page_size_of(state.page_shift)` / `*_shift` APIs.
-pub const PAGE_SHIFT_ARM64E: u32 = crate::contract::gva::PAGE_SHIFT_ARM64E;
-pub const PAGE_SIZE_ARM64E: u64 = 1u64 << PAGE_SHIFT_ARM64E;
-/// x86 page shift/size.
-pub const PAGE_SHIFT_X86: u32 = crate::contract::gva::PAGE_SHIFT_X86;
-pub const PAGE_SIZE_X86: u64 = 1u64 << PAGE_SHIFT_X86;
-
 #[inline]
 pub fn page_size_of(page_shift: u32) -> u64 {
     1u64 << page_shift
@@ -85,12 +76,18 @@ pub const ARM_KERNEL_VA_BASE: u64 = 0xfffffe00_00000000;
 /// x86_64 Darwin canonical kernel half (bits 63:47 all ones in 48-bit VA).
 pub const X86_KERNEL_VA_MIN: u64 = 0xffff8000_00000000;
 
+/// Why a mapper/page-table resolve refused, or [`Status::Ok`] if it did not.
+///
+/// Every variant here names a check this walker actually performs. `ErrArgs`,
+/// `ErrOverflow` and `ErrSpanRange` used to sit alongside them and were never
+/// constructed: the argument checks are `ErrShortDescriptor`, the arithmetic
+/// goes through `checked_*` helpers that fold overflow into the length and
+/// page-count refusals, and the span walk refuses as `ErrPageCount`. A refusal
+/// class the code cannot reach is a claim the fail log can never substantiate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Status {
     Ok,
-    ErrArgs(&'static str),
     ErrShortDescriptor(&'static str),
-    ErrOverflow(&'static str),
     ErrNotKernelVa(&'static str),
     ErrInternalRead(&'static str),
     ErrInternalOwner(&'static str),
@@ -101,16 +98,13 @@ pub enum Status {
     ErrPageTableRead(&'static str),
     ErrPageEntry(&'static str),
     ErrNoPageTable(&'static str),
-    ErrSpanRange(&'static str),
 }
 
 impl crate::observe::Refusal for Status {
     fn refusal(&self) -> Option<&'static str> {
         match self {
             Self::Ok => None,
-            Self::ErrArgs(reason)
-            | Self::ErrShortDescriptor(reason)
-            | Self::ErrOverflow(reason)
+            Self::ErrShortDescriptor(reason)
             | Self::ErrNotKernelVa(reason)
             | Self::ErrInternalRead(reason)
             | Self::ErrInternalOwner(reason)
@@ -120,17 +114,14 @@ impl crate::observe::Refusal for Status {
             | Self::ErrPageCount(reason)
             | Self::ErrPageTableRead(reason)
             | Self::ErrPageEntry(reason)
-            | Self::ErrNoPageTable(reason)
-            | Self::ErrSpanRange(reason) => Some(reason),
+            | Self::ErrNoPageTable(reason) => Some(reason),
         }
     }
 
     fn fields(&self) -> Vec<(&'static str, String)> {
         let class = match self {
             Self::Ok => return Vec::new(),
-            Self::ErrArgs(_) => "args",
             Self::ErrShortDescriptor(_) => "short_descriptor",
-            Self::ErrOverflow(_) => "overflow",
             Self::ErrNotKernelVa(_) => "not_kernel_va",
             Self::ErrInternalRead(_) => "internal_read",
             Self::ErrInternalOwner(_) => "internal_owner",
@@ -141,7 +132,6 @@ impl crate::observe::Refusal for Status {
             Self::ErrPageTableRead(_) => "page_table_read",
             Self::ErrPageEntry(_) => "page_entry",
             Self::ErrNoPageTable(_) => "no_page_table",
-            Self::ErrSpanRange(_) => "span_range",
         };
         vec![("class", class.to_string())]
     }
@@ -773,7 +763,7 @@ pub fn build_table_plan(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::contract::iosurface_pages::{PAGE_SHIFT_ARM64E, PAGE_SIZE_ARM64E};
+    use crate::model::{PAGE_SHIFT_ARM64E, PAGE_SIZE_ARM64E};
     use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::observe::Refusal;
 

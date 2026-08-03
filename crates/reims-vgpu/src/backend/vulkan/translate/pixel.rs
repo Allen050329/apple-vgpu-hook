@@ -16,7 +16,7 @@
 //! A path that genuinely cannot apply the transfer function (because it is
 //! moving raw texels, not shading) asks for [`PixelFormat::linear_vk`] and
 //! records the [`TranslateReason::SrgbDowngraded`] that
-//! [`linear_with_decline`] hands back. The loss is then one grep away instead
+//! [`srgb_decline`] hands back. The loss is then one grep away instead
 //! of invisible.
 
 use ash::vk;
@@ -341,8 +341,7 @@ pub fn storage_image(mtl: u16) -> Result<StorageImageFormat, TranslateReason> {
         pf::MTL_FORMAT_RGB9E5_FLOAT => return Ok(StorageImageFormat::Rgb9e5Ufloat),
         _ => {}
     }
-    let (selector, _bpp) =
-        pf::storage_selector(mtl).ok_or(TranslateReason::NoStorageImageFormat(mtl))?;
+    let selector = pf::storage_selector(mtl).ok_or(TranslateReason::NoStorageImageFormat(mtl))?;
     storage_image_from_selector(selector as u32)
 }
 

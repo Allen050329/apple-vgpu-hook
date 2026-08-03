@@ -358,14 +358,12 @@ pub(crate) fn bind_storage_images(
         descriptor.set_usage(MTLTextureUsage::ShaderRead | MTLTextureUsage::ShaderWrite);
         let texture = device.new_texture(&descriptor);
         let region = MTLRegion::new_2d(0, 0, image.width as u64, image.height as u64);
-        unsafe {
-            texture.replace_region(
-                region,
-                0,
-                image.data as *const _,
-                (image.width as u64) * (bpp as u64),
-            );
-        }
+        texture.replace_region(
+            region,
+            0,
+            image.data as *const _,
+            (image.width as u64) * (bpp as u64),
+        );
         encoder.set_texture(texture_index as u64, Some(&texture));
         mtl_images.push(texture);
     }
@@ -469,14 +467,12 @@ pub(crate) fn bind_compute_sampled_images(
         descriptor.set_usage(usage);
         let texture = device.new_texture(&descriptor);
         let region = MTLRegion::new_2d(0, 0, image.width as u64, image.height as u64);
-        unsafe {
-            texture.replace_region(
-                region,
-                0,
-                image.data as *const _,
-                (image.width as u64) * (bpp as u64),
-            );
-        }
+        texture.replace_region(
+            region,
+            0,
+            image.data as *const _,
+            (image.width as u64) * (bpp as u64),
+        );
         mtl_sampled.push(texture.clone());
         let bound = if let Some(sw) = swizzle {
             match new_texture_view_swizzled(&texture, pixel_format, sw) {
@@ -832,14 +828,12 @@ pub fn compute_writeback_from_mtl(
         };
         let texture = &mtl_images[i];
         let region = MTLRegion::new_2d(0, 0, image.width as u64, image.height as u64);
-        unsafe {
-            texture.get_bytes(
-                image.data as *mut _,
-                (image.width as u64) * (bpp as u64),
-                region,
-                0,
-            );
-        }
+        texture.get_bytes(
+            image.data as *mut _,
+            (image.width as u64) * (bpp as u64),
+            region,
+            0,
+        );
     }
     clear_err(err);
     Status::OK

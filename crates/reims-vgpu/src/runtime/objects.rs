@@ -706,6 +706,41 @@ pub fn resolve_type11_ref<M: HostMemory>(
     Some(mapping_id)
 }
 
+/// The detail line a refused page walk reports.
+///
+/// # Why the walk status is on it
+///
+/// [`crate::contract::gva_resolve::ResolveStatus`] distinguishes fifteen checks
+/// in the guest page-table walk and has done since it was written; this site
+/// collapsed all of them into the single word `translate`. Two refusals with
+/// opposite remedies were therefore indistinguishable in the log: a leaf PTE the
+/// guest has not filled in yet (`zero-pfn` — the surface is mid-map, and the
+/// next frame resolves it) and a task root this device could not read at all
+/// (`no-directory`, `root(...)` — the walk is aimed at the wrong table and
+/// waiting will never help).
+///
+/// The distinction had to be reconstructed by hand for a whole A/B's worth of
+/// refusals, by matching each against later attaches of the same surface id and
+/// inferring which it had been. `walk=` states it outright.
+///
+/// Pure and separate from the emit so the composition is testable: the always-on
+/// sink has no in-memory capture, so a test can only reach this line by building
+/// it.
+fn type4_translate_fail_detail(
+    surface_id: u32,
+    task_id: u32,
+    page: u64,
+    page_count: u64,
+    gva: u64,
+    walk: &str,
+) -> String {
+    format!(
+        "type4_backing_fail reason=translate sid={surface_id} task={task_id} \
+         page={page}/{page_count} gva={gva:#x} walk=[{walk}] \
+         (no translation in this task; not substituting the GVA)"
+    )
+}
+
 /// Apply a decoded type-4 surface as page-table backing for `surface_id`.
 ///
 /// `backing_pfn` is a GPU-VA page (same source as type-2/3 textures). Translate
@@ -764,37 +799,52 @@ fn apply_type4_backing<M: HostMemory>(
 
     // Contract: backing_pfn is getGPUVirtualAddress>>page_shift (GPU-VA page).
     // Translate each consecutive GVA page through the task directory.
-    // Identity GPA is only used when the walk fails *and* that GPA is RAM —
-    // never preferred by content heuristics (AGENTS.md).
+    //
+    // A failed walk is not an address. The device used to substitute the guest
+    // *virtual* address as a guest *physical* one whenever `read_gpa` could
+    // touch it, but that probe asks "is this RAM", which nearly all of low
+    // guest memory answers yes to. Two things follow, and the second is why
+    // this refuses rather than guesses harder.
+    //
+    // The fabricated PFN goes into `m.page_entries`, which is the address list
+    // every later reader and writer resolves through, so a guess aims real
+    // pixel writes at memory the guest allocated for something else — and it
+    // stays there, because the guess is cached as the surface's backing.
+    //
+    // What refusing buys, measured, is a retry. On boot 20260731-192622 both
+    // refusals were followed by a full real-walk resolve of the same surface on
+    // the same task within one or two frames: the guest had not finished
+    // mapping the backing when the device first asked. The callers are
+    // per-frame (scanout, bind, draw), so re-asking is already the shape of the
+    // code; the guess was standing in for an answer about to be available.
+    //
+    // Refusing also lets the task search do its job, which a guess ended.
+    // `apply_type4_backing` returning `true` stops the loop in
+    // `resolve_type4_surface_ex`, and task 0 is probed first, so a guess made
+    // task 0 claim surfaces it could not translate. That path is covered by
+    // `the_task_search_reaches_the_owner_when_task_zero_cannot_translate`; it
+    // has not been observed on the rig, where every attach resolves on task 0.
     let mut entries = Vec::with_capacity(page_count as usize);
     let mut gva_hits = 0u32;
-    let mut id_hits = 0u32;
     for i in 0..page_count {
         let gva = ((surf.backing_pfn as u64) + i) << page_shift;
-        let walked = gva_mem::translate_task_gva(host, task, gva, page_shift);
-        let gpa = match walked {
-            Some(g) => {
-                gva_hits = gva_hits.saturating_add(1);
-                Some(g)
-            }
-            None => {
-                let candidate = gva;
-                let mut probe = [0u8; 1];
-                if host.read_gpa(candidate, &mut probe).is_ok() {
-                    id_hits = id_hits.saturating_add(1);
-                    Some(candidate)
-                } else {
-                    None
-                }
-            }
-        };
-        let Some(gpa) = gpa else {
-            crate::observe::fail(format!(
-                "type4 translate fail sid={surface_id} task={task_id} page={i}/{} gva={gva:#x}",
-                page_count
-            ));
+        let Some(gpa) = gva_mem::translate_task_gva(host, task, gva, page_shift) else {
+            crate::runtime::drain::note_store_route("type4_translate_refused");
+            note_type4_fail(
+                surface_id,
+                "translate",
+                type4_translate_fail_detail(
+                    surface_id,
+                    task_id,
+                    i,
+                    page_count,
+                    gva,
+                    &gva_mem::diagnose_task_slot(host, task, task_id, gva, page_shift),
+                ),
+            );
             return false;
         };
+        gva_hits = gva_hits.saturating_add(1);
         let pfn = gpa >> page_shift;
         if pfn > u32::MAX as u64 {
             note_type4_fail(
@@ -860,8 +910,15 @@ fn apply_type4_backing<M: HostMemory>(
         // "first attach" re-fires per recycle (page_entries cleared by the
         // teardown), so on fail() it floods the curated real-error view (~4k
         // lines under a continuously-animating app, burying genuine failures).
+        // `gva0` is what the refusal line above prints as `gva=`, so a refusal
+        // and a later resolve can be matched by the *backing* they name. Matching
+        // them by `sid` alone is unsound: surface ids recycle within a boot and
+        // across geometries — sid 145 was a 15x622 scrollbar at t=332488 and a
+        // 1225x512 tile 2.8 s later — so "the same surface resolved a frame
+        // later" can be a different surface wearing the same id.
+        let gva0 = (surf.backing_pfn as u64) << page_shift;
         crate::observe::off(format!(
-            "type4 pages sid={surface_id} task={task_id} n={page_count} gva_hits={gva_hits} id_hits={id_hits} gpa0={g0:#x} gpa1={g1:#x} gpa2={g2:#x} sample0_nz={snz}/16 w={} h={} bpr={} len={:#x} plane0_bytes={plane0_bytes} fmt={:#x} planes={} multi={}",
+            "type4 pages sid={surface_id} task={task_id} n={page_count} gva_hits={gva_hits} gva0={gva0:#x} gpa0={g0:#x} gpa1={g1:#x} gpa2={g2:#x} sample0_nz={snz}/16 w={} h={} bpr={} len={:#x} plane0_bytes={plane0_bytes} fmt={:#x} planes={} multi={}",
             surf.width,
             surf.height,
             surf.bytes_per_row,
@@ -900,9 +957,9 @@ fn apply_type4_backing<M: HostMemory>(
             crate::model::DeviceState::bump_map_generation(m);
         }
         if replaced {
-            // Recycled-mid backing-refresh census (not a drop; the recycle rate
-            // is summarized by teardown_churn). Off the curated fail() view —
-            // per-recycle under animation churn it floods the real-error view.
+            // Recycled-mid backing-refresh census — not a drop. Off the curated
+            // fail() view: per-recycle under animation churn it floods the
+            // real-error view, at 793 lines in one measured boot.
             crate::observe::off(format!(
                 "type4_pages_refreshed sid={surface_id} task={task_id} n={} map_gen={}",
                 entries.len(),
@@ -920,25 +977,52 @@ fn apply_type4_backing<M: HostMemory>(
         // a live x86 boot, the one that actually runs — the mapper's own
         // adoption stayed silent for whole boots while surfaces plainly had
         // 2040 pages each, because the page list arrives here.
+        //
+        // No `changed=` field, though `changed` is in scope and the mapper's
+        // peer emitter prints its own. Here it could only ever be 1: the dedup
+        // is `first_sight` on the span, and an unchanged plan has by definition
+        // the same span as the plan before it, so the unchanged case is filtered
+        // out before reaching this line. The one way to arrive here unchanged is
+        // the first visit for a surface, and there `prior` is empty, which makes
+        // `changed` true. The mapper's copy is not in that position — its
+        // reprieve path can repopulate an emptied entry list with no change.
         if let Some((lo, hi)) = crate::runtime::mapper::entry_gpa_span(&entries, state_page_shift) {
             let key = (u64::from(surface_id) << 40) ^ (lo >> state_page_shift) ^ (hi << 20);
             if crate::observe::first_sight("mapping_gpa_span", key) {
                 crate::observe::off(format!(
-                    "mapping_gpa_span mid={surface_id} gen={} pages={} src=type4 changed={} \
+                    "mapping_gpa_span mid={surface_id} gen={} pages={} src=type4 \
                      lo={lo:#x} hi={:#x} pn_lo={:#x} pn_hi={:#x}",
                     m.map_generation,
                     entries.len(),
-                    changed as u8,
                     hi + (1u64 << state_page_shift),
                     lo >> state_page_shift,
                     hi >> state_page_shift,
                 ));
             }
         }
+        // The type-4 peer of the adoption in `mapper::resolve_mapping_backing`:
+        // these pages are a surface's again, so the write-after-teardown
+        // detector must stop reporting writes into them.
+        crate::observe::footprint::note_pages_authorized(
+            entries.iter().filter_map(|&e| {
+                crate::contract::iosurface_pages::entry_gpa_shift(e, state_page_shift)
+            }),
+            crate::contract::iosurface_pages::page_size_of(state_page_shift),
+        );
         m.page_entries = entries;
         m.mapped = true;
         m.page_table_kva = 0;
         m.device_desc = device_desc;
+        // Latched with the list rather than near it: this records the walk that
+        // produced the entries above, so a later reader can repeat that walk —
+        // and find out whether the entries still name the guest's memory —
+        // without repeating the object search that found the surface. Written at
+        // the assignment so the two cannot be updated independently.
+        m.type4_walk = Some(crate::model::Type4Walk {
+            task_id,
+            backing_pfn: surf.backing_pfn,
+            map_generation: m.map_generation,
+        });
         // Contiguous view must be rebuilt.
         if m.contig_ptr != 0 {
             state.retired_views.push((m.contig_ptr, m.contig_len));
@@ -1113,9 +1197,12 @@ fn resolve_type4_surface_ex<M: HostMemory>(
                             .and_then(|t| gva_mem::translate_task_gva(host, t, gva, page_shift))
                         {
                             Some(gpa) => cached == Some(gpa & !(page_size - 1)),
-                            // Walk fails now: cached identity fallback is
-                            // still the best available answer — keep it.
-                            None => cached == Some(gva),
+                            // No translation now, so nothing here can vouch for
+                            // the cached table. The device never caches a
+                            // GVA-as-GPA entry, so say stale and let the rebuild
+                            // refuse, which is what moves the task search on to
+                            // the task that can translate.
+                            None => false,
                         }
                     };
                     let last = m.page_entries.len() - 1;
@@ -1383,18 +1470,20 @@ mod tests {
         .is_none());
     }
 
+    /// A failed page-table walk is not an address. The device used to answer it
+    /// with the backing *virtual* address used as a physical one whenever that
+    /// number happened to be RAM, which put a fabricated PFN into
+    /// `page_entries` — the list every later reader and writer resolves
+    /// through. Here the walk cannot resolve the backing GVA and the identity
+    /// candidate *is* mapped RAM, so the old path would have accepted it.
     #[test]
-    fn resolve_type4_identity_gpa() {
+    fn resolve_type4_refuses_to_substitute_the_gva_when_the_walk_fails() {
         let mut host = FakeHost::new();
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         state.page_shift = PAGE_SHIFT_X86;
-        // Pages for identity GPA fallback at pfn 0x20.
-        let page = 0x20u64 << PAGE_SHIFT_X86;
-        host.map_range(page, 0x2000, 0x5a);
-        // Task with empty directory — force identity GPA path.
-        assert!(state.define_task(0, 0x1000, 0)); // directory_pfn=0 → no GVA
-                                                  // Put a type-4 entry at surface_id=3: need object list in GPA (not GVA).
-                                                  // With directory_pfn=0, lookup will fail GVA. Build a task with PT.
+        // The identity candidate is backed RAM: `read_gpa` succeeds on it, which
+        // is the whole of what the old gate checked.
+        host.map_range(0x20u64 << PAGE_SHIFT_X86, 0x2000, 0x5a);
         let dir_gpa = 2u64 << PAGE_SHIFT_X86;
         let root_gpa = 3u64 << PAGE_SHIFT_X86;
         let data_gpa = 4u64 << PAGE_SHIFT_X86;
@@ -1405,18 +1494,19 @@ mod tests {
         st32(&mut d[DIRECTORY_ROOT_PFN as usize..], 3);
         st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
         let _ = host.write_gpa(dir_gpa, &d);
+        // root[0] carries the object list and descriptors. root[0x20] — the
+        // backing GVA page — is left unmapped, so the backing walk fails.
         st32(&mut d[..4], 4);
         let _ = host.write_gpa(root_gpa, &d[..4]);
         assert!(state.define_task(1, 0x1000, 2));
         assert!(state.set_object_list(1, 0, 8));
-        // Entry at index 3 (surface_id).
         let mut entry = [0u8; 12];
         st32(&mut entry[0..], 4u32 | (0x30u32 << 8));
         entry[4..12].copy_from_slice(&0x80u64.to_le_bytes());
         let _ = host.write_gpa(data_gpa + 3 * 12, &entry);
         let mut desc = vec![0u8; 0x30];
         st64(&mut desc[0..], 0x1000);
-        st32(&mut desc[8..], 0x20); // identity GPA pfn
+        st32(&mut desc[8..], 0x20); // backing GVA page — unmapped in this task
         st32(&mut desc[0xc..], 0x50);
         desc[0x10] = 1;
         st32(&mut desc[0x18..], 16);
@@ -1424,12 +1514,98 @@ mod tests {
         st32(&mut desc[0x20..], 64);
         let _ = host.write_gpa(data_gpa + 0x80, &desc);
 
-        assert!(resolve_type4_surface(&mut state, &host, 3));
+        assert!(
+            !resolve_type4_surface(&mut state, &host, 3),
+            "an untranslatable backing must not resolve"
+        );
+        // The refusal happens before any mutation, so no fabricated entry is
+        // left behind for a later writer to aim at.
+        let fabricated = state
+            .mappings
+            .get(&3)
+            .map(|m| m.mapped || !m.page_entries.is_empty())
+            .unwrap_or(false);
+        assert!(!fabricated, "refusal must not cache a fabricated backing");
+    }
+
+    /// `resolve_type4_surface_ex` probes task 0 first and returns on the first
+    /// task whose backing applies. The identity guess made task 0 succeed for
+    /// surfaces it could not translate, so the search stopped there and the
+    /// owning task was never tried — the surface was then backed by an address
+    /// derived from a virtual one. Refusing is what lets the loop continue.
+    ///
+    /// Both tasks list the surface, as task 0 (the kernel/global list) and the
+    /// owner do in production; only the owner can translate the backing.
+    #[test]
+    fn the_task_search_reaches_the_owner_when_task_zero_cannot_translate() {
+        let mut host = FakeHost::new();
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        state.page_shift = PAGE_SHIFT_X86;
+        let dir0_gpa = 2u64 << PAGE_SHIFT_X86;
+        let root0_gpa = 3u64 << PAGE_SHIFT_X86;
+        let data_gpa = 4u64 << PAGE_SHIFT_X86;
+        let dir1_gpa = 7u64 << PAGE_SHIFT_X86;
+        let root1_gpa = 8u64 << PAGE_SHIFT_X86;
+        let real_page = 9u64 << PAGE_SHIFT_X86;
+        for (gpa, len) in [
+            (dir0_gpa, 0x20),
+            (root0_gpa, 0x1000),
+            (data_gpa, 0x200),
+            (dir1_gpa, 0x20),
+            (root1_gpa, 0x1000),
+            (real_page, 0x1000),
+        ] {
+            host.map_range(gpa, len, 0);
+        }
+        // The identity candidate for the backing GVA is RAM, so the old path
+        // would have taken it on task 0 rather than moving on.
+        host.map_range(0x20u64 << PAGE_SHIFT_X86, 0x1000, 0x5a);
+
+        let mut d = [0u8; 8];
+        st32(&mut d[DIRECTORY_ROOT_PFN as usize..], 3);
+        st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
+        let _ = host.write_gpa(dir0_gpa, &d);
+        st32(&mut d[DIRECTORY_ROOT_PFN as usize..], 8);
+        let _ = host.write_gpa(dir1_gpa, &d);
+        // Both roots reach the object list at GVA 0; only task 1's maps the
+        // backing GVA page 0x20, and it maps it to `real_page`.
+        st32(&mut d[..4], 4);
+        let _ = host.write_gpa(root0_gpa, &d[..4]);
+        let _ = host.write_gpa(root1_gpa, &d[..4]);
+        st32(&mut d[..4], 9);
+        let _ = host.write_gpa(root1_gpa + 0x20 * 4, &d[..4]);
+
+        assert!(state.define_task(0, 0x1000, 2));
+        assert!(state.set_object_list(0, 0, 8));
+        assert!(state.define_task(1, 0x1000, 7));
+        assert!(state.set_object_list(1, 0, 8));
+
+        let mut entry = [0u8; 12];
+        st32(&mut entry[0..], 4u32 | (0x30u32 << 8));
+        entry[4..12].copy_from_slice(&0x80u64.to_le_bytes());
+        let _ = host.write_gpa(data_gpa + 3 * 12, &entry);
+        let mut desc = vec![0u8; 0x30];
+        st64(&mut desc[0..], 0x1000);
+        st32(&mut desc[8..], 0x20);
+        st32(&mut desc[0xc..], 0x50);
+        desc[0x10] = 1;
+        st32(&mut desc[0x18..], 16);
+        st32(&mut desc[0x1c..], 16);
+        st32(&mut desc[0x20..], 64);
+        let _ = host.write_gpa(data_gpa + 0x80, &desc);
+
+        assert!(
+            resolve_type4_surface(&mut state, &host, 3),
+            "the owning task can translate the backing, so the resolve must succeed"
+        );
         let m = state.mappings.get(&3).unwrap();
-        assert!(m.mapped);
         assert_eq!(m.page_entries.len(), 1);
-        assert!(m.has_geom);
-        assert_eq!((m.width, m.height), (16, 16));
+        assert_eq!(
+            entry_gpa_shift(m.page_entries[0], PAGE_SHIFT_X86),
+            Some(real_page),
+            "the backing must come from the task that could translate it, \
+             not from task 0's untranslatable GVA"
+        );
     }
 
     /// Force-resolve must rebuild the cached page table when the task PT
@@ -1555,6 +1731,56 @@ mod tests {
                 .unwrap()
                 .contains(&(sid, "task_inactive")),
             "clear_type4_fail must re-arm so a later failure logs again"
+        );
+    }
+
+    /// A refused walk must say **which** of the walk's checks refused.
+    ///
+    /// The walk distinguishes fifteen refusals and this rail reported one word,
+    /// `translate`, for all of them — so "the guest has not filled in this leaf
+    /// PTE yet" and "this device could not read the task root at all" produced
+    /// identical log lines while wanting opposite responses. Both halves are
+    /// locked here: the walk names its failing check, and the detail line
+    /// carries that name verbatim.
+    ///
+    /// The fixture maps GVA page 0 and nothing else, so the *same* task walks
+    /// clean for one address and refuses for the next. Asserting the clean case
+    /// too is what keeps this from passing vacuously: a fixture in which every
+    /// walk fails would satisfy the refusal assertions on its own.
+    #[test]
+    fn a_refused_type4_walk_names_the_check_that_refused() {
+        let mut host = FakeHost::new();
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        setup_task_with_list(&mut host, &mut state);
+        let task = state.tasks.get(1).expect("fixture defines task 1");
+
+        // Control: the address the fixture does map walks all the way down.
+        let mapped = gva_mem::diagnose_task_slot(&host, task, 1, 0, PAGE_SHIFT_ARM64E);
+        assert!(
+            mapped.contains("st=ok"),
+            "fixture must be able to translate, got {mapped:?}"
+        );
+
+        // The case the rig produces: a backing whose leaf entry the guest has
+        // not written. Page 1 shares the fixture's root and has no PTE.
+        let gva = 1u64 << PAGE_SHIFT_ARM64E;
+        let walk = gva_mem::diagnose_task_slot(&host, task, 1, gva, PAGE_SHIFT_ARM64E);
+        assert!(
+            walk.contains("st=zero-pfn"),
+            "an unwritten leaf must be reported as zero-pfn, got {walk:?}"
+        );
+        assert!(
+            walk.contains("lvl=") && walk.contains("idx="),
+            "the refusal must name where in the walk it stopped, got {walk:?}"
+        );
+
+        let line = type4_translate_fail_detail(202, 1, 0, 640, gva, &walk);
+        assert!(line.contains("reason=translate"), "{line}");
+        assert!(line.contains("sid=202"), "{line}");
+        assert!(line.contains("page=0/640"), "{line}");
+        assert!(
+            line.contains(&format!("walk=[{walk}]")),
+            "the refusal must carry the walk diagnosis verbatim, got {line}"
         );
     }
 

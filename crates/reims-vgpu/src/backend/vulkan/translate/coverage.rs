@@ -359,7 +359,13 @@ const RENDER_PASS: &[FieldCoverage] = &[
     honored(
         "colorAttachments[n].clearColor",
         "ColorAttachment.clear_color",
-        "backend/vulkan/engine/exec.rs:LoadOp",
+        // The runtime, not the engine. A CLEAR attachment is materialized as a
+        // solid RGBA8 seed at the guest's colour and uploaded as the pass's
+        // LOAD seed; the engine's own `VkClearValue` for attachment 0 is
+        // `[0, 0, 0, 0]` unconditionally and never carried the guest's floats.
+        // This entry named the engine and was wrong about where the field is
+        // read.
+        "runtime/metal_draw/vulkan.rs:solid_rgba_local",
     ),
     honored(
         "colorAttachments[n].resolveTexture",
@@ -873,6 +879,17 @@ const FIFO_RESOURCE_COMMANDS: &[FieldCoverage] = decoded_fields! {
         "fifo::SynchronizeResourcesCommand.count",
         "fifo::SynchronizeResourcesCommand.object_ids",
     ];
+    honored "runtime/exec.rs:consume_resource_table" => [
+        "fifo::ExecResourceDesc.object_id",
+        "fifo::ExecResourceDesc.ops",
+    ];
+    declined "exec_res_table" at "runtime/exec.rs:consume_resource_table" => [
+        // Zero across 84 868 records on the Ventura 13.7.8 x86 build, so their
+        // unrecovered meaning costs nothing there. Read rather than dropped so a
+        // build that populates them raises `exec_res_tail_populated` instead of
+        // passing unread.
+        "fifo::ExecResourceDesc.tail",
+    ];
 };
 
 /// Full render command stream state, beyond the fixed-function request fields
@@ -1162,6 +1179,7 @@ pub const MANIFEST: &[DescriptorFamily] = &[
             "fifo::InvalidateResourceRecord",
             "fifo::InvalidateResourcesCommand",
             "fifo::SynchronizeResourcesCommand",
+            "fifo::ExecResourceDesc",
         ],
         fields: FIFO_RESOURCE_COMMANDS,
     },
@@ -1238,10 +1256,6 @@ pub const DECODE_STRUCT_EXCLUSIONS: &[(&str, &str)] = &[
         "a normalized command-stream record envelope: segment identity and byte ranges route the payload to a rail decoder",
     ),
     (
-        "resource::ObjectEntry",
-        "the outer object-table envelope: type, reference, flags, and record length route an embedded descriptor but are not descriptor state",
-    ),
-    (
         "resource::CompactTlv",
         "compact TLV framing retained by the resource decoder; its tag and offsets locate descriptor fields rather than becoming GPU state",
     ),
@@ -1274,9 +1288,6 @@ pub const DECODE_ENUMS: &[&str] = &[
     "render::Kind",
     "render::Stage",
     "resource::DecodeStatus",
-    "resource::ObjectType",
-    "resource::DescriptorKind",
-    "resource::ProducerCoverage",
     "resource::Descriptor",
     "stream::DecodeStatus",
     "stream::SegmentDisposition",
@@ -1624,9 +1635,9 @@ mod tests {
         );
         assert_eq!(
             (structs.len(), actual_enums.len()),
-            (43, 21),
+            (43, 18),
             "the public decode type census moved; keep the 43-struct field \
-             manifest and 21-enum inventory exhaustive, then update this pin"
+             manifest and 18-enum inventory exhaustive, then update this pin"
         );
     }
 
@@ -1888,10 +1899,20 @@ mod tests {
         }
         assert_eq!(
             (honored, declined, dropped, absent),
+            // Moved 2026-08-01, second: `ExecResourceDesc.flags` left the
+            // manifest with the field. It was the raw dword `ops` decodes from,
+            // kept only for the `exec_res_table` census histogram, so deleting
+            // that census left nothing reading it. `declined` fell by one.
+            //
+            // Moved 2026-08-01: the four `ExecResourceDesc` fields entered the
+            // manifest — the EXEC_INDIRECT2 resource table, which the device
+            // used to step over unread. `object_id` and `ops` are Honored by
+            // `consume_resource_table`; `tail` is Declined there too.
+            //
             // Moved 2026-07-30: `colorAttachments[n].writeMask` went
             // NotOnTheWire -> Honored, so `absent` fell by one and `honored`
             // rose by one. It is on the wire after all, as tag 0x09.
-            (251, 60, 23, 24),
+            (253, 61, 23, 24),
             "the coverage census moved; update this baseline in the same commit \
              that moves it, and describe which way it moved"
         );

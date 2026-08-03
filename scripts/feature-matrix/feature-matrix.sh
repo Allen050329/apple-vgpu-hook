@@ -42,16 +42,28 @@ The three supported arms, one per host GPU API actually available:
   Vulkan / native    same feature set                             Linux
 
 The feature sets are exactly what vendor/qemu/hw/display/meson.build passes for
-REIMS_VGPU_BACKEND=metal and REIMS_VGPU_BACKEND=vulkan. Which arms this host can build
-depends on the host: an Apple host builds all three (the Linux one by cross
-check); a Linux host builds only the native Vulkan arm, because backend-metal
-off Apple is a compile error by design and Metal cannot be cross-checked to a
-host that has no Metal.
+REIMS_VGPU_BACKEND=metal and REIMS_VGPU_BACKEND=vulkan. An Apple host builds
+all three natively (the Linux one by cross check). A Linux host builds the
+native Vulkan arm and cross-checks the other two.
+
+The Metal arm cross-checks from any host. src/lib.rs rejects backend-metal on
+`not(target_os = "macos")` — that is a condition on the *target*, not on the
+host, so `--target *-apple-darwin` satisfies it and the real cfgs are
+exercised. `cargo check` needs no Apple SDK. This script used to skip the arm
+off Apple on the theory that Metal could not be cross-checked at all, and the
+arm rotted to 11 errors unnoticed; every one of them was in first-party code
+that this cell catches.
+
+Checking is all that is claimed: it type-checks the arm, it does not link
+against a real SDK and cannot run it.
 
 Warnings do not fail an arm; the count is printed so drift stays visible.
 
 env:
   CROSS_TARGET   Linux target to cross-check (default x86_64-unknown-linux-gnu)
+  METAL_TARGET   Apple target to cross-check the Metal arm against off Apple
+                 (default: aarch64-apple-darwin if installed, else
+                 x86_64-apple-darwin)
 EOF
 }
 
@@ -168,17 +180,39 @@ count_cell() {
 
 echo "[feature-matrix] host=$HOST_TRIPLE cross=$CROSS_TARGET cargo=$CARGO_CMD"
 
-# Arm 1 — Metal. Apple hosts only; backend-metal off Apple is a compile_error!
-# in lib.rs, so this arm is genuinely absent on a Linux host rather than skipped
-# for convenience.
+# Arm 1 — Metal. Native on Apple, cross-checked everywhere else: lib.rs gates
+# backend-metal on target_os, so an Apple *target* is all the arm needs. Only
+# the run half is Apple-only, which is why the off-Apple cell never counts
+# tests.
 case "$HOST_TRIPLE" in
   *-apple-*)
     run_cell "metal / $HOST_TRIPLE" "" "$FEATURES_METAL"
     count_cell "metal / $HOST_TRIPLE" "$FEATURES_METAL"
     ;;
   *)
-    RESULTS+=("$(printf '%-4s %-46s %s' "n/a" "metal / $HOST_TRIPLE" \
-      "(backend-metal is Apple-only)")")
+    # arm64 macOS is the pathway this arm actually ships on, so prefer it and
+    # fall back to the x86 Apple target; both carry target_os = "macos" and so
+    # exercise the same cfgs.
+    if [ -z "${METAL_TARGET:-}" ]; then
+      for cand in aarch64-apple-darwin x86_64-apple-darwin; do
+        if rustup target list --installed 2>/dev/null | grep -qx "$cand"; then
+          METAL_TARGET="$cand"
+          break
+        fi
+      done
+    fi
+    if [ -n "${METAL_TARGET:-}" ]; then
+      run_cell "metal / $METAL_TARGET" "$METAL_TARGET" "$FEATURES_METAL"
+      if [ "$COUNT_TESTS" -eq 1 ]; then
+        COUNTS+=("$(printf '%-46s %s' "metal / $METAL_TARGET" \
+          "(cross-compiled — cannot run here)")")
+      fi
+    else
+      # Not a pass. Say which command restores the cell, because the last time
+      # this arm went unchecked it accumulated 11 errors.
+      RESULTS+=("$(printf '%-4s %-46s %s' "SKIP" "metal / $HOST_TRIPLE" \
+        "(rustup target add aarch64-apple-darwin)")")
+    fi
     ;;
 esac
 

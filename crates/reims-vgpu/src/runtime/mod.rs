@@ -3,10 +3,15 @@
 //! Drain FIFOs, parse wire (using [`crate::contract`]), resolve memory, plan
 //! ops, update [`crate::model`] state. No GPU API calls here.
 
+/// The split of [`chain_phase`]'s largest column, `binds_us`.
+pub mod bind_phase;
 /// Product-path blit fill/copy execution against guest GVA.
 pub mod blit_exec;
 /// Always-on proxies and censuses, one per measured bug class.
 pub mod census;
+/// Where a draw chain's wall clock goes on the runtime side of the engine
+/// boundary, which is 82% of it.
+pub mod chain_phase;
 /// Product-path compute bind/dispatch (pipeline + buffers + direct dispatch).
 pub mod compute_exec;
 /// Multi-record compute encoder session (control-flow SPI + ICB execute).
@@ -19,6 +24,10 @@ pub mod drain;
 pub mod exec;
 /// Product-path event + encoder fence sync (event/blit/compute/render domains).
 pub mod fence_exec;
+/// Is the hypervisor's guest-write generation a sound cache key for the
+/// zero-copy sampled gathers? Measurement, not policy.
+#[cfg(feature = "backend-vulkan")]
+pub mod gather_witness;
 /// Guest-physical control-plane writes via HostOps map_pages.
 pub mod gpa_map;
 /// Task GVA → guest RAM reads.
@@ -28,10 +37,15 @@ pub mod gva_view;
 /// CmdHeapTextureSizeAndAlign wire decode + host requirement query.
 pub mod heap_query;
 pub mod host;
+/// Which guest pages this device has written, and when — the half of the
+/// guest-write witness the hypervisor's dirty bitmap cannot supply.
+pub mod host_writes;
 /// Type-7 ICB (0x36) materialization, host command fills, execute writeback.
 pub mod icb;
 
 pub mod input;
+/// How much of a render writeback the guest's pages already hold.
+pub mod land_redundancy;
 /// Process-global metal2vulkan SPIR-V cache (AIR content hash → SPIR-V).
 pub mod m2v_cache;
 /// IOSurface mapper capture + page-table resolve.
@@ -51,6 +65,8 @@ pub mod plan;
 /// The resident identity a type-11 guest surface renders into.
 #[cfg(feature = "backend-vulkan")]
 pub mod present_identity;
+/// The guest's per-resource validity quad, from both of its producers.
+pub mod resource_validity;
 /// Guest surface → host BGRA8 for the QEMU console.
 pub mod scanout;
 /// SPIR-V set-0 binding relocation for metal2vulkan + internal Vulkan engine (Linux).
@@ -67,12 +83,11 @@ pub mod task_slot;
 pub mod texture;
 
 pub use drain::{
-    complete_async_job, drain_child_fifo, drain_main_fifo, drain_other_child_fifos, drain_pending,
-    enqueue_async_stamp_surface, signal_display_vbl, wait_surface_mapping,
-    wait_surface_other_channels, write_stamp, Packet, PacketError,
+    drain_child_fifo, drain_main_fifo, drain_other_child_fifos, drain_pending, signal_display_vbl,
+    write_stamp, Packet, PacketError,
 };
 pub use host::{
-    read_u32, write_u32, FakeHost, HostAction, HostActionKind, HostMemory, HostOps, MemError,
+    read_u32, FakeHost, HostAction, HostActionKind, HostMemory, HostOps, MemError,
 };
 
 #[cfg(test)]

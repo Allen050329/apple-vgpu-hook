@@ -80,22 +80,6 @@ fn compute_defer_readback_follows_gpu_only_content_gate() {
     assert!(!compute_defer_readback_allowed(true, true, false));
 }
 
-#[test]
-fn m2v_handoff_dir_prefers_explicit_dir_then_repo_local_private_dir() {
-    assert_eq!(
-        m2v_handoff_dir_from_env(Some("/custom/m2v".into()), Some("/repo".into())),
-        std::path::PathBuf::from("/custom/m2v")
-    );
-    assert_eq!(
-        m2v_handoff_dir_from_env(None, Some("/repo".into())),
-        std::path::PathBuf::from("/repo/m2v-handoff/artifacts")
-    );
-    assert_eq!(
-        m2v_handoff_dir_from_env(None, None),
-        std::path::PathBuf::from("/tmp/reims-vgpu-m2v-compute-fails")
-    );
-}
-
 /// A type-5 view names its IOSurface plane on the wire (record `+0x20`, the
 /// `newTextureWithDescriptor:iosurface:plane:` argument). When two planes share
 /// geometry and bytes-per-element the geometry scan cannot separate them and
@@ -242,64 +226,6 @@ fn stage_texture_type5_plane_index_beats_the_ambiguous_geometry_scan() {
         }
         _ => panic!("a type-5 view over a surface mapping must write back as type-11"),
     }
-}
-
-/// The buffer handoff writes a bounded prefix, and the bound is the one Metal
-/// puts on an inline constant block (`setBytes:` is specified to 4 KiB). A
-/// buffer shorter than that must be written whole — truncating a 64-byte
-/// constant block would lose the thing the dump exists to capture — and a
-/// larger one must stop exactly at the bound rather than spill a whole image
-/// buffer to disk.
-#[test]
-fn handoff_buffer_preview_writes_short_buffers_whole_and_caps_long_ones() {
-    assert_eq!(handoff_buffer_preview(&[]).len(), 0);
-    let small = vec![0xa5u8; 64];
-    assert_eq!(handoff_buffer_preview(&small), &small[..]);
-    let exact = vec![0x5au8; HANDOFF_BUFFER_PREVIEW_LEN];
-    assert_eq!(
-        handoff_buffer_preview(&exact).len(),
-        HANDOFF_BUFFER_PREVIEW_LEN
-    );
-    let big = vec![0x11u8; HANDOFF_BUFFER_PREVIEW_LEN * 4 + 7];
-    let preview = handoff_buffer_preview(&big);
-    assert_eq!(preview.len(), HANDOFF_BUFFER_PREVIEW_LEN);
-    // The prefix, not a sample or the tail: offsets in the dump must match
-    // offsets in the guest buffer or reading a struct out of it is guesswork.
-    assert_eq!(preview, &big[..HANDOFF_BUFFER_PREVIEW_LEN]);
-}
-
-/// The draw and compute handoff dumps share one selection parse, so a boot that
-/// lists a pipe for one knob gets the same answer from the other. Unset must
-/// select nothing: these dumps write Apple-owned IR, so a default-on knob would
-/// litter the handoff directory on every normal boot.
-#[test]
-fn handoff_pipe_selection_matches_all_or_a_listed_ref_and_nothing_when_unset() {
-    let none = HandoffPipeSelection::from_raw(None);
-    assert!(!none.wants(0));
-    assert!(!none.wants(196));
-
-    let all = HandoffPipeSelection::from_raw(Some("all".into()));
-    assert!(all.wants(196));
-    assert!(all.wants(0));
-    // Case and surrounding whitespace come from a shell export, not from us.
-    assert!(HandoffPipeSelection::from_raw(Some("  ALL \n".into())).wants(7));
-
-    let listed = HandoffPipeSelection::from_raw(Some("53, 196,155".into()));
-    assert!(listed.wants(53));
-    assert!(listed.wants(196));
-    assert!(listed.wants(155));
-    assert!(!listed.wants(154));
-
-    // An unparseable entry drops itself, not the whole list.
-    let mixed = HandoffPipeSelection::from_raw(Some("53,notapipe,196".into()));
-    assert!(mixed.wants(53));
-    assert!(mixed.wants(196));
-    assert!(!mixed.wants(0));
-
-    // An empty variable is an empty list, not `all`.
-    let empty = HandoffPipeSelection::from_raw(Some(String::new()));
-    assert!(!empty.wants(0));
-    assert!(!empty.wants(196));
 }
 
 #[test]
@@ -701,7 +627,6 @@ fn dispatch_nometal_with_texture_binds() {
     };
     cmd.threads_per_threadgroup = compute::Size3 { x: 32, y: 0, z: 1 };
     let st = execute_dispatch(&mut state, &mut host, 1, &acc, &cmd);
-    #[cfg(feature = "backend-vulkan")]
     assert!(
         matches!(
             st,
@@ -1355,9 +1280,6 @@ fn linear_writeback_retains_cache_when_guest_gva_is_unmapped() {
     let task_id = 6u32;
     let texture_ref = 11u32;
     let gva = 0x101000u64;
-    // An unrelated live span makes the product bound audit authoritative;
-    // the texture range itself is intentionally outside it.
-    state.note_task_map(task_id, 0x200000, 0x1000);
     let rgba = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
     let staged = StagedTexture {
         binding: 32,
@@ -1371,6 +1293,7 @@ fn linear_writeback_retains_cache_when_guest_gva_is_unmapped() {
         seed_skipped: false,
         sample_resident: None,
         writeback: TextureWriteback::Linear {
+            pages: Default::default(),
             texture_ref,
             gva,
             pixel_format: MTL_FORMAT_RGBA8_UNORM,
@@ -1541,101 +1464,6 @@ fn incomplete_compute_engine_call_fires_stall_proxy() {
 }
 
 #[test]
-fn storage_residency_proxy_requires_exact_view_and_generation() {
-    let pipe = 0xd000_0000 | (std::process::id() & 0x0fff_ffff);
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-    state.map_surface(9);
-    state.mappings.get_mut(&9).unwrap().content_generation = 4;
-    let key = crate::model::ComputeStorageResidencyKey {
-        mapping_id: 9,
-        map_generation: state.mappings[&9].map_generation,
-        surface_offset: 64,
-        surface_bpr: 32,
-        span_end: 128,
-        width: 4,
-        height: 2,
-        pixel_format: pixel_format::MTL_FORMAT_RGBA8_UNORM,
-        texture_ref: 0,
-    };
-    let mut texture = StagedTexture {
-        binding: 32,
-        pixel_format: pixel_format::MTL_FORMAT_RGBA8_UNORM,
-        storage_selector: Some(pixel_format::StorageImageSelector::Rgba8Unorm as u32),
-        width: 4,
-        height: 2,
-        bytes: vec![0; 32],
-        is_storage: true,
-        residency: Some(ComputeStorageResidencyCandidate {
-            key,
-            seed_generation: 4,
-        }),
-        seed_skipped: false,
-        sample_resident: None,
-        writeback: TextureWriteback::None,
-    };
-
-    assert_eq!(
-        storage_residency_opportunity(&state, std::slice::from_ref(&texture)),
-        (1, 0, 32, 0)
-    );
-    state.compute_storage_residency.insert(key, 4);
-    assert_eq!(
-        storage_residency_opportunity(&state, std::slice::from_ref(&texture)),
-        (1, 1, 32, 32)
-    );
-
-    texture.residency.as_mut().unwrap().seed_generation = 5;
-    assert_eq!(
-        storage_residency_opportunity(&state, std::slice::from_ref(&texture)),
-        (1, 0, 32, 0)
-    );
-    // An intersecting stale window is dropped by note; a disjoint sibling
-    // window (ping-pong canvas) survives it.
-    let mut stale_view = key;
-    stale_view.surface_offset = 0;
-    state.compute_storage_residency.insert(stale_view, 3);
-    let mut sibling = key;
-    sibling.surface_offset = 128;
-    sibling.span_end = 192;
-    state.compute_storage_residency.insert(sibling, 2);
-    state.mappings.get_mut(&9).unwrap().content_generation = 5;
-    note_storage_residency_writeback(&mut state, &texture);
-    assert_eq!(state.compute_storage_residency.len(), 2);
-    assert!(!state.compute_storage_residency.contains_key(&stale_view));
-    assert!(state.compute_storage_residency.contains_key(&sibling));
-    // The mirror stores the engine currency next(seed_generation), so the
-    // staged candidate hits only once its seed matches that value.
-    assert_eq!(state.compute_storage_residency.get(&key), Some(&6));
-    assert_eq!(
-        storage_residency_opportunity(&state, std::slice::from_ref(&texture)),
-        (1, 0, 32, 0)
-    );
-    texture.residency.as_mut().unwrap().seed_generation = 6;
-    state.compute_storage_residency.remove(&sibling);
-    assert_eq!(
-        storage_residency_opportunity(&state, std::slice::from_ref(&texture)),
-        (1, 1, 32, 32)
-    );
-
-    let (eligible, hits, eligible_bytes, hit_bytes) =
-        storage_residency_opportunity(&state, std::slice::from_ref(&texture));
-    log_storage_residency_opportunity(pipe, eligible, hits, eligible_bytes, hit_bytes);
-    let marker = format!(
-            "OFF compute_storage_residency reason=generation_match action=measure pipe={pipe} eligible=1 hits=1 eligible_bytes=32 hit_bytes=32"
-        );
-    let log = std::fs::read_to_string(crate::observe::fail_log_path()).expect("fail log");
-    assert!(log
-        .lines()
-        .any(|line| crate::observe::line_is(line, &marker)));
-
-    texture.residency.as_mut().unwrap().key.map_generation += 1;
-    assert_eq!(
-        storage_residency_opportunity(&state, std::slice::from_ref(&texture)),
-        (1, 0, 32, 0)
-    );
-}
-
-#[test]
 fn storage_access_proxy_names_writeonly_seed_cost() {
     let pipe = 0xd000_0000 | (std::process::id() & 0x0fff_ffff);
     log_storage_image_access(pipe, 34, "write_only", 29_614_080);
@@ -1743,10 +1571,7 @@ fn storage_format_specialization_preserves_raw_views_and_runtime_shape() {
     // storage_selector now maps 0x35, and both format bridges round-trip it.
     assert_eq!(
         pixel_format::storage_selector(pixel_format::MTL_FORMAT_R32_UINT),
-        Some((
-            pixel_format::StorageImageSelector::R32Uint,
-            pixel_format::R32_BPP
-        ))
+        Some(pixel_format::StorageImageSelector::R32Uint)
     );
     assert_eq!(
         simg_u32_to_engine_storage(pixel_format::StorageImageSelector::R32Uint as u32),
@@ -1926,7 +1751,7 @@ fn bulk_linear_write_scatters_rows_and_preserves_padding() {
         .unwrap();
     let bytes: Vec<u8> = (0..tight * h as usize).map(|i| i as u8 + 1).collect();
     assert!(write_linear_texture_bulk(
-        &mut state, &mut host, 1, gva, stride, tight, h, &bytes
+        &mut state, &mut host, 1, gva, stride, tight, h, &bytes, None
     ));
     for y in 0..h as u64 {
         let mut row = vec![0u8; stride as usize];
@@ -1943,6 +1768,92 @@ fn bulk_linear_write_scatters_rows_and_preserves_padding() {
             );
         }
     }
+}
+
+/// The linear compute rail carries the deferred-window bound on BOTH of its
+/// writers, so which one a real flush takes cannot decide whether the bound
+/// applies.
+///
+/// `write_linear_guest_within` tries the packed bulk view first and drops to a
+/// per-row `write_task_gva_product_within` when the span is fragmented. Here the
+/// task's page table resolves `data0`, and the window says it was armed on a
+/// page it does not own — the shape the guest produces by releasing a GPU
+/// allocation and letting the range be re-pointed. Both writers must refuse, and
+/// `data0` must be byte-unchanged: an unbounded writer would have scattered a
+/// compute storage image into whatever owns it now.
+#[test]
+fn a_linear_flush_cannot_write_pages_its_window_was_not_armed_on() {
+    let mut host = FakeHost::new();
+    host.strict_linux_map = true;
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    setup_linear_task_x86(&mut host, &mut state, &[4, 5]);
+    let (tight, stride, h) = (8usize, 16u64, 3u32);
+    let gva = 0x40u64;
+    let data0 = 4u64 << PAGE_SHIFT_X86;
+    let span = (h as u64) * stride;
+    host.write_gpa(data0 + gva, &vec![0xEEu8; span as usize])
+        .unwrap();
+    let bytes: Vec<u8> = (0..tight * h as usize).map(|i| i as u8 + 1).collect();
+
+    // A page set naming somewhere this window's GVA does not resolve to.
+    let foreign: std::collections::HashSet<u64> = [9u64 << PAGE_SHIFT_X86].into_iter().collect();
+    assert!(
+        !write_linear_texture_bulk(
+            &mut state,
+            &mut host,
+            1,
+            gva,
+            stride,
+            tight,
+            h,
+            &bytes,
+            Some(&foreign)
+        ),
+        "the bulk view must refuse a span outside the armed pages"
+    );
+    assert_eq!(
+        write_linear_guest_within(
+            &mut state,
+            &mut host,
+            1,
+            gva,
+            stride,
+            tight,
+            h,
+            &bytes,
+            "test",
+            Some(&foreign),
+        ),
+        LinearWrite::Failed,
+        "the per-row fallback must refuse it too, not quietly land the rows"
+    );
+    let mut back = vec![0u8; span as usize];
+    host.read_gpa(data0 + gva, &mut back).unwrap();
+    assert!(
+        back.iter().all(|&b| b == 0xEE),
+        "not one byte may reach a page the window was not armed on"
+    );
+
+    // Control: armed on the page it actually resolves to, the same flush lands.
+    let armed: std::collections::HashSet<u64> = [data0].into_iter().collect();
+    assert_eq!(
+        write_linear_guest_within(
+            &mut state,
+            &mut host,
+            1,
+            gva,
+            stride,
+            tight,
+            h,
+            &bytes,
+            "test",
+            Some(&armed),
+        ),
+        LinearWrite::Written,
+        "a window writing its own pages must still write"
+    );
+    host.read_gpa(data0 + gva, &mut back).unwrap();
+    assert_eq!(&back[..tight], &bytes[..tight]);
 }
 
 /// Fragmented PFNs under strict Linux map: the packed view fails, both
@@ -1964,9 +1875,78 @@ fn bulk_linear_helpers_fall_back_on_fragmented_span() {
         &mut state, &mut host, 1, gva, stride, tight, h, &mut bytes
     ));
     assert!(!write_linear_texture_bulk(
-        &mut state, &mut host, 1, gva, stride, tight, h, &bytes
+        &mut state, &mut host, 1, gva, stride, tight, h, &bytes, None
     ));
     // The fallback primitive still lands bytes across the fragmented span.
     let payload = [0xABu8; 8];
     assert!(gva_mem::write_task_gva_product(&mut state, &mut host, 1, gva, &payload).is_ok());
+}
+
+/// A staged compute buffer records the pages it resolved to, and the writeback
+/// that runs after the dispatch is bounded to them.
+///
+/// `stage_buffer` reads the guest bytes before the dispatch; `writeback_buffer`
+/// runs at the far end of the dispatch and, in a nested session, after however
+/// many more jobs accumulated. That is the longest arm-to-write gap on this
+/// rail, and the guest can hand the range to something else across it.
+#[test]
+fn a_staged_buffer_carries_the_pages_its_writeback_is_bounded_to() {
+    use crate::contract::endian::st32;
+    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let (dir_pfn, root_pfn, pt_base) = (2u32, 3u32, 4u32);
+    let dir_gpa = (dir_pfn as u64) << PAGE_SHIFT_ARM64E;
+    let root_gpa = (root_pfn as u64) << PAGE_SHIFT_ARM64E;
+    host.map_range(dir_gpa, 0x20, 0);
+    host.map_range(root_gpa, 0x4000, 0);
+    let mut d = [0u8; 8];
+    st32(&mut d[DIRECTORY_ROOT_PFN as usize..], root_pfn);
+    st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
+    let _ = host.write_gpa(dir_gpa, &d);
+    for i in 0..8u32 {
+        let pfn = pt_base + i;
+        host.map_range((pfn as u64) << PAGE_SHIFT_ARM64E, 0x4000, 0);
+        let mut pte = [0u8; 4];
+        st32(&mut pte, pfn);
+        let _ = host.write_gpa(root_gpa + (i as u64) * 4, &pte);
+    }
+    assert!(state.define_task(1, 0x1000, dir_pfn));
+
+    let page = 1u64 << PAGE_SHIFT_ARM64E;
+    let pages = staged_span_pages(&state, &host, 1, page, 0x100);
+    assert_eq!(pages.len(), 1, "a 256-byte span sits in one page");
+    assert!(pages.contains(&((pt_base as u64 + 1) << PAGE_SHIFT_ARM64E)));
+
+    // The guest re-points that virtual page while the dispatch is in flight.
+    let mut pte = [0u8; 4];
+    st32(&mut pte, pt_base + 6);
+    let _ = host.write_gpa(root_gpa + 4, &pte);
+    let bytes = vec![0xffu8; 0x100];
+    let err = crate::runtime::gva_mem::write_task_gva_product_within(
+        &mut state,
+        &mut host,
+        1,
+        page,
+        &bytes,
+        Some(&pages),
+    )
+    .expect_err("a page the dispatch never named must be refused");
+    assert!(
+        matches!(err, crate::runtime::host::MemError::WriteOutsideWindow),
+        "expected WriteOutsideWindow, got {err:?}"
+    );
+    // Unbounded, the same write lands in whatever owns that page now.
+    assert!(
+        crate::runtime::gva_mem::write_task_gva_product_within(
+            &mut state, &mut host, 1, page, &bytes, None,
+        )
+        .is_ok(),
+        "without the bound the write reaches the new owner"
+    );
+
+    // An unresolvable span records nothing rather than an empty authorisation,
+    // so the writeback stays unbounded and the writer fails closed itself.
+    assert!(staged_span_pages(&state, &host, 1, 0, 0x100).is_empty());
+    assert!(staged_span_pages(&state, &host, 1, page, 0).is_empty());
 }

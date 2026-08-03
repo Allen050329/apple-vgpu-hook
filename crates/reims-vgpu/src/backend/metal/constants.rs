@@ -36,6 +36,27 @@ mod tests {
         );
     }
 
+    /// The buffer argument table is one Metal limit, so the two spellings of it
+    /// must stay equal.
+    ///
+    /// Four bind paths gate on it and they must all refuse the same index:
+    /// direct compute (`backend::metal::compute` via
+    /// [`crate::backend::metal::util::valid_buffer_binding`], which reads
+    /// `REIMS_VGPU_METAL_MAX_BUFFERS`), direct render and render ICB inheritance
+    /// (both `metal_draw::MAX_BIND_SLOTS`), and compute ICB inheritance
+    /// (`valid_buffer_binding`). Letting the two constants drift would leave one
+    /// pair of paths passing an index to `setBuffer:offset:atIndex:` that the
+    /// other pair rejects, and Metal answers an out-of-range index with an
+    /// exception that aborts the process rather than a status this device can
+    /// decline.
+    #[test]
+    fn the_two_spellings_of_the_buffer_bind_limit_agree() {
+        assert_eq!(
+            REIMS_VGPU_METAL_MAX_BUFFERS as u32,
+            crate::runtime::metal_draw::MAX_BIND_SLOTS
+        );
+    }
+
     #[test]
     fn fixed_cache_caps_are_nonzero_and_cover_each_cache_family() {
         for cap in [

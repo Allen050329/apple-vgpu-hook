@@ -57,6 +57,18 @@ pub const CHILD_EXEC_INDIRECT_CMDBUF_DESC_LEN: u32 = 16;
 pub const CHILD_EXEC_INDIRECT_CMDBUF_GVA: u32 = 0x00;
 pub const CHILD_EXEC_INDIRECT_CMDBUF_LENGTH: u32 = 0x08;
 
+/// Per-resource descriptor offsets inside the EXEC_INDIRECT2 resource table.
+///
+/// RE of `AppleParavirtCommandQueue::writeInvalidates(AppleParavirtSegmentResourceList*,
+/// AppleParavirtCommandAllocator&)`: one 24-byte record per live list entry,
+/// `{object_id u32}` followed by the same four validity-op bytes a
+/// `CmdInvalidateResources` record carries, then 16 trailing bytes this kext
+/// build zeroes.
+pub const CHILD_EXEC_RESOURCE_OBJECT_ID: u32 = 0x00;
+pub const CHILD_EXEC_RESOURCE_VALIDITY_OPS: u32 = 0x04;
+pub const CHILD_EXEC_RESOURCE_TAIL: u32 = 0x08;
+pub const CHILD_EXEC_RESOURCE_TAIL_LEN: u32 = 16;
+
 // --- display-descriptor timing entries ---
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -223,6 +235,76 @@ pub fn decode_invalidate_resources(payload: &[u8]) -> Option<InvalidateResources
     })
 }
 
+/// One entry of the per-resource table an `EXEC_INDIRECT2` payload carries
+/// between its 12-byte header and its command-buffer descriptors.
+///
+/// The guest builds this in `writeInvalidates`, one record per live entry of the
+/// submission's `AppleParavirtSegmentResourceList`. The first eight bytes are
+/// byte-identical in layout to a `CmdInvalidateResources` record, so [`ops`]
+/// comes off the same [`InvalidateValidityOps`] decoder — the record *lengths*
+/// differ (8 vs 24), the quad does not.
+///
+/// `clear_host_valid` is sourced from `AppleParavirtResource::shouldInvalidateHost()`,
+/// which is a `lock btr` test-and-clear of the resource's dirty bit plus a sticky
+/// flag it also clears. `writeInvalidates` is its only caller, so the guest's
+/// statement that it CPU-wrote a resource is delivered here exactly once and is
+/// never resent.
+///
+/// [`ops`]: Self::ops
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ExecResourceDesc {
+    pub object_id: u32,
+    pub ops: InvalidateValidityOps,
+    /// Bytes `+0x08..0x18`. Zeroed by the Ventura 13.7.8 x86 kext; kept raw
+    /// rather than dropped so a build that populates them is visible instead of
+    /// silently discarded.
+    pub tail: [u8; CHILD_EXEC_RESOURCE_TAIL_LEN as usize],
+}
+
+impl ExecResourceDesc {
+    /// How many of the 16 trailing bytes this record actually sets.
+    pub fn tail_nonzero_bytes(&self) -> u32 {
+        self.tail.iter().filter(|b| **b != 0).count() as u32
+    }
+}
+
+/// Decode the `EXEC_INDIRECT2` resource table: `resource_count` records of
+/// [`CHILD_EXEC_INDIRECT_RESOURCE_DESC_LEN`] bytes, starting right after the
+/// header.
+///
+/// `None` when the payload is shorter than the count it declares — the same
+/// refusal shape as the other list decoders here, so a malformed or truncated
+/// submission is a caller-visible failure rather than a partial table. The
+/// bound is checked before the allocation, so a hostile `resource_count`
+/// cannot reserve memory the payload does not back.
+pub fn decode_exec_resource_table(payload: &[u8]) -> Option<Vec<ExecResourceDesc>> {
+    if payload.len() < CHILD_EXEC_INDIRECT_HEADER_LEN as usize {
+        return None;
+    }
+    let count = ld32(&payload[CHILD_EXEC_INDIRECT_RESOURCE_COUNT as usize..]);
+    let table_len = (count as u64).checked_mul(CHILD_EXEC_INDIRECT_RESOURCE_DESC_LEN as u64)?;
+    let need = (CHILD_EXEC_INDIRECT_HEADER_LEN as u64).checked_add(table_len)?;
+    if need > payload.len() as u64 {
+        return None;
+    }
+    let mut descs = Vec::with_capacity(count as usize);
+    let mut off = CHILD_EXEC_INDIRECT_HEADER_LEN as usize;
+    for _ in 0..count {
+        let object_id = ld32(&payload[off + CHILD_EXEC_RESOURCE_OBJECT_ID as usize..]);
+        let flags = ld32(&payload[off + CHILD_EXEC_RESOURCE_VALIDITY_OPS as usize..]);
+        let tail_off = off + CHILD_EXEC_RESOURCE_TAIL as usize;
+        let mut tail = [0u8; CHILD_EXEC_RESOURCE_TAIL_LEN as usize];
+        tail.copy_from_slice(&payload[tail_off..tail_off + CHILD_EXEC_RESOURCE_TAIL_LEN as usize]);
+        descs.push(ExecResourceDesc {
+            object_id,
+            ops: InvalidateValidityOps::from_le_dword(flags),
+            tail,
+        });
+        off += CHILD_EXEC_INDIRECT_RESOURCE_DESC_LEN as usize;
+    }
+    Some(descs)
+}
+
 /// Decode CmdSynchronizeResources: header `{task_id, count}` + `count × {object_id}`.
 ///
 /// Guest `synchronizeForUnwire` uses `getCommandBytes(4)` for the object cell (no flags).
@@ -320,6 +402,104 @@ mod tests {
         assert_eq!(c.count, 2);
         assert_eq!(c.records[0].object_id, 10);
         assert_eq!(c.records[1].object_id, 11);
+    }
+
+    /// The three descriptor offsets must tile the stride `exec.rs` uses to skip
+    /// the table. If they ever disagree, the decoded records and the cmdbuf
+    /// section would be read from different places in the same payload.
+    #[test]
+    fn exec_resource_desc_offsets_tile_the_stride() {
+        assert_eq!(CHILD_EXEC_RESOURCE_OBJECT_ID, 0);
+        assert_eq!(CHILD_EXEC_RESOURCE_VALIDITY_OPS, 4);
+        assert_eq!(
+            CHILD_EXEC_RESOURCE_TAIL + CHILD_EXEC_RESOURCE_TAIL_LEN,
+            CHILD_EXEC_INDIRECT_RESOURCE_DESC_LEN
+        );
+    }
+
+    /// Build an EXEC_INDIRECT2 payload with `descs` resource records and no
+    /// command buffers.
+    fn exec_payload_with_table(descs: &[(u32, u32, [u8; 16])]) -> Vec<u8> {
+        let mut p = vec![
+            0u8;
+            CHILD_EXEC_INDIRECT_HEADER_LEN as usize
+                + descs.len() * CHILD_EXEC_INDIRECT_RESOURCE_DESC_LEN as usize
+        ];
+        st32(
+            &mut p[CHILD_EXEC_INDIRECT_RESOURCE_COUNT as usize..],
+            descs.len() as u32,
+        );
+        for (i, (id, flags, tail)) in descs.iter().enumerate() {
+            let off = CHILD_EXEC_INDIRECT_HEADER_LEN as usize
+                + i * CHILD_EXEC_INDIRECT_RESOURCE_DESC_LEN as usize;
+            st32(&mut p[off + CHILD_EXEC_RESOURCE_OBJECT_ID as usize..], *id);
+            st32(
+                &mut p[off + CHILD_EXEC_RESOURCE_VALIDITY_OPS as usize..],
+                *flags,
+            );
+            let t = off + CHILD_EXEC_RESOURCE_TAIL as usize;
+            p[t..t + CHILD_EXEC_RESOURCE_TAIL_LEN as usize].copy_from_slice(tail);
+        }
+        p
+    }
+
+    /// RE writeInvalidates: `{object_id}` + the same validity quad an
+    /// invalidate record carries, at stride 24 with 16 trailing bytes.
+    #[test]
+    fn decode_exec_resource_table_reads_id_quad_and_tail() {
+        let mut tail = [0u8; 16];
+        tail[0] = 0xaa;
+        tail[15] = 0x01;
+        let p = exec_payload_with_table(&[
+            (0x2a, 0x0000_0001, [0u8; 16]),
+            (0x2b, 0x0000_0100, tail),
+        ]);
+        let descs = decode_exec_resource_table(&p).expect("decode");
+        assert_eq!(descs.len(), 2);
+        assert_eq!(descs[0].object_id, 0x2a);
+        assert_eq!(descs[0].ops.clear_host_valid, 1);
+        assert_eq!(descs[0].ops.set_host_valid, 0);
+        assert_eq!(descs[0].tail_nonzero_bytes(), 0);
+        assert_eq!(descs[1].object_id, 0x2b);
+        assert_eq!(descs[1].ops.clear_host_valid, 0);
+        assert_eq!(descs[1].ops.set_host_valid, 1);
+        assert_eq!(descs[1].tail_nonzero_bytes(), 2);
+    }
+
+    /// The quad decoder is shared with `CmdInvalidateResources`; only the record
+    /// length differs. A second decoder for the same four bytes would be a
+    /// second place for the field order to drift.
+    #[test]
+    fn exec_table_and_invalidate_record_decode_the_same_quad() {
+        let p = exec_payload_with_table(&[(7, CHILD_INVALIDATE_PAGEON_FLAGS, [0u8; 16])]);
+        let descs = decode_exec_resource_table(&p).expect("decode");
+        assert_eq!(descs[0].ops, InvalidateValidityOps::PAGEON);
+    }
+
+    #[test]
+    fn decode_exec_resource_table_empty_when_count_zero() {
+        let p = exec_payload_with_table(&[]);
+        assert_eq!(decode_exec_resource_table(&p).expect("decode").len(), 0);
+    }
+
+    /// `resource_count` is guest-controlled. A count the payload cannot back
+    /// must refuse, not read past the buffer and not reserve for records that
+    /// are not there.
+    #[test]
+    fn decode_exec_resource_table_rejects_count_the_payload_cannot_back() {
+        let mut p = exec_payload_with_table(&[(1, 0, [0u8; 16])]);
+        st32(&mut p[CHILD_EXEC_INDIRECT_RESOURCE_COUNT as usize..], 2);
+        assert!(decode_exec_resource_table(&p).is_none());
+        st32(
+            &mut p[CHILD_EXEC_INDIRECT_RESOURCE_COUNT as usize..],
+            u32::MAX,
+        );
+        assert!(decode_exec_resource_table(&p).is_none());
+    }
+
+    #[test]
+    fn decode_exec_resource_table_rejects_short_header() {
+        assert!(decode_exec_resource_table(&[0u8; 4]).is_none());
     }
 
     #[test]

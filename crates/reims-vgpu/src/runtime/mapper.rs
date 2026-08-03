@@ -558,6 +558,9 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
     // Read before the `get_mut` below takes `state` mutably.
     let page_shift = state.page_shift;
     let mut retired = None;
+    // The superseded incarnation's page list, kept for the write-after-teardown
+    // detector. See the `incarnation_changed` arm below.
+    let mut superseded_pages: Vec<u32> = Vec::new();
     let mut incarnation_changed = false;
     let mut reprieved = false;
     let mut pages_changed = false;
@@ -571,6 +574,11 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
         let prev_pages = m.page_entries.len();
         (pages_changed, incarnation_changed, reprieved) =
             plan_adoption_decision(condemned.as_deref(), &m.page_entries, &plan.entries);
+        if incarnation_changed {
+            if let Some(ref c) = condemned {
+                superseded_pages = c.clone();
+            }
+        }
         // New page table ⇒ the contiguous view (and any Metal texture aliasing
         // it) describe the old pages; retire them before adopting the plan.
         if m.contig_ptr != 0 && pages_changed {
@@ -618,8 +626,16 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
         if let Some((lo, hi)) = entry_gpa_span(&plan.entries, page_shift) {
             let key = (u64::from(mapping_id) << 40) ^ (lo >> page_shift) ^ (hi << 20);
             if crate::observe::first_sight("mapping_gpa_span", key) {
+                // `src=mapper` against the type-4 adoption site's `src=type4`.
+                // The field existed and only one of the two set it, so it named
+                // a distinction the log could not express: every
+                // `mapping_gpa_span` line in a boot read `src=type4`, and this
+                // emitter's silence was invisible rather than reported. The
+                // silence is the interesting part — on x86 this site has stayed
+                // quiet for whole boots while the type-4 one carried every span.
                 crate::observe::off(format!(
-                    "mapping_gpa_span mid={mapping_id} gen={} pages={} prev_pages={prev_pages} \
+                    "mapping_gpa_span mid={mapping_id} gen={} pages={} src=mapper \
+                     prev_pages={prev_pages} \
                      changed={} lo={lo:#x} hi={:#x} pn_lo={:#x} pn_hi={:#x}",
                     m.map_generation,
                     plan.entries.len(),
@@ -630,6 +646,17 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
                 ));
             }
         }
+        // Adoption is the other half of the write-after-teardown detector: these
+        // pages are a surface's again, so a write into them is ordinary. Without
+        // this the retired set would only ever grow, and since the guest recycles
+        // physical pages between surfaces constantly it would end up flagging
+        // every one of those perfectly ordinary reuses.
+        crate::observe::footprint::note_pages_authorized(
+            plan.entries
+                .iter()
+                .filter_map(|&e| crate::contract::iosurface_pages::entry_gpa_shift(e, page_shift)),
+            crate::contract::iosurface_pages::page_size_of(page_shift),
+        );
         m.page_entries = plan.entries;
         m.page_table_kva = plan.page_table_kva;
         m.mapping_internal = internal;
@@ -646,6 +673,26 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
         // surface: drop the prior incarnation's deferred windows before any
         // access could flush old content through the new pages.
         crate::runtime::storage_flush::drop_windows(state, mapping_id, "incarnation_changed");
+        // And tell the write-after-teardown detector, because this is the most
+        // common way a backing dies and it was invisible to it.
+        //
+        // The other retire point is `unmap_surface`, which needs the guest to
+        // delete a backing TWICE with no resolve between — a rare shape. Here
+        // the device has the same evidence by a different route and it is at
+        // least as strong: the guest deleted the backing, and the re-resolve
+        // came back with a different page list, which is exactly what
+        // `plan_adoption_decision` means by a new incarnation. On one 600 s
+        // driven boot the unmap route ran 10 times; this one is the ordinary
+        // per-surface teardown.
+        //
+        // `skip: None` is load-bearing. This mapping is still live and its
+        // `page_entries` now hold the NEW plan, so leaving it in the live set is
+        // what keeps a page carried over from the old backing into the new one
+        // out of the retired set — it really is still a surface's. Adoption has
+        // already run for the new plan just above, so the two agree either way,
+        // and stating it here means the order is not what makes it correct.
+        let going = std::mem::take(&mut superseded_pages);
+        state.retire_pages_no_live_mapping_holds(&going, None);
     } else if reprieved {
         // Stale trailing delete on a live incarnation — the exact black-band
         // trigger. Only note when content was actually at stake (an armed
@@ -677,15 +724,7 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
             // closed: name it, drop deferred writes, and invalidate the page
             // plan. Runs only on reprieve-with-armed-windows (rare), on the drain
             // worker.
-            if let Some((gpa, owner)) = first_surface_page_collision(state, mapping_id) {
-                let mine_pages = state
-                    .mappings
-                    .get(&mapping_id)
-                    .map(|m| m.page_entries.len())
-                    .unwrap_or(0);
-                fail_closed_surface_page_collision(
-                    state, mapping_id, gpa, owner, mine_pages, "reprieve",
-                );
+            if !surface_pages_are_exclusively_owned(state, mapping_id, "reprieve") {
                 return false;
             }
         }
@@ -702,16 +741,8 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
     // violation, so fail closed: name it, drop deferred writes, invalidate the
     // adopted plan, and make this resolve fail. Runs only on a genuine rewire
     // (`pages_changed`), on the drain worker.
-    if pages_changed {
-        if let Some((gpa, owner)) = first_surface_page_collision(state, mapping_id) {
-            let mine_pages = state
-                .mappings
-                .get(&mapping_id)
-                .map(|m| m.page_entries.len())
-                .unwrap_or(0);
-            fail_closed_surface_page_collision(state, mapping_id, gpa, owner, mine_pages, "rewire");
-            return false;
-        }
+    if pages_changed && !surface_pages_are_exclusively_owned(state, mapping_id, "rewire") {
+        return false;
     }
     // Resolved: re-arm the fail latch so a later genuine failure (a re-map that
     // goes bad, a corrupted descriptor) is logged again rather than swallowed.
@@ -719,13 +750,47 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
     true
 }
 
+/// Whether `mapping_id`'s adopted page plan is free of cross-surface aliasing.
+///
+/// Two distinct live IOSurface mappings backing the same guest physical page
+/// means one holds a stale PFN, and a pixel writeback through it scribbles the
+/// other surface — or, if the page was recycled to userspace, guest heap. So a
+/// detection is a proven ownership violation and this fails closed: it names
+/// the collision, drops the deferred writes and invalidates the plan, and the
+/// caller must fail its resolve.
+///
+/// `site` names which rewire reached here (`reprieve` or `rewire`) so the two
+/// populations stay separable in the log.
+fn surface_pages_are_exclusively_owned(
+    state: &mut DeviceState,
+    mapping_id: u32,
+    site: &str,
+) -> bool {
+    let Some((gpa, owner)) = first_surface_page_collision(state, mapping_id) else {
+        return true;
+    };
+    let mine_pages = state
+        .mappings
+        .get(&mapping_id)
+        .map(|m| m.page_entries.len())
+        .unwrap_or(0);
+    fail_closed_surface_page_collision(state, mapping_id, gpa, owner, mine_pages, site);
+    false
+}
+
 /// Detect the wrong-PFN rewire-race corruption vector: the mapping `mapping_id`
 /// just adopted a fresh page plan whose page base is also owned by a
 /// *different* currently-live surface mapping. Two distinct live IOSurface
 /// mappings must never back the same guest physical page; if they do, one holds
 /// a stale/wrong PFN and a writeback through it corrupts memory it does not own
-/// (see the WindowServer heap-corruption class). Measure-only — never gates a
-/// write. Cost O(this_pages + Σ other live pages); called only on a rewire.
+/// (see the WindowServer heap-corruption class).
+///
+/// A detection **fails the resolve closed** — see
+/// [`surface_pages_are_exclusively_owned`], which is how both call sites reach
+/// this. It is not measure-only; the doc said so for a while and was wrong,
+/// which is the worse way round for a detector on the guest-corruption rail.
+///
+/// Cost O(this_pages + Σ other live pages); called only on a rewire.
 fn first_surface_page_collision(state: &DeviceState, mapping_id: u32) -> Option<(u64, u32)> {
     let page_shift = state.page_shift;
     let page = state.page_size();
@@ -803,14 +868,6 @@ fn fail_closed_surface_page_collision(
     let _ = state.invalidate_mapping_pages(mapping_id);
 }
 
-/// Incarnation decision when adopting a freshly resolved page plan into a
-/// mapping slot. `condemned` is the fingerprint a trailing
-/// `DeleteIOSurfaceBacking2` stashed (None when the slot is not condemned).
-/// Returns `(pages_changed, incarnation_changed, reprieved)`:
-/// `incarnation_changed` = the condemned backing really died and the id now
-/// carries different pages (drop the old windows); `reprieved` = the delete
-/// was stale — the plan matches the fingerprint, the same incarnation lives
-/// on (keep generation, resident, deferred windows).
 /// Lowest and highest page-aligned GPA a page-entry list resolves to.
 ///
 /// Invalid entries are skipped rather than failing the span: the span is a
@@ -832,6 +889,15 @@ pub(crate) fn entry_gpa_span(entries: &[u32], page_shift: u32) -> Option<(u64, u
     (lo != u64::MAX).then_some((lo, hi))
 }
 
+/// Incarnation decision when adopting a freshly resolved page plan into a
+/// mapping slot. `condemned` is the fingerprint a trailing
+/// `DeleteIOSurfaceBacking2` stashed (None when the slot is not condemned).
+///
+/// Returns `(pages_changed, incarnation_changed, reprieved)`:
+/// `incarnation_changed` = the condemned backing really died and the id now
+/// carries different pages (drop the old windows); `reprieved` = the delete
+/// was stale — the plan matches the fingerprint, the same incarnation lives
+/// on (keep generation, resident, deferred windows).
 pub(crate) fn plan_adoption_decision(
     condemned: Option<&[u32]>,
     current: &[u32],
@@ -1034,6 +1100,302 @@ pub fn revalidate_mapping_reason<H: HostMemory + HostOps>(
     }
 }
 
+/// Whether a mapping's cached page list still names the guest memory it was
+/// walked from, re-derived rather than remembered.
+///
+/// # Why the existing revalidation cannot answer this
+///
+/// [`revalidate_mapping_reason`] re-resolves a mapping *only* when
+/// `mapping_internal != 0`. A type-4 surface has no MappingInternal, so that
+/// function reaches its final `match` with `resolve_ran == false` and returns
+/// `None` — "resolvable" — on the strength of `mapped && !page_entries
+/// .is_empty()` alone. The list is accepted because it is non-empty, not
+/// because anything checked it. Its own doc records the scale: 2 280 render
+/// windows in one boot were armed on mappings with `mapping_internal == 0`.
+///
+/// Nothing on the wire closes that gap. When the guest re-points a type-4
+/// surface's backing in its own page table there is no packet, so
+/// `map_generation` does not move and the cached entries stay trusted until the
+/// next type-4 command happens to re-resolve — which for an idle surface may be
+/// never. `resolve_type4_surface_ex` knows this and checks for it, but only
+/// there, and only on the first and last entry:
+///
+/// ```text
+/// type4_pages_stale sid=49 task=0 n=256 gpa0=0x2e8cf6000 (task PT translation moved; rebuilding)
+/// ```
+///
+/// That line is from a live boot. The translations do move.
+///
+/// # What this checks
+///
+/// Every page, not two. [`crate::model::Type4Walk`] latched the task and GPU-VA
+/// base the entries were walked from, so the walk repeats with no object search:
+/// page `i` is `(backing_pfn + i) << page_shift` translated through that task.
+/// Any page that translates differently — or no longer translates at all — means
+/// the list in hand names memory that is no longer the surface's.
+///
+/// Returns `true` when there is nothing to check (`type4_walk` absent, or
+/// latched at a superseded `map_generation`), because this is a *specific*
+/// witness and not a general one; a caller must not read `true` as "these pages
+/// were verified".
+///
+/// The peer for the raw-GVA rails is
+/// [`crate::runtime::storage_flush::deferred_pages_still_ours`], which asks the
+/// same question about a window's armed page set. This one asks it about a
+/// mapping's list, which is what the mapping-keyed rails write through.
+/// Which of the two `true`s a bare "are these pages still ours" bool would
+/// have returned.
+///
+/// That function's contract says a caller must not read `true` as "these pages
+/// were verified", because four of its five exits check nothing at all. Every
+/// caller then collapsed both meanings into [`PagesVerdict::Ours`], and the
+/// counters built on it — `mapw_pages_vouched` 29 002 against
+/// `mapw_pages_refused` **0** on one boot — cannot say whether that zero is a
+/// guard that passed or a guard that was never armed. Those are opposite claims
+/// about the write-after-free class and the census reported them identically.
+///
+/// This is the denominator, and it is measure-only: [`Unwitnessed`] still
+/// yields a token and still lets the write through, exactly as before. Nothing
+/// here changes policy; it changes what the boot can say about it.
+///
+/// [`Unwitnessed`]: Type4Witness::Unwitnessed
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Type4Witness {
+    /// Every page of the cached list was re-walked and agreed. The only exit
+    /// that is evidence the list still names the surface's memory.
+    Verified,
+    /// Nothing was checked. Carries which of the four states it was, because
+    /// they are not one outcome: a surface that never latched a walk is a
+    /// different gap from one whose walk was superseded.
+    Unwitnessed(&'static str),
+    /// The re-walk disagreed, or the owning task is gone.
+    Drifted,
+}
+
+/// Re-walk a mapping's cached page list, reporting which exit it took.
+pub fn type4_pages_witness<H: HostMemory>(
+    state: &DeviceState,
+    host: &H,
+    mapping_id: u32,
+) -> Type4Witness {
+    let Some(m) = state.mappings.get(&mapping_id) else {
+        return Type4Witness::Unwitnessed("no_mapping");
+    };
+    let Some(walk) = m.type4_walk else {
+        // No type-4 walk was ever latched for this mapping, so this witness has
+        // never had anything to say about it. The type-11 rail lives here.
+        return Type4Witness::Unwitnessed("no_walk");
+    };
+    if walk.map_generation != m.map_generation {
+        // The list has been replaced since the walk was latched. The new list
+        // may be perfectly good — it simply has no witness of its own yet.
+        return Type4Witness::Unwitnessed("walk_superseded");
+    }
+    if m.page_entries.is_empty() {
+        return Type4Witness::Unwitnessed("no_pages");
+    }
+    let page_shift = state.page_shift;
+    let page_size = crate::contract::iosurface_pages::page_size_of(page_shift);
+    let Some(task) = state.tasks.get(walk.task_id as usize).filter(|t| t.active) else {
+        // The task that owned the translation is gone. Its page table is gone
+        // with it, so the cached GPAs are unbacked by anything this device can
+        // still read — which is exactly the state a write must not proceed in.
+        crate::observe::fail(format!(
+            "mapping_page_drift mid={mapping_id} task={} reason=task_inactive pages={} \
+             (the page table these entries were walked from no longer exists)",
+            walk.task_id,
+            m.page_entries.len()
+        ));
+        return Type4Witness::Drifted;
+    };
+    for (i, &entry) in m.page_entries.iter().enumerate() {
+        let gva = ((walk.backing_pfn as u64) + i as u64) << page_shift;
+        let cached = crate::contract::iosurface_pages::entry_gpa_shift(entry, page_shift);
+        let walked = crate::runtime::gva_mem::translate_task_gva(host, task, gva, page_shift);
+        let Some(live) = walked.map(|gpa| gpa & !(page_size - 1)) else {
+            // No translation now. This used to answer the failed walk with the
+            // GVA, to match the identity fallback that produced the entry, and
+            // that mirror had to go with it: `apply_type4_backing` no longer
+            // adopts a page at its own GVA, so the only entry this could still
+            // accept is one the control arm made.
+            //
+            // The distinction is not cosmetic. Reporting the substitute as
+            // `live` made a walk that FAILED indistinguishable from one that
+            // succeeded and disagreed, so every such page was written up as
+            // `translation_moved` — "the guest re-pointed this surface" — when
+            // nothing had moved and the device simply could not translate it.
+            // Both outcomes refuse the write; only one of them is about the
+            // guest.
+            crate::observe::fail(format!(
+                "mapping_page_drift mid={mapping_id} task={} page={i}/{} gva={gva:#x} \
+                 cached={cached:?} live=None reason=no_translation \
+                 (this task cannot translate the page the entry was walked from)",
+                walk.task_id,
+                m.page_entries.len()
+            ));
+            return Type4Witness::Drifted;
+        };
+        if cached != Some(live) {
+            // Every entry in this list came from a `translate_task_gva` that
+            // succeeded: `apply_type4_backing` refuses the whole surface on the
+            // first page it cannot walk, so it cannot leave a fabricated one
+            // behind. A disagreement here is therefore between two real
+            // translations taken at different times, which is the guest having
+            // re-pointed the surface without saying so.
+            crate::observe::fail(format!(
+                "mapping_page_drift mid={mapping_id} task={} page={i}/{} gva={gva:#x} \
+                 cached={cached:?} live={:?} reason=translation_moved \
+                 (the guest re-pointed this surface and no packet said so)",
+                walk.task_id,
+                m.page_entries.len(),
+                Some(live)
+            ));
+            return Type4Witness::Drifted;
+        }
+    }
+    Type4Witness::Verified
+}
+
+/// Proof that a mapping's cached page list named the guest memory it was walked
+/// from at the moment this was taken, carried by value so a writer cannot reach
+/// guest RAM without holding one.
+///
+/// # Why a token and not a call
+///
+/// [`type4_pages_witness`] existed for a release with exactly one caller —
+/// [`crate::runtime::storage_flush::flush_render_one`] — while every other write
+/// through `MappingEntry::page_entries` went unchecked. That is not an oversight
+/// that a second call site fixes: the check has to be *reachable only through*
+/// the write, or the next rail added to this crate arrives unguarded too, and
+/// nothing in review distinguishes it from the guarded ones.
+///
+/// So [`write_mapping_bytes`] and the contig write view both demand one of
+/// these, and the four public writers in [`crate::runtime::mapping_write`] take
+/// it once at the head of the operation. "Once" is the other half of the design:
+/// the walk is a translation per page, and two of those writers call
+/// `write_mapping_bytes` per row, so checking inside the funnel would have cost
+/// rows x pages per frame — 2.2 M translations for a 1080p surface. Hoisting the
+/// proof to the operation and *presenting* it in the funnel keeps the guarantee
+/// without the quadratic.
+///
+/// # Why it carries the generation
+///
+/// Six sites clear or replace `page_entries` and all six bump `map_generation`.
+/// A token minted before one of them names a list that no longer exists, so it
+/// records the generation it was taken at and [`PagesVouched::covers`] re-checks
+/// it at the point of use. A carried-over token is then unusable by
+/// construction rather than by every future writer remembering a second field —
+/// the same rule [`crate::model::Type4Walk`] states for its own latch.
+#[derive(Clone, Copy, Debug)]
+pub struct PagesVouched {
+    mapping_id: u32,
+    map_generation: u32,
+}
+
+impl PagesVouched {
+    /// Whether this proof is about `mapping_id`'s page list *as it is now*.
+    ///
+    /// False once anything has cleared or replaced the list since the walk, so a
+    /// funnel that takes a token still refuses when the flush it performs first
+    /// invalidates the mapping underneath it.
+    pub fn covers(&self, state: &DeviceState, mapping_id: u32) -> bool {
+        self.mapping_id == mapping_id
+            && state
+                .mappings
+                .get(&mapping_id)
+                .is_some_and(|m| m.map_generation == self.map_generation)
+    }
+}
+
+/// Re-walk a mapping's page list and mint the proof a write needs, or refuse.
+///
+/// `None` means the list in hand does not name the surface's memory any more.
+/// The response is not to skip this one write: `page_entries` is what every
+/// later reader and writer resolves through, so the list is invalidated, which
+/// clears it, bumps `map_generation` and retires the contiguous view and the
+/// guest-write token with it. Every window still armed against the old
+/// incarnation then refuses on the `map_generation` check it already had, and
+/// the next type-4 bind re-resolves the surface from the object list.
+///
+/// Returning a token when there is nothing to check is deliberate and is why
+/// [`type4_pages_witness`] reports "nothing to check" separately rather than
+/// "verified": a mapping with no [`crate::model::Type4Walk`] latch has a page
+/// list this witness cannot speak about, and refusing every write to it would
+/// blank surfaces the device has no evidence against.
+/// The verdict is handed back alongside the token, not folded into it, because
+/// `Unwitnessed` and `Ours` both yield a token and only one of them is a clean
+/// answer. A caller that emits counters needs to tell them apart: folding them
+/// together would make a boot that never armed the guard indistinguishable from
+/// one with no drift — a count that reads as success when it is the opposite.
+pub fn vouch_mapping_pages_verdict<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &H,
+    mapping_id: u32,
+) -> (PagesVerdict, Option<PagesVouched>) {
+    let verdict = mapping_pages_verdict(state, host, mapping_id);
+    if verdict == PagesVerdict::Drifted {
+        return (verdict, None);
+    }
+    let token = state.mappings.get(&mapping_id).map(|m| PagesVouched {
+        mapping_id,
+        map_generation: m.map_generation,
+    });
+    (verdict, token)
+}
+
+/// What the re-walk found, kept separate from what the device does about it.
+///
+/// Two rails ask this question — the deferred render flush and the four direct
+/// writers — and they want different counters but must not want different
+/// *policy*.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PagesVerdict {
+    /// The re-walk agreed with the cached list, every page of it.
+    Ours,
+    /// Nothing was checked; the payload is which of the four states it was, per
+    /// [`Type4Witness::Unwitnessed`]. **The write proceeds exactly as it does
+    /// for [`Self::Ours`]** — this variant changes no policy. It exists because
+    /// `Ours` used to mean both "verified" and "unverifiable", so a boot
+    /// reporting `mapw_pages_refused = 0` could not say whether its guard had
+    /// passed or had simply never been armed, and those are opposite claims
+    /// about the write-after-free class.
+    Unwitnessed(&'static str),
+    /// The re-walk disagreed. The list has been invalidated — refusing this one
+    /// write is not enough, because `page_entries` is what every later reader and
+    /// writer resolves through.
+    Drifted,
+}
+
+/// The single decision both mapping-keyed rails take, so they cannot drift apart
+/// in policy or in what the control knob turns off.
+///
+/// An earlier shape had the deferred flush spell this out inline while the write
+/// rails had no gate at all, which would have made a control boot measure only
+/// half the change — the kind of divergence that makes an A/B report the rig
+/// rather than the code.
+pub fn mapping_pages_verdict<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &H,
+    mapping_id: u32,
+) -> PagesVerdict {
+    match type4_pages_witness(state, host, mapping_id) {
+        Type4Witness::Verified => return PagesVerdict::Ours,
+        // Same policy as `Verified` — the write goes through — and a different
+        // counter, because only one of the two is evidence.
+        Type4Witness::Unwitnessed(why) => return PagesVerdict::Unwitnessed(why),
+        Type4Witness::Drifted => {}
+    }
+    state.invalidate_mapping_pages(mapping_id);
+    PagesVerdict::Drifted
+}
+
+/// Report a page-table revalidation that took at least a millisecond.
+///
+/// A pure observability gate — nothing branches on it, so the value costs
+/// nothing but log volume if it is wrong in either direction. One millisecond
+/// is the frame budget's own scale: at 60 Hz a frame is 16.7 ms, so a single
+/// revalidation spending 6 % of it is worth a line, and anything shorter is
+/// noise against a rail that runs per surface per frame.
 const REVALIDATE_SLOW_US: u64 = 1_000;
 
 #[inline]
@@ -1048,6 +1410,279 @@ pub fn flush_retired_views<H: HostOps>(state: &mut DeviceState, host: &mut H) {
     for (ptr, len) in state.retired_views.drain(..) {
         host.unmap_pages(ptr, len);
     }
+    // Same shape and the same reason: a guest-write token is host-side state
+    // for a page list that no longer exists, and only the host can free it.
+    for token in state.retired_guest_write_tokens.drain(..) {
+        host.untrack_guest_writes(token);
+    }
+}
+
+/// The live guest-write token for this mapping's current page list, asking the
+/// host for one if the list has none.
+///
+/// Registration is what makes the host observe writes to these pages at all,
+/// so it happens where the device first cares — at the Store that publishes
+/// the surface — rather than at every mapping resolve. A host that cannot
+/// observe guest writes answers `None` here forever, and every consumer reads
+/// that as "assume written".
+///
+/// Reads `page_entries` directly instead of going through
+/// [`mapping_page_gpas`]: the revalidation that function performs is a guest
+/// page-table walk, and the caller has already proved the mapping resolvable by
+/// rendering into it.
+///
+/// What keys the token to the surface's *current* pages is
+/// [`crate::model::MappingEntry::map_generation`], not the eager retirement in
+/// the lifecycle mutators. Two writers replace `page_entries` in place without
+/// going near those mutators — the mapper's own plan adoption and the type-4
+/// page refresh — and both retired the contiguous view while leaving the token
+/// alone. Both do bump the generation exactly when the list changes, so
+/// checking it here makes a carried-over token unusable by construction instead
+/// of depending on every future writer remembering a second thing to retire.
+pub fn ensure_guest_write_token<H: HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+    mapping_id: u32,
+) -> Option<u64> {
+    let page_shift = state.page_shift;
+    let page_size = state.page_size() as usize;
+    let m = state.mappings.get(&mapping_id)?;
+    let map_generation = m.map_generation;
+    if m.guest_write_token != 0 {
+        if m.guest_write_token_gen == map_generation {
+            return Some(m.guest_write_token);
+        }
+        // The list moved underneath the token. Everything recorded against it
+        // describes pages this surface may no longer own, so the Store stamp
+        // goes with it.
+        //
+        // Counted because retiring a token reopens its two-harvest arming
+        // window, and everything downstream of an unarmed token falls back to
+        // the whole-surface answer: the type-11 LOAD elision refuses with
+        // `t11_gw_ref_no_stamp` and the draw pays a full-frame seed read plus a
+        // full-frame staging upload. `t11_gw_unarmed` says the window was open;
+        // this says whether it keeps being reopened, which separates "the token
+        // is warming up once" from "the page list churns and it never warms up".
+        crate::runtime::drain::note_store_route("gw_token_retired");
+        let e = state.mappings.get_mut(&mapping_id)?;
+        let stale = std::mem::replace(&mut e.guest_write_token, 0);
+        e.guest_write_token_gen = 0;
+        e.guest_write_gen_at_store = 0;
+        state.retired_guest_write_tokens.push(stale);
+    }
+    let m = state.mappings.get(&mapping_id)?;
+    if !m.mapped || m.page_entries.is_empty() {
+        return None;
+    }
+    let gpas: Vec<u64> = m
+        .page_entries
+        .iter()
+        .filter_map(|&e| crate::contract::iosurface_pages::entry_gpa_shift(e, page_shift))
+        .collect();
+    // A partial list would have the host watch some of the surface and report
+    // "unwritten" for the rest, which is the one answer that must never be
+    // invented.
+    if gpas.len() != m.page_entries.len() {
+        return None;
+    }
+    let token = host.track_guest_writes(&gpas, page_size)?;
+    let e = state.mappings.get_mut(&mapping_id)?;
+    e.guest_write_token = token;
+    e.guest_write_token_gen = map_generation;
+    Some(token)
+}
+
+/// Record the host's guest-write generation for a mapping whose pixels a Store
+/// has just published, registering its pages for tracking the first time.
+///
+/// Called from every rail that publishes a type-11 surface: the Vulkan Store
+/// rails next to their `surface_content_epoch` stamp, and the CPU writer in
+/// [`crate::runtime::mapping_write`] next to the host-cache store it makes
+/// authoritative. Lives here rather than in the Vulkan draw path because
+/// `mapping_write` is backend-agnostic and the witness is not a backend concern.
+///
+/// Historically only the Vulkan Store rails armed it, which is why the type-4
+/// sampled ladder's first census read `t11rung_host_cache_gw_no_stamp` 14 092
+/// against `gw_clean` 0: the copy that rung serves is written here, and nothing
+/// here had ever asked the host to watch the pages it is a copy of.
+///
+/// Next to that rail's
+/// `surface_content_epoch` stamp. The two are halves of one witness — the epoch
+/// covers writers inside this crate, this covers the guest CPU — and a rail that
+/// wrote only the epoch would let the elision vouch for a resident on evidence
+/// that cannot see the surface's owner. The resident-store rail did exactly that
+/// and it was the whole of the rail's traffic: one boot measured
+/// `surface_resident` ~210/s against zero calls through the readback rails.
+///
+/// 0 is written for every unknown, and it is never a live generation (the host's
+/// first readable one is 1), so a surface whose host cannot answer fails the
+/// currency test instead of passing it by default.
+pub fn stamp_guest_write_gen<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+) {
+    let gen_ = match crate::runtime::mapper::ensure_guest_write_token(state, host, mapping_id) {
+        None => {
+            // The host cannot watch these pages: no dirty bitmap, or the mapping
+            // has no page list to name. Counted, because a rail whose
+            // registration silently never happens is indistinguishable from a
+            // guest that writes every frame, and the two want opposite fixes.
+            crate::runtime::drain::note_store_route("t11_gw_untracked");
+            0
+        }
+        Some(token) => match host.guest_write_gen(token) {
+            // The host has the pages but cannot vouch for them yet: its report
+            // only becomes a fact about the guest once logging has been on for a
+            // full interval.
+            None => {
+                crate::runtime::drain::note_store_route("t11_gw_unarmed");
+                0
+            }
+            Some(gen_) => {
+                crate::runtime::drain::note_store_route("t11_gw_armed");
+                gen_
+            }
+        },
+    };
+    if let Some(m) = state.mappings.get_mut(&mapping_id) {
+        m.guest_write_gen_at_store = gen_;
+    }
+}
+
+/// What the hypervisor's dirty bitmap can say about a type-4 surface's pages
+/// since the Store that stamped them.
+///
+/// Every variant but [`Self::Clean`] means "assume written". They are kept
+/// apart because "this rail never got started" and "the guest rewrites this
+/// surface every frame" are the same refusal and completely different findings.
+#[cfg(feature = "backend-vulkan")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GuestWriteVerdict {
+    /// The host has observed no write to these pages since the stamp.
+    Clean,
+    /// No mapping under this id.
+    NoMapping,
+    /// No Store has stamped this surface against a live token for its
+    /// *current* page list.
+    NoStamp,
+    /// The host observed a write.
+    Wrote,
+    /// The host cannot answer for this token.
+    Unreadable,
+}
+
+/// The verdict itself, with no counters attached.
+///
+/// Split from the type-11 LOAD gate's `type11_guest_wrote_since_store` so more
+/// than one rail can ask
+/// the same question and report it under its own names. A shared counter would
+/// pool two rails' refusals into one number, and the number would then be
+/// unreadable for either.
+#[cfg(feature = "backend-vulkan")]
+pub(crate) fn mapping_guest_write_verdict<M: HostOps>(
+    state: &DeviceState,
+    host: &M,
+    mapping_id: u32,
+) -> GuestWriteVerdict {
+    let Some(m) = state.mappings.get(&mapping_id) else {
+        return GuestWriteVerdict::NoMapping;
+    };
+    // The dominant disjunct is the first, and the reason is the shim's arming
+    // window rather than anything about this mapping. `reims_vgpu_dirty_track`
+    // sets `arm_at = harvests + 1`, and `reims_vgpu_dirty_harvest` pins
+    // `s->gen = 0` until `harvests >= arm_at`; `HostOps::guest_write_gen` maps
+    // that 0 to `None`, so `stamp_guest_write_gen` records 0 and counts
+    // `t11_gw_unarmed`. Every Store landing inside a token's arming window
+    // therefore stamps 0, and every LOAD against that stamp lands here.
+    //
+    // That window is per *token*, not per boot, and it is entered two ways. A
+    // brand new mapping enters it once. `ensure_guest_write_token` also retires
+    // a token and builds a new one whenever `guest_write_token_gen` has fallen
+    // behind `map_generation`, so a mapping whose page list churns re-enters it
+    // each time — counted as `gw_token_retired`, and measured at **0 per second
+    // across a driven x86/PCI boot**, so on this pathway churn is not how the
+    // window is reached and new surfaces are.
+    //
+    // It is the structural explanation for `t11_gw_ref_no_stamp` running far
+    // ahead of `t11_gw_ref_moved` — the refusals are this device's own startup
+    // cost, repeated, not guest writes. What it costs is measured: the window
+    // is counted in harvests, harvests are driven by guest doorbells, and a
+    // draw that lands in it pays a whole-frame seed read plus a whole-frame
+    // staging upload. On a near-idle desktop `chain_phase` reads 12-65 ms per
+    // draw with `seed_us` and the engine's `stage_us` holding it, against
+    // 0.2 ms per draw driven, which is the hitch class goals 5 and 6 name.
+    if m.guest_write_gen_at_store == 0
+        // Subsumed by the stamp test above rather than independent: every writer
+        // that zeroes the token zeroes the stamp in the same breath
+        // (`DeviceState::take_guest_write_token`, and the stale-token path in
+        // `ensure_guest_write_token`), and a default `MappingEntry` starts with
+        // both at 0. Kept because it is the cheap half of a check whose false
+        // "unwritten" is the one answer that produces a wrong frame, so a future
+        // writer that clears only the token must not be able to slip past.
+        || m.guest_write_token == 0
+        // A token built for a different page list watches pages this surface
+        // may no longer own, so its generation is not a statement about the
+        // pages the resident would be reused for. Checked here and not only in
+        // `ensure_guest_write_token` because a LOAD can arrive between the list
+        // changing and the next Store rebuilding the token.
+        || m.guest_write_token_gen != m.map_generation
+    {
+        return GuestWriteVerdict::NoStamp;
+    }
+    match host.guest_write_gen(m.guest_write_token) {
+        Some(gen_) if gen_ == m.guest_write_gen_at_store => GuestWriteVerdict::Clean,
+        Some(_) => GuestWriteVerdict::Wrote,
+        None => GuestWriteVerdict::Unreadable,
+    }
+}
+
+/// Mapping byte ranges covering the pages of `mapping_id` whose GPAs appear in
+/// `written`, ascending and merged.
+///
+/// The dirty bitmap answers in guest *physical* pages; a writeback lays bytes
+/// out in the mapping's own offset space. This is the one place the two meet,
+/// and it goes through `page_entries` — the same list the tracking token was
+/// built from — so page `i` of the surface is offset `i * page_size` by
+/// construction rather than by an address arithmetic that could drift from it.
+///
+/// A GPA the mapping does not hold is ignored: a token is per page list, but a
+/// caller may hand back an answer taken before a rebind, and inventing an offset
+/// for a page this surface does not own would exclude bytes at random.
+///
+/// Adjacent pages merge, so a guest that rewrites a whole surface produces one
+/// range rather than thousands.
+pub fn mapping_offsets_of_pages(
+    state: &DeviceState,
+    mapping_id: u32,
+    written: &[u64],
+) -> Vec<(u64, u64)> {
+    let Some(m) = state.mappings.get(&mapping_id) else {
+        return Vec::new();
+    };
+    if written.is_empty() {
+        return Vec::new();
+    }
+    let page_shift = state.page_shift;
+    let page_size = 1u64 << page_shift;
+    let mut sorted: Vec<u64> = written.to_vec();
+    sorted.sort_unstable();
+    let mut out: Vec<(u64, u64)> = Vec::new();
+    for (i, &entry) in m.page_entries.iter().enumerate() {
+        let Some(gpa) = crate::contract::iosurface_pages::entry_gpa_shift(entry, page_shift) else {
+            continue;
+        };
+        if sorted.binary_search(&gpa).is_err() {
+            continue;
+        }
+        let lo = (i as u64).saturating_mul(page_size);
+        let hi = lo.saturating_add(page_size);
+        match out.last_mut() {
+            Some(last) if last.1 == lo => last.1 = hi,
+            _ => out.push((lo, hi)),
+        }
+    }
+    out
 }
 
 /// Revalidate + collect page-aligned GPAs for a mapped surface (GVA order).
@@ -1159,6 +1794,13 @@ fn first_control_page_collision(state: &DeviceState, gpas: &[u64]) -> Option<(u6
     None
 }
 
+/// Device-wide count of [`ensure_contig_view`] calls answered "fragmented",
+/// whether the verdict was derived or served from `contig_fragmented_gen`.
+/// Reported as `served=` on every `contig_view_fragmented` line so the
+/// magnitude the old per-call line carried survives its deduplication.
+static CONTIG_FRAGMENTED_SERVED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// Contiguous host-VA view over the mapping's guest pages (unified memory).
 ///
 /// Builds the view on first use via [`HostOps::map_pages`] (mach_vm_remap of
@@ -1172,13 +1814,6 @@ fn first_control_page_collision(state: &DeviceState, gpas: &[u64]) -> Option<(u6
 /// On Linux, only a **packed** sequential host run succeeds. Fragmented
 /// IOSurface page lists must use [`write_mapping_bytes`] / [`read_mapping_bytes`]
 /// or multi-run import-present.
-/// Device-wide count of [`ensure_contig_view`] calls answered "fragmented",
-/// whether the verdict was derived or served from `contig_fragmented_gen`.
-/// Reported as `served=` on every `contig_view_fragmented` line so the
-/// magnitude the old per-call line carried survives its deduplication.
-static CONTIG_FRAGMENTED_SERVED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
 pub fn ensure_contig_view<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut H,
@@ -1236,17 +1871,370 @@ pub fn ensure_contig_view<H: HostMemory + HostOps>(
     Some((ptr, len))
 }
 
+/// Record the guest frames a mapping-rail write of `[off, off+len)` lands in.
+///
+/// Resolved through the mapping's own page list rather than over the span's
+/// hull, because that list is a scatter: a surface's pages are wherever the
+/// guest allocator put them, and a hull would claim every frame in between —
+/// memory belonging to someone else, every one of which would then read as a
+/// hit for the rest of the boot.
+///
+/// Each page contributes only its intersection with the byte range, so a write
+/// of one row into a 16 KiB arm64 page marks the frame that row is in and not
+/// the other three.
+pub(crate) fn note_mapping_write_footprint(
+    state: &DeviceState,
+    mapping_id: u32,
+    off: u64,
+    len: u64,
+) {
+    if len == 0 {
+        return;
+    }
+    let Some(m) = state.mappings.get(&mapping_id) else {
+        return;
+    };
+    let page_size = state.page_size();
+    let page_shift = state.page_shift;
+    let end = off.saturating_add(len);
+    let first = off / page_size;
+    let last = (end - 1) / page_size;
+    for i in first..=last {
+        let Some(&entry) = m.page_entries.get(i as usize) else {
+            // A short page list is a refusal the caller reports; there is no
+            // frame to name for a page the list does not have.
+            break;
+        };
+        let Some(gpa) = crate::contract::iosurface_pages::entry_gpa_shift(entry, page_shift) else {
+            continue;
+        };
+        let page_lo = i.saturating_mul(page_size);
+        let lo = off.max(page_lo);
+        let hi = end.min(page_lo.saturating_add(page_size));
+        if lo < hi {
+            crate::observe::footprint::note_written_range(
+                crate::observe::footprint::Rail::Mapping,
+                gpa + (lo - page_lo),
+                hi - lo,
+            );
+        }
+    }
+}
+
+/// Which way a mapping-rail run copy moves bytes.
+///
+/// The direction is the only thing the write and read walks disagree about, so
+/// it is the only thing that is a parameter.
+enum RunCopy<'a> {
+    Write(&'a [u8]),
+    Read(&'a mut [u8]),
+}
+
+impl RunCopy<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Write(buf) => buf.len(),
+            Self::Read(buf) => buf.len(),
+        }
+    }
+
+    fn is_write(&self) -> bool {
+        matches!(self, Self::Write(_))
+    }
+
+    /// The bytes a write direction is about to store, for the audit that
+    /// compares them against what the guest's pages already hold.
+    fn write_src(&self) -> Option<&[u8]> {
+        match self {
+            Self::Write(buf) => Some(buf),
+            Self::Read(_) => None,
+        }
+    }
+
+    /// Move `n` bytes between the caller's buffer at `buf_off` and the mapped
+    /// host range at `host_off`.
+    ///
+    /// # Safety
+    ///
+    /// `host_ptr` must be a live mapping of at least `host_off + n` bytes, and
+    /// `buf_off + n` must be within the caller's buffer. The single caller
+    /// checks both against the run's mapped total before calling.
+    unsafe fn apply(&mut self, host_ptr: usize, host_off: usize, buf_off: usize, n: usize) {
+        match self {
+            Self::Write(buf) => unsafe {
+                std::ptr::copy_nonoverlapping(
+                    buf.as_ptr().add(buf_off),
+                    (host_ptr as *mut u8).add(host_off),
+                    n,
+                );
+            },
+            Self::Read(buf) => unsafe {
+                std::ptr::copy_nonoverlapping(
+                    (host_ptr as *const u8).add(host_off),
+                    buf.as_mut_ptr().add(buf_off),
+                    n,
+                );
+            },
+        }
+    }
+}
+
+/// The parts of `[lo, hi)` a selection covers, ascending.
+///
+/// `None` selects the window whole. `Some(&[])` selects **nothing**, which is
+/// why this is an `Option` rather than "empty means everything": a caller
+/// handing over the ranges a difference pass found changed has an empty list
+/// exactly when the frame is entirely redundant, and reading that as "write it
+/// all" would turn the cheapest landing into the most expensive one.
+///
+/// `ranges` is ascending and disjoint. The first candidate is found by binary
+/// search rather than by walking from the front, so a caller with thousands of
+/// runs — which a 256-byte-tile bitmap over an 8 MB frame is — costs
+/// `O(log n)` per query instead of `O(n)`. Nothing here assumes successive
+/// queries ascend, so a caller may probe windows in any order.
+pub(crate) fn selected_within(
+    ranges: Option<&[(u64, u64)]>,
+    lo: u64,
+    hi: u64,
+) -> impl Iterator<Item = (u64, u64)> + '_ {
+    let whole = ranges.is_none();
+    let list: &[(u64, u64)] = ranges.unwrap_or(&[]);
+    let start = list.partition_point(|&(_, e)| e <= lo);
+    std::iter::once((lo, hi))
+        .filter(move |_| whole && lo < hi)
+        .chain(
+            list[start..]
+                .iter()
+                .take_while(move |&&(s, _)| s < hi)
+                .filter_map(move |&(s, e)| {
+                    let a = s.max(lo);
+                    let b = e.min(hi);
+                    (a < b).then_some((a, b))
+                }),
+        )
+}
+
+/// Copy `[off, off+len)` between a caller buffer and the mapping's guest pages.
+///
+/// One packed contig view when the mapping has one that covers the range;
+/// otherwise the page list is split into maximal packed runs, each mapped,
+/// copied and unmapped in turn.
+///
+/// **This is the only implementation of that walk.** The
+/// `buf_off`/`host_off`/`n` arithmetic and the bounds check that guards it used
+/// to exist once per direction. One of those directions is the guest-corruption
+/// rail, so a bound corrected on the read copy and not the write copy would
+/// have been silent — and the two are otherwise identical.
+///
+/// `only` narrows what is moved without narrowing what is *resolved*: the page
+/// list, its packed runs and the imports are worked out for `[off, off+len)`
+/// whole, and each mapped run then moves only the parts of itself the selection
+/// names. That is the whole reason it is a parameter rather than a loop in the
+/// caller — resolving the page list per run costs `O(pages)` each time, so a
+/// caller looping over a thousand runs pays it a thousand times.
+///
+/// `site` names the caller in the refusal lines. Every failure here loses the
+/// caller's bytes, so all four are named; the read direction used to return a
+/// bare `false` on three of them and left the caller with no reason.
+///
+/// Callers flush deferred writeback over the range first, and the write
+/// direction re-checks its [`PagesVouched`] after that flush.
+fn copy_mapping_runs<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+    mapping_id: u32,
+    off: u64,
+    mut copy: RunCopy<'_>,
+    only: Option<&[(u64, u64)]>,
+    site: &str,
+) -> bool {
+    if copy.is_write() {
+        // Puts bytes into guest pages the hypervisor's dirty bitmap cannot
+        // witness. The read direction shares this walk and writes nothing.
+        state.note_host_wrote_mapping(mapping_id);
+    }
+    // Taken once for the walk so an audited landing is compared whole, and held
+    // so its runs are tallied together and the landing is bucketed by its own
+    // redundancy. See [`crate::runtime::land_redundancy::begin_audit`] for why a
+    // per-run stride would describe no frame in particular.
+    let mut audit = copy
+        .is_write()
+        .then(|| crate::runtime::land_redundancy::begin_audit(crate::runtime::land_redundancy::Leg::Mapping))
+        .flatten();
+    let page_size = state.page_size();
+    let len = copy.len();
+    let need_end = off.saturating_add(len as u64);
+    // Fast path: one packed view covering the whole range.
+    if let Some((ptr, view_len)) = ensure_contig_view(state, host, mapping_id) {
+        if (view_len as u64) >= need_end && (off as usize) + len <= view_len {
+            // Collected before the loop because the audit and the copy both
+            // borrow `copy`, and the selection borrows nothing either owns.
+            let spans: Vec<(u64, u64)> = selected_within(only, off, need_end).collect();
+            for (lo, hi) in spans {
+                let buf_off = (lo - off) as usize;
+                let n = (hi - lo) as usize;
+                if let (Some(walk), Some(buf)) = (audit.as_mut(), copy.write_src()) {
+                    // SAFETY: exactly the range `apply` is about to write below,
+                    // and the audit only reads it.
+                    unsafe {
+                        walk.note_write(
+                            lo,
+                            (ptr as *const u8).add(lo as usize),
+                            &buf[buf_off..buf_off + n],
+                            page_size,
+                        );
+                    }
+                }
+                // SAFETY: the view covers `need_end`, checked directly above,
+                // and `[lo, hi)` is within `[off, need_end)` by construction.
+                unsafe { copy.apply(ptr, lo as usize, buf_off, n) };
+                if copy.is_write() {
+                    note_mapping_write_footprint(state, mapping_id, lo, n as u64);
+                }
+            }
+            return true;
+        }
+    }
+    let Some(gpas) = mapping_page_gpas(state, host, mapping_id) else {
+        crate::observe::fail(format!(
+            "{site} fail reason=revalidate mid={mapping_id} off={off:#x} len={len:#x}"
+        ));
+        return false;
+    };
+    let page_sz = page_size as usize;
+    let span_end = (gpas.len() as u64).saturating_mul(page_size);
+    if need_end > span_end {
+        crate::observe::fail(format!(
+            "{site} fail reason=short_table mid={mapping_id} off={off:#x} len={len:#x} span={span_end:#x}"
+        ));
+        return false;
+    }
+    flush_retired_views(state, host);
+    let runs = crate::runtime::gva_view::contig_page_runs(&gpas, page_size);
+    let import_started = std::time::Instant::now();
+    for run in &runs {
+        let run_gpas = &gpas[run.clone()];
+        let run_mlo = (run.start as u64).saturating_mul(page_size);
+        let run_mhi = (run.end as u64).saturating_mul(page_size);
+        let copy_lo = off.max(run_mlo);
+        let copy_hi = need_end.min(run_mhi);
+        if copy_lo >= copy_hi {
+            continue;
+        }
+        let Some(ptr) = host.map_pages(run_gpas, page_sz) else {
+            crate::observe::fail(format!(
+                "{site} fail reason=map_pages mid={mapping_id} run_pages={} mlo={run_mlo:#x}",
+                run_gpas.len()
+            ));
+            return false;
+        };
+        let total = run_gpas.len().saturating_mul(page_sz);
+        let buf_off = (copy_lo - off) as usize;
+        let host_off = (copy_lo - run_mlo) as usize;
+        let n = (copy_hi - copy_lo) as usize;
+        if host_off + n > total || buf_off + n > len {
+            host.unmap_pages(ptr, total);
+            crate::observe::fail(format!(
+                "{site} fail reason=run_bounds mid={mapping_id} host_off={host_off:#x} \
+                 buf_off={buf_off:#x} n={n:#x} total={total:#x} len={len:#x}"
+            ));
+            return false;
+        }
+        // The selection is applied *inside* the mapped run, so a run the
+        // selection touches nowhere still costs its import — and a run it
+        // touches in twenty places costs only one. Splitting the import per
+        // selected span instead would map and unmap the same pages repeatedly.
+        let spans: Vec<(u64, u64)> = selected_within(only, copy_lo, copy_hi).collect();
+        for (sel_lo, sel_hi) in spans {
+            let buf_off = (sel_lo - off) as usize;
+            let host_off = (sel_lo - run_mlo) as usize;
+            let n = (sel_hi - sel_lo) as usize;
+            if let (Some(walk), Some(buf)) = (audit.as_mut(), copy.write_src()) {
+                // SAFETY: exactly the range `apply` is about to write below,
+                // whose bounds are within the window checked directly above;
+                // the audit only reads it.
+                unsafe {
+                    walk.note_write(
+                        sel_lo,
+                        (ptr as *const u8).add(host_off),
+                        &buf[buf_off..buf_off + n],
+                        page_size,
+                    );
+                }
+            }
+            // SAFETY: the map covers `total`, and `host_off + n <= total` and
+            // `buf_off + n <= len` were both just checked for the enclosing
+            // window, which `[sel_lo, sel_hi)` is inside.
+            unsafe { copy.apply(ptr, host_off, buf_off, n) };
+            if copy.is_write() {
+                // Packed run, so the `n` bytes at `host_off` are the `n` bytes
+                // at `run_gpas[0] + host_off`. Marked per span rather than once
+                // over the whole range because the runs are what is contiguous;
+                // the mapping's list between them is not.
+                crate::observe::footprint::note_written_range(
+                    crate::observe::footprint::Rail::Mapping,
+                    run_gpas[0].saturating_add(host_off as u64),
+                    n as u64,
+                );
+            }
+        }
+        host.unmap_pages(ptr, total);
+    }
+    let import_us = import_started.elapsed().as_micros() as u64;
+    if mapping_run_import_is_slow(import_us) {
+        crate::observe::off(format!(
+            "{site}_runs mid={mapping_id} us={import_us} bytes={len} pages={} runs={}",
+            gpas.len(),
+            runs.len()
+        ));
+    }
+    true
+}
+
 /// Write `buf` into mapping linear offset `off` via packed map_pages runs.
 ///
 /// Covers fragmented page lists (Linux product): split GPAs into maximal packed
 /// runs, map each, poke, unmap. No `write_gpa`. Returns false if revalidate /
 /// map fails.
+///
+/// `vouched` is the caller's proof that the page list still names the surface's
+/// guest memory ([`vouch_mapping_pages_verdict`]); it is a parameter rather than a call
+/// here because two callers write a row at a time and the walk is per page.
 pub fn write_mapping_bytes<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut H,
     mapping_id: u32,
     off: u64,
     buf: &[u8],
+    vouched: &PagesVouched,
+) -> bool {
+    write_mapping_bytes_only(state, host, mapping_id, off, buf, None, vouched)
+}
+
+/// [`write_mapping_bytes`], storing only the parts of `buf` that `only` names.
+///
+/// `only` is in the same mapping-linear space as `off`, ascending and disjoint;
+/// `None` stores the buffer whole. Everything the write owes before the first
+/// byte moves — the deferred-writeback flush, the residency invalidation, the
+/// re-check of `vouched` and the payload sample — is owed once for the span
+/// `buf` covers and is done once here, whatever the selection turns out to
+/// name. That is what makes this different from calling the whole-buffer form
+/// once per run: `flush_intersecting` alone re-scans the deferred windows, and
+/// the walk below re-resolves the mapping's page list, so a thousand-run frame
+/// through the loop shape pays both a thousand times.
+///
+/// A selection that names nothing still does the prologue. It has to: the
+/// pages are about to be declared current with `buf` by the caller's
+/// `mark_mapping_written`, and a pending deferred window left unflushed under
+/// them would land afterwards and put an older frame on top.
+pub fn write_mapping_bytes_only<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+    mapping_id: u32,
+    off: u64,
+    buf: &[u8],
+    only: Option<&[(u64, u64)]>,
+    vouched: &PagesVouched,
 ) -> bool {
     if buf.is_empty() {
         return true;
@@ -1267,89 +2255,31 @@ pub fn write_mapping_bytes<H: HostMemory + HostOps>(
         off,
         off.saturating_add(buf.len() as u64),
     );
-    // Fast path: one packed view covering the write.
-    let need_end = off.saturating_add(buf.len() as u64);
-    if let Some((ptr, len)) = ensure_contig_view(state, host, mapping_id) {
-        if (len as u64) >= need_end && (off as usize) + buf.len() <= len {
-            // SAFETY: view covers need_end.
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    buf.as_ptr(),
-                    (ptr as *mut u8).add(off as usize),
-                    buf.len(),
-                );
-            }
-            return true;
-        }
-    }
-    let gpas = match mapping_page_gpas(state, host, mapping_id) {
-        Some(g) => g,
-        None => {
-            crate::observe::fail(format!(
-                "mapping_write fail reason=revalidate mid={mapping_id} off={off:#x} len={:#x}",
-                buf.len()
-            ));
-            return false;
-        }
-    };
-    let page_size = state.page_size();
-    let page_sz = page_size as usize;
-    let span_end = (gpas.len() as u64).saturating_mul(page_size);
-    if need_end > span_end {
+    // The flush above can invalidate this mapping — that is exactly what it does
+    // when its own drift check refuses — so the proof is re-checked after it and
+    // not before. A stale token here is not a lost frame to mourn: the list it
+    // was taken against is gone, and writing through whatever replaced it is the
+    // corruption this token exists to prevent.
+    if !vouched.covers(state, mapping_id) {
         crate::observe::fail(format!(
-            "mapping_write fail reason=short_table mid={mapping_id} off={off:#x} len={:#x} span={span_end:#x}",
+            "mapping_write fail reason=vouch_stale mid={mapping_id} off={off:#x} len={:#x} \
+             (the page list was cleared or replaced between the walk and this write)",
             buf.len()
         ));
         return false;
     }
-    flush_retired_views(state, host);
-    let runs = crate::runtime::gva_view::contig_page_runs(&gpas, page_size);
-    let import_started = std::time::Instant::now();
-    let end = need_end;
-    for run in &runs {
-        let run_gpas = &gpas[run.clone()];
-        let run_mlo = (run.start as u64).saturating_mul(page_size);
-        let run_mhi = (run.end as u64).saturating_mul(page_size);
-        let copy_lo = off.max(run_mlo);
-        let copy_hi = end.min(run_mhi);
-        if copy_lo >= copy_hi {
-            continue;
-        }
-        let Some(ptr) = host.map_pages(run_gpas, page_sz) else {
-            crate::observe::fail(format!(
-                "mapping_write fail reason=map_pages mid={mapping_id} run_pages={} mlo={run_mlo:#x}",
-                run_gpas.len()
-            ));
-            return false;
-        };
-        let total = run_gpas.len().saturating_mul(page_sz);
-        let buf_off = (copy_lo - off) as usize;
-        let host_off = (copy_lo - run_mlo) as usize;
-        let n = (copy_hi - copy_lo) as usize;
-        if host_off + n > total || buf_off + n > buf.len() {
-            host.unmap_pages(ptr, total);
-            return false;
-        }
-        // SAFETY: map covers total; host_off+n in range.
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                buf.as_ptr().add(buf_off),
-                (ptr as *mut u8).add(host_off),
-                n,
-            );
-        }
-        host.unmap_pages(ptr, total);
-    }
-    let import_us = import_started.elapsed().as_micros() as u64;
-    if mapping_run_import_is_slow(import_us) {
-        crate::observe::off(format!(
-            "mapping_write_runs mid={mapping_id} us={import_us} bytes={} pages={} runs={}",
-            buf.len(),
-            gpas.len(),
-            runs.len()
-        ));
-    }
-    true
+    // Sampled payload shape, taken once for the call rather than per run, so a
+    // fragmented write and a packed one of the same bytes count the same.
+    crate::observe::footprint::note_written_payload(buf);
+    copy_mapping_runs(
+        state,
+        host,
+        mapping_id,
+        off,
+        RunCopy::Write(buf),
+        only,
+        "mapping_write",
+    )
 }
 
 /// Read mapping linear `[off, off+buf.len())` via packed map_pages runs.
@@ -1372,74 +2302,22 @@ pub fn read_mapping_bytes<H: HostMemory + HostOps>(
         off,
         off.saturating_add(buf.len() as u64),
     );
-    let need_end = off.saturating_add(buf.len() as u64);
-    if let Some((ptr, len)) = ensure_contig_view(state, host, mapping_id) {
-        if (len as u64) >= need_end && (off as usize) + buf.len() <= len {
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    (ptr as *const u8).add(off as usize),
-                    buf.as_mut_ptr(),
-                    buf.len(),
-                );
-            }
-            return true;
-        }
-    }
-    let gpas = match mapping_page_gpas(state, host, mapping_id) {
-        Some(g) => g,
-        None => return false,
-    };
-    let page_size = state.page_size();
-    let page_sz = page_size as usize;
-    let span_end = (gpas.len() as u64).saturating_mul(page_size);
-    if need_end > span_end {
-        return false;
-    }
-    flush_retired_views(state, host);
-    let runs = crate::runtime::gva_view::contig_page_runs(&gpas, page_size);
-    let import_started = std::time::Instant::now();
-    let end = need_end;
-    for run in &runs {
-        let run_gpas = &gpas[run.clone()];
-        let run_mlo = (run.start as u64).saturating_mul(page_size);
-        let run_mhi = (run.end as u64).saturating_mul(page_size);
-        let copy_lo = off.max(run_mlo);
-        let copy_hi = end.min(run_mhi);
-        if copy_lo >= copy_hi {
-            continue;
-        }
-        let Some(ptr) = host.map_pages(run_gpas, page_sz) else {
-            return false;
-        };
-        let total = run_gpas.len().saturating_mul(page_sz);
-        let buf_off = (copy_lo - off) as usize;
-        let host_off = (copy_lo - run_mlo) as usize;
-        let n = (copy_hi - copy_lo) as usize;
-        if host_off + n > total || buf_off + n > buf.len() {
-            host.unmap_pages(ptr, total);
-            return false;
-        }
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                (ptr as *const u8).add(host_off),
-                buf.as_mut_ptr().add(buf_off),
-                n,
-            );
-        }
-        host.unmap_pages(ptr, total);
-    }
-    let import_us = import_started.elapsed().as_micros() as u64;
-    if mapping_run_import_is_slow(import_us) {
-        crate::observe::off(format!(
-            "mapping_read_runs mid={mapping_id} us={import_us} bytes={} pages={} runs={}",
-            buf.len(),
-            gpas.len(),
-            runs.len()
-        ));
-    }
-    true
+    copy_mapping_runs(
+        state,
+        host,
+        mapping_id,
+        off,
+        RunCopy::Read(buf),
+        None,
+        "mapping_read",
+    )
 }
 
+/// Report a per-run host-pointer import that took at least a millisecond.
+///
+/// Same gate and same basis as [`REVALIDATE_SLOW_US`]: observability only, and
+/// one millisecond is 6 % of a 60 Hz frame. Deliberately the same number as its
+/// peer so the two rails' slow lines are comparable without a conversion.
 const MAPPING_RUN_IMPORT_SLOW_US: u64 = 1_000;
 
 #[inline]
@@ -1679,7 +2557,17 @@ mod revalidate_tests {
         assert!(!read_mapping_bytes(
             &mut state, &mut host, mid, 0, &mut byte,
         ));
-        assert!(!write_mapping_bytes(&mut state, &mut host, mid, 0, &[1],));
+        let vouched = vouch_mapping_pages_verdict(&mut state, &host, mid)
+            .1
+            .expect("no walk to contradict");
+        assert!(!write_mapping_bytes(
+            &mut state,
+            &mut host,
+            mid,
+            0,
+            &[1],
+            &vouched
+        ));
     }
 
     #[test]
@@ -1816,7 +2704,12 @@ mod revalidate_tests {
             "fragmented list must not pack under strict_linux_map"
         );
         let payload = b"FRAG-MULTI-IMPORT-OK!!!!"; // 24 bytes
-        assert!(write_mapping_bytes(&mut state, &mut host, mid, 0, payload));
+        let vouched = vouch_mapping_pages_verdict(&mut state, &host, mid)
+            .1
+            .expect("no walk to contradict");
+        assert!(write_mapping_bytes(
+            &mut state, &mut host, mid, 0, payload, &vouched
+        ));
         // Second page offset = page_size.
         let mut hi = [0u8; 8];
         assert!(read_mapping_bytes(
@@ -1830,17 +2723,724 @@ mod revalidate_tests {
         // Cross-page write spanning the gap.
         let cross = vec![0xABu8; 16];
         let off = page - 8;
-        assert!(write_mapping_bytes(&mut state, &mut host, mid, off, &cross));
+        assert!(write_mapping_bytes(
+            &mut state, &mut host, mid, off, &cross, &vouched
+        ));
         let mut check = [0u8; 16];
         assert!(read_mapping_bytes(
             &mut state, &mut host, mid, off, &mut check
         ));
         assert_eq!(check, [0xABu8; 16]);
     }
+
+    /// The mapping rail's writes reach `observe::footprint`, and claim exactly
+    /// the frames they wrote.
+    ///
+    /// This is the positive control the footprint's own unit tests cannot be:
+    /// those drive the bit set directly, so they prove the container works and
+    /// say nothing about whether any rail is wired to it. A footprint fed by no
+    /// rail reports an empty set, and an empty set answers "this device never
+    /// wrote that page" to every question — the exoneration that costs nothing
+    /// to produce and cannot be told from a real one.
+    ///
+    /// The negatives are the load-bearing half. A mapping's page list is a
+    /// scatter, so the tempting implementation — mark `[gpa_lo, gpa_hi]` over
+    /// the write's span — would claim the 64 Ki frames between these two pages,
+    /// none of which this device can reach through this mapping. Every one of
+    /// them would then read as a hit for the rest of the boot, against a guest
+    /// panic that had nothing to do with us.
+    #[test]
+    fn a_mapping_write_marks_its_own_frames_and_not_the_gap_between_them() {
+        use crate::observe::footprint;
+
+        let _fp = footprint::exclusive_for_tests();
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+        host.strict_linux_map = true;
+        let page = 1u64 << PAGE_SHIFT_X86;
+        let gpa0 = 0x1000_0000u64;
+        let gpa1 = 0x2000_0000u64;
+        host.map_range(gpa0, page as usize, 0);
+        host.map_range(gpa1, page as usize, 0);
+        let mid = 9u32;
+        state.map_surface(mid);
+        {
+            let m = state.mappings.get_mut(&mid).unwrap();
+            m.page_entries = vec![
+                (((gpa0 >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID,
+                (((gpa1 >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID,
+            ];
+        }
+        let vouched = vouch_mapping_pages_verdict(&mut state, &host, mid)
+            .1
+            .expect("no walk to contradict");
+
+        // 24 bytes at offset 0: page 0 only.
+        assert!(write_mapping_bytes(
+            &mut state,
+            &mut host,
+            mid,
+            0,
+            b"FOOTPRINT-FIRST-PAGE!!!!",
+            &vouched
+        ));
+        assert!(footprint::wrote_gpa(gpa0), "the destination must be marked");
+        assert!(
+            !footprint::wrote_gpa(gpa1),
+            "a write that never reached page 1 must not claim it"
+        );
+        assert!(
+            !footprint::wrote_gpa((gpa0 + gpa1) / 2),
+            "the hull between the two pages belongs to whoever the guest gave it \
+             to; claiming it would make every later `pn` in that range a hit"
+        );
+        assert_eq!(footprint::counts(), (1, 0));
+
+        // Cross-page: now both, and still nothing between them.
+        assert!(write_mapping_bytes(
+            &mut state,
+            &mut host,
+            mid,
+            page - 8,
+            &[0xABu8; 16],
+            &vouched
+        ));
+        assert!(footprint::wrote_gpa(gpa1), "the second page is reached now");
+        assert!(!footprint::wrote_gpa((gpa0 + gpa1) / 2));
+        assert_eq!(
+            footprint::counts(),
+            (2, 0),
+            "two frames total, not the span between them"
+        );
+    }
+
+    /// Unmapping one of two mappings that name the same guest pages must not
+    /// make the survivor's writes look like write-after-teardown.
+    ///
+    /// This is the false positive that decides whether the detector is usable
+    /// at all. Mappings genuinely alias — planes of one surface, a slot the
+    /// guest re-presents under a second id — so a retire that walked only the
+    /// dying mapping's list would mark pages a live surface is still writing
+    /// every frame, and `write_after_retire` would read in the thousands on a
+    /// healthy boot. A detector whose first finding is its own bookkeeping gets
+    /// switched off before it ever reports a real one.
+    #[test]
+    fn unmapping_one_of_two_mappings_that_alias_does_not_retire_the_survivors_pages() {
+        use crate::observe::footprint;
+
+        let _fp = footprint::exclusive_for_tests();
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let page = 1u64 << PAGE_SHIFT_X86;
+        let shared = 0x6000_0000u64;
+        let only_mine = 0x6000_0000u64 + page;
+        let entry = |gpa: u64| {
+            (((gpa >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID
+        };
+
+        for mid in [20u32, 21] {
+            state.map_surface(mid);
+            let m = state.mappings.get_mut(&mid).unwrap();
+            m.mapped = true;
+            m.page_entries = if mid == 20 {
+                vec![entry(shared), entry(only_mine)]
+            } else {
+                vec![entry(shared)]
+            };
+        }
+
+        assert!(state.unmap_surface(20));
+        assert_eq!(
+            footprint::retired_counts().0,
+            1,
+            "only the page mapping 20 held alone"
+        );
+
+        // The survivor writes its own page: not a finding.
+        footprint::note_written_range(footprint::Rail::Mapping, shared, 16);
+        assert_eq!(
+            footprint::retired_counts().1,
+            0,
+            "mapping 21 still names this page, so writing it is ordinary"
+        );
+
+        // The page nobody holds any more: the finding.
+        footprint::note_written_range(footprint::Rail::Mapping, only_mine, 16);
+        assert_eq!(footprint::retired_counts().1, 1);
+    }
+
+    /// The guest teardown production actually performs — condemn, then unmap —
+    /// must retire the pages, and reading `page_entries` alone never could.
+    ///
+    /// `DeleteIOSurfaceBacking2` calls `condemn_surface_backing` first, which
+    /// *moves* the list into `condemned_entries`. Every subsequent route into
+    /// `unmap_surface` therefore sees an empty `page_entries`: the second delete
+    /// takes the `mapping_backing_condemned` branch, and the fall-through branch
+    /// is reached only because `condemn_surface_backing` returned `false`, which
+    /// it does precisely when the list was already empty. So the retire path was
+    /// unreachable on the delete route by construction, and a 600 s driven boot
+    /// duly reported `retire_scans=0` — an UNMEASURED detector reading like a
+    /// clean one.
+    #[test]
+    fn the_condemn_then_unmap_teardown_retires_the_condemned_pages() {
+        use crate::observe::footprint;
+
+        let _fp = footprint::exclusive_for_tests();
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let page = 1u64 << PAGE_SHIFT_X86;
+        let gpa = 0x6100_0000u64;
+        let entry = (((gpa >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
+
+        state.map_surface(30);
+        let m = state.mappings.get_mut(&30).unwrap();
+        m.mapped = true;
+        m.page_entries = vec![entry];
+
+        // First delete: the list moves to `condemned_entries`, and nothing is
+        // retired yet — a resolve may still reprieve it.
+        assert!(state.condemn_surface_backing(30));
+        assert!(state.mappings.get(&30).unwrap().page_entries.is_empty());
+        assert_eq!(
+            footprint::retired_counts().0,
+            0,
+            "a condemned list can still be handed back by the reprieve path"
+        );
+
+        // Second delete with no resolve between: genuinely dead.
+        assert!(state.unmap_surface(30));
+        assert_eq!(
+            footprint::retire_scan_counts().0,
+            1,
+            "the retire scan must run; a zero here is what made the detector \
+             UNMEASURED on every driven boot"
+        );
+        assert_eq!(
+            footprint::retired_counts().0,
+            1,
+            "the condemned page retires"
+        );
+
+        footprint::note_written_range(footprint::Rail::Mapping, gpa, 16);
+        assert_eq!(
+            footprint::retired_counts().1,
+            1,
+            "a write into a twice-deleted surface's pages is the finding"
+        );
+
+        // Re-adoption clears it, or the set would only ever grow.
+        footprint::note_pages_authorized([gpa], page);
+        assert_eq!(footprint::retired_counts().0, 0);
+    }
+
+    /// A superseded incarnation's pages retire, and one carried into the new
+    /// plan does not.
+    ///
+    /// `unmap_surface` needs the guest to delete a backing *twice* with no
+    /// resolve between, which is rare — 10 times in a 600 s driven boot. The
+    /// ordinary teardown is a delete followed by a re-resolve that comes back
+    /// with a different page list, and that was invisible to the detector. The
+    /// evidence there is at least as strong: the guest deleted the backing and
+    /// the device then proved the backing changed.
+    ///
+    /// The carried-over page is the half that can go wrong silently. A new plan
+    /// that keeps some of the old pages must not retire them — they really are
+    /// still a surface's — which is what leaving this mapping in the live set
+    /// buys.
+    #[test]
+    fn a_superseded_incarnation_retires_its_pages_but_not_one_the_new_plan_kept() {
+        use crate::observe::footprint;
+
+        let _fp = footprint::exclusive_for_tests();
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let gone = 0x7000_0000u64;
+        let kept = 0x7100_0000u64;
+        let entry = |gpa: u64| {
+            (((gpa >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID
+        };
+
+        state.map_surface(70);
+        {
+            let m = state.mappings.get_mut(&70).unwrap();
+            m.mapped = true;
+            m.page_entries = vec![entry(gone), entry(kept)];
+        }
+        // The guest deletes the backing: the list moves to `condemned_entries`.
+        assert!(state.condemn_surface_backing(70));
+        let condemned = state.mappings.get(&70).unwrap().condemned_entries.clone();
+
+        // The re-resolve comes back with a different plan that keeps one page.
+        let plan = vec![entry(kept), entry(0x7200_0000)];
+        let (_, incarnation_changed, _) = plan_adoption_decision(condemned.as_deref(), &[], &plan);
+        assert!(incarnation_changed, "a different plan is a new incarnation");
+        {
+            let m = state.mappings.get_mut(&70).unwrap();
+            m.page_entries = plan;
+            m.condemned_entries = None;
+        }
+
+        state.retire_pages_no_live_mapping_holds(&condemned.unwrap(), None);
+        assert_eq!(
+            footprint::retire_scan_counts().0,
+            1,
+            "the ordinary teardown must reach the detector at all"
+        );
+        assert_eq!(footprint::retired_counts().0, 1, "only the abandoned page");
+
+        footprint::note_written_range(footprint::Rail::Mapping, kept, 16);
+        assert_eq!(
+            footprint::retired_counts().1,
+            0,
+            "the new plan kept this page, so writing it is ordinary"
+        );
+        footprint::note_written_range(footprint::Rail::Mapping, gone, 16);
+        assert_eq!(
+            footprint::retired_counts().1,
+            1,
+            "the abandoned page is the finding"
+        );
+    }
+
+    /// A condemned list on a *surviving* mapping is still-held, so tearing down
+    /// a mapping that aliases it retires nothing.
+    ///
+    /// The conservative direction, and deliberately so: the survivor is awaiting
+    /// its fingerprint compare and may be reprieved, at which point its writes
+    /// through those pages are ordinary. Counting them as free would give the
+    /// detector a false positive out of this device's own bookkeeping.
+    #[test]
+    fn a_survivors_condemned_list_still_holds_its_pages() {
+        use crate::observe::footprint;
+
+        let _fp = footprint::exclusive_for_tests();
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let shared = 0x6200_0000u64;
+        let entry =
+            (((shared >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
+
+        for mid in [40u32, 41] {
+            state.map_surface(mid);
+            let m = state.mappings.get_mut(&mid).unwrap();
+            m.mapped = true;
+            m.page_entries = vec![entry];
+        }
+        // 41 survives, condemned rather than live.
+        assert!(state.condemn_surface_backing(41));
+
+        assert!(state.unmap_surface(40));
+        assert_eq!(footprint::retire_scan_counts().0, 1, "the scan ran");
+        assert_eq!(
+            footprint::retired_counts().0,
+            0,
+            "mapping 41's reprieve may hand this page straight back"
+        );
+    }
+
+    /// The same claim for the contiguous-view fast path, which is the one
+    /// production takes.
+    ///
+    /// The two paths mark through different code — the fast path resolves the
+    /// destination from the mapping's page list because it has only a host
+    /// pointer and an offset, the slow path from each packed run it maps — so a
+    /// control over one says nothing about the other. The fast path is where
+    /// nearly all of the ~100 000 mapping writes a driven boot makes actually
+    /// go, so an unmarked one there is most of the footprint missing.
+    #[test]
+    fn a_contiguous_mapping_write_marks_only_the_pages_its_offset_reaches() {
+        use crate::observe::footprint;
+
+        let _fp = footprint::exclusive_for_tests();
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+        let page = 1u64 << PAGE_SHIFT_X86;
+        // Adjacent, so `ensure_contig_view` packs them into one view.
+        let gpa0 = 0x3000_0000u64;
+        let gpa1 = gpa0 + page;
+        host.map_range(gpa0, 2 * page as usize, 0);
+        let mid = 11u32;
+        state.map_surface(mid);
+        {
+            let m = state.mappings.get_mut(&mid).unwrap();
+            m.page_entries = vec![
+                (((gpa0 >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID,
+                (((gpa1 >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID,
+            ];
+        }
+        assert!(
+            ensure_contig_view(&mut state, &mut host, mid).is_some(),
+            "the fixture must take the fast path or it is testing the other one"
+        );
+        let vouched = vouch_mapping_pages_verdict(&mut state, &host, mid)
+            .1
+            .expect("no walk to contradict");
+
+        // Entirely inside page 1: the offset, not the base, decides the frame.
+        assert!(write_mapping_bytes(
+            &mut state,
+            &mut host,
+            mid,
+            page + 16,
+            &[0x5Au8; 32],
+            &vouched
+        ));
+        assert!(footprint::wrote_gpa(gpa1));
+        assert!(
+            !footprint::wrote_gpa(gpa0),
+            "marking from the mapping's base rather than the write's offset \
+             would claim page 0, which this write never touched"
+        );
+        assert_eq!(footprint::counts(), (1, 0));
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::selected_within;
+
+    fn sel(ranges: Option<&[(u64, u64)]>, lo: u64, hi: u64) -> Vec<(u64, u64)> {
+        selected_within(ranges, lo, hi).collect()
+    }
+
+    /// `None` is the whole window and `Some(&[])` is none of it. The two must
+    /// never collapse: a difference pass whose frame is entirely redundant
+    /// hands over an empty list, and reading that as "everything" would make
+    /// the cheapest landing the most expensive one.
+    #[test]
+    fn an_absent_selection_and_an_empty_one_are_opposites() {
+        assert_eq!(sel(None, 10, 20), vec![(10, 20)]);
+        assert_eq!(sel(Some(&[]), 10, 20), vec![]);
+        // An empty window selects nothing either way.
+        assert_eq!(sel(None, 10, 10), vec![]);
+    }
+
+    /// Each selected range is clipped to the window, and ranges wholly outside
+    /// it contribute nothing.
+    #[test]
+    fn a_selection_is_clipped_to_the_window() {
+        let ranges = [(0u64, 8u64), (16, 24), (32, 40)];
+        assert_eq!(sel(Some(&ranges), 4, 20), vec![(4, 8), (16, 20)]);
+        assert_eq!(sel(Some(&ranges), 8, 16), vec![]);
+        assert_eq!(sel(Some(&ranges), 0, 64), vec![(0, 8), (16, 24), (32, 40)]);
+        assert_eq!(sel(Some(&ranges), 40, 64), vec![]);
+        // A window inside one range yields exactly that window.
+        assert_eq!(sel(Some(&ranges), 18, 22), vec![(18, 22)]);
+    }
+
+    /// The binary search must land on the first range whose *end* is past the
+    /// window start, not the first whose start is. A range straddling the
+    /// window's left edge is the case a `start >= lo` search silently drops,
+    /// and dropping it loses guest pixels rather than failing.
+    #[test]
+    fn a_range_straddling_the_window_start_is_not_skipped() {
+        let ranges = [(0u64, 100u64), (200, 300)];
+        assert_eq!(sel(Some(&ranges), 50, 250), vec![(50, 100), (200, 250)]);
+    }
+
+    /// Queries need not ascend — the walk re-finds its start each time — so a
+    /// caller may probe page runs in whatever order its page list gives them.
+    #[test]
+    fn windows_may_be_queried_out_of_order() {
+        let ranges = [(0u64, 8u64), (16, 24), (32, 40)];
+        assert_eq!(sel(Some(&ranges), 32, 40), vec![(32, 40)]);
+        assert_eq!(sel(Some(&ranges), 0, 8), vec![(0, 8)]);
+        assert_eq!(sel(Some(&ranges), 16, 24), vec![(16, 24)]);
+    }
+
+    /// A type-4 surface can be re-pointed by the guest with no packet at all,
+    /// and this is the only thing that can see it.
+    ///
+    /// The gap is precise. `revalidate_mapping_reason` re-resolves only when
+    /// `mapping_internal != 0`; a type-4 surface has none, so that function
+    /// falls through to `mapped && !page_entries.is_empty()` and answers
+    /// "resolvable" without checking anything. The guest then re-points the
+    /// backing in its own page table — no MapMemory2, no UnmapMemory, no
+    /// ReplacePhysical, so `map_generation` does not move — and the cached list
+    /// stays trusted. Every deferred flush after that writes a framebuffer into
+    /// whatever now owns those pages.
+    ///
+    /// The fixture is exactly that sequence: adopt a list walked through a live
+    /// task page table, rewire the PTE behind the device's back, and require the
+    /// answer to flip. The final assertion is the one that keeps the check
+    /// honest — restore the PTE and it must go back to `true`, because a witness
+    /// that always says "drifted" would pass the first half and refuse every
+    /// legitimate write in production.
+    #[test]
+    fn the_page_witness_sees_a_rewire_no_packet_announced() {
+        use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+        use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+        use crate::model::{DeviceId, Type4Walk, PAGE_SHIFT_X86};
+        use crate::runtime::host::{FakeHost, HostMemory};
+
+        let page = 1u64 << PAGE_SHIFT_X86;
+        let mut host = FakeHost::new();
+        let dir_gpa = 2u64 << PAGE_SHIFT_X86;
+        let root_gpa = 3u64 << PAGE_SHIFT_X86;
+        let data0 = 4u64 << PAGE_SHIFT_X86;
+        let data1 = 10u64 << PAGE_SHIFT_X86;
+        for gpa in [dir_gpa, root_gpa, data0, data1] {
+            host.map_range(gpa, page as usize, 0);
+        }
+        let st32 = |b: &mut [u8], v: u32| b[..4].copy_from_slice(&v.to_le_bytes());
+        let mut d = [0u8; 8];
+        st32(&mut d[DIRECTORY_ROOT_PFN as usize..], 3);
+        st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
+        host.write_gpa(dir_gpa, &d).unwrap();
+        // GVA page 0 of the task translates to `data0`.
+        let mut pte = [0u8; 4];
+        st32(&mut pte, (data0 >> PAGE_SHIFT_X86) as u32);
+        host.write_gpa(root_gpa, &pte).unwrap();
+
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        assert!(state.define_task(1, page, 2));
+        state.map_surface(6);
+        {
+            let m = state.mappings.get_mut(&6).unwrap();
+            m.mapped = true;
+            m.page_entries = vec![
+                (((data0 >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID,
+            ];
+            m.type4_walk = Some(Type4Walk {
+                task_id: 1,
+                backing_pfn: 0,
+                map_generation: m.map_generation,
+            });
+        }
+        assert!(
+            super::type4_pages_witness(&state, &host, 6) == super::Type4Witness::Verified,
+            "the list was just walked from this page table"
+        );
+
+        // The guest re-points the backing. Nothing on the wire says so, and
+        // `map_generation` is untouched — which is the whole defect.
+        let generation_before = state.mappings.get(&6).unwrap().map_generation;
+        st32(&mut pte, (data1 >> PAGE_SHIFT_X86) as u32);
+        host.write_gpa(root_gpa, &pte).unwrap();
+        assert_eq!(
+            state.mappings.get(&6).unwrap().map_generation,
+            generation_before,
+            "no packet arrived, so nothing bumped the incarnation"
+        );
+        assert!(
+            super::type4_pages_witness(&state, &host, 6) == super::Type4Witness::Drifted,
+            "a fresh walk names a different page, and a writeback through the \
+             cached one lands in whatever the guest gave it to"
+        );
+
+        // A latch from a superseded incarnation is not evidence about the list
+        // in hand, so it must not be read as drift.
+        {
+            let m = state.mappings.get_mut(&6).unwrap();
+            let mut walk = m.type4_walk.unwrap();
+            walk.map_generation = m.map_generation.wrapping_sub(1);
+            m.type4_walk = Some(walk);
+        }
+        assert!(
+            super::type4_pages_witness(&state, &host, 6)
+                == super::Type4Witness::Unwitnessed("walk_superseded"),
+            "a stale latch says nothing about the current list — it must not refuse, \
+             and it must not be counted as a verification either"
+        );
+
+        // And the check must be able to say yes: put the translation back and
+        // the same list is legitimate again. A witness that only ever refuses
+        // would pass the assertion above and lose every frame in production.
+        {
+            let m = state.mappings.get_mut(&6).unwrap();
+            let mut walk = m.type4_walk.unwrap();
+            walk.map_generation = m.map_generation;
+            m.type4_walk = Some(walk);
+        }
+        st32(&mut pte, (data0 >> PAGE_SHIFT_X86) as u32);
+        host.write_gpa(root_gpa, &pte).unwrap();
+        assert!(
+            super::type4_pages_witness(&state, &host, 6) == super::Type4Witness::Verified,
+            "the translation is back where the list says it is"
+        );
+    }
+
+    /// "Nothing to check" must not be reported as "checked and fine".
+    ///
+    /// Four of this witness's exits check no pages at all, and every caller used
+    /// to collapse them into the same `PagesVerdict::Ours` a full clean re-walk
+    /// produces. The counters built on that cannot distinguish a guard that
+    /// passed from one that was never armed — opposite claims about the
+    /// write-after-free class — and one boot reported `mapw_pages_vouched`
+    /// 29 002 against `mapw_pages_refused` 0 without being able to say which it
+    /// meant.
+    ///
+    /// This pins the split, and pins that it is measurement only: an
+    /// `Unwitnessed` verdict still issues a `PagesVouched` token, so the write
+    /// proceeds exactly as before.
+    #[test]
+    fn a_mapping_with_nothing_to_check_is_not_counted_as_verified() {
+        use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+        use crate::model::{DeviceId, PAGE_SHIFT_X86};
+        use crate::runtime::host::FakeHost;
+
+        let host = FakeHost::new();
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        state.map_surface(6);
+        {
+            let m = state.mappings.get_mut(&6).unwrap();
+            m.mapped = true;
+            m.page_entries = vec![(4u32 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+            // No `type4_walk`: nothing ever latched a walk for this mapping.
+            m.type4_walk = None;
+        }
+        assert_eq!(
+            super::type4_pages_witness(&state, &host, 6),
+            super::Type4Witness::Unwitnessed("no_walk"),
+            "a list nothing walked is unwitnessed, not verified"
+        );
+
+        // An empty list and an absent mapping are their own states, because a
+        // single slug would make four different gaps look like one.
+        state.mappings.get_mut(&6).unwrap().page_entries.clear();
+        assert_eq!(
+            super::type4_pages_witness(&state, &host, 6),
+            super::Type4Witness::Unwitnessed("no_walk"),
+        );
+        assert_eq!(
+            super::type4_pages_witness(&state, &host, 999),
+            super::Type4Witness::Unwitnessed("no_mapping"),
+        );
+
+        // Policy is unchanged: the verdict still hands back a token, so the
+        // writers this gates still write. Only the counter differs.
+        let mut state = state;
+        let verdict = super::mapping_pages_verdict(&mut state, &host, 6);
+        assert!(
+            matches!(verdict, super::PagesVerdict::Unwitnessed(_)),
+            "got {verdict:?}"
+        );
+        let (verdict, token) = super::vouch_mapping_pages_verdict(&mut state, &host, 6);
+        assert!(matches!(verdict, super::PagesVerdict::Unwitnessed(_)));
+        assert!(
+            token.is_some(),
+            "an unwitnessed list still writes — this split is a measurement, \
+             not a new refusal"
+        );
+    }
+
+    /// A page the task cannot translate at all is a different finding from one
+    /// that translates somewhere new, and the witness has to say which.
+    ///
+    /// The failed walk used to be answered with the GVA, to match the identity
+    /// fallback that built such entries. Both outcomes refuse the write, so the
+    /// substitution cost nothing in safety — it cost the diagnosis. Every page
+    /// whose walk failed was written up as `translation_moved`, "the guest
+    /// re-pointed this surface and no packet said so", when the guest had done
+    /// nothing at all.
+    #[test]
+    fn a_page_the_task_cannot_translate_is_not_reported_as_a_move() {
+        use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+        use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+        use crate::model::{DeviceId, Type4Walk, PAGE_SHIFT_X86};
+        use crate::runtime::host::{FakeHost, HostMemory};
+
+        crate::observe::redirect_logs_for_tests();
+        let page = 1u64 << PAGE_SHIFT_X86;
+        let mut host = FakeHost::new();
+        let dir_gpa = 2u64 << PAGE_SHIFT_X86;
+        let root_gpa = 3u64 << PAGE_SHIFT_X86;
+        let data0 = 4u64 << PAGE_SHIFT_X86;
+        for gpa in [dir_gpa, root_gpa, data0] {
+            host.map_range(gpa, page as usize, 0);
+        }
+        let st32 = |b: &mut [u8], v: u32| b[..4].copy_from_slice(&v.to_le_bytes());
+        let mut d = [0u8; 8];
+        st32(&mut d[DIRECTORY_ROOT_PFN as usize..], 3);
+        st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
+        host.write_gpa(dir_gpa, &d).unwrap();
+        let mut pte = [0u8; 4];
+        st32(&mut pte, (data0 >> PAGE_SHIFT_X86) as u32);
+        host.write_gpa(root_gpa, &pte).unwrap();
+
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        assert!(state.define_task(1, page, 2));
+        state.map_surface(6);
+        {
+            let m = state.mappings.get_mut(&6).unwrap();
+            m.mapped = true;
+            m.page_entries = vec![
+                (((data0 >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID,
+            ];
+            m.type4_walk = Some(Type4Walk {
+                task_id: 1,
+                backing_pfn: 0,
+                map_generation: m.map_generation,
+            });
+        }
+        assert!(super::type4_pages_witness(&state, &host, 6) != super::Type4Witness::Drifted);
+
+        // The translation goes away rather than moving: the PTE is cleared, so
+        // the walk fails outright.
+        let at = std::fs::read_to_string(crate::observe::fail_log_path())
+            .unwrap_or_default()
+            .len();
+        st32(&mut pte, 0);
+        host.write_gpa(root_gpa, &pte).unwrap();
+        assert!(
+            super::type4_pages_witness(&state, &host, 6) == super::Type4Witness::Drifted,
+            "a page the table cannot translate must not vouch for a write"
+        );
+        let body = std::fs::read_to_string(crate::observe::fail_log_path()).unwrap_or_default();
+        let fresh: Vec<&str> = body[at.min(body.len())..]
+            .lines()
+            .filter(|l| l.starts_with("mapping_page_drift "))
+            .collect();
+        assert!(
+            fresh.iter().any(|l| l.contains("reason=no_translation")),
+            "the refusal must name the failed walk, got: {fresh:?}"
+        );
+        assert!(
+            !fresh.iter().any(|l| l.contains("reason=translation_moved")),
+            "nothing moved — blaming the guest here is the bug: {fresh:?}"
+        );
+    }
+
+    /// The dirty bitmap answers in guest physical pages and a writeback lays
+    /// bytes out in mapping offsets; this is the only place the two meet, so it
+    /// is tested against a page list that is deliberately not in address order.
+    ///
+    /// A GPA the mapping does not hold contributes nothing. A token is per page
+    /// list, but an answer can be taken across a rebind, and inventing an offset
+    /// for a page this surface does not own would exclude bytes at random.
+    #[test]
+    fn mapping_offsets_of_pages_maps_guest_pages_to_surface_offsets() {
+        use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+        use crate::model::{DeviceId, PAGE_SHIFT_X86};
+        const PAGE: u64 = 1 << PAGE_SHIFT_X86;
+
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        state.map_surface(6);
+        // Surface pages 0..4 live at PFNs 0x50, 0x53, 0x51, 0x52 — out of
+        // address order, which is what makes the index the answer and not the
+        // address.
+        let pfns = [0x50u32, 0x53, 0x51, 0x52];
+        state.mappings.get_mut(&6).unwrap().page_entries = pfns
+            .iter()
+            .map(|p| (p << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID)
+            .collect();
+        let gpa = |pfn: u32| (pfn as u64) << PAGE_SHIFT_X86;
+
+        assert_eq!(mapping_offsets_of_pages(&state, 6, &[]), vec![]);
+        // Surface page 1 is the highest GPA of the four.
+        assert_eq!(
+            mapping_offsets_of_pages(&state, 6, &[gpa(0x53)]),
+            vec![(PAGE, 2 * PAGE)]
+        );
+        // Adjacent surface pages merge even though their GPAs are not adjacent.
+        assert_eq!(
+            mapping_offsets_of_pages(&state, 6, &[gpa(0x51), gpa(0x52)]),
+            vec![(2 * PAGE, 4 * PAGE)]
+        );
+        // Non-adjacent stay apart, and a page this surface does not own is
+        // ignored rather than placed somewhere.
+        assert_eq!(
+            mapping_offsets_of_pages(&state, 6, &[gpa(0x50), gpa(0x52), gpa(0x99)]),
+            vec![(0, PAGE), (3 * PAGE, 4 * PAGE)]
+        );
+        assert_eq!(mapping_offsets_of_pages(&state, 7, &[gpa(0x50)]), vec![]);
+    }
 
     use super::*;
     use crate::contract::endian::st32;

@@ -10,13 +10,18 @@ mod state;
 pub use lru_memo::LruBytesMemo;
 pub use regs::*;
 pub use state::{
-    ChannelRing, ChannelStamps, ComputeStorageResidencyKey, CursorState, DeferredOwner, DeviceId,
+    ChannelRing, ComputeStorageResidencyKey, CursorState, DeferredOwner, DeviceId,
     DeviceState, DisplayHandshake, ExecFault, FENCE_DOMAIN_BLIT, FENCE_DOMAIN_COMPUTE,
     FENCE_DOMAIN_EVENT, FENCE_DOMAIN_RENDER, FailEvent, GfxRegs, GuestLinearMemo,
-    GuestRunMemoEntry, GuestRunSpan, GvaDeferredEntry, GvaHostView, HostLinearTexture, HostSurface,
-    IosfcRegs, LinearSampledMemo, MapperCapture, MappingEntry, MmioWindow, PacketFault, PaintSrc,
-    PendingWork, PresentBacking, PresentState, RenderWindowSource, StampSlot, SurfaceWriteKind,
-    TaskEntry, TaskMapSpan, WriteGate,
+    GvaBacking, GvaDeferredEntry, GvaHostView,
+    GvaEvictionWitness, HostLinearTexture, HostSurface, GVA_ENCODE_CACHE_BYTE_CAP,
+    GVA_EVICTION_WITNESS_KEYS,
+    IosfcRegs, LinearDeferredEntry, MapperCapture, MappingEntry,
+    PacketFault,
+    PendingWork, PresentBacking, PresentState, RenderFlushWitness, RenderWindowSource,
+    ResourceValidity,
+    SurfaceWriteKind,
+    TaskEntry, Type4Walk,
 };
 
 use crate::backend::Backend;
@@ -38,10 +43,6 @@ impl<B: Backend> Device<B> {
             state: DeviceState::new(id, page_shift),
             backend,
         }
-    }
-
-    pub fn id(&self) -> DeviceId {
-        self.state.id
     }
 
     pub fn reset(&mut self) {
@@ -100,6 +101,7 @@ impl<B: Backend> Device<B> {
         runtime::drain::drain_pending(&mut self.state, host);
     }
 
+    #[cfg(test)]
     pub fn fails(&self) -> &[FailEvent] {
         &self.state.fails
     }
@@ -113,7 +115,7 @@ mod tests {
     use crate::backend::NullBackend;
     use crate::contract::endian::st32;
     use crate::runtime::{
-        FakeHost, HostActionKind, HostMemory, complete_async_job, enqueue_async_stamp_surface,
+        FakeHost, HostActionKind, HostMemory,
     };
 
     #[test]
@@ -198,6 +200,31 @@ mod tests {
         let mut h = FakeHost::new();
         d.gfx_write(&mut h, GFX_REG_VERSION, 0x3e, MMIO_U32);
         assert_eq!(d.gfx_read(GFX_REG_VERSION, MMIO_U32), 0x3e);
+    }
+
+    /// A version this host does not implement must come back as the newest one
+    /// it does, not as itself.
+    ///
+    /// The guest switches on what it reads back, and its switch has no arm
+    /// above `PROTOCOL_VERSION_MAX` — everything past the top rung lands in a
+    /// default that turns object tables, the child doorbell, heaps and
+    /// buffer-from-IOSurface all off at once. Echoing the request is therefore
+    /// not a harmless pass-through: it is how a guest newer than this host gets
+    /// silently degraded to a near-empty device.
+    #[test]
+    fn version_handshake_clamps_above_what_this_host_implements() {
+        let mut d = dev();
+        let mut h = FakeHost::new();
+        d.gfx_write(&mut h, GFX_REG_VERSION, PROTOCOL_VERSION_MAX as u64 + 1, MMIO_U32);
+        assert_eq!(
+            d.gfx_read(GFX_REG_VERSION, MMIO_U32),
+            PROTOCOL_VERSION_MAX as u64
+        );
+        // A guest older than this host keeps its own version: the host must not
+        // answer with features the guest never asked to speak.
+        d.reset();
+        d.gfx_write(&mut h, GFX_REG_VERSION, 4, MMIO_U32);
+        assert_eq!(d.gfx_read(GFX_REG_VERSION, MMIO_U32), 4);
     }
 
     #[test]
@@ -290,40 +317,23 @@ mod tests {
         d.state.gfx.fifo_written = PACKET_HEADER_LEN + 12;
         d.state.pending.main_drain = true;
         d.drain(&mut h);
-        assert!(d.state.is_tahoe);
         assert_eq!(
             h.get_u32(pfn_to_gpa(reply_pfn, PAGE_SHIFT_ARM64E)),
             DEVICE_INFO_CAPS[0].0
         );
-        assert_eq!(
-            h.get_u32(pfn_to_gpa(reply_pfn, PAGE_SHIFT_ARM64E) + 4),
+        // The value is asserted as a bound, not as the table entry. The
+        // GPU-dependent keys are reduced to what the host can execute, and in a
+        // test there is no resolved device, so the answer is the backend's
+        // floor. Pinning the table entry here would pin the over-promise the
+        // reduction exists to prevent.
+        let served = h.get_u32(pfn_to_gpa(reply_pfn, PAGE_SHIFT_ARM64E) + 4);
+        assert!(
+            served >= 1 && served <= DEVICE_INFO_CAPS[0].1,
+            "served {served} must be a reduction of {}",
             DEVICE_INFO_CAPS[0].1
         );
     }
 
-    #[test]
-    fn stamp_order_async_then_sync() {
-        let mut d = dev();
-        let mut h = FakeHost::new();
-        setup_boot_regs(&mut d, &mut h);
-        let ch = 1u32;
-        let job = enqueue_async_stamp_surface(&mut d.state, ch, ch, 5, 0).unwrap();
-        d.state.child_stamps[ch as usize].push(StampSlot {
-            stamp_index: ch,
-            stamp_value: 6,
-            ready: true,
-            job_id: None,
-            target_mapping: 0,
-        });
-        let ready = d.state.child_stamps[ch as usize].drain_ready();
-        assert!(ready.is_empty());
-        complete_async_job(&mut d.state, &mut h, ch, job);
-        assert_eq!(
-            h.get_u32(pfn_to_gpa(0x10, PAGE_SHIFT_ARM64E) + ch as u64 * 4),
-            6
-        );
-        assert!(h.action_count(HostActionKind::IrqGfxPulse) >= 2);
-    }
 
     #[test]
     fn reset_clears_state() {
@@ -387,7 +397,6 @@ mod tests {
         let mut d = dev();
         d.state.present.width = 1440;
         d.state.present.height = 900;
-        d.state.present.mapping_id = 3;
         d.state.cursor.show = true;
         d.state.cursor.hot_x = 1;
         d.state.cursor.hot_y = 2;

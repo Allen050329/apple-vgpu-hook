@@ -60,6 +60,14 @@ const PORTABILITY_DETECTION_SITES: &[&str] =
 /// reached through its `KHR`/`EXT` form, gated on runtime presence, with the 1.2
 /// path still implemented and tested — otherwise the baseline is 1.3 in fact
 /// while claiming 1.2 in the docs, and the first host to notice is a user's.
+///
+/// **The `KHR` form is that prescription, so the scan must not forbid it.** ash
+/// spells the extension type as the core name with `KHR` appended
+/// (`vk::MemoryBarrier2KHR`, `vk::SubmitInfo2KHR`) and its entry points behind
+/// an `ash::khr::` module, so a plain substring test convicts exactly the path
+/// the failure message tells the author to take. [`is_khr_spelling`] is what
+/// separates them; without it this gate forbids its own advice, and the only
+/// way past would be to delete an entry, which widens it for the core form too.
 const VULKAN_13_CORE_SYMBOLS: &[&str] = &[
     "PhysicalDeviceVulkan13Features",
     "PhysicalDeviceDynamicRenderingFeatures",
@@ -76,6 +84,26 @@ const VULKAN_13_CORE_SYMBOLS: &[&str] = &[
     "SubmitInfo2",
     "API_VERSION_1_3",
 ];
+
+/// Is this occurrence of `symbol` at `at` the extension spelling rather than the
+/// promoted core one?
+///
+/// Two shapes, because ash offers two. The type is the core name with `KHR`
+/// appended — `MemoryBarrier2KHR`, `SubmitInfo2KHR` — and the entry point lives
+/// behind the extension's own module, `ash::khr::synchronization2::Device`,
+/// where the loader for it must have been created from a runtime presence check
+/// in the first place. Both are the 1.2-compatible path.
+///
+/// Deliberately not a general "the line mentions KHR somewhere" test. That would
+/// let a core `queue_submit2` through on any line that also named an unrelated
+/// KHR extension, which is a far easier accident than the one this gate exists
+/// for.
+fn is_khr_spelling(line: &str, symbol: &str, at: usize) -> bool {
+    if line[at + symbol.len()..].starts_with("KHR") {
+        return true;
+    }
+    line[..at].contains("khr::")
+}
 
 #[cfg(test)]
 mod tests {
@@ -228,7 +256,10 @@ mod tests {
             };
             for (i, line) in src.lines().enumerate() {
                 for symbol in VULKAN_13_CORE_SYMBOLS {
-                    if line.contains(symbol) {
+                    if line
+                        .match_indices(symbol)
+                        .any(|(at, _)| !is_khr_spelling(line, symbol, at))
+                    {
                         offenders.push(format!("{name}:{}: {}", i + 1, line.trim()));
                     }
                 }
@@ -240,6 +271,57 @@ mod tests {
              this capability through its KHR/EXT form gated on runtime \
              presence, and keep the 1.2 path implemented:\n{}",
             offenders.join("\n")
+        );
+    }
+
+    /// The gate must not convict the path its own failure message prescribes.
+    ///
+    /// It told authors to reach a promoted capability through its `KHR` form,
+    /// and then matched that form as a substring of the core name, so the only
+    /// way to satisfy it was to delete the entry — which reopens the core
+    /// spelling too. Both directions are asserted here because a carve-out that
+    /// let the core form through would be worse than no carve-out at all.
+    #[test]
+    fn the_khr_spelling_is_the_prescribed_path_and_the_core_one_is_not() {
+        // The type, as ash spells the extension: core name, `KHR` appended.
+        for (line, symbol) in [
+            ("let b = vk::MemoryBarrier2KHR::default();", "MemoryBarrier2"),
+            ("let s = vk::SubmitInfo2KHR::default();", "SubmitInfo2"),
+        ] {
+            let at = line.find(symbol).expect("the fixture names its symbol");
+            assert!(
+                is_khr_spelling(line, symbol, at),
+                "{line} is the extension spelling"
+            );
+        }
+        // The entry point, behind the extension's own loader module.
+        let line = "ash::khr::synchronization2::Device::cmd_pipeline_barrier2(&d, cb, &info);";
+        let at = line
+            .find("cmd_pipeline_barrier2")
+            .expect("the fixture names its symbol");
+        assert!(is_khr_spelling(line, "cmd_pipeline_barrier2", at));
+
+        // The core spellings, which stay banned.
+        for (line, symbol) in [
+            ("let b = vk::MemoryBarrier2::default();", "MemoryBarrier2"),
+            ("device.cmd_pipeline_barrier2(cb, &info);", "cmd_pipeline_barrier2"),
+            ("let v = vk::API_VERSION_1_3;", "API_VERSION_1_3"),
+        ] {
+            let at = line.find(symbol).expect("the fixture names its symbol");
+            assert!(
+                !is_khr_spelling(line, symbol, at),
+                "{line} is the core spelling and must still be caught"
+            );
+        }
+
+        // Not a general "the line says KHR somewhere". A core call on a line
+        // that also names an unrelated extension is a much easier accident than
+        // the one this gate exists for, so it must not be excused.
+        let line = "if have_khr_maintenance { device.queue_submit2(q, &[si], f) }";
+        let at = line.find("queue_submit2").expect("the fixture names its symbol");
+        assert!(
+            !is_khr_spelling(line, "queue_submit2", at),
+            "an unrelated KHR mention must not excuse a core entry point"
         );
     }
 

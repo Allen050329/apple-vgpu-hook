@@ -47,9 +47,15 @@ pub const OP_WAIT_FENCE: u32 = 0x19;
 pub const OP_RENDER_PASS: u32 = 0x1a;
 
 /// Live render-pass attachment layout (reims_vgpu_render_format.h).
+///
+/// The three sections are contiguous, so each record's extent is the distance to
+/// the one after it and is never written down separately: depth is
+/// `[0x00, 0x28)`, stencil is `[0x28, 0x4c)`, and the color slots run from 0x4c
+/// at `PASS_COLOR_ATTACH_STRIDE` each. A single "depth/stencil stride" constant
+/// used to state both of the first two as 0x28, which is right for depth and
+/// 4 bytes too long for stencil — that spare word is color slot 0's texture ref.
 pub const PASS_DEPTH_ATTACH_OFF: usize = 0x00;
 pub const PASS_STENCIL_ATTACH_OFF: usize = 0x28;
-pub const PASS_DEPTH_STENCIL_ATTACH_STRIDE: usize = 0x28;
 pub const PASS_COLOR_ATTACH_OFF: usize = 0x4c;
 pub const PASS_COLOR_ATTACH_STRIDE: usize = 0x3c;
 pub const PASS_ATTACH_TEXREF: usize = 0x00;
@@ -109,10 +115,13 @@ pub const SCISSOR_PAYLOAD_LEN: usize = 0x20;
 
 // Supported window is the full C-accepted encoder range 0x00..=0x98 minus rejected.
 
+/// Why the render decoder refused a command.
+///
+/// No `Ok` and no `ErrArgs`, for the reason recorded on `blit::DecodeStatus`:
+/// success is the result's own `Ok`, and a bad argument here is a payload
+/// shorter than the field, which `ErrShort` already names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DecodeStatus {
-    Ok,
-    ErrArgs,
     ErrShort,
     ErrUnknownOpcode,
     ErrUnsupportedOpcode,
@@ -127,8 +136,6 @@ impl crate::observe::Refusal for DecodeStatus {
     /// from any other's.
     fn refusal(&self) -> Option<&'static str> {
         Some(match self {
-            Self::Ok => return None,
-            Self::ErrArgs => "render_decode_args",
             Self::ErrShort => "render_decode_short",
             Self::ErrUnknownOpcode => "render_decode_unknown_opcode",
             Self::ErrUnsupportedOpcode => "render_decode_unsupported_opcode",
@@ -174,7 +181,7 @@ pub struct ColorAttachment {
     pub level: u32,
     pub load_action: u16,
     pub store_action: u16,
-    /// MTLClearColor as RGBA doubles in [0,1].
+    /// MTLClearColor as RGBA doubles in `[0,1]`.
     pub clear_color: [f64; 4],
 }
 
@@ -202,15 +209,25 @@ pub struct StencilAttachment {
     pub clear_stencil: u32,
 }
 
+/// Which encoder table a render bind record names.
+///
+/// Derived from the opcode, not from a wire field: `OP_SET_VERTEX_*` versus
+/// `OP_SET_FRAGMENT_*`. The render opcode set expresses no other stage, so
+/// there are no other variants — an object/mesh/tile bind reaches the device
+/// through the indirect-command-buffer path and carries
+/// [`crate::runtime::icb::IcbRenderBindStage`], which is a different vocabulary
+/// with a different wire encoding.
+///
+/// Keeping this exhaustive is the point. With unreachable variants present,
+/// every `match` over it needed a catch-all, and a catch-all is what would
+/// swallow a genuinely new stage in silence.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Stage {
+    /// The record named no stage, or the opcode was not a stage-bearing one.
     #[default]
     Unknown,
     Vertex,
     Fragment,
-    Object,
-    Mesh,
-    Tile,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -318,11 +335,10 @@ pub fn decode_color_attachment(payload: &[u8], index: usize) -> ColorAttachment 
 /// Decode the depth attachment (fixed slot @0).
 pub fn decode_depth_attachment(payload: &[u8]) -> DepthAttachment {
     let mut out = DepthAttachment::default();
-    if payload.len() < PASS_DEPTH_ATTACH_OFF + PASS_DEPTH_STENCIL_ATTACH_STRIDE {
+    if payload.len() < PASS_STENCIL_ATTACH_OFF {
         return out;
     }
-    let slot =
-        &payload[PASS_DEPTH_ATTACH_OFF..PASS_DEPTH_ATTACH_OFF + PASS_DEPTH_STENCIL_ATTACH_STRIDE];
+    let slot = &payload[PASS_DEPTH_ATTACH_OFF..PASS_STENCIL_ATTACH_OFF];
     out.texture_ref = ld32(&slot[PASS_ATTACH_TEXREF..]);
     out.resolve_texture_ref = ld32(&slot[PASS_ATTACH_RESOLVEREF..]);
     // Archive uses u16 for depth/stencil level (color uses u32).
@@ -337,11 +353,10 @@ pub fn decode_depth_attachment(payload: &[u8]) -> DepthAttachment {
 /// Decode the stencil attachment (fixed slot @0x28).
 pub fn decode_stencil_attachment(payload: &[u8]) -> StencilAttachment {
     let mut out = StencilAttachment::default();
-    if payload.len() < PASS_STENCIL_ATTACH_OFF + PASS_DEPTH_STENCIL_ATTACH_STRIDE {
+    if payload.len() < PASS_COLOR_ATTACH_OFF {
         return out;
     }
-    let slot = &payload
-        [PASS_STENCIL_ATTACH_OFF..PASS_STENCIL_ATTACH_OFF + PASS_DEPTH_STENCIL_ATTACH_STRIDE];
+    let slot = &payload[PASS_STENCIL_ATTACH_OFF..PASS_COLOR_ATTACH_OFF];
     out.texture_ref = ld32(&slot[PASS_ATTACH_TEXREF..]);
     out.resolve_texture_ref = ld32(&slot[PASS_ATTACH_RESOLVEREF..]);
     out.level = ld16(&slot[PASS_ATTACH_LEVEL..]) as u32;
@@ -350,17 +365,6 @@ pub fn decode_stencil_attachment(payload: &[u8]) -> StencilAttachment {
     out.clear_stencil = ld32(&slot[PASS_STENCIL_ATTACH_CLEAR_STENCIL..]);
     out.present = out.texture_ref != 0;
     out
-}
-
-pub fn stage_name(s: Stage) -> &'static str {
-    match s {
-        Stage::Vertex => "vertex",
-        Stage::Fragment => "fragment",
-        Stage::Object => "object",
-        Stage::Mesh => "mesh",
-        Stage::Tile => "tile",
-        Stage::Unknown => "unknown",
-    }
 }
 
 /// Transactional render command decode.
@@ -430,13 +434,25 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             }
             Ok(out)
         }
-        OP_SET_VERTEX_TEXTURE | OP_SET_FRAGMENT_TEXTURE => {
-            // Archive layout: [first:u32][count:u32][ ref:u32 × count ]
+        OP_SET_VERTEX_TEXTURE
+        | OP_SET_FRAGMENT_TEXTURE
+        | OP_SET_VERTEX_SAMPLER
+        | OP_SET_FRAGMENT_SAMPLER => {
+            // Archive layout: [first:u32][count:u32][ ref:u32 × count ]. All four
+            // opcodes are that one record crossed with two independent axes —
+            // which stage the refs bind to, and whether they name textures or
+            // samplers — so the record is decoded once and the axes read off the
+            // opcode.
             if payload.len() < BIND_ENTRIES {
                 return Err(DecodeStatus::ErrShort);
             }
-            out.kind = Kind::SetTexture;
-            out.stage = if opcode == OP_SET_VERTEX_TEXTURE {
+            let textures = opcode == OP_SET_VERTEX_TEXTURE || opcode == OP_SET_FRAGMENT_TEXTURE;
+            out.kind = if textures {
+                Kind::SetTexture
+            } else {
+                Kind::SetSampler
+            };
+            out.stage = if opcode == OP_SET_VERTEX_TEXTURE || opcode == OP_SET_VERTEX_SAMPLER {
                 Stage::Vertex
             } else {
                 Stage::Fragment
@@ -455,38 +471,14 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
                 let e = BIND_ENTRIES + i * REF_BIND_ENTRY_SIZE;
                 out.ref_binds.push(ld32(&payload[e..]));
             }
+            // The single-ref field the rest of the runtime reads for a one-slot
+            // bind; which of the two it is, is the same axis as `kind`.
             if let Some(&r) = out.ref_binds.first() {
-                out.texture_ref = r;
-            }
-            Ok(out)
-        }
-        OP_SET_VERTEX_SAMPLER | OP_SET_FRAGMENT_SAMPLER => {
-            // Archive layout: [first:u32][count:u32][ ref:u32 × count ]
-            if payload.len() < BIND_ENTRIES {
-                return Err(DecodeStatus::ErrShort);
-            }
-            out.kind = Kind::SetSampler;
-            out.stage = if opcode == OP_SET_VERTEX_SAMPLER {
-                Stage::Vertex
-            } else {
-                Stage::Fragment
-            };
-            out.first = ld32(&payload[BIND_FIRST..]);
-            out.count = ld32(&payload[BIND_COUNT..]);
-            if out.count == 0 || out.count > MAX_BIND_ENTRIES {
-                return Err(DecodeStatus::ErrBadLength);
-            }
-            let need = BIND_ENTRIES + (out.count as usize) * REF_BIND_ENTRY_SIZE;
-            if payload.len() < need {
-                return Err(DecodeStatus::ErrShort);
-            }
-            out.ref_binds.clear();
-            for i in 0..out.count as usize {
-                let e = BIND_ENTRIES + i * REF_BIND_ENTRY_SIZE;
-                out.ref_binds.push(ld32(&payload[e..]));
-            }
-            if let Some(&r) = out.ref_binds.first() {
-                out.sampler_ref = r;
+                if textures {
+                    out.texture_ref = r;
+                } else {
+                    out.sampler_ref = r;
+                }
             }
             Ok(out)
         }
@@ -504,7 +496,7 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             // compact draw was rejected `ErrShort` and dropped. Silently, until
             // the decode refusal was named: one fired on the first arm64 boot
             // that could report it.
-            if command_length != DRAW_COMPACT_CMD_LEN || payload.len() < DRAW_COMPACT_PAYLOAD_LEN {
+            if command_length != DRAW_COMPACT_CMD_LEN {
                 return Err(DecodeStatus::ErrBadLength);
             }
             out.kind = Kind::Draw;
@@ -551,7 +543,7 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             // u32 indexCount@8, u32 pad@0xc, u32 indexBufferOffset@0x10,
             // u32 trailing pad@0x14. Full wire record is exactly 0x20 bytes.
             const PAYLOAD_LEN: usize = 0x18;
-            if command_length != HEADER_LEN + PAYLOAD_LEN || payload.len() < PAYLOAD_LEN {
+            if command_length != HEADER_LEN + PAYLOAD_LEN {
                 return Err(DecodeStatus::ErrBadLength);
             }
             out.kind = Kind::Draw;
@@ -724,7 +716,7 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             Ok(out)
         }
         OP_EXECUTE_COMMANDS_INDIRECT => {
-            if command_length != EXECUTE_INDIRECT_CMD_LEN || payload.len() < 0x10 {
+            if command_length != EXECUTE_INDIRECT_CMD_LEN {
                 return Err(DecodeStatus::ErrBadLength);
             }
             out.kind = Kind::ExecuteCommands;
@@ -735,7 +727,7 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             Ok(out)
         }
         OP_EXECUTE_COMMANDS_RANGE => {
-            if command_length != EXECUTE_RANGE_CMD_LEN || payload.len() < 0x14 {
+            if command_length != EXECUTE_RANGE_CMD_LEN {
                 return Err(DecodeStatus::ErrBadLength);
             }
             out.kind = Kind::ExecuteCommands;
@@ -774,16 +766,14 @@ mod tests {
     /// work. Each check names itself now, `Ok` still produces nothing, and the
     /// prefix keeps them apart from the six sibling `DecodeStatus` enums.
     #[test]
-    fn every_render_decode_failure_but_ok_names_its_own_check() {
+    fn every_render_decode_failure_names_its_own_check() {
         use crate::observe::Refusal;
         const ERRS: &[DecodeStatus] = &[
-            DecodeStatus::ErrArgs,
             DecodeStatus::ErrShort,
             DecodeStatus::ErrUnknownOpcode,
             DecodeStatus::ErrUnsupportedOpcode,
             DecodeStatus::ErrBadLength,
         ];
-        assert_eq!(DecodeStatus::Ok.refusal(), None, "Ok is not a refusal");
         let mut slugs: Vec<&str> = ERRS.iter().filter_map(|s| s.refusal()).collect();
         assert_eq!(slugs.len(), ERRS.len(), "every error variant refuses");
         assert!(slugs.iter().all(|s| s.starts_with("render_decode_")));
@@ -981,6 +971,51 @@ mod tests {
         assert!(s.present);
         assert_eq!(s.texture_ref, 88);
         assert_eq!(s.clear_stencil, 9);
+    }
+
+    /// Each of the first two records ends where the next one begins: depth
+    /// `[0x00, 0x28)`, stencil `[0x28, 0x4c)`. A payload that carries both in
+    /// full — and not one byte of the color section — must decode both.
+    ///
+    /// A shared `PASS_DEPTH_STENCIL_ATTACH_STRIDE = 0x28` used to give the
+    /// stencil record the depth record's length, so the decoder demanded 0x50
+    /// bytes to read a 0x24-byte record and sliced 4 bytes past its end, over
+    /// color slot 0's texture ref. This payload is exactly `PASS_COLOR_ATTACH_OFF`
+    /// long, so the old guard rejected it and returned a defaulted attachment.
+    #[test]
+    fn depth_and_stencil_records_end_where_the_next_section_begins() {
+        use crate::contract::endian::{st32, st64};
+        let mut payload = vec![0u8; PASS_COLOR_ATTACH_OFF];
+        st32(
+            &mut payload[PASS_DEPTH_ATTACH_OFF + PASS_ATTACH_TEXREF..],
+            31,
+        );
+        st64(
+            &mut payload[PASS_DEPTH_ATTACH_OFF + PASS_DEPTH_ATTACH_CLEAR_DEPTH..],
+            0.25f64.to_bits(),
+        );
+        st32(
+            &mut payload[PASS_STENCIL_ATTACH_OFF + PASS_ATTACH_TEXREF..],
+            32,
+        );
+        st32(
+            &mut payload[PASS_STENCIL_ATTACH_OFF + PASS_STENCIL_ATTACH_CLEAR_STENCIL..],
+            0xfe,
+        );
+        let d = decode_depth_attachment(&payload);
+        assert!(
+            d.present,
+            "depth record is complete at {PASS_STENCIL_ATTACH_OFF} bytes"
+        );
+        assert_eq!(d.texture_ref, 31);
+        assert!((d.clear_depth - 0.25).abs() < 1e-9);
+        let s = decode_stencil_attachment(&payload);
+        assert!(
+            s.present,
+            "stencil record is complete at {PASS_COLOR_ATTACH_OFF} bytes"
+        );
+        assert_eq!(s.texture_ref, 32);
+        assert_eq!(s.clear_stencil, 0xfe);
     }
 
     #[test]

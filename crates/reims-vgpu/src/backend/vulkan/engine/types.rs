@@ -1,7 +1,7 @@
 //! Draw request surface for the internal Vulkan engine (v1 §1.2 surface).
 //!
 //! Field meanings match the historical Metal→Vulkan product draw seam
-//! (viewport flip, blend, Load seed, stage-in attributes, SSBOs, sampled images).
+//! (blend, Load seed, stage-in attributes, SSBOs, sampled images).
 
 use ash::vk;
 
@@ -221,22 +221,26 @@ pub struct DrawRequest {
     pub width: u32,
     pub height: u32,
     pub vertex_count: u32,
-    pub flip_viewport_y: bool,
     pub first_vertex: u32,
     pub instance_count: Option<u32>,
     /// Metal baseInstance / Vulkan firstInstance. Constant step-function shift uses this.
     pub base_instance: u32,
     pub primitive_topology: PrimitiveTopology,
-    pub viewports: Vec<ViewportResource>,
-    pub scissors: Vec<ScissorResource>,
+    /// The guest's viewport, when it bound one. At most one: Metal's
+    /// `setViewports:` array reaches us as a single decoded viewport per draw,
+    /// and the engine binds exactly `cmd_set_viewport(.., &[one])`. `None`
+    /// takes the full-target default.
+    pub viewport: Option<ViewportResource>,
+    /// The guest's scissor rect, when it bound one, on the same terms as
+    /// [`Self::viewport`].
+    pub scissor: Option<ScissorResource>,
     pub indexed: Option<IndexedDrawResource>,
     pub vertex_attributes: Vec<VertexAttributeResource>,
     pub storage_buffers: Vec<StorageBufferResource>,
     pub sampled_images: Vec<SampledImageResource>,
     pub samplers: Vec<SamplerResource>,
-    /// CPU Load seed for the color target (None = clear black), in the order
-    /// [`DrawRequest::target_seed_order`] names. Preferred when `load_op` is not
-    /// set; still honored as `LoadOp::LoadSeed`.
+    /// CPU Load seed for the color target, in the order
+    /// [`DrawRequest::target_seed_order`] names.
     ///
     /// Shared rather than owned so a caller holding the frame behind an `Arc` —
     /// `surface_cache` does — can seed a draw with a refcount instead of a
@@ -260,9 +264,15 @@ pub struct DrawRequest {
     pub color_write_mask: ColorWriteMask,
     /// Protocol-derived target identity for GPU residency (workstream D).
     pub target_identity: Option<TargetIdentity>,
-    /// Explicit load action. When `None`, derived from `target_rgba8`
-    /// (`Some` → LoadSeed, `None` → Clear black).
-    pub load_op: Option<LoadOp>,
+    /// Load the live GPU image for [`DrawRequest::target_identity`] instead of
+    /// seeding the attachment from the CPU. Requires that resident to exist.
+    ///
+    /// This and `target_rgba8` are the whole load action, and they are ordered:
+    /// `load_from_target` wins, else a seed is uploaded, else the attachment
+    /// clears to transparent black. There is no third spelling — the primary
+    /// attachment's `VkClearValue` is `[0, 0, 0, 0]` unconditionally, so a
+    /// "clear to these floats" request could never have been honoured.
+    pub load_from_target: bool,
     /// When true, skip full-frame readback (non-Store / ticket path). Content
     /// remains on the GPU under `target_identity` when provided.
     pub skip_readback: bool,
@@ -289,8 +299,8 @@ pub struct DrawRequest {
     pub secondary_targets: Vec<SecondaryColorTarget>,
     /// Face culling (Metal `MTLCullMode`). `None` (default) draws both faces —
     /// the 2D UI path. `Front`/`Back` reproduce Metal culling; which winding is
-    /// "front" is `front_face_ccw`, resolved against `flip_viewport_y` in the
-    /// pipeline builder (the Metal Y-flip reverses framebuffer winding).
+    /// "front" is `front_face_ccw`, mapped to a Vulkan winding by
+    /// [`crate::backend::vulkan::engine::caches::metal_front_face`].
     pub cull_mode: CullMode,
     /// Metal front-facing winding: `true` = counter-clockwise (`MTLWinding`
     /// CounterClockwise), `false` = the Metal default clockwise. Only affects
@@ -960,16 +970,17 @@ pub struct ComputeBufferOutput {
 }
 
 /// Storage image for compute. Formats mirror the live `simg_u32_to_vk_storage` map.
+///
+/// Single-layer 2D only: a compute texture binding is staged from one type-11
+/// plane window or one linear GVA level, both of which are a flat `width ×
+/// height` rectangle. There is no decoded slice or depth axis on this rail, so
+/// the engine builds `TYPE_2D` unconditionally.
 #[derive(Debug)]
 pub struct ComputeStorageImageResource {
     pub binding: u32,
     pub format: StorageImageFormat,
     pub width: u32,
     pub height: u32,
-    pub layers: u32,
-    pub one_dim: bool,
-    pub arrayed: bool,
-    pub volume: bool,
     pub bytes: Vec<u8>,
     /// Exact type-11 resource lifetime/view contract for persistent GPU
     /// storage. `None` keeps the conservative transient upload path.
@@ -1016,16 +1027,15 @@ pub struct ComputeStorageResidency {
 /// Read-only sampled image for compute. The format set is shared with storage
 /// images because both are derived from the same Metal pixel-format contract;
 /// descriptor access is carried separately by the request field.
+///
+/// Single-layer 2D only, for the same reason as
+/// [`ComputeStorageImageResource`].
 #[derive(Debug)]
 pub struct ComputeSampledImageResource {
     pub binding: u32,
     pub format: StorageImageFormat,
     pub width: u32,
     pub height: u32,
-    pub layers: u32,
-    pub one_dim: bool,
-    pub arrayed: bool,
-    pub volume: bool,
     pub bytes: Vec<u8>,
     /// When set, `bytes` is a zero placeholder: the engine seeds the sampled
     /// image with a device-local copy of the named resident storage image
@@ -1116,15 +1126,19 @@ pub enum TargetIdentity {
 
 pub type PresentRect = (u32, u32, u32, u32);
 
-/// Ordered resident candidates for a host-window present. The first
-/// content-ready BGRA candidate at `width`x`height` is authoritative; the list
-/// resolves the ONE surface the display transaction named, never a choice
-/// between surfaces.
+/// The resident a host-window present should blit from.
+///
+/// One identity, not a list. The display transaction names exactly one surface,
+/// and `present_identity::surface_identity` turns that name into exactly one
+/// identity — so there was never a second candidate to rank against the first.
+/// It stays a request rather than a resolved slot because only the engine, under
+/// its own lock, can say whether that identity is resident and presentable at
+/// `width`x`height`.
 #[derive(Clone, Debug)]
 pub struct WindowPresentSource {
     pub width: u32,
     pub height: u32,
-    pub candidates: Vec<TargetIdentity>,
+    pub identity: TargetIdentity,
 }
 
 impl Default for TargetIdentity {
@@ -1199,23 +1213,6 @@ pub enum SeedOrder {
     Rgba8,
     /// Guest scanout order — B, G, R, A in memory.
     Bgra8,
-}
-
-/// Color attachment load action for resident targets.
-#[derive(Debug)]
-pub enum LoadOp {
-    /// Clear to the given RGBA float values (or black if omitted).
-    Clear([f32; 4]),
-    /// Load the live GPU image for this identity (must already exist).
-    LoadFromTarget,
-    /// Upload semantic RGBA8 CPU seed bytes into the target (first-touch / guest-newer).
-    LoadSeed(Vec<u8>),
-}
-
-impl Default for LoadOp {
-    fn default() -> Self {
-        Self::Clear([0.0, 0.0, 0.0, 0.0])
-    }
 }
 
 /// Where a sampled image's content comes from.

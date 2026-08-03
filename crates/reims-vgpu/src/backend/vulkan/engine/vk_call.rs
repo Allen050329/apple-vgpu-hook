@@ -89,6 +89,10 @@ pub enum VkOp {
 
     /// `vkGetPipelineCacheData` before persisting a grown pipeline cache.
     ContextPipelineCacheGetData,
+    /// `vkCreateQueryPool` for the readback's two-slot timestamp probe.
+    ContextCreateQueryPool,
+    /// `vkGetQueryPoolResults` reading that probe after its fence signalled.
+    ContextGetQueryPoolResults,
 
     // ---- desc_arena.rs — the per-frame descriptor-set arena ----
     /// `vkCreateDescriptorPool` for the arena's pool.
@@ -179,12 +183,16 @@ pub enum VkOp {
     PoolsAllocReadback,
     /// `vkBindBufferMemory` for a readback slot.
     PoolsBindReadback,
+    /// `vkMapMemory` of a readback slot, for the slot's whole lifetime.
+    PoolsMapReadback,
     /// `vkCreateBuffer` for the secondary ("extra") readback slot.
     PoolsCreateReadbackExtra,
     /// `vkAllocateMemory` for the extra readback slot.
     PoolsAllocReadbackExtra,
     /// `vkBindBufferMemory` for the extra readback slot.
     PoolsBindReadbackExtra,
+    /// `vkMapMemory` of an extra readback slot, for the slot's whole lifetime.
+    PoolsMapReadbackExtra,
 
     // ---- pools/mod.rs — the target / sampled / storage / registry / MRT-
     //      secondary / depth image + view + framebuffer allocation rails ----
@@ -210,6 +218,12 @@ pub enum VkOp {
     PoolsBindStorageImage,
     /// `vkCreateImageView` for a storage image.
     PoolsCreateStorageImageView,
+    /// `vkCreateBuffer` for a writeback difference-pass scratch buffer.
+    PoolsCreateDiffScratch,
+    /// `vkAllocateMemory` for a difference-pass scratch buffer.
+    PoolsAllocDiffScratch,
+    /// `vkBindBufferMemory` for a difference-pass scratch buffer.
+    PoolsBindDiffScratch,
     /// `vkCreateFramebuffer` for a resident-registry target.
     PoolsCreateRegistryFramebuffer,
     /// `vkCreateImage` for a resident-registry target.
@@ -343,6 +357,8 @@ impl Decline for VkCall {
             VkOp::CachesCreateComputePipelines => "vk_caches_create_compute_pipelines",
 
             VkOp::ContextPipelineCacheGetData => "vk_context_pipeline_cache_get_data",
+            VkOp::ContextCreateQueryPool => "vk_context_create_query_pool",
+            VkOp::ContextGetQueryPoolResults => "vk_context_get_query_pool_results",
 
             VkOp::DescArenaCreatePool => "vk_desc_arena_create_pool",
             VkOp::DescArenaAllocSets => "vk_desc_arena_alloc_sets",
@@ -388,9 +404,11 @@ impl Decline for VkCall {
             VkOp::PoolsCreateReadback => "vk_pools_create_readback",
             VkOp::PoolsAllocReadback => "vk_pools_alloc_readback",
             VkOp::PoolsBindReadback => "vk_pools_bind_readback",
+            VkOp::PoolsMapReadback => "vk_pools_map_readback",
             VkOp::PoolsCreateReadbackExtra => "vk_pools_create_readback_extra",
             VkOp::PoolsAllocReadbackExtra => "vk_pools_alloc_readback_extra",
             VkOp::PoolsBindReadbackExtra => "vk_pools_bind_readback_extra",
+            VkOp::PoolsMapReadbackExtra => "vk_pools_map_readback_extra",
 
             VkOp::PoolsCreateTargetImage => "vk_pools_create_target_image",
             VkOp::PoolsBindTarget => "vk_pools_bind_target",
@@ -403,6 +421,9 @@ impl Decline for VkCall {
             VkOp::PoolsAllocStorageImage => "vk_pools_alloc_storage_image",
             VkOp::PoolsBindStorageImage => "vk_pools_bind_storage_image",
             VkOp::PoolsCreateStorageImageView => "vk_pools_create_storage_image_view",
+            VkOp::PoolsCreateDiffScratch => "vk_pools_create_diff_scratch",
+            VkOp::PoolsAllocDiffScratch => "vk_pools_alloc_diff_scratch",
+            VkOp::PoolsBindDiffScratch => "vk_pools_bind_diff_scratch",
             VkOp::PoolsCreateRegistryFramebuffer => "vk_pools_create_registry_framebuffer",
             VkOp::PoolsCreateRegistryTarget => "vk_pools_create_registry_target",
             VkOp::PoolsBindRegistryTarget => "vk_pools_bind_registry_target",
@@ -502,6 +523,8 @@ mod tests {
         VkOp::CachesCreateGraphicsPipelines,
         VkOp::CachesCreateComputePipelines,
         VkOp::ContextPipelineCacheGetData,
+        VkOp::ContextCreateQueryPool,
+        VkOp::ContextGetQueryPoolResults,
         VkOp::DescArenaCreatePool,
         VkOp::DescArenaAllocSets,
         VkOp::DescArenaAllocSetsGrown,
@@ -539,9 +562,11 @@ mod tests {
         VkOp::PoolsCreateReadback,
         VkOp::PoolsAllocReadback,
         VkOp::PoolsBindReadback,
+        VkOp::PoolsMapReadback,
         VkOp::PoolsCreateReadbackExtra,
         VkOp::PoolsAllocReadbackExtra,
         VkOp::PoolsBindReadbackExtra,
+        VkOp::PoolsMapReadbackExtra,
         VkOp::PoolsCreateTargetImage,
         VkOp::PoolsBindTarget,
         VkOp::PoolsCreateTargetView,
@@ -553,6 +578,9 @@ mod tests {
         VkOp::PoolsAllocStorageImage,
         VkOp::PoolsBindStorageImage,
         VkOp::PoolsCreateStorageImageView,
+        VkOp::PoolsCreateDiffScratch,
+        VkOp::PoolsAllocDiffScratch,
+        VkOp::PoolsBindDiffScratch,
         VkOp::PoolsCreateRegistryFramebuffer,
         VkOp::PoolsCreateRegistryTarget,
         VkOp::PoolsBindRegistryTarget,
