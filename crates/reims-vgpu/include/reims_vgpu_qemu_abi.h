@@ -55,6 +55,26 @@ extern "C" {
 #define REIMS_VGPU_QEMU_ERR_PANIC 3
 #define REIMS_VGPU_QEMU_EMPTY 4
 
+/*
+ * Largest scanout / surface edge the device accepts, in pixels.
+ *
+ * The basis is the allocation it bounds, not a device capability. Every host
+ * pixel buffer here is tightly packed BGRA8, so this edge squared times 4 is
+ * the largest single surface the device can be asked to hold: 8192 gives
+ * 256 MiB, which is the figure `surface_cache`'s GVA cache cap is reasoned
+ * against at its own eviction site. The wire fields are 16-bit and would admit
+ * 65535 — a 16 GiB surface out of one corrupt guest word — so a ceiling is
+ * required, and this is the product's.
+ *
+ * Rust `model::MAX_SCANOUT_DIM` owns it: the bound is product policy and every
+ * geometry accept/refuse in the device tests against the Rust constant. This
+ * define exists only so the two QEMU shims stop each carrying a private copy of
+ * the number. A duplicated bound is a bound that can drift, and a drift here is
+ * a geometry one pathway accepts and the other silently drops.
+ * `model::regs::the_abi_header_agrees_on_the_scanout_bound` fails if they part.
+ */
+#define REIMS_VGPU_MAX_SCANOUT_DIM 8192u
+
 /* HostAction kinds — match Rust HostActionKind / ReimsVgpuHostActionKind. */
 #define REIMS_VGPU_HOST_ACTION_NONE 0u
 #define REIMS_VGPU_HOST_ACTION_IRQ_GFX 1u
