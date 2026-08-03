@@ -1750,12 +1750,20 @@ pub fn decode_texture_view_descriptor(bytes: &[u8]) -> Result<TextureViewDescrip
     if declared < min_len || declared != bytes.len() {
         return Err(DecodeStatus::ErrShort("res_texture_view_declared_len"));
     }
+    let pixel_format = ld16(&bytes[TEXTURE_VIEW_DESC_PIXEL_FORMAT..]);
     let mut out = TextureViewDescriptor {
         view_opcode,
         view_texture_ref: ld32(&bytes[TEXTURE_VIEW_DESC_TEXTURE_REF..]),
         base_texture_ref: ld32(&bytes[TEXTURE_VIEW_DESC_BASE_REF..]),
-        pixel_format: ld16(&bytes[TEXTURE_VIEW_DESC_PIXEL_FORMAT..]),
-        has_pixel_format: true,
+        pixel_format,
+        // `!= 0`, the same rule `decode_texture_descriptor` uses, and not the
+        // unconditional `true` this used to carry. `MTLPixelFormatInvalid` is 0,
+        // so a zero here is a format the descriptor did not state — and a flag
+        // named `has_pixel_format` that answers yes for a format nobody named is
+        // a trap for the first caller to gate on it. Every current reader of
+        // this flag is on `TextureDescriptor`, so the two must not disagree
+        // about what it means.
+        has_pixel_format: pixel_format != 0,
         ..Default::default()
     };
     if view_opcode >= TEXTURE_VIEW_OPCODE_RANGED && bytes.len() >= TEXTURE_VIEW_MIN_RANGED {
@@ -1855,6 +1863,19 @@ const TYPE7_MIN_LEN: usize = 17;
 /// (`runtime/objects.rs`, `decode_type4_surface` -> `set_mapping_geom`). Do not
 /// reason about what the guest tells us at surface-create time from this
 /// decoder without re-confirming it runs; measure `decode_type4_surface`.
+/// Offsets in the type-11 IOSurface-texture descriptor. Named rather than
+/// written as hex at the read sites, which is the convention every other
+/// decoder in this file already follows — an offset that appears only as a
+/// literal cannot be found by a reader checking whether the layout still holds.
+pub const IOSURFACE_TEX_MAPPING_ID: usize = 0x00;
+pub const IOSURFACE_TEX_OBJECT_REF: usize = 0x10;
+pub const IOSURFACE_TEX_PIXEL_FORMAT: usize = 0x16;
+pub const IOSURFACE_TEX_WIDTH: usize = 0x18;
+pub const IOSURFACE_TEX_HEIGHT: usize = 0x1c;
+/// Through `height`. Live blobs run longer (0x38 / 0x58); the tail past this is
+/// not decoded, and the comment on the decoder says why.
+pub const IOSURFACE_TEX_MIN_LEN: usize = 0x20;
+
 pub fn decode_iosurface_texture_descriptor(bytes: &[u8]) -> Result<Descriptor, DecodeStatus> {
     // Matches reims-vgpu-iosurface-pages texture descriptor min layout (mappingID,
     // object self-ref, format, width, height). Live type-11 blobs are longer
@@ -1863,18 +1884,15 @@ pub fn decode_iosurface_texture_descriptor(bytes: &[u8]) -> Result<Descriptor, D
     // (`newTextureWithDescriptor:iosurface:` rejects mipmapLevelCount > 1),
     // and product resolve fail-closes non-zero levels rather than inventing
     // a pyramid packing in the mapping (see blit_exec::Type11Texture).
-    if bytes.len() < 0x20 {
+    if bytes.len() < IOSURFACE_TEX_MIN_LEN {
         return Err(DecodeStatus::ErrShort("res_iosurface_short"));
     }
-    let mapping_id = ld32(&bytes[0x00..]);
-    let width = ld32(&bytes[0x18..]);
-    let height = ld32(&bytes[0x1c..]);
     Ok(Descriptor::IOSurfaceTexture {
-        mapping_id,
-        object_ref: ld32(&bytes[0x10..]),
-        pixel_format: ld16(&bytes[0x16..]),
-        width,
-        height,
+        mapping_id: ld32(&bytes[IOSURFACE_TEX_MAPPING_ID..]),
+        object_ref: ld32(&bytes[IOSURFACE_TEX_OBJECT_REF..]),
+        pixel_format: ld16(&bytes[IOSURFACE_TEX_PIXEL_FORMAT..]),
+        width: ld32(&bytes[IOSURFACE_TEX_WIDTH..]),
+        height: ld32(&bytes[IOSURFACE_TEX_HEIGHT..]),
     })
 }
 
@@ -3291,7 +3309,21 @@ mod tests {
         assert_eq!(v.base_texture_ref, 3);
         assert_eq!(v.view_texture_ref, 10);
         assert_eq!(v.pixel_format, 0x50);
+        assert!(v.has_pixel_format);
         assert!(!v.has_swizzle);
+
+        // A view that states no format must not claim one. This used to be an
+        // unconditional `true`, which disagreed with `decode_texture_descriptor`
+        // — the decoder every current reader of this flag goes through — about
+        // what the flag means. `MTLPixelFormatInvalid` is 0, so a zero here is
+        // an absent format and the gates that fail closed on it must see that.
+        st16(&mut b[TEXTURE_VIEW_DESC_PIXEL_FORMAT..], 0);
+        let none = decode_texture_view_descriptor(&b).unwrap();
+        assert_eq!(none.pixel_format, 0);
+        assert!(
+            !none.has_pixel_format,
+            "format 0 is MTLPixelFormatInvalid, not a format the view named"
+        );
     }
 
     #[test]
