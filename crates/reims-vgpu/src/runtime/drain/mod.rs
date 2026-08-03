@@ -128,7 +128,13 @@ fn apply_define_task2<H: HostMemory + HostOps>(
     let raw_id = ld32(&payload[DEFINE_TASK_RAW_ID..]);
     let length = define_task_length(payload);
     let dir = ld32(&payload[DEFINE_TASK_DIRECTORY_PFN..]);
+    // `raw_id` is `(task_id << 1) | is_kernel_task`: the guest's kernel-task and
+    // user-task registrations differ only in that low bit, and the kernel task's
+    // own id is 0, so `0x1` is the kernel task and not user task 1. Both halves
+    // are decoded — the id to index the slot, the flag so the log says which
+    // class registered rather than leaving the bit unaccounted for.
     let task_id = raw_id >> DEFINE_TASK_ID_SHIFT;
+    let kernel_task = raw_id & 1 != 0;
     if !state.define_task(task_id, length, dir) || task_id as usize >= state.tasks.len() {
         return;
     }
@@ -140,7 +146,8 @@ fn apply_define_task2<H: HostMemory + HostOps>(
     // as `tid=` and the directory as `dir=`, and a key printed twice in one line
     // is a field every log reader resolves arbitrarily.
     crate::observe::off(format!(
-        "define_task {site} raw={raw_id:#x} len={length:#x} page_shift={} {walk}",
+        "define_task {site} raw={raw_id:#x} kernel={} len={length:#x} page_shift={} {walk}",
+        kernel_task as u8,
         state.page_shift
     ));
 }

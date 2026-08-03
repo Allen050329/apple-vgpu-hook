@@ -156,102 +156,32 @@ fn find_covering_view(
     })
 }
 
-/// The wire task word names two live tasks at once, and only one can be meant.
-///
-/// `DefineTask2` (op `0x38`) registers a task under `raw_id >> 1`
-/// ([`crate::model::DEFINE_TASK_ID_SHIFT`]), while `DeleteTask` (`0x20`),
-/// `SetObjectList` (`0x33`), `MapMemory2` (`0x39`), `UnmapMemory` (`0x22`),
-/// `DeleteObject` (`0x25`) and `CursorGlyph` (`0x04`) read a task word at the
-/// same payload offset **unshifted**. Nothing decodes that word canonically.
-///
-/// Measured on the x86/Vulkan rail: the `DefineTask2` raw words are `0x1`, `0x2`,
-/// `0x4`, `0x6`, `0x8` for slots 0–4, so the wire form is `(slot << 1) | flag`
-/// and the low bit is a flag the crate discards rather than decodes. Every other
-/// opcode then names the slot directly. Slots run densely from 0 upward, so for
-/// almost any wire id `n`, slot `n >> 1` is **also live**.
-///
-/// That is what makes the collision structural rather than incidental, and it is
-/// why this is a census and not a refusal: the walk takes the wire id, which on a
-/// healthy boot is the right answer. What the reading rules out is the safety
-/// argument for ever preferring `n >> 1` — a fallback to it could not fail
-/// loudly, because it would always find a live slot to land on.
-///
-/// Ambiguity is a property of `tasks[]` at the instant of the walk, so it is read
-/// from the table rather than counted from events: a count of aliased *walks*
-/// would say how often a fallback ran, never whether the namespace collided.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum TaskWalkAmbiguity {
-    /// The wire id and `id >> 1` both name live tasks.
-    BothSlotsLive,
-}
-
-impl crate::observe::Decline for TaskWalkAmbiguity {
-    fn slug(&self) -> &'static str {
-        match self {
-            Self::BothSlotsLive => "task_walk_ambiguous",
-        }
-    }
-}
-
-/// Record that the wire word named two live slots, latched per `(named, other)`.
-///
-/// Latched rather than counted because the pair is the identity that matters and
-/// the first sighting is timestamped — a boot that drives several stages gets a
-/// set difference between them for free. The discriminant is built from the two
-/// ids alone: both are stable identities, not accumulators, so this cannot
-/// repeat the reverted witness whose discriminator read a counter that many
-/// events advanced.
-///
-/// The latch is taken *before* the line is built, not by `fail_once` after it.
-/// This sits inside the resolver every guest read and write goes through, and
-/// `Emit::field` renders eagerly — building and dropping two `String`s per walk
-/// would make the probe cost scale with the traffic it is measuring.
-fn note_task_walk_ambiguity(named: u32, other: u32) {
-    use crate::observe::Decline;
-    let amb = TaskWalkAmbiguity::BothSlotsLive;
-    let discriminant = (u64::from(named) << 32) | u64::from(other);
-    if !crate::observe::first_sight(amb.slug(), discriminant) {
-        return;
-    }
-    crate::observe::Emit::decline("task_walk", &amb)
-        .field("named", named)
-        .field("other", other)
-        .fail();
-}
-
 /// Resolve which task slot to walk. **The wire id, or nothing.**
 ///
-/// This used to fall back to `task_id >> 1` when the named slot was not live.
-/// That arm was measured over a full x86/Vulkan boot (wiki, apple.com, a drag,
-/// 660 s idle) and **decided zero times**, while the ambiguity census fired for
-/// six distinct wire ids — so the premise the fallback rested on, that only one
-/// of the two slots is ever live, is false.
+/// The wire id is the slot id. Only `DefineTask2` (`0x38`) carries the doubled
+/// form — it registers under `raw >> 1`
+/// ([`crate::model::DEFINE_TASK_ID_SHIFT`]) — and every other opcode names the
+/// slot directly, so `task_id >> 1` is never the intended task and this does not
+/// consider it.
 ///
-/// Both readings point the same way. Dead, it costs nothing to remove. Live, it
-/// could not have failed safely: slots run densely from 0, so `task_id >> 1` is
-/// almost always some *other* live task, and the fallback would have walked that
-/// task's page tables rather than refusing. On a read that returns another task's
-/// bytes; on a write it puts host bytes at a GPA the named task does not own.
+/// That used to be an open question, hedged with a fallback to `task_id >> 1`
+/// and then with a census counting how often both slots were live. It is closed:
+/// the `DefineTask2` wire space is `(slot << 1) | is_kernel_task`, which
+/// contains exactly one odd word — `0x1`, the kernel task, whose id is 0 — and
+/// is otherwise strictly even. The words the other opcodes were measured
+/// receiving include `0x5`, `0x7` and `0x9`, all odd and all greater than one,
+/// so they cannot be `DefineTask2` words and are slot ids. Two live slots are
+/// therefore not an ambiguity, only a dense table, and there is nothing left for
+/// a census to decide.
 ///
-/// Returning `None` instead is what makes that case visible: the callers turn it
-/// into a typed, always-on refusal (`MemError::NoSuchTask`) rather than a
-/// plausible wrong answer nothing can see.
+/// A word naming no live slot still refuses rather than landing on a neighbour:
+/// slots run densely from 0, so `task_id >> 1` is almost always some *other*
+/// live task, and walking it would return that task's bytes on a read and put
+/// host bytes at a GPA the named task does not own on a write. Callers turn the
+/// `None` into a typed, always-on refusal (`MemError::NoSuchTask`).
 fn resolve_task_for_walk(tasks: &[TaskEntry], task_id: u32) -> Option<(u32, &TaskEntry)> {
-    let shifted = task_id >> 1;
-    let shifted_live = shifted != task_id
-        && (shifted as usize) < tasks.len()
-        && tasks[shifted as usize].active
-        && tasks[shifted as usize].directory_pfn != 0;
-    if (task_id as usize) < tasks.len() {
-        let t = &tasks[task_id as usize];
-        if t.active && t.directory_pfn != 0 {
-            if shifted_live {
-                note_task_walk_ambiguity(task_id, shifted);
-            }
-            return Some((task_id, t));
-        }
-    }
-    None
+    let t = tasks.get(task_id as usize)?;
+    (t.active && t.directory_pfn != 0).then_some((task_id, t))
 }
 
 /// Collect one GPA per guest page covering `[gva, gva+length)` under the task PT.
@@ -1379,21 +1309,16 @@ mod tests {
         );
     }
 
-    /// A wire task word that names two live tasks at once is not resolvable
-    /// from the wire, and the walk silently prefers one of them.
+    /// A live `task_id >> 1` is a dense task table, not a second reading of the
+    /// word, and must not perturb the walk.
     ///
-    /// `DefineTask2` registers under `raw >> 1` while the opcodes that later
-    /// name the task read it unshifted, so slot `n` and slot `n >> 1` can both
-    /// be live. When they are, a write naming `n` translates through slot `n`'s
-    /// page tables — and a guest that meant `n >> 1` has its bytes written into
-    /// a different task's address space.
-    ///
-    /// Ids 9 and 4 rather than 2 and 1: the emission is latched per
-    /// `(slug, named, resolved)` for the life of the process, so a pair that
-    /// another test in this binary also walks would make this test pass or fail
-    /// on ordering.
+    /// Only `DefineTask2` carries the doubled form; the opcodes that later name
+    /// a task carry slot ids. So with slots 9 and 4 both live, a write naming 9
+    /// walks slot 9 — silently, because there is nothing to report. This used to
+    /// emit a `task_walk_ambiguous` census on the reading that 4 might be what
+    /// the guest meant.
     #[test]
-    fn ambiguous_task_word_is_named_when_both_slots_are_live() {
+    fn a_live_shifted_slot_does_not_perturb_the_walk() {
         let page_shift = PAGE_SHIFT_X86;
         let (mut host, _root_gpa, _data0, _data1, page) = pt_fixture(page_shift);
         let mut state = state_x86();
@@ -1402,19 +1327,9 @@ mod tests {
         let before = log_mark();
         assert!(write_span_within(&mut state, &mut host, 9, 8, &[1, 2, 3, 4], None).is_ok());
         let tail = log_tail(before);
-        let line = tail
-            .lines()
-            .find(|l| l.contains("task_walk "))
-            .expect("a walk whose wire word names two live tasks is always-on");
         assert!(
-            line.contains("reason=task_walk_ambiguous"),
-            "both slots live must read as ambiguous, not as the ordinary \
-             fallback: {line}"
-        );
-        assert!(
-            line.contains("named=9") && line.contains("other=4"),
-            "the line must name the wire id and the slot that collided with it, \
-             since the walk always takes the wire id: {line}"
+            !tail.contains("task_walk "),
+            "two live slots are an ordinary table, so the walk must say nothing: {tail}"
         );
     }
 
