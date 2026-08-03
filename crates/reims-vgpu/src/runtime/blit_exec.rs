@@ -1095,9 +1095,16 @@ use gva_mem::dest_window;
 /// first row to last, so a level, slice or plane stride this bound does not
 /// model cannot place a row outside the set it authorises.
 ///
-/// `None` for a type-11 texture: that write goes through the mapping rail,
+/// `Ok(None)` for a type-11 texture: that write goes through the mapping rail,
 /// authorised by the page list the guest declared for the mapping. Walking a
 /// GVA span for it would bound the wrong address space.
+///
+/// Every other way this can fail to produce a bound is an `Err`, never a
+/// `None`. `None` reaches [`write_texture_row`] as "authorised by the command",
+/// so an arithmetic failure answered with `None` would *widen* the write from
+/// the region the guest named to the whole address space — the opposite of what
+/// failing to measure that region should do. The geometry here is the copy the
+/// command decoded; if it does not resolve, the command does not execute.
 #[allow(
     clippy::too_many_arguments,
     reason = "the window mirrors the copy region the row loop walks"
@@ -1114,19 +1121,36 @@ fn texture_region_window<M: HostMemory>(
     copy_h: u64,
     copy_d: u64,
     bpp: u32,
-) -> Option<std::collections::HashSet<u64>> {
+) -> Result<Option<std::collections::HashSet<u64>>, BlitStatus> {
     let TextureBacking::Linear(t) = tex else {
-        return None;
+        return Ok(None);
     };
-    let first = t.texel_offset(ox, oy, oz)?;
-    let last = t.texel_offset(
-        ox,
-        oy.checked_add(copy_h.checked_sub(1)?)?,
-        oz.checked_add(copy_d.checked_sub(1)?)?,
-    )?;
-    let row_bytes = (copy_w as u64).checked_mul(bpp as u64)?;
-    let span = last.checked_add(row_bytes)?.checked_sub(first)?;
-    dest_window(state, host, task_id, t.base_gva.checked_add(first)?, span)
+    // An empty extent authorises no page, which is exact: every caller's row
+    // loop is `for z in 0..copy_d { for y in 0..copy_h`, so it writes nothing.
+    let (Some(last_row), Some(last_plane)) = (copy_h.checked_sub(1), copy_d.checked_sub(1)) else {
+        return Ok(Some(std::collections::HashSet::new()));
+    };
+    let oob = |slug| br(BlitStatus::Bounds, slug);
+    let first = t
+        .texel_offset(ox, oy, oz)
+        .ok_or_else(|| oob("tex_window_first_texel_oob"))?;
+    let last = oy
+        .checked_add(last_row)
+        .zip(oz.checked_add(last_plane))
+        .and_then(|(y, z)| t.texel_offset(ox, y, z))
+        .ok_or_else(|| oob("tex_window_last_texel_oob"))?;
+    let row_bytes = (copy_w as u64)
+        .checked_mul(bpp as u64)
+        .ok_or_else(|| oob("tex_window_row_bytes_overflow"))?;
+    let span = last
+        .checked_add(row_bytes)
+        .and_then(|end| end.checked_sub(first))
+        .ok_or_else(|| oob("tex_window_span_overflow"))?;
+    let base = t
+        .base_gva
+        .checked_add(first)
+        .ok_or_else(|| oob("tex_window_base_overflow"))?;
+    Ok(dest_window(state, host, task_id, base, span))
 }
 
 /// Highest byte offset past `base` a strided plane/row walk reaches.
@@ -1568,7 +1592,7 @@ fn copy_buffer_texture_rows_aspect<M: HostMemory + HostOps>(
     let allowed = if to_texture {
         texture_region_window(
             state, host, task_id, tex, tex_ox, tex_oy, tex_oz, copy_w, copy_h, copy_d, storage_bpp,
-        )
+        )?
     } else {
         let span = strided_span(
             plane_row as u64,
@@ -1901,9 +1925,12 @@ fn exec_copy_buffer_to_texture<M: HostMemory + HostOps>(
     }
     // `None` for the type-11 destination this arm is for, which the mapping rail
     // authorises instead; a linear destination reaching here is still bounded.
-    let allowed = texture_region_window(
+    let allowed = match texture_region_window(
         state, host, task_id, &dst, ox, oy, oz, copy_w as u32, copy_h, copy_d, copy_bpp,
-    );
+    ) {
+        Ok(v) => v,
+        Err(st) => return st,
+    };
     let mut row = vec![0u8; row_bytes as usize];
     for z in 0..copy_d {
         for y in 0..copy_h {
@@ -2261,7 +2288,7 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
         let mut plane = vec![0u8; plane_row];
         let mut src_packed = vec![0u8; (copy_w as usize).saturating_mul(src_storage as usize)];
         let mut dst_packed = vec![0u8; (copy_w as usize).saturating_mul(dst_storage as usize)];
-        let allowed = texture_region_window(
+        let allowed = match texture_region_window(
             state,
             host,
             task_id,
@@ -2276,7 +2303,10 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
             // `dst_storage` row, the other a `copy_bpp` plane row. The window
             // has to cover whichever runs, so it is measured on the wider.
             dst_storage.max(copy_bpp),
-        );
+        ) {
+            Ok(v) => v,
+            Err(st) => return st,
+        };
         for z in 0..copy_d {
             for y in 0..copy_h {
                 if repack_src {
@@ -2485,9 +2515,12 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
         };
     }
     // Mixed or type-11↔type-11: stage rows.
-    let allowed = texture_region_window(
+    let allowed = match texture_region_window(
         state, host, task_id, &dst, dox, doy, doz, copy_w as u32, copy_h, copy_d, copy_bpp,
-    );
+    ) {
+        Ok(v) => v,
+        Err(st) => return st,
+    };
     let mut row = vec![0u8; row_bytes as usize];
     for z in 0..copy_d {
         for y in 0..copy_h {
@@ -2748,8 +2781,12 @@ fn exec_copy_texture_to_texture_slice_level<M: HostMemory + HostOps>(
                 return br(BlitStatus::Bounds, "sl_inner_dim_mismatch");
             }
             let mut row = vec![0u8; row_bytes as usize];
-            let allowed =
-                texture_region_window(state, host, task_id, &dst, 0, 0, 0, w, h as u64, 1, bpp);
+            let allowed = match texture_region_window(
+                state, host, task_id, &dst, 0, 0, 0, w, h as u64, 1, bpp,
+            ) {
+                Ok(v) => v,
+                Err(st) => return st,
+            };
             for y in 0..h as u64 {
                 if let Err(st) =
                     read_texture_row(state, host, task_id, &src, 0, 0, 0, y, row_bytes, &mut row)
@@ -3963,6 +4000,59 @@ mod tests {
         t1.slice_index = 2;
         // + 2 * 64 slice stride
         assert_eq!(t1.texel_offset(1, 2, 0), Some(0x124 + 128));
+    }
+
+    /// Geometry this device cannot measure must refuse the copy, never hand the
+    /// row loop the `None` that means "authorised by the command".
+    ///
+    /// `write_texture_row` consults `allowed` only when it is `Some`, so a
+    /// `None` produced by arithmetic that overflowed widens the write from the
+    /// region the guest named to every page the task can reach. Before this was
+    /// a `Result` the whole ladder answered `None`, so the wider write was also
+    /// the silent one: it reached no counter, because every early return
+    /// happened before `dest_window` — the only thing that reports here — was
+    /// ever called.
+    #[test]
+    fn an_unmeasurable_copy_region_refuses_rather_than_writing_unbounded() {
+        let (host, state) = blit_device();
+        let level = |row_stride: u64| LinearTextureLevel {
+            base_gva: 0x1000,
+            alloc_size: 0x1000,
+            level_offset: 0,
+            row_stride,
+            slice_stride: 0,
+            slice_index: 0,
+            width: 4,
+            height: 1,
+            depth: 1,
+            bpp: 4,
+            pixel_format: MTL_FORMAT_RGBA8_UNORM,
+        };
+
+        // Row 0 resolves and row 7's `y * row_stride` does not, which is the
+        // case that matters: the loop would have written its way up to the bad
+        // row before anything noticed.
+        let tex = TextureBacking::Linear(level(1 << 62));
+        clear_blit_fail_reason();
+        assert_eq!(
+            texture_region_window(&state, &host, 1, &tex, 0, 0, 0, 4, 8, 1, 4),
+            Err(BlitStatus::Bounds),
+            "an overflowing region must refuse the copy"
+        );
+        assert_eq!(
+            blit_fail_reason(),
+            "tex_window_last_texel_oob",
+            "the refusal must name itself on the always-on failure channel"
+        );
+
+        // A zero extent is not a failure: the row loops are `0..copy_d` /
+        // `0..copy_h`, so they write nothing and no page is authorised.
+        let tex = TextureBacking::Linear(level(16));
+        assert_eq!(
+            texture_region_window(&state, &host, 1, &tex, 0, 0, 0, 4, 0, 1, 4),
+            Ok(Some(std::collections::HashSet::new())),
+            "an empty copy authorises no page"
+        );
     }
 
     #[test]
