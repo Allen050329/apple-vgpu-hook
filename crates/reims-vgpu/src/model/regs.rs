@@ -686,18 +686,9 @@ mod tests {
     /// up.
     #[test]
     fn the_abi_header_agrees_on_the_scanout_bound() {
-        const HEADER: &str = include_str!("../../include/reims_vgpu_qemu_abi.h");
-        let define = HEADER
-            .lines()
-            .find_map(|l| l.strip_prefix("#define REIMS_VGPU_MAX_SCANOUT_DIM "))
-            .expect("the shared ABI header must define REIMS_VGPU_MAX_SCANOUT_DIM");
-        let value: u32 = define
-            .trim()
-            .trim_end_matches('u')
-            .parse()
-            .expect("REIMS_VGPU_MAX_SCANOUT_DIM must be a plain decimal literal");
         assert_eq!(
-            value, MAX_SCANOUT_DIM,
+            crate::qemu::abi::header_define("REIMS_VGPU_MAX_SCANOUT_DIM"),
+            MAX_SCANOUT_DIM,
             "the QEMU shims bound guest geometry against the header's value; \
              it has drifted from the Rust constant that owns the bound"
         );

@@ -1275,48 +1275,112 @@ pub fn device_pop_action(id: u64) -> Option<ReimsVgpuHostAction> {
     d.actions.pop_front().map(ReimsVgpuHostAction::from)
 }
 
-/// Early-boot console re-pull target: `(mapping_id, width, height, generation)`.
+/// Which source owns the host console right now.
 ///
-/// `None` after the first present boundary (`frame_flush_seen`) or when no
-/// compositor front mapping has been written yet.
-pub fn device_early_scanout_target(id: u64) -> Option<(u32, u32, u32, u32)> {
-    let slot = device_slot(id)?;
-    // Monotonic boundary gate (same rule the x86 PCI shim applies to the BAR1
-    // GOP overlay): once the compositor has presented, the early console feed
-    // never returns. `early_scanout_target`'s own `frame_flush_seen` check is
-    // NOT monotonic — a flush-less (ClearOnly) present clears it, and on the
-    // arm64 MMIO console that re-armed this early paint mid-session, flickering
-    // stale pre-boundary GOP content (Apple logo at the old geometry) against
-    // live product presents.
-    if slot.present_boundary_seen.load(Ordering::Acquire) {
-        return None;
+/// The three arms are exhaustive and ordered: see [`device_console_feed`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsoleFeed {
+    /// BAR1 UEFI GOP, or the guest-programmed `efi_fb_start` when it has one.
+    Firmware,
+    /// A latched same-geometry early front writeback — the Apple logo and
+    /// progress pill, before the compositor's first present.
+    Early {
+        mapping_id: u32,
+        width: u32,
+        height: u32,
+        generation: u32,
+    },
+    /// The compositor has presented; product present owns the console.
+    Product,
+}
+
+impl ConsoleFeed {
+    /// The `REIMS_VGPU_CONSOLE_FEED_*` discriminant the QEMU shims switch on.
+    /// Must match `include/reims_vgpu_qemu_abi.h`; see
+    /// `the_abi_header_agrees_on_the_console_feed_kinds`.
+    pub fn kind(&self) -> u32 {
+        match self {
+            Self::Firmware => 0,
+            Self::Early { .. } => 1,
+            Self::Product => 2,
+        }
     }
-    let d = slot.inner.try_lock()?;
-    runtime::scanout::early_scanout_target(&d.device.state)
 }
 
-/// True after the first product present boundary (`frame_flush_seen` / DisplaySwap).
+/// The whole console-ownership decision, from protocol state only.
 ///
-/// QEMU uses this to stop overlaying BAR1 UEFI GOP onto the host console — only
-/// after the compositor owns scanout, not on the first early logo writeback.
-/// The published value is monotonic and lock-free so worker contention cannot
-/// masquerade as a return to the early-console feed.
-pub fn device_present_boundary_seen(id: u64) -> Option<bool> {
+/// **Not** content, sparsity, boot stage, or any screenshot heuristic.
+///
+/// Both QEMU shims used to reach this answer themselves, by calling
+/// `present_boundary_seen` and `early_scanout_target` and branching on the pair.
+/// That put the rule in C twice over, beside a third copy here
+/// ([`host_console_uses_bar1`], which the host-window pump uses) whose doc
+/// admitted as much — it said "shipped C mirrors this". Three copies of one
+/// display-ownership rule is three chances for a pathway to disagree about who
+/// owns the screen. This is the one copy; the shims paint what it returns.
+///
+/// The boundary check is deliberately the **monotonic** latch and not
+/// `state.present.frame_flush_seen`. The latter is not monotonic — a flush-less
+/// (ClearOnly) present clears it — and on the arm64 MMIO console that re-armed
+/// the early paint mid-session, flickering stale pre-boundary GOP content (the
+/// Apple logo at the old geometry) against live product presents.
+///
+/// Returns `None` only when `id` names no device.
+pub fn device_console_feed(id: u64) -> Option<ConsoleFeed> {
     let slot = device_slot(id)?;
-    Some(slot.present_boundary_seen.load(Ordering::Acquire))
+    if slot.present_boundary_seen.load(Ordering::Acquire) {
+        return Some(ConsoleFeed::Product);
+    }
+    // A contended device is reported as `Firmware` rather than as an error: the
+    // caller is a display tick, the early console is the pre-boundary source by
+    // definition, and the alternative — failing the call — makes the shim invent
+    // a policy for "no answer", which is the thing being removed.
+    let Some(d) = slot.inner.try_lock() else {
+        return Some(ConsoleFeed::Firmware);
+    };
+    Some(
+        match runtime::scanout::early_scanout_target(&d.device.state) {
+            // `Early` guarantees a paintable target, so the shims do not re-test
+            // the geometry — both used to, which is a decode rule living in C.
+            // A zero here is not a target, it is the absence of one.
+            Some((mapping_id, width, height, generation))
+                if mapping_id != 0 && width != 0 && height != 0 =>
+            {
+                ConsoleFeed::Early {
+                    mapping_id,
+                    width,
+                    height,
+                    generation,
+                }
+            }
+            _ => ConsoleFeed::Firmware,
+        },
+    )
 }
 
-/// Host-console feed decision (shipped C mirrors this).
+/// [`ConsoleFeed::Firmware`], for a caller that already holds device state.
 ///
-/// Host-console feed selection from **protocol state only** (not content).
+/// From **protocol state only** — not content, sparsity, boot stage, or any
+/// screenshot heuristic:
 ///
-/// - `frame_flush_seen` (DisplaySwap / x86 present): product owns console.
-/// - Else if `early_front_latched` (same-geom type-11 front writeback latched
-///   for `early_scanout_target`): product early paint (logo+pill pre-swap).
+/// - `frame_flush_seen` (DisplaySwap / x86 present): product owns the console.
+/// - Else if `early_front_latched` (same-geom type-11 front writeback): the
+///   product early paint, logo + pill, before the swap.
 /// - Else: BAR1 / guest-programmed `efi_fb_start` (UEFI + PE log console).
 ///
-/// **Not** content, sparsity, boot-stage, or screenshot heuristics.
-/// See early-boot + `reims-vgpu-pci` gfx_update.
+/// This doc used to say "shipped C mirrors this", and it did — that mirroring is
+/// what [`device_console_feed`] removed, so the QEMU shims now ask rather than
+/// reconstruct. What is left here is not a second copy of the rule for them; it
+/// is the form the host-window early pump needs, which runs inside the drain
+/// with `&DeviceState` in hand and so cannot take `device_console_feed`'s
+/// by-id, lock-free path.
+///
+/// The two are deliberately **not** identical, and the difference is the
+/// `frame_flush_seen` argument: `device_console_feed` reads the monotonic
+/// boundary latch instead, because a flush-less (ClearOnly) present clears
+/// `frame_flush_seen` and a console that re-armed on that flickered stale
+/// pre-boundary content. This predicate takes whatever its caller passes, and
+/// its caller passes the non-monotonic flag.
 #[inline]
 pub fn host_console_uses_bar1(frame_flush_seen: bool, early_front_latched: bool) -> bool {
     !frame_flush_seen && !early_front_latched
@@ -1679,14 +1743,10 @@ mod tests {
         assert!(!host_console_uses_bar1(true, true));
 
         let id = device_create(None, PAGE_SHIFT_ARM64E).expect("create");
-        assert_eq!(device_present_boundary_seen(id), Some(false));
-        assert!(host_console_uses_bar1(
-            device_present_boundary_seen(id).unwrap(),
-            false
-        ));
+        assert_eq!(device_console_feed(id), Some(ConsoleFeed::Firmware));
 
-        // Present bookkeeping without boundary must not leave BAR1 by itself —
-        // only frame_flush_seen or early_front_latched.
+        // Present bookkeeping without boundary must not leave the firmware feed
+        // by itself — only frame_flush_seen or an early front latch.
         {
             let slot = device_slot(id).expect("device");
             let mut d = slot.inner.lock();
@@ -1695,10 +1755,7 @@ mod tests {
             d.device.state.present.height = 1080;
             d.device.state.present.present_mapping = 3;
         }
-        assert_eq!(device_present_boundary_seen(id), Some(false));
-        assert!(host_console_uses_bar1(false, false));
-        // Early latch (protocol) leaves BAR1 before DisplaySwap.
-        assert!(!host_console_uses_bar1(false, true));
+        assert_eq!(device_console_feed(id), Some(ConsoleFeed::Firmware));
 
         {
             let slot = device_slot(id).expect("device");
@@ -1706,12 +1763,35 @@ mod tests {
             d.device.state.present.frame_flush_seen = true;
             publish_present_boundary(&slot, d.device.state.present.frame_flush_seen);
         }
-        assert_eq!(device_present_boundary_seen(id), Some(true));
-        assert!(!host_console_uses_bar1(
-            device_present_boundary_seen(id).unwrap(),
-            false
-        ));
+        assert_eq!(device_console_feed(id), Some(ConsoleFeed::Product));
         assert!(device_destroy(id));
+    }
+
+    /// The kinds the shims switch on are a wire contract, not an internal
+    /// numbering: a shim built against a header whose `_EARLY` is 1 and a
+    /// staticlib whose `Early` is 2 would paint the firmware framebuffer for the
+    /// whole boot and report nothing. Nothing else compares the two.
+    #[test]
+    fn the_abi_header_agrees_on_the_console_feed_kinds() {
+        use crate::qemu::abi::header_define as define;
+        assert_eq!(
+            define("REIMS_VGPU_CONSOLE_FEED_FIRMWARE"),
+            ConsoleFeed::Firmware.kind()
+        );
+        assert_eq!(
+            define("REIMS_VGPU_CONSOLE_FEED_EARLY"),
+            ConsoleFeed::Early {
+                mapping_id: 1,
+                width: 1,
+                height: 1,
+                generation: 1,
+            }
+            .kind()
+        );
+        assert_eq!(
+            define("REIMS_VGPU_CONSOLE_FEED_PRODUCT"),
+            ConsoleFeed::Product.kind()
+        );
     }
 
     #[test]
@@ -1720,23 +1800,28 @@ mod tests {
         let slot = device_slot(id).expect("device");
         let inner = slot.inner.lock();
 
-        assert_eq!(device_present_boundary_seen(id), Some(false));
+        // The lock is held for all of this. Before the boundary the answer is
+        // `Firmware` — the contended device reports the pre-boundary source
+        // rather than an error, because the caller is a display tick and making
+        // it invent a policy for "no answer" is what moving the rule here
+        // removes.
+        assert_eq!(device_console_feed(id), Some(ConsoleFeed::Firmware));
         publish_present_boundary(&slot, true);
         assert_eq!(
-            device_present_boundary_seen(id),
-            Some(true),
+            device_console_feed(id),
+            Some(ConsoleFeed::Product),
             "QEMU refresh must read the boundary while the worker owns device state"
         );
         publish_present_boundary(&slot, false);
         assert_eq!(
-            device_present_boundary_seen(id),
-            Some(true),
-            "the per-boot product-console boundary must not regress to BAR1"
+            device_console_feed(id),
+            Some(ConsoleFeed::Product),
+            "the per-boot product-console boundary must not regress to firmware"
         );
 
         drop(inner);
         assert!(device_reset(id));
-        assert_eq!(device_present_boundary_seen(id), Some(false));
+        assert_eq!(device_console_feed(id), Some(ConsoleFeed::Firmware));
         assert!(device_destroy(id));
     }
 

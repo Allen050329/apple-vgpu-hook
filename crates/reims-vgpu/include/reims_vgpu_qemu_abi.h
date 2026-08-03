@@ -21,7 +21,13 @@
 extern "C" {
 #endif
 
-/* v13: ReimsVgpuHostOps.guest_written_pages — the per-page form of v12's
+/* v14: reims_vgpu_qemu_console_feed replaces reims_vgpu_qemu_present_boundary_seen
+ *      and reims_vgpu_qemu_early_scanout_target. The shims took the old pair
+ *      together and branched on it, so the console-ownership rule lived in C
+ *      twice over. It is product policy; a thin shim does not hold one. Both old
+ *      symbols are removed rather than kept — a shim that can still assemble its
+ *      own answer will eventually do so again.
+ * v13: ReimsVgpuHostOps.guest_written_pages — the per-page form of v12's
  *      generation. The generation says a surface's pages moved; this says
  *      which, which is what a deferred writeback needs in order to land its
  *      frame without replacing the guest's own stores.
@@ -47,7 +53,7 @@ extern "C" {
  *     thread so IRQ pulses reach the guest mid-drain — ack fast).
  * v6: ReimsVgpuHostOps.is_ram_gpa (reject non-RAM PFNs on mapper / map_pages paths).
  * v5: ReimsVgpuQemuCreateInfo.guest_page_shift (12 = x86 Tahoe, 14 = arm64e). */
-#define REIMS_VGPU_QEMU_ABI_VERSION 13u
+#define REIMS_VGPU_QEMU_ABI_VERSION 14u
 
 #define REIMS_VGPU_QEMU_OK 0
 #define REIMS_VGPU_QEMU_ERR_ARGS 1
@@ -323,21 +329,35 @@ int reims_vgpu_qemu_device_poll(uint64_t handle);
 int reims_vgpu_qemu_device_pop_action(uint64_t handle, ReimsVgpuHostAction *out);
 
 /*
- * 1 if guest crossed first product present boundary (DisplaySwap /
- * frame_flush_seen). BAR1 UEFI GOP must keep driving the host console until
- * then — do not cut over on the first early logo writeback.
- * REIMS_VGPU_QEMU_OK fills *out_seen with 0 or 1.
+ * Which source owns the host console right now.
+ *
+ * This is the whole console-ownership decision, answered in one call, from
+ * protocol state only — never content, sparsity, boot stage or any screenshot
+ * heuristic. Rust decides; the shim paints what it is told and holds no rule of
+ * its own. Both shims previously rebuilt this three-way from two separate
+ * queries and their own branching, which made the rule exist twice in C and a
+ * third time in Rust (`host_console_uses_bar1`), free to drift apart.
  */
-int reims_vgpu_qemu_present_boundary_seen(uint64_t handle, uint32_t *out_seen);
+#define REIMS_VGPU_CONSOLE_FEED_FIRMWARE 0u /* BAR1 UEFI GOP / guest efi_fb */
+#define REIMS_VGPU_CONSOLE_FEED_EARLY 1u    /* latched early front; out_* valid */
+#define REIMS_VGPU_CONSOLE_FEED_PRODUCT 2u  /* compositor present owns the console */
 
 /*
- * Pre-boundary (logo + progress pill) scanout target for gfx_update re-pull.
- * REIMS_VGPU_QEMU_OK fills outs; REIMS_VGPU_QEMU_EMPTY after first present boundary or when
- * no compositor front mapping has been written yet.
+ * REIMS_VGPU_QEMU_OK fills *out_kind with one of the three above. The four
+ * geometry outs are filled only for _EARLY (the logo + progress pill front
+ * mapping to re-pull); they are left untouched otherwise, so a caller that only
+ * wants the kind may pass NULL for them.
+ *
+ * _FIRMWARE holds until the guest crosses the first product present boundary
+ * (DisplaySwap / frame_flush_seen) — the cutover is NOT the first early logo
+ * writeback. Once _PRODUCT is reported it never returns to either of the other
+ * two: the boundary is latched monotonically, because a flush-less (ClearOnly)
+ * present clears `frame_flush_seen` and re-arming the early paint on that
+ * flickers stale pre-boundary content against live presents.
  */
-int reims_vgpu_qemu_early_scanout_target(uint64_t handle, uint32_t *out_mapping_id,
-                                  uint32_t *out_width, uint32_t *out_height,
-                                  uint32_t *out_generation);
+int reims_vgpu_qemu_console_feed(uint64_t handle, uint32_t *out_kind,
+                                 uint32_t *out_mapping_id, uint32_t *out_width,
+                                 uint32_t *out_height, uint32_t *out_generation);
 
 /*
  * Fill a QEMU DisplaySurface (BGRA8, dst_stride bytes/row) from the guest
