@@ -1171,15 +1171,23 @@ fn record_type4_owner(state: &mut DeviceState, surface_id: u32, task_id: u32) {
 /// state keyed on that incarnation, and the next resolve re-walks the page table
 /// the guest has already rewritten.
 ///
-/// `object_id` is the resource's host id. A type-11 texture registers under
-/// `(task, ref)`; a type-4 surface *is* its mapping id. Both are tried, in that
-/// order, and which one answered is counted so the split stays legible.
+/// `object_id` is the mapping id, and is used as one directly.
+///
+/// It is not looked up in `texture_to_mapping` first. That map is keyed by the
+/// task object-list *ref*, and a ref and a surface id are different id spaces
+/// that collide — `blit_exec`'s type-5 resolve states the rule ("never the task
+/// object-list ref — those id spaces collide"). A ref-keyed lookup ahead of the
+/// direct reading would therefore silently misroute a packet naming surface `n`
+/// onto whatever mapping the same task has registered under ref `n`, and
+/// invalidate a surface the guest said nothing about while leaving the one it
+/// did name stale. Every observed packet resolves directly: 40 in a driven boot,
+/// all with `mid == object_id`, and the ref-keyed arm never answered.
+///
+/// A type-11 texture that is re-pointed is therefore not handled here yet, and
+/// that is deliberate — which id its packet would carry is not established, and
+/// guessing costs the packets that do arrive.
 pub fn replace_physical(state: &mut DeviceState, task_id: u32, object_id: u32) {
-    let (mapping_id, kind) = match state.texture_to_mapping.get(&(task_id, object_id)) {
-        Some(&mid) => (mid, "type11"),
-        None => (object_id, "type4"),
-    };
-    let had = state.invalidate_mapping_pages(mapping_id);
+    let had = state.invalidate_mapping_pages(object_id);
     crate::runtime::drain::note_store_route(if had {
         "replace_physical_dropped"
     } else {
@@ -1187,7 +1195,7 @@ pub fn replace_physical(state: &mut DeviceState, task_id: u32, object_id: u32) {
     });
     if had {
         crate::observe::off(format!(
-            "replace_physical task={task_id} object={object_id} mid={mapping_id} kind={kind} \
+            "replace_physical task={task_id} mid={object_id} \
              (guest re-pointed the backing; cached page list dropped)"
         ));
     }

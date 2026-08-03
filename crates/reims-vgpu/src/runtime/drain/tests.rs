@@ -432,6 +432,19 @@ fn replace_physical_drops_the_cached_page_list() {
     }
     let generation_before = state.mappings.get(&7).unwrap().map_generation;
 
+    // A type-11 texture registered under object-list *ref* 7 of the same task,
+    // naming a different mapping. Surface ids and object-list refs are separate
+    // id spaces that collide, so resolving this packet through the ref-keyed map
+    // would land on mapping 99 — invalidating a surface the guest never named
+    // and leaving stale the one it did.
+    state.map_surface(99);
+    {
+        let m = state.mappings.get_mut(&99).unwrap();
+        m.mapped = true;
+        m.page_entries = vec![0xaa];
+    }
+    state.texture_to_mapping.insert((0, 7), 99);
+
     let mut payload = vec![0u8; 8];
     payload[4..8].copy_from_slice(&7u32.to_le_bytes()); // {task 0, object 7}
     let pkt = Packet {
@@ -460,6 +473,12 @@ fn replace_physical_drops_the_cached_page_list() {
         m.map_generation, generation_before,
         "dropping the list must bump the incarnation, which is what retires the \
          type-4 walk latch and any state keyed on it"
+    );
+    assert_eq!(
+        state.mappings.get(&99).unwrap().page_entries,
+        vec![0xaa],
+        "the object id is a mapping id, not an object-list ref: a mapping that \
+         merely shares the ref must be left alone"
     );
 }
 
