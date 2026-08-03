@@ -178,6 +178,25 @@ already been run to exhaustion; re-running one costs hours and has so far return
   copy forms are distinguished by exact length rather than magnitude, variable-length records
   bounds-check before access, and every overflow path names its own `ErrBadLength` slug. Spend the
   next fidelity hour on `resource.rs` and the descriptor formats, not on re-reading these six.
+- **The descriptor-format half of that vein has now been mined, and it produced five fixes; do not
+  re-run it.** `objects.rs`'s three descriptor decoders and every consumer of them were audited for
+  the same shapes. What came back, all fixed: a blit resolving a type-5 view through the type-11
+  window helper and so dropping the wire plane index; the colour-RT resolve inventing BGRA8 over the
+  type-4 decoder's deliberate format-0 refusal; the type-4 freshness guard comparing width on the
+  arm that skips the rebuild and width+height on the arm that does not, with neither comparing
+  format; the single-plane device-descriptor arm decoding plane 0's offset and then not publishing
+  it; and the arm64 mapper narrowing the descriptor's format word with `& 0xffff`, which turns a
+  FourCC into a value nothing accepts.
+  Three things worth keeping from it. **The descriptor's `pixelFormat` word carries two encodings**
+  — an MTL ordinal when this device synthesized it, an OSType FourCC when the guest wrote it — and
+  they are separated by *width*, not magnitude: an ordinal fits in 16 bits by construction and a
+  FourCC cannot (`objects::device_desc_format_to_mtl`). **A format of 0 means different things on
+  different rails**: on a type-4 mapping it has one writer and is a refusal, so the RT resolve now
+  declines it; on a type-11 mapping it can mean "not latched yet" and BGRA8 is the display
+  contract's default there, which is why only one of those two arms changed. And **an audit that
+  groups sites by their shared code shape will over-group**: three of the five "invents BGRA8" sites
+  an audit reported were a page-count floor where over-estimating is safe, a different descriptor's
+  own format field, and a documented display default.
 - **The consumer side has now been swept too, and the vein there is *divergence between two arms
   that consume one wire form*.** `blit_exec`, `drain`, `exec`, `compute_exec`, `compute_session` and
   `metal_draw` (~30 000 lines, the clusters the earlier oracle sweep did not reach) were audited for
