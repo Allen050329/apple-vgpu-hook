@@ -1201,11 +1201,6 @@ pub fn materialize_metal_icb(
     Ok(icb)
 }
 
-#[cfg(feature = "backend-vulkan")]
-pub fn materialize_metal_icb(_desc: &IndirectCommandBufferDescriptor) -> Result<(), IcbStatus> {
-    Err(IcbStatus::NoMetal("icb_materialize_no_vulkan_path"))
-}
-
 // ---------------------------------------------------------------------------
 // Host ICB cache: (task_id, icb_ref) → filled Metal ICB + retained resources
 // ---------------------------------------------------------------------------
@@ -1504,6 +1499,7 @@ fn type1_buffer_gva_size<M: HostMemory + HostOps>(
         .ok_or(IcbStatus::Missing("icb_type1_no_backing"))
 }
 
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
 /// Convert absolute bind VA → offset into type-1 allocation (`handle << page_shift`).
 ///
 /// PGSerializer stores `base+offset` in the bind VA field (not a separate offset).
@@ -1529,6 +1525,7 @@ fn offset_from_wire_va<M: HostMemory + HostOps>(
     Ok(off)
 }
 
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
 /// Resolve wire VAs on a compute fill into type-1 bind offsets (mutates in place).
 pub fn resolve_compute_fill_offsets<M: HostMemory + HostOps>(
     state: &DeviceState,
@@ -1544,6 +1541,7 @@ pub fn resolve_compute_fill_offsets<M: HostMemory + HostOps>(
     Ok(())
 }
 
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
 /// Resolve wire VAs on a render fill into type-1 bind / index offsets (mutates in place).
 pub fn resolve_render_fill_offsets<M: HostMemory + HostOps>(
     state: &DeviceState,
@@ -2457,29 +2455,6 @@ pub fn fill_render_command<M: HostMemory + HostOps>(
 }
 
 #[cfg(feature = "backend-vulkan")]
-pub fn fill_render_command<M: HostMemory + HostOps>(
-    _state: &DeviceState,
-    _host: &M,
-    _task_id: u32,
-    _icb_ref: u32,
-    _fill: &IcbRenderFill,
-) -> Result<(), IcbStatus> {
-    Err(IcbStatus::NoMetal("icb_frc_no_vulkan_path"))
-}
-
-#[cfg(feature = "backend-vulkan")]
-pub fn fill_icb_from_command_memory<M: HostMemory + HostOps>(
-    _state: &DeviceState,
-    _host: &M,
-    _task_id: u32,
-    _icb_ref: u32,
-    _range_location: u64,
-    _range_length: u64,
-) -> Result<(), IcbStatus> {
-    Err(IcbStatus::NoMetal("icb_fill_no_vulkan_path"))
-}
-
-#[cfg(feature = "backend-vulkan")]
 pub fn resolve_metal_icb<M: HostMemory + HostOps>(
     _state: &DeviceState,
     _host: &M,
@@ -2747,17 +2722,6 @@ pub fn fill_compute_command<M: HostMemory + HostOps>(
     }
     entry.has_fills = true;
     Ok(())
-}
-
-#[cfg(feature = "backend-vulkan")]
-pub fn fill_compute_command<M: HostMemory + HostOps>(
-    _state: &DeviceState,
-    _host: &M,
-    _task_id: u32,
-    _icb_ref: u32,
-    _fill: &IcbComputeFill,
-) -> Result<(), IcbStatus> {
-    Err(IcbStatus::NoMetal("icb_fcc_no_vulkan_path"))
 }
 
 #[cfg(test)]

@@ -15,15 +15,16 @@ use crate::runtime::decode::resource::{
     ICB_DESC_MAX_FRAGMENT_BINDS, ICB_DESC_MAX_KERNEL_BINDS, ICB_DESC_MAX_VERTEX_BINDS,
     ICB_DESC_OPTIONS, ICB_FLAG_INHERIT_BUFFERS, ICB_LAYOUT_LEN,
     MTL_INDIRECT_CMD_CONCURRENT_DISPATCH, MTL_INDIRECT_CMD_DRAW, MTL_INDIRECT_CMD_DRAW_INDEXED,
-    OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_BUFFER, OBJECT_TYPE_TYPE7, PIPELINE_TAG_FRAGMENT_FUNC,
-    PIPELINE_TAG_VERTEX_FUNC, RESOURCE_PAGE_SHIFT, TYPE7_OBJECT_ICB, TYPE7_OBJECT_RENDER_PIPELINE,
+    OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_TYPE7, PIPELINE_TAG_FRAGMENT_FUNC, PIPELINE_TAG_VERTEX_FUNC,
+    RESOURCE_PAGE_SHIFT, TYPE7_OBJECT_ICB, TYPE7_OBJECT_RENDER_PIPELINE,
 };
-/// Compute-pipeline descriptor constants, used only by the Metal-arm
-/// execute tests below. Kept in their own gated `use` so the Vulkan arm
+/// Compute-pipeline and buffer-object descriptor constants, used only by the
+/// Metal-arm execute tests below. Kept in their own gated `use` so the Vulkan arm
 /// does not carry unused imports.
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 use crate::runtime::decode::resource::{
-    OBJECT_TYPE_FUNCTION, PIPELINE_TAG_KERNEL_FUNC, TYPE7_FIRST_TLVS, TYPE7_OBJECT_COMPUTE_PIPELINE,
+    OBJECT_TYPE_BUFFER, OBJECT_TYPE_FUNCTION, PIPELINE_TAG_KERNEL_FUNC, TYPE7_FIRST_TLVS,
+    TYPE7_OBJECT_COMPUTE_PIPELINE,
 };
 use crate::runtime::gva_mem;
 use crate::runtime::host::FakeHost;
@@ -606,6 +607,7 @@ fn make_mesh_render_pipeline_desc(
     b
 }
 
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn put_type1_buffer(
     host: &mut FakeHost,
     state: &DeviceState,
@@ -4548,6 +4550,7 @@ fn icb_argument_buffer_sample_and_write() {
     }
 }
 
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
 #[test]
 fn resolve_bind_offset_from_wire_va() {
     let (mut host, state) = icb_device();
