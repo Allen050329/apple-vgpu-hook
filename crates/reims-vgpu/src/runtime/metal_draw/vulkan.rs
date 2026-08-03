@@ -3215,6 +3215,15 @@ fn note_draw_coverage(
     } else {
         "draw_scissor_partial"
     });
+    // Into the union before the early return, and clamped to the target: a
+    // full-coverage draw is exactly the case that makes a pass's union total,
+    // so leaving it out would measure only the passes that were already cheap.
+    note_pass_scissor_rect(
+        x.min(target_w),
+        y.min(target_h),
+        sw.min(target_w),
+        sh.min(target_h),
+    );
     if covers || target_w == 0 || target_h == 0 {
         return;
     }
@@ -3282,14 +3291,174 @@ fn note_draw_coverage(
     let area = (sw as u64).saturating_mul(sh as u64);
     let full = (target_w as u64).saturating_mul(target_h as u64);
     let pct = area.saturating_mul(100) / full.max(1);
-    crate::runtime::drain::note_store_route(match pct {
-        0 => "draw_scissor_area_lt1",
-        1..=5 => "draw_scissor_area_le5",
-        6..=10 => "draw_scissor_area_le10",
-        11..=25 => "draw_scissor_area_le25",
-        26..=50 => "draw_scissor_area_le50",
-        _ => "draw_scissor_area_gt50",
-    });
+    crate::runtime::drain::note_store_route(DRAW_AREA_SLUGS[coverage_band(pct)]);
+}
+
+/// Which coverage band a percentage falls in, as an index.
+///
+/// Shared by the per-draw census and the per-pass union so the two are read
+/// against the same boundaries. Band 0 is *under* one percent rather than
+/// exactly one, because the percentage is integer-truncated.
+fn coverage_band(pct: u64) -> usize {
+    match pct {
+        0 => 0,
+        1..=5 => 1,
+        6..=10 => 2,
+        11..=25 => 3,
+        26..=50 => 4,
+        51..=99 => 5,
+        _ => 6,
+    }
+}
+
+/// Per-draw slugs. A draw that reaches this is partial by construction, so the
+/// top two bands are one `gt50` bucket rather than the union's `le99`/`full`
+/// split — "this draw covered everything" is already `draw_scissor_full`.
+const DRAW_AREA_SLUGS: [&str; 7] = [
+    "draw_scissor_area_lt1",
+    "draw_scissor_area_le5",
+    "draw_scissor_area_le10",
+    "draw_scissor_area_le25",
+    "draw_scissor_area_le50",
+    "draw_scissor_area_gt50",
+    "draw_scissor_area_gt50",
+];
+
+/// Per-pass slugs. `full` is split out from `le99` because a union of 100 % is
+/// the answer that decides the question: it is a window where bounding the
+/// flush by the guest's scissors would save nothing at all.
+const PASS_UNION_SLUGS: [&str; 7] = [
+    "pass_scissor_union_lt1",
+    "pass_scissor_union_le5",
+    "pass_scissor_union_le10",
+    "pass_scissor_union_le25",
+    "pass_scissor_union_le50",
+    "pass_scissor_union_le99",
+    "pass_scissor_union_full",
+];
+
+/// Union of the scissor rects drawn since the last render window was armed,
+/// packed as four 16-bit fields `x0 | y0<<16 | x1<<32 | y1<<48`.
+///
+/// `u64::MAX` is the empty sentinel, which is unambiguous because `x0 > x1`
+/// there and a real union always has `x0 <= x1`. Sixteen bits per field is the
+/// contract's own bound: `MAX_SCANOUT_DIM` is 8 192, so a coordinate cannot
+/// reach 16 bits and no clamping is needed.
+///
+/// A static rather than device state, for the same reason `note_store_route` is
+/// one: this is a census on the encode path, and threading a field through
+/// `exec`'s pass loop into the draw encoder to hold four numbers would put
+/// plumbing in the product path for an instrument.
+///
+/// **The window is "since the last arm", not "this pass".** Resetting at the
+/// arm rather than at a pass boundary is what makes it self-synchronising - it
+/// needs no hook in `exec` and cannot drift out of step with the thing it is
+/// measuring. The cost is that a pass which never arms a window folds its draws
+/// into the next union, so this **over**-estimates coverage. That is the safe
+/// direction: it under-states how much a bounded flush would save, so a
+/// promising reading here is not an artifact of the instrument.
+static PASS_SCISSOR_UNION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// Fold one draw's rect into the union above.
+fn note_pass_scissor_rect(x: u32, y: u32, w: u32, h: u32) {
+    use std::sync::atomic::Ordering;
+    let (x0, y0) = (x.min(u16::MAX as u32), y.min(u16::MAX as u32));
+    let x1 = x.saturating_add(w).min(u16::MAX as u32);
+    let y1 = y.saturating_add(h).min(u16::MAX as u32);
+    let mut cur = PASS_SCISSOR_UNION.load(Ordering::Relaxed);
+    loop {
+        let next = if cur == u64::MAX {
+            pack_rect(x0, y0, x1, y1)
+        } else {
+            let (cx0, cy0, cx1, cy1) = unpack_rect(cur);
+            pack_rect(cx0.min(x0), cy0.min(y0), cx1.max(x1), cy1.max(y1))
+        };
+        match PASS_SCISSOR_UNION.compare_exchange_weak(
+            cur,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return,
+            Err(seen) => cur = seen,
+        }
+    }
+}
+
+fn pack_rect(x0: u32, y0: u32, x1: u32, y1: u32) -> u64 {
+    (x0 as u64) | ((y0 as u64) << 16) | ((x1 as u64) << 32) | ((y1 as u64) << 48)
+}
+
+fn unpack_rect(v: u64) -> (u32, u32, u32, u32) {
+    (
+        (v & 0xffff) as u32,
+        ((v >> 16) & 0xffff) as u32,
+        ((v >> 32) & 0xffff) as u32,
+        ((v >> 48) & 0xffff) as u32,
+    )
+}
+
+/// Report the union of the scissors drawn into this window, and reset it.
+///
+/// Called where a deferred render window is armed, because that is where the
+/// question is answerable: the flush that lands this window will copy
+/// `width * height` texels, and this says how many of them the pass that
+/// produced it actually drew. A union of 100 % means bounding the copy by the
+/// guest's own scissors would save nothing for this window.
+///
+/// # It has been read, and the answer is no
+///
+/// A clean driven x86/Vulkan boot - 30 s Safari drag, two web-content probe
+/// runs, gate clean - over 17 696 armed windows:
+///
+/// ```text
+/// pass_scissor_union_lt1        0
+/// pass_scissor_union_le5       11
+/// pass_scissor_union_le10       2
+/// pass_scissor_union_le25       0
+/// pass_scissor_union_le50       0
+/// pass_scissor_union_le99       1
+/// pass_scissor_union_full  17 682     99.92 %
+/// ```
+///
+/// **Bounding the deferred render flush by the guest's own scissor rects would
+/// save nothing.** 99.92 % of windows come from a pass that drew the whole
+/// surface, so there is no smaller extent to copy. Do not build a damage-rect
+/// flush on the strength of the per-draw distribution above; this is the number
+/// that governs, and the two are consistent rather than in conflict.
+///
+/// The instrument agrees with its own inputs, which is why the reading is
+/// trustworthy: the boot runs 7 draws per armed window and 50 % of all draws
+/// are full-coverage, so a window escapes saturation only if all 7 of its draws
+/// are partial - `0.5^7` is 0.78 %, predicting ~99.2 % against the 99.92 %
+/// measured. The residual is draws clustering rather than being independent,
+/// plus this counter's own documented over-estimate.
+///
+/// **And the bounding box is not what kills it.** A union is a rectangle, so
+/// two small disjoint rects produce a large one, and a richer damage
+/// representation - a rect list, tiles - would score better here. It would not
+/// help: half of all individual draws cover the entire attachment on their own,
+/// and no representation makes a full-surface draw smaller. The saving is not
+/// hiding behind the approximation.
+///
+/// What this does not close is the rail's cost, which is real and is still the
+/// largest in the device. It closes one candidate repair. `flush_render_one`
+/// names the others.
+pub(super) fn note_pass_scissor_union(width: u32, height: u32) {
+    use std::sync::atomic::Ordering;
+    let packed = PASS_SCISSOR_UNION.swap(u64::MAX, Ordering::Relaxed);
+    if packed == u64::MAX || width == 0 || height == 0 {
+        return;
+    }
+    let (x0, y0, x1, y1) = unpack_rect(packed);
+    let union_area = (x1.saturating_sub(x0) as u64).saturating_mul(y1.saturating_sub(y0) as u64);
+    let full = (width as u64).saturating_mul(height as u64);
+    // The union is clamped to the surface: a scissor may legitimately exceed the
+    // attachment (Metal permits it; the rasteriser clips), and an unclamped
+    // ratio would then read over 100 % and make the census unreadable.
+    let pct = union_area.min(full).saturating_mul(100) / full.max(1);
+    crate::runtime::drain::note_store_route(PASS_UNION_SLUGS[coverage_band(pct)]);
 }
 
 /// Score a `MTLLoadActionLoad` colour attachment against whether a seed was
@@ -6242,6 +6411,10 @@ fn arm_surface_resident_store<M: HostMemory + HostOps>(
     width: u32,
     height: u32,
 ) -> Option<u32> {
+    // Before any early return below: the union belongs to the draws that just
+    // ran whether or not this arm goes on to succeed, and leaving it un-reset on
+    // a declined arm would fold this pass into the next window's reading.
+    note_pass_scissor_union(width, height);
     let identity = type11_store_identity(state, req, true)?;
     let key = prepare_surface_deferred_window(state, host, req, mapping_id, width, height)?;
     // The slot this arm pins and the slot the flush will look up have to be the
@@ -6898,6 +7071,63 @@ mod vulkan_split_tests {
             store_route_count("lin_rung_blank_with_host_entry"),
             blanks + 1
         );
+    }
+
+    /// The per-pass union must union, reset, and include full-coverage draws.
+    ///
+    /// Three properties, and each one is a way the instrument could read
+    /// promising while being wrong. If it did not union it would report the last
+    /// draw and make every pass look cheap. If it did not reset at the arm it
+    /// would accumulate across the whole boot and saturate at 100 %. And if it
+    /// skipped full-coverage draws - which take an early return in the per-draw
+    /// census - it would measure only the passes that were already cheap, which
+    /// is exactly the population whose answer does not matter.
+    #[test]
+    fn the_pass_scissor_union_unions_resets_and_counts_full_coverage_draws() {
+        use crate::runtime::drain::store_route_count;
+        // Drain any rect left by another test in this binary.
+        note_pass_scissor_union(1000, 1000);
+
+        // Two disjoint quarter-width strips: 20 % each, union 60 % because the
+        // bounding box spans them. A "last draw wins" accumulator says 20 %.
+        let n = store_route_count("pass_scissor_union_le99");
+        note_draw_coverage(0, 0, 200, 1000, 1000, 1000, None, false, false);
+        note_draw_coverage(400, 0, 200, 1000, 1000, 1000, None, false, false);
+        note_pass_scissor_union(1000, 1000);
+        assert_eq!(
+            store_route_count("pass_scissor_union_le99"),
+            n + 1,
+            "the union of two 20 % strips 400px apart is 60 %, not 20 %"
+        );
+
+        // The reset landed: a fresh single 4 % draw reads as 4 %, not 64 %.
+        let n = store_route_count("pass_scissor_union_le5");
+        note_draw_coverage(0, 0, 200, 200, 1000, 1000, None, false, false);
+        note_pass_scissor_union(1000, 1000);
+        assert_eq!(
+            store_route_count("pass_scissor_union_le5"),
+            n + 1,
+            "the arm must reset the union, or it saturates across passes"
+        );
+
+        // A full-coverage draw takes the per-draw early return but must still
+        // reach the union - it is the case that makes a pass unbounded.
+        let n = store_route_count("pass_scissor_union_full");
+        note_draw_coverage(0, 0, 40, 40, 1000, 1000, None, false, false);
+        note_draw_coverage(0, 0, 1000, 1000, 1000, 1000, None, false, false);
+        note_pass_scissor_union(1000, 1000);
+        assert_eq!(
+            store_route_count("pass_scissor_union_full"),
+            n + 1,
+            "a pass containing a full-coverage draw has a union of 100 %"
+        );
+
+        // An arm with no draws since the last one reports nothing at all,
+        // rather than reporting a stale or empty rect as a real reading.
+        let before: u64 = PASS_UNION_SLUGS.iter().map(|s| store_route_count(s)).sum();
+        note_pass_scissor_union(1000, 1000);
+        let after: u64 = PASS_UNION_SLUGS.iter().map(|s| store_route_count(s)).sum();
+        assert_eq!(before, after, "an empty union is not a reading");
     }
 
     /// The scissor-area buckets must score the fraction, not the extent.
