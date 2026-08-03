@@ -1297,11 +1297,26 @@ reading `0`, `3`, `23`, `10`, `0`, `0` across consecutive windows is that floor,
 not a free attribute walk. The censuses now accumulate nanoseconds and divide
 once at the window boundary; the numbers above predate the fix.
 
-What still stands is the shape of the question: `load_buffer_content` over
-vertex and fragment buffers is a large part of the column, and whether the
-attribute walk is a third cost or a rounding error is **open** until the split is
-read again on the fixed accumulator. `draw_phase`'s `stage_us` is still
-undivided.
+**Re-taken on the fixed accumulator, the conclusion holds and is now evidence.**
+Five driven one-second windows over 500 binds each, x86/PCI, host GPU P8, with
+`bind_phase` and `chain_phase` joined per window:
+
+```text
+binds   vertex_us   fragment_us   attrs_us   binds_us   accounted
+  735       15860         12394         98      29493       96.1 %
+  599       12041          7864         67      20635       96.8 %
+  871       13452          8323        116      22933       95.5 %
+  768       11031          6486         86      18259       96.4 %
+  514        9959          7071         73      17749       96.4 %
+```
+
+**95.5-96.8 % accounted, and the attribute walk is 0.11-0.14 µs a bind** —
+0.33-0.51 % of the column. So it is not zero, it never was, and it is still
+negligible: the truncating reading was right by accident and is now right on
+purpose. The column is `load_buffer_content` over vertex and fragment buffers,
+and the remaining ~3.5 % is the two shader `Arc` clones and the `BTreeSet`.
+Whatever is done here is done inside that one function. `draw_phase`'s
+`stage_us` is still undivided.
 
 The arithmetic that says whether the tier matters: 120 fps is 8.33 ms, run 4
 achieved 10.2 ms, and draws are 6.0 ms of that. So goal 6 needs about **2 ms a
