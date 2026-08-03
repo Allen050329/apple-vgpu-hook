@@ -779,14 +779,28 @@ const COMPUTE_STORAGE_REGISTRY_CAP: usize = 64;
 /// byte cap below is three orders of magnitude from being reached and has never
 /// fired. Over the same boot: 7264 identity hits, 976 content hits, 1657 misses.
 ///
-/// What that closes and what it does not. It closes "is there any capacity
-/// pressure at all": there is, and it is entirely this constant. It does **not**
-/// close whether the 1657 misses are that pressure — an eviction of an entry
-/// nothing asks for again costs nothing, and nothing here distinguishes a miss
-/// for evicted content from a miss for content never held. The A/B the
-/// frame-rate plan budgets for — raise this to 256, read
-/// `sampled_cache_misses` — is what answers that, and it is now licensed rather
-/// than speculative.
+/// **Raising it buys nothing, and that is measured rather than argued.** The
+/// same boot re-run at 256 — a 4x rise, same guest image, same `visual-gate`
+/// workload:
+///
+/// ```text
+///              misses  identity_hits  content_hits  evict_count  evict_byte
+///   cap  64      1657           7264           976         2436           0
+///   cap 256      1701           7302           963           67         658
+/// ```
+///
+/// Count-cap evictions fell 97 % and **the miss count did not move** — 1657
+/// against 1701, which is inside the run-to-run spread the hit columns show
+/// (7264/7302, 976/963, so the two workloads were comparable). The misses are
+/// therefore *content* the cache has never held, not capacity it was forced to
+/// drop, and no size of this constant reaches them.
+///
+/// Two things follow. The frame-rate plan's D1 lever — worth an estimated
+/// 0.42 ms/frame on the premise that the count cap was evicting live entries —
+/// is **dead**; its premise was half right and the half that mattered is false.
+/// And at 256 the byte cap starts binding instead (658 evictions against 0),
+/// so the headroom the plan read as unused is real only while the entry count
+/// is small.
 const SAMPLED_CACHE_CAP: usize = 64;
 const SAMPLED_CACHE_BYTE_CAP: usize = 128 * 1024 * 1024;
 /// Max recycled sampled slots retained per geometry key in `sampled_free`. A
