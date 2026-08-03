@@ -1521,66 +1521,6 @@ fn log_present_page_identity(state: &DeviceState, mapping: u32, w: u32, h: u32) 
     }
 }
 
-/// Always-on diagnostic: sample spread guest pages of the present-named
-/// surface and log BGRA-interpreted content stats.
-///
-/// Decides whether the guest itself writes frame content into the presented
-/// surface's own pages (the pages are pixel storage, so page bytes ARE
-/// decoded surface content). Bounded: at most 16 pages per present, logged
-/// only when the sampled stats change, capped per mapping. Never selects
-/// behavior.
-fn log_present_named_page_content<H: HostMemory + HostOps>(
-    state: &DeviceState,
-    host: &mut H,
-    mapping: u32,
-) {
-    use std::collections::HashMap;
-    use std::sync::Mutex;
-    type PageContentStats = (usize, u8, u32);
-    type PageContentByMapping = HashMap<u32, PageContentStats>;
-    static LAST: Mutex<Option<PageContentByMapping>> = Mutex::new(None);
-    const SAMPLE_PAGES: usize = 16;
-    const LOG_CAP_PER_MID: u32 = 32;
-    let Some(m) = state.mappings.get(&mapping) else {
-        return;
-    };
-    if m.page_entries.is_empty() {
-        return;
-    }
-    let n = m.page_entries.len();
-    let step = (n / SAMPLE_PAGES).max(1);
-    let page_size = state.page_size() as usize;
-    let mut buf = vec![0u8; page_size];
-    let mut rgb_nz = 0usize;
-    let mut max_rgb = 0u8;
-    let mut pages_read = 0usize;
-    for i in (0..n).step_by(step).take(SAMPLE_PAGES) {
-        let Some(gpa) =
-            crate::contract::iosurface_pages::entry_gpa_shift(m.page_entries[i], state.page_shift)
-        else {
-            continue;
-        };
-        if host.read_gpa(gpa, &mut buf).is_err() {
-            continue;
-        }
-        pages_read += 1;
-        let (nz, mx, _) = crate::observe::bgra_rgb_stats(&buf);
-        rgb_nz += nz;
-        max_rgb = max_rgb.max(mx);
-    }
-    let mut guard = LAST.lock().unwrap_or_else(|p| p.into_inner());
-    let last = guard.get_or_insert_with(HashMap::new);
-    let entry = last.entry(mapping).or_insert((usize::MAX, 0, 0));
-    if entry.2 >= LOG_CAP_PER_MID || (entry.0 == rgb_nz && entry.1 == max_rgb) {
-        return;
-    }
-    *entry = (rgb_nz, max_rgb, entry.2 + 1);
-    crate::observe::fail(format!(
-        "present_named_pages mid={mapping} sampled={pages_read}/{SAMPLE_PAGES} step={step} rgb_nz={rgb_nz} max_rgb={max_rgb} map_gen={}",
-        m.map_generation
-    ));
-}
-
 /// Present a named mapping to the host console (DisplaySwap / x86 present op6/7).
 fn present_named_mapping<H: HostMemory + HostOps>(
     state: &mut DeviceState,
@@ -1685,7 +1625,6 @@ fn present_named_mapping<H: HostMemory + HostOps>(
         state.present.height = h;
         state.present.generation = gen;
         log_present_page_identity(state, mapping, w, h);
-        log_present_named_page_content(state, host, mapping);
         // Every present takes one route: capture the surface the transaction
         // named. A ClearOnly present — one whose named mid's most recent write
         // was a `display_clear`/CLEAR Store rather than a draw — used to take a
