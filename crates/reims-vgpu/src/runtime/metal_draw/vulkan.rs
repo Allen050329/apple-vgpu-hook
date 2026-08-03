@@ -2859,6 +2859,9 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
 /// 13 distinct spans, backing=Same and fmt=Bgra8 on every one
 /// ```
 ///
+/// A second driven boot on the same workload read 28 / 28 / 0 — the same
+/// partition, so the zero is not one boot's luck.
+///
 /// So the two rails agree on every occurrence. The dominant blank class is
 /// elsewhere — 98.8 % of blank samples have no cache entry for the span at all,
 /// which is "we do not have the pixels", not "we lost them". `fmt=Bgra8`
