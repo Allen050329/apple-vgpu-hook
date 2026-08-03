@@ -1608,6 +1608,20 @@ pub fn flush_gva_one<M: HostMemory + HostOps>(
             }
         };
     }
+    // The host cache is stored on all five outcomes, deliberately: on the four
+    // that did not reach guest RAM it is what holds the authoritative bytes. But
+    // that makes the cache store a poor witness of whether the guest got them,
+    // and the `guest=` word below rides `observe::line`, which is off by
+    // default — so on a stock boot nothing says how the rail's writes divided.
+    // Census it on the always-on counters instead. `written` is the healthy
+    // majority; the other four are each explained at their arm above.
+    crate::runtime::drain::note_store_route(match guest {
+        "written" => "gva_flush_guest_written",
+        "skip" => "gva_flush_guest_skip",
+        "skip_drift" => "gva_flush_guest_skip_drift",
+        "unmapped" => "gva_flush_guest_unmapped",
+        _ => "gva_flush_guest_write_fail",
+    });
     crate::runtime::metal_draw::host_cache_store_gva_layer(
         state,
         host,
