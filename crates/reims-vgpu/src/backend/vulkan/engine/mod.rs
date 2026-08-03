@@ -106,9 +106,6 @@ struct EngineState {
     caches: ObjectCaches,
     pools: ResourcePools,
     counters: EngineCounters,
-    /// Per-target scratch for the tile-difference census probe. Empty unless
-    /// `REIMS_VGPU_PROBE_TILE_DIFF_CENSUS` is set.
-    diff_census: diff_pass::DiffCensus,
     /// Per-destination `cur`/`prev` scratch for the render writeback's
     /// difference pass.
     diff_rail: diff_pass::DiffRail,
@@ -123,7 +120,6 @@ impl EngineState {
             caches: ObjectCaches::new(),
             pools: ResourcePools::new(),
             counters: EngineCounters::default(),
-            diff_census: diff_pass::DiffCensus::default(),
             diff_rail: diff_pass::DiffRail::default(),
             #[cfg(feature = "host-window")]
             window_presenter: None,
@@ -137,7 +133,6 @@ impl EngineState {
                 if let Some(mut presenter) = self.window_presenter.take() {
                     presenter.destroy(ctx, Some(&mut self.pools));
                 }
-                self.diff_census.destroy_all(&ctx.device);
                 self.diff_rail.destroy_all(&ctx.device);
                 self.caches.destroy_all(&ctx.device);
                 self.pools.destroy_all(&ctx.device);
@@ -147,7 +142,6 @@ impl EngineState {
         }
         self.pools = ResourcePools::new();
         self.caches = ObjectCaches::new();
-        self.diff_census = diff_pass::DiffCensus::default();
         self.diff_rail = diff_pass::DiffRail::default();
     }
 }
@@ -1552,7 +1546,6 @@ pub fn read_target_leased_diffed(
         ref mut caches,
         ref mut pools,
         ref counters,
-        ref mut diff_census,
         ref mut diff_rail,
         ..
     } = &mut *guard;
@@ -1590,25 +1583,6 @@ pub fn read_target_leased_diffed(
         )?;
         pools.registry_set_layout(identity, ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
         counters.note_target_read(rb_size);
-        // After the readback rather than inside it, and only under the probe:
-        // the census runs its own submission, so a boot without it recorded
-        // nothing here and paid nothing. This is the leg the writeback rail
-        // measures at `write_split frag`, so it is the leg whose per-surface
-        // redundancy is the open number.
-        if diff_pass::census_requested() {
-            diff_pass::census_target(
-                ctx,
-                caches,
-                pools,
-                counters,
-                diff_census,
-                identity,
-                snap.image,
-                snap.width,
-                snap.height,
-                rb_size,
-            );
-        }
         // A bitmap produced against an unseeded `prev` describes a comparison
         // with a buffer nothing wrote, so it is discarded rather than trusted:
         // the frame lands whole and seeds the destination.
