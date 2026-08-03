@@ -108,8 +108,11 @@ fn apply_define_task2<H: HostMemory + HostOps>(
     let slot = &state.tasks[task_id as usize];
     let walk =
         crate::runtime::gva_mem::diagnose_task_slot(host, slot, task_id, 0, state.page_shift);
+    // `task=`/`dir=` are not repeated here: `walk` already carries the task id
+    // as `tid=` and the directory as `dir=`, and a key printed twice in one line
+    // is a field every log reader resolves arbitrarily.
     crate::observe::off(format!(
-        "define_task {site} raw={raw_id:#x} task={task_id} len={length:#x} dir={dir:#x} page_shift={} {walk}",
+        "define_task {site} raw={raw_id:#x} len={length:#x} page_shift={} {walk}",
         state.page_shift
     ));
 }
