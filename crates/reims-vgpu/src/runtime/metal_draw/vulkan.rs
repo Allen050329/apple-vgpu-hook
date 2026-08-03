@@ -2882,16 +2882,15 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
 /// gone — it is in the cache, for this span — and the pages that read zero are
 /// the pageable alias the guest never writes.
 ///
-/// `gvac_gw_no_entry` 611 against `gvac_hit` 3 in that window is NOT an arming
-/// gap, which is what it looks like next to the type-4 rail's. The GVA cache's
-/// witness is armed wherever an entry is made (`surface_cache::
-/// mirror_linear_color_cache` calls `arm_gva_guest_write_witness`), and
-/// `gvac_gw_no_entry` counts lookups that found *no cache entry at all*. So the
-/// span an icon samples is usually not cached, and the two binds that were are
-/// the interesting population. `gvac_gw_wrote` was 9 in the same window: the
-/// rung is also being bypassed for spans it holds, on a witness whose
-/// `page_gen` is stamped at the harvest rather than at the write — the same
-/// unsoundness that made the deferred rail's preserve withhold frames.
+/// A note on the `gvac_*` counters this section used to reason from
+/// (`gvac_hit`, `gvac_gw_wrote`, `gvac_gw_no_entry`), and on the
+/// `arm_gva_guest_write_witness` / `gva_guest_wrote_since_store` pair that
+/// produced them: **none of them exist any more.** They belonged to the GVA
+/// encode-cache rung, and that rung was deleted along with its freshness gate —
+/// see the note in [`load_linear_from_host_caches`] for the measurement that
+/// removed it. Numbers quoted from them above are history, not instruments a
+/// reader can go and re-read. What replaces them for this class is the backing
+/// state on the fail line below.
 ///
 /// ## The rate is not improved, and one 14-round boot cannot say it is
 ///
@@ -2984,16 +2983,52 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
 /// What it does establish is that the "0"s above cannot be reasoned from as
 /// though the class had stopped happening. On the general workload it happens
 /// roughly three hundred times a boot.
-fn note_guest_rung_blank(
+///
+/// ## What the report was missing, and what it now carries
+///
+/// Everything above compares this rung against the *cache*, and none of it asks
+/// the prior question: **are the pages that read zero still the pages the cache
+/// entry was produced over?** Without that, one line covers two unrelated
+/// defects. If the key still translates to the page the encode was stored over
+/// (`Same`), the device rendered this span, cached it, and its own writeback
+/// either never landed or landed somewhere else — a loss on the GVA flush rail.
+/// If the key now translates elsewhere (`Moved`) or not at all (`Unmapped`), the
+/// guest handed this address to another allocation and the *cache* entry is the
+/// stale one; the zeroes are then whatever the new owner has, and serving the
+/// cache would be the corruption rather than the repair.
+///
+/// So the two point in opposite directions and the earlier reading — "the host
+/// copy is not gone, it is in the cache for this span" — silently assumes the
+/// first. [`crate::runtime::surface_cache::gva_backing_state`] is the same test
+/// the colour-LOAD seed already runs at its own serve site
+/// ([`crate::runtime::metal_draw::seed_color_load`], where it read `Same` 536 of
+/// 536), and it is one page-table walk per distinct blank span rather than per
+/// sample: the fail line is behind `first_sight`, and the walk sits under it.
+///
+/// The route counter beside it is per-occurrence, so `lin_rung_host_entry`
+/// against `lin_rung_blank_with_host_entry` gives the class a denominator it has
+/// never had — how often this rung falls through to guest pages for a span the
+/// cache holds, blank or not.
+/// `span` is `(gva, width, height)` — the GVA cache's key, taken as one value
+/// because every lookup below needs all three and none of them means anything
+/// apart.
+fn note_guest_rung_blank<H: HostMemory>(
     state: &DeviceState,
+    host: &H,
     task_id: u32,
     texture_ref: u32,
-    gva: u64,
-    w: u32,
-    h: u32,
+    span: (u64, u32, u32),
     rgba: &[u8],
 ) {
+    let (gva, w, h) = span;
     crate::runtime::drain::note_store_route("lin_rung_guest_memo");
+    // The denominator for the loss below: every serve off the guest's pages for
+    // a span the cache also holds, whatever came back. Taken before the blank
+    // test so the blank ones are a subset of a population, not a bare count.
+    let host_entry = crate::runtime::surface_cache::has_gva(state, gva, w, h);
+    if host_entry {
+        crate::runtime::drain::note_store_route("lin_rung_host_entry");
+    }
     if rgba.is_empty() || rgba.iter().any(|&b| b != 0) {
         return;
     }
@@ -3011,7 +3046,7 @@ fn note_guest_rung_blank(
             "lin_rung_guest_blank task={task_id} ref={texture_ref} gva={gva:#x} {w}x{h}"
         ));
     }
-    if !crate::runtime::surface_cache::has_gva(state, gva, w, h) {
+    if !host_entry {
         return;
     }
     crate::runtime::drain::note_store_route("lin_rung_blank_with_host_entry");
@@ -3019,9 +3054,15 @@ fn note_guest_rung_blank(
         "lin_rung_blank_with_host_entry",
         gva ^ ((w as u64) << 32) ^ h as u64,
     ) {
+        // Under `first_sight`, so this walk is once per distinct blank span for
+        // the life of the boot and not once per sample.
+        let backing = crate::runtime::surface_cache::gva_backing_state(state, host, gva);
         crate::observe::fail(format!(
             "lin_rung_blank_with_host_entry task={task_id} ref={texture_ref} \
-             gva={gva:#x} {w}x{h} bytes={} (guest alias is zero and the host cache has this span)",
+             gva={gva:#x} {w}x{h} bytes={} backing={backing:?} (guest alias is zero and \
+             the host cache has this span; backing=Same means the cache entry is still \
+             over these pages, Moved/Unmapped means the address was handed on and the \
+             cache entry is the stale one)",
             rgba.len()
         ));
     }
@@ -3081,7 +3122,7 @@ pub(super) fn load_linear_from_host_caches<M: HostMemory + HostOps>(
     if let Some((rgba, identity, byte_format)) =
         load_linear_guest_memoized(state, host, task_id, tex, gva, w, h)
     {
-        note_guest_rung_blank(state, task_id, texture_ref, gva, w, h, &rgba);
+        note_guest_rung_blank(state, host, task_id, texture_ref, (gva, w, h), &rgba);
         return Some((w, h, rgba, identity, byte_format));
     }
     // There is deliberately no second guest rung under the memo. One used to
@@ -6818,6 +6859,72 @@ mod vulkan_split_tests {
     use super::*;
     use crate::model::{DeviceId, PAGE_SHIFT_X86};
     use crate::runtime::host::FakeHost;
+
+    /// The blank-with-host-entry loss must be reported as a subset of a
+    /// population, not as a bare count.
+    ///
+    /// `lin_rung_blank_with_host_entry` has been read three ways in this file's
+    /// history and each reading needed a denominator it did not have: how often
+    /// this rung serves the guest's pages for a span the cache also holds. With
+    /// only the numerator, "300 a boot" cannot be told apart from "300 of 300"
+    /// or "300 of 300 000", and those are different defects. So a content-
+    /// bearing serve over a cached span must still be counted, and a blank one
+    /// must land in both counters — the subset relation is the property, not
+    /// either number.
+    #[test]
+    fn a_serve_over_a_cached_span_is_counted_whether_or_not_it_came_back_blank() {
+        use crate::runtime::drain::store_route_count;
+        let mut state = DeviceState::new(DeviceId(0), PAGE_SHIFT_X86);
+        let host = FakeHost::new();
+        let (w, h) = (4u32, 4u32);
+        let gva = 0x40_0000u64;
+        crate::runtime::surface_cache::store_gva_owned(
+            &mut state,
+            gva,
+            w,
+            h,
+            vec![0x7f; (w * h * 4) as usize],
+            0,
+            None,
+        );
+
+        let entries = store_route_count("lin_rung_host_entry");
+        let blanks = store_route_count("lin_rung_blank_with_host_entry");
+
+        // Content came back: the cache holds the span, so this is one more
+        // fall-through to guest pages over a cached span, and no loss.
+        let content = vec![1u8; (w * h * 4) as usize];
+        note_guest_rung_blank(&state, &host, 1, 9, (gva, w, h), &content);
+        assert_eq!(
+            store_route_count("lin_rung_host_entry"),
+            entries + 1,
+            "a content-bearing serve over a cached span is part of the population"
+        );
+        assert_eq!(
+            store_route_count("lin_rung_blank_with_host_entry"),
+            blanks,
+            "content came back, so nothing was lost"
+        );
+
+        // All zeroes over the same cached span: the loss, and still a member of
+        // the population it is a subset of.
+        let blank = vec![0u8; (w * h * 4) as usize];
+        note_guest_rung_blank(&state, &host, 1, 9, (gva, w, h), &blank);
+        assert_eq!(store_route_count("lin_rung_host_entry"), entries + 2);
+        assert_eq!(
+            store_route_count("lin_rung_blank_with_host_entry"),
+            blanks + 1
+        );
+
+        // No cache entry for the span: a blank serve here is the other class
+        // ("we do not have the pixels at all") and must reach neither counter.
+        note_guest_rung_blank(&state, &host, 1, 9, (gva + 0x10_0000, w, h), &blank);
+        assert_eq!(store_route_count("lin_rung_host_entry"), entries + 2);
+        assert_eq!(
+            store_route_count("lin_rung_blank_with_host_entry"),
+            blanks + 1
+        );
+    }
 
     /// A refused arm must hand the frame back intact, because the synchronous
     /// route is the next thing to run and those are the only pixels it has.
