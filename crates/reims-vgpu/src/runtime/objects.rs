@@ -1249,6 +1249,82 @@ pub fn replace_physical(state: &mut DeviceState, task_id: u32, object_id: u32) {
     }
 }
 
+/// The active tasks whose object list holds an `OBJECT_TYPE_SURFACE` at slot
+/// `surface_id` — every task the search could legitimately have stopped on.
+///
+/// `lookup_list_entry` already refuses an inactive task, an out-of-range slot
+/// and an entry with no descriptor, so a task reaching the type test is one with
+/// a real object at that slot.
+fn type4_claimant_tasks<M: HostMemory>(state: &DeviceState, host: &M, surface_id: u32) -> Vec<u32> {
+    (0..MAX_TASKS as u32)
+        .filter(|&task_id| {
+            lookup_list_entry(state, host, task_id, surface_id)
+                .is_some_and(|e| e.object_type == OBJECT_TYPE_SURFACE)
+        })
+        .collect()
+}
+
+/// Report how many active tasks claim `surface_id`, once per surface id.
+///
+/// The search below takes the first task that produces a translatable backing.
+/// If two tasks can, probe order decides which of them the guest gets, and
+/// nothing on the wire would say it chose wrong — there is no field to verify a
+/// candidate against. The object-list entry is `[type | desc_len]` plus
+/// `desc_gva` and carries no identity ([`decode_list_object_entry`]), and the
+/// type-4 descriptor is fully consumed: its only undecoded span is the three
+/// bytes at `0x11`, which read zero on every distinct shape a driven boot
+/// produces (`type4_desc_shape … undecoded_nz=0`).
+///
+/// So the question the wire cannot answer directly is answered by counting
+/// instead. A surface id only ever claimed by one task is a surface whose owner
+/// probe order cannot have gotten wrong, whatever order it used.
+///
+/// The claim test is the object-list slot's type alone, not a descriptor read or
+/// a translation: a task that lists a type-4 surface at this slot is a task the
+/// search could have stopped on. That keeps the sweep to one 12-byte guest read
+/// per active task, and it is taken once per surface id — whether a surface id
+/// is claimed twice is a property of the guest's allocation, not of this
+/// resolve.
+///
+/// `claims=1` is the healthy reading and stays on the quiet channel. More than
+/// one claimant is the case that makes the search's tie-break load-bearing, so
+/// that one is a failure line naming the tasks involved.
+fn note_type4_claimants<M: HostMemory>(
+    state: &DeviceState,
+    host: &M,
+    surface_id: u32,
+    winner: u32,
+) {
+    if !crate::observe::first_sight("type4_claimants", surface_id as u64) {
+        return;
+    }
+    let claimants = type4_claimant_tasks(state, host, surface_id);
+    let line = format!(
+        "type4_claimants sid={surface_id} winner={winner} claims={} tasks={claimants:?}",
+        claimants.len()
+    );
+    if claimants.len() > 1 {
+        crate::observe::fail(format!(
+            "{line} (more than one task lists this surface id, so probe order \
+             chose between them and no wire field can say it chose right)"
+        ));
+    } else {
+        crate::observe::off(line);
+    }
+}
+
+/// Take `task_id` as the owner of `surface_id` and report the search's exposure.
+fn win_type4_search<M: HostMemory>(
+    state: &mut DeviceState,
+    host: &M,
+    surface_id: u32,
+    task_id: u32,
+) -> bool {
+    record_type4_owner(state, surface_id, task_id);
+    note_type4_claimants(state, host, surface_id, task_id);
+    true
+}
+
 fn resolve_type4_surface_ex<M: HostMemory>(
     state: &mut DeviceState,
     host: &M,
@@ -1340,8 +1416,7 @@ fn resolve_type4_surface_ex<M: HostMemory>(
             if same_geom {
                 // Same geom + non-empty pages: keep (guest double-buffer
                 // may still rewrite page *content* without changing pfn).
-                record_type4_owner(state, surface_id, task_id);
-                return true;
+                return win_type4_search(state, host, surface_id, task_id);
             }
         } else if let Some(m) = state.mappings.get(&surface_id) {
             // Force: keep the cached table only while the CURRENT task
@@ -1389,12 +1464,10 @@ fn resolve_type4_surface_ex<M: HostMemory>(
             }
         }
         if force_fresh {
-            record_type4_owner(state, surface_id, task_id);
-            return true;
+            return win_type4_search(state, host, surface_id, task_id);
         }
         if apply_type4_backing(state, host, task_id, surface_id, &surf) {
-            record_type4_owner(state, surface_id, task_id);
-            return true;
+            return win_type4_search(state, host, surface_id, task_id);
         }
     }
     // No task could back it. Only now is a probe's refusal a backing failure.
@@ -1878,6 +1951,96 @@ mod tests {
             Some(real_page),
             "the backing must come from the task that could translate it, \
              not from task 0's untranslatable GVA"
+        );
+    }
+
+    /// The search stops on the first task that can back a surface, so whether
+    /// that choice was ever a choice is the thing to count. Nothing on the wire
+    /// can verify a candidate — the object-list entry carries no identity and
+    /// the type-4 descriptor is fully decoded — so the claimant count is the
+    /// only available reading of the search's exposure, and it has to
+    /// distinguish "one task lists this id" from "two do".
+    #[test]
+    fn a_surface_id_claimed_by_two_tasks_is_counted_as_two() {
+        // Two tasks, each with its own directory and root, both listing eight
+        // object slots at GVA 0. Task 0's list page holds a type-4 surface at
+        // slot 3; task 1's holds a type-5 there until the second half of the
+        // test rewrites it.
+        let mut host = FakeHost::new();
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        state.page_shift = PAGE_SHIFT_X86;
+        let dir0_gpa = 2u64 << PAGE_SHIFT_X86;
+        let root0_gpa = 3u64 << PAGE_SHIFT_X86;
+        let list0_gpa = 4u64 << PAGE_SHIFT_X86;
+        let dir1_gpa = 7u64 << PAGE_SHIFT_X86;
+        let root1_gpa = 8u64 << PAGE_SHIFT_X86;
+        let list1_gpa = 9u64 << PAGE_SHIFT_X86;
+        for (gpa, len) in [
+            (dir0_gpa, 0x20),
+            (root0_gpa, 0x1000),
+            (list0_gpa, 0x200),
+            (dir1_gpa, 0x20),
+            (root1_gpa, 0x1000),
+            (list1_gpa, 0x200),
+        ] {
+            host.map_range(gpa, len, 0);
+        }
+
+        let mut d = [0u8; 8];
+        st32(&mut d[DIRECTORY_ROOT_PFN as usize..], 3);
+        st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
+        let _ = host.write_gpa(dir0_gpa, &d);
+        st32(&mut d[DIRECTORY_ROOT_PFN as usize..], 8);
+        let _ = host.write_gpa(dir1_gpa, &d);
+        // Each task's GVA page 0 reaches its own list page.
+        st32(&mut d[..4], 4);
+        let _ = host.write_gpa(root0_gpa, &d[..4]);
+        st32(&mut d[..4], 9);
+        let _ = host.write_gpa(root1_gpa, &d[..4]);
+
+        assert!(state.define_task(0, 0x1000, 2));
+        assert!(state.set_object_list(0, 0, 8));
+        assert!(state.define_task(1, 0x1000, 7));
+        assert!(state.set_object_list(1, 0, 8));
+
+        // Slot 3 of task 0 is the surface. Both entries carry a descriptor GVA
+        // and length, which is what `lookup_list_entry` requires before the type
+        // is even looked at.
+        let mut entry = [0u8; 12];
+        st32(&mut entry[0..], OBJECT_TYPE_SURFACE as u32 | (0x30u32 << 8));
+        entry[4..12].copy_from_slice(&0x80u64.to_le_bytes());
+        let _ = host.write_gpa(list0_gpa + 3 * 12, &entry);
+
+        // Task 1 lists a *different object type* at the same slot, so it is not
+        // a claimant even though the slot is populated.
+        let mut other = [0u8; 12];
+        st32(&mut other[0..], OBJECT_TYPE_REF_TEXTURE as u32 | (0x30u32 << 8));
+        other[4..12].copy_from_slice(&0x80u64.to_le_bytes());
+        let _ = host.write_gpa(list1_gpa + 3 * 12, &other);
+
+        assert_eq!(
+            type4_claimant_tasks(&state, &host, 3),
+            vec![0],
+            "a populated slot of another object type is not a claim on this id"
+        );
+
+        // Now task 1 lists a type-4 surface at the same slot. The id spaces are
+        // per task, so this is a second, unrelated surface wearing the same id —
+        // and the search would have to break the tie by probe order alone.
+        let _ = host.write_gpa(list1_gpa + 3 * 12, &entry);
+        assert_eq!(
+            type4_claimant_tasks(&state, &host, 3),
+            vec![0, 1],
+            "both tasks list a type-4 surface at slot 3, so both are claimants"
+        );
+
+        // An inactive task cannot be the one the search stops on, so it is not
+        // counted either.
+        state.tasks[1].active = false;
+        assert_eq!(
+            type4_claimant_tasks(&state, &host, 3),
+            vec![0],
+            "an inactive task is not a claimant"
         );
     }
 
