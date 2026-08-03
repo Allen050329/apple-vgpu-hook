@@ -1360,25 +1360,41 @@ Whatever is done here is done inside that one function. `draw_phase`'s
 
 **`descriptors_us` has a number now, and it is not a lever.** It had never been
 quoted anywhere, so the descriptor-side ceiling was unknown rather than small.
-Six driven windows of 400-514 draws on the same boot, per draw:
+**79** driven windows of 200+ draws on one boot, microseconds per draw:
 
 ```text
-prep 2.1-7.3   pipeline 4.7-11.6   stage 53.6-66.9   acquire_sampled 0.4 / 20.3
-sampled_upload 6.8-9.6   descriptors 0.74-0.92   record 5.3-6.7   submit 1.4-2.7
+                       med     p10     p90     max
+prep                  2.14    1.59    6.65   63.13
+pipeline              4.79    3.27    7.07  105.37
+stage                60.57   33.35   76.92  245.75
+acquire_sampled       0.43    0.33   10.06   25.15
+sampled_upload        7.14    1.76   16.76   80.40
+descriptors           0.79    0.65    0.92    1.37
+record                5.24    3.49    6.24   10.03
+submit                1.38    0.95    2.88    5.57
 ```
 
-**0.74-0.92 µs a draw**, about 1.5 % of the draw. Writing the descriptor set is
-not where the time goes and pool pressure is not a story here.
+**`descriptors_us` is 0.79 µs a draw at the median and 1.37 at its worst**, about
+1 % of the draw. Writing the descriptor set is not where the time goes and pool
+pressure is not a story here. It is also the *only* column with a tight
+distribution — every other one has a p90 several times its median.
 
-Two other things that reading says. `acquire_sampled_us` is **bimodal to two
-decimal places** — 0.40-0.46 on three windows and 20.30-20.48 on the other two,
-with nothing between — so something in that phase is switched, not scaled, and
-whatever it is costs 20 µs a draw when it is on. And `stage_us` at **54-67 µs a
-draw is two thirds of the whole draw on this workload**, four to five times what
-it costs under a window drag, which makes it the largest undivided column in the
-device by a wide margin.
+**`stage_us` at 60 µs a draw is two thirds of the whole draw on this workload**,
+four to five times what it costs under a window drag, which makes it the largest
+undivided column in the device by a wide margin.
 
-Read those against the window-drag table above with care: this is Safari
+**A first write-up of this called `acquire_sampled_us` "bimodal to two decimal
+places" — 0.40-0.46 against 20.30-20.48, nothing between. That was six windows,
+and it is wrong.** Over 79 the column is a continuum with a heavy tail: 51 of
+them fall between 0.23 and 0.51, then it climbs through 0.8, 1.5, 3.3, 5.6,
+10.1, 14.3 to 25.15. The six-window sample happened to draw two neighbours from
+the cluster and two from the tail, which is exactly what a bimodal distribution
+looks like when you have four points. **Do not read a distribution off fewer
+windows than it has modes**, and prefer quantiles over a range for anything with
+a tail — the ranges quoted for the other columns above are the same hazard, which
+is why they are given as p10/p90 here.
+
+Read all of it against the window-drag table above with care: this is Safari
 compositing the web-content probe's churn page, not a window drag, and the two
 workloads apportion the draw differently. What transfers is the ranking, not the
 microseconds.
