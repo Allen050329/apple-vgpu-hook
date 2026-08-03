@@ -1536,18 +1536,27 @@ pub fn read_rect_raw_at<M: HostMemory + HostOps>(
     }
     let rb = row_bytes as usize;
     let bpr = surface_bpr as usize;
+    // The rect must end inside the sample window, and that is asked once for both
+    // arms below rather than inside either. A correctly-sized read satisfies it
+    // exactly (a dense tight read has `read_end == span_end`), so it drops only a
+    // genuine overrun.
+    //
+    // It used to sit inside the contig arm, on the reasoning that the fragmented
+    // arm was bounded anyway — which is true, but only by its own slice bounds:
+    // that arm reads the window and then indexes rows into it, so an overrunning
+    // rect came back as a bare `false` from a `get` that returned `None`. Both
+    // callers do name that (`rd_row_t11_io`, `Type5ViewDecline::Read`), so it was
+    // never a silent loss, but neither can say the rect left the window, and the
+    // fragmented arm is the one a driven x86 boot actually takes. One check above
+    // the split gives both arms the same refusal and the same line.
+    let read_end = rect_extent_end(base_off, origin_y, height, bpr, x_off, rb);
+    if read_end > span_end {
+        crate::observe::fail(format!(
+            "mapping_read fail reason=read_overrun mid={mapping_id} base_off={base_off} origin_y={origin_y} height={height} bpr={surface_bpr} x_off={x_off} rb={rb} read_end={read_end} span_end={span_end}"
+        ));
+        return false;
+    }
     if let Some((ptr, _)) = contig_for_span(state, host, mapping_id, span_end) {
-        // The fragmented branch below goes through `mapper::read_mapping_bytes`,
-        // which is bounded already. A correctly-sized read satisfies this exactly
-        // (dense tight read: `read_end == span_end`), so it drops ONLY a genuine
-        // overrun.
-        let read_end = rect_extent_end(base_off, origin_y, height, bpr, x_off, rb);
-        if read_end > span_end {
-            crate::observe::fail(format!(
-                "mapping_read fail reason=read_overrun mid={mapping_id} base_off={base_off} origin_y={origin_y} height={height} bpr={surface_bpr} x_off={x_off} rb={rb} read_end={read_end} span_end={span_end}"
-            ));
-            return false;
-        }
         // SAFETY: contig covers span_end, and read_end ≤ span_end (checked).
         let base = unsafe { (ptr as *const u8).add(base_off as usize) };
         if x_off == 0 && rb == bpr && dst_stride as usize == rb {
@@ -3019,6 +3028,85 @@ mod tests {
         ));
         assert_eq!(&dst[..8], &row0);
         assert_eq!(&dst[8..], &row1);
+    }
+
+    /// A rect ending past the sample window must be refused the same way and
+    /// named the same way whichever arm reads it. The bound used to live inside
+    /// the contig arm, so the fragmented arm — the one a driven x86 boot takes —
+    /// answered an overrun with a bare `false` from a slice index and no line
+    /// saying the rect had left the window.
+    ///
+    /// Run over both arms from one body so the two cannot drift: a single packed
+    /// page takes the contig arm, two scattered pages take the fragmented one.
+    #[test]
+    fn a_rect_past_the_sample_window_is_named_on_both_read_arms() {
+        use crate::model::PAGE_SHIFT_X86;
+
+        for scattered in [false, true] {
+            let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+            let mut host = FakeHost::new();
+            host.strict_linux_map = true;
+            let page = 1u64 << PAGE_SHIFT_X86;
+            let gpa0 = 0x5100_0000u64;
+            let gpa1 = 0x6200_0000u64;
+            host.map_range(gpa0, page as usize, 0);
+            host.map_range(gpa1, page as usize, 0);
+            let pfn0 = (gpa0 >> PAGE_SHIFT_X86) as u32;
+            let pfn1 = (gpa1 >> PAGE_SHIFT_X86) as u32;
+            let mid = 12u32;
+            state.map_surface(mid);
+            {
+                let m = state.mappings.get_mut(&mid).unwrap();
+                m.mapped = true;
+                m.mapping_internal = 1;
+                // One page is a packed view; two distant ones cannot be.
+                m.page_entries = if scattered {
+                    vec![
+                        (pfn0 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID,
+                        (pfn1 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID,
+                    ]
+                } else {
+                    vec![(pfn0 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID]
+                };
+            }
+            assert_eq!(
+                mapper::ensure_contig_view(&mut state, &mut host, mid).is_some(),
+                !scattered,
+                "scattered={scattered} must select the arm this iteration is about"
+            );
+
+            // The window is one page. Asking for four rows at a one-page pitch
+            // puts the fourth row's last byte three pages past its end.
+            let mut dst = [0u8; 4 * 8];
+            let cap = crate::observe::FailCapture::start();
+            let ok = read_rect_raw_at(
+                &mut state,
+                &mut host,
+                mid,
+                0,
+                page as u32,
+                page,
+                0,
+                0,
+                2,
+                4,
+                4,
+                &mut dst,
+                8,
+            );
+            let overruns: Vec<String> = cap
+                .lines()
+                .into_iter()
+                .filter(|l| l.contains("reason=read_overrun"))
+                .collect();
+            assert!(!ok, "scattered={scattered}: the read must refuse");
+            assert_eq!(
+                overruns.len(),
+                1,
+                "scattered={scattered}: the refusal must name the bound it broke, \
+                 not leave the caller's decline to stand for it: {overruns:?}"
+            );
+        }
     }
 
     /// compute_full_tight_scratch: an exact-pitch fragmented compute plane
