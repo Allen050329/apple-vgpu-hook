@@ -1522,15 +1522,16 @@ impl ResourcePools {
     /// Create one host-visible buffer of exactly `bucket` bytes, usable as a
     /// transfer destination and as a storage buffer.
     ///
-    /// `STORAGE_BUFFER` is here for the render writeback's difference pass,
-    /// which writes its output straight into a readback slot rather than
-    /// copying a whole frame into one. It is unconditional rather than a second
-    /// kind of slot because the pool is bucketed by size and shared by every
-    /// rail, so two kinds would have to be bucketed separately and a slot
-    /// acquired for a copy could not be handed to a dispatch. The flag costs a
-    /// `memory_type_bits` that may be narrower; the type is chosen from the
-    /// bits this buffer actually reports, so a device that excluded a type here
-    /// would pick another rather than mis-bind.
+    /// `TRANSFER_DST` is what every acquirer of a readback slot uses: the
+    /// graphics and compute paths both fill one with `vkCmdCopyImageToBuffer`
+    /// and then read the persistent mapping. No caller binds a readback slot as
+    /// a shader-visible buffer today, so `STORAGE_BUFFER` is reach rather than a
+    /// requirement, and it is unconditional because the pool is bucketed by size
+    /// and shared by every rail — two usages would have to be bucketed
+    /// separately, and a slot acquired for a copy could not then be handed to a
+    /// dispatch. The flag costs a `memory_type_bits` that may be narrower; the
+    /// type is chosen from the bits this buffer actually reports, so a device
+    /// that excluded a type here picks another rather than mis-binds.
     ///
     /// The two readback acquires differ only in where they stash the slot and in
     /// which `VkOp`/`AllocSite` names each step, so the Vulkan sequence lives

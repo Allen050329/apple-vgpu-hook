@@ -218,9 +218,6 @@ pub enum VkOp {
     PoolsBindStorageImage,
     /// `vkCreateImageView` for a storage image.
     PoolsCreateStorageImageView,
-    /// `vkCreateBuffer` for a writeback difference-pass scratch buffer.
-    /// `vkAllocateMemory` for a difference-pass scratch buffer.
-    /// `vkBindBufferMemory` for a difference-pass scratch buffer.
     /// `vkCreateFramebuffer` for a resident-registry target.
     PoolsCreateRegistryFramebuffer,
     /// `vkCreateImage` for a resident-registry target.

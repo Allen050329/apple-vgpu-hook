@@ -2011,14 +2011,13 @@ impl RunCopy<'_> {
 ///
 /// `None` selects the window whole. `Some(&[])` selects **nothing**, which is
 /// why this is an `Option` rather than "empty means everything": a caller
-/// handing over the ranges a difference pass found changed has an empty list
-/// exactly when the frame is entirely redundant, and reading that as "write it
-/// all" would turn the cheapest landing into the most expensive one.
+/// handing over an explicit list of ranges to write has an empty list exactly
+/// when there is nothing to write, and reading that as "write it all" would turn
+/// the cheapest landing into the most expensive one.
 ///
 /// `ranges` is ascending and disjoint. The first candidate is found by binary
-/// search rather than by walking from the front, so a caller with thousands of
-/// runs — which a 256-byte-tile bitmap over an 8 MB frame is — costs
-/// `O(log n)` per query instead of `O(n)`. Nothing here assumes successive
+/// search rather than by walking from the front, so a caller carrying many runs
+/// costs `O(log n)` per query instead of `O(n)`. Nothing here assumes successive
 /// queries ascend, so a caller may probe windows in any order.
 pub(crate) fn selected_within(
     ranges: Option<&[(u64, u64)]>,
@@ -3091,9 +3090,9 @@ mod tests {
     }
 
     /// `None` is the whole window and `Some(&[])` is none of it. The two must
-    /// never collapse: a difference pass whose frame is entirely redundant
-    /// hands over an empty list, and reading that as "everything" would make
-    /// the cheapest landing the most expensive one.
+    /// never collapse: a caller with an explicit list of ranges to write hands
+    /// over an empty one when there is nothing to write, and reading that as
+    /// "everything" would make the cheapest landing the most expensive one.
     #[test]
     fn an_absent_selection_and_an_empty_one_are_opposites() {
         assert_eq!(sel(None, 10, 20), vec![(10, 20)]);

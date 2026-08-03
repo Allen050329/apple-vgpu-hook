@@ -15,7 +15,7 @@ use crate::runtime::mapper;
 
 /// Why one render writeback did not land its frame in the guest's pages.
 ///
-/// [`write_bgra8_inner`] has sixteen refusal sites and used to answer all of them
+/// [`write_bgra8_inner`] has fifteen refusal sites and used to answer all of them
 /// with a bare `false`, which its caller rendered as a single
 /// `deferred_flush_lost reason=write_refused`. That is the defect the decline
 /// vocabulary exists to prevent: the composite surface is the largest frame this
@@ -64,11 +64,6 @@ pub enum SurfaceWriteRefusal {
     StagedShort { need: usize, have: usize, row: u32 },
     /// The mapper refused to write a run of the frame into the guest's pages.
     MapperWrite { lo: u64, len: usize },
-    /// A partial frame was offered to a caller that publishes to the host
-    /// surface cache. The cache stores whatever `src` holds, and a frame
-    /// narrowed to its changed runs holds nothing at all outside them, so
-    /// publishing it would seed later reads from uninitialised memory.
-    PartialFramePublished { runs: usize },
 }
 
 impl crate::observe::decline::Decline for SurfaceWriteRefusal {
@@ -87,7 +82,6 @@ impl crate::observe::decline::Decline for SurfaceWriteRefusal {
             Self::FrameExtent { .. } => "surface_write_frame_extent",
             Self::StagedShort { .. } => "surface_write_staged_short",
             Self::MapperWrite { .. } => "surface_write_mapper_write",
-            Self::PartialFramePublished { .. } => "surface_write_partial_frame_published",
         }
     }
 
@@ -141,7 +135,6 @@ impl crate::observe::decline::Decline for SurfaceWriteRefusal {
             Self::MapperWrite { lo, len } => {
                 vec![("lo", format!("{lo:#x}")), ("len", len.to_string())]
             }
-            Self::PartialFramePublished { runs } => vec![("runs", runs.to_string())],
         }
     }
 }
@@ -467,80 +460,6 @@ fn unskipped(start: u64, end: u64, skip: SkipRanges<'_>) -> Vec<(u64, u64)> {
     out
 }
 
-/// Byte ranges of a **tightly packed** frame, ascending and disjoint.
-///
-/// The unit the render writeback's difference pass answers in: the frame it
-/// compared has `tight` bytes per row and no inter-row padding, which is not
-/// the space `SkipRanges` is in. [`tight_runs_to_mapping`] is the only crossing
-/// between the two.
-pub type ChangedRuns<'a> = &'a [(u64, u64)];
-
-/// Place tightly-packed frame ranges at their mapping-linear destinations.
-///
-/// Frame byte `s` belongs to row `s / tight` at `s % tight` into it, and that
-/// row starts at `base_off + row * bpr`. When `bpr` and `tight` agree the whole
-/// frame is one linear shift and neighbouring rows come back merged; when they
-/// do not, a run crossing a row boundary becomes one range per row it touches,
-/// because the padding between rows is outside the texture contract and may
-/// belong to another guest allocation.
-///
-/// Runs past the frame's last row are dropped rather than wrapped: a bitmap is
-/// a whole number of tiles and the last tile of a frame is usually partial, so
-/// its bits name bytes the frame does not have.
-fn tight_runs_to_mapping(
-    runs: ChangedRuns<'_>,
-    base_off: u64,
-    bpr: u64,
-    tight: u64,
-    height: u64,
-) -> Vec<(u64, u64)> {
-    let frame = tight.saturating_mul(height);
-    let mut out: Vec<(u64, u64)> = Vec::new();
-    for &(start, end) in runs {
-        let mut cur = start.min(frame);
-        let end = end.min(frame);
-        while cur < end {
-            let row = cur / tight;
-            let seg_end = end.min((row + 1).saturating_mul(tight));
-            let lo = base_off
-                .saturating_add(row.saturating_mul(bpr))
-                .saturating_add(cur - row.saturating_mul(tight));
-            let hi = lo.saturating_add(seg_end - cur);
-            match out.last_mut() {
-                Some(last) if last.1 == lo => last.1 = hi,
-                _ => out.push((lo, hi)),
-            }
-            cur = seg_end;
-        }
-    }
-    out
-}
-
-/// The parts of `[lo, hi)` this write should store: what `changed` selects,
-/// less what `skip` excludes.
-///
-/// The two narrowings are unrelated and both are subtractions from the same
-/// window, so they compose rather than choose. `changed` says the destination
-/// already holds these bytes; `skip` says the destination holds bytes the guest
-/// wrote and this device must not replace. Nothing requires one to imply the
-/// other.
-fn writable_spans(
-    changed: Option<&[(u64, u64)]>,
-    skip: SkipRanges<'_>,
-    lo: u64,
-    hi: u64,
-) -> Vec<(u64, u64)> {
-    let mut out = Vec::new();
-    for (a, b) in mapper::selected_within(changed, lo, hi) {
-        if skip.is_empty() {
-            out.push((a, b));
-        } else {
-            out.extend(unskipped(a, b, skip));
-        }
-    }
-    out
-}
-
 /// Write a tight BGRA8 image into the mapping's guest pages.
 ///
 /// Packed contig HostOps view when possible; else multi-import maximal packed
@@ -596,7 +515,6 @@ pub fn write_bgra8_skipping<M: HostMemory + HostOps>(
         width,
         height,
         skip,
-        None,
     )
 }
 
@@ -642,7 +560,6 @@ pub fn write_bgra8_owned<M: HostMemory + HostOps>(
         width,
         height,
         &[],
-        None,
     )
 }
 
@@ -674,41 +591,6 @@ pub fn write_bgra8_uncached<M: HostMemory + HostOps>(
     width: u32,
     height: u32,
 ) -> bool {
-    write_bgra8_uncached_changed(state, host, mapping_id, src, src_stride, width, height, None)
-}
-
-/// [`write_bgra8_uncached`], storing only the frame ranges `changed` names.
-///
-/// `changed` is in the frame's own tightly-packed byte space — `width * 4` per
-/// row, no padding — which is what the render writeback's difference pass
-/// answers in. `None` stores the frame whole; `Some(&[])` stores none of it,
-/// which is the correct landing for a frame identical to the one already in the
-/// guest's pages.
-///
-/// Storing a subset is sound because not writing a byte that already holds the
-/// value being written is an identity: the pages end holding exactly what an
-/// eager landing would have left, so `mark_mapping_written`, the guest-write
-/// stamp and every later reader see what they would have seen. What the caller
-/// owes is that the ranges really are the only ones that differ — a claim about
-/// the destination, not about the frame, and one this function cannot check.
-///
-/// Only the uncached form takes it. The publishing forms hand `src` to
-/// [`crate::runtime::surface_cache`], which would then serve the bytes outside
-/// the runs to later readers, and outside the runs there are no bytes.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the geometry the frame is in, plus the narrowing of it"
-)]
-pub fn write_bgra8_uncached_changed<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
-    host: &mut M,
-    mapping_id: u32,
-    src: &[u8],
-    src_stride: u32,
-    width: u32,
-    height: u32,
-    changed: Option<ChangedRuns<'_>>,
-) -> bool {
     write_bgra8_inner(
         state,
         host,
@@ -719,7 +601,6 @@ pub fn write_bgra8_uncached_changed<M: HostMemory + HostOps>(
         width,
         height,
         &[],
-        changed,
     )
 }
 
@@ -808,18 +689,7 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
     width: u32,
     height: u32,
     skip: SkipRanges<'_>,
-    changed: Option<ChangedRuns<'_>>,
 ) -> bool {
-    // A narrowed frame holds nothing outside its runs, and the cache stores
-    // whatever `src` holds, so the two are incompatible by construction rather
-    // than by convention. Refused rather than asserted: this is reachable only
-    // from a caller that has not been written yet, and a refusal names it.
-    if let (Some(runs), CacheOutcome::Publish(_)) = (changed, &cache) {
-        return refuse(
-            mapping_id,
-            SurfaceWriteRefusal::PartialFramePublished { runs: runs.len() },
-        );
-    }
     if width == 0 || height == 0 || width > MAX_SCANOUT_DIM || height > MAX_SCANOUT_DIM {
         return refuse(mapping_id, SurfaceWriteRefusal::Geometry { width, height });
     }
@@ -908,13 +778,6 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
     // in its tail.
     let direct_rows = rgba.is_none() && tight == (mw as usize) * (RGBA8_BPP as usize);
 
-    // Once for the frame, before either path: the difference pass answers in
-    // the frame's own tightly-packed space and everything below is in mapping
-    // offsets, so the crossing happens exactly here.
-    let changed_map = changed
-        .map(|runs| tight_runs_to_mapping(runs, base_off, bpr as u64, tight as u64, mh as u64));
-    let changed_map = changed_map.as_deref();
-
     use crate::runtime::drain::{
         SurfaceWritePhase, note_surface_write_path, note_surface_write_phase,
     };
@@ -961,12 +824,7 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
             // The row's destination in mapping-offset space, so the skip list —
             // which is in that space — is subtracted before any pointer exists.
             let row_off = base_off.saturating_add((y as u64).saturating_mul(bpr as u64));
-            for (lo, hi) in writable_spans(
-                changed_map,
-                skip,
-                row_off,
-                row_off.saturating_add(tight as u64),
-            ) {
+            for (lo, hi) in unskipped(row_off, row_off.saturating_add(tight as u64), skip) {
                 let within = (lo - row_off) as usize;
                 let len = (hi - lo) as usize;
                 let dst = unsafe { base.add((y as usize).saturating_mul(bpr) + within) };
@@ -1073,21 +931,14 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
         };
         let frame: &[u8] = staged.as_ref();
         let land_started = std::time::Instant::now();
-        // One call for the whole frame, carrying the runs it should store.
-        //
-        // This used to be one call per surviving run, which is fine for the
-        // handful of ranges a guest-write skip list carries and ruinous for the
-        // thousands a difference bitmap does: every call re-runs
+        // One call for the whole frame, carrying the runs it should store,
+        // rather than one call per surviving run: every call re-runs
         // `flush_intersecting` over the deferred windows and re-resolves the
-        // mapping's page list, both `O(pages)`. The selection now travels into
-        // the walk, so the resolution happens once and each imported page run
-        // moves only the parts of itself the runs name.
-        let runs = writable_spans(
-            changed_map,
-            skip,
-            base_off,
-            base_off.saturating_add(frame.len() as u64),
-        );
+        // mapping's page list, both `O(pages)`, so the per-run shape pays that
+        // twice-over walk for each hole the skip list cuts. The selection
+        // travels into the walk instead, so the resolution happens once and
+        // each imported page run moves only the parts of itself the runs name.
+        let runs = unskipped(base_off, base_off.saturating_add(frame.len() as u64), skip);
         if !mapper::write_mapping_bytes_only(
             state,
             host,
@@ -2046,204 +1897,6 @@ mod tests {
             unskipped(10, 30, &[(5, 12), (16, 18), (28, 35)]),
             vec![(12, 16), (18, 28)]
         );
-    }
-
-    /// The frame the difference pass compares is tightly packed and the guest's
-    /// rows are `bpr` apart, so this is the only crossing between the two
-    /// spaces and an error in it lands pixels at the wrong offset.
-    #[test]
-    fn tight_runs_reach_their_rows_and_merge_only_when_the_pitches_agree() {
-        // Pitches agree: the frame is one linear shift and rows merge, so a run
-        // crossing three rows is one range rather than three.
-        assert_eq!(
-            tight_runs_to_mapping(&[(300, 800)], 4096, 256, 256, 64),
-            vec![(4096 + 300, 4096 + 800)]
-        );
-        // Pitches differ: the same run is one range per row it touches, and the
-        // padding between rows is never named.
-        assert_eq!(
-            tight_runs_to_mapping(&[(300, 800)], 0, 512, 256, 64),
-            vec![(512 + 44, 512 + 256), (1024, 1024 + 256), (1536, 1536 + 32)]
-        );
-        // A run inside one row stays one range under either pitch.
-        assert_eq!(
-            tight_runs_to_mapping(&[(260, 300)], 0, 512, 256, 64),
-            vec![(512 + 4, 512 + 44)]
-        );
-        // The last tile of a frame is usually partial, so a bitmap names bytes
-        // past the final row. They are dropped, not wrapped onto row 0.
-        assert_eq!(
-            tight_runs_to_mapping(&[(200, 400)], 0, 256, 256, 1),
-            vec![(200, 256)]
-        );
-        assert_eq!(tight_runs_to_mapping(&[(300, 400)], 0, 256, 256, 1), vec![]);
-        // Disjoint runs stay disjoint; adjacent ones merge.
-        assert_eq!(
-            tight_runs_to_mapping(&[(0, 16), (16, 32), (64, 80)], 0, 256, 256, 4),
-            vec![(0, 32), (64, 80)]
-        );
-    }
-
-    /// The two narrowings are independent and both subtract.
-    #[test]
-    fn a_changed_selection_and_a_skip_list_compose() {
-        assert_eq!(writable_spans(None, &[], 0, 100), vec![(0, 100)]);
-        assert_eq!(writable_spans(Some(&[]), &[], 0, 100), vec![]);
-        assert_eq!(
-            writable_spans(Some(&[(10, 40)]), &[], 0, 100),
-            vec![(10, 40)]
-        );
-        // The skip list cuts a hole in what the selection named.
-        assert_eq!(
-            writable_spans(Some(&[(10, 40)]), &[(20, 25)], 0, 100),
-            vec![(10, 20), (25, 40)]
-        );
-        // A skip covering the whole selection leaves nothing.
-        assert_eq!(writable_spans(Some(&[(10, 40)]), &[(0, 50)], 0, 100), vec![]);
-    }
-
-    /// A writeback given a change set stores those bytes and leaves every other
-    /// byte of the surface exactly as it found it.
-    ///
-    /// Both storage shapes, because they place bytes by different means — the
-    /// packed one pokes a host view through a raw pointer, the fragmented one
-    /// hands the runs to the mapper's page walk — and a selection honoured by
-    /// one and not the other corrupts only whichever guest allocation happens
-    /// to be scattered.
-    #[test]
-    fn a_changed_run_writeback_stores_only_the_bytes_it_names() {
-        use crate::model::PAGE_SHIFT_X86;
-        const PAGE: u64 = 1 << PAGE_SHIFT_X86;
-        const W: u32 = 64;
-        const H: u32 = 64;
-        // Crosses two page boundaries and starts and ends mid-row, so a walk
-        // that only ever splits on one of the two gets it wrong.
-        const RUN: (u64, u64) = (300, 9000);
-
-        for packed in [true, false] {
-            let mut state = DeviceState::new(DeviceId(2), PAGE_SHIFT_X86);
-            let mut host = FakeHost::new();
-            host.strict_linux_map = !packed;
-            let base_pfn = 0x40u32;
-            host.map_range((base_pfn as u64) << PAGE_SHIFT_X86, 8 * PAGE as usize, 0x55);
-            let order: Vec<u32> = if packed {
-                (0..4).collect()
-            } else {
-                vec![3, 2, 1, 0]
-            };
-            let entries: Vec<u32> = order
-                .iter()
-                .map(|i| ((base_pfn + i) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID)
-                .collect();
-            state.map_surface(4);
-            state.attach_mapping_internal(4, 0);
-            let m = state.mappings.get_mut(&4).unwrap();
-            m.mapping_internal = 1;
-            m.page_entries = entries;
-            assert!(state.set_mapping_geom(4, W, H, MTL_FORMAT_BGRA8_UNORM));
-
-            let frame = vec![0xAAu8; (W * H * 4) as usize];
-            assert!(write_bgra8_uncached_changed(
-                &mut state,
-                &mut host,
-                4,
-                &frame,
-                W * 4,
-                W,
-                H,
-                Some(&[RUN]),
-            ));
-
-            let read = |off: u64| -> u8 {
-                let gpa = ((base_pfn as u64 + order[(off / PAGE) as usize] as u64)
-                    << PAGE_SHIFT_X86)
-                    + (off % PAGE);
-                let mut got = [0u8; 1];
-                host.read_gpa(gpa, &mut got).unwrap();
-                got[0]
-            };
-            for off in 0..(W * H * 4) as u64 {
-                let want = if off >= RUN.0 && off < RUN.1 {
-                    0xAA
-                } else {
-                    0x55
-                };
-                assert_eq!(
-                    read(off),
-                    want,
-                    "packed={packed} byte {off} of a run-limited writeback"
-                );
-            }
-        }
-    }
-
-    /// A frame identical to the one already in the guest's pages names no runs,
-    /// and that is the cheapest correct landing rather than a refusal: nothing
-    /// is stored, and the write still succeeds so its caller goes on to stamp
-    /// the pages as current.
-    #[test]
-    fn an_empty_change_set_stores_nothing_and_still_succeeds() {
-        use crate::model::PAGE_SHIFT_X86;
-        const PAGE: u64 = 1 << PAGE_SHIFT_X86;
-        const W: u32 = 64;
-        const H: u32 = 64;
-
-        for packed in [true, false] {
-            let mut state = DeviceState::new(DeviceId(2), PAGE_SHIFT_X86);
-            let mut host = FakeHost::new();
-            host.strict_linux_map = !packed;
-            let base_pfn = 0x40u32;
-            host.map_range((base_pfn as u64) << PAGE_SHIFT_X86, 8 * PAGE as usize, 0x55);
-            let entries: Vec<u32> = (0..4)
-                .map(|i| ((base_pfn + i) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID)
-                .collect();
-            state.map_surface(4);
-            state.attach_mapping_internal(4, 0);
-            let m = state.mappings.get_mut(&4).unwrap();
-            m.mapping_internal = 1;
-            m.page_entries = entries;
-            assert!(state.set_mapping_geom(4, W, H, MTL_FORMAT_BGRA8_UNORM));
-
-            let frame = vec![0xAAu8; (W * H * 4) as usize];
-            assert!(write_bgra8_uncached_changed(
-                &mut state,
-                &mut host,
-                4,
-                &frame,
-                W * 4,
-                W,
-                H,
-                Some(&[]),
-            ));
-            for page in 0..4u64 {
-                let mut got = [0u8; 4];
-                host.read_gpa((base_pfn as u64 + page) << PAGE_SHIFT_X86, &mut got)
-                    .unwrap();
-                assert_eq!(got, [0x55; 4], "packed={packed} page {page} was touched");
-            }
-        }
-    }
-
-    /// A narrowed frame holds nothing outside its runs, so a writer that would
-    /// hand it to the host surface cache is refused rather than allowed to seed
-    /// later readers from bytes that were never written.
-    #[test]
-    fn a_partial_frame_is_refused_by_a_publishing_writer() {
-        use crate::model::PAGE_SHIFT_X86;
-        let mut state = DeviceState::new(DeviceId(2), PAGE_SHIFT_X86);
-        let mut host = FakeHost::new();
-        assert!(!write_bgra8_inner(
-            &mut state,
-            &mut host,
-            4,
-            &[0u8; 64],
-            CacheOutcome::Publish(None),
-            16,
-            4,
-            4,
-            &[],
-            Some(&[(0, 16)]),
-        ));
     }
 
     /// Every row must land at its own offset, with content that can tell rows

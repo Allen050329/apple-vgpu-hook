@@ -300,12 +300,6 @@ pub(crate) struct DeviceContext {
     /// caller cannot tell GPU work from the latency of asking. See
     /// [`TimestampProbe`].
     pub timestamps: Option<TimestampProbe>,
-    /// `VkPhysicalDeviceLimits::maxComputeWorkGroupCount[0]`.
-    ///
-    /// Read from the device rather than assumed. Vulkan guarantees only 65 535
-    /// per axis, which a 4K frame's one-workgroup-per-tile dispatch exceeds, so
-    /// the difference pass folds onto the second axis when it has to — and a
-    /// device that reports far more should not pay for a fold it does not need.
     /// On-disk VkPipelineCache blob for this device (keyed by
     /// pipelineCacheUUID), or None when persistence is unavailable.
     pub pipeline_cache_path: Option<std::path::PathBuf>,

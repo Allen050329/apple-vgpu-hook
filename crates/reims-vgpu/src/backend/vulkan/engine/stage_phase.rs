@@ -2,8 +2,8 @@
 //!
 //! `stage_us` is the largest single column in the device. On a driven Safari
 //! drag, settled x86/PCI, host GPU at P8: 3978 draws in one second spend
-//! **200 ms** there, which is 83 % of `draw_phase`'s whole second and level
-//! with the difference pass's `pass_us`. Everything else in that phase together
+//! **200 ms** there, which is 83 % of `draw_phase`'s whole second. Everything
+//! else in that phase together
 //! — pipeline, record, sampled, prep, descriptors, submit — is ~41 ms.
 //!
 //! One bar cannot choose between the fixes, which is the same argument that
