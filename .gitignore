@@ -56,3 +56,8 @@ Vulkan-Headers/
 
 # Guest crash reports (.ips) — Apple diagnostic artifacts, keep local, never commit
 .agents/crashes/
+
+# LLVM coverage artifacts (scripts/runtime-dead writes under /tmp; these are
+# what a stray instrumented `cargo test` drops in the tree).
+*.profraw
+*.profdata
