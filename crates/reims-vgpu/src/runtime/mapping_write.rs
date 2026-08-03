@@ -858,23 +858,16 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
         };
         // The staged buffer is `src` itself whenever the layout it would be
         // built into is the layout `src` already has: no conversion (the rows go
-        // through untouched), the mapping's row pitch equal to the packed row
-        // length (so there is no inter-row padding to zero-fill), and a source
-        // pitch equal to it too (so the rows are already consecutive). Under all
-        // three, byte `i` of the staged frame is byte `i` of `src` for every
-        // `i < frame_len`, and building it copies 8 MB to produce a slice we are
-        // holding.
+        // through untouched) and a source pitch equal to the mapping's row pitch
+        // (so row `y` is already at `y * bpr`). Under both, byte `i` of the
+        // staged frame is byte `i` of `src` for every `i < frame_len`, and
+        // building it copies 8 MB to produce a slice we are holding.
         //
-        // Each condition is load-bearing rather than defensive. Drop the pitch
-        // equality and the gaps between rows — which the guest's allocator may
-        // have given to something else — stop being zeroed and start carrying
-        // whatever `src` has at those offsets. Drop `direct_rows` and the rows
-        // are supposed to be converted on the way through.
-        let staged: std::borrow::Cow<'_, [u8]> = if direct_rows
-            && bpr == tight
-            && src_stride as usize == tight
-            && src.len() >= frame_len
-        {
+        // What `src` has in the gaps between rows does not enter into it: the
+        // store below names the texel runs only, so those bytes are never read
+        // out of this buffer whichever way it was built.
+        let staged: std::borrow::Cow<'_, [u8]> =
+            if direct_rows && bpr == src_stride as usize && src.len() >= frame_len {
             std::borrow::Cow::Borrowed(&src[..frame_len])
         } else {
             let mut frame = vec![0u8; frame_len];
@@ -938,7 +931,33 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
         // twice-over walk for each hole the skip list cuts. The selection
         // travels into the walk instead, so the resolution happens once and
         // each imported page run moves only the parts of itself the runs name.
-        let runs = unskipped(base_off, base_off.saturating_add(frame.len() as u64), skip);
+        //
+        // The runs are the `tight` bytes at the head of each of `mh` rows, not
+        // the frame's whole extent. A row pitch wider than the packed row leaves
+        // padding between rows, and that padding is not a texel this call was
+        // given: the contig arm above writes row by row and never touches it,
+        // so storing the staged frame entire would zero it here and leave it
+        // alone there — the same call landing different guest memory depending
+        // only on whether the guest's pages happened to be adjacent.
+        //
+        // Those bytes do belong to this plane (`sample_window_from_device_plane`
+        // requires the plane's own `plane_size` to cover `bpr * (mh - 1) +
+        // tight`), so this is not an overrun into a neighbouring allocation. It
+        // is content the guest put there and the device was never asked to
+        // replace.
+        let mut runs: Vec<(u64, u64)> = Vec::new();
+        for y in 0..mh {
+            let row_lo = base_off.saturating_add((y as u64).saturating_mul(bpr as u64));
+            for (lo, hi) in unskipped(row_lo, row_lo.saturating_add(tight as u64), skip) {
+                match runs.last_mut() {
+                    // A packed pitch makes consecutive rows adjacent; coalescing
+                    // keeps that frame the single run it was before the split,
+                    // which is the shape the hot 8 MB composite surface takes.
+                    Some(last) if last.1 == lo => last.1 = hi,
+                    _ => runs.push((lo, hi)),
+                }
+            }
+        }
         if !mapper::write_mapping_bytes_only(
             state,
             host,
@@ -2838,9 +2857,12 @@ mod tests {
         assert!(mapper::ensure_contig_view(&mut state, &mut host, mid).is_none());
     }
 
-    /// The fragmented BGRA write path must stop at the final row's last texel.
-    /// Writing `bpr * height` includes padding after the final row, which is not
-    /// texture content and can overrun an exact IOSurface allocation.
+    /// The fragmented BGRA write path must land the texels and nothing else —
+    /// the same contract `write_bgra8_contig_writes_only_inside_the_sample_window`
+    /// pins on the pointer arm, asserted the same way so the two arms cannot
+    /// drift apart. Padding after the final row would overrun an exact IOSurface
+    /// allocation; padding *between* rows is inside the plane but is still
+    /// content the guest put there and this call never named.
     #[test]
     fn write_bgra8_fragmented_skips_final_row_padding() {
         use crate::model::PAGE_SHIFT_X86;
@@ -2871,17 +2893,26 @@ mod tests {
             0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee,
             0xff, 0x10,
         ];
+        assert!(
+            mapper::ensure_contig_view(&mut state, &mut host, mid).is_none(),
+            "two non-adjacent pages must take the staged path this test is about"
+        );
         assert!(write_bgra8(&mut state, &mut host, mid, &src, 8, 2, 2));
 
-        let mut final_row = [0u8; 8];
-        assert!(host.read_gpa(gpa0 + 128, &mut final_row).is_ok());
-        assert_eq!(final_row, src[8..16]);
-
-        let mut final_padding = [0u8; 4];
-        assert!(host.read_gpa(gpa0 + 128 + 8, &mut final_padding).is_ok());
+        // No device descriptor, so the invented window applies: tight = 2 × 4,
+        // bpr = ALIGN_UP(8, ROW_BYTES_ALIGN) = 128, two rows — a pitch wider
+        // than the packed row, so there is inter-row padding to get wrong.
+        let tight = 8usize;
+        let bpr = 128usize;
+        let mut got = vec![0u8; page as usize];
+        assert!(host.read_gpa(gpa0, &mut got).is_ok());
+        let mut want = vec![0xCCu8; page as usize];
+        want[..tight].copy_from_slice(&src[..tight]);
+        want[bpr..bpr + tight].copy_from_slice(&src[tight..]);
+        let first_diff = got.iter().zip(want.iter()).position(|(a, b)| a != b);
         assert_eq!(
-            final_padding, [0xCC; 4],
-            "padding after the final row must remain untouched"
+            first_diff, None,
+            "byte {first_diff:?} outside the sample window was modified"
         );
     }
 
