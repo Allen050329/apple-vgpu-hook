@@ -193,6 +193,20 @@ already been run to exhaustion; re-running one costs hours and has so far return
   loops skipped the `dest_window` bound six sibling call sites take. When auditing here, diff the two
   arms against each other rather than reading either alone — and grep the *other* arm's comments,
   because in three of these four the correct rule was already written down next to the wrong code.
+- **The x86 GVA page-table walk is exactly conformant; do not re-audit it.** `contract/gva.rs` and
+  `contract/gva_resolve.rs` were checked field by field against the contract and every constant
+  holds: a PTE is 4 bytes, the PFN is bits `[30:0]` raw (`PTE_PFN_MASK`), bit 31 is a flag, the
+  fan-out is 1024 (`X86_64_INDEX_BITS = 10`), the page shift is 12, and the index split
+  `(page_index >> ((depth-1-level) * index_bits)) & index_mask` is the right one. The one subtlety
+  is already right and is worth not "simplifying": **`pte == 0` is the guest's sole not-present
+  encoding**, so the walk reports `ErrZeroPfn` for it and `ErrMalformedPte` for a zero PFN with bit
+  31 set. That second case cannot occur legitimately — the guest refuses to store an entry whose
+  bit 31 is already set and never maps physical page 0 — so collapsing the two arms would discard a
+  real corruption signal to save a branch. `gva_zero_pfn` in the fail log is therefore the guest
+  saying "not mapped here", not a device defect.
+  `MAX_DEPTH = 4` is a bound, not the depth: the depth is read per task from the task descriptor
+  (`DIRECTORY_DEPTH`), which is correct and must stay — do not hardcode it even though the x86 guest
+  currently always says 3.
 - **The type-4 task search is not an oracle, and replacing it with "the task the guest named"
   regresses the boot.** It reads exactly like one: `resolve_type4_surface_ex` takes a bare surface id
   and probes up to 256 task object lists — task 0 first as the "historical home", then a hint its own
