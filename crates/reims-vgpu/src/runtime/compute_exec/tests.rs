@@ -285,7 +285,7 @@ fn compute_bind_overflow_drops_the_bind_but_keeps_in_cap_and_unbinds() {
         "index == MAX-1 is the last valid slot"
     );
 
-    // A zero-ref entry is an unbind: expected control flow, silently skipped.
+    // A zero-ref entry is an unbind: expected control flow, no new slot.
     acc.bind_buffers(
         6,
         &[BufferBinding {
@@ -302,6 +302,62 @@ fn compute_bind_overflow_drops_the_bind_but_keeps_in_cap_and_unbinds() {
     assert!(
         acc.threadgroup_memory.is_empty(),
         "over-cap threadgroup memory must not be stored"
+    );
+}
+
+/// A nil entry over an *occupied* compute slot clears it.
+///
+/// `compute_bind_overflow_drops_the_bind_but_keeps_in_cap_and_unbinds` covers
+/// the easy half — a nil at a slot that was already empty adds nothing — and
+/// that half passes whether the arm clears or merely skips. This is the half
+/// that separates them, and it is the half with a consequence: a retained bind
+/// is staged again on the next dispatch, and a texture slot the guest unbound
+/// still receives `writeback_texture`'s output into its guest surface.
+///
+/// The rule is the render rail's, over the same `[first][count][ref x count]`
+/// wire form: `ExecResult::buffer_unbinds` states that explicit nil entries
+/// "must remove prior slot state rather than silently retaining a stale
+/// resource", and `exec::apply_binds` retains-by-slot to do it. All three
+/// compute bind kinds are asserted, because the arm was wrong in all three.
+#[test]
+fn a_nil_entry_clears_an_occupied_compute_slot() {
+    let mut acc = ComputeAccum::default();
+    acc.bind_buffers(
+        3,
+        &[BufferBinding {
+            ref_: 77,
+            ..Default::default()
+        }],
+    );
+    acc.bind_textures(3, &[RefBinding { ref_: 78 }]);
+    acc.bind_samplers(
+        3,
+        &[SamplerBinding {
+            ref_: 79,
+            ..Default::default()
+        }],
+    );
+    assert_eq!((acc.buffers.len(), acc.textures.len(), acc.samplers.len()), (1, 1, 1));
+
+    acc.bind_buffers(
+        3,
+        &[BufferBinding {
+            ref_: 0,
+            ..Default::default()
+        }],
+    );
+    acc.bind_textures(3, &[RefBinding { ref_: 0 }]);
+    acc.bind_samplers(
+        3,
+        &[SamplerBinding {
+            ref_: 0,
+            ..Default::default()
+        }],
+    );
+    assert_eq!(
+        (acc.buffers.len(), acc.textures.len(), acc.samplers.len()),
+        (0, 0, 0),
+        "a nil entry must remove the slot it names, not leave the previous bind live"
     );
 }
 

@@ -173,7 +173,16 @@ impl ComputeAccum {
         for (i, e) in entries.iter().enumerate() {
             let index = first.saturating_add(i as u32);
             if e.ref_ == 0 {
-                continue; // unbind this slot: expected control flow, stay silent.
+                // A nil entry clears the slot. Retaining the previous bind
+                // instead is not a stale read but a write: the retained buffer
+                // is staged again on the next dispatch, and reflection calling
+                // it writable sends the dispatch's output back into a guest
+                // resource the guest explicitly unbound. Same rule the render
+                // rail states on `ExecResult::buffer_unbinds` and applies in
+                // `exec::apply_binds`, over the same wire form.
+                self.buffers.retain(|b| b.index != index);
+                crate::runtime::drain::note_store_route("compute_unbind_buffer");
+                continue;
             }
             if index >= MAX_COMPUTE_BUFFER_SLOTS {
                 note_compute_bind_overflow("buffer", index, e.ref_, MAX_COMPUTE_BUFFER_SLOTS);
@@ -208,7 +217,12 @@ impl ComputeAccum {
         for (i, e) in entries.iter().enumerate() {
             let index = first.saturating_add(i as u32);
             if e.ref_ == 0 {
-                continue; // unbind this slot: expected control flow, stay silent.
+                // Clears the slot; see `bind_buffers`. A retained texture is
+                // the sharper case of the two, because `writeback_texture`
+                // lands the dispatch's result in the guest surface behind it.
+                self.textures.retain(|t| t.index != index);
+                crate::runtime::drain::note_store_route("compute_unbind_texture");
+                continue;
             }
             if index >= MAX_COMPUTE_TEXTURE_SLOTS {
                 note_compute_bind_overflow("texture", index, e.ref_, MAX_COMPUTE_TEXTURE_SLOTS);
@@ -230,7 +244,10 @@ impl ComputeAccum {
         for (i, e) in entries.iter().enumerate() {
             let index = first.saturating_add(i as u32);
             if e.ref_ == 0 {
-                continue; // unbind this slot: expected control flow, stay silent.
+                // Clears the slot; see `bind_buffers`.
+                self.samplers.retain(|s| s.index != index);
+                crate::runtime::drain::note_store_route("compute_unbind_sampler");
+                continue;
             }
             if index >= MAX_COMPUTE_SAMPLER_SLOTS {
                 note_compute_bind_overflow("sampler", index, e.ref_, MAX_COMPUTE_SAMPLER_SLOTS);
