@@ -2110,9 +2110,27 @@ pub fn render_window_identity(
 /// guest is told the work is done, so the interval in which a guest store can be
 /// both after the Store and before the writeback does not exist. Nothing needs
 /// preserving because nothing is clobbered, and this function becomes the
-/// standing check on that — a `render_flush_over_guest_write` after the binding
-/// names a window that landed outside the fence anyway, which is a defect and
-/// not a cost.
+/// standing check on that.
+///
+/// It is a **loose** check, and reading it as a tight one sends a reader after a
+/// hole that need not exist. The verdict is `guest_write_gen(token) !=
+/// guest_write_gen_at_store`, and that generation moves at the *harvest* that
+/// saw the page dirty, not at the write —
+/// [`render_flush_guest_written_ranges`] states the same rule for the same
+/// reason. `reims_vgpu_dirty_gen` returns the value as of the last harvest and
+/// only marks a read as owed; `reims_vgpu_dirty_harvest` then returns early
+/// unless a read is owed, and runs at the drain tail. So a guest store made
+/// *before* the Store, in a tranche whose harvest had not yet run, is stamped
+/// into a generation that moves *after* it, and this fires. That is structural,
+/// not a race: it is the same unsoundness that made preserving the pages black
+/// the screen, and it points the one way that costs nothing to be wrong about.
+///
+/// So a surviving occurrence is an **upper bound on** clobbered windows, not a
+/// count of them, and a single line is not by itself a defect. What would be a
+/// defect is the rate not falling when the fence binding tightens, or a
+/// `rendw_stamp_outlived` naming a window that landed after
+/// [`crate::runtime::drain::write_stamp`] — that one is an ordering statement
+/// the device can actually make.
 ///
 /// [`crate::runtime::mapping_write::write_bgra8_skipping`] and
 /// `HostOps::guest_written_pages` stay: the sampled ladder's merge uses both,
@@ -2130,8 +2148,10 @@ fn note_render_flush_over_guest_write<M: HostOps>(
     crate::runtime::drain::note_store_route("render_flush_over_guest_write");
     crate::observe::fail(format!(
         "deferred_flush_clobber kind=render mapping={} {}x{} fmt={:#x} gen={} \
-         (the guest wrote pages of this surface after the Store this window defers; \
-         the full-extent writeback replaces them)",
+         (a guest write to this surface was observed since the Store this window \
+         defers, and the full-extent writeback replaces it; the witness moves at \
+         harvest, not at the write, so this cannot order the two and is an upper \
+         bound)",
         key.mapping_id, key.width, key.height, key.pixel_format, key.map_generation
     ));
 }
@@ -3294,6 +3314,73 @@ mod tests {
                 "guest_wrote={guest_wrote} must decide whether the loss is reported: {clobbers:?}"
             );
         }
+    }
+
+    /// All the report knows is that the generation moved since the stamp. It
+    /// carries no ordering against the Store, so the line must not claim one.
+    ///
+    /// Why that matters is at the shim, not here. `reims_vgpu_dirty_gen` answers
+    /// with the generation as of the last harvest and only marks a read as owed;
+    /// `reims_vgpu_dirty_harvest` returns early unless one is owed, and runs at
+    /// the drain tail. A guest store in a tranche whose harvest has not yet run
+    /// is therefore stamped into a generation that moves *after* the Store, and
+    /// arrives here indistinguishable from a store that genuinely followed it —
+    /// the same unsoundness that made preserving the pages black the screen.
+    ///
+    /// `FakeHost` cannot stage that: `guest_wrote_page` is both the write and
+    /// the observation, so the harvest lag has no double here and this fixture
+    /// does not reproduce it. What it does pin is the consequence — the verdict
+    /// is a bare generation comparison — and that the emitted line stops short of
+    /// an ordering claim. `note_render_flush_over_guest_write`'s doc used to make
+    /// that claim two paragraphs after `render_flush_guest_written_ranges` stated
+    /// the opposite rule.
+    #[cfg(feature = "backend-vulkan")]
+    #[test]
+    fn the_clobber_report_claims_no_ordering_against_the_store() {
+        use crate::runtime::host::{FakeHost, HostOps};
+        let page = 1u64 << PAGE_SHIFT_X86;
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+        let token = host
+            .track_guest_writes(&[page], 1usize << PAGE_SHIFT_X86)
+            .unwrap();
+
+        let stamped = host.guest_write_gen(token).unwrap();
+        // The only input the verdict has: the generation is no longer `stamped`.
+        // Whether the store behind it preceded or followed the Store is exactly
+        // what neither this fixture nor the product witness can say.
+        host.guest_wrote_page(page);
+
+        let m = state.mappings.entry(9).or_default();
+        m.mapped = true;
+        m.map_generation = 1;
+        m.page_entries = vec![
+            (((page >> PAGE_SHIFT_X86) as u32)
+                << crate::contract::iosurface_pages::PAGE_ENTRY_PFN_SHIFT)
+                | crate::contract::iosurface_pages::PAGE_ENTRY_VALID,
+        ];
+        m.guest_write_token = token;
+        m.guest_write_token_gen = 1;
+        m.guest_write_gen_at_store = stamped;
+
+        let cap = crate::observe::FailCapture::start();
+        super::note_render_flush_over_guest_write(&state, &host, &key(9, 0, 256));
+        let clobbers: Vec<String> = cap
+            .lines()
+            .into_iter()
+            .filter(|l| l.split_whitespace().next() == Some("deferred_flush_clobber"))
+            .collect();
+        assert_eq!(
+            clobbers.len(),
+            1,
+            "the witness cannot order the write against the Store, so it reports \
+             either way — the line is an upper bound, not a defect count"
+        );
+        assert!(
+            !clobbers[0].contains("wrote pages of this surface after"),
+            "the line must not claim an ordering the witness cannot establish: {:?}",
+            clobbers[0]
+        );
     }
 
     /// A `Resident` window whose resident no longer vouches for the frame
