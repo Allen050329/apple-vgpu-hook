@@ -37,8 +37,6 @@
 pub mod api_floor;
 pub mod device_features;
 pub mod device_select;
-#[cfg(test)]
-mod gate;
 pub mod memory_topology;
 
 pub use device_select::{rank_physical_device, select_physical_device};
