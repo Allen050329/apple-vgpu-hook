@@ -1348,6 +1348,24 @@ fn handle_render_record<M: HostMemory + HostOps>(
                     index_buffer_offset: cmd.index_buffer_offset,
                 });
             } else {
+                // An indexed opcode whose record named no index buffer falls
+                // through to a *non-indexed* draw of `index_count` vertices,
+                // because `count` above took `index_count` and `indexed` is
+                // None. That is not a form Metal has:
+                // `drawIndexedPrimitives` takes its index buffer as an
+                // argument and there is no bound-index-buffer state for a zero
+                // ref to mean, so the record is malformed and this is the
+                // device inventing a different draw call from it.
+                //
+                // Named rather than declined, deliberately. Declining is the
+                // contract-faithful answer, but `index_buffer_ref` is read at a
+                // payload offset that differs per draw form, so if any of those
+                // offsets is wrong the ref reads 0 and declining would turn a
+                // decode fault into a blank frame. This counter says first
+                // whether the cell is reached at all.
+                if cmd.index_count != 0 && is_indexed_draw_opcode(opcode) {
+                    note_indexed_draw_without_buffer(task_id, opcode, cmd.index_count);
+                }
                 acc.indexed = None;
             }
             // Snapshot bind state for this draw (archive multi-draw job).
@@ -1552,6 +1570,34 @@ fn apply_binds<T: Copy, B: Clone>(
         }
     }
     cleared
+}
+
+/// The draw opcodes whose records carry an index buffer.
+///
+/// `render::decode` collapses every draw form to `Kind::Draw`, so the decoded
+/// record cannot say which class it came from and the opcode is the only thing
+/// that can.
+fn is_indexed_draw_opcode(opcode: u32) -> bool {
+    use crate::runtime::decode::render::{
+        OP_DRAW_INDEXED, OP_DRAW_INDEXED_INST, OP_DRAW_INDEXED_WIDE,
+    };
+    matches!(
+        opcode,
+        OP_DRAW_INDEXED | OP_DRAW_INDEXED_INST | OP_DRAW_INDEXED_WIDE
+    )
+}
+
+/// Name an indexed draw whose record carried no index buffer.
+///
+/// Deduped on the opcode: the three indexed forms read `index_buffer_ref` from
+/// three different payload offsets, so which form fires is the whole diagnostic
+/// value — one form firing alone points at that form's offset, all three
+/// firing points at the guest.
+fn note_indexed_draw_without_buffer(task_id: u32, opcode: u32, index_count: u32) {
+    crate::observe::fail(format!(
+        "stream_draw reason=indexed_without_index_buffer task={task_id} op={opcode:#x} \
+         index_count={index_count} drawn_as=non_indexed"
+    ));
 }
 
 /// Name a depth or stencil attachment dropped for a form this device does not
@@ -2985,6 +3031,75 @@ mod tests {
         let c = render::decode(&cmd).unwrap();
         assert_eq!(c.kind, RenderKind::RenderPass);
         assert_eq!(c.color0.texture_ref, 41);
+    }
+
+    /// An indexed draw whose record named no index buffer says so.
+    ///
+    /// `count` takes `index_count` and `indexed` stays `None`, so the record
+    /// executes as a non-indexed draw of `index_count` vertices — a draw call
+    /// the guest never made, built from one it did. Metal has no such form:
+    /// `drawIndexedPrimitives` takes its index buffer as an argument, so a zero
+    /// ref has nothing to mean.
+    ///
+    /// Asserts the line and, separately, that a well-formed indexed draw does
+    /// not produce it — the counter is only useful if it is quiet on the path
+    /// that works.
+    #[test]
+    fn an_indexed_draw_with_no_index_buffer_is_named() {
+        use crate::runtime::decode::render::OP_DRAW_INDEXED;
+        // ARM compact indexed payload: prim@0, indexBufferRef@4, count@8:u16,
+        // offset@0xa:u16 — total record 0x14.
+        let record = |index_buffer_ref: u32| {
+            let mut cmd = vec![0u8; 0x14];
+            st32(&mut cmd[0..], OP_DRAW_INDEXED);
+            st32(&mut cmd[4..], 0x14);
+            st32(&mut cmd[HEADER_LEN..], 3); // primitiveType
+            st32(&mut cmd[HEADER_LEN + 4..], index_buffer_ref);
+            cmd[HEADER_LEN + 8..HEADER_LEN + 10].copy_from_slice(&6u16.to_le_bytes());
+            cmd
+        };
+        let run = |cmd: &[u8]| {
+            let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+            let host = FakeHost::new();
+            let mut out = ExecResult::default();
+            let mut acc = StreamAccum {
+                pipeline_ref: 5,
+                ..Default::default()
+            };
+            handle_render_record(
+                &mut state,
+                &host,
+                1,
+                OP_DRAW_INDEXED,
+                cmd,
+                &mut out,
+                &mut acc,
+            );
+            acc
+        };
+
+        let good = run(&record(42));
+        assert!(
+            good.indexed.is_some(),
+            "a record naming an index buffer is an indexed draw"
+        );
+
+        let bad = run(&record(0));
+        assert!(
+            bad.indexed.is_none(),
+            "behaviour is unchanged: still no index buffer to draw with"
+        );
+
+        let log = std::fs::read_to_string(crate::observe::fail_log_path()).expect("fail log");
+        assert!(
+            log.contains("reason=indexed_without_index_buffer"),
+            "an indexed draw reinterpreted as non-indexed must say so"
+        );
+        assert!(
+            log.contains(&format!("op={OP_DRAW_INDEXED:#x}")),
+            "the line must name which indexed form fired, since each reads the \
+             ref at a different offset"
+        );
     }
 
     /// A depth attachment this device cannot honour is dropped, and says so.
