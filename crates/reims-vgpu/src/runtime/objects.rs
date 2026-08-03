@@ -1206,19 +1206,15 @@ fn apply_type4_backing<M: HostMemory>(
         }
     }
 
-    // Mapping geom format: single-plane MTL only. Multi-plane / unknown → format 0
-    // (stage/paint must not invent BGRA; type-11 selects planes via device_desc).
-    let format = iosurface_pixel_format_to_mtl(surf.pixel_format);
+    // Dims come from plane 0 for a multi-plane surface, which is bookkeeping;
+    // the format is `latched_mapping_format`'s, which is a contract.
     if surf.width > 0 && surf.height > 0 {
-        if type4_is_multiplanar(surf) {
-            // Dims from plane0 for bookkeeping; format 0 = not a single color RT.
-            let _ = state.set_mapping_geom(surface_id, surf.width, surf.height, 0);
-        } else if format != 0 {
-            let _ = state.set_mapping_geom(surface_id, surf.width, surf.height, format);
-        } else if surf.width > 0 && surf.height > 0 {
-            // Unknown single-plane FourCC: keep dims, format 0 (fail closed on sample bpp).
-            let _ = state.set_mapping_geom(surface_id, surf.width, surf.height, 0);
-        }
+        let _ = state.set_mapping_geom(
+            surface_id,
+            surf.width,
+            surf.height,
+            latched_mapping_format(surf),
+        );
     }
 
     // Backing built cleanly — re-arm the fail latch so a later genuine failure
@@ -1365,6 +1361,53 @@ fn note_type4_claimants<M: HostMemory>(
     }
 }
 
+/// The mapping format a type-4 backing latches: single-plane MTL only.
+///
+/// Multi-plane and unknown-FourCC surfaces get `0`, and that zero is a decoded
+/// refusal rather than an absence — stage and paint must not invent BGRA, and
+/// type-11 selects planes through `device_desc` instead.
+/// [`iosurface_pixel_format_to_mtl`] states the same rule for the conversion.
+///
+/// Named rather than inlined at [`apply_type4_backing`] because
+/// [`backing_matches_latched_geom`] has to compute the *same* value: it compares
+/// a freshly-read descriptor against `m.format`, which is whatever this returned
+/// last time.
+fn latched_mapping_format(surf: &Type4Surface) -> u16 {
+    if type4_is_multiplanar(surf) {
+        return 0;
+    }
+    iosurface_pixel_format_to_mtl(surf.pixel_format)
+}
+
+/// Whether the geometry already latched on this mapping is still the geometry
+/// the freshly-read descriptor declares.
+///
+/// Both arms of [`resolve_type4_surface_ex`]'s freshness test ask this, and they
+/// used to ask it differently: the non-force arm compared width **and** height,
+/// the force arm compared width only. They are the same question — "may this
+/// resolve return without rebuilding" — and the force arm is the one that cannot
+/// afford to be looser, because `force_fresh` returns through
+/// [`win_type4_search`] *without* calling [`apply_type4_backing`], so neither
+/// `set_mapping_geom` nor `synthesize_device_desc_from_type4` runs. A height
+/// change that stays inside the same page count therefore left `m.height` and
+/// the whole device descriptor describing the previous incarnation, on the exact
+/// path `ensure_surface_for_present` calls to catch a wire geometry change.
+///
+/// Format is compared too, and neither arm used to. A surface id can be recycled
+/// at identical dimensions with a different pixel format, and the format is what
+/// every read window's bytes-per-pixel comes from — so keeping the old one
+/// samples the new backing at the wrong stride. The comparison goes through
+/// [`latched_mapping_format`] rather than the wire FourCC, because `m.format` is
+/// whatever that function last returned. Comparing the FourCC would report every
+/// surface as changed, and comparing the raw conversion would report every
+/// multi-plane surface as changed forever, since the latch deliberately discards
+/// it in favour of 0.
+fn backing_matches_latched_geom(m: &MappingEntry, surf: &Type4Surface) -> bool {
+    m.width == surf.width
+        && m.height == surf.height
+        && m.format == latched_mapping_format(surf)
+}
+
 /// Take `task_id` as the owner of `surface_id` and report the search's exposure.
 fn win_type4_search<M: HostMemory>(
     state: &mut DeviceState,
@@ -1472,8 +1515,7 @@ fn resolve_type4_surface_ex<M: HostMemory>(
                     m.mapped
                         && !m.page_entries.is_empty()
                         && m.has_geom
-                        && m.width == surf.width
-                        && m.height == surf.height
+                        && backing_matches_latched_geom(m, &surf)
                 })
                 .unwrap_or(false);
             if same_geom {
@@ -1494,7 +1536,7 @@ fn resolve_type4_surface_ex<M: HostMemory>(
                 let page_shift = state.page_shift;
                 let page_size = page_size_of(page_shift);
                 let need = ((surf.length.saturating_sub(1)) / page_size) + 1;
-                if m.page_entries.len() as u64 == need && m.width == surf.width {
+                if m.page_entries.len() as u64 == need && backing_matches_latched_geom(m, &surf) {
                     let task = state.tasks.get(task_id as usize).filter(|t| t.active);
                     let entry_fresh = |idx: u64, entry: u32| -> bool {
                         let gva = ((surf.backing_pfn as u64) + idx) << page_shift;
@@ -2588,6 +2630,104 @@ mod tests {
     /// swapchain buffer from a same-geometry offscreen tile, so membership is
     /// reconstructed by half a dozen downstream mechanisms. If the guest is
     /// telling us in the undecoded span, the probe has to be able to see it.
+    /// The two arms of the type-4 freshness test must accept exactly the same
+    /// backings, because only one of them rebuilds when it says no.
+    ///
+    /// The force arm returns through `win_type4_search` **without** calling
+    /// `apply_type4_backing`, so `set_mapping_geom` and
+    /// `synthesize_device_desc_from_type4` are both skipped. It used to compare
+    /// width alone while the non-force arm compared width and height, and
+    /// `ensure_surface_for_present` calls the force arm precisely to catch a
+    /// wire geometry change — so a height change that stayed inside the same
+    /// page count left the mapping describing the previous incarnation, on the
+    /// path whose job was to notice.
+    ///
+    /// Neither arm compared format, and a surface id recycled at identical
+    /// dimensions with a different pixel format keeps the old bytes-per-pixel
+    /// for every read window built over it.
+    #[test]
+    fn a_latched_backing_is_stale_when_any_of_geometry_or_format_moved() {
+        use crate::contract::pixel_format::{MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_RGBA8_UNORM};
+        let surf = |w: u32, h: u32, fourcc: u32| Type4Surface {
+            length: 0x1000,
+            backing_pfn: 1,
+            pixel_format: fourcc,
+            plane_count: 1,
+            planes: Default::default(),
+            width: w,
+            height: h,
+            bytes_per_row: w * 4,
+        };
+        // 'BGRA' and 'RGBA' are distinct single-plane FourCCs at one bpp, so a
+        // swap between them is invisible to a dimensions-only test.
+        const BGRA: u32 = 0x4247_5241;
+        const RGBA: u32 = 0x5247_4241;
+        assert_eq!(
+            latched_mapping_format(&surf(8, 4, BGRA)),
+            MTL_FORMAT_BGRA8_UNORM
+        );
+        assert_eq!(
+            latched_mapping_format(&surf(8, 4, RGBA)),
+            MTL_FORMAT_RGBA8_UNORM
+        );
+
+        let m = MappingEntry {
+            width: 8,
+            height: 4,
+            format: MTL_FORMAT_BGRA8_UNORM,
+            ..Default::default()
+        };
+        assert!(backing_matches_latched_geom(&m, &surf(8, 4, BGRA)));
+        assert!(
+            !backing_matches_latched_geom(&m, &surf(8, 5, BGRA)),
+            "a height change must be stale on both arms"
+        );
+        assert!(!backing_matches_latched_geom(&m, &surf(9, 4, BGRA)));
+        assert!(
+            !backing_matches_latched_geom(&m, &surf(8, 4, RGBA)),
+            "same dimensions, different format: every read window's bpp comes from it"
+        );
+    }
+
+    /// A multi-plane backing must compare equal to itself.
+    ///
+    /// The latch stores `0` for it — the decoder's refusal to name a single
+    /// colour format — while the raw FourCC conversion may well return a real
+    /// format. A freshness test that compared the raw conversion would find
+    /// `0 != BGRA8` on every present and rebuild the backing forever, which is
+    /// the failure a shared `latched_mapping_format` exists to make impossible.
+    #[test]
+    fn a_multiplane_backing_compares_equal_to_the_zero_it_latched() {
+        let mut surf = Type4Surface {
+            length: 0x1000,
+            backing_pfn: 1,
+            pixel_format: 0x4247_5241, // 'BGRA' — a format the converter knows
+            plane_count: 2,
+            planes: Default::default(),
+            width: 8,
+            height: 4,
+            bytes_per_row: 32,
+        };
+        assert_ne!(
+            iosurface_pixel_format_to_mtl(surf.pixel_format),
+            0,
+            "the fixture only means something if the raw conversion resolves"
+        );
+        assert_eq!(latched_mapping_format(&surf), 0, "multi-plane latches 0");
+
+        let m = MappingEntry {
+            width: 8,
+            height: 4,
+            format: 0,
+            ..Default::default()
+        };
+        assert!(backing_matches_latched_geom(&m, &surf));
+        // Dropping to one plane makes it a single-plane BGRA8 surface, which is
+        // a real change of what the mapping describes.
+        surf.plane_count = 1;
+        assert!(!backing_matches_latched_geom(&m, &surf));
+    }
+
     #[test]
     fn undecoded_type4_span_is_exactly_what_the_decoder_skips() {
         // One plane: the decoder consumes 0x14..0x24, so the tail starts there.
