@@ -141,6 +141,21 @@ pub const CHILD_OP_DISPLAY_SWAP: u16 = 0x08;
 /// PVG `CmdDeleteTask` (same opcode as root [`ROOT_OP_DELETE_TASK`]).
 pub const CHILD_OP_DELETE_TASK: u16 = 0x20;
 pub const CHILD_OP_UNMAP_MEMORY: u16 = 0x22;
+/// Display-channel flush: a fence carrying **stamps and no payload**.
+///
+/// The guest's display pipe emits this from the failure and teardown legs of a
+/// present, on the pipe's own channel, to fence work it is about to abandon.
+/// Alone among the child commands it allocates no command bytes at all, so its
+/// packet is header plus stamps and a non-empty payload would be a contract
+/// violation rather than a longer form.
+///
+/// There is nothing for this device to execute — retiring the stamps *is* the
+/// whole obligation, and the drain does that for every accepted packet. It is
+/// named here only so it stops reading as an unknown opcode: it was landing in
+/// the `UnknownChildOpcode` arm, which reports a real Apple command as a device
+/// defect, on the display channel, exactly when the present path is already in
+/// trouble and the log is being read.
+pub const CHILD_OP_FLUSH_CHANNEL_EVENT: u16 = 0x1e;
 pub const CHILD_OP_DELETE_OBJECT: u16 = 0x25;
 pub const CHILD_OP_PRESENT_FRAME: u16 = 0x28;
 pub const CHILD_OP_SET_OBJECT_LIST: u16 = 0x33;

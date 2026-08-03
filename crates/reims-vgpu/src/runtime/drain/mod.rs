@@ -2514,6 +2514,25 @@ fn process_child_packet<H: HostMemory + HostOps>(
                 ));
             }
         }
+        // A fence with no payload. The guest emits it from a present's failure
+        // and teardown legs to order work it is abandoning, and retiring its
+        // stamps — which the drain does for every accepted packet — is the whole
+        // contract. Named so it stops being reported as an unknown opcode.
+        CHILD_OP_FLUSH_CHANNEL_EVENT => {
+            crate::runtime::drain::note_store_route("child_flush_channel_event");
+            // The command allocates no bytes, so payload is the one thing that
+            // can falsify this reading. Bytes here would mean the command grew a
+            // form this arm does not decode, and dropping them silently is what
+            // the unknown-opcode arm was at least loud about.
+            if !packet.payload.is_empty() {
+                crate::observe::fail(format!(
+                    "child_flush_channel_event fail reason=unexpected_payload ch={channel_id} \
+                     plen={} (this command carries stamps only; a payload means it has grown \
+                     a form this arm does not decode)",
+                    packet.payload.len()
+                ));
+            }
+        }
         _ => {
             state.record_fail(FailEvent::UnknownChildOpcode {
                 channel: channel_id,

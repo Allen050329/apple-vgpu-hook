@@ -3258,6 +3258,62 @@ fn a_translation_hold_is_census_and_only_an_unreleased_one_fails() {
     }
 }
 
+/// The display channel's flush fence is a real command, not an unknown opcode.
+///
+/// The guest emits it from the failure and teardown legs of a present, on the
+/// display channel, carrying stamps and no payload. It was landing in the
+/// unknown-opcode arm, which reports a real Apple command as a device defect —
+/// and does so on the display channel exactly when the present path is already
+/// in trouble and someone is reading the log.
+///
+/// Retiring the stamps is the whole contract, so the assertion is that the
+/// packet completes and reports nothing, while a payload — which the command
+/// cannot have, since it allocates no command bytes — still says so.
+#[test]
+fn the_display_flush_fence_is_a_named_command_and_not_a_defect() {
+    use crate::runtime::drain::store_route_count;
+    let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+    let fence = |plen: usize| Packet {
+        opcode: CHILD_OP_FLUSH_CHANNEL_EVENT,
+        stamp_count: 0,
+        total_size: PACKET_HEADER_LEN + plen as u32,
+        completion_stamp: 0,
+        payload: vec![0u8; plen],
+        next_head: 0,
+    };
+
+    let n = store_route_count("child_flush_channel_event");
+    let disposition = process_child_packet(&mut state, &mut host, 4, &fence(0));
+    assert_eq!(
+        disposition,
+        ChildPacketDisposition::Complete,
+        "the stamps must retire, or the guest waits on this fence forever"
+    );
+    assert_eq!(
+        store_route_count("child_flush_channel_event"),
+        n + 1,
+        "the command is counted like every other decoded one"
+    );
+    assert!(
+        !state
+            .fails
+            .iter()
+            .any(|e| matches!(
+                e,
+                FailEvent::UnknownChildOpcode {
+                    opcode: CHILD_OP_FLUSH_CHANNEL_EVENT,
+                    ..
+                }
+            )),
+        "a real Apple command must not be reported as an unknown opcode"
+    );
+
+    // A payload is the one thing that would falsify the stamps-only reading.
+    process_child_packet(&mut state, &mut host, 4, &fence(4));
+    assert_eq!(store_route_count("child_flush_channel_event"), n + 2);
+}
+
 /// A display-transaction command longer than its declared trailer must alarm,
 /// and a conformant one must stay silent.
 ///
