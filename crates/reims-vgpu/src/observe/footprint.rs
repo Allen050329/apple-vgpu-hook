@@ -91,6 +91,14 @@ struct Footprint {
     last_dump_ms: AtomicU64,
     last_dump_pages: AtomicU64,
     dump_seq: AtomicUsize,
+    /// The runs the previous dump reported, so this one can report only what it
+    /// adds. The set is monotone — a bit goes 0 → 1 and never back — so every
+    /// dump after the first restates almost all of the one before it: a measured
+    /// 1 239 of 1 243 spans on one boot and 1 724 of 1 733 on another, which put
+    /// the reprint at roughly 15% of every byte in the failure log. That log is
+    /// the only ground truth for what the protocol actually exercises, so the
+    /// space matters.
+    last_dump_runs: std::sync::Mutex<Vec<(u64, u64)>>,
 }
 
 impl Footprint {
@@ -104,6 +112,7 @@ impl Footprint {
             last_dump_ms: AtomicU64::new(0),
             last_dump_pages: AtomicU64::new(u64::MAX),
             dump_seq: AtomicUsize::new(0),
+            last_dump_runs: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -239,7 +248,50 @@ impl Footprint {
         self.last_dump_ms.store(0, Ordering::Relaxed);
         self.last_dump_pages.store(u64::MAX, Ordering::Relaxed);
         self.dump_seq.store(0, Ordering::Relaxed);
+        if let Ok(mut prev) = self.last_dump_runs.lock() {
+            prev.clear();
+        }
     }
+}
+
+/// The parts of `now` that `prev` did not already cover.
+///
+/// Both lists are sorted, disjoint and inclusive-ended, which is what
+/// [`Footprint::runs`] produces. The result is expressed in the same form, so a
+/// reader reassembling a boot's footprint takes the union of every dump's runs
+/// and gets exactly what a full dump would have said.
+///
+/// A plain set-difference of the two run *lists* would be wrong: a single new
+/// frame between two existing runs merges them, so the merged run is "new" as a
+/// run while almost all of its frames are not. The difference has to be taken
+/// over the covered space, which is what this does.
+fn runs_added(now: &[(u64, u64)], prev: &[(u64, u64)]) -> Vec<(u64, u64)> {
+    let mut out: Vec<(u64, u64)> = Vec::new();
+    let mut i = 0usize;
+    for &(start, end) in now {
+        let mut cursor = start;
+        // `prev` is sorted, and `now` is walked in order, so the index only ever
+        // moves forward across the whole call.
+        while i < prev.len() && prev[i].1 < cursor {
+            i += 1;
+        }
+        let mut j = i;
+        while j < prev.len() && prev[j].0 <= end {
+            let (ps, pe) = prev[j];
+            if ps > cursor {
+                out.push((cursor, ps - 1));
+            }
+            cursor = cursor.max(pe.saturating_add(1));
+            if cursor > end {
+                break;
+            }
+            j += 1;
+        }
+        if cursor <= end {
+            out.push((cursor, end));
+        }
+    }
+    out
 }
 
 static FOOTPRINT: std::sync::LazyLock<Footprint> = std::sync::LazyLock::new(Footprint::new);
@@ -666,16 +718,32 @@ pub fn census_lines(now_ms: u64) -> Vec<String> {
     let seq = fp.dump_seq.fetch_add(1, Ordering::Relaxed);
 
     let runs = fp.runs();
-    let parts = runs.len().div_ceil(RUNS_PER_LINE).max(1);
-    for (i, chunk) in runs.chunks(RUNS_PER_LINE).enumerate() {
+    // Report what this dump adds, not the whole set again. `seq` orders the
+    // deltas and the summary line above carries the absolute `pages` level, so a
+    // reader can both reassemble the footprint (union the dumps in `seq` order)
+    // and check the reassembly against `pages` without any dump restating what
+    // an earlier one already said.
+    let added = match fp.last_dump_runs.lock() {
+        Ok(mut prev) => {
+            let added = runs_added(&runs, &prev);
+            *prev = runs;
+            added
+        }
+        // A poisoned lock means a previous dump panicked mid-update, so the
+        // recorded set cannot be trusted to be a subset. Report everything —
+        // over-reporting costs log space; under-reporting loses frames.
+        Err(_) => runs,
+    };
+    let parts = added.len().div_ceil(RUNS_PER_LINE).max(1);
+    for (i, chunk) in added.chunks(RUNS_PER_LINE).enumerate() {
         let spans: Vec<String> = chunk
             .iter()
             .map(|(a, b)| format!("{a:#x}-{b:#x}"))
             .collect();
         out.push(format!(
-            "guest_write_footprint_runs seq={seq} part={}/{parts} runs={} {}",
+            "guest_write_footprint_runs seq={seq} part={}/{parts} added={} {}",
             i + 1,
-            runs.len(),
+            added.len(),
             spans.join(" ")
         ));
     }
@@ -1203,5 +1271,85 @@ mod tests {
             "the chunks must sum to the whole set, or a scorer reassembling them \
              reports a smaller footprint than the device has"
         );
+    }
+
+    /// A second dump reports what it adds, not the whole set again.
+    ///
+    /// The set only ever grows, so a dump that restates it costs the log the
+    /// entire history every time. What makes the delta safe is that the union of
+    /// the dumps still reconstructs the footprint — asserted here by taking that
+    /// union and comparing it to what a single full dump of the same bits says.
+    #[test]
+    fn a_later_dump_reports_only_what_it_adds() {
+        let _g = fresh();
+        note_written_range(Rail::Mapping, 0x1000, 0x1000);
+        note_written_range(Rail::Mapping, 0x9000, 0x1000);
+        let first = census_lines(0);
+        let first_spans = spans_of(&first);
+        assert_eq!(first_spans, vec![(1, 1), (9, 9)]);
+
+        // A frame between the two, plus one beyond them. The frame between
+        // merges 0x1 and 0x9 into one run once 0x2..=0x8 fill in, so a naive
+        // diff of run *lists* would re-report frames 1 and 9.
+        for f in 2..=8u64 {
+            note_written_range(Rail::Mapping, f << FRAME_SHIFT, 1);
+        }
+        note_written_range(Rail::Mapping, 0x20 << FRAME_SHIFT, 1);
+        let second = census_lines(DUMP_INTERVAL_MS);
+        let second_spans = spans_of(&second);
+        assert_eq!(
+            second_spans,
+            vec![(2, 8), (0x20, 0x20)],
+            "frames 1 and 9 were already reported and must not appear again"
+        );
+
+        // The union of both dumps is the whole footprint.
+        let mut union: Vec<u64> = first_spans
+            .iter()
+            .chain(second_spans.iter())
+            .flat_map(|&(a, b)| a..=b)
+            .collect();
+        union.sort_unstable();
+        union.dedup();
+        let expected: Vec<u64> = (1..=9).chain(std::iter::once(0x20)).collect();
+        assert_eq!(union, expected);
+    }
+
+    /// `runs_added` works over covered frames, not over run identity.
+    #[test]
+    fn a_merge_only_reports_the_frames_that_caused_it() {
+        // Two runs joined by one frame: only the joining frame is new.
+        assert_eq!(runs_added(&[(0, 10)], &[(0, 4), (6, 10)]), vec![(5, 5)]);
+        // A run that grew at both ends.
+        assert_eq!(runs_added(&[(0, 10)], &[(3, 6)]), vec![(0, 2), (7, 10)]);
+        // Nothing new at all.
+        assert!(runs_added(&[(0, 4), (6, 10)], &[(0, 4), (6, 10)]).is_empty());
+        // No prior dump: everything is new.
+        assert_eq!(runs_added(&[(2, 3)], &[]), vec![(2, 3)]);
+        // A prior run entirely below and entirely above the new one.
+        assert_eq!(
+            runs_added(&[(10, 12)], &[(0, 2), (10, 10), (20, 22)]),
+            vec![(11, 12)]
+        );
+    }
+
+    /// The `(start, end)` frame pairs named by a census's dump lines, in order.
+    fn spans_of(lines: &[String]) -> Vec<(u64, u64)> {
+        lines
+            .iter()
+            .filter(|l| l.starts_with("guest_write_footprint_runs"))
+            .flat_map(|l| {
+                l.split_whitespace()
+                    .filter(|t| t.starts_with("0x") && t.contains('-'))
+                    .map(|t| {
+                        let (a, b) = t.split_once('-').expect("span");
+                        (
+                            u64::from_str_radix(a.trim_start_matches("0x"), 16).expect("start"),
+                            u64::from_str_radix(b.trim_start_matches("0x"), 16).expect("end"),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
     }
 }
