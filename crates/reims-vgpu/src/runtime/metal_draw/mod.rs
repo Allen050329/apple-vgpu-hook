@@ -3260,30 +3260,65 @@ pub fn writeback_chain_rgba<M: HostMemory + HostOps>(
     color_slots: &[(u32, crate::runtime::decode::render::ColorAttachment)],
     rgba: &[u8],
 ) -> bool {
+    // This whole function is the recovery rail for an abandoned chain, so a
+    // refusal here is the last frame being lost outright. Every arm names
+    // itself: `let _ = writeback_chain_rgba(..)` is how both callers invoke it,
+    // and `dirty_color_targets` advances the content generation on the next line
+    // regardless — so a silent `false` leaves pages stale while the device
+    // reports them fresh, which is the class `land_chain_before_abandon` exists
+    // to prevent.
+    let lost = |why: &'static str| -> bool {
+        crate::runtime::drain::note_store_route("chain_land_refused");
+        crate::observe::fail(format!(
+            "writeback_chain_rgba fail reason={why} task={task_id} slots={} bytes={} \
+             (the abandoned chain's last frame is not landing; guest pages keep stale bytes)",
+            color_slots.len(),
+            rgba.len()
+        ));
+        false
+    };
     if color_slots.is_empty() || rgba.is_empty() {
-        return false;
+        return lost("no_source");
     }
     let Some((_, att)) = color_slots.first() else {
-        return false;
+        return lost("no_color_slot");
     };
     if att.texture_ref == 0 {
-        return false;
+        return lost("unbound_texture_ref");
     }
     let Some((mapping_id, gva, w, h, bpr, fmt)) =
         lookup_render_target(state, host, task_id, att.texture_ref)
     else {
-        return false;
+        return lost("render_target_unresolved");
     };
     let need = (w as usize).saturating_mul(h as usize).saturating_mul(4);
     if rgba.len() < need {
-        return false;
+        return lost("readback_short");
     }
     if gva != 0 {
         supersede_gva_window(state, host, gva, w, h, "chain_land");
-        return write_gva_rgba8(state, host, task_id, gva, w, h, bpr, fmt, rgba).is_ok();
+        // The refusal is carried out, not collapsed. `write_gva_rgba8`'s own doc
+        // asks for exactly this — "a caller has to be able to tell 'the guest
+        // tore this target down' from a write that genuinely lost content" — and
+        // `MemError` already names all of its refusals, so `.is_ok()` was
+        // throwing away the one word that distinguishes them.
+        return match write_gva_rgba8(state, host, task_id, gva, w, h, bpr, fmt, rgba) {
+            Ok(()) => true,
+            Err(e) => {
+                crate::runtime::drain::note_store_route("chain_land_refused");
+                crate::observe::Emit::decline("writeback_chain_rgba", &e)
+                    .field("task", task_id)
+                    .field("gva", format!("{gva:#x}"))
+                    .field("dims", format!("{w}x{h}"))
+                    .field("bpr", bpr)
+                    .field("fmt", format!("{fmt:#x}"))
+                    .fail();
+                false
+            }
+        };
     }
     if mapping_id == 0 {
-        return false;
+        return lost("no_mapping_and_no_gva");
     }
     // An abandoned portability chain must still preserve the last successful
     // record. This is an error recovery rail, not normal product behavior: land
@@ -4552,5 +4587,53 @@ mod memo_scratch_tests {
         assert_eq!(scratch.len(), 512);
         prepare_memo_scratch(&mut scratch, 512, 9999);
         assert_eq!(scratch.len(), 512);
+    }
+
+    /// The abandoned-chain recovery rail must name a lost frame.
+    ///
+    /// Both callers invoke this as `let _ = writeback_chain_rgba(..)` and then
+    /// advance the content generation on the next line, so a bare `false` leaves
+    /// the guest's pages stale while the device reports them fresh. That is the
+    /// exact class the land-before-abandon rail exists to prevent, and it is
+    /// also the last frame of a chain that already went wrong once.
+    #[test]
+    fn an_unlandable_chain_writeback_names_itself() {
+        use crate::runtime::drain::store_route_count;
+        let mut state = crate::model::DeviceState::new(
+            crate::model::DeviceId(1),
+            crate::model::PAGE_SHIFT_X86,
+        );
+        let mut host = crate::runtime::host::FakeHost::new();
+
+        // No source at all: the commonest way this rail is reached with nothing
+        // to land, and previously the quietest.
+        let n = store_route_count("chain_land_refused");
+        assert!(!super::writeback_chain_rgba(
+            &mut state,
+            &mut host,
+            1,
+            &[],
+            &[1u8; 4]
+        ));
+        assert_eq!(
+            store_route_count("chain_land_refused"),
+            n + 1,
+            "an empty slot list is a lost frame, not a no-op"
+        );
+
+        // A slot whose texture_ref is unbound cannot resolve a target.
+        let att = crate::runtime::decode::render::ColorAttachment {
+            texture_ref: 0,
+            ..Default::default()
+        };
+        let n = store_route_count("chain_land_refused");
+        assert!(!super::writeback_chain_rgba(
+            &mut state,
+            &mut host,
+            1,
+            &[(0, att)],
+            &[1u8; 4]
+        ));
+        assert_eq!(store_route_count("chain_land_refused"), n + 1);
     }
 }
