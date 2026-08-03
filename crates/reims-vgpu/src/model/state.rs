@@ -1,7 +1,7 @@
 //! Device-owned state: registers, rings, tasks, mapper, present, fail log.
 
 use crate::model::{GFX_MMIO_SIZE, LruBytesMemo, MAX_CHANNELS, MAX_MAPPINGS, MAX_TASKS};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -1374,11 +1374,10 @@ pub struct DisplayHandshake {
     /// re-arms the probe exactly once at the transition into steady-state
     /// compositing.
     ///
-    /// The plane-0 surface id is deliberately *not* part of the key: it is
-    /// expected to change every frame, so keying on it would make the probe
-    /// unbounded. Whether the task field is likewise per-frame is answered by
-    /// comparing the samples within its bucket.
-    pub txn_payload_samples: BTreeMap<(u16, usize, u32, bool), u32>,
+    /// Keyed on `(opcode, payload_len)`: the alarm is that a command grew past
+    /// the size its own contract declares, and a guest that grew it grew it for
+    /// every frame, so one line per distinct shape is the whole signal.
+    pub txn_payload_samples: BTreeSet<(u16, usize)>,
 }
 
 /// Last **command-class** write to a surface mid (not pixel occupancy).

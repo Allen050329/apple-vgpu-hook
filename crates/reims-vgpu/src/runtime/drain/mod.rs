@@ -60,18 +60,6 @@ fn release_translation_order_holds(state: &mut DeviceState) {
     ));
 }
 
-/// Samples logged per distinct display-transaction `(opcode, payload_len)` shape.
-///
-/// One sample proves the shape exists; a few more let the reader compare which
-/// words move between frames (surface id, task id) and which are constant
-/// (pipe index) without re-booting.
-const DISPLAY_TXN_PAYLOAD_SAMPLES: u32 = 4;
-
-/// Payload bytes hex-dumped per sample. A transaction payload that carried an
-/// inline plane list would be tens of bytes, not kilobytes; this bounds a
-/// pathological length without truncating the interesting case.
-const DISPLAY_TXN_PAYLOAD_DUMP_MAX: usize = 128;
-
 /// Install a `DefineTask2` payload and record the page-table identity it
 /// resolved to.
 ///
@@ -221,83 +209,60 @@ fn present_surface_id(opcode: u16, payload: &[u8]) -> Option<u32> {
     })
 }
 
-/// Measurement for the display-transaction wire shape (`display_txn_payload`).
+/// Alarm for a display-transaction payload longer than its command declares.
 ///
-/// We decode opcode 6/7 as a fixed 12/0x24-byte record read from payload offset
-/// zero, which yields a single surface id — plane 0 of what is really an
-/// `IOAccelDisplayPipeTransaction2`: a per-frame list of planes with source,
-/// destination and dirty rects. Whether the rest of that list rides inline in
-/// this payload decides where a real decode reads it from, and nothing in the
-/// guest driver settles it statically because the serializer it calls lives in
-/// IOAcceleratorFamily2.
+/// # The wire shape, and why there is nothing left to sample here
 ///
-/// So record the shape from a live boot. `head*` is the trailer under the
-/// current offset-zero reading; `tail*` is the same trailer read from the end of
-/// the payload, which is where it lands if a plane list precedes it. When the
-/// two agree the payload is trailer-only and the list travels elsewhere; when
-/// they diverge, `hex` shows the list and `tail*` is the correct reading.
+/// A display present is an `IOAccelDisplayPipeTransaction2` on the guest side —
+/// a per-frame list of planes carrying source, destination and dirty rects — and
+/// this device decodes only a single surface id from it. That reads like a
+/// truncation, and a sampler used to sit here recording whether the rest of the
+/// list rode inline in the payload.
 ///
-/// A live x86 session answered the framing half: every payload was trailer-only,
-/// so `tail*` is the authoritative reading and the named `pipe`/`surface`/`task`
-/// fields below are decoded from it. What remains open is the task field, which
-/// was zero for every sample taken during bring-up. It is `task->+0x268` in
-/// `submitTransaction`, and whether it identifies the GPU task that produced the
-/// surface decides how the host learns that a present's content is ready — so
-/// the sample budget re-arms when it first becomes non-zero.
+/// It does not, and it never can: the guest's display pipe serializes the
+/// transaction by taking **plane 0's** IOSurface and writing that one id into a
+/// fixed-size command. There is no plane list on the wire, so decoding one
+/// surface is the whole contract rather than a first approximation of it. The
+/// command is 12 bytes for `CmdDisplayTransaction3` and 36 for its gamma
+/// variant, which is what [`display_txn_trailer_len`] returns, and the field
+/// order differs between them exactly as [`display_txn_trailer_slots`] says.
+///
+/// The same reading settles the third word. It is the id of the paravirt task
+/// that owns the presented surface, taken from the display pipe's own resource
+/// heap rather than from the transaction — so a zero there means the pipe has no
+/// task bound yet, not that the field is unused.
+///
+/// One consequence worth stating because it is easy to go looking for: **the
+/// guest's damage rects never reach this device.** They exist in the
+/// transaction, and the serializer drops them. Any repair that wants per-frame
+/// damage has to get it from somewhere other than the display path.
+///
+/// What survives is the one thing a static reading cannot promise for a guest
+/// this device does not ship: that the payload keeps its declared size. A longer
+/// one means a plane list has appeared and this decode has become a truncation,
+/// so it is an always-on alarm rather than a sample budget. Under-length is
+/// already refused by [`present_surface_id`], which is where it costs a present.
 fn note_display_txn_payload(state: &mut DeviceState, channel_id: u32, packet: &Packet) {
     let plen = packet.payload.len();
     let trailer = display_txn_trailer_len(packet.opcode);
-    let tail_base = plen.checked_sub(trailer);
-    let word =
-        |off: usize| -> Option<u32> { (off + 4 <= plen).then(|| ld32(&packet.payload[off..])) };
-    let show =
-        |v: Option<u32>| -> String { v.map_or_else(|| "-".to_string(), |w| format!("{w:#010x}")) };
-    let tail = |slot: usize| -> Option<u32> { tail_base.and_then(|base| word(base + slot * 4)) };
-
-    let (surface_slot, task_slot) = display_txn_trailer_slots(packet.opcode);
-    let pipe = tail(0);
-    let surface = tail(surface_slot);
-    let task = task_slot.and_then(tail);
-
-    let seen = state
-        .display
-        .txn_payload_samples
-        .entry((
-            packet.opcode,
-            plen,
-            pipe.unwrap_or(u32::MAX),
-            task.is_some_and(|t| t != 0),
-        ))
-        .or_insert(0);
-    if *seen >= DISPLAY_TXN_PAYLOAD_SAMPLES {
+    if plen <= trailer {
         return;
     }
-    *seen += 1;
-    let sample = *seen;
-
-    let dumped = plen.min(DISPLAY_TXN_PAYLOAD_DUMP_MAX);
-    let mut hex = String::with_capacity(dumped * 2);
-    for b in &packet.payload[..dumped] {
-        hex.push_str(&format!("{b:02x}"));
+    crate::runtime::drain::note_store_route("display_txn_payload_overlong");
+    // Latched per (opcode, length): a guest that grew this command grew it for
+    // every frame, and the thousandth line says nothing the first did not.
+    if !state
+        .display
+        .txn_payload_samples
+        .insert((packet.opcode, plen))
+    {
+        return;
     }
-
     crate::observe::fail(format!(
-        "display_txn_payload op={:#x} ch={channel_id} plen={plen} total_size={} stamp={:#x} \
-         sample={sample}/{DISPLAY_TXN_PAYLOAD_SAMPLES} trailer={trailer} \
-         pipe={} surface={} task={} \
-         head0={} head1={} head2={} tail0={} tail1={} tail2={} dumped={dumped} hex={hex}",
-        packet.opcode,
-        packet.total_size,
-        packet.completion_stamp,
-        show(pipe),
-        show(surface),
-        show(task),
-        show(word(0)),
-        show(word(4)),
-        show(word(8)),
-        show(tail(0)),
-        show(tail(1)),
-        show(tail(2)),
+        "display_txn_payload_overlong op={:#x} ch={channel_id} plen={plen} trailer={trailer} \
+         (the command carries more than its declared trailer, so a plane list may have appeared \
+         and decoding a single surface id would be dropping planes)",
+        packet.opcode
     ));
 }
 
