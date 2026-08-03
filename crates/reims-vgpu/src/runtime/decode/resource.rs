@@ -1884,6 +1884,19 @@ pub const IOSURFACE_TEX_WIDTH: usize = 0x18;
 pub const IOSURFACE_TEX_HEIGHT: usize = 0x1c;
 /// Through `height`. Live blobs run longer (0x38 / 0x58); the tail past this is
 /// not decoded, and the comment on the decoder says why.
+///
+/// Whether that tail carries guest intent is **open, and an x86 boot cannot
+/// settle it.** A probe emitting every distinct (length, tail) shape from this
+/// decoder was run against a driven x86 PCI boot and emitted nothing at all,
+/// which confirms rather than contradicts
+/// [`crate::runtime::objects::undecoded_type4_surface_bytes`] — that doc already
+/// records that this decoder does not run on that pathway. The 0x38/0x58 blobs
+/// are an arm64 phenomenon.
+///
+/// Settling it needs the same Apple host as the other arm64-only questions:
+/// re-add a dedup-by-(len, tail) probe here, boot `reims-vgpu-mmio`, and read
+/// the shapes out of the fail log. Do not re-run it on x86 — that measurement
+/// has been made and its answer is "not observable here".
 pub const IOSURFACE_TEX_MIN_LEN: usize = 0x20;
 
 pub fn decode_iosurface_texture_descriptor(bytes: &[u8]) -> Result<Descriptor, DecodeStatus> {
