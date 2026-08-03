@@ -93,19 +93,6 @@ pub fn gfx_write<H: HostMemory + HostOps>(
         state.gfx.efi_fb_start = data;
         if data != prev {
             crate::observe::off(format!("efi_fb_start {prev:#x} -> {data:#x} (u64 write)"));
-            // Always-on console proxy rail (correlate with "console relocated").
-            let _ = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open("/tmp/reims-vgpu-gop-console.log")
-                .and_then(|mut f| {
-                    use std::io::Write;
-                    writeln!(
-                        f,
-                        "GOPCON efi_fb_start {prev:#x}->{data:#x} stride={}",
-                        state.gfx.efi_fb_stride
-                    )
-                });
         }
         return;
     }
@@ -204,18 +191,6 @@ pub fn gfx_write<H: HostMemory + HostOps>(
                     "efi_fb_start {prev:#x} -> {:#x} (u32 lo write)",
                     state.gfx.efi_fb_start
                 ));
-                let _ = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open("/tmp/reims-vgpu-gop-console.log")
-                    .and_then(|mut f| {
-                        use std::io::Write;
-                        writeln!(
-                            f,
-                            "GOPCON efi_fb_start {prev:#x}->{:#x} stride={}",
-                            state.gfx.efi_fb_start, state.gfx.efi_fb_stride
-                        )
-                    });
             }
         }
         GFX_REG_EFI_FB_LENGTH => state.gfx.efi_fb_length = val,
