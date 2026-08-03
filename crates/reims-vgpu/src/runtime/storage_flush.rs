@@ -2124,7 +2124,14 @@ pub fn render_window_identity(
     }
 }
 
-/// Report what a landing window is about to overwrite, and preserve none of it.
+/// Report that a landing window is about to overwrite the guest's own stores.
+///
+/// This returns nothing, and that is the finding rather than an omission. It
+/// used to hand back the ranges to preserve; it now preserves none of them, and
+/// carrying an always-empty `Vec` out to the writeback made three signatures
+/// advertise a narrowing no caller can ever ask for — a reader auditing whether
+/// this rail honours guest writes would find a `skip` parameter and conclude it
+/// does, when it deliberately does not and says so on every occurrence.
 ///
 /// A deferred window promises to replay a synchronous Store later, and that is
 /// only a replay while nothing else writes the pages in between. The writeback
@@ -2175,14 +2182,14 @@ pub fn render_window_identity(
 /// `HostOps::guest_written_pages` stay: the sampled ladder's merge uses both,
 /// and it errs the other way — it keeps both halves rather than choosing.
 #[cfg(feature = "backend-vulkan")]
-fn render_flush_guest_written_ranges<M: HostOps>(
+fn note_render_flush_over_guest_write<M: HostOps>(
     state: &DeviceState,
     host: &M,
     key: &crate::model::ComputeStorageResidencyKey,
-) -> Vec<(u64, u64)> {
+) {
     use crate::runtime::mapper::{mapping_guest_write_verdict, GuestWriteVerdict};
     if mapping_guest_write_verdict(state, host, key.mapping_id) != GuestWriteVerdict::Wrote {
-        return Vec::new();
+        return;
     }
     crate::runtime::drain::note_store_route("render_flush_over_guest_write");
     crate::observe::fail(format!(
@@ -2191,7 +2198,6 @@ fn render_flush_guest_written_ranges<M: HostOps>(
          the full-extent writeback replaces them)",
         key.mapping_id, key.width, key.height, key.pixel_format, key.map_generation
     ));
-    Vec::new()
 }
 
 #[cfg(feature = "backend-vulkan")]
@@ -2446,7 +2452,7 @@ fn flush_render_one<M: HostMemory + HostOps>(
             }
         }
     };
-    let preserve = render_flush_guest_written_ranges(state, host, key);
+    note_render_flush_over_guest_write(state, host, key);
     let write_started = std::time::Instant::now();
     let ok = match &frame {
         FlushFrame::Owned(bytes) => crate::runtime::mapping_write::write_bgra8_owned(
@@ -2457,7 +2463,6 @@ fn flush_render_one<M: HostMemory + HostOps>(
             key.width.saturating_mul(4),
             key.width,
             key.height,
-            &preserve,
         ),
         FlushFrame::Leased(leased) => crate::runtime::mapping_write::write_bgra8_uncached(
             state,
@@ -2467,7 +2472,6 @@ fn flush_render_one<M: HostMemory + HostOps>(
             key.width.saturating_mul(4),
             key.width,
             key.height,
-            &preserve,
         ),
     };
     crate::runtime::drain::note_readback_phase(
@@ -2475,11 +2479,12 @@ fn flush_render_one<M: HostMemory + HostOps>(
         write_started.elapsed().as_micros() as u64,
     );
     // Whether this flush left a host surface cache copy behind, which decides
-    // whether the witness has a cache leg to score at all. Two writebacks leave
-    // none: a borrowed frame drops the entry because the memory holding it goes
-    // back to the pool, and a skipping write drops it because the guest's own
-    // stores are in the pages and no host-side copy is their content any more.
-    let cache_stored = matches!(&frame, FlushFrame::Owned(_)) && preserve.is_empty();
+    // whether the witness has a cache leg to score at all. A borrowed frame
+    // leaves none: it drops the entry because the memory holding it goes back to
+    // the pool. The skipping write is the other writeback that leaves none, and
+    // it is not reachable from here — this rail preserves nothing, so no store
+    // it makes is a skipping one.
+    let cache_stored = matches!(&frame, FlushFrame::Owned(_));
     // End the lease before anything below reaches the engine again — the
     // resident re-stamp does. A holder that blocks on the engine lock while a
     // teardown is waiting for exactly this lease is the deadlock `LeasedFrame`
@@ -3292,7 +3297,9 @@ mod tests {
     /// before it), because `page_gen` is stamped at the harvest and not at the
     /// write, so a store the device's own render superseded can still be named
     /// "written since the Store". See
-    /// [`super::render_flush_guest_written_ranges`].
+    /// [`super::note_render_flush_over_guest_write`], which returns nothing at
+    /// all now — "preserves nothing" is in its signature and no longer only in
+    /// this assertion.
     #[cfg(feature = "backend-vulkan")]
     #[test]
     fn a_render_window_landing_over_guest_writes_reports_them_and_preserves_nothing() {
@@ -3322,16 +3329,12 @@ mod tests {
                 host.guest_wrote_page(page);
             }
             let cap = crate::observe::FailCapture::start();
-            let preserve = super::render_flush_guest_written_ranges(&state, &host, &key(9, 0, 256));
+            super::note_render_flush_over_guest_write(&state, &host, &key(9, 0, 256));
             let clobbers: Vec<String> = cap
                 .lines()
                 .into_iter()
                 .filter(|l| l.split_whitespace().next() == Some("deferred_flush_clobber"))
                 .collect();
-            assert!(
-                preserve.is_empty(),
-                "guest_wrote={guest_wrote}: the landing writes its whole extent, always"
-            );
             assert_eq!(
                 clobbers.len(),
                 usize::from(guest_wrote),

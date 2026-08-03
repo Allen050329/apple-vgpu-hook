@@ -2061,8 +2061,7 @@ fn an_owned_writeback_publishes_its_frame_to_the_cache_without_copying_it() {
         &frame,
         stride,
         w,
-        h,
-        &[]
+        h
     ));
 
     let published = crate::runtime::surface_cache::get(&state, 7, w, h)
@@ -2087,8 +2086,7 @@ fn an_owned_writeback_publishes_its_frame_to_the_cache_without_copying_it() {
         &padded,
         padded_stride,
         w,
-        h,
-        &[]
+        h
     ));
     let repacked = crate::runtime::surface_cache::get(&state, 7, w, h).unwrap();
     assert_ne!(
@@ -2142,7 +2140,7 @@ fn a_borrowed_writeback_drops_the_cache_entry_rather_than_leaving_it_stale() {
     // An owning writeback first, so there is an entry to be left behind.
     let first = std::sync::Arc::new(vec![0x11u8; need]);
     assert!(write_bgra8_owned(
-        &mut state, &mut host, 9, &first, stride, w, h, &[]
+        &mut state, &mut host, 9, &first, stride, w, h
     ));
     assert!(
         crate::runtime::surface_cache::get(&state, 9, w, h).is_some(),
@@ -2151,7 +2149,7 @@ fn a_borrowed_writeback_drops_the_cache_entry_rather_than_leaving_it_stale() {
 
     let second: Vec<u8> = (0..need).map(|i| (i % 241) as u8).collect();
     assert!(write_bgra8_uncached(
-        &mut state, &mut host, 9, &second, stride, w, h, &[]
+        &mut state, &mut host, 9, &second, stride, w, h
     ));
 
     assert!(

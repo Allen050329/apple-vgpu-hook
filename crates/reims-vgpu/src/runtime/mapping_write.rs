@@ -617,10 +617,12 @@ pub fn write_bgra8_skipping<M: HostMemory + HostOps>(
 /// pointer has to be the one the rest of this write read from, the pitch has to
 /// be the packed row length, and the allocation has to cover the whole frame.
 /// Anything else takes the copying publish.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the geometry the frame is in, plus the ranges its owner may not overwrite"
-)]
+/// Writes the frame whole. Its one caller is the deferred render flush, which
+/// preserves nothing by design — see
+/// [`crate::runtime::storage_flush`]'s `note_render_flush_over_guest_write` for
+/// why the witness a narrowing would rest on cannot answer. A caller that does
+/// need to skip has [`write_bgra8_skipping`]; adding the parameter back here
+/// belongs with the caller that can fill it.
 pub fn write_bgra8_owned<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -629,7 +631,6 @@ pub fn write_bgra8_owned<M: HostMemory + HostOps>(
     src_stride: u32,
     width: u32,
     height: u32,
-    skip: SkipRanges<'_>,
 ) -> bool {
     write_bgra8_inner(
         state,
@@ -640,7 +641,7 @@ pub fn write_bgra8_owned<M: HostMemory + HostOps>(
         src_stride,
         width,
         height,
-        skip,
+        &[],
         None,
     )
 }
@@ -663,10 +664,7 @@ pub fn write_bgra8_owned<M: HostMemory + HostOps>(
 /// through to a source that does hold this frame — the surface's own guest
 /// pages, which this write has just landed, or the resident it came out of —
 /// so the miss costs a slower route to the same pixels and never wrong ones.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the geometry the frame is in, plus the ranges its owner may not overwrite"
-)]
+/// Writes the frame whole, for the same reason [`write_bgra8_owned`] does.
 pub fn write_bgra8_uncached<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -675,11 +673,8 @@ pub fn write_bgra8_uncached<M: HostMemory + HostOps>(
     src_stride: u32,
     width: u32,
     height: u32,
-    skip: SkipRanges<'_>,
 ) -> bool {
-    write_bgra8_uncached_changed(
-        state, host, mapping_id, src, src_stride, width, height, skip, None,
-    )
+    write_bgra8_uncached_changed(state, host, mapping_id, src, src_stride, width, height, None)
 }
 
 /// [`write_bgra8_uncached`], storing only the frame ranges `changed` names.
@@ -702,7 +697,7 @@ pub fn write_bgra8_uncached<M: HostMemory + HostOps>(
 /// the runs to later readers, and outside the runs there are no bytes.
 #[allow(
     clippy::too_many_arguments,
-    reason = "the geometry the frame is in, plus the two independent narrowings of it"
+    reason = "the geometry the frame is in, plus the narrowing of it"
 )]
 pub fn write_bgra8_uncached_changed<M: HostMemory + HostOps>(
     state: &mut DeviceState,
@@ -712,7 +707,6 @@ pub fn write_bgra8_uncached_changed<M: HostMemory + HostOps>(
     src_stride: u32,
     width: u32,
     height: u32,
-    skip: SkipRanges<'_>,
     changed: Option<ChangedRuns<'_>>,
 ) -> bool {
     write_bgra8_inner(
@@ -724,7 +718,7 @@ pub fn write_bgra8_uncached_changed<M: HostMemory + HostOps>(
         src_stride,
         width,
         height,
-        skip,
+        &[],
         changed,
     )
 }
@@ -2157,7 +2151,6 @@ mod tests {
                 W * 4,
                 W,
                 H,
-                &[],
                 Some(&[RUN]),
             ));
 
@@ -2220,7 +2213,6 @@ mod tests {
                 W * 4,
                 W,
                 H,
-                &[],
                 Some(&[]),
             ));
             for page in 0..4u64 {
