@@ -4450,32 +4450,34 @@ fn type11_sample_resolves_geometry_before_reading_it() {
     );
 }
 
-/// The format-0 invent must be counted every time it is taken, and never when
-/// it is not.
+/// A type-4 colour attachment whose mapping carries the decoder's format
+/// refusal must be declined, and every decline must be counted.
 ///
-/// `m.format == 0` is the type-4 decoder's refusal — multi-plane, or a FourCC it
-/// does not know — and it says in three places that callers must not invent
-/// BGRA from it. This resolve does, on both its arms. The counter is what will
-/// decide whether that invent is reachable at all; a counter that fires on
-/// ordinary formats, or stays quiet on the refusal, would answer the wrong
-/// question and the answer would look the same either way.
+/// `m.format == 0` on a type-4 mapping has exactly one writer,
+/// `apply_type4_backing`, and it means multi-plane or unknown FourCC — a surface
+/// that is not a single-format colour attachment. Inventing BGRA8 from it
+/// describes the wrong stride over the wrong bytes and every downstream window
+/// is built from the answer. The counter has to fire on the refusal and only on
+/// it: one that also fired on ordinary formats would answer a different question
+/// and read identically.
 #[test]
-fn the_render_target_format_invent_counts_exactly_the_refusals() {
+fn a_type4_render_target_declines_the_decoders_format_refusal() {
     use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::drain::store_route_count;
 
-    let before = store_route_count("rt_base_fmt_invent");
+    let before = store_route_count("rt_base_fmt_declined");
     // A format the decoder resolved is passed through untouched and uncounted.
     assert_eq!(
-        super::rt_base_format(MTL_FORMAT_BGRA8_UNORM, 11, "t"),
-        MTL_FORMAT_BGRA8_UNORM
+        super::rt_type4_base_format(MTL_FORMAT_BGRA8_UNORM, 11),
+        Some(MTL_FORMAT_BGRA8_UNORM)
     );
-    assert_eq!(store_route_count("rt_base_fmt_invent"), before);
-    // The refusal is what gets invented over, and it is counted per occurrence
-    // (not per mapping — the fail line is deduped, the counter is not).
-    assert_eq!(super::rt_base_format(0, 11, "t"), MTL_FORMAT_BGRA8_UNORM);
-    assert_eq!(super::rt_base_format(0, 12, "t"), MTL_FORMAT_BGRA8_UNORM);
-    assert_eq!(store_route_count("rt_base_fmt_invent"), before + 2);
+    assert_eq!(store_route_count("rt_base_fmt_declined"), before);
+    // The refusal declines, and is counted per occurrence — the fail line is
+    // deduped per mapping, the counter is not.
+    assert_eq!(super::rt_type4_base_format(0, 11), None);
+    assert_eq!(super::rt_type4_base_format(0, 12), None);
+    assert_eq!(super::rt_type4_base_format(0, 11), None);
+    assert_eq!(store_route_count("rt_base_fmt_declined"), before + 3);
 }
 
 /// A type-5 colour attachment must be scored on whether its view agrees with

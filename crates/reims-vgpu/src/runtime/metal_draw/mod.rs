@@ -3313,45 +3313,51 @@ pub fn encode_icb_execute_and_writeback<M: HostMemory + HostOps>(
     EncodeStatus::NoMetal("icb_exec_no_metal_build")
 }
 
-/// The colour render target's base format, counting the case where the mapping
-/// has none.
+/// The colour render target's base format for a **type-4** surface, or nothing.
 ///
-/// `m.format == 0` is not "unset", it is a decoded refusal:
-/// [`objects::apply_type4_backing`] stores 0 for a multi-plane surface and for a
-/// single-plane one whose FourCC it does not know, and says why — "stage/paint
-/// must not invent BGRA". [`objects::iosurface_pixel_format_to_mtl`] repeats it
-/// twice more, and the compute staging path honours it, declining with typed
-/// `multiplane` / `fmt_unknown` reasons.
+/// On this arm `m.format == 0` is not "unset", it is a decoded refusal:
+/// [`objects::apply_type4_backing`] is the only writer of it, and it stores 0 for
+/// a multi-plane surface and for a single-plane one whose FourCC it does not
+/// know, saying why — "stage/paint must not invent BGRA".
+/// [`objects::iosurface_pixel_format_to_mtl`] repeats it twice more, and the
+/// compute staging path honours it, declining with typed `multiplane` /
+/// `fmt_unknown` reasons.
 ///
-/// This resolve does invent BGRA8, on both of its arms. That is the divergence,
-/// and it is not repaired here because refusing instead would drop a colour
-/// attachment — a whole compositing layer going black — on a class nothing has
-/// yet counted. `rt_base_fmt_invent` is that count. While it reads zero the
-/// invent is unreachable and can go; a non-zero reading is a surface the compute
-/// path refuses and this one renders into as BGRA8, and *then* the two arms have
-/// to be made to agree deliberately rather than by deletion.
+/// This resolve used to invent BGRA8 from it, so one surface was refused by the
+/// compute path and rendered into as BGRA8 by this one. That is not a survivable
+/// disagreement for a multi-plane surface: BGRA8 over a `'420f'` allocation
+/// describes the wrong stride and the wrong bytes, and every downstream window is
+/// built from what this returns.
 ///
-/// **Read on two driven x86/Vulkan boots (40 s Safari window drag plus the
-/// web-content probe): 0 on both.** So the invent is unreached on this workload
-/// and the divergence is latent, not live. That is an argument for replacing it
-/// with the compute path's typed decline rather than leaving two arms disagreeing
-/// — and not an argument that the question is closed. Two boots of one workload
-/// on one pathway cannot say a multi-plane IOSurface is never named as a colour
-/// attachment; this counter going non-zero is exactly how that would first be
-/// seen.
-fn rt_base_format(format: u16, mapping_id: u32, site: &str) -> u16 {
+/// It now declines. Refusing was held back because it drops a colour attachment
+/// — a compositing layer going black — on a class nothing had counted, so the
+/// class was counted first: `rt_base_fmt_invent` read **0 on two driven
+/// x86/Vulkan boots** (Safari window drag plus the web-content probe). The arm is
+/// unreached on this workload, so declining costs nothing measurable and stops
+/// the device from silently rendering a format the guest did not declare. The
+/// counter stays and the fail line stays, because "unreached on this workload" is
+/// not "unreachable" — the first surface to take it will now be named and
+/// refused rather than named and rendered wrong.
+///
+/// The **type-11** arm deliberately does not come through here. A type-11
+/// mapping's format has other writers, so its 0 can mean "not latched yet" rather
+/// than "refused", and BGRA8 is the display contract's stated default for that
+/// case ([`crate::runtime::compute_exec`]'s `or_bgra8` writes the same rule down).
+/// Those are different zeros and only this one is provably a refusal.
+fn rt_type4_base_format(format: u16, mapping_id: u32) -> Option<u16> {
     if format != 0 {
-        return format;
+        return Some(format);
     }
-    crate::runtime::drain::note_store_route("rt_base_fmt_invent");
-    if crate::observe::first_sight("rt_base_fmt_invent", mapping_id as u64) {
+    crate::runtime::drain::note_store_route("rt_base_fmt_declined");
+    if crate::observe::first_sight("rt_base_fmt_declined", mapping_id as u64) {
         crate::observe::fail(format!(
-            "rt_base_fmt_invent site={site} mapping={mapping_id} \
-             (the mapping's format is the decoder's multi-plane / unknown-FourCC \
-             refusal and this resolve renders into it as BGRA8 anyway)"
+            "rt_base_fmt_declined mapping={mapping_id} \
+             (the mapping's format is the type-4 decoder's multi-plane / \
+             unknown-FourCC refusal, so this surface is not a single-format \
+             colour attachment and no format is invented for it)"
         ));
     }
-    MTL_FORMAT_BGRA8_UNORM
+    None
 }
 
 /// Report a type-5 colour attachment whose view record disagrees with the base
@@ -3495,7 +3501,15 @@ fn lookup_render_target<M: HostMemory + HostOps>(
         let _ = mapper::ensure_resolved_for_scanout(state, host, mapping_id);
         if let Some(m) = state.mappings.get(&mapping_id) {
             if m.has_geom && m.width > 0 && m.height > 0 {
-                let base_fmt = rt_base_format(m.format, mapping_id, "type11");
+                // Not `rt_type4_base_format`: a type-11 mapping's format has
+                // writers other than the type-4 decoder, so 0 here can mean "not
+                // latched yet" rather than "refused", and BGRA8 is the display
+                // contract's default for that case. See that function.
+                let base_fmt = if m.format != 0 {
+                    m.format
+                } else {
+                    MTL_FORMAT_BGRA8_UNORM
+                };
                 let fmt =
                     effective_view_sample_format(base_fmt, view_fmt_override).unwrap_or(base_fmt);
                 if pixel_format::render_target_bpp(fmt).is_some() {
@@ -3555,7 +3569,7 @@ fn lookup_render_target<M: HostMemory + HostOps>(
         if live_type == Some(objects::OBJECT_TYPE_REF_TEXTURE) {
             note_rt_type5_view(type5_view, surface_id, (base_w, base_h, base_raw_fmt));
         }
-        let base_fmt = rt_base_format(base_raw_fmt, surface_id, "type4");
+        let base_fmt = rt_type4_base_format(base_raw_fmt, surface_id)?;
         let fmt = effective_view_sample_format(base_fmt, view_fmt_override).unwrap_or(base_fmt);
         pixel_format::render_target_bpp(fmt)?;
         // mapping_id = surface_id; no linear GVA.
