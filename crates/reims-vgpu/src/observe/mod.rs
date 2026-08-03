@@ -26,16 +26,30 @@
 //!   names its refusals through.
 //! - [`emit`] — the one builder that renders `reason=<slug> k=v …`, and cannot
 //!   produce a line without a reason.
-//! - `gate` — static scans that keep the above true (test-only).
 //!
 //! # The obligation
 //!
 //! Per `AGENTS.md`: every path that rejects, drops, degrades or mis-executes a
 //! decoded guest command returns a typed decline whose slug is unique crate-wide
-//! and reaches the sink at some call site. `gate::no_two_declines_share_a_slug`
-//! reads the `Decline`/`Refusal` impls to hold the uniqueness half; that a
-//! decline is actually *logged* is the author's obligation, and a typed decline
-//! nobody logs is still a silent failure.
+//! and reaches the sink at some call site. Both halves are the author's
+//! obligation — nothing enforces either. A typed decline nobody logs is still a
+//! silent failure.
+//!
+//! Uniqueness is not a tidiness rule, and this is the failure it prevents.
+//! [`Emit::fail_once`] latches on `(slug, discriminant)` through
+//! [`first_sight`], whose set is one process-global `HashSet`. Two declines
+//! sharing a slug therefore share a latch: whichever fires first for a given
+//! discriminant silences the other for that discriminant for the life of the
+//! boot, and the loss is invisible because the log looks healthy. That is not
+//! hypothetical — `mapping_gpa_span` had exactly this shape between its two
+//! emitters, and the silence it produced had already been written up as a
+//! finding about the device before the collision was noticed.
+//!
+//! A scan of every `Decline::slug` body reads 609 distinct slugs and no
+//! duplicate. That is a measurement of one tree state, not a guarantee about
+//! the next one; a `gate` module that checked it by scanning source text was
+//! removed in `db80389` because the check was over text rather than behaviour,
+//! and it has not been replaced.
 //!
 //! The judgement no gate can make stays with the author: do **not** log
 //! speculative returns (a resolver legitimately answering "not ready yet" every
