@@ -468,6 +468,34 @@ Pick the pathway your change affects.
 - x86: `vm/boot-x86.sh --device reims-vgpu-pci --testing`, then
   `scripts/screenshot-when-kde-plasma-host/screenshot-when-kde-plasma-host.sh -o /tmp/screen.png`
 
+### A boot measured next to your own subagents measures the contention
+
+Every `us=` number this device reports is wall clock on a shared machine, so a driven boot taken
+while a subagent greps, a `cargo` build runs, or a second VM lives is measuring your harness as
+much as the device. This is easy to do by accident and it does not look like an error — the log is
+well-formed and the counters are self-consistent.
+
+Measured directly. Two boots of the identical workload and binary, one with a subagent running and
+one with nothing else on the machine:
+
+| | flush share | draw share | draws/s | µs per draw |
+|---|---|---|---|---|
+| subagent running | 46.4 % | 51.2 % | 561 | 418 |
+| clean | 66.9 % | 29.1 % | 1 070 | 118 |
+
+The contended run halves throughput, triples per-draw cost, and **inverts the flush-vs-draw
+ranking** — which is the number the whole "where is the time going" section below is built on.
+Taken at face value it says the flush rail is no longer the largest cost and the priority should
+move to draw. That conclusion is entirely an artifact.
+
+So: **run the boot with nothing else running, and check `uptime` before believing a timing.** The
+sequence of five boots that produced the table above trends monotonically with how much other work
+was in flight, not with anything in the device.
+
+Counts are far more robust than timings — `store_routes`, refusal counters and the gate survive
+contention, because they do not measure time. When a machine cannot be quiesced, reason from counts
+and treat every `_us` field as an upper bound.
+
 ### An undriven boot measures an idle device
 
 A `--testing` boot reaches the desktop and then sits there. Its counters are the *idle* device's,
