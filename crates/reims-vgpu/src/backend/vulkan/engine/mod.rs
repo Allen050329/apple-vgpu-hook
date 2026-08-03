@@ -1536,6 +1536,24 @@ pub struct DiffedFrame {
 /// whose frame never left the readback slot, leaves the guest's pages holding
 /// the frame before it, and promoting there would make the *next* comparison
 /// answer about a frame that was never landed.
+///
+/// # No caller passes `Some` yet, so the rail is dormant
+///
+/// The only call site is [`read_target_leased`], which passes `None`. Every
+/// consequence follows from that and should be read before believing a boot
+/// log: `diff_pass::attach_for_readback` is never reached, so the tile-diff
+/// shader never runs on the product path, `changed` is always `None`, and
+/// `diff_pass::note_diff_result` — and with it `dr_frames`, `dr_tiles` and
+/// `dr_tiles_changed` — is never emitted. The three functions the contract
+/// above says the caller owes ([`promote_diffed_landing`],
+/// [`diffed_prev_stamp`], [`withdraw_diffed_landing`]) have no callers either.
+///
+/// This is staged work, not an orphan: the pass is exercised end to end through
+/// the real bindings by `diff_pass::probe_tile_diff` and
+/// `tests/vk_engine_compute.rs`. What is missing is the writeback-side consumer
+/// that would pass `Some`, hold the returned ranges, and promote after the
+/// bytes land. Until it exists, no measurement of this rail can come from a
+/// product boot, because none of it executes in one.
 pub fn read_target_leased_diffed(
     identity: &TargetIdentity,
     compare: Option<(&diff_pass::LandingIdentity, bool)>,
