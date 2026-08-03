@@ -64,6 +64,14 @@ pub enum SurfaceWriteRefusal {
     StagedShort { need: usize, have: usize, row: u32 },
     /// The mapper refused to write a run of the frame into the guest's pages.
     MapperWrite { lo: u64, len: usize },
+    /// The seed (previous-frame) buffer ends before the frame it must diff
+    /// against. Distinct from [`Self::SourceShort`] because the two buffers come
+    /// from different producers, and a log that conflated them could not say
+    /// which one to go and look at.
+    SeedShort { need: usize, have: usize },
+    /// A seed row would not convert into the mapping's pixel format. Same
+    /// distinction from [`Self::RowConvert`], and the same reason.
+    SeedRowConvert { format: u16, row: u32 },
 }
 
 impl crate::observe::decline::Decline for SurfaceWriteRefusal {
@@ -82,6 +90,8 @@ impl crate::observe::decline::Decline for SurfaceWriteRefusal {
             Self::FrameExtent { .. } => "surface_write_frame_extent",
             Self::StagedShort { .. } => "surface_write_staged_short",
             Self::MapperWrite { .. } => "surface_write_mapper_write",
+            Self::SeedShort { .. } => "surface_write_seed_short",
+            Self::SeedRowConvert { .. } => "surface_write_seed_row_convert",
         }
     }
 
@@ -135,6 +145,14 @@ impl crate::observe::decline::Decline for SurfaceWriteRefusal {
             Self::MapperWrite { lo, len } => {
                 vec![("lo", format!("{lo:#x}")), ("len", len.to_string())]
             }
+            Self::SeedShort { need, have } => vec![
+                ("need", need.to_string()),
+                ("have", have.to_string()),
+            ],
+            Self::SeedRowConvert { format, row } => vec![
+                ("fmt", format!("{format:#x}")),
+                ("row", row.to_string()),
+            ],
         }
     }
 }
@@ -1134,35 +1152,63 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
     height: u32,
 ) -> bool {
     if width == 0 || height == 0 || width > MAX_SCANOUT_DIM || height > MAX_SCANOUT_DIM {
-        return false;
+        return refuse(mapping_id, SurfaceWriteRefusal::Geometry { width, height });
     }
     let rgba_stride = width.saturating_mul(RGBA8_BPP);
     let need = (height as usize).saturating_mul(rgba_stride as usize);
     if rgba.len() < need {
-        return false;
+        return refuse(
+            mapping_id,
+            SurfaceWriteRefusal::SourceShort {
+                need,
+                have: rgba.len(),
+                row: 0,
+            },
+        );
     }
     if let Some(seed) = seed_rgba {
         if seed.len() < need {
-            return false;
+            return refuse(
+                mapping_id,
+                SurfaceWriteRefusal::SeedShort {
+                    need,
+                    have: seed.len(),
+                },
+            );
         }
     }
     let Some(m) = state.mappings.get(&mapping_id) else {
-        return false;
+        return refuse(mapping_id, SurfaceWriteRefusal::MappingAbsent);
     };
     if !m.mapped || m.page_entries.is_empty() {
-        return false;
+        return refuse(mapping_id, SurfaceWriteRefusal::MappingNotResident);
     }
     let (mw, mh, format) = mapping_write_geometry(m, width, height);
     if mw != width || mh != height {
-        return false;
+        return refuse(
+            mapping_id,
+            SurfaceWriteRefusal::GeometryMoved {
+                latched_width: mw,
+                latched_height: mh,
+                frame_width: width,
+                frame_height: height,
+            },
+        );
     }
     let Some((base_off, bpr_u32, span_end)) = type11_sample_window(m, mapping_id, mw, mh, format)
     else {
-        return false;
+        return refuse(
+            mapping_id,
+            SurfaceWriteRefusal::WindowUnresolved {
+                width: mw,
+                height: mh,
+                format,
+            },
+        );
     };
     let bpr = bpr_u32 as u64;
     let Some(tight) = pixel_format::tight_row_bytes(mw, format) else {
-        return false;
+        return refuse(mapping_id, SurfaceWriteRefusal::FormatRowLength { format });
     };
     let bpr_usize = bpr as usize;
     let tight = tight as usize;
@@ -1182,7 +1228,7 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
     // One proof for the whole image: the changed-span loop below writes each
     // differing row separately, and the walk is a translation per page.
     let Some(vouched) = vouch_for_write(state, host, mapping_id, "rgba8_changed") else {
-        return false;
+        return refuse(mapping_id, SurfaceWriteRefusal::PagesNotOurs);
     };
     let contig = contig_for_write(state, host, mapping_id, span_end, &vouched, rgba);
     // SAFETY: when Some, contig covers span_end.
@@ -1191,12 +1237,24 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
         let src_off = y * rgba_stride as usize;
         let src_row = &rgba[src_off..src_off + rgba_stride as usize];
         if !rgba8_row_to_native(format, src_row, mw, &mut native) {
-            return false;
+            return refuse(
+                mapping_id,
+                SurfaceWriteRefusal::RowConvert {
+                    format,
+                    row: y as u32,
+                },
+            );
         }
         let seed_row = if let Some(seed) = seed_rgba {
             let s = &seed[src_off..src_off + rgba_stride as usize];
             if !rgba8_row_to_native(format, s, mw, &mut seed_native) {
-                return false;
+                return refuse(
+                    mapping_id,
+                    SurfaceWriteRefusal::SeedRowConvert {
+                        format,
+                        row: y as u32,
+                    },
+                );
             }
             Some(seed_native.as_slice())
         } else {
@@ -1258,12 +1316,24 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
                     &native[start..x],
                     &vouched,
                 ) {
-                    return false;
+                    return refuse(
+                        mapping_id,
+                        SurfaceWriteRefusal::MapperWrite {
+                            lo: row_moff.saturating_add(start as u64),
+                            len: x - start,
+                        },
+                    );
                 }
             }
         } else if !mapper::write_mapping_bytes(state, host, mapping_id, row_moff, &native, &vouched)
         {
-            return false;
+            return refuse(
+                mapping_id,
+                SurfaceWriteRefusal::MapperWrite {
+                    lo: row_moff,
+                    len: native.len(),
+                },
+            );
         }
     }
     state.invalidate_storage_residency_window(mapping_id, base_off, span_end);
@@ -3562,6 +3632,100 @@ mod tests {
         assert_eq!(&row[4..8], &[0, 0, 255, 255]);
         // Contrast: Load seed=logo + same rgba would leave logo where equal —
         // not tested here; store_seed_policy gates that path.
+    }
+
+    /// Every refusal in `write_rgba8_image_changed` must name itself.
+    ///
+    /// This writeback is the guest's own copy of a rendered frame, and it is
+    /// reached on the live x86/Vulkan sync-store route. Every one of its
+    /// refusals used to be a bare `false`, so a frame the guest never received
+    /// left no trace at all — while the sibling writer in this same file
+    /// answered the identical conditions through `SurfaceWriteRefusal`. The
+    /// vocabulary was already complete; only this arm did not use it.
+    ///
+    /// Asserting on the route slugs rather than on the fail lines is what makes
+    /// this a regression test: `refuse` latches its line per `(check, mapping)`
+    /// but always counts, so a reverted arm shows up as a counter that stops
+    /// moving even on a mapping that has already refused once.
+    #[test]
+    fn every_rgba8_image_changed_refusal_names_itself() {
+        use crate::runtime::drain::store_route_count;
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut host = FakeHost::new();
+        let pfn = 0x14u32;
+        let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
+        host.map_range(gpa, 0x4000, 0);
+        let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
+        state.map_surface(7);
+        let m = state.mappings.get_mut(&7).unwrap();
+        m.mapped = true;
+        m.mapping_internal = 1;
+        m.page_entries = vec![entry];
+        assert!(state.set_mapping_geom(7, 4, 2, MTL_FORMAT_BGRA8_UNORM));
+        let frame = vec![0u8; 4 * 2 * 4];
+
+        // Each case: (slug, the call that must take that arm).
+        let before = |slug: &str| store_route_count(slug);
+
+        // A zero dimension is not a rect.
+        let n = before("surface_write_geometry");
+        assert!(!write_rgba8_image_changed(
+            &mut state, &mut host, 7, &frame, None, 0, 2
+        ));
+        assert_eq!(store_route_count("surface_write_geometry"), n + 1);
+
+        // The source ends before the frame it declares.
+        let n = before("surface_write_source_short");
+        assert!(!write_rgba8_image_changed(
+            &mut state,
+            &mut host,
+            7,
+            &frame[..4],
+            None,
+            4,
+            2
+        ));
+        assert_eq!(store_route_count("surface_write_source_short"), n + 1);
+
+        // The seed ends before it: a different buffer, so a different slug.
+        let n = before("surface_write_seed_short");
+        assert!(!write_rgba8_image_changed(
+            &mut state,
+            &mut host,
+            7,
+            &frame,
+            Some(&frame[..4]),
+            4,
+            2
+        ));
+        assert_eq!(
+            store_route_count("surface_write_seed_short"),
+            n + 1,
+            "a short seed must not be reported as a short source"
+        );
+
+        // No such mapping: the surface went away between the arm and the landing.
+        let n = before("surface_write_mapping_absent");
+        assert!(!write_rgba8_image_changed(
+            &mut state, &mut host, 4242, &frame, None, 4, 2
+        ));
+        assert_eq!(store_route_count("surface_write_mapping_absent"), n + 1);
+
+        // The latched geometry is not the frame's: landing it would skew.
+        let n = before("surface_write_geometry_moved");
+        let big = vec![0u8; 8 * 8 * 4];
+        assert!(!write_rgba8_image_changed(
+            &mut state, &mut host, 7, &big, None, 8, 8
+        ));
+        assert_eq!(store_route_count("surface_write_geometry_moved"), n + 1);
+
+        // Unmapped: there is nowhere to write.
+        let n = before("surface_write_mapping_not_resident");
+        state.mappings.get_mut(&7).unwrap().mapped = false;
+        assert!(!write_rgba8_image_changed(
+            &mut state, &mut host, 7, &frame, None, 4, 2
+        ));
+        assert_eq!(store_route_count("surface_write_mapping_not_resident"), n + 1);
     }
 
     #[test]
