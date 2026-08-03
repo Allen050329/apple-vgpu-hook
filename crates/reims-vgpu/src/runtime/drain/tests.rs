@@ -3889,3 +3889,80 @@ fn the_compute_info_reply_answers_device_limits_not_a_fixed_triple() {
         "static threadgroup memory is per-pipeline; no device limit answers it"
     );
 }
+
+/// Every control arm that guards on payload length names a short payload.
+///
+/// The dispatch is acknowledged either way — `drain_main_fifo` writes the root
+/// completion stamp after the match and `drain_child_fifo` calls `write_stamp`
+/// the same way — so an arm that merely skips tells the guest its command
+/// completed while nothing happened, and leaves no record. The symptom then
+/// surfaces arbitrarily far downstream: a channel that never drains, an object
+/// list that never binds, a display that never onlines.
+///
+/// One packet per arm, each one byte too short, asserting the arm both refuses
+/// (state unchanged) and says so. `define_task2` and `setup_shared_state`
+/// already named theirs and are included so the vocabulary stays one word.
+#[test]
+fn every_short_control_packet_names_itself() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let short = |opcode: u16, len: usize| Packet {
+        opcode,
+        stamp_count: 0,
+        total_size: PACKET_HEADER_LEN + len as u32,
+        completion_stamp: 0,
+        payload: vec![0u8; len],
+        next_head: 0,
+    };
+
+    let before_mask = state.active_child_mask;
+    for (opcode, need) in [
+        (ROOT_OP_DEVICE_INFO_TAHOE, DEVICE_INFO_TAHOE_REPLY_PFN + 4),
+        (
+            ROOT_OP_DEVICE_INFO_MONTEREY,
+            DEVICE_INFO_MONTEREY_REPLY_PFN + 4,
+        ),
+        (ROOT_OP_DEFINE_FIFO, 4),
+        (ROOT_OP_FREE_FIFO, 4),
+        (ROOT_OP_SET_OBJECT_LIST, SET_OBJECT_LIST_LEN),
+        (ROOT_OP_DEFINE_TASK2, DEFINE_TASK_LEN),
+    ] {
+        process_root_packet(&mut state, &mut host, &short(opcode, need - 1));
+    }
+    assert_eq!(
+        state.active_child_mask, before_mask,
+        "a short DEFINE_FIFO must not open a channel"
+    );
+
+    for (opcode, need) in [
+        (CHILD_OP_SET_OBJECT_LIST, SET_OBJECT_LIST_LEN),
+        (CHILD_OP_DELETE_OBJECT, 8),
+        (CHILD_OP_CURSOR_SHOW, 8),
+        (CHILD_OP_SETUP_SHARED_STATE, CHILD_SHARED_STATE_LEN),
+    ] {
+        process_child_packet(&mut state, &mut host, 4, &short(opcode, need - 1));
+    }
+    assert_eq!(
+        state.display.shared_gpa, 0,
+        "a short SETUP_SHARED_STATE must not latch a display page"
+    );
+
+    let log = std::fs::read_to_string(crate::observe::fail_log_path()).expect("fail log");
+    for reason in [
+        "reason=device_info_tahoe_short site=root",
+        "reason=device_info_monterey_short site=root",
+        "reason=define_fifo_short site=root",
+        "reason=free_fifo_short site=root",
+        "reason=set_object_list_short site=root",
+        "reason=define_task2_short site=root",
+        "reason=set_object_list_short site=ch4",
+        "reason=delete_object_short site=ch4",
+        "reason=cursor_show_short site=ch4",
+        "reason=setup_shared_state_short site=ch4",
+    ] {
+        assert!(
+            log.contains(reason),
+            "a short packet was dropped without naming itself: {reason}"
+        );
+    }
+}

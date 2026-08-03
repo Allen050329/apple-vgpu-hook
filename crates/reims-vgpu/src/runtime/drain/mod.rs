@@ -84,6 +84,34 @@ const DISPLAY_TXN_PAYLOAD_DUMP_MAX: usize = 128;
 /// A short payload drops the task definition, and every later draw or resolve
 /// on that task then fails downstream with no root cause. The child ring named
 /// that; the root ring did not, and dropped silently. Both name it now.
+/// True when a control packet is too short to carry the fields its opcode
+/// needs, having said so.
+///
+/// Every arm that guards on payload length is acknowledged regardless of
+/// whether it did anything: `drain_main_fifo` writes the root completion stamp
+/// after the dispatch match, and `drain_child_fifo` calls `write_stamp` the
+/// same way. So an arm that just skips on a short payload tells the guest its
+/// command completed while nothing happened, and leaves the fail log empty —
+/// the worst shape a loss can take, because the symptom surfaces arbitrarily
+/// far downstream (a channel that never drains, an object list that never
+/// binds) with no record of the cause.
+///
+/// `site` separates the two rings on the census line the way
+/// [`apply_define_task2`] does, since the same opcode arrives on both.
+fn packet_short(op: &'static str, channel: Option<u32>, have: usize, need: usize) -> bool {
+    if have >= need {
+        return false;
+    }
+    let site = match channel {
+        Some(ch) => format!("ch{ch}"),
+        None => "root".to_string(),
+    };
+    crate::observe::fail(format!(
+        "packet_short reason={op}_short site={site} plen={have} need={need}"
+    ));
+    true
+}
+
 fn apply_define_task2<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut H,
@@ -755,21 +783,31 @@ fn process_root_packet<H: HostMemory + HostOps>(
 
     match effective {
         ROOT_OP_DEVICE_INFO_TAHOE => {
-            if packet.payload.len() >= DEVICE_INFO_TAHOE_REPLY_PFN + 4 {
+            if !packet_short(
+                "device_info_tahoe",
+                None,
+                packet.payload.len(),
+                DEVICE_INFO_TAHOE_REPLY_PFN + 4,
+            ) {
                 let count = ld32(&packet.payload[DEVICE_INFO_TAHOE_COUNT..]);
                 let pfn = ld32(&packet.payload[DEVICE_INFO_TAHOE_REPLY_PFN..]);
                 let _ = reply_device_info(host, count, pfn, state.page_shift, state.gfx.version);
             }
         }
         ROOT_OP_DEVICE_INFO_MONTEREY => {
-            if packet.payload.len() >= DEVICE_INFO_MONTEREY_REPLY_PFN + 4 {
+            if !packet_short(
+                "device_info_monterey",
+                None,
+                packet.payload.len(),
+                DEVICE_INFO_MONTEREY_REPLY_PFN + 4,
+            ) {
                 let count = ld32(&packet.payload[DEVICE_INFO_MONTEREY_COUNT..]);
                 let pfn = ld32(&packet.payload[DEVICE_INFO_MONTEREY_REPLY_PFN..]);
                 let _ = reply_device_info(host, count, pfn, state.page_shift, state.gfx.version);
             }
         }
         ROOT_OP_DEFINE_FIFO => {
-            if packet.payload.len() >= 4 {
+            if !packet_short("define_fifo", None, packet.payload.len(), 4) {
                 let ch = ld32(&packet.payload[0..]);
                 if ch >= 1 && (ch as usize) < MAX_CHANNELS {
                     let bit = 1u32 << ch;
@@ -783,7 +821,7 @@ fn process_root_packet<H: HostMemory + HostOps>(
             }
         }
         ROOT_OP_FREE_FIFO => {
-            if packet.payload.len() >= 4 {
+            if !packet_short("free_fifo", None, packet.payload.len(), 4) {
                 let ch = ld32(&packet.payload[0..]);
                 if ch >= 1 && (ch as usize) < MAX_CHANNELS {
                     let bit = 1u32 << ch;
@@ -798,7 +836,12 @@ fn process_root_packet<H: HostMemory + HostOps>(
         }
         ROOT_OP_DEFINE_TASK2 => apply_define_task2(state, host, &packet.payload, "root"),
         ROOT_OP_SET_OBJECT_LIST => {
-            if packet.payload.len() >= SET_OBJECT_LIST_LEN {
+            if !packet_short(
+                "set_object_list",
+                None,
+                packet.payload.len(),
+                SET_OBJECT_LIST_LEN,
+            ) {
                 let task_id = ld32(&packet.payload[SET_OBJECT_LIST_TASK_ID..]);
                 let pfn = ld32(&packet.payload[SET_OBJECT_LIST_PFN..]);
                 let count = ld32(&packet.payload[SET_OBJECT_LIST_COUNT..]);
@@ -1883,23 +1926,23 @@ fn process_child_packet<H: HostMemory + HostOps>(
             );
         }
         CHILD_OP_SET_OBJECT_LIST => {
-            if packet.payload.len() >= SET_OBJECT_LIST_LEN {
+            // A short SET_OBJECT_LIST leaves the task's object list unbound —
+            // every type-11 texture/object resolve on it then fails
+            // (object_list_count==0). Never on a well-formed boot.
+            if !packet_short(
+                "set_object_list",
+                Some(channel_id),
+                packet.payload.len(),
+                SET_OBJECT_LIST_LEN,
+            ) {
                 let task_id = ld32(&packet.payload[SET_OBJECT_LIST_TASK_ID..]);
                 let pfn = ld32(&packet.payload[SET_OBJECT_LIST_PFN..]);
                 let count = ld32(&packet.payload[SET_OBJECT_LIST_COUNT..]);
                 let _ = state.set_object_list(task_id, pfn, count);
-            } else {
-                // A short SET_OBJECT_LIST silently leaves the task's object list
-                // unbound — every type-11 texture/object resolve on it then
-                // fails (object_list_count==0). Never on a well-formed boot.
-                crate::observe::fail(format!(
-                    "child_packet_short reason=set_object_list_short ch={channel_id} plen={} need={SET_OBJECT_LIST_LEN}",
-                    packet.payload.len()
-                ));
             }
         }
         CHILD_OP_DELETE_OBJECT => {
-            if packet.payload.len() >= 8 {
+            if !packet_short("delete_object", Some(channel_id), packet.payload.len(), 8) {
                 let task_id = ld32(&packet.payload[0..]);
                 let id = ld32(&packet.payload[4..]);
                 let _ = state.delete_object(task_id, id);
@@ -1920,7 +1963,15 @@ fn process_child_packet<H: HostMemory + HostOps>(
             ));
         }
         CHILD_OP_SETUP_SHARED_STATE => {
-            if packet.payload.len() >= CHILD_SHARED_STATE_LEN {
+            // A short SETUP_SHARED_STATE drops display registration:
+            // shared_gpa/index never latch, so the display NEVER onlines and the
+            // boot wedges on a blank/console frame. The loudest of this class.
+            if !packet_short(
+                "setup_shared_state",
+                Some(channel_id),
+                packet.payload.len(),
+                CHILD_SHARED_STATE_LEN,
+            ) {
                 let index = ld32(&packet.payload[CHILD_SHARED_STATE_INDEX..]);
                 let pfn = ld32(&packet.payload[CHILD_SHARED_STATE_PFN..]);
                 // reinit=1 means the guest tears down + re-registers the display
@@ -1945,16 +1996,6 @@ fn process_child_packet<H: HostMemory + HostOps>(
                 // Do **not** pulse ONLINE here — enable() has not set +0x104 yet
                 // (archive poll waits for mask bit 2, then pending+IRQ).
                 fill_display_descriptor(host, state.display.shared_gpa, index, state.page_size());
-            } else {
-                // A short SETUP_SHARED_STATE silently drops display registration:
-                // shared_gpa/index never latch, so the display NEVER onlines and
-                // the boot wedges on a blank/console frame with no root cause.
-                // The single loudest silent-drop in the pipeline. Never on a
-                // well-formed boot.
-                crate::observe::fail(format!(
-                    "child_packet_short reason=setup_shared_state_short ch={channel_id} plen={} need={CHILD_SHARED_STATE_LEN}",
-                    packet.payload.len()
-                ));
             }
         }
         CHILD_OP_ONLINE_ACK => {
@@ -2052,7 +2093,7 @@ fn process_child_packet<H: HostMemory + HostOps>(
             }
         }
         CHILD_OP_CURSOR_SHOW => {
-            if packet.payload.len() >= 8 {
+            if !packet_short("cursor_show", Some(channel_id), packet.payload.len(), 8) {
                 let show = ld32(&packet.payload[4..]) != 0;
                 state.cursor.show = show;
                 sample_cursor_position(state, host);
