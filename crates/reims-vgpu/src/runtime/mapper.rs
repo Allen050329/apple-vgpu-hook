@@ -1814,17 +1814,35 @@ fn first_control_page_collision(state: &DeviceState, gpas: &[u64]) -> Option<(u6
     let mut pages: Vec<u64> = gpas.iter().map(|&gpa| page_base(gpa)).collect();
     pages.sort_unstable();
     let holds = |gpa: u64| pages.binary_search(&page_base(gpa)).is_ok();
+    // The lowest surface page in `[start, end)`, if any. `start` is page-aligned
+    // and every entry is a page base, so a hit is exactly one of the pages a
+    // per-page enumeration would have reported — same page, same reported gpa.
+    let holds_range = |start: u64, len: u64| -> Option<u64> {
+        let end = start.saturating_add(len);
+        let i = pages.partition_point(|&p| p < start);
+        pages.get(i).copied().filter(|&p| p < end)
+    };
 
     if state.gfx.root_page != 0 && holds((state.gfx.root_page as u64) << state.page_shift) {
         return Some(((state.gfx.root_page as u64) << state.page_shift, "gfx_root"));
     }
-    if state.gfx.fifo_base_page != 0 && holds((state.gfx.fifo_base_page as u64) << state.page_shift)
-    {
-        return Some((
-            (state.gfx.fifo_base_page as u64) << state.page_shift,
-            "root_fifo",
-        ));
+    // The main FIFO is as long as the guest said it is, not one page. The ring
+    // spans `fifo_length` bytes from the base page — `drain_main_fifo` reads it
+    // over exactly that extent, `fifo_start` being the header offset *inside*
+    // it — and it is routinely more than one page, so probing only the first
+    // let a surface alias the rest of the ring undetected.
+    if state.gfx.fifo_base_page != 0 {
+        let base = (state.gfx.fifo_base_page as u64) << state.page_shift;
+        if let Some(gpa) = holds_range(base, state.gfx.fifo_length.max(1) as u64) {
+            return Some((gpa, "root_fifo"));
+        }
     }
+    // Still the first page only. `iosfc.capacity` would give the ring's extent
+    // the way `fifo_length` does above, but nothing in this crate consumes it —
+    // it is written and read back over MMIO and never bounds anything — so its
+    // units are not established, and sizing a rejection window from a field
+    // whose meaning is a guess is how a legitimate surface gets refused. Bound
+    // it when a consumer settles whether it counts entries or bytes.
     if state.iosfc.ring_base != 0 && holds(state.iosfc.ring_base) {
         return Some((page_base(state.iosfc.ring_base), "iosfc_ring"));
     }
@@ -4063,6 +4081,52 @@ mod tests {
             Some((0x440_000, "task_directory"))
         );
         assert_eq!(first_control_page_collision(&state, &[0x660_000]), None);
+    }
+
+    /// The main FIFO is as long as the guest declared it, not one page.
+    ///
+    /// The ring spans `fifo_length` bytes from its base page and is routinely
+    /// larger than a page, but the guard probed only the first one — so a
+    /// surface backed by the ring's second page aliased live transport memory
+    /// and was accepted. `fifo_length` is a decoded guest field with a real
+    /// consumer (`drain_main_fifo` reads the ring over exactly that extent), so
+    /// the bound is the guest's own number rather than a chosen one.
+    #[test]
+    fn the_main_fifo_is_probed_over_every_page_the_guest_declared() {
+        let mut state = DeviceState::new(DeviceId(1), crate::model::PAGE_SHIFT_X86);
+        let page = 1u64 << crate::model::PAGE_SHIFT_X86;
+        state.gfx.fifo_base_page = 0x220;
+        // Four pages of ring, which is what the guest's own length says.
+        state.gfx.fifo_length = (4 * page) as u32;
+        let base = 0x220u64 << crate::model::PAGE_SHIFT_X86;
+
+        for i in 0..4u64 {
+            let gpa = base + i * page;
+            assert_eq!(
+                first_control_page_collision(&state, &[gpa]),
+                Some((gpa, "root_fifo")),
+                "page {i} of the declared ring is transport memory"
+            );
+        }
+        // One page past the declared end is not the ring.
+        assert_eq!(
+            first_control_page_collision(&state, &[base + 4 * page]),
+            None
+        );
+        // The lowest colliding page is the one reported, whatever order the
+        // surface names its pages in.
+        assert_eq!(
+            first_control_page_collision(&state, &[base + 3 * page, base + page]),
+            Some((base + page, "root_fifo"))
+        );
+        // A declared length of zero still guards the base page itself, so a
+        // ring the guest has based but not yet sized is not a hole.
+        state.gfx.fifo_length = 0;
+        assert_eq!(
+            first_control_page_collision(&state, &[base]),
+            Some((base, "root_fifo"))
+        );
+        assert_eq!(first_control_page_collision(&state, &[base + page]), None);
     }
 
     /// A task's object list lives in that task's GVA space, so its number must
