@@ -221,6 +221,27 @@ Pick the pathway your change affects.
 - x86: `vm/boot-x86.sh --device reims-vgpu-pci --testing`, then
   `scripts/screenshot-when-kde-plasma-host/screenshot-when-kde-plasma-host.sh -o /tmp/screen.png`
 
+### An undriven boot measures an idle device
+
+A `--testing` boot reaches the desktop and then sits there. Its counters are the *idle* device's,
+and reading them as this device's behaviour is how a rail gets called dead when the workload simply
+never asked for it. If a change is about throughput, caching, writeback or present cadence, the boot
+has to be driven.
+
+Run the boot in the background and drive the guest **while it is up** — the `--testing` boot exposes
+SSH on `localhost:2222` (`macos-vm` in `~/.ssh/config`) for its whole life, so a probe does not need
+its own boot:
+
+```sh
+vm/boot-x86.sh --device reims-vgpu-pci --testing &     # ~7 min before its own hard kill
+ssh macos-vm true                                      # wait for the guest to answer
+scripts/window-drag-probe/window-drag-probe.sh --seconds 25 --app Safari
+```
+
+That produces real window-server compositing — a measured 499 draws/s at drain duty 0.97, against
+0 draws/s idle. The probe refuses a verdict if the window never moved, so a run that produced no
+motion cannot be mistaken for a slow device.
+
 For Rust changes, run the relevant native tests serially from the repo root:
 
 ```sh
