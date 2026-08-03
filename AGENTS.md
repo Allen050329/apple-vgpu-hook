@@ -337,8 +337,24 @@ already been run to exhaustion; re-running one costs hours and has so far return
   `OBJECT_LIST_ENTRY_LEN` is 12. **The generalisable check is cheap: for any predicate mixing
   fields, confirm every operand is in the same address space, by tracing each to its writer and to
   one other consumer.** A field named `*_pfn` does not settle it; `object_list_pfn` is a virtual
-  one. This has now been run over that function and its five survivors are clean; the rest of the
-  crate has not been swept for it.
+  one.
+  **That sweep has now been run over the whole crate, and it returned nothing — do not re-run it.**
+  Every non-test `<< page_shift` / `pfn_to_gpa` / `pfn_gpa` site (14), every `is_ram_gpa` /
+  `read_gpa` / `write_gpa` / `map_pages` / `entry_gpa_shift` call, and every `.contains`,
+  `binary_search` and `partition_point` in non-test code were enumerated rather than sampled. The
+  bug does not recur. Four near-misses cost the sweep real time and are worth not re-deriving:
+  `observe::footprint::Rail::RawGva` is named for its *rail*, not its argument, and both callers
+  correctly pass translated GPAs; `flush_intersecting_task_gva` probes a GVA-keyed map and a
+  GPA-keyed one in the same function, correctly on both; `gva_view.rs`'s `run_gva = span_page_base
+  + run.start * page_size` mixes a GVA base with an index into a GPA array, which is sound because
+  `gpas[i]` is span page `i` by construction; and `blit_exec`'s `sl.base_gva == dl.base_gva`
+  compares two GVAs resolved through the same task.
+  **The one field most likely to reproduce this bug is `Type4Walk`/`Type4Surface::backing_pfn`**,
+  which is a *virtual* address (`getGPUVirtualAddress >> page_shift`) despite the `_pfn` name. Its
+  four consumers all correctly feed `translate_task_gva`; a fifth that shifts it into a physical
+  read would be the same defect. The arm64-only kernel-VA-vs-GPA discrimination in
+  `iosurface_pages::build_table_plan` is a different address-space pair and is priced separately
+  above; it still needs an Apple host.
 - **The blank-sample loss class is closed — it was never a loss.** `lin_rung_blank_with_host_entry`
   read 22 a boot with `lin_rung_blank_host_agrees` 22 and `lin_rung_blank_host_content` **0**: every
   occurrence is a span the device CLEARed, cached blank, and read back blank off pages that are also
