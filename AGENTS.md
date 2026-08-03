@@ -553,6 +553,21 @@ never read by anything in the device before the next flush replaces it. Note als
 tile-difference delivery path was built and deleted whole in `6df980c` for being reached by nothing
 — read that commit before rebuilding it.
 
+**The obvious way to bound it is now measured and it is dead: the guest's own scissor rects.** The
+device knows, per draw, the rect the guest scissored to, so bounding each flush by the union of its
+pass's scissors is the repair that needs no new contract and no host capability. It saves nothing.
+Over 17 696 armed windows on a clean driven boot, **99.92% have a per-pass scissor union of 100%** —
+the pass drew the whole surface, so there is no smaller extent to copy (`note_pass_scissor_union`,
+which carries the table). The per-draw distribution beside it looks encouraging in isolation — two
+thirds of *partial* draws cover a quarter of the surface or less — and reading only that is how this
+gets rebuilt; the governing number is that **half of all draws are full-coverage**, and a window is
+7 draws, so `0.5^7` says essentially every window contains one.
+That also settles the shape of any successor: it is not the bounding-box approximation that kills
+it. A rect list or a tile map would score better on a union, but no representation makes a
+full-surface draw smaller, so `6df980c`'s tile-diff rail must not be revived on this argument
+either. A damage-bounded flush needs a *different* source of damage than the draw stream — and none
+is currently decoded.
+
 For Rust changes, run the relevant native tests serially from the repo root:
 
 ```sh
