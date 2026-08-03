@@ -13,8 +13,9 @@
 
 use crate::contract::endian::{ld32, ld64, st16, st32, st64};
 use crate::contract::iosurface_pages::{
-    entry_gpa_shift, page_size_of, DEVICE_DESC_ALLOC_SIZE, DEVICE_DESC_BPE, DEVICE_DESC_BPR,
-    DEVICE_DESC_DIMS, DEVICE_DESC_LEN, DEVICE_DESC_PIXEL_FORMAT, DEVICE_DESC_PLANES,
+    entry_gpa_shift, page_size_of, DEVICE_DESC_ALLOC_SIZE, DEVICE_DESC_BASE_OFFSET,
+    DEVICE_DESC_BPE, DEVICE_DESC_BPR, DEVICE_DESC_DIMS, DEVICE_DESC_LEN,
+    DEVICE_DESC_PIXEL_FORMAT, DEVICE_DESC_PLANES,
     DEVICE_DESC_PLANE_COUNT, DEVICE_PLANE_BPE, DEVICE_PLANE_BPR, DEVICE_PLANE_DESC_LEN,
     DEVICE_PLANE_DIMS, DEVICE_PLANE_OFFSET, DEVICE_PLANE_SIZE, PAGE_ENTRY_PFN_SHIFT,
     PAGE_ENTRY_VALID,
@@ -758,6 +759,32 @@ fn synthesize_device_desc_from_type4(surf: &Type4Surface) -> Vec<u8> {
     } else {
         // Single-plane surface-level sample path (plane_count 0).
         device_desc[DEVICE_DESC_PLANE_COUNT] = 0;
+        // Plane 0's offset, which this arm used to decode and then drop.
+        //
+        // `decode_type4_plane` reads four fields per plane; the surface-level
+        // convenience copies took three of them (width, height, bytes-per-row)
+        // and left the offset behind, so a single-plane surface whose pixels
+        // start past the base of its allocation was read and written at 0. The
+        // multi-plane arm above publishes every plane's offset, and the
+        // consumers are symmetric: `sample_window_from_device_surface` returns
+        // `base_offset` as the window offset and folds it into `span_end`, which
+        // is exactly what `sample_window_from_device_plane` does with a plane's.
+        // On the arm64 mapper path this same field is read straight out of the
+        // guest's descriptor rather than synthesized, so dropping it here also
+        // made the two pathways describe one surface differently.
+        //
+        // Zero is the ordinary value and stays silent; a non-zero one is the
+        // population that was being misread, and `type4_base_offset_nonzero`
+        // counts how large that is. Read on a driven x86/Vulkan boot: **0**, so
+        // no single-plane surface on that workload starts past its base and this
+        // is contract fidelity rather than a live repair. It is also why the
+        // change was safe to make without a rate: every window it could move is
+        // one the counter would have named.
+        let base_offset = surf.planes[0].offset;
+        if base_offset != 0 {
+            crate::runtime::drain::note_store_route("type4_base_offset_nonzero");
+            st32(&mut device_desc[DEVICE_DESC_BASE_OFFSET..], base_offset);
+        }
         if mtl != 0 {
             if let Some(bpp) = crate::contract::pixel_format::bytes_per_pixel(mtl) {
                 st16(&mut device_desc[DEVICE_DESC_BPE..], bpp as u16);
@@ -2726,6 +2753,68 @@ mod tests {
         // a real change of what the mapping describes.
         surf.plane_count = 1;
         assert!(!backing_matches_latched_geom(&m, &surf));
+    }
+
+    /// A single-plane surface must publish plane 0's offset, because both its
+    /// consumers fold it in and one of them is the other pathway.
+    ///
+    /// `decode_type4_plane` reads four fields; the surface-level convenience
+    /// copies on `Type4Surface` take three, and the synthesizer's single-plane
+    /// arm used to publish only those three. A surface whose pixels start past
+    /// the base of its allocation was then read and written at 0 — the
+    /// multi-plane arm has always published each plane's offset, and
+    /// `sample_window_from_device_surface` treats `base_offset` exactly as
+    /// `sample_window_from_device_plane` treats a plane's.
+    #[test]
+    fn a_single_plane_backing_publishes_the_offset_its_pixels_start_at() {
+        use crate::contract::iosurface_pages::{decode_device_surface, sample_window_prefer_device};
+        use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+        const BASE: u32 = 0x800;
+        let (w, h, bpr) = (8u32, 4u32, 32u32);
+        let mut surf = Type4Surface {
+            length: 0x4000,
+            backing_pfn: 1,
+            pixel_format: 0x4247_5241, // 'BGRA'
+            plane_count: 1,
+            planes: Default::default(),
+            width: w,
+            height: h,
+            bytes_per_row: bpr,
+        };
+        surf.planes[0] = Type4Plane {
+            offset: BASE,
+            width: w,
+            height: h,
+            bytes_per_row: bpr,
+            bytes_per_element: 4,
+        };
+        assert!(
+            !type4_is_multiplanar(&surf),
+            "the single-plane arm is the one under test"
+        );
+
+        let desc = synthesize_device_desc_from_type4(&surf);
+        let decoded = decode_device_surface(&desc).expect("device descriptor");
+        assert_eq!(
+            decoded.plane_count, 0,
+            "single-plane publishes no plane records"
+        );
+        assert_eq!(decoded.base_offset, BASE);
+
+        // The consumer, not just the field: the sample window must start at the
+        // offset and its span must end past it, or publishing it bought nothing.
+        let (off, got_bpr, end, from_device) =
+            sample_window_prefer_device(Some(&desc), None, MTL_FORMAT_BGRA8_UNORM, w, h)
+                .expect("surface-level window");
+        assert!(from_device, "the window must come from the descriptor");
+        assert_eq!(off, BASE as u64);
+        assert_eq!(got_bpr, bpr);
+        assert_eq!(end, BASE as u64 + (h as u64 - 1) * bpr as u64 + (w as u64 * 4));
+
+        // Zero stays zero — the ordinary case must not gain an offset.
+        surf.planes[0].offset = 0;
+        let zero = synthesize_device_desc_from_type4(&surf);
+        assert_eq!(decode_device_surface(&zero).expect("desc").base_offset, 0);
     }
 
     #[test]
