@@ -4628,6 +4628,35 @@ fn emit_draw_phase() {
         w.max_us,
         w.stalls,
     ));
+    emit_stage_phase();
+}
+
+/// Under `draw_phase`, dividing its largest column — `stage_us` is 83 % of that
+/// phase's second on a driven drag, and the five parts want opposite fixes.
+#[cfg(feature = "backend-vulkan")]
+fn emit_stage_phase() {
+    let Some(w) = crate::backend::vulkan::engine::stage_phase::take_window() else {
+        return;
+    };
+    crate::observe::off(format!(
+        "stage_phase acquire_us={} acquires={} bytes_us={} bytes_n={} bytes_b={} \
+         runs_us={} runs_n={} runs_b={} swap_us={} swap_n={} swap_b={} \
+         shift_us={} shift_n={} shift_b={}",
+        w.acquire_us,
+        w.acquires,
+        w.bytes_us,
+        w.bytes_n,
+        w.bytes_b,
+        w.runs_us,
+        w.runs_n,
+        w.runs_b,
+        w.swap_us,
+        w.swap_n,
+        w.swap_b,
+        w.shift_us,
+        w.shift_n,
+        w.shift_b,
+    ));
 }
 
 #[cfg(not(feature = "backend-vulkan"))]

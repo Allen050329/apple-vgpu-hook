@@ -13,6 +13,7 @@ use super::context::ContextOwner;
 use super::counters::EngineCounters;
 use super::device_lost::{DeviceLostDecline, DeviceLostOp};
 use super::draw_execution::DrawExecutionDecline;
+use super::stage_phase;
 use super::draw_validation::DrawValidationDecline;
 use super::pools::{BufferSlot, ResourcePools, SampledSlot, TargetKey};
 use super::types::{
@@ -58,8 +59,13 @@ unsafe fn stage_buffer_content(
     }
     let slot = match content {
         BufferContent::Bytes(b) => {
-            let slot = pools.acquire_staging(ctx, b.len() as u64, usage, counters)?;
+            let slot = {
+                let _s = stage_phase::Span::open(stage_phase::Part::Acquire);
+                pools.acquire_staging(ctx, b.len() as u64, usage, counters)?
+            };
+            let _s = stage_phase::Span::moving(stage_phase::Part::Bytes, b.len() as u64);
             pools.write_staging(ctx, &slot, b)?;
+            drop(_s);
             slot
         }
         // Guest runs are gathered by the CPU into the mapped staging span, with
@@ -75,8 +81,13 @@ unsafe fn stage_buffer_content(
         // asked for a stable snapshot, which is what this arm has always given
         // it.
         BufferContent::GuestRuns(src) => {
-            let slot = pools.acquire_staging(ctx, src.total_len, usage, counters)?;
+            let slot = {
+                let _s = stage_phase::Span::open(stage_phase::Part::Acquire);
+                pools.acquire_staging(ctx, src.total_len, usage, counters)?
+            };
+            let _s = stage_phase::Span::moving(stage_phase::Part::Runs, src.total_len);
             pools.write_staging_from_runs(ctx, &slot, &src.runs, src.total_len)?;
+            drop(_s);
             if snapshot_volatile {
                 counters
                     .buffer_snapshot_binds
@@ -1052,15 +1063,24 @@ pub(crate) unsafe fn execute_draw_inner(
                     bytes_len: bytes.len(),
                 })
             })?;
-            let mut shifted = vec![0u8; len];
-            shifted[prefix..].copy_from_slice(bytes);
-            let slot = pools.acquire_staging(
-                ctx,
-                shifted.len() as u64,
-                vk::BufferUsageFlags::VERTEX_BUFFER,
-                counters,
-            )?;
+            let shifted = {
+                let _s = stage_phase::Span::moving(stage_phase::Part::Shift, len as u64);
+                let mut shifted = vec![0u8; len];
+                shifted[prefix..].copy_from_slice(bytes);
+                shifted
+            };
+            let slot = {
+                let _s = stage_phase::Span::open(stage_phase::Part::Acquire);
+                pools.acquire_staging(
+                    ctx,
+                    shifted.len() as u64,
+                    vk::BufferUsageFlags::VERTEX_BUFFER,
+                    counters,
+                )?
+            };
+            let _s = stage_phase::Span::moving(stage_phase::Part::Bytes, shifted.len() as u64);
             pools.write_staging(ctx, &slot, &shifted)?;
+            drop(_s);
             slot
         } else {
             stage_buffer_content(
@@ -1079,13 +1099,19 @@ pub(crate) unsafe fn execute_draw_inner(
     // Index buffer
     let mut index_slot = None;
     if let Some(indexed) = &req.indexed {
-        let slot = pools.acquire_staging(
-            ctx,
-            indexed.indices.len() as u64,
-            vk::BufferUsageFlags::INDEX_BUFFER,
-            counters,
-        )?;
+        let slot = {
+            let _s = stage_phase::Span::open(stage_phase::Part::Acquire);
+            pools.acquire_staging(
+                ctx,
+                indexed.indices.len() as u64,
+                vk::BufferUsageFlags::INDEX_BUFFER,
+                counters,
+            )?
+        };
+        let _s =
+            stage_phase::Span::moving(stage_phase::Part::Bytes, indexed.indices.len() as u64);
         pools.write_staging(ctx, &slot, &indexed.indices)?;
+        drop(_s);
         index_slot = Some(slot);
     }
 
@@ -1108,12 +1134,15 @@ pub(crate) unsafe fn execute_draw_inner(
 
     // Target seed staging (CPU import only — not LoadFromTarget).
     let seed_slot = if let Some(rgba8) = seed_bytes {
-        let slot = pools.acquire_staging(
-            ctx,
-            rgba8.len() as u64,
-            vk::BufferUsageFlags::TRANSFER_SRC,
-            counters,
-        )?;
+        let slot = {
+            let _s = stage_phase::Span::open(stage_phase::Part::Acquire);
+            pools.acquire_staging(
+                ctx,
+                rgba8.len() as u64,
+                vk::BufferUsageFlags::TRANSFER_SRC,
+                counters,
+            )?
+        };
         // Vulkan buffer→image copies do not perform format conversion, so the
         // staged bytes must already be in the attachment's physical order —
         // otherwise partial draws preserve an exact R/B-exchanged seed outside
@@ -1121,8 +1150,10 @@ pub(crate) unsafe fn execute_draw_inner(
         // seed states its own order. Exchange exactly when they disagree, inside
         // the copy that has to happen anyway.
         if matches!(req.target_seed_order, SeedOrder::Bgra8) != output_bgra {
+            let _s = stage_phase::Span::moving(stage_phase::Part::Swap, rgba8.len() as u64);
             pools.write_staging_swap_rb(ctx, &slot, rgba8)?;
         } else {
+            let _s = stage_phase::Span::moving(stage_phase::Part::Bytes, rgba8.len() as u64);
             pools.write_staging(ctx, &slot, rgba8)?;
         }
         counters.note_seed_upload(rgba8.len() as u64);

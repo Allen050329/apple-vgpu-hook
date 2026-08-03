@@ -18,6 +18,7 @@ mod device_lost;
 mod digest;
 mod draw_execution;
 mod draw_phase;
+pub mod stage_phase;
 mod draw_preparation;
 mod draw_validation;
 mod exec;
