@@ -169,6 +169,16 @@ already been run to exhaustion; re-running one costs hours and has so far return
   alarm, where a firing *is* the bug (23 of them, all drift/unbounded/unwitnessed detectors). None
   were reducible. Deleting a decoded-but-untaken arm loses guest work silently the first time a
   guest takes it.
+- **The two C shims are not 2 200 duplicated lines.** `reims-vgpu-pci.c` and `reims-vgpu-mmio.c` look
+  like near-copies and are read that way by every fresh sweep. What is actually shared is already in
+  `reims-vgpu-shim.c`, and the rest is blocked by that header's own stated rule — bus-specific trace
+  events and the per-device dirty tracker stay in their shim. `gfx_read`/`gfx_write` and the
+  `MemoryRegionOps` (~77 lines) touch both and cannot move. The eight dirty-tracking wrappers (~60
+  lines) *are* byte-identical apart from the `ctx` cast, but `HostOps.ctx` is genuinely per-device —
+  `schedule_bh`, `map_pages`, `read_xreg` and `notify_actions` all need the bus object — so
+  collapsing them needs a second ctx field in the ABI, which buys 30 net lines for a new drift
+  surface. What the shims *did* hold was a real rule, and that is now exported (`scanout_may_paint`);
+  look for reconstructed rules there, not for duplicate bodies.
 
 The remaining reduction lever is runtime-dead code — paths that compile and are reachable but that
 the protocol never takes — and `dead-state` cannot see that class. `scripts/runtime-dead` is the
