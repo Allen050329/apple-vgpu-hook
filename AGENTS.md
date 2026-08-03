@@ -1318,6 +1318,31 @@ and the remaining ~3.5 % is the two shader `Arc` clones and the `BTreeSet`.
 Whatever is done here is done inside that one function. `draw_phase`'s
 `stage_us` is still undivided.
 
+**`descriptors_us` has a number now, and it is not a lever.** It had never been
+quoted anywhere, so the descriptor-side ceiling was unknown rather than small.
+Six driven windows of 400-514 draws on the same boot, per draw:
+
+```text
+prep 2.1-7.3   pipeline 4.7-11.6   stage 53.6-66.9   acquire_sampled 0.4 / 20.3
+sampled_upload 6.8-9.6   descriptors 0.74-0.92   record 5.3-6.7   submit 1.4-2.7
+```
+
+**0.74-0.92 µs a draw**, about 1.5 % of the draw. Writing the descriptor set is
+not where the time goes and pool pressure is not a story here.
+
+Two other things that reading says. `acquire_sampled_us` is **bimodal to two
+decimal places** — 0.40-0.46 on three windows and 20.30-20.48 on the other two,
+with nothing between — so something in that phase is switched, not scaled, and
+whatever it is costs 20 µs a draw when it is on. And `stage_us` at **54-67 µs a
+draw is two thirds of the whole draw on this workload**, four to five times what
+it costs under a window drag, which makes it the largest undivided column in the
+device by a wide margin.
+
+Read those against the window-drag table above with care: this is Safari
+compositing the web-content probe's churn page, not a window drag, and the two
+workloads apportion the draw differently. What transfers is the ranking, not the
+microseconds.
+
 The arithmetic that says whether the tier matters: 120 fps is 8.33 ms, run 4
 achieved 10.2 ms, and draws are 6.0 ms of that. So goal 6 needs about **2 ms a
 frame out of the draw path** on top of the writeback — roughly a third of it,
