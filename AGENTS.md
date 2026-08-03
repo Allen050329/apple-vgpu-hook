@@ -193,6 +193,25 @@ already been run to exhaustion; re-running one costs hours and has so far return
   loops skipped the `dest_window` bound six sibling call sites take. When auditing here, diff the two
   arms against each other rather than reading either alone — and grep the *other* arm's comments,
   because in three of these four the correct rule was already written down next to the wrong code.
+- **The type-4 task search is not an oracle, and replacing it with "the task the guest named"
+  regresses the boot.** It reads exactly like one: `resolve_type4_surface_ex` takes a bare surface id
+  and probes up to 256 task object lists — task 0 first as the "historical home", then a hint its own
+  doc calls "allowed to be wrong" — accepting the first list that yields a translatable backing,
+  while the sibling call on the line above (`resolve_type11_ref`) is already being passed `task_id`.
+  Threading that same `task_id` in and deleting the search took a driven x86 boot from **0
+  `rt_resolve FAIL` and 6 `present_unbacked` to 21 816 and 2 774**, with the desktop unbacked.
+  The reason is the thing the id spaces hide: **an IOSurface is cross-process.** It is created in one
+  task and referenced from another, so the task whose command stream names a surface id is routinely
+  *not* the task whose object list holds it — the naming task holds the type-5 *view*, and the
+  descriptor inside it points at a surface owned elsewhere. The search is how the owner is located,
+  and there is no task word on the wire that answers it. `blit_exec`'s "never the task object-list
+  ref — those id spaces collide" is about the id *spaces*, not about which list to read, and reading
+  it as the latter is what makes this look like a settled bug.
+  What is still open is narrower and worth keeping separate: the search accepts the first list that
+  *translates*, and two tasks can both have an `OBJECT_TYPE_SURFACE` at the same slot, so it can in
+  principle adopt a stranger's object. Do not attack that by removing the search. Attack it by
+  finding something to verify the candidate against, and note that the type-4 descriptor carries no
+  surface id of its own to check.
 - **The per-dispatch compute stall watchdog is priced, and it is not worth rewriting.**
   `spawn_compute_engine_stall_watchdog` spawns a thread and clones the SPIR-V on *every* compute
   dispatch, then sleeps 2 s. At the measured peak of 124 computes/s that is ~250 live sleeping

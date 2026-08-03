@@ -1575,16 +1575,10 @@ fn log_present_named_page_content<H: HostMemory + HostOps>(
 }
 
 /// Present a named mapping to the host console (DisplaySwap / x86 present op6/7).
-/// `submitting_task` is the task the display transaction names as the
-/// submitter, and is the object list the surface id is read from. `None` is the
-/// `CHILD_OP_DISPLAY_SWAP` form, which carries no task word — there the surface
-/// must already have been claimed by a command-side resolve, and
-/// [`crate::runtime::objects::ensure_surface_for_present`] uses that owner.
 fn present_named_mapping<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut H,
     channel_id: u32,
-    submitting_task: Option<u32>,
     mapping: u32,
 ) -> ChildPacketDisposition {
     if mapping == 0 {
@@ -1660,7 +1654,7 @@ fn present_named_mapping<H: HostMemory + HostOps>(
     // x86: present surface_id → type-4 object-list slot (heap index =
     // IOSurface getSurfaceID). Arm: MappingInternal page-table resolve.
     // Always attempt type-4 when pages empty; then iosfc/mapper path.
-    let _ = crate::runtime::objects::ensure_surface_for_present(state, host, submitting_task, mapping);
+    let _ = crate::runtime::objects::ensure_surface_for_present(state, host, mapping);
     let force = state
         .mappings
         .get(&mapping)
@@ -2062,10 +2056,8 @@ fn process_child_packet<H: HostMemory + HostOps>(
             // and not a completion stamp; the packet's own stamp lives in the
             // FIFO header. op8 has no such word, and prints `-`.
             let (_, task_slot) = display_txn_trailer_slots(opcode);
-            let submitting_task =
-                task_slot.map(|slot| ld32(&packet.payload[slot * 4..]));
-            let task = submitting_task
-                .map(|t| format!("{t:#x}"))
+            let task = task_slot
+                .map(|slot| format!("{:#x}", ld32(&packet.payload[slot * 4..])))
                 .unwrap_or_else(|| "-".to_string());
             crate::observe::line(format!(
                 "present_txn op={opcode:#x} ch={channel_id} pipe={} sid={mapping} task={task} \
@@ -2075,7 +2067,7 @@ fn process_child_packet<H: HostMemory + HostOps>(
                 state.present.unpainted_presents,
                 state.present.present_mapping
             ));
-            if present_named_mapping(state, host, channel_id, submitting_task, mapping)
+            if present_named_mapping(state, host, channel_id, mapping)
                 == ChildPacketDisposition::Deferred
             {
                 return ChildPacketDisposition::Deferred;

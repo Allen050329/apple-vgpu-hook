@@ -716,27 +716,21 @@ pub struct MappingEntry {
     /// never compares equal to a live generation (the host's first readable
     /// generation is 1).
     pub guest_write_gen_at_store: u64,
-    /// Task whose object list this surface's type-4 backing was read from.
-    ///
-    /// Not a hint. An object-list slot is per-task, so slot `surface_id` in two
-    /// tasks names two different objects; this records which list produced the
-    /// entries that are in [`Self::page_entries`] right now. The present path
-    /// resolves through it because a display transaction names a surface id
-    /// without naming a list to read it from.
-    ///
-    /// Only meaningful while [`Self::owner_task_known`] is set — task 0 is a
-    /// real task, so a zero here is not "no owner".
-    pub owner_task: u32,
-    /// Whether [`Self::owner_task`] has been claimed by a task-scoped resolve.
-    pub owner_task_known: bool,
+    /// Task id that last owned this surface as a type-4 `OBJECT_TYPE_SURFACE`
+    /// object (0 = no non-trivial hint; task 0 is always probed first anyway).
+    /// `resolve_type4_surface_ex` probes this task right after task 0 so a
+    /// per-bind present-path scan short-circuits instead of walking all 256
+    /// task slots. Purely a search-order hint — a stale/wrong value only costs
+    /// one extra probe before the full-table fallback re-finds the owner.
+    pub owner_task_hint: u32,
     /// How [`Self::page_entries`] were derived, when they came from a type-4
     /// surface plan — see [`Type4Walk`]. `None` for every other source, and for
     /// a mapping whose list has been invalidated.
     ///
-    /// Distinct from [`Self::owner_task`], which names the object list the
-    /// entries were read from. This is a statement about the entries in the
-    /// mapping right now: repeat this walk and you must get them back, or the
-    /// guest has re-pointed the surface underneath us.
+    /// Distinct from [`Self::owner_task_hint`], which is a *search* hint and is
+    /// allowed to be wrong. This is a statement about the list that is in the
+    /// entry right now: repeat this walk and you must get these entries back, or
+    /// the guest has moved the surface underneath us without saying so.
     pub type4_walk: Option<Type4Walk>,
 }
 

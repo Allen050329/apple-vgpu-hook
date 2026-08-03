@@ -641,11 +641,11 @@ fn present_holds_for_translation_deferred_on_other_channel() {
     state.translation_deferred_mask = 1 << 1;
 
     assert_eq!(
-        present_named_mapping(&mut state, &mut host, 5, None, 2),
+        present_named_mapping(&mut state, &mut host, 5, 2),
         ChildPacketDisposition::Deferred
     );
     assert_eq!(
-        present_named_mapping(&mut state, &mut host, 5, None, 2),
+        present_named_mapping(&mut state, &mut host, 5, 2),
         ChildPacketDisposition::Deferred
     );
 
@@ -656,7 +656,7 @@ fn present_holds_for_translation_deferred_on_other_channel() {
 
     state.translation_deferred_mask = 0;
     assert_eq!(
-        present_named_mapping(&mut state, &mut host, 5, None, 2),
+        present_named_mapping(&mut state, &mut host, 5, 2),
         ChildPacketDisposition::Complete
     );
     assert_eq!(state.present_translation_hold_mask, 0);
@@ -673,7 +673,7 @@ fn present_does_not_hold_for_current_channel_translation_bit() {
     state.translation_deferred_mask = 1 << 5;
 
     assert_eq!(
-        present_named_mapping(&mut state, &mut host, 5, None, 2),
+        present_named_mapping(&mut state, &mut host, 5, 2),
         ChildPacketDisposition::Complete
     );
 

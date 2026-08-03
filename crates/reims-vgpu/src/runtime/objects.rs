@@ -1127,44 +1127,32 @@ fn apply_type4_backing<M: HostMemory>(
     true
 }
 
-/// Resolve `surface_id` to type-4 backing pages + geometry, in the task that
-/// owns it.
+/// Resolve present `surface_id` to type-4 backing pages + geometry.
 ///
-/// An object-list slot is per-task: `ref_` indexes *that task's* list, so slot
-/// `surface_id` in two tasks names two different objects. The caller therefore
-/// has to say which task's list to read, and every command-side caller has one
-/// — it is the task whose command stream named the texture.
-///
-/// Returns true when pages were latched.
-pub fn resolve_type4_surface_in_task<M: HostMemory>(
+/// Scans active tasks: object-list slot `surface_id` must be type-4 (heap is
+/// indexed by IOSurface surface ID). Returns true when pages were latched.
+pub fn resolve_type4_surface<M: HostMemory>(
     state: &mut DeviceState,
     host: &M,
-    task_id: u32,
     surface_id: u32,
 ) -> bool {
-    resolve_type4_surface_ex(state, host, task_id, surface_id, false)
+    resolve_type4_surface_ex(state, host, surface_id, false)
 }
 
-/// Like [`resolve_type4_surface_in_task`] but always re-reads the object list / PT.
-pub fn resolve_type4_surface_force_in_task<M: HostMemory>(
+/// Like [`resolve_type4_surface`] but always re-reads the object list / PT.
+pub fn resolve_type4_surface_force<M: HostMemory>(
     state: &mut DeviceState,
     host: &M,
-    task_id: u32,
     surface_id: u32,
 ) -> bool {
-    resolve_type4_surface_ex(state, host, task_id, surface_id, true)
+    resolve_type4_surface_ex(state, host, surface_id, true)
 }
 
-/// Latch the task whose object list this surface's backing was read from.
-///
-/// Authoritative, not a search hint: it records which task's list produced the
-/// entries now in the mapping, and the present path resolves through it because
-/// a display transaction names a surface id without naming a list to read it
-/// from.
+/// Latch the task that owns `surface_id` as its type-4 backing so the next
+/// present-path scan tries it right after task 0.
 fn record_type4_owner(state: &mut DeviceState, surface_id: u32, task_id: u32) {
     if let Some(m) = state.mappings.get_mut(&surface_id) {
-        m.owner_task = task_id;
-        m.owner_task_known = true;
+        m.owner_task_hint = task_id;
     }
 }
 
@@ -1205,50 +1193,49 @@ pub fn replace_physical(state: &mut DeviceState, task_id: u32, object_id: u32) {
     }
 }
 
-/// The task whose object list produced this surface's type-4 entries, or `None`
-/// when no task-scoped resolve has claimed it yet.
-///
-/// Task 0 is a legitimate owner, so the presence of an owner is carried by its
-/// own flag rather than inferred from a zero id.
-pub fn type4_owner_task(state: &DeviceState, surface_id: u32) -> Option<u32> {
-    state
-        .mappings
-        .get(&surface_id)
-        .filter(|m| m.owner_task_known)
-        .map(|m| m.owner_task)
-}
-
 fn resolve_type4_surface_ex<M: HostMemory>(
     state: &mut DeviceState,
     host: &M,
-    task_id: u32,
     surface_id: u32,
     force: bool,
 ) -> bool {
     if surface_id == 0 || surface_id as usize >= MAX_MAPPINGS {
         return false;
     }
+    // Task probe order: task 0 (kernel/global — historical type-4 home) first,
+    // then the cached owner-task hint (so a hot present-path re-scan
+    // short-circuits on the owning task instead of walking all 256 slots),
+    // then the remaining tasks.
+    let hint = state
+        .mappings
+        .get(&surface_id)
+        .map(|m| m.owner_task_hint)
+        .unwrap_or(0);
+    let mut order: Vec<u32> = Vec::with_capacity(MAX_TASKS + 1);
+    order.push(0);
+    if hint != 0 && (hint as usize) < MAX_TASKS {
+        order.push(hint);
+    }
+    for tid in 1..MAX_TASKS as u32 {
+        if tid == hint {
+            continue;
+        }
+        order.push(tid);
+    }
 
-    {
+    for task_id in order {
         if task_id as usize >= state.tasks.len() {
-            return false;
+            continue;
         }
         if !state.tasks[task_id as usize].active {
-            note_type4_fail(
-                surface_id,
-                "task_inactive",
-                format!(
-                    "type4_backing_fail reason=task_inactive sid={surface_id} task={task_id}"
-                ),
-            );
-            return false;
+            continue;
         }
         // Count the guest-read cost of one active-task object-list probe.
         let Some(entry) = lookup_list_entry(state, host, task_id, surface_id) else {
-            return false;
+            continue;
         };
         if entry.object_type != OBJECT_TYPE_SURFACE {
-            return false;
+            continue;
         }
         let Some(desc) = read_descriptor(state, host, task_id, &entry) else {
             note_type4_fail(
@@ -1259,7 +1246,7 @@ fn resolve_type4_surface_ex<M: HostMemory>(
                     entry.descriptor_gva, entry.descriptor_length
                 ),
             );
-            return false;
+            continue;
         };
         let _ = state.insert_object(task_id, surface_id);
         let Some(surf) = decode_type4_surface(&desc) else {
@@ -1277,7 +1264,7 @@ fn resolve_type4_surface_ex<M: HostMemory>(
                         .unwrap_or(0)
                 ),
             );
-            return false;
+            continue;
         };
         // Force path validated the cached pages are still fresh → keep them.
         let mut force_fresh = false;
@@ -1353,8 +1340,8 @@ fn resolve_type4_surface_ex<M: HostMemory>(
             record_type4_owner(state, surface_id, task_id);
             return true;
         }
-        false
     }
+    false
 }
 
 /// Ensure surface backing for present: type-4 pages when needed, else keep arm
@@ -1362,63 +1349,24 @@ fn resolve_type4_surface_ex<M: HostMemory>(
 ///
 /// Resolves type-4 once pages are empty; guest double-buffering uses distinct
 /// surface_ids (content updates land in-place on an already-mapped pfn).
-///
-/// `named_task` is the task whose object list holds the surface, when the guest
-/// named one: command-side callers pass the task their packet was decoded
-/// under, and the display-present path passes the transaction's submitting
-/// task. It wins over the recorded owner, because it is what the guest says
-/// now.
-///
-/// `None` is the one wire form that carries no task word
-/// (`CHILD_OP_DISPLAY_SWAP`); there the surface must already have been claimed
-/// by a task-scoped resolve, and that recorded owner is used.
 pub fn ensure_surface_for_present<M: HostMemory + crate::runtime::host::HostOps>(
     state: &mut DeviceState,
     host: &M,
-    named_task: Option<u32>,
     surface_id: u32,
 ) -> bool {
     if surface_id == 0 {
         return false;
     }
-    // A named task is only usable if it names a live slot. The display
-    // transaction's task word has not been shown to be in the same space as the
-    // slot ids `DefineTask2` registers, so a word that names nothing live is
-    // reported and the recorded owner is used instead of acting on it.
-    let named_live = named_task.filter(|&t| {
-        let live = (t as usize) < state.tasks.len() && state.tasks[t as usize].active;
-        if !live && crate::observe::first_sight("present_task_word_dead", u64::from(t)) {
-            crate::observe::fail(format!(
-                "present_task_word reason=dead task={t:#x} sid={surface_id} \
-                 (named task is not a live slot; using the recorded owner)"
-            ));
-        }
-        live
-    });
-    let owner = match named_live.or_else(|| type4_owner_task(state, surface_id)) {
-        Some(t) => t,
-        // No task named the surface and none ever claimed it, so there is no
-        // object list to read it from. The arm MappingInternal path below may
-        // still resolve it; type-4 cannot.
-        None => {
-            let _ = crate::runtime::mapper::ensure_resolved_for_scanout(state, host, surface_id);
-            return state
-                .mappings
-                .get(&surface_id)
-                .map(|m| m.mapped && !m.page_entries.is_empty() && m.has_geom)
-                .unwrap_or(false);
-        }
-    };
     let need = state
         .mappings
         .get(&surface_id)
         .map(|m| !m.mapped || m.page_entries.is_empty())
         .unwrap_or(true);
     if need {
-        let _ = resolve_type4_surface_in_task(state, host, owner, surface_id);
+        let _ = resolve_type4_surface(state, host, surface_id);
     } else {
         // Opportunistic refresh if wire geom changed (mode switch).
-        let _ = resolve_type4_surface_force_in_task(state, host, owner, surface_id);
+        let _ = resolve_type4_surface_force(state, host, surface_id);
     }
     // Arm/iosfc path: MappingInternal resolve when captured.
     let _ = crate::runtime::mapper::ensure_resolved_for_scanout(state, host, surface_id);
@@ -1782,7 +1730,7 @@ mod tests {
         let _ = host.write_gpa(data_gpa + 0x80, &desc);
 
         assert!(
-            !resolve_type4_surface_in_task(&mut state, &host, 1, 3),
+            !resolve_type4_surface(&mut state, &host, 3),
             "an untranslatable backing must not resolve"
         );
         // The refusal happens before any mutation, so no fabricated entry is
@@ -1795,16 +1743,16 @@ mod tests {
         assert!(!fabricated, "refusal must not cache a fabricated backing");
     }
 
-    /// An object-list slot is per-task, so the same slot in two tasks names two
-    /// different objects. Resolving reads the list of the task the caller names
-    /// and no other: the owner resolves, and a task that merely has something
-    /// at the same slot does not stand in for it.
+    /// `resolve_type4_surface_ex` probes task 0 first and returns on the first
+    /// task whose backing applies. The identity guess made task 0 succeed for
+    /// surfaces it could not translate, so the search stopped there and the
+    /// owning task was never tried — the surface was then backed by an address
+    /// derived from a virtual one. Refusing is what lets the loop continue.
     ///
-    /// Both tasks list slot 3, as task 0 and the owner do in production; only
-    /// the owner's entry translates. A resolver that searched would take
-    /// whichever list answered first and back the surface from the wrong one.
+    /// Both tasks list the surface, as task 0 (the kernel/global list) and the
+    /// owner do in production; only the owner can translate the backing.
     #[test]
-    fn a_surface_resolves_only_in_the_task_whose_list_the_caller_names() {
+    fn the_task_search_reaches_the_owner_when_task_zero_cannot_translate() {
         let mut host = FakeHost::new();
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         state.page_shift = PAGE_SHIFT_X86;
@@ -1862,18 +1810,8 @@ mod tests {
         let _ = host.write_gpa(data_gpa + 0x80, &desc);
 
         assert!(
-            !resolve_type4_surface_in_task(&mut state, &host, 0, 3),
-            "task 0's slot 3 is a different object and cannot translate the \
-             backing; it must not stand in for the owner"
-        );
-        assert!(
-            resolve_type4_surface_in_task(&mut state, &host, 1, 3),
+            resolve_type4_surface(&mut state, &host, 3),
             "the owning task can translate the backing, so the resolve must succeed"
-        );
-        assert_eq!(
-            type4_owner_task(&state, 3),
-            Some(1),
-            "the owner recorded is the list the entries were read from"
         );
         let m = state.mappings.get(&3).unwrap();
         assert_eq!(m.page_entries.len(), 1);
@@ -1929,7 +1867,7 @@ mod tests {
         st32(&mut desc[0x20..], 64);
         let _ = host.write_gpa(data_gpa + 0x80, &desc);
 
-        assert!(resolve_type4_surface_in_task(&mut state, &host, 1, 3));
+        assert!(resolve_type4_surface(&mut state, &host, 3));
         {
             let m = state.mappings.get(&3).unwrap();
             assert_eq!(m.page_entries.len(), 1);
@@ -1942,7 +1880,7 @@ mod tests {
         // Guest remaps GVA page 1 onto a new physical page (same id/geometry).
         st32(&mut d[..4], 6);
         let _ = host.write_gpa(root_gpa + 4, &d[..4]);
-        assert!(resolve_type4_surface_force_in_task(&mut state, &host, 1, 3));
+        assert!(resolve_type4_surface_force(&mut state, &host, 3));
         {
             let m = state.mappings.get(&3).unwrap();
             assert_eq!(
@@ -1953,7 +1891,7 @@ mod tests {
             assert_eq!(m.map_generation, 2, "page move bumps map_generation");
         }
         // Unchanged translation: force keeps the table without a rebuild.
-        assert!(resolve_type4_surface_force_in_task(&mut state, &host, 1, 3));
+        assert!(resolve_type4_surface_force(&mut state, &host, 3));
         let m = state.mappings.get(&3).unwrap();
         assert_eq!(m.map_generation, 2);
         assert_eq!(
@@ -2172,7 +2110,7 @@ mod tests {
         clear_type4_fail(sid);
         let _ = setup_type4_candidate(&mut host, &mut state, sid, 0x3000, 0x30);
 
-        assert!(!resolve_type4_surface_in_task(&mut state, &host, 1, sid));
+        assert!(!resolve_type4_surface(&mut state, &host, sid));
         assert!(
             type4_fail_latch()
                 .lock()
@@ -2196,7 +2134,7 @@ mod tests {
         let bad_desc = vec![0u8; 0x30];
         let _ = host.write_gpa(data_gpa + 0x80, &bad_desc);
 
-        assert!(!resolve_type4_surface_in_task(&mut state, &host, 1, sid));
+        assert!(!resolve_type4_surface(&mut state, &host, sid));
         assert!(
             type4_fail_latch()
                 .lock()

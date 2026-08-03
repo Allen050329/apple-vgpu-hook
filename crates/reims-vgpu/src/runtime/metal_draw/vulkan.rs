@@ -1018,7 +1018,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
 
     if let Some(mid) = surface {
         // Ensure type-4 pages exist for this surface id.
-        let _ = objects::ensure_surface_for_present(state, host, Some(task_id), mid);
+        let _ = objects::ensure_surface_for_present(state, host, mid);
         // A type-5 serialized record is the exact Metal texture view over the
         // IOSurface bytes. Materialize it only when it differs from (or cannot
         // be inferred from) the base mapping. Exact base views keep the fast

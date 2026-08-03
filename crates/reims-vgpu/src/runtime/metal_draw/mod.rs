@@ -3443,7 +3443,7 @@ fn lookup_render_target<M: HostMemory + HostOps>(
         if view_level != 0 {
             return None;
         }
-        if !objects::resolve_type4_surface_in_task(state, host, task_id, surface_id) {
+        if !objects::resolve_type4_surface(state, host, surface_id) {
             crate::observe::fail(format!(
                 "rt_resolve FAIL type4 tex_ref={resolved_ref} sid={surface_id} live_type={live_type:?}"
             ));

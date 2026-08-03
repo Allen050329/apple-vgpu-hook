@@ -726,7 +726,7 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
         };
         // Surface id IS the type-4 mapping mid (never the task object-list ref —
         // those id spaces collide). Resolve the backing, then the mapping.
-        let _ = objects::ensure_surface_for_present(state, host, Some(task_id), sid);
+        let _ = objects::ensure_surface_for_present(state, host, sid);
         let _ = mapper::ensure_resolved_for_scanout(state, host, sid);
         let Some(m) = state.mappings.get(&sid) else {
             return Err(br(BlitStatus::MissingResource, "t5_no_mapping"));
