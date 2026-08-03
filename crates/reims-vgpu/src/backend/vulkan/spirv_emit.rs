@@ -11,12 +11,12 @@
 //!
 //! It needs one for the render writeback. That rail moves 2.26 GB/s into guest
 //! RAM and 93-98% of the bytes are already at the destination, measured per
-//! landing and spread across every landing rather than concentrated in a few
-//! (see [`crate::runtime::land_redundancy`]). The CPU cannot collect on that —
-//! comparing on the CPU was built and is refuted, because a full-cache-line
-//! store never reads its destination and the compare adds a read the eager path
-//! never paid. Only a GPU pass can decline bytes *before* they cross the bus,
-//! and a GPU pass needs a shader the engine wrote.
+//! landing and spread across every landing rather than concentrated in a few.
+//! The CPU cannot collect on that — comparing on the CPU was built and is
+//! refuted, because a full-cache-line store never reads its destination and the
+//! compare adds a read the eager path never paid. Only a GPU pass can decline
+//! bytes *before* they cross the bus, and a GPU pass needs a shader the engine
+//! wrote.
 //!
 //! # Why words rather than a build step
 //!
@@ -529,8 +529,8 @@ impl Builder {
 /// Words per tile, which is also [`tile_diff`]'s workgroup size.
 ///
 /// One invocation per 32-bit word and one workgroup per tile, so a workgroup
-/// covers 256 bytes — one [`crate::runtime::land_redundancy::FINE_TILE`], the
-/// granularity the writeback's redundancy was measured at.
+/// covers 256 bytes — the granularity the writeback's redundancy was measured
+/// at.
 ///
 /// The two being equal is load-bearing rather than incidental. The shader
 /// decides a whole tile from a flag its workgroup shares, so the tile *is* the

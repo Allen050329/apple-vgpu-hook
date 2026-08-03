@@ -1942,15 +1942,6 @@ impl RunCopy<'_> {
         matches!(self, Self::Write(_))
     }
 
-    /// The bytes a write direction is about to store, for the audit that
-    /// compares them against what the guest's pages already hold.
-    fn write_src(&self) -> Option<&[u8]> {
-        match self {
-            Self::Write(buf) => Some(buf),
-            Self::Read(_) => None,
-        }
-    }
-
     /// Move `n` bytes between the caller's buffer at `buf_off` and the mapped
     /// host range at `host_off`.
     ///
@@ -2053,38 +2044,15 @@ fn copy_mapping_runs<H: HostMemory + HostOps>(
         // witness. The read direction shares this walk and writes nothing.
         state.note_host_wrote_mapping(mapping_id);
     }
-    // Taken once for the walk so an audited landing is compared whole, and held
-    // so its runs are tallied together and the landing is bucketed by its own
-    // redundancy. See [`crate::runtime::land_redundancy::begin_audit`] for why a
-    // per-run stride would describe no frame in particular.
-    let mut audit = copy
-        .is_write()
-        .then(|| crate::runtime::land_redundancy::begin_audit(crate::runtime::land_redundancy::Leg::Mapping))
-        .flatten();
     let page_size = state.page_size();
     let len = copy.len();
     let need_end = off.saturating_add(len as u64);
     // Fast path: one packed view covering the whole range.
     if let Some((ptr, view_len)) = ensure_contig_view(state, host, mapping_id) {
         if (view_len as u64) >= need_end && (off as usize) + len <= view_len {
-            // Collected before the loop because the audit and the copy both
-            // borrow `copy`, and the selection borrows nothing either owns.
-            let spans: Vec<(u64, u64)> = selected_within(only, off, need_end).collect();
-            for (lo, hi) in spans {
+            for (lo, hi) in selected_within(only, off, need_end) {
                 let buf_off = (lo - off) as usize;
                 let n = (hi - lo) as usize;
-                if let (Some(walk), Some(buf)) = (audit.as_mut(), copy.write_src()) {
-                    // SAFETY: exactly the range `apply` is about to write below,
-                    // and the audit only reads it.
-                    unsafe {
-                        walk.note_write(
-                            lo,
-                            (ptr as *const u8).add(lo as usize),
-                            &buf[buf_off..buf_off + n],
-                            page_size,
-                        );
-                    }
-                }
                 // SAFETY: the view covers `need_end`, checked directly above,
                 // and `[lo, hi)` is within `[off, need_end)` by construction.
                 unsafe { copy.apply(ptr, lo as usize, buf_off, n) };
@@ -2144,24 +2112,10 @@ fn copy_mapping_runs<H: HostMemory + HostOps>(
         // selection touches nowhere still costs its import — and a run it
         // touches in twenty places costs only one. Splitting the import per
         // selected span instead would map and unmap the same pages repeatedly.
-        let spans: Vec<(u64, u64)> = selected_within(only, copy_lo, copy_hi).collect();
-        for (sel_lo, sel_hi) in spans {
+        for (sel_lo, sel_hi) in selected_within(only, copy_lo, copy_hi) {
             let buf_off = (sel_lo - off) as usize;
             let host_off = (sel_lo - run_mlo) as usize;
             let n = (sel_hi - sel_lo) as usize;
-            if let (Some(walk), Some(buf)) = (audit.as_mut(), copy.write_src()) {
-                // SAFETY: exactly the range `apply` is about to write below,
-                // whose bounds are within the window checked directly above;
-                // the audit only reads it.
-                unsafe {
-                    walk.note_write(
-                        sel_lo,
-                        (ptr as *const u8).add(host_off),
-                        &buf[buf_off..buf_off + n],
-                        page_size,
-                    );
-                }
-            }
             // SAFETY: the map covers `total`, and `host_off + n <= total` and
             // `buf_off + n <= len` were both just checked for the enclosing
             // window, which `[sel_lo, sel_hi)` is inside.

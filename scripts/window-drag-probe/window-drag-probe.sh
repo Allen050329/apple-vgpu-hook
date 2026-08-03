@@ -244,14 +244,6 @@ wl = rows("host_window_loop", ["ticks", "redraws_asked", "draws",
                                "draws_fresh", "draws_stale"])
 bp = rows("bind_phase", ["binds", "vertex_us", "fragment_us", "attrs_us"])
 cp = rows("chain_phase", ["chains", "binds_us"])
-# One line per writeback leg, so they are read apart. `mapping` is the leg the
-# no-writeback counterfactual dropped to measure 2.9x; `gva` is the larger of
-# the two by flush count and was unmeasured until it had its own hook.
-lr_all = rows("land_redundancy", ["runs", "bytes", "pages", "same_pages",
-                                  "fine", "same_fine",
-                                  "whole", "whole_bytes",
-                                  "over_90", "over_50", "under_50"],
-              leg_of=True)
 ws = rows("write_split", ["bytes", "land_us", "land"])
 
 print("host_window_cadence — frames this device put out")
@@ -265,35 +257,15 @@ show("flush_us/flush", [r["flush_us"] / r["flushes"] for r in duty if r["flushes
 print("readback_split — the device's GPU cost")
 show("fence_us/fence", [r["fence_us"] / r["fence"] for r in rb if r["fence"]], " us")
 
-# What the writeback moved, and how much of it the destination already held.
-# The two granularities answer different questions and are not interchangeable:
-# `same_pages` is what a CPU-side skip could decline, `same_fine` what a
-# GPU-side compaction could leave out of the copy that is 78% of the fence
-# above. A sideways window move changes a vertical band, so it touches nearly
-# every row — expect the fine fraction to be much the larger of the two.
-print("write_split / land_redundancy — bytes moved, and how many were already there")
+# What the writeback moved. The share of it the destination already held is no
+# longer sampled here: it was measured at 70-99% and that finding is banked in
+# the GPU tile-difference pass that acts on it.
+print("write_split — bytes moved")
 show("MB/s written", [r["bytes"] / 1e6 for r in ws], " MB")
-for leg in ("mapping", "gva"):
-    lr = [r for r in lr_all if r["leg"] == leg]
-    show(f"{leg}: same_pages %",
-         [100.0 * r["same_pages"] / r["pages"] for r in lr if r["pages"]], " %")
-    show(f"{leg}: same_fine %",
-         [100.0 * r["same_fine"] / r["fine"] for r in lr if r["fine"]], " %")
-    show(f"{leg}: audited MB", [r["bytes"] / 1e6 for r in lr], " MB")
-    # The shape of the distribution behind that mean, which is what decides
-    # which rail is worth building. `whole %` is the share of audited *bytes*
-    # in landings where every tile matched — what declining whole landings
-    # would collect, needing only a hash and no tile bitmap. If it is small
-    # while `same_fine %` is large the redundancy is spread across every
-    # landing, and only tile compaction collects it.
-    show(f"{leg}: whole-walk %",
-         [100.0 * r["whole_bytes"] / r["bytes"] for r in lr if r["bytes"]], " %")
-    for b in ("whole", "over_90", "over_50", "under_50"):
-        show(f"{leg}:   {b} walks", [r[b] for r in lr])
 
-# The per-landing CPU scatter cost the redundancy above is a claim about. It is
+# The per-landing CPU scatter cost. It is
 # reported here rather than left to a reader because a CPU tile-skipping rail
-# was built against these fractions and made it *worse* — 744/769 us per landing
+# was built against the redundancy fractions and made it *worse* — 744/769 us per landing
 # without it against 802 with it, while declining 92 % of the bytes — since a
 # full-cache-line store never reads its destination and the compare adds a read
 # the eager path never paid. Unlike `fence_us` above, this is a CPU cost and so

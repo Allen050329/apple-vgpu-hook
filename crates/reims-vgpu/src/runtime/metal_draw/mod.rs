@@ -3725,15 +3725,6 @@ pub(crate) fn write_gva_rgba8_within<M: HostMemory + HostOps>(
         // here, and a source that is not white cannot become white.
         crate::observe::footprint::note_written_payload(rgba);
         let (base, avail) = (span_map.ptr, span_map.avail);
-        // Taken once for the whole span so an audited window is compared whole,
-        // then charged per row — the same shape `mapper::copy_mapping_runs`
-        // uses, and for the same reason. This is the raw task-GVA leg, which
-        // `store_routes` reads at `gvaw_fence_flush` against the mapping-keyed
-        // `mapw_fence_flush` beside it; without this hook the audit reports on
-        // only one of the two writeback legs.
-        let mut audit =
-            crate::runtime::land_redundancy::begin_audit(crate::runtime::land_redundancy::Leg::Gva);
-        let page_size = state.page_size();
         let mut res = Ok(());
         for y in 0..height as usize {
             let src = &rgba[y * rgba_row..y * rgba_row + rgba_row];
@@ -3745,16 +3736,6 @@ pub(crate) fn write_gva_rgba8_within<M: HostMemory + HostOps>(
             if off + row.len() > avail {
                 res = Err(MemError::RunOutOfRange);
                 break;
-            }
-            if let Some(walk) = audit.as_mut() {
-                // The tiles are aligned in guest-address space, which is where
-                // a rail could decline a unit — not to the start of the row.
-                //
-                // SAFETY: as below, `map_fresh_span` covers `span` and the
-                // audit only reads the range the copy is about to write.
-                unsafe {
-                    walk.note_write(gva.saturating_add(off as u64), base.add(off), &row, page_size);
-                }
             }
             // SAFETY: map_fresh_span covers `span`.
             unsafe {

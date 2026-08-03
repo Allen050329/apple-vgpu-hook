@@ -4319,10 +4319,6 @@ pub fn note_drain_tranche(drain_us: u64, publish_us: u64) {
         // the timer is runtime-side and the Metal arm can adopt it without a
         // second census.
         emit_chain_phase();
-        // Under the write and readback splits, which price the writeback in
-        // bytes and in fence time; this says how many of those bytes the
-        // destination already held.
-        emit_land_redundancy();
     }
 }
 
@@ -4519,54 +4515,6 @@ fn emit_bind_phase() {
         "bind_phase binds={} vertex_us={} fragment_us={} attrs_us={}",
         w.binds, w.vertex_us, w.fragment_us, w.attrs_us,
     ));
-}
-
-/// How much of the render writeback's bytes the guest's pages already held,
-/// over a sample of the window's landings.
-///
-/// Read beside `write_split`, which says how many bytes were stored, and
-/// `readback_split`'s `gpu_us`, which says what carrying them across the bus
-/// cost. This says how many of them the destination already had — see
-/// [`crate::runtime::land_redundancy`] for why that is a different question
-/// from the declared damage rect, which is already measured at 99.34% of the
-/// attachment and worth nothing.
-///
-/// One line per writeback leg that compared anything — `store_routes` counts
-/// the two apart at `mapw_fence_flush` and `gvaw_fence_flush`, and one blended
-/// fraction over both would describe neither. A leg that measured nothing emits
-/// nothing, so an idle desktop costs no line and a zero always means "measured
-/// and not redundant" rather than "not measured".
-///
-/// The `whole=`/`over_90=` tail is each audited walk placed by its *own*
-/// redundancy, with the bytes it carried beside it. `same_fine` is a mean over
-/// the window, and a mean cannot separate a few wholly-unchanged landings from
-/// every landing being mostly unchanged — the first is collected by a
-/// landing-granular skip and the second only by tile compaction.
-///
-/// Walks and bytes are separate `key=value` fields rather than one packed pair
-/// because every reader of this log — the drag probe's parser and
-/// `constant-fields.sh` among them — reads a field as a single number.
-fn emit_land_redundancy() {
-    for (leg, w) in crate::runtime::land_redundancy::take_window() {
-        let buckets = w
-            .buckets()
-            .map(|(label, walks, bytes)| format!("{label}={walks} {label}_bytes={bytes}"))
-            .collect::<Vec<_>>()
-            .join(" ");
-        crate::observe::off(format!(
-            "land_redundancy leg={} audits={} calls={} runs={} bytes={} pages={} \
-             same_pages={} fine={} same_fine={} {buckets}",
-            leg.label(),
-            w.audits,
-            w.calls,
-            w.runs,
-            w.bytes,
-            w.pages,
-            w.same_pages,
-            w.fine,
-            w.same_fine,
-        ));
-    }
 }
 
 fn emit_chain_phase() {

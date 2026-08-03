@@ -4,8 +4,8 @@
 //!
 //! The writeback rail copies a whole composited frame out of a render target
 //! and scatters it into guest RAM, and 70-99% of the bytes it writes are
-//! already at the destination (see [`crate::runtime::land_redundancy`]). Two
-//! separate costs follow from moving them anyway:
+//! already at the destination. Two separate costs follow from moving them
+//! anyway:
 //!
 //! - The copy out of the target is 87-91% of the readback fence, because on a
 //!   discrete part it crosses the bus into host-visible memory.
@@ -814,11 +814,10 @@ impl DiffCensus {
 /// boot with the probe off is byte-identical on the hot path — and a boot with
 /// it on cannot be read for timing, which the announcement says.
 ///
-/// What it answers is the question [`crate::runtime::land_redundancy`] can only
-/// sample: over *every* landing rather than one in 64, and per target rather
-/// than pooled, how much of a composited frame is already what the frame before
-/// it was. That per-surface split is the measurement the tile rail's saving was
-/// only ever bounded to a factor without.
+/// What it answers, over *every* landing rather than a sample and per target
+/// rather than pooled, is how much of a composited frame is already what the
+/// frame before it was. That per-surface split is the measurement the tile
+/// rail's saving was only ever bounded to a factor without.
 ///
 /// Declines quietly and often — an odd frame size, a device that refuses the
 /// scratch, a target whose geometry just changed. A census is never worth
