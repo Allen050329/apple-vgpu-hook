@@ -21,7 +21,7 @@ use crate::{
     backend_name, device_create, device_cursor_glyph_copy, device_cursor_glyph_info,
     device_console_feed, device_destroy, device_drain, device_efi_console_copy,
     device_gfx_read, device_gfx_write, device_iosfc_read, device_iosfc_write, device_poll,
-    device_pop_action, device_reset, device_scanout_copy,
+    device_pop_action, device_reset, device_scanout_copy, device_scanout_may_paint,
     device_window_run_main, device_window_set_early_fb, device_window_start, device_window_stop,
     unwind_safe, ConsoleFeed, CursorGlyphInfo,
 };
@@ -30,6 +30,12 @@ use std::slice;
 
 /// Bump when breaking the C shim contract.
 ///
+/// v15 adds `reims_vgpu_qemu_scanout_may_paint`, the console-ownership verdict
+/// for one presented mapping. v14 moved the three-way *kind* into Rust but went
+/// on exporting it as an input, and the shims did with it what shims do: the x86
+/// one rebuilt "may this paint" from the kind and the mapping id, the arm64 one
+/// built nothing and painted every present it was handed. Exporting the inputs
+/// to a rule is exporting the rule.
 /// v14 replaces `present_boundary_seen` + `early_scanout_target` with the single
 /// `console_feed`. The shims took the old pair together and branched on it, so
 /// the console-ownership rule existed in C twice and in Rust once more; the
@@ -57,7 +63,7 @@ use std::slice;
 /// [[host-window]]). The symbol is always present; when the staticlib was built
 /// without the `host-window` feature it returns `REIMS_VGPU_QEMU_ERR_STATE` so the C
 /// shim falls back to QEMU's own display.
-pub const REIMS_VGPU_QEMU_ABI_VERSION: u32 = 14;
+pub const REIMS_VGPU_QEMU_ABI_VERSION: u32 = 15;
 
 #[repr(C)]
 pub struct ReimsVgpuQemuCreateInfo {
@@ -547,6 +553,42 @@ pub unsafe extern "C" fn reims_vgpu_qemu_console_feed(
                         *out_generation = generation;
                     }
                 }
+            }
+            REIMS_VGPU_QEMU_OK
+        },
+        REIMS_VGPU_QEMU_ERR_PANIC,
+    )
+}
+
+/// May a present naming `mapping_id` paint the host console right now?
+///
+/// REIMS_VGPU_QEMU_OK fills `*out_may` with 0 or 1; ERR_STATE if no device.
+///
+/// This is the answer, not the inputs. Both shims call it before painting a
+/// presented mapping. The x86 shim used to assemble it from
+/// [`reims_vgpu_qemu_console_feed`]'s `out_kind` and `out_mapping_id`, and the
+/// arm64 shim did not gate at all — so the same present that the x86 console
+/// refused as a pre-boundary steal was painted on arm64. Exporting the kind
+/// without the verdict is what let those two drift; see
+/// [`crate::device_scanout_may_paint`].
+///
+/// SAFETY: `out_may` non-null and writable.
+#[no_mangle]
+pub unsafe extern "C" fn reims_vgpu_qemu_scanout_may_paint(
+    handle: u64,
+    mapping_id: u32,
+    out_may: *mut u32,
+) -> c_int {
+    unwind_safe(
+        || {
+            if handle == 0 || out_may.is_null() {
+                return REIMS_VGPU_QEMU_ERR_ARGS;
+            }
+            let Some(may) = device_scanout_may_paint(handle, mapping_id) else {
+                return REIMS_VGPU_QEMU_ERR_STATE;
+            };
+            unsafe {
+                *out_may = u32::from(may);
             }
             REIMS_VGPU_QEMU_OK
         },

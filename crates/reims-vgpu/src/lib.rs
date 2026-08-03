@@ -1358,6 +1358,38 @@ pub fn device_console_feed(id: u64) -> Option<ConsoleFeed> {
     )
 }
 
+/// Whether a present naming `mapping_id` may paint the host console.
+///
+/// This is the second half of the console-ownership rule, and it belonged in the
+/// shims for exactly as long as it took one of them to disagree. The x86 PCI
+/// shim held it — `kind == FIRMWARE || (kind == EARLY && latched != mapping_id)`,
+/// assembled from [`device_console_feed`]'s kind and mapping out-params — and the
+/// arm64 MMIO shim held nothing at all and painted every present it was handed.
+/// One rule, two pathways, one of them missing it: the same shape as the GPA
+/// attrs drift, on the question of who owns the screen.
+///
+/// The three arms, from protocol state only:
+///
+/// - [`ConsoleFeed::Product`]: the compositor owns the console, so every present
+///   paints.
+/// - [`ConsoleFeed::Early`]: only the latched front may paint. A clear-only
+///   present naming some other mapping must not steal the surface from the
+///   firmware console underneath it.
+/// - [`ConsoleFeed::Firmware`]: the guest is still on BAR1 / `efi_fb`; nothing
+///   presented here paints.
+///
+/// Returns `None` only when `id` names no device.
+pub fn device_scanout_may_paint(id: u64, mapping_id: u32) -> Option<bool> {
+    Some(match device_console_feed(id)? {
+        ConsoleFeed::Product => true,
+        ConsoleFeed::Early {
+            mapping_id: latched,
+            ..
+        } => latched == mapping_id,
+        ConsoleFeed::Firmware => false,
+    })
+}
+
 /// [`ConsoleFeed::Firmware`], for a caller that already holds device state.
 ///
 /// From **protocol state only** — not content, sparsity, boot stage, or any
@@ -1764,6 +1796,79 @@ mod tests {
             publish_present_boundary(&slot, d.device.state.present.frame_flush_seen);
         }
         assert_eq!(device_console_feed(id), Some(ConsoleFeed::Product));
+        assert!(device_destroy(id));
+    }
+
+    /// The paint verdict, over all three console feeds.
+    ///
+    /// This is the rule the x86 shim used to assemble from `console_feed`'s kind
+    /// and mapping out-params while the arm64 shim assembled nothing and painted
+    /// unconditionally. The `Early` arm is the one that differed: a present
+    /// naming a mapping other than the latched front is a pre-boundary steal of
+    /// the firmware console, and only one pathway refused it.
+    #[test]
+    fn only_the_latched_front_may_paint_before_the_present_boundary() {
+        use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+
+        let id = device_create(None, PAGE_SHIFT_ARM64E).expect("create");
+
+        // _FIRMWARE: the guest is still on BAR1 / efi_fb. Nothing presented
+        // paints, whichever mapping it names.
+        assert_eq!(device_console_feed(id), Some(ConsoleFeed::Firmware));
+        assert_eq!(device_scanout_may_paint(id, 0), Some(false));
+        assert_eq!(device_scanout_may_paint(id, 7), Some(false));
+
+        // _EARLY: latch mapping 7 as the composited front.
+        {
+            let slot = device_slot(id).expect("device");
+            let mut d = slot.inner.lock();
+            let state = &mut d.device.state;
+            state.present.valid = true;
+            state.present.width = 1920;
+            state.present.height = 1080;
+            assert!(state.map_surface(7));
+            let m = state.mappings.get_mut(&7).unwrap();
+            m.mapped = true;
+            m.has_geom = true;
+            m.width = 1920;
+            m.height = 1080;
+            m.format = MTL_FORMAT_BGRA8_UNORM;
+            m.content_generation = 4;
+            m.page_entries = vec![1];
+            state.note_surface_composite(7);
+            state.present.early_front_mapping = 7;
+        }
+        assert!(matches!(
+            device_console_feed(id),
+            Some(ConsoleFeed::Early { mapping_id: 7, .. })
+        ));
+        assert_eq!(
+            device_scanout_may_paint(id, 7),
+            Some(true),
+            "the latched early front is exactly what the pre-boundary console shows"
+        );
+        assert_eq!(
+            device_scanout_may_paint(id, 8),
+            Some(false),
+            "a present naming any other mapping must not steal the surface from \
+             the firmware console underneath it"
+        );
+
+        // _PRODUCT: the compositor owns the console, so every present paints —
+        // including the mapping the early arm just refused.
+        {
+            let slot = device_slot(id).expect("device");
+            publish_present_boundary(&slot, true);
+        }
+        assert_eq!(device_console_feed(id), Some(ConsoleFeed::Product));
+        assert_eq!(device_scanout_may_paint(id, 7), Some(true));
+        assert_eq!(device_scanout_may_paint(id, 8), Some(true));
+
+        assert_eq!(
+            device_scanout_may_paint(id.wrapping_add(1_000_000), 7),
+            None,
+            "an unknown device has no verdict to give; the shim must not paint"
+        );
         assert!(device_destroy(id));
     }
 

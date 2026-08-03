@@ -21,7 +21,13 @@
 extern "C" {
 #endif
 
-/* v14: reims_vgpu_qemu_console_feed replaces reims_vgpu_qemu_present_boundary_seen
+/* v15: reims_vgpu_qemu_scanout_may_paint — the console-ownership *verdict* for a
+ *      presented mapping, which v14 left in C. v14 moved the three-way kind into
+ *      Rust but kept exporting it as an input, and the x86 shim promptly rebuilt
+ *      "may this paint" out of the kind and the mapping id while the arm64 shim
+ *      built nothing and painted unconditionally. Exporting inputs instead of the
+ *      answer is what lets two shims disagree; this exports the answer.
+ * v14: reims_vgpu_qemu_console_feed replaces reims_vgpu_qemu_present_boundary_seen
  *      and reims_vgpu_qemu_early_scanout_target. The shims took the old pair
  *      together and branched on it, so the console-ownership rule lived in C
  *      twice over. It is product policy; a thin shim does not hold one. Both old
@@ -53,7 +59,7 @@ extern "C" {
  *     thread so IRQ pulses reach the guest mid-drain — ack fast).
  * v6: ReimsVgpuHostOps.is_ram_gpa (reject non-RAM PFNs on mapper / map_pages paths).
  * v5: ReimsVgpuQemuCreateInfo.guest_page_shift (12 = x86 Tahoe, 14 = arm64e). */
-#define REIMS_VGPU_QEMU_ABI_VERSION 14u
+#define REIMS_VGPU_QEMU_ABI_VERSION 15u
 
 #define REIMS_VGPU_QEMU_OK 0
 #define REIMS_VGPU_QEMU_ERR_ARGS 1
@@ -358,6 +364,19 @@ int reims_vgpu_qemu_device_pop_action(uint64_t handle, ReimsVgpuHostAction *out)
 int reims_vgpu_qemu_console_feed(uint64_t handle, uint32_t *out_kind,
                                  uint32_t *out_mapping_id, uint32_t *out_width,
                                  uint32_t *out_height, uint32_t *out_generation);
+
+/*
+ * May a present naming mapping_id paint the host console right now?
+ * REIMS_VGPU_QEMU_OK fills *out_may with 0 or 1.
+ *
+ * This is the verdict, not the inputs it is derived from. Call it before
+ * painting a presented mapping; do NOT rebuild it from console_feed's out_kind
+ * and out_mapping_id. That reconstruction is what the two shims had drifted on:
+ * the x86 shim refused a pre-boundary clear-only present naming an unlatched
+ * mapping, and the arm64 shim painted the same present without asking.
+ */
+int reims_vgpu_qemu_scanout_may_paint(uint64_t handle, uint32_t mapping_id,
+                                      uint32_t *out_may);
 
 /*
  * Fill a QEMU DisplaySurface (BGRA8, dst_stride bytes/row) from the guest
