@@ -239,17 +239,48 @@ const MAX_TRACKED_WINDOWS: usize = 256;
 pub const AUDIT_STRIDE: u32 = 64;
 
 impl GatherWitness {
-    /// Release every tracking token this witness armed.
+    /// Detach every tracking token this witness armed, for release through
+    /// [`crate::runtime::host::HostOps::untrack_guest_writes`].
     ///
-    /// The tokens are host resources keyed to page sets; dropping the map without
-    /// this would leak them for the life of the VM.
-    pub fn release<M: crate::runtime::host::HostOps>(&mut self, host: &mut M) {
-        for entry in self.entries.values() {
-            if entry.token != 0 {
-                host.untrack_guest_writes(entry.token);
-            }
-        }
+    /// Returns them rather than releasing them because this type has no
+    /// `HostOps` and the crate already has one rail for host state it cannot
+    /// free itself: `DeviceState::retired_guest_write_tokens`, drained by
+    /// `mapper::flush_retired_views`. The tokens are host resources keyed to
+    /// page sets, so dropping the map without this leaves the host dirty-logging
+    /// those pages for the life of the process.
+    pub fn take_tokens(&mut self) -> Vec<u64> {
+        let tokens = self
+            .entries
+            .values()
+            .map(|entry| entry.token)
+            .filter(|&token| token != 0)
+            .collect();
         self.entries.clear();
+        tokens
+    }
+
+    /// Arm one window against `token` with nothing else set, so a test can
+    /// prove the token is released without driving a gather to create it.
+    #[cfg(test)]
+    pub fn arm_token_for_test(&mut self, token: u64) {
+        self.entries.insert(
+            GatherKey::TaskGva {
+                task_id: 1,
+                gva: 0x1000,
+            },
+            Entry {
+                gpas: vec![0x3000],
+                span: 0x1000,
+                token,
+                gen: 0,
+                fold: 0,
+                fold_valid: false,
+                binds_since_fold: 0,
+                pages_epoch: 0,
+                last_seen: 0,
+                generation: 0,
+            },
+        );
     }
 
     /// The generation currently vouched for `key`'s bytes.

@@ -2234,10 +2234,17 @@ impl DeviceState {
                 tokens.push(token);
             }
         }
+        // The sampled-cache witness arms its own tokens against window page
+        // sets, and they are not reachable from any `MappingEntry` — so the
+        // loop above cannot see them and a reset that only walked mappings left
+        // them armed on the host forever.
+        #[cfg(feature = "backend-vulkan")]
+        tokens.extend(self.gather_witness.take_tokens());
         // Back onto the retired list rather than out through the return value:
         // the caller's contract is "invalidate backend aliases, then release
         // views", and a token release is neither. `flush_retired_views` drains
-        // both, and a device reset always runs it.
+        // both, and `Device::reset_with_host` runs it before `reset` discards
+        // the vector.
         self.retired_guest_write_tokens = tokens;
         views.extend(self.gva_host_views.drain(..).filter_map(|view| {
             (view.ptr != 0 && view.ptr_len != 0).then_some((view.ptr, view.ptr_len))
