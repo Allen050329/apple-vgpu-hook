@@ -3330,6 +3330,15 @@ pub fn encode_icb_execute_and_writeback<M: HostMemory + HostOps>(
 /// invent is unreachable and can go; a non-zero reading is a surface the compute
 /// path refuses and this one renders into as BGRA8, and *then* the two arms have
 /// to be made to agree deliberately rather than by deletion.
+///
+/// **Read on two driven x86/Vulkan boots (40 s Safari window drag plus the
+/// web-content probe): 0 on both.** So the invent is unreached on this workload
+/// and the divergence is latent, not live. That is an argument for replacing it
+/// with the compute path's typed decline rather than leaving two arms disagreeing
+/// — and not an argument that the question is closed. Two boots of one workload
+/// on one pathway cannot say a multi-plane IOSurface is never named as a colour
+/// attachment; this counter going non-zero is exactly how that would first be
+/// seen.
 fn rt_base_format(format: u16, mapping_id: u32, site: &str) -> u16 {
     if format != 0 {
         return format;
@@ -3362,6 +3371,18 @@ fn rt_base_format(format: u16, mapping_id: u32, site: &str) -> u16 {
 /// rather than repaired: taking the view's geometry here changes what every
 /// type-5 colour attachment renders into, and that is not a change to make on an
 /// unmeasured population.
+///
+/// **Read on two driven x86/Vulkan boots: `same` 20 273 and 24 360, `differs`
+/// 0, `undecoded` 0.** So on this workload every type-5 colour attachment's view
+/// agrees with the base mapping in width, height and format, and resolving
+/// through the base loses nothing. The reinterpretation view the contract names
+/// is real traffic elsewhere — the compute staging path sees it — but it is not
+/// bound as a render target here.
+///
+/// That is a reason not to change the resolve, and not a reason to stop asking.
+/// `differs` is a healthy zero: the first non-zero line names a surface being
+/// rendered at the wrong geometry, which no other counter in this path could
+/// report.
 fn note_rt_type5_view(
     view: Option<objects::Type5TextureView>,
     surface_id: u32,

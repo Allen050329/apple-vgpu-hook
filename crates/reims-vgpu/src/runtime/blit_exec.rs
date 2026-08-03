@@ -753,6 +753,16 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
         // resolution. Without it a change to the window this arm resolves cannot
         // be attributed: an unchanged screen and an arm that never executed look
         // identical, and so do a repaired blit and a blit that never happened.
+        //
+        // Read on a driven x86/Vulkan boot (Safari window drag + two
+        // web-content-probe runs): **both counters 0** — this arm does not
+        // execute on that workload at all, while `blit_dest_bound` reads 26, so
+        // the blit path itself does run and it is the type-5 source that is
+        // absent. The plane-index resolution above is therefore contract
+        // fidelity, not a repair of anything this workload does, and a screen
+        // that looks the same after changing it says nothing either way. It also
+        // means this arm cannot be blamed for a display defect seen on a boot
+        // where these read zero, which is what they were added to establish.
         crate::runtime::drain::note_store_route(if from_device {
             "blit_t5_plane_device"
         } else {
