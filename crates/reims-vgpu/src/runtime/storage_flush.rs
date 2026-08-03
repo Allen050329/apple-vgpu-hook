@@ -715,6 +715,25 @@ pub fn flush_linear_windows_before_fence<M: HostMemory + HostOps>(
 /// flush into submit 7 µs, fence 3.04 ms, staging memcpy 0.83 ms and guest-page
 /// write 2.68 ms.
 ///
+/// `fence_us` owning that line reads like latency, and it is not. The GPU
+/// timestamp pair taken inside the fence divides it. On a driven Safari
+/// window-drag boot, one 1063 ms window reads `render_us=717130` split
+/// `fence_us=410022 write_us=290863 submit_us=6163 map_us=430`, and inside the
+/// fence `gpu_us=324787 bar_us=729`. So **79% of `fence_us` is the readback
+/// command buffer's own execution** — the copy — and the barrier waiting on the
+/// draw batch ahead of it is 729 µs across 720 fences, one microsecond each.
+/// Summing what scales with bytes (`gpu_us` + `write_us` + `map_us`) against
+/// what does not (`bar_us` + `submit_us` + the fence's non-GPU remainder) puts
+/// the rail at **86% bytes and 13% latency**.
+///
+/// That matters because it decides which of the two endgames below is worth
+/// building first, and the naive reading decides it wrong. 720 fences that
+/// second each copied a full surface, to produce the 11-17 fresh frames the
+/// window presented. The rail is not waiting on the GPU; it is moving whole
+/// frames that nobody asked for, so bounding *what* each flush copies attacks
+/// six sevenths of it and is not blocked on the host being able to address
+/// guest memory.
+///
 /// All of it is speculative. In the same second `mapw_fence_flush` equals
 /// `surface_flush` exactly (104 = 104), so **every flush is this fence and none
 /// is a guest demand** — [`flush_mapping_for_guest_read`], the

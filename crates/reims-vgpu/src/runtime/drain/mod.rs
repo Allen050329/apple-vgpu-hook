@@ -3756,9 +3756,14 @@ impl DrainDutyCensus {
     /// The inside of the render rail over the window `drain_duty` just
     /// reported, or `None` when nothing was read back in it.
     ///
-    /// Sits under `flush_rails`'s `render_us` and divides it: a `fence_us` that
-    /// owns the line is GPU round-trip latency and no smaller copy touches it,
-    /// while a `map_us`/`write_us` that owns it is bytes and a dirty rect would.
+    /// Sits under `flush_rails`'s `render_us` and divides it. Read `gpu_us` and
+    /// `bar_us` before concluding anything from `fence_us`: they are the GPU's
+    /// own timestamps taken from inside that wait, so `fence_us` owning the line
+    /// means latency only when `gpu_us` is a small part of it. When `gpu_us`
+    /// owns `fence_us` the wait is the readback command buffer copying, which is
+    /// bytes and a smaller copy does touch it; `bar_us` is the draw batch queued
+    /// ahead of it, and only that part is a scheduling cost rather than a size
+    /// one. `map_us`/`write_us` are host-side bytes either way.
     pub(crate) fn take_readback_split(&self) -> Option<String> {
         use std::sync::atomic::Ordering::Relaxed;
         let win_ms = self.last_win_ms.load(Relaxed);
