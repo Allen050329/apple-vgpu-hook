@@ -2220,11 +2220,28 @@ fn flush_render_one<M: HostMemory + HostOps>(
     // `flush_mapping_windows_before_fence` changes what the ratio means, and a
     // census read on the old rule would draw the wrong conclusion from it. Every
     // armed window now lands at the next completion stamp by design, so M ≈ N is
-    // the *intended* state and says nothing about guest-page readers. What the
-    // deferral still buys is coalescing inside one fence — a chain of passes into
-    // one surface, and the supersede of a window a later Store in the same
-    // submission fully covers — so the quantity to read is `surface_resident`
-    // against `surface_flush` in one second, not the lifetime ratio.
+    // the *intended* state and says nothing about guest-page readers.
+    //
+    // This comment used to send the reader to `surface_resident` against
+    // `surface_flush` in one second, on the reasoning that what deferral still
+    // buys is coalescing inside one fence. That instrument has now been read,
+    // and it cannot answer: the two are equal on **all 1 780 census lines** of
+    // the accumulated x86 / Vulkan log, 193 458 each, with not one line
+    // differing. Every arm gets exactly one flush, because
+    // `surface_deferred_superseded` has never once fired — no later Store in the
+    // whole log fully covered a live window — and every arm succeeds, because
+    // `surface_resident_sync` is likewise absent. A ratio pinned at 1.0 by the
+    // workload is not a measurement of coalescing; it is the statement that no
+    // coalescing was available to do.
+    //
+    // So do not quote that ratio as this rail's payoff. What is measured is the
+    // readback: the resident Store arms without reading the frame back off the
+    // GPU, and `surface_resident_sync` counts the arms that had to. Coalescing
+    // is a guard for a workload shape — several passes fully covering one
+    // surface inside one submission — that nine driven boots, including a
+    // SceneKit title and a live WebGL scene, never produced. It is kept because
+    // landing a covered window costs a full-framebuffer write for nothing, not
+    // because anything here has seen it pay.
     crate::runtime::drain::note_store_route("surface_flush");
     // Whether this writeback is owed at all, before any question about where it
     // would land. The guard below asks "are these still our pages"; this asks
