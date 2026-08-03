@@ -1051,44 +1051,7 @@ fn ranges_overlap(a0: u64, a_len: u64, b0: u64, b_len: u64) -> bool {
     a0 < b1 && b0 < a1
 }
 
-/// Guest pages a blit's destination span resolves to, taken before the loop that
-/// writes them.
-///
-/// A blit does not wait for the GPU, which is why these writes were argued to be
-/// authorised by the page table at the moment they run. That argument confuses
-/// "synchronous with the device thread" with "instantaneous": a full-screen
-/// texture copy is tens of MiB of per-row guest read and guest write, the guest's
-/// own vCPUs run throughout, and the destination is re-resolved from scratch on
-/// every row. The pages `gva + 8000 * stride` names at the end of the loop need
-/// not be the pages the same expression named at the start, and a copy that runs
-/// off its resource paints whatever the guest handed those pages to next — the
-/// heap and kernel corruption this class is made of.
-///
-/// Capturing the whole destination span once, up front, makes every row's write
-/// authorised by the walk the command itself would have been authorised by.
-///
-/// `None` when the span resolves no page at all. That leaves the writer to fail
-/// closed on its own terms rather than refusing a whole blit because the capture
-/// failed for an unrelated reason; it is counted so the arm is measurable
-/// instead of assumed.
-fn dest_window<M: HostMemory>(
-    state: &DeviceState,
-    host: &M,
-    task_id: u32,
-    gva: u64,
-    span: u64,
-) -> Option<std::collections::HashSet<u64>> {
-    if gva == 0 || span == 0 {
-        return None;
-    }
-    let pages = gva_mem::task_gva_page_gpa_set(host, &state.tasks, task_id, gva, span, state.page_shift);
-    if pages.is_empty() {
-        crate::runtime::drain::note_store_route("blit_dest_unbounded");
-        return None;
-    }
-    crate::runtime::drain::note_store_route("blit_dest_bound");
-    Some(pages)
-}
+use gva_mem::dest_window;
 
 /// [`dest_window`] over the region of a texture a row loop is about to write.
 ///
@@ -2108,6 +2071,19 @@ fn exec_copy_texture_to_buffer<M: HostMemory + HostOps>(
     if dst_span > dst.size {
         return br(BlitStatus::Bounds, "t2b_stage_dst_span_oob");
     }
+    // `dst_span` is measured from `dst.gva`, so the span this loop writes starts
+    // one `destination_offset` in.
+    let dst_base = match dst.gva.checked_add(cmd.destination_offset) {
+        Some(v) => v,
+        None => return br(BlitStatus::Bounds, "t2b_stage_dst_gva_overflow"),
+    };
+    let allowed = dest_window(
+        state,
+        host,
+        task_id,
+        dst_base,
+        dst_span.saturating_sub(cmd.destination_offset),
+    );
     let mut row = vec![0u8; row_bytes as usize];
     for z in 0..copy_d {
         for y in 0..copy_h {
@@ -2125,16 +2101,23 @@ fn exec_copy_texture_to_buffer<M: HostMemory + HostOps>(
             ) {
                 return st;
             }
-            let d = match dst
-                .gva
-                .checked_add(cmd.destination_offset)
-                .and_then(|b| b.checked_add(z.saturating_mul(dst_bpi)))
+            let d = match dst_base
+                .checked_add(z.saturating_mul(dst_bpi))
                 .and_then(|b| b.checked_add(y.saturating_mul(dst_bpr)))
             {
                 Some(v) => v,
                 None => return br(BlitStatus::Bounds, "t2b_stage_dst_gva_overflow"),
             };
-            if gva_mem::write_task_gva_product(state, host, task_id, d, &row).is_err() {
+            if gva_mem::write_task_gva_product_within(
+                state,
+                host,
+                task_id,
+                d,
+                &row,
+                allowed.as_ref(),
+            )
+            .is_err()
+            {
                 return br(BlitStatus::GuestIo, "t2b_stage_write_io");
             }
         }

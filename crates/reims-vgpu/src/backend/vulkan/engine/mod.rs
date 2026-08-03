@@ -1217,11 +1217,11 @@ unsafe fn copy_image_level0_to_host_delivered(
             height,
             depth: 1,
         })];
-    // With a comparison attached the frame is copied into device-local scratch
-    // instead, and only the tiles that differ from `prev` reach the
-    // host-visible slot. On a discrete part that is the whole point: the copy
-    // that crosses the bus is 87-91% of this fence, and it shrinks by whatever
-    // fraction of the frame is already at the destination.
+    // The whole level, every time: nothing upstream tells this call which part
+    // of the frame the draws touched. That is what the slots 1-2 span prices —
+    // on a discrete part this copy crosses the bus and is 87-91% of the fence,
+    // so `gpu_us` owning `fence_us` in `readback_split` is bytes and not
+    // latency, and bounding the region is the lever that would move it.
     ctx.device.cmd_copy_image_to_buffer(
         cb,
         image,

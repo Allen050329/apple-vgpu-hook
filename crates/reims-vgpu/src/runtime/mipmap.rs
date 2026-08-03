@@ -326,13 +326,27 @@ fn store_level_tight_native<M: HostMemory + HostOps>(
     if tex.allocation_size != 0 && layout.offset.saturating_add(span) > tex.allocation_size {
         return Err(MipmapStatus::IncompleteLayout);
     }
+    // The same bound every other multi-row guest writer takes, for the reason
+    // `dest_window` states: this loop re-resolves `row_gva` from the live page
+    // table on each of `h` rows while the guest's vCPUs run, and a level that
+    // runs off its resource paints whatever the guest handed those pages to.
+    let allowed = gva_mem::dest_window(state, host, task_id, gva, span);
     for y in 0..h {
         let src_off = (y as usize) * (tight_row as usize);
         let row = &tight[src_off..src_off + tight_row as usize];
         let Some(row_gva) = gva.checked_add((y as u64).saturating_mul(bpr)) else {
             return Err(MipmapStatus::GuestIo);
         };
-        if gva_mem::write_task_gva_product(state, host, task_id, row_gva, row).is_err() {
+        if gva_mem::write_task_gva_product_within(
+            state,
+            host,
+            task_id,
+            row_gva,
+            row,
+            allowed.as_ref(),
+        )
+        .is_err()
+        {
             return Err(MipmapStatus::GuestIo);
         }
     }

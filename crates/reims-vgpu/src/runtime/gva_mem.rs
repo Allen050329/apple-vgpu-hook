@@ -348,6 +348,50 @@ pub fn write_task_gva_product<H: HostMemory + crate::runtime::host::HostOps>(
     write_task_gva_product_within(state, host, task_id, gva, buf, None)
 }
 
+/// The guest pages a row loop's destination span resolves to, taken before the
+/// loop that writes them.
+///
+/// A blit does not wait for the GPU, which is why these writes were argued to be
+/// authorised by the page table at the moment they run. That argument confuses
+/// "synchronous with the device thread" with "instantaneous": a full-screen
+/// texture copy is tens of MiB of per-row guest read and guest write, the guest's
+/// own vCPUs run throughout, and the destination is re-resolved from scratch on
+/// every row. The pages `gva + 8000 * stride` names at the end of the loop need
+/// not be the pages the same expression named at the start, and a copy that runs
+/// off its resource paints whatever the guest handed those pages to next — the
+/// heap and kernel corruption this class is made of.
+///
+/// Capturing the whole destination span once, up front, makes every row's write
+/// authorised by the walk the command itself would have been authorised by.
+///
+/// This lives beside [`write_task_gva_product_within`] rather than in one of its
+/// callers because it is the bound that writer takes: every multi-row guest
+/// writer owes it, and a second copy of the rule is how one of them ends up not
+/// taking it.
+///
+/// `None` when the span resolves no page at all. That leaves the writer to fail
+/// closed on its own terms rather than refusing a whole copy because the capture
+/// failed for an unrelated reason; it is counted so the arm is measurable
+/// instead of assumed.
+pub fn dest_window<M: HostMemory>(
+    state: &crate::model::DeviceState,
+    host: &M,
+    task_id: u32,
+    gva: u64,
+    span: u64,
+) -> Option<std::collections::HashSet<u64>> {
+    if gva == 0 || span == 0 {
+        return None;
+    }
+    let pages = task_gva_page_gpa_set(host, &state.tasks, task_id, gva, span, state.page_shift);
+    if pages.is_empty() {
+        crate::runtime::drain::note_store_route("blit_dest_unbounded");
+        return None;
+    }
+    crate::runtime::drain::note_store_route("blit_dest_bound");
+    Some(pages)
+}
+
 /// [`write_task_gva_product`] bounded to the guest pages a deferred window was
 /// armed on.
 ///
@@ -721,6 +765,41 @@ mod tests {
     use super::*;
     use crate::contract::endian::st32;
     use crate::observe::Decline;
+
+    /// Every guest writer that loops over rows takes [`dest_window`] first.
+    ///
+    /// The bounded/unbounded pair is one character apart at the call site, the
+    /// unbounded form is the shorter one, and the difference is invisible in
+    /// review: `a_blit_destination_is_bounded_against_a_guest_that_repoints_it_mid_copy`
+    /// shows what the unbounded arm does to a guest that re-points the range —
+    /// it reports success and paints a page the command never named. Two row
+    /// loops had drifted onto it (`blit_exec`'s staged texture-to-buffer arm and
+    /// `mipmap`'s level writeback), each surrounded by siblings doing it right.
+    ///
+    /// So this is a gate on the class rather than on those two: a loop writer is
+    /// a `write_task_gva_product` call whose enclosing file also re-derives a
+    /// destination per row, and there is no way to spell that reliably from
+    /// source. What is reliable is that the modules that own row loops must not
+    /// name the unbounded form at all. `drain` is not one of them — its three
+    /// calls are single completion stamps, authorised by the packet being
+    /// retired — and `gva_view`/`compute_exec` name it only from tests.
+    #[test]
+    fn row_loop_writers_take_the_bounded_form() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/runtime");
+        for relative in ["blit_exec.rs", "mipmap.rs", "mapping_write.rs", "storage_flush.rs"] {
+            let src = std::fs::read_to_string(root.join(relative))
+                .unwrap_or_else(|e| panic!("{relative}: {e}"));
+            // `_within` is the bounded form and shares this prefix, so match the
+            // open paren that only the unbounded form can present.
+            let unbounded = src.match_indices("write_task_gva_product(").count();
+            assert_eq!(
+                unbounded, 0,
+                "{relative} calls the unbounded write_task_gva_product; a row loop \
+                 that re-resolves its destination must capture dest_window once \
+                 up front and pass it to write_task_gva_product_within"
+            );
+        }
+    }
 
     /// A span's page count is decided by where it *starts*, not only by how long
     /// it is.
