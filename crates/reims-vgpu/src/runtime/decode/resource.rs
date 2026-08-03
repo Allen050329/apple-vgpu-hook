@@ -3000,6 +3000,52 @@ mod tests {
         assert_eq!(all.len(), 1);
     }
 
+    /// `color_attachments` is a dense prefix whose `slot` is its own index.
+    ///
+    /// This is the property every consumer's `find(|a| a.slot == c.slot)` rests
+    /// on, and the reason an `or_else(first())` beside one of those is not a
+    /// harmless belt-and-braces: because entry 0 always carries slot 0, `find`
+    /// can never miss for slot 0, so such a fallback is reachable *only* for a
+    /// secondary slot that has no entry — the one case where answering with
+    /// slot 0's state invents it. Each slot here carries a distinct `dst_rgb`
+    /// so borrowing entry 0's would be visible rather than coincidentally equal.
+    #[test]
+    fn colour_attachment_slots_are_their_own_index_and_carry_their_own_state() {
+        use crate::contract::endian::st32;
+        // [count][off0][off1][off2] then three 1-field entries, 7 bytes each.
+        const ENTRY_LEN: usize = 7;
+        let off = 16usize;
+        let header = 4 + 4 * 3;
+        let mut buf = vec![0u8; off + header + ENTRY_LEN * 3];
+        st32(&mut buf[off..], 3);
+        for i in 0..3 {
+            let entry_rel = header + i * ENTRY_LEN;
+            st32(&mut buf[off + 4 + i * 4..], entry_rel as u32);
+            let entry = off + entry_rel;
+            buf[entry] = 1;
+            buf[entry + 1] = COLOR_ATTACHMENT_TAG_DST_RGB;
+            buf[entry + 2] = 4;
+            // Distinct per slot: 10, 11, 12.
+            st32(&mut buf[entry + 3..], 10 + i as u32);
+        }
+        let all = parse_color_attachments(&buf, buf.len(), off);
+        assert_eq!(all.len(), 3, "all three entries are in range");
+        for (i, a) in all.iter().enumerate() {
+            assert_eq!(a.slot, i as u32, "slot is the entry index");
+            assert_eq!(a.dst_rgb, 10 + i as u32, "each slot keeps its own state");
+        }
+        // What a consumer's `find` must return, and what `first()` would.
+        let by_slot = |s: u32| all.iter().find(|a| a.slot == s).map(|a| a.dst_rgb);
+        assert_eq!(by_slot(2), Some(12));
+        assert_ne!(
+            by_slot(2),
+            all.first().map(|a| a.dst_rgb),
+            "slot 2 must not resolve to entry 0's state"
+        );
+        // A secondary slot the table does not describe has no state at all.
+        assert_eq!(by_slot(5), None);
+    }
+
     /// A section that declares three attachments and delivers one is a pipeline
     /// whose other two slots take opaque `ONE`/`ZERO` defaults, which downstream
     /// cannot tell from a guest that declared one. The loss has to say so.

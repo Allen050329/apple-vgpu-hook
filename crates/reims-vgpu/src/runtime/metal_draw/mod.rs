@@ -1788,11 +1788,17 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
         let out_ptr = color_outs[i].as_mut_ptr();
         let out_len = color_outs[i].len();
         let out = unsafe { std::slice::from_raw_parts_mut(out_ptr, out_len) };
+        // This slot's own entry and no other. `parse_color_attachments` stamps
+        // `slot = i` and pushes in order, so the vector is a dense prefix and
+        // `find` already hits entry 0 for slot 0 — an `or_else(first())` here
+        // could therefore only ever fire for a *secondary* slot with no entry
+        // of its own, which is exactly the case where borrowing slot 0's blend
+        // state invents one. The compat `color0` alias it looked like it served
+        // is served by the `or_else` below, which tests `c.slot == 0`.
         let slot_blend = pipeline
             .color_attachments
             .iter()
             .find(|a| a.slot == c.slot)
-            .or_else(|| pipeline.color_attachments.first())
             .filter(|a| a.blending_enabled)
             .map(|a| ReimsVgpuBlendState {
                 enable: 1,
