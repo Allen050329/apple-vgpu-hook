@@ -1749,30 +1749,20 @@ fn present_named_mapping<H: HostMemory + HostOps>(
                      (dmabuf carried the frame; no CPU pixels to judge)"
                 ));
             } else if verdict == PresentContentVerdict::Black {
-                // Measure dual-mid: other same-geom host_caches with visible RGB
-                // while the named mid freezes black (console stays black).
-                let mut peers = String::new();
-                for (&mid, e) in state.host_surfaces.iter() {
-                    if mid == mapping || e.width != w || e.height != h || e.bgra.is_empty() {
-                        continue;
-                    }
-                    let (pnz, pmax, _) = crate::observe::bgra_rgb_stats(&e.bgra);
-                    if pmax > 0 && pnz > 10_000 {
-                        if !peers.is_empty() {
-                            peers.push(',');
-                        }
-                        peers.push_str(&format!(
-                            "mid{mid}:rgb_nz={pnz}:max_rgb={pmax}:hgen={}",
-                            e.host_gen
-                        ));
-                    }
-                }
+                // Both lines name the mapping the guest asked us to show and say
+                // it came out black. They deliberately do not go looking for a
+                // different surface that looks better: "which other host surface
+                // has real content" is a judgement about observed pixels, and
+                // `scanout::present_capture` already removed the same walk —
+                // same undefended non-zero-pixel threshold — for that reason. A
+                // black present is a decode or a writeback fault, and the mid,
+                // geometry and generation here are what locate it.
                 crate::observe::off(format!(
-                    "present_black mid={mapping} {w}x{h} gen={gen} rgb_nz={rgb_nz} px0=[{},{},{},{}] (QMP will be black) peers=[{peers}]",
+                    "present_black mid={mapping} {w}x{h} gen={gen} rgb_nz={rgb_nz} px0=[{},{},{},{}] (QMP will be black)",
                     px0[0], px0[1], px0[2], px0[3]
                 ));
                 crate::observe::fail(format!(
-                    "present_black_retain mid={mapping} {w}x{h} gen={gen} (alpha-only/black +0x188) peers=[{peers}]"
+                    "present_black_retain mid={mapping} {w}x{h} gen={gen} (alpha-only/black +0x188)"
                 ));
             } else {
                 crate::observe::off(format!(
@@ -2912,7 +2902,7 @@ pub fn signal_display_present_complete<H: HostMemory + HostOps>(
     // A bit2 (ONLINE) still pending *after* online was acked is stale: the guest
     // already consumed that online event (`online_acked`), so re-delivering it
     // makes `signalDisplay` re-run process_online → connectionChange → a
-    // boot-progress overlay rebuild (x86 RE 2026-07-17: the host-driven strobe).
+    // boot-progress overlay rebuild (the host-driven strobe).
     // Preserving bit2 via the `pending |` write is only correct *pre-ack*; drop
     // it once acked so we don't hand the guest a redundant online. `stale` is 0
     // on healthy boots (bit2 clears at ack), so this is a no-op there — it only
