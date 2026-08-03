@@ -561,7 +561,9 @@ the pass drew the whole surface, so there is no smaller extent to copy (`note_pa
 which carries the table). The per-draw distribution beside it looks encouraging in isolation — two
 thirds of *partial* draws cover a quarter of the surface or less — and reading only that is how this
 gets rebuilt; the governing number is that **half of all draws are full-coverage**, and a window is
-7 draws, so `0.5^7` says essentially every window contains one.
+~8 draws, so `0.5^8` says essentially every window contains one. That 99.92% is per *window*, and a
+pass is ~3 draws, so the per-*pass* figure is the weaker ~87% (`0.5^3`) — but the window is what a
+flush copies, so 99.92% is the number a repair has to beat.
 That also settles the shape of any successor: it is not the bounding-box approximation that kills
 it. A rect list or a tile map would score better on a union, but no representation makes a
 full-surface draw smaller, so `6df980c`'s tile-diff rail must not be revived on this argument

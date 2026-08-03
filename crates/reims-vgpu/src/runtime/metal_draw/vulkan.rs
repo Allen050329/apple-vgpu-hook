@@ -3429,11 +3429,20 @@ fn unpack_rect(v: u64) -> (u32, u32, u32, u32) {
 /// that governs, and the two are consistent rather than in conflict.
 ///
 /// The instrument agrees with its own inputs, which is why the reading is
-/// trustworthy: the boot runs 7 draws per armed window and 50 % of all draws
-/// are full-coverage, so a window escapes saturation only if all 7 of its draws
-/// are partial - `0.5^7` is 0.78 %, predicting ~99.2 % against the 99.92 %
-/// measured. The residual is draws clustering rather than being independent,
-/// plus this counter's own documented over-estimate.
+/// trustworthy: the boot runs 7.9 draws per armed window and 50 % of all draws
+/// are full-coverage, so a window escapes saturation only if every one of those
+/// draws is partial - `0.5^7.9` is 0.4 %, predicting ~99.6 % against the 99.92 %
+/// measured. The residual is draws clustering rather than being independent.
+///
+/// **99.92 % is the per-*window* figure and it overstates the per-*pass* one.**
+/// This counter resets at the arm, and a render pass is ~3 draws, so each
+/// reading unions roughly 2.6 passes rather than one - the over-estimate the
+/// section above declares. Correcting for it does not change the answer: at 3
+/// draws a pass and the same 50 % full-coverage rate, `0.5^3` leaves ~87 % of
+/// true passes still drawing their whole surface. The honest claim is therefore
+/// "~87 % of passes, 99.92 % of the windows a flush actually lands", and a
+/// damage-bounded flush would have to beat the second number, because the
+/// window is what gets copied.
 ///
 /// **And the bounding box is not what kills it.** A union is a rectangle, so
 /// two small disjoint rects produce a large one, and a richer damage
