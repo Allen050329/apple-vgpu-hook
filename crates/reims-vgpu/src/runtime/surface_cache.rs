@@ -936,6 +936,35 @@ impl CacheLevel {
 /// an entry's allocation rather than copying it — so a cache figure is the size
 /// of the pixels reachable through the cache, not memory additional to the
 /// windows.
+///
+/// # The surface tier reads zero by construction, and that zero is the finding
+///
+/// `surfaces`/`surface_bytes`/`surface_largest` are 0 on every census line of
+/// every driven boot — 4 896 samples — while `gva` and `linear` beside them hold
+/// 100 MB and 70 MB. That is not a dead tier and not a broken counter. It is
+/// where the census samples:
+///
+/// - `note_cache_levels` runs in `lib.rs` at the tail of a drain tranche, after
+///   `Device::drain` has returned.
+/// - Inside that drain, `storage_flush::flush_all_windows_before_fence` lands
+///   every armed render window before the guest is told the work is done.
+/// - Every one of those landings takes the leased frame — `render_flush_copied`
+///   has never fired, `render_flush_leased` fires on every census line — so each
+///   one writes through `mapping_write::write_bgra8_uncached`, whose
+///   `CacheOutcome::Invalidate` calls [`forget`].
+///
+/// So every entry an arm put in has been reclaimed before the reader looks, and
+/// the tier is guaranteed empty at exactly the instant it is measured. A
+/// **non-zero** reading is therefore the alarm: it means a cache entry outlived
+/// the window that armed it, which is the leak this counter was added to catch
+/// and which nothing else in the device would report.
+///
+/// Two consequences a reader has to carry: `total_bytes` and `peak_bytes`
+/// exclude this tier by construction, so they understate the host-side pixel
+/// footprint by whatever the surface cache holds mid-drain (an 8.29 MB composite
+/// frame, at ~95 a second). And anyone wanting the tier's real occupancy needs a
+/// high-water mark maintained at insert time — a level read here cannot answer
+/// it, and reading zero here is not evidence that it is small.
 fn cache_levels(state: &DeviceState) -> (CacheLevel, CacheLevel, CacheLevel) {
     (
         CacheLevel::of(&state.host_surfaces, |e| e.bgra.len()),

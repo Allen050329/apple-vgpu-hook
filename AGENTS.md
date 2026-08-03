@@ -129,6 +129,14 @@ already been run to exhaustion; re-running one costs hours and has so far return
 - **A zero hit rate on one pathway is not a dead cache.** `gva_view`'s `view_reuse` reads 0 on
   x86/Vulkan because a 12-bit page shift fragments nearly every span. A 14-bit shift covers the same
   span in a quarter of the pages. The module documents this at its own reuse site.
+- **A census field that is zero on every sample can be zero because of where it samples.**
+  `host_cache_levels surfaces/surface_bytes/surface_largest` read 0 across 4 896 samples while the
+  two tiers beside them hold 170 MB. The surface tier is not dead: the census runs at the drain
+  tail, every armed render window lands inside that drain, and every landing is leased and forgets
+  its entry — so the tier is guaranteed empty at the instant it is read, and a **non-zero** reading
+  is the leak alarm. Documented at `cache_levels` in `runtime/surface_cache.rs`. Before cutting a
+  constant field, find its sampling point; `scripts/constant-fields/README.md` lists five ways a
+  constant can be legitimate and this is a sixth.
 
 The remaining reduction lever is runtime-dead code — paths that compile and are reachable but that
 the protocol never takes — and `dead-state` cannot see that class. `/tmp/reims-vgpu-fail.log` is the
