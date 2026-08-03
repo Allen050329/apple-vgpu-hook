@@ -745,6 +745,32 @@ one where a rate is available at all. For the other thirteen the occurrence rate
 is not measured, and "the counts are stable across boots" is a statement about
 distinct instances only.
 
+### A Performance Commit Is Not Verified Until Its Pixels Are
+
+**A performance commit does not land until `scripts/visual-gate/visual-gate.sh`
+passes on a live boot of the pathway it touches, and the commit body says which
+pathway and quotes the verdict line.**
+
+This is a rule rather than a suggestion because the alternative has already been
+paid for. A branch of 59 commits — 21 of them code-changing, +7687/−820 across 38
+files, about seven hours — was reset off wholesale because it had introduced
+graphical glitches. Every one of those commits was verified: clippy, unit tests,
+the feature matrix, device-side performance counters. The work was performance
+work, so the instruments it was checked with were performance instruments, and a
+rendering regression was invisible **by construction**. Nothing lied. The right
+question was never asked.
+
+The three probes below already answer that question and had done so for weeks.
+None of them gated anything, which is the entire defect. `visual-gate` runs all
+three on a settled guest, applies the six silent-loss counters over its own byte
+window of the fail log, and exits non-zero on any of it. Its README has the
+counter table and the two things it is not.
+
+If a change cannot be gated — because it only manifests under a workload no
+probe drives — say so explicitly in the commit body under "Not verified". The
+suspect commit on that branch did exactly that, honestly, in its own body. The
+failure was that nobody treated the admission as blocking.
+
 ### A Screenshot Cannot Say Who Dropped The Pixels
 
 Several open goals are reported as screenshots: web content whose background
