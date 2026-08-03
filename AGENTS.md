@@ -155,9 +155,44 @@ already been run to exhaustion; re-running one costs hours and has so far return
   constant field, find its sampling point; `scripts/constant-fields/README.md` lists five ways a
   constant can be legitimate and this is a sixth.
 
+- **Four more large modules have now been swept, and three returned nothing.** `storage_flush.rs`,
+  `mapper.rs` + `mapping_write.rs`, `scanout.rs` + `host_window/present.rs` + `surface_cache.rs` +
+  `window_present.rs`, and `decode/resource.rs` + `model/state.rs` + `objects.rs`. **No oracles were
+  found in any of them** — no PFN plausibility heuristic, no poison-pattern check, no stride or
+  geometry guessing, no multi-interpretation resolve ladder, no retry loop. What the sweep did find
+  was two *speculative* rails with no producer (both deleted) and two decoders overriding a decoded
+  field (both fixed). Re-running the oracle hunt over these files is not worth the hours.
+- **A never-firing dispatch arm is almost never a deletion.** An audit of all 85 `store_routes`
+  names against two driven boots found 39 that never fire. Every one resolved into either contract
+  fidelity — a real Apple opcode this workload happens not to issue (`icb_exec_seen`,
+  `compute_ctrl_seen`, the five `compute_noop_*` fence/barrier/residency arms) — or a healthy-zero
+  alarm, where a firing *is* the bug (23 of them, all drift/unbounded/unwitnessed detectors). None
+  were reducible. Deleting a decoded-but-untaken arm loses guest work silently the first time a
+  guest takes it.
+
 The remaining reduction lever is runtime-dead code — paths that compile and are reachable but that
 the protocol never takes — and `dead-state` cannot see that class. `/tmp/reims-vgpu-fail.log` is the
 only ground truth for it, and it is untracked and disappears.
+
+### Reading the fail log
+
+Two things about its shape, so a reader does not mis-size what they are looking at:
+
+- **Volume is not alarm.** Across a driven boot only ~1.7 % of records are on the `fail` channel;
+  the rest are `OFF`. The seven highest-volume tags (`window_publish`, `host_cache_levels`,
+  `guest_write_footprint`, `engine_lock`, `engine_delta`, `drain_duty`, `host_window_loop`) are
+  ~59 % of all records and are **one 1 Hz heartbeat** — inter-record deltas of 1000-1003 ms. That is
+  cadence working, not an over-eager emitter.
+- **Absence of a decode line proves nothing.** Every decoder in `decode/` is silent on success and
+  emits only on `Err*`. So "opcode X never appears in the log" is not evidence that arm never ran.
+  The only usable never-fired signal is the `store_routes` counter set.
+
+### Units
+
+`draw_stall`'s headline `us=` field once carried nanoseconds while its thirteen siblings carried
+microseconds — a 1000× error on the device's own first-look number for a slow draw. The rest of the
+tree was then audited for the same class: every other `*_us` field traces to a variable already in
+microseconds. Fixed and checked; do not re-run this sweep.
 
 ## Support Matrix
 
