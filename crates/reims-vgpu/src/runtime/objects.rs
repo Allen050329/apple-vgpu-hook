@@ -217,10 +217,6 @@ pub const TYPE4_PIXEL_FORMAT: usize = 0x0c;
 pub const TYPE4_PLANE_COUNT: usize = 0x10;
 pub const TYPE4_PLANES: usize = 0x14;
 pub const TYPE4_PLANE_STRIDE: usize = 0x10;
-/// Plane0 fields relative to descriptor base (after off-by-one fix in kb).
-pub const TYPE4_PLANE0_WIDTH: usize = 0x18;
-pub const TYPE4_PLANE0_HEIGHT: usize = 0x1c;
-pub const TYPE4_PLANE0_BPR_PACKED: usize = 0x20;
 pub const TYPE4_MIN_LEN: usize = 0x24;
 /// Max plane records in type-4 wire / device desc (IOSurface getPlaneCount cap).
 pub const TYPE4_PLANE_CAP: usize = 8;
@@ -481,6 +477,42 @@ fn note_type4_surface_shape(desc: &[u8]) {
     ));
 }
 
+/// Report, once per reason, that the type-4 decoder dropped something the guest
+/// declared.
+///
+/// Deduped rather than sampled: each reason names a distinct shape of blob, and
+/// a surface stream re-decodes the same descriptor thousands of times a boot, so
+/// an undeduped line would flood while adding nothing. The first occurrence is
+/// what a reader needs — after it, `type4_desc_shape` carries the geometry.
+fn type4_decode_drop_latch() -> &'static std::sync::Mutex<std::collections::HashSet<&'static str>> {
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<std::collections::HashSet<&'static str>>> = OnceLock::new();
+    SEEN.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+fn note_type4_decode_drop(reason: &'static str, detail: String) {
+    let fresh = {
+        let mut guard = type4_decode_drop_latch()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        guard.insert(reason)
+    };
+    if fresh {
+        crate::observe::fail(detail);
+    }
+}
+
+/// Forget which reasons have been reported, so a test observes the first
+/// occurrence rather than whatever an earlier test in the same process left
+/// behind.
+#[cfg(test)]
+fn reset_type4_decode_drops() {
+    type4_decode_drop_latch()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clear();
+}
+
 /// Decode a type-4 surface descriptor blob.
 pub fn decode_type4_surface(desc: &[u8]) -> Option<Type4Surface> {
     note_type4_surface_shape(desc);
@@ -495,10 +527,35 @@ pub fn decode_type4_surface(desc: &[u8]) -> Option<Type4Surface> {
         return None;
     }
     let plane_count = (plane_count_raw as usize).min(TYPE4_PLANE_CAP) as u8;
+    if plane_count_raw as usize > TYPE4_PLANE_CAP {
+        // The bound itself is right — IOSurface's own `getPlaneCount` caps at
+        // eight — but dropping the surplus quietly is not. The guest declared
+        // planes this device will never look at, and every later reader sees a
+        // surface that simply has eight.
+        note_type4_decode_drop(
+            "plane_count_over_cap",
+            format!(
+                "type4_decode_drop reason=plane_count_over_cap declared={plane_count_raw} \
+                 cap={TYPE4_PLANE_CAP} fmt={pixel_format:#x}"
+            ),
+        );
+    }
     let mut planes = [Type4Plane::default(); TYPE4_PLANE_CAP];
     for (i, plane) in planes.iter_mut().enumerate().take(plane_count as usize) {
-        if let Some(p) = decode_type4_plane(desc, i) {
-            *plane = p;
+        match decode_type4_plane(desc, i) {
+            Some(p) => *plane = p,
+            // A declared plane whose record the blob does not reach. Leaving the
+            // default in place publishes a 0x0 plane as if the guest had asked
+            // for one, which reads downstream as a surface with no content
+            // rather than as a descriptor we could not decode.
+            None => note_type4_decode_drop(
+                "plane_record_short",
+                format!(
+                    "type4_decode_drop reason=plane_record_short plane={i} \
+                     planes={plane_count} desc_len={} fmt={pixel_format:#x}",
+                    desc.len()
+                ),
+            ),
         }
     }
     let (width, height, bpr) = if plane_count > 0 {
@@ -538,7 +595,22 @@ fn synthesize_device_desc_from_type4(surf: &Type4Surface) -> Vec<u8> {
         surf.pixel_format
     };
     st32(&mut device_desc[DEVICE_DESC_PIXEL_FORMAT..], fmt_word);
+    // `allocSize` is a u32 field in the device descriptor and `length` is u64 on
+    // the wire, so a surface above 4 GiB cannot be published faithfully. Saying
+    // `u32::MAX` is the least wrong answer available — it is the largest size the
+    // field can hold, so a reader sizing a mapping from it under-reads rather
+    // than walking past the end — but it is still a size the guest did not ask
+    // for, and it must not be published as though it were.
     let alloc = if surf.length > u32::MAX as u64 {
+        note_type4_decode_drop(
+            "alloc_size_over_u32",
+            format!(
+                "type4_decode_drop reason=alloc_size_over_u32 length={} \
+                 published={} (device-descriptor allocSize is 32-bit)",
+                surf.length,
+                u32::MAX
+            ),
+        );
         u32::MAX
     } else {
         surf.length as u32
@@ -882,37 +954,25 @@ fn apply_type4_backing<M: HostMemory>(
         .unwrap_or(true);
     if first_attach && page_count >= 1 {
         let g0 = entry_gpa_shift(entries[0], page_shift).unwrap_or(0);
-        let g1 = entries
-            .get(1)
-            .and_then(|&e| entry_gpa_shift(e, page_shift))
-            .unwrap_or(0);
-        let g2 = entries
-            .get(2)
-            .and_then(|&e| entry_gpa_shift(e, page_shift))
-            .unwrap_or(0);
-        let mut sample = [0u8; 16];
-        let snz = if host.read_gpa(g0, &mut sample).is_ok() {
-            sample.iter().filter(|&&b| b != 0).count()
-        } else {
-            0
-        };
-        // Tight plane0 footprint using wire bpe when present (else 0 — log only).
-        let bpe0 = if surf.planes[0].bytes_per_element != 0 {
-            surf.planes[0].bytes_per_element as u64
-        } else if iosurface_fourcc_is_biplanar(surf.pixel_format) {
-            1
-        } else if iosurface_pixel_format_to_mtl(surf.pixel_format) != 0 {
-            crate::contract::pixel_format::bytes_per_pixel(iosurface_pixel_format_to_mtl(
-                surf.pixel_format,
-            ))
-            .unwrap_or(0) as u64
-        } else {
-            0
-        };
-        let plane0_bytes = (surf.width as u64)
-            .saturating_mul(surf.height as u64)
-            .saturating_mul(bpe0);
-        // Bring-up census (dims/fmt/sample probe), not a drop — the genuine
+        // Three fields that used to ride on this line are gone, all of them
+        // probe residue rather than census:
+        //
+        // - `sample0_nz`: a 16-byte `read_gpa` of the first backing page, per
+        //   first attach, to count non-zero bytes. It fed no decision, and it
+        //   read `0/16` on every one of the 131 attaches across two driven
+        //   boots — a content sniff answering a bring-up question that has been
+        //   answered.
+        // - `plane0_bytes` and its `bpe0`: where the wire did not state
+        //   bytes-per-element, a four-branch ladder guessed one from the format
+        //   so a log field could be filled. Deriving a number nothing consumes
+        //   is how a guess becomes a rule later.
+        // - `gpa1`/`gpa2`: the second and third pages, sampled for no stated
+        //   reason. `n` and `gva_hits` already say how many pages resolved.
+        //
+        // What remains is the census the comment below defends: the identity of
+        // the backing, so a refusal and a later resolve can be matched.
+        //
+        // Bring-up census (dims/fmt), not a drop — the genuine
         // type-4 failures route through note_type4_fail with reason=. On the
         // always-on `off()` sink, not `fail()`: under surface recycling this
         // "first attach" re-fires per recycle (page_entries cleared by the
@@ -926,7 +986,7 @@ fn apply_type4_backing<M: HostMemory>(
         // later" can be a different surface wearing the same id.
         let gva0 = (surf.backing_pfn as u64) << page_shift;
         crate::observe::off(format!(
-            "type4 pages sid={surface_id} task={task_id} n={page_count} gva_hits={gva_hits} gva0={gva0:#x} gpa0={g0:#x} gpa1={g1:#x} gpa2={g2:#x} sample0_nz={snz}/16 w={} h={} bpr={} len={:#x} plane0_bytes={plane0_bytes} fmt={:#x} planes={} multi={}",
+            "type4 pages sid={surface_id} task={task_id} n={page_count} gva_hits={gva_hits} gva0={gva0:#x} gpa0={g0:#x} w={} h={} bpr={} len={:#x} fmt={:#x} planes={} multi={}",
             surf.width,
             surf.height,
             surf.bytes_per_row,
@@ -1365,6 +1425,86 @@ mod tests {
         let m = state.mappings.get(&9).unwrap();
         assert!(m.has_geom);
         assert_eq!((m.width, m.height, m.format), (64, 32, 0x50));
+    }
+
+    /// The type-4 decoder says so when it drops what the guest declared.
+    ///
+    /// All three of these bounds are correct — IOSurface caps `getPlaneCount`
+    /// at eight, a plane record the blob does not reach cannot be decoded, and
+    /// the device descriptor's `allocSize` really is 32 bits. What was wrong is
+    /// that each one applied in silence, so a surface whose ninth plane this
+    /// device will never look at, or whose size it cannot express, reached every
+    /// later reader as a surface that simply had eight planes and that size.
+    /// Never Fail Silently: a bound the guest crossed is a bound worth naming.
+    #[test]
+    fn the_type4_decoder_reports_what_it_drops() {
+        // `desc` reaches only plane 0's record, so planes 1..=7 are declared
+        // and unreachable, and plane 8+ is over the cap.
+        let mut desc = vec![0u8; 0x24];
+        st64(&mut desc[TYPE4_LEN..], 0x1000);
+        st32(&mut desc[TYPE4_BACKING_PFN..], 0x100);
+        st32(&mut desc[TYPE4_PIXEL_FORMAT..], 0x4247_5241); // 'BGRA'
+        desc[TYPE4_PLANE_COUNT] = 12;
+
+        reset_type4_decode_drops();
+        let cap = crate::observe::FailCapture::start();
+        let s = decode_type4_surface(&desc).expect("type4 decodes");
+        assert_eq!(s.plane_count, TYPE4_PLANE_CAP as u8, "still clamped");
+        // Two distinct drops on this descriptor, so select by reason rather
+        // than by slug: the surplus planes over the cap, and — separately —
+        // the declared planes whose records the blob does not reach.
+        let over = cap
+            .lines()
+            .into_iter()
+            .find(|l| l.contains("reason=plane_count_over_cap"))
+            .expect("an over-cap plane count must be reported");
+        assert!(
+            over.contains("declared=12") && over.contains("cap=8"),
+            "the line must name what the guest asked for and what it got: {over}"
+        );
+
+        // Same reason twice is one line — the latch is what keeps a per-surface
+        // stream from flooding the always-on channel.
+        let cap2 = crate::observe::FailCapture::start();
+        let _ = decode_type4_surface(&desc);
+        assert!(
+            cap2.lines()
+                .iter()
+                .all(|l| !l.contains("reason=plane_count_over_cap")),
+            "a repeat must not spend a second line: {:?}",
+            cap2.lines()
+        );
+
+        // A declared plane whose record the blob does not reach.
+        reset_type4_decode_drops();
+        let cap3 = crate::observe::FailCapture::start();
+        let _ = decode_type4_surface(&desc);
+        let short = cap3
+            .lines()
+            .into_iter()
+            .find(|l| l.contains("reason=plane_record_short"))
+            .expect("an unreachable plane record must be reported");
+        assert!(short.contains("plane=1"), "{short}");
+
+        // A surface larger than the 32-bit `allocSize` field can express.
+        reset_type4_decode_drops();
+        let mut big = vec![0u8; 0x30];
+        st64(&mut big[TYPE4_LEN..], (u32::MAX as u64) + 1);
+        st32(&mut big[TYPE4_BACKING_PFN..], 0x100);
+        st32(&mut big[TYPE4_PIXEL_FORMAT..], 0x4247_5241);
+        big[TYPE4_PLANE_COUNT] = 1;
+        st32(&mut big[TYPE4_PLANES + 4..], 64);
+        st32(&mut big[TYPE4_PLANES + 8..], 32);
+        st32(&mut big[TYPE4_PLANES + 12..], 256);
+        let surf = decode_type4_surface(&big).expect("type4 decodes");
+        let cap4 = crate::observe::FailCapture::start();
+        let _ = synthesize_device_desc_from_type4(&surf);
+        let sat = cap4
+            .lines()
+            .into_iter()
+            .find(|l| l.contains("reason=alloc_size_over_u32"))
+            .expect("a length the 32-bit allocSize cannot hold must be reported");
+        assert!(sat.contains("length=4294967296"), "{sat}");
     }
 
     #[test]

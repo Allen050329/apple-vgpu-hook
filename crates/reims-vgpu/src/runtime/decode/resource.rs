@@ -352,9 +352,7 @@ pub const TEXTURE_LEVEL_ROW_STRIDE: usize = 16;
 pub const TEXTURE_LEVEL_WIDTH: usize = 24;
 pub const TEXTURE_LEVEL_HEIGHT: usize = 28;
 pub const TEXTURE_LEVEL_DEPTH: usize = 32;
-pub const TEXTURE_DESC_FORMAT_WORD: usize = 84;
 pub const TEXTURE_DESC_PIXEL_FORMAT: usize = 86;
-pub const TEXTURE_DESC_FORMAT_LEN: usize = 88;
 pub const TEXTURE_DESC_BASE_LEN: usize = 116;
 pub const TEXTURE_MAX_MIP_LEVELS: usize = 16;
 
@@ -597,8 +595,8 @@ pub const TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE: u32 = 9;
 pub const BUF_TEX_DESC_BUFFER_REF: usize = 12;
 pub const BUF_TEX_DESC_OFFSET: usize = 16;
 pub const BUF_TEX_DESC_BYTES_PER_ROW: usize = 24;
-// Embedded MTLTextureDescriptor base @0x20 (packed by the shared descriptor serializer).
-pub const BUF_TEX_DESC_EMBEDDED: usize = 32;
+// The embedded MTLTextureDescriptor base is @0x20, which is where the flags
+// word sits — one offset, read under the name the decoder uses for it.
 pub const BUF_TEX_DESC_FLAGS: usize = 32; // bits[0:4]=textureType, bits[16:32]=pixelFormat
 pub const BUF_TEX_DESC_WIDTH: usize = 36;
 pub const BUF_TEX_DESC_HEIGHT: usize = 40;
@@ -1019,9 +1017,21 @@ pub fn decode_texture_descriptor(bytes: &[u8]) -> Result<TextureDescriptor, Deco
     if bytes.len() >= pf_off + 2 {
         out.pixel_format = ld16(&bytes[pf_off..]);
         out.has_pixel_format = out.pixel_format != 0;
-    } else if bytes.len() >= TEXTURE_DESC_FORMAT_LEN {
-        out.pixel_format = ld16(&bytes[TEXTURE_DESC_PIXEL_FORMAT..]);
-        out.has_pixel_format = out.pixel_format != 0;
+    } else if crate::observe::first_sight("texture_desc_format_unreachable", levels as u64) {
+        // No fallback to the unshifted offset. The fallback's own length test
+        // was `TEXTURE_DESC_PIXEL_FORMAT + 2`, so for a single-mip body it
+        // guarded the same two bytes the branch above already read. It
+        // was reachable only when `format_shift > 0` — and there offset 86 is
+        // not the format at all: the level records start at 72 and run 36 bytes
+        // each, so 86..88 is inside level record 1. The fallback therefore
+        // produced a format only in the case where it was guaranteed to be
+        // reading something else, and then set `has_pixel_format`, which is
+        // what seven downstream gates fail closed on. Better to have no format.
+        crate::observe::fail(format!(
+            "texture_desc_format_unreachable levels={levels} pf_off={pf_off} len={} \
+             (multi-mip body too short for its shifted format trailer)",
+            bytes.len()
+        ));
     }
     Ok(out)
 }
@@ -1089,68 +1099,13 @@ fn compact_tlv_u32(fields: &[CompactTlv], tag: u8) -> Option<u32> {
         .map(|f| f.value_u32)
 }
 
-/// DIAG(blank-content): dump the raw tag/value fields of a vertex-buffer layout
-/// entry for the first few entries decoded, so it is directly visible whether the
-/// guest serializes a step-function tag (0x01 = perVertex/perInstance). If the
-/// tag is absent, PerVertex is the Metal default (correct); if present with value
-/// 2 and we were decoding PerVertex, that would be a decode bug. Bounded, no flood.
-fn dump_layout_entry_tags(
-    bytes: &[u8],
-    len: usize,
-    entry_off: usize,
-    buffer_index: u32,
-    stride: u32,
-) {
-    use std::sync::atomic::{AtomicU32, Ordering};
-    static N: AtomicU32 = AtomicU32::new(0);
-    if N.fetch_add(1, Ordering::Relaxed) >= 24 || entry_off >= len {
-        return;
-    }
-    let field_count = bytes[entry_off] as usize;
-    let mut p = entry_off + 1;
-    let mut fields = String::new();
-    for _ in 0..field_count {
-        if p + 2 > len {
-            break;
-        }
-        let t = bytes[p];
-        let flen = bytes[p + 1] as usize;
-        if p + 2 + flen > len {
-            break;
-        }
-        let val = if flen >= 4 { ld32(&bytes[p + 2..]) } else { 0 };
-        fields.push_str(&format!("{:#x}:{}={} ", t, flen, val));
-        p += 2 + flen;
-    }
-    // Decoded vertex-layout census (not an error) — route off() so it stays in
-    // the log for offline analysis but leaves the curated real-error view clean.
-    crate::observe::off(format!(
-        "vtx_layout_entry buf={buffer_index} stride={stride} nfields={field_count} [{}]",
-        fields.trim_end()
-    ));
-}
-
+/// [`entry_tag_u32_present`] with a value for "the entry does not carry `tag`".
+///
+/// The two used to be written out separately, with identical control flow and
+/// five identical bounds checks, differing only in what they returned when the
+/// walk fell through. A walk written twice is a walk that can be fixed once.
 fn entry_tag_u32(bytes: &[u8], len: usize, entry_off: usize, tag: u8, default: u32) -> u32 {
-    if entry_off >= len {
-        return default;
-    }
-    let field_count = bytes[entry_off] as usize;
-    let mut p = entry_off + 1;
-    for _ in 0..field_count {
-        if p + 2 > len {
-            return default;
-        }
-        let t = bytes[p];
-        let field_len = bytes[p + 1] as usize;
-        if p + 2 + field_len > len {
-            return default;
-        }
-        if t == tag && field_len >= 4 {
-            return ld32(&bytes[p + 2..]);
-        }
-        p += 2 + field_len;
-    }
-    default
+    entry_tag_u32_present(bytes, len, entry_off, tag).unwrap_or(default)
 }
 
 fn entry_tag_u32_present(bytes: &[u8], len: usize, entry_off: usize, tag: u8) -> Option<u32> {
@@ -1243,7 +1198,6 @@ pub fn parse_vertex_block(
             has_step_rate.is_some(),
             has_step_rate.unwrap_or(0),
         ));
-        dump_layout_entry_tags(bytes, block_end, entry, buffer_index, stride);
     }
 
     let attr_section = bo.saturating_add(attr_off as usize);
