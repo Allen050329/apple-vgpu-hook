@@ -771,6 +771,31 @@ probe drives — say so explicitly in the commit body under "Not verified". The
 suspect commit on that branch did exactly that, honestly, in its own body. The
 failure was that nobody treated the admission as blocking.
 
+**A green gate is necessary and it is a long way from sufficient. That is now
+measured, not feared.** A render-writeback change on a side branch was run
+against a per-landing instrument that asks whether the bytes a landing declines
+to store are already in the guest's pages. On one driven x86/PCI boot of three
+full gate runs it read **6807 unsound landings against 1102 sound — 86 % — and
+1.5 GB of declined bytes the pages did not hold.** All three of those gate runs
+read PASS, as did six more across two other boots of the same build; one
+failure in ten runs was everything the screen ever said.
+
+The arithmetic is the lesson. `visual-gate` takes 20 captures per run. That leg
+lands ~290 times a second. A defect that corrupts most landings but whose damage
+needs several frames to accumulate into a visible region passes the gate far
+more often than it fails, and *how* often is a property of the workload rather
+than of the bug.
+
+So the rule stands as written — nothing lands without a green gate — but do not
+read a green one as evidence that a rail is correct. When a change makes the
+device *decline* work it used to do, build an instrument that checks the
+declining rule itself, at the rate the rule fires. Two guards make such an
+instrument worth trusting, and both were got wrong first: it must compare
+**before** the store, because afterwards everything matches by construction; and
+it must judge only the bytes the rail is responsible for, because inter-row
+padding is outside the texture contract and comparing it reports a lost pixel
+per padded row.
+
 ### A Screenshot Cannot Say Who Dropped The Pixels
 
 Several open goals are reported as screenshots: web content whose background
