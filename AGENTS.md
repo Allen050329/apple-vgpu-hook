@@ -193,6 +193,18 @@ already been run to exhaustion; re-running one costs hours and has so far return
   loops skipped the `dest_window` bound six sibling call sites take. When auditing here, diff the two
   arms against each other rather than reading either alone — and grep the *other* arm's comments,
   because in three of these four the correct rule was already written down next to the wrong code.
+  **The vein has kept producing, and the newest instance shows how the shape hides.** `blit_exec`'s
+  type-5 arm decoded the view's wire plane index and then resolved its window through
+  `type11_sample_window`, which takes no plane index — while the other two type-5 consumers pass it
+  and `type5_sample_window` exists for exactly that. `type11_sample_window`'s own doc, twenty lines
+  above the call, states the rule ("Type-11 is the case with **no wire plane index**"), and on a
+  surface whose planes share geometry and bytes-per-element the scan matches two, takes neither, and
+  returns plane 0 packed. What made it invisible is that the call site's *own* comment said "resolve
+  it exactly like type-11", so the code matched its comment and only the callee's comment disagreed.
+  **When two arms diverge, the comment that settles it is more often on the function being called
+  than on the call.** The other instance was an alarm written out inline at one of three consumers,
+  so the other two could not report the case at all: when you find a divergence, check whether its
+  failure line is shared or copied, because a copied one is a divergence waiting to happen.
 - **The one remaining oracle-shaped thing is in the mapper, and only an Apple host can settle it.**
   `contract/iosurface_pages::build_table_plan` reaches the IOSurface page table through *two*
   candidate chases — `MappingInternal` field `+0x48` then `+0xb8`, and field `+0x50` then `+0x28` —
@@ -255,6 +267,16 @@ already been run to exhaustion; re-running one costs hours and has so far return
   successful resolve on this workload — but do not delete them on that reading alone. It is one
   workload on one pathway, and `claims > 1` is a live failure-channel alarm that will say so if the
   assumption ever breaks.
+  **"Task 0" is now a decoded field rather than an inference.** The type-5 descriptor's dword at
+  `+0x04` — long documented as an opaque "device-side field" and read only into a verbose echo — is
+  the id of the task whose object list holds the referenced surface, and the guest writes it from
+  the accelerator's task rather than from the view's own. That task is the kernel task, its id is an
+  immediate 0, and index 0 is reserved out of the 256-entry task-id allocator before any client task
+  exists. `TYPE5_OWNER_TASK` and `note_type5_owner_task` carry this; a driven x86 boot reads exactly
+  one distinct value, `task=0`. So the probe order is the guest's own answer, and a non-zero reading
+  is a failure line because it would falsify the ordering and the field's meaning at once. This does
+  **not** license deleting the other 255 probes — it is the same one-workload caveat plus the
+  `claims > 1` alarm — but it does mean the next session need not re-derive where surfaces live.
 
 - **The per-present type-4 force refresh is not redundant with the `0x3c` re-point packet, and
   deleting it on that argument would lose 98% of the page-list changes.** `ensure_surface_for_present`
