@@ -1,32 +1,34 @@
-//! Host-owned window presentation — a self-contained `winit` window with its
-//! own `VkSurfaceKHR`/swapchain that presents the guest frame, replacing QEMU's
-//! UI ([[host-window]]).
+//! Host-owned window presentation — a `winit` window that presents the guest
+//! frame on the engine's own `VkDevice`, replacing QEMU's UI ([[host-window]]).
 //!
-//! This file opens the window, builds a swapchain, and drives an acquire →
-//! clear/blit → present loop; it translates window input via
-//! [`super::input_map`] and hands each [`HostAction`] to the [`InputSink`] (the
-//! device wires that to the prompt action queue).
+//! This file owns the window and the event loop. The surface, the swapchain and
+//! the acquire → clear/blit → present sequence live in
+//! [`crate::backend::vulkan::engine::window_present`], on the device that
+//! rendered the frame; this file drives them and decides *when* to present. It
+//! also translates window input via [`super::input_map`] and hands each
+//! [`HostAction`] to the [`InputSink`] (the device wires that to the prompt
+//! action queue).
 //!
-//! The frame source is a CPU-BGRA [`FrameSlot`] the device fills from its
-//! present capture, so a frame crosses host memory once on its way to the
-//! window. Presenting the engine's resident image directly on a shared
-//! `VkDevice` would remove that copy and is not implemented.
+//! The presenter prefers the engine-resident image, which is what keeps a
+//! presented layer from crossing host memory at all; the CPU-BGRA [`FrameSlot`]
+//! the device fills from its present capture is the source for the frames no
+//! resident carries — the firmware framebuffer, and any mapping the compositor
+//! has not rendered into.
+//!
+//! There is exactly one presenter, on every platform. A host whose engine
+//! device cannot present to this surface gets a named refusal and a shutdown
+//! rather than a second `VkDevice`; `resumed` records why.
 //!
 //! Linux owns the event loop on a dedicated thread. macOS requires AppKit work
 //! on the process main thread, so QEMU creates it through
 //! [`start_main_thread`] during device realize and then makes
 //! [`run_main_thread`] its process-main UI loop.
-// ash-heavy module: inner unsafe blocks add noise per ash call (matches the
-// engine modules' convention).
-#![allow(unsafe_op_in_unsafe_fn)]
 
 #[cfg(target_os = "macos")]
 use std::cell::RefCell;
-use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use ash::vk;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, WindowEvent};
@@ -35,7 +37,6 @@ use winit::keyboard::PhysicalKey;
 use winit::window::{Window, WindowId};
 
 use super::input_map;
-use crate::backend::vulkan::caps;
 use crate::runtime::host::HostAction;
 
 // How often the window looks for a new guest frame.
@@ -120,15 +121,6 @@ fn window_cpu_frame(frame: &Frame) -> crate::backend::vulkan::engine::WindowCpuF
     }
 }
 
-/// Whether a present must upload `incoming`'s frame into the staging image.
-/// True unless the staging image already holds that exact `seq` — the seq-gated
-/// fast path that elides the per-vblank full-frame re-upload of unchanged
-/// content. `staged` is `None` before the first upload or after a staging
-/// recreate, which always forces an upload.
-fn needs_staging_upload(staged: Option<u64>, incoming: u64) -> bool {
-    staged != Some(incoming)
-}
-
 /// Whether the window must present at all.
 ///
 /// A present is an acquire, a full-frame blit into the swapchain image, a submit
@@ -148,7 +140,7 @@ fn needs_engine_present(
 /// height)` for [`HostAction::input_pointer_move`], whose consumer scales `x`
 /// against `width` (`min_in = 0`, `max_in = dim`).
 ///
-/// Both presenters aspect-fit the guest frame into the drawable, so a window
+/// The presenter aspect-fits the guest frame into the drawable, so a window
 /// position is proportional to a guest position only *inside* the viewport — in
 /// a letterbox bar it is not over the guest surface at all. Reporting raw
 /// window coordinates therefore offsets and rescales every event by the bar
@@ -212,8 +204,8 @@ fn guest_resize_request(
 /// Under the old exact-match rule those three logged
 /// `native_resize_not_applied` — a fail-visible line saying the resize never
 /// happened, about a window that had resized — and each held *all* presentation
-/// for the full second the alarm takes, because [`App::draw_engine_window`]
-/// returns early while a request is outstanding. So a guest mode change froze
+/// for the full second the alarm takes, because [`App::draw`] returns early
+/// while a request is outstanding. So a guest mode change froze
 /// the display for a second and then claimed it had been refused.
 ///
 /// The alarm still has a job, and it is now the case it was written for: a
@@ -246,26 +238,6 @@ struct PendingGuestResize {
     requested_at: std::time::Instant,
 }
 
-fn direct_present_degrade_line(reason: &'static str, detail: String) -> String {
-    format!("direct_present_degrade reason={reason} {detail}")
-}
-
-fn direct_present_source_line(presents: u64, uploads: u64, staging_blits: u64) -> String {
-    format!(
-        "direct_present_source presents={presents} uploads={uploads} \
-         staging_blits={staging_blits}"
-    )
-}
-
-/// What the present should blit into the acquired swapchain image this frame.
-#[derive(Clone, Copy)]
-enum BlitSource {
-    /// No usable frame yet — clear to the slate color.
-    Slate,
-    /// Blit the CPU staging image (the guest frame was uploaded into it).
-    Staging,
-}
-
 /// Shared flag the device sets to ask the window to close (VM teardown). The
 /// event loop polls it in `about_to_wait` and exits promptly. Distinct from a
 /// UI close (which the window originates); either way the thread ends and its
@@ -275,17 +247,22 @@ pub type StopFlag = Arc<AtomicBool>;
 /// Errors from bringing up or running the window.
 ///
 /// One variant per distinct check, so each names itself in `/tmp/reims-vgpu-fail.log`
-/// through [`crate::observe::Decline`]. The old three String variants
-/// (`EventLoop`/`Vulkan`/`Handle`) collapsed twenty-six checks into three grep
-/// prefixes: the Linux `VkState::new` bring-up alone hid seventeen ash calls
-/// behind `Vulkan(String)`, and its two `semaphore: {e}` sites were the same
-/// prose for two different objects. The specific check now lives in the slug;
-/// the raw driver/winit string rides along as a whitespace-safe `detail=` field.
+/// through [`crate::observe::Decline`]. A coarse `Vulkan(String)`-style variant
+/// collapses many checks into one grep prefix and loses which of them fired; the
+/// specific check lives in the slug instead, and the raw driver/winit string
+/// rides along as a whitespace-safe `detail=` field.
 ///
-/// `#[allow(dead_code)]` because the enum is shared across two mutually
-/// exclusive platform paths — the `Attach*` variants are macOS-only (the engine
-/// swapchain attach) and the `Vk*` variants build the window's own ash device on
-/// Linux — so on either target roughly half are unconstructed.
+/// Every variant is a *window lifecycle* refusal: creating the loop, owning the
+/// process window, creating the native window, or attaching the engine
+/// presenter to it. Nothing here describes a swapchain or a blit — those belong
+/// to the engine presenter, which types its own declines
+/// ([`crate::backend::vulkan::engine`]'s `DrawError`), and there is no second
+/// presenter in this file to type declines for.
+///
+/// `#[allow(dead_code)]` because four of the variants (`MainLoopRun`,
+/// `AlreadyOwned`, `NoRegisteredWindow`, `WrongOwner`) are
+/// constructed only by the macOS main-thread entry points, so they are
+/// unconstructed on every other target.
 #[allow(dead_code)]
 #[derive(Debug)]
 pub enum WindowError {
@@ -304,70 +281,13 @@ pub enum WindowError {
     /// `resumed`: winit could not create the native window (shared step, both
     /// platforms) — the bring-up cannot proceed past this.
     CreateNativeWindow(String),
-    /// macOS engine-attach: the window's display handle was unavailable.
+    /// Engine-attach: the window's display handle was unavailable.
     AttachDisplayHandle(String),
-    /// macOS engine-attach: the window's window handle was unavailable.
+    /// Engine-attach: the window's window handle was unavailable.
     AttachWindowHandle(String),
-    /// macOS engine-attach: `window_present_attach` (engine swapchain) failed.
+    /// Engine-attach: `window_present_attach` (engine swapchain) failed. The
+    /// refusal that ends the window, on every platform.
     AttachEngine(String),
-    /// Linux bring-up: the Vulkan loader failed to load.
-    VkLoadLoader(String),
-    /// Linux bring-up: the window's display handle was unavailable.
-    VkDisplayHandle(String),
-    /// Linux bring-up: the window's window handle was unavailable.
-    VkWindowHandle(String),
-    /// Linux bring-up: the required surface extensions could not be enumerated.
-    VkRequiredExts(String),
-    /// Linux bring-up: enumerating instance extensions failed.
-    VkEnumerateInstanceExts(String),
-    /// Linux bring-up: `create_instance` failed.
-    VkCreateInstance(String),
-    /// Linux bring-up: `create_surface` failed.
-    VkCreateSurface(String),
-    /// Linux bring-up: enumerating physical devices failed.
-    VkEnumeratePhysicalDevices(String),
-    /// Linux bring-up: no present-capable device met the Vulkan floor.
-    VkNoUsableDevice(String),
-    /// Linux bring-up: enumerating device extensions failed.
-    VkEnumerateDeviceExts(String),
-    /// Linux bring-up: the chosen device does not advertise `VK_KHR_swapchain`.
-    VkNoSwapchainExtension,
-    /// Linux bring-up: `create_device` failed.
-    VkCreateDevice(String),
-    /// Linux bring-up: `create_command_pool` failed.
-    VkCommandPool(String),
-    /// Linux bring-up: `allocate_command_buffers` failed.
-    VkAllocCmd(String),
-    /// Linux bring-up: the image-available semaphore could not be created.
-    VkSemaphoreImageAvailable(String),
-    /// Linux bring-up: the render-finished semaphore could not be created.
-    VkSemaphoreRenderFinished(String),
-    /// Linux bring-up: the in-flight fence could not be created.
-    VkFence(String),
-    /// Linux present loop: acquiring the next swapchain image failed.
-    PresentAcquire(vk::Result),
-    /// Linux present loop: resetting the in-flight fence failed.
-    PresentResetFence(vk::Result),
-    /// Linux present loop: resetting its command buffer failed.
-    PresentResetCommandBuffer(vk::Result),
-    /// Linux present loop: beginning its command buffer failed.
-    PresentBeginCommandBuffer(vk::Result),
-    /// Linux present loop: ending its command buffer failed.
-    PresentEndCommandBuffer(vk::Result),
-    /// Linux present loop: submitting its blit failed.
-    PresentQueueSubmit(vk::Result),
-    /// Linux present loop: presenting the acquired image failed.
-    PresentQueue(vk::Result),
-    /// CPU fallback: creating the persistently mapped staging image failed.
-    StagingCreateImage(vk::Result),
-    /// CPU fallback: no upload-compatible memory type exists.
-    StagingMemoryTypeUnavailable { type_bits: u32 },
-    /// CPU fallback: allocating staging-image memory failed.
-    StagingAllocateMemory { bytes: u64, result: vk::Result },
-    /// CPU fallback: binding staging-image memory failed.
-    StagingBindMemory(vk::Result),
-    /// CPU fallback: mapping staging-image memory failed.
-    StagingMapMemory { bytes: u64, result: vk::Result },
 }
 
 impl WindowError {
@@ -382,39 +302,10 @@ impl WindowError {
             | Self::CreateNativeWindow(d)
             | Self::AttachDisplayHandle(d)
             | Self::AttachWindowHandle(d)
-            | Self::AttachEngine(d)
-            | Self::VkLoadLoader(d)
-            | Self::VkDisplayHandle(d)
-            | Self::VkWindowHandle(d)
-            | Self::VkRequiredExts(d)
-            | Self::VkEnumerateInstanceExts(d)
-            | Self::VkCreateInstance(d)
-            | Self::VkCreateSurface(d)
-            | Self::VkEnumeratePhysicalDevices(d)
-            | Self::VkNoUsableDevice(d)
-            | Self::VkEnumerateDeviceExts(d)
-            | Self::VkCreateDevice(d)
-            | Self::VkCommandPool(d)
-            | Self::VkAllocCmd(d)
-            | Self::VkSemaphoreImageAvailable(d)
-            | Self::VkSemaphoreRenderFinished(d)
-            | Self::VkFence(d) => Some(d),
+            | Self::AttachEngine(d) => Some(d),
             Self::AlreadyOwned { .. }
             | Self::NoRegisteredWindow { .. }
-            | Self::WrongOwner { .. }
-            | Self::VkNoSwapchainExtension
-            | Self::PresentAcquire(_)
-            | Self::PresentResetFence(_)
-            | Self::PresentResetCommandBuffer(_)
-            | Self::PresentBeginCommandBuffer(_)
-            | Self::PresentEndCommandBuffer(_)
-            | Self::PresentQueueSubmit(_)
-            | Self::PresentQueue(_)
-            | Self::StagingCreateImage(_)
-            | Self::StagingMemoryTypeUnavailable { .. }
-            | Self::StagingAllocateMemory { .. }
-            | Self::StagingBindMemory(_)
-            | Self::StagingMapMemory { .. } => None,
+            | Self::WrongOwner { .. } => None,
         }
     }
 }
@@ -438,35 +329,6 @@ impl crate::observe::Decline for WindowError {
             Self::AttachDisplayHandle(_) => "window_attach_display_handle",
             Self::AttachWindowHandle(_) => "window_attach_window_handle",
             Self::AttachEngine(_) => "window_attach_engine",
-            Self::VkLoadLoader(_) => "window_vk_load_loader",
-            Self::VkDisplayHandle(_) => "window_vk_display_handle",
-            Self::VkWindowHandle(_) => "window_vk_window_handle",
-            Self::VkRequiredExts(_) => "window_vk_required_exts",
-            Self::VkEnumerateInstanceExts(_) => "window_vk_enumerate_instance_exts",
-            Self::VkCreateInstance(_) => "window_vk_create_instance",
-            Self::VkCreateSurface(_) => "window_vk_create_surface",
-            Self::VkEnumeratePhysicalDevices(_) => "window_vk_enumerate_physical_devices",
-            Self::VkNoUsableDevice(_) => "window_vk_no_usable_device",
-            Self::VkEnumerateDeviceExts(_) => "window_vk_enumerate_device_exts",
-            Self::VkNoSwapchainExtension => "window_vk_no_swapchain_extension",
-            Self::VkCreateDevice(_) => "window_vk_create_device",
-            Self::VkCommandPool(_) => "window_vk_command_pool",
-            Self::VkAllocCmd(_) => "window_vk_alloc_cmd",
-            Self::VkSemaphoreImageAvailable(_) => "window_vk_semaphore_image_available",
-            Self::VkSemaphoreRenderFinished(_) => "window_vk_semaphore_render_finished",
-            Self::VkFence(_) => "window_vk_fence",
-            Self::PresentAcquire(_) => "window_present_acquire",
-            Self::PresentResetFence(_) => "window_present_reset_fence",
-            Self::PresentResetCommandBuffer(_) => "window_present_reset_command_buffer",
-            Self::PresentBeginCommandBuffer(_) => "window_present_begin_command_buffer",
-            Self::PresentEndCommandBuffer(_) => "window_present_end_command_buffer",
-            Self::PresentQueueSubmit(_) => "window_present_queue_submit",
-            Self::PresentQueue(_) => "window_present_queue",
-            Self::StagingCreateImage(_) => "window_staging_create_image",
-            Self::StagingMemoryTypeUnavailable { .. } => "window_staging_memory_type_unavailable",
-            Self::StagingAllocateMemory { .. } => "window_staging_allocate_memory",
-            Self::StagingBindMemory(_) => "window_staging_bind_memory",
-            Self::StagingMapMemory { .. } => "window_staging_map_memory",
         }
     }
 
@@ -477,25 +339,6 @@ impl crate::observe::Decline for WindowError {
             Self::WrongOwner { owner, requested } => vec![
                 ("owner", owner.to_string()),
                 ("requested", requested.to_string()),
-            ],
-            Self::PresentAcquire(result)
-            | Self::PresentResetFence(result)
-            | Self::PresentResetCommandBuffer(result)
-            | Self::PresentBeginCommandBuffer(result)
-            | Self::PresentEndCommandBuffer(result)
-            | Self::PresentQueueSubmit(result)
-            | Self::PresentQueue(result)
-            | Self::StagingCreateImage(result)
-            | Self::StagingBindMemory(result) => {
-                vec![("vk_result", result.as_raw().to_string())]
-            }
-            Self::StagingMemoryTypeUnavailable { type_bits } => {
-                vec![("type_bits", format!("{type_bits:#x}"))]
-            }
-            Self::StagingAllocateMemory { bytes, result }
-            | Self::StagingMapMemory { bytes, result } => vec![
-                ("bytes", bytes.to_string()),
-                ("vk_result", result.as_raw().to_string()),
             ],
             other => match other.detail() {
                 Some(d) => vec![("detail", detail_field(d))],
@@ -652,19 +495,12 @@ struct App {
     /// True once a `WindowClosed` action has been emitted (UI close), so the
     /// shutdown request is sent exactly once.
     closed_sent: bool,
-    /// MUST be declared before `window`: Rust drops fields in declaration order,
-    /// and `VkState::drop` destroys the swapchain + `VkSurfaceKHR`, which the
-    /// driver services through the native (Wayland/X) surface owned by `window`.
-    /// Dropping the window first leaves those calls marshalling to a dead
-    /// `wl_proxy` → SIGSEGV inside the driver's WSI. `exiting()` also tears them
-    /// down explicitly in this order; this ordering is the backstop.
-    vk: Option<VkState>,
     window: Option<Arc<Window>>,
     /// Last cursor position in window pixels (for absolute pointer moves).
     cursor: (u32, u32),
-    /// The window presents from the engine's own `VkDevice`. False means the
-    /// engine presenter refused this surface and [`VkState`] is driving the
-    /// swapchain from a second device instead.
+    /// The engine presenter holds a swapchain on this window's surface. False
+    /// before the attach in `resumed` and again after `exiting` releases it;
+    /// there is no other presenter, so false means nothing can be drawn.
     engine_attached: bool,
     first_engine_present_logged: bool,
     first_engine_guest_logged: bool,
@@ -793,10 +629,10 @@ impl ApplicationHandler for App {
                 return;
             }
         };
-        // Prefer the engine's own device. Presenting the compositor resident
-        // from the device that rendered it is what removes the three full-frame
-        // host copies every presented layer otherwise pays: the drain's
-        // `read_target`, the publish copy, and the window's staging upload.
+        // Present from the engine's own device. Presenting the compositor
+        // resident from the device that rendered it is what removes the three
+        // full-frame host copies every presented layer otherwise pays: the
+        // drain's `read_target`, the publish copy, and a staging upload.
         let attach = window
             .display_handle()
             .map_err(|error| WindowError::AttachDisplayHandle(error.to_string()))
@@ -820,50 +656,39 @@ impl ApplicationHandler for App {
             Ok(()) => {
                 self.engine_attached = true;
                 crate::backend::vulkan::engine::note_window_present_attached(true);
-                window.request_redraw();
-                self.window = Some(window);
-                return;
-            }
-            Err(error) => {
-                // macOS has no second rail: MoltenVK surface creation failing
-                // is fatal for the window either way, and opening a second
-                // `VkInstance` against the same `CAMetalLayer` would not fix
-                // it. Elsewhere the presenter's typed capability refusals
-                // (`SwapchainUnavailable`, `QueueCannotPresent`) name a host
-                // whose engine device cannot drive this surface — a hybrid
-                // laptop where the engine picked the discrete GPU, or a build
-                // without the swapchain extension — and the window falls back
-                // to its own device and CPU pixels.
-                #[cfg(target_os = "macos")]
-                {
-                    crate::observe::Emit::decline("host_window_init", &error).fail();
-                    eprintln!("reims-vgpu-window: engine swapchain init failed: {error}");
-                    self.request_shutdown();
-                    event_loop.exit();
-                    return;
-                }
-                #[cfg(not(target_os = "macos"))]
-                {
-                    crate::observe::Emit::decline("host_window_engine_attach", &error).fail();
-                    eprintln!(
-                        "reims-vgpu-window: engine present unavailable ({error}); \
-                         falling back to the window's own device"
-                    );
-                }
-            }
-        }
-        #[cfg(not(target_os = "macos"))]
-        match unsafe { VkState::new(&window) } {
-            Ok(vk) => {
-                self.vk = Some(vk);
                 // Kick the first frame; RedrawRequested re-arms each subsequent
                 // one, so without this the window would never draw.
                 window.request_redraw();
                 self.window = Some(window);
             }
-            Err(e) => {
-                crate::observe::Emit::decline("host_window_init", &e).fail();
-                eprintln!("reims-vgpu-window: Vulkan init failed: {e}");
+            Err(error) => {
+                // One rule on every platform: a host whose engine device cannot
+                // present to this surface gets a named refusal, not a second
+                // presenter.
+                //
+                // The alternative was a self-contained `VkInstance`/`VkDevice`
+                // and swapchain in this file, reached only here. It could not
+                // draw the same picture the engine rail draws — it stretched
+                // instead of letterboxing, so the pointer mapping had to be
+                // suppressed to stay in agreement with it, and it presented
+                // FIFO where the engine rail takes MAILBOX when the surface
+                // offers it. A user on the one host that reached it therefore
+                // got a measurably different display with no counter saying
+                // which rail had drawn it, which is the silent degradation this
+                // project does not ship. macOS already refused here for its own
+                // reason (a second `VkInstance` on the same `CAMetalLayer` does
+                // not fix a MoltenVK surface failure); the two pathways now
+                // agree on what an attach failure means.
+                //
+                // `host_window_engine_attach` is the counter that says the
+                // refusal happened, and the presenter's own typed reason
+                // (`SwapchainUnavailable`, `QueueCannotPresent`, a `vk_window_*`
+                // slug) rides along in it as the detail.
+                crate::observe::Emit::decline("host_window_engine_attach", &error).fail();
+                eprintln!(
+                    "reims-vgpu-window: engine present unavailable ({error}); \
+                     the host window has no other presenter — shutting down"
+                );
                 self.request_shutdown();
                 event_loop.exit();
             }
@@ -885,11 +710,6 @@ impl ApplicationHandler for App {
                 if self.engine_attached {
                     crate::backend::vulkan::engine::window_present_resize(applied.0, applied.1);
                     self.note_guest_resize_applied(applied);
-                } else {
-                    #[cfg(not(target_os = "macos"))]
-                    if let Some(vk) = self.vk.as_mut() {
-                        unsafe { vk.recreate_swapchain(applied.0, applied.1) };
-                    }
                 }
                 // Fresh swapchain images hold nothing; the seq gate would
                 // otherwise skip until the guest happened to produce a new
@@ -929,20 +749,16 @@ impl ApplicationHandler for App {
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
-        // Tear Vulkan down while the native window is still alive. VkState::drop
-        // destroys the swapchain and VkSurfaceKHR, and the driver services those
-        // through the Wayland/X surface owned by `window`; releasing the window
-        // first makes the driver marshal to a freed wl_proxy and crash. winit
-        // calls this before the loop ends, so the ordering is explicit here
-        // rather than relying on struct field order alone.
+        // Tear the presenter down while the native window is still alive.
+        // Detaching destroys the swapchain and the `VkSurfaceKHR`, and the
+        // driver services those through the Wayland/X (or AppKit) surface owned
+        // by `window`; releasing the window first makes the driver marshal to a
+        // freed `wl_proxy` and crash. winit calls this before the loop ends, so
+        // the ordering is explicit here rather than left to drop order.
         if self.engine_attached {
             crate::backend::vulkan::engine::window_present_detach();
             crate::backend::vulkan::engine::note_window_present_attached(false);
             self.engine_attached = false;
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            self.vk = None;
         }
         self.window = None;
     }
@@ -951,14 +767,14 @@ impl ApplicationHandler for App {
         self.loop_census.tick();
         // The device sets `stop` on VM teardown. The loop wakes at least once
         // per [`ENGINE_WINDOW_REDRAW_POLL`], so the request is picked up within
-        // one poll — then the loop exits and `VkState::drop` tears the window's
-        // Vulkan objects down on this thread before the device's join returns.
+        // one poll — then the loop exits and `exiting` releases the presenter's
+        // swapchain and surface on this thread before the device's join returns.
         if self.stop.load(Ordering::Relaxed) {
             event_loop.exit();
         }
-        // Same pacing on both window rails: wake on a fixed poll, ask for a
-        // redraw, and let `draw`'s seq gate decide whether anything is actually
-        // presented. Linux used to re-request a redraw from inside
+        // Pacing: wake on a fixed poll, ask for a redraw, and let `draw`'s seq
+        // gate decide whether anything is actually presented. The window used to
+        // re-request a redraw from inside
         // `RedrawRequested`, which is a spin: measured on x86/Vulkan it held
         // **510 presents/s** — a full-frame swapchain blit and submit each —
         // while the guest was producing 4.5-8 frames/s. FIFO does not throttle
@@ -1007,7 +823,6 @@ impl App {
             stop,
             closed_sent: false,
             window: None,
-            vk: None,
             cursor: (0, 0),
             engine_attached: false,
             first_engine_present_logged: false,
@@ -1031,17 +846,15 @@ impl App {
 
     fn surface_dims(&self) -> (u32, u32) {
         // The engine presenter owns the swapchain, so the native window is the
-        // only thing that knows the drawable size on that rail.
-        if self.engine_attached {
-            if let Some(window) = self.window.as_ref() {
+        // only thing here that knows the drawable size. Before it opens, the
+        // requested size is the best answer available.
+        match self.window.as_ref() {
+            Some(window) => {
                 let size = window.inner_size();
-                return (size.width.max(1), size.height.max(1));
+                (size.width.max(1), size.height.max(1))
             }
+            None => (self.config.width, self.config.height),
         }
-        self.vk
-            .as_ref()
-            .map(|v| (v.extent.width, v.extent.height))
-            .unwrap_or((self.config.width, self.config.height))
     }
 
     /// Emit an absolute pointer move. Once a guest geometry is known the
@@ -1056,80 +869,17 @@ impl App {
         (self.on_input)(HostAction::input_pointer_move(x, y, width, height));
     }
 
+    /// Present one frame through the engine presenter, or decide there is
+    /// nothing to present.
+    ///
+    /// The guard is teardown, not a rail choice: `exiting` releases the
+    /// presenter before the loop ends, and an attach that failed never stored a
+    /// window at all. Both already named themselves where they happened, so a
+    /// redraw arriving after either is expected control flow and stays quiet.
     fn draw(&mut self) {
-        if self.engine_attached {
-            self.draw_engine_window();
+        if !self.engine_attached {
             return;
         }
-        // Everything past this point is the `VkState` presenter: its own
-        // swapchain, its own blit, its own resize handling — several hundred
-        // lines that only run when `attach_engine_present` failed in
-        // `resumed()`, which is the host-without-a-working-engine case.
-        //
-        // **Measured zero.** A driven x86/Vulkan boot (Chess, Maps, the WebGL
-        // aquarium, Wikipedia, apple.com) never reached this line, while
-        // `host_window_direct_present path=engine_resident status=live` fired
-        // and the `host_window_engine_attach` decline fired zero times across
-        // two boots — the engine attaches, so this rail never draws.
-        //
-        // That is *not* a licence to delete it. It is the fallback for an
-        // attach failure, and an attach failure on a host this one has not
-        // seen would then have no presenter at all. What the reading licenses
-        // is the opposite question: if `host_window_engine_attach` can be shown
-        // never to decline on any supported host, this rail has no reason to
-        // exist. That needs a host where the engine legitimately fails.
-        //
-        // Latched — a per-redraw line would flood.
-        {
-            use std::sync::atomic::{AtomicBool, Ordering};
-            static SAID: AtomicBool = AtomicBool::new(false);
-            if !SAID.swap(true, Ordering::Relaxed) {
-                crate::observe::off(format!(
-                    "host_window_vk_presenter reason=engine_not_attached vk={}",
-                    self.vk.is_some() as u8
-                ));
-            }
-        }
-        #[cfg(not(target_os = "macos"))]
-        let Some(vk) = self.vk.as_mut() else {
-            return;
-        };
-        #[cfg(not(target_os = "macos"))]
-        {
-            let frame = self.frames.lock().ok().and_then(|g| g.clone());
-            let incoming_seq = frame.as_ref().map(|frame| frame.seq);
-            if !needs_engine_present(
-                self.last_engine_seq,
-                self.engine_redraw_required,
-                incoming_seq,
-            ) {
-                self.loop_census.draws_stale += 1;
-                return;
-            }
-            // Counted on both rails so `draws_fresh + draws_stale + draws_held`
-            // sums to `draws` whichever presenter is driving. A boot where they
-            // do not sum is one where a fourth disposition was added without a
-            // counter.
-            self.loop_census.draws_fresh += 1;
-            match unsafe { vk.present(frame.as_deref()) } {
-                Ok(()) => {
-                    self.last_engine_seq = incoming_seq;
-                    self.engine_redraw_required = false;
-                }
-                Err(e) => {
-                    // The drawable is in an unknown state — an acquire that
-                    // failed, a swapchain that was recreated mid-present. Hold
-                    // the force flag so the next tick presents rather than
-                    // waiting for a guest frame that may be seconds away.
-                    self.engine_redraw_required = true;
-                    crate::observe::Emit::decline("host_window_present", &e).fail_once(0);
-                    eprintln!("reims-vgpu-window: present failed: {e}");
-                }
-            }
-        }
-    }
-
-    fn draw_engine_window(&mut self) {
         let frame = self.frames.lock().ok().and_then(|guard| guard.clone());
         self.request_guest_geometry(frame.as_deref());
         if self.pending_guest_resize.is_some() {
@@ -1212,12 +962,11 @@ impl App {
     /// wait: until the resize applies, frames letterbox into the current
     /// drawable and pointer input maps through the same viewport.
     ///
-    /// Called only from [`Self::draw_engine_window`], which is the presenter
-    /// that aspect-fits. The window's own `VkState` fallback stretches to fill
-    /// instead, and leaves `guest_extent` `None` so [`pointer_report`] forwards
-    /// full-window coordinates — the mapping that rail's blit actually implies.
-    /// Calling this from that rail would pair a viewport-mapped pointer with a
-    /// stretched picture, which is the same split this fixes, mirrored.
+    /// Called only from [`Self::draw`], which is where the extent it records is
+    /// paid for: `guest_extent` is also what [`pointer_report`] maps a window
+    /// position through, so it must be set by the same pass that hands the
+    /// frame to the aspect-fitting presenter. Setting it anywhere else risks a
+    /// viewport-mapped pointer against a picture drawn to a different rule.
     fn request_guest_geometry(&mut self, frame: Option<&Frame>) {
         let Some(frame) = frame else { return };
         let incoming = (frame.width.max(1), frame.height.max(1));
@@ -1268,877 +1017,6 @@ impl App {
             applied.0, applied.1, requested.0, requested.1
         ));
         self.pending_guest_resize = None;
-    }
-}
-
-/// The Vulkan swapchain + per-frame objects for the window. Self-contained
-/// instance/device (see module docs).
-struct VkState {
-    _entry: ash::Entry,
-    instance: ash::Instance,
-    surface_loader: ash::khr::surface::Instance,
-    surface: vk::SurfaceKHR,
-    pd: vk::PhysicalDevice,
-    device: ash::Device,
-    queue: vk::Queue,
-    swapchain_loader: ash::khr::swapchain::Device,
-    swapchain: vk::SwapchainKHR,
-    images: Vec<vk::Image>,
-    format: vk::Format,
-    extent: vk::Extent2D,
-    cmd_pool: vk::CommandPool,
-    cmd: vk::CommandBuffer,
-    image_available: vk::Semaphore,
-    render_finished: vk::Semaphore,
-    in_flight: vk::Fence,
-    /// Latches after the first successful present so bring-up logs the live
-    /// window exactly once (not per frame).
-    first_present_logged: bool,
-    /// Latches after the first present that carried a real guest [`Frame`] (not
-    /// the pre-frame slate). Distinguishes "window is up" from "guest content is
-    /// flowing end to end" in the boot log — diagnostic only.
-    first_guest_frame_logged: bool,
-    /// Latched direct-present degradation reasons. These are always-on fail-log
-    /// lines, not per-frame stderr, because a broken import with an intentionally
-    /// elided CPU buffer otherwise looks like a frozen/blank window with no
-    /// reason in `/tmp/reims-vgpu-fail.log`.
-    direct_degrade_logged: HashSet<&'static str>,
-    mem_props: vk::PhysicalDeviceMemoryProperties,
-    /// Support-matrix classification of the WINDOW device. It may be a
-    /// different physical device than the engine's (hybrid laptops), so it gets
-    /// its own topology and handoff answers rather than borrowing the engine's.
-    caps: caps::HostGpuCaps,
-    /// Host-visible LINEAR staging image the guest BGRA frame uploads into and
-    /// the swapchain image blits from; recreated when the frame geometry changes.
-    staging: Option<StagingFrame>,
-    /// True once the current staging image has been transitioned out of
-    /// `PREINITIALIZED` (its first blit). Reset when staging is recreated.
-    staging_general: bool,
-    /// `Frame::seq` currently resident in the staging image, or `None` before
-    /// the first upload / after a staging recreate. A present whose frame seq
-    /// matches this skips the full-frame CPU upload and only re-blits — the
-    /// idle/steady-desktop fast path (the swapchain still redraws per vblank).
-    staged_seq: Option<u64>,
-    /// Skip-ratio proxy (always-on, throttled to one log line per 1024
-    /// presents so it never floods). `presents` counts every `queue_present`;
-    /// `uploads` counts the full-frame staging copies actually performed. A
-    /// presents≫uploads ratio confirms the seq-gated upload elision is live on
-    /// a static/steady desktop; a ~1:1 ratio would mean every vblank still
-    /// re-uploads (a regression).
-    presents: u64,
-    uploads: u64,
-    /// Present-source census (always-on, folded into the throttled skip-ratio
-    /// line): presents served by the CPU staging path, which is every present the
-    /// window makes. Kept beside `presents`/`uploads` so the line states its own
-    /// denominator rather than leaving it implied.
-    staging_blits: u64,
-}
-
-/// A host-visible LINEAR BGRA8 image the guest frame is uploaded into (mapped,
-/// coherent) and blitted from into the swapchain image. Kept in `GENERAL` layout
-/// so both host writes and the transfer read are valid without a layout change
-/// per frame.
-struct StagingFrame {
-    image: vk::Image,
-    memory: vk::DeviceMemory,
-    /// Persistent HOST_COHERENT mapping of `memory` (write the frame bytes here).
-    mapped: *mut u8,
-    width: u32,
-    height: u32,
-    /// Bytes per row of the LINEAR image (from the subresource layout — may
-    /// exceed `width*4` due to driver alignment).
-    row_pitch: u64,
-    /// Byte offset of the (single) subresource within `memory`.
-    offset: u64,
-}
-
-impl StagingFrame {
-    /// Unmap + destroy. Caller ensures no in-flight command references it.
-    unsafe fn destroy(self, device: &ash::Device) {
-        device.unmap_memory(self.memory);
-        device.destroy_image(self.image, None);
-        device.free_memory(self.memory, None);
-    }
-}
-
-impl VkState {
-    unsafe fn new(window: &Window) -> Result<Self, WindowError> {
-        let entry = ash::Entry::load().map_err(|e| WindowError::VkLoadLoader(e.to_string()))?;
-        let display = window
-            .display_handle()
-            .map_err(|e| WindowError::VkDisplayHandle(e.to_string()))?
-            .as_raw();
-        let win = window
-            .window_handle()
-            .map_err(|e| WindowError::VkWindowHandle(e.to_string()))?
-            .as_raw();
-
-        let surface_exts = ash_window::enumerate_required_extensions(display)
-            .map_err(|e| WindowError::VkRequiredExts(e.to_string()))?;
-        let portability_enumeration = entry
-            .enumerate_instance_extension_properties(None)
-            .map_err(|e| WindowError::VkEnumerateInstanceExts(e.to_string()))?
-            .iter()
-            .any(|extension| {
-                std::ffi::CStr::from_ptr(extension.extension_name.as_ptr())
-                    == vk::KHR_PORTABILITY_ENUMERATION_NAME
-            });
-        let mut instance_exts = surface_exts.to_vec();
-        if portability_enumeration {
-            instance_exts.push(vk::KHR_PORTABILITY_ENUMERATION_NAME.as_ptr());
-        }
-        // Same negotiation as the engine device: ask for what the loader can
-        // give, capped at the highest version we know how to use. Hardcoding
-        // 1.3 is VK_ERROR_INCOMPATIBLE_DRIVER on a Vulkan 1.0 loader.
-        let loader_version = entry
-            .try_enumerate_instance_version()
-            .ok()
-            .flatten()
-            .unwrap_or(vk::API_VERSION_1_0);
-        let app = vk::ApplicationInfo::default()
-            .api_version(caps::api_floor::instance_api_version(loader_version));
-        let mut ici = vk::InstanceCreateInfo::default()
-            .application_info(&app)
-            .enabled_extension_names(&instance_exts);
-        if portability_enumeration {
-            ici = ici.flags(vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR);
-        }
-        let instance = entry
-            .create_instance(&ici, None)
-            .map_err(|e| WindowError::VkCreateInstance(e.to_string()))?;
-
-        let surface = ash_window::create_surface(&entry, &instance, display, win, None)
-            .map_err(|e| WindowError::VkCreateSurface(e.to_string()))?;
-        let surface_loader = ash::khr::surface::Instance::new(&entry, &instance);
-
-        // Pick a device + queue family that can present to this surface, preferring
-        // a discrete GPU (falls back to any device — iGPU hosts).
-        let pds = instance
-            .enumerate_physical_devices()
-            .map_err(|e| WindowError::VkEnumeratePhysicalDevices(e.to_string()))?;
-        // Candidates are (api_version, device_type, (pd, queue_family)) for
-        // every present-capable graphics family. Ranking and the Vulkan 1.2
-        // floor come from the SHARED selector the engine device uses, so the
-        // two devices can no longer disagree about which GPU is best — the old
-        // local 3/2/1/0 scale did not demote a CPU software rasterizer below an
-        // unclassified device, and applied no API floor at all.
-        let mut candidates: Vec<(u32, vk::PhysicalDeviceType, (vk::PhysicalDevice, u32))> =
-            Vec::new();
-        for pd in pds {
-            let props = instance.get_physical_device_properties(pd);
-            let qfs = instance.get_physical_device_queue_family_properties(pd);
-            for (i, qf) in qfs.iter().enumerate() {
-                if !qf.queue_flags.contains(vk::QueueFlags::GRAPHICS) {
-                    continue;
-                }
-                let present = surface_loader
-                    .get_physical_device_surface_support(pd, i as u32, surface)
-                    .unwrap_or(false);
-                if !present {
-                    continue;
-                }
-                candidates.push((props.api_version, props.device_type, (pd, i as u32)));
-            }
-        }
-        let ((pd, qfamily), _chosen_api_version) =
-            caps::device_select::select_physical_device(&candidates).map_err(|below| {
-                let msg = if below.is_empty() {
-                    "no present-capable device".to_string()
-                } else {
-                    format!(
-                        "no present-capable device meets the Vulkan {} floor",
-                        caps::api_floor::version_str(caps::api_floor::MIN_SUPPORTED_API),
-                    )
-                };
-                // Emitted by the caller through `Emit::decline("host_window_init",
-                // …)` when this reaches `resumed`, so the reason is the registered
-                // `window_vk_no_usable_device` rather than a bare free-text line.
-                WindowError::VkNoUsableDevice(msg)
-            })?;
-
-        let prio = [1.0f32];
-        let qci = [vk::DeviceQueueCreateInfo::default()
-            .queue_family_index(qfamily)
-            .queue_priorities(&prio)];
-        let device_extensions = instance
-            .enumerate_device_extension_properties(pd)
-            .map_err(|e| WindowError::VkEnumerateDeviceExts(e.to_string()))?;
-        let has_device_extension = |want: &std::ffi::CStr| {
-            device_extensions
-                .iter()
-                .any(|property| std::ffi::CStr::from_ptr(property.extension_name.as_ptr()) == want)
-        };
-        // VK_KHR_swapchain was pushed unconditionally, so a device that does
-        // not advertise it failed at create_device with a bare
-        // ERROR_EXTENSION_NOT_PRESENT and no reason. A window without a
-        // swapchain cannot work, so decline here by name instead — the caller
-        // emits `window_vk_no_swapchain_extension` when this reaches `resumed`.
-        if !has_device_extension(ash::khr::swapchain::NAME) {
-            return Err(WindowError::VkNoSwapchainExtension);
-        }
-        let mut dev_exts = vec![ash::khr::swapchain::NAME.as_ptr()];
-        if has_device_extension(vk::KHR_PORTABILITY_SUBSET_NAME) {
-            dev_exts.push(vk::KHR_PORTABILITY_SUBSET_NAME.as_ptr());
-        }
-        let dci = vk::DeviceCreateInfo::default()
-            .queue_create_infos(&qci)
-            .enabled_extension_names(&dev_exts);
-        let device = instance
-            .create_device(pd, &dci, None)
-            .map_err(|e| WindowError::VkCreateDevice(e.to_string()))?;
-        let queue = device.get_device_queue(qfamily, 0);
-        let swapchain_loader = ash::khr::swapchain::Device::new(&instance, &device);
-
-        let cmd_pool = device
-            .create_command_pool(
-                &vk::CommandPoolCreateInfo::default()
-                    .queue_family_index(qfamily)
-                    .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
-                None,
-            )
-            .map_err(|e| WindowError::VkCommandPool(e.to_string()))?;
-        let cmd = device
-            .allocate_command_buffers(
-                &vk::CommandBufferAllocateInfo::default()
-                    .command_pool(cmd_pool)
-                    .level(vk::CommandBufferLevel::PRIMARY)
-                    .command_buffer_count(1),
-            )
-            .map_err(|e| WindowError::VkAllocCmd(e.to_string()))?[0];
-        let sem = |device: &ash::Device| {
-            device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
-        };
-        let image_available =
-            sem(&device).map_err(|e| WindowError::VkSemaphoreImageAvailable(e.to_string()))?;
-        let render_finished =
-            sem(&device).map_err(|e| WindowError::VkSemaphoreRenderFinished(e.to_string()))?;
-        let in_flight = device
-            .create_fence(
-                &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
-                None,
-            )
-            .map_err(|e| WindowError::VkFence(e.to_string()))?;
-
-        let mem_props = instance.get_physical_device_memory_properties(pd);
-        let device_props = instance.get_physical_device_properties(pd);
-        let window_caps = caps::HostGpuCaps {
-            memory: caps::memory_topology::classify_memory(&mem_props),
-            quirks: caps::DriverQuirk::for_portability_subset(has_device_extension(
-                vk::KHR_PORTABILITY_SUBSET_NAME,
-            )),
-            portability_subset: has_device_extension(vk::KHR_PORTABILITY_SUBSET_NAME),
-            device_api_version: device_props.api_version,
-            device_type: device_props.device_type,
-        };
-        crate::observe::off(format!(
-            "host_window_{}",
-            window_caps.consumer_line(
-                &std::ffi::CStr::from_ptr(device_props.device_name.as_ptr()).to_string_lossy()
-            )
-        ));
-        let mut s = VkState {
-            _entry: entry,
-            instance,
-            surface_loader,
-            surface,
-            pd,
-            device,
-            queue,
-            swapchain_loader,
-            swapchain: vk::SwapchainKHR::null(),
-            images: Vec::new(),
-            format: crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT,
-            extent: vk::Extent2D {
-                width: 0,
-                height: 0,
-            },
-            cmd_pool,
-            cmd,
-            image_available,
-            render_finished,
-            in_flight,
-            first_present_logged: false,
-            first_guest_frame_logged: false,
-            direct_degrade_logged: HashSet::new(),
-            mem_props,
-            caps: window_caps,
-            staging: None,
-            staging_general: false,
-            staged_seq: None,
-            presents: 0,
-            uploads: 0,
-            staging_blits: 0,
-        };
-        let size = window.inner_size();
-        s.recreate_swapchain(size.width.max(1), size.height.max(1));
-        Ok(s)
-    }
-
-    /// (Re)build the swapchain at `width`x`height`. Idempotent on failure: leaves
-    /// `swapchain` null so `present` skips until the next resize.
-    unsafe fn recreate_swapchain(&mut self, width: u32, height: u32) {
-        let _ = self.device.device_wait_idle();
-        // A failure here leaves `swapchain` null, so `present()` returns Ok
-        // and draws nothing — a permanently blank window. It must be
-        // fail-visible, not an eprintln nobody reads. (Local renamed from
-        // `caps` so it no longer shadows the capability module.)
-        let surface_caps = match self
-            .surface_loader
-            .get_physical_device_surface_capabilities(self.pd, self.surface)
-        {
-            Ok(c) => c,
-            Err(error) => {
-                self.log_direct_present_degrade(
-                    "swapchain_surface_caps",
-                    format!("{width}x{height} err={error}"),
-                );
-                return;
-            }
-        };
-        let formats = self
-            .surface_loader
-            .get_physical_device_surface_formats(self.pd, self.surface)
-            .unwrap_or_default();
-        // Prefer BGRA8 UNORM sRGB-nonlinear; else take the first offered.
-        let sfmt = formats
-            .iter()
-            .find(|f| {
-                f.format == crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT
-                    && f.color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR
-            })
-            .or_else(|| formats.first())
-            .copied()
-            .unwrap_or(vk::SurfaceFormatKHR {
-                format: crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT,
-                color_space: vk::ColorSpaceKHR::SRGB_NONLINEAR,
-            });
-        let extent = if surface_caps.current_extent.width != u32::MAX {
-            surface_caps.current_extent
-        } else {
-            vk::Extent2D {
-                width: width.clamp(
-                    surface_caps.min_image_extent.width,
-                    surface_caps.max_image_extent.width,
-                ),
-                height: height.clamp(
-                    surface_caps.min_image_extent.height,
-                    surface_caps.max_image_extent.height,
-                ),
-            }
-        };
-        if extent.width == 0 || extent.height == 0 {
-            return;
-        }
-        let mut min_images = surface_caps.min_image_count + 1;
-        if surface_caps.max_image_count > 0 {
-            min_images = min_images.min(surface_caps.max_image_count);
-        }
-        let old = self.swapchain;
-        let ci = vk::SwapchainCreateInfoKHR::default()
-            .surface(self.surface)
-            .min_image_count(min_images)
-            .image_format(sfmt.format)
-            .image_color_space(sfmt.color_space)
-            .image_extent(extent)
-            .image_array_layers(1)
-            .image_usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::COLOR_ATTACHMENT)
-            .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
-            .pre_transform(surface_caps.current_transform)
-            .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
-            .present_mode(vk::PresentModeKHR::FIFO)
-            .clipped(true)
-            .old_swapchain(old);
-        let swapchain = match self.swapchain_loader.create_swapchain(&ci, None) {
-            Ok(sc) => sc,
-            Err(e) => {
-                eprintln!("reims-vgpu-window: create_swapchain: {e}");
-                return;
-            }
-        };
-        if old != vk::SwapchainKHR::null() {
-            self.swapchain_loader.destroy_swapchain(old, None);
-        }
-        self.swapchain = swapchain;
-        self.images = self
-            .swapchain_loader
-            .get_swapchain_images(swapchain)
-            .unwrap_or_default();
-        self.format = sfmt.format;
-        self.extent = extent;
-    }
-
-    /// Acquire → clear (or blit the frame) → present one image. Recreates the
-    /// swapchain on OUT_OF_DATE/SUBOPTIMAL.
-    unsafe fn present(&mut self, frame: Option<&Frame>) -> Result<(), WindowError> {
-        if self.swapchain == vk::SwapchainKHR::null() {
-            return Ok(());
-        }
-        let fences = [self.in_flight];
-        let _ = self.device.wait_for_fences(&fences, true, u64::MAX);
-
-        // Prepare this frame's blit source (the CPU staging upload),
-        // seq-gated so an unchanged frame is neither re-uploaded nor re-imported.
-        let src = self.prepare_frame(frame);
-
-        let acquire = self.swapchain_loader.acquire_next_image(
-            self.swapchain,
-            u64::MAX,
-            self.image_available,
-            vk::Fence::null(),
-        );
-        let index = match acquire {
-            Ok((i, _suboptimal)) => i,
-            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
-                self.recreate_swapchain(self.extent.width, self.extent.height);
-                return Ok(());
-            }
-            Err(e) => return Err(WindowError::PresentAcquire(e)),
-        };
-        self.device
-            .reset_fences(&fences)
-            .map_err(WindowError::PresentResetFence)?;
-        let image = self.images[index as usize];
-
-        self.device
-            .reset_command_buffer(self.cmd, vk::CommandBufferResetFlags::empty())
-            .map_err(WindowError::PresentResetCommandBuffer)?;
-        self.device
-            .begin_command_buffer(
-                self.cmd,
-                &vk::CommandBufferBeginInfo::default()
-                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-            )
-            .map_err(WindowError::PresentBeginCommandBuffer)?;
-
-        let sub = vk::ImageSubresourceRange::default()
-            .aspect_mask(vk::ImageAspectFlags::COLOR)
-            .level_count(1)
-            .layer_count(1);
-        self.barrier(
-            image,
-            sub,
-            vk::ImageLayout::UNDEFINED,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            vk::AccessFlags::empty(),
-            vk::AccessFlags::TRANSFER_WRITE,
-            vk::PipelineStageFlags::TOP_OF_PIPE,
-            vk::PipelineStageFlags::TRANSFER,
-        );
-        match src {
-            // Scale-blit the guest frame into the swapchain image (LINEAR filter
-            // covers guest-res != window-res).
-            BlitSource::Staging => {
-                self.staging_blits = self.staging_blits.wrapping_add(1);
-                self.blit_staging(image)
-            }
-            BlitSource::Slate => {
-                // No frame yet: clear to a dim slate so the window is visibly alive.
-                let clear = vk::ClearColorValue {
-                    float32: [0.05, 0.06, 0.08, 1.0],
-                };
-                self.device.cmd_clear_color_image(
-                    self.cmd,
-                    image,
-                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    &clear,
-                    &[sub],
-                );
-            }
-        }
-        if !matches!(src, BlitSource::Slate) && !self.first_guest_frame_logged {
-            if let Some(f) = frame {
-                eprintln!(
-                    "reims-vgpu-window: first guest frame presented ({}x{}, via staging)",
-                    f.width, f.height
-                );
-            }
-            self.first_guest_frame_logged = true;
-        }
-        self.barrier(
-            image,
-            sub,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            vk::ImageLayout::PRESENT_SRC_KHR,
-            vk::AccessFlags::TRANSFER_WRITE,
-            vk::AccessFlags::empty(),
-            vk::PipelineStageFlags::TRANSFER,
-            vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-        );
-        self.device
-            .end_command_buffer(self.cmd)
-            .map_err(WindowError::PresentEndCommandBuffer)?;
-
-        let wait = [self.image_available];
-        let wait_stage = [vk::PipelineStageFlags::TRANSFER];
-        let signal = [self.render_finished];
-        let cmds = [self.cmd];
-        let submit = vk::SubmitInfo::default()
-            .wait_semaphores(&wait)
-            .wait_dst_stage_mask(&wait_stage)
-            .command_buffers(&cmds)
-            .signal_semaphores(&signal);
-        self.device
-            .queue_submit(self.queue, &[submit], self.in_flight)
-            .map_err(WindowError::PresentQueueSubmit)?;
-
-        let swapchains = [self.swapchain];
-        let indices = [index];
-        let present = vk::PresentInfoKHR::default()
-            .wait_semaphores(&signal)
-            .swapchains(&swapchains)
-            .image_indices(&indices);
-        match self.swapchain_loader.queue_present(self.queue, &present) {
-            Ok(_) => {
-                if !self.first_present_logged {
-                    eprintln!(
-                        "reims-vgpu-window: first frame presented ({}x{}, {} swapchain images)",
-                        self.extent.width,
-                        self.extent.height,
-                        self.images.len()
-                    );
-                    self.first_present_logged = true;
-                }
-                self.presents = self.presents.wrapping_add(1);
-                // Throttled skip-ratio proxy: one line per 1024 presents (~8 s
-                // at 120 Hz), never per-frame — confirms the upload elision is
-                // live without flooding.
-                if self.presents.is_multiple_of(1024) {
-                    eprintln!(
-                        "reims-vgpu-window: present skip-ratio uploads={} presents={} \
-                         (elided {} redundant full-frame uploads) staging_blits={}",
-                        self.uploads,
-                        self.presents,
-                        self.presents.saturating_sub(self.uploads),
-                        self.staging_blits,
-                    );
-                    crate::observe::off(direct_present_source_line(
-                        self.presents,
-                        self.uploads,
-                        self.staging_blits,
-                    ));
-                }
-                Ok(())
-            }
-            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) | Err(vk::Result::SUBOPTIMAL_KHR) => {
-                self.recreate_swapchain(self.extent.width, self.extent.height);
-                Ok(())
-            }
-            Err(e) => Err(WindowError::PresentQueue(e)),
-        }
-    }
-
-    fn log_direct_present_degrade(&mut self, reason: &'static str, detail: String) {
-        if self.direct_degrade_logged.insert(reason) {
-            crate::observe::off(direct_present_degrade_line(reason, detail));
-        }
-    }
-
-    fn log_direct_present_decline(
-        &mut self,
-        class: &'static str,
-        decline: &WindowError,
-        frame: &Frame,
-    ) {
-        use crate::observe::Decline as _;
-        if self.direct_degrade_logged.insert(decline.slug()) {
-            let emit = crate::observe::Emit::decline("direct_present_degrade", decline)
-                .field("class", class)
-                .field("seq", frame.seq)
-                .field("width", frame.width)
-                .field("height", frame.height);
-            emit.off();
-        }
-    }
-
-    /// Pick a memory type for `class` on the window device, through the same
-    /// topology-aware policy the engine uses. The local flag-matching helper
-    /// this replaces had no notion of preferences at all, so window staging
-    /// always took the first host-visible type even when a device-local one
-    /// (unified host) or a cached one was available.
-    fn memory_type_for(&self, type_bits: u32, class: caps::MemoryClass) -> Option<u32> {
-        caps::memory_topology::select_memory_type(
-            &self.mem_props,
-            type_bits,
-            &self.caps.memory_request(class),
-        )
-    }
-
-    /// Ensure the staging image matches `width`x`height`, (re)creating it — a
-    /// host-visible coherent LINEAR BGRA8 image, persistently mapped, in
-    /// `PREINITIALIZED` layout (host writes are valid immediately).
-    unsafe fn ensure_staging(&mut self, width: u32, height: u32) -> Result<(), WindowError> {
-        if let Some(s) = &self.staging {
-            if s.width == width && s.height == height {
-                return Ok(());
-            }
-        }
-        // Geometry changed (rare): the prior staging is only referenced by the
-        // just-completed frame (we waited on in_flight above), so it is safe to
-        // drop now.
-        if let Some(old) = self.staging.take() {
-            old.destroy(&self.device);
-        }
-        self.staging_general = false;
-        // New staging image holds no frame yet — force the next present to
-        // upload regardless of its seq.
-        self.staged_seq = None;
-        let image = self
-            .device
-            .create_image(
-                &vk::ImageCreateInfo::default()
-                    .image_type(vk::ImageType::TYPE_2D)
-                    .format(crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT)
-                    .extent(vk::Extent3D {
-                        width,
-                        height,
-                        depth: 1,
-                    })
-                    .mip_levels(1)
-                    .array_layers(1)
-                    .samples(vk::SampleCountFlags::TYPE_1)
-                    .tiling(vk::ImageTiling::LINEAR)
-                    .usage(vk::ImageUsageFlags::TRANSFER_SRC)
-                    .initial_layout(vk::ImageLayout::PREINITIALIZED),
-                None,
-            )
-            .map_err(WindowError::StagingCreateImage)?;
-        let req = self.device.get_image_memory_requirements(image);
-        let mem_type = self
-            .memory_type_for(req.memory_type_bits, caps::MemoryClass::Upload)
-            .ok_or(WindowError::StagingMemoryTypeUnavailable {
-                type_bits: req.memory_type_bits,
-            })?;
-        let memory = self
-            .device
-            .allocate_memory(
-                &vk::MemoryAllocateInfo::default()
-                    .allocation_size(req.size)
-                    .memory_type_index(mem_type),
-                None,
-            )
-            .map_err(|e| {
-                self.device.destroy_image(image, None);
-                WindowError::StagingAllocateMemory {
-                    bytes: req.size,
-                    result: e,
-                }
-            })?;
-        self.device
-            .bind_image_memory(image, memory, 0)
-            .map_err(WindowError::StagingBindMemory)?;
-        let layout = self.device.get_image_subresource_layout(
-            image,
-            vk::ImageSubresource::default().aspect_mask(vk::ImageAspectFlags::COLOR),
-        );
-        let mapped = self
-            .device
-            .map_memory(memory, 0, req.size, vk::MemoryMapFlags::empty())
-            .map_err(|result| WindowError::StagingMapMemory {
-                bytes: req.size,
-                result,
-            })? as *mut u8;
-        self.staging = Some(StagingFrame {
-            image,
-            memory,
-            mapped,
-            width,
-            height,
-            row_pitch: layout.row_pitch,
-            offset: layout.offset,
-        });
-        Ok(())
-    }
-
-    /// Copy a tightly-packed BGRA frame into the staging image honoring its
-    /// row pitch. Coherent memory: no explicit flush.
-    unsafe fn upload_frame(&mut self, f: &Frame) {
-        let Some(s) = self.staging.as_ref() else {
-            // No staging image: the frame is silently discarded and the
-            // swapchain shows whatever it held before.
-            self.log_direct_present_degrade(
-                "upload_no_staging",
-                format!("{}x{}", f.width, f.height),
-            );
-            return;
-        };
-        let src_row = f.width as usize * 4;
-        for y in 0..f.height as usize {
-            let dst = s.mapped.add(s.offset as usize + y * s.row_pitch as usize);
-            let src = f.bgra.as_ptr().add(y * src_row);
-            std::ptr::copy_nonoverlapping(src, dst, src_row);
-        }
-    }
-
-    /// Record: make host writes visible, then scale-blit the staging image into
-    /// `dst` (already in `TRANSFER_DST_OPTIMAL`).
-    unsafe fn blit_staging(&mut self, dst: vk::Image) {
-        let (src_image, sw, sh) = match self.staging.as_ref() {
-            Some(s) => (s.image, s.width, s.height),
-            None => {
-                // Returning here presents a swapchain image that was only
-                // transitioned, never written — undefined contents on screen.
-                self.log_direct_present_degrade("blit_no_staging", String::new());
-                return;
-            }
-        };
-        // Staging stays in GENERAL (valid host write + blit src); the barrier
-        // publishes this frame's host write to the transfer read. First use
-        // transitions from PREINITIALIZED (preserving the uploaded bytes).
-        let sub = vk::ImageSubresourceRange::default()
-            .aspect_mask(vk::ImageAspectFlags::COLOR)
-            .level_count(1)
-            .layer_count(1);
-        let old = if self.staging_general {
-            vk::ImageLayout::GENERAL
-        } else {
-            vk::ImageLayout::PREINITIALIZED
-        };
-        let b = vk::ImageMemoryBarrier::default()
-            .old_layout(old)
-            .new_layout(vk::ImageLayout::GENERAL)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .image(src_image)
-            .subresource_range(sub)
-            .src_access_mask(vk::AccessFlags::HOST_WRITE)
-            .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
-        self.device.cmd_pipeline_barrier(
-            self.cmd,
-            vk::PipelineStageFlags::HOST,
-            vk::PipelineStageFlags::TRANSFER,
-            vk::DependencyFlags::empty(),
-            &[],
-            &[],
-            &[b],
-        );
-        self.staging_general = true;
-        let layers = vk::ImageSubresourceLayers::default()
-            .aspect_mask(vk::ImageAspectFlags::COLOR)
-            .layer_count(1);
-        let region = vk::ImageBlit::default()
-            .src_subresource(layers)
-            .src_offsets([
-                vk::Offset3D { x: 0, y: 0, z: 0 },
-                vk::Offset3D {
-                    x: sw as i32,
-                    y: sh as i32,
-                    z: 1,
-                },
-            ])
-            .dst_subresource(layers)
-            .dst_offsets([
-                vk::Offset3D { x: 0, y: 0, z: 0 },
-                vk::Offset3D {
-                    x: self.extent.width as i32,
-                    y: self.extent.height as i32,
-                    z: 1,
-                },
-            ]);
-        self.device.cmd_blit_image(
-            self.cmd,
-            src_image,
-            vk::ImageLayout::GENERAL,
-            dst,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            &[region],
-            crate::backend::vulkan::translate::sampler::PRESENT_BLIT_FILTER,
-        );
-    }
-
-    /// Prepare the blit source for `frame`, seq-gated so an unchanged frame is
-    /// not re-uploaded.
-    unsafe fn prepare_frame(&mut self, frame: Option<&Frame>) -> BlitSource {
-        let Some(f) = frame else {
-            return BlitSource::Slate;
-        };
-        if f.width == 0 || f.height == 0 {
-            return BlitSource::Slate;
-        }
-        // `bgra` is the only source, so its length is required here: a short or
-        // empty buffer means we genuinely have nothing to show, and holding a
-        // slate beats blitting uninitialised memory.
-        if f.bgra.len() < (f.width as usize * f.height as usize * 4) {
-            self.log_direct_present_degrade(
-                "no_source",
-                format!(
-                    "seq={} bgra={} need={} {}x{}",
-                    f.seq,
-                    f.bgra.len(),
-                    f.width as usize * f.height as usize * 4,
-                    f.width,
-                    f.height
-                ),
-            );
-            return BlitSource::Slate;
-        }
-        match self.ensure_staging(f.width, f.height) {
-            Ok(()) => {
-                if needs_staging_upload(self.staged_seq, f.seq) {
-                    self.upload_frame(f);
-                    self.staged_seq = Some(f.seq);
-                    self.uploads = self.uploads.wrapping_add(1);
-                }
-                BlitSource::Staging
-            }
-            Err(e) => {
-                self.log_direct_present_decline("staging_failed", &e, f);
-                BlitSource::Slate
-            }
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    unsafe fn barrier(
-        &self,
-        image: vk::Image,
-        sub: vk::ImageSubresourceRange,
-        old: vk::ImageLayout,
-        new: vk::ImageLayout,
-        src_access: vk::AccessFlags,
-        dst_access: vk::AccessFlags,
-        src_stage: vk::PipelineStageFlags,
-        dst_stage: vk::PipelineStageFlags,
-    ) {
-        let b = vk::ImageMemoryBarrier::default()
-            .old_layout(old)
-            .new_layout(new)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .image(image)
-            .subresource_range(sub)
-            .src_access_mask(src_access)
-            .dst_access_mask(dst_access);
-        self.device.cmd_pipeline_barrier(
-            self.cmd,
-            src_stage,
-            dst_stage,
-            vk::DependencyFlags::empty(),
-            &[],
-            &[],
-            &[b],
-        );
-    }
-}
-
-impl Drop for VkState {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = self.device.device_wait_idle();
-            if let Some(staging) = self.staging.take() {
-                staging.destroy(&self.device);
-            }
-            self.device.destroy_fence(self.in_flight, None);
-            self.device.destroy_semaphore(self.image_available, None);
-            self.device.destroy_semaphore(self.render_finished, None);
-            self.device.destroy_command_pool(self.cmd_pool, None);
-            if self.swapchain != vk::SwapchainKHR::null() {
-                self.swapchain_loader
-                    .destroy_swapchain(self.swapchain, None);
-            }
-            self.device.destroy_device(None);
-            self.surface_loader.destroy_surface(self.surface, None);
-            self.instance.destroy_instance(None);
-        }
     }
 }
 
@@ -2254,15 +1132,13 @@ mod tests {
         );
     }
 
-    /// Every window bring-up check names itself, its slug is namespaced to the
-    /// window rail and distinct, and — the property no crate-wide gate can see —
-    /// its `fields()` values are whitespace-free even though `detail` is an
-    /// arbitrary driver/winit string. The always-on log is parsed by splitting
-    /// on spaces, so a space in a value would corrupt the line.
-    #[test]
-    fn every_window_bringup_check_names_itself_log_safe() {
-        use crate::observe::{Decline as _, Emit};
-        let all = [
+    /// One value of every [`WindowError`] variant.
+    ///
+    /// The list is closed by [`variant_name`], whose `match` has no wildcard
+    /// arm: a variant added to the enum stops this module compiling until it is
+    /// named there and built here.
+    fn every_window_error() -> Vec<WindowError> {
+        vec![
             WindowError::EventLoopBuild("os error while building".into()),
             WindowError::RunApp("event loop exited".into()),
             WindowError::MainLoopRun("event loop exited".into()),
@@ -2275,27 +1151,36 @@ mod tests {
             WindowError::CreateNativeWindow("os error creating window".into()),
             WindowError::AttachDisplayHandle("no display handle".into()),
             WindowError::AttachWindowHandle("no window handle".into()),
-            WindowError::AttachEngine("engine attach failed".into()),
-            WindowError::VkLoadLoader("libvulkan not found".into()),
-            WindowError::VkDisplayHandle("no display handle".into()),
-            WindowError::VkWindowHandle("no window handle".into()),
-            WindowError::VkRequiredExts("ERROR_EXTENSION_NOT_PRESENT".into()),
-            WindowError::VkEnumerateInstanceExts("ERROR_OUT_OF_HOST_MEMORY".into()),
-            WindowError::VkCreateInstance("ERROR_INCOMPATIBLE_DRIVER".into()),
-            WindowError::VkCreateSurface("ERROR_SURFACE_LOST_KHR".into()),
-            WindowError::VkEnumeratePhysicalDevices("ERROR_INITIALIZATION_FAILED".into()),
-            WindowError::VkNoUsableDevice(
-                "no present-capable device meets the Vulkan 1.2 floor".into(),
-            ),
-            WindowError::VkEnumerateDeviceExts("ERROR_OUT_OF_HOST_MEMORY".into()),
-            WindowError::VkNoSwapchainExtension,
-            WindowError::VkCreateDevice("ERROR_DEVICE_LOST".into()),
-            WindowError::VkCommandPool("ERROR_OUT_OF_DEVICE_MEMORY".into()),
-            WindowError::VkAllocCmd("ERROR_OUT_OF_POOL_MEMORY".into()),
-            WindowError::VkSemaphoreImageAvailable("ERROR_OUT_OF_HOST_MEMORY".into()),
-            WindowError::VkSemaphoreRenderFinished("ERROR_OUT_OF_HOST_MEMORY".into()),
-            WindowError::VkFence("ERROR_OUT_OF_HOST_MEMORY".into()),
-        ];
+            WindowError::AttachEngine("swapchain unavailable".into()),
+        ]
+    }
+
+    /// The variant's own name, matched exhaustively on purpose — the wildcard
+    /// arm is what would let [`every_window_error`] silently miss one.
+    fn variant_name(error: &WindowError) -> &'static str {
+        match error {
+            WindowError::EventLoopBuild(_) => "EventLoopBuild",
+            WindowError::RunApp(_) => "RunApp",
+            WindowError::MainLoopRun(_) => "MainLoopRun",
+            WindowError::AlreadyOwned { .. } => "AlreadyOwned",
+            WindowError::NoRegisteredWindow { .. } => "NoRegisteredWindow",
+            WindowError::WrongOwner { .. } => "WrongOwner",
+            WindowError::CreateNativeWindow(_) => "CreateNativeWindow",
+            WindowError::AttachDisplayHandle(_) => "AttachDisplayHandle",
+            WindowError::AttachWindowHandle(_) => "AttachWindowHandle",
+            WindowError::AttachEngine(_) => "AttachEngine",
+        }
+    }
+
+    /// Every window check names itself, its slug is namespaced to the window
+    /// rail and distinct, and — the property no crate-wide gate can see — its
+    /// `fields()` values are whitespace-free even though `detail` is an
+    /// arbitrary driver/winit string. The always-on log is parsed by splitting
+    /// on spaces, so a space in a value would corrupt the line.
+    #[test]
+    fn every_window_bringup_check_names_itself_log_safe() {
+        use crate::observe::{Decline as _, Emit};
+        let all = every_window_error();
         let mut slugs: Vec<&str> = Vec::new();
         for e in &all {
             assert!(
@@ -2317,65 +1202,61 @@ mod tests {
         slugs.dedup();
         assert_eq!(before, slugs.len(), "duplicate WindowError slug");
 
-        // End-to-end: a multi-word driver string collapses to one safe field.
+        // End-to-end, on the refusal that now ends the window: a multi-word
+        // driver string collapses to one safe field, and the line a future
+        // reader greps for is exactly this.
         assert_eq!(
             Emit::decline(
-                "host_window_init",
-                &WindowError::VkNoUsableDevice("no present-capable device".into()),
+                "host_window_engine_attach",
+                &WindowError::AttachEngine("swapchain unavailable".into()),
             )
             .render(),
-            "host_window_init reason=window_vk_no_usable_device detail=no_present-capable_device"
+            "host_window_engine_attach reason=window_attach_engine detail=swapchain_unavailable"
         );
     }
 
+    /// This file types the refusals of a window that has **one** presenter, and
+    /// no others.
+    ///
+    /// An engine-attach failure ends the window on every platform, so nothing
+    /// here owns a `VkInstance`, a physical-device choice, a swapchain, a queue
+    /// submit or a staging image — and none of those can name a refusal from
+    /// this module. While the window carried a second self-contained presenter
+    /// it typed 29 further variants (`Vk*` bring-up, `Present*` loop, `Staging*`
+    /// upload) for a rail that measured zero presents, drew a stretched rather
+    /// than letterboxed picture, and left no counter saying which rail had
+    /// drawn. Re-adding a presenter here means re-adding that family, and this
+    /// count is what makes that a deliberate act.
+    ///
+    /// The ten: building the event loop, running it (one variant per entry
+    /// point), the three ways the single process window can be claimed by the
+    /// wrong device, creating the native window, and the three steps of the
+    /// engine attach.
     #[test]
-    fn every_window_runtime_decline_names_the_exact_operation() {
+    fn the_window_types_only_its_own_lifecycle_refusals() {
         use crate::observe::Decline as _;
-        let all = [
-            WindowError::PresentAcquire(vk::Result::ERROR_DEVICE_LOST),
-            WindowError::PresentResetFence(vk::Result::ERROR_DEVICE_LOST),
-            WindowError::PresentResetCommandBuffer(vk::Result::ERROR_DEVICE_LOST),
-            WindowError::PresentBeginCommandBuffer(vk::Result::ERROR_DEVICE_LOST),
-            WindowError::PresentEndCommandBuffer(vk::Result::ERROR_DEVICE_LOST),
-            WindowError::PresentQueueSubmit(vk::Result::ERROR_DEVICE_LOST),
-            WindowError::PresentQueue(vk::Result::ERROR_DEVICE_LOST),
-            WindowError::StagingCreateImage(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY),
-            WindowError::StagingMemoryTypeUnavailable { type_bits: 0x80 },
-            WindowError::StagingAllocateMemory {
-                bytes: 4096,
-                result: vk::Result::ERROR_OUT_OF_DEVICE_MEMORY,
-            },
-            WindowError::StagingBindMemory(vk::Result::ERROR_MEMORY_MAP_FAILED),
-            WindowError::StagingMapMemory {
-                bytes: 4096,
-                result: vk::Result::ERROR_MEMORY_MAP_FAILED,
-            },
-        ];
-        let mut slugs = std::collections::HashSet::new();
-        for decline in all {
-            assert!(slugs.insert(decline.slug()), "duplicate {}", decline.slug());
-            assert!(decline.slug().starts_with("window_"));
-            for (_, value) in decline.fields() {
-                assert!(!value.contains(char::is_whitespace));
-            }
-        }
-        // A floor, not a census. `slugs.insert` above already proves the table
-        // has no duplicates, so an exact count would only restate `all.len()` —
-        // and a hand-bumped total taxes every variant this file loses without
-        // being able to see a variant the table never listed. The floor is here
-        // so a table gutted to one entry cannot pass vacuously.
-        assert!(slugs.len() >= 10, "{} window declines listed", slugs.len());
-    }
-
-    #[test]
-    fn seq_gate_uploads_once_per_new_frame_and_elides_repeats() {
-        // Fresh staging (no seq yet) always uploads.
-        assert!(needs_staging_upload(None, 0));
-        assert!(needs_staging_upload(None, 7));
-        // Same seq republished every vblank: no re-upload (the win).
-        assert!(!needs_staging_upload(Some(7), 7));
-        // A new frame's seq forces exactly one upload.
-        assert!(needs_staging_upload(Some(7), 8));
+        let all = every_window_error();
+        let names: std::collections::BTreeSet<&str> = all.iter().map(variant_name).collect();
+        assert_eq!(
+            names.len(),
+            all.len(),
+            "every_window_error lists a variant twice"
+        );
+        assert_eq!(
+            names.len(),
+            10,
+            "WindowError carries {} variants; a presenter-shaped family here is \
+             a second rail that no fail line distinguishes",
+            names.len()
+        );
+        // The attach refusal itself must survive under its registered name: it
+        // is the counter that tells a reader the window refused rather than
+        // quietly drew something else.
+        assert!(names.contains("AttachEngine"));
+        assert_eq!(
+            WindowError::AttachEngine("swapchain unavailable".into()).slug(),
+            "window_attach_engine"
+        );
     }
 
     #[test]
@@ -2437,10 +1318,9 @@ mod tests {
         assert_ne!(pointer_report((240.0, 0.0), window, Some(guest)), raw);
     }
 
-    /// No guest frame yet ⇒ no viewport to map through, and the window's own
-    /// `VkState` fallback stretches rather than letterboxing. Both are the
-    /// full-window identity, which is what keeps that rail's pointer and its
-    /// blit in agreement.
+    /// No guest frame yet ⇒ no viewport to map through, so the full-window
+    /// space is the only honest report: there is no guest surface under the
+    /// pointer to name a coordinate in.
     #[test]
     fn without_a_guest_extent_the_full_window_space_is_forwarded() {
         assert_eq!(
@@ -2493,47 +1373,5 @@ mod tests {
     #[test]
     fn a_resize_with_nothing_pending_is_not_an_answer() {
         assert_eq!(guest_resize_settled(None, (1920, 1080)), None);
-    }
-
-    #[test]
-    fn steady_desktop_elides_all_but_the_first_upload() {
-        // Simulate 1 published frame (seq=1) held across 120 vblanks: the seq
-        // gate must upload once and skip the remaining 119.
-        let mut staged: Option<u64> = None;
-        let mut uploads = 0u32;
-        for _vblank in 0..120 {
-            let incoming = 1u64; // static desktop republishes the same seq
-            if needs_staging_upload(staged, incoming) {
-                uploads += 1;
-                staged = Some(incoming);
-            }
-        }
-        assert_eq!(
-            uploads, 1,
-            "static frame must upload exactly once, not per vblank"
-        );
-    }
-
-    #[test]
-    fn direct_present_degrade_line_names_reason() {
-        let line = direct_present_degrade_line(
-            "import_failed",
-            "seq=9 ring=2 1920x1080 err=VK_ERROR_INVALID_EXTERNAL_HANDLE".to_string(),
-        );
-        assert!(line.starts_with("direct_present_degrade reason=import_failed"));
-        assert!(line.contains("seq=9"));
-        assert!(line.contains("ring=2"));
-        assert!(line.contains("1920x1080"));
-    }
-
-    /// The throttled census line has to state its own denominator: `presents`
-    /// against `uploads` is the elision ratio, and `staging_blits` says how many
-    /// of those presents actually blitted a guest frame.
-    #[test]
-    fn direct_present_source_line_names_its_denominator() {
-        let line = direct_present_source_line(2048, 12, 2000);
-        assert!(line.starts_with("direct_present_source presents=2048"));
-        assert!(line.contains("uploads=12"));
-        assert!(line.contains("staging_blits=2000"));
     }
 }
