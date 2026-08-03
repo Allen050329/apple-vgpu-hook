@@ -240,11 +240,34 @@ already been run to exhaustion; re-running one costs hours and has so far return
   and there is no task word on the wire that answers it. `blit_exec`'s "never the task object-list
   ref — those id spaces collide" is about the id *spaces*, not about which list to read, and reading
   it as the latter is what makes this look like a settled bug.
-  What is still open is narrower and worth keeping separate: the search accepts the first list that
-  *translates*, and two tasks can both have an `OBJECT_TYPE_SURFACE` at the same slot, so it can in
-  principle adopt a stranger's object. Do not attack that by removing the search. Attack it by
-  finding something to verify the candidate against, and note that the type-4 descriptor carries no
-  surface id of its own to check.
+  The narrower worry that used to sit here — the search takes the first list that *translates*, and
+  two tasks could both hold an `OBJECT_TYPE_SURFACE` at the same slot — has now been measured, and it
+  does not occur. There is indeed nothing to verify a candidate against: the object-list entry is
+  twelve bytes, `[type | desc_len]` plus `desc_gva`, with no identity field, and the type-4
+  descriptor is fully consumed — its only undecoded span is three bytes at `0x11` that read
+  `undecoded_nz=0` on every distinct shape a driven boot produces. So `type4_claimants` counts
+  instead. On a driven x86 boot: **87 distinct surface ids, `claims=1` on every one, `winner=0` on
+  every one**, across 16 defined tasks. Every type-4 IOSurface lives in task 0's object list and only
+  task 0's, and every successful resolve stops on the first probe.
+  That sharpens why the task threading was reverted: surfaces live in task 0 while the command
+  streams naming them belong to other tasks, so threading the naming task looks in the one list that
+  structurally cannot hold them. It also means the search's other 255 probes contribute to no
+  successful resolve on this workload — but do not delete them on that reading alone. It is one
+  workload on one pathway, and `claims > 1` is a live failure-channel alarm that will say so if the
+  assumption ever breaks.
+
+- **Two arms of one guest-memory write must be diffed against each other, not read alone.** This is
+  the `mapping_write.rs` instance of the consumer-side finding above, and it has now produced three
+  bugs in a row: a `span_end` bound present on two arms of three, two entries draining deferred
+  windows only on the scattered arm, and the staged arm zeroing inter-row padding the contig arm
+  preserves. The trap is that **the arm that is easiest to read is not the arm that runs**: on a
+  driven x86 boot `write_split` reads `contig=0` on essentially every window, so the fragmented
+  staging arm is the live one and the pointer arm is nearly dead. Check which arm the boot takes
+  before concluding a divergence is theoretical.
+  Note also what is *not* a divergence there: `write_rect_raw_at_impl`'s `full_tight_direct` fast
+  path returns early and skips the shared `invalidate_storage_residency_window`, but its own guard
+  requires `frame_len == span_end - base_off` and `write_mapping_bytes` invalidates `[off, off+len)`
+  internally — the same window. That one has been checked; it is correct.
 - **The per-dispatch compute stall watchdog is priced, and it is not worth rewriting.**
   `spawn_compute_engine_stall_watchdog` spawns a thread and clones the SPIR-V on *every* compute
   dispatch, then sleeps 2 s. At the measured peak of 124 computes/s that is ~250 live sleeping
