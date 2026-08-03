@@ -653,6 +653,16 @@ pub fn texture_view_type_is_3d(texture_type: u16) -> bool {
 // the property's one-based header index. Tag `0x00` sits before the first
 // property and is not one; it rides every entry with value 0 in every workload
 // measured and is reported by `note_color_entry_fields` as unconsumed.
+/// Which `colorAttachments[n]` this entry configures.
+///
+/// Tag `0x00` is the entry's own index in all three sections this serializer
+/// emits in this shape: [`VERTEX_ATTR_TAG_LOCATION`] is the attribute's
+/// location and [`VERTEX_LAYOUT_TAG_BUFFER_INDEX`] is the layout's buffer
+/// index, both read from the wire here. It is outside the property numbering
+/// for the same reason — tags `0x01..=0x09` are the nine properties of
+/// `MTLRenderPipelineColorAttachmentDescriptor` in header order, so there is no
+/// property left for `0x00` to be.
+pub const COLOR_ATTACHMENT_TAG_INDEX: u8 = 0x00;
 pub const COLOR_ATTACHMENT_TAG_PIXEL_FORMAT: u8 = 0x01;
 pub const COLOR_ATTACHMENT_TAG_BLEND_ENABLE: u8 = 0x02;
 pub const COLOR_ATTACHMENT_TAG_SRC_RGB: u8 = 0x03;
@@ -1418,11 +1428,10 @@ pub fn decode_render_pipeline_descriptor(
 
 /// A colour-attachment TLV field this decoder does not read.
 ///
-/// The entry is `[field_count][tag][len][value…]*` and eight tags are consumed
-/// (`COLOR_ATTACHMENT_TAG_PIXEL_FORMAT` through `..._ALPHA_OP`). Anything else
-/// is a field the guest serialized and we dropped on the floor — including,
-/// per `translate/coverage.rs`, `colorAttachments[n].writeMask`, whose position
-/// in this block is unknown and is an RE question rather than a guess.
+/// The entry is `[field_count][tag][len][value…]*` and ten tags are consumed:
+/// the entry's own index (`COLOR_ATTACHMENT_TAG_INDEX`) and the nine properties
+/// of `MTLRenderPipelineColorAttachmentDescriptor`. Anything else is a field
+/// the guest serialized and we dropped on the floor.
 struct ColorAttachDropped {
     tag: u8,
 }
@@ -1437,7 +1446,8 @@ impl crate::observe::Decline for ColorAttachDropped {
     }
 }
 
-const COLOR_ATTACHMENT_TAGS_CONSUMED: [u8; 9] = [
+const COLOR_ATTACHMENT_TAGS_CONSUMED: [u8; 10] = [
+    COLOR_ATTACHMENT_TAG_INDEX,
     COLOR_ATTACHMENT_TAG_PIXEL_FORMAT,
     COLOR_ATTACHMENT_TAG_BLEND_ENABLE,
     COLOR_ATTACHMENT_TAG_SRC_RGB,
@@ -1457,6 +1467,21 @@ const COLOR_ATTACHMENT_TAGS_CONSUMED: [u8; 9] = [
 /// header, not from the one observed value. If the tag is something else, it
 /// will eventually carry a value no four-bit mask can hold, and that value
 /// arrives here by name instead of quietly masking channels off.
+/// A colour-attachment entry naming a slot above [`MAX_COLOR_ATTACHMENTS`].
+struct ColorAttachIndexOutOfRange {
+    declared: u32,
+}
+
+impl crate::observe::Decline for ColorAttachIndexOutOfRange {
+    fn slug(&self) -> &'static str {
+        "color_attachment_index_out_of_range"
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        vec![("declared", self.declared.to_string())]
+    }
+}
+
 struct ColorWriteMaskOutOfRange;
 
 impl crate::observe::Decline for ColorWriteMaskOutOfRange {
@@ -1559,12 +1584,46 @@ fn note_color_entry_fields(bytes: &[u8], len: usize, entry: usize, slot: u32) {
     }
 }
 
+/// `position` is the entry's index in the section's offset table, used only
+/// when the entry does not carry [`COLOR_ATTACHMENT_TAG_INDEX`]. Defaulting an
+/// absent index to 0 the way the vertex-layout sibling does would collapse every
+/// attachment onto slot 0, which is worse than the position it replaces.
 fn parse_one_color_entry(
     bytes: &[u8],
     len: usize,
     entry: usize,
-    slot: u32,
+    position: u32,
 ) -> PipelineColorAttachment {
+    let slot = match entry_tag_u32_present(bytes, len, entry, COLOR_ATTACHMENT_TAG_INDEX) {
+        Some(declared) if (declared as usize) < MAX_COLOR_ATTACHMENTS => {
+            if declared != position {
+                // The case this decoder could not previously see: the guest's
+                // attachments are not a dense in-order prefix, so every consumer
+                // that matches `a.slot == c.slot` was reading another slot's
+                // blend state, write mask and pixel format.
+                crate::runtime::drain::note_store_route("type7_color_slot_off_position");
+            }
+            declared
+        }
+        Some(declared) => {
+            // A slot this device cannot represent. Keeping the position would
+            // bind this entry's state to a slot the guest did not name, so the
+            // entry is reported and left on its position rather than silently
+            // aliasing a real attachment.
+            if crate::observe::first_sight("color_attachment_index_out_of_range", u64::from(declared))
+            {
+                crate::observe::Emit::decline(
+                    "type7_color_attach",
+                    &ColorAttachIndexOutOfRange { declared },
+                )
+                .field("position", position)
+                .field("max", MAX_COLOR_ATTACHMENTS)
+                .fail();
+            }
+            position
+        }
+        None => position,
+    };
     note_color_entry_fields(bytes, len, entry, slot);
     let mut out = PipelineColorAttachment {
         slot,
@@ -1705,7 +1764,13 @@ fn note_color_table_truncated(
 /// because this is the pipeline-descriptor side of the same Metal limit.
 const MAX_COLOR_ATTACHMENTS: usize = 8;
 
-/// Parse all color-attachment entries (slot = entry index in the section).
+/// Parse all color-attachment entries.
+///
+/// The slot is the index the entry declares in [`COLOR_ATTACHMENT_TAG_INDEX`],
+/// not its position in this offset table. The two agree whenever the guest
+/// serializes a dense in-order prefix, which is why the position stood in for
+/// the index for so long without a visible symptom; they part as soon as it
+/// does not, and every consumer of the result selects by `slot`.
 ///
 /// `section_off == 0` is the descriptor saying it has no color section at all —
 /// expected control flow, and quiet. Every other early exit is a loss and says
@@ -3158,6 +3223,73 @@ mod tests {
             cap2.lines().is_empty(),
             "the census is deduped per shape and per (tag, len, value): {:?}",
             cap2.lines()
+        );
+    }
+
+    /// A colour attachment binds to the slot the guest named, not to its
+    /// position in the section's offset table.
+    ///
+    /// Every consumer selects the pipeline's blend state, write mask and pixel
+    /// format with `find(|a| a.slot == c.slot)`, so a slot derived from the
+    /// table position binds one attachment's state to another's slot the moment
+    /// the guest stops serializing a dense in-order prefix. Tag `0x00` is the
+    /// declared index — the same tag that carries `VERTEX_ATTR_TAG_LOCATION`
+    /// and `VERTEX_LAYOUT_TAG_BUFFER_INDEX` in the two sibling sections this
+    /// serializer emits in the identical shape, both of which this decoder
+    /// already read from the wire.
+    #[test]
+    fn a_colour_attachment_takes_the_slot_the_guest_declared() {
+        use crate::contract::endian::st32;
+        use crate::contract::pixel_format::{MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_RGBA8_UNORM};
+
+        // Two entries, declared out of order: table position 0 names slot 3 and
+        // position 1 names slot 1. Nothing but the declared index distinguishes
+        // them from a dense prefix.
+        let off = 16usize;
+        let entry_len = 1 + 2 * 6;
+        let mut buf = vec![0u8; off + 12 + 2 * entry_len];
+        st32(&mut buf[off..], 2);
+        st32(&mut buf[off + 4..], 12);
+        st32(&mut buf[off + 8..], (12 + entry_len) as u32);
+        let mut put = |entry: usize, index: u32, fmt: u32| {
+            buf[entry] = 2;
+            buf[entry + 1] = COLOR_ATTACHMENT_TAG_INDEX;
+            buf[entry + 2] = 4;
+            st32(&mut buf[entry + 3..], index);
+            buf[entry + 7] = COLOR_ATTACHMENT_TAG_PIXEL_FORMAT;
+            buf[entry + 8] = 4;
+            st32(&mut buf[entry + 9..], fmt);
+        };
+        put(off + 12, 3, MTL_FORMAT_BGRA8_UNORM as u32);
+        put(off + 12 + entry_len, 1, MTL_FORMAT_RGBA8_UNORM as u32);
+
+        let got = parse_color_attachments(&buf, buf.len(), off);
+        assert_eq!(got.len(), 2);
+        assert_eq!(
+            (got[0].slot, got[1].slot),
+            (3, 1),
+            "the slot is the declared index; positions would read (0, 1)"
+        );
+        assert_eq!(
+            got.iter().find(|a| a.slot == 3).map(|a| a.pixel_format),
+            Some(MTL_FORMAT_BGRA8_UNORM as u32),
+            "the lookup every consumer performs must reach this entry's own state"
+        );
+        assert_eq!(
+            got.iter().find(|a| a.slot == 1).map(|a| a.pixel_format),
+            Some(MTL_FORMAT_RGBA8_UNORM as u32)
+        );
+
+        // The index is a consumed field now, so it is no longer reported as a
+        // field this decoder dropped.
+        let cap = crate::observe::FailCapture::start();
+        let _ = parse_color_attachments(&buf, buf.len(), off);
+        assert!(
+            !cap.lines()
+                .iter()
+                .any(|l| l.contains("reason=color_attachment_field_dropped")),
+            "tag 0x00 is read, not dropped: {:?}",
+            cap.lines()
         );
     }
 
