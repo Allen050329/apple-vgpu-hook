@@ -195,18 +195,42 @@ enum StreamDrawDrop {
     /// count is what separates the two: a rate that tracks the draw rate is the
     /// second reading, an occasional one is the first.
     Unbound { dropped: u32 },
+    /// A depth or stencil attachment this device cannot honour as decoded.
+    ///
+    /// The pass still runs, and it runs *without* the attachment — so depth or
+    /// stencil testing silently disappears for every draw in it, which shows up
+    /// as wrong occlusion rather than as a missing frame. Both conditions are
+    /// real Metal that this device does not implement: a non-zero `level` binds
+    /// a mip of the depth texture, and a non-zero `resolve_texture_ref` is a
+    /// multisample depth resolve. Naming them is what separates "the guest
+    /// never asked" from "the guest asked and we dropped it".
+    DepthStencilUnsupported {
+        aspect: &'static str,
+        level: u32,
+        resolve_texture_ref: u32,
+    },
 }
 
 impl crate::observe::Decline for StreamDrawDrop {
     fn slug(&self) -> &'static str {
         match self {
             Self::Unbound { .. } => "stream_draw_dropped_unbound",
+            Self::DepthStencilUnsupported { .. } => "stream_depth_stencil_unsupported",
         }
     }
 
     fn fields(&self) -> Vec<(&'static str, String)> {
         match self {
             Self::Unbound { dropped } => vec![("dropped", dropped.to_string())],
+            Self::DepthStencilUnsupported {
+                aspect,
+                level,
+                resolve_texture_ref,
+            } => vec![
+                ("aspect", (*aspect).to_string()),
+                ("level", level.to_string()),
+                ("resolve", format!("{resolve_texture_ref:#x}")),
+            ],
         }
     }
 }
@@ -1206,12 +1230,30 @@ fn handle_render_record<M: HostMemory + HostOps>(
             if cmd_bytes.len() >= 8 {
                 let payload = &cmd_bytes[8..];
                 let depth = decode_depth_attachment(payload);
-                if depth.present && depth.level == 0 && depth.resolve_texture_ref == 0 {
-                    acc.depth_attach = Some(depth);
+                if depth.present {
+                    if depth.level == 0 && depth.resolve_texture_ref == 0 {
+                        acc.depth_attach = Some(depth);
+                    } else {
+                        note_depth_stencil_unsupported(
+                            task_id,
+                            "depth",
+                            depth.level,
+                            depth.resolve_texture_ref,
+                        );
+                    }
                 }
                 let stencil = decode_stencil_attachment(payload);
-                if stencil.present && stencil.level == 0 && stencil.resolve_texture_ref == 0 {
-                    acc.stencil_attach = Some(stencil);
+                if stencil.present {
+                    if stencil.level == 0 && stencil.resolve_texture_ref == 0 {
+                        acc.stencil_attach = Some(stencil);
+                    } else {
+                        note_depth_stencil_unsupported(
+                            task_id,
+                            "stencil",
+                            stencil.level,
+                            stencil.resolve_texture_ref,
+                        );
+                    }
                 }
                 for i in 0..PASS_MAX_COLOR_ATTACHMENTS {
                     let att = decode_color_attachment(payload, i);
@@ -1510,6 +1552,29 @@ fn apply_binds<T: Copy, B: Clone>(
         }
     }
     cleared
+}
+
+/// Name a depth or stencil attachment dropped for a form this device does not
+/// implement.
+///
+/// Deduped on the pair that decides the arm, not on the task: this fires from a
+/// per-`RenderPass` decode, so a guest that uses mip-1 depth throughout would
+/// otherwise emit on every pass in every stream. One line per distinct
+/// (aspect, level, resolve-present) combination is what answers the question
+/// the arm exists to answer — whether any guest asks for this at all.
+fn note_depth_stencil_unsupported(task_id: u32, aspect: &'static str, level: u32, resolve: u32) {
+    crate::observe::Emit::decline(
+        "stream_pass",
+        &StreamDrawDrop::DepthStencilUnsupported {
+            aspect,
+            level,
+            resolve_texture_ref: resolve,
+        },
+    )
+    .field("task", task_id)
+    .fail_once(
+        u64::from(level) << 8 | u64::from(resolve != 0) << 1 | u64::from(aspect == "stencil"),
+    );
 }
 
 /// Report what this stream's draw list cost, and anything it lost building it.
@@ -2920,6 +2985,86 @@ mod tests {
         let c = render::decode(&cmd).unwrap();
         assert_eq!(c.kind, RenderKind::RenderPass);
         assert_eq!(c.color0.texture_ref, 41);
+    }
+
+    /// A depth attachment this device cannot honour is dropped, and says so.
+    ///
+    /// A non-zero `level` binds a mip of the depth texture and a non-zero
+    /// `resolve_texture_ref` is a multisample depth resolve; both are real Metal
+    /// and neither is implemented here. The gate that drops them was a bare `if`
+    /// with no else, so the pass ran on with no depth attachment at all — depth
+    /// testing gone for every draw in it, which reads as wrong occlusion rather
+    /// than as a missing frame, and left nothing in the log to connect the two.
+    ///
+    /// Both halves are asserted: the attachment is still refused (unchanged
+    /// behaviour) and the refusal is now named.
+    #[test]
+    fn an_unsupported_depth_attachment_is_named_not_just_dropped() {
+        use crate::runtime::decode::render::{
+            OP_RENDER_PASS, PASS_ATTACH_LEVEL, PASS_ATTACH_RESOLVEREF, PASS_ATTACH_TEXREF,
+            PASS_DEPTH_ATTACH_OFF, PASS_STENCIL_ATTACH_OFF,
+        };
+        let pass = |level: u16, resolve: u32| {
+            let mut payload = vec![0u8; 0x200];
+            st32(
+                &mut payload[PASS_DEPTH_ATTACH_OFF + PASS_ATTACH_TEXREF..],
+                77,
+            );
+            payload[PASS_DEPTH_ATTACH_OFF + PASS_ATTACH_LEVEL
+                ..PASS_DEPTH_ATTACH_OFF + PASS_ATTACH_LEVEL + 2]
+                .copy_from_slice(&level.to_le_bytes());
+            st32(
+                &mut payload[PASS_DEPTH_ATTACH_OFF + PASS_ATTACH_RESOLVEREF..],
+                resolve,
+            );
+            // A stencil slot this device *can* honour, so the two aspects stay
+            // separable and the depth arm is the only one under test.
+            st32(
+                &mut payload[PASS_STENCIL_ATTACH_OFF + PASS_ATTACH_TEXREF..],
+                88,
+            );
+            let mut cmd = vec![0u8; HEADER_LEN + payload.len()];
+            st32(&mut cmd[0..], OP_RENDER_PASS);
+            st32(&mut cmd[4..], (HEADER_LEN + payload.len()) as u32);
+            cmd[HEADER_LEN..].copy_from_slice(&payload);
+            cmd
+        };
+        let run = |cmd: &[u8]| {
+            let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+            let host = FakeHost::new();
+            let mut out = ExecResult::default();
+            let mut acc = StreamAccum::default();
+            handle_render_record(&mut state, &host, 1, OP_RENDER_PASS, cmd, &mut out, &mut acc);
+            acc
+        };
+
+        let ok = run(&pass(0, 0));
+        assert!(
+            ok.depth_attach.is_some() && ok.stencil_attach.is_some(),
+            "a level-0 depth attachment with no resolve is honoured"
+        );
+
+        for (level, resolve) in [(1u16, 0u32), (0, 99)] {
+            let acc = run(&pass(level, resolve));
+            assert!(
+                acc.depth_attach.is_none(),
+                "level={level} resolve={resolve} must still be refused"
+            );
+            assert!(
+                acc.stencil_attach.is_some(),
+                "refusing depth must not take the stencil attachment with it"
+            );
+        }
+
+        let log = std::fs::read_to_string(crate::observe::fail_log_path()).expect("fail log");
+        assert!(
+            log.contains("stream_depth_stencil_unsupported"),
+            "an unsupported depth attachment was dropped without naming itself"
+        );
+        assert!(
+            log.contains("aspect=depth"),
+            "the line must say which aspect was lost"
+        );
     }
 
     #[test]
