@@ -256,6 +256,20 @@ already been run to exhaustion; re-running one costs hours and has so far return
   workload on one pathway, and `claims > 1` is a live failure-channel alarm that will say so if the
   assumption ever breaks.
 
+- **The per-present type-4 force refresh is not redundant with the `0x3c` re-point packet, and
+  deleting it on that argument would lose 98% of the page-list changes.** `ensure_surface_for_present`
+  calls `resolve_type4_surface_force` on every present for an already-resident mapping, which re-reads
+  the descriptor and re-translates the first and last backing page. That reads exactly like polling for
+  something the guest announces — and `replace_physical`'s own doc says of `CmdReplacePhysical`
+  (`0x3c`) that "the packet is the announcement, and it is the only one there is", which invites the
+  conclusion that once `0x3c` is decoded (it is, since `2f9f2f2`) the polling can go. Measured on a
+  driven x86 boot: **1 700 `type4_pages_refreshed` against 34 `replace_physical` packets**, only 10 of
+  which dropped a cached list. `type4_pages_refreshed` only fires when a *prior non-empty* page list
+  differed from the freshly built one, so those 1 700 are real changes to real cached backings. The
+  packet's doc is right about the case it covers — a GPU-VA re-point at unchanged surface id, geometry
+  and length — and that case is ~2% of the traffic. The rest reaches the rebuild through a geometry
+  change or a recycled incarnation. Do not trade the poll for the packet.
+
 - **Two arms of one guest-memory write must be diffed against each other, not read alone.** This is
   the `mapping_write.rs` instance of the consumer-side finding above, and it has now produced three
   bugs in a row: a `span_end` bound present on two arms of three, two entries draining deferred
