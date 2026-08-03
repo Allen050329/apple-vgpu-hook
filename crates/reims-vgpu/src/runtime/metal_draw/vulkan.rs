@@ -2818,261 +2818,74 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
 }
 
 /// Report a sampled texture served entirely as zeroes out of the guest's pages
-/// while a host entry for the same address is sitting in the cache.
+/// while the host cache holds an entry for the same address.
 ///
 /// A type-2/3 texture's guest GVA pages are a *pageable alias* of a body this
-/// device owns -- `surface_cache::store_linear_texture` says so, and the
-/// measured reading agrees: on every sampled bind audited with a byte-for-byte
-/// content probe, the cache held content and the guest's pages
-/// for the same span were zero end to end, 7 of 7. The guest never writes
-/// them. So the ladder's lower rungs are not a fallback for this class at all;
-/// reading them returns a blank texture, the draw succeeds, nothing declines,
-/// and a blank cell is painted and held. That is the silent loss of guest work
-/// the ground rules forbid, and it is the shape both the surviving Finder icon
-/// class and the Safari scroll-buffer patches have.
+/// device owns (`surface_cache::store_linear_texture`), so a blank read here
+/// could mean the device rendered the span, cached it, and its own writeback
+/// never landed in the guest's pages — a silent loss, since the draw then
+/// succeeds and paints a blank cell with nothing declining.
 ///
-/// Reported rather than refused: refusing would change what is drawn, and
-/// nothing here has yet established what SHOULD be drawn when the host copy is
-/// gone.
+/// Three questions separate that defect from its lookalikes, and this function
+/// asks all three:
 ///
-/// **Measured, and it refutes the "we had the pixels" half of that.** One
-/// driven boot, ten Finder recomposites, x86/Vulkan:
+/// - **Does the cache hold this span at all?** `lin_rung_host_entry` against
+///   `lin_rung_guest_memo` is the denominator. Without it a bare count cannot
+///   tell "300 of 300" from "300 of 300 000".
+/// - **Are the zeroed pages still the pages the entry was produced over?**
+///   [`crate::runtime::surface_cache::gva_backing_state`]: `Same` means the
+///   cache entry is live over these pages, `Moved`/`Unmapped` means the guest
+///   handed the address to another allocation and the *cache* is the stale
+///   side — where serving it would be the corruption, not the repair.
+/// - **Does the entry hold any pixels?** The question the class was named for
+///   and never asked. A span the device CLEARed and cached blank reads blank
+///   off blank pages with nothing lost, and `draw_partial_clear` runs in the
+///   thousands a boot.
 ///
-///   lin_rung_gva_bypassed 725233   lin_rung_guest_memo 725231
-///   lin_rung_texref 2              lin_rung_guest_blank 3379
-///   lin_rung_blank_with_host_entry 0        gvac_hit 305
+/// ## Measured, and the class is not a loss
 ///
-/// Two things follow. The GVA cache rung is bypassed on essentially every
-/// sampled linear load, and not because entries are being refused -- `gvac_hit`
-/// is 305 against 725 233 loads, so `has_gva` simply finds nothing for these
-/// spans. And of the 3 379 samples that came back a completely blank texture,
-/// **none** had a host entry for the same address. We did not have the pixels
-/// and paint nothing; we do not have them at all.
-///
-/// `lin_rung_guest_blank` is not it either, and the identity line settles that.
-/// Across a ten-recomposite boot in which three rounds came out corrupt, EVERY
-/// blank sample was `1x1` -- six distinct spans, all of them one texel. A 1x1
-/// zero texture is an ordinary solid-colour source. There were no 64x64 blank
-/// samples at all, in the corrupt rounds or the clean ones.
-///
-/// So the icon that renders as a small block of content in an otherwise empty
-/// square is NOT a sample that came back empty. Its sample returns content. The
-/// emptiness around it is therefore produced after the sample -- by what the
-/// draw covers, not by what it reads.
-///
-/// ## That reading no longer holds. The counter is not zero.
-///
-/// A 14-round boot of the same harness, x86/Vulkan, after the sampled type-4
-/// ladder's resident rung stopped binding GPU copies the guest had overwritten
-/// and the deferred rail stopped withholding landings:
+/// One driven x86/Vulkan boot — 30 s Safari window drag plus two web-content
+/// probe runs, all declared regions measuring their colour — summed over its
+/// `store_routes` windows:
 ///
 /// ```text
-/// 13 of 14 rounds clean; the one corrupt round is TWO adjacent icon cells,
-/// completely empty -- not a wrong glyph, not a shrunken one.
+/// lin_rung_guest_memo             79898   sampled serves off the guest's pages
+/// lin_rung_host_entry             18988   …of which the cache also held the span (23.8 %)
+/// lin_rung_guest_blank             1859   …that came back all zeroes (2.3 %)
+/// lin_rung_blank_with_host_entry     22   …of those, with a host entry (1.2 % of blanks)
+/// lin_rung_blank_host_agrees         22   …where the cache is blank too: nothing lost
+/// lin_rung_blank_host_content         0   …where the cache holds pixels: the defect
 ///
-/// corrupt round   lin_rung_guest_blank 399   lin_rung_blank_with_host_entry 1
-/// clean round     lin_rung_guest_blank ~400  lin_rung_blank_with_host_entry 0
-/// whole boot                                 lin_rung_blank_with_host_entry 2
-///
-/// lin_rung_blank_with_host_entry rung=guest_memo task=1 ref=238
-///   gva=0xacb000 64x64 bytes=16384
+/// 13 distinct spans, backing=Same and fmt=Bgra8 on every one
 /// ```
 ///
-/// `64x64`, 16 384 bytes: a folder icon exactly, at the geometry the earlier
-/// boot found none of. The class the older measurement described — the icon that
-/// keeps a *block of content* in an empty square — is the one that is gone. What
-/// is left is a whole cell that is blank, and for at least one of them the
-/// sample really did come back zero while this device held a host copy of the
-/// same span.
+/// So the two rails agree on every occurrence. The dominant blank class is
+/// elsewhere — 98.8 % of blank samples have no cache entry for the span at all,
+/// which is "we do not have the pixels", not "we lost them". `fmt=Bgra8`
+/// throughout also excludes a conversion artifact: the blank test runs on
+/// converted RGBA, and a layout whose conversion zeroed the buffer would show
+/// up as a different `fmt`.
 ///
-/// The two are not the same defect and the older evidence does not speak to the
-/// one that is left. `lin_rung_blank_with_host_entry` is also the only class
-/// that separates the corrupt round from the clean ones in that boot's fail
-/// channel, alongside one `deferred_flush_lost` and two
-/// `deferred_window_page_drift`.
+/// `lin_rung_blank_host_content` is therefore a healthy zero, and a non-zero
+/// reading is the alarm: it is the only arm that means guest work was lost, and
+/// the place to repair it is the GVA writeback rail upstream of this rung.
 ///
-/// The reason for reporting rather than refusing was that nothing established
-/// what should be drawn when the host copy is gone. Here the host copy is *not*
-/// gone — it is in the cache, for this span — and the pages that read zero are
-/// the pageable alias the guest never writes.
+/// ## What this does not license
 ///
-/// A note on the `gvac_*` counters this section used to reason from
-/// (`gvac_hit`, `gvac_gw_wrote`, `gvac_gw_no_entry`), and on the
-/// `arm_gva_guest_write_witness` / `gva_guest_wrote_since_store` pair that
-/// produced them: **none of them exist any more.** They belonged to the GVA
-/// encode-cache rung, and that rung was deleted along with its freshness gate —
-/// see the note in [`load_linear_from_host_caches`] for the measurement that
-/// removed it. Numbers quoted from them above are history, not instruments a
-/// reader can go and re-read. What replaces them for this class is the backing
-/// state on the fail line below.
+/// Serving the cache on the whole rung — making the order match
+/// [`crate::runtime::metal_draw::seed_color_load`]'s stated rule, "exact target
+/// GVA is the strongest identity … Guest memory is last" — would change ~19 000
+/// serves to repair nothing. The two rails are not the same case: the seed's
+/// entry is for an attachment the pass is about to draw *onto*, while a sampled
+/// span may be guest-CPU-produced between the encode and the sample with
+/// nothing here able to witness it. Serving the cache only when the sample came
+/// back blank is not available either — that is selecting on content.
 ///
-/// ## The rate is not improved, and one 14-round boot cannot say it is
-///
-/// Two more 14-round boots on the same binary as the run above: 8 of 14 corrupt
-/// and 2 of 14 corrupt. Across all three, 11 of 42 rounds, against 9 of 42 on
-/// the three recorded `22a3346` boots. **No change in the icon rate has been
-/// demonstrated by any of this branch's work.** What has changed is that the
-/// desktop paints at all, and that the corrupt cell is now blank rather than
-/// holding another element's pixels.
-///
-/// Round-to-round clustering is severe enough that a single 14-round boot is
-/// not a rate. The 1-of-14 boot and the 8-of-14 boot differ only in that the
-/// second harness ran on a VM already driven for 28 minutes.
-///
-/// ## After the deferred rail was bounded by the guest's fence
-///
-/// `storage_flush::flush_gva_windows_before_fence` stopped the GVA rail writing
-/// guest RAM after the guest had been told the render finished. One 14-round
-/// boot on that binary, fresh VM, same harness:
-///
-/// ```text
-/// 14 of 14 rounds CLEAN
-/// lin_rung_blank_with_host_entry 0   (2-3 per boot before)
-/// gvaw_stamp_outlived            0   (810 before)
-/// ```
-///
-/// That is the first all-clean boot this harness has recorded, and the counter
-/// this section was written to chase went to zero with it. The mechanism is
-/// direct: a sampled linear load whose GVA cache is bypassed falls through to
-/// the guest's own pages, and those pages used to be stale for as long as the
-/// deferred window sat unlanded — median 133 fences. They are now current at
-/// every fence, so the fall-through reads the render instead of what was there
-/// before it.
-///
-/// **This does not establish a rate, and the load proxy says why.**
-/// `gva_guest_wrote_since_store`'s `gvac_gw_wrote` normalises to 42.4 per 1000
-/// `draw_scissor_full` on this boot, against a corrupting threshold of ~127. So
-/// every round of it was in the LOW mode, where the pooled base rate is 3 of 22
-/// rounds corrupt — 14 %, giving a ~12 % chance of seeing 14 clean rounds with
-/// no change at all. The boot is consistent with the repair and also consistent
-/// with a quiet boot. It cannot confirm or refute the high-mode defect because
-/// it never entered the high mode, which is exactly the trap recorded above.
-///
-/// ### Second boot, and the two together are a result
-///
-/// A second 14-round boot, fresh VM, same harness, same binary family:
-///
-/// ```text
-/// boot 1   14 of 14 CLEAN   gvac_gw_wrote/1000 draws = 42.4
-/// boot 2   14 of 14 CLEAN   gvac_gw_wrote/1000 draws = 79.5
-/// pooled   28 of 28 CLEAN
-/// ```
-///
-/// Against this branch's own baseline of 11 corrupt of 42 rounds (26 %), 28
-/// consecutive clean rounds has probability 0.74^28 ~ 2e-4. Against the
-/// low-mode-only base rate of 3 of 22 (14 %) it is 0.86^28 ~ 1.5 %. Either way
-/// the null hypothesis that nothing changed is no longer comfortable, which is
-/// more than any earlier arm on this branch could say.
-///
-/// The caveat that survives: neither boot reached the HIGH mode. 79.5 is nearly
-/// double boot 1 and still short of the ~127 threshold, so the reliable
-/// high-recycling defect remains unscored — nothing here shows it is fixed, only
-/// that it did not appear. `lin_rung_blank_with_host_entry` was 0 on both.
-///
-/// ## Read the two zeros above as fail-line counts, not occurrence counts
-///
-/// `lin_rung_blank_with_host_entry` names **two different quantities**, and
-/// every "0" recorded above is the smaller one. The `fail` line below is behind
-/// `first_sight` on `(gva, w, h)`, so it fires once per distinct span for the
-/// life of the boot; the `store_route` counter beside it is unconditional. A
-/// boot that revisits the same spans can therefore report a handful of lines
-/// and hundreds of occurrences, and the two are not comparable.
-///
-/// Three independent driven boots on a later binary — Chess, Maps, the WebGL
-/// aquarium, page-downs, a title-bar drag, apple.com — read:
-///
-/// ```text
-/// store_route occurrences   263 / 299 / 360
-/// distinct fail lines        15          (same boot as the 360)
-/// ```
-///
-/// Every sample was 64x64 on the guest-memo rung, which is the icon-cell geometry
-/// this section was written to chase. What that does *not* establish is a
-/// regression: the readings above came from `icon-boot-ab.sh`'s round harness on
-/// an older binary, and this is a different workload on a different build, so
-/// build and workload are confounded and neither can be blamed. Isolating it
-/// means re-running that harness and reading the occurrence counter, not the
-/// line count.
-///
-/// What it does establish is that the "0"s above cannot be reasoned from as
-/// though the class had stopped happening. On the general workload it happens
-/// roughly three hundred times a boot.
-///
-/// ## What the report was missing, and what it now carries
-///
-/// Everything above compares this rung against the *cache*, and none of it asks
-/// the prior question: **are the pages that read zero still the pages the cache
-/// entry was produced over?** Without that, one line covers two unrelated
-/// defects. If the key still translates to the page the encode was stored over
-/// (`Same`), the device rendered this span, cached it, and its own writeback
-/// either never landed or landed somewhere else — a loss on the GVA flush rail.
-/// If the key now translates elsewhere (`Moved`) or not at all (`Unmapped`), the
-/// guest handed this address to another allocation and the *cache* entry is the
-/// stale one; the zeroes are then whatever the new owner has, and serving the
-/// cache would be the corruption rather than the repair.
-///
-/// So the two point in opposite directions and the earlier reading — "the host
-/// copy is not gone, it is in the cache for this span" — silently assumes the
-/// first. [`crate::runtime::surface_cache::gva_backing_state`] is the same test
-/// the colour-LOAD seed already runs at its own serve site
-/// ([`crate::runtime::metal_draw::seed_color_load`], where it read `Same` 536 of
-/// 536), and it is one page-table walk per distinct blank span rather than per
-/// sample: the fail line is behind `first_sight`, and the walk sits under it.
-///
-/// The route counter beside it is per-occurrence, so `lin_rung_host_entry`
-/// against `lin_rung_blank_with_host_entry` gives the class a denominator it has
-/// never had — how often this rung falls through to guest pages for a span the
-/// cache holds, blank or not.
-///
-/// ## Both instruments have now been read, and the class is much smaller than
-/// this section assumed
-///
-/// One driven x86/Vulkan boot — 40 s Safari window drag plus the web-content
-/// probe's 20 captures, all 11 declared regions measuring their colour — summed
-/// over its `store_routes` windows:
-///
-/// ```text
-/// lin_rung_guest_memo             85669   sampled serves off the guest's pages
-/// lin_rung_host_entry             20164   …of which the cache also held the span (23.5 %)
-/// lin_rung_guest_blank             1919   …that came back all zeroes (2.2 %)
-/// lin_rung_blank_with_host_entry     31   …of those, with a host entry (1.6 % of blanks)
-///
-/// 13 distinct fail lines, backing=Same on every one
-/// ```
-///
-/// Two corrections to everything above.
-///
-/// **The dominant blank class is still "we do not have the pixels at all".**
-/// 98.4 % of blank samples have no cache entry for the span, which is what the
-/// older 3 379-against-0 reading said and what the "300 a boot" paragraph then
-/// talked past. The loss this section is named for is **31 occurrences a boot**,
-/// not three hundred.
-///
-/// **Where those 31 sit is not an aliasing hazard.** `backing=Same` on every
-/// distinct span: the key still translates to the page the encode was stored
-/// over, so the guest did not hand the address on and the cache entry is not the
-/// stale one.
-///
-/// **They are not all loss, and the count that said they were could not tell.**
-/// The reading above concluded "the device rendered these spans, cached them,
-/// and the guest's own pages read zero anyway", but the test behind it asked
-/// only whether the cache *held* the span, never whether it held any pixels. A
-/// span the device cleared and cached blank gives a blank guest read off blank
-/// pages with nothing lost, and `draw_partial_clear` runs in the thousands.
-/// `lin_rung_blank_host_agrees` against `lin_rung_blank_host_content` splits
-/// them: only the latter is a coherence loss on the GVA writeback rail upstream
-/// of this rung, and only it needs repairing.
-///
-/// **What this does not license.** Serving the cache on the whole rung — making
-/// the order match [`crate::runtime::metal_draw::seed_color_load`]'s stated rule,
-/// "exact target GVA is the strongest identity … Guest memory is last" — would
-/// change 20 164 serves to repair 31, and the two rails are not the same case:
-/// the seed's entry is for an attachment the pass is about to draw *onto*, while
-/// a sampled span may be guest-CPU-produced between the encode and the sample
-/// with nothing here able to witness it. Serving the cache only when the sample
-/// came back blank is not available either — that is selecting on content, which
-/// this project does not do. So the 31 stay reported and unrepaired, and the
-/// place to repair them is whatever leaves a `backing=Same` span reading zero.
+/// The `fail` line is behind `first_sight` on `(gva, w, h)`, so it fires once
+/// per distinct span for the life of the boot while the counters beside it are
+/// per-occurrence; the two are not comparable. The `gva_backing_state` walk
+/// sits under that latch, so it is one page-table walk per distinct span rather
+/// than per sample.
 ///
 /// `span` is `(gva, width, height)` — the GVA cache's key, taken as one value
 /// because every lookup below needs all three and none of them means anything
