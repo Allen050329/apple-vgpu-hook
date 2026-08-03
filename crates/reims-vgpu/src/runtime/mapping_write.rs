@@ -1894,8 +1894,18 @@ fn write_rect_raw_at_impl<M: HostMemory + HostOps>(
         // each maximal packed GPA run once. Calling write_mapping_bytes once
         // per row turns a 1928-row storage-texture writeback into thousands of
         // QEMU memory-region imports (the live compute_writeback_amplification
-        // class). Native row padding is not texture content and is zeroed, as
-        // in write_bgra8's fragmented path above.
+        // class).
+        //
+        // The store names each row's `rb` texel bytes rather than the frame's
+        // whole extent, for the reason `write_bgra8_inner` states at its own
+        // staging branch: a row pitch wider than the packed row leaves padding
+        // between rows, the contig arm twenty lines above writes row by row and
+        // never touches it, so storing the staged frame entire would zero it
+        // here and leave it alone there — the same call landing different guest
+        // memory depending only on whether the guest's pages happened to be
+        // adjacent. Those bytes belong to this plane, so it was never an overrun
+        // into a neighbour; it is content the guest put there and this call was
+        // not asked to replace.
         // `span_end` ends at the final row's last texel. It deliberately does
         // not include padding after the final row, so staging bpr * height
         // rejects every exact-span surface whose row pitch exceeds row_bytes.
@@ -1943,6 +1953,10 @@ fn write_rect_raw_at_impl<M: HostMemory + HostOps>(
             return true;
         }
         let mut frame = vec![0u8; frame_len];
+        // Built alongside the fill so the two cannot describe different rows.
+        // Adjacent runs coalesce, so a packed pitch collapses to the single run
+        // it was before the split and moves exactly the same bytes.
+        let mut runs: Vec<(u64, u64)> = Vec::new();
         for y in 0..height as usize {
             let src_off = y * src_stride as usize;
             let dst_off = ((origin_y as usize) + y)
@@ -1952,8 +1966,22 @@ fn write_rect_raw_at_impl<M: HostMemory + HostOps>(
                 return false;
             }
             frame[dst_off..dst_off + rb].copy_from_slice(&src[src_off..src_off + rb]);
+            let lo = base_off.saturating_add(dst_off as u64);
+            let hi = lo.saturating_add(rb as u64);
+            match runs.last_mut() {
+                Some(last) if last.1 == lo => last.1 = hi,
+                _ => runs.push((lo, hi)),
+            }
         }
-        if !mapper::write_mapping_bytes(state, host, mapping_id, base_off, &frame, &vouched) {
+        if !mapper::write_mapping_bytes_only(
+            state,
+            host,
+            mapping_id,
+            base_off,
+            &frame,
+            Some(&runs),
+            &vouched,
+        ) {
             return false;
         }
     } else {
@@ -2925,6 +2953,80 @@ mod tests {
     /// drift apart. Padding after the final row would overrun an exact IOSurface
     /// allocation; padding *between* rows is inside the plane but is still
     /// content the guest put there and this call never named.
+    /// The staged full-plane rect write must leave inter-row padding alone, on
+    /// the same assertion as its two siblings.
+    ///
+    /// `write_rect_raw_at_impl` has three arms that must land identical guest
+    /// memory. The contiguous one pokes each row's texel bytes through a raw
+    /// pointer, the per-row fragmented one writes each row's bytes on its own,
+    /// and the staged one built a pitch-wide zeroed frame and stored it entire —
+    /// so every padding byte between rows was zeroed in the guest's pages. That
+    /// is the defect `write_bgra8_inner` was fixed for, in the sibling function,
+    /// and this arm's own comment cited the pre-fix behaviour as its
+    /// justification.
+    ///
+    /// Asserted as "every byte outside the texel runs is unchanged", the same
+    /// whole-page comparison the BGRA arms are pinned by, so all three cannot
+    /// drift apart again. The fixture forces the staged arm two ways: two
+    /// non-adjacent pages (no contiguous view) and `full_plane`, and a pitch
+    /// wider than the packed row so `full_tight_direct` cannot take it either.
+    #[test]
+    fn write_full_rect_raw_staged_leaves_inter_row_padding_alone() {
+        use crate::model::PAGE_SHIFT_X86;
+
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+        host.strict_linux_map = true;
+        let page = 1u64 << PAGE_SHIFT_X86;
+        let gpa0 = 0x3500_0000u64;
+        let gpa1 = 0x4600_0000u64;
+        host.map_range(gpa0, page as usize, 0xCC);
+        host.map_range(gpa1, page as usize, 0xCC);
+        let pfn0 = (gpa0 >> PAGE_SHIFT_X86) as u32;
+        let pfn1 = (gpa1 >> PAGE_SHIFT_X86) as u32;
+        let mid = 14u32;
+        state.map_surface(mid);
+        {
+            let m = state.mappings.get_mut(&mid).unwrap();
+            m.mapped = true;
+            m.mapping_internal = 1;
+            m.page_entries = vec![
+                (pfn0 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID,
+                (pfn1 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID,
+            ];
+        }
+        assert!(state.set_mapping_geom(mid, 2, 2, MTL_FORMAT_BGRA8_UNORM));
+        assert!(
+            mapper::ensure_contig_view(&mut state, &mut host, mid).is_none(),
+            "two non-adjacent pages must take the staged path this test is about"
+        );
+
+        // 2x2 BGRA8: 8 tight bytes per row at a 128-byte pitch, so 120 bytes of
+        // guest content sit between the rows.
+        let (w, h, bpp) = (2u32, 2u32, 4u32);
+        let tight = (w * bpp) as usize;
+        let bpr = 128u32;
+        let span_end = (bpr as u64) * (h as u64 - 1) + tight as u64;
+        let src = [
+            0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee,
+            0xff, 0x10,
+        ];
+        assert!(write_full_rect_raw_at(
+            &mut state, &mut host, mid, 0, bpr, span_end, w, h, bpp, &src, tight as u32,
+        ));
+
+        let mut got = vec![0u8; page as usize];
+        assert!(host.read_gpa(gpa0, &mut got).is_ok());
+        let mut want = vec![0xCCu8; page as usize];
+        want[..tight].copy_from_slice(&src[..tight]);
+        want[bpr as usize..bpr as usize + tight].copy_from_slice(&src[tight..]);
+        let first_diff = got.iter().zip(want.iter()).position(|(a, b)| a != b);
+        assert_eq!(
+            first_diff, None,
+            "byte {first_diff:?} outside the texel runs was modified"
+        );
+    }
+
     #[test]
     fn write_bgra8_fragmented_skips_final_row_padding() {
         use crate::model::PAGE_SHIFT_X86;
