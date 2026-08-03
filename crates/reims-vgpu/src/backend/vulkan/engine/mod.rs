@@ -795,18 +795,21 @@ pub fn touch_resident_target(identity: Option<&TargetIdentity>, now_ms: u64) {
 /// `vk_engine_probe` decline's `probe=` field.
 ///
 /// [`EngineProbe::discriminant`] is the `fail_once` dedup key, so it is a
-/// stable numbering and not an index: 1 through 6 are retired holes. 1, 2 and 3
+/// stable numbering and not an index: 1 through 6 and 8 are retired holes. 1, 2
+/// and 3
 /// named the present-proxy GPU stats oracle's context / pool / take prologues
 /// (`present_stats_context`, `present_stats_pools`, `take_stats_context`); 4 and
 /// 5 named the host-pointer import prologues (`host_import_context`,
 /// `host_import_pools`), which went out with the import subsystem; 6 was
 /// `compute_writeback_alignment`, which went out with the GPU-direct compute
-/// writeback. Do not reuse them — a fail-log line already carrying one of those
+/// writeback; 8 was `compute_capable`, the public query for a combined
+/// GRAPHICS|COMPUTE queue family, which no caller ever asked — the two engine
+/// paths that need the capability read `ctx.compute_capable` directly.
+/// Do not reuse them — a fail-log line already carrying one of those
 /// keys must not be conflated with a new probe's.
 #[derive(Clone, Copy, Debug)]
 enum EngineProbe {
     StorageWriteWithoutFormat,
-    ComputeCapable,
     SampledR32fLinearFilter,
 }
 
@@ -814,7 +817,6 @@ impl EngineProbe {
     fn name(self) -> &'static str {
         match self {
             Self::StorageWriteWithoutFormat => "storage_write_without_format",
-            Self::ComputeCapable => "compute_capable",
             Self::SampledR32fLinearFilter => "sampled_r32f_linear_filter",
         }
     }
@@ -824,7 +826,6 @@ impl EngineProbe {
     fn discriminant(self) -> u64 {
         match self {
             Self::StorageWriteWithoutFormat => 7,
-            Self::ComputeCapable => 8,
             Self::SampledR32fLinearFilter => 9,
         }
     }
@@ -1928,24 +1929,6 @@ pub fn test_poison_and_flush() {
     g.flush_device_derived();
 }
 
-/// Whether the live device has a combined GRAPHICS|COMPUTE queue family.
-pub fn compute_capable() -> bool {
-    let mut g = lock_engine();
-    let EngineState {
-        ref mut owner,
-        ref counters,
-        ..
-    } = &mut *g;
-    match owner.ensure(counters) {
-        Ok(ctx) => ctx.compute_capable,
-        Err(error) => {
-            engine_probe_decline(EngineProbe::ComputeCapable, &error)
-                .fail_once(EngineProbe::ComputeCapable.discriminant());
-            false
-        }
-    }
-}
-
 #[cfg(test)]
 mod engine_lock_census_tests {
     use super::*;
@@ -2052,7 +2035,6 @@ mod probe_visibility_tests {
         let error = vk_call::exec_submit_device_lost_fixture();
         for probe in [
             EngineProbe::StorageWriteWithoutFormat,
-            EngineProbe::ComputeCapable,
             EngineProbe::SampledR32fLinearFilter,
         ] {
             let line = engine_probe_decline(probe, &error).render();
