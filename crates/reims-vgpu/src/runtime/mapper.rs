@@ -1144,6 +1144,35 @@ pub fn revalidate_mapping_reason<H: HostMemory + HostOps>(
     }
 }
 
+/// Which of the two `true`s a bare "are these pages still ours" bool would
+/// have returned.
+///
+/// [`type4_pages_witness`]'s contract says a caller must not read a bare
+/// "yes" as "these pages were verified", because four of its five exits check
+/// nothing at all. Every caller then collapsed both meanings into
+/// [`PagesVerdict::Ours`], and the counters built on it — `mapw_pages_vouched` 29 002 against
+/// `mapw_pages_refused` **0** on one boot — cannot say whether that zero is a
+/// guard that passed or a guard that was never armed. Those are opposite claims
+/// about the write-after-free class and the census reported them identically.
+///
+/// This is the denominator, and it is measure-only: [`Unwitnessed`] still
+/// yields a token and still lets the write through, exactly as before. Nothing
+/// here changes policy; it changes what the boot can say about it.
+///
+/// [`Unwitnessed`]: Type4Witness::Unwitnessed
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Type4Witness {
+    /// Every page of the cached list was re-walked and agreed. The only exit
+    /// that is evidence the list still names the surface's memory.
+    Verified,
+    /// Nothing was checked. Carries which of the four states it was, because
+    /// they are not one outcome: a surface that never latched a walk is a
+    /// different gap from one whose walk was superseded.
+    Unwitnessed(&'static str),
+    /// The re-walk disagreed, or the owning task is gone.
+    Drifted,
+}
+
 /// Whether a mapping's cached page list still names the guest memory it was
 /// walked from, re-derived rather than remembered.
 ///
@@ -1178,45 +1207,18 @@ pub fn revalidate_mapping_reason<H: HostMemory + HostOps>(
 /// Any page that translates differently — or no longer translates at all — means
 /// the list in hand names memory that is no longer the surface's.
 ///
-/// Returns `true` when there is nothing to check (`type4_walk` absent, or
-/// latched at a superseded `map_generation`), because this is a *specific*
-/// witness and not a general one; a caller must not read `true` as "these pages
-/// were verified".
+/// Answers [`Type4Witness::Unwitnessed`] when there is nothing to check
+/// (`type4_walk` absent, or latched at a superseded `map_generation`), because
+/// this is a *specific* witness and not a general one. That exit is the reason
+/// the return type is an enum rather than a bool: it is not evidence, and a
+/// caller must not read it as "these pages were verified".
 ///
 /// The peer for the raw-GVA rails is
 /// [`crate::runtime::storage_flush::deferred_pages_still_ours`], which asks the
 /// same question about a window's armed page set. This one asks it about a
 /// mapping's list, which is what the mapping-keyed rails write through.
-/// Which of the two `true`s a bare "are these pages still ours" bool would
-/// have returned.
 ///
-/// That function's contract says a caller must not read `true` as "these pages
-/// were verified", because four of its five exits check nothing at all. Every
-/// caller then collapsed both meanings into [`PagesVerdict::Ours`], and the
-/// counters built on it — `mapw_pages_vouched` 29 002 against
-/// `mapw_pages_refused` **0** on one boot — cannot say whether that zero is a
-/// guard that passed or a guard that was never armed. Those are opposite claims
-/// about the write-after-free class and the census reported them identically.
-///
-/// This is the denominator, and it is measure-only: [`Unwitnessed`] still
-/// yields a token and still lets the write through, exactly as before. Nothing
-/// here changes policy; it changes what the boot can say about it.
-///
-/// [`Unwitnessed`]: Type4Witness::Unwitnessed
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Type4Witness {
-    /// Every page of the cached list was re-walked and agreed. The only exit
-    /// that is evidence the list still names the surface's memory.
-    Verified,
-    /// Nothing was checked. Carries which of the four states it was, because
-    /// they are not one outcome: a surface that never latched a walk is a
-    /// different gap from one whose walk was superseded.
-    Unwitnessed(&'static str),
-    /// The re-walk disagreed, or the owning task is gone.
-    Drifted,
-}
-
-/// Re-walk a mapping's cached page list, reporting which exit it took.
+/// Re-walks the cached page list and reports which exit it took.
 pub fn type4_pages_witness<H: HostMemory>(
     state: &DeviceState,
     host: &H,

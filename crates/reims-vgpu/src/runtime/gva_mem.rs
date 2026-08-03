@@ -292,20 +292,6 @@ fn latch_key(task_id: u32, other: u32, loc: &std::panic::Location<'_>) -> u64 {
     h.finish()
 }
 
-/// Product GVA write: HostOps `map_pages` only (no `write_gpa` walk).
-///
-/// Full-span packed view when possible; otherwise **multi-import** maximal
-/// packed GPA runs ([`crate::runtime::gva_view::write_span_within`]). Fails closed when
-/// any page is unmapped or a run cannot be mapped — that walk is the whole
-/// bound on this write. Always-on: `gva_write fail reason=…`, carrying the
-/// check `write_span` actually refused on rather than a reason chosen here.
-///
-/// `#[track_caller]` so the always-on lines can name **which** of the fifteen
-/// product call sites issued the write. The reason and the writer were both
-/// unattributable before: a refusal or a gate census named a task, an address
-/// and a length, and finding the code that produced them meant guessing from
-/// the size. Reading `Location::caller()` keeps that a reading — the callee
-/// asks who called it, rather than each caller passing a label it chose.
 /// Whether any page of `[gva, gva+span)` resolves under `task_id`'s tables.
 ///
 /// Separates "there is nowhere to put this" from "putting it there went wrong",
@@ -337,6 +323,20 @@ pub fn any_task_gva_page_resolves<M: HostMemory>(
     found
 }
 
+/// Product GVA write: HostOps `map_pages` only (no `write_gpa` walk).
+///
+/// Full-span packed view when possible; otherwise **multi-import** maximal
+/// packed GPA runs ([`crate::runtime::gva_view::write_span_within`]). Fails closed when
+/// any page is unmapped or a run cannot be mapped — that walk is the whole
+/// bound on this write. Always-on: `gva_write fail reason=…`, carrying the
+/// check `write_span` actually refused on rather than a reason chosen here.
+///
+/// `#[track_caller]` so the always-on lines can name **which** of the fifteen
+/// product call sites issued the write. The reason and the writer were both
+/// unattributable before: a refusal or a gate census named a task, an address
+/// and a length, and finding the code that produced them meant guessing from
+/// the size. Reading `Location::caller()` keeps that a reading — the callee
+/// asks who called it, rather than each caller passing a label it chose.
 #[track_caller]
 pub fn write_task_gva_product<H: HostMemory + crate::runtime::host::HostOps>(
     state: &mut crate::model::DeviceState,

@@ -492,14 +492,6 @@ pub fn host_ptr_for_span<H: HostMemory + HostOps>(
     Some((p, avail))
 }
 
-/// Write `buf` into guest `[gva, gva+buf.len())` via HostOps map_pages.
-///
-/// **Writes never reuse a cached view.** A registered `gva_host_views` entry
-/// goes stale the moment the guest rewires its task PT (tile/page recycle)
-/// and is only retired when the Unmap/Map2 notify drains — a write through
-/// it lands in whatever now owns those host pages (guest heap corruption:
-/// the 2026-07-19 WindowServer SIGSEGV class). Every write walks the PT at
-/// write time: packed spans map once, fragmented spans multi-import per run.
 /// Pages a deferred write is allowed to reach, or `None` for a write whose
 /// authorisation is the command that issued it.
 pub type WindowPages<'a> = Option<&'a std::collections::HashSet<u64>>;
@@ -525,6 +517,13 @@ fn span_within_window(gpas: &[u64], allowed: WindowPages<'_>) -> bool {
 
 /// Write `buf` into guest `[gva, gva+buf.len())`, bounded to the pages a
 /// deferred window was armed on.
+///
+/// **Writes never reuse a cached view.** A registered `gva_host_views` entry
+/// goes stale the moment the guest rewires its task PT (tile/page recycle)
+/// and is only retired when the Unmap/Map2 notify drains — a write through
+/// it lands in whatever now owns those host pages (guest heap corruption:
+/// the 2026-07-19 WindowServer SIGSEGV class). Every write walks the PT at
+/// write time: packed spans map once, fragmented spans multi-import per run.
 pub fn write_span_within<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut H,
