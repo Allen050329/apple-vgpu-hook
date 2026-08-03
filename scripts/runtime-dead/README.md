@@ -110,4 +110,20 @@ Files at 0.00% function coverage: `runtime/icb/mod.rs`, `runtime/fence_exec.rs`,
 `runtime/mipmap.rs`, `runtime/heap_query.rs`, `runtime/plan/event_sync.rs`,
 `backend/vulkan/engine/draw_preparation.rs`.
 
-None of those six were deleted on the strength of this number.
+## All six 0.00% files have been adjudicated. None is a deletion.
+
+Do not re-run this. Each was traced upward to the decode dispatch arm that
+reaches it, and each named the guest action that would take it:
+
+| file | why it is zero | the guest action that takes it |
+|---|---|---|
+| `runtime/icb/mod.rs` | already priced, five boots behind it | indirect command buffers, type-7 tag `0x36` |
+| `runtime/heap_query.rs` | Vulkan host has no Metal device, so it answers `NoMetalDevice` | `CmdHeapTextureSizeAndAlign`, child-FIFO config op `0x40` — `[MTLDevice heapTextureSizeAndAlignForDescriptor:]` |
+| `runtime/mipmap.rs` | a window drag creates no multi-mip textures | blit opcode `0x133 generateMipmaps` |
+| `runtime/plan/event_sync.rs` | pure planning behind `fence_exec`; same reason | Metal events and encoder fences, segment type 3 and the blit/compute/render fence fields |
+| `runtime/fence_exec.rs` | the sole executor for the above; this workload issued no cross-encoder sync | same |
+| `backend/vulkan/engine/draw_preparation.rs` | it is the decline type — no draw failed preparation | nothing; a firing here *is* the bug |
+
+Two of the six (`icb`, `draw_preparation`) are healthy-zero alarms; the other
+four are real opcodes this one workload does not issue. That ratio is the point:
+the instrument's yield is a map of the contract, not a list of things to cut.
