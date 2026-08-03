@@ -112,21 +112,6 @@ impl HostGpuCaps {
         )
     }
 
-    /// Summary for a device that only **consumes** finished frames — the host
-    /// window's `VkDevice`, which on a hybrid host may be a different physical
-    /// GPU than the engine's. Omits the heap sizes: they describe how guest
-    /// memory reaches the GPU, which is the engine device's job.
-    pub fn consumer_line(&self, device_name: &str) -> String {
-        format!(
-            "vk_caps role=consumer api={} baseline={} memory={} memory_signal={} portability_subset={} type={:?} name={device_name:?}",
-            api_floor::version_str(self.device_api_version),
-            api_floor::version_str(api_floor::MIN_SUPPORTED_API),
-            self.memory.topology.slug(),
-            self.memory.signal.slug(),
-            self.portability_subset,
-            self.device_type,
-        )
-    }
 }
 
 #[cfg(test)]
@@ -182,17 +167,6 @@ mod tests {
             caps(vk::API_VERSION_1_2, &fixtures::apple_m3_max()).selection_line("Apple M3 Max");
         assert!(line.contains("memory=unified"), "{line}");
         assert!(line.contains("memory_signal="), "{line}");
-    }
-
-    /// The consumer line answers for the window's own device and does not
-    /// restate the engine's heap classification, which would contradict the
-    /// engine's line for the same GPU on a hybrid host.
-    #[test]
-    fn consumer_line_omits_the_engine_only_fields() {
-        let line = caps(vk::API_VERSION_1_2, &fixtures::intel_igpu()).consumer_line("iGPU");
-        assert!(line.contains("role=consumer"), "{line}");
-        assert!(line.contains("memory=unified"), "{line}");
-        assert!(!line.contains("device_local_mb"), "{line}");
     }
 
     /// Quirks are derived from portability-subset in ONE place, so no other

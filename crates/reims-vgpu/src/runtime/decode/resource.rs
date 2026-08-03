@@ -984,8 +984,36 @@ pub fn decode_texture_descriptor(bytes: &[u8]) -> Result<TextureDescriptor, Deco
         if declared_levels > 1 {
             let mut rec_off = TEXTURE_DESC_LEVEL_RECORDS;
             let max_extra = (declared_levels as usize - 1).min(TEXTURE_MAX_MIP_LEVELS - 1);
+            // Both truncations below leave `mipmap_level_count` at what the
+            // guest declared while `levels` holds fewer, so `level(n)` answers
+            // `None` for a level the descriptor named. That is a level of a
+            // texture this device will not sample or blit, and it has to be
+            // legible as a drop rather than as an absence.
+            if declared_levels as usize - 1 > max_extra
+                && crate::observe::first_sight(
+                    "texture_desc_levels_over_cap",
+                    u64::from(declared_levels),
+                )
+            {
+                crate::observe::fail(format!(
+                    "texture_desc_levels_over_cap declared={declared_levels} \
+                     cap={TEXTURE_MAX_MIP_LEVELS}"
+                ));
+            }
             for _ in 0..max_extra {
                 if rec_off + TEXTURE_DESC_MIP_LEVEL_RECORD_LEN > bytes.len() {
+                    if crate::observe::first_sight(
+                        "texture_desc_level_record_short",
+                        u64::from(declared_levels),
+                    ) {
+                        crate::observe::fail(format!(
+                            "texture_desc_level_record_short declared={declared_levels} \
+                             decoded={} rec_off={rec_off} len={} \
+                             (body ends before a level record the descriptor named)",
+                            out.levels.len(),
+                            bytes.len()
+                        ));
+                    }
                     break;
                 }
                 let rec = &bytes[rec_off..rec_off + TEXTURE_DESC_MIP_LEVEL_RECORD_LEN];
@@ -2766,6 +2794,56 @@ mod tests {
         assert_eq!(gva1, ((0x20u64) << RESOURCE_PAGE_SHIFT) + 0x2000);
         assert_eq!(lay1.width, 32);
         assert!(d.level_gva(2, PAGE_SHIFT_ARM64E).is_none());
+    }
+
+    /// A mip level the descriptor named but the body does not reach is a drop,
+    /// and it says so.
+    ///
+    /// `mipmap_level_count` keeps what the guest declared while `levels` holds
+    /// fewer, so `level(n)` answers `None` for a level that was named — the same
+    /// answer it gives for a level that was never named at all. Without a line
+    /// here the two are indistinguishable, and the first is a texture level this
+    /// device will not sample or blit.
+    ///
+    /// The unshifted-format fallback that used to sit under this case is gone
+    /// too, so a body this short reports no format rather than reading bytes
+    /// 86..88 — which for a multi-mip body are inside level record 1, not the
+    /// format trailer.
+    #[test]
+    fn a_level_record_the_body_does_not_reach_is_reported_not_dropped() {
+        use crate::contract::endian::{st16, st32, st64};
+        // Declares 3 levels but carries only L0's geometry prefix and one
+        // record's worth of room — L2's record runs past the end.
+        let body = TEXTURE_DESC_LEVEL_RECORDS + TEXTURE_DESC_MIP_LEVEL_RECORD_LEN;
+        let mut b = vec![0u8; body];
+        st64(&mut b[0..], 0x20000);
+        st32(&mut b[8..], 0x20);
+        st16(&mut b[TEXTURE_DESC_MIPMAP_LEVEL_COUNT..], 3);
+        st32(&mut b[TEXTURE_DESC_USED_SIZE..], 64 * 32 * 4);
+        st32(&mut b[TEXTURE_DESC_ROW_STRIDE..], 256);
+        st32(&mut b[TEXTURE_DESC_WIDTH..], 64);
+        st32(&mut b[TEXTURE_DESC_HEIGHT..], 32);
+        let rec = TEXTURE_DESC_LEVEL_RECORDS;
+        st32(&mut b[rec + TEXTURE_LEVEL_WIDTH..], 32);
+        st32(&mut b[rec + TEXTURE_LEVEL_HEIGHT..], 16);
+
+        let cap = crate::observe::FailCapture::start();
+        let d = decode_texture_descriptor(&b).unwrap();
+        assert_eq!(d.mipmap_level_count, 3, "the declaration is preserved");
+        assert_eq!(d.levels.len(), 2, "only two records are reachable");
+        assert!(d.level(2).is_none());
+        let short = cap
+            .lines()
+            .into_iter()
+            .find(|l| l.starts_with("texture_desc_level_record_short"))
+            .expect("a level the body does not reach must be reported");
+        assert!(
+            short.contains("declared=3") && short.contains("decoded=2"),
+            "the line must name both counts: {short}"
+        );
+        // Same body: the format trailer sits past the end, so there is no
+        // format rather than two bytes read out of a level record.
+        assert!(!d.has_pixel_format, "no format is better than a wrong one");
     }
 
     #[test]
