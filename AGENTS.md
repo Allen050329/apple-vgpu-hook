@@ -353,8 +353,32 @@ The Vulkan backend must support all four memory/DMA cells:
 Vulkan 1.2 is the baseline. Anything above Vulkan 1.2 must have a fallback or a capability-gated
 path. Gate on capabilities, not vendor names, driver names, or API-version assumptions.
 
-Host-pointer imports must stay windowed. Do not import the whole guest RAM VMA for GPU DMA; it pins
-host RAM. Use the existing capped window resolver.
+**Host-pointer imports are not windowed any more — they are forbidden.** `VK_EXT_external_memory_host`
+must never be asked for, and Metal's `newBufferWithBytesNoCopy` may alias only this process's own
+bytes. Importing a host pointer over guest RAM gives the host GPU read *and write* access to the
+guest VM's memory, and that is a property of the mechanism rather than of how much of it is used —
+so the bound is "never requested", not a budget. The whole subsystem was deleted in `018499e`
+(Vulkan) and `4fd4695` (the Metal texture that aliased guest RAM), and both invariants are enforced
+by `crates/reims-vgpu/tests/guest_ram_isolation.rs`.
+
+Do not go looking for a "capped window resolver". There isn't one — it went with `018499e`, and this
+paragraph said to use it for a day because `967894a` reset this file over the correction `b3df160`
+had already made. That is worse than a broken link: it names a plausible mechanism, so a reader
+spends the session hunting for it instead of concluding it is gone. What *does* hand back a host
+pointer is `runtime/gva_view.rs::ensure_gva_view`, which is not a window resolver — it requires the
+span to be **one** contiguous page run and returns `None` otherwise, which on x86 is nearly always
+(a 12-bit page shift fragments almost everything).
+
+The temptation recurs, so the reason it is still not the route: the render deferred-flush rail is the
+largest cost in the device (~73% of the drain worker's budget, 86% of it bytes), and a GPU-direct
+write into guest pages would erase it. `storage_flush.rs` names that endgame and also its own
+qualifier — "available only where the host GPU can address host memory". Beyond the policy, x86 has
+an independent blocker: `reims_vgpu_pci_map_pages` only *translates*, returning a pointer when the
+GPA list is already host-contiguous, so a fragmented IOSurface has no contiguous host VA to import
+at all. arm64 can build one with `mach_vm_remap`, but it is transient (`map_pages_stable = 0`) and
+must not be retained in an import. Neither pathway has both properties. The routes that are not
+blocked on any of this are the ones `storage_flush.rs` names: make the undeclared guest read
+observable so the writeback becomes demand-driven, and split the readback asynchronously.
 
 ## Verification
 
