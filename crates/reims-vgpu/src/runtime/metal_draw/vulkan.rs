@@ -2973,7 +2973,7 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
 /// distinct fail lines        15          (same boot as the 360)
 /// ```
 ///
-/// Every sample was 64x64 on `rung=guest_memo`, which is the icon-cell geometry
+/// Every sample was 64x64 on the guest-memo rung, which is the icon-cell geometry
 /// this section was written to chase. What that does *not* establish is a
 /// regression: the readings above came from `icon-boot-ab.sh`'s round harness on
 /// an older binary, and this is a different workload on a different build, so
@@ -2984,13 +2984,8 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
 /// What it does establish is that the "0"s above cannot be reasoned from as
 /// though the class had stopped happening. On the general workload it happens
 /// roughly three hundred times a boot.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the census line carries the identity of the sample it scored"
-)]
 fn note_guest_rung_blank(
     state: &DeviceState,
-    rung: &'static str,
     task_id: u32,
     texture_ref: u32,
     gva: u64,
@@ -2998,10 +2993,7 @@ fn note_guest_rung_blank(
     h: u32,
     rgba: &[u8],
 ) {
-    crate::runtime::drain::note_store_route(match rung {
-        "guest_memo" => "lin_rung_guest_memo",
-        _ => "lin_rung_guest_native",
-    });
+    crate::runtime::drain::note_store_route("lin_rung_guest_memo");
     if rgba.is_empty() || rgba.iter().any(|&b| b != 0) {
         return;
     }
@@ -3016,7 +3008,7 @@ fn note_guest_rung_blank(
         gva ^ ((w as u64) << 32) ^ h as u64,
     ) {
         crate::observe::off(format!(
-            "lin_rung_guest_blank rung={rung} task={task_id} ref={texture_ref} gva={gva:#x} {w}x{h}"
+            "lin_rung_guest_blank task={task_id} ref={texture_ref} gva={gva:#x} {w}x{h}"
         ));
     }
     if !crate::runtime::surface_cache::has_gva(state, gva, w, h) {
@@ -3028,7 +3020,7 @@ fn note_guest_rung_blank(
         gva ^ ((w as u64) << 32) ^ h as u64,
     ) {
         crate::observe::fail(format!(
-            "lin_rung_blank_with_host_entry rung={rung} task={task_id} ref={texture_ref} \
+            "lin_rung_blank_with_host_entry task={task_id} ref={texture_ref} \
              gva={gva:#x} {w}x{h} bytes={} (guest alias is zero and the host cache has this span)",
             rgba.len()
         ));
@@ -3089,7 +3081,7 @@ pub(super) fn load_linear_from_host_caches<M: HostMemory + HostOps>(
     if let Some((rgba, identity, byte_format)) =
         load_linear_guest_memoized(state, host, task_id, tex, gva, w, h)
     {
-        note_guest_rung_blank(state, "guest_memo", task_id, texture_ref, gva, w, h, &rgba);
+        note_guest_rung_blank(state, task_id, texture_ref, gva, w, h, &rgba);
         return Some((w, h, rgba, identity, byte_format));
     }
     // There is deliberately no second guest rung under the memo. One used to
