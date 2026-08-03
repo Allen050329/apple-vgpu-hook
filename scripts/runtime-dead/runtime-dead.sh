@@ -129,22 +129,33 @@ llvm-cov export --instr-profile="$OUT_DIR/merged.profdata" "$QEMU_BIN" \
     --format=text "${sources[@]}" > "$OUT_DIR/export.json" 2>/dev/null
 
 # Every function whose counter stayed at zero, with the file it lives in.
+#
+# The source list passed to `llvm-cov export` restricts the per-file summaries
+# and NOT the function list — a bare walk of data[].functions reports every
+# monomorphization in every dependency, which on this binary is 54 210 rather
+# than the ~1 000 that are ours. Filter on the filenames each function actually
+# spans.
 python3 - "$OUT_DIR/export.json" "$OUT_DIR/never-ran.txt" <<'PY'
 import json, sys
+
+MARK = "/crates/reims-vgpu/src/"
 data = json.load(open(sys.argv[1]))
-rows = []
+rows, ours = [], 0
 for export in data["data"]:
     for fn in export.get("functions", []):
+        spans = [f for f in fn["filenames"] if MARK in f]
+        if not spans:
+            continue
+        ours += 1
         if fn["count"]:
             continue
-        files = ", ".join(sorted({f.split("/crates/reims-vgpu/src/")[-1]
-                                  for f in fn["filenames"]}))
+        files = ", ".join(sorted({f.split(MARK)[-1] for f in spans}))
         rows.append((files, fn["name"]))
 rows.sort()
 with open(sys.argv[2], "w") as out:
     for path, name in rows:
         out.write(f"{path}\t{name}\n")
-print(f"runtime-dead: {len(rows)} functions never ran")
+print(f"runtime-dead: {len(rows)} of {ours} functions never ran")
 PY
 
 echo
