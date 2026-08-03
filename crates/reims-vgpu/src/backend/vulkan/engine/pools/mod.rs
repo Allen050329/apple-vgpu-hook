@@ -771,6 +771,22 @@ const IDLE_TARGET_DRAIN_MAX_PER_CALL: usize = 4;
 /// have their own pin lifecycle and working-set profile, and were never part of
 /// the deferred-present pin-burst class that motivated the target-cap change.
 const COMPUTE_STORAGE_REGISTRY_CAP: usize = 64;
+/// Entries in the exact-content sampled cache.
+///
+/// **This is the cap that evicts, and its sibling never does.** Measured on one
+/// driven x86/PCI boot over a full `visual-gate` run:
+/// `sampled_evict_count_cap = 2436`, `sampled_evict_byte_cap` **absent** — the
+/// byte cap below is three orders of magnitude from being reached and has never
+/// fired. Over the same boot: 7264 identity hits, 976 content hits, 1657 misses.
+///
+/// What that closes and what it does not. It closes "is there any capacity
+/// pressure at all": there is, and it is entirely this constant. It does **not**
+/// close whether the 1657 misses are that pressure — an eviction of an entry
+/// nothing asks for again costs nothing, and nothing here distinguishes a miss
+/// for evicted content from a miss for content never held. The A/B the
+/// frame-rate plan budgets for — raise this to 256, read
+/// `sampled_cache_misses` — is what answers that, and it is now licensed rather
+/// than speculative.
 const SAMPLED_CACHE_CAP: usize = 64;
 const SAMPLED_CACHE_BYTE_CAP: usize = 128 * 1024 * 1024;
 /// Max recycled sampled slots retained per geometry key in `sampled_free`. A
