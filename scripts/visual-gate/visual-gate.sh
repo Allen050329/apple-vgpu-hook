@@ -134,7 +134,22 @@ run_probe() {
   verdict=$(grep -v '^[[:space:]]*$' "$log" | tail -1)
   printf '%s\t%s\t%s\n' "$name" "$rc" "$verdict" >>"$WORK/verdicts"
   say "  $name exit=$rc: $verdict"
+  # A count of failures is not a diagnosis. The probes name the region, the
+  # trial and the colour they measured on their own lines, and without those a
+  # reader has to re-run with --keep to learn anything — by which time the boot
+  # that produced the failure is gone. Bounded because a probe that fails every
+  # trial would otherwise bury its own verdict.
+  if [ "$rc" != 0 ]; then
+    grep -v '^[[:space:]]*$' "$log" | head -n -1 | tail -"$FINDING_LINES" \
+      | sed "s/^/visual-gate:     /"
+  fi
 }
+
+# Findings echoed from a failing probe. Ten covers every trial of a `--quick`
+# run and the first ten of a full one, which is enough to see whether one region
+# is failing repeatedly or every region failed once — a distinction that decides
+# where to look next.
+FINDING_LINES="${FINDING_LINES:-10}"
 
 : >"$WORK/verdicts"
 # --keep is passed down only when this gate was asked to keep, so a failing run
