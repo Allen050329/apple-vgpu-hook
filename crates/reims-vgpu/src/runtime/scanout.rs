@@ -1195,8 +1195,7 @@ mod tests {
     /// Bare, three of these belonged to other rails too — `unmapped` and
     /// `short_view` to the guest-page import path and `no_mapping` to the type-5
     /// loader — so a `grep reason=unmapped` over one boot returned a mix of
-    /// subsystems. Crate-wide distinctness is `observe::gate`'s job; the prefix is
-    /// this module's.
+    /// subsystems. The prefix is what makes that grep answerable.
     #[test]
     fn every_capture_reason_names_its_rail_and_is_distinct() {
         use crate::observe::Decline as _;

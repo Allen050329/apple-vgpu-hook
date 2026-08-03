@@ -44,8 +44,6 @@
 pub mod decline;
 pub mod emit;
 pub mod footprint;
-#[cfg(test)]
-mod gate;
 pub mod phase_clock;
 pub mod sink;
 

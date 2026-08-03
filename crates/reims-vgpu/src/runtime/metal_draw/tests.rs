@@ -463,7 +463,7 @@ fn index_load_failures_report_the_specific_reason() {
 
 /// Eleven checks, eleven names, one namespace.
 ///
-/// Crate-wide distinctness is `observe::gate`'s job; what this asserts is the
+/// What this asserts is the
 /// *prefix*, because bare names (`out_of_bounds`, `read_fail`) would match
 /// three other rails on a `grep reason=` and the reader could not tell an
 /// index buffer from a blit row.

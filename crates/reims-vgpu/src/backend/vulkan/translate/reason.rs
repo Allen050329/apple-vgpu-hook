@@ -92,8 +92,8 @@ impl crate::observe::Decline for TranslateReason {
     /// This was an inherent method with a per-enum uniqueness test, which is how
     /// `unknown_pixel_format` came to be claimed by `runtime/heap_query`'s
     /// `QueryError` as well: both enums were internally consistent and nothing
-    /// compared them. Implementing the crate trait puts every slug here under
-    /// `observe::gate`'s crate-wide checks.
+    /// compared them. Implementing the crate trait gives every slug here one
+    /// vocabulary to be distinct within.
     fn slug(&self) -> &'static str {
         match self {
             Self::UnknownPixelFormat(_) => "unknown_pixel_format",

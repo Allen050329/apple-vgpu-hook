@@ -440,9 +440,8 @@ mod tests {
     #[test]
     fn every_refusal_in_this_decoder_carries_a_registered_slug() {
         use crate::observe::Refusal;
-        // The registry row is checked crate-wide by `observe::gate`; what this
-        // test pins is the local half — that no site returns a refusal whose
-        // payload is empty or absent, which would render `reason=` bare.
+        // What this pins is that no site returns a refusal whose payload is
+        // empty or absent, which would render `reason=` bare.
         for status in [
             DecodeStatus::ErrArgs("stream_seg_cursor_past_end"),
             DecodeStatus::ErrShort("stream_seg_short_header"),

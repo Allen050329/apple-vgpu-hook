@@ -1400,7 +1400,7 @@ type SampleWindowDesc = (u32, u32, u32, u32, u32);
 /// capture, guest-page import and this loader — that the last present-rail
 /// migration recorded as still sharing the word. The `type5_view_` prefix keeps
 /// `grep reason=type5_view_…` answerable against the copy path that shares the
-/// surface; crate-wide distinctness is `observe::gate`'s job.
+/// surface.
 #[cfg(feature = "backend-vulkan")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Type5ViewDecline {
@@ -3567,9 +3567,7 @@ enum M2vDrawSpan {
 ///
 /// Reachability is not uniform and must be read that way. `import` requires the
 /// engine to have enabled a host-pointer import, and there is no longer any code
-/// that could: the whole `VK_EXT_external_memory_host` subsystem is deleted and
-/// `observe::gate::the_host_pointer_import_extension_is_never_requested` fails
-/// the build of any source that names it back into existence. So `import` is
+/// that could: the whole `VK_EXT_external_memory_host` subsystem is deleted. So `import` is
 /// unreachable, and `rgba_not_import` is its complement's complement — with the
 /// import never allowed, `type11_cpu_store_fallback_allowed` is always true and
 /// that arm cannot be entered either. Both are kept as call sites so their

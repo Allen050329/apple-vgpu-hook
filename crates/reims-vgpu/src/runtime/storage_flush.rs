@@ -897,9 +897,9 @@ pub fn flush_linear_windows_before_fence<M: HostMemory + HostOps>(
 ///   `UFFD_PAGEFAULT_FLAG_WRITE`, and a rail that ignores it will conclude the
 ///   guest reads everything.
 /// - Arming a page this device is about to write itself is a fault this rail
-///   caused, and `observe::gate`'s `MAP_PAGES_SITES` is the authority
-///   on which code writes guest RAM — not a grep, which has already missed
-///   `gva_view::map_fresh_span_within` once.
+///   caused, so the arming site has to know every rail that writes guest RAM —
+///   and a grep for that has already missed `gva_view::map_fresh_span_within`
+///   once.
 /// - Punching a page out loses whatever the guest had put there, so the content
 ///   to fill with has to be captured before the punch, not after.
 ///
@@ -1091,10 +1091,9 @@ pub fn flush_mapping_windows_before_fence<M: HostMemory + HostOps>(
     // whole rect is worth 0.66%.
     //
     // Moving the bytes without a CPU pass is closed too, and by policy rather
-    // than by measurement: it needs `VK_EXT_external_memory_host`, which
-    // `observe::gate::the_host_pointer_import_extension_is_never_requested`
-    // forbids because importing a host pointer over guest RAM gives the host GPU
-    // write access to guest memory.
+    // than by measurement: it needs `VK_EXT_external_memory_host`, which this
+    // pathway does not request, because importing a host pointer over guest RAM
+    // gives the host GPU write access to guest memory.
     //
     // Flushing *fewer times* is closed as well, and by the same witness.
     // [`crate::model::RenderFlushWitness::landed_us`] buckets how long each
