@@ -3065,15 +3065,21 @@ mod tests {
         assert_eq!(all.len(), 1);
     }
 
-    /// `color_attachments` is a dense prefix whose `slot` is its own index.
+    /// An entry that omits [`COLOR_ATTACHMENT_TAG_INDEX`] falls back to its
+    /// position, and still carries its own state.
     ///
-    /// This is the property every consumer's `find(|a| a.slot == c.slot)` rests
-    /// on, and the reason an `or_else(first())` beside one of those is not a
-    /// harmless belt-and-braces: because entry 0 always carries slot 0, `find`
-    /// can never miss for slot 0, so such a fallback is reachable *only* for a
-    /// secondary slot that has no entry — the one case where answering with
-    /// slot 0's state invents it. Each slot here carries a distinct `dst_rgb`
-    /// so borrowing entry 0's would be visible rather than coincidentally equal.
+    /// This pins the fallback arm specifically: no entry here declares an
+    /// index, which is the only reason these slots come out as a dense prefix.
+    /// The arm where the guest does declare one is
+    /// `a_colour_attachment_takes_the_slot_the_guest_declared`.
+    ///
+    /// Either way `slot` is what every consumer's `find(|a| a.slot == c.slot)`
+    /// rests on, and that is why an `or_else(first())` beside one of those is
+    /// not a harmless belt-and-braces: with an entry on slot 0, `find` cannot
+    /// miss for slot 0, so such a fallback is reachable *only* for a secondary
+    /// slot that has no entry — the one case where answering with slot 0's
+    /// state invents it. Each slot here carries a distinct `dst_rgb` so
+    /// borrowing entry 0's would be visible rather than coincidentally equal.
     #[test]
     fn colour_attachment_slots_are_their_own_index_and_carry_their_own_state() {
         use crate::contract::endian::st32;
@@ -3096,7 +3102,10 @@ mod tests {
         let all = parse_color_attachments(&buf, buf.len(), off);
         assert_eq!(all.len(), 3, "all three entries are in range");
         for (i, a) in all.iter().enumerate() {
-            assert_eq!(a.slot, i as u32, "slot is the entry index");
+            assert_eq!(
+                a.slot, i as u32,
+                "an entry declaring no index keeps its position"
+            );
             assert_eq!(a.dst_rgb, 10 + i as u32, "each slot keeps its own state");
         }
         // What a consumer's `find` must return, and what `first()` would.
