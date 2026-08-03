@@ -1096,6 +1096,17 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
     let tight = tight as usize;
     let mut native = vec![0u8; tight];
     let mut seed_native = vec![0u8; tight];
+    // Deferred-writeback flush-on-access, as at every other read/write entry in
+    // this file — the module doc for `storage_flush` names them all as choke
+    // points. It has to be here rather than on one arm: the fragmented arm ends
+    // in `mapper::write_mapping_bytes`, which flushes, while the
+    // `contig_for_write` arm is a raw `copy_nonoverlapping` into the mapped span
+    // and flushes nothing. Whether an armed window landed before or after this
+    // write therefore depended on whether the guest's pages happened to be
+    // contiguous, and landing after puts an older frame on top of this one —
+    // which `mapper::write_mapping_bytes_only` states as its own reason for
+    // flushing here.
+    crate::runtime::storage_flush::flush_intersecting(state, host, mapping_id, base_off, span_end);
     // One proof for the whole image: the changed-span loop below writes each
     // differing row separately, and the walk is a translation per page.
     let Some(vouched) = vouch_for_write(state, host, mapping_id, "rgba8_changed") else {
@@ -1764,6 +1775,14 @@ fn write_rect_raw_at_impl<M: HostMemory + HostOps>(
         ));
         return false;
     }
+    // Deferred-writeback flush-on-access, for the same reason and on the same
+    // split as `write_rgba8_image_changed`: the fragmented arms below flush
+    // through `mapper::write_mapping_bytes` and the contiguous one does not, so
+    // without this an armed window could land on top of this rect on packed
+    // surfaces only. Safe to call from inside a flush — the storage rail reaches
+    // this function through `write_full_rect_raw_at`, and `flush_intersecting`
+    // removes intersecting windows up front so the nested call finds nothing.
+    crate::runtime::storage_flush::flush_intersecting(state, host, mapping_id, base_off, span_end);
     let Some(vouched) = vouch_for_write(state, host, mapping_id, "rect_raw") else {
         return false;
     };
@@ -1912,6 +1931,104 @@ mod tests {
     /// Every row must land at its own offset, with content that can tell rows
     /// apart.
     ///
+    /// Both write entries drain the mapping's armed deferred windows first, on
+    /// **both** storage shapes.
+    ///
+    /// `storage_flush`'s module doc names "`mapping_write` read/write entries"
+    /// as choke points, and five of them took the flush. These two did not, and
+    /// the consequence was shape-dependent rather than absent: their fragmented
+    /// arm reaches `mapper::write_mapping_bytes`, which flushes, while their
+    /// contiguous arm is a raw `copy_nonoverlapping` that does not. So on a
+    /// packed surface the window stayed armed and landed *after* the write,
+    /// putting an older frame on top of the one just written — the outcome
+    /// `mapper::write_mapping_bytes_only` gives as its own reason for flushing.
+    ///
+    /// Asserting on the armed window rather than on pixels is deliberate: the
+    /// window landing late is the mechanism, and a pixel assertion would depend
+    /// on which frame the fixture happened to arm.
+    #[test]
+    fn the_write_entries_drain_armed_windows_on_both_storage_shapes() {
+        use crate::model::PAGE_SHIFT_X86;
+        const PAGE: u64 = 1 << PAGE_SHIFT_X86;
+        const W: u32 = 16;
+        const H: u32 = 16;
+        const BPR: u32 = W * 4;
+
+        let arm = |state: &mut DeviceState| {
+            let key = crate::model::ComputeStorageResidencyKey {
+                mapping_id: 5,
+                map_generation: state.mappings.get(&5).map(|m| m.map_generation).unwrap_or(0),
+                surface_offset: 0,
+                surface_bpr: BPR,
+                span_end: (W * H * 4) as u64,
+                width: W,
+                height: H,
+                pixel_format: MTL_FORMAT_BGRA8_UNORM,
+                texture_ref: 0,
+            };
+            state.compute_deferred_flush.insert(
+                key,
+                crate::model::DeferredOwner::Render {
+                    armed_seq: 0,
+                    armed_stamp_seq: 0,
+                    source: crate::model::RenderWindowSource::Owned(std::sync::Arc::new(vec![
+                        0u8;
+                        (W * H * 4) as usize
+                    ])),
+                },
+            );
+        };
+
+        for packed in [true, false] {
+            for entry in ["rect", "rgba8_changed"] {
+                let mut state = DeviceState::new(DeviceId(4), PAGE_SHIFT_X86);
+                let mut host = FakeHost::new();
+                host.strict_linux_map = !packed;
+                let base_pfn = 0x80u32;
+                host.map_range((base_pfn as u64) << PAGE_SHIFT_X86, 4 * PAGE as usize, 0);
+                let order: Vec<u32> = if packed { (0..4).collect() } else { vec![3, 2, 1, 0] };
+                let entries: Vec<u32> = order
+                    .iter()
+                    .map(|i| ((base_pfn + i) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID)
+                    .collect();
+                state.map_surface(5);
+                state.attach_mapping_internal(5, 0);
+                let m = state.mappings.get_mut(&5).unwrap();
+                m.mapping_internal = 1;
+                m.page_entries = entries;
+                assert!(state.set_mapping_geom(5, W, H, MTL_FORMAT_BGRA8_UNORM));
+                arm(&mut state);
+                assert!(!state.compute_deferred_flush.is_empty());
+
+                let src = vec![0x33u8; (W * H * 4) as usize];
+                let _ = match entry {
+                    "rect" => write_rect_raw_at(
+                        &mut state,
+                        &mut host,
+                        5,
+                        0,
+                        BPR,
+                        (W * H * 4) as u64,
+                        0,
+                        0,
+                        W,
+                        H,
+                        4,
+                        &src,
+                        BPR,
+                    ),
+                    _ => write_rgba8_image_changed(&mut state, &mut host, 5, &src, None, W, H),
+                };
+
+                assert!(
+                    state.compute_deferred_flush.is_empty(),
+                    "packed={packed} entry={entry}: the write must drain the armed \
+                     window, or it lands afterwards and puts an older frame on top"
+                );
+            }
+        }
+    }
+
     /// A rect taller than the window it names is refused on **both** storage
     /// shapes, and writes nothing past the window.
     ///
