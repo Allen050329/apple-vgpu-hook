@@ -70,6 +70,18 @@ export REIMS_VGPU_COVERAGE="$PROFILE_RT"
 export LLVM_PROFILE_FILE="$OUT_DIR/reims.profraw"
 
 echo "runtime-dead: profile runtime $PROFILE_RT"
+
+# A QEMU still holding :2222 makes the new boot fail its hostfwd and exit
+# immediately, and every later step then measures — or SIGTERMs — the OLD,
+# uninstrumented VM. Refuse rather than guess which one is ours.
+stale="$(ps -eo pid,args | grep '[q]emu-system-x86_64' | awk '{print $1}')"
+if [ -n "$stale" ]; then
+    echo "runtime-dead: a qemu-system-x86_64 is already running (pid $(echo "$stale" | tr '\n' ' '))." >&2
+    echo "runtime-dead: it holds localhost:2222; this boot would fail and the run" >&2
+    echo "runtime-dead: would measure that VM instead. Stop it first (kill by PID)." >&2
+    exit 1
+fi
+
 echo "runtime-dead: booting (instrumented) ..."
 "$REPO_ROOT/vm/boot-x86.sh" --device reims-vgpu-pci --testing > "$OUT_DIR/boot.log" 2>&1 &
 
@@ -94,6 +106,8 @@ for _ in $(seq 1 120); do
 done
 if [ "$guest_up" -eq 0 ]; then
     echo "runtime-dead: guest never answered on macos-vm; see $OUT_DIR/boot.log" >&2
+    # No profile is written for a boot that never ran the device, so kill rather
+    # than pretend this run measured anything.
     kill -TERM "$qemu_pid" 2>/dev/null || true
     exit 1
 fi
