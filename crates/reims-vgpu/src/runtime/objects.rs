@@ -92,9 +92,57 @@ fn note_type4_fail(surface_id: u32, reason: &'static str, detail: String) {
     }
 }
 
+/// The first probe failure of the search in progress, per surface.
+///
+/// A surface lives in exactly one task's object list, so a search that walks
+/// tasks in order meets non-owners before it meets the owner. Those misses are
+/// the search working, not a backing failure, and reporting them as one is what
+/// put ~95 `type4_backing_fail reason=translate` lines on a driven boot's
+/// always-on channel for surfaces that then backed perfectly — the resolve
+/// succeeded on a later task and the line stayed behind to be read as a defect.
+///
+/// So a probe records its reason here and nothing is emitted until the search
+/// runs out of tasks. The first reason is kept rather than the last: it is the
+/// most specific one available, and the tail of a search is dominated by tasks
+/// that simply do not list the surface.
+fn type4_pending_latch(
+) -> &'static std::sync::Mutex<std::collections::HashMap<u32, (&'static str, String)>> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static PENDING: OnceLock<Mutex<HashMap<u32, (&'static str, String)>>> = OnceLock::new();
+    PENDING.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Record why one task's probe refused, to be reported only if none succeeds.
+fn defer_type4_fail(surface_id: u32, reason: &'static str, detail: String) {
+    let mut guard = type4_pending_latch()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    guard.entry(surface_id).or_insert((reason, detail));
+}
+
+/// The search found no task that could back this surface: report the first
+/// probe's reason through the flood latch.
+fn flush_type4_fail(surface_id: u32) {
+    let pending = {
+        let mut guard = type4_pending_latch()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        guard.remove(&surface_id)
+    };
+    if let Some((reason, detail)) = pending {
+        note_type4_fail(surface_id, reason, detail);
+    }
+}
+
 /// Re-arm the type-4 fail latch for a surface that just backed cleanly, so a
-/// later genuine backing failure on the same surface is logged again.
+/// later genuine backing failure on the same surface is logged again, and drop
+/// the probe reasons the successful search left behind.
 fn clear_type4_fail(surface_id: u32) {
+    type4_pending_latch()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&surface_id);
     let mut guard = type4_fail_latch().lock().unwrap_or_else(|e| e.into_inner());
     guard.retain(|(s, _)| *s != surface_id);
 }
@@ -834,7 +882,7 @@ fn apply_type4_backing<M: HostMemory>(
     surf: &Type4Surface,
 ) -> bool {
     if surface_id == 0 || surface_id as usize >= MAX_MAPPINGS {
-        note_type4_fail(
+        defer_type4_fail(
             surface_id,
             "sid_oob",
             format!("type4_backing_fail reason=sid_oob sid={surface_id} task={task_id} max={MAX_MAPPINGS}"),
@@ -844,7 +892,7 @@ fn apply_type4_backing<M: HostMemory>(
     let page_shift = state.page_shift;
     let page_size = page_size_of(page_shift);
     if page_size == 0 {
-        note_type4_fail(
+        defer_type4_fail(
             surface_id,
             "page_size_zero",
             format!("type4_backing_fail reason=page_size_zero sid={surface_id} task={task_id} page_shift={page_shift}"),
@@ -855,7 +903,7 @@ fn apply_type4_backing<M: HostMemory>(
     // No host MiB budget: page count follows guest `surf.length` only.
     // Fail if zero or not host-addressable as a page-entry vector.
     if page_count == 0 || crate::runtime::metal_draw::host_alloc_len(page_count).is_none() {
-        note_type4_fail(
+        defer_type4_fail(
             surface_id,
             "page_count_oob",
             format!(
@@ -868,7 +916,7 @@ fn apply_type4_backing<M: HostMemory>(
     let task = match state.tasks.get(task_id as usize) {
         Some(t) if t.active => t,
         _ => {
-            note_type4_fail(
+            defer_type4_fail(
                 surface_id,
                 "task_inactive",
                 format!("type4_backing_fail reason=task_inactive sid={surface_id} task={task_id}"),
@@ -910,7 +958,7 @@ fn apply_type4_backing<M: HostMemory>(
         let gva = ((surf.backing_pfn as u64) + i) << page_shift;
         let Some(gpa) = gva_mem::translate_task_gva(host, task, gva, page_shift) else {
             crate::runtime::drain::note_store_route("type4_translate_refused");
-            note_type4_fail(
+            defer_type4_fail(
                 surface_id,
                 "translate",
                 type4_translate_fail_detail(
@@ -927,7 +975,7 @@ fn apply_type4_backing<M: HostMemory>(
         gva_hits = gva_hits.saturating_add(1);
         let pfn = gpa >> page_shift;
         if pfn > u32::MAX as u64 {
-            note_type4_fail(
+            defer_type4_fail(
                 surface_id,
                 "pfn_oob",
                 format!("type4_backing_fail reason=pfn_oob sid={surface_id} task={task_id} page={i}/{page_count} gpa={gpa:#x} pfn={pfn:#x}"),
@@ -937,7 +985,7 @@ fn apply_type4_backing<M: HostMemory>(
         let entry = ((pfn as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
         // Sanity: entry_gpa must round-trip.
         if entry_gpa_shift(entry, page_shift) != Some(gpa & !(page_size - 1)) {
-            note_type4_fail(
+            defer_type4_fail(
                 surface_id,
                 "entry_roundtrip",
                 format!("type4_backing_fail reason=entry_roundtrip sid={surface_id} task={task_id} page={i}/{page_count} gpa={gpa:#x} entry={entry:#x}"),
@@ -998,7 +1046,7 @@ fn apply_type4_backing<M: HostMemory>(
     }
 
     if !state.map_surface(surface_id) {
-        note_type4_fail(
+        defer_type4_fail(
             surface_id,
             "map_surface",
             format!("type4_backing_fail reason=map_surface sid={surface_id} task={task_id} n={page_count}"),
@@ -1246,7 +1294,7 @@ fn resolve_type4_surface_ex<M: HostMemory>(
             continue;
         }
         let Some(desc) = read_descriptor(state, host, task_id, &entry) else {
-            note_type4_fail(
+            defer_type4_fail(
                 surface_id,
                 "desc_read",
                 format!(
@@ -1258,7 +1306,7 @@ fn resolve_type4_surface_ex<M: HostMemory>(
         };
         let _ = state.insert_object(task_id, surface_id);
         let Some(surf) = decode_type4_surface(&desc) else {
-            note_type4_fail(
+            defer_type4_fail(
                 surface_id,
                 "desc_decode",
                 format!(
@@ -1349,6 +1397,8 @@ fn resolve_type4_surface_ex<M: HostMemory>(
             return true;
         }
     }
+    // No task could back it. Only now is a probe's refusal a backing failure.
+    flush_type4_fail(surface_id);
     false
 }
 
@@ -1940,11 +1990,23 @@ mod tests {
         };
         assert!(!apply_type4_backing(&mut state, &host, 5, sid, &surf));
         assert!(
+            !type4_fail_latch()
+                .lock()
+                .unwrap()
+                .contains(&(sid, "task_inactive")),
+            "one task's probe is not a backing failure: the search has other \
+             tasks to try, and reporting here is what put `reason=translate` \
+             lines under surfaces that then backed cleanly"
+        );
+        // The search running out of tasks is what turns the probe's reason into
+        // a reported failure.
+        flush_type4_fail(sid);
+        assert!(
             type4_fail_latch()
                 .lock()
                 .unwrap()
                 .contains(&(sid, "task_inactive")),
-            "genuine backing failure must latch a reason slug"
+            "an exhausted search must report the first probe's reason slug"
         );
         // A clean backing on the same surface re-arms the latch.
         clear_type4_fail(sid);
