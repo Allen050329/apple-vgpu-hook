@@ -1399,35 +1399,50 @@ pub fn write_raw_rows<M: HostMemory + HostOps>(
     width: u32,
     height: u32,
 ) -> bool {
-    if width == 0
-        || height == 0
-        || width > MAX_SCANOUT_DIM
-        || height > MAX_SCANOUT_DIM
-        || row_bytes == 0
-        || src_stride < row_bytes
-    {
-        return false;
+    if width == 0 || height == 0 || width > MAX_SCANOUT_DIM || height > MAX_SCANOUT_DIM {
+        return refuse(mapping_id, SurfaceWriteRefusal::Geometry { width, height });
+    }
+    if row_bytes == 0 || src_stride < row_bytes {
+        return refuse(
+            mapping_id,
+            SurfaceWriteRefusal::SourceStride { src_stride, width },
+        );
     }
     let need = (height as u64).saturating_mul(src_stride as u64) as usize;
     if src.len() < need {
-        return false;
+        return refuse(
+            mapping_id,
+            SurfaceWriteRefusal::SourceShort {
+                need,
+                have: src.len(),
+                row: 0,
+            },
+        );
     }
     // Deferred-writeback flush-on-access (coarse: whole mapping — this entry
     // resolves its window only later and is off the hot compute path).
     crate::runtime::storage_flush::flush_intersecting(state, host, mapping_id, 0, u64::MAX);
     let Some(m) = state.mappings.get(&mapping_id) else {
-        return false;
+        return refuse(mapping_id, SurfaceWriteRefusal::MappingAbsent);
     };
     if !m.mapped || m.page_entries.is_empty() {
-        return false;
+        return refuse(mapping_id, SurfaceWriteRefusal::MappingNotResident);
     }
     if m.has_geom && (m.width != width || m.height != height) {
-        return false;
+        return refuse(
+            mapping_id,
+            SurfaceWriteRefusal::GeometryMoved {
+                latched_width: m.width,
+                latched_height: m.height,
+                frame_width: width,
+                frame_height: height,
+            },
+        );
     }
     let span_end = (row_bytes as u64).saturating_mul(height as u64);
     let rb = row_bytes as usize;
     let Some(vouched) = vouch_for_write(state, host, mapping_id, "raw_rows") else {
-        return false;
+        return refuse(mapping_id, SurfaceWriteRefusal::PagesNotOurs);
     };
     if let Some((ptr, _)) = contig_for_write(state, host, mapping_id, span_end, &vouched, src) {
         // SAFETY: contig covers span_end from offset 0.
@@ -1451,7 +1466,10 @@ pub fn write_raw_rows<M: HostMemory + HostOps>(
                 &src[src_off..src_off + rb],
                 &vouched,
             ) {
-                return false;
+                return refuse(
+                    mapping_id,
+                    SurfaceWriteRefusal::MapperWrite { lo: moff, len: rb },
+                );
             }
         }
     }
@@ -3632,6 +3650,83 @@ mod tests {
         assert_eq!(&row[4..8], &[0, 0, 255, 255]);
         // Contrast: Load seed=logo + same rgba would leave logo where equal —
         // not tested here; store_seed_policy gates that path.
+    }
+
+    /// The depth/stencil writeback must name its refusals too.
+    ///
+    /// `write_raw_rows` is the third guest-memory writer in this file and was
+    /// the last one still answering every refusal with a bare `false`. It is
+    /// worse placed than the others to be silent: both callers discard its
+    /// result outright, so nothing above it could report a reason even if it
+    /// wanted to, and the guest work it drops is a `MTLStoreActionStore` on a
+    /// depth/stencil attachment - the mapping simply keeps stale bytes and the
+    /// pass reports success. The colour writeback twenty lines from its caller
+    /// emits for the analogous condition.
+    #[test]
+    fn every_raw_rows_refusal_names_itself() {
+        use crate::runtime::drain::store_route_count;
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut host = FakeHost::new();
+        let pfn = 0x14u32;
+        let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
+        host.map_range(gpa, 0x4000, 0);
+        let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
+        state.map_surface(7);
+        let m = state.mappings.get_mut(&7).unwrap();
+        m.mapped = true;
+        m.mapping_internal = 1;
+        m.page_entries = vec![entry];
+        assert!(state.set_mapping_geom(7, 4, 2, MTL_FORMAT_BGRA8_UNORM));
+        let rows = vec![0u8; 4 * 2 * 4];
+
+        // A zero dimension is not a rect.
+        let n = store_route_count("surface_write_geometry");
+        assert!(!write_raw_rows(
+            &mut state, &mut host, 7, &rows, 16, 16, 0, 2
+        ));
+        assert_eq!(store_route_count("surface_write_geometry"), n + 1);
+
+        // A source pitch that cannot hold one row.
+        let n = store_route_count("surface_write_source_stride");
+        assert!(!write_raw_rows(&mut state, &mut host, 7, &rows, 4, 16, 4, 2));
+        assert_eq!(store_route_count("surface_write_source_stride"), n + 1);
+
+        // The source ends before the rows it declares.
+        let n = store_route_count("surface_write_source_short");
+        assert!(!write_raw_rows(
+            &mut state,
+            &mut host,
+            7,
+            &rows[..8],
+            16,
+            16,
+            4,
+            2
+        ));
+        assert_eq!(store_route_count("surface_write_source_short"), n + 1);
+
+        // No such mapping.
+        let n = store_route_count("surface_write_mapping_absent");
+        assert!(!write_raw_rows(
+            &mut state, &mut host, 4242, &rows, 16, 16, 4, 2
+        ));
+        assert_eq!(store_route_count("surface_write_mapping_absent"), n + 1);
+
+        // The latched geometry is not this frame's.
+        let n = store_route_count("surface_write_geometry_moved");
+        let big = vec![0u8; 8 * 8 * 4];
+        assert!(!write_raw_rows(
+            &mut state, &mut host, 7, &big, 32, 32, 8, 8
+        ));
+        assert_eq!(store_route_count("surface_write_geometry_moved"), n + 1);
+
+        // Unmapped: there is nowhere to write.
+        let n = store_route_count("surface_write_mapping_not_resident");
+        state.mappings.get_mut(&7).unwrap().mapped = false;
+        assert!(!write_raw_rows(
+            &mut state, &mut host, 7, &rows, 16, 16, 4, 2
+        ));
+        assert_eq!(store_route_count("surface_write_mapping_not_resident"), n + 1);
     }
 
     /// Every refusal in `write_rgba8_image_changed` must name itself.
