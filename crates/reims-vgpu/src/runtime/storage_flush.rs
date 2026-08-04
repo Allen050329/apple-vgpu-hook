@@ -581,13 +581,20 @@ pub fn flush_gva_windows_before_fence<M: HostMemory + HostOps>(
 ///
 /// [`flush_gva_one`] pays a private `vkQueueSubmit` and its own fence wait per
 /// window, so a batch of *n* is *n* serialized GPU round trips inside one
-/// completion stamp. That is the number that prices recording each copy into its
+/// completion stamp. That is the number that priced recording each copy into its
 /// draw's own command buffer instead: at a batch of 1 the build saves one
 /// submission's overhead per flush, and at a batch of 8 it collapses eight waits
 /// into the one the tranche already owes.
 ///
-/// `gvaw_fence_flush` cannot answer this — it counts windows, and a hundred
-/// windows landing one-at-a-time and ten landing ten-at-a-time read the same.
+/// **It reads 1, always** — 56 209 of 56 209 on a driven boot, with every other
+/// band at 0 — which is one of the two readings that retired that build. See
+/// [`flush_gva_one`] for the other and for the verdict.
+///
+/// Kept after the verdict rather than removed, because it is the assumption the
+/// verdict rests on and not a number that was consumed once. A workload that
+/// ever lands two windows on one stamp reopens the question, and this is the
+/// only thing that would say so — `gvaw_fence_flush` counts windows, and a
+/// hundred landing one at a time reads the same as ten landing ten at a time.
 /// Banded rather than summed for the reason the draw-list census is: the tail is
 /// the case that matters and a mean hides it.
 ///
@@ -1858,23 +1865,50 @@ pub fn gva_window_identity(
 /// `convert_rgba8_to_row` is a straight copy only for the two RGBA8 formats)
 /// are real but do not need answering, because this one closes it first.
 ///
-/// ## What is left is the round trip
+/// ## What is left is the round trip — and recording the copy does not remove it
 ///
-/// 68% of the rail is a wait for a submission made microseconds earlier, and
-/// the draw's own command buffer is submitted and deliberately *not* waited
-/// (`render_post_wait_skips` equals the draw count). A readback recorded into
-/// that command buffer at arm time would be waited against a fence with the
-/// rest of the tranche to signal rather than one issued a moment ago, and it
-/// keeps the host copy the cache contract requires. That is the build this
-/// rail's numbers point at; it is not attempted here.
+/// The build this rail's numbers used to point at was: record the readback into
+/// the draw's own command buffer at arm time, so it is waited against a fence
+/// with the rest of the tranche to signal rather than one issued a moment ago.
+/// The draw's command buffer is submitted and deliberately *not* waited
+/// (`render_post_wait_skips` equals the draw count), so there was room for it.
 ///
-/// What sizes it is **how many windows one completion fence lands**, which none
-/// of the counters above can say — they all count windows, and a hundred landing
-/// singly reads the same as ten landing ten at a time. The private submit is per
-/// window, so a batch of one saves only that submission's own overhead while a
-/// batch of eight collapses eight serialized round trips into the one the
-/// tranche already owes. `gvaw_fence_batch_*` is that band; read it before
-/// starting the build, because it decides whether the build is worth its risk.
+/// **Measured, it is not worth building.** Two readings close it, both from one
+/// driven x86/Vulkan boot under a 60 s Safari drag:
+///
+/// ```text
+/// gvaw_fence_batch_1 56209        every other band 0
+/// readback_split     submit 10.1 us   fence 213 us   map 1.8 us   (per readback)
+/// ```
+///
+/// The first says **there is no tranche**. Every one of 56 209 completion stamps
+/// landed exactly one window — the batch is 1.000, never 2 — so there is no set
+/// of serialized round trips for a shared fence to collapse. That was the half
+/// of the argument that could have paid for the risk, and it does not exist.
+/// [`flush_gva_windows_before_fence`]'s own repair note explains why: landing at
+/// the fence keeps the window set nearly empty by construction.
+///
+/// The second says what is left to win. Folding the copy into the draw's command
+/// buffer removes the private **submit**; it cannot remove the **fence**, whose
+/// own census doc calls it "pure GPU round-trip latency, and the part no smaller
+/// copy can reduce". The draw's work has to complete before the bytes exist to
+/// copy, and the guest is about to be told it has. So the build's ceiling is the
+/// submit's share — about 4.5% of a readback — in exchange for a three-state
+/// readback decision, a staging-slot lease held across the ring, and a fence
+/// handle threaded into the deferred entry. Do not attempt it.
+///
+/// The split is pooled across this rail and the render rail, so 4.5% is a shape
+/// rather than this rail's exact figure; it is quoted as a ceiling for that
+/// reason. Nothing about the ranking is close enough for the pooling to change
+/// it — the fence is 21x the submit.
+///
+/// ## Where the rail's time actually goes
+///
+/// `fence_us` summed 20.0 s across 77.6 s of census windows, with `write_us` at
+/// 0 because the GPU-direct rail already landed the copies. **A quarter of the
+/// device's wall clock is spent blocked on readback fences**, and none of it is
+/// the copy. That is a question about who waits, not about what is copied, and
+/// no rearrangement of the copy addresses it.
 #[cfg(feature = "backend-vulkan")]
 pub fn flush_gva_one<M: HostMemory + HostOps>(
     state: &mut DeviceState,
