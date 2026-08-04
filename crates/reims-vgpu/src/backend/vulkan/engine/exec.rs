@@ -22,18 +22,52 @@ use super::types::{
 };
 use super::vk_call::{VkCall, VkOp};
 
-/// Stage one draw-time buffer content into a pooled slot, deduplicating
-/// within the draw: several binds sharing one content (an `Arc`'d byte
-/// allocation, or the same gathered guest span) get ONE slot and ONE gather.
-/// Returns a handle copy of the slot.
+/// A buffer a draw binds, and where in it the bytes start.
 ///
-/// `snapshot_volatile` — set for a deferred-submit (batched) draw — no longer
-/// selects a mechanism. Every `GuestRuns` bind is now copied on the CPU at
-/// preparation time, which is what the snapshot always did and what the
-/// deferred CB needs: a gather recorded into a batched CB would have read guest
-/// RAM at flush time, after ack-fast let the guest repaint the pages. The flag
-/// survives because the counter it feeds distinguishes a batched bind from an
-/// immediate one, which is still a real difference in when the bytes were read.
+/// Two origins, and the offset is what distinguishes them. A pooled staging slot
+/// always starts at zero — the pool carved it for this content alone. A guest
+/// window import starts wherever the guest's own span sits inside the first page
+/// its dma-buf names, because a dma-buf covers whole pages and the guest's
+/// allocator does not.
+///
+/// Deliberately not a [`BufferSlot`]. A slot is a *pool* object: `acquire_staging`
+/// enters it in `staging_live` and the ring recycles it at retire. An import
+/// belongs to [`super::dmabuf::ImportCache`] and is revoked by freeing its
+/// memory, so a type that could be mistaken for a slot would eventually be
+/// handed to the staging free list — where it would be reissued as scratch over
+/// the guest's live pages.
+#[derive(Clone, Copy)]
+struct BoundBuffer {
+    buffer: vk::Buffer,
+    offset: vk::DeviceSize,
+}
+
+impl From<BufferSlot> for BoundBuffer {
+    fn from(slot: BufferSlot) -> Self {
+        Self {
+            buffer: slot.buffer,
+            offset: 0,
+        }
+    }
+}
+
+/// Stage one draw-time buffer content into something the draw can bind,
+/// deduplicating within the draw: several binds sharing one content (an `Arc`'d
+/// byte allocation, or the same guest span) resolve to ONE buffer and at most
+/// one copy.
+///
+/// A `GuestRuns` span is bound **directly out of the guest's pages** where the
+/// host can export them as a dma-buf and the span sits at an offset the device
+/// will accept — no copy at all, not even a GPU one. Otherwise the CPU gathers
+/// the runs into a pooled staging span, which is what this arm did
+/// unconditionally before and is still what every host without an exporter does.
+///
+/// The direct bind reads guest RAM when the command buffer *executes*, which is
+/// after this device would otherwise have told the guest the packet finished.
+/// [`super::quiesce_guest_reads`], called from `write_stamp`, is what makes that
+/// ordering a rule rather than a short window; `snapshot_volatile` records that
+/// the runtime asked for a stable snapshot, which only the CPU arm still gives
+/// it.
 #[allow(
     clippy::too_many_arguments,
     reason = "buffer staging carries the Vulkan context, pools, binding, and lifetime sets"
@@ -45,8 +79,8 @@ unsafe fn stage_buffer_content(
     content: &BufferContent,
     usage: vk::BufferUsageFlags,
     snapshot_volatile: bool,
-    slots_by_content: &mut std::collections::HashMap<(usize, u64), BufferSlot>,
-) -> Result<BufferSlot, DrawError> {
+    slots_by_content: &mut std::collections::HashMap<(usize, u64), BoundBuffer>,
+) -> Result<BoundBuffer, DrawError> {
     let key = match content {
         BufferContent::Bytes(b) => (std::sync::Arc::as_ptr(b) as usize, b.len() as u64),
         BufferContent::GuestRuns(src) => (
@@ -54,10 +88,10 @@ unsafe fn stage_buffer_content(
             src.total_len,
         ),
     };
-    if let Some(slot) = slots_by_content.get(&key) {
-        return Ok(*slot);
+    if let Some(bound) = slots_by_content.get(&key) {
+        return Ok(*bound);
     }
-    let slot = match content {
+    let bound = match content {
         BufferContent::Bytes(b) => {
             let slot = {
                 let _s = stage_phase::Span::open(stage_phase::Part::Acquire);
@@ -66,39 +100,134 @@ unsafe fn stage_buffer_content(
             let _s = stage_phase::Span::moving(stage_phase::Part::Bytes, b.len() as u64);
             pools.write_staging(ctx, &slot, b)?;
             drop(_s);
-            slot
+            BoundBuffer::from(slot)
         }
-        // Guest runs are gathered by the CPU into the mapped staging span, with
-        // no intermediate `cpu_bytes()` heap Vec (this is the deferred-submit
-        // hot path, ~4.8 binds/draw under compositing).
-        //
-        // There used to be a second arm here that skipped this copy entirely:
-        // it resolved each run through a `VK_EXT_external_memory_host` import
-        // and had the command buffer read the guest pages directly. That is
-        // gone — an imported host pointer is one the GPU can *write*, and the
-        // runs point into guest RAM. `snapshot_volatile` therefore no longer
-        // selects between two mechanisms; it only records that the runtime
-        // asked for a stable snapshot, which is what this arm has always given
-        // it.
         BufferContent::GuestRuns(src) => {
-            let slot = {
-                let _s = stage_phase::Span::open(stage_phase::Part::Acquire);
-                pools.acquire_staging(ctx, src.total_len, usage, counters)?
-            };
-            let _s = stage_phase::Span::moving(stage_phase::Part::Runs, src.total_len);
-            pools.write_staging_from_runs(ctx, &slot, &src.runs, src.total_len)?;
-            drop(_s);
-            if snapshot_volatile {
-                counters
-                    .buffer_snapshot_binds
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // The bytes are already in memory the device can address. Bind them.
+            //
+            // Note what this is *not*. This arm once resolved each run through a
+            // `VK_EXT_external_memory_host` import and bound that, and the whole
+            // mechanism is banned: an imported host pointer is one the GPU can
+            // *write*, over a mapping it can stray within, with no handle to
+            // revoke it by. A dma-buf names an explicit page list, ends when the
+            // memory is freed, and is tracked by the kernel.
+            if let Some(bound) = unsafe { import_guest_buffer_window(ctx, pools, src) } {
+                pools.note_guest_read_recorded();
+                counters.note_buffer_guest_import(src.total_len);
+                bound
+            } else {
+                // No exporter, or an offset this device will not bind at. The
+                // CPU gathers the runs into the mapped staging span, with no
+                // intermediate `cpu_bytes()` heap Vec (this is the
+                // deferred-submit hot path, ~4.8 binds/draw under compositing).
+                let slot = {
+                    let _s = stage_phase::Span::open(stage_phase::Part::Acquire);
+                    pools.acquire_staging(ctx, src.total_len, usage, counters)?
+                };
+                let _s = stage_phase::Span::moving(stage_phase::Part::Runs, src.total_len);
+                pools.write_staging_from_runs(ctx, &slot, &src.runs, src.total_len)?;
+                drop(_s);
+                if snapshot_volatile {
+                    counters
+                        .buffer_snapshot_binds
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                BoundBuffer::from(slot)
             }
-            slot
         }
     };
-    slots_by_content.insert(key, slot);
-    Ok(slot)
+    slots_by_content.insert(key, bound);
+    Ok(bound)
 }
+
+/// Bind a buffer source's guest pages directly, or say why they have to be
+/// gathered.
+///
+/// Every `None` is a routing answer and never a lost draw: the caller's CPU
+/// gather reads the same bytes through the same runs.
+///
+/// # Safety
+///
+/// `ctx` must own the device `pools` holds every live import against.
+unsafe fn import_guest_buffer_window(
+    ctx: &super::context::DeviceContext,
+    pools: &mut ResourcePools,
+    src: &super::types::GuestRunSource,
+) -> Option<BoundBuffer> {
+    if !ctx.caps.dma_buf_import.is_available() {
+        return None;
+    }
+    let window = src.pages.as_ref()?;
+    let offset = u64::from(window.head_offset);
+    // Unlike the sampled rail's copy offset, this one is a *bind*: the device
+    // publishes the alignment it will accept and there is no arm that can
+    // renegotiate it. A guest span that lands elsewhere in its page is gathered.
+    if !offset.is_multiple_of(ctx.guest_bind_offset_align) {
+        crate::observe::Emit::decline(
+            "vk_buffer_import",
+            &BufferImportDecline::BindOffsetAlignment {
+                offset,
+                align: ctx.guest_bind_offset_align,
+            },
+        )
+        .fail_once(offset % ctx.guest_bind_offset_align);
+        return None;
+    }
+    let mapped = (window.gpas.len() as u64).saturating_mul(u64::from(window.page_size));
+    if offset.saturating_add(src.total_len) > mapped {
+        crate::observe::Emit::decline(
+            "vk_buffer_import",
+            &BufferImportDecline::WindowTooSmall {
+                need: offset + src.total_len,
+                have: mapped,
+            },
+        )
+        .fail_once(0);
+        return None;
+    }
+    match unsafe { pools.import_guest_window(ctx, &window.dmabuf, mapped) } {
+        Ok(import) => Some(BoundBuffer {
+            buffer: import.buffer,
+            offset,
+        }),
+        Err(inner) => {
+            crate::observe::Emit::decline("vk_buffer_import", &inner).fail_once(0);
+            None
+        }
+    }
+}
+
+/// A check that sent a guest buffer span back to the CPU gather.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BufferImportDecline {
+    /// The span does not start at an offset this device will bind a vertex or
+    /// storage buffer at. See [`super::context::DeviceContext::guest_bind_offset_align`].
+    BindOffsetAlignment { offset: u64, align: u64 },
+    /// The page list does not reach the end of the span it was resolved for.
+    WindowTooSmall { need: u64, have: u64 },
+}
+
+impl crate::observe::Decline for BufferImportDecline {
+    fn slug(&self) -> &'static str {
+        match self {
+            Self::BindOffsetAlignment { .. } => "buffer_import_bind_offset_alignment",
+            Self::WindowTooSmall { .. } => "buffer_import_window_too_small",
+        }
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        match self {
+            Self::BindOffsetAlignment { offset, align } => {
+                vec![("offset", offset.to_string()), ("align", align.to_string())]
+            }
+            Self::WindowTooSmall { need, have } => {
+                vec![("need", need.to_string()), ("have", have.to_string())]
+            }
+        }
+    }
+}
+
+crate::observe::decline::decline_display!(BufferImportDecline);
 
 /// Where the buffer half of a guest-sourced sampled upload came from.
 ///
@@ -1172,7 +1301,7 @@ pub(crate) unsafe fn execute_draw_inner(
     // Vertex buffers (with Constant step shift), deduplicated by content:
     // several attributes on one interleaved stream share one staging slot.
     let no_vertex_fetch = draw_has_no_invocations(req);
-    let mut slots_by_content: std::collections::HashMap<(usize, u64), BufferSlot> =
+    let mut slots_by_content: std::collections::HashMap<(usize, u64), BoundBuffer> =
         std::collections::HashMap::new();
     let mut vertex_bufs = Vec::new();
     for resource in &req.vertex_attributes {
@@ -1223,7 +1352,7 @@ pub(crate) unsafe fn execute_draw_inner(
             let _s = stage_phase::Span::moving(stage_phase::Part::Bytes, shifted.len() as u64);
             pools.write_staging(ctx, &slot, &shifted)?;
             drop(_s);
-            slot
+            BoundBuffer::from(slot)
         } else {
             stage_buffer_content(
                 ctx,
@@ -1764,10 +1893,14 @@ pub(crate) unsafe fn execute_draw_inner(
         dset_pool = Some(pool);
         let buffer_infos: Vec<_> = storage_slots
             .iter()
-            .map(|(_, s)| {
+            .map(|(_, bound)| {
+                // `WHOLE_SIZE` is the rest of the buffer from `offset`. For a
+                // pooled slot that is the slot; for a guest window import it is
+                // the remainder of the guest's own pages, which the shader is
+                // already entitled to and which its own bounds keep it inside.
                 vk::DescriptorBufferInfo::default()
-                    .buffer(s.buffer)
-                    .offset(0)
+                    .buffer(bound.buffer)
+                    .offset(bound.offset)
                     .range(vk::WHOLE_SIZE)
             })
             .collect();
@@ -2364,9 +2497,9 @@ pub(crate) unsafe fn execute_draw_inner(
             &[],
         );
     }
-    for (binding, slot) in &vertex_bufs {
+    for (binding, bound) in &vertex_bufs {
         ctx.device
-            .cmd_bind_vertex_buffers(cb, *binding, &[slot.buffer], &[0]);
+            .cmd_bind_vertex_buffers(cb, *binding, &[bound.buffer], &[bound.offset]);
     }
     match (&req.indexed, &index_slot) {
         (Some(indexed), Some(ibuf)) => {
@@ -2832,6 +2965,70 @@ mod tests {
         for offset in [4u64, 8, 12, 100] {
             assert!(!offset.is_multiple_of(GUEST_IMPORT_COPY_OFFSET_ALIGN));
         }
+    }
+
+    /// A pooled staging slot binds at zero and a guest window import does not,
+    /// and every bind site has to take the offset from the same place.
+    ///
+    /// The conversion exists so that `From<BufferSlot>` is the *only* way a slot
+    /// becomes bindable — a site that reached past it and used `slot.buffer`
+    /// with a literal `0` would be right for staging and silently wrong for an
+    /// import, binding the head of the guest's page instead of the span the
+    /// guest named. That is a wrong draw, not a failed one.
+    #[test]
+    fn a_pooled_slot_binds_at_zero_and_carries_its_own_buffer() {
+        let slot = BufferSlot {
+            buffer: {
+                use ash::vk::Handle;
+                vk::Buffer::from_raw(0x1234)
+            },
+            memory: vk::DeviceMemory::null(),
+            size: 4096,
+            mapped: 0,
+            coherent: true,
+            cached: false,
+            backing: super::super::pools::BufferBacking::Dedicated,
+        };
+        let bound = BoundBuffer::from(slot);
+        assert_eq!(bound.buffer, slot.buffer);
+        assert_eq!(bound.offset, 0);
+    }
+
+    /// Each reason a guest span fails to become a directly bound buffer is its
+    /// own line in the log.
+    ///
+    /// The alignment refusal in particular is the one that decides whether this
+    /// rail runs at all on a given host: it is a device limit against a guest
+    /// allocator's choices, and neither side is under this device's control. A
+    /// boot where the rail moves nothing has to be able to say whether that is
+    /// because the host cannot export, or because every span this guest hands
+    /// over lands mid-alignment.
+    #[test]
+    fn every_buffer_import_decline_names_its_own_check() {
+        let declines = [
+            BufferImportDecline::BindOffsetAlignment {
+                offset: 40,
+                align: 64,
+            },
+            BufferImportDecline::WindowTooSmall {
+                need: 8192,
+                have: 4096,
+            },
+        ];
+        let slugs: Vec<_> = declines.iter().map(|d| d.slug()).collect();
+        let unique: std::collections::HashSet<_> = slugs.iter().collect();
+        assert_eq!(slugs.len(), unique.len(), "slugs collide: {slugs:?}");
+        for decline in &declines {
+            assert!(!decline.fields().is_empty(), "{decline} carries no values");
+            assert!(decline.slug().starts_with("buffer_import_"));
+        }
+        // The two rails refuse for different reasons and must not share a slug
+        // with each other either — a sampled window and a buffer span can fail
+        // the same way and still need different fixes.
+        assert_ne!(
+            BufferImportDecline::WindowTooSmall { need: 1, have: 0 }.slug(),
+            SampledImportDecline::WindowTooSmall { need: 1, have: 0 }.slug()
+        );
     }
 
     /// Each reason a guest window fails to become a copy source is its own line

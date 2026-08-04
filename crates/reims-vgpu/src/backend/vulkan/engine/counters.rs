@@ -214,20 +214,26 @@ engine_counters! {
         /// what the copy names, which is what the CPU no longer moves.
         sampled_guest_imports,
         sampled_guest_import_bytes,
+        /// Vertex/storage buffer binds the draw pointed straight at the guest's
+        /// own pages through an imported dma-buf, with no copy in either
+        /// direction. Ranked against `buffer_snapshot_binds` and the
+        /// `stage_phase` `runs_*` bars, which are what the CPU still gathers.
+        buffer_guest_imports,
+        buffer_guest_import_bytes,
         sampled_cache_hits,
         sampled_identity_hits,
         sampled_cache_hit_bytes,
         sampled_cache_misses,
         sampled_gpu_binds,
-        /// Guest-run buffer binds snapshotted on the CPU at record time because
-        /// the draw defers its submit (batched CB must not read volatile guest
-        /// RAM at flush time).
+        /// Batched-draw guest-run buffer binds the CPU had to gather, because
+        /// the host could not export the pages or the span sits at an offset
+        /// this device will not bind at.
         ///
-        /// Its two former siblings, `sampled_zerocopy_binds` and
-        /// `buffer_zerocopy_binds`, counted guest-run binds the device gathered
-        /// itself out of imported guest pages. That mechanism is gone, so both
-        /// were fixed at zero — the shape the counter census calls out as
-        /// unreadable — and they were deleted rather than left reporting nothing.
+        /// A subset of the `stage_phase` `runs_*` bars, distinguished by *when*
+        /// the bytes were read: a batched CB reads them at record time and an
+        /// immediate one effectively at submit, which is a real difference in
+        /// how stale a snapshot can be. `buffer_guest_imports` is the other
+        /// disposition of the same bind, where nothing was read at all.
         buffer_snapshot_binds,
         gpu_load_hits,
         target_evicts,
@@ -322,6 +328,12 @@ impl EngineCounters {
     pub fn note_sampled_gather(&self, bytes: u64) {
         self.sampled_gathers.fetch_add(1, Ordering::Relaxed);
         self.sampled_gather_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub fn note_buffer_guest_import(&self, bytes: u64) {
+        self.buffer_guest_imports.fetch_add(1, Ordering::Relaxed);
+        self.buffer_guest_import_bytes
             .fetch_add(bytes, Ordering::Relaxed);
     }
 

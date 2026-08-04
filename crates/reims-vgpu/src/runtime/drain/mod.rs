@@ -4502,6 +4502,10 @@ pub fn note_drain_tranche(drain_us: u64, publish_us: u64) {
 ///   guest-sourced bind that had to move bytes into the ones that moved them
 ///   over the host CPU and the ones that did not; a host with no exporter reads
 ///   zero here and all of it there.
+/// - `buffer_guest_imports` / `buffer_guest_import_bytes` — vertex and storage
+///   binds pointed straight at the guest's pages, with no copy in either
+///   direction. `buffer_snapshot_binds` is what still had to be gathered, and
+///   the `stage_phase` `runs_*` bars are what that gathering costs.
 /// - `ring_retire_blocks` / `target_evicts` — the engine waiting on itself.
 ///
 /// One line per second, one atomic load per field. Emitted from the same window
@@ -4585,6 +4589,8 @@ fn emit_engine_delta() {
          sampled_reupload_bytes={} sampled_gathers={} sampled_gather_bytes={} \
          sampled_gather_skips={} sampled_gather_skip_bytes={} \
          sampled_guest_imports={} sampled_guest_import_bytes={} \
+         buffer_guest_imports={} buffer_guest_import_bytes={} \
+         buffer_snapshot_binds={} \
          seed_uploads={} seed_upload_bytes={} \
          ring_retire_blocks={} target_evicts={} desc_pool_grow={} gen_mismatch={}",
         d.creates,
@@ -4615,6 +4621,9 @@ fn emit_engine_delta() {
         d.sampled_gather_skip_bytes,
         d.sampled_guest_imports,
         d.sampled_guest_import_bytes,
+        d.buffer_guest_imports,
+        d.buffer_guest_import_bytes,
+        d.buffer_snapshot_binds,
         d.seed_uploads,
         d.seed_upload_bytes,
         d.ring_retire_blocks,

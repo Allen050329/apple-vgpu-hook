@@ -282,6 +282,19 @@ pub(crate) struct DeviceContext {
     pub sampled_r32f_linear_filter: bool,
     pub pipeline_cache: vk::PipelineCache,
     pub vertex_divisor: VertexDivisorCapabilities,
+    /// Offset alignment a guest-window import must satisfy before a draw may
+    /// bind it directly as a vertex or storage buffer, taken from
+    /// `VkPhysicalDeviceLimits`.
+    ///
+    /// One number for both because the dedup in `stage_buffer_content` shares a
+    /// bound buffer between a stream that feeds vertex fetch and one that feeds
+    /// a storage binding, so a value legal for only one of them would be a
+    /// valid-usage violation the moment the same guest span is used twice.
+    /// `min*BufferOffsetAlignment` are the device's own answers; the 16 floor
+    /// covers vertex fetch, which the spec gives no queryable limit for and
+    /// which implementations may require to be component-aligned — 16 bytes is
+    /// the largest component-size any vertex format has.
+    pub guest_bind_offset_align: u64,
     /// Which vertex attribute formats this device accepts in a vertex buffer,
     /// probed once. Vulkan makes the three-component 8/16-bit formats optional,
     /// so a pipeline resolves each attribute through this rather than assuming
@@ -719,6 +732,11 @@ impl DeviceContext {
             sampled_r32f_linear_filter,
             pipeline_cache,
             vertex_divisor,
+            guest_bind_offset_align: props
+                .limits
+                .min_storage_buffer_offset_alignment
+                .max(props.limits.min_uniform_buffer_offset_alignment)
+                .max(16),
             vertex_formats,
             max_sampler_anisotropy: features.max_sampler_anisotropy,
             sampler_anisotropy: features.sampler_anisotropy,
