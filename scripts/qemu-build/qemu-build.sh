@@ -192,6 +192,14 @@ if [ -f "build/build.ninja" ]; then
   fi
 fi
 
+# The backend travels as a meson option and not only as an exported variable.
+# Meson re-runs its build files whenever ninja finds them out of date, and that
+# regeneration inherits ninja's environment rather than this script's — so a
+# tree configured here for Vulkan silently became a Metal one the next time any
+# meson.build changed, and the boot that followed died in twenty Rust errors
+# from an Apple-only arm on a Linux host. An option is stored in the build
+# directory and survives regeneration.
+REIMS_VGPU_MESON_OPT="-Dreims_vgpu_backend=$REIMS_VGPU_BACKEND"
 if [ ! -f "build/build.ninja" ]; then
   case "$QEMU_TARGET" in
     aarch64)
@@ -203,7 +211,8 @@ if [ ! -f "build/build.ninja" ]; then
         --disable-docs \
         --disable-bsd-user \
         --disable-linux-user \
-        --disable-tools
+        --disable-tools \
+        "$REIMS_VGPU_MESON_OPT"
       ;;
     x86_64)
       echo "[qemu-build] configuring (x86_64-softmmu, no hvf/cocoa) ..."
@@ -214,7 +223,8 @@ if [ ! -f "build/build.ninja" ]; then
         --disable-docs \
         --disable-bsd-user \
         --disable-linux-user \
-        --disable-tools
+        --disable-tools \
+        "$REIMS_VGPU_MESON_OPT"
       ;;
   esac
 else
