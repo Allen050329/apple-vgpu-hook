@@ -130,6 +130,22 @@ pub fn flush_intersecting<M: HostMemory + HostOps>(
 /// first, so it and its 1-in-64 sampled self-heal are gone. Do not re-derive
 /// it: this walk is not a cost on this rail, and caching it reintroduces a
 /// hole that only a sampled walk can close.
+///
+/// That reading is now standing rather than historical, which is the one thing
+/// it was missing: it came from the memo's own counters, and deleting the memo
+/// deleted them, so nothing could say whether it still held. The
+/// `gva_alias_probe_*` fields on the `store_routes` line replace them and are
+/// not tied to a heuristic that can be removed. A driven x86/Vulkan boot —
+/// Safari window drag, drain duty 0.90, 4 972 draws/s — reads **705 988 quiet
+/// calls and one walk** over 43 census windows, that walk costing 12 µs over
+/// 256 pages, with `gva_alias_hit_page` never firing.
+///
+/// So the conclusion is unchanged and is now cheap to re-check: divide
+/// `gva_alias_probe_us` by `gva_alias_probe_walked`, and read the walked count
+/// against `gva_alias_probe_quiet`. A walked count that climbs toward the quiet
+/// one means a rail is staying armed across binds, which puts an `O(pages)`
+/// guest page-table walk on the draw path — and that, not the hit rate, is the
+/// event worth alarming on.
 pub fn flush_intersecting_task_gva<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
