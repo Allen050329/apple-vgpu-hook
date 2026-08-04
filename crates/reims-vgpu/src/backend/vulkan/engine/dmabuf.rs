@@ -95,6 +95,12 @@ pub enum DmaBufDecline {
     /// a process at its descriptor limit reaches here, and no Vulkan result
     /// describes that.
     CloneFd { errno: i32 },
+    /// The pinned-bytes bound is full of imports the command buffer now being
+    /// recorded already names, so nothing can be displaced to make room. Not a
+    /// device refusal and not a page-list problem: one draw asked for more guest
+    /// memory at once than the rail is allowed to pin, and the caller gathers on
+    /// the CPU instead.
+    BoundInUse { held: u64, incoming: u64 },
 }
 
 impl Decline for DmaBufDecline {
@@ -109,6 +115,7 @@ impl Decline for DmaBufDecline {
             Self::AllocateMemory { .. } => "vk_dmabuf_allocate_memory",
             Self::BindBuffer { .. } => "vk_dmabuf_bind_buffer",
             Self::CloneFd { .. } => "vk_dmabuf_clone_fd",
+            Self::BoundInUse { .. } => "vk_dmabuf_bound_in_use",
         }
     }
 
@@ -139,6 +146,10 @@ impl Decline for DmaBufDecline {
             } => vec![
                 ("required", required.to_string()),
                 ("available", available.to_string()),
+            ],
+            Self::BoundInUse { held, incoming } => vec![
+                ("held", held.to_string()),
+                ("incoming", incoming.to_string()),
             ],
         }
     }
@@ -361,17 +372,28 @@ crate::observe::decline::decline_display!(GuestWriteDecline);
 /// # When an entry may be freed
 ///
 /// `vkFreeMemory` on memory an in-flight command buffer references is undefined
-/// behaviour, so eviction is only sound where no submission naming an import is
-/// outstanding. Every consumer of this cache waits its own fence before
-/// returning ([`super::copy_target_to_guest_pages`] is the only one), and
-/// eviction runs at the *start* of the next import — after that wait and before
-/// anything is recorded. A future consumer that submits without waiting must
-/// route its imports through the ring's graveyard instead of this bound.
+/// behaviour, so this cache never frees an eviction itself: [`Self::get_or_import`]
+/// hands the displaced imports back and
+/// [`super::pools::ResourcePools::import_guest_window`] routes each through the
+/// ring's graveyard, which destroys it once every slot open at that instant has
+/// retired. That is what lets a *draw* import a window — it records a copy and
+/// submits without waiting, so the "no consumer outlives its own fence" rule the
+/// writeback rail relied on is no longer true of every caller.
+///
+/// The graveyard cannot see the command buffer currently being **recorded**,
+/// though, because its slot is not pending until submit. So an eviction is also
+/// refused for any entry the open recording has already been handed, tracked by
+/// [`Self::epoch`]; a draw whose own imports do not fit under the bound is
+/// declined ([`DmaBufDecline::BoundInUse`]) and gathers on the CPU instead.
 #[derive(Default)]
 pub(crate) struct ImportCache {
     entries: Vec<ImportEntry>,
     bytes: u64,
     clock: u64,
+    /// Bumped by [`Self::begin_recording`] at the start of each command buffer.
+    /// An entry stamped with the current value has been handed to the CB being
+    /// recorded right now, which no fence and no graveyard mask can yet name.
+    epoch: u64,
 }
 
 struct ImportEntry {
@@ -385,26 +407,39 @@ struct ImportEntry {
     _window_fd: Arc<GuestDmaBuf>,
     import: ImportedDmaBuf,
     used: u64,
+    /// [`ImportCache::epoch`] when this entry was last handed out. Equal to the
+    /// live epoch means the command buffer still recording may already name it.
+    epoch: u64,
 }
 
 /// Most guest memory this device will hold imported at once. Equal to the
 /// runtime cache's pin bound by construction; see [`ImportCache`].
 const MAX_IMPORTED_BYTES: u64 = crate::runtime::guest_dmabuf::MAX_PINNED_BYTES;
 
-/// Index of the entry to drop next: the one least recently handed out.
+/// Index of the entry to drop next: the one least recently handed out, skipping
+/// every entry the command buffer now recording has already been given.
 ///
 /// Separate from the eviction loop so the choice can be tested without a Vulkan
-/// device — the loop's other half is `vkFreeMemory`, and getting *which* entry
-/// it frees wrong is the half that costs a re-import every frame.
-fn lru_victim(entries: &[ImportEntry]) -> Option<usize> {
+/// device — the loop's other half is handing the import to the graveyard, and
+/// getting *which* entry it displaces wrong is either a re-import every frame or
+/// a copy reading freed memory.
+fn lru_victim(entries: &[ImportEntry], live_epoch: u64) -> Option<usize> {
     entries
         .iter()
         .enumerate()
+        .filter(|(_, e)| e.epoch != live_epoch)
         .min_by_key(|(_, e)| e.used)
         .map(|(i, _)| i)
 }
 
 impl ImportCache {
+    /// Start of a command buffer's recording. Every entry handed out from here
+    /// until the next call is pinned against eviction, because nothing else can
+    /// name a CB that has not been submitted.
+    pub(crate) fn begin_recording(&mut self) {
+        self.epoch += 1;
+    }
+
     /// The bound `window`'s pages reach the device through, imported if this is
     /// the first time this window has been asked for.
     ///
@@ -412,25 +447,41 @@ impl ImportCache {
     /// whatever part of it a given copy names — a caller wanting a sub-range
     /// says so with the copy's own offset rather than by importing twice.
     ///
+    /// Imports displaced to make room are **appended to `displaced` rather than
+    /// freed**: the caller owns disposing of them safely, which for a submitting
+    /// caller means the ring's graveyard. See [`ImportCache`].
+    ///
     /// # Safety
     ///
-    /// `device` must be the one `ctx` owns, and no submission may still
-    /// reference an import this call evicts. See [`ImportCache`].
+    /// `device` must be the one `ctx` owns.
     pub(crate) unsafe fn get_or_import(
         &mut self,
         ctx: &super::context::DeviceContext,
         window: &Arc<GuestDmaBuf>,
         size: u64,
+        displaced: &mut Vec<ImportedDmaBuf>,
     ) -> Result<ImportedDmaBuf, DmaBufDecline> {
         self.clock += 1;
         let clock = self.clock;
+        let epoch = self.epoch;
         if let Some(entry) = self.entries.iter_mut().find(|e| e.window == window.id) {
             entry.used = clock;
+            entry.epoch = epoch;
             return Ok(entry.import);
         }
-        // Before the import rather than after it, so the bound is restored while
-        // nothing new is in flight — the moment named in this type's doc.
-        unsafe { self.evict_to_bound(&ctx.device, size) };
+        // Before the import rather than after it, so the bound is restored
+        // before it is added to rather than after.
+        self.evict_to_bound(size, displaced);
+        if self.bytes.saturating_add(size) > MAX_IMPORTED_BYTES {
+            // Everything left is pinned by the CB now recording, so there is no
+            // eviction that would not free memory a recorded copy reads. The
+            // caller still has its CPU gather; taking it is slower than this
+            // rail and correct, which is the whole reason the fallback is kept.
+            return Err(DmaBufDecline::BoundInUse {
+                held: self.bytes,
+                incoming: size,
+            });
+        }
         // The driver takes the fd it is given, and the runtime keeps the
         // original for every other importer and for the revocation that closing
         // it performs. So the import gets a duplicate; `import_buffer` then owns
@@ -444,25 +495,23 @@ impl ImportCache {
             _window_fd: Arc::clone(window),
             import,
             used: clock,
+            epoch,
         });
         self.bytes += size;
         Ok(import)
     }
 
-    /// Drop least-recently-used imports until `incoming` more bytes would still
-    /// fit under [`MAX_IMPORTED_BYTES`].
-    ///
-    /// # Safety
-    ///
-    /// As [`Self::get_or_import`].
-    unsafe fn evict_to_bound(&mut self, device: &ash::Device, incoming: u64) {
+    /// Displace least-recently-used imports into `displaced` until `incoming`
+    /// more bytes would fit under [`MAX_IMPORTED_BYTES`], or until everything
+    /// left is pinned by the open recording.
+    fn evict_to_bound(&mut self, incoming: u64, displaced: &mut Vec<ImportedDmaBuf>) {
         while self.bytes.saturating_add(incoming) > MAX_IMPORTED_BYTES {
-            let Some(victim) = lru_victim(&self.entries) else {
+            let Some(victim) = lru_victim(&self.entries, self.epoch) else {
                 return;
             };
             let entry = self.entries.swap_remove(victim);
             self.bytes = self.bytes.saturating_sub(entry.import.size);
-            unsafe { entry.import.destroy(device) };
+            displaced.push(entry.import);
         }
     }
 
@@ -592,6 +641,10 @@ mod tests {
     }
 
     fn entry(window: u64, size: u64, used: u64) -> ImportEntry {
+        entry_at_epoch(window, size, used, 0)
+    }
+
+    fn entry_at_epoch(window: u64, size: u64, used: u64, epoch: u64) -> ImportEntry {
         let (read, _write) = std::io::pipe().expect("a pipe for a placeholder fd");
         ImportEntry {
             window,
@@ -607,6 +660,7 @@ mod tests {
                 size,
             },
             used,
+            epoch,
         }
     }
 
@@ -619,8 +673,73 @@ mod tests {
     #[test]
     fn eviction_takes_the_least_recently_used_import() {
         let entries = vec![entry(1, 4096, 30), entry(2, 4096, 7), entry(3, 4096, 19)];
-        assert_eq!(lru_victim(&entries), Some(1));
-        assert_eq!(lru_victim(&[]), None);
+        assert_eq!(lru_victim(&entries, 1), Some(1));
+        assert_eq!(lru_victim(&[], 1), None);
+    }
+
+    /// An import the command buffer now recording was already handed is not a
+    /// candidate however cold it looks, because nothing else can see that CB.
+    ///
+    /// A submitted CB is named by its ring slot, so the graveyard holds its
+    /// imports until the slot retires. One still being *recorded* has no slot
+    /// bit set and no fence, so an eviction would `vkFreeMemory` guest pages a
+    /// recorded `vkCmdCopyBufferToImage` is about to read — the frame comes back
+    /// as whatever the driver put there, or the submit faults.
+    #[test]
+    fn an_import_the_open_recording_holds_is_never_the_victim() {
+        let entries = vec![
+            entry_at_epoch(1, 4096, 1, 7),
+            entry_at_epoch(2, 4096, 2, 6),
+            entry_at_epoch(3, 4096, 3, 7),
+        ];
+        assert_eq!(
+            lru_victim(&entries, 7),
+            Some(1),
+            "the coldest entry is pinned by the live epoch; the next one goes"
+        );
+        assert_eq!(
+            lru_victim(&entries, 8),
+            Some(0),
+            "a later recording pins none of them, so the plain LRU answer returns"
+        );
+    }
+
+    /// Displacement hands the imports back rather than freeing them, and stops
+    /// as soon as everything left belongs to the open recording.
+    ///
+    /// Both halves are load-bearing. Freeing here would be a `vkFreeMemory`
+    /// under a possibly in-flight command buffer, which is why the caller routes
+    /// them through the ring's graveyard instead. And a loop that could not stop
+    /// would either spin or evict the recording's own pages.
+    #[test]
+    fn displacement_yields_the_imports_and_stops_at_the_pinned_ones() {
+        let mut cache = ImportCache {
+            entries: vec![
+                entry_at_epoch(1, MAX_IMPORTED_BYTES / 2, 1, 4),
+                entry_at_epoch(2, MAX_IMPORTED_BYTES / 2, 2, 3),
+            ],
+            bytes: MAX_IMPORTED_BYTES,
+            clock: 2,
+            epoch: 4,
+        };
+
+        let mut displaced = Vec::new();
+        cache.evict_to_bound(MAX_IMPORTED_BYTES / 2, &mut displaced);
+        assert_eq!(
+            displaced.len(),
+            1,
+            "the unpinned entry is the one displaced"
+        );
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(cache.entries[0].window, 1);
+        assert_eq!(cache.bytes, MAX_IMPORTED_BYTES / 2);
+
+        // Nothing unpinned is left, so a second ask cannot be satisfied and must
+        // leave the survivor alone rather than loop or free it.
+        let mut again = Vec::new();
+        cache.evict_to_bound(MAX_IMPORTED_BYTES, &mut again);
+        assert!(again.is_empty());
+        assert_eq!(cache.entries.len(), 1);
     }
 
     /// The two caches bound the same physical guest pages, so they carry the

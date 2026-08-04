@@ -482,6 +482,15 @@ pub fn write_stamp<H: HostMemory + HostOps>(
     // corruption continued. See `storage_flush::flush_all_windows_before_fence`,
     // which the root completion stamp in `drain_main_fifo` shares.
     crate::runtime::storage_flush::flush_all_windows_before_fence(state, host);
+    // And the other half of that sentence: everything this device is still
+    // *reading* out of guest RAM has to be done reading. A draw that binds guest
+    // pages through an imported dma-buf reads them when its command buffer
+    // executes, and this stamp is what tells the guest those pages are free to
+    // repaint. The owed-writes flush above cannot stand in for it — it settles
+    // residents into guest memory and knows nothing about what a submission
+    // still sources.
+    #[cfg(feature = "backend-vulkan")]
+    crate::backend::vulkan::engine::quiesce_guest_reads();
     let Some(off) = stamp_slot_offset(index, state.page_size()) else {
         return;
     };
@@ -4485,8 +4494,14 @@ pub fn note_drain_tranche(drain_us: u64, publish_us: u64) {
 /// - `sampled_reuploads` — re-staging texture content a cache hit should have
 ///   kept.
 /// - `sampled_gathers` / `sampled_gather_bytes` — sampled binds served by
-///   gathering scattered guest pages into staging. The sampled loop's only
-///   byte-moving arm, and the last one of that loop to report itself.
+///   gathering scattered guest pages into staging. The CPU-copy arm of a
+///   guest-sourced bind, and the one the import rail exists to empty.
+/// - `sampled_guest_imports` / `sampled_guest_import_bytes` — the same binds
+///   served by the GPU reading the guest's pages through a dma-buf, with no CPU
+///   copy at all. Ranked against `sampled_gathers`, these two divide every
+///   guest-sourced bind that had to move bytes into the ones that moved them
+///   over the host CPU and the ones that did not; a host with no exporter reads
+///   zero here and all of it there.
 /// - `ring_retire_blocks` / `target_evicts` — the engine waiting on itself.
 ///
 /// One line per second, one atomic load per field. Emitted from the same window
@@ -4569,6 +4584,7 @@ fn emit_engine_delta() {
          sampled_cache_misses={} sampled_reuploads={} \
          sampled_reupload_bytes={} sampled_gathers={} sampled_gather_bytes={} \
          sampled_gather_skips={} sampled_gather_skip_bytes={} \
+         sampled_guest_imports={} sampled_guest_import_bytes={} \
          seed_uploads={} seed_upload_bytes={} \
          ring_retire_blocks={} target_evicts={} desc_pool_grow={} gen_mismatch={}",
         d.creates,
@@ -4597,6 +4613,8 @@ fn emit_engine_delta() {
         d.sampled_gather_bytes,
         d.sampled_gather_skips,
         d.sampled_gather_skip_bytes,
+        d.sampled_guest_imports,
+        d.sampled_guest_import_bytes,
         d.seed_uploads,
         d.seed_upload_bytes,
         d.ring_retire_blocks,

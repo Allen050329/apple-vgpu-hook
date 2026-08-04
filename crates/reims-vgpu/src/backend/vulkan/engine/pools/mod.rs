@@ -295,6 +295,16 @@ pub(crate) struct ResourcePools {
     /// teardown that destroys every other device object, and so the bound is
     /// enforced against the pool that owns it. See [`super::dmabuf::ImportCache`].
     dmabuf_imports: super::dmabuf::ImportCache,
+    /// Whether any command buffer recorded or submitted since the last quiesce
+    /// **reads** guest RAM when it executes.
+    ///
+    /// The whole reason [`ResourcePools::quiesce_guest_reads`] exists: this
+    /// device tells the guest a packet is finished before the GPU has run it, so
+    /// a read that happens at execute time can land after the guest has already
+    /// repainted or freed the pages. One flag rather than a per-slot mask
+    /// because the answer the stamp needs is "is there any", and a quiesce
+    /// retires the whole ring regardless.
+    guest_reads_in_flight: bool,
     initialized: bool,
 }
 
@@ -387,6 +397,12 @@ pub(crate) enum DeferredHandle {
     RenderPass(vk::RenderPass),
     ShaderModule(vk::ShaderModule),
     Sampler(vk::Sampler),
+    /// A guest page-window import displaced from [`super::dmabuf::ImportCache`]
+    /// by its pinned-bytes bound. Freeing the `VkDeviceMemory` is what revokes
+    /// the GPU's reach into those guest pages, and an in-flight command buffer
+    /// may still be copying out of it, so the revocation waits for the ring
+    /// exactly like every image destroy does.
+    DmaBufImport(super::dmabuf::ImportedDmaBuf),
 }
 
 impl ResourcePools {
@@ -434,6 +450,7 @@ impl ResourcePools {
             DeferredHandle::RenderPass(rp) => device.destroy_render_pass(rp, None),
             DeferredHandle::ShaderModule(s) => device.destroy_shader_module(s, None),
             DeferredHandle::Sampler(s) => device.destroy_sampler(s, None),
+            DeferredHandle::DmaBufImport(import) => unsafe { import.destroy(device) },
         }
     }
 }

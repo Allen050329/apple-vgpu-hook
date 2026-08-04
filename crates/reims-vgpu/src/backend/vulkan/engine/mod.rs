@@ -546,6 +546,38 @@ pub fn flush_batched_draws() {
     }
 }
 
+/// Wait until nothing this device has recorded will read guest RAM again.
+///
+/// Called from [`crate::runtime::drain::write_stamp`], immediately before the
+/// guest is told a packet finished. The stamp's own contract is that everything
+/// the packet named may be freed or repainted from that moment, and a draw that
+/// binds guest pages as a copy source reads them when its command buffer
+/// *executes* — which, on a device that acks before it runs, is otherwise after
+/// the guest was told it was safe.
+///
+/// A no-op unless a guest-reading command buffer was actually recorded, so a
+/// host that cannot export dma-bufs never pays for it. See
+/// [`pools::ResourcePools::quiesce_guest_reads`] for why the wait retires the
+/// whole ring rather than the fences carrying the reads.
+pub fn quiesce_guest_reads() {
+    let mut guard = lock_engine();
+    let EngineState {
+        ref mut owner,
+        ref mut pools,
+        ref counters,
+        ..
+    } = &mut *guard;
+    let Some(ctx) = owner.ctx.as_ref() else {
+        return;
+    };
+    if let Err(e) = unsafe { pools.quiesce_guest_reads(ctx, counters) } {
+        // The wait failed, so this device cannot say the guest's pages are done
+        // being read. Nothing here can hold the stamp back — the guest would
+        // hang — so report it and let the lost device surface on the next draw.
+        crate::observe::Emit::decline("vk_guest_read_quiesce", &e).fail_once(0);
+    }
+}
+
 /// Execute one compute dispatch against the persistent engine.
 pub fn execute_compute_request(req: &ComputeRequest) -> Result<ComputeOutput, ComputeError> {
     let mut guard = lock_engine();
@@ -1590,9 +1622,9 @@ pub fn copy_target_to_guest_pages(
         // The whole window, not `need`: one window is one buffer whatever part
         // of it this copy names, so the next flush of the same surface reuses
         // the import instead of making a second one over the same pages.
+        pools.dmabuf_imports_mut().begin_recording();
         let import = pools
-            .dmabuf_imports_mut()
-            .get_or_import(ctx, &dst.window, dst.mapped_bytes)
+            .import_guest_window(ctx, &dst.window, dst.mapped_bytes)
             .map_err(|inner| DrawError::GuestPageWrite(GuestWriteDecline::Import { inner }))?;
         copy_image_level0_to_buffer(ctx, pools, counters, &snap, import.buffer, dst)?;
         pools.registry_set_layout(identity, ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL);

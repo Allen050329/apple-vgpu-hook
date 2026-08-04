@@ -205,6 +205,15 @@ engine_counters! {
         /// rail would cost with no cache.
         sampled_gather_skips,
         sampled_gather_skip_bytes,
+        /// Sampled binds the GPU read straight out of the guest's own pages
+        /// through an imported dma-buf — no CPU gather, no staging scratch.
+        ///
+        /// The third disposition of a `SampledSource::GuestRuns` bind, ranked
+        /// against `sampled_gather_skips` (bound a retained image, moved
+        /// nothing) and `sampled_gathers` (the CPU packed the texels). Bytes are
+        /// what the copy names, which is what the CPU no longer moves.
+        sampled_guest_imports,
+        sampled_guest_import_bytes,
         sampled_cache_hits,
         sampled_identity_hits,
         sampled_cache_hit_bytes,
@@ -313,6 +322,12 @@ impl EngineCounters {
     pub fn note_sampled_gather(&self, bytes: u64) {
         self.sampled_gathers.fetch_add(1, Ordering::Relaxed);
         self.sampled_gather_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub fn note_sampled_guest_import(&self, bytes: u64) {
+        self.sampled_guest_imports.fetch_add(1, Ordering::Relaxed);
+        self.sampled_guest_import_bytes
             .fetch_add(bytes, Ordering::Relaxed);
     }
 

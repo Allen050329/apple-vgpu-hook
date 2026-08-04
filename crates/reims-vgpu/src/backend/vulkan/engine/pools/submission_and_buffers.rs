@@ -12,6 +12,32 @@ impl ResourcePools {
         &mut self.dmabuf_imports
     }
 
+    /// The bindable buffer over `window`'s guest pages, importing it if this is
+    /// the first ask, and retiring whatever the pinned-bytes bound displaced.
+    ///
+    /// This is the only way to reach [`super::dmabuf::ImportCache::get_or_import`]
+    /// that is safe for a caller which submits without waiting: a displaced
+    /// import goes to the graveyard, so its `vkFreeMemory` lands after every
+    /// command buffer that could still be copying out of it has retired.
+    ///
+    /// # Safety
+    ///
+    /// `ctx` must own the device every live import was made against.
+    pub(crate) unsafe fn import_guest_window(
+        &mut self,
+        ctx: &DeviceContext,
+        window: &std::sync::Arc<super::types::GuestDmaBuf>,
+        size: u64,
+    ) -> Result<super::dmabuf::ImportedDmaBuf, super::dmabuf::DmaBufDecline> {
+        let mut displaced = Vec::new();
+        let result =
+            unsafe { self.dmabuf_imports.get_or_import(ctx, window, size, &mut displaced) };
+        for import in displaced {
+            unsafe { self.dispose(&ctx.device, DeferredHandle::DmaBufImport(import)) };
+        }
+        result
+    }
+
     pub(crate) fn new() -> Self {
         Self {
             staging_free: HashMap::new(),
@@ -54,6 +80,7 @@ impl ResourcePools {
             slab: super::slab::SlabPool::new(),
             host_slab: super::host_slab::HostSlabPool::new(),
             dmabuf_imports: super::dmabuf::ImportCache::default(),
+            guest_reads_in_flight: false,
             initialized: false,
         }
     }
@@ -1103,6 +1130,57 @@ impl ResourcePools {
         ctx.device
             .wait_for_fences(&[fence], true, FENCE_TIMEOUT_NS)
             .map_err(|e| Self::wait_error(counters, e, DeviceLostOp::PoolsWaitFencesEntry))
+    }
+
+    /// Record that the command buffer being built reads guest RAM when it
+    /// executes, so the next completion stamp waits for it.
+    pub(crate) fn note_guest_read_recorded(&mut self) {
+        self.guest_reads_in_flight = true;
+    }
+
+    /// Clear the guest-read debt and answer whether there was one.
+    ///
+    /// Split from the wait so the ledger half is testable without a device: it
+    /// is what decides whether a stamp pays for this rail at all, and on a host
+    /// that cannot export a dma-buf the answer is always `false`.
+    pub(crate) fn take_guest_read_debt(&mut self) -> bool {
+        std::mem::take(&mut self.guest_reads_in_flight)
+    }
+
+    /// Wait until nothing this device has recorded will read guest RAM again.
+    ///
+    /// The completion stamp is the only thing this device says to the guest
+    /// about whether work is finished, and once it moves the guest may repaint
+    /// or free everything that work named. `flush_all_windows_before_fence`
+    /// settles what the device still owes guest RAM; this settles what it is
+    /// still *reading* from guest RAM, which is the other half of the same
+    /// sentence and the one that only exists because a draw can bind guest pages
+    /// directly.
+    ///
+    /// Retiring the whole ring is deliberately blunter than waiting the fences
+    /// that actually carry a guest read. The open batch has to be flushed
+    /// regardless — an unsubmitted CB's read has not happened yet, so waiting
+    /// fences alone would let it happen *after* the stamp — and once the batch
+    /// is submitted, the slots ahead of it are the ones about to be reclaimed
+    /// anyway. Cheap where it matters: this runs at a stamp, and a stamp that
+    /// flushed a window has already waited that flush's own fence, which is
+    /// ordered behind every draw the flush read.
+    ///
+    /// A no-op when nothing recorded a guest read, which is every packet on a
+    /// host with no dma-buf import.
+    pub(crate) unsafe fn quiesce_guest_reads(
+        &mut self,
+        ctx: &DeviceContext,
+        counters: &EngineCounters,
+    ) -> Result<(), DrawError> {
+        // Taken before the wait, not after: a failed wait leaves the slot
+        // pending and whichever entry claims it next re-waits, so the read is
+        // still ordered — but leaving the debt standing would re-run a failing
+        // quiesce at every stamp for the rest of the boot.
+        if !self.take_guest_read_debt() {
+            return Ok(());
+        }
+        unsafe { self.retire_all(ctx, counters) }
     }
 
     /// Wait + retire every in-flight slot and drain the graveyard. Callers
@@ -2846,6 +2924,39 @@ mod recycle_tests {
             fence: vk::Fence::null(),
             pending: None,
         }
+    }
+
+    /// The completion stamp pays for the guest-read rail exactly when the rail
+    /// ran, and never otherwise.
+    ///
+    /// Both directions matter. A debt that survived its quiesce would make every
+    /// stamp for the rest of the boot wait out the whole ring, which is a
+    /// serialization of the guest against the host GPU that no counter would
+    /// name. A debt that was never recorded would let a `vkCmdCopyBufferToImage`
+    /// read guest pages after the guest was told it could repaint them, which is
+    /// the corruption the rail is allowed to exist only because this prevents.
+    #[test]
+    fn a_stamp_waits_for_guest_reads_only_when_one_was_recorded() {
+        let mut pools = ResourcePools::new();
+        assert!(
+            !pools.take_guest_read_debt(),
+            "a device that has recorded nothing owes no wait; this is every \
+             packet on a host with no dma-buf exporter"
+        );
+
+        pools.note_guest_read_recorded();
+        assert!(pools.take_guest_read_debt());
+        assert!(
+            !pools.take_guest_read_debt(),
+            "one recorded read is one wait, not a wait at every stamp after it"
+        );
+
+        // Several reads inside one packet still settle in one quiesce: the
+        // wait retires the whole ring, so there is nothing left for a second.
+        pools.note_guest_read_recorded();
+        pools.note_guest_read_recorded();
+        assert!(pools.take_guest_read_debt());
+        assert!(!pools.take_guest_read_debt());
     }
 
     /// A dispose site has already unlinked the handle, so only the entries

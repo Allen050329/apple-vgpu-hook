@@ -100,6 +100,45 @@ unsafe fn stage_buffer_content(
     Ok(slot)
 }
 
+/// Where the buffer half of a guest-sourced sampled upload came from.
+///
+/// The two arms are the same `vkCmdCopyBufferToImage` over a different buffer,
+/// and the whole difference is whether the CPU moved the texels first.
+enum GuestTexels {
+    /// The buffer **is** the guest's pages, reached through a dma-buf import.
+    /// Nothing copied them into it: the GPU reads the bytes where the guest
+    /// wrote them, and `offset` is where inside the fd's whole-page extent the
+    /// first texel sits.
+    ///
+    /// The read happens when the command buffer executes rather than when it is
+    /// recorded, which is later than the guest's fence would otherwise allow —
+    /// see [`crate::backend::vulkan::engine::quiesce_guest_reads`], which is
+    /// what makes that legal.
+    Imported { buffer: vk::Buffer, offset: u64 },
+    /// The CPU packed the texels into a pooled staging span, because this host
+    /// could not export the pages (no `/dev/udmabuf`, guest RAM with no backing
+    /// fd, a run list the exporter refused) or the copy could not name them at
+    /// the offset they sit at. Always available, which is why the import is
+    /// allowed to decline for any reason at all.
+    Scratch(BufferSlot),
+}
+
+impl GuestTexels {
+    fn buffer(&self) -> vk::Buffer {
+        match self {
+            Self::Imported { buffer, .. } => *buffer,
+            Self::Scratch(slot) => slot.buffer,
+        }
+    }
+
+    fn offset(&self) -> u64 {
+        match self {
+            Self::Imported { offset, .. } => *offset,
+            Self::Scratch(_) => 0,
+        }
+    }
+}
+
 enum PreparedSampled {
     Upload {
         binding: u32,
@@ -108,25 +147,22 @@ enum PreparedSampled {
         volume: bool,
         layers: u32,
     },
-    /// Guest gather: the CPU packs the texel bytes out of the guest runs into a
-    /// pooled scratch, then one buffer→image copy uploads it.
+    /// Guest source: one buffer→image copy fills the sampled image out of the
+    /// guest's own texel bytes. [`GuestTexels`] says how far those bytes had to
+    /// travel to become a buffer the copy can name.
     ///
-    /// No owned CPU byte buffer exists, so nothing can fingerprint this content.
-    /// The slot is still retained when the producer vouched for an identity —
-    /// see [`super::types::SampledSource::GuestRuns`] — and the next bind of the
-    /// same window under the same generation binds it back through
-    /// `find_sampled_by_identity` without gathering at all.
-    ///
-    /// The gather used to happen on the device, out of per-run host-pointer
-    /// imports of the guest pages, which is why the scratch carried
-    /// `TRANSFER_DST` and a per-source copy list. Both are gone with the import.
+    /// No owned CPU byte buffer exists either way, so nothing can fingerprint
+    /// this content. The slot is still retained when the producer vouched for an
+    /// identity — see [`super::types::SampledSource::GuestRuns`] — and the next
+    /// bind of the same window under the same generation binds it back through
+    /// `find_sampled_by_identity` without touching the bytes at all.
     GuestGather {
         binding: u32,
         image: SampledSlot,
-        scratch: BufferSlot,
+        source: GuestTexels,
         /// `bufferRowLength` for the buffer→image copy (0 = tight rows).
         row_length_texels: u32,
-        /// Bytes gathered, for the cache's byte-cap accounting.
+        /// Bytes the copy names, for the cache's byte-cap accounting.
         gathered_len: usize,
     },
     Cached {
@@ -170,6 +206,106 @@ impl PreparedSampled {
         }
     }
 }
+
+/// `vkCmdCopyBufferToImage` requires `bufferOffset` to be a multiple of 4 and of
+/// the format's texel block size. 16 is the largest uncompressed block in core
+/// Vulkan and the larger of the two BC block sizes, so one check covers every
+/// format the sampled pool can produce without the arm having to know which one
+/// it is holding. A guest window whose first texel sits at any other offset
+/// takes the CPU gather, which has no such rule.
+const GUEST_IMPORT_COPY_OFFSET_ALIGN: u64 = 16;
+
+/// Bind a sampled source's guest pages as a buffer the copy can read directly,
+/// or say why it must be gathered on the CPU instead.
+///
+/// Every `None` is a routing answer and never a lost frame: the caller's CPU
+/// gather reads the same bytes through the same runs. So the checks here are
+/// free to be conservative — a window this refuses costs one `memcpy` that the
+/// device was making unconditionally until now.
+///
+/// # Safety
+///
+/// `ctx` must own the device `pools` holds every live import against.
+unsafe fn import_sampled_guest_window(
+    ctx: &super::context::DeviceContext,
+    pools: &mut ResourcePools,
+    src: &super::types::GuestRunSource,
+) -> Option<GuestTexels> {
+    if !ctx.caps.dma_buf_import.is_available() {
+        return None;
+    }
+    let window = src.pages.as_ref()?;
+    let offset = u64::from(window.head_offset);
+    if !offset.is_multiple_of(GUEST_IMPORT_COPY_OFFSET_ALIGN) {
+        crate::observe::Emit::decline(
+            "vk_sampled_import",
+            &SampledImportDecline::CopyOffsetAlignment { offset },
+        )
+        .fail_once(offset % GUEST_IMPORT_COPY_OFFSET_ALIGN);
+        return None;
+    }
+    let mapped = (window.gpas.len() as u64).saturating_mul(u64::from(window.page_size));
+    // The window is whole pages and the span starts inside the first one, so a
+    // span reaching past the last page is a page list that never covered it.
+    // Refusing beats binding a buffer the copy reads off the end of.
+    if offset.saturating_add(src.total_len) > mapped {
+        crate::observe::Emit::decline(
+            "vk_sampled_import",
+            &SampledImportDecline::WindowTooSmall {
+                need: offset + src.total_len,
+                have: mapped,
+            },
+        )
+        .fail_once(0);
+        return None;
+    }
+    match unsafe { pools.import_guest_window(ctx, &window.dmabuf, mapped) } {
+        Ok(import) => Some(GuestTexels::Imported {
+            buffer: import.buffer,
+            offset,
+        }),
+        Err(inner) => {
+            crate::observe::Emit::decline("vk_sampled_import", &inner).fail_once(0);
+            None
+        }
+    }
+}
+
+/// A check that sent a guest-sourced sampled bind back to the CPU gather before
+/// the import itself was ever asked.
+///
+/// Separate from [`super::dmabuf::DmaBufDecline`] because these are properties
+/// of the *copy* this arm wants to record, not of the fd or the device: the same
+/// window would import fine for a caller that named it differently.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SampledImportDecline {
+    /// The first texel does not sit at an offset `vkCmdCopyBufferToImage` can
+    /// name. See [`GUEST_IMPORT_COPY_OFFSET_ALIGN`].
+    CopyOffsetAlignment { offset: u64 },
+    /// The page list does not reach the end of the texel span it was resolved
+    /// for.
+    WindowTooSmall { need: u64, have: u64 },
+}
+
+impl crate::observe::Decline for SampledImportDecline {
+    fn slug(&self) -> &'static str {
+        match self {
+            Self::CopyOffsetAlignment { .. } => "sampled_import_copy_offset_alignment",
+            Self::WindowTooSmall { .. } => "sampled_import_window_too_small",
+        }
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        match self {
+            Self::CopyOffsetAlignment { offset } => vec![("offset", offset.to_string())],
+            Self::WindowTooSmall { need, have } => {
+                vec![("need", need.to_string()), ("have", have.to_string())]
+            }
+        }
+    }
+}
+
+crate::observe::decline::decline_display!(SampledImportDecline);
 
 /// Shared validation for a draw-time buffer's content source. A `GuestRuns`
 /// span must be internally consistent: the run lengths sum to `total_len`,
@@ -682,6 +818,7 @@ unsafe fn upload_buffer_to_sampled_image(
     ctx: &super::context::DeviceContext,
     cb: vk::CommandBuffer,
     src: vk::Buffer,
+    src_offset: u64,
     image: vk::Image,
     width: u32,
     height: u32,
@@ -713,6 +850,7 @@ unsafe fn upload_buffer_to_sampled_image(
         &to_transfer,
     );
     let copy = [vk::BufferImageCopy::default()
+        .buffer_offset(src_offset)
         .buffer_row_length(row_length_texels)
         .image_subresource(vk::ImageSubresourceLayers {
             aspect_mask: vk::ImageAspectFlags::COLOR,
@@ -799,20 +937,18 @@ pub(crate) unsafe fn execute_draw_inner(
         .target_identity
         .as_ref()
         .is_some_and(|id| req.output_bgra || id.is_bgra());
-    // A sampled zero-copy source reads guest RAM when the CB *executes*, and
-    // ack-fast means the guest may repaint that buffer as soon as the command
-    // is consumed — deferred submit stretches record→execute from ~0 to a
-    // whole batch, so the GPU samples half-repainted a/b window buffers
-    // (large black bands under window drags, 2026-07-19 live A/B). Such draws take the immediate-submit path; buffer GuestRuns stay
-    // batchable because `stage_buffer_content` snapshots them at record time.
-    let has_zc_sampled = req
-        .sampled_images
-        .iter()
-        .any(|s| matches!(s.source, SampledSource::GuestRuns(_)));
+    // A guest-sourced sampled bind used to force the immediate-submit path.
+    // Its read of guest RAM happens when the CB *executes*, and this device
+    // acked the packet as soon as it was consumed, so deferred submit stretched
+    // record→execute from ~0 to a whole batch and the GPU sampled half-repainted
+    // a/b window buffers (large black bands under window drags, 2026-07-19 live
+    // A/B). Bounding the exposure by keeping it short was never a rule, only a
+    // small enough window; `write_stamp` now quiesces every recorded guest read
+    // before the guest is told anything finished, which makes it a rule and
+    // costs the exclusion nothing to drop.
     let batch_eligible = !force_loss
         && !ctx.caps.quirks.no_deferred_draw_batching
         && !is_mrt
-        && !has_zc_sampled
         && req.depth.is_none()
         && req.skip_readback
         && req.target_identity.is_some();
@@ -845,6 +981,12 @@ pub(crate) unsafe fn execute_draw_inner(
             .batch_slot(id, req.width, req.height, output_bgra)
             .expect("joins checked batch_slot")
     } else {
+        // A fresh command buffer, so the guest-window imports the previous one
+        // pinned against eviction may be displaced again. A *joiner*
+        // deliberately does not bump: it records into the open batch's CB, which
+        // still names every import the draws before it were handed and has not
+        // been submitted, so nothing may free one out from under it.
+        pools.dmabuf_imports_mut().begin_recording();
         pools.begin_entry(ctx, counters)?
     };
     phase.enter(super::draw_phase::Phase::Pipeline);
@@ -1553,31 +1695,46 @@ pub(crate) unsafe fn execute_draw_inner(
                 // accumulates, so a draw binding several gathers charges each
                 // half of each bind to its own bar.
                 phase.enter(super::draw_phase::Phase::SampledUpload);
-                let scratch = pools.acquire_staging(
-                    ctx,
-                    src.total_len,
-                    vk::BufferUsageFlags::TRANSFER_SRC,
-                    counters,
-                )?;
-                // The CPU gathers the texel bytes out of the guest runs into
-                // the mapped scratch; the command buffer then does one
-                // buffer→image copy over it.
+                // First ask whether the bytes have to move at all. A dma-buf
+                // over the guest's own pages is a buffer the copy can name, so
+                // where the host can export one this arm moves nothing on the
+                // CPU and the `memcpy` below never runs.
                 //
-                // The command buffer used to do the gather itself, copying from
-                // per-run `VK_EXT_external_memory_host` imports of the guest
-                // pages. That is the mechanism this removal is about: an
-                // imported host pointer is one the GPU can write, and these
-                // runs are guest RAM. `TRANSFER_DST` came off the scratch usage
-                // with it — nothing on the device writes this buffer any more.
-                pools.write_staging_from_runs(ctx, &scratch, &src.runs, src.total_len)?;
-                // The only arm of this loop that moves bytes, and until now the
-                // only one that reported nothing — which is what let the whole
-                // of `acquire_sampled` sit unattributed.
-                counters.note_sampled_gather(src.total_len);
+                // Note what this is *not*. The gather used to happen on the
+                // device out of per-run `VK_EXT_external_memory_host` imports,
+                // and that mechanism is banned: an imported host pointer is one
+                // the GPU can write, and these runs are guest RAM. A dma-buf
+                // names an explicit page list, is revoked by freeing it, and is
+                // tracked by the kernel — which is why it is the one import
+                // allowed over guest memory.
+                let source = match unsafe { import_sampled_guest_window(ctx, pools, src) } {
+                    Some(imported) => {
+                        // The read is now the command buffer's, at execute time.
+                        // `write_stamp` quiesces before telling the guest these
+                        // pages are free, which is what keeps that legal.
+                        pools.note_guest_read_recorded();
+                        counters.note_sampled_guest_import(src.total_len);
+                        imported
+                    }
+                    None => {
+                        let scratch = pools.acquire_staging(
+                            ctx,
+                            src.total_len,
+                            vk::BufferUsageFlags::TRANSFER_SRC,
+                            counters,
+                        )?;
+                        pools.write_staging_from_runs(ctx, &scratch, &src.runs, src.total_len)?;
+                        // The only arm of this loop that moves bytes, and until
+                        // now the only one that reported nothing — which is what
+                        // let the whole of `acquire_sampled` sit unattributed.
+                        counters.note_sampled_gather(src.total_len);
+                        GuestTexels::Scratch(scratch)
+                    }
+                };
                 sampled.push(PreparedSampled::GuestGather {
                     binding: resource.binding,
                     image: img,
-                    scratch,
+                    source,
                     row_length_texels: src.row_length_texels,
                     gathered_len: src.total_len as usize,
                 });
@@ -2035,6 +2192,7 @@ pub(crate) unsafe fn execute_draw_inner(
             ctx,
             cb,
             st.buffer,
+            0,
             img.image,
             img.width,
             img.height,
@@ -2044,21 +2202,20 @@ pub(crate) unsafe fn execute_draw_inner(
         );
     }
 
-    // Guest gathers: the scratch was packed by `write_staging_from_runs` during
-    // preparation, so this is the same host-staged upload the CPU-origin loop
-    // above performs, differing only in `row_length_texels` striding over guest
-    // row padding (0 = tight rows).
+    // Guest-sourced sampled uploads: one buffer→image copy over either the
+    // guest's imported pages or the scratch the CPU packed them into, differing
+    // from the CPU-origin loop above only in `row_length_texels` striding over
+    // guest row padding (0 = tight rows) and in the copy's `bufferOffset`.
     //
-    // No HOST→TRANSFER barrier, matching that loop: writes the host made before
-    // `vkQueueSubmit` are automatically visible to the device, and this scratch
-    // is written before the submit like every other staging slot. The two
-    // barriers that used to open this block ordered the *device-side* gather —
-    // per-run copies out of imported guest pages — against the image copy, and
-    // there is no device-side write to order any more.
+    // No HOST→TRANSFER barrier on either arm. For a scratch, the reason is the
+    // one the loop above relies on: host writes made before `vkQueueSubmit` are
+    // automatically visible to the device. For an import there is no host write
+    // at all — the bytes are the guest's, already in memory the device reads
+    // through the fd, and nothing in this process touched them.
     for image in &sampled {
         let PreparedSampled::GuestGather {
             image: img,
-            scratch,
+            source,
             row_length_texels,
             ..
         } = image
@@ -2068,7 +2225,8 @@ pub(crate) unsafe fn execute_draw_inner(
         upload_buffer_to_sampled_image(
             ctx,
             cb,
-            scratch.buffer,
+            source.buffer(),
+            source.offset(),
             img.image,
             img.width,
             img.height,
@@ -2646,6 +2804,61 @@ mod tests {
         GuestRun, GuestRunSource, SampledImageResource, SampledSource,
     };
     use crate::observe::Decline;
+
+    /// `bufferOffset` has a hard rule in the Vulkan spec, and this rail is the
+    /// only thing that ever gives it a nonzero value: every other sampled upload
+    /// starts at the head of a staging span this device allocated. A window
+    /// whose first texel sits at an offset the copy cannot name has to reach the
+    /// CPU gather, because the alternative is `VUID-vkCmdCopyBufferToImage`
+    /// undefined behaviour on a value the guest chose.
+    #[test]
+    fn the_copy_offset_bound_covers_every_texel_block_the_sampled_pool_can_hold() {
+        // A multiple of 16 is a multiple of 4, which is the other half of the
+        // rule for every non-depth/stencil format, and 16 is the largest block
+        // the pool can produce: it covers R32G32B32A32 as well as
+        // BC2/BC3/BC5/BC7.
+        assert_eq!(GUEST_IMPORT_COPY_OFFSET_ALIGN % 4, 0);
+        assert_eq!(
+            GUEST_IMPORT_COPY_OFFSET_ALIGN.max(16),
+            GUEST_IMPORT_COPY_OFFSET_ALIGN
+        );
+
+        // The check the constant exists for: an offset it accepts satisfies
+        // both halves of the rule, and one it rejects would not have.
+        for offset in [0u64, 16, 32, 4096] {
+            assert!(offset.is_multiple_of(GUEST_IMPORT_COPY_OFFSET_ALIGN));
+            assert!(offset.is_multiple_of(4));
+        }
+        for offset in [4u64, 8, 12, 100] {
+            assert!(!offset.is_multiple_of(GUEST_IMPORT_COPY_OFFSET_ALIGN));
+        }
+    }
+
+    /// Each reason a guest window fails to become a copy source is its own line
+    /// in the log.
+    ///
+    /// They route to the same place — the CPU gather — so nothing downstream
+    /// tells them apart, and a shared slug would leave "this host never imports
+    /// a sampled window" with no way to say whether the exporter is missing, the
+    /// page list is short, or every window this guest hands over lands on an odd
+    /// offset. Those are three different fixes.
+    #[test]
+    fn every_sampled_import_decline_names_its_own_check() {
+        let declines = [
+            SampledImportDecline::CopyOffsetAlignment { offset: 12 },
+            SampledImportDecline::WindowTooSmall {
+                need: 8192,
+                have: 4096,
+            },
+        ];
+        let slugs: Vec<_> = declines.iter().map(|d| d.slug()).collect();
+        let unique: std::collections::HashSet<_> = slugs.iter().collect();
+        assert_eq!(slugs.len(), unique.len(), "slugs collide: {slugs:?}");
+        for decline in &declines {
+            assert!(!decline.fields().is_empty(), "{decline} carries no values");
+            assert!(decline.slug().starts_with("sampled_import_"));
+        }
+    }
 
     fn validation_slug(req: &DrawRequest) -> &'static str {
         match validate_v1(req) {
