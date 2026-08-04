@@ -13,7 +13,11 @@ use std::os::raw::c_char;
 pub type ErrOut<'a> = (*mut c_char, usize);
 
 pub fn set_err(err: ErrOut<'_>, msg: impl AsRef<str>) {
-    write_err(err.0, err.1, msg.as_ref());
+    // SAFETY: `ErrOut` is the `(char *err, size_t err_cap)` pair the shim hands
+    // in, and `reims_vgpu_qemu_abi.h` requires it to be null or valid for
+    // `err_cap` bytes. `write_err` checks both null and a zero capacity itself,
+    // so this is the one place the ABI's promise is taken at face value.
+    unsafe { write_err(err.0, err.1, msg.as_ref()) };
 }
 
 pub fn clear_err(err: ErrOut<'_>) {

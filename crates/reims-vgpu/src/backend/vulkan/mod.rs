@@ -19,31 +19,25 @@
 
 pub mod caps;
 pub mod engine;
-pub mod spirv_emit;
 pub mod translate;
 
 use crate::backend::Backend;
 
-/// Vulkan-rail backend handle. Holds the ash-facing context when encode lands.
+/// Vulkan-rail backend handle.
+///
+/// Carries no state: the device and instance live in [`engine`]'s process-global
+/// context, which spins up lazily at the first real encode so off-VM protocol
+/// tests can construct this shell without a Vulkan ICD.
 #[derive(Debug, Default)]
-pub struct VulkanBackend {
-    ready: bool,
-}
+pub struct VulkanBackend;
 
 impl VulkanBackend {
     pub fn new() -> Self {
-        // Device/instance spin-up stays lazy until the first real encode path
-        // needs it, so off-VM protocol tests can construct the shell without a
-        // Vulkan ICD.
-        Self { ready: true }
+        Self
     }
 
     pub fn name(&self) -> &'static str {
         "vulkan"
-    }
-
-    pub fn ready(&self) -> bool {
-        self.ready
     }
 }
 

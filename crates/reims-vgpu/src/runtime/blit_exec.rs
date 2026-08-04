@@ -699,10 +699,16 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
     // blit path previously dropped every one as `tex_wrong_type` (~99/six-app
     // launch, all object_type=5), so a blit COPY from a video/biplanar plane
     // or a row-byte-equivalent reinterpretation view (e.g. RGBA32Uint over
-    // BGRA8) never landed. Resolve it exactly like type-11 but using the
-    // decoded VIEW geometry/format: `type11_sample_window` matches the actual
-    // plane record by geometry+bpe (or a packed row-compatible reinterpretation)
-    // and fail-closes when it cannot, so this never invents a plane window.
+    // BGRA8) never landed.
+    //
+    // Resolve it with the view's own geometry, format **and plane index**. The
+    // plane is on the wire here (record `+0x20`) and must be used: it is the
+    // whole difference between this and type-11, whose window resolves the plane
+    // by matching geometry and bytes-per-element and so cannot tell two planes
+    // that share both apart. A biplanar COPY names exactly such a pair, so this
+    // is the path where dropping the index lands. `type5_sample_window` states
+    // the case and `note_type5_plane_invent` reports the one way it can still go
+    // wrong.
     if entry.object_type == objects::OBJECT_TYPE_REF_TEXTURE {
         if level != 0 || slice != 0 {
             return Err(br(BlitStatus::Unsupported, "t5_level_slice"));
@@ -738,11 +744,41 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
         let Some(bpp) = pixel_format::bytes_per_pixel(format) else {
             return Err(br(BlitStatus::Unsupported, "t5_fmt_bpp"));
         };
-        let Some((surface_offset, surface_bpr, span_end)) =
-            mapping_write::type11_sample_window(m, sid, view.width, view.height, format)
+        let Some((surface_offset, surface_bpr, span_end, from_device)) =
+            mapping_write::type5_sample_window(m, view.plane_index, view.width, view.height, format)
         else {
             return Err(br(BlitStatus::Bounds, "t5_sample_window"));
         };
+        // Whether this arm runs at all, and on which side of the plane
+        // resolution. Without it a change to the window this arm resolves cannot
+        // be attributed: an unchanged screen and an arm that never executed look
+        // identical, and so do a repaired blit and a blit that never happened.
+        //
+        // Read on a driven x86/Vulkan boot (Safari window drag + two
+        // web-content-probe runs): **both counters 0** — this arm does not
+        // execute on that workload at all, while `blit_dest_bound` reads 26, so
+        // the blit path itself does run and it is the type-5 source that is
+        // absent. The plane-index resolution above is therefore contract
+        // fidelity, not a repair of anything this workload does, and a screen
+        // that looks the same after changing it says nothing either way. It also
+        // means this arm cannot be blamed for a display defect seen on a boot
+        // where these read zero, which is what they were added to establish.
+        crate::runtime::drain::note_store_route(if from_device {
+            "blit_t5_plane_device"
+        } else {
+            "blit_t5_plane_invent"
+        });
+        if !from_device {
+            mapping_write::note_type5_plane_invent(
+                sid,
+                view.plane_index,
+                view.width,
+                view.height,
+                format,
+                (surface_offset, surface_bpr),
+                "blit_texture",
+            );
+        }
         return Ok(TextureBacking::Type11(Type11Texture {
             mapping_id: sid,
             width: view.width,
@@ -1051,44 +1087,7 @@ fn ranges_overlap(a0: u64, a_len: u64, b0: u64, b_len: u64) -> bool {
     a0 < b1 && b0 < a1
 }
 
-/// Guest pages a blit's destination span resolves to, taken before the loop that
-/// writes them.
-///
-/// A blit does not wait for the GPU, which is why these writes were argued to be
-/// authorised by the page table at the moment they run. That argument confuses
-/// "synchronous with the device thread" with "instantaneous": a full-screen
-/// texture copy is tens of MiB of per-row guest read and guest write, the guest's
-/// own vCPUs run throughout, and the destination is re-resolved from scratch on
-/// every row. The pages `gva + 8000 * stride` names at the end of the loop need
-/// not be the pages the same expression named at the start, and a copy that runs
-/// off its resource paints whatever the guest handed those pages to next — the
-/// heap and kernel corruption this class is made of.
-///
-/// Capturing the whole destination span once, up front, makes every row's write
-/// authorised by the walk the command itself would have been authorised by.
-///
-/// `None` when the span resolves no page at all. That leaves the writer to fail
-/// closed on its own terms rather than refusing a whole blit because the capture
-/// failed for an unrelated reason; it is counted so the arm is measurable
-/// instead of assumed.
-fn dest_window<M: HostMemory>(
-    state: &DeviceState,
-    host: &M,
-    task_id: u32,
-    gva: u64,
-    span: u64,
-) -> Option<std::collections::HashSet<u64>> {
-    if gva == 0 || span == 0 {
-        return None;
-    }
-    let pages = gva_mem::task_gva_page_gpa_set(host, &state.tasks, task_id, gva, span, state.page_shift);
-    if pages.is_empty() {
-        crate::runtime::drain::note_store_route("blit_dest_unbounded");
-        return None;
-    }
-    crate::runtime::drain::note_store_route("blit_dest_bound");
-    Some(pages)
-}
+use gva_mem::dest_window;
 
 /// [`dest_window`] over the region of a texture a row loop is about to write.
 ///
@@ -1096,9 +1095,16 @@ fn dest_window<M: HostMemory>(
 /// first row to last, so a level, slice or plane stride this bound does not
 /// model cannot place a row outside the set it authorises.
 ///
-/// `None` for a type-11 texture: that write goes through the mapping rail,
+/// `Ok(None)` for a type-11 texture: that write goes through the mapping rail,
 /// authorised by the page list the guest declared for the mapping. Walking a
 /// GVA span for it would bound the wrong address space.
+///
+/// Every other way this can fail to produce a bound is an `Err`, never a
+/// `None`. `None` reaches [`write_texture_row`] as "authorised by the command",
+/// so an arithmetic failure answered with `None` would *widen* the write from
+/// the region the guest named to the whole address space — the opposite of what
+/// failing to measure that region should do. The geometry here is the copy the
+/// command decoded; if it does not resolve, the command does not execute.
 #[allow(
     clippy::too_many_arguments,
     reason = "the window mirrors the copy region the row loop walks"
@@ -1115,19 +1121,36 @@ fn texture_region_window<M: HostMemory>(
     copy_h: u64,
     copy_d: u64,
     bpp: u32,
-) -> Option<std::collections::HashSet<u64>> {
+) -> Result<Option<std::collections::HashSet<u64>>, BlitStatus> {
     let TextureBacking::Linear(t) = tex else {
-        return None;
+        return Ok(None);
     };
-    let first = t.texel_offset(ox, oy, oz)?;
-    let last = t.texel_offset(
-        ox,
-        oy.checked_add(copy_h.checked_sub(1)?)?,
-        oz.checked_add(copy_d.checked_sub(1)?)?,
-    )?;
-    let row_bytes = (copy_w as u64).checked_mul(bpp as u64)?;
-    let span = last.checked_add(row_bytes)?.checked_sub(first)?;
-    dest_window(state, host, task_id, t.base_gva.checked_add(first)?, span)
+    // An empty extent authorises no page, which is exact: every caller's row
+    // loop is `for z in 0..copy_d { for y in 0..copy_h`, so it writes nothing.
+    let (Some(last_row), Some(last_plane)) = (copy_h.checked_sub(1), copy_d.checked_sub(1)) else {
+        return Ok(Some(std::collections::HashSet::new()));
+    };
+    let oob = |slug| br(BlitStatus::Bounds, slug);
+    let first = t
+        .texel_offset(ox, oy, oz)
+        .ok_or_else(|| oob("tex_window_first_texel_oob"))?;
+    let last = oy
+        .checked_add(last_row)
+        .zip(oz.checked_add(last_plane))
+        .and_then(|(y, z)| t.texel_offset(ox, y, z))
+        .ok_or_else(|| oob("tex_window_last_texel_oob"))?;
+    let row_bytes = (copy_w as u64)
+        .checked_mul(bpp as u64)
+        .ok_or_else(|| oob("tex_window_row_bytes_overflow"))?;
+    let span = last
+        .checked_add(row_bytes)
+        .and_then(|end| end.checked_sub(first))
+        .ok_or_else(|| oob("tex_window_span_overflow"))?;
+    let base = t
+        .base_gva
+        .checked_add(first)
+        .ok_or_else(|| oob("tex_window_base_overflow"))?;
+    Ok(dest_window(state, host, task_id, base, span))
 }
 
 /// Highest byte offset past `base` a strided plane/row walk reaches.
@@ -1157,13 +1180,47 @@ fn write_fill_range<M: HostMemory + HostOps>(
     length: u64,
     value: u8,
 ) -> Result<(), BlitStatus> {
+    write_fill_pattern(host, state, task_id, gva, length, &[value])
+}
+
+/// Write `length` bytes at `gva` by repeating `pattern` from its first byte.
+///
+/// One body for both fill records rather than a copy per record. The byte fill
+/// is this with a one-byte pattern, which is not a generalisation for its own
+/// sake: the bounds check, the `dest_window` authorisation, the chunked write
+/// and the GVA advance are the four things a second copy would have to keep in
+/// step, and this rail has already produced three bugs from two arms of one
+/// guest-memory write drifting apart.
+///
+/// Phase is preserved across chunks because the tile is a whole number of
+/// patterns, so every chunk begins on pattern byte 0 exactly as the first one
+/// does. That is asserted rather than assumed — a `CHUNK` that stopped being a
+/// multiple of the pattern width would shift every byte after the first tile.
+fn write_fill_pattern<M: HostMemory + HostOps>(
+    host: &mut M,
+    state: &mut DeviceState,
+    task_id: u32,
+    gva: u64,
+    length: u64,
+    pattern: &[u8],
+) -> Result<(), BlitStatus> {
     if length == 0 {
         return Ok(());
     }
+    debug_assert!(!pattern.is_empty(), "a fill with no pattern writes nothing");
+    debug_assert_eq!(
+        CHUNK % pattern.len(),
+        0,
+        "the staging tile must hold a whole number of patterns, or the phase \
+         shifts at every chunk boundary"
+    );
     let allowed = dest_window(state, host, task_id, gva, length);
     let mut remaining = length;
     let mut cur = gva;
-    let chunk = vec![value; CHUNK];
+    let mut chunk = vec![0u8; CHUNK];
+    for (i, b) in chunk.iter_mut().enumerate() {
+        *b = pattern[i % pattern.len()];
+    }
     while remaining > 0 {
         let n = remaining.min(CHUNK as u64) as usize;
         if gva_mem::write_task_gva_product_within(
@@ -1382,6 +1439,64 @@ fn exec_fill_buffer<M: HostMemory + HostOps>(
     }
 }
 
+/// `fillBuffer:range:pattern4:` — the byte fill with a repeating 32-bit unit.
+///
+/// Same resolve, same bounds check and same write path as
+/// [`exec_fill_buffer`]; only the chunk this repeats differs. That is the whole
+/// difference between the two records on the wire too — one length, one layout,
+/// and a last field that is one byte wide in `0x132` and four in `0x13f`.
+///
+/// # Why an unaligned range is refused rather than filled
+///
+/// The record settles *what* repeats and says nothing about the **phase** it
+/// repeats on, and there are two readings that differ:
+///
+/// - the pattern restarts at `range.location`, so byte `i` of the range takes
+///   `pattern[i % 4]`;
+/// - the pattern is anchored to the buffer, so the byte at buffer offset `o`
+///   takes `pattern[o % 4]`.
+///
+/// The two agree for every byte exactly when `range.location % 4 == 0`, and
+/// nothing this project can reach decides between them otherwise: the
+/// serializer forwards the arguments untouched, so the choice belongs to
+/// Apple's host implementation and no capture of the command stream can see it.
+///
+/// So the aligned case is executed — no guess is being made there — and the
+/// unaligned case is refused by name. Filling it under either reading would put
+/// bytes in guest memory that are plausible and possibly wrong, which is worse
+/// than a refusal the fail log explains. `fill_pattern4_unaligned_range` is a
+/// healthy zero, and a non-zero reading is the measured argument for going and
+/// deriving the phase rule.
+fn exec_fill_buffer_pattern4<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    cmd: &Command,
+) -> BlitStatus {
+    if cmd.range_length == 0 {
+        return BlitStatus::ZeroExtent;
+    }
+    let pattern = cmd.fill_pattern.to_le_bytes();
+    if !cmd.range_location.is_multiple_of(pattern.len() as u64) {
+        return br(BlitStatus::Unsupported, "fill_pattern4_unaligned_range");
+    }
+    let buf = match resolve_buffer(state, host, task_id, cmd.buffer) {
+        Ok(b) => b,
+        Err(st) => return st,
+    };
+    if !range_fits(cmd.range_location, cmd.range_length, buf.size) {
+        return br(BlitStatus::Bounds, "fill_pattern4_range_oob");
+    }
+    let gva = match buf.gva.checked_add(cmd.range_location) {
+        Some(v) => v,
+        None => return br(BlitStatus::Bounds, "fill_pattern4_gva_overflow"),
+    };
+    match write_fill_pattern(host, state, task_id, gva, cmd.range_length, &pattern) {
+        Ok(()) => BlitStatus::Ok,
+        Err(st) => st,
+    }
+}
+
 fn exec_copy_buffer_to_buffer<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -1569,7 +1684,7 @@ fn copy_buffer_texture_rows_aspect<M: HostMemory + HostOps>(
     let allowed = if to_texture {
         texture_region_window(
             state, host, task_id, tex, tex_ox, tex_oy, tex_oz, copy_w, copy_h, copy_d, storage_bpp,
-        )
+        )?
     } else {
         let span = strided_span(
             plane_row as u64,
@@ -1902,9 +2017,12 @@ fn exec_copy_buffer_to_texture<M: HostMemory + HostOps>(
     }
     // `None` for the type-11 destination this arm is for, which the mapping rail
     // authorises instead; a linear destination reaching here is still bounded.
-    let allowed = texture_region_window(
+    let allowed = match texture_region_window(
         state, host, task_id, &dst, ox, oy, oz, copy_w as u32, copy_h, copy_d, copy_bpp,
-    );
+    ) {
+        Ok(v) => v,
+        Err(st) => return st,
+    };
     let mut row = vec![0u8; row_bytes as usize];
     for z in 0..copy_d {
         for y in 0..copy_h {
@@ -2108,6 +2226,19 @@ fn exec_copy_texture_to_buffer<M: HostMemory + HostOps>(
     if dst_span > dst.size {
         return br(BlitStatus::Bounds, "t2b_stage_dst_span_oob");
     }
+    // `dst_span` is measured from `dst.gva`, so the span this loop writes starts
+    // one `destination_offset` in.
+    let dst_base = match dst.gva.checked_add(cmd.destination_offset) {
+        Some(v) => v,
+        None => return br(BlitStatus::Bounds, "t2b_stage_dst_gva_overflow"),
+    };
+    let allowed = dest_window(
+        state,
+        host,
+        task_id,
+        dst_base,
+        dst_span.saturating_sub(cmd.destination_offset),
+    );
     let mut row = vec![0u8; row_bytes as usize];
     for z in 0..copy_d {
         for y in 0..copy_h {
@@ -2125,16 +2256,23 @@ fn exec_copy_texture_to_buffer<M: HostMemory + HostOps>(
             ) {
                 return st;
             }
-            let d = match dst
-                .gva
-                .checked_add(cmd.destination_offset)
-                .and_then(|b| b.checked_add(z.saturating_mul(dst_bpi)))
+            let d = match dst_base
+                .checked_add(z.saturating_mul(dst_bpi))
                 .and_then(|b| b.checked_add(y.saturating_mul(dst_bpr)))
             {
                 Some(v) => v,
                 None => return br(BlitStatus::Bounds, "t2b_stage_dst_gva_overflow"),
             };
-            if gva_mem::write_task_gva_product(state, host, task_id, d, &row).is_err() {
+            if gva_mem::write_task_gva_product_within(
+                state,
+                host,
+                task_id,
+                d,
+                &row,
+                allowed.as_ref(),
+            )
+            .is_err()
+            {
                 return br(BlitStatus::GuestIo, "t2b_stage_write_io");
             }
         }
@@ -2242,7 +2380,7 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
         let mut plane = vec![0u8; plane_row];
         let mut src_packed = vec![0u8; (copy_w as usize).saturating_mul(src_storage as usize)];
         let mut dst_packed = vec![0u8; (copy_w as usize).saturating_mul(dst_storage as usize)];
-        let allowed = texture_region_window(
+        let allowed = match texture_region_window(
             state,
             host,
             task_id,
@@ -2257,7 +2395,10 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
             // `dst_storage` row, the other a `copy_bpp` plane row. The window
             // has to cover whichever runs, so it is measured on the wider.
             dst_storage.max(copy_bpp),
-        );
+        ) {
+            Ok(v) => v,
+            Err(st) => return st,
+        };
         for z in 0..copy_d {
             for y in 0..copy_h {
                 if repack_src {
@@ -2466,9 +2607,12 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
         };
     }
     // Mixed or type-11↔type-11: stage rows.
-    let allowed = texture_region_window(
+    let allowed = match texture_region_window(
         state, host, task_id, &dst, dox, doy, doz, copy_w as u32, copy_h, copy_d, copy_bpp,
-    );
+    ) {
+        Ok(v) => v,
+        Err(st) => return st,
+    };
     let mut row = vec![0u8; row_bytes as usize];
     for z in 0..copy_d {
         for y in 0..copy_h {
@@ -2729,8 +2873,12 @@ fn exec_copy_texture_to_texture_slice_level<M: HostMemory + HostOps>(
                 return br(BlitStatus::Bounds, "sl_inner_dim_mismatch");
             }
             let mut row = vec![0u8; row_bytes as usize];
-            let allowed =
-                texture_region_window(state, host, task_id, &dst, 0, 0, 0, w, h as u64, 1, bpp);
+            let allowed = match texture_region_window(
+                state, host, task_id, &dst, 0, 0, 0, w, h as u64, 1, bpp,
+            ) {
+                Ok(v) => v,
+                Err(st) => return st,
+            };
             for y in 0..h as u64 {
                 if let Err(st) =
                     read_texture_row(state, host, task_id, &src, 0, 0, 0, y, row_bytes, &mut row)
@@ -2819,6 +2967,7 @@ pub fn execute_blit<M: HostMemory + HostOps>(
     clear_blit_fail_reason();
     match cmd.kind {
         Kind::FillBuffer => exec_fill_buffer(state, host, task_id, cmd),
+        Kind::FillBufferPattern4 => exec_fill_buffer_pattern4(state, host, task_id, cmd),
         Kind::Copy => match cmd.copy_kind {
             CopyKind::BufferToBuffer => exec_copy_buffer_to_buffer(state, host, task_id, cmd),
             CopyKind::BufferToTexture => exec_copy_buffer_to_texture(state, host, task_id, cmd),
@@ -2832,6 +2981,21 @@ pub fn execute_blit<M: HostMemory + HostOps>(
         Kind::Fence => execute_blit_fence(state, task_id, cmd),
         Kind::Resource | Kind::Image | Kind::Unknown => {
             br(BlitStatus::Unsupported, "blit_kind_unsupported")
+        }
+        // The three indirect-command-buffer records never reach here:
+        // `handle_blit_record` answers them itself, counting the two that are
+        // lost work and treating the optimize hint as the no-op it is. A
+        // sighting means the dispatch there stopped routing them, so it gets a
+        // reason of its own rather than joining the unsupported kinds above.
+        Kind::IcbRange | Kind::IcbCopy => br(BlitStatus::Unsupported, "blit_kind_icb_misrouted"),
+        // The two `BlitEncoderSPI` records this device decodes and does not
+        // apply. Like the ICB pair above they are answered by
+        // `handle_blit_record`, which counts the texture fill as lost work and
+        // the compressed-texture invalidate as the no-op it is — so reaching
+        // here means that dispatch stopped routing them, which is a different
+        // defect from a kind nobody implemented and gets its own reason.
+        Kind::FillTexture | Kind::InvalidateCompressedTexture => {
+            br(BlitStatus::Unsupported, "blit_kind_spi_misrouted")
         }
     }
 }
@@ -3161,6 +3325,118 @@ mod tests {
         assert_eq!(out, [0x5a; 8]);
     }
 
+    /// The pattern fill lands a repeating 32-bit unit, in the right order and
+    /// on the right phase.
+    ///
+    /// Deliberately not four equal bytes: a pattern of `0x89abcdef` fails if
+    /// the executor wrote the `u32` big-endian, wrote only its low byte, or
+    /// started the repeat anywhere but the range's first byte, and each of
+    /// those produces bytes that look filled. The range starts at 16 rather
+    /// than 0 so a fill that ignored `range_location` also fails, and the
+    /// length is not a multiple of the pattern so the partial tail is checked.
+    #[test]
+    fn fill_buffer_pattern4_roundtrip() {
+        let (mut host, mut state) = blit_device();
+        install_buffer(&mut host, &mut state, 7, 1, 256);
+        let mut cmd = Command::default();
+        cmd.kind = Kind::FillBufferPattern4;
+        cmd.buffer = 7;
+        cmd.range_location = 16;
+        cmd.range_length = 10;
+        cmd.fill_pattern = 0x89ab_cdef;
+        assert_eq!(execute_blit(&mut state, &mut host, 1, &cmd), BlitStatus::Ok);
+        let mut out = [0u8; 12];
+        let gva = (1u64 << RESOURCE_PAGE_SHIFT) + 16;
+        assert!(
+            gva_mem::read_task_gva(&host, &state.tasks[1], gva, &mut out, PAGE_SHIFT_ARM64E)
+                .is_ok()
+        );
+        assert_eq!(
+            &out[..10],
+            &[0xef, 0xcd, 0xab, 0x89, 0xef, 0xcd, 0xab, 0x89, 0xef, 0xcd],
+            "the pattern must repeat little-endian from the range's first byte"
+        );
+        assert_eq!(&out[10..], &[0, 0], "the fill wrote past its length");
+    }
+
+    /// A range whose start is not pattern-aligned is refused, by name.
+    ///
+    /// The record says what repeats and not what phase it repeats on, and the
+    /// two readings — anchored to the range, anchored to the buffer — disagree
+    /// for exactly these ranges. Filling one under either reading writes
+    /// plausible bytes into guest memory that may be wrong, which is worse than
+    /// a refusal the fail log explains. A non-zero reading of
+    /// `fill_pattern4_unaligned_range` on a driven boot is the argument for
+    /// deriving the phase rule; until then it is a healthy zero.
+    #[test]
+    fn an_unaligned_pattern_fill_is_refused_rather_than_guessed() {
+        let (mut host, mut state) = blit_device();
+        install_buffer(&mut host, &mut state, 7, 1, 256);
+        let mut cmd = Command::default();
+        cmd.kind = Kind::FillBufferPattern4;
+        cmd.buffer = 7;
+        cmd.range_location = 17;
+        cmd.range_length = 8;
+        cmd.fill_pattern = 0x89ab_cdef;
+        assert_eq!(
+            execute_blit(&mut state, &mut host, 1, &cmd),
+            BlitStatus::Unsupported
+        );
+        assert_eq!(
+            blit_fail_reason(),
+            "fill_pattern4_unaligned_range",
+            "the refusal must name the phase question rather than reporting a \
+             generic unsupported"
+        );
+        // And nothing was written: a refusal that had already painted part of
+        // the range would be worse than the fill it declined to do.
+        let mut out = [0u8; 8];
+        let gva = (1u64 << RESOURCE_PAGE_SHIFT) + 17;
+        assert!(
+            gva_mem::read_task_gva(&host, &state.tasks[1], gva, &mut out, PAGE_SHIFT_ARM64E)
+                .is_ok()
+        );
+        assert_eq!(out, [0u8; 8]);
+    }
+
+    /// The byte fill and the pattern fill are one write path.
+    ///
+    /// `write_fill_range` is `write_fill_pattern` with a one-byte pattern, and
+    /// this asserts the two agree on the bytes rather than only on the code
+    /// being shared — the divergence this rail keeps producing is two arms of
+    /// one guest-memory write drifting, and a shared body is only worth
+    /// anything if the equivalence is checked.
+    #[test]
+    fn a_byte_fill_and_a_four_equal_byte_pattern_fill_write_the_same_bytes() {
+        let read_back = |cmd: &Command| {
+            let (mut host, mut state) = blit_device();
+            install_buffer(&mut host, &mut state, 7, 1, 256);
+            assert_eq!(execute_blit(&mut state, &mut host, 1, cmd), BlitStatus::Ok);
+            let mut out = [0u8; 12];
+            let gva = (1u64 << RESOURCE_PAGE_SHIFT) + 16;
+            assert!(gva_mem::read_task_gva(
+                &host,
+                &state.tasks[1],
+                gva,
+                &mut out,
+                PAGE_SHIFT_ARM64E
+            )
+            .is_ok());
+            out
+        };
+        let mut byte_fill = Command::default();
+        byte_fill.kind = Kind::FillBuffer;
+        byte_fill.buffer = 7;
+        byte_fill.range_location = 16;
+        byte_fill.range_length = 10;
+        byte_fill.fill_value = 0x5a;
+        let mut pattern_fill = byte_fill.clone();
+        pattern_fill.kind = Kind::FillBufferPattern4;
+        pattern_fill.fill_value = 0;
+        pattern_fill.fill_pattern = u32::from_le_bytes([0x5a; 4]);
+        assert_eq!(read_back(&byte_fill), read_back(&pattern_fill));
+    }
+
     /// The reason channel names *which* collapsed check fired for a coarse
     /// `BlitStatus`, distinguishes distinct causes, is reset per command so a stale
     /// slug never leaks across blits, and stays empty after a successful blit.
@@ -3481,6 +3757,127 @@ mod tests {
         );
         let e = objects::lookup_list_entry(state, host, 1, obj_ref).expect("type5 entry");
         assert_eq!(e.object_type, objects::OBJECT_TYPE_REF_TEXTURE);
+    }
+
+    /// A blit source must read the plane the wire named, and the only shape that
+    /// can prove it is two planes that share geometry and bytes-per-element.
+    ///
+    /// This branch resolved type-5 views through `type11_sample_window`, which
+    /// takes no plane index and picks a plane by matching width, height and bpe.
+    /// On the v0a8 shape the live apple.com hero produces — Y and alpha both R8
+    /// at the luma geometry — that scan matches *two* records, takes neither, and
+    /// returns the invented packed window: plane 0's bytes at offset 0. So a COPY
+    /// from the alpha plane silently read luma, the copy succeeded, and nothing
+    /// downstream could tell.
+    ///
+    /// The fixture is that shape at a size that fits one page. Plane 2 is byte-
+    /// identical in geometry to plane 0 and differs only in offset, so an
+    /// assertion on the offset is exactly the assertion that the index was used.
+    #[test]
+    fn a_type5_blit_source_reads_the_plane_the_wire_named() {
+        use crate::contract::endian::st64;
+        use crate::contract::iosurface_pages::{
+            DEVICE_DESC_ALLOC_SIZE, DEVICE_DESC_LEN, DEVICE_DESC_PLANES, DEVICE_DESC_PLANE_COUNT,
+            DEVICE_PLANE_BPE, DEVICE_PLANE_BPR, DEVICE_PLANE_DESC_LEN, DEVICE_PLANE_DIMS,
+            DEVICE_PLANE_OFFSET, DEVICE_PLANE_SIZE,
+        };
+        use crate::contract::pixel_format::{MTL_FORMAT_R8_UNORM, MTL_FORMAT_RG8_UNORM};
+        // Device-plane dims word: width u24@1, height u24@5 (`decode_device_plane`).
+        let pack_plane_dims =
+            |w: u32, h: u32| ((w as u64 & 0xffffff) << 8) | ((h as u64 & 0xffffff) << 40);
+
+        let (mut host, mut state) = blit_device();
+        let (mapping_id, obj_ref) = (34u32, 12u32);
+        let (w, h) = (8u32, 4u32);
+        // Plane 2 is the alpha plane: same 8x4 R8 as plane 0, different offset.
+        const ALPHA_OFFSET: u32 = 128;
+        install_type5(
+            &mut host,
+            &mut state,
+            obj_ref,
+            mapping_id,
+            0x30,
+            MTL_FORMAT_R8_UNORM,
+            w,
+            h,
+        );
+        set_type5_record_plane(&mut host, &state, obj_ref, 2);
+
+        let mut desc = vec![0u8; DEVICE_DESC_LEN];
+        st32(&mut desc[DEVICE_DESC_ALLOC_SIZE..], 0x1000);
+        desc[DEVICE_DESC_PLANE_COUNT] = 3;
+        // (offset, size, width, height, bpr, bpe)
+        let planes = [
+            (0u32, 32u32, 8u32, 4u32, 8u32, 1u16),
+            (64, 16, 4, 2, 8, 2),
+            (ALPHA_OFFSET, 32, 8, 4, 8, 1),
+        ];
+        for (i, (off, size, pw, ph, bpr, bpe)) in planes.iter().enumerate() {
+            let base = DEVICE_DESC_PLANES + i * DEVICE_PLANE_DESC_LEN;
+            st32(&mut desc[base + DEVICE_PLANE_OFFSET..], *off);
+            st32(&mut desc[base + DEVICE_PLANE_SIZE..], *size);
+            st64(
+                &mut desc[base + DEVICE_PLANE_DIMS..],
+                pack_plane_dims(*pw, *ph),
+            );
+            st32(&mut desc[base + DEVICE_PLANE_BPR..], *bpr);
+            st16(&mut desc[base + DEVICE_PLANE_BPE..], *bpe);
+        }
+        state
+            .mappings
+            .get_mut(&mapping_id)
+            .expect("mapping")
+            .device_desc = desc;
+
+        // The scan is genuinely ambiguous on this descriptor: without the index
+        // it lands on the invent, which is what this test exists to exclude.
+        let ambiguous = {
+            let m = state.mappings.get(&mapping_id).unwrap();
+            mapping_write::type11_sample_window(m, mapping_id, w, h, MTL_FORMAT_R8_UNORM)
+        };
+        assert_eq!(
+            ambiguous.map(|(off, _, _)| off),
+            Some(0),
+            "fixture must be ambiguous by geometry, or it proves nothing"
+        );
+        // Sanity: plane 1 is a different geometry, so the ambiguity is between
+        // planes 0 and 2 specifically and not a descriptor that resolves nothing.
+        let uv = {
+            let m = state.mappings.get(&mapping_id).unwrap();
+            mapping_write::type5_sample_window(m, 1, 4, 2, MTL_FORMAT_RG8_UNORM)
+        };
+        assert_eq!(uv.map(|(off, _, _, dev)| (off, dev)), Some((64, true)));
+
+        let backing = resolve_texture_backing(&mut state, &mut host, 1, obj_ref, 0, 0)
+            .expect("type-5 blit source must resolve");
+        match backing {
+            TextureBacking::Type11(t) => assert_eq!(
+                t.surface_offset, ALPHA_OFFSET as u64,
+                "the wire named plane 2; offset 0 is plane 0's invented window"
+            ),
+            TextureBacking::Linear(_) => panic!("expected Type11 backing, got Linear"),
+        }
+    }
+
+    /// Overwrite the plane index in an installed type-5 record.
+    ///
+    /// `install_type5` leaves it 0 (the field sits past the fields it writes and
+    /// the blob is zeroed), which is the one value that cannot distinguish a
+    /// used index from a dropped one.
+    fn set_type5_record_plane(host: &mut FakeHost, state: &DeviceState, obj_ref: u32, plane: u32) {
+        let off = objects::TYPE5_ARG_RECORD + objects::TYPE5_RECORD_PLANE;
+        let desc_gva = 0x180u64 + (obj_ref as u64) * 0x40;
+        let mut word = [0u8; 4];
+        st32(&mut word, plane);
+        write_task_gva_arm64e(host, &state.tasks[1], desc_gva + off as u64, &word);
+        let entry = objects::lookup_list_entry(state, host, 1, obj_ref).expect("type5 entry");
+        let desc = objects::read_descriptor(state, host, 1, &entry).expect("type5 desc");
+        assert_eq!(
+            objects::decode_type5_texture_view(&desc)
+                .expect("view")
+                .plane_index,
+            plane
+        );
     }
 
     /// Regression guard for the type-5 RefTexture blit-source branch
@@ -3823,6 +4220,59 @@ mod tests {
         t1.slice_index = 2;
         // + 2 * 64 slice stride
         assert_eq!(t1.texel_offset(1, 2, 0), Some(0x124 + 128));
+    }
+
+    /// Geometry this device cannot measure must refuse the copy, never hand the
+    /// row loop the `None` that means "authorised by the command".
+    ///
+    /// `write_texture_row` consults `allowed` only when it is `Some`, so a
+    /// `None` produced by arithmetic that overflowed widens the write from the
+    /// region the guest named to every page the task can reach. Before this was
+    /// a `Result` the whole ladder answered `None`, so the wider write was also
+    /// the silent one: it reached no counter, because every early return
+    /// happened before `dest_window` — the only thing that reports here — was
+    /// ever called.
+    #[test]
+    fn an_unmeasurable_copy_region_refuses_rather_than_writing_unbounded() {
+        let (host, state) = blit_device();
+        let level = |row_stride: u64| LinearTextureLevel {
+            base_gva: 0x1000,
+            alloc_size: 0x1000,
+            level_offset: 0,
+            row_stride,
+            slice_stride: 0,
+            slice_index: 0,
+            width: 4,
+            height: 1,
+            depth: 1,
+            bpp: 4,
+            pixel_format: MTL_FORMAT_RGBA8_UNORM,
+        };
+
+        // Row 0 resolves and row 7's `y * row_stride` does not, which is the
+        // case that matters: the loop would have written its way up to the bad
+        // row before anything noticed.
+        let tex = TextureBacking::Linear(level(1 << 62));
+        clear_blit_fail_reason();
+        assert_eq!(
+            texture_region_window(&state, &host, 1, &tex, 0, 0, 0, 4, 8, 1, 4),
+            Err(BlitStatus::Bounds),
+            "an overflowing region must refuse the copy"
+        );
+        assert_eq!(
+            blit_fail_reason(),
+            "tex_window_last_texel_oob",
+            "the refusal must name itself on the always-on failure channel"
+        );
+
+        // A zero extent is not a failure: the row loops are `0..copy_d` /
+        // `0..copy_h`, so they write nothing and no page is authorised.
+        let tex = TextureBacking::Linear(level(16));
+        assert_eq!(
+            texture_region_window(&state, &host, 1, &tex, 0, 0, 0, 4, 0, 1, 4),
+            Ok(Some(std::collections::HashSet::new())),
+            "an empty copy authorises no page"
+        );
     }
 
     #[test]

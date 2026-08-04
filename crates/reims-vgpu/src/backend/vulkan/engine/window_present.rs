@@ -1857,10 +1857,8 @@ mod tests {
 
     /// Every reason has a distinct, `slate_`-prefixed slug.
     ///
-    /// Distinctness is now also covered crate-wide by
-    /// `observe::gate::every_registered_slug_is_unique_crate_wide`; what stays
-    /// local is the **prefix**, which is what keeps a grep for this window's
-    /// blit choice from also matching the capture rail's `no_resident_content`
+    /// What the prefix buys beyond distinctness is keeping a grep for this
+    /// window's blit choice from also matching the capture rail's `no_resident_content`
     /// and the `THRASH geom_mismatch` proxy.
     #[test]
     fn slate_reason_slugs_are_distinct_and_namespaced() {

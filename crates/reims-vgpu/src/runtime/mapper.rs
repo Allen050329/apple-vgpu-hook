@@ -472,7 +472,14 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
                     if surf.width > 0 && surf.height > 0 {
                         width = surf.width;
                         height = surf.height;
-                        format = (surf.pixel_format & 0xffff) as u16;
+                        // Not `as u16`: this field carries an MTL ordinal or
+                        // an OSType FourCC depending on who wrote the
+                        // descriptor, and narrowing a FourCC produces a format
+                        // nothing in the device accepts. See
+                        // `objects::device_desc_format_to_mtl`.
+                        format = crate::runtime::objects::device_desc_format_to_mtl(
+                            surf.pixel_format,
+                        );
                         if let Some((_, _, end, _)) =
                             sample_window_prefer_device(Some(&desc), None, format, width, height)
                         {
@@ -555,6 +562,35 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
         }
     };
 
+    // The count that carried `build_table_plan`'s second candidate to its
+    // deletion, kept because it is what would falsify that deletion.
+    //
+    // That function used to chase `MappingInternal` `+0x48` then `+0xb8`, and
+    // `+0x50` then `+0x28`, taking whichever parsed first. The question was
+    // whether that is a "try both, keep the one that works" ladder or two
+    // layouts handled side by side, and it turns on how often both fields are
+    // populated at once: never, and it dispatches; always, and it chooses.
+    //
+    // Measured **223 successful resolves across two driven arm64 workloads**,
+    // and both fields held a kernel VA on every single one while `+0x48` won
+    // every single one. So it chose, always the same way, and the second chase
+    // never carried a resolve — which is a fallback, and it is gone.
+    //
+    // `iosurface_pt_cand_both` therefore stays as the premise's alarm rather
+    // than as a tally: it should keep reading equal to
+    // `iosurface_pt_cand_only_48 + itself`, i.e. essentially 100%. A run where
+    // `only_48` grows means the two fields are *not* both always populated,
+    // which is the reading under which the deleted chase was load-bearing.
+    //
+    // This rail is arm64-only — it is entered from `capture_at_producer`, which
+    // needs `HostOps::read_xreg`, and the x86 PCI shim returns -1 for that
+    // unconditionally — so only an arm64 boot can move these.
+    crate::runtime::drain::note_store_route(if plan.candidates.other_field_populated {
+        "iosurface_pt_cand_both"
+    } else {
+        "iosurface_pt_cand_only_48"
+    });
+
     // Read before the `get_mut` below takes `state` mutably.
     let page_shift = state.page_shift;
     let mut retired = None;
@@ -624,15 +660,21 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
         // *distinct footprints* rather than by resolve rate — a mapping
         // re-resolved every frame to the same pages logs once.
         if let Some((lo, hi)) = entry_gpa_span(&plan.entries, page_shift) {
-            let key = (u64::from(mapping_id) << 40) ^ (lo >> page_shift) ^ (hi << 20);
-            if crate::observe::first_sight("mapping_gpa_span", key) {
-                // `src=mapper` against the type-4 adoption site's `src=type4`.
-                // The field existed and only one of the two set it, so it named
-                // a distinction the log could not express: every
-                // `mapping_gpa_span` line in a boot read `src=type4`, and this
-                // emitter's silence was invisible rather than reported. The
-                // silence is the interesting part — on x86 this site has stayed
-                // quiet for whole boots while the type-4 one carried every span.
+            let key = span_first_sight_key(mapping_id, lo, hi, page_shift);
+            if crate::observe::first_sight(SPAN_SEEN_MAPPER, key) {
+                // `src=mapper` against the type-4 adoption site's `src=type4`,
+                // which says which path a surface's page list arrived through.
+                //
+                // Read that field with the latch in mind: until the two sites
+                // were given separate `first_sight` namespaces they shared one,
+                // and on identical keys, so the type-4 site claimed every
+                // footprint it reached first and this one was suppressed for
+                // that footprint permanently. Every `mapping_gpa_span` line in
+                // an x86 boot read `src=type4`, which was taken as evidence that
+                // the page list arrives at the type-4 site — but the latch could
+                // not have produced any other reading. Whether this site is
+                // genuinely quiet is now an open question again, and a driven
+                // boot is what answers it.
                 crate::observe::off(format!(
                     "mapping_gpa_span mid={mapping_id} gen={} pages={} src=mapper \
                      prev_pages={prev_pages} \
@@ -889,6 +931,37 @@ pub(crate) fn entry_gpa_span(entries: &[u32], page_shift: u32) -> Option<(u64, u
     (lo != u64::MAX).then_some((lo, hi))
 }
 
+/// `first_sight` namespace for the mapper's own adoption span line.
+///
+/// Separate from [`SPAN_SEEN_TYPE4`] on purpose, and the separation is the
+/// point. Both emitters print `mapping_gpa_span`, both dedup on
+/// [`span_first_sight_key`], and the key is built from the same three values at
+/// both — mapping id, span low, span high. Sharing one namespace therefore made
+/// them share one latch: whichever site reached a given footprint first claimed
+/// it, and the other could never report that footprint at all.
+///
+/// That is not a harmless overlap, because the two lines are read against each
+/// other. `src=` exists to say which adoption path a surface's page list
+/// arrived through, and the type-4 site wins the race in practice, so the
+/// mapper's silence was manufactured by the latch rather than observed. Two
+/// namespaces make each site's silence its own evidence.
+pub(crate) const SPAN_SEEN_MAPPER: &str = "mapping_gpa_span_mapper";
+
+/// `first_sight` namespace for the type-4 adoption span line. See
+/// [`SPAN_SEEN_MAPPER`] for why the two are not one.
+pub(crate) const SPAN_SEEN_TYPE4: &str = "mapping_gpa_span_type4";
+
+/// Dedup discriminant for a `mapping_gpa_span` line: the footprint identity.
+///
+/// Keyed on the span rather than on the resolve, so a mapping re-resolved every
+/// frame to the same pages logs once while a mapping that moves logs again.
+/// Shared by both emitters so the two cannot drift apart on what counts as the
+/// same footprint — they are compared against each other, which only means
+/// anything if they agree on the identity.
+pub(crate) fn span_first_sight_key(mapping_id: u32, lo: u64, hi: u64, page_shift: u32) -> u64 {
+    (u64::from(mapping_id) << 40) ^ (lo >> page_shift) ^ (hi << 20)
+}
+
 /// Incarnation decision when adopting a freshly resolved page plan into a
 /// mapping slot. `condemned` is the fingerprint a trailing
 /// `DeleteIOSurfaceBacking2` stashed (None when the slot is not condemned).
@@ -1100,6 +1173,35 @@ pub fn revalidate_mapping_reason<H: HostMemory + HostOps>(
     }
 }
 
+/// Which of the two `true`s a bare "are these pages still ours" bool would
+/// have returned.
+///
+/// [`type4_pages_witness`]'s contract says a caller must not read a bare
+/// "yes" as "these pages were verified", because four of its five exits check
+/// nothing at all. Every caller then collapsed both meanings into
+/// [`PagesVerdict::Ours`], and the counters built on it — `mapw_pages_vouched` 29 002 against
+/// `mapw_pages_refused` **0** on one boot — cannot say whether that zero is a
+/// guard that passed or a guard that was never armed. Those are opposite claims
+/// about the write-after-free class and the census reported them identically.
+///
+/// This is the denominator, and it is measure-only: [`Unwitnessed`] still
+/// yields a token and still lets the write through, exactly as before. Nothing
+/// here changes policy; it changes what the boot can say about it.
+///
+/// [`Unwitnessed`]: Type4Witness::Unwitnessed
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Type4Witness {
+    /// Every page of the cached list was re-walked and agreed. The only exit
+    /// that is evidence the list still names the surface's memory.
+    Verified,
+    /// Nothing was checked. Carries which of the four states it was, because
+    /// they are not one outcome: a surface that never latched a walk is a
+    /// different gap from one whose walk was superseded.
+    Unwitnessed(&'static str),
+    /// The re-walk disagreed, or the owning task is gone.
+    Drifted,
+}
+
 /// Whether a mapping's cached page list still names the guest memory it was
 /// walked from, re-derived rather than remembered.
 ///
@@ -1134,45 +1236,18 @@ pub fn revalidate_mapping_reason<H: HostMemory + HostOps>(
 /// Any page that translates differently — or no longer translates at all — means
 /// the list in hand names memory that is no longer the surface's.
 ///
-/// Returns `true` when there is nothing to check (`type4_walk` absent, or
-/// latched at a superseded `map_generation`), because this is a *specific*
-/// witness and not a general one; a caller must not read `true` as "these pages
-/// were verified".
+/// Answers [`Type4Witness::Unwitnessed`] when there is nothing to check
+/// (`type4_walk` absent, or latched at a superseded `map_generation`), because
+/// this is a *specific* witness and not a general one. That exit is the reason
+/// the return type is an enum rather than a bool: it is not evidence, and a
+/// caller must not read it as "these pages were verified".
 ///
 /// The peer for the raw-GVA rails is
 /// [`crate::runtime::storage_flush::deferred_pages_still_ours`], which asks the
 /// same question about a window's armed page set. This one asks it about a
 /// mapping's list, which is what the mapping-keyed rails write through.
-/// Which of the two `true`s a bare "are these pages still ours" bool would
-/// have returned.
 ///
-/// That function's contract says a caller must not read `true` as "these pages
-/// were verified", because four of its five exits check nothing at all. Every
-/// caller then collapsed both meanings into [`PagesVerdict::Ours`], and the
-/// counters built on it — `mapw_pages_vouched` 29 002 against
-/// `mapw_pages_refused` **0** on one boot — cannot say whether that zero is a
-/// guard that passed or a guard that was never armed. Those are opposite claims
-/// about the write-after-free class and the census reported them identically.
-///
-/// This is the denominator, and it is measure-only: [`Unwitnessed`] still
-/// yields a token and still lets the write through, exactly as before. Nothing
-/// here changes policy; it changes what the boot can say about it.
-///
-/// [`Unwitnessed`]: Type4Witness::Unwitnessed
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Type4Witness {
-    /// Every page of the cached list was re-walked and agreed. The only exit
-    /// that is evidence the list still names the surface's memory.
-    Verified,
-    /// Nothing was checked. Carries which of the four states it was, because
-    /// they are not one outcome: a surface that never latched a walk is a
-    /// different gap from one whose walk was superseded.
-    Unwitnessed(&'static str),
-    /// The re-walk disagreed, or the owning task is gone.
-    Drifted,
-}
-
-/// Re-walk a mapping's cached page list, reporting which exit it took.
+/// Re-walks the cached page list and reports which exit it took.
 pub fn type4_pages_witness<H: HostMemory>(
     state: &DeviceState,
     host: &H,
@@ -1728,6 +1803,31 @@ pub fn mapping_page_gpas<H: HostMemory + HostOps>(
 /// transport or task-control structures. `is_ram_gpa` alone cannot distinguish
 /// an IOSurface page from a FIFO/page-table page; reject the provable overlap
 /// before either CPU or GPU writes touch it.
+///
+/// Every region compared here is guest-**physical** by construction, which is
+/// what makes the comparison mean anything: `gfx.root_page`, `gfx.fifo_base_page`
+/// and `directory_pfn` are PFNs the guest writes and every other consumer turns
+/// into a GPA with `pfn_gpa`/`pfn_to_gpa` before a physical read, while
+/// `iosfc.ring_base` and `child_rings[..].page_gpas` are already GPAs and are
+/// read raw.
+///
+/// **A task's object list is not, and so cannot be checked here.**
+/// `object_list_pfn << page_shift` is an address in that task's *virtual* space:
+/// [`crate::runtime::objects::lookup_list_entry`] builds it, names it
+/// `entry_gva` and reads it through `gva_mem::read_task_gva_by_id`, and
+/// `gva_mem`'s own doc states the rule — "a GVA has no meaning apart from the
+/// page table it is resolved against". Testing it against surface GPAs compares
+/// two different address spaces, so it can only ever produce a coincidence, and
+/// the coincidence is not remote: tasks put their object lists in low pages.
+/// That arm therefore rejected a legitimate surface — losing real guest work —
+/// on a numeric collision, while a genuine alias stayed invisible to it. It also
+/// strided the span at 16 bytes where the contract's `OBJECT_LIST_ENTRY_LEN` is
+/// 12, oversizing the window it got wrong by a third.
+///
+/// Making it meaningful would mean walking the task's page table over the whole
+/// object-list span on every call, which is the cost this function's range-query
+/// shape exists to avoid, to enforce a rule the protocol never states and that
+/// no boot has ever seen violated. Do not re-add it without those GPAs in hand.
 fn first_control_page_collision(state: &DeviceState, gpas: &[u64]) -> Option<(u64, &'static str)> {
     let page = state.page_size();
     let page_base = |gpa: u64| gpa & !(page - 1);
@@ -1743,10 +1843,11 @@ fn first_control_page_collision(state: &DeviceState, gpas: &[u64]) -> Option<(u6
     let mut pages: Vec<u64> = gpas.iter().map(|&gpa| page_base(gpa)).collect();
     pages.sort_unstable();
     let holds = |gpa: u64| pages.binary_search(&page_base(gpa)).is_ok();
-    // The lowest surface page in `[start, end)`, if any. Both bounds and every
-    // entry are multiples of `page`, so a hit is exactly one of the pages the
-    // per-page form would have enumerated — same page, same reported gpa.
-    let holds_range = |start: u64, end: u64| -> Option<u64> {
+    // The lowest surface page in `[start, end)`, if any. `start` is page-aligned
+    // and every entry is a page base, so a hit is exactly one of the pages a
+    // per-page enumeration would have reported — same page, same reported gpa.
+    let holds_range = |start: u64, len: u64| -> Option<u64> {
+        let end = start.saturating_add(len);
         let i = pages.partition_point(|&p| p < start);
         pages.get(i).copied().filter(|&p| p < end)
     };
@@ -1754,13 +1855,23 @@ fn first_control_page_collision(state: &DeviceState, gpas: &[u64]) -> Option<(u6
     if state.gfx.root_page != 0 && holds((state.gfx.root_page as u64) << state.page_shift) {
         return Some(((state.gfx.root_page as u64) << state.page_shift, "gfx_root"));
     }
-    if state.gfx.fifo_base_page != 0 && holds((state.gfx.fifo_base_page as u64) << state.page_shift)
-    {
-        return Some((
-            (state.gfx.fifo_base_page as u64) << state.page_shift,
-            "root_fifo",
-        ));
+    // The main FIFO is as long as the guest said it is, not one page. The ring
+    // spans `fifo_length` bytes from the base page — `drain_main_fifo` reads it
+    // over exactly that extent, `fifo_start` being the header offset *inside*
+    // it — and it is routinely more than one page, so probing only the first
+    // let a surface alias the rest of the ring undetected.
+    if state.gfx.fifo_base_page != 0 {
+        let base = (state.gfx.fifo_base_page as u64) << state.page_shift;
+        if let Some(gpa) = holds_range(base, state.gfx.fifo_length.max(1) as u64) {
+            return Some((gpa, "root_fifo"));
+        }
     }
+    // Still the first page only. `iosfc.capacity` would give the ring's extent
+    // the way `fifo_length` does above, but nothing in this crate consumes it —
+    // it is written and read back over MMIO and never bounds anything — so its
+    // units are not established, and sizing a rejection window from a field
+    // whose meaning is a guess is how a legitimate surface gets refused. Bound
+    // it when a consumer settles whether it counts entries or bytes.
     if state.iosfc.ring_base != 0 && holds(state.iosfc.ring_base) {
         return Some((page_base(state.iosfc.ring_base), "iosfc_ring"));
     }
@@ -1779,15 +1890,6 @@ fn first_control_page_collision(state: &DeviceState, gpas: &[u64]) -> Option<(u6
             let gpa = (task.directory_pfn as u64) << state.page_shift;
             if holds(gpa) {
                 return Some((gpa, "task_directory"));
-            }
-        }
-        if task.object_list_pfn != 0 {
-            let first = (task.object_list_pfn as u64) << state.page_shift;
-            let bytes = (task.object_list_count as u64).saturating_mul(16);
-            let count = bytes.saturating_add(page - 1) / page;
-            let end = first.saturating_add(count.saturating_mul(page));
-            if let Some(gpa) = holds_range(first, end) {
-                return Some((gpa, "task_object_list"));
             }
         }
     }
@@ -1942,15 +2044,6 @@ impl RunCopy<'_> {
         matches!(self, Self::Write(_))
     }
 
-    /// The bytes a write direction is about to store, for the audit that
-    /// compares them against what the guest's pages already hold.
-    fn write_src(&self) -> Option<&[u8]> {
-        match self {
-            Self::Write(buf) => Some(buf),
-            Self::Read(_) => None,
-        }
-    }
-
     /// Move `n` bytes between the caller's buffer at `buf_off` and the mapped
     /// host range at `host_off`.
     ///
@@ -1983,14 +2076,13 @@ impl RunCopy<'_> {
 ///
 /// `None` selects the window whole. `Some(&[])` selects **nothing**, which is
 /// why this is an `Option` rather than "empty means everything": a caller
-/// handing over the ranges a difference pass found changed has an empty list
-/// exactly when the frame is entirely redundant, and reading that as "write it
-/// all" would turn the cheapest landing into the most expensive one.
+/// handing over an explicit list of ranges to write has an empty list exactly
+/// when there is nothing to write, and reading that as "write it all" would turn
+/// the cheapest landing into the most expensive one.
 ///
 /// `ranges` is ascending and disjoint. The first candidate is found by binary
-/// search rather than by walking from the front, so a caller with thousands of
-/// runs — which a 256-byte-tile bitmap over an 8 MB frame is — costs
-/// `O(log n)` per query instead of `O(n)`. Nothing here assumes successive
+/// search rather than by walking from the front, so a caller carrying many runs
+/// costs `O(log n)` per query instead of `O(n)`. Nothing here assumes successive
 /// queries ascend, so a caller may probe windows in any order.
 pub(crate) fn selected_within(
     ranges: Option<&[(u64, u64)]>,
@@ -2053,38 +2145,15 @@ fn copy_mapping_runs<H: HostMemory + HostOps>(
         // witness. The read direction shares this walk and writes nothing.
         state.note_host_wrote_mapping(mapping_id);
     }
-    // Taken once for the walk so an audited landing is compared whole, and held
-    // so its runs are tallied together and the landing is bucketed by its own
-    // redundancy. See [`crate::runtime::land_redundancy::begin_audit`] for why a
-    // per-run stride would describe no frame in particular.
-    let mut audit = copy
-        .is_write()
-        .then(|| crate::runtime::land_redundancy::begin_audit(crate::runtime::land_redundancy::Leg::Mapping))
-        .flatten();
     let page_size = state.page_size();
     let len = copy.len();
     let need_end = off.saturating_add(len as u64);
     // Fast path: one packed view covering the whole range.
     if let Some((ptr, view_len)) = ensure_contig_view(state, host, mapping_id) {
         if (view_len as u64) >= need_end && (off as usize) + len <= view_len {
-            // Collected before the loop because the audit and the copy both
-            // borrow `copy`, and the selection borrows nothing either owns.
-            let spans: Vec<(u64, u64)> = selected_within(only, off, need_end).collect();
-            for (lo, hi) in spans {
+            for (lo, hi) in selected_within(only, off, need_end) {
                 let buf_off = (lo - off) as usize;
                 let n = (hi - lo) as usize;
-                if let (Some(walk), Some(buf)) = (audit.as_mut(), copy.write_src()) {
-                    // SAFETY: exactly the range `apply` is about to write below,
-                    // and the audit only reads it.
-                    unsafe {
-                        walk.note_write(
-                            lo,
-                            (ptr as *const u8).add(lo as usize),
-                            &buf[buf_off..buf_off + n],
-                            page_size,
-                        );
-                    }
-                }
                 // SAFETY: the view covers `need_end`, checked directly above,
                 // and `[lo, hi)` is within `[off, need_end)` by construction.
                 unsafe { copy.apply(ptr, lo as usize, buf_off, n) };
@@ -2144,24 +2213,10 @@ fn copy_mapping_runs<H: HostMemory + HostOps>(
         // selection touches nowhere still costs its import — and a run it
         // touches in twenty places costs only one. Splitting the import per
         // selected span instead would map and unmap the same pages repeatedly.
-        let spans: Vec<(u64, u64)> = selected_within(only, copy_lo, copy_hi).collect();
-        for (sel_lo, sel_hi) in spans {
+        for (sel_lo, sel_hi) in selected_within(only, copy_lo, copy_hi) {
             let buf_off = (sel_lo - off) as usize;
             let host_off = (sel_lo - run_mlo) as usize;
             let n = (sel_hi - sel_lo) as usize;
-            if let (Some(walk), Some(buf)) = (audit.as_mut(), copy.write_src()) {
-                // SAFETY: exactly the range `apply` is about to write below,
-                // whose bounds are within the window checked directly above;
-                // the audit only reads it.
-                unsafe {
-                    walk.note_write(
-                        sel_lo,
-                        (ptr as *const u8).add(host_off),
-                        &buf[buf_off..buf_off + n],
-                        page_size,
-                    );
-                }
-            }
             // SAFETY: the map covers `total`, and `host_off + n <= total` and
             // `buf_off + n <= len` were both just checked for the enclosing
             // window, which `[sel_lo, sel_hi)` is inside.
@@ -3100,9 +3155,9 @@ mod tests {
     }
 
     /// `None` is the whole window and `Some(&[])` is none of it. The two must
-    /// never collapse: a difference pass whose frame is entirely redundant
-    /// hands over an empty list, and reading that as "everything" would make
-    /// the cheapest landing the most expensive one.
+    /// never collapse: a caller with an explicit list of ranges to write hands
+    /// over an empty one when there is nothing to write, and reading that as
+    /// "everything" would make the cheapest landing the most expensive one.
     #[test]
     fn an_absent_selection_and_an_empty_one_are_opposites() {
         assert_eq!(sel(None, 10, 20), vec![(10, 20)]);
@@ -3686,15 +3741,27 @@ mod tests {
         assert!(!seen(9, "mapper_capture_request_type_mismatch"));
     }
 
-    #[test]
-    fn resolve_builds_page_entries() {
+    /// A mapping id 3 whose internal object resolves to exactly one valid page,
+    /// attached and ready for `resolve_mapping_backing`.
+    ///
+    /// Shared by the two span tests so they build the footprint the same way.
+    ///
+    /// `pfn` is a parameter rather than a constant because the emitters dedup
+    /// through `observe::first_sight`, whose latch is process-global and so is
+    /// shared by every test in the binary. Two tests resolving the same page
+    /// would compute the same [`span_first_sight_key`], and whichever ran first
+    /// would silence the other's line — the very coupling these tests exist to
+    /// check, reappearing between the tests themselves. Distinct PFNs keep each
+    /// test's latch its own whatever the run order.
+    ///
+    /// Returns `(state, host, page_gpa)`.
+    fn span_fixture(pfn: u32) -> (DeviceState, FakeHost, u64) {
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         let mut host = FakeHost::new();
         let internal = KVA;
         let mapper = KVA + 0x1000;
         let page_obj = KVA + 0x2000;
         let table = KVA + 0x3000;
-        let pfn = 0x1e88c_u32;
         let page_gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
 
         put_u64(&mut host, internal + MAPPING_INTERNAL_BACKPTR, mapper);
@@ -3732,6 +3799,14 @@ mod tests {
 
         state.mapper_device_kva = mapper;
         assert!(state.attach_mapping_internal(3, internal));
+        (state, host, page_gpa)
+    }
+
+    #[test]
+    fn resolve_builds_page_entries() {
+        let pfn = 0x1e88c_u32;
+        let (mut state, host, _page_gpa) = span_fixture(pfn);
+        let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
         // The adopted page list is what bounds every mapping-rail guest write,
         // so a successful resolve must report its guest-physical footprint. An
         // earlier cut of `mapping_gpa_span` keyed on `pages_changed` and was
@@ -3750,6 +3825,51 @@ mod tests {
         );
         // The page number is what a guest panic prints (`pmap_page_protect()
         // ... pn=0x...`), so it has to be readable without arithmetic.
+        assert!(
+            span.contains(&format!("pn_lo={pfn:#x}")),
+            "span must name the adopted PFN as a page number, got {span:?}"
+        );
+    }
+
+    /// The type-4 adoption site must not be able to silence this one.
+    ///
+    /// Both emitters print `mapping_gpa_span` and both dedup on
+    /// [`span_first_sight_key`], which is built from the mapping id and the span
+    /// alone — so for any footprint both sites reach, they compute the *same*
+    /// key. While they also shared one `first_sight` namespace, whichever
+    /// arrived first claimed that footprint and the other went permanently
+    /// quiet for it. The type-4 site wins in practice, so `src=type4` on every
+    /// line in a boot was a property of the latch, not a finding about where
+    /// page lists arrive.
+    ///
+    /// This claims the footprint under the type-4 namespace first and then
+    /// requires the mapper's line anyway. With one shared namespace the claim
+    /// below swallows it and `cap.one("OFF")` finds nothing to return.
+    #[test]
+    fn the_type4_span_latch_does_not_suppress_the_mapper_span() {
+        // A PFN of this test's own, so the sibling span test's latch — claimed
+        // under the same namespace on whichever of the two runs first — cannot
+        // decide this one.
+        let pfn = 0x2c4d1_u32;
+        let (mut state, host, page_gpa) = span_fixture(pfn);
+
+        // The fixture's single page is both ends of the span. Same discriminant
+        // the emitter will compute, taken from the shared helper so this cannot
+        // drift from the site it is guarding.
+        let key = span_first_sight_key(3, page_gpa, page_gpa, state.page_shift);
+        assert!(
+            crate::observe::first_sight(SPAN_SEEN_TYPE4, key),
+            "the type-4 latch must be unclaimed at the start of this test"
+        );
+
+        let cap = crate::observe::sink::FailCapture::start();
+        assert!(resolve_mapping_backing(&mut state, &host, 3));
+        let span = cap.one("OFF");
+        assert!(
+            span.contains("mapping_gpa_span mid=3") && span.contains("src=mapper"),
+            "the mapper's own adoption must report its footprint even after the \
+             type-4 site has claimed the same one, got {span:?}"
+        );
         assert!(
             span.contains(&format!("pn_lo={pfn:#x}")),
             "span must name the adopted PFN as a page number, got {span:?}"
@@ -3989,59 +4109,93 @@ mod tests {
             first_control_page_collision(&state, &[0x440_000]),
             Some((0x440_000, "task_directory"))
         );
-        assert_eq!(
-            first_control_page_collision(&state, &[0x551_000]),
-            Some((0x551_000, "task_object_list"))
-        );
         assert_eq!(first_control_page_collision(&state, &[0x660_000]), None);
     }
 
-    /// The object-list probe is a RANGE query over the surface, and the three
-    /// things a range query can get wrong that a per-page enumeration cannot.
+    /// The main FIFO is as long as the guest declared it, not one page.
     ///
-    /// The per-page form walked `first + i*page` for every slot page and returned
-    /// the first one the surface held, so it reported the LOWEST colliding page
-    /// and stopped exactly at `count`. A `partition_point` that is off by one
-    /// entry, or an end bound computed from slots rather than pages, reproduces
-    /// the same `Some(_)`/`None` on a single-page surface and diverges here.
+    /// The ring spans `fifo_length` bytes from its base page and is routinely
+    /// larger than a page, but the guard probed only the first one — so a
+    /// surface backed by the ring's second page aliased live transport memory
+    /// and was accepted. `fifo_length` is a decoded guest field with a real
+    /// consumer (`drain_main_fifo` reads the ring over exactly that extent), so
+    /// the bound is the guest's own number rather than a chosen one.
     #[test]
-    fn object_list_collision_reports_the_lowest_page_and_stops_at_the_span_end() {
+    fn the_main_fifo_is_probed_over_every_page_the_guest_declared() {
+        let mut state = DeviceState::new(DeviceId(1), crate::model::PAGE_SHIFT_X86);
+        let page = 1u64 << crate::model::PAGE_SHIFT_X86;
+        state.gfx.fifo_base_page = 0x220;
+        // Four pages of ring, which is what the guest's own length says.
+        state.gfx.fifo_length = (4 * page) as u32;
+        let base = 0x220u64 << crate::model::PAGE_SHIFT_X86;
+
+        for i in 0..4u64 {
+            let gpa = base + i * page;
+            assert_eq!(
+                first_control_page_collision(&state, &[gpa]),
+                Some((gpa, "root_fifo")),
+                "page {i} of the declared ring is transport memory"
+            );
+        }
+        // One page past the declared end is not the ring.
+        assert_eq!(
+            first_control_page_collision(&state, &[base + 4 * page]),
+            None
+        );
+        // The lowest colliding page is the one reported, whatever order the
+        // surface names its pages in.
+        assert_eq!(
+            first_control_page_collision(&state, &[base + 3 * page, base + page]),
+            Some((base + page, "root_fifo"))
+        );
+        // A declared length of zero still guards the base page itself, so a
+        // ring the guest has based but not yet sized is not a hole.
+        state.gfx.fifo_length = 0;
+        assert_eq!(
+            first_control_page_collision(&state, &[base]),
+            Some((base, "root_fifo"))
+        );
+        assert_eq!(first_control_page_collision(&state, &[base + page]), None);
+    }
+
+    /// A task's object list lives in that task's GVA space, so its number must
+    /// not be tested against surface GPAs at all.
+    ///
+    /// `object_list_pfn` used to be shifted and compared here like the physical
+    /// regions beside it. Because tasks put their object lists in low pages, a
+    /// surface page whose *physical* address happens to equal that *virtual*
+    /// one was rejected outright — real guest work lost to a coincidence, with
+    /// any genuine alias still invisible. The five regions this function does
+    /// compare are guest-physical by construction; this one is not.
+    #[test]
+    fn an_object_list_gva_is_not_compared_against_surface_physical_pages() {
         let mut state = DeviceState::new(DeviceId(1), crate::model::PAGE_SHIFT_X86);
         assert!(state.define_task(1, 0x4000_0000, 0x440));
-        // 1024 slots x 16 bytes = 16 KiB = pages 0x550..0x554 at a 4 KiB shift.
         assert!(state.set_object_list(1, 0x550, 1024));
 
-        // Several surface pages inside the span, listed out of order: the answer
-        // is the lowest, not whichever the surface happens to name first.
+        // The exact numeric coincidence: a surface page at the GPA that equals
+        // the object list's GVA, and pages across the whole span it spelled out
+        // under either the contract's 12-byte slot or the 16 it used to assume.
+        for gpa in [0x550_000, 0x551_000, 0x552_000, 0x553_000] {
+            assert_eq!(
+                first_control_page_collision(&state, &[gpa]),
+                None,
+                "{gpa:#x} is a GPA; the object list's {:#x} is a GVA and they do not compare",
+                (state.tasks[1].object_list_pfn as u64) << state.page_shift
+            );
+        }
+        // The task's directory is a real PFN and must still be caught, so this
+        // is not "the task loop stopped checking anything".
         assert_eq!(
-            first_control_page_collision(&state, &[0x553_000, 0x551_000, 0x552_000]),
-            Some((0x551_000, "task_object_list"))
-        );
-        // Both ends of the span are inside it.
-        assert_eq!(
-            first_control_page_collision(&state, &[0x550_000]),
-            Some((0x550_000, "task_object_list"))
-        );
-        assert_eq!(
-            first_control_page_collision(&state, &[0x553_000]),
-            Some((0x553_000, "task_object_list"))
-        );
-        // The page immediately after the span is not part of it.
-        assert_eq!(first_control_page_collision(&state, &[0x554_000]), None);
-        // Nor is the page immediately before.
-        assert_eq!(first_control_page_collision(&state, &[0x54f_000]), None);
-        // A surface that straddles the span without landing in it stays clean —
-        // the query must not report the neighbour it binary-searched past.
-        assert_eq!(
-            first_control_page_collision(&state, &[0x100_000, 0x554_000]),
-            None
+            first_control_page_collision(&state, &[0x440_000]),
+            Some((0x440_000, "task_directory"))
         );
     }
 
     /// Priority order survives the rewrite: a surface colliding with several
     /// control structures at once names the same one it always did. The walk is
-    /// per task and interleaved (task 1's object list before task 2's directory),
-    /// which a flat "collect every control page then sort" would silently lose.
+    /// per task, so task 1's directory is reported before task 2's — which a
+    /// flat "collect every control page then sort" would silently lose.
     #[test]
     fn a_surface_colliding_with_several_control_structures_names_the_first() {
         let mut state = DeviceState::new(DeviceId(1), crate::model::PAGE_SHIFT_X86);
@@ -4050,11 +4204,10 @@ mod tests {
         state.iosfc.ring_base = 0x300_000;
         state.child_rings[2].page_gpas = vec![0x330_000];
         assert!(state.define_task(1, 0x4000_0000, 0x440));
-        assert!(state.set_object_list(1, 0x550, 1024));
         assert!(state.define_task(2, 0x4000_0000, 0x660));
 
         let all = [
-            0x660_000, 0x551_000, 0x440_000, 0x330_000, 0x300_000, 0x220_000, 0x120_000,
+            0x660_000, 0x440_000, 0x330_000, 0x300_000, 0x220_000, 0x120_000,
         ];
         assert_eq!(
             first_control_page_collision(&state, &all),
@@ -4080,13 +4233,8 @@ mod tests {
             first_control_page_collision(&state, &all),
             Some((0x440_000, "task_directory"))
         );
-        // Task 1's object list outranks task 2's directory: the walk is per task.
+        // Task 1 outranks task 2: the walk is in task order, not address order.
         state.tasks[1].directory_pfn = 0;
-        assert_eq!(
-            first_control_page_collision(&state, &all),
-            Some((0x551_000, "task_object_list"))
-        );
-        assert!(state.set_object_list(1, 0, 0));
         assert_eq!(
             first_control_page_collision(&state, &all),
             Some((0x660_000, "task_directory"))

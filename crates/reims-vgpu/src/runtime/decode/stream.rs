@@ -3,12 +3,34 @@
 use crate::contract::endian::ld32;
 use crate::contract::size_fits_u32;
 
-pub const SEGMENT_TYPE_RENDER: u8 = 0;
-pub const SEGMENT_TYPE_COMPUTE: u8 = 1;
-pub const SEGMENT_TYPE_BLIT: u8 = 2;
+// The four segment types Apple's serializer has been observed writing, and the
+// segment header's length, come from `reims-vgpu-wire` rather than being
+// restated here. That module's doc used to note that these values "are also
+// exactly `reims_vgpu::runtime::decode::stream`'s ... two independent
+// derivations agreeing on the whole header" — which was true, and is the
+// condition under which two declarations should become one. `contract::gva`
+// made the same move for the page-table format: re-exporting means drift is
+// impossible rather than merely detectable.
+//
+// `SEGMENT_TYPE_INFO` is the load-bearing one. It is 4, not the next number in
+// sequence, so a device that had guessed rather than derived would have written
+// 3 — and 3 is `SEGMENT_TYPE_EVENT`, which stays local below.
+// `SEGMENT_TYPE_PROTECTION_OPTIONS` joined this list once the capture drove the
+// envelope. It had been local for the reason below — unobserved — and this
+// device's value for it turned out to be right, which is the outcome that
+// licenses the move.
+pub use reims_vgpu_wire::ops::segment::{
+    PROTECTION_OPTIONS_ENVELOPE_LEN as PROTECTION_OPTIONS_PAYLOAD_LEN, SEGMENT_HEADER_LEN,
+    SEGMENT_TYPE_BLIT, SEGMENT_TYPE_COMPUTE, SEGMENT_TYPE_INFO, SEGMENT_TYPE_PROTECTION_OPTIONS,
+    SEGMENT_TYPE_RENDER,
+};
+
+// The one type the wire crate deliberately does not name, because its capture
+// has never driven the encoder that writes it, plus this device's own
+// not-a-segment sentinel. Keeping them here rather than pushing them upstream
+// is the honest split: `reims-vgpu-wire` names what Apple's serializer was
+// observed to emit, and an unobserved value has no place in it.
 pub const SEGMENT_TYPE_EVENT: u8 = 3;
-pub const SEGMENT_TYPE_INFO: u8 = 4;
-pub const SEGMENT_TYPE_PROTECTION_OPTIONS: u8 = 5;
 pub const SEGMENT_TYPE_UNKNOWN: u8 = 0xff;
 
 pub const SEGMENT_LENGTH_OFFSET: usize = 0;
@@ -16,12 +38,17 @@ pub const SEGMENT_TYPE_OFFSET: usize = 4;
 pub const SEGMENT_CONT_OFFSET: usize = 5;
 pub const SEGMENT_CHAIN_OFFSET: usize = 6;
 pub const SEGMENT_PAD_OFFSET: usize = 7;
-pub const SEGMENT_HEADER_LEN: usize = 8;
-pub const PROTECTION_OPTIONS_PAYLOAD_LEN: usize = 8;
 
 pub const RECORD_OPCODE_OFFSET: usize = 0;
 pub const RECORD_LENGTH_OFFSET: usize = 4;
-pub const RECORD_HEADER_LEN: usize = 8;
+/// The record header this stream frames is the serializer's op header, so it is
+/// the wire crate's constant rather than a second 8.
+///
+/// Distinct from [`SEGMENT_HEADER_LEN`] above, which is also 8 and is a
+/// different fact — `reims_vgpu_wire::op`'s own doc warns against porting
+/// constants between framing levels, and these two sitting in one module with
+/// the same value is exactly where that goes wrong.
+pub use reims_vgpu_wire::OP_HEADER_LEN as RECORD_HEADER_LEN;
 
 pub const INFO_RECORD_OPCODE: u32 = 0x180;
 pub const INFO_RECORD_LEN: u32 = 0x10;
@@ -104,11 +131,32 @@ pub fn segment_type_name(type_: u32) -> &'static str {
 pub enum SegmentDisposition {
     /// A family with a record walker: render, compute, blit, event, info.
     Walk,
-    /// Type 5. `writeSegmentHeader:continuation:protectionOptions:` can emit a
-    /// segment-level envelope *before* the real segment, and its command window
-    /// is raw envelope bytes carrying no decodable protection value. Skipping it
-    /// is contract-correct, so it is control flow and stays silent — logging it
-    /// would put a line in the sink on every healthy frame that carries one.
+    /// Type 5. `-beginSegment:protectionOptions:` emits a segment-level envelope
+    /// *before* the real segment. Skipping it is contract-correct, so it is
+    /// control flow and stays silent — logging it would put a line in the sink
+    /// on every healthy frame that carries one.
+    ///
+    /// # Its command window is the protection value, and this doc used to deny
+    /// that
+    ///
+    /// The wording here was "raw envelope bytes carrying no decodable protection
+    /// value", which was a guess written where a measurement now sits. Driven
+    /// under `-setSupportsProtectionOptionsEnvelope:` the burst is exactly three
+    /// records: this type-5 header, then **eight fully-written bytes that are the
+    /// `protectionOptions:` argument verbatim**, then the ordinary segment
+    /// header. `reims_vgpu_wire::ops::segment::ProtectionOptionsEnvelope` is the
+    /// view; `blit_begin_segment_protected` sends `0x44` and `..._alt` sends
+    /// `0x33`, so it is the guest's value and not a constant.
+    ///
+    /// Skipping stays right — this device implements no protection domains, so
+    /// there is nothing to do with the value — but "we cannot read it" and "we
+    /// choose not to act on it" are different claims and only the second is
+    /// true.
+    ///
+    /// The envelope needs **both** conditions: the `BOOL` argument clear *and*
+    /// non-zero options. Either alone emits the ordinary single header, which is
+    /// measured by `blit_begin_segment_protected_flag_set` and
+    /// `blit_begin_segment_protection_zero` respectively.
     Envelope,
     /// A family this host has no contract for. MetalSerializer's deserializer
     /// constructs decoders for `0..3` and rejects new non-continuation types
@@ -440,9 +488,8 @@ mod tests {
     #[test]
     fn every_refusal_in_this_decoder_carries_a_registered_slug() {
         use crate::observe::Refusal;
-        // The registry row is checked crate-wide by `observe::gate`; what this
-        // test pins is the local half — that no site returns a refusal whose
-        // payload is empty or absent, which would render `reason=` bare.
+        // What this pins is that no site returns a refusal whose payload is
+        // empty or absent, which would render `reason=` bare.
         for status in [
             DecodeStatus::ErrArgs("stream_seg_cursor_past_end"),
             DecodeStatus::ErrShort("stream_seg_short_header"),

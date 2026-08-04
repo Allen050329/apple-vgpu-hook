@@ -31,6 +31,7 @@ use crate::runtime::decode::resource::{
     FunctionDescriptor, RenderPipelineDescriptor, OBJECT_TYPE_BUFFER, OBJECT_TYPE_FUNCTION,
     OBJECT_TYPE_IOSURFACE, OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_VARIANT,
     OBJECT_TYPE_TEXTURE_VIEW, OBJECT_TYPE_TYPE7, TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE,
+    TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE_WIDE,
 };
 use crate::runtime::gva_mem;
 use crate::runtime::host::{HostMemory, HostOps};
@@ -39,6 +40,34 @@ use crate::runtime::mapper;
 use crate::runtime::mapper::{mapping_guest_write_verdict, GuestWriteVerdict};
 use crate::runtime::mapping_write;
 use crate::runtime::objects;
+
+// The Vulkan half of this path. Gated once here rather than per item, and
+// re-exported flat so callers keep naming its items
+// `crate::runtime::metal_draw::<name>`.
+#[cfg(feature = "backend-vulkan")]
+mod vulkan;
+// Only for `exec`'s pass-extent census, which declares its own copy of these
+// bands because it runs on every backend. See
+// `the_two_coverage_censuses_use_the_same_bands`.
+#[cfg(all(test, feature = "backend-vulkan"))]
+pub(crate) use vulkan::coverage_band_for_test;
+#[cfg(feature = "backend-vulkan")]
+pub use vulkan::*;
+
+// The Metal ICB execute half of this path. Gated once here rather than per
+// item, and re-exported flat for the same reason as `vulkan`. The
+// `backend-vulkan` arm of `encode_icb_execute_and_writeback` is the one item
+// the file carried that this gate does not describe, so it stays below.
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+mod metal_icb;
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+pub use metal_icb::*;
+
+// Type-8 texture-view resolution and linear texture loads. Backend-independent,
+// so the module carries no gate of its own; the two items inside it that are
+// arm- or test-specific keep theirs.
+mod texture_view;
+pub(crate) use texture_view::*;
 
 /// Upper bound on a single buffer materialization (pathological pooled allocs).
 /// Metal buffer/texture bind **index** cap (`REIMS_VGPU_METAL_MAX_BUFFERS`) — API slot
@@ -272,6 +301,10 @@ pub struct IndexedDrawInfo {
     pub index_count: u32,
     pub index_buffer_ref: u32,
     pub index_buffer_offset: u64,
+    /// Metal `baseVertex` / Vulkan `vertexOffset`, added to every index before
+    /// the vertex fetch. Signed, because Metal's is, and because a negative one
+    /// read as unsigned becomes a huge index rather than an error.
+    pub base_vertex: i64,
 }
 
 /// One color RT for MRT encode/writeback.
@@ -305,6 +338,10 @@ pub struct DrawEncodeRequest {
     pub instance_count: u32,
     pub primitive_type: u32,
     pub first_vertex: u32,
+    /// Metal `baseInstance` / Vulkan `firstInstance`. Both backends already
+    /// take it; until the draw forms that carry one were decoded, both were
+    /// handed a hardcoded zero from here.
+    pub base_instance: u32,
     /// Every color RT the pass declared, slot 0 first. The sole statement of
     /// what this draw renders into: geometry, format, target identity and Load
     /// seed all live here and nowhere else, so no two fields of one request can
@@ -553,7 +590,14 @@ fn raster_or_default<T, E>(
 /// (e.g. a whole 3D scene requesting depth LOAD, or every draw of one pipeline
 /// carrying the same out-of-contract raster value) logs once, not per draw.
 /// Returns true the first time a given key is seen.
-#[cfg(feature = "backend-vulkan")]
+///
+/// Backend-agnostic on purpose: both encode arms degrade, so both need the same
+/// dedupe. While this was Vulkan-only the Metal arm had no way to report a
+/// degradation without flooding per draw, and reported none.
+#[cfg(any(
+    feature = "backend-vulkan",
+    all(feature = "backend-metal", target_os = "macos")
+))]
 fn degrade_log_first(pipeline_ref: u32, slug: &'static str) -> bool {
     use std::collections::HashSet;
     use std::sync::Mutex;
@@ -664,6 +708,12 @@ pub enum IndexLoadReason {
     OffsetOverflow,
     OutOfBounds,
     ReadFail,
+    /// The guest's `baseVertex` does not fit Vulkan's signed 32-bit
+    /// `vertexOffset`. Metal's is 64-bit, so this is a real narrowing rather
+    /// than an impossible one — but no guest can currently produce it, because
+    /// Apple's serializer truncates `baseVertex` to 16 bits in the compact
+    /// records. A firing here means a wide record carried something enormous.
+    BaseVertexOutOfRange,
 }
 
 impl crate::observe::Decline for IndexLoadReason {
@@ -680,6 +730,7 @@ impl crate::observe::Decline for IndexLoadReason {
             Self::OffsetOverflow => "draw_index_offset_overflow",
             Self::OutOfBounds => "draw_index_out_of_bounds",
             Self::ReadFail => "draw_index_read_fail",
+            Self::BaseVertexOutOfRange => "draw_index_base_vertex_out_of_range",
         }
     }
 }
@@ -896,9 +947,10 @@ fn load_buffer_bytes<M: HostMemory>(
 }
 
 /// If `texture_ref` is a type-8 object whose descriptor is a buffer-backed
-/// texture (view_opcode 9, `newTextureWithDescriptor:offset:bytesPerRow:`),
-/// return its decoded descriptor. `None` for a non-type-8 object or a real
-/// texture VIEW (opcode 7/8/0x1b) — those stay on the view path silently.
+/// texture (view_opcode 9, `newTextureWithDescriptor:offset:bytesPerRow:`, or
+/// its `TextureDescriptor2` form), return its decoded descriptor. `None` for a
+/// non-type-8 object or a real texture VIEW (opcode 7/8/0x1b) — those stay on
+/// the view path silently.
 fn buffer_texture_descriptor<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &M,
@@ -915,7 +967,10 @@ fn buffer_texture_descriptor<M: HostMemory + HostOps>(
         return None;
     }
     let desc_bytes = objects::read_descriptor(state, host, task_id, &entry)?;
-    if texture_type8_opcode(&desc_bytes) != Some(TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE) {
+    if !matches!(
+        texture_type8_opcode(&desc_bytes),
+        Some(TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE) | Some(TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE_WIDE)
+    ) {
         return None;
     }
     decode_buffer_texture_descriptor(&desc_bytes).ok()
@@ -936,7 +991,7 @@ fn load_buffer_texture_rgba<M: HostMemory + HostOps>(
     texture_ref: u32,
     bt: &BufferTextureDescriptor,
 ) -> Option<(u32, u32, Vec<u8>)> {
-    let (w, h) = (bt.width, bt.height);
+    let (w, h) = (bt.desc.width, bt.desc.height);
     if w == 0 || h == 0 {
         crate::observe::fail(format!(
             "buftex zero_geom ref={texture_ref} buf={} {}x{}",
@@ -944,8 +999,8 @@ fn load_buffer_texture_rgba<M: HostMemory + HostOps>(
         ));
         return None;
     }
-    let fmt = if bt.pixel_format != 0 {
-        bt.pixel_format
+    let fmt = if bt.desc.pixel_format != 0 {
+        bt.desc.pixel_format
     } else {
         MTL_FORMAT_BGRA8_UNORM
     };
@@ -1567,7 +1622,6 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
             if mid != 0 {
                 let _ = mapper::ensure_resolved_for_scanout(state, host, mid);
             }
-            let mut load_act = da.load_action;
             match da.load_action {
                 x if x == PASS_LOAD_ACTION_CLEAR => {
                     fill_depth32(&mut buf, da.clear_depth as f32);
@@ -1591,9 +1645,24 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
                         )
                     };
                     if !ok {
-                        // Soft seed with clear_depth when guest pages are not ready.
+                        // The guest asked to load prior depth and this device
+                        // could not read it, so the pass runs against clear
+                        // values instead: depth tests decide against content the
+                        // guest never wrote. The load action deliberately stays
+                        // LOAD — the seeded buffer *is* what Metal loads, so
+                        // switching it to CLEAR would describe the same bytes
+                        // twice — but the substitution is a loss of guest state
+                        // and says so. The Vulkan arm reports the same class
+                        // through `shader_state_degraded`; this one did not.
                         fill_depth32(&mut buf, da.clear_depth as f32);
-                        load_act = PASS_LOAD_ACTION_LOAD;
+                        if degrade_log_first(req.pipeline_ref, "depth_load_readback_failed") {
+                            crate::observe::fail(format!(
+                                "shader_state_degraded reason=depth_load_readback_failed \
+                                 pipe={} task={} ds_ref={} mid={mid} {width}x{height} \
+                                 (guest depth unreadable; pass seeded with clear_depth)",
+                                req.pipeline_ref, req.task_id, da.texture_ref
+                            ));
+                        }
                     }
                 }
                 _ => {}
@@ -1603,7 +1672,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
             depth_mapping_id = mid;
             depth_attach_api = Some(ReimsVgpuDepthAttachment {
                 pixel_format: REIMS_VGPU_MTL_PIXEL_FORMAT_DEPTH32_FLOAT,
-                load_action: map_load_action(req.pipeline_ref, load_act),
+                load_action: map_load_action(req.pipeline_ref, da.load_action),
                 store_action: map_store_action(da.store_action),
                 clear_depth: da.clear_depth,
                 data: data_ptr,
@@ -1630,7 +1699,6 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
             if mid != 0 {
                 let _ = mapper::ensure_resolved_for_scanout(state, host, mid);
             }
-            let mut load_act = sa.load_action;
             match sa.load_action {
                 x if x == PASS_LOAD_ACTION_CLEAR => {
                     buf.fill(sa.clear_stencil as u8);
@@ -1654,8 +1722,19 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
                         )
                     };
                     if !ok {
+                        // Same substitution and the same loss as the depth arm
+                        // above: the guest's stencil contents are replaced by
+                        // clear_stencil, so every stencil test in the pass reads
+                        // state the guest never wrote.
                         buf.fill(sa.clear_stencil as u8);
-                        load_act = PASS_LOAD_ACTION_LOAD;
+                        if degrade_log_first(req.pipeline_ref, "stencil_load_readback_failed") {
+                            crate::observe::fail(format!(
+                                "shader_state_degraded reason=stencil_load_readback_failed \
+                                 pipe={} task={} ds_ref={} mid={mid} {width}x{height} \
+                                 (guest stencil unreadable; pass seeded with clear_stencil)",
+                                req.pipeline_ref, req.task_id, sa.texture_ref
+                            ));
+                        }
                     }
                 }
                 _ => {}
@@ -1665,7 +1744,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
             stencil_mapping_id = mid;
             stencil_attach_api = Some(ReimsVgpuStencilAttachment {
                 pixel_format: REIMS_VGPU_MTL_PIXEL_FORMAT_STENCIL8,
-                load_action: map_load_action(req.pipeline_ref, load_act),
+                load_action: map_load_action(req.pipeline_ref, sa.load_action),
                 store_action: map_store_action(sa.store_action),
                 clear_stencil: sa.clear_stencil,
                 data: data_ptr,
@@ -1686,7 +1765,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
                     Some(ReimsVgpuIndexedDraw {
                         index_type: info.index_type,
                         index_count: info.index_count as usize,
-                        base_vertex: 0,
+                        base_vertex: info.base_vertex,
                         indices: b.as_ptr(),
                         indices_len: b.len(),
                         indirect: std::ptr::null(),
@@ -1765,11 +1844,18 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
         let out_ptr = color_outs[i].as_mut_ptr();
         let out_len = color_outs[i].len();
         let out = unsafe { std::slice::from_raw_parts_mut(out_ptr, out_len) };
+        // This slot's own entry and no other. `slot` is the index the guest
+        // declared on the entry, so the vector is keyed by the same numbering
+        // `c.slot` uses and `find` is an exact lookup rather than a search over
+        // positions. An `or_else(first())` here could only ever fire for a slot
+        // with no entry of its own, which is exactly the case where borrowing
+        // another slot's blend state invents one. The compat `color0` alias it
+        // looked like it served is served by the `or` below, which tests
+        // `c.slot == 0`.
         let slot_blend = pipeline
             .color_attachments
             .iter()
             .find(|a| a.slot == c.slot)
-            .or_else(|| pipeline.color_attachments.first())
             .filter(|a| a.blending_enabled)
             .map(|a| ReimsVgpuBlendState {
                 enable: 1,
@@ -1782,7 +1868,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
                 has_blend_color: 0,
                 blend_color: [0.0; 4],
             })
-            .or_else(|| {
+            .or({
                 if pipeline.color0.blending_enabled && c.slot == 0 {
                     Some(ReimsVgpuBlendState {
                         enable: 1,
@@ -1836,7 +1922,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
         vertex_count,
         req.first_vertex as usize,
         req.instance_count.max(1) as usize,
-        0,
+        req.base_instance as usize,
         req.primitive_type,
         None,
         indexed_draw.as_ref(),
@@ -2039,6 +2125,9 @@ fn fill_depth32(buf: &mut [u8], depth: f32) {
 
 /// Type-2/3 linear GVA raw image read (tight dst rows of `row_bytes`).
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
+// A raw image read is addressed by texture, level, geometry and destination
+// stride; every one of those is a separate wire-decoded value.
+#[allow(clippy::too_many_arguments)]
 fn load_linear_raw<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &M,
@@ -2684,7 +2773,12 @@ fn sample_miss_detail<M: HostMemory + HostOps>(
             if let Some(bt) = buffer_texture_descriptor(state, host, task_id, texture_ref, None) {
                 return format!(
                     "type=8 desc_len={desc_len} buf={} off={} bpr={} {}x{} fmt={:#x} reason=buftex_load",
-                    bt.buffer_ref, bt.offset, bt.bytes_per_row, bt.width, bt.height, bt.pixel_format
+                    bt.buffer_ref,
+                    bt.offset,
+                    bt.bytes_per_row,
+                    bt.desc.width,
+                    bt.desc.height,
+                    bt.desc.pixel_format
                 );
             }
             match resolve_texture_view_reasoned(state, host, task_id, texture_ref) {
@@ -2765,17 +2859,15 @@ fn load_sampled_rgba<M: HostMemory + HostOps>(
                 return None;
             }
             v
-        } else if let Some(v) = load_linear_texture_rgba_at_level(
-            state,
-            host,
-            task_id,
-            view.base_texture_ref,
-            view.level,
-            view.pixel_format,
-        ) {
-            v
         } else {
-            return None;
+            load_linear_texture_rgba_at_level(
+                state,
+                host,
+                task_id,
+                view.base_texture_ref,
+                view.level,
+                view.pixel_format,
+            )?
         };
         apply_view_swizzle_rgba8(&mut loaded.2, view.swizzle.as_ref(), texture_ref)?;
         return Some(loaded);
@@ -3165,8 +3257,261 @@ pub(crate) fn load_vulkan_sampler<M: HostMemory + HostOps>(
     vulkan_sampler_resource(sampler_ref, binding, &sampler)
 }
 
-include!("vulkan.rs");
-include!("metal_icb.rs");
+/// Metal-direct builds never arm GVA windows — nothing to supersede.
+#[cfg(not(feature = "backend-vulkan"))]
+pub(crate) fn supersede_gva_window<M: HostMemory + HostOps>(
+    _state: &mut DeviceState,
+    _host: &mut M,
+    _gva: u64,
+    _width: u32,
+    _height: u32,
+    _by: &str,
+) {
+}
+
+/// Store encode RGBA8 into **texture_ref** host cache as BGRA (not surface_id).
+#[cfg(test)]
+fn host_cache_store_rgba8(
+    state: &mut DeviceState,
+    texture_ref: u32,
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+) {
+    if texture_ref == 0 || width == 0 || height == 0 {
+        return;
+    }
+    let need = (width as usize)
+        .saturating_mul(height as usize)
+        .saturating_mul(4);
+    if rgba.len() < need {
+        return;
+    }
+    let bgra = swap_rb_channels(&rgba[..need]);
+    crate::runtime::surface_cache::store_texture(state, texture_ref, width, height, bgra);
+}
+
+/// Advance the guest-visible publish milestones for a type-11 Store whose
+/// pixels have landed in the mapping's guest pages.
+///
+/// Route-independent: the synchronous `cpu_portability` Store calls it inline,
+/// and the deferred render rail calls it from the flush that finally performs
+/// the same write (`storage_flush::flush_render_one`). Both have just proved
+/// the same thing — `write_rgba8_image_changed` verified geometry and landed a
+/// complete frame — and without it the `present_unbacked` gate is structurally
+/// dead on whichever route skips it, because no mapping's `dense_frame_seq`
+/// would advance.
+pub(crate) fn publish_surface_store<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+    width: u32,
+    height: u32,
+    format: u16,
+) {
+    state.note_surface_composite(mapping_id);
+    state.note_dense_frame_published(mapping_id, width, height);
+    crate::runtime::scanout::note_front_buffer_writeback(
+        state, host, mapping_id, width, height, format,
+    );
+}
+
+pub fn writeback_chain_rgba<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    color_slots: &[(u32, crate::runtime::decode::render::ColorAttachment)],
+    rgba: &[u8],
+) -> bool {
+    // This whole function is the recovery rail for an abandoned chain, so a
+    // refusal here is the last frame being lost outright. Every arm names
+    // itself: `let _ = writeback_chain_rgba(..)` is how both callers invoke it,
+    // and `dirty_color_targets` advances the content generation on the next line
+    // regardless — so a silent `false` leaves pages stale while the device
+    // reports them fresh, which is the class `land_chain_before_abandon` exists
+    // to prevent.
+    let lost = |why: &'static str| -> bool {
+        crate::runtime::drain::note_store_route("chain_land_refused");
+        crate::observe::fail(format!(
+            "writeback_chain_rgba fail reason={why} task={task_id} slots={} bytes={} \
+             (the abandoned chain's last frame is not landing; guest pages keep stale bytes)",
+            color_slots.len(),
+            rgba.len()
+        ));
+        false
+    };
+    if color_slots.is_empty() || rgba.is_empty() {
+        return lost("no_source");
+    }
+    let Some((_, att)) = color_slots.first() else {
+        return lost("no_color_slot");
+    };
+    if att.texture_ref == 0 {
+        return lost("unbound_texture_ref");
+    }
+    let Some((mapping_id, gva, w, h, bpr, fmt)) =
+        lookup_render_target(state, host, task_id, att.texture_ref)
+    else {
+        return lost("render_target_unresolved");
+    };
+    let need = (w as usize).saturating_mul(h as usize).saturating_mul(4);
+    if rgba.len() < need {
+        return lost("readback_short");
+    }
+    if gva != 0 {
+        supersede_gva_window(state, host, gva, w, h, "chain_land");
+        // The refusal is carried out, not collapsed. `write_gva_rgba8`'s own doc
+        // asks for exactly this — "a caller has to be able to tell 'the guest
+        // tore this target down' from a write that genuinely lost content" — and
+        // `MemError` already names all of its refusals, so `.is_ok()` was
+        // throwing away the one word that distinguishes them.
+        return match write_gva_rgba8(state, host, task_id, gva, w, h, bpr, fmt, rgba) {
+            Ok(()) => true,
+            Err(e) => {
+                crate::runtime::drain::note_store_route("chain_land_refused");
+                crate::observe::Emit::decline("writeback_chain_rgba", &e)
+                    .field("task", task_id)
+                    .field("gva", format!("{gva:#x}"))
+                    .field("dims", format!("{w}x{h}"))
+                    .field("bpr", bpr)
+                    .field("fmt", format!("{fmt:#x}"))
+                    .fail();
+                false
+            }
+        };
+    }
+    if mapping_id == 0 {
+        return lost("no_mapping_and_no_gva");
+    }
+    // An abandoned portability chain must still preserve the last successful
+    // record. This is an error recovery rail, not normal product behavior: land
+    // the resident readback into the type-11 mapping, publish the Composite
+    // Store, and keep the degradation fail-visible.
+    crate::observe::fail(format!(
+        "writeback_chain_rgba reason=resident_chain_abandoned_cpu_recovery \
+         mid={mapping_id} {w}x{h} fmt={fmt:#x}"
+    ));
+    let wrote = mapping_write::write_rgba8_image_changed(state, host, mapping_id, rgba, None, w, h);
+    if wrote {
+        publish_surface_store(state, host, mapping_id, w, h, fmt);
+    }
+    wrote
+}
+
+/// Builds without a Metal encode path have no host ICB to execute.
+#[cfg(feature = "backend-vulkan")]
+pub fn encode_icb_execute_and_writeback<M: HostMemory + HostOps>(
+    _state: &mut DeviceState,
+    _host: &mut M,
+    _req: &DrawEncodeRequest,
+    _icb_ref: u32,
+    _range_location: u64,
+    _range_length: u64,
+) -> EncodeStatus {
+    EncodeStatus::NoMetal("icb_exec_no_metal_build")
+}
+
+/// The colour render target's base format for a **type-4** surface, or nothing.
+///
+/// On this arm `m.format == 0` is not "unset", it is a decoded refusal:
+/// [`objects::apply_type4_backing`] is the only writer of it, and it stores 0 for
+/// a multi-plane surface and for a single-plane one whose FourCC it does not
+/// know, saying why — "stage/paint must not invent BGRA".
+/// [`objects::iosurface_pixel_format_to_mtl`] repeats it twice more, and the
+/// compute staging path honours it, declining with typed `multiplane` /
+/// `fmt_unknown` reasons.
+///
+/// This resolve used to invent BGRA8 from it, so one surface was refused by the
+/// compute path and rendered into as BGRA8 by this one. That is not a survivable
+/// disagreement for a multi-plane surface: BGRA8 over a `'420f'` allocation
+/// describes the wrong stride and the wrong bytes, and every downstream window is
+/// built from what this returns.
+///
+/// It now declines. Refusing was held back because it drops a colour attachment
+/// — a compositing layer going black — on a class nothing had counted, so the
+/// class was counted first: `rt_base_fmt_invent` read **0 on two driven
+/// x86/Vulkan boots** (Safari window drag plus the web-content probe). The arm is
+/// unreached on this workload, so declining costs nothing measurable and stops
+/// the device from silently rendering a format the guest did not declare. The
+/// counter stays and the fail line stays, because "unreached on this workload" is
+/// not "unreachable" — the first surface to take it will now be named and
+/// refused rather than named and rendered wrong.
+///
+/// The **type-11** arm deliberately does not come through here. A type-11
+/// mapping's format has other writers, so its 0 can mean "not latched yet" rather
+/// than "refused", and BGRA8 is the display contract's stated default for that
+/// case ([`crate::runtime::compute_exec`]'s `or_bgra8` writes the same rule down).
+/// Those are different zeros and only this one is provably a refusal.
+fn rt_type4_base_format(format: u16, mapping_id: u32) -> Option<u16> {
+    if format != 0 {
+        return Some(format);
+    }
+    crate::runtime::drain::note_store_route("rt_base_fmt_declined");
+    if crate::observe::first_sight("rt_base_fmt_declined", mapping_id as u64) {
+        crate::observe::fail(format!(
+            "rt_base_fmt_declined mapping={mapping_id} \
+             (the mapping's format is the type-4 decoder's multi-plane / \
+             unknown-FourCC refusal, so this surface is not a single-format \
+             colour attachment and no format is invented for it)"
+        ));
+    }
+    None
+}
+
+/// Report a type-5 colour attachment whose view record disagrees with the base
+/// mapping it is resolved through.
+///
+/// This resolve reads only `surfaceID@0` out of a type-5 descriptor and takes
+/// geometry and format from the mapping. [`objects::decode_type5_texture_view`]'s
+/// own contract forbids that — "callers must not replace it with base mapping
+/// geometry merely because the surface itself is otherwise stageable" — and the
+/// live case it names is real: the BGRA8 desktop target is also exposed as a
+/// row-byte-equivalent quarter-width RGBA32Uint view. Every other type-5
+/// consumer binds the view's own geometry.
+///
+/// It is harmless exactly while view == base, so the question is how often that
+/// holds for a *render target* specifically, which nothing has measured.
+/// `rt_type5_view_differs` against `rt_type5_view_same` answers it. Reported
+/// rather than repaired: taking the view's geometry here changes what every
+/// type-5 colour attachment renders into, and that is not a change to make on an
+/// unmeasured population.
+///
+/// **Read on two driven x86/Vulkan boots: `same` 20 273 and 24 360, `differs`
+/// 0, `undecoded` 0.** So on this workload every type-5 colour attachment's view
+/// agrees with the base mapping in width, height and format, and resolving
+/// through the base loses nothing. The reinterpretation view the contract names
+/// is real traffic elsewhere — the compute staging path sees it — but it is not
+/// bound as a render target here.
+///
+/// That is a reason not to change the resolve, and not a reason to stop asking.
+/// `differs` is a healthy zero: the first non-zero line names a surface being
+/// rendered at the wrong geometry, which no other counter in this path could
+/// report.
+fn note_rt_type5_view(
+    view: Option<objects::Type5TextureView>,
+    surface_id: u32,
+    base: (u32, u32, u16),
+) {
+    let Some(view) = view else {
+        crate::runtime::drain::note_store_route("rt_type5_view_undecoded");
+        return;
+    };
+    let (base_w, base_h, base_fmt) = base;
+    if view.width == base_w && view.height == base_h && view.pixel_format == base_fmt {
+        crate::runtime::drain::note_store_route("rt_type5_view_same");
+        return;
+    }
+    crate::runtime::drain::note_store_route("rt_type5_view_differs");
+    if crate::observe::first_sight("rt_type5_view_differs", surface_id as u64) {
+        crate::observe::fail(format!(
+            "rt_type5_view_differs sid={surface_id} view={}x{} fmt={:#x} plane={} \
+             base={base_w}x{base_h} fmt={base_fmt:#x} (the colour attachment is \
+             resolved with the base mapping's geometry, not the view's)",
+            view.width, view.height, view.pixel_format, view.plane_index
+        ));
+    }
+}
+
 /// Archive `apple_pv_gpu_lookup_render_target`: type-11 first, else type-2/3 GVA.
 ///
 /// Wallpaper/background intermediates are type-2/3 guest-VA; type-11-only resolve
@@ -3254,6 +3599,10 @@ fn lookup_render_target<M: HostMemory + HostOps>(
         let _ = mapper::ensure_resolved_for_scanout(state, host, mapping_id);
         if let Some(m) = state.mappings.get(&mapping_id) {
             if m.has_geom && m.width > 0 && m.height > 0 {
+                // Not `rt_type4_base_format`: a type-11 mapping's format has
+                // writers other than the type-4 decoder, so 0 here can mean "not
+                // latched yet" rather than "refused", and BGRA8 is the display
+                // contract's default for that case. See that function.
                 let base_fmt = if m.format != 0 {
                     m.format
                 } else {
@@ -3277,6 +3626,7 @@ fn lookup_render_target<M: HostMemory + HostOps>(
     // mids — guest pages stay empty and dual-mid thrash paints black.
     // Type-4: object-list index is surface_id. Type-5 RefTextureHandle: surfaceID@0
     // (allocateRefTextureHandle) — product color RTs are type-5 wrapping type-4.
+    let mut type5_view: Option<objects::Type5TextureView> = None;
     let type4_sid = if live_type == Some(objects::OBJECT_TYPE_SURFACE) {
         Some(resolved_ref)
     } else if live_type == Some(objects::OBJECT_TYPE_REF_TEXTURE) {
@@ -3289,6 +3639,7 @@ fn lookup_render_target<M: HostMemory + HostOps>(
         if sid == 0 {
             return None;
         }
+        type5_view = objects::decode_type5_texture_view(&desc);
         Some(sid)
     } else {
         None
@@ -3312,11 +3663,11 @@ fn lookup_render_target<M: HostMemory + HostOps>(
             ));
             return None;
         }
-        let base_fmt = if m.format != 0 {
-            m.format
-        } else {
-            MTL_FORMAT_BGRA8_UNORM
-        };
+        let (base_w, base_h, base_raw_fmt) = (m.width, m.height, m.format);
+        if live_type == Some(objects::OBJECT_TYPE_REF_TEXTURE) {
+            note_rt_type5_view(type5_view, surface_id, (base_w, base_h, base_raw_fmt));
+        }
+        let base_fmt = rt_type4_base_format(base_raw_fmt, surface_id)?;
         let fmt = effective_view_sample_format(base_fmt, view_fmt_override).unwrap_or(base_fmt);
         pixel_format::render_target_bpp(fmt)?;
         // mapping_id = surface_id; no linear GVA.
@@ -3399,6 +3750,7 @@ pub fn color_target_request<M: HostMemory + HostOps>(
     instance_count: u32,
     primitive_type: u32,
     first_vertex: u32,
+    base_instance: u32,
 ) -> Option<DrawEncodeRequest> {
     let (mapping_id, gva, w, h, bpr, fmt) =
         lookup_render_target(state, host, task_id, color_texture_ref)?;
@@ -3423,6 +3775,7 @@ pub fn color_target_request<M: HostMemory + HostOps>(
         instance_count,
         primitive_type,
         first_vertex,
+        base_instance,
         colors: vec![c0],
         ..Default::default()
     })
@@ -3444,6 +3797,7 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
     instance_count: u32,
     primitive_type: u32,
     first_vertex: u32,
+    base_instance: u32,
 ) -> Option<DrawEncodeRequest> {
     if color_slots.is_empty() {
         return None;
@@ -3542,6 +3896,7 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
         instance_count,
         primitive_type,
         first_vertex,
+        base_instance,
         colors,
         ..Default::default()
     })
@@ -3725,15 +4080,6 @@ pub(crate) fn write_gva_rgba8_within<M: HostMemory + HostOps>(
         // here, and a source that is not white cannot become white.
         crate::observe::footprint::note_written_payload(rgba);
         let (base, avail) = (span_map.ptr, span_map.avail);
-        // Taken once for the whole span so an audited window is compared whole,
-        // then charged per row — the same shape `mapper::copy_mapping_runs`
-        // uses, and for the same reason. This is the raw task-GVA leg, which
-        // `store_routes` reads at `gvaw_fence_flush` against the mapping-keyed
-        // `mapw_fence_flush` beside it; without this hook the audit reports on
-        // only one of the two writeback legs.
-        let mut audit =
-            crate::runtime::land_redundancy::begin_audit(crate::runtime::land_redundancy::Leg::Gva);
-        let page_size = state.page_size();
         let mut res = Ok(());
         for y in 0..height as usize {
             let src = &rgba[y * rgba_row..y * rgba_row + rgba_row];
@@ -3745,16 +4091,6 @@ pub(crate) fn write_gva_rgba8_within<M: HostMemory + HostOps>(
             if off + row.len() > avail {
                 res = Err(MemError::RunOutOfRange);
                 break;
-            }
-            if let Some(walk) = audit.as_mut() {
-                // The tiles are aligned in guest-address space, which is where
-                // a rail could decline a unit — not to the start of the row.
-                //
-                // SAFETY: as below, `map_fresh_span` covers `span` and the
-                // audit only reads the range the copy is about to write.
-                unsafe {
-                    walk.note_write(gva.saturating_add(off as u64), base.add(off), &row, page_size);
-                }
             }
             // SAFETY: map_fresh_span covers `span`.
             unsafe {
@@ -3923,6 +4259,10 @@ pub(crate) fn write_gva_rgba8_rect<M: HostMemory + HostOps>(
 
 /// Store scissor rect of tight RGBA8 into a type-11 mapping (BGRA host → guest fmt).
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
+// Source geometry, destination geometry and the scissor rect, which are three
+// independent rectangles; collapsing them into one struct would invite exactly
+// the mix-up the separate names prevent.
+#[allow(clippy::too_many_arguments)]
 fn write_mapping_rgba8_rect<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -4143,16 +4483,6 @@ fn load_sampled_rgba_static<M: HostMemory + HostOps>(
     load_linear_texture_rgba_host(state, host, task_id, tex_ref, level, fmt_override)
 }
 
-/// Byte-exact revalidated memo for the type-11 mapping-backed guest-page sampled
-/// path. Same contract as [`load_linear_guest_memoized`] / the type-5 view memo:
-/// re-read the native BGRA rect every bind (a guest CPU write is always
-/// observed — neither `map_generation` nor `content_generation` tracks in-place
-/// guest writes), memcmp against the memo, and on an unchanged hit return the
-/// cached RGBA `Arc` + a namespaced content identity so BOTH the CPU convert/
-/// alloc AND the engine's content hash + GPU upload are skipped. A dock-
-/// magnification burst re-binds the same static icons ~1000×, so this collapses
-/// the `t11_guest` CPU copies that saturate the serial drain worker (the
-/// dock-hover whole-VM freeze). Returns `(rgba, identity)`.
 /// Size a recycled scratch buffer to `span` for a `filled`-byte rect, without
 /// re-zeroing the rect.
 ///
@@ -4173,6 +4503,16 @@ fn prepare_memo_scratch(scratch: &mut Vec<u8>, span: usize, filled: usize) {
     scratch[filled..].fill(0);
 }
 
+/// Byte-exact revalidated memo for the type-11 mapping-backed guest-page sampled
+/// path. Same contract as [`load_linear_guest_memoized`] / the type-5 view memo:
+/// re-read the native BGRA rect every bind (a guest CPU write is always
+/// observed — neither `map_generation` nor `content_generation` tracks in-place
+/// guest writes), memcmp against the memo, and on an unchanged hit return the
+/// cached RGBA `Arc` + a namespaced content identity so BOTH the CPU convert/
+/// alloc AND the engine's content hash + GPU upload are skipped. A dock-
+/// magnification burst re-binds the same static icons ~1000×, so this collapses
+/// the `t11_guest` CPU copies that saturate the serial drain worker (the
+/// dock-hover whole-VM freeze). Returns `(rgba, identity)`.
 #[cfg(feature = "backend-vulkan")]
 fn load_type11_rgba_memoized<M: HostMemory + HostOps>(
     state: &mut DeviceState,
@@ -4265,7 +4605,6 @@ fn load_type11_rgba_memoized<M: HostMemory + HostOps>(
     ))
 }
 
-include!("texture_view.rs");
 #[cfg(test)]
 mod tests;
 
@@ -4319,5 +4658,53 @@ mod memo_scratch_tests {
         assert_eq!(scratch.len(), 512);
         prepare_memo_scratch(&mut scratch, 512, 9999);
         assert_eq!(scratch.len(), 512);
+    }
+
+    /// The abandoned-chain recovery rail must name a lost frame.
+    ///
+    /// Both callers invoke this as `let _ = writeback_chain_rgba(..)` and then
+    /// advance the content generation on the next line, so a bare `false` leaves
+    /// the guest's pages stale while the device reports them fresh. That is the
+    /// exact class the land-before-abandon rail exists to prevent, and it is
+    /// also the last frame of a chain that already went wrong once.
+    #[test]
+    fn an_unlandable_chain_writeback_names_itself() {
+        use crate::runtime::drain::store_route_count;
+        let mut state = crate::model::DeviceState::new(
+            crate::model::DeviceId(1),
+            crate::model::PAGE_SHIFT_X86,
+        );
+        let mut host = crate::runtime::host::FakeHost::new();
+
+        // No source at all: the commonest way this rail is reached with nothing
+        // to land, and previously the quietest.
+        let n = store_route_count("chain_land_refused");
+        assert!(!super::writeback_chain_rgba(
+            &mut state,
+            &mut host,
+            1,
+            &[],
+            &[1u8; 4]
+        ));
+        assert_eq!(
+            store_route_count("chain_land_refused"),
+            n + 1,
+            "an empty slot list is a lost frame, not a no-op"
+        );
+
+        // A slot whose texture_ref is unbound cannot resolve a target.
+        let att = crate::runtime::decode::render::ColorAttachment {
+            texture_ref: 0,
+            ..Default::default()
+        };
+        let n = store_route_count("chain_land_refused");
+        assert!(!super::writeback_chain_rgba(
+            &mut state,
+            &mut host,
+            1,
+            &[(0, att)],
+            &[1u8; 4]
+        ));
+        assert_eq!(store_route_count("chain_land_refused"), n + 1);
     }
 }

@@ -144,6 +144,17 @@ pub struct DeviceFeatures {
     pub int8: bool,
     pub shader_output_viewport_index: bool,
     pub mirror_clamp_to_edge: MirrorClampToEdge,
+    /// `VkPhysicalDeviceFeatures::dualSrcBlend` — whether a pipeline may name
+    /// the `SRC1_*` blend factors, which read the fragment shader's second
+    /// colour output.
+    ///
+    /// Same shape as [`Self::mirror_clamp_to_edge`] and here for the same
+    /// reason: `MTLBlendFactor` 15-18 are the dual-source factors, the
+    /// translation table now spells them, and a pipeline naming one on a device
+    /// that does not advertise this is invalid. Optional in core Vulkan — not
+    /// an extension, but not mandatory either — so it is asked rather than
+    /// assumed, and the pipeline path declines by name where it is absent.
+    pub dual_src_blend: bool,
 }
 
 impl DeviceFeatures {
@@ -167,6 +178,7 @@ impl DeviceFeatures {
             .shader_int16(self.shader_int16)
             .shader_storage_image_extended_formats(self.storage_image_extended_formats)
             .shader_storage_image_write_without_format(self.storage_image_write_without_format)
+            .dual_src_blend(self.dual_src_blend)
     }
 
     /// The Vulkan 1.2 features to enable.
@@ -299,6 +311,7 @@ pub unsafe fn query(
     DeviceFeatures {
         robust_buffer_access: supported.robust_buffer_access == vk::TRUE,
         sampler_anisotropy: supported.sampler_anisotropy == vk::TRUE,
+        dual_src_blend: supported.dual_src_blend == vk::TRUE,
         max_sampler_anisotropy: props.limits.max_sampler_anisotropy.max(1.0),
         max_image_dimension_2d: props
             .limits
@@ -357,7 +370,30 @@ mod tests {
             int8: true,
             shader_output_viewport_index: true,
             mirror_clamp_to_edge: MirrorClampToEdge::Core12,
+            dual_src_blend: true,
         }
+    }
+
+    /// `dualSrcBlend` is queried and enabled together, which is rule 1 of this
+    /// module: a feature asked about here and not enabled here is the same
+    /// ungated-bind bug in a new place.
+    ///
+    /// It is a plain optional core feature, so unlike the mirror-clamp mode it
+    /// has no extension rung — the only two states are advertised and not, and
+    /// the not-advertised state must leave the enable bit clear so device
+    /// creation does not fail asking for it.
+    #[test]
+    fn dual_source_blend_is_enabled_only_where_the_device_advertises_it() {
+        assert_eq!(all_supported().enabled_features().dual_src_blend, vk::TRUE);
+        let without = DeviceFeatures {
+            dual_src_blend: false,
+            ..all_supported()
+        };
+        assert_eq!(without.enabled_features().dual_src_blend, vk::FALSE);
+        assert!(without.required_extensions().is_empty());
+        // The default is "not supported", so a `DeviceFeatures` built without a
+        // query never claims a capability it has not checked for.
+        assert!(!DeviceFeatures::default().dual_src_blend);
     }
 
     /// The 1.2 rung sets the core feature bit and asks for no extension.

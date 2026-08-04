@@ -174,7 +174,16 @@ impl Refusal for Status {
     }
 }
 
-pub fn write_err(err: *mut c_char, err_cap: usize, msg: &str) {
+/// Copy `msg` into the shim's error buffer, NUL-terminated and truncated to fit.
+///
+/// # Safety
+///
+/// `err` must be null, or valid for writes of `err_cap` bytes. Null and a zero
+/// capacity are both checked here, so the caller's obligation is only that a
+/// non-null pointer really has the capacity it claims — which is the contract
+/// `reims_vgpu_qemu_abi.h` states for every `(char *err, size_t err_cap)` pair
+/// crossing the boundary.
+pub unsafe fn write_err(err: *mut c_char, err_cap: usize, msg: &str) {
     if err.is_null() || err_cap == 0 {
         return;
     }

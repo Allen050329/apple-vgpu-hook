@@ -15,15 +15,16 @@ use crate::runtime::decode::resource::{
     ICB_DESC_MAX_FRAGMENT_BINDS, ICB_DESC_MAX_KERNEL_BINDS, ICB_DESC_MAX_VERTEX_BINDS,
     ICB_DESC_OPTIONS, ICB_FLAG_INHERIT_BUFFERS, ICB_LAYOUT_LEN,
     MTL_INDIRECT_CMD_CONCURRENT_DISPATCH, MTL_INDIRECT_CMD_DRAW, MTL_INDIRECT_CMD_DRAW_INDEXED,
-    OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_BUFFER, OBJECT_TYPE_TYPE7, PIPELINE_TAG_FRAGMENT_FUNC,
-    PIPELINE_TAG_VERTEX_FUNC, RESOURCE_PAGE_SHIFT, TYPE7_OBJECT_ICB, TYPE7_OBJECT_RENDER_PIPELINE,
+    OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_TYPE7, PIPELINE_TAG_FRAGMENT_FUNC, PIPELINE_TAG_VERTEX_FUNC,
+    RESOURCE_PAGE_SHIFT, TYPE7_OBJECT_ICB, TYPE7_OBJECT_RENDER_PIPELINE,
 };
-/// Compute-pipeline descriptor constants, used only by the Metal-arm
-/// execute tests below. Kept in their own gated `use` so the Vulkan arm
+/// Compute-pipeline and buffer-object descriptor constants, used only by the
+/// Metal-arm execute tests below. Kept in their own gated `use` so the Vulkan arm
 /// does not carry unused imports.
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 use crate::runtime::decode::resource::{
-    OBJECT_TYPE_FUNCTION, PIPELINE_TAG_KERNEL_FUNC, TYPE7_FIRST_TLVS, TYPE7_OBJECT_COMPUTE_PIPELINE,
+    OBJECT_TYPE_BUFFER, OBJECT_TYPE_FUNCTION, PIPELINE_TAG_KERNEL_FUNC, TYPE7_FIRST_TLVS,
+    TYPE7_OBJECT_COMPUTE_PIPELINE,
 };
 use crate::runtime::gva_mem;
 use crate::runtime::host::FakeHost;
@@ -343,7 +344,14 @@ fn make_icb_desc_bytes_tg(
     b[ICB_DESC_MAX_FRAGMENT_BINDS] = 0;
     b[ICB_DESC_MAX_KERNEL_BINDS] = max_kernel as u8;
     b[ICB_DESC_MAX_KERNEL_TG_BINDS] = max_kernel_tg as u8;
-    st16(&mut b[ICB_DESC_FLAGS..], flags);
+    // Off the word Apple writes for an untouched descriptor, so a synthetic
+    // record is one the serializer could have produced. Writing the caller's
+    // flags alone would clear six inherit bits that default on, which is a
+    // guest asking to inherit nothing rather than a blank descriptor.
+    st16(
+        &mut b[ICB_DESC_FLAGS..],
+        crate::runtime::decode::resource::ICB_FLAGS_DEFAULT | flags,
+    );
     let layout = compute_icb_layout(max_kernel, max_kernel_tg);
     b[ICB_DESC_LAYOUT..ICB_DESC_LAYOUT + ICB_LAYOUT_LEN]
         .copy_from_slice(&encode_icb_command_layout(&layout));
@@ -405,7 +413,11 @@ fn make_render_icb_desc_bytes_ex(
     b[ICB_DESC_MAX_KERNEL_BINDS] = 0;
     b[ICB_DESC_MAX_OBJECT_BINDS] = max_object as u8;
     b[ICB_DESC_MAX_MESH_BINDS] = max_mesh as u8;
-    st16(&mut b[ICB_DESC_FLAGS..], flags);
+    // See `make_icb_desc_bytes_tg`: off the serializer's default word.
+    st16(
+        &mut b[ICB_DESC_FLAGS..],
+        crate::runtime::decode::resource::ICB_FLAGS_DEFAULT | flags,
+    );
     let layout = render_icb_layout_ex(
         max_vertex,
         max_fragment,
@@ -606,6 +618,7 @@ fn make_mesh_render_pipeline_desc(
     b
 }
 
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn put_type1_buffer(
     host: &mut FakeHost,
     state: &DeviceState,
@@ -848,8 +861,88 @@ fn load_icb_from_object_list() {
     let icb = load_icb_descriptor(&state, &host, 1, 9).unwrap();
     assert_eq!(icb.max_command_count, 8);
     assert_eq!(icb.max_kernel_buffer_bind_count, 4);
-    assert!(icb.inherit_buffers);
+    assert!(icb.inherit_buffers());
     assert_eq!(icb.command_types, MTL_INDIRECT_CMD_CONCURRENT_DISPATCH);
+}
+
+/// A flag this device does not apply is counted when the guest asks for it, and
+/// not counted when the guest leaves it alone.
+///
+/// The load path is where this has to be checked rather than at the decoder:
+/// `load_icb_descriptor` is what both backends call, and it is the only place
+/// that sees a decoded descriptor on the Vulkan arm at all. A counter sited in
+/// `materialize_metal_icb` would read structurally zero there for a reason that
+/// has nothing to do with what the guest asked for.
+#[test]
+fn a_flag_this_device_does_not_apply_is_counted_when_the_guest_asks_for_it() {
+    use crate::runtime::decode::resource::{
+        ICB_FLAG_INHERIT_CULL_MODE, ICB_FLAG_SUPPORT_RAY_TRACING,
+    };
+    use crate::runtime::drain::store_route_count;
+
+    let _guard = icb_test_guard();
+
+    // Baseline: a descriptor at the serializer's defaults asks for nothing this
+    // device drops, so every counter must hold still.
+    let routes = [
+        "icb_flag_support_ray_tracing_dropped",
+        "icb_flag_no_inherit_cull_mode_dropped",
+    ];
+    let before: Vec<u64> = routes.iter().map(|r| store_route_count(r)).collect();
+    {
+        let (mut host, state) = icb_device();
+        let desc = make_icb_desc_bytes(8, 4, true);
+        let gva = 1u64 << RESOURCE_PAGE_SHIFT;
+        put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, gva, &desc);
+        load_icb_descriptor(&state, &host, 1, 9).unwrap();
+    }
+    for (route, was) in routes.iter().zip(&before) {
+        assert_eq!(
+            store_route_count(route),
+            *was,
+            "{route} fired for a descriptor at its defaults"
+        );
+    }
+
+    // Two asks, in opposite directions: `supportRayTracing` defaults off so the
+    // guest sets it, `inheritCullMode` defaults on so the guest clears it. Each
+    // must reach its own counter and only its own.
+    for (set, clear, route, other) in [
+        (
+            ICB_FLAG_SUPPORT_RAY_TRACING,
+            0,
+            "icb_flag_support_ray_tracing_dropped",
+            "icb_flag_no_inherit_cull_mode_dropped",
+        ),
+        (
+            0,
+            ICB_FLAG_INHERIT_CULL_MODE,
+            "icb_flag_no_inherit_cull_mode_dropped",
+            "icb_flag_support_ray_tracing_dropped",
+        ),
+    ] {
+        let (mut host, state) = icb_device();
+        // The helper ORs the serializer's default word in, so a flag the guest
+        // *clears* has to be cleared after the fact.
+        let mut desc = make_icb_desc_bytes_tg(8, 4, 0, set);
+        let word = crate::contract::endian::ld16(&desc[ICB_DESC_FLAGS..]);
+        st16(&mut desc[ICB_DESC_FLAGS..], word & !clear);
+        let gva = 1u64 << RESOURCE_PAGE_SHIFT;
+        put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, gva, &desc);
+        let before_route = store_route_count(route);
+        let before_other = store_route_count(other);
+        load_icb_descriptor(&state, &host, 1, 9).unwrap();
+        assert_eq!(
+            store_route_count(route),
+            before_route + 1,
+            "{route} did not fire"
+        );
+        assert_eq!(
+            store_route_count(other),
+            before_other,
+            "{other} fired for a flag it does not name"
+        );
+    }
 }
 
 #[test]
@@ -1212,7 +1305,7 @@ fn fill_render_draw_patches_tessellation_oracle() {
         .iter()
         .flat_map(|v| v.iter().flat_map(|f| f.to_le_bytes()))
         .collect();
-    put_type1_buffer(&mut host, &mut state, 11, 4, &cp_bytes);
+    put_type1_buffer(&mut host, &state, 11, 4, &cp_bytes);
 
     // MTLTriangleTessellationFactorsHalf: edge[3] + inside, half 1.0 = 0x3c00.
     let tess_bytes: [u8; 8] = [
@@ -1221,7 +1314,7 @@ fn fill_render_draw_patches_tessellation_oracle() {
         0x00, 0x3c, // edge2
         0x00, 0x3c, // inside
     ];
-    put_type1_buffer(&mut host, &mut state, 12, 5, &tess_bytes);
+    put_type1_buffer(&mut host, &state, 12, 5, &tess_bytes);
 
     fill_render(
         &state,
@@ -1304,15 +1397,15 @@ fn fill_render_draw_indexed_patches_tessellation_oracle() {
         .iter()
         .flat_map(|v| v.iter().flat_map(|f| f.to_le_bytes()))
         .collect();
-    put_type1_buffer(&mut host, &mut state, 11, 4, &cp_bytes);
+    put_type1_buffer(&mut host, &state, 11, 4, &cp_bytes);
 
     // UInt16 control-point indices [1,2,3].
     let indices: [u16; 3] = [1, 2, 3];
     let index_bytes: Vec<u8> = indices.iter().flat_map(|v| v.to_le_bytes()).collect();
-    put_type1_buffer(&mut host, &mut state, 13, 5, &index_bytes);
+    put_type1_buffer(&mut host, &state, 13, 5, &index_bytes);
 
     let tess_bytes: [u8; 8] = [0x00, 0x3c, 0x00, 0x3c, 0x00, 0x3c, 0x00, 0x3c];
-    put_type1_buffer(&mut host, &mut state, 12, 6, &tess_bytes);
+    put_type1_buffer(&mut host, &state, 12, 6, &tess_bytes);
 
     fill_render(
         &state,
@@ -1748,18 +1841,18 @@ fn fill_render_negative_base_vertex_stagein_oracle() {
         .iter()
         .flat_map(|v| v.iter().flat_map(|f| f.to_le_bytes()))
         .collect();
-    put_type1_buffer(&mut host, &mut state, 11, 4, &pos_bytes);
+    put_type1_buffer(&mut host, &state, 11, 4, &pos_bytes);
 
     // indices [1,2,3] + baseVertex(-1) → vertex_id 0,1,2.
     let indices: [u16; 3] = [1, 2, 3];
     let index_bytes: Vec<u8> = indices.iter().flat_map(|v| v.to_le_bytes()).collect();
-    put_type1_buffer(&mut host, &mut state, 12, 5, &index_bytes);
+    put_type1_buffer(&mut host, &state, 12, 5, &index_bytes);
 
     let sid = 7u8;
     let r = (0x60u32 + sid as u32) as f32 / 255.0;
     let color = [r, 0x44 as f32 / 255.0, 0x22 as f32 / 255.0, 1.0f32];
     let color_bytes: Vec<u8> = color.iter().flat_map(|f| f.to_le_bytes()).collect();
-    put_type1_buffer(&mut host, &mut state, 13, 6, &color_bytes);
+    put_type1_buffer(&mut host, &state, 13, 6, &color_bytes);
 
     fill_render(
         &state,
@@ -2003,14 +2096,14 @@ fn fill_render_draw_indexed_execute_oracle() {
     // Index buffer (ref 12, handle 4): UInt16 [0,1,2].
     let indices: [u16; 3] = [0, 1, 2];
     let index_bytes: Vec<u8> = indices.iter().flat_map(|v| v.to_le_bytes()).collect();
-    put_type1_buffer(&mut host, &mut state, 12, 4, &index_bytes);
+    put_type1_buffer(&mut host, &state, 12, 4, &index_bytes);
 
     // Fragment color buffer (ref 13, handle 5): RGBA float4 for sid=7.
     let sid = 7u8;
     let r = (0x60u32 + sid as u32) as f32 / 255.0;
     let color = [r, 0x44 as f32 / 255.0, 0x22 as f32 / 255.0, 1.0f32];
     let color_bytes: Vec<u8> = color.iter().flat_map(|f| f.to_le_bytes()).collect();
-    put_type1_buffer(&mut host, &mut state, 13, 5, &color_bytes);
+    put_type1_buffer(&mut host, &state, 13, 5, &color_bytes);
 
     // Mapping for color writeback (4×4 BGRA).
     let mapping_id = map_draw_target(&mut host, &mut state, 0x30);
@@ -2070,13 +2163,13 @@ fn buffer_backed_render_draw_indexed_fill_execute() {
 
     let indices: [u16; 3] = [0, 1, 2];
     let index_bytes: Vec<u8> = indices.iter().flat_map(|v| v.to_le_bytes()).collect();
-    put_type1_buffer(&mut host, &mut state, 12, 4, &index_bytes);
+    put_type1_buffer(&mut host, &state, 12, 4, &index_bytes);
 
     let sid = 7u8;
     let r = (0x60u32 + sid as u32) as f32 / 255.0;
     let color = [r, 0x44 as f32 / 255.0, 0x22 as f32 / 255.0, 1.0f32];
     let color_bytes: Vec<u8> = color.iter().flat_map(|f| f.to_le_bytes()).collect();
-    put_type1_buffer(&mut host, &mut state, 13, 5, &color_bytes);
+    put_type1_buffer(&mut host, &state, 13, 5, &color_bytes);
 
     let slot = encode_render_command_slot(
         &layout,
@@ -2150,10 +2243,10 @@ fn wire_backed_draw_patches_tessellation_e2e() {
         .iter()
         .flat_map(|v| v.iter().flat_map(|f| f.to_le_bytes()))
         .collect();
-    put_type1_buffer(&mut host, &mut state, 11, 4, &cp_bytes);
+    put_type1_buffer(&mut host, &state, 11, 4, &cp_bytes);
 
     let tess_bytes: [u8; 8] = [0x00, 0x3c, 0x00, 0x3c, 0x00, 0x3c, 0x00, 0x3c];
-    put_type1_buffer(&mut host, &mut state, 12, 5, &tess_bytes);
+    put_type1_buffer(&mut host, &state, 12, 5, &tess_bytes);
 
     // Absolute wire VAs for control-point bind + tess factor (base+0).
     let cp_wire = (4u64) << RESOURCE_PAGE_SHIFT;
@@ -2253,14 +2346,14 @@ fn wire_backed_draw_indexed_patches_tessellation_e2e() {
         .iter()
         .flat_map(|v| v.iter().flat_map(|f| f.to_le_bytes()))
         .collect();
-    put_type1_buffer(&mut host, &mut state, 11, 4, &cp_bytes);
+    put_type1_buffer(&mut host, &state, 11, 4, &cp_bytes);
 
     let indices: [u16; 3] = [1, 2, 3];
     let index_bytes: Vec<u8> = indices.iter().flat_map(|v| v.to_le_bytes()).collect();
-    put_type1_buffer(&mut host, &mut state, 13, 5, &index_bytes);
+    put_type1_buffer(&mut host, &state, 13, 5, &index_bytes);
 
     let tess_bytes: [u8; 8] = [0x00, 0x3c, 0x00, 0x3c, 0x00, 0x3c, 0x00, 0x3c];
-    put_type1_buffer(&mut host, &mut state, 12, 6, &tess_bytes);
+    put_type1_buffer(&mut host, &state, 12, 6, &tess_bytes);
 
     let cp_wire = (4u64) << RESOURCE_PAGE_SHIFT;
     let index_wire = (5u64) << RESOURCE_PAGE_SHIFT;
@@ -3286,13 +3379,13 @@ fn inherit_buffers_encoder_fragment_color() {
 
     let indices: [u16; 3] = [0, 1, 2];
     let index_bytes: Vec<u8> = indices.iter().flat_map(|v| v.to_le_bytes()).collect();
-    put_type1_buffer(&mut host, &mut state, 12, 4, &index_bytes);
+    put_type1_buffer(&mut host, &state, 12, 4, &index_bytes);
 
     let sid = 7u8;
     let r = (0x60u32 + sid as u32) as f32 / 255.0;
     let color = [r, 0x44 as f32 / 255.0, 0x22 as f32 / 255.0, 1.0f32];
     let color_bytes: Vec<u8> = color.iter().flat_map(|f| f.to_le_bytes()).collect();
-    put_type1_buffer(&mut host, &mut state, 13, 5, &color_bytes);
+    put_type1_buffer(&mut host, &state, 13, 5, &color_bytes);
 
     // Fill: pipeline + draw only — no fragment buffer in the ICB slot.
     fill_render(
@@ -3369,13 +3462,13 @@ fn inherit_pipeline_encoder_fragment_color() {
 
     let indices: [u16; 3] = [0, 1, 2];
     let index_bytes: Vec<u8> = indices.iter().flat_map(|v| v.to_le_bytes()).collect();
-    put_type1_buffer(&mut host, &mut state, 12, 4, &index_bytes);
+    put_type1_buffer(&mut host, &state, 12, 4, &index_bytes);
 
     let sid = 7u8;
     let r = (0x60u32 + sid as u32) as f32 / 255.0;
     let color = [r, 0x44 as f32 / 255.0, 0x22 as f32 / 255.0, 1.0f32];
     let color_bytes: Vec<u8> = color.iter().flat_map(|f| f.to_le_bytes()).collect();
-    put_type1_buffer(&mut host, &mut state, 13, 5, &color_bytes);
+    put_type1_buffer(&mut host, &state, 13, 5, &color_bytes);
 
     // Fill: buffers + draw only — pipeline_ref 0 (inherited from parent).
     fill_render(
@@ -3462,13 +3555,13 @@ fn fill_render_stagein_draw_execute_oracle() {
         .iter()
         .flat_map(|v| v.iter().flat_map(|f| f.to_le_bytes()))
         .collect();
-    put_type1_buffer(&mut host, &mut state, 11, 4, &pos_bytes);
+    put_type1_buffer(&mut host, &state, 11, 4, &pos_bytes);
 
     let sid = 7u8;
     let r = (0x60u32 + sid as u32) as f32 / 255.0;
     let color = [r, 0x44 as f32 / 255.0, 0x22 as f32 / 255.0, 1.0f32];
     let color_bytes: Vec<u8> = color.iter().flat_map(|f| f.to_le_bytes()).collect();
-    put_type1_buffer(&mut host, &mut state, 13, 5, &color_bytes);
+    put_type1_buffer(&mut host, &state, 13, 5, &color_bytes);
 
     fill_render(
         &state,
@@ -3534,13 +3627,13 @@ fn wire_backed_draw_primitives_stagein_e2e() {
         .iter()
         .flat_map(|v| v.iter().flat_map(|f| f.to_le_bytes()))
         .collect();
-    put_type1_buffer(&mut host, &mut state, 11, 4, &pos_bytes);
+    put_type1_buffer(&mut host, &state, 11, 4, &pos_bytes);
 
     let sid = 7u8;
     let r = (0x60u32 + sid as u32) as f32 / 255.0;
     let color = [r, 0x44 as f32 / 255.0, 0x22 as f32 / 255.0, 1.0f32];
     let color_bytes: Vec<u8> = color.iter().flat_map(|f| f.to_le_bytes()).collect();
-    put_type1_buffer(&mut host, &mut state, 13, 5, &color_bytes);
+    put_type1_buffer(&mut host, &state, 13, 5, &color_bytes);
 
     let pos_wire = (4u64) << RESOURCE_PAGE_SHIFT;
     let color_wire = (5u64) << RESOURCE_PAGE_SHIFT;
@@ -3723,13 +3816,13 @@ fn fill_render_attribute_stride_stagein_execute() {
         .iter()
         .flat_map(|v| v.iter().flat_map(|f| f.to_le_bytes()))
         .collect();
-    put_type1_buffer(&mut host, &mut state, 11, 4, &pos_bytes);
+    put_type1_buffer(&mut host, &state, 11, 4, &pos_bytes);
 
     let sid = 7u8;
     let r = (0x60u32 + sid as u32) as f32 / 255.0;
     let color = [r, 0x44 as f32 / 255.0, 0x22 as f32 / 255.0, 1.0f32];
     let color_bytes: Vec<u8> = color.iter().flat_map(|f| f.to_le_bytes()).collect();
-    put_type1_buffer(&mut host, &mut state, 13, 5, &color_bytes);
+    put_type1_buffer(&mut host, &state, 13, 5, &color_bytes);
 
     fill_render(
         &state,
@@ -3814,13 +3907,13 @@ fn wire_backed_attribute_stride_stagein_e2e() {
         .iter()
         .flat_map(|v| v.iter().flat_map(|f| f.to_le_bytes()))
         .collect();
-    put_type1_buffer(&mut host, &mut state, 11, 4, &pos_bytes);
+    put_type1_buffer(&mut host, &state, 11, 4, &pos_bytes);
 
     let sid = 7u8;
     let r = (0x60u32 + sid as u32) as f32 / 255.0;
     let color = [r, 0x44 as f32 / 255.0, 0x22 as f32 / 255.0, 1.0f32];
     let color_bytes: Vec<u8> = color.iter().flat_map(|f| f.to_le_bytes()).collect();
-    put_type1_buffer(&mut host, &mut state, 13, 5, &color_bytes);
+    put_type1_buffer(&mut host, &state, 13, 5, &color_bytes);
 
     let pos_wire = (4u64) << RESOURCE_PAGE_SHIFT;
     let color_wire = (5u64) << RESOURCE_PAGE_SHIFT;
@@ -3934,7 +4027,6 @@ fn decode_encode_barrier_and_threadgroup_memory() {
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn fill_compute_barrier_and_tg_memory_execute() {
     use crate::runtime::compute_session::ComputeSession;
-    use crate::runtime::decode::resource::compute_icb_layout;
 
     let (_guard, mtlb, mut host, mut state) = mul3add1_fixture();
 
@@ -4137,6 +4229,8 @@ fn inherit_pipeline_encoder_kernel_mul3add1() {
 
 /// Install a type-2 linear texture (single level) and write seed texels.
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
+// A test fixture builder: object ref, handle, geometry and seed texels.
+#[allow(clippy::too_many_arguments)]
 fn put_type2_texture(
     host: &mut FakeHost,
     state: &mut DeviceState,
@@ -4549,6 +4643,7 @@ fn icb_argument_buffer_sample_and_write() {
     }
 }
 
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
 #[test]
 fn resolve_bind_offset_from_wire_va() {
     let (mut host, state) = icb_device();
@@ -4595,7 +4690,7 @@ fn fill_render_nonzero_bind_offset_oracle() {
     // Index buffer: 4 B pad + 6 B indices (offset 4).
     let mut index_bytes = vec![0u8; 4];
     index_bytes.extend(indices.iter().flat_map(|v| v.to_le_bytes()));
-    put_type1_buffer(&mut host, &mut state, 12, 4, &index_bytes);
+    put_type1_buffer(&mut host, &state, 12, 4, &index_bytes);
     let index_base = (4u64) << RESOURCE_PAGE_SHIFT;
 
     let sid = 7u8;
@@ -4605,7 +4700,7 @@ fn fill_render_nonzero_bind_offset_oracle() {
     // Color buffer: 16 B pad + float4 (offset 16).
     let mut color_buf = vec![0xAAu8; 16];
     color_buf.extend_from_slice(&color_bytes);
-    put_type1_buffer(&mut host, &mut state, 13, 5, &color_buf);
+    put_type1_buffer(&mut host, &state, 13, 5, &color_buf);
     let color_base = (5u64) << RESOURCE_PAGE_SHIFT;
 
     fill_render(
@@ -4684,7 +4779,7 @@ fn buffer_backed_nonzero_wire_va_offset() {
     let indices: [u16; 3] = [0, 1, 2];
     let mut index_bytes = vec![0u8; 8]; // pad 8
     index_bytes.extend(indices.iter().flat_map(|v| v.to_le_bytes()));
-    put_type1_buffer(&mut host, &mut state, 12, 4, &index_bytes);
+    put_type1_buffer(&mut host, &state, 12, 4, &index_bytes);
     let index_wire = ((4u64) << RESOURCE_PAGE_SHIFT) + 8;
 
     let sid = 7u8;
@@ -4693,7 +4788,7 @@ fn buffer_backed_nonzero_wire_va_offset() {
     let color_bytes: Vec<u8> = color.iter().flat_map(|f| f.to_le_bytes()).collect();
     let mut color_buf = vec![0u8; 24]; // pad 24
     color_buf.extend_from_slice(&color_bytes);
-    put_type1_buffer(&mut host, &mut state, 13, 5, &color_buf);
+    put_type1_buffer(&mut host, &state, 13, 5, &color_buf);
     let color_wire = ((5u64) << RESOURCE_PAGE_SHIFT) + 24;
 
     let slot = encode_render_command_slot(

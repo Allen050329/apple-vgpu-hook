@@ -9,7 +9,7 @@
 
 use crate::contract::endian::{ld32, st16, st32};
 
-// --- child opcodes and record layout (static RE of the PVG command table) ---
+// --- child opcodes and record layout, as the PVG command table numbers them ---
 
 /// PVG table: CmdUnmapMemory (not map — MapMemory2 is `0x39`).
 pub const CHILD_OP_UNMAP_MEMORY: u16 = 0x22;
@@ -21,7 +21,7 @@ pub const CHILD_OP_SYNCHRONIZE_RESOURCES: u16 = 0x35;
 pub const CHILD_OP_MAP_MEMORY2: u16 = 0x39;
 pub const CHILD_OP_CONFIG_40: u16 = 0x40;
 
-/// CmdInvalidateResources / CmdSynchronizeResources shared header (RE pageBacking).
+/// CmdInvalidateResources / CmdSynchronizeResources shared header.
 pub const CHILD_RESOURCE_LIST_TASK_ID: u32 = 0x00;
 pub const CHILD_RESOURCE_LIST_COUNT: u32 = 0x04;
 pub const CHILD_RESOURCE_LIST_HEADER_LEN: u32 = 8;
@@ -29,6 +29,10 @@ pub const CHILD_RESOURCE_LIST_HEADER_LEN: u32 = 8;
 pub const CHILD_INVALIDATE_RECORD_LEN: u32 = 8;
 /// Per-object record on Synchronize: `{object_id u32}` only (no validity ops).
 pub const CHILD_SYNCHRONIZE_RECORD_LEN: u32 = 4;
+/// CmdReplacePhysical (`0x3c`): a fixed `{task_id, object_id}` pair, no list.
+pub const CHILD_REPLACE_PHYSICAL_TASK_ID: u32 = 0x00;
+pub const CHILD_REPLACE_PHYSICAL_OBJECT_ID: u32 = 0x04;
+pub const CHILD_REPLACE_PHYSICAL_LEN: u32 = 8;
 /// Hardcoded pageon second dword from `pageBacking` (LE bytes `01 00 00 01`).
 ///
 /// Not a free-form bitfield. PVG host `invalidateResources:` treats the four
@@ -59,11 +63,9 @@ pub const CHILD_EXEC_INDIRECT_CMDBUF_LENGTH: u32 = 0x08;
 
 /// Per-resource descriptor offsets inside the EXEC_INDIRECT2 resource table.
 ///
-/// RE of `AppleParavirtCommandQueue::writeInvalidates(AppleParavirtSegmentResourceList*,
-/// AppleParavirtCommandAllocator&)`: one 24-byte record per live list entry,
-/// `{object_id u32}` followed by the same four validity-op bytes a
-/// `CmdInvalidateResources` record carries, then 16 trailing bytes this kext
-/// build zeroes.
+/// The queue writes one 24-byte record per live list entry: `{object_id u32}`
+/// followed by the same four validity-op bytes a `CmdInvalidateResources`
+/// record carries, then 16 trailing bytes it zeroes.
 pub const CHILD_EXEC_RESOURCE_OBJECT_ID: u32 = 0x00;
 pub const CHILD_EXEC_RESOURCE_VALIDITY_OPS: u32 = 0x04;
 pub const CHILD_EXEC_RESOURCE_TAIL: u32 = 0x08;
@@ -189,6 +191,13 @@ pub struct InvalidateResourcesCommand {
     pub records: Vec<InvalidateResourceRecord>,
 }
 
+/// FIFO CmdReplacePhysical (0x3c) payload — `{task_id, object_id}`, 8 bytes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReplacePhysicalCommand {
+    pub task_id: u32,
+    pub object_id: u32,
+}
+
 /// FIFO CmdSynchronizeResources (0x35) payload (RE synchronizeForUnwire + live plen=12).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SynchronizeResourcesCommand {
@@ -199,8 +208,9 @@ pub struct SynchronizeResourcesCommand {
 
 /// Decode CmdInvalidateResources: header `{task_id, count}` + `count × {object_id, flags}`.
 ///
-/// Guest `pageBacking` always writes count=1 and flags=`0x1000001` on this kext; decoder
-/// still accepts count>1 when the payload is long enough (forward-compatible).
+/// Guest `pageBacking` always writes count=1 and flags=`0x1000001` on the observed
+/// guest driver; decoder still accepts count>1 when the payload is long enough
+/// (forward-compatible).
 pub fn decode_invalidate_resources(payload: &[u8]) -> Option<InvalidateResourcesCommand> {
     if payload.len() < CHILD_RESOURCE_LIST_HEADER_LEN as usize {
         return None;
@@ -255,9 +265,9 @@ pub fn decode_invalidate_resources(payload: &[u8]) -> Option<InvalidateResources
 pub struct ExecResourceDesc {
     pub object_id: u32,
     pub ops: InvalidateValidityOps,
-    /// Bytes `+0x08..0x18`. Zeroed by the Ventura 13.7.8 x86 kext; kept raw
-    /// rather than dropped so a build that populates them is visible instead of
-    /// silently discarded.
+    /// Bytes `+0x08..0x18`. Zeroed by the Ventura 13.7.8 x86 guest driver; kept
+    /// raw rather than dropped so a build that populates them is visible instead
+    /// of silently discarded.
     pub tail: [u8; CHILD_EXEC_RESOURCE_TAIL_LEN as usize],
 }
 
@@ -303,6 +313,26 @@ pub fn decode_exec_resource_table(payload: &[u8]) -> Option<Vec<ExecResourceDesc
         off += CHILD_EXEC_INDIRECT_RESOURCE_DESC_LEN as usize;
     }
     Some(descs)
+}
+
+/// Decode CmdReplacePhysical (`0x3c`): `{task_id, object_id}`, 8 bytes.
+///
+/// The guest emits this once per attached resource at the tail of a re-commit
+/// into the GPU page table — that is, after the range was released, its pages
+/// were wired to different host frames, and the new PFNs were written back at
+/// the *same* GPU-VA. It therefore carries no address of its own: the GVA is
+/// unchanged, and only the translation behind it moved.
+///
+/// `task_id` is a plain slot id, as the other resource-list commands carry it,
+/// and not the doubled `DefineTask2` word.
+pub fn decode_replace_physical(payload: &[u8]) -> Option<ReplacePhysicalCommand> {
+    if payload.len() < CHILD_REPLACE_PHYSICAL_LEN as usize {
+        return None;
+    }
+    Some(ReplacePhysicalCommand {
+        task_id: ld32(&payload[CHILD_REPLACE_PHYSICAL_TASK_ID as usize..]),
+        object_id: ld32(&payload[CHILD_REPLACE_PHYSICAL_OBJECT_ID as usize..]),
+    })
 }
 
 /// Decode CmdSynchronizeResources: header `{task_id, count}` + `count × {object_id}`.

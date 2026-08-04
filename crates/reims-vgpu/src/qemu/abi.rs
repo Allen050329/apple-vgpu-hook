@@ -19,17 +19,29 @@
 use crate::qemu::host_ops::{ReimsVgpuHostAction, ReimsVgpuHostOps};
 use crate::{
     backend_name, device_create, device_cursor_glyph_copy, device_cursor_glyph_info,
-    device_destroy, device_drain, device_early_scanout_target, device_efi_console_copy,
+    device_console_feed, device_destroy, device_drain, device_efi_console_copy,
     device_gfx_read, device_gfx_write, device_iosfc_read, device_iosfc_write, device_poll,
-    device_pop_action, device_present_boundary_seen, device_reset, device_scanout_copy,
+    device_pop_action, device_reset, device_scanout_copy, device_scanout_may_paint,
     device_window_run_main, device_window_set_early_fb, device_window_start, device_window_stop,
-    unwind_safe, CursorGlyphInfo,
+    unwind_safe, ConsoleFeed, CursorGlyphInfo,
 };
 use std::os::raw::{c_char, c_int};
 use std::slice;
 
 /// Bump when breaking the C shim contract.
 ///
+/// v15 adds `reims_vgpu_qemu_scanout_may_paint`, the console-ownership verdict
+/// for one presented mapping. v14 moved the three-way *kind* into Rust but went
+/// on exporting it as an input, and the shims did with it what shims do: the x86
+/// one rebuilt "may this paint" from the kind and the mapping id, the arm64 one
+/// built nothing and painted every present it was handed. Exporting the inputs
+/// to a rule is exporting the rule.
+/// v14 replaces `present_boundary_seen` + `early_scanout_target` with the single
+/// `console_feed`. The shims took the old pair together and branched on it, so
+/// the console-ownership rule existed in C twice and in Rust once more; the
+/// branch is product policy and a thin shim does not hold one. Removing both
+/// symbols rather than leaving them is deliberate — a shim that can still
+/// assemble its own answer will eventually do so again.
 /// v13 adds `guest_written_pages` on [`ReimsVgpuHostOps`]: the per-page form of
 /// v12's generation. A whole-set generation is enough to decide whether to reuse
 /// a host-side copy, and not enough to decide what to write back — a deferred
@@ -51,7 +63,7 @@ use std::slice;
 /// [[host-window]]). The symbol is always present; when the staticlib was built
 /// without the `host-window` feature it returns `REIMS_VGPU_QEMU_ERR_STATE` so the C
 /// shim falls back to QEMU's own display.
-pub const REIMS_VGPU_QEMU_ABI_VERSION: u32 = 13;
+pub const REIMS_VGPU_QEMU_ABI_VERSION: u32 = 15;
 
 #[repr(C)]
 pub struct ReimsVgpuQemuCreateInfo {
@@ -483,33 +495,102 @@ pub unsafe extern "C" fn reims_vgpu_qemu_device_pop_action(
     )
 }
 
-/// Whether the guest has crossed the first product present boundary
-/// (`frame_flush_seen`). REIMS_VGPU_QEMU_OK + `*out_seen` 0/1; ERR_STATE if no device.
-/// The per-boot value is monotonic and does not contend on mutable device state.
+/// Which source owns the host console right now, as one answer.
 ///
-/// C uses this so BAR1 UEFI GOP stays on the host console until DisplaySwap —
-/// not until the first early front writeback (which was killing GOP too early).
+/// REIMS_VGPU_QEMU_OK fills `*out_kind` with a `REIMS_VGPU_CONSOLE_FEED_*`;
+/// ERR_STATE if no device. The four geometry outs are written only for `Early`,
+/// and may be null when the caller wants the kind alone.
 ///
-/// SAFETY: `out_seen` non-null.
+/// This replaced `present_boundary_seen` + `early_scanout_target`, which the
+/// shims took together and recombined into a three-way branch of their own. The
+/// branch is the console-ownership rule, it is product policy, and C is a thin
+/// shim — so it is answered here, by [`crate::device_console_feed`], which is
+/// the same predicate the host-window path already uses.
+///
+/// SAFETY: `out_kind` non-null; the geometry outs either null or writable.
 #[no_mangle]
-pub unsafe extern "C" fn reims_vgpu_qemu_present_boundary_seen(
+pub unsafe extern "C" fn reims_vgpu_qemu_console_feed(
     handle: u64,
-    out_seen: *mut u32,
+    out_kind: *mut u32,
+    out_mapping_id: *mut u32,
+    out_width: *mut u32,
+    out_height: *mut u32,
+    out_generation: *mut u32,
 ) -> c_int {
     unwind_safe(
         || {
-            if handle == 0 || out_seen.is_null() {
+            if handle == 0 || out_kind.is_null() {
                 return REIMS_VGPU_QEMU_ERR_ARGS;
             }
-            match device_present_boundary_seen(handle) {
-                Some(seen) => {
-                    unsafe {
-                        *out_seen = if seen { 1 } else { 0 };
-                    }
-                    REIMS_VGPU_QEMU_OK
-                }
-                None => REIMS_VGPU_QEMU_ERR_STATE,
+            let Some(feed) = device_console_feed(handle) else {
+                return REIMS_VGPU_QEMU_ERR_STATE;
+            };
+            unsafe {
+                *out_kind = feed.kind();
             }
+            if let ConsoleFeed::Early {
+                mapping_id,
+                width,
+                height,
+                generation,
+            } = feed
+            {
+                // Written one at a time rather than behind a single all-or-nothing
+                // null check: a caller that wants only the kind passes null for
+                // every one of these, and refusing that would put the shim back in
+                // the business of holding a scratch tuple it does not use.
+                unsafe {
+                    if !out_mapping_id.is_null() {
+                        *out_mapping_id = mapping_id;
+                    }
+                    if !out_width.is_null() {
+                        *out_width = width;
+                    }
+                    if !out_height.is_null() {
+                        *out_height = height;
+                    }
+                    if !out_generation.is_null() {
+                        *out_generation = generation;
+                    }
+                }
+            }
+            REIMS_VGPU_QEMU_OK
+        },
+        REIMS_VGPU_QEMU_ERR_PANIC,
+    )
+}
+
+/// May a present naming `mapping_id` paint the host console right now?
+///
+/// REIMS_VGPU_QEMU_OK fills `*out_may` with 0 or 1; ERR_STATE if no device.
+///
+/// This is the answer, not the inputs. Both shims call it before painting a
+/// presented mapping. The x86 shim used to assemble it from
+/// [`reims_vgpu_qemu_console_feed`]'s `out_kind` and `out_mapping_id`, and the
+/// arm64 shim did not gate at all — so the same present that the x86 console
+/// refused as a pre-boundary steal was painted on arm64. Exporting the kind
+/// without the verdict is what let those two drift; see
+/// [`crate::device_scanout_may_paint`].
+///
+/// SAFETY: `out_may` non-null and writable.
+#[no_mangle]
+pub unsafe extern "C" fn reims_vgpu_qemu_scanout_may_paint(
+    handle: u64,
+    mapping_id: u32,
+    out_may: *mut u32,
+) -> c_int {
+    unwind_safe(
+        || {
+            if handle == 0 || out_may.is_null() {
+                return REIMS_VGPU_QEMU_ERR_ARGS;
+            }
+            let Some(may) = device_scanout_may_paint(handle, mapping_id) else {
+                return REIMS_VGPU_QEMU_ERR_STATE;
+            };
+            unsafe {
+                *out_may = u32::from(may);
+            }
+            REIMS_VGPU_QEMU_OK
         },
         REIMS_VGPU_QEMU_ERR_PANIC,
     )
@@ -520,7 +601,7 @@ pub unsafe extern "C" fn reims_vgpu_qemu_present_boundary_seen(
 /// REIMS_VGPU_QEMU_OK when efi_fb_start is programmed and GPA read succeeds.
 /// REIMS_VGPU_QEMU_EMPTY when efi_fb_start == 0 (C falls back to BAR1 GOP RAM).
 ///
-/// SAFETY: `dst` valid for dst_stride*height; out pointers non-null when OK expected.
+/// SAFETY: `dst` valid for dst_stride*height.
 #[no_mangle]
 pub unsafe extern "C" fn reims_vgpu_qemu_efi_console_copy(
     handle: u64,
@@ -528,8 +609,6 @@ pub unsafe extern "C" fn reims_vgpu_qemu_efi_console_copy(
     dst_stride: u32,
     width: u32,
     height: u32,
-    out_gpa: *mut u64,
-    out_stride: *mut u32,
 ) -> c_int {
     unwind_safe(
         || {
@@ -541,62 +620,10 @@ pub unsafe extern "C" fn reims_vgpu_qemu_efi_console_copy(
                 return REIMS_VGPU_QEMU_ERR_ARGS;
             }
             let buf = unsafe { slice::from_raw_parts_mut(dst, len) };
-            match device_efi_console_copy(handle, buf, dst_stride, width, height) {
-                Some((gpa, stride)) => {
-                    if !out_gpa.is_null() {
-                        unsafe {
-                            *out_gpa = gpa;
-                        }
-                    }
-                    if !out_stride.is_null() {
-                        unsafe {
-                            *out_stride = stride;
-                        }
-                    }
-                    REIMS_VGPU_QEMU_OK
-                }
-                None => REIMS_VGPU_QEMU_EMPTY,
-            }
-        },
-        REIMS_VGPU_QEMU_ERR_PANIC,
-    )
-}
-
-/// Pre-boundary scanout target for `gfx_update` re-pull (logo + pill).
-///
-/// REIMS_VGPU_QEMU_OK fills all outs; REIMS_VGPU_QEMU_EMPTY when post-boundary or no front
-/// mapping yet (C should only re-show the last surface).
-///
-/// SAFETY: out pointers non-null when OK is expected.
-#[no_mangle]
-pub unsafe extern "C" fn reims_vgpu_qemu_early_scanout_target(
-    handle: u64,
-    out_mapping_id: *mut u32,
-    out_width: *mut u32,
-    out_height: *mut u32,
-    out_generation: *mut u32,
-) -> c_int {
-    unwind_safe(
-        || {
-            if handle == 0
-                || out_mapping_id.is_null()
-                || out_width.is_null()
-                || out_height.is_null()
-                || out_generation.is_null()
-            {
-                return REIMS_VGPU_QEMU_ERR_ARGS;
-            }
-            match device_early_scanout_target(handle) {
-                Some((mid, w, h, gen)) => {
-                    unsafe {
-                        *out_mapping_id = mid;
-                        *out_width = w;
-                        *out_height = h;
-                        *out_generation = gen;
-                    }
-                    REIMS_VGPU_QEMU_OK
-                }
-                None => REIMS_VGPU_QEMU_EMPTY,
+            if device_efi_console_copy(handle, buf, dst_stride, width, height) {
+                REIMS_VGPU_QEMU_OK
+            } else {
+                REIMS_VGPU_QEMU_EMPTY
             }
         },
         REIMS_VGPU_QEMU_ERR_PANIC,
@@ -692,11 +719,48 @@ pub unsafe extern "C" fn reims_vgpu_qemu_cursor_glyph_copy(
     )
 }
 
+/// Read `#define NAME <decimal>[u]` out of the shared ABI header.
+///
+/// Test-only, and the only thing in the toolchain that reads the header at all:
+/// Rust does not include it and the shims do not read Rust, so every constant
+/// crossing the boundary exists as two copies with nothing comparing them. Each
+/// caller is the sole check that one of them has not drifted. Takes the first
+/// token after the name, because several of these carry a trailing `/* ... */`.
+#[cfg(test)]
+pub(crate) fn header_define(name: &str) -> u32 {
+    const HEADER: &str = include_str!("../../include/reims_vgpu_qemu_abi.h");
+    HEADER
+        .lines()
+        .find_map(|l| l.strip_prefix(&format!("#define {name} ")))
+        .unwrap_or_else(|| panic!("the shared ABI header must define {name}"))
+        .split_whitespace()
+        .next()
+        .unwrap_or_else(|| panic!("{name} must have a value"))
+        .trim_end_matches('u')
+        .parse()
+        .unwrap_or_else(|e| panic!("{name} must be a plain decimal literal: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
 
     use super::*;
     use crate::model::{PAGE_SHIFT_ARM64E, PAGE_SHIFT_X86};
+
+    /// The version is the handshake itself: `copy_host_ops` refuses an ops table
+    /// whose `abi_version` is not this exact number, so a header and a staticlib
+    /// that disagree do not degrade — every device_create fails and the guest
+    /// gets no GPU at all. That is a loud failure at boot; this makes it a loud
+    /// failure at build, which is where a version bump that touched only one of
+    /// the two files is cheap to fix.
+    #[test]
+    fn the_abi_header_agrees_on_the_version() {
+        assert_eq!(
+            header_define("REIMS_VGPU_QEMU_ABI_VERSION"),
+            REIMS_VGPU_QEMU_ABI_VERSION,
+            "the shim header and the staticlib disagree on the ABI version"
+        );
+    }
 
     #[test]
     fn create_reset_destroy() {

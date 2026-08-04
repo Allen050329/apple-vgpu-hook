@@ -233,9 +233,34 @@ impl Decline for DrawPreparationDecline {
             Self::FragmentBufferMissing { .. } => "draw_prepare_fragment_buffer_missing",
             Self::VertexAttributeFormat { .. } => "draw_prepare_vertex_attribute_format",
             Self::StageInBytesMissing { .. } => "draw_prepare_stage_in_bytes_missing",
-            Self::VertexStepFunctionUnsupported { .. } => {
-                "draw_prepare_vertex_step_function_unsupported"
-            }
+            // The one `TranslateReason` carrier that needs two slugs, and the
+            // asymmetry with its nine siblings is the point rather than an
+            // oversight.
+            //
+            // Every other translate entry point returns exactly one reason
+            // variant — `filter` only `UnknownSamplerFilter`, `address_mode`
+            // only `UnknownSamplerAddressMode`, `attribute_format` only
+            // `UnknownVertexFormat` — so for those one fixed string loses
+            // nothing and says more, because it also names *which* field
+            // failed. `step_function` is the one that returns **two**, and the
+            // distinction is the whole reason the second exists: a tessellation
+            // step rate is a value this backend recognises and has no Vulkan
+            // spelling for, not a value it failed to recognise.
+            //
+            // Under one fixed string the two rendered identically apart from
+            // `value`, which is the state `translate::reason` says the split
+            // was introduced to end — so that fix never reached the log.
+            // Delegating to `reason.slug()` the way `VertexTranslate` and
+            // `IndexLoad` do is not the repair either: those carry
+            // `M2vCacheDecline` and `IndexLoadReason`, whose slugs already
+            // begin `m2v_`/`mtlb_`, while `TranslateReason`'s are unprefixed
+            // and would leave the emitted name unattributable to a subsystem.
+            Self::VertexStepFunctionUnsupported { reason, .. } => match reason {
+                TranslateReason::VertexStepFunctionPerPatch(_) => {
+                    "draw_prepare_vertex_step_function_per_patch"
+                }
+                _ => "draw_prepare_vertex_step_function_unsupported",
+            },
             Self::ColorInputMrtUnsupported { .. } => "draw_prepare_color_input_mrt_unsupported",
             Self::AttachmentAliasIdentityMissing { .. } => {
                 "draw_prepare_attachment_alias_identity_missing"
@@ -689,6 +714,14 @@ mod tests {
                 buffer_index: 1,
                 reason: TranslateReason::UnknownVertexStepFunction(9),
             },
+            // The same variant under its other reason. It is in the census
+            // because it is a distinct slug, and it is the entry that fails if
+            // the two ever collapse back into one.
+            DrawPreparationDecline::VertexStepFunctionUnsupported {
+                location: 3,
+                buffer_index: 1,
+                reason: TranslateReason::VertexStepFunctionPerPatch(3),
+            },
             DrawPreparationDecline::ColorInputMrtUnsupported {
                 destination_index: 1,
             },
@@ -843,7 +876,7 @@ mod tests {
         slugs.sort_unstable();
         let before = slugs.len();
         slugs.dedup();
-        assert_eq!(before, 40, "the draw-preparation reason census moved");
+        assert_eq!(before, 41, "the draw-preparation reason census moved");
         assert_eq!(before, slugs.len(), "duplicate draw-preparation slug");
     }
 

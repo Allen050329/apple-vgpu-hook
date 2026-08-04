@@ -6,15 +6,17 @@ use crate::backend::metal::abi::{
     REIMS_VGPU_COMPUTE_STAGE_INPUT_STRIDE_DYNAMIC,
 };
 use crate::backend::metal::constants::{
-    MTL_ATTRIBUTE_FORMAT_FLOAT_RGB9E5, MTL_BUFFER_LAYOUT_STRIDE_DYNAMIC,
-    REIMS_VGPU_METAL_MAX_ATTRS, REIMS_VGPU_METAL_MAX_BUFFERS,
+    MTL_BUFFER_LAYOUT_STRIDE_DYNAMIC, REIMS_VGPU_METAL_MAX_ATTRS, REIMS_VGPU_METAL_MAX_BUFFERS,
 };
+use crate::backend::metal::mtl_enum;
 use crate::backend::metal::util::{set_err, ErrOut, Status};
-use metal::{MTLAttributeFormat, MTLIndexType, StageInputOutputDescriptor};
+use metal::{MTLAttributeFormat, StageInputOutputDescriptor};
 
 // Apple Metal.framework MTLStepFunction raw values (MTLStageInputOutputDescriptor.h).
-// Do not use metal-0.33's MTLStepFunction as u32 for X/Y Indexed — that crate
-// swaps ThreadPositionInGridY (6) with ThreadPositionInGridXIndexed (7).
+// Do not use metal-0.33's MTLStepFunction names — that crate assigns six of the
+// enum's nine names to the wrong numbers, not just the X/Y Indexed pair this
+// comment used to name. [`mtl_enum::step_function`] carries the full table and
+// the test that pins it.
 const MTL_STEP_THREAD_POS_IN_GRID_X: u32 = 5;
 const MTL_STEP_THREAD_POS_IN_GRID_Y: u32 = 6;
 const MTL_STEP_THREAD_POS_IN_GRID_X_INDEXED: u32 = 7;
@@ -153,15 +155,27 @@ pub fn make_compute_stage_input_descriptor(
             layout.stride
         };
         metal_layout.set_stride(stride);
-        metal_layout.set_step_function(unsafe { std::mem::transmute(layout.step_function as u64) });
+        // `step_supported` above already narrows to the four compute forms, so
+        // this cannot be `None`; it is converted rather than transmuted so the
+        // two are not a cross-function soundness invariant.
+        let Some(step) = mtl_enum::step_function(layout.step_function) else {
+            set_err(
+                err,
+                format!(
+                    "unsupported compute stageInputDescriptor step function {}",
+                    layout.step_function
+                ),
+            );
+            return Err(Status::args("metal_stage_input_step_function_unsupported")
+                .field("step", layout.step_function));
+        };
+        metal_layout.set_step_function(step);
         metal_layout.set_step_rate(layout.step_rate as u64);
         layout_seen[layout.buffer_index as usize] = true;
     }
 
     if has_indexed {
-        if stage_input.index_type != MTLIndexType::UInt16 as u32
-            && stage_input.index_type != MTLIndexType::UInt32 as u32
-        {
+        let Some(index_type) = mtl_enum::index_type(stage_input.index_type) else {
             set_err(
                 err,
                 format!(
@@ -171,7 +185,7 @@ pub fn make_compute_stage_input_descriptor(
             );
             return Err(Status::args("metal_stage_input_index_type_unsupported")
                 .field("index_type", stage_input.index_type));
-        }
+        };
         if stage_input.index_buffer_index as usize >= REIMS_VGPU_METAL_MAX_BUFFERS {
             set_err(
                 err,
@@ -184,7 +198,7 @@ pub fn make_compute_stage_input_descriptor(
                 .field("buffer", stage_input.index_buffer_index)
                 .field("limit", REIMS_VGPU_METAL_MAX_BUFFERS));
         }
-        descriptor.set_index_type(unsafe { std::mem::transmute(stage_input.index_type as u64) });
+        descriptor.set_index_type(index_type);
         descriptor.set_index_buffer_index(stage_input.index_buffer_index as u64);
     }
 
@@ -241,9 +255,16 @@ pub fn make_compute_stage_input_descriptor(
                 .field("location", attr.location)
                 .field("buffer", attr.buffer_index));
         }
-        if attr.format == MTLAttributeFormat::Invalid as u32
-            || attr.format > MTL_ATTRIBUTE_FORMAT_FLOAT_RGB9E5
-        {
+        // `Invalid` is a declared variant, so the conversion accepts it and the
+        // explicit refusal has to stay. What the conversion replaced is the
+        // upper bound beside it, which was `MTL_ATTRIBUTE_FORMAT_FLOAT_RGB9E5 =
+        // 54` — wrong twice over. Apple's `FloatRGB9E5` is 55, not 54, so the
+        // constant carried `FloatRG11B10`'s value under `FloatRGB9E5`'s name;
+        // and a bound of any kind admits 43 and 44, which Apple leaves
+        // unassigned between `UChar4Normalized_BGRA` and `UChar`.
+        let Some(format) = mtl_enum::attribute_format(attr.format)
+            .filter(|_| attr.format != MTLAttributeFormat::Invalid as u32)
+        else {
             set_err(
                 err,
                 format!(
@@ -256,7 +277,7 @@ pub fn make_compute_stage_input_descriptor(
                     .field("location", attr.location)
                     .field("format", attr.format),
             );
-        }
+        };
         let metal_attr = descriptor
             .attributes()
             .and_then(|a| a.object_at(attr.location as u64))
@@ -265,7 +286,7 @@ pub fn make_compute_stage_input_descriptor(
                 Status::execute("metal_stage_input_attributes_unavailable")
                     .field("location", attr.location)
             })?;
-        metal_attr.set_format(unsafe { std::mem::transmute(attr.format as u64) });
+        metal_attr.set_format(format);
         metal_attr.set_offset(attr.offset as u64);
         metal_attr.set_buffer_index(attr.buffer_index as u64);
         attribute_seen[attr.location as usize] = true;

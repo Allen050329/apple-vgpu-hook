@@ -41,8 +41,25 @@ pub fn mtl_pixel_format_bpp(pixel_format: u32) -> Option<usize> {
     crate::contract::pixel_format::bytes_per_pixel(code).map(|bpp| bpp as usize)
 }
 
+/// Reinterpret a format code as `MTLPixelFormat`.
+///
+/// **This is the one member of the unchecked-Metal-enum class that
+/// [`crate::backend::metal::mtl_enum`] has not taken, and its safety comment
+/// used to claim more than it could.** "Callers only pass raw Metal enum values
+/// from the ABI contract" is not true of every caller: `depth.pixel_format` and
+/// `stencil.pixel_format` reach here from the guest's own attachment records,
+/// and `MTLPixelFormat` is by far the sparsest of these enums — a few dozen
+/// declared values scattered over 0..=255 — so an undeclared code is undefined
+/// behaviour rather than a format Metal will reject.
+///
+/// It was left for its own change because it is a different size of job from
+/// the other fifteen: twelve call sites, several of them (`configure_*_
+/// attachment`, `mipmap`) with no status channel to decline into, so closing it
+/// means deciding per site what a refused format does rather than adding one
+/// table. [`crate::contract::pixel_format::bytes_per_pixel`] already knows which
+/// codes this device recognises and is the natural place to start.
 pub fn pixel_format_from_u32(v: u32) -> MTLPixelFormat {
-    // SAFETY: callers only pass raw Metal enum values from the ABI contract.
+    // SAFETY: not established for every caller — see the doc above.
     unsafe { std::mem::transmute(v as u64) }
 }
 

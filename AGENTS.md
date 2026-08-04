@@ -2,6 +2,24 @@
 
 Operating guide for AI agents working in this repository.
 
+## What Belongs In This File
+
+Durable rules that change how an agent works: the principles below, the support matrix, the commands
+that verify a change, and what a commit must say.
+
+**Findings do not belong here.** A measurement, a counter reading, a sweep that came back empty, or
+an account of how a past session was misled is not an instruction — and this file has repeatedly
+grown to several times its useful length by collecting them. Put them where they will be read:
+
+- **next to the code they explain**, as a module or function doc — that is where the next reader
+  meets them, and it is the only place that stays true when the code moves;
+- **in the commit body**, for what one change measured and did not verify;
+- **in `kb/` and `journal/`** (both gitignored) for investigation notes, working hypotheses, and
+  session logs. `kb/` entries carry frontmatter and `[[links]]`; follow the existing shape.
+
+Before adding anything to this file, ask whether it changes what someone *does*. If it only records
+what was once true, it goes in one of the three places above.
+
 ## What This Project Is
 
 This research project emulates Apple's paravirtualized GPU on the host. An unmodified macOS guest
@@ -17,7 +35,9 @@ execute it through Metal or Vulkan. We ship no guest driver.
 | arm64 macOS / macOS Vulkan | Apple Silicon macOS (HVF) | arm64 macOS Metal guest | sysbus MMIO (`reims-vgpu-mmio`) | 14 | Vulkan through MoltenVK | `vm/boot-arm64.sh` |
 
 Pathway-specific facts must be verified on the pathway being changed. Do not generalize from arm64
-to x86, from Metal to Vulkan, or from one host GPU class to another.
+to x86, from Metal to Vulkan, or from one host GPU class to another. Some rails run on exactly one
+pathway — the arm64-only mapper rail is the standing example — and no boot on the other host can
+measure them.
 
 ## Main Components
 
@@ -27,11 +47,12 @@ to x86, from Metal to Vulkan, or from one host GPU class to another.
   command planning/execution, scheduling, and Metal/Vulkan backend behavior.
 - `crates/reims-vgpu/src/observe/` - crate-wide observability: fail logs, typed decline reasons,
   emission helpers, and gates.
+- `crates/reims-vgpu-wire` - derived wire-format views, with their own `AGENTS.md`. Where that file
+  is stricter than this one, it wins.
 - `vm/` - snapshot-revert boot scripts for arm64 and x86 guests.
 
 Start with the owning source modules and nearby tests when changing device, decode, present, or
-backend behavior. Keep durable design facts in tracked docs or code comments close to the behavior
-they explain.
+backend behavior. Keep durable design facts in code comments close to the behavior they explain.
 
 ## Operating Principles
 
@@ -40,6 +61,17 @@ they explain.
 C and Objective-C in the QEMU path exist to connect QEMU to Rust. Keep product logic in
 `crates/reims-vgpu`: protocol interpretation, resource state, scheduling, GPU encode, present model,
 backend policy, and performance behavior belong in Rust.
+
+A shim that calls two queries and branches on the pair has reconstructed a rule, which is the same
+violation as writing one. Export the answer, not the inputs — and delete the inputs, because a shim
+that can still assemble its own answer eventually will.
+
+Anything crossing the boundary lives twice, once in Rust and once in
+`crates/reims-vgpu/include/reims_vgpu_qemu_abi.h`, and nothing in the toolchain compares the two:
+Rust does not include the header and the shims do not read Rust. Every constant that crosses gets a
+test, using `qemu::abi::header_define` — see `the_abi_header_agrees_on_the_version`,
+`..._on_the_scanout_bound` and `..._on_the_console_feed_kinds`. Add one with any new shared
+constant; a drift here is a bug on exactly one pathway.
 
 ### Never Fail Silently
 
@@ -76,15 +108,11 @@ function name, pipeline ref, or observed content pattern. Implement the decoded 
 Temporary probes are fine when they collect evidence. Remove probe-only behavior before claiming the
 fix. Do not turn observations into product heuristics.
 
-For metal2vulkan, do not make translation pass by matching corpus names. Handle the structural AIR
-or LLVM semantics, or leave the gap visible.
-
 ### No Magic Numbers
 
 Do not guess numbers because they fit one observation. Derive constants from the contract: SDK
 headers, `sizeof`/`offsetof`, decoded guest fields, documented serializer output, or controlled
-empirical measurement. Record the basis in the code, tracked docs, or the commit body when the
-value is not obvious.
+empirical measurement. Record the basis in the code or the commit body when the value is not obvious.
 
 Guest page geometry is always explicit. Portable code takes `page_shift` or `page_size`; arch-fixed
 helpers must say so in their names.
@@ -100,7 +128,72 @@ that no longer exist.
 
 State exactly what you verified. A single green boot does not prove an entire class is fixed. Broad
 claims such as "zero-copy everywhere" or "no fallback remains" require an audit of every place that
-could falsify them.
+could falsify them. One workload on one pathway proves one workload on one pathway.
+
+## Before A Broad Sweep
+
+Deletion and audit sweeps over this crate have been run many times. What each concluded lives next
+to the code it concluded it about — read the module doc before deciding a rail is dead, and do not
+"discover" a comment recording a heuristic that was already measured and removed.
+
+Four rules survive every sweep:
+
+- **A never-firing branch is almost never a deletion.** A decoded-but-untaken arm is usually
+  contract fidelity — a real Apple opcode this workload does not issue — or a healthy-zero alarm,
+  where a firing *is* the bug. The test to apply: **name the guest action that would take this
+  path.** If you can name it, it stays. Deleting one loses guest work silently the first time a
+  guest takes it.
+- **A zero can be an artifact of where it is sampled.** Find a census field's sampling point before
+  cutting it; `scripts/constant-fields/README.md` lists the ways a constant reading is legitimate.
+  A zero hit rate on one pathway is not a dead cache either — page shift alone changes it.
+- **A drop counter reading zero is not a measurement.** A record stopping at slot 4 and one stopping
+  at slot 30 both read zero, and only one says the bound has headroom. Band the *requested* reach
+  before widening or narrowing any table.
+- **Two arms that consume one wire form must be diffed against each other, not read alone.** The
+  comment that settles a divergence is more often on the callee than on the call site, and the arm
+  that is easiest to read is often not the arm the boot takes. Check which one runs before calling a
+  divergence theoretical. When you find one, check whether its failure line is shared or copied — a
+  copied one is the next divergence.
+
+Prefer an instrument over a reading. Reading an audit against itself cannot see an opcode that is
+simply the wrong number, a length four bytes off, or a field two bytes too wide:
+
+| Question | Instrument |
+|---|---|
+| What compiles but is never referenced? | `scripts/dead-state/dead-state.sh` |
+| What is reachable but never runs? | `scripts/runtime-dead` — coverage-instrumented driven boot |
+| Does a decoder refuse or drop a record Apple emits? | `crates/reims-vgpu/tests/wire_fixtures_reach_the_decoders.rs` |
+| Is a wire constant still declared twice? | the two greps below |
+
+```sh
+ls crates/reims-vgpu-wire/src/ops/*.rs | xargs -n1 basename | sed 's/.rs$//'
+grep -rh 'use reims_vgpu_wire' --include='*.rs' crates/reims-vgpu/src
+```
+
+A wire module with no importer is either a real gap or a family still declared twice. Where a device
+offset names a field a wire struct already declares, reach for `offset_of!` rather than a re-exported
+number, so a rename fails the build.
+
+Their output is a map, not a kill list. And one trap they teach: **an `Ok` from `render::decode` is
+not a decode** — `Kind::OtherAccepted` is the catch-all for "no arm claimed this", and reading it as
+success hides a whole family of lost records behind a green run.
+
+### Reading the fail log
+
+- **Volume is not alarm.** Most records are on the `OFF` channel, and the highest-volume tags are a
+  1 Hz heartbeat. That is cadence working, not an over-eager emitter.
+- **Absence of a decode line proves nothing.** Every decoder in `decode/` is silent on success and
+  emits only on `Err*`. "Opcode X never appears in the log" is not evidence that arm never ran; the
+  `store_routes` counter set is the only usable never-fired signal.
+- **Filter the channel before ranking `reason=`.** `OFF` records carry `reason=` too, for ordering
+  and control-flow events that are not losses, so the obvious
+  `grep -o 'reason=[a-z_0-9]*' | sort | uniq -c | sort -rn` inverts the queue. A fail-channel record
+  begins with its own event name and an off-channel one begins with the literal `OFF `, so
+  `grep -v '^OFF '` first.
+- **A named reason on the fail channel is not automatically lost work.** Some report a repair that
+  *succeeded*, fail-visible so the reliance stays measurable. Read the emitter.
+- **A counter and a fail line count different things.** Census counters are per-window and
+  cumulative; emitters dedupe. Do not quote one as the other.
 
 ## Support Matrix
 
@@ -117,8 +210,18 @@ The Vulkan backend must support all four memory/DMA cells:
 Vulkan 1.2 is the baseline. Anything above Vulkan 1.2 must have a fallback or a capability-gated
 path. Gate on capabilities, not vendor names, driver names, or API-version assumptions.
 
-Host-pointer imports must stay windowed. Do not import the whole guest RAM VMA for GPU DMA; it pins
-host RAM. Use the existing capped window resolver.
+**Host-pointer imports over guest RAM are forbidden.** `VK_EXT_external_memory_host` must never be
+asked for, and Metal's `newBufferWithBytesNoCopy` may alias only this process's own bytes. Importing
+a host pointer over guest RAM gives the host GPU read *and write* access to the guest VM's memory,
+and that is a property of the mechanism rather than of how much of it is used — so the bound is
+"never requested", not a budget. Both invariants are enforced by
+`crates/reims-vgpu/tests/guest_ram_isolation.rs`.
+
+The proposal recurs because the deferred-flush rail is the device's largest cost and a GPU-direct
+write into guest pages would erase it. It stays forbidden regardless; `storage_flush.rs` carries
+that reading, its own qualifier, and the routes that are *not* blocked. Note that
+`runtime/gva_view.rs::ensure_gva_view` hands back a host pointer but is not a window resolver — it
+requires the span to be one contiguous page run and returns `None` otherwise.
 
 ## Verification
 
@@ -129,7 +232,41 @@ Pick the pathway your change affects.
 - x86: `vm/boot-x86.sh --device reims-vgpu-pci --testing`, then
   `scripts/screenshot-when-kde-plasma-host/screenshot-when-kde-plasma-host.sh -o /tmp/screen.png`
 
-For Rust changes, run the relevant native tests serially from the repo root:
+### An undriven boot measures an idle device
+
+A `--testing` boot reaches the desktop and then sits there. Reading its counters as this device's
+behavior is how a rail gets called dead when the workload simply never asked for it. If a change is
+about throughput, caching, writeback or present cadence, the boot has to be driven.
+
+Run the boot in the background and drive the guest **while it is up** — the `--testing` boot exposes
+SSH on `localhost:2222` (`macos-vm` in `~/.ssh/config`) for its whole life, so a probe does not need
+its own boot:
+
+```sh
+vm/boot-x86.sh --device reims-vgpu-pci --testing &     # ~7 min before its own hard kill
+ssh macos-vm true                                      # wait for the guest to answer
+scripts/window-drag-probe/window-drag-probe.sh --seconds 25 --app Safari
+```
+
+That produces real window-server compositing, against 0 draws/s idle. The probe refuses a verdict if
+the window never moved, so a run that produced no motion cannot be mistaken for a slow device.
+
+### A boot measured next to your own subagents measures the contention
+
+Every `us=` number this device reports is wall clock on a shared machine, so a driven boot taken
+while a subagent greps, a `cargo` build runs, or a second VM lives is measuring your harness as much
+as the device. This does not look like an error — the log is well-formed and the counters are
+self-consistent — and it has been measured to halve throughput, triple per-draw cost, and invert the
+ranking between the device's two largest costs.
+
+**Run the boot with nothing else running, and check `uptime` before believing a timing.** Counts are
+far more robust than timings: `store_routes`, refusal counters and the gate do not measure time and
+survive contention. When a machine cannot be quiesced, reason from counts and treat every `_us`
+field as an upper bound.
+
+### Rust tests
+
+Run the relevant native tests serially from the repo root:
 
 ```sh
 cargo test -p reims-vgpu --no-default-features --features backend-vulkan,host-window -- --test-threads=1
@@ -149,12 +286,18 @@ Before and after long Rust test runs, sweep orphaned test binaries:
 pkill -9 -f 'target/debug/deps/reims_vgp[u]-'
 ```
 
+The `backend-metal` `--lib` arm has six pre-existing failures, all in
+`runtime::storage_flush::tests` and all exercising `flush_render_one`, which is a fail-visible stub
+on a build without `backend-vulkan`. They are Vulkan-rail tests compiled unconditionally rather than
+a Metal defect. Check the failing *module and count*, not the pass count — the pass count moves
+whenever anyone adds a test. Do not "fix" them by weakening what they assert.
+
 ## Commit Guidelines
 
 Commit only work you wrote. Never commit third-party code or intellectual property, including Apple
-software, firmware, disk images, `.mtlb`, AIR, or SPIR-V. Keep those artifacts ignored and local.
-Reports may include original analysis, metadata, hashes, and reproduction steps, but no third-party
-bytes or excerpts.
+software, firmware, disk images, `.mtlb`, AIR, or SPIR-V, or a disassembly listing of any of them.
+Keep those artifacts ignored and local. Reports may include original analysis, metadata, hashes, and
+reproduction steps, but no third-party bytes or excerpts.
 
 Each commit should have a detailed message body that states:
 
@@ -172,4 +315,15 @@ cargo clippy -p reims-vgpu --all-targets --no-default-features --features backen
 cargo clippy -p reims-vgpu --target x86_64-unknown-linux-gnu --all-targets --no-default-features --features backend-vulkan,host-window -- -D warnings
 ```
 
-Do not hide warnings, skip an affected arm, or commit a dropped test count without calling it out.
+Expect zero from all three. Do not hide warnings, skip an affected arm, or commit a dropped test
+count without calling it out — and **do not read "clippy clean" in a commit body as covering every
+arm**; it means the arms that commit ran.
+
+Two standing exceptions, both carried by `#[allow]`s at the module declarations that state the
+reason. `backend::metal::error::Status` is large by design — the payload is what makes each refusal
+name the check that refused, and it is `Copy` and compared by value at hundreds of sites — so
+`result_large_err` and `large_enum_variant` are exempted there. **A new error type that is large for
+no such reason should still be boxed**, not added to the exemption. Separately, the
+`transmute::<u64, MTL*>` sites turn a guest-decoded ordinal into a `#[repr(u64)]` Metal enum, where
+an out-of-range value is undefined behavior rather than a decode error; they are greppable and
+nothing range-checks them yet. Do not add more.

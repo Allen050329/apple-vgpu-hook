@@ -13,8 +13,16 @@ pub mod census;
 /// boundary, which is 82% of it.
 pub mod chain_phase;
 /// Product-path compute bind/dispatch (pipeline + buffers + direct dispatch).
+// See the note on `backend::metal`: `Status` is a 264-byte `Copy` payload
+// carried on failure paths, and boxing it would cost the refusal vocabulary
+// that makes each one greppable.
+#[allow(clippy::result_large_err, clippy::large_enum_variant)]
 pub mod compute_exec;
 /// Multi-record compute encoder session (control-flow SPI + ICB execute).
+// See the note on `backend::metal`: `Status` is a 264-byte `Copy` payload
+// carried on failure paths, and boxing it would cost the refusal vocabulary
+// that makes each one greppable.
+#[allow(clippy::result_large_err, clippy::large_enum_variant)]
 pub mod compute_session;
 pub mod decode;
 pub mod drain;
@@ -44,8 +52,6 @@ pub mod host_writes;
 pub mod icb;
 
 pub mod input;
-/// How much of a render writeback the guest's pages already hold.
-pub mod land_redundancy;
 /// Process-global metal2vulkan SPIR-V cache (AIR content hash → SPIR-V).
 pub mod m2v_cache;
 /// IOSurface mapper capture + page-table resolve.
@@ -53,6 +59,10 @@ pub mod mapper;
 /// Write host BGRA into guest mapping pages (render writeback).
 pub mod mapping_write;
 /// Metal draw encode + writeback when MTLBs resolve.
+// See the note on `backend::metal`: `Status` is a 264-byte `Copy` payload
+// carried on failure paths, and boxing it would cost the refusal vocabulary
+// that makes each one greppable.
+#[allow(clippy::result_large_err, clippy::large_enum_variant)]
 pub mod metal_draw;
 /// generateMipmaps for multi-mip type-2/3 linear textures.
 pub mod mipmap;
@@ -86,9 +96,11 @@ pub use drain::{
     drain_child_fifo, drain_main_fifo, drain_other_child_fifos, drain_pending, signal_display_vbl,
     write_stamp, Packet, PacketError,
 };
-pub use host::{
-    read_u32, FakeHost, HostAction, HostActionKind, HostMemory, HostOps, MemError,
-};
+pub use host::{read_u32, HostAction, HostActionKind, HostMemory, HostOps, MemError};
+/// The unit-test host double, gated with its definition. An ungated re-export
+/// would keep it reachable and so keep it in the staticlib.
+#[cfg(test)]
+pub use host::FakeHost;
 
 #[cfg(test)]
 mod arch_path_gate {

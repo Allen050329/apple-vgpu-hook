@@ -1,3 +1,15 @@
+//! Type-8 texture-view chain resolution and the CPU linear-texture loads that
+//! consume it: swizzle application, native upload-format selection, and the
+//! tight-row RGBA/BGRA readers shared by the sample and seed paths.
+//!
+//! Backend-independent, so [`super`] declares this module ungated and
+//! re-exports its items flat — callers keep addressing them as
+//! `crate::runtime::metal_draw::<name>`. The two items that really are arm- or
+//! test-specific carry their own cfg. `use super::*` pulls in the parent's
+//! imports, which this module shares.
+
+use super::*;
+
 /// Type-8 view resolution for sample/seed paths.
 #[derive(Clone, Debug)]
 pub(crate) struct ViewResolve {
@@ -157,6 +169,45 @@ impl std::error::Error for TextureViewDecline {}
 /// to a non-view base (`apple_pv_gpu_resource_resolve_texture` chain walk).
 const MAX_TEXTURE_VIEW_CHAIN: usize = 8;
 
+/// Report a slice range the render path decodes and does not apply.
+///
+/// [`decode_texture_view_hop_reasoned`] resolves a type-8 view to four things —
+/// base ref, mip level, swizzle and format override — and the ranged forms
+/// (opcodes `0x08` and `0x1b`) carry two more that nothing on this path reads:
+/// `slice_base` and `slice_count`. `blit_exec` consumes them; the draw and
+/// sample path does not. So a guest that views slices `[5, 9)` of a texture
+/// array samples slice **0** of the base, silently, and the wrong texels reach
+/// the frame with no refusal anywhere.
+///
+/// Reported rather than declined, because declining would break every view
+/// that asks for the default. A view whose range *is* the default —
+/// `slice_base == 0` with at most one slice — is asking for what this path
+/// already does, so it says nothing. That makes this a healthy zero, and a
+/// non-zero reading is the measured argument for threading the slice through.
+///
+/// Keyed by texture ref through [`crate::observe::state_changed`] rather than
+/// latched once: this runs per bind, so an undeduped line floods and a
+/// first-sight latch goes quiet after the first view and never reports the
+/// second. A transition report is bounded by the number of real changes.
+fn note_view_slice_range_dropped(
+    texture_ref: u32,
+    opcode: u32,
+    view: &crate::runtime::decode::resource::TextureViewDescriptor,
+) {
+    if !view.has_slices || (view.slice_base == 0 && view.slice_count <= 1) {
+        return;
+    }
+    let state = view.slice_base.rotate_left(32) ^ view.slice_count;
+    if !crate::observe::state_changed("view_slice_dropped", texture_ref as u64, state) {
+        return;
+    }
+    crate::observe::fail(format!(
+        "texture_view slice_dropped ref={texture_ref} opcode={opcode:#x} \
+         base={} count={} note=render path samples slice 0",
+        view.slice_base, view.slice_count
+    ));
+}
+
 /// Decode one type-8 hop (does not walk nested bases).
 ///
 /// The `Result` carries a specific failure slug for the always-on fail log; the
@@ -215,6 +266,7 @@ fn decode_texture_view_hop_reasoned<M: HostMemory + HostOps>(
             opcode,
         });
     }
+    note_view_slice_range_dropped(texture_ref, opcode, &view);
     let level = if view.has_levels {
         // level_base is a mip index (u64 on wire); reject pathological values.
         if view.level_base > u32::MAX as u64 {
@@ -306,7 +358,7 @@ pub(crate) fn resolve_texture_view_reasoned<M: HostMemory + HostOps>(
 /// the chain exceeds the max depth without a non-view base, a base ref is zero,
 /// or swizzle selectors are malformed. See [`resolve_texture_view_reasoned`] for
 /// the specific reason on the fail path.
-fn resolve_texture_view<M: HostMemory + HostOps>(
+pub(super) fn resolve_texture_view<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &M,
     task_id: u32,
@@ -340,7 +392,7 @@ pub(crate) fn effective_view_sample_format(base_fmt: u16, view_fmt: Option<u16>)
 /// Metal-direct pathway still needs it, so it reports itself rather than being
 /// deleted.
 #[cfg(any(test, all(feature = "backend-metal", target_os = "macos")))]
-fn apply_view_swizzle_rgba8(
+pub(super) fn apply_view_swizzle_rgba8(
     rgba: &mut [u8],
     plan: Option<&pixel_format::SwizzlePlan>,
     texture_ref: u32,
@@ -460,7 +512,7 @@ impl crate::observe::Decline for LinearLoadRefusal {
     }
 }
 
-fn load_linear_texture_rgba_host<M: HostMemory + HostOps>(
+pub(super) fn load_linear_texture_rgba_host<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
@@ -488,7 +540,7 @@ fn load_linear_texture_rgba_host<M: HostMemory + HostOps>(
 /// `BGRA8` qualifies only when the caller opts into a native BGRA8 upload
 /// (`native_bgra8`), otherwise it must be swapped to RGBA8. Every other format
 /// needs a real convert pass and returns `None`.
-fn linear_native_upload_format(sample_format: u16, native_bgra8: bool) -> Option<TexelLayout> {
+pub(super) fn linear_native_upload_format(sample_format: u16, native_bgra8: bool) -> Option<TexelLayout> {
     use pixel_format::SampledClass;
     // The decode contract's sampled class is the one rule for "which 8-bit
     // channel order is this"; it folds each sRGB format onto its linear
@@ -653,7 +705,7 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
     Ok((rgba, TexelLayout::Rgba8))
 }
 
-fn load_tight_linear_rgba_with<F>(
+pub(super) fn load_tight_linear_rgba_with<F>(
     width: u32,
     height: u32,
     sample_format: u16,
@@ -729,6 +781,7 @@ where
 #[cfg(test)]
 mod texture_view_split_tests {
     use super::*;
+    use crate::runtime::decode::resource::TextureViewDescriptor;
 
     #[test]
     fn view_pixel_format_override_effective() {
@@ -823,5 +876,107 @@ mod texture_view_split_tests {
         use crate::observe::Decline;
         let r = LinearLoadRefusal::PaddedRowUnreadable { row: 11 };
         assert_eq!(r.fields(), vec![("row", "11".to_string())]);
+    }
+
+    /// Start capturing the always-on log; returns the offset to slice from.
+    fn log_mark() -> usize {
+        crate::observe::redirect_logs_for_tests();
+        std::fs::read_to_string(crate::observe::fail_log_path())
+            .unwrap_or_default()
+            .len()
+    }
+
+    fn log_since(mark: usize) -> String {
+        let body = std::fs::read_to_string(crate::observe::fail_log_path()).unwrap_or_default();
+        body[mark.min(body.len())..].to_string()
+    }
+
+    fn ranged_view(slice_base: u64, slice_count: u64) -> TextureViewDescriptor {
+        TextureViewDescriptor {
+            base_texture_ref: 9,
+            has_slices: true,
+            slice_base,
+            slice_count,
+            ..Default::default()
+        }
+    }
+
+    /// A slice range the render path cannot honour is guest work lost, and the
+    /// device must say so.
+    ///
+    /// The loss is real: `decode_texture_view_hop_reasoned` resolves a view to
+    /// base ref, mip level, swizzle and format, and nothing downstream of it
+    /// reads `slice_base`. A guest viewing slices `[5, 9)` samples slice 0.
+    #[test]
+    fn a_slice_range_the_render_path_drops_is_reported() {
+        let mark = log_mark();
+        // Distinct refs, because the report is keyed by ref and would
+        // otherwise dedup the second away.
+        note_view_slice_range_dropped(0x1001, 8, &ranged_view(5, 4));
+        note_view_slice_range_dropped(0x1002, 0x1b, &ranged_view(0, 6));
+        let log = log_since(mark);
+        assert!(
+            log.contains("slice_dropped ref=4097") && log.contains("base=5 count=4"),
+            "a non-default slice base went unreported:\n{log}"
+        );
+        assert!(
+            log.contains("slice_dropped ref=4098") && log.contains("base=0 count=6"),
+            "a multi-slice range went unreported:\n{log}"
+        );
+    }
+
+    /// ...and a view asking for what this path already does says nothing.
+    ///
+    /// This is the half that makes the counter usable: without it the line
+    /// fires on every ordinary 2D view and a real loss is invisible in the
+    /// volume. A healthy zero here is what makes a non-zero reading the
+    /// measured argument for threading the slice through.
+    #[test]
+    fn a_default_slice_range_is_not_reported() {
+        let mark = log_mark();
+        note_view_slice_range_dropped(0x2001, 8, &ranged_view(0, 1));
+        note_view_slice_range_dropped(0x2002, 8, &ranged_view(0, 0));
+        // The format-only form carries no slice range at all.
+        note_view_slice_range_dropped(
+            0x2003,
+            7,
+            &TextureViewDescriptor {
+                base_texture_ref: 9,
+                has_slices: false,
+                slice_base: 5,
+                slice_count: 4,
+                ..Default::default()
+            },
+        );
+        let log = log_since(mark);
+        assert!(
+            !log.contains("slice_dropped"),
+            "a default slice range was reported as a loss:\n{log}"
+        );
+    }
+
+    /// The report is bounded by real changes, not by binds.
+    ///
+    /// It sits on the per-bind path, so an undeduped line floods the log and a
+    /// once-latch goes quiet after the first view and never reports a second.
+    #[test]
+    fn the_same_view_bound_twice_reports_once_and_a_changed_range_reports_again() {
+        let mark = log_mark();
+        for _ in 0..5 {
+            note_view_slice_range_dropped(0x3001, 8, &ranged_view(5, 4));
+        }
+        assert_eq!(
+            log_since(mark).matches("slice_dropped").count(),
+            1,
+            "the per-bind path reported more than once for an unchanged view"
+        );
+
+        let mark = log_mark();
+        note_view_slice_range_dropped(0x3001, 8, &ranged_view(6, 4));
+        assert_eq!(
+            log_since(mark).matches("slice_dropped").count(),
+            1,
+            "a view whose slice range changed did not report again"
+        );
     }
 }

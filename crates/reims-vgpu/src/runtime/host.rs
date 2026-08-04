@@ -3,6 +3,9 @@
 //! Production: QEMU C offers HostOps callbacks; Rust enqueues HostActions for a
 //! QEMU BH. Tests: [`FakeHost`] owns an in-memory GPA space and action log.
 
+/// Only [`FakeHost`]'s sparse byte store, X-register fixtures and guest-write
+/// sets use this, and all three are test-gated.
+#[cfg(test)]
 use std::collections::BTreeMap;
 
 /// Guest-physical memory access error.
@@ -451,7 +454,7 @@ pub const GUEST_PAGE_SIZE_ARM64E: usize = 1usize << crate::contract::gva::PAGE_S
 /// mach VM aliasing for FakeHost views — the same mechanism the QEMU shim
 /// uses in production (`mach_vm_remap` of guest RAM), exercised for real in
 /// unit tests so view coherence is tested, not simulated.
-#[cfg(target_os = "macos")]
+#[cfg(all(test, target_os = "macos"))]
 mod mach_vm {
     #[allow(non_upper_case_globals)]
     extern "C" {
@@ -478,6 +481,7 @@ mod mach_vm {
     pub const VM_INHERIT_NONE: u32 = 2;
 }
 
+#[cfg(test)]
 /// A real, 16KiB-aligned memory block backing a GPA range in [`FakeHost`].
 #[derive(Debug)]
 struct RealRange {
@@ -487,6 +491,7 @@ struct RealRange {
     alloc_len: usize,
 }
 
+#[cfg(test)]
 /// Combined host for unit tests: GPA store + action log + BH flag.
 ///
 /// GPA ranges are backed by real page-aligned host memory so
@@ -552,6 +557,7 @@ pub struct FakeHost {
     pub guest_write_startup_window: bool,
 }
 
+#[cfg(test)]
 /// One [`HostOps::track_guest_writes`] registration in [`FakeHost`].
 ///
 /// The product host learns of a write from the hypervisor's dirty bitmap; the
@@ -571,6 +577,7 @@ struct GuestWriteSet {
     page_gen: Vec<u64>,
 }
 
+#[cfg(test)]
 /// A guest page-table edit that fires from inside a device guest read.
 ///
 /// The corruption class this harness exists to test is defined by something the
@@ -599,18 +606,52 @@ pub struct Rewire {
     pub bytes: Vec<u8>,
 }
 
-/// Contiguous bounce for [`FakeHost::map_pages`] on non-macOS (sparse GPA store).
+/// The host's own page size.
+///
+/// Distinct from every guest page size in this crate, and the distinction is
+/// load-bearing on Apple Silicon: a 16 KiB host page cannot express an x86
+/// guest's 4 KiB page as an independent mapping.
+///
+/// Gated to macOS because its only caller is: `mach_vm_remap` is what needs host
+/// page granularity, and the non-macOS arm of `map_pages` bounces instead. The
+/// gate used to be `#[cfg(test)]` alone, which was invisible because `libc` is
+/// declared only for macOS — so the x86_64-linux arm of the feature matrix
+/// failed to compile its tests rather than reporting this as dead.
+#[cfg(all(test, target_os = "macos"))]
+fn host_page_size() -> usize {
+    // SAFETY: `sysconf` takes an int and returns a long; it touches no memory.
+    let v = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if v > 0 {
+        v as usize
+    } else {
+        GUEST_PAGE_SIZE_ARM64E
+    }
+}
+
+/// Contiguous bounce for [`FakeHost::map_pages`] where an alias is not expressible.
+#[cfg(test)]
 #[derive(Debug)]
 struct BounceView {
     ptr: usize,
-    #[cfg(not(target_os = "macos"))]
     len: usize,
     gpas: Vec<u64>,
     page_sz: usize,
 }
 
+#[cfg(test)]
 impl Drop for FakeHost {
     fn drop(&mut self) {
+        // Bounce views are heap allocations on every platform, and they are
+        // also tracked in `self.views`. Free them first and drop their
+        // tracking, or the macOS arm below would hand a `Box` pointer to
+        // `mach_vm_deallocate`.
+        for b in self.bounce.drain(..) {
+            self.views.retain(|&(p, l)| !(p == b.ptr && l == b.len));
+            // SAFETY: ptr from Box::into_raw in `bounce_view`, with this len.
+            unsafe {
+                let _ = Box::from_raw(std::ptr::slice_from_raw_parts_mut(b.ptr as *mut u8, b.len));
+            }
+        }
         #[cfg(target_os = "macos")]
         unsafe {
             for (ptr, len) in self.views.drain(..) {
@@ -626,13 +667,6 @@ impl Drop for FakeHost {
         }
         #[cfg(not(target_os = "macos"))]
         {
-            for b in self.bounce.drain(..) {
-                // SAFETY: ptr from Box::into_raw in map_pages.
-                unsafe {
-                    let _ =
-                        Box::from_raw(std::ptr::slice_from_raw_parts_mut(b.ptr as *mut u8, b.len));
-                }
-            }
             for r in self.ranges.drain(..) {
                 let layout = std::alloc::Layout::from_size_align(r.alloc_len, GUEST_PAGE_SIZE_ARM64E)
                     .unwrap_or(std::alloc::Layout::from_size_align(r.alloc_len, 1).unwrap());
@@ -643,6 +677,7 @@ impl Drop for FakeHost {
     }
 }
 
+#[cfg(test)]
 impl FakeHost {
     pub fn new() -> Self {
         Self::default()
@@ -848,7 +883,59 @@ impl FakeHost {
     }
 }
 
+#[cfg(test)]
 impl FakeHost {
+    /// Contiguous heap copy of a scattered page list, written back on unmap.
+    ///
+    /// The answer wherever an *aliasing* view cannot be built: a page list
+    /// spanning several provisioned ranges, or one whose guest page is smaller
+    /// than the host's, which `mach_vm_remap` cannot place independently. It
+    /// costs a copy and it is exact, where a remap of those shapes silently
+    /// returns a view of the wrong bytes.
+    fn bounce_view(&mut self, gpas: &[u64], page_size: usize) -> Option<usize> {
+        let total = gpas.len().checked_mul(page_size)?;
+        let mut buf = vec![0u8; total].into_boxed_slice();
+        for (i, &gpa) in gpas.iter().enumerate() {
+            let off = i * page_size;
+            let _ = self.read_gpa(gpa, &mut buf[off..off + page_size]);
+        }
+        let ptr = Box::into_raw(buf) as *mut u8 as usize;
+        self.bounce.push(BounceView {
+            ptr,
+            len: total,
+            gpas: gpas.to_vec(),
+            page_sz: page_size,
+        });
+        self.views.push((ptr, total));
+        Some(ptr)
+    }
+
+    /// Write a bounce view back to guest memory and free it. `false` if this
+    /// pointer is not one.
+    fn release_bounce_view(&mut self, ptr: usize, len: usize) -> bool {
+        let Some(pos) = self
+            .bounce
+            .iter()
+            .position(|b| b.ptr == ptr && b.len == len)
+        else {
+            return false;
+        };
+        let b = self.bounce.remove(pos);
+        self.views.retain(|&(p, l)| !(p == ptr && l == len));
+        // SAFETY: the bounce buffer is exclusively owned for this view's
+        // lifetime, and `len` is the length it was allocated with.
+        let slice = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) };
+        for (i, &gpa) in b.gpas.iter().enumerate() {
+            let off = i * b.page_sz;
+            let _ = self.write_gpa(gpa, &slice[off..off + b.page_sz]);
+        }
+        // SAFETY: allocated by `bounce_view` as a boxed slice of this length.
+        unsafe {
+            let _ = Box::from_raw(std::ptr::slice_from_raw_parts_mut(ptr as *mut u8, len));
+        }
+        true
+    }
+
     /// If `addr` is in a live bounce view, return `(bounce_base, offset, max_contig)`.
     fn bounce_slot(&self, addr: u64) -> Option<(usize, usize, usize)> {
         for b in &self.bounce {
@@ -864,6 +951,7 @@ impl FakeHost {
     }
 }
 
+#[cfg(test)]
 impl HostMemory for FakeHost {
     fn read_gpa(&self, gpa: u64, buf: &mut [u8]) -> Result<(), MemError> {
         if buf.is_empty() {
@@ -942,6 +1030,7 @@ impl HostMemory for FakeHost {
     }
 }
 
+#[cfg(test)]
 impl HostOps for FakeHost {
     fn mono_ns(&self) -> u64 {
         self.mono_ns
@@ -1093,18 +1182,69 @@ impl HostOps for FakeHost {
                 }
                 return None;
             }
+            for &gpa in gpas {
+                if self.range_containing(gpa).is_none() {
+                    let _ = self.provision_range(gpa, page_size)?;
+                }
+            }
+            // A packed run inside one provisioned range is aliased directly,
+            // exactly as the two arms below and above this one already do, and
+            // as `reims_vgpu_pci_map_pages` does in the product.
+            //
+            // This has to come BEFORE the remap loop, because `mach_vm_remap`
+            // works at *host* page granularity while `page_size` here is the
+            // *guest* one. On Apple Silicon the host page is 16 KiB, so an
+            // x86 fixture's 4 KiB guest page at offset 0x1000 is rounded down
+            // to the enclosing host page and the view aliases offset 0. The
+            // remap succeeds and hands back a valid pointer, so nothing
+            // reports anything: a seed write lands one guest page early and
+            // the test that reads it back sees zeros. The alignment guard the
+            // loop used to carry tested `r.ptr + off` against `page_size`,
+            // which is satisfied by exactly the case that breaks.
+            //
+            // The alias is deliberately NOT recorded in `self.views`: it points
+            // into a fixture's own guest RAM, and `unmap_pages` would
+            // `mach_vm_deallocate` it out from under the range.
+            if let Some(i) = self.range_containing(gpas[0]) {
+                let r = &self.ranges[i];
+                let base_off = (gpas[0] - r.gpa) as usize;
+                let need = gpas.len() * page_size;
+                let packed = gpas
+                    .iter()
+                    .enumerate()
+                    .all(|(n, &gpa)| gpa == gpas[0] + (n * page_size) as u64);
+                if packed && base_off + need <= r.len {
+                    return Some(r.ptr + base_off);
+                }
+            }
+            // Fragmented, or spanning ranges. Each page has to be placed on its
+            // own, and `mach_vm_remap` can only do that at host page
+            // granularity: it rounds the source down and the size up to whole
+            // host pages. So a page whose source is not host-page-aligned
+            // aliases its neighbour, and a `page_size` below the host's makes
+            // every destination slot overlap the next. Neither is expressible,
+            // and both used to be attempted — silently, since the remap
+            // succeeds either way.
+            //
+            // Where it is not expressible, copy instead. A bounce view is
+            // correct rather than lucky, and `unmap_pages` writes it back.
+            let host_page = host_page_size();
+            let remappable = page_size >= host_page
+                && gpas.iter().all(|&gpa| {
+                    self.range_containing(gpa).is_some_and(|idx| {
+                        let r = &self.ranges[idx];
+                        let off = (gpa - r.gpa) as usize;
+                        off + page_size <= r.alloc_len && (r.ptr + off).is_multiple_of(host_page)
+                    })
+                });
+            if !remappable {
+                return self.bounce_view(gpas, page_size);
+            }
             let mut srcs = Vec::with_capacity(gpas.len());
             for &gpa in gpas {
-                let idx = match self.range_containing(gpa) {
-                    Some(i) => i,
-                    None => self.provision_range(gpa, page_size)?,
-                };
+                let idx = self.range_containing(gpa)?;
                 let r = &self.ranges[idx];
-                let off = (gpa - r.gpa) as usize;
-                if off + page_size > r.alloc_len || !(r.ptr + off).is_multiple_of(page_size) {
-                    return None;
-                }
-                srcs.push(r.ptr + off);
+                srcs.push(r.ptr + (gpa - r.gpa) as usize);
             }
             let len = gpas.len() * page_size;
             unsafe {
@@ -1172,25 +1312,18 @@ impl HostOps for FakeHost {
                 }
             }
             // Scattered pages: bounce + write-back on unmap (test convenience).
-            let total = gpas.len().checked_mul(page_size)?;
-            let mut buf = vec![0u8; total].into_boxed_slice();
-            for (i, &gpa) in gpas.iter().enumerate() {
-                let off = i * page_size;
-                let _ = self.read_gpa(gpa, &mut buf[off..off + page_size]);
-            }
-            let ptr = Box::into_raw(buf) as *mut u8 as usize;
-            self.bounce.push(BounceView {
-                ptr,
-                len: total,
-                gpas: gpas.to_vec(),
-                page_sz: page_size,
-            });
-            self.views.push((ptr, total));
-            Some(ptr)
+            self.bounce_view(gpas, page_size)
         }
     }
 
     fn unmap_pages(&mut self, ptr: usize, len: usize) {
+        // A bounce view is a heap copy on every platform, so it is released the
+        // same way on every platform — and it must be checked first, because
+        // handing one to `mach_vm_deallocate` would free memory Mach never
+        // owned.
+        if self.release_bounce_view(ptr, len) {
+            return;
+        }
         #[cfg(target_os = "macos")]
         {
             if let Some(pos) = self.views.iter().position(|&(p, l)| p == ptr && l == len) {
@@ -1202,27 +1335,8 @@ impl HostOps for FakeHost {
         }
         #[cfg(not(target_os = "macos"))]
         {
-            if let Some(pos) = self
-                .bounce
-                .iter()
-                .position(|b| b.ptr == ptr && b.len == len)
-            {
-                let b = self.bounce.remove(pos);
-                self.views.retain(|&(p, l)| !(p == ptr && l == len));
-                // Write bounce back into guest GPA store.
-                // SAFETY: bounce exclusive for this view lifetime.
-                let slice = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) };
-                for (i, &gpa) in b.gpas.iter().enumerate() {
-                    let off = i * b.page_sz;
-                    let _ = self.write_gpa(gpa, &slice[off..off + b.page_sz]);
-                }
-                unsafe {
-                    let _ = Box::from_raw(std::ptr::slice_from_raw_parts_mut(ptr as *mut u8, len));
-                }
-            } else {
-                // Aliasing view into a RealRange — drop tracking only.
-                self.views.retain(|&(p, l)| !(p == ptr && l == len));
-            }
+            // Aliasing view into a RealRange — drop tracking only.
+            self.views.retain(|&(p, l)| !(p == ptr && l == len));
         }
     }
 }
@@ -1386,6 +1500,55 @@ mod tests {
         unsafe { *((view + 4) as *mut u32) = 0x1122_3344 };
         assert_eq!(h.get_u32(0x10 * p + 4), 0x1122_3344);
         h.unmap_pages(view, 2 * GUEST_PAGE_SIZE_ARM64E);
+    }
+
+    /// A guest page smaller than the host's must still map to its own bytes.
+    ///
+    /// This is the case [`map_pages_view_aliases_guest_ram`] cannot reach: it
+    /// uses `GUEST_PAGE_SIZE_ARM64E` for both the range and the page size, so
+    /// every offset it produces is host-page-aligned by construction. An x86
+    /// fixture uses 4 KiB guest pages, and on Apple Silicon the host page is
+    /// 16 KiB — so page 1 of such a range sits at offset 0x1000, which
+    /// `mach_vm_remap` rounds down to the enclosing host page. The remap
+    /// succeeded and returned a valid pointer aliasing page 0, so a seed write
+    /// through the view landed a page early and reported success. One drain
+    /// test had been red on this host since the day it was written because of
+    /// it, and its two substantive assertions never ran.
+    #[test]
+    fn a_guest_page_smaller_than_the_hosts_maps_to_its_own_bytes() {
+        const X86_PAGE: usize = 1usize << crate::contract::gva::PAGE_SHIFT_X86;
+        let mut h = FakeHost::new();
+        let base = 0x40u64 * X86_PAGE as u64;
+        h.map_range(base, 3 * X86_PAGE, 0);
+
+        // A distinct marker in each of the three pages, written through the
+        // GPA store rather than the view.
+        for i in 0..3u64 {
+            h.put_u32(base + i * X86_PAGE as u64, 0x1000_0000 + i as u32);
+        }
+
+        let gpas: Vec<u64> = (0..3).map(|i| base + i * X86_PAGE as u64).collect();
+        let view = h
+            .map_pages(&gpas, X86_PAGE)
+            .expect("a packed run inside one provisioned range must map");
+        for i in 0..3usize {
+            let got = unsafe { *((view + i * X86_PAGE) as *const u32) };
+            assert_eq!(
+                got,
+                0x1000_0000 + i as u32,
+                "view page {i} aliases the wrong guest page"
+            );
+        }
+
+        // And the other direction: a write through page 1 of the view must not
+        // land in page 0, which is exactly what the rounded remap did.
+        unsafe { *((view + X86_PAGE) as *mut u32) = 0xfeed_face };
+        assert_eq!(h.get_u32(base + X86_PAGE as u64), 0xfeed_face);
+        assert_eq!(h.get_u32(base), 0x1000_0000, "page 0 must be untouched");
+        h.unmap_pages(view, 3 * X86_PAGE);
+        // The alias is not a view the harness owns; unmapping it must leave the
+        // range's own memory alive.
+        assert_eq!(h.get_u32(base + X86_PAGE as u64), 0xfeed_face);
     }
 
     #[test]

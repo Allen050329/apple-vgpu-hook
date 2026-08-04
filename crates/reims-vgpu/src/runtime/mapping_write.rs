@@ -15,7 +15,7 @@ use crate::runtime::mapper;
 
 /// Why one render writeback did not land its frame in the guest's pages.
 ///
-/// [`write_bgra8_inner`] has sixteen refusal sites and used to answer all of them
+/// [`write_bgra8_inner`] has fifteen refusal sites and used to answer all of them
 /// with a bare `false`, which its caller rendered as a single
 /// `deferred_flush_lost reason=write_refused`. That is the defect the decline
 /// vocabulary exists to prevent: the composite surface is the largest frame this
@@ -64,11 +64,14 @@ pub enum SurfaceWriteRefusal {
     StagedShort { need: usize, have: usize, row: u32 },
     /// The mapper refused to write a run of the frame into the guest's pages.
     MapperWrite { lo: u64, len: usize },
-    /// A partial frame was offered to a caller that publishes to the host
-    /// surface cache. The cache stores whatever `src` holds, and a frame
-    /// narrowed to its changed runs holds nothing at all outside them, so
-    /// publishing it would seed later reads from uninitialised memory.
-    PartialFramePublished { runs: usize },
+    /// The seed (previous-frame) buffer ends before the frame it must diff
+    /// against. Distinct from [`Self::SourceShort`] because the two buffers come
+    /// from different producers, and a log that conflated them could not say
+    /// which one to go and look at.
+    SeedShort { need: usize, have: usize },
+    /// A seed row would not convert into the mapping's pixel format. Same
+    /// distinction from [`Self::RowConvert`], and the same reason.
+    SeedRowConvert { format: u16, row: u32 },
 }
 
 impl crate::observe::decline::Decline for SurfaceWriteRefusal {
@@ -87,7 +90,8 @@ impl crate::observe::decline::Decline for SurfaceWriteRefusal {
             Self::FrameExtent { .. } => "surface_write_frame_extent",
             Self::StagedShort { .. } => "surface_write_staged_short",
             Self::MapperWrite { .. } => "surface_write_mapper_write",
-            Self::PartialFramePublished { .. } => "surface_write_partial_frame_published",
+            Self::SeedShort { .. } => "surface_write_seed_short",
+            Self::SeedRowConvert { .. } => "surface_write_seed_row_convert",
         }
     }
 
@@ -141,7 +145,14 @@ impl crate::observe::decline::Decline for SurfaceWriteRefusal {
             Self::MapperWrite { lo, len } => {
                 vec![("lo", format!("{lo:#x}")), ("len", len.to_string())]
             }
-            Self::PartialFramePublished { runs } => vec![("runs", runs.to_string())],
+            Self::SeedShort { need, have } => vec![
+                ("need", need.to_string()),
+                ("have", have.to_string()),
+            ],
+            Self::SeedRowConvert { format, row } => vec![
+                ("fmt", format!("{format:#x}")),
+                ("row", row.to_string()),
+            ],
         }
     }
 }
@@ -226,6 +237,21 @@ pub fn type11_sample_window(
 /// carries the IOSurface plane index on the wire (type-5 record `+0x20`).
 /// The index names the device plane record directly; same-geometry planes
 /// (v0a8 Y plane 0 vs alpha plane 2) are indistinguishable by geometry scan.
+///
+/// Every type-5 consumer must come through here rather than through
+/// [`type11_sample_window`], and the distinction is not cosmetic: type-11's
+/// window resolves the plane by matching width, height and bytes-per-element,
+/// and on a surface whose planes share all three (v0a8 Y and alpha are both R8
+/// at the luma geometry) the scan matches two, takes neither, and returns the
+/// invented packed window — plane 0's bytes at offset 0. Handing a type-5 view's
+/// geometry to it therefore reads the *luma* plane for a bind the wire said was
+/// alpha, and the geometry scan cannot detect that by construction.
+///
+/// The `from_device` flag it returns is the caller's obligation, not a detail:
+/// `false` means the descriptor resolved no plane and the window is the invented
+/// packed one over plane 0. A caller that then *binds* that window while the wire
+/// named a non-zero plane has bound the wrong plane, and must say so through
+/// [`note_type5_plane_invent`].
 pub fn type5_sample_window(
     m: &MappingEntry,
     plane_index: u32,
@@ -239,6 +265,44 @@ pub fn type5_sample_window(
         None
     };
     sample_window_prefer_device(desc, Some(plane_index), format, width, height)
+}
+
+/// Report a type-5 bind that fell through to the invented packed window after
+/// the wire named a plane.
+///
+/// The invent is always plane 0's bytes at offset 0, so this is a guaranteed
+/// wrong bind — the window came back, the copy succeeds, and nothing else in the
+/// device will ever say the pixels are the wrong plane's. That makes it a
+/// failure line rather than a census.
+///
+/// Owned here rather than written out at each consumer because there are three
+/// of them (compute staging, blit texture backing, the CPU type-5 draw load) and
+/// the blit one was added after a spell resolving type-5 views through
+/// [`type11_sample_window`], which drops the wire plane index entirely and so
+/// could not have reported anything. `site` is what tells the three apart.
+///
+/// Call it only where the window is bound. The zero-copy sampled path checks
+/// `from_device` and refuses the invent, falling through to the CPU load that
+/// does bind it; reporting at both would double-count one bind.
+pub fn note_type5_plane_invent(
+    mapping_id: u32,
+    plane_index: u32,
+    width: u32,
+    height: u32,
+    format: u16,
+    window: (u64, u32),
+    site: &str,
+) {
+    if plane_index == 0 {
+        return;
+    }
+    let (offset, bpr) = window;
+    crate::observe::fail(format!(
+        "plane_invent site={site} mapping={mapping_id} plane={plane_index} \
+         {width}x{height} fmt={format:#x} offset={offset} bpr={bpr} \
+         (the wire named a plane and the device descriptor did not resolve one, \
+         so this window is plane 0 packed)"
+    ));
 }
 
 /// Revalidate + packed contig host view covering at least `span_end` bytes.
@@ -467,80 +531,6 @@ fn unskipped(start: u64, end: u64, skip: SkipRanges<'_>) -> Vec<(u64, u64)> {
     out
 }
 
-/// Byte ranges of a **tightly packed** frame, ascending and disjoint.
-///
-/// The unit the render writeback's difference pass answers in: the frame it
-/// compared has `tight` bytes per row and no inter-row padding, which is not
-/// the space `SkipRanges` is in. [`tight_runs_to_mapping`] is the only crossing
-/// between the two.
-pub type ChangedRuns<'a> = &'a [(u64, u64)];
-
-/// Place tightly-packed frame ranges at their mapping-linear destinations.
-///
-/// Frame byte `s` belongs to row `s / tight` at `s % tight` into it, and that
-/// row starts at `base_off + row * bpr`. When `bpr` and `tight` agree the whole
-/// frame is one linear shift and neighbouring rows come back merged; when they
-/// do not, a run crossing a row boundary becomes one range per row it touches,
-/// because the padding between rows is outside the texture contract and may
-/// belong to another guest allocation.
-///
-/// Runs past the frame's last row are dropped rather than wrapped: a bitmap is
-/// a whole number of tiles and the last tile of a frame is usually partial, so
-/// its bits name bytes the frame does not have.
-fn tight_runs_to_mapping(
-    runs: ChangedRuns<'_>,
-    base_off: u64,
-    bpr: u64,
-    tight: u64,
-    height: u64,
-) -> Vec<(u64, u64)> {
-    let frame = tight.saturating_mul(height);
-    let mut out: Vec<(u64, u64)> = Vec::new();
-    for &(start, end) in runs {
-        let mut cur = start.min(frame);
-        let end = end.min(frame);
-        while cur < end {
-            let row = cur / tight;
-            let seg_end = end.min((row + 1).saturating_mul(tight));
-            let lo = base_off
-                .saturating_add(row.saturating_mul(bpr))
-                .saturating_add(cur - row.saturating_mul(tight));
-            let hi = lo.saturating_add(seg_end - cur);
-            match out.last_mut() {
-                Some(last) if last.1 == lo => last.1 = hi,
-                _ => out.push((lo, hi)),
-            }
-            cur = seg_end;
-        }
-    }
-    out
-}
-
-/// The parts of `[lo, hi)` this write should store: what `changed` selects,
-/// less what `skip` excludes.
-///
-/// The two narrowings are unrelated and both are subtractions from the same
-/// window, so they compose rather than choose. `changed` says the destination
-/// already holds these bytes; `skip` says the destination holds bytes the guest
-/// wrote and this device must not replace. Nothing requires one to imply the
-/// other.
-fn writable_spans(
-    changed: Option<&[(u64, u64)]>,
-    skip: SkipRanges<'_>,
-    lo: u64,
-    hi: u64,
-) -> Vec<(u64, u64)> {
-    let mut out = Vec::new();
-    for (a, b) in mapper::selected_within(changed, lo, hi) {
-        if skip.is_empty() {
-            out.push((a, b));
-        } else {
-            out.extend(unskipped(a, b, skip));
-        }
-    }
-    out
-}
-
 /// Write a tight BGRA8 image into the mapping's guest pages.
 ///
 /// Packed contig HostOps view when possible; else multi-import maximal packed
@@ -596,7 +586,6 @@ pub fn write_bgra8_skipping<M: HostMemory + HostOps>(
         width,
         height,
         skip,
-        None,
     )
 }
 
@@ -617,10 +606,12 @@ pub fn write_bgra8_skipping<M: HostMemory + HostOps>(
 /// pointer has to be the one the rest of this write read from, the pitch has to
 /// be the packed row length, and the allocation has to cover the whole frame.
 /// Anything else takes the copying publish.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the geometry the frame is in, plus the ranges its owner may not overwrite"
-)]
+/// Writes the frame whole. Its one caller is the deferred render flush, which
+/// preserves nothing by design — see
+/// [`crate::runtime::storage_flush`]'s `note_render_flush_over_guest_write` for
+/// why the witness a narrowing would rest on cannot answer. A caller that does
+/// need to skip has [`write_bgra8_skipping`]; adding the parameter back here
+/// belongs with the caller that can fill it.
 pub fn write_bgra8_owned<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -629,7 +620,6 @@ pub fn write_bgra8_owned<M: HostMemory + HostOps>(
     src_stride: u32,
     width: u32,
     height: u32,
-    skip: SkipRanges<'_>,
 ) -> bool {
     write_bgra8_inner(
         state,
@@ -640,8 +630,7 @@ pub fn write_bgra8_owned<M: HostMemory + HostOps>(
         src_stride,
         width,
         height,
-        skip,
-        None,
+        &[],
     )
 }
 
@@ -663,10 +652,7 @@ pub fn write_bgra8_owned<M: HostMemory + HostOps>(
 /// through to a source that does hold this frame — the surface's own guest
 /// pages, which this write has just landed, or the resident it came out of —
 /// so the miss costs a slower route to the same pixels and never wrong ones.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the geometry the frame is in, plus the ranges its owner may not overwrite"
-)]
+/// Writes the frame whole, for the same reason [`write_bgra8_owned`] does.
 pub fn write_bgra8_uncached<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -675,45 +661,6 @@ pub fn write_bgra8_uncached<M: HostMemory + HostOps>(
     src_stride: u32,
     width: u32,
     height: u32,
-    skip: SkipRanges<'_>,
-) -> bool {
-    write_bgra8_uncached_changed(
-        state, host, mapping_id, src, src_stride, width, height, skip, None,
-    )
-}
-
-/// [`write_bgra8_uncached`], storing only the frame ranges `changed` names.
-///
-/// `changed` is in the frame's own tightly-packed byte space — `width * 4` per
-/// row, no padding — which is what the render writeback's difference pass
-/// answers in. `None` stores the frame whole; `Some(&[])` stores none of it,
-/// which is the correct landing for a frame identical to the one already in the
-/// guest's pages.
-///
-/// Storing a subset is sound because not writing a byte that already holds the
-/// value being written is an identity: the pages end holding exactly what an
-/// eager landing would have left, so `mark_mapping_written`, the guest-write
-/// stamp and every later reader see what they would have seen. What the caller
-/// owes is that the ranges really are the only ones that differ — a claim about
-/// the destination, not about the frame, and one this function cannot check.
-///
-/// Only the uncached form takes it. The publishing forms hand `src` to
-/// [`crate::runtime::surface_cache`], which would then serve the bytes outside
-/// the runs to later readers, and outside the runs there are no bytes.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the geometry the frame is in, plus the two independent narrowings of it"
-)]
-pub fn write_bgra8_uncached_changed<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
-    host: &mut M,
-    mapping_id: u32,
-    src: &[u8],
-    src_stride: u32,
-    width: u32,
-    height: u32,
-    skip: SkipRanges<'_>,
-    changed: Option<ChangedRuns<'_>>,
 ) -> bool {
     write_bgra8_inner(
         state,
@@ -724,8 +671,7 @@ pub fn write_bgra8_uncached_changed<M: HostMemory + HostOps>(
         src_stride,
         width,
         height,
-        skip,
-        changed,
+        &[],
     )
 }
 
@@ -814,18 +760,7 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
     width: u32,
     height: u32,
     skip: SkipRanges<'_>,
-    changed: Option<ChangedRuns<'_>>,
 ) -> bool {
-    // A narrowed frame holds nothing outside its runs, and the cache stores
-    // whatever `src` holds, so the two are incompatible by construction rather
-    // than by convention. Refused rather than asserted: this is reachable only
-    // from a caller that has not been written yet, and a refusal names it.
-    if let (Some(runs), CacheOutcome::Publish(_)) = (changed, &cache) {
-        return refuse(
-            mapping_id,
-            SurfaceWriteRefusal::PartialFramePublished { runs: runs.len() },
-        );
-    }
     if width == 0 || height == 0 || width > MAX_SCANOUT_DIM || height > MAX_SCANOUT_DIM {
         return refuse(mapping_id, SurfaceWriteRefusal::Geometry { width, height });
     }
@@ -914,13 +849,6 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
     // in its tail.
     let direct_rows = rgba.is_none() && tight == (mw as usize) * (RGBA8_BPP as usize);
 
-    // Once for the frame, before either path: the difference pass answers in
-    // the frame's own tightly-packed space and everything below is in mapping
-    // offsets, so the crossing happens exactly here.
-    let changed_map = changed
-        .map(|runs| tight_runs_to_mapping(runs, base_off, bpr as u64, tight as u64, mh as u64));
-    let changed_map = changed_map.as_deref();
-
     use crate::runtime::drain::{
         SurfaceWritePhase, note_surface_write_path, note_surface_write_phase,
     };
@@ -929,16 +857,6 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
     // Fast path: one packed view, poke rows in place.
     if let Some((ptr, _)) = contig_for_write(state, host, mapping_id, span_end, &vouched, src) {
         note_surface_write_path(true, frame_bytes);
-        // Taken once for the frame so an audited landing is compared whole,
-        // then charged per row segment. This path reaches
-        // `mapper::write_mapping_bytes` not at all — it pokes rows straight
-        // into a contig view — so without its own hook the audit goes silent
-        // on any host whose mappings are host-contiguous, and `write_split`'s
-        // `contig`/`frag` is the only thing that would say so.
-        let mut audit = crate::runtime::land_redundancy::begin_audit(
-            crate::runtime::land_redundancy::Leg::Mapping,
-        );
-        let page_size = state.page_size();
         let land_started = std::time::Instant::now();
         // SAFETY: contig covers span_end; revalidated in ensure_contig_view.
         let base = unsafe { (ptr as *mut u8).add(base_off as usize) };
@@ -977,24 +895,10 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
             // The row's destination in mapping-offset space, so the skip list —
             // which is in that space — is subtracted before any pointer exists.
             let row_off = base_off.saturating_add((y as u64).saturating_mul(bpr as u64));
-            for (lo, hi) in writable_spans(
-                changed_map,
-                skip,
-                row_off,
-                row_off.saturating_add(tight as u64),
-            ) {
+            for (lo, hi) in unskipped(row_off, row_off.saturating_add(tight as u64), skip) {
                 let within = (lo - row_off) as usize;
                 let len = (hi - lo) as usize;
                 let dst = unsafe { base.add((y as usize).saturating_mul(bpr) + within) };
-                if let Some(walk) = audit.as_mut() {
-                    // `lo` is already the segment's mapping-linear offset, which
-                    // is the space the tiles align in.
-                    //
-                    // SAFETY: as below, and the audit only reads the range.
-                    unsafe {
-                        walk.note_write(lo, dst, &row_bytes[within..within + len], page_size);
-                    }
-                }
                 // SAFETY: `within + len <= tight <= row_bytes.len()`, and the
                 // view covers span_end which is at or past this row's last byte.
                 unsafe {
@@ -1025,23 +929,16 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
         };
         // The staged buffer is `src` itself whenever the layout it would be
         // built into is the layout `src` already has: no conversion (the rows go
-        // through untouched), the mapping's row pitch equal to the packed row
-        // length (so there is no inter-row padding to zero-fill), and a source
-        // pitch equal to it too (so the rows are already consecutive). Under all
-        // three, byte `i` of the staged frame is byte `i` of `src` for every
-        // `i < frame_len`, and building it copies 8 MB to produce a slice we are
-        // holding.
+        // through untouched) and a source pitch equal to the mapping's row pitch
+        // (so row `y` is already at `y * bpr`). Under both, byte `i` of the
+        // staged frame is byte `i` of `src` for every `i < frame_len`, and
+        // building it copies 8 MB to produce a slice we are holding.
         //
-        // Each condition is load-bearing rather than defensive. Drop the pitch
-        // equality and the gaps between rows — which the guest's allocator may
-        // have given to something else — stop being zeroed and start carrying
-        // whatever `src` has at those offsets. Drop `direct_rows` and the rows
-        // are supposed to be converted on the way through.
-        let staged: std::borrow::Cow<'_, [u8]> = if direct_rows
-            && bpr == tight
-            && src_stride as usize == tight
-            && src.len() >= frame_len
-        {
+        // What `src` has in the gaps between rows does not enter into it: the
+        // store below names the texel runs only, so those bytes are never read
+        // out of this buffer whichever way it was built.
+        let staged: std::borrow::Cow<'_, [u8]> =
+            if direct_rows && bpr == src_stride as usize && src.len() >= frame_len {
             std::borrow::Cow::Borrowed(&src[..frame_len])
         } else {
             let mut frame = vec![0u8; frame_len];
@@ -1098,21 +995,40 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
         };
         let frame: &[u8] = staged.as_ref();
         let land_started = std::time::Instant::now();
-        // One call for the whole frame, carrying the runs it should store.
-        //
-        // This used to be one call per surviving run, which is fine for the
-        // handful of ranges a guest-write skip list carries and ruinous for the
-        // thousands a difference bitmap does: every call re-runs
+        // One call for the whole frame, carrying the runs it should store,
+        // rather than one call per surviving run: every call re-runs
         // `flush_intersecting` over the deferred windows and re-resolves the
-        // mapping's page list, both `O(pages)`. The selection now travels into
-        // the walk, so the resolution happens once and each imported page run
-        // moves only the parts of itself the runs name.
-        let runs = writable_spans(
-            changed_map,
-            skip,
-            base_off,
-            base_off.saturating_add(frame.len() as u64),
-        );
+        // mapping's page list, both `O(pages)`, so the per-run shape pays that
+        // twice-over walk for each hole the skip list cuts. The selection
+        // travels into the walk instead, so the resolution happens once and
+        // each imported page run moves only the parts of itself the runs name.
+        //
+        // The runs are the `tight` bytes at the head of each of `mh` rows, not
+        // the frame's whole extent. A row pitch wider than the packed row leaves
+        // padding between rows, and that padding is not a texel this call was
+        // given: the contig arm above writes row by row and never touches it,
+        // so storing the staged frame entire would zero it here and leave it
+        // alone there — the same call landing different guest memory depending
+        // only on whether the guest's pages happened to be adjacent.
+        //
+        // Those bytes do belong to this plane (`sample_window_from_device_plane`
+        // requires the plane's own `plane_size` to cover `bpr * (mh - 1) +
+        // tight`), so this is not an overrun into a neighbouring allocation. It
+        // is content the guest put there and the device was never asked to
+        // replace.
+        let mut runs: Vec<(u64, u64)> = Vec::new();
+        for y in 0..mh {
+            let row_lo = base_off.saturating_add((y as u64).saturating_mul(bpr as u64));
+            for (lo, hi) in unskipped(row_lo, row_lo.saturating_add(tight as u64), skip) {
+                match runs.last_mut() {
+                    // A packed pitch makes consecutive rows adjacent; coalescing
+                    // keeps that frame the single run it was before the split,
+                    // which is the shape the hot 8 MB composite surface takes.
+                    Some(last) if last.1 == lo => last.1 = hi,
+                    _ => runs.push((lo, hi)),
+                }
+            }
+        }
         if !mapper::write_mapping_bytes_only(
             state,
             host,
@@ -1236,44 +1152,83 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
     height: u32,
 ) -> bool {
     if width == 0 || height == 0 || width > MAX_SCANOUT_DIM || height > MAX_SCANOUT_DIM {
-        return false;
+        return refuse(mapping_id, SurfaceWriteRefusal::Geometry { width, height });
     }
     let rgba_stride = width.saturating_mul(RGBA8_BPP);
     let need = (height as usize).saturating_mul(rgba_stride as usize);
     if rgba.len() < need {
-        return false;
+        return refuse(
+            mapping_id,
+            SurfaceWriteRefusal::SourceShort {
+                need,
+                have: rgba.len(),
+                row: 0,
+            },
+        );
     }
     if let Some(seed) = seed_rgba {
         if seed.len() < need {
-            return false;
+            return refuse(
+                mapping_id,
+                SurfaceWriteRefusal::SeedShort {
+                    need,
+                    have: seed.len(),
+                },
+            );
         }
     }
     let Some(m) = state.mappings.get(&mapping_id) else {
-        return false;
+        return refuse(mapping_id, SurfaceWriteRefusal::MappingAbsent);
     };
     if !m.mapped || m.page_entries.is_empty() {
-        return false;
+        return refuse(mapping_id, SurfaceWriteRefusal::MappingNotResident);
     }
     let (mw, mh, format) = mapping_write_geometry(m, width, height);
     if mw != width || mh != height {
-        return false;
+        return refuse(
+            mapping_id,
+            SurfaceWriteRefusal::GeometryMoved {
+                latched_width: mw,
+                latched_height: mh,
+                frame_width: width,
+                frame_height: height,
+            },
+        );
     }
     let Some((base_off, bpr_u32, span_end)) = type11_sample_window(m, mapping_id, mw, mh, format)
     else {
-        return false;
+        return refuse(
+            mapping_id,
+            SurfaceWriteRefusal::WindowUnresolved {
+                width: mw,
+                height: mh,
+                format,
+            },
+        );
     };
     let bpr = bpr_u32 as u64;
     let Some(tight) = pixel_format::tight_row_bytes(mw, format) else {
-        return false;
+        return refuse(mapping_id, SurfaceWriteRefusal::FormatRowLength { format });
     };
     let bpr_usize = bpr as usize;
     let tight = tight as usize;
     let mut native = vec![0u8; tight];
     let mut seed_native = vec![0u8; tight];
+    // Deferred-writeback flush-on-access, as at every other read/write entry in
+    // this file — the module doc for `storage_flush` names them all as choke
+    // points. It has to be here rather than on one arm: the fragmented arm ends
+    // in `mapper::write_mapping_bytes`, which flushes, while the
+    // `contig_for_write` arm is a raw `copy_nonoverlapping` into the mapped span
+    // and flushes nothing. Whether an armed window landed before or after this
+    // write therefore depended on whether the guest's pages happened to be
+    // contiguous, and landing after puts an older frame on top of this one —
+    // which `mapper::write_mapping_bytes_only` states as its own reason for
+    // flushing here.
+    crate::runtime::storage_flush::flush_intersecting(state, host, mapping_id, base_off, span_end);
     // One proof for the whole image: the changed-span loop below writes each
     // differing row separately, and the walk is a translation per page.
     let Some(vouched) = vouch_for_write(state, host, mapping_id, "rgba8_changed") else {
-        return false;
+        return refuse(mapping_id, SurfaceWriteRefusal::PagesNotOurs);
     };
     let contig = contig_for_write(state, host, mapping_id, span_end, &vouched, rgba);
     // SAFETY: when Some, contig covers span_end.
@@ -1282,12 +1237,24 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
         let src_off = y * rgba_stride as usize;
         let src_row = &rgba[src_off..src_off + rgba_stride as usize];
         if !rgba8_row_to_native(format, src_row, mw, &mut native) {
-            return false;
+            return refuse(
+                mapping_id,
+                SurfaceWriteRefusal::RowConvert {
+                    format,
+                    row: y as u32,
+                },
+            );
         }
         let seed_row = if let Some(seed) = seed_rgba {
             let s = &seed[src_off..src_off + rgba_stride as usize];
             if !rgba8_row_to_native(format, s, mw, &mut seed_native) {
-                return false;
+                return refuse(
+                    mapping_id,
+                    SurfaceWriteRefusal::SeedRowConvert {
+                        format,
+                        row: y as u32,
+                    },
+                );
             }
             Some(seed_native.as_slice())
         } else {
@@ -1349,12 +1316,24 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
                     &native[start..x],
                     &vouched,
                 ) {
-                    return false;
+                    return refuse(
+                        mapping_id,
+                        SurfaceWriteRefusal::MapperWrite {
+                            lo: row_moff.saturating_add(start as u64),
+                            len: x - start,
+                        },
+                    );
                 }
             }
         } else if !mapper::write_mapping_bytes(state, host, mapping_id, row_moff, &native, &vouched)
         {
-            return false;
+            return refuse(
+                mapping_id,
+                SurfaceWriteRefusal::MapperWrite {
+                    lo: row_moff,
+                    len: native.len(),
+                },
+            );
         }
     }
     state.invalidate_storage_residency_window(mapping_id, base_off, span_end);
@@ -1420,35 +1399,50 @@ pub fn write_raw_rows<M: HostMemory + HostOps>(
     width: u32,
     height: u32,
 ) -> bool {
-    if width == 0
-        || height == 0
-        || width > MAX_SCANOUT_DIM
-        || height > MAX_SCANOUT_DIM
-        || row_bytes == 0
-        || src_stride < row_bytes
-    {
-        return false;
+    if width == 0 || height == 0 || width > MAX_SCANOUT_DIM || height > MAX_SCANOUT_DIM {
+        return refuse(mapping_id, SurfaceWriteRefusal::Geometry { width, height });
+    }
+    if row_bytes == 0 || src_stride < row_bytes {
+        return refuse(
+            mapping_id,
+            SurfaceWriteRefusal::SourceStride { src_stride, width },
+        );
     }
     let need = (height as u64).saturating_mul(src_stride as u64) as usize;
     if src.len() < need {
-        return false;
+        return refuse(
+            mapping_id,
+            SurfaceWriteRefusal::SourceShort {
+                need,
+                have: src.len(),
+                row: 0,
+            },
+        );
     }
     // Deferred-writeback flush-on-access (coarse: whole mapping — this entry
     // resolves its window only later and is off the hot compute path).
     crate::runtime::storage_flush::flush_intersecting(state, host, mapping_id, 0, u64::MAX);
     let Some(m) = state.mappings.get(&mapping_id) else {
-        return false;
+        return refuse(mapping_id, SurfaceWriteRefusal::MappingAbsent);
     };
     if !m.mapped || m.page_entries.is_empty() {
-        return false;
+        return refuse(mapping_id, SurfaceWriteRefusal::MappingNotResident);
     }
     if m.has_geom && (m.width != width || m.height != height) {
-        return false;
+        return refuse(
+            mapping_id,
+            SurfaceWriteRefusal::GeometryMoved {
+                latched_width: m.width,
+                latched_height: m.height,
+                frame_width: width,
+                frame_height: height,
+            },
+        );
     }
     let span_end = (row_bytes as u64).saturating_mul(height as u64);
     let rb = row_bytes as usize;
     let Some(vouched) = vouch_for_write(state, host, mapping_id, "raw_rows") else {
-        return false;
+        return refuse(mapping_id, SurfaceWriteRefusal::PagesNotOurs);
     };
     if let Some((ptr, _)) = contig_for_write(state, host, mapping_id, span_end, &vouched, src) {
         // SAFETY: contig covers span_end from offset 0.
@@ -1472,7 +1466,10 @@ pub fn write_raw_rows<M: HostMemory + HostOps>(
                 &src[src_off..src_off + rb],
                 &vouched,
             ) {
-                return false;
+                return refuse(
+                    mapping_id,
+                    SurfaceWriteRefusal::MapperWrite { lo: moff, len: rb },
+                );
             }
         }
     }
@@ -1680,18 +1677,27 @@ pub fn read_rect_raw_at<M: HostMemory + HostOps>(
     }
     let rb = row_bytes as usize;
     let bpr = surface_bpr as usize;
+    // The rect must end inside the sample window, and that is asked once for both
+    // arms below rather than inside either. A correctly-sized read satisfies it
+    // exactly (a dense tight read has `read_end == span_end`), so it drops only a
+    // genuine overrun.
+    //
+    // It used to sit inside the contig arm, on the reasoning that the fragmented
+    // arm was bounded anyway — which is true, but only by its own slice bounds:
+    // that arm reads the window and then indexes rows into it, so an overrunning
+    // rect came back as a bare `false` from a `get` that returned `None`. Both
+    // callers do name that (`rd_row_t11_io`, `Type5ViewDecline::Read`), so it was
+    // never a silent loss, but neither can say the rect left the window, and the
+    // fragmented arm is the one a driven x86 boot actually takes. One check above
+    // the split gives both arms the same refusal and the same line.
+    let read_end = rect_extent_end(base_off, origin_y, height, bpr, x_off, rb);
+    if read_end > span_end {
+        crate::observe::fail(format!(
+            "mapping_read fail reason=read_overrun mid={mapping_id} base_off={base_off} origin_y={origin_y} height={height} bpr={surface_bpr} x_off={x_off} rb={rb} read_end={read_end} span_end={span_end}"
+        ));
+        return false;
+    }
     if let Some((ptr, _)) = contig_for_span(state, host, mapping_id, span_end) {
-        // The fragmented branch below goes through `mapper::read_mapping_bytes`,
-        // which is bounded already. A correctly-sized read satisfies this exactly
-        // (dense tight read: `read_end == span_end`), so it drops ONLY a genuine
-        // overrun.
-        let read_end = rect_extent_end(base_off, origin_y, height, bpr, x_off, rb);
-        if read_end > span_end {
-            crate::observe::fail(format!(
-                "mapping_read fail reason=read_overrun mid={mapping_id} base_off={base_off} origin_y={origin_y} height={height} bpr={surface_bpr} x_off={x_off} rb={rb} read_end={read_end} span_end={span_end}"
-            ));
-            return false;
-        }
         // SAFETY: contig covers span_end, and read_end ≤ span_end (checked).
         let base = unsafe { (ptr as *const u8).add(base_off as usize) };
         if x_off == 0 && rb == bpr && dst_stride as usize == rb {
@@ -1917,22 +1923,39 @@ fn write_rect_raw_at_impl<M: HostMemory + HostOps>(
     }
     let rb = row_bytes as usize;
     let bpr = surface_bpr as usize;
+    // The destination bound, before the branch, because all three arms below
+    // write guest memory and only two of them used to check it. The per-row
+    // fragmented arm went through `mapper::write_mapping_bytes`, which bounds
+    // against the *whole mapping's* page span and not this plane's window, so an
+    // over-tall rect landed in whatever follows the window — on a multi-plane
+    // IOSurface that is the next plane's pixels — and said nothing.
+    //
+    // `rect_extent_end` is the shared expression for exactly this reason: its own
+    // doc records that the read and write sides disagreed while each computed it
+    // separately. A third caller computing its own variant is how that happens
+    // again, so the bound is taken once here and the arms carry none of their own.
+    // A correctly-sized writeback satisfies it exactly (a dense tight write gives
+    // `write_end == span_end`), so this drops ONLY a genuine overrun — named,
+    // never silent.
+    let write_end = rect_extent_end(base_off, origin_y, height, bpr, x_off, rb);
+    if write_end > span_end {
+        crate::observe::fail(format!(
+            "mapping_write fail reason=writeback_overrun mid={mapping_id} base_off={base_off} origin_y={origin_y} height={height} bpr={surface_bpr} x_off={x_off} rb={rb} write_end={write_end} span_end={span_end}"
+        ));
+        return false;
+    }
+    // Deferred-writeback flush-on-access, for the same reason and on the same
+    // split as `write_rgba8_image_changed`: the fragmented arms below flush
+    // through `mapper::write_mapping_bytes` and the contiguous one does not, so
+    // without this an armed window could land on top of this rect on packed
+    // surfaces only. Safe to call from inside a flush — the storage rail reaches
+    // this function through `write_full_rect_raw_at`, and `flush_intersecting`
+    // removes intersecting windows up front so the nested call finds nothing.
+    crate::runtime::storage_flush::flush_intersecting(state, host, mapping_id, base_off, span_end);
     let Some(vouched) = vouch_for_write(state, host, mapping_id, "rect_raw") else {
         return false;
     };
     if let Some((ptr, _)) = contig_for_write(state, host, mapping_id, span_end, &vouched, src) {
-        // The fragmented full-plane branch below already rejects on the same bound
-        // (`frame_end > span_end`); enforce it here too so the contig fast paths
-        // can never overrun. A correctly-sized writeback satisfies this exactly
-        // (dense tight write: `write_end == span_end`), so it drops ONLY a genuine
-        // overrun — named, never silent.
-        let write_end = rect_extent_end(base_off, origin_y, height, bpr, x_off, rb);
-        if write_end > span_end {
-            crate::observe::fail(format!(
-                "mapping_write fail reason=writeback_overrun mid={mapping_id} base_off={base_off} origin_y={origin_y} height={height} bpr={surface_bpr} x_off={x_off} rb={rb} write_end={write_end} span_end={span_end}"
-            ));
-            return false;
-        }
         // SAFETY: contig covers span_end, and write_end ≤ span_end (checked).
         let base = unsafe { (ptr as *mut u8).add(base_off as usize) };
         if x_off == 0 && rb == bpr && src_stride as usize == rb {
@@ -1959,8 +1982,18 @@ fn write_rect_raw_at_impl<M: HostMemory + HostOps>(
         // each maximal packed GPA run once. Calling write_mapping_bytes once
         // per row turns a 1928-row storage-texture writeback into thousands of
         // QEMU memory-region imports (the live compute_writeback_amplification
-        // class). Native row padding is not texture content and is zeroed, as
-        // in write_bgra8's fragmented path above.
+        // class).
+        //
+        // The store names each row's `rb` texel bytes rather than the frame's
+        // whole extent, for the reason `write_bgra8_inner` states at its own
+        // staging branch: a row pitch wider than the packed row leaves padding
+        // between rows, the contig arm twenty lines above writes row by row and
+        // never touches it, so storing the staged frame entire would zero it
+        // here and leave it alone there — the same call landing different guest
+        // memory depending only on whether the guest's pages happened to be
+        // adjacent. Those bytes belong to this plane, so it was never an overrun
+        // into a neighbour; it is content the guest put there and this call was
+        // not asked to replace.
         // `span_end` ends at the final row's last texel. It deliberately does
         // not include padding after the final row, so staging bpr * height
         // rejects every exact-span surface whose row pitch exceeds row_bytes.
@@ -1972,10 +2005,11 @@ fn write_rect_raw_at_impl<M: HostMemory + HostOps>(
             Some(v) => v,
             None => return false,
         };
-        let Some(frame_end) = base_off.checked_add(frame_len as u64) else {
-            return false;
-        };
-        if frame_end > span_end {
+        // No `frame_end > span_end` here: this arm used to take its own variant
+        // of the bound, computed without `x_off` and so looser than the one
+        // `rect_extent_end` gives above. The overflow check on `frame_len` stays
+        // because it guards the allocation on the next lines.
+        if base_off.checked_add(frame_len as u64).is_none() {
             return false;
         }
         // With no physical row padding, the engine's tight result is already
@@ -2007,6 +2041,10 @@ fn write_rect_raw_at_impl<M: HostMemory + HostOps>(
             return true;
         }
         let mut frame = vec![0u8; frame_len];
+        // Built alongside the fill so the two cannot describe different rows.
+        // Adjacent runs coalesce, so a packed pitch collapses to the single run
+        // it was before the split and moves exactly the same bytes.
+        let mut runs: Vec<(u64, u64)> = Vec::new();
         for y in 0..height as usize {
             let src_off = y * src_stride as usize;
             let dst_off = ((origin_y as usize) + y)
@@ -2016,8 +2054,22 @@ fn write_rect_raw_at_impl<M: HostMemory + HostOps>(
                 return false;
             }
             frame[dst_off..dst_off + rb].copy_from_slice(&src[src_off..src_off + rb]);
+            let lo = base_off.saturating_add(dst_off as u64);
+            let hi = lo.saturating_add(rb as u64);
+            match runs.last_mut() {
+                Some(last) if last.1 == lo => last.1 = hi,
+                _ => runs.push((lo, hi)),
+            }
         }
-        if !mapper::write_mapping_bytes(state, host, mapping_id, base_off, &frame, &vouched) {
+        if !mapper::write_mapping_bytes_only(
+            state,
+            host,
+            mapping_id,
+            base_off,
+            &frame,
+            Some(&runs),
+            &vouched,
+        ) {
             return false;
         }
     } else {
@@ -2073,209 +2125,176 @@ mod tests {
         );
     }
 
-    /// The frame the difference pass compares is tightly packed and the guest's
-    /// rows are `bpr` apart, so this is the only crossing between the two
-    /// spaces and an error in it lands pixels at the wrong offset.
-    #[test]
-    fn tight_runs_reach_their_rows_and_merge_only_when_the_pitches_agree() {
-        // Pitches agree: the frame is one linear shift and rows merge, so a run
-        // crossing three rows is one range rather than three.
-        assert_eq!(
-            tight_runs_to_mapping(&[(300, 800)], 4096, 256, 256, 64),
-            vec![(4096 + 300, 4096 + 800)]
-        );
-        // Pitches differ: the same run is one range per row it touches, and the
-        // padding between rows is never named.
-        assert_eq!(
-            tight_runs_to_mapping(&[(300, 800)], 0, 512, 256, 64),
-            vec![(512 + 44, 512 + 256), (1024, 1024 + 256), (1536, 1536 + 32)]
-        );
-        // A run inside one row stays one range under either pitch.
-        assert_eq!(
-            tight_runs_to_mapping(&[(260, 300)], 0, 512, 256, 64),
-            vec![(512 + 4, 512 + 44)]
-        );
-        // The last tile of a frame is usually partial, so a bitmap names bytes
-        // past the final row. They are dropped, not wrapped onto row 0.
-        assert_eq!(
-            tight_runs_to_mapping(&[(200, 400)], 0, 256, 256, 1),
-            vec![(200, 256)]
-        );
-        assert_eq!(tight_runs_to_mapping(&[(300, 400)], 0, 256, 256, 1), vec![]);
-        // Disjoint runs stay disjoint; adjacent ones merge.
-        assert_eq!(
-            tight_runs_to_mapping(&[(0, 16), (16, 32), (64, 80)], 0, 256, 256, 4),
-            vec![(0, 32), (64, 80)]
-        );
-    }
-
-    /// The two narrowings are independent and both subtract.
-    #[test]
-    fn a_changed_selection_and_a_skip_list_compose() {
-        assert_eq!(writable_spans(None, &[], 0, 100), vec![(0, 100)]);
-        assert_eq!(writable_spans(Some(&[]), &[], 0, 100), vec![]);
-        assert_eq!(
-            writable_spans(Some(&[(10, 40)]), &[], 0, 100),
-            vec![(10, 40)]
-        );
-        // The skip list cuts a hole in what the selection named.
-        assert_eq!(
-            writable_spans(Some(&[(10, 40)]), &[(20, 25)], 0, 100),
-            vec![(10, 20), (25, 40)]
-        );
-        // A skip covering the whole selection leaves nothing.
-        assert_eq!(writable_spans(Some(&[(10, 40)]), &[(0, 50)], 0, 100), vec![]);
-    }
-
-    /// A writeback given a change set stores those bytes and leaves every other
-    /// byte of the surface exactly as it found it.
+    /// Every row must land at its own offset, with content that can tell rows
+    /// apart.
     ///
-    /// Both storage shapes, because they place bytes by different means — the
-    /// packed one pokes a host view through a raw pointer, the fragmented one
-    /// hands the runs to the mapper's page walk — and a selection honoured by
-    /// one and not the other corrupts only whichever guest allocation happens
-    /// to be scattered.
+    /// Both write entries drain the mapping's armed deferred windows first, on
+    /// **both** storage shapes.
+    ///
+    /// `storage_flush`'s module doc names "`mapping_write` read/write entries"
+    /// as choke points, and five of them took the flush. These two did not, and
+    /// the consequence was shape-dependent rather than absent: their fragmented
+    /// arm reaches `mapper::write_mapping_bytes`, which flushes, while their
+    /// contiguous arm is a raw `copy_nonoverlapping` that does not. So on a
+    /// packed surface the window stayed armed and landed *after* the write,
+    /// putting an older frame on top of the one just written — the outcome
+    /// `mapper::write_mapping_bytes_only` gives as its own reason for flushing.
+    ///
+    /// Asserting on the armed window rather than on pixels is deliberate: the
+    /// window landing late is the mechanism, and a pixel assertion would depend
+    /// on which frame the fixture happened to arm.
     #[test]
-    fn a_changed_run_writeback_stores_only_the_bytes_it_names() {
+    fn the_write_entries_drain_armed_windows_on_both_storage_shapes() {
         use crate::model::PAGE_SHIFT_X86;
         const PAGE: u64 = 1 << PAGE_SHIFT_X86;
-        const W: u32 = 64;
-        const H: u32 = 64;
-        // Crosses two page boundaries and starts and ends mid-row, so a walk
-        // that only ever splits on one of the two gets it wrong.
-        const RUN: (u64, u64) = (300, 9000);
+        const W: u32 = 16;
+        const H: u32 = 16;
+        const BPR: u32 = W * 4;
+
+        let arm = |state: &mut DeviceState| {
+            let key = crate::model::ComputeStorageResidencyKey {
+                mapping_id: 5,
+                map_generation: state.mappings.get(&5).map(|m| m.map_generation).unwrap_or(0),
+                surface_offset: 0,
+                surface_bpr: BPR,
+                span_end: (W * H * 4) as u64,
+                width: W,
+                height: H,
+                pixel_format: MTL_FORMAT_BGRA8_UNORM,
+                texture_ref: 0,
+            };
+            state.compute_deferred_flush.insert(
+                key,
+                crate::model::DeferredOwner::Render {
+                    armed_seq: 0,
+                    armed_stamp_seq: 0,
+                    source: crate::model::RenderWindowSource::Owned(std::sync::Arc::new(vec![
+                        0u8;
+                        (W * H * 4) as usize
+                    ])),
+                },
+            );
+        };
 
         for packed in [true, false] {
-            let mut state = DeviceState::new(DeviceId(2), PAGE_SHIFT_X86);
-            let mut host = FakeHost::new();
-            host.strict_linux_map = !packed;
-            let base_pfn = 0x40u32;
-            host.map_range((base_pfn as u64) << PAGE_SHIFT_X86, 8 * PAGE as usize, 0x55);
-            let order: Vec<u32> = if packed {
-                (0..4).collect()
-            } else {
-                vec![3, 2, 1, 0]
-            };
-            let entries: Vec<u32> = order
-                .iter()
-                .map(|i| ((base_pfn + i) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID)
-                .collect();
-            state.map_surface(4);
-            state.attach_mapping_internal(4, 0);
-            let m = state.mappings.get_mut(&4).unwrap();
-            m.mapping_internal = 1;
-            m.page_entries = entries;
-            assert!(state.set_mapping_geom(4, W, H, MTL_FORMAT_BGRA8_UNORM));
+            for entry in ["rect", "rgba8_changed"] {
+                let mut state = DeviceState::new(DeviceId(4), PAGE_SHIFT_X86);
+                let mut host = FakeHost::new();
+                host.strict_linux_map = !packed;
+                let base_pfn = 0x80u32;
+                host.map_range((base_pfn as u64) << PAGE_SHIFT_X86, 4 * PAGE as usize, 0);
+                let order: Vec<u32> = if packed { (0..4).collect() } else { vec![3, 2, 1, 0] };
+                let entries: Vec<u32> = order
+                    .iter()
+                    .map(|i| ((base_pfn + i) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID)
+                    .collect();
+                state.map_surface(5);
+                state.attach_mapping_internal(5, 0);
+                let m = state.mappings.get_mut(&5).unwrap();
+                m.mapping_internal = 1;
+                m.page_entries = entries;
+                assert!(state.set_mapping_geom(5, W, H, MTL_FORMAT_BGRA8_UNORM));
+                arm(&mut state);
+                assert!(!state.compute_deferred_flush.is_empty());
 
-            let frame = vec![0xAAu8; (W * H * 4) as usize];
-            assert!(write_bgra8_uncached_changed(
-                &mut state,
-                &mut host,
-                4,
-                &frame,
-                W * 4,
-                W,
-                H,
-                &[],
-                Some(&[RUN]),
-            ));
-
-            let read = |off: u64| -> u8 {
-                let gpa = ((base_pfn as u64 + order[(off / PAGE) as usize] as u64)
-                    << PAGE_SHIFT_X86)
-                    + (off % PAGE);
-                let mut got = [0u8; 1];
-                host.read_gpa(gpa, &mut got).unwrap();
-                got[0]
-            };
-            for off in 0..(W * H * 4) as u64 {
-                let want = if off >= RUN.0 && off < RUN.1 {
-                    0xAA
-                } else {
-                    0x55
+                let src = vec![0x33u8; (W * H * 4) as usize];
+                let _ = match entry {
+                    "rect" => write_rect_raw_at(
+                        &mut state,
+                        &mut host,
+                        5,
+                        0,
+                        BPR,
+                        (W * H * 4) as u64,
+                        0,
+                        0,
+                        W,
+                        H,
+                        4,
+                        &src,
+                        BPR,
+                    ),
+                    _ => write_rgba8_image_changed(&mut state, &mut host, 5, &src, None, W, H),
                 };
-                assert_eq!(
-                    read(off),
-                    want,
-                    "packed={packed} byte {off} of a run-limited writeback"
+
+                assert!(
+                    state.compute_deferred_flush.is_empty(),
+                    "packed={packed} entry={entry}: the write must drain the armed \
+                     window, or it lands afterwards and puts an older frame on top"
                 );
             }
         }
     }
 
-    /// A frame identical to the one already in the guest's pages names no runs,
-    /// and that is the cheapest correct landing rather than a refusal: nothing
-    /// is stored, and the write still succeeds so its caller goes on to stamp
-    /// the pages as current.
+    /// A rect taller than the window it names is refused on **both** storage
+    /// shapes, and writes nothing past the window.
+    ///
+    /// `write_rect_raw_at_impl` has three arms that all write guest memory, and
+    /// the bound used to be on two of them. The per-row fragmented arm reached
+    /// `mapper::write_mapping_bytes`, which bounds against the whole mapping's
+    /// page span rather than this plane's window, so an over-tall rect landed in
+    /// whatever follows the window — on a multi-plane IOSurface, the next plane's
+    /// pixels — with no fail line. The packed arm refused the same call.
+    ///
+    /// So the loop over `packed` is the test: an assertion on one shape alone
+    /// passed throughout, which is how the hole survived. `span_end` is set short
+    /// of the mapping's real extent on purpose, because that gap is exactly the
+    /// region the unbounded arm wrote into and the bounded one did not.
     #[test]
-    fn an_empty_change_set_stores_nothing_and_still_succeeds() {
+    fn a_rect_taller_than_its_window_is_refused_on_both_storage_shapes() {
         use crate::model::PAGE_SHIFT_X86;
         const PAGE: u64 = 1 << PAGE_SHIFT_X86;
-        const W: u32 = 64;
-        const H: u32 = 64;
+        const W: u32 = 16;
+        const BPR: u32 = W * 4;
 
         for packed in [true, false] {
-            let mut state = DeviceState::new(DeviceId(2), PAGE_SHIFT_X86);
+            let mut state = DeviceState::new(DeviceId(3), PAGE_SHIFT_X86);
             let mut host = FakeHost::new();
             host.strict_linux_map = !packed;
-            let base_pfn = 0x40u32;
-            host.map_range((base_pfn as u64) << PAGE_SHIFT_X86, 8 * PAGE as usize, 0x55);
-            let entries: Vec<u32> = (0..4)
+            let base_pfn = 0x60u32;
+            host.map_range((base_pfn as u64) << PAGE_SHIFT_X86, 4 * PAGE as usize, 0xee);
+            let order: Vec<u32> = if packed { (0..4).collect() } else { vec![3, 2, 1, 0] };
+            let entries: Vec<u32> = order
+                .iter()
                 .map(|i| ((base_pfn + i) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID)
                 .collect();
-            state.map_surface(4);
-            state.attach_mapping_internal(4, 0);
-            let m = state.mappings.get_mut(&4).unwrap();
+            state.map_surface(5);
+            state.attach_mapping_internal(5, 0);
+            let m = state.mappings.get_mut(&5).unwrap();
             m.mapping_internal = 1;
             m.page_entries = entries;
-            assert!(state.set_mapping_geom(4, W, H, MTL_FORMAT_BGRA8_UNORM));
 
-            let frame = vec![0xAAu8; (W * H * 4) as usize];
-            assert!(write_bgra8_uncached_changed(
+            // The window is one page: 64 rows of 64 bytes. The rect asks for 80.
+            let span_end = PAGE;
+            let rows = (PAGE / BPR as u64) as u32;
+            let over = rows + 16;
+            let src = vec![0x5au8; (over as usize) * BPR as usize];
+
+            assert!(
+                !write_rect_raw_at(
+                    &mut state, &mut host, 5, 0, BPR, span_end, 0, 0, W, over, 4, &src, BPR,
+                ),
+                "packed={packed}: a rect past the window's last row must be refused"
+            );
+
+            // The bytes after the window still hold the fill the mapping was
+            // seeded with, on both shapes.
+            let mut after = [0u8; 16];
+            assert!(mapper::read_mapping_bytes(
                 &mut state,
                 &mut host,
-                4,
-                &frame,
-                W * 4,
-                W,
-                H,
-                &[],
-                Some(&[]),
+                5,
+                span_end,
+                &mut after
             ));
-            for page in 0..4u64 {
-                let mut got = [0u8; 4];
-                host.read_gpa((base_pfn as u64 + page) << PAGE_SHIFT_X86, &mut got)
-                    .unwrap();
-                assert_eq!(got, [0x55; 4], "packed={packed} page {page} was touched");
-            }
+            assert_eq!(
+                after,
+                [0xeeu8; 16],
+                "packed={packed}: the refused rect must not have written past the window"
+            );
         }
     }
 
-    /// A narrowed frame holds nothing outside its runs, so a writer that would
-    /// hand it to the host surface cache is refused rather than allowed to seed
-    /// later readers from bytes that were never written.
-    #[test]
-    fn a_partial_frame_is_refused_by_a_publishing_writer() {
-        use crate::model::PAGE_SHIFT_X86;
-        let mut state = DeviceState::new(DeviceId(2), PAGE_SHIFT_X86);
-        let mut host = FakeHost::new();
-        assert!(!write_bgra8_inner(
-            &mut state,
-            &mut host,
-            4,
-            &[0u8; 64],
-            CacheOutcome::Publish(None),
-            16,
-            4,
-            4,
-            &[],
-            Some(&[(0, 16)]),
-        ));
-    }
-
-    /// Every row must land at its own offset, with content that can tell rows
-    /// apart.
-    ///
     /// The skip test below fills the frame with one repeated byte, so it proves
     /// which *pages* were written and nothing at all about which row went
     /// where: a writeback that repeated row 0 sixty-four times, or that shifted
@@ -3016,9 +3035,86 @@ mod tests {
         assert!(mapper::ensure_contig_view(&mut state, &mut host, mid).is_none());
     }
 
-    /// The fragmented BGRA write path must stop at the final row's last texel.
-    /// Writing `bpr * height` includes padding after the final row, which is not
-    /// texture content and can overrun an exact IOSurface allocation.
+    /// The fragmented BGRA write path must land the texels and nothing else —
+    /// the same contract `write_bgra8_contig_writes_only_inside_the_sample_window`
+    /// pins on the pointer arm, asserted the same way so the two arms cannot
+    /// drift apart. Padding after the final row would overrun an exact IOSurface
+    /// allocation; padding *between* rows is inside the plane but is still
+    /// content the guest put there and this call never named.
+    /// The staged full-plane rect write must leave inter-row padding alone, on
+    /// the same assertion as its two siblings.
+    ///
+    /// `write_rect_raw_at_impl` has three arms that must land identical guest
+    /// memory. The contiguous one pokes each row's texel bytes through a raw
+    /// pointer, the per-row fragmented one writes each row's bytes on its own,
+    /// and the staged one built a pitch-wide zeroed frame and stored it entire —
+    /// so every padding byte between rows was zeroed in the guest's pages. That
+    /// is the defect `write_bgra8_inner` was fixed for, in the sibling function,
+    /// and this arm's own comment cited the pre-fix behaviour as its
+    /// justification.
+    ///
+    /// Asserted as "every byte outside the texel runs is unchanged", the same
+    /// whole-page comparison the BGRA arms are pinned by, so all three cannot
+    /// drift apart again. The fixture forces the staged arm two ways: two
+    /// non-adjacent pages (no contiguous view) and `full_plane`, and a pitch
+    /// wider than the packed row so `full_tight_direct` cannot take it either.
+    #[test]
+    fn write_full_rect_raw_staged_leaves_inter_row_padding_alone() {
+        use crate::model::PAGE_SHIFT_X86;
+
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+        host.strict_linux_map = true;
+        let page = 1u64 << PAGE_SHIFT_X86;
+        let gpa0 = 0x3500_0000u64;
+        let gpa1 = 0x4600_0000u64;
+        host.map_range(gpa0, page as usize, 0xCC);
+        host.map_range(gpa1, page as usize, 0xCC);
+        let pfn0 = (gpa0 >> PAGE_SHIFT_X86) as u32;
+        let pfn1 = (gpa1 >> PAGE_SHIFT_X86) as u32;
+        let mid = 14u32;
+        state.map_surface(mid);
+        {
+            let m = state.mappings.get_mut(&mid).unwrap();
+            m.mapped = true;
+            m.mapping_internal = 1;
+            m.page_entries = vec![
+                (pfn0 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID,
+                (pfn1 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID,
+            ];
+        }
+        assert!(state.set_mapping_geom(mid, 2, 2, MTL_FORMAT_BGRA8_UNORM));
+        assert!(
+            mapper::ensure_contig_view(&mut state, &mut host, mid).is_none(),
+            "two non-adjacent pages must take the staged path this test is about"
+        );
+
+        // 2x2 BGRA8: 8 tight bytes per row at a 128-byte pitch, so 120 bytes of
+        // guest content sit between the rows.
+        let (w, h, bpp) = (2u32, 2u32, 4u32);
+        let tight = (w * bpp) as usize;
+        let bpr = 128u32;
+        let span_end = (bpr as u64) * (h as u64 - 1) + tight as u64;
+        let src = [
+            0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee,
+            0xff, 0x10,
+        ];
+        assert!(write_full_rect_raw_at(
+            &mut state, &mut host, mid, 0, bpr, span_end, w, h, bpp, &src, tight as u32,
+        ));
+
+        let mut got = vec![0u8; page as usize];
+        assert!(host.read_gpa(gpa0, &mut got).is_ok());
+        let mut want = vec![0xCCu8; page as usize];
+        want[..tight].copy_from_slice(&src[..tight]);
+        want[bpr as usize..bpr as usize + tight].copy_from_slice(&src[tight..]);
+        let first_diff = got.iter().zip(want.iter()).position(|(a, b)| a != b);
+        assert_eq!(
+            first_diff, None,
+            "byte {first_diff:?} outside the texel runs was modified"
+        );
+    }
+
     #[test]
     fn write_bgra8_fragmented_skips_final_row_padding() {
         use crate::model::PAGE_SHIFT_X86;
@@ -3049,17 +3145,26 @@ mod tests {
             0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee,
             0xff, 0x10,
         ];
+        assert!(
+            mapper::ensure_contig_view(&mut state, &mut host, mid).is_none(),
+            "two non-adjacent pages must take the staged path this test is about"
+        );
         assert!(write_bgra8(&mut state, &mut host, mid, &src, 8, 2, 2));
 
-        let mut final_row = [0u8; 8];
-        assert!(host.read_gpa(gpa0 + 128, &mut final_row).is_ok());
-        assert_eq!(final_row, src[8..16]);
-
-        let mut final_padding = [0u8; 4];
-        assert!(host.read_gpa(gpa0 + 128 + 8, &mut final_padding).is_ok());
+        // No device descriptor, so the invented window applies: tight = 2 × 4,
+        // bpr = ALIGN_UP(8, ROW_BYTES_ALIGN) = 128, two rows — a pitch wider
+        // than the packed row, so there is inter-row padding to get wrong.
+        let tight = 8usize;
+        let bpr = 128usize;
+        let mut got = vec![0u8; page as usize];
+        assert!(host.read_gpa(gpa0, &mut got).is_ok());
+        let mut want = vec![0xCCu8; page as usize];
+        want[..tight].copy_from_slice(&src[..tight]);
+        want[bpr..bpr + tight].copy_from_slice(&src[tight..]);
+        let first_diff = got.iter().zip(want.iter()).position(|(a, b)| a != b);
         assert_eq!(
-            final_padding, [0xCC; 4],
-            "padding after the final row must remain untouched"
+            first_diff, None,
+            "byte {first_diff:?} outside the sample window was modified"
         );
     }
 
@@ -3166,6 +3271,85 @@ mod tests {
         ));
         assert_eq!(&dst[..8], &row0);
         assert_eq!(&dst[8..], &row1);
+    }
+
+    /// A rect ending past the sample window must be refused the same way and
+    /// named the same way whichever arm reads it. The bound used to live inside
+    /// the contig arm, so the fragmented arm — the one a driven x86 boot takes —
+    /// answered an overrun with a bare `false` from a slice index and no line
+    /// saying the rect had left the window.
+    ///
+    /// Run over both arms from one body so the two cannot drift: a single packed
+    /// page takes the contig arm, two scattered pages take the fragmented one.
+    #[test]
+    fn a_rect_past_the_sample_window_is_named_on_both_read_arms() {
+        use crate::model::PAGE_SHIFT_X86;
+
+        for scattered in [false, true] {
+            let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+            let mut host = FakeHost::new();
+            host.strict_linux_map = true;
+            let page = 1u64 << PAGE_SHIFT_X86;
+            let gpa0 = 0x5100_0000u64;
+            let gpa1 = 0x6200_0000u64;
+            host.map_range(gpa0, page as usize, 0);
+            host.map_range(gpa1, page as usize, 0);
+            let pfn0 = (gpa0 >> PAGE_SHIFT_X86) as u32;
+            let pfn1 = (gpa1 >> PAGE_SHIFT_X86) as u32;
+            let mid = 12u32;
+            state.map_surface(mid);
+            {
+                let m = state.mappings.get_mut(&mid).unwrap();
+                m.mapped = true;
+                m.mapping_internal = 1;
+                // One page is a packed view; two distant ones cannot be.
+                m.page_entries = if scattered {
+                    vec![
+                        (pfn0 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID,
+                        (pfn1 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID,
+                    ]
+                } else {
+                    vec![(pfn0 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID]
+                };
+            }
+            assert_eq!(
+                mapper::ensure_contig_view(&mut state, &mut host, mid).is_some(),
+                !scattered,
+                "scattered={scattered} must select the arm this iteration is about"
+            );
+
+            // The window is one page. Asking for four rows at a one-page pitch
+            // puts the fourth row's last byte three pages past its end.
+            let mut dst = [0u8; 4 * 8];
+            let cap = crate::observe::FailCapture::start();
+            let ok = read_rect_raw_at(
+                &mut state,
+                &mut host,
+                mid,
+                0,
+                page as u32,
+                page,
+                0,
+                0,
+                2,
+                4,
+                4,
+                &mut dst,
+                8,
+            );
+            let overruns: Vec<String> = cap
+                .lines()
+                .into_iter()
+                .filter(|l| l.contains("reason=read_overrun"))
+                .collect();
+            assert!(!ok, "scattered={scattered}: the read must refuse");
+            assert_eq!(
+                overruns.len(),
+                1,
+                "scattered={scattered}: the refusal must name the bound it broke, \
+                 not leave the caller's decline to stand for it: {overruns:?}"
+            );
+        }
     }
 
     /// compute_full_tight_scratch: an exact-pitch fragmented compute plane
@@ -3466,6 +3650,177 @@ mod tests {
         assert_eq!(&row[4..8], &[0, 0, 255, 255]);
         // Contrast: Load seed=logo + same rgba would leave logo where equal —
         // not tested here; store_seed_policy gates that path.
+    }
+
+    /// The depth/stencil writeback must name its refusals too.
+    ///
+    /// `write_raw_rows` is the third guest-memory writer in this file and was
+    /// the last one still answering every refusal with a bare `false`. It is
+    /// worse placed than the others to be silent: both callers discard its
+    /// result outright, so nothing above it could report a reason even if it
+    /// wanted to, and the guest work it drops is a `MTLStoreActionStore` on a
+    /// depth/stencil attachment - the mapping simply keeps stale bytes and the
+    /// pass reports success. The colour writeback twenty lines from its caller
+    /// emits for the analogous condition.
+    #[test]
+    fn every_raw_rows_refusal_names_itself() {
+        use crate::runtime::drain::store_route_count;
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut host = FakeHost::new();
+        let pfn = 0x14u32;
+        let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
+        host.map_range(gpa, 0x4000, 0);
+        let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
+        state.map_surface(7);
+        let m = state.mappings.get_mut(&7).unwrap();
+        m.mapped = true;
+        m.mapping_internal = 1;
+        m.page_entries = vec![entry];
+        assert!(state.set_mapping_geom(7, 4, 2, MTL_FORMAT_BGRA8_UNORM));
+        let rows = vec![0u8; 4 * 2 * 4];
+
+        // A zero dimension is not a rect.
+        let n = store_route_count("surface_write_geometry");
+        assert!(!write_raw_rows(
+            &mut state, &mut host, 7, &rows, 16, 16, 0, 2
+        ));
+        assert_eq!(store_route_count("surface_write_geometry"), n + 1);
+
+        // A source pitch that cannot hold one row.
+        let n = store_route_count("surface_write_source_stride");
+        assert!(!write_raw_rows(&mut state, &mut host, 7, &rows, 4, 16, 4, 2));
+        assert_eq!(store_route_count("surface_write_source_stride"), n + 1);
+
+        // The source ends before the rows it declares.
+        let n = store_route_count("surface_write_source_short");
+        assert!(!write_raw_rows(
+            &mut state,
+            &mut host,
+            7,
+            &rows[..8],
+            16,
+            16,
+            4,
+            2
+        ));
+        assert_eq!(store_route_count("surface_write_source_short"), n + 1);
+
+        // No such mapping.
+        let n = store_route_count("surface_write_mapping_absent");
+        assert!(!write_raw_rows(
+            &mut state, &mut host, 4242, &rows, 16, 16, 4, 2
+        ));
+        assert_eq!(store_route_count("surface_write_mapping_absent"), n + 1);
+
+        // The latched geometry is not this frame's.
+        let n = store_route_count("surface_write_geometry_moved");
+        let big = vec![0u8; 8 * 8 * 4];
+        assert!(!write_raw_rows(
+            &mut state, &mut host, 7, &big, 32, 32, 8, 8
+        ));
+        assert_eq!(store_route_count("surface_write_geometry_moved"), n + 1);
+
+        // Unmapped: there is nowhere to write.
+        let n = store_route_count("surface_write_mapping_not_resident");
+        state.mappings.get_mut(&7).unwrap().mapped = false;
+        assert!(!write_raw_rows(
+            &mut state, &mut host, 7, &rows, 16, 16, 4, 2
+        ));
+        assert_eq!(store_route_count("surface_write_mapping_not_resident"), n + 1);
+    }
+
+    /// Every refusal in `write_rgba8_image_changed` must name itself.
+    ///
+    /// This writeback is the guest's own copy of a rendered frame, and it is
+    /// reached on the live x86/Vulkan sync-store route. Every one of its
+    /// refusals used to be a bare `false`, so a frame the guest never received
+    /// left no trace at all — while the sibling writer in this same file
+    /// answered the identical conditions through `SurfaceWriteRefusal`. The
+    /// vocabulary was already complete; only this arm did not use it.
+    ///
+    /// Asserting on the route slugs rather than on the fail lines is what makes
+    /// this a regression test: `refuse` latches its line per `(check, mapping)`
+    /// but always counts, so a reverted arm shows up as a counter that stops
+    /// moving even on a mapping that has already refused once.
+    #[test]
+    fn every_rgba8_image_changed_refusal_names_itself() {
+        use crate::runtime::drain::store_route_count;
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut host = FakeHost::new();
+        let pfn = 0x14u32;
+        let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
+        host.map_range(gpa, 0x4000, 0);
+        let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
+        state.map_surface(7);
+        let m = state.mappings.get_mut(&7).unwrap();
+        m.mapped = true;
+        m.mapping_internal = 1;
+        m.page_entries = vec![entry];
+        assert!(state.set_mapping_geom(7, 4, 2, MTL_FORMAT_BGRA8_UNORM));
+        let frame = vec![0u8; 4 * 2 * 4];
+
+        // Each case: (slug, the call that must take that arm).
+        let before = |slug: &str| store_route_count(slug);
+
+        // A zero dimension is not a rect.
+        let n = before("surface_write_geometry");
+        assert!(!write_rgba8_image_changed(
+            &mut state, &mut host, 7, &frame, None, 0, 2
+        ));
+        assert_eq!(store_route_count("surface_write_geometry"), n + 1);
+
+        // The source ends before the frame it declares.
+        let n = before("surface_write_source_short");
+        assert!(!write_rgba8_image_changed(
+            &mut state,
+            &mut host,
+            7,
+            &frame[..4],
+            None,
+            4,
+            2
+        ));
+        assert_eq!(store_route_count("surface_write_source_short"), n + 1);
+
+        // The seed ends before it: a different buffer, so a different slug.
+        let n = before("surface_write_seed_short");
+        assert!(!write_rgba8_image_changed(
+            &mut state,
+            &mut host,
+            7,
+            &frame,
+            Some(&frame[..4]),
+            4,
+            2
+        ));
+        assert_eq!(
+            store_route_count("surface_write_seed_short"),
+            n + 1,
+            "a short seed must not be reported as a short source"
+        );
+
+        // No such mapping: the surface went away between the arm and the landing.
+        let n = before("surface_write_mapping_absent");
+        assert!(!write_rgba8_image_changed(
+            &mut state, &mut host, 4242, &frame, None, 4, 2
+        ));
+        assert_eq!(store_route_count("surface_write_mapping_absent"), n + 1);
+
+        // The latched geometry is not the frame's: landing it would skew.
+        let n = before("surface_write_geometry_moved");
+        let big = vec![0u8; 8 * 8 * 4];
+        assert!(!write_rgba8_image_changed(
+            &mut state, &mut host, 7, &big, None, 8, 8
+        ));
+        assert_eq!(store_route_count("surface_write_geometry_moved"), n + 1);
+
+        // Unmapped: there is nowhere to write.
+        let n = before("surface_write_mapping_not_resident");
+        state.mappings.get_mut(&7).unwrap().mapped = false;
+        assert!(!write_rgba8_image_changed(
+            &mut state, &mut host, 7, &frame, None, 4, 2
+        ));
+        assert_eq!(store_route_count("surface_write_mapping_not_resident"), n + 1);
     }
 
     #[test]

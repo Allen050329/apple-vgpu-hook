@@ -37,6 +37,8 @@ fn clear_black_attachment(
         texture_ref,
         resolve_texture_ref: 0,
         level: 0,
+        slice: 0,
+        depth_plane: 0,
         load_action: PASS_LOAD_ACTION_CLEAR,
         store_action: PASS_STORE_ACTION_STORE,
         clear_color: [0.0, 0.0, 0.0, 1.0],
@@ -63,6 +65,7 @@ fn single_rt_draw_request<M: HostMemory + HostOps>(
         3,
         1,
         3,
+        0,
         0,
     )
 }
@@ -437,6 +440,7 @@ fn index_load_failures_report_the_specific_reason() {
 
     // Unsupported MTLIndexType (only 0=u16 / 1=u32 exist).
     let bad_type = IndexedDrawInfo {
+        base_vertex: 0,
         index_type: 5,
         index_count: 3,
         index_buffer_ref: 9,
@@ -450,6 +454,7 @@ fn index_load_failures_report_the_specific_reason() {
     // Valid type + count, but the bound index buffer ref resolves to nothing on
     // an empty state → the entry-missing site, not a generic miss.
     let unresolved = IndexedDrawInfo {
+        base_vertex: 0,
         index_type: 1,
         index_count: 6,
         index_buffer_ref: 9,
@@ -463,7 +468,7 @@ fn index_load_failures_report_the_specific_reason() {
 
 /// Eleven checks, eleven names, one namespace.
 ///
-/// Crate-wide distinctness is `observe::gate`'s job; what this asserts is the
+/// What this asserts is the
 /// *prefix*, because bare names (`out_of_bounds`, `read_fail`) would match
 /// three other rails on a `grep reason=` and the reader could not tell an
 /// index buffer from a blit row.
@@ -1836,6 +1841,44 @@ fn vertex_attribute_preparation_returns_exact_declines() {
             ("value", "9".into()),
         ]
     );
+
+    // A tessellation step rate must not render as an unrecognised value. Both
+    // reach the same `DrawPreparationDecline` variant, so for a long time both
+    // reached the same slug too: that variant returned a fixed string where its
+    // `TranslateReason`-carrying siblings delegate, and the split
+    // `translate::reason` introduced never got as far as the log. The `value`
+    // field was the only thing telling 3 apart from 9, which is exactly what the
+    // second slug exists to stop a reader having to do.
+    //
+    // This is the assertion that would have caught it, and it is deliberately a
+    // comparison of the two rather than a check of one: a fixed string passes
+    // any single-slug assertion.
+    for mtl in [3u32, 4] {
+        attribute.step_function = mtl;
+        let patch = prepare_vertex_step_function(&attribute)
+            .expect_err("a per-patch step rate has no VkVertexInputRate");
+        assert_eq!(
+            patch.slug(),
+            "draw_prepare_vertex_step_function_per_patch",
+            "MTLVertexStepFunction {mtl} is a declared SDK value this backend \
+             recognises and cannot spell in Vulkan, not a value it failed to \
+             recognise"
+        );
+        assert_ne!(
+            patch.slug(),
+            step.slug(),
+            "a tessellation step rate and a corrupt ordinal must not share a \
+             slug; a driven boot's log cannot tell them apart if they do"
+        );
+        assert_eq!(
+            patch.fields(),
+            vec![
+                ("location", "3".into()),
+                ("buffer_index", "2".into()),
+                ("value", mtl.to_string()),
+            ]
+        );
+    }
 }
 
 #[cfg(feature = "backend-vulkan")]
@@ -2008,12 +2051,14 @@ fn mrt_draw_request_load_seed_miss_still_encodes() {
         texture_ref: 42,
         resolve_texture_ref: 0,
         level: 0,
+        slice: 0,
+        depth_plane: 0,
         load_action: PASS_LOAD_ACTION_LOAD,
         store_action: PASS_STORE_ACTION_STORE,
         clear_color: [1.0, 1.0, 1.0, 1.0], // would paint solid white if Clear invented
     };
     let slots = [(0u32, att)];
-    let req = mrt_draw_request(&mut state, &mut host, 1, 1, &slots, &[], 3, 1, 3, 0);
+    let req = mrt_draw_request(&mut state, &mut host, 1, 1, &slots, &[], 3, 1, 3, 0, 0);
     // Archive: seed miss still builds the job (NULL seed). Product must not
     // drop the pass — that freezes lagging dual-mid on stale logo.
     let req = req.expect("Load seed miss must still encode (archive NULL seed)");
@@ -2243,6 +2288,7 @@ fn mrt_draw_request_type8_swizzled_view_rejected_as_color_rt() {
             3,
             1,
             3,
+            0,
             0
         )
         .is_none(),
@@ -2437,6 +2483,7 @@ fn mrt_draw_request_type8_nonzero_level_rejected_as_color_rt() {
             3,
             1,
             3,
+            0,
             0
         )
         .is_none(),
@@ -4447,5 +4494,117 @@ fn type11_sample_resolves_geometry_before_reading_it() {
     assert!(
         state.mappings.get(&mid).expect("mapping").has_geom,
         "the resolve must have latched the descriptor geometry"
+    );
+}
+
+/// A type-4 colour attachment whose mapping carries the decoder's format
+/// refusal must be declined, and every decline must be counted.
+///
+/// `m.format == 0` on a type-4 mapping has exactly one writer,
+/// `apply_type4_backing`, and it means multi-plane or unknown FourCC — a surface
+/// that is not a single-format colour attachment. Inventing BGRA8 from it
+/// describes the wrong stride over the wrong bytes and every downstream window
+/// is built from the answer. The counter has to fire on the refusal and only on
+/// it: one that also fired on ordinary formats would answer a different question
+/// and read identically.
+#[test]
+fn a_type4_render_target_declines_the_decoders_format_refusal() {
+    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::runtime::drain::store_route_count;
+
+    let before = store_route_count("rt_base_fmt_declined");
+    // A format the decoder resolved is passed through untouched and uncounted.
+    assert_eq!(
+        super::rt_type4_base_format(MTL_FORMAT_BGRA8_UNORM, 11),
+        Some(MTL_FORMAT_BGRA8_UNORM)
+    );
+    assert_eq!(store_route_count("rt_base_fmt_declined"), before);
+    // The refusal declines, and is counted per occurrence — the fail line is
+    // deduped per mapping, the counter is not.
+    assert_eq!(super::rt_type4_base_format(0, 11), None);
+    assert_eq!(super::rt_type4_base_format(0, 12), None);
+    assert_eq!(super::rt_type4_base_format(0, 11), None);
+    assert_eq!(store_route_count("rt_base_fmt_declined"), before + 3);
+}
+
+/// A type-5 colour attachment must be scored on whether its view agrees with
+/// the base mapping, and "no view decoded" must not read as agreement.
+///
+/// The resolve takes geometry from the base mapping either way, so the counter
+/// is the only thing that can say whether that is lossless. Folding an
+/// undecoded record into `same` would report the ambiguous case as the healthy
+/// one, which is the failure mode that makes a census worthless.
+#[test]
+fn a_type5_render_target_view_is_scored_against_the_base_it_resolves_through() {
+    use crate::runtime::drain::store_route_count;
+    use crate::runtime::objects::Type5TextureView;
+
+    let base = (64u32, 32u32, 0x50u16);
+    let view = |w, h, fmt| {
+        Some(Type5TextureView {
+            pixel_format: fmt,
+            width: w,
+            height: h,
+            depth: 1,
+            plane_index: 0,
+        })
+    };
+    let (same0, diff0, und0) = (
+        store_route_count("rt_type5_view_same"),
+        store_route_count("rt_type5_view_differs"),
+        store_route_count("rt_type5_view_undecoded"),
+    );
+
+    super::note_rt_type5_view(view(64, 32, 0x50), 5, base);
+    assert_eq!(store_route_count("rt_type5_view_same"), same0 + 1);
+
+    // The live case the contract names: a row-byte-equivalent reinterpretation
+    // at a different width and format over the same bytes.
+    super::note_rt_type5_view(view(16, 32, 0x73), 6, base);
+    assert_eq!(store_route_count("rt_type5_view_differs"), diff0 + 1);
+    // Geometry alone is not the test — a format-only view is still a different
+    // view, and it is the one this resolve would silently render as BGRA8.
+    super::note_rt_type5_view(view(64, 32, 0x73), 7, base);
+    assert_eq!(store_route_count("rt_type5_view_differs"), diff0 + 2);
+
+    super::note_rt_type5_view(None, 8, base);
+    assert_eq!(store_route_count("rt_type5_view_undecoded"), und0 + 1);
+    assert_eq!(
+        store_route_count("rt_type5_view_same"),
+        same0 + 1,
+        "an undecoded record must not be scored as agreement"
+    );
+}
+
+/// The degradation dedupe is keyed by `(pipeline_ref, slug)`, and both encode
+/// arms depend on that being true.
+///
+/// It is what makes a per-draw degradation reportable at all: the depth and
+/// stencil LOAD substitutions sit inside the draw path, so without a first-only
+/// gate the only two options are a flood or the silence the Metal arm had. The
+/// key has to separate slugs as well as pipelines, or one degradation would
+/// mask a different one on the same pipeline — which is the case the Metal arm
+/// hits, since its depth and stencil substitutions can both fire on one pass.
+#[cfg(any(
+    feature = "backend-vulkan",
+    all(feature = "backend-metal", target_os = "macos")
+))]
+#[test]
+fn a_degradation_reports_once_per_pipeline_and_slug() {
+    // Pipeline refs local to this test so a sibling cannot consume the first
+    // fire out from under it — the dedupe set is process-wide by design.
+    let (a, b) = (0x5eed_0001, 0x5eed_0002);
+    assert!(degrade_log_first(a, "depth_load_readback_failed"));
+    assert!(
+        !degrade_log_first(a, "depth_load_readback_failed"),
+        "a repeat of the same degradation on the same pipeline must stay quiet"
+    );
+    assert!(
+        degrade_log_first(a, "stencil_load_readback_failed"),
+        "a different degradation on the same pipeline is a different report"
+    );
+    assert!(
+        degrade_log_first(b, "depth_load_readback_failed"),
+        "the same degradation on a different pipeline is a different report"
     );
 }

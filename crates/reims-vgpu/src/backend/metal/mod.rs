@@ -29,6 +29,8 @@ mod function;
 #[cfg(target_os = "macos")]
 pub(crate) mod mipmap;
 #[cfg(target_os = "macos")]
+pub(crate) mod mtl_enum;
+#[cfg(target_os = "macos")]
 pub(crate) mod raw_metal;
 #[cfg(target_os = "macos")]
 pub(crate) mod render;

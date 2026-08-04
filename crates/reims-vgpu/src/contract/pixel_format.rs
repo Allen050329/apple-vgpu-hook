@@ -71,7 +71,6 @@ pub enum StorageImageSelector {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SampledClass {
-    Unsupported = 0,
     A8Unorm,
     R8Unorm,
     Rg8Unorm,
@@ -1383,6 +1382,82 @@ mod tests {
                     "storage-capable {fmt:#x} is not pinned above"
                 );
             }
+        }
+    }
+
+    /// A [`TexelLayout`]'s width is the width of the guest format it stands for.
+    ///
+    /// The layout enum and the `u16` format table are two vocabularies for one
+    /// fact, and every sampled rail crosses between them: the format decides
+    /// what the guest wrote, the layout decides the stride the host reads it
+    /// at. Nothing compared them, and a disagreement is not a decode error —
+    /// it is rows read at the wrong stride, which produces a sheared image
+    /// rather than a refusal.
+    ///
+    /// The `match` is exhaustive on purpose. A new layout cannot be added
+    /// without naming the guest format it represents, which is the question a
+    /// new variant most needs to answer.
+    #[test]
+    fn a_texel_layout_is_as_wide_as_the_guest_format_it_stands_for() {
+        for layout in [
+            TexelLayout::Rgba8,
+            TexelLayout::Bgra8,
+            TexelLayout::R8,
+            TexelLayout::Rg8,
+            TexelLayout::R16Float,
+            TexelLayout::R32Float,
+        ] {
+            let mtl = match layout {
+                TexelLayout::Rgba8 => MTL_FORMAT_RGBA8_UNORM,
+                TexelLayout::Bgra8 => MTL_FORMAT_BGRA8_UNORM,
+                TexelLayout::R8 => MTL_FORMAT_R8_UNORM,
+                TexelLayout::Rg8 => MTL_FORMAT_RG8_UNORM,
+                TexelLayout::R16Float => MTL_FORMAT_R16_FLOAT,
+                TexelLayout::R32Float => MTL_FORMAT_R32_FLOAT,
+            };
+            assert_eq!(
+                Some(layout.bytes_per_texel()),
+                bytes_per_pixel(mtl),
+                "{layout:?} and its guest format {mtl:#x} disagree on texel width"
+            );
+            // Exactly the four byte-order layouts have a CPU loader class. The
+            // two float ones deliberately do not — `texel_to_rgba8` has no
+            // float arm, which is why they ride a native sampled rail instead,
+            // and `TexelLayout::R16Float`'s own doc says converting them would
+            // quantize the transfer curve. Pinned here because it is an
+            // *absence*, and an absence is what a later "just add the missing
+            // arm" edit removes without noticing what it was for.
+            let expects_loader = !matches!(layout, TexelLayout::R16Float | TexelLayout::R32Float);
+            assert_eq!(
+                sampled_class(mtl).is_some(),
+                expects_loader,
+                "{layout:?} ({mtl:#x}) changed whether the CPU loader claims it"
+            );
+        }
+    }
+
+    /// Four bytes wide is not the same as a four-byte colour order.
+    ///
+    /// [`TexelLayout::is_four_byte_color`] gates the RGBA8-shaped loaders, the
+    /// tight-row gathers and the zero-copy rails, all of which reinterpret the
+    /// four bytes as R,G,B,A. `R32Float` is exactly as wide and is a single
+    /// channel, so admitting it on width would hand a float LUT to a loader
+    /// that swizzles it as colour. The enum's own doc states this; nothing
+    /// checked it.
+    #[test]
+    fn four_bytes_wide_does_not_admit_a_layout_to_the_colour_rails() {
+        for layout in [TexelLayout::Rgba8, TexelLayout::Bgra8] {
+            assert!(layout.is_four_byte_color(), "{layout:?} is a colour order");
+            assert_eq!(layout.bytes_per_texel(), RGBA8_BPP);
+        }
+        assert_eq!(TexelLayout::R32Float.bytes_per_texel(), RGBA8_BPP);
+        assert!(
+            !TexelLayout::R32Float.is_four_byte_color(),
+            "a single-channel float is four bytes wide and is not a colour order"
+        );
+        for layout in [TexelLayout::R8, TexelLayout::Rg8, TexelLayout::R16Float] {
+            assert!(!layout.is_four_byte_color());
+            assert_ne!(layout.bytes_per_texel(), RGBA8_BPP);
         }
     }
 

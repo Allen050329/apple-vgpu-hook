@@ -54,6 +54,17 @@ pub enum DrawReason {
     /// for. That is undefined behaviour a validation layer catches on someone
     /// else's GPU; declining by name is the honest answer.
     SamplerMirrorClampToEdgeUnsupported,
+    /// The guest pipeline names one of `MTLBlendFactor`'s four dual-source
+    /// factors (`Source1Color` .. `OneMinusSource1Alpha`, 15-18) and this device
+    /// does not advertise `VkPhysicalDeviceFeatures::dualSrcBlend`.
+    ///
+    /// These reached no arm at all until the translation table was extended —
+    /// `translate::blend::factor` stopped at 14 and its test asserted 15 was
+    /// past the end of `MTLBlendFactor`, which runs to 18. So a guest asking
+    /// for dual-source blending was refused as an unknown factor on every host,
+    /// including the ones that support it. Now it translates, and only a host
+    /// that genuinely cannot run it declines — here, by name.
+    DualSourceBlendUnsupported,
     /// The device declines this vertex attribute format and no portable
     /// substitute fits. Carries the translation-layer reason so the two log
     /// lines agree on why.
@@ -90,8 +101,6 @@ pub enum DrawReason {
     NoDeviceLocalMemoryForMrtSecondary { memory_type_bits: u32 },
     /// No device-local memory type for a depth attachment image.
     NoDeviceLocalMemoryForDepth { memory_type_bits: u32 },
-    /// No device-local memory type for the writeback difference pass's scratch.
-    NoDeviceLocalMemoryForDiffScratch { memory_type_bits: u32 },
     /// `VK_KHR_swapchain` is not enabled on the engine device.
     SwapchainUnavailable,
     /// The engine's queue family cannot present to the host window's surface.
@@ -116,6 +125,7 @@ impl crate::observe::Decline for DrawReason {
             Self::DepthWithSecondaryAttachments => "depth_with_secondary_attachments",
             Self::SamplerAnisotropyUnsupported => "sampler_anisotropy_unsupported",
             Self::SamplerMirrorClampToEdgeUnsupported => "sampler_mirror_clamp_to_edge_unsupported",
+            Self::DualSourceBlendUnsupported => "dual_source_blend_unsupported",
             // Deliberately delegates: the translation layer already named the
             // exact format problem, and inventing a second slug here would make
             // the two log lines disagree about one event.
@@ -135,9 +145,6 @@ impl crate::observe::Decline for DrawReason {
                 "no_device_local_memory_for_mrt_secondary"
             }
             Self::NoDeviceLocalMemoryForDepth { .. } => "no_device_local_memory_for_depth",
-            Self::NoDeviceLocalMemoryForDiffScratch { .. } => {
-                "no_device_local_memory_for_diff_scratch"
-            }
             Self::SwapchainUnavailable => "swapchain_unavailable",
             Self::QueueCannotPresent { .. } => "queue_cannot_present",
             Self::SwapchainLacksTransferDst => "swapchain_lacks_transfer_dst",
@@ -171,8 +178,7 @@ impl std::fmt::Display for DrawReason {
             | Self::NoDeviceLocalMemoryForStorageImage { memory_type_bits }
             | Self::NoDeviceLocalMemoryForSlab { memory_type_bits }
             | Self::NoDeviceLocalMemoryForMrtSecondary { memory_type_bits }
-            | Self::NoDeviceLocalMemoryForDepth { memory_type_bits }
-            | Self::NoDeviceLocalMemoryForDiffScratch { memory_type_bits } => {
+            | Self::NoDeviceLocalMemoryForDepth { memory_type_bits } => {
                 write!(f, " memory_type_bits={memory_type_bits:#x}")
             }
             Self::QueueCannotPresent { queue_family } => write!(f, " queue_family={queue_family}"),

@@ -379,11 +379,12 @@ impl Drop for DrawTimer {
             ""
         };
         crate::observe::off(format!(
-            "draw_stall us={total} prep_us={} pipeline_us={} stage_us={} stage_pass_us={} \
+            "draw_stall us={} prep_us={} pipeline_us={} stage_us={} stage_pass_us={} \
              acquire_us={} acquire_sampled_us={} sampled_upload_us={} acquire_readback_us={} \
              descriptors_us={} \
              record_us={} submit_us={} wait_us={} readback_us={} geom={w}x{h} \
              readback_bytes={} exit={:?}{latched}",
+            to_us(total),
             to_us(self.ns[Phase::Prep as usize]),
             to_us(self.ns[Phase::Pipeline as usize]),
             to_us(self.ns[Phase::Stage as usize]),

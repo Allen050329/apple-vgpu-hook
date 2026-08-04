@@ -1,0 +1,19 @@
+[package]
+name = "reims-vgpu-wire"
+version = "0.1.0"
+edition = "2021"
+description = "Zero-copy views over the Apple paravirtualized GPU wire format, checked against Apple's own serializer"
+license = "GPL-2.0-or-later"
+
+[lib]
+name = "reims_vgpu_wire"
+
+# No dependencies, on purpose. The crate is `#![no_std]` and allocation-free:
+# a view that needs to allocate is a view that copied, which is the one thing
+# this crate exists to avoid. See AGENTS.md, "Invariants".
+[dependencies]
+
+# Fixture tests only. `tests/` is a separate crate, so nothing here reaches the
+# staticlib QEMU links against.
+[dev-dependencies]
+serde_json = "1"

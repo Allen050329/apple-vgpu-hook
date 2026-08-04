@@ -184,6 +184,31 @@ pub struct PageTablePlan {
     pub page_table_kva: u64,
     pub min_size: u64,
     pub required_pages: u64,
+    /// Whether the `MappingInternal` field this plan did *not* come through was
+    /// populated as well.
+    ///
+    /// [`build_table_plan`] used to chase `+0x48` then `+0xb8`, and `+0x50`
+    /// then `+0x28`, returning the entries of whichever parsed first — the
+    /// classic "try both, keep the one that works" ladder. Two driven arm64
+    /// boots retired it; see that function. This is what is left of the
+    /// measurement, and it stays because it is free: `contract` stays clear of
+    /// the observability dependency, so the fact travels in the plan rather
+    /// than being emitted here.
+    pub candidates: CandidateOutcome,
+}
+
+/// What the unused `MappingInternal` page field held on one successful plan.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CandidateOutcome {
+    /// `+0x50` held a kernel VA as well as `+0x48`, which the plan came
+    /// through.
+    ///
+    /// Measured `true` on every one of 223 successful resolves across two
+    /// driven arm64 workloads, which is *why* the second chase could go: the
+    /// field is populated essentially always, so it never discriminated
+    /// anything. A run where this turned mostly `false` would mean the two
+    /// fields really are two layouts and the deletion was wrong.
+    pub other_field_populated: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -675,7 +700,9 @@ pub fn build_table_plan(
     if st != Status::Ok {
         return Err(st);
     }
-    if !mem.is_kernel_va(fields.page_field_48) && !mem.is_kernel_va(fields.page_field_50) {
+    let field_48_populated = mem.is_kernel_va(fields.page_field_48);
+    let field_50_populated = mem.is_kernel_va(fields.page_field_50);
+    if !field_48_populated && !field_50_populated {
         return Err(Status::ErrInternalFields(
             "iosurface_page_table_fields_invalid",
         ));
@@ -683,81 +710,55 @@ pub fn build_table_plan(
     let required_pages = span_page_count_shift(min_size, page_shift);
     let pages = required_entry_count(fields, min_size, page_shift)?;
 
-    let mut candidates = [0u64; 2];
-    let mut candidate_valid = [false; 2];
-    let mut first_candidate_failure = None;
-    if mem.is_kernel_va(fields.page_field_48) {
-        match read_u64_at(mem, fields.page_field_48, MAPPING_PAGE_TABLE_FROM_F48) {
-            Some(v) if mem.is_kernel_va(v) => {
-                candidates[0] = v;
-                candidate_valid[0] = true;
-            }
-            Some(_) => {
-                first_candidate_failure = Some(Status::ErrNoPageTable(
-                    "iosurface_page_table_pointer_48_invalid",
-                ));
-            }
-            None => {
-                first_candidate_failure = Some(Status::ErrPageTableRead(
-                    "iosurface_page_table_pointer_48_read",
-                ));
-            }
-        }
+    // One chase, `+0x48` then `+0xb8`.
+    //
+    // There used to be a second, `+0x50` then `+0x28`, with the entries of
+    // whichever parsed first being returned — a "try both, keep the one that
+    // works" ladder, which this project refuses on principle but could not
+    // refuse here without evidence, because the alternative reading was that
+    // the two fields are two layouts handled side by side.
+    //
+    // Two driven arm64 boots settled it, over **223 successful resolves** on
+    // deliberately different workloads (Safari plus window drags; Finder view
+    // switching, System Settings panes, Mission Control and window resizes).
+    // Both fields held a kernel VA on every one of them, so the branch really
+    // did choose rather than dispatch — and `+0x48` won every one, with the
+    // second chase never once carrying a resolve that the first had failed.
+    // A branch that chooses, and always chooses the same way, is a fallback.
+    //
+    // What replaces the fallback is loudness. Every way the `+0x48` chase can
+    // fail now reaches `mapper_resolve_fail` under its own slug instead of
+    // being silently rescued by a rail nothing has confirmed, and
+    // [`CandidateOutcome::other_field_populated`] keeps measuring the premise.
+    // The field test above stays: a mapping with only `+0x50` set is still
+    // *detected*, and refused by name rather than resolved through the
+    // unconfirmed path.
+    if !field_48_populated {
+        return Err(Status::ErrNoPageTable("iosurface_page_table_only_field_50"));
     }
-    if mem.is_kernel_va(fields.page_field_50) {
-        match read_u64_at(mem, fields.page_field_50, MAPPING_PAGE_TABLE_FROM_F50) {
-            Some(v) if mem.is_kernel_va(v) => {
-                candidates[1] = v;
-                candidate_valid[1] = true;
-            }
-            Some(_) if first_candidate_failure.is_none() => {
-                first_candidate_failure = Some(Status::ErrNoPageTable(
-                    "iosurface_page_table_pointer_50_invalid",
-                ));
-            }
-            None if first_candidate_failure.is_none() => {
-                first_candidate_failure = Some(Status::ErrPageTableRead(
-                    "iosurface_page_table_pointer_50_read",
-                ));
-            }
-            _ => {}
+    let table_kva = match read_u64_at(mem, fields.page_field_48, MAPPING_PAGE_TABLE_FROM_F48) {
+        Some(v) if mem.is_kernel_va(v) => v,
+        Some(_) => {
+            return Err(Status::ErrNoPageTable(
+                "iosurface_page_table_pointer_48_invalid",
+            ))
         }
-    }
-
-    let mut saw_kernel = false;
-    let mut first_table_failure = None;
-    for i in 0..2 {
-        let table_kva = candidates[i];
-        if !candidate_valid[i] {
-            continue;
+        None => {
+            return Err(Status::ErrPageTableRead(
+                "iosurface_page_table_pointer_48_read",
+            ))
         }
-        saw_kernel = true;
-        match read_table_entries(mem, table_kva, pages, page_shift) {
-            Ok(entries) => {
-                return Ok(PageTablePlan {
-                    entries,
-                    page_table_kva: table_kva,
-                    min_size,
-                    required_pages,
-                });
-            }
-            Err(e) => {
-                if first_table_failure.is_none() {
-                    first_table_failure = Some(e);
-                }
-            }
-        }
-    }
-    if !saw_kernel {
-        return Err(first_candidate_failure.unwrap_or(Status::ErrNoPageTable(
-            "iosurface_page_table_candidate_missing",
-        )));
-    }
-    Err(first_table_failure
-        .or(first_candidate_failure)
-        .unwrap_or(Status::ErrNoPageTable(
-            "iosurface_page_table_failure_unattributed",
-        )))
+    };
+    let entries = read_table_entries(mem, table_kva, pages, page_shift)?;
+    Ok(PageTablePlan {
+        entries,
+        page_table_kva: table_kva,
+        min_size,
+        required_pages,
+        candidates: CandidateOutcome {
+            other_field_populated: field_50_populated,
+        },
+    })
 }
 
 #[cfg(test)]
@@ -834,18 +835,24 @@ mod tests {
         );
     }
 
+    /// An unreadable `+0x48` pointer is refused by its own name, however good
+    /// the other field looks.
+    ///
+    /// This case used to be the interesting one for a different reason: with
+    /// two candidates the question was which failure to *attribute* the refusal
+    /// to, and the answer was "the candidate actually walked". With one
+    /// candidate there is nothing to outrank, and the case becomes the alarm
+    /// instead. A well-formed table sits behind `+0x50` here and this device
+    /// deliberately does not go and get it, so if a driven arm64 boot ever
+    /// shows this slug the deletion of that chase is what to reconsider.
     #[test]
-    fn table_entry_failure_outranks_an_unreadable_alternative_pointer() {
+    fn an_unreadable_chased_pointer_is_refused_by_its_own_name() {
         let internal = ARM_KERNEL_VA_BASE + 0x10_000;
         let field_48 = ARM_KERNEL_VA_BASE + 0x20_000;
         let field_50 = ARM_KERNEL_VA_BASE + 0x30_000;
         let table = ARM_KERNEL_VA_BASE + 0x40_000;
         let mut mem = MapMem::new();
 
-        // The 0x48 candidate is unreadable. The 0x50 candidate resolves to a
-        // real table, whose first entry is invalid. The result must describe
-        // the candidate that was actually walked, not the irrelevant earlier
-        // pointer read.
         mem.put_u64(field_50 + MAPPING_PAGE_TABLE_FROM_F50, table);
         mem.put_u32(table, 0);
         let fields = MapperInternalFields {
@@ -860,7 +867,114 @@ mod tests {
 
         let error =
             build_table_plan(&mem, 3, &fields, PAGE_SIZE_ARM64E, PAGE_SHIFT_ARM64E).unwrap_err();
-        assert_eq!(error.refusal(), Some("iosurface_page_table_entry_invalid"));
+        assert_eq!(
+            error.refusal(),
+            Some("iosurface_page_table_pointer_48_read")
+        );
+    }
+
+    /// The page table comes through `+0x48` or it does not come at all.
+    ///
+    /// The `+0x50` chase that used to stand behind it was retired on 223
+    /// successful resolves across two driven arm64 workloads, on which both
+    /// fields were always populated and `+0x48` always won. The two cases that
+    /// used to be rescued by it are now refusals **by name**, which is the
+    /// whole trade: a rail nothing has confirmed no longer answers silently,
+    /// and if either refusal ever appears in a driven boot's log it says the
+    /// deletion was wrong and names which reading was right.
+    #[test]
+    fn the_page_table_comes_through_field_48_or_is_refused_by_name() {
+        let internal = ARM_KERNEL_VA_BASE + 0x10_000;
+        let field_48 = ARM_KERNEL_VA_BASE + 0x20_000;
+        let field_50 = ARM_KERNEL_VA_BASE + 0x30_000;
+        let table_a = ARM_KERNEL_VA_BASE + 0x40_000;
+        let table_b = ARM_KERNEL_VA_BASE + 0x50_000;
+        let good_entry = 1u32; // frame 1, which `entry_gpa_shift` accepts
+        let base = |page_field_48, page_field_50| MapperInternalFields {
+            internal_kva: internal,
+            mapping_id: 3,
+            internal_size: MAPPING_INTERNAL_EXPECTED_SIZE,
+            page_field_48,
+            page_field_50,
+            raw_page_count: 1,
+            ..MapperInternalFields::default()
+        };
+
+        // Only `+0x48` populated: a plan, and the census says the other field
+        // was empty. On the two measured workloads this never happened.
+        let mut mem = MapMem::new();
+        mem.put_u64(field_48 + MAPPING_PAGE_TABLE_FROM_F48, table_a);
+        mem.put_u32(table_a, good_entry);
+        let plan = build_table_plan(
+            &mem,
+            3,
+            &base(field_48, 0),
+            PAGE_SIZE_ARM64E,
+            PAGE_SHIFT_ARM64E,
+        )
+        .expect("the chased field alone is a plan");
+        assert_eq!(plan.page_table_kva, table_a);
+        assert!(!plan.candidates.other_field_populated);
+
+        // Both populated and both parseable: the plan comes through `+0x48`,
+        // and `table_b` is never read. This is the shape all 223 measured
+        // resolves had.
+        let mut mem = MapMem::new();
+        mem.put_u64(field_48 + MAPPING_PAGE_TABLE_FROM_F48, table_a);
+        mem.put_u64(field_50 + MAPPING_PAGE_TABLE_FROM_F50, table_b);
+        mem.put_u32(table_a, good_entry);
+        mem.put_u32(table_b, good_entry);
+        let plan = build_table_plan(
+            &mem,
+            3,
+            &base(field_48, field_50),
+            PAGE_SIZE_ARM64E,
+            PAGE_SHIFT_ARM64E,
+        )
+        .expect("both good is a plan");
+        assert_eq!(plan.page_table_kva, table_a, "the chase is `+0x48`");
+        assert!(plan.candidates.other_field_populated);
+
+        // Only `+0x50` populated. The field test still sees it — this is not
+        // `iosurface_page_table_fields_invalid` — but the chase that used to
+        // answer it is gone, so it is refused under a name that says exactly
+        // which reading of the two fields it would take to make that wrong.
+        let mut mem = MapMem::new();
+        mem.put_u64(field_50 + MAPPING_PAGE_TABLE_FROM_F50, table_b);
+        mem.put_u32(table_b, good_entry);
+        let error = build_table_plan(
+            &mem,
+            3,
+            &base(0, field_50),
+            PAGE_SIZE_ARM64E,
+            PAGE_SHIFT_ARM64E,
+        )
+        .expect_err("the deleted chase does not answer this");
+        assert_eq!(error.refusal(), Some("iosurface_page_table_only_field_50"));
+
+        // Both populated, `+0x48`'s table unparseable. This is the one shape
+        // the fallback was ever load-bearing for, and `earlier_failed` read
+        // zero over both driven boots — so it is now a refusal carrying the
+        // reason the table failed, rather than a silent rescue.
+        let mut mem = MapMem::new();
+        mem.put_u64(field_48 + MAPPING_PAGE_TABLE_FROM_F48, table_a);
+        mem.put_u64(field_50 + MAPPING_PAGE_TABLE_FROM_F50, table_b);
+        mem.put_u32(table_a, 0); // a zero entry is refused
+        mem.put_u32(table_b, good_entry);
+        let error = build_table_plan(
+            &mem,
+            3,
+            &base(field_48, field_50),
+            PAGE_SIZE_ARM64E,
+            PAGE_SHIFT_ARM64E,
+        )
+        .expect_err("no second candidate rescues this any more");
+        assert_eq!(
+            error.refusal(),
+            Some("iosurface_page_table_entry_invalid"),
+            "the refusal names why the chased table failed, not that a \
+             fallback was missing"
+        );
     }
 
     #[test]

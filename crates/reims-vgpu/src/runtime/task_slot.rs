@@ -10,36 +10,31 @@
 //! `CmdExecIndirect2` (`0x35`), `CmdGetComputeInfo` (`0x3b`) and
 //! `CmdHeapTextureSizeAndAlign` — one resolver spelled three times, so a reading
 //! taken at one site said nothing about the other two. They are one function
-//! here, and that function carries the census.
+//! here, and that function carries the refusal.
 //!
-//! # Which space each word is in, and how that is decided
+//! # Which space each word is in
 //!
-//! `DefineTask2` (`0x38`) registers a task under `raw >> 1`
-//! ([`crate::model::DEFINE_TASK_ID_SHIFT`]); every other opcode measured so far
-//! reads its task word **unshifted**. Nothing decodes the word canonically, so
-//! for each opcode the open question is which space its word is in, and the way
-//! to settle it is to read the *set* of words that opcode actually receives.
+//! The word is a slot id. Only `DefineTask2` (`0x38`) carries the doubled form,
+//! registering under `raw >> 1` ([`crate::model::DEFINE_TASK_ID_SHIFT`]); every
+//! other opcode names the slot directly, so halving one of their words names a
+//! **different task**.
 //!
-//! The `DefineTask2` wire space, enumerated over a full x86/Vulkan boot for
-//! slots 0–12, is `0x1, 0x2, 0x4, 0x6, 0x8, 0xa … 0x18`: one odd value — `0x1`,
-//! for slot 0 — and then strictly even. So the argument has to be "odd **and
-//! greater than one**", not merely "odd"; the doubled space does produce exactly
-//! one odd word and a looser reading of the same numbers would have proved the
-//! opposite of what they say.
+//! The `DefineTask2` wire space is `(slot << 1) | is_kernel_task`. Enumerated
+//! over a full x86/Vulkan boot for slots 0–12 it reads `0x1, 0x2, 0x4, 0x6,
+//! 0x8, 0xa … 0x18`: exactly one odd word — `0x1`, the kernel task, whose slot
+//! id is 0 — and then strictly even. So the discriminator is "odd **and greater
+//! than one**", not merely "odd"; a looser reading of the same numbers would
+//! have proved the opposite of what they say.
 //!
-//! `exec_indirect2` receives `0x5`, `0x7` and `0x9`, which that space does not
-//! contain, so its word is a slot id. `MapMemory2` files spans under `0x5`,
-//! `0x7`, `0x9` for the same reason. The two decodes agree, and both are slot
-//! ids, so halving either one names a **different task**.
+//! `exec_indirect2` receives `0x5`, `0x7` and `0x9`, and `MapMemory2` files
+//! spans under the same three. All are odd and greater than one, so that space
+//! does not contain them and they are slot ids.
 //!
-//! Slots run densely from 0, so for almost any word `n` the slot `n >> 1` is
-//! *also* live and a raw-first resolver wins by position rather than by
-//! evidence. Counting how often a fallback arm *ran* cannot see that — it is a
-//! property of `tasks[]` at the instant of the decode, so it is read from the
-//! table, and the four-arm partition below is what makes both readings legible
-//! at once.
+//! This resolver therefore does not consider `raw >> 1` at all. Slots run
+//! densely from 0, so `raw >> 1` is usually *also* live — that is a dense table,
+//! not an ambiguity, and there is nothing for a census to decide.
 
-use crate::model::{TaskEntry, DEFINE_TASK_ID_SHIFT};
+use crate::model::TaskEntry;
 
 /// Which command carried the task word. Distinguishes otherwise identical
 /// decodes so a per-site set difference is possible.
@@ -63,29 +58,21 @@ impl TaskWordSite {
     }
 }
 
-/// How the wire word resolved against the task table. A total partition of the
-/// four ways the two candidate slots can be live, so the union of the four
-/// slugs' `raw=` values is the complete set of words a site received.
+/// The word named no live slot, so the resolver has no answer and the caller
+/// refuses.
+///
+/// The only outcome worth naming. Whether `word >> 1` also happens to be live
+/// used to be split out alongside this, on the reading that it might be the
+/// intended task; it is not, so a live word is simply the answer and a dead one
+/// is this.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TaskWordDecode {
-    /// The word named a live slot and `word >> 1` did not. Unambiguous.
-    Direct,
-    /// The word named a live slot and so did `word >> 1`. Raw-first won by
-    /// position: had the guest meant the shifted slot, nothing here could tell.
-    Ambiguous,
-    /// The word named no live slot and `word >> 1` did. The fallback arm is the
-    /// only thing that produced an answer.
-    Shifted,
-    /// Neither slot is live. The resolver has no answer and the caller refuses.
     Dead,
 }
 
 impl crate::observe::Decline for TaskWordDecode {
     fn slug(&self) -> &'static str {
         match self {
-            Self::Direct => "cmd_task_direct",
-            Self::Ambiguous => "cmd_task_ambiguous",
-            Self::Shifted => "cmd_task_shifted",
             Self::Dead => "cmd_task_dead",
         }
     }
@@ -100,21 +87,10 @@ fn slot_live(tasks: &[TaskEntry], id: u32) -> bool {
 /// or nothing.**
 ///
 /// This used to fall back to `raw >> 1` when the word named no live slot. That
-/// arm was censused over two x86/Vulkan boots and **decided zero times** at both
-/// sites the guest exercised, while `Direct` also never fired — so every decode
-/// on those boots was ambiguous and the raw-first arm won by position on all of
-/// them, never on evidence.
-///
-/// Both readings point the same way. Dead, it costs nothing to remove. Live, it
-/// could not have failed safely: slots run densely from 0, so `raw >> 1` is
-/// almost always some *other* live task, and this returned that task's slot
-/// rather than refusing. `CmdExecIndirect2` then runs a whole command stream —
-/// including guest writes — against page tables the named task does not own.
-///
-/// The word set the guest actually sent says the fallback is wrong on the
-/// contract too, not merely unexercised: `exec_indirect2` received `0x5`, `0x7`
-/// and `0x9`, which the `DefineTask2` wire space (`0x1`, then strictly even) does
-/// not contain, so the word is a slot id and halving it names a different task.
+/// could not fail safely: slots run densely from 0, so `raw >> 1` is almost
+/// always some *other* live task, and returning its slot rather than refusing
+/// means `CmdExecIndirect2` runs a whole command stream — including guest
+/// writes — against page tables the named task does not own.
 ///
 /// Returning `None` is what makes that case visible: each caller turns it into
 /// its own always-on refusal rather than a plausible wrong answer nothing sees.
@@ -124,24 +100,18 @@ fn slot_live(tasks: &[TaskEntry], id: u32) -> bool {
 /// every decode would make the probe cost scale with the traffic it measures.
 pub(crate) fn resolve_task_word(tasks: &[TaskEntry], site: TaskWordSite, raw: u32) -> Option<u32> {
     use crate::observe::Decline;
-    let shifted = raw >> DEFINE_TASK_ID_SHIFT;
-    let raw_live = slot_live(tasks, raw);
-    let shifted_live = shifted != raw && slot_live(tasks, shifted);
-    let decode = match (raw_live, shifted_live) {
-        (true, false) => TaskWordDecode::Direct,
-        (true, true) => TaskWordDecode::Ambiguous,
-        (false, true) => TaskWordDecode::Shifted,
-        (false, false) => TaskWordDecode::Dead,
-    };
+    if slot_live(tasks, raw) {
+        return Some(raw);
+    }
+    let decode = TaskWordDecode::Dead;
     let discriminant = ((site as u64) << 32) | u64::from(raw);
     if crate::observe::first_sight(decode.slug(), discriminant) {
         crate::observe::Emit::decline("cmd_task", &decode)
             .field("site", site.name())
             .field("raw", format!("{raw:#x}"))
-            .field("shifted", shifted)
             .fail();
     }
-    raw_live.then_some(raw)
+    None
 }
 
 #[cfg(test)]
@@ -156,28 +126,7 @@ mod tests {
         tasks
     }
 
-    /// The four ways the two candidate slots can be live are a partition, and
-    /// each one names itself. A census that collapsed any two of them could not
-    /// answer "was raw-first forced, or did it merely win the race".
-    #[test]
-    fn every_way_the_two_candidate_slots_can_be_live_has_its_own_name() {
-        use crate::observe::Decline;
-        let seen: Vec<&str> = [
-            TaskWordDecode::Direct,
-            TaskWordDecode::Ambiguous,
-            TaskWordDecode::Shifted,
-            TaskWordDecode::Dead,
-        ]
-        .iter()
-        .map(|d| d.slug())
-        .collect();
-        let mut uniq = seen.clone();
-        uniq.sort_unstable();
-        uniq.dedup();
-        assert_eq!(seen.len(), uniq.len(), "two decodes share a slug: {seen:?}");
-    }
-
-    /// Slot 5 live, slot 2 not: only one candidate, raw-first is not a choice.
+    /// Slot 5 live, slot 2 not.
     #[test]
     fn a_word_whose_shifted_slot_is_dead_resolves_directly() {
         let tasks = table(&[5]);
@@ -187,11 +136,12 @@ mod tests {
         );
     }
 
-    /// Slots 3 and 6 both live: the guest sent `6`, we act on `6`, and slot 3 is
-    /// equally available. This is the case the census exists to count — the
-    /// resolver cannot distinguish it from the previous one on its own.
+    /// Slots 3 and 6 both live: the guest sent `6` and `6` is what it meant.
+    /// Slot 3 being live too is a dense task table, not a second candidate —
+    /// only `DefineTask2` carries the doubled form, so nothing here may read
+    /// `6 >> 1` as an alternative reading of this word.
     #[test]
-    fn a_word_whose_shifted_slot_is_also_live_still_resolves_raw_first() {
+    fn a_live_shifted_slot_is_not_a_second_candidate() {
         let tasks = table(&[3, 6]);
         assert_eq!(
             resolve_task_word(&tasks, TaskWordSite::ExecIndirect2, 6),
@@ -221,10 +171,10 @@ mod tests {
         );
     }
 
-    /// Word 0 shifts to itself, so there is no second candidate and the decode
-    /// must not report an ambiguity against its own slot.
+    /// Slot 0 is a real task — the kernel task's id is 0 — so word 0 resolves
+    /// like any other rather than reading as "unset".
     #[test]
-    fn word_zero_has_no_second_candidate() {
+    fn word_zero_resolves_to_the_live_slot_zero() {
         let tasks = table(&[0]);
         assert_eq!(
             resolve_task_word(&tasks, TaskWordSite::ExecIndirect2, 0),

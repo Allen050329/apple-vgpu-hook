@@ -31,7 +31,7 @@ struct ThrashState {
     ///
     /// A post-**ack** display IRQ raised while the shared-page ONLINE bit (bit2)
     /// was still pending makes the guest re-read it and re-run `process_online`
-    /// → `connectionChange` → boot-progress overlay rebuild (x86 RE 2026-07-17)
+    /// → `connectionChange` → boot-progress overlay rebuild
     /// — the host-driven strobe source the RE named ("re-signals bit2 every
     /// frame"). This is a first-occurrence alarm, not a rate: the line says the
     /// class happened at all, which is the whole question, and it has never
@@ -319,7 +319,7 @@ pub mod window_publish {
 /// Record that a post-ack display IRQ (`src` = vbl|present) was raised while the
 /// shared-page ONLINE bit (bit2) was still pending — meaning the guest will
 /// re-dispatch `process_online` → `connectionChange` and re-composite the
-/// boot-progress overlay (x86 RE 2026-07-17: the host-driven strobe source).
+/// boot-progress overlay (the host-driven strobe source).
 ///
 /// Emits an always-on line the **first** time per boot and stays silent
 /// afterwards: VBL runs ~60 Hz, so a per-call line would flood. Measure-only;

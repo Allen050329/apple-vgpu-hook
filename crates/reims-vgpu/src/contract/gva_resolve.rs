@@ -2,6 +2,8 @@
 
 use crate::contract::endian::ld32;
 use crate::contract::gva::*;
+use reims_vgpu_wire::mem as wire_mem;
+use reims_vgpu_wire::page_table as wire_page_table;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Geometry {
@@ -190,6 +192,53 @@ pub trait PhysReader {
     fn read_phys(&self, gpa: u64, dst: &mut [u8]) -> bool;
 }
 
+/// Presents a [`PhysReader`] as the wire crate's guest-memory seam.
+///
+/// Deliberately borrows rather than owns, and implements only `read_at`: a
+/// `PhysReader` cannot hand back a borrow of guest bytes, so the default
+/// `slice_at` — which refuses every borrow — is the correct behaviour and not
+/// an omission.
+struct PhysAsGuestMemory<'a>(&'a dyn PhysReader);
+
+impl wire_mem::GuestMemory for PhysAsGuestMemory<'_> {
+    fn read_at(&self, addr: u64, out: &mut [u8]) -> bool {
+        self.0.read_phys(addr, out)
+    }
+}
+
+/// This module's geometry as the wire crate's.
+///
+/// The wire crate derives fan-out, masks and page size from the page shift
+/// because a node is one page of four-byte entries. This module carries them as
+/// separate fields and [`validate_geometry`] checks they agree, so the
+/// conversion drops the derived ones rather than translating them.
+fn wire_geometry(geometry: &Geometry) -> wire_page_table::Geometry {
+    wire_page_table::Geometry {
+        page_shift: geometry.page_shift,
+        max_depth: geometry.max_depth,
+    }
+}
+
+/// Wire walk failures as this device's typed refusals.
+///
+/// The names differ in one place worth stating: the wire crate calls a zero
+/// entry `NotPresent`, because Apple's builder writes zero for absent. This
+/// device calls the same thing `ErrZeroPfn` and reports it as `gva_zero_pfn`,
+/// which is the guest saying "not mapped here" rather than a device defect. The
+/// slug is unchanged so the fail log reads the same.
+fn resolve_status_of(error: wire_page_table::WalkError) -> ResolveStatus {
+    use wire_page_table::WalkError as W;
+    match error {
+        W::UnsupportedGeometry => ResolveStatus::ErrUnsupportedGeometry,
+        W::ZeroRootPfn => ResolveStatus::ErrZeroRootPfn,
+        W::ZeroDepth => ResolveStatus::ErrZeroDepth,
+        W::DepthTooDeep => ResolveStatus::ErrDepthTooDeep,
+        W::TableRead => ResolveStatus::ErrPageTableRead,
+        W::NotPresent => ResolveStatus::ErrZeroPfn,
+        W::MalformedPte => ResolveStatus::ErrMalformedPte,
+    }
+}
+
 pub fn resolve_status_name(status: ResolveStatus) -> &'static str {
     match status {
         ResolveStatus::Ok => "ok",
@@ -373,44 +422,40 @@ pub fn translate_root(
         CacheStatus::Miss
     };
 
-    // Every level reads one PTE the same way and descends into the PFN it
-    // names; the PFN the last level names is the leaf. `depth` is in `1..=4`
-    // here, so the loop always runs at least once and `current_pfn` after it is
-    // always a PFN some PTE supplied, never `root_pfn`.
+    // The descent itself lives in `reims_vgpu_wire::page_table`, which owns the
+    // format. Keeping it there means there is one declaration rather than two
+    // that could drift apart silently, and the tree walk gets exercised by that
+    // crate's tests as well as by this module's.
+    //
+    // What stays here is everything that is not byte interpretation: the
+    // translation cache above, and the typed refusal statuses below that the
+    // device's failure channel reports.
     let page_index = out.gva_page_index;
-    let mut current_pfn = root_pfn;
-    for level in 0..depth {
-        let shift = (depth - 1 - level) * geometry.index_bits;
-        let entry_idx = ((page_index >> shift) & geometry.index_mask as u64) as u32;
-        let table_gpa = pfn_to_gpa(current_pfn, geometry.page_shift);
-        let pte_gpa = table_gpa + (entry_idx as u64) * (geometry.pte_size as u64);
-        out.level = level;
-        out.entry_index = entry_idx;
-        let pte = match read_u32_phys(reader, pte_gpa) {
-            Some(v) => v,
-            None => {
-                out.status = ResolveStatus::ErrPageTableRead;
-                return out;
-            }
-        };
-        out.raw_pte = pte;
-        let next_pfn = pte & geometry.pte_pfn_mask;
-        if next_pfn == 0 {
-            out.status = if pte == 0 {
-                ResolveStatus::ErrZeroPfn
-            } else {
-                ResolveStatus::ErrMalformedPte
-            };
+    let mem = PhysAsGuestMemory(reader);
+    let walked = wire_page_table::walk(&mem, wire_geometry(geometry), root_pfn, depth, gva);
+
+    let w = match walked {
+        Ok(w) => w,
+        Err(f) => {
+            out.level = f.level;
+            out.entry_index = f.entry_index;
+            out.raw_pte = f.raw_pte;
+            out.status = resolve_status_of(f.error);
             return out;
         }
-        current_pfn = next_pfn;
-    }
+    };
 
-    let gpa_page = pfn_to_gpa(current_pfn, geometry.page_shift);
+    // On success the walker reports the deepest level it read, which is where
+    // the loop this replaced left these fields.
+    out.level = depth - 1;
+    out.entry_index = (page_index & geometry.index_mask as u64) as u32;
+    out.raw_pte = w.raw_pte;
+    let gpa_page = w.addr_page;
     out.status = ResolveStatus::Ok;
-    out.leaf_pfn = current_pfn;
+    out.leaf_pfn = w.leaf_pfn;
     out.gpa_page = gpa_page;
     out.gpa = gpa_page + page_off;
+    debug_assert_eq!(out.gpa, w.addr);
     if let Some(c) = cache {
         cache_insert(c, geometry, root_pfn, depth, page_index, gpa_page);
         out.cache_status = CacheStatus::MissInserted;

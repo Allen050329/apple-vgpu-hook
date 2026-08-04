@@ -1,10 +1,20 @@
+//! Vulkan-backend half of the [`super`] draw encode path: sampled-source
+//! resolution, zero-copy load paths, metal2vulkan draw submission, and the
+//! deferred GVA/surface store windows.
+//!
+//! The whole module is gated on `backend-vulkan` at its declaration in
+//! [`super`], which also re-exports these items flat so callers keep addressing
+//! them as `crate::runtime::metal_draw::<name>`. `use super::*` pulls in the
+//! parent's imports, which this half shares.
+
+use super::*;
+
 /// Vulkan image shape for a reflected Metal sampled-image dimensionality.
 ///
 /// The engine caps array layers at 1 (a single-layer array is still a distinct
 /// descriptor type from a plain 2D image), so array shapes report `layers = 1`
 /// and a genuinely multi-layer source declines on its byte length rather than
 /// binding a truncated array.
-#[cfg(feature = "backend-vulkan")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SampledImageShape {
     arrayed: bool,
@@ -18,7 +28,6 @@ struct SampledImageShape {
 /// shape the sampled-draw path builds. `None` is a shape the path cannot yet
 /// express (`Cube` / `CubeArray`); the caller declines it by name so the gap
 /// stays visible instead of binding the wrong view type.
-#[cfg(feature = "backend-vulkan")]
 fn sampled_image_shape(
     kind: crate::runtime::spirv_bind::SampledImageKind,
 ) -> Option<SampledImageShape> {
@@ -40,7 +49,6 @@ fn sampled_image_shape(
     })
 }
 
-#[cfg(feature = "backend-vulkan")]
 pub fn encode_draw_and_writeback<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -56,7 +64,6 @@ pub fn encode_draw_and_writeback<M: HostMemory + HostOps>(
 /// encode** and return color0 for chaining — returning `NoMetal` when
 /// `!writeback_guest` aborted every multi-draw stream after the first
 /// record (live `draw_fail_clear_fallback nometal=1` on clear+draw packets).
-#[cfg(feature = "backend-vulkan")]
 pub fn encode_draw_chain<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -653,8 +660,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
 }
 
 /// Sampled texture source + geometry for an engine draw.
-#[cfg(feature = "backend-vulkan")]
-enum SampledSourceRequest {
+pub(super) enum SampledSourceRequest {
     /// Shared texel bytes + optional producer identity (see
     /// [`LinearSampleIdentity`]) + the byte layout of those texels; the Arc lets
     /// memoized repeat binds skip the per-draw copy and the engine skip
@@ -699,14 +705,12 @@ enum SampledSourceRequest {
 /// of them — a device-global counter, never per-entry — so a `(key, generation)`
 /// pair names one content for the life of the device and content cannot alias
 /// even if two producers did collide on a key.
-#[cfg(feature = "backend-vulkan")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct LinearSampleIdentity {
-    key: u64,
-    generation: u64,
+pub(super) struct LinearSampleIdentity {
+    pub(super) key: u64,
+    pub(super) generation: u64,
 }
 
-#[cfg(feature = "backend-vulkan")]
 impl From<crate::runtime::gather_witness::GatheredIdentity> for LinearSampleIdentity {
     /// The zero-copy gather rail's key is a hash of the window's name rather
     /// than a bit-namespaced id like the four rows above, so it can collide with
@@ -722,7 +726,6 @@ impl From<crate::runtime::gather_witness::GatheredIdentity> for LinearSampleIden
     }
 }
 
-#[cfg(feature = "backend-vulkan")]
 type LoadedType5View = (
     u32,
     u32,
@@ -730,7 +733,6 @@ type LoadedType5View = (
     LinearSampleIdentity,
     TexelLayout,
 );
-#[cfg(feature = "backend-vulkan")]
 type LoadedLinearSample = (
     u32,
     u32,
@@ -746,9 +748,8 @@ type LoadedLinearSample = (
 /// carry the prior draw in `target_seed_rgba`; reloading guest pages here would
 /// expose the pre-pass image to the shader even though attachment Load sees the
 /// chained image.
-#[cfg(feature = "backend-vulkan")]
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum AttachmentAliasSample<'a> {
+pub(super) enum AttachmentAliasSample<'a> {
     Clear([f64; 4]),
     Seed(&'a [u8]),
     /// Records 2+ of a resident GVA chain: the prior record's content lives
@@ -757,8 +758,7 @@ enum AttachmentAliasSample<'a> {
     ResidentChain,
 }
 
-#[cfg(feature = "backend-vulkan")]
-fn fragment_attachment_alias_sample<'a>(
+pub(super) fn fragment_attachment_alias_sample<'a>(
     req: &'a DrawEncodeRequest,
     texture_index: u32,
     texture_ref: u32,
@@ -804,8 +804,7 @@ fn fragment_attachment_alias_sample<'a>(
 /// geometry equals the window geometry, and the same storage-family gate that
 /// would let the post-flush cache layer serve this object type accepts it. Any
 /// mismatch must land the window (flush path) instead.
-#[cfg(feature = "backend-vulkan")]
-fn deferred_gva_sample_eligible(
+pub(super) fn deferred_gva_sample_eligible(
     win: &crate::model::GvaDeferredEntry,
     desc_width: u32,
     desc_height: u32,
@@ -826,7 +825,6 @@ fn deferred_gva_sample_eligible(
 /// gate would accept the layer. Mismatches fall through to the flush path.
 /// The window stays armed: the contract Store still lands on first guest
 /// access, and the resident stays authoritative for further samples.
-#[cfg(feature = "backend-vulkan")]
 fn try_sample_deferred_gva<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -943,8 +941,7 @@ fn try_sample_deferred_gva<M: HostMemory + HostOps>(
 ///   both page-reading rungs, so nothing below would have corrected it. Two
 ///   uncorrected stale binds on a repainted surface is the "renders correctly
 ///   for a few frames, then stays corrupted" report.
-#[cfg(feature = "backend-vulkan")]
-fn resolve_sampled_source<M: HostMemory + HostOps>(
+pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
@@ -1367,9 +1364,8 @@ fn resolve_sampled_source<M: HostMemory + HostOps>(
     ))
 }
 
-#[cfg(feature = "backend-vulkan")]
 #[inline]
-fn type5_view_requires_materialization(
+pub(super) fn type5_view_requires_materialization(
     base_has_geom: bool,
     base_width: u32,
     base_height: u32,
@@ -1386,7 +1382,6 @@ fn type5_view_requires_materialization(
 
 /// The decoded device-surface fields a failed sample-window derivation dumps
 /// for diagnosis: `(width, height, pixel_format, bytes_per_row, alloc_size)`.
-#[cfg(feature = "backend-vulkan")]
 type SampleWindowDesc = (u32, u32, u32, u32, u32);
 
 /// Why the type-5 serialized-view loader refused to materialize a plane.
@@ -1400,10 +1395,9 @@ type SampleWindowDesc = (u32, u32, u32, u32, u32);
 /// capture, guest-page import and this loader — that the last present-rail
 /// migration recorded as still sharing the word. The `type5_view_` prefix keeps
 /// `grep reason=type5_view_…` answerable against the copy path that shares the
-/// surface; crate-wide distinctness is `observe::gate`'s job.
-#[cfg(feature = "backend-vulkan")]
+/// surface.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Type5ViewDecline {
+pub(super) enum Type5ViewDecline {
     /// The serialized view is volumetric; only `depth == 1` planes materialize.
     UnsupportedDepth { depth: u32 },
     /// The mapping's page table is not resident for scanout.
@@ -1451,7 +1445,6 @@ enum Type5ViewDecline {
     Convert { row: usize, bpp: u32 },
 }
 
-#[cfg(feature = "backend-vulkan")]
 impl crate::observe::Decline for Type5ViewDecline {
     fn slug(&self) -> &'static str {
         match self {
@@ -1550,7 +1543,6 @@ impl crate::observe::Decline for Type5ViewDecline {
 /// always-on channel. Measured on one x86/Vulkan boot before the guest-pages rung
 /// existed: **121 distinct (mapping, geometry) wipes** in ~170 s, four of them at
 /// the full 1920x1080 composite extent, against 0 in the idle phase.
-#[cfg(feature = "backend-vulkan")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Type11SeedDecline {
     /// The cache holds no entry for this mapping id and the mapping's own pages
@@ -1584,7 +1576,6 @@ enum Type11SeedDecline {
     CededToResident,
 }
 
-#[cfg(feature = "backend-vulkan")]
 impl crate::observe::Decline for Type11SeedDecline {
     fn slug(&self) -> &'static str {
         match self {
@@ -1604,7 +1595,6 @@ impl crate::observe::Decline for Type11SeedDecline {
 
 /// Which rung of the type-11 `LOAD` seed ladder produced the attachment's prior
 /// contents.
-#[cfg(feature = "backend-vulkan")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Type11SeedRung {
     /// The host render cache held this mapping at exactly this geometry.
@@ -1613,7 +1603,6 @@ enum Type11SeedRung {
     GuestPages,
 }
 
-#[cfg(feature = "backend-vulkan")]
 impl Type11SeedRung {
     fn name(self) -> &'static str {
         match self {
@@ -1641,7 +1630,6 @@ impl Type11SeedRung {
 /// The mapping's own latched geometry and generation ride along on every arm:
 /// `want == mapgeom` is the condition under which the guest-pages rung can serve
 /// at all, so the pair says whether a miss was recoverable.
-#[cfg(feature = "backend-vulkan")]
 fn note_type11_load_seed(
     state: &DeviceState,
     mapping_id: u32,
@@ -1731,7 +1719,6 @@ fn note_type11_load_seed(
 ///
 /// `None` means the guest's LOAD could not be honoured at all, and
 /// [`note_type11_load_seed`] has already said which check refused.
-#[cfg(feature = "backend-vulkan")]
 fn resolve_type11_load_seed<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -1781,8 +1768,7 @@ fn resolve_type11_load_seed<M: HostMemory + HostOps>(
 /// bind re-reads the native plane window so a guest write is always observed;
 /// conversion, allocation, and — via the returned content identity — the
 /// engine upload are skipped when the bytes are unchanged.
-#[cfg(feature = "backend-vulkan")]
-fn load_type5_view_rgba<M: HostMemory + HostOps>(
+pub(super) fn load_type5_view_rgba<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
@@ -1852,6 +1838,20 @@ fn load_type5_view_rgba<M: HostMemory + HostOps>(
             from_device,
         )
     };
+    // This path binds whatever window came back, invented or not — the per-bind
+    // `invent=` echo below is behind `REIMS_VGPU_DRAW_LOG`, so on a normal boot a
+    // wrong-plane bind here would be silent.
+    if !from_device {
+        mapping_write::note_type5_plane_invent(
+            mapping_id,
+            view.plane_index,
+            view.width,
+            view.height,
+            view.pixel_format,
+            (base_off, surface_bpr),
+            "type5_draw_view",
+        );
+    }
     let page_bytes = (pages_n as u64).saturating_mul(1u64 << state.page_shift);
     if page_bytes < span_end {
         return fail(Type5ViewDecline::Span {
@@ -2035,8 +2035,7 @@ fn load_type5_view_rgba<M: HostMemory + HostOps>(
 /// The floor is also the *only* thing that has ever declined the type-11
 /// gather: over 1 051 sampled declines it was 100% of them, which is why the
 /// rail no longer carries a reason enum to distinguish the rest.
-#[cfg(feature = "backend-vulkan")]
-const ZERO_COPY_SAMPLED_MIN_BYTES: u64 = 64 * 1024;
+pub(super) const ZERO_COPY_SAMPLED_MIN_BYTES: u64 = 64 * 1024;
 
 /// Zero-copy floor for draw-time vertex/storage buffer binds. Performance
 /// threshold only — never a correctness gate; below it the bind takes the CPU
@@ -2071,8 +2070,7 @@ const ZERO_COPY_SAMPLED_MIN_BYTES: u64 = 64 * 1024;
 /// above zero beats no floor on this workload; it does not say this is the best
 /// one. A sweep would settle that, and until one is run the value is a guess
 /// whose direction has evidence and whose magnitude does not.
-#[cfg(feature = "backend-vulkan")]
-const ZERO_COPY_BUFFER_MIN_BYTES: u64 = 16 * 1024;
+pub(super) const ZERO_COPY_BUFFER_MIN_BYTES: u64 = 16 * 1024;
 
 /// Does this host promise a guest-page alias that stays valid indefinitely?
 ///
@@ -2093,7 +2091,6 @@ const ZERO_COPY_BUFFER_MIN_BYTES: u64 = 16 * 1024;
 /// released on `unmap_pages` rather than retained until teardown, the shim
 /// answers 0. The x86 PCI shim never allocates — it refuses anything that is
 /// not a packed host-contiguous run — so it still answers 1.
-#[cfg(feature = "backend-vulkan")]
 fn guest_run_alias_available<M: HostOps>(host: &M) -> bool {
     if host.map_pages_stable() {
         return true;
@@ -2118,7 +2115,6 @@ fn guest_run_alias_available<M: HostOps>(host: &M) -> bool {
 /// The page list rides out with the runs because a caller that wants to say
 /// anything about the window's *contents* over time needs the pages, not the
 /// host pointers: guest-write tracking is registered per page set.
-#[cfg(feature = "backend-vulkan")]
 fn task_gva_guest_run_window<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &mut M,
@@ -2140,8 +2136,7 @@ fn task_gva_guest_run_window<M: HostMemory + HostOps>(
 
 /// [`task_gva_guest_run_window`] for callers with nothing to say about the
 /// window's page set.
-#[cfg(feature = "backend-vulkan")]
-fn task_gva_guest_runs<M: HostMemory + HostOps>(
+pub(super) fn task_gva_guest_runs<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &mut M,
     task_id: u32,
@@ -2162,7 +2157,6 @@ fn task_gva_guest_runs<M: HostMemory + HostOps>(
 /// `None` if any stretch fails to import, or if the window runs out before
 /// `span` — a partial gather would hand the GPU a short buffer, which is a
 /// wrong frame rather than a slow one.
-#[cfg(feature = "backend-vulkan")]
 fn coalesce_pages_to_runs<M: HostOps>(
     host: &mut M,
     window: &[u64],
@@ -2202,8 +2196,7 @@ fn coalesce_pages_to_runs<M: HostOps>(
 /// a byte-granular stride has no representation. Padded strides otherwise ride
 /// the same rail. The extent stops after the last row's texels because trailing
 /// padding may not be mapped.
-#[cfg(feature = "backend-vulkan")]
-fn strided_window_extent(w: u32, h: u32, bpp: u64, bpr: u64) -> Option<(u64, u32)> {
+pub(super) fn strided_window_extent(w: u32, h: u32, bpp: u64, bpr: u64) -> Option<(u64, u32)> {
     let tight = (w as u64).checked_mul(bpp)?;
     if bpr < tight || bpp == 0 || !bpr.is_multiple_of(bpp) {
         return None;
@@ -2228,7 +2221,6 @@ fn strided_window_extent(w: u32, h: u32, bpp: u64, bpr: u64) -> Option<(u64, u32
 /// through different window math. The flush is the coherence rule the CPU
 /// loaders obey: a resident-authoritative window covering this mapping must
 /// land before the GPU reads, or the gather sees the pre-Store bytes.
-#[cfg(feature = "backend-vulkan")]
 fn mapping_window_guest_runs<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -2266,7 +2258,6 @@ fn mapping_window_guest_runs<M: HostMemory + HostOps>(
 /// the buffer zero-copy floor and every page walkable into mappable runs.
 /// Deferred stores intersecting the span are landed first, exactly like the
 /// CPU path.
-#[cfg(feature = "backend-vulkan")]
 fn try_buffer_zero_copy_resolved<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -2314,7 +2305,6 @@ fn try_buffer_zero_copy_resolved<M: HostMemory + HostOps>(
 /// eligible, else the CPU staging read. `allow_zero_copy` is false for
 /// buffers feeding Constant-step attributes (the engine prepends a CPU
 /// base-instance prefix to those).
-#[cfg(feature = "backend-vulkan")]
 fn load_buffer_content<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -2349,7 +2339,6 @@ fn load_buffer_content<M: HostMemory + HostOps>(
 /// texel layout Vulkan samples identically (BGRA8/RGBA8 UNORM), tight rows,
 /// window inside the allocation, span ≥ the zero-copy floor, every page
 /// walkable, and packed-contiguous runs mappable.
-#[cfg(feature = "backend-vulkan")]
 fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -2453,8 +2442,7 @@ fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
 /// the resident is not authoritative. Mirrors `paint_mapping`'s window math
 /// (`type11_sample_window`) and its flush-on-access rule; any gate miss
 /// falls back to the CPU byte path.
-#[cfg(feature = "backend-vulkan")]
-fn try_type11_sample_zero_copy<M: HostMemory + HostOps>(
+pub(super) fn try_type11_sample_zero_copy<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     mid: u32,
@@ -2530,7 +2518,6 @@ fn try_type11_sample_zero_copy<M: HostMemory + HostOps>(
 /// Mirrors `try_type11_sample_zero_copy`'s page coalescing over the plane
 /// window from `type5_sample_window` (which carries the wire plane index +
 /// biplanar offset); any gate miss falls back to the CPU byte path.
-#[cfg(feature = "backend-vulkan")]
 fn try_type5_sample_zero_copy<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -2627,7 +2614,6 @@ fn try_type5_sample_zero_copy<M: HostMemory + HostOps>(
 /// format; every other format converts to RGBA8 per row. Shared by the
 /// guest-linear memo's miss-fill so its padded and tight branches agree
 /// byte-for-byte with the direct loader.
-#[cfg(feature = "backend-vulkan")]
 fn native_scratch_to_upload(
     scratch: &[u8],
     w: u32,
@@ -2691,7 +2677,6 @@ fn native_scratch_to_upload(
 /// That is measured, not asserted, and it is why the surviving Finder icon
 /// class is not a wrong-bytes defect on this rung: the bytes served are the
 /// bytes at the address the guest named, checked afresh each time.
-#[cfg(feature = "backend-vulkan")]
 #[allow(clippy::too_many_arguments)]
 fn load_linear_guest_memoized<M: HostMemory + HostOps>(
     state: &mut DeviceState,
@@ -2833,205 +2818,104 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
 }
 
 /// Report a sampled texture served entirely as zeroes out of the guest's pages
-/// while a host entry for the same address is sitting in the cache.
+/// while the host cache holds an entry for the same address.
 ///
 /// A type-2/3 texture's guest GVA pages are a *pageable alias* of a body this
-/// device owns -- `surface_cache::store_linear_texture` says so, and the
-/// measured reading agrees: on every sampled bind audited with a byte-for-byte
-/// content probe, the cache held content and the guest's pages
-/// for the same span were zero end to end, 7 of 7. The guest never writes
-/// them. So the ladder's lower rungs are not a fallback for this class at all;
-/// reading them returns a blank texture, the draw succeeds, nothing declines,
-/// and a blank cell is painted and held. That is the silent loss of guest work
-/// the ground rules forbid, and it is the shape both the surviving Finder icon
-/// class and the Safari scroll-buffer patches have.
+/// device owns (`surface_cache::store_linear_texture`), so a blank read here
+/// could mean the device rendered the span, cached it, and its own writeback
+/// never landed in the guest's pages — a silent loss, since the draw then
+/// succeeds and paints a blank cell with nothing declining.
 ///
-/// Reported rather than refused: refusing would change what is drawn, and
-/// nothing here has yet established what SHOULD be drawn when the host copy is
-/// gone.
+/// Three questions separate that defect from its lookalikes, and this function
+/// asks all three:
 ///
-/// **Measured, and it refutes the "we had the pixels" half of that.** One
-/// driven boot, ten Finder recomposites, x86/Vulkan:
+/// - **Does the cache hold this span at all?** `lin_rung_host_entry` against
+///   `lin_rung_guest_memo` is the denominator. Without it a bare count cannot
+///   tell "300 of 300" from "300 of 300 000".
+/// - **Are the zeroed pages still the pages the entry was produced over?**
+///   [`crate::runtime::surface_cache::gva_backing_state`]: `Same` means the
+///   cache entry is live over these pages, `Moved`/`Unmapped` means the guest
+///   handed the address to another allocation and the *cache* is the stale
+///   side — where serving it would be the corruption, not the repair.
+/// - **Does the entry hold any pixels?** The question the class was named for
+///   and never asked. A span the device CLEARed and cached blank reads blank
+///   off blank pages with nothing lost, and `draw_partial_clear` runs in the
+///   thousands a boot.
 ///
-///   lin_rung_gva_bypassed 725233   lin_rung_guest_memo 725231
-///   lin_rung_texref 2              lin_rung_guest_blank 3379
-///   lin_rung_blank_with_host_entry 0        gvac_hit 305
+/// ## Measured, and the class is not a loss
 ///
-/// Two things follow. The GVA cache rung is bypassed on essentially every
-/// sampled linear load, and not because entries are being refused -- `gvac_hit`
-/// is 305 against 725 233 loads, so `has_gva` simply finds nothing for these
-/// spans. And of the 3 379 samples that came back a completely blank texture,
-/// **none** had a host entry for the same address. We did not have the pixels
-/// and paint nothing; we do not have them at all.
-///
-/// `lin_rung_guest_blank` is not it either, and the identity line settles that.
-/// Across a ten-recomposite boot in which three rounds came out corrupt, EVERY
-/// blank sample was `1x1` -- six distinct spans, all of them one texel. A 1x1
-/// zero texture is an ordinary solid-colour source. There were no 64x64 blank
-/// samples at all, in the corrupt rounds or the clean ones.
-///
-/// So the icon that renders as a small block of content in an otherwise empty
-/// square is NOT a sample that came back empty. Its sample returns content. The
-/// emptiness around it is therefore produced after the sample -- by what the
-/// draw covers, not by what it reads.
-///
-/// ## That reading no longer holds. The counter is not zero.
-///
-/// A 14-round boot of the same harness, x86/Vulkan, after the sampled type-4
-/// ladder's resident rung stopped binding GPU copies the guest had overwritten
-/// and the deferred rail stopped withholding landings:
+/// One driven x86/Vulkan boot — 30 s Safari window drag plus two web-content
+/// probe runs, all declared regions measuring their colour — summed over its
+/// `store_routes` windows:
 ///
 /// ```text
-/// 13 of 14 rounds clean; the one corrupt round is TWO adjacent icon cells,
-/// completely empty -- not a wrong glyph, not a shrunken one.
+/// lin_rung_guest_memo             79898   sampled serves off the guest's pages
+/// lin_rung_host_entry             18988   …of which the cache also held the span (23.8 %)
+/// lin_rung_guest_blank             1859   …that came back all zeroes (2.3 %)
+/// lin_rung_blank_with_host_entry     22   …of those, with a host entry (1.2 % of blanks)
+/// lin_rung_blank_host_agrees         22   …where the cache is blank too: nothing lost
+/// lin_rung_blank_host_content         0   …where the cache holds pixels: the defect
 ///
-/// corrupt round   lin_rung_guest_blank 399   lin_rung_blank_with_host_entry 1
-/// clean round     lin_rung_guest_blank ~400  lin_rung_blank_with_host_entry 0
-/// whole boot                                 lin_rung_blank_with_host_entry 2
-///
-/// lin_rung_blank_with_host_entry rung=guest_memo task=1 ref=238
-///   gva=0xacb000 64x64 bytes=16384
+/// 13 distinct spans, backing=Same and fmt=Bgra8 on every one
 /// ```
 ///
-/// `64x64`, 16 384 bytes: a folder icon exactly, at the geometry the earlier
-/// boot found none of. The class the older measurement described — the icon that
-/// keeps a *block of content* in an empty square — is the one that is gone. What
-/// is left is a whole cell that is blank, and for at least one of them the
-/// sample really did come back zero while this device held a host copy of the
-/// same span.
+/// A second driven boot on the same workload read 28 / 28 / 0 — the same
+/// partition, so the zero is not one boot's luck.
 ///
-/// The two are not the same defect and the older evidence does not speak to the
-/// one that is left. `lin_rung_blank_with_host_entry` is also the only class
-/// that separates the corrupt round from the clean ones in that boot's fail
-/// channel, alongside one `deferred_flush_lost` and two
-/// `deferred_window_page_drift`.
+/// So the two rails agree on every occurrence. The dominant blank class is
+/// elsewhere — 98.8 % of blank samples have no cache entry for the span at all,
+/// which is "we do not have the pixels", not "we lost them". `fmt=Bgra8`
+/// throughout also excludes a conversion artifact: the blank test runs on
+/// converted RGBA, and a layout whose conversion zeroed the buffer would show
+/// up as a different `fmt`.
 ///
-/// The reason for reporting rather than refusing was that nothing established
-/// what should be drawn when the host copy is gone. Here the host copy is *not*
-/// gone — it is in the cache, for this span — and the pages that read zero are
-/// the pageable alias the guest never writes.
+/// `lin_rung_blank_host_content` is therefore a healthy zero, and a non-zero
+/// reading is the alarm: it is the only arm that means guest work was lost, and
+/// the place to repair it is the GVA writeback rail upstream of this rung.
 ///
-/// `gvac_gw_no_entry` 611 against `gvac_hit` 3 in that window is NOT an arming
-/// gap, which is what it looks like next to the type-4 rail's. The GVA cache's
-/// witness is armed wherever an entry is made (`surface_cache::
-/// mirror_linear_color_cache` calls `arm_gva_guest_write_witness`), and
-/// `gvac_gw_no_entry` counts lookups that found *no cache entry at all*. So the
-/// span an icon samples is usually not cached, and the two binds that were are
-/// the interesting population. `gvac_gw_wrote` was 9 in the same window: the
-/// rung is also being bypassed for spans it holds, on a witness whose
-/// `page_gen` is stamped at the harvest rather than at the write — the same
-/// unsoundness that made the deferred rail's preserve withhold frames.
+/// ## What this does not license
 ///
-/// ## The rate is not improved, and one 14-round boot cannot say it is
+/// Serving the cache on the whole rung — making the order match
+/// [`crate::runtime::metal_draw::seed_color_load`]'s stated rule, "exact target
+/// GVA is the strongest identity … Guest memory is last" — would change ~19 000
+/// serves to repair nothing. The two rails are not the same case: the seed's
+/// entry is for an attachment the pass is about to draw *onto*, while a sampled
+/// span may be guest-CPU-produced between the encode and the sample with
+/// nothing here able to witness it. Serving the cache only when the sample came
+/// back blank is not available either — that is selecting on content.
 ///
-/// Two more 14-round boots on the same binary as the run above: 8 of 14 corrupt
-/// and 2 of 14 corrupt. Across all three, 11 of 42 rounds, against 9 of 42 on
-/// the three recorded `22a3346` boots. **No change in the icon rate has been
-/// demonstrated by any of this branch's work.** What has changed is that the
-/// desktop paints at all, and that the corrupt cell is now blank rather than
-/// holding another element's pixels.
+/// The `fail` line is behind `first_sight` on `(gva, w, h)`, so it fires once
+/// per distinct span for the life of the boot while the counters beside it are
+/// per-occurrence; the two are not comparable. The `gva_backing_state` walk
+/// sits under that latch, so it is one page-table walk per distinct span rather
+/// than per sample.
 ///
-/// Round-to-round clustering is severe enough that a single 14-round boot is
-/// not a rate. The 1-of-14 boot and the 8-of-14 boot differ only in that the
-/// second harness ran on a VM already driven for 28 minutes.
-///
-/// ## After the deferred rail was bounded by the guest's fence
-///
-/// `storage_flush::flush_gva_windows_before_fence` stopped the GVA rail writing
-/// guest RAM after the guest had been told the render finished. One 14-round
-/// boot on that binary, fresh VM, same harness:
-///
-/// ```text
-/// 14 of 14 rounds CLEAN
-/// lin_rung_blank_with_host_entry 0   (2-3 per boot before)
-/// gvaw_stamp_outlived            0   (810 before)
-/// ```
-///
-/// That is the first all-clean boot this harness has recorded, and the counter
-/// this section was written to chase went to zero with it. The mechanism is
-/// direct: a sampled linear load whose GVA cache is bypassed falls through to
-/// the guest's own pages, and those pages used to be stale for as long as the
-/// deferred window sat unlanded — median 133 fences. They are now current at
-/// every fence, so the fall-through reads the render instead of what was there
-/// before it.
-///
-/// **This does not establish a rate, and the load proxy says why.**
-/// `gva_guest_wrote_since_store`'s `gvac_gw_wrote` normalises to 42.4 per 1000
-/// `draw_scissor_full` on this boot, against a corrupting threshold of ~127. So
-/// every round of it was in the LOW mode, where the pooled base rate is 3 of 22
-/// rounds corrupt — 14 %, giving a ~12 % chance of seeing 14 clean rounds with
-/// no change at all. The boot is consistent with the repair and also consistent
-/// with a quiet boot. It cannot confirm or refute the high-mode defect because
-/// it never entered the high mode, which is exactly the trap recorded above.
-///
-/// ### Second boot, and the two together are a result
-///
-/// A second 14-round boot, fresh VM, same harness, same binary family:
-///
-/// ```text
-/// boot 1   14 of 14 CLEAN   gvac_gw_wrote/1000 draws = 42.4
-/// boot 2   14 of 14 CLEAN   gvac_gw_wrote/1000 draws = 79.5
-/// pooled   28 of 28 CLEAN
-/// ```
-///
-/// Against this branch's own baseline of 11 corrupt of 42 rounds (26 %), 28
-/// consecutive clean rounds has probability 0.74^28 ~ 2e-4. Against the
-/// low-mode-only base rate of 3 of 22 (14 %) it is 0.86^28 ~ 1.5 %. Either way
-/// the null hypothesis that nothing changed is no longer comfortable, which is
-/// more than any earlier arm on this branch could say.
-///
-/// The caveat that survives: neither boot reached the HIGH mode. 79.5 is nearly
-/// double boot 1 and still short of the ~127 threshold, so the reliable
-/// high-recycling defect remains unscored — nothing here shows it is fixed, only
-/// that it did not appear. `lin_rung_blank_with_host_entry` was 0 on both.
-///
-/// ## Read the two zeros above as fail-line counts, not occurrence counts
-///
-/// `lin_rung_blank_with_host_entry` names **two different quantities**, and
-/// every "0" recorded above is the smaller one. The `fail` line below is behind
-/// `first_sight` on `(gva, w, h)`, so it fires once per distinct span for the
-/// life of the boot; the `store_route` counter beside it is unconditional. A
-/// boot that revisits the same spans can therefore report a handful of lines
-/// and hundreds of occurrences, and the two are not comparable.
-///
-/// Three independent driven boots on a later binary — Chess, Maps, the WebGL
-/// aquarium, page-downs, a title-bar drag, apple.com — read:
-///
-/// ```text
-/// store_route occurrences   263 / 299 / 360
-/// distinct fail lines        15          (same boot as the 360)
-/// ```
-///
-/// Every sample was 64x64 on `rung=guest_memo`, which is the icon-cell geometry
-/// this section was written to chase. What that does *not* establish is a
-/// regression: the readings above came from `icon-boot-ab.sh`'s round harness on
-/// an older binary, and this is a different workload on a different build, so
-/// build and workload are confounded and neither can be blamed. Isolating it
-/// means re-running that harness and reading the occurrence counter, not the
-/// line count.
-///
-/// What it does establish is that the "0"s above cannot be reasoned from as
-/// though the class had stopped happening. On the general workload it happens
-/// roughly three hundred times a boot.
-#[cfg(feature = "backend-vulkan")]
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the census line carries the identity of the sample it scored"
-)]
-fn note_guest_rung_blank(
+/// `span` is `(gva, width, height)` — the GVA cache's key, taken as one value
+/// because every lookup below needs all three and none of them means anything
+/// apart.
+fn note_guest_rung_blank<H: HostMemory>(
     state: &DeviceState,
-    rung: &'static str,
+    host: &H,
     task_id: u32,
     texture_ref: u32,
-    gva: u64,
-    w: u32,
-    h: u32,
+    span: (u64, u32, u32),
     rgba: &[u8],
+    byte_format: TexelLayout,
 ) {
-    crate::runtime::drain::note_store_route(match rung {
-        "guest_memo" => "lin_rung_guest_memo",
-        _ => "lin_rung_guest_native",
-    });
+    let (gva, w, h) = span;
+    crate::runtime::drain::note_store_route("lin_rung_guest_memo");
+    // The denominator for the loss below: every serve off the guest's pages for
+    // a span the cache also holds, whatever came back. Taken before the blank
+    // test so the blank ones are a subset of a population, not a bare count.
+    //
+    // The bytes, not just the presence: a blank guest read only means pixels
+    // were lost if the cache holds pixels to lose. `has_gva` cannot tell the two
+    // apart, so it counted "we cached a blank frame" as loss.
+    let host_bytes = crate::runtime::surface_cache::get_gva(state, gva, w, h);
+    let host_entry = host_bytes.is_some();
+    if host_entry {
+        crate::runtime::drain::note_store_route("lin_rung_host_entry");
+    }
     if rgba.is_empty() || rgba.iter().any(|&b| b != 0) {
         return;
     }
@@ -3046,27 +2930,45 @@ fn note_guest_rung_blank(
         gva ^ ((w as u64) << 32) ^ h as u64,
     ) {
         crate::observe::off(format!(
-            "lin_rung_guest_blank rung={rung} task={task_id} ref={texture_ref} gva={gva:#x} {w}x{h}"
+            "lin_rung_guest_blank task={task_id} ref={texture_ref} gva={gva:#x} {w}x{h}"
         ));
     }
-    if !crate::runtime::surface_cache::has_gva(state, gva, w, h) {
+    let Some(host_bytes) = host_bytes else {
         return;
-    }
+    };
     crate::runtime::drain::note_store_route("lin_rung_blank_with_host_entry");
+    // Which of the two cases this span is. A cache entry that is itself all
+    // zeroes agrees with the guest's pages, so nothing was lost and there is
+    // nothing upstream to repair; only a cache entry holding content while the
+    // guest alias reads zero is a coherence loss.
+    let host_blank = host_bytes.iter().all(|&b| b == 0);
+    crate::runtime::drain::note_store_route(if host_blank {
+        "lin_rung_blank_host_agrees"
+    } else {
+        "lin_rung_blank_host_content"
+    });
     if crate::observe::first_sight(
         "lin_rung_blank_with_host_entry",
         gva ^ ((w as u64) << 32) ^ h as u64,
     ) {
+        // Under `first_sight`, so this walk is once per distinct blank span for
+        // the life of the boot and not once per sample.
+        let backing = crate::runtime::surface_cache::gva_backing_state(state, host, gva);
         crate::observe::fail(format!(
-            "lin_rung_blank_with_host_entry rung={rung} task={task_id} ref={texture_ref} \
-             gva={gva:#x} {w}x{h} bytes={} (guest alias is zero and the host cache has this span)",
-            rgba.len()
+            "lin_rung_blank_with_host_entry task={task_id} ref={texture_ref} \
+             gva={gva:#x} {w}x{h} bytes={} fmt={byte_format:?} host_blank={} \
+             backing={backing:?} (guest alias is zero and the host cache has this span; \
+             host_blank=true means the cache agrees and nothing was lost, false means \
+             the cache holds content this read did not return; backing=Same means the \
+             cache entry is still over these pages, Moved/Unmapped means the address \
+             was handed on and the cache entry is the stale one)",
+            rgba.len(),
+            u8::from(host_blank)
         ));
     }
 }
 
-#[cfg(feature = "backend-vulkan")]
-fn load_linear_from_host_caches<M: HostMemory + HostOps>(
+pub(super) fn load_linear_from_host_caches<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
@@ -3120,7 +3022,15 @@ fn load_linear_from_host_caches<M: HostMemory + HostOps>(
     if let Some((rgba, identity, byte_format)) =
         load_linear_guest_memoized(state, host, task_id, tex, gva, w, h)
     {
-        note_guest_rung_blank(state, "guest_memo", task_id, texture_ref, gva, w, h, &rgba);
+        note_guest_rung_blank(
+            state,
+            host,
+            task_id,
+            texture_ref,
+            (gva, w, h),
+            &rgba,
+            byte_format,
+        );
         return Some((w, h, rgba, identity, byte_format));
     }
     // There is deliberately no second guest rung under the memo. One used to
@@ -3145,8 +3055,7 @@ fn load_linear_from_host_caches<M: HostMemory + HostOps>(
 /// The Vulkan rail writes back only color attachment 0, so this narrows
 /// [`sync_store_target_pages`] to that record and to the case where this record
 /// owns guest writeback at all.
-#[cfg(feature = "backend-vulkan")]
-fn sync_store_allowed_pages<M: HostMemory>(
+pub(super) fn sync_store_allowed_pages<M: HostMemory>(
     state: &DeviceState,
     host: &M,
     task_id: u32,
@@ -3216,7 +3125,6 @@ fn sync_store_allowed_pages<M: HostMemory>(
 /// every LOAD, with the 237 GB left saved. One driven boot after it landed
 /// measured `type11_seed_elided` 283 against `type11_seed_uploaded` 23, so the
 /// reuse survived the soundness.
-#[cfg(feature = "backend-vulkan")]
 fn note_type11_elision_extent(w: u32, h: u32) {
     let texels = (w as u64).saturating_mul(h as u64);
     crate::runtime::drain::note_store_route(match texels {
@@ -3286,7 +3194,6 @@ fn note_type11_elision_extent(w: u32, h: u32) {
 /// trace in a census this large will not be found by adding another counter to
 /// these rails; the next instrument has to observe surface *content* across the
 /// transition, not the routes taken to produce it.
-#[cfg(feature = "backend-vulkan")]
 #[allow(
     clippy::too_many_arguments,
     reason = "the census joins the scissor rect, the target, and how the attachment was loaded"
@@ -3308,6 +3215,15 @@ fn note_draw_coverage(
     } else {
         "draw_scissor_partial"
     });
+    // Into the union before the early return, and clamped to the target: a
+    // full-coverage draw is exactly the case that makes a pass's union total,
+    // so leaving it out would measure only the passes that were already cheap.
+    note_pass_scissor_rect(
+        x.min(target_w),
+        y.min(target_h),
+        sw.min(target_w),
+        sh.min(target_h),
+    );
     if covers || target_w == 0 || target_h == 0 {
         return;
     }
@@ -3333,6 +3249,235 @@ fn note_draw_coverage(
         Some(PASS_LOAD_ACTION_DONT_CARE) => "draw_partial_dontcare",
         _ => "draw_partial_load_unknown",
     });
+    // How much of the surface this draw's scissor actually covers.
+    //
+    // The deferred render flush copies the whole attachment on every landing,
+    // and that copy is the largest single cost in the device. Whether the
+    // guest's own scissors could bound it turns on a number nothing measures:
+    // if a partial draw typically covers most of the surface, the union over a
+    // pass is near-total and there is nothing to win, and the far more invasive
+    // per-pass union accumulator need never be built. These buckets answer that
+    // cheaply, from inputs this function already has.
+    //
+    // Per draw, so it bounds the union from below rather than giving it: a pass
+    // is ~3 draws, so a union is at most the sum of its members and at least the
+    // largest. Both bounds come from this distribution.
+    //
+    // Read on a clean driven x86/Vulkan boot (30 s Safari drag, two web-content
+    // probe runs), over 65 397 partial draws against 67 729 full-coverage ones:
+    //
+    // ```text
+    // draw_scissor_area_lt1    18 167   27.8 %
+    // draw_scissor_area_le5    14 353   21.9 %   (cumulative <=5 %:  49.7 %)
+    // draw_scissor_area_le10      513    0.8 %
+    // draw_scissor_area_le25    9 029   13.8 %   (cumulative <=25 %: 64.3 %)
+    // draw_scissor_area_le50   23 101   35.3 %
+    // draw_scissor_area_gt50      234    0.4 %
+    // ```
+    //
+    // The idea is not dead: essentially nothing (0.4 %) covers more than half
+    // the surface, and two thirds cover a quarter or less. But it is not
+    // confirmed either, and the reason is the *other* counter — **51 % of all
+    // draws are full-coverage**, and a pass containing one has a union of 100 %
+    // and saves nothing. Whether that matters turns entirely on whether full
+    // and partial draws mix within a pass or segregate into whole passes, which
+    // a per-draw census cannot see.
+    //
+    // So the next measurement is the per-pass union itself, and it is worth the
+    // plumbing this census was written to avoid paying blind. Take it at the
+    // arm point rather than at the flush: the fraction a pass drew is known
+    // when the window is armed, and asking there needs no state that has to
+    // survive until the deferred landing.
+    let area = (sw as u64).saturating_mul(sh as u64);
+    let full = (target_w as u64).saturating_mul(target_h as u64);
+    let pct = area.saturating_mul(100) / full.max(1);
+    crate::runtime::drain::note_store_route(DRAW_AREA_SLUGS[coverage_band(pct)]);
+}
+
+/// Which coverage band a percentage falls in, as an index.
+///
+/// Shared by the per-draw census and the per-pass union so the two are read
+/// against the same boundaries. Band 0 is *under* one percent rather than
+/// exactly one, because the percentage is integer-truncated.
+/// The band function, for `exec`'s pass-extent census to compare against.
+///
+/// That census declares its own copy because it runs on every backend and this
+/// module is behind `backend-vulkan`; the test that calls this is what stops the
+/// two from drifting.
+#[cfg(test)]
+pub(crate) fn coverage_band_for_test(pct: u64) -> usize {
+    coverage_band(pct)
+}
+
+fn coverage_band(pct: u64) -> usize {
+    match pct {
+        0 => 0,
+        1..=5 => 1,
+        6..=10 => 2,
+        11..=25 => 3,
+        26..=50 => 4,
+        51..=99 => 5,
+        _ => 6,
+    }
+}
+
+/// Per-draw slugs. A draw that reaches this is partial by construction, so the
+/// top two bands are one `gt50` bucket rather than the union's `le99`/`full`
+/// split — "this draw covered everything" is already `draw_scissor_full`.
+const DRAW_AREA_SLUGS: [&str; 7] = [
+    "draw_scissor_area_lt1",
+    "draw_scissor_area_le5",
+    "draw_scissor_area_le10",
+    "draw_scissor_area_le25",
+    "draw_scissor_area_le50",
+    "draw_scissor_area_gt50",
+    "draw_scissor_area_gt50",
+];
+
+/// Per-pass slugs. `full` is split out from `le99` because a union of 100 % is
+/// the answer that decides the question: it is a window where bounding the
+/// flush by the guest's scissors would save nothing at all.
+const PASS_UNION_SLUGS: [&str; 7] = [
+    "pass_scissor_union_lt1",
+    "pass_scissor_union_le5",
+    "pass_scissor_union_le10",
+    "pass_scissor_union_le25",
+    "pass_scissor_union_le50",
+    "pass_scissor_union_le99",
+    "pass_scissor_union_full",
+];
+
+/// Union of the scissor rects drawn since the last render window was armed,
+/// packed as four 16-bit fields `x0 | y0<<16 | x1<<32 | y1<<48`.
+///
+/// `u64::MAX` is the empty sentinel, which is unambiguous because `x0 > x1`
+/// there and a real union always has `x0 <= x1`. Sixteen bits per field is the
+/// contract's own bound: `MAX_SCANOUT_DIM` is 8 192, so a coordinate cannot
+/// reach 16 bits and no clamping is needed.
+///
+/// A static rather than device state, for the same reason `note_store_route` is
+/// one: this is a census on the encode path, and threading a field through
+/// `exec`'s pass loop into the draw encoder to hold four numbers would put
+/// plumbing in the product path for an instrument.
+///
+/// **The window is "since the last arm", not "this pass".** Resetting at the
+/// arm rather than at a pass boundary is what makes it self-synchronising - it
+/// needs no hook in `exec` and cannot drift out of step with the thing it is
+/// measuring. The cost is that a pass which never arms a window folds its draws
+/// into the next union, so this **over**-estimates coverage. That is the safe
+/// direction: it under-states how much a bounded flush would save, so a
+/// promising reading here is not an artifact of the instrument.
+static PASS_SCISSOR_UNION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// Fold one draw's rect into the union above.
+fn note_pass_scissor_rect(x: u32, y: u32, w: u32, h: u32) {
+    use std::sync::atomic::Ordering;
+    let (x0, y0) = (x.min(u16::MAX as u32), y.min(u16::MAX as u32));
+    let x1 = x.saturating_add(w).min(u16::MAX as u32);
+    let y1 = y.saturating_add(h).min(u16::MAX as u32);
+    let mut cur = PASS_SCISSOR_UNION.load(Ordering::Relaxed);
+    loop {
+        let next = if cur == u64::MAX {
+            pack_rect(x0, y0, x1, y1)
+        } else {
+            let (cx0, cy0, cx1, cy1) = unpack_rect(cur);
+            pack_rect(cx0.min(x0), cy0.min(y0), cx1.max(x1), cy1.max(y1))
+        };
+        match PASS_SCISSOR_UNION.compare_exchange_weak(
+            cur,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return,
+            Err(seen) => cur = seen,
+        }
+    }
+}
+
+fn pack_rect(x0: u32, y0: u32, x1: u32, y1: u32) -> u64 {
+    (x0 as u64) | ((y0 as u64) << 16) | ((x1 as u64) << 32) | ((y1 as u64) << 48)
+}
+
+fn unpack_rect(v: u64) -> (u32, u32, u32, u32) {
+    (
+        (v & 0xffff) as u32,
+        ((v >> 16) & 0xffff) as u32,
+        ((v >> 32) & 0xffff) as u32,
+        ((v >> 48) & 0xffff) as u32,
+    )
+}
+
+/// Report the union of the scissors drawn into this window, and reset it.
+///
+/// Called where a deferred render window is armed, because that is where the
+/// question is answerable: the flush that lands this window will copy
+/// `width * height` texels, and this says how many of them the pass that
+/// produced it actually drew. A union of 100 % means bounding the copy by the
+/// guest's own scissors would save nothing for this window.
+///
+/// # It has been read, and the answer is no
+///
+/// A clean driven x86/Vulkan boot - 30 s Safari drag, two web-content probe
+/// runs, gate clean - over 17 696 armed windows:
+///
+/// ```text
+/// pass_scissor_union_lt1        0
+/// pass_scissor_union_le5       11
+/// pass_scissor_union_le10       2
+/// pass_scissor_union_le25       0
+/// pass_scissor_union_le50       0
+/// pass_scissor_union_le99       1
+/// pass_scissor_union_full  17 682     99.92 %
+/// ```
+///
+/// **Bounding the deferred render flush by the guest's own scissor rects would
+/// save nothing.** 99.92 % of windows come from a pass that drew the whole
+/// surface, so there is no smaller extent to copy. Do not build a damage-rect
+/// flush on the strength of the per-draw distribution above; this is the number
+/// that governs, and the two are consistent rather than in conflict.
+///
+/// The instrument agrees with its own inputs, which is why the reading is
+/// trustworthy: the boot runs 7.9 draws per armed window and 50 % of all draws
+/// are full-coverage, so a window escapes saturation only if every one of those
+/// draws is partial - `0.5^7.9` is 0.4 %, predicting ~99.6 % against the 99.92 %
+/// measured. The residual is draws clustering rather than being independent.
+///
+/// **99.92 % is the per-*window* figure and it overstates the per-*pass* one.**
+/// This counter resets at the arm, and a render pass is ~3 draws, so each
+/// reading unions roughly 2.6 passes rather than one - the over-estimate the
+/// section above declares. Correcting for it does not change the answer: at 3
+/// draws a pass and the same 50 % full-coverage rate, `0.5^3` leaves ~87 % of
+/// true passes still drawing their whole surface. The honest claim is therefore
+/// "~87 % of passes, 99.92 % of the windows a flush actually lands", and a
+/// damage-bounded flush would have to beat the second number, because the
+/// window is what gets copied.
+///
+/// **And the bounding box is not what kills it.** A union is a rectangle, so
+/// two small disjoint rects produce a large one, and a richer damage
+/// representation - a rect list, tiles - would score better here. It would not
+/// help: half of all individual draws cover the entire attachment on their own,
+/// and no representation makes a full-surface draw smaller. The saving is not
+/// hiding behind the approximation.
+///
+/// What this does not close is the rail's cost, which is real and is still the
+/// largest in the device. It closes one candidate repair. `flush_render_one`
+/// names the others.
+pub(super) fn note_pass_scissor_union(width: u32, height: u32) {
+    use std::sync::atomic::Ordering;
+    let packed = PASS_SCISSOR_UNION.swap(u64::MAX, Ordering::Relaxed);
+    if packed == u64::MAX || width == 0 || height == 0 {
+        return;
+    }
+    let (x0, y0, x1, y1) = unpack_rect(packed);
+    let union_area = (x1.saturating_sub(x0) as u64).saturating_mul(y1.saturating_sub(y0) as u64);
+    let full = (width as u64).saturating_mul(height as u64);
+    // The union is clamped to the surface: a scissor may legitimately exceed the
+    // attachment (Metal permits it; the rasteriser clips), and an unclamped
+    // ratio would then read over 100 % and make the census unreadable.
+    let pct = union_area.min(full).saturating_mul(100) / full.max(1);
+    crate::runtime::drain::note_store_route(PASS_UNION_SLUGS[coverage_band(pct)]);
 }
 
 /// Score a `MTLLoadActionLoad` colour attachment against whether a seed was
@@ -3348,7 +3493,6 @@ fn note_draw_coverage(
 /// `chain_load_from_target` (the resident target already carries the chain) is
 /// a different arm and never reaches here: it is a seed that does not need
 /// uploading, not a seed that is missing.
-#[cfg(feature = "backend-vulkan")]
 fn note_load_seed_outcome(
     door: &'static str,
     seeded: bool,
@@ -3409,7 +3553,6 @@ fn note_load_seed_outcome(
     }
 }
 
-#[cfg(feature = "backend-vulkan")]
 #[inline]
 fn gva_cache_linear_texture_type(object_type: u8) -> bool {
     matches!(
@@ -3422,9 +3565,8 @@ fn gva_cache_linear_texture_type(object_type: u8) -> bool {
 /// wrappers may alias the same GVA allocation, so a matching GVA+geometry cache
 /// entry can serve either tag. Other nonzero object-type transitions remain
 /// separate resource classes and fall through to current ref/guest backing.
-#[cfg(feature = "backend-vulkan")]
 #[inline]
-fn gva_cache_owner_allows_object_type(producer_type: u8, current_type: u8) -> bool {
+pub(super) fn gva_cache_owner_allows_object_type(producer_type: u8, current_type: u8) -> bool {
     producer_type == 0
         || current_type == 0
         || producer_type == current_type
@@ -3438,7 +3580,6 @@ fn gva_cache_owner_allows_object_type(producer_type: u8, current_type: u8) -> bo
 /// records the pages it resolves to so a later sample can tell whether the
 /// address still names this allocation, and asks the host to watch them so a
 /// later sample can also tell whether the guest has since rewritten it.
-#[cfg(feature = "backend-vulkan")]
 #[allow(
     clippy::too_many_arguments,
     reason = "the cache identity mirrors the object, GVA, texture geometry, and guest backing"
@@ -3488,30 +3629,7 @@ pub(crate) fn host_cache_store_gva_layer<M: HostMemory + HostOps>(
     }
 }
 
-/// Store encode RGBA8 into **texture_ref** host cache as BGRA (not surface_id).
-#[cfg(test)]
-fn host_cache_store_rgba8(
-    state: &mut DeviceState,
-    texture_ref: u32,
-    width: u32,
-    height: u32,
-    rgba: &[u8],
-) {
-    if texture_ref == 0 || width == 0 || height == 0 {
-        return;
-    }
-    let need = (width as usize)
-        .saturating_mul(height as usize)
-        .saturating_mul(4);
-    if rgba.len() < need {
-        return;
-    }
-    let bgra = swap_rb_channels(&rgba[..need]);
-    crate::runtime::surface_cache::store_texture(state, texture_ref, width, height, bgra);
-}
-
 /// Result of a Linux metal2vulkan draw.
-#[cfg(feature = "backend-vulkan")]
 enum M2vDrawSpan {
     /// No drawable color0 geom.
     None,
@@ -3567,9 +3685,7 @@ enum M2vDrawSpan {
 ///
 /// Reachability is not uniform and must be read that way. `import` requires the
 /// engine to have enabled a host-pointer import, and there is no longer any code
-/// that could: the whole `VK_EXT_external_memory_host` subsystem is deleted and
-/// `observe::gate::the_host_pointer_import_extension_is_never_requested` fails
-/// the build of any source that names it back into existence. So `import` is
+/// that could: the whole `VK_EXT_external_memory_host` subsystem is deleted. So `import` is
 /// unreachable, and `rgba_not_import` is its complement's complement — with the
 /// import never allowed, `type11_cpu_store_fallback_allowed` is always true and
 /// that arm cannot be entered either. Both are kept as call sites so their
@@ -3587,13 +3703,11 @@ enum M2vDrawSpan {
 /// `return`s out of its own middle on the deferred route — the measurement that
 /// matters most — and a hand-closed bracket there records nothing while looking
 /// exactly like one that does. Reporting on `Drop` makes every exit pay.
-#[cfg(feature = "backend-vulkan")]
 struct StoreCostSpan {
     name: &'static str,
     started: std::time::Instant,
 }
 
-#[cfg(feature = "backend-vulkan")]
 impl StoreCostSpan {
     fn new(name: &'static str) -> Self {
         Self {
@@ -3603,7 +3717,6 @@ impl StoreCostSpan {
     }
 }
 
-#[cfg(feature = "backend-vulkan")]
 impl Drop for StoreCostSpan {
     fn drop(&mut self) {
         crate::runtime::drain::note_store_route_us(
@@ -3654,7 +3767,6 @@ impl Drop for StoreCostSpan {
 /// host GPU class to another, and this is exactly that boundary. Measuring these
 /// four needs a host whose quirk set turns deferral off, or one where the pin
 /// refuses — not another boot here.
-#[cfg(feature = "backend-vulkan")]
 fn note_type11_store_route(route: &'static str) {
     use std::sync::Mutex;
     static SEEN: Mutex<Option<std::collections::BTreeSet<&'static str>>> = Mutex::new(None);
@@ -3668,31 +3780,6 @@ fn note_type11_store_route(route: &'static str) {
     crate::observe::fail(format!("type11_store_route route={route}"));
 }
 
-/// Advance the guest-visible publish milestones for a type-11 Store whose
-/// pixels have landed in the mapping's guest pages.
-///
-/// Route-independent: the synchronous `cpu_portability` Store calls it inline,
-/// and the deferred render rail calls it from the flush that finally performs
-/// the same write (`storage_flush::flush_render_one`). Both have just proved
-/// the same thing — `write_rgba8_image_changed` verified geometry and landed a
-/// complete frame — and without it the `present_unbacked` gate is structurally
-/// dead on whichever route skips it, because no mapping's `dense_frame_seq`
-/// would advance.
-pub(crate) fn publish_surface_store<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
-    host: &mut M,
-    mapping_id: u32,
-    width: u32,
-    height: u32,
-    format: u16,
-) {
-    state.note_surface_composite(mapping_id);
-    state.note_dense_frame_published(mapping_id, width, height);
-    crate::runtime::scanout::note_front_buffer_writeback(
-        state, host, mapping_id, width, height, format,
-    );
-}
-
 /// Build the engine's secondary MRT attachments (slot 1..) from a draw's color
 /// list. Empty result ⇒ the classic single-RT path (no regression). A fragment
 /// shader that writes `location` 1.. has those outputs rendered rather than
@@ -3703,12 +3790,11 @@ pub(crate) fn publish_surface_store<M: HostMemory + HostOps>(
 /// than a guessed attachment: requires a resident primary, contiguous slots
 /// (0,1,2,… matching the shader's `location`s), matching framebuffer geometry,
 /// a known color-renderable format, and a resolvable identity.
-#[cfg(feature = "backend-vulkan")]
 #[allow(
     clippy::too_many_arguments,
     reason = "every argument is a distinct wire-derived input to the attachment set"
 )]
-fn build_secondary_targets<M: HostMemory + HostOps>(
+pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &mut M,
     task_id: u32,
@@ -3888,8 +3974,7 @@ fn build_secondary_targets<M: HostMemory + HostOps>(
 /// (revalidate + strided host ptr) on backends that can keep guest-visible
 /// content resident. Portability-subset devices take the synchronous CPU
 /// writeback path so guest pages remain authoritative across device recreates.
-#[cfg(feature = "backend-vulkan")]
-fn prepare_vertex_attribute_format(
+pub(super) fn prepare_vertex_attribute_format(
     attribute: &crate::runtime::decode::resource::VertexAttribute,
 ) -> Result<crate::backend::vulkan::engine::VertexAttributeFormat, DrawPreparationDecline> {
     translate::vertex::attribute_format(attribute.format).map_err(|reason| {
@@ -3902,8 +3987,7 @@ fn prepare_vertex_attribute_format(
     })
 }
 
-#[cfg(feature = "backend-vulkan")]
-fn prepare_vertex_step_function(
+pub(super) fn prepare_vertex_step_function(
     attribute: &crate::runtime::decode::resource::VertexAttribute,
 ) -> Result<crate::backend::vulkan::engine::VertexStepFunction, DrawPreparationDecline> {
     translate::vertex::step_function(attribute.has_step_function, attribute.step_function).map_err(
@@ -3915,7 +3999,6 @@ fn prepare_vertex_step_function(
     )
 }
 
-#[cfg(feature = "backend-vulkan")]
 fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -4908,11 +4991,25 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             resources.indexed = Some(crate::backend::vulkan::engine::IndexedDrawResource {
                 index_type,
                 index_count: idx.index_count,
-                // IndexedDrawInfo does not carry baseVertex yet (Metal path uses 0).
-                vertex_offset: 0,
+                // Vulkan's vertexOffset is a signed 32-bit field where Metal's
+                // baseVertex is 64-bit, so a value that cannot fit is declined
+                // rather than wrapped into an index somewhere else in the
+                // buffer. The guest cannot express one: Apple's serializer
+                // truncates baseVertex to 16 bits in the compact records and
+                // this device's own decode is the only other source.
+                vertex_offset: i32::try_from(idx.base_vertex).map_err(|_| {
+                    DrawError::DrawPreparation(DrawPreparationDecline::IndexLoad {
+                        reason: crate::runtime::metal_draw::IndexLoadReason::BaseVertexOutOfRange,
+                    })
+                })?,
                 indices,
             });
         }
+        // Vulkan's `firstInstance` is Metal's `baseInstance`. The field has
+        // always been here and always read 0, because nothing upstream decoded
+        // the draw forms that carry one; the engine's Constant-step-rate vertex
+        // prefix rebuild already reads it.
+        resources.base_instance = req.base_instance;
         resources.vertex_attributes = attrs;
         resources.storage_buffers = storage;
         resources.sampled_images = images;
@@ -5506,8 +5603,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
 /// type-2/3 targets use the GVA identity below. Unlike deferred writeback, this
 /// lifetime is safe on portability-subset devices because the final record
 /// materializes guest bytes before the packet completes.
-#[cfg(feature = "backend-vulkan")]
-fn render_chain_identity(
+pub(super) fn render_chain_identity(
     state: &DeviceState,
     req: &DrawEncodeRequest,
 ) -> Option<crate::backend::vulkan::engine::TargetIdentity> {
@@ -5555,8 +5651,7 @@ fn render_chain_identity(
 /// [`render_chain_identity`] — and the intermediates already render into that
 /// resident under `skip_readback` with `LoadOp::LoadFromTarget`. The last record
 /// differs only in what happens *after* the draw.
-#[cfg(feature = "backend-vulkan")]
-fn type11_store_identity(
+pub(super) fn type11_store_identity(
     state: &DeviceState,
     req: &DrawEncodeRequest,
     writeback_guest: bool,
@@ -5591,7 +5686,6 @@ fn type11_store_identity(
 /// `!writeback_guest` intermediate, and the composite-Store rail claims it for the
 /// last record. So the condition here is the same one those blocks share, asked
 /// once.
-#[cfg(feature = "backend-vulkan")]
 fn type11_render_identity(
     state: &DeviceState,
     req: &DrawEncodeRequest,
@@ -5607,7 +5701,6 @@ fn type11_render_identity(
 /// it must be a LOAD, and no explicit seed may already have been selected for
 /// it by RT provenance. Separate from the currency question so the two counters
 /// on the branch below divide candidates, not all draws.
-#[cfg(feature = "backend-vulkan")]
 fn type11_load_is_a_seed_candidate(c0: &ColorRtRequest) -> bool {
     c0.load_action == PASS_LOAD_ACTION_LOAD && c0.target_seed_rgba.is_none()
 }
@@ -5626,8 +5719,7 @@ fn type11_load_is_a_seed_candidate(c0: &ColorRtRequest) -> bool {
 /// a rescheduling with a GPU round trip added: `surface_flush / surface_resident`
 /// = 1369/1373 on one boot. Structure rather than a test, because a unit test on
 /// the resolver passes whatever the call site then decides to pass it.
-#[cfg(feature = "backend-vulkan")]
-fn type11_load_currency_query(
+pub(super) fn type11_load_currency_query(
     state: &DeviceState,
     req: &DrawEncodeRequest,
 ) -> Option<(crate::backend::vulkan::engine::TargetIdentity, Option<u32>)> {
@@ -5675,8 +5767,7 @@ fn type11_load_currency_query(
 /// surface it has just asked the GPU to render into, and — unlike the epoch-only
 /// rail this replaced — the very next guest write moves the generation again and
 /// clears it.
-#[cfg(feature = "backend-vulkan")]
-fn type11_guest_wrote_since_store<M: HostOps>(
+pub(super) fn type11_guest_wrote_since_store<M: HostOps>(
     state: &DeviceState,
     host: &M,
     mapping_id: u32,
@@ -5715,14 +5806,12 @@ fn type11_guest_wrote_since_store<M: HostOps>(
 /// the guest; on the boot that first measured the ladder it was 14 092 of 14 396
 /// cache binds, so refusing on it would turn the rung off on the strength of a
 /// rail that was never armed.
-#[cfg(feature = "backend-vulkan")]
 fn guest_wrote_allocation(verdict: GuestWriteVerdict) -> bool {
     matches!(verdict, GuestWriteVerdict::Wrote)
 }
 
 /// Where the guest's writes since the stamping Store landed, relative to the
 /// pixel window a sampled bind reads.
-#[cfg(feature = "backend-vulkan")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum GuestWriteSite {
     /// At least one written page overlaps the sampled window, so every
@@ -5754,7 +5843,6 @@ enum GuestWriteSite {
 /// mapping does not own — is [`GuestWriteSite::Unknown`], which the caller
 /// treats as [`GuestWriteSite::Pixels`]. Serving a stale copy is a wrong frame
 /// that is then held; re-reading the guest's pages costs a copy.
-#[cfg(feature = "backend-vulkan")]
 fn guest_write_site<M: HostOps>(
     state: &DeviceState,
     host: &M,
@@ -5814,7 +5902,6 @@ fn guest_write_site<M: HostOps>(
 ///
 /// Returns whether the merge landed. On `false` the caller has a surface whose
 /// halves are still split and must say so rather than bind either one.
-#[cfg(feature = "backend-vulkan")]
 fn merge_guest_writes_into_pages<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -5865,7 +5952,6 @@ fn merge_guest_writes_into_pages<M: HostMemory + HostOps>(
 ///
 /// Half-open on both sides: a range that abuts the window without entering it
 /// is the padding page after the last row, not the last row.
-#[cfg(feature = "backend-vulkan")]
 fn ranges_touch_window(ranges: &[(u64, u64)], base_off: u64, span_end: u64) -> bool {
     ranges
         .iter()
@@ -5951,7 +6037,6 @@ fn ranges_touch_window(ranges: &[(u64, u64)], base_off: u64, span_end: u64) -> b
 /// `gw_wrote_elsewhere` on either rung. They are denominators, not dead code —
 /// their being empty is what says a served copy is never a copy the hypervisor
 /// actively contradicted.
-#[cfg(feature = "backend-vulkan")]
 fn note_type11_sample_rung(rung: &'static str, guest_write: GuestWriteVerdict) {
     crate::runtime::drain::note_store_route(rung);
     if let Some(gw) = sample_rung_gw_route(rung, guest_write) {
@@ -5961,7 +6046,6 @@ fn note_type11_sample_rung(rung: &'static str, guest_write: GuestWriteVerdict) {
 
 /// The census column for a rung's guest-write verdict, or `None` for a rung the
 /// verdict says nothing about.
-#[cfg(feature = "backend-vulkan")]
 fn sample_rung_gw_route(rung: &str, guest_write: GuestWriteVerdict) -> Option<&'static str> {
     Some(match (rung, guest_write) {
         ("t11rung_resident", GuestWriteVerdict::Clean) => "t11rung_resident_gw_clean",
@@ -5991,7 +6075,6 @@ fn sample_rung_gw_route(rung: &str, guest_write: GuestWriteVerdict) -> Option<&'
 /// mapping has no entry" and "this image was never stamped" as agreement and
 /// load undefined memory as though it were the guest's prior frame. That is
 /// precisely the black-layer class. Absence on either side is a refusal.
-#[cfg(feature = "backend-vulkan")]
 fn type11_resident_is_current(mapping_epoch: Option<u32>, resident_epoch: Option<u32>) -> bool {
     mapping_epoch.is_some() && mapping_epoch == resident_epoch
 }
@@ -6013,7 +6096,6 @@ fn type11_resident_is_current(mapping_epoch: Option<u32>, resident_epoch: Option
 /// device operation. Registration happens here rather than at mapping resolve
 /// because this is the first moment the device has a host-side copy whose reuse
 /// would depend on the answer.
-#[cfg(feature = "backend-vulkan")]
 fn stamp_type11_resident<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -6037,7 +6119,6 @@ fn stamp_type11_resident<M: HostMemory + HostOps>(
 /// golden-ratio constant (2^64 / phi rounded to odd), used here only to spread
 /// page GPAs — which are dense multiples of the page size, so their low bits are
 /// all zero — across the whole word before the XOR fold.
-#[cfg(feature = "backend-vulkan")]
 fn gva_page_set_hash(pages: &std::collections::HashSet<u64>) -> u64 {
     let mut hash: u64 = 0;
     for p in pages {
@@ -6067,7 +6148,6 @@ fn gva_page_set_hash(pages: &std::collections::HashSet<u64>) -> u64 {
 /// only *miss* the registry lookup, which costs a CPU seed and never produces
 /// wrong pixels. Sharing a slot is the wrong-content direction, so every
 /// ambiguity here resolves toward the miss.
-#[cfg(feature = "backend-vulkan")]
 fn gva_alloc_generation<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &mut M,
@@ -6099,7 +6179,6 @@ fn gva_alloc_generation<M: HostMemory + HostOps>(
 ///
 /// A short walk yields 0. An incomplete walk names no allocation, and hashing the
 /// pages that happened to resolve would be an identity the guest never had.
-#[cfg(feature = "backend-vulkan")]
 fn gva_span_alloc_generation<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &mut M,
@@ -6134,7 +6213,6 @@ fn gva_span_alloc_generation<M: HostMemory + HostOps>(
 /// guest recycles names. Without it the registry keys this resident on
 /// `(gva, width, height)` alone, and the cross-pass resident Load below hands a
 /// new allocation the previous one's pixels as its prior content.
-#[cfg(feature = "backend-vulkan")]
 pub(crate) fn gva_chain_identity(
     req: &DrawEncodeRequest,
 ) -> Option<crate::backend::vulkan::engine::TargetIdentity> {
@@ -6157,7 +6235,6 @@ pub(crate) fn gva_chain_identity(
 /// Read an abandoned resident render-pass chain so the exec loop can land the
 /// last good record's pixels (`writeback_chain_rgba`). Every failure is
 /// fail-visible; the guest keeps its pre-pass bytes on loss.
-#[cfg(feature = "backend-vulkan")]
 pub(crate) fn read_resident_chain(state: &DeviceState, req: &DrawEncodeRequest) -> Option<Vec<u8>> {
     let identity = render_chain_identity(state, req)?;
     match crate::backend::vulkan::engine::read_target(&identity) {
@@ -6200,7 +6277,6 @@ pub(crate) fn read_resident_chain(state: &DeviceState, req: &DrawEncodeRequest) 
 ///
 /// If it ever does bind, each forced landing says so as
 /// `gva_deferred_flush ... trigger=window_cap`.
-#[cfg(feature = "backend-vulkan")]
 const GVA_DEFERRED_WINDOW_CAP: usize = 16;
 
 /// Bound on live type-11 render windows. Each one pins a display-sized target
@@ -6215,7 +6291,6 @@ const GVA_DEFERRED_WINDOW_CAP: usize = 16;
 /// note on `GVA_DEFERRED_WINDOW_CAP` for why, and for what would change the
 /// answer. If it ever does bind, `evict_render_windows_to_cap` emits
 /// `surface_window_cap_evicted`.
-#[cfg(feature = "backend-vulkan")]
 const SURFACE_DEFERRED_WINDOW_CAP: usize = 16;
 
 /// Defer gate for a type-11 (surface) render Store.
@@ -6228,7 +6303,6 @@ const SURFACE_DEFERRED_WINDOW_CAP: usize = 16;
 /// comes from it. A window with no range would be armed and then never found
 /// by a reader, which is the silent-stale-read failure this rail exists to
 /// avoid.
-#[cfg(feature = "backend-vulkan")]
 fn surface_store_defer_eligible(
     state: &DeviceState,
     req: &DrawEncodeRequest,
@@ -6281,7 +6355,6 @@ fn surface_store_defer_eligible(
 /// guest-page reader drains this window through the `flush_intersecting` choke
 /// point it already calls — no new trigger sites, and no way to cover one rail
 /// and miss the other.
-#[cfg(feature = "backend-vulkan")]
 #[allow(
     clippy::too_many_arguments,
     reason = "the arm names the frame it is deferring and the geometry it was drawn at"
@@ -6363,104 +6436,6 @@ fn arm_surface_deferred_store_with<M: HostMemory + HostOps>(
 /// draw's `target_identity` — so the slot pinned and stamped is the slot the draw
 /// rendered into. Deriving it a second way here is how a pin ends up protecting
 /// an image the frame is not in.
-/// Census: how much of the attachment does the Store that arms a window
-/// actually touch?
-///
-/// The render deferred-flush rail reads back and scatters the **whole**
-/// attachment for every window it lands — a gigabyte a second on a driven
-/// 1080p boot, of which `RenderFlushWitness` measures 99% as read by nothing.
-/// The rail's own note says the remaining lever is moving fewer bytes, and the
-/// guest already supplies the rect that would say which: `OP_SET_SCISSOR` is
-/// decoded verbatim into `req.scissor` and, as `note_draw_coverage` records, a
-/// partial scissor is the compositor's damage rect carried faithfully — this
-/// device computes, clamps and derives nothing from it.
-///
-/// So the question this answers is whether a damage-limited writeback could pay
-/// on the composite rail specifically. `draw_scissor_partial` already says 35%
-/// of *all* draws are scissored, but that is every draw on every target; the
-/// Stores that arm a window are a different population and could easily be the
-/// full-screen ones. Bucketed by coverage rather than summed, because a mean
-/// over a bimodal population (full-screen composites plus small damage rects)
-/// would describe neither.
-///
-/// A rate, not a refusal: a full-coverage Store is entirely ordinary.
-///
-/// # Read, and the answer closes the lever
-///
-/// A 30 s driven Safari probe on the x86/PCI/Vulkan pathway:
-///
-/// ```text
-/// store_damage_full            1891
-/// store_damage_unscissored     1881
-/// store_damage_le10pct           32
-/// store_damage_texels    7766070272
-/// store_attach_texels    7817714977
-/// ```
-///
-/// **99.34% of the texels a Store arms are texels it covers.** Half the Stores
-/// carry no scissor at all and the other half carry one that spans the whole
-/// attachment; the 32 small ones are 0.8% of the population and 0.66% of the
-/// area. A damage-limited writeback would save two thirds of one percent.
-///
-/// So the guess this measurement existed to test is wrong, and it was a
-/// reasonable guess: 35% of *all* draws are scissored, and a compositor that
-/// repaints only what changed is exactly what one expects behind that number.
-/// It does not carry to the Store. The partial scissors belong to the many
-/// small draws *inside* a pass — an icon, a glyph run, a window's own layer —
-/// while the Store that ends a full-screen composite declares the full screen.
-///
-/// Keep the census on. It is four counters a second, it is the denominator for
-/// any future claim that the flush rail could move fewer bytes, and if the
-/// guest's compositing strategy ever changes this is where it would show.
-#[cfg(feature = "backend-vulkan")]
-fn note_store_damage_coverage(req: &DrawEncodeRequest, width: u32, height: u32) {
-    let Some((route, covered, attach)) = store_damage_bucket(req.scissor, width, height) else {
-        return;
-    };
-    crate::runtime::drain::note_store_route(route);
-    // The saving a damage-limited writeback would make is the area, so carry it
-    // as texels too: the bucket says how the population splits, this pair says
-    // what the split is worth.
-    crate::runtime::drain::note_store_route_n("store_damage_texels", covered);
-    crate::runtime::drain::note_store_route_n("store_attach_texels", attach);
-}
-
-/// The arithmetic behind [`note_store_damage_coverage`]: which bucket a Store's
-/// scissor falls in, and the covered/attachment texel pair behind it.
-///
-/// `None` for a degenerate attachment, which has no coverage to report.
-#[cfg(feature = "backend-vulkan")]
-fn store_damage_bucket(
-    scissor: Option<(u32, u32, u32, u32)>,
-    width: u32,
-    height: u32,
-) -> Option<(&'static str, u64, u64)> {
-    let attach = u64::from(width).saturating_mul(u64::from(height));
-    if attach == 0 {
-        return None;
-    }
-    let Some((x, y, sw, sh)) = scissor else {
-        // No scissor is the whole attachment by declaration, and it is the
-        // arm's default: counting it keeps the buckets a partition rather than
-        // a filtered view of the scissored minority.
-        return Some(("store_damage_unscissored", attach, attach));
-    };
-    // Clamped to the attachment: a scissor may legally exceed it, and an
-    // unclamped product would report over 100% coverage.
-    let w = sw.min(width.saturating_sub(x.min(width)));
-    let h = sh.min(height.saturating_sub(y.min(height)));
-    let covered = u64::from(w).saturating_mul(u64::from(h));
-    let route = match covered.saturating_mul(100) / attach {
-        0..=9 => "store_damage_le10pct",
-        10..=24 => "store_damage_le25pct",
-        25..=49 => "store_damage_le50pct",
-        50..=89 => "store_damage_le90pct",
-        _ => "store_damage_full",
-    };
-    Some((route, covered, attach))
-}
-
-#[cfg(feature = "backend-vulkan")]
 fn arm_surface_resident_store<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -6469,6 +6444,10 @@ fn arm_surface_resident_store<M: HostMemory + HostOps>(
     width: u32,
     height: u32,
 ) -> Option<u32> {
+    // Before any early return below: the union belongs to the draws that just
+    // ran whether or not this arm goes on to succeed, and leaving it un-reset on
+    // a declined arm would fold this pass into the next window's reading.
+    note_pass_scissor_union(width, height);
     let identity = type11_store_identity(state, req, true)?;
     let key = prepare_surface_deferred_window(state, host, req, mapping_id, width, height)?;
     // The slot this arm pins and the slot the flush will look up have to be the
@@ -6499,7 +6478,6 @@ fn arm_surface_resident_store<M: HostMemory + HostOps>(
         .fail_once(u64::from(mapping_id));
         return None;
     }
-    note_store_damage_coverage(req, width, height);
     if !crate::backend::vulkan::engine::pin_resident_target(&identity) {
         crate::observe::Emit::decline(
             "surface_resident_arm",
@@ -6582,7 +6560,6 @@ fn arm_surface_resident_store<M: HostMemory + HostOps>(
 /// acquisitions — and a single `reason=arm_failed` would name none of them. Every
 /// arm is recoverable and none of them loses guest work, so these are declines and
 /// not losses.
-#[cfg(feature = "backend-vulkan")]
 enum SurfaceResidentArmDecline {
     PinRefused,
     NoEpoch { epoch: u32 },
@@ -6595,7 +6572,6 @@ enum SurfaceResidentArmDecline {
     IdentitySplit,
 }
 
-#[cfg(feature = "backend-vulkan")]
 impl crate::observe::Decline for SurfaceResidentArmDecline {
     fn slug(&self) -> &'static str {
         match self {
@@ -6623,7 +6599,6 @@ impl crate::observe::Decline for SurfaceResidentArmDecline {
 /// against, with nothing stale left inside it — and a rail that reimplemented one
 /// of them slightly differently is how one kind of window ends up covered by a
 /// trigger the other kind misses.
-#[cfg(feature = "backend-vulkan")]
 fn prepare_surface_deferred_window<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -6681,7 +6656,6 @@ fn prepare_surface_deferred_window<M: HostMemory + HostOps>(
 /// writes guest pages and republishes this mapping's one cache entry. Each rail
 /// therefore calls [`evict_render_windows_to_cap`] where its own last write is,
 /// and the two orders differ — which is exactly why this function cannot own it.
-#[cfg(feature = "backend-vulkan")]
 fn finish_surface_deferred_window(
     state: &mut DeviceState,
     req: &DrawEncodeRequest,
@@ -6717,7 +6691,6 @@ fn finish_surface_deferred_window(
 }
 
 /// Live [`crate::model::DeferredOwner::Render`] windows, for the population cap.
-#[cfg(feature = "backend-vulkan")]
 fn render_window_count(state: &DeviceState) -> usize {
     state
         .compute_deferred_flush
@@ -6742,7 +6715,6 @@ fn render_window_count(state: &DeviceState) -> usize {
 ///
 /// The order is taken once and walked. Re-deriving "the oldest" after a refusal
 /// returns the same stuck window forever, which is the bug this replaced.
-#[cfg(feature = "backend-vulkan")]
 fn evict_render_windows_to_cap<M: HostMemory + HostOps>(state: &mut DeviceState, host: &mut M) {
     for (mid, lo, hi) in render_windows_oldest_first(state) {
         let before = render_window_count(state);
@@ -6776,7 +6748,6 @@ fn evict_render_windows_to_cap<M: HostMemory + HostOps>(state: &mut DeviceState,
 /// window now owns the frame it deferred that is a full framebuffer per stuck
 /// key — the "~260 stale residents pinned for the guest lifetime" shape. Step
 /// over it instead.
-#[cfg(feature = "backend-vulkan")]
 fn render_windows_oldest_first(state: &DeviceState) -> Vec<(u32, u64, u64)> {
     let mut live: Vec<(u64, u32, u64, u64)> = state
         .compute_deferred_flush
@@ -6800,7 +6771,6 @@ fn render_windows_oldest_first(state: &DeviceState) -> Vec<(u32, u64, u64)> {
 /// fence wait on the stamp path. All gates are protocol-shape checks (never
 /// content): the flush must be able to replay the sync `write_gva_rgba8`
 /// exactly — identity geometry == c0 geometry, convertible format, sane BPR.
-#[cfg(feature = "backend-vulkan")]
 fn gva_store_defer_eligible(req: &DrawEncodeRequest) -> bool {
     let Some(c0) = req.colors.first() else {
         return false;
@@ -6823,7 +6793,6 @@ fn gva_store_defer_eligible(req: &DrawEncodeRequest) -> bool {
 /// fully covers the window; its bytes were never observable without a flush,
 /// which would have taken it); different geometry lands the old identity
 /// first, preserving the sync serialization (old bytes, then new bytes).
-#[cfg(feature = "backend-vulkan")]
 pub(crate) fn supersede_gva_window<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -6850,18 +6819,6 @@ pub(crate) fn supersede_gva_window<M: HostMemory + HostOps>(
     } else {
         crate::runtime::storage_flush::flush_gva_exact(state, host, gva, true, by);
     }
-}
-
-/// Metal-direct builds never arm GVA windows — nothing to supersede.
-#[cfg(not(feature = "backend-vulkan"))]
-pub(crate) fn supersede_gva_window<M: HostMemory + HostOps>(
-    _state: &mut DeviceState,
-    _host: &mut M,
-    _gva: u64,
-    _width: u32,
-    _height: u32,
-    _by: &str,
-) {
 }
 
 /// How often does a GVA render target's address change hands between arms?
@@ -6914,7 +6871,6 @@ pub(crate) fn supersede_gva_window<M: HostMemory + HostOps>(
 ///
 /// Scoring anything on this class therefore needs boots, not rounds. A change
 /// that is measured on one boot has measured the latch, not the change.
-#[cfg(feature = "backend-vulkan")]
 fn note_gva_resident_aliasing(
     state: &mut DeviceState,
     gva: u64,
@@ -6960,7 +6916,6 @@ fn note_gva_resident_aliasing(
 /// Returns `false` when a gate fails (unwalkable span, pin refusal) — the
 /// caller then lands the Store synchronously from a resident readback, and
 /// the sync site's supersede handling covers any older window at this GVA.
-#[cfg(feature = "backend-vulkan")]
 fn arm_gva_deferred_store<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -7063,58 +7018,285 @@ fn arm_gva_deferred_store<M: HostMemory + HostOps>(
     true
 }
 
-pub fn writeback_chain_rgba<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
-    host: &mut M,
-    task_id: u32,
-    color_slots: &[(u32, crate::runtime::decode::render::ColorAttachment)],
-    rgba: &[u8],
-) -> bool {
-    if color_slots.is_empty() || rgba.is_empty() {
-        return false;
-    }
-    let Some((_, att)) = color_slots.first() else {
-        return false;
-    };
-    if att.texture_ref == 0 {
-        return false;
-    }
-    let Some((mapping_id, gva, w, h, bpr, fmt)) =
-        lookup_render_target(state, host, task_id, att.texture_ref)
-    else {
-        return false;
-    };
-    let need = (w as usize).saturating_mul(h as usize).saturating_mul(4);
-    if rgba.len() < need {
-        return false;
-    }
-    if gva != 0 {
-        supersede_gva_window(state, host, gva, w, h, "chain_land");
-        return write_gva_rgba8(state, host, task_id, gva, w, h, bpr, fmt, rgba).is_ok();
-    }
-    if mapping_id == 0 {
-        return false;
-    }
-    // An abandoned portability chain must still preserve the last successful
-    // record. This is an error recovery rail, not normal product behavior: land
-    // the resident readback into the type-11 mapping, publish the Composite
-    // Store, and keep the degradation fail-visible.
-    crate::observe::fail(format!(
-        "writeback_chain_rgba reason=resident_chain_abandoned_cpu_recovery \
-         mid={mapping_id} {w}x{h} fmt={fmt:#x}"
-    ));
-    let wrote = mapping_write::write_rgba8_image_changed(state, host, mapping_id, rgba, None, w, h);
-    if wrote {
-        publish_surface_store(state, host, mapping_id, w, h, fmt);
-    }
-    wrote
-}
-
 #[cfg(all(test, feature = "backend-vulkan"))]
 mod vulkan_split_tests {
     use super::*;
     use crate::model::{DeviceId, PAGE_SHIFT_X86};
     use crate::runtime::host::FakeHost;
+
+    /// The blank-with-host-entry loss must be reported as a subset of a
+    /// population, not as a bare count.
+    ///
+    /// `lin_rung_blank_with_host_entry` has been read three ways in this file's
+    /// history and each reading needed a denominator it did not have: how often
+    /// this rung serves the guest's pages for a span the cache also holds. With
+    /// only the numerator, "300 a boot" cannot be told apart from "300 of 300"
+    /// or "300 of 300 000", and those are different defects. So a content-
+    /// bearing serve over a cached span must still be counted, and a blank one
+    /// must land in both counters — the subset relation is the property, not
+    /// either number.
+    #[test]
+    fn a_serve_over_a_cached_span_is_counted_whether_or_not_it_came_back_blank() {
+        use crate::runtime::drain::store_route_count;
+        let mut state = DeviceState::new(DeviceId(0), PAGE_SHIFT_X86);
+        let host = FakeHost::new();
+        let (w, h) = (4u32, 4u32);
+        let gva = 0x40_0000u64;
+        crate::runtime::surface_cache::store_gva_owned(
+            &mut state,
+            gva,
+            w,
+            h,
+            vec![0x7f; (w * h * 4) as usize],
+            0,
+            None,
+        );
+
+        let entries = store_route_count("lin_rung_host_entry");
+        let blanks = store_route_count("lin_rung_blank_with_host_entry");
+
+        // Content came back: the cache holds the span, so this is one more
+        // fall-through to guest pages over a cached span, and no loss.
+        let content = vec![1u8; (w * h * 4) as usize];
+        note_guest_rung_blank(
+            &state,
+            &host,
+            1,
+            9,
+            (gva, w, h),
+            &content,
+            TexelLayout::Rgba8,
+        );
+        assert_eq!(
+            store_route_count("lin_rung_host_entry"),
+            entries + 1,
+            "a content-bearing serve over a cached span is part of the population"
+        );
+        assert_eq!(
+            store_route_count("lin_rung_blank_with_host_entry"),
+            blanks,
+            "content came back, so nothing was lost"
+        );
+
+        // All zeroes over the same cached span: the loss, and still a member of
+        // the population it is a subset of.
+        let blank = vec![0u8; (w * h * 4) as usize];
+        note_guest_rung_blank(&state, &host, 1, 9, (gva, w, h), &blank, TexelLayout::Rgba8);
+        assert_eq!(store_route_count("lin_rung_host_entry"), entries + 2);
+        assert_eq!(
+            store_route_count("lin_rung_blank_with_host_entry"),
+            blanks + 1
+        );
+
+        // No cache entry for the span: a blank serve here is the other class
+        // ("we do not have the pixels at all") and must reach neither counter.
+        note_guest_rung_blank(
+            &state,
+            &host,
+            1,
+            9,
+            (gva + 0x10_0000, w, h),
+            &blank,
+            TexelLayout::Rgba8,
+        );
+        assert_eq!(store_route_count("lin_rung_host_entry"), entries + 2);
+        assert_eq!(
+            store_route_count("lin_rung_blank_with_host_entry"),
+            blanks + 1
+        );
+    }
+
+    /// The per-pass union must union, reset, and include full-coverage draws.
+    ///
+    /// Three properties, and each one is a way the instrument could read
+    /// promising while being wrong. If it did not union it would report the last
+    /// draw and make every pass look cheap. If it did not reset at the arm it
+    /// would accumulate across the whole boot and saturate at 100 %. And if it
+    /// skipped full-coverage draws - which take an early return in the per-draw
+    /// census - it would measure only the passes that were already cheap, which
+    /// is exactly the population whose answer does not matter.
+    #[test]
+    fn the_pass_scissor_union_unions_resets_and_counts_full_coverage_draws() {
+        use crate::runtime::drain::store_route_count;
+        // Drain any rect left by another test in this binary.
+        note_pass_scissor_union(1000, 1000);
+
+        // Two disjoint quarter-width strips: 20 % each, union 60 % because the
+        // bounding box spans them. A "last draw wins" accumulator says 20 %.
+        let n = store_route_count("pass_scissor_union_le99");
+        note_draw_coverage(0, 0, 200, 1000, 1000, 1000, None, false, false);
+        note_draw_coverage(400, 0, 200, 1000, 1000, 1000, None, false, false);
+        note_pass_scissor_union(1000, 1000);
+        assert_eq!(
+            store_route_count("pass_scissor_union_le99"),
+            n + 1,
+            "the union of two 20 % strips 400px apart is 60 %, not 20 %"
+        );
+
+        // The reset landed: a fresh single 4 % draw reads as 4 %, not 64 %.
+        let n = store_route_count("pass_scissor_union_le5");
+        note_draw_coverage(0, 0, 200, 200, 1000, 1000, None, false, false);
+        note_pass_scissor_union(1000, 1000);
+        assert_eq!(
+            store_route_count("pass_scissor_union_le5"),
+            n + 1,
+            "the arm must reset the union, or it saturates across passes"
+        );
+
+        // A full-coverage draw takes the per-draw early return but must still
+        // reach the union - it is the case that makes a pass unbounded.
+        let n = store_route_count("pass_scissor_union_full");
+        note_draw_coverage(0, 0, 40, 40, 1000, 1000, None, false, false);
+        note_draw_coverage(0, 0, 1000, 1000, 1000, 1000, None, false, false);
+        note_pass_scissor_union(1000, 1000);
+        assert_eq!(
+            store_route_count("pass_scissor_union_full"),
+            n + 1,
+            "a pass containing a full-coverage draw has a union of 100 %"
+        );
+
+        // An arm with no draws since the last one reports nothing at all,
+        // rather than reporting a stale or empty rect as a real reading.
+        let before: u64 = PASS_UNION_SLUGS.iter().map(|s| store_route_count(s)).sum();
+        note_pass_scissor_union(1000, 1000);
+        let after: u64 = PASS_UNION_SLUGS.iter().map(|s| store_route_count(s)).sum();
+        assert_eq!(before, after, "an empty union is not a reading");
+    }
+
+    /// The scissor-area buckets must score the fraction, not the extent.
+    ///
+    /// The whole point of the census is comparing a draw against the surface it
+    /// draws into, so the same rect on a small target and a large one belong in
+    /// different buckets. A version that bucketed raw pixel area would answer a
+    /// question nobody asked and read plausibly while doing it.
+    #[test]
+    fn scissor_area_buckets_score_the_fraction_of_the_target() {
+        use crate::runtime::drain::store_route_count;
+        // 1000x1000 target: the rect's area in pixels IS its percentage.
+        let cases = [
+            (10u32, 10u32, "draw_scissor_area_lt1"),    // 0.01 %, rounds to 0
+            (100, 100, "draw_scissor_area_le5"),        // exactly 1 %, so not the sub-1 bucket
+            (200, 200, "draw_scissor_area_le5"),       // 4 %
+            (300, 300, "draw_scissor_area_le10"),      // 9 %
+            (500, 500, "draw_scissor_area_le25"),      // 25 %
+            (700, 700, "draw_scissor_area_le50"),      // 49 %
+            (800, 800, "draw_scissor_area_gt50"),      // 64 %
+        ];
+        for (sw, sh, slug) in cases {
+            let before = store_route_count(slug);
+            note_draw_coverage(0, 0, sw, sh, 1000, 1000, None, false, false);
+            assert_eq!(
+                store_route_count(slug),
+                before + 1,
+                "{sw}x{sh} of 1000x1000 belongs in {slug}"
+            );
+        }
+
+        // The same rect against a target it fully covers is not a partial draw
+        // at all, so it takes the `covers` early return and reaches no bucket.
+        let before = store_route_count("draw_scissor_area_gt50");
+        note_draw_coverage(0, 0, 800, 800, 800, 800, None, false, false);
+        assert_eq!(
+            store_route_count("draw_scissor_area_gt50"),
+            before,
+            "a full-coverage draw is counted by draw_scissor_full, not bucketed"
+        );
+
+        // A degenerate target must not divide by zero.
+        note_draw_coverage(0, 0, 4, 4, 0, 0, None, false, false);
+    }
+
+    /// A blank guest read is only a loss if the cache holds pixels to lose.
+    ///
+    /// `lin_rung_blank_with_host_entry` tested that the cache *held* the span
+    /// and reported every hit as a coherence loss. It could not distinguish a
+    /// span the device cleared and cached blank — where the guest's pages
+    /// agreeing with a blank cache is both rails telling the truth — from one
+    /// where the cache holds content the guest alias failed to return. Only the
+    /// second is a defect, so the two must land in different counters while both
+    /// stay inside the population counter above.
+    #[test]
+    fn a_blank_serve_is_split_by_whether_the_cached_entry_holds_pixels() {
+        use crate::runtime::drain::store_route_count;
+        let mut state = DeviceState::new(DeviceId(0), PAGE_SHIFT_X86);
+        let host = FakeHost::new();
+        let (w, h) = (4u32, 4u32);
+        let blank = vec![0u8; (w * h * 4) as usize];
+
+        // A span the device cached with content, read back blank: the loss.
+        let content_gva = 0x50_0000u64;
+        crate::runtime::surface_cache::store_gva_owned(
+            &mut state,
+            content_gva,
+            w,
+            h,
+            vec![0x7f; (w * h * 4) as usize],
+            0,
+            None,
+        );
+        // A span the device cached blank, read back blank: the two rails agree.
+        let blank_gva = 0x60_0000u64;
+        crate::runtime::surface_cache::store_gva_owned(
+            &mut state,
+            blank_gva,
+            w,
+            h,
+            vec![0u8; (w * h * 4) as usize],
+            0,
+            None,
+        );
+
+        let agrees = store_route_count("lin_rung_blank_host_agrees");
+        let lost = store_route_count("lin_rung_blank_host_content");
+        let population = store_route_count("lin_rung_blank_with_host_entry");
+
+        note_guest_rung_blank(
+            &state,
+            &host,
+            1,
+            9,
+            (content_gva, w, h),
+            &blank,
+            TexelLayout::Rgba8,
+        );
+        assert_eq!(
+            store_route_count("lin_rung_blank_host_content"),
+            lost + 1,
+            "the cache holds pixels this read did not return: a real loss"
+        );
+        assert_eq!(
+            store_route_count("lin_rung_blank_host_agrees"),
+            agrees,
+            "a content-bearing cache entry is not agreement"
+        );
+
+        note_guest_rung_blank(
+            &state,
+            &host,
+            1,
+            9,
+            (blank_gva, w, h),
+            &blank,
+            TexelLayout::Rgba8,
+        );
+        assert_eq!(
+            store_route_count("lin_rung_blank_host_agrees"),
+            agrees + 1,
+            "a blank cache entry over blank guest pages loses nothing"
+        );
+        assert_eq!(
+            store_route_count("lin_rung_blank_host_content"),
+            lost + 1,
+            "agreement must not be counted as loss"
+        );
+
+        // Both remain members of the population they subset.
+        assert_eq!(
+            store_route_count("lin_rung_blank_with_host_entry"),
+            population + 2,
+            "the split partitions the population rather than replacing it"
+        );
+    }
 
     /// A refused arm must hand the frame back intact, because the synchronous
     /// route is the next thing to run and those are the only pixels it has.
@@ -8121,58 +8303,5 @@ mod vulkan_split_tests {
             gen_a,
             "two allocations at one secondary address must not share one image"
         );
-    }
-}
-
-#[cfg(all(test, feature = "backend-vulkan"))]
-mod store_damage_tests {
-    use super::store_damage_bucket;
-
-    /// The bucket is a partition, not a filter: an unscissored Store is the
-    /// whole attachment by declaration and has to be counted, or the census
-    /// reads as though every Store were a small damage rect.
-    #[test]
-    fn an_unscissored_store_counts_as_the_whole_attachment() {
-        assert_eq!(
-            store_damage_bucket(None, 1920, 1080),
-            Some(("store_damage_unscissored", 1920 * 1080, 1920 * 1080))
-        );
-    }
-
-    /// The whole point of the measurement: a compositor damage rect must land
-    /// in a small bucket and carry its own area, since that area is what a
-    /// damage-limited writeback would save.
-    #[test]
-    fn a_small_damage_rect_lands_in_the_small_bucket_with_its_area() {
-        let (route, covered, attach) =
-            store_damage_bucket(Some((100, 100, 192, 108)), 1920, 1080).expect("live attachment");
-        assert_eq!(route, "store_damage_le10pct");
-        assert_eq!(covered, 192 * 108);
-        assert_eq!(attach, 1920 * 1080);
-    }
-
-    /// A scissor may legally exceed the attachment. Unclamped it would report
-    /// over 100% coverage and inflate `store_damage_texels` past
-    /// `store_attach_texels`, which would make the ratio the census exists to
-    /// produce meaningless.
-    #[test]
-    fn a_scissor_larger_than_the_attachment_is_clamped_to_it() {
-        let (route, covered, attach) =
-            store_damage_bucket(Some((0, 0, 4096, 4096)), 1920, 1080).expect("live attachment");
-        assert_eq!(route, "store_damage_full");
-        assert_eq!(covered, attach);
-
-        // Offset past the edge leaves nothing, rather than wrapping.
-        let (route, covered, _) =
-            store_damage_bucket(Some((1920, 1080, 64, 64)), 1920, 1080).expect("live attachment");
-        assert_eq!(route, "store_damage_le10pct");
-        assert_eq!(covered, 0);
-    }
-
-    /// A degenerate attachment has no coverage to report and must not divide.
-    #[test]
-    fn a_zero_attachment_reports_nothing() {
-        assert_eq!(store_damage_bucket(Some((0, 0, 8, 8)), 0, 1080), None);
-        assert_eq!(store_damage_bucket(None, 1920, 0), None);
     }
 }

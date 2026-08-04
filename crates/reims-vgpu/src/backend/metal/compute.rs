@@ -620,6 +620,11 @@ pub struct ComputeEncodeRetain {
 /// Used by multi-record control-flow sessions so nested dispatches sit inside
 /// `encodeStartIf`/`While` SPI regions. Caller must keep `retain` alive until
 /// after GPU completion, then call [`compute_writeback_from_mtl`].
+// Twenty arguments because they are the compute dispatch's whole input set —
+// the eight `ReimsVgpu*` bind arrays plus the grid — and this is the encoder-
+// borrowing twin of `compute_core` below. Grouping them into a struct would
+// have to be done to both or it splits one contract in two.
+#[allow(clippy::too_many_arguments)]
 pub fn compute_encode_on_encoder(
     device: &Device,
     encoder: &ComputeCommandEncoderRef,
@@ -693,14 +698,8 @@ pub fn compute_encode_on_encoder(
         }
     };
 
-    let function = match load_only_function(device, mtlb, "compute", err) {
-        Ok(f) => f,
-        Err(st) => return Err(st),
-    };
-    let pso = match new_compute_pipeline_state(device, &function, mtlb, stage_input, err) {
-        Ok(p) => p,
-        Err(st) => return Err(st),
-    };
+    let function = load_only_function(device, mtlb, "compute", err)?;
+    let pso = new_compute_pipeline_state(device, &function, mtlb, stage_input, err)?;
 
     let threadgroup_total = (tg_x as u64) * (tg_y as u64) * (tg_z as u64);
     let max_tg = pso.max_total_threads_per_threadgroup();
@@ -839,6 +838,8 @@ pub fn compute_writeback_from_mtl(
     Status::OK
 }
 
+// The same input set as `compute_encode_on_encoder`, one encoder shorter.
+#[allow(clippy::too_many_arguments)]
 pub fn compute_core(
     mtlb: &[u8],
     buffers: &mut [ReimsVgpuBuffer],
@@ -1067,24 +1068,6 @@ pub fn reflect_compute_textures_mtlb(
 unsafe fn msg_send_release(obj: *mut objc::runtime::Object) {
     use objc::{msg_send, sel, sel_impl};
     let _: () = msg_send![obj, release];
-}
-
-// MTLRegion helper — metal crate may not expose new_2d.
-trait RegionExt {
-    fn new_2d(x: u64, y: u64, w: u64, h: u64) -> Self;
-}
-
-impl RegionExt for MTLRegion {
-    fn new_2d(x: u64, y: u64, w: u64, h: u64) -> Self {
-        MTLRegion {
-            origin: MTLOrigin { x, y, z: 0 },
-            size: MTLSize {
-                width: w,
-                height: h,
-                depth: 1,
-            },
-        }
-    }
 }
 
 #[cfg(test)]

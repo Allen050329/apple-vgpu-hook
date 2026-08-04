@@ -10,8 +10,8 @@
 //!
 //! ## Command fills — buffer-backed, not stream opcodes
 //!
-//! RE of `AppleParavirtGPUMetalIOGPUFamily` (2026-07-11): there is **no** Reims VGPU
-//! compute-stream opcode for `indirectComputeCommandAtIndex` fills. Guest CPU
+//! There is **no** Reims VGPU compute-stream opcode for
+//! `indirectComputeCommandAtIndex` fills. Guest CPU
 //! writes into an ICB backing buffer via
 //! `PGSerializerIndirectComputeCommand` (setPSO / setKernelBuffer /
 //! concurrentDispatch*). Command slots use the layout from create:
@@ -239,7 +239,7 @@ impl IcbRenderBufferBind {
 }
 
 /// Tessellation-factor buffer recorded at layout `tessellationFactorOffset`.
-/// Host RE 2026-07-12: u32 ref@0 · u64 va@4 · u64 gpuva@0xc · u64 instanceStride@0x14.
+/// u32 ref@0 · u64 va@4 · u64 gpuva@0xc · u64 instanceStride@0x14.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct IcbTessellationFactor {
     pub buffer_ref: u32,
@@ -314,8 +314,8 @@ pub enum IcbRenderDraw {
 /// Wire: three MTLSize as 3×u64 each at `commandArgumentsOffset`, total
 /// [`ICB_DRAW_MESH_ARGS_LEN`] (`0x48` from host `setupCommandLayout`). Field
 /// order matches Metal SPI `MTLIndirectDrawMesh*Arguments` — grid @0, object TG
-/// @0x18, mesh TG @0x30. Fill IMPs are stubs; layout is RE'd from
-/// setupCommandLayout + concurrent-dispatch packing + SPI field order.
+/// @0x18, mesh TG @0x30. Fill IMPs are stubs; the layout follows
+/// `setupCommandLayout` + concurrent-dispatch packing + SPI field order.
 ///
 /// `drawMeshThreads` (`0x100`) and `drawMeshThreadgroups` (`0x80`) write byte-
 /// identical records; the only difference is what the first MTLSize counts,
@@ -481,7 +481,7 @@ pub fn decode_compute_command_slot(
     }
 
     // Barrier: u32 at barrierOffset (setBarrier writes 1, clearBarrier writes 0).
-    // Host RE 2026-07-12 PGSerializerIndirectComputeCommand setBarrier/clearBarrier.
+    // PGSerializerIndirectComputeCommand setBarrier/clearBarrier.
     let mut barrier = false;
     if layout.barrier_offset != 0 {
         let bo = layout.barrier_offset as usize;
@@ -674,7 +674,7 @@ pub fn decode_render_command_slot(
             }
         }
         ICB_CMD_TYPE_DRAW_PATCHES => {
-            // Host RE: u16 controlPoints@0, u64 patchStart@2, u64 patchCount@0xa,
+            // u16 controlPoints@0, u64 patchStart@2, u64 patchCount@0xa,
             // u32 patchIndexRef@0x12, u64 va@0x16, u64 gpuva@0x1e,
             // u64 instanceCount@0x26, u64 baseInstance@0x2e.
             if args + ICB_DRAW_PATCHES_ARGS_LEN as usize > slot.len() {
@@ -696,7 +696,7 @@ pub fn decode_render_command_slot(
             }
         }
         ICB_CMD_TYPE_DRAW_INDEXED_PATCHES => {
-            // Host RE: like DrawPatches through patchIndex, then
+            // like DrawPatches through patchIndex, then
             // u32 controlPointIndexRef@0x26, u64 va@0x2a, u64 gpuva@0x32,
             // u64 instanceCount@0x3a, u64 baseInstance@0x42.
             if args + ICB_DRAW_INDEXED_PATCHES_ARGS_LEN as usize > slot.len() {
@@ -1131,9 +1131,67 @@ pub fn load_icb_descriptor<M: HostMemory + HostOps>(
     let desc = objects::read_descriptor(state, host, task_id, &entry)
         .ok_or(IcbStatus::Missing("icb_desc_read"))?;
     match decode_type7_descriptor(&desc) {
-        Ok(ResourceDescriptor::IndirectCommandBuffer(icb)) => Ok(icb),
+        Ok(ResourceDescriptor::IndirectCommandBuffer(icb)) => {
+            note_unapplied_icb_flags(task_id, icb_ref, &icb);
+            Ok(icb)
+        }
         Ok(_) => Err(IcbStatus::BadDescriptor("icb_desc_not_icb_body")),
         Err(_) => Err(IcbStatus::BadDescriptor("icb_desc_type7_decode")),
+    }
+}
+
+/// A flag the guest set on its indirect command buffer that this device decodes
+/// and does not apply.
+struct IcbFlagDropped(crate::runtime::decode::resource::IcbUnappliedFlag);
+
+impl crate::observe::Decline for IcbFlagDropped {
+    fn slug(&self) -> &'static str {
+        self.0.slug()
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        Vec::new()
+    }
+}
+
+/// Report every decoded ICB flag this device drops on the floor.
+///
+/// Eight of the ten attributed bits in the create body's flag word reach no
+/// host setter: `supportRayTracing`, `supportDynamicAttributeStride` and the six
+/// inherit-state flags Metal added in macOS 26. This device builds its host
+/// `MTLIndirectCommandBufferDescriptor` without touching any of them, so each
+/// one silently takes Metal's default instead of the guest's.
+///
+/// Counted rather than executed, deliberately. Six of the eight default *on* at
+/// both ends, so on a descriptor the guest left alone nothing is lost and every
+/// counter here is a healthy zero — which means a **non**-zero reading is the
+/// measured argument for building that flag's setter, and says which one. Doing
+/// it the other way round would mean writing eight `objc_msgSend` wrappers into
+/// the Metal-only arm for a path a driven boot has never taken
+/// (`runtime::icb` reads 0.00% on a driven x86 boot, and `icb_exec_seen` has
+/// never fired on arm64 either).
+///
+/// This sits in [`load_icb_descriptor`] rather than in `materialize_metal_icb`
+/// on purpose: the descriptor is decoded on both backends and only materialized
+/// on one, so the count would otherwise be structurally zero on Vulkan for a
+/// reason that has nothing to do with what the guest asked for.
+fn note_unapplied_icb_flags(
+    task_id: u32,
+    icb_ref: u32,
+    desc: &IndirectCommandBufferDescriptor,
+) {
+    use crate::observe::Decline as _;
+    for flag in desc.unapplied_flags() {
+        let decline = IcbFlagDropped(flag);
+        crate::runtime::drain::note_store_route(decline.slug());
+        crate::observe::Emit::decline("icb_desc_flag", &decline)
+            .field("task", task_id)
+            .field("icb", icb_ref)
+            .field("flags", format!("{:#06x}", desc.flags))
+            // The slug is already per flag, so the buffer is the only thing
+            // left to key on: one line per ICB per flag, however many times a
+            // cache miss reloads the descriptor.
+            .fail_once(icb_ref as u64);
     }
 }
 
@@ -1160,8 +1218,8 @@ pub fn materialize_metal_icb(
         mtl_desc.as_ref(),
         desc.command_types as u64,
     );
-    mtl_desc.set_inherit_buffers(desc.inherit_buffers);
-    mtl_desc.set_inherit_pipeline_state(desc.inherit_pipeline_state);
+    mtl_desc.set_inherit_buffers(desc.inherit_buffers());
+    mtl_desc.set_inherit_pipeline_state(desc.inherit_pipeline_state());
     mtl_desc.set_max_vertex_buffer_bind_count(desc.max_vertex_buffer_bind_count as u64);
     mtl_desc.set_max_fragment_buffer_bind_count(desc.max_fragment_buffer_bind_count as u64);
     mtl_desc.set_max_kernel_buffer_bind_count(desc.max_kernel_buffer_bind_count as u64);
@@ -1199,11 +1257,6 @@ pub fn materialize_metal_icb(
     );
     let _ = TYPE7_OBJECT_ICB;
     Ok(icb)
-}
-
-#[cfg(feature = "backend-vulkan")]
-pub fn materialize_metal_icb(_desc: &IndirectCommandBufferDescriptor) -> Result<(), IcbStatus> {
-    Err(IcbStatus::NoMetal("icb_materialize_no_vulkan_path"))
 }
 
 // ---------------------------------------------------------------------------
@@ -1302,7 +1355,30 @@ pub fn resolve_metal_icb<M: HostMemory + HostOps>(
 ///
 /// Full wire record length `0x18` (8 B header + 16 B payload). Payload:
 /// `icb_ref:u32 @0`, `buffer_ref:u32 @4`, `gpu_address:u64 @8`.
-/// Host RE 2026-07-11 AppleParavirtGPUMetalIOGPUFamily.
+///
+/// **The offsets are right and the last two names are wrong.** Apple's own bytes
+/// say this record is a *query*: `+4` is the reply staging buffer and `+8` is
+/// the offset into it where the host is being asked to write two `u64`s, which
+/// is what the selector's `^{?=QQ}` out-parameter means. The reading below —
+/// the ICB's backing buffer and its GPU address — has no derivation behind it;
+/// it arrived with the initial import and nothing has tested it against a
+/// captured record, because `PGSerializerInfoCommandEncoder` sits in the
+/// divergence instrument's `UNCOVERED_CLASSES`.
+///
+/// The evidence is in [`reims_vgpu_wire::ops::info::Query`], which declares the
+/// same three offsets under the other names. Shortest form: `+4` reads the same
+/// value in all ten query fixtures, *including* the one whose queried object is
+/// itself a buffer with a different ref — so it cannot be that object's backing
+/// buffer.
+///
+/// Left standing rather than half-repaired. Renaming the fields is not the fix:
+/// this record does not say where an ICB's command memory is, so
+/// [`apply_icb_host_resource_info`] cannot do its job from it and should
+/// decline by name — and the device separately never writes the answer the
+/// guest asked for, though `runtime::heap_query` shows the pattern for that.
+/// The rail is dormant, which is why the wrong reading survived: `runtime::icb`
+/// reads 0.00% on a driven boot and `bind_icb_command_memory` returns
+/// `icb_bind_memory_no_vulkan_path` on the entire Vulkan arm.
 pub const INFO_OP_ICB_HOST_RESOURCE: u32 = 0x1d1;
 pub const INFO_OP_ICB_HOST_RESOURCE_RECORD_LEN: u32 = 0x18;
 pub const INFO_OP_ICB_HOST_RESOURCE_PAYLOAD_LEN: usize = 0x10;
@@ -1504,6 +1580,7 @@ fn type1_buffer_gva_size<M: HostMemory + HostOps>(
         .ok_or(IcbStatus::Missing("icb_type1_no_backing"))
 }
 
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
 /// Convert absolute bind VA → offset into type-1 allocation (`handle << page_shift`).
 ///
 /// PGSerializer stores `base+offset` in the bind VA field (not a separate offset).
@@ -1529,6 +1606,7 @@ fn offset_from_wire_va<M: HostMemory + HostOps>(
     Ok(off)
 }
 
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
 /// Resolve wire VAs on a compute fill into type-1 bind offsets (mutates in place).
 pub fn resolve_compute_fill_offsets<M: HostMemory + HostOps>(
     state: &DeviceState,
@@ -1544,6 +1622,7 @@ pub fn resolve_compute_fill_offsets<M: HostMemory + HostOps>(
     Ok(())
 }
 
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
 /// Resolve wire VAs on a render fill into type-1 bind / index offsets (mutates in place).
 pub fn resolve_render_fill_offsets<M: HostMemory + HostOps>(
     state: &DeviceState,
@@ -1685,7 +1764,7 @@ pub fn fill_icb_from_command_memory<M: HostMemory + HostOps>(
     if end > max_cmds {
         return Err(IcbStatus::Args("icb_fill_range_past_capacity"));
     }
-    let need = (end as u64).saturating_mul(layout.command_size as u64);
+    let need = end.saturating_mul(layout.command_size as u64);
     if need > mem.byte_len {
         return Err(IcbStatus::Args("icb_fill_range_past_memory"));
     }
@@ -1715,7 +1794,7 @@ pub fn fill_icb_from_command_memory<M: HostMemory + HostOps>(
     for i in range_location..end {
         let off = (i as usize) * (layout.command_size as usize);
         let slot = &bytes[off..off + layout.command_size as usize];
-        if is_compute || (!is_render && !is_compute) {
+        if is_compute || !is_render {
             // Prefer compute when ConcurrentDispatch bits are set; empty slots skip.
             if let Some(mut fill) = decode_compute_command_slot(&layout, slot, max_kernel)? {
                 fill.command_index = i as u32;
@@ -1758,6 +1837,7 @@ pub(crate) fn metal_vertex_descriptor_from_attrs_for_draw(
     attrs: &[crate::runtime::decode::resource::VertexAttribute],
     for_patches: bool,
 ) -> Option<metal::VertexDescriptor> {
+    use crate::backend::metal::mtl_enum;
     use metal::{MTLVertexStepFunction, VertexDescriptor};
 
     if attrs.is_empty() {
@@ -1769,23 +1849,43 @@ pub(crate) fn metal_vertex_descriptor_from_attrs_for_draw(
         if a.format == 0 || a.stride == 0 {
             continue;
         }
+        // Both words come straight off the guest's type-7 descriptor and had no
+        // check at all — they were reinterpreted as `MTLVertexFormat` and
+        // `MTLVertexStepFunction` directly. The attribute is dropped rather
+        // than the whole descriptor, because one bad attribute does not make
+        // the others unencodable, and the drop is reported.
+        let Some(format) = mtl_enum::vertex_format(a.format) else {
+            note_dropped_vertex_attribute(
+                "icb_vertex_attr_format_unsupported",
+                a.location,
+                a.format,
+            );
+            continue;
+        };
+        let step_ordinal = if a.has_step_function {
+            a.step_function
+        } else if for_patches {
+            MTLVertexStepFunction::PerPatchControlPoint as u32
+        } else {
+            MTLVertexStepFunction::PerVertex as u32
+        };
+        let Some(step) = mtl_enum::vertex_step_function(step_ordinal) else {
+            note_dropped_vertex_attribute(
+                "icb_vertex_attr_step_function_unsupported",
+                a.location,
+                step_ordinal,
+            );
+            continue;
+        };
         any = true;
         if let Some(attr) = vd.attributes().object_at(a.location as u64) {
-            // MTLVertexFormat is NSUInteger-sized on Apple platforms.
-            attr.set_format(unsafe { std::mem::transmute(a.format as u64) });
+            attr.set_format(format);
             attr.set_offset(a.offset as u64);
             attr.set_buffer_index(a.buffer_index as u64);
         }
         if let Some(layout) = vd.layouts().object_at(a.buffer_index as u64) {
             layout.set_stride(a.stride as u64);
-            let step = if a.has_step_function {
-                a.step_function
-            } else if for_patches {
-                MTLVertexStepFunction::PerPatchControlPoint as u32
-            } else {
-                MTLVertexStepFunction::PerVertex as u32
-            };
-            layout.set_step_function(unsafe { std::mem::transmute(step as u64) });
+            layout.set_step_function(step);
             let rate = if a.has_step_rate {
                 a.step_rate.max(1)
             } else {
@@ -1799,6 +1899,42 @@ pub(crate) fn metal_vertex_descriptor_from_attrs_for_draw(
     } else {
         None
     }
+}
+
+/// A vertex attribute this device could not encode, named by which of its two
+/// enum words the guest set to something Metal does not declare.
+///
+/// Skipping one attribute silently would leave a pipeline whose `[[stage_in]]`
+/// struct is missing a field, which shows up as wrong geometry rather than as
+/// an error, so the drop is counted and printed even though the caller has no
+/// status channel to return.
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+struct DroppedVertexAttribute {
+    slug: &'static str,
+}
+
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+impl crate::observe::Decline for DroppedVertexAttribute {
+    fn slug(&self) -> &'static str {
+        self.slug
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        Vec::new()
+    }
+}
+
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+fn note_dropped_vertex_attribute(slug: &'static str, location: u32, value: u32) {
+    use crate::observe::Decline as _;
+    let decline = DroppedVertexAttribute { slug };
+    crate::runtime::drain::note_store_route(decline.slug());
+    crate::observe::Emit::decline("icb_vertex_attr", &decline)
+        .field("location", location)
+        .field("value", value)
+        // One line per (location, value) pair: a pipeline rebuilt on every
+        // cache miss would otherwise repeat the same drop indefinitely.
+        .fail_once(((location as u64) << 32) | value as u64);
 }
 
 /// The five `MTLPrimitiveType` values the ICB wire encodes, by SDK ordinal.
@@ -1872,7 +2008,7 @@ pub fn fill_render_command<M: HostMemory + HostOps>(
     // Pipeline is required on the ICB command unless inheritPipelineState.
     // Mirrors fill_compute_command: when inherit, parent encoder supplies PSO
     // at execute (metal_draw::apply_icb_encoder_inheritance).
-    let pso = if !icb_desc.inherit_pipeline_state {
+    let pso = if !icb_desc.inherit_pipeline_state() {
         if fill.pipeline_ref == 0 {
             return Err(IcbStatus::Args("icb_frc_pipeline_ref_zero"));
         }
@@ -2242,7 +2378,7 @@ pub fn fill_render_command<M: HostMemory + HostOps>(
     }
     // When inheritBuffers, vertex/fragment buffers come from the parent encoder
     // at execute (see metal_draw::encode_icb_execute_and_writeback).
-    if !entry.desc.inherit_buffers {
+    if !entry.desc.inherit_buffers() {
         for (idx, stage, has_stride, stride, mtl) in &staged {
             match stage {
                 IcbRenderBindStage::Fragment => {
@@ -2457,29 +2593,6 @@ pub fn fill_render_command<M: HostMemory + HostOps>(
 }
 
 #[cfg(feature = "backend-vulkan")]
-pub fn fill_render_command<M: HostMemory + HostOps>(
-    _state: &DeviceState,
-    _host: &M,
-    _task_id: u32,
-    _icb_ref: u32,
-    _fill: &IcbRenderFill,
-) -> Result<(), IcbStatus> {
-    Err(IcbStatus::NoMetal("icb_frc_no_vulkan_path"))
-}
-
-#[cfg(feature = "backend-vulkan")]
-pub fn fill_icb_from_command_memory<M: HostMemory + HostOps>(
-    _state: &DeviceState,
-    _host: &M,
-    _task_id: u32,
-    _icb_ref: u32,
-    _range_location: u64,
-    _range_length: u64,
-) -> Result<(), IcbStatus> {
-    Err(IcbStatus::NoMetal("icb_fill_no_vulkan_path"))
-}
-
-#[cfg(feature = "backend-vulkan")]
 pub fn resolve_metal_icb<M: HostMemory + HostOps>(
     _state: &DeviceState,
     _host: &M,
@@ -2491,7 +2604,7 @@ pub fn resolve_metal_icb<M: HostMemory + HostOps>(
 
 /// Clone writeback slots for a cached ICB into a session nested job (after execute).
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-pub fn export_icb_writeback_job(
+pub(crate) fn export_icb_writeback_job(
     task_id: u32,
     icb_ref: u32,
 ) -> Option<crate::runtime::compute_exec::NestedDispatchJob> {
@@ -2582,7 +2695,7 @@ pub fn fill_compute_command<M: HostMemory + HostOps>(
     let fill = &fill_resolved;
 
     // Pipeline is required on the ICB command unless inheritPipelineState.
-    let pso = if !desc.inherit_pipeline_state {
+    let pso = if !desc.inherit_pipeline_state() {
         if fill.pipeline_ref == 0 {
             return Err(IcbStatus::Args("icb_fcc_pipeline_ref_zero"));
         }
@@ -2603,7 +2716,7 @@ pub fn fill_compute_command<M: HostMemory + HostOps>(
         metal::Buffer,
         crate::runtime::compute_exec::StagedBuffer,
     )> = Vec::new();
-    if !desc.inherit_buffers {
+    if !desc.inherit_buffers() {
         for b in &fill.buffers {
             if b.buffer_ref == 0 {
                 return Err(IcbStatus::Args("icb_fcc_bind_ref_zero"));
@@ -2648,7 +2761,7 @@ pub fn fill_compute_command<M: HostMemory + HostOps>(
         return Err(IcbStatus::Args("icb_fcc_command_index_past_capacity"));
     }
     // maxKernelBufferBindCount: reject binds past the create descriptor.
-    if !entry.desc.inherit_buffers {
+    if !entry.desc.inherit_buffers() {
         for (idx, _, _, _, _) in &staged_binds {
             if *idx as u64 >= entry.desc.max_kernel_buffer_bind_count as u64 {
                 return Err(IcbStatus::Args("icb_fcc_bind_index_past_max"));
@@ -2663,7 +2776,7 @@ pub fn fill_compute_command<M: HostMemory + HostOps>(
         cmd.set_compute_pipeline_state(pso);
     }
     // When inheritBuffers, kernel buffers come from the parent compute encoder.
-    if !entry.desc.inherit_buffers {
+    if !entry.desc.inherit_buffers() {
         for (idx, has_stride, stride, mtl, _) in &staged_binds {
             if *has_stride {
                 crate::backend::metal::raw_metal::icb_set_kernel_buffer_attribute_stride(
@@ -2747,17 +2860,6 @@ pub fn fill_compute_command<M: HostMemory + HostOps>(
     }
     entry.has_fills = true;
     Ok(())
-}
-
-#[cfg(feature = "backend-vulkan")]
-pub fn fill_compute_command<M: HostMemory + HostOps>(
-    _state: &DeviceState,
-    _host: &M,
-    _task_id: u32,
-    _icb_ref: u32,
-    _fill: &IcbComputeFill,
-) -> Result<(), IcbStatus> {
-    Err(IcbStatus::NoMetal("icb_fcc_no_vulkan_path"))
 }
 
 #[cfg(test)]

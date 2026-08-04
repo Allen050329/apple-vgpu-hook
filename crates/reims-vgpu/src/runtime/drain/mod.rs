@@ -60,18 +60,6 @@ fn release_translation_order_holds(state: &mut DeviceState) {
     ));
 }
 
-/// Samples logged per distinct display-transaction `(opcode, payload_len)` shape.
-///
-/// One sample proves the shape exists; a few more let the reader compare which
-/// words move between frames (surface id, task id) and which are constant
-/// (pipe index) without re-booting.
-const DISPLAY_TXN_PAYLOAD_SAMPLES: u32 = 4;
-
-/// Payload bytes hex-dumped per sample. A transaction payload that carried an
-/// inline plane list would be tens of bytes, not kilobytes; this bounds a
-/// pathological length without truncating the interesting case.
-const DISPLAY_TXN_PAYLOAD_DUMP_MAX: usize = 128;
-
 /// Install a `DefineTask2` payload and record the page-table identity it
 /// resolved to.
 ///
@@ -84,6 +72,34 @@ const DISPLAY_TXN_PAYLOAD_DUMP_MAX: usize = 128;
 /// A short payload drops the task definition, and every later draw or resolve
 /// on that task then fails downstream with no root cause. The child ring named
 /// that; the root ring did not, and dropped silently. Both name it now.
+/// True when a control packet is too short to carry the fields its opcode
+/// needs, having said so.
+///
+/// Every arm that guards on payload length is acknowledged regardless of
+/// whether it did anything: `drain_main_fifo` writes the root completion stamp
+/// after the dispatch match, and `drain_child_fifo` calls `write_stamp` the
+/// same way. So an arm that just skips on a short payload tells the guest its
+/// command completed while nothing happened, and leaves the fail log empty —
+/// the worst shape a loss can take, because the symptom surfaces arbitrarily
+/// far downstream (a channel that never drains, an object list that never
+/// binds) with no record of the cause.
+///
+/// `site` separates the two rings on the census line the way
+/// [`apply_define_task2`] does, since the same opcode arrives on both.
+fn packet_short(op: &'static str, channel: Option<u32>, have: usize, need: usize) -> bool {
+    if have >= need {
+        return false;
+    }
+    let site = match channel {
+        Some(ch) => format!("ch{ch}"),
+        None => "root".to_string(),
+    };
+    crate::observe::fail(format!(
+        "packet_short reason={op}_short site={site} plen={have} need={need}"
+    ));
+    true
+}
+
 fn apply_define_task2<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut H,
@@ -100,7 +116,13 @@ fn apply_define_task2<H: HostMemory + HostOps>(
     let raw_id = ld32(&payload[DEFINE_TASK_RAW_ID..]);
     let length = define_task_length(payload);
     let dir = ld32(&payload[DEFINE_TASK_DIRECTORY_PFN..]);
+    // `raw_id` is `(task_id << 1) | is_kernel_task`: the guest's kernel-task and
+    // user-task registrations differ only in that low bit, and the kernel task's
+    // own id is 0, so `0x1` is the kernel task and not user task 1. Both halves
+    // are decoded — the id to index the slot, the flag so the log says which
+    // class registered rather than leaving the bit unaccounted for.
     let task_id = raw_id >> DEFINE_TASK_ID_SHIFT;
+    let kernel_task = raw_id & 1 != 0;
     if !state.define_task(task_id, length, dir) || task_id as usize >= state.tasks.len() {
         return;
     }
@@ -108,8 +130,12 @@ fn apply_define_task2<H: HostMemory + HostOps>(
     let slot = &state.tasks[task_id as usize];
     let walk =
         crate::runtime::gva_mem::diagnose_task_slot(host, slot, task_id, 0, state.page_shift);
+    // `task=`/`dir=` are not repeated here: `walk` already carries the task id
+    // as `tid=` and the directory as `dir=`, and a key printed twice in one line
+    // is a field every log reader resolves arbitrarily.
     crate::observe::off(format!(
-        "define_task {site} raw={raw_id:#x} task={task_id} len={length:#x} dir={dir:#x} page_shift={} {walk}",
+        "define_task {site} raw={raw_id:#x} kernel={} len={length:#x} page_shift={} {walk}",
+        kernel_task as u8,
         state.page_shift
     ));
 }
@@ -183,83 +209,132 @@ fn present_surface_id(opcode: u16, payload: &[u8]) -> Option<u32> {
     })
 }
 
-/// Measurement for the display-transaction wire shape (`display_txn_payload`).
+/// Alarm for a display-transaction payload longer than its command declares.
 ///
-/// We decode opcode 6/7 as a fixed 12/0x24-byte record read from payload offset
-/// zero, which yields a single surface id — plane 0 of what is really an
-/// `IOAccelDisplayPipeTransaction2`: a per-frame list of planes with source,
-/// destination and dirty rects. Whether the rest of that list rides inline in
-/// this payload decides where a real decode reads it from, and nothing in the
-/// guest driver settles it statically because the serializer it calls lives in
-/// IOAcceleratorFamily2.
+/// # The wire shape, and why there is nothing left to sample here
 ///
-/// So record the shape from a live boot. `head*` is the trailer under the
-/// current offset-zero reading; `tail*` is the same trailer read from the end of
-/// the payload, which is where it lands if a plane list precedes it. When the
-/// two agree the payload is trailer-only and the list travels elsewhere; when
-/// they diverge, `hex` shows the list and `tail*` is the correct reading.
+/// A display present is an `IOAccelDisplayPipeTransaction2` on the guest side —
+/// a per-frame list of planes carrying source, destination and dirty rects — and
+/// this device decodes only a single surface id from it. That reads like a
+/// truncation, and a sampler used to sit here recording whether the rest of the
+/// list rode inline in the payload.
 ///
-/// A live x86 session answered the framing half: every payload was trailer-only,
-/// so `tail*` is the authoritative reading and the named `pipe`/`surface`/`task`
-/// fields below are decoded from it. What remains open is the task field, which
-/// was zero for every sample taken during bring-up. It is `task->+0x268` in
-/// `submitTransaction`, and whether it identifies the GPU task that produced the
-/// surface decides how the host learns that a present's content is ready — so
-/// the sample budget re-arms when it first becomes non-zero.
+/// It does not, and it never can: the guest's display pipe serializes the
+/// transaction by taking **plane 0's** IOSurface and writing that one id into a
+/// fixed-size command. There is no plane list on the wire, so decoding one
+/// surface is the whole contract rather than a first approximation of it. The
+/// command is 12 bytes for `CmdDisplayTransaction3` and 36 for its gamma
+/// variant, which is what [`display_txn_trailer_len`] returns, and the field
+/// order differs between them exactly as [`display_txn_trailer_slots`] says.
+///
+/// The same reading settles the third word. It is the id of the paravirt task
+/// that owns the presented surface, taken from the display pipe's own resource
+/// heap rather than from the transaction — so a zero there means the pipe has no
+/// task bound yet, not that the field is unused.
+///
+/// One consequence worth stating because it is easy to go looking for: **the
+/// guest's damage rects never reach this device.** They exist in the
+/// transaction, and the serializer drops them. Any repair that wants per-frame
+/// damage has to get it from somewhere other than the display path.
+///
+/// What survives is the one thing a static reading cannot promise for a guest
+/// this device does not ship: that the payload keeps its declared size. A longer
+/// one means this decode has become a truncation, so it is an always-on alarm
+/// rather than a sample budget. Under-length is already refused by
+/// [`present_surface_id`], which is where it costs a present.
+///
+/// # The plane-list reading is op6/op7's, and only op6/op7's
+///
+/// Everything above is about `submitTransaction`, which is what op6
+/// `CmdDisplayTransaction3` and its gamma variant op7 emit. **op8
+/// `CmdDisplaySwapMapping` does not serialize a transaction at all** — it names
+/// a single mapping, as [`display_txn_trailer_slots`] says — so it has no plane
+/// list to grow and "a plane list may have appeared" cannot be true of it.
+///
+/// That distinction is not hypothetical. op8 is the arm64 present path, and on
+/// a driven arm64 boot this alarm fires on **every present**, 1 668 times in
+/// 212 s, always as `op=0x8 plen=40 trailer=12`. The message it printed was an
+/// explanation that structurally could not apply, on a first-class pathway's
+/// normal traffic. What is true there is narrower and is what it says now: 28
+/// bytes past the words this device knows, contents unnamed.
+///
+/// So the line carries the undecoded tail's bytes. It is latched per
+/// `(opcode, length)` and therefore costs one line per shape per boot, and
+/// without them a reader who sees this alarm has to rebuild and reboot before
+/// learning anything at all — which is what closing the gap actually needs.
+///
+/// # What the arm64 guest actually puts there
+///
+/// Measured, and deliberately not interpreted. On two boots at 1920×1080 the
+/// tail is byte-identical and there is exactly **one** `(opcode, length)` shape
+/// in the whole boot — `op=0x8 plen=40` — so this is what every present on this
+/// pathway carries:
+///
+/// ```text
+/// +0x0c  00 00 00 00
+/// +0x10  00 40 10 00
+/// +0x14  00 00 00 00
+/// +0x18  00 40 00 00
+/// +0x1c  00 00 00 00
+/// +0x20  01 01 00 00
+/// +0x24  00 00 40 48
+/// ```
+///
+/// No field here is named, and none should be until it has been made to move.
+/// Read as little-endian `u32` the non-zero words are `0x00104000`, `0x00004000`,
+/// `0x00000101` and `0x48400000`, and it is tempting to call the second one the
+/// 16 KiB arm64 page size and the first a page-aligned length because
+/// `0x104000 / 0x4000` is exactly 65. That is arithmetic agreeing with a guess,
+/// which is not a derivation — every one of those words is also consistent with
+/// a stride, an extent, a pair of `u16`s, or a `f32` (`0x48400000` is 196608.0).
+///
+/// **The experiment that would settle it is a display mode change.** Change the
+/// guest's resolution, take the alarm's line again — the latch is keyed on
+/// length, so a second mode at the same length needs the latch cleared or a
+/// second boot — and diff the seven words. Whatever tracks width, height or
+/// stride identifies itself immediately. Nothing short of that should turn
+/// these into named fields.
 fn note_display_txn_payload(state: &mut DeviceState, channel_id: u32, packet: &Packet) {
     let plen = packet.payload.len();
     let trailer = display_txn_trailer_len(packet.opcode);
-    let tail_base = plen.checked_sub(trailer);
-    let word =
-        |off: usize| -> Option<u32> { (off + 4 <= plen).then(|| ld32(&packet.payload[off..])) };
-    let show =
-        |v: Option<u32>| -> String { v.map_or_else(|| "-".to_string(), |w| format!("{w:#010x}")) };
-    let tail = |slot: usize| -> Option<u32> { tail_base.and_then(|base| word(base + slot * 4)) };
-
-    let (surface_slot, task_slot) = display_txn_trailer_slots(packet.opcode);
-    let pipe = tail(0);
-    let surface = tail(surface_slot);
-    let task = task_slot.and_then(tail);
-
-    let seen = state
-        .display
-        .txn_payload_samples
-        .entry((
-            packet.opcode,
-            plen,
-            pipe.unwrap_or(u32::MAX),
-            task.is_some_and(|t| t != 0),
-        ))
-        .or_insert(0);
-    if *seen >= DISPLAY_TXN_PAYLOAD_SAMPLES {
+    if plen <= trailer {
         return;
     }
-    *seen += 1;
-    let sample = *seen;
-
-    let dumped = plen.min(DISPLAY_TXN_PAYLOAD_DUMP_MAX);
-    let mut hex = String::with_capacity(dumped * 2);
-    for b in &packet.payload[..dumped] {
+    crate::runtime::drain::note_store_route("display_txn_payload_overlong");
+    // Latched per (opcode, length): a guest that grew this command grew it for
+    // every frame, and the thousandth line says nothing the first did not.
+    if !state
+        .display
+        .txn_payload_samples
+        .insert((packet.opcode, plen))
+    {
+        return;
+    }
+    // Bounded, because the length is the guest's. 64 bytes is four times the
+    // largest trailer here and is enough to show the shape of whatever follows.
+    const TAIL_DUMP_MAX: usize = 64;
+    let tail = &packet.payload[trailer..];
+    let shown = tail.len().min(TAIL_DUMP_MAX);
+    let mut hex = String::with_capacity(shown * 3);
+    for b in &tail[..shown] {
         hex.push_str(&format!("{b:02x}"));
     }
-
+    let what = if packet.opcode == CHILD_OP_DISPLAY_SWAP {
+        // No transaction is serialized here, so there is no plane list this
+        // could be. Naming one would send the next reader looking for a
+        // structure that cannot exist on this command.
+        "this command names a single mapping and serializes no transaction, so these \
+         bytes are not a plane list and nothing in this device names them"
+    } else {
+        "the command carries more than its declared trailer, so a plane list may have \
+         appeared and decoding a single surface id would be dropping planes"
+    };
     crate::observe::fail(format!(
-        "display_txn_payload op={:#x} ch={channel_id} plen={plen} total_size={} stamp={:#x} \
-         sample={sample}/{DISPLAY_TXN_PAYLOAD_SAMPLES} trailer={trailer} \
-         pipe={} surface={} task={} \
-         head0={} head1={} head2={} tail0={} tail1={} tail2={} dumped={dumped} hex={hex}",
+        "display_txn_payload_overlong op={:#x} ch={channel_id} plen={plen} trailer={trailer} \
+         undecoded={} tail=0x{hex}{} ({what})",
         packet.opcode,
-        packet.total_size,
-        packet.completion_stamp,
-        show(pipe),
-        show(surface),
-        show(task),
-        show(word(0)),
-        show(word(4)),
-        show(word(8)),
-        show(tail(0)),
-        show(tail(1)),
-        show(tail(2)),
+        tail.len(),
+        if shown < tail.len() { "..." } else { "" },
     ));
 }
 
@@ -752,21 +827,31 @@ fn process_root_packet<H: HostMemory + HostOps>(
 
     match effective {
         ROOT_OP_DEVICE_INFO_TAHOE => {
-            if packet.payload.len() >= DEVICE_INFO_TAHOE_REPLY_PFN + 4 {
+            if !packet_short(
+                "device_info_tahoe",
+                None,
+                packet.payload.len(),
+                DEVICE_INFO_TAHOE_REPLY_PFN + 4,
+            ) {
                 let count = ld32(&packet.payload[DEVICE_INFO_TAHOE_COUNT..]);
                 let pfn = ld32(&packet.payload[DEVICE_INFO_TAHOE_REPLY_PFN..]);
                 let _ = reply_device_info(host, count, pfn, state.page_shift, state.gfx.version);
             }
         }
         ROOT_OP_DEVICE_INFO_MONTEREY => {
-            if packet.payload.len() >= DEVICE_INFO_MONTEREY_REPLY_PFN + 4 {
+            if !packet_short(
+                "device_info_monterey",
+                None,
+                packet.payload.len(),
+                DEVICE_INFO_MONTEREY_REPLY_PFN + 4,
+            ) {
                 let count = ld32(&packet.payload[DEVICE_INFO_MONTEREY_COUNT..]);
                 let pfn = ld32(&packet.payload[DEVICE_INFO_MONTEREY_REPLY_PFN..]);
                 let _ = reply_device_info(host, count, pfn, state.page_shift, state.gfx.version);
             }
         }
         ROOT_OP_DEFINE_FIFO => {
-            if packet.payload.len() >= 4 {
+            if !packet_short("define_fifo", None, packet.payload.len(), 4) {
                 let ch = ld32(&packet.payload[0..]);
                 if ch >= 1 && (ch as usize) < MAX_CHANNELS {
                     let bit = 1u32 << ch;
@@ -780,7 +865,7 @@ fn process_root_packet<H: HostMemory + HostOps>(
             }
         }
         ROOT_OP_FREE_FIFO => {
-            if packet.payload.len() >= 4 {
+            if !packet_short("free_fifo", None, packet.payload.len(), 4) {
                 let ch = ld32(&packet.payload[0..]);
                 if ch >= 1 && (ch as usize) < MAX_CHANNELS {
                     let bit = 1u32 << ch;
@@ -795,7 +880,12 @@ fn process_root_packet<H: HostMemory + HostOps>(
         }
         ROOT_OP_DEFINE_TASK2 => apply_define_task2(state, host, &packet.payload, "root"),
         ROOT_OP_SET_OBJECT_LIST => {
-            if packet.payload.len() >= SET_OBJECT_LIST_LEN {
+            if !packet_short(
+                "set_object_list",
+                None,
+                packet.payload.len(),
+                SET_OBJECT_LIST_LEN,
+            ) {
                 let task_id = ld32(&packet.payload[SET_OBJECT_LIST_TASK_ID..]);
                 let pfn = ld32(&packet.payload[SET_OBJECT_LIST_PFN..]);
                 let count = ld32(&packet.payload[SET_OBJECT_LIST_COUNT..]);
@@ -1468,66 +1558,6 @@ fn log_present_page_identity(state: &DeviceState, mapping: u32, w: u32, h: u32) 
     }
 }
 
-/// Always-on diagnostic: sample spread guest pages of the present-named
-/// surface and log BGRA-interpreted content stats.
-///
-/// Decides whether the guest itself writes frame content into the presented
-/// surface's own pages (the pages are pixel storage, so page bytes ARE
-/// decoded surface content). Bounded: at most 16 pages per present, logged
-/// only when the sampled stats change, capped per mapping. Never selects
-/// behavior.
-fn log_present_named_page_content<H: HostMemory + HostOps>(
-    state: &DeviceState,
-    host: &mut H,
-    mapping: u32,
-) {
-    use std::collections::HashMap;
-    use std::sync::Mutex;
-    type PageContentStats = (usize, u8, u32);
-    type PageContentByMapping = HashMap<u32, PageContentStats>;
-    static LAST: Mutex<Option<PageContentByMapping>> = Mutex::new(None);
-    const SAMPLE_PAGES: usize = 16;
-    const LOG_CAP_PER_MID: u32 = 32;
-    let Some(m) = state.mappings.get(&mapping) else {
-        return;
-    };
-    if m.page_entries.is_empty() {
-        return;
-    }
-    let n = m.page_entries.len();
-    let step = (n / SAMPLE_PAGES).max(1);
-    let page_size = state.page_size() as usize;
-    let mut buf = vec![0u8; page_size];
-    let mut rgb_nz = 0usize;
-    let mut max_rgb = 0u8;
-    let mut pages_read = 0usize;
-    for i in (0..n).step_by(step).take(SAMPLE_PAGES) {
-        let Some(gpa) =
-            crate::contract::iosurface_pages::entry_gpa_shift(m.page_entries[i], state.page_shift)
-        else {
-            continue;
-        };
-        if host.read_gpa(gpa, &mut buf).is_err() {
-            continue;
-        }
-        pages_read += 1;
-        let (nz, mx, _) = crate::observe::bgra_rgb_stats(&buf);
-        rgb_nz += nz;
-        max_rgb = max_rgb.max(mx);
-    }
-    let mut guard = LAST.lock().unwrap_or_else(|p| p.into_inner());
-    let last = guard.get_or_insert_with(HashMap::new);
-    let entry = last.entry(mapping).or_insert((usize::MAX, 0, 0));
-    if entry.2 >= LOG_CAP_PER_MID || (entry.0 == rgb_nz && entry.1 == max_rgb) {
-        return;
-    }
-    *entry = (rgb_nz, max_rgb, entry.2 + 1);
-    crate::observe::fail(format!(
-        "present_named_pages mid={mapping} sampled={pages_read}/{SAMPLE_PAGES} step={step} rgb_nz={rgb_nz} max_rgb={max_rgb} map_gen={}",
-        m.map_generation
-    ));
-}
-
 /// Present a named mapping to the host console (DisplaySwap / x86 present op6/7).
 fn present_named_mapping<H: HostMemory + HostOps>(
     state: &mut DeviceState,
@@ -1632,7 +1662,6 @@ fn present_named_mapping<H: HostMemory + HostOps>(
         state.present.height = h;
         state.present.generation = gen;
         log_present_page_identity(state, mapping, w, h);
-        log_present_named_page_content(state, host, mapping);
         // Every present takes one route: capture the surface the transaction
         // named. A ClearOnly present — one whose named mid's most recent write
         // was a `display_clear`/CLEAR Store rather than a draw — used to take a
@@ -1746,30 +1775,20 @@ fn present_named_mapping<H: HostMemory + HostOps>(
                      (dmabuf carried the frame; no CPU pixels to judge)"
                 ));
             } else if verdict == PresentContentVerdict::Black {
-                // Measure dual-mid: other same-geom host_caches with visible RGB
-                // while the named mid freezes black (console stays black).
-                let mut peers = String::new();
-                for (&mid, e) in state.host_surfaces.iter() {
-                    if mid == mapping || e.width != w || e.height != h || e.bgra.is_empty() {
-                        continue;
-                    }
-                    let (pnz, pmax, _) = crate::observe::bgra_rgb_stats(&e.bgra);
-                    if pmax > 0 && pnz > 10_000 {
-                        if !peers.is_empty() {
-                            peers.push(',');
-                        }
-                        peers.push_str(&format!(
-                            "mid{mid}:rgb_nz={pnz}:max_rgb={pmax}:hgen={}",
-                            e.host_gen
-                        ));
-                    }
-                }
+                // Both lines name the mapping the guest asked us to show and say
+                // it came out black. They deliberately do not go looking for a
+                // different surface that looks better: "which other host surface
+                // has real content" is a judgement about observed pixels, and
+                // `scanout::present_capture` already removed the same walk —
+                // same undefended non-zero-pixel threshold — for that reason. A
+                // black present is a decode or a writeback fault, and the mid,
+                // geometry and generation here are what locate it.
                 crate::observe::off(format!(
-                    "present_black mid={mapping} {w}x{h} gen={gen} rgb_nz={rgb_nz} px0=[{},{},{},{}] (QMP will be black) peers=[{peers}]",
+                    "present_black mid={mapping} {w}x{h} gen={gen} rgb_nz={rgb_nz} px0=[{},{},{},{}] (QMP will be black)",
                     px0[0], px0[1], px0[2], px0[3]
                 ));
                 crate::observe::fail(format!(
-                    "present_black_retain mid={mapping} {w}x{h} gen={gen} (alpha-only/black +0x188) peers=[{peers}]"
+                    "present_black_retain mid={mapping} {w}x{h} gen={gen} (alpha-only/black +0x188)"
                 ));
             } else {
                 crate::observe::off(format!(
@@ -1890,23 +1909,23 @@ fn process_child_packet<H: HostMemory + HostOps>(
             );
         }
         CHILD_OP_SET_OBJECT_LIST => {
-            if packet.payload.len() >= SET_OBJECT_LIST_LEN {
+            // A short SET_OBJECT_LIST leaves the task's object list unbound —
+            // every type-11 texture/object resolve on it then fails
+            // (object_list_count==0). Never on a well-formed boot.
+            if !packet_short(
+                "set_object_list",
+                Some(channel_id),
+                packet.payload.len(),
+                SET_OBJECT_LIST_LEN,
+            ) {
                 let task_id = ld32(&packet.payload[SET_OBJECT_LIST_TASK_ID..]);
                 let pfn = ld32(&packet.payload[SET_OBJECT_LIST_PFN..]);
                 let count = ld32(&packet.payload[SET_OBJECT_LIST_COUNT..]);
                 let _ = state.set_object_list(task_id, pfn, count);
-            } else {
-                // A short SET_OBJECT_LIST silently leaves the task's object list
-                // unbound — every type-11 texture/object resolve on it then
-                // fails (object_list_count==0). Never on a well-formed boot.
-                crate::observe::fail(format!(
-                    "child_packet_short reason=set_object_list_short ch={channel_id} plen={} need={SET_OBJECT_LIST_LEN}",
-                    packet.payload.len()
-                ));
             }
         }
         CHILD_OP_DELETE_OBJECT => {
-            if packet.payload.len() >= 8 {
+            if !packet_short("delete_object", Some(channel_id), packet.payload.len(), 8) {
                 let task_id = ld32(&packet.payload[0..]);
                 let id = ld32(&packet.payload[4..]);
                 let _ = state.delete_object(task_id, id);
@@ -1927,7 +1946,15 @@ fn process_child_packet<H: HostMemory + HostOps>(
             ));
         }
         CHILD_OP_SETUP_SHARED_STATE => {
-            if packet.payload.len() >= CHILD_SHARED_STATE_LEN {
+            // A short SETUP_SHARED_STATE drops display registration:
+            // shared_gpa/index never latch, so the display NEVER onlines and the
+            // boot wedges on a blank/console frame. The loudest of this class.
+            if !packet_short(
+                "setup_shared_state",
+                Some(channel_id),
+                packet.payload.len(),
+                CHILD_SHARED_STATE_LEN,
+            ) {
                 let index = ld32(&packet.payload[CHILD_SHARED_STATE_INDEX..]);
                 let pfn = ld32(&packet.payload[CHILD_SHARED_STATE_PFN..]);
                 // reinit=1 means the guest tears down + re-registers the display
@@ -1952,16 +1979,6 @@ fn process_child_packet<H: HostMemory + HostOps>(
                 // Do **not** pulse ONLINE here — enable() has not set +0x104 yet
                 // (archive poll waits for mask bit 2, then pending+IRQ).
                 fill_display_descriptor(host, state.display.shared_gpa, index, state.page_size());
-            } else {
-                // A short SETUP_SHARED_STATE silently drops display registration:
-                // shared_gpa/index never latch, so the display NEVER onlines and
-                // the boot wedges on a blank/console frame with no root cause.
-                // The single loudest silent-drop in the pipeline. Never on a
-                // well-formed boot.
-                crate::observe::fail(format!(
-                    "child_packet_short reason=setup_shared_state_short ch={channel_id} plen={} need={CHILD_SHARED_STATE_LEN}",
-                    packet.payload.len()
-                ));
             }
         }
         CHILD_OP_ONLINE_ACK => {
@@ -2059,7 +2076,7 @@ fn process_child_packet<H: HostMemory + HostOps>(
             }
         }
         CHILD_OP_CURSOR_SHOW => {
-            if packet.payload.len() >= 8 {
+            if !packet_short("cursor_show", Some(channel_id), packet.payload.len(), 8) {
                 let show = ld32(&packet.payload[4..]) != 0;
                 state.cursor.show = show;
                 sample_cursor_position(state, host);
@@ -2140,6 +2157,24 @@ fn process_child_packet<H: HostMemory + HostOps>(
         crate::runtime::decode::fifo::CHILD_OP_CONFIG_40 => {
             let _ = reply_heap_texture_size_and_align(state, host, &packet.payload);
         }
+        // The one packet that says a cached page list has gone stale. It used to
+        // sit in the stamp-and-forget family below, which is why
+        // `mapping_page_drift` could report "the guest re-pointed this surface
+        // and no packet said so" — the packet arrived and was discarded.
+        CHILD_OP_REPLACE_PHYSICAL => {
+            if !packet_short(
+                "replace_physical",
+                Some(channel_id),
+                packet.payload.len(),
+                crate::runtime::decode::fifo::CHILD_REPLACE_PHYSICAL_LEN as usize,
+            ) {
+                if let Some(cmd) =
+                    crate::runtime::decode::fifo::decode_replace_physical(&packet.payload)
+                {
+                    crate::runtime::objects::replace_physical(state, cmd.task_id, cmd.object_id);
+                }
+            }
+        }
         // PVG bookkeeping family: accept + stamp (already below). Full PT/map
         // semantics land with metal2vulkan encode; until then fail-visible
         // UnknownChildOpcode flooded /tmp/reims-vgpu-fail and hid draw telemetry.
@@ -2147,8 +2182,7 @@ fn process_child_packet<H: HostMemory + HostOps>(
         | CHILD_OP_MAP_MEMORY2
         | CHILD_OP_INVALIDATE_RESOURCES
         | CHILD_OP_SYNCHRONIZE_RESOURCES
-        | CHILD_OP_DELETE_IOSURFACE_BACKING2
-        | CHILD_OP_REPLACE_PHYSICAL => {
+        | CHILD_OP_DELETE_IOSURFACE_BACKING2 => {
             // Stamp-complete for PT wire (no invent). Unmap/Map retire
             // gva_host_views; verbose-gated map_probe census for stage Unmapped.
             //
@@ -2157,7 +2191,6 @@ fn process_child_packet<H: HostMemory + HostOps>(
             let plen = packet.payload.len();
             let name = match packet.opcode {
                 CHILD_OP_MAP_MEMORY2 => "MapMemory2",
-                CHILD_OP_REPLACE_PHYSICAL => "ReplacePhysical",
                 CHILD_OP_UNMAP_MEMORY => "UnmapMemory",
                 CHILD_OP_INVALIDATE_RESOURCES => "InvalidateResources",
                 CHILD_OP_SYNCHRONIZE_RESOURCES => "SynchronizeResources",
@@ -2273,8 +2306,8 @@ fn process_child_packet<H: HostMemory + HostOps>(
                 // the broad implementation is not kept around to be switched
                 // back on. See kb map-memory2 / xnu-pte-corruption-windowserver.
             } else if packet.opcode == CHILD_OP_DELETE_IOSURFACE_BACKING2 && plen >= 8 {
-                // Live Ventura payload + current-kext symbol agree with the
-                // resource contract: `{objectID, taskID}`. This is the lifetime
+                // The live Ventura payload agrees with the resource contract:
+                // `{objectID, taskID}`. This is the lifetime
                 // boundary for the host IOSurface backing, not stamp-only
                 // bookkeeping. Keeping page_entries after it lets later id
                 // reuse/clear write pixels into pages the guest has recycled.
@@ -2553,11 +2586,32 @@ fn process_child_packet<H: HostMemory + HostOps>(
                 ));
             }
         }
+        // A fence with no payload. The guest emits it from a present's failure
+        // and teardown legs to order work it is abandoning, and retiring its
+        // stamps — which the drain does for every accepted packet — is the whole
+        // contract. Named so it stops being reported as an unknown opcode.
+        CHILD_OP_FLUSH_CHANNEL_EVENT => {
+            crate::runtime::drain::note_store_route("child_flush_channel_event");
+            // The command allocates no bytes, so payload is the one thing that
+            // can falsify this reading. Bytes here would mean the command grew a
+            // form this arm does not decode, and dropping them silently is what
+            // the unknown-opcode arm was at least loud about.
+            if !packet.payload.is_empty() {
+                crate::observe::fail(format!(
+                    "child_flush_channel_event fail reason=unexpected_payload ch={channel_id} \
+                     plen={} (this command carries stamps only; a payload means it has grown \
+                     a form this arm does not decode)",
+                    packet.payload.len()
+                ));
+            }
+        }
         _ => {
             state.record_fail(FailEvent::UnknownChildOpcode {
                 channel: channel_id,
                 opcode: packet.opcode,
                 total_size: packet.total_size,
+                stamp_count: packet.stamp_count,
+                payload: packet.payload.clone(),
             });
         }
     }
@@ -2849,11 +2903,17 @@ pub fn drain_iosfc<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut 
                     if let Some(c) = cap {
                         state.mapper_capture = Some(c);
                     }
-                    // Unknown mapper request: fail-visible, still advance.
+                    // Unknown mapper request: fail-visible, still advance. A
+                    // mapper ring entry is not a FIFO packet — it carries no
+                    // stamps and no payload span — so the two packet-shaped
+                    // fields report the absence rather than borrowing the
+                    // entry's bytes and implying a framing it does not have.
                     state.record_fail(FailEvent::UnknownChildOpcode {
                         channel: 0,
                         opcode: rtype as u16,
                         total_size: MAPPER_REQUEST_ENTRY_LEN as u32,
+                        stamp_count: 0,
+                        payload: Vec::new(),
                     });
                 }
             }
@@ -2909,7 +2969,7 @@ pub fn signal_display_present_complete<H: HostMemory + HostOps>(
     // A bit2 (ONLINE) still pending *after* online was acked is stale: the guest
     // already consumed that online event (`online_acked`), so re-delivering it
     // makes `signalDisplay` re-run process_online → connectionChange → a
-    // boot-progress overlay rebuild (x86 RE 2026-07-17: the host-driven strobe).
+    // boot-progress overlay rebuild (the host-driven strobe).
     // Preserving bit2 via the `pending |` write is only correct *pre-ack*; drop
     // it once acked so we don't hand the guest a redundant online. `stale` is 0
     // on healthy boots (bit2 clears at ack), so this is a no-op there — it only
@@ -3198,6 +3258,20 @@ pub enum FlushRail {
 /// guest pages, for ~62 presented frames. Every phase here is proportional to
 /// that volume, so the next lever is reading back less than the whole
 /// attachment, not making any one phase faster.
+///
+/// The obvious form of that lever does not pay, and the number is recorded here
+/// so it is not re-derived. The guest already supplies a damage rect —
+/// `OP_SET_SCISSOR`, decoded verbatim into `req.scissor` — so a writeback could
+/// land only the scissored region. A 30 s driven Safari probe on the
+/// x86/PCI/Vulkan pathway bucketed every window-arming Store by the fraction of
+/// its attachment the scissor covered: **99.34% of the texels a Store arms are
+/// texels it covers**. Half the Stores carry no scissor at all and the other
+/// half carry one spanning the whole attachment; the small ones were 0.8% of the
+/// population and 0.66% of the area. The 35% of *all* draws that are scissored
+/// are the small draws *inside* a pass — an icon, a glyph run, a window's own
+/// layer — while the Store that ends a full-screen composite declares the full
+/// screen. Reading back less has to find its evidence somewhere other than the
+/// guest's scissor.
 ///
 /// This paragraph used to end "[`Fence`](Self::Fence) is the GPU rendering the
 /// frame rather than latency to reschedule — that is measured, not assumed",
@@ -3749,9 +3823,14 @@ impl DrainDutyCensus {
     /// The inside of the render rail over the window `drain_duty` just
     /// reported, or `None` when nothing was read back in it.
     ///
-    /// Sits under `flush_rails`'s `render_us` and divides it: a `fence_us` that
-    /// owns the line is GPU round-trip latency and no smaller copy touches it,
-    /// while a `map_us`/`write_us` that owns it is bytes and a dirty rect would.
+    /// Sits under `flush_rails`'s `render_us` and divides it. Read `gpu_us` and
+    /// `bar_us` before concluding anything from `fence_us`: they are the GPU's
+    /// own timestamps taken from inside that wait, so `fence_us` owning the line
+    /// means latency only when `gpu_us` is a small part of it. When `gpu_us`
+    /// owns `fence_us` the wait is the readback command buffer copying, which is
+    /// bytes and a smaller copy does touch it; `bar_us` is the draw batch queued
+    /// ahead of it, and only that part is a scheduling cost rather than a size
+    /// one. `map_us`/`write_us` are host-side bytes either way.
     pub(crate) fn take_readback_split(&self) -> Option<String> {
         use std::sync::atomic::Ordering::Relaxed;
         let win_ms = self.last_win_ms.load(Relaxed);
@@ -4319,10 +4398,6 @@ pub fn note_drain_tranche(drain_us: u64, publish_us: u64) {
         // the timer is runtime-side and the Metal arm can adopt it without a
         // second census.
         emit_chain_phase();
-        // Under the write and readback splits, which price the writeback in
-        // bytes and in fence time; this says how many of those bytes the
-        // destination already held.
-        emit_land_redundancy();
     }
 }
 
@@ -4521,54 +4596,6 @@ fn emit_bind_phase() {
     ));
 }
 
-/// How much of the render writeback's bytes the guest's pages already held,
-/// over a sample of the window's landings.
-///
-/// Read beside `write_split`, which says how many bytes were stored, and
-/// `readback_split`'s `gpu_us`, which says what carrying them across the bus
-/// cost. This says how many of them the destination already had — see
-/// [`crate::runtime::land_redundancy`] for why that is a different question
-/// from the declared damage rect, which is already measured at 99.34% of the
-/// attachment and worth nothing.
-///
-/// One line per writeback leg that compared anything — `store_routes` counts
-/// the two apart at `mapw_fence_flush` and `gvaw_fence_flush`, and one blended
-/// fraction over both would describe neither. A leg that measured nothing emits
-/// nothing, so an idle desktop costs no line and a zero always means "measured
-/// and not redundant" rather than "not measured".
-///
-/// The `whole=`/`over_90=` tail is each audited walk placed by its *own*
-/// redundancy, with the bytes it carried beside it. `same_fine` is a mean over
-/// the window, and a mean cannot separate a few wholly-unchanged landings from
-/// every landing being mostly unchanged — the first is collected by a
-/// landing-granular skip and the second only by tile compaction.
-///
-/// Walks and bytes are separate `key=value` fields rather than one packed pair
-/// because every reader of this log — the drag probe's parser and
-/// `constant-fields.sh` among them — reads a field as a single number.
-fn emit_land_redundancy() {
-    for (leg, w) in crate::runtime::land_redundancy::take_window() {
-        let buckets = w
-            .buckets()
-            .map(|(label, walks, bytes)| format!("{label}={walks} {label}_bytes={bytes}"))
-            .collect::<Vec<_>>()
-            .join(" ");
-        crate::observe::off(format!(
-            "land_redundancy leg={} audits={} calls={} runs={} bytes={} pages={} \
-             same_pages={} fine={} same_fine={} {buckets}",
-            leg.label(),
-            w.audits,
-            w.calls,
-            w.runs,
-            w.bytes,
-            w.pages,
-            w.same_pages,
-            w.fine,
-            w.same_fine,
-        ));
-    }
-}
-
 fn emit_chain_phase() {
     let Some(w) = crate::runtime::chain_phase::take_window() else {
         return;
@@ -4658,9 +4685,6 @@ fn emit_stage_phase() {
         w.shift_b,
     ));
 }
-
-#[cfg(not(feature = "backend-vulkan"))]
-fn emit_draw_phase() {}
 
 #[cfg(not(feature = "backend-vulkan"))]
 fn emit_engine_delta() {}

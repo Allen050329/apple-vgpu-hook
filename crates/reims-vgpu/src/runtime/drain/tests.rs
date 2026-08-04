@@ -414,26 +414,99 @@ fn delete_task_root_clears_active_task() {
     );
 }
 
-/// CmdReplacePhysical (0x3c) is stamp-complete bookkeeping — not UnknownChildOpcode.
+/// CmdReplacePhysical (0x3c) is the guest saying a cached page list is stale.
+///
+/// It must drop that list rather than stamp and forget it. The surface id, the
+/// geometry and the GPU-VA are all unchanged across the re-commit, so a device
+/// that ignores this packet has no other way to learn the pages moved — which
+/// is what `mapping_page_drift`'s "no packet said so" was reporting.
 #[test]
-fn replace_physical_is_accepted_not_unknown() {
+fn replace_physical_drops_the_cached_page_list() {
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
+    state.map_surface(7);
+    {
+        let m = state.mappings.get_mut(&7).unwrap();
+        m.mapped = true;
+        m.page_entries = vec![0x11, 0x22, 0x33];
+    }
+    let generation_before = state.mappings.get(&7).unwrap().map_generation;
+
+    // A type-11 texture registered under object-list *ref* 7 of the same task,
+    // naming a different mapping. Surface ids and object-list refs are separate
+    // id spaces that collide, so resolving this packet through the ref-keyed map
+    // would land on mapping 99 — invalidating a surface the guest never named
+    // and leaving stale the one it did.
+    state.map_surface(99);
+    {
+        let m = state.mappings.get_mut(&99).unwrap();
+        m.mapped = true;
+        m.page_entries = vec![0xaa];
+    }
+    state.texture_to_mapping.insert((0, 7), 99);
+
+    let mut payload = vec![0u8; 8];
+    payload[4..8].copy_from_slice(&7u32.to_le_bytes()); // {task 0, object 7}
     let pkt = Packet {
         opcode: CHILD_OP_REPLACE_PHYSICAL,
         stamp_count: 0,
         total_size: PACKET_HEADER_LEN + 8,
         completion_stamp: 0,
-        payload: vec![0u8; 8], // {taskID, objectID} placeholder
+        payload,
         next_head: 0,
     };
     process_child_packet(&mut state, &mut host, 2, &pkt);
+
     assert!(
         !state
             .fails
             .iter()
             .any(|e| matches!(e, FailEvent::UnknownChildOpcode { opcode: 0x3c, .. })),
         "0x3c must not flood UnknownChildOpcode"
+    );
+    let m = state.mappings.get(&7).unwrap();
+    assert!(
+        m.page_entries.is_empty(),
+        "the announced re-point must drop the stale page list"
+    );
+    assert_ne!(
+        m.map_generation, generation_before,
+        "dropping the list must bump the incarnation, which is what retires the \
+         type-4 walk latch and any state keyed on it"
+    );
+    assert_eq!(
+        state.mappings.get(&99).unwrap().page_entries,
+        vec![0xaa],
+        "the object id is a mapping id, not an object-list ref: a mapping that \
+         merely shares the ref must be left alone"
+    );
+}
+
+/// A short 0x3c is a lost invalidation, not a no-op: the device would keep
+/// writing through pages the guest has re-pointed. It must be named, and it
+/// must not silently drop a list it could not identify.
+#[test]
+fn a_short_replace_physical_is_reported_and_drops_nothing() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    state.map_surface(7);
+    {
+        let m = state.mappings.get_mut(&7).unwrap();
+        m.mapped = true;
+        m.page_entries = vec![0x11];
+    }
+    let pkt = Packet {
+        opcode: CHILD_OP_REPLACE_PHYSICAL,
+        stamp_count: 0,
+        total_size: PACKET_HEADER_LEN + 4,
+        completion_stamp: 0,
+        payload: vec![0u8; 4],
+        next_head: 0,
+    };
+    process_child_packet(&mut state, &mut host, 2, &pkt);
+    assert!(
+        !state.mappings.get(&7).unwrap().page_entries.is_empty(),
+        "a packet too short to name an object must not invalidate one"
     );
 }
 
@@ -2061,8 +2134,7 @@ fn an_owned_writeback_publishes_its_frame_to_the_cache_without_copying_it() {
         &frame,
         stride,
         w,
-        h,
-        &[]
+        h
     ));
 
     let published = crate::runtime::surface_cache::get(&state, 7, w, h)
@@ -2087,8 +2159,7 @@ fn an_owned_writeback_publishes_its_frame_to_the_cache_without_copying_it() {
         &padded,
         padded_stride,
         w,
-        h,
-        &[]
+        h
     ));
     let repacked = crate::runtime::surface_cache::get(&state, 7, w, h).unwrap();
     assert_ne!(
@@ -2142,7 +2213,7 @@ fn a_borrowed_writeback_drops_the_cache_entry_rather_than_leaving_it_stale() {
     // An owning writeback first, so there is an entry to be left behind.
     let first = std::sync::Arc::new(vec![0x11u8; need]);
     assert!(write_bgra8_owned(
-        &mut state, &mut host, 9, &first, stride, w, h, &[]
+        &mut state, &mut host, 9, &first, stride, w, h
     ));
     assert!(
         crate::runtime::surface_cache::get(&state, 9, w, h).is_some(),
@@ -2151,7 +2222,7 @@ fn a_borrowed_writeback_drops_the_cache_entry_rather_than_leaving_it_stale() {
 
     let second: Vec<u8> = (0..need).map(|i| (i % 241) as u8).collect();
     assert!(write_bgra8_uncached(
-        &mut state, &mut host, 9, &second, stride, w, h, &[]
+        &mut state, &mut host, 9, &second, stride, w, h
     ));
 
     assert!(
@@ -2606,8 +2677,8 @@ fn claim_display_vbl_long_stall_resyncs_without_burst() {
 
 /// After online is acked, a stale ONLINE bit (bit2) left in pending is
 /// suppressed by the present/VBL signalers instead of re-delivered — else the
-/// guest re-runs process_online → connectionChange → boot-progress overlay
-/// (x86 RE 2026-07-17). The signaler still records `stale_online_pending`
+/// guest re-runs process_online → connectionChange → boot-progress overlay.
+/// The signaler still records `stale_online_pending`
 /// (measure + fix together). Pre-ack the bit is preserved (see the present
 /// completion test) — the suppression is gated strictly on `online_acked`.
 #[test]
@@ -3187,18 +3258,76 @@ fn a_translation_hold_is_census_and_only_an_unreleased_one_fails() {
     }
 }
 
-/// The display-transaction probe must key on the payload *shape*, not fire per
-/// present.
+/// The display channel's flush fence is a real command, not an unknown opcode.
 ///
-/// A steady-state x86 boot pushes tens of thousands of opcode-6 packets. An
-/// unbounded `display_txn_payload` line would bury every other always-on record
-/// in the fail log, which is the one place a bad boot explains itself — the
-/// probe would destroy the evidence it exists to collect. A repeat of a shape we
-/// have already sampled carries no new information about where the plane list
-/// lives, so the budget is per
-/// `(opcode, payload_len, pipe_index, task_field_is_set)`.
+/// The guest emits it from the failure and teardown legs of a present, on the
+/// display channel, carrying stamps and no payload. It was landing in the
+/// unknown-opcode arm, which reports a real Apple command as a device defect —
+/// and does so on the display channel exactly when the present path is already
+/// in trouble and someone is reading the log.
+///
+/// Retiring the stamps is the whole contract, so the assertion is that the
+/// packet completes and reports nothing, while a payload — which the command
+/// cannot have, since it allocates no command bytes — still says so.
 #[test]
-fn display_txn_payload_probe_is_bounded_per_wire_shape() {
+fn the_display_flush_fence_is_a_named_command_and_not_a_defect() {
+    use crate::runtime::drain::store_route_count;
+    let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+    let fence = |plen: usize| Packet {
+        opcode: CHILD_OP_FLUSH_CHANNEL_EVENT,
+        stamp_count: 0,
+        total_size: PACKET_HEADER_LEN + plen as u32,
+        completion_stamp: 0,
+        payload: vec![0u8; plen],
+        next_head: 0,
+    };
+
+    let n = store_route_count("child_flush_channel_event");
+    let disposition = process_child_packet(&mut state, &mut host, 4, &fence(0));
+    assert_eq!(
+        disposition,
+        ChildPacketDisposition::Complete,
+        "the stamps must retire, or the guest waits on this fence forever"
+    );
+    assert_eq!(
+        store_route_count("child_flush_channel_event"),
+        n + 1,
+        "the command is counted like every other decoded one"
+    );
+    assert!(
+        !state
+            .fails
+            .iter()
+            .any(|e| matches!(
+                e,
+                FailEvent::UnknownChildOpcode {
+                    opcode: CHILD_OP_FLUSH_CHANNEL_EVENT,
+                    ..
+                }
+            )),
+        "a real Apple command must not be reported as an unknown opcode"
+    );
+
+    // A payload is the one thing that would falsify the stamps-only reading.
+    process_child_packet(&mut state, &mut host, 4, &fence(4));
+    assert_eq!(store_route_count("child_flush_channel_event"), n + 2);
+}
+
+/// A display-transaction command longer than its declared trailer must alarm,
+/// and a conformant one must stay silent.
+///
+/// The guest's display pipe serializes only plane 0's surface id into a
+/// fixed-size command, so decoding a single surface is the whole contract. The
+/// one thing that would falsify that is the payload growing past its declared
+/// size, which would mean a plane list had appeared and this decode had silently
+/// become a truncation. That is the alarm; the conformant sizes are not events.
+///
+/// Latched per `(opcode, payload_len)`, because a guest that grew the command
+/// grew it for every frame.
+#[test]
+fn an_overlong_display_transaction_alarms_once_per_shape() {
+    use crate::runtime::drain::store_route_count;
     let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
     let packet = |opcode: u16, plen: usize| Packet {
         opcode,
@@ -3209,118 +3338,138 @@ fn display_txn_payload_probe_is_bounded_per_wire_shape() {
         next_head: 0,
     };
 
-    for _ in 0..(DISPLAY_TXN_PAYLOAD_SAMPLES * 8) {
-        note_display_txn_payload(&mut state, 5, &packet(CHILD_OP_PRESENT_X86, 12));
-    }
-    assert_eq!(
-        state
-            .display
-            .txn_payload_samples
-            .get(&(CHILD_OP_PRESENT_X86, 12, 0, false)),
-        Some(&DISPLAY_TXN_PAYLOAD_SAMPLES),
-        "a known shape must stop logging once its sample budget is spent"
-    );
-
-    // A *new* length is the whole point of the measurement: if the guest ever
-    // appends an inline plane list the payload grows, and that packet must be
-    // sampled even though the opcode is one we have already seen many times.
-    note_display_txn_payload(&mut state, 5, &packet(CHILD_OP_PRESENT_X86, 64));
-    assert_eq!(
-        state
-            .display
-            .txn_payload_samples
-            .get(&(CHILD_OP_PRESENT_X86, 64, 0, false)),
-        Some(&1),
-        "a new payload length must get its own sample budget"
-    );
-
-    // Opcodes are budgeted independently: 6 and 7 are different commands with
-    // different trailers, and 8 is the arm64 pathway entirely.
+    // Every command at exactly its declared trailer is conformant and silent.
+    let quiet = store_route_count("display_txn_payload_overlong");
+    note_display_txn_payload(&mut state, 5, &packet(CHILD_OP_PRESENT_X86, 0x0c));
     note_display_txn_payload(&mut state, 5, &packet(CHILD_OP_PRESENT_GAMMA_X86, 0x24));
-    note_display_txn_payload(&mut state, 4, &packet(CHILD_OP_DISPLAY_SWAP, 12));
+    note_display_txn_payload(&mut state, 4, &packet(CHILD_OP_DISPLAY_SWAP, 0x0c));
     assert_eq!(
-        state
-            .display
-            .txn_payload_samples
-            .get(&(CHILD_OP_PRESENT_GAMMA_X86, 0x24, 0, false)),
-        Some(&1)
+        store_route_count("display_txn_payload_overlong"),
+        quiet,
+        "a command at its declared size is the contract, not an event"
     );
-    assert_eq!(
-        state
-            .display
-            .txn_payload_samples
-            .get(&(CHILD_OP_DISPLAY_SWAP, 12, 0, false)),
-        Some(&1)
-    );
-}
+    assert!(state.display.txn_payload_samples.is_empty());
 
-/// The plane-0 surface id changes every frame by design; the pipe index and the
-/// task field do not.
-///
-/// Keying the budget on length alone spent it inside the first 400ms of a live
-/// boot and left the probe silent for the rest of the session, because the
-/// length never varies. The trailer's other two words are what still carry news,
-/// so a second display pipe or the task field's first non-zero value must each
-/// re-arm the budget — while a fresh surface id every frame must not, or the
-/// probe becomes unbounded again.
-#[test]
-fn display_txn_payload_probe_rearms_on_trailer_change_but_not_on_surface_id() {
-    let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
-    let trailer = |pipe: u32, surface: u32, task: u32| {
-        let mut payload = Vec::new();
-        payload.extend_from_slice(&pipe.to_le_bytes());
-        payload.extend_from_slice(&surface.to_le_bytes());
-        payload.extend_from_slice(&task.to_le_bytes());
-        Packet {
-            opcode: CHILD_OP_PRESENT_X86,
-            stamp_count: 0,
-            total_size: PACKET_HEADER_LEN + payload.len() as u32,
-            completion_stamp: 0,
-            payload,
-            next_head: 0,
-        }
-    };
-
-    // Bring-up: pipe 0, task still zero, a different surface id every frame.
-    for surface in 0..(DISPLAY_TXN_PAYLOAD_SAMPLES * 8) {
-        note_display_txn_payload(&mut state, 5, &trailer(0, surface + 1, 0));
+    // A payload past the trailer is the one thing that falsifies the decode.
+    for _ in 0..8 {
+        note_display_txn_payload(&mut state, 5, &packet(CHILD_OP_PRESENT_X86, 64));
     }
     assert_eq!(
-        state
-            .display
-            .txn_payload_samples
-            .get(&(CHILD_OP_PRESENT_X86, 12, 0, false)),
-        Some(&DISPLAY_TXN_PAYLOAD_SAMPLES),
-        "a per-frame surface id must not re-arm the budget"
+        store_route_count("display_txn_payload_overlong"),
+        quiet + 8,
+        "the counter carries the magnitude on every occurrence"
     );
     assert_eq!(
         state.display.txn_payload_samples.len(),
         1,
-        "surface ids must not each open their own bucket"
+        "but the line is latched per shape"
     );
 
-    // Steady state: the task field goes non-zero. That transition is the open
-    // question, so it gets a fresh budget exactly once.
-    note_display_txn_payload(&mut state, 5, &trailer(0, 0x2a, 7));
-    note_display_txn_payload(&mut state, 5, &trailer(0, 0x2b, 9));
+    // The gamma variant's trailer is larger, so 0x24 is conformant there while
+    // the same length would be overlong for op6 - the sizes are per command.
+    note_display_txn_payload(&mut state, 5, &packet(CHILD_OP_PRESENT_X86, 0x24));
     assert_eq!(
-        state
-            .display
-            .txn_payload_samples
-            .get(&(CHILD_OP_PRESENT_X86, 12, 0, true)),
-        Some(&2),
-        "the task field's first non-zero value must re-arm the budget"
+        state.display.txn_payload_samples.len(),
+        2,
+        "0x24 is this command's overlong even though it is op7's exact size"
+    );
+}
+
+/// The alarm carries the bytes it is alarming about, and it does not explain
+/// op8 with op6's structure.
+///
+/// Both halves come from the same reading of a driven arm64 boot, where this
+/// alarm fires on **every** present — 1 668 times in 212 s, always `op=0x8
+/// plen=40 trailer=12` — and printed a plane-list explanation that cannot apply
+/// to op8, which serializes no transaction. So the message was wrong about a
+/// first-class pathway's normal traffic, and the reader was told nothing about
+/// the 28 undecoded bytes that would let anyone act on it.
+///
+/// The line is latched per `(opcode, length)`, so the dump costs one line per
+/// shape per boot. Without it, learning what those bytes hold needs a rebuild
+/// and a reboot.
+#[test]
+fn the_overlong_alarm_dumps_the_tail_and_explains_the_right_command() {
+    let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_ARM64E);
+    let packet = |opcode: u16, payload: Vec<u8>| Packet {
+        opcode,
+        stamp_count: 0,
+        total_size: PACKET_HEADER_LEN + payload.len() as u32,
+        completion_stamp: 0,
+        payload,
+        next_head: 0,
+    };
+
+    // op8 at the length the arm64 guest actually sends: 12 known, 28 unnamed.
+    let mut body = vec![0u8; 12];
+    body.extend((0..28u8).map(|i| 0xa0 + i));
+    let cap = crate::observe::FailCapture::start();
+    note_display_txn_payload(&mut state, 4, &packet(CHILD_OP_DISPLAY_SWAP, body));
+    let lines = cap.lines();
+    let line = lines
+        .iter()
+        .find(|l| l.contains("display_txn_payload_overlong"))
+        .unwrap_or_else(|| panic!("the alarm did not fire: {lines:?}"));
+    assert!(
+        line.contains("undecoded=28"),
+        "the line must say how much it could not read: {line}"
+    );
+    assert!(
+        line.contains("tail=0xa0a1a2a3"),
+        "the line must carry the undecoded bytes, starting at the trailer: {line}"
+    );
+    // Asserted on the *claim*, not on the words. The op8 message does mention a
+    // plane list — to say these bytes are not one, which is the conclusion a
+    // reader would otherwise draw from the alarm's name and its op6 sibling.
+    // What it must not do is assert one may have appeared.
+    assert!(
+        !line.contains("may have appeared"),
+        "op8 serializes no transaction, so a plane list is not a thing it can \
+         have grown; claiming one sends the next reader looking for a structure \
+         that cannot exist: {line}"
+    );
+    assert!(
+        line.contains("serializes no transaction"),
+        "the line must say why the plane-list reading does not apply here, or \
+         the next reader re-derives it: {line}"
     );
 
-    // A second display pipe is a different wire shape, not a repeat.
-    note_display_txn_payload(&mut state, 6, &trailer(1, 0x2a, 7));
-    assert_eq!(
-        state
-            .display
-            .txn_payload_samples
-            .get(&(CHILD_OP_PRESENT_X86, 12, 1, true)),
-        Some(&1),
-        "a new pipe index must get its own sample budget"
+    // op6 does serialize a transaction, so the plane-list reading is its own
+    // and must survive. Same alarm, different explanation.
+    let cap = crate::observe::FailCapture::start();
+    note_display_txn_payload(&mut state, 5, &packet(CHILD_OP_PRESENT_X86, vec![7u8; 64]));
+    let lines = cap.lines();
+    let line = lines
+        .iter()
+        .find(|l| l.contains("display_txn_payload_overlong"))
+        .unwrap_or_else(|| panic!("the alarm did not fire for op6: {lines:?}"));
+    assert!(
+        line.contains("may have appeared"),
+        "op6 is the transaction command, so the plane-list reading is its own \
+         and must survive the op8 correction: {line}"
+    );
+
+    // The dump is bounded: the length is guest-controlled, so a pathological
+    // payload must not turn one latched line into an unbounded one.
+    let cap = crate::observe::FailCapture::start();
+    note_display_txn_payload(
+        &mut state,
+        5,
+        &packet(CHILD_OP_PRESENT_X86, vec![0u8; 4096]),
+    );
+    let lines = cap.lines();
+    let line = lines
+        .iter()
+        .find(|l| l.contains("display_txn_payload_overlong"))
+        .unwrap_or_else(|| panic!("the alarm did not fire for the long payload: {lines:?}"));
+    assert!(
+        line.contains("undecoded=4084") && line.contains("..."),
+        "the full length is reported but the dump is truncated and says so: {line}"
+    );
+    assert!(
+        line.len() < 512,
+        "a guest-sized payload must not produce a guest-sized log line: {}",
+        line.len()
     );
 }
 
@@ -3368,34 +3517,29 @@ fn display_txn_trailer_slots_follow_the_emitting_command() {
         );
     }
 
-    // The swap has to survive the budget key, not just the log line: a gamma
-    // packet whose *task* is zero and whose surface id is non-zero must land in
-    // the task-is-zero bucket.
-    let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
-    let mut payload = Vec::new();
-    payload.extend_from_slice(&0u32.to_le_bytes()); // pipe
-    payload.extend_from_slice(&0u32.to_le_bytes()); // task
-    payload.extend_from_slice(&0x2au32.to_le_bytes()); // surface
-    payload.resize(0x24, 0);
-    note_display_txn_payload(
-        &mut state,
-        5,
-        &Packet {
-            opcode: CHILD_OP_PRESENT_GAMMA_X86,
-            stamp_count: 0,
-            total_size: PACKET_HEADER_LEN + payload.len() as u32,
-            completion_stamp: 0,
-            payload,
-            next_head: 0,
-        },
-    );
+    // The swap is between two adjacent u32s, so reading either at the other's
+    // offset yields a plausible value and nothing downstream would complain.
+    // Pin both directions on a payload where the two differ.
+    let mut gamma = Vec::new();
+    gamma.extend_from_slice(&7u32.to_le_bytes()); // pipe
+    gamma.extend_from_slice(&9u32.to_le_bytes()); // task
+    gamma.extend_from_slice(&0x2au32.to_le_bytes()); // surface
+    gamma.resize(0x24, 0);
     assert_eq!(
-        state
-            .display
-            .txn_payload_samples
-            .get(&(CHILD_OP_PRESENT_GAMMA_X86, 0x24, 0, false)),
-        Some(&1),
-        "gamma's task field is slot 1; reading slot 2 would mistake a surface id for it"
+        present_surface_id(CHILD_OP_PRESENT_GAMMA_X86, &gamma),
+        Some(0x2a),
+        "gamma's surface is the third word; the second is its task"
+    );
+
+    let mut plain = Vec::new();
+    plain.extend_from_slice(&7u32.to_le_bytes()); // pipe
+    plain.extend_from_slice(&0x2au32.to_le_bytes()); // surface
+    plain.extend_from_slice(&9u32.to_le_bytes()); // task
+    plain.resize(0x0c, 0);
+    assert_eq!(
+        present_surface_id(CHILD_OP_PRESENT_X86, &plain),
+        Some(0x2a),
+        "the plain command's surface is the second word; the third is its task"
     );
 }
 
@@ -3410,55 +3554,6 @@ fn display_txn_trailer_width_matches_the_emitting_command() {
     assert_eq!(display_txn_trailer_len(CHILD_OP_PRESENT_X86), 0x0c);
     assert_eq!(display_txn_trailer_len(CHILD_OP_PRESENT_GAMMA_X86), 0x24);
     assert_eq!(display_txn_trailer_len(CHILD_OP_DISPLAY_SWAP), 0x0c);
-}
-
-/// Head and tail readings coincide exactly when the payload is trailer-only.
-///
-/// That coincidence is the measurement's verdict: agreement means the plane list
-/// is not inline and a real decode has to reach it another way; divergence means
-/// the list precedes the trailer and our fixed offset-zero read has been parsing
-/// the list header all along.
-#[test]
-fn display_txn_probe_distinguishes_trailer_only_from_prefixed_payload() {
-    let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
-
-    // Trailer-only: [pipe=0][surface=0x2a][task=7].
-    let mut trailer_only = Vec::new();
-    trailer_only.extend_from_slice(&0u32.to_le_bytes());
-    trailer_only.extend_from_slice(&0x2au32.to_le_bytes());
-    trailer_only.extend_from_slice(&7u32.to_le_bytes());
-    assert_eq!(
-        trailer_only.len(),
-        display_txn_trailer_len(CHILD_OP_PRESENT_X86)
-    );
-
-    // Same trailer behind an 8-byte prefix: offset-zero now reads the prefix.
-    let mut prefixed = vec![0xEEu8; 8];
-    prefixed.extend_from_slice(&trailer_only);
-
-    for payload in [trailer_only, prefixed] {
-        let plen = payload.len();
-        note_display_txn_payload(
-            &mut state,
-            5,
-            &Packet {
-                opcode: CHILD_OP_PRESENT_X86,
-                stamp_count: 0,
-                total_size: PACKET_HEADER_LEN + plen as u32,
-                completion_stamp: 0,
-                payload,
-                next_head: 0,
-            },
-        );
-        assert_eq!(
-            state
-                .display
-                .txn_payload_samples
-                .get(&(CHILD_OP_PRESENT_X86, plen, 0, true)),
-            Some(&1),
-            "each distinct shape must be sampled once"
-        );
-    }
 }
 
 /// A present the dmabuf carried is not a black present.
@@ -3890,4 +3985,81 @@ fn the_compute_info_reply_answers_device_limits_not_a_fixed_triple() {
         caps[2].1, 0,
         "static threadgroup memory is per-pipeline; no device limit answers it"
     );
+}
+
+/// Every control arm that guards on payload length names a short payload.
+///
+/// The dispatch is acknowledged either way — `drain_main_fifo` writes the root
+/// completion stamp after the match and `drain_child_fifo` calls `write_stamp`
+/// the same way — so an arm that merely skips tells the guest its command
+/// completed while nothing happened, and leaves no record. The symptom then
+/// surfaces arbitrarily far downstream: a channel that never drains, an object
+/// list that never binds, a display that never onlines.
+///
+/// One packet per arm, each one byte too short, asserting the arm both refuses
+/// (state unchanged) and says so. `define_task2` and `setup_shared_state`
+/// already named theirs and are included so the vocabulary stays one word.
+#[test]
+fn every_short_control_packet_names_itself() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let short = |opcode: u16, len: usize| Packet {
+        opcode,
+        stamp_count: 0,
+        total_size: PACKET_HEADER_LEN + len as u32,
+        completion_stamp: 0,
+        payload: vec![0u8; len],
+        next_head: 0,
+    };
+
+    let before_mask = state.active_child_mask;
+    for (opcode, need) in [
+        (ROOT_OP_DEVICE_INFO_TAHOE, DEVICE_INFO_TAHOE_REPLY_PFN + 4),
+        (
+            ROOT_OP_DEVICE_INFO_MONTEREY,
+            DEVICE_INFO_MONTEREY_REPLY_PFN + 4,
+        ),
+        (ROOT_OP_DEFINE_FIFO, 4),
+        (ROOT_OP_FREE_FIFO, 4),
+        (ROOT_OP_SET_OBJECT_LIST, SET_OBJECT_LIST_LEN),
+        (ROOT_OP_DEFINE_TASK2, DEFINE_TASK_LEN),
+    ] {
+        process_root_packet(&mut state, &mut host, &short(opcode, need - 1));
+    }
+    assert_eq!(
+        state.active_child_mask, before_mask,
+        "a short DEFINE_FIFO must not open a channel"
+    );
+
+    for (opcode, need) in [
+        (CHILD_OP_SET_OBJECT_LIST, SET_OBJECT_LIST_LEN),
+        (CHILD_OP_DELETE_OBJECT, 8),
+        (CHILD_OP_CURSOR_SHOW, 8),
+        (CHILD_OP_SETUP_SHARED_STATE, CHILD_SHARED_STATE_LEN),
+    ] {
+        process_child_packet(&mut state, &mut host, 4, &short(opcode, need - 1));
+    }
+    assert_eq!(
+        state.display.shared_gpa, 0,
+        "a short SETUP_SHARED_STATE must not latch a display page"
+    );
+
+    let log = std::fs::read_to_string(crate::observe::fail_log_path()).expect("fail log");
+    for reason in [
+        "reason=device_info_tahoe_short site=root",
+        "reason=device_info_monterey_short site=root",
+        "reason=define_fifo_short site=root",
+        "reason=free_fifo_short site=root",
+        "reason=set_object_list_short site=root",
+        "reason=define_task2_short site=root",
+        "reason=set_object_list_short site=ch4",
+        "reason=delete_object_short site=ch4",
+        "reason=cursor_show_short site=ch4",
+        "reason=setup_shared_state_short site=ch4",
+    ] {
+        assert!(
+            log.contains(reason),
+            "a short packet was dropped without naming itself: {reason}"
+        );
+    }
 }

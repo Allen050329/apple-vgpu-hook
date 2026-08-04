@@ -22,6 +22,7 @@ use crate::runtime::gva_mem;
 use crate::runtime::gva_mem::write_task_gva_arm64e;
 use crate::runtime::host::FakeHost;
 
+#[cfg(feature = "backend-vulkan")]
 #[test]
 fn spirv_word_parser_splits_short_header_from_misalignment() {
     assert_eq!(
@@ -66,6 +67,7 @@ fn compute_spirv_declines_are_distinct_and_log_safe() {
     }
 }
 
+#[cfg(feature = "backend-vulkan")]
 #[test]
 fn compute_defer_readback_follows_gpu_only_content_gate() {
     assert!(
@@ -283,7 +285,7 @@ fn compute_bind_overflow_drops_the_bind_but_keeps_in_cap_and_unbinds() {
         "index == MAX-1 is the last valid slot"
     );
 
-    // A zero-ref entry is an unbind: expected control flow, silently skipped.
+    // A zero-ref entry is an unbind: expected control flow, no new slot.
     acc.bind_buffers(
         6,
         &[BufferBinding {
@@ -300,6 +302,62 @@ fn compute_bind_overflow_drops_the_bind_but_keeps_in_cap_and_unbinds() {
     assert!(
         acc.threadgroup_memory.is_empty(),
         "over-cap threadgroup memory must not be stored"
+    );
+}
+
+/// A nil entry over an *occupied* compute slot clears it.
+///
+/// `compute_bind_overflow_drops_the_bind_but_keeps_in_cap_and_unbinds` covers
+/// the easy half — a nil at a slot that was already empty adds nothing — and
+/// that half passes whether the arm clears or merely skips. This is the half
+/// that separates them, and it is the half with a consequence: a retained bind
+/// is staged again on the next dispatch, and a texture slot the guest unbound
+/// still receives `writeback_texture`'s output into its guest surface.
+///
+/// The rule is the render rail's, over the same `[first][count][ref x count]`
+/// wire form: `ExecResult::buffer_unbinds` states that explicit nil entries
+/// "must remove prior slot state rather than silently retaining a stale
+/// resource", and `exec::apply_binds` retains-by-slot to do it. All three
+/// compute bind kinds are asserted, because the arm was wrong in all three.
+#[test]
+fn a_nil_entry_clears_an_occupied_compute_slot() {
+    let mut acc = ComputeAccum::default();
+    acc.bind_buffers(
+        3,
+        &[BufferBinding {
+            ref_: 77,
+            ..Default::default()
+        }],
+    );
+    acc.bind_textures(3, &[RefBinding { ref_: 78 }]);
+    acc.bind_samplers(
+        3,
+        &[SamplerBinding {
+            ref_: 79,
+            ..Default::default()
+        }],
+    );
+    assert_eq!((acc.buffers.len(), acc.textures.len(), acc.samplers.len()), (1, 1, 1));
+
+    acc.bind_buffers(
+        3,
+        &[BufferBinding {
+            ref_: 0,
+            ..Default::default()
+        }],
+    );
+    acc.bind_textures(3, &[RefBinding { ref_: 0 }]);
+    acc.bind_samplers(
+        3,
+        &[SamplerBinding {
+            ref_: 0,
+            ..Default::default()
+        }],
+    );
+    assert_eq!(
+        (acc.buffers.len(), acc.textures.len(), acc.samplers.len()),
+        (0, 0, 0),
+        "a nil entry must remove the slot it names, not leave the previous bind live"
     );
 }
 
@@ -1198,6 +1256,7 @@ fn stage_texture_linear_ref_does_not_collide_with_surface_mid() {
     }
 }
 
+#[cfg(feature = "backend-vulkan")]
 #[test]
 fn stage_heap_texture_uses_host_only_residency_identity() {
     use crate::contract::pixel_format::{StorageImageSelector, MTL_FORMAT_RGBA32_FLOAT};
@@ -1266,6 +1325,7 @@ fn stage_heap_texture_uses_host_only_residency_identity() {
     assert_eq!(residency.seed_generation, 0);
 }
 
+#[cfg(feature = "backend-vulkan")]
 /// UnmapMemory removes the guest page-table alias, not the discrete
 /// type-2/3 texture body. Compute writeback must retain raw output, mirror
 /// normalized color for render sampling, and complete without attempting
@@ -1463,6 +1523,7 @@ fn incomplete_compute_engine_call_fires_stall_proxy() {
     let _ = std::fs::remove_file(format!("{base}.txt"));
 }
 
+#[cfg(feature = "backend-vulkan")]
 #[test]
 fn storage_access_proxy_names_writeonly_seed_cost() {
     let pipe = 0xd000_0000 | (std::process::id() & 0x0fff_ffff);

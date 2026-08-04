@@ -16,7 +16,7 @@
 //!
 //! Type-7 tag `0x36` materializes a host `MTLIndirectCommandBuffer` (cached per
 //! task/ref). Command fills use the host Metal fill API in
-//! [`crate::runtime::icb`] — stream fill opcodes are not RE'd yet. Execute
+//! [`crate::runtime::icb`] — the stream carries no fill opcodes. Execute
 //! applies **parent-encoder inheritance** from stream [`ComputeAccum`] (Metal:
 //! buffers when `inheritBuffers`, pipeline when `inheritPipelineState`; textures/
 //! samplers are never recordable into classic `MTLIndirectComputeCommand` and
@@ -517,6 +517,9 @@ pub fn apply_sequencing<M: HostMemory + HostOps>(
 /// textures (flushed after session commit), or `None` when nothing needs
 /// writeback.
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
+// Session, device state, host, task, ICB and range: the inheritance rule needs
+// all of them, and each is already a distinct borrow.
+#[allow(clippy::too_many_arguments)]
 fn apply_icb_compute_encoder_inheritance<M: HostMemory + HostOps>(
     session: &mut ComputeSession,
     state: &mut DeviceState,
@@ -561,7 +564,7 @@ fn apply_icb_compute_encoder_inheritance<M: HostMemory + HostOps>(
     };
 
     // Pipeline when inheritPipelineState — not recorded into the ICB slot.
-    if desc.inherit_pipeline_state {
+    if desc.inherit_pipeline_state() {
         if acc.pipeline_ref == 0 {
             return Err(ComputeStatus::MissingPipeline(
                 "compute_icb_inherit_pipeline_ref_zero",
@@ -581,7 +584,7 @@ fn apply_icb_compute_encoder_inheritance<M: HostMemory + HostOps>(
     let mut mtl_buffers = Vec::new();
 
     // Kernel buffers when inheritBuffers — Metal uses parent-encoder binds.
-    if desc.inherit_buffers {
+    if desc.inherit_buffers() {
         for b in &acc.buffers {
             if b.buffer_ref == 0 {
                 continue;
@@ -846,7 +849,7 @@ fn apply_icb_compute_encoder_inheritance<M: HostMemory + HostOps>(
                 .encoder
                 .set_buffer(ab_layout.buffer_index, Some(ab.as_ref()), 0);
             // When ICB does not inherit buffers, also patch each command in range.
-            if !desc.inherit_buffers {
+            if !desc.inherit_buffers() {
                 if let Some(icb_ref) = icb {
                     for i in 0..range_length {
                         let idx = range_location.saturating_add(i);
@@ -1127,27 +1130,33 @@ mod tests {
         }
 
         let mut session = ComputeSession::open(0).expect("metal session");
-        let mut start = ComputeCommand::default();
-        start.kind = Kind::ControlStartIf;
-        start.condition_buffer_ref = 7;
-        start.condition_buffer_offset = 0;
-        start.condition_comparison = 2; // Equal
-        start.condition_reference_value = 5;
+        let start = ComputeCommand {
+            kind: Kind::ControlStartIf,
+            condition_buffer_ref: 7,
+            condition_buffer_offset: 0,
+            condition_comparison: 2, // Equal
+            condition_reference_value: 5,
+            ..Default::default()
+        };
         assert_eq!(
             session.encode_control(&state, &host, 1, &start),
             ComputeStatus::Ok
         );
         assert_eq!(session.control_depth, 1);
 
-        let mut els = ComputeCommand::default();
-        els.kind = Kind::ControlStartElse;
+        let els = ComputeCommand {
+            kind: Kind::ControlStartElse,
+            ..Default::default()
+        };
         assert_eq!(
             session.encode_control(&state, &host, 1, &els),
             ComputeStatus::Ok
         );
 
-        let mut end = ComputeCommand::default();
-        end.kind = Kind::ControlEndIf;
+        let end = ComputeCommand {
+            kind: Kind::ControlEndIf,
+            ..Default::default()
+        };
         assert_eq!(
             session.encode_control(&state, &host, 1, &end),
             ComputeStatus::Ok
@@ -1261,10 +1270,12 @@ mod tests {
                 attribute_stride: 0,
                 has_attribute_stride: false,
             });
-            let mut dcmd = ComputeCommand::default();
-            dcmd.kind = Kind::DispatchThreadgroups;
-            dcmd.grid = Size3 { x: 1, y: 1, z: 1 };
-            dcmd.threads_per_threadgroup = Size3 { x: 4, y: 1, z: 1 };
+            let dcmd = ComputeCommand {
+                kind: Kind::DispatchThreadgroups,
+                grid: Size3 { x: 1, y: 1, z: 1 },
+                threads_per_threadgroup: Size3 { x: 4, y: 1, z: 1 },
+                ..Default::default()
+            };
             assert_eq!(
                 execute_dispatch_nested(&mut state, &mut host, 1, &acc, &dcmd, &mut session),
                 ComputeStatus::Ok
@@ -1296,11 +1307,13 @@ mod tests {
         // SPI host for encodeStartIf. Wire comparison is the Reims VGPU encoder's enum
         // (not MTLCompareFunction): Equal=0 for buffer==reference (probed).
         let mut session = ComputeSession::open(1).expect("session");
-        let mut start = ComputeCommand::default();
-        start.kind = Kind::ControlStartIf;
-        start.condition_buffer_ref = 8;
-        start.condition_comparison = 0; // SPI Equal (buffer == reference)
-        start.condition_reference_value = 1;
+        let start = ComputeCommand {
+            kind: Kind::ControlStartIf,
+            condition_buffer_ref: 8,
+            condition_comparison: 0, // SPI Equal (buffer == reference)
+            condition_reference_value: 1,
+            ..Default::default()
+        };
         assert_eq!(
             session.encode_control(&state, &host, 1, &start),
             ComputeStatus::Ok
@@ -1314,16 +1327,20 @@ mod tests {
             attribute_stride: 0,
             has_attribute_stride: false,
         });
-        let mut dcmd = ComputeCommand::default();
-        dcmd.kind = Kind::DispatchThreadgroups;
-        dcmd.grid = Size3 { x: 1, y: 1, z: 1 };
-        dcmd.threads_per_threadgroup = Size3 { x: 4, y: 1, z: 1 };
+        let dcmd = ComputeCommand {
+            kind: Kind::DispatchThreadgroups,
+            grid: Size3 { x: 1, y: 1, z: 1 },
+            threads_per_threadgroup: Size3 { x: 4, y: 1, z: 1 },
+            ..Default::default()
+        };
         assert_eq!(
             execute_dispatch_nested(&mut state, &mut host, 1, &acc, &dcmd, &mut session),
             ComputeStatus::Ok
         );
-        let mut end = ComputeCommand::default();
-        end.kind = Kind::ControlEndIf;
+        let end = ComputeCommand {
+            kind: Kind::ControlEndIf,
+            ..Default::default()
+        };
         assert_eq!(
             session.encode_control(&state, &host, 1, &end),
             ComputeStatus::Ok

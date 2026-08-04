@@ -77,6 +77,20 @@ pub const EFI_BUILTIN_CONNECTED: u32 = 1;
 pub const MAX_CHANNELS: usize = 32;
 pub const MAX_TASKS: usize = 256;
 pub const MAX_MAPPINGS: usize = 4096;
+
+/// Largest scanout / surface edge the device accepts, in pixels.
+///
+/// Derived from the allocation it bounds rather than from a device capability.
+/// Host pixel buffers here are tightly packed BGRA8, so this edge squared times
+/// 4 is the largest single surface the device can be asked to hold: 8192 gives
+/// 256 MiB, which is the figure [`crate::runtime::surface_cache`]'s GVA cache
+/// cap is reasoned against at its own eviction site. The wire fields are 16-bit
+/// and would admit 65535 — a 16 GiB surface out of one corrupt guest word — so
+/// a ceiling is required, and this is the product's.
+///
+/// This constant is the owner. `REIMS_VGPU_MAX_SCANOUT_DIM` in
+/// `include/reims_vgpu_qemu_abi.h` mirrors it for the two QEMU shims, and
+/// [`the_abi_header_agrees_on_the_scanout_bound`] fails if they drift.
 pub const MAX_SCANOUT_DIM: u32 = 8192;
 
 // Single source of truth for the shifts: `contract::gva::PAGE_SHIFT_*`,
@@ -127,6 +141,21 @@ pub const CHILD_OP_DISPLAY_SWAP: u16 = 0x08;
 /// PVG `CmdDeleteTask` (same opcode as root [`ROOT_OP_DELETE_TASK`]).
 pub const CHILD_OP_DELETE_TASK: u16 = 0x20;
 pub const CHILD_OP_UNMAP_MEMORY: u16 = 0x22;
+/// Display-channel flush: a fence carrying **stamps and no payload**.
+///
+/// The guest's display pipe emits this from the failure and teardown legs of a
+/// present, on the pipe's own channel, to fence work it is about to abandon.
+/// Alone among the child commands it allocates no command bytes at all, so its
+/// packet is header plus stamps and a non-empty payload would be a contract
+/// violation rather than a longer form.
+///
+/// There is nothing for this device to execute — retiring the stamps *is* the
+/// whole obligation, and the drain does that for every accepted packet. It is
+/// named here only so it stops reading as an unknown opcode: it was landing in
+/// the `UnknownChildOpcode` arm, which reports a real Apple command as a device
+/// defect, on the display channel, exactly when the present path is already in
+/// trouble and the log is being read.
+pub const CHILD_OP_FLUSH_CHANNEL_EVENT: u16 = 0x1e;
 pub const CHILD_OP_DELETE_OBJECT: u16 = 0x25;
 pub const CHILD_OP_PRESENT_FRAME: u16 = 0x28;
 pub const CHILD_OP_SET_OBJECT_LIST: u16 = 0x33;
@@ -655,6 +684,29 @@ mod tests {
         );
         assert_eq!(stamp_slot_offset(x86_slots, PAGE_SIZE_X86), None);
         assert_eq!(stamp_slot_index(0xabcd_1234), 0x1234);
+    }
+
+    /// The C shims bound guest geometry against the same ceiling this module
+    /// owns, and they get it from `REIMS_VGPU_MAX_SCANOUT_DIM` in the shared ABI
+    /// header. Both shims carried a private `8192u` before that define existed,
+    /// which is the shape `reims-vgpu-shim.h` warns about in as many words: a
+    /// duplicated table is a table that can drift, and a drift between the two
+    /// shims is a bug the guest sees on exactly one pathway. Here it would be a
+    /// geometry that one attach accepts and the other drops.
+    ///
+    /// Nothing in the toolchain compares the two — Rust does not read the header
+    /// and the shims do not read Rust — so this test is the only thing that
+    /// does. It parses the header rather than restating the literal, because a
+    /// second copy of the number in an assertion is the same defect one level
+    /// up.
+    #[test]
+    fn the_abi_header_agrees_on_the_scanout_bound() {
+        assert_eq!(
+            crate::qemu::abi::header_define("REIMS_VGPU_MAX_SCANOUT_DIM"),
+            MAX_SCANOUT_DIM,
+            "the QEMU shims bound guest geometry against the header's value; \
+             it has drifted from the Rust constant that owns the bound"
+        );
     }
 
     #[test]

@@ -78,11 +78,26 @@ struct RenderIcbExecute {
 /// seeding draw N from draw N-1's writeback. Product previously kept only
 /// `last_draw`, which dropped the logo when the pill was the final draw in the
 /// same stream (journal: logo RG8 168×206 + pill → one type-11 FB).
+/// The arguments of one draw, as the guest issued them.
+///
+/// A named struct rather than the four-tuple this was: `base_instance` is a
+/// fifth `u32` joining four that were already told apart only by position, and
+/// the four sites that destructure it would each have been a silent swap away
+/// from drawing the wrong thing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct DrawArgs {
+    vertex_count: u32,
+    instance_count: u32,
+    primitive_type: u32,
+    first_vertex: u32,
+    /// Metal `baseInstance` / Vulkan `firstInstance`.
+    base_instance: u32,
+}
+
 #[derive(Clone, Debug, Default)]
 struct PendingDraw {
     pipeline_ref: u32,
-    /// (count, instance, prim, first_vertex)
-    draw: (u32, u32, u32, u32),
+    draw: DrawArgs,
     indexed: Option<IndexedDrawInfo>,
     vertex_buffers: BindTable<BufferBind>,
     fragment_buffers: BindTable<BufferBind>,
@@ -195,18 +210,93 @@ enum StreamDrawDrop {
     /// count is what separates the two: a rate that tracks the draw rate is the
     /// second reading, an occasional one is the first.
     Unbound { dropped: u32 },
+    /// A depth or stencil attachment this device cannot honour as decoded.
+    ///
+    /// The pass still runs, and it runs *without* the attachment — so depth or
+    /// stencil testing silently disappears for every draw in it, which shows up
+    /// as wrong occlusion rather than as a missing frame. Both conditions are
+    /// real Metal that this device does not implement: a non-zero `level` binds
+    /// a mip of the depth texture, and a non-zero `resolve_texture_ref` is a
+    /// multisample depth resolve. Naming them is what separates "the guest
+    /// never asked" from "the guest asked and we dropped it".
+    DepthStencilUnsupported {
+        aspect: &'static str,
+        level: u32,
+        slice: u32,
+        depth_plane: u32,
+        resolve_texture_ref: u32,
+    },
+    /// A colour attachment naming a subresource this device renders past.
+    ///
+    /// The same shape as [`Self::DepthStencilUnsupported`] and it was invisible
+    /// for longer, because the fields did not exist: `level`, `slice` and
+    /// `depth_plane` are three sixteen-bit fields of the pass record and this
+    /// device read only the first of them, thirty-two bits wide, so a slice
+    /// arrived folded into the level and a depth plane was never decoded at all.
+    ///
+    /// The pass still runs, into **level 0, slice 0, plane 0** of the named
+    /// texture. So a guest rendering a cube face, a texture-array layer or a mip
+    /// gets its work — into the wrong subresource, overwriting face 0 every
+    /// time. That is wrong pixels rather than missing ones, which is why it is
+    /// fail-visible: nothing downstream can tell it happened.
+    ColorSubresourceUnsupported {
+        slot: u32,
+        level: u32,
+        slice: u32,
+        depth_plane: u32,
+    },
+    /// The pass named an explicit render target extent and this device used the
+    /// attachment's.
+    ///
+    /// Unlike its three siblings on the pass tail this is **not** a healthy
+    /// zero: a driven arm64/Vulkan boot reads it on essentially every pass. The
+    /// line carries the extent because the count alone cannot say whether it
+    /// matters — a pass whose stated extent equals its attachment's is asking
+    /// for what already happens, and one that states less is a region this
+    /// device renders outside of.
+    TargetExtentUnapplied { width: u64, height: u64 },
 }
 
 impl crate::observe::Decline for StreamDrawDrop {
     fn slug(&self) -> &'static str {
         match self {
             Self::Unbound { .. } => "stream_draw_dropped_unbound",
+            Self::DepthStencilUnsupported { .. } => "stream_depth_stencil_unsupported",
+            Self::ColorSubresourceUnsupported { .. } => "stream_color_subresource_unsupported",
+            Self::TargetExtentUnapplied { .. } => "stream_pass_target_extent_unapplied",
         }
     }
 
     fn fields(&self) -> Vec<(&'static str, String)> {
         match self {
             Self::Unbound { dropped } => vec![("dropped", dropped.to_string())],
+            Self::DepthStencilUnsupported {
+                aspect,
+                level,
+                slice,
+                depth_plane,
+                resolve_texture_ref,
+            } => vec![
+                ("aspect", (*aspect).to_string()),
+                ("level", level.to_string()),
+                ("slice", slice.to_string()),
+                ("plane", depth_plane.to_string()),
+                ("resolve", format!("{resolve_texture_ref:#x}")),
+            ],
+            Self::ColorSubresourceUnsupported {
+                slot,
+                level,
+                slice,
+                depth_plane,
+            } => vec![
+                ("slot", slot.to_string()),
+                ("level", level.to_string()),
+                ("slice", slice.to_string()),
+                ("plane", depth_plane.to_string()),
+            ],
+            Self::TargetExtentUnapplied { width, height } => {
+                vec![("width", width.to_string()), ("height", height.to_string())]
+            }
         }
     }
 }
@@ -401,6 +491,18 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
 /// majority; `validity_unknown_object` is a record naming an id no registry has
 /// heard of. Merging them would bury the second under the first at roughly four
 /// to one.
+///
+/// **That four-to-one is the x86 pathway's, and arm64 is not close to it.** Two
+/// driven arm64/Vulkan boots read `no_surface`/`unknown` of 1342/926 and
+/// 713/536 — about **1.4 to 1** on both, with the two workloads deliberately
+/// different. So the majority is much thinner here, and a reader who takes the
+/// ratio above as the protocol's shape will either think this pathway is broken
+/// or fail to notice that it is not the same. Neither reading is available from
+/// one host: the numbers are the same counters measuring the same thing, and
+/// what differs is how much of a submission's residency list has already been
+/// named by an executed command when the table arrives. What would still be the
+/// finding on *either* pathway is the one named above — this count staying high
+/// for ids that later do execute — and nothing measures that yet on either.
 ///
 /// `validity_unknown_object` is **not** by itself a defect either, and a reader
 /// scoring it needs to know why: `DeviceState::objects` is populated lazily, by
@@ -959,6 +1061,62 @@ fn handle_compute_record<M: HostMemory + HostOps>(
     }
 }
 
+/// An indirect-command-buffer record this rail decoded and did not apply.
+///
+/// Two slugs rather than one, because the two losses are not the same loss: a
+/// dropped `resetCommandsInBuffer:` leaves commands live that the guest retired,
+/// and a dropped `copyIndirectCommandBuffer:` leaves the destination holding
+/// whatever it held before. One slug for both is exactly the collapse
+/// [`crate::observe::Decline`]'s own doc refuses — you watch it fire and still
+/// cannot tell which buffer is wrong.
+struct IcbRecordDropped(u32);
+
+impl crate::observe::Decline for IcbRecordDropped {
+    fn slug(&self) -> &'static str {
+        match self.0 {
+            blit::OP_RESET_ICB => "blit_icb_reset_dropped",
+            blit::OP_COPY_ICB => "blit_icb_copy_dropped",
+            // `0x138` cannot arrive: the optimize hint is answered by the no-op
+            // arm before this one. So this names a record that reached an ICB
+            // kind without being one of the three, which would be a decoder bug
+            // rather than a dropped command. A healthy zero.
+            _ => "blit_icb_unclassified",
+        }
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        vec![("opcode", format!("{:#x}", self.0))]
+    }
+}
+
+/// A texture fill this rail decoded and did not apply.
+///
+/// Two slugs, on the same reasoning as [`IcbRecordDropped`]: the colour form
+/// and the staged-bytes form are lost the same way but cost different things to
+/// implement. The colour form needs a clear-colour-to-pixel-format converter
+/// this device does not have; the bytes form needs the staging buffer read and
+/// the pattern tiled across the region, and nothing converted. A single count
+/// could not tell which of those a driven boot is asking for.
+struct TextureFillDropped(blit::FillSource);
+
+impl crate::observe::Decline for TextureFillDropped {
+    fn slug(&self) -> &'static str {
+        match self.0 {
+            blit::FillSource::Color => "blit_fill_texture_color_dropped",
+            blit::FillSource::Bytes => "blit_fill_texture_bytes_dropped",
+            // Unreachable while both decode arms set the source: `FillSource`
+            // defaults to `None` and only a `Kind::FillTexture` gets here. A
+            // firing means a third fill form reached this kind without naming
+            // where its value comes from. A healthy zero.
+            blit::FillSource::None => "blit_fill_texture_source_unset",
+        }
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        vec![("source", format!("{:?}", self.0))]
+    }
+}
+
 fn handle_blit_record<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -997,6 +1155,36 @@ fn handle_blit_record<M: HostMemory + HostOps>(
         }
         // optimize*/synchronize* are protocol no-ops on the unified-memory path.
         BlitKind::Resource | BlitKind::Image => {}
+        // The three indirect-command-buffer records. All three used to be
+        // refused before decode under one shared reason, which said three
+        // different things with one word — and only two of them are losses.
+        //
+        // `optimizeIndirectCommandBuffer:` is Metal's hint that a range will be
+        // reused, so skipping it is semantically correct and costs speed alone;
+        // it joins the no-ops above and is counted so the census still shows the
+        // traffic. The other two change what a later `executeCommandsInBuffer:`
+        // will run: a reset the device drops leaves commands live that the guest
+        // retired, and a copy it drops leaves the destination holding whatever it
+        // held before. Both are stale commands executing, which is worse than a
+        // dropped one, so they stay fail-visible as well as counted.
+        //
+        // Counted rather than executed on purpose. `runtime::icb` materializes
+        // host ICBs on the Metal arm only, and it reads 0.00% on a driven x86
+        // boot — so the count is what says whether an executor is worth building,
+        // and for which of the two.
+        BlitKind::IcbRange if cmd.opcode == blit::OP_OPTIMIZE_ICB => {
+            crate::runtime::drain::note_store_route("blit_noop_icb_optimize");
+        }
+        BlitKind::IcbRange | BlitKind::IcbCopy => {
+            use crate::observe::Decline as _;
+            let decline = IcbRecordDropped(cmd.opcode);
+            crate::runtime::drain::note_store_route(decline.slug());
+            crate::observe::Emit::decline("blit_icb", &decline)
+                .field("task", task_id)
+                .field("range_loc", cmd.range_location)
+                .field("range_len", cmd.range_length)
+                .fail_once(cmd.opcode as u64);
+        }
         BlitKind::Fence => {
             // Log from the *blit* status, before the remap. The remap folds two
             // meanings into `FenceStatus::Missing` — an absent object and a zero
@@ -1008,7 +1196,51 @@ fn handle_blit_record<M: HostMemory + HostOps>(
                 e.field("opcode", format!("{:#x}", cmd.opcode)).fail();
             }
         }
-        BlitKind::FillBuffer | BlitKind::Copy => {
+        // `invalidateCompressedTexture:` and its `slice:level:` form. Apple's
+        // lossless-compression metadata is a property of a *host* texture's
+        // backing, and this device writes the guest's pages directly — there is
+        // no compressed representation here to mark stale, so skipping it is
+        // semantically correct and it joins the `optimize*`/`synchronize*`
+        // no-ops. It is counted rather than folded into them because the two
+        // records share the `Ref` and `RefSliceLevel` wire shapes with those
+        // selectors: without its own route a compressed-texture invalidate
+        // would be indistinguishable from a synchronize that genuinely needed
+        // nothing done, and "this workload issues none" would be unprovable.
+        BlitKind::InvalidateCompressedTexture => {
+            crate::runtime::drain::note_store_route("blit_noop_invalidate_compressed");
+        }
+        // `fillTexture:…:color:` and `fillTexture:…:bytes:length:`. Unlike the
+        // invalidate above these are writes the guest expects to land, so a
+        // dropped one leaves the region holding what it held before and the
+        // guest reads back content it believes it just wrote. Counted and
+        // fail-visible, with the extent named, because the extent is what
+        // decides whether an executor is worth building.
+        //
+        // Not executed here on purpose. A texture fill needs the destination
+        // resolved through the type-4/5/11 rails, the region walked per row,
+        // and — for the colour form — the clear colour converted into the
+        // texture's pixel format, which is a converter this device does not
+        // have. The count is what says whether to build one, and for which of
+        // the two sources.
+        BlitKind::FillTexture => {
+            use crate::observe::Decline as _;
+            let decline = TextureFillDropped(cmd.fill_source);
+            crate::runtime::drain::note_store_route(decline.slug());
+            crate::observe::Emit::decline("blit_fill_texture", &decline)
+                .field("task", task_id)
+                .field("texture", cmd.texture)
+                .field("level", cmd.level)
+                .field("slice", cmd.slice)
+                .field(
+                    "extent",
+                    format!(
+                        "{}x{}x{}",
+                        cmd.fill_size.width, cmd.fill_size.height, cmd.fill_size.depth
+                    ),
+                )
+                .fail_once(cmd.opcode as u64);
+        }
+        BlitKind::FillBuffer | BlitKind::FillBufferPattern4 | BlitKind::Copy => {
             match blit_exec::execute_blit(state, host, task_id, &cmd) {
                 BlitStatus::Ok | BlitStatus::ZeroExtent => {}
                 st => {
@@ -1092,6 +1324,16 @@ fn handle_render_record<M: HostMemory + HostOps>(
             acc.pipeline_ref = cmd.pipeline_ref;
         }
         RenderKind::SetBuffer => {
+            if cmd.has_attribute_stride {
+                // Same shape as `render_sampler_lod_dropped` below, and it was
+                // the same bug: `0xa5` sits above the old accepted window, so a
+                // guest that negotiated `supportsDynamicAttributeStride` had
+                // every strided vertex bind refused and the buffer never bound.
+                // The bind is applied now; the per-entry stride is not, because
+                // `BufferBind` carries none and the vertex fetch layout is
+                // pipeline state neither backend is asked to re-declare.
+                crate::runtime::drain::note_store_route("render_vertex_attribute_stride_dropped");
+            }
             // Slots first..first+n from the archive layout's entry array.
             // `render::decode` refuses `count == 0` with `ErrBadLength`, and
             // sets `cmd.buffer_ref` from `buffer_binds.first()`, so a decoded
@@ -1100,7 +1342,10 @@ fn handle_render_record<M: HostMemory + HostOps>(
             let cleared = apply_binds(
                 &cmd.buffer_binds,
                 cmd.first,
-                cmd.stage,
+                BindTarget {
+                    stage: cmd.stage,
+                    class: BindClass::Buffer,
+                },
                 &mut acc.vertex_buffers,
                 &mut acc.fragment_buffers,
                 |b| b.index,
@@ -1115,18 +1360,40 @@ fn handle_render_record<M: HostMemory + HostOps>(
             out.buffer_unbinds = out.buffer_unbinds.saturating_add(cleared);
         }
         RenderKind::SetBufferOffset => {
+            if cmd.has_attribute_stride {
+                crate::runtime::drain::note_store_route("render_vertex_attribute_stride_dropped");
+            }
             // Archive apply_buffer_offset: update offset on an already-bound slot.
-            if cmd.first < MAX_BIND_SLOTS {
-                let list = match cmd.stage {
-                    Stage::Vertex => Arc::make_mut(&mut acc.vertex_buffers),
-                    Stage::Fragment => Arc::make_mut(&mut acc.fragment_buffers),
-                    // An offset update names a slot in a table; with no stage
-                    // there is no table, and inventing one would move somebody
-                    // else's binding.
-                    Stage::Unknown => return,
-                };
-                if let Some(b) = list.iter_mut().find(|b| b.index == cmd.first) {
-                    b.offset = cmd.buffer_offset;
+            if cmd.first >= MAX_BIND_SLOTS {
+                // The slot is outside the table, so the bind that would have
+                // occupied it was already dropped by `apply_binds` and counted
+                // under `render_buffer_bind_slot_past_table`. This is the
+                // *second* record the guest spends on that slot, and it was
+                // silently ignored — so the bind counter under-reported how much
+                // of the stream the table bound costs. Counted separately rather
+                // than folded in, because these are different records.
+                crate::runtime::drain::note_store_route("render_buffer_offset_slot_past_table");
+                return;
+            }
+            let list = match cmd.stage {
+                Stage::Vertex => Arc::make_mut(&mut acc.vertex_buffers),
+                Stage::Fragment => Arc::make_mut(&mut acc.fragment_buffers),
+                // An offset update names a slot in a table; with no stage
+                // there is no table, and inventing one would move somebody
+                // else's binding.
+                Stage::Unknown => return,
+            };
+            match list.iter_mut().find(|b| b.index == cmd.first) {
+                Some(b) => b.offset = cmd.buffer_offset,
+                // A healthy zero, and a sharp one. Metal requires a buffer
+                // already bound at the index before
+                // `setVertexBufferOffset:atIndex:`, and a render encoder's bind
+                // state does not outlive the encoder, so the guest and this
+                // table should agree on which slots are live. A firing means
+                // they do not — a bind this device dropped, refused or never
+                // decoded — and the offset lands on nothing.
+                None => {
+                    crate::runtime::drain::note_store_route("render_buffer_offset_slot_unbound")
                 }
             }
         }
@@ -1136,7 +1403,10 @@ fn handle_render_record<M: HostMemory + HostOps>(
             let cleared = apply_binds(
                 &cmd.ref_binds,
                 cmd.first,
-                cmd.stage,
+                BindTarget {
+                    stage: cmd.stage,
+                    class: BindClass::Texture,
+                },
                 &mut acc.vertex_textures,
                 &mut acc.fragment_textures,
                 |b| b.index,
@@ -1164,10 +1434,23 @@ fn handle_render_record<M: HostMemory + HostOps>(
             out.texture_unbinds = out.texture_unbinds.saturating_add(cleared);
         }
         RenderKind::SetSampler => {
+            if cmd.has_sampler_lod {
+                // The bind itself is applied below; what is not applied is the
+                // per-entry LOD clamp pair the guest sent with it, because
+                // `SamplerBind` carries no clamps and neither backend is asked
+                // for any. Until this commit the whole record was dropped —
+                // `0x80`/`0x71` reached no arm — so the slot stayed unbound;
+                // binding it with default clamps is the closer answer, and this
+                // counter is the distance still left.
+                crate::runtime::drain::note_store_route("render_sampler_lod_dropped");
+            }
             let cleared = apply_binds(
                 &cmd.ref_binds,
                 cmd.first,
-                cmd.stage,
+                BindTarget {
+                    stage: cmd.stage,
+                    class: BindClass::Sampler,
+                },
                 &mut acc.vertex_samplers,
                 &mut acc.fragment_samplers,
                 |b| b.index,
@@ -1178,9 +1461,16 @@ fn handle_render_record<M: HostMemory + HostOps>(
             out.sampler_unbinds = out.sampler_unbinds.saturating_add(cleared);
         }
         RenderKind::SetViewport => {
+            // `cmd.viewport` is entry 0 of the record, which for the singular
+            // opcode is the whole of it. The plural form (`0x83`) used to reach
+            // no arm at all, so a guest that set its viewport through
+            // `setViewports:count:` got none — this rail models one viewport,
+            // and one is what the overwhelming majority of those records carry.
+            note_extra_state_entries("viewport", cmd.count);
             acc.viewport = Some(cmd.viewport);
         }
         RenderKind::SetScissor if cmd.scissor_w > 0 && cmd.scissor_h > 0 => {
+            note_extra_state_entries("scissor", cmd.count);
             acc.scissor = Some((cmd.scissor_x, cmd.scissor_y, cmd.scissor_w, cmd.scissor_h));
         }
         RenderKind::SetBlendColor if cmd.has_blend_color => {
@@ -1202,16 +1492,69 @@ fn handle_render_record<M: HostMemory + HostOps>(
             acc.stencil_ref = Some((cmd.stencil_ref_front, cmd.stencil_ref_back));
         }
         RenderKind::RenderPass => {
+            // The pass's own tail, decoded and not applied. Four counters
+            // rather than one, because they name four different losses and one
+            // of them is not a loss at all when it is zero.
+            //
+            // `render_target_width`/`height` are the guest's explicit extent
+            // and this device renders at the attachment's instead, which is a
+            // silent over-render whenever the two differ. `array_length` is
+            // layered rendering. The visibility buffer is the other half of
+            // `setVisibilityResultMode:offset:` — that record already counts
+            // its own drop, and this counts the buffer it would have written
+            // to, so the two should track and a divergence means one of the
+            // arms is wrong. All four report only a non-default value: a pass
+            // that asks for the API default is asking for what already happens.
+            //
+            // The extent one is **not** a healthy zero and the others are. On a
+            // driven arm64/Vulkan boot it reads 1 575 over 127 one-second
+            // windows while the visibility buffer, the array length and the
+            // colour subresource all read 0 — so the macOS window server states
+            // an explicit pass extent on essentially every pass, and this
+            // device renders at the attachment's instead. Whether that is a
+            // defect depends on whether the two agree, which is why the extent
+            // is reported with its *values* rather than only counted.
+            if cmd.pass_visibility_result_buffer_ref != 0 {
+                crate::runtime::drain::note_store_route("render_pass_visibility_buffer_dropped");
+            }
+            if cmd.pass_render_target_array_length > 1 {
+                crate::runtime::drain::note_store_route("render_pass_array_length_dropped");
+            }
+            if cmd.pass_render_target_width != 0 || cmd.pass_render_target_height != 0 {
+                note_pass_target_extent(
+                    task_id,
+                    cmd.pass_render_target_width,
+                    cmd.pass_render_target_height,
+                );
+            }
             // Full multi-attachment: re-decode all color slots from payload.
             if cmd_bytes.len() >= 8 {
                 let payload = &cmd_bytes[8..];
                 let depth = decode_depth_attachment(payload);
-                if depth.present && depth.level == 0 && depth.resolve_texture_ref == 0 {
-                    acc.depth_attach = Some(depth);
+                if depth.present {
+                    if depth_stencil_is_bindable(
+                        depth.level,
+                        depth.slice,
+                        depth.depth_plane,
+                        depth.resolve_texture_ref,
+                    ) {
+                        acc.depth_attach = Some(depth);
+                    } else {
+                        note_depth_stencil_unsupported(task_id, "depth", &depth.into());
+                    }
                 }
                 let stencil = decode_stencil_attachment(payload);
-                if stencil.present && stencil.level == 0 && stencil.resolve_texture_ref == 0 {
-                    acc.stencil_attach = Some(stencil);
+                if stencil.present {
+                    if depth_stencil_is_bindable(
+                        stencil.level,
+                        stencil.slice,
+                        stencil.depth_plane,
+                        stencil.resolve_texture_ref,
+                    ) {
+                        acc.stencil_attach = Some(stencil);
+                    } else {
+                        note_depth_stencil_unsupported(task_id, "stencil", &stencil.into());
+                    }
                 }
                 for i in 0..PASS_MAX_COLOR_ATTACHMENTS {
                     let att = decode_color_attachment(payload, i);
@@ -1219,6 +1562,16 @@ fn handle_render_record<M: HostMemory + HostOps>(
                         continue;
                     }
                     let slot = i as u32;
+                    // Every consumer of a colour attachment binds the texture
+                    // whole, so a subresource the guest named is rendered past
+                    // rather than into. Reported and then rendered anyway: the
+                    // pass carries real guest work and dropping it would trade
+                    // wrong pixels for none, which is worse. The count is what
+                    // decides whether a subresource-aware bind is worth
+                    // building.
+                    if att.level != 0 || att.slice != 0 || att.depth_plane != 0 {
+                        note_color_subresource_unsupported(task_id, slot, &att);
+                    }
                     if !acc
                         .color_slots
                         .iter()
@@ -1238,6 +1591,21 @@ fn handle_render_record<M: HostMemory + HostOps>(
                     if let Some(m) =
                         objects::resolve_type11_ref(state, host, task_id, att.texture_ref)
                     {
+                        // The measurement the extent count could not make. Only
+                        // slot 0 and only where the mapping is already resolved
+                        // — this is a census, not a resolve, and making it
+                        // resolve would put a guest-memory walk on the hottest
+                        // record in the device.
+                        if slot == 0 {
+                            if let Some(e) = state.mappings.get(&m) {
+                                note_pass_extent_coverage(
+                                    cmd.pass_render_target_width,
+                                    cmd.pass_render_target_height,
+                                    e.width,
+                                    e.height,
+                                );
+                            }
+                        }
                         if !out.type11_mappings.contains(&m) {
                             out.type11_mappings.push(m);
                         }
@@ -1304,8 +1672,27 @@ fn handle_render_record<M: HostMemory + HostOps>(
                     index_count: cmd.index_count,
                     index_buffer_ref: cmd.index_buffer_ref,
                     index_buffer_offset: cmd.index_buffer_offset,
+                    base_vertex: cmd.base_vertex,
                 });
             } else {
+                // An indexed opcode whose record named no index buffer falls
+                // through to a *non-indexed* draw of `index_count` vertices,
+                // because `count` above took `index_count` and `indexed` is
+                // None. That is not a form Metal has:
+                // `drawIndexedPrimitives` takes its index buffer as an
+                // argument and there is no bound-index-buffer state for a zero
+                // ref to mean, so the record is malformed and this is the
+                // device inventing a different draw call from it.
+                //
+                // Named rather than declined, deliberately. Declining is the
+                // contract-faithful answer, but `index_buffer_ref` is read at a
+                // payload offset that differs per draw form, so if any of those
+                // offsets is wrong the ref reads 0 and declining would turn a
+                // decode fault into a blank frame. This counter says first
+                // whether the cell is reached at all.
+                if cmd.index_count != 0 && is_indexed_draw_opcode(opcode) {
+                    note_indexed_draw_without_buffer(task_id, opcode, cmd.index_count);
+                }
                 acc.indexed = None;
             }
             // Snapshot bind state for this draw (archive multi-draw job).
@@ -1314,12 +1701,13 @@ fn handle_render_record<M: HostMemory + HostOps>(
             } else {
                 acc.draws.push(PendingDraw {
                     pipeline_ref: acc.pipeline_ref,
-                    draw: (
-                        count,
-                        cmd.instance_count.max(1),
-                        cmd.primitive_type,
-                        cmd.vertex_start,
-                    ),
+                    draw: DrawArgs {
+                        vertex_count: count,
+                        instance_count: cmd.instance_count.max(1),
+                        primitive_type: cmd.primitive_type,
+                        first_vertex: cmd.vertex_start,
+                        base_instance: cmd.base_instance,
+                    },
                     ..acc.bind_snapshot()
                 });
             }
@@ -1369,6 +1757,235 @@ fn handle_render_record<M: HostMemory + HostOps>(
             // so the layout can be decoded offline. Unknown wire stays unknown;
             // we never invent semantics for it.
             note_unimplemented_render_opcode(cmd.opcode, cmd_bytes, task_id, acc);
+        }
+        // Two kinds the product answers by doing nothing, counted separately.
+        // They used to fall into the catch-all below, which made them
+        // indistinguishable from a record that was handled — and unlike a
+        // `SetBuffer` these carry ordering and lifetime the guest expects us to
+        // honour, so silence was the wrong answer even though doing nothing is
+        // the right one.
+        //
+        // The arguments are the compute rail's, which reached the same two
+        // conclusions first (`compute_noop_residency_hint`,
+        // `compute_noop_barrier`). Residency: `useResource:`/`useHeap:` are
+        // hints for a driver that pages resources, and this product resolves
+        // every binding per draw, so there is nothing for them to keep
+        // resident. Barriers: the render rail submits and waits at pass
+        // granularity, so a barrier inside the pass is implied by the boundary.
+        //
+        // These counters exist to price those arguments rather than to doubt
+        // them. A large residency count is the cost of resolving per draw; a
+        // large barrier count is what the pass-granularity submit is buying.
+        // Six render states this rail decodes and does not apply. Each reports
+        // only when the guest asked for something *other* than the API default,
+        // because asking for the default is asking for what we already do — so
+        // these are healthy zeros, and a non-zero reading is the measured
+        // argument for implementing that state.
+        //
+        // That distinction is the point of decoding them at all. All six used to
+        // reach `OtherAccepted`, and `0x7c` alone fires thousands of times per
+        // app render, so the one line it produced said a record had arrived and
+        // nothing about whether any of them mattered.
+        RenderKind::SetRasterState => {
+            // `MTLTriangleFillModeFill` and `MTLDepthClipModeClip` are both 0.
+            if cmd.mode != 0 {
+                crate::runtime::drain::note_store_route(match cmd.opcode {
+                    render::OP_SET_TRIANGLE_FILL_MODE => "render_fill_mode_dropped",
+                    _ => "render_depth_clip_mode_dropped",
+                });
+            }
+        }
+        RenderKind::SetFloatState => {
+            // Both default to 1.0. Compared exactly rather than with a
+            // tolerance: the guest wrote a literal and the question is whether
+            // it wrote *the* literal, not whether it is close to it.
+            if cmd.float_value != 1.0 {
+                crate::runtime::drain::note_store_route(match cmd.opcode {
+                    render::OP_SET_LINE_WIDTH => "render_line_width_dropped",
+                    _ => "render_tessellation_scale_dropped",
+                });
+            }
+        }
+        RenderKind::SetStoreAction => {
+            // No default to compare against: this record *overrides* what the
+            // render-pass descriptor said for that attachment, so every one of
+            // them is a change this rail is not making. The precise signal would
+            // compare against the pass's own store action, which this arm does
+            // not have; the count is the upper bound and is what says whether
+            // reaching for it is worth it.
+            crate::runtime::drain::note_store_route("render_store_action_override_dropped");
+        }
+        RenderKind::SetVertexAmplification => {
+            // Amplification makes one vertex invocation produce several views,
+            // so a dropped record renders one view where the guest asked for
+            // many. Both forms have an API default that means "no
+            // amplification" — a count of 1, and mode 0 — and asking for the
+            // default is asking for what this rail already does, so only the
+            // rest is a loss.
+            let asked_for_more = match cmd.opcode {
+                render::OP_SET_VERTEX_AMPLIFICATION_COUNT => cmd.count > 1,
+                _ => cmd.mode != 0 || cmd.amplification_value != 0,
+            };
+            if asked_for_more {
+                crate::runtime::drain::note_store_route("render_vertex_amplification_dropped");
+            }
+        }
+        RenderKind::SetVisibilityResultMode => {
+            // The seventh of those states. `MTLVisibilityResultModeDisabled` is
+            // 0, so a zero mode is a guest disarming a query this rail never
+            // armed — which is what we already do.
+            if cmd.mode != 0 {
+                crate::runtime::drain::note_store_route("render_visibility_result_mode_dropped");
+            }
+        }
+        RenderKind::DrawIndirect => {
+            // Not one of those states, and not a healthy zero. An indirect draw
+            // is geometry the guest asked for, so every one of these is a
+            // dropped draw rather than a state left at its default — which is
+            // why this arm keeps the fail-visible line the catch-all used to
+            // give it, on top of the count.
+            //
+            // It cannot be executed from the record: the vertex and instance
+            // counts are in the indirect buffer, written by the GPU or by a
+            // compute pass, and this rail replays counts it has read. The count
+            // is what decides whether resolving that buffer is worth building.
+            crate::runtime::drain::note_store_route(match cmd.opcode {
+                render::OP_DRAW_INDEXED_INDIRECT => "render_draw_indexed_indirect_dropped",
+                _ => "render_draw_indirect_dropped",
+            });
+            note_unimplemented_render_opcode(cmd.opcode, cmd_bytes, task_id, acc);
+        }
+        RenderKind::UseResource | RenderKind::UseHeap => {
+            crate::runtime::drain::note_store_route("render_noop_residency_hint");
+        }
+        RenderKind::Barrier => {
+            crate::runtime::drain::note_store_route("render_noop_barrier");
+        }
+        // The tile-shader family. Nine opcodes that used to reach
+        // `OtherAccepted` together, split here into the three different things
+        // they actually are — because "a tile record arrived" is not a
+        // measurement anyone can act on.
+        RenderKind::TileBind => {
+            // A bind against the tile argument tables. There is no default a
+            // bind could be sitting at, so this counts unconditionally: it is
+            // an upper bound on tile resources the guest attached and this rail
+            // did not, the same footing as `render_store_action_override_dropped`.
+            //
+            // Counted rather than applied, and the reason is the same one the
+            // decoder gives for not reusing `Kind::SetBuffer`: this device has
+            // no tile argument table to bind into. Routing these into the
+            // vertex or fragment table would not be a partial implementation,
+            // it would be a wrong one.
+            //
+            // Split by which table, because they are not interchangeable when
+            // an implementation is costed — a tile buffer bind is imageblock
+            // storage, a tile texture bind is a sampled attachment.
+            crate::runtime::drain::note_store_route(match cmd.opcode {
+                render::OP_SET_TILE_BUFFER | render::OP_SET_TILE_BUFFER_OFFSET => {
+                    "render_tile_buffer_bind_dropped"
+                }
+                render::OP_SET_TILE_TEXTURE => "render_tile_texture_bind_dropped",
+                // Imageblock memory, not an argument-table slot: this one is
+                // the tile shader's scratch storage, so it is priced on its own
+                // rather than with the buffer binds it sits next to.
+                render::OP_SET_TILE_THREADGROUP_MEMORY => {
+                    "render_tile_threadgroup_memory_dropped"
+                }
+                _ => "render_tile_sampler_bind_dropped",
+            });
+        }
+        RenderKind::TileDispatch => {
+            // A tile shader the guest asked to run. Like an indirect draw and
+            // unlike the unapplied states, this is work rather than state, so
+            // it keeps the deduped fail-visible line as well as the count.
+            //
+            // The one healthy zero here is a genuinely empty grid: Metal
+            // dispatches nothing when any dimension of `threadsPerTile` is 0,
+            // so dropping such a record loses nothing and counting it would
+            // inflate the loss estimate this counter exists to be.
+            if cmd.tile_threads.iter().all(|&n| n != 0) {
+                crate::runtime::drain::note_store_route("render_tile_dispatch_dropped");
+                note_unimplemented_render_opcode(cmd.opcode, cmd_bytes, task_id, acc);
+            }
+        }
+        RenderKind::SetStoreActionOptions => {
+            // The options sibling of the store action beside it, and unapplied
+            // for the same reason: this rail does not honour the store action
+            // either, so there is nothing for an option on it to modify. No
+            // default to compare against — `MTLStoreActionOptionNone` is 0, but
+            // a guest that writes 0 is still overriding whatever the pass
+            // descriptor said, exactly as `render_store_action_override_dropped`
+            // argues for the action.
+            crate::runtime::drain::note_store_route("render_store_action_options_dropped");
+        }
+        RenderKind::DrawPatches => {
+            // A tessellated draw. Geometry the guest asked for and did not get,
+            // so it counts unconditionally and keeps the deduped fail-visible
+            // line, on the same footing as the indirect draws — there is no
+            // default a draw could be sitting at.
+            //
+            // Split by form because they are not equally far from being
+            // executable: the two direct forms carry their patch counts on the
+            // wire, while the indirect pair reads them from a buffer the GPU
+            // may not have written yet.
+            crate::runtime::drain::note_store_route(match cmd.opcode {
+                render::OP_DRAW_PATCHES_INDIRECT
+                | render::OP_DRAW_INDEXED_PATCHES_INDIRECT => {
+                    "render_draw_patches_indirect_dropped"
+                }
+                _ => "render_draw_patches_dropped",
+            });
+            note_unimplemented_render_opcode(cmd.opcode, cmd_bytes, task_id, acc);
+        }
+        RenderKind::SetTessellationFactorBuffer => {
+            // The state half of a tessellated draw. Unapplied like the draws
+            // themselves, so this should track `render_draw_patches_dropped`;
+            // the two being far apart would mean one of the two arms is wrong
+            // rather than that the guest is doing something unusual.
+            crate::runtime::drain::note_store_route("render_tessellation_factor_buffer_dropped");
+        }
+        RenderKind::RenderPassProperty => {
+            // One of the six records `writeDescriptor` emits beside the pass
+            // descriptor. Every one is behind a serializer capability that
+            // defaults off, so these are healthy zeros: a non-zero reading is
+            // the first evidence this project would have that a guest
+            // negotiates one of the sixteen flags, which nothing in this device
+            // currently observes.
+            //
+            // Counted per opcode rather than under one name, because the six
+            // are not equally costly to drop. The rate map and the sample
+            // positions change *where fragments land*; the raster sample count
+            // changes how many there are; the three tile ones are tile-shader
+            // pass geometry this device has no executor for at all.
+            crate::runtime::drain::note_store_route(match cmd.opcode {
+                render::OP_PASS_RATE_MAP => "render_pass_rate_map_dropped",
+                render::OP_PASS_SAMPLE_POSITIONS => "render_pass_sample_positions_dropped",
+                render::OP_PASS_DEFAULT_RASTER_SAMPLE_COUNT => {
+                    "render_pass_raster_sample_count_dropped"
+                }
+                render::OP_PASS_IMAGEBLOCK_SAMPLE_LENGTH => "render_pass_imageblock_dropped",
+                render::OP_PASS_THREADGROUP_MEMORY_LENGTH => {
+                    "render_pass_threadgroup_memory_dropped"
+                }
+                _ => "render_pass_tile_size_dropped",
+            });
+            note_unimplemented_render_opcode(cmd.opcode, cmd_bytes, task_id, acc);
+        }
+        RenderKind::TileDimensionsQuery => {
+            // Not a dropped command — a *wrong answer*. The guest handed over a
+            // buffer for this device to write the tile width and height into
+            // and will read it back regardless of whether anything was written,
+            // so ignoring the record leaves the guest treating whatever its ring
+            // last held as a tile geometry. There is no default and no healthy
+            // zero, which is why this one is fail-visible on its own line
+            // naming where the answer was expected rather than through the
+            // deduped opcode path.
+            crate::runtime::drain::note_store_route("render_tile_dimensions_unanswered");
+            crate::observe::fail(format!(
+                "render_tile_dimensions reason=render_tile_dimensions_unanswered \
+                 task={task_id} buffer={} offset={:#x}",
+                cmd.buffer_ref, cmd.buffer_offset
+            ));
         }
         _ => {}
     }
@@ -1458,6 +2075,171 @@ fn reset_unimplemented_opcode_dedup_for_test() {
     }
 }
 
+/// Count the entries of a plural viewport or scissor record this rail cannot
+/// hold.
+///
+/// Both records carry `count` entries and this rail models exactly one, so
+/// entries past the first are dropped. That is a narrower loss than it sounds —
+/// the plural selectors are how Metal apps set a single rect as often as not,
+/// and `count == 1` is the same record as the singular opcode — but it is a
+/// loss, and before these opcodes were decoded at all the *whole* record was
+/// dropped rather than its tail.
+///
+/// A non-zero reading is the argument for modelling a viewport array, and it
+/// says how many entries such a model would have to hold. `count == 0` never
+/// reaches here: the decoder refuses it.
+fn note_extra_state_entries(what: &'static str, count: u32) {
+    let extra = count.saturating_sub(1);
+    if extra == 0 {
+        return;
+    }
+    crate::runtime::drain::note_store_route_n(
+        match what {
+            "viewport" => "render_extra_viewports_dropped",
+            _ => "render_extra_scissors_dropped",
+        },
+        extra as u64,
+    );
+}
+
+/// Which of the three argument tables a bind record names.
+///
+/// [`apply_binds`] gates all three on the single [`MAX_BIND_SLOTS`], and that
+/// is defensible as a *bound* — it is the smallest of the three host tables —
+/// but it is not defensible as a *counter*. Apple's serializer truncates a
+/// plural bind at the stage's argument table, and
+/// [`reims_vgpu_wire::ops::bind_limit`] measured those three tables at 128
+/// textures, 31 buffers and 16 samplers, so a slot dropped here means something
+/// different in each class:
+///
+/// * **Texture** — real loss. Apple emits up to 128, this device holds 31, so
+///   slots 31..127 are guest work with nowhere to go.
+/// * **Buffer** — cannot fire from an Apple guest. 31 is exactly the serializer's
+///   own buffer bound, so a non-zero reading is either a guest writing its own
+///   stream or a decode that mis-sized the table.
+/// * **Sampler** — same, one step further: Apple truncates at 16, well below the
+///   bound, so this can only fire on a stream Apple's serializer did not write.
+///
+/// One slug for all three said "31 slots were lost" and could not say which
+/// table to widen, which is the whole reason the counter exists. Splitting it is
+/// the same lesson `BlitEncoderSPI` taught one layer up — a family is not
+/// uniform in what its loss means.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BindClass {
+    Buffer,
+    Texture,
+    Sampler,
+}
+
+impl BindClass {
+    /// The census name for slots this class lost to [`MAX_BIND_SLOTS`].
+    fn past_table_route(self) -> &'static str {
+        match self {
+            BindClass::Buffer => "render_buffer_bind_slot_past_table",
+            BindClass::Texture => "render_texture_bind_slot_past_table",
+            BindClass::Sampler => "render_sampler_bind_slot_past_table",
+        }
+    }
+
+    /// The census name for the band a record's requested reach falls in.
+    ///
+    /// `reach` is `first + count`, the exclusive end of the slot run the guest
+    /// asked for. The drop counters above say only that traffic crossed the
+    /// bound, and a zero from them is not interpretable on its own: every
+    /// record reaching slot 30 and every record reaching slot 4 both read zero,
+    /// and only one of those says the bound has headroom. That is the same
+    /// shape as `pass_scissor_union` and `pass_extent_full` — a census of what
+    /// the guest asked for, kept beside the counter for what it lost.
+    ///
+    /// The bands are Apple's own three argument tables rather than round
+    /// numbers, so each one means something:
+    ///
+    /// * `le16` — inside all three of Apple's tables, so inside any bound this
+    ///   device could plausibly adopt.
+    /// * `le_table` — above Apple's 16-entry sampler table, inside its buffer
+    ///   table and inside [`MAX_BIND_SLOTS`]. This is headroom being spent.
+    /// * `over_table` — past this device's bound. Fires on exactly the records
+    ///   the sibling `*_bind_slot_past_table` counts slots for, so the two
+    ///   reconcile: records here, slots there.
+    ///
+    /// # What a driven boot reads, and why it settles the widening question
+    ///
+    /// arm64 / MoltenVK-Vulkan, `vm/boot-arm64.sh --device reims-vgpu-mmio
+    /// --testing`, driven with `window-drag-probe` repositioning a Safari
+    /// window; 325 census windows, peak 1 205 draws in a window, 325 523 bind
+    /// records:
+    ///
+    /// | class | `le16` | `le_table` | `over_table` |
+    /// |---|---|---|---|
+    /// | buffer | 188 072 | 5 104 | 0 |
+    /// | texture | 84 692 | 0 | 0 |
+    /// | sampler | 47 655 | 0 | 0 |
+    ///
+    /// **The texture table's 31-against-128 gap costs this workload nothing.**
+    /// Not one texture bind reaches even slot 17, so widening it — which on the
+    /// Vulkan arm means re-laying every band in
+    /// [`crate::runtime::spirv_bind`], whose texture band is exactly 32 wide and
+    /// abuts the sampler band — would buy zero. That is the measured argument
+    /// the drop counter was added to produce, and it argues against.
+    ///
+    /// **The table actually running near its ceiling is the buffer one**, which
+    /// no reading of the loss counters could have said: 2.6 % of buffer binds
+    /// reach into 17..31, and 31 is *exactly* Apple's own buffer bound, so this
+    /// device fits it with no loss and no margin at all. If a later serializer
+    /// raises that table, this rail starts dropping on the first record rather
+    /// than degrading — which is what makes the build gate beside
+    /// [`BindClass`] load-bearing rather than tidy.
+    ///
+    /// The standing caveat applies: one workload, one pathway. A guest binding
+    /// many textures at once — a deferred renderer, an atlas-heavy engine — is
+    /// exactly where `render_bind_reach_texture_le_table` would move first, and
+    /// it is the band to watch rather than the drop counter.
+    fn reach_route(self, reach: u32) -> &'static str {
+        use reims_vgpu_wire::ops::bind_limit;
+        match (self, reach) {
+            (BindClass::Buffer, r) if r <= bind_limit::SAMPLER => "render_bind_reach_buffer_le16",
+            (BindClass::Buffer, r) if r <= MAX_BIND_SLOTS => "render_bind_reach_buffer_le_table",
+            (BindClass::Buffer, _) => "render_bind_reach_buffer_over_table",
+            (BindClass::Texture, r) if r <= bind_limit::SAMPLER => "render_bind_reach_texture_le16",
+            (BindClass::Texture, r) if r <= MAX_BIND_SLOTS => "render_bind_reach_texture_le_table",
+            (BindClass::Texture, _) => "render_bind_reach_texture_over_table",
+            (BindClass::Sampler, r) if r <= bind_limit::SAMPLER => "render_bind_reach_sampler_le16",
+            (BindClass::Sampler, r) if r <= MAX_BIND_SLOTS => "render_bind_reach_sampler_le_table",
+            (BindClass::Sampler, _) => "render_bind_reach_sampler_over_table",
+        }
+    }
+}
+
+// The three relations that make each `*_bind_slot_past_table` slug readable in a
+// driven boot's census, pinned at build time because both sides can move
+// independently: a new macOS serializer can change Apple's argument tables, and
+// widening the host tables changes [`MAX_BIND_SLOTS`]. Either would silently
+// re-point what the census means, so this is a build gate rather than a test —
+// the same reason `reims_vgpu_wire::Wire::ASSERT_ALIGN_1` is one.
+//
+// Textures: Apple emits above the bound, so a reading is lost guest work and is
+// the argument for widening.
+const _: () = assert!(reims_vgpu_wire::ops::bind_limit::TEXTURE > MAX_BIND_SLOTS);
+// Buffers: two independent derivations of one table size — Apple's serializer
+// truncates there and Metal's `REIMS_VGPU_METAL_MAX_BUFFERS` stops there.
+const _: () = assert!(reims_vgpu_wire::ops::bind_limit::BUFFER == MAX_BIND_SLOTS);
+// Samplers: Apple truncates well below the bound, so this slug cannot fire on a
+// stream Apple's serializer wrote. A reading is a guest writing its own stream,
+// or a decode that mis-sized the table.
+const _: () = assert!(reims_vgpu_wire::ops::bind_limit::SAMPLER < MAX_BIND_SLOTS);
+
+/// Which bind table a record names: the stage picks vertex or fragment, the
+/// class picks buffer, texture or sampler.
+///
+/// The two travel together because [`apply_binds`] needs both to say where a
+/// slot went and, when the slot is past the bound, which of the three tables
+/// lost it.
+#[derive(Clone, Copy, Debug)]
+struct BindTarget {
+    stage: Stage,
+    class: BindClass,
+}
+
 /// Apply one `Set{Buffer,Texture,Sampler}` record to a stage's bind table.
 ///
 /// All three carry the same wire form: `count` consecutive slots starting at
@@ -1476,16 +2258,41 @@ fn reset_unimplemented_opcode_dedup_for_test() {
 fn apply_binds<T: Copy, B: Clone>(
     entries: &[T],
     first: u32,
-    stage: Stage,
+    target: BindTarget,
     vertex: &mut BindTable<B>,
     fragment: &mut BindTable<B>,
     slot: impl Fn(&B) -> u32,
     mut make: impl FnMut(u32, T) -> Option<B>,
 ) -> u32 {
+    let BindTarget { stage, class } = target;
+    // Once per record, before the walk, so it reports what the guest asked for
+    // rather than what survived the bound. An empty entry list is not a request
+    // and `first` alone is not a reach.
+    if let Some(last) = entries.len().checked_sub(1) {
+        let reach = first.saturating_add(last as u32).saturating_add(1);
+        crate::runtime::drain::note_store_route(class.reach_route(reach));
+    }
     let mut cleared = 0u32;
     for (i, entry) in entries.iter().copied().enumerate() {
         let index = first.saturating_add(i as u32);
         if index >= MAX_BIND_SLOTS {
+            // The walk stops here, and it used to stop in silence — a `break`
+            // that dropped every remaining slot with nothing to say so. The
+            // guest really does bind past this: `setVertexTextures:withRange:`
+            // over a range of 40 is a record Apple's serializer produces, and
+            // `MAX_BIND_SLOTS` is 31 because it is Metal's *buffer* index cap,
+            // where the texture limit is 128. So this fires on real traffic and
+            // the binds it drops are real.
+            //
+            // Raising the cap means widening the backends' tables, which is a
+            // change with its own measurement; naming the loss is not. The
+            // counter says how much is at stake, and a non-zero reading is the
+            // argument for doing the widening — for the table [`BindClass`]
+            // names, which is why there are three slugs rather than one.
+            crate::runtime::drain::note_store_route_n(
+                class.past_table_route(),
+                (entries.len() - i) as u64,
+            );
             break;
         }
         let bind = make(index, entry);
@@ -1510,6 +2317,228 @@ fn apply_binds<T: Copy, B: Clone>(
         }
     }
     cleared
+}
+
+/// The draw opcodes whose records carry an index buffer.
+///
+/// `render::decode` collapses every draw form to `Kind::Draw`, so the decoded
+/// record cannot say which class it came from and the opcode is the only thing
+/// that can.
+fn is_indexed_draw_opcode(opcode: u32) -> bool {
+    use crate::runtime::decode::render::{
+        OP_DRAW_INDEXED, OP_DRAW_INDEXED_INST, OP_DRAW_INDEXED_WIDE,
+    };
+    matches!(
+        opcode,
+        OP_DRAW_INDEXED | OP_DRAW_INDEXED_INST | OP_DRAW_INDEXED_WIDE
+    )
+}
+
+/// Name an indexed draw whose record carried no index buffer.
+///
+/// Deduped on the opcode: the three indexed forms read `index_buffer_ref` from
+/// three different payload offsets, so which form fires is the whole diagnostic
+/// value — one form firing alone points at that form's offset, all three
+/// firing points at the guest.
+fn note_indexed_draw_without_buffer(task_id: u32, opcode: u32, index_count: u32) {
+    crate::observe::fail(format!(
+        "stream_draw reason=indexed_without_index_buffer task={task_id} op={opcode:#x} \
+         index_count={index_count} drawn_as=non_indexed"
+    ));
+}
+
+/// Name a depth or stencil attachment dropped for a form this device does not
+/// implement.
+///
+/// Deduped on the pair that decides the arm, not on the task: this fires from a
+/// per-`RenderPass` decode, so a guest that uses mip-1 depth throughout would
+/// otherwise emit on every pass in every stream. One line per distinct
+/// (aspect, level, resolve-present) combination is what answers the question
+/// the arm exists to answer — whether any guest asks for this at all.
+/// The subresource coordinates and resolve target shared by all three
+/// attachment shapes, lifted so the depth and stencil arms cannot drift apart.
+///
+/// They are one 28-byte prefix on the wire
+/// (`reims_vgpu_wire::ops::render_pass::AttachmentPrefix`), and this device had
+/// two arms reading it with two copies of the same four-line check. A third
+/// copy is what the colour arm would have needed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct AttachSubresource {
+    level: u32,
+    slice: u32,
+    depth_plane: u32,
+    resolve_texture_ref: u32,
+}
+
+impl From<crate::runtime::decode::render::DepthAttachment> for AttachSubresource {
+    fn from(a: crate::runtime::decode::render::DepthAttachment) -> Self {
+        Self {
+            level: a.level,
+            slice: a.slice,
+            depth_plane: a.depth_plane,
+            resolve_texture_ref: a.resolve_texture_ref,
+        }
+    }
+}
+
+impl From<crate::runtime::decode::render::StencilAttachment> for AttachSubresource {
+    fn from(a: crate::runtime::decode::render::StencilAttachment) -> Self {
+        Self {
+            level: a.level,
+            slice: a.slice,
+            depth_plane: a.depth_plane,
+            resolve_texture_ref: a.resolve_texture_ref,
+        }
+    }
+}
+
+/// Whether this device can honour a depth or stencil attachment as decoded.
+///
+/// Only the whole texture at level 0, slice 0, plane 0 with no multisample
+/// resolve. `slice` and `depth_plane` joined the test when they became
+/// decodable: a depth buffer bound at slice 5 was previously read as slice 0 and
+/// silently accepted, which is the same defect the colour arm had.
+fn depth_stencil_is_bindable(level: u32, slice: u32, depth_plane: u32, resolve: u32) -> bool {
+    level == 0 && slice == 0 && depth_plane == 0 && resolve == 0
+}
+
+fn note_depth_stencil_unsupported(task_id: u32, aspect: &'static str, s: &AttachSubresource) {
+    crate::observe::Emit::decline(
+        "stream_pass",
+        &StreamDrawDrop::DepthStencilUnsupported {
+            aspect,
+            level: s.level,
+            slice: s.slice,
+            depth_plane: s.depth_plane,
+            resolve_texture_ref: s.resolve_texture_ref,
+        },
+    )
+    .field("task", task_id)
+    .fail_once(
+        u64::from(s.level) << 32
+            | u64::from(s.slice) << 16
+            | u64::from(s.depth_plane) << 8
+            | u64::from(s.resolve_texture_ref != 0) << 1
+            | u64::from(aspect == "stencil"),
+    );
+}
+
+/// Bands for the stated pass extent as a fraction of its attachment's area.
+///
+/// Same seven bands as the scissor-union census in `metal_draw::vulkan`, so the
+/// two are readable side by side — they answer the same question from two
+/// different sources, and the whole point is which of the two carries damage the
+/// other does not.
+const PASS_EXTENT_SLUGS: [&str; 7] = [
+    "pass_extent_lt1",
+    "pass_extent_le5",
+    "pass_extent_le10",
+    "pass_extent_le25",
+    "pass_extent_le50",
+    "pass_extent_le99",
+    "pass_extent_full",
+];
+
+/// Score the guest's stated pass extent against the attachment it names.
+///
+/// This is the number the flush rail has been missing. The root `AGENTS.md`
+/// records that bounding a writeback by the *draw stream's* scissors saves
+/// nothing — 99.92 % of armed windows have a per-pass scissor union of 100 % —
+/// and concludes that "a damage-bounded flush needs a different source of damage
+/// than the draw stream, and none is currently decoded". `renderTargetWidth` and
+/// `renderTargetHeight` are decoded now, and a driven boot shows the window
+/// server naming extents like 170x12 and 32x32 rather than the display's
+/// 1920x1080.
+///
+/// What this cannot say by itself is whether those small extents sit on small
+/// attachments. That is exactly what the bands measure: a distribution weighted
+/// at `full` means the extent is the surface and there is nothing to bound, and
+/// one with mass below `le50` is a writeback that could be halved.
+///
+/// A pass that states no extent at all is not scored — there is no fraction to
+/// take — and neither is one whose attachment has no geometry yet.
+fn note_pass_extent_coverage(pass_w: u64, pass_h: u64, surf_w: u32, surf_h: u32) {
+    if pass_w == 0 || pass_h == 0 || surf_w == 0 || surf_h == 0 {
+        return;
+    }
+    let full = u64::from(surf_w).saturating_mul(u64::from(surf_h));
+    let stated = pass_w.saturating_mul(pass_h);
+    // Clamped for the reason the scissor union is: a guest may state an extent
+    // larger than the attachment and the rasteriser clips, so an unclamped
+    // ratio would read over 100 % and make the census unreadable.
+    let pct = stated.min(full).saturating_mul(100) / full.max(1);
+    crate::runtime::drain::note_store_route(PASS_EXTENT_SLUGS[pass_extent_band(pct)]);
+}
+
+/// The bands, matching `metal_draw::vulkan::coverage_band` exactly.
+///
+/// Declared here rather than shared because that one is behind
+/// `backend-vulkan` and this census runs on every backend; the two are pinned
+/// equal by `the_two_coverage_censuses_use_the_same_bands`.
+fn pass_extent_band(pct: u64) -> usize {
+    match pct {
+        0 => 0,
+        1..=5 => 1,
+        6..=10 => 2,
+        11..=25 => 3,
+        26..=50 => 4,
+        51..=99 => 5,
+        _ => 6,
+    }
+}
+
+/// The pass extent the guest asked for, which this device does not apply.
+///
+/// `renderTargetWidth`/`Height` are the guest's explicit statement about how
+/// much of each attachment the pass covers, and every consumer here uses the
+/// attachment's own extent instead. That is only a defect when the two differ,
+/// and nothing at this point knows the attachment's size — so what this reports
+/// is the *value*, deduped on the pair, and the comparison is left to a reader
+/// with the surface geometry beside it.
+///
+/// Deduped rather than counted per pass for the reason the resource table's
+/// `TailPopulated` gives: a statement this device discards is a property of the
+/// guest build, not of the pass that happened to carry it first. A driven boot
+/// produces 1 575 of these and a handful of distinct extents.
+fn note_pass_target_extent(task_id: u32, width: u64, height: u64) {
+    crate::runtime::drain::note_store_route("render_pass_target_extent_unapplied");
+    crate::observe::Emit::decline(
+        "stream_pass",
+        &StreamDrawDrop::TargetExtentUnapplied { width, height },
+    )
+    .field("task", task_id)
+    .fail_once(width << 32 | (height & 0xffff_ffff));
+}
+
+/// A colour attachment naming a mip, a slice or a depth plane this device
+/// renders past. See [`StreamDrawDrop::ColorSubresourceUnsupported`].
+///
+/// Deduped on the three coordinates and the slot rather than on the texture,
+/// because the question is which *shape* of subresource a guest asks for, not
+/// how many textures it asks for it on.
+fn note_color_subresource_unsupported(
+    task_id: u32,
+    slot: u32,
+    att: &crate::runtime::decode::render::ColorAttachment,
+) {
+    crate::runtime::drain::note_store_route("render_color_subresource_unsupported");
+    crate::observe::Emit::decline(
+        "stream_pass",
+        &StreamDrawDrop::ColorSubresourceUnsupported {
+            slot,
+            level: att.level,
+            slice: att.slice,
+            depth_plane: att.depth_plane,
+        },
+    )
+    .field("task", task_id)
+    .field("texture", att.texture_ref)
+    .fail_once(
+        u64::from(slot) << 48
+            | u64::from(att.level) << 32
+            | u64::from(att.slice) << 16
+            | u64::from(att.depth_plane),
+    );
 }
 
 /// Report what this stream's draw list cost, and anything it lost building it.
@@ -1629,14 +2658,33 @@ fn finish_stream<M: HostMemory + HostOps>(
             // rather than the stream's last draw, because the ICB carries its
             // own. Otherwise the last pass's geometry describes the pass this
             // ICB runs inside.
-            let (pipeline, count, inst, prim, first) = if acc.pipeline_ref != 0 {
-                let (count, inst, prim, first) = acc.draws.last().map_or((1, 1, 3, 0), |pd| {
-                    let (count, inst, prim, first) = pd.draw;
-                    (count.max(1), inst.max(1), prim, first)
-                });
-                (acc.pipeline_ref, count, inst, prim, first)
+            let (pipeline, args) = if acc.pipeline_ref != 0 {
+                let args = acc.draws.last().map_or(
+                    DrawArgs {
+                        vertex_count: 1,
+                        instance_count: 1,
+                        primitive_type: 3,
+                        first_vertex: 0,
+                        base_instance: 0,
+                    },
+                    |pd| DrawArgs {
+                        vertex_count: pd.draw.vertex_count.max(1),
+                        instance_count: pd.draw.instance_count.max(1),
+                        ..pd.draw
+                    },
+                );
+                (acc.pipeline_ref, args)
             } else {
-                (1, 1, 1, 3, 0)
+                (
+                    1,
+                    DrawArgs {
+                        vertex_count: 1,
+                        instance_count: 1,
+                        primitive_type: 3,
+                        first_vertex: 0,
+                        base_instance: 0,
+                    },
+                )
             };
             let req = metal_draw::mrt_draw_request(
                 state,
@@ -1645,10 +2693,11 @@ fn finish_stream<M: HostMemory + HostOps>(
                 pipeline,
                 &acc.color_slots,
                 &acc.clears,
-                count,
-                inst,
-                prim,
-                first,
+                args.vertex_count,
+                args.instance_count,
+                args.primitive_type,
+                args.first_vertex,
+                args.base_instance,
             );
             if let Some(mut req) = req {
                 // ICB execute inherits stream bind state at end of stream.
@@ -1738,7 +2787,7 @@ fn finish_stream<M: HostMemory + HostOps>(
         let draw_list: Vec<&PendingDraw> = acc
             .draws
             .iter()
-            .filter(|pd| pd.pipeline_ref != 0 && pd.draw.0 > 0)
+            .filter(|pd| pd.pipeline_ref != 0 && pd.draw.vertex_count > 0)
             .collect();
         let mut chain_rgba: Option<Vec<u8>> = None;
         // Resident render-pass chain: intermediate records keep their content
@@ -1747,7 +2796,6 @@ fn finish_stream<M: HostMemory + HostOps>(
         let mut saw_nometal = false;
         let first_draw = draw_list.first().copied();
         let mut first_req = first_draw.and_then(|pd| {
-            let (count, inst, prim, first) = pd.draw;
             out.render_attachment_resolves = out.render_attachment_resolves.saturating_add(1);
             metal_draw::mrt_draw_request(
                 state,
@@ -1756,10 +2804,11 @@ fn finish_stream<M: HostMemory + HostOps>(
                 pd.pipeline_ref,
                 &acc.color_slots,
                 &acc.clears,
-                count,
-                inst,
-                prim,
-                first,
+                pd.draw.vertex_count,
+                pd.draw.instance_count,
+                pd.draw.primitive_type,
+                pd.draw.first_vertex,
+                pd.draw.base_instance,
             )
         });
         // A serialized Metal render stream is one render pass: its attachment
@@ -2057,13 +3106,13 @@ fn retarget_render_pass_draw(
     template: &metal_draw::DrawEncodeRequest,
     draw: &PendingDraw,
 ) -> metal_draw::DrawEncodeRequest {
-    let (count, inst, prim, first) = draw.draw;
     let mut req = template.clone();
     req.pipeline_ref = draw.pipeline_ref;
-    req.vertex_count = count;
-    req.instance_count = inst;
-    req.primitive_type = prim;
-    req.first_vertex = first;
+    req.vertex_count = draw.draw.vertex_count;
+    req.instance_count = draw.draw.instance_count;
+    req.primitive_type = draw.draw.primitive_type;
+    req.first_vertex = draw.draw.first_vertex;
+    req.base_instance = draw.draw.base_instance;
     req
 }
 
@@ -2230,7 +3279,9 @@ fn apply_clear<M: HostMemory + HostOps>(
     }
     // Prefer full draw-path resolve (type-11 or type-2/3 GVA wallpaper targets).
     let Some(req) =
-        metal_draw::color_target_request(state, host, task_id, att.texture_ref, 0, 0, 1, 0, 0)
+        // A clear-only pass: no pipeline and no geometry, so every draw
+        // argument including the base instance is zero by construction.
+        metal_draw::color_target_request(state, host, task_id, att.texture_ref, 0, 0, 1, 0, 0, 0)
     else {
         // A clear whose color target cannot resolve (mapping unresolved, geometry
         // missing) is dropped here with no other trace — the "background didn't
@@ -2922,6 +3973,336 @@ mod tests {
         assert_eq!(c.color0.texture_ref, 41);
     }
 
+    /// An indexed draw whose record named no index buffer says so.
+    ///
+    /// `count` takes `index_count` and `indexed` stays `None`, so the record
+    /// executes as a non-indexed draw of `index_count` vertices — a draw call
+    /// the guest never made, built from one it did. Metal has no such form:
+    /// `drawIndexedPrimitives` takes its index buffer as an argument, so a zero
+    /// ref has nothing to mean.
+    ///
+    /// Asserts the line and, separately, that a well-formed indexed draw does
+    /// not produce it — the counter is only useful if it is quiet on the path
+    /// that works.
+    #[test]
+    fn an_indexed_draw_with_no_index_buffer_is_named() {
+        use crate::runtime::decode::render::OP_DRAW_INDEXED;
+        // ARM compact indexed payload: prim@0, indexBufferRef@4, count@8:u16,
+        // offset@0xa:u16 — total record 0x14.
+        let record = |index_buffer_ref: u32| {
+            let mut cmd = vec![0u8; 0x14];
+            st32(&mut cmd[0..], OP_DRAW_INDEXED);
+            st32(&mut cmd[4..], 0x14);
+            st32(&mut cmd[HEADER_LEN..], 3); // primitiveType
+            st32(&mut cmd[HEADER_LEN + 4..], index_buffer_ref);
+            cmd[HEADER_LEN + 8..HEADER_LEN + 10].copy_from_slice(&6u16.to_le_bytes());
+            cmd
+        };
+        let run = |cmd: &[u8]| {
+            let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+            let host = FakeHost::new();
+            let mut out = ExecResult::default();
+            let mut acc = StreamAccum {
+                pipeline_ref: 5,
+                ..Default::default()
+            };
+            handle_render_record(
+                &mut state,
+                &host,
+                1,
+                OP_DRAW_INDEXED,
+                cmd,
+                &mut out,
+                &mut acc,
+            );
+            acc
+        };
+
+        let good = run(&record(42));
+        assert!(
+            good.indexed.is_some(),
+            "a record naming an index buffer is an indexed draw"
+        );
+
+        let bad = run(&record(0));
+        assert!(
+            bad.indexed.is_none(),
+            "behaviour is unchanged: still no index buffer to draw with"
+        );
+
+        let log = std::fs::read_to_string(crate::observe::fail_log_path()).expect("fail log");
+        assert!(
+            log.contains("reason=indexed_without_index_buffer"),
+            "an indexed draw reinterpreted as non-indexed must say so"
+        );
+        assert!(
+            log.contains(&format!("op={OP_DRAW_INDEXED:#x}")),
+            "the line must name which indexed form fired, since each reads the \
+             ref at a different offset"
+        );
+    }
+
+    /// A depth attachment this device cannot honour is dropped, and says so.
+    ///
+    /// A non-zero `level` binds a mip of the depth texture and a non-zero
+    /// `resolve_texture_ref` is a multisample depth resolve; both are real Metal
+    /// and neither is implemented here. The gate that drops them was a bare `if`
+    /// with no else, so the pass ran on with no depth attachment at all — depth
+    /// testing gone for every draw in it, which reads as wrong occlusion rather
+    /// than as a missing frame, and left nothing in the log to connect the two.
+    ///
+    /// Both halves are asserted: the attachment is still refused (unchanged
+    /// behaviour) and the refusal is now named.
+    #[test]
+    fn an_unsupported_depth_attachment_is_named_not_just_dropped() {
+        use crate::runtime::decode::render::{
+            HEADER_LEN, OP_RENDER_PASS, PASS_ATTACH_DEPTH_PLANE, PASS_ATTACH_LEVEL,
+            PASS_ATTACH_RESOLVEREF, PASS_ATTACH_SLICE, PASS_ATTACH_TEXREF, PASS_DEPTH_ATTACH_OFF,
+            PASS_STENCIL_ATTACH_OFF,
+        };
+        let pass = |level: u16, resolve: u32| {
+            let mut payload = vec![0u8; 0x200];
+            st32(
+                &mut payload[PASS_DEPTH_ATTACH_OFF + PASS_ATTACH_TEXREF..],
+                77,
+            );
+            payload[PASS_DEPTH_ATTACH_OFF + PASS_ATTACH_LEVEL
+                ..PASS_DEPTH_ATTACH_OFF + PASS_ATTACH_LEVEL + 2]
+                .copy_from_slice(&level.to_le_bytes());
+            st32(
+                &mut payload[PASS_DEPTH_ATTACH_OFF + PASS_ATTACH_RESOLVEREF..],
+                resolve,
+            );
+            // A stencil slot this device *can* honour, so the two aspects stay
+            // separable and the depth arm is the only one under test.
+            st32(
+                &mut payload[PASS_STENCIL_ATTACH_OFF + PASS_ATTACH_TEXREF..],
+                88,
+            );
+            let mut cmd = vec![0u8; HEADER_LEN + payload.len()];
+            st32(&mut cmd[0..], OP_RENDER_PASS);
+            st32(&mut cmd[4..], (HEADER_LEN + payload.len()) as u32);
+            cmd[HEADER_LEN..].copy_from_slice(&payload);
+            cmd
+        };
+        let run = |cmd: &[u8]| {
+            let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+            let host = FakeHost::new();
+            let mut out = ExecResult::default();
+            let mut acc = StreamAccum::default();
+            handle_render_record(&mut state, &host, 1, OP_RENDER_PASS, cmd, &mut out, &mut acc);
+            acc
+        };
+
+        let ok = run(&pass(0, 0));
+        assert!(
+            ok.depth_attach.is_some() && ok.stencil_attach.is_some(),
+            "a level-0 depth attachment with no resolve is honoured"
+        );
+
+        for (level, resolve) in [(1u16, 0u32), (0, 99)] {
+            let acc = run(&pass(level, resolve));
+            assert!(
+                acc.depth_attach.is_none(),
+                "level={level} resolve={resolve} must still be refused"
+            );
+            assert!(
+                acc.stencil_attach.is_some(),
+                "refusing depth must not take the stencil attachment with it"
+            );
+        }
+
+        // `slice` and `depth_plane` are the two sixteen-bit fields above
+        // `level` in the shared attachment prefix, and this arm read neither
+        // until they were decodable. A depth buffer bound at slice 5 was read
+        // as slice 0 and silently accepted, which is a depth test against the
+        // wrong layer rather than a missing one.
+        for (field, at) in [
+            ("slice", PASS_ATTACH_SLICE),
+            ("plane", PASS_ATTACH_DEPTH_PLANE),
+        ] {
+            let mut cmd = pass(0, 0);
+            let slot = HEADER_LEN + PASS_DEPTH_ATTACH_OFF + at;
+            cmd[slot..slot + 2].copy_from_slice(&5u16.to_le_bytes());
+            let acc = run(&cmd);
+            assert!(
+                acc.depth_attach.is_none(),
+                "a depth attachment naming {field} 5 must be refused, not read as 0"
+            );
+        }
+
+        let log = std::fs::read_to_string(crate::observe::fail_log_path()).expect("fail log");
+        assert!(
+            log.contains("stream_depth_stencil_unsupported"),
+            "an unsupported depth attachment was dropped without naming itself"
+        );
+        assert!(
+            log.contains("aspect=depth"),
+            "the line must say which aspect was lost"
+        );
+        assert!(
+            log.contains("slice=5"),
+            "the line must carry the slice; it was undecodable before the shared \
+             prefix was derived"
+        );
+    }
+
+    /// A colour attachment naming a mip, a slice or a depth plane says so.
+    ///
+    /// Every consumer binds the texture whole, so the pass renders into level 0
+    /// slice 0 plane 0 regardless — a guest drawing a cube face overwrites face
+    /// 0. Nothing downstream can tell that happened, which is why the report is
+    /// here and not in a backend.
+    ///
+    /// The `slice` and `depth_plane` arms are the ones that could not have been
+    /// written before: those fields did not exist, because the decoder read
+    /// `level` thirty-two bits wide and swallowed the slice into it.
+    #[test]
+    fn a_colour_attachment_naming_a_subresource_this_device_cannot_bind_says_so() {
+        use crate::contract::endian::st32;
+        use crate::runtime::decode::render::{
+            HEADER_LEN, OP_RENDER_PASS, PASS_ATTACH_DEPTH_PLANE, PASS_ATTACH_LEVEL,
+            PASS_ATTACH_SLICE, PASS_ATTACH_TEXREF, PASS_COLOR_ATTACH_OFF, PASS_MIN_PAYLOAD,
+        };
+
+        let pass = |level: u16, slice: u16, plane: u16| {
+            let total = HEADER_LEN + PASS_MIN_PAYLOAD;
+            let mut cmd = vec![0u8; total];
+            st32(&mut cmd[0..], OP_RENDER_PASS);
+            st32(&mut cmd[4..], total as u32);
+            let slot = HEADER_LEN + PASS_COLOR_ATTACH_OFF;
+            st32(&mut cmd[slot + PASS_ATTACH_TEXREF..], 77);
+            cmd[slot + PASS_ATTACH_LEVEL..slot + PASS_ATTACH_LEVEL + 2]
+                .copy_from_slice(&level.to_le_bytes());
+            cmd[slot + PASS_ATTACH_SLICE..slot + PASS_ATTACH_SLICE + 2]
+                .copy_from_slice(&slice.to_le_bytes());
+            cmd[slot + PASS_ATTACH_DEPTH_PLANE..slot + PASS_ATTACH_DEPTH_PLANE + 2]
+                .copy_from_slice(&plane.to_le_bytes());
+            cmd
+        };
+        let run = |cmd: &[u8]| {
+            let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+            let host = FakeHost::new();
+            let mut out = ExecResult::default();
+            let mut acc = StreamAccum::default();
+            handle_render_record(
+                &mut state,
+                &host,
+                1,
+                OP_RENDER_PASS,
+                cmd,
+                &mut out,
+                &mut acc,
+            );
+            acc
+        };
+
+        // Subresource 0/0/0 is what this device binds, so it reports nothing.
+        let acc = run(&pass(0, 0, 0));
+        assert_eq!(
+            acc.color_slots.len(),
+            1,
+            "the plain attachment still reaches the slot list"
+        );
+
+        for (level, slice, plane) in [(3u16, 0u16, 0u16), (0, 5, 0), (0, 0, 2)] {
+            let acc = run(&pass(level, slice, plane));
+            assert_eq!(
+                acc.color_slots.len(),
+                1,
+                "level={level} slice={slice} plane={plane}: the pass still runs -- \
+                 reporting must not cost the guest its draw"
+            );
+        }
+
+        let log = std::fs::read_to_string(crate::observe::fail_log_path()).expect("fail log");
+        assert!(
+            log.contains("stream_color_subresource_unsupported"),
+            "a colour attachment bound at the wrong subresource said nothing"
+        );
+        assert!(
+            log.contains("slice=5"),
+            "the line must carry the slice; before the decode fix it was folded \
+             into the level and could not be reported"
+        );
+        assert!(
+            log.contains("plane=2"),
+            "the line must carry the depth plane"
+        );
+    }
+
+    /// The pass-extent census bands agree with the scissor-union census's.
+    ///
+    /// The two answer the same question from two different sources — the pass
+    /// descriptor and the draw stream — and the whole reason to have both is to
+    /// read them side by side. Bands that drifted apart would make that
+    /// comparison silently wrong rather than obviously so.
+    ///
+    /// Declared twice because `coverage_band` is behind `backend-vulkan` and
+    /// this census runs on every backend. This is the comparison that keeps the
+    /// duplication honest.
+    #[test]
+    fn the_two_coverage_censuses_use_the_same_bands() {
+        // Every boundary of every band, plus one over the top.
+        for pct in [0u64, 1, 5, 6, 10, 11, 25, 26, 50, 51, 99, 100, 101] {
+            let band = pass_extent_band(pct);
+            assert!(
+                band < PASS_EXTENT_SLUGS.len(),
+                "pct {pct} banded out of range"
+            );
+            #[cfg(feature = "backend-vulkan")]
+            assert_eq!(
+                band,
+                crate::runtime::metal_draw::coverage_band_for_test(pct),
+                "pct {pct}: the two censuses band it differently"
+            );
+        }
+        // The bands are ordered, so a larger fraction never scores lower.
+        let mut last = 0usize;
+        for pct in 0..=100u64 {
+            let b = pass_extent_band(pct);
+            assert!(b >= last, "pct {pct} banded below its predecessor");
+            last = b;
+        }
+        assert_eq!(pass_extent_band(100), PASS_EXTENT_SLUGS.len() - 1);
+    }
+
+    /// A stated extent is scored against the attachment, and only when both are
+    /// real.
+    #[test]
+    fn the_pass_extent_census_scores_a_fraction_and_clamps_it() {
+        use crate::runtime::drain::store_route_count;
+
+        // A pass covering a quarter of its attachment.
+        let before = store_route_count("pass_extent_le25");
+        note_pass_extent_coverage(960, 540, 1920, 1080);
+        assert_eq!(
+            store_route_count("pass_extent_le25"),
+            before + 1,
+            "960x540 of 1920x1080 is 25%"
+        );
+
+        // A pass stating more than the attachment holds. Metal permits it and
+        // the rasteriser clips, so this reads full rather than over 100%.
+        let before = store_route_count("pass_extent_full");
+        note_pass_extent_coverage(4096, 4096, 1920, 1080);
+        assert_eq!(store_route_count("pass_extent_full"), before + 1);
+
+        // Neither a missing extent nor a geometry-less attachment is scored:
+        // there is no fraction to take, and counting it as zero would put every
+        // unstated pass in the bottom band and make the census read as damage.
+        let before: u64 = PASS_EXTENT_SLUGS.iter().map(|s| store_route_count(s)).sum();
+        note_pass_extent_coverage(0, 0, 1920, 1080);
+        note_pass_extent_coverage(100, 100, 0, 0);
+        assert_eq!(
+            PASS_EXTENT_SLUGS
+                .iter()
+                .map(|s| store_route_count(s))
+                .sum::<u64>(),
+            before
+        );
+    }
+
     #[test]
     fn stream_accum_upserts_buffer_and_viewport() {
         use crate::runtime::decode::render::{
@@ -3040,7 +4421,68 @@ mod tests {
         assert_eq!(indexed.index_buffer_ref, 0x3e);
         assert_eq!(indexed.index_count, 6);
         assert_eq!(indexed.index_buffer_offset, 0x10100);
-        assert_eq!(acc.draws[0].draw, (6, 1, 3, 0));
+        assert_eq!(
+            acc.draws[0].draw,
+            DrawArgs {
+                vertex_count: 6,
+                instance_count: 1,
+                primitive_type: 3,
+                first_vertex: 0,
+                base_instance: 0,
+            }
+        );
+    }
+
+    /// A base vertex and a base instance survive the whole accumulator hop.
+    ///
+    /// Both had a home in every backend already — Metal's `render_core_mrt`
+    /// takes a base instance and `ReimsVgpuIndexedDraw` a base vertex, Vulkan's
+    /// `DrawRequest` and `IndexedDrawResource` the same two — and both were fed
+    /// a hardcoded zero from here, because nothing upstream decoded a draw form
+    /// that carries them. This is the seam that was missing, so it is the seam
+    /// worth pinning: a regression to a literal `0` anywhere between decode and
+    /// `DrawEncodeRequest` fails here.
+    #[test]
+    fn a_base_vertex_and_base_instance_reach_the_pending_draw() {
+        use crate::contract::endian::st16;
+
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let host = FakeHost::new();
+        let mut out = ExecResult::default();
+        let mut acc = StreamAccum {
+            pipeline_ref: 61,
+            ..Default::default()
+        };
+        let op = render::OP_DRAW_INDEXED_BASE;
+        let total = reims_vgpu_wire::ops::render::DRAW_INDEXED_INSTANCED_BASE_TOTAL_LEN;
+        let mut command = vec![0u8; total as usize];
+        st32(&mut command[0..], op);
+        st32(&mut command[4..], total);
+        st16(&mut command[8..], 3); // primitiveType
+        st16(&mut command[10..], 1); // indexType UInt32
+        st32(&mut command[12..], 0x3e); // index buffer ref
+        st16(&mut command[16..], 0x40); // index buffer offset (first, on this form)
+        st16(&mut command[18..], 6); // index count
+        st16(&mut command[20..], 9); // instanceCount
+        st16(&mut command[22..], 0xfffb); // baseVertex = -5
+        st16(&mut command[24..], 7); // baseInstance
+        handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
+
+        assert_eq!(acc.draws.len(), 1, "the draw must not be dropped");
+        assert_eq!(acc.draws[0].draw.instance_count, 9);
+        assert_eq!(acc.draws[0].draw.base_instance, 7);
+        let indexed = acc.draws[0].indexed.as_ref().expect("indexed draw");
+        assert_eq!(indexed.index_count, 6);
+        assert_eq!(indexed.index_buffer_offset, 0x40);
+        assert_eq!(indexed.base_vertex, -5, "a negative base vertex survives");
+
+        // And onward into the request the backends receive. `retarget_render_
+        // pass_draw` is the path records 2+ of a chained pass take, and it
+        // rebuilds every draw argument from the template.
+        let template = metal_draw::DrawEncodeRequest::default();
+        let req = retarget_render_pass_draw(&template, &acc.draws[0]);
+        assert_eq!(req.base_instance, 7);
+        assert_eq!(req.instance_count, 9);
     }
 
     /// Every decoded draw in a stream reaches the draw list.
@@ -3157,7 +4599,10 @@ mod tests {
         apply_binds(
             &[(77u32, 0u64)],
             0,
-            Stage::Vertex,
+            BindTarget {
+                stage: Stage::Vertex,
+                class: BindClass::Buffer,
+            },
             &mut acc.vertex_buffers,
             &mut acc.fragment_buffers,
             |b| b.index,
@@ -3192,18 +4637,27 @@ mod tests {
         };
         let task_id = 0xfeed;
         let mut command = vec![0u8; HEADER_LEN];
-        let op = render::OP_ACCEPTED_LAST;
+        // An opcode inside the encoder's range that no arm claims, found rather
+        // than named. It used to be `OP_ACCEPTED_LAST`, which stopped working
+        // the moment that bound was corrected to `0xa6` -- because `0xa6` is a
+        // record this rail now decodes. `0x99` was the replacement and lasted
+        // one commit, until `setVertexAmplificationMode:value:` turned out to be
+        // that number. The catch-all is what is under test, not any literal.
+        let op = render::unclaimed_accepted_opcode();
         st32(&mut command[0..], op);
         st32(&mut command[4..], HEADER_LEN as u32);
         handle_render_record(&mut state, &host, task_id, op, &command, &mut out, &mut acc);
 
         let body = std::fs::read_to_string(crate::observe::fail_log_path())
             .expect("reims-vgpu-fail.log readable");
-        assert!(body.lines().any(|line| {
-            line.contains(
-                "render_unimplemented reason=accepted_without_executor task=65261 opcode=0x98 len=8",
-            ) && line.contains("pipeline=64206")
-        }));
+        let want = format!(
+            "render_unimplemented reason=accepted_without_executor task=65261 opcode={op:#x} len=8"
+        );
+        assert!(
+            body.lines()
+                .any(|line| line.contains(&want) && line.contains("pipeline=64206")),
+            "no line matching {want:?}"
+        );
     }
 
     /// Regression guard: the accepted-without-executor line is deduped to ONE
@@ -3447,6 +4901,8 @@ mod tests {
             texture_ref: 5,
             resolve_texture_ref: 0,
             level: 0,
+            slice: 0,
+            depth_plane: 0,
             load_action: PASS_LOAD_ACTION_CLEAR,
             store_action: PASS_STORE_ACTION_STORE,
             clear_color: [1.0, 0.0, 0.0, 1.0], // red → BGRA (0,0,255,255)
@@ -3481,6 +4937,8 @@ mod tests {
             texture_ref: 99,
             resolve_texture_ref: 0,
             level: 0,
+            slice: 0,
+            depth_plane: 0,
             load_action: PASS_LOAD_ACTION_CLEAR,
             store_action: PASS_STORE_ACTION_STORE,
             clear_color: [0.0, 0.0, 0.0, 1.0],
@@ -3504,6 +4962,8 @@ mod tests {
             texture_ref: 99,
             resolve_texture_ref: 0,
             level: 0,
+            slice: 0,
+            depth_plane: 0,
             load_action: PASS_LOAD_ACTION_CLEAR,
             store_action: PASS_STORE_ACTION_STORE,
             clear_color: [1.0, 0.0, 0.0, 1.0],
@@ -3513,7 +4973,13 @@ mod tests {
         acc.color_slots.push((0, att));
         acc.draws.push(PendingDraw {
             pipeline_ref: 1,
-            draw: (3, 1, 3, 0),
+            draw: DrawArgs {
+                vertex_count: 3,
+                instance_count: 1,
+                primitive_type: 3,
+                first_vertex: 0,
+                base_instance: 0,
+            },
             indexed: None,
             vertex_buffers: Arc::new(vec![BufferBind {
                 index: 0,
@@ -3600,6 +5066,8 @@ mod tests {
             texture_ref: 5,
             resolve_texture_ref: 0,
             level: 0,
+            slice: 0,
+            depth_plane: 0,
             load_action: PASS_LOAD_ACTION_CLEAR,
             store_action: PASS_STORE_ACTION_STORE,
             clear_color: [0.0, 1.0, 0.0, 1.0], // green
@@ -3609,7 +5077,13 @@ mod tests {
         acc.color_slots.push((0, att));
         acc.draws.push(PendingDraw {
             pipeline_ref: 7,
-            draw: (3, 1, 3, 0),
+            draw: DrawArgs {
+                vertex_count: 3,
+                instance_count: 1,
+                primitive_type: 3,
+                first_vertex: 0,
+                base_instance: 0,
+            },
             indexed: None,
             vertex_buffers: Arc::new(vec![BufferBind {
                 index: 0,
@@ -3749,7 +5223,13 @@ mod tests {
 
         let draw = PendingDraw {
             pipeline_ref: 42,
-            draw: (6, 2, 4, 9),
+            draw: DrawArgs {
+                vertex_count: 6,
+                instance_count: 2,
+                primitive_type: 4,
+                first_vertex: 9,
+                base_instance: 0,
+            },
             ..Default::default()
         };
         let req = retarget_render_pass_draw(&template, &draw);
@@ -3802,5 +5282,1046 @@ mod tests {
             0x9001,
             "color_target_request=none"
         ));
+    }
+
+    /// A plural viewport or scissor applies its first entry and counts the rest.
+    ///
+    /// Before `0x83`/`0x76` were decoded the whole record reached no arm, so a
+    /// guest setting its viewport through `setViewports:count:` got none at all.
+    /// Now it gets the first, and the counter says what a viewport-array model
+    /// would have to hold.
+    #[test]
+    fn a_plural_viewport_or_scissor_applies_one_and_counts_the_rest() {
+        use crate::contract::endian::st64;
+        use crate::runtime::drain::store_route_count;
+
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let host = FakeHost::new();
+        let mut out = ExecResult::default();
+        let mut acc = StreamAccum::default();
+
+        let op = render::OP_SET_SCISSOR_RECTS;
+        let total = render::HEADER_LEN + render::SCISSOR_RECTS_COUNT_LEN
+            + 3 * render::SCISSOR_PAYLOAD_LEN;
+        let mut command = vec![0u8; total];
+        st32(&mut command[0..], op);
+        st32(&mut command[4..], total as u32);
+        st64(&mut command[render::HEADER_LEN..], 3);
+        let e0 = render::HEADER_LEN + render::SCISSOR_RECTS_COUNT_LEN;
+        for (i, val) in [11u64, 22, 33, 44].into_iter().enumerate() {
+            st64(&mut command[e0 + i * 8..], val);
+        }
+
+        let before = store_route_count("render_extra_scissors_dropped");
+        handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
+        assert_eq!(
+            acc.scissor,
+            Some((11, 22, 33, 44)),
+            "the first rect must reach the accumulator"
+        );
+        assert_eq!(
+            store_route_count("render_extra_scissors_dropped") - before,
+            2,
+            "the counter must name the entries dropped, not the record"
+        );
+
+        // One entry is the singular record and drops nothing.
+        let before = store_route_count("render_extra_scissors_dropped");
+        let total = render::HEADER_LEN + render::SCISSOR_PAYLOAD_LEN;
+        let mut command = vec![0u8; total];
+        let op = render::OP_SET_SCISSOR;
+        st32(&mut command[0..], op);
+        st32(&mut command[4..], total as u32);
+        for (i, val) in [1u64, 2, 3, 4].into_iter().enumerate() {
+            st64(&mut command[render::HEADER_LEN + i * 8..], val);
+        }
+        handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
+        assert_eq!(acc.scissor, Some((1, 2, 3, 4)));
+        assert_eq!(store_route_count("render_extra_scissors_dropped"), before);
+    }
+
+    /// A bind past the table's last slot says how many slots it dropped, and
+    /// which of the three tables lost them.
+    ///
+    /// Apple's serializer produces `setVertexTextures:withRange:` over a range
+    /// of 40, and `MAX_BIND_SLOTS` is 31 — Metal's *buffer* index cap, applied
+    /// to a texture table whose real limit is 128. So the walk ends early on
+    /// traffic a guest actually sends, and it used to end with a bare `break`.
+    /// The count is the argument for widening the tables, so it has to be the
+    /// number of slots lost rather than one event — and it has to name the
+    /// table, because the three do not lose the same thing. The sibling slugs
+    /// must stay still while the texture one moves; a shared counter that
+    /// incremented for all three is what this replaced.
+    #[test]
+    fn a_bind_past_the_last_table_slot_reports_what_it_dropped() {
+        use crate::runtime::drain::store_route_count;
+
+        const COUNT: u32 = 40;
+        let entry = render::REF_BIND_ENTRY_SIZE;
+        let total = render::HEADER_LEN + render::BIND_ENTRIES + (COUNT as usize) * entry;
+        let mut command = vec![0u8; total];
+        let op = render::OP_SET_VERTEX_TEXTURE;
+        st32(&mut command[0..], op);
+        st32(&mut command[4..], total as u32);
+        st32(&mut command[render::HEADER_LEN + render::BIND_FIRST..], 0);
+        st32(&mut command[render::HEADER_LEN + render::BIND_COUNT..], COUNT);
+        for i in 0..COUNT as usize {
+            let at = render::HEADER_LEN + render::BIND_ENTRIES + i * entry;
+            st32(&mut command[at..], 0x4000 + i as u32);
+        }
+
+        // The record itself must survive decode; a cap that refused it whole is
+        // what this counter exists to distinguish from.
+        let c = render::decode(&command).expect("forty texture binds must decode");
+        assert_eq!(c.ref_binds.len(), COUNT as usize);
+
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let host = FakeHost::new();
+        let mut out = ExecResult::default();
+        let mut acc = StreamAccum::default();
+        let before = store_route_count(BindClass::Texture.past_table_route());
+        let before_buf = store_route_count(BindClass::Buffer.past_table_route());
+        let before_smp = store_route_count(BindClass::Sampler.past_table_route());
+        handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
+        assert_eq!(
+            store_route_count(BindClass::Texture.past_table_route()) - before,
+            (COUNT - MAX_BIND_SLOTS) as u64,
+            "the counter must name every slot dropped, not the one event"
+        );
+        assert_eq!(
+            store_route_count(BindClass::Buffer.past_table_route()),
+            before_buf,
+            "a texture bind must not move the buffer table's counter"
+        );
+        assert_eq!(
+            store_route_count(BindClass::Sampler.past_table_route()),
+            before_smp,
+            "a texture bind must not move the sampler table's counter"
+        );
+        assert_eq!(
+            acc.vertex_textures.len(),
+            MAX_BIND_SLOTS as usize,
+            "every slot the table does hold must still be bound"
+        );
+    }
+
+    /// A bind at the last slot Apple's *sampler* table can name still binds.
+    ///
+    /// The three classes now carry three counters, and the risk that creates is
+    /// the opposite of the one it fixes: a per-class slug invites a per-class
+    /// *bound*, and bounding a table by what Apple's serializer emits is the
+    /// mistake [`reims_vgpu_wire::ops::bind_limit`]'s own doc names — it would
+    /// refuse a guest that writes its own stream. So the bound stays one number
+    /// and this pins that it did: a sampler at index 20, which is above Apple's
+    /// 16-entry sampler table and below [`MAX_BIND_SLOTS`], binds rather than
+    /// being counted away.
+    #[test]
+    fn a_sampler_above_apples_table_but_inside_ours_still_binds() {
+        use crate::runtime::drain::store_route_count;
+        use reims_vgpu_wire::ops::bind_limit;
+
+        const FIRST: u32 = 20;
+        const { assert!(FIRST >= bind_limit::SAMPLER && FIRST < MAX_BIND_SLOTS) };
+
+        let entry = render::REF_BIND_ENTRY_SIZE;
+        let total = render::HEADER_LEN + render::BIND_ENTRIES + entry;
+        let mut command = vec![0u8; total];
+        let op = render::OP_SET_VERTEX_SAMPLER;
+        st32(&mut command[0..], op);
+        st32(&mut command[4..], total as u32);
+        st32(
+            &mut command[render::HEADER_LEN + render::BIND_FIRST..],
+            FIRST,
+        );
+        st32(&mut command[render::HEADER_LEN + render::BIND_COUNT..], 1);
+        st32(
+            &mut command[render::HEADER_LEN + render::BIND_ENTRIES..],
+            0x3333,
+        );
+
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let host = FakeHost::new();
+        let mut out = ExecResult::default();
+        let mut acc = StreamAccum::default();
+        let before = store_route_count(BindClass::Sampler.past_table_route());
+        handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
+
+        assert_eq!(
+            store_route_count(BindClass::Sampler.past_table_route()),
+            before,
+            "the bound is the host table, not Apple's — this slot is inside it"
+        );
+        assert_eq!(
+            acc.vertex_samplers
+                .iter()
+                .map(|s| s.index)
+                .collect::<Vec<_>>(),
+            vec![FIRST]
+        );
+    }
+
+    /// Every bind record lands in exactly one reach band, and the top band
+    /// fires on the same records the drop counter counts slots for.
+    ///
+    /// The bands are what make a zero from `*_bind_slot_past_table` readable: a
+    /// workload whose every record stops at slot 4 and one whose every record
+    /// stops at slot 30 both drop nothing, and only the second says the bound
+    /// is nearly spent. So the band has to be chosen from the reach the guest
+    /// *asked for*, before the walk truncates it — which is what the `le_table`
+    /// case below would catch if the census moved inside the loop.
+    #[test]
+    fn every_bind_record_lands_in_one_reach_band_and_the_top_one_reconciles() {
+        use crate::runtime::drain::store_route_count;
+        use reims_vgpu_wire::ops::bind_limit;
+
+        let texture_record = |first: u32, count: u32| {
+            let entry = render::REF_BIND_ENTRY_SIZE;
+            let total = render::HEADER_LEN + render::BIND_ENTRIES + (count as usize) * entry;
+            let mut command = vec![0u8; total];
+            let op = render::OP_SET_VERTEX_TEXTURE;
+            st32(&mut command[0..], op);
+            st32(&mut command[4..], total as u32);
+            st32(
+                &mut command[render::HEADER_LEN + render::BIND_FIRST..],
+                first,
+            );
+            st32(
+                &mut command[render::HEADER_LEN + render::BIND_COUNT..],
+                count,
+            );
+            for i in 0..count as usize {
+                let at = render::HEADER_LEN + render::BIND_ENTRIES + i * entry;
+                st32(&mut command[at..], 0x4000 + i as u32);
+            }
+            (op, command)
+        };
+
+        let bands = [
+            "render_bind_reach_texture_le16",
+            "render_bind_reach_texture_le_table",
+            "render_bind_reach_texture_over_table",
+        ];
+        let read = || bands.map(store_route_count);
+
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let host = FakeHost::new();
+        let mut out = ExecResult::default();
+        let mut acc = StreamAccum::default();
+
+        // Reach exactly Apple's sampler-table size: the lowest band, inclusive.
+        let before = read();
+        let (op, command) = texture_record(0, bind_limit::SAMPLER);
+        handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
+        assert_eq!(
+            read()
+                .iter()
+                .zip(before)
+                .map(|(a, b)| a - b)
+                .collect::<Vec<_>>(),
+            vec![1, 0, 0],
+            "a reach of exactly {} is inside every one of Apple's tables",
+            bind_limit::SAMPLER
+        );
+
+        // One past it, still inside this device's table.
+        let before = read();
+        let (op, command) = texture_record(0, bind_limit::SAMPLER + 1);
+        handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
+        assert_eq!(
+            read()
+                .iter()
+                .zip(before)
+                .map(|(a, b)| a - b)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 0],
+            "one slot past Apple's sampler table is headroom being spent, not a loss"
+        );
+
+        // Past this device's table: the band and the slot counter must agree
+        // that the same record crossed, in their own units.
+        let before = read();
+        let before_slots = store_route_count(BindClass::Texture.past_table_route());
+        let (op, command) = texture_record(MAX_BIND_SLOTS - 1, 4);
+        handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
+        assert_eq!(
+            read()
+                .iter()
+                .zip(before)
+                .map(|(a, b)| a - b)
+                .collect::<Vec<_>>(),
+            vec![0, 0, 1],
+            "a record reaching past the bound is one record in the top band"
+        );
+        assert_eq!(
+            store_route_count(BindClass::Texture.past_table_route()) - before_slots,
+            3,
+            "and three slots in the drop counter — records here, slots there"
+        );
+    }
+
+    /// A buffer-offset record that lands on nothing says so, both ways.
+    ///
+    /// `setVertexBufferOffset:atIndex:` is the second record the guest spends on
+    /// a slot, and both of its miss paths were silent: an index past the table,
+    /// and an index inside it whose slot this device never bound. The second is
+    /// the sharper one — Metal requires a live bind at that index and encoder
+    /// state does not outlive the encoder, so a firing means this device's table
+    /// and the guest's disagree.
+    #[test]
+    fn a_buffer_offset_that_lands_on_nothing_reports_which_way_it_missed() {
+        use crate::runtime::drain::store_route_count;
+
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let host = FakeHost::new();
+        let mut out = ExecResult::default();
+        let mut acc = StreamAccum::default();
+
+        // index:u32 @0, offset:u64 @4 — a different payload shape from the plural
+        // binds, which is why it takes its own offsets rather than `BIND_*`.
+        let offset_record = |index: u32| {
+            let total = render::HEADER_LEN + render::BUFFER_OFFSET_PAYLOAD_LEN;
+            let mut command = vec![0u8; total];
+            let op = render::OP_SET_VERTEX_BUFFER_OFFSET;
+            st32(&mut command[0..], op);
+            st32(&mut command[4..], total as u32);
+            st32(
+                &mut command[render::HEADER_LEN + render::BUFFER_OFFSET_INDEX..],
+                index,
+            );
+            st64(
+                &mut command[render::HEADER_LEN + render::BUFFER_OFFSET_VALUE..],
+                0x5555,
+            );
+            (op, command)
+        };
+
+        // Inside the table, but nothing is bound there.
+        let before_unbound = store_route_count("render_buffer_offset_slot_unbound");
+        let (op, command) = offset_record(3);
+        handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
+        assert_eq!(
+            store_route_count("render_buffer_offset_slot_unbound") - before_unbound,
+            1,
+            "an offset for a slot this device never bound must be named"
+        );
+
+        // Past the table entirely.
+        let before_past = store_route_count("render_buffer_offset_slot_past_table");
+        let (op, command) = offset_record(MAX_BIND_SLOTS + 4);
+        handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
+        assert_eq!(
+            store_route_count("render_buffer_offset_slot_past_table") - before_past,
+            1,
+            "an offset past the table bound must be named separately"
+        );
+        assert_eq!(
+            store_route_count("render_buffer_offset_slot_unbound") - before_unbound,
+            1,
+            "a slot past the table is not also an unbound slot inside it"
+        );
+    }
+
+    /// The records this rail answers by doing nothing still say they arrived.
+    ///
+    /// `UseResource`, `UseHeap` and `Barrier` all reached the dispatch's
+    /// catch-all, so a guest's residency declaration and its barriers were
+    /// indistinguishable from a record that had been executed — the arm they
+    /// fell into was shared with `Kind::Unknown` and with every guarded arm's
+    /// else-case. Doing nothing is still the answer; being silent about it is
+    /// not, and a counter nobody reads back cannot show it is wired up.
+    #[test]
+    fn a_residency_or_barrier_record_is_counted_rather_than_dropped_in_silence() {
+        use crate::runtime::drain::store_route_count;
+
+        for (op, route, payload_len) in [
+            (
+                render::OP_USE_RESOURCE,
+                "render_noop_residency_hint",
+                render::USE_RESOURCE_REFS + 4,
+            ),
+            (
+                render::OP_USE_HEAP,
+                "render_noop_residency_hint",
+                render::USE_HEAP_REFS + 4,
+            ),
+            (render::OP_RESOURCE_BARRIER, "render_noop_barrier", 0),
+            (render::OP_MEMORY_BARRIER, "render_noop_barrier", 0),
+        ] {
+            let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+            let host = FakeHost::new();
+            let mut out = ExecResult::default();
+            let mut acc = StreamAccum::default();
+
+            let total = render::HEADER_LEN + payload_len;
+            let mut command = vec![0u8; total];
+            st32(&mut command[0..], op);
+            st32(&mut command[4..], total as u32);
+            if payload_len > 0 {
+                // One resource named, so the count-led extent is satisfied.
+                st32(&mut command[render::HEADER_LEN..], 1);
+            }
+
+            let before = store_route_count(route);
+            handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
+            assert_eq!(
+                store_route_count(route),
+                before + 1,
+                "op {op:#x} did not reach {route}"
+            );
+        }
+    }
+
+    /// The three ICB blit records are told apart rather than refused as one.
+    ///
+    /// They used to be declined before decode under a single shared reason,
+    /// which said three different things with one word. Only two of them are
+    /// losses: skipping Metal's optimize hint is semantically correct, while a
+    /// dropped reset leaves commands live that the guest retired and a dropped
+    /// copy leaves the destination holding what it held before. A counter that
+    /// cannot tell those apart cannot answer the question they exist to answer.
+    #[test]
+    fn each_icb_blit_record_reaches_a_counter_that_names_which_one_it_is() {
+        use crate::contract::endian::st64;
+        use crate::runtime::drain::store_route_count;
+        use reims_vgpu_wire::ops::blit as wire;
+
+        let range = |op: u32| {
+            let total = wire::ICB_RANGE_TOTAL_LEN as usize;
+            let mut v = vec![0u8; total];
+            st32(&mut v[0..], op);
+            st32(&mut v[4..], total as u32);
+            st32(&mut v[blit::HEADER_LEN..], 6161);
+            st64(&mut v[blit::HEADER_LEN + 4..], 0x3300);
+            st64(&mut v[blit::HEADER_LEN + 12..], 0x4400);
+            v
+        };
+        let copy = || {
+            let total = wire::COPY_ICB_TOTAL_LEN as usize;
+            let mut v = vec![0u8; total];
+            st32(&mut v[0..], blit::OP_COPY_ICB);
+            st32(&mut v[4..], total as u32);
+            st32(&mut v[blit::HEADER_LEN..], 7171);
+            st32(&mut v[blit::HEADER_LEN + 4..], 7272);
+            st64(&mut v[blit::HEADER_LEN + 8..], 0x1100);
+            st64(&mut v[blit::HEADER_LEN + 16..], 0x2200);
+            st64(&mut v[blit::HEADER_LEN + 24..], 0x3300);
+            v
+        };
+
+        for (op, command, route) in [
+            (
+                blit::OP_OPTIMIZE_ICB,
+                range(blit::OP_OPTIMIZE_ICB),
+                "blit_noop_icb_optimize",
+            ),
+            (
+                blit::OP_RESET_ICB,
+                range(blit::OP_RESET_ICB),
+                "blit_icb_reset_dropped",
+            ),
+            (blit::OP_COPY_ICB, copy(), "blit_icb_copy_dropped"),
+        ] {
+            let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+            let mut host = FakeHost::new();
+            let before = store_route_count(route);
+            handle_blit_record(&mut state, &mut host, 1, op, &command);
+            assert_eq!(
+                store_route_count(route),
+                before + 1,
+                "op {op:#x} did not reach {route}"
+            );
+        }
+
+        // The optimize hint is the one that is *not* a loss, so it must not
+        // reach either of the dropped-work counters. Sharing one would put a
+        // correct no-op in the same bucket as stale commands executing.
+        for route in ["blit_icb_reset_dropped", "blit_icb_copy_dropped"] {
+            let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+            let mut host = FakeHost::new();
+            let before = store_route_count(route);
+            let command = range(blit::OP_OPTIMIZE_ICB);
+            handle_blit_record(&mut state, &mut host, 1, blit::OP_OPTIMIZE_ICB, &command);
+            assert_eq!(
+                store_route_count(route),
+                before,
+                "the optimize hint was counted as {route}"
+            );
+        }
+    }
+
+    /// The five `BlitEncoderSPI` records each reach a route that names them.
+    ///
+    /// All five answered `blit_decode_unknown_opcode` until the wire capture
+    /// drove this class with the capability forced on, and three of them are
+    /// writes to guest-visible memory. The routes are not interchangeable and
+    /// the test says so in both directions: the two texture fills are lost work
+    /// and must not land on the invalidate's no-op counter, while the
+    /// compressed-texture invalidate is a correct skip and must not land on
+    /// either dropped-fill counter. Sharing one bucket would make a driven
+    /// boot's reading unusable for deciding which executor to build.
+    #[test]
+    fn each_blit_spi_record_reaches_a_counter_that_names_which_one_it_is() {
+        use crate::contract::endian::st64;
+        use crate::runtime::drain::store_route_count;
+        use reims_vgpu_wire::ops::blit as wire;
+
+        // A texture fill of either form: identical through the region, then the
+        // tail that tells the two apart. Zero-filled past that, which is what
+        // the guest's staged-bytes fill of length 0 would look like — the
+        // routing under test is by opcode, not by any value in the tail.
+        let texture_fill = |op: u32, total: u32| {
+            let mut v = vec![0u8; total as usize];
+            st32(&mut v[0..], op);
+            st32(&mut v[4..], total);
+            let p = blit::HEADER_LEN;
+            st32(&mut v[p..], 4242); // texture
+            st16(&mut v[p + 4..], 3); // level
+            st16(&mut v[p + 6..], 5); // slice
+            st64(&mut v[p + 8..], 0x44); // size w/h/d
+            st64(&mut v[p + 16..], 0x55);
+            st64(&mut v[p + 24..], 1);
+            st64(&mut v[p + 32..], 0x11); // origin x/y/z
+            st64(&mut v[p + 40..], 0x22);
+            st64(&mut v[p + 48..], 0x33);
+            v
+        };
+        let invalidate = |op: u32, total: u32| {
+            let mut v = vec![0u8; total as usize];
+            st32(&mut v[0..], op);
+            st32(&mut v[4..], total);
+            st32(&mut v[blit::HEADER_LEN..], 4242);
+            v
+        };
+
+        const COLOR: &str = "blit_fill_texture_color_dropped";
+        const BYTES: &str = "blit_fill_texture_bytes_dropped";
+        const INVALID: &str = "blit_noop_invalidate_compressed";
+
+        for (op, command, route) in [
+            (
+                blit::OP_FILL_TEXTURE_COLOR,
+                texture_fill(
+                    blit::OP_FILL_TEXTURE_COLOR,
+                    wire::FILL_TEXTURE_COLOR_TOTAL_LEN,
+                ),
+                COLOR,
+            ),
+            (
+                blit::OP_FILL_TEXTURE_BYTES,
+                texture_fill(
+                    blit::OP_FILL_TEXTURE_BYTES,
+                    wire::FILL_TEXTURE_BYTES_TOTAL_LEN,
+                ),
+                BYTES,
+            ),
+            (
+                blit::OP_INVALIDATE_COMPRESSED_TEXTURE,
+                invalidate(blit::OP_INVALIDATE_COMPRESSED_TEXTURE, wire::REF_TOTAL_LEN),
+                INVALID,
+            ),
+            (
+                blit::OP_INVALIDATE_COMPRESSED_TEXTURE_SLICE_LEVEL,
+                invalidate(
+                    blit::OP_INVALIDATE_COMPRESSED_TEXTURE_SLICE_LEVEL,
+                    wire::REF_SLICE_LEVEL_TOTAL_LEN,
+                ),
+                INVALID,
+            ),
+        ] {
+            let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+            let mut host = FakeHost::new();
+            let others: Vec<(&str, u64)> = [COLOR, BYTES, INVALID]
+                .into_iter()
+                .filter(|r| *r != route)
+                .map(|r| (r, store_route_count(r)))
+                .collect();
+            let before = store_route_count(route);
+            handle_blit_record(&mut state, &mut host, 1, op, &command);
+            assert_eq!(
+                store_route_count(route),
+                before + 1,
+                "op {op:#x} did not reach {route}"
+            );
+            for (other, was) in others {
+                assert_eq!(
+                    store_route_count(other),
+                    was,
+                    "op {op:#x} also reached {other}; the two losses are not the \
+                     same loss and one counter cannot answer for both"
+                );
+            }
+        }
+
+        // The pattern fill is the one of the five that is *executed*, so it
+        // must not appear on any of the three counters above. It fails on a
+        // missing buffer here, which is the executor running rather than the
+        // record being dropped.
+        let mut v = vec![0u8; wire::FILL_BUFFER_PATTERN4_TOTAL_LEN as usize];
+        st32(&mut v[0..], blit::OP_FILL_BUFFER_PATTERN4);
+        st32(&mut v[4..], wire::FILL_BUFFER_PATTERN4_TOTAL_LEN);
+        st32(&mut v[blit::HEADER_LEN..], 7);
+        st64(&mut v[blit::HEADER_LEN + 4..], 0);
+        st64(&mut v[blit::HEADER_LEN + 12..], 8);
+        st32(&mut v[blit::HEADER_LEN + 20..], 0x89ab_cdef);
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut host = FakeHost::new();
+        let before: Vec<u64> = [COLOR, BYTES, INVALID]
+            .into_iter()
+            .map(store_route_count)
+            .collect();
+        handle_blit_record(&mut state, &mut host, 1, blit::OP_FILL_BUFFER_PATTERN4, &v);
+        for (route, was) in [COLOR, BYTES, INVALID].into_iter().zip(before) {
+            assert_eq!(
+                store_route_count(route),
+                was,
+                "the executed pattern fill was counted as {route}"
+            );
+        }
+    }
+
+    /// A strided vertex bind reaches the bind table *and* its own counter.
+    ///
+    /// Both halves matter and they are different claims. The bind must land,
+    /// because this record used to be refused before decode and the buffer
+    /// never bound at all; the counter must fire, because the per-entry
+    /// attribute stride still is not applied and the count is what says whether
+    /// applying it is worth building.
+    #[test]
+    fn a_strided_vertex_bind_lands_in_the_table_and_still_reports_the_stride() {
+        use crate::contract::endian::st64;
+        use crate::runtime::drain::store_route_count;
+
+        const ROUTE: &str = "render_vertex_attribute_stride_dropped";
+        let total = render::HEADER_LEN + render::BIND_ENTRIES + render::BUFFER_STRIDE_BIND_ENTRY_SIZE;
+        let mut command = vec![0u8; total];
+        st32(&mut command[0..], render::OP_SET_VERTEX_BUFFER_STRIDE);
+        st32(&mut command[4..], total as u32);
+        st32(&mut command[render::HEADER_LEN + render::BIND_FIRST..], 4);
+        st32(&mut command[render::HEADER_LEN + render::BIND_COUNT..], 1);
+        let e = render::HEADER_LEN + render::BIND_ENTRIES;
+        st32(&mut command[e..], 5151);
+        st64(&mut command[e + 4..], 0x2345);
+        st64(&mut command[e + 12..], 0x3456);
+
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let host = FakeHost::new();
+        let mut out = ExecResult::default();
+        let mut acc = StreamAccum::default();
+        let before = store_route_count(ROUTE);
+        handle_render_record(
+            &mut state,
+            &host,
+            1,
+            render::OP_SET_VERTEX_BUFFER_STRIDE,
+            &command,
+            &mut out,
+            &mut acc,
+        );
+        assert_eq!(
+            store_route_count(ROUTE),
+            before + 1,
+            "the dropped stride was not counted"
+        );
+        assert_eq!(
+            acc.vertex_buffers.len(),
+            1,
+            "the buffer did not bind; this record used to be refused whole"
+        );
+        let b = &acc.vertex_buffers[0];
+        assert_eq!((b.index, b.buffer_ref, b.offset), (4, 5151, 0x2345));
+        assert!(
+            acc.fragment_buffers.is_empty(),
+            "a vertex bind reached the fragment table"
+        );
+
+        // The plain bind must not report a stride it never carried, or the
+        // counter reads as traffic on every ordinary vertex bind.
+        let plain_total = render::HEADER_LEN + render::BIND_ENTRIES + render::BUFFER_BIND_ENTRY_SIZE;
+        let mut plain = vec![0u8; plain_total];
+        st32(&mut plain[0..], render::OP_SET_VERTEX_BUFFER);
+        st32(&mut plain[4..], plain_total as u32);
+        st32(&mut plain[render::HEADER_LEN + render::BIND_COUNT..], 1);
+        st32(&mut plain[render::HEADER_LEN + render::BIND_ENTRIES..], 5151);
+        let before = store_route_count(ROUTE);
+        handle_render_record(
+            &mut state,
+            &host,
+            1,
+            render::OP_SET_VERTEX_BUFFER,
+            &plain,
+            &mut out,
+            &mut acc,
+        );
+        assert_eq!(
+            store_route_count(ROUTE),
+            before,
+            "a plain vertex bind reported a stride it does not carry"
+        );
+    }
+
+    /// Every state this rail decodes and does not apply reaches its own counter,
+    /// and the ones with an API default stay quiet when the guest asks for it.
+    ///
+    /// The counters are the whole reason those opcodes are decoded: each is the
+    /// measured argument for whether implementing that state is worth building,
+    /// and a counter nobody reads back cannot be shown to be wired up. Nine of
+    /// them had no such test until now.
+    ///
+    /// The two indirect draws are deliberately not in the default half. They
+    /// have no default to be at -- an indirect draw is geometry the guest asked
+    /// for, so every one is a loss and is counted unconditionally.
+    #[test]
+    fn every_decoded_but_unapplied_render_state_reaches_its_own_counter() {
+        use crate::contract::endian::{st16, st64};
+        use crate::runtime::drain::store_route_count;
+
+        // (opcode, total length, payload writer, route, whether a default-valued
+        // record of the same opcode must NOT count).
+        type Writer = fn(&mut [u8]);
+        let non_default: Writer = |p| st64(p, 2);
+        let at_default: Writer = |p| st64(p, 0);
+        let float_non_default: Writer = |p| st32(p, 2.5f32.to_bits());
+        let float_at_default: Writer = |p| st32(p, 1.0f32.to_bits());
+
+        let cases: &[(u32, usize, Writer, Option<Writer>, &str)] = &[
+            (
+                render::OP_SET_TRIANGLE_FILL_MODE,
+                16,
+                non_default,
+                Some(at_default),
+                "render_fill_mode_dropped",
+            ),
+            (
+                render::OP_SET_DEPTH_CLIP_MODE,
+                16,
+                non_default,
+                Some(at_default),
+                "render_depth_clip_mode_dropped",
+            ),
+            (
+                render::OP_SET_LINE_WIDTH,
+                12,
+                float_non_default,
+                Some(float_at_default),
+                "render_line_width_dropped",
+            ),
+            (
+                render::OP_SET_TESSELLATION_FACTOR_SCALE,
+                12,
+                float_non_default,
+                Some(float_at_default),
+                "render_tessellation_scale_dropped",
+            ),
+            (
+                render::OP_SET_DEPTH_STORE_ACTION,
+                16,
+                non_default,
+                // No default to compare against: the record overrides the pass
+                // descriptor, so even a zero is a change this rail is not making.
+                None,
+                "render_store_action_override_dropped",
+            ),
+            (
+                render::OP_SET_VISIBILITY_RESULT_MODE,
+                24,
+                // The mode is the *second* field: this record puts the offset
+                // first, reversing its selector. Writing the mode at payload+0
+                // sets the offset instead and leaves the mode at Disabled, so
+                // the counter correctly stays quiet -- which is how this test
+                // first failed.
+                |p| {
+                    st64(p, 0x1234);
+                    st64(&mut p[8..], 2);
+                },
+                Some(|p| {
+                    st64(p, 0x1234);
+                    st64(&mut p[8..], 0);
+                }),
+                "render_visibility_result_mode_dropped",
+            ),
+            (
+                render::OP_SET_VERTEX_AMPLIFICATION_COUNT,
+                render::HEADER_LEN
+                    + render::AMPLIFICATION_COUNT_LEN
+                    + 2 * render::AMPLIFICATION_MAPPING_SIZE,
+                // Two views. One is Metal's default and means no amplification,
+                // so the default arm below asks for one and must not count.
+                |p| st32(p, 2),
+                Some(|p| st32(p, 1)),
+                "render_vertex_amplification_dropped",
+            ),
+            (
+                render::OP_SET_VERTEX_AMPLIFICATION_MODE,
+                render::HEADER_LEN + 8,
+                |p| {
+                    st32(p, 0x5555);
+                    st32(&mut p[4..], 0x6666);
+                },
+                Some(|p| {
+                    st32(p, 0);
+                    st32(&mut p[4..], 0);
+                }),
+                "render_vertex_amplification_dropped",
+            ),
+            (
+                render::OP_DRAW_INDIRECT,
+                24,
+                |p| {
+                    st64(p, 0x1111);
+                    st32(&mut p[8..], 5151);
+                    st16(&mut p[12..], 3);
+                },
+                None,
+                "render_draw_indirect_dropped",
+            ),
+            (
+                render::OP_DRAW_INDEXED_INDIRECT,
+                36,
+                |p| {
+                    st16(p, 4);
+                    st16(&mut p[2..], 1);
+                    st32(&mut p[4..], 5151);
+                    st32(&mut p[8..], 5252);
+                    st64(&mut p[12..], 0x1111);
+                    st64(&mut p[20..], 0x2222);
+                },
+                None,
+                "render_draw_indexed_indirect_dropped",
+            ),
+            // The tile family. The four bind opcodes each get a one-slot record
+            // at their own entry stride, so a route that fired from the wrong
+            // arm would have to have accepted the wrong length first.
+            (
+                render::OP_SET_TILE_BUFFER,
+                render::HEADER_LEN + render::BIND_ENTRIES + render::BUFFER_BIND_ENTRY_SIZE,
+                |p| {
+                    st32(&mut p[render::BIND_FIRST..], 3);
+                    st32(&mut p[render::BIND_COUNT..], 1);
+                },
+                None,
+                "render_tile_buffer_bind_dropped",
+            ),
+            (
+                render::OP_SET_TILE_BUFFER_OFFSET,
+                20,
+                |p| {
+                    st32(p, 4);
+                    st64(&mut p[4..], 0x2345);
+                },
+                None,
+                "render_tile_buffer_bind_dropped",
+            ),
+            (
+                render::OP_SET_TILE_TEXTURE,
+                render::HEADER_LEN + render::BIND_ENTRIES + render::REF_BIND_ENTRY_SIZE,
+                |p| {
+                    st32(&mut p[render::BIND_FIRST..], 2);
+                    st32(&mut p[render::BIND_COUNT..], 1);
+                },
+                None,
+                "render_tile_texture_bind_dropped",
+            ),
+            (
+                render::OP_SET_TILE_SAMPLER,
+                render::HEADER_LEN + render::BIND_ENTRIES + render::REF_BIND_ENTRY_SIZE,
+                |p| {
+                    st32(&mut p[render::BIND_FIRST..], 4);
+                    st32(&mut p[render::BIND_COUNT..], 1);
+                },
+                None,
+                "render_tile_sampler_bind_dropped",
+            ),
+            (
+                render::OP_SET_TILE_SAMPLER_LOD,
+                render::HEADER_LEN + render::BIND_ENTRIES + render::SAMPLER_LOD_BIND_ENTRY_SIZE,
+                |p| {
+                    st32(&mut p[render::BIND_FIRST..], 5);
+                    st32(&mut p[render::BIND_COUNT..], 1);
+                },
+                None,
+                "render_tile_sampler_bind_dropped",
+            ),
+            // The three dispatches. Their default arm is a grid with a zero
+            // dimension, which Metal dispatches nothing for -- dropping one
+            // loses no work, so counting it would inflate the very number this
+            // counter exists to be.
+            (
+                render::OP_DISPATCH_THREADS_PER_TILE,
+                32,
+                |p| {
+                    st64(p, 0x11);
+                    st64(&mut p[8..], 0x22);
+                    st64(&mut p[16..], 0x33);
+                },
+                Some(|p| {
+                    st64(p, 0x11);
+                    st64(&mut p[8..], 0x22);
+                    st64(&mut p[16..], 0);
+                }),
+                "render_tile_dispatch_dropped",
+            ),
+            (
+                render::OP_DISPATCH_THREADS_PER_TILE_IN_REGION,
+                84,
+                |p| {
+                    st64(p, 0x11);
+                    st64(&mut p[8..], 0x22);
+                    st64(&mut p[16..], 0x33);
+                },
+                Some(|p| st64(&mut p[16..], 0)),
+                "render_tile_dispatch_dropped",
+            ),
+            (
+                render::OP_DISPATCH_THREADS_PER_TILE_IN_REGION_RT_INDEX,
+                84,
+                |p| {
+                    st64(p, 0x11);
+                    st64(&mut p[8..], 0x22);
+                    st64(&mut p[16..], 0x33);
+                },
+                Some(|p| st64(&mut p[16..], 0)),
+                "render_tile_dispatch_dropped",
+            ),
+            // Not a dropped command but an unanswered question, so it has no
+            // default arm: every one of these leaves the guest reading its own
+            // stale ring as a tile geometry.
+            (
+                render::OP_GET_TILE_DIMENSIONS,
+                20,
+                |p| {
+                    st32(p, 5151);
+                    st64(&mut p[4..], 0x9999);
+                },
+                None,
+                "render_tile_dimensions_unanswered",
+            ),
+            (
+                render::OP_SET_TILE_THREADGROUP_MEMORY,
+                28,
+                |p| {
+                    st64(p, 0x1234);
+                    st64(&mut p[8..], 0x2345);
+                    st32(&mut p[16..], 5);
+                },
+                None,
+                "render_tile_threadgroup_memory_dropped",
+            ),
+            // The store-action options. Their record is four bytes longer on
+            // the colour form than on the other two, so a route reached from
+            // the wrong arm would have had to accept the wrong length first.
+            (
+                render::OP_SET_COLOR_STORE_ACTION_OPTIONS,
+                20,
+                |p| {
+                    st64(p, 0x1111);
+                    st32(&mut p[8..], 3);
+                },
+                None,
+                "render_store_action_options_dropped",
+            ),
+            (
+                render::OP_SET_DEPTH_STORE_ACTION_OPTIONS,
+                16,
+                |p| st64(p, 0x2222),
+                None,
+                "render_store_action_options_dropped",
+            ),
+            (
+                render::OP_SET_STENCIL_STORE_ACTION_OPTIONS,
+                16,
+                |p| st64(p, 0x3333),
+                None,
+                "render_store_action_options_dropped",
+            ),
+            (
+                render::OP_SET_TESSELLATION_FACTOR_BUFFER,
+                28,
+                |p| {
+                    st32(p, 5151);
+                    st64(&mut p[4..], 0x3456);
+                    st64(&mut p[12..], 0x4567);
+                },
+                None,
+                "render_tessellation_factor_buffer_dropped",
+            ),
+            // The patch draws. The two `0x0c` rows are the point: one opcode,
+            // two lengths, and both must reach the counter -- a length-based
+            // dispatch that refused one of them would read as a healthy zero.
+            (
+                render::OP_DRAW_PATCHES,
+                24,
+                |_p| {},
+                None,
+                "render_draw_patches_dropped",
+            ),
+            (
+                render::OP_DRAW_PATCHES_WIDE,
+                56,
+                |_p| {},
+                None,
+                "render_draw_patches_dropped",
+            ),
+            (
+                render::OP_DRAW_PATCHES_WIDE,
+                68,
+                |_p| {},
+                None,
+                "render_draw_patches_dropped",
+            ),
+            (
+                render::OP_DRAW_INDEXED_PATCHES,
+                32,
+                |_p| {},
+                None,
+                "render_draw_patches_dropped",
+            ),
+            (
+                render::OP_DRAW_PATCHES_INDIRECT,
+                36,
+                |_p| {},
+                None,
+                "render_draw_patches_indirect_dropped",
+            ),
+            (
+                render::OP_DRAW_INDEXED_PATCHES_INDIRECT,
+                48,
+                |_p| {},
+                None,
+                "render_draw_patches_indirect_dropped",
+            ),
+        ];
+
+        let run = |op: u32, total: usize, write: Writer| {
+            let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+            let host = FakeHost::new();
+            let mut out = ExecResult::default();
+            let mut acc = StreamAccum::default();
+            let mut command = vec![0u8; total];
+            st32(&mut command[0..], op);
+            st32(&mut command[4..], total as u32);
+            write(&mut command[render::HEADER_LEN..]);
+            handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
+        };
+
+        for (op, total, write, default_write, route) in cases {
+            let before = store_route_count(route);
+            run(*op, *total, *write);
+            assert_eq!(
+                store_route_count(route),
+                before + 1,
+                "op {op:#x} did not reach {route}"
+            );
+            if let Some(default_write) = default_write {
+                let before = store_route_count(route);
+                run(*op, *total, *default_write);
+                assert_eq!(
+                    store_route_count(route),
+                    before,
+                    "op {op:#x} counted a guest asking for the API default, which \
+                     is what this rail already does -- that turns the healthy \
+                     zero back into a flood"
+                );
+            }
+        }
     }
 }

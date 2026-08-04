@@ -60,13 +60,14 @@ Do not cut on the report alone. Read the emitting code. These are all fine:
   one boot.
 - **A support-matrix cell** selected by a host *capability* rather than by the
   workload, per `AGENTS.md`.
-- **One cell of a partition, where the constant value is the measurement.**
-  `land_redundancy`'s `under_50=0` says no render-writeback landing is under
-  half already-correct — the finding that licensed a GPU tile pass over a
-  landing-granular skip. It is single-valued on every driven second measured,
-  and the four buckets partition the whole range, so there is no field it would
-  be traded for: deleting it deletes the result. This class is the hardest of
-  the five to spot, because the field looks exactly like a vestigial counter and
-  the value it holds is the one a vestigial counter holds.
+- **One cell of a partition, where the constant value is the measurement.** A
+  bucket reading zero on every driven second can be the finding rather than a
+  dead counter: if the buckets partition the whole range, the empty one says the
+  population never reaches it, and deleting the field deletes the result. This
+  class is the hardest of the five to spot, because the field looks exactly like
+  a vestigial counter and the value it holds is the one a vestigial counter
+  holds. Weigh it against the opposite reading — once such a measurement has an
+  answer and the answer is recorded where it is acted on, the instrument is a
+  probe that outlived its investigation and should go.
 
 The report points at code; it does not convict it.

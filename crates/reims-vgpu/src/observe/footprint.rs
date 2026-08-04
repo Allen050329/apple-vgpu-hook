@@ -91,6 +91,14 @@ struct Footprint {
     last_dump_ms: AtomicU64,
     last_dump_pages: AtomicU64,
     dump_seq: AtomicUsize,
+    /// The runs the previous dump reported, so this one can report only what it
+    /// adds. The set is monotone — a bit goes 0 → 1 and never back — so every
+    /// dump after the first restates almost all of the one before it: a measured
+    /// 1 239 of 1 243 spans on one boot and 1 724 of 1 733 on another, which put
+    /// the reprint at roughly 15% of every byte in the failure log. That log is
+    /// the only ground truth for what the protocol actually exercises, so the
+    /// space matters.
+    last_dump_runs: std::sync::Mutex<Vec<(u64, u64)>>,
 }
 
 impl Footprint {
@@ -104,6 +112,7 @@ impl Footprint {
             last_dump_ms: AtomicU64::new(0),
             last_dump_pages: AtomicU64::new(u64::MAX),
             dump_seq: AtomicUsize::new(0),
+            last_dump_runs: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -127,16 +136,25 @@ impl Footprint {
         // RAM without being asked whether the frame is still a surface's.
         if let Some((rword, rbit)) = retired_word(frame) {
             if rword.load(Ordering::Relaxed) & rbit != 0 {
-                RETIRED.hits.fetch_add(1, Ordering::Relaxed);
                 RETIRE_HITS_BY_RAIL[rail as usize].fetch_add(1, Ordering::Relaxed);
                 // Only the mapping rail's hits are a claim about this device.
                 // A raw-GVA write into a page some other surface used to own is
                 // ordinary guest page recycling with no adoption event that
                 // could have cleared the bit, so giving it a fail line would
                 // fill the log with the detector's own blind spot.
+                //
+                // `hits` is therefore counted on this side of the gate, not
+                // above it. Counted above, the headline `write_after_retire`
+                // read 11 737 across nine driven boots with not one
+                // `write_after_retire` fail line to go with it, because every
+                // one of those hits was the blind spot — the exact "meaningless
+                // rail and finding rail in one counter" the split below was
+                // introduced to end, left in place on the field a reader sees
+                // first. An alarm nobody can act on is one they learn to skip.
                 if rail != Rail::Mapping {
                     return;
                 }
+                RETIRED.hits.fetch_add(1, Ordering::Relaxed);
                 // Latched per frame AND capped in total. Per-frame alone is not
                 // enough: a rail writing a whole 1080p surface into retired
                 // pages has ~2 000 distinct frames to report, all of them the
@@ -230,7 +248,50 @@ impl Footprint {
         self.last_dump_ms.store(0, Ordering::Relaxed);
         self.last_dump_pages.store(u64::MAX, Ordering::Relaxed);
         self.dump_seq.store(0, Ordering::Relaxed);
+        if let Ok(mut prev) = self.last_dump_runs.lock() {
+            prev.clear();
+        }
     }
+}
+
+/// The parts of `now` that `prev` did not already cover.
+///
+/// Both lists are sorted, disjoint and inclusive-ended, which is what
+/// [`Footprint::runs`] produces. The result is expressed in the same form, so a
+/// reader reassembling a boot's footprint takes the union of every dump's runs
+/// and gets exactly what a full dump would have said.
+///
+/// A plain set-difference of the two run *lists* would be wrong: a single new
+/// frame between two existing runs merges them, so the merged run is "new" as a
+/// run while almost all of its frames are not. The difference has to be taken
+/// over the covered space, which is what this does.
+fn runs_added(now: &[(u64, u64)], prev: &[(u64, u64)]) -> Vec<(u64, u64)> {
+    let mut out: Vec<(u64, u64)> = Vec::new();
+    let mut i = 0usize;
+    for &(start, end) in now {
+        let mut cursor = start;
+        // `prev` is sorted, and `now` is walked in order, so the index only ever
+        // moves forward across the whole call.
+        while i < prev.len() && prev[i].1 < cursor {
+            i += 1;
+        }
+        let mut j = i;
+        while j < prev.len() && prev[j].0 <= end {
+            let (ps, pe) = prev[j];
+            if ps > cursor {
+                out.push((cursor, ps - 1));
+            }
+            cursor = cursor.max(pe.saturating_add(1));
+            if cursor > end {
+                break;
+            }
+            j += 1;
+        }
+        if cursor <= end {
+            out.push((cursor, end));
+        }
+    }
+    out
 }
 
 static FOOTPRINT: std::sync::LazyLock<Footprint> = std::sync::LazyLock::new(Footprint::new);
@@ -264,7 +325,10 @@ static FOOTPRINT: std::sync::LazyLock<Footprint> = std::sync::LazyLock::new(Foot
 struct Retired {
     bits: Box<[AtomicU64]>,
     frames: AtomicU64,
-    /// Writes that landed in a retired frame. The finding.
+    /// [`Rail::Mapping`] writes that landed in a retired frame. The finding,
+    /// and the only rail whose hits are one — see [`Rail`]. Every increment has
+    /// a `write_after_retire` fail line beside it, up to [`MAX_RETIRE_LINES`]
+    /// distinct frames.
     hits: AtomicU64,
     /// Retire events, and the total pages walked to answer them.
     ///
@@ -358,7 +422,10 @@ pub fn note_pages_authorized<I: IntoIterator<Item = u64>>(gpas: I, page_size: u6
     }
 }
 
-/// `(frames currently retired, writes that landed in one)`.
+/// `(frames currently retired, [`Rail::Mapping`] writes that landed in one)`.
+///
+/// The second is the alarm, not a total: the other two rails' hits are counted
+/// separately by [`retired_hits_by_rail`] and are not evidence of anything.
 pub fn retired_counts() -> (u64, u64) {
     (
         RETIRED.frames.load(Ordering::Relaxed),
@@ -620,13 +687,22 @@ pub fn census_lines(now_ms: u64) -> Vec<String> {
     let (retired_frames, retired_hits) = retired_counts();
     let (retire_scans, retire_scan_pages) = retire_scan_counts();
     let (ff_run, ff_run_max) = ff_run_counts();
-    let (war_map, war_raw, war_gpa) = retired_hits_by_rail();
+    // `write_after_retire` is now the mapping rail's count on its own, so the
+    // `war_mapping` that used to sit beside it is the same number twice.
+    //
+    // The other two stay, and reading zero is not what would license cutting
+    // them: they are how a reader tells "no write landed in a retired frame"
+    // from "no frame was ever retired, so nothing was tested". `retire_scans=0`
+    // once made this detector read clean while it was doing nothing at all
+    // (`model/state.rs`), and a rail whose hits are expected is the cheapest
+    // standing witness that the bitmap is populated and being consulted.
+    let (_, war_raw, war_gpa) = retired_hits_by_rail();
     let mut out = vec![format!(
         "guest_write_footprint pages={pages} kib={kib} dropped={dropped} \
          frame_shift={FRAME_SHIFT} writes={calls} sampled={sampled} \
          samp_bytes={bytes_sampled} ff_run={ff_run} ff_run_max={ff_run_max} \
          ff_run_counted_from={FF_RUN_MIN} retired={retired_frames} \
-         write_after_retire={retired_hits} war_mapping={war_map} \
+         write_after_retire={retired_hits} \
          war_rawgva={war_raw} war_gpa={war_gpa} retire_scans={retire_scans} \
          retire_scan_pages={retire_scan_pages} (levels, not per-interval)"
     )];
@@ -642,16 +718,32 @@ pub fn census_lines(now_ms: u64) -> Vec<String> {
     let seq = fp.dump_seq.fetch_add(1, Ordering::Relaxed);
 
     let runs = fp.runs();
-    let parts = runs.len().div_ceil(RUNS_PER_LINE).max(1);
-    for (i, chunk) in runs.chunks(RUNS_PER_LINE).enumerate() {
+    // Report what this dump adds, not the whole set again. `seq` orders the
+    // deltas and the summary line above carries the absolute `pages` level, so a
+    // reader can both reassemble the footprint (union the dumps in `seq` order)
+    // and check the reassembly against `pages` without any dump restating what
+    // an earlier one already said.
+    let added = match fp.last_dump_runs.lock() {
+        Ok(mut prev) => {
+            let added = runs_added(&runs, &prev);
+            *prev = runs;
+            added
+        }
+        // A poisoned lock means a previous dump panicked mid-update, so the
+        // recorded set cannot be trusted to be a subset. Report everything —
+        // over-reporting costs log space; under-reporting loses frames.
+        Err(_) => runs,
+    };
+    let parts = added.len().div_ceil(RUNS_PER_LINE).max(1);
+    for (i, chunk) in added.chunks(RUNS_PER_LINE).enumerate() {
         let spans: Vec<String> = chunk
             .iter()
             .map(|(a, b)| format!("{a:#x}-{b:#x}"))
             .collect();
         out.push(format!(
-            "guest_write_footprint_runs seq={seq} part={}/{parts} runs={} {}",
+            "guest_write_footprint_runs seq={seq} part={}/{parts} added={} {}",
             i + 1,
-            runs.len(),
+            added.len(),
             spans.join(" ")
         ));
     }
@@ -972,11 +1064,15 @@ mod tests {
         note_written_range(Rail::Gpa, 0x8000, 0x10);
         note_written_range(Rail::Mapping, 0x8000, 0x10);
 
-        assert_eq!(retired_counts().1, 3, "every rail's hit is still counted");
         assert_eq!(
             retired_hits_by_rail(),
             (1, 1, 1),
-            "and each is attributed to the rail that wrote it"
+            "every rail's hit is still counted, each against the rail that wrote it"
+        );
+        assert_eq!(
+            retired_counts().1,
+            1,
+            "but the headline alarm is the mapping rail alone"
         );
     }
 
@@ -1045,14 +1141,25 @@ mod tests {
         note_pages_retired([0x50000u64], 1 << FRAME_SHIFT);
         note_written_range(Rail::RawGva, 0x50000, 8);
         note_written_range(Rail::Gpa, 0x50000, 8);
-        assert_eq!(retired_counts().1, 2, "both hits are counted by rail");
         assert_eq!(
             retired_hits_by_rail(),
             (0, 1, 1),
-            "neither rail may be attributed to the mapping rail"
+            "both hits are counted, and neither may land in the mapping bucket"
+        );
+        // The regression this pins: `write_after_retire` used to be the sum of
+        // all three rails, so it reported an alarm on traffic that is expected
+        // by construction and that never gets a fail line to explain it. Nine
+        // driven boots read 11 737 there with no line at all. A reader who
+        // greps for the line and finds none has to decide the log is lying or
+        // the alarm is — and both readings cost more than the field is worth.
+        assert_eq!(
+            retired_counts().1,
+            0,
+            "no rail but the mapping rail may raise the alarm"
         );
         note_written_range(Rail::Mapping, 0x50000, 8);
         assert_eq!(retired_hits_by_rail(), (1, 1, 1));
+        assert_eq!(retired_counts().1, 1, "and the mapping rail does");
     }
 
     #[test]
@@ -1164,5 +1271,85 @@ mod tests {
             "the chunks must sum to the whole set, or a scorer reassembling them \
              reports a smaller footprint than the device has"
         );
+    }
+
+    /// A second dump reports what it adds, not the whole set again.
+    ///
+    /// The set only ever grows, so a dump that restates it costs the log the
+    /// entire history every time. What makes the delta safe is that the union of
+    /// the dumps still reconstructs the footprint — asserted here by taking that
+    /// union and comparing it to what a single full dump of the same bits says.
+    #[test]
+    fn a_later_dump_reports_only_what_it_adds() {
+        let _g = fresh();
+        note_written_range(Rail::Mapping, 0x1000, 0x1000);
+        note_written_range(Rail::Mapping, 0x9000, 0x1000);
+        let first = census_lines(0);
+        let first_spans = spans_of(&first);
+        assert_eq!(first_spans, vec![(1, 1), (9, 9)]);
+
+        // A frame between the two, plus one beyond them. The frame between
+        // merges 0x1 and 0x9 into one run once 0x2..=0x8 fill in, so a naive
+        // diff of run *lists* would re-report frames 1 and 9.
+        for f in 2..=8u64 {
+            note_written_range(Rail::Mapping, f << FRAME_SHIFT, 1);
+        }
+        note_written_range(Rail::Mapping, 0x20 << FRAME_SHIFT, 1);
+        let second = census_lines(DUMP_INTERVAL_MS);
+        let second_spans = spans_of(&second);
+        assert_eq!(
+            second_spans,
+            vec![(2, 8), (0x20, 0x20)],
+            "frames 1 and 9 were already reported and must not appear again"
+        );
+
+        // The union of both dumps is the whole footprint.
+        let mut union: Vec<u64> = first_spans
+            .iter()
+            .chain(second_spans.iter())
+            .flat_map(|&(a, b)| a..=b)
+            .collect();
+        union.sort_unstable();
+        union.dedup();
+        let expected: Vec<u64> = (1..=9).chain(std::iter::once(0x20)).collect();
+        assert_eq!(union, expected);
+    }
+
+    /// `runs_added` works over covered frames, not over run identity.
+    #[test]
+    fn a_merge_only_reports_the_frames_that_caused_it() {
+        // Two runs joined by one frame: only the joining frame is new.
+        assert_eq!(runs_added(&[(0, 10)], &[(0, 4), (6, 10)]), vec![(5, 5)]);
+        // A run that grew at both ends.
+        assert_eq!(runs_added(&[(0, 10)], &[(3, 6)]), vec![(0, 2), (7, 10)]);
+        // Nothing new at all.
+        assert!(runs_added(&[(0, 4), (6, 10)], &[(0, 4), (6, 10)]).is_empty());
+        // No prior dump: everything is new.
+        assert_eq!(runs_added(&[(2, 3)], &[]), vec![(2, 3)]);
+        // A prior run entirely below and entirely above the new one.
+        assert_eq!(
+            runs_added(&[(10, 12)], &[(0, 2), (10, 10), (20, 22)]),
+            vec![(11, 12)]
+        );
+    }
+
+    /// The `(start, end)` frame pairs named by a census's dump lines, in order.
+    fn spans_of(lines: &[String]) -> Vec<(u64, u64)> {
+        lines
+            .iter()
+            .filter(|l| l.starts_with("guest_write_footprint_runs"))
+            .flat_map(|l| {
+                l.split_whitespace()
+                    .filter(|t| t.starts_with("0x") && t.contains('-'))
+                    .map(|t| {
+                        let (a, b) = t.split_once('-').expect("span");
+                        (
+                            u64::from_str_radix(a.trim_start_matches("0x"), 16).expect("start"),
+                            u64::from_str_radix(b.trim_start_matches("0x"), 16).expect("end"),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
     }
 }

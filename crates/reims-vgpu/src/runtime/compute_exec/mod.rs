@@ -31,12 +31,12 @@ use crate::runtime::decode::compute::{
     BufferBinding, Command as ComputeCommand, Kind, RefBinding, SamplerBinding,
 };
 use crate::runtime::decode::resource::{
-    decode_function_descriptor, decode_texture_descriptor, decode_type7_descriptor,
-    texture_type8_opcode, ComputeStageInputDescriptor, Descriptor as ResourceDescriptor,
-    HEAP_TEXTURE_DESCRIPTOR, HEAP_TEXTURE_HEAP_REF, HEAP_TEXTURE_LEN, HEAP_TEXTURE_OFFSET,
-    HEAP_TEXTURE_OPCODE, HEAP_TEXTURE_USE_OFFSET, OBJECT_TYPE_BUFFER, OBJECT_TYPE_FUNCTION,
-    OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_VARIANT, OBJECT_TYPE_TEXTURE_VIEW, OBJECT_TYPE_TYPE7,
-    TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE,
+    decode_function_descriptor, decode_heap_texture, decode_texture_descriptor,
+    decode_type7_descriptor, texture_type8_opcode, ComputeStageInputDescriptor,
+    Descriptor as ResourceDescriptor, HEAP_TEXTURE_OPCODE, HEAP_TEXTURE_WIDE_OPCODE,
+    OBJECT_TYPE_BUFFER, OBJECT_TYPE_FUNCTION, OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_VARIANT,
+    OBJECT_TYPE_TEXTURE_VIEW, OBJECT_TYPE_TYPE7, TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE,
+    TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE_WIDE,
 };
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 use crate::runtime::decode::resource::{decode_sampler_descriptor, TYPE7_OBJECT_SAMPLER};
@@ -173,7 +173,16 @@ impl ComputeAccum {
         for (i, e) in entries.iter().enumerate() {
             let index = first.saturating_add(i as u32);
             if e.ref_ == 0 {
-                continue; // unbind this slot: expected control flow, stay silent.
+                // A nil entry clears the slot. Retaining the previous bind
+                // instead is not a stale read but a write: the retained buffer
+                // is staged again on the next dispatch, and reflection calling
+                // it writable sends the dispatch's output back into a guest
+                // resource the guest explicitly unbound. Same rule the render
+                // rail states on `ExecResult::buffer_unbinds` and applies in
+                // `exec::apply_binds`, over the same wire form.
+                self.buffers.retain(|b| b.index != index);
+                crate::runtime::drain::note_store_route("compute_unbind_buffer");
+                continue;
             }
             if index >= MAX_COMPUTE_BUFFER_SLOTS {
                 note_compute_bind_overflow("buffer", index, e.ref_, MAX_COMPUTE_BUFFER_SLOTS);
@@ -208,7 +217,12 @@ impl ComputeAccum {
         for (i, e) in entries.iter().enumerate() {
             let index = first.saturating_add(i as u32);
             if e.ref_ == 0 {
-                continue; // unbind this slot: expected control flow, stay silent.
+                // Clears the slot; see `bind_buffers`. A retained texture is
+                // the sharper case of the two, because `writeback_texture`
+                // lands the dispatch's result in the guest surface behind it.
+                self.textures.retain(|t| t.index != index);
+                crate::runtime::drain::note_store_route("compute_unbind_texture");
+                continue;
             }
             if index >= MAX_COMPUTE_TEXTURE_SLOTS {
                 note_compute_bind_overflow("texture", index, e.ref_, MAX_COMPUTE_TEXTURE_SLOTS);
@@ -230,7 +244,10 @@ impl ComputeAccum {
         for (i, e) in entries.iter().enumerate() {
             let index = first.saturating_add(i as u32);
             if e.ref_ == 0 {
-                continue; // unbind this slot: expected control flow, stay silent.
+                // Clears the slot; see `bind_buffers`.
+                self.samplers.retain(|s| s.index != index);
+                crate::runtime::drain::note_store_route("compute_unbind_sampler");
+                continue;
             }
             if index >= MAX_COMPUTE_SAMPLER_SLOTS {
                 note_compute_bind_overflow("sampler", index, e.ref_, MAX_COMPUTE_SAMPLER_SLOTS);
@@ -547,6 +564,22 @@ fn apply_record_inner<M: HostMemory + HostOps>(
         // binding per dispatch, so there is nothing for them to keep resident.
         // These counters exist to price that argument, not to doubt it — if
         // they are large, the per-record submit is what they are the cost of.
+        //
+        // That argument is load-bearing in a way it did not look, and the
+        // capture now says how much traffic rests on it. Under
+        // `-setSupportsComputePassDescriptorDispatchType:` Apple's serializer
+        // emits a scope barrier — `0xd7`, `Buffers|Textures` — after **every**
+        // dispatch and every ICB execution of a serial pass, measured on all six
+        // selectors (`crate::runtime::decode::compute::OP_BARRIER_SCOPE`, and
+        // `reims_vgpu_wire::ops::compute::MemoryBarrierScope` carries the
+        // derivation). So a guest that negotiates that flag doubles this rail's
+        // record count and every second record lands here. The no-op stays
+        // right, and on the Vulkan arm it is stronger than "pass granularity":
+        // `backend::vulkan::engine::exec_compute::execute_compute_inner` begins,
+        // ends and submits one command buffer per dispatch, so consecutive
+        // dispatches are separated by a queue submission rather than by a
+        // barrier inside one. `compute_noop_barrier` reading high is that
+        // capability being on, not a defect.
         //
         // The fence pair has no such argument and never had one; it sat in the
         // barrier group's arm without sharing its comment. An `MTLFence` update
@@ -973,18 +1006,22 @@ pub(crate) struct StagedTexture {
     pub height: u32,
     pub bytes: Vec<u8>,
     pub is_storage: bool,
+    #[cfg(feature = "backend-vulkan")]
     residency: Option<ComputeStorageResidencyCandidate>,
     /// Stage-time guest read skipped (resident generation verified); `bytes`
     /// is a zero placeholder the engine must never seed.
+    #[cfg(feature = "backend-vulkan")]
     seed_skipped: bool,
     /// Sampled input whose window the engine already holds GPU-resident (a
     /// prior dispatch's storage output at this generation): the guest read was
     /// skipped, `bytes` is a zero placeholder, and the engine must seed the
     /// sampled image by copy-on-sample from the resident (never the bytes).
+    #[cfg(feature = "backend-vulkan")]
     sample_resident: Option<(crate::model::ComputeStorageResidencyKey, u32)>,
     writeback: TextureWriteback,
 }
 
+#[cfg(feature = "backend-vulkan")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ComputeStorageResidencyCandidate {
     key: crate::model::ComputeStorageResidencyKey,
@@ -996,6 +1033,7 @@ struct ComputeStorageResidencyCandidate {
 /// point), which is only a safe authority when the device grants
 /// `deferred_gpu_only_content` — portability-subset (MoltenVK) devices must
 /// write guest pages synchronously instead.
+#[cfg(feature = "backend-vulkan")]
 fn compute_defer_readback_allowed(
     deferred_gpu_only_content: bool,
     has_residency: bool,
@@ -1031,8 +1069,10 @@ fn compute_defer_readback_allowed(
 /// canvas this doc predicted needs 2, so the shape of the guess is confirmed
 /// while the number is not: 8 is 4x the observed high-water mark, and nothing
 /// has yet produced the "planar layouts a few more" case that chose it.
+#[cfg(feature = "backend-vulkan")]
 const STORAGE_RESIDENCY_WINDOWS_PER_MAPPING: usize = 8;
 
+#[cfg(feature = "backend-vulkan")]
 fn note_storage_residency_writeback(state: &mut DeviceState, texture: &StagedTexture) {
     let Some(candidate) = texture.residency else {
         return;
@@ -1091,6 +1131,7 @@ fn note_storage_residency_writeback(state: &mut DeviceState, texture: &StagedTex
         .insert(candidate.key, generation);
 }
 
+#[cfg(feature = "backend-vulkan")]
 fn next_mapping_content_generation(current: u32) -> u32 {
     let next = current.wrapping_add(1);
     if next == 0 {
@@ -1105,6 +1146,7 @@ fn next_mapping_content_generation(current: u32) -> u32 {
 /// `write_only` is intentionally still seeded: access alone does not prove a
 /// dispatch overwrites every texel. The proxy makes that retained transfer
 /// cost visible while preserving partial-write semantics.
+#[cfg(feature = "backend-vulkan")]
 fn log_storage_image_access(pipe: u32, binding: u32, access: &str, bytes: u64) {
     crate::observe::off(format!(
         "compute_linux storage_access pipe={pipe} bind={binding} access={access} seed=1 bytes={bytes}"
@@ -1202,19 +1244,26 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
                 ));
             };
             let opcode = texture_type8_opcode(&desc).unwrap_or(0);
-            if opcode == HEAP_TEXTURE_OPCODE {
-                if desc.len() != HEAP_TEXTURE_LEN {
-                    crate::observe::fail(format!(
-                        "compute_stage_tex heap_fail reason=bad_len ref={texture_ref} len={} expected={HEAP_TEXTURE_LEN}",
-                        desc.len(),
-                    ));
-                    return Err(ComputeStatus::MissingTexture(
-                        "compute_stage_tex_heap_bad_len",
-                    ));
-                }
-                let heap_ref = ld32(&desc[HEAP_TEXTURE_HEAP_REF..]);
-                let use_offset = ld32(&desc[HEAP_TEXTURE_USE_OFFSET..]);
-                let offset = crate::contract::endian::ld64(&desc[HEAP_TEXTURE_OFFSET..]);
+            // Both opcodes are the same record: the wide one is what the guest's
+            // serializer emits with `TextureDescriptor2` on. The length each
+            // implies is `decode_heap_texture`'s to check — this site used to
+            // check it too, against the narrow constant alone, which would have
+            // rejected every wide record before its decoder saw the opcode.
+            if opcode == HEAP_TEXTURE_OPCODE || opcode == HEAP_TEXTURE_WIDE_OPCODE {
+                let record = match decode_heap_texture(&desc) {
+                    Ok(record) => record,
+                    Err(error) => {
+                        crate::observe::Emit::decline("compute_stage_tex_heap", &error)
+                            .field("ref", texture_ref)
+                            .field("len", desc.len())
+                            .fail();
+                        return Err(ComputeStatus::MissingTexture(
+                            "compute_stage_tex_heap_bad_record",
+                        ));
+                    }
+                };
+                let (heap_ref, use_offset, offset) =
+                    (record.heap_ref, record.use_offset, record.offset);
                 if heap_ref == 0 {
                     crate::observe::fail(format!(
                         "compute_stage_tex heap_fail reason=zero_heap ref={texture_ref}"
@@ -1223,35 +1272,37 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
                         "compute_stage_tex_heap_zero_ref",
                     ));
                 }
-                if use_offset > 1 {
-                    crate::observe::fail(format!(
-                        "compute_stage_tex heap_fail reason=bad_use_offset ref={texture_ref} heap={heap_ref} use_offset={use_offset} offset={offset:#x}"
-                    ));
-                    return Err(ComputeStatus::Unsupported("compute_heap_use_offset"));
-                }
-                let descriptor =
-                    match crate::runtime::heap_query::decode_serialized_texture_descriptor(
-                        &desc[HEAP_TEXTURE_DESCRIPTOR..HEAP_TEXTURE_USE_OFFSET],
-                    ) {
-                        Ok(descriptor) => descriptor,
-                        Err(error) => {
-                            crate::observe::Emit::decline("compute_stage_tex_heap", &error)
-                                .field("ref", texture_ref)
-                                .field("heap", heap_ref)
-                                .field("use_offset", use_offset)
-                                .field("offset", format!("{offset:#x}"))
-                                .fail();
-                            return Err(ComputeStatus::MissingTexture(
-                                "compute_stage_tex_heap_desc_decode",
-                            ));
-                        }
-                    };
-                heap_texture = Some((heap_ref, use_offset != 0, offset, descriptor));
+                let body = if record.wide {
+                    crate::runtime::heap_query::decode_wide_serialized_texture_descriptor(
+                        record.descriptor,
+                    )
+                } else {
+                    crate::runtime::heap_query::decode_serialized_texture_descriptor(
+                        record.descriptor,
+                    )
+                };
+                let descriptor = match body {
+                    Ok(descriptor) => descriptor,
+                    Err(error) => {
+                        crate::observe::Emit::decline("compute_stage_tex_heap", &error)
+                            .field("ref", texture_ref)
+                            .field("heap", heap_ref)
+                            .field("use_offset", use_offset)
+                            .field("offset", format!("{offset:#x}"))
+                            .fail();
+                        return Err(ComputeStatus::MissingTexture(
+                            "compute_stage_tex_heap_desc_decode",
+                        ));
+                    }
+                };
+                heap_texture = Some((heap_ref, use_offset, offset, descriptor));
             }
             if heap_texture.is_some() {
                 // Heap textures are complete resource objects, not texture
                 // views. Their backing is a host GPU residency identity.
-            } else if opcode == TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE {
+            } else if opcode == TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE
+                || opcode == TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE_WIDE
+            {
                 crate::observe::fail(format!(
                     "compute_stage_tex view_fail reason=buffer_texture_unsupported ref={texture_ref} opcode={opcode} desc_len={}",
                     desc.len()
@@ -1340,6 +1391,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             ));
             return Err(ComputeStatus::Unsupported("compute_heap_host_len"));
         };
+        #[cfg(feature = "backend-vulkan")]
         let key = crate::model::ComputeStorageResidencyKey::heap(
             task_id,
             texture_ref,
@@ -1371,7 +1423,10 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
                 },
             };
         #[cfg(not(feature = "backend-vulkan"))]
-        let (seed_generation, seed_skipped, sample_resident) = (0, false, None);
+        let (seed_generation, sample_resident): (
+            u32,
+            Option<(crate::model::ComputeStorageResidencyKey, u32)>,
+        ) = (0, None);
         crate::observe::off(format!(
             "compute_stage_tex heap_ok ref={texture_ref} heap={heap_ref} fmt={format:#x} {width}x{height} storage={} seed_gen={seed_generation} resident_sample={} use_offset={} offset={offset:#x}",
             is_storage as u8,
@@ -1386,11 +1441,14 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             height,
             bytes: vec![0; need],
             is_storage,
+            #[cfg(feature = "backend-vulkan")]
             residency: is_storage.then_some(ComputeStorageResidencyCandidate {
                 key,
                 seed_generation,
             }),
+            #[cfg(feature = "backend-vulkan")]
             seed_skipped,
+            #[cfg(feature = "backend-vulkan")]
             sample_resident,
             writeback: TextureWriteback::None,
         });
@@ -1420,11 +1478,13 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
                         // ensure failure surfaces downstream as `MissingTexture` (the
                         // mapping lookup below misses), so no always-on line is lost.
                         if crate::observe::draw_log_enabled() {
-                            let field = if desc.len() >= objects::TYPE5_FIELD + 4 {
-                                ld32(&desc[objects::TYPE5_FIELD..])
-                            } else {
-                                0
-                            };
+                            // The owner task the view names. `note_type5_owner_task`
+                            // is the always-on check on its value; this echo carries
+                            // it beside the descriptor it came out of.
+                            let owner_task = desc
+                                .get(objects::TYPE5_OWNER_TASK..objects::TYPE5_OWNER_TASK + 4)
+                                .map(ld32)
+                                .unwrap_or(0);
                             let args_n = desc.len().saturating_sub(objects::TYPE5_ARGS);
                             let mut args_hex = String::new();
                             if args_n > 0 {
@@ -1439,7 +1499,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
                                 }
                             }
                             crate::observe::line(format!(
-                                "compute_stage_tex type5 ref={texture_ref} sid={sid} ensure={} field={field:#x} desc_len={} args_n={args_n} args_hex={args_hex}",
+                                "compute_stage_tex type5 ref={texture_ref} sid={sid} ensure={} owner_task={owner_task} desc_len={} args_n={args_n} args_hex={args_hex}",
                                 ok as u8,
                                 desc.len(),
                             ));
@@ -1624,11 +1684,9 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             .ok_or(ComputeStatus::MissingTexture(
                 "compute_stage_tex_mapping_gone",
             ))?;
+        #[cfg(feature = "backend-vulkan")]
         let map_generation = m.map_generation;
-        #[cfg_attr(
-            not(feature = "backend-vulkan"),
-            allow(unused_mut, reason = "the Vulkan resident-skip block below assigns it")
-        )]
+        #[cfg(feature = "backend-vulkan")]
         let mut seed_generation = m.content_generation;
         let pages_n = m.page_entries.len();
         // Wire type-4 `length` (page-aligned getResidentSize), stashed as device_desc.alloc_size.
@@ -1648,15 +1706,16 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             Some(rec) => {
                 mapping_write::type5_sample_window(m, rec.plane_index, width, height, stage_fmt)
                     .map(|(offset, bpr, end, from_device)| {
-                        // Invent always produces a packed window at offset 0 —
-                        // plane 0's bytes. Reaching it after the wire named a
-                        // different plane is a guaranteed wrong bind, so it
-                        // cannot stay quiet just because it returned a window.
-                        if !from_device && rec.plane_index != 0 {
-                            crate::observe::fail(format!(
-                                "compute_stage_tex plane_invent mapping={mapping_id} plane={} {width}x{height} fmt={stage_fmt:#x} offset={offset} bpr={bpr}",
-                                rec.plane_index
-                            ));
+                        if !from_device {
+                            mapping_write::note_type5_plane_invent(
+                                mapping_id,
+                                rec.plane_index,
+                                width,
+                                height,
+                                stage_fmt,
+                                (offset, bpr),
+                                "compute_stage_tex",
+                            );
                         }
                         (offset, bpr, end)
                     })
@@ -1712,6 +1771,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             ));
             return Err(ComputeStatus::GuestIo("compute_stage_tex_type11_span"));
         }
+        #[cfg(feature = "backend-vulkan")]
         let residency_key = crate::model::ComputeStorageResidencyKey {
             mapping_id,
             map_generation,
@@ -1764,7 +1824,10 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             None => (false, None),
         };
         #[cfg(not(feature = "backend-vulkan"))]
-        let (seed_skipped, sample_resident) = (false, None);
+        let (seed_skipped, sample_resident): (
+            bool,
+            Option<(crate::model::ComputeStorageResidencyKey, u32)>,
+        ) = (false, None);
         let mut bytes = vec![0u8; need];
         if !seed_skipped
             && sample_resident.is_none()
@@ -1818,11 +1881,14 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             height,
             bytes,
             is_storage,
+            #[cfg(feature = "backend-vulkan")]
             residency: is_storage.then_some(ComputeStorageResidencyCandidate {
                 key: residency_key,
                 seed_generation,
             }),
+            #[cfg(feature = "backend-vulkan")]
             seed_skipped,
+            #[cfg(feature = "backend-vulkan")]
             sample_resident,
             writeback,
         });
@@ -2004,7 +2070,10 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
         _ => (false, 0u32, None),
     };
     #[cfg(not(feature = "backend-vulkan"))]
-    let (seed_skipped, sample_resident) = (false, None);
+    let (seed_skipped, sample_resident): (
+        bool,
+        Option<(crate::model::ComputeStorageResidencyKey, u32)>,
+    ) = (false, None);
     #[cfg(feature = "backend-vulkan")]
     if let Some((key, resident_gen, None)) = resident {
             // A bytes consumer (format-mismatched view, non-vulkan reuse):
@@ -2139,13 +2208,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
     // mapped at writeback time (the sync path would have written guest
     // pages), the deferred-writeback arm records a flush obligation with a
     // defer-time page index so aliased raw-GVA readers land it first.
-    #[cfg_attr(
-        not(feature = "backend-vulkan"),
-        allow(
-            unused_mut,
-            reason = "the Vulkan storage-residency block below assigns it"
-        )
-    )]
+    #[cfg(feature = "backend-vulkan")]
     let mut residency = None;
     #[cfg(feature = "backend-vulkan")]
     if is_storage {
@@ -2175,8 +2238,11 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
         height: h,
         bytes,
         is_storage,
+        #[cfg(feature = "backend-vulkan")]
         residency,
+        #[cfg(feature = "backend-vulkan")]
         seed_skipped,
+        #[cfg(feature = "backend-vulkan")]
         sample_resident,
         writeback,
     })
@@ -3733,6 +3799,7 @@ fn spawn_compute_engine_stall_watchdog(
     done
 }
 
+#[cfg(feature = "backend-vulkan")]
 fn spirv_words_le(bytes: &[u8]) -> Result<Vec<u32>, ComputeSpirvDecline> {
     const HEADER_LEN: usize = 20;
     const WORD_ALIGNMENT: usize = 4;
