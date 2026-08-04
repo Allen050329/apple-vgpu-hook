@@ -608,6 +608,32 @@ fn visit_task_gva_pages<M: HostMemory>(
     }
 }
 
+/// Every page of `[gva, gva+span)` in order, resolved through one root read and
+/// one walk cache, with `None` for a page the table cannot translate.
+///
+/// [`visit_task_gva_page_gpas`] drops the unresolved pages; a caller checking a
+/// cached page list against the live table needs them, because "page 40 does not
+/// translate" and "page 40 translates elsewhere" are different findings and only
+/// one of them is about the guest. Stride is fixed at one page for the same
+/// reason: a check that samples cannot conclude anything about the pages it
+/// skipped.
+///
+/// The visitor stops when `visit` answers `false`, and it visits nothing at all
+/// for an inactive task, an absent directory or an unwalkable page geometry — so
+/// a caller must compare what it saw against what it expected rather than
+/// treating a quiet return as agreement.
+pub fn visit_task_gva_pages_in_order<M: HostMemory>(
+    host: &M,
+    tasks: &[TaskEntry],
+    task_id: u32,
+    gva: u64,
+    span: u64,
+    page_shift: u32,
+    visit: &mut dyn FnMut(Option<u64>) -> bool,
+) {
+    visit_task_gva_pages(host, tasks, task_id, gva, span, page_shift, 1, visit);
+}
+
 /// Translate one GVA to a GPA under the task directory (single page).
 pub fn translate_task_gva<M: HostMemory>(
     host: &M,

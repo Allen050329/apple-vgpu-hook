@@ -1270,7 +1270,14 @@ pub fn type4_pages_witness<H: HostMemory>(
     }
     let page_shift = state.page_shift;
     let page_size = crate::contract::iosurface_pages::page_size_of(page_shift);
-    let Some(task) = state.tasks.get(walk.task_id as usize).filter(|t| t.active) else {
+    // Checked here as well as by the visitor below, which visits nothing for an
+    // inactive task: the two answers are the same refusal, and only this one can
+    // say *why* without the reader having to know the visitor's early returns.
+    if !state
+        .tasks
+        .get(walk.task_id as usize)
+        .is_some_and(|t| t.active)
+    {
         // The task that owned the translation is gone. Its page table is gone
         // with it, so the cached GPAs are unbacked by anything this device can
         // still read — which is exactly the state a write must not proceed in.
@@ -1281,51 +1288,108 @@ pub fn type4_pages_witness<H: HostMemory>(
             m.page_entries.len()
         ));
         return Type4Witness::Drifted;
-    };
-    for (i, &entry) in m.page_entries.iter().enumerate() {
-        let gva = ((walk.backing_pfn as u64) + i as u64) << page_shift;
-        let cached = crate::contract::iosurface_pages::entry_gpa_shift(entry, page_shift);
-        let walked = crate::runtime::gva_mem::translate_task_gva(host, task, gva, page_shift);
-        let Some(live) = walked.map(|gpa| gpa & !(page_size - 1)) else {
-            // No translation now. This used to answer the failed walk with the
-            // GVA, to match the identity fallback that produced the entry, and
-            // that mirror had to go with it: `apply_type4_backing` no longer
-            // adopts a page at its own GVA, so the only entry this could still
-            // accept is one the control arm made.
-            //
-            // The distinction is not cosmetic. Reporting the substitute as
-            // `live` made a walk that FAILED indistinguishable from one that
-            // succeeded and disagreed, so every such page was written up as
-            // `translation_moved` — "the guest re-pointed this surface" — when
-            // nothing had moved and the device simply could not translate it.
-            // Both outcomes refuse the write; only one of them is about the
-            // guest.
-            crate::observe::fail(format!(
-                "mapping_page_drift mid={mapping_id} task={} page={i}/{} gva={gva:#x} \
-                 cached={cached:?} live=None reason=no_translation \
-                 (this task cannot translate the page the entry was walked from)",
-                walk.task_id,
-                m.page_entries.len()
-            ));
-            return Type4Witness::Drifted;
-        };
-        if cached != Some(live) {
-            // Every entry in this list came from a `translate_task_gva` that
-            // succeeded: `apply_type4_backing` refuses the whole surface on the
-            // first page it cannot walk, so it cannot leave a fabricated one
-            // behind. A disagreement here is therefore between two real
-            // translations taken at different times, which is the guest having
-            // re-pointed the surface without saying so.
-            crate::observe::fail(format!(
-                "mapping_page_drift mid={mapping_id} task={} page={i}/{} gva={gva:#x} \
-                 cached={cached:?} live={:?} reason=translation_moved \
-                 (the guest re-pointed this surface and no packet said so)",
-                walk.task_id,
-                m.page_entries.len(),
-                Some(live)
-            ));
-            return Type4Witness::Drifted;
-        }
+    }
+    // One walk over the whole run, not one per page.
+    //
+    // The pages this checks are consecutive GVAs by construction — entry `i` is
+    // `backing_pfn + i` — so every one of them resolves through the same upper
+    // page-table levels, and a per-page `translate_task_gva` re-reads the task
+    // directory and re-descends those levels for each. `visit_task_gva_pages`
+    // reads the root once and carries a walk cache across the range, which is
+    // what it exists for.
+    //
+    // The cost this removes is not incidental. It is `O(pages)` guest memory
+    // reads on the licence check every write to a mapping takes, so a 1080p
+    // surface pays it 2025 times per flush; a driven window-drag boot measured
+    // `readback_split vouch_us` at 221 µs a flush over 11 854 flushes, which is
+    // 2.6 s of the boot spent re-deriving an answer from the same three
+    // page-table pages.
+    //
+    // Same walk and same comparisons — this is the identical page-table read
+    // with the redundant descents removed, not a weaker check. A short visit is
+    // a refusal, because a walk that stops early has proved nothing about the
+    // pages it did not reach.
+    let entries = &m.page_entries;
+    let base_gva = (walk.backing_pfn as u64) << page_shift;
+    let span = (entries.len() as u64).saturating_mul(page_size);
+    let mut i = 0usize;
+    let mut verdict = None;
+    crate::runtime::gva_mem::visit_task_gva_pages_in_order(
+        host,
+        &state.tasks,
+        walk.task_id,
+        base_gva,
+        span,
+        page_shift,
+        &mut |walked| {
+            let Some(&entry) = entries.get(i) else {
+                return false;
+            };
+            let gva = base_gva + (i as u64) * page_size;
+            let cached = crate::contract::iosurface_pages::entry_gpa_shift(entry, page_shift);
+            let Some(live) = walked else {
+                // No translation now. This used to answer the failed walk with
+                // the GVA, to match the identity fallback that produced the
+                // entry, and that mirror had to go with it: `apply_type4_backing`
+                // no longer adopts a page at its own GVA, so the only entry this
+                // could still accept is one the control arm made.
+                //
+                // The distinction is not cosmetic. Reporting the substitute as
+                // `live` made a walk that FAILED indistinguishable from one that
+                // succeeded and disagreed, so every such page was written up as
+                // `translation_moved` — "the guest re-pointed this surface" —
+                // when nothing had moved and the device simply could not
+                // translate it. Both outcomes refuse the write; only one of them
+                // is about the guest.
+                crate::observe::fail(format!(
+                    "mapping_page_drift mid={mapping_id} task={} page={i}/{} gva={gva:#x} \
+                     cached={cached:?} live=None reason=no_translation \
+                     (this task cannot translate the page the entry was walked from)",
+                    walk.task_id,
+                    entries.len()
+                ));
+                verdict = Some(Type4Witness::Drifted);
+                return false;
+            };
+            if cached != Some(live) {
+                // Every entry in this list came from a walk that succeeded:
+                // `apply_type4_backing` refuses the whole surface on the first
+                // page it cannot walk, so it cannot leave a fabricated one
+                // behind. A disagreement here is therefore between two real
+                // translations taken at different times, which is the guest
+                // having re-pointed the surface without saying so.
+                crate::observe::fail(format!(
+                    "mapping_page_drift mid={mapping_id} task={} page={i}/{} gva={gva:#x} \
+                     cached={cached:?} live={:?} reason=translation_moved \
+                     (the guest re-pointed this surface and no packet said so)",
+                    walk.task_id,
+                    entries.len(),
+                    Some(live)
+                ));
+                verdict = Some(Type4Witness::Drifted);
+                return false;
+            }
+            i += 1;
+            true
+        },
+    );
+    if let Some(verdict) = verdict {
+        return verdict;
+    }
+    if i != entries.len() {
+        // The visitor stopped before the list did — an inactive task, a
+        // directory that has gone, or a page geometry it cannot walk. Each of
+        // those is the state the per-page loop reported as `task_inactive` or as
+        // a failed translation, and all of them mean the same thing here: the
+        // pages this write was about to land in are not provably the mapping's.
+        crate::observe::fail(format!(
+            "mapping_page_drift mid={mapping_id} task={} reason=walk_short \
+             pages={i}/{} (the page table these entries were walked from cannot \
+             be walked now)",
+            walk.task_id,
+            entries.len()
+        ));
+        return Type4Witness::Drifted;
     }
     Type4Witness::Verified
 }
@@ -3448,6 +3512,135 @@ mod tests {
         assert!(
             !fresh.iter().any(|l| l.contains("reason=translation_moved")),
             "nothing moved — blaming the guest here is the bug: {fresh:?}"
+        );
+    }
+
+    /// Every page of a multi-page surface is checked, including the ones in the
+    /// middle.
+    ///
+    /// The witness resolves the whole run through one root read and one walk
+    /// cache rather than descending the table per page, which is what makes the
+    /// licence check for a 1080p writeback cost one walk instead of two
+    /// thousand. The hazard that shape introduces is a cache that answers for
+    /// page N with what it read for page N-1, and the symptom would be silent:
+    /// a surface the guest re-pointed in the middle would vouch, and the next
+    /// flush would write a frame into whatever now owns those pages.
+    ///
+    /// So the page that moves here is deliberately neither the first nor the
+    /// last. The single-page test above cannot see this class at all.
+    #[test]
+    fn a_page_moved_in_the_middle_of_a_run_still_refuses_the_write() {
+        use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+        use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+        use crate::model::{DeviceId, Type4Walk, PAGE_SHIFT_X86};
+        use crate::runtime::host::{FakeHost, HostMemory};
+
+        crate::observe::redirect_logs_for_tests();
+        const PAGES: usize = 5;
+        let page = 1u64 << PAGE_SHIFT_X86;
+        let mut host = FakeHost::new();
+        let dir_gpa = 2u64 << PAGE_SHIFT_X86;
+        let root_gpa = 3u64 << PAGE_SHIFT_X86;
+        // Data pages 4..9, plus one more the guest can re-point a PTE at.
+        let data_pfn = |i: usize| 4u32 + i as u32;
+        let elsewhere_pfn = 4u32 + PAGES as u32;
+        for pfn in [2u32, 3].into_iter().chain(4..=elsewhere_pfn) {
+            host.map_range(u64::from(pfn) << PAGE_SHIFT_X86, page as usize, 0);
+        }
+        let st32 = |b: &mut [u8], v: u32| b[..4].copy_from_slice(&v.to_le_bytes());
+        let mut d = [0u8; 8];
+        st32(&mut d[DIRECTORY_ROOT_PFN as usize..], 3);
+        st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
+        host.write_gpa(dir_gpa, &d).unwrap();
+        let write_pte = |host: &mut FakeHost, index: usize, pfn: u32| {
+            let mut pte = [0u8; 4];
+            st32(&mut pte, pfn);
+            host.write_gpa(root_gpa + (index as u64) * 4, &pte).unwrap();
+        };
+        for i in 0..PAGES {
+            write_pte(&mut host, i, data_pfn(i));
+        }
+
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        assert!(state.define_task(1, page, 2));
+        state.map_surface(6);
+        {
+            let m = state.mappings.get_mut(&6).unwrap();
+            m.mapped = true;
+            m.page_entries = (0..PAGES)
+                .map(|i| (data_pfn(i) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID)
+                .collect();
+            m.type4_walk = Some(Type4Walk {
+                task_id: 1,
+                backing_pfn: 0,
+                map_generation: m.map_generation,
+            });
+        }
+        assert_eq!(
+            super::type4_pages_witness(&state, &host, 6),
+            super::Type4Witness::Verified,
+            "a run whose every page still translates where it was walked must vouch"
+        );
+
+        // Re-point page 2 of 5 and nothing else. A per-page walk and a cached
+        // one must reach the same verdict; only one of them can get this wrong.
+        let at = std::fs::read_to_string(crate::observe::fail_log_path())
+            .unwrap_or_default()
+            .len();
+        write_pte(&mut host, 2, elsewhere_pfn);
+        assert_eq!(
+            super::type4_pages_witness(&state, &host, 6),
+            super::Type4Witness::Drifted,
+            "a page re-pointed in the middle of the run must refuse the write"
+        );
+        let body = std::fs::read_to_string(crate::observe::fail_log_path()).unwrap_or_default();
+        let fresh: Vec<&str> = body[at.min(body.len())..]
+            .lines()
+            .filter(|l| l.starts_with("mapping_page_drift "))
+            .collect();
+        assert!(
+            fresh.iter().any(|l| l.contains("reason=translation_moved")),
+            "the refusal must name the move, got: {fresh:?}"
+        );
+        assert!(
+            fresh.iter().any(|l| l.contains("page=2/5")),
+            "the refusal must name which page moved, got: {fresh:?}"
+        );
+    }
+
+    /// A task whose page table is gone refuses rather than vouching on a walk
+    /// that visited nothing.
+    ///
+    /// The bulk visitor returns without calling back at all for an inactive
+    /// task, so "saw no disagreement" and "checked nothing" are the same silence
+    /// from inside the loop. Counting what it visited is what separates them,
+    /// and a witness that skipped that count would vouch for every page of every
+    /// surface the instant a task went away.
+    #[test]
+    fn a_walk_that_visits_nothing_is_not_agreement() {
+        use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+        use crate::model::{DeviceId, Type4Walk, PAGE_SHIFT_X86};
+        use crate::runtime::host::FakeHost;
+
+        crate::observe::redirect_logs_for_tests();
+        let host = FakeHost::new();
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        // A task id that was never defined: no directory, so nothing to walk.
+        state.map_surface(6);
+        {
+            let m = state.mappings.get_mut(&6).unwrap();
+            m.mapped = true;
+            m.page_entries = vec![(4u32 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID; 3];
+            m.type4_walk = Some(Type4Walk {
+                task_id: 1,
+                backing_pfn: 0,
+                map_generation: m.map_generation,
+            });
+        }
+        assert_eq!(
+            super::type4_pages_witness(&state, &host, 6),
+            super::Type4Witness::Drifted,
+            "a page list nothing walked must not vouch for a write"
         );
     }
 
