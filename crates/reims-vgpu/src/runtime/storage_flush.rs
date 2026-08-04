@@ -744,6 +744,44 @@ pub fn flush_linear_windows_before_fence<M: HostMemory + HostOps>(
 /// `write_us=0 write=0`, which is the phase recording nothing because nothing
 /// runs. The rail sustains 528 flushes in its busiest second at ~830 µs each.
 ///
+/// **This rail is no longer the device's largest cost, and the next reader
+/// should not start here.** Summed over the 63 busy seconds of a driven boot,
+/// `drain_duty` reads `draw_us` at **61%** of the worker against `flush_us` at
+/// **34%** — the exact inverse of the 21/69 split below. Whatever is spent next
+/// on flushing is spent on a third of the worker; `draw_phase stage_us` and
+/// `chain_phase seed_us` are on two thirds of it.
+///
+/// ## What is left inside a flush, and which lever moves it
+///
+/// `readback_split` and the GPU's own timestamps divide it, and the answer is
+/// bytes rather than latency — which decides between the two candidate levers,
+/// and the naive reading decides it wrong. Over one boot, both rails together:
+///
+/// ```text
+/// fence/op=235us  gpu/op=146us  bar/op=1.2us     gpu is 62% of the fence
+/// vouch/op=143us  resolve/op=30us  write/op=0us
+/// ```
+///
+/// Netting out the GVA rail's smaller copies puts a render flush's own fence
+/// near 434 µs with ~354 µs of it GPU execution — about 23 GB/s for an 8 MB
+/// surface, which is a PCIe write to system memory running at roughly the width
+/// of the link. So:
+///
+/// - **Batching the fences** (one command buffer for the N windows landing at
+///   one drain fence, one wait) recovers only the ~80 µs of submit-to-signal per
+///   flush. Real, and about a tenth of a flush.
+/// - **Bounding what each flush copies** attacks the 354 µs, and is the lever the
+///   "moving whole frames that nobody asked for" paragraph below already argued
+///   for. It needs a damage rect, which nothing upstream carries to this rail —
+///   the engine's resident slot is where one could be accumulated, since every
+///   draw into it already passes through `registry_mark_ready`.
+///
+/// `vouch` is the other measurable half and it is now near its floor: one guest
+/// page-table entry read per page is what checking every page costs, and
+/// `bcbc859` already removed the repeated descents around it (221 µs → 143 µs).
+/// Going below that means not checking every page, which is a different and much
+/// more careful argument.
+///
 /// The paragraphs below are the reading from **before** that rail existed, kept
 /// because what they establish about the *shape* of the remaining cost still
 /// decides what to build next. Read them as history: the numbers in them are the
