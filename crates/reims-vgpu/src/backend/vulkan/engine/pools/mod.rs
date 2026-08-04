@@ -1091,21 +1091,29 @@ const STAGING_MISS_EMIT_EVERY: u64 = 512;
 /// Driven x86/Vulkan boot, 60 s Safari drag probe, 87.6 s of census windows:
 ///
 /// ```text
-/// batch_opens 160524   batch_joins 123223   batch_flush_draws 283747
-/// batch_flushes 160524                      -> 1.77 draws per batch
+/// batch_flushes           180775
+/// batch_flush_by_readback 106290   58.8 % of them
+/// batch_flush_draws       319685    1.77 draws per batch
 /// ```
 ///
 /// **1.77 against a ceiling of 8**, so raising this constant would change
 /// nothing — a batch almost never reaches it. What ends a batch is
 /// `Pools::begin_entry`, which calls `batch_flush` unconditionally before
-/// claiming a ring slot, and every readback claims one. The same boot ran 94 723
-/// readbacks, so up to 59 % of all batch flushes are a readback interrupting a
-/// run of draws rather than a batch filling up.
+/// claiming a ring slot, and every readback claims one. `batch_flush_by_readback`
+/// is that share measured rather than inferred: **58.8 % of batch flushes are a
+/// readback cutting a run of draws short**, not a batch filling up.
 ///
-/// The cost is paid twice over: each interruption is an extra `vkQueueSubmit`
-/// (160 524 batch submits plus 94 723 readback submits, ~2 900 submissions a
-/// second), and the draws that would have shared one submission are split across
-/// several.
+/// The cost is paid twice over. Each interruption is an extra `vkQueueSubmit` —
+/// a readback today is two submissions, one to flush the batch out of the way
+/// and one for its own command buffer — and the draws that would have shared a
+/// submission are split across several.
+///
+/// Both are the same fix: record the copy into the **open batch's** command
+/// buffer and submit that once, instead of flushing the batch and submitting a
+/// second buffer behind it. The readback then waits the batch's fence, which is
+/// one fence for work it was going to wait for anyway, and the run of draws
+/// stays whole. Where no batch is open there is nothing to collapse and the
+/// present path is already right.
 ///
 /// So the lever on submission count is the readback path, not this number.
 /// Before changing this constant, read `batch_flush_draws / batch_flushes`
