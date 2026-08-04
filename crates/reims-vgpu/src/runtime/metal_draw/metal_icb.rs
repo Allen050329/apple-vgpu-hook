@@ -279,6 +279,9 @@ impl crate::observe::Decline for MetalIcbInheritanceDecline {
 /// - **Vertex/fragment buffers** are used when the ICB was created with
 ///   `inheritBuffers=true`.
 /// - **Pipeline** is used when created with `inheritPipelineState=true`.
+// As the compute twin in `compute_session`: the parent encoder, the device
+// state and the ICB request are all needed to decide what the ICB inherits.
+#[allow(clippy::too_many_arguments)]
 fn apply_icb_encoder_inheritance<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -358,7 +361,7 @@ fn apply_icb_encoder_inheritance<M: HostMemory + HostOps>(
     // Buffers: applied when inheritBuffers or when the request carries binds
     // (inherit path). Metal ignores encoder buffers for ICB draws when
     // inheritBuffers is false; setting them is still safe for textures-only ICBs.
-    if icb_desc.inherit_buffers
+    if icb_desc.inherit_buffers()
         || !req.vertex_buffers.is_empty()
         || !req.fragment_buffers.is_empty()
     {
@@ -570,7 +573,7 @@ fn apply_icb_encoder_inheritance<M: HostMemory + HostOps>(
 
     // Pipeline when inheritPipelineState — PSO is not recorded into the slot,
     // so a parent pipeline is required rather than optional.
-    if icb_desc.inherit_pipeline_state {
+    if icb_desc.inherit_pipeline_state() {
         if req.pipeline_ref == 0 {
             return Err(MetalIcbInheritanceDecline::PipelineRefZero);
         }
@@ -823,7 +826,7 @@ pub fn encode_icb_execute_and_writeback<M: HostMemory + HostOps>(
         state,
         host,
         device,
-        &enc,
+        enc,
         req,
         &icb_desc,
         width,

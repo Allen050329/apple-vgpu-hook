@@ -816,6 +816,32 @@ impl ObjectCaches {
         }
         counters.pipeline_misses.fetch_add(1, Ordering::Relaxed);
 
+        // `MTLBlendFactor` 15-18 are the dual-source factors; Vulkan spells them
+        // `SRC1_*` and gates them behind `VkPhysicalDeviceFeatures::dualSrcBlend`.
+        // Same shape as the sampler's mirror-clamp check: capability question,
+        // typed decline, cached negatively so a replay returns this exact reason.
+        //
+        // Every attachment is checked, not just slot 0 — the secondaries carry
+        // their own decoded blend, and a pipeline is invalid if *any* attachment
+        // names a `SRC1_*` factor without the feature.
+        if !ctx.features.dual_src_blend {
+            let uses_dual_source = std::iter::once(&key.blend)
+                .chain(key.secondary_blend.iter())
+                .flatten()
+                .any(|b| {
+                    [b.src_color, b.dst_color, b.src_alpha, b.dst_alpha]
+                        .iter()
+                        .any(|f| f.is_dual_source())
+                });
+            if uses_dual_source {
+                let reason = super::reason::DrawReason::DualSourceBlendUnsupported;
+                crate::observe::Emit::decline("vk_engine_pipeline", &reason).fail();
+                let err = DrawError::Unsupported(reason);
+                self.pipelines.insert_negative(key.clone(), err.clone());
+                return Err(err);
+            }
+        }
+
         // Resolve every attribute against what this device accepts as a vertex
         // buffer format. Vulkan makes the three-component 8/16-bit formats
         // optional, so the format the guest decoded is not automatically

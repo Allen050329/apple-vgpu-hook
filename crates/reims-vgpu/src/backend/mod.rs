@@ -13,6 +13,15 @@
 //! Vulkan-only binding rewrites live only in [`vulkan`].
 
 #[cfg(feature = "backend-metal")]
+// `Status` is 264 bytes — six inline `(key, value)` fields, no allocation — and
+// it is the `Err` of most of this module's functions, so `result_large_err` and
+// `large_enum_variant` fire across it. Boxing is the lint's remedy and it is
+// the wrong trade here: the payload is what makes every refusal name the check
+// that refused (see `backend::metal::error::Status`), the type is `Copy` and
+// compared by value at hundreds of sites, and the cost being complained about
+// is stack traffic on a **failure** path. A new error type that is large for no
+// such reason should still be boxed rather than added to this exemption.
+#[allow(clippy::result_large_err, clippy::large_enum_variant)]
 pub mod metal;
 #[cfg(feature = "backend-vulkan")]
 pub mod vulkan;

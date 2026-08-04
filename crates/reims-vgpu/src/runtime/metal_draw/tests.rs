@@ -37,6 +37,8 @@ fn clear_black_attachment(
         texture_ref,
         resolve_texture_ref: 0,
         level: 0,
+        slice: 0,
+        depth_plane: 0,
         load_action: PASS_LOAD_ACTION_CLEAR,
         store_action: PASS_STORE_ACTION_STORE,
         clear_color: [0.0, 0.0, 0.0, 1.0],
@@ -63,6 +65,7 @@ fn single_rt_draw_request<M: HostMemory + HostOps>(
         3,
         1,
         3,
+        0,
         0,
     )
 }
@@ -437,6 +440,7 @@ fn index_load_failures_report_the_specific_reason() {
 
     // Unsupported MTLIndexType (only 0=u16 / 1=u32 exist).
     let bad_type = IndexedDrawInfo {
+        base_vertex: 0,
         index_type: 5,
         index_count: 3,
         index_buffer_ref: 9,
@@ -450,6 +454,7 @@ fn index_load_failures_report_the_specific_reason() {
     // Valid type + count, but the bound index buffer ref resolves to nothing on
     // an empty state → the entry-missing site, not a generic miss.
     let unresolved = IndexedDrawInfo {
+        base_vertex: 0,
         index_type: 1,
         index_count: 6,
         index_buffer_ref: 9,
@@ -1836,6 +1841,44 @@ fn vertex_attribute_preparation_returns_exact_declines() {
             ("value", "9".into()),
         ]
     );
+
+    // A tessellation step rate must not render as an unrecognised value. Both
+    // reach the same `DrawPreparationDecline` variant, so for a long time both
+    // reached the same slug too: that variant returned a fixed string where its
+    // `TranslateReason`-carrying siblings delegate, and the split
+    // `translate::reason` introduced never got as far as the log. The `value`
+    // field was the only thing telling 3 apart from 9, which is exactly what the
+    // second slug exists to stop a reader having to do.
+    //
+    // This is the assertion that would have caught it, and it is deliberately a
+    // comparison of the two rather than a check of one: a fixed string passes
+    // any single-slug assertion.
+    for mtl in [3u32, 4] {
+        attribute.step_function = mtl;
+        let patch = prepare_vertex_step_function(&attribute)
+            .expect_err("a per-patch step rate has no VkVertexInputRate");
+        assert_eq!(
+            patch.slug(),
+            "draw_prepare_vertex_step_function_per_patch",
+            "MTLVertexStepFunction {mtl} is a declared SDK value this backend \
+             recognises and cannot spell in Vulkan, not a value it failed to \
+             recognise"
+        );
+        assert_ne!(
+            patch.slug(),
+            step.slug(),
+            "a tessellation step rate and a corrupt ordinal must not share a \
+             slug; a driven boot's log cannot tell them apart if they do"
+        );
+        assert_eq!(
+            patch.fields(),
+            vec![
+                ("location", "3".into()),
+                ("buffer_index", "2".into()),
+                ("value", mtl.to_string()),
+            ]
+        );
+    }
 }
 
 #[cfg(feature = "backend-vulkan")]
@@ -2008,12 +2051,14 @@ fn mrt_draw_request_load_seed_miss_still_encodes() {
         texture_ref: 42,
         resolve_texture_ref: 0,
         level: 0,
+        slice: 0,
+        depth_plane: 0,
         load_action: PASS_LOAD_ACTION_LOAD,
         store_action: PASS_STORE_ACTION_STORE,
         clear_color: [1.0, 1.0, 1.0, 1.0], // would paint solid white if Clear invented
     };
     let slots = [(0u32, att)];
-    let req = mrt_draw_request(&mut state, &mut host, 1, 1, &slots, &[], 3, 1, 3, 0);
+    let req = mrt_draw_request(&mut state, &mut host, 1, 1, &slots, &[], 3, 1, 3, 0, 0);
     // Archive: seed miss still builds the job (NULL seed). Product must not
     // drop the pass — that freezes lagging dual-mid on stale logo.
     let req = req.expect("Load seed miss must still encode (archive NULL seed)");
@@ -2243,6 +2288,7 @@ fn mrt_draw_request_type8_swizzled_view_rejected_as_color_rt() {
             3,
             1,
             3,
+            0,
             0
         )
         .is_none(),
@@ -2437,6 +2483,7 @@ fn mrt_draw_request_type8_nonzero_level_rejected_as_color_rt() {
             3,
             1,
             3,
+            0,
             0
         )
         .is_none(),

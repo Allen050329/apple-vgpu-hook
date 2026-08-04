@@ -2,6 +2,7 @@
 
 use crate::backend::metal::abi::ReimsVgpuSampler;
 use crate::backend::metal::cache::{sampler_insert, sampler_key_hash, sampler_lookup};
+use crate::backend::metal::mtl_enum;
 use crate::backend::metal::runtime::cached_default_sampler;
 use crate::backend::metal::util::{f32_from_bits, set_err, ErrOut, Status};
 use metal::{
@@ -11,6 +12,13 @@ use metal::{
 
 pub fn make_default_sampler(device: &Device) -> SamplerState {
     cached_default_sampler(device)
+}
+
+/// One refusal shape for the eight sampler enum words, so each keeps its own
+/// slug without eight copies of the message.
+fn unsupported(err: ErrOut<'_>, slug: &'static str, field: &'static str, value: u32) -> Status {
+    set_err(err, format!("unsupported sampler {field} {value}"));
+    Status::args(slug).field(field, value)
 }
 
 pub fn validate_sampler_state(sampler: &ReimsVgpuSampler, err: ErrOut<'_>) -> Status {
@@ -61,11 +69,6 @@ pub fn validate_sampler_state(sampler: &ReimsVgpuSampler, err: ErrOut<'_>) -> St
     Status::OK
 }
 
-fn enum_u64<T: Copy>(v: u32) -> T {
-    // Metal C enums are NSUInteger-sized (u64 on arm64).
-    unsafe { std::mem::transmute_copy(&(v as u64)) }
-}
-
 pub fn make_explicit_sampler(
     device: &Device,
     sampler: &ReimsVgpuSampler,
@@ -75,20 +78,95 @@ pub fn make_explicit_sampler(
     if !rc.is_ok() {
         return Err(rc);
     }
+    // Every one of the eight enum words is converted rather than reinterpreted.
+    // What this replaced was `fn enum_u64<T: Copy>(v: u32) -> T`, a *generic*
+    // `transmute_copy` whose output type came from whatever setter it was
+    // passed to — so one line could produce an undefined discriminant for eight
+    // different Metal enums, and `transmute_copy` does not even require the
+    // sizes to match the way `transmute` does.
+    //
+    // `validate_sampler_state` above bounds each of these, and every one of its
+    // bounds happens to name its enum's real last variant, so nothing here can
+    // currently be `None`. That is the point: it was true by coincidence across
+    // two functions and nothing in the types said so.
+    let Some(min_filter) = mtl_enum::sampler_min_mag_filter(sampler.min_filter) else {
+        return Err(unsupported(
+            err,
+            "metal_sampler_min_filter_unsupported",
+            "min_filter",
+            sampler.min_filter,
+        ));
+    };
+    let Some(mag_filter) = mtl_enum::sampler_min_mag_filter(sampler.mag_filter) else {
+        return Err(unsupported(
+            err,
+            "metal_sampler_mag_filter_unsupported",
+            "mag_filter",
+            sampler.mag_filter,
+        ));
+    };
+    let Some(mip_filter) = mtl_enum::sampler_mip_filter(sampler.mip_filter) else {
+        return Err(unsupported(
+            err,
+            "metal_sampler_mip_filter_unsupported",
+            "mip_filter",
+            sampler.mip_filter,
+        ));
+    };
+    let Some(address_s) = mtl_enum::sampler_address_mode(sampler.s_address_mode) else {
+        return Err(unsupported(
+            err,
+            "metal_sampler_address_s_unsupported",
+            "mode",
+            sampler.s_address_mode,
+        ));
+    };
+    let Some(address_t) = mtl_enum::sampler_address_mode(sampler.t_address_mode) else {
+        return Err(unsupported(
+            err,
+            "metal_sampler_address_t_unsupported",
+            "mode",
+            sampler.t_address_mode,
+        ));
+    };
+    let Some(address_r) = mtl_enum::sampler_address_mode(sampler.r_address_mode) else {
+        return Err(unsupported(
+            err,
+            "metal_sampler_address_r_unsupported",
+            "mode",
+            sampler.r_address_mode,
+        ));
+    };
+    let Some(border_color) = mtl_enum::sampler_border_color(sampler.border_color) else {
+        return Err(unsupported(
+            err,
+            "metal_sampler_border_color_unsupported",
+            "border_color",
+            sampler.border_color,
+        ));
+    };
+    let Some(compare) = mtl_enum::compare_function(sampler.compare_function) else {
+        return Err(unsupported(
+            err,
+            "metal_sampler_compare_function_unsupported",
+            "compare",
+            sampler.compare_function,
+        ));
+    };
     let key = sampler_key_hash(sampler);
     if let Some(hit) = sampler_lookup(key, sampler) {
         return Ok(hit);
     }
 
     let descriptor = SamplerDescriptor::new();
-    descriptor.set_min_filter(enum_u64(sampler.min_filter));
-    descriptor.set_mag_filter(enum_u64(sampler.mag_filter));
-    descriptor.set_mip_filter(enum_u64(sampler.mip_filter));
-    descriptor.set_address_mode_s(enum_u64(sampler.s_address_mode));
-    descriptor.set_address_mode_t(enum_u64(sampler.t_address_mode));
-    descriptor.set_address_mode_r(enum_u64(sampler.r_address_mode));
-    descriptor.set_border_color(enum_u64(sampler.border_color));
-    descriptor.set_compare_function(enum_u64(sampler.compare_function));
+    descriptor.set_min_filter(min_filter);
+    descriptor.set_mag_filter(mag_filter);
+    descriptor.set_mip_filter(mip_filter);
+    descriptor.set_address_mode_s(address_s);
+    descriptor.set_address_mode_t(address_t);
+    descriptor.set_address_mode_r(address_r);
+    descriptor.set_border_color(border_color);
+    descriptor.set_compare_function(compare);
     descriptor.set_max_anisotropy(sampler.max_anisotropy as u64);
     descriptor.set_normalized_coordinates(sampler.unnormalized == 0);
     descriptor.set_lod_min_clamp(f32_from_bits(sampler.lod_min_bits));

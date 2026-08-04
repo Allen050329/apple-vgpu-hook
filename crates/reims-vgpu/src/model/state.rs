@@ -83,6 +83,13 @@ impl ExecFault {
     }
 }
 
+/// How many leading payload words an unknown child opcode echoes. Four covers
+/// every unknown packet a driven boot has produced whole (the largest is 76
+/// bytes of which 64 are payload) while bounding the line for a command that
+/// carries a large buffer; `plen` always reports the true length, so a reader
+/// can tell an echo that was cut from one that was complete.
+const UNKNOWN_OPCODE_ECHO_WORDS: usize = 4;
+
 /// Fail-visible protocol event (unknown/malformed). Never invents semantics.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FailEvent {
@@ -90,10 +97,22 @@ pub enum FailEvent {
         opcode: u16,
         total_size: u32,
     },
+    /// A child opcode this device does not decode. The guest's work is dropped
+    /// and its stamps are still retired, so the guest is told this succeeded —
+    /// which makes the record the only trace the command ever existed.
+    ///
+    /// `total_size` alone cannot identify the command: it counts the header and
+    /// the stamps as well as the payload, so a 24-byte packet is one stamp plus
+    /// one payload word or no stamps and three, and those are different
+    /// commands. `stamp_count` and `payload` separate them and carry the wire
+    /// bytes needed to name the opcode, matching what the `map_family` echo
+    /// beside this arm already reports for the opcodes it does decode.
     UnknownChildOpcode {
         channel: u32,
         opcode: u16,
         total_size: u32,
+        stamp_count: u16,
+        payload: Vec<u8>,
     },
     MalformedRootPacket {
         fault: PacketFault,
@@ -147,11 +166,33 @@ impl crate::observe::Decline for FailEvent {
                 channel,
                 opcode,
                 total_size,
-            } => vec![
-                ("ch", channel.to_string()),
-                ("opcode", format!("{opcode:#x}")),
-                ("total_size", total_size.to_string()),
-            ],
+                stamp_count,
+                payload,
+            } => {
+                let mut fields = vec![
+                    ("ch", channel.to_string()),
+                    ("opcode", format!("{opcode:#x}")),
+                    ("total_size", total_size.to_string()),
+                    ("stamps", stamp_count.to_string()),
+                    ("plen", payload.len().to_string()),
+                ];
+                // Whole words only, in wire order, so a reader can line the echo
+                // up against the packet layout. A trailing sub-word tail is
+                // reported by `plen` rather than zero-padded into a word that
+                // the guest never wrote.
+                if !payload.is_empty() {
+                    let words = payload
+                        .chunks_exact(4)
+                        .take(UNKNOWN_OPCODE_ECHO_WORDS)
+                        .map(|word| format!("{:#010x}", crate::contract::endian::ld32(word)))
+                        .collect::<Vec<_>>()
+                        .join(":");
+                    if !words.is_empty() {
+                        fields.push(("payload", words));
+                    }
+                }
+                fields
+            }
             Self::MalformedRootPacket { head, .. } => vec![("head", head.to_string())],
             Self::MalformedChildPacket { channel, head, .. } => {
                 vec![("ch", channel.to_string()), ("head", head.to_string())]
@@ -3150,7 +3191,9 @@ mod fail_vocabulary_tests {
             FailEvent::UnknownChildOpcode {
                 channel: 5,
                 opcode: 6,
-                total_size: 32
+                total_size: 32,
+                stamp_count: 0,
+                payload: Vec::new()
             }
             .slug(),
             "unknown_child_opcode"
@@ -3198,12 +3241,15 @@ mod fail_vocabulary_tests {
                 channel: 5,
                 opcode: 6,
                 total_size: 32,
+                stamp_count: 1,
+                payload: vec![0x21, 0x43, 0x65, 0x87, 0x01, 0x00, 0x00, 0x00],
             },
         )
         .render();
         assert_eq!(
             line,
-            "fail_event reason=unknown_child_opcode ch=5 opcode=0x6 total_size=32"
+            "fail_event reason=unknown_child_opcode ch=5 opcode=0x6 total_size=32 stamps=1 \
+             plen=8 payload=0x87654321:0x00000001"
         );
 
         let root = crate::observe::Emit::decline(
@@ -3226,6 +3272,63 @@ mod fail_vocabulary_tests {
         )
         .render();
         assert_eq!(child, "fail_event reason=packet_bad_size ch=2 head=4096");
+    }
+
+    /// An unknown child opcode is acknowledged to the guest — its stamps retire
+    /// like any other packet's — so this record is the only evidence the command
+    /// was ever issued. It therefore has to say enough to identify it.
+    ///
+    /// `total_size` cannot: it spans the header, the stamps and the payload at
+    /// once. A driven arm64 boot reports 968 packets at `opcode=0x3f` and 83 at
+    /// `0x3e`, all `total_size=24`, and against a 12-byte header and 8-byte
+    /// stamps that is either one stamp and one payload word or no stamps and
+    /// three — different commands with the same size. The two readings must not
+    /// render alike.
+    #[test]
+    fn an_unknown_child_opcode_separates_its_stamps_from_its_payload() {
+        let render = |stamp_count, payload: Vec<u8>| {
+            crate::observe::Emit::decline(
+                "fail_event",
+                &FailEvent::UnknownChildOpcode {
+                    channel: 3,
+                    opcode: 0x3f,
+                    total_size: 24,
+                    stamp_count,
+                    payload,
+                },
+            )
+            .render()
+        };
+        let one_stamp = render(1, vec![0x0c, 0x00, 0x00, 0x00]);
+        let no_stamps = render(0, vec![0; 12]);
+        assert_ne!(
+            one_stamp, no_stamps,
+            "two packets of one total_size must not render alike"
+        );
+        assert!(one_stamp.contains("stamps=1 plen=4 payload=0x0000000c"));
+        assert!(no_stamps.contains("stamps=0 plen=12"));
+
+        // A payload longer than the echo is reported by `plen`, so a truncated
+        // echo can be told from a complete one rather than read as the whole
+        // command.
+        let long = render(0, (0..40).collect());
+        assert!(long.contains("plen=40"), "{long}");
+        assert_eq!(
+            long.matches("0x").count(),
+            UNKNOWN_OPCODE_ECHO_WORDS + 1,
+            "the echo is bounded, and the opcode is the one other hex field: {long}"
+        );
+
+        // A sub-word tail is never zero-padded into a word the guest did not
+        // write; `plen` is what reports it.
+        let ragged = render(0, vec![0xff, 0xff, 0xff, 0xff, 0xaa]);
+        assert!(
+            ragged.contains("plen=5 payload=0xffffffff") && !ragged.contains("0x000000aa"),
+            "{ragged}"
+        );
+
+        // Nothing to echo must not emit an empty field.
+        assert!(!render(2, Vec::new()).contains("payload="));
     }
 
     /// The malformed-packet checks used to be hyphenated string literals passed

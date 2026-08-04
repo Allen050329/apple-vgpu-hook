@@ -15,6 +15,25 @@ use crate::runtime::decode::resource::{
 };
 
 /// `MTLBlendFactor` (SDK numeric values, Metal header order).
+///
+/// The table used to stop at 14 and its test asserted 15 as "past the end".
+/// It is not: `MTLRenderPipeline.h` on the macOS 26 SDK runs to
+/// `MTLBlendFactorOneMinusSource1Alpha = 18`, so 14 is the fifteenth of
+/// nineteen and the four dual-source factors were refused device-wide, on this
+/// arm and on the Metal one, with both claiming to cover the SDK range.
+///
+/// 15-18 are the dual-source factors, which read the fragment shader's second
+/// colour output. Vulkan spells them `SRC1_*` and gates them behind
+/// `VkPhysicalDeviceFeatures::dualSrcBlend`; naming one in a pipeline without
+/// that feature is invalid, so the *capability* question is asked where the
+/// pipeline is built (`caches::get_or_create_pipeline`) rather than here.
+/// Translation is unconditional: whether the guest asked for a dual-source
+/// blend and whether this host can run one are two different facts and
+/// collapsing them would report a capability gap as a decode failure.
+///
+/// 19 (`MTLBlendFactorUnspecialized`) is deliberately absent. It is Metal 4's
+/// "resolve this at specialization time" sentinel rather than a blend factor,
+/// and nothing in this device performs that resolution.
 pub fn factor(mtl: u32) -> Result<BlendFactor, TranslateReason> {
     Ok(match mtl {
         0 => BlendFactor::Zero,
@@ -32,11 +51,30 @@ pub fn factor(mtl: u32) -> Result<BlendFactor, TranslateReason> {
         12 => BlendFactor::OneMinusConstantColor,
         13 => BlendFactor::ConstantAlpha,
         14 => BlendFactor::OneMinusConstantAlpha,
+        15 => BlendFactor::Src1Color,
+        16 => BlendFactor::OneMinusSrc1Color,
+        17 => BlendFactor::Src1Alpha,
+        18 => BlendFactor::OneMinusSrc1Alpha,
         other => return Err(TranslateReason::UnknownBlendFactor(other)),
     })
 }
 
-/// `MTLBlendOperation` (SDK numeric values).
+/// `MTLBlendOperation` (SDK numeric values, Metal header order).
+///
+/// **The enum runs 0-5, not 0-4**, and the fifth is refused on purpose:
+/// `MTLRenderPipeline.h` on the macOS 26 SDK declares
+/// `MTLBlendOperationUnspecialized = 5`. Like [`factor`]'s
+/// `MTLBlendFactorUnspecialized = 19` and `MTLColorWriteMaskUnspecialized =
+/// 0x10` beside them, it is Metal 4's "resolve this at specialization time"
+/// sentinel rather than an operation, and nothing in this device performs that
+/// resolution — so there is nothing for a guest to lose by its refusal.
+///
+/// Saying so here is the point. Refusing 5 without a word about it leaves the
+/// converter and its test in the exact shape that hid the dual-source blend
+/// gap: a range mapped from 0 to N and `N + 1` asserted to decline, with
+/// nothing distinguishing "one past the end of Apple's enum" from "a declared
+/// Apple value this device turns down". The first is a bound; the second is a
+/// decision, and only a decision can be wrong.
 pub fn operation(mtl: u32) -> Result<BlendOp, TranslateReason> {
     Ok(match mtl {
         0 => BlendOp::Add,
@@ -121,6 +159,10 @@ pub fn vk_factor(factor: BlendFactor) -> vk::BlendFactor {
         BlendFactor::OneMinusConstantColor => vk::BlendFactor::ONE_MINUS_CONSTANT_COLOR,
         BlendFactor::ConstantAlpha => vk::BlendFactor::CONSTANT_ALPHA,
         BlendFactor::OneMinusConstantAlpha => vk::BlendFactor::ONE_MINUS_CONSTANT_ALPHA,
+        BlendFactor::Src1Color => vk::BlendFactor::SRC1_COLOR,
+        BlendFactor::OneMinusSrc1Color => vk::BlendFactor::ONE_MINUS_SRC1_COLOR,
+        BlendFactor::Src1Alpha => vk::BlendFactor::SRC1_ALPHA,
+        BlendFactor::OneMinusSrc1Alpha => vk::BlendFactor::ONE_MINUS_SRC1_ALPHA,
     }
 }
 
@@ -138,23 +180,88 @@ pub fn vk_operation(op: BlendOp) -> vk::BlendOp {
 mod tests {
     use super::*;
 
-    /// Metal's blend enums are dense from 0, so the whole range maps and the
-    /// first value past the end declines by name.
+    /// Metal's blend enums are dense from 0, so the whole range maps — and the
+    /// two values above each range decline for **two different reasons**.
+    ///
+    /// The factor run ends at **18**, not 14. This test asserted `factor(15)`
+    /// was past it, which is what let the four dual-source factors read as a
+    /// covered range for as long as they did: 15 is
+    /// `MTLBlendFactorSource1Color`, and the run ends at
+    /// `OneMinusSource1Alpha = 18`.
+    ///
+    /// Fixing the bound alone would leave the same trap one notch along, so the
+    /// two refusals are now asserted apart. `factor(19)` and `operation(5)` are
+    /// **declared SDK values** — the `Unspecialized` specialization sentinels —
+    /// refused because this device resolves nothing at specialization time.
+    /// `factor(20)` and `operation(6)` are genuinely past the end of Apple's
+    /// enums. A test that only checks the first value that declines cannot tell
+    /// those apart, and cannot notice when Apple adds a real member where the
+    /// sentinel used to be the boundary: that is precisely what happened between
+    /// `MTLBlendFactorOneMinusBlendAlpha = 14` and the dual-source four.
     #[test]
     fn the_blend_enums_are_total_over_their_sdk_range() {
-        for mtl in 0..=14u32 {
+        for mtl in 0..=18u32 {
             assert!(factor(mtl).is_ok(), "MTLBlendFactor {mtl}");
         }
-        assert_eq!(
-            factor(15).unwrap_err(),
-            TranslateReason::UnknownBlendFactor(15)
-        );
         for mtl in 0..=4u32 {
             assert!(operation(mtl).is_ok(), "MTLBlendOperation {mtl}");
         }
+
+        // Declared by Apple, refused by decision.
+        assert_eq!(
+            factor(19).unwrap_err(),
+            TranslateReason::UnknownBlendFactor(19),
+            "MTLBlendFactorUnspecialized is declared; refusing it is a decision \
+             this module documents, not a range bound"
+        );
         assert_eq!(
             operation(5).unwrap_err(),
-            TranslateReason::UnknownBlendOperation(5)
+            TranslateReason::UnknownBlendOperation(5),
+            "MTLBlendOperationUnspecialized is declared; refusing it is a \
+             decision this module documents, not a range bound"
+        );
+
+        // Past the end of Apple's enums.
+        assert_eq!(
+            factor(20).unwrap_err(),
+            TranslateReason::UnknownBlendFactor(20)
+        );
+        assert_eq!(
+            operation(6).unwrap_err(),
+            TranslateReason::UnknownBlendOperation(6)
+        );
+    }
+
+    /// The four dual-source factors map to Vulkan's `SRC1_*` and report
+    /// themselves as needing `dualSrcBlend`; the fifteen below them do not.
+    ///
+    /// The split has to be exact in both directions. Marking a plain factor
+    /// dual-source would decline a pipeline every compositor builds on any host
+    /// without the feature; missing one would build a pipeline Vulkan rejects,
+    /// which is the ungated-bind shape `caps::device_features` exists to stop.
+    #[test]
+    fn only_the_four_dual_source_factors_ask_for_the_feature() {
+        for mtl in 0..=14u32 {
+            assert!(
+                !factor(mtl).unwrap().is_dual_source(),
+                "MTLBlendFactor {mtl} is not dual-source"
+            );
+        }
+        for mtl in 15..=18u32 {
+            assert!(
+                factor(mtl).unwrap().is_dual_source(),
+                "MTLBlendFactor {mtl} is dual-source"
+            );
+        }
+        assert_eq!(vk_factor(factor(15).unwrap()), vk::BlendFactor::SRC1_COLOR);
+        assert_eq!(
+            vk_factor(factor(16).unwrap()),
+            vk::BlendFactor::ONE_MINUS_SRC1_COLOR
+        );
+        assert_eq!(vk_factor(factor(17).unwrap()), vk::BlendFactor::SRC1_ALPHA);
+        assert_eq!(
+            vk_factor(factor(18).unwrap()),
+            vk::BlendFactor::ONE_MINUS_SRC1_ALPHA
         );
     }
 
@@ -162,7 +269,7 @@ mod tests {
     /// onto one would silently change how a surface composites.
     #[test]
     fn every_blend_factor_has_a_distinct_vulkan_spelling() {
-        let all: Vec<BlendFactor> = (0..=14).map(|m| factor(m).unwrap()).collect();
+        let all: Vec<BlendFactor> = (0..=18).map(|m| factor(m).unwrap()).collect();
         let mut vks: Vec<i32> = all.iter().map(|f| vk_factor(*f).as_raw()).collect();
         vks.sort_unstable();
         let before = vks.len();

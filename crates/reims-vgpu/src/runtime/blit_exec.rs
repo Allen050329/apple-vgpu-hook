@@ -1180,13 +1180,47 @@ fn write_fill_range<M: HostMemory + HostOps>(
     length: u64,
     value: u8,
 ) -> Result<(), BlitStatus> {
+    write_fill_pattern(host, state, task_id, gva, length, &[value])
+}
+
+/// Write `length` bytes at `gva` by repeating `pattern` from its first byte.
+///
+/// One body for both fill records rather than a copy per record. The byte fill
+/// is this with a one-byte pattern, which is not a generalisation for its own
+/// sake: the bounds check, the `dest_window` authorisation, the chunked write
+/// and the GVA advance are the four things a second copy would have to keep in
+/// step, and this rail has already produced three bugs from two arms of one
+/// guest-memory write drifting apart.
+///
+/// Phase is preserved across chunks because the tile is a whole number of
+/// patterns, so every chunk begins on pattern byte 0 exactly as the first one
+/// does. That is asserted rather than assumed — a `CHUNK` that stopped being a
+/// multiple of the pattern width would shift every byte after the first tile.
+fn write_fill_pattern<M: HostMemory + HostOps>(
+    host: &mut M,
+    state: &mut DeviceState,
+    task_id: u32,
+    gva: u64,
+    length: u64,
+    pattern: &[u8],
+) -> Result<(), BlitStatus> {
     if length == 0 {
         return Ok(());
     }
+    debug_assert!(!pattern.is_empty(), "a fill with no pattern writes nothing");
+    debug_assert_eq!(
+        CHUNK % pattern.len(),
+        0,
+        "the staging tile must hold a whole number of patterns, or the phase \
+         shifts at every chunk boundary"
+    );
     let allowed = dest_window(state, host, task_id, gva, length);
     let mut remaining = length;
     let mut cur = gva;
-    let chunk = vec![value; CHUNK];
+    let mut chunk = vec![0u8; CHUNK];
+    for (i, b) in chunk.iter_mut().enumerate() {
+        *b = pattern[i % pattern.len()];
+    }
     while remaining > 0 {
         let n = remaining.min(CHUNK as u64) as usize;
         if gva_mem::write_task_gva_product_within(
@@ -1400,6 +1434,64 @@ fn exec_fill_buffer<M: HostMemory + HostOps>(
         None => return br(BlitStatus::Bounds, "fill_gva_overflow"),
     };
     match write_fill_range(host, state, task_id, gva, cmd.range_length, cmd.fill_value) {
+        Ok(()) => BlitStatus::Ok,
+        Err(st) => st,
+    }
+}
+
+/// `fillBuffer:range:pattern4:` — the byte fill with a repeating 32-bit unit.
+///
+/// Same resolve, same bounds check and same write path as
+/// [`exec_fill_buffer`]; only the chunk this repeats differs. That is the whole
+/// difference between the two records on the wire too — one length, one layout,
+/// and a last field that is one byte wide in `0x132` and four in `0x13f`.
+///
+/// # Why an unaligned range is refused rather than filled
+///
+/// The record settles *what* repeats and says nothing about the **phase** it
+/// repeats on, and there are two readings that differ:
+///
+/// - the pattern restarts at `range.location`, so byte `i` of the range takes
+///   `pattern[i % 4]`;
+/// - the pattern is anchored to the buffer, so the byte at buffer offset `o`
+///   takes `pattern[o % 4]`.
+///
+/// The two agree for every byte exactly when `range.location % 4 == 0`, and
+/// nothing this project can reach decides between them otherwise: the
+/// serializer forwards the arguments untouched, so the choice belongs to
+/// Apple's host implementation and no capture of the command stream can see it.
+///
+/// So the aligned case is executed — no guess is being made there — and the
+/// unaligned case is refused by name. Filling it under either reading would put
+/// bytes in guest memory that are plausible and possibly wrong, which is worse
+/// than a refusal the fail log explains. `fill_pattern4_unaligned_range` is a
+/// healthy zero, and a non-zero reading is the measured argument for going and
+/// deriving the phase rule.
+fn exec_fill_buffer_pattern4<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    cmd: &Command,
+) -> BlitStatus {
+    if cmd.range_length == 0 {
+        return BlitStatus::ZeroExtent;
+    }
+    let pattern = cmd.fill_pattern.to_le_bytes();
+    if !cmd.range_location.is_multiple_of(pattern.len() as u64) {
+        return br(BlitStatus::Unsupported, "fill_pattern4_unaligned_range");
+    }
+    let buf = match resolve_buffer(state, host, task_id, cmd.buffer) {
+        Ok(b) => b,
+        Err(st) => return st,
+    };
+    if !range_fits(cmd.range_location, cmd.range_length, buf.size) {
+        return br(BlitStatus::Bounds, "fill_pattern4_range_oob");
+    }
+    let gva = match buf.gva.checked_add(cmd.range_location) {
+        Some(v) => v,
+        None => return br(BlitStatus::Bounds, "fill_pattern4_gva_overflow"),
+    };
+    match write_fill_pattern(host, state, task_id, gva, cmd.range_length, &pattern) {
         Ok(()) => BlitStatus::Ok,
         Err(st) => st,
     }
@@ -2875,6 +2967,7 @@ pub fn execute_blit<M: HostMemory + HostOps>(
     clear_blit_fail_reason();
     match cmd.kind {
         Kind::FillBuffer => exec_fill_buffer(state, host, task_id, cmd),
+        Kind::FillBufferPattern4 => exec_fill_buffer_pattern4(state, host, task_id, cmd),
         Kind::Copy => match cmd.copy_kind {
             CopyKind::BufferToBuffer => exec_copy_buffer_to_buffer(state, host, task_id, cmd),
             CopyKind::BufferToTexture => exec_copy_buffer_to_texture(state, host, task_id, cmd),
@@ -2888,6 +2981,21 @@ pub fn execute_blit<M: HostMemory + HostOps>(
         Kind::Fence => execute_blit_fence(state, task_id, cmd),
         Kind::Resource | Kind::Image | Kind::Unknown => {
             br(BlitStatus::Unsupported, "blit_kind_unsupported")
+        }
+        // The three indirect-command-buffer records never reach here:
+        // `handle_blit_record` answers them itself, counting the two that are
+        // lost work and treating the optimize hint as the no-op it is. A
+        // sighting means the dispatch there stopped routing them, so it gets a
+        // reason of its own rather than joining the unsupported kinds above.
+        Kind::IcbRange | Kind::IcbCopy => br(BlitStatus::Unsupported, "blit_kind_icb_misrouted"),
+        // The two `BlitEncoderSPI` records this device decodes and does not
+        // apply. Like the ICB pair above they are answered by
+        // `handle_blit_record`, which counts the texture fill as lost work and
+        // the compressed-texture invalidate as the no-op it is — so reaching
+        // here means that dispatch stopped routing them, which is a different
+        // defect from a kind nobody implemented and gets its own reason.
+        Kind::FillTexture | Kind::InvalidateCompressedTexture => {
+            br(BlitStatus::Unsupported, "blit_kind_spi_misrouted")
         }
     }
 }
@@ -3215,6 +3323,118 @@ mod tests {
                 .is_ok()
         );
         assert_eq!(out, [0x5a; 8]);
+    }
+
+    /// The pattern fill lands a repeating 32-bit unit, in the right order and
+    /// on the right phase.
+    ///
+    /// Deliberately not four equal bytes: a pattern of `0x89abcdef` fails if
+    /// the executor wrote the `u32` big-endian, wrote only its low byte, or
+    /// started the repeat anywhere but the range's first byte, and each of
+    /// those produces bytes that look filled. The range starts at 16 rather
+    /// than 0 so a fill that ignored `range_location` also fails, and the
+    /// length is not a multiple of the pattern so the partial tail is checked.
+    #[test]
+    fn fill_buffer_pattern4_roundtrip() {
+        let (mut host, mut state) = blit_device();
+        install_buffer(&mut host, &mut state, 7, 1, 256);
+        let mut cmd = Command::default();
+        cmd.kind = Kind::FillBufferPattern4;
+        cmd.buffer = 7;
+        cmd.range_location = 16;
+        cmd.range_length = 10;
+        cmd.fill_pattern = 0x89ab_cdef;
+        assert_eq!(execute_blit(&mut state, &mut host, 1, &cmd), BlitStatus::Ok);
+        let mut out = [0u8; 12];
+        let gva = (1u64 << RESOURCE_PAGE_SHIFT) + 16;
+        assert!(
+            gva_mem::read_task_gva(&host, &state.tasks[1], gva, &mut out, PAGE_SHIFT_ARM64E)
+                .is_ok()
+        );
+        assert_eq!(
+            &out[..10],
+            &[0xef, 0xcd, 0xab, 0x89, 0xef, 0xcd, 0xab, 0x89, 0xef, 0xcd],
+            "the pattern must repeat little-endian from the range's first byte"
+        );
+        assert_eq!(&out[10..], &[0, 0], "the fill wrote past its length");
+    }
+
+    /// A range whose start is not pattern-aligned is refused, by name.
+    ///
+    /// The record says what repeats and not what phase it repeats on, and the
+    /// two readings — anchored to the range, anchored to the buffer — disagree
+    /// for exactly these ranges. Filling one under either reading writes
+    /// plausible bytes into guest memory that may be wrong, which is worse than
+    /// a refusal the fail log explains. A non-zero reading of
+    /// `fill_pattern4_unaligned_range` on a driven boot is the argument for
+    /// deriving the phase rule; until then it is a healthy zero.
+    #[test]
+    fn an_unaligned_pattern_fill_is_refused_rather_than_guessed() {
+        let (mut host, mut state) = blit_device();
+        install_buffer(&mut host, &mut state, 7, 1, 256);
+        let mut cmd = Command::default();
+        cmd.kind = Kind::FillBufferPattern4;
+        cmd.buffer = 7;
+        cmd.range_location = 17;
+        cmd.range_length = 8;
+        cmd.fill_pattern = 0x89ab_cdef;
+        assert_eq!(
+            execute_blit(&mut state, &mut host, 1, &cmd),
+            BlitStatus::Unsupported
+        );
+        assert_eq!(
+            blit_fail_reason(),
+            "fill_pattern4_unaligned_range",
+            "the refusal must name the phase question rather than reporting a \
+             generic unsupported"
+        );
+        // And nothing was written: a refusal that had already painted part of
+        // the range would be worse than the fill it declined to do.
+        let mut out = [0u8; 8];
+        let gva = (1u64 << RESOURCE_PAGE_SHIFT) + 17;
+        assert!(
+            gva_mem::read_task_gva(&host, &state.tasks[1], gva, &mut out, PAGE_SHIFT_ARM64E)
+                .is_ok()
+        );
+        assert_eq!(out, [0u8; 8]);
+    }
+
+    /// The byte fill and the pattern fill are one write path.
+    ///
+    /// `write_fill_range` is `write_fill_pattern` with a one-byte pattern, and
+    /// this asserts the two agree on the bytes rather than only on the code
+    /// being shared — the divergence this rail keeps producing is two arms of
+    /// one guest-memory write drifting, and a shared body is only worth
+    /// anything if the equivalence is checked.
+    #[test]
+    fn a_byte_fill_and_a_four_equal_byte_pattern_fill_write_the_same_bytes() {
+        let read_back = |cmd: &Command| {
+            let (mut host, mut state) = blit_device();
+            install_buffer(&mut host, &mut state, 7, 1, 256);
+            assert_eq!(execute_blit(&mut state, &mut host, 1, cmd), BlitStatus::Ok);
+            let mut out = [0u8; 12];
+            let gva = (1u64 << RESOURCE_PAGE_SHIFT) + 16;
+            assert!(gva_mem::read_task_gva(
+                &host,
+                &state.tasks[1],
+                gva,
+                &mut out,
+                PAGE_SHIFT_ARM64E
+            )
+            .is_ok());
+            out
+        };
+        let mut byte_fill = Command::default();
+        byte_fill.kind = Kind::FillBuffer;
+        byte_fill.buffer = 7;
+        byte_fill.range_location = 16;
+        byte_fill.range_length = 10;
+        byte_fill.fill_value = 0x5a;
+        let mut pattern_fill = byte_fill.clone();
+        pattern_fill.kind = Kind::FillBufferPattern4;
+        pattern_fill.fill_value = 0;
+        pattern_fill.fill_pattern = u32::from_le_bytes([0x5a; 4]);
+        assert_eq!(read_back(&byte_fill), read_back(&pattern_fill));
     }
 
     /// The reason channel names *which* collapsed check fired for a coarse

@@ -219,6 +219,12 @@ pub fn attribute_format(mtl: u32) -> Result<F, TranslateReason> {
 ///
 /// The serializer omits the field for Metal's default `PerVertex` behavior, so
 /// absence is part of this translation rather than a caller-side fallback.
+///
+/// The SDK enum runs 0-4. Only 0-2 have a `VkVertexInputRate` — Vulkan has
+/// `VERTEX` and `INSTANCE` and nothing else — so 3 (`PerPatch`) and 4
+/// (`PerPatchControlPoint`) decline, but under their own reason rather than as
+/// unrecognised values. They are recognised; this backend builds no
+/// tessellation pipeline for them to belong to.
 pub fn step_function(is_present: bool, mtl: u32) -> Result<VertexStepFunction, TranslateReason> {
     if !is_present {
         return Ok(VertexStepFunction::PerVertex);
@@ -227,6 +233,7 @@ pub fn step_function(is_present: bool, mtl: u32) -> Result<VertexStepFunction, T
         0 => Ok(VertexStepFunction::Constant),
         1 => Ok(VertexStepFunction::PerVertex),
         2 => Ok(VertexStepFunction::PerInstance),
+        3 | 4 => Err(TranslateReason::VertexStepFunctionPerPatch(mtl)),
         other => Err(TranslateReason::UnknownVertexStepFunction(other)),
     }
 }
@@ -340,9 +347,43 @@ mod tests {
             VertexStepFunction::PerInstance
         );
         assert_eq!(
-            step_function(true, 3).unwrap_err(),
-            TranslateReason::UnknownVertexStepFunction(3)
+            step_function(true, 5).unwrap_err(),
+            TranslateReason::UnknownVertexStepFunction(5)
         );
+    }
+
+    /// The two tessellation step rates decline under their own reason, and the
+    /// first value genuinely off the end of the SDK enum declines under the
+    /// other.
+    ///
+    /// This test asserted `UnknownVertexStepFunction(3)` before, which encoded
+    /// the wrong end of `MTLVertexStepFunction` as the intended behaviour: the
+    /// enum runs to `PerPatchControlPoint = 4`, so 3 and 4 are declared values
+    /// this backend recognises and cannot spell, not values it fails to
+    /// recognise. Reading a boot's log, the two want different answers — one is
+    /// "the guest ran a tessellation pipeline", the other is "something is
+    /// wrong upstream of here".
+    #[test]
+    fn the_two_tessellation_step_rates_decline_by_their_own_name() {
+        for mtl in [3u32, 4] {
+            assert_eq!(
+                step_function(true, mtl).unwrap_err(),
+                TranslateReason::VertexStepFunctionPerPatch(mtl),
+                "MTLVertexStepFunction {mtl}"
+            );
+        }
+        use crate::observe::Decline as _;
+        assert_eq!(
+            TranslateReason::VertexStepFunctionPerPatch(3).slug(),
+            "vertex_step_function_per_patch"
+        );
+        assert_ne!(
+            TranslateReason::VertexStepFunctionPerPatch(3).slug(),
+            TranslateReason::UnknownVertexStepFunction(5).slug()
+        );
+        // Absence still means `PerVertex` whatever the word holds, so a record
+        // that never carried the field cannot reach either refusal.
+        assert_eq!(step_function(false, 3).unwrap(), VertexStepFunction::PerVertex);
     }
 
     /// **L2's co-location invariant.** The byte size must equal the Vulkan

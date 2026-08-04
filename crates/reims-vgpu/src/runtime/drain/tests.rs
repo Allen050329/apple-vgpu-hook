@@ -3375,6 +3375,104 @@ fn an_overlong_display_transaction_alarms_once_per_shape() {
     );
 }
 
+/// The alarm carries the bytes it is alarming about, and it does not explain
+/// op8 with op6's structure.
+///
+/// Both halves come from the same reading of a driven arm64 boot, where this
+/// alarm fires on **every** present — 1 668 times in 212 s, always `op=0x8
+/// plen=40 trailer=12` — and printed a plane-list explanation that cannot apply
+/// to op8, which serializes no transaction. So the message was wrong about a
+/// first-class pathway's normal traffic, and the reader was told nothing about
+/// the 28 undecoded bytes that would let anyone act on it.
+///
+/// The line is latched per `(opcode, length)`, so the dump costs one line per
+/// shape per boot. Without it, learning what those bytes hold needs a rebuild
+/// and a reboot.
+#[test]
+fn the_overlong_alarm_dumps_the_tail_and_explains_the_right_command() {
+    let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_ARM64E);
+    let packet = |opcode: u16, payload: Vec<u8>| Packet {
+        opcode,
+        stamp_count: 0,
+        total_size: PACKET_HEADER_LEN + payload.len() as u32,
+        completion_stamp: 0,
+        payload,
+        next_head: 0,
+    };
+
+    // op8 at the length the arm64 guest actually sends: 12 known, 28 unnamed.
+    let mut body = vec![0u8; 12];
+    body.extend((0..28u8).map(|i| 0xa0 + i));
+    let cap = crate::observe::FailCapture::start();
+    note_display_txn_payload(&mut state, 4, &packet(CHILD_OP_DISPLAY_SWAP, body));
+    let lines = cap.lines();
+    let line = lines
+        .iter()
+        .find(|l| l.contains("display_txn_payload_overlong"))
+        .unwrap_or_else(|| panic!("the alarm did not fire: {lines:?}"));
+    assert!(
+        line.contains("undecoded=28"),
+        "the line must say how much it could not read: {line}"
+    );
+    assert!(
+        line.contains("tail=0xa0a1a2a3"),
+        "the line must carry the undecoded bytes, starting at the trailer: {line}"
+    );
+    // Asserted on the *claim*, not on the words. The op8 message does mention a
+    // plane list — to say these bytes are not one, which is the conclusion a
+    // reader would otherwise draw from the alarm's name and its op6 sibling.
+    // What it must not do is assert one may have appeared.
+    assert!(
+        !line.contains("may have appeared"),
+        "op8 serializes no transaction, so a plane list is not a thing it can \
+         have grown; claiming one sends the next reader looking for a structure \
+         that cannot exist: {line}"
+    );
+    assert!(
+        line.contains("serializes no transaction"),
+        "the line must say why the plane-list reading does not apply here, or \
+         the next reader re-derives it: {line}"
+    );
+
+    // op6 does serialize a transaction, so the plane-list reading is its own
+    // and must survive. Same alarm, different explanation.
+    let cap = crate::observe::FailCapture::start();
+    note_display_txn_payload(&mut state, 5, &packet(CHILD_OP_PRESENT_X86, vec![7u8; 64]));
+    let lines = cap.lines();
+    let line = lines
+        .iter()
+        .find(|l| l.contains("display_txn_payload_overlong"))
+        .unwrap_or_else(|| panic!("the alarm did not fire for op6: {lines:?}"));
+    assert!(
+        line.contains("may have appeared"),
+        "op6 is the transaction command, so the plane-list reading is its own \
+         and must survive the op8 correction: {line}"
+    );
+
+    // The dump is bounded: the length is guest-controlled, so a pathological
+    // payload must not turn one latched line into an unbounded one.
+    let cap = crate::observe::FailCapture::start();
+    note_display_txn_payload(
+        &mut state,
+        5,
+        &packet(CHILD_OP_PRESENT_X86, vec![0u8; 4096]),
+    );
+    let lines = cap.lines();
+    let line = lines
+        .iter()
+        .find(|l| l.contains("display_txn_payload_overlong"))
+        .unwrap_or_else(|| panic!("the alarm did not fire for the long payload: {lines:?}"));
+    assert!(
+        line.contains("undecoded=4084") && line.contains("..."),
+        "the full length is reported but the dump is truncated and says so: {line}"
+    );
+    assert!(
+        line.len() < 512,
+        "a guest-sized payload must not produce a guest-sized log line: {}",
+        line.len()
+    );
+}
+
 /// The gamma command swaps the surface id and the task field relative to the
 /// plain one.
 ///

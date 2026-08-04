@@ -850,11 +850,30 @@ pub enum BlendFactor {
     OneMinusConstantColor,
     ConstantAlpha,
     OneMinusConstantAlpha,
+    /// `MTLBlendFactorSource1Color` and its three siblings — the dual-source
+    /// factors, which read the fragment shader's *second* colour output.
+    ///
+    /// Separated from the fifteen above by [`BlendFactor::is_dual_source`]
+    /// because Vulkan gates exactly these four behind the `dualSrcBlend` device
+    /// feature, and a pipeline naming one without it is invalid.
+    Src1Color,
+    OneMinusSrc1Color,
+    Src1Alpha,
+    OneMinusSrc1Alpha,
 }
 
 impl BlendFactor {
     pub(crate) fn vk(self) -> vk::BlendFactor {
         translate::blend::vk_factor(self)
+    }
+
+    /// Whether this factor reads the second fragment output, and so needs
+    /// `VkPhysicalDeviceFeatures::dualSrcBlend`.
+    pub(crate) fn is_dual_source(self) -> bool {
+        matches!(
+            self,
+            Self::Src1Color | Self::OneMinusSrc1Color | Self::Src1Alpha | Self::OneMinusSrc1Alpha
+        )
     }
 }
 

@@ -907,6 +907,48 @@ mod tests {
         assert_eq!(vk_texel_layout(r32), vk::Format::R32_SFLOAT);
     }
 
+    /// Every layout uploads as a Vulkan format exactly as wide as the stride
+    /// this device reads its rows at.
+    ///
+    /// [`vk_texel_layout`] is the one crossing from the decode vocabulary to
+    /// the host one, and the two sides carry the width independently: the guest
+    /// side is [`TexelLayout::bytes_per_texel`], which every row loader
+    /// multiplies by, and the host side is whatever the `vk::Format` occupies.
+    /// A disagreement is not a validation error — Vulkan will happily consume
+    /// the buffer — it is a sheared or truncated image, which is the failure
+    /// mode hardest to attribute from a screenshot.
+    ///
+    /// Two of the six were pinned by
+    /// `single_channel_float_samples_natively_through_its_own_layout`, which is
+    /// where the asymmetry was noticed; this is the same check over all six,
+    /// with the widths spelled out for the reason
+    /// `storage_texel_width_matches_the_pixel_table` gives — a change to
+    /// `bytes_per_texel` that silently redefined a stride is exactly what a
+    /// derived expectation would fail to catch.
+    #[test]
+    fn every_texel_layout_uploads_as_a_format_of_its_own_width() {
+        use crate::contract::pixel_format::TexelLayout;
+        for (layout, format, width) in [
+            (TexelLayout::Rgba8, vk::Format::R8G8B8A8_UNORM, 4u32),
+            (TexelLayout::Bgra8, vk::Format::B8G8R8A8_UNORM, 4),
+            (TexelLayout::R8, vk::Format::R8_UNORM, 1),
+            (TexelLayout::Rg8, vk::Format::R8G8_UNORM, 2),
+            (TexelLayout::R16Float, vk::Format::R16_SFLOAT, 2),
+            (TexelLayout::R32Float, vk::Format::R32_SFLOAT, 4),
+        ] {
+            assert_eq!(
+                vk_texel_layout(layout),
+                format,
+                "{layout:?} changed the Vulkan format it uploads as"
+            );
+            assert_eq!(
+                layout.bytes_per_texel(),
+                width,
+                "{layout:?} reads rows at a stride its upload format does not have"
+            );
+        }
+    }
+
     /// Every rail's accepted set, spelled out. A format silently joining or
     /// leaving one of these changes which draws take the zero-copy path.
     #[test]

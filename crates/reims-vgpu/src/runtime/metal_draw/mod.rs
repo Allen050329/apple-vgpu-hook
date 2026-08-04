@@ -31,6 +31,7 @@ use crate::runtime::decode::resource::{
     FunctionDescriptor, RenderPipelineDescriptor, OBJECT_TYPE_BUFFER, OBJECT_TYPE_FUNCTION,
     OBJECT_TYPE_IOSURFACE, OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_VARIANT,
     OBJECT_TYPE_TEXTURE_VIEW, OBJECT_TYPE_TYPE7, TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE,
+    TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE_WIDE,
 };
 use crate::runtime::gva_mem;
 use crate::runtime::host::{HostMemory, HostOps};
@@ -45,6 +46,11 @@ use crate::runtime::objects;
 // `crate::runtime::metal_draw::<name>`.
 #[cfg(feature = "backend-vulkan")]
 mod vulkan;
+// Only for `exec`'s pass-extent census, which declares its own copy of these
+// bands because it runs on every backend. See
+// `the_two_coverage_censuses_use_the_same_bands`.
+#[cfg(all(test, feature = "backend-vulkan"))]
+pub(crate) use vulkan::coverage_band_for_test;
 #[cfg(feature = "backend-vulkan")]
 pub use vulkan::*;
 
@@ -295,6 +301,10 @@ pub struct IndexedDrawInfo {
     pub index_count: u32,
     pub index_buffer_ref: u32,
     pub index_buffer_offset: u64,
+    /// Metal `baseVertex` / Vulkan `vertexOffset`, added to every index before
+    /// the vertex fetch. Signed, because Metal's is, and because a negative one
+    /// read as unsigned becomes a huge index rather than an error.
+    pub base_vertex: i64,
 }
 
 /// One color RT for MRT encode/writeback.
@@ -328,6 +338,10 @@ pub struct DrawEncodeRequest {
     pub instance_count: u32,
     pub primitive_type: u32,
     pub first_vertex: u32,
+    /// Metal `baseInstance` / Vulkan `firstInstance`. Both backends already
+    /// take it; until the draw forms that carry one were decoded, both were
+    /// handed a hardcoded zero from here.
+    pub base_instance: u32,
     /// Every color RT the pass declared, slot 0 first. The sole statement of
     /// what this draw renders into: geometry, format, target identity and Load
     /// seed all live here and nowhere else, so no two fields of one request can
@@ -694,6 +708,12 @@ pub enum IndexLoadReason {
     OffsetOverflow,
     OutOfBounds,
     ReadFail,
+    /// The guest's `baseVertex` does not fit Vulkan's signed 32-bit
+    /// `vertexOffset`. Metal's is 64-bit, so this is a real narrowing rather
+    /// than an impossible one — but no guest can currently produce it, because
+    /// Apple's serializer truncates `baseVertex` to 16 bits in the compact
+    /// records. A firing here means a wide record carried something enormous.
+    BaseVertexOutOfRange,
 }
 
 impl crate::observe::Decline for IndexLoadReason {
@@ -710,6 +730,7 @@ impl crate::observe::Decline for IndexLoadReason {
             Self::OffsetOverflow => "draw_index_offset_overflow",
             Self::OutOfBounds => "draw_index_out_of_bounds",
             Self::ReadFail => "draw_index_read_fail",
+            Self::BaseVertexOutOfRange => "draw_index_base_vertex_out_of_range",
         }
     }
 }
@@ -926,9 +947,10 @@ fn load_buffer_bytes<M: HostMemory>(
 }
 
 /// If `texture_ref` is a type-8 object whose descriptor is a buffer-backed
-/// texture (view_opcode 9, `newTextureWithDescriptor:offset:bytesPerRow:`),
-/// return its decoded descriptor. `None` for a non-type-8 object or a real
-/// texture VIEW (opcode 7/8/0x1b) — those stay on the view path silently.
+/// texture (view_opcode 9, `newTextureWithDescriptor:offset:bytesPerRow:`, or
+/// its `TextureDescriptor2` form), return its decoded descriptor. `None` for a
+/// non-type-8 object or a real texture VIEW (opcode 7/8/0x1b) — those stay on
+/// the view path silently.
 fn buffer_texture_descriptor<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &M,
@@ -945,7 +967,10 @@ fn buffer_texture_descriptor<M: HostMemory + HostOps>(
         return None;
     }
     let desc_bytes = objects::read_descriptor(state, host, task_id, &entry)?;
-    if texture_type8_opcode(&desc_bytes) != Some(TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE) {
+    if !matches!(
+        texture_type8_opcode(&desc_bytes),
+        Some(TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE) | Some(TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE_WIDE)
+    ) {
         return None;
     }
     decode_buffer_texture_descriptor(&desc_bytes).ok()
@@ -966,7 +991,7 @@ fn load_buffer_texture_rgba<M: HostMemory + HostOps>(
     texture_ref: u32,
     bt: &BufferTextureDescriptor,
 ) -> Option<(u32, u32, Vec<u8>)> {
-    let (w, h) = (bt.width, bt.height);
+    let (w, h) = (bt.desc.width, bt.desc.height);
     if w == 0 || h == 0 {
         crate::observe::fail(format!(
             "buftex zero_geom ref={texture_ref} buf={} {}x{}",
@@ -974,8 +999,8 @@ fn load_buffer_texture_rgba<M: HostMemory + HostOps>(
         ));
         return None;
     }
-    let fmt = if bt.pixel_format != 0 {
-        bt.pixel_format
+    let fmt = if bt.desc.pixel_format != 0 {
+        bt.desc.pixel_format
     } else {
         MTL_FORMAT_BGRA8_UNORM
     };
@@ -1740,7 +1765,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
                     Some(ReimsVgpuIndexedDraw {
                         index_type: info.index_type,
                         index_count: info.index_count as usize,
-                        base_vertex: 0,
+                        base_vertex: info.base_vertex,
                         indices: b.as_ptr(),
                         indices_len: b.len(),
                         indirect: std::ptr::null(),
@@ -1825,7 +1850,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
         // positions. An `or_else(first())` here could only ever fire for a slot
         // with no entry of its own, which is exactly the case where borrowing
         // another slot's blend state invents one. The compat `color0` alias it
-        // looked like it served is served by the `or_else` below, which tests
+        // looked like it served is served by the `or` below, which tests
         // `c.slot == 0`.
         let slot_blend = pipeline
             .color_attachments
@@ -1843,7 +1868,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
                 has_blend_color: 0,
                 blend_color: [0.0; 4],
             })
-            .or_else(|| {
+            .or({
                 if pipeline.color0.blending_enabled && c.slot == 0 {
                     Some(ReimsVgpuBlendState {
                         enable: 1,
@@ -1897,7 +1922,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
         vertex_count,
         req.first_vertex as usize,
         req.instance_count.max(1) as usize,
-        0,
+        req.base_instance as usize,
         req.primitive_type,
         None,
         indexed_draw.as_ref(),
@@ -2100,6 +2125,9 @@ fn fill_depth32(buf: &mut [u8], depth: f32) {
 
 /// Type-2/3 linear GVA raw image read (tight dst rows of `row_bytes`).
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
+// A raw image read is addressed by texture, level, geometry and destination
+// stride; every one of those is a separate wire-decoded value.
+#[allow(clippy::too_many_arguments)]
 fn load_linear_raw<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &M,
@@ -2745,7 +2773,12 @@ fn sample_miss_detail<M: HostMemory + HostOps>(
             if let Some(bt) = buffer_texture_descriptor(state, host, task_id, texture_ref, None) {
                 return format!(
                     "type=8 desc_len={desc_len} buf={} off={} bpr={} {}x{} fmt={:#x} reason=buftex_load",
-                    bt.buffer_ref, bt.offset, bt.bytes_per_row, bt.width, bt.height, bt.pixel_format
+                    bt.buffer_ref,
+                    bt.offset,
+                    bt.bytes_per_row,
+                    bt.desc.width,
+                    bt.desc.height,
+                    bt.desc.pixel_format
                 );
             }
             match resolve_texture_view_reasoned(state, host, task_id, texture_ref) {
@@ -2826,17 +2859,15 @@ fn load_sampled_rgba<M: HostMemory + HostOps>(
                 return None;
             }
             v
-        } else if let Some(v) = load_linear_texture_rgba_at_level(
-            state,
-            host,
-            task_id,
-            view.base_texture_ref,
-            view.level,
-            view.pixel_format,
-        ) {
-            v
         } else {
-            return None;
+            load_linear_texture_rgba_at_level(
+                state,
+                host,
+                task_id,
+                view.base_texture_ref,
+                view.level,
+                view.pixel_format,
+            )?
         };
         apply_view_swizzle_rgba8(&mut loaded.2, view.swizzle.as_ref(), texture_ref)?;
         return Some(loaded);
@@ -3719,6 +3750,7 @@ pub fn color_target_request<M: HostMemory + HostOps>(
     instance_count: u32,
     primitive_type: u32,
     first_vertex: u32,
+    base_instance: u32,
 ) -> Option<DrawEncodeRequest> {
     let (mapping_id, gva, w, h, bpr, fmt) =
         lookup_render_target(state, host, task_id, color_texture_ref)?;
@@ -3743,6 +3775,7 @@ pub fn color_target_request<M: HostMemory + HostOps>(
         instance_count,
         primitive_type,
         first_vertex,
+        base_instance,
         colors: vec![c0],
         ..Default::default()
     })
@@ -3764,6 +3797,7 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
     instance_count: u32,
     primitive_type: u32,
     first_vertex: u32,
+    base_instance: u32,
 ) -> Option<DrawEncodeRequest> {
     if color_slots.is_empty() {
         return None;
@@ -3862,6 +3896,7 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
         instance_count,
         primitive_type,
         first_vertex,
+        base_instance,
         colors,
         ..Default::default()
     })
@@ -4224,6 +4259,10 @@ pub(crate) fn write_gva_rgba8_rect<M: HostMemory + HostOps>(
 
 /// Store scissor rect of tight RGBA8 into a type-11 mapping (BGRA host → guest fmt).
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
+// Source geometry, destination geometry and the scissor rect, which are three
+// independent rectangles; collapsing them into one struct would invite exactly
+// the mix-up the separate names prevent.
+#[allow(clippy::too_many_arguments)]
 fn write_mapping_rgba8_rect<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,

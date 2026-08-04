@@ -31,12 +31,12 @@ use crate::runtime::decode::compute::{
     BufferBinding, Command as ComputeCommand, Kind, RefBinding, SamplerBinding,
 };
 use crate::runtime::decode::resource::{
-    decode_function_descriptor, decode_texture_descriptor, decode_type7_descriptor,
-    texture_type8_opcode, ComputeStageInputDescriptor, Descriptor as ResourceDescriptor,
-    HEAP_TEXTURE_DESCRIPTOR, HEAP_TEXTURE_HEAP_REF, HEAP_TEXTURE_LEN, HEAP_TEXTURE_OFFSET,
-    HEAP_TEXTURE_OPCODE, HEAP_TEXTURE_USE_OFFSET, OBJECT_TYPE_BUFFER, OBJECT_TYPE_FUNCTION,
-    OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_VARIANT, OBJECT_TYPE_TEXTURE_VIEW, OBJECT_TYPE_TYPE7,
-    TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE,
+    decode_function_descriptor, decode_heap_texture, decode_texture_descriptor,
+    decode_type7_descriptor, texture_type8_opcode, ComputeStageInputDescriptor,
+    Descriptor as ResourceDescriptor, HEAP_TEXTURE_OPCODE, HEAP_TEXTURE_WIDE_OPCODE,
+    OBJECT_TYPE_BUFFER, OBJECT_TYPE_FUNCTION, OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_VARIANT,
+    OBJECT_TYPE_TEXTURE_VIEW, OBJECT_TYPE_TYPE7, TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE,
+    TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE_WIDE,
 };
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 use crate::runtime::decode::resource::{decode_sampler_descriptor, TYPE7_OBJECT_SAMPLER};
@@ -564,6 +564,22 @@ fn apply_record_inner<M: HostMemory + HostOps>(
         // binding per dispatch, so there is nothing for them to keep resident.
         // These counters exist to price that argument, not to doubt it — if
         // they are large, the per-record submit is what they are the cost of.
+        //
+        // That argument is load-bearing in a way it did not look, and the
+        // capture now says how much traffic rests on it. Under
+        // `-setSupportsComputePassDescriptorDispatchType:` Apple's serializer
+        // emits a scope barrier — `0xd7`, `Buffers|Textures` — after **every**
+        // dispatch and every ICB execution of a serial pass, measured on all six
+        // selectors (`crate::runtime::decode::compute::OP_BARRIER_SCOPE`, and
+        // `reims_vgpu_wire::ops::compute::MemoryBarrierScope` carries the
+        // derivation). So a guest that negotiates that flag doubles this rail's
+        // record count and every second record lands here. The no-op stays
+        // right, and on the Vulkan arm it is stronger than "pass granularity":
+        // `backend::vulkan::engine::exec_compute::execute_compute_inner` begins,
+        // ends and submits one command buffer per dispatch, so consecutive
+        // dispatches are separated by a queue submission rather than by a
+        // barrier inside one. `compute_noop_barrier` reading high is that
+        // capability being on, not a defect.
         //
         // The fence pair has no such argument and never had one; it sat in the
         // barrier group's arm without sharing its comment. An `MTLFence` update
@@ -1228,19 +1244,26 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
                 ));
             };
             let opcode = texture_type8_opcode(&desc).unwrap_or(0);
-            if opcode == HEAP_TEXTURE_OPCODE {
-                if desc.len() != HEAP_TEXTURE_LEN {
-                    crate::observe::fail(format!(
-                        "compute_stage_tex heap_fail reason=bad_len ref={texture_ref} len={} expected={HEAP_TEXTURE_LEN}",
-                        desc.len(),
-                    ));
-                    return Err(ComputeStatus::MissingTexture(
-                        "compute_stage_tex_heap_bad_len",
-                    ));
-                }
-                let heap_ref = ld32(&desc[HEAP_TEXTURE_HEAP_REF..]);
-                let use_offset = ld32(&desc[HEAP_TEXTURE_USE_OFFSET..]);
-                let offset = crate::contract::endian::ld64(&desc[HEAP_TEXTURE_OFFSET..]);
+            // Both opcodes are the same record: the wide one is what the guest's
+            // serializer emits with `TextureDescriptor2` on. The length each
+            // implies is `decode_heap_texture`'s to check — this site used to
+            // check it too, against the narrow constant alone, which would have
+            // rejected every wide record before its decoder saw the opcode.
+            if opcode == HEAP_TEXTURE_OPCODE || opcode == HEAP_TEXTURE_WIDE_OPCODE {
+                let record = match decode_heap_texture(&desc) {
+                    Ok(record) => record,
+                    Err(error) => {
+                        crate::observe::Emit::decline("compute_stage_tex_heap", &error)
+                            .field("ref", texture_ref)
+                            .field("len", desc.len())
+                            .fail();
+                        return Err(ComputeStatus::MissingTexture(
+                            "compute_stage_tex_heap_bad_record",
+                        ));
+                    }
+                };
+                let (heap_ref, use_offset, offset) =
+                    (record.heap_ref, record.use_offset, record.offset);
                 if heap_ref == 0 {
                     crate::observe::fail(format!(
                         "compute_stage_tex heap_fail reason=zero_heap ref={texture_ref}"
@@ -1249,35 +1272,37 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
                         "compute_stage_tex_heap_zero_ref",
                     ));
                 }
-                if use_offset > 1 {
-                    crate::observe::fail(format!(
-                        "compute_stage_tex heap_fail reason=bad_use_offset ref={texture_ref} heap={heap_ref} use_offset={use_offset} offset={offset:#x}"
-                    ));
-                    return Err(ComputeStatus::Unsupported("compute_heap_use_offset"));
-                }
-                let descriptor =
-                    match crate::runtime::heap_query::decode_serialized_texture_descriptor(
-                        &desc[HEAP_TEXTURE_DESCRIPTOR..HEAP_TEXTURE_USE_OFFSET],
-                    ) {
-                        Ok(descriptor) => descriptor,
-                        Err(error) => {
-                            crate::observe::Emit::decline("compute_stage_tex_heap", &error)
-                                .field("ref", texture_ref)
-                                .field("heap", heap_ref)
-                                .field("use_offset", use_offset)
-                                .field("offset", format!("{offset:#x}"))
-                                .fail();
-                            return Err(ComputeStatus::MissingTexture(
-                                "compute_stage_tex_heap_desc_decode",
-                            ));
-                        }
-                    };
-                heap_texture = Some((heap_ref, use_offset != 0, offset, descriptor));
+                let body = if record.wide {
+                    crate::runtime::heap_query::decode_wide_serialized_texture_descriptor(
+                        record.descriptor,
+                    )
+                } else {
+                    crate::runtime::heap_query::decode_serialized_texture_descriptor(
+                        record.descriptor,
+                    )
+                };
+                let descriptor = match body {
+                    Ok(descriptor) => descriptor,
+                    Err(error) => {
+                        crate::observe::Emit::decline("compute_stage_tex_heap", &error)
+                            .field("ref", texture_ref)
+                            .field("heap", heap_ref)
+                            .field("use_offset", use_offset)
+                            .field("offset", format!("{offset:#x}"))
+                            .fail();
+                        return Err(ComputeStatus::MissingTexture(
+                            "compute_stage_tex_heap_desc_decode",
+                        ));
+                    }
+                };
+                heap_texture = Some((heap_ref, use_offset, offset, descriptor));
             }
             if heap_texture.is_some() {
                 // Heap textures are complete resource objects, not texture
                 // views. Their backing is a host GPU residency identity.
-            } else if opcode == TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE {
+            } else if opcode == TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE
+                || opcode == TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE_WIDE
+            {
                 crate::observe::fail(format!(
                     "compute_stage_tex view_fail reason=buffer_texture_unsupported ref={texture_ref} opcode={opcode} desc_len={}",
                     desc.len()

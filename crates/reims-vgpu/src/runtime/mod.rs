@@ -13,8 +13,16 @@ pub mod census;
 /// boundary, which is 82% of it.
 pub mod chain_phase;
 /// Product-path compute bind/dispatch (pipeline + buffers + direct dispatch).
+// See the note on `backend::metal`: `Status` is a 264-byte `Copy` payload
+// carried on failure paths, and boxing it would cost the refusal vocabulary
+// that makes each one greppable.
+#[allow(clippy::result_large_err, clippy::large_enum_variant)]
 pub mod compute_exec;
 /// Multi-record compute encoder session (control-flow SPI + ICB execute).
+// See the note on `backend::metal`: `Status` is a 264-byte `Copy` payload
+// carried on failure paths, and boxing it would cost the refusal vocabulary
+// that makes each one greppable.
+#[allow(clippy::result_large_err, clippy::large_enum_variant)]
 pub mod compute_session;
 pub mod decode;
 pub mod drain;
@@ -51,6 +59,10 @@ pub mod mapper;
 /// Write host BGRA into guest mapping pages (render writeback).
 pub mod mapping_write;
 /// Metal draw encode + writeback when MTLBs resolve.
+// See the note on `backend::metal`: `Status` is a 264-byte `Copy` payload
+// carried on failure paths, and boxing it would cost the refusal vocabulary
+// that makes each one greppable.
+#[allow(clippy::result_large_err, clippy::large_enum_variant)]
 pub mod metal_draw;
 /// generateMipmaps for multi-mip type-2/3 linear textures.
 pub mod mipmap;

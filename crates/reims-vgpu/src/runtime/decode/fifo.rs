@@ -208,8 +208,9 @@ pub struct SynchronizeResourcesCommand {
 
 /// Decode CmdInvalidateResources: header `{task_id, count}` + `count × {object_id, flags}`.
 ///
-/// Guest `pageBacking` always writes count=1 and flags=`0x1000001` on this kext; decoder
-/// still accepts count>1 when the payload is long enough (forward-compatible).
+/// Guest `pageBacking` always writes count=1 and flags=`0x1000001` on the observed
+/// guest driver; decoder still accepts count>1 when the payload is long enough
+/// (forward-compatible).
 pub fn decode_invalidate_resources(payload: &[u8]) -> Option<InvalidateResourcesCommand> {
     if payload.len() < CHILD_RESOURCE_LIST_HEADER_LEN as usize {
         return None;
@@ -264,9 +265,9 @@ pub fn decode_invalidate_resources(payload: &[u8]) -> Option<InvalidateResources
 pub struct ExecResourceDesc {
     pub object_id: u32,
     pub ops: InvalidateValidityOps,
-    /// Bytes `+0x08..0x18`. Zeroed by the Ventura 13.7.8 x86 kext; kept raw
-    /// rather than dropped so a build that populates them is visible instead of
-    /// silently discarded.
+    /// Bytes `+0x08..0x18`. Zeroed by the Ventura 13.7.8 x86 guest driver; kept
+    /// raw rather than dropped so a build that populates them is visible instead
+    /// of silently discarded.
     pub tail: [u8; CHILD_EXEC_RESOURCE_TAIL_LEN as usize],
 }
 

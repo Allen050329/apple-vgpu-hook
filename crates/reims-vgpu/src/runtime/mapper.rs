@@ -562,6 +562,35 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
         }
     };
 
+    // The count that carried `build_table_plan`'s second candidate to its
+    // deletion, kept because it is what would falsify that deletion.
+    //
+    // That function used to chase `MappingInternal` `+0x48` then `+0xb8`, and
+    // `+0x50` then `+0x28`, taking whichever parsed first. The question was
+    // whether that is a "try both, keep the one that works" ladder or two
+    // layouts handled side by side, and it turns on how often both fields are
+    // populated at once: never, and it dispatches; always, and it chooses.
+    //
+    // Measured **223 successful resolves across two driven arm64 workloads**,
+    // and both fields held a kernel VA on every single one while `+0x48` won
+    // every single one. So it chose, always the same way, and the second chase
+    // never carried a resolve — which is a fallback, and it is gone.
+    //
+    // `iosurface_pt_cand_both` therefore stays as the premise's alarm rather
+    // than as a tally: it should keep reading equal to
+    // `iosurface_pt_cand_only_48 + itself`, i.e. essentially 100%. A run where
+    // `only_48` grows means the two fields are *not* both always populated,
+    // which is the reading under which the deleted chase was load-bearing.
+    //
+    // This rail is arm64-only — it is entered from `capture_at_producer`, which
+    // needs `HostOps::read_xreg`, and the x86 PCI shim returns -1 for that
+    // unconditionally — so only an arm64 boot can move these.
+    crate::runtime::drain::note_store_route(if plan.candidates.other_field_populated {
+        "iosurface_pt_cand_both"
+    } else {
+        "iosurface_pt_cand_only_48"
+    });
+
     // Read before the `get_mut` below takes `state` mutably.
     let page_shift = state.page_shift;
     let mut retired = None;

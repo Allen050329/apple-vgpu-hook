@@ -239,9 +239,61 @@ fn present_surface_id(opcode: u16, payload: &[u8]) -> Option<u32> {
 ///
 /// What survives is the one thing a static reading cannot promise for a guest
 /// this device does not ship: that the payload keeps its declared size. A longer
-/// one means a plane list has appeared and this decode has become a truncation,
-/// so it is an always-on alarm rather than a sample budget. Under-length is
-/// already refused by [`present_surface_id`], which is where it costs a present.
+/// one means this decode has become a truncation, so it is an always-on alarm
+/// rather than a sample budget. Under-length is already refused by
+/// [`present_surface_id`], which is where it costs a present.
+///
+/// # The plane-list reading is op6/op7's, and only op6/op7's
+///
+/// Everything above is about `submitTransaction`, which is what op6
+/// `CmdDisplayTransaction3` and its gamma variant op7 emit. **op8
+/// `CmdDisplaySwapMapping` does not serialize a transaction at all** — it names
+/// a single mapping, as [`display_txn_trailer_slots`] says — so it has no plane
+/// list to grow and "a plane list may have appeared" cannot be true of it.
+///
+/// That distinction is not hypothetical. op8 is the arm64 present path, and on
+/// a driven arm64 boot this alarm fires on **every present**, 1 668 times in
+/// 212 s, always as `op=0x8 plen=40 trailer=12`. The message it printed was an
+/// explanation that structurally could not apply, on a first-class pathway's
+/// normal traffic. What is true there is narrower and is what it says now: 28
+/// bytes past the words this device knows, contents unnamed.
+///
+/// So the line carries the undecoded tail's bytes. It is latched per
+/// `(opcode, length)` and therefore costs one line per shape per boot, and
+/// without them a reader who sees this alarm has to rebuild and reboot before
+/// learning anything at all — which is what closing the gap actually needs.
+///
+/// # What the arm64 guest actually puts there
+///
+/// Measured, and deliberately not interpreted. On two boots at 1920×1080 the
+/// tail is byte-identical and there is exactly **one** `(opcode, length)` shape
+/// in the whole boot — `op=0x8 plen=40` — so this is what every present on this
+/// pathway carries:
+///
+/// ```text
+/// +0x0c  00 00 00 00
+/// +0x10  00 40 10 00
+/// +0x14  00 00 00 00
+/// +0x18  00 40 00 00
+/// +0x1c  00 00 00 00
+/// +0x20  01 01 00 00
+/// +0x24  00 00 40 48
+/// ```
+///
+/// No field here is named, and none should be until it has been made to move.
+/// Read as little-endian `u32` the non-zero words are `0x00104000`, `0x00004000`,
+/// `0x00000101` and `0x48400000`, and it is tempting to call the second one the
+/// 16 KiB arm64 page size and the first a page-aligned length because
+/// `0x104000 / 0x4000` is exactly 65. That is arithmetic agreeing with a guess,
+/// which is not a derivation — every one of those words is also consistent with
+/// a stride, an extent, a pair of `u16`s, or a `f32` (`0x48400000` is 196608.0).
+///
+/// **The experiment that would settle it is a display mode change.** Change the
+/// guest's resolution, take the alarm's line again — the latch is keyed on
+/// length, so a second mode at the same length needs the latch cleared or a
+/// second boot — and diff the seven words. Whatever tracks width, height or
+/// stride identifies itself immediately. Nothing short of that should turn
+/// these into named fields.
 fn note_display_txn_payload(state: &mut DeviceState, channel_id: u32, packet: &Packet) {
     let plen = packet.payload.len();
     let trailer = display_txn_trailer_len(packet.opcode);
@@ -258,11 +310,31 @@ fn note_display_txn_payload(state: &mut DeviceState, channel_id: u32, packet: &P
     {
         return;
     }
+    // Bounded, because the length is the guest's. 64 bytes is four times the
+    // largest trailer here and is enough to show the shape of whatever follows.
+    const TAIL_DUMP_MAX: usize = 64;
+    let tail = &packet.payload[trailer..];
+    let shown = tail.len().min(TAIL_DUMP_MAX);
+    let mut hex = String::with_capacity(shown * 3);
+    for b in &tail[..shown] {
+        hex.push_str(&format!("{b:02x}"));
+    }
+    let what = if packet.opcode == CHILD_OP_DISPLAY_SWAP {
+        // No transaction is serialized here, so there is no plane list this
+        // could be. Naming one would send the next reader looking for a
+        // structure that cannot exist on this command.
+        "this command names a single mapping and serializes no transaction, so these \
+         bytes are not a plane list and nothing in this device names them"
+    } else {
+        "the command carries more than its declared trailer, so a plane list may have \
+         appeared and decoding a single surface id would be dropping planes"
+    };
     crate::observe::fail(format!(
         "display_txn_payload_overlong op={:#x} ch={channel_id} plen={plen} trailer={trailer} \
-         (the command carries more than its declared trailer, so a plane list may have appeared \
-         and decoding a single surface id would be dropping planes)",
-        packet.opcode
+         undecoded={} tail=0x{hex}{} ({what})",
+        packet.opcode,
+        tail.len(),
+        if shown < tail.len() { "..." } else { "" },
     ));
 }
 
@@ -2234,8 +2306,8 @@ fn process_child_packet<H: HostMemory + HostOps>(
                 // the broad implementation is not kept around to be switched
                 // back on. See kb map-memory2 / xnu-pte-corruption-windowserver.
             } else if packet.opcode == CHILD_OP_DELETE_IOSURFACE_BACKING2 && plen >= 8 {
-                // Live Ventura payload + current-kext symbol agree with the
-                // resource contract: `{objectID, taskID}`. This is the lifetime
+                // The live Ventura payload agrees with the resource contract:
+                // `{objectID, taskID}`. This is the lifetime
                 // boundary for the host IOSurface backing, not stamp-only
                 // bookkeeping. Keeping page_entries after it lets later id
                 // reuse/clear write pixels into pages the guest has recycled.
@@ -2538,6 +2610,8 @@ fn process_child_packet<H: HostMemory + HostOps>(
                 channel: channel_id,
                 opcode: packet.opcode,
                 total_size: packet.total_size,
+                stamp_count: packet.stamp_count,
+                payload: packet.payload.clone(),
             });
         }
     }
@@ -2829,11 +2903,17 @@ pub fn drain_iosfc<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut 
                     if let Some(c) = cap {
                         state.mapper_capture = Some(c);
                     }
-                    // Unknown mapper request: fail-visible, still advance.
+                    // Unknown mapper request: fail-visible, still advance. A
+                    // mapper ring entry is not a FIFO packet — it carries no
+                    // stamps and no payload span — so the two packet-shaped
+                    // fields report the absence rather than borrowing the
+                    // entry's bytes and implying a framing it does not have.
                     state.record_fail(FailEvent::UnknownChildOpcode {
                         channel: 0,
                         opcode: rtype as u16,
                         total_size: MAPPER_REQUEST_ENTRY_LEN as u32,
+                        stamp_count: 0,
+                        payload: Vec::new(),
                     });
                 }
             }

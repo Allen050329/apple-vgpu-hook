@@ -1,44 +1,80 @@
 //! Compute command decoder (port of `host/utils/reims-vgpu-compute-decode`).
 
 use crate::contract::endian::{ld16, ld32, ld64};
+use reims_vgpu_wire::ops::compute as wire;
 
-pub const MAX_BIND_ENTRIES: usize = 128;
-pub const HEADER_LEN: usize = 8;
+/// Map a `reims-vgpu-wire` view onto a payload, translating its refusal.
+///
+/// Same arrangement as `decode::blit` and `decode::render`: the layout lives in
+/// that crate, derived from Apple's own serializer and pinned by a fixture, and
+/// this module reads it rather than restating it. A view that does not fit is a
+/// payload shorter than the record claims, which is `ErrShort`.
+#[inline]
+fn wire_view<T: reims_vgpu_wire::Wire>(payload: &[u8]) -> Result<&T, DecodeStatus> {
+    reims_vgpu_wire::view::<T>(payload).map_err(|_| DecodeStatus::ErrShort)
+}
+
+/// Bytes before a record's payload, from [`reims_vgpu_wire::OP_HEADER_LEN`].
+///
+/// One fact that used to be declared six times — here, in `render`, `compute`,
+/// `blit` and twice in `stream` — all agreeing, with nothing comparing them.
+/// Re-exporting makes drift impossible rather than merely detectable, which is
+/// the move `contract::gva` already made for the page-table format.
+pub use reims_vgpu_wire::OP_HEADER_LEN as HEADER_LEN;
 pub const SIZE3_SIZE: usize = 24;
 
+/// Residency on the compute rail, and the one pair here with no selector
+/// behind it.
+///
+/// `PGSerializerComputeCommandEncoder` on `AppleParavirtGPUMetal` 64.4.7 ships
+/// **no `useHeaps:` or `useResources:` selector at all** — the class's 58
+/// selectors are enumerated in `reims_vgpu_wire::manifest`, and residency is
+/// not among them. So nothing in the userspace serializer produces these two
+/// numbers on this build, which is why `compute_noop_residency_hint` reads zero
+/// on a driven boot.
+///
+/// That is a reason to leave the arm alone rather than to delete it: a decoded
+/// arm that never fires is contract fidelity, and this one is already visible
+/// through its counter. What it is *not* is a source for these numbers
+/// elsewhere. `runtime::decode::render` carried `0x86`/`0x87` as its residency
+/// pair until it was measured against the serializer, which emits `0x1b` and
+/// `0x89` for the render encoder's four residency selectors; the numbers here
+/// are the likeliest origin of that copy, and they have no more support than
+/// the ones it replaced. Do not propagate them to a third rail without a
+/// capture.
 pub const OP_USE_HEAPS: u32 = 0x86;
 pub const OP_USE_RESOURCES: u32 = 0x87;
-pub const OP_DISPATCH_THREADGROUPS: u32 = 0xc8;
-pub const OP_DISPATCH_THREADGROUPS_INDIRECT: u32 = 0xc9;
-pub const OP_DISPATCH_THREADS: u32 = 0xca;
-pub const OP_SET_BUFFERS: u32 = 0xcb;
-pub const OP_SET_SAMPLERS: u32 = 0xcc;
-pub const OP_SET_SAMPLERS_LOD: u32 = 0xcd;
-pub const OP_SET_TEXTURES: u32 = 0xce;
-pub const OP_SET_BUFFER_OFFSET: u32 = 0xcf;
-pub const OP_SET_PIPELINE: u32 = 0xd0;
-pub const OP_SET_STAGE_IN_REGION: u32 = 0xd1;
-pub const OP_SET_STAGE_IN_REGION_INDIRECT: u32 = 0xd2;
-pub const OP_SET_THREADGROUP_MEMORY_LENGTH: u32 = 0xd3;
-pub const OP_UPDATE_FENCE: u32 = 0xd4;
-pub const OP_WAIT_FENCE: u32 = 0xd5;
-pub const OP_BARRIER_RESOURCES: u32 = 0xd6;
-pub const OP_BARRIER_SCOPE: u32 = 0xd7;
-pub const OP_SET_IMAGEBLOCK_DIMENSIONS: u32 = 0xd8;
-pub const OP_SET_BUFFERS_ATTRIBUTE_STRIDE: u32 = 0xd9;
-pub const OP_SET_BUFFER_OFFSET_ATTRIBUTE_STRIDE: u32 = 0xda;
-pub const OP_DISPATCH_TYPE: u32 = 0xdb;
-pub const OP_ENCODE_START_DO_WHILE: u32 = 0xdc;
-pub const OP_ENCODE_END_DO_WHILE: u32 = 0xdd;
-pub const OP_ENCODE_START_WHILE: u32 = 0xde;
-pub const OP_ENCODE_END_WHILE: u32 = 0xdf;
-pub const OP_ENCODE_START_IF: u32 = 0xe0;
-pub const OP_ENCODE_START_ELSE: u32 = 0xe1;
-pub const OP_ENCODE_END_IF: u32 = 0xe2;
-pub const OP_INSERT_COMPRESSED_TEXTURE_FLUSH: u32 = 0xe3;
-pub const OP_EXECUTE_COMMANDS_IN_BUFFER: u32 = 0xe4;
-pub const OP_EXECUTE_COMMANDS_IN_BUFFER_INDIRECT: u32 = 0xe5;
-pub const OP_DISPATCH_THREADS_INDIRECT: u32 = 0xe6;
+pub const OP_DISPATCH_THREADGROUPS: u32 = wire::OPCODE_DISPATCH_THREADGROUPS;
+pub const OP_DISPATCH_THREADGROUPS_INDIRECT: u32 = wire::OPCODE_DISPATCH_THREADGROUPS_INDIRECT;
+pub const OP_DISPATCH_THREADS: u32 = wire::OPCODE_DISPATCH_THREADS;
+pub const OP_SET_BUFFERS: u32 = wire::OPCODE_SET_BUFFER;
+pub const OP_SET_SAMPLERS: u32 = wire::OPCODE_SET_SAMPLER;
+pub const OP_SET_SAMPLERS_LOD: u32 = wire::OPCODE_SET_SAMPLER_LOD;
+pub const OP_SET_TEXTURES: u32 = wire::OPCODE_SET_TEXTURE;
+pub const OP_SET_BUFFER_OFFSET: u32 = wire::OPCODE_SET_BUFFER_OFFSET;
+pub const OP_SET_PIPELINE: u32 = wire::OPCODE_SET_PIPELINE_STATE;
+pub const OP_SET_STAGE_IN_REGION: u32 = wire::OPCODE_SET_STAGE_IN_REGION;
+pub const OP_SET_STAGE_IN_REGION_INDIRECT: u32 = wire::OPCODE_SET_STAGE_IN_REGION_INDIRECT;
+pub const OP_SET_THREADGROUP_MEMORY_LENGTH: u32 = wire::OPCODE_SET_THREADGROUP_MEMORY_LENGTH;
+pub const OP_UPDATE_FENCE: u32 = wire::OPCODE_UPDATE_FENCE;
+pub const OP_WAIT_FENCE: u32 = wire::OPCODE_WAIT_FOR_FENCE;
+pub const OP_BARRIER_RESOURCES: u32 = wire::OPCODE_MEMORY_BARRIER_RESOURCES;
+pub const OP_BARRIER_SCOPE: u32 = wire::OPCODE_MEMORY_BARRIER_SCOPE;
+pub const OP_SET_IMAGEBLOCK_DIMENSIONS: u32 = wire::OPCODE_SET_IMAGEBLOCK_SIZE;
+pub const OP_SET_BUFFERS_ATTRIBUTE_STRIDE: u32 = wire::OPCODE_SET_BUFFER_STRIDE;
+pub const OP_SET_BUFFER_OFFSET_ATTRIBUTE_STRIDE: u32 = wire::OPCODE_SET_BUFFER_OFFSET_STRIDE;
+pub const OP_DISPATCH_TYPE: u32 = wire::OPCODE_WRITE_DESCRIPTOR;
+pub const OP_ENCODE_START_DO_WHILE: u32 = wire::OPCODE_START_DO_WHILE;
+pub const OP_ENCODE_END_DO_WHILE: u32 = wire::OPCODE_END_DO_WHILE;
+pub const OP_ENCODE_START_WHILE: u32 = wire::OPCODE_START_WHILE;
+pub const OP_ENCODE_END_WHILE: u32 = wire::OPCODE_END_WHILE;
+pub const OP_ENCODE_START_IF: u32 = wire::OPCODE_START_IF;
+pub const OP_ENCODE_START_ELSE: u32 = wire::OPCODE_START_ELSE;
+pub const OP_ENCODE_END_IF: u32 = wire::OPCODE_END_IF;
+pub const OP_INSERT_COMPRESSED_TEXTURE_FLUSH: u32 = wire::OPCODE_INSERT_COMPRESSED_TEXTURE_FLUSH;
+pub const OP_EXECUTE_COMMANDS_IN_BUFFER: u32 = wire::OPCODE_EXECUTE_COMMANDS_RANGE;
+pub const OP_EXECUTE_COMMANDS_IN_BUFFER_INDIRECT: u32 = wire::OPCODE_EXECUTE_COMMANDS_INDIRECT;
+pub const OP_DISPATCH_THREADS_INDIRECT: u32 = wire::OPCODE_DISPATCH_THREADS_INDIRECT;
 
 pub const REJECTED_85: u32 = 0x85;
 pub const REJECTED_88: u32 = 0x88;
@@ -50,23 +86,42 @@ const REF_SIZE: usize = 4;
 const BUF_ENTRY: usize = 12;
 const BUF_STRIDE_ENTRY: usize = 20;
 const SAMPLER_LOD_ENTRY: usize = 12;
-const BUF_OFF_LEN: usize = 0x14;
-const BUF_OFF_STRIDE_LEN: usize = 0x1c;
-const DISPATCH_DIRECT_LEN: usize = HEADER_LEN + 2 * SIZE3_SIZE;
-const DISPATCH_INDIRECT_LEN: usize = HEADER_LEN + SIZE3_SIZE + 8 + 4;
-const DISPATCH_THREADS_INDIRECT_LEN: usize = 0x14;
-const STAGE_IN_LEN: usize = HEADER_LEN + 2 * SIZE3_SIZE;
-const STAGE_IN_INDIRECT_LEN: usize = 0x14;
-const TG_MEM_LEN: usize = 0x14;
-const FENCE_LEN: usize = HEADER_LEN + 4;
-const BARRIER_SCOPE_LEN: usize = HEADER_LEN + 4;
-const IMAGEBLOCK_LEN: usize = 0x10;
-const DISPATCH_TYPE_LEN: usize = HEADER_LEN + 4;
-const CONDITION_LEN: usize = 0x1c;
-const EXECUTE_LEN: usize = 0x1c;
-const EXECUTE_INDIRECT_LEN: usize = 0x18;
-const EMPTY_LEN: usize = HEADER_LEN;
-const PIPELINE_LEN: usize = HEADER_LEN + 4;
+const BUF_OFF_LEN: usize = wire::SET_BUFFER_OFFSET_TOTAL_LEN as usize;
+const BUF_OFF_STRIDE_LEN: usize = wire::SET_BUFFER_OFFSET_STRIDE_TOTAL_LEN as usize;
+/// Header plus two `Size3`, and taken from the crate that pins it.
+const DISPATCH_DIRECT_LEN: usize = wire::DISPATCH_TOTAL_LEN as usize;
+/// Header, one `Size3`, a `u64` offset and a `u32` ref.
+const DISPATCH_INDIRECT_LEN: usize = wire::DISPATCH_THREADGROUPS_INDIRECT_TOTAL_LEN as usize;
+/// Header, a `u64` offset and a `u32` ref — no threadgroup size, unlike its
+/// threadgroup-granular sibling. Taken from the crate that pins it.
+const DISPATCH_THREADS_INDIRECT_LEN: usize = wire::DISPATCH_THREADS_INDIRECT_TOTAL_LEN as usize;
+/// Header plus two `Size3` — the region's size and its origin.
+const STAGE_IN_LEN: usize = wire::SET_STAGE_IN_REGION_TOTAL_LEN as usize;
+const STAGE_IN_INDIRECT_LEN: usize = wire::SET_STAGE_IN_REGION_INDIRECT_TOTAL_LEN as usize;
+const TG_MEM_LEN: usize = wire::SET_THREADGROUP_MEMORY_LENGTH_TOTAL_LEN as usize;
+const FENCE_LEN: usize = wire::FENCE_TOTAL_LEN as usize;
+const BARRIER_SCOPE_LEN: usize = wire::MEMORY_BARRIER_SCOPE_TOTAL_LEN as usize;
+const IMAGEBLOCK_LEN: usize = wire::SET_IMAGEBLOCK_SIZE_TOTAL_LEN as usize;
+const DISPATCH_TYPE_LEN: usize = wire::WRITE_DESCRIPTOR_TOTAL_LEN as usize;
+/// The condition record's length, from the crate that derived it.
+///
+/// Was `0x1c` written here. It is the same number, and that is the point: the
+/// two agreed by luck for as long as nobody could check, because
+/// `-setSupportsCommandBufferJump:` defaults off and the capture recorded all
+/// seven control-flow selectors as emitting nothing at all.
+const CONDITION_LEN: usize = wire::CONTROL_FLOW_PREDICATE_TOTAL_LEN as usize;
+const EXECUTE_LEN: usize = wire::EXECUTE_COMMANDS_RANGE_TOTAL_LEN as usize;
+const EXECUTE_INDIRECT_LEN: usize = wire::EXECUTE_COMMANDS_INDIRECT_TOTAL_LEN as usize;
+/// A control-flow marker is the header alone; the crate that derived the
+/// predicate form derived this one beside it.
+///
+/// `insertCompressedTextureReinterpretationFlush` shares this arm and is a
+/// different family with its own derivation, so its length is asserted equal
+/// rather than assumed: two records being the header alone is a fact about each
+/// one, not a fact they share.
+const EMPTY_LEN: usize = wire::CONTROL_FLOW_MARKER_TOTAL_LEN as usize;
+const _: () = assert!(EMPTY_LEN == wire::INSERT_COMPRESSED_TEXTURE_FLUSH_TOTAL_LEN as usize);
+const PIPELINE_LEN: usize = wire::SET_PIPELINE_STATE_TOTAL_LEN as usize;
 
 /// Why the compute decoder refused a command.
 ///
@@ -78,7 +133,6 @@ pub enum DecodeStatus {
     ErrShort,
     ErrUnknownOpcode,
     ErrUnsupportedOpcode,
-    ErrTooManyBindings,
 }
 
 impl crate::observe::Refusal for DecodeStatus {
@@ -92,7 +146,6 @@ impl crate::observe::Refusal for DecodeStatus {
             Self::ErrShort => "compute_decode_short",
             Self::ErrUnknownOpcode => "compute_decode_unknown_opcode",
             Self::ErrUnsupportedOpcode => "compute_decode_unsupported_opcode",
-            Self::ErrTooManyBindings => "compute_decode_too_many_bindings",
         })
     }
 }
@@ -209,7 +262,6 @@ pub struct Command {
     pub resource_usage: u32,
     pub fence_ref: u32,
     pub barrier_scope: u16,
-    pub barrier_scope_reserved: u16,
     pub condition_buffer_ref: u32,
     pub condition_buffer_offset: u64,
     pub condition_comparison: u32,
@@ -282,6 +334,49 @@ fn decode_size3(p: &[u8]) -> Size3 {
     }
 }
 
+/// Whether a variable-length record's declared length is exactly what `count`
+/// entries of `stride` need.
+///
+/// **A bind record is bounded by its own length and by nothing else.** Seven
+/// call sites used to test `count > MAX_BIND_ENTRIES` first and refuse the whole
+/// record with `ErrTooManyBindings`; the constant was 128 and carried no
+/// citation. `runtime::decode::render` removed the identical check for the
+/// identical reason — its cap was 32 and refused a 40-slot texture bind Apple's
+/// serializer really produces, dropping all forty rather than the eight that
+/// would not fit — and `bind_record_len` there states the rule this doc now
+/// states here.
+///
+/// The cap was also redundant, which is why removing it costs no safety. The
+/// count is never trusted before this check, `command_length <= command.len()`
+/// is established at the top of [`decode`], and the arithmetic below is done in
+/// `u64` and bounded at `u32::MAX`, so nothing is read or pushed until the
+/// entries are known to be inside the record the guest itself sized. What the
+/// cap added was a second, lower bound with no derivation behind it.
+///
+/// Which index a backend can actually bind is a *backend* question and is
+/// already answered there — `REIMS_VGPU_METAL_MAX_BUFFERS` and
+/// `valid_buffer_binding` on the Metal arm, the descriptor-set limits on the
+/// Vulkan one. A decoder that pre-empts them refuses guest work neither of them
+/// would have.
+///
+/// **The limit those caps were reaching for has since been measured, and it is
+/// three numbers rather than one** — see [`reims_vgpu_wire::ops::bind_limit`],
+/// where fixtures pin them. Apple's serializer truncates a plural bind's range
+/// at the stage's argument table: 128 textures, **31** buffers, 16 samplers,
+/// with the bound falling on `first + count` rather than on `count`.
+///
+/// That is the sharper reason a single `MAX_BIND_ENTRIES` could not have been
+/// right at these seven sites. The compute rail's 128 was correct for the two
+/// texture sites and four times too permissive for the buffer ones; the render
+/// rail's 32 was above the buffer limit and a quarter of the texture one, which
+/// is the half that fired. A cap that is too permissive never refuses anything
+/// and so never looks wrong.
+///
+/// It does **not** license reinstating them as three constants. These describe
+/// what Apple's serializer *emits*; they are not a validity check on bytes
+/// arriving from a guest, and refusing a record for declaring more entries than
+/// Apple currently writes loses every bind in it the first time a limit moves.
+/// The record's own declared length is the bound, and it always was.
 fn var_len(cmd_len: usize, base: usize, count: u32, stride: usize) -> bool {
     let expected = base as u64 + (count as u64) * (stride as u64);
     expected <= u32::MAX as u64 && cmd_len == expected as usize
@@ -318,9 +413,6 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
                 return Err(DecodeStatus::ErrShort);
             }
             let count = ld32(&payload[0..]);
-            if count as usize > MAX_BIND_ENTRIES {
-                return Err(DecodeStatus::ErrTooManyBindings);
-            }
             if !var_len(command_length, COUNT_BASE, count, REF_SIZE) {
                 return Err(DecodeStatus::ErrShort);
             }
@@ -338,9 +430,6 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
                 return Err(DecodeStatus::ErrShort);
             }
             let count = ld32(&payload[0..]);
-            if count as usize > MAX_BIND_ENTRIES {
-                return Err(DecodeStatus::ErrTooManyBindings);
-            }
             if !var_len(command_length, BIND_BASE, count, REF_SIZE) {
                 return Err(DecodeStatus::ErrShort);
             }
@@ -367,9 +456,6 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
                 return Err(DecodeStatus::ErrShort);
             }
             let count = ld32(&payload[4..]);
-            if count as usize > MAX_BIND_ENTRIES {
-                return Err(DecodeStatus::ErrTooManyBindings);
-            }
             if !var_len(command_length, BIND_BASE, count, BUF_ENTRY) {
                 return Err(DecodeStatus::ErrShort);
             }
@@ -391,9 +477,6 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
                 return Err(DecodeStatus::ErrShort);
             }
             let count = ld32(&payload[4..]);
-            if count as usize > MAX_BIND_ENTRIES {
-                return Err(DecodeStatus::ErrTooManyBindings);
-            }
             if !var_len(command_length, BIND_BASE, count, BUF_STRIDE_ENTRY) {
                 return Err(DecodeStatus::ErrShort);
             }
@@ -420,9 +503,6 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
                 return Err(DecodeStatus::ErrShort);
             }
             let count = ld32(&payload[4..]);
-            if count as usize > MAX_BIND_ENTRIES {
-                return Err(DecodeStatus::ErrTooManyBindings);
-            }
             if !var_len(command_length, BIND_BASE, count, REF_SIZE) {
                 return Err(DecodeStatus::ErrShort);
             }
@@ -452,9 +532,6 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
                 return Err(DecodeStatus::ErrShort);
             }
             let count = ld32(&payload[4..]);
-            if count as usize > MAX_BIND_ENTRIES {
-                return Err(DecodeStatus::ErrTooManyBindings);
-            }
             if !var_len(command_length, BIND_BASE, count, SAMPLER_LOD_ENTRY) {
                 return Err(DecodeStatus::ErrShort);
             }
@@ -518,9 +595,16 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             if command_length != DISPATCH_THREADS_INDIRECT_LEN {
                 return Err(DecodeStatus::ErrShort);
             }
+            // These offsets were ported with no derivation recorded and nothing
+            // could confirm them: the selector asserts at the default capability
+            // state, so no capture reached it. Driven under
+            // `-setSupportsDispatchThreadsIndirect:` they are right, and reading
+            // the derived view is what keeps them one declaration rather than
+            // two that happen to agree.
+            let d = wire_view::<wire::DispatchThreadsIndirect>(payload)?;
             out.kind = Kind::DispatchThreadsIndirect;
-            out.indirect_buffer_offset = ld64(&payload[0..]);
-            out.indirect_buffer_ref = ld32(&payload[8..]);
+            out.indirect_buffer_offset = d.indirect_buffer_offset.get();
+            out.indirect_buffer_ref = d.indirect_buffer_ref.get();
             Ok(out)
         }
         OP_SET_STAGE_IN_REGION => {
@@ -563,33 +647,45 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             Ok(out)
         }
         OP_BARRIER_RESOURCES => {
-            if command_length < BIND_BASE {
+            // `memoryBarrierWithResources:count:` is count-led with the refs
+            // immediately after, at [`COUNT_BASE`]. This arm used to start at
+            // [`BIND_BASE`], four bytes further on, and so demanded a record
+            // four bytes longer than the serializer writes -- which refused
+            // *every* compute resource barrier with `ErrShort` before any
+            // executor saw one. The four bytes it read as a usage mask were the
+            // first resource's ref: the compute selector takes no stage masks
+            // where the render encoder's does, and the record is shorter rather
+            // than zero-filled. Fixture `compute_memory_barrier_resources` in
+            // `reims-vgpu-wire`.
+            if command_length < COUNT_BASE {
                 return Err(DecodeStatus::ErrShort);
             }
             let count = ld32(&payload[0..]);
-            if count as usize > MAX_BIND_ENTRIES {
-                return Err(DecodeStatus::ErrTooManyBindings);
-            }
-            if !var_len(command_length, BIND_BASE, count, REF_SIZE) {
+            if !var_len(command_length, COUNT_BASE, count, REF_SIZE) {
                 return Err(DecodeStatus::ErrShort);
             }
             out.kind = Kind::BarrierResources;
             out.count = count;
-            out.resource_usage = ld32(&payload[4..]);
             for i in 0..count as usize {
                 out.resources.push(RefBinding {
-                    ref_: ld32(&payload[8 + i * REF_SIZE..]),
+                    ref_: ld32(&payload[4 + i * REF_SIZE..]),
                 });
             }
             Ok(out)
         }
         OP_BARRIER_SCOPE => {
+            // Two bytes of the four-byte payload are written and two are not:
+            // `compute_memory_barrier_scope` came back `04 00 AA AA` against
+            // the oracle's poison. On a real wire those two hold whatever the
+            // guest's ring last contained, so they belong to no field -- this
+            // arm used to lift them into `barrier_scope_reserved`, which was a
+            // decoder reading noise. The render encoder's scope barrier fills
+            // all four, because it has two stage masks to put there.
             if command_length != BARRIER_SCOPE_LEN {
                 return Err(DecodeStatus::ErrShort);
             }
             out.kind = Kind::BarrierScope;
             out.barrier_scope = ld16(&payload[0..]);
-            out.barrier_scope_reserved = ld16(&payload[2..]);
             Ok(out)
         }
         OP_SET_IMAGEBLOCK_DIMENSIONS => {
@@ -609,22 +705,36 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             out.dispatch_type = ld32(payload);
             Ok(out)
         }
-        // Condition payloads live on start-while / start-if / *end*-do-while
-        // (MetalSerializer + Reims VGPU surface: start-do-while is empty; end-do-while carries
-        // buffer/offset/comparison/referenceValue). See compute-surface-manifest.
+        // Condition payloads live on start-while / start-if / *end*-do-while;
+        // start-do-while is empty and its condition is on the record that ends
+        // the loop, which is the one asymmetry in the seven.
+        //
+        // The layout came from a ported header with no derivation recorded, and
+        // `compute_ctrl_seen` has never fired on a driven boot — so for a long
+        // time nothing said whether it was right. It now reads Apple's own
+        // struct: `-setSupportsCommandBufferJump:` gates these selectors, all
+        // seven were being captured with it off and so looked like records the
+        // serializer never writes, and driving them showed this arm had every
+        // offset and every width correct. Reading the view rather than
+        // restating the offsets is what keeps that true — one declaration,
+        // pinned by a fixture, instead of two that agree today.
         OP_ENCODE_START_WHILE | OP_ENCODE_START_IF | OP_ENCODE_END_DO_WHILE => {
             if command_length != CONDITION_LEN {
                 return Err(DecodeStatus::ErrShort);
             }
+            let p = wire_view::<wire::ControlFlowPredicate>(payload)?;
             out.kind = match opcode {
                 OP_ENCODE_START_WHILE => Kind::ControlStartWhile,
                 OP_ENCODE_START_IF => Kind::ControlStartIf,
                 _ => Kind::ControlEndDoWhile,
             };
-            out.condition_buffer_ref = ld32(&payload[0..]);
-            out.condition_buffer_offset = ld64(&payload[4..]);
-            out.condition_comparison = ld32(&payload[12..]);
-            out.condition_reference_value = ld32(&payload[16..]);
+            out.condition_buffer_ref = p.buffer_ref.get();
+            out.condition_buffer_offset = p.offset.get();
+            // `comparison` is declared `Q` on all three selectors and reaches
+            // the wire as a `u32`. The record's length settles it: 8 + 4 + 8 +
+            // 4 + 4 is exactly 28, with no room for a second `u64`.
+            out.condition_comparison = p.comparison.get();
+            out.condition_reference_value = p.reference_value.get();
             Ok(out)
         }
         OP_ENCODE_START_DO_WHILE
@@ -682,7 +792,6 @@ mod tests {
             DecodeStatus::ErrShort,
             DecodeStatus::ErrUnknownOpcode,
             DecodeStatus::ErrUnsupportedOpcode,
-            DecodeStatus::ErrTooManyBindings,
         ];
         let mut slugs: Vec<&str> = ERRS.iter().filter_map(|s| s.refusal()).collect();
         assert_eq!(slugs.len(), ERRS.len(), "every error variant refuses");
@@ -700,6 +809,51 @@ mod tests {
         st32(&mut v[0..4], op);
         st32(&mut v[4..8], len as u32);
         v
+    }
+
+    /// A bind record above the old `MAX_BIND_ENTRIES = 128` cap decodes, and
+    /// every entry of it survives.
+    ///
+    /// This is the compute half of the bug `runtime::decode::render` fixed by
+    /// deleting its own cap: a well-formed record was refused whole, so a guest
+    /// binding 200 textures lost all 200 rather than the 72 that would not have
+    /// fit. Metal's own per-stage texture limit is 128, but that is the
+    /// *backend's* bound to enforce and it is enforced there — a decoder that
+    /// pre-empts it turns a bind the backend would have clamped into a decode
+    /// failure with a shape slug, which the divergence instrument reads as this
+    /// project having the layout wrong.
+    ///
+    /// 200 rather than 129 so the assertion cannot pass by an off-by-one in a
+    /// bound that is supposed to be gone entirely.
+    #[test]
+    fn a_bind_larger_than_the_deleted_cap_decodes_every_entry() {
+        const COUNT: u32 = 200;
+        let len = BIND_BASE + COUNT as usize * REF_SIZE;
+        let mut v = hdr(OP_SET_TEXTURES, len);
+        st32(&mut v[8..], 0); // first
+        st32(&mut v[12..], COUNT);
+        for i in 0..COUNT as usize {
+            st32(&mut v[BIND_BASE + i * REF_SIZE..], 1000 + i as u32);
+        }
+        let c = decode(&v).expect("a record the guest sized correctly must decode");
+        assert_eq!(c.kind, Kind::TextureBind);
+        assert_eq!(c.count, COUNT);
+        assert_eq!(c.textures.len(), COUNT as usize);
+        assert_eq!(c.textures[0].ref_, 1000);
+        assert_eq!(c.textures[COUNT as usize - 1].ref_, 1000 + COUNT - 1);
+
+        // The record's own length is still the bound, and it is exact: one
+        // entry's worth of slack either way is `ErrShort`, not a silent
+        // truncation. Deleting the cap must not have loosened this.
+        let mut short = v.clone();
+        st32(&mut short[12..], COUNT + 1);
+        assert_eq!(decode(&short).unwrap_err(), DecodeStatus::ErrShort);
+        st32(&mut short[12..], COUNT - 1);
+        assert_eq!(decode(&short).unwrap_err(), DecodeStatus::ErrShort);
+        // A count whose entries would overflow the length arithmetic is refused
+        // by the same check rather than by a cap.
+        st32(&mut short[12..], u32::MAX);
+        assert_eq!(decode(&short).unwrap_err(), DecodeStatus::ErrShort);
     }
 
     #[test]
@@ -778,6 +932,61 @@ mod tests {
         assert!(decode(&hdr(OP_ENCODE_END_DO_WHILE, EMPTY_LEN)).is_err());
     }
 
+    /// The control-flow layout this device uses is Apple's, field for field.
+    ///
+    /// It arrived here as a port with no derivation recorded, and
+    /// `compute_ctrl_seen` has never fired on a driven boot — so nothing said
+    /// whether it was right, and the wire capture could not say either while
+    /// `-setSupportsCommandBufferJump:` was at its default and all seven
+    /// selectors looked like records Apple never writes. Driving them showed
+    /// this arm had every offset and every width correct.
+    ///
+    /// This asserts the offsets against `offset_of!` on the derived struct
+    /// rather than against the numbers that were here, so the check is against
+    /// Apple's layout rather than against this module's memory of it. The
+    /// interesting one is `comparison`: it is `Q` on all three selectors and
+    /// four bytes on the wire, and widening it to match the API would push
+    /// `reference_value` off the end.
+    #[test]
+    fn the_control_flow_condition_is_apples_own_layout() {
+        use core::mem::offset_of;
+
+        assert_eq!(
+            CONDITION_LEN,
+            HEADER_LEN + core::mem::size_of::<wire::ControlFlowPredicate>(),
+            "the condition record is its header plus the derived body"
+        );
+        assert_eq!(offset_of!(wire::ControlFlowPredicate, buffer_ref), 0);
+        assert_eq!(offset_of!(wire::ControlFlowPredicate, offset), 4);
+        assert_eq!(offset_of!(wire::ControlFlowPredicate, comparison), 12);
+        assert_eq!(offset_of!(wire::ControlFlowPredicate, reference_value), 16);
+
+        // All three condition-bearing opcodes read the same body. Driven per
+        // opcode rather than generalized from one, because the three are
+        // separate arms and only the `Kind` is supposed to differ.
+        for (op, kind) in [
+            (OP_ENCODE_START_IF, Kind::ControlStartIf),
+            (OP_ENCODE_START_WHILE, Kind::ControlStartWhile),
+            (OP_ENCODE_END_DO_WHILE, Kind::ControlEndDoWhile),
+        ] {
+            let mut v = hdr(op, CONDITION_LEN);
+            st32(&mut v[HEADER_LEN..], 5151);
+            v[HEADER_LEN + 4..HEADER_LEN + 12].copy_from_slice(&0x1111u64.to_le_bytes());
+            st32(&mut v[HEADER_LEN + 12..], 0x22);
+            st32(&mut v[HEADER_LEN + 16..], 0x89ab_cdef);
+            let c = decode(&v).unwrap_or_else(|e| panic!("op {op:#x}: {e:?}"));
+            assert_eq!(c.kind, kind);
+            assert_eq!(c.condition_buffer_ref, 5151);
+            assert_eq!(c.condition_buffer_offset, 0x1111);
+            // Outside `MTLCompareFunction`'s 0–7 on purpose: the serializer
+            // carries the guest's ordinal verbatim rather than validating or
+            // remapping it, so a reader must treat an out-of-range value as
+            // guest data rather than as impossible.
+            assert_eq!(c.condition_comparison, 0x22);
+            assert_eq!(c.condition_reference_value, 0x89ab_cdef);
+        }
+    }
+
     #[test]
     fn control_if_while_and_icb_lengths() {
         let mut v = hdr(OP_ENCODE_START_IF, CONDITION_LEN);
@@ -804,5 +1013,267 @@ mod tests {
         assert_eq!(c.indirect_command_buffer_ref, 1301);
         assert_eq!(c.indirect_command_range_location, 3);
         assert_eq!(c.indirect_command_range_length, 7);
+    }
+
+    /// A compute resource barrier is the length the serializer writes.
+    ///
+    /// It is `12 + 4 * count`: eight bytes of header, the count, then the refs.
+    /// This arm demanded `16 + 4 * count`, four bytes further on, so every
+    /// barrier a guest issued was refused with `ErrShort` and every resource it
+    /// named was lost — and the four bytes it skipped were the first ref, so a
+    /// record long enough to pass would have read the list shifted by one.
+    ///
+    /// The lengths come from `reims_vgpu_wire::ops::compute`, which pins them
+    /// against bytes Apple's serializer produced. Both directions are asserted:
+    /// the length Apple writes is accepted, and the one this arm used to demand
+    /// is refused.
+    #[test]
+    fn a_resource_barrier_is_the_length_the_serializer_writes() {
+        use crate::contract::endian::st32;
+
+        const COUNT: u32 = 2;
+        let apple_len = COUNT_BASE + (COUNT as usize) * REF_SIZE;
+        assert_eq!(apple_len, 20, "the serializer's own record is 20 bytes");
+
+        let mut v = vec![0u8; apple_len];
+        st32(&mut v[0..], OP_BARRIER_RESOURCES);
+        st32(&mut v[4..], apple_len as u32);
+        st32(&mut v[HEADER_LEN..], COUNT);
+        st32(&mut v[HEADER_LEN + 4..], 5151);
+        st32(&mut v[HEADER_LEN + 8..], 4343);
+
+        let c = decode(&v).expect("the serializer's own record must decode");
+        assert_eq!(c.kind, Kind::BarrierResources);
+        assert_eq!(c.count, COUNT);
+        let refs: Vec<u32> = c.resources.iter().map(|r| r.ref_).collect();
+        assert_eq!(
+            refs,
+            vec![5151, 4343],
+            "the refs start at the count, not four bytes past it"
+        );
+
+        // The length this arm used to require. Nothing writes it, so it must
+        // not be the one that decodes.
+        let old_len = BIND_BASE + (COUNT as usize) * REF_SIZE;
+        let mut v = vec![0u8; old_len];
+        st32(&mut v[0..], OP_BARRIER_RESOURCES);
+        st32(&mut v[4..], old_len as u32);
+        st32(&mut v[HEADER_LEN..], COUNT);
+        assert_eq!(decode(&v).unwrap_err(), DecodeStatus::ErrShort);
+    }
+
+    /// The scope barrier lifts only the bytes the serializer wrote.
+    ///
+    /// `compute_memory_barrier_scope` is `04 00 AA AA` against the oracle's
+    /// poison: two bytes written, two never touched. On a guest's wire those
+    /// two hold whatever the ring last contained, so a field reading them
+    /// reports noise. Poison here stands in for that ring content — if a future
+    /// change grew a field into those bytes, this decodes `0xAAAA` into it.
+    #[test]
+    fn the_scope_barrier_reads_no_byte_the_serializer_left_alone() {
+        use crate::contract::endian::st32;
+
+        let mut v = vec![0xAAu8; BARRIER_SCOPE_LEN];
+        st32(&mut v[0..], OP_BARRIER_SCOPE);
+        st32(&mut v[4..], BARRIER_SCOPE_LEN as u32);
+        v[HEADER_LEN] = 4;
+        v[HEADER_LEN + 1] = 0;
+
+        let c = decode(&v).expect("the serializer's own record must decode");
+        assert_eq!(c.kind, Kind::BarrierScope);
+        assert_eq!(c.barrier_scope, 4);
+        // Everything else the record could carry stays at its default, so no
+        // field picked up the two unwritten bytes.
+        assert_eq!(c.count, 0);
+        assert_eq!(c.resource_usage, 0);
+        assert_eq!(c.fence_ref, 0);
+    }
+
+    /// No compute selector declares residency, so these two opcodes have no
+    /// producer in the serializer.
+    ///
+    /// [`OP_USE_HEAPS`] and [`OP_USE_RESOURCES`] say so in prose; this is the
+    /// statement made executable, against the selector list Apple's runtime
+    /// hands over. If a future build adds `useResources:` to this class, the
+    /// assertion fails and the arm below it needs a capture rather than an
+    /// inherited number.
+    #[test]
+    fn the_compute_encoder_declares_no_residency_selector() {
+        let residency: Vec<&str> = reims_vgpu_wire::manifest::MANIFEST
+            .iter()
+            .filter(|e| e.class == "PGSerializerComputeCommandEncoder")
+            .map(|e| e.selector)
+            .filter(|s| s.starts_with("useHeap") || s.starts_with("useResource"))
+            .collect();
+        assert!(
+            residency.is_empty(),
+            "the compute encoder now ships {residency:?}; OP_USE_HEAPS/\
+             OP_USE_RESOURCES may no longer be assumed"
+        );
+        // The render encoder does ship them, and its opcodes are not these.
+        use reims_vgpu_wire::ops::render as wire;
+        assert_ne!(OP_USE_HEAPS, wire::OPCODE_USE_HEAP);
+        assert_ne!(OP_USE_RESOURCES, wire::OPCODE_USE_RESOURCE);
+    }
+
+    /// Every compute opcode Apple's serializer emits has a constant here, and
+    /// the two this module names beyond them are named as exceptions.
+    ///
+    /// The render sibling of this test can assert plain set equality; this one
+    /// cannot, and the difference is the point. `0x86`/`0x87` have **no selector
+    /// at all** on this class, which is what
+    /// `the_compute_encoder_declares_no_residency_selector` states. They are
+    /// inherited numbers, and they are the pair `runtime::decode::render`
+    /// carried as its residency opcodes until a capture replaced them with
+    /// `0x1b`/`0x89`.
+    ///
+    /// # This list used to hold four, and the other two were a wrong claim
+    ///
+    /// `0xe3`/`0xe6` sat here as "a selector Apple's serializer **refuses**,
+    /// failing an assertion instead of emitting". That was measured, and it was
+    /// measured in one capability state. Both selectors are gated —
+    /// `insertCompressedTextureReinterpretationFlush` on
+    /// `-setSupportsInsertCompressedTextureReinterpretationFlush:`,
+    /// `dispatchThreadsWithIndirectBuffer:indirectBufferOffset:` on
+    /// `-setSupportsDispatchThreadsIndirect:` — and with the flag forced on the
+    /// serializer emits both. They are ordinary derived opcodes now, and the
+    /// layouts this module already read for them turned out to be right.
+    ///
+    /// The lesson is about the *shape* of the old claim rather than its
+    /// content: an assertion is a refusal by this harness's inputs, not by
+    /// Apple, and neither is a claim any single capability state can support.
+    ///
+    /// Keeping the remaining exception explicit is what stops a third from being
+    /// added silently, which is how `0x86`/`0x87` reached a second rail.
+    ///
+    /// The gap direction is the one that costs guest work. An opcode Apple
+    /// emits and this module does not name reaches no arm, and a compute record
+    /// that reaches no arm is a dispatch or a bind that never happened.
+    #[test]
+    fn the_compute_opcode_table_is_apples_compute_manifest_plus_four_named_exceptions() {
+        let derived: &[(u32, &str)] = &[
+            (OP_DISPATCH_THREADGROUPS, "OP_DISPATCH_THREADGROUPS"),
+            (
+                OP_DISPATCH_THREADGROUPS_INDIRECT,
+                "OP_DISPATCH_THREADGROUPS_INDIRECT",
+            ),
+            (OP_DISPATCH_THREADS, "OP_DISPATCH_THREADS"),
+            (OP_SET_BUFFERS, "OP_SET_BUFFERS"),
+            (OP_SET_SAMPLERS, "OP_SET_SAMPLERS"),
+            (OP_SET_SAMPLERS_LOD, "OP_SET_SAMPLERS_LOD"),
+            (OP_SET_TEXTURES, "OP_SET_TEXTURES"),
+            (OP_SET_BUFFER_OFFSET, "OP_SET_BUFFER_OFFSET"),
+            (OP_SET_PIPELINE, "OP_SET_PIPELINE"),
+            (OP_SET_STAGE_IN_REGION, "OP_SET_STAGE_IN_REGION"),
+            (
+                OP_SET_STAGE_IN_REGION_INDIRECT,
+                "OP_SET_STAGE_IN_REGION_INDIRECT",
+            ),
+            (
+                OP_SET_THREADGROUP_MEMORY_LENGTH,
+                "OP_SET_THREADGROUP_MEMORY_LENGTH",
+            ),
+            (OP_UPDATE_FENCE, "OP_UPDATE_FENCE"),
+            (OP_WAIT_FENCE, "OP_WAIT_FENCE"),
+            (OP_BARRIER_RESOURCES, "OP_BARRIER_RESOURCES"),
+            (OP_BARRIER_SCOPE, "OP_BARRIER_SCOPE"),
+            (OP_SET_IMAGEBLOCK_DIMENSIONS, "OP_SET_IMAGEBLOCK_DIMENSIONS"),
+            (
+                OP_SET_BUFFERS_ATTRIBUTE_STRIDE,
+                "OP_SET_BUFFERS_ATTRIBUTE_STRIDE",
+            ),
+            (
+                OP_SET_BUFFER_OFFSET_ATTRIBUTE_STRIDE,
+                "OP_SET_BUFFER_OFFSET_ATTRIBUTE_STRIDE",
+            ),
+            (OP_DISPATCH_TYPE, "OP_DISPATCH_TYPE"),
+            (OP_ENCODE_START_DO_WHILE, "OP_ENCODE_START_DO_WHILE"),
+            (OP_ENCODE_END_DO_WHILE, "OP_ENCODE_END_DO_WHILE"),
+            (OP_ENCODE_START_WHILE, "OP_ENCODE_START_WHILE"),
+            (OP_ENCODE_END_WHILE, "OP_ENCODE_END_WHILE"),
+            (OP_ENCODE_START_IF, "OP_ENCODE_START_IF"),
+            (OP_ENCODE_START_ELSE, "OP_ENCODE_START_ELSE"),
+            (OP_ENCODE_END_IF, "OP_ENCODE_END_IF"),
+            (
+                OP_EXECUTE_COMMANDS_IN_BUFFER,
+                "OP_EXECUTE_COMMANDS_IN_BUFFER",
+            ),
+            (
+                OP_EXECUTE_COMMANDS_IN_BUFFER_INDIRECT,
+                "OP_EXECUTE_COMMANDS_IN_BUFFER_INDIRECT",
+            ),
+            (
+                OP_INSERT_COMPRESSED_TEXTURE_FLUSH,
+                "OP_INSERT_COMPRESSED_TEXTURE_FLUSH",
+            ),
+            (OP_DISPATCH_THREADS_INDIRECT, "OP_DISPATCH_THREADS_INDIRECT"),
+        ];
+
+        // Each exception names the selector that explains it, or `None` when
+        // the class ships no selector for it at all.
+        let unsupported: &[(u32, &str, Option<&str>)] = &[
+            (OP_USE_HEAPS, "OP_USE_HEAPS", None),
+            (OP_USE_RESOURCES, "OP_USE_RESOURCES", None),
+        ];
+
+        let rows = || {
+            reims_vgpu_wire::manifest::MANIFEST
+                .iter()
+                .filter(|e| e.class == "PGSerializerComputeCommandEncoder")
+        };
+        let mut apple: Vec<u32> = rows().flat_map(|e| e.opcodes.iter().copied()).collect();
+        apple.sort_unstable();
+        apple.dedup();
+
+        for (op, name) in derived {
+            assert!(
+                apple.contains(op),
+                "{name} = {op:#x} is not an opcode Apple's compute manifest \
+                 lists, so no capture supports it"
+            );
+        }
+        for op in &apple {
+            assert!(
+                derived.iter().any(|(d, _)| d == op),
+                "Apple's serializer emits compute opcode {op:#x} and this module \
+                 names no constant for it, so every dispatch or bind carrying it \
+                 reaches no arm"
+            );
+        }
+        for (op, name, selector) in unsupported {
+            assert!(
+                !apple.contains(op),
+                "{name} = {op:#x} now has a producer in Apple's manifest and must \
+                 move to the derived roster, taking its decoder arm with it"
+            );
+            match selector {
+                // A refused selector is a measured outcome, so the row must
+                // still be there saying Apple declined to emit it.
+                Some(sel) => {
+                    let row = rows().find(|e| e.selector == *sel).unwrap_or_else(|| {
+                        panic!("{name}: the compute class no longer ships {sel}")
+                    });
+                    assert!(
+                        matches!(
+                            row.coverage,
+                            reims_vgpu_wire::manifest::Coverage::Excluded { .. }
+                        ),
+                        "{name}: {sel} is no longer excluded, so {op:#x} needs a \
+                         capture rather than an inherited number"
+                    );
+                }
+                // No selector at all is the weaker state, and the one the
+                // residency test above pins by name.
+                None => assert!(
+                    !rows().any(|e| e.opcodes.contains(op)),
+                    "{name}: a selector now claims {op:#x}"
+                ),
+            }
+        }
+        assert_eq!(
+            derived.len(),
+            apple.len(),
+            "the derived roster has a duplicate entry"
+        );
     }
 }

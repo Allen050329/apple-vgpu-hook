@@ -17,9 +17,6 @@ pub const REIMS_VGPU_COMPUTE_REFLECT_CACHE_CAP: usize = 64;
 /// Metal `MTLBufferLayoutStrideDynamic` == `NSUIntegerMax`.
 pub const MTL_BUFFER_LAYOUT_STRIDE_DYNAMIC: u64 = u64::MAX;
 
-/// Upper bound used when validating attribute formats (`MTLAttributeFormatFloatRGB9E5`).
-pub const MTL_ATTRIBUTE_FORMAT_FLOAT_RGB9E5: u32 = 54;
-
 #[cfg(test)]
 mod tests {
     use super::*;

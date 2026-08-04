@@ -2,6 +2,24 @@
 
 Operating guide for AI agents working in this repository.
 
+## What Belongs In This File
+
+Durable rules that change how an agent works: the principles below, the support matrix, the commands
+that verify a change, and what a commit must say.
+
+**Findings do not belong here.** A measurement, a counter reading, a sweep that came back empty, or
+an account of how a past session was misled is not an instruction — and this file has repeatedly
+grown to several times its useful length by collecting them. Put them where they will be read:
+
+- **next to the code they explain**, as a module or function doc — that is where the next reader
+  meets them, and it is the only place that stays true when the code moves;
+- **in the commit body**, for what one change measured and did not verify;
+- **in `kb/` and `journal/`** (both gitignored) for investigation notes, working hypotheses, and
+  session logs. `kb/` entries carry frontmatter and `[[links]]`; follow the existing shape.
+
+Before adding anything to this file, ask whether it changes what someone *does*. If it only records
+what was once true, it goes in one of the three places above.
+
 ## What This Project Is
 
 This research project emulates Apple's paravirtualized GPU on the host. An unmodified macOS guest
@@ -17,7 +35,9 @@ execute it through Metal or Vulkan. We ship no guest driver.
 | arm64 macOS / macOS Vulkan | Apple Silicon macOS (HVF) | arm64 macOS Metal guest | sysbus MMIO (`reims-vgpu-mmio`) | 14 | Vulkan through MoltenVK | `vm/boot-arm64.sh` |
 
 Pathway-specific facts must be verified on the pathway being changed. Do not generalize from arm64
-to x86, from Metal to Vulkan, or from one host GPU class to another.
+to x86, from Metal to Vulkan, or from one host GPU class to another. Some rails run on exactly one
+pathway — the arm64-only mapper rail is the standing example — and no boot on the other host can
+measure them.
 
 ## Main Components
 
@@ -27,11 +47,12 @@ to x86, from Metal to Vulkan, or from one host GPU class to another.
   command planning/execution, scheduling, and Metal/Vulkan backend behavior.
 - `crates/reims-vgpu/src/observe/` - crate-wide observability: fail logs, typed decline reasons,
   emission helpers, and gates.
+- `crates/reims-vgpu-wire` - derived wire-format views, with their own `AGENTS.md`. Where that file
+  is stricter than this one, it wins.
 - `vm/` - snapshot-revert boot scripts for arm64 and x86 guests.
 
 Start with the owning source modules and nearby tests when changing device, decode, present, or
-backend behavior. Keep durable design facts in tracked docs or code comments close to the behavior
-they explain.
+backend behavior. Keep durable design facts in code comments close to the behavior they explain.
 
 ## Operating Principles
 
@@ -51,12 +72,6 @@ Rust does not include the header and the shims do not read Rust. Every constant 
 test, using `qemu::abi::header_define` — see `the_abi_header_agrees_on_the_version`,
 `..._on_the_scanout_bound` and `..._on_the_console_feed_kinds`. Add one with any new shared
 constant; a drift here is a bug on exactly one pathway.
-
-Verifying a shim change needs the pathway that runs it. The default
-`vm/boot-x86.sh` config sets `REIMS_VGPU_WINDOW=1`, so QEMU takes `-display none` and **never calls
-`gfx_update`** — a boot like that does not exercise `fb_update` or `apply_scanout` at all. Use
-`REIMS_VGPU_WINDOW=0` for those, and A/B against a stashed baseline: that console renders black on
-both arms, so a screenshot only means something next to the baseline's.
 
 ### Never Fail Silently
 
@@ -93,15 +108,11 @@ function name, pipeline ref, or observed content pattern. Implement the decoded 
 Temporary probes are fine when they collect evidence. Remove probe-only behavior before claiming the
 fix. Do not turn observations into product heuristics.
 
-For metal2vulkan, do not make translation pass by matching corpus names. Handle the structural AIR
-or LLVM semantics, or leave the gap visible.
-
 ### No Magic Numbers
 
 Do not guess numbers because they fit one observation. Derive constants from the contract: SDK
 headers, `sizeof`/`offsetof`, decoded guest fields, documented serializer output, or controlled
-empirical measurement. Record the basis in the code, tracked docs, or the commit body when the
-value is not obvious.
+empirical measurement. Record the basis in the code or the commit body when the value is not obvious.
 
 Guest page geometry is always explicit. Portable code takes `page_shift` or `page_size`; arch-fixed
 helpers must say so in their names.
@@ -117,305 +128,72 @@ that no longer exist.
 
 State exactly what you verified. A single green boot does not prove an entire class is fixed. Broad
 claims such as "zero-copy everywhere" or "no fallback remains" require an audit of every place that
-could falsify them.
+could falsify them. One workload on one pathway proves one workload on one pathway.
 
-## Where Code Reduction Stands
+## Before A Broad Sweep
 
-Read this before opening a broad "what can be deleted" sweep. Each line below is a search that has
-already been run to exhaustion; re-running one costs hours and has so far returned nothing.
+Deletion and audit sweeps over this crate have been run many times. What each concluded lives next
+to the code it concluded it about — read the module doc before deciding a rail is dead, and do not
+"discover" a comment recording a heuristic that was already measured and removed.
 
-- **Compile-dead items: swept.** `scripts/dead-state/dead-state.sh` is the instrument, and its
-  intersection report is empty. Its one remaining lead is the ~45 items dead on the Metal arm
-  (`--keep`, `hits.metal`) — those are **not** deletions. A shared census that Metal never calls is
-  more likely an observability gap on a first-class pathway than dead code, and a `cfg` would cement
-  it invisibly against Never Fail Silently. Deciding needs an Apple host.
-- **Heuristics and fallbacks: none of substance left.** What reads like a fallback is a device
-  capability query (depth/vertex format, memory topology), a real two-path strategy, or a comment
-  recording a heuristic that was already measured and removed. Do not "discover" the latter and
-  delete the explanation.
-- **Censuses are not bloat.** The phase censuses (`chain_phase`, `bind_phase`, `draw_phase`,
-  `stage_phase`) are ~55 lines of code each under their docs, they reconcile against each other by
-  construction, and they are how "slow" gets diagnosed. A never-firing *decline* is a quiet failure
-  path, which is the healthy state — not a dead branch.
-- **Structural unification has been costed and rejected twice.** The three sampled rails (linear,
-  type-11, type-5) differ in wire source, stride handling and bounds, not in naming; the two
-  memoized loaders differ in read, conversion, census and return type. In `backend/vulkan`, merging
-  the keyed caches loses per-key bucketing and negative caching, and a shared barrier helper puts a
-  stage/access-mask bug in both the graphics and compute paths at once. The measured savings were
-  tens of lines each. Do not re-derive this.
-- **A zero hit rate on one pathway is not a dead cache.** `gva_view`'s `view_reuse` reads 0 on
-  x86/Vulkan because a 12-bit page shift fragments nearly every span. A 14-bit shift covers the same
-  span in a quarter of the pages. The module documents this at its own reuse site.
-- **A census field that is zero on every sample can be zero because of where it samples.**
-  `host_cache_levels surfaces/surface_bytes/surface_largest` read 0 across 4 896 samples while the
-  two tiers beside them hold 170 MB. The surface tier is not dead: the census runs at the drain
-  tail, every armed render window lands inside that drain, and every landing is leased and forgets
-  its entry — so the tier is guaranteed empty at the instant it is read, and a **non-zero** reading
-  is the leak alarm. Documented at `cache_levels` in `runtime/surface_cache.rs`. Before cutting a
-  constant field, find its sampling point; `scripts/constant-fields/README.md` lists five ways a
-  constant can be legitimate and this is a sixth.
+Four rules survive every sweep:
 
-- **Four more large modules have now been swept, and three returned nothing.** `storage_flush.rs`,
-  `mapper.rs` + `mapping_write.rs`, `scanout.rs` + `host_window/present.rs` + `surface_cache.rs` +
-  `window_present.rs`, and `decode/resource.rs` + `model/state.rs` + `objects.rs`. **No oracles were
-  found in any of them** — no PFN plausibility heuristic, no poison-pattern check, no stride or
-  geometry guessing, no multi-interpretation resolve ladder, no retry loop. What the sweep did find
-  was two *speculative* rails with no producer (both deleted) and two decoders overriding a decoded
-  field (both fixed). Re-running the oracle hunt over these files is not worth the hours.
-- **A never-firing dispatch arm is almost never a deletion.** An audit of all 85 `store_routes`
-  names against two driven boots found 39 that never fire. Every one resolved into either contract
-  fidelity — a real Apple opcode this workload happens not to issue (`icb_exec_seen`,
-  `compute_ctrl_seen`, the five `compute_noop_*` fence/barrier/residency arms) — or a healthy-zero
-  alarm, where a firing *is* the bug (23 of them, all drift/unbounded/unwitnessed detectors). None
-  were reducible. Deleting a decoded-but-untaken arm loses guest work silently the first time a
+- **A never-firing branch is almost never a deletion.** A decoded-but-untaken arm is usually
+  contract fidelity — a real Apple opcode this workload does not issue — or a healthy-zero alarm,
+  where a firing *is* the bug. The test to apply: **name the guest action that would take this
+  path.** If you can name it, it stays. Deleting one loses guest work silently the first time a
   guest takes it.
-- **The decode fidelity vein is `resource.rs`, not `decode/` generally.** Four real decoder bugs
-  landed recently — a field overridden from a command mask, a format chosen by magnitude, a value
-  read from the wrong record when the preferred one was unreachable, an unconditional `has_` flag —
-  and every one was in `decode/resource.rs`. The other six decoders (`render`, `compute`, `blit`,
-  `fifo`, `stream`, `event`, ~3 750 lines) were then audited for those same four shapes plus silent
-  drops, and came back clean: `has_*` flags are conditional on the read that sets them, draw and
-  copy forms are distinguished by exact length rather than magnitude, variable-length records
-  bounds-check before access, and every overflow path names its own `ErrBadLength` slug. Spend the
-  next fidelity hour on `resource.rs` and the descriptor formats, not on re-reading these six.
-- **The descriptor-format half of that vein has now been mined, and it produced five fixes; do not
-  re-run it.** `objects.rs`'s three descriptor decoders and every consumer of them were audited for
-  the same shapes. What came back, all fixed: a blit resolving a type-5 view through the type-11
-  window helper and so dropping the wire plane index; the colour-RT resolve inventing BGRA8 over the
-  type-4 decoder's deliberate format-0 refusal; the type-4 freshness guard comparing width on the
-  arm that skips the rebuild and width+height on the arm that does not, with neither comparing
-  format; the single-plane device-descriptor arm decoding plane 0's offset and then not publishing
-  it; and the arm64 mapper narrowing the descriptor's format word with `& 0xffff`, which turns a
-  FourCC into a value nothing accepts.
-  Three things worth keeping from it. **The descriptor's `pixelFormat` word carries two encodings**
-  — an MTL ordinal when this device synthesized it, an OSType FourCC when the guest wrote it — and
-  they are separated by *width*, not magnitude: an ordinal fits in 16 bits by construction and a
-  FourCC cannot (`objects::device_desc_format_to_mtl`). **A format of 0 means different things on
-  different rails**: on a type-4 mapping it has one writer and is a refusal, so the RT resolve now
-  declines it; on a type-11 mapping it can mean "not latched yet" and BGRA8 is the display
-  contract's default there, which is why only one of those two arms changed. And **an audit that
-  groups sites by their shared code shape will over-group**: three of the five "invents BGRA8" sites
-  an audit reported were a page-count floor where over-estimating is safe, a different descriptor's
-  own format field, and a documented display default.
-- **The consumer side has now been swept too, and the vein there is *divergence between two arms
-  that consume one wire form*.** `blit_exec`, `drain`, `exec`, `compute_exec`, `compute_session` and
-  `metal_draw` (~30 000 lines, the clusters the earlier oracle sweep did not reach) were audited for
-  the same shapes. Almost no classic oracles came back — no poison/sentinel checks, no retry loops,
-  no PFN plausibility test, no magnitude-based format selection, and the one thing that looks like a
-  resolve ladder (the four-rung type-11 sampled path) is four distinct sources with a traffic census,
-  not one source reinterpreted. What *did* come back was five real bugs, and four of them are the
-  same shape: **two consumers of one decoded record, one of which contradicts a rule the other one
-  states in a comment.** A nil compute bind entry did not unbind while `exec::apply_binds` did and
-  `ExecResult::buffer_unbinds` said it must; a Metal colour slot borrowed slot 0's blend state while
-  the Vulkan arm's comment named that exact line as inventing state; seven root FIFO arms dropped a
-  short packet silently while the child arm of one of the same opcodes already reported it; two row
-  loops skipped the `dest_window` bound six sibling call sites take. When auditing here, diff the two
-  arms against each other rather than reading either alone — and grep the *other* arm's comments,
-  because in three of these four the correct rule was already written down next to the wrong code.
-  **The vein has kept producing, and the newest instance shows how the shape hides.** `blit_exec`'s
-  type-5 arm decoded the view's wire plane index and then resolved its window through
-  `type11_sample_window`, which takes no plane index — while the other two type-5 consumers pass it
-  and `type5_sample_window` exists for exactly that. `type11_sample_window`'s own doc, twenty lines
-  above the call, states the rule ("Type-11 is the case with **no wire plane index**"), and on a
-  surface whose planes share geometry and bytes-per-element the scan matches two, takes neither, and
-  returns plane 0 packed. What made it invisible is that the call site's *own* comment said "resolve
-  it exactly like type-11", so the code matched its comment and only the callee's comment disagreed.
-  **When two arms diverge, the comment that settles it is more often on the function being called
-  than on the call.** The other instance was an alarm written out inline at one of three consumers,
-  so the other two could not report the case at all: when you find a divergence, check whether its
-  failure line is shared or copied, because a copied one is a divergence waiting to happen.
-- **The one remaining oracle-shaped thing is in the mapper, and only an Apple host can settle it.**
-  `contract/iosurface_pages::build_table_plan` reaches the IOSurface page table through *two*
-  candidate chases — `MappingInternal` field `+0x48` then `+0xb8`, and field `+0x50` then `+0x28` —
-  builds a candidate from each field that holds a kernel VA, and returns the entries of whichever
-  candidate `read_table_entries` parses first. Read cold that is the classic "try both, keep the one
-  that works" ladder, and `MapperMem::read` beside it picks `read_kva` vs `read_gpa` by testing the
-  address against the kernel-VA ranges rather than by knowing which space the field is in.
-  **Do not change either from an x86 host.** This whole rail is arm64-only: it is entered from
-  `mapper::capture_at_producer`, which needs `HostOps::read_xreg`, and the x86 PCI shim returns -1
-  for that unconditionally (`reims_vgpu_pci_read_xreg`, "no arm xreg handoff"). Nothing here
-  executes on the x86/Vulkan pathway, so no boot on this host can measure it and no x86 evidence can
-  justify touching it.
-  It also may not be a ladder at all. The two-candidate branch only *chooses* when both fields hold
-  kernel VAs at once; if exactly one is ever populated, this is two layouts handled side by side and
-  is fine as written. Settling it needs one arm64 boot and two counts: how often both fields are
-  populated, and — when they are — whether candidate `+0x48` ever fails where `+0x50` then succeeds.
-  If that pair never happens, delete the fallback and keep the field test. If it does, the
-  discriminator is a real contract gap and the fix is to find the field that selects between them,
-  not to keep parsing both.
-- **The x86 GVA page-table walk is exactly conformant; do not re-audit it.** `contract/gva.rs` and
-  `contract/gva_resolve.rs` were checked field by field against the contract and every constant
-  holds: a PTE is 4 bytes, the PFN is bits `[30:0]` raw (`PTE_PFN_MASK`), bit 31 is a flag, the
-  fan-out is 1024 (`X86_64_INDEX_BITS = 10`), the page shift is 12, and the index split
-  `(page_index >> ((depth-1-level) * index_bits)) & index_mask` is the right one. The one subtlety
-  is already right and is worth not "simplifying": **`pte == 0` is the guest's sole not-present
-  encoding**, so the walk reports `ErrZeroPfn` for it and `ErrMalformedPte` for a zero PFN with bit
-  31 set. That second case cannot occur legitimately — the guest refuses to store an entry whose
-  bit 31 is already set and never maps physical page 0 — so collapsing the two arms would discard a
-  real corruption signal to save a branch. `gva_zero_pfn` in the fail log is therefore the guest
-  saying "not mapped here", not a device defect.
-  `MAX_DEPTH = 4` is a bound, not the depth: the depth is read per task from the task descriptor
-  (`DIRECTORY_DEPTH`), which is correct and must stay — do not hardcode it even though the x86 guest
-  currently always says 3.
-- **The type-4 task search is not an oracle, and replacing it with "the task the guest named"
-  regresses the boot.** It reads exactly like one: `resolve_type4_surface_ex` takes a bare surface id
-  and probes up to 256 task object lists — task 0 first as the "historical home", then a hint its own
-  doc calls "allowed to be wrong" — accepting the first list that yields a translatable backing,
-  while the sibling call on the line above (`resolve_type11_ref`) is already being passed `task_id`.
-  Threading that same `task_id` in and deleting the search took a driven x86 boot from **0
-  `rt_resolve FAIL` and 6 `present_unbacked` to 21 816 and 2 774**, with the desktop unbacked.
-  The reason is the thing the id spaces hide: **an IOSurface is cross-process.** It is created in one
-  task and referenced from another, so the task whose command stream names a surface id is routinely
-  *not* the task whose object list holds it — the naming task holds the type-5 *view*, and the
-  descriptor inside it points at a surface owned elsewhere. The search is how the owner is located,
-  and there is no task word on the wire that answers it. `blit_exec`'s "never the task object-list
-  ref — those id spaces collide" is about the id *spaces*, not about which list to read, and reading
-  it as the latter is what makes this look like a settled bug.
-  The narrower worry that used to sit here — the search takes the first list that *translates*, and
-  two tasks could both hold an `OBJECT_TYPE_SURFACE` at the same slot — has now been measured, and it
-  does not occur. There is indeed nothing to verify a candidate against: the object-list entry is
-  twelve bytes, `[type | desc_len]` plus `desc_gva`, with no identity field, and the type-4
-  descriptor is fully consumed — its only undecoded span is three bytes at `0x11` that read
-  `undecoded_nz=0` on every distinct shape a driven boot produces. So `type4_claimants` counts
-  instead. On a driven x86 boot: **87 distinct surface ids, `claims=1` on every one, `winner=0` on
-  every one**, across 16 defined tasks. Every type-4 IOSurface lives in task 0's object list and only
-  task 0's, and every successful resolve stops on the first probe.
-  That sharpens why the task threading was reverted: surfaces live in task 0 while the command
-  streams naming them belong to other tasks, so threading the naming task looks in the one list that
-  structurally cannot hold them. It also means the search's other 255 probes contribute to no
-  successful resolve on this workload — but do not delete them on that reading alone. It is one
-  workload on one pathway, and `claims > 1` is a live failure-channel alarm that will say so if the
-  assumption ever breaks.
-  **"Task 0" is now a decoded field rather than an inference.** The type-5 descriptor's dword at
-  `+0x04` — long documented as an opaque "device-side field" and read only into a verbose echo — is
-  the id of the task whose object list holds the referenced surface, and the guest writes it from
-  the accelerator's task rather than from the view's own. That task is the kernel task, its id is an
-  immediate 0, and index 0 is reserved out of the 256-entry task-id allocator before any client task
-  exists. `TYPE5_OWNER_TASK` and `note_type5_owner_task` carry this; a driven x86 boot reads exactly
-  one distinct value, `task=0`. So the probe order is the guest's own answer, and a non-zero reading
-  is a failure line because it would falsify the ordering and the field's meaning at once. This does
-  **not** license deleting the other 255 probes — it is the same one-workload caveat plus the
-  `claims > 1` alarm — but it does mean the next session need not re-derive where surfaces live.
+- **A zero can be an artifact of where it is sampled.** Find a census field's sampling point before
+  cutting it; `scripts/constant-fields/README.md` lists the ways a constant reading is legitimate.
+  A zero hit rate on one pathway is not a dead cache either — page shift alone changes it.
+- **A drop counter reading zero is not a measurement.** A record stopping at slot 4 and one stopping
+  at slot 30 both read zero, and only one says the bound has headroom. Band the *requested* reach
+  before widening or narrowing any table.
+- **Two arms that consume one wire form must be diffed against each other, not read alone.** The
+  comment that settles a divergence is more often on the callee than on the call site, and the arm
+  that is easiest to read is often not the arm the boot takes. Check which one runs before calling a
+  divergence theoretical. When you find one, check whether its failure line is shared or copied — a
+  copied one is the next divergence.
 
-- **The per-present type-4 force refresh is not redundant with the `0x3c` re-point packet, and
-  deleting it on that argument would lose 98% of the page-list changes.** `ensure_surface_for_present`
-  calls `resolve_type4_surface_force` on every present for an already-resident mapping, which re-reads
-  the descriptor and re-translates the first and last backing page. That reads exactly like polling for
-  something the guest announces — and `replace_physical`'s own doc says of `CmdReplacePhysical`
-  (`0x3c`) that "the packet is the announcement, and it is the only one there is", which invites the
-  conclusion that once `0x3c` is decoded (it is, since `2f9f2f2`) the polling can go. Measured on a
-  driven x86 boot: **1 700 `type4_pages_refreshed` against 34 `replace_physical` packets**, only 10 of
-  which dropped a cached list. `type4_pages_refreshed` only fires when a *prior non-empty* page list
-  differed from the freshly built one, so those 1 700 are real changes to real cached backings. The
-  packet's doc is right about the case it covers — a GPU-VA re-point at unchanged surface id, geometry
-  and length — and that case is ~2% of the traffic. The rest reaches the rebuild through a geometry
-  change or a recycled incarnation. Do not trade the poll for the packet.
+Prefer an instrument over a reading. Reading an audit against itself cannot see an opcode that is
+simply the wrong number, a length four bytes off, or a field two bytes too wide:
 
-- **Two arms of one guest-memory write must be diffed against each other, not read alone.** This is
-  the `mapping_write.rs` instance of the consumer-side finding above, and it has now produced three
-  bugs in a row: a `span_end` bound present on two arms of three, two entries draining deferred
-  windows only on the scattered arm, and the staged arm zeroing inter-row padding the contig arm
-  preserves. The trap is that **the arm that is easiest to read is not the arm that runs**: on a
-  driven x86 boot `write_split` reads `contig=0` on essentially every window, so the fragmented
-  staging arm is the live one and the pointer arm is nearly dead. Check which arm the boot takes
-  before concluding a divergence is theoretical.
-  Note also what is *not* a divergence there: `write_rect_raw_at_impl`'s `full_tight_direct` fast
-  path returns early and skips the shared `invalidate_storage_residency_window`, but its own guard
-  requires `frame_len == span_end - base_off` and `write_mapping_bytes` invalidates `[off, off+len)`
-  internally — the same window. That one has been checked; it is correct.
-- **A healthy zero can also be an address-space error, and that class is worth one grep.** The
-  divergence vein produced a new shape: an alarm that reads zero forever because it compares two
-  addresses that do not compare. `first_control_page_collision` rejects a surface whose backing
-  pages alias a control structure, and five of its six regions are guest-physical by construction —
-  but the sixth shifted `task.object_list_pfn`, which `objects::lookup_list_entry` builds, names
-  `entry_gva` and reads through `gva_mem::read_task_gva_by_id`. `gva_mem`'s own doc states the rule
-  it broke ("a GVA has no meaning apart from the page table it is resolved against"), which is the
-  same "the comment that settles it is on the callee" trap as `c99fe05`. Both directions were
-  wrong: a real alias was undetectable, and a surface whose *physical* page happened to equal that
-  *virtual* number was rejected and its guest work lost — and the coincidence is not remote,
-  because tasks put their object lists in low pages. It also strided at 16 where
-  `OBJECT_LIST_ENTRY_LEN` is 12. **The generalisable check is cheap: for any predicate mixing
-  fields, confirm every operand is in the same address space, by tracing each to its writer and to
-  one other consumer.** A field named `*_pfn` does not settle it; `object_list_pfn` is a virtual
-  one.
-  **That sweep has now been run over the whole crate, and it returned nothing — do not re-run it.**
-  Every non-test `<< page_shift` / `pfn_to_gpa` / `pfn_gpa` site (14), every `is_ram_gpa` /
-  `read_gpa` / `write_gpa` / `map_pages` / `entry_gpa_shift` call, and every `.contains`,
-  `binary_search` and `partition_point` in non-test code were enumerated rather than sampled. The
-  bug does not recur. Four near-misses cost the sweep real time and are worth not re-deriving:
-  `observe::footprint::Rail::RawGva` is named for its *rail*, not its argument, and both callers
-  correctly pass translated GPAs; `flush_intersecting_task_gva` probes a GVA-keyed map and a
-  GPA-keyed one in the same function, correctly on both; `gva_view.rs`'s `run_gva = span_page_base
-  + run.start * page_size` mixes a GVA base with an index into a GPA array, which is sound because
-  `gpas[i]` is span page `i` by construction; and `blit_exec`'s `sl.base_gva == dl.base_gva`
-  compares two GVAs resolved through the same task.
-  **The one field most likely to reproduce this bug is `Type4Walk`/`Type4Surface::backing_pfn`**,
-  which is a *virtual* address (`getGPUVirtualAddress >> page_shift`) despite the `_pfn` name. Its
-  four consumers all correctly feed `translate_task_gva`; a fifth that shifts it into a physical
-  read would be the same defect. The arm64-only kernel-VA-vs-GPA discrimination in
-  `iosurface_pages::build_table_plan` is a different address-space pair and is priced separately
-  above; it still needs an Apple host.
-- **The blank-sample loss class is closed — it was never a loss.** `lin_rung_blank_with_host_entry`
-  read 22 a boot with `lin_rung_blank_host_agrees` 22 and `lin_rung_blank_host_content` **0**: every
-  occurrence is a span the device CLEARed, cached blank, and read back blank off pages that are also
-  blank. The counter that called it loss tested only whether the cache *held* the span, never
-  whether it held pixels. Do not reopen this on the old "31 a boot" or "300 a boot" readings; the
-  live alarm is `lin_rung_blank_host_content`, and it is a healthy zero.
-- **The per-dispatch compute stall watchdog is priced, and it is not worth rewriting.**
-  `spawn_compute_engine_stall_watchdog` spawns a thread and clones the SPIR-V on *every* compute
-  dispatch, then sleeps 2 s. At the measured peak of 124 computes/s that is ~250 live sleeping
-  threads and 124 spawns/s for a probe that has never fired (0 hits across a driven boot, and no
-  `/tmp/reims-vgpu-compute-stall-*` dump has ever been written). It reads like obvious bloat. It is
-  ~0.25% of one core and a few MB of RSS — three orders of magnitude below the flush rail above —
-  and it is a healthy-zero hang alarm for backend calls a Vulkan fence timeout cannot bound. Collapsing
-  it to one long-lived thread plus an in-flight registry is correct but buys almost nothing; do the
-  flush rail first.
-- **The two C shims are not 2 200 duplicated lines.** `reims-vgpu-pci.c` and `reims-vgpu-mmio.c` look
-  like near-copies and are read that way by every fresh sweep. What is actually shared is already in
-  `reims-vgpu-shim.c`, and the rest is blocked by that header's own stated rule — bus-specific trace
-  events and the per-device dirty tracker stay in their shim. `gfx_read`/`gfx_write` and the
-  `MemoryRegionOps` (~77 lines) touch both and cannot move. The eight dirty-tracking wrappers (~60
-  lines) *are* byte-identical apart from the `ctx` cast, but `HostOps.ctx` is genuinely per-device —
-  `schedule_bh`, `map_pages`, `read_xreg` and `notify_actions` all need the bus object — so
-  collapsing them needs a second ctx field in the ABI, which buys 30 net lines for a new drift
-  surface. What the shims *did* hold was a real rule, and that is now exported (`scanout_may_paint`);
-  look for reconstructed rules there, not for duplicate bodies.
+| Question | Instrument |
+|---|---|
+| What compiles but is never referenced? | `scripts/dead-state/dead-state.sh` |
+| What is reachable but never runs? | `scripts/runtime-dead` — coverage-instrumented driven boot |
+| Does a decoder refuse or drop a record Apple emits? | `crates/reims-vgpu/tests/wire_fixtures_reach_the_decoders.rs` |
+| Is a wire constant still declared twice? | the two greps below |
 
-The remaining reduction lever is runtime-dead code — paths that compile and are reachable but that
-the protocol never takes — and `dead-state` cannot see that class. `scripts/runtime-dead` is the
-instrument: it builds the staticlib with `-C instrument-coverage`, boots x86, drives the guest, and
-reports every function whose counter stayed at zero. One boot, whole crate, function granularity.
-It replaces reading `/tmp/reims-vgpu-fail.log` for this, which was never good at it — every decoder
-in `decode/` is silent on success, so absence of a line proves nothing.
+```sh
+ls crates/reims-vgpu-wire/src/ops/*.rs | xargs -n1 basename | sed 's/.rs$//'
+grep -rh 'use reims_vgpu_wire' --include='*.rs' crates/reims-vgpu/src
+```
 
-**Its output is a map, not a kill list.** First run: 1 066 of 2 826 functions never ran on a driven
-boot. `runtime/icb/mod.rs` reads 0.00%, which is the correct reading and is already priced as *not*
-a deletion — the instrument agreeing with a conclusion reached the expensive way is why to trust it,
-not a reason to act. Six files read 0.00% and none were deleted on the strength of it. The reasons a
-zero is legitimate — a decline that healthily never fired, a real Apple opcode this workload does
-not issue, a path the one driven workload never asked for, an error path, the other pathway's
-geometry — are in `scripts/runtime-dead/README.md`, with the test to apply: **name the guest action
-that would take this path.** If you can name it, it is contract fidelity and it stays.
+A wire module with no importer is either a real gap or a family still declared twice. Where a device
+offset names a field a wire struct already declares, reach for `offset_of!` rather than a re-exported
+number, so a rename fails the build.
+
+Their output is a map, not a kill list. And one trap they teach: **an `Ok` from `render::decode` is
+not a decode** — `Kind::OtherAccepted` is the catch-all for "no arm claimed this", and reading it as
+success hides a whole family of lost records behind a green run.
 
 ### Reading the fail log
 
-Two things about its shape, so a reader does not mis-size what they are looking at:
-
-- **Volume is not alarm.** Across a driven boot only ~1.7 % of records are on the `fail` channel;
-  the rest are `OFF`. The seven highest-volume tags (`window_publish`, `host_cache_levels`,
-  `guest_write_footprint`, `engine_lock`, `engine_delta`, `drain_duty`, `host_window_loop`) are
-  ~59 % of all records and are **one 1 Hz heartbeat** — inter-record deltas of 1000-1003 ms. That is
-  cadence working, not an over-eager emitter.
+- **Volume is not alarm.** Most records are on the `OFF` channel, and the highest-volume tags are a
+  1 Hz heartbeat. That is cadence working, not an over-eager emitter.
 - **Absence of a decode line proves nothing.** Every decoder in `decode/` is silent on success and
-  emits only on `Err*`. So "opcode X never appears in the log" is not evidence that arm never ran.
-  The only usable never-fired signal is the `store_routes` counter set.
-
-### Units
-
-`draw_stall`'s headline `us=` field once carried nanoseconds while its thirteen siblings carried
-microseconds — a 1000× error on the device's own first-look number for a slow draw. The rest of the
-tree was then audited for the same class: every other `*_us` field traces to a variable already in
-microseconds. Fixed and checked; do not re-run this sweep.
+  emits only on `Err*`. "Opcode X never appears in the log" is not evidence that arm never ran; the
+  `store_routes` counter set is the only usable never-fired signal.
+- **Filter the channel before ranking `reason=`.** `OFF` records carry `reason=` too, for ordering
+  and control-flow events that are not losses, so the obvious
+  `grep -o 'reason=[a-z_0-9]*' | sort | uniq -c | sort -rn` inverts the queue. A fail-channel record
+  begins with its own event name and an off-channel one begins with the literal `OFF `, so
+  `grep -v '^OFF '` first.
+- **A named reason on the fail channel is not automatically lost work.** Some report a repair that
+  *succeeded*, fail-visible so the reliance stays measurable. Read the emitter.
+- **A counter and a fail line count different things.** Census counters are per-window and
+  cumulative; emitters dedupe. Do not quote one as the other.
 
 ## Support Matrix
 
@@ -432,32 +210,18 @@ The Vulkan backend must support all four memory/DMA cells:
 Vulkan 1.2 is the baseline. Anything above Vulkan 1.2 must have a fallback or a capability-gated
 path. Gate on capabilities, not vendor names, driver names, or API-version assumptions.
 
-**Host-pointer imports are not windowed any more — they are forbidden.** `VK_EXT_external_memory_host`
-must never be asked for, and Metal's `newBufferWithBytesNoCopy` may alias only this process's own
-bytes. Importing a host pointer over guest RAM gives the host GPU read *and write* access to the
-guest VM's memory, and that is a property of the mechanism rather than of how much of it is used —
-so the bound is "never requested", not a budget. The whole subsystem was deleted in `018499e`
-(Vulkan) and `4fd4695` (the Metal texture that aliased guest RAM), and both invariants are enforced
-by `crates/reims-vgpu/tests/guest_ram_isolation.rs`.
+**Host-pointer imports over guest RAM are forbidden.** `VK_EXT_external_memory_host` must never be
+asked for, and Metal's `newBufferWithBytesNoCopy` may alias only this process's own bytes. Importing
+a host pointer over guest RAM gives the host GPU read *and write* access to the guest VM's memory,
+and that is a property of the mechanism rather than of how much of it is used — so the bound is
+"never requested", not a budget. Both invariants are enforced by
+`crates/reims-vgpu/tests/guest_ram_isolation.rs`.
 
-Do not go looking for a "capped window resolver". There isn't one — it went with `018499e`, and this
-paragraph said to use it for a day because `967894a` reset this file over the correction `b3df160`
-had already made. That is worse than a broken link: it names a plausible mechanism, so a reader
-spends the session hunting for it instead of concluding it is gone. What *does* hand back a host
-pointer is `runtime/gva_view.rs::ensure_gva_view`, which is not a window resolver — it requires the
-span to be **one** contiguous page run and returns `None` otherwise, which on x86 is nearly always
-(a 12-bit page shift fragments almost everything).
-
-The temptation recurs, so the reason it is still not the route: the render deferred-flush rail is the
-largest cost in the device (~73% of the drain worker's budget, 86% of it bytes), and a GPU-direct
-write into guest pages would erase it. `storage_flush.rs` names that endgame and also its own
-qualifier — "available only where the host GPU can address host memory". Beyond the policy, x86 has
-an independent blocker: `reims_vgpu_pci_map_pages` only *translates*, returning a pointer when the
-GPA list is already host-contiguous, so a fragmented IOSurface has no contiguous host VA to import
-at all. arm64 can build one with `mach_vm_remap`, but it is transient (`map_pages_stable = 0`) and
-must not be retained in an import. Neither pathway has both properties. The routes that are not
-blocked on any of this are the ones `storage_flush.rs` names: make the undeclared guest read
-observable so the writeback becomes demand-driven, and split the readback asynchronously.
+The proposal recurs because the deferred-flush rail is the device's largest cost and a GPU-direct
+write into guest pages would erase it. It stays forbidden regardless; `storage_flush.rs` carries
+that reading, its own qualifier, and the routes that are *not* blocked. Note that
+`runtime/gva_view.rs::ensure_gva_view` hands back a host pointer but is not a window resolver — it
+requires the span to be one contiguous page run and returns `None` otherwise.
 
 ## Verification
 
@@ -468,40 +232,11 @@ Pick the pathway your change affects.
 - x86: `vm/boot-x86.sh --device reims-vgpu-pci --testing`, then
   `scripts/screenshot-when-kde-plasma-host/screenshot-when-kde-plasma-host.sh -o /tmp/screen.png`
 
-### A boot measured next to your own subagents measures the contention
-
-Every `us=` number this device reports is wall clock on a shared machine, so a driven boot taken
-while a subagent greps, a `cargo` build runs, or a second VM lives is measuring your harness as
-much as the device. This is easy to do by accident and it does not look like an error — the log is
-well-formed and the counters are self-consistent.
-
-Measured directly. Two boots of the identical workload and binary, one with a subagent running and
-one with nothing else on the machine:
-
-| | flush share | draw share | draws/s | µs per draw |
-|---|---|---|---|---|
-| subagent running | 46.4 % | 51.2 % | 561 | 418 |
-| clean | 66.9 % | 29.1 % | 1 070 | 118 |
-
-The contended run halves throughput, triples per-draw cost, and **inverts the flush-vs-draw
-ranking** — which is the number the whole "where is the time going" section below is built on.
-Taken at face value it says the flush rail is no longer the largest cost and the priority should
-move to draw. That conclusion is entirely an artifact.
-
-So: **run the boot with nothing else running, and check `uptime` before believing a timing.** The
-sequence of five boots that produced the table above trends monotonically with how much other work
-was in flight, not with anything in the device.
-
-Counts are far more robust than timings — `store_routes`, refusal counters and the gate survive
-contention, because they do not measure time. When a machine cannot be quiesced, reason from counts
-and treat every `_us` field as an upper bound.
-
 ### An undriven boot measures an idle device
 
-A `--testing` boot reaches the desktop and then sits there. Its counters are the *idle* device's,
-and reading them as this device's behaviour is how a rail gets called dead when the workload simply
-never asked for it. If a change is about throughput, caching, writeback or present cadence, the boot
-has to be driven.
+A `--testing` boot reaches the desktop and then sits there. Reading its counters as this device's
+behavior is how a rail gets called dead when the workload simply never asked for it. If a change is
+about throughput, caching, writeback or present cadence, the boot has to be driven.
 
 Run the boot in the background and drive the guest **while it is up** — the `--testing` boot exposes
 SSH on `localhost:2222` (`macos-vm` in `~/.ssh/config`) for its whole life, so a probe does not need
@@ -513,64 +248,25 @@ ssh macos-vm true                                      # wait for the guest to a
 scripts/window-drag-probe/window-drag-probe.sh --seconds 25 --app Safari
 ```
 
-That produces real window-server compositing — a measured 499 draws/s at drain duty 0.97, against
-0 draws/s idle. The probe refuses a verdict if the window never moved, so a run that produced no
-motion cannot be mistaken for a slow device.
+That produces real window-server compositing, against 0 draws/s idle. The probe refuses a verdict if
+the window never moved, so a run that produced no motion cannot be mistaken for a slow device.
 
-### The probe's Hz verdict is upstream of the present path, not in it
+### A boot measured next to your own subagents measures the contention
 
-`seconds below 100 Hz: 23/23` reads like the host window is dropping frames. It is not. Across a
-driven boot's 36 `host_window_cadence` windows, **35 have `presents == offered` with `busy=0`**, and
-the one exception still presented all 19 frames it was offered (`busy_fence=2`). `direct_frac` is
-1.00 throughout. The window presents every frame it is handed, immediately, and stalls on
-essentially nothing.
+Every `us=` number this device reports is wall clock on a shared machine, so a driven boot taken
+while a subagent greps, a `cargo` build runs, or a second VM lives is measuring your harness as much
+as the device. This does not look like an error — the log is well-formed and the counters are
+self-consistent — and it has been measured to halve throughput, triple per-draw cost, and invert the
+ranking between the device's two largest costs.
 
-`present_hz` therefore tracks `offered_hz` exactly, and both measure what the guest and the drain
-*produced* — 17-35 fresh frames a second while the compositor ran at 496 draws/s, of which
-`draws_fresh` is 11-17 and the rest are the loop correctly declining to re-present unchanged
-content. So a slow verdict from this probe points **upstream**: drain, decode, draw. It does not
-implicate `host_window/present.rs`, `backend/vulkan/engine/window_present.rs`, or the surface-cache
-present path, and measuring those again to explain a low Hz number is measuring the wrong end.
+**Run the boot with nothing else running, and check `uptime` before believing a timing.** Counts are
+far more robust than timings: `store_routes`, refusal counters and the gate do not measure time and
+survive contention. When a machine cannot be quiesced, reason from counts and treat every `_us`
+field as an upper bound.
 
-### Upstream is the flush rail, and it is bytes
+### Rust tests
 
-The three candidates that verdict leaves — drain, decode, draw — are not equal, and the driven log
-already settles it. In the busiest window `drain_duty` reads `flush_us=732687` of `drain_us=995063`
-against `draw_us=225287`: **73% of the device's entire time budget is writeback, 3.2× draw.**
-`compute_us` is 0. `flush_rails` puts essentially all of it on the render rail (`render_us=717130`
-over 304 flushes; gva, linear and storage rails are ~0).
-
-Do not then read `readback_split`'s `fence_us` as latency. `gpu_us`/`bar_us` are GPU timestamps
-taken *inside* that fence: `fence_us=410022` with `gpu_us=324787` and `bar_us=729` means 79% of the
-fence is the readback command buffer's own copy and the barrier waiting on the draw batch is one
-microsecond per fence. Adding `write_us=290863` and `map_us`, the rail is **86% bytes, 13% latency**.
-720 fences that second each copied a whole surface to produce 11-17 fresh frames.
-
-So the lever is bounding *what* a flush copies, not scheduling it differently, and it is not blocked
-on a host that can address guest memory the way the zero-copy endgame is. `flush_render_one`'s doc
-carries the full reading, including the separate measurement that 99.3% of what the rail writes is
-never read by anything in the device before the next flush replaces it. Note also that a
-tile-difference delivery path was built and deleted whole in `6df980c` for being reached by nothing
-— read that commit before rebuilding it.
-
-**The obvious way to bound it is now measured and it is dead: the guest's own scissor rects.** The
-device knows, per draw, the rect the guest scissored to, so bounding each flush by the union of its
-pass's scissors is the repair that needs no new contract and no host capability. It saves nothing.
-Over 17 696 armed windows on a clean driven boot, **99.92% have a per-pass scissor union of 100%** —
-the pass drew the whole surface, so there is no smaller extent to copy (`note_pass_scissor_union`,
-which carries the table). The per-draw distribution beside it looks encouraging in isolation — two
-thirds of *partial* draws cover a quarter of the surface or less — and reading only that is how this
-gets rebuilt; the governing number is that **half of all draws are full-coverage**, and a window is
-~8 draws, so `0.5^8` says essentially every window contains one. That 99.92% is per *window*, and a
-pass is ~3 draws, so the per-*pass* figure is the weaker ~87% (`0.5^3`) — but the window is what a
-flush copies, so 99.92% is the number a repair has to beat.
-That also settles the shape of any successor: it is not the bounding-box approximation that kills
-it. A rect list or a tile map would score better on a union, but no representation makes a
-full-surface draw smaller, so `6df980c`'s tile-diff rail must not be revived on this argument
-either. A damage-bounded flush needs a *different* source of damage than the draw stream — and none
-is currently decoded.
-
-For Rust changes, run the relevant native tests serially from the repo root:
+Run the relevant native tests serially from the repo root:
 
 ```sh
 cargo test -p reims-vgpu --no-default-features --features backend-vulkan,host-window -- --test-threads=1
@@ -590,12 +286,18 @@ Before and after long Rust test runs, sweep orphaned test binaries:
 pkill -9 -f 'target/debug/deps/reims_vgp[u]-'
 ```
 
+The `backend-metal` `--lib` arm has six pre-existing failures, all in
+`runtime::storage_flush::tests` and all exercising `flush_render_one`, which is a fail-visible stub
+on a build without `backend-vulkan`. They are Vulkan-rail tests compiled unconditionally rather than
+a Metal defect. Check the failing *module and count*, not the pass count — the pass count moves
+whenever anyone adds a test. Do not "fix" them by weakening what they assert.
+
 ## Commit Guidelines
 
 Commit only work you wrote. Never commit third-party code or intellectual property, including Apple
-software, firmware, disk images, `.mtlb`, AIR, or SPIR-V. Keep those artifacts ignored and local.
-Reports may include original analysis, metadata, hashes, and reproduction steps, but no third-party
-bytes or excerpts.
+software, firmware, disk images, `.mtlb`, AIR, or SPIR-V, or a disassembly listing of any of them.
+Keep those artifacts ignored and local. Reports may include original analysis, metadata, hashes, and
+reproduction steps, but no third-party bytes or excerpts.
 
 Each commit should have a detailed message body that states:
 
@@ -613,4 +315,15 @@ cargo clippy -p reims-vgpu --all-targets --no-default-features --features backen
 cargo clippy -p reims-vgpu --target x86_64-unknown-linux-gnu --all-targets --no-default-features --features backend-vulkan,host-window -- -D warnings
 ```
 
-Do not hide warnings, skip an affected arm, or commit a dropped test count without calling it out.
+Expect zero from all three. Do not hide warnings, skip an affected arm, or commit a dropped test
+count without calling it out — and **do not read "clippy clean" in a commit body as covering every
+arm**; it means the arms that commit ran.
+
+Two standing exceptions, both carried by `#[allow]`s at the module declarations that state the
+reason. `backend::metal::error::Status` is large by design — the payload is what makes each refusal
+name the check that refused, and it is `Copy` and compared by value at hundreds of sites — so
+`result_large_err` and `large_enum_variant` are exempted there. **A new error type that is large for
+no such reason should still be boxed**, not added to the exemption. Separately, the
+`transmute::<u64, MTL*>` sites turn a guest-decoded ordinal into a `#[repr(u64)]` Metal enum, where
+an out-of-range value is undefined behavior rather than a decode error; they are greppable and
+nothing range-checks them yet. Do not add more.

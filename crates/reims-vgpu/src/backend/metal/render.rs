@@ -8,6 +8,7 @@ use crate::backend::metal::constants::*;
 use crate::backend::metal::format::{mtl_pixel_format_bpp, pixel_format_from_u32};
 use crate::backend::metal::function::load_only_function;
 use crate::backend::metal::hash::{hash_bytes, hash_u64};
+use crate::backend::metal::mtl_enum;
 use crate::backend::metal::raw_metal::{
     command_buffer_error_description, render_reflection_sampler_mask, set_line_width,
 };
@@ -39,52 +40,53 @@ fn apply_blend(
     let Some(blend) = blend.filter(|b| b.enable != 0) else {
         return Status::OK;
     };
-    let max_factor = MTLBlendFactor::OneMinusBlendAlpha as u32;
-    let max_op = MTLBlendOperation::Max as u32;
-    if blend.src_rgb > max_factor {
-        set_err(err, "unsupported Metal blend state");
-        return Status::args("metal_render_blend_src_rgb_unsupported")
-            .field("value", blend.src_rgb)
-            .field("limit", max_factor);
+    // Each factor and operation is validated by being converted, so the
+    // accepted set is `MTLBlendFactor`'s own variant list rather than a ceiling
+    // written beside it. That matters here specifically: the ceiling this used
+    // to carry was `MTLBlendFactor::OneMinusBlendAlpha as u32`, which was the
+    // last variant when Metal shipped and is now the fifteenth of nineteen, so
+    // the four dual-source factors (`Source1Color` .. `OneMinusSource1Alpha`,
+    // 15-18) were refused device-wide. Every sibling bound in this file names
+    // its enum's actual last variant; this one had drifted.
+    //
+    // The six slugs stay one per field: which of the six words the guest got
+    // wrong is the whole content of the refusal, and a shared slug would report
+    // "a blend state was refused" for six different guest mistakes.
+    macro_rules! factor {
+        ($field:ident, $slug:literal) => {
+            match mtl_enum::blend_factor(blend.$field) {
+                Some(v) => v,
+                None => {
+                    set_err(err, "unsupported Metal blend state");
+                    return Status::args($slug).field("value", blend.$field);
+                }
+            }
+        };
     }
-    if blend.dst_rgb > max_factor {
-        set_err(err, "unsupported Metal blend state");
-        return Status::args("metal_render_blend_dst_rgb_unsupported")
-            .field("value", blend.dst_rgb)
-            .field("limit", max_factor);
+    macro_rules! operation {
+        ($field:ident, $slug:literal) => {
+            match mtl_enum::blend_operation(blend.$field) {
+                Some(v) => v,
+                None => {
+                    set_err(err, "unsupported Metal blend state");
+                    return Status::args($slug).field("value", blend.$field);
+                }
+            }
+        };
     }
-    if blend.src_alpha > max_factor {
-        set_err(err, "unsupported Metal blend state");
-        return Status::args("metal_render_blend_src_alpha_unsupported")
-            .field("value", blend.src_alpha)
-            .field("limit", max_factor);
-    }
-    if blend.dst_alpha > max_factor {
-        set_err(err, "unsupported Metal blend state");
-        return Status::args("metal_render_blend_dst_alpha_unsupported")
-            .field("value", blend.dst_alpha)
-            .field("limit", max_factor);
-    }
-    if blend.op_rgb > max_op {
-        set_err(err, "unsupported Metal blend state");
-        return Status::args("metal_render_blend_rgb_operation_unsupported")
-            .field("value", blend.op_rgb)
-            .field("limit", max_op);
-    }
-    if blend.op_alpha > max_op {
-        set_err(err, "unsupported Metal blend state");
-        return Status::args("metal_render_blend_alpha_operation_unsupported")
-            .field("value", blend.op_alpha)
-            .field("limit", max_op);
-    }
+    let src_rgb = factor!(src_rgb, "metal_render_blend_src_rgb_unsupported");
+    let dst_rgb = factor!(dst_rgb, "metal_render_blend_dst_rgb_unsupported");
+    let src_alpha = factor!(src_alpha, "metal_render_blend_src_alpha_unsupported");
+    let dst_alpha = factor!(dst_alpha, "metal_render_blend_dst_alpha_unsupported");
+    let op_rgb = operation!(op_rgb, "metal_render_blend_rgb_operation_unsupported");
+    let op_alpha = operation!(op_alpha, "metal_render_blend_alpha_operation_unsupported");
     color.set_blending_enabled(true);
-    color.set_source_rgb_blend_factor(unsafe { std::mem::transmute(blend.src_rgb as u64) });
-    color.set_destination_rgb_blend_factor(unsafe { std::mem::transmute(blend.dst_rgb as u64) });
-    color.set_rgb_blend_operation(unsafe { std::mem::transmute(blend.op_rgb as u64) });
-    color.set_source_alpha_blend_factor(unsafe { std::mem::transmute(blend.src_alpha as u64) });
-    color
-        .set_destination_alpha_blend_factor(unsafe { std::mem::transmute(blend.dst_alpha as u64) });
-    color.set_alpha_blend_operation(unsafe { std::mem::transmute(blend.op_alpha as u64) });
+    color.set_source_rgb_blend_factor(src_rgb);
+    color.set_destination_rgb_blend_factor(dst_rgb);
+    color.set_rgb_blend_operation(op_rgb);
+    color.set_source_alpha_blend_factor(src_alpha);
+    color.set_destination_alpha_blend_factor(dst_alpha);
+    color.set_alpha_blend_operation(op_alpha);
     Status::OK
 }
 
@@ -109,45 +111,67 @@ fn apply_raster_state(
     let Some(raster) = raster else {
         return Status::OK;
     };
-    if raster.has_cull_mode != 0 && raster.cull_mode > MTLCullMode::Back as u32 {
-        set_err(err, "unsupported Metal raster state");
-        return Status::args("metal_render_cull_mode_unsupported")
-            .field("cull_mode", raster.cull_mode);
+    // Convert every word the record carries before touching the encoder, the
+    // way the four range checks this replaced all ran first: a refusal on the
+    // fill mode must not leave the cull mode already applied.
+    //
+    // Each `has_` flag guards its own conversion, so a word the guest never set
+    // is not read at all — converting unconditionally would refuse a raster
+    // record for a field it does not carry.
+    macro_rules! optional {
+        ($has:ident, $field:ident, $convert:ident, $slug:literal, $name:literal) => {
+            if raster.$has != 0 {
+                match mtl_enum::$convert(raster.$field) {
+                    Some(v) => Some(v),
+                    None => {
+                        set_err(err, "unsupported Metal raster state");
+                        return Status::args($slug).field($name, raster.$field);
+                    }
+                }
+            } else {
+                None
+            }
+        };
     }
-    if raster.has_depth_clip_mode != 0 && raster.depth_clip_mode > MTLDepthClipMode::Clamp as u32 {
-        set_err(err, "unsupported Metal raster state");
-        return Status::args("metal_render_depth_clip_mode_unsupported")
-            .field("depth_clip_mode", raster.depth_clip_mode);
+    let cull = optional!(
+        has_cull_mode,
+        cull_mode,
+        cull_mode,
+        "metal_render_cull_mode_unsupported",
+        "cull_mode"
+    );
+    let depth_clip = optional!(
+        has_depth_clip_mode,
+        depth_clip_mode,
+        depth_clip_mode,
+        "metal_render_depth_clip_mode_unsupported",
+        "depth_clip_mode"
+    );
+    let front_facing = optional!(
+        has_front_facing_winding,
+        front_facing_winding,
+        winding,
+        "metal_render_winding_unsupported",
+        "winding"
+    );
+    let fill = optional!(
+        has_triangle_fill_mode,
+        triangle_fill_mode,
+        triangle_fill_mode,
+        "metal_render_fill_mode_unsupported",
+        "fill_mode"
+    );
+    if let Some(cull) = cull {
+        encoder.set_cull_mode(cull);
     }
-    if raster.has_front_facing_winding != 0
-        && raster.front_facing_winding > MTLWinding::CounterClockwise as u32
-    {
-        set_err(err, "unsupported Metal raster state");
-        return Status::args("metal_render_winding_unsupported")
-            .field("winding", raster.front_facing_winding);
+    if let Some(depth_clip) = depth_clip {
+        encoder.set_depth_clip_mode(depth_clip);
     }
-    if raster.has_triangle_fill_mode != 0
-        && raster.triangle_fill_mode > MTLTriangleFillMode::Lines as u32
-    {
-        set_err(err, "unsupported Metal raster state");
-        return Status::args("metal_render_fill_mode_unsupported")
-            .field("fill_mode", raster.triangle_fill_mode);
+    if let Some(front_facing) = front_facing {
+        encoder.set_front_facing_winding(front_facing);
     }
-    if raster.has_cull_mode != 0 {
-        encoder.set_cull_mode(unsafe { std::mem::transmute(raster.cull_mode as u64) });
-    }
-    if raster.has_depth_clip_mode != 0 {
-        encoder.set_depth_clip_mode(unsafe { std::mem::transmute(raster.depth_clip_mode as u64) });
-    }
-    if raster.has_front_facing_winding != 0 {
-        encoder.set_front_facing_winding(unsafe {
-            std::mem::transmute(raster.front_facing_winding as u64)
-        });
-    }
-    if raster.has_triangle_fill_mode != 0 {
-        encoder.set_triangle_fill_mode(unsafe {
-            std::mem::transmute(raster.triangle_fill_mode as u64)
-        });
+    if let Some(fill) = fill {
+        encoder.set_triangle_fill_mode(fill);
     }
     if raster.has_line_width != 0 {
         // RenderCommandEncoder is a Message object.
@@ -174,24 +198,38 @@ fn apply_depth_bias(
     }
 }
 
-fn stencil_face_valid(face: &ReimsVgpuDepthStencilFaceState) -> bool {
-    face.compare_function <= MTLCompareFunction::Always as u32
-        && face.stencil_failure_operation <= MTLStencilOperation::DecrementWrap as u32
-        && face.depth_failure_operation <= MTLStencilOperation::DecrementWrap as u32
-        && face.depth_stencil_pass_operation <= MTLStencilOperation::DecrementWrap as u32
+/// One stencil face's four enum words, already converted.
+///
+/// The validity check and the application used to be separate functions over
+/// the same raw struct — one comparing four ordinals against a ceiling, the
+/// other transmuting the same four. Carrying the converted values instead means
+/// the check *is* the conversion, so there is no way to apply a face that was
+/// not checked and no second copy of the accepted set.
+struct StencilFace {
+    compare: MTLCompareFunction,
+    stencil_fail: MTLStencilOperation,
+    depth_fail: MTLStencilOperation,
+    pass: MTLStencilOperation,
 }
 
-fn apply_stencil_face(dst: &StencilDescriptorRef, src: &ReimsVgpuDepthStencilFaceState) {
-    dst.set_stencil_compare_function(unsafe { std::mem::transmute(src.compare_function as u64) });
-    dst.set_stencil_failure_operation(unsafe {
-        std::mem::transmute(src.stencil_failure_operation as u64)
-    });
-    dst.set_depth_failure_operation(unsafe {
-        std::mem::transmute(src.depth_failure_operation as u64)
-    });
-    dst.set_depth_stencil_pass_operation(unsafe {
-        std::mem::transmute(src.depth_stencil_pass_operation as u64)
-    });
+fn stencil_face_converted(face: &ReimsVgpuDepthStencilFaceState) -> Option<StencilFace> {
+    Some(StencilFace {
+        compare: mtl_enum::compare_function(face.compare_function)?,
+        stencil_fail: mtl_enum::stencil_operation(face.stencil_failure_operation)?,
+        depth_fail: mtl_enum::stencil_operation(face.depth_failure_operation)?,
+        pass: mtl_enum::stencil_operation(face.depth_stencil_pass_operation)?,
+    })
+}
+
+fn apply_stencil_face(
+    dst: &StencilDescriptorRef,
+    src: &ReimsVgpuDepthStencilFaceState,
+    face: &StencilFace,
+) {
+    dst.set_stencil_compare_function(face.compare);
+    dst.set_stencil_failure_operation(face.stencil_fail);
+    dst.set_depth_failure_operation(face.depth_fail);
+    dst.set_depth_stencil_pass_operation(face.pass);
     dst.set_read_mask(src.read_mask);
     dst.set_write_mask(src.write_mask);
 }
@@ -204,44 +242,42 @@ fn apply_depth_stencil_state(
     err: ErrOut<'_>,
 ) -> Status {
     if let Some(ds) = depth_stencil {
-        if ds.depth_compare_function > MTLCompareFunction::Always as u32 {
+        let Some(depth_compare) = mtl_enum::compare_function(ds.depth_compare_function) else {
             set_err(err, "unsupported Metal depth-stencil enum value");
             return Status::args("metal_render_depth_compare_unsupported")
                 .field("compare", ds.depth_compare_function);
-        }
-        if !stencil_face_valid(&ds.front_face) {
+        };
+        let Some(front) = stencil_face_converted(&ds.front_face) else {
             set_err(err, "unsupported Metal depth-stencil enum value");
             return Status::args("metal_render_front_stencil_state_unsupported")
                 .field("compare", ds.front_face.compare_function)
                 .field("stencil_fail", ds.front_face.stencil_failure_operation)
                 .field("depth_fail", ds.front_face.depth_failure_operation)
                 .field("pass", ds.front_face.depth_stencil_pass_operation);
-        }
-        if !stencil_face_valid(&ds.back_face) {
+        };
+        let Some(back) = stencil_face_converted(&ds.back_face) else {
             set_err(err, "unsupported Metal depth-stencil enum value");
             return Status::args("metal_render_back_stencil_state_unsupported")
                 .field("compare", ds.back_face.compare_function)
                 .field("stencil_fail", ds.back_face.stencil_failure_operation)
                 .field("depth_fail", ds.back_face.depth_failure_operation)
                 .field("pass", ds.back_face.depth_stencil_pass_operation);
-        }
+        };
         let ds_key = hash_bytes(bytes_of(ds));
         let state = if let Some(hit) = depth_stencil_lookup(ds_key, ds) {
             hit
         } else {
             let descriptor = DepthStencilDescriptor::new();
-            descriptor.set_depth_compare_function(unsafe {
-                std::mem::transmute(ds.depth_compare_function as u64)
-            });
+            descriptor.set_depth_compare_function(depth_compare);
             descriptor.set_depth_write_enabled(ds.depth_write_enabled != 0);
             if ds.front_stencil_enabled != 0 {
                 let face = StencilDescriptor::new();
-                apply_stencil_face(&face, &ds.front_face);
+                apply_stencil_face(&face, &ds.front_face, &front);
                 descriptor.set_front_face_stencil(Some(&face));
             }
             if ds.back_stencil_enabled != 0 {
                 let face = StencilDescriptor::new();
-                apply_stencil_face(&face, &ds.back_face);
+                apply_stencil_face(&face, &ds.back_face, &back);
                 descriptor.set_back_face_stencil(Some(&face));
             }
             let state = device.new_depth_stencil_state(&descriptor);
@@ -450,21 +486,45 @@ fn make_vertex_descriptor(
                     .field("limit", REIMS_VGPU_METAL_MAX_BUFFERS),
             );
         }
+        // The format and step-function words come straight off the guest's
+        // type-7 pipeline descriptor and nothing upstream clamps them, so both
+        // are converted before anything is encoded. Neither had any check at
+        // all before; the location and buffer index above did.
+        let Some(format) = mtl_enum::vertex_format(attr.format) else {
+            set_err(
+                err,
+                format!("unsupported vertex attribute format {}", attr.format),
+            );
+            return Err(
+                Status::args("metal_render_vertex_attribute_format_unsupported")
+                    .field("location", attr.location)
+                    .field("format", attr.format),
+            );
+        };
+        let step_ordinal = if attr.has_step_function != 0 {
+            attr.step_function
+        } else {
+            MTLVertexStepFunction::PerVertex as u32
+        };
+        let Some(step) = mtl_enum::vertex_step_function(step_ordinal) else {
+            set_err(
+                err,
+                format!("unsupported vertex step function {step_ordinal}"),
+            );
+            return Err(Status::args("metal_render_vertex_step_function_unsupported")
+                .field("buffer", attr.buffer_index)
+                .field("step", step_ordinal));
+        };
         // Optional host bytes → Metal buffer slot for encode-time bind.
         find_or_add_attr_slot(device, &mut slots, attr, err)?;
         if let Some(a) = descriptor.attributes().object_at(attr.location as u64) {
-            a.set_format(unsafe { std::mem::transmute(attr.format as u64) });
+            a.set_format(format);
             a.set_offset(attr.offset as u64);
             a.set_buffer_index(attr.buffer_index as u64);
         }
         if let Some(layout) = descriptor.layouts().object_at(attr.buffer_index as u64) {
             layout.set_stride(attr.stride as u64);
-            let step = if attr.has_step_function != 0 {
-                attr.step_function
-            } else {
-                MTLVertexStepFunction::PerVertex as u32
-            };
-            layout.set_step_function(unsafe { std::mem::transmute(step as u64) });
+            layout.set_step_function(step);
             let rate = if attr.has_step_rate != 0 {
                 attr.step_rate
             } else {
@@ -491,6 +551,9 @@ pub struct ColorRtKey {
     pub write_mask: u32,
 }
 
+// Every argument is one component of the pipeline-state key, and the point of
+// the function is that the key is built from exactly these and nothing else.
+#[allow(clippy::too_many_arguments)]
 fn fill_render_pso_key(
     vert_hash: u64,
     vert_len: usize,
@@ -503,12 +566,14 @@ fn fill_render_pso_key(
     stencil_pixel_format: u32,
 ) -> RenderPsoKey {
     use crate::backend::metal::constants::REIMS_VGPU_METAL_MAX_COLOR_RTS;
-    let mut key = RenderPsoKey::default();
-    key.vert_hash = vert_hash;
-    key.frag_hash = frag_hash;
-    key.vert_len = vert_len;
-    key.frag_len = frag_len;
-    key.attr_count = attrs.len() as u32;
+    let mut key = RenderPsoKey {
+        vert_hash,
+        frag_hash,
+        vert_len,
+        frag_len,
+        attr_count: attrs.len() as u32,
+        ..Default::default()
+    };
     for (i, attr) in attrs.iter().enumerate().take(REIMS_VGPU_METAL_MAX_ATTRS) {
         key.attr_location[i] = attr.location;
         key.attr_format[i] = attr.format;
@@ -1077,12 +1142,16 @@ fn bind_samplers(
         }
     }
 
-    for index in 0..REIMS_VGPU_METAL_MAX_SAMPLERS {
-        if (sampler_mask & (1u32 << index)) == 0 || seen[index] {
+    for (index, seen) in seen
+        .iter_mut()
+        .enumerate()
+        .take(REIMS_VGPU_METAL_MAX_SAMPLERS)
+    {
+        if (sampler_mask & (1u32 << index)) == 0 || *seen {
             continue;
         }
         let sampler = make_default_sampler(device);
-        seen[index] = true;
+        *seen = true;
         if fragment_stage {
             encoder.set_fragment_sampler_state(index as u64, Some(&sampler));
         } else {
@@ -1092,14 +1161,42 @@ fn bind_samplers(
     Status::OK
 }
 
+/// A depth or stencil attachment's two actions, converted once by the validator
+/// and handed to the configure pass.
+///
+/// Converting here rather than where they are encoded keeps this device's two
+/// layers of narrowing distinct and each stated once. The validator below is
+/// *policy*: it accepts only `DontCare`/`Load`/`Clear` and only
+/// `DontCare`/`Store`, refusing `MultisampleResolve` and the rest because this
+/// device has no resolve path. [`mtl_enum`] is *type validity*: it accepts
+/// every variant `metal` declares. Encoding used to transmute the raw ordinal
+/// and was sound only because the validator happened to have run first, in a
+/// different function, with nothing in the types saying so.
+#[derive(Clone, Copy, Debug)]
+struct AttachmentActions {
+    load: MTLLoadAction,
+    store: MTLStoreAction,
+}
+
+impl Default for AttachmentActions {
+    /// What an absent attachment carries; `configure_*` returns before reading
+    /// it, because a `None` attachment produces no texture at all.
+    fn default() -> Self {
+        Self {
+            load: MTLLoadAction::DontCare,
+            store: MTLStoreAction::DontCare,
+        }
+    }
+}
+
 fn validate_depth_attachment(
     depth: Option<&ReimsVgpuDepthAttachment>,
     width: u32,
     height: u32,
     err: ErrOut<'_>,
-) -> Result<usize, Status> {
+) -> Result<AttachmentActions, Status> {
     let Some(depth) = depth else {
-        return Ok(0);
+        return Ok(AttachmentActions::default());
     };
     if depth.pixel_format != REIMS_VGPU_MTL_PIXEL_FORMAT_DEPTH32_FLOAT {
         set_err(
@@ -1112,7 +1209,7 @@ fn validate_depth_attachment(
         return Err(Status::args("metal_render_depth_format_unsupported")
             .field("format", depth.pixel_format));
     }
-    if depth.load_action > REIMS_VGPU_MTL_LOAD_ACTION_CLEAR {
+    let Some(load) = mtl_enum::load_action(depth.load_action) else {
         set_err(
             err,
             format!(
@@ -1122,10 +1219,13 @@ fn validate_depth_attachment(
         );
         return Err(Status::args("metal_render_depth_load_action_unsupported")
             .field("load_action", depth.load_action));
-    }
-    if depth.store_action != REIMS_VGPU_MTL_STORE_ACTION_DONT_CARE
-        && depth.store_action != REIMS_VGPU_MTL_STORE_ACTION_STORE
-    {
+    };
+    // The two accepted store actions are named rather than bounded: this device
+    // has no resolve path, so `MultisampleResolve` and everything above it are
+    // refused even though they are legal `MTLStoreAction` values.
+    let Some(store @ (MTLStoreAction::DontCare | MTLStoreAction::Store)) =
+        mtl_enum::store_action(depth.store_action)
+    else {
         set_err(
             err,
             format!(
@@ -1135,7 +1235,7 @@ fn validate_depth_attachment(
         );
         return Err(Status::args("metal_render_depth_store_action_unsupported")
             .field("store_action", depth.store_action));
-    }
+    };
     let Some(depth_len) = image_len(width, height, std::mem::size_of::<f32>()) else {
         set_err(err, "invalid depth attachment dimensions");
         return Err(Status::args("metal_render_depth_geometry_invalid")
@@ -1162,7 +1262,10 @@ fn validate_depth_attachment(
             .field("load_action", depth.load_action)
             .field("store_action", depth.store_action));
     }
-    Ok(depth_len)
+    // `depth_len` is checked above against the attachment's declared length and
+    // is not needed beyond that; the caller used to receive it and discard it.
+    let _ = depth_len;
+    Ok(AttachmentActions { load, store })
 }
 
 fn validate_stencil_attachment(
@@ -1170,9 +1273,9 @@ fn validate_stencil_attachment(
     width: u32,
     height: u32,
     err: ErrOut<'_>,
-) -> Result<usize, Status> {
+) -> Result<AttachmentActions, Status> {
     let Some(stencil) = stencil else {
-        return Ok(0);
+        return Ok(AttachmentActions::default());
     };
     if stencil.pixel_format != REIMS_VGPU_MTL_PIXEL_FORMAT_STENCIL8 {
         set_err(
@@ -1185,7 +1288,7 @@ fn validate_stencil_attachment(
         return Err(Status::args("metal_render_stencil_format_unsupported")
             .field("format", stencil.pixel_format));
     }
-    if stencil.load_action > REIMS_VGPU_MTL_LOAD_ACTION_CLEAR {
+    let Some(load) = mtl_enum::load_action(stencil.load_action) else {
         set_err(
             err,
             format!(
@@ -1195,10 +1298,10 @@ fn validate_stencil_attachment(
         );
         return Err(Status::args("metal_render_stencil_load_action_unsupported")
             .field("load_action", stencil.load_action));
-    }
-    if stencil.store_action != REIMS_VGPU_MTL_STORE_ACTION_DONT_CARE
-        && stencil.store_action != REIMS_VGPU_MTL_STORE_ACTION_STORE
-    {
+    };
+    let Some(store @ (MTLStoreAction::DontCare | MTLStoreAction::Store)) =
+        mtl_enum::store_action(stencil.store_action)
+    else {
         set_err(
             err,
             format!(
@@ -1210,7 +1313,7 @@ fn validate_stencil_attachment(
             Status::args("metal_render_stencil_store_action_unsupported")
                 .field("store_action", stencil.store_action),
         );
-    }
+    };
     let Some(stencil_len) = image_len(width, height, 1) else {
         set_err(err, "invalid stencil attachment dimensions");
         return Err(Status::args("metal_render_stencil_geometry_invalid")
@@ -1239,7 +1342,8 @@ fn validate_stencil_attachment(
             .field("load_action", stencil.load_action)
             .field("store_action", stencil.store_action));
     }
-    Ok(stencil_len)
+    let _ = stencil_len;
+    Ok(AttachmentActions { load, store })
 }
 
 fn configure_depth_attachment(
@@ -1249,10 +1353,9 @@ fn configure_depth_attachment(
     depth: Option<&ReimsVgpuDepthAttachment>,
     width: u32,
     height: u32,
+    actions: AttachmentActions,
 ) -> Option<Texture> {
-    let Some(depth) = depth else {
-        return None;
-    };
+    let depth = depth?;
     let descriptor = TextureDescriptor::new();
     descriptor.set_texture_type(MTLTextureType::D2);
     descriptor.set_pixel_format(pixel_format_from_u32(depth.pixel_format));
@@ -1280,9 +1383,9 @@ fn configure_depth_attachment(
     retained.push(texture.clone());
     if let Some(att) = pass.depth_attachment() {
         att.set_texture(Some(&texture));
-        att.set_load_action(unsafe { std::mem::transmute(depth.load_action as u64) });
+        att.set_load_action(actions.load);
         att.set_clear_depth(depth.clear_depth);
-        att.set_store_action(unsafe { std::mem::transmute(depth.store_action as u64) });
+        att.set_store_action(actions.store);
     }
     Some(texture)
 }
@@ -1294,10 +1397,9 @@ fn configure_stencil_attachment(
     stencil: Option<&ReimsVgpuStencilAttachment>,
     width: u32,
     height: u32,
+    actions: AttachmentActions,
 ) -> Option<Texture> {
-    let Some(stencil) = stencil else {
-        return None;
-    };
+    let stencil = stencil?;
     let descriptor = TextureDescriptor::new();
     descriptor.set_texture_type(MTLTextureType::D2);
     descriptor.set_pixel_format(pixel_format_from_u32(stencil.pixel_format));
@@ -1320,9 +1422,9 @@ fn configure_stencil_attachment(
     retained.push(texture.clone());
     if let Some(att) = pass.stencil_attachment() {
         att.set_texture(Some(&texture));
-        att.set_load_action(unsafe { std::mem::transmute(stencil.load_action as u64) });
+        att.set_load_action(actions.load);
         att.set_clear_stencil(stencil.clear_stencil);
-        att.set_store_action(unsafe { std::mem::transmute(stencil.store_action as u64) });
+        att.set_store_action(actions.store);
     }
     Some(texture)
 }
@@ -1577,11 +1679,11 @@ pub fn render_core_mrt(
         );
         return Status::args("metal_render_indirect_and_indexed_conflict");
     }
-    if primitive_type > MTLPrimitiveType::TriangleStrip as u32 {
+    let Some(prim) = mtl_enum::primitive_type(primitive_type) else {
         set_err(err, "unsupported Metal primitive type");
         return Status::args("metal_render_primitive_type_unsupported")
             .field("primitive_type", primitive_type);
-    }
+    };
     if viewports.len() > REIMS_VGPU_BACKEND_MAX_VIEWPORTS {
         set_err(err, "invalid viewport array state");
         return Status::args("metal_render_viewport_count_exceeded")
@@ -1614,17 +1716,16 @@ pub fn render_core_mrt(
         Err(st) => return st,
     };
 
-    let depth_len = match validate_depth_attachment(depth_attachment.as_deref(), width, height, err)
-    {
-        Ok(n) => n,
-        Err(st) => return st,
-    };
-    let stencil_len =
-        match validate_stencil_attachment(stencil_attachment.as_deref(), width, height, err) {
-            Ok(n) => n,
+    let depth_actions =
+        match validate_depth_attachment(depth_attachment.as_deref(), width, height, err) {
+            Ok(a) => a,
             Err(st) => return st,
         };
-    let _ = (depth_len, stencil_len);
+    let stencil_actions =
+        match validate_stencil_attachment(stencil_attachment.as_deref(), width, height, err) {
+            Ok(a) => a,
+            Err(st) => return st,
+        };
 
     let color_rt_keys: Vec<ColorRtKey> = colors
         .iter()
@@ -1733,24 +1834,26 @@ pub fn render_core_mrt(
 
     let depth_texture = configure_depth_attachment(
         device,
-        &pass,
+        pass,
         &mut retained_tex,
         depth_attachment.as_deref(),
         width,
         height,
+        depth_actions,
     );
     let stencil_texture = configure_stencil_attachment(
         device,
-        &pass,
+        pass,
         &mut retained_tex,
         stencil_attachment.as_deref(),
         width,
         height,
+        stencil_actions,
     );
 
     let queue = thread_queue(device);
     let command_buffer = queue.new_command_buffer().to_owned();
-    let encoder = command_buffer.new_render_command_encoder(&pass);
+    let encoder = command_buffer.new_render_command_encoder(pass);
     encoder.set_render_pipeline_state(&pso);
     apply_blend_color(encoder, blend);
     let rc = apply_raster_state(encoder, raster, err);
@@ -1815,8 +1918,6 @@ pub fn render_core_mrt(
         return rc;
     }
 
-    let prim: MTLPrimitiveType = unsafe { std::mem::transmute(primitive_type as u64) };
-
     if let Some(pi) = primitive_indirect {
         let need = std::mem::size_of::<ReimsVgpuPrimitiveIndirectArguments>();
         if pi.arguments.is_null() {
@@ -1839,8 +1940,7 @@ pub fn render_core_mrt(
         retained_buf.push(indirect.clone());
         encoder.draw_primitives_indirect(prim, &indirect, 0);
     } else if let Some(ix) = indexed {
-        let index_type_ok = ix.index_type == MTLIndexType::UInt16 as u32
-            || ix.index_type == MTLIndexType::UInt32 as u32;
+        let converted_index_type = mtl_enum::index_type(ix.index_type);
         if ix.indices.is_null() {
             set_err(err, "invalid indexed draw");
             encoder.end_encoding();
@@ -1856,17 +1956,18 @@ pub fn render_core_mrt(
             encoder.end_encoding();
             return Status::args("metal_render_index_count_zero");
         }
-        if !index_type_ok {
+        // Kept after the three checks above so the refusal order is unchanged;
+        // the conversion itself ran before any of them.
+        let Some(index_type) = converted_index_type else {
             set_err(err, "invalid indexed draw");
             encoder.end_encoding();
             return Status::args("metal_render_index_type_unsupported")
                 .field("index_type", ix.index_type);
-        }
+        };
         let base_vertex = ix.base_vertex;
-        let index_size: usize = if ix.index_type == MTLIndexType::UInt16 as u32 {
-            2
-        } else {
-            4
+        let index_size: usize = match index_type {
+            MTLIndexType::UInt16 => 2,
+            MTLIndexType::UInt32 => 4,
         };
         if indexed_indirect {
             let ind = unsafe { &*ix.indirect };
@@ -1891,11 +1992,7 @@ pub fn render_core_mrt(
                 base_instance: 0,
             };
             unsafe {
-                ptr::copy_nonoverlapping(
-                    ind.arguments as *const u8,
-                    &mut args as *mut _ as *mut u8,
-                    need,
-                );
+                ptr::copy_nonoverlapping(ind.arguments, &mut args as *mut _ as *mut u8, need);
             }
             let Some(index_end) =
                 (args.index_start as usize).checked_add(args.index_count as usize)
@@ -1955,7 +2052,7 @@ pub fn render_core_mrt(
             retained_buf.push(indirect.clone());
             encoder.draw_indexed_primitives_indirect(
                 prim,
-                unsafe { std::mem::transmute(ix.index_type as u64) },
+                index_type,
                 &index_buffer,
                 0,
                 &indirect,
@@ -1965,7 +2062,7 @@ pub fn render_core_mrt(
             encoder.draw_indexed_primitives_instanced_base_instance(
                 prim,
                 ix.index_count as u64,
-                unsafe { std::mem::transmute(ix.index_type as u64) },
+                index_type,
                 &index_buffer,
                 0,
                 instance_count as u64,

@@ -3299,6 +3299,16 @@ fn note_draw_coverage(
 /// Shared by the per-draw census and the per-pass union so the two are read
 /// against the same boundaries. Band 0 is *under* one percent rather than
 /// exactly one, because the percentage is integer-truncated.
+/// The band function, for `exec`'s pass-extent census to compare against.
+///
+/// That census declares its own copy because it runs on every backend and this
+/// module is behind `backend-vulkan`; the test that calls this is what stops the
+/// two from drifting.
+#[cfg(test)]
+pub(crate) fn coverage_band_for_test(pct: u64) -> usize {
+    coverage_band(pct)
+}
+
 fn coverage_band(pct: u64) -> usize {
     match pct {
         0 => 0,
@@ -4981,11 +4991,25 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             resources.indexed = Some(crate::backend::vulkan::engine::IndexedDrawResource {
                 index_type,
                 index_count: idx.index_count,
-                // IndexedDrawInfo does not carry baseVertex yet (Metal path uses 0).
-                vertex_offset: 0,
+                // Vulkan's vertexOffset is a signed 32-bit field where Metal's
+                // baseVertex is 64-bit, so a value that cannot fit is declined
+                // rather than wrapped into an index somewhere else in the
+                // buffer. The guest cannot express one: Apple's serializer
+                // truncates baseVertex to 16 bits in the compact records and
+                // this device's own decode is the only other source.
+                vertex_offset: i32::try_from(idx.base_vertex).map_err(|_| {
+                    DrawError::DrawPreparation(DrawPreparationDecline::IndexLoad {
+                        reason: crate::runtime::metal_draw::IndexLoadReason::BaseVertexOutOfRange,
+                    })
+                })?,
                 indices,
             });
         }
+        // Vulkan's `firstInstance` is Metal's `baseInstance`. The field has
+        // always been here and always read 0, because nothing upstream decoded
+        // the draw forms that carry one; the engine's Constant-step-rate vertex
+        // prefix rebuild already reads it.
+        resources.base_instance = req.base_instance;
         resources.vertex_attributes = attrs;
         resources.storage_buffers = storage;
         resources.sampled_images = images;

@@ -60,7 +60,7 @@ pub fn new_buffer_from_host(device: &Device, data: *const u8, len: usize) -> Opt
     }
     let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize };
     let addr = data as usize;
-    if page != 0 && addr % page == 0 && len % page == 0 {
+    if page != 0 && addr.is_multiple_of(page) && len.is_multiple_of(page) {
         let buf = device.new_buffer_with_bytes_no_copy(
             data as *const _,
             len as u64,

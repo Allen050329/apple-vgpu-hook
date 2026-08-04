@@ -244,6 +244,17 @@ struct PendingGuestResize {
 /// Vulkan objects tear down before the join returns.
 pub type StopFlag = Arc<AtomicBool>;
 
+/// Set after the native window and all of its Vulkan objects have torn down.
+/// QEMU's backend teardown waits for this before destroying shared GPU state.
+///
+/// Darwin only, like the [`start_main_thread`]/[`run_main_thread`] pair that
+/// publishes it: elsewhere the window owns its own thread and `stop` plus the
+/// join covers the same ordering. A reachability sweep run on a non-Apple host
+/// sees every user of this alias behind a `cfg` it did not compile and reports
+/// it unused — that reading cost one broken macOS build already.
+#[cfg(target_os = "macos")]
+pub type ExitedFlag = Arc<AtomicBool>;
+
 /// Errors from bringing up or running the window.
 ///
 /// One variant per distinct check, so each names itself in `/tmp/reims-vgpu-fail.log`

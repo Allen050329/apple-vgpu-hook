@@ -1,8 +1,16 @@
 //! Resource descriptor decode (port of `host/utils/reims-vgpu-resource-decode`).
 
 use crate::contract::endian::{ld16, ld32, ld64}; // ld64: texture-view level base/count
+use crate::runtime::heap_query;
 #[cfg(test)]
 use crate::contract::endian::{st16, st32}; // ICB layout fixture encoder only
+
+use core::mem::{offset_of, size_of};
+use reims_vgpu_wire::ops::{
+    backed_texture as w_backed, depth_stencil as w_ds, heap_texture as w_heap, icb as w_icb,
+    sampler as w_smp, texture_view as w_view,
+};
+use reims_vgpu_wire::OP_HEADER_LEN as OP_HDR;
 
 /// A refusal from the descriptor decoder.
 ///
@@ -74,38 +82,45 @@ pub const OBJECT_TYPE_TEXTURE_VIEW: u8 = 8;
 pub const OBJECT_TYPE_IOSURFACE: u8 = 11;
 
 /// Type-7 first dword subtypes.
-pub const TYPE7_OBJECT_SAMPLER: u32 = 0x03;
-pub const TYPE7_OBJECT_DEPTH_STENCIL: u32 = 0x04;
+pub const TYPE7_OBJECT_SAMPLER: u32 = w_smp::OPCODE_NEW_SAMPLER;
+pub const TYPE7_OBJECT_DEPTH_STENCIL: u32 = w_ds::OPCODE_NEW_DEPTH_STENCIL;
 pub const TYPE7_OBJECT_COMPUTE_PIPELINE: u32 = 0x0b;
 pub const TYPE7_OBJECT_RENDER_PIPELINE: u32 = 0x0e;
 /// Indirect command buffer create body from
 /// `PGSerializer newIndirectCommandBufferWithDescriptor:layout:maxCommandCount:options:allocator:`.
-pub const TYPE7_OBJECT_ICB: u32 = 0x36;
+pub const TYPE7_OBJECT_ICB: u32 = w_icb::OPCODE_NEW_INDIRECT_COMMAND_BUFFER;
 /// End of the 16-byte type-7 header, which is also where its first TLV
 /// starts — one boundary, so one name.
 pub const TYPE7_FIRST_TLVS: usize = 16;
 /// Serialized ICB descriptor length (allocateOperationBytes 0x58).
-pub const ICB_DESC_LEN: usize = 0x58;
+pub const ICB_DESC_LEN: usize = w_icb::NEW_INDIRECT_COMMAND_BUFFER_TOTAL_LEN as usize;
 pub const ICB_DESC_TAG: usize = 0;
 pub const ICB_DESC_DECLARED_LEN: usize = 4;
-pub const ICB_DESC_COMMAND_TYPES: usize = 8;
+pub const ICB_DESC_COMMAND_TYPES: usize = OP_HDR + offset_of!(w_icb::NewIcbBody, command_types);
 /// Per-stage max bind counts are single bytes (PGSerializer create body).
 /// `newIndirectCommandBufferWithDescriptor:…` strb order:
 /// +0xc vertex · +0xd fragment · +0xe kernel · +0xf object · +0x10 mesh ·
 /// +0x11 kernelTG · +0x12 objectTG.
-pub const ICB_DESC_MAX_VERTEX_BINDS: usize = 0x0c; // u8
-pub const ICB_DESC_MAX_FRAGMENT_BINDS: usize = 0x0d; // u8
+pub const ICB_DESC_MAX_VERTEX_BINDS: usize =
+    OP_HDR + offset_of!(w_icb::NewIcbBody, max_vertex_buffer_bind_count);
+pub const ICB_DESC_MAX_FRAGMENT_BINDS: usize =
+    OP_HDR + offset_of!(w_icb::NewIcbBody, max_fragment_buffer_bind_count);
 /// maxKernelBufferBindCount.
-pub const ICB_DESC_MAX_KERNEL_BINDS: usize = 0x0e; // u8
+pub const ICB_DESC_MAX_KERNEL_BINDS: usize =
+    OP_HDR + offset_of!(w_icb::NewIcbBody, max_kernel_buffer_bind_count);
 /// maxObjectBufferBindCount (mesh object stage).
-pub const ICB_DESC_MAX_OBJECT_BINDS: usize = 0x0f; // u8
+pub const ICB_DESC_MAX_OBJECT_BINDS: usize =
+    OP_HDR + offset_of!(w_icb::NewIcbBody, max_object_buffer_bind_count);
 /// maxMeshBufferBindCount.
-pub const ICB_DESC_MAX_MESH_BINDS: usize = 0x10; // u8
+pub const ICB_DESC_MAX_MESH_BINDS: usize =
+    OP_HDR + offset_of!(w_icb::NewIcbBody, max_mesh_buffer_bind_count);
 /// maxKernelThreadgroupMemoryBindCount.
-pub const ICB_DESC_MAX_KERNEL_TG_BINDS: usize = 0x11; // u8
+pub const ICB_DESC_MAX_KERNEL_TG_BINDS: usize =
+    OP_HDR + offset_of!(w_icb::NewIcbBody, max_kernel_threadgroup_memory_bind_count);
 /// maxObjectThreadgroupMemoryBindCount.
-pub const ICB_DESC_MAX_OBJECT_TG_BINDS: usize = 0x12; // u8
-pub const ICB_DESC_FLAGS: usize = 0x16; // u16 feature flags
+pub const ICB_DESC_MAX_OBJECT_TG_BINDS: usize =
+    OP_HDR + offset_of!(w_icb::NewIcbBody, max_object_threadgroup_memory_bind_count);
+pub const ICB_DESC_FLAGS: usize = OP_HDR + offset_of!(w_icb::NewIcbBody, flags);
 /// Bytes per ICB kernel-threadgroup-memory length slot (`u64` length at index).
 pub const ICB_TG_MEMORY_STRIDE: usize = 8;
 /// Bytes per ICB attribute-stride table entry (`u64` stride at buffer index).
@@ -113,15 +128,86 @@ pub const ICB_TG_MEMORY_STRIDE: usize = 8;
 /// `setVertexBuffer:offset:attributeStride:atIndex:` store at
 /// `attributeStrideOffset + index*8`.
 pub const ICB_ATTRIBUTE_STRIDE_ENTRY_SIZE: usize = 8;
-/// Flags at +0x16 from create, in the order the command layout sets them up:
-/// bit0 = inheritPipelineState, bit1 = inheritBuffers.
+/// Flags at `+0x16`, one bit per `MTLIndirectCommandBufferDescriptor` BOOL.
+///
+/// Every position below was derived by inverting exactly that property from the
+/// value a fresh descriptor reads back and diffing the emitted record — one
+/// case per property, so no bit is named from an assumption about ordering. The
+/// derivation and its fixtures live in
+/// [`reims_vgpu_wire::ops::icb::flag`](reims_vgpu_wire::ops::icb::flag), which
+/// this device agrees with bit for bit; the two are checked against each other
+/// in this module's tests.
+///
+/// The order is **not** the order Metal declares the properties, and the run is
+/// **not contiguous**: bit 6 sits between `INHERIT_DEPTH_BIAS` and
+/// `INHERIT_DEPTH_CLIP_MODE` and no property moves it. Do not extend this list
+/// by counting.
 pub const ICB_FLAG_INHERIT_PIPELINE_STATE: u16 = 1 << 0;
 pub const ICB_FLAG_INHERIT_BUFFERS: u16 = 1 << 1;
+/// `supportRayTracing`, default **off** on both Metal's descriptor and the
+/// guest's, so a set bit is the guest asking for something.
+pub const ICB_FLAG_SUPPORT_RAY_TRACING: u16 = 1 << 2;
+/// `supportDynamicAttributeStride`, default off.
+pub const ICB_FLAG_SUPPORT_DYNAMIC_ATTRIBUTE_STRIDE: u16 = 1 << 3;
+/// `inheritDepthStencilState`, default **on** — so a *clear* bit is the guest
+/// asking for something, which is the opposite reading from the two above.
+pub const ICB_FLAG_INHERIT_DEPTH_STENCIL_STATE: u16 = 1 << 4;
+/// `inheritDepthBias`, default on.
+pub const ICB_FLAG_INHERIT_DEPTH_BIAS: u16 = 1 << 5;
+/// `inheritDepthClipMode`, default on. Bit **7**, not bit 6.
+pub const ICB_FLAG_INHERIT_DEPTH_CLIP_MODE: u16 = 1 << 7;
+/// `inheritCullMode`, default on.
+pub const ICB_FLAG_INHERIT_CULL_MODE: u16 = 1 << 8;
+/// `inheritFrontFacingWinding`, default on.
+pub const ICB_FLAG_INHERIT_FRONT_FACING_WINDING: u16 = 1 << 9;
+/// `inheritTriangleFillMode`, default on.
+pub const ICB_FLAG_INHERIT_TRIANGLE_FILL_MODE: u16 = 1 << 10;
+/// Bits 6 and 11-14: set in every record the serializer produced and moved by
+/// none of the eleven BOOLs the descriptor declares. Bit 15 is excluded because
+/// the serializer never writes it, which the poison test measures rather than
+/// assumes.
+pub const ICB_FLAG_UNIDENTIFIED: u16 = (1 << 6) | (1 << 11) | (1 << 12) | (1 << 13) | (1 << 14);
+/// Bit 15, which the serializer never writes: on a guest's ring it is whatever
+/// the last record left there.
+///
+/// [`decode_icb_descriptor`] masks it off, so the decoded word holds only bits
+/// Apple wrote. That is not fastidiousness —
+/// [`IndirectCommandBufferDescriptor`] derives `PartialEq` and the host ICB
+/// cache compares descriptors, so a noise bit would make one buffer look like
+/// two. Storing the raw word without this mask is a bug the fixture instrument
+/// caught within minutes of the word being stored at all.
+pub const ICB_FLAG_NEVER_WRITTEN: u16 = 1 << 15;
+/// The word Apple's serializer writes for a descriptor whose BOOLs are all at
+/// their defaults: the six inherit-state flags **on**, the two `support*`
+/// **off**, and the five unidentified bits on. Measured on every ICB fixture
+/// the oracle captured.
+///
+/// Exists so a synthetic record in a test is a record Apple would actually
+/// produce. A helper that writes `0` here builds a descriptor asking to inherit
+/// *nothing*, which is a guest request rather than a blank, and it would trip
+/// six of the counters in
+/// [`IndirectCommandBufferDescriptor::unapplied_flags`] on every test that used
+/// it.
+pub const ICB_FLAGS_DEFAULT: u16 = 0x7ff0;
 /// Embedded ICB command layout (52 B) at +0x1c in the create body.
-pub const ICB_DESC_LAYOUT: usize = 0x1c;
-pub const ICB_LAYOUT_LEN: usize = 0x34;
-pub const ICB_DESC_MAX_COMMAND_COUNT: usize = 0x50;
-pub const ICB_DESC_OPTIONS: usize = 0x54;
+pub const ICB_DESC_LAYOUT: usize = OP_HDR + offset_of!(w_icb::NewIcbBody, layout);
+pub const ICB_LAYOUT_LEN: usize = size_of::<w_icb::IcbLayout>();
+pub const ICB_DESC_MAX_COMMAND_COUNT: usize =
+    OP_HDR + offset_of!(w_icb::NewIcbBody, max_command_count);
+/// `MTLResourceOptions`, and it is a **`u16`**: the serializer narrows the `Q`
+/// its selector declares, and `+0x56`/`+0x57` are never written at all.
+///
+/// Measured, not read. This was a `ld32` until the oracle's complementary-fill
+/// passes were pointed at the record — `no_decoder_reads_a_bit_apples_serializer
+/// _never_wrote` reported the same descriptor decoding `options: 0` under one
+/// fill and `0xffff0000` under the other, which on a guest's ring is whatever
+/// the last record left there. Same shape as the `copyFromTexture:toBuffer:`
+/// `options` bug: a field read wider than the serializer writes.
+pub const ICB_DESC_OPTIONS: usize = OP_HDR + offset_of!(w_icb::NewIcbBody, options);
+/// The two bytes above [`ICB_DESC_OPTIONS`], which the serializer never writes.
+/// Named so a future widening has to delete a constant that says why not.
+pub const ICB_DESC_OPTIONS_UNWRITTEN: usize =
+    OP_HDR + offset_of!(w_icb::NewIcbBody, never_written_tail);
 /// Command-type values written by PGSerializerIndirect*Command fills.
 pub const ICB_CMD_TYPE_DRAW: u32 = 0x1;
 pub const ICB_CMD_TYPE_DRAW_INDEXED: u32 = 0x2;
@@ -558,53 +644,109 @@ pub struct TextureViewDescriptor {
     pub has_swizzle: bool,
 }
 
-pub const TEXTURE_VIEW_DESC_OPCODE: usize = 0;
-pub const TEXTURE_VIEW_DESC_LEN: usize = 4;
-pub const TEXTURE_VIEW_DESC_TEXTURE_REF: usize = 8;
-pub const TEXTURE_VIEW_DESC_BASE_REF: usize = 12;
-pub const TEXTURE_VIEW_DESC_PIXEL_FORMAT: usize = 16;
-pub const TEXTURE_VIEW_DESC_TEXTURE_TYPE: usize = 18;
-pub const TEXTURE_VIEW_DESC_LEVEL_BASE: usize = 20;
-pub const TEXTURE_VIEW_DESC_LEVEL_COUNT: usize = 28;
-pub const TEXTURE_VIEW_DESC_SLICE_BASE: usize = 36;
-pub const TEXTURE_VIEW_DESC_SLICE_COUNT: usize = 44;
-pub const TEXTURE_VIEW_DESC_SWIZZLE: usize = 52;
-pub const TEXTURE_VIEW_MIN_SIMPLE: usize = 20;
-pub const TEXTURE_VIEW_MIN_RANGED: usize = 52;
-pub const TEXTURE_VIEW_MIN_SWIZZLE: usize = 56;
-pub const TEXTURE_VIEW_OPCODE_SIMPLE: u32 = 7;
-pub const TEXTURE_VIEW_OPCODE_RANGED: u32 = 8;
-pub const TEXTURE_VIEW_OPCODE_SWIZZLE: u32 = 0x1b;
+// The record header every type-8 blob starts with. Named here because this
+// file reads it on five different records, and derived from the wire crate's
+// `OpHeader` so the two words cannot be swapped in one place and not the other.
+pub const TEXTURE_VIEW_DESC_OPCODE: usize = offset_of!(reims_vgpu_wire::OpHeader, opcode);
+pub const TEXTURE_VIEW_DESC_LEN: usize = offset_of!(reims_vgpu_wire::OpHeader, length);
+
+// The three texture-view forms. Every offset is `offset_of!` on the wire
+// crate's struct field, so a field it renames fails this build rather than
+// leaving two readings that agree only by habit — the same treatment the heap
+// and buffer-backed records below get.
+//
+// The `*_MIN_*` names are historical: each is the record's *total* length, not
+// a floor. Apple's serializer writes exactly one length per opcode, which is
+// what the wire crate's `*_TOTAL_LEN` names say.
+pub const TEXTURE_VIEW_DESC_TEXTURE_REF: usize =
+    OP_HDR + offset_of!(w_view::TextureViewBody, object_ref);
+pub const TEXTURE_VIEW_DESC_BASE_REF: usize =
+    OP_HDR + offset_of!(w_view::TextureViewBody, base_texture_ref);
+pub const TEXTURE_VIEW_DESC_PIXEL_FORMAT: usize =
+    OP_HDR + offset_of!(w_view::TextureViewBody, pixel_format);
+pub const TEXTURE_VIEW_DESC_TEXTURE_TYPE: usize =
+    OP_HDR + offset_of!(w_view::TextureViewRangedBody, texture_type);
+pub const TEXTURE_VIEW_DESC_LEVEL_BASE: usize =
+    OP_HDR + offset_of!(w_view::TextureViewRangedBody, level_base);
+pub const TEXTURE_VIEW_DESC_LEVEL_COUNT: usize =
+    OP_HDR + offset_of!(w_view::TextureViewRangedBody, level_count);
+pub const TEXTURE_VIEW_DESC_SLICE_BASE: usize =
+    OP_HDR + offset_of!(w_view::TextureViewRangedBody, slice_base);
+pub const TEXTURE_VIEW_DESC_SLICE_COUNT: usize =
+    OP_HDR + offset_of!(w_view::TextureViewRangedBody, slice_count);
+pub const TEXTURE_VIEW_DESC_SWIZZLE: usize =
+    OP_HDR + offset_of!(w_view::TextureViewSwizzleBody, swizzle);
+pub const TEXTURE_VIEW_MIN_SIMPLE: usize = w_view::TEXTURE_VIEW_TOTAL_LEN as usize;
+pub const TEXTURE_VIEW_MIN_RANGED: usize = w_view::TEXTURE_VIEW_RANGED_TOTAL_LEN as usize;
+pub const TEXTURE_VIEW_MIN_SWIZZLE: usize = w_view::TEXTURE_VIEW_SWIZZLE_TOTAL_LEN as usize;
+pub const TEXTURE_VIEW_OPCODE_SIMPLE: u32 = w_view::OPCODE_TEXTURE_VIEW;
+pub const TEXTURE_VIEW_OPCODE_RANGED: u32 = w_view::OPCODE_TEXTURE_VIEW_RANGED;
+pub const TEXTURE_VIEW_OPCODE_SWIZZLE: u32 = w_view::OPCODE_TEXTURE_VIEW_SWIZZLE;
 // Heap-backed texture (`newTextureWithDescriptor:heap:offset:useOffset:
 // allocator:`). It shares the type-8 object tag, but is a complete texture
-// resource rather than a view. The 32-byte PGSerializedTextureDescriptor body
-// starts at +0x10, followed by `useOffset` and the heap byte offset.
-pub const HEAP_TEXTURE_OPCODE: u32 = 0x15;
-pub const HEAP_TEXTURE_LEN: usize = 60;
-pub const HEAP_TEXTURE_HEAP_REF: usize = 12;
-pub const HEAP_TEXTURE_DESCRIPTOR: usize = 16;
-pub const HEAP_TEXTURE_USE_OFFSET: usize = 48;
-pub const HEAP_TEXTURE_OFFSET: usize = 52;
+// resource rather than a view: a heap ref, the embedded
+// PGSerializedTextureDescriptor, then `useOffset` and the heap byte offset.
+//
+// Every offset below is `offset_of!` on the wire crate's struct rather than a
+// number written again here, so a field it renames fails this build instead of
+// leaving two readings that agree only by habit.
+pub const HEAP_TEXTURE_OPCODE: u32 = w_heap::OPCODE_NEW_HEAP_TEXTURE;
+pub const HEAP_TEXTURE_LEN: usize = w_heap::NEW_HEAP_TEXTURE_TOTAL_LEN as usize;
+pub const HEAP_TEXTURE_HEAP_REF: usize = OP_HDR + offset_of!(w_heap::NewHeapTextureBody, heap_ref);
+pub const HEAP_TEXTURE_DESCRIPTOR: usize = OP_HDR + offset_of!(w_heap::NewHeapTextureBody, desc);
+pub const HEAP_TEXTURE_USE_OFFSET: usize =
+    OP_HDR + offset_of!(w_heap::NewHeapTextureBody, use_offset_bits);
+pub const HEAP_TEXTURE_OFFSET: usize = OP_HDR + offset_of!(w_heap::NewHeapTextureBody, offset);
+/// `useOffset` is **one bit** of the byte at [`HEAP_TEXTURE_USE_OFFSET`].
+///
+/// Measured, not assumed: `reims_vgpu_wire::ops::heap_texture` captures this
+/// record under two complementary arena fills and the bits that agree are the
+/// ones the serializer wrote. Only bit 0 of that byte does. The seven bits
+/// above it and the three bytes to [`HEAP_TEXTURE_OFFSET`] are whatever the
+/// guest's ring last contained, so a 32-bit load here reads noise into 31 of
+/// its bits.
+pub const HEAP_TEXTURE_USE_OFFSET_BIT: u8 = 0x1;
+
+// The same record once the guest's serializer has `TextureDescriptor2` on. It
+// is a different opcode, not a longer one, and every field after the heap ref
+// moves by the eight bytes the wide descriptor adds.
+pub const HEAP_TEXTURE_WIDE_OPCODE: u32 = w_heap::OPCODE_NEW_HEAP_TEXTURE_WIDE;
+pub const HEAP_TEXTURE_WIDE_LEN: usize = w_heap::NEW_HEAP_TEXTURE_WIDE_TOTAL_LEN as usize;
+pub const HEAP_TEXTURE_WIDE_HEAP_REF: usize =
+    OP_HDR + offset_of!(w_heap::NewHeapTextureWideBody, heap_ref);
+pub const HEAP_TEXTURE_WIDE_DESCRIPTOR: usize =
+    OP_HDR + offset_of!(w_heap::NewHeapTextureWideBody, desc);
+pub const HEAP_TEXTURE_WIDE_USE_OFFSET: usize =
+    OP_HDR + offset_of!(w_heap::NewHeapTextureWideBody, use_offset_bits);
+pub const HEAP_TEXTURE_WIDE_OFFSET: usize =
+    OP_HDR + offset_of!(w_heap::NewHeapTextureWideBody, offset);
+
 // Opcode 9 is NOT a view: it is a buffer-backed texture (`newTextureWithBuffer:
 // descriptor:offset:bytesPerRow:`) serialized by `-[PGSerializer newTextureWith
 // Buffer:...]`.
 // It shares only the type-8 object tag + 16-byte header (opcode@0, len@4,
 // self-ref@8, source-ref@0xc); the source ref @0xc is a BUFFER, not a texture,
-// and the body is {u64 offset, u64 bytesPerRow, 32-byte embedded MTLTextureDescriptor}.
-pub const TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE: u32 = 9;
-pub const BUF_TEX_DESC_BUFFER_REF: usize = 12;
-pub const BUF_TEX_DESC_OFFSET: usize = 16;
-pub const BUF_TEX_DESC_BYTES_PER_ROW: usize = 24;
-// The embedded MTLTextureDescriptor base is @0x20, which is where the flags
-// word sits — one offset, read under the name the decoder uses for it.
-pub const BUF_TEX_DESC_FLAGS: usize = 32; // bits[0:4]=textureType, bits[16:32]=pixelFormat
-pub const BUF_TEX_DESC_WIDTH: usize = 36;
-pub const BUF_TEX_DESC_HEIGHT: usize = 40;
-pub const BUF_TEX_DESC_DEPTH: usize = 44;
-pub const BUF_TEX_DESC_MIP_COUNT: usize = 48; // u16
-pub const BUF_TEX_DESC_SAMPLE_COUNT: usize = 50; // u16
-pub const BUF_TEX_DESC_ARRAY_LEN: usize = 52; // u16
-pub const BUF_TEX_MIN_LEN: usize = 64;
+// and the body is {u64 offset, u64 bytesPerRow, embedded MTLTextureDescriptor}.
+pub const TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE: u32 = w_backed::OPCODE_BUFFER_TEXTURE;
+pub const BUF_TEX_DESC_BUFFER_REF: usize =
+    OP_HDR + offset_of!(w_backed::BufferTextureBody, buffer_ref);
+pub const BUF_TEX_DESC_OFFSET: usize = OP_HDR + offset_of!(w_backed::BufferTextureBody, offset);
+pub const BUF_TEX_DESC_BYTES_PER_ROW: usize =
+    OP_HDR + offset_of!(w_backed::BufferTextureBody, bytes_per_row);
+// Base of the embedded `PGSerializedTextureDescriptor`. One offset,
+// because there is one decoder: everything inside it is at that decoder's own
+// offsets. The seven that used to be named here — flags, width, height, depth,
+// mip count, sample count, array length — were a second copy of a layout
+// `heap_query` already had, and a second copy is a second thing to get wrong.
+pub const BUF_TEX_DESC_BODY: usize = OP_HDR + offset_of!(w_backed::BufferTextureBody, desc);
+pub const BUF_TEX_MIN_LEN: usize = w_backed::BUFFER_TEXTURE_TOTAL_LEN as usize;
+
+// The buffer-backed record's `TextureDescriptor2` form. The three fields before
+// the descriptor keep their offsets; only the descriptor widens.
+pub const TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE_WIDE: u32 = w_backed::OPCODE_BUFFER_TEXTURE_WIDE;
+pub const BUF_TEX_WIDE_DESC_BODY: usize =
+    OP_HDR + offset_of!(w_backed::BufferTextureWideBody, desc);
+pub const BUF_TEX_WIDE_LEN: usize = w_backed::BUFFER_TEXTURE_WIDE_TOTAL_LEN as usize;
 // MTLTextureType values (Metal.framework Headers/MTLTextureType.h).
 pub const TEXTURE_VIEW_MTL_TYPE_1D: u16 = 0;
 pub const TEXTURE_VIEW_MTL_TYPE_1D_ARRAY: u16 = 1;
@@ -843,12 +985,141 @@ pub struct IndirectCommandBufferDescriptor {
     pub max_kernel_threadgroup_memory_bind_count: u16,
     /// `maxObjectThreadgroupMemoryBindCount` create body `+0x12`.
     pub max_object_threadgroup_memory_bind_count: u16,
-    pub inherit_buffers: bool,
-    pub inherit_pipeline_state: bool,
+    /// The whole flag word at `+0x16`, ten of whose bits are attributed.
+    ///
+    /// Stored as the word rather than as a bool per bit, and read through the
+    /// accessors below, because this device previously carried two of them as
+    /// fields and dropped the other eight on the floor. One declaration is what
+    /// keeps a decoded bit and its accessor from drifting apart, and it means a
+    /// bit that gains a consumer needs no decoder change.
+    pub flags: u16,
     pub max_command_count: u32,
-    pub options: u32,
+    /// `MTLResourceOptions`, **sixteen bits wide on the wire** despite the
+    /// selector declaring the argument `Q`. See [`ICB_DESC_OPTIONS`].
+    pub options: u16,
     /// Layout for decoding filled command slots in the ICB backing buffer.
     pub layout: IcbCommandLayout,
+}
+
+/// One decoded flag the guest asked for and this device does not carry into the
+/// host indirect command buffer.
+///
+/// Eight of the ten attributed bits reach no host setter. Six of them default
+/// **on** in the descriptor Metal builds and in the one the guest built, so a
+/// guest that leaves them alone loses nothing; the loss is the guest turning one
+/// *off*, or turning one of the two `support*` flags *on*. That asymmetry is why
+/// this is a list of named losses rather than a mask comparison — see
+/// [`IndirectCommandBufferDescriptor::unapplied_flags`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IcbUnappliedFlag {
+    SupportRayTracing,
+    SupportDynamicAttributeStride,
+    InheritDepthStencilState,
+    InheritDepthBias,
+    InheritDepthClipMode,
+    InheritCullMode,
+    InheritFrontFacingWinding,
+    InheritTriangleFillMode,
+}
+
+impl IcbUnappliedFlag {
+    /// One slug per flag rather than one for the set. A count that said only
+    /// "some flag was dropped" would not say whether the guest wanted ray
+    /// tracing or wanted its cull mode not inherited, and those cost entirely
+    /// different things to implement.
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::SupportRayTracing => "icb_flag_support_ray_tracing_dropped",
+            Self::SupportDynamicAttributeStride => "icb_flag_dynamic_attribute_stride_dropped",
+            Self::InheritDepthStencilState => "icb_flag_no_inherit_depth_stencil_dropped",
+            Self::InheritDepthBias => "icb_flag_no_inherit_depth_bias_dropped",
+            Self::InheritDepthClipMode => "icb_flag_no_inherit_depth_clip_dropped",
+            Self::InheritCullMode => "icb_flag_no_inherit_cull_mode_dropped",
+            Self::InheritFrontFacingWinding => "icb_flag_no_inherit_winding_dropped",
+            Self::InheritTriangleFillMode => "icb_flag_no_inherit_fill_mode_dropped",
+        }
+    }
+}
+
+impl IndirectCommandBufferDescriptor {
+    /// `inheritPipelineState`, bit 0 of [`Self::flags`].
+    pub fn inherit_pipeline_state(&self) -> bool {
+        self.flags & ICB_FLAG_INHERIT_PIPELINE_STATE != 0
+    }
+
+    /// `inheritBuffers`, bit 1.
+    pub fn inherit_buffers(&self) -> bool {
+        self.flags & ICB_FLAG_INHERIT_BUFFERS != 0
+    }
+
+    /// `supportRayTracing`, bit 2.
+    pub fn support_ray_tracing(&self) -> bool {
+        self.flags & ICB_FLAG_SUPPORT_RAY_TRACING != 0
+    }
+
+    /// `supportDynamicAttributeStride`, bit 3.
+    pub fn support_dynamic_attribute_stride(&self) -> bool {
+        self.flags & ICB_FLAG_SUPPORT_DYNAMIC_ATTRIBUTE_STRIDE != 0
+    }
+
+    /// The bits no `MTLIndirectCommandBufferDescriptor` property moves.
+    ///
+    /// Exposed so a reading other than the `0x7840` every record Apple produced
+    /// carries is visible: one of them would then be a real field this contract
+    /// does not know about.
+    pub fn unidentified_flags(&self) -> u16 {
+        self.flags & ICB_FLAG_UNIDENTIFIED
+    }
+
+    /// Every flag the guest asked for that this device does not apply.
+    ///
+    /// Empty on a descriptor whose flags are at their defaults, which is what
+    /// makes each of these a healthy zero: a non-zero count is the measured
+    /// argument for building the host setter that flag needs.
+    pub fn unapplied_flags(&self) -> Vec<IcbUnappliedFlag> {
+        let mut out = Vec::new();
+        // Default off: asking is setting the bit.
+        for (bit, flag) in [
+            (ICB_FLAG_SUPPORT_RAY_TRACING, IcbUnappliedFlag::SupportRayTracing),
+            (
+                ICB_FLAG_SUPPORT_DYNAMIC_ATTRIBUTE_STRIDE,
+                IcbUnappliedFlag::SupportDynamicAttributeStride,
+            ),
+        ] {
+            if self.flags & bit != 0 {
+                out.push(flag);
+            }
+        }
+        // Default on: asking is clearing the bit. This device sets none of
+        // these on the host descriptor, so it inherits whatever Metal defaults
+        // to — which is the same "on" the guest started from. A guest that
+        // cleared one gets a host ICB that still inherits that state.
+        for (bit, flag) in [
+            (
+                ICB_FLAG_INHERIT_DEPTH_STENCIL_STATE,
+                IcbUnappliedFlag::InheritDepthStencilState,
+            ),
+            (ICB_FLAG_INHERIT_DEPTH_BIAS, IcbUnappliedFlag::InheritDepthBias),
+            (
+                ICB_FLAG_INHERIT_DEPTH_CLIP_MODE,
+                IcbUnappliedFlag::InheritDepthClipMode,
+            ),
+            (ICB_FLAG_INHERIT_CULL_MODE, IcbUnappliedFlag::InheritCullMode),
+            (
+                ICB_FLAG_INHERIT_FRONT_FACING_WINDING,
+                IcbUnappliedFlag::InheritFrontFacingWinding,
+            ),
+            (
+                ICB_FLAG_INHERIT_TRIANGLE_FILL_MODE,
+                IcbUnappliedFlag::InheritTriangleFillMode,
+            ),
+        ] {
+            if self.flags & bit == 0 {
+                out.push(flag);
+            }
+        }
+        out
+    }
 }
 
 /// One decoded object-list descriptor.
@@ -1810,6 +2081,84 @@ pub fn parse_color_attachments(
     out
 }
 
+/// A heap-placed texture record, opcode [`HEAP_TEXTURE_OPCODE`].
+///
+/// It shares the type-8 object tag with the texture views, so it arrives at the
+/// same peek, but it is a complete texture resource: a heap ref, the same
+/// 32-byte `PGSerializedTextureDescriptor` a plain creation carries, and where
+/// in the heap to put it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeapTextureRecord<'a> {
+    /// Ref of the heap the texture is placed in. Never 0 for a well-formed
+    /// record; the caller decides what a 0 means for its own path.
+    pub heap_ref: u32,
+    /// Whether [`HeapTextureRecord::offset`] is the guest's request or is to be
+    /// ignored. The serializer writes the offset either way.
+    pub use_offset: bool,
+    /// Byte offset into the heap.
+    pub offset: u64,
+    /// The embedded descriptor, for
+    /// [`crate::runtime::heap_query::decode_serialized_texture_descriptor`] —
+    /// or its wide sibling when [`HeapTextureRecord::wide`] is set.
+    pub descriptor: &'a [u8],
+    /// Which of the two descriptor bodies [`HeapTextureRecord::descriptor`]
+    /// holds, taken from the record's **opcode**.
+    ///
+    /// Carried rather than inferred from the slice length on purpose: the two
+    /// bodies are 32 and 40 bytes, and a reader that picks by length is one
+    /// record-length change away from decoding the wrong layout in silence.
+    pub wide: bool,
+}
+
+/// Decode a heap-placed texture record.
+///
+/// The layout is pinned by `reims_vgpu_wire::ops::heap_texture` against bytes
+/// Apple's serializer produced. Split out of `compute_exec`, where it was open
+/// coded, so it can be tested at all: the interesting part is not the offsets
+/// but [`HEAP_TEXTURE_USE_OFFSET_BIT`], and an open-coded read of it had no
+/// test and was wrong.
+pub fn decode_heap_texture(bytes: &[u8]) -> Result<HeapTextureRecord<'_>, DecodeStatus> {
+    if bytes.len() < OP_HDR {
+        return Err(DecodeStatus::ErrShort("res_heap_texture_len"));
+    }
+    // Dispatch on the opcode, then require the length that opcode implies. The
+    // wide form is a *different opcode* rather than a longer record, so the
+    // other order — pick a layout from the length — would read a 68-byte record
+    // at the narrow offsets whenever the two ever collide.
+    let (len, heap_ref_at, desc_at, use_offset_at, offset_at, wide) =
+        match ld32(&bytes[TEXTURE_VIEW_DESC_OPCODE..]) {
+            HEAP_TEXTURE_OPCODE => (
+                HEAP_TEXTURE_LEN,
+                HEAP_TEXTURE_HEAP_REF,
+                HEAP_TEXTURE_DESCRIPTOR,
+                HEAP_TEXTURE_USE_OFFSET,
+                HEAP_TEXTURE_OFFSET,
+                false,
+            ),
+            HEAP_TEXTURE_WIDE_OPCODE => (
+                HEAP_TEXTURE_WIDE_LEN,
+                HEAP_TEXTURE_WIDE_HEAP_REF,
+                HEAP_TEXTURE_WIDE_DESCRIPTOR,
+                HEAP_TEXTURE_WIDE_USE_OFFSET,
+                HEAP_TEXTURE_WIDE_OFFSET,
+                true,
+            ),
+            _ => return Err(DecodeStatus::ErrUnsupported("res_heap_texture_opcode")),
+        };
+    if bytes.len() != len {
+        return Err(DecodeStatus::ErrShort("res_heap_texture_len"));
+    }
+    Ok(HeapTextureRecord {
+        heap_ref: ld32(&bytes[heap_ref_at..]),
+        // One bit. Everything else in this four-byte slot is the guest's stale
+        // ring, so a wider read here is a lost texture, not a stricter check.
+        use_offset: bytes[use_offset_at] & HEAP_TEXTURE_USE_OFFSET_BIT != 0,
+        offset: ld64(&bytes[offset_at..]),
+        descriptor: &bytes[desc_at..use_offset_at],
+        wide,
+    })
+}
+
 pub fn decode_texture_view_descriptor(bytes: &[u8]) -> Result<TextureViewDescriptor, DecodeStatus> {
     if bytes.len() < TEXTURE_VIEW_MIN_SIMPLE {
         return Err(DecodeStatus::ErrShort("res_texture_view_short"));
@@ -1867,56 +2216,78 @@ pub fn decode_texture_view_descriptor(bytes: &[u8]) -> Result<TextureViewDescrip
 /// (`newTextureWithDescriptor:offset:bytesPerRow:`). Distinct from a texture view:
 /// the source ref is a BUFFER and the sampled bytes come straight from that
 /// buffer's guest storage at `offset`, `bytes_per_row` stride.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+///
+/// The trailing 32 bytes are the same `PGSerializedTextureDescriptor` a plain
+/// texture creation carries, so they are carried as one rather than flattened —
+/// which is also the shape `reims_vgpu_wire::ops::backed_texture` derived from
+/// Apple's bytes (`BufferTextureBody { object_ref, buffer_ref, offset,
+/// bytes_per_row, desc }`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BufferTextureDescriptor {
     pub new_texture_ref: u32,
     pub buffer_ref: u32,
     pub offset: u64,
     pub bytes_per_row: u64,
-    pub texture_type: u16,
-    pub pixel_format: u16,
-    pub width: u32,
-    pub height: u32,
-    pub depth: u32,
-    pub mipmap_level_count: u16,
-    pub sample_count: u16,
-    pub array_length: u16,
+    /// The embedded texture descriptor, read by
+    /// [`crate::runtime::heap_query::decode_serialized_texture_descriptor`] —
+    /// the single reader that function's own doc asks every path to use.
+    pub desc: crate::runtime::heap_query::TextureDescriptor,
 }
 
 /// Decode the opcode-9 (buffer-backed texture) type-8 descriptor — the
 /// serialized form of
 /// `newTextureWithBuffer:descriptor:offset:bytesPerRow:allocator:`.
+///
+/// The embedded descriptor is handed to the shared decoder rather than read
+/// here. It used to be re-derived inline, and the two readings agreed on every
+/// offset they shared — but this one stopped after `texture_type`,
+/// `pixel_format` and the geometry, so `usage`, `resource_options`,
+/// `protection_options` and the three descriptor flag bits were decoded by the
+/// serializer and dropped by this device. That is the divergence shape this
+/// repository keeps finding: two consumers of one wire form, one of which
+/// contradicts a rule the other one states in a comment. The rule is on
+/// `decode_serialized_texture_descriptor` ("keeping one decoder prevents the
+/// query and resource paths from drifting"), and there is now one decoder.
 pub fn decode_buffer_texture_descriptor(
     bytes: &[u8],
 ) -> Result<BufferTextureDescriptor, DecodeStatus> {
-    if bytes.len() < BUF_TEX_MIN_LEN {
+    if bytes.len() < OP_HDR {
         return Err(DecodeStatus::ErrShort("res_buffer_texture_short"));
     }
-    let opcode = ld32(&bytes[TEXTURE_VIEW_DESC_OPCODE..]);
-    if opcode != TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE {
-        return Err(DecodeStatus::ErrUnsupported("res_buffer_texture_opcode"));
+    // Opcode first, then the length that opcode implies — see
+    // [`decode_heap_texture`] for why the reverse order is unsafe here.
+    let (record_len, body_at, wide) = match ld32(&bytes[TEXTURE_VIEW_DESC_OPCODE..]) {
+        TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE => (BUF_TEX_MIN_LEN, BUF_TEX_DESC_BODY, false),
+        TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE_WIDE => (BUF_TEX_WIDE_LEN, BUF_TEX_WIDE_DESC_BODY, true),
+        _ => return Err(DecodeStatus::ErrUnsupported("res_buffer_texture_opcode")),
+    };
+    // Exactly the length this opcode implies, not "at least" it. The two forms
+    // differ only in how wide their descriptor is, so a record accepted at a
+    // length its own opcode does not name is one whose body may be read eight
+    // bytes from where it lives — and until the wide opcode existed, nothing
+    // in the family could tell the two apart. `decode_heap_texture` has always
+    // required the exact length; this is the sibling agreeing with it.
+    if bytes.len() != record_len {
+        return Err(DecodeStatus::ErrShort("res_buffer_texture_short"));
     }
     let declared = ld32(&bytes[TEXTURE_VIEW_DESC_LEN..]) as usize;
-    if declared < BUF_TEX_MIN_LEN || declared != bytes.len() {
+    if declared != record_len {
         return Err(DecodeStatus::ErrShort("res_buffer_texture_declared_len"));
     }
-    // Embedded MTLTextureDescriptor flags word: bits[0:4]=textureType, bits[16:32]=pixelFormat.
-    let flags = ld32(&bytes[BUF_TEX_DESC_FLAGS..]);
-    let texture_type = (flags & 0xf) as u16;
-    let pixel_format = ((flags >> 16) & 0xffff) as u16;
+    let desc = if wide {
+        let body = &bytes[body_at..body_at + heap_query::WIDE_TEXTURE_BODY_LEN];
+        heap_query::decode_wide_serialized_texture_descriptor(body)
+    } else {
+        let body = &bytes[body_at..body_at + heap_query::TEXTURE_BODY_LEN];
+        heap_query::decode_serialized_texture_descriptor(body)
+    }
+    .map_err(|_| DecodeStatus::ErrShort("res_buffer_texture_body"))?;
     Ok(BufferTextureDescriptor {
         new_texture_ref: ld32(&bytes[TEXTURE_VIEW_DESC_TEXTURE_REF..]),
         buffer_ref: ld32(&bytes[BUF_TEX_DESC_BUFFER_REF..]),
         offset: ld64(&bytes[BUF_TEX_DESC_OFFSET..]),
         bytes_per_row: ld64(&bytes[BUF_TEX_DESC_BYTES_PER_ROW..]),
-        texture_type,
-        pixel_format,
-        width: ld32(&bytes[BUF_TEX_DESC_WIDTH..]),
-        height: ld32(&bytes[BUF_TEX_DESC_HEIGHT..]),
-        depth: ld32(&bytes[BUF_TEX_DESC_DEPTH..]),
-        mipmap_level_count: ld16(&bytes[BUF_TEX_DESC_MIP_COUNT..]),
-        sample_count: ld16(&bytes[BUF_TEX_DESC_SAMPLE_COUNT..]),
-        array_length: ld16(&bytes[BUF_TEX_DESC_ARRAY_LEN..]),
+        desc,
     })
 }
 
@@ -2458,7 +2829,8 @@ pub fn decode_icb_descriptor(
     let max_mesh = bytes[ICB_DESC_MAX_MESH_BINDS] as u16;
     let max_kernel_tg = bytes[ICB_DESC_MAX_KERNEL_TG_BINDS] as u16;
     let max_object_tg = bytes[ICB_DESC_MAX_OBJECT_TG_BINDS] as u16;
-    let flags = ld16(&bytes[ICB_DESC_FLAGS..]);
+    // Bit 15 is never written by the serializer; see [`ICB_FLAG_NEVER_WRITTEN`].
+    let flags = ld16(&bytes[ICB_DESC_FLAGS..]) & !ICB_FLAG_NEVER_WRITTEN;
     // `maxFragmentBufferBindCount` is reported as the guest wrote it at +0x0d.
     // It used to be forced to 0 whenever `command_types` named a dispatch and no
     // draw, on the reading that the guest "meant" a compute-only buffer. That is
@@ -2480,10 +2852,9 @@ pub fn decode_icb_descriptor(
         max_mesh_buffer_bind_count: max_mesh,
         max_kernel_threadgroup_memory_bind_count: max_kernel_tg,
         max_object_threadgroup_memory_bind_count: max_object_tg,
-        inherit_buffers: (flags & ICB_FLAG_INHERIT_BUFFERS) != 0,
-        inherit_pipeline_state: (flags & ICB_FLAG_INHERIT_PIPELINE_STATE) != 0,
+        flags,
         max_command_count: ld32(&bytes[ICB_DESC_MAX_COMMAND_COUNT..]),
-        options: ld32(&bytes[ICB_DESC_OPTIONS..]),
+        options: ld16(&bytes[ICB_DESC_OPTIONS..]),
         layout,
     })
 }
@@ -2534,6 +2905,265 @@ mod tests {
 
     use super::*;
     use crate::contract::endian::st32;
+
+    /// A well-formed heap-texture record, with the bytes the serializer does
+    /// not write left as the caller asks.
+    fn heap_texture_record(use_offset_byte: u8, ring: u8, offset: u64) -> Vec<u8> {
+        let mut b = vec![ring; HEAP_TEXTURE_LEN];
+        st32(&mut b[TEXTURE_VIEW_DESC_OPCODE..], HEAP_TEXTURE_OPCODE);
+        st32(&mut b[4..], HEAP_TEXTURE_LEN as u32);
+        st32(&mut b[8..], 48);
+        st32(&mut b[HEAP_TEXTURE_HEAP_REF..], 6565);
+        b[HEAP_TEXTURE_USE_OFFSET] = use_offset_byte;
+        b[HEAP_TEXTURE_OFFSET..HEAP_TEXTURE_LEN].copy_from_slice(&offset.to_le_bytes());
+        b
+    }
+
+    /// `useOffset` is one bit, and the rest of its slot is the guest's ring.
+    ///
+    /// The bug this pins: the read used to be a `ld32` of the four bytes at
+    /// [`HEAP_TEXTURE_USE_OFFSET`] followed by a refusal of anything above 1.
+    /// `reims_vgpu_wire::ops::heap_texture` measures, against Apple's own bytes
+    /// under two arena fills, that the serializer writes bit 0 of the first
+    /// byte and nothing else in that slot — so on a real wire the other 31 bits
+    /// are whatever the ring last held, and the refusal fired on content the
+    /// guest never wrote. A dropped texture bind is the most severe loss class
+    /// in the device, and this one was invisible because a host capture arena
+    /// is zero-filled there.
+    #[test]
+    fn heap_texture_use_offset_ignores_the_ring_bytes_around_it() {
+        for ring in [0x00u8, 0xaa, 0xff, 0x5a] {
+            for (byte, expect) in [(0x00u8, false), (0x01, true), (0xfe, false), (0xff, true)] {
+                let bytes = heap_texture_record(byte, ring, 0x0123_4ab0);
+                let record = decode_heap_texture(&bytes)
+                    .unwrap_or_else(|e| panic!("ring {ring:#04x} byte {byte:#04x}: {e:?}"));
+                assert_eq!(
+                    record.use_offset, expect,
+                    "ring {ring:#04x} byte {byte:#04x}: use_offset"
+                );
+                assert_eq!(
+                    record.offset, 0x0123_4ab0,
+                    "ring {ring:#04x} byte {byte:#04x}: offset"
+                );
+                assert_eq!(record.heap_ref, 6565);
+                assert_eq!(record.descriptor.len(), 32);
+            }
+        }
+    }
+
+    /// The 40-byte descriptor body, laid out at the wire crate's own offsets.
+    ///
+    /// Distinctive values throughout, and `usage` deliberately carries a bit
+    /// above its low byte: the narrow body packs usage into eight bits, so a
+    /// decoder that kept the narrow width would read `0x05` here.
+    fn wide_descriptor_body() -> Vec<u8> {
+        use reims_vgpu_wire::ops::texture::WideTextureDescriptorBody as W;
+        let mut d = vec![0u8; heap_query::WIDE_TEXTURE_BODY_LEN];
+        d[offset_of!(W, type_and_flags)] = 0x42; // 2D, allowGPUOptimizedContents
+        st16(&mut d[offset_of!(W, pixel_format)..], 80); // BGRA8Unorm
+        st32(&mut d[offset_of!(W, usage)..], 0x0001_0005);
+        st32(&mut d[offset_of!(W, width)..], 0x1111);
+        st32(&mut d[offset_of!(W, height)..], 0x2222);
+        st32(&mut d[offset_of!(W, depth)..], 1);
+        st16(&mut d[offset_of!(W, mipmap_level_count)..], 3);
+        st16(&mut d[offset_of!(W, sample_count)..], 1);
+        st16(&mut d[offset_of!(W, array_length)..], 7);
+        st16(&mut d[offset_of!(W, resource_options)..], 0x0020);
+        d[offset_of!(W, swizzle_red)] = 5;
+        d[offset_of!(W, swizzle_green)] = 0;
+        d[offset_of!(W, swizzle_blue)] = 1;
+        d[offset_of!(W, swizzle_alpha)] = 2;
+        d
+    }
+
+    /// A well-formed wide heap-texture record.
+    fn heap_texture_wide_record(use_offset_byte: u8, ring: u8, offset: u64) -> Vec<u8> {
+        let mut b = vec![ring; HEAP_TEXTURE_WIDE_LEN];
+        st32(&mut b[TEXTURE_VIEW_DESC_OPCODE..], HEAP_TEXTURE_WIDE_OPCODE);
+        st32(
+            &mut b[TEXTURE_VIEW_DESC_LEN..],
+            HEAP_TEXTURE_WIDE_LEN as u32,
+        );
+        st32(&mut b[TEXTURE_VIEW_DESC_TEXTURE_REF..], 48);
+        st32(&mut b[HEAP_TEXTURE_WIDE_HEAP_REF..], 6565);
+        b[HEAP_TEXTURE_WIDE_DESCRIPTOR..HEAP_TEXTURE_WIDE_USE_OFFSET]
+            .copy_from_slice(&wide_descriptor_body());
+        b[HEAP_TEXTURE_WIDE_USE_OFFSET] = use_offset_byte;
+        b[HEAP_TEXTURE_WIDE_OFFSET..HEAP_TEXTURE_WIDE_LEN].copy_from_slice(&offset.to_le_bytes());
+        b
+    }
+
+    /// The `TextureDescriptor2` heap record decodes at its own offsets.
+    ///
+    /// Every field after the heap ref moves by the eight bytes the wide
+    /// descriptor adds, so decoding this at the narrow offsets would put
+    /// `useOffset` inside the descriptor and read the heap offset from the
+    /// swizzle. It is the *opcode* that says which, never the length.
+    #[test]
+    fn a_wide_heap_texture_record_decodes_at_its_own_offsets() {
+        for ring in [0x00u8, 0xaa, 0xff] {
+            let bytes = heap_texture_wide_record(0x01, ring, 0x0077_7000);
+            let record = decode_heap_texture(&bytes).expect("wide heap texture");
+            assert!(
+                record.wide,
+                "ring {ring:#04x}: record reports its body width"
+            );
+            assert_eq!(record.heap_ref, 6565);
+            assert!(record.use_offset);
+            assert_eq!(record.offset, 0x0077_7000);
+            assert_eq!(record.descriptor.len(), heap_query::WIDE_TEXTURE_BODY_LEN);
+
+            let desc = heap_query::decode_wide_serialized_texture_descriptor(record.descriptor)
+                .expect("wide body");
+            assert_eq!(desc.width, 0x1111);
+            assert_eq!(desc.height, 0x2222);
+            assert_eq!(desc.array_length, 7);
+            assert_eq!(desc.pixel_format, 80);
+            assert_eq!(desc.texture_type, 2);
+            assert!(desc.allow_gpu_optimized_contents);
+            // Thirty-two bits, not eight. The narrow body's `usage` is a byte
+            // of the packed word; this one is a field of its own, and holding
+            // it at the narrow width would silently drop bit 16.
+            assert_eq!(desc.usage, 0x0001_0005);
+            assert_eq!(desc.swizzle, Some([5, 0, 1, 2]));
+        }
+    }
+
+    /// Neither heap record may be decoded at the other's length.
+    ///
+    /// This is the invariant that makes the pair safe: the wide form is a
+    /// different opcode rather than a longer record, so a decoder that picked
+    /// its layout from the length would read one as the other the moment the
+    /// two ever agreed on a size.
+    #[test]
+    fn a_heap_texture_record_is_refused_at_the_other_forms_length() {
+        let wide = heap_texture_wide_record(0x01, 0x00, 0);
+        assert!(matches!(
+            decode_heap_texture(&wide[..HEAP_TEXTURE_LEN]),
+            Err(DecodeStatus::ErrShort("res_heap_texture_len"))
+        ));
+
+        let mut narrow_at_wide_len = wide.clone();
+        st32(
+            &mut narrow_at_wide_len[TEXTURE_VIEW_DESC_OPCODE..],
+            HEAP_TEXTURE_OPCODE,
+        );
+        assert!(matches!(
+            decode_heap_texture(&narrow_at_wide_len),
+            Err(DecodeStatus::ErrShort("res_heap_texture_len"))
+        ));
+    }
+
+    /// The narrow body has no swizzle field, and absent is not the identity.
+    ///
+    /// A reader that turned `None` into `[R, G, B, A]` would be inventing a
+    /// contract for a record that never states one; a reader that turned it
+    /// into `[0, 0, 0, 0]` would swizzle every channel to zero.
+    #[test]
+    fn the_narrow_descriptor_body_carries_no_swizzle() {
+        let narrow = vec![0u8; heap_query::TEXTURE_BODY_LEN];
+        let desc = heap_query::decode_serialized_texture_descriptor(&narrow).expect("narrow body");
+        assert_eq!(desc.swizzle, None);
+    }
+
+    /// A wide buffer-backed texture keeps its prefix and widens only its body.
+    #[test]
+    fn a_wide_buffer_texture_record_decodes_its_wide_descriptor() {
+        let mut b = vec![0u8; BUF_TEX_WIDE_LEN];
+        st32(
+            &mut b[TEXTURE_VIEW_DESC_OPCODE..],
+            TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE_WIDE,
+        );
+        st32(&mut b[TEXTURE_VIEW_DESC_LEN..], BUF_TEX_WIDE_LEN as u32);
+        st32(&mut b[TEXTURE_VIEW_DESC_TEXTURE_REF..], 99);
+        st32(&mut b[BUF_TEX_DESC_BUFFER_REF..], 5151);
+        b[BUF_TEX_DESC_OFFSET..BUF_TEX_DESC_OFFSET + 8].copy_from_slice(&0x2200u64.to_le_bytes());
+        b[BUF_TEX_DESC_BYTES_PER_ROW..BUF_TEX_DESC_BYTES_PER_ROW + 8]
+            .copy_from_slice(&0x4400u64.to_le_bytes());
+        b[BUF_TEX_WIDE_DESC_BODY..].copy_from_slice(&wide_descriptor_body());
+
+        let d = decode_buffer_texture_descriptor(&b).expect("wide buffer texture");
+        assert_eq!(d.new_texture_ref, 99);
+        assert_eq!(d.buffer_ref, 5151);
+        assert_eq!(d.offset, 0x2200);
+        assert_eq!(d.bytes_per_row, 0x4400);
+        assert_eq!(d.desc.width, 0x1111);
+        assert_eq!(d.desc.usage, 0x0001_0005);
+        assert_eq!(d.desc.swizzle, Some([5, 0, 1, 2]));
+
+        // The narrow opcode at this length is not this record. Before the wide
+        // form existed this decoder took any length at or above the narrow one,
+        // so these bytes decoded as a narrow record with its descriptor read
+        // eight bytes short of where it lives.
+        let mut mislabelled = b.clone();
+        st32(
+            &mut mislabelled[TEXTURE_VIEW_DESC_OPCODE..],
+            TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE,
+        );
+        assert!(matches!(
+            decode_buffer_texture_descriptor(&mislabelled),
+            Err(DecodeStatus::ErrShort("res_buffer_texture_short"))
+        ));
+
+        // And a record whose declared length disagrees with its own opcode is
+        // refused by the other name, whichever way the disagreement runs.
+        let mut wrong_declared = b.clone();
+        st32(
+            &mut wrong_declared[TEXTURE_VIEW_DESC_LEN..],
+            BUF_TEX_MIN_LEN as u32,
+        );
+        assert!(matches!(
+            decode_buffer_texture_descriptor(&wrong_declared),
+            Err(DecodeStatus::ErrShort("res_buffer_texture_declared_len"))
+        ));
+    }
+
+    #[test]
+    fn a_heap_texture_record_of_the_wrong_length_or_opcode_is_refused_by_name() {
+        let good = heap_texture_record(0x01, 0x00, 0);
+        assert!(matches!(
+            decode_heap_texture(&good[..HEAP_TEXTURE_LEN - 1]),
+            Err(DecodeStatus::ErrShort("res_heap_texture_len"))
+        ));
+
+        let mut wrong = good.clone();
+        st32(
+            &mut wrong[TEXTURE_VIEW_DESC_OPCODE..],
+            TEXTURE_VIEW_OPCODE_RANGED,
+        );
+        assert!(matches!(
+            decode_heap_texture(&wrong),
+            Err(DecodeStatus::ErrUnsupported("res_heap_texture_opcode"))
+        ));
+    }
+
+    /// The embedded descriptor is the one the shared decoder reads.
+    ///
+    /// Two offsets have to agree for this record to work at all: the body
+    /// starts at [`HEAP_TEXTURE_DESCRIPTOR`] and ends where `useOffset` begins.
+    /// If either moves, this decodes a descriptor shifted by the difference,
+    /// which produces plausible-looking geometry rather than an error.
+    #[test]
+    fn the_embedded_descriptor_decodes_through_the_shared_reader() {
+        let mut bytes = heap_texture_record(0x01, 0x00, 0);
+        // packed: type 2, GPU-optimized contents, usage 5, format 80 — the
+        // shape the serializer produced for the oracle's baseline.
+        st32(&mut bytes[HEAP_TEXTURE_DESCRIPTOR..], 0x0050_05c2);
+        st32(&mut bytes[HEAP_TEXTURE_DESCRIPTOR + 4..], 0x1111);
+        st32(&mut bytes[HEAP_TEXTURE_DESCRIPTOR + 8..], 0x2222);
+        st32(&mut bytes[HEAP_TEXTURE_DESCRIPTOR + 12..], 1);
+
+        let record = decode_heap_texture(&bytes).expect("well formed");
+        let descriptor =
+            crate::runtime::heap_query::decode_serialized_texture_descriptor(record.descriptor)
+                .expect("the shared decoder accepts the embedded body");
+        assert_eq!(descriptor.texture_type, 2);
+        assert_eq!(descriptor.usage, 5);
+        assert_eq!(descriptor.pixel_format, 80);
+        assert_eq!(descriptor.width, 0x1111);
+        assert_eq!(descriptor.height, 0x2222);
+        assert_eq!(descriptor.depth, 1);
+    }
 
     /// Short reads on different descriptors name different checks.
     ///
@@ -2595,8 +3225,244 @@ mod tests {
         assert_eq!(icb.command_types, MTL_INDIRECT_CMD_CONCURRENT_DISPATCH);
         assert_eq!(icb.max_kernel_buffer_bind_count, 4);
         assert_eq!(icb.max_command_count, 8);
-        assert!(!icb.inherit_buffers);
-        assert!(!icb.inherit_pipeline_state);
+        assert!(!icb.inherit_buffers());
+        assert!(!icb.inherit_pipeline_state());
+    }
+
+    /// The two crates that read this flag word name the same bits.
+    ///
+    /// `reims_vgpu_wire::ops::icb::flag` derived them from Apple's serializer,
+    /// one case per property, and this module restates them because the decoder
+    /// here is reached by object type rather than through a wire view. Two
+    /// declarations of one contract is exactly the drift this repository writes
+    /// ABI tests for, so they are compared rather than trusted.
+    #[test]
+    fn the_icb_flag_bits_agree_with_the_derivation_they_came_from() {
+        use reims_vgpu_wire::ops::icb::flag;
+        for (mine, theirs, name) in [
+            (
+                ICB_FLAG_INHERIT_PIPELINE_STATE,
+                flag::INHERIT_PIPELINE_STATE,
+                "inherit_pipeline_state",
+            ),
+            (ICB_FLAG_INHERIT_BUFFERS, flag::INHERIT_BUFFERS, "inherit_buffers"),
+            (
+                ICB_FLAG_SUPPORT_RAY_TRACING,
+                flag::SUPPORT_RAY_TRACING,
+                "support_ray_tracing",
+            ),
+            (
+                ICB_FLAG_SUPPORT_DYNAMIC_ATTRIBUTE_STRIDE,
+                flag::SUPPORT_DYNAMIC_ATTRIBUTE_STRIDE,
+                "support_dynamic_attribute_stride",
+            ),
+            (
+                ICB_FLAG_INHERIT_DEPTH_STENCIL_STATE,
+                flag::INHERIT_DEPTH_STENCIL_STATE,
+                "inherit_depth_stencil_state",
+            ),
+            (
+                ICB_FLAG_INHERIT_DEPTH_BIAS,
+                flag::INHERIT_DEPTH_BIAS,
+                "inherit_depth_bias",
+            ),
+            (
+                ICB_FLAG_INHERIT_DEPTH_CLIP_MODE,
+                flag::INHERIT_DEPTH_CLIP_MODE,
+                "inherit_depth_clip_mode",
+            ),
+            (
+                ICB_FLAG_INHERIT_CULL_MODE,
+                flag::INHERIT_CULL_MODE,
+                "inherit_cull_mode",
+            ),
+            (
+                ICB_FLAG_INHERIT_FRONT_FACING_WINDING,
+                flag::INHERIT_FRONT_FACING_WINDING,
+                "inherit_front_facing_winding",
+            ),
+            (
+                ICB_FLAG_INHERIT_TRIANGLE_FILL_MODE,
+                flag::INHERIT_TRIANGLE_FILL_MODE,
+                "inherit_triangle_fill_mode",
+            ),
+            (ICB_FLAG_UNIDENTIFIED, flag::UNIDENTIFIED, "unidentified"),
+        ] {
+            assert_eq!(mine, theirs, "{name} disagrees between the two crates");
+        }
+        // The wire side also names the bit the serializer never writes. This
+        // decoder must not claim it in any group, because on a guest's ring it
+        // is noise.
+        assert_eq!(
+            ICB_FLAG_UNIDENTIFIED & flag::NEVER_WRITTEN,
+            0,
+            "the unidentified group claims the bit the serializer never writes"
+        );
+        assert_eq!(ICB_FLAG_NEVER_WRITTEN, flag::NEVER_WRITTEN);
+    }
+
+    /// The decoded flag word holds no bit the serializer never wrote.
+    ///
+    /// The word is stored raw now, and bit 15 is noise on a real wire, so a
+    /// descriptor read off a ring that last held `0xff` there would compare
+    /// unequal to the identical descriptor read off a zeroed one — and the host
+    /// ICB cache compares descriptors. Caught by the fixture instrument's
+    /// poison half; kept here as the unit-level gate.
+    #[test]
+    fn the_decoded_flag_word_holds_no_bit_the_serializer_never_wrote() {
+        let mut seen = std::collections::BTreeSet::new();
+        for ring in [0x00u8, 0x80, 0xff] {
+            let mut b = [0u8; ICB_DESC_LEN];
+            st32(&mut b[0..], TYPE7_OBJECT_ICB);
+            st32(&mut b[4..], ICB_DESC_LEN as u32);
+            st32(&mut b[8..], MTL_INDIRECT_CMD_DRAW);
+            // Every written bit set, plus whatever the ring left in bit 15.
+            st16(
+                &mut b[ICB_DESC_FLAGS..],
+                ICB_FLAGS_DEFAULT | ((ring as u16 & 0x80) << 8),
+            );
+            let layout = compute_only_icb_layout(0);
+            b[ICB_DESC_LAYOUT..ICB_DESC_LAYOUT + ICB_LAYOUT_LEN]
+                .copy_from_slice(&encode_icb_command_layout(&layout));
+            st32(&mut b[ICB_DESC_MAX_COMMAND_COUNT..], 8);
+            let icb = decode_icb_descriptor(&b).unwrap();
+            assert_eq!(icb.flags & ICB_FLAG_NEVER_WRITTEN, 0, "ring {ring:#04x}");
+            seen.insert(icb.flags);
+        }
+        assert_eq!(seen.len(), 1, "the flag word moved with the ring: {seen:?}");
+    }
+
+    /// Every flag the guest can ask for is either applied or counted as lost.
+    ///
+    /// A descriptor left at its defaults must report nothing — that is what
+    /// makes each of these counters a healthy zero — and each of the eight this
+    /// device does not carry must name itself when the guest asks for it. A
+    /// single "some flag was dropped" count could not tell ray tracing from a
+    /// cull mode the guest did not want inherited.
+    #[test]
+    fn a_flag_this_device_drops_names_itself_and_a_default_descriptor_names_none() {
+        const DEFAULT_FLAGS: u16 = ICB_FLAGS_DEFAULT;
+        let at_default = IndirectCommandBufferDescriptor {
+            flags: DEFAULT_FLAGS,
+            ..Default::default()
+        };
+        assert!(
+            at_default.unapplied_flags().is_empty(),
+            "a descriptor at its defaults reports a loss: {:?}",
+            at_default.unapplied_flags()
+        );
+        assert_eq!(at_default.unidentified_flags(), ICB_FLAG_UNIDENTIFIED);
+
+        for (flags, want) in [
+            (
+                DEFAULT_FLAGS | ICB_FLAG_SUPPORT_RAY_TRACING,
+                IcbUnappliedFlag::SupportRayTracing,
+            ),
+            (
+                DEFAULT_FLAGS | ICB_FLAG_SUPPORT_DYNAMIC_ATTRIBUTE_STRIDE,
+                IcbUnappliedFlag::SupportDynamicAttributeStride,
+            ),
+            (
+                DEFAULT_FLAGS & !ICB_FLAG_INHERIT_DEPTH_STENCIL_STATE,
+                IcbUnappliedFlag::InheritDepthStencilState,
+            ),
+            (
+                DEFAULT_FLAGS & !ICB_FLAG_INHERIT_DEPTH_BIAS,
+                IcbUnappliedFlag::InheritDepthBias,
+            ),
+            (
+                DEFAULT_FLAGS & !ICB_FLAG_INHERIT_DEPTH_CLIP_MODE,
+                IcbUnappliedFlag::InheritDepthClipMode,
+            ),
+            (
+                DEFAULT_FLAGS & !ICB_FLAG_INHERIT_CULL_MODE,
+                IcbUnappliedFlag::InheritCullMode,
+            ),
+            (
+                DEFAULT_FLAGS & !ICB_FLAG_INHERIT_FRONT_FACING_WINDING,
+                IcbUnappliedFlag::InheritFrontFacingWinding,
+            ),
+            (
+                DEFAULT_FLAGS & !ICB_FLAG_INHERIT_TRIANGLE_FILL_MODE,
+                IcbUnappliedFlag::InheritTriangleFillMode,
+            ),
+        ] {
+            let desc = IndirectCommandBufferDescriptor {
+                flags,
+                ..Default::default()
+            };
+            assert_eq!(
+                desc.unapplied_flags(),
+                vec![want],
+                "flags {flags:#06x} did not report exactly {want:?}"
+            );
+        }
+
+        // The two this device *does* apply must never appear on the list,
+        // whichever way they are set — otherwise a working path reports a loss.
+        for flags in [
+            DEFAULT_FLAGS | ICB_FLAG_INHERIT_BUFFERS | ICB_FLAG_INHERIT_PIPELINE_STATE,
+            DEFAULT_FLAGS,
+        ] {
+            let desc = IndirectCommandBufferDescriptor {
+                flags,
+                ..Default::default()
+            };
+            assert!(desc.unapplied_flags().is_empty(), "flags {flags:#06x}");
+        }
+
+        // Every slug is distinct: eight losses that shared one name would be
+        // the collapse this enum exists to prevent.
+        let slugs: std::collections::BTreeSet<&str> = [
+            IcbUnappliedFlag::SupportRayTracing,
+            IcbUnappliedFlag::SupportDynamicAttributeStride,
+            IcbUnappliedFlag::InheritDepthStencilState,
+            IcbUnappliedFlag::InheritDepthBias,
+            IcbUnappliedFlag::InheritDepthClipMode,
+            IcbUnappliedFlag::InheritCullMode,
+            IcbUnappliedFlag::InheritFrontFacingWinding,
+            IcbUnappliedFlag::InheritTriangleFillMode,
+        ]
+        .iter()
+        .map(|f| f.slug())
+        .collect();
+        assert_eq!(slugs.len(), 8, "two dropped flags share a slug");
+    }
+
+    /// `options` is sixteen bits, and the two bytes above it are the guest's
+    /// ring.
+    ///
+    /// The serializer narrows the `Q` its selector declares and never touches
+    /// `+0x56`/`+0x57`. This decoder read a `u32` there, so a descriptor
+    /// allocated over a ring that last held anything non-zero produced
+    /// `MTLResourceOptions` with garbage in its top half — the same shape as
+    /// the `copyFromTexture:toBuffer:` `options` bug. Found by the oracle's
+    /// complementary-fill passes rather than by reading, which is why the two
+    /// fills are what this test drives.
+    #[test]
+    fn the_options_word_ignores_the_two_bytes_the_serializer_never_writes() {
+        let mut decoded = Vec::new();
+        for ring in [0x00u8, 0xaa, 0x55, 0xff] {
+            let mut b = [0u8; ICB_DESC_LEN];
+            st32(&mut b[0..], TYPE7_OBJECT_ICB);
+            st32(&mut b[4..], ICB_DESC_LEN as u32);
+            st32(&mut b[8..], MTL_INDIRECT_CMD_DRAW);
+            b[ICB_DESC_MAX_VERTEX_BINDS] = 4;
+            st16(&mut b[ICB_DESC_FLAGS..], 0);
+            let layout = compute_only_icb_layout(0);
+            b[ICB_DESC_LAYOUT..ICB_DESC_LAYOUT + ICB_LAYOUT_LEN]
+                .copy_from_slice(&encode_icb_command_layout(&layout));
+            st32(&mut b[ICB_DESC_MAX_COMMAND_COUNT..], 8);
+            // MTLResourceStorageModePrivate, the value a real guest writes.
+            st16(&mut b[ICB_DESC_OPTIONS..], 0x20);
+            b[ICB_DESC_OPTIONS_UNWRITTEN] = ring;
+            b[ICB_DESC_OPTIONS_UNWRITTEN + 1] = ring;
+            decoded.push(decode_icb_descriptor(&b).unwrap().options);
+        }
+        assert!(
+            decoded.iter().all(|&o| o == 0x20),
+            "options moved with bytes the serializer never wrote: {decoded:?}"
+        );
     }
 
     /// A dispatch-only `command_types` does not license discarding the
@@ -2647,7 +3513,7 @@ mod tests {
             ICB_FLAG_INHERIT_BUFFERS | ICB_FLAG_INHERIT_PIPELINE_STATE,
         );
         let icb = decode_icb_descriptor(&b).unwrap();
-        assert!(icb.inherit_buffers && icb.inherit_pipeline_state);
+        assert!(icb.inherit_buffers() && icb.inherit_pipeline_state());
     }
 
     /// Dedicated create-body max-count matrix: decode offsets +0x0f..+0x12 and
@@ -3621,13 +4487,26 @@ mod tests {
         assert_eq!(d1.buffer_ref, 8);
         assert_eq!(d1.offset, 0);
         assert_eq!(d1.bytes_per_row, 1280);
-        assert_eq!(d1.pixel_format, 0x50); // BGRA8_UNORM
-        assert_eq!(d1.texture_type, TEXTURE_VIEW_MTL_TYPE_2D);
-        assert_eq!((d1.width, d1.height), (284, 284));
-        assert_eq!(d1.depth, 1);
-        assert_eq!(d1.mipmap_level_count, 1);
-        assert_eq!(d1.sample_count, 1);
-        assert_eq!(d1.array_length, 1);
+        assert_eq!(d1.desc.pixel_format, 0x50); // BGRA8_UNORM
+        assert_eq!(d1.desc.texture_type as u16, TEXTURE_VIEW_MTL_TYPE_2D);
+        assert_eq!((d1.desc.width, d1.desc.height), (284, 284));
+        assert_eq!(d1.desc.depth, 1);
+        assert_eq!(d1.desc.mipmap_level_count, 1);
+        assert_eq!(d1.desc.sample_count, 1);
+        assert_eq!(d1.desc.array_length, 1);
+        // The fields the inline reading dropped. `usage` is the byte the old
+        // `flags & 0xf` / `flags >> 16` pair stepped straight over: the packed
+        // word here is `0x00501142`, so `usage` is `0x11` —
+        // `MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView`, which
+        // is the guest saying it will sample this tile through a *different*
+        // pixel format than the one it declared. This device discarded that on
+        // every buffer-backed texture.
+        assert_eq!(d1.desc.usage, 0x11);
+        assert_eq!(d1.desc.resource_options, 0x0010);
+        assert_eq!(d1.desc.protection_options, 0);
+        assert!(d1.desc.allow_gpu_optimized_contents);
+        assert!(!d1.desc.framebuffer_only);
+        assert!(!d1.desc.is_drawable);
 
         let b2 = hex_to_bytes(
             "09000000400000004c0000004b000000000000000000000000010000000000004\
@@ -3637,8 +4516,8 @@ mod tests {
         assert_eq!(d2.new_texture_ref, 76);
         assert_eq!(d2.buffer_ref, 75);
         assert_eq!(d2.bytes_per_row, 256);
-        assert_eq!(d2.pixel_format, 0x50);
-        assert_eq!((d2.width, d2.height), (64, 64));
+        assert_eq!(d2.desc.pixel_format, 0x50);
+        assert_eq!((d2.desc.width, d2.desc.height), (64, 64));
 
         // A real texture-VIEW (opcode 8) is NOT a buffer texture.
         let mut view = vec![0u8; TEXTURE_VIEW_MIN_RANGED];
@@ -3674,6 +4553,67 @@ mod tests {
         for t in 0u8..16 {
             let bytes = vec![0u8; 128];
             let _ = decode_descriptor(t, &bytes);
+        }
+    }
+
+    /// A type-7 subtype **is** a `PGSerializer` opcode, and the two this module
+    /// still spells as numbers are exactly the two nothing has driven.
+    ///
+    /// The type-7 object-list entry is reached by object *type* rather than off
+    /// the command stream, which is why its subtypes look like a private
+    /// enumeration and were written as one. They are not: `0x03` is
+    /// `newSamplerState`, `0x04` is `newDepthStencilState` and `0x36` is
+    /// `newIndirectCommandBuffer`, all three now taken from the crate that
+    /// derived them, and `decode_icb_descriptor` reads the identical 88 bytes
+    /// the fixture instrument feeds `ops::icb`.
+    ///
+    /// `0x0b` and `0x0e` stay numbers because no capture has produced them.
+    /// Their selectors are the pipeline-creation family, which needs a
+    /// *serialized* descriptor rather than a Metal descriptor object to drive,
+    /// so they have no manifest row at all — they are the remainder behind
+    /// `counts()`, not an `Unimplemented` row, and driving them with malformed
+    /// input would prove nothing.
+    ///
+    /// The class filter is load-bearing. `0x0b` is also
+    /// `drawIndexedPrimitives:…:baseVertex:baseInstance:` on the render
+    /// encoder, and reading that as support for this tag would be taking a
+    /// number from the wrong opcode space — the same trap `0x1b` sets, where
+    /// the texture-view creation and `useHeap:` share a value.
+    #[test]
+    fn the_undrivable_type7_subtypes_are_the_pipeline_pair_and_nothing_claims_them() {
+        let serializer_opcodes = |op: u32| {
+            reims_vgpu_wire::manifest::MANIFEST
+                .iter()
+                .filter(|e| e.class == "PGSerializer")
+                .any(|e| e.opcodes.contains(&op))
+        };
+
+        // The three that are derived must still be, in the serializer's space.
+        for (tag, name) in [
+            (TYPE7_OBJECT_SAMPLER, "TYPE7_OBJECT_SAMPLER"),
+            (TYPE7_OBJECT_DEPTH_STENCIL, "TYPE7_OBJECT_DEPTH_STENCIL"),
+            (TYPE7_OBJECT_ICB, "TYPE7_OBJECT_ICB"),
+        ] {
+            assert!(
+                serializer_opcodes(tag),
+                "{name} = {tag:#x} is no longer an opcode Apple's PGSerializer                  manifest lists"
+            );
+        }
+
+        // The two that are not must stay unclaimed. A capture that drives the
+        // pipeline family gives them a row, and then the number here has a
+        // derivation and must come from it rather than stay a literal.
+        for (tag, name) in [
+            (
+                TYPE7_OBJECT_COMPUTE_PIPELINE,
+                "TYPE7_OBJECT_COMPUTE_PIPELINE",
+            ),
+            (TYPE7_OBJECT_RENDER_PIPELINE, "TYPE7_OBJECT_RENDER_PIPELINE"),
+        ] {
+            assert!(
+                !serializer_opcodes(tag),
+                "{name} = {tag:#x} now has a PGSerializer row, so it is derived                  and must be read from reims-vgpu-wire rather than written here"
+            );
         }
     }
 }

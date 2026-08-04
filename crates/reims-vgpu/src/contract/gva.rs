@@ -1,30 +1,48 @@
-//! GVA page-table geometry constants (reims_vgpu_gva_format.h).
+//! GVA page-table geometry, as this device names it.
+//!
+//! Nothing here is declared. The format itself lives in
+//! `reims_vgpu_wire::page_table`, which owns it — so every value below is either
+//! re-exported from there or computed from it, and the two cannot drift because
+//! there is only one of each. What this module adds is *this device's names for them*, which the
+//! rest of the crate uses and which encode a rule the wire crate has no reason
+//! to care about (see the arch-prefix note below).
+//!
+//! An earlier version of this file declared the same constants a second time,
+//! with a test asserting the two agreed. That is the right remedy where the two
+//! sides cannot see each other — the QEMU ABI header, which Rust does not
+//! include — but both of these are Rust, so a re-export is strictly better: it
+//! makes the drift impossible rather than detectable.
 
-pub const DIRECTORY_ROOT_PFN: u32 = 0x00;
-pub const DIRECTORY_DEPTH: u32 = 0x04;
+use reims_vgpu_wire::page_table as wire;
 
-pub const PTE_SIZE: u32 = 4;
-pub const PTE_FLAG_MASK: u32 = 0x8000_0000;
-pub const PTE_PFN_MASK: u32 = 0x7fff_ffff;
+pub use wire::{MAX_DEPTH, PTE_FLAG_MASK, PTE_PFN_MASK, PTE_SIZE};
 
-pub const MAX_DEPTH: u32 = 4;
+/// Offsets within a task's directory page. Narrowed from the wire crate's `u64`
+/// because every consumer here indexes a `u32` field set.
+pub const DIRECTORY_ROOT_PFN: u32 = wire::DIRECTORY_ROOT_PFN as u32;
+pub const DIRECTORY_DEPTH: u32 = wire::DIRECTORY_DEPTH as u32;
+
+/// Largest span this device will resolve in one call.
+///
+/// A device policy bound rather than a property of the format, so it stays here:
+/// the guest's page table can describe more than this, and we decline instead.
 pub const MAX_SPAN_PAGES: u32 = 1 << 20;
 
-pub const PAGE_SHIFT_ARM64E: u32 = 14;
-pub const PAGE_SIZE_ARM64E: u32 = 1 << PAGE_SHIFT_ARM64E;
-pub const ARM64E_PAGE_OFFSET_MASK: u32 = PAGE_SIZE_ARM64E - 1;
-pub const ARM64E_INDEX_BITS: u32 = 12;
-pub const ARM64E_INDEX_MASK: u32 = 0xfff;
-pub const ARM64E_ENTRIES_PER_TABLE: u32 = 1 << ARM64E_INDEX_BITS;
-pub const ARM64E_MAX_DEPTH: u32 = MAX_DEPTH;
+pub const PAGE_SHIFT_ARM64E: u32 = wire::ARM64E.page_shift;
+pub const PAGE_SIZE_ARM64E: u32 = wire::ARM64E.page_size() as u32;
+pub const ARM64E_PAGE_OFFSET_MASK: u32 = wire::ARM64E.page_offset_mask() as u32;
+pub const ARM64E_INDEX_BITS: u32 = wire::ARM64E.index_bits();
+pub const ARM64E_INDEX_MASK: u32 = wire::ARM64E.index_mask() as u32;
+pub const ARM64E_ENTRIES_PER_TABLE: u32 = wire::ARM64E.entries_per_table() as u32;
+pub const ARM64E_MAX_DEPTH: u32 = wire::ARM64E.max_depth;
 
-pub const PAGE_SHIFT_X86: u32 = 12;
-pub const PAGE_SIZE_X86: u32 = 1 << PAGE_SHIFT_X86;
-pub const X86_64_PAGE_OFFSET_MASK: u32 = PAGE_SIZE_X86 - 1;
-pub const X86_64_INDEX_BITS: u32 = 10;
-pub const X86_64_INDEX_MASK: u32 = 0x3ff;
-pub const X86_64_ENTRIES_PER_TABLE: u32 = 1 << X86_64_INDEX_BITS;
-pub const X86_64_MAX_DEPTH: u32 = MAX_DEPTH;
+pub const PAGE_SHIFT_X86: u32 = wire::X86_64.page_shift;
+pub const PAGE_SIZE_X86: u32 = wire::X86_64.page_size() as u32;
+pub const X86_64_PAGE_OFFSET_MASK: u32 = wire::X86_64.page_offset_mask() as u32;
+pub const X86_64_INDEX_BITS: u32 = wire::X86_64.index_bits();
+pub const X86_64_INDEX_MASK: u32 = wire::X86_64.index_mask() as u32;
+pub const X86_64_ENTRIES_PER_TABLE: u32 = wire::X86_64.entries_per_table() as u32;
+pub const X86_64_MAX_DEPTH: u32 = wire::X86_64.max_depth;
 
 // No bare `PAGE_SHIFT`, `PAGE_SIZE`, `INDEX_BITS`, `INDEX_MASK` or
 // `ENTRIES_PER_TABLE`. Every one of those silently meant arm64e and caused
@@ -59,6 +77,24 @@ mod tests {
         assert_eq!(X86_64_ENTRIES_PER_TABLE, 1 << X86_64_INDEX_BITS);
         assert_eq!(X86_64_INDEX_MASK, X86_64_ENTRIES_PER_TABLE - 1);
         assert_ne!(PAGE_SIZE_ARM64E, PAGE_SIZE_X86);
+    }
+
+    /// The wire crate states page geometry in `u64`; this module narrows it.
+    ///
+    /// The narrowing is silent, so it gets a test. There is no drift test here
+    /// on purpose — these names are re-exports and computations, not a second
+    /// declaration, so there is nothing that *can* disagree. What a widened
+    /// page shift would do instead is truncate, and this is what catches that.
+    #[test]
+    fn narrowing_the_wire_geometry_to_this_devices_width_loses_nothing() {
+        for g in [wire::X86_64, wire::ARM64E] {
+            assert_eq!(g.page_size() as u32 as u64, g.page_size());
+            assert_eq!(g.page_offset_mask() as u32 as u64, g.page_offset_mask());
+            assert_eq!(g.index_mask() as u32 as u64, g.index_mask());
+            assert_eq!(g.entries_per_table() as u32 as u64, g.entries_per_table());
+        }
+        assert_eq!(DIRECTORY_ROOT_PFN as u64, wire::DIRECTORY_ROOT_PFN);
+        assert_eq!(DIRECTORY_DEPTH as u64, wire::DIRECTORY_DEPTH);
     }
 
     /// A PFN shifted to a GPA still names its own page at any offset inside it.

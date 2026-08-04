@@ -1,12 +1,19 @@
 //! Event/sync command decoder (port of `host/utils/reims-vgpu-event-decode`).
 
 use crate::contract::endian::{ld32, ld64};
+use reims_vgpu_wire::ops::blit as wire_blit;
 
 pub const U32_SIZE: usize = 4;
 pub const U64_SIZE: usize = 8;
 pub const OPCODE_OFFSET: usize = 0;
 pub const LENGTH_OFFSET: usize = 4;
-pub const HEADER_LEN: usize = 8;
+/// Bytes before a record's payload, from [`reims_vgpu_wire::OP_HEADER_LEN`].
+///
+/// One fact that used to be declared six times — here, in `render`, `compute`,
+/// `blit` and twice in `stream` — all agreeing, with nothing comparing them.
+/// Re-exporting makes drift impossible rather than merely detectable, which is
+/// the move `contract::gva` already made for the page-table format.
+pub use reims_vgpu_wire::OP_HEADER_LEN as HEADER_LEN;
 
 pub const VALUE_REF: usize = 0;
 pub const VALUE_VALUE: usize = 4;
@@ -20,10 +27,25 @@ pub const OP_WAIT_EVENT: u32 = 0x190;
 pub const OP_SIGNAL_EVENT: u32 = 0x191;
 pub const OP_WAIT_EVENT_TIMEOUT: u32 = 0x192;
 
-pub const REJECTED_BLIT_UPDATE_FENCE: u32 = 0x13c;
-pub const REJECTED_BLIT_WAIT_FENCE: u32 = 0x13d;
-pub const REJECTED_BEFORE_WINDOW: u32 = 0x18f;
-pub const REJECTED_AFTER_WINDOW: u32 = 0x193;
+/// Opcodes the event deserializer refuses, and why each is here.
+///
+/// The first two are the **blit encoder's** fence records, and naming them is
+/// this list's whole point: `0x13c`/`0x13d` are real opcodes in another space,
+/// so an event decoder that accepted them would be reading a blit fence as an
+/// event. They are taken from the crate that derived them rather than written
+/// again — a number whose only job is to be another encoder's opcode should be
+/// that opcode, or the two can part company and this list starts refusing
+/// something Apple never writes while letting a renumbered fence through.
+///
+/// The last two are the boundary probes, one below and one above the event
+/// window `OP_WAIT_EVENT`..=`OP_WAIT_EVENT_TIMEOUT`. They are derived from the
+/// window rather than transcribed beside it, so extending the window moves the
+/// probes with it instead of leaving one of them *inside* the accepted range —
+/// which would make this predicate refuse a command the decoder implements.
+pub const REJECTED_BLIT_UPDATE_FENCE: u32 = wire_blit::OPCODE_UPDATE_FENCE;
+pub const REJECTED_BLIT_WAIT_FENCE: u32 = wire_blit::OPCODE_WAIT_FOR_FENCE;
+pub const REJECTED_BEFORE_WINDOW: u32 = OP_WAIT_EVENT - 1;
+pub const REJECTED_AFTER_WINDOW: u32 = OP_WAIT_EVENT_TIMEOUT + 1;
 
 /// Why the event decoder refused a command.
 ///
@@ -219,6 +241,49 @@ mod tests {
     #[test]
     fn short_header() {
         assert_eq!(decode(&[0; 4]).unwrap_err(), DecodeStatus::ErrShort);
+    }
+
+    /// No refused opcode is one this decoder implements.
+    ///
+    /// The two boundary probes are now `OP_WAIT_EVENT - 1` and
+    /// `OP_WAIT_EVENT_TIMEOUT + 1` rather than `0x18f`/`0x193` written beside
+    /// them, and this is the property that derivation buys: a window that grows
+    /// downward or upward carries its probes with it. Transcribed, one of them
+    /// would end up *inside* the accepted range and
+    /// [`opcode_rejected_by_deserializer`] would refuse a command the match
+    /// below decodes — a guest's event silently declined by a constant that was
+    /// only ever meant to sit outside.
+    ///
+    /// The blit pair is checked the same way and for the sharper reason: those
+    /// two are real opcodes in another encoder's space, so this list is only
+    /// correct while it names *that* space's fences and not this one's events.
+    #[test]
+    fn no_refused_opcode_is_one_this_decoder_implements() {
+        for (op, name) in [
+            (OP_WAIT_EVENT, "OP_WAIT_EVENT"),
+            (OP_SIGNAL_EVENT, "OP_SIGNAL_EVENT"),
+            (OP_WAIT_EVENT_TIMEOUT, "OP_WAIT_EVENT_TIMEOUT"),
+        ] {
+            assert!(
+                !opcode_rejected_by_deserializer(op),
+                "{name} = {op:#x} is both implemented and refused"
+            );
+        }
+        // And every refused opcode really is refused, so the list is not
+        // quietly empty of the case it exists for.
+        for (op, name) in [
+            (REJECTED_BLIT_UPDATE_FENCE, "REJECTED_BLIT_UPDATE_FENCE"),
+            (REJECTED_BLIT_WAIT_FENCE, "REJECTED_BLIT_WAIT_FENCE"),
+            (REJECTED_BEFORE_WINDOW, "REJECTED_BEFORE_WINDOW"),
+            (REJECTED_AFTER_WINDOW, "REJECTED_AFTER_WINDOW"),
+        ] {
+            assert!(opcode_rejected_by_deserializer(op), "{name} is not refused");
+            assert_eq!(
+                decode(&build(op, &[0u8; 32])).unwrap_err(),
+                DecodeStatus::ErrRejectedOpcode,
+                "{name} = {op:#x} must refuse by name rather than as an unknown"
+            );
+        }
     }
 
     #[test]

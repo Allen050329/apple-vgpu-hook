@@ -54,6 +54,17 @@ pub enum DrawReason {
     /// for. That is undefined behaviour a validation layer catches on someone
     /// else's GPU; declining by name is the honest answer.
     SamplerMirrorClampToEdgeUnsupported,
+    /// The guest pipeline names one of `MTLBlendFactor`'s four dual-source
+    /// factors (`Source1Color` .. `OneMinusSource1Alpha`, 15-18) and this device
+    /// does not advertise `VkPhysicalDeviceFeatures::dualSrcBlend`.
+    ///
+    /// These reached no arm at all until the translation table was extended —
+    /// `translate::blend::factor` stopped at 14 and its test asserted 15 was
+    /// past the end of `MTLBlendFactor`, which runs to 18. So a guest asking
+    /// for dual-source blending was refused as an unknown factor on every host,
+    /// including the ones that support it. Now it translates, and only a host
+    /// that genuinely cannot run it declines — here, by name.
+    DualSourceBlendUnsupported,
     /// The device declines this vertex attribute format and no portable
     /// substitute fits. Carries the translation-layer reason so the two log
     /// lines agree on why.
@@ -114,6 +125,7 @@ impl crate::observe::Decline for DrawReason {
             Self::DepthWithSecondaryAttachments => "depth_with_secondary_attachments",
             Self::SamplerAnisotropyUnsupported => "sampler_anisotropy_unsupported",
             Self::SamplerMirrorClampToEdgeUnsupported => "sampler_mirror_clamp_to_edge_unsupported",
+            Self::DualSourceBlendUnsupported => "dual_source_blend_unsupported",
             // Deliberately delegates: the translation layer already named the
             // exact format problem, and inventing a second slug here would make
             // the two log lines disagree about one event.
