@@ -236,6 +236,9 @@ pub(crate) struct ResourcePools {
     /// rather than guessed at. Diagnostic only — nothing reads it to decide
     /// anything.
     reclaimed_recent: VecDeque<(TargetIdentity, ResidentReclaim)>,
+    /// Source of [`ResidentTargetSlot::use_seq`]. Monotonic for the life of the
+    /// pools; at one bump per bind it cannot wrap in any realistic session.
+    use_clock: u64,
     /// Monotonic wall-clock milliseconds for the resident-target idle drain, fed
     /// from the poll heartbeat and each publish ([`Self::advance_registry_touch_and_drain`]).
     /// Each admit/hit/present stamps its slot's `last_touch_ms` with this value;
@@ -720,6 +723,16 @@ pub(crate) struct ResidentTargetSlot {
     /// guest lifetime, while an actively-drawn target (touched every frame) never
     /// ages out.
     pub last_touch_ms: u64,
+    /// Strictly increasing stamp of the last use, for the capacity walk's
+    /// least-recently-used choice.
+    ///
+    /// Separate from `last_touch_ms` because that clock is wall time fed from
+    /// the ~244 Hz poll heartbeat, so every use inside one tick shares a value.
+    /// The cap walk needs a total order, and ties there fall to the
+    /// oldest-*created* entry — which is exactly the session-long backdrop the
+    /// walk must stop taking. The drain still wants wall time (it asks how
+    /// *old* something is, not which came last), so the two are kept apart.
+    pub use_seq: u64,
 }
 
 /// Geometry+format key for the resident-target recycle pool (`target_free`).

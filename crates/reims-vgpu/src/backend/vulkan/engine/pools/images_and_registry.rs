@@ -319,8 +319,11 @@ impl ResourcePools {
                         .gpu_load_hits
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let touch = self.idle_clock_ms;
+                    self.use_clock += 1;
+                    let seq = self.use_clock;
                     let slot = self.registry.get_mut(&identity).unwrap();
                     slot.last_touch_ms = touch;
+                    slot.use_seq = seq;
                     return Ok(slot);
                 }
                 // Same image, new pass → recreate framebuffer only.
@@ -478,6 +481,8 @@ impl ResourcePools {
         };
         counters.note_create();
         let touch_ms = self.idle_clock_ms;
+        self.use_clock += 1;
+        let use_seq = self.use_clock;
         self.registry.insert(
             identity.clone(),
             ResidentTargetSlot {
@@ -496,6 +501,7 @@ impl ResourcePools {
                 color_format: format,
                 pin_count: 0,
                 last_touch_ms: touch_ms,
+                use_seq,
             },
         );
         self.registry_order.push_back(identity.clone());
@@ -644,6 +650,8 @@ impl ResourcePools {
             (image, memory, view)
         };
         let touch_ms = self.idle_clock_ms;
+        self.use_clock += 1;
+        let use_seq = self.use_clock;
         self.registry.insert(
             identity.clone(),
             ResidentTargetSlot {
@@ -662,6 +670,7 @@ impl ResourcePools {
                 color_format: format,
                 pin_count: 0,
                 last_touch_ms: touch_ms,
+                use_seq,
             },
         );
         self.registry_order.push_back(identity.clone());
@@ -938,6 +947,7 @@ mod pin_count_tests {
             color_format: translate::pixel::SCANOUT_FORMAT,
             pin_count: 0,
             last_touch_ms: 0,
+            use_seq: 0,
         }
     }
 
@@ -1197,6 +1207,37 @@ mod pin_count_tests {
             pools.cap_eviction_victim(Some(&surf(2))),
             Some(surf(3)),
             "a protected identity is passed over for the next-oldest use"
+        );
+    }
+
+    /// Uses inside one poll tick are still ordered against each other.
+    ///
+    /// `last_touch_ms` comes from the ~244 Hz poll heartbeat, so every use
+    /// between two ticks carries the same millisecond. Choosing the victim on
+    /// that alone leaves a tie, and the tie falls to the oldest-created entry —
+    /// which is precisely the session-long backdrop this walk must stop taking.
+    /// `use_seq` gives the total order, so a resident read this tick outranks
+    /// one last read several ticks ago even though the clock never moved
+    /// between them.
+    #[test]
+    fn uses_within_one_clock_tick_are_still_ordered() {
+        let mut pools = ResourcePools::new();
+        // Same wall-clock stamp on every slot: one poll tick.
+        admit(&mut pools, surf(1), 500, 0);
+        admit(&mut pools, surf(2), 500, 0);
+        pools.idle_clock_ms = 500;
+        // Read the oldest-created one last. The clock cannot express that.
+        pools.registry_note_sampled_use(&surf(2));
+        pools.registry_note_sampled_use(&surf(1));
+        assert_eq!(
+            pools.registry.get(&surf(1)).unwrap().last_touch_ms,
+            pools.registry.get(&surf(2)).unwrap().last_touch_ms,
+            "precondition: the wall clock cannot separate these two uses"
+        );
+        assert_eq!(
+            pools.cap_eviction_victim(None),
+            Some(surf(2)),
+            "the earlier use in the tick is the victim, not the earlier creation"
         );
     }
 

@@ -1478,9 +1478,10 @@ pub(crate) unsafe fn execute_draw_inner(
     // needs load to be heavy; heavy load only makes the registry sit at cap,
     // which is when the walk evicts at all.
     //
-    // Marking them used is enough to close it: the cap walk rotates past a
-    // recently-used resident exactly as it does a pinned one. That reuses the
-    // recency the sampled resolve already records rather than threading a
+    // Marking them used is enough to close it: the cap walk evicts the
+    // least-recently-used resident, and one this draw is about to read is by
+    // construction the most recently used thing in the registry. That reuses
+    // the recency the sampled resolve already records rather than threading a
     // second protected set through `registry_ensure`, and it protects these
     // residents from the idle drain in the same breath.
     for s in &req.sampled_images {

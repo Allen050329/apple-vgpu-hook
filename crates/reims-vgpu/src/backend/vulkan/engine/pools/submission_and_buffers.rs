@@ -67,6 +67,7 @@ impl ResourcePools {
             registry: HashMap::new(),
             registry_order: VecDeque::new(),
             reclaimed_recent: VecDeque::new(),
+            use_clock: 0,
             idle_clock_ms: 0,
             last_drain_ms: 0,
             settled_drain_passes: 0,
@@ -574,8 +575,11 @@ impl ResourcePools {
             self.idle_clock_ms = now_ms;
         }
         let touch = self.idle_clock_ms;
+        self.use_clock += 1;
+        let seq = self.use_clock;
         if let Some(slot) = self.registry.get_mut(identity) {
             slot.last_touch_ms = touch;
+            slot.use_seq = seq;
         }
     }
 
@@ -648,7 +652,7 @@ impl ResourcePools {
             .iter()
             .filter_map(|k| self.registry.get(k).map(|slot| (k, slot)))
             .filter(|(k, slot)| slot.pin_count == 0 && protect != Some(k))
-            .min_by_key(|(_, slot)| slot.last_touch_ms)
+            .min_by_key(|(_, slot)| slot.use_seq)
             .map(|(k, _)| k.clone())
     }
 
@@ -683,8 +687,11 @@ impl ResourcePools {
     /// each of them.
     pub(crate) fn registry_note_sampled_use(&mut self, identity: &TargetIdentity) {
         let touch = self.idle_clock_ms;
+        self.use_clock += 1;
+        let seq = self.use_clock;
         if let Some(slot) = self.registry.get_mut(identity) {
             slot.last_touch_ms = touch;
+            slot.use_seq = seq;
         }
     }
 
