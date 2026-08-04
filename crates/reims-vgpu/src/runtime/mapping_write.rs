@@ -952,9 +952,22 @@ pub fn write_bgra8_from_resident_gpu<M: HostMemory + HostOps>(
     // own drift check does — and every value taken after it is taken against
     // whatever it left behind.
     crate::runtime::storage_flush::flush_intersecting(state, host, mapping_id, base_off, span_end);
-    let Some(_vouched) = vouch_for_write(state, host, mapping_id, "gpu_writeback") else {
+    // Timed on its own because it is the largest `O(pages)` step left and its
+    // fix is not the other one's. `vouch_for_write` re-walks every page of the
+    // mapping through the guest's page table — the check that licenses writing
+    // to them at all — and until the host copies were removed that cost was
+    // hidden inside a millisecond of memcpy.
+    use crate::runtime::drain::{note_readback_phase, ReadbackPhase};
+    let vouch_started = std::time::Instant::now();
+    let vouched = vouch_for_write(state, host, mapping_id, "gpu_writeback");
+    note_readback_phase(
+        ReadbackPhase::Vouch,
+        vouch_started.elapsed().as_micros() as u64,
+    );
+    if vouched.is_none() {
         return Err(GpuWritebackDecline::PagesNotOurs);
-    };
+    }
+    let resolve_started = std::time::Instant::now();
     let page_size = state.page_size();
     let page_shift = state.page_shift;
     let Some(m) = state.mappings.get(&mapping_id) else {
@@ -995,6 +1008,10 @@ pub fn write_bgra8_from_resident_gpu<M: HostMemory + HostOps>(
     // rows and has no pointer whose coverage it is restating.
     mapper::note_mapping_write_footprint(state, mapping_id, base_off, span_end - base_off);
     state.note_host_wrote_mapping(mapping_id);
+    note_readback_phase(
+        ReadbackPhase::Resolve,
+        resolve_started.elapsed().as_micros() as u64,
+    );
     crate::backend::vulkan::engine::copy_target_to_guest_pages(identity, &target)
         .map_err(|inner| GpuWritebackDecline::Engine { inner })?;
     state.invalidate_storage_residency_window(mapping_id, base_off, span_end);

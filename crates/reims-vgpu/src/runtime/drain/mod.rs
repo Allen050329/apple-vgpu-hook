@@ -3297,15 +3297,40 @@ pub enum ReadbackPhase {
     /// climbs in proportion to the ones that were not.
     Map,
     /// Write the frame into the guest's pages (`write_bgra8_skipping`).
+    ///
+    /// Reads zero on a window the GPU rail landed, because that rail's
+    /// destination *is* the guest's pages and there is no second pass to time.
+    /// See `mapping_write::write_bgra8_from_resident_gpu`.
     Write,
+    /// Re-walk the mapping's page list against the guest's page table
+    /// (`mapper::vouch_mapping_pages_verdict`), which is what licenses any write
+    /// to those pages at all.
+    ///
+    /// Split out because it is `O(pages)` with a guest page-table walk each, it
+    /// runs once per flush on every rail, and until the host copies were removed
+    /// it was hidden inside a millisecond of memcpy. A rail that has stopped
+    /// moving bytes is measured by what it does instead.
+    Vouch,
+    /// Everything else a flush does before the copy: resolve the sample window,
+    /// turn the page list into a dma-buf, and mark the write footprint. Also
+    /// `O(pages)`, and separate from `Vouch` because the two have different
+    /// fixes — one is a cache, the other is a smaller walk.
+    Resolve,
 }
 
 impl ReadbackPhase {
-    const ALL: [ReadbackPhase; 4] = [
+    /// How many phases there are. The census arrays are sized from this, so a
+    /// new variant that forgets to bump it fails to build [`Self::ALL`] rather
+    /// than overflowing an array at report time.
+    pub(crate) const COUNT: usize = 6;
+
+    const ALL: [ReadbackPhase; Self::COUNT] = [
         ReadbackPhase::Submit,
         ReadbackPhase::Fence,
         ReadbackPhase::Map,
         ReadbackPhase::Write,
+        ReadbackPhase::Vouch,
+        ReadbackPhase::Resolve,
     ];
 
     const fn index(self) -> usize {
@@ -3314,6 +3339,8 @@ impl ReadbackPhase {
             ReadbackPhase::Fence => 1,
             ReadbackPhase::Map => 2,
             ReadbackPhase::Write => 3,
+            ReadbackPhase::Vouch => 4,
+            ReadbackPhase::Resolve => 5,
         }
     }
 
@@ -3323,6 +3350,8 @@ impl ReadbackPhase {
             ReadbackPhase::Fence => "fence",
             ReadbackPhase::Map => "map",
             ReadbackPhase::Write => "write",
+            ReadbackPhase::Vouch => "vouch",
+            ReadbackPhase::Resolve => "resolve",
         }
     }
 }
@@ -3739,9 +3768,15 @@ pub(crate) struct DrainDutyCensus {
     rail_count: [std::sync::atomic::AtomicU64; 4],
     rail_max_us: [std::sync::atomic::AtomicU64; 4],
     /// The inside of the render rail, indexed by [`ReadbackPhase::index`].
-    rb_us: [std::sync::atomic::AtomicU64; 4],
-    rb_count: [std::sync::atomic::AtomicU64; 4],
-    rb_max_us: [std::sync::atomic::AtomicU64; 4],
+    ///
+    /// Sized from [`ReadbackPhase::COUNT`] and not from a literal. These were
+    /// `[_; 4]` while the enum grew to six, and the only thing that noticed was
+    /// an index-out-of-bounds panic in the census emitter — on the reporting
+    /// path, so a build could pass every compile check and die the first time it
+    /// printed a line.
+    rb_us: [std::sync::atomic::AtomicU64; ReadbackPhase::COUNT],
+    rb_count: [std::sync::atomic::AtomicU64; ReadbackPhase::COUNT],
+    rb_max_us: [std::sync::atomic::AtomicU64; ReadbackPhase::COUNT],
     /// GPU-side execution of the readback command buffer, from the device's own
     /// timestamp queries, split at the barrier. `rb_bar_us` is the copy command
     /// buffer waiting for the draw batch ahead of it to finish; `rb_gpu_us` is

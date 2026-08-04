@@ -1971,6 +1971,13 @@ fn the_readback_split_divides_a_round_trip_from_the_bytes_it_carried() {
     c.note_readback(ReadbackPhase::Fence, 9_000);
     c.note_readback(ReadbackPhase::Map, 750);
     c.note_readback(ReadbackPhase::Write, 640);
+    // The two host-side halves the GPU rail leaves behind when it stops moving
+    // bytes. Reported here so a phase added to the enum without a slot in the
+    // census arrays fails this test rather than panicking the emitter on a live
+    // boot — which is where the `[_; 4]` that outlived a six-variant enum showed
+    // up, on the reporting path, after every compile check had passed.
+    c.note_readback(ReadbackPhase::Vouch, 300);
+    c.note_readback(ReadbackPhase::Resolve, 90);
     assert!(c.note(0, 0, 6_100).is_some(), "a full window must report");
 
     let split = c
@@ -1981,6 +1988,8 @@ fn the_readback_split_divides_a_round_trip_from_the_bytes_it_carried() {
     assert!(split.contains("fence_us=14400 fence=2"), "{split}");
     assert!(split.contains("map_us=1550 map=2"), "{split}");
     assert!(split.contains("write_us=1240 write=2"), "{split}");
+    assert!(split.contains("vouch_us=300 vouch=1"), "{split}");
+    assert!(split.contains("resolve_us=90 resolve=1"), "{split}");
     // The tail matters for the same reason it does on the rail above: a mean
     // fence of 7.2 ms and a worst of 9 ms is a steady tax, not a hitch.
     assert!(split.contains("fence_max_us=9000"), "{split}");
