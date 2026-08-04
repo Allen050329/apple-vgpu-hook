@@ -142,6 +142,12 @@ pub fn flush_intersecting_task_gva<M: HostMemory + HostOps>(
             && state.linear_deferred_flush.is_empty()
             && state.gva_deferred_flush.is_empty())
     {
+        // The whole call, walk included, costs nothing when no rail is armed.
+        // Counted apart from the walking arm because the two are what decide
+        // whether this probe is on the draw path's bill at all: every zero-copy
+        // bind makes this call, so a quiet:walked ratio near 1 means the early
+        // return is doing the work and a ratio near 0 means it is not.
+        crate::runtime::drain::note_store_route("gva_alias_probe_quiet");
         return;
     }
     // Fast exact-window path: a sample of the deferred GVA surface itself
@@ -153,13 +159,26 @@ pub fn flush_intersecting_task_gva<M: HostMemory + HostOps>(
         && state.linear_deferred_flush.is_empty()
         && state.gva_deferred_flush.is_empty()
     {
+        crate::runtime::drain::note_store_route("gva_alias_probe_quiet");
         return;
     }
+    // The arm that walks. Timed and counted because it is `O(pages)` guest
+    // page-table reads on a call every zero-copy bind makes, and because the
+    // caller immediately walks the *same* range again to build its run window —
+    // so what this costs is also what collapsing the two would return.
+    // `gva_alias_hit_page` below says how often the walk finds anything.
+    crate::runtime::drain::note_store_route("gva_alias_probe_walked");
+    let probe_started = std::time::Instant::now();
     let page = state.page_size();
     let n_pages = crate::runtime::gva_mem::pages_spanned(gva, span, page);
     let mut hits: Vec<u32> = Vec::new();
     let mut linear_hits: Vec<(crate::model::ComputeStorageResidencyKey, u32)> = Vec::new();
     let mut gva_hits: Vec<u64> = Vec::new();
+    // Pages the walk actually resolved, which is not `n_pages`: the visitor
+    // stops early once every armed window has been hit, and an unresolvable
+    // page is skipped rather than visited. The requested reach is `n_pages`
+    // beside it, so a reader can see which of the two the cost tracks.
+    let mut walked_pages: u64 = 0;
     {
         let index = &state.deferred_alias_pages;
         let linear_index = &state.linear_deferred_flush;
@@ -174,6 +193,7 @@ pub fn flush_intersecting_task_gva<M: HostMemory + HostOps>(
             state.page_shift,
             1,
             &mut |gpa_page| {
+                walked_pages += 1;
                 for (&mid, pages) in index.iter() {
                     if pages.contains(&gpa_page) && !hits.contains(&mid) {
                         hits.push(mid);
@@ -194,6 +214,12 @@ pub fn flush_intersecting_task_gva<M: HostMemory + HostOps>(
             },
         );
     }
+    crate::runtime::drain::note_store_route_n("gva_alias_probe_pages", walked_pages);
+    crate::runtime::drain::note_store_route_n("gva_alias_probe_reach", n_pages);
+    crate::runtime::drain::note_store_route_us(
+        "gva_alias_probe_us",
+        probe_started.elapsed().as_micros() as u64,
+    );
     let hit_ct = (hits.len() + linear_hits.len() + gva_hits.len()) as u64;
     if hit_ct == 0 {
         return;
@@ -3259,6 +3285,48 @@ mod render_flush_witness_tests {
 #[cfg(test)]
 mod tests {
     use crate::model::{ComputeStorageResidencyKey, DeviceId, DeviceState, PAGE_SHIFT_X86};
+
+    /// The alias probe charges the quiet arm when no rail is armed.
+    ///
+    /// Every zero-copy bind makes this call, so which arm it takes is what
+    /// decides whether the probe is on the draw path's bill at all. The two
+    /// counters are read against each other on the `store_routes` line and a
+    /// counter on the wrong side of the early return would read as "the walk
+    /// never runs" — which is the answer that would retire a cost that is
+    /// actually being paid.
+    #[test]
+    fn an_unarmed_alias_probe_takes_the_quiet_arm() {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut host = crate::runtime::host::FakeHost::default();
+        let before = crate::runtime::drain::store_route_count("gva_alias_probe_quiet");
+        let walked_before = crate::runtime::drain::store_route_count("gva_alias_probe_walked");
+        super::flush_intersecting_task_gva(&mut state, &mut host, 1, 0x4000, 0x1000);
+        assert_eq!(
+            crate::runtime::drain::store_route_count("gva_alias_probe_quiet"),
+            before + 1,
+            "an unarmed probe must charge the quiet arm"
+        );
+        assert_eq!(
+            crate::runtime::drain::store_route_count("gva_alias_probe_walked"),
+            walked_before,
+            "an unarmed probe must not reach the walking arm"
+        );
+    }
+
+    /// A zero span is quiet too, and is counted — it shares the early return
+    /// with the unarmed case, so a reader dividing `gva_alias_probe_us` by the
+    /// walked count is not silently also dividing by these.
+    #[test]
+    fn a_zero_span_alias_probe_never_walks() {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut host = crate::runtime::host::FakeHost::default();
+        let walked_before = crate::runtime::drain::store_route_count("gva_alias_probe_walked");
+        super::flush_intersecting_task_gva(&mut state, &mut host, 1, 0x4000, 0);
+        assert_eq!(
+            crate::runtime::drain::store_route_count("gva_alias_probe_walked"),
+            walked_before
+        );
+    }
 
     fn key(mapping_id: u32, lo: u64, hi: u64) -> ComputeStorageResidencyKey {
         ComputeStorageResidencyKey {
