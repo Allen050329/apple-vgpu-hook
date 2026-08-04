@@ -482,6 +482,94 @@ fn replace_physical_drops_the_cached_page_list() {
     );
 }
 
+/// A re-point naming an object this device holds no *mapping* for still names
+/// something: a type-11 texture, through the object-list ref its task registered
+/// it under. That fallback is the packet family the arm used to drop entirely —
+/// 57 % of the re-points on a driven boot found no mapping under `object_id` —
+/// and dropping it leaves the texture's page list trusted while it names pages
+/// that back something else.
+///
+/// The fallback is safe here and only here, because the direct reading found
+/// nothing: there is no surface under this id to misroute the packet away from.
+/// [`replace_physical_drops_the_cached_page_list`] holds the other half — when
+/// the direct reading *does* answer, the ref-keyed map must not be consulted at
+/// all.
+#[test]
+fn replace_physical_routes_through_the_texture_ref_when_no_mapping_owns_the_id() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    // Mapping 41 backs a type-11 texture the guest registered at object-list
+    // ref 12 of task 3. Nothing is mapped under id 12.
+    state.map_surface(41);
+    {
+        let m = state.mappings.get_mut(&41).unwrap();
+        m.mapped = true;
+        m.page_entries = vec![0x51, 0x52];
+    }
+    state.texture_to_mapping.insert((3, 12), 41);
+    let generation_before = state.mappings.get(&41).unwrap().map_generation;
+
+    let mut payload = vec![0u8; 8];
+    payload[0..4].copy_from_slice(&3u32.to_le_bytes()); // task 3
+    payload[4..8].copy_from_slice(&12u32.to_le_bytes()); // object 12
+    let pkt = Packet {
+        opcode: CHILD_OP_REPLACE_PHYSICAL,
+        stamp_count: 0,
+        total_size: PACKET_HEADER_LEN + 8,
+        completion_stamp: 0,
+        payload,
+        next_head: 0,
+    };
+    process_child_packet(&mut state, &mut host, 2, &pkt);
+
+    let m = state.mappings.get(&41).unwrap();
+    assert!(
+        m.page_entries.is_empty(),
+        "a re-point that names a texture ref must reach the mapping behind it"
+    );
+    assert_ne!(
+        m.map_generation, generation_before,
+        "the incarnation must move, or a resident gathered from the old pages \
+         stays eligible"
+    );
+}
+
+/// The ref-keyed fallback must not fire when the direct reading found a mapping
+/// but that mapping happened to have no resolved pages. "Nothing to drop" is not
+/// "nobody owns this id", and treating it as one would walk into exactly the
+/// misroute [`replace_physical_drops_the_cached_page_list`] guards.
+#[test]
+fn replace_physical_does_not_fall_back_when_the_named_mapping_is_merely_empty() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    state.map_surface(7); // exists, no page_entries
+    state.map_surface(99);
+    {
+        let m = state.mappings.get_mut(&99).unwrap();
+        m.mapped = true;
+        m.page_entries = vec![0xaa];
+    }
+    state.texture_to_mapping.insert((0, 7), 99);
+
+    let mut payload = vec![0u8; 8];
+    payload[4..8].copy_from_slice(&7u32.to_le_bytes()); // {task 0, object 7}
+    let pkt = Packet {
+        opcode: CHILD_OP_REPLACE_PHYSICAL,
+        stamp_count: 0,
+        total_size: PACKET_HEADER_LEN + 8,
+        completion_stamp: 0,
+        payload,
+        next_head: 0,
+    };
+    process_child_packet(&mut state, &mut host, 2, &pkt);
+
+    assert_eq!(
+        state.mappings.get(&99).unwrap().page_entries,
+        vec![0xaa],
+        "an empty mapping still owns its id; the ref-keyed map must stay unread"
+    );
+}
+
 /// A short 0x3c is a lost invalidation, not a no-op: the device would keep
 /// writing through pages the guest has re-pointed. It must be named, and it
 /// must not silently drop a list it could not identify.

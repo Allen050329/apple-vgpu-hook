@@ -1325,31 +1325,93 @@ fn record_type4_owner(state: &mut DeviceState, surface_id: u32, task_id: u32) {
 /// state keyed on that incarnation, and the next resolve re-walks the page table
 /// the guest has already rewritten.
 ///
-/// `object_id` is the mapping id, and is used as one directly.
+/// The list is *cleared* rather than condemned, which is where this packet parts
+/// from `DeleteIOSurfaceBacking2` even though the two look alike. A delete may
+/// be trailing a recycled id whose slot already carries a live surface, so it
+/// stashes a fingerprint and lets the next resolve decide. A re-point carries no
+/// such ambiguity — by its own contract the PFNs under this GPU-VA have already
+/// changed — and condemning would leave `map_generation` unmoved, so a resident
+/// gathered from the old pages would stay eligible until some later resolve
+/// disqualified it. Clearing fails closed on the packet that says the pages
+/// moved; on this rail that is the direction every ambiguity resolves toward.
 ///
-/// It is not looked up in `texture_to_mapping` first. That map is keyed by the
-/// task object-list *ref*, and a ref and a surface id are different id spaces
-/// that collide — `blit_exec`'s type-5 resolve states the rule ("never the task
-/// object-list ref — those id spaces collide"). A ref-keyed lookup ahead of the
-/// direct reading would therefore silently misroute a packet naming surface `n`
-/// onto whatever mapping the same task has registered under ref `n`, and
-/// invalidate a surface the guest said nothing about while leaving the one it
-/// did name stale. Every observed packet resolves directly: 40 in a driven boot,
-/// all with `mid == object_id`, and the ref-keyed arm never answered.
+/// # Two id spaces reach one packet
 ///
-/// A type-11 texture that is re-pointed is therefore not handled here yet, and
-/// that is deliberate — which id its packet would carry is not established, and
-/// guessing costs the packets that do arrive.
-pub fn replace_physical(state: &mut DeviceState, task_id: u32, object_id: u32) {
-    let had = state.invalidate_mapping_pages(object_id);
+/// `object_id` is read as a mapping id first, and that reading is never
+/// replaced: a ref and a surface id are different id spaces that collide —
+/// `blit_exec`'s type-5 resolve states the rule ("never the task object-list ref
+/// — those id spaces collide") — so a ref-keyed lookup taken *ahead* of the
+/// direct one would misroute a packet naming surface `n` onto whatever mapping
+/// the same task registered under ref `n`, invalidating a surface the guest
+/// never named and leaving stale the one it did.
+///
+/// The ref-keyed reading is taken only when the direct one names no mapping at
+/// all. There is nothing to misroute in that case — the device holds no surface
+/// under that id — and what it recovers is the packet family this arm used to
+/// drop on the floor: 57 % of the re-points on a driven boot found no mapping
+/// under `object_id`, and every one of them was a re-point this device never
+/// applied to anything.
+///
+/// The cost of that silence outlives the workload that caused it. The cached
+/// page list stays trusted while naming pages that back something else,
+/// `mapping_page_drift` finds the move later and reports "no packet said so",
+/// the deferred paint riding the old plan dies on a generation check with no
+/// name attached, and every later compositor pass LOADs from a resident nothing
+/// refreshed. A surface composited once and then only sampled — a popup
+/// backdrop, a settings pane — never gets the Store that would replace those
+/// bytes, so what the guest sees is a layer that stopped being redrawn.
+///
+/// A re-point that reaches nothing at all is therefore reported rather than
+/// counted as a no-op: it is the loss of the only notice there is.
+pub fn replace_physical<H: HostMemory + crate::runtime::host::HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+    task_id: u32,
+    object_id: u32,
+) {
+    let mut target = object_id;
+    if !state.mappings.contains_key(&target) {
+        if let Some(&mid) = state.texture_to_mapping.get(&(task_id, object_id)) {
+            target = mid;
+            crate::runtime::drain::note_store_route("replace_physical_routed_ref");
+        }
+    }
+    if !state.mappings.contains_key(&target) {
+        // The guest announced a move this device could not apply to anything it
+        // holds. Deduped per `(task, object)`: a compositor re-pointing the same
+        // resource does it every frame, and the class is what matters here.
+        crate::runtime::drain::note_store_route("replace_physical_unknown_object");
+        if crate::observe::first_sight(
+            "replace_physical_unknown_object",
+            (u64::from(task_id) << 32) | u64::from(object_id),
+        ) {
+            crate::observe::fail(format!(
+                "replace_physical_unknown_object task={task_id} object={object_id} \
+                 (no mapping under this id and no type-11 ref route; the re-point is unapplied)"
+            ));
+        }
+        return;
+    }
+    // A deferred window still owed on this mapping is riding the page plan the
+    // guest has just replaced. The generation bump below would refuse it anyway,
+    // so taking it here changes no outcome — it changes whether the loss has a
+    // name. `drop_windows` reports each one against this packet instead of
+    // letting it disappear into a generation mismatch nothing attributes.
+    crate::runtime::storage_flush::drop_windows(state, target, "replace_physical");
+    let had = state.invalidate_mapping_pages(target);
     crate::runtime::drain::note_store_route(if had {
         "replace_physical_dropped"
     } else {
-        "replace_physical_nothing_cached"
+        "replace_physical_no_pages"
     });
+    // The views the invalidation retired name pages the guest is re-pointing.
+    // Handing them back now, rather than at the next poll, keeps this device from
+    // holding a host mapping over memory the guest has already rewired — the same
+    // reason the trailing delete flushes here.
+    crate::runtime::mapper::flush_retired_views(state, host);
     if had {
         crate::observe::off(format!(
-            "replace_physical task={task_id} mid={object_id} \
+            "replace_physical task={task_id} object={object_id} mid={target} \
              (guest re-pointed the backing; cached page list dropped)"
         ));
     }

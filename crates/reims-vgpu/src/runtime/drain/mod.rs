@@ -2165,10 +2165,17 @@ fn process_child_packet<H: HostMemory + HostOps>(
         crate::runtime::decode::fifo::CHILD_OP_CONFIG_40 => {
             let _ = reply_heap_texture_size_and_align(state, host, &packet.payload);
         }
-        // The one packet that says a cached page list has gone stale. It used to
-        // sit in the stamp-and-forget family below, which is why
-        // `mapping_page_drift` could report "the guest re-pointed this surface
-        // and no packet said so" — the packet arrived and was discarded.
+        // The one packet that says a cached page list has gone stale, and the
+        // only arm that consumes it. A second handler used to sit inside the
+        // stamp-and-forget family below, behind an `else if` on this opcode that
+        // the family's own pattern list does not include — structurally
+        // unreachable, and the richer of the two: it routed the object id
+        // through `texture_to_mapping`, condemned with a page fingerprint rather
+        // than clearing, and took the deferred windows. Everything it did lives
+        // in `objects::replace_physical` now, so the packet has one meaning
+        // again. `mapping_page_drift` reporting "the guest re-pointed this
+        // surface and no packet said so" is what a lost half of it looks like
+        // from the far end.
         CHILD_OP_REPLACE_PHYSICAL => {
             if !packet_short(
                 "replace_physical",
@@ -2179,7 +2186,12 @@ fn process_child_packet<H: HostMemory + HostOps>(
                 if let Some(cmd) =
                     crate::runtime::decode::fifo::decode_replace_physical(&packet.payload)
                 {
-                    crate::runtime::objects::replace_physical(state, cmd.task_id, cmd.object_id);
+                    crate::runtime::objects::replace_physical(
+                        state,
+                        host,
+                        cmd.task_id,
+                        cmd.object_id,
+                    );
                 }
             }
         }
@@ -2347,56 +2359,6 @@ fn process_child_packet<H: HostMemory + HostOps>(
                 if crate::observe::draw_log_enabled() {
                     crate::observe::line(format!(
                         "map_family op=DeleteIOSurfaceBacking2 ch={channel_id} object={object_id} task={task_id} plen={plen} mode={mode}"
-                    ));
-                }
-            } else if packet.opcode == CHILD_OP_REPLACE_PHYSICAL && plen >= 8 {
-                // Archived lead: {taskID, objectID}; live total_size=20 ⇒ header+payload.
-                // Guest may rebind physical pages under the object — drop cached
-                // page_entries / contig so the next Store re-resolves (safe
-                // zero-copy / freelist-prevention). Object id is typically a
-                // texture ref; also try as mapping_id when texture map misses.
-                let task_id = crate::contract::endian::ld32(&packet.payload[0..]);
-                let object_id = crate::contract::endian::ld32(&packet.payload[4..]);
-                // Guest MAY rebind physical pages under the object — retire the
-                // cached bindings so the next Store re-resolves (freelist
-                // prevention). Like the trailing delete, this must not destroy
-                // a live incarnation's deferred paint (a tile's only copy sits
-                // in the GPU resident until writeback): condemn with a page
-                // fingerprint and let the next resolve decide. A genuine rebind
-                // resolves to different pages → bump + windows dropped there;
-                // a revalidation/no-op resolves identical → content survives.
-                let mut n_inv = 0u32;
-                let mut n_cond = 0u32;
-                let mut targets = vec![object_id];
-                if let Some(&mid) = state.texture_to_mapping.get(&(task_id, object_id)) {
-                    if mid != object_id {
-                        targets.push(mid);
-                    }
-                }
-                for id in targets {
-                    if state.mapping_backing_condemned(id) {
-                        // Decision already pending; the next resolve settles it.
-                        continue;
-                    }
-                    if state.condemn_surface_backing(id) {
-                        n_cond = n_cond.saturating_add(1);
-                    } else {
-                        // No resolved pages ⇒ nothing a stale replace could
-                        // hurt; keep the old teardown semantics.
-                        crate::runtime::storage_flush::drop_windows(state, id, "replace_physical");
-                        if state.invalidate_mapping_pages(id) {
-                            n_inv = n_inv.saturating_add(1);
-                        }
-                    }
-                }
-                // Per-op echo of a routine lifecycle op. Keep the per-op detail
-                // (inv/condemn split) gated so it does not flood the always-on
-                // sink; the `draw_log_enabled()` guard also skips the format
-                // alloc on a healthy boot (mirrors the DeleteIOSurfaceBacking2
-                // site above).
-                if crate::observe::draw_log_enabled() {
-                    crate::observe::line(format!(
-                        "map_family op=ReplacePhysical ch={channel_id} task={task_id} object={object_id} plen={plen} inv_pages={n_inv} condemned={n_cond}"
                     ));
                 }
             } else if packet.opcode == CHILD_OP_INVALIDATE_RESOURCES {
