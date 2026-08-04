@@ -56,7 +56,6 @@ pub const MAX_PINNED_BYTES: u64 =
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 struct Entry {
-    key: u64,
     gpas: Vec<u64>,
     bytes: u64,
     dmabuf: Arc<GuestDmaBuf>,
@@ -66,7 +65,17 @@ struct Entry {
 
 #[derive(Default)]
 struct Cache {
-    entries: Vec<Entry>,
+    /// Windows grouped by [`digest`] of their page list.
+    ///
+    /// A bucket holds more than one entry only on a digest collision, so the
+    /// full page-list comparison that decides a hit runs once per lookup
+    /// instead of once per table entry. The digest is not stored on the
+    /// [`Entry`] as well: the map key already is it, and a second copy is a
+    /// field that can drift from the bucket it sits in.
+    buckets: std::collections::HashMap<u64, Vec<Entry>>,
+    /// Windows across all buckets. Kept alongside rather than summed on demand
+    /// because eviction tests it every pass and the census reads it per miss.
+    entry_count: usize,
     pinned_bytes: u64,
     clock: u64,
     /// Set once the host has refused for a reason that cannot change while the
@@ -115,6 +124,44 @@ fn digest(gpas: &[u64], page_size: u32) -> u64 {
     hash
 }
 
+/// Find the window for `gpas`, marking it used, and report what the search
+/// compared.
+///
+/// # Why the step count is still taken
+///
+/// It is the proof that the bucket is doing its job. The comparison this counts
+/// is the full page list — the digest only narrows the search and cannot decide
+/// a hit — so a lookup that compares one list has resolved the table in one
+/// step, and one that compares many has found a digest collision. Charged on
+/// hit *and* miss, so `guest_dmabuf_scan_steps / guest_dmabuf_lookups` read
+/// against `guest_dmabuf_windows_sum / guest_dmabuf_misses` says whether the
+/// search still scales with the table.
+///
+/// A count rather than a timer: this rail is read on a shared development host
+/// where every `_us` field is an upper bound, and counts survive contention.
+fn lookup(
+    cache: &mut Cache,
+    key: u64,
+    gpas: &[u64],
+    clock: u64,
+) -> (Option<Arc<GuestDmaBuf>>, u64) {
+    let mut steps: u64 = 0;
+    let Some(bucket) = cache.buckets.get_mut(&key) else {
+        return (None, steps);
+    };
+    let found = bucket.iter_mut().find(|e| {
+        steps += 1;
+        e.gpas == gpas
+    });
+    match found {
+        Some(entry) => {
+            entry.used = clock;
+            (Some(Arc::clone(&entry.dmabuf)), steps)
+        }
+        None => (None, steps),
+    }
+}
+
 /// The dma-buf over `gpas`, made if this is the first time these pages have been
 /// asked for and reused otherwise.
 ///
@@ -142,23 +189,10 @@ pub fn dmabuf_for<M: HostOps>(
     }
     cache.clock += 1;
     let clock = cache.clock;
-    // The lookup is a linear scan, and this counts what it walked rather than
-    // how long it took: a step count survives a contended host where a
-    // microsecond reading does not, and it is the only thing that says whether
-    // the scan is the shape of this table's cost. Charged on hit *and* miss,
-    // because a miss walks the whole table and a hit walks half of it on
-    // average — so `steps / lookups` against `windows` is what separates "the
-    // table is small" from "the scan is the cost".
-    let mut steps: u64 = 0;
-    let found = cache.entries.iter_mut().find(|e| {
-        steps += 1;
-        e.key == key && e.gpas == gpas
-    });
+    let (found, steps) = lookup(cache, key, gpas, clock);
     crate::runtime::drain::note_store_route("guest_dmabuf_lookups");
     crate::runtime::drain::note_store_route_n("guest_dmabuf_scan_steps", steps);
-    if let Some(entry) = found {
-        entry.used = clock;
-        let dmabuf = Arc::clone(&entry.dmabuf);
+    if let Some(dmabuf) = found {
         crate::runtime::drain::note_store_route("guest_dmabuf_hits");
         return Some(dmabuf);
     }
@@ -186,31 +220,31 @@ pub fn dmabuf_for<M: HostOps>(
         id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
         fd,
     });
-    cache.entries.push(Entry {
-        key,
+    cache.buckets.entry(key).or_default().push(Entry {
         gpas: gpas.to_vec(),
         bytes,
         dmabuf: Arc::clone(&dmabuf),
         used: clock,
     });
+    cache.entry_count += 1;
     cache.pinned_bytes += bytes;
     evict_to_bound(cache);
-    // The table's own size, sampled once per miss. `cached_windows` and
-    // `pinned_bytes` have existed since this cache did and nothing has ever
-    // called them, so the bound this table is held to — pinned bytes, not entry
-    // count — has never been read on a live boot. Both are needed: 512 MiB of
-    // 8 KiB vertex windows is 65 536 entries and 512 MiB of one framebuffer is
-    // one, and the scan above costs the entry count while the bound counts the
-    // bytes.
+    // The table's own size, sampled once per miss. Both fields are needed
+    // because the entry count and the pin come apart by orders of magnitude:
+    // 512 MiB of 8 KiB vertex windows is 65 536 entries and 512 MiB of one
+    // framebuffer is one.
+    //
+    // A driven x86/Vulkan boot reads this table at ~956 windows holding ~490 MiB
+    // — right against [`MAX_PINNED_BYTES`], so it evicts continuously, and far
+    // longer than a table a linear search can afford. That reading is what put
+    // the lookup in a bucket; it stays sampled because the bound it establishes
+    // is the one [`evict_to_bound`]'s cost is priced against.
     //
     // These two are **sums, not gauges** — the census map adds. Divide each by
     // `guest_dmabuf_misses` for the mean over the window; a reader quoting the
     // raw field as "the cache holds N windows" is off by the miss count.
     crate::runtime::drain::note_store_route("guest_dmabuf_misses");
-    crate::runtime::drain::note_store_route_n(
-        "guest_dmabuf_windows_sum",
-        cache.entries.len() as u64,
-    );
+    crate::runtime::drain::note_store_route_n("guest_dmabuf_windows_sum", cache.entry_count as u64);
     crate::runtime::drain::note_store_route_n(
         "guest_dmabuf_pinned_kb_sum",
         cache.pinned_bytes >> 10,
@@ -224,19 +258,35 @@ pub fn dmabuf_for<M: HostOps>(
 /// The entry just inserted is the most recently used, so it is never the one
 /// evicted — a single window larger than the whole bound would otherwise be
 /// created and dropped on every bind, which is worse than not caching at all.
+///
+/// Still a walk of every window, and deliberately so: it runs only on a miss
+/// that pushed the pin over the bound, which the lookup no longer does, and an
+/// LRU order maintained on the side would have to be updated on every one of
+/// the millions of hits to save work on the thousands of evictions.
 fn evict_to_bound(cache: &mut Cache) {
-    while cache.pinned_bytes > MAX_PINNED_BYTES && cache.entries.len() > 1 {
-        let Some(victim) = cache
-            .entries
+    while cache.pinned_bytes > MAX_PINNED_BYTES && cache.entry_count > 1 {
+        // Ties in `used` break in whatever order the map iterates. They cannot
+        // arise between two live windows — the clock advances once per lookup
+        // and only the window that lookup touched takes the new value — and
+        // between equally-stale windows either choice is the same choice.
+        let Some((key, idx)) = cache
+            .buckets
             .iter()
-            .enumerate()
-            .min_by_key(|(_, e)| e.used)
-            .map(|(i, _)| i)
+            .flat_map(|(k, bucket)| bucket.iter().enumerate().map(move |(i, e)| (*k, i, e.used)))
+            .min_by_key(|&(_, _, used)| used)
+            .map(|(k, i, _)| (k, i))
         else {
             return;
         };
-        cache.pinned_bytes -= cache.entries[victim].bytes;
-        cache.entries.swap_remove(victim);
+        let Some(bucket) = cache.buckets.get_mut(&key) else {
+            return;
+        };
+        cache.pinned_bytes -= bucket[idx].bytes;
+        bucket.swap_remove(idx);
+        if bucket.is_empty() {
+            cache.buckets.remove(&key);
+        }
+        cache.entry_count -= 1;
     }
 }
 
@@ -247,7 +297,7 @@ pub fn pinned_bytes() -> u64 {
 
 /// Windows currently cached. Census only.
 pub fn cached_windows() -> usize {
-    CACHE.lock().as_ref().map_or(0, |c| c.entries.len())
+    CACHE.lock().as_ref().map_or(0, |c| c.entry_count)
 }
 
 #[cfg(test)]
@@ -308,10 +358,95 @@ mod tests {
     #[test]
     fn eviction_bounds_pinned_bytes_and_keeps_the_newest() {
         let mut cache = Cache::default();
-        let push = |cache: &mut Cache, id: u64, bytes: u64, used: u64| {
-            cache.entries.push(Entry {
-                key: id,
+        let big = MAX_PINNED_BYTES / 2 + 1;
+        push(&mut cache, 1, big, 1);
+        push(&mut cache, 2, big, 2);
+        push(&mut cache, 3, big, 3);
+        evict_to_bound(&mut cache);
+        assert!(cache.pinned_bytes <= MAX_PINNED_BYTES, "bound not restored");
+        let ids = ids(&cache);
+        assert!(ids.contains(&3), "the newest window was evicted: {ids:?}");
+        assert!(!ids.contains(&1), "the oldest window survived: {ids:?}");
+        assert_eq!(cache.entry_count, ids.len(), "entry_count drifted");
+    }
+
+    /// A hit resolves the table in one page-list comparison however many windows
+    /// it holds.
+    ///
+    /// This is the bound the bucket exists for. The lookup used to compare every
+    /// entry's digest in turn, and a driven x86/Vulkan boot read 3.6 M lookups
+    /// against 1.61 G comparisons — 444 per lookup, over a table averaging 956
+    /// windows, which is the half-table walk a linear scan of a hit costs. The
+    /// assertion is on the *step count* rather than a duration for the reason
+    /// [`lookup`] gives.
+    ///
+    /// A thousand windows rather than a handful: the failure mode being excluded
+    /// is one that only shows up as the table grows, so a table small enough for
+    /// a scan to look fine cannot witness it.
+    #[test]
+    fn a_hit_does_not_scale_with_the_number_of_cached_windows() {
+        let mut cache = Cache::default();
+        for id in 1..=1000u64 {
+            push(&mut cache, id, 4096, id);
+        }
+        assert_eq!(cache.entry_count, 1000);
+        // The window inserted last and the one inserted first cost the same,
+        // which a scan cannot manage for both at once.
+        for probe in [1u64, 500, 1000] {
+            let gpas = [probe];
+            let (found, steps) = lookup(&mut cache, digest(&gpas, 4096), &gpas, 10_000);
+            assert!(found.is_some(), "window {probe} was not found");
+            assert_eq!(steps, 1, "window {probe} took {steps} comparisons");
+        }
+        // A window that was never cached compares nothing at all: its digest
+        // names no bucket.
+        let absent = [0xdead_beefu64];
+        let (found, steps) = lookup(&mut cache, digest(&absent, 4096), &absent, 10_001);
+        assert!(found.is_none());
+        assert_eq!(steps, 0, "a miss walked {steps} entries");
+    }
+
+    /// Two windows whose page lists collide under [`digest`] share a bucket, and
+    /// each still gets its own dma-buf.
+    ///
+    /// The digest narrows and the full list decides, so the bucket has to hold
+    /// both and the comparison inside it has to separate them. Constructed by
+    /// filing both under one key rather than by finding a real FNV-1a collision:
+    /// what is under test is the bucket's behaviour when it holds two, not the
+    /// hash's spread.
+    #[test]
+    fn a_digest_collision_keeps_the_windows_apart() {
+        let mut cache = Cache::default();
+        let shared = 0x5eed_u64;
+        for id in [11u64, 22] {
+            cache.buckets.entry(shared).or_default().push(Entry {
                 gpas: vec![id],
+                bytes: 4096,
+                dmabuf: Arc::new(GuestDmaBuf { id, fd: pipe_fd() }),
+                used: id,
+            });
+            cache.entry_count += 1;
+            cache.pinned_bytes += 4096;
+        }
+        for (probe, want) in [(11u64, 11u64), (22, 22)] {
+            let (found, steps) = lookup(&mut cache, shared, &[probe], 99);
+            assert_eq!(found.expect("collided window").id, want);
+            assert!((1..=2).contains(&steps), "unexpected step count {steps}");
+        }
+        // A third list under the same digest matches neither.
+        let (found, _) = lookup(&mut cache, shared, &[33], 100);
+        assert!(found.is_none(), "a non-member matched inside the bucket");
+    }
+
+    /// Push a window with a one-page list of `id` under its real digest.
+    fn push(cache: &mut Cache, id: u64, bytes: u64, used: u64) {
+        let gpas = vec![id];
+        cache
+            .buckets
+            .entry(digest(&gpas, 4096))
+            .or_default()
+            .push(Entry {
+                gpas,
                 bytes,
                 dmabuf: Arc::new(GuestDmaBuf {
                     id,
@@ -321,17 +456,17 @@ mod tests {
                 }),
                 used,
             });
-            cache.pinned_bytes += bytes;
-        };
-        let big = MAX_PINNED_BYTES / 2 + 1;
-        push(&mut cache, 1, big, 1);
-        push(&mut cache, 2, big, 2);
-        push(&mut cache, 3, big, 3);
-        evict_to_bound(&mut cache);
-        assert!(cache.pinned_bytes <= MAX_PINNED_BYTES, "bound not restored");
-        let ids: Vec<u64> = cache.entries.iter().map(|e| e.dmabuf.id).collect();
-        assert!(ids.contains(&3), "the newest window was evicted: {ids:?}");
-        assert!(!ids.contains(&1), "the oldest window survived: {ids:?}");
+        cache.entry_count += 1;
+        cache.pinned_bytes += bytes;
+    }
+
+    fn ids(cache: &Cache) -> Vec<u64> {
+        cache
+            .buckets
+            .values()
+            .flatten()
+            .map(|e| e.dmabuf.id)
+            .collect()
     }
 
     /// A single window larger than the whole bound is kept rather than
@@ -339,19 +474,9 @@ mod tests {
     #[test]
     fn one_oversized_window_is_kept_rather_than_rebuilt_every_bind() {
         let mut cache = Cache::default();
-        cache.entries.push(Entry {
-            key: 1,
-            gpas: vec![1],
-            bytes: MAX_PINNED_BYTES * 2,
-            dmabuf: Arc::new(GuestDmaBuf {
-                id: 1,
-                fd: pipe_fd(),
-            }),
-            used: 1,
-        });
-        cache.pinned_bytes = MAX_PINNED_BYTES * 2;
+        push(&mut cache, 1, MAX_PINNED_BYTES * 2, 1);
         evict_to_bound(&mut cache);
-        assert_eq!(cache.entries.len(), 1, "the only entry was evicted");
+        assert_eq!(cache.entry_count, 1, "the only entry was evicted");
     }
 
     fn pipe_fd() -> std::os::fd::OwnedFd {
