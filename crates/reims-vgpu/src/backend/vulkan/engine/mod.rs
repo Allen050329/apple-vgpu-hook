@@ -1249,9 +1249,26 @@ unsafe fn copy_image_level0_to_host_delivered(
         })];
     // The whole level, every time: nothing upstream tells this call which part
     // of the frame the draws touched. That is what the slots 1-2 span prices —
-    // on a discrete part this copy crosses the bus and is 87-91% of the fence,
-    // so `gpu_us` owning `fence_us` in `readback_split` is bytes and not
-    // latency, and bounding the region is the lever that would move it.
+    // on a discrete part this copy crosses the bus, so `gpu_us`'s share of
+    // `fence_us` in `readback_split` is bytes and not latency.
+    //
+    // **Bounding the region is not an available lever, and this used to say it
+    // was.** It needs a damage rect, and the device decodes no source for one.
+    // The draw stream's scissors are 100% of the attachment on 99.92% of armed
+    // windows, and the guest's own `renderTargetWidth`/`Height` — the remaining
+    // candidate, and the one `runtime::exec::note_pass_extent_coverage` was
+    // built to score — reads `pass_extent_full` on 11 826 of 11 827 scored
+    // passes. The guest states the attachment's geometry, not a sub-rect. Small
+    // numbers in the fail log are small *surfaces*.
+    //
+    // What the same boot does leave open is the other half of the fence. Per
+    // readback, 217.6 us divides as `bar_us` 1.16 + `gpu_us` 131.1 + 85.3
+    // unaccounted, and `bar_us` near zero proves the draws are already finished
+    // when the copy runs — so the 85.3 us is submission and wake latency. A
+    // readback is two submissions today, because `begin_entry` above flushes the
+    // open draw batch before claiming a slot (`batch_flush_by_readback` is 58.8%
+    // of all batch flushes). Collapsing those two is the lever; see
+    // `pools::BATCH_MAX_DRAWS`.
     ctx.device.cmd_copy_image_to_buffer(
         cb,
         image,
