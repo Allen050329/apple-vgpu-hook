@@ -587,7 +587,6 @@ fn color_from_wire(c: &wire_pass::ColorAttachmentBody) -> ColorAttachment {
         store_action: p.store_action.get(),
         clear_color: c.clear_color(),
         present: texture_ref != 0,
-        ..Default::default()
     }
 }
 
@@ -604,7 +603,6 @@ fn depth_from_wire(d: &wire_pass::DepthAttachmentBody) -> DepthAttachment {
         store_action: p.store_action.get(),
         clear_depth: d.clear_depth(),
         present: texture_ref != 0,
-        ..Default::default()
     }
 }
 
@@ -621,7 +619,6 @@ fn stencil_from_wire(s: &wire_pass::StencilAttachmentBody) -> StencilAttachment 
         store_action: p.store_action.get(),
         clear_stencil: s.clear_stencil.get(),
         present: texture_ref != 0,
-        ..Default::default()
     }
 }
 

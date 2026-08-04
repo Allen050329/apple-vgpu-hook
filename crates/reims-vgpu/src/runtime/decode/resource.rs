@@ -2236,7 +2236,6 @@ pub fn decode_texture_view_descriptor(bytes: &[u8]) -> Result<TextureViewDescrip
                     b.swizzle.blue,
                     b.swizzle.alpha,
                 ],
-                ..Default::default()
             })
         }
         _ => Err(DecodeStatus::ErrUnsupported("res_texture_view_opcode")),

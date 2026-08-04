@@ -5055,7 +5055,6 @@ mod tests {
 
     #[test]
     fn blit_fence_wait_pending_without_update() {
-        use wire_blit::OPCODE_WAIT_FOR_FENCE;
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         let mut wait = Command::default();
         wait.kind = Kind::Fence;
@@ -5070,7 +5069,6 @@ mod tests {
 
     #[test]
     fn blit_fence_zero_ref_fails() {
-        use wire_blit::OPCODE_UPDATE_FENCE;
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         let mut upd = Command::default();
         upd.kind = Kind::Fence;

@@ -3836,7 +3836,7 @@ mod tests {
         let mut records = Vec::new();
         for pipeline in [41u32, 77, 41] {
             let mut cmd = [0u8; 12];
-            st32(&mut cmd[0..4], wire_compute::OPCODE_SET_PIPELINE_STATE);
+            st32(&mut cmd[0..4], OPCODE_SET_RENDER_PIPELINE_STATE);
             st32(&mut cmd[4..8], 12);
             st32(&mut cmd[8..12], pipeline);
             records.extend_from_slice(&cmd);
@@ -3988,7 +3988,6 @@ mod tests {
     /// that works.
     #[test]
     fn an_indexed_draw_with_no_index_buffer_is_named() {
-        use wire_render::OPCODE_DRAW_INDEXED;
         // ARM compact indexed payload: prim@0, indexBufferRef@4, count@8:u16,
         // offset@0xa:u16 — total record 0x14.
         let record = |index_buffer_ref: u32| {
