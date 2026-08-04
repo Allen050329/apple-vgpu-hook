@@ -586,9 +586,11 @@ pub fn flush_gva_windows_before_fence<M: HostMemory + HostOps>(
 /// submission's overhead per flush, and at a batch of 8 it collapses eight waits
 /// into the one the tranche already owes.
 ///
-/// **It reads 1, always** — 56 209 of 56 209 on a driven boot, with every other
-/// band at 0 — which is one of the two readings that retired that build. See
-/// [`flush_gva_one`] for the other and for the verdict.
+/// **It reads 1, always** — 56 209 of 56 209 on one driven boot and 56 713 of
+/// 56 713 on a second, with every other band at 0. That retires the *tranche*
+/// half of the argument for that build: there is no set of round trips for a
+/// shared fence to collapse. It says nothing about the latency half, which
+/// [`flush_gva_one`] records as open.
 ///
 /// Kept after the verdict rather than removed, because it is the assumption the
 /// verdict rests on and not a number that was consumed once. A workload that
@@ -1888,19 +1890,38 @@ pub fn gva_window_identity(
 /// [`flush_gva_windows_before_fence`]'s own repair note explains why: landing at
 /// the fence keeps the window set nearly empty by construction.
 ///
-/// The second says what is left to win. Folding the copy into the draw's command
-/// buffer removes the private **submit**; it cannot remove the **fence**, whose
-/// own census doc calls it "pure GPU round-trip latency, and the part no smaller
-/// copy can reduce". The draw's work has to complete before the bytes exist to
-/// copy, and the guest is about to be told it has. So the build's ceiling is the
-/// submit's share — about 4.5% of a readback — in exchange for a three-state
-/// readback decision, a staging-slot lease held across the ring, and a fence
-/// handle threaded into the deferred entry. Do not attempt it.
+/// The second reading does **not** close it, and an earlier revision of this
+/// section said it did. That claim is withdrawn; what follows is what the
+/// numbers actually support.
 ///
-/// The split is pooled across this rail and the render rail, so 4.5% is a shape
-/// rather than this rail's exact figure; it is quoted as a ceiling for that
-/// reason. Nothing about the ranking is close enough for the pooling to change
-/// it — the fence is 21x the submit.
+/// `readback_split` is **pooled across this rail and the render rail**, and the
+/// two are nothing alike. The render rail copies whole frames; this one copies
+/// 17.1 KB a flush, which is why the section above concludes it "contributes
+/// nothing to `gpu_us`" — at the measured rate that copy is about a microsecond.
+/// So the pooled `gpu_us` of 131 µs is the render rail's, and applying it here
+/// to conclude "the fence is mostly the copy, so folding saves only the 10 µs
+/// submit" was reading the wrong rail's number. **For this rail, essentially all
+/// of `gva_read_us` is submit-to-signal latency**, and folding is exactly a
+/// change to how many submissions that latency is paid for.
+///
+/// What folding provably removes: one of the two `vkQueueSubmit`s, the draw
+/// batch flush that `begin_entry` forces before every readback, and the
+/// submit-to-GPU-start latency of the second command buffer. What it cannot
+/// remove: the copy's own execution, and the fence-signal-to-CPU-wake.
+/// `bar_us = 1.16 µs` proves the draw is already finished when the copy runs, so
+/// none of the wait is the draw.
+///
+/// The split between those two halves of the ~85 µs is **not measured**, and the
+/// GPU and CPU timelines here are deliberately uncorrelated (see
+/// `note_readback_gpu_us`: both spans are deltas on the GPU's own clock), so no
+/// existing counter can separate them. That is the measurement to take before
+/// building — it needs correlated timestamps, not another band.
+///
+/// Standing verdict: **unsized, not refuted.** The tranche argument is dead and
+/// will not revive; the latency argument is open and is plausibly large for this
+/// rail specifically — 56 713 flushes a boot, each ~90 µs to move 17 KB. Weigh
+/// it against a three-state readback decision, a staging-slot lease held across
+/// the ring, and a fence handle threaded into the deferred entry.
 ///
 /// ## Where the rail's time actually goes
 ///
