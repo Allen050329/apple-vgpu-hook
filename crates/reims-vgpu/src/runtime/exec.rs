@@ -1594,28 +1594,18 @@ fn handle_render_record<M: HostMemory + HostOps>(
                     if let Some(m) =
                         objects::resolve_type11_ref(state, host, task_id, att.texture_ref)
                     {
-                        // The measurement the extent count could not make. Only
-                        // slot 0 and only where the mapping is already resolved
-                        // — this is a census, not a resolve, and making it
-                        // resolve would put a guest-memory walk on the hottest
-                        // record in the device.
-                        if slot == 0 {
-                            if let Some(e) = state.mappings.get(&m) {
-                                note_pass_extent_coverage(
-                                    cmd.pass_render_target_width,
-                                    cmd.pass_render_target_height,
-                                    e.width,
-                                    e.height,
-                                );
-                            }
-                        }
+                        note_pass_extent_for_slot(state, slot, m, &cmd);
                         if !out.type11_mappings.contains(&m) {
                             out.type11_mappings.push(m);
                         }
-                    } else if objects::resolve_type4_surface(state, host, att.texture_ref)
-                        && !out.type11_mappings.contains(&att.texture_ref)
-                    {
-                        out.type11_mappings.push(att.texture_ref);
+                    } else if objects::resolve_type4_surface(state, host, att.texture_ref) {
+                        // A type-4 attachment is its own mapping id — the arm
+                        // below pushes `att.texture_ref` where the type-11 arm
+                        // pushes the id it resolved to.
+                        note_pass_extent_for_slot(state, slot, att.texture_ref, &cmd);
+                        if !out.type11_mappings.contains(&att.texture_ref) {
+                            out.type11_mappings.push(att.texture_ref);
+                        }
                     }
                     if att.load_action == PASS_LOAD_ACTION_CLEAR {
                         if att.store_action == PASS_STORE_ACTION_STORE {
@@ -2442,6 +2432,39 @@ const PASS_EXTENT_SLUGS: [&str; 7] = [
     "pass_extent_le99",
     "pass_extent_full",
 ];
+
+/// Score slot 0's attachment, whichever resolve arm found it.
+///
+/// Both arms of the colour-attachment resolve consume the same wire form and
+/// must be scored the same way; only the mapping id differs, because a type-11
+/// attachment resolves *to* an id and a type-4 attachment *is* one. This existed
+/// on the type-11 arm alone, and the consequence was not that the census
+/// undercounted — it was that the census read **zero** on the whole x86/Vulkan
+/// pathway, where the workload takes the type-4 arm. A pathway-shaped blind spot
+/// reads exactly like "the guest never states an extent", which is the opposite
+/// of what it does.
+///
+/// Slot 0 only, and only where the mapping is already resolved: this is a
+/// census, not a resolve, and making it resolve would put a guest-memory walk on
+/// the hottest record in the device.
+fn note_pass_extent_for_slot(
+    state: &crate::model::DeviceState,
+    slot: u32,
+    mapping_id: u32,
+    cmd: &crate::runtime::decode::render::Command,
+) {
+    if slot != 0 {
+        return;
+    }
+    if let Some(e) = state.mappings.get(&mapping_id) {
+        note_pass_extent_coverage(
+            cmd.pass_render_target_width,
+            cmd.pass_render_target_height,
+            e.width,
+            e.height,
+        );
+    }
+}
 
 /// Score the guest's stated pass extent against the attachment it names.
 ///
@@ -4305,6 +4328,53 @@ mod tests {
         let before: u64 = PASS_EXTENT_SLUGS.iter().map(|s| store_route_count(s)).sum();
         note_pass_extent_coverage(0, 0, 1920, 1080);
         note_pass_extent_coverage(100, 100, 0, 0);
+        assert_eq!(
+            PASS_EXTENT_SLUGS
+                .iter()
+                .map(|s| store_route_count(s))
+                .sum::<u64>(),
+            before
+        );
+    }
+
+    /// The extent census scores whichever resolve arm supplied the mapping id,
+    /// and only for slot 0.
+    ///
+    /// This is the arm-parity test. The census used to hang off the type-11
+    /// resolve alone, so on the x86/Vulkan pathway — where the workload takes
+    /// the type-4 arm — every band read zero, which is indistinguishable from a
+    /// guest that never states an extent. A type-4 attachment *is* its own
+    /// mapping id, so the only difference between the two call sites is which
+    /// id they pass, and this pins that the scoring does not care which.
+    #[test]
+    fn the_pass_extent_census_scores_either_resolve_arm() {
+        use crate::runtime::drain::store_route_count;
+
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let cmd = crate::runtime::decode::render::Command {
+            pass_render_target_width: 960,
+            pass_render_target_height: 540,
+            ..Default::default()
+        };
+        // One mapping, reached by the id either arm would hand over.
+        assert!(state.map_surface(7));
+        let _ = state.set_mapping_geom(7, 1920, 1080, 0);
+
+        let before = store_route_count("pass_extent_le25");
+        note_pass_extent_for_slot(&state, 0, 7, &cmd);
+        assert_eq!(
+            store_route_count("pass_extent_le25"),
+            before + 1,
+            "slot 0 was not scored"
+        );
+
+        // A slot the device does not treat as the pass's attachment, and a
+        // mapping id with no geometry yet, are both silent — the first because
+        // the census is defined on slot 0, the second because there is no
+        // fraction to take.
+        let before: u64 = PASS_EXTENT_SLUGS.iter().map(|s| store_route_count(s)).sum();
+        note_pass_extent_for_slot(&state, 1, 7, &cmd);
+        note_pass_extent_for_slot(&state, 0, 4242, &cmd);
         assert_eq!(
             PASS_EXTENT_SLUGS
                 .iter()
