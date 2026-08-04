@@ -2482,6 +2482,38 @@ fn note_pass_extent_for_slot(
 /// at `full` means the extent is the surface and there is nothing to bound, and
 /// one with mass below `le50` is a writeback that could be halved.
 ///
+/// # The answer is `full`, and it closes the question
+///
+/// Driven x86/Vulkan boot, 60 s Safari drag, once both resolve arms scored:
+///
+/// ```text
+/// pass_extent_full 11826      pass_extent_le5 1      every other band 0
+/// ```
+///
+/// **The extent is the attachment, 99.99 % of the time.** The small numbers in
+/// the log — 242x5, 1920x24, the many under 110 px — are small *surfaces*, not
+/// sub-rects of large ones. The window server states `renderTargetWidth/Height`
+/// on nearly every pass and states them equal to the target it is rendering
+/// into.
+///
+/// Two things follow, and both are conclusions rather than leads:
+///
+/// - **There is nothing to bound.** The pass extent is not a second source of
+///   damage; it is the attachment's own geometry restated on the wire. The
+///   `AGENTS.md` conclusion that "a damage-bounded flush needs a different
+///   source of damage than the draw stream, and none is currently decoded"
+///   survives having this one decoded and measured. Do not re-open damage
+///   bounding on the strength of the raw extent values in the fail log — they
+///   look like damage and are not.
+/// - **Ignoring the extent is not a defect.** Every consumer here uses the
+///   attachment's extent, which is what the guest asked for. See
+///   [`note_pass_target_extent`], whose "only a defect when the two differ" is
+///   now answered: they do not differ.
+///
+/// The bands stay. They are what would say so if a future guest build, a
+/// different app, or the arm64 pathway ever states a real sub-rect, and nothing
+/// else in the device would notice.
+///
 /// A pass that states no extent at all is not scored — there is no fraction to
 /// take — and neither is one whose attachment has no geometry yet.
 fn note_pass_extent_coverage(pass_w: u64, pass_h: u64, surf_w: u32, surf_h: u32) {
@@ -2522,6 +2554,13 @@ fn pass_extent_band(pct: u64) -> usize {
 /// and nothing at this point knows the attachment's size — so what this reports
 /// is the *value*, deduped on the pair, and the comparison is left to a reader
 /// with the surface geometry beside it.
+///
+/// **That reader is [`note_pass_extent_coverage`], and it says the two do not
+/// differ**: 11 826 of 11 827 scored passes state exactly the attachment's
+/// geometry. So this is a census of a value the device is right to discard, not
+/// a queued defect — which matters because it is the highest-volume reason in
+/// the fail log and its raw values (242x5, 1920x24) read like damage rects. They
+/// are small surfaces. Read the bands, not these numbers.
 ///
 /// Deduped rather than counted per pass for the reason the resource table's
 /// `TailPopulated` gives: a statement this device discards is a property of the
