@@ -2286,6 +2286,43 @@ fn note_mapping_window_against_fence(
 /// adoption restores them. Running that from inside a flush puts a mapping
 /// through a destructive half-state while a writeback is in progress, to answer
 /// a question the next bind answers for free.
+///
+/// # This is not a duplicate of the writer's vouch, and collapsing them is wrong
+///
+/// `flush_render_one` calls this, and then the write it performs calls
+/// `mapping_write::vouch_for_write`, which reaches the same
+/// `mapper::mapping_pages_verdict` — the same `O(pages)` guest page-table walk,
+/// microseconds apart. It reads as pure redundancy and it is not. Both halves
+/// were measured on a driven x86/Vulkan boot — `mapping_pages_ours=15686`
+/// against `mapw_pages_vouched=15699` on 15 653 flushes, so each runs once per
+/// flush, and `readback_split vouch_us` prices one at 55 µs, about 37 ms of a
+/// 913 ms busy second — so the cost is real. Removing this call is still wrong,
+/// for two independent reasons:
+///
+/// - **They are the same question asked at two times, and both times matter.**
+///   Between them run `flush_windows_under_bgra8_write` and the writeback's own
+///   `flush_intersecting`, and the guest runs on its own vCPUs across both. A
+///   re-point inside that interval is visible only to the later walk; a
+///   re-point before it, only to this one.
+/// - **Only this one can drop the window cleanly.** It refuses before the frame
+///   is acquired, releases the registry pin, and reports the loss under its own
+///   name (`rendflush_page_drift`, `reason=mapping_page_drift`). The writer's
+///   vouch refuses with `GpuWritebackDecline::PagesNotOurs` after the flush has
+///   committed to landing, which falls through to the copying arm to be refused
+///   a second time under a different name.
+///
+/// Hoisting instead of deleting does not work either. `PagesVouched::covers`
+/// re-checks `map_generation` and nothing else, and the case this guard exists
+/// for is a type-4 surface re-pointed with **no** generation bump — so a token
+/// minted here and presented later would still be `covers`-valid over exactly
+/// the drift it was supposed to catch.
+///
+/// `rendflush_page_drift` reading 0 is not evidence against any of this. It is
+/// 0 on the Safari window-drag workload and non-zero on the control boot that
+/// traced the class end to end (a 1225x512 WebKit tile whose backing was
+/// fabricated at its own GVA, refused when the live walk disagreed);
+/// `a_render_window_over_repointed_pages_is_refused_and_counted` is that boot
+/// turned into a test, and it fails on the collapsed version.
 #[cfg(feature = "backend-vulkan")]
 fn mapping_pages_still_ours<M: HostMemory + HostOps>(
     state: &mut DeviceState,
