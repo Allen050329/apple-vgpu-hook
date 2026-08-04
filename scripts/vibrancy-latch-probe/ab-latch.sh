@@ -43,9 +43,9 @@
 #
 # Both paths must live inside `vendor/qemu/build/` and keep `qemu-system-x86_64`
 # in the filename — QEMU finds its firmware relative to its own executable, and
-# every VM sweep in this repo matches that name when killing stragglers. Neither
-# path may be passed on this script's own command line to a child, because the
-# kill pattern would then match the invoking shell (learned by having it happen).
+# every VM sweep in this repo matches that name when killing stragglers. That
+# second requirement is why `kill_vm` below cannot use the bare pattern the other
+# sweeps use: this script's own arguments contain it. See the note there.
 set -euo pipefail
 export LC_ALL=C
 
@@ -85,9 +85,26 @@ WORK="${OUT:-$(mktemp -d -t ab-latch-XXXXXX)}"
 mkdir -p "$WORK"
 say() { echo "ab-latch: $*"; }
 
-# `pgrep -x` cannot see this process: the name is longer than 15 characters.
+# Kill stragglers without killing the sweep.
+#
+# `pgrep -x` cannot see QEMU at all — the name is longer than 15 characters — so
+# the pattern has to be a `-f` match on the command line. But this script takes
+# two *paths to QEMU binaries* as arguments, so the bare `qemu-system-x86_64`
+# pattern every other sweep here uses matches this script's own invocation, and
+# `pkill -9` on it kills the sweep mid-run. That is not theoretical: it happened
+# twice while building this, once to `latch-rate.sh` launched with `QEMU_BIN=…`
+# on the command line and once to this script.
+#
+# Two independent guards, because either alone is thin:
+#   - anchor on `-enable-kvm`, which the real process always carries directly
+#     after the binary and no argument list here does;
+#   - skip our own pid and our ancestors explicitly, so a future caller that
+#     happens to reproduce the anchor still cannot be killed.
 kill_vm() {
-  pkill -9 -f 'qemu-system-x86_64' 2>/dev/null || true
+  for pid in $(pgrep -A -f 'qemu-system-x86_64 -enable-kvm' 2>/dev/null || true); do
+    [ "$pid" = "$$" ] && continue
+    kill -9 "$pid" 2>/dev/null || true
+  done
   # Give the port forward time to come back, or the next boot dies on
   # "Could not set up host forwarding rule 'tcp::2222-:22'" and the ssh wait
   # then succeeds against the *previous* guest.
