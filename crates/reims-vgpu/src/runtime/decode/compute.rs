@@ -39,21 +39,6 @@ const REF_SIZE: usize = 4;
 const BUF_ENTRY: usize = 12;
 const BUF_STRIDE_ENTRY: usize = 20;
 const SAMPLER_LOD_ENTRY: usize = 12;
-/// Header plus two `Size3`, and taken from the crate that pins it.
-const DISPATCH_DIRECT_LEN: usize = wire::DISPATCH_TOTAL_LEN as usize;
-/// Header, one `Size3`, a `u64` offset and a `u32` ref.
-/// Header, a `u64` offset and a `u32` ref — no threadgroup size, unlike its
-/// threadgroup-granular sibling. Taken from the crate that pins it.
-/// Header plus two `Size3` — the region's size and its origin.
-const BARRIER_SCOPE_LEN: usize = wire::MEMORY_BARRIER_SCOPE_TOTAL_LEN as usize;
-/// The condition record's length, from the crate that derived it.
-///
-/// Was `0x1c` written here. It is the same number, and that is the point: the
-/// two agreed by luck for as long as nobody could check, because
-/// `-setSupportsCommandBufferJump:` defaults off and the capture recorded all
-/// seven control-flow selectors as emitting nothing at all.
-const CONDITION_LEN: usize = wire::CONTROL_FLOW_PREDICATE_TOTAL_LEN as usize;
-const EXECUTE_LEN: usize = wire::EXECUTE_COMMANDS_RANGE_TOTAL_LEN as usize;
 /// A control-flow marker is the header alone; the crate that derived the
 /// predicate form derived this one beside it.
 ///
@@ -63,7 +48,6 @@ const EXECUTE_LEN: usize = wire::EXECUTE_COMMANDS_RANGE_TOTAL_LEN as usize;
 /// one, not a fact they share.
 const EMPTY_LEN: usize = wire::CONTROL_FLOW_MARKER_TOTAL_LEN as usize;
 const _: () = assert!(EMPTY_LEN == wire::INSERT_COMPRESSED_TEXTURE_FLUSH_TOTAL_LEN as usize);
-const PIPELINE_LEN: usize = wire::SET_PIPELINE_STATE_TOTAL_LEN as usize;
 
 /// Why the compute decoder refused a command.
 ///
@@ -702,6 +686,22 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::contract::endian::st32;
+
+    /// Header plus two `Size3`, and taken from the crate that pins it.
+    const DISPATCH_DIRECT_LEN: usize = wire::DISPATCH_TOTAL_LEN as usize;
+    /// Header plus two `Size3` — the region's size and its origin.
+    const BARRIER_SCOPE_LEN: usize = wire::MEMORY_BARRIER_SCOPE_TOTAL_LEN as usize;
+    /// The condition record's length, from the crate that derived it.
+    ///
+    /// Was `0x1c` written here. It is the same number, and that is the point:
+    /// the two agreed by luck for as long as nobody could check, because
+    /// `-setSupportsCommandBufferJump:` defaults off and the capture recorded
+    /// all seven control-flow selectors as emitting nothing at all.
+    const CONDITION_LEN: usize = wire::CONTROL_FLOW_PREDICATE_TOTAL_LEN as usize;
+    const EXECUTE_LEN: usize = wire::EXECUTE_COMMANDS_RANGE_TOTAL_LEN as usize;
+    const PIPELINE_LEN: usize = wire::SET_PIPELINE_STATE_TOTAL_LEN as usize;
 
     /// A malformed compute command used to be dropped at the dispatch site with no
     /// log line at all — indistinguishable from a segment carrying no compute
@@ -723,9 +723,6 @@ mod tests {
         slugs.dedup();
         assert_eq!(slugs.len(), n, "two compute decode checks share a slug");
     }
-    use super::*;
-    use crate::contract::endian::st32;
-
     fn hdr(op: u32, len: usize) -> Vec<u8> {
         let mut v = vec![0u8; len];
         st32(&mut v[0..4], op);

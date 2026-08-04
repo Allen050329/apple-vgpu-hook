@@ -1,21 +1,6 @@
 //! Blit command decoder (port of `host/utils/reims-vgpu-blit-decode`).
 
-use core::mem::offset_of;
 use reims_vgpu_wire::ops::blit as wire;
-
-/// Shared serializer op-header length from `reims-vgpu-wire`.
-use reims_vgpu_wire::OP_HEADER_LEN;
-
-/// Map a `reims-vgpu-wire` view onto a payload, translating its refusal.
-///
-/// The ICB layouts live in that crate, derived from Apple's own serializer and
-/// pinned by fixtures, so this module reads them rather than restating them --
-/// the same arrangement `decode::render` uses. A view that does not fit is a
-/// payload shorter than the record claims, which is `ErrShort`.
-#[inline]
-fn wire_view<T: reims_vgpu_wire::Wire>(payload: &[u8]) -> Result<&T, DecodeStatus> {
-    reims_vgpu_wire::view::<T>(payload).map_err(|_| DecodeStatus::ErrShort)
-}
 
 /// The three indirect-command-buffer records, which this decoder reads and no
 /// executor applies.
@@ -121,31 +106,6 @@ pub fn parse_blit_options(has_options: bool, options: u32) -> Result<BlitAspect,
         (true, true) => Err(BlitOptionError::ConflictingAspects),
     }
 }
-
-// format offsets (payload-relative)
-
-const CBT_OPTIONS: usize = offset_of!(wire::CopyBufferToTexture, options);
-const CBT_LEN: usize = wire::COPY_BUFFER_TO_TEXTURE_TOTAL_LEN as usize;
-
-const CBB_SRC_OFF: usize = offset_of!(wire::BufferToBuffer, source_offset);
-const CBB_DST_OFF: usize = offset_of!(wire::BufferToBuffer, dest_offset);
-const CBB_SIZE: usize = offset_of!(wire::BufferToBuffer, size);
-const CBB_LEN: usize = wire::COPY_BUFFER_TO_BUFFER_TOTAL_LEN as usize;
-
-const CTB_OPTIONS: usize = offset_of!(wire::CopyTextureToBuffer, options);
-const CTB_LEN: usize = wire::COPY_TEXTURE_TO_BUFFER_TOTAL_LEN as usize;
-
-const CTT_LEN: usize = wire::COPY_TEXTURE_REGION_TOTAL_LEN as usize;
-const CTT_OPTIONS_LEN: usize = wire::COPY_TEXTURE_REGION_OPTIONS_TOTAL_LEN as usize;
-
-const FILL_REF: usize = offset_of!(wire::FillBuffer, buffer_ref);
-const FILL_RANGE_LOC: usize = offset_of!(wire::FillBuffer, range_location);
-const FILL_RANGE_LEN: usize = offset_of!(wire::FillBuffer, range_length);
-const FILL_VALUE: usize = offset_of!(wire::FillBuffer, value);
-const FILL_LEN: usize = wire::FILL_BUFFER_TOTAL_LEN as usize;
-
-const RESOURCE_LEN: usize = wire::REF_TOTAL_LEN as usize;
-const FENCE_LEN: usize = wire::REF_TOTAL_LEN as usize;
 
 /// Why the blit decoder refused a command.
 ///
@@ -711,6 +671,33 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
 mod tests {
     use super::*;
     use crate::contract::endian::{st16, st32, st64};
+    use core::mem::offset_of;
+    use reims_vgpu_wire::OP_HEADER_LEN;
+
+    // format offsets (payload-relative)
+
+    const CBT_OPTIONS: usize = offset_of!(wire::CopyBufferToTexture, options);
+    const CBT_LEN: usize = wire::COPY_BUFFER_TO_TEXTURE_TOTAL_LEN as usize;
+
+    const CBB_SRC_OFF: usize = offset_of!(wire::BufferToBuffer, source_offset);
+    const CBB_DST_OFF: usize = offset_of!(wire::BufferToBuffer, dest_offset);
+    const CBB_SIZE: usize = offset_of!(wire::BufferToBuffer, size);
+    const CBB_LEN: usize = wire::COPY_BUFFER_TO_BUFFER_TOTAL_LEN as usize;
+
+    const CTB_OPTIONS: usize = offset_of!(wire::CopyTextureToBuffer, options);
+    const CTB_LEN: usize = wire::COPY_TEXTURE_TO_BUFFER_TOTAL_LEN as usize;
+
+    const CTT_LEN: usize = wire::COPY_TEXTURE_REGION_TOTAL_LEN as usize;
+    const CTT_OPTIONS_LEN: usize = wire::COPY_TEXTURE_REGION_OPTIONS_TOTAL_LEN as usize;
+
+    const FILL_REF: usize = offset_of!(wire::FillBuffer, buffer_ref);
+    const FILL_RANGE_LOC: usize = offset_of!(wire::FillBuffer, range_location);
+    const FILL_RANGE_LEN: usize = offset_of!(wire::FillBuffer, range_length);
+    const FILL_VALUE: usize = offset_of!(wire::FillBuffer, value);
+    const FILL_LEN: usize = wire::FILL_BUFFER_TOTAL_LEN as usize;
+
+    const RESOURCE_LEN: usize = wire::REF_TOTAL_LEN as usize;
+    const FENCE_LEN: usize = wire::REF_TOTAL_LEN as usize;
 
     fn hdr(opcode: u32, len: u32) -> Vec<u8> {
         let mut v = vec![0u8; len as usize];
