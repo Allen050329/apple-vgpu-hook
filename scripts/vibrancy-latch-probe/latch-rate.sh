@@ -26,8 +26,28 @@
 # at the noise floor and a cluster far above it), and a mean would hide exactly
 # that.
 #
+# ## Read `gw_refused` before the verdict
+#
+# The pane gate only fires when the defect lands on the pane that was
+# photographed, so it is the *less* sensitive of the two columns. The
+# `gw_refused_guest_store` census counter is the mechanism itself: the guest-write
+# witness telling a gather that the guest overwrote the pages it was about to
+# skip. It separates the classes with no overlap at all, over twelve recorded
+# boots on two binaries:
+#
+#   clean      155  157  164  168  174  174  186
+#   degraded 20122 26072 27502 32604 34772
+#
+# Two orders of magnitude, and nothing in between. A boot in the thousands has
+# latched whether or not the screenshot caught it. Score on this column and use
+# the verdict to confirm.
+#
 # Usage:
 #   latch-rate.sh [--boots N] [--load-seconds S] [--census-seconds C] [--out DIR]
+#
+# Pin the binary with QEMU_BIN or every boot rebuilds QEMU, which both makes the
+# boots differ and locks the tree for the length of the sweep. Export it rather
+# than placing it on the command line — see kill_vm below.
 #
 # Exits 0 whenever the loop ran. It does not fail on a degraded boot — that is
 # the measurement, not an error.
@@ -58,13 +78,31 @@ WORK="${OUT:-$(mktemp -d -t latch-rate-XXXXXX)}"
 mkdir -p "$WORK"
 say() { echo "latch-rate: $*"; }
 
-# `pgrep -x` cannot see this process: the name is longer than 15 characters.
+# Kill stragglers without killing the sweep.
+#
+# `pgrep -x` cannot see QEMU at all — the name is longer than 15 characters — so
+# the pattern has to be a `-f` match on the command line. The bare
+# `qemu-system-x86_64` this used matches any caller that named a QEMU binary on
+# its own command line, including `QEMU_BIN=… latch-rate.sh`, and `pkill -9` then
+# kills the sweep mid-run. Anchor on `-enable-kvm`, which the real process always
+# carries directly after the binary and no invocation of this script does, and
+# skip our own pid.
 kill_vm() {
-  pkill -9 -f 'qemu-system-x86_64' 2>/dev/null || true
+  for pid in $(pgrep -f 'qemu-system-x86_64 -enable-kvm' 2>/dev/null || true); do
+    [ "$pid" = "$$" ] && continue
+    kill -9 "$pid" 2>/dev/null || true
+  done
   # Give the port forward time to come back, or the next boot dies on
   # "Could not set up host forwarding rule 'tcp::2222-:22'" — and the ssh wait
   # then succeeds against nothing.
   sleep 6
+}
+
+# Sum a per-second census counter over a whole boot's fail log. Absent reads 0,
+# which for these counters is the same statement as a run of zero lines.
+census_total() {
+  grep -o "$2=[0-9]*" "$1" 2>/dev/null | cut -d= -f2 \
+    | awk '{s += $1} END {print s + 0}'
 }
 
 # The probe's phases plus the boot, with headroom; the boot's own hard kill is
@@ -96,15 +134,20 @@ for i in $(seq 1 "$BOOTS"); do
   done
   if ! ssh -o ConnectTimeout=5 -o BatchMode=yes macos-vm true 2>/dev/null; then
     say "boot $i never came up — see $boot_dir/boot.log" >&2
-    printf '%s\t%s\t%s\n' "$i" "no-boot" "-" >>"$verdicts"
+    printf '%s\t%s\t%s\t%s\t%s\n' "$i" "no-boot" "-" "-" "-" >>"$verdicts"
     continue
   fi
 
   if ! "$PROBE" --load-seconds "$LOAD_SECONDS" --census-seconds "$CENSUS_SECONDS" \
       --out "$boot_dir" >"$boot_dir/probe.log" 2>&1; then
     say "boot $i: the probe refused a verdict — see $boot_dir/probe.log" >&2
-    printf '%s\t%s\t%s\n' "$i" "probe-refused" "-" >>"$verdicts"
     cp "$FAILLOG" "$boot_dir/full-boot.log" 2>/dev/null || true
+    # The mechanism counter still reads, and it does not need the screenshots
+    # the gate refused on.
+    printf '%s\t%s\t%s\t%s\t%s\n' "$i" "probe-refused" "-" \
+      "$(census_total "$boot_dir/full-boot.log" gw_refused_guest_store)" \
+      "$(grep -c 'deferred_flush_clobber' "$boot_dir/full-boot.log" 2>/dev/null || echo 0)" \
+      >>"$verdicts"
     continue
   fi
 
@@ -114,15 +157,17 @@ for i in $(seq 1 "$BOOTS"); do
   rmse=$(echo "$gate_out" | sed -n 's/.*pane=[^ ]* rmse=\([0-9.e-]*\).*/\1/p')
   # The gate's own refusal (control moved) is neither clean nor degraded.
   echo "$gate_out" | grep -q "not of the same scene" && verdict="gate-refused"
-  printf '%s\t%s\t%s\n' "$i" "$verdict" "${rmse:--}" >>"$verdicts"
-  say "boot $i: $verdict (pane rmse ${rmse:--})"
   cp "$FAILLOG" "$boot_dir/full-boot.log" 2>/dev/null || true
+  gw=$(census_total "$boot_dir/full-boot.log" gw_refused_guest_store)
+  clobber=$(grep -c 'deferred_flush_clobber' "$boot_dir/full-boot.log" 2>/dev/null || echo 0)
+  printf '%s\t%s\t%s\t%s\t%s\n' "$i" "$verdict" "${rmse:--}" "$gw" "$clobber" >>"$verdicts"
+  say "boot $i: $verdict (pane rmse ${rmse:--}, gw_refused $gw, clobber $clobber)"
 done
 
 kill_vm
 
 say ""
-say "boot	verdict	pane_rmse"
+say "boot	verdict	pane_rmse	gw_refused	clobber"
 sed 's/^/latch-rate:   /' "$verdicts"
 clean=$(awk -F'\t' '$2 == "clean"' "$verdicts" | wc -l)
 degraded=$(awk -F'\t' '$2 == "degraded"' "$verdicts" | wc -l)
@@ -133,5 +178,12 @@ if [ "$scored" -gt 0 ]; then
 else
   say "no boot produced a scoreable pair"
 fi
+# The mechanism column, which reads on every boot that produced a fail log —
+# including the ones the gate could not score. The threshold is three orders of
+# magnitude below the degraded cluster and two above the clean one, so no boot
+# recorded so far lands near it.
+latched=$(awk -F'\t' '$4 ~ /^[0-9]+$/ && $4 > 1000' "$verdicts" | wc -l)
+withlog=$(awk -F'\t' '$4 ~ /^[0-9]+$/' "$verdicts" | wc -l)
+say "gw_refused_guest_store over 1000 on $latched of $withlog boots with a fail log"
 say "per-boot evidence in $WORK/boot-*/ (screenshots, census logs, full-boot.log)"
 exit 0
