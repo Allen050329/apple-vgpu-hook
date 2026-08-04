@@ -1150,6 +1150,35 @@ pub enum TargetIdentity {
     Anonymous { slot: u64 },
 }
 
+/// What this device last did with a resident it no longer holds.
+///
+/// A draw that samples a missing resident cannot say, on its own, whether the
+/// pixels were taken from under it or never existed: both read as an absent
+/// registry entry. Those are different defects with different repairs — one is a
+/// reclaim policy that counted an actively-read resident as idle, the other is a
+/// target the guest never rendered into — and telling them apart is the whole
+/// value of recording this.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResidentReclaim {
+    /// The idle drain aged it out. A terminal destroy, not a recycle.
+    IdleDrained,
+    /// The capacity walk evicted it to hold the non-pinned population at cap.
+    CapEvicted,
+    /// `registry_ensure` replaced it for the same identity at a new geometry,
+    /// generation or format.
+    Recreated,
+}
+
+impl ResidentReclaim {
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::IdleDrained => "idle_drained",
+            Self::CapEvicted => "cap_evicted",
+            Self::Recreated => "recreated",
+        }
+    }
+}
+
 pub type PresentRect = (u32, u32, u32, u32);
 
 /// The resident a host-window present should blit from.

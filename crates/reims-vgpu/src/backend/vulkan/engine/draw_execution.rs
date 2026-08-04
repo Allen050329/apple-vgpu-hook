@@ -13,7 +13,7 @@
 
 use ash::vk;
 
-use super::types::TargetIdentity;
+use super::types::{ResidentReclaim, TargetIdentity};
 use crate::observe::Decline;
 
 /// A specific failure while preparing or executing a validated draw.
@@ -54,6 +54,11 @@ pub enum DrawExecutionDecline {
     SampledResidentMissing {
         binding: u32,
         identity: TargetIdentity,
+        /// What this device last did with this identity's resident, or `None`
+        /// if it has no record inside its history window. This is what separates
+        /// a resident reclaimed out from under an active reader from one the
+        /// guest never rendered into — the same log line otherwise.
+        prior: Option<ResidentReclaim>,
     },
     SampledResidentNotReady {
         binding: u32,
@@ -145,8 +150,20 @@ impl Decline for DrawExecutionDecline {
                 ]);
                 fields
             }
-            Self::SampledResidentMissing { binding, identity }
-            | Self::SampledResidentNotReady { binding, identity } => {
+            Self::SampledResidentMissing {
+                binding,
+                identity,
+                prior,
+            } => {
+                let mut fields = vec![("binding", binding.to_string())];
+                fields.extend(identity_fields(identity));
+                fields.push((
+                    "prior",
+                    prior.map_or("no_record", ResidentReclaim::slug).to_string(),
+                ));
+                fields
+            }
+            Self::SampledResidentNotReady { binding, identity } => {
                 let mut fields = vec![("binding", binding.to_string())];
                 fields.extend(identity_fields(identity));
                 fields
@@ -271,6 +288,7 @@ mod tests {
             DrawExecutionDecline::SampledResidentMissing {
                 binding: 32,
                 identity: identity(),
+                prior: Some(ResidentReclaim::IdleDrained),
             },
             DrawExecutionDecline::SampledResidentNotReady {
                 binding: 32,

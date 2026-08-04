@@ -66,6 +66,7 @@ impl ResourcePools {
             compute_storage_order: VecDeque::new(),
             registry: HashMap::new(),
             registry_order: VecDeque::new(),
+            reclaimed_recent: VecDeque::new(),
             idle_clock_ms: 0,
             last_drain_ms: 0,
             settled_drain_passes: 0,
@@ -427,6 +428,7 @@ impl ResourcePools {
                 self.registry_order.remove(pos);
             }
             if let Some(old) = self.registry.remove(&k) {
+                self.note_resident_reclaimed(&k, ResidentReclaim::IdleDrained);
                 self.dispose(&ctx.device, DeferredHandle::Framebuffer(old.framebuffer));
                 // Terminal DESTROY, not RecycleTarget: an idle-drained resident is
                 // stale by `IDLE_TARGET_AGE_MS` — it is not being actively recycled
@@ -548,6 +550,7 @@ impl ResourcePools {
                 continue;
             }
             if let Some(old) = self.registry.remove(&old_k) {
+                self.note_resident_reclaimed(&old_k, ResidentReclaim::CapEvicted);
                 if old.framebuffer != vk::Framebuffer::null() {
                     self.dispose(&ctx.device, DeferredHandle::Framebuffer(old.framebuffer));
                 }
@@ -583,6 +586,35 @@ impl ResourcePools {
         if let Some(slot) = self.registry.get_mut(identity) {
             slot.last_touch_ms = touch;
         }
+    }
+
+    /// Remember that `identity`'s resident was reclaimed, and by which path.
+    ///
+    /// Called from every site that removes a live registry entry, so a later
+    /// draw sampling it can distinguish "taken from under you" from "never
+    /// existed". Bounded FIFO; the oldest record is dropped rather than letting
+    /// a diagnostic grow without limit.
+    pub(crate) fn note_resident_reclaimed(
+        &mut self,
+        identity: &TargetIdentity,
+        why: ResidentReclaim,
+    ) {
+        if self.reclaimed_recent.len() >= RECLAIM_HISTORY {
+            self.reclaimed_recent.pop_front();
+        }
+        self.reclaimed_recent.push_back((identity.clone(), why));
+    }
+
+    /// The most recent thing this device did with `identity`'s resident, if it
+    /// is still inside the history window. `None` means no record — which covers
+    /// both "never held one" and "reclaimed longer ago than the window reaches",
+    /// two cases this deliberately does not guess between.
+    pub(crate) fn prior_reclaim(&self, identity: &TargetIdentity) -> Option<ResidentReclaim> {
+        self.reclaimed_recent
+            .iter()
+            .rev()
+            .find(|(k, _)| k == identity)
+            .map(|(_, why)| *why)
     }
 
     /// Record that a draw is reading this resident as a **sampled source**, so

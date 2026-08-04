@@ -15,7 +15,7 @@ use super::counters::EngineCounters;
 use super::desc_arena::{DescriptorArena, DESC_BLOCK_MAX_SETS};
 use super::device_lost::{DeviceLostDecline, DeviceLostOp};
 use super::host_slab::{HostSlabToken, HOST_SLAB_IDLE_KEEP_EMPTY};
-use super::types::{DrawError, StorageImageFormat, TargetIdentity};
+use super::types::{DrawError, ResidentReclaim, StorageImageFormat, TargetIdentity};
 use super::vk_call::{VkCall, VkOp};
 use crate::backend::vulkan::caps::{MappedMemoryKind, MemoryClass};
 use crate::backend::vulkan::translate;
@@ -215,11 +215,27 @@ pub(crate) struct ResourcePools {
     compute_storage_order: VecDeque<ComputeStorageResidencyKey>,
     /// Identity-keyed resident target registry (workstream D).
     registry: HashMap<TargetIdentity, ResidentTargetSlot>,
-    /// LRU order for [`Self::registry`], oldest at the front. A `VecDeque` so the
-    /// cap-eviction sweep's front pop / rotate-to-back is O(1) — the sweep is
-    /// then O(n), not the O(n²) a `Vec` front-`remove(0)` would make it under a
-    /// large pinned population (measured `reg=512` under multi-4K load).
+    /// Insertion order for [`Self::registry`], oldest *created* at the front. A
+    /// `VecDeque` so the cap-eviction sweep's front pop / rotate-to-back is
+    /// O(1) — the sweep is then O(n), not the O(n²) a `Vec` front-`remove(0)`
+    /// would make it under a large pinned population (measured `reg=512` under
+    /// multi-4K load).
+    ///
+    /// **Not use order.** Nothing promotes an entry when a draw reuses it, so
+    /// this alone would make a session-long resident the permanent front and the
+    /// first victim of every burst. Recency lives on the slot
+    /// ([`ResidentTargetSlot::last_touch_ms`]) and the sweep consults it through
+    /// [`ResourcePools::resident_recently_used`] rather than reordering here,
+    /// which keeps a promotion off the per-bind path.
     registry_order: VecDeque<TargetIdentity>,
+    /// Recently reclaimed identities and which path took each, so a draw that
+    /// samples a missing resident can say whether this device ever held one.
+    ///
+    /// Bounded and FIFO: it answers "what happened to this just now", and an
+    /// identity that has fallen out of the window is reported as no record
+    /// rather than guessed at. Diagnostic only — nothing reads it to decide
+    /// anything.
+    reclaimed_recent: VecDeque<(TargetIdentity, ResidentReclaim)>,
     /// Monotonic wall-clock milliseconds for the resident-target idle drain, fed
     /// from the poll heartbeat and each publish ([`Self::advance_registry_touch_and_drain`]).
     /// Each admit/hit/present stamps its slot's `last_touch_ms` with this value;
@@ -794,6 +810,12 @@ const IDLE_TARGET_DRAIN_MAX_PER_CALL: usize = 4;
 /// have their own pin lifecycle and working-set profile, and were never part of
 /// the deferred-present pin-burst class that motivated the target-cap change.
 const COMPUTE_STORAGE_REGISTRY_CAP: usize = 64;
+/// Reclaimed identities remembered for [`ResourcePools::reclaimed_recent`].
+///
+/// Sized to comfortably span one burst's reclamations so the answer is still
+/// there when the next draw samples one of them, without becoming a second
+/// registry. Diagnostic memory only: a `TargetIdentity` and a discriminant.
+const RECLAIM_HISTORY: usize = 256;
 /// Entries in the exact-content sampled cache.
 ///
 /// **This is the cap that evicts, and its sibling never does.** Measured on one

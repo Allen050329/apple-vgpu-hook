@@ -353,6 +353,7 @@ impl ResourcePools {
             }
             // Geometry/gen mismatch → destroy and recreate.
             if let Some(old) = self.registry.remove(&identity) {
+                self.note_resident_reclaimed(&identity, ResidentReclaim::Recreated);
                 self.dispose(&ctx.device, DeferredHandle::Framebuffer(old.framebuffer));
                 self.dispose(
                     &ctx.device,
@@ -1190,6 +1191,47 @@ mod pin_count_tests {
             !pools.resident_recently_used(&surf(2)),
             "an untouched resident stays evictable, so the cap still has victims"
         );
+    }
+
+    /// The reclaim history answers which path took a resident, and says "no
+    /// record" rather than guessing when it cannot.
+    ///
+    /// This is what lets `vk_draw_exec_sampled_resident_missing` distinguish a
+    /// resident reclaimed out from under an active reader from one the guest
+    /// never rendered into. Both present as an absent registry entry, and the
+    /// two have different repairs.
+    #[test]
+    fn the_reclaim_history_names_the_path_and_is_bounded() {
+        let mut pools = ResourcePools::new();
+        pools.note_resident_reclaimed(&surf(1), ResidentReclaim::IdleDrained);
+        pools.note_resident_reclaimed(&surf(2), ResidentReclaim::CapEvicted);
+        assert_eq!(
+            pools.prior_reclaim(&surf(1)),
+            Some(ResidentReclaim::IdleDrained)
+        );
+        assert_eq!(
+            pools.prior_reclaim(&surf(2)),
+            Some(ResidentReclaim::CapEvicted)
+        );
+        assert_eq!(
+            pools.prior_reclaim(&surf(3)),
+            None,
+            "an identity never reclaimed has no record, and is not guessed at"
+        );
+        // The most recent verdict wins: an identity recreated after being
+        // evicted is not still reported as evicted.
+        pools.note_resident_reclaimed(&surf(1), ResidentReclaim::Recreated);
+        assert_eq!(
+            pools.prior_reclaim(&surf(1)),
+            Some(ResidentReclaim::Recreated)
+        );
+        // Bounded: the oldest record falls out rather than the history growing
+        // without limit, and falling out reads as no record.
+        for i in 0..RECLAIM_HISTORY as u32 {
+            pools.note_resident_reclaimed(&surf(1000 + i), ResidentReclaim::CapEvicted);
+        }
+        assert!(pools.reclaimed_recent.len() <= RECLAIM_HISTORY);
+        assert_eq!(pools.prior_reclaim(&surf(2)), None, "aged out of the window");
     }
 
     /// The reclaim pass is throttled to `IDLE_DRAIN_INTERVAL_MS`: a second call

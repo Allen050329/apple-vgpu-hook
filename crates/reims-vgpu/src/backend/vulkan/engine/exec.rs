@@ -1725,6 +1725,7 @@ pub(crate) unsafe fn execute_draw_inner(
                             DrawError::DrawExecution(DrawExecutionDecline::SampledResidentMissing {
                                 binding: resource.binding,
                                 identity: identity.clone(),
+                                prior: pools.prior_reclaim(identity),
                             })
                         })?;
                 if !source_ready {
