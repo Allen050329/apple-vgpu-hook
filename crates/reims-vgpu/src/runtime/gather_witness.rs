@@ -41,6 +41,29 @@
 //! | `gw_unarmed` | no token, or a generation not yet readable — no answer |
 //! | `gw_rearm` | the window's page set changed, so nothing to compare against |
 //!
+//! # A device-wide `gw_refused_guest_store` is the hypervisor rail, not the guest
+//!
+//! This counter reads in the low hundreds over a whole driven boot. A boot where
+//! it reads in the tens of thousands has not met a guest that started writing its
+//! surfaces; it has met a witness that cannot say otherwise, and the difference is
+//! worth recognising because the second one latches and the first does not.
+//!
+//! The shape to look for is a **step**: the per-second rate jumping two orders of
+//! magnitude inside one second, across every mapping at once, and never coming
+//! back. Per-surface causes cannot do that — only state the whole device shares
+//! can, and on this rail that state lives in `reims_vgpu_dirty_harvest`
+//! (`hw/display/reims-vgpu-dirty.c`), which reads any tracked page it cannot
+//! resolve to a recorded guest-RAM range as written. One such bug is fixed and
+//! documented there: the harvest cut its window with a walk that swallowed every
+//! page above the first non-RAM byte, and nothing unwound it short of a reboot.
+//!
+//! It is worth recognising from the other side too, because the same step drives
+//! `metal_draw`'s type-11 sampled rung into
+//! `t11rung_resident_refused`, whose merge skips every page the witness claims
+//! and so leaves a GPU-side composite reading blank. Twelve recorded boots
+//! separated on this counter with no overlap — 155-186 clean against
+//! 20 122-34 772 degraded — which makes it the gate for that class as well.
+//!
 //! # The content fold is now an audit, not the decision
 //!
 //! A full fold over the window is what *established* the rule above: crossed
