@@ -1,6 +1,80 @@
 use super::*;
 use crate::model::{PAGE_SHIFT_ARM64E, PAGE_SHIFT_X86, PAGE_SIZE_ARM64E};
 
+/// No child opcode may be handled twice — once by its own `match` arm and again
+/// by an `if packet.opcode ==` inside another arm's body.
+///
+/// `process_child_packet` dispatches on the opcode and then, inside the
+/// bookkeeping family's shared body, branches on it again to separate the five
+/// packets that arm covers. Both shapes are fine on their own. What is not fine
+/// is an inner branch on an opcode the enclosing arm's pattern does not list:
+/// the outer `match` has already claimed it, so the inner branch is
+/// unreachable — and it reads exactly like a handler.
+///
+/// `CHILD_OP_REPLACE_PHYSICAL` was in that state. The reachable arm cleared the
+/// named mapping's page list; the unreachable one also routed the object id
+/// through `texture_to_mapping` and took the mapping's deferred windows. Nothing
+/// in the toolchain saw it — the code compiles, the body is well-formed, and a
+/// coverage sweep reports it as an untaken branch among thousands.
+///
+/// So the invariant is asserted against the source itself. It is a source test
+/// rather than a behavioural one because the failure has no behaviour: the
+/// second handler does nothing, which is indistinguishable at runtime from a
+/// handler whose conditions never held.
+#[test]
+fn no_child_opcode_is_claimed_by_an_arm_and_branched_on_inside_another() {
+    const SRC: &str = include_str!("mod.rs");
+    // The dispatch `match` is the only place in the file at this indentation
+    // whose arms are bare opcode constants, so arms are found by shape.
+    let mut current: Option<Vec<&str>> = None;
+    let mut pending: Vec<&str> = Vec::new();
+    let mut violations: Vec<String> = Vec::new();
+    for line in SRC.lines() {
+        let body = line.trim();
+        let is_arm_indent = line.starts_with("        ") && !line.starts_with("         ");
+        if is_arm_indent && body.starts_with("CHILD_OP_") || is_arm_indent && body.starts_with("| ")
+        {
+            for name in body.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
+                if name.starts_with("CHILD_OP_") {
+                    pending.push(name);
+                }
+            }
+            if body.contains("=>") {
+                current = Some(std::mem::take(&mut pending));
+            }
+            continue;
+        }
+        // Any other arm-indent line ends the arm we were inside.
+        if is_arm_indent && body.ends_with("=> {") {
+            current = Some(std::mem::take(&mut pending));
+            continue;
+        }
+        let Some(patterns) = current.as_ref() else {
+            continue;
+        };
+        let Some(rest) = body.split("packet.opcode ==").nth(1) else {
+            continue;
+        };
+        let Some(named) = rest
+            .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .find(|t| t.starts_with("CHILD_OP_"))
+        else {
+            continue;
+        };
+        if !patterns.contains(&named) {
+            violations.push(format!(
+                "{named} is branched on inside an arm matching {patterns:?}, \
+                 which does not list it — the branch is unreachable"
+            ));
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "unreachable opcode handlers in process_child_packet:\n  {}",
+        violations.join("\n  ")
+    );
+}
+
 /// I2's carve-out, asserted rather than trusted: a partial packet is the
 /// normal state of a ring whose producer is mid-write, so it must not reach
 /// the always-on log. A bad size or a desync must.

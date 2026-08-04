@@ -1377,19 +1377,7 @@ pub fn replace_physical<H: HostMemory + crate::runtime::host::HostOps>(
         }
     }
     if !state.mappings.contains_key(&target) {
-        // The guest announced a move this device could not apply to anything it
-        // holds. Deduped per `(task, object)`: a compositor re-pointing the same
-        // resource does it every frame, and the class is what matters here.
-        crate::runtime::drain::note_store_route("replace_physical_unknown_object");
-        if crate::observe::first_sight(
-            "replace_physical_unknown_object",
-            (u64::from(task_id) << 32) | u64::from(object_id),
-        ) {
-            crate::observe::fail(format!(
-                "replace_physical_unknown_object task={task_id} object={object_id} \
-                 (no mapping under this id and no type-11 ref route; the re-point is unapplied)"
-            ));
-        }
+        note_replace_physical_unmapped(state, host, task_id, object_id);
         return;
     }
     // A deferred window still owed on this mapping is riding the page plan the
@@ -1413,6 +1401,67 @@ pub fn replace_physical<H: HostMemory + crate::runtime::host::HostOps>(
         crate::observe::off(format!(
             "replace_physical task={task_id} object={object_id} mid={target} \
              (guest re-pointed the backing; cached page list dropped)"
+        ));
+    }
+}
+
+/// Say what a re-point named when no mapping owns the id, and whether this
+/// device is holding anything else for it.
+///
+/// A mapping is not the only place a resource's bytes can be cached. The type-2/3
+/// rails key their host copies by object-list ref (`host_texture_surfaces`,
+/// `host_linear_textures`) rather than by mapping id, and neither carries a page
+/// list to notice a move — so "no mapping under this id" does not settle whether
+/// the re-point had anything to invalidate. It only settles that the *mapping*
+/// rail had nothing.
+///
+/// The counters split three ways, because the three call for different repairs:
+/// `_unmapped_no_state` is a re-point of a resource this device holds nothing
+/// for, which is genuinely a no-op — the first resolve of that ref will read the
+/// page table the guest has already rewritten. `_unmapped_texture_cache` and
+/// `_unmapped_linear_cache` are re-points over a host copy that stays trusted,
+/// which is the loss.
+///
+/// The guest's own object list supplies the type, which is the only authority on
+/// what the id names: `lookup_list_entry` reads it at use time and this device
+/// caches no copy of it. The type is on the line rather than in a counter
+/// because the interesting reading is which types show up at all, and that is a
+/// small set a boot enumerates in a handful of lines.
+fn note_replace_physical_unmapped<M: HostMemory>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    object_id: u32,
+) {
+    let object_type = lookup_list_entry(state, host, task_id, object_id).map(|e| e.object_type);
+    let texture_cache = state.host_texture_surfaces.contains_key(&object_id);
+    let linear_cache = state
+        .host_linear_textures
+        .contains_key(&(task_id, object_id));
+    crate::runtime::drain::note_store_route("replace_physical_unknown_object");
+    if texture_cache {
+        crate::runtime::drain::note_store_route("replace_physical_unmapped_texture_cache");
+    }
+    if linear_cache {
+        crate::runtime::drain::note_store_route("replace_physical_unmapped_linear_cache");
+    }
+    if !texture_cache && !linear_cache {
+        crate::runtime::drain::note_store_route("replace_physical_unmapped_no_state");
+    }
+    // Deduped per `(task, object)`: a compositor re-pointing the same resource
+    // does it every frame, and the class is what matters here.
+    if crate::observe::first_sight(
+        "replace_physical_unknown_object",
+        (u64::from(task_id) << 32) | u64::from(object_id),
+    ) {
+        let kind = object_type
+            .map(|t| t.to_string())
+            .unwrap_or_else(|| "absent".to_string());
+        crate::observe::fail(format!(
+            "replace_physical_unknown_object task={task_id} object={object_id} \
+             obj_type={kind} tex_cache={} lin_cache={} \
+             (no mapping owns this id; the re-point reached no page list)",
+            texture_cache as u8, linear_cache as u8
         ));
     }
 }
