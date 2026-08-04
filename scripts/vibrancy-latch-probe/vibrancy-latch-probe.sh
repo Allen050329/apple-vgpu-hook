@@ -120,7 +120,9 @@ quiesce
 say "phase load: $URL for ${LOAD_SECONDS}s with the window in motion"
 sh_guest "open -a Safari '$URL'" >/dev/null || { say "could not open Safari" >&2; exit 2; }
 sleep 10
-osa 'tell application "System Events" to tell process "Safari" to set position of window 1 to {320, 180}' >/dev/null 2>&1 || true
+# Parked at an x the motion loop never visits, so the mid-run sample below
+# cannot read the start position back by coincidence.
+osa 'tell application "System Events" to tell process "Safari" to set position of window 1 to {160, 180}' >/dev/null 2>&1 || true
 osa 'tell application "System Events" to tell process "Safari" to set size of window 1 to {1000, 640}' >/dev/null 2>&1 || true
 sleep 2
 
@@ -143,18 +145,28 @@ while time.time() - t0 < $LOAD_SECONDS:
         capture_output=True)
     n += 1
 print(n)
-\"" >"$WORK/load.count" 2>"$WORK/load.err" || {
+\"" >"$WORK/load.count" 2>"$WORK/load.err" &
+LOAD_PID=$!
+
+# Sample the window's real position *during* the motion, not after it. The
+# reposition loop cycles through a fixed set of x values, so where it stops is
+# whichever one the last iteration happened to land on — comparing that to the
+# start reports "never moved" for a run that moved 309 times and simply came
+# back. What the check is actually for is the case where the events went
+# nowhere, and only a mid-run sample can see that.
+sleep 5
+MID_POS=$(osa 'tell application "System Events" to tell process "Safari" to get position of window 1' || true)
+"$SHOT" -o "$WORK/load.png" >/dev/null 2>&1 || true
+wait "$LOAD_PID" || {
   say "the load phase did not run — see $WORK/load.err" >&2
   sed 's/^/  /' "$WORK/load.err" >&2; exit 2; }
 
-END_POS=$(osa 'tell application "System Events" to tell process "Safari" to get position of window 1' || true)
 tail -c "+$((LOAD_OFF + 1))" "$FAILLOG" >"$WORK/load.log"
-say "load: $(cat "$WORK/load.count") repositions, window ($START_POS) -> ($END_POS)"
-"$SHOT" -o "$WORK/load.png" >/dev/null 2>&1 || true
+say "load: $(cat "$WORK/load.count") repositions, window ($START_POS) mid ($MID_POS)"
 
 # A load that never moved the window leaves the counters idle, and an idle
 # `after` differs from `before` for reasons unrelated to the bug.
-if [ "$START_POS" = "$END_POS" ] || [ -z "$END_POS" ]; then
+if [ "$MID_POS" = "$START_POS" ] || [ -z "$MID_POS" ]; then
   say "the window never moved — the load phase measured an idle guest and the \
 diff below would not be about this bug" >&2
   exit 2
