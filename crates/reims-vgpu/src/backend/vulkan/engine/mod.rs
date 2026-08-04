@@ -1627,6 +1627,23 @@ unsafe fn copy_image_level0_to_buffer(
                 .flags(ash::vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
         )
         .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::GuestWriteBeginCb, e)))?;
+    // The device's own clock, for the reason the readback rail takes it: `fence_us`
+    // is CPU wall clock and cannot tell "the GPU is copying eight megabytes across
+    // PCIe" from "the round trip costs more than the work". Those have opposite
+    // fixes — a damage rect shrinks the first and does nothing at all to the
+    // second — so the rail that is now most of a flush must not be read without
+    // this pair. Slot 0 stamps the command buffer's start, slot 1 the point after
+    // the barrier where the draws ahead are known done, slot 2 the end of the copy.
+    //
+    // The reset must be recorded into the same command buffer: a query pool's
+    // results are undefined until reset, and resetting on the host needs
+    // `hostQueryReset`, a Vulkan 1.2 feature this device does not ask for.
+    if let Some(probe) = ctx.timestamps.as_ref() {
+        ctx.device
+            .cmd_reset_query_pool(cb, probe.pool, 0, context::TimestampProbe::SLOTS);
+        ctx.device
+            .cmd_write_timestamp(cb, ash::vk::PipelineStageFlags::TOP_OF_PIPE, probe.pool, 0);
+    }
     // Unconditional, for the reason `copy_image_level0_to_host_delivered` states
     // at length: the barrier is a layout transition *and* a dependency, and this
     // rail needs the dependency whether or not the layout already matches. A
@@ -1649,6 +1666,10 @@ unsafe fn copy_image_level0_to_buffer(
         &[],
         &barrier,
     );
+    if let Some(probe) = ctx.timestamps.as_ref() {
+        ctx.device
+            .cmd_write_timestamp(cb, ash::vk::PipelineStageFlags::TRANSFER, probe.pool, 1);
+    }
     let region = [ash::vk::BufferImageCopy::default()
         .buffer_offset(dst.offset)
         // In texels, and only meaningful when the guest's pitch is wider than
@@ -1668,6 +1689,14 @@ unsafe fn copy_image_level0_to_buffer(
         buffer,
         &region,
     );
+    if let Some(probe) = ctx.timestamps.as_ref() {
+        ctx.device.cmd_write_timestamp(
+            cb,
+            ash::vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+            probe.pool,
+            2,
+        );
+    }
     // The reader of these bytes is the guest's vCPU, which is a host reader as
     // far as this device is concerned: the memory is guest RAM the driver
     // imported, not device-local memory that owes a readback. So the write is
@@ -1713,6 +1742,35 @@ unsafe fn copy_image_level0_to_buffer(
         ReadbackPhase::Fence,
         fence_started.elapsed().as_micros() as u64,
     );
+    // Read against the fence that just signalled, so both queries are available
+    // and this cannot block. What is left of `fence_us` after `gpu_us` is the
+    // round trip: submit-to-signal on a queue this thread is the only user of.
+    if let Some(probe) = ctx.timestamps.as_ref() {
+        let mut ticks = [0u64; context::TimestampProbe::SLOTS as usize];
+        match ctx.device.get_query_pool_results(
+            probe.pool,
+            0,
+            &mut ticks,
+            ash::vk::QueryResultFlags::TYPE_64,
+        ) {
+            // In f64, not integer ticks-times-period: `timestampPeriod` is a
+            // float and drivers do report values below 1 ns, which an integer
+            // multiply would truncate to zero and report as "the GPU did nothing".
+            Ok(()) => {
+                let us = |from: usize, to: usize| {
+                    (ticks[to].saturating_sub(ticks[from]) as f64
+                        * probe.ns_per_tick.max(0.0) as f64
+                        / 1_000.0) as u64
+                };
+                crate::runtime::drain::note_readback_gpu_us(us(0, 1), us(1, 2));
+            }
+            Err(e) => crate::observe::Emit::decline(
+                "vk_timestamp_read",
+                &VkCall::new(VkOp::ContextGetQueryPoolResults, e),
+            )
+            .fail_once(0),
+        }
+    }
     Ok(())
 }
 
