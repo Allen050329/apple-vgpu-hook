@@ -21,7 +21,14 @@
 extern "C" {
 #endif
 
-/* v15: reims_vgpu_qemu_scanout_may_paint — the console-ownership *verdict* for a
+/* v16: ReimsVgpuHostOps.dmabuf_for_pages — a run of guest pages as one Linux
+ *      dma-buf fd, so the host GPU can read and write those pages directly
+ *      instead of through a CPU copy in each direction. The shim answers with
+ *      the fd or with a named REIMS_VGPU_DMABUF_ERR_* code; it never exports
+ *      whether this host has udmabuf, whether guest RAM is fd-backed, or how
+ *      the run list coalesced, because a caller holding those three can rebuild
+ *      the rule and eventually will.
+ * v15: reims_vgpu_qemu_scanout_may_paint — the console-ownership *verdict* for a
  *      presented mapping, which v14 left in C. v14 moved the three-way kind into
  *      Rust but kept exporting it as an input, and the x86 shim promptly rebuilt
  *      "may this paint" out of the kind and the mapping id while the arm64 shim
@@ -59,13 +66,59 @@ extern "C" {
  *     thread so IRQ pulses reach the guest mid-drain — ack fast).
  * v6: ReimsVgpuHostOps.is_ram_gpa (reject non-RAM PFNs on mapper / map_pages paths).
  * v5: ReimsVgpuQemuCreateInfo.guest_page_shift (12 = x86 Tahoe, 14 = arm64e). */
-#define REIMS_VGPU_QEMU_ABI_VERSION 15u
+#define REIMS_VGPU_QEMU_ABI_VERSION 16u
 
 #define REIMS_VGPU_QEMU_OK 0
 #define REIMS_VGPU_QEMU_ERR_ARGS 1
 #define REIMS_VGPU_QEMU_ERR_STATE 2
 #define REIMS_VGPU_QEMU_ERR_PANIC 3
 #define REIMS_VGPU_QEMU_EMPTY 4
+
+/*
+ * Why dmabuf_for_pages refused, when it did. Negative so one return value
+ * carries both an owned fd (>= 0) and a named refusal, and distinct per check
+ * because these are four different hosts and four different things to do about
+ * them — a missing /dev/udmabuf is a permission fix, a non-fd-backed guest RAM
+ * is a boot-argument fix, and a run list past the bound is a fragmentation
+ * property of the guest's own allocation that no host change addresses.
+ */
+#define REIMS_VGPU_DMABUF_ERR_ARGS -1
+/* No /dev/udmabuf: not a Linux host, module absent, or no permission. */
+#define REIMS_VGPU_DMABUF_ERR_UNSUPPORTED -2
+/*
+ * Guest RAM has no backing fd. A plain `-m` allocation is an anonymous mapping
+ * and nothing can be exported from it; the boot scripts pass
+ * `-object memory-backend-memfd,share=on` so this does not fire.
+ */
+#define REIMS_VGPU_DMABUF_ERR_NOT_MEMFD -3
+/* A GPA in the list does not translate to guest RAM. */
+#define REIMS_VGPU_DMABUF_ERR_NOT_RAM -4
+/* A GPA in the list is not aligned to the page size the caller named. */
+#define REIMS_VGPU_DMABUF_ERR_ALIGNMENT -5
+/*
+ * The caller's page size is not a whole multiple of the host page size, so its
+ * pages cannot be named as udmabuf ranges without rounding to cover bytes the
+ * caller did not ask for.
+ */
+#define REIMS_VGPU_DMABUF_ERR_PAGE_SIZE -6
+/*
+ * After coalescing adjacent pages, the run list is longer than
+ * REIMS_VGPU_DMABUF_MAX_RUNS. Named separately from a failed create because it
+ * is the one refusal that says "this guest allocation is scattered", which is a
+ * property of the workload rather than of the host.
+ */
+#define REIMS_VGPU_DMABUF_ERR_TOO_FRAGMENTED -7
+/* UDMABUF_CREATE_LIST itself failed — most often the kernel's size bound. */
+#define REIMS_VGPU_DMABUF_ERR_CREATE -8
+
+/*
+ * Longest run list one dma-buf may carry, matching the Linux udmabuf driver's
+ * `list_limit` module parameter default (drivers/dma-buf/udmabuf.c). The kernel
+ * refuses a longer list, so refusing it here names the reason instead of
+ * surfacing an opaque ioctl failure. Adjacent pages coalesce first, so this
+ * bounds *runs*, not pages: a contiguous surface of any size is one run.
+ */
+#define REIMS_VGPU_DMABUF_MAX_RUNS 1024u
 
 /*
  * Largest scanout / surface edge the device accepts, in pixels.
@@ -173,6 +226,24 @@ typedef struct ReimsVgpuHostOps {
      * Mapper page-entry accept and multi-import fail closed on non-RAM PFNs.
      */
     int (*is_ram_gpa)(void *ctx, uint64_t gpa);
+    /*
+     * Export `count` page-aligned guest GPAs, each `page_size` bytes, as ONE
+     * Linux dma-buf. Returns an owned fd (>= 0) the caller must close, or a
+     * negative REIMS_VGPU_DMABUF_ERR_* code naming the check that refused.
+     *
+     * This is how the host GPU reaches guest memory without a CPU copy in
+     * either direction. It is deliberately NOT map_pages with a different
+     * return type: map_pages hands back a host pointer, and a host pointer
+     * imported into a GPU is unbounded, unrevocable and unmediated. A dma-buf
+     * is bounded to the ranges named here, revoked by closing the fd, and
+     * referenced through the kernel. Only the second is admissible over guest
+     * RAM, and only the second is offered.
+     *
+     * Absent (NULL) on any shim that cannot do this, which callers must read as
+     * a refusal rather than as a reason to reach for map_pages instead.
+     */
+    int (*dmabuf_for_pages)(void *ctx, const uint64_t *gpas, size_t count,
+                            size_t page_size);
     /*
      * Safe from any thread; schedules the HostAction-delivery BH (the queue
      * drained via reims_vgpu_qemu_device_pop_action). Distinct from schedule_bh,

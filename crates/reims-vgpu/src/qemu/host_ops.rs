@@ -46,6 +46,23 @@ pub struct ReimsVgpuHostOps {
     pub unmap_pages: Option<unsafe extern "C" fn(ctx: *mut c_void, ptr: *mut c_void, len: usize)>,
     /// 1 = guest RAM, 0 = not RAM. Optional (None → treat as RAM for unit fixtures).
     pub is_ram_gpa: Option<unsafe extern "C" fn(ctx: *mut c_void, gpa: u64) -> i32>,
+    /// Export `count` page-aligned GPAs as one Linux dma-buf. Returns an owned
+    /// fd (>= 0) or a negative `REIMS_VGPU_DMABUF_ERR_*` code.
+    ///
+    /// Deliberately not `map_pages` with a different return type. `map_pages`
+    /// yields a host pointer, and a host pointer imported into a GPU is
+    /// unbounded by anything the guest asked for, cannot be revoked, and is
+    /// trusted rather than kernel-mediated. A dma-buf is none of those, which
+    /// is the entire reason guest pages may reach the GPU through this and not
+    /// through that.
+    pub dmabuf_for_pages: Option<
+        unsafe extern "C" fn(
+            ctx: *mut c_void,
+            gpas: *const u64,
+            count: usize,
+            page_size: usize,
+        ) -> i32,
+    >,
     /// Schedule the HostAction-delivery BH (pop_action consumer). Safe from any
     /// thread. Distinct from `schedule_bh` (drain-worker wake): prompt actions
     /// (IRQ pulses, cursor moves) must be deliverable mid-drain.
@@ -135,6 +152,7 @@ impl ReimsVgpuHostOps {
             guest_write_gen: None,
             guest_written_pages: None,
             is_ram_gpa: None,
+            dmabuf_for_pages: None,
             notify_actions: None,
         }
     }
@@ -562,6 +580,33 @@ impl HostOps for QemuHost<'_> {
 
     fn map_pages_stable(&self) -> bool {
         self.ops.map_pages_stable != 0
+    }
+
+    fn dmabuf_for_pages(
+        &mut self,
+        gpas: &[u64],
+        page_size: usize,
+    ) -> Result<std::os::fd::OwnedFd, crate::runtime::host::DmaBufExportError> {
+        use crate::runtime::host::DmaBufExportError;
+        if gpas.is_empty() || page_size == 0 {
+            return Err(DmaBufExportError::Args);
+        }
+        let f = self
+            .ops
+            .dmabuf_for_pages
+            .ok_or(DmaBufExportError::CallbackMissing)?;
+        // SAFETY: QEMU owns ctx and keeps it valid for the device lifetime;
+        // `gpas` is valid for `count` reads for the duration of the call.
+        let rc = unsafe { f(self.ops.ctx, gpas.as_ptr(), gpas.len(), page_size) };
+        if rc < 0 {
+            return Err(DmaBufExportError::from_code(rc));
+        }
+        // The shim created this fd and does not retain it, so ownership is
+        // ours from here and the `OwnedFd` is what closes it. A refusal never
+        // reaches this arm, so no path both takes the fd and closes it.
+        //
+        // SAFETY: `rc` is a live fd the shim just created and no longer holds.
+        Ok(unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(rc) })
     }
 
     fn unmap_pages(&mut self, ptr: usize, len: usize) {
