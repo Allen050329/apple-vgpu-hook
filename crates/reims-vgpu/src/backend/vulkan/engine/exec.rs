@@ -1700,6 +1700,13 @@ pub(crate) unsafe fn execute_draw_inner(
                 });
             }
             SampledSource::Target(identity) => {
+                // Reading a resident is using it. Marked before the lookup so
+                // the refusal paths below cannot skip it: a resident whose
+                // content is not ready yet, or whose geometry disagrees with
+                // this bind, is still one the guest is actively sampling, and
+                // aging it out between two attempts is how a recoverable
+                // not-ready became a permanent missing.
+                pools.registry_note_sampled_use(identity);
                 let (source_image, source_view, source_layout, source_bgra, source_ready, sw, sh) =
                     pools
                         .registry_get(identity)

@@ -1126,6 +1126,72 @@ mod pin_count_tests {
         assert_eq!(pools.idle_clock_ms, now, "clock advanced to wall time");
     }
 
+    /// A resident that a draw only ever *samples* survives the idle drain.
+    ///
+    /// This is the compositor-backdrop case: the desktop behind a translucent
+    /// panel is rendered once and then read by every vibrancy draw over it.
+    /// Before [`ResourcePools::registry_note_sampled_use`] existed, reading a
+    /// resident refreshed nothing — `registry_ensure` (render *into*) and the
+    /// present touch were the only writers of `last_touch_ms` — so the backdrop
+    /// aged exactly as if it had been abandoned and the drain terminally
+    /// destroyed it. Every later draw sampling it then refused with
+    /// `vk_draw_exec_sampled_resident_missing`, and nothing recreates a resident
+    /// except a draw rendering into that identity, so the refusal held for the
+    /// rest of the boot.
+    ///
+    /// Fails without the fix: with the body of `registry_note_sampled_use`
+    /// removed, `surf(1)` is selected and the assertion reports it as a victim.
+    #[test]
+    fn a_sampled_only_resident_is_not_aged_out() {
+        let mut pools = ResourcePools::new();
+        // Aged past the cutoff by every measure the drain has, and never drawn
+        // into again — only read.
+        admit(&mut pools, surf(1), 10, 0);
+        admit(&mut pools, surf(2), 10, 0);
+        let now = 10 + IDLE_TARGET_AGE_MS + 1;
+        // The drain's clock has to be current before a use can be recorded
+        // against it; the real caller advances it from the poll heartbeat.
+        pools.plan_idle_drain(now, None);
+        pools.registry_note_sampled_use(&surf(1));
+        // A second pass, far enough after the first to clear the throttle.
+        let later = now + IDLE_DRAIN_INTERVAL_MS + 1;
+        let victims = pools.plan_idle_drain(later, None).expect("pass due");
+        assert!(
+            !victims.contains(&surf(1)),
+            "a resident being sampled is in use and must not be destroyed"
+        );
+        assert!(
+            victims.contains(&surf(2)),
+            "its untouched peer is still reclaimed — the fix must not disable the drain"
+        );
+    }
+
+    /// The capacity walk asks the same question the drain does, so a resident a
+    /// frame is reading cannot be evicted by whichever path happens to run.
+    ///
+    /// `registry_order` is insertion order — nothing promotes an entry when a
+    /// draw reuses it — so the front is the oldest-*created* resident, which for
+    /// a session-long backdrop is permanent. Consulting recency is what stops
+    /// the cap walk from taking it; without it the two paths disagree and the
+    /// backdrop is protected from the drain but not from a burst.
+    #[test]
+    fn the_cap_walk_and_the_drain_agree_on_what_is_in_use() {
+        let mut pools = ResourcePools::new();
+        admit(&mut pools, surf(1), 0, 0);
+        admit(&mut pools, surf(2), 0, 0);
+        let now = IDLE_TARGET_AGE_MS + 1;
+        pools.plan_idle_drain(now, None);
+        pools.registry_note_sampled_use(&surf(1));
+        assert!(
+            pools.resident_recently_used(&surf(1)),
+            "the sampled resident is in use, so the cap walk rotates it past"
+        );
+        assert!(
+            !pools.resident_recently_used(&surf(2)),
+            "an untouched resident stays evictable, so the cap still has victims"
+        );
+    }
+
     /// The reclaim pass is throttled to `IDLE_DRAIN_INTERVAL_MS`: a second call
     /// inside the interval selects nothing even though a resident is aged, so the
     /// ~244 Hz poll cadence cannot empty the registry at once. The clock still

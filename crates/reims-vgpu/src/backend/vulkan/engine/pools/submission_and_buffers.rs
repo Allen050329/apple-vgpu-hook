@@ -514,10 +514,33 @@ impl ResourcePools {
             let Some(old_k) = self.registry_order.front().cloned() else {
                 break;
             };
+            // `registry_order` is insertion order, not use order: nothing
+            // promotes an entry when a draw reuses it, so the front is the
+            // oldest-*created* resident rather than the least-recently-used one.
+            // A compositor backdrop is created early and lives for the whole
+            // session, which put it permanently at the front — first victim of
+            // every burst, however hard the current frame is reading it.
+            //
+            // Recency is already tracked per slot, so the walk consults it
+            // rather than reordering the deque on every use (a promotion would
+            // be an O(cap) scan per sampled bind per draw; this is O(cap) only
+            // when the cap is actually exceeded). A resident used within
+            // `IDLE_TARGET_AGE_MS` rotates to the back exactly like a pinned
+            // one, which is what makes `registry_note_sampled_use` protect a
+            // backdrop from this path as well as from the idle drain.
+            //
+            // If every entry is recent the loop completes its rotation budget
+            // having evicted nothing and the registry soft-exceeds the cap. That
+            // is the same trade the pinned case already takes, and it is bounded
+            // in time rather than unbounded: whatever is recent now ages out of
+            // this test within `IDLE_TARGET_AGE_MS`, after which both this path
+            // and the idle drain can reclaim it.
+            let recently_used = self.resident_recently_used(&old_k);
             if self
                 .registry
                 .get(&old_k)
                 .is_some_and(|slot| slot.pin_count > 0)
+                || recently_used
                 || protect == Some(&old_k)
             {
                 self.registry_order.pop_front();
@@ -556,6 +579,50 @@ impl ResourcePools {
         if now_ms > self.idle_clock_ms {
             self.idle_clock_ms = now_ms;
         }
+        let touch = self.idle_clock_ms;
+        if let Some(slot) = self.registry.get_mut(identity) {
+            slot.last_touch_ms = touch;
+        }
+    }
+
+    /// Record that a draw is reading this resident as a **sampled source**, so
+    /// both reclaim paths count it as in use.
+    ///
+    /// Reading a resident was not a use. `last_touch_ms` was refreshed by
+    /// `registry_ensure` (a draw rendering *into* the target), by the present
+    /// touch, and by nothing else — while the sampled-source resolve in
+    /// `execute_draw_inner` goes through `registry_get`, which takes `&self` and
+    /// therefore cannot mark anything. A resident that every frame samples but
+    /// no frame draws into consequently aged as if it were abandoned.
+    ///
+    /// That is the shape of a compositor backdrop: the desktop behind a
+    /// translucent panel is rendered once and then read by every vibrancy draw
+    /// over it. After `IDLE_TARGET_AGE_MS` the idle drain took it, and the drain
+    /// is a terminal destroy rather than a recycle, so the pixels were gone. The
+    /// next draw to sample it refuses with
+    /// `vk_draw_exec_sampled_resident_missing`, and because the exec loop
+    /// abandons the remaining records of a packet once a record cannot encode,
+    /// one missing backdrop drops a whole packet of draws.
+    ///
+    /// Nothing recreates a resident except a draw rendering into that identity,
+    /// so a backdrop the guest considers still valid is never rebuilt: the
+    /// refusal repeats for the life of the boot. That is why this class survives
+    /// closing the application that caused the pressure and why only a reboot
+    /// clears it.
+    /// Has this resident been used within the idle drain's own age window?
+    ///
+    /// The single definition of "in use" both reclaim paths consult, so the
+    /// capacity walk and the idle drain cannot drift apart on it. Shares
+    /// `IDLE_TARGET_AGE_MS` with the drain deliberately: two windows would mean
+    /// a resident the drain still considers live could be taken by the cap, and
+    /// the whole point is that neither path takes something a frame is reading.
+    pub(crate) fn resident_recently_used(&self, identity: &TargetIdentity) -> bool {
+        self.registry.get(identity).is_some_and(|slot| {
+            self.idle_clock_ms.saturating_sub(slot.last_touch_ms) < IDLE_TARGET_AGE_MS
+        })
+    }
+
+    pub(crate) fn registry_note_sampled_use(&mut self, identity: &TargetIdentity) {
         let touch = self.idle_clock_ms;
         if let Some(slot) = self.registry.get_mut(identity) {
             slot.last_touch_ms = touch;
