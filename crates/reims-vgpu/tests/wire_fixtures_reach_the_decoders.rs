@@ -43,19 +43,16 @@ use reims_vgpu::runtime::decode::{blit, compute, render};
 use serde_json::Value;
 
 fn fixtures() -> Option<Value> {
-    let dir = std::env::var("REIMS_WIRE_FIXTURES_DIR").unwrap_or_else(|_| {
-        format!(
-            "{}/../reims-vgpu-wire/fixtures",
-            env!("CARGO_MANIFEST_DIR")
-        )
-    });
+    let dir = std::env::var("REIMS_WIRE_FIXTURES_DIR")
+        .unwrap_or_else(|_| format!("{}/../reims-vgpu-wire/fixtures", env!("CARGO_MANIFEST_DIR")));
     let path = format!("{dir}/fixtures.json");
     match std::fs::read_to_string(&path) {
         Ok(s) => Some(serde_json::from_str(&s).expect("fixtures.json is valid JSON")),
         Err(_) => {
             let required = std::env::var("REIMS_WIRE_FIXTURES_REQUIRED").is_ok();
-            let msg =
-                format!("no fixtures at {path}; regenerate with scripts/wire-oracle/wire-oracle.sh");
+            let msg = format!(
+                "no fixtures at {path}; regenerate with scripts/wire-oracle/wire-oracle.sh"
+            );
             assert!(!required, "REIMS_WIRE_FIXTURES_REQUIRED is set but {msg}");
             eprintln!("SKIP: {msg}");
             None
@@ -130,7 +127,9 @@ fn compute_verdict(bytes: &[u8]) -> Reading {
     let verdict = match &decoded {
         Ok(_) => Verdict::Decoded,
         Err(S::ErrUnknownOpcode) => Verdict::NotImplemented("compute_decode_unknown_opcode"),
-        Err(S::ErrUnsupportedOpcode) => Verdict::NotImplemented("compute_decode_unsupported_opcode"),
+        Err(S::ErrUnsupportedOpcode) => {
+            Verdict::NotImplemented("compute_decode_unsupported_opcode")
+        }
         // `ErrShort` is now the compute arm's only shape failure, the way the
         // blit arm's became after `ErrUnimplementedOpcode` went. Every compute
         // refusal that is not an unknown or unsupported opcode is a layout this
@@ -641,13 +640,21 @@ fn no_decoder_reads_a_bit_apples_serializer_never_wrote() {
 
         let zeros = repaint_unwritten(&bytes, &mask, false);
         let ones = repaint_unwritten(&bytes, &mask, true);
-        let lo = read_record(class, &zeros, opcode).expect("same class").signature;
-        let hi = read_record(class, &ones, opcode).expect("same class").signature;
+        let lo = read_record(class, &zeros, opcode)
+            .expect("same class")
+            .signature;
+        let hi = read_record(class, &ones, opcode)
+            .expect("same class")
+            .signature;
         if lo != hi {
             // Keyed by record rather than by case: every fixture of one record
             // shares its layout, so a wide read reports once with the first
             // case that showed it rather than once per perturbation.
-            noise.entry(format!("{class} opcode {opcode:#x} ({} bytes)", bytes.len()))
+            noise
+                .entry(format!(
+                    "{class} opcode {opcode:#x} ({} bytes)",
+                    bytes.len()
+                ))
                 .or_insert_with(|| {
                     format!("{name}\n      unwritten=0 -> {lo}\n      unwritten=1 -> {hi}")
                 });

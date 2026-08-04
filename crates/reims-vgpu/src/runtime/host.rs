@@ -668,8 +668,9 @@ impl Drop for FakeHost {
         #[cfg(not(target_os = "macos"))]
         {
             for r in self.ranges.drain(..) {
-                let layout = std::alloc::Layout::from_size_align(r.alloc_len, GUEST_PAGE_SIZE_ARM64E)
-                    .unwrap_or(std::alloc::Layout::from_size_align(r.alloc_len, 1).unwrap());
+                let layout =
+                    std::alloc::Layout::from_size_align(r.alloc_len, GUEST_PAGE_SIZE_ARM64E)
+                        .unwrap_or(std::alloc::Layout::from_size_align(r.alloc_len, 1).unwrap());
                 // SAFETY: ptr/alloc_len from alloc_block.
                 unsafe { std::alloc::dealloc(r.ptr as *mut u8, layout) };
             }
@@ -731,7 +732,8 @@ impl FakeHost {
             // Real host pages so map_pages can return an aliasing pointer (product
             // contig write path). Align to 16 KiB so arm fixtures work.
             let alloc_len = len.max(1).next_multiple_of(GUEST_PAGE_SIZE_ARM64E);
-            let layout = std::alloc::Layout::from_size_align(alloc_len, GUEST_PAGE_SIZE_ARM64E).ok()?;
+            let layout =
+                std::alloc::Layout::from_size_align(alloc_len, GUEST_PAGE_SIZE_ARM64E).ok()?;
             // SAFETY: non-zero layout.
             let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
             if ptr.is_null() {
@@ -1364,7 +1366,9 @@ mod tests {
     fn guest_write_gen_is_idempotent() {
         let mut h = FakeHost::new();
         let p = GUEST_PAGE_SIZE_ARM64E as u64;
-        let token = h.track_guest_writes(&[4 * p, 9 * p], GUEST_PAGE_SIZE_ARM64E).unwrap();
+        let token = h
+            .track_guest_writes(&[4 * p, 9 * p], GUEST_PAGE_SIZE_ARM64E)
+            .unwrap();
         let first = h.guest_write_gen(token).unwrap();
         assert_eq!(h.guest_write_gen(token), Some(first));
         assert_eq!(h.guest_write_gen(token), Some(first));
@@ -1377,15 +1381,23 @@ mod tests {
     fn guest_write_gen_moves_only_for_tracked_pages() {
         let mut h = FakeHost::new();
         let p = GUEST_PAGE_SIZE_ARM64E as u64;
-        let a = h.track_guest_writes(&[4 * p, 9 * p], GUEST_PAGE_SIZE_ARM64E).unwrap();
-        let b = h.track_guest_writes(&[7 * p], GUEST_PAGE_SIZE_ARM64E).unwrap();
+        let a = h
+            .track_guest_writes(&[4 * p, 9 * p], GUEST_PAGE_SIZE_ARM64E)
+            .unwrap();
+        let b = h
+            .track_guest_writes(&[7 * p], GUEST_PAGE_SIZE_ARM64E)
+            .unwrap();
         let (a0, b0) = (h.guest_write_gen(a).unwrap(), h.guest_write_gen(b).unwrap());
 
         // Mid-page offset: the contract is stated in pages, so any address in
         // the page counts.
         h.guest_wrote_page(9 * p + 17);
         assert_ne!(h.guest_write_gen(a), Some(a0), "tracked page must move a");
-        assert_eq!(h.guest_write_gen(b), Some(b0), "untracked page must not move b");
+        assert_eq!(
+            h.guest_write_gen(b),
+            Some(b0),
+            "untracked page must not move b"
+        );
 
         let a1 = h.guest_write_gen(a).unwrap();
         h.guest_wrote_page(7 * p);

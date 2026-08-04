@@ -40,9 +40,10 @@
 //!
 //! # Relationship to `reims-vgpu`
 //!
-//! This crate does not replace `reims_vgpu::runtime::decode`. It is validated
-//! against Apple independently, and call sites move over one at a time. The two
-//! also frame different levels: [`op::OpHeader`] is the serializer's operation
+//! This crate is the layout authority for serializer records that
+//! `reims_vgpu::runtime::decode` consumes. Decode maps wire views into its
+//! product model; it does not re-declare covered opcodes or layouts. The two
+//! still frame different levels: [`op::OpHeader`] is the serializer's operation
 //! head, *not* the FIFO packet header in `decode::fifo`, whose fields collide
 //! with it at offsets 4 and 8 while meaning something else.
 

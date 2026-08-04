@@ -187,10 +187,7 @@ mod tests {
     #[test]
     fn a_header_one_byte_short_is_refused_rather_than_read() {
         let buf = [0u8; SEGMENT_HEADER_LEN - 2];
-        assert!(matches!(
-            segment_header(&buf),
-            Err(WireError::Short { .. })
-        ));
+        assert!(matches!(segment_header(&buf), Err(WireError::Short { .. })));
     }
 
     /// The four fields occupy four distinct byte offsets in the order declared.

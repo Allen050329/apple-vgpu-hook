@@ -26,10 +26,7 @@ pub fn gfx_read(state: &mut DeviceState, offset: u64, size: u32) -> u64 {
         return lo | (hi << 32);
     }
     if size != MMIO_U32 {
-        state.record_fail(FailEvent::BadMmioAccess {
-            offset,
-            size,
-        });
+        state.record_fail(FailEvent::BadMmioAccess { offset, size });
         return 0;
     }
 
@@ -106,10 +103,7 @@ pub fn gfx_write<H: HostMemory + HostOps>(
         return;
     }
     if size != MMIO_U32 {
-        state.record_fail(FailEvent::BadMmioAccess {
-            offset,
-            size,
-        });
+        state.record_fail(FailEvent::BadMmioAccess { offset, size });
         return;
     }
 

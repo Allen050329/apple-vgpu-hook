@@ -684,7 +684,6 @@ impl EncodeStatus {
             Self::NoMetal(_) => "no_metal",
         }
     }
-
 }
 
 /// Why an indexed draw's index bytes could not be resolved.
@@ -2609,10 +2608,8 @@ pub(crate) fn sampler_record(
     argument_buffers: bool,
 ) -> crate::backend::metal::abi::ReimsVgpuSampler {
     use crate::backend::metal::abi::ReimsVgpuSampler;
-    let (lod_min, lod_max) = lod_clamp.unwrap_or((
-        sd.lod_min_clamp.to_bits(),
-        sd.lod_max_clamp.to_bits(),
-    ));
+    let (lod_min, lod_max) =
+        lod_clamp.unwrap_or((sd.lod_min_clamp.to_bits(), sd.lod_max_clamp.to_bits()));
     ReimsVgpuSampler {
         binding,
         unnormalized: if sd.normalized_coordinates { 0 } else { 1 },
@@ -2705,9 +2702,15 @@ mod sampler_record_tests {
     #[test]
     fn anisotropy_is_floored_at_one() {
         let mut sd = descriptor();
-        assert_eq!(super::sampler_record(64, &sd, None, false).max_anisotropy, 1);
+        assert_eq!(
+            super::sampler_record(64, &sd, None, false).max_anisotropy,
+            1
+        );
         sd.max_anisotropy = 4;
-        assert_eq!(super::sampler_record(64, &sd, None, false).max_anisotropy, 4);
+        assert_eq!(
+            super::sampler_record(64, &sd, None, false).max_anisotropy,
+            4
+        );
     }
 }
 
@@ -2746,8 +2749,7 @@ fn sample_miss_detail<M: HostMemory + HostOps>(
                         ),
                         None => format!(
                             "type=5 desc_len={desc_len} surface_id={sid} reason=ref_texture_no_view"
-                        ),
-                    }
+                        )}
                 }
             }
         }
@@ -2765,8 +2767,7 @@ fn sample_miss_detail<M: HostMemory + HostOps>(
                     m.format,
                     m.mapped as u8,
                     m.page_entries.len()
-                ),
-            }
+                )}
         }
         OBJECT_TYPE_TEXTURE_VIEW => {
             // Opcode-9 buffer-backed textures share the type-8 tag but are not views.
@@ -2797,8 +2798,7 @@ fn sample_miss_detail<M: HostMemory + HostOps>(
                     view.base_texture_ref,
                     view.level,
                     view.pixel_format
-                ),
-            }
+                )}
         }
         OBJECT_TYPE_TEXTURE | OBJECT_TYPE_TEXTURE_VARIANT => {
             let Some(desc_bytes) = objects::read_descriptor(state, host, task_id, &entry) else {
@@ -4410,7 +4410,8 @@ fn seed_color_load<M: HostMemory + HostOps>(
         // interpretable, and its other three legs are pinned by
         // `surface_cache`'s unit tests, so a zero here is a measured zero and
         // not a probe that cannot tell the cases apart.
-        if target_gva != 0 && crate::runtime::surface_cache::has_gva(state, target_gva, width, height)
+        if target_gva != 0
+            && crate::runtime::surface_cache::has_gva(state, target_gva, width, height)
         {
             use crate::runtime::surface_cache::GvaBackingState as B;
             crate::runtime::drain::note_store_route(
@@ -4670,10 +4671,8 @@ mod memo_scratch_tests {
     #[test]
     fn an_unlandable_chain_writeback_names_itself() {
         use crate::runtime::drain::store_route_count;
-        let mut state = crate::model::DeviceState::new(
-            crate::model::DeviceId(1),
-            crate::model::PAGE_SHIFT_X86,
-        );
+        let mut state =
+            crate::model::DeviceState::new(crate::model::DeviceId(1), crate::model::PAGE_SHIFT_X86);
         let mut host = crate::runtime::host::FakeHost::new();
 
         // No source at all: the commonest way this rail is reached with nothing

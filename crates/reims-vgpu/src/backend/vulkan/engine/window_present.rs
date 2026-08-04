@@ -428,11 +428,7 @@ pub(crate) fn swapchain_plan(
 /// something to replace while one is queued and one is being drawn, so the floor
 /// is raised on that arm only — and `max_image_count` still wins, since a
 /// surface that caps at two cannot be argued with (0 means no maximum).
-pub(crate) fn swapchain_image_count(
-    caps_min: u32,
-    caps_max: u32,
-    mode: vk::PresentModeKHR,
-) -> u32 {
+pub(crate) fn swapchain_image_count(caps_min: u32, caps_max: u32, mode: vk::PresentModeKHR) -> u32 {
     let mut count = caps_min.saturating_add(1);
     if mode == vk::PresentModeKHR::MAILBOX {
         count = count.max(3);

@@ -140,38 +140,40 @@ Opcodes measured but not yet viewed: 3 (sampler state), 4 (depth/stencil state),
 
 ## Relationship to `reims-vgpu`
 
-This crate does not replace `reims_vgpu::runtime::decode`, and nothing depends
-on it yet. It earns its way in one call site at a time, starting with
-`decode::resource`, where the project's recorded decode-fidelity bugs cluster.
+This crate is the **layout authority** for serializer records that
+`reims_vgpu::runtime::decode` consumes. Decode maps wire views into the
+product model (`Command`, `Kind`, decline slugs, exec routing); it does not
+re-declare opcodes or restate field layouts when a wire parser or view already
+exists.
 
-`op::OpHeader` — `[opcode u32][length u32]` — is the same record framing
-`decode::{render,blit,compute}` already use (`HEADER_LEN = 8`) and that
-`decode::stream` walks. It is *not* the FIFO packet header in `decode::fifo`,
-which frames a different level with fields at offsets 4 and 8 meaning something
-else entirely.
+Covered families used today:
 
-Five opcodes captured from `PGSerializerRenderCommandEncoder` match
-`decode::render`'s independently reverse-engineered constants exactly —
-`setScissorRect:`→`0x75`, `setCullMode:`→`0x6b`,
-`setFrontFacingWinding:`→`0x73`, `setBlendColorRed:…`→`0x65`,
-`drawPrimitives:…`→`0x01`. That is the first direct evidence the existing
-decoder's opcode table is right, and it is why the encoder path is the
-integration surface worth covering first: 248 of the 364 selectors are encoder
-commands, and `runtime::exec` decodes exactly those.
+| Decode module | Wire module(s) | How it is consumed |
+|---|---|---|
+| `decode::blit` | `ops::blit` | `op` framing + family parsers (`copy_*`, `fill_*`, …) |
+| `decode::compute` | `ops::compute` | `op` framing + family parsers (dispatch, binds, fences, …) |
+| `decode::render` | `ops::render`, `ops::render_pass`, `ops::tile` | `op` framing + draw/state parsers and views |
+| `decode::resource` | `ops::{sampler,depth_stencil,texture_view,icb,heap_texture,backed_texture,…}` | parsers for covered create records (sampler, depth/stencil, texture views, ICB, heap/buffer textures) |
+| `decode::stream` | `ops::segment`, `OP_HEADER_LEN` | segment header types and record framing constants |
+| `contract::gva` / page walk | `page_table` | GVA walk layout |
 
-Covering the draw family found three things in that decoder the boot could not
-have shown, all recorded in the view that settles each:
+What stays local in decode (wire has no export):
 
-- `0x00` is declined as unknown, and the layout its comment *guessed* is wrong:
-  `primitiveType` leads and is 32-bit, as in `0x01`, not trailing as in the
-  instanced forms. Every draw of more than 65 535 vertices is currently lost.
-- The compact indexed draws read `u32 primitiveType@0`, which silently absorbs
-  `indexType` at `+2`. It reads correctly only for `MTLIndexTypeUInt16`, whose
-  ordinal is 0 — and `index_type` is then hardcoded to that same value, so a
-  guest drawing with 32-bit indices gets a nonsense primitive type *and* the
-  wrong index width.
-- `0x02`, `0x04`, `0x05`, `0x08`, `0x0a` and `0x0b` have no arm at all and fall
-  through to `Kind::OtherAccepted`, which executes nothing.
+- **FIFO** packet framing (`decode::fifo`) — a different level of the protocol
+- **Event** opcodes `0x190`–`0x192` (no wire event module yet)
+- **Compute residency** `0x86`/`0x87` (no `useHeaps:` / `useResources:` on the
+  compute serializer surface measured here)
+- **Unobserved segment type** `SEGMENT_TYPE_EVENT` (wire only names what the
+  oracle has driven)
+
+`op::OpHeader` — `[opcode u32][length u32]` — is the serializer record head.
+It is *not* the FIFO packet header in `decode::fifo`, which frames a different
+level with fields at offsets 4 and 8 meaning something else entirely.
+
+Wire views also surface layout bugs that a boot cannot prove. The draw-family
+derivation is the standing example: compact vs wide forms, index-type width, and
+opcodes that used to fall through to `Kind::OtherAccepted` are recorded next to
+the views that settle them in `ops::render`.
 
 ## Caveats
 

@@ -296,10 +296,9 @@ fn publish_present_boundary(slot: &BoundDevice, frame_flush_seen: bool) {
 
 fn apply_gfx_write(inner: &mut DeviceInner, slot: &BoundDevice, write: QueuedGfxWrite) {
     match write.queued_at {
-        Some(at) => runtime::drain::note_doorbell_queued(
-            write.offset,
-            at.elapsed().as_micros() as u64,
-        ),
+        Some(at) => {
+            runtime::drain::note_doorbell_queued(write.offset, at.elapsed().as_micros() as u64)
+        }
         None => runtime::drain::note_doorbell_direct(),
     }
     if let Some(ops) = slot.ops {
@@ -579,7 +578,7 @@ pub fn device_window_run_main(_id: u64) -> bool {
 /// never contends the render tranche. Latest-wins.
 #[cfg(feature = "host-window")]
 fn publish_window_frame(slot: &BoundDevice, state: &mut crate::model::DeviceState) {
-    use crate::runtime::drain::{WindowPublish, note_window_publish};
+    use crate::runtime::drain::{note_window_publish, WindowPublish};
     let mut guard = slot.window.lock();
     let Some(link) = guard.as_mut() else {
         // No window consumes the capture: revert the next capture to the full
@@ -1619,7 +1618,6 @@ mod tests {
     use super::*;
     use crate::model::PAGE_SHIFT_ARM64E;
 
-
     #[test]
     fn lifecycle() {
         let id = device_create(None, PAGE_SHIFT_ARM64E).expect("create");
@@ -1981,7 +1979,12 @@ mod tests {
             "and into an active channel, or the stranded-FIFO rescue cannot see it"
         );
         assert_eq!(
-            inner.device.state.gfx.child_doorbell_rung.load(Ordering::Acquire),
+            inner
+                .device
+                .state
+                .gfx
+                .child_doorbell_rung
+                .load(Ordering::Acquire),
             0,
             "the fold consumes the bit rather than replaying it every drain"
         );

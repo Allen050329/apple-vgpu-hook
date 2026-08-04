@@ -972,7 +972,9 @@ mod tests {
         assert_eq!(ff_run_counts(), (0, 0));
 
         // And a photograph: no long uniform anything.
-        let noise: Vec<u8> = (0..8192u32).map(|i| (i.wrapping_mul(37) % 251) as u8).collect();
+        let noise: Vec<u8> = (0..8192u32)
+            .map(|i| (i.wrapping_mul(37) % 251) as u8)
+            .collect();
         assert_eq!(longest_ff_run(&noise), 0);
     }
 
@@ -1191,7 +1193,11 @@ mod tests {
         note_pages_retired([0x2000u64, 0x2000], 0x1000);
         assert_eq!(retired_counts().0, 1);
         note_pages_authorized([0x7000u64], 0x1000);
-        assert_eq!(retired_counts().0, 1, "adopting a live frame changes nothing");
+        assert_eq!(
+            retired_counts().0,
+            1,
+            "adopting a live frame changes nothing"
+        );
         note_pages_authorized([0x2000u64, 0x2000], 0x1000);
         assert_eq!(retired_counts().0, 0);
     }

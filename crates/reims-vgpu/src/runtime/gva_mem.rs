@@ -786,7 +786,12 @@ mod tests {
     #[test]
     fn row_loop_writers_take_the_bounded_form() {
         let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/runtime");
-        for relative in ["blit_exec.rs", "mipmap.rs", "mapping_write.rs", "storage_flush.rs"] {
+        for relative in [
+            "blit_exec.rs",
+            "mipmap.rs",
+            "mapping_write.rs",
+            "storage_flush.rs",
+        ] {
             let src = std::fs::read_to_string(root.join(relative))
                 .unwrap_or_else(|e| panic!("{relative}: {e}"));
             // `_within` is the bounded form and shares this prefix, so match the
@@ -1249,5 +1254,4 @@ mod tests {
             .unwrap_err();
         assert_eq!(err, MemError::NoSuchTask);
     }
-
 }

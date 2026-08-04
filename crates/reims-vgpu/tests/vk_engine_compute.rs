@@ -1341,4 +1341,3 @@ fn compute_storage_image_r16float_if_supported() {
         }
     }
 }
-

@@ -104,7 +104,7 @@ pub const MAX_SCANOUT_DIM: u32 = 8192;
 // the device's address arithmetic and its fixtures want. Both derive from the
 // one re-exported shift, so they cannot disagree in value — but the names do
 // collide, so import from one module or the other on purpose.
-pub use crate::contract::gva::{PAGE_SHIFT_ARM64E, PAGE_SHIFT_X86, pfn_to_gpa};
+pub use crate::contract::gva::{pfn_to_gpa, PAGE_SHIFT_ARM64E, PAGE_SHIFT_X86};
 pub const PAGE_SIZE_ARM64E: u64 = 1u64 << PAGE_SHIFT_ARM64E;
 pub const PAGE_SIZE_X86: u64 = 1u64 << PAGE_SHIFT_X86;
 
@@ -645,9 +645,13 @@ mod tests {
         // Keys that describe the protocol rather than the GPU are untouched by
         // any host: reducing the serializer version or the primitive-type mask
         // would be answering a question the host GPU was never asked.
-        let table: std::collections::BTreeMap<u32, u32> = DEVICE_INFO_CAPS.iter().copied().collect();
+        let table: std::collections::BTreeMap<u32, u32> =
+            DEVICE_INFO_CAPS.iter().copied().collect();
         for key in [7u32, 8, 10, 11, 12, 13, 14, 15, 16, 17] {
-            assert_eq!(served[&key], table[&key], "key {key} must not depend on host");
+            assert_eq!(
+                served[&key], table[&key],
+                "key {key} must not depend on host"
+            );
         }
     }
 

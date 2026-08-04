@@ -1925,7 +1925,9 @@ fn the_drain_duty_census_separates_a_flush_tail_from_a_flush_mean() {
     // express: `flushes=10` reads as one busy mechanism, while the count says
     // the linear rail owns nine tenths of it and the cost says the render rail
     // owns three quarters. Those two readings point at different code.
-    let rails = c.take_flush_rails().expect("a window that flushed must split");
+    let rails = c
+        .take_flush_rails()
+        .expect("a window that flushed must split");
     assert!(rails.contains("win_ms=1100"), "{rails}");
     assert!(rails.contains("render_us=30000 render=1"), "{rails}");
     assert!(rails.contains("linear_us=9000 linear=9"), "{rails}");
@@ -2128,13 +2130,7 @@ fn an_owned_writeback_publishes_its_frame_to_the_cache_without_copying_it() {
 
     let frame = std::sync::Arc::new((0..need).map(|i| (i % 251) as u8).collect::<Vec<u8>>());
     assert!(write_bgra8_owned(
-        &mut state,
-        &mut host,
-        7,
-        &frame,
-        stride,
-        w,
-        h
+        &mut state, &mut host, 7, &frame, stride, w, h
     ));
 
     let published = crate::runtime::surface_cache::get(&state, 7, w, h)
@@ -2276,7 +2272,10 @@ fn the_surface_cache_reuses_its_buffer_but_never_one_someone_else_is_holding() {
         "a frame someone else is holding must not be rewritten"
     );
     let third = surface_cache::get(&state, 4, w, h).unwrap();
-    assert_eq!(third[0], 0x33, "and the entry must still take the new frame");
+    assert_eq!(
+        third[0], 0x33,
+        "and the entry must still take the new frame"
+    );
     assert_ne!(
         third.as_ptr(),
         held.as_ptr(),
@@ -2372,7 +2371,10 @@ fn the_resident_arm_age_refuses_to_pair_a_flush_with_an_arm_it_cannot_name() {
     c.note_arm(600_000);
     c.note_flush(607_000);
     let line = c.take(1_000).expect("traffic must report");
-    assert!(line.contains("multi=1"), "the stale arm is ambiguous once: {line}");
+    assert!(
+        line.contains("multi=1"),
+        "the stale arm is ambiguous once: {line}"
+    );
     assert!(
         line.contains("aged=1") && line.contains("age_us=7000"),
         "and the next pairing is exact again: {line}"
@@ -3296,16 +3298,13 @@ fn the_display_flush_fence_is_a_named_command_and_not_a_defect() {
         "the command is counted like every other decoded one"
     );
     assert!(
-        !state
-            .fails
-            .iter()
-            .any(|e| matches!(
-                e,
-                FailEvent::UnknownChildOpcode {
-                    opcode: CHILD_OP_FLUSH_CHANNEL_EVENT,
-                    ..
-                }
-            )),
+        !state.fails.iter().any(|e| matches!(
+            e,
+            FailEvent::UnknownChildOpcode {
+                opcode: CHILD_OP_FLUSH_CHANNEL_EVENT,
+                ..
+            }
+        )),
         "a real Apple command must not be reported as an unknown opcode"
     );
 

@@ -7,21 +7,16 @@ pub const U32_SIZE: usize = 4;
 pub const U64_SIZE: usize = 8;
 pub const OPCODE_OFFSET: usize = 0;
 pub const LENGTH_OFFSET: usize = 4;
-/// Bytes before a record's payload, from [`reims_vgpu_wire::OP_HEADER_LEN`].
-///
-/// One fact that used to be declared six times — here, in `render`, `compute`,
-/// `blit` and twice in `stream` — all agreeing, with nothing comparing them.
-/// Re-exporting makes drift impossible rather than merely detectable, which is
-/// the move `contract::gva` already made for the page-table format.
-pub use reims_vgpu_wire::OP_HEADER_LEN as HEADER_LEN;
+/// Shared serializer op-header length from `reims-vgpu-wire`.
+use reims_vgpu_wire::OP_HEADER_LEN;
 
 pub const VALUE_REF: usize = 0;
 pub const VALUE_VALUE: usize = 4;
 pub const TIMEOUT: usize = 12;
 pub const SIGNAL_WAIT_PAYLOAD_LEN: usize = VALUE_VALUE + U64_SIZE;
 pub const WAIT_TIMEOUT_PAYLOAD_LEN: usize = TIMEOUT + U32_SIZE;
-pub const SIGNAL_WAIT_LEN: usize = HEADER_LEN + SIGNAL_WAIT_PAYLOAD_LEN;
-pub const WAIT_TIMEOUT_LEN: usize = HEADER_LEN + WAIT_TIMEOUT_PAYLOAD_LEN;
+pub const SIGNAL_WAIT_LEN: usize = OP_HEADER_LEN + SIGNAL_WAIT_PAYLOAD_LEN;
+pub const WAIT_TIMEOUT_LEN: usize = OP_HEADER_LEN + WAIT_TIMEOUT_PAYLOAD_LEN;
 
 pub const OP_WAIT_EVENT: u32 = 0x190;
 pub const OP_SIGNAL_EVENT: u32 = 0x191;
@@ -108,15 +103,15 @@ pub fn opcode_rejected_by_deserializer(opcode: u32) -> bool {
 
 /// Decode one event command. Transactional: returns Ok only with a full snapshot.
 pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
-    if command.len() < HEADER_LEN {
+    if command.len() < OP_HEADER_LEN {
         return Err(DecodeStatus::ErrShort);
     }
     let opcode = ld32(&command[OPCODE_OFFSET..]);
     let command_length = ld32(&command[LENGTH_OFFSET..]) as usize;
-    if command_length < HEADER_LEN || command_length > command.len() {
+    if command_length < OP_HEADER_LEN || command_length > command.len() {
         return Err(DecodeStatus::ErrShort);
     }
-    let payload = &command[HEADER_LEN..command_length];
+    let payload = &command[OP_HEADER_LEN..command_length];
     let mut decoded = Command {
         opcode,
         command_length: command_length as u32,
@@ -125,8 +120,8 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
         value: 0,
         has_timeout: false,
         timeout: 0,
-        raw_payload_offset: HEADER_LEN,
-        raw_payload_length: command_length - HEADER_LEN,
+        raw_payload_offset: OP_HEADER_LEN,
+        raw_payload_length: command_length - OP_HEADER_LEN,
     };
 
     match opcode {
@@ -197,11 +192,11 @@ mod tests {
     use crate::contract::endian::{st32, st64};
 
     fn build(opcode: u32, payload: &[u8]) -> Vec<u8> {
-        let len = (HEADER_LEN + payload.len()) as u32;
-        let mut v = vec![0u8; HEADER_LEN + payload.len()];
+        let len = (OP_HEADER_LEN + payload.len()) as u32;
+        let mut v = vec![0u8; OP_HEADER_LEN + payload.len()];
         st32(&mut v[0..4], opcode);
         st32(&mut v[4..8], len);
-        v[HEADER_LEN..].copy_from_slice(payload);
+        v[OP_HEADER_LEN..].copy_from_slice(payload);
         v
     }
 

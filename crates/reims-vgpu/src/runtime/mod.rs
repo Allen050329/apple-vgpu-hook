@@ -96,11 +96,11 @@ pub use drain::{
     drain_child_fifo, drain_main_fifo, drain_other_child_fifos, drain_pending, signal_display_vbl,
     write_stamp, Packet, PacketError,
 };
-pub use host::{read_u32, HostAction, HostActionKind, HostMemory, HostOps, MemError};
 /// The unit-test host double, gated with its definition. An ungated re-export
 /// would keep it reachable and so keep it in the staticlib.
 #[cfg(test)]
 pub use host::FakeHost;
+pub use host::{read_u32, HostAction, HostActionKind, HostMemory, HostOps, MemError};
 
 #[cfg(test)]
 mod arch_path_gate {

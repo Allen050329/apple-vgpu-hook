@@ -764,8 +764,8 @@ pub fn build_table_plan(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{PAGE_SHIFT_ARM64E, PAGE_SIZE_ARM64E};
     use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::model::{PAGE_SHIFT_ARM64E, PAGE_SIZE_ARM64E};
     use crate::observe::Refusal;
 
     use std::collections::HashMap;

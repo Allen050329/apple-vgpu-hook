@@ -60,7 +60,6 @@ pub fn pfn_to_gpa(pfn: u32, page_shift: u32) -> u64 {
     (pfn as u64) << page_shift
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

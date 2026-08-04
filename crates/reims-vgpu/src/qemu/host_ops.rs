@@ -729,7 +729,6 @@ mod tests {
         0
     }
 
-
     #[test]
     fn enqueue_routes_prompt_kinds_to_prompt_queue() {
         let ops = ReimsVgpuHostOps::null();

@@ -3452,7 +3452,11 @@ mod tests {
                     );
                 }
                 Coverage::Excluded { reason } => {
-                    assert!(!reason.is_empty(), "{} excluded without a reason", e.selector);
+                    assert!(
+                        !reason.is_empty(),
+                        "{} excluded without a reason",
+                        e.selector
+                    );
                     assert!(
                         e.opcodes.is_empty(),
                         "-[{} {}] is excluded as emitting nothing, yet records opcodes {:?}",

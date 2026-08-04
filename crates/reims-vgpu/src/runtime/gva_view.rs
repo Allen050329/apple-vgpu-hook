@@ -1172,7 +1172,8 @@ mod tests {
         assert!(state.define_task(1, page, 2));
 
         let gva = 0x100u64;
-        write_span_within(&mut state, &mut host, 1, gva, &[0x7Eu8; 64], None).expect("the walk resolves");
+        write_span_within(&mut state, &mut host, 1, gva, &[0x7Eu8; 64], None)
+            .expect("the walk resolves");
 
         assert!(
             footprint::wrote_gpa(data0),
@@ -1517,7 +1518,8 @@ mod tests {
 
         // The packed case still goes to the host and still resolves.
         let before = host.map_pages_calls;
-        let s = map_fresh_span_within(&mut state, &mut host, 1, 8, 4, None).expect("packed span maps");
+        let s =
+            map_fresh_span_within(&mut state, &mut host, 1, 8, 4, None).expect("packed span maps");
         assert!(s.avail >= 4);
         unmap_fresh_span(&mut host, s);
         assert_eq!(host.map_pages_calls, before + 1);

@@ -193,6 +193,7 @@ pub fn execute_event(state: &mut DeviceState, task_id: u32, cmd: &EventCommand) 
 
 #[cfg(test)]
 mod tests {
+    use reims_vgpu_wire::OP_HEADER_LEN;
 
     use super::*;
     use crate::contract::endian::{st32, st64};
@@ -201,8 +202,8 @@ mod tests {
         PAGE_SHIFT_ARM64E,
     };
     use crate::runtime::decode::event::{
-        HEADER_LEN, OP_SIGNAL_EVENT, OP_WAIT_EVENT, OP_WAIT_EVENT_TIMEOUT, SIGNAL_WAIT_PAYLOAD_LEN,
-        TIMEOUT, WAIT_TIMEOUT_PAYLOAD_LEN,
+        OP_SIGNAL_EVENT, OP_WAIT_EVENT, OP_WAIT_EVENT_TIMEOUT, SIGNAL_WAIT_PAYLOAD_LEN, TIMEOUT,
+        WAIT_TIMEOUT_PAYLOAD_LEN,
     };
 
     fn event_cmd(opcode: u32, event_ref: u32, value: u64, timeout: Option<u32>) -> EventCommand {
@@ -216,10 +217,10 @@ mod tests {
         if let Some(t) = timeout {
             st32(&mut payload[TIMEOUT..TIMEOUT + 4], t);
         }
-        let mut bytes = vec![0u8; HEADER_LEN + payload.len()];
+        let mut bytes = vec![0u8; OP_HEADER_LEN + payload.len()];
         st32(&mut bytes[0..4], opcode);
-        st32(&mut bytes[4..8], (HEADER_LEN + payload.len()) as u32);
-        bytes[HEADER_LEN..].copy_from_slice(&payload);
+        st32(&mut bytes[4..8], (OP_HEADER_LEN + payload.len()) as u32);
+        bytes[OP_HEADER_LEN..].copy_from_slice(&payload);
         crate::runtime::decode::event::decode(&bytes).expect("build event cmd")
     }
 

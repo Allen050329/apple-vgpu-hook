@@ -9,7 +9,7 @@ use crate::contract::pixel_format::{f64_to_unorm8, MTL_FORMAT_BGRA8_UNORM, RGBA8
 use crate::model::DeviceState;
 use crate::runtime::blit_exec::{self, BlitStatus};
 use crate::runtime::compute_exec::{self, ComputeStatus};
-use crate::runtime::decode::blit::{self, Kind as BlitKind, OP_GENERATE_MIPMAPS};
+use crate::runtime::decode::blit::{self, Kind as BlitKind};
 use crate::runtime::decode::compute::{self, Kind as ComputeKind};
 use crate::runtime::decode::event as event_decode;
 use crate::runtime::decode::fifo::{decode_exec_resource_table, ExecResourceDesc};
@@ -22,7 +22,6 @@ use crate::runtime::decode::fifo::{
 use crate::runtime::decode::render::{
     self, decode_color_attachment, decode_depth_attachment, decode_stencil_attachment,
     ColorAttachment, DepthAttachment, Kind as RenderKind, Stage, StencilAttachment,
-    OP_UPDATE_FENCE as RENDER_OP_UPDATE_FENCE, OP_WAIT_FENCE as RENDER_OP_WAIT_FENCE,
     PASS_LOAD_ACTION_CLEAR, PASS_LOAD_ACTION_LOAD, PASS_MAX_COLOR_ATTACHMENTS,
     PASS_STORE_ACTION_STORE,
 };
@@ -41,6 +40,10 @@ use crate::runtime::mipmap::{self, MipmapStatus};
 use crate::runtime::objects;
 use crate::runtime::plan::event_sync::{Domain as FenceDomain, FenceAction};
 use crate::runtime::task_slot::{resolve_task_word, TaskWordSite};
+use reims_vgpu_wire::ops::blit as wire_blit;
+use reims_vgpu_wire::ops::render as wire_render;
+use reims_vgpu_wire::ops::render_pass as wire_pass;
+use reims_vgpu_wire::ops::tile as wire_tile;
 use std::sync::Arc;
 
 /// Max descriptors per ExecIndirect2 (wire table size), not a byte budget.
@@ -1074,8 +1077,8 @@ struct IcbRecordDropped(u32);
 impl crate::observe::Decline for IcbRecordDropped {
     fn slug(&self) -> &'static str {
         match self.0 {
-            blit::OP_RESET_ICB => "blit_icb_reset_dropped",
-            blit::OP_COPY_ICB => "blit_icb_copy_dropped",
+            wire_blit::OPCODE_RESET_ICB => "blit_icb_reset_dropped",
+            wire_blit::OPCODE_COPY_ICB => "blit_icb_copy_dropped",
             // `0x138` cannot arrive: the optimize hint is answered by the no-op
             // arm before this one. So this names a record that reached an ICB
             // kind without being one of the three, which would be a decoder bug
@@ -1140,7 +1143,7 @@ fn handle_blit_record<M: HostMemory + HostOps>(
         }
     };
     match cmd.kind {
-        BlitKind::Resource if cmd.opcode == OP_GENERATE_MIPMAPS => {
+        BlitKind::Resource if cmd.opcode == wire_blit::OPCODE_GENERATE_MIPMAPS => {
             match mipmap::generate_mipmaps_linear(state, host, task_id, cmd.resource) {
                 MipmapStatus::Ok => {}
                 st => {
@@ -1172,7 +1175,7 @@ fn handle_blit_record<M: HostMemory + HostOps>(
         // host ICBs on the Metal arm only, and it reads 0.00% on a driven x86
         // boot — so the count is what says whether an executor is worth building,
         // and for which of the two.
-        BlitKind::IcbRange if cmd.opcode == blit::OP_OPTIMIZE_ICB => {
+        BlitKind::IcbRange if cmd.opcode == wire_blit::OPCODE_OPTIMIZE_ICB => {
             crate::runtime::drain::note_store_route("blit_noop_icb_optimize");
         }
         BlitKind::IcbRange | BlitKind::IcbCopy => {
@@ -1647,7 +1650,7 @@ fn handle_render_record<M: HostMemory + HostOps>(
             }
         }
         RenderKind::Draw => {
-            if cmd.opcode == render::OP_DRAW_INDEXED_WIDE {
+            if cmd.opcode == wire_render::OPCODE_DRAW_INDEXED_WIDE {
                 crate::observe::line(format!(
                     "render_wide_indexed task={task_id} target_refs={:?} pipeline={} prim={} index_type={} index_ref={} count={} offset={:#x}",
                     acc.color_targets,
@@ -1724,8 +1727,8 @@ fn handle_render_record<M: HostMemory + HostOps>(
         }
         RenderKind::Fence => {
             let action = match cmd.opcode {
-                RENDER_OP_UPDATE_FENCE => FenceAction::Update,
-                RENDER_OP_WAIT_FENCE => FenceAction::Wait,
+                wire_blit::OPCODE_UPDATE_FENCE => FenceAction::Update,
+                wire_blit::OPCODE_WAIT_FOR_FENCE => FenceAction::Wait,
                 opcode => {
                     // A render fence record whose opcode is neither update nor
                     // wait drops the guest's encoder synchronisation. The
@@ -1790,7 +1793,7 @@ fn handle_render_record<M: HostMemory + HostOps>(
             // `MTLTriangleFillModeFill` and `MTLDepthClipModeClip` are both 0.
             if cmd.mode != 0 {
                 crate::runtime::drain::note_store_route(match cmd.opcode {
-                    render::OP_SET_TRIANGLE_FILL_MODE => "render_fill_mode_dropped",
+                    wire_render::OPCODE_SET_TRIANGLE_FILL_MODE => "render_fill_mode_dropped",
                     _ => "render_depth_clip_mode_dropped",
                 });
             }
@@ -1801,7 +1804,7 @@ fn handle_render_record<M: HostMemory + HostOps>(
             // it wrote *the* literal, not whether it is close to it.
             if cmd.float_value != 1.0 {
                 crate::runtime::drain::note_store_route(match cmd.opcode {
-                    render::OP_SET_LINE_WIDTH => "render_line_width_dropped",
+                    wire_render::OPCODE_SET_LINE_WIDTH => "render_line_width_dropped",
                     _ => "render_tessellation_scale_dropped",
                 });
             }
@@ -1823,7 +1826,7 @@ fn handle_render_record<M: HostMemory + HostOps>(
             // default is asking for what this rail already does, so only the
             // rest is a loss.
             let asked_for_more = match cmd.opcode {
-                render::OP_SET_VERTEX_AMPLIFICATION_COUNT => cmd.count > 1,
+                wire_render::OPCODE_SET_VERTEX_AMPLIFICATION_COUNT => cmd.count > 1,
                 _ => cmd.mode != 0 || cmd.amplification_value != 0,
             };
             if asked_for_more {
@@ -1850,7 +1853,7 @@ fn handle_render_record<M: HostMemory + HostOps>(
             // compute pass, and this rail replays counts it has read. The count
             // is what decides whether resolving that buffer is worth building.
             crate::runtime::drain::note_store_route(match cmd.opcode {
-                render::OP_DRAW_INDEXED_INDIRECT => "render_draw_indexed_indirect_dropped",
+                wire_render::OPCODE_DRAW_INDEXED_INDIRECT => "render_draw_indexed_indirect_dropped",
                 _ => "render_draw_indirect_dropped",
             });
             note_unimplemented_render_opcode(cmd.opcode, cmd_bytes, task_id, acc);
@@ -1881,14 +1884,14 @@ fn handle_render_record<M: HostMemory + HostOps>(
             // an implementation is costed — a tile buffer bind is imageblock
             // storage, a tile texture bind is a sampled attachment.
             crate::runtime::drain::note_store_route(match cmd.opcode {
-                render::OP_SET_TILE_BUFFER | render::OP_SET_TILE_BUFFER_OFFSET => {
+                wire_tile::OPCODE_SET_TILE_BUFFER | wire_tile::OPCODE_SET_TILE_BUFFER_OFFSET => {
                     "render_tile_buffer_bind_dropped"
                 }
-                render::OP_SET_TILE_TEXTURE => "render_tile_texture_bind_dropped",
+                wire_tile::OPCODE_SET_TILE_TEXTURE => "render_tile_texture_bind_dropped",
                 // Imageblock memory, not an argument-table slot: this one is
                 // the tile shader's scratch storage, so it is priced on its own
                 // rather than with the buffer binds it sits next to.
-                render::OP_SET_TILE_THREADGROUP_MEMORY => {
+                wire_tile::OPCODE_SET_TILE_THREADGROUP_MEMORY => {
                     "render_tile_threadgroup_memory_dropped"
                 }
                 _ => "render_tile_sampler_bind_dropped",
@@ -1929,8 +1932,8 @@ fn handle_render_record<M: HostMemory + HostOps>(
             // wire, while the indirect pair reads them from a buffer the GPU
             // may not have written yet.
             crate::runtime::drain::note_store_route(match cmd.opcode {
-                render::OP_DRAW_PATCHES_INDIRECT
-                | render::OP_DRAW_INDEXED_PATCHES_INDIRECT => {
+                wire_render::OPCODE_DRAW_PATCHES_INDIRECT
+                | wire_render::OPCODE_DRAW_INDEXED_PATCHES_INDIRECT => {
                     "render_draw_patches_indirect_dropped"
                 }
                 _ => "render_draw_patches_dropped",
@@ -1958,13 +1961,13 @@ fn handle_render_record<M: HostMemory + HostOps>(
             // changes how many there are; the three tile ones are tile-shader
             // pass geometry this device has no executor for at all.
             crate::runtime::drain::note_store_route(match cmd.opcode {
-                render::OP_PASS_RATE_MAP => "render_pass_rate_map_dropped",
-                render::OP_PASS_SAMPLE_POSITIONS => "render_pass_sample_positions_dropped",
-                render::OP_PASS_DEFAULT_RASTER_SAMPLE_COUNT => {
+                wire_pass::OPCODE_RASTERIZATION_RATE_MAP => "render_pass_rate_map_dropped",
+                wire_pass::OPCODE_SAMPLE_POSITIONS => "render_pass_sample_positions_dropped",
+                wire_pass::OPCODE_DEFAULT_RASTER_SAMPLE_COUNT => {
                     "render_pass_raster_sample_count_dropped"
                 }
-                render::OP_PASS_IMAGEBLOCK_SAMPLE_LENGTH => "render_pass_imageblock_dropped",
-                render::OP_PASS_THREADGROUP_MEMORY_LENGTH => {
+                wire_pass::OPCODE_IMAGEBLOCK_SAMPLE_LENGTH => "render_pass_imageblock_dropped",
+                wire_pass::OPCODE_THREADGROUP_MEMORY_LENGTH => {
                     "render_pass_threadgroup_memory_dropped"
                 }
                 _ => "render_pass_tile_size_dropped",
@@ -2325,12 +2328,13 @@ fn apply_binds<T: Copy, B: Clone>(
 /// record cannot say which class it came from and the opcode is the only thing
 /// that can.
 fn is_indexed_draw_opcode(opcode: u32) -> bool {
-    use crate::runtime::decode::render::{
-        OP_DRAW_INDEXED, OP_DRAW_INDEXED_INST, OP_DRAW_INDEXED_WIDE,
-    };
+    // wire opcodes via wire_render import
+
     matches!(
         opcode,
-        OP_DRAW_INDEXED | OP_DRAW_INDEXED_INST | OP_DRAW_INDEXED_WIDE
+        wire_render::OPCODE_DRAW_INDEXED
+            | wire_render::OPCODE_DRAW_INDEXED_INSTANCED
+            | wire_render::OPCODE_DRAW_INDEXED_WIDE
     )
 }
 
@@ -3337,14 +3341,17 @@ fn apply_clear<M: HostMemory + HostOps>(
 
 #[cfg(test)]
 mod tests {
+    use reims_vgpu_wire::ops::compute as wire_compute;
+
+    use reims_vgpu_wire::OP_HEADER_LEN;
 
     use super::*;
     use crate::contract::endian::{st16, st32, st64};
     use crate::model::{DeviceId, PAGE_SHIFT_ARM64E, PAGE_SHIFT_X86};
     use crate::runtime::decode::render::{
-        HEADER_LEN, OP_RENDER_PASS, PASS_ATTACH_CLEAR_COLOR, PASS_ATTACH_LOAD_ACTION,
-        PASS_ATTACH_STORE_ACTION, PASS_ATTACH_TEXREF, PASS_COLOR_ATTACH_OFF,
-        PASS_COLOR_ATTACH_STRIDE, PASS_LOAD_ACTION_CLEAR, PASS_STORE_ACTION_STORE,
+        PASS_ATTACH_CLEAR_COLOR, PASS_ATTACH_LOAD_ACTION, PASS_ATTACH_STORE_ACTION,
+        PASS_ATTACH_TEXREF, PASS_COLOR_ATTACH_OFF, PASS_COLOR_ATTACH_STRIDE,
+        PASS_LOAD_ACTION_CLEAR, PASS_STORE_ACTION_STORE,
     };
     use crate::runtime::host::FakeHost;
 
@@ -3823,13 +3830,13 @@ mod tests {
     #[cfg(feature = "backend-vulkan")]
     #[test]
     fn render_preflight_collects_content_pipelines_without_duplicates() {
-        use crate::runtime::decode::render::OP_SET_PIPELINE;
         use crate::runtime::decode::stream::{SEGMENT_HEADER_LEN, SEGMENT_TYPE_RENDER};
+        use wire_render::OPCODE_SET_RENDER_PIPELINE_STATE;
 
         let mut records = Vec::new();
         for pipeline in [41u32, 77, 41] {
             let mut cmd = [0u8; 12];
-            st32(&mut cmd[0..4], OP_SET_PIPELINE);
+            st32(&mut cmd[0..4], wire_compute::OPCODE_SET_PIPELINE_STATE);
             st32(&mut cmd[4..8], 12);
             st32(&mut cmd[8..12], pipeline);
             records.extend_from_slice(&cmd);
@@ -3846,21 +3853,18 @@ mod tests {
     #[cfg(feature = "backend-vulkan")]
     #[test]
     fn compute_preflight_collects_pipeline_and_local_size_without_duplicates() {
-        use crate::runtime::decode::compute::{
-            OP_DISPATCH_THREADGROUPS, OP_DISPATCH_THREADS, OP_SET_PIPELINE,
-        };
         use crate::runtime::decode::stream::{SEGMENT_HEADER_LEN, SEGMENT_TYPE_COMPUTE};
 
         let mut records = Vec::new();
         let mut pipeline = [0u8; 12];
-        st32(&mut pipeline[0..4], OP_SET_PIPELINE);
+        st32(&mut pipeline[0..4], wire_compute::OPCODE_SET_PIPELINE_STATE);
         st32(&mut pipeline[4..8], 12);
         st32(&mut pipeline[8..12], 20);
         records.extend_from_slice(&pipeline);
         for opcode in [
-            OP_DISPATCH_THREADGROUPS,
-            OP_DISPATCH_THREADGROUPS,
-            OP_DISPATCH_THREADS,
+            wire_compute::OPCODE_DISPATCH_THREADGROUPS,
+            wire_compute::OPCODE_DISPATCH_THREADGROUPS,
+            wire_compute::OPCODE_DISPATCH_THREADS,
         ] {
             let mut dispatch = [0u8; 56];
             st32(&mut dispatch[0..4], opcode);
@@ -3885,9 +3889,7 @@ mod tests {
     #[test]
     fn event_segment_signal_wait_in_stream() {
         use crate::model::FENCE_DOMAIN_EVENT;
-        use crate::runtime::decode::event::{
-            OP_SIGNAL_EVENT, OP_WAIT_EVENT, SIGNAL_WAIT_PAYLOAD_LEN,
-        };
+        use crate::runtime::decode::event::SIGNAL_WAIT_PAYLOAD_LEN;
         use crate::runtime::decode::stream::{SEGMENT_HEADER_LEN, SEGMENT_TYPE_EVENT};
 
         fn push_segment(buf: &mut Vec<u8>, type_: u8, payload: &[u8]) {
@@ -3902,7 +3904,7 @@ mod tests {
             let mut payload = [0u8; SIGNAL_WAIT_PAYLOAD_LEN];
             st32(&mut payload[0..4], event_ref);
             st64(&mut payload[4..12], value);
-            let len = (HEADER_LEN + SIGNAL_WAIT_PAYLOAD_LEN) as u32;
+            let len = (OP_HEADER_LEN + SIGNAL_WAIT_PAYLOAD_LEN) as u32;
             let mut hdr = [0u8; 8];
             st32(&mut hdr[0..4], opcode);
             st32(&mut hdr[4..8], len);
@@ -3911,9 +3913,9 @@ mod tests {
         }
 
         let mut records = Vec::new();
-        push_event_record(&mut records, OP_SIGNAL_EVENT, 11, 7);
-        push_event_record(&mut records, OP_WAIT_EVENT, 11, 7);
-        push_event_record(&mut records, OP_WAIT_EVENT, 11, 8); // pending
+        push_event_record(&mut records, event_decode::OP_SIGNAL_EVENT, 11, 7);
+        push_event_record(&mut records, event_decode::OP_WAIT_EVENT, 11, 7);
+        push_event_record(&mut records, event_decode::OP_WAIT_EVENT, 11, 8); // pending
         let mut stream = Vec::new();
         push_segment(&mut stream, SEGMENT_TYPE_EVENT, &records);
 
@@ -3964,10 +3966,10 @@ mod tests {
         let a1 = decode_color_attachment(&payload, 1);
         assert_eq!(a0.texture_ref, 41);
         assert_eq!(a1.texture_ref, 42);
-        let mut cmd = vec![0u8; HEADER_LEN + payload.len()];
-        st32(&mut cmd[0..], OP_RENDER_PASS);
-        st32(&mut cmd[4..], (HEADER_LEN + payload.len()) as u32);
-        cmd[HEADER_LEN..].copy_from_slice(&payload);
+        let mut cmd = vec![0u8; OP_HEADER_LEN + payload.len()];
+        st32(&mut cmd[0..], wire_pass::OPCODE_RENDER_PASS);
+        st32(&mut cmd[4..], (OP_HEADER_LEN + payload.len()) as u32);
+        cmd[OP_HEADER_LEN..].copy_from_slice(&payload);
         let c = render::decode(&cmd).unwrap();
         assert_eq!(c.kind, RenderKind::RenderPass);
         assert_eq!(c.color0.texture_ref, 41);
@@ -3986,16 +3988,16 @@ mod tests {
     /// that works.
     #[test]
     fn an_indexed_draw_with_no_index_buffer_is_named() {
-        use crate::runtime::decode::render::OP_DRAW_INDEXED;
+        use wire_render::OPCODE_DRAW_INDEXED;
         // ARM compact indexed payload: prim@0, indexBufferRef@4, count@8:u16,
         // offset@0xa:u16 — total record 0x14.
         let record = |index_buffer_ref: u32| {
             let mut cmd = vec![0u8; 0x14];
-            st32(&mut cmd[0..], OP_DRAW_INDEXED);
+            st32(&mut cmd[0..], wire_render::OPCODE_DRAW_INDEXED);
             st32(&mut cmd[4..], 0x14);
-            st32(&mut cmd[HEADER_LEN..], 3); // primitiveType
-            st32(&mut cmd[HEADER_LEN + 4..], index_buffer_ref);
-            cmd[HEADER_LEN + 8..HEADER_LEN + 10].copy_from_slice(&6u16.to_le_bytes());
+            st32(&mut cmd[OP_HEADER_LEN..], 3); // primitiveType
+            st32(&mut cmd[OP_HEADER_LEN + 4..], index_buffer_ref);
+            cmd[OP_HEADER_LEN + 8..OP_HEADER_LEN + 10].copy_from_slice(&6u16.to_le_bytes());
             cmd
         };
         let run = |cmd: &[u8]| {
@@ -4010,7 +4012,7 @@ mod tests {
                 &mut state,
                 &host,
                 1,
-                OP_DRAW_INDEXED,
+                wire_render::OPCODE_DRAW_INDEXED,
                 cmd,
                 &mut out,
                 &mut acc,
@@ -4036,7 +4038,7 @@ mod tests {
             "an indexed draw reinterpreted as non-indexed must say so"
         );
         assert!(
-            log.contains(&format!("op={OP_DRAW_INDEXED:#x}")),
+            log.contains(&format!("op={:#x}", wire_render::OPCODE_DRAW_INDEXED)),
             "the line must name which indexed form fired, since each reads the \
              ref at a different offset"
         );
@@ -4056,9 +4058,8 @@ mod tests {
     #[test]
     fn an_unsupported_depth_attachment_is_named_not_just_dropped() {
         use crate::runtime::decode::render::{
-            HEADER_LEN, OP_RENDER_PASS, PASS_ATTACH_DEPTH_PLANE, PASS_ATTACH_LEVEL,
-            PASS_ATTACH_RESOLVEREF, PASS_ATTACH_SLICE, PASS_ATTACH_TEXREF, PASS_DEPTH_ATTACH_OFF,
-            PASS_STENCIL_ATTACH_OFF,
+            PASS_ATTACH_DEPTH_PLANE, PASS_ATTACH_LEVEL, PASS_ATTACH_RESOLVEREF, PASS_ATTACH_SLICE,
+            PASS_ATTACH_TEXREF, PASS_DEPTH_ATTACH_OFF, PASS_STENCIL_ATTACH_OFF,
         };
         let pass = |level: u16, resolve: u32| {
             let mut payload = vec![0u8; 0x200];
@@ -4079,10 +4080,10 @@ mod tests {
                 &mut payload[PASS_STENCIL_ATTACH_OFF + PASS_ATTACH_TEXREF..],
                 88,
             );
-            let mut cmd = vec![0u8; HEADER_LEN + payload.len()];
-            st32(&mut cmd[0..], OP_RENDER_PASS);
-            st32(&mut cmd[4..], (HEADER_LEN + payload.len()) as u32);
-            cmd[HEADER_LEN..].copy_from_slice(&payload);
+            let mut cmd = vec![0u8; OP_HEADER_LEN + payload.len()];
+            st32(&mut cmd[0..], wire_pass::OPCODE_RENDER_PASS);
+            st32(&mut cmd[4..], (OP_HEADER_LEN + payload.len()) as u32);
+            cmd[OP_HEADER_LEN..].copy_from_slice(&payload);
             cmd
         };
         let run = |cmd: &[u8]| {
@@ -4090,7 +4091,15 @@ mod tests {
             let host = FakeHost::new();
             let mut out = ExecResult::default();
             let mut acc = StreamAccum::default();
-            handle_render_record(&mut state, &host, 1, OP_RENDER_PASS, cmd, &mut out, &mut acc);
+            handle_render_record(
+                &mut state,
+                &host,
+                1,
+                wire_pass::OPCODE_RENDER_PASS,
+                cmd,
+                &mut out,
+                &mut acc,
+            );
             acc
         };
 
@@ -4122,7 +4131,7 @@ mod tests {
             ("plane", PASS_ATTACH_DEPTH_PLANE),
         ] {
             let mut cmd = pass(0, 0);
-            let slot = HEADER_LEN + PASS_DEPTH_ATTACH_OFF + at;
+            let slot = OP_HEADER_LEN + PASS_DEPTH_ATTACH_OFF + at;
             cmd[slot..slot + 2].copy_from_slice(&5u16.to_le_bytes());
             let acc = run(&cmd);
             assert!(
@@ -4161,16 +4170,16 @@ mod tests {
     fn a_colour_attachment_naming_a_subresource_this_device_cannot_bind_says_so() {
         use crate::contract::endian::st32;
         use crate::runtime::decode::render::{
-            HEADER_LEN, OP_RENDER_PASS, PASS_ATTACH_DEPTH_PLANE, PASS_ATTACH_LEVEL,
-            PASS_ATTACH_SLICE, PASS_ATTACH_TEXREF, PASS_COLOR_ATTACH_OFF, PASS_MIN_PAYLOAD,
+            PASS_ATTACH_DEPTH_PLANE, PASS_ATTACH_LEVEL, PASS_ATTACH_SLICE, PASS_ATTACH_TEXREF,
+            PASS_COLOR_ATTACH_OFF, PASS_MIN_PAYLOAD,
         };
 
         let pass = |level: u16, slice: u16, plane: u16| {
-            let total = HEADER_LEN + PASS_MIN_PAYLOAD;
+            let total = OP_HEADER_LEN + PASS_MIN_PAYLOAD;
             let mut cmd = vec![0u8; total];
-            st32(&mut cmd[0..], OP_RENDER_PASS);
+            st32(&mut cmd[0..], wire_pass::OPCODE_RENDER_PASS);
             st32(&mut cmd[4..], total as u32);
-            let slot = HEADER_LEN + PASS_COLOR_ATTACH_OFF;
+            let slot = OP_HEADER_LEN + PASS_COLOR_ATTACH_OFF;
             st32(&mut cmd[slot + PASS_ATTACH_TEXREF..], 77);
             cmd[slot + PASS_ATTACH_LEVEL..slot + PASS_ATTACH_LEVEL + 2]
                 .copy_from_slice(&level.to_le_bytes());
@@ -4189,7 +4198,7 @@ mod tests {
                 &mut state,
                 &host,
                 1,
-                OP_RENDER_PASS,
+                wire_pass::OPCODE_RENDER_PASS,
                 cmd,
                 &mut out,
                 &mut acc,
@@ -4305,9 +4314,8 @@ mod tests {
 
     #[test]
     fn stream_accum_upserts_buffer_and_viewport() {
-        use crate::runtime::decode::render::{
-            OP_SET_FRAGMENT_BUFFER, OP_SET_VERTEX_BUFFER, OP_SET_VIEWPORT,
-        };
+        // wire opcodes via wire_render import
+
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         let host = FakeHost::new();
         let mut out = ExecResult::default();
@@ -4315,9 +4323,9 @@ mod tests {
 
         // setVertexBuffer multi-entry: first=2 count=1 ref=9 offset=16
         // payload = first:u32 + count:u32 + {ref:u32, offset:u64}
-        let mut vb = vec![0u8; HEADER_LEN + 8 + 12];
+        let mut vb = vec![0u8; OP_HEADER_LEN + 8 + 12];
         let vb_len = vb.len() as u32;
-        st32(&mut vb[0..], OP_SET_VERTEX_BUFFER);
+        st32(&mut vb[0..], wire_render::OPCODE_SET_VERTEX_BUFFER);
         st32(&mut vb[4..], vb_len);
         st32(&mut vb[8..], 2); // first
         st32(&mut vb[12..], 1); // count
@@ -4327,7 +4335,7 @@ mod tests {
             &mut state,
             &host,
             0,
-            OP_SET_VERTEX_BUFFER,
+            wire_render::OPCODE_SET_VERTEX_BUFFER,
             &vb,
             &mut out,
             &mut acc,
@@ -4343,7 +4351,7 @@ mod tests {
             &mut state,
             &host,
             0,
-            OP_SET_VERTEX_BUFFER,
+            wire_render::OPCODE_SET_VERTEX_BUFFER,
             &vb,
             &mut out,
             &mut acc,
@@ -4352,9 +4360,9 @@ mod tests {
         assert_eq!(acc.vertex_buffers[0].buffer_ref, 10);
 
         // fragment buffer multi-entry: first=0 count=1 ref=7 offset=0
-        let mut fb = vec![0u8; HEADER_LEN + 8 + 12];
+        let mut fb = vec![0u8; OP_HEADER_LEN + 8 + 12];
         let fb_len = fb.len() as u32;
-        st32(&mut fb[0..], OP_SET_FRAGMENT_BUFFER);
+        st32(&mut fb[0..], wire_render::OPCODE_SET_FRAGMENT_BUFFER);
         st32(&mut fb[4..], fb_len);
         st32(&mut fb[8..], 0); // first
         st32(&mut fb[12..], 1); // count
@@ -4364,7 +4372,7 @@ mod tests {
             &mut state,
             &host,
             0,
-            OP_SET_FRAGMENT_BUFFER,
+            wire_render::OPCODE_SET_FRAGMENT_BUFFER,
             &fb,
             &mut out,
             &mut acc,
@@ -4372,18 +4380,18 @@ mod tests {
         assert_eq!(acc.fragment_buffers.len(), 1);
 
         // viewport
-        let mut vp = vec![0u8; HEADER_LEN + 48];
-        st32(&mut vp[0..], OP_SET_VIEWPORT);
-        st32(&mut vp[4..], (HEADER_LEN + 48) as u32);
+        let mut vp = vec![0u8; OP_HEADER_LEN + 48];
+        st32(&mut vp[0..], wire_render::OPCODE_SET_VIEWPORT);
+        st32(&mut vp[4..], (OP_HEADER_LEN + 48) as u32);
         for i in 0..6 {
             let bits = (i as f64 + 1.0).to_bits();
-            st64(&mut vp[HEADER_LEN + i * 8..], bits);
+            st64(&mut vp[OP_HEADER_LEN + i * 8..], bits);
         }
         handle_render_record(
             &mut state,
             &host,
             0,
-            OP_SET_VIEWPORT,
+            wire_render::OPCODE_SET_VIEWPORT,
             &vp,
             &mut out,
             &mut acc,
@@ -4403,7 +4411,7 @@ mod tests {
             ..Default::default()
         };
         let mut command = vec![0u8; 0x20];
-        let op = render::OP_DRAW_INDEXED_WIDE;
+        let op = wire_render::OPCODE_DRAW_INDEXED_WIDE;
         st32(&mut command[0..], op);
         st32(&mut command[4..], 0x20);
         st16(&mut command[8..], 3);
@@ -4428,7 +4436,7 @@ mod tests {
                 instance_count: 1,
                 primitive_type: 3,
                 first_vertex: 0,
-                base_instance: 0,
+                base_instance: 0
             }
         );
     }
@@ -4453,7 +4461,7 @@ mod tests {
             pipeline_ref: 61,
             ..Default::default()
         };
-        let op = render::OP_DRAW_INDEXED_BASE;
+        let op = wire_render::OPCODE_DRAW_INDEXED_INSTANCED_BASE;
         let total = reims_vgpu_wire::ops::render::DRAW_INDEXED_INSTANCED_BASE_TOTAL_LEN;
         let mut command = vec![0u8; total as usize];
         st32(&mut command[0..], op);
@@ -4503,7 +4511,7 @@ mod tests {
             ..Default::default()
         };
         let mut command = vec![0u8; 0x20];
-        let op = render::OP_DRAW_INDEXED_WIDE;
+        let op = wire_render::OPCODE_DRAW_INDEXED_WIDE;
         st32(&mut command[0..], op);
         st32(&mut command[4..], 0x20);
         st16(&mut command[8..], 3);
@@ -4548,7 +4556,7 @@ mod tests {
             ..Default::default()
         };
         let mut command = vec![0u8; 0x20];
-        let op = render::OP_DRAW_INDEXED_WIDE;
+        let op = wire_render::OPCODE_DRAW_INDEXED_WIDE;
         st32(&mut command[0..], op);
         st32(&mut command[4..], 0x20);
         st16(&mut command[8..], 3);
@@ -4588,7 +4596,7 @@ mod tests {
             ..Default::default()
         };
         let mut command = vec![0u8; 0x20];
-        let op = render::OP_DRAW_INDEXED_WIDE;
+        let op = wire_render::OPCODE_DRAW_INDEXED_WIDE;
         st32(&mut command[0..], op);
         st32(&mut command[4..], 0x20);
         st16(&mut command[8..], 3);
@@ -4636,16 +4644,16 @@ mod tests {
             ..Default::default()
         };
         let task_id = 0xfeed;
-        let mut command = vec![0u8; HEADER_LEN];
+        let mut command = vec![0u8; OP_HEADER_LEN];
         // An opcode inside the encoder's range that no arm claims, found rather
-        // than named. It used to be `OP_ACCEPTED_LAST`, which stopped working
+        // than named. It used to be `wire_render::OPCODE_SET_VERTEX_BUFFER_OFFSET_STRIDE`, which stopped working
         // the moment that bound was corrected to `0xa6` -- because `0xa6` is a
         // record this rail now decodes. `0x99` was the replacement and lasted
         // one commit, until `setVertexAmplificationMode:value:` turned out to be
         // that number. The catch-all is what is under test, not any literal.
         let op = render::unclaimed_accepted_opcode();
         st32(&mut command[0..], op);
-        st32(&mut command[4..], HEADER_LEN as u32);
+        st32(&mut command[4..], OP_HEADER_LEN as u32);
         handle_render_record(&mut state, &host, task_id, op, &command, &mut out, &mut acc);
 
         let body = std::fs::read_to_string(crate::observe::fail_log_path())
@@ -4784,17 +4792,15 @@ mod tests {
 
     #[test]
     fn zero_ref_render_bind_unbinds_existing_slots() {
-        use crate::runtime::decode::render::{
-            OP_SET_FRAGMENT_SAMPLER, OP_SET_FRAGMENT_TEXTURE, OP_SET_VERTEX_BUFFER,
-        };
+        // wire opcodes via wire_render import
 
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         let host = FakeHost::new();
         let mut out = ExecResult::default();
         let mut acc = StreamAccum::default();
-        let mut buffer = vec![0u8; HEADER_LEN + 8 + 12];
-        st32(&mut buffer[0..], OP_SET_VERTEX_BUFFER);
-        st32(&mut buffer[4..], (HEADER_LEN + 8 + 12) as u32);
+        let mut buffer = vec![0u8; OP_HEADER_LEN + 8 + 12];
+        st32(&mut buffer[0..], wire_render::OPCODE_SET_VERTEX_BUFFER);
+        st32(&mut buffer[4..], (OP_HEADER_LEN + 8 + 12) as u32);
         st32(&mut buffer[8..], 0);
         st32(&mut buffer[12..], 1);
         st32(&mut buffer[16..], 41);
@@ -4802,7 +4808,7 @@ mod tests {
             &mut state,
             &host,
             0,
-            OP_SET_VERTEX_BUFFER,
+            wire_render::OPCODE_SET_VERTEX_BUFFER,
             &buffer,
             &mut out,
             &mut acc,
@@ -4812,7 +4818,7 @@ mod tests {
             &mut state,
             &host,
             0,
-            OP_SET_VERTEX_BUFFER,
+            wire_render::OPCODE_SET_VERTEX_BUFFER,
             &buffer,
             &mut out,
             &mut acc,
@@ -4820,12 +4826,12 @@ mod tests {
         assert!(acc.vertex_buffers.is_empty());
 
         for (opcode, bound) in [
-            (OP_SET_FRAGMENT_TEXTURE, 42u32),
-            (OP_SET_FRAGMENT_SAMPLER, 43u32),
+            (wire_render::OPCODE_SET_FRAGMENT_TEXTURE, 42u32),
+            (wire_render::OPCODE_SET_FRAGMENT_SAMPLER, 43u32),
         ] {
-            let mut command = vec![0u8; HEADER_LEN + 8 + 4];
+            let mut command = vec![0u8; OP_HEADER_LEN + 8 + 4];
             st32(&mut command[0..], opcode);
-            st32(&mut command[4..], (HEADER_LEN + 8 + 4) as u32);
+            st32(&mut command[4..], (OP_HEADER_LEN + 8 + 4) as u32);
             st32(&mut command[8..], 3);
             st32(&mut command[12..], 1);
             st32(&mut command[16..], bound);
@@ -5156,7 +5162,10 @@ mod tests {
             for di in 0..n {
                 let (wb, full) = multi_draw_store_plan(n, di);
                 let last = di + 1 == n;
-                assert_eq!(wb, last, "writeback is the last record only (n={n} di={di})");
+                assert_eq!(
+                    wb, last,
+                    "writeback is the last record only (n={n} di={di})"
+                );
                 assert_eq!(
                     full,
                     last && n > 1,
@@ -5300,14 +5309,15 @@ mod tests {
         let mut out = ExecResult::default();
         let mut acc = StreamAccum::default();
 
-        let op = render::OP_SET_SCISSOR_RECTS;
-        let total = render::HEADER_LEN + render::SCISSOR_RECTS_COUNT_LEN
+        let op = wire_render::OPCODE_SET_SCISSOR_RECTS;
+        let total = reims_vgpu_wire::OP_HEADER_LEN
+            + render::SCISSOR_RECTS_COUNT_LEN
             + 3 * render::SCISSOR_PAYLOAD_LEN;
         let mut command = vec![0u8; total];
         st32(&mut command[0..], op);
         st32(&mut command[4..], total as u32);
-        st64(&mut command[render::HEADER_LEN..], 3);
-        let e0 = render::HEADER_LEN + render::SCISSOR_RECTS_COUNT_LEN;
+        st64(&mut command[reims_vgpu_wire::OP_HEADER_LEN..], 3);
+        let e0 = reims_vgpu_wire::OP_HEADER_LEN + render::SCISSOR_RECTS_COUNT_LEN;
         for (i, val) in [11u64, 22, 33, 44].into_iter().enumerate() {
             st64(&mut command[e0 + i * 8..], val);
         }
@@ -5327,13 +5337,13 @@ mod tests {
 
         // One entry is the singular record and drops nothing.
         let before = store_route_count("render_extra_scissors_dropped");
-        let total = render::HEADER_LEN + render::SCISSOR_PAYLOAD_LEN;
+        let total = reims_vgpu_wire::OP_HEADER_LEN + render::SCISSOR_PAYLOAD_LEN;
         let mut command = vec![0u8; total];
-        let op = render::OP_SET_SCISSOR;
+        let op = wire_render::OPCODE_SET_SCISSOR;
         st32(&mut command[0..], op);
         st32(&mut command[4..], total as u32);
         for (i, val) in [1u64, 2, 3, 4].into_iter().enumerate() {
-            st64(&mut command[render::HEADER_LEN + i * 8..], val);
+            st64(&mut command[reims_vgpu_wire::OP_HEADER_LEN + i * 8..], val);
         }
         handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
         assert_eq!(acc.scissor, Some((1, 2, 3, 4)));
@@ -5358,15 +5368,22 @@ mod tests {
 
         const COUNT: u32 = 40;
         let entry = render::REF_BIND_ENTRY_SIZE;
-        let total = render::HEADER_LEN + render::BIND_ENTRIES + (COUNT as usize) * entry;
+        let total =
+            reims_vgpu_wire::OP_HEADER_LEN + render::BIND_ENTRIES + (COUNT as usize) * entry;
         let mut command = vec![0u8; total];
-        let op = render::OP_SET_VERTEX_TEXTURE;
+        let op = wire_render::OPCODE_SET_VERTEX_TEXTURE;
         st32(&mut command[0..], op);
         st32(&mut command[4..], total as u32);
-        st32(&mut command[render::HEADER_LEN + render::BIND_FIRST..], 0);
-        st32(&mut command[render::HEADER_LEN + render::BIND_COUNT..], COUNT);
+        st32(
+            &mut command[reims_vgpu_wire::OP_HEADER_LEN + render::BIND_FIRST..],
+            0,
+        );
+        st32(
+            &mut command[reims_vgpu_wire::OP_HEADER_LEN + render::BIND_COUNT..],
+            COUNT,
+        );
         for i in 0..COUNT as usize {
-            let at = render::HEADER_LEN + render::BIND_ENTRIES + i * entry;
+            let at = reims_vgpu_wire::OP_HEADER_LEN + render::BIND_ENTRIES + i * entry;
             st32(&mut command[at..], 0x4000 + i as u32);
         }
 
@@ -5424,18 +5441,21 @@ mod tests {
         const { assert!(FIRST >= bind_limit::SAMPLER && FIRST < MAX_BIND_SLOTS) };
 
         let entry = render::REF_BIND_ENTRY_SIZE;
-        let total = render::HEADER_LEN + render::BIND_ENTRIES + entry;
+        let total = reims_vgpu_wire::OP_HEADER_LEN + render::BIND_ENTRIES + entry;
         let mut command = vec![0u8; total];
-        let op = render::OP_SET_VERTEX_SAMPLER;
+        let op = wire_render::OPCODE_SET_VERTEX_SAMPLER;
         st32(&mut command[0..], op);
         st32(&mut command[4..], total as u32);
         st32(
-            &mut command[render::HEADER_LEN + render::BIND_FIRST..],
+            &mut command[reims_vgpu_wire::OP_HEADER_LEN + render::BIND_FIRST..],
             FIRST,
         );
-        st32(&mut command[render::HEADER_LEN + render::BIND_COUNT..], 1);
         st32(
-            &mut command[render::HEADER_LEN + render::BIND_ENTRIES..],
+            &mut command[reims_vgpu_wire::OP_HEADER_LEN + render::BIND_COUNT..],
+            1,
+        );
+        st32(
+            &mut command[reims_vgpu_wire::OP_HEADER_LEN + render::BIND_ENTRIES..],
             0x3333,
         );
 
@@ -5476,21 +5496,22 @@ mod tests {
 
         let texture_record = |first: u32, count: u32| {
             let entry = render::REF_BIND_ENTRY_SIZE;
-            let total = render::HEADER_LEN + render::BIND_ENTRIES + (count as usize) * entry;
+            let total =
+                reims_vgpu_wire::OP_HEADER_LEN + render::BIND_ENTRIES + (count as usize) * entry;
             let mut command = vec![0u8; total];
-            let op = render::OP_SET_VERTEX_TEXTURE;
+            let op = wire_render::OPCODE_SET_VERTEX_TEXTURE;
             st32(&mut command[0..], op);
             st32(&mut command[4..], total as u32);
             st32(
-                &mut command[render::HEADER_LEN + render::BIND_FIRST..],
+                &mut command[reims_vgpu_wire::OP_HEADER_LEN + render::BIND_FIRST..],
                 first,
             );
             st32(
-                &mut command[render::HEADER_LEN + render::BIND_COUNT..],
+                &mut command[reims_vgpu_wire::OP_HEADER_LEN + render::BIND_COUNT..],
                 count,
             );
             for i in 0..count as usize {
-                let at = render::HEADER_LEN + render::BIND_ENTRIES + i * entry;
+                let at = reims_vgpu_wire::OP_HEADER_LEN + render::BIND_ENTRIES + i * entry;
                 st32(&mut command[at..], 0x4000 + i as u32);
             }
             (op, command)
@@ -5579,17 +5600,17 @@ mod tests {
         // index:u32 @0, offset:u64 @4 — a different payload shape from the plural
         // binds, which is why it takes its own offsets rather than `BIND_*`.
         let offset_record = |index: u32| {
-            let total = render::HEADER_LEN + render::BUFFER_OFFSET_PAYLOAD_LEN;
+            let total = reims_vgpu_wire::OP_HEADER_LEN + render::BUFFER_OFFSET_PAYLOAD_LEN;
             let mut command = vec![0u8; total];
-            let op = render::OP_SET_VERTEX_BUFFER_OFFSET;
+            let op = wire_render::OPCODE_SET_VERTEX_BUFFER_OFFSET;
             st32(&mut command[0..], op);
             st32(&mut command[4..], total as u32);
             st32(
-                &mut command[render::HEADER_LEN + render::BUFFER_OFFSET_INDEX..],
+                &mut command[reims_vgpu_wire::OP_HEADER_LEN + render::BUFFER_OFFSET_INDEX..],
                 index,
             );
             st64(
-                &mut command[render::HEADER_LEN + render::BUFFER_OFFSET_VALUE..],
+                &mut command[reims_vgpu_wire::OP_HEADER_LEN + render::BUFFER_OFFSET_VALUE..],
                 0x5555,
             );
             (op, command)
@@ -5635,30 +5656,38 @@ mod tests {
 
         for (op, route, payload_len) in [
             (
-                render::OP_USE_RESOURCE,
+                wire_render::OPCODE_USE_RESOURCE,
                 "render_noop_residency_hint",
                 render::USE_RESOURCE_REFS + 4,
             ),
             (
-                render::OP_USE_HEAP,
+                wire_render::OPCODE_USE_HEAP,
                 "render_noop_residency_hint",
                 render::USE_HEAP_REFS + 4,
             ),
-            (render::OP_RESOURCE_BARRIER, "render_noop_barrier", 0),
-            (render::OP_MEMORY_BARRIER, "render_noop_barrier", 0),
+            (
+                wire_render::OPCODE_MEMORY_BARRIER_RESOURCES,
+                "render_noop_barrier",
+                0,
+            ),
+            (
+                wire_render::OPCODE_MEMORY_BARRIER_SCOPE,
+                "render_noop_barrier",
+                0,
+            ),
         ] {
             let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
             let host = FakeHost::new();
             let mut out = ExecResult::default();
             let mut acc = StreamAccum::default();
 
-            let total = render::HEADER_LEN + payload_len;
+            let total = reims_vgpu_wire::OP_HEADER_LEN + payload_len;
             let mut command = vec![0u8; total];
             st32(&mut command[0..], op);
             st32(&mut command[4..], total as u32);
             if payload_len > 0 {
                 // One resource named, so the count-led extent is satisfied.
-                st32(&mut command[render::HEADER_LEN..], 1);
+                st32(&mut command[reims_vgpu_wire::OP_HEADER_LEN..], 1);
             }
 
             let before = store_route_count(route);
@@ -5690,36 +5719,36 @@ mod tests {
             let mut v = vec![0u8; total];
             st32(&mut v[0..], op);
             st32(&mut v[4..], total as u32);
-            st32(&mut v[blit::HEADER_LEN..], 6161);
-            st64(&mut v[blit::HEADER_LEN + 4..], 0x3300);
-            st64(&mut v[blit::HEADER_LEN + 12..], 0x4400);
+            st32(&mut v[reims_vgpu_wire::OP_HEADER_LEN..], 6161);
+            st64(&mut v[reims_vgpu_wire::OP_HEADER_LEN + 4..], 0x3300);
+            st64(&mut v[reims_vgpu_wire::OP_HEADER_LEN + 12..], 0x4400);
             v
         };
         let copy = || {
             let total = wire::COPY_ICB_TOTAL_LEN as usize;
             let mut v = vec![0u8; total];
-            st32(&mut v[0..], blit::OP_COPY_ICB);
+            st32(&mut v[0..], wire_blit::OPCODE_COPY_ICB);
             st32(&mut v[4..], total as u32);
-            st32(&mut v[blit::HEADER_LEN..], 7171);
-            st32(&mut v[blit::HEADER_LEN + 4..], 7272);
-            st64(&mut v[blit::HEADER_LEN + 8..], 0x1100);
-            st64(&mut v[blit::HEADER_LEN + 16..], 0x2200);
-            st64(&mut v[blit::HEADER_LEN + 24..], 0x3300);
+            st32(&mut v[reims_vgpu_wire::OP_HEADER_LEN..], 7171);
+            st32(&mut v[reims_vgpu_wire::OP_HEADER_LEN + 4..], 7272);
+            st64(&mut v[reims_vgpu_wire::OP_HEADER_LEN + 8..], 0x1100);
+            st64(&mut v[reims_vgpu_wire::OP_HEADER_LEN + 16..], 0x2200);
+            st64(&mut v[reims_vgpu_wire::OP_HEADER_LEN + 24..], 0x3300);
             v
         };
 
         for (op, command, route) in [
             (
-                blit::OP_OPTIMIZE_ICB,
-                range(blit::OP_OPTIMIZE_ICB),
+                wire_blit::OPCODE_OPTIMIZE_ICB,
+                range(wire_blit::OPCODE_OPTIMIZE_ICB),
                 "blit_noop_icb_optimize",
             ),
             (
-                blit::OP_RESET_ICB,
-                range(blit::OP_RESET_ICB),
+                wire_blit::OPCODE_RESET_ICB,
+                range(wire_blit::OPCODE_RESET_ICB),
                 "blit_icb_reset_dropped",
             ),
-            (blit::OP_COPY_ICB, copy(), "blit_icb_copy_dropped"),
+            (wire_blit::OPCODE_COPY_ICB, copy(), "blit_icb_copy_dropped"),
         ] {
             let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
             let mut host = FakeHost::new();
@@ -5739,8 +5768,14 @@ mod tests {
             let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
             let mut host = FakeHost::new();
             let before = store_route_count(route);
-            let command = range(blit::OP_OPTIMIZE_ICB);
-            handle_blit_record(&mut state, &mut host, 1, blit::OP_OPTIMIZE_ICB, &command);
+            let command = range(wire_blit::OPCODE_OPTIMIZE_ICB);
+            handle_blit_record(
+                &mut state,
+                &mut host,
+                1,
+                wire_blit::OPCODE_OPTIMIZE_ICB,
+                &command,
+            );
             assert_eq!(
                 store_route_count(route),
                 before,
@@ -5773,7 +5808,7 @@ mod tests {
             let mut v = vec![0u8; total as usize];
             st32(&mut v[0..], op);
             st32(&mut v[4..], total);
-            let p = blit::HEADER_LEN;
+            let p = reims_vgpu_wire::OP_HEADER_LEN;
             st32(&mut v[p..], 4242); // texture
             st16(&mut v[p + 4..], 3); // level
             st16(&mut v[p + 6..], 5); // slice
@@ -5789,7 +5824,7 @@ mod tests {
             let mut v = vec![0u8; total as usize];
             st32(&mut v[0..], op);
             st32(&mut v[4..], total);
-            st32(&mut v[blit::HEADER_LEN..], 4242);
+            st32(&mut v[reims_vgpu_wire::OP_HEADER_LEN..], 4242);
             v
         };
 
@@ -5799,30 +5834,33 @@ mod tests {
 
         for (op, command, route) in [
             (
-                blit::OP_FILL_TEXTURE_COLOR,
+                wire_blit::OPCODE_FILL_TEXTURE_COLOR,
                 texture_fill(
-                    blit::OP_FILL_TEXTURE_COLOR,
+                    wire_blit::OPCODE_FILL_TEXTURE_COLOR,
                     wire::FILL_TEXTURE_COLOR_TOTAL_LEN,
                 ),
                 COLOR,
             ),
             (
-                blit::OP_FILL_TEXTURE_BYTES,
+                wire_blit::OPCODE_FILL_TEXTURE_BYTES,
                 texture_fill(
-                    blit::OP_FILL_TEXTURE_BYTES,
+                    wire_blit::OPCODE_FILL_TEXTURE_BYTES,
                     wire::FILL_TEXTURE_BYTES_TOTAL_LEN,
                 ),
                 BYTES,
             ),
             (
-                blit::OP_INVALIDATE_COMPRESSED_TEXTURE,
-                invalidate(blit::OP_INVALIDATE_COMPRESSED_TEXTURE, wire::REF_TOTAL_LEN),
+                wire_blit::OPCODE_INVALIDATE_COMPRESSED_TEXTURE,
+                invalidate(
+                    wire_blit::OPCODE_INVALIDATE_COMPRESSED_TEXTURE,
+                    wire::REF_TOTAL_LEN,
+                ),
                 INVALID,
             ),
             (
-                blit::OP_INVALIDATE_COMPRESSED_TEXTURE_SLICE_LEVEL,
+                wire_blit::OPCODE_INVALIDATE_COMPRESSED_TEXTURE_SLICE_LEVEL,
                 invalidate(
-                    blit::OP_INVALIDATE_COMPRESSED_TEXTURE_SLICE_LEVEL,
+                    wire_blit::OPCODE_INVALIDATE_COMPRESSED_TEXTURE_SLICE_LEVEL,
                     wire::REF_SLICE_LEVEL_TOTAL_LEN,
                 ),
                 INVALID,
@@ -5857,19 +5895,25 @@ mod tests {
         // missing buffer here, which is the executor running rather than the
         // record being dropped.
         let mut v = vec![0u8; wire::FILL_BUFFER_PATTERN4_TOTAL_LEN as usize];
-        st32(&mut v[0..], blit::OP_FILL_BUFFER_PATTERN4);
+        st32(&mut v[0..], wire_blit::OPCODE_FILL_BUFFER_PATTERN4);
         st32(&mut v[4..], wire::FILL_BUFFER_PATTERN4_TOTAL_LEN);
-        st32(&mut v[blit::HEADER_LEN..], 7);
-        st64(&mut v[blit::HEADER_LEN + 4..], 0);
-        st64(&mut v[blit::HEADER_LEN + 12..], 8);
-        st32(&mut v[blit::HEADER_LEN + 20..], 0x89ab_cdef);
+        st32(&mut v[reims_vgpu_wire::OP_HEADER_LEN..], 7);
+        st64(&mut v[reims_vgpu_wire::OP_HEADER_LEN + 4..], 0);
+        st64(&mut v[reims_vgpu_wire::OP_HEADER_LEN + 12..], 8);
+        st32(&mut v[reims_vgpu_wire::OP_HEADER_LEN + 20..], 0x89ab_cdef);
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         let mut host = FakeHost::new();
         let before: Vec<u64> = [COLOR, BYTES, INVALID]
             .into_iter()
             .map(store_route_count)
             .collect();
-        handle_blit_record(&mut state, &mut host, 1, blit::OP_FILL_BUFFER_PATTERN4, &v);
+        handle_blit_record(
+            &mut state,
+            &mut host,
+            1,
+            wire_blit::OPCODE_FILL_BUFFER_PATTERN4,
+            &v,
+        );
         for (route, was) in [COLOR, BYTES, INVALID].into_iter().zip(before) {
             assert_eq!(
                 store_route_count(route),
@@ -5892,13 +5936,24 @@ mod tests {
         use crate::runtime::drain::store_route_count;
 
         const ROUTE: &str = "render_vertex_attribute_stride_dropped";
-        let total = render::HEADER_LEN + render::BIND_ENTRIES + render::BUFFER_STRIDE_BIND_ENTRY_SIZE;
+        let total = reims_vgpu_wire::OP_HEADER_LEN
+            + render::BIND_ENTRIES
+            + render::BUFFER_STRIDE_BIND_ENTRY_SIZE;
         let mut command = vec![0u8; total];
-        st32(&mut command[0..], render::OP_SET_VERTEX_BUFFER_STRIDE);
+        st32(
+            &mut command[0..],
+            wire_render::OPCODE_SET_VERTEX_BUFFER_STRIDE,
+        );
         st32(&mut command[4..], total as u32);
-        st32(&mut command[render::HEADER_LEN + render::BIND_FIRST..], 4);
-        st32(&mut command[render::HEADER_LEN + render::BIND_COUNT..], 1);
-        let e = render::HEADER_LEN + render::BIND_ENTRIES;
+        st32(
+            &mut command[reims_vgpu_wire::OP_HEADER_LEN + render::BIND_FIRST..],
+            4,
+        );
+        st32(
+            &mut command[reims_vgpu_wire::OP_HEADER_LEN + render::BIND_COUNT..],
+            1,
+        );
+        let e = reims_vgpu_wire::OP_HEADER_LEN + render::BIND_ENTRIES;
         st32(&mut command[e..], 5151);
         st64(&mut command[e + 4..], 0x2345);
         st64(&mut command[e + 12..], 0x3456);
@@ -5912,7 +5967,7 @@ mod tests {
             &mut state,
             &host,
             1,
-            render::OP_SET_VERTEX_BUFFER_STRIDE,
+            wire_render::OPCODE_SET_VERTEX_BUFFER_STRIDE,
             &command,
             &mut out,
             &mut acc,
@@ -5936,18 +5991,25 @@ mod tests {
 
         // The plain bind must not report a stride it never carried, or the
         // counter reads as traffic on every ordinary vertex bind.
-        let plain_total = render::HEADER_LEN + render::BIND_ENTRIES + render::BUFFER_BIND_ENTRY_SIZE;
+        let plain_total =
+            reims_vgpu_wire::OP_HEADER_LEN + render::BIND_ENTRIES + render::BUFFER_BIND_ENTRY_SIZE;
         let mut plain = vec![0u8; plain_total];
-        st32(&mut plain[0..], render::OP_SET_VERTEX_BUFFER);
+        st32(&mut plain[0..], wire_render::OPCODE_SET_VERTEX_BUFFER);
         st32(&mut plain[4..], plain_total as u32);
-        st32(&mut plain[render::HEADER_LEN + render::BIND_COUNT..], 1);
-        st32(&mut plain[render::HEADER_LEN + render::BIND_ENTRIES..], 5151);
+        st32(
+            &mut plain[reims_vgpu_wire::OP_HEADER_LEN + render::BIND_COUNT..],
+            1,
+        );
+        st32(
+            &mut plain[reims_vgpu_wire::OP_HEADER_LEN + render::BIND_ENTRIES..],
+            5151,
+        );
         let before = store_route_count(ROUTE);
         handle_render_record(
             &mut state,
             &host,
             1,
-            render::OP_SET_VERTEX_BUFFER,
+            wire_render::OPCODE_SET_VERTEX_BUFFER,
             &plain,
             &mut out,
             &mut acc,
@@ -5985,35 +6047,35 @@ mod tests {
 
         let cases: &[(u32, usize, Writer, Option<Writer>, &str)] = &[
             (
-                render::OP_SET_TRIANGLE_FILL_MODE,
+                wire_render::OPCODE_SET_TRIANGLE_FILL_MODE,
                 16,
                 non_default,
                 Some(at_default),
                 "render_fill_mode_dropped",
             ),
             (
-                render::OP_SET_DEPTH_CLIP_MODE,
+                wire_render::OPCODE_SET_DEPTH_CLIP_MODE,
                 16,
                 non_default,
                 Some(at_default),
                 "render_depth_clip_mode_dropped",
             ),
             (
-                render::OP_SET_LINE_WIDTH,
+                wire_render::OPCODE_SET_LINE_WIDTH,
                 12,
                 float_non_default,
                 Some(float_at_default),
                 "render_line_width_dropped",
             ),
             (
-                render::OP_SET_TESSELLATION_FACTOR_SCALE,
+                wire_render::OPCODE_SET_TESSELLATION_FACTOR_SCALE,
                 12,
                 float_non_default,
                 Some(float_at_default),
                 "render_tessellation_scale_dropped",
             ),
             (
-                render::OP_SET_DEPTH_STORE_ACTION,
+                wire_render::OPCODE_SET_DEPTH_STORE_ACTION,
                 16,
                 non_default,
                 // No default to compare against: the record overrides the pass
@@ -6022,7 +6084,7 @@ mod tests {
                 "render_store_action_override_dropped",
             ),
             (
-                render::OP_SET_VISIBILITY_RESULT_MODE,
+                wire_render::OPCODE_SET_VISIBILITY_RESULT_MODE,
                 24,
                 // The mode is the *second* field: this record puts the offset
                 // first, reversing its selector. Writing the mode at payload+0
@@ -6040,8 +6102,8 @@ mod tests {
                 "render_visibility_result_mode_dropped",
             ),
             (
-                render::OP_SET_VERTEX_AMPLIFICATION_COUNT,
-                render::HEADER_LEN
+                wire_render::OPCODE_SET_VERTEX_AMPLIFICATION_COUNT,
+                reims_vgpu_wire::OP_HEADER_LEN
                     + render::AMPLIFICATION_COUNT_LEN
                     + 2 * render::AMPLIFICATION_MAPPING_SIZE,
                 // Two views. One is Metal's default and means no amplification,
@@ -6051,8 +6113,8 @@ mod tests {
                 "render_vertex_amplification_dropped",
             ),
             (
-                render::OP_SET_VERTEX_AMPLIFICATION_MODE,
-                render::HEADER_LEN + 8,
+                wire_render::OPCODE_SET_VERTEX_AMPLIFICATION_MODE,
+                reims_vgpu_wire::OP_HEADER_LEN + 8,
                 |p| {
                     st32(p, 0x5555);
                     st32(&mut p[4..], 0x6666);
@@ -6064,7 +6126,7 @@ mod tests {
                 "render_vertex_amplification_dropped",
             ),
             (
-                render::OP_DRAW_INDIRECT,
+                wire_render::OPCODE_DRAW_INDIRECT,
                 24,
                 |p| {
                     st64(p, 0x1111);
@@ -6075,7 +6137,7 @@ mod tests {
                 "render_draw_indirect_dropped",
             ),
             (
-                render::OP_DRAW_INDEXED_INDIRECT,
+                wire_render::OPCODE_DRAW_INDEXED_INDIRECT,
                 36,
                 |p| {
                     st16(p, 4);
@@ -6092,8 +6154,10 @@ mod tests {
             // at their own entry stride, so a route that fired from the wrong
             // arm would have to have accepted the wrong length first.
             (
-                render::OP_SET_TILE_BUFFER,
-                render::HEADER_LEN + render::BIND_ENTRIES + render::BUFFER_BIND_ENTRY_SIZE,
+                wire_tile::OPCODE_SET_TILE_BUFFER,
+                reims_vgpu_wire::OP_HEADER_LEN
+                    + render::BIND_ENTRIES
+                    + render::BUFFER_BIND_ENTRY_SIZE,
                 |p| {
                     st32(&mut p[render::BIND_FIRST..], 3);
                     st32(&mut p[render::BIND_COUNT..], 1);
@@ -6102,7 +6166,7 @@ mod tests {
                 "render_tile_buffer_bind_dropped",
             ),
             (
-                render::OP_SET_TILE_BUFFER_OFFSET,
+                wire_tile::OPCODE_SET_TILE_BUFFER_OFFSET,
                 20,
                 |p| {
                     st32(p, 4);
@@ -6112,8 +6176,8 @@ mod tests {
                 "render_tile_buffer_bind_dropped",
             ),
             (
-                render::OP_SET_TILE_TEXTURE,
-                render::HEADER_LEN + render::BIND_ENTRIES + render::REF_BIND_ENTRY_SIZE,
+                wire_tile::OPCODE_SET_TILE_TEXTURE,
+                reims_vgpu_wire::OP_HEADER_LEN + render::BIND_ENTRIES + render::REF_BIND_ENTRY_SIZE,
                 |p| {
                     st32(&mut p[render::BIND_FIRST..], 2);
                     st32(&mut p[render::BIND_COUNT..], 1);
@@ -6122,8 +6186,8 @@ mod tests {
                 "render_tile_texture_bind_dropped",
             ),
             (
-                render::OP_SET_TILE_SAMPLER,
-                render::HEADER_LEN + render::BIND_ENTRIES + render::REF_BIND_ENTRY_SIZE,
+                wire_tile::OPCODE_SET_TILE_SAMPLER,
+                reims_vgpu_wire::OP_HEADER_LEN + render::BIND_ENTRIES + render::REF_BIND_ENTRY_SIZE,
                 |p| {
                     st32(&mut p[render::BIND_FIRST..], 4);
                     st32(&mut p[render::BIND_COUNT..], 1);
@@ -6132,8 +6196,10 @@ mod tests {
                 "render_tile_sampler_bind_dropped",
             ),
             (
-                render::OP_SET_TILE_SAMPLER_LOD,
-                render::HEADER_LEN + render::BIND_ENTRIES + render::SAMPLER_LOD_BIND_ENTRY_SIZE,
+                wire_tile::OPCODE_SET_TILE_SAMPLER_LOD,
+                reims_vgpu_wire::OP_HEADER_LEN
+                    + render::BIND_ENTRIES
+                    + render::SAMPLER_LOD_BIND_ENTRY_SIZE,
                 |p| {
                     st32(&mut p[render::BIND_FIRST..], 5);
                     st32(&mut p[render::BIND_COUNT..], 1);
@@ -6146,7 +6212,7 @@ mod tests {
             // loses no work, so counting it would inflate the very number this
             // counter exists to be.
             (
-                render::OP_DISPATCH_THREADS_PER_TILE,
+                wire_tile::OPCODE_DISPATCH_THREADS_PER_TILE,
                 32,
                 |p| {
                     st64(p, 0x11);
@@ -6161,7 +6227,7 @@ mod tests {
                 "render_tile_dispatch_dropped",
             ),
             (
-                render::OP_DISPATCH_THREADS_PER_TILE_IN_REGION,
+                wire_tile::OPCODE_DISPATCH_THREADS_PER_TILE_IN_REGION,
                 84,
                 |p| {
                     st64(p, 0x11);
@@ -6172,7 +6238,7 @@ mod tests {
                 "render_tile_dispatch_dropped",
             ),
             (
-                render::OP_DISPATCH_THREADS_PER_TILE_IN_REGION_RT_INDEX,
+                wire_tile::OPCODE_DISPATCH_THREADS_PER_TILE_IN_REGION_RT_INDEX,
                 84,
                 |p| {
                     st64(p, 0x11);
@@ -6186,7 +6252,7 @@ mod tests {
             // default arm: every one of these leaves the guest reading its own
             // stale ring as a tile geometry.
             (
-                render::OP_GET_TILE_DIMENSIONS,
+                wire_tile::OPCODE_GET_TILE_DIMENSIONS,
                 20,
                 |p| {
                     st32(p, 5151);
@@ -6196,7 +6262,7 @@ mod tests {
                 "render_tile_dimensions_unanswered",
             ),
             (
-                render::OP_SET_TILE_THREADGROUP_MEMORY,
+                wire_tile::OPCODE_SET_TILE_THREADGROUP_MEMORY,
                 28,
                 |p| {
                     st64(p, 0x1234);
@@ -6210,7 +6276,7 @@ mod tests {
             // the colour form than on the other two, so a route reached from
             // the wrong arm would have had to accept the wrong length first.
             (
-                render::OP_SET_COLOR_STORE_ACTION_OPTIONS,
+                wire_render::OPCODE_SET_COLOR_STORE_ACTION_OPTIONS,
                 20,
                 |p| {
                     st64(p, 0x1111);
@@ -6220,21 +6286,21 @@ mod tests {
                 "render_store_action_options_dropped",
             ),
             (
-                render::OP_SET_DEPTH_STORE_ACTION_OPTIONS,
+                wire_render::OPCODE_SET_DEPTH_STORE_ACTION_OPTIONS,
                 16,
                 |p| st64(p, 0x2222),
                 None,
                 "render_store_action_options_dropped",
             ),
             (
-                render::OP_SET_STENCIL_STORE_ACTION_OPTIONS,
+                wire_render::OPCODE_SET_STENCIL_STORE_ACTION_OPTIONS,
                 16,
                 |p| st64(p, 0x3333),
                 None,
                 "render_store_action_options_dropped",
             ),
             (
-                render::OP_SET_TESSELLATION_FACTOR_BUFFER,
+                wire_render::OPCODE_SET_TESSELLATION_FACTOR_BUFFER,
                 28,
                 |p| {
                     st32(p, 5151);
@@ -6248,42 +6314,42 @@ mod tests {
             // two lengths, and both must reach the counter -- a length-based
             // dispatch that refused one of them would read as a healthy zero.
             (
-                render::OP_DRAW_PATCHES,
+                wire_render::OPCODE_DRAW_PATCHES,
                 24,
                 |_p| {},
                 None,
                 "render_draw_patches_dropped",
             ),
             (
-                render::OP_DRAW_PATCHES_WIDE,
+                wire_render::OPCODE_DRAW_PATCHES_WIDE,
                 56,
                 |_p| {},
                 None,
                 "render_draw_patches_dropped",
             ),
             (
-                render::OP_DRAW_PATCHES_WIDE,
+                wire_render::OPCODE_DRAW_PATCHES_WIDE,
                 68,
                 |_p| {},
                 None,
                 "render_draw_patches_dropped",
             ),
             (
-                render::OP_DRAW_INDEXED_PATCHES,
+                wire_render::OPCODE_DRAW_INDEXED_PATCHES,
                 32,
                 |_p| {},
                 None,
                 "render_draw_patches_dropped",
             ),
             (
-                render::OP_DRAW_PATCHES_INDIRECT,
+                wire_render::OPCODE_DRAW_PATCHES_INDIRECT,
                 36,
                 |_p| {},
                 None,
                 "render_draw_patches_indirect_dropped",
             ),
             (
-                render::OP_DRAW_INDEXED_PATCHES_INDIRECT,
+                wire_render::OPCODE_DRAW_INDEXED_PATCHES_INDIRECT,
                 48,
                 |_p| {},
                 None,
@@ -6299,7 +6365,7 @@ mod tests {
             let mut command = vec![0u8; total];
             st32(&mut command[0..], op);
             st32(&mut command[4..], total as u32);
-            write(&mut command[render::HEADER_LEN..]);
+            write(&mut command[reims_vgpu_wire::OP_HEADER_LEN..]);
             handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
         };
 

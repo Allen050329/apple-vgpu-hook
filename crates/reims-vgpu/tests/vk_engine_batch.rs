@@ -132,13 +132,7 @@ fn batched_draws_compose_and_flush_on_read() {
     };
 
     let before = engine::counter_snapshot();
-    let opener = batch_req(
-        &vert,
-        &frag,
-        &identity,
-        false,
-        half_scissor(true),
-    );
+    let opener = batch_req(&vert, &frag, &identity, false, half_scissor(true));
     match engine::execute_draw_request(&opener) {
         Ok(out) => assert!(out.pixels.is_empty(), "skip_readback returns no pixels"),
         Err(e) => {
@@ -150,13 +144,7 @@ fn batched_draws_compose_and_flush_on_read() {
             panic!("opener draw: {msg}");
         }
     }
-    let joiner = batch_req(
-        &vert,
-        &frag,
-        &identity,
-        true,
-        half_scissor(false),
-    );
+    let joiner = batch_req(&vert, &frag, &identity, true, half_scissor(false));
     engine::execute_draw_request(&joiner).expect("joiner draw");
     let mid = engine::counter_snapshot().delta_since(&before);
     assert_eq!(mid.batch_opens, 1, "first draw opens the batch");
@@ -206,13 +194,7 @@ fn cross_target_draw_flushes_open_batch() {
     };
 
     let before = engine::counter_snapshot();
-    let opener = batch_req(
-        &vert,
-        &frag,
-        &a,
-        false,
-        half_scissor(true),
-    );
+    let opener = batch_req(&vert, &frag, &a, false, half_scissor(true));
     match engine::execute_draw_request(&opener) {
         Ok(_) => {}
         Err(e) => {
@@ -226,13 +208,7 @@ fn cross_target_draw_flushes_open_batch() {
     }
     // Different identity: not joinable — begin_entry flushes A's batch, and
     // this draw opens a batch of its own.
-    let other = batch_req(
-        &vert,
-        &frag,
-        &b,
-        false,
-        half_scissor(false),
-    );
+    let other = batch_req(&vert, &frag, &b, false, half_scissor(false));
     engine::execute_draw_request(&other).expect("cross-target draw");
     let mid = engine::counter_snapshot().delta_since(&before);
     assert_eq!(mid.batch_opens, 2, "each target opened its own batch");
@@ -271,13 +247,7 @@ fn prefetch_arm_flushes_open_batch() {
     };
 
     let before = engine::counter_snapshot();
-    let opener = batch_req(
-        &vert,
-        &frag,
-        &identity,
-        false,
-        half_scissor(true),
-    );
+    let opener = batch_req(&vert, &frag, &identity, false, half_scissor(true));
     match engine::execute_draw_request(&opener) {
         Ok(_) => {}
         Err(e) => {
@@ -309,13 +279,7 @@ fn batch_length_cap_flushes_and_reopens() {
     };
 
     let before = engine::counter_snapshot();
-    let opener = batch_req(
-        &vert,
-        &frag,
-        &identity,
-        false,
-        half_scissor(true),
-    );
+    let opener = batch_req(&vert, &frag, &identity, false, half_scissor(true));
     match engine::execute_draw_request(&opener) {
         Ok(_) => {}
         Err(e) => {
@@ -328,13 +292,7 @@ fn batch_length_cap_flushes_and_reopens() {
         }
     }
     for n in 1..10 {
-        let joiner = batch_req(
-            &vert,
-            &frag,
-            &identity,
-            true,
-            half_scissor(n % 2 == 0),
-        );
+        let joiner = batch_req(&vert, &frag, &identity, true, half_scissor(n % 2 == 0));
         engine::execute_draw_request(&joiner).unwrap_or_else(|e| panic!("draw #{n}: {e}"));
     }
     let d = engine::counter_snapshot().delta_since(&before);
@@ -371,13 +329,7 @@ fn batched_guest_runs_buffer_snapshots_at_record() {
 
     let before = engine::counter_snapshot();
     let backing = vec![7u8; 64];
-    let mut opener = batch_req(
-        &vert,
-        &frag,
-        &identity,
-        false,
-        half_scissor(true),
-    );
+    let mut opener = batch_req(&vert, &frag, &identity, false, half_scissor(true));
     opener.storage_buffers.push(StorageBufferResource {
         binding: 0,
         content: BufferContent::GuestRuns(GuestRunSource {

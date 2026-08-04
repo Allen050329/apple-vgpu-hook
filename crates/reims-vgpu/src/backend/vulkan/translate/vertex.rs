@@ -383,7 +383,10 @@ mod tests {
         );
         // Absence still means `PerVertex` whatever the word holds, so a record
         // that never carried the field cannot reach either refusal.
-        assert_eq!(step_function(false, 3).unwrap(), VertexStepFunction::PerVertex);
+        assert_eq!(
+            step_function(false, 3).unwrap(),
+            VertexStepFunction::PerVertex
+        );
     }
 
     /// **L2's co-location invariant.** The byte size must equal the Vulkan

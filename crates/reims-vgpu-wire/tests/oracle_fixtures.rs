@@ -24,9 +24,8 @@ use serde_json::Value;
 const DERIVED_AGAINST_BUNDLE_VERSION: &str = "64.4.7";
 
 fn fixtures() -> Option<Value> {
-    let dir = std::env::var("REIMS_WIRE_FIXTURES_DIR").unwrap_or_else(|_| {
-        format!("{}/fixtures", env!("CARGO_MANIFEST_DIR"))
-    });
+    let dir = std::env::var("REIMS_WIRE_FIXTURES_DIR")
+        .unwrap_or_else(|_| format!("{}/fixtures", env!("CARGO_MANIFEST_DIR")));
     let path = format!("{dir}/fixtures.json");
     match std::fs::read_to_string(&path) {
         Ok(s) => Some(serde_json::from_str(&s).expect("fixtures.json is valid JSON")),
@@ -131,9 +130,7 @@ fn record_len_for(opcode: u32) -> Option<u32> {
         r::OPCODE_DRAW_INDEXED_INSTANCED => r::DRAW_INDEXED_INSTANCED_TOTAL_LEN,
         r::OPCODE_DRAW_INDEXED_INSTANCED_WIDE => r::DRAW_INDEXED_INSTANCED_WIDE_TOTAL_LEN,
         r::OPCODE_DRAW_INDEXED_INSTANCED_BASE => r::DRAW_INDEXED_INSTANCED_BASE_TOTAL_LEN,
-        r::OPCODE_DRAW_INDEXED_INSTANCED_BASE_WIDE => {
-            r::DRAW_INDEXED_INSTANCED_BASE_WIDE_TOTAL_LEN
-        }
+        r::OPCODE_DRAW_INDEXED_INSTANCED_BASE_WIDE => r::DRAW_INDEXED_INSTANCED_BASE_WIDE_TOTAL_LEN,
         r::OPCODE_SET_SCISSOR => r::SET_SCISSOR_TOTAL_LEN,
         r::OPCODE_SET_VIEWPORT => r::SET_VIEWPORT_TOTAL_LEN,
         r::OPCODE_SET_BLEND_COLOR => r::SET_BLEND_COLOR_TOTAL_LEN,
@@ -418,20 +415,56 @@ fn every_texture_fixture_reads_back_what_metal_was_asked_for() {
 
         let t = new_texture(&o).unwrap_or_else(|e| panic!("{name}: {e}"));
 
-        assert_eq!(t.desc.texture_type() as u64, expect_u64(case, "texture_type"), "{name}: texture_type");
-        assert_eq!(t.desc.usage() as u64, expect_u64(case, "usage"), "{name}: usage");
-        assert_eq!(t.desc.pixel_format() as u64, expect_u64(case, "pixel_format"), "{name}: pixel_format");
-        assert_eq!(t.desc.width.get() as u64, expect_u64(case, "width"), "{name}: width");
-        assert_eq!(t.desc.height.get() as u64, expect_u64(case, "height"), "{name}: height");
-        assert_eq!(t.desc.depth.get() as u64, expect_u64(case, "depth"), "{name}: depth");
+        assert_eq!(
+            t.desc.texture_type() as u64,
+            expect_u64(case, "texture_type"),
+            "{name}: texture_type"
+        );
+        assert_eq!(
+            t.desc.usage() as u64,
+            expect_u64(case, "usage"),
+            "{name}: usage"
+        );
+        assert_eq!(
+            t.desc.pixel_format() as u64,
+            expect_u64(case, "pixel_format"),
+            "{name}: pixel_format"
+        );
+        assert_eq!(
+            t.desc.width.get() as u64,
+            expect_u64(case, "width"),
+            "{name}: width"
+        );
+        assert_eq!(
+            t.desc.height.get() as u64,
+            expect_u64(case, "height"),
+            "{name}: height"
+        );
+        assert_eq!(
+            t.desc.depth.get() as u64,
+            expect_u64(case, "depth"),
+            "{name}: depth"
+        );
         assert_eq!(
             t.desc.mipmap_level_count.get() as u64,
             expect_u64(case, "mipmap_level_count"),
             "{name}: mipmap_level_count"
         );
-        assert_eq!(t.desc.sample_count.get() as u64, expect_u64(case, "sample_count"), "{name}: sample_count");
-        assert_eq!(t.desc.array_length.get() as u64, expect_u64(case, "array_length"), "{name}: array_length");
-        assert_eq!(t.desc.storage_mode() as u64, expect_u64(case, "storage_mode"), "{name}: storage_mode");
+        assert_eq!(
+            t.desc.sample_count.get() as u64,
+            expect_u64(case, "sample_count"),
+            "{name}: sample_count"
+        );
+        assert_eq!(
+            t.desc.array_length.get() as u64,
+            expect_u64(case, "array_length"),
+            "{name}: array_length"
+        );
+        assert_eq!(
+            t.desc.storage_mode() as u64,
+            expect_u64(case, "storage_mode"),
+            "{name}: storage_mode"
+        );
         assert_eq!(
             t.desc.allow_gpu_optimized_contents() as u64,
             expect_u64(case, "allow_gpu_optimized_contents"),
@@ -606,8 +639,7 @@ fn the_unidentified_flag_nibble_still_reads_what_it_always_has() {
         match *seen {
             None => *seen = Some(flags),
             Some(prev) => assert_eq!(
-                flags,
-                prev,
+                flags, prev,
                 "case {} moved the unidentified flags from {prev:#06b} to {flags:#06b} -- \
                  identify them and give them names",
                 case["name"]
@@ -835,7 +867,12 @@ const PARTIALLY_WRITTEN: &[(&str, &str, usize, UnwrittenBytes)] = &[
     ),
     // The format-only texture view allocates room for the texture type its two
     // wider siblings carry, and never writes it.
-    ("PGSerializer", "opcode 0x0007", 20, &[(18, 0x00), (19, 0x00)]),
+    (
+        "PGSerializer",
+        "opcode 0x0007",
+        20,
+        &[(18, 0x00), (19, 0x00)],
+    ),
     // Both backed textures embed the plain descriptor, so `packed` bit 7 comes
     // with it; the IOSurface form's plane index is a `u16` in a wider slot.
     ("PGSerializer", "opcode 0x0009", 64, &[(32, 0x7f)]),
@@ -982,13 +1019,38 @@ const PARTIALLY_WRITTEN: &[(&str, &str, usize, UnwrittenBytes)] = &[
     ),
     // The texture body's `packed` bit 7 for the third time, in the info
     // encoder's descriptor query. Same struct, same hole, a third offset.
-    ("PGSerializerInfoCommandEncoder", "opcode 0x01c3", 52, &[(8, 0x7f)]),
+    (
+        "PGSerializerInfoCommandEncoder",
+        "opcode 0x01c3",
+        52,
+        &[(8, 0x7f)],
+    ),
     // The segment header's eighth byte, which neither `-beginSegment:` nor
     // `-endEncoding` writes. Every encoder class allocates one.
-    ("PGSerializerBlitCommandEncoder", "segment header", 8, &[(7, 0x00)]),
-    ("PGSerializerComputeCommandEncoder", "segment header", 8, &[(7, 0x00)]),
-    ("PGSerializerInfoCommandEncoder", "segment header", 8, &[(7, 0x00)]),
-    ("PGSerializerRenderCommandEncoder", "segment header", 8, &[(7, 0x00)]),
+    (
+        "PGSerializerBlitCommandEncoder",
+        "segment header",
+        8,
+        &[(7, 0x00)],
+    ),
+    (
+        "PGSerializerComputeCommandEncoder",
+        "segment header",
+        8,
+        &[(7, 0x00)],
+    ),
+    (
+        "PGSerializerInfoCommandEncoder",
+        "segment header",
+        8,
+        &[(7, 0x00)],
+    ),
+    (
+        "PGSerializerRenderCommandEncoder",
+        "segment header",
+        8,
+        &[(7, 0x00)],
+    ),
 ];
 
 /// Which record a fixture's bytes are, for grouping written masks.
@@ -1477,9 +1539,7 @@ fn every_excluded_row_that_claims_a_refusal_still_gets_one() {
     let Some(root) = fixtures() else { return };
     let refused: std::collections::BTreeSet<&str> = root["unsupported"]
         .as_array()
-        .expect(
-            "fixtures.json has no `unsupported` list; it predates schema 2, regenerate it",
-        )
+        .expect("fixtures.json has no `unsupported` list; it predates schema 2, regenerate it")
         .iter()
         .map(|u| u["selector"].as_str().expect("selector"))
         .collect();
@@ -1512,7 +1572,10 @@ fn every_excluded_row_that_claims_a_refusal_still_gets_one() {
              selector nobody looked at"
         );
     }
-    eprintln!("{} selectors refused by the serializer, all recorded", refused.len());
+    eprintln!(
+        "{} selectors refused by the serializer, all recorded",
+        refused.len()
+    );
 }
 
 /// An exclusion that cites silence must still be getting it.
@@ -1973,8 +2036,7 @@ fn every_excluded_row_that_claims_silence_still_gets_it() {
     // capability unlocks is a different thing entirely — it emits, and this
     // crate has no view for it — which is `Unimplemented`. Both are records of
     // having looked; only the absence of a row is not.
-    let gated: std::collections::BTreeSet<(&str, &str)> = root
-        ["silent_with_every_capability"]
+    let gated: std::collections::BTreeSet<(&str, &str)> = root["silent_with_every_capability"]
         .as_array()
         .expect("fixtures.json has no `silent_with_every_capability` list")
         .iter()
@@ -2721,7 +2783,8 @@ fn every_render_fixture_reads_back_what_metal_was_asked_for() {
     // inference, and the manifest would be claiming otherwise.
     let all: std::collections::BTreeSet<u32> = (0x00..=0x0bu32).collect();
     assert_eq!(
-        draw_opcodes_seen, all,
+        draw_opcodes_seen,
+        all,
         "the draw fixtures no longer cover every opcode in 0x00..=0x0b; \
          missing {:?}",
         all.difference(&draw_opcodes_seen).collect::<Vec<_>>()
@@ -3035,8 +3098,16 @@ fn check_patch_draw(name: &str, case: &Value, o: &reims_vgpu_wire::op::Op<'_>) {
         );
     }
     if let Some((start, count, inst, base)) = f.instancing {
-        assert_eq!(start, expect_u64(case, "patch_start"), "{name}: patch_start");
-        assert_eq!(count, expect_u64(case, "patch_count"), "{name}: patch_count");
+        assert_eq!(
+            start,
+            expect_u64(case, "patch_start"),
+            "{name}: patch_start"
+        );
+        assert_eq!(
+            count,
+            expect_u64(case, "patch_count"),
+            "{name}: patch_count"
+        );
         assert_eq!(
             inst,
             expect_u64(case, "instance_count"),
@@ -3090,8 +3161,8 @@ fn check_tile_record(name: &str, case: &Value, o: &reims_vgpu_wire::op::Op<'_>) 
             assert_eq!(d.depth.get(), expect_u64(case, "depth"), "{name}: depth");
         }
         op if tile::is_dispatch_threads_per_tile_in_region(op) => {
-            let d =
-                tile::dispatch_threads_per_tile_in_region(o).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let d = tile::dispatch_threads_per_tile_in_region(o)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
             for (got, key) in [
                 (d.width.get(), "width"),
                 (d.height.get(), "height"),
@@ -3128,11 +3199,19 @@ fn check_tile_record(name: &str, case: &Value, o: &reims_vgpu_wire::op::Op<'_>) 
             let m = tile::tile_threadgroup_memory(o).unwrap_or_else(|e| panic!("{name}: {e}"));
             assert_eq!(m.length.get(), expect_u64(case, "length"), "{name}: length");
             assert_eq!(m.offset.get(), expect_u64(case, "offset"), "{name}: offset");
-            assert_eq!(m.index.get() as u64, expect_u64(case, "index"), "{name}: index");
+            assert_eq!(
+                m.index.get() as u64,
+                expect_u64(case, "index"),
+                "{name}: index"
+            );
         }
         tile::OPCODE_SET_TILE_BUFFER_OFFSET => {
             let b = tile::tile_buffer_offset(o).unwrap_or_else(|e| panic!("{name}: {e}"));
-            assert_eq!(b.index.get() as u64, expect_u64(case, "index"), "{name}: index");
+            assert_eq!(
+                b.index.get() as u64,
+                expect_u64(case, "index"),
+                "{name}: index"
+            );
             assert_eq!(b.offset.get(), expect_u64(case, "offset"), "{name}: offset");
         }
         tile::OPCODE_GET_TILE_DIMENSIONS => {
@@ -3154,8 +3233,16 @@ fn check_tile_record(name: &str, case: &Value, o: &reims_vgpu_wire::op::Op<'_>) 
         tile::OPCODE_SET_TILE_BUFFER => {
             let (h, entries) = tile::tile_buffer_binds(o).unwrap_or_else(|e| panic!("{name}: {e}"));
             let first = sole_key(case, &["first", "index"]);
-            assert_eq!(h.first.get() as u64, expect_u64(case, first), "{name}: first");
-            assert_eq!(entries.len() as u64, h.count.get() as u64, "{name}: entry count");
+            assert_eq!(
+                h.first.get() as u64,
+                expect_u64(case, first),
+                "{name}: first"
+            );
+            assert_eq!(
+                entries.len() as u64,
+                h.count.get() as u64,
+                "{name}: entry count"
+            );
             for (i, suffix) in ["", "_2"].iter().enumerate().take(entries.len()) {
                 assert_eq!(
                     entries[i].buffer_ref.get() as u64,
@@ -3182,8 +3269,16 @@ fn check_tile_record(name: &str, case: &Value, o: &reims_vgpu_wire::op::Op<'_>) 
                 "sampler_ref"
             };
             let first = sole_key(case, &["first", "index"]);
-            assert_eq!(h.first.get() as u64, expect_u64(case, first), "{name}: first");
-            assert_eq!(entries.len() as u64, h.count.get() as u64, "{name}: entry count");
+            assert_eq!(
+                h.first.get() as u64,
+                expect_u64(case, first),
+                "{name}: first"
+            );
+            assert_eq!(
+                entries.len() as u64,
+                h.count.get() as u64,
+                "{name}: entry count"
+            );
             for (i, suffix) in ["", "_2"].iter().enumerate().take(entries.len()) {
                 // The plural sampler case binds the same stub twice, so its
                 // second entry has no `_2` expectation of its own.
@@ -3198,8 +3293,16 @@ fn check_tile_record(name: &str, case: &Value, o: &reims_vgpu_wire::op::Op<'_>) 
             let (h, entries) =
                 tile::tile_sampler_lod_binds(o).unwrap_or_else(|e| panic!("{name}: {e}"));
             let first = sole_key(case, &["first", "index"]);
-            assert_eq!(h.first.get() as u64, expect_u64(case, first), "{name}: first");
-            assert_eq!(entries.len() as u64, h.count.get() as u64, "{name}: entry count");
+            assert_eq!(
+                h.first.get() as u64,
+                expect_u64(case, first),
+                "{name}: first"
+            );
+            assert_eq!(
+                entries.len() as u64,
+                h.count.get() as u64,
+                "{name}: entry count"
+            );
             for (i, suffix) in ["", "_2"].iter().enumerate().take(entries.len()) {
                 assert_eq!(
                     entries[i].sampler_ref.get() as u64,
@@ -3634,7 +3737,10 @@ fn every_segment_header_fixture_reads_back_what_the_encoder_wrote() {
             expect_u64(case, "flag"),
             "{name}: begin_flag"
         );
-        assert_eq!(h.unidentified_u8, 0, "{name}: unidentified_u8 is no longer 0");
+        assert_eq!(
+            h.unidentified_u8, 0,
+            "{name}: unidentified_u8 is no longer 0"
+        );
 
         // The eighth byte is never written. If a view ever grew into it, a real
         // guest would be reading whatever its ring last held.
@@ -3724,7 +3830,10 @@ fn every_segment_header_fixture_reads_back_what_the_encoder_wrote() {
          it is a type rather than a constant: {by_class:?}"
     );
 
-    eprintln!("checked {checked} segment headers across {} classes", by_class.len());
+    eprintln!(
+        "checked {checked} segment headers across {} classes",
+        by_class.len()
+    );
 }
 
 /// The compute encoder's record length the crate's constants claim.
@@ -3855,13 +3964,29 @@ fn every_compute_fixture_reads_back_what_metal_was_asked_for() {
                     compute::buffer_binds(&o).unwrap_or_else(|e| panic!("{name}: {e}"));
                 eq!(h.first.get(), "first");
                 eq!(h.count.get(), "count");
-                assert_eq!(entries.len() as u64, h.count.get() as u64, "{name}: entry count");
+                assert_eq!(
+                    entries.len() as u64,
+                    h.count.get() as u64,
+                    "{name}: entry count"
+                );
                 eq!(entries[0].buffer_ref.get(), "buffer_ref");
                 eq!(entries[0].offset.get(), "offset");
                 if let Some(r2) = case["expect"]["buffer_ref_2"].as_u64() {
-                    assert_eq!(entries[1].buffer_ref.get() as u64, r2, "{name}: buffer_ref_2");
-                    assert_eq!(entries[1].offset.get(), expect_u64(case, "offset_2"), "{name}: offset_2");
-                    assert_ne!(entries[0].offset.get(), entries[1].offset.get(), "{name}: the two slots share an offset");
+                    assert_eq!(
+                        entries[1].buffer_ref.get() as u64,
+                        r2,
+                        "{name}: buffer_ref_2"
+                    );
+                    assert_eq!(
+                        entries[1].offset.get(),
+                        expect_u64(case, "offset_2"),
+                        "{name}: offset_2"
+                    );
+                    assert_ne!(
+                        entries[0].offset.get(),
+                        entries[1].offset.get(),
+                        "{name}: the two slots share an offset"
+                    );
                 }
             }
             compute::OPCODE_SET_SAMPLER_LOD => {
@@ -3869,7 +3994,11 @@ fn every_compute_fixture_reads_back_what_metal_was_asked_for() {
                     compute::sampler_lod_binds(&o).unwrap_or_else(|e| panic!("{name}: {e}"));
                 eq!(h.first.get(), "first");
                 eq!(h.count.get(), "count");
-                assert_eq!(entries.len() as u64, h.count.get() as u64, "{name}: entry count");
+                assert_eq!(
+                    entries.len() as u64,
+                    h.count.get() as u64,
+                    "{name}: entry count"
+                );
                 eq!(entries[0].sampler_ref.get(), "sampler_ref");
                 for (i, suffix) in ["", "_2"].iter().enumerate() {
                     if i >= entries.len() {
@@ -3880,7 +4009,9 @@ fn every_compute_fixture_reads_back_what_metal_was_asked_for() {
                         (entries[i].lod_max_clamp.get(), "lod_max_clamp"),
                     ] {
                         let k = format!("{key}{suffix}");
-                        let want = case["expect"][&k].as_f64().unwrap_or_else(|| panic!("{name}: no expect.{k}"));
+                        let want = case["expect"][&k]
+                            .as_f64()
+                            .unwrap_or_else(|| panic!("{name}: no expect.{k}"));
                         assert_eq!(got as f64, want, "{name}: {k}");
                     }
                 }
@@ -3891,7 +4022,11 @@ fn every_compute_fixture_reads_back_what_metal_was_asked_for() {
                 eq!(h.count.get(), "count");
                 assert_eq!(refs.len() as u64, h.count.get() as u64, "{name}: ref count");
                 let key = sole_key(case, &["texture_ref", "sampler_ref"]);
-                assert_eq!(refs[0].object_ref.get() as u64, expect_u64(case, key), "{name}: {key}");
+                assert_eq!(
+                    refs[0].object_ref.get() as u64,
+                    expect_u64(case, key),
+                    "{name}: {key}"
+                );
                 if let Some(r2) = case["expect"]["texture_ref_2"].as_u64() {
                     assert_eq!(refs[1].object_ref.get() as u64, r2, "{name}: texture_ref_2");
                 }
@@ -3938,8 +4073,8 @@ fn every_compute_fixture_reads_back_what_metal_was_asked_for() {
                 eq!(f.object_ref.get(), "fence_ref");
             }
             compute::OPCODE_MEMORY_BARRIER_RESOURCES => {
-                let (h, refs) = compute::memory_barrier_resources(&o)
-                    .unwrap_or_else(|e| panic!("{name}: {e}"));
+                let (h, refs) =
+                    compute::memory_barrier_resources(&o).unwrap_or_else(|e| panic!("{name}: {e}"));
                 eq!(h.count.get(), "count");
                 assert_eq!(refs.len() as u64, h.count.get() as u64, "{name}: ref count");
                 eq!(refs[0].object_ref.get(), "resource_ref");
@@ -3993,13 +4128,15 @@ fn every_compute_fixture_reads_back_what_metal_was_asked_for() {
                 );
             }
             compute::OPCODE_EXECUTE_COMMANDS_RANGE => {
-                let e = compute::execute_commands_range(&o).unwrap_or_else(|e| panic!("{name}: {e}"));
+                let e =
+                    compute::execute_commands_range(&o).unwrap_or_else(|e| panic!("{name}: {e}"));
                 eq!(e.icb_ref.get(), "icb_ref");
                 eq!(e.range_location.get(), "range_location");
                 eq!(e.range_length.get(), "range_length");
             }
             compute::OPCODE_EXECUTE_COMMANDS_INDIRECT => {
-                let e = compute::execute_commands_indirect(&o).unwrap_or_else(|e| panic!("{name}: {e}"));
+                let e = compute::execute_commands_indirect(&o)
+                    .unwrap_or_else(|e| panic!("{name}: {e}"));
                 eq!(e.icb_ref.get(), "icb_ref");
                 eq!(e.indirect_buffer_ref.get(), "indirect_buffer_ref");
                 eq!(e.indirect_buffer_offset.get(), "indirect_buffer_offset");
@@ -4128,7 +4265,11 @@ fn every_info_fixture_reads_back_what_metal_was_asked_for() {
                     expect_u64(case, "reply_buffer_ref"),
                     "{name}: reply_buffer_ref"
                 );
-                assert_eq!(off, expect_u64(case, "reply_offset"), "{name}: reply_offset");
+                assert_eq!(
+                    off,
+                    expect_u64(case, "reply_offset"),
+                    "{name}: reply_offset"
+                );
                 reply_refs.insert(buf);
             }};
         }
@@ -4383,7 +4524,10 @@ fn every_destroy_fixture_reads_back_the_ref_the_serializer_allocated() {
         "the serializer ships eleven -deleteXRef:allocator: selectors and this \
          capture drove {checked}"
     );
-    eprintln!("checked {checked} destroy fixtures, {} distinct opcodes", opcodes.len());
+    eprintln!(
+        "checked {checked} destroy fixtures, {} distinct opcodes",
+        opcodes.len()
+    );
 }
 
 /// Every opcode Apple wrote for a covered selector is one its row lists.
@@ -4415,7 +4559,10 @@ fn every_covered_row_lists_the_opcode_apple_wrote() {
         let class = case["class"].as_str().expect("case class");
         let bytes = unhex(case["buffer"].as_str().expect("buffer hex"));
         let o = op(&bytes, 0).unwrap_or_else(|e| panic!("{}: {e}", case["name"]));
-        observed.entry((class, selector)).or_default().insert(o.opcode());
+        observed
+            .entry((class, selector))
+            .or_default()
+            .insert(o.opcode());
     }
 
     let mut checked = 0usize;
@@ -4483,7 +4630,10 @@ fn a_selector_whose_records_went_uncaptured_is_not_claimed_covered() {
             e.selector
         );
     }
-    eprintln!("{} selectors emitted an unclaimed record count", multi.len());
+    eprintln!(
+        "{} selectors emitted an unclaimed record count",
+        multi.len()
+    );
 }
 
 /// A selector the harness could not drive is not a selector Apple refused.
@@ -4521,7 +4671,10 @@ fn a_selector_that_faulted_the_harness_claims_nothing() {
             e.selector
         );
     }
-    eprintln!("{} selectors faulted the harness, none claimed", crashed.len());
+    eprintln!(
+        "{} selectors faulted the harness, none claimed",
+        crashed.len()
+    );
 }
 
 #[test]
@@ -4540,7 +4693,11 @@ fn every_sampler_fixture_reads_back_what_metal_was_asked_for() {
         assert_eq!(bytes.len() as u64, allocated, "{name}: captured length");
 
         let o = op(&bytes, 0).unwrap_or_else(|e| panic!("{name}: {e}"));
-        assert_eq!(o.opcode(), sampler::OPCODE_NEW_SAMPLER, "{name}: opcode drifted");
+        assert_eq!(
+            o.opcode(),
+            sampler::OPCODE_NEW_SAMPLER,
+            "{name}: opcode drifted"
+        );
         assert_eq!(
             o.length(),
             sampler::NEW_SAMPLER_TOTAL_LEN,
@@ -4562,9 +4719,21 @@ fn every_sampler_fixture_reads_back_what_metal_was_asked_for() {
             expect_u64(case, "object_ref"),
             "{name}: object_ref"
         );
-        assert_eq!(s.min_filter() as u64, expect_u64(case, "min_filter"), "{name}: min_filter");
-        assert_eq!(s.mag_filter() as u64, expect_u64(case, "mag_filter"), "{name}: mag_filter");
-        assert_eq!(s.mip_filter() as u64, expect_u64(case, "mip_filter"), "{name}: mip_filter");
+        assert_eq!(
+            s.min_filter() as u64,
+            expect_u64(case, "min_filter"),
+            "{name}: min_filter"
+        );
+        assert_eq!(
+            s.mag_filter() as u64,
+            expect_u64(case, "mag_filter"),
+            "{name}: mag_filter"
+        );
+        assert_eq!(
+            s.mip_filter() as u64,
+            expect_u64(case, "mip_filter"),
+            "{name}: mip_filter"
+        );
         assert_eq!(
             s.s_address_mode() as u64,
             expect_u64(case, "s_address_mode"),
@@ -4614,12 +4783,16 @@ fn every_sampler_fixture_reads_back_what_metal_was_asked_for() {
         // JSON carries, so the comparison is made in the wire's own width.
         assert_eq!(
             s.lod_min_clamp.get(),
-            case["expect"]["lod_min_clamp"].as_f64().expect("lod_min_clamp") as f32,
+            case["expect"]["lod_min_clamp"]
+                .as_f64()
+                .expect("lod_min_clamp") as f32,
             "{name}: lod_min_clamp"
         );
         assert_eq!(
             s.lod_max_clamp.get(),
-            case["expect"]["lod_max_clamp"].as_f64().expect("lod_max_clamp") as f32,
+            case["expect"]["lod_max_clamp"]
+                .as_f64()
+                .expect("lod_max_clamp") as f32,
             "{name}: lod_max_clamp"
         );
         checked += 1;
@@ -4783,7 +4956,11 @@ fn the_fence_fixture_is_a_header_and_the_ref_the_serializer_allocated() {
         }
         let bytes = unhex(case["buffer"].as_str().expect("buffer hex"));
         let o = op(&bytes, 0).unwrap_or_else(|e| panic!("{name}: {e}"));
-        assert_eq!(o.opcode(), fence::OPCODE_NEW_FENCE, "{name}: opcode drifted");
+        assert_eq!(
+            o.opcode(),
+            fence::OPCODE_NEW_FENCE,
+            "{name}: opcode drifted"
+        );
         assert_eq!(
             o.length(),
             fence::NEW_FENCE_TOTAL_LEN,
@@ -4893,11 +5070,7 @@ fn every_heap_texture_fixture_reads_back_what_metal_was_asked_for() {
             expect_u64(case, "heap_ref"),
             "{name}: heap_ref"
         );
-        assert_eq!(
-            h.offset.get(),
-            expect_u64(case, "offset"),
-            "{name}: offset"
-        );
+        assert_eq!(h.offset.get(), expect_u64(case, "offset"), "{name}: offset");
         assert_eq!(
             h.use_offset() as u64,
             expect_u64(case, "use_offset"),
@@ -4916,8 +5089,16 @@ fn every_heap_texture_fixture_reads_back_what_metal_was_asked_for() {
             expect_u64(case, "pixel_format"),
             "{name}: pixel_format"
         );
-        assert_eq!(h.desc.usage() as u64, expect_u64(case, "usage"), "{name}: usage");
-        assert_eq!(h.desc.width.get() as u64, expect_u64(case, "width"), "{name}: width");
+        assert_eq!(
+            h.desc.usage() as u64,
+            expect_u64(case, "usage"),
+            "{name}: usage"
+        );
+        assert_eq!(
+            h.desc.width.get() as u64,
+            expect_u64(case, "width"),
+            "{name}: width"
+        );
         assert_eq!(
             h.desc.height.get() as u64,
             expect_u64(case, "height"),
@@ -4973,7 +5154,11 @@ fn every_texture_view_fixture_reads_back_what_metal_was_asked_for() {
             tv::OPCODE_TEXTURE_VIEW => {
                 assert_eq!(o.length(), tv::TEXTURE_VIEW_TOTAL_LEN, "{name}: length");
                 let v = tv::texture_view(&o).unwrap_or_else(|e| panic!("{name}: {e}"));
-                (v.object_ref.get(), v.base_texture_ref.get(), v.pixel_format.get())
+                (
+                    v.object_ref.get(),
+                    v.base_texture_ref.get(),
+                    v.pixel_format.get(),
+                )
             }
             tv::OPCODE_TEXTURE_VIEW_RANGED => {
                 assert_eq!(
@@ -4983,7 +5168,11 @@ fn every_texture_view_fixture_reads_back_what_metal_was_asked_for() {
                 );
                 let v = tv::texture_view_ranged(&o).unwrap_or_else(|e| panic!("{name}: {e}"));
                 assert_ranges(case, name, v);
-                (v.object_ref.get(), v.base_texture_ref.get(), v.pixel_format.get())
+                (
+                    v.object_ref.get(),
+                    v.base_texture_ref.get(),
+                    v.pixel_format.get(),
+                )
             }
             tv::OPCODE_TEXTURE_VIEW_SWIZZLE => {
                 assert_eq!(
@@ -5048,7 +5237,10 @@ fn every_texture_view_fixture_reads_back_what_metal_was_asked_for() {
         .collect(),
         "all three view forms must be captured; a missing one leaves its opcode unpinned"
     );
-    eprintln!("checked texture-view fixtures across {} opcodes", seen.len());
+    eprintln!(
+        "checked texture-view fixtures across {} opcodes",
+        seen.len()
+    );
 }
 
 /// The four range numbers, each against its own expectation.
@@ -5067,13 +5259,21 @@ fn assert_ranges(
         expect_u64(case, "texture_type"),
         "{name}: texture_type"
     );
-    assert_eq!(v.level_base.get(), expect_u64(case, "level_base"), "{name}: level_base");
+    assert_eq!(
+        v.level_base.get(),
+        expect_u64(case, "level_base"),
+        "{name}: level_base"
+    );
     assert_eq!(
         v.level_count.get(),
         expect_u64(case, "level_count"),
         "{name}: level_count"
     );
-    assert_eq!(v.slice_base.get(), expect_u64(case, "slice_base"), "{name}: slice_base");
+    assert_eq!(
+        v.slice_base.get(),
+        expect_u64(case, "slice_base"),
+        "{name}: slice_base"
+    );
     assert_eq!(
         v.slice_count.get(),
         expect_u64(case, "slice_count"),
@@ -5210,14 +5410,22 @@ fn every_backed_texture_fixture_reads_back_what_metal_was_asked_for() {
                 continue;
             }
             assert_eq!(o.opcode(), bt::OPCODE_IOSURFACE_TEXTURE, "{name}: opcode");
-            assert_eq!(o.length(), bt::IOSURFACE_TEXTURE_TOTAL_LEN, "{name}: length");
+            assert_eq!(
+                o.length(),
+                bt::IOSURFACE_TEXTURE_TOTAL_LEN,
+                "{name}: length"
+            );
             let t = bt::iosurface_texture(&o).unwrap_or_else(|e| panic!("{name}: {e}"));
             assert_eq!(
                 t.object_ref.get() as u64,
                 expect_u64(case, "object_ref"),
                 "{name}: object_ref"
             );
-            assert_eq!(t.plane.get() as u64, expect_u64(case, "plane"), "{name}: plane");
+            assert_eq!(
+                t.plane.get() as u64,
+                expect_u64(case, "plane"),
+                "{name}: plane"
+            );
             assert_desc(case, name, &t.desc);
             // The experiment `ops::texture::unidentified_u64` named as the last
             // way to move that word. It did not move.
@@ -5230,7 +5438,10 @@ fn every_backed_texture_fixture_reads_back_what_metal_was_asked_for() {
         }
     }
 
-    assert!(buffer_cases > 0, "no buffer-backed texture cases in fixtures.json");
+    assert!(
+        buffer_cases > 0,
+        "no buffer-backed texture cases in fixtures.json"
+    );
     assert!(
         planes.len() > 1,
         "every IOSurface case asked for the same plane ({planes:?}), so the field is pinned \
@@ -5243,11 +5454,7 @@ fn every_backed_texture_fixture_reads_back_what_metal_was_asked_for() {
 }
 
 /// The shared 32-byte descriptor, wherever a record embeds it.
-fn assert_desc(
-    case: &Value,
-    name: &str,
-    d: &reims_vgpu_wire::ops::texture::TextureDescriptorBody,
-) {
+fn assert_desc(case: &Value, name: &str, d: &reims_vgpu_wire::ops::texture::TextureDescriptorBody) {
     assert_eq!(
         d.texture_type() as u64,
         expect_u64(case, "texture_type"),
@@ -5259,9 +5466,21 @@ fn assert_desc(
         expect_u64(case, "pixel_format"),
         "{name}: pixel_format"
     );
-    assert_eq!(d.width.get() as u64, expect_u64(case, "width"), "{name}: width");
-    assert_eq!(d.height.get() as u64, expect_u64(case, "height"), "{name}: height");
-    assert_eq!(d.depth.get() as u64, expect_u64(case, "depth"), "{name}: depth");
+    assert_eq!(
+        d.width.get() as u64,
+        expect_u64(case, "width"),
+        "{name}: width"
+    );
+    assert_eq!(
+        d.height.get() as u64,
+        expect_u64(case, "height"),
+        "{name}: height"
+    );
+    assert_eq!(
+        d.depth.get() as u64,
+        expect_u64(case, "depth"),
+        "{name}: depth"
+    );
     assert_eq!(
         d.storage_mode() as u64,
         expect_u64(case, "storage_mode"),
@@ -5319,7 +5538,11 @@ fn every_rate_map_fixture_reads_back_what_metal_was_asked_for() {
             expect_u64(case, "layer_count"),
             "{name}: layer_count"
         );
-        assert_eq!(layers.len() as u64, expect_u64(case, "layer_count"), "{name}: layer array");
+        assert_eq!(
+            layers.len() as u64,
+            expect_u64(case, "layer_count"),
+            "{name}: layer array"
+        );
         // The `new` form allocates the ref and the `reset` form is handed one;
         // both land in the same field, which is the claim that lets the two
         // selectors share a manifest opcode.
@@ -5337,18 +5560,38 @@ fn every_rate_map_fixture_reads_back_what_metal_was_asked_for() {
             2,
             "{name}: unidentified_u32_a moved; the experiment in its doc may now be available"
         );
-        assert_eq!(head.unidentified_u32_b.get(), 0, "{name}: unidentified_u32_b moved");
+        assert_eq!(
+            head.unidentified_u32_b.get(),
+            0,
+            "{name}: unidentified_u32_b moved"
+        );
 
         for (index, layer) in layers.iter().enumerate() {
             let w = expect_u64(case, &format!("layer{index}_sample_width"));
             let h = expect_u64(case, &format!("layer{index}_sample_height"));
-            assert_eq!(layer.sample_width.get() as u64, w, "{name}: layer{index} sample_width");
-            assert_eq!(layer.sample_height.get() as u64, h, "{name}: layer{index} sample_height");
+            assert_eq!(
+                layer.sample_width.get() as u64,
+                w,
+                "{name}: layer{index} sample_width"
+            );
+            assert_eq!(
+                layer.sample_height.get() as u64,
+                h,
+                "{name}: layer{index} sample_height"
+            );
 
             let (horizontal, vertical) =
                 rate_map::layer_qualities(&o, index).unwrap_or_else(|e| panic!("{name}: {e}"));
-            assert_eq!(horizontal.len() as u64, w, "{name}: layer{index} horizontal count");
-            assert_eq!(vertical.len() as u64, h, "{name}: layer{index} vertical count");
+            assert_eq!(
+                horizontal.len() as u64,
+                w,
+                "{name}: layer{index} horizontal count"
+            );
+            assert_eq!(
+                vertical.len() as u64,
+                h,
+                "{name}: layer{index} vertical count"
+            );
             for (q, value) in horizontal.iter().enumerate() {
                 assert_eq!(
                     value.get() as f64,
@@ -5429,10 +5672,22 @@ fn every_icb_fixture_reads_back_what_metal_was_asked_for() {
             };
         }
         eq!(b.command_types.get(), "command_types");
-        eq!(b.max_vertex_buffer_bind_count, "max_vertex_buffer_bind_count");
-        eq!(b.max_fragment_buffer_bind_count, "max_fragment_buffer_bind_count");
-        eq!(b.max_kernel_buffer_bind_count, "max_kernel_buffer_bind_count");
-        eq!(b.max_object_buffer_bind_count, "max_object_buffer_bind_count");
+        eq!(
+            b.max_vertex_buffer_bind_count,
+            "max_vertex_buffer_bind_count"
+        );
+        eq!(
+            b.max_fragment_buffer_bind_count,
+            "max_fragment_buffer_bind_count"
+        );
+        eq!(
+            b.max_kernel_buffer_bind_count,
+            "max_kernel_buffer_bind_count"
+        );
+        eq!(
+            b.max_object_buffer_bind_count,
+            "max_object_buffer_bind_count"
+        );
         eq!(b.max_mesh_buffer_bind_count, "max_mesh_buffer_bind_count");
         eq!(
             b.max_kernel_threadgroup_memory_bind_count,
@@ -5453,12 +5708,24 @@ fn every_icb_fixture_reads_back_what_metal_was_asked_for() {
                 icb::flag::SUPPORT_DYNAMIC_ATTRIBUTE_STRIDE,
                 "support_dynamic_attribute_stride",
             ),
-            (icb::flag::INHERIT_DEPTH_STENCIL_STATE, "inherit_depth_stencil_state"),
+            (
+                icb::flag::INHERIT_DEPTH_STENCIL_STATE,
+                "inherit_depth_stencil_state",
+            ),
             (icb::flag::INHERIT_DEPTH_BIAS, "inherit_depth_bias"),
-            (icb::flag::INHERIT_DEPTH_CLIP_MODE, "inherit_depth_clip_mode"),
+            (
+                icb::flag::INHERIT_DEPTH_CLIP_MODE,
+                "inherit_depth_clip_mode",
+            ),
             (icb::flag::INHERIT_CULL_MODE, "inherit_cull_mode"),
-            (icb::flag::INHERIT_FRONT_FACING_WINDING, "inherit_front_facing_winding"),
-            (icb::flag::INHERIT_TRIANGLE_FILL_MODE, "inherit_triangle_fill_mode"),
+            (
+                icb::flag::INHERIT_FRONT_FACING_WINDING,
+                "inherit_front_facing_winding",
+            ),
+            (
+                icb::flag::INHERIT_TRIANGLE_FILL_MODE,
+                "inherit_triangle_fill_mode",
+            ),
         ] {
             // A host whose SDK predates a property produces no expectation for
             // it and no case for it either; the bit is then unchecked rather
@@ -5534,7 +5801,10 @@ fn every_icb_fixture_reads_back_what_metal_was_asked_for() {
         checked += 1;
     }
 
-    assert!(checked > 0, "no indirect command buffer cases in fixtures.json");
+    assert!(
+        checked > 0,
+        "no indirect command buffer cases in fixtures.json"
+    );
     assert!(
         refs.len() >= 8,
         "only {} distinct refs were allocated across the ICB cases; the \

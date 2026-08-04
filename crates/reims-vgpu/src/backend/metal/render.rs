@@ -511,9 +511,11 @@ fn make_vertex_descriptor(
                 err,
                 format!("unsupported vertex step function {step_ordinal}"),
             );
-            return Err(Status::args("metal_render_vertex_step_function_unsupported")
-                .field("buffer", attr.buffer_index)
-                .field("step", step_ordinal));
+            return Err(
+                Status::args("metal_render_vertex_step_function_unsupported")
+                    .field("buffer", attr.buffer_index)
+                    .field("step", step_ordinal),
+            );
         };
         // Optional host bytes → Metal buffer slot for encode-time bind.
         find_or_add_attr_slot(device, &mut slots, attr, err)?;

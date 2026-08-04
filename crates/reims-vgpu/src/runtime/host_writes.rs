@@ -211,10 +211,8 @@ mod tests {
 
     #[test]
     fn a_write_to_other_pages_leaves_this_window_quiet() {
-        let state = crate::model::DeviceState::new(
-            crate::model::DeviceId(1),
-            crate::model::PAGE_SHIFT_X86,
-        );
+        let state =
+            crate::model::DeviceState::new(crate::model::DeviceId(1), crate::model::PAGE_SHIFT_X86);
         let mut w = HostWrites::default();
         let mark = w.epoch();
         w.note_pages(vec![9 * P, 10 * P]);
@@ -226,10 +224,8 @@ mod tests {
     /// already accounted for must not invalidate it forever.
     #[test]
     fn a_write_the_reader_already_saw_does_not_answer_for_a_later_mark() {
-        let state = crate::model::DeviceState::new(
-            crate::model::DeviceId(1),
-            crate::model::PAGE_SHIFT_X86,
-        );
+        let state =
+            crate::model::DeviceState::new(crate::model::DeviceId(1), crate::model::PAGE_SHIFT_X86);
         let mut w = HostWrites::default();
         w.note_pages(vec![4 * P]);
         let after = w.epoch();
@@ -242,10 +238,8 @@ mod tests {
     /// reader older than the ring must be told the ring cannot answer.
     #[test]
     fn what_the_ring_cannot_decide_reads_as_written() {
-        let state = crate::model::DeviceState::new(
-            crate::model::DeviceId(1),
-            crate::model::PAGE_SHIFT_X86,
-        );
+        let state =
+            crate::model::DeviceState::new(crate::model::DeviceId(1), crate::model::PAGE_SHIFT_X86);
         let mut w = HostWrites::default();
         let mark = w.epoch();
         w.note_unknown();
@@ -269,10 +263,8 @@ mod tests {
     #[test]
     fn a_mapping_re_pointed_since_the_write_cannot_be_ruled_out() {
         use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-        let mut state = crate::model::DeviceState::new(
-            crate::model::DeviceId(1),
-            crate::model::PAGE_SHIFT_X86,
-        );
+        let mut state =
+            crate::model::DeviceState::new(crate::model::DeviceId(1), crate::model::PAGE_SHIFT_X86);
         state.map_surface(4);
         state.attach_mapping_internal(4, 0);
         let m = state.mappings.get_mut(&4).expect("just mapped");

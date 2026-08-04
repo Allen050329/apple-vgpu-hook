@@ -570,7 +570,7 @@ fn apply_record_inner<M: HostMemory + HostOps>(
         // `-setSupportsComputePassDescriptorDispatchType:` Apple's serializer
         // emits a scope barrier — `0xd7`, `Buffers|Textures` — after **every**
         // dispatch and every ICB execution of a serial pass, measured on all six
-        // selectors (`crate::runtime::decode::compute::OP_BARRIER_SCOPE`, and
+        // selectors (`reims_vgpu_wire::ops::compute::OPCODE_MEMORY_BARRIER_SCOPE`, and
         // `reims_vgpu_wire::ops::compute::MemoryBarrierScope` carries the
         // derivation). So a guest that negotiates that flag doubles this rail's
         // record count and every second record lands here. The no-op stays
@@ -1403,25 +1403,26 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
         // a resident, the engine's copy is the only content, so a resident the
         // engine can no longer serve is a loss, not a fallback.
         #[cfg(feature = "backend-vulkan")]
-        let (seed_generation, seed_skipped, sample_resident) =
-            match state.compute_storage_residency.get(&key).copied() {
-                None => (0, false, None),
-                Some(generation) => match resident_serve(key, generation, is_storage, format) {
-                    Some(ResidentServe::Seed(generation)) => (generation, true, None),
-                    Some(ResidentServe::Sample(key, generation)) => {
-                        (0, false, Some((key, generation)))
-                    }
-                    None => {
-                        crate::observe::fail(format!(
+        let (seed_generation, seed_skipped, sample_resident) = match state
+            .compute_storage_residency
+            .get(&key)
+            .copied()
+        {
+            None => (0, false, None),
+            Some(generation) => match resident_serve(key, generation, is_storage, format) {
+                Some(ResidentServe::Seed(generation)) => (generation, true, None),
+                Some(ResidentServe::Sample(key, generation)) => (0, false, Some((key, generation))),
+                None => {
+                    crate::observe::fail(format!(
                             "compute_stage_tex heap_fail reason=resident_lost ref={texture_ref} heap={heap_ref} fmt={format:#x} {width}x{height} gen={generation} use_offset={} offset={offset:#x}",
                             use_offset as u8
                         ));
-                        return Err(ComputeStatus::MissingTexture(
-                            "compute_stage_tex_heap_resident_lost",
-                        ));
-                    }
-                },
-            };
+                    return Err(ComputeStatus::MissingTexture(
+                        "compute_stage_tex_heap_resident_lost",
+                    ));
+                }
+            },
+        };
         #[cfg(not(feature = "backend-vulkan"))]
         let (seed_generation, sample_resident): (
             u32,
@@ -2046,9 +2047,11 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             layout.row_stride,
         ),
     ) {
-        (Some(key), Some(resident_gen)) => {
-            Some((key, resident_gen, resident_serve(key, resident_gen, is_storage, stage_format)))
-        }
+        (Some(key), Some(resident_gen)) => Some((
+            key,
+            resident_gen,
+            resident_serve(key, resident_gen, is_storage, stage_format),
+        )),
         _ => None,
     };
     #[cfg(feature = "backend-vulkan")]
@@ -2076,40 +2079,40 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
     ) = (false, None);
     #[cfg(feature = "backend-vulkan")]
     if let Some((key, resident_gen, None)) = resident {
-            // A bytes consumer (format-mismatched view, non-vulkan reuse):
-            // land the resident into the cache entry (and any owed guest
-            // write) through the one flush path, then serve the bytes.
-            if crate::runtime::storage_flush::flush_linear_one(state, host, &key, resident_gen) {
-                if let Some(cached) = crate::runtime::surface_cache::get_linear_texture(
-                    state,
-                    task_id,
-                    stage_ref,
-                    gva,
-                    stage_format,
-                    w,
-                    h,
-                    layout.row_stride,
-                ) {
-                    bytes.copy_from_slice(cached);
-                    have_bytes = true;
-                    crate::observe::off(format!(
+        // A bytes consumer (format-mismatched view, non-vulkan reuse):
+        // land the resident into the cache entry (and any owed guest
+        // write) through the one flush path, then serve the bytes.
+        if crate::runtime::storage_flush::flush_linear_one(state, host, &key, resident_gen) {
+            if let Some(cached) = crate::runtime::surface_cache::get_linear_texture(
+                state,
+                task_id,
+                stage_ref,
+                gva,
+                stage_format,
+                w,
+                h,
+                layout.row_stride,
+            ) {
+                bytes.copy_from_slice(cached);
+                have_bytes = true;
+                crate::observe::off(format!(
                         "compute_linear_flush task={task_id} ref={texture_ref} gva={gva:#x} fmt={:#x} dims={w}x{h} gen={resident_gen}",
                         stage_format
                     ));
-                }
             }
-            if !have_bytes {
-                // Deferred content is unrecoverable — name the loss, clear
-                // the marker, and fall back to the coherent stale seed.
-                // (flush_linear_one already fail-logged the engine loss.)
-                crate::observe::fail(format!(
+        }
+        if !have_bytes {
+            // Deferred content is unrecoverable — name the loss, clear
+            // the marker, and fall back to the coherent stale seed.
+            // (flush_linear_one already fail-logged the engine loss.)
+            crate::observe::fail(format!(
                     "compute_stage_tex linear_resident_lost task={task_id} ref={texture_ref} gva={gva:#x} fmt={:#x} dims={w}x{h} gen={resident_gen}",
                     stage_format
                 ));
-                if let Some(e) = state.host_linear_textures.get_mut(&(task_id, stage_ref)) {
-                    e.resident_gen = 0;
-                }
+            if let Some(e) = state.host_linear_textures.get_mut(&(task_id, stage_ref)) {
+                e.resident_gen = 0;
             }
+        }
     }
     if seed_skipped || sample_resident.is_some() || have_bytes {
         // Engine resident serves this window; no cache/guest read.
@@ -4201,7 +4204,7 @@ fn execute_dispatch_metal<M: HostMemory + HostOps>(
     let mut usages = vec![
         ReimsVgpuComputeTextureUsage {
             binding: 0,
-            access: 0,
+            access: 0
         };
         32
     ];

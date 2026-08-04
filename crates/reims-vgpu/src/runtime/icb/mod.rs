@@ -1175,11 +1175,7 @@ impl crate::observe::Decline for IcbFlagDropped {
 /// on purpose: the descriptor is decoded on both backends and only materialized
 /// on one, so the count would otherwise be structurally zero on Vulkan for a
 /// reason that has nothing to do with what the guest asked for.
-fn note_unapplied_icb_flags(
-    task_id: u32,
-    icb_ref: u32,
-    desc: &IndirectCommandBufferDescriptor,
-) {
+fn note_unapplied_icb_flags(task_id: u32, icb_ref: u32, desc: &IndirectCommandBufferDescriptor) {
     use crate::observe::Decline as _;
     for flag in desc.unapplied_flags() {
         let decline = IcbFlagDropped(flag);

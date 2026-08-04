@@ -82,7 +82,9 @@ pub(crate) fn draw_log_enabled() -> bool {
 /// window their counters on the same process-monotonic clock that stamps every
 /// line — no second time base to reconcile against `t=`.
 pub(crate) fn elapsed_ms() -> u128 {
-    T0.get_or_init(std::time::Instant::now).elapsed().as_millis()
+    T0.get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis()
 }
 
 /// The same process-monotonic clock in microseconds.
@@ -92,7 +94,9 @@ pub(crate) fn elapsed_ms() -> u128 {
 /// pace something the guest measures need this one; `t=` stamps stay in
 /// milliseconds so line-class censuses keep working.
 pub(crate) fn elapsed_us() -> u64 {
-    T0.get_or_init(std::time::Instant::now).elapsed().as_micros() as u64
+    T0.get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_micros() as u64
 }
 
 static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();

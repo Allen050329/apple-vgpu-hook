@@ -14,11 +14,10 @@
 use crate::contract::endian::{ld32, ld64, st16, st32, st64};
 use crate::contract::iosurface_pages::{
     entry_gpa_shift, page_size_of, DEVICE_DESC_ALLOC_SIZE, DEVICE_DESC_BASE_OFFSET,
-    DEVICE_DESC_BPE, DEVICE_DESC_BPR, DEVICE_DESC_DIMS, DEVICE_DESC_LEN,
-    DEVICE_DESC_PIXEL_FORMAT, DEVICE_DESC_PLANES,
-    DEVICE_DESC_PLANE_COUNT, DEVICE_PLANE_BPE, DEVICE_PLANE_BPR, DEVICE_PLANE_DESC_LEN,
-    DEVICE_PLANE_DIMS, DEVICE_PLANE_OFFSET, DEVICE_PLANE_SIZE, PAGE_ENTRY_PFN_SHIFT,
-    PAGE_ENTRY_VALID,
+    DEVICE_DESC_BPE, DEVICE_DESC_BPR, DEVICE_DESC_DIMS, DEVICE_DESC_LEN, DEVICE_DESC_PIXEL_FORMAT,
+    DEVICE_DESC_PLANES, DEVICE_DESC_PLANE_COUNT, DEVICE_PLANE_BPE, DEVICE_PLANE_BPR,
+    DEVICE_PLANE_DESC_LEN, DEVICE_PLANE_DIMS, DEVICE_PLANE_OFFSET, DEVICE_PLANE_SIZE,
+    PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID,
 };
 use crate::model::{DeviceState, MappingEntry, MAX_MAPPINGS, MAX_TASKS};
 use crate::runtime::decode::resource::{
@@ -1462,9 +1461,7 @@ fn latched_mapping_format(surf: &Type4Surface) -> u16 {
 /// multi-plane surface as changed forever, since the latch deliberately discards
 /// it in favour of 0.
 fn backing_matches_latched_geom(m: &MappingEntry, surf: &Type4Surface) -> bool {
-    m.width == surf.width
-        && m.height == surf.height
-        && m.format == latched_mapping_format(surf)
+    m.width == surf.width && m.height == surf.height && m.format == latched_mapping_format(surf)
 }
 
 /// The order [`resolve_type4_surface_ex`] probes task object lists in: task 0,
@@ -2195,7 +2192,10 @@ mod tests {
         // Task 1 lists a *different object type* at the same slot, so it is not
         // a claimant even though the slot is populated.
         let mut other = [0u8; 12];
-        st32(&mut other[0..], OBJECT_TYPE_REF_TEXTURE as u32 | (0x30u32 << 8));
+        st32(
+            &mut other[0..],
+            OBJECT_TYPE_REF_TEXTURE as u32 | (0x30u32 << 8),
+        );
         other[4..12].copy_from_slice(&0x80u64.to_le_bytes());
         let _ = host.write_gpa(list1_gpa + 3 * 12, &other);
 
@@ -2816,7 +2816,9 @@ mod tests {
     /// `sample_window_from_device_plane` treats a plane's.
     #[test]
     fn a_single_plane_backing_publishes_the_offset_its_pixels_start_at() {
-        use crate::contract::iosurface_pages::{decode_device_surface, sample_window_prefer_device};
+        use crate::contract::iosurface_pages::{
+            decode_device_surface, sample_window_prefer_device,
+        };
         use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
         const BASE: u32 = 0x800;
         let (w, h, bpr) = (8u32, 4u32, 32u32);
@@ -2858,7 +2860,10 @@ mod tests {
         assert!(from_device, "the window must come from the descriptor");
         assert_eq!(off, BASE as u64);
         assert_eq!(got_bpr, bpr);
-        assert_eq!(end, BASE as u64 + (h as u64 - 1) * bpr as u64 + (w as u64 * 4));
+        assert_eq!(
+            end,
+            BASE as u64 + (h as u64 - 1) * bpr as u64 + (w as u64 * 4)
+        );
 
         // Zero stays zero — the ordinary case must not gain an offset.
         surf.planes[0].offset = 0;

@@ -115,7 +115,10 @@ mod tests {
 
     #[test]
     fn the_record_is_its_body_plus_the_header() {
-        assert_eq!(size_of::<Delete>() + OP_HEADER_LEN, DELETE_TOTAL_LEN as usize);
+        assert_eq!(
+            size_of::<Delete>() + OP_HEADER_LEN,
+            DELETE_TOTAL_LEN as usize
+        );
     }
 
     /// The eleven opcodes are eleven, and none of the five unclaimed numbers in

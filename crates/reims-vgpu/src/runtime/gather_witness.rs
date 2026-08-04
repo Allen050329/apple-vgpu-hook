@@ -454,7 +454,11 @@ pub enum GatherWitnessFault {
     /// Both halves vouched for a window and the content audit found its bytes
     /// moved. Names the window so the writer can be hunted, and the bind count
     /// so the number of stale frames served is bounded rather than guessed.
-    VouchedBytesMoved { key: GatherKey, span: u64, binds: u32 },
+    VouchedBytesMoved {
+        key: GatherKey,
+        span: u64,
+        binds: u32,
+    },
 }
 
 impl crate::observe::decline::Decline for GatherWitnessFault {
@@ -713,7 +717,6 @@ fn observe<M: crate::runtime::host::HostOps>(
     GatherObservation { verdict, audit }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -765,7 +768,14 @@ mod tests {
     ) -> GatherObservation {
         let mut last = None;
         for _ in 0..n {
-            last = Some(observe(w, host, KEY, one_page(gpas, runs), QUIET, next_gen()));
+            last = Some(observe(
+                w,
+                host,
+                KEY,
+                one_page(gpas, runs),
+                QUIET,
+                next_gen(),
+            ));
         }
         last.expect("bind_quietly is never called with n == 0")
     }
@@ -1030,12 +1040,24 @@ mod tests {
             GatherVerdict::Rearmed
         );
         assert_eq!(
-            verdict(&mut w, &mut host, one_page(&moved, &runs), QUIET, next_gen()),
+            verdict(
+                &mut w,
+                &mut host,
+                one_page(&moved, &runs),
+                QUIET,
+                next_gen()
+            ),
             GatherVerdict::Rearmed,
             "same key, different pages: nothing to compare"
         );
         assert_eq!(
-            verdict(&mut w, &mut host, one_page(&moved, &runs), QUIET, next_gen()),
+            verdict(
+                &mut w,
+                &mut host,
+                one_page(&moved, &runs),
+                QUIET,
+                next_gen()
+            ),
             GatherVerdict::Vouched
         );
     }
@@ -1066,7 +1088,15 @@ mod tests {
         buf[11] ^= 0xff;
         host.guest_wrote_page(GPAS[0]);
         assert!(matches!(
-            observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs), QUIET, next_gen()).verdict,
+            observe(
+                &mut w,
+                &mut host,
+                KEY,
+                one_page(&GPAS, &runs),
+                QUIET,
+                next_gen()
+            )
+            .verdict,
             GatherVerdict::Refused { .. }
         ));
 

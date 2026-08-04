@@ -262,10 +262,7 @@ mod tests {
         };
         assert!(matches!(
             new_heap_texture(&short),
-            Err(WireError::Short {
-                need: 52,
-                have: 40
-            })
+            Err(WireError::Short { need: 52, have: 40 })
         ));
     }
 }
