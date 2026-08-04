@@ -2607,6 +2607,31 @@ pub(crate) unsafe fn execute_draw_inner(
     // post-draw layout, and upload-path sampled bytes queue for cache
     // admission at retire time.
     if let Some(identity) = &req.target_identity {
+        // How much of the attachment this draw could have written. Nothing in
+        // this device acts on it — it is the standing instrument for whether
+        // bounding a flush to a damage rect could ever pay, which
+        // `runtime::storage_flush` names as a lever and this answers. See
+        // `EngineCounters::note_draw_coverage` for the arithmetic and for the
+        // reading that retired the rail built over it.
+        //
+        // The pass runs with LOAD only when the attachment already held the
+        // content this draw builds on, and then the scissor bounds every
+        // fragment that can write. Every other load action rewrites the whole
+        // attachment first: a CLEAR clears the render area, which is the full
+        // target, and both seed forms fill it.
+        let rewrites_whole_attachment =
+            !load_uses_gpu_content || seed_bytes.is_some() || req.seed_from_target.is_some();
+        counters.note_draw_coverage(if rewrites_whole_attachment {
+            super::counters::DrawCoverage::Full
+        } else if scissor.offset.x <= 0
+            && scissor.offset.y <= 0
+            && scissor.extent.width >= req.width
+            && scissor.extent.height >= req.height
+        {
+            super::counters::DrawCoverage::LoadedFullScissor
+        } else {
+            super::counters::DrawCoverage::LoadedPartialScissor
+        });
         pools.registry_mark_ready(identity);
     }
     // MRT secondary attachments settle at COLOR_ATTACHMENT_OPTIMAL (the pass

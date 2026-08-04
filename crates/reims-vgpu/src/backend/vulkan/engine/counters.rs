@@ -56,6 +56,31 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// How much of its render target one draw could have written.
+///
+/// The standing instrument for "would bounding what a flush copies pay
+/// anything?" — the question `runtime::storage_flush` carried as its largest
+/// named lever until it was built, measured at zero, and removed. It is a
+/// property of the *guest's* draws and not of any rail here, which is why it
+/// outlives the rail: the answer changes with the workload, and nothing else in
+/// this device can be read for it.
+///
+/// See [`EngineCounters::note_draw_coverage`] for the arithmetic that turns
+/// these into a verdict.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DrawCoverage {
+    /// The pass did not load the target, so it rewrote the whole attachment
+    /// before the draw began — a CLEAR load action, or a whole-frame CPU seed
+    /// standing in for one.
+    Full,
+    /// The pass loaded the target and bound a scissor covering all of it. The
+    /// draw could have written any texel.
+    LoadedFullScissor,
+    /// The pass loaded the target and bound a scissor smaller than it. The only
+    /// arm whose writes are bounded by anything.
+    LoadedPartialScissor,
+}
+
 /// Declare the engine counter vocabulary once; see the module docs for why.
 ///
 /// Doc comments written on a name here land on *both* the atomic field and its
@@ -214,6 +239,11 @@ engine_counters! {
         /// what the copy names, which is what the CPU no longer moves.
         sampled_guest_imports,
         sampled_guest_import_bytes,
+        /// How much of its target each draw could have written, split three
+        /// ways. See [`DrawCoverage`] and [`EngineCounters::note_draw_coverage`].
+        draw_cover_full,
+        draw_cover_loaded_full_scissor,
+        draw_cover_loaded_partial_scissor,
         /// Vertex/storage buffer binds the draw pointed straight at the guest's
         /// own pages through an imported dma-buf, with no copy in either
         /// direction. Ranked against `buffer_snapshot_binds` and the
@@ -335,6 +365,41 @@ impl EngineCounters {
         self.buffer_guest_imports.fetch_add(1, Ordering::Relaxed);
         self.buffer_guest_import_bytes
             .fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Record how much of its target one draw could have written.
+    ///
+    /// # Reading the three against `surface_flush`
+    ///
+    /// A damage rect can only pay when a flushed surface receives *no*
+    /// whole-surface write between two flushes, because any one of those makes
+    /// the union total. So the verdict is a comparison of rates, not a ratio of
+    /// these three to each other:
+    ///
+    /// ```text
+    ///   (draw_cover_full + draw_cover_loaded_full_scissor) per second
+    ///   ---------------------------------------------------------- << 1
+    ///                    flushes per second
+    /// ```
+    ///
+    /// On a driven x86 Safari window-drag boot it was **4.4**, not «1: 840
+    /// clears and 1 637 full-scissor draws against 560 flushes, so every flush
+    /// interval held several whole-surface writes and a rect built over this
+    /// would have copied whole surfaces anyway. That is what was measured when
+    /// the rail existed, by a `flush_rows` / `flush_surface_rows` pair that read
+    /// exactly equal on every census line of the boot.
+    ///
+    /// `draw_cover_loaded_partial_scissor` was 1 718 in the same second — 41% of
+    /// all draws — which is why the ratio and not that number is the test. A
+    /// workload can bind mostly-partial scissors and still leave nothing to
+    /// narrow.
+    pub fn note_draw_coverage(&self, coverage: DrawCoverage) {
+        let field = match coverage {
+            DrawCoverage::Full => &self.draw_cover_full,
+            DrawCoverage::LoadedFullScissor => &self.draw_cover_loaded_full_scissor,
+            DrawCoverage::LoadedPartialScissor => &self.draw_cover_loaded_partial_scissor,
+        };
+        field.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn note_sampled_guest_import(&self, bytes: u64) {

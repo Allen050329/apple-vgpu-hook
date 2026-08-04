@@ -4502,6 +4502,10 @@ pub fn note_drain_tranche(drain_us: u64, publish_us: u64) {
 ///   guest-sourced bind that had to move bytes into the ones that moved them
 ///   over the host CPU and the ones that did not; a host with no exporter reads
 ///   zero here and all of it there.
+/// - `draw_cover_*` — how much of its target each draw could have written.
+///   Nothing acts on it; it is what says whether bounding a flush to a damage
+///   rect could pay, and the answer is a rate against `surface_flush` rather
+///   than a ratio between the three. See `EngineCounters::note_draw_coverage`.
 /// - `buffer_guest_imports` / `buffer_guest_import_bytes` — vertex and storage
 ///   binds pointed straight at the guest's pages, with no copy in either
 ///   direction. `buffer_snapshot_binds` is what still had to be gathered, and
@@ -4589,6 +4593,8 @@ fn emit_engine_delta() {
          sampled_reupload_bytes={} sampled_gathers={} sampled_gather_bytes={} \
          sampled_gather_skips={} sampled_gather_skip_bytes={} \
          sampled_guest_imports={} sampled_guest_import_bytes={} \
+         draw_cover_full={} draw_cover_loaded_full_scissor={} \
+         draw_cover_loaded_partial_scissor={} \
          buffer_guest_imports={} buffer_guest_import_bytes={} \
          buffer_snapshot_binds={} \
          seed_uploads={} seed_upload_bytes={} \
@@ -4621,6 +4627,9 @@ fn emit_engine_delta() {
         d.sampled_gather_skip_bytes,
         d.sampled_guest_imports,
         d.sampled_guest_import_bytes,
+        d.draw_cover_full,
+        d.draw_cover_loaded_full_scissor,
+        d.draw_cover_loaded_partial_scissor,
         d.buffer_guest_imports,
         d.buffer_guest_import_bytes,
         d.buffer_snapshot_binds,

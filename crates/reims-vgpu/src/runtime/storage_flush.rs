@@ -744,12 +744,23 @@ pub fn flush_linear_windows_before_fence<M: HostMemory + HostOps>(
 /// `write_us=0 write=0`, which is the phase recording nothing because nothing
 /// runs. The rail sustains 528 flushes in its busiest second at ~830 µs each.
 ///
-/// **This rail is no longer the device's largest cost, and the next reader
-/// should not start here.** Summed over the 63 busy seconds of a driven boot,
-/// `drain_duty` reads `draw_us` at **61%** of the worker against `flush_us` at
-/// **34%** — the exact inverse of the 21/69 split below. Whatever is spent next
-/// on flushing is spent on a third of the worker; `draw_phase stage_us` and
-/// `chain_phase seed_us` are on two thirds of it.
+/// **This rail is the device's largest cost again, and the reason is that the
+/// other one was removed rather than that this one grew.** The ranking has now
+/// inverted twice, so read it as a ranking and not as a fact about this rail:
+///
+/// ```text
+/// driven Safari window-drag, busiest second   draw_us   flush_us
+///   the copying rail (21/69 below)               21%        69%
+///   after the GPU writeback landed               61%        34%
+///   after the read direction went zero-copy      35%        59%
+/// ```
+///
+/// The third line is what a draw costs once it stops copying guest RAM on the
+/// CPU: the guest's pages reach the GPU as dma-buf imports for sampled textures
+/// and for vertex/storage binds, `stage_phase runs_us` falls from 111 ms of a
+/// worker second to 3.3 ms, and a draw goes from 111 µs to 78 µs. Nothing about
+/// the flush changed between the second and third lines. It is 59% of the worker
+/// because it is the last rail that still moves a whole frame per fence.
 ///
 /// ## What is left inside a flush, and which lever moves it
 ///
@@ -770,11 +781,46 @@ pub fn flush_linear_windows_before_fence<M: HostMemory + HostOps>(
 /// - **Batching the fences** (one command buffer for the N windows landing at
 ///   one drain fence, one wait) recovers only the ~80 µs of submit-to-signal per
 ///   flush. Real, and about a tenth of a flush.
-/// - **Bounding what each flush copies** attacks the 354 µs, and is the lever the
-///   "moving whole frames that nobody asked for" paragraph below already argued
-///   for. It needs a damage rect, which nothing upstream carries to this rail —
-///   the engine's resident slot is where one could be accumulated, since every
-///   draw into it already passes through `registry_mark_ready`.
+/// - **Bounding what each flush copies** attacks the 354 µs, and was the lever
+///   the "moving whole frames that nobody asked for" paragraph below argued for
+///   across three sessions. **It has been built and it saves nothing.** Read the
+///   next section before building it a fourth time.
+///
+/// ### The damage rect was built, measured at zero, and removed
+///
+/// The design was the obvious one and it was not wrong: a damage enum on the
+/// engine's `ResidentTargetSlot`, initialised `All`, unioned per draw through
+/// `registry_mark_ready` (which every path leaving new pixels in a resident
+/// already goes through, the same property that makes the `content_epoch`
+/// invalidation total), taken and reset by the flush, and used to narrow the
+/// copy, the page list, the dma-buf and the pin to a band of rows. Fail-closed
+/// on a CLEAR load action, on either seed form, and on a recycled image.
+///
+/// It narrowed **nothing**. On a driven x86 Safari window-drag boot the census
+/// pair `flush_rows` / `flush_surface_rows` read *exactly equal on every line of
+/// the boot* — every flushed surface was fully damaged, every time.
+///
+/// The cause is the guest's own draws, not the rail. In the busiest second:
+///
+/// ```text
+/// draws that could write anywhere    clears 840   loaded/full-scissor 1637
+/// draws bounded by a scissor         1718  (41% of 4195)
+/// flushes                            560
+/// ```
+///
+/// 2477 whole-surface writes against 560 flushes is **4.4 per flush interval**,
+/// and one is enough: the union of a bounded draw and an unbounded one is
+/// unbounded. The 41% of draws that *are* scissored never get an interval to
+/// themselves. `creates=312 target_evicts=0 gen_mismatch=0` in the same second
+/// rules out the other explanation — the identities are stable, so the rail was
+/// unioning over the right window and not restarting from `All` each frame.
+///
+/// What survives is the instrument, because the verdict is a property of the
+/// workload and will change with it: `draw_cover_full`,
+/// `draw_cover_loaded_full_scissor` and `draw_cover_loaded_partial_scissor` on
+/// the `engine_delta` line. Build the rect when the first two, summed, fall well
+/// below the flush rate. `EngineCounters::note_draw_coverage` carries the
+/// arithmetic and this reading.
 ///
 /// `vouch` is the other measurable half and it is now near its floor: one guest
 /// page-table entry read per page is what checking every page costs, and
@@ -869,12 +915,11 @@ pub fn flush_linear_windows_before_fence<M: HostMemory + HostOps>(
 ///   is what would make the rail's cost proportional to its 0.7% of consumed
 ///   work on a discrete host too. Still the route that pays on every host, and
 ///   still unbuilt; the section below is why it starts as a counter.
-/// - Bounding *what* each flush copies. Now the largest remaining lever by
-///   arithmetic: with the host passes gone, essentially all of the ~1.0 ms is
-///   the GPU copying a whole surface, and the analysis two paragraphs up —
-///   "moving whole frames that nobody asked for" — is untouched by making that
-///   move cheaper. It needs a damage rect, which nothing upstream currently
-///   carries to this rail.
+/// - **Tried and removed.** Bounding *what* each flush copies. The arithmetic
+///   below is still right — essentially all of the ~1.0 ms is the GPU copying a
+///   whole surface — and it is still not what the guest gives this device a
+///   choice about. See "The damage rect was built, measured at zero, and
+///   removed" above.
 /// - **Not** "flush only the mappings whose copies get read": which flushes were
 ///   wasted is knowable only in hindsight, and a mapping whose pages are read
 ///   while stale has already served wrong pixels.
