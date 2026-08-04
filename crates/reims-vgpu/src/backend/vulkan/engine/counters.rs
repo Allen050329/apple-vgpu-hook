@@ -297,10 +297,11 @@ engine_counters! {
         /// ending a run of draws to buy itself a second `vkQueueSubmit`. Each
         /// one counted here is now one submission rather than two.
         ///
-        /// Read against `batch_flushes` for the share that collapses, and
-        /// against `batch_flush_draws / batch_flushes` for what the intact runs
-        /// are worth. A readback arriving with no batch open is not counted and
-        /// has nothing to collapse.
+        /// Read against `batch_flushes` for the share that collapses. Do **not**
+        /// expect `batch_flush_draws / batch_flushes` to move with it — it read
+        /// 1.77 before the append path and 1.78 after, because a readback still
+        /// ends the batch it joined. A readback arriving with no batch open is
+        /// not counted and has nothing to collapse.
         ///
         /// Counted at the readback sites rather than inside `batch_flush`,
         /// because that function cannot see who called it and threading a reason

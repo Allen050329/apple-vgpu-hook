@@ -602,6 +602,10 @@ pub fn flush_gva_windows_before_fence<M: HostMemory + HostOps>(
 ///
 /// Zero is not counted. An empty map returns before this, so a zero band would
 /// only ever record calls that had nothing to do.
+///
+/// Gated with its caller: `flush_gva_windows_before_fence` is Vulkan-only and a
+/// Metal build arms no GVA windows, so an ungated band is dead code there.
+#[cfg(feature = "backend-vulkan")]
 fn note_fence_batch_band(landed: u64) {
     if let Some(slug) = fence_batch_band(landed) {
         crate::runtime::drain::note_store_route(slug);
@@ -610,6 +614,7 @@ fn note_fence_batch_band(landed: u64) {
 
 /// The band [`note_fence_batch_band`] charges, split out so the boundaries can
 /// be read without an emit.
+#[cfg(feature = "backend-vulkan")]
 fn fence_batch_band(landed: u64) -> Option<&'static str> {
     Some(match landed {
         0 => return None,
@@ -1911,17 +1916,31 @@ pub fn gva_window_identity(
 /// `bar_us = 1.16 µs` proves the draw is already finished when the copy runs, so
 /// none of the wait is the draw.
 ///
-/// The split between those two halves of the ~85 µs is **not measured**, and the
-/// GPU and CPU timelines here are deliberately uncorrelated (see
-/// `note_readback_gpu_us`: both spans are deltas on the GPU's own clock), so no
-/// existing counter can separate them. That is the measurement to take before
-/// building — it needs correlated timestamps, not another band.
+/// The split between those two halves of the ~85 µs was not measurable by
+/// counter — the GPU and CPU timelines here are deliberately uncorrelated (see
+/// `note_readback_gpu_us`: both spans are deltas on the GPU's own clock). It was
+/// settled by experiment instead, and the experiment says **submission latency
+/// is not the cost**.
 ///
-/// Standing verdict: **unsized, not refuted.** The tranche argument is dead and
-/// will not revive; the latency argument is open and is plausibly large for this
-/// rail specifically — 56 713 flushes a boot, each ~90 µs to move 17 KB. Weigh
-/// it against a three-state readback decision, a staging-slot lease held across
-/// the ring, and a fence handle threaded into the deferred entry.
+/// The readback paths were changed to append their copy to the open draw batch
+/// and submit once rather than twice. Submissions across a driven boot fell from
+/// 287 425 to 159 901, a 44 % cut that removed one whole `vkQueueSubmit` from
+/// the front of nearly every readback. `fence_us` per readback did not fall:
+/// 203 µs before, 222 µs after, inside boot-to-boot variance, with total fence
+/// time 21.7 s against 21.6 s over comparable census windows.
+///
+/// Removing a submission did not shorten the wait, so the ~85 µs is
+/// fence-signal-to-CPU-wake and not submit-to-GPU-start. Folding the copy into
+/// the draw's own command buffer removes a submission too, and nothing else —
+/// so it would buy the same nothing, for a three-state readback decision, a
+/// staging-slot lease held across the ring, and a fence handle threaded into the
+/// deferred entry.
+///
+/// Standing verdict: **refuted on measurement.** Both halves are now closed —
+/// the tranche half by `gvaw_fence_batch_1`, the latency half by the append
+/// experiment. What is left of this rail's ~90 µs is the cost of blocking a
+/// thread on a GPU fence at all, which is a question about *who waits* rather
+/// than about how the work is submitted.
 ///
 /// ## Where the rail's time actually goes
 ///
@@ -3577,6 +3596,7 @@ mod tests {
     /// banded: [`flush_gva_windows_before_fence`] returns before the call when
     /// the map is empty, so a zero band could only ever count calls with nothing
     /// to do, and one appearing would mean that early return had moved.
+    #[cfg(feature = "backend-vulkan")]
     #[test]
     fn the_fence_batch_bands_separate_one_from_many() {
         use super::fence_batch_band;

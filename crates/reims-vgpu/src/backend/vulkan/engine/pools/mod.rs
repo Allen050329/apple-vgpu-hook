@@ -1103,19 +1103,28 @@ const STAGING_MISS_EMIT_EVERY: u64 = 512;
 /// is that share measured rather than inferred: **58.8 % of batch flushes are a
 /// readback cutting a run of draws short**, not a batch filling up.
 ///
-/// The cost is paid twice over. Each interruption is an extra `vkQueueSubmit` —
-/// a readback today is two submissions, one to flush the batch out of the way
-/// and one for its own command buffer — and the draws that would have shared a
-/// submission are split across several.
+/// That looked like two costs: an extra `vkQueueSubmit` per readback, and runs
+/// of draws split across several submissions. Only the first was real.
 ///
-/// Both are the same fix: record the copy into the **open batch's** command
-/// buffer and submit that once, instead of flushing the batch and submitting a
-/// second buffer behind it. The readback then waits the batch's fence, which is
-/// one fence for work it was going to wait for anyway, and the run of draws
-/// stays whole. Where no batch is open there is nothing to collapse and the
-/// present path is already right.
+/// The readback paths now record the copy into the **open batch's** command
+/// buffer and submit it with them, instead of flushing the batch and submitting
+/// a second buffer behind it. Across a driven boot that took submissions from
+/// 287 425 to 159 901 — 44 % — with no rendering change.
 ///
-/// So the lever on submission count is the readback path, not this number.
+/// **Batch length did not move: 1.77 before, 1.78 after.** The prediction that
+/// it would rise toward 4.3 was wrong, and why is worth keeping, because the
+/// counters do not show it. A readback still *ends* the batch — it has to,
+/// because it needs a fence to wait on and `batch_flush` is what submits one.
+/// Appending changes how many submissions that ending costs, not whether it
+/// happens.
+///
+/// So batch length is set by **how often a readback occurs**, not by how a
+/// readback submits. 1.78 draws per batch is the guest issuing a Store about
+/// every other draw. The only thing that would lengthen these runs is deferring
+/// the readback past more draws, and `runtime::storage_flush`'s completion-stamp
+/// contract forbids that: every armed window must be in guest RAM before the
+/// stamp that claims it is.
+///
 /// Before changing this constant, read `batch_flush_draws / batch_flushes`
 /// against it — while the ratio sits far below, the ceiling is not the bound.
 const BATCH_MAX_DRAWS: u64 = 8;
