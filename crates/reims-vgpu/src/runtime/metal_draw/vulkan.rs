@@ -1165,7 +1165,22 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                     note_type11_sample_rung("t11rung_resident_refused", guest_write);
                     match guest_owned {
                         Some(ranges) => {
-                            merge_guest_writes_into_pages(
+                            // The merge is what makes falling through sound: it
+                            // puts the resident's half into every page the guest
+                            // did not write, so the rungs below read a surface
+                            // holding both. When it does not land, that premise
+                            // is false — the halves are still split, and the
+                            // pages below hold only the guest's, which for a
+                            // composite the Store deliberately left GPU-side is
+                            // nothing at all. Falling through anyway is how a
+                            // sampled backdrop comes back blank.
+                            //
+                            // So refuse the bind instead of choosing a half.
+                            // `merge_guest_writes_into_pages` has already named
+                            // the stage that failed on the fail channel; this
+                            // turns its `false` into a decline the draw reports,
+                            // which is what its doc asks the caller for.
+                            if !merge_guest_writes_into_pages(
                                 state,
                                 host,
                                 mid,
@@ -1173,7 +1188,12 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                                 h,
                                 &resident_id,
                                 ranges,
-                            );
+                            ) {
+                                crate::runtime::drain::note_store_route(
+                                    "t11sample_resident_merge_unlanded",
+                                );
+                                return None;
+                            }
                         }
                         // `Unknown`: the host named no pages, so there is no
                         // list to preserve and no merge to make. The rungs below
@@ -5926,6 +5946,12 @@ fn guest_write_site<M: HostOps>(
 ///
 /// Returns whether the merge landed. On `false` the caller has a surface whose
 /// halves are still split and must say so rather than bind either one.
+///
+/// `#[must_use]` because that is the whole contract: dropping the result leaves
+/// the caller falling through to rungs that read pages holding only the guest's
+/// half, and for a composite the Store deliberately left GPU-side those pages
+/// were never written at all.
+#[must_use]
 fn merge_guest_writes_into_pages<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
