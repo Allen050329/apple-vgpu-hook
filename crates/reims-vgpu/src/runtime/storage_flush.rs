@@ -2601,8 +2601,7 @@ pub fn render_window_identity(
 /// IOSurface — is gone the moment this window lands. Nothing else in the flush
 /// can see that: `map_generation` covers a rebind, `resident_content_epoch`
 /// covers a later device draw, and neither is a witness for the surface's own
-/// owner. One 14-round composite boot measured `render_flush_over_guest_write`
-/// at 68 of every 99 `surface_flush`es.
+/// owner.
 ///
 /// This rail did preserve those pages, and it must not, because the witness it
 /// would preserve them on cannot answer the question it is being asked.
@@ -2650,12 +2649,40 @@ pub fn render_window_identity(
 /// not a race: it is the same unsoundness that made preserving the pages black
 /// the screen, and it points the one way that costs nothing to be wrong about.
 ///
-/// So a surviving occurrence is an **upper bound on** clobbered windows, not a
-/// count of them, and a single line is not by itself a defect. What would be a
-/// defect is the rate not falling when the fence binding tightens, or a
-/// `rendw_stamp_outlived` naming a window that landed after
-/// [`crate::runtime::drain::write_stamp`] — that one is an ordering statement
-/// the device can actually make.
+/// So a surviving occurrence cannot be read as a count of clobbered windows. It
+/// is, however, no longer something to tolerate a line of, because on a healthy
+/// device it does not occur at all.
+///
+/// Over twenty recorded x86/Vulkan boots on three binaries, this route fires if
+/// and only if the boot's guest-write witness latched — the state
+/// `reims_vgpu_dirty_harvest` used to reach when its tracked window crossed the
+/// PCI hole, in which every page of every surface reads permanently written:
+///
+/// ```text
+/// witness healthy   15 boots   0 firings, over 69k-85k surface_flushes each
+/// witness latched    5 boots   29-69 firings
+/// ```
+///
+/// Zero overlap, and the zeroes are on boots that ran the rail tens of thousands
+/// of times — a real never-fires rather than a rail the workload skipped. That
+/// makes this a **healthy-zero alarm**: a firing is not a loose upper bound to
+/// be discounted, it is the witness reporting that every page reads written, and
+/// the guest is about to show transparent backdrops and broken popover geometry
+/// until it reboots. Treat a single line as that, and read
+/// `gw_refused_guest_store` next to it — the two move together.
+///
+/// The loose-verdict reasoning above still holds and is why the *preserve* rail
+/// stays retired: it is structural, about stamping at harvest rather than at the
+/// write, and it is untouched by the witness being fixed. What the fix removes
+/// is only the expectation that this counter carries a standing background rate.
+/// The bisect that blacked the screen was run on a latched binary, which is
+/// exactly what preserving produces when the witness claims every page was
+/// written, so it corroborates far less than its numbers suggest. Do not read it
+/// as having independently measured the preserve rail.
+///
+/// The other thing that would be a defect is a `rendw_stamp_outlived` naming a
+/// window that landed after [`crate::runtime::drain::write_stamp`] — that one is
+/// an ordering statement the device can actually make.
 ///
 /// [`crate::runtime::mapping_write::write_bgra8_skipping`] and
 /// `HostOps::guest_written_pages` stay: the sampled ladder's merge uses both,
@@ -2675,8 +2702,10 @@ fn note_render_flush_over_guest_write<M: HostOps>(
         "deferred_flush_clobber kind=render mapping={} {}x{} fmt={:#x} gen={} \
          (a guest write to this surface was observed since the Store this window \
          defers, and the full-extent writeback replaces it; the witness moves at \
-         harvest, not at the write, so this cannot order the two and is an upper \
-         bound)",
+         harvest, not at the write, so this line cannot order the two — but it \
+         does not occur at all on a healthy device, so a run of these means the \
+         guest-write witness has latched every page as written, and \
+         gw_refused_guest_store will be in the thousands)",
         key.mapping_id, key.width, key.height, key.pixel_format, key.map_generation
     ));
 }
