@@ -980,7 +980,10 @@ pub fn flush_linear_windows_before_fence<M: HostMemory + HostOps>(
 ///   and a grep for that has already missed `gva_view::map_fresh_span_within`
 ///   once.
 /// - Punching a page out loses whatever the guest had put there, so the content
-///   to fill with has to be captured before the punch, not after.
+///   to fill with has to be captured before the punch, not after. This one is
+///   `MISSING`-mode only; guest RAM here is a shared memfd, where minor-fault
+///   mode unmaps without evicting the page cache and there is nothing to
+///   capture. See "Which pages to register" below.
 ///
 /// ## What the rail is worth, and the second-order cost of not doing it
 ///
@@ -1045,9 +1048,26 @@ pub fn flush_linear_windows_before_fence<M: HostMemory + HostOps>(
 /// - **x86/PCI is the pathway this works on.** Its shim never allocates: it
 ///   translates and hands back `memory_region_get_ram_ptr(mr) + xlat`, which is
 ///   QEMU's own RAMBlock pointer, and answers `map_pages_stable = 1` for exactly
-///   that reason. `vm/boot-x86.sh` passes plain `-m` with no memory backend
-///   object, so guest RAM is a conventional anonymous mapping — the case uffd
-///   handles best. A registration on that range does trap the vCPU.
+///   that reason. A registration on that range does trap the vCPU.
+///
+///   Guest RAM is **shmem, not anonymous**, and that changes which uffd mode
+///   applies. `vm/boot-x86.sh` passes `memory-backend-memfd,share=on` because a
+///   dma-buf export needs an fd-backed RAMBlock, so the paragraph this replaces
+///   — "plain `-m`, a conventional anonymous mapping, the case uffd handles
+///   best" — described a boot script that no longer exists.
+///
+///   The consequence is favourable rather than not. `MISSING` mode over shmem
+///   needs the page punched out of the *file*, which is the third hazard below;
+///   but a shared memfd keeps the content in the page cache, so the applicable
+///   primitive is minor-fault mode (`UFFD_FEATURE_MINOR_SHMEM`, Linux 5.19+;
+///   this host runs 7.1.3). A page unmapped from the VMA but still in the page
+///   cache raises a *minor* fault, and `UFFDIO_CONTINUE` maps the cached page
+///   back with no copy and no content to have captured first. That is the mode
+///   post-copy uses for shared memory, and it is the one a rail re-arming the
+///   same pages every frame wants: arming costs an unmap, not a punch.
+///
+///   None of which makes uffd available here — see the privilege section below,
+///   which is unchanged and is what actually decides the mechanism.
 /// - **arm64/MMIO cannot take this route at all**, for two independent reasons.
 ///   Its shim answers `map_pages_stable = 0` because a page list that is not
 ///   host-contiguous gets a packed `mach_vm_remap` view — a second alias, which
