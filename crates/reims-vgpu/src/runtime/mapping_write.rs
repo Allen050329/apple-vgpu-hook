@@ -834,11 +834,18 @@ fn plan_guest_window(
     base_off: u64,
     span_end: u64,
     bpr: u32,
+    width: u32,
 ) -> Result<GuestWindowPlan, GpuWritebackDecline> {
     // `bufferRowLength` is in texels, so a pitch that is not a whole number of
     // them has no spelling. Checked rather than assumed: the value comes from
     // the guest's own device descriptor.
-    if !bpr.is_multiple_of(RGBA8_BPP) {
+    //
+    // The second half is a Vulkan validity rule rather than an arithmetic one:
+    // `bufferRowLength` must be zero or at least `imageExtent.width`, so a pitch
+    // narrower than the frame is an invalid copy and not a tight one. It cannot
+    // happen for a well-formed plane, which is exactly why nothing would notice
+    // if it did.
+    if !bpr.is_multiple_of(RGBA8_BPP) || bpr / RGBA8_BPP < width {
         return Err(GpuWritebackDecline::PitchNotTexels { bpr });
     }
     if span_end <= base_off || page_size == 0 {
@@ -953,7 +960,7 @@ pub fn write_bgra8_from_resident_gpu<M: HostMemory + HostOps>(
     let Some(m) = state.mappings.get(&mapping_id) else {
         return Err(GpuWritebackDecline::NotWritable);
     };
-    let plan = plan_guest_window(m.page_entries.len(), page_size, base_off, span_end, bpr)?;
+    let plan = plan_guest_window(m.page_entries.len(), page_size, base_off, span_end, bpr, mw)?;
     let mut gpas = Vec::with_capacity(plan.pages());
     for (i, &entry) in m.page_entries[plan.first_page..=plan.last_page]
         .iter()
@@ -2448,7 +2455,8 @@ mod tests {
         // 1920x1080 BGRA8, tight, starting at offset 0 of a 4 KiB-page guest.
         let (page, bpr) = (4096u64, 1920 * 4u32);
         let span = u64::from(bpr) * 1080;
-        let plan = plan_guest_window(usize::MAX, page, 0, span, bpr).expect("a tight window plans");
+        let plan =
+            plan_guest_window(usize::MAX, page, 0, span, bpr, 1920).expect("a tight window plans");
         assert_eq!(plan.first_page, 0);
         assert_eq!(plan.last_page, ((span - 1) / page) as usize);
         assert_eq!(plan.in_page, 0);
@@ -2472,7 +2480,7 @@ mod tests {
         let (page, bpr) = (4096u64, 256 * 4u32);
         let base = 3 * page + 512;
         let span = base + u64::from(bpr) * 8;
-        let plan = plan_guest_window(usize::MAX, page, base, span, bpr).expect("plans");
+        let plan = plan_guest_window(usize::MAX, page, base, span, bpr, 256).expect("plans");
         assert_eq!(plan.first_page, 3);
         assert_eq!(plan.in_page, 512);
         // Not the mapping offset: that is the bug this asserts against.
@@ -2487,8 +2495,8 @@ mod tests {
     fn the_same_window_spans_fewer_pages_on_a_sixteen_kilobyte_guest() {
         let bpr = 1024 * 4u32;
         let span = u64::from(bpr) * 64;
-        let x86 = plan_guest_window(usize::MAX, 4096, 0, span, bpr).expect("plans on x86");
-        let arm = plan_guest_window(usize::MAX, 16384, 0, span, bpr).expect("plans on arm64");
+        let x86 = plan_guest_window(usize::MAX, 4096, 0, span, bpr, 1024).expect("plans on x86");
+        let arm = plan_guest_window(usize::MAX, 16384, 0, span, bpr, 1024).expect("plans on arm64");
         assert_eq!(x86.pages(), arm.pages() * 4);
     }
 
@@ -2500,7 +2508,8 @@ mod tests {
     #[test]
     fn a_padded_pitch_becomes_a_row_length_in_texels() {
         let bpr = 2048 * 4u32;
-        let plan = plan_guest_window(usize::MAX, 4096, 0, u64::from(bpr) * 4, bpr).expect("plans");
+        let plan =
+            plan_guest_window(usize::MAX, 4096, 0, u64::from(bpr) * 4, bpr, 1600).expect("plans");
         assert_eq!(plan.row_length_texels, 2048);
     }
 
@@ -2516,24 +2525,32 @@ mod tests {
     fn a_geometry_the_copy_cannot_express_declines_by_name() {
         // A row pitch that is not a whole number of texels.
         assert_eq!(
-            plan_guest_window(usize::MAX, 4096, 0, 4096, 1023),
+            plan_guest_window(usize::MAX, 4096, 0, 4096, 1023, 1),
             Err(GpuWritebackDecline::PitchNotTexels { bpr: 1023 })
         );
         // A window starting on an odd byte inside its page.
         assert_eq!(
-            plan_guest_window(usize::MAX, 4096, 2, 4096, 4),
+            plan_guest_window(usize::MAX, 4096, 2, 4096, 4, 1),
             Err(GpuWritebackDecline::OffsetNotTexelAligned { in_page: 2 })
         );
         // A page list that stops before the window does. Writing anyway would
         // export whatever the shorter list's tail happens to name.
         assert_eq!(
-            plan_guest_window(2, 4096, 0, 3 * 4096, 4),
+            plan_guest_window(2, 4096, 0, 3 * 4096, 4, 1),
             Err(GpuWritebackDecline::PageListShort { need: 3, have: 2 })
         );
         // An empty or inverted window has no destination at all.
         assert_eq!(
-            plan_guest_window(usize::MAX, 4096, 100, 100, 4),
+            plan_guest_window(usize::MAX, 4096, 100, 100, 4, 1),
             Err(GpuWritebackDecline::NotWritable)
+        );
+        // A pitch narrower than the frame. Vulkan requires `bufferRowLength` to
+        // be zero or at least the extent's width, so this is an invalid copy
+        // rather than a tight one — and a plan that let it through would submit
+        // it, because nothing else in the path re-derives the row length.
+        assert_eq!(
+            plan_guest_window(usize::MAX, 4096, 0, 4096, 4 * 8, 9),
+            Err(GpuWritebackDecline::PitchNotTexels { bpr: 32 })
         );
     }
 
