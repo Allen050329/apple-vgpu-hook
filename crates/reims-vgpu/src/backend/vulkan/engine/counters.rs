@@ -287,6 +287,22 @@ engine_counters! {
         batch_joins,
         batch_flushes,
         batch_flush_draws,
+        /// Of `batch_flushes`, the ones a readback caused by claiming a ring
+        /// slot while a batch was still recording.
+        ///
+        /// `begin_entry` flushes unconditionally, so a batch ends either because
+        /// it filled to `BATCH_MAX_DRAWS` or because something else wanted a
+        /// slot — and a driven boot reads 1.77 draws per batch against a ceiling
+        /// of 8, which says almost none of them fill. This separates "a readback
+        /// cut the run short" from "a draw could not join". Without it the
+        /// readback's share is only boundable, because a readback that arrives
+        /// with no batch open flushes nothing and still calls `begin_entry`.
+        ///
+        /// Counted at the readback sites rather than inside `batch_flush`,
+        /// because that function cannot see who called it and threading a reason
+        /// through `begin_entry` would put a diagnostic in the signature of the
+        /// device's hottest slot claim.
+        batch_flush_by_readback,
     }
 
     cumulative {

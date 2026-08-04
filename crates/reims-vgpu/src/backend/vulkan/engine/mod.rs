@@ -1149,6 +1149,11 @@ unsafe fn copy_image_level0_to_host_delivered(
     // frames the rail exists for. A live boot read `render_flush_copied`
     // outnumbering `render_flush_leased` 5:1 on a host whose readback memory is
     // cached, which is the only symptom that mis-ordering has.
+    if pools.batch_is_open() {
+        counters
+            .batch_flush_by_readback
+            .fetch_add(1, Ordering::Relaxed);
+    }
     let (cb, fence) = pools.begin_entry(ctx, counters)?;
     let readback = pools.acquire_readback(ctx, rb_size, counters)?;
     // Acquired here rather than beside the dispatch, for the ordering reason
@@ -1648,6 +1653,11 @@ unsafe fn copy_image_level0_to_buffer(
     dst: &GuestPageTarget,
 ) -> Result<(), DrawError> {
     let submit_started = std::time::Instant::now();
+    if pools.batch_is_open() {
+        counters
+            .batch_flush_by_readback
+            .fetch_add(1, Ordering::Relaxed);
+    }
     let (cb, fence) = pools.begin_entry(ctx, counters)?;
     ctx.device
         .reset_command_buffer(cb, ash::vk::CommandBufferResetFlags::empty())

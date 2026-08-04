@@ -883,6 +883,17 @@ impl ResourcePools {
         Ok(())
     }
 
+    /// Whether a batch is recording and would be submitted by the next
+    /// [`Self::begin_entry`].
+    ///
+    /// For the readback paths, which claim a slot and therefore end whatever run
+    /// of draws was accumulating. Asked *before* `begin_entry` because after it
+    /// the answer is always `false`, and the census wants the readback's share
+    /// of `batch_flushes` rather than a bound on it.
+    pub(crate) fn batch_is_open(&self) -> bool {
+        self.open_batch.is_some()
+    }
+
     /// Start a new entry (draw / dispatch / sync helper): advance to the next
     /// ring slot, retiring it first if its CB is still in flight (this is the
     /// only place a full ring blocks). Returns the slot's CB + fence; the CB
