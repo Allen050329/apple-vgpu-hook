@@ -133,17 +133,34 @@ LOAD_OFF=$(stat -c %s "$FAILLOG")
 # guest where a posted pointer drag is not — see window-drag-probe.sh for why
 # the real drag cannot be arranged here. Each `set position` is a synchronous
 # round trip, so the loop runs for the duration and reports the rate it reached.
+# Position *and* size, plus a second app opening and closing throughout.
+#
+# Repositioning alone did not reproduce the degradation in two runs, and the
+# counter that separates a degraded boot from a healthy one — `type4_pages_stale`,
+# "task PT translation moved" — is about a surface's backing being *reallocated*,
+# which a window that only moves never does. A resize reallocates the window's
+# IOSurface, and an app opening and closing churns the whole surface pool, so
+# both are in the loop. The animated page keeps GPU traffic up underneath.
 ssh -o BatchMode=yes "$GUEST" "python3 -c \"
 import subprocess, time
+def osa(s):
+    subprocess.run(['osascript', '-e', s], capture_output=True)
+def evt(s):
+    osa('tell application \\\"System Events\\\" to tell process \\\"Safari\\\" to ' + s)
 t0, n = time.time(), 0
-xs = [320, 520, 720, 520]
+frames = [(320, 1400, 900), (520, 700, 500), (720, 1200, 780),
+          (400, 1600, 1000), (240, 900, 620)]
 while time.time() - t0 < $LOAD_SECONDS:
-    x = xs[n % len(xs)]
-    subprocess.run(['osascript', '-e',
-        'tell application \\\"System Events\\\" to tell process \\\"Safari\\\" '
-        'to set position of window 1 to {%d, 180}' % x],
-        capture_output=True)
+    x, w, h = frames[n % len(frames)]
+    evt('set position of window 1 to {%d, 140}' % x)
+    evt('set size of window 1 to {%d, %d}' % (w, h))
+    # Surface-pool churn: a second app's windows come and go under the load.
+    if n % 6 == 3:
+        subprocess.run(['open', '-a', 'TextEdit'], capture_output=True)
+    elif n % 6 == 0 and n:
+        osa('tell application \\\"TextEdit\\\" to quit')
     n += 1
+osa('tell application \\\"TextEdit\\\" to quit')
 print(n)
 \"" >"$WORK/load.count" 2>"$WORK/load.err" &
 LOAD_PID=$!
