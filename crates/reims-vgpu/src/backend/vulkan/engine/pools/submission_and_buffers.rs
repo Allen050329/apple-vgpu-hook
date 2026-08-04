@@ -883,15 +883,17 @@ impl ResourcePools {
         Ok(())
     }
 
-    /// Whether a batch is recording and would be submitted by the next
-    /// [`Self::begin_entry`].
+    /// The open batch's command buffer and the fence [`Self::batch_flush`] will
+    /// submit it with, for a caller that wants to append to the run rather than
+    /// end it.
     ///
-    /// For the readback paths, which claim a slot and therefore end whatever run
-    /// of draws was accumulating. Asked *before* `begin_entry` because after it
-    /// the answer is always `false`, and the census wants the readback's share
-    /// of `batch_flushes` rather than a bound on it.
-    pub(crate) fn batch_is_open(&self) -> bool {
-        self.open_batch.is_some()
+    /// The command buffer is **already recording** — the caller must not begin
+    /// or reset it — and it is between render passes, because a batch only
+    /// admits a draw that has ended its own. The fence is the one returned here
+    /// precisely so the caller can wait it after `batch_flush` without having to
+    /// reach back into a batch that no longer exists by then.
+    pub(crate) fn batch_open_recording(&self) -> Option<(vk::CommandBuffer, vk::Fence)> {
+        self.open_batch.as_ref().map(|b| (b.cb, b.fence))
     }
 
     /// Start a new entry (draw / dispatch / sync helper): advance to the next

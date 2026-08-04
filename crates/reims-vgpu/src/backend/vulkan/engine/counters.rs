@@ -287,22 +287,26 @@ engine_counters! {
         batch_joins,
         batch_flushes,
         batch_flush_draws,
-        /// Of `batch_flushes`, the ones a readback caused by claiming a ring
-        /// slot while a batch was still recording.
+        /// Readbacks that appended their copy to a batch that was still
+        /// recording, and so were submitted with it instead of behind it.
         ///
-        /// `begin_entry` flushes unconditionally, so a batch ends either because
-        /// it filled to `BATCH_MAX_DRAWS` or because something else wanted a
-        /// slot — and a driven boot reads 1.77 draws per batch against a ceiling
-        /// of 8, which says almost none of them fill. This separates "a readback
-        /// cut the run short" from "a draw could not join". Without it the
-        /// readback's share is only boundable, because a readback that arrives
-        /// with no batch open flushes nothing and still calls `begin_entry`.
+        /// This counted the opposite before the append path existed: the same
+        /// population, as *flushes a readback forced*. A driven boot read it at
+        /// 58.8 % of all `batch_flushes`, with batches averaging 1.77 draws
+        /// against a `BATCH_MAX_DRAWS` of 8 — so nearly every readback was
+        /// ending a run of draws to buy itself a second `vkQueueSubmit`. Each
+        /// one counted here is now one submission rather than two.
+        ///
+        /// Read against `batch_flushes` for the share that collapses, and
+        /// against `batch_flush_draws / batch_flushes` for what the intact runs
+        /// are worth. A readback arriving with no batch open is not counted and
+        /// has nothing to collapse.
         ///
         /// Counted at the readback sites rather than inside `batch_flush`,
         /// because that function cannot see who called it and threading a reason
         /// through `begin_entry` would put a diagnostic in the signature of the
         /// device's hottest slot claim.
-        batch_flush_by_readback,
+        batch_readback_joins,
     }
 
     cumulative {

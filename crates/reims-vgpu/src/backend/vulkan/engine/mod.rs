@@ -1149,12 +1149,35 @@ unsafe fn copy_image_level0_to_host_delivered(
     // frames the rail exists for. A live boot read `render_flush_copied`
     // outnumbering `render_flush_leased` 5:1 on a host whose readback memory is
     // cached, which is the only symptom that mis-ordering has.
-    if pools.batch_is_open() {
-        counters
-            .batch_flush_by_readback
-            .fetch_add(1, Ordering::Relaxed);
-    }
-    let (cb, fence) = pools.begin_entry(ctx, counters)?;
+    //
+    // # Appending to an open batch instead of flushing it
+    //
+    // A readback used to be two submissions: `begin_entry` submits the open
+    // draw batch to get it out of the way, then this function submits its own
+    // command buffer behind it. A driven boot measured
+    // `batch_readback_joins` at 58.8 % of all batch flushes and the batches
+    // themselves at 1.77 draws against a ceiling of 8 — so nearly every readback
+    // was cutting a run of draws short to pay for a second submission.
+    //
+    // When a batch is recording, the copy is appended to *it* and the batch is
+    // submitted once. Queue order is unchanged: the copy is recorded after the
+    // draws it reads, which is the same order the two submissions produced. The
+    // barrier below is what makes that an actual dependency, and it is recorded
+    // either way.
+    //
+    // This also *removes* the staging-slot hazard the paragraph above describes
+    // rather than adding to it. The slot is acquired after the batch's cb is in
+    // hand and is sealed into the batch's own pending cleanup by
+    // `batch_flush` — so the fence that returns it to the free list is now the
+    // very fence this copy was submitted with, instead of one submitted earlier.
+    let appended = pools.batch_open_recording();
+    let (cb, fence) = match appended {
+        Some(pair) => {
+            counters.batch_readback_joins.fetch_add(1, Ordering::Relaxed);
+            pair
+        }
+        None => pools.begin_entry(ctx, counters)?,
+    };
     let readback = pools.acquire_readback(ctx, rb_size, counters)?;
     // Acquired here rather than beside the dispatch, for the ordering reason
     // above: every readback slot this submission owns must be claimed after
@@ -1170,16 +1193,21 @@ unsafe fn copy_image_level0_to_host_delivered(
     } else {
         None
     });
-    ctx.device
-        .reset_command_buffer(cb, ash::vk::CommandBufferResetFlags::empty())
-        .map_err(|e| DrawError::VkCall(VkCall::new(ops.reset_cb, e)))?;
-    ctx.device
-        .begin_command_buffer(
-            cb,
-            &ash::vk::CommandBufferBeginInfo::default()
-                .flags(ash::vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-        )
-        .map_err(|e| DrawError::VkCall(VkCall::new(ops.begin_cb, e)))?;
+    // Only for a command buffer this call owns. An appended-to batch is already
+    // recording and holds the draws the copy is about to read; resetting it
+    // would discard them and beginning it again is invalid.
+    if appended.is_none() {
+        ctx.device
+            .reset_command_buffer(cb, ash::vk::CommandBufferResetFlags::empty())
+            .map_err(|e| DrawError::VkCall(VkCall::new(ops.reset_cb, e)))?;
+        ctx.device
+            .begin_command_buffer(
+                cb,
+                &ash::vk::CommandBufferBeginInfo::default()
+                    .flags(ash::vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )
+            .map_err(|e| DrawError::VkCall(VkCall::new(ops.begin_cb, e)))?;
+    }
     // Unconditional, and the layout match is exactly why. A barrier is two
     // things — a layout transition and a dependency — and this rail needs the
     // second one whether or not it needs the first. Every render pass resolves
@@ -1266,7 +1294,7 @@ unsafe fn copy_image_level0_to_host_delivered(
     // unaccounted, and `bar_us` near zero proves the draws are already finished
     // when the copy runs — so the 85.3 us is submission and wake latency. A
     // readback is two submissions today, because `begin_entry` above flushes the
-    // open draw batch before claiming a slot (`batch_flush_by_readback` is 58.8%
+    // open draw batch before claiming a slot (`batch_readback_joins` is 58.8%
     // of all batch flushes). Collapsing those two is the lever; see
     // `pools::BATCH_MAX_DRAWS`.
     ctx.device.cmd_copy_image_to_buffer(
@@ -1284,17 +1312,25 @@ unsafe fn copy_image_level0_to_host_delivered(
             2,
         );
     }
-    ctx.device
-        .end_command_buffer(cb)
-        .map_err(|e| DrawError::VkCall(VkCall::new(ops.end_cb, e)))?;
-    let queue = ctx.queue();
-    let cbs = [cb];
-    let si = ash::vk::SubmitInfo::default().command_buffers(&cbs);
-    ctx.device
-        .queue_submit(queue, &[si], fence)
-        .map_err(|e| DrawError::VkCall(VkCall::new(ops.submit, e)))?;
-    let cleanup = pools.seal_entry(Vec::new(), Vec::new());
-    pools.finish_entry_async(cleanup);
+    if appended.is_some() {
+        // `batch_flush` ends the command buffer, submits it with the fence
+        // `batch_open_recording` handed back, and seals the batch's cleanup —
+        // which now carries this copy's staging slot. One submission for the
+        // draws and the copy together.
+        pools.batch_flush(ctx, counters)?;
+    } else {
+        ctx.device
+            .end_command_buffer(cb)
+            .map_err(|e| DrawError::VkCall(VkCall::new(ops.end_cb, e)))?;
+        let queue = ctx.queue();
+        let cbs = [cb];
+        let si = ash::vk::SubmitInfo::default().command_buffers(&cbs);
+        ctx.device
+            .queue_submit(queue, &[si], fence)
+            .map_err(|e| DrawError::VkCall(VkCall::new(ops.submit, e)))?;
+        let cleanup = pools.seal_entry(Vec::new(), Vec::new());
+        pools.finish_entry_async(cleanup);
+    }
     // Split three ways rather than timed as a whole: the submit and the copy
     // scale with the surface, the fence does not scale with anything we control,
     // and the fix for one is not the fix for the others.
@@ -1670,22 +1706,30 @@ unsafe fn copy_image_level0_to_buffer(
     dst: &GuestPageTarget,
 ) -> Result<(), DrawError> {
     let submit_started = std::time::Instant::now();
-    if pools.batch_is_open() {
-        counters
-            .batch_flush_by_readback
-            .fetch_add(1, Ordering::Relaxed);
+    // Appended to a recording batch where there is one, for the reason
+    // `copy_image_level0_to_host_delivered` gives: `begin_entry` would submit
+    // that batch only to submit this copy behind it, and the copy has to be
+    // ordered after those draws either way.
+    let appended = pools.batch_open_recording();
+    let (cb, fence) = match appended {
+        Some(pair) => {
+            counters.batch_readback_joins.fetch_add(1, Ordering::Relaxed);
+            pair
+        }
+        None => pools.begin_entry(ctx, counters)?,
+    };
+    if appended.is_none() {
+        ctx.device
+            .reset_command_buffer(cb, ash::vk::CommandBufferResetFlags::empty())
+            .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::GuestWriteResetCb, e)))?;
+        ctx.device
+            .begin_command_buffer(
+                cb,
+                &ash::vk::CommandBufferBeginInfo::default()
+                    .flags(ash::vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )
+            .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::GuestWriteBeginCb, e)))?;
     }
-    let (cb, fence) = pools.begin_entry(ctx, counters)?;
-    ctx.device
-        .reset_command_buffer(cb, ash::vk::CommandBufferResetFlags::empty())
-        .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::GuestWriteResetCb, e)))?;
-    ctx.device
-        .begin_command_buffer(
-            cb,
-            &ash::vk::CommandBufferBeginInfo::default()
-                .flags(ash::vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-        )
-        .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::GuestWriteBeginCb, e)))?;
     // The device's own clock, for the reason the readback rail takes it: `fence_us`
     // is CPU wall clock and cannot tell "the GPU is copying eight megabytes across
     // PCIe" from "the round trip costs more than the work". Those have opposite
@@ -1777,16 +1821,23 @@ unsafe fn copy_image_level0_to_buffer(
         &[],
         &[],
     );
-    ctx.device
-        .end_command_buffer(cb)
-        .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::GuestWriteEndCb, e)))?;
-    let cbs = [cb];
-    let si = ash::vk::SubmitInfo::default().command_buffers(&cbs);
-    ctx.device
-        .queue_submit(ctx.queue(), &[si], fence)
-        .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::GuestWriteSubmit, e)))?;
-    let cleanup = pools.seal_entry(Vec::new(), Vec::new());
-    pools.finish_entry_async(cleanup);
+    if appended.is_some() {
+        // Ends and submits the batch with the fence `batch_open_recording`
+        // returned, and seals the batch's cleanup — one submission carrying the
+        // draws and this copy together.
+        pools.batch_flush(ctx, counters)?;
+    } else {
+        ctx.device
+            .end_command_buffer(cb)
+            .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::GuestWriteEndCb, e)))?;
+        let cbs = [cb];
+        let si = ash::vk::SubmitInfo::default().command_buffers(&cbs);
+        ctx.device
+            .queue_submit(ctx.queue(), &[si], fence)
+            .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::GuestWriteSubmit, e)))?;
+        let cleanup = pools.seal_entry(Vec::new(), Vec::new());
+        pools.finish_entry_async(cleanup);
+    }
     use crate::runtime::drain::{note_readback_phase, ReadbackPhase};
     note_readback_phase(
         ReadbackPhase::Submit,

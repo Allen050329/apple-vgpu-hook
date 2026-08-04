@@ -1092,14 +1092,14 @@ const STAGING_MISS_EMIT_EVERY: u64 = 512;
 ///
 /// ```text
 /// batch_flushes           180775
-/// batch_flush_by_readback 106290   58.8 % of them
+/// batch_readback_joins 106290   58.8 % of them
 /// batch_flush_draws       319685    1.77 draws per batch
 /// ```
 ///
 /// **1.77 against a ceiling of 8**, so raising this constant would change
 /// nothing — a batch almost never reaches it. What ends a batch is
 /// `Pools::begin_entry`, which calls `batch_flush` unconditionally before
-/// claiming a ring slot, and every readback claims one. `batch_flush_by_readback`
+/// claiming a ring slot, and every readback claims one. `batch_readback_joins`
 /// is that share measured rather than inferred: **58.8 % of batch flushes are a
 /// readback cutting a run of draws short**, not a batch filling up.
 ///
