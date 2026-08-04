@@ -735,14 +735,34 @@ pub fn flush_linear_windows_before_fence<M: HostMemory + HostOps>(
 ///
 /// # What this costs, measured
 ///
-/// It is the single largest cost in the device. On a driven x86 boot (Safari
-/// WebGL, 120 Hz) `flush_rails` reads `render_us=688003 render=100` with the
-/// gva, linear and storage rails all at zero: **69% of the drain worker's
-/// entire second**, against 21% for draws. `readback_split` divides each 6.9 ms
-/// flush into submit 7 µs, fence 3.04 ms, staging memcpy 0.83 ms and guest-page
-/// write 2.68 ms.
+/// A flush is **~1.0 ms**, and the two host passes over the frame are gone.
+/// [`crate::runtime::mapping_write::write_bgra8_from_resident_gpu`] makes the
+/// guest's own pages the destination of the copy the GPU was making anyway, so
+/// nothing reads the frame back to the host and nothing scatters it out again.
+/// On a driven x86 window-drag boot the whole log sums to `render=13573
+/// render_us=13636753` — **1005 µs a flush** — and `readback_split` reports
+/// `write_us=0 write=0`, which is the phase recording nothing because nothing
+/// runs. The rail sustains 528 flushes in its busiest second at ~830 µs each.
 ///
-/// `fence_us` owning that line reads like latency, and it is not. The GPU
+/// The paragraphs below are the reading from **before** that rail existed, kept
+/// because what they establish about the *shape* of the remaining cost still
+/// decides what to build next. Read them as history: the numbers in them are the
+/// copying rail's, and the copying rail now runs only where the GPU one declines
+/// (`render_flush_gpu_declined`, which the boot above never once emitted).
+///
+/// ## The copying rail, as it was
+///
+/// It was the single largest cost in the device. On a driven x86 boot (Safari
+/// WebGL, 120 Hz) `flush_rails` read `render_us=688003 render=100` with the
+/// gva, linear and storage rails all at zero: **69% of the drain worker's
+/// entire second**, against 21% for draws. `readback_split` divided each 6.9 ms
+/// flush into submit 7 µs, fence 3.04 ms, staging memcpy 0.83 ms and guest-page
+/// write 2.68 ms. The two that the GPU rail deletes outright are the last two,
+/// and the 6.8× it measures is larger than their 3.5 ms share alone, because a
+/// fence that no longer waits on a full-surface readback into host-visible
+/// memory is a shorter fence.
+///
+/// `fence_us` owning that line read like latency, and it was not. The GPU
 /// timestamp pair taken inside the fence divides it. On a driven Safari
 /// window-drag boot, one 1063 ms window reads `render_us=717130` split
 /// `fence_us=410022 write_us=290863 submit_us=6163 map_us=430`, and inside the
@@ -770,8 +790,10 @@ pub fn flush_linear_windows_before_fence<M: HostMemory + HostOps>(
 /// Nothing reads what it produces, either. `RenderFlushWitness` marks each of
 /// the two copies a flush lands — the mapping's guest pages and its host surface
 /// cache entry — and clears the mark when a host reader takes that copy, so the
-/// next flush of the same mapping reports what became of the previous one. A
-/// 30 s driven Safari probe scored 3766 landings:
+/// next flush of the same mapping reports what became of the previous one. The
+/// GPU rail lands only the first of the two, so its cache leg is `cache_stored =
+/// false` on every flush and the `render_flush_cache_*` pair now scores the
+/// copying rail alone. A 30 s driven Safari probe scored 3766 landings:
 ///
 /// ```text
 /// render_flush_cache_used      15    render_flush_cache_unread   3751
@@ -797,20 +819,31 @@ pub fn flush_linear_windows_before_fence<M: HostMemory + HostOps>(
 /// is the safe one.
 ///
 /// What the pair of numbers argues for is not flushing less often but not
-/// needing to flush at all. Two routes remain, and the witness rules out a third:
+/// needing to flush at all. Three routes were named; one has been built.
 ///
-/// - The zero-copy endgame above — a resident whose image memory *is* the guest
-///   pages. Available only where the host GPU can address host memory.
+/// - **Built.** The host copies are gone: the GPU writes the frame into the
+///   guest's pages through an imported dma-buf, so the flush is one copy instead
+///   of three passes over the frame. This is the near half of the "zero-copy
+///   endgame" — the *destination* is guest memory, though the resident's own
+///   image memory still is not, and cannot be while the resident is tiled.
 /// - Making the undeclared guest read observable, so the writeback becomes
 ///   demand-driven everywhere rather than only on `SynchronizeResources`. That
 ///   is what would make the rail's cost proportional to its 0.7% of consumed
-///   work on a discrete host too.
+///   work on a discrete host too. Still the route that pays on every host, and
+///   still unbuilt; the section below is why it starts as a counter.
+/// - Bounding *what* each flush copies. Now the largest remaining lever by
+///   arithmetic: with the host passes gone, essentially all of the ~1.0 ms is
+///   the GPU copying a whole surface, and the analysis two paragraphs up —
+///   "moving whole frames that nobody asked for" — is untouched by making that
+///   move cheaper. It needs a damage rect, which nothing upstream currently
+///   carries to this rail.
 /// - **Not** "flush only the mappings whose copies get read": which flushes were
 ///   wasted is knowable only in hindsight, and a mapping whose pages are read
 ///   while stale has already served wrong pixels.
 ///
 /// The async-readback split (release the device lock across the fence wait) is
-/// the step that does not require any of them.
+/// the step that does not require any of them, and the fence is now most of what
+/// a flush is.
 ///
 /// # What witnessing the undeclared read would take
 ///
