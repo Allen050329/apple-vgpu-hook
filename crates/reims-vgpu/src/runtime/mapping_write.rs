@@ -675,6 +675,331 @@ pub fn write_bgra8_uncached<M: HostMemory + HostOps>(
     )
 }
 
+/// A check that stopped a resident's frame from reaching the guest's pages
+/// without a host copy, so the flush owes the copying rail instead.
+///
+/// Every variant is a routing answer and not a loss — the caller still lands the
+/// frame — but each one is a whole frame's worth of memcpy the device paid twice
+/// over, on the rail that is 69% of the drain worker's time. So they are named
+/// individually: "the GPU writeback declined" cannot tell a host with no
+/// `/dev/udmabuf` from a surface whose row pitch is not a whole texel, and those
+/// have different fixes.
+#[cfg(feature = "backend-vulkan")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GpuWritebackDecline {
+    /// A zero or over-large rect, or a mapping that is gone or unmapped. The
+    /// copying rail refuses these too, by its own [`SurfaceWriteRefusal`]; this
+    /// path declines before making the guest pay two refusals for one cause.
+    NotWritable,
+    /// The mapping's declared geometry is not the frame's. The copying rail
+    /// reports this as `GeometryMoved`; here it means the same thing and the
+    /// same rail will say so.
+    GeometryMoved {
+        latched_width: u32,
+        latched_height: u32,
+        frame_width: u32,
+        frame_height: u32,
+    },
+    /// No sample window resolves for this geometry, so there is no destination
+    /// offset or row pitch to copy against.
+    WindowUnresolved {
+        width: u32,
+        height: u32,
+        format: u16,
+    },
+    /// The mapping's pixel format is not the one the resident holds, so landing
+    /// it needs a per-row conversion. A buffer→image copy performs none, which
+    /// is why this is a routing answer rather than something to work around.
+    FormatNeedsConversion { format: u16 },
+    /// The guest's row pitch is not a whole number of texels, so it cannot be
+    /// expressed as `bufferRowLength`.
+    PitchNotTexels { bpr: u32 },
+    /// The frame's first texel does not start on a 4-byte boundary within its
+    /// page. `VkBufferImageCopy::bufferOffset` must be a multiple of the texel
+    /// block size, and a copy that ignored this is undefined rather than
+    /// misaligned.
+    OffsetNotTexelAligned { in_page: u64 },
+    /// The mapping's page list does not cover the sample window.
+    PageListShort { need: usize, have: usize },
+    /// A page in the window carries no valid entry, so there is no guest frame
+    /// to name in the export list.
+    PageUnbacked { index: usize },
+    /// The page walk refused: these are no longer provably the mapping's pages.
+    /// The copying rail refuses for the same reason and reports it.
+    PagesNotOurs,
+    /// This host cannot export the window as a dma-buf. Latched and reported by
+    /// [`crate::runtime::guest_dmabuf`], which knows whether the reason is the
+    /// host or this window.
+    NoDmaBuf,
+    /// The engine declined or the copy failed; the inner error names which.
+    Engine {
+        inner: crate::backend::vulkan::engine::DrawError,
+    },
+}
+
+#[cfg(feature = "backend-vulkan")]
+impl crate::observe::Decline for GpuWritebackDecline {
+    fn slug(&self) -> &'static str {
+        match self {
+            Self::NotWritable => "gpuwb_not_writable",
+            Self::GeometryMoved { .. } => "gpuwb_geometry_moved",
+            Self::WindowUnresolved { .. } => "gpuwb_window_unresolved",
+            Self::FormatNeedsConversion { .. } => "gpuwb_format_needs_conversion",
+            Self::PitchNotTexels { .. } => "gpuwb_pitch_not_texels",
+            Self::OffsetNotTexelAligned { .. } => "gpuwb_offset_not_texel_aligned",
+            Self::PageListShort { .. } => "gpuwb_page_list_short",
+            Self::PageUnbacked { .. } => "gpuwb_page_unbacked",
+            Self::PagesNotOurs => "gpuwb_pages_not_ours",
+            Self::NoDmaBuf => "gpuwb_no_dmabuf",
+            // The engine's own slug, so a driver that refuses the fd and a
+            // resident in the wrong channel order stay as distinguishable here
+            // as they are where they were decided.
+            Self::Engine { inner } => crate::observe::Decline::slug(inner),
+        }
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        match self {
+            Self::NotWritable | Self::PagesNotOurs | Self::NoDmaBuf => Vec::new(),
+            Self::GeometryMoved {
+                latched_width,
+                latched_height,
+                frame_width,
+                frame_height,
+            } => vec![
+                ("latched", format!("{latched_width}x{latched_height}")),
+                ("frame", format!("{frame_width}x{frame_height}")),
+            ],
+            Self::WindowUnresolved {
+                width,
+                height,
+                format,
+            } => vec![
+                ("geom", format!("{width}x{height}")),
+                ("fmt", format!("{format:#x}")),
+            ],
+            Self::FormatNeedsConversion { format } => vec![("fmt", format!("{format:#x}"))],
+            Self::PitchNotTexels { bpr } => vec![("bpr", bpr.to_string())],
+            Self::OffsetNotTexelAligned { in_page } => vec![("in_page", in_page.to_string())],
+            Self::PageListShort { need, have } => {
+                vec![("need", need.to_string()), ("have", have.to_string())]
+            }
+            Self::PageUnbacked { index } => vec![("page", index.to_string())],
+            Self::Engine { inner } => crate::observe::Decline::fields(inner),
+        }
+    }
+}
+
+#[cfg(feature = "backend-vulkan")]
+crate::observe::decline::decline_display!(GpuWritebackDecline);
+
+/// Which of a mapping's pages a writeback's texels live in, and where inside
+/// them the first one is.
+///
+/// A dma-buf names whole pages and starts at a page boundary; a sample window
+/// starts wherever the guest's plane descriptor put it. This is the translation
+/// between the two, and getting it wrong lands a frame at the wrong offset in
+/// the guest's memory — which is a visibly shifted surface at best and another
+/// allocation's bytes at worst.
+#[cfg(feature = "backend-vulkan")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GuestWindowPlan {
+    /// Indices into `page_entries` of the first and last page the frame touches.
+    first_page: usize,
+    last_page: usize,
+    /// Byte offset of the frame's first texel within page `first_page`, which is
+    /// therefore its offset within the dma-buf.
+    in_page: u64,
+    /// Guest row pitch in texels (`bufferRowLength`).
+    row_length_texels: u32,
+}
+
+#[cfg(feature = "backend-vulkan")]
+impl GuestWindowPlan {
+    fn pages(&self) -> usize {
+        self.last_page - self.first_page + 1
+    }
+}
+
+/// Resolve a sample window against a mapping's page list.
+///
+/// Pure, and separate from its one caller for that reason: every value it
+/// produces feeds a `VkBufferImageCopy` whose failure mode is silent — Vulkan
+/// will happily write a frame at the wrong offset — and none of the surrounding
+/// device state is needed to decide any of them.
+#[cfg(feature = "backend-vulkan")]
+fn plan_guest_window(
+    page_entries: usize,
+    page_size: u64,
+    base_off: u64,
+    span_end: u64,
+    bpr: u32,
+) -> Result<GuestWindowPlan, GpuWritebackDecline> {
+    // `bufferRowLength` is in texels, so a pitch that is not a whole number of
+    // them has no spelling. Checked rather than assumed: the value comes from
+    // the guest's own device descriptor.
+    if !bpr.is_multiple_of(RGBA8_BPP) {
+        return Err(GpuWritebackDecline::PitchNotTexels { bpr });
+    }
+    if span_end <= base_off || page_size == 0 {
+        return Err(GpuWritebackDecline::NotWritable);
+    }
+    let first_page = (base_off / page_size) as usize;
+    let last_page = ((span_end - 1) / page_size) as usize;
+    if page_entries <= last_page {
+        return Err(GpuWritebackDecline::PageListShort {
+            need: last_page + 1,
+            have: page_entries,
+        });
+    }
+    // The dma-buf starts at a page boundary, so the frame's first texel sits
+    // this far into it. Whole texels only, which is what `bufferOffset` requires
+    // and what a guest pitch in texels already implies for every row but the
+    // first.
+    let in_page = base_off % page_size;
+    if !in_page.is_multiple_of(u64::from(RGBA8_BPP)) {
+        return Err(GpuWritebackDecline::OffsetNotTexelAligned { in_page });
+    }
+    Ok(GuestWindowPlan {
+        first_page,
+        last_page,
+        in_page,
+        row_length_texels: bpr / RGBA8_BPP,
+    })
+}
+
+/// Copy a resident target straight into the guest's pages, with the frame never
+/// existing on the host.
+///
+/// # What this is for
+///
+/// The copying rail this replaces moves the frame twice after the GPU has
+/// already written it once: the resident is read into a `HOST_VISIBLE` staging
+/// buffer, and the CPU then scatters that buffer into guest RAM row by row.
+/// `readback_split` prices the pair at 0.83 ms of staging map plus 2.68 ms of
+/// guest-page write inside a 6.9 ms flush, and the flush rail is 69% of the
+/// drain worker's second. Making the guest's own pages the copy's destination
+/// leaves only the copy that always had to happen.
+///
+/// # What it still owes
+///
+/// Everything [`write_bgra8_inner`] does *besides* moving bytes, because those
+/// obligations are about the guest's pages having changed and not about who
+/// changed them. In particular the guest-write witness
+/// ([`DeviceState::note_host_wrote_mapping`]) and the page footprint: a rail that
+/// lands frames without recording that it did makes
+/// [`crate::runtime::gather_witness`] attribute its own writes to the guest, and
+/// the type-11 resident rung above it then refuses residents and gathers whole
+/// surfaces per bind. That failure is measured and it costs more than this rail
+/// saves — see the ledger in [`crate::runtime::storage_flush`].
+///
+/// # Errors
+///
+/// Every decline is a routing answer: the caller still owes the frame and takes
+/// the copying rail. `Ok(())` means the pixels are in the guest's pages and the
+/// GPU has finished writing them.
+#[cfg(feature = "backend-vulkan")]
+pub fn write_bgra8_from_resident_gpu<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+    identity: &crate::backend::vulkan::engine::TargetIdentity,
+    width: u32,
+    height: u32,
+) -> Result<u64, GpuWritebackDecline> {
+    if width == 0 || height == 0 || width > MAX_SCANOUT_DIM || height > MAX_SCANOUT_DIM {
+        return Err(GpuWritebackDecline::NotWritable);
+    }
+    let Some(m) = state.mappings.get(&mapping_id) else {
+        return Err(GpuWritebackDecline::NotWritable);
+    };
+    if !m.mapped || m.page_entries.is_empty() {
+        return Err(GpuWritebackDecline::NotWritable);
+    }
+    let (mw, mh, format) = mapping_write_geometry(m, width, height);
+    if mw != width || mh != height {
+        return Err(GpuWritebackDecline::GeometryMoved {
+            latched_width: mw,
+            latched_height: mh,
+            frame_width: width,
+            frame_height: height,
+        });
+    }
+    // A buffer→image copy moves bytes and converts nothing, so the mapping's
+    // format has to be the one the resident already holds. `into_bgra8` on the
+    // copying rail is where a semantic-RGBA resident is exchanged, and the
+    // engine refuses one of those on its own account too.
+    if format != MTL_FORMAT_BGRA8_UNORM && format != pixel_format::MTL_FORMAT_BGRA8_UNORM_SRGB {
+        return Err(GpuWritebackDecline::FormatNeedsConversion { format });
+    }
+    let Some((base_off, bpr, span_end)) = type11_sample_window(m, mapping_id, mw, mh, format)
+    else {
+        return Err(GpuWritebackDecline::WindowUnresolved {
+            width: mw,
+            height: mh,
+            format,
+        });
+    };
+    // Deferred-writeback flush-on-access, before the vouch and before the page
+    // list is read: this can invalidate the mapping — that is exactly what its
+    // own drift check does — and every value taken after it is taken against
+    // whatever it left behind.
+    crate::runtime::storage_flush::flush_intersecting(state, host, mapping_id, base_off, span_end);
+    let Some(_vouched) = vouch_for_write(state, host, mapping_id, "gpu_writeback") else {
+        return Err(GpuWritebackDecline::PagesNotOurs);
+    };
+    let page_size = state.page_size();
+    let page_shift = state.page_shift;
+    let Some(m) = state.mappings.get(&mapping_id) else {
+        return Err(GpuWritebackDecline::NotWritable);
+    };
+    let plan = plan_guest_window(m.page_entries.len(), page_size, base_off, span_end, bpr)?;
+    let mut gpas = Vec::with_capacity(plan.pages());
+    for (i, &entry) in m.page_entries[plan.first_page..=plan.last_page]
+        .iter()
+        .enumerate()
+    {
+        let Some(gpa) = crate::contract::iosurface_pages::entry_gpa_shift(entry, page_shift) else {
+            return Err(GpuWritebackDecline::PageUnbacked {
+                index: plan.first_page + i,
+            });
+        };
+        gpas.push(gpa);
+    }
+    let Some(window) = crate::runtime::guest_dmabuf::dmabuf_for(host, &gpas, page_size as u32)
+    else {
+        return Err(GpuWritebackDecline::NoDmaBuf);
+    };
+    let target = crate::backend::vulkan::engine::GuestPageTarget {
+        window,
+        mapped_bytes: gpas.len() as u64 * page_size,
+        offset: plan.in_page,
+        row_length_texels: plan.row_length_texels,
+        width: mw,
+        height: mh,
+    };
+    // Both witnesses before the copy rather than after it, matching
+    // `contig_for_write`: a refused write costs a spurious bump, which makes a
+    // reader re-read bytes that did not change, while the opposite error hands
+    // out a stale copy as fresh.
+    //
+    // Marked over `[base_off, span_end)` — the extent the copy names — rather
+    // than from zero, because unlike the contig view this rail knows its own
+    // rows and has no pointer whose coverage it is restating.
+    mapper::note_mapping_write_footprint(state, mapping_id, base_off, span_end - base_off);
+    state.note_host_wrote_mapping(mapping_id);
+    crate::backend::vulkan::engine::copy_target_to_guest_pages(identity, &target)
+        .map_err(|inner| GpuWritebackDecline::Engine { inner })?;
+    state.invalidate_storage_residency_window(mapping_id, base_off, span_end);
+    let _ = state.mark_mapping_written(mapping_id);
+    // Nothing here leaves a host copy of the frame, so the surface cache must
+    // not go on naming one: its entry, if any, is a previous flush's bytes and
+    // the guest's pages are now the only place this frame exists. Same reason
+    // `write_bgra8_uncached` invalidates rather than publishes.
+    crate::runtime::surface_cache::forget(state, mapping_id);
+    Ok(span_end - base_off)
+}
+
 /// Land every deferred window overlapping the sample window a BGRA8 writeback
 /// of this mapping would cover.
 ///
@@ -2109,6 +2434,108 @@ mod tests {
     use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
     use crate::model::{DeviceId, PAGE_SHIFT_ARM64E};
     use crate::runtime::host::FakeHost;
+
+    /// A tight full-page-aligned surface names exactly the pages its bytes
+    /// occupy, and no more.
+    ///
+    /// The last page is the one holding the last *texel*, not the one holding
+    /// `bpr * height`. A plan that rounded up to the row pitch would pin — and
+    /// hand the GPU write access to — a page past the surface on every flush of
+    /// a padded layout, and the guest owns whatever is in it.
+    #[cfg(feature = "backend-vulkan")]
+    #[test]
+    fn a_tight_window_names_the_pages_its_texels_occupy() {
+        // 1920x1080 BGRA8, tight, starting at offset 0 of a 4 KiB-page guest.
+        let (page, bpr) = (4096u64, 1920 * 4u32);
+        let span = u64::from(bpr) * 1080;
+        let plan = plan_guest_window(usize::MAX, page, 0, span, bpr).expect("a tight window plans");
+        assert_eq!(plan.first_page, 0);
+        assert_eq!(plan.last_page, ((span - 1) / page) as usize);
+        assert_eq!(plan.in_page, 0);
+        assert_eq!(plan.row_length_texels, 1920);
+        // Exactly the pages the bytes are in: 1920*4*1080 is a whole number of
+        // 4 KiB pages, so the last texel is the last byte of the last one.
+        assert_eq!(plan.pages() as u64, span / page);
+    }
+
+    /// A window starting part-way into a page reports that offset, and the page
+    /// it starts in is the first the dma-buf names.
+    ///
+    /// This is the whole reason the plan exists. The fd starts at a page
+    /// boundary and the sample window does not, so a copy that took the window's
+    /// mapping offset as its `bufferOffset` would land the frame `first_page *
+    /// page_size` bytes early — off the front of the export entirely for any
+    /// surface past the first page.
+    #[cfg(feature = "backend-vulkan")]
+    #[test]
+    fn a_window_starting_inside_a_page_carries_the_offset_and_not_the_mapping_one() {
+        let (page, bpr) = (4096u64, 256 * 4u32);
+        let base = 3 * page + 512;
+        let span = base + u64::from(bpr) * 8;
+        let plan = plan_guest_window(usize::MAX, page, base, span, bpr).expect("plans");
+        assert_eq!(plan.first_page, 3);
+        assert_eq!(plan.in_page, 512);
+        // Not the mapping offset: that is the bug this asserts against.
+        assert_ne!(plan.in_page, base);
+    }
+
+    /// Page shift is explicit, so the same window plans differently on the two
+    /// guests. A helper that assumed 4 KiB would name four times too many pages
+    /// on arm64 and export three quarters of a surface it was never asked for.
+    #[cfg(feature = "backend-vulkan")]
+    #[test]
+    fn the_same_window_spans_fewer_pages_on_a_sixteen_kilobyte_guest() {
+        let bpr = 1024 * 4u32;
+        let span = u64::from(bpr) * 64;
+        let x86 = plan_guest_window(usize::MAX, 4096, 0, span, bpr).expect("plans on x86");
+        let arm = plan_guest_window(usize::MAX, 16384, 0, span, bpr).expect("plans on arm64");
+        assert_eq!(x86.pages(), arm.pages() * 4);
+    }
+
+    /// A padded guest pitch travels as texels, because that is what
+    /// `bufferRowLength` is. The inter-row bytes are never named, so the guest's
+    /// own content in the padding survives the flush — matching the copying
+    /// rail, which writes row by row and skips it too.
+    #[cfg(feature = "backend-vulkan")]
+    #[test]
+    fn a_padded_pitch_becomes_a_row_length_in_texels() {
+        let bpr = 2048 * 4u32;
+        let plan = plan_guest_window(usize::MAX, 4096, 0, u64::from(bpr) * 4, bpr).expect("plans");
+        assert_eq!(plan.row_length_texels, 2048);
+    }
+
+    /// Every value a `VkBufferImageCopy` cannot express declines by name rather
+    /// than being rounded into one it can.
+    ///
+    /// `bufferOffset` must be a multiple of the texel block size and
+    /// `bufferRowLength` is counted in texels; a copy submitted with either one
+    /// wrong is undefined behaviour, not a misplaced frame, so neither may be
+    /// silently repaired.
+    #[cfg(feature = "backend-vulkan")]
+    #[test]
+    fn a_geometry_the_copy_cannot_express_declines_by_name() {
+        // A row pitch that is not a whole number of texels.
+        assert_eq!(
+            plan_guest_window(usize::MAX, 4096, 0, 4096, 1023),
+            Err(GpuWritebackDecline::PitchNotTexels { bpr: 1023 })
+        );
+        // A window starting on an odd byte inside its page.
+        assert_eq!(
+            plan_guest_window(usize::MAX, 4096, 2, 4096, 4),
+            Err(GpuWritebackDecline::OffsetNotTexelAligned { in_page: 2 })
+        );
+        // A page list that stops before the window does. Writing anyway would
+        // export whatever the shorter list's tail happens to name.
+        assert_eq!(
+            plan_guest_window(2, 4096, 0, 3 * 4096, 4),
+            Err(GpuWritebackDecline::PageListShort { need: 3, have: 2 })
+        );
+        // An empty or inverted window has no destination at all.
+        assert_eq!(
+            plan_guest_window(usize::MAX, 4096, 100, 100, 4),
+            Err(GpuWritebackDecline::NotWritable)
+        );
+    }
 
     /// The gap walk is what both writeback paths subtract their skipped ranges
     /// with, so it is tested on its own: an off-by-one here is a row of pixels

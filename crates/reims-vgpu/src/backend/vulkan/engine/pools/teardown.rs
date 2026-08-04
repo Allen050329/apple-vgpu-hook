@@ -130,6 +130,12 @@ impl ResourcePools {
             device.destroy_image(t.image, None);
         }
         self.registry_order.clear();
+        // Every fence above was waited, so nothing can still be copying into an
+        // imported window. Freeing them here is what ends the GPU's access to
+        // the guest pages they name — the revocation the dma-buf carve-out rests
+        // on, and the one release that must happen even when the teardown is
+        // otherwise giving up.
+        self.dmabuf_imports.destroy_all(device);
         // Free every slab block now that all slab-backed images are destroyed.
         self.slab.destroy_all(device);
         // Same for the HOST_VISIBLE upload blocks: every staging buffer bound

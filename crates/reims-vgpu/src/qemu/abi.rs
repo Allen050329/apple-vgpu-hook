@@ -816,7 +816,10 @@ mod tests {
                 "REIMS_VGPU_DMABUF_ERR_NOT_MEMFD",
                 REIMS_VGPU_DMABUF_ERR_NOT_MEMFD,
             ),
-            ("REIMS_VGPU_DMABUF_ERR_NOT_RAM", REIMS_VGPU_DMABUF_ERR_NOT_RAM),
+            (
+                "REIMS_VGPU_DMABUF_ERR_NOT_RAM",
+                REIMS_VGPU_DMABUF_ERR_NOT_RAM,
+            ),
             (
                 "REIMS_VGPU_DMABUF_ERR_ALIGNMENT",
                 REIMS_VGPU_DMABUF_ERR_ALIGNMENT,
@@ -836,7 +839,10 @@ mod tests {
                 ours,
                 "the shim header and the staticlib disagree on {name}"
             );
-            assert!(ours < 0, "{name} must be negative so an fd of 0 is a success");
+            assert!(
+                ours < 0,
+                "{name} must be negative so an fd of 0 is a success"
+            );
         }
         assert_eq!(
             header_define("REIMS_VGPU_DMABUF_MAX_RUNS") as usize,

@@ -2119,7 +2119,7 @@ fn guest_run_alias_available<M: HostOps>(host: &M) -> bool {
 /// The page list rides out with the runs because a caller that wants to say
 /// anything about the window's *contents* over time needs the pages, not the
 /// host pointers: guest-write tracking is registered per page set.
-fn task_gva_guest_run_window<M: HostMemory + HostOps>(
+pub(super) fn task_gva_guest_run_window<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &mut M,
     task_id: u32,
@@ -2137,18 +2137,6 @@ fn task_gva_guest_run_window<M: HostMemory + HostOps>(
     }
     let runs = coalesce_pages_to_runs(host, &gpas, page, gva % page, span)?;
     Some((gpas, runs))
-}
-
-/// [`task_gva_guest_run_window`] for callers with nothing to say about the
-/// window's page set.
-pub(super) fn task_gva_guest_runs<M: HostMemory + HostOps>(
-    state: &DeviceState,
-    host: &mut M,
-    task_id: u32,
-    gva: u64,
-    span: u64,
-) -> Option<Vec<crate::backend::vulkan::engine::GuestRun>> {
-    task_gva_guest_run_window(state, host, task_id, gva, span).map(|(_, runs)| runs)
 }
 
 /// The page window behind a set of runs, when this host can export a dma-buf

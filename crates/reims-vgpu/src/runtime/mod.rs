@@ -38,12 +38,18 @@ pub mod fence_exec;
 pub mod gather_witness;
 /// Guest-physical control-plane writes via HostOps map_pages.
 pub mod gpa_map;
+/// The dma-buf over a guest page window — see the module doc for what bounds it.
+///
+/// Vulkan-only, and not merely because of where the code sits: a dma-buf is a
+/// Linux kernel object with no Metal importer, and every type this cache holds
+/// belongs to the Vulkan engine. A build without that backend has nothing to
+/// export to.
+#[cfg(feature = "backend-vulkan")]
+pub mod guest_dmabuf;
 /// Task GVA → guest RAM reads.
 pub mod gva_mem;
 /// Task-GVA HostOps views (MapMemory2 / UnmapMemory lifecycle).
 pub mod gva_view;
-/// The dma-buf over a guest page window — see the module doc for what bounds it.
-pub mod guest_dmabuf;
 /// CmdHeapTextureSizeAndAlign wire decode + host requirement query.
 pub mod heap_query;
 pub mod host;

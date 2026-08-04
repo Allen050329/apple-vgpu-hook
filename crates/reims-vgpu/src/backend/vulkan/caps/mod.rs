@@ -167,7 +167,10 @@ mod tests {
         let mut c = caps(vk::API_VERSION_1_2, &fixtures::apple_m3_max());
         c.dma_buf_import = DmaBufImport::NoDmaBufExtension;
         let line = c.selection_line("Apple M3 Max");
-        assert!(line.contains("dma_buf_import=no_dma_buf_extension"), "{line}");
+        assert!(
+            line.contains("dma_buf_import=no_dma_buf_extension"),
+            "{line}"
+        );
     }
 
     /// The API version does not change the classification. Getting this wrong is

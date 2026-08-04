@@ -3341,6 +3341,9 @@ fn apply_clear<M: HostMemory + HostOps>(
 
 #[cfg(test)]
 mod tests {
+    // Only the compute-preflight test names these opcodes, and that test is
+    // Vulkan-only — this device compiles no compute preflight without it.
+    #[cfg(feature = "backend-vulkan")]
     use reims_vgpu_wire::ops::compute as wire_compute;
 
     use reims_vgpu_wire::OP_HEADER_LEN;

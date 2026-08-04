@@ -219,11 +219,6 @@ pub fn cached_windows() -> usize {
 }
 
 #[cfg(test)]
-pub(crate) fn reset_for_tests() {
-    *CACHE.lock() = None;
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -281,7 +276,7 @@ mod tests {
     #[test]
     fn eviction_bounds_pinned_bytes_and_keeps_the_newest() {
         let mut cache = Cache::default();
-        let mut push = |cache: &mut Cache, id: u64, bytes: u64, used: u64| {
+        let push = |cache: &mut Cache, id: u64, bytes: u64, used: u64| {
             cache.entries.push(Entry {
                 key: id,
                 gpas: vec![id],
@@ -316,7 +311,10 @@ mod tests {
             key: 1,
             gpas: vec![1],
             bytes: MAX_PINNED_BYTES * 2,
-            dmabuf: Arc::new(GuestDmaBuf { id: 1, fd: pipe_fd() }),
+            dmabuf: Arc::new(GuestDmaBuf {
+                id: 1,
+                fd: pipe_fd(),
+            }),
             used: 1,
         });
         cache.pinned_bytes = MAX_PINNED_BYTES * 2;

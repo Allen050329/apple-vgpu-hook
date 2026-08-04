@@ -51,13 +51,13 @@ pub use types::{
     ComputeBufferResource, ComputeOutput, ComputeRequest, ComputeResidentSampleBind,
     ComputeSampledImageResource, ComputeStorageImageResource, ComputeStorageResidency, CullMode,
     DepthState, DrawError, DrawOutput, DrawRequest, GuestDmaBuf, GuestPageWindow, GuestRun,
-    GuestRunSource, IndexType,
-    IndexedDrawResource, PrimitiveTopology, SampledContentIdentity, SampledImageResource,
-    SampledSource, SamplerAddressMode, SamplerBorderColor, SamplerCompareFunction, SamplerFilter,
-    SamplerMipFilter, SamplerResource, ScissorResource, SecondaryColorTarget, SeedOrder,
-    StencilFaceOps, StencilOp, StencilState, StorageBufferResource, StorageImageFormat,
-    TargetIdentity, VertexAttributeFormat, VertexAttributeResource, VertexStepFunction,
-    ViewportResource, WindowPresentSource, COLOR_INPUT_BINDING,
+    GuestRunSource, IndexType, IndexedDrawResource, PrimitiveTopology, SampledContentIdentity,
+    SampledImageResource, SampledSource, SamplerAddressMode, SamplerBorderColor,
+    SamplerCompareFunction, SamplerFilter, SamplerMipFilter, SamplerResource, ScissorResource,
+    SecondaryColorTarget, SeedOrder, StencilFaceOps, StencilOp, StencilState,
+    StorageBufferResource, StorageImageFormat, TargetIdentity, VertexAttributeFormat,
+    VertexAttributeResource, VertexStepFunction, ViewportResource, WindowPresentSource,
+    COLOR_INPUT_BINDING,
 };
 pub use vk_call::{VkCall, VkOp};
 #[cfg(feature = "host-window")]
@@ -1474,6 +1474,256 @@ pub fn read_target_leased(identity: &TargetIdentity) -> Result<Option<LeasedFram
     }
 }
 
+/// Where in the guest's own pages a resident's frame lands, and the dma-buf that
+/// reaches them.
+///
+/// Built by the runtime, which is the only side that knows a mapping's page list
+/// and its row pitch; the engine takes it as given and checks only what it can
+/// see — that the resident matches the extent and that the window is long enough.
+pub struct GuestPageTarget {
+    /// The dma-buf over the pages. Held by `Arc` because the import cache keeps
+    /// it alive for as long as it names the window, and cloned rather than
+    /// consumed because the runtime's own cache keeps the original.
+    pub window: std::sync::Arc<GuestDmaBuf>,
+    /// Bytes the fd covers, which is whole pages and therefore at or past
+    /// `offset` plus the frame's extent.
+    pub mapped_bytes: u64,
+    /// Byte offset of the frame's first texel inside the dma-buf. Nonzero
+    /// whenever the surface does not start on a page boundary, which is what a
+    /// buffer→image copy expresses natively and a bound buffer cannot.
+    pub offset: u64,
+    /// Guest row pitch in **texels** (`bufferRowLength`). Rows past the first
+    /// start this far apart, which is how a padded guest pitch is honoured
+    /// without the inter-row bytes ever being written.
+    pub row_length_texels: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl GuestPageTarget {
+    /// One past the last byte the copy writes: the last texel of the last row.
+    ///
+    /// Padding after the final row is deliberately excluded. Those bytes belong
+    /// to the surface's plane but are not texels this call was given, and the
+    /// copying rail does not write them either — a bound that included them
+    /// would make the two rails land different guest memory for one frame.
+    fn extent_end(&self) -> u64 {
+        let pitch = u64::from(self.row_length_texels.max(self.width)) * 4;
+        let rows_before = u64::from(self.height.saturating_sub(1));
+        self.offset + rows_before * pitch + u64::from(self.width) * 4
+    }
+}
+
+/// Copy a resident target straight into the guest's pages, with no host copy of
+/// the frame at any point.
+///
+/// # What this replaces
+///
+/// The copying rail reads the resident into a `HOST_VISIBLE` staging buffer,
+/// waits, and then has the CPU scatter it row by row into guest RAM. Both halves
+/// move the whole frame — `readback_split` prices them at 0.83 ms of staging
+/// memcpy plus 2.68 ms of guest-page write in a 6.9 ms flush — and the GPU is
+/// already writing every one of those bytes once. Handing it the guest pages as
+/// the copy's destination deletes both, leaving the copy that always had to
+/// happen.
+///
+/// # Why this direction is sound where the read direction is not
+///
+/// Binding guest pages as a draw's *source* would have the GPU read them when
+/// the command buffer executes, and this device acks a command before its work
+/// runs — so the guest may repaint the pages first. Nothing here has that shape.
+/// The fence is waited before returning, and the caller runs inside
+/// `flush_all_windows_before_fence`, which is ordered before the completion
+/// stamp: the pages hold the frame before the guest is told anything.
+///
+/// # Errors
+///
+/// Every error is a routing answer — the caller still owes the frame, by the
+/// copying rail — except that a `VkCall` failure after the submit means the copy
+/// may have partly landed. That is the same exposure the copying rail carries
+/// for a partial scatter, and the caller reports it the same way.
+pub fn copy_target_to_guest_pages(
+    identity: &TargetIdentity,
+    dst: &GuestPageTarget,
+) -> Result<(), DrawError> {
+    use dmabuf::GuestWriteDecline;
+    let mut guard = lock_engine();
+    let EngineState {
+        ref mut owner,
+        ref mut pools,
+        ref counters,
+        ..
+    } = &mut *guard;
+    let ctx = owner.ensure(counters)?;
+    if !ctx.caps.dma_buf_import.is_available() {
+        return Err(DrawError::GuestPageWrite(GuestWriteDecline::Unsupported {
+            rung: ctx.caps.dma_buf_import,
+        }));
+    }
+    unsafe { pools.ensure_init(ctx, counters)? };
+    let snap = resident_read_snapshot(pools, identity)?;
+    if !snap.bgra {
+        return Err(DrawError::GuestPageWrite(
+            GuestWriteDecline::NotScanoutOrder,
+        ));
+    }
+    if snap.width != dst.width || snap.height != dst.height {
+        return Err(DrawError::GuestPageWrite(
+            GuestWriteDecline::GeometryMoved {
+                resident_width: snap.width,
+                resident_height: snap.height,
+                want_width: dst.width,
+                want_height: dst.height,
+            },
+        ));
+    }
+    let need = dst.extent_end();
+    if need > dst.mapped_bytes {
+        return Err(DrawError::GuestPageWrite(
+            GuestWriteDecline::WindowTooSmall {
+                need,
+                have: dst.mapped_bytes,
+            },
+        ));
+    }
+    unsafe {
+        // The whole window, not `need`: one window is one buffer whatever part
+        // of it this copy names, so the next flush of the same surface reuses
+        // the import instead of making a second one over the same pages.
+        let import = pools
+            .dmabuf_imports_mut()
+            .get_or_import(ctx, &dst.window, dst.mapped_bytes)
+            .map_err(|inner| DrawError::GuestPageWrite(GuestWriteDecline::Import { inner }))?;
+        copy_image_level0_to_buffer(ctx, pools, counters, &snap, import.buffer, dst)?;
+        pools.registry_set_layout(identity, ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+        counters.note_target_read(u64::from(dst.width) * u64::from(dst.height) * 4);
+    }
+    Ok(())
+}
+
+/// Record, submit and wait one image→buffer copy of a resident's level 0.
+///
+/// # Safety
+///
+/// `buffer` must be bound to memory covering `dst`'s extent, and `snap` must
+/// name a live image belonging to `ctx`.
+unsafe fn copy_image_level0_to_buffer(
+    ctx: &context::DeviceContext,
+    pools: &mut pools::ResourcePools,
+    counters: &counters::EngineCounters,
+    snap: &ResidentReadSnapshot,
+    buffer: ash::vk::Buffer,
+    dst: &GuestPageTarget,
+) -> Result<(), DrawError> {
+    let submit_started = std::time::Instant::now();
+    let (cb, fence) = pools.begin_entry(ctx, counters)?;
+    ctx.device
+        .reset_command_buffer(cb, ash::vk::CommandBufferResetFlags::empty())
+        .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::GuestWriteResetCb, e)))?;
+    ctx.device
+        .begin_command_buffer(
+            cb,
+            &ash::vk::CommandBufferBeginInfo::default()
+                .flags(ash::vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+        )
+        .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::GuestWriteBeginCb, e)))?;
+    // Unconditional, for the reason `copy_image_level0_to_host_delivered` states
+    // at length: the barrier is a layout transition *and* a dependency, and this
+    // rail needs the dependency whether or not the layout already matches. A
+    // render pass leaves its attachment in TRANSFER_SRC_OPTIMAL, so the common
+    // case transitions nothing and still must order this copy after the draws
+    // that produced the pixels.
+    let barrier = [ash::vk::ImageMemoryBarrier::default()
+        .src_access_mask(RESIDENT_READ_SRC_ACCESS)
+        .dst_access_mask(ash::vk::AccessFlags::TRANSFER_READ)
+        .old_layout(snap.layout)
+        .new_layout(ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+        .image(snap.image)
+        .subresource_range(color_subresource_range())];
+    ctx.device.cmd_pipeline_barrier(
+        cb,
+        ash::vk::PipelineStageFlags::ALL_COMMANDS,
+        ash::vk::PipelineStageFlags::TRANSFER,
+        ash::vk::DependencyFlags::empty(),
+        &[],
+        &[],
+        &barrier,
+    );
+    let region = [ash::vk::BufferImageCopy::default()
+        .buffer_offset(dst.offset)
+        // In texels, and only meaningful when the guest's pitch is wider than
+        // the frame. Zero means tight rows, which is what the guest's own row
+        // pitch reduces to whenever it equals `width * 4`.
+        .buffer_row_length(dst.row_length_texels)
+        .image_subresource(color_subresource_layers())
+        .image_extent(ash::vk::Extent3D {
+            width: dst.width,
+            height: dst.height,
+            depth: 1,
+        })];
+    ctx.device.cmd_copy_image_to_buffer(
+        cb,
+        snap.image,
+        ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+        buffer,
+        &region,
+    );
+    // The reader of these bytes is the guest's vCPU, which is a host reader as
+    // far as this device is concerned: the memory is guest RAM the driver
+    // imported, not device-local memory that owes a readback. So the write is
+    // released to `HOST` with `HOST_READ`, which is what makes it visible to a
+    // CPU access after the fence signals.
+    //
+    // Cache maintenance beyond that is the exporter's. `udmabuf` hands the
+    // importer references to ordinary system pages, and a PCIe write to system
+    // memory is snooped, so there is no invalidate for this side to issue.
+    let host_visible = [ash::vk::MemoryBarrier::default()
+        .src_access_mask(ash::vk::AccessFlags::TRANSFER_WRITE)
+        .dst_access_mask(ash::vk::AccessFlags::HOST_READ)];
+    ctx.device.cmd_pipeline_barrier(
+        cb,
+        ash::vk::PipelineStageFlags::TRANSFER,
+        ash::vk::PipelineStageFlags::HOST,
+        ash::vk::DependencyFlags::empty(),
+        &host_visible,
+        &[],
+        &[],
+    );
+    ctx.device
+        .end_command_buffer(cb)
+        .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::GuestWriteEndCb, e)))?;
+    let cbs = [cb];
+    let si = ash::vk::SubmitInfo::default().command_buffers(&cbs);
+    ctx.device
+        .queue_submit(ctx.queue(), &[si], fence)
+        .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::GuestWriteSubmit, e)))?;
+    let cleanup = pools.seal_entry(Vec::new(), Vec::new());
+    pools.finish_entry_async(cleanup);
+    use crate::runtime::drain::{note_readback_phase, ReadbackPhase};
+    note_readback_phase(
+        ReadbackPhase::Submit,
+        submit_started.elapsed().as_micros() as u64,
+    );
+    // The wait this rail cannot skip. The caller runs before the completion
+    // stamp, and the guest reads these pages with no device operation at all, so
+    // "the copy is queued" is not a state the stamp may be written in.
+    let fence_started = std::time::Instant::now();
+    pools.wait_entry_fence(ctx, counters, fence)?;
+    note_readback_phase(
+        ReadbackPhase::Fence,
+        fence_started.elapsed().as_micros() as u64,
+    );
+    Ok(())
+}
+
+/// Guest memory the device can currently reach through imported dma-bufs, and
+/// how many windows that is. Census only.
+pub fn guest_import_census() -> (u64, usize) {
+    let mut guard = lock_engine();
+    let cache = guard.pools.dmabuf_imports_mut();
+    (cache.imported_bytes(), cache.len())
+}
+
 /// The `srcAccessMask` a resident color target's readback must drain.
 const RESIDENT_READ_SRC_ACCESS: ash::vk::AccessFlags = ash::vk::AccessFlags::from_raw(
     ash::vk::AccessFlags::COLOR_ATTACHMENT_WRITE.as_raw()
@@ -1835,6 +2085,68 @@ mod engine_lock_census_tests {
             .and_then(|value| value.parse().ok())
             .expect("window_wait_us parses");
         assert!(waited >= 10_000, "waited only {waited} us: {line}");
+    }
+}
+
+#[cfg(test)]
+mod guest_page_target_tests {
+    use super::*;
+
+    fn target(width: u32, height: u32, row_length_texels: u32, offset: u64) -> GuestPageTarget {
+        let (read, _write) = std::io::pipe().expect("a pipe for a placeholder fd");
+        GuestPageTarget {
+            window: std::sync::Arc::new(GuestDmaBuf {
+                id: 1,
+                fd: std::os::fd::OwnedFd::from(read),
+            }),
+            mapped_bytes: u64::MAX,
+            offset,
+            row_length_texels,
+            width,
+            height,
+        }
+    }
+
+    /// The bound stops at the last row's last texel, not at a whole row pitch
+    /// past it.
+    ///
+    /// Padding after the final row belongs to the surface's plane but is not a
+    /// texel this copy was given, and the copying rail does not write it either.
+    /// A bound that included it would make the two rails land different guest
+    /// memory for one frame — the same divergence
+    /// `write_full_rect_raw_staged_leaves_inter_row_padding_alone` guards on the
+    /// CPU side.
+    #[test]
+    fn the_write_bound_ends_at_the_last_texel_and_not_a_row_pitch_past_it() {
+        // 8 rows of 4 texels at a 16-texel pitch: 7 full pitches plus one packed
+        // row, not 8 full pitches.
+        let padded = target(4, 8, 16, 0);
+        assert_eq!(padded.extent_end(), 7 * 16 * 4 + 4 * 4);
+        // A tight frame is the same expression with the pitch equal to the
+        // width, which reduces to the whole frame.
+        let tight = target(4, 8, 4, 0);
+        assert_eq!(tight.extent_end(), 4 * 8 * 4);
+    }
+
+    /// A frame that does not start on a page boundary is bounded from where it
+    /// actually starts. Dropping the offset here would under-report the reach by
+    /// exactly the amount the copy writes past the end of the export.
+    #[test]
+    fn the_write_bound_includes_the_offset_into_the_window() {
+        let at_zero = target(64, 64, 64, 0);
+        let shifted = target(64, 64, 64, 512);
+        assert_eq!(shifted.extent_end(), at_zero.extent_end() + 512);
+    }
+
+    /// A zero row length means tight rows, which is what `bufferRowLength`
+    /// itself means — so the bound must read it as the frame's own width rather
+    /// than as a zero pitch that collapses every row onto the first.
+    #[test]
+    fn a_zero_row_length_is_a_tight_pitch_and_not_a_zero_one() {
+        assert_eq!(
+            target(32, 4, 0, 0).extent_end(),
+            target(32, 4, 32, 0).extent_end()
+        );
     }
 }
 

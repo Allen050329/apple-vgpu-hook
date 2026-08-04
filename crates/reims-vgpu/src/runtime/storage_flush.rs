@@ -2384,6 +2384,12 @@ fn flush_render_one<M: HostMemory + HostOps>(
     // [`crate::backend::vulkan::engine::LeasedFrame`] for what the borrow costs
     // and [`crate::runtime::mapping_write::write_bgra8_uncached`] for what
     // happens to the cache entry instead.
+    // Before the frame is acquired rather than after, so the one reading is
+    // taken at the same point on every route this function has. The GPU-direct
+    // arm below returns without ever reaching the copying arms, and a census
+    // sampled only on the copying side would report this rail's guest-write
+    // overlap as though the fast route did not exist.
+    note_render_flush_over_guest_write(state, host, key);
     let frame: FlushFrame = match source {
         crate::model::RenderWindowSource::Owned(bytes) => FlushFrame::Owned(bytes.clone()),
         crate::model::RenderWindowSource::Resident { epoch } => {
@@ -2425,6 +2431,62 @@ fn flush_render_one<M: HostMemory + HostOps>(
                     key.mapping_id, key.width, key.height, key.pixel_format, key.map_generation
                 ));
                 return false;
+            }
+            // The frame need not exist on the host at all.
+            //
+            // Both arms below move it twice after the GPU has already written it
+            // once: into a staging buffer, then out of that buffer into guest
+            // RAM. `copy_target_to_guest_pages` makes the guest's own pages the
+            // destination of the copy the GPU was going to make anyway, so the
+            // two host passes — `readback_split map_us` plus `write_us`, about
+            // 3.5 ms of a 6.9 ms flush — simply do not happen.
+            //
+            // Tried first because when it works there is nothing left for the
+            // rest of this function to do, and declined for a named reason
+            // otherwise. A decline is a routing answer, not a loss: the copying
+            // arms below still land the frame, exactly as they did before this
+            // rail existed.
+            //
+            // Ordered against the guest here in the one way that matters: this
+            // runs inside `flush_all_windows_before_fence`, which is ordered
+            // before `write_stamp`, and the engine waits its own fence before
+            // returning. The pages hold the frame before the guest is told
+            // anything about the submission that produced it.
+            match crate::runtime::mapping_write::write_bgra8_from_resident_gpu(
+                state,
+                host,
+                key.mapping_id,
+                &identity,
+                key.width,
+                key.height,
+            ) {
+                Ok(bytes) => {
+                    crate::backend::vulkan::engine::unpin_resident_target(&identity);
+                    crate::runtime::drain::note_store_route("render_flush_gpu_direct");
+                    return finish_render_flush(
+                        state,
+                        key,
+                        Some(identity),
+                        bytes as usize,
+                        true,
+                        // Nothing was published to the host surface cache: this
+                        // rail never had a host copy to publish.
+                        false,
+                        started,
+                    );
+                }
+                Err(decline) => {
+                    // Latched per mapping as well as per reason. A host with no
+                    // `/dev/udmabuf` declines every flush of every surface, and
+                    // a line per flush would drown the channel; a line per
+                    // (reason, mapping) says which surfaces are paying the copy
+                    // and why, once each.
+                    crate::observe::Emit::decline("render_flush_gpu_declined", &decline)
+                        .field("mapping", key.mapping_id)
+                        .field("geom", format!("{}x{}", key.width, key.height))
+                        .fail_once(u64::from(key.mapping_id));
+                    crate::runtime::drain::note_store_route("render_flush_gpu_declined");
+                }
             }
             // Borrow first, and only where the borrow needs no transformation.
             //
@@ -2487,7 +2549,6 @@ fn flush_render_one<M: HostMemory + HostOps>(
             }
         }
     };
-    note_render_flush_over_guest_write(state, host, key);
     let write_started = std::time::Instant::now();
     let ok = match &frame {
         FlushFrame::Owned(bytes) => crate::runtime::mapping_write::write_bgra8_owned(
@@ -2526,6 +2587,39 @@ fn flush_render_one<M: HostMemory + HostOps>(
     // forbids, and the frame has no reader left after the write in any case.
     let frame_len = frame.len();
     drop(frame);
+    finish_render_flush(
+        state,
+        key,
+        flushed_from_resident,
+        frame_len,
+        ok,
+        cache_stored,
+        started,
+    )
+}
+
+/// The bookkeeping every landed render window owes, whichever route landed it.
+///
+/// Shared by the GPU-direct arm and the two copying arms because the obligations
+/// are about the guest's pages having changed, not about who moved the bytes.
+/// Splitting them was how the resident re-stamp below came to exist in one place
+/// and be missing from another, and the symptom of that omission — a rail that
+/// invalidates the resident holding exactly the content it just published — is a
+/// loop rather than a wrong pixel, which is much harder to see.
+#[cfg(feature = "backend-vulkan")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the window, what landed it, how much, and whether it succeeded"
+)]
+fn finish_render_flush(
+    state: &mut DeviceState,
+    key: &crate::model::ComputeStorageResidencyKey,
+    flushed_from_resident: Option<crate::backend::vulkan::engine::TargetIdentity>,
+    frame_len: usize,
+    ok: bool,
+    cache_stored: bool,
+    started: std::time::Instant,
+) -> bool {
     if !ok {
         crate::observe::fail(format!(
             "deferred_flush_lost kind=render mapping={} {}x{} fmt={:#x} gen={} reason=write_refused",

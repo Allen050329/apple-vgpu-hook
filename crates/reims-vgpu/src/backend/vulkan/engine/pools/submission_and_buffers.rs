@@ -6,6 +6,12 @@ impl ResourcePools {
         (self.registry.len(), self.targets.len(), sampled, storage)
     }
 
+    /// The guest page-window import cache. `&mut` because every use of it can
+    /// import or evict; there is no read-only question to ask of it.
+    pub(crate) fn dmabuf_imports_mut(&mut self) -> &mut super::dmabuf::ImportCache {
+        &mut self.dmabuf_imports
+    }
+
     pub(crate) fn new() -> Self {
         Self {
             staging_free: HashMap::new(),
@@ -47,6 +53,7 @@ impl ResourcePools {
             open_batch: None,
             slab: super::slab::SlabPool::new(),
             host_slab: super::host_slab::HostSlabPool::new(),
+            dmabuf_imports: super::dmabuf::ImportCache::default(),
             initialized: false,
         }
     }

@@ -54,6 +54,17 @@ pub enum VkOp {
     /// `vkInvalidateMappedMemoryRanges` of the readback buffer.
     ReadbackInvalidate,
 
+    // ---- mod.rs `copy_target_to_guest_pages` — the GPU-direct writeback rail,
+    //      which copies a resident straight into imported guest pages ----
+    /// `vkResetCommandBuffer` before recording the guest-page copy.
+    GuestWriteResetCb,
+    /// `vkBeginCommandBuffer` for the guest-page copy.
+    GuestWriteBeginCb,
+    /// `vkEndCommandBuffer` closing the guest-page copy.
+    GuestWriteEndCb,
+    /// `vkQueueSubmit` of the guest-page copy.
+    GuestWriteSubmit,
+
     // ---- mod.rs `read_resident_storage` — the pinned deferred-writeback
     //      storage-image flush rail (GPU→host tight copy, then unpin) ----
     /// `vkResetCommandBuffer` before recording the storage flush copy.
@@ -335,6 +346,11 @@ impl Decline for VkCall {
             VkOp::ReadbackMap => "vk_readback_map",
             VkOp::ReadbackInvalidate => "vk_readback_invalidate",
 
+            VkOp::GuestWriteResetCb => "vk_guest_write_reset_cb",
+            VkOp::GuestWriteBeginCb => "vk_guest_write_begin_cb",
+            VkOp::GuestWriteEndCb => "vk_guest_write_end_cb",
+            VkOp::GuestWriteSubmit => "vk_guest_write_submit",
+
             VkOp::StorageReadResetCb => "vk_storage_read_reset_cb",
             VkOp::StorageReadBeginCb => "vk_storage_read_begin_cb",
             VkOp::StorageReadEndCb => "vk_storage_read_end_cb",
@@ -500,6 +516,10 @@ mod tests {
         VkOp::ReadbackSubmit,
         VkOp::ReadbackMap,
         VkOp::ReadbackInvalidate,
+        VkOp::GuestWriteResetCb,
+        VkOp::GuestWriteBeginCb,
+        VkOp::GuestWriteEndCb,
+        VkOp::GuestWriteSubmit,
         VkOp::StorageReadResetCb,
         VkOp::StorageReadBeginCb,
         VkOp::StorageReadEndCb,

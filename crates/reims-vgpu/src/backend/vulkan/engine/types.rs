@@ -34,6 +34,10 @@ pub enum DrawError {
     /// A resident-target readback could not find its content.
     /// See [`super::reason::TargetReadDecline`].
     TargetRead(super::reason::TargetReadDecline),
+    /// A resident's frame could not be copied straight into the guest's pages,
+    /// so the flush owes the CPU route instead.
+    /// See [`super::dmabuf::GuestWriteDecline`].
+    GuestPageWrite(super::dmabuf::GuestWriteDecline),
     /// A specific Vulkan call that returned an error, typed by *(rail,
     /// operation)*. Former `Vulkan(String)` sites move here so the log names
     /// which call refused.
@@ -60,6 +64,7 @@ impl std::fmt::Display for DrawError {
             Self::ComputeValidation(d) => write!(f, "vk_engine_compute_validation: {d}"),
             Self::ComputeExecution(d) => write!(f, "vk_engine_compute_execution: {d}"),
             Self::TargetRead(d) => write!(f, "vk_engine_target_read: {d}"),
+            Self::GuestPageWrite(d) => write!(f, "vk_engine_guest_page_write: {d}"),
             Self::VkCall(c) => write!(f, "vk_engine_vk: {c}"),
             Self::Slab(d) => write!(f, "vk_engine_slab: {d}"),
             Self::FenceTimeout => write!(f, "vk_engine_fence_timeout"),
@@ -76,6 +81,7 @@ impl crate::observe::Decline for DrawError {
     fn slug(&self) -> &'static str {
         match self {
             Self::TargetRead(d) => d.slug(),
+            Self::GuestPageWrite(d) => d.slug(),
             Self::Unsupported(r) => r.slug(),
             // Delegates like the two typed variants above: the call names itself,
             // so one event has one name whether it is read here or on `VkCall`.
@@ -96,6 +102,7 @@ impl crate::observe::Decline for DrawError {
     fn fields(&self) -> Vec<(&'static str, String)> {
         match self {
             Self::TargetRead(d) => d.fields(),
+            Self::GuestPageWrite(d) => d.fields(),
             Self::Unsupported(r) => r.fields(),
             Self::VkCall(c) => c.fields(),
             Self::Slab(d) => d.fields(),

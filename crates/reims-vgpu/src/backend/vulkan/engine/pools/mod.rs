@@ -290,6 +290,11 @@ pub(crate) struct ResourcePools {
     /// `vkAllocateMemory` whatever its size, and the pool takes ~1 500 of them
     /// a boot, clustered on the first composite after idle.
     host_slab: super::host_slab::HostSlabPool,
+    /// Guest page windows imported as `VkBuffer`s, kept across frames. Lives
+    /// here rather than beside its one consumer so it is destroyed by the same
+    /// teardown that destroys every other device object, and so the bound is
+    /// enforced against the pool that owns it. See [`super::dmabuf::ImportCache`].
+    dmabuf_imports: super::dmabuf::ImportCache,
     initialized: bool,
 }
 

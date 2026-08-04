@@ -4071,7 +4071,7 @@ fn guest_runs_decline_on_unstable_host_mappings() {
 
         let mut state = DeviceState::new(DeviceId(1), page_shift);
         assert!(state.define_task(1, page, 2));
-        task_gva_guest_runs(&state, &mut host, 1, gva, 16)
+        task_gva_guest_run_window(&state, &mut host, 1, gva, 16).map(|(_, runs)| runs)
     };
 
     assert!(

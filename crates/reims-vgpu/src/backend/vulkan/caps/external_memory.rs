@@ -209,9 +209,9 @@ mod tests {
         let count = slugs.len();
         slugs.dedup();
         assert_eq!(slugs.len(), count, "two rungs share a slug");
-        assert!(slugs.iter().all(|s| s
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b == b'_')));
+        assert!(slugs
+            .iter()
+            .all(|s| s.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')));
     }
 
     /// The usage set queried is the usage set bound. Asking about a narrower set
