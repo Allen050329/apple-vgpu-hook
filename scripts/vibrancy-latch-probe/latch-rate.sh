@@ -42,6 +42,14 @@
 # latched whether or not the screenshot caught it. Score on this column and use
 # the verdict to confirm.
 #
+# Once the cause was fixed in the guest-write witness itself, eight consecutive
+# boots read 145 154 156 166 167 167 168 186 with `deferred_flush_clobber` 0 on
+# every one. Read the two controls alongside it before believing such a run:
+# `t11_gw_armed` and `gw_vouched` stayed at their pre-fix magnitudes, so the
+# witness was still armed and still answering. A change that silenced the
+# witness instead of fixing it would zero this column too, and those two are how
+# the difference is told.
+#
 # Usage:
 #   latch-rate.sh [--boots N] [--load-seconds S] [--census-seconds C] [--out DIR]
 #
@@ -105,6 +113,17 @@ census_total() {
     | awk '{s += $1} END {print s + 0}'
 }
 
+# Count the lines matching a pattern. Not `grep -c ... || echo 0`: grep -c
+# prints its count *and* exits 1 when that count is zero, so the fallback fires
+# on exactly the case it was meant to cover and the substitution yields two
+# lines. That put a bare "0" between every row of the TSV. Capture first, then
+# default, so a missing file still reads 0 without a zero count printing twice.
+line_count() {
+  local n
+  n=$(grep -c "$2" "$1" 2>/dev/null) || true
+  printf '%s' "${n:-0}"
+}
+
 # The probe's phases plus the boot, with headroom; the boot's own hard kill is
 # the backstop that keeps a wedged guest from stalling the sweep.
 budget=$(( LOAD_SECONDS + 4 * CENSUS_SECONDS + 420 ))
@@ -146,7 +165,7 @@ for i in $(seq 1 "$BOOTS"); do
     # the gate refused on.
     printf '%s\t%s\t%s\t%s\t%s\n' "$i" "probe-refused" "-" \
       "$(census_total "$boot_dir/full-boot.log" gw_refused_guest_store)" \
-      "$(grep -c 'deferred_flush_clobber' "$boot_dir/full-boot.log" 2>/dev/null || echo 0)" \
+      "$(line_count "$boot_dir/full-boot.log" 'deferred_flush_clobber')" \
       >>"$verdicts"
     continue
   fi
@@ -159,7 +178,7 @@ for i in $(seq 1 "$BOOTS"); do
   echo "$gate_out" | grep -q "not of the same scene" && verdict="gate-refused"
   cp "$FAILLOG" "$boot_dir/full-boot.log" 2>/dev/null || true
   gw=$(census_total "$boot_dir/full-boot.log" gw_refused_guest_store)
-  clobber=$(grep -c 'deferred_flush_clobber' "$boot_dir/full-boot.log" 2>/dev/null || echo 0)
+  clobber=$(line_count "$boot_dir/full-boot.log" 'deferred_flush_clobber')
   printf '%s\t%s\t%s\t%s\t%s\n' "$i" "$verdict" "${rmse:--}" "$gw" "$clobber" >>"$verdicts"
   say "boot $i: $verdict (pane rmse ${rmse:--}, gw_refused $gw, clobber $clobber)"
 done
