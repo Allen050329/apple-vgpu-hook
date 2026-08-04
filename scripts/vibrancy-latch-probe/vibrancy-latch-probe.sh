@@ -54,6 +54,9 @@ GUEST="${GUEST:-macos-vm}"
 FAILLOG="${REIMS_FAIL_LOG:-/tmp/reims-vgpu-fail.log}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SHOT="$REPO_ROOT/scripts/screenshot-when-kde-plasma-host/screenshot-when-kde-plasma-host.sh"
+# The x86 boot's stable per-boot symlink; the drag rides `input-send-event`
+# through it. See scripts/qmp/README.md — the arm64 default does not apply here.
+QMP_SOCK="${QMP_SOCK:-$REPO_ROOT/vm/disks/run/qmp.sock}"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -159,49 +162,32 @@ sleep 2
 START_POS=$(osa 'tell application "System Events" to tell process "Safari" to get position of window 1' || true)
 LOAD_OFF=$(stat -c %s "$FAILLOG")
 
-# Reposition through System Events, which is trusted for Accessibility on this
-# guest where a posted pointer drag is not — see window-drag-probe.sh for why
-# the real drag cannot be arranged here. Each `set position` is a synchronous
-# round trip, so the loop runs for the duration and reports the rate it reached.
-# Position *and* size, plus a second app opening and closing throughout.
+# A real pointer drag, through QEMU's own usb-tablet.
 #
-# Repositioning alone did not reproduce the degradation in two runs, and the
-# counter that separates a degraded boot from a healthy one — `type4_pages_stale`,
-# "task PT translation moved" — is about a surface's backing being *reallocated*,
-# which a window that only moves never does. A resize reallocates the window's
-# IOSurface, and an app opening and closing churns the whole surface pool, so
-# both are in the loop. The animated page keeps GPU traffic up underneath.
-ssh -o BatchMode=yes "$GUEST" "python3 -c \"
-import subprocess, time
-def osa(s):
-    subprocess.run(['osascript', '-e', s], capture_output=True)
-def evt(s):
-    osa('tell application \\\"System Events\\\" to tell process \\\"Safari\\\" to ' + s)
-t0, n = time.time(), 0
-frames = [(320, 1400, 900), (520, 700, 500), (720, 1200, 780),
-          (400, 1600, 1000), (240, 900, 620)]
-while time.time() - t0 < $LOAD_SECONDS:
-    x, w, h = frames[n % len(frames)]
-    evt('set position of window 1 to {%d, 140}' % x)
-    evt('set size of window 1 to {%d, %d}' % (w, h))
-    # Surface-pool churn: a second app's windows come and go under the load.
-    if n % 6 == 3:
-        subprocess.run(['open', '-a', 'TextEdit'], capture_output=True)
-    elif n % 6 == 0 and n:
-        osa('tell application \\\"TextEdit\\\" to quit')
-    n += 1
-osa('tell application \\\"TextEdit\\\" to quit')
-print(n)
-\"" >"$WORK/load.count" 2>"$WORK/load.err" &
+# The report is "run testufo at count=8 **and drag the window around**", and the
+# second half was the part this probe could not do. `set position` teleports the
+# window, and a window the AX API moves does not take the window server's drag
+# path. `window-drag-probe` records why a *guest-side* posted drag cannot be
+# arranged — the posting process is not trusted for Accessibility and TCC.db is
+# unwritable under SIP — and settles for repositioning for the same reason.
+#
+# Neither needed to. The machine already has a usb-tablet, and an
+# `input-send-event` pointer stream reaches the window server as a real mouse
+# with no trust to arrange. `drag-load.py` drives that, and keeps the resize and
+# second-app churn alongside it because those are a different stressor: surface
+# *reallocation*, which a window that only moves never does, and which a previous
+# session measured as the thing that moves `type4_pages_stale` off zero.
+"$REPO_ROOT/scripts/vibrancy-latch-probe/drag-load.py" \
+  --seconds "$LOAD_SECONDS" --guest "$GUEST" --app Safari --qmp "$QMP_SOCK" \
+  >"$WORK/load.count" 2>"$WORK/load.err" &
 LOAD_PID=$!
 
 # Sample the window's real position *during* the motion, not after it. The
-# reposition loop cycles through a fixed set of x values, so where it stops is
-# whichever one the last iteration happened to land on — comparing that to the
-# start reports "never moved" for a run that moved 309 times and simply came
-# back. What the check is actually for is the case where the events went
-# nowhere, and only a mid-run sample can see that.
-sleep 5
+# destinations cycle, so where the window stops is whichever one the last
+# iteration reached — comparing that to the start reports "never moved" for a run
+# that moved many times and came back. What the check is for is the case where
+# the pointer stream went nowhere, and only a mid-run sample can see that.
+sleep 12
 MID_POS=$(osa 'tell application "System Events" to tell process "Safari" to get position of window 1' || true)
 "$SHOT" -o "$WORK/load.png" >/dev/null 2>&1 || true
 wait "$LOAD_PID" || {
@@ -209,7 +195,7 @@ wait "$LOAD_PID" || {
   sed 's/^/  /' "$WORK/load.err" >&2; exit 2; }
 
 tail -c "+$((LOAD_OFF + 1))" "$FAILLOG" >"$WORK/load.log"
-say "load: $(cat "$WORK/load.count") repositions, window ($START_POS) mid ($MID_POS)"
+say "load: $(cat "$WORK/load.count"), window ($START_POS) mid ($MID_POS)"
 
 # A load that never moved the window leaves the counters idle, and an idle
 # `after` differs from `before` for reasons unrelated to the bug.
