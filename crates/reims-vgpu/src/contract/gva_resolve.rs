@@ -463,6 +463,49 @@ pub fn translate_root(
     out
 }
 
+/// Translate a run of consecutive pages under one root, calling `visit` with
+/// each page's GPA or `None` for a page the table cannot translate.
+///
+/// The run form of [`translate_root`], and it exists for one reason: the
+/// per-page form re-reads every upper level of the tree for every page, because
+/// the [`Cache`] it consults holds finished translations keyed by the exact page
+/// index and a run visits each index once. A 1080p surface's licence check walks
+/// 2 025 consecutive pages and paid `depth` guest-memory reads for each; the
+/// upper levels of all of them are the same three or four entries.
+///
+/// The descent still lives in `reims_vgpu_wire::page_table`, which owns the
+/// format — [`wire_page_table::walk_run`] is the same walk with the repeated
+/// upper reads elided, and that crate's tests assert it answers identically to
+/// [`wire_page_table::walk`] page for page.
+///
+/// The visitor stops the run by answering `false`. It is not called at all when
+/// the root or geometry is unusable, so a caller must compare what it saw
+/// against what it expected rather than reading a quiet return as agreement —
+/// the same contract [`translate_root`] has by returning a status.
+pub fn translate_root_run(
+    reader: &dyn PhysReader,
+    geometry: &Geometry,
+    root_pfn: u32,
+    depth: u32,
+    first_gva: u64,
+    pages: u64,
+    visit: &mut dyn FnMut(u64, Option<u64>) -> bool,
+) {
+    if validate_geometry(geometry) != ResolveStatus::Ok || root_pfn == 0 || depth == 0 {
+        return;
+    }
+    let mem = PhysAsGuestMemory(reader);
+    wire_page_table::walk_run(
+        &mem,
+        wire_geometry(geometry),
+        root_pfn,
+        depth,
+        first_gva,
+        pages,
+        &mut |index, walked| visit(index, walked.ok().map(|w| w.addr)),
+    );
+}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "the walker exposes each page-table and span input explicitly"

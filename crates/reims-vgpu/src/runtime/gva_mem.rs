@@ -585,6 +585,24 @@ fn visit_task_gva_pages<M: HostMemory>(
     let first = gva & !(page - 1);
     let last = gva.saturating_add(span - 1) & !(page - 1);
     let step = page.saturating_mul(stride_pages);
+    // Every page of the run, which is the shape the licence check and the
+    // guest-run resolvers ask for. One descent is shared across the pages whose
+    // upper indices match, instead of `depth` guest reads per page — the cache
+    // below cannot do that, because it holds finished translations keyed by the
+    // exact page index and a run visits each index exactly once.
+    if stride_pages == 1 {
+        let pages = ((last - first) / page) + 1;
+        crate::contract::gva_resolve::translate_root_run(
+            &reader,
+            geom,
+            root.root_pfn,
+            root.depth,
+            first,
+            pages,
+            &mut |_, gpa| visit(gpa.map(|g| g & !(page - 1))),
+        );
+        return;
+    }
     let mut cache = Cache::default();
     let mut cur = first;
     loop {

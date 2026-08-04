@@ -314,6 +314,142 @@ pub fn walk<M: GuestMemory>(
     })
 }
 
+/// Walk a run of consecutive pages, re-reading only the levels whose entry
+/// index changed.
+///
+/// A run of `pages` pages starting at `first_gva` shares every level of the tree
+/// except the deepest for `1 << index_bits` pages at a time, so walking each one
+/// with [`walk`] re-reads the same upper entries `depth - 1` times per page. On
+/// a guest with a four-level tree that is four guest-memory reads per page where
+/// one is needed, and the caller that motivates this — a licence check over a
+/// 1080p surface's page list — pays it 2 025 times a flush.
+///
+/// The visitor is called once per page in ascending order with the page's index
+/// within the run, and stops the walk by answering `false`. A failure is
+/// reported for the page it happened on and does not stop the run: a caller
+/// checking a cached list against the live table needs to know *which* pages
+/// disagree, and a walk that stopped at the first would report a shorter
+/// disagreement than there is.
+///
+/// # What the reuse assumes
+///
+/// That the tree does not change under the walk. It is the same assumption
+/// [`walk`] makes within one descent, extended to the run — a guest that
+/// rewrites an upper entry midway through is a guest editing a page table this
+/// device is reading, and neither form of walk can be atomic against that.
+/// A caller needing a coherent snapshot needs one from the hypervisor, not from
+/// a re-read here.
+pub fn walk_run<M: GuestMemory>(
+    mem: &M,
+    geometry: Geometry,
+    root_pfn: u32,
+    depth: u32,
+    first_gva: u64,
+    pages: u64,
+    visit: &mut dyn FnMut(u64, Result<Walk, WalkFailure>) -> bool,
+) {
+    let fail = |error| WalkFailure {
+        error,
+        level: 0,
+        entry_index: 0,
+        raw_pte: 0,
+    };
+    if let Err(f) = geometry.validate().map_err(fail) {
+        visit(0, Err(f));
+        return;
+    }
+    if root_pfn == 0 {
+        visit(0, Err(fail(WalkError::ZeroRootPfn)));
+        return;
+    }
+    if depth == 0 {
+        visit(0, Err(fail(WalkError::ZeroDepth)));
+        return;
+    }
+    if depth > geometry.max_depth {
+        visit(0, Err(fail(WalkError::DepthTooDeep)));
+        return;
+    }
+
+    // The entry index taken at each level of the previous page's descent, and
+    // the frame that entry named. `held` is how many *leading* levels of that
+    // record are still true: a level whose index differs invalidates itself and
+    // everything under it, which is why one prefix length is enough and a
+    // per-level valid bit is not.
+    let mut seen_index = [0u32; MAX_DEPTH as usize];
+    let mut seen_next = [0u32; MAX_DEPTH as usize];
+    let mut held = 0usize;
+
+    let first_page = first_gva >> geometry.page_shift;
+    for i in 0..pages {
+        let page_index = first_page + i;
+        let gva = (page_index << geometry.page_shift) | (first_gva & geometry.page_offset_mask());
+        let page_off = gva & geometry.page_offset_mask();
+        let mut current_pfn = root_pfn;
+        let mut raw_pte = 0u32;
+        let mut failure = None;
+        for level in 0..depth {
+            let shift = (depth - 1 - level) * geometry.index_bits();
+            let entry_index = ((page_index >> shift) & geometry.index_mask()) as u32;
+            let lv = level as usize;
+            if lv < held && seen_index[lv] == entry_index {
+                current_pfn = seen_next[lv];
+                continue;
+            }
+            let entry_addr =
+                geometry.pfn_to_addr(current_pfn) + (entry_index as u64) * PTE_SIZE as u64;
+            let at = |error, raw_pte| WalkFailure {
+                error,
+                level,
+                entry_index,
+                raw_pte,
+            };
+            let Some(pte) = mem.u32_at(entry_addr) else {
+                failure = Some(at(WalkError::TableRead, 0));
+                break;
+            };
+            raw_pte = pte;
+            let next_pfn = pte & PTE_PFN_MASK;
+            if next_pfn == 0 {
+                failure = Some(at(
+                    if pte == 0 {
+                        WalkError::NotPresent
+                    } else {
+                        WalkError::MalformedPte
+                    },
+                    pte,
+                ));
+                break;
+            }
+            seen_index[lv] = entry_index;
+            seen_next[lv] = next_pfn;
+            held = lv + 1;
+            current_pfn = next_pfn;
+        }
+        let result = match failure {
+            // A failed descent leaves the record describing a tree the walk did
+            // not finish reading, so the next page starts from the root.
+            Some(f) => {
+                held = 0;
+                Err(f)
+            }
+            None => {
+                let addr_page = geometry.pfn_to_addr(current_pfn);
+                Ok(Walk {
+                    leaf_pfn: current_pfn,
+                    addr_page,
+                    addr: addr_page + page_off,
+                    page_index,
+                    raw_pte,
+                })
+            }
+        };
+        if !visit(i, result) {
+            return;
+        }
+    }
+}
+
 /// Builds page tables the way the guest does.
 ///
 /// This exists so tests walk a tree assembled by the format's own rules rather
@@ -510,6 +646,73 @@ mod tests {
                 assert_eq!(w.addr, geometry.pfn_to_addr(leaf) + off);
             }
         }
+    }
+
+    /// `walk_run` and `walk` must answer identically for every page of a run,
+    /// including the pages that do not resolve.
+    ///
+    /// This is the whole of `walk_run`'s contract. It exists only to avoid
+    /// re-reading upper levels, so the moment it answers differently from the
+    /// walk it optimises it is not an optimisation but a second, weaker walker —
+    /// and the way it would fail is by carrying a stale upper level across an
+    /// index boundary, which the run below crosses deliberately.
+    #[test]
+    fn a_run_walk_agrees_with_the_single_walk_on_every_page() {
+        for geometry in [X86_64, ARM64E] {
+            for depth in 1..=MAX_DEPTH {
+                let mut buf = [0u8; IMAGE];
+                let mut b = Builder::new(geometry, &mut buf);
+                // Two pages whose indices differ above the deepest level, so the
+                // run has to notice the upper entry changed, plus their
+                // neighbours, which must reuse it.
+                let stride = 1u64 << geometry.index_bits();
+                let root = b.map(depth, 0, 0x11);
+                b.map_into(root, depth, 1, 0x12);
+                if depth > 1 {
+                    b.map_into(root, depth, stride, 0x21);
+                    b.map_into(root, depth, stride + 1, 0x22);
+                }
+                let mem = SliceMemory::new(b.bytes());
+
+                // Covers both mapped clusters, the hole between them, and the
+                // unmapped tail past the second.
+                let pages = if depth > 1 { stride + 3 } else { 4 };
+                let mut seen = 0u64;
+                walk_run(&mem, geometry, root, depth, 0, pages, &mut |i, got| {
+                    let gva = i << geometry.page_shift;
+                    let want = walk(&mem, geometry, root, depth, gva);
+                    match (&got, &want) {
+                        (Ok(a), Ok(e)) => assert_eq!(a, e, "page {i} depth {depth}"),
+                        (Err(a), Err(e)) => assert_eq!(a, e, "page {i} depth {depth}"),
+                        _ => panic!("page {i} depth {depth}: {got:?} vs {want:?}"),
+                    }
+                    seen += 1;
+                    true
+                });
+                assert_eq!(seen, pages, "every page of the run is visited, in order");
+            }
+        }
+    }
+
+    /// The visitor stops the run by answering `false`, and no page past it is
+    /// walked. A caller checking a page list against the live table stops at the
+    /// first disagreement it cares about, and a run that kept reading would cost
+    /// the guest-memory reads the stop exists to avoid.
+    #[test]
+    fn a_run_walk_stops_when_the_visitor_says_so() {
+        let geometry = X86_64;
+        let mut buf = [0u8; IMAGE];
+        let mut b = Builder::new(geometry, &mut buf);
+        let root = b.map(2, 0, 0x11);
+        b.map_into(root, 2, 1, 0x12);
+        let mem = SliceMemory::new(b.bytes());
+
+        let mut visited = 0;
+        walk_run(&mem, geometry, root, 2, 0, 64, &mut |_, _| {
+            visited += 1;
+            visited < 2
+        });
+        assert_eq!(visited, 2);
     }
 
     #[test]
