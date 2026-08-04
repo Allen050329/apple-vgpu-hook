@@ -568,10 +568,50 @@ pub fn flush_gva_windows_before_fence<M: HostMemory + HostOps>(
     // Oldest-first, so windows land in the order they were rendered: a later
     // Store at an address the guest recycled within one submission must not be
     // overwritten by the earlier one.
+    let mut landed = 0u64;
     while let Some((gva, entry)) = state.take_oldest_gva_deferred_window() {
         crate::runtime::drain::note_store_route("gvaw_fence_flush");
         let _ = flush_gva_one(state, host, gva, &entry, true, "fence");
+        landed += 1;
     }
+    note_fence_batch_band(landed);
+}
+
+/// How many windows one completion fence lands at once.
+///
+/// [`flush_gva_one`] pays a private `vkQueueSubmit` and its own fence wait per
+/// window, so a batch of *n* is *n* serialized GPU round trips inside one
+/// completion stamp. That is the number that prices recording each copy into its
+/// draw's own command buffer instead: at a batch of 1 the build saves one
+/// submission's overhead per flush, and at a batch of 8 it collapses eight waits
+/// into the one the tranche already owes.
+///
+/// `gvaw_fence_flush` cannot answer this — it counts windows, and a hundred
+/// windows landing one-at-a-time and ten landing ten-at-a-time read the same.
+/// Banded rather than summed for the reason the draw-list census is: the tail is
+/// the case that matters and a mean hides it.
+///
+/// Zero is not counted. An empty map returns before this, so a zero band would
+/// only ever record calls that had nothing to do.
+fn note_fence_batch_band(landed: u64) {
+    if let Some(slug) = fence_batch_band(landed) {
+        crate::runtime::drain::note_store_route(slug);
+    }
+}
+
+/// The band [`note_fence_batch_band`] charges, split out so the boundaries can
+/// be read without an emit.
+fn fence_batch_band(landed: u64) -> Option<&'static str> {
+    Some(match landed {
+        0 => return None,
+        1 => "gvaw_fence_batch_1",
+        2 => "gvaw_fence_batch_2",
+        3..=4 => "gvaw_fence_batch_3_4",
+        5..=8 => "gvaw_fence_batch_5_8",
+        9..=16 => "gvaw_fence_batch_9_16",
+        17..=64 => "gvaw_fence_batch_17_64",
+        _ => "gvaw_fence_batch_over_64",
+    })
 }
 
 /// Metal-direct builds never arm GVA windows — nothing to land at the fence.
@@ -1827,6 +1867,14 @@ pub fn gva_window_identity(
 /// rest of the tranche to signal rather than one issued a moment ago, and it
 /// keeps the host copy the cache contract requires. That is the build this
 /// rail's numbers point at; it is not attempted here.
+///
+/// What sizes it is **how many windows one completion fence lands**, which none
+/// of the counters above can say — they all count windows, and a hundred landing
+/// singly reads the same as ten landing ten at a time. The private submit is per
+/// window, so a batch of one saves only that submission's own overhead while a
+/// batch of eight collapses eight serialized round trips into the one the
+/// tranche already owes. `gvaw_fence_batch_*` is that band; read it before
+/// starting the build, because it decides whether the build is worth its risk.
 #[cfg(feature = "backend-vulkan")]
 pub fn flush_gva_one<M: HostMemory + HostOps>(
     state: &mut DeviceState,
@@ -3464,6 +3512,40 @@ mod render_flush_witness_tests {
 #[cfg(test)]
 mod tests {
     use crate::model::{ComputeStorageResidencyKey, DeviceId, DeviceState, PAGE_SHIFT_X86};
+
+    /// The fence-batch bands cover every count, start at one, and separate the
+    /// two readings that decide the round-trip build.
+    ///
+    /// A batch of 1 and a batch of many are the whole question — one says the
+    /// per-window submit is all there is to save, the other says the waits
+    /// collapse — so they must never share a band. Zero is excluded rather than
+    /// banded: [`flush_gva_windows_before_fence`] returns before the call when
+    /// the map is empty, so a zero band could only ever count calls with nothing
+    /// to do, and one appearing would mean that early return had moved.
+    #[test]
+    fn the_fence_batch_bands_separate_one_from_many() {
+        use super::fence_batch_band;
+        assert_eq!(fence_batch_band(0), None, "an empty batch was banded");
+        assert_eq!(fence_batch_band(1), Some("gvaw_fence_batch_1"));
+        assert_eq!(fence_batch_band(2), Some("gvaw_fence_batch_2"));
+        // Every band is reachable and the boundaries do not overlap or leave a
+        // gap: each count lands in exactly one, and the edges land where the
+        // arms say they do.
+        for (landed, want) in [
+            (3u64, "gvaw_fence_batch_3_4"),
+            (4, "gvaw_fence_batch_3_4"),
+            (5, "gvaw_fence_batch_5_8"),
+            (8, "gvaw_fence_batch_5_8"),
+            (9, "gvaw_fence_batch_9_16"),
+            (16, "gvaw_fence_batch_9_16"),
+            (17, "gvaw_fence_batch_17_64"),
+            (64, "gvaw_fence_batch_17_64"),
+            (65, "gvaw_fence_batch_over_64"),
+            (u64::MAX, "gvaw_fence_batch_over_64"),
+        ] {
+            assert_eq!(fence_batch_band(landed), Some(want), "landed={landed}");
+        }
+    }
 
     /// The alias probe charges the quiet arm when no rail is armed.
     ///
