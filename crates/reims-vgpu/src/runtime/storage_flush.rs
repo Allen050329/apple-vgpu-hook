@@ -1800,7 +1800,22 @@ pub fn flush_gva_one<M: HostMemory + HostOps>(
     // this is a no-op, but the writer below (`write_gva_rgba8`) is declared in
     // semantic RGBA and the readback states its own order. Asserting the order
     // here instead would be the caller writing a fact it did not read.
-    let rgba = match crate::backend::vulkan::engine::read_target(&identity) {
+    // Timed apart from the rest of the flush because it is the whole routing
+    // question for this rail. `flush_rails gva_us` is the end-to-end cost and
+    // `readback_split fence_us` pools this rail's fence with the render rail's,
+    // so how much of a GVA flush is the GPU round trip and how much is the
+    // three host passes has only ever been derived by algebra off `gpu_us`.
+    // The two answers point at different builds: a dma-buf destination removes
+    // the host passes and keeps the round trip, and recording the copy into the
+    // draw's own command buffer removes the round trip and keeps the passes.
+    let read_started = std::time::Instant::now();
+    let read_target = crate::backend::vulkan::engine::read_target(&identity);
+    crate::runtime::drain::note_store_route_us(
+        "gva_read_us",
+        read_started.elapsed().as_micros() as u64,
+    );
+    crate::runtime::drain::note_store_route("gva_reads");
+    let rgba = match read_target {
         Ok(rb) => rb.into_rgba8(),
         Err(e) => {
             crate::backend::vulkan::engine::unpin_resident_target(&identity);
@@ -1826,7 +1841,11 @@ pub fn flush_gva_one<M: HostMemory + HostOps>(
         // a decision about a page table the bytes do not go through.
         guest = "skip_drift";
     } else if guest_write {
-        guest = match crate::runtime::metal_draw::write_gva_rgba8_within(
+        // The CPU scatter, timed against `gva_read_us`. This is the pass a
+        // dma-buf destination would delete and the round trip above is the one
+        // it would keep, so the two readings are what choose between the builds.
+        let write_started = std::time::Instant::now();
+        let written = crate::runtime::metal_draw::write_gva_rgba8_within(
             state,
             host,
             entry.task_id,
@@ -1837,7 +1856,13 @@ pub fn flush_gva_one<M: HostMemory + HostOps>(
             entry.format,
             &rgba,
             Some(&entry.pages),
-        ) {
+        );
+        crate::runtime::drain::note_store_route_us(
+            "gva_write_us",
+            write_started.elapsed().as_micros() as u64,
+        );
+        crate::runtime::drain::note_store_route_n("gva_write_kb", (rgba.len() as u64) >> 10);
+        guest = match written {
             Ok(()) => "written",
             // The guest already tore this window down and its Unmap notify has
             // not drained yet. That is the same state the Unmap/Map notify path
@@ -1877,6 +1902,11 @@ pub fn flush_gva_one<M: HostMemory + HostOps>(
         "unmapped" => "gva_flush_guest_unmapped",
         _ => "gva_flush_guest_write_fail",
     });
+    // The third host pass over the frame, timed for the same reason as the
+    // other two: a GPU-direct arm has no host copy to publish, so this is the
+    // one that has to be answered for rather than simply removed. What it costs
+    // is what a reader has to weigh against whatever replaces it.
+    let cache_started = std::time::Instant::now();
     crate::runtime::metal_draw::host_cache_store_gva_layer(
         state,
         host,
@@ -1887,6 +1917,10 @@ pub fn flush_gva_one<M: HostMemory + HostOps>(
         entry.width,
         entry.height,
         &rgba,
+    );
+    crate::runtime::drain::note_store_route_us(
+        "gva_cache_us",
+        cache_started.elapsed().as_micros() as u64,
     );
     // A flush that landed is expected control flow and stays quiet. The two
     // outcomes that are not — a refused write, and a window whose span the guest
