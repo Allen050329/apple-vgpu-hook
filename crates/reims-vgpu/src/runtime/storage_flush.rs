@@ -1777,14 +1777,56 @@ pub fn gva_window_identity(
 ///
 /// Every arm is flushed, by the very next fence, inside the stamp it was armed
 /// in — four counters that cannot agree by accident. So the objection that
-/// closes the door for the render rail does not reach this one, and the
-/// remaining question is the other half of that refutation: whether the wait
-/// itself can be avoided, given that the copy's bytes must be in guest pages
-/// before the stamp either way. The draw's own command buffer is submitted and
-/// deliberately *not* waited (`render_post_wait_skips` equals the draw count),
-/// so a copy recorded into it would be waited against a fence that has had the
-/// rest of the tranche to signal, rather than against one submitted a
-/// microsecond earlier. That is the part worth measuring before building.
+/// closes the door for the render rail does not reach this one.
+///
+/// # Where the 97 µs goes, and which of the two builds it chooses
+///
+/// Measured boot-wide over 25 853 flushes, the three spans this function now
+/// brackets:
+///
+/// ```text
+/// gva_us       2512514   97.2 us/flush   end to end
+/// gva_read_us  1700067   65.8 us  (68%)  read_target: submit, own fence, map, copy to Vec
+/// gva_write_us  630126   24.4 us  (25%)  CPU scatter into guest pages
+/// gva_cache_us  117957    4.6 us  ( 5%)  host cache store
+/// gva_write_kb  474639   18.4 KB/flush
+/// ```
+///
+/// 18 KB a flush is why this rail contributes nothing to `gpu_us`: at the
+/// measured PCIe rate that copy is about a microsecond, so essentially all of
+/// `gva_read_us` is submit-to-signal latency and the staging map. The scatter's
+/// 24.4 µs over 18 KB is ~750 MB/s, which is the cache-cold guest-page write
+/// rate the ledger already quotes.
+///
+/// ## The dma-buf arm is refuted, and not on performance grounds
+///
+/// Giving this rail `render_flush_gpu_direct`'s shape — guest pages as the
+/// copy's destination — would delete `gva_write_us`, a quarter of the flush. It
+/// cannot be done, because [`crate::runtime::metal_draw::host_cache_store_gva_layer`]
+/// below is not optional. `surface_cache`'s GVA entry is the *only* place the
+/// frame survives the guest unmapping the VA — the wallpaper-retain contract —
+/// and `enforce_gva_cache_cap` refuses to evict any entry that still owes a
+/// deferred writeback, calling that a correctness exclusion rather than a
+/// heuristic. Publishing that entry needs a host copy of the frame, which is
+/// what `read_target` exists to produce.
+///
+/// So a GPU-direct arm would have to keep the readback *and* add a second
+/// submission for the dma-buf copy: it would pay `gva_read_us` unchanged, add a
+/// round trip, and save only the scatter. Strictly worse. The two channel-order
+/// and format questions it also raises (a GVA resident is RGBA where
+/// `copy_target_to_guest_pages` demands scanout order, and
+/// `convert_rgba8_to_row` is a straight copy only for the two RGBA8 formats)
+/// are real but do not need answering, because this one closes it first.
+///
+/// ## What is left is the round trip
+///
+/// 68% of the rail is a wait for a submission made microseconds earlier, and
+/// the draw's own command buffer is submitted and deliberately *not* waited
+/// (`render_post_wait_skips` equals the draw count). A readback recorded into
+/// that command buffer at arm time would be waited against a fence with the
+/// rest of the tranche to signal rather than one issued a moment ago, and it
+/// keeps the host copy the cache contract requires. That is the build this
+/// rail's numbers point at; it is not attempted here.
 #[cfg(feature = "backend-vulkan")]
 pub fn flush_gva_one<M: HostMemory + HostOps>(
     state: &mut DeviceState,
