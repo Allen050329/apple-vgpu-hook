@@ -711,8 +711,16 @@ mod tests {
             let buf = synth(0x0050_05c2, 8, 8, 1, 1, 1, 1, options);
             let o = op(&buf, 0).expect("well formed");
             let t = new_texture(&o).expect("fits");
-            assert_eq!(t.desc.cpu_cache_mode(), cache, "{options:#06x}: cpu cache mode");
-            assert_eq!(t.desc.storage_mode(), storage, "{options:#06x}: storage mode");
+            assert_eq!(
+                t.desc.cpu_cache_mode(),
+                cache,
+                "{options:#06x}: cpu cache mode"
+            );
+            assert_eq!(
+                t.desc.storage_mode(),
+                storage,
+                "{options:#06x}: storage mode"
+            );
             assert_eq!(
                 t.desc.hazard_tracking_mode(),
                 hazard,
@@ -756,7 +764,11 @@ mod tests {
                 1,
                 "{label} perturbation moved more than its own field"
             );
-            assert_eq!(t.desc.unidentified_flags(), fl, "{label} disturbed the flags");
+            assert_eq!(
+                t.desc.unidentified_flags(),
+                fl,
+                "{label} disturbed the flags"
+            );
         }
     }
 

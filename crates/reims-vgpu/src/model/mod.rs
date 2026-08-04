@@ -10,18 +10,13 @@ mod state;
 pub use lru_memo::LruBytesMemo;
 pub use regs::*;
 pub use state::{
-    ChannelRing, ComputeStorageResidencyKey, CursorState, DeferredOwner, DeviceId,
-    DeviceState, DisplayHandshake, ExecFault, FENCE_DOMAIN_BLIT, FENCE_DOMAIN_COMPUTE,
-    FENCE_DOMAIN_EVENT, FENCE_DOMAIN_RENDER, FailEvent, GfxRegs, GuestLinearMemo,
-    GvaBacking, GvaDeferredEntry, GvaHostView,
-    GvaEvictionWitness, HostLinearTexture, HostSurface, GVA_ENCODE_CACHE_BYTE_CAP,
-    GVA_EVICTION_WITNESS_KEYS,
-    IosfcRegs, LinearDeferredEntry, MapperCapture, MappingEntry,
-    PacketFault,
-    PendingWork, PresentBacking, PresentState, RenderFlushWitness, RenderWindowSource,
-    ResourceValidity,
-    SurfaceWriteKind,
-    TaskEntry, Type4Walk,
+    ChannelRing, ComputeStorageResidencyKey, CursorState, DeferredOwner, DeviceId, DeviceState,
+    DisplayHandshake, ExecFault, FailEvent, GfxRegs, GuestLinearMemo, GvaBacking, GvaDeferredEntry,
+    GvaEvictionWitness, GvaHostView, HostLinearTexture, HostSurface, IosfcRegs,
+    LinearDeferredEntry, MapperCapture, MappingEntry, PacketFault, PendingWork, PresentBacking,
+    PresentState, RenderFlushWitness, RenderWindowSource, ResourceValidity, SurfaceWriteKind,
+    TaskEntry, Type4Walk, FENCE_DOMAIN_BLIT, FENCE_DOMAIN_COMPUTE, FENCE_DOMAIN_EVENT,
+    FENCE_DOMAIN_RENDER, GVA_ENCODE_CACHE_BYTE_CAP, GVA_EVICTION_WITNESS_KEYS,
 };
 
 use crate::backend::Backend;
@@ -120,9 +115,7 @@ mod tests {
     use super::*;
     use crate::backend::NullBackend;
     use crate::contract::endian::st32;
-    use crate::runtime::{
-        FakeHost, HostActionKind, HostMemory,
-    };
+    use crate::runtime::{FakeHost, HostActionKind, HostMemory};
 
     #[test]
     fn stamp_slot_offset_respects_guest_page_size() {
@@ -269,7 +262,12 @@ mod tests {
     fn version_handshake_clamps_above_what_this_host_implements() {
         let mut d = dev();
         let mut h = FakeHost::new();
-        d.gfx_write(&mut h, GFX_REG_VERSION, PROTOCOL_VERSION_MAX as u64 + 1, MMIO_U32);
+        d.gfx_write(
+            &mut h,
+            GFX_REG_VERSION,
+            PROTOCOL_VERSION_MAX as u64 + 1,
+            MMIO_U32,
+        );
         assert_eq!(
             d.gfx_read(GFX_REG_VERSION, MMIO_U32),
             PROTOCOL_VERSION_MAX as u64
@@ -387,7 +385,6 @@ mod tests {
             DEVICE_INFO_CAPS[0].1
         );
     }
-
 
     #[test]
     fn reset_clears_state() {

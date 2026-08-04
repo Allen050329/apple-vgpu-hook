@@ -3,22 +3,12 @@
 use crate::contract::endian::ld32;
 use crate::contract::size_fits_u32;
 
-// The four segment types Apple's serializer has been observed writing, and the
-// segment header's length, come from `reims-vgpu-wire` rather than being
-// restated here. That module's doc used to note that these values "are also
-// exactly `reims_vgpu::runtime::decode::stream`'s ... two independent
-// derivations agreeing on the whole header" — which was true, and is the
-// condition under which two declarations should become one. `contract::gva`
-// made the same move for the page-table format: re-exporting means drift is
-// impossible rather than merely detectable.
+// Segment types and header length from `reims-vgpu-wire` (observed serializer
+// surface). Re-exported so stream walkers share one path with the wire crate.
 //
-// `SEGMENT_TYPE_INFO` is the load-bearing one. It is 4, not the next number in
-// sequence, so a device that had guessed rather than derived would have written
-// 3 — and 3 is `SEGMENT_TYPE_EVENT`, which stays local below.
-// `SEGMENT_TYPE_PROTECTION_OPTIONS` joined this list once the capture drove the
-// envelope. It had been local for the reason below — unobserved — and this
-// device's value for it turned out to be right, which is the outcome that
-// licenses the move.
+// `SEGMENT_TYPE_INFO` is 4, not the next integer in sequence — a guess would
+// write 3, which is `SEGMENT_TYPE_EVENT` and stays local below. Protection
+// options joined once the capture drove that envelope.
 pub use reims_vgpu_wire::ops::segment::{
     PROTECTION_OPTIONS_ENVELOPE_LEN as PROTECTION_OPTIONS_PAYLOAD_LEN, SEGMENT_HEADER_LEN,
     SEGMENT_TYPE_BLIT, SEGMENT_TYPE_COMPUTE, SEGMENT_TYPE_INFO, SEGMENT_TYPE_PROTECTION_OPTIONS,
@@ -41,14 +31,10 @@ pub const SEGMENT_PAD_OFFSET: usize = 7;
 
 pub const RECORD_OPCODE_OFFSET: usize = 0;
 pub const RECORD_LENGTH_OFFSET: usize = 4;
-/// The record header this stream frames is the serializer's op header, so it is
-/// the wire crate's constant rather than a second 8.
-///
-/// Distinct from [`SEGMENT_HEADER_LEN`] above, which is also 8 and is a
-/// different fact — `reims_vgpu_wire::op`'s own doc warns against porting
-/// constants between framing levels, and these two sitting in one module with
-/// the same value is exactly where that goes wrong.
-pub use reims_vgpu_wire::OP_HEADER_LEN as RECORD_HEADER_LEN;
+/// Serializer op-header length ([`reims_vgpu_wire::OP_HEADER_LEN`]). Distinct
+/// from [`SEGMENT_HEADER_LEN`]: both are 8, but they frame different protocol
+/// levels — do not treat them as interchangeable.
+use reims_vgpu_wire::OP_HEADER_LEN;
 
 pub const INFO_RECORD_OPCODE: u32 = 0x180;
 pub const INFO_RECORD_LEN: u32 = 0x10;
@@ -326,13 +312,13 @@ pub fn decode_next_record(
     if *cursor == command_end {
         return Err(DecodeStatus::Done);
     }
-    if command_end - *cursor < RECORD_HEADER_LEN {
+    if command_end - *cursor < OP_HEADER_LEN {
         return Err(DecodeStatus::ErrShort("stream_rec_short_header"));
     }
     let header = &bytes[*cursor..];
     let opcode = ld32(&header[RECORD_OPCODE_OFFSET..]);
     let record_len = ld32(&header[RECORD_LENGTH_OFFSET..]) as usize;
-    if record_len < RECORD_HEADER_LEN {
+    if record_len < OP_HEADER_LEN {
         return Err(DecodeStatus::ErrBadLength("stream_rec_len_below_header"));
     }
     if record_len > command_end - *cursor {
@@ -392,7 +378,7 @@ mod tests {
     }
 
     fn push_record(buf: &mut Vec<u8>, opcode: u32, payload: &[u8]) {
-        let len = (RECORD_HEADER_LEN + payload.len()) as u32;
+        let len = (OP_HEADER_LEN + payload.len()) as u32;
         let mut hdr = [0u8; 8];
         st32(&mut hdr[0..4], opcode);
         st32(&mut hdr[4..8], len);

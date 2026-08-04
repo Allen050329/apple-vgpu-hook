@@ -515,7 +515,10 @@ mod tests {
             f.subgroup_size, 32,
             "the fixture is a wave64 part precisely so a hardcoded 32 cannot pass"
         );
-        assert!(f.subgroup_size > 0, "a zero wave would divide by zero downstream");
+        assert!(
+            f.subgroup_size > 0,
+            "a zero wave would divide by zero downstream"
+        );
     }
 
     /// The enable list is derived from what the backend binds, and

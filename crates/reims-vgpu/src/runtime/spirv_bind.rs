@@ -352,9 +352,7 @@ fn propagate_derived(
             let marked = |id: u32| derived.get(id as usize).copied() == Some(true);
             let result_from = match opcode {
                 OP_COPY_OBJECT if word_count >= 4 => marked(words[i + 3]),
-                OP_SELECT if word_count >= 6 => {
-                    marked(words[i + 4]) || marked(words[i + 5])
-                }
+                OP_SELECT if word_count >= 6 => marked(words[i + 4]) || marked(words[i + 5]),
                 OP_PHI if word_count >= 5 => (i + 3..i + word_count)
                     .step_by(2)
                     .any(|at| marked(words[at])),
@@ -388,31 +386,36 @@ fn propagate_derived(
 /// escape scan below enumerates the opcodes it cares about. `storage_image_access`
 /// cannot seed its root for exactly that reason — see the note there.
 pub fn buffer_access(words: &[u32], wanted_binding: u32) -> Option<BufferAccess> {
-    let (root, bound) =
-        match descriptor_root(words, wanted_binding, STORAGE_CLASS_STORAGE_BUFFER)? {
-            Root::One { id, bound } => (id, bound),
-            Root::Ambiguous => return Some(BufferAccess::AmbiguousBinding),
-        };
+    let (root, bound) = match descriptor_root(words, wanted_binding, STORAGE_CLASS_STORAGE_BUFFER)?
+    {
+        Root::One { id, bound } => (id, bound),
+        Root::Ambiguous => return Some(BufferAccess::AmbiguousBinding),
+    };
 
-    let derived = propagate_derived(words, bound, Some(root), |opcode, word_count, i, derived| {
-        let marked = |id: u32| derived.get(id as usize).copied() == Some(true);
-        match opcode {
-            // Both families take the base pointer at operand 3 and yield another
-            // pointer to the same buffer.
-            OP_ACCESS_CHAIN
-            | OP_IN_BOUNDS_ACCESS_CHAIN
-            | OP_PTR_ACCESS_CHAIN
-            | OP_IN_BOUNDS_PTR_ACCESS_CHAIN
-            | OP_PTR_CAST_TO_GENERIC
-            | OP_GENERIC_CAST_TO_PTR
-            | OP_GENERIC_CAST_TO_PTR_EXPLICIT
-                if word_count >= 4 =>
-            {
-                marked(words[i + 3])
+    let derived = propagate_derived(
+        words,
+        bound,
+        Some(root),
+        |opcode, word_count, i, derived| {
+            let marked = |id: u32| derived.get(id as usize).copied() == Some(true);
+            match opcode {
+                // Both families take the base pointer at operand 3 and yield another
+                // pointer to the same buffer.
+                OP_ACCESS_CHAIN
+                | OP_IN_BOUNDS_ACCESS_CHAIN
+                | OP_PTR_ACCESS_CHAIN
+                | OP_IN_BOUNDS_PTR_ACCESS_CHAIN
+                | OP_PTR_CAST_TO_GENERIC
+                | OP_GENERIC_CAST_TO_PTR
+                | OP_GENERIC_CAST_TO_PTR_EXPLICIT
+                    if word_count >= 4 =>
+                {
+                    marked(words[i + 3])
+                }
+                _ => false,
             }
-            _ => false,
-        }
-    });
+        },
+    );
 
     let is_derived = |id: u32| derived.get(id as usize).copied() == Some(true);
     let mut unknown = false;
@@ -1421,7 +1424,10 @@ mod tests {
                 .push(texture_binding(bind, shape(dim, arrayed, false)));
             assert_eq!(
                 reflected_sampled_kind(&r, bind),
-                want.map_or(ReflectedSampledKind::Unsupported, ReflectedSampledKind::Kind),
+                want.map_or(
+                    ReflectedSampledKind::Unsupported,
+                    ReflectedSampledKind::Kind
+                ),
                 "dim={dim:?} arrayed={arrayed}"
             );
         }

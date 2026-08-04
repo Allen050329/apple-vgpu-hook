@@ -49,7 +49,11 @@ pub enum SurfaceWriteRefusal {
         frame_height: u32,
     },
     /// The sample window could not be resolved from the surface descriptor.
-    WindowUnresolved { width: u32, height: u32, format: u16 },
+    WindowUnresolved {
+        width: u32,
+        height: u32,
+        format: u16,
+    },
     /// The page walk refused to vouch for the mapping's page list.
     PagesNotOurs,
     /// The format has no packed row length, so there is no rect to write.
@@ -129,14 +133,12 @@ impl crate::observe::decline::Decline for SurfaceWriteRefusal {
                 ("have", have.to_string()),
                 ("row", row.to_string()),
             ],
-            Self::RowConvert { format, row } => vec![
-                ("fmt", format!("{format:#x}")),
-                ("row", row.to_string()),
-            ],
-            Self::FrameExtent { bpr, height } => vec![
-                ("bpr", bpr.to_string()),
-                ("height", height.to_string()),
-            ],
+            Self::RowConvert { format, row } => {
+                vec![("fmt", format!("{format:#x}")), ("row", row.to_string())]
+            }
+            Self::FrameExtent { bpr, height } => {
+                vec![("bpr", bpr.to_string()), ("height", height.to_string())]
+            }
             Self::StagedShort { need, have, row } => vec![
                 ("need", need.to_string()),
                 ("have", have.to_string()),
@@ -145,14 +147,12 @@ impl crate::observe::decline::Decline for SurfaceWriteRefusal {
             Self::MapperWrite { lo, len } => {
                 vec![("lo", format!("{lo:#x}")), ("len", len.to_string())]
             }
-            Self::SeedShort { need, have } => vec![
-                ("need", need.to_string()),
-                ("have", have.to_string()),
-            ],
-            Self::SeedRowConvert { format, row } => vec![
-                ("fmt", format!("{format:#x}")),
-                ("row", row.to_string()),
-            ],
+            Self::SeedShort { need, have } => {
+                vec![("need", need.to_string()), ("have", have.to_string())]
+            }
+            Self::SeedRowConvert { format, row } => {
+                vec![("fmt", format!("{format:#x}")), ("row", row.to_string())]
+            }
         }
     }
 }
@@ -765,7 +765,10 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
         return refuse(mapping_id, SurfaceWriteRefusal::Geometry { width, height });
     }
     if src_stride < width.saturating_mul(RGBA8_BPP) {
-        return refuse(mapping_id, SurfaceWriteRefusal::SourceStride { src_stride, width });
+        return refuse(
+            mapping_id,
+            SurfaceWriteRefusal::SourceStride { src_stride, width },
+        );
     }
     let Some(m) = state.mappings.get(&mapping_id) else {
         return refuse(mapping_id, SurfaceWriteRefusal::MappingAbsent);
@@ -850,7 +853,7 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
     let direct_rows = rgba.is_none() && tight == (mw as usize) * (RGBA8_BPP as usize);
 
     use crate::runtime::drain::{
-        SurfaceWritePhase, note_surface_write_path, note_surface_write_phase,
+        note_surface_write_path, note_surface_write_phase, SurfaceWritePhase,
     };
     let frame_bytes = (mh as u64).saturating_mul(tight as u64);
 
@@ -939,60 +942,60 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
         // out of this buffer whichever way it was built.
         let staged: std::borrow::Cow<'_, [u8]> =
             if direct_rows && bpr == src_stride as usize && src.len() >= frame_len {
-            std::borrow::Cow::Borrowed(&src[..frame_len])
-        } else {
-            let mut frame = vec![0u8; frame_len];
-            for y in 0..mh {
-                let src_off = (y as usize) * (src_stride as usize);
-                let src_row_len = (mw as usize) * (RGBA8_BPP as usize);
-                if src_off + src_row_len > src.len() {
-                    return refuse(
-                        mapping_id,
-                        SurfaceWriteRefusal::SourceShort {
-                            need: src_off + src_row_len,
-                            have: src.len(),
-                            row: y,
-                        },
-                    );
-                }
-                let src_row = &src[src_off..src_off + src_row_len];
-                let row_bytes: &[u8] = if direct_rows {
-                    &src_row[..tight]
-                } else {
-                    if let Some(ref mut rgba_row) = rgba {
-                        if !convert_row_to_rgba8(MTL_FORMAT_BGRA8_UNORM, src_row, mw, rgba_row)
-                            || !convert_rgba8_to_row(format, rgba_row, mw, &mut row)
-                        {
-                            return refuse(
-                                mapping_id,
-                                SurfaceWriteRefusal::RowConvert { format, row: y },
-                            );
-                        }
-                    } else {
-                        let n = src_row_len.min(row.len());
-                        row[..n].copy_from_slice(&src_row[..n]);
+                std::borrow::Cow::Borrowed(&src[..frame_len])
+            } else {
+                let mut frame = vec![0u8; frame_len];
+                for y in 0..mh {
+                    let src_off = (y as usize) * (src_stride as usize);
+                    let src_row_len = (mw as usize) * (RGBA8_BPP as usize);
+                    if src_off + src_row_len > src.len() {
+                        return refuse(
+                            mapping_id,
+                            SurfaceWriteRefusal::SourceShort {
+                                need: src_off + src_row_len,
+                                have: src.len(),
+                                row: y,
+                            },
+                        );
                     }
-                    &row
-                };
-                let dst_off = (y as usize).saturating_mul(bpr);
-                if dst_off + tight > frame.len() {
-                    return refuse(
-                        mapping_id,
-                        SurfaceWriteRefusal::StagedShort {
-                            need: dst_off + tight,
-                            have: frame.len(),
-                            row: y,
-                        },
-                    );
+                    let src_row = &src[src_off..src_off + src_row_len];
+                    let row_bytes: &[u8] = if direct_rows {
+                        &src_row[..tight]
+                    } else {
+                        if let Some(ref mut rgba_row) = rgba {
+                            if !convert_row_to_rgba8(MTL_FORMAT_BGRA8_UNORM, src_row, mw, rgba_row)
+                                || !convert_rgba8_to_row(format, rgba_row, mw, &mut row)
+                            {
+                                return refuse(
+                                    mapping_id,
+                                    SurfaceWriteRefusal::RowConvert { format, row: y },
+                                );
+                            }
+                        } else {
+                            let n = src_row_len.min(row.len());
+                            row[..n].copy_from_slice(&src_row[..n]);
+                        }
+                        &row
+                    };
+                    let dst_off = (y as usize).saturating_mul(bpr);
+                    if dst_off + tight > frame.len() {
+                        return refuse(
+                            mapping_id,
+                            SurfaceWriteRefusal::StagedShort {
+                                need: dst_off + tight,
+                                have: frame.len(),
+                                row: y,
+                            },
+                        );
+                    }
+                    frame[dst_off..dst_off + tight].copy_from_slice(&row_bytes[..tight]);
                 }
-                frame[dst_off..dst_off + tight].copy_from_slice(&row_bytes[..tight]);
-            }
-            note_surface_write_phase(
-                SurfaceWritePhase::Stage,
-                stage_started.elapsed().as_micros() as u64,
-            );
-            std::borrow::Cow::Owned(frame)
-        };
+                note_surface_write_phase(
+                    SurfaceWritePhase::Stage,
+                    stage_started.elapsed().as_micros() as u64,
+                );
+                std::borrow::Cow::Owned(frame)
+            };
         let frame: &[u8] = staged.as_ref();
         let land_started = std::time::Instant::now();
         // One call for the whole frame, carrying the runs it should store,
@@ -1111,12 +1114,16 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
                 && owner.len() >= tight_frame
                 && std::ptr::eq(owner.as_ptr(), src.as_ptr())
         }) {
-            Some(owner) => {
-                crate::runtime::surface_cache::store_shared(state, mapping_id, mw, mh, owner.clone())
-            }
-            None => {
-                crate::runtime::surface_cache::store_rows(state, mapping_id, mw, mh, src, src_stride)
-            }
+            Some(owner) => crate::runtime::surface_cache::store_shared(
+                state,
+                mapping_id,
+                mw,
+                mh,
+                owner.clone(),
+            ),
+            None => crate::runtime::surface_cache::store_rows(
+                state, mapping_id, mw, mh, src, src_stride,
+            ),
         },
     }
     note_surface_write_phase(
@@ -2154,7 +2161,11 @@ mod tests {
         let arm = |state: &mut DeviceState| {
             let key = crate::model::ComputeStorageResidencyKey {
                 mapping_id: 5,
-                map_generation: state.mappings.get(&5).map(|m| m.map_generation).unwrap_or(0),
+                map_generation: state
+                    .mappings
+                    .get(&5)
+                    .map(|m| m.map_generation)
+                    .unwrap_or(0),
                 surface_offset: 0,
                 surface_bpr: BPR,
                 span_end: (W * H * 4) as u64,
@@ -2183,7 +2194,11 @@ mod tests {
                 host.strict_linux_map = !packed;
                 let base_pfn = 0x80u32;
                 host.map_range((base_pfn as u64) << PAGE_SHIFT_X86, 4 * PAGE as usize, 0);
-                let order: Vec<u32> = if packed { (0..4).collect() } else { vec![3, 2, 1, 0] };
+                let order: Vec<u32> = if packed {
+                    (0..4).collect()
+                } else {
+                    vec![3, 2, 1, 0]
+                };
                 let entries: Vec<u32> = order
                     .iter()
                     .map(|i| ((base_pfn + i) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID)
@@ -2253,7 +2268,11 @@ mod tests {
             host.strict_linux_map = !packed;
             let base_pfn = 0x60u32;
             host.map_range((base_pfn as u64) << PAGE_SHIFT_X86, 4 * PAGE as usize, 0xee);
-            let order: Vec<u32> = if packed { (0..4).collect() } else { vec![3, 2, 1, 0] };
+            let order: Vec<u32> = if packed {
+                (0..4).collect()
+            } else {
+                vec![3, 2, 1, 0]
+            };
             let entries: Vec<u32> = order
                 .iter()
                 .map(|i| ((base_pfn + i) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID)
@@ -2281,15 +2300,10 @@ mod tests {
             // seeded with, on both shapes.
             let mut after = [0u8; 16];
             assert!(mapper::read_mapping_bytes(
-                &mut state,
-                &mut host,
-                5,
-                span_end,
-                &mut after
+                &mut state, &mut host, 5, span_end, &mut after
             ));
             assert_eq!(
-                after,
-                [0xeeu8; 16],
+                after, [0xeeu8; 16],
                 "packed={packed}: the refused rect must not have written past the window"
             );
         }
@@ -2346,7 +2360,14 @@ mod tests {
                     frame[y * BPR..(y + 1) * BPR].fill(y as u8);
                 }
                 assert!(write_bgra8_skipping(
-                    &mut state, &mut host, 4, &frame, W * 4, W, H, &[]
+                    &mut state,
+                    &mut host,
+                    4,
+                    &frame,
+                    W * 4,
+                    W,
+                    H,
+                    &[]
                 ));
 
                 for y in 0..H as usize {
@@ -3100,7 +3121,17 @@ mod tests {
             0xff, 0x10,
         ];
         assert!(write_full_rect_raw_at(
-            &mut state, &mut host, mid, 0, bpr, span_end, w, h, bpp, &src, tight as u32,
+            &mut state,
+            &mut host,
+            mid,
+            0,
+            bpr,
+            span_end,
+            w,
+            h,
+            bpp,
+            &src,
+            tight as u32,
         ));
 
         let mut got = vec![0u8; page as usize];
@@ -3688,7 +3719,9 @@ mod tests {
 
         // A source pitch that cannot hold one row.
         let n = store_route_count("surface_write_source_stride");
-        assert!(!write_raw_rows(&mut state, &mut host, 7, &rows, 4, 16, 4, 2));
+        assert!(!write_raw_rows(
+            &mut state, &mut host, 7, &rows, 4, 16, 4, 2
+        ));
         assert_eq!(store_route_count("surface_write_source_stride"), n + 1);
 
         // The source ends before the rows it declares.
@@ -3726,7 +3759,10 @@ mod tests {
         assert!(!write_raw_rows(
             &mut state, &mut host, 7, &rows, 16, 16, 4, 2
         ));
-        assert_eq!(store_route_count("surface_write_mapping_not_resident"), n + 1);
+        assert_eq!(
+            store_route_count("surface_write_mapping_not_resident"),
+            n + 1
+        );
     }
 
     /// Every refusal in `write_rgba8_image_changed` must name itself.
@@ -3820,7 +3856,10 @@ mod tests {
         assert!(!write_rgba8_image_changed(
             &mut state, &mut host, 7, &frame, None, 4, 2
         ));
-        assert_eq!(store_route_count("surface_write_mapping_not_resident"), n + 1);
+        assert_eq!(
+            store_route_count("surface_write_mapping_not_resident"),
+            n + 1
+        );
     }
 
     #[test]

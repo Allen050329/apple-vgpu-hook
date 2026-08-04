@@ -97,7 +97,8 @@ pub struct StagePhaseWindow {
 /// Take and clear the window. `None` when nothing staged, so an idle second
 /// costs no line.
 pub fn take_window() -> Option<StagePhaseWindow> {
-    let us = |p: Part| crate::observe::phase_clock::to_us(NS[p as usize].swap(0, Ordering::Relaxed));
+    let us =
+        |p: Part| crate::observe::phase_clock::to_us(NS[p as usize].swap(0, Ordering::Relaxed));
     let n = |p: Part| N[p as usize].swap(0, Ordering::Relaxed);
     let b = |p: Part| BYTES[p as usize].swap(0, Ordering::Relaxed);
     let w = StagePhaseWindow {

@@ -44,6 +44,7 @@ their unit of work is on.
   [`steelbrain/qemu-reims-vgpu@host-reims-vgpu-vmapple`](https://github.com/steelbrain/qemu-reims-vgpu/tree/host-reims-vgpu-vmapple)
   (thin C — QOM/MMIO/IRQ/console/HostOps only)
 - Product logic: `crates/reims-vgpu` (decode + device model + Metal/Vulkan backends)
+- Wire layouts: `crates/reims-vgpu-wire` (derived serializer views/parsers; decode uses these as the layout authority for covered records)
 - Vulkan translator dependency: public `steelbrain/metal2vulkan` Git crate. On macOS, the Vulkan
   host backend runs through MoltenVK.
 - VM lifecycle: `vm/` (snapshot-revert; arm and x86 guest boot scripts)
@@ -150,11 +151,21 @@ Arm bring-up is **in-tree**: Virtualization.framework via Homebrew **`macosvm`**
 
 ```text
 AGENTS.md           - repo operating guide for agents
-crates/             - Rust crates (`reims-vgpu`, `reims-vgpu-efi`)
+crates/             - Rust crates (`reims-vgpu`, `reims-vgpu-wire`, `reims-vgpu-efi`)
 scripts/            - host setup, VM lifecycle, screenshot, and diagnostic helpers
 vendor/             - vendored QEMU submodule and patch record
 vm/                 - VM launch/configuration glue; images are private/untracked
 ```
+
+`crates/reims-vgpu-wire` holds zero-copy views and parsers for the Apple
+paravirtualized GPU serializer format, derived from Apple's own encoder rather
+than inferred from captures. `crates/reims-vgpu`'s `runtime::decode` uses those
+exports for opcodes, record framing, and field layouts on wire-covered
+families (encoder blit/compute/render binds and state, and the create records
+above); decode remains the mapping layer into the device's `Command` / `Kind`
+model and decline naming. Gaps without a wire export (FIFO, event opcodes,
+unobserved compute residency, pipeline TLV) stay local to decode.
+
 
 ## License
 

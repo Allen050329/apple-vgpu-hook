@@ -28,9 +28,7 @@ fn m2v_draw_boundary_preserves_the_engine_vk_call_slug() {
 /// black and stores — the pass shape seven bodies need so a draw resolves, and
 /// which none of them is about. The attachments that carry a real load action
 /// or clear colour stay written out.
-fn clear_black_attachment(
-    texture_ref: u32,
-) -> crate::runtime::decode::render::ColorAttachment {
+fn clear_black_attachment(texture_ref: u32) -> crate::runtime::decode::render::ColorAttachment {
     use crate::runtime::decode::render::ColorAttachment;
     ColorAttachment {
         present: true,
@@ -1158,8 +1156,8 @@ fn a_guest_write_since_the_store_refuses_the_resident() {
     use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
     use crate::runtime::host::{FakeHost, HostOps};
 
-    let entry_for = |gpa: u64| (((gpa >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT)
-        | PAGE_ENTRY_VALID;
+    let entry_for =
+        |gpa: u64| (((gpa >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
     let mut host = FakeHost::new();
@@ -1257,9 +1255,8 @@ fn the_guest_write_verdict_separates_its_refusals() {
     use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
     use crate::runtime::host::{FakeHost, HostOps};
 
-    let entry_for = |gpa: u64| {
-        (((gpa >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID
-    };
+    let entry_for =
+        |gpa: u64| (((gpa >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
     let mut host = FakeHost::new();
     let page = state.page_size();
@@ -1325,8 +1322,8 @@ fn a_replaced_page_list_invalidates_the_token_it_was_built_for() {
     use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
     use crate::runtime::host::{FakeHost, HostOps};
 
-    let entry_for = |gpa: u64, shift: u32| (((gpa >> shift) as u32) << PAGE_ENTRY_PFN_SHIFT)
-        | PAGE_ENTRY_VALID;
+    let entry_for =
+        |gpa: u64, shift: u32| (((gpa >> shift) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
     let mut host = FakeHost::new();
@@ -1409,9 +1406,9 @@ fn a_host_that_cannot_observe_guest_writes_never_vouches() {
     assert!(state.map_surface(7));
     {
         let m = state.mappings.get_mut(&7).expect("mapped above");
-        m.page_entries =
-            vec![((((0x40 * page) >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT)
-                | PAGE_ENTRY_VALID];
+        m.page_entries = vec![
+            ((((0x40 * page) >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID,
+        ];
     }
     assert_eq!(
         crate::runtime::mapper::ensure_guest_write_token(&mut state, &mut host, 7),
@@ -2135,7 +2132,7 @@ fn mrt_draw_request_type8_view_of_type11_as_color_rt() {
 
     let att = clear_black_attachment(view_ref);
     let req = single_rt_draw_request(&mut state, &mut host, 12, att)
-    .expect("type-8 view of type-11 must resolve as color RT");
+        .expect("type-8 view of type-11 must resolve as color RT");
     assert_eq!(req.colors[0].mapping_id, 9);
     assert_eq!(req.colors[0].width, 64);
     assert_eq!(req.colors[0].height, 64);
@@ -2213,7 +2210,7 @@ fn mrt_draw_request_nested_type8_view_chain_to_type11() {
 
     let att = clear_black_attachment(211);
     let req = single_rt_draw_request(&mut state, &mut host, 12, att)
-    .expect("nested type-8→type-8→type-11 must resolve as color RT");
+        .expect("nested type-8→type-8→type-11 must resolve as color RT");
     assert_eq!(req.colors[0].mapping_id, 9);
     assert_eq!(req.colors[0].width, 64);
     assert_eq!(req.colors[0].height, 64);
@@ -2348,7 +2345,7 @@ fn mrt_draw_request_type2_rgba16f_as_color_rt_despite_stale_t11_latch() {
 
     let att = clear_black_attachment(tex_ref);
     let req = single_rt_draw_request(&mut state, &mut host, 12, att)
-    .expect("type-2 RGBA16F RT must resolve despite stale type-11 latch");
+        .expect("type-2 RGBA16F RT must resolve despite stale type-11 latch");
     assert_eq!(req.colors[0].mapping_id, 0);
     assert_eq!(req.colors[0].width, w);
     assert_eq!(req.colors[0].height, h);
@@ -2409,7 +2406,7 @@ fn mrt_draw_request_type11_live_mapping_overrides_stale_latch() {
 
     let att = clear_black_attachment(1);
     let req = single_rt_draw_request(&mut state, &mut host, 12, att)
-    .expect("live type-11 RT must resolve");
+        .expect("live type-11 RT must resolve");
     assert_eq!(
         req.colors[0].mapping_id, 4,
         "live descriptor mapping_id=4 must beat stale latch mid=3"
@@ -2588,7 +2585,7 @@ fn mrt_draw_request_type8_mip_level_view_of_linear_as_color_rt() {
 
     let att = clear_black_attachment(view_ref);
     let req = single_rt_draw_request(&mut state, &mut host, 12, att)
-    .expect("mip-1 view of linear texture must resolve as color RT");
+        .expect("mip-1 view of linear texture must resolve as color RT");
     let c0 = &req.colors[0];
     assert_eq!(c0.mapping_id, 0);
     assert_eq!(
@@ -3353,7 +3350,10 @@ fn type11_host_cache_rung_identity_tracks_the_cached_frame() {
         Some(first_id),
         "an untouched cache entry must keep its identity, or nothing is ever elided"
     );
-    assert_eq!(again_bytes, first_bytes, "identity repeated but bytes moved");
+    assert_eq!(
+        again_bytes, first_bytes,
+        "identity repeated but bytes moved"
+    );
 
     // Repaint. The bytes change, so the identity must too.
     crate::runtime::surface_cache::store(
@@ -3939,15 +3939,7 @@ fn a_secondary_mrt_slot_binds_its_own_blend() {
 
     let mut host = crate::runtime::host::FakeHost::new();
     let secs = build_secondary_targets(
-        &state,
-        &mut host,
-        1,
-        &colors,
-        &pipeline,
-        &primary,
-        64,
-        64,
-        [0.0; 4],
+        &state, &mut host, 1, &colors, &pipeline, &primary, 64, 64, [0.0; 4],
     );
     assert_eq!(secs.len(), 1, "one secondary attachment expected");
     let blend = secs[0].blend.expect(
@@ -3976,15 +3968,7 @@ fn a_secondary_mrt_slot_binds_its_own_blend() {
     };
     let mut host = crate::runtime::host::FakeHost::new();
     let secs = build_secondary_targets(
-        &state,
-        &mut host,
-        1,
-        &colors,
-        &unblended,
-        &primary,
-        64,
-        64,
-        [0.0; 4],
+        &state, &mut host, 1, &colors, &unblended, &primary, 64, 64, [0.0; 4],
     );
     assert_eq!(secs.len(), 1);
     assert!(
@@ -4072,7 +4056,8 @@ fn guest_runs_decline_on_unstable_host_mappings() {
         let mut host = FakeHost::new();
         host.strict_linux_map = true;
         host.stable_map_pages = stable;
-        let (dir_gpa, root_gpa, data0) = (2u64 << page_shift, 3u64 << page_shift, 4u64 << page_shift);
+        let (dir_gpa, root_gpa, data0) =
+            (2u64 << page_shift, 3u64 << page_shift, 4u64 << page_shift);
         for gpa in [dir_gpa, root_gpa, data0] {
             host.map_range(gpa, page as usize, 0);
         }
@@ -4236,7 +4221,16 @@ fn a_synchronous_gva_store_is_bounded_to_the_pages_the_command_named() {
     // kernel reported over its freed heap element.
     assert!(
         write_gva_rgba8_within(
-            &mut state, &mut host, 1, page, 64, 64, 64 * 4, c0.format, &rgba, None,
+            &mut state,
+            &mut host,
+            1,
+            page,
+            64,
+            64,
+            64 * 4,
+            c0.format,
+            &rgba,
+            None,
         )
         .is_ok(),
         "without the bound the same write succeeds into the new owner's page"
@@ -4369,8 +4363,7 @@ fn a_scissored_gva_store_is_bounded_on_both_its_rails() {
             .host
             .read_gpa(StoreRig::frame_gpa(moved_to), &mut victim);
         assert_eq!(
-            victim,
-            [0xffu8; 4],
+            victim, [0xffu8; 4],
             "packed={packed}: and it succeeds by painting the new owner's page"
         );
     }
@@ -4434,7 +4427,11 @@ fn type11_sample_resolves_geometry_before_reading_it() {
         internal + MAPPING_INTERNAL_SIZE,
         MAPPING_INTERNAL_EXPECTED_SIZE,
     );
-    put_u64(&mut host, internal + MAPPING_INTERNAL_PAGE_FIELD_48, page_obj);
+    put_u64(
+        &mut host,
+        internal + MAPPING_INTERNAL_PAGE_FIELD_48,
+        page_obj,
+    );
     put_u64(&mut host, internal + MAPPING_INTERNAL_PAGE_FIELD_50, 0);
     put_u64(&mut host, internal + MAPPING_INTERNAL_PAGE_COUNT, 1);
     put_u64(&mut host, internal + MAPPING_INTERNAL_DESC_PTR, desc_kva);

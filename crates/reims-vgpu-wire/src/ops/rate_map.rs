@@ -122,9 +122,7 @@ unsafe impl Wire for LayerSampleCount {}
 ///
 /// The quality floats follow, and are reached through [`layer_qualities`],
 /// which needs the sample counts to find them.
-pub fn rate_map<'a>(
-    op: &Op<'a>,
-) -> Result<(&'a RateMapHead, &'a [LayerSampleCount]), WireError> {
+pub fn rate_map<'a>(op: &Op<'a>) -> Result<(&'a RateMapHead, &'a [LayerSampleCount]), WireError> {
     debug_assert_eq!(op.opcode(), OPCODE_NEW_RASTERIZATION_RATE_MAP);
     let (head, rest) = split::<RateMapHead>(op.payload)?;
     let layers = view_slice::<LayerSampleCount>(rest, head.layer_count.get() as usize)?;

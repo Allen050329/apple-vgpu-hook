@@ -29,11 +29,12 @@
 //! does not fit encoder records, which have no ref and would have lost the
 //! first four bytes of every payload.
 //!
-//! Those five opcodes also match `reims_vgpu::runtime::decode::render`'s
-//! independently reverse-engineered table exactly (`OP_SET_SCISSOR`,
-//! `OP_SET_CULL_MODE`, `OP_SET_FRONT_FACING`, `OP_SET_BLEND_COLOR`, `OP_DRAW`),
-//! and `HEADER_LEN` there is 8 in all three encoder decoders. Two independent
-//! derivations agreeing is why this is stated rather than proposed.
+//! Those five opcodes match the encoder table decode uses from this crate
+//! (`OPCODE_SET_SCISSOR`, `OPCODE_SET_CULL_MODE`, `OPCODE_SET_FRONT_FACING`,
+//! `OPCODE_SET_BLEND_COLOR`, `OPCODE_DRAW`), and decode takes
+//! [`OP_HEADER_LEN`] from here rather than restating 8. Agreement between the
+//! serializer allocation sizes and the shared header constant is why this is
+//! stated rather than proposed.
 //!
 //! # This is not the FIFO packet header
 //!
@@ -245,6 +246,9 @@ mod tests {
             [s.next().expect("first"), s.next().expect("second")]
         };
         assert!(items[0].is_ok());
-        assert!(matches!(items[1], Err(WireError::BadLength { opcode: 2, .. })));
+        assert!(matches!(
+            items[1],
+            Err(WireError::BadLength { opcode: 2, .. })
+        ));
     }
 }

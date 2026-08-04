@@ -42,7 +42,6 @@ struct PreparedSampledImage {
     height: u32,
 }
 
-
 /// Post-dispatch copy destination for one storage image.
 enum ComputeImageDst {
     /// Pooled host-visible buffer; the CPU reads it back and the runtime

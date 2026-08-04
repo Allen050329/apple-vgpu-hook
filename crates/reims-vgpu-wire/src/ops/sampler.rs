@@ -359,10 +359,7 @@ mod tests {
             new_sampler(&oa).expect("fits"),
             new_sampler(&ob).expect("fits"),
         );
-        assert_eq!(
-            sa.support_argument_buffers(),
-            sb.support_argument_buffers()
-        );
+        assert_eq!(sa.support_argument_buffers(), sb.support_argument_buffers());
         assert_eq!(sa.unidentified_flag_bits(), sb.unidentified_flag_bits());
         assert_eq!(sa.lod_min_clamp.get(), sb.lod_min_clamp.get());
         assert_eq!(sa.lod_max_clamp.get(), sb.lod_max_clamp.get());

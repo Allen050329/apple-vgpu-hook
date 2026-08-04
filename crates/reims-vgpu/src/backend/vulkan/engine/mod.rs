@@ -17,7 +17,6 @@ mod device_lost;
 mod digest;
 mod draw_execution;
 mod draw_phase;
-pub mod stage_phase;
 mod draw_preparation;
 mod draw_validation;
 mod exec;
@@ -28,6 +27,7 @@ pub mod init_decline;
 mod pools;
 pub mod reason;
 mod slab;
+pub mod stage_phase;
 pub mod types;
 pub mod vk_call;
 #[cfg(feature = "host-window")]
@@ -49,14 +49,13 @@ pub use types::{
     BlendFactor, BlendOp, BlendStateResource, BufferContent, ColorWriteMask, ComputeBufferOutput,
     ComputeBufferResource, ComputeOutput, ComputeRequest, ComputeResidentSampleBind,
     ComputeSampledImageResource, ComputeStorageImageResource, ComputeStorageResidency, CullMode,
-    DepthState, DrawError, DrawOutput, DrawRequest, GuestRun, GuestRunSource,
-    IndexType, IndexedDrawResource, PrimitiveTopology, SampledContentIdentity,
-    SampledImageResource, SampledSource, SamplerAddressMode, SamplerBorderColor,
-    SamplerCompareFunction, SamplerFilter, SamplerMipFilter, SamplerResource, ScissorResource,
-    SecondaryColorTarget, SeedOrder, StencilFaceOps, StencilOp, StencilState,
-    StorageBufferResource, StorageImageFormat, TargetIdentity, VertexAttributeFormat,
-    VertexAttributeResource, VertexStepFunction, ViewportResource, WindowPresentSource,
-    COLOR_INPUT_BINDING,
+    DepthState, DrawError, DrawOutput, DrawRequest, GuestRun, GuestRunSource, IndexType,
+    IndexedDrawResource, PrimitiveTopology, SampledContentIdentity, SampledImageResource,
+    SampledSource, SamplerAddressMode, SamplerBorderColor, SamplerCompareFunction, SamplerFilter,
+    SamplerMipFilter, SamplerResource, ScissorResource, SecondaryColorTarget, SeedOrder,
+    StencilFaceOps, StencilOp, StencilState, StorageBufferResource, StorageImageFormat,
+    TargetIdentity, VertexAttributeFormat, VertexAttributeResource, VertexStepFunction,
+    ViewportResource, WindowPresentSource, COLOR_INPUT_BINDING,
 };
 pub use vk_call::{VkCall, VkOp};
 #[cfg(feature = "host-window")]
@@ -1158,18 +1157,10 @@ unsafe fn copy_image_level0_to_host_delivered(
     // `hostQueryReset`, which is a Vulkan 1.2 feature this device does not ask
     // for.
     if let Some(probe) = ctx.timestamps.as_ref() {
-        ctx.device.cmd_reset_query_pool(
-            cb,
-            probe.pool,
-            0,
-            context::TimestampProbe::SLOTS,
-        );
-        ctx.device.cmd_write_timestamp(
-            cb,
-            ash::vk::PipelineStageFlags::TOP_OF_PIPE,
-            probe.pool,
-            0,
-        );
+        ctx.device
+            .cmd_reset_query_pool(cb, probe.pool, 0, context::TimestampProbe::SLOTS);
+        ctx.device
+            .cmd_write_timestamp(cb, ash::vk::PipelineStageFlags::TOP_OF_PIPE, probe.pool, 0);
     }
     // Nothing else supplies it. Queue submission order starts command buffers
     // in order; it does not finish them in order, and it is not a memory
@@ -1251,7 +1242,7 @@ unsafe fn copy_image_level0_to_host_delivered(
     // Split three ways rather than timed as a whole: the submit and the copy
     // scale with the surface, the fence does not scale with anything we control,
     // and the fix for one is not the fix for the others.
-    use crate::runtime::drain::{ReadbackPhase, note_readback_phase};
+    use crate::runtime::drain::{note_readback_phase, ReadbackPhase};
     note_readback_phase(
         ReadbackPhase::Submit,
         submit_started.elapsed().as_micros() as u64,

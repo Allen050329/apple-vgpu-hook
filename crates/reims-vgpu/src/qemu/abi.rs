@@ -18,8 +18,8 @@
 
 use crate::qemu::host_ops::{ReimsVgpuHostAction, ReimsVgpuHostOps};
 use crate::{
-    backend_name, device_create, device_cursor_glyph_copy, device_cursor_glyph_info,
-    device_console_feed, device_destroy, device_drain, device_efi_console_copy,
+    backend_name, device_console_feed, device_create, device_cursor_glyph_copy,
+    device_cursor_glyph_info, device_destroy, device_drain, device_efi_console_copy,
     device_gfx_read, device_gfx_write, device_iosfc_read, device_iosfc_write, device_poll,
     device_pop_action, device_reset, device_scanout_copy, device_scanout_may_paint,
     device_window_run_main, device_window_set_early_fb, device_window_start, device_window_stop,

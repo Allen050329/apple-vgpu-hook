@@ -6,18 +6,11 @@
 //! remaining accepted opcodes are recognized and returned as typed kinds with
 //! raw length validation where the contract specifies fixed sizes.
 
-use crate::contract::endian::{ld16, ld32, ld64}; // ld16: render-pass load/store actions
 use reims_vgpu_wire::ops::render as wire;
 use reims_vgpu_wire::ops::render_pass as wire_pass;
 use reims_vgpu_wire::ops::tile as wire_tile;
 
-/// Bytes before a record's payload, from [`reims_vgpu_wire::OP_HEADER_LEN`].
-///
-/// One fact that used to be declared six times — here, in `render`, `compute`,
-/// `blit` and twice in `stream` — all agreeing, with nothing comparing them.
-/// Re-exporting makes drift impossible rather than merely detectable, which is
-/// the move `contract::gva` already made for the page-table format.
-pub use reims_vgpu_wire::OP_HEADER_LEN as HEADER_LEN;
+use reims_vgpu_wire::OP_HEADER_LEN;
 
 /// Map a `reims-vgpu-wire` view onto a payload, translating its refusal.
 ///
@@ -42,59 +35,17 @@ fn narrow_count(value: u64) -> Result<u32, DecodeStatus> {
     u32::try_from(value).map_err(|_| DecodeStatus::ErrCountOutOfRange)
 }
 
-// Contract opcodes from reims_vgpu_render_decode.h / reims_vgpu_render_format.h.
-/// Wide `drawPrimitives:vertexStart:vertexCount:` — `alloc(0, 0x14)`. Its payload
-/// layout is unverified, so it is declined by name rather than decoded.
-pub const OP_DRAW_WIDE: u32 = wire::OPCODE_DRAW_WIDE;
-/// Compact `drawPrimitives:vertexStart:vertexCount:` — `alloc(1, 8)`, wire sz 0x10.
-pub const OP_DRAW: u32 = wire::OPCODE_DRAW;
-/// Wire record length and payload length of the compact form, from the encoder's
-/// own `alloc(1, 8)`. Checked exactly: a `0x1` record of any other size is not a
-/// form this contract knows.
+// Layout lengths for fixed-size records and bind tables. Opcodes live in
+// `reims_vgpu_wire::ops::{render,render_pass,tile}`; this module maps them into
+// product `Kind`/`Command` and does not re-export wire opcode constants.
+/// Compact `drawPrimitives:vertexStart:vertexCount:` payload length (`alloc(1, 8)`).
+/// Checked exactly: a `0x1` record of any other size is not a form this contract knows.
 pub const DRAW_COMPACT_PAYLOAD_LEN: usize = 8;
-pub const DRAW_COMPACT_CMD_LEN: usize = HEADER_LEN + DRAW_COMPACT_PAYLOAD_LEN;
-/// Compact `drawPrimitives:vertexStart:vertexCount:instanceCount:` (wire sz 0x10).
-pub const OP_DRAW_INST_COMPACT: u32 = wire::OPCODE_DRAW_INSTANCED;
-/// Wide `drawPrimitives:vertexStart:vertexCount:instanceCount:`.
-pub const OP_DRAW_INST_WIDE: u32 = wire::OPCODE_DRAW_INSTANCED_WIDE;
-/// `drawPrimitives:vertexStart:vertexCount:instanceCount:baseInstance:`,
-/// compact and wide.
-pub const OP_DRAW_INST_BASE: u32 = wire::OPCODE_DRAW_INSTANCED_BASE;
-pub const OP_DRAW_INST_BASE_WIDE: u32 = wire::OPCODE_DRAW_INSTANCED_BASE_WIDE;
-/// Wide drawIndexedPrimitives form (wire size 0x20).
-pub const OP_DRAW_INDEXED_WIDE: u32 = wire::OPCODE_DRAW_INDEXED_WIDE;
-pub const OP_DRAW_INDEXED: u32 = wire::OPCODE_DRAW_INDEXED;
-/// Wide `drawIndexedPrimitives:…:instanceCount:`.
-pub const OP_DRAW_INDEXED_INST_WIDE: u32 = wire::OPCODE_DRAW_INDEXED_INSTANCED_WIDE;
-/// `drawIndexedPrimitives:…:instanceCount:baseVertex:baseInstance:`, compact
-/// and wide. Note that these two put the buffer offset BEFORE the index count,
-/// which their four siblings do not — see `reims_vgpu_wire::ops::render`.
-pub const OP_DRAW_INDEXED_BASE: u32 = wire::OPCODE_DRAW_INDEXED_INSTANCED_BASE;
-pub const OP_DRAW_INDEXED_BASE_WIDE: u32 = wire::OPCODE_DRAW_INDEXED_INSTANCED_BASE_WIDE;
-/// Last opcode in the accepted render-command enum window.
-///
-/// `0xa6`, not `0x98`. It was `0x98` because that was the highest opcode this
-/// project had seen, and the predicate below turned "not seen" into "Apple does
-/// not emit it" -- the same claim `decode::blit`'s `opcode_apple_rejected` made
-/// about the three ICB records, and wrong the same way.
-///
-/// `reims_vgpu_wire`'s manifest is the derivation: every opcode Apple's own
-/// serializer writes on this encoder is a row there, and the highest is
-/// [`OP_SET_VERTEX_BUFFER_OFFSET_STRIDE`]. `0x99`..`0xa4` are inside the window
-/// and unclaimed, which is what [`Kind::OtherAccepted`] is for -- an opcode
-/// nobody has driven is not the same statement as one Apple refuses to write.
-///
-/// So it is taken from that crate rather than transcribed from it. Writing the
-/// number here is what put `0x98` in it: a doc can name a derivation and still
-/// hold a stale copy of its answer, and nothing fails when the two part company.
-/// `the_accepted_window_ends_where_apples_render_manifest_does` closes the
-/// remaining half — that this *particular* constant is still the manifest's
-/// maximum after a capture adds a higher opcode.
-pub const OP_ACCEPTED_LAST: u32 = wire::OPCODE_SET_VERTEX_BUFFER_OFFSET_STRIDE;
-pub const OP_DRAW_INDEXED_INST: u32 = wire::OPCODE_DRAW_INDEXED_INSTANCED;
-pub const OP_EXECUTE_COMMANDS_INDIRECT: u32 = wire::OPCODE_EXECUTE_COMMANDS_INDIRECT;
-pub const OP_EXECUTE_COMMANDS_RANGE: u32 = wire::OPCODE_EXECUTE_COMMANDS_RANGE;
-/// Full record lengths (header + payload) from reims_vgpu_render_format.h.
+/// Compact draw total length including the shared op header.
+pub const DRAW_COMPACT_CMD_LEN: usize = OP_HEADER_LEN + DRAW_COMPACT_PAYLOAD_LEN;
+/// Fixed total lengths for ICB execute records (header + payload). Prefer
+/// `wire::EXECUTE_COMMANDS_*_TOTAL_LEN` at new call sites; these remain for
+/// historical tests and local checks that already use them.
 pub const EXECUTE_INDIRECT_CMD_LEN: usize = 0x18;
 pub const EXECUTE_RANGE_CMD_LEN: usize = 0x1c;
 pub const EXECUTE_INDIRECT_COMMAND_BUFFER_REF: usize = 0;
@@ -103,27 +54,6 @@ pub const EXECUTE_INDIRECT_BUFFER_OFFSET: usize = 8;
 pub const EXECUTE_RANGE_COMMAND_BUFFER_REF: usize = 0;
 pub const EXECUTE_RANGE_LOCATION: usize = 4;
 pub const EXECUTE_RANGE_LENGTH: usize = 0x0c;
-pub const OP_RESOURCE_BARRIER: u32 = wire::OPCODE_MEMORY_BARRIER_RESOURCES;
-pub const OP_MEMORY_BARRIER: u32 = wire::OPCODE_MEMORY_BARRIER_SCOPE;
-pub const OP_UPDATE_FENCE: u32 = wire::OPCODE_UPDATE_FENCE;
-pub const OP_WAIT_FENCE: u32 = wire::OPCODE_WAIT_FOR_FENCE;
-pub const OP_RENDER_PASS: u32 = wire_pass::OPCODE_RENDER_PASS;
-
-/// The five records `-[PGSerializerRenderCommandEncoder writeDescriptor]` emits
-/// beside the pass descriptor, each carrying one pass property.
-///
-/// Two are gated on their own capability (`DefaultRasterSampleCount`,
-/// `RasterizationRateMap`, `ProgrammableSamplePositions`) and three on
-/// `TileShaders`, which is why none had ever been seen: all sixteen serializer
-/// capabilities default off. They sit *inside* the accepted opcode window, so
-/// before this they reached [`Kind::OtherAccepted`] — accepted, dropped, and
-/// silent. Each is decoded and counted now; see [`Kind::RenderPassProperty`].
-pub const OP_PASS_DEFAULT_RASTER_SAMPLE_COUNT: u32 = wire_pass::OPCODE_DEFAULT_RASTER_SAMPLE_COUNT;
-pub const OP_PASS_SAMPLE_POSITIONS: u32 = wire_pass::OPCODE_SAMPLE_POSITIONS;
-pub const OP_PASS_RATE_MAP: u32 = wire_pass::OPCODE_RASTERIZATION_RATE_MAP;
-pub const OP_PASS_IMAGEBLOCK_SAMPLE_LENGTH: u32 = wire_pass::OPCODE_IMAGEBLOCK_SAMPLE_LENGTH;
-pub const OP_PASS_THREADGROUP_MEMORY_LENGTH: u32 = wire_pass::OPCODE_THREADGROUP_MEMORY_LENGTH;
-pub const OP_PASS_TILE_SIZE: u32 = wire_pass::OPCODE_TILE_SIZE;
 
 /// Render-pass attachment layout, taken from the wire structs' own fields.
 ///
@@ -134,12 +64,11 @@ pub const OP_PASS_TILE_SIZE: u32 = wire_pass::OPCODE_TILE_SIZE;
 /// used to state both of the first two as 0x28, which is right for depth and
 /// 4 bytes too long for stencil — that spare word is color slot 0's texture ref.
 ///
-/// Every offset below is now `offset_of!` on
-/// [`reims_vgpu_wire::ops::render_pass`], whose layout fixtures pin against
-/// bytes Apple's serializer produced. They were numbers here for a long time and
-/// they were right, with one exception the fixtures found: `PASS_ATTACH_LEVEL`
-/// is a **sixteen**-bit field with `slice` immediately above it, and the colour
-/// arm loaded thirty-two bits — see [`decode_color_attachment`].
+/// Offsets are `offset_of!` / `size_of!` on
+/// [`reims_vgpu_wire::ops::render_pass`]. Attachment decode maps wire attachment
+/// bodies rather than hand-loading fields; `level` is sixteen bits with `slice`
+/// immediately above it (a former product colour-arm u32 load swallowed the
+/// slice).
 pub const PASS_DEPTH_ATTACH_OFF: usize = 0x00;
 pub const PASS_STENCIL_ATTACH_OFF: usize = core::mem::size_of::<wire_pass::DepthAttachmentBody>();
 pub const PASS_COLOR_ATTACH_OFF: usize =
@@ -183,255 +112,19 @@ pub const PASS_LOAD_ACTION_CLEAR: u16 = 2;
 pub const PASS_STORE_ACTION_DONT_CARE: u16 = 0;
 pub const PASS_STORE_ACTION_STORE: u16 = 1;
 pub const PASS_MIN_PAYLOAD: usize = PASS_COLOR_ATTACH_OFF + PASS_COLOR_ATTACH_STRIDE;
-pub const OP_SET_BLEND_COLOR: u32 = wire::OPCODE_SET_BLEND_COLOR;
-pub const OP_SET_DEPTH_STENCIL: u32 = wire::OPCODE_SET_DEPTH_STENCIL_STATE;
-pub const OP_SET_CULL_MODE: u32 = wire::OPCODE_SET_CULL_MODE;
-/// The render states this device decodes and does not apply.
-///
-/// All six reached [`Kind::OtherAccepted`] until now -- one deduped log line
-/// naming a raw opcode, which for `0x7c` fires thousands of times per app render
-/// and says nothing about whether anything was lost. Decoding them gives each
-/// its own kind, and `runtime::exec` reports only the values that are *not* the
-/// API default, because a guest setting the default asks for what we already do.
-/// That turns a flood into a healthy zero whose non-zero reading is the argument
-/// for implementing the state.
-///
-/// Layouts and lengths from `reims_vgpu_wire::ops::render` (`ModeState`,
-/// `FloatState`, `ColorStoreAction`); the two mode records are 16 bytes with a
-/// `u64` payload and the two float records are 12 with an `f32`.
-pub const OP_SET_DEPTH_CLIP_MODE: u32 = wire::OPCODE_SET_DEPTH_CLIP_MODE;
-pub const OP_SET_TRIANGLE_FILL_MODE: u32 = wire::OPCODE_SET_TRIANGLE_FILL_MODE;
-pub const OP_SET_LINE_WIDTH: u32 = wire::OPCODE_SET_LINE_WIDTH;
-pub const OP_SET_TESSELLATION_FACTOR_SCALE: u32 = wire::OPCODE_SET_TESSELLATION_FACTOR_SCALE;
-pub const OP_SET_COLOR_STORE_ACTION: u32 = wire::OPCODE_SET_COLOR_STORE_ACTION;
-pub const OP_SET_DEPTH_STORE_ACTION: u32 = wire::OPCODE_SET_DEPTH_STORE_ACTION;
-pub const OP_SET_STENCIL_STORE_ACTION: u32 = wire::OPCODE_SET_STENCIL_STORE_ACTION;
-/// `MTLStoreActionOptions`, one opcode above each store action.
-///
-/// A second, independent record per attachment rather than a field of the one
-/// above: the guest can change the options without restating the action, and
-/// `runtime::exec` applies neither. **The widths do not carry over** — the
-/// options are a `u64` where the action is a `u32`, so the colour form's index
-/// is at payload `+8` and its record is 20 bytes. Layouts in
-/// `reims_vgpu_wire::ops::render` (`ColorStoreActionOptions`,
-/// `StoreActionOptions`).
-pub const OP_SET_COLOR_STORE_ACTION_OPTIONS: u32 = wire::OPCODE_SET_COLOR_STORE_ACTION_OPTIONS;
-pub const OP_SET_DEPTH_STORE_ACTION_OPTIONS: u32 = wire::OPCODE_SET_DEPTH_STORE_ACTION_OPTIONS;
-pub const OP_SET_STENCIL_STORE_ACTION_OPTIONS: u32 = wire::OPCODE_SET_STENCIL_STORE_ACTION_OPTIONS;
-/// `setTessellationFactorBuffer:offset:instanceStride:`.
-///
-/// **Not a bind** — one factor buffer per encoder, so no slot and no count.
-/// The draws that consume it are [`OP_DRAW_PATCHES`] and its siblings, which
-/// this protocol does carry; `render_tessellation_factor_buffer_dropped` is
-/// therefore an upper bound on real tessellation state, and it should track
-/// [`OP_DRAW_PATCHES`]'s own counter.
-pub const OP_SET_TESSELLATION_FACTOR_BUFFER: u32 = wire::OPCODE_SET_TESSELLATION_FACTOR_BUFFER;
-/// The four patch draws — tessellation's consumers — and the wide forms.
-///
-/// **`0x0c` is two records, told apart by length alone**: 56 bytes is the plain
-/// wide patch draw, 68 is the indexed one. Every other draw pair here gives the
-/// wide form its own opcode, so this is the exception, and a decoder that
-/// dispatched on `0x0c` and read the plain body would take the indexed record's
-/// control-point buffer ref as an offset. `0x0e` is unused.
-///
-/// All six were briefly recorded in this project as records Apple's serializer
-/// refuses — written from the ray-tracing binds beside them rather than from a
-/// capture. Layouts in `reims_vgpu_wire::ops::render`.
-pub const OP_DRAW_PATCHES: u32 = wire::OPCODE_DRAW_PATCHES;
-pub const OP_DRAW_PATCHES_WIDE: u32 = wire::OPCODE_DRAW_PATCHES_WIDE;
-pub const OP_DRAW_INDEXED_PATCHES: u32 = wire::OPCODE_DRAW_INDEXED_PATCHES;
-pub const OP_DRAW_PATCHES_INDIRECT: u32 = wire::OPCODE_DRAW_PATCHES_INDIRECT;
-pub const OP_DRAW_INDEXED_PATCHES_INDIRECT: u32 = wire::OPCODE_DRAW_INDEXED_PATCHES_INDIRECT;
-/// The two indirect draws, whose counts live in a buffer rather than the record.
-///
-/// `drawPrimitives:indirectBuffer:indirectBufferOffset:` and its indexed
-/// sibling. Both reached [`Kind::OtherAccepted`], so the guest's draw was lost
-/// against one deduped line naming a raw opcode — and unlike the six unapplied
-/// states, there is no API default here that would make a loss harmless: every
-/// one of these is geometry the guest asked for and did not get.
-///
-/// They cannot be executed by reading the record, which is the point of the
-/// counter. The vertex count, instance count, first vertex and base instance
-/// are in the indirect buffer's `MTLDrawPrimitivesIndirectArguments`, written
-/// by the GPU or by a compute pass that may not have run when the record is
-/// decoded. What the record does carry is the buffer and the offset, so the
-/// count says how much work an implementation would recover.
-///
-/// Layouts and lengths from `reims_vgpu_wire::ops::render` (`DrawIndirect`,
-/// `DrawIndexedIndirect`), each pinned by a fixture. Note the two do not share
-/// a field order: `0x10` puts the offset first and gives `primitive_type` 16
-/// bits, `0x11` leads with both 16-bit type fields and trails both `u64`
-/// offsets.
-pub const OP_DRAW_INDIRECT: u32 = wire::OPCODE_DRAW_INDIRECT;
-pub const OP_DRAW_INDEXED_INDIRECT: u32 = wire::OPCODE_DRAW_INDEXED_INDIRECT;
-/// `setVisibilityResultMode:offset:`, which arms an occlusion query.
-///
-/// A seventh state this rail decodes and does not apply, reported on the same
-/// terms as the other six: `MTLVisibilityResultModeDisabled` is 0 and is the
-/// API default, so only a non-zero mode is a loss.
-///
-/// **The offset is the first field**, reversing the selector's argument order.
-/// Both are `Q`, so nothing about the widths would catch a swap — only the
-/// fixture does (`reims_vgpu_wire::ops::render::VisibilityResult`).
-pub const OP_SET_VISIBILITY_RESULT_MODE: u32 = wire::OPCODE_SET_VISIBILITY_RESULT_MODE;
-/// `textureBarrier`: the header and nothing else, so it joins the two barrier
-/// opcodes this decoder already answers with [`Kind::Barrier`]. Fixture
-/// `render_texture_barrier` is 8 bytes with an empty payload.
-pub const OP_TEXTURE_BARRIER: u32 = wire::OPCODE_TEXTURE_BARRIER;
-pub const OP_SET_DEPTH_BIAS: u32 = wire::OPCODE_SET_DEPTH_BIAS;
-pub const OP_SET_FRAGMENT_BUFFER: u32 = wire::OPCODE_SET_FRAGMENT_BUFFER;
-pub const OP_SET_FRAGMENT_BUFFER_OFFSET: u32 = wire::OPCODE_SET_FRAGMENT_BUFFER_OFFSET;
-pub const OP_SET_FRAGMENT_SAMPLER: u32 = wire::OPCODE_SET_FRAGMENT_SAMPLER;
-/// `setFragmentSamplerState:lodMinClamp:lodMaxClamp:atIndex:` and its plural
-/// form. See [`OP_SET_VERTEX_SAMPLER_LOD`].
-pub const OP_SET_FRAGMENT_SAMPLER_LOD: u32 = wire::OPCODE_SET_FRAGMENT_SAMPLER_LOD;
-pub const OP_SET_FRAGMENT_TEXTURE: u32 = wire::OPCODE_SET_FRAGMENT_TEXTURE;
-pub const OP_SET_FRONT_FACING: u32 = wire::OPCODE_SET_FRONT_FACING;
-pub const OP_SET_PIPELINE: u32 = wire::OPCODE_SET_RENDER_PIPELINE_STATE;
-pub const OP_SET_SCISSOR: u32 = wire::OPCODE_SET_SCISSOR;
-/// `setScissorRects:count:`, the plural form of [`OP_SET_SCISSOR`].
-///
-/// The element is the singular record's whole payload, unchanged, behind a
-/// **`u64`** count — see [`SCISSOR_RECTS_COUNT_LEN`], which is not the width
-/// [`OP_SET_VIEWPORTS`] uses. Pinned by
-/// `reims_vgpu_wire::ops::render::SetScissorRects` (fixture
-/// `render_set_scissor_rects`, two rects in 80 bytes).
-pub const OP_SET_SCISSOR_RECTS: u32 = wire::OPCODE_SET_SCISSOR_RECTS;
-/// The plural scissor record's count is eight bytes; the plural viewport's is
-/// four. Two records of the same shape at two widths, so neither may borrow the
-/// other's constant.
+/// Count width of `setScissorRects:count:` — eight bytes, not the four used by
+/// `setViewports:count:`. The element is the singular scissor payload.
 pub const SCISSOR_RECTS_COUNT_LEN: usize = 8;
-pub const OP_SET_STENCIL_REF: u32 = wire::OPCODE_SET_STENCIL_REFERENCE;
-pub const OP_SET_VERTEX_BUFFER: u32 = wire::OPCODE_SET_VERTEX_BUFFER;
-pub const OP_SET_VERTEX_BUFFER_OFFSET: u32 = wire::OPCODE_SET_VERTEX_BUFFER_OFFSET;
-/// The vertex buffer binds that carry a dynamic attribute stride.
-///
-/// **Different opcodes from [`OP_SET_VERTEX_BUFFER`]/[`OP_SET_VERTEX_BUFFER_OFFSET`],
-/// not longer forms of them** — exactly the relationship
-/// [`OP_SET_VERTEX_SAMPLER_LOD`] has to the plain sampler bind, and it went
-/// wrong the same way twice over: these sit above the old `OP_ACCEPTED_LAST` of
-/// `0x98`, so a guest binding vertex buffers with a stride had **every one of
-/// those binds refused** as a record Apple does not emit.
-///
-/// Three selectors reach `0xa5` — the singular, the plural, and
-/// `setVertexBytes:length:attributeStride:atIndex:`, which stages the bytes
-/// through a buffer just as its non-stride sibling does. `0xa6` is the offset
-/// re-point.
-///
-/// There is no fragment sibling; Metal puts `attributeStride` only on the
-/// vertex-stage selectors.
-///
-/// Both are gated on the guest negotiating `supportsDynamicAttributeStride`,
-/// which the serializer answers false by default. That is why they were never
-/// seen, and why `render_vertex_attribute_stride_dropped` is the measurement
-/// that says whether a guest uses them. Layouts in
-/// `reims_vgpu_wire::ops::render` (`BufferStrideBind`, `BufferOffsetStride`).
-pub const OP_SET_VERTEX_BUFFER_STRIDE: u32 = wire::OPCODE_SET_VERTEX_BUFFER_STRIDE;
-pub const OP_SET_VERTEX_BUFFER_OFFSET_STRIDE: u32 = wire::OPCODE_SET_VERTEX_BUFFER_OFFSET_STRIDE;
-/// Vertex amplification: `setVertexAmplificationMode:value:` and
-/// `setVertexAmplificationCount:viewMappings:`.
-///
-/// Inside the accepted window, so these were never refused — they reached
-/// [`Kind::OtherAccepted`] and were dropped with one deduped line naming a
-/// number. Amplification makes one vertex shader invocation produce several
-/// views, so dropping it renders one view where the guest asked for many.
-///
-/// Both are gated on `-supportsVertexAmplification`, which the serializer
-/// answers false by default; that is why neither had been seen. Layouts in
-/// `reims_vgpu_wire::ops::render` (`VertexAmplificationMode`, `ViewMapping`) —
-/// note the mode record narrows both its `Q` arguments to 32 bits, and the
-/// count record's head is four bytes rather than the eight-byte bind header.
-pub const OP_SET_VERTEX_AMPLIFICATION_MODE: u32 = wire::OPCODE_SET_VERTEX_AMPLIFICATION_MODE;
-pub const OP_SET_VERTEX_AMPLIFICATION_COUNT: u32 = wire::OPCODE_SET_VERTEX_AMPLIFICATION_COUNT;
-/// The tile-shader family, `0x9b` and `0x9d`–`0xa4`.
-///
-/// Nine opcodes, all inside the accepted window and all previously claimed by
-/// no arm, so a guest running a tile shader had every tile bind and every tile
-/// dispatch reach [`Kind::OtherAccepted`] — one deduped line naming a number.
-///
-/// The bind records are the vertex and fragment stages' layouts byte for byte
-/// at tile opcodes, which is why the arms below reuse [`BIND_FIRST`],
-/// [`BIND_COUNT`] and [`BIND_ENTRIES`] rather than declaring their own. The
-/// two sampler forms stand in the same relation as `0x7f` to `0x80`: `0xa0` is
-/// a *different opcode*, not a longer `0x9f`.
-///
-/// All nineteen tile selectors are gated on `-supportsTileShaders`, which the
-/// serializer answers false by default. That is why none had been seen, and it
-/// is the third capability-gated family in a row to turn up records this device
-/// was dropping. Layouts in [`reims_vgpu_wire::ops::tile`].
-pub const OP_DISPATCH_THREADS_PER_TILE: u32 = wire_tile::OPCODE_DISPATCH_THREADS_PER_TILE;
-/// `setThreadgroupMemoryLength:offset:atIndex:`, the tile stage's imageblock
-/// allocation. The one selector in the family whose name does not say "tile",
-/// which is why `0x9c` looked for a while like a hole in the `0x9b`–`0xa4` run.
-/// Not the compute encoder's namesake record: that one has no offset.
-pub const OP_SET_TILE_THREADGROUP_MEMORY: u32 = wire_tile::OPCODE_SET_TILE_THREADGROUP_MEMORY;
-pub const OP_SET_TILE_BUFFER: u32 = wire_tile::OPCODE_SET_TILE_BUFFER;
-pub const OP_SET_TILE_BUFFER_OFFSET: u32 = wire_tile::OPCODE_SET_TILE_BUFFER_OFFSET;
-pub const OP_SET_TILE_SAMPLER: u32 = wire_tile::OPCODE_SET_TILE_SAMPLER;
-pub const OP_SET_TILE_SAMPLER_LOD: u32 = wire_tile::OPCODE_SET_TILE_SAMPLER_LOD;
-pub const OP_SET_TILE_TEXTURE: u32 = wire_tile::OPCODE_SET_TILE_TEXTURE;
-/// `dispatchThreadsPerTile:inRegion:` and its `withRenderTargetArrayIndex:`
-/// sibling. Same 84-byte record and same nine leading `u64`; only `0xa3` writes
-/// the trailing index, and `0xa2` leaves those four bytes to the guest's ring —
-/// so this decoder must not read them on `0xa2`. See
-/// [`reims_vgpu_wire::ops::tile::dispatch_threads_per_tile_region_rt_index`],
-/// which refuses them for exactly that reason.
-pub const OP_DISPATCH_THREADS_PER_TILE_IN_REGION: u32 =
-    wire_tile::OPCODE_DISPATCH_THREADS_PER_TILE_IN_REGION;
-pub const OP_DISPATCH_THREADS_PER_TILE_IN_REGION_RT_INDEX: u32 =
-    wire_tile::OPCODE_DISPATCH_THREADS_PER_TILE_IN_REGION_RT_INDEX;
-/// `getTileDimensions:`, which runs the protocol backwards.
-///
-/// The only record in this family that is not the guest issuing work. It names
-/// a guest buffer and offset the **host** is expected to write the tile width
-/// and height into. Dropping it does not lose a command — it leaves the guest
-/// reading whatever its own ring last held as a tile geometry, which is why
-/// this one has no healthy zero and is fail-visible on every occurrence.
-pub const OP_GET_TILE_DIMENSIONS: u32 = wire_tile::OPCODE_GET_TILE_DIMENSIONS;
-pub const OP_SET_VERTEX_SAMPLER: u32 = wire::OPCODE_SET_VERTEX_SAMPLER;
-/// `setVertexSamplerState:lodMinClamp:lodMaxClamp:atIndex:` and its plural form.
-///
-/// **A different opcode from the plain sampler bind, not a longer form of it.**
-/// This decoder knew only `0x7f` and `0x70`, so a bind carrying clamps did not
-/// lose its clamps -- it was never seen as a bind at all and fell to
-/// [`Kind::OtherAccepted`], leaving the sampler slot unbound. Pinned by
-/// `reims_vgpu_wire::ops::render::SamplerLodBind` (fixtures
-/// `render_set_vertex_sampler_lod`, `render_set_vertex_samplers_lod_range`).
-///
-/// The entry is twelve bytes -- ref, then two `f32` clamps -- against the plain
-/// form's four, and the clamps are **per entry**, which is why the plural
-/// fixture passes different clamps in each slot.
-pub const OP_SET_VERTEX_SAMPLER_LOD: u32 = wire::OPCODE_SET_VERTEX_SAMPLER_LOD;
-/// Bytes one LOD-bearing sampler entry occupies: the ref and two `f32` clamps.
+/// Bytes one LOD-bearing sampler entry occupies: ref, then two `f32` clamps.
 pub const SAMPLER_LOD_BIND_ENTRY_SIZE: usize = 12;
-pub const OP_SET_VERTEX_TEXTURE: u32 = wire::OPCODE_SET_VERTEX_TEXTURE;
-pub const OP_SET_VIEWPORT: u32 = wire::OPCODE_SET_VIEWPORT;
-/// `setViewports:count:`, the plural form of [`OP_SET_VIEWPORT`].
-///
-/// Element and layout as the singular record, behind a **`u32`** count. Pinned
-/// by `reims_vgpu_wire::ops::render::SetViewports` (fixture
-/// `render_set_viewports`, two viewports in 108 bytes).
-pub const OP_SET_VIEWPORTS: u32 = wire::OPCODE_SET_VIEWPORTS;
-/// See [`SCISSOR_RECTS_COUNT_LEN`]: this one is four.
+/// Count width of `setViewports:count:` — four bytes (see [`SCISSOR_RECTS_COUNT_LEN`]).
 pub const VIEWPORTS_COUNT_LEN: usize = 4;
-/// `useHeap:stages:` and `useHeaps:count:stages:`.
-///
-/// **These two are not neighbours and were previously recorded as `0x86` and
-/// `0x87`, which Apple's serializer assigns to neither.** Both numbers now come
-/// from [`reims_vgpu_wire::ops::render`], which pins them against bytes the
-/// serializer produced (fixtures `render_use_heap`, `render_use_resource`,
-/// `render_use_resources_count`), and
-/// `the_residency_opcodes_are_the_ones_apples_serializer_writes` holds the two
-/// declarations together so they cannot drift again.
-///
-/// `0x86` and `0x87` are now decoded by nothing here. They sit one and two
-/// above `textureBarrier` (`0x85`), so whatever they are they are in the
-/// barrier neighbourhood, and they reach [`Kind::OtherAccepted`] — which is
-/// visible on the failure channel, where the residency kinds were not.
-pub const OP_USE_HEAP: u32 = wire::OPCODE_USE_HEAP;
-pub const OP_USE_RESOURCE: u32 = wire::OPCODE_USE_RESOURCE;
 
 /// Residency record head: `count:u32` at `+0` on both forms.
+///
+/// Wire opcodes are `wire::OPCODE_USE_HEAP` (`0x1b`) and
+/// `wire::OPCODE_USE_RESOURCE` (`0x89`); the old `0x86`/`0x87` pair is not
+/// residency (see `the_residency_opcodes_are_the_ones_apples_serializer_writes`).
 pub const RESIDENCY_COUNT: usize = 0;
 /// `useResource:` packs `usage` and `stages` into the word at `+4` as two
 /// `u16`s, so its refs begin at `+8`.
@@ -447,7 +140,7 @@ pub const BIND_COUNT: usize = 4;
 pub const BIND_ENTRIES: usize = 8;
 pub const BUFFER_BIND_ENTRY_SIZE: usize = 12;
 /// The same entry with a `u64` attribute stride appended. See
-/// [`OP_SET_VERTEX_BUFFER_STRIDE`].
+/// [`wire::OPCODE_SET_VERTEX_BUFFER_STRIDE`].
 pub const BUFFER_STRIDE_BIND_ENTRY_SIZE: usize = 20;
 /// `setVertexAmplificationCount:viewMappings:`: a four-byte count, then one
 /// `MTLVertexAmplificationViewMapping` (two `u32`) per view.
@@ -573,7 +266,7 @@ pub enum Kind {
     /// [`Command::amplification_value`]; `setVertexAmplificationCount:viewMappings:`
     /// fills [`Command::count`]. Which of the two is [`Command::opcode`], as on
     /// the wire. The view mappings are not lifted — see
-    /// [`OP_SET_VERTEX_AMPLIFICATION_MODE`].
+    /// [`wire::OPCODE_SET_VERTEX_AMPLIFICATION_MODE`].
     SetVertexAmplification,
     /// A bind against the **tile** argument tables: `0x9d`/`0x9e` (buffer and
     /// offset), `0x9f`/`0xa0` (sampler, plain and LOD-bearing), `0xa1`
@@ -604,7 +297,7 @@ pub enum Kind {
     /// `setTessellationFactorBuffer:offset:instanceStride:` (`0x7a`), in
     /// [`Command::buffer_ref`] and [`Command::buffer_offset`].
     SetTessellationFactorBuffer,
-    /// A tessellated draw: [`OP_DRAW_PATCHES`] and its four siblings. Which
+    /// A tessellated draw: [`wire::OPCODE_DRAW_PATCHES`] and its four siblings. Which
     /// form is [`Command::opcode`], as on the wire — except that `0x0c` is two
     /// records and [`Command::command_length`] is what separates them.
     ///
@@ -684,12 +377,12 @@ pub struct StencilAttachment {
 
 /// Which encoder table a render bind record names.
 ///
-/// Derived from the opcode, not from a wire field: `OP_SET_VERTEX_*` versus
-/// `OP_SET_FRAGMENT_*`. The render opcode set expresses no other stage, so
-/// there are no other variants — an object/mesh/tile bind reaches the device
-/// through the indirect-command-buffer path and carries
-/// [`crate::runtime::icb::IcbRenderBindStage`], which is a different vocabulary
-/// with a different wire encoding.
+/// Derived from the opcode, not from a wire field:
+/// `wire::OPCODE_SET_VERTEX_*` versus `wire::OPCODE_SET_FRAGMENT_*`. The render
+/// opcode set expresses no other stage, so there are no other variants — an
+/// object/mesh/tile bind reaches the device through the indirect-command-buffer
+/// path and carries [`crate::runtime::icb::IcbRenderBindStage`], which is a
+/// different vocabulary with a different wire encoding.
 ///
 /// Keeping this exhaustive is the point. With unreachable variants present,
 /// every `match` over it needed a catch-all, and a catch-all is what would
@@ -769,11 +462,11 @@ pub struct Command {
     /// Value of a [`Kind::SetFloatState`] record.
     pub float_value: f32,
     /// The sampler bind carried per-entry LOD clamps this decoder did not lift.
-    /// Only ever true on [`Kind::SetSampler`]; see [`OP_SET_VERTEX_SAMPLER_LOD`].
+    /// Only ever true on [`Kind::SetSampler`]; see [`wire::OPCODE_SET_VERTEX_SAMPLER_LOD`].
     pub has_sampler_lod: bool,
     /// The vertex buffer bind carried a per-entry attribute stride this decoder
     /// did not lift. True on [`Kind::SetBuffer`] and [`Kind::SetBufferOffset`];
-    /// see [`OP_SET_VERTEX_BUFFER_STRIDE`]. The buffer still binds — what is
+    /// see [`wire::OPCODE_SET_VERTEX_BUFFER_STRIDE`]. The buffer still binds — what is
     /// missing is the stride the guest wanted the vertex fetch to use.
     pub has_attribute_stride: bool,
     pub raw_payload_len: usize,
@@ -833,31 +526,31 @@ pub struct Command {
 /// `decode::blit::opcode_unimplemented_here` needed, and the same lesson: the
 /// highest opcode *this project has driven* is not the highest Apple writes.
 ///
-/// The bound comes from [`OP_ACCEPTED_LAST`], which is now derived from
+/// The bound comes from [`wire::OPCODE_SET_VERTEX_BUFFER_OFFSET_STRIDE`], which is now derived from
 /// `reims_vgpu_wire`'s manifest rather than from observation.
 /// An opcode inside the accepted window that no decode arm claims.
 ///
 /// Two tests need one -- this module's catch-all test and `runtime::exec`'s
 /// fail-visible test -- and both used to hardcode it. Both went stale, twice:
-/// `OP_ACCEPTED_LAST` stopped working when that bound was corrected to `0xa6`,
+/// `wire::OPCODE_SET_VERTEX_BUFFER_OFFSET_STRIDE` stopped working when that bound was corrected to `0xa6`,
 /// and its replacement `0x99` lasted one commit until
 /// `setVertexAmplificationMode:value:` turned out to be exactly that number.
 /// Searching keeps them honest as arms are added, because what they test is
 /// that the catch-all exists and reports, not that any number is in it.
 #[cfg(test)]
 pub(crate) fn unclaimed_accepted_opcode() -> u32 {
-    (0..=OP_ACCEPTED_LAST)
+    (0..=wire::OPCODE_SET_VERTEX_BUFFER_OFFSET_STRIDE)
         .find(|&op| {
-            let mut v = vec![0u8; HEADER_LEN];
+            let mut v = vec![0u8; OP_HEADER_LEN];
             crate::contract::endian::st32(&mut v[0..4], op);
-            crate::contract::endian::st32(&mut v[4..8], HEADER_LEN as u32);
+            crate::contract::endian::st32(&mut v[4..8], OP_HEADER_LEN as u32);
             matches!(decode(&v), Ok(c) if c.kind == Kind::OtherAccepted)
         })
         .expect("every opcode in the window is decoded; the catch-all is unreachable")
 }
 
 pub fn opcode_above_the_encoder_window(opcode: u32) -> bool {
-    opcode > OP_ACCEPTED_LAST
+    opcode > wire::OPCODE_SET_VERTEX_BUFFER_OFFSET_STRIDE
 }
 
 pub fn opcode_supported(opcode: u32) -> bool {
@@ -865,7 +558,7 @@ pub fn opcode_supported(opcode: u32) -> bool {
         return false;
     }
     // Full accepted window from reims_vgpu_render_decode.h enum range.
-    opcode <= OP_ACCEPTED_LAST
+    opcode <= wire::OPCODE_SET_VERTEX_BUFFER_OFFSET_STRIDE
 }
 
 /// Decode color attachment slot `index` from a render-pass payload.
@@ -881,88 +574,96 @@ pub fn opcode_supported(opcode: u32) -> bool {
 /// So a pass rendering into array slice 1 — a cube face, a texture-array layer,
 /// a layered shadow map — reported mip level 65536 and lost its slice entirely.
 /// Both are decoded now.
+fn color_from_wire(c: &wire_pass::ColorAttachmentBody) -> ColorAttachment {
+    let p = &c.prefix;
+    let texture_ref = p.texture_ref.get();
+    ColorAttachment {
+        texture_ref,
+        resolve_texture_ref: p.resolve_texture_ref.get(),
+        level: u32::from(p.level.get()),
+        slice: u32::from(p.slice.get()),
+        depth_plane: u32::from(p.depth_plane.get()),
+        load_action: p.load_action.get(),
+        store_action: p.store_action.get(),
+        clear_color: c.clear_color(),
+        present: texture_ref != 0,
+        ..Default::default()
+    }
+}
+
+fn depth_from_wire(d: &wire_pass::DepthAttachmentBody) -> DepthAttachment {
+    let p = &d.prefix;
+    let texture_ref = p.texture_ref.get();
+    DepthAttachment {
+        texture_ref,
+        resolve_texture_ref: p.resolve_texture_ref.get(),
+        level: u32::from(p.level.get()),
+        slice: u32::from(p.slice.get()),
+        depth_plane: u32::from(p.depth_plane.get()),
+        load_action: p.load_action.get(),
+        store_action: p.store_action.get(),
+        clear_depth: d.clear_depth(),
+        present: texture_ref != 0,
+        ..Default::default()
+    }
+}
+
+fn stencil_from_wire(s: &wire_pass::StencilAttachmentBody) -> StencilAttachment {
+    let p = &s.prefix;
+    let texture_ref = p.texture_ref.get();
+    StencilAttachment {
+        texture_ref,
+        resolve_texture_ref: p.resolve_texture_ref.get(),
+        level: u32::from(p.level.get()),
+        slice: u32::from(p.slice.get()),
+        depth_plane: u32::from(p.depth_plane.get()),
+        load_action: p.load_action.get(),
+        store_action: p.store_action.get(),
+        clear_stencil: s.clear_stencil.get(),
+        present: texture_ref != 0,
+        ..Default::default()
+    }
+}
+
 pub fn decode_color_attachment(payload: &[u8], index: usize) -> ColorAttachment {
-    let mut out = ColorAttachment::default();
     let base = PASS_COLOR_ATTACH_OFF + index * PASS_COLOR_ATTACH_STRIDE;
-    if payload.len() < base + PASS_COLOR_ATTACH_STRIDE {
-        return out;
+    match reims_vgpu_wire::view_at::<wire_pass::ColorAttachmentBody>(payload, base) {
+        Ok(c) => color_from_wire(c),
+        Err(_) => ColorAttachment::default(),
     }
-    let slot = &payload[base..base + PASS_COLOR_ATTACH_STRIDE];
-    out.texture_ref = ld32(&slot[PASS_ATTACH_TEXREF..]);
-    out.resolve_texture_ref = ld32(&slot[PASS_ATTACH_RESOLVEREF..]);
-    out.level = ld16(&slot[PASS_ATTACH_LEVEL..]) as u32;
-    out.slice = ld16(&slot[PASS_ATTACH_SLICE..]) as u32;
-    out.depth_plane = ld16(&slot[PASS_ATTACH_DEPTH_PLANE..]) as u32;
-    out.load_action = ld16(&slot[PASS_ATTACH_LOAD_ACTION..]);
-    out.store_action = ld16(&slot[PASS_ATTACH_STORE_ACTION..]);
-    for i in 0..4 {
-        let bits = ld64(&slot[PASS_ATTACH_CLEAR_COLOR + i * 8..]);
-        out.clear_color[i] = f64::from_bits(bits);
-    }
-    out.present = out.texture_ref != 0;
-    out
 }
 
 /// Decode the depth attachment (fixed slot @0).
 pub fn decode_depth_attachment(payload: &[u8]) -> DepthAttachment {
-    let mut out = DepthAttachment::default();
-    if payload.len() < PASS_STENCIL_ATTACH_OFF {
-        return out;
+    match reims_vgpu_wire::view::<wire_pass::DepthAttachmentBody>(payload) {
+        Ok(d) if payload.len() >= PASS_STENCIL_ATTACH_OFF => depth_from_wire(d),
+        _ => DepthAttachment::default(),
     }
-    let slot = &payload[PASS_DEPTH_ATTACH_OFF..PASS_STENCIL_ATTACH_OFF];
-    out.texture_ref = ld32(&slot[PASS_ATTACH_TEXREF..]);
-    out.resolve_texture_ref = ld32(&slot[PASS_ATTACH_RESOLVEREF..]);
-    // Sixteen bits, with `slice` and `depth_plane` in the two fields above it.
-    // This arm carried the comment "the archive uses u16 for depth/stencil
-    // level (color uses u32)", which was the only statement of the rule
-    // anywhere and was wrong about the colour half; see
-    // [`decode_color_attachment`].
-    out.level = ld16(&slot[PASS_ATTACH_LEVEL..]) as u32;
-    out.slice = ld16(&slot[PASS_ATTACH_SLICE..]) as u32;
-    out.depth_plane = ld16(&slot[PASS_ATTACH_DEPTH_PLANE..]) as u32;
-    out.load_action = ld16(&slot[PASS_ATTACH_LOAD_ACTION..]);
-    out.store_action = ld16(&slot[PASS_ATTACH_STORE_ACTION..]);
-    out.clear_depth = f64::from_bits(ld64(&slot[PASS_DEPTH_ATTACH_CLEAR_DEPTH..]));
-    out.present = out.texture_ref != 0;
-    out
 }
 
-/// Decode the stencil attachment (fixed slot @0x28).
+/// Decode the stencil attachment (fixed slot after depth).
 pub fn decode_stencil_attachment(payload: &[u8]) -> StencilAttachment {
-    let mut out = StencilAttachment::default();
-    if payload.len() < PASS_COLOR_ATTACH_OFF {
-        return out;
+    match reims_vgpu_wire::view_at::<wire_pass::StencilAttachmentBody>(
+        payload,
+        PASS_STENCIL_ATTACH_OFF,
+    ) {
+        Ok(s) => stencil_from_wire(s),
+        Err(_) => StencilAttachment::default(),
     }
-    let slot = &payload[PASS_STENCIL_ATTACH_OFF..PASS_COLOR_ATTACH_OFF];
-    out.texture_ref = ld32(&slot[PASS_ATTACH_TEXREF..]);
-    out.resolve_texture_ref = ld32(&slot[PASS_ATTACH_RESOLVEREF..]);
-    out.level = ld16(&slot[PASS_ATTACH_LEVEL..]) as u32;
-    out.slice = ld16(&slot[PASS_ATTACH_SLICE..]) as u32;
-    out.depth_plane = ld16(&slot[PASS_ATTACH_DEPTH_PLANE..]) as u32;
-    out.load_action = ld16(&slot[PASS_ATTACH_LOAD_ACTION..]);
-    out.store_action = ld16(&slot[PASS_ATTACH_STORE_ACTION..]);
-    out.clear_stencil = ld32(&slot[PASS_STENCIL_ATTACH_CLEAR_STENCIL..]);
-    out.present = out.texture_ref != 0;
-    out
 }
 
 /// Transactional render command decode.
 pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
-    if command.len() < HEADER_LEN {
-        return Err(DecodeStatus::ErrShort);
-    }
-    let opcode = ld32(&command[0..]);
-    let command_length = ld32(&command[4..]) as usize;
-    if command_length < HEADER_LEN || command_length > command.len() {
-        return Err(DecodeStatus::ErrShort);
-    }
+    let op = reims_vgpu_wire::op(command, 0).map_err(|_| DecodeStatus::ErrShort)?;
+    let opcode = op.opcode();
+    let command_length = op.length() as usize;
     if opcode_above_the_encoder_window(opcode) {
         return Err(DecodeStatus::ErrUnsupportedOpcode);
     }
     if !opcode_supported(opcode) {
         return Err(DecodeStatus::ErrUnknownOpcode);
     }
-    let payload = &command[HEADER_LEN..command_length];
+    let payload = op.payload;
     let mut out = Command {
         opcode,
         command_length: command_length as u32,
@@ -971,118 +672,99 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
     };
 
     match opcode {
-        OP_SET_PIPELINE => {
-            if payload.len() < 4 {
-                return Err(DecodeStatus::ErrShort);
-            }
+        wire::OPCODE_SET_RENDER_PIPELINE_STATE => {
+            let r = wire::state_ref(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::SetPipeline;
-            out.pipeline_ref = ld32(payload);
+            out.pipeline_ref = r.object_ref.get();
             Ok(out)
         }
-        OP_SET_VERTEX_BUFFER | OP_SET_FRAGMENT_BUFFER | OP_SET_VERTEX_BUFFER_STRIDE => {
-            // Archive layout: [first:u32][count:u32][ {ref:u32, offset:u64} × count ]
-            if payload.len() < BIND_ENTRIES {
-                return Err(DecodeStatus::ErrShort);
-            }
+        wire::OPCODE_SET_VERTEX_BUFFER | wire::OPCODE_SET_FRAGMENT_BUFFER => {
+            let (head, entries) = wire::buffer_binds(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::SetBuffer;
-            out.stage = if opcode == OP_SET_FRAGMENT_BUFFER {
+            out.stage = if opcode == wire::OPCODE_SET_FRAGMENT_BUFFER {
                 Stage::Fragment
             } else {
                 Stage::Vertex
             };
-            // The third opcode changes the entry stride and nothing else: the
-            // attribute stride is a `u64` after the offset. It is not lifted,
-            // because nothing downstream applies it and a field with a producer
-            // and no consumer is worse than its absence -- but the *bind* is
-            // read, which is the whole point. This record used to be refused,
-            // so the buffer did not bind at all.
-            out.has_attribute_stride = opcode == OP_SET_VERTEX_BUFFER_STRIDE;
-            let entry_size = if out.has_attribute_stride {
-                BUFFER_STRIDE_BIND_ENTRY_SIZE
-            } else {
-                BUFFER_BIND_ENTRY_SIZE
-            };
-            out.first = ld32(&payload[BIND_FIRST..]);
-            out.count = ld32(&payload[BIND_COUNT..]);
+            out.first = head.first.get();
+            out.count = head.count.get();
             if out.count == 0 {
                 return Err(DecodeStatus::ErrBadLength);
             }
-            match bind_record_len(out.count, entry_size) {
+            // Exact length: product refuses slack the guest did not size for.
+            match bind_record_len(out.count, BUFFER_BIND_ENTRY_SIZE) {
                 Some(need) if payload.len() >= need => {}
                 _ => return Err(DecodeStatus::ErrShort),
             }
             out.buffer_binds.clear();
-            for i in 0..out.count as usize {
-                let e = BIND_ENTRIES + i * entry_size;
-                let r = ld32(&payload[e + BUFFER_BIND_ENTRY_REF..]);
-                let o = ld64(&payload[e + BUFFER_BIND_ENTRY_OFFSET..]);
-                out.buffer_binds.push((r, o));
+            for e in entries {
+                out.buffer_binds.push((e.buffer_ref.get(), e.offset.get()));
             }
-            // Convenience: first entry.
             if let Some(&(r, o)) = out.buffer_binds.first() {
                 out.buffer_ref = r;
                 out.buffer_offset = o;
             }
             Ok(out)
         }
-        OP_SET_VERTEX_TEXTURE
-        | OP_SET_FRAGMENT_TEXTURE
-        | OP_SET_VERTEX_SAMPLER
-        | OP_SET_FRAGMENT_SAMPLER
-        | OP_SET_VERTEX_SAMPLER_LOD
-        | OP_SET_FRAGMENT_SAMPLER_LOD => {
-            // Archive layout: [first:u32][count:u32][ ref:u32 × count ]. All four
-            // opcodes are that one record crossed with two independent axes —
-            // which stage the refs bind to, and whether they name textures or
-            // samplers — so the record is decoded once and the axes read off the
-            // opcode.
-            if payload.len() < BIND_ENTRIES {
-                return Err(DecodeStatus::ErrShort);
+        wire::OPCODE_SET_VERTEX_BUFFER_STRIDE => {
+            // Attribute-stride form: twenty-byte entries. Stride is not lifted
+            // (nothing applies it), but the bind itself must decode.
+            let (head, entries) =
+                wire::buffer_stride_binds(&op).map_err(|_| DecodeStatus::ErrShort)?;
+            out.kind = Kind::SetBuffer;
+            out.stage = Stage::Vertex;
+            out.has_attribute_stride = true;
+            out.first = head.first.get();
+            out.count = head.count.get();
+            if out.count == 0 {
+                return Err(DecodeStatus::ErrBadLength);
             }
-            let textures = opcode == OP_SET_VERTEX_TEXTURE || opcode == OP_SET_FRAGMENT_TEXTURE;
+            match bind_record_len(out.count, BUFFER_STRIDE_BIND_ENTRY_SIZE) {
+                Some(need) if payload.len() >= need => {}
+                _ => return Err(DecodeStatus::ErrShort),
+            }
+            out.buffer_binds.clear();
+            for e in entries {
+                out.buffer_binds.push((e.buffer_ref.get(), e.offset.get()));
+            }
+            if let Some(&(r, o)) = out.buffer_binds.first() {
+                out.buffer_ref = r;
+                out.buffer_offset = o;
+            }
+            Ok(out)
+        }
+        wire::OPCODE_SET_VERTEX_TEXTURE
+        | wire::OPCODE_SET_FRAGMENT_TEXTURE
+        | wire::OPCODE_SET_VERTEX_SAMPLER
+        | wire::OPCODE_SET_FRAGMENT_SAMPLER => {
+            let (head, entries) = wire::ref_binds(&op).map_err(|_| DecodeStatus::ErrShort)?;
+            let textures = opcode == wire::OPCODE_SET_VERTEX_TEXTURE
+                || opcode == wire::OPCODE_SET_FRAGMENT_TEXTURE;
             out.kind = if textures {
                 Kind::SetTexture
             } else {
                 Kind::SetSampler
             };
-            out.stage = if opcode == OP_SET_VERTEX_TEXTURE
-                || opcode == OP_SET_VERTEX_SAMPLER
-                || opcode == OP_SET_VERTEX_SAMPLER_LOD
+            out.stage = if opcode == wire::OPCODE_SET_VERTEX_TEXTURE
+                || opcode == wire::OPCODE_SET_VERTEX_SAMPLER
             {
                 Stage::Vertex
             } else {
                 Stage::Fragment
             };
-            // A third axis, and the only one that changes the entry stride: the
-            // LOD-bearing forms put two `f32` clamps after each ref. The clamps
-            // are not lifted, because nothing downstream applies them and a
-            // field with a producer and no consumer is worse than its absence --
-            // but the record is no longer dropped, and `runtime::exec` counts
-            // what the bind is missing. The layout is in
-            // `reims_vgpu_wire::ops::render::SamplerLodBind` for whoever adds it.
-            out.has_sampler_lod = opcode == OP_SET_VERTEX_SAMPLER_LOD
-                || opcode == OP_SET_FRAGMENT_SAMPLER_LOD;
-            let entry_size = if out.has_sampler_lod {
-                SAMPLER_LOD_BIND_ENTRY_SIZE
-            } else {
-                REF_BIND_ENTRY_SIZE
-            };
-            out.first = ld32(&payload[BIND_FIRST..]);
-            out.count = ld32(&payload[BIND_COUNT..]);
+            out.first = head.first.get();
+            out.count = head.count.get();
             if out.count == 0 {
                 return Err(DecodeStatus::ErrBadLength);
             }
-            match bind_record_len(out.count, entry_size) {
+            match bind_record_len(out.count, REF_BIND_ENTRY_SIZE) {
                 Some(need) if payload.len() >= need => {}
                 _ => return Err(DecodeStatus::ErrShort),
             }
             out.ref_binds.clear();
-            for i in 0..out.count as usize {
-                let e = BIND_ENTRIES + i * entry_size;
-                out.ref_binds.push(ld32(&payload[e..]));
+            for e in entries {
+                out.ref_binds.push(e.object_ref.get());
             }
-            // The single-ref field the rest of the runtime reads for a one-slot
-            // bind; which of the two it is, is the same axis as `kind`.
             if let Some(&r) = out.ref_binds.first() {
                 if textures {
                     out.texture_ref = r;
@@ -1092,7 +774,37 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             }
             Ok(out)
         }
-        OP_DRAW => {
+        wire::OPCODE_SET_VERTEX_SAMPLER_LOD | wire::OPCODE_SET_FRAGMENT_SAMPLER_LOD => {
+            // LOD clamps are not lifted (nothing applies them), but the bind
+            // itself is read through the wire layout rather than dropped.
+            let (head, entries) =
+                wire::sampler_lod_binds(&op).map_err(|_| DecodeStatus::ErrShort)?;
+            out.kind = Kind::SetSampler;
+            out.stage = if opcode == wire::OPCODE_SET_VERTEX_SAMPLER_LOD {
+                Stage::Vertex
+            } else {
+                Stage::Fragment
+            };
+            out.has_sampler_lod = true;
+            out.first = head.first.get();
+            out.count = head.count.get();
+            if out.count == 0 {
+                return Err(DecodeStatus::ErrBadLength);
+            }
+            match bind_record_len(out.count, SAMPLER_LOD_BIND_ENTRY_SIZE) {
+                Some(need) if payload.len() >= need => {}
+                _ => return Err(DecodeStatus::ErrShort),
+            }
+            out.ref_binds.clear();
+            for e in entries {
+                out.ref_binds.push(e.sampler_ref.get());
+            }
+            if let Some(&r) = out.ref_binds.first() {
+                out.sampler_ref = r;
+            }
+            Ok(out)
+        }
+        wire::OPCODE_DRAW => {
             // Compact `drawPrimitives:vertexStart:vertexCount:`: an 8-byte
             // payload of `u32 primitiveType · u16 vertexStart · u16 vertexCount`.
             //
@@ -1107,7 +819,7 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             if command_length != DRAW_COMPACT_CMD_LEN {
                 return Err(DecodeStatus::ErrBadLength);
             }
-            let d = wire_view::<wire::Draw>(payload)?;
+            let d = wire::draw(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::Draw;
             out.primitive_type = d.primitive_type.get();
             out.vertex_start = d.vertex_start.get() as u32;
@@ -1126,11 +838,11 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
         // is 32-bit, exactly as in the compact form. Fixtures
         // `render_draw_primitives_wide`, `..._count_over_16bit` and
         // `..._start_over_16bit` settle it.
-        OP_DRAW_WIDE => {
+        wire::OPCODE_DRAW_WIDE => {
             if command_length != wire::DRAW_WIDE_TOTAL_LEN as usize {
                 return Err(DecodeStatus::ErrBadLength);
             }
-            let d = wire_view::<wire::DrawWide>(payload)?;
+            let d = wire::draw_wide(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::Draw;
             out.primitive_type = d.primitive_type.get();
             out.vertex_start = narrow_count(d.vertex_start.get())?;
@@ -1147,8 +859,8 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
         // field for field. This is WebKit's instanced glyph/rect batch; the
         // non-instanced `0x01` and indexed `0x07` forms render chrome text,
         // which is why chrome rendered while page content stayed blank.
-        OP_DRAW_INST_COMPACT => {
-            let d = wire_view::<wire::DrawInstanced>(payload)?;
+        wire::OPCODE_DRAW_INSTANCED => {
+            let d = wire::draw_instanced(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::Draw;
             out.vertex_start = d.vertex_start.get() as u32;
             out.vertex_count = d.vertex_count.get() as u32;
@@ -1159,11 +871,11 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
         // Wide `drawPrimitives:…:instanceCount:` — the counts widen together
         // when any one of them passes 16 bits, so the whole record is 64-bit
         // even where two of the three would have fitted.
-        OP_DRAW_INST_WIDE => {
+        wire::OPCODE_DRAW_INSTANCED_WIDE => {
             if command_length != wire::DRAW_INSTANCED_WIDE_TOTAL_LEN as usize {
                 return Err(DecodeStatus::ErrBadLength);
             }
-            let d = wire_view::<wire::DrawInstancedWide>(payload)?;
+            let d = wire::draw_instanced_wide(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::Draw;
             out.vertex_start = narrow_count(d.vertex_start.get())?;
             out.vertex_count = narrow_count(d.vertex_count.get())?;
@@ -1177,11 +889,11 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
         // window, so they reached `Kind::OtherAccepted` and executed nothing —
         // an entire Metal draw selector dropped, wearing the shape of an
         // accepted state-set.
-        OP_DRAW_INST_BASE => {
+        wire::OPCODE_DRAW_INSTANCED_BASE => {
             if command_length != wire::DRAW_INSTANCED_BASE_TOTAL_LEN as usize {
                 return Err(DecodeStatus::ErrBadLength);
             }
-            let d = wire_view::<wire::DrawInstancedBase>(payload)?;
+            let d = wire::draw_instanced_base(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::Draw;
             out.vertex_start = d.vertex_start.get() as u32;
             out.vertex_count = d.vertex_count.get() as u32;
@@ -1190,11 +902,11 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             out.primitive_type = d.primitive_type.get() as u32;
             Ok(out)
         }
-        OP_DRAW_INST_BASE_WIDE => {
+        wire::OPCODE_DRAW_INSTANCED_BASE_WIDE => {
             if command_length != wire::DRAW_INSTANCED_BASE_WIDE_TOTAL_LEN as usize {
                 return Err(DecodeStatus::ErrBadLength);
             }
-            let d = wire_view::<wire::DrawInstancedBaseWide>(payload)?;
+            let d = wire::draw_instanced_base_wide(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::Draw;
             out.vertex_start = narrow_count(d.vertex_start.get())?;
             out.vertex_count = narrow_count(d.vertex_count.get())?;
@@ -1203,7 +915,7 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             out.primitive_type = d.primitive_type.get() as u32;
             Ok(out)
         }
-        OP_DRAW_INDEXED_WIDE => {
+        wire::OPCODE_DRAW_INDEXED_WIDE => {
             // The wide indexed form. This arm's head was already right; what it
             // called `u32 indexCount@8, u32 pad@0xc` and `u32
             // indexBufferOffset@0x10, u32 pad@0x14` are the two halves of two
@@ -1213,7 +925,7 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             if command_length != wire::DRAW_INDEXED_WIDE_TOTAL_LEN as usize {
                 return Err(DecodeStatus::ErrBadLength);
             }
-            let d = wire_view::<wire::DrawIndexedWide>(payload)?;
+            let d = wire::draw_indexed_wide(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::Draw;
             out.primitive_type = d.primitive_type.get() as u32;
             out.index_type = d.index_type.get() as u32;
@@ -1240,27 +952,29 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
         // gone. These two records are 12 and 16 bytes of payload and never
         // anything else; the wide forms are separate opcodes (`0x06`, `0x08`).
         // It was unreachable, and the layout it carried was an invention.
-        OP_DRAW_INDEXED | OP_DRAW_INDEXED_INST => {
+        wire::OPCODE_DRAW_INDEXED | wire::OPCODE_DRAW_INDEXED_INSTANCED => {
             out.kind = Kind::Draw;
+            // Shared compact body; the instanced form only adds instance_count.
+            // Use the layout view (not draw_indexed's opcode assert) so both arms share it.
             let d = wire_view::<wire::DrawIndexed>(payload)?;
             out.primitive_type = d.primitive_type.get() as u32;
             out.index_type = d.index_type.get() as u32;
             out.index_buffer_ref = d.index_buffer_ref.get();
             out.index_count = d.index_count.get() as u32;
             out.index_buffer_offset = d.index_buffer_offset.get() as u64;
-            out.instance_count = if opcode == OP_DRAW_INDEXED_INST {
-                let i = wire_view::<wire::DrawIndexedInstanced>(payload)?;
+            out.instance_count = if opcode == wire::OPCODE_DRAW_INDEXED_INSTANCED {
+                let i = wire::draw_indexed_instanced(&op).map_err(|_| DecodeStatus::ErrShort)?;
                 (i.instance_count.get() as u32).max(1)
             } else {
                 1
             };
             Ok(out)
         }
-        OP_DRAW_INDEXED_INST_WIDE => {
+        wire::OPCODE_DRAW_INDEXED_INSTANCED_WIDE => {
             if command_length != wire::DRAW_INDEXED_INSTANCED_WIDE_TOTAL_LEN as usize {
                 return Err(DecodeStatus::ErrBadLength);
             }
-            let d = wire_view::<wire::DrawIndexedInstancedWide>(payload)?;
+            let d = wire::draw_indexed_instanced_wide(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::Draw;
             out.primitive_type = d.primitive_type.get() as u32;
             out.index_type = d.index_type.get() as u32;
@@ -1277,11 +991,11 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
         // swaps a guest's index count and its buffer offset, which draws from
         // the wrong place in the wrong amount — so the field order here is not
         // a copy of the arm above and must not be made one.
-        OP_DRAW_INDEXED_BASE => {
+        wire::OPCODE_DRAW_INDEXED_INSTANCED_BASE => {
             if command_length != wire::DRAW_INDEXED_INSTANCED_BASE_TOTAL_LEN as usize {
                 return Err(DecodeStatus::ErrBadLength);
             }
-            let d = wire_view::<wire::DrawIndexedInstancedBase>(payload)?;
+            let d = wire::draw_indexed_instanced_base(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::Draw;
             out.primitive_type = d.primitive_type.get() as u32;
             out.index_type = d.index_type.get() as u32;
@@ -1293,11 +1007,12 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             out.base_vertex = d.base_vertex.get() as i64;
             Ok(out)
         }
-        OP_DRAW_INDEXED_BASE_WIDE => {
+        wire::OPCODE_DRAW_INDEXED_INSTANCED_BASE_WIDE => {
             if command_length != wire::DRAW_INDEXED_INSTANCED_BASE_WIDE_TOTAL_LEN as usize {
                 return Err(DecodeStatus::ErrBadLength);
             }
-            let d = wire_view::<wire::DrawIndexedInstancedBaseWide>(payload)?;
+            let d =
+                wire::draw_indexed_instanced_base_wide(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::Draw;
             out.primitive_type = d.primitive_type.get() as u32;
             out.index_type = d.index_type.get() as u32;
@@ -1309,215 +1024,177 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             out.base_vertex = d.base_vertex.get();
             Ok(out)
         }
-        OP_SET_VERTEX_BUFFER_OFFSET
-        | OP_SET_FRAGMENT_BUFFER_OFFSET
-        | OP_SET_VERTEX_BUFFER_OFFSET_STRIDE => {
-            // Archive: index:u32 @0, offset:u64 @4 (REIMS_VGPU_RENDER_BUFFER_OFFSET_*).
-            // The stride form appends a `u64` and is otherwise this record.
-            if payload.len() < BUFFER_OFFSET_PAYLOAD_LEN {
-                return Err(DecodeStatus::ErrShort);
-            }
+        wire::OPCODE_SET_VERTEX_BUFFER_OFFSET | wire::OPCODE_SET_FRAGMENT_BUFFER_OFFSET => {
+            let b = wire::buffer_offset(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::SetBufferOffset;
-            out.stage = if opcode == OP_SET_FRAGMENT_BUFFER_OFFSET {
+            out.stage = if opcode == wire::OPCODE_SET_FRAGMENT_BUFFER_OFFSET {
                 Stage::Fragment
             } else {
                 Stage::Vertex
             };
-            out.has_attribute_stride = opcode == OP_SET_VERTEX_BUFFER_OFFSET_STRIDE;
-            if out.has_attribute_stride
-                && payload.len() < BUFFER_OFFSET_PAYLOAD_LEN + core::mem::size_of::<u64>()
-            {
-                return Err(DecodeStatus::ErrShort);
-            }
-            out.first = ld32(&payload[BUFFER_OFFSET_INDEX..]);
-            out.buffer_offset = ld64(&payload[BUFFER_OFFSET_VALUE..]);
+            out.first = b.index.get();
+            out.buffer_offset = b.offset.get();
             Ok(out)
         }
-        OP_SET_VIEWPORT | OP_SET_VIEWPORTS => {
-            // The plural form is the singular record behind a count, so the
-            // only difference is where the first viewport starts. `count` is
-            // kept because the executor models one viewport and the rest are a
-            // loss it has to be able to name.
-            let (base, count) = if opcode == OP_SET_VIEWPORTS {
-                if payload.len() < VIEWPORTS_COUNT_LEN {
-                    return Err(DecodeStatus::ErrShort);
-                }
-                (VIEWPORTS_COUNT_LEN, ld32(payload))
-            } else {
-                (0, 1)
-            };
+        wire::OPCODE_SET_VERTEX_BUFFER_OFFSET_STRIDE => {
+            let b = wire::buffer_offset_stride(&op).map_err(|_| DecodeStatus::ErrShort)?;
+            out.kind = Kind::SetBufferOffset;
+            out.stage = Stage::Vertex;
+            out.has_attribute_stride = true;
+            out.first = b.index.get();
+            out.buffer_offset = b.offset.get();
+            Ok(out)
+        }
+        wire::OPCODE_SET_VIEWPORT => {
+            let v = wire::set_viewport(&op).map_err(|_| DecodeStatus::ErrShort)?;
+            out.kind = Kind::SetViewport;
+            out.count = 1;
+            out.viewport = [
+                v.origin_x.get(),
+                v.origin_y.get(),
+                v.width.get(),
+                v.height.get(),
+                v.znear.get(),
+                v.zfar.get(),
+            ];
+            Ok(out)
+        }
+        wire::OPCODE_SET_VIEWPORTS => {
+            // Count is kept: the executor models one viewport; further rects are
+            // a named loss. First viewport is still lifted.
+            let (head, ports) = wire::set_viewports(&op).map_err(|_| DecodeStatus::ErrShort)?;
+            let count = head.count.get();
             if count == 0 {
                 return Err(DecodeStatus::ErrBadLength);
             }
-            match (count as usize)
-                .checked_mul(48)
-                .and_then(|n| n.checked_add(base))
-            {
-                Some(need) if payload.len() >= need => {}
-                _ => return Err(DecodeStatus::ErrShort),
-            }
             out.kind = Kind::SetViewport;
             out.count = count;
-            for i in 0..6 {
-                let bits = ld64(&payload[base + i * 8..]);
-                out.viewport[i] = f64::from_bits(bits);
-            }
+            let v = ports.first().ok_or(DecodeStatus::ErrShort)?;
+            out.viewport = [
+                v.origin_x.get(),
+                v.origin_y.get(),
+                v.width.get(),
+                v.height.get(),
+                v.znear.get(),
+                v.zfar.get(),
+            ];
             Ok(out)
         }
-        OP_SET_SCISSOR | OP_SET_SCISSOR_RECTS => {
-            // Four u64 fields at 0/8/0x10/0x18 (payload 0x20). Product once
-            // mis-read four u32s, which is wrong for live op 0x75 len=40.
-            //
-            // The plural form puts that same rect behind a count, at a width
-            // that is *not* the viewport record's -- see
-            // [`SCISSOR_RECTS_COUNT_LEN`].
-            let (base, count) = if opcode == OP_SET_SCISSOR_RECTS {
-                if payload.len() < SCISSOR_RECTS_COUNT_LEN {
-                    return Err(DecodeStatus::ErrShort);
-                }
-                (SCISSOR_RECTS_COUNT_LEN, ld64(payload))
-            } else {
-                (0, 1)
-            };
+        wire::OPCODE_SET_SCISSOR => {
+            let r = wire::set_scissor(&op).map_err(|_| DecodeStatus::ErrShort)?;
+            out.kind = Kind::SetScissor;
+            out.count = 1;
+            out.scissor_x = r.x.get() as u32;
+            out.scissor_y = r.y.get() as u32;
+            out.scissor_w = r.width.get() as u32;
+            out.scissor_h = r.height.get() as u32;
+            Ok(out)
+        }
+        wire::OPCODE_SET_SCISSOR_RECTS => {
+            let (head, rects) = wire::set_scissor_rects(&op).map_err(|_| DecodeStatus::ErrShort)?;
+            let count = head.count.get();
             if count == 0 {
                 return Err(DecodeStatus::ErrBadLength);
             }
             let Ok(count) = u32::try_from(count) else {
                 return Err(DecodeStatus::ErrCountOutOfRange);
             };
-            match (count as usize)
-                .checked_mul(SCISSOR_PAYLOAD_LEN)
-                .and_then(|n| n.checked_add(base))
-            {
-                Some(need) if payload.len() >= need => {}
-                _ => return Err(DecodeStatus::ErrShort),
-            }
+            let r = rects.first().ok_or(DecodeStatus::ErrShort)?;
             out.kind = Kind::SetScissor;
             out.count = count;
-            out.scissor_x = ld64(&payload[base + SCISSOR_X..]) as u32;
-            out.scissor_y = ld64(&payload[base + SCISSOR_Y..]) as u32;
-            out.scissor_w = ld64(&payload[base + SCISSOR_WIDTH..]) as u32;
-            out.scissor_h = ld64(&payload[base + SCISSOR_HEIGHT..]) as u32;
+            out.scissor_x = r.x.get() as u32;
+            out.scissor_y = r.y.get() as u32;
+            out.scissor_w = r.width.get() as u32;
+            out.scissor_h = r.height.get() as u32;
             Ok(out)
         }
-        OP_SET_BLEND_COLOR => {
-            if payload.len() < 16 {
-                return Err(DecodeStatus::ErrShort);
-            }
+        wire::OPCODE_SET_BLEND_COLOR => {
+            let b = wire::set_blend_color(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::SetBlendColor;
             out.has_blend_color = true;
-            for i in 0..4 {
-                out.blend_color[i] = f32::from_bits(ld32(&payload[i * 4..]));
-            }
+            out.blend_color = [b.red.get(), b.green.get(), b.blue.get(), b.alpha.get()];
             Ok(out)
         }
-        OP_SET_CULL_MODE => {
-            if payload.len() < 4 {
-                return Err(DecodeStatus::ErrShort);
-            }
+        wire::OPCODE_SET_CULL_MODE => {
+            let m = wire::set_cull_mode(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::SetCullMode;
             out.has_cull_mode = true;
-            out.cull_mode = ld32(payload);
+            out.cull_mode = m.mode.get() as u32;
             Ok(out)
         }
-        OP_SET_FRONT_FACING => {
-            if payload.len() < 4 {
-                return Err(DecodeStatus::ErrShort);
-            }
+        wire::OPCODE_SET_FRONT_FACING => {
+            let m = wire::set_front_facing(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::SetFrontFacing;
             out.has_front_facing = true;
-            out.front_facing = ld32(payload);
+            out.front_facing = m.mode.get() as u32;
             Ok(out)
         }
-        OP_SET_DEPTH_BIAS => {
-            if payload.len() < 12 {
-                return Err(DecodeStatus::ErrShort);
-            }
+        wire::OPCODE_SET_DEPTH_BIAS => {
+            let d = wire::set_depth_bias(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::SetDepthBias;
             out.has_depth_bias = true;
-            out.depth_bias[0] = f32::from_bits(ld32(&payload[0..]));
-            out.depth_bias[1] = f32::from_bits(ld32(&payload[4..]));
-            out.depth_bias[2] = f32::from_bits(ld32(&payload[8..]));
+            out.depth_bias = [d.bias.get(), d.slope_scale.get(), d.clamp.get()];
             Ok(out)
         }
-        OP_SET_DEPTH_STENCIL => {
-            if payload.len() < 4 {
-                return Err(DecodeStatus::ErrShort);
-            }
+        wire::OPCODE_SET_DEPTH_STENCIL_STATE => {
+            let r = wire::state_ref(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::SetDepthStencil;
-            out.depth_stencil_ref = ld32(payload);
+            out.depth_stencil_ref = r.object_ref.get();
             Ok(out)
         }
-        OP_SET_STENCIL_REF => {
-            if payload.len() < 8 {
-                return Err(DecodeStatus::ErrShort);
-            }
+        wire::OPCODE_SET_STENCIL_REFERENCE => {
+            let s = wire::set_stencil_reference(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::SetStencilReference;
             out.has_stencil_ref = true;
-            out.stencil_ref_front = ld32(&payload[0..]);
-            out.stencil_ref_back = ld32(&payload[4..]);
+            out.stencil_ref_front = s.front.get();
+            out.stencil_ref_back = s.back.get();
             Ok(out)
         }
-        OP_UPDATE_FENCE | OP_WAIT_FENCE => {
-            if payload.len() < 4 {
-                return Err(DecodeStatus::ErrShort);
-            }
+        wire::OPCODE_UPDATE_FENCE | wire::OPCODE_WAIT_FOR_FENCE => {
+            let f = wire::fence(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::Fence;
-            out.fence_ref = ld32(payload);
+            out.fence_ref = f.fence_ref.get();
             Ok(out)
         }
-        OP_USE_RESOURCE | OP_USE_HEAP => {
-            // Both forms are count-led with a trailing ref array, and they
-            // differ only in where the array starts — see [`USE_RESOURCE_REFS`]
-            // and [`USE_HEAP_REFS`]. The array's extent is the whole contract
-            // check here: the refs themselves are not lifted, because the
-            // product answers residency by doing nothing (see
-            // `RenderKind::UseResource` in `runtime::exec`) and a field with a
-            // producer and no consumer is worse than the absence of one.
-            let refs_at = if opcode == OP_USE_RESOURCE {
-                USE_RESOURCE_REFS
-            } else {
-                USE_HEAP_REFS
-            };
-            if payload.len() < refs_at {
+        wire::OPCODE_USE_RESOURCE => {
+            // Refs are not lifted (exec no-ops residency); count bounds the
+            // record via the wire layout (usage+stages pack to 4 bytes, refs
+            // at +8).
+            let (head, refs) = wire::use_resource(&op).map_err(|_| DecodeStatus::ErrShort)?;
+            out.kind = Kind::UseResource;
+            out.count = head.count.get();
+            if out.count as usize != refs.len() {
                 return Err(DecodeStatus::ErrShort);
             }
-            out.kind = if opcode == OP_USE_RESOURCE {
-                Kind::UseResource
-            } else {
-                Kind::UseHeap
-            };
-            out.count = ld32(&payload[RESIDENCY_COUNT..]);
-            // Bounded by the record and by nothing else, exactly as the bind
-            // records are — see [`bind_record_len`]. This one names no table
-            // slot at all, so even a bind-table cap would have no claim on it:
-            // a guest may declare far more resources resident than it can bind
-            // at once.
-            let need = (out.count as usize)
-                .checked_mul(REF_BIND_ENTRY_SIZE)
-                .and_then(|n| n.checked_add(refs_at));
-            match need {
-                Some(need) if payload.len() >= need => Ok(out),
-                _ => Err(DecodeStatus::ErrShort),
-            }
+            Ok(out)
         }
-        OP_RESOURCE_BARRIER | OP_MEMORY_BARRIER | OP_TEXTURE_BARRIER => {
+        wire::OPCODE_USE_HEAP => {
+            // Heap form: no usage word, stages u16, refs at +6 (align-1).
+            let (head, refs) = wire::use_heap(&op).map_err(|_| DecodeStatus::ErrShort)?;
+            out.kind = Kind::UseHeap;
+            out.count = head.count.get();
+            if out.count as usize != refs.len() {
+                return Err(DecodeStatus::ErrShort);
+            }
+            Ok(out)
+        }
+        wire::OPCODE_MEMORY_BARRIER_RESOURCES
+        | wire::OPCODE_MEMORY_BARRIER_SCOPE
+        | wire::OPCODE_TEXTURE_BARRIER => {
             out.kind = Kind::Barrier;
             Ok(out)
         }
-        OP_SET_DEPTH_CLIP_MODE | OP_SET_TRIANGLE_FILL_MODE => {
-            if payload.len() < 8 {
-                return Err(DecodeStatus::ErrShort);
-            }
+        wire::OPCODE_SET_DEPTH_CLIP_MODE | wire::OPCODE_SET_TRIANGLE_FILL_MODE => {
+            let m = wire::mode_state(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::SetRasterState;
-            out.mode = ld64(payload);
+            out.mode = m.mode.get();
             Ok(out)
         }
-        OP_DRAW_INDIRECT => {
+        wire::OPCODE_DRAW_INDIRECT => {
             if command_length != wire::DRAW_INDIRECT_TOTAL_LEN as usize {
                 return Err(DecodeStatus::ErrBadLength);
             }
-            let d = wire_view::<wire::DrawIndirect>(payload)?;
+            let d = wire::draw_indirect(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::DrawIndirect;
             // 16 bits here, where the direct draws give the same field 32. The
             // two bytes above it are never written by the serializer, so a
@@ -1527,11 +1204,11 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             out.indirect_buffer_offset = d.indirect_buffer_offset.get();
             Ok(out)
         }
-        OP_DRAW_INDEXED_INDIRECT => {
+        wire::OPCODE_DRAW_INDEXED_INDIRECT => {
             if command_length != wire::DRAW_INDEXED_INDIRECT_TOTAL_LEN as usize {
                 return Err(DecodeStatus::ErrBadLength);
             }
-            let d = wire_view::<wire::DrawIndexedIndirect>(payload)?;
+            let d = wire::draw_indexed_indirect(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::DrawIndirect;
             out.primitive_type = d.primitive_type.get() as u32;
             // Its own 16-bit field beside `primitive_type`, not the upper half
@@ -1544,11 +1221,11 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             out.indirect_buffer_offset = d.indirect_buffer_offset.get();
             Ok(out)
         }
-        OP_SET_TILE_THREADGROUP_MEMORY => {
+        wire_tile::OPCODE_SET_TILE_THREADGROUP_MEMORY => {
             if command_length != wire_tile::SET_TILE_THREADGROUP_MEMORY_TOTAL_LEN as usize {
                 return Err(DecodeStatus::ErrBadLength);
             }
-            let m = wire_view::<wire_tile::TileThreadgroupMemory>(payload)?;
+            let m = wire_tile::tile_threadgroup_memory(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::TileBind;
             out.first = m.index.get();
             out.count = 1;
@@ -1559,185 +1236,192 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             // dispatch's grid and must not be borrowed for it.
             Ok(out)
         }
-        OP_SET_TILE_BUFFER | OP_SET_TILE_SAMPLER | OP_SET_TILE_SAMPLER_LOD
-        | OP_SET_TILE_TEXTURE => {
-            // The vertex and fragment bind layout at tile opcodes:
-            // `[first:u32][count:u32][ entry × count ]`, with the entry stride
-            // set by which of the four this is. Bounds-checked against the
-            // record's own count exactly as the other stages are — the count is
-            // guest-controlled here too.
-            //
-            // The entries themselves are not lifted. Nothing downstream binds a
-            // tile table, so a `buffer_binds` vector here would be a producer
-            // with no consumer; what `runtime::exec` needs is how many slots
-            // the guest asked for, which is `count`.
-            if payload.len() < BIND_ENTRIES {
-                return Err(DecodeStatus::ErrShort);
-            }
+        wire_tile::OPCODE_SET_TILE_BUFFER => {
+            // Entries are not lifted (no tile table consumer); first/count and
+            // length come from the wire bind walk.
+            let (head, _entries) =
+                wire_tile::tile_buffer_binds(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::TileBind;
-            let entry_size = match opcode {
-                OP_SET_TILE_BUFFER => BUFFER_BIND_ENTRY_SIZE,
-                OP_SET_TILE_SAMPLER_LOD => SAMPLER_LOD_BIND_ENTRY_SIZE,
-                _ => REF_BIND_ENTRY_SIZE,
-            };
-            out.first = ld32(&payload[BIND_FIRST..]);
-            out.count = ld32(&payload[BIND_COUNT..]);
+            out.first = head.first.get();
+            out.count = head.count.get();
             if out.count == 0 {
                 return Err(DecodeStatus::ErrBadLength);
             }
-            match bind_record_len(out.count, entry_size) {
+            match bind_record_len(out.count, BUFFER_BIND_ENTRY_SIZE) {
                 Some(need) if payload.len() >= need => Ok(out),
                 _ => Err(DecodeStatus::ErrShort),
             }
         }
-        OP_SET_TILE_BUFFER_OFFSET => {
-            // Not a bind header: the second word is a 64-bit offset, not a
-            // count. Same trap as `0x7e`/`0x6f`, same layout, tile opcode.
+        wire_tile::OPCODE_SET_TILE_TEXTURE => {
+            let (head, _entries) =
+                wire_tile::tile_texture_binds(&op).map_err(|_| DecodeStatus::ErrShort)?;
+            out.kind = Kind::TileBind;
+            out.first = head.first.get();
+            out.count = head.count.get();
+            if out.count == 0 {
+                return Err(DecodeStatus::ErrBadLength);
+            }
+            match bind_record_len(out.count, REF_BIND_ENTRY_SIZE) {
+                Some(need) if payload.len() >= need => Ok(out),
+                _ => Err(DecodeStatus::ErrShort),
+            }
+        }
+        wire_tile::OPCODE_SET_TILE_SAMPLER => {
+            let (head, _entries) =
+                wire_tile::tile_sampler_binds(&op).map_err(|_| DecodeStatus::ErrShort)?;
+            out.kind = Kind::TileBind;
+            out.first = head.first.get();
+            out.count = head.count.get();
+            if out.count == 0 {
+                return Err(DecodeStatus::ErrBadLength);
+            }
+            match bind_record_len(out.count, REF_BIND_ENTRY_SIZE) {
+                Some(need) if payload.len() >= need => Ok(out),
+                _ => Err(DecodeStatus::ErrShort),
+            }
+        }
+        wire_tile::OPCODE_SET_TILE_SAMPLER_LOD => {
+            let (head, _entries) =
+                wire_tile::tile_sampler_lod_binds(&op).map_err(|_| DecodeStatus::ErrShort)?;
+            out.kind = Kind::TileBind;
+            out.first = head.first.get();
+            out.count = head.count.get();
+            if out.count == 0 {
+                return Err(DecodeStatus::ErrBadLength);
+            }
+            match bind_record_len(out.count, SAMPLER_LOD_BIND_ENTRY_SIZE) {
+                Some(need) if payload.len() >= need => Ok(out),
+                _ => Err(DecodeStatus::ErrShort),
+            }
+        }
+        wire_tile::OPCODE_SET_TILE_BUFFER_OFFSET => {
             if command_length != wire_tile::SET_TILE_BUFFER_OFFSET_TOTAL_LEN as usize {
                 return Err(DecodeStatus::ErrBadLength);
             }
-            let b = wire_view::<wire_tile::BufferOffset>(payload)?;
+            let b = wire_tile::tile_buffer_offset(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::TileBind;
             out.first = b.index.get();
             out.count = 1;
             out.buffer_offset = b.offset.get();
             Ok(out)
         }
-        OP_DISPATCH_THREADS_PER_TILE => {
+        wire_tile::OPCODE_DISPATCH_THREADS_PER_TILE => {
             if command_length != wire_tile::DISPATCH_THREADS_PER_TILE_TOTAL_LEN as usize {
                 return Err(DecodeStatus::ErrBadLength);
             }
-            let d = wire_view::<wire_tile::DispatchThreadsPerTile>(payload)?;
+            let d =
+                wire_tile::dispatch_threads_per_tile(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::TileDispatch;
             out.tile_threads = [d.width.get(), d.height.get(), d.depth.get()];
             Ok(out)
         }
-        OP_DISPATCH_THREADS_PER_TILE_IN_REGION
-        | OP_DISPATCH_THREADS_PER_TILE_IN_REGION_RT_INDEX => {
+        wire_tile::OPCODE_DISPATCH_THREADS_PER_TILE_IN_REGION
+        | wire_tile::OPCODE_DISPATCH_THREADS_PER_TILE_IN_REGION_RT_INDEX => {
             if command_length != wire_tile::DISPATCH_THREADS_PER_TILE_IN_REGION_TOTAL_LEN as usize {
                 return Err(DecodeStatus::ErrBadLength);
             }
-            let d = wire_view::<wire_tile::DispatchThreadsPerTileInRegion>(payload)?;
+            let d = wire_tile::dispatch_threads_per_tile_in_region(&op)
+                .map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::TileDispatch;
             out.tile_threads = [d.width.get(), d.height.get(), d.depth.get()];
-            // The region and the render-target array index are deliberately
-            // not lifted. Nothing dispatches a tile shader, so neither has a
-            // consumer -- and the index in particular is only *written* by
-            // `0xa3`: the same four bytes on `0xa2` are whatever the guest's
-            // ring last held, so a field filled from both would carry noise
-            // half the time. `reims_vgpu_wire::ops::tile` refuses them for
-            // `0xa2` and is where to start when a dispatcher exists.
+            // Region / RT index not lifted — see wire tile module.
             Ok(out)
         }
-        OP_GET_TILE_DIMENSIONS => {
+        wire_tile::OPCODE_GET_TILE_DIMENSIONS => {
             if command_length != wire_tile::GET_TILE_DIMENSIONS_TOTAL_LEN as usize {
                 return Err(DecodeStatus::ErrBadLength);
             }
-            let g = wire_view::<wire_tile::GetTileDimensions>(payload)?;
+            let g = wire_tile::get_tile_dimensions(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::TileDimensionsQuery;
             out.buffer_ref = g.buffer_ref.get();
             out.buffer_offset = g.offset.get();
             Ok(out)
         }
-        OP_SET_VERTEX_AMPLIFICATION_MODE => {
+        wire::OPCODE_SET_VERTEX_AMPLIFICATION_MODE => {
             if command_length != wire::SET_VERTEX_AMPLIFICATION_MODE_TOTAL_LEN as usize {
                 return Err(DecodeStatus::ErrBadLength);
             }
-            let m = wire_view::<wire::VertexAmplificationMode>(payload)?;
+            let m = wire::vertex_amplification_mode(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::SetVertexAmplification;
             out.mode = m.mode.get() as u64;
             out.amplification_value = m.value.get();
             Ok(out)
         }
-        OP_SET_VERTEX_AMPLIFICATION_COUNT => {
-            // A four-byte head, not the eight-byte bind header: the mappings
-            // start straight after the count, so reading a `BindHeader` here
-            // would take the first mapping's viewport offset as the count.
-            if payload.len() < AMPLIFICATION_COUNT_LEN {
+        wire::OPCODE_SET_VERTEX_AMPLIFICATION_COUNT => {
+            // Four-byte count head (not BindHeader); mappings follow and are
+            // not lifted — nothing downstream amplifies. Wire parser bounds
+            // entries to the record length.
+            let (head, mappings) =
+                wire::vertex_amplification_count(&op).map_err(|_| DecodeStatus::ErrShort)?;
+            out.kind = Kind::SetVertexAmplification;
+            out.count = head.count.get();
+            if out.count as usize != mappings.len() {
                 return Err(DecodeStatus::ErrShort);
             }
-            out.kind = Kind::SetVertexAmplification;
-            out.count = ld32(payload);
-            // The mappings are not lifted: nothing downstream amplifies, and a
-            // field with a producer and no consumer is worse than its absence.
-            // The record is bounds-checked against its own count so a
-            // truncated one is refused rather than reported as a smaller ask.
-            match (out.count as usize)
-                .checked_mul(AMPLIFICATION_MAPPING_SIZE)
-                .and_then(|n| n.checked_add(AMPLIFICATION_COUNT_LEN))
-            {
-                Some(need) if payload.len() >= need => Ok(out),
-                _ => Err(DecodeStatus::ErrShort),
-            }
+            let _ = mappings; // unlifted by design
+            Ok(out)
         }
-        OP_SET_VISIBILITY_RESULT_MODE => {
+        wire::OPCODE_SET_VISIBILITY_RESULT_MODE => {
             if command_length != wire::SET_VISIBILITY_RESULT_MODE_TOTAL_LEN as usize {
                 return Err(DecodeStatus::ErrBadLength);
             }
-            let v = wire_view::<wire::VisibilityResult>(payload)?;
+            let v = wire::set_visibility_result_mode(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::SetVisibilityResultMode;
-            // Offset first, mode second. See `OP_SET_VISIBILITY_RESULT_MODE`.
+            // Offset first, mode second. See `wire::OPCODE_SET_VISIBILITY_RESULT_MODE`.
             out.visibility_result_offset = v.offset.get();
             out.mode = v.mode.get();
             Ok(out)
         }
-        OP_SET_LINE_WIDTH | OP_SET_TESSELLATION_FACTOR_SCALE => {
-            // Four bytes of payload, not eight: this is the shortest record the
-            // encoder emits, and reading it as a `f64` would take four bytes of
-            // the next record.
-            if payload.len() < 4 {
-                return Err(DecodeStatus::ErrShort);
-            }
+        wire::OPCODE_SET_LINE_WIDTH | wire::OPCODE_SET_TESSELLATION_FACTOR_SCALE => {
+            let f = wire::float_state(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::SetFloatState;
-            out.float_value = f32::from_bits(ld32(payload));
+            out.float_value = f.value.get();
             Ok(out)
         }
-        OP_SET_COLOR_STORE_ACTION | OP_SET_DEPTH_STORE_ACTION | OP_SET_STENCIL_STORE_ACTION => {
-            // The colour form is `[action:u32][index:u32]`; the depth and
-            // stencil forms have one attachment each and are the mode record's
-            // single `u64`. Both start with the action, so the read is shared
-            // and only the index is conditional.
-            if payload.len() < 8 {
-                return Err(DecodeStatus::ErrShort);
-            }
+        wire::OPCODE_SET_COLOR_STORE_ACTION => {
+            let a = wire::set_color_store_action(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::SetStoreAction;
-            if opcode == OP_SET_COLOR_STORE_ACTION {
-                out.mode = ld32(payload) as u64;
-                out.first = ld32(&payload[4..]);
-            } else {
-                out.mode = ld64(payload);
-            }
+            out.mode = u64::from(a.store_action.get());
+            out.first = a.index.get();
             Ok(out)
         }
-        OP_SET_COLOR_STORE_ACTION_OPTIONS
-        | OP_SET_DEPTH_STORE_ACTION_OPTIONS
-        | OP_SET_STENCIL_STORE_ACTION_OPTIONS => {
+        wire::OPCODE_SET_DEPTH_STORE_ACTION | wire::OPCODE_SET_STENCIL_STORE_ACTION => {
+            // Depth/stencil store actions share the one-NSUInteger mode shape.
+            let m = wire::mode_state(&op).map_err(|_| DecodeStatus::ErrShort)?;
+            out.kind = Kind::SetStoreAction;
+            out.mode = m.mode.get();
+            Ok(out)
+        }
+        wire::OPCODE_SET_COLOR_STORE_ACTION_OPTIONS
+        | wire::OPCODE_SET_DEPTH_STORE_ACTION_OPTIONS
+        | wire::OPCODE_SET_STENCIL_STORE_ACTION_OPTIONS => {
             // The same three-attachment split one opcode higher, and the widths
             // do *not* carry over: the options are a `u64` where the store
             // action is a `u32`, so the colour form's index sits at `+8` rather
             // than `+4` and the record is 20 bytes rather than 16.
-            if opcode == OP_SET_COLOR_STORE_ACTION_OPTIONS {
+            if opcode == wire::OPCODE_SET_COLOR_STORE_ACTION_OPTIONS {
                 if command_length != wire::SET_COLOR_STORE_ACTION_OPTIONS_TOTAL_LEN as usize {
                     return Err(DecodeStatus::ErrBadLength);
                 }
-                let a = wire_view::<wire::ColorStoreActionOptions>(payload)?;
+                let a = wire::set_color_store_action_options(&op)
+                    .map_err(|_| DecodeStatus::ErrShort)?;
                 out.mode = a.options.get();
                 out.first = a.index.get();
             } else {
                 if command_length != wire::SET_STORE_ACTION_OPTIONS_TOTAL_LEN as usize {
                     return Err(DecodeStatus::ErrBadLength);
                 }
-                let a = wire_view::<wire::StoreActionOptions>(payload)?;
+                let a = wire::set_store_action_options(&op).map_err(|_| DecodeStatus::ErrShort)?;
                 out.mode = a.options.get();
             }
             out.kind = Kind::SetStoreActionOptions;
             Ok(out)
         }
-        OP_DRAW_PATCHES
-        | OP_DRAW_PATCHES_WIDE
-        | OP_DRAW_INDEXED_PATCHES
-        | OP_DRAW_PATCHES_INDIRECT
-        | OP_DRAW_INDEXED_PATCHES_INDIRECT => {
+        wire::OPCODE_DRAW_PATCHES
+        | wire::OPCODE_DRAW_PATCHES_WIDE
+        | wire::OPCODE_DRAW_INDEXED_PATCHES
+        | wire::OPCODE_DRAW_PATCHES_INDIRECT
+        | wire::OPCODE_DRAW_INDEXED_PATCHES_INDIRECT => {
             // Six records across five opcodes, because `0x0c` is two: the plain
             // wide draw at 56 bytes and the indexed wide draw at 68. Dispatched
             // on the length rather than guessed, and a `0x0c` at any other
@@ -1752,10 +1436,12 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             // what `runtime::exec` needs is that a patch draw happened and
             // which form, and the opcode carries both.
             let want = match opcode {
-                OP_DRAW_PATCHES => wire::DRAW_PATCHES_TOTAL_LEN as usize,
-                OP_DRAW_INDEXED_PATCHES => wire::DRAW_INDEXED_PATCHES_TOTAL_LEN as usize,
-                OP_DRAW_PATCHES_INDIRECT => wire::DRAW_PATCHES_INDIRECT_TOTAL_LEN as usize,
-                OP_DRAW_INDEXED_PATCHES_INDIRECT => {
+                wire::OPCODE_DRAW_PATCHES => wire::DRAW_PATCHES_TOTAL_LEN as usize,
+                wire::OPCODE_DRAW_INDEXED_PATCHES => wire::DRAW_INDEXED_PATCHES_TOTAL_LEN as usize,
+                wire::OPCODE_DRAW_PATCHES_INDIRECT => {
+                    wire::DRAW_PATCHES_INDIRECT_TOTAL_LEN as usize
+                }
+                wire::OPCODE_DRAW_INDEXED_PATCHES_INDIRECT => {
                     wire::DRAW_INDEXED_PATCHES_INDIRECT_TOTAL_LEN as usize
                 }
                 // `0x0c`: the two wide forms, and nothing else.
@@ -1771,140 +1457,125 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             // Viewed, so a record whose declared length outran its bytes is
             // refused here rather than by whoever reads it next.
             match opcode {
-                OP_DRAW_PATCHES => {
-                    wire_view::<wire::DrawPatches>(payload)?;
+                wire::OPCODE_DRAW_PATCHES => {
+                    wire::draw_patches(&op).map_err(|_| DecodeStatus::ErrShort)?;
                 }
-                OP_DRAW_INDEXED_PATCHES => {
-                    wire_view::<wire::DrawIndexedPatches>(payload)?;
+                wire::OPCODE_DRAW_INDEXED_PATCHES => {
+                    wire::draw_indexed_patches(&op).map_err(|_| DecodeStatus::ErrShort)?;
                 }
-                OP_DRAW_PATCHES_INDIRECT => {
-                    wire_view::<wire::DrawPatchesIndirect>(payload)?;
+                wire::OPCODE_DRAW_PATCHES_INDIRECT => {
+                    wire::draw_patches_indirect(&op).map_err(|_| DecodeStatus::ErrShort)?;
                 }
-                OP_DRAW_INDEXED_PATCHES_INDIRECT => {
-                    wire_view::<wire::DrawIndexedPatchesIndirect>(payload)?;
+                wire::OPCODE_DRAW_INDEXED_PATCHES_INDIRECT => {
+                    wire::draw_indexed_patches_indirect(&op).map_err(|_| DecodeStatus::ErrShort)?;
                 }
                 _ if command_length == wire::DRAW_PATCHES_WIDE_TOTAL_LEN as usize => {
-                    wire_view::<wire::DrawPatchesWide>(payload)?;
+                    wire::draw_patches_wide(&op).map_err(|_| DecodeStatus::ErrShort)?;
                 }
                 _ => {
-                    wire_view::<wire::DrawIndexedPatchesWide>(payload)?;
+                    wire::draw_indexed_patches_wide(&op).map_err(|_| DecodeStatus::ErrShort)?;
                 }
             }
             out.kind = Kind::DrawPatches;
             Ok(out)
         }
-        OP_SET_TESSELLATION_FACTOR_BUFFER => {
+        wire::OPCODE_SET_TESSELLATION_FACTOR_BUFFER => {
             // Not a bind: one buffer per encoder, so there is no slot and no
             // count -- the ref and its two `u64` sit directly in the payload.
             if command_length != wire::SET_TESSELLATION_FACTOR_BUFFER_TOTAL_LEN as usize {
                 return Err(DecodeStatus::ErrBadLength);
             }
-            let t = wire_view::<wire::TessellationFactorBuffer>(payload)?;
+            let t =
+                wire::set_tessellation_factor_buffer(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::SetTessellationFactorBuffer;
             out.buffer_ref = t.buffer_ref.get();
             out.buffer_offset = t.offset.get();
             Ok(out)
         }
-        OP_EXECUTE_COMMANDS_INDIRECT => {
-            if command_length != EXECUTE_INDIRECT_CMD_LEN {
+        wire::OPCODE_EXECUTE_COMMANDS_INDIRECT => {
+            if command_length != wire::EXECUTE_COMMANDS_INDIRECT_TOTAL_LEN as usize {
                 return Err(DecodeStatus::ErrBadLength);
             }
+            let e = wire::execute_commands_indirect(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::ExecuteCommands;
             out.icb_is_range = false;
-            out.indirect_command_buffer_ref = ld32(&payload[EXECUTE_INDIRECT_COMMAND_BUFFER_REF..]);
-            out.icb_args_buffer_ref = ld32(&payload[EXECUTE_INDIRECT_BUFFER_REF..]);
-            out.icb_args_buffer_offset = ld64(&payload[EXECUTE_INDIRECT_BUFFER_OFFSET..]);
+            out.indirect_command_buffer_ref = e.icb_ref.get();
+            out.icb_args_buffer_ref = e.indirect_buffer_ref.get();
+            out.icb_args_buffer_offset = e.indirect_buffer_offset.get();
             Ok(out)
         }
-        OP_EXECUTE_COMMANDS_RANGE => {
-            if command_length != EXECUTE_RANGE_CMD_LEN {
+        wire::OPCODE_EXECUTE_COMMANDS_RANGE => {
+            if command_length != wire::EXECUTE_COMMANDS_RANGE_TOTAL_LEN as usize {
                 return Err(DecodeStatus::ErrBadLength);
             }
+            let e = wire::execute_commands_range(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::ExecuteCommands;
             out.icb_is_range = true;
-            out.indirect_command_buffer_ref = ld32(&payload[EXECUTE_RANGE_COMMAND_BUFFER_REF..]);
-            // Unaligned u64s after the ICB ref (contract).
-            out.icb_range_location = ld64(&payload[EXECUTE_RANGE_LOCATION..]);
-            out.icb_range_length = ld64(&payload[EXECUTE_RANGE_LENGTH..]);
+            out.indirect_command_buffer_ref = e.icb_ref.get();
+            out.icb_range_location = e.range_location.get();
+            out.icb_range_length = e.range_length.get();
             Ok(out)
         }
-        OP_RENDER_PASS => {
+        wire_pass::OPCODE_RENDER_PASS => {
             if payload.len() < PASS_MIN_PAYLOAD {
                 return Err(DecodeStatus::ErrShort);
             }
             out.kind = Kind::RenderPass;
-            out.depth = decode_depth_attachment(payload);
-            out.stencil = decode_stencil_attachment(payload);
-            out.color0 = decode_color_attachment(payload, 0);
+            // Full Apple record: one wire body. Shorter product fixtures still
+            // decode through the attachment views (same wire layouts at offsets).
+            if let Ok(body) = wire_pass::render_pass(&op) {
+                out.depth = depth_from_wire(&body.depth);
+                out.stencil = stencil_from_wire(&body.stencil);
+                out.color0 = color_from_wire(&body.color[0]);
+                out.pass_visibility_result_buffer_ref = body.visibility_result_buffer_ref.get();
+                out.pass_render_target_array_length = body.render_target_array_length.get();
+                out.pass_render_target_width = body.render_target_width.get();
+                out.pass_render_target_height = body.render_target_height.get();
+            } else {
+                out.depth = decode_depth_attachment(payload);
+                out.stencil = decode_stencil_attachment(payload);
+                out.color0 = decode_color_attachment(payload, 0);
+            }
             if out.color0.texture_ref != 0 {
                 out.texture_ref = out.color0.texture_ref;
             }
-            // The tail is present only on a full-length record. This decoder
-            // has always accepted a payload as short as one colour slot
-            // (`PASS_MIN_PAYLOAD`), and tightening that to Apple's 584 would
-            // refuse whatever the shorter form is rather than reading it, so
-            // the bound is checked here instead of raised there.
-            if payload.len() >= PASS_TAIL_OFF + 0x1c {
-                let t = &payload[PASS_TAIL_OFF..];
-                out.pass_visibility_result_buffer_ref = ld32(&t[PASS_TAIL_VISIBILITY_BUFFER_REF..]);
-                out.pass_render_target_array_length = ld64(&t[PASS_TAIL_ARRAY_LENGTH..]);
-                out.pass_render_target_width = ld64(&t[PASS_TAIL_TARGET_WIDTH..]);
-                out.pass_render_target_height = ld64(&t[PASS_TAIL_TARGET_HEIGHT..]);
-            }
             Ok(out)
         }
-        // The five records `writeDescriptor` emits beside the pass descriptor.
-        // Decoded and counted; the executor names the loss. Splitting the rate
-        // map out is what lets its ref reach `object_ref` rather than `mode` —
-        // a ref and a length are not the same kind of number and a single arm
-        // would have to pick one field for both. `texture_ref` is this
-        // decoder's generic object-ref slot, not a claim that a rate map is a
-        // texture; see the `0x21` arm's counter for what names it.
-        OP_PASS_RATE_MAP => {
-            if payload.len() < 4 {
-                return Err(DecodeStatus::ErrBadLength);
-            }
+        wire_pass::OPCODE_RASTERIZATION_RATE_MAP => {
+            let r = wire_pass::pass_rate_map(&op).map_err(|_| DecodeStatus::ErrBadLength)?;
             out.kind = Kind::RenderPassProperty;
-            out.texture_ref = ld32(payload);
+            out.texture_ref = r.rate_map_ref.get();
             Ok(out)
         }
-        OP_PASS_DEFAULT_RASTER_SAMPLE_COUNT
-        | OP_PASS_IMAGEBLOCK_SAMPLE_LENGTH
-        | OP_PASS_THREADGROUP_MEMORY_LENGTH => {
-            if payload.len() < 4 {
-                return Err(DecodeStatus::ErrBadLength);
-            }
+        wire_pass::OPCODE_DEFAULT_RASTER_SAMPLE_COUNT => {
+            let c = wire_pass::default_raster_sample_count(&op)
+                .map_err(|_| DecodeStatus::ErrBadLength)?;
             out.kind = Kind::RenderPassProperty;
-            out.mode = u64::from(ld32(payload));
+            out.mode = u64::from(c.count.get());
             Ok(out)
         }
-        OP_PASS_TILE_SIZE => {
-            if payload.len() < 4 {
-                return Err(DecodeStatus::ErrBadLength);
-            }
+        wire_pass::OPCODE_IMAGEBLOCK_SAMPLE_LENGTH
+        | wire_pass::OPCODE_THREADGROUP_MEMORY_LENGTH => {
+            let m = wire_pass::tile_memory(&op).map_err(|_| DecodeStatus::ErrBadLength)?;
             out.kind = Kind::RenderPassProperty;
-            // Two sixteen-bit fields, kept in one `u64` as width | height << 16
-            // rather than widened: the record's own widths are the contract and
-            // the executor does not apply either.
-            out.mode = u64::from(ld32(payload));
+            out.mode = u64::from(m.length.get());
             Ok(out)
         }
-        OP_PASS_SAMPLE_POSITIONS => {
-            // Head plus `count` eight-byte positions, and the count is guest
-            // data: a record claiming more positions than it carries is
-            // refused rather than read past.
-            if payload.len() < 4 {
-                return Err(DecodeStatus::ErrBadLength);
-            }
-            let count = ld32(payload) as usize;
-            let need = 4usize
-                .checked_add(count.checked_mul(8).ok_or(DecodeStatus::ErrBadLength)?)
-                .ok_or(DecodeStatus::ErrBadLength)?;
-            if payload.len() < need {
-                return Err(DecodeStatus::ErrBadLength);
-            }
+        wire_pass::OPCODE_TILE_SIZE => {
+            let s = wire_pass::tile_size(&op).map_err(|_| DecodeStatus::ErrBadLength)?;
             out.kind = Kind::RenderPassProperty;
-            out.count = count as u32;
+            // width | height << 16 — product packing, not a second layout.
+            out.mode = u64::from(s.width.get()) | (u64::from(s.height.get()) << 16);
+            Ok(out)
+        }
+        wire_pass::OPCODE_SAMPLE_POSITIONS => {
+            let (head, positions) =
+                wire_pass::sample_positions(&op).map_err(|_| DecodeStatus::ErrBadLength)?;
+            out.kind = Kind::RenderPassProperty;
+            out.count = head.count.get();
+            if out.count as usize != positions.len() {
+                return Err(DecodeStatus::ErrBadLength);
+            }
             Ok(out)
         }
         _ => {
@@ -1950,7 +1621,7 @@ mod tests {
 
     #[test]
     fn pipeline_and_draw() {
-        let mut v = hdr(OP_SET_PIPELINE, 12);
+        let mut v = hdr(wire::OPCODE_SET_RENDER_PIPELINE_STATE, 12);
         st32(&mut v[8..], 9);
         let c = decode(&v).unwrap();
         assert_eq!(c.pipeline_ref, 9);
@@ -2001,10 +1672,10 @@ mod tests {
     /// it is refused by name rather than read at a guessed offset.
     #[test]
     fn a_compact_draw_of_the_wrong_length_is_refused_not_guessed() {
-        let mut wide = hdr(OP_DRAW, 24);
+        let mut wide = hdr(wire::OPCODE_DRAW, 24);
         st32(&mut wide[8..], 3);
         assert_eq!(decode(&wide), Err(DecodeStatus::ErrBadLength));
-        let short = hdr(OP_DRAW, 12);
+        let short = hdr(wire::OPCODE_DRAW, 12);
         assert_eq!(decode(&short), Err(DecodeStatus::ErrBadLength));
     }
 
@@ -2023,7 +1694,7 @@ mod tests {
     fn the_wide_draw_form_decodes_with_the_compact_forms_field_order() {
         use crate::contract::endian::st64;
 
-        let mut v = hdr(OP_DRAW_WIDE, wire::DRAW_WIDE_TOTAL_LEN as usize);
+        let mut v = hdr(wire::OPCODE_DRAW_WIDE, wire::DRAW_WIDE_TOTAL_LEN as usize);
         st32(&mut v[8..], 3); // primitiveType, 32-bit and FIRST
         st64(&mut v[12..], 0x11111); // vertexStart
         st64(&mut v[20..], 0x22222); // vertexCount
@@ -2039,7 +1710,10 @@ mod tests {
         // half and read zero. A regression to that guess shows up here.
         assert_ne!(c.primitive_type, 0);
 
-        let short = hdr(OP_DRAW_WIDE, wire::DRAW_WIDE_TOTAL_LEN as usize - 4);
+        let short = hdr(
+            wire::OPCODE_DRAW_WIDE,
+            wire::DRAW_WIDE_TOTAL_LEN as usize - 4,
+        );
         assert_eq!(decode(&short), Err(DecodeStatus::ErrBadLength));
     }
 
@@ -2053,7 +1727,7 @@ mod tests {
     fn a_wide_count_that_cannot_fit_the_commands_field_is_refused_not_truncated() {
         use crate::contract::endian::st64;
 
-        let mut v = hdr(OP_DRAW_WIDE, wire::DRAW_WIDE_TOTAL_LEN as usize);
+        let mut v = hdr(wire::OPCODE_DRAW_WIDE, wire::DRAW_WIDE_TOTAL_LEN as usize);
         st32(&mut v[8..], 3);
         st64(&mut v[12..], 0);
         st64(&mut v[20..], 0x1_0000_0000);
@@ -2074,7 +1748,10 @@ mod tests {
     fn a_compact_indexed_draw_reads_its_index_type_from_the_wire() {
         use crate::contract::endian::st16;
 
-        let mut v = hdr(OP_DRAW_INDEXED, wire::DRAW_INDEXED_TOTAL_LEN as usize);
+        let mut v = hdr(
+            wire::OPCODE_DRAW_INDEXED,
+            wire::DRAW_INDEXED_TOTAL_LEN as usize,
+        );
         st16(&mut v[8..], 4); // primitiveType, 16-bit
         st16(&mut v[10..], 1); // indexType UInt32
         st32(&mut v[12..], 0x141f); // index buffer ref
@@ -2083,7 +1760,10 @@ mod tests {
 
         let c = decode(&v).expect("compact indexed draw");
         assert_eq!(c.kind, Kind::Draw);
-        assert_eq!(c.primitive_type, 4, "primitiveType must not absorb indexType");
+        assert_eq!(
+            c.primitive_type, 4,
+            "primitiveType must not absorb indexType"
+        );
         assert_eq!(c.index_type, 1, "UInt32 must survive rather than reading 0");
         assert_eq!(c.index_buffer_ref, 0x141f);
         assert_eq!(c.index_count, 0x1111);
@@ -2093,7 +1773,7 @@ mod tests {
         // The instanced sibling appends a 16-bit instance count and changes
         // nothing before it.
         let mut w = hdr(
-            OP_DRAW_INDEXED_INST,
+            wire::OPCODE_DRAW_INDEXED_INSTANCED,
             wire::DRAW_INDEXED_INSTANCED_TOTAL_LEN as usize,
         );
         w[8..20].copy_from_slice(&v[8..20]);
@@ -2140,31 +1820,40 @@ mod tests {
     #[test]
     fn no_draw_opcode_falls_through_to_the_accepted_catch_all() {
         for (opcode, total) in [
-            (OP_DRAW_WIDE, wire::DRAW_WIDE_TOTAL_LEN),
-            (OP_DRAW, wire::DRAW_TOTAL_LEN),
-            (OP_DRAW_INST_WIDE, wire::DRAW_INSTANCED_WIDE_TOTAL_LEN),
-            (OP_DRAW_INST_COMPACT, wire::DRAW_INSTANCED_TOTAL_LEN),
+            (wire::OPCODE_DRAW_WIDE, wire::DRAW_WIDE_TOTAL_LEN),
+            (wire::OPCODE_DRAW, wire::DRAW_TOTAL_LEN),
             (
-                OP_DRAW_INST_BASE_WIDE,
+                wire::OPCODE_DRAW_INSTANCED_WIDE,
+                wire::DRAW_INSTANCED_WIDE_TOTAL_LEN,
+            ),
+            (wire::OPCODE_DRAW_INSTANCED, wire::DRAW_INSTANCED_TOTAL_LEN),
+            (
+                wire::OPCODE_DRAW_INSTANCED_BASE_WIDE,
                 wire::DRAW_INSTANCED_BASE_WIDE_TOTAL_LEN,
             ),
-            (OP_DRAW_INST_BASE, wire::DRAW_INSTANCED_BASE_TOTAL_LEN),
-            (OP_DRAW_INDEXED_WIDE, wire::DRAW_INDEXED_WIDE_TOTAL_LEN),
-            (OP_DRAW_INDEXED, wire::DRAW_INDEXED_TOTAL_LEN),
             (
-                OP_DRAW_INDEXED_INST_WIDE,
+                wire::OPCODE_DRAW_INSTANCED_BASE,
+                wire::DRAW_INSTANCED_BASE_TOTAL_LEN,
+            ),
+            (
+                wire::OPCODE_DRAW_INDEXED_WIDE,
+                wire::DRAW_INDEXED_WIDE_TOTAL_LEN,
+            ),
+            (wire::OPCODE_DRAW_INDEXED, wire::DRAW_INDEXED_TOTAL_LEN),
+            (
+                wire::OPCODE_DRAW_INDEXED_INSTANCED_WIDE,
                 wire::DRAW_INDEXED_INSTANCED_WIDE_TOTAL_LEN,
             ),
             (
-                OP_DRAW_INDEXED_INST,
+                wire::OPCODE_DRAW_INDEXED_INSTANCED,
                 wire::DRAW_INDEXED_INSTANCED_TOTAL_LEN,
             ),
             (
-                OP_DRAW_INDEXED_BASE_WIDE,
+                wire::OPCODE_DRAW_INDEXED_INSTANCED_BASE_WIDE,
                 wire::DRAW_INDEXED_INSTANCED_BASE_WIDE_TOTAL_LEN,
             ),
             (
-                OP_DRAW_INDEXED_BASE,
+                wire::OPCODE_DRAW_INDEXED_INSTANCED_BASE,
                 wire::DRAW_INDEXED_INSTANCED_BASE_TOTAL_LEN,
             ),
         ] {
@@ -2189,7 +1878,10 @@ mod tests {
     fn a_base_instance_draw_carries_its_base_instance() {
         use crate::contract::endian::st16;
 
-        let mut v = hdr(OP_DRAW_INST_BASE, wire::DRAW_INSTANCED_BASE_TOTAL_LEN as usize);
+        let mut v = hdr(
+            wire::OPCODE_DRAW_INSTANCED_BASE,
+            wire::DRAW_INSTANCED_BASE_TOTAL_LEN as usize,
+        );
         st16(&mut v[8..], 1); // vertexStart
         st16(&mut v[10..], 2); // vertexCount
         st16(&mut v[12..], 3); // instanceCount
@@ -2216,7 +1908,7 @@ mod tests {
         use crate::contract::endian::st16;
 
         let mut v = hdr(
-            OP_DRAW_INDEXED_BASE,
+            wire::OPCODE_DRAW_INDEXED_INSTANCED_BASE,
             wire::DRAW_INDEXED_INSTANCED_BASE_TOTAL_LEN as usize,
         );
         st16(&mut v[8..], 3); // primitiveType
@@ -2236,7 +1928,10 @@ mod tests {
         assert_eq!(c.index_buffer_ref, 0x141f);
         assert_eq!(c.instance_count, 0x3333);
         assert_eq!(c.base_instance, 0x55);
-        assert_eq!(c.base_vertex, -2, "a negative base vertex must stay negative");
+        assert_eq!(
+            c.base_vertex, -2,
+            "a negative base vertex must stay negative"
+        );
     }
 
     /// The wide form of the same record, whose base vertex is sign-extended to
@@ -2246,7 +1941,7 @@ mod tests {
         use crate::contract::endian::{st16, st64};
 
         let mut v = hdr(
-            OP_DRAW_INDEXED_BASE_WIDE,
+            wire::OPCODE_DRAW_INDEXED_INSTANCED_BASE_WIDE,
             wire::DRAW_INDEXED_INSTANCED_BASE_WIDE_TOTAL_LEN as usize,
         );
         st16(&mut v[8..], 3);
@@ -2270,7 +1965,7 @@ mod tests {
     fn wide_indexed_draw_layout() {
         use crate::contract::endian::st16;
 
-        let mut v = hdr(OP_DRAW_INDEXED_WIDE, 0x20);
+        let mut v = hdr(wire::OPCODE_DRAW_INDEXED_WIDE, 0x20);
         st16(&mut v[8..], 3); // triangle
         st16(&mut v[10..], 0); // UInt16
         st32(&mut v[12..], 0x3e); // index buffer ref
@@ -2291,7 +1986,7 @@ mod tests {
     fn execute_commands_range_and_indirect() {
         use crate::contract::endian::st64;
         // 0x15 withRange: ref + unaligned location/length
-        let mut v = hdr(OP_EXECUTE_COMMANDS_RANGE, EXECUTE_RANGE_CMD_LEN);
+        let mut v = hdr(wire::OPCODE_EXECUTE_COMMANDS_RANGE, EXECUTE_RANGE_CMD_LEN);
         st32(&mut v[8..], 0x3333);
         st64(&mut v[12..], 5);
         st64(&mut v[20..], 7);
@@ -2302,7 +1997,10 @@ mod tests {
         assert_eq!(c.icb_range_location, 5);
         assert_eq!(c.icb_range_length, 7);
         // 0x14 indirect buffer form
-        let mut v = hdr(OP_EXECUTE_COMMANDS_INDIRECT, EXECUTE_INDIRECT_CMD_LEN);
+        let mut v = hdr(
+            wire::OPCODE_EXECUTE_COMMANDS_INDIRECT,
+            EXECUTE_INDIRECT_CMD_LEN,
+        );
         st32(&mut v[8..], 0x1111);
         st32(&mut v[12..], 0x2222);
         st64(&mut v[16..], 0x40);
@@ -2400,7 +2098,7 @@ mod tests {
 
     #[test]
     fn blend_color_and_cull() {
-        let mut v = hdr(OP_SET_BLEND_COLOR, 24);
+        let mut v = hdr(wire::OPCODE_SET_BLEND_COLOR, 24);
         // RGBA as f32 bits
         st32(&mut v[8..], 1.0f32.to_bits());
         st32(&mut v[12..], 0.0f32.to_bits());
@@ -2410,7 +2108,11 @@ mod tests {
         assert!(c.has_blend_color);
         assert!((c.blend_color[0] - 1.0).abs() < 1e-6);
 
-        let mut v = hdr(OP_SET_CULL_MODE, 12);
+        // Mode state is one NSUInteger on the wire (SET_MODE_TOTAL_LEN = 16).
+        let mut v = hdr(
+            wire::OPCODE_SET_CULL_MODE,
+            wire::SET_MODE_TOTAL_LEN as usize,
+        );
         st32(&mut v[8..], 2);
         let c = decode(&v).unwrap();
         assert!(c.has_cull_mode);
@@ -2433,9 +2135,11 @@ mod tests {
             DecodeStatus::ErrUnsupportedOpcode
         );
         // One past the highest opcode Apple's serializer writes here.
-        assert!(opcode_above_the_encoder_window(OP_ACCEPTED_LAST + 1));
+        assert!(opcode_above_the_encoder_window(
+            wire::OPCODE_SET_VERTEX_BUFFER_OFFSET_STRIDE + 1
+        ));
         assert_eq!(
-            decode(&hdr(OP_ACCEPTED_LAST + 1, 16)).unwrap_err(),
+            decode(&hdr(wire::OPCODE_SET_VERTEX_BUFFER_OFFSET_STRIDE + 1, 16)).unwrap_err(),
             DecodeStatus::ErrUnsupportedOpcode
         );
         // Inside the range, claimed by no arm. `OtherAccepted` is what says so.
@@ -2453,7 +2157,6 @@ mod tests {
         );
     }
 
-
     /// Every bind opcode refuses `count == 0` and refuses more entries than the
     /// slot table holds, so a decoded bind record ALWAYS carries at least one
     /// entry.
@@ -2464,12 +2167,12 @@ mod tests {
     #[test]
     fn a_bind_record_never_decodes_to_zero_entries() {
         for (op, entry_size) in [
-            (OP_SET_VERTEX_BUFFER, BUFFER_BIND_ENTRY_SIZE),
-            (OP_SET_FRAGMENT_BUFFER, BUFFER_BIND_ENTRY_SIZE),
-            (OP_SET_VERTEX_TEXTURE, REF_BIND_ENTRY_SIZE),
-            (OP_SET_FRAGMENT_TEXTURE, REF_BIND_ENTRY_SIZE),
-            (OP_SET_VERTEX_SAMPLER, REF_BIND_ENTRY_SIZE),
-            (OP_SET_FRAGMENT_SAMPLER, REF_BIND_ENTRY_SIZE),
+            (wire::OPCODE_SET_VERTEX_BUFFER, BUFFER_BIND_ENTRY_SIZE),
+            (wire::OPCODE_SET_FRAGMENT_BUFFER, BUFFER_BIND_ENTRY_SIZE),
+            (wire::OPCODE_SET_VERTEX_TEXTURE, REF_BIND_ENTRY_SIZE),
+            (wire::OPCODE_SET_FRAGMENT_TEXTURE, REF_BIND_ENTRY_SIZE),
+            (wire::OPCODE_SET_VERTEX_SAMPLER, REF_BIND_ENTRY_SIZE),
+            (wire::OPCODE_SET_FRAGMENT_SAMPLER, REF_BIND_ENTRY_SIZE),
         ] {
             let hdr_len = 8;
             let body = |count: u32, entries: usize| {
@@ -2503,7 +2206,8 @@ mod tests {
             );
             // Forty slots, which Apple produces (`setVertexTextures:withRange:`
             // over a range of 40) and a 32-entry cap used to refuse whole.
-            let c = decode(&body(40, 40)).unwrap_or_else(|e| panic!("op {op:#x} refused 40: {e:?}"));
+            let c =
+                decode(&body(40, 40)).unwrap_or_else(|e| panic!("op {op:#x} refused 40: {e:?}"));
             assert_eq!(
                 c.buffer_binds.len() + c.ref_binds.len(),
                 40,
@@ -2526,41 +2230,62 @@ mod tests {
         use reims_vgpu_wire::ops::render as wire;
 
         for (op, wire_op) in [
-            (OP_SET_DEPTH_CLIP_MODE, wire::OPCODE_SET_DEPTH_CLIP_MODE),
-            (OP_SET_TRIANGLE_FILL_MODE, wire::OPCODE_SET_TRIANGLE_FILL_MODE),
-            (OP_SET_LINE_WIDTH, wire::OPCODE_SET_LINE_WIDTH),
             (
-                OP_SET_TESSELLATION_FACTOR_SCALE,
+                wire::OPCODE_SET_DEPTH_CLIP_MODE,
+                wire::OPCODE_SET_DEPTH_CLIP_MODE,
+            ),
+            (
+                wire::OPCODE_SET_TRIANGLE_FILL_MODE,
+                wire::OPCODE_SET_TRIANGLE_FILL_MODE,
+            ),
+            (wire::OPCODE_SET_LINE_WIDTH, wire::OPCODE_SET_LINE_WIDTH),
+            (
+                wire::OPCODE_SET_TESSELLATION_FACTOR_SCALE,
                 wire::OPCODE_SET_TESSELLATION_FACTOR_SCALE,
             ),
-            (OP_SET_COLOR_STORE_ACTION, wire::OPCODE_SET_COLOR_STORE_ACTION),
-            (OP_SET_DEPTH_STORE_ACTION, wire::OPCODE_SET_DEPTH_STORE_ACTION),
-            (OP_SET_STENCIL_STORE_ACTION, wire::OPCODE_SET_STENCIL_STORE_ACTION),
-            (OP_TEXTURE_BARRIER, wire::OPCODE_TEXTURE_BARRIER),
+            (
+                wire::OPCODE_SET_COLOR_STORE_ACTION,
+                wire::OPCODE_SET_COLOR_STORE_ACTION,
+            ),
+            (
+                wire::OPCODE_SET_DEPTH_STORE_ACTION,
+                wire::OPCODE_SET_DEPTH_STORE_ACTION,
+            ),
+            (
+                wire::OPCODE_SET_STENCIL_STORE_ACTION,
+                wire::OPCODE_SET_STENCIL_STORE_ACTION,
+            ),
+            (wire::OPCODE_TEXTURE_BARRIER, wire::OPCODE_TEXTURE_BARRIER),
         ] {
             assert_eq!(op, wire_op, "the serializer writes a different opcode");
         }
 
         // The `u64` mode records.
-        for op in [OP_SET_DEPTH_CLIP_MODE, OP_SET_TRIANGLE_FILL_MODE] {
+        for op in [
+            wire::OPCODE_SET_DEPTH_CLIP_MODE,
+            wire::OPCODE_SET_TRIANGLE_FILL_MODE,
+        ] {
             let mut v = hdr(op, wire::SET_MODE_TOTAL_LEN as usize);
-            st64(&mut v[HEADER_LEN..], 1);
+            st64(&mut v[OP_HEADER_LEN..], 1);
             let c = decode(&v).unwrap_or_else(|e| panic!("op {op:#x}: {e:?}"));
             assert_eq!(c.kind, Kind::SetRasterState, "op {op:#x}");
             assert_eq!(c.mode, 1, "op {op:#x}");
             assert_eq!(
-                decode(&hdr(op, HEADER_LEN + 4)).unwrap_err(),
+                decode(&hdr(op, OP_HEADER_LEN + 4)).unwrap_err(),
                 DecodeStatus::ErrShort,
                 "op {op:#x} read a mode out of four bytes"
             );
         }
 
         // The `f32` records: twelve bytes, and the payload is four.
-        for op in [OP_SET_LINE_WIDTH, OP_SET_TESSELLATION_FACTOR_SCALE] {
+        for op in [
+            wire::OPCODE_SET_LINE_WIDTH,
+            wire::OPCODE_SET_TESSELLATION_FACTOR_SCALE,
+        ] {
             let total = wire::SET_FLOAT_TOTAL_LEN as usize;
-            assert_eq!(total, HEADER_LEN + 4, "op {op:#x}");
+            assert_eq!(total, OP_HEADER_LEN + 4, "op {op:#x}");
             let mut v = hdr(op, total);
-            st32(&mut v[HEADER_LEN..], 2.5f32.to_bits());
+            st32(&mut v[OP_HEADER_LEN..], 2.5f32.to_bits());
             let c = decode(&v).unwrap_or_else(|e| panic!("op {op:#x}: {e:?}"));
             assert_eq!(c.kind, Kind::SetFloatState, "op {op:#x}");
             assert_eq!(c.float_value, 2.5, "op {op:#x}");
@@ -2568,16 +2293,19 @@ mod tests {
 
         // The colour store action carries an index; the other two do not, and
         // the values are deliberately unequal so a swap is visible.
-        let mut v = hdr(OP_SET_COLOR_STORE_ACTION, 16);
-        st32(&mut v[HEADER_LEN..], 2);
-        st32(&mut v[HEADER_LEN + 4..], 3);
+        let mut v = hdr(wire::OPCODE_SET_COLOR_STORE_ACTION, 16);
+        st32(&mut v[OP_HEADER_LEN..], 2);
+        st32(&mut v[OP_HEADER_LEN + 4..], 3);
         let c = decode(&v).expect("colour store action");
         assert_eq!(c.kind, Kind::SetStoreAction);
         assert_eq!((c.mode, c.first), (2, 3), "action and index are swapped");
 
-        for op in [OP_SET_DEPTH_STORE_ACTION, OP_SET_STENCIL_STORE_ACTION] {
+        for op in [
+            wire::OPCODE_SET_DEPTH_STORE_ACTION,
+            wire::OPCODE_SET_STENCIL_STORE_ACTION,
+        ] {
             let mut v = hdr(op, 16);
-            st64(&mut v[HEADER_LEN..], 1);
+            st64(&mut v[OP_HEADER_LEN..], 1);
             let c = decode(&v).unwrap_or_else(|e| panic!("op {op:#x}: {e:?}"));
             assert_eq!(c.kind, Kind::SetStoreAction, "op {op:#x}");
             assert_eq!(c.mode, 1, "op {op:#x}");
@@ -2585,14 +2313,14 @@ mod tests {
         }
 
         // `textureBarrier` is the header alone and joins the barrier kind.
-        let c = decode(&hdr(OP_TEXTURE_BARRIER, HEADER_LEN)).expect("texture barrier");
+        let c = decode(&hdr(wire::OPCODE_TEXTURE_BARRIER, OP_HEADER_LEN)).expect("texture barrier");
         assert_eq!(c.kind, Kind::Barrier);
     }
 
     /// A vertex bind carrying an attribute stride binds the buffer.
     ///
     /// It used to be refused outright: `0xa5`/`0xa6` are above the old
-    /// `OP_ACCEPTED_LAST` of `0x98`, so `opcode_is_apple_rejected` called them
+    /// `wire::OPCODE_SET_VERTEX_BUFFER_OFFSET_STRIDE` of `0x98`, so `opcode_is_apple_rejected` called them
     /// records Apple does not emit -- and Apple emits them whenever the guest
     /// negotiates `supportsDynamicAttributeStride`. Every strided vertex bind
     /// was dropped and the buffer never bound, which is the sampler-LOD bug
@@ -2608,9 +2336,12 @@ mod tests {
         use reims_vgpu_wire::ops::render as wire;
 
         for (op, wire_op) in [
-            (OP_SET_VERTEX_BUFFER_STRIDE, wire::OPCODE_SET_VERTEX_BUFFER_STRIDE),
             (
-                OP_SET_VERTEX_BUFFER_OFFSET_STRIDE,
+                wire::OPCODE_SET_VERTEX_BUFFER_STRIDE,
+                wire::OPCODE_SET_VERTEX_BUFFER_STRIDE,
+            ),
+            (
+                wire::OPCODE_SET_VERTEX_BUFFER_OFFSET_STRIDE,
                 wire::OPCODE_SET_VERTEX_BUFFER_OFFSET_STRIDE,
             ),
         ] {
@@ -2623,16 +2354,16 @@ mod tests {
 
         // Two slots, twenty bytes apart: {ref u32, offset u64, stride u64}.
         let entries = 2usize;
-        let total = HEADER_LEN + BIND_ENTRIES + entries * BUFFER_STRIDE_BIND_ENTRY_SIZE;
+        let total = OP_HEADER_LEN + BIND_ENTRIES + entries * BUFFER_STRIDE_BIND_ENTRY_SIZE;
         assert_eq!(total, 56, "the plural fixture is 56 bytes");
-        let mut v = hdr(OP_SET_VERTEX_BUFFER_STRIDE, total);
-        st32(&mut v[HEADER_LEN + BIND_FIRST..], 9);
-        st32(&mut v[HEADER_LEN + BIND_COUNT..], entries as u32);
+        let mut v = hdr(wire::OPCODE_SET_VERTEX_BUFFER_STRIDE, total);
+        st32(&mut v[OP_HEADER_LEN + BIND_FIRST..], 9);
+        st32(&mut v[OP_HEADER_LEN + BIND_COUNT..], entries as u32);
         for (i, (r, off, stride)) in [(5151u32, 0x3333u64, 0x5555u64), (5252, 0x4444, 0x6666)]
             .into_iter()
             .enumerate()
         {
-            let e = HEADER_LEN + BIND_ENTRIES + i * BUFFER_STRIDE_BIND_ENTRY_SIZE;
+            let e = OP_HEADER_LEN + BIND_ENTRIES + i * BUFFER_STRIDE_BIND_ENTRY_SIZE;
             st32(&mut v[e..], r);
             st64(&mut v[e + 4..], off);
             st64(&mut v[e + 12..], stride);
@@ -2650,19 +2381,19 @@ mod tests {
 
         // The plain bind must not be told it carries one, or every ordinary
         // vertex bind would report a loss it did not have.
-        let plain_total = HEADER_LEN + BIND_ENTRIES + BUFFER_BIND_ENTRY_SIZE;
-        let mut p = hdr(OP_SET_VERTEX_BUFFER, plain_total);
-        st32(&mut p[HEADER_LEN + BIND_COUNT..], 1);
-        st32(&mut p[HEADER_LEN + BIND_ENTRIES..], 5151);
+        let plain_total = OP_HEADER_LEN + BIND_ENTRIES + BUFFER_BIND_ENTRY_SIZE;
+        let mut p = hdr(wire::OPCODE_SET_VERTEX_BUFFER, plain_total);
+        st32(&mut p[OP_HEADER_LEN + BIND_COUNT..], 1);
+        st32(&mut p[OP_HEADER_LEN + BIND_ENTRIES..], 5151);
         let c = decode(&p).expect("plain vertex bind");
         assert!(!c.has_attribute_stride);
 
         // `0xa6` is the offset re-point with the stride appended: 28 bytes.
         let total = wire::SET_BUFFER_OFFSET_STRIDE_TOTAL_LEN as usize;
-        let mut v = hdr(OP_SET_VERTEX_BUFFER_OFFSET_STRIDE, total);
-        st32(&mut v[HEADER_LEN..], 8);
-        st64(&mut v[HEADER_LEN + 4..], 0x4567);
-        st64(&mut v[HEADER_LEN + 12..], 0x5678);
+        let mut v = hdr(wire::OPCODE_SET_VERTEX_BUFFER_OFFSET_STRIDE, total);
+        st32(&mut v[OP_HEADER_LEN..], 8);
+        st64(&mut v[OP_HEADER_LEN + 4..], 0x4567);
+        st64(&mut v[OP_HEADER_LEN + 12..], 0x5678);
         let c = decode(&v).expect("a strided offset re-point must decode");
         assert_eq!(c.kind, Kind::SetBufferOffset);
         assert_eq!(c.stage, Stage::Vertex);
@@ -2671,7 +2402,11 @@ mod tests {
         // Short of its own stride word it is refused, rather than read as the
         // twenty-byte record it is not.
         assert_eq!(
-            decode(&hdr(OP_SET_VERTEX_BUFFER_OFFSET_STRIDE, total - 8)).unwrap_err(),
+            decode(&hdr(
+                wire::OPCODE_SET_VERTEX_BUFFER_OFFSET_STRIDE,
+                total - 8
+            ))
+            .unwrap_err(),
             DecodeStatus::ErrShort
         );
     }
@@ -2692,11 +2427,11 @@ mod tests {
 
         for (op, wire_op) in [
             (
-                OP_SET_VERTEX_AMPLIFICATION_MODE,
+                wire::OPCODE_SET_VERTEX_AMPLIFICATION_MODE,
                 wire::OPCODE_SET_VERTEX_AMPLIFICATION_MODE,
             ),
             (
-                OP_SET_VERTEX_AMPLIFICATION_COUNT,
+                wire::OPCODE_SET_VERTEX_AMPLIFICATION_COUNT,
                 wire::OPCODE_SET_VERTEX_AMPLIFICATION_COUNT,
             ),
         ] {
@@ -2704,10 +2439,10 @@ mod tests {
         }
 
         let total = wire::SET_VERTEX_AMPLIFICATION_MODE_TOTAL_LEN as usize;
-        assert_eq!(total, HEADER_LEN + 8, "two u32, not two u64");
-        let mut v = hdr(OP_SET_VERTEX_AMPLIFICATION_MODE, total);
-        st32(&mut v[HEADER_LEN..], 0x5555);
-        st32(&mut v[HEADER_LEN + 4..], 0x6666);
+        assert_eq!(total, OP_HEADER_LEN + 8, "two u32, not two u64");
+        let mut v = hdr(wire::OPCODE_SET_VERTEX_AMPLIFICATION_MODE, total);
+        st32(&mut v[OP_HEADER_LEN..], 0x5555);
+        st32(&mut v[OP_HEADER_LEN + 4..], 0x6666);
         let c = decode(&v).expect("amplification mode");
         assert_eq!(c.kind, Kind::SetVertexAmplification);
         assert_eq!(
@@ -2720,12 +2455,15 @@ mod tests {
         // viewport offset is 0x1111, so a four-byte head cannot be confused
         // with an eight-byte one.
         let mappings = 2usize;
-        let total = HEADER_LEN + AMPLIFICATION_COUNT_LEN + mappings * AMPLIFICATION_MAPPING_SIZE;
+        let total = OP_HEADER_LEN + AMPLIFICATION_COUNT_LEN + mappings * AMPLIFICATION_MAPPING_SIZE;
         assert_eq!(total, 28, "the fixture is 28 bytes");
-        let mut v = hdr(OP_SET_VERTEX_AMPLIFICATION_COUNT, total);
-        st32(&mut v[HEADER_LEN..], mappings as u32);
-        for (i, (vp, rt)) in [(0x1111u32, 0x2222u32), (0x3333, 0x4444)].into_iter().enumerate() {
-            let e = HEADER_LEN + AMPLIFICATION_COUNT_LEN + i * AMPLIFICATION_MAPPING_SIZE;
+        let mut v = hdr(wire::OPCODE_SET_VERTEX_AMPLIFICATION_COUNT, total);
+        st32(&mut v[OP_HEADER_LEN..], mappings as u32);
+        for (i, (vp, rt)) in [(0x1111u32, 0x2222u32), (0x3333, 0x4444)]
+            .into_iter()
+            .enumerate()
+        {
+            let e = OP_HEADER_LEN + AMPLIFICATION_COUNT_LEN + i * AMPLIFICATION_MAPPING_SIZE;
             st32(&mut v[e..], vp);
             st32(&mut v[e + 4..], rt);
         }
@@ -2735,11 +2473,11 @@ mod tests {
 
         // A count with no mappings behind it. The record is the guest's own
         // length claim, so this is the bound, and it must not wrap.
-        let mut short = hdr(OP_SET_VERTEX_AMPLIFICATION_COUNT, total);
-        st32(&mut short[HEADER_LEN..], 3);
+        let mut short = hdr(wire::OPCODE_SET_VERTEX_AMPLIFICATION_COUNT, total);
+        st32(&mut short[OP_HEADER_LEN..], 3);
         assert_eq!(decode(&short).unwrap_err(), DecodeStatus::ErrShort);
-        let mut huge = hdr(OP_SET_VERTEX_AMPLIFICATION_COUNT, total);
-        st32(&mut huge[HEADER_LEN..], u32::MAX);
+        let mut huge = hdr(wire::OPCODE_SET_VERTEX_AMPLIFICATION_COUNT, total);
+        st32(&mut huge[OP_HEADER_LEN..], u32::MAX);
         assert_eq!(decode(&huge).unwrap_err(), DecodeStatus::ErrShort);
     }
 
@@ -2760,15 +2498,21 @@ mod tests {
         use reims_vgpu_wire::ops::render as wire;
 
         for (op, wire_op) in [
-            (OP_DRAW_PATCHES, wire::OPCODE_DRAW_PATCHES),
-            (OP_DRAW_PATCHES_WIDE, wire::OPCODE_DRAW_PATCHES_WIDE),
-            (OP_DRAW_INDEXED_PATCHES, wire::OPCODE_DRAW_INDEXED_PATCHES),
+            (wire::OPCODE_DRAW_PATCHES, wire::OPCODE_DRAW_PATCHES),
             (
-                OP_DRAW_PATCHES_INDIRECT,
+                wire::OPCODE_DRAW_PATCHES_WIDE,
+                wire::OPCODE_DRAW_PATCHES_WIDE,
+            ),
+            (
+                wire::OPCODE_DRAW_INDEXED_PATCHES,
+                wire::OPCODE_DRAW_INDEXED_PATCHES,
+            ),
+            (
+                wire::OPCODE_DRAW_PATCHES_INDIRECT,
                 wire::OPCODE_DRAW_PATCHES_INDIRECT,
             ),
             (
-                OP_DRAW_INDEXED_PATCHES_INDIRECT,
+                wire::OPCODE_DRAW_INDEXED_PATCHES_INDIRECT,
                 wire::OPCODE_DRAW_INDEXED_PATCHES_INDIRECT,
             ),
         ] {
@@ -2786,7 +2530,7 @@ mod tests {
             wire::DRAW_PATCHES_WIDE_TOTAL_LEN as usize,
             wire::DRAW_INDEXED_PATCHES_WIDE_TOTAL_LEN as usize,
         ] {
-            let c = decode(&hdr(OP_DRAW_PATCHES_WIDE, total))
+            let c = decode(&hdr(wire::OPCODE_DRAW_PATCHES_WIDE, total))
                 .unwrap_or_else(|e| panic!("0x0c at {total} bytes: {e:?}"));
             assert_eq!(c.kind, Kind::DrawPatches);
             assert_eq!(c.command_length as usize, total);
@@ -2799,7 +2543,7 @@ mod tests {
             wire::DRAW_PATCHES_WIDE_TOTAL_LEN as usize - 4,
         ] {
             assert_eq!(
-                decode(&hdr(OP_DRAW_PATCHES_WIDE, total)).unwrap_err(),
+                decode(&hdr(wire::OPCODE_DRAW_PATCHES_WIDE, total)).unwrap_err(),
                 DecodeStatus::ErrBadLength,
                 "0x0c at {total} bytes was given a reading; it has none"
             );
@@ -2809,17 +2553,20 @@ mod tests {
         // refused four bytes short. A patch draw read short is invented
         // geometry, not a smaller draw.
         for (op, total) in [
-            (OP_DRAW_PATCHES, wire::DRAW_PATCHES_TOTAL_LEN as usize),
             (
-                OP_DRAW_INDEXED_PATCHES,
+                wire::OPCODE_DRAW_PATCHES,
+                wire::DRAW_PATCHES_TOTAL_LEN as usize,
+            ),
+            (
+                wire::OPCODE_DRAW_INDEXED_PATCHES,
                 wire::DRAW_INDEXED_PATCHES_TOTAL_LEN as usize,
             ),
             (
-                OP_DRAW_PATCHES_INDIRECT,
+                wire::OPCODE_DRAW_PATCHES_INDIRECT,
                 wire::DRAW_PATCHES_INDIRECT_TOTAL_LEN as usize,
             ),
             (
-                OP_DRAW_INDEXED_PATCHES_INDIRECT,
+                wire::OPCODE_DRAW_INDEXED_PATCHES_INDIRECT,
                 wire::DRAW_INDEXED_PATCHES_INDIRECT_TOTAL_LEN as usize,
             ),
         ] {
@@ -2834,7 +2581,10 @@ mod tests {
 
         // A record whose header promises more bytes than are present is
         // refused by the framing, before any of the above runs.
-        let mut truncated = hdr(OP_DRAW_PATCHES, wire::DRAW_PATCHES_TOTAL_LEN as usize);
+        let mut truncated = hdr(
+            wire::OPCODE_DRAW_PATCHES,
+            wire::DRAW_PATCHES_TOTAL_LEN as usize,
+        );
         truncated.truncate(truncated.len() - 4);
         assert!(decode(&truncated).is_err(), "a short buffer was accepted");
     }
@@ -2870,11 +2620,11 @@ mod tests {
     #[test]
     fn a_colour_attachments_level_does_not_swallow_its_slice() {
         for (level, slice, plane) in [(1u16, 5u16, 2u16), (0, 0xffff, 0), (0xffff, 0, 0)] {
-            let total = HEADER_LEN + PASS_MIN_PAYLOAD;
+            let total = OP_HEADER_LEN + PASS_MIN_PAYLOAD;
             let mut cmd = vec![0u8; total];
-            st32(&mut cmd[0..], OP_RENDER_PASS);
+            st32(&mut cmd[0..], wire_pass::OPCODE_RENDER_PASS);
             st32(&mut cmd[4..], total as u32);
-            let slot = HEADER_LEN + PASS_COLOR_ATTACH_OFF;
+            let slot = OP_HEADER_LEN + PASS_COLOR_ATTACH_OFF;
             st32(&mut cmd[slot + PASS_ATTACH_TEXREF..], 7);
             cmd[slot + PASS_ATTACH_LEVEL..slot + PASS_ATTACH_LEVEL + 2]
                 .copy_from_slice(&level.to_le_bytes());
@@ -2882,7 +2632,7 @@ mod tests {
                 .copy_from_slice(&slice.to_le_bytes());
             cmd[slot + PASS_ATTACH_DEPTH_PLANE..slot + PASS_ATTACH_DEPTH_PLANE + 2]
                 .copy_from_slice(&plane.to_le_bytes());
-            let att = decode_color_attachment(&cmd[HEADER_LEN..], 0);
+            let att = decode_color_attachment(&cmd[OP_HEADER_LEN..], 0);
             assert_eq!(att.level, u32::from(level), "level took the slice's bits");
             assert_eq!(att.slice, u32::from(slice), "slice went unread");
             assert_eq!(att.depth_plane, u32::from(plane), "depth plane went unread");
@@ -2897,11 +2647,11 @@ mod tests {
     #[test]
     fn the_render_pass_tail_is_read_only_when_the_record_carries_one() {
         use crate::contract::endian::st64;
-        let full = HEADER_LEN + PASS_TAIL_OFF + 0x1c;
+        let full = OP_HEADER_LEN + PASS_TAIL_OFF + 0x1c;
         let mut cmd = vec![0u8; full];
-        st32(&mut cmd[0..], OP_RENDER_PASS);
+        st32(&mut cmd[0..], wire_pass::OPCODE_RENDER_PASS);
         st32(&mut cmd[4..], full as u32);
-        let t = HEADER_LEN + PASS_TAIL_OFF;
+        let t = OP_HEADER_LEN + PASS_TAIL_OFF;
         st32(&mut cmd[t + PASS_TAIL_VISIBILITY_BUFFER_REF..], 5151);
         st64(&mut cmd[t + PASS_TAIL_ARRAY_LENGTH..], 0x11);
         st64(&mut cmd[t + PASS_TAIL_TARGET_WIDTH..], 0x1234);
@@ -2913,9 +2663,9 @@ mod tests {
         assert_eq!(c.pass_render_target_width, 0x1234);
         assert_eq!(c.pass_render_target_height, 0x5678);
 
-        let short = HEADER_LEN + PASS_MIN_PAYLOAD;
+        let short = OP_HEADER_LEN + PASS_MIN_PAYLOAD;
         let mut cmd = vec![0u8; short];
-        st32(&mut cmd[0..], OP_RENDER_PASS);
+        st32(&mut cmd[0..], wire_pass::OPCODE_RENDER_PASS);
         st32(&mut cmd[4..], short as u32);
         let c = decode(&cmd).expect("well formed");
         assert_eq!(c.kind, Kind::RenderPass);
@@ -2930,29 +2680,29 @@ mod tests {
     #[test]
     fn every_pass_property_record_reaches_an_arm_of_its_own() {
         for (op, payload_len) in [
-            (OP_PASS_DEFAULT_RASTER_SAMPLE_COUNT, 4usize),
-            (OP_PASS_RATE_MAP, 4),
-            (OP_PASS_IMAGEBLOCK_SAMPLE_LENGTH, 4),
-            (OP_PASS_THREADGROUP_MEMORY_LENGTH, 4),
-            (OP_PASS_TILE_SIZE, 4),
+            (wire_pass::OPCODE_DEFAULT_RASTER_SAMPLE_COUNT, 4usize),
+            (wire_pass::OPCODE_RASTERIZATION_RATE_MAP, 4),
+            (wire_pass::OPCODE_IMAGEBLOCK_SAMPLE_LENGTH, 4),
+            (wire_pass::OPCODE_THREADGROUP_MEMORY_LENGTH, 4),
+            (wire_pass::OPCODE_TILE_SIZE, 4),
         ] {
-            let total = HEADER_LEN + payload_len;
+            let total = OP_HEADER_LEN + payload_len;
             let mut cmd = vec![0u8; total];
             st32(&mut cmd[0..], op);
             st32(&mut cmd[4..], total as u32);
-            st32(&mut cmd[HEADER_LEN..], 4);
+            st32(&mut cmd[OP_HEADER_LEN..], 4);
             let c = decode(&cmd).expect("well formed");
             assert_eq!(c.kind, Kind::RenderPassProperty, "opcode {op:#x}");
-            if op == OP_PASS_RATE_MAP {
+            if op == wire_pass::OPCODE_RASTERIZATION_RATE_MAP {
                 assert_eq!(c.texture_ref, 4, "opcode {op:#x}: ref");
             } else {
                 assert_eq!(c.mode, 4, "opcode {op:#x}: scalar");
             }
             // A header that claims to be the whole record carries no scalar,
             // and that is a refusal rather than a zero.
-            let mut bare = vec![0u8; HEADER_LEN];
+            let mut bare = vec![0u8; OP_HEADER_LEN];
             st32(&mut bare[0..], op);
-            st32(&mut bare[4..], HEADER_LEN as u32);
+            st32(&mut bare[4..], OP_HEADER_LEN as u32);
             assert!(
                 matches!(decode(&bare), Err(DecodeStatus::ErrBadLength)),
                 "opcode {op:#x}"
@@ -2961,15 +2711,15 @@ mod tests {
 
         // Sample positions are head plus `count` pairs, and the count is guest
         // data: one claiming more pairs than the record holds is refused.
-        let total = HEADER_LEN + 4 + 2 * 8;
+        let total = OP_HEADER_LEN + 4 + 2 * 8;
         let mut cmd = vec![0u8; total];
-        st32(&mut cmd[0..], OP_PASS_SAMPLE_POSITIONS);
+        st32(&mut cmd[0..], wire_pass::OPCODE_SAMPLE_POSITIONS);
         st32(&mut cmd[4..], total as u32);
-        st32(&mut cmd[HEADER_LEN..], 2);
+        st32(&mut cmd[OP_HEADER_LEN..], 2);
         let c = decode(&cmd).expect("well formed");
         assert_eq!(c.kind, Kind::RenderPassProperty);
         assert_eq!(c.count, 2);
-        st32(&mut cmd[HEADER_LEN..], 0xffff_ffff);
+        st32(&mut cmd[OP_HEADER_LEN..], 0xffff_ffff);
         assert!(matches!(decode(&cmd), Err(DecodeStatus::ErrBadLength)));
     }
 
@@ -2980,19 +2730,19 @@ mod tests {
 
         for (op, wire_op) in [
             (
-                OP_SET_COLOR_STORE_ACTION_OPTIONS,
+                wire::OPCODE_SET_COLOR_STORE_ACTION_OPTIONS,
                 wire::OPCODE_SET_COLOR_STORE_ACTION_OPTIONS,
             ),
             (
-                OP_SET_DEPTH_STORE_ACTION_OPTIONS,
+                wire::OPCODE_SET_DEPTH_STORE_ACTION_OPTIONS,
                 wire::OPCODE_SET_DEPTH_STORE_ACTION_OPTIONS,
             ),
             (
-                OP_SET_STENCIL_STORE_ACTION_OPTIONS,
+                wire::OPCODE_SET_STENCIL_STORE_ACTION_OPTIONS,
                 wire::OPCODE_SET_STENCIL_STORE_ACTION_OPTIONS,
             ),
             (
-                OP_SET_TESSELLATION_FACTOR_BUFFER,
+                wire::OPCODE_SET_TESSELLATION_FACTOR_BUFFER,
                 wire::OPCODE_SET_TESSELLATION_FACTOR_BUFFER,
             ),
         ] {
@@ -3003,11 +2753,17 @@ mod tests {
         // two are different records at different lengths. Asserting the
         // adjacency keeps a future edit from collapsing them into one arm.
         for (action, options) in [
-            (OP_SET_COLOR_STORE_ACTION, OP_SET_COLOR_STORE_ACTION_OPTIONS),
-            (OP_SET_DEPTH_STORE_ACTION, OP_SET_DEPTH_STORE_ACTION_OPTIONS),
             (
-                OP_SET_STENCIL_STORE_ACTION,
-                OP_SET_STENCIL_STORE_ACTION_OPTIONS,
+                wire::OPCODE_SET_COLOR_STORE_ACTION,
+                wire::OPCODE_SET_COLOR_STORE_ACTION_OPTIONS,
+            ),
+            (
+                wire::OPCODE_SET_DEPTH_STORE_ACTION,
+                wire::OPCODE_SET_DEPTH_STORE_ACTION_OPTIONS,
+            ),
+            (
+                wire::OPCODE_SET_STENCIL_STORE_ACTION,
+                wire::OPCODE_SET_STENCIL_STORE_ACTION_OPTIONS,
             ),
         ] {
             assert_eq!(options, action + 1);
@@ -3016,9 +2772,9 @@ mod tests {
         // The colour form. The index is at +8; a `u32` read of the options
         // would leave it at +4 and find the options' own high half.
         let total = wire::SET_COLOR_STORE_ACTION_OPTIONS_TOTAL_LEN as usize;
-        let mut v = hdr(OP_SET_COLOR_STORE_ACTION_OPTIONS, total);
-        st64(&mut v[HEADER_LEN..], 0x1111);
-        st32(&mut v[HEADER_LEN + 8..], 3);
+        let mut v = hdr(wire::OPCODE_SET_COLOR_STORE_ACTION_OPTIONS, total);
+        st64(&mut v[OP_HEADER_LEN..], 0x1111);
+        st32(&mut v[OP_HEADER_LEN + 8..], 3);
         let c = decode(&v).expect("colour store action options");
         assert_eq!(c.kind, Kind::SetStoreActionOptions);
         assert_eq!(
@@ -3030,13 +2786,16 @@ mod tests {
         // Depth and stencil have one attachment each and carry no index, so
         // their record is four bytes shorter than the colour form's.
         let total = wire::SET_STORE_ACTION_OPTIONS_TOTAL_LEN as usize;
-        assert_eq!(total + 4, wire::SET_COLOR_STORE_ACTION_OPTIONS_TOTAL_LEN as usize);
+        assert_eq!(
+            total + 4,
+            wire::SET_COLOR_STORE_ACTION_OPTIONS_TOTAL_LEN as usize
+        );
         for (op, options) in [
-            (OP_SET_DEPTH_STORE_ACTION_OPTIONS, 0x2222u64),
-            (OP_SET_STENCIL_STORE_ACTION_OPTIONS, 0x3333),
+            (wire::OPCODE_SET_DEPTH_STORE_ACTION_OPTIONS, 0x2222u64),
+            (wire::OPCODE_SET_STENCIL_STORE_ACTION_OPTIONS, 0x3333),
         ] {
             let mut v = hdr(op, total);
-            st64(&mut v[HEADER_LEN..], options);
+            st64(&mut v[OP_HEADER_LEN..], options);
             let c = decode(&v).unwrap_or_else(|e| panic!("op {op:#x}: {e:?}"));
             assert_eq!(c.kind, Kind::SetStoreActionOptions);
             assert_eq!(c.mode, options, "op {op:#x}");
@@ -3045,10 +2804,10 @@ mod tests {
 
         // `0x7a`: ref, then two `u64` that differ, so a crossed pair shows.
         let total = wire::SET_TESSELLATION_FACTOR_BUFFER_TOTAL_LEN as usize;
-        let mut v = hdr(OP_SET_TESSELLATION_FACTOR_BUFFER, total);
-        st32(&mut v[HEADER_LEN..], 5151);
-        st64(&mut v[HEADER_LEN + 4..], 0x3456);
-        st64(&mut v[HEADER_LEN + 12..], 0x4567);
+        let mut v = hdr(wire::OPCODE_SET_TESSELLATION_FACTOR_BUFFER, total);
+        st32(&mut v[OP_HEADER_LEN..], 5151);
+        st64(&mut v[OP_HEADER_LEN + 4..], 0x3456);
+        st64(&mut v[OP_HEADER_LEN + 12..], 0x4567);
         let c = decode(&v).expect("tessellation factor buffer");
         assert_eq!(c.kind, Kind::SetTessellationFactorBuffer);
         assert_eq!(
@@ -3059,19 +2818,19 @@ mod tests {
 
         for (op, total) in [
             (
-                OP_SET_COLOR_STORE_ACTION_OPTIONS,
+                wire::OPCODE_SET_COLOR_STORE_ACTION_OPTIONS,
                 wire::SET_COLOR_STORE_ACTION_OPTIONS_TOTAL_LEN as usize,
             ),
             (
-                OP_SET_DEPTH_STORE_ACTION_OPTIONS,
+                wire::OPCODE_SET_DEPTH_STORE_ACTION_OPTIONS,
                 wire::SET_STORE_ACTION_OPTIONS_TOTAL_LEN as usize,
             ),
             (
-                OP_SET_STENCIL_STORE_ACTION_OPTIONS,
+                wire::OPCODE_SET_STENCIL_STORE_ACTION_OPTIONS,
                 wire::SET_STORE_ACTION_OPTIONS_TOTAL_LEN as usize,
             ),
             (
-                OP_SET_TESSELLATION_FACTOR_BUFFER,
+                wire::OPCODE_SET_TESSELLATION_FACTOR_BUFFER,
                 wire::SET_TESSELLATION_FACTOR_BUFFER_TOTAL_LEN as usize,
             ),
         ] {
@@ -3105,34 +2864,43 @@ mod tests {
         // can drift. This is the check that would have caught `0x86`/`0x87`.
         for (op, wire_op) in [
             (
-                OP_DISPATCH_THREADS_PER_TILE,
+                wire_tile::OPCODE_DISPATCH_THREADS_PER_TILE,
                 wire_tile::OPCODE_DISPATCH_THREADS_PER_TILE,
             ),
-            (OP_SET_TILE_BUFFER, wire_tile::OPCODE_SET_TILE_BUFFER),
             (
-                OP_SET_TILE_BUFFER_OFFSET,
+                wire_tile::OPCODE_SET_TILE_BUFFER,
+                wire_tile::OPCODE_SET_TILE_BUFFER,
+            ),
+            (
+                wire_tile::OPCODE_SET_TILE_BUFFER_OFFSET,
                 wire_tile::OPCODE_SET_TILE_BUFFER_OFFSET,
             ),
-            (OP_SET_TILE_SAMPLER, wire_tile::OPCODE_SET_TILE_SAMPLER),
             (
-                OP_SET_TILE_SAMPLER_LOD,
+                wire_tile::OPCODE_SET_TILE_SAMPLER,
+                wire_tile::OPCODE_SET_TILE_SAMPLER,
+            ),
+            (
+                wire_tile::OPCODE_SET_TILE_SAMPLER_LOD,
                 wire_tile::OPCODE_SET_TILE_SAMPLER_LOD,
             ),
-            (OP_SET_TILE_TEXTURE, wire_tile::OPCODE_SET_TILE_TEXTURE),
             (
-                OP_DISPATCH_THREADS_PER_TILE_IN_REGION,
+                wire_tile::OPCODE_SET_TILE_TEXTURE,
+                wire_tile::OPCODE_SET_TILE_TEXTURE,
+            ),
+            (
+                wire_tile::OPCODE_DISPATCH_THREADS_PER_TILE_IN_REGION,
                 wire_tile::OPCODE_DISPATCH_THREADS_PER_TILE_IN_REGION,
             ),
             (
-                OP_DISPATCH_THREADS_PER_TILE_IN_REGION_RT_INDEX,
+                wire_tile::OPCODE_DISPATCH_THREADS_PER_TILE_IN_REGION_RT_INDEX,
                 wire_tile::OPCODE_DISPATCH_THREADS_PER_TILE_IN_REGION_RT_INDEX,
             ),
             (
-                OP_GET_TILE_DIMENSIONS,
+                wire_tile::OPCODE_GET_TILE_DIMENSIONS,
                 wire_tile::OPCODE_GET_TILE_DIMENSIONS,
             ),
             (
-                OP_SET_TILE_THREADGROUP_MEMORY,
+                wire_tile::OPCODE_SET_TILE_THREADGROUP_MEMORY,
                 wire_tile::OPCODE_SET_TILE_THREADGROUP_MEMORY,
             ),
         ] {
@@ -3143,20 +2911,20 @@ mod tests {
         // decoder that took the compute encoder's two-field namesake would read
         // the offset's low half as the index.
         let total = wire_tile::SET_TILE_THREADGROUP_MEMORY_TOTAL_LEN as usize;
-        let mut v = hdr(OP_SET_TILE_THREADGROUP_MEMORY, total);
-        st64(&mut v[HEADER_LEN..], 0x1234);
-        st64(&mut v[HEADER_LEN + 8..], 0x2345);
-        st32(&mut v[HEADER_LEN + 16..], 5);
+        let mut v = hdr(wire_tile::OPCODE_SET_TILE_THREADGROUP_MEMORY, total);
+        st64(&mut v[OP_HEADER_LEN..], 0x1234);
+        st64(&mut v[OP_HEADER_LEN + 8..], 0x2345);
+        st32(&mut v[OP_HEADER_LEN + 16..], 5);
         let c = decode(&v).expect("tile threadgroup memory");
         assert_eq!(c.kind, Kind::TileBind);
         assert_eq!((c.first, c.count), (5, 1));
 
         // `0x9b`: three unnarrowed `u64`, none of them equal.
         let total = wire_tile::DISPATCH_THREADS_PER_TILE_TOTAL_LEN as usize;
-        let mut v = hdr(OP_DISPATCH_THREADS_PER_TILE, total);
-        st64(&mut v[HEADER_LEN..], 0x11);
-        st64(&mut v[HEADER_LEN + 8..], 0x22);
-        st64(&mut v[HEADER_LEN + 16..], 0x33);
+        let mut v = hdr(wire_tile::OPCODE_DISPATCH_THREADS_PER_TILE, total);
+        st64(&mut v[OP_HEADER_LEN..], 0x11);
+        st64(&mut v[OP_HEADER_LEN + 8..], 0x22);
+        st64(&mut v[OP_HEADER_LEN + 16..], 0x33);
         let c = decode(&v).expect("tile dispatch");
         assert_eq!(c.kind, Kind::TileDispatch);
         assert_eq!(c.tile_threads, [0x11, 0x22, 0x33]);
@@ -3167,15 +2935,15 @@ mod tests {
         // answer not to move on either opcode.
         let total = wire_tile::DISPATCH_THREADS_PER_TILE_IN_REGION_TOTAL_LEN as usize;
         for op in [
-            OP_DISPATCH_THREADS_PER_TILE_IN_REGION,
-            OP_DISPATCH_THREADS_PER_TILE_IN_REGION_RT_INDEX,
+            wire_tile::OPCODE_DISPATCH_THREADS_PER_TILE_IN_REGION,
+            wire_tile::OPCODE_DISPATCH_THREADS_PER_TILE_IN_REGION_RT_INDEX,
         ] {
             let mut v = hdr(op, total);
             for (i, value) in [0x11u64, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99]
                 .into_iter()
                 .enumerate()
             {
-                st64(&mut v[HEADER_LEN + i * 8..], value);
+                st64(&mut v[OP_HEADER_LEN + i * 8..], value);
             }
             let c = decode(&v).expect("tile region dispatch");
             assert_eq!(c.kind, Kind::TileDispatch);
@@ -3186,7 +2954,7 @@ mod tests {
             );
 
             let mut noisy = v.clone();
-            noisy[HEADER_LEN + wire_tile::REGION_RT_INDEX_OFFSET..][..4].fill(0xff);
+            noisy[OP_HEADER_LEN + wire_tile::REGION_RT_INDEX_OFFSET..][..4].fill(0xff);
             assert_eq!(
                 decode(&noisy).expect("tile region dispatch"),
                 c,
@@ -3198,9 +2966,9 @@ mod tests {
         // `0xa4`: a ref then a 64-bit offset, and it is a readback rather than
         // a bind -- the buffer is where the *host* writes.
         let total = wire_tile::GET_TILE_DIMENSIONS_TOTAL_LEN as usize;
-        let mut v = hdr(OP_GET_TILE_DIMENSIONS, total);
-        st32(&mut v[HEADER_LEN..], 5151);
-        st64(&mut v[HEADER_LEN + 4..], 0x9999);
+        let mut v = hdr(wire_tile::OPCODE_GET_TILE_DIMENSIONS, total);
+        st32(&mut v[OP_HEADER_LEN..], 5151);
+        st64(&mut v[OP_HEADER_LEN + 4..], 0x9999);
         let c = decode(&v).expect("tile dimensions query");
         assert_eq!(c.kind, Kind::TileDimensionsQuery);
         assert_eq!((c.buffer_ref, c.buffer_offset), (5151, 0x9999));
@@ -3208,9 +2976,9 @@ mod tests {
         // `0x9e`: index then a 64-bit offset. Not a bind header -- a decoder
         // that read one would take the offset's low half as a count.
         let total = wire_tile::SET_TILE_BUFFER_OFFSET_TOTAL_LEN as usize;
-        let mut v = hdr(OP_SET_TILE_BUFFER_OFFSET, total);
-        st32(&mut v[HEADER_LEN..], 4);
-        st64(&mut v[HEADER_LEN + 4..], 0x2345);
+        let mut v = hdr(wire_tile::OPCODE_SET_TILE_BUFFER_OFFSET, total);
+        st32(&mut v[OP_HEADER_LEN..], 4);
+        st64(&mut v[OP_HEADER_LEN + 4..], 0x2345);
         let c = decode(&v).expect("tile buffer offset");
         assert_eq!(c.kind, Kind::TileBind);
         assert_eq!((c.first, c.count, c.buffer_offset), (4, 1, 0x2345));
@@ -3220,22 +2988,25 @@ mod tests {
         // one entry short is refused -- which is what separates "knows the
         // stride" from "accepts anything with a plausible head".
         for (op, entry_size) in [
-            (OP_SET_TILE_BUFFER, BUFFER_BIND_ENTRY_SIZE),
-            (OP_SET_TILE_TEXTURE, REF_BIND_ENTRY_SIZE),
-            (OP_SET_TILE_SAMPLER, REF_BIND_ENTRY_SIZE),
-            (OP_SET_TILE_SAMPLER_LOD, SAMPLER_LOD_BIND_ENTRY_SIZE),
+            (wire_tile::OPCODE_SET_TILE_BUFFER, BUFFER_BIND_ENTRY_SIZE),
+            (wire_tile::OPCODE_SET_TILE_TEXTURE, REF_BIND_ENTRY_SIZE),
+            (wire_tile::OPCODE_SET_TILE_SAMPLER, REF_BIND_ENTRY_SIZE),
+            (
+                wire_tile::OPCODE_SET_TILE_SAMPLER_LOD,
+                SAMPLER_LOD_BIND_ENTRY_SIZE,
+            ),
         ] {
-            let total = HEADER_LEN + BIND_ENTRIES + 2 * entry_size;
+            let total = OP_HEADER_LEN + BIND_ENTRIES + 2 * entry_size;
             let mut v = hdr(op, total);
-            st32(&mut v[HEADER_LEN + BIND_FIRST..], 7);
-            st32(&mut v[HEADER_LEN + BIND_COUNT..], 2);
+            st32(&mut v[OP_HEADER_LEN + BIND_FIRST..], 7);
+            st32(&mut v[OP_HEADER_LEN + BIND_COUNT..], 2);
             let c = decode(&v).unwrap_or_else(|e| panic!("op {op:#x}: {e:?}"));
             assert_eq!(c.kind, Kind::TileBind, "op {op:#x}");
             assert_eq!((c.first, c.count), (7, 2), "op {op:#x}");
 
             let mut short = hdr(op, total - entry_size);
-            st32(&mut short[HEADER_LEN + BIND_FIRST..], 7);
-            st32(&mut short[HEADER_LEN + BIND_COUNT..], 2);
+            st32(&mut short[OP_HEADER_LEN + BIND_FIRST..], 7);
+            st32(&mut short[OP_HEADER_LEN + BIND_COUNT..], 2);
             assert_eq!(
                 decode(&short).unwrap_err(),
                 DecodeStatus::ErrShort,
@@ -3244,8 +3015,8 @@ mod tests {
 
             // A zero count is not a bind; it is a record whose head does not
             // describe itself, the same refusal the other stages give.
-            let mut empty = hdr(op, HEADER_LEN + BIND_ENTRIES);
-            st32(&mut empty[HEADER_LEN + BIND_COUNT..], 0);
+            let mut empty = hdr(op, OP_HEADER_LEN + BIND_ENTRIES);
+            st32(&mut empty[OP_HEADER_LEN + BIND_COUNT..], 0);
             assert_eq!(
                 decode(&empty).unwrap_err(),
                 DecodeStatus::ErrBadLength,
@@ -3257,27 +3028,27 @@ mod tests {
         // read short.
         for (op, total) in [
             (
-                OP_DISPATCH_THREADS_PER_TILE,
+                wire_tile::OPCODE_DISPATCH_THREADS_PER_TILE,
                 wire_tile::DISPATCH_THREADS_PER_TILE_TOTAL_LEN as usize,
             ),
             (
-                OP_DISPATCH_THREADS_PER_TILE_IN_REGION,
+                wire_tile::OPCODE_DISPATCH_THREADS_PER_TILE_IN_REGION,
                 wire_tile::DISPATCH_THREADS_PER_TILE_IN_REGION_TOTAL_LEN as usize,
             ),
             (
-                OP_DISPATCH_THREADS_PER_TILE_IN_REGION_RT_INDEX,
+                wire_tile::OPCODE_DISPATCH_THREADS_PER_TILE_IN_REGION_RT_INDEX,
                 wire_tile::DISPATCH_THREADS_PER_TILE_IN_REGION_TOTAL_LEN as usize,
             ),
             (
-                OP_SET_TILE_BUFFER_OFFSET,
+                wire_tile::OPCODE_SET_TILE_BUFFER_OFFSET,
                 wire_tile::SET_TILE_BUFFER_OFFSET_TOTAL_LEN as usize,
             ),
             (
-                OP_GET_TILE_DIMENSIONS,
+                wire_tile::OPCODE_GET_TILE_DIMENSIONS,
                 wire_tile::GET_TILE_DIMENSIONS_TOTAL_LEN as usize,
             ),
             (
-                OP_SET_TILE_THREADGROUP_MEMORY,
+                wire_tile::OPCODE_SET_TILE_THREADGROUP_MEMORY,
                 wire_tile::SET_TILE_THREADGROUP_MEMORY_TOTAL_LEN as usize,
             ),
         ] {
@@ -3308,10 +3079,13 @@ mod tests {
         use reims_vgpu_wire::ops::render as wire;
 
         for (op, wire_op) in [
-            (OP_DRAW_INDIRECT, wire::OPCODE_DRAW_INDIRECT),
-            (OP_DRAW_INDEXED_INDIRECT, wire::OPCODE_DRAW_INDEXED_INDIRECT),
+            (wire::OPCODE_DRAW_INDIRECT, wire::OPCODE_DRAW_INDIRECT),
             (
-                OP_SET_VISIBILITY_RESULT_MODE,
+                wire::OPCODE_DRAW_INDEXED_INDIRECT,
+                wire::OPCODE_DRAW_INDEXED_INDIRECT,
+            ),
+            (
+                wire::OPCODE_SET_VISIBILITY_RESULT_MODE,
                 wire::OPCODE_SET_VISIBILITY_RESULT_MODE,
             ),
         ] {
@@ -3320,10 +3094,10 @@ mod tests {
 
         // `0x10`: offset first, then the buffer, then a 16-bit primitive type.
         let total = wire::DRAW_INDIRECT_TOTAL_LEN as usize;
-        let mut v = hdr(OP_DRAW_INDIRECT, total);
-        st64(&mut v[HEADER_LEN..], 0x1111);
-        st32(&mut v[HEADER_LEN + 8..], 5151);
-        st16(&mut v[HEADER_LEN + 12..], 3);
+        let mut v = hdr(wire::OPCODE_DRAW_INDIRECT, total);
+        st64(&mut v[OP_HEADER_LEN..], 0x1111);
+        st32(&mut v[OP_HEADER_LEN + 8..], 5151);
+        st16(&mut v[OP_HEADER_LEN + 12..], 3);
         let c = decode(&v).expect("indirect draw");
         assert_eq!(c.kind, Kind::DrawIndirect);
         assert_eq!(c.indirect_buffer_offset, 0x1111);
@@ -3334,8 +3108,8 @@ mod tests {
         // answer not to move; `no_decoder_reads_a_bit_apples_serializer_never_wrote`
         // makes the same check against Apple's own measured mask.
         let mut noisy = v.clone();
-        noisy[HEADER_LEN + 14] = 0xff;
-        noisy[HEADER_LEN + 15] = 0xff;
+        noisy[OP_HEADER_LEN + 14] = 0xff;
+        noisy[OP_HEADER_LEN + 15] = 0xff;
         assert_eq!(
             decode(&noisy).expect("indirect draw"),
             c,
@@ -3345,13 +3119,13 @@ mod tests {
         // `0x11`: both types lead as `u16`, both refs follow as `u32`, both
         // offsets trail as `u64` -- the blit family's shape, not `0x10`'s.
         let total = wire::DRAW_INDEXED_INDIRECT_TOTAL_LEN as usize;
-        let mut v = hdr(OP_DRAW_INDEXED_INDIRECT, total);
-        st16(&mut v[HEADER_LEN..], 4);
-        st16(&mut v[HEADER_LEN + 2..], 1);
-        st32(&mut v[HEADER_LEN + 4..], 5151);
-        st32(&mut v[HEADER_LEN + 8..], 5252);
-        st64(&mut v[HEADER_LEN + 12..], 0x1111);
-        st64(&mut v[HEADER_LEN + 20..], 0x2222);
+        let mut v = hdr(wire::OPCODE_DRAW_INDEXED_INDIRECT, total);
+        st16(&mut v[OP_HEADER_LEN..], 4);
+        st16(&mut v[OP_HEADER_LEN + 2..], 1);
+        st32(&mut v[OP_HEADER_LEN + 4..], 5151);
+        st32(&mut v[OP_HEADER_LEN + 8..], 5252);
+        st64(&mut v[OP_HEADER_LEN + 12..], 0x1111);
+        st64(&mut v[OP_HEADER_LEN + 20..], 0x2222);
         let c = decode(&v).expect("indexed indirect draw");
         assert_eq!(c.kind, Kind::DrawIndirect);
         assert_eq!(c.primitive_type, 4);
@@ -3365,9 +3139,9 @@ mod tests {
 
         // `0x84`: offset first, mode second, reversing the selector.
         let total = wire::SET_VISIBILITY_RESULT_MODE_TOTAL_LEN as usize;
-        let mut v = hdr(OP_SET_VISIBILITY_RESULT_MODE, total);
-        st64(&mut v[HEADER_LEN..], 0x1234);
-        st64(&mut v[HEADER_LEN + 8..], 2);
+        let mut v = hdr(wire::OPCODE_SET_VISIBILITY_RESULT_MODE, total);
+        st64(&mut v[OP_HEADER_LEN..], 0x1234);
+        st64(&mut v[OP_HEADER_LEN + 8..], 2);
         let c = decode(&v).expect("visibility result mode");
         assert_eq!(c.kind, Kind::SetVisibilityResultMode);
         assert_eq!(
@@ -3379,13 +3153,16 @@ mod tests {
         // Each is a fixed length the serializer always writes, so a record that
         // is not that length is refused rather than read short.
         for (op, total) in [
-            (OP_DRAW_INDIRECT, wire::DRAW_INDIRECT_TOTAL_LEN as usize),
             (
-                OP_DRAW_INDEXED_INDIRECT,
+                wire::OPCODE_DRAW_INDIRECT,
+                wire::DRAW_INDIRECT_TOTAL_LEN as usize,
+            ),
+            (
+                wire::OPCODE_DRAW_INDEXED_INDIRECT,
                 wire::DRAW_INDEXED_INDIRECT_TOTAL_LEN as usize,
             ),
             (
-                OP_SET_VISIBILITY_RESULT_MODE,
+                wire::OPCODE_SET_VISIBILITY_RESULT_MODE,
                 wire::SET_VISIBILITY_RESULT_MODE_TOTAL_LEN as usize,
             ),
         ] {
@@ -3409,18 +3186,21 @@ mod tests {
         use crate::contract::endian::{st32, st64};
         use reims_vgpu_wire::ops::render as wire;
 
-        assert_eq!(OP_SET_SCISSOR_RECTS, wire::OPCODE_SET_SCISSOR_RECTS);
-        assert_eq!(OP_SET_VIEWPORTS, wire::OPCODE_SET_VIEWPORTS);
+        assert_eq!(
+            wire::OPCODE_SET_SCISSOR_RECTS,
+            wire::OPCODE_SET_SCISSOR_RECTS
+        );
+        assert_eq!(wire::OPCODE_SET_VIEWPORTS, wire::OPCODE_SET_VIEWPORTS);
         assert_ne!(
             SCISSOR_RECTS_COUNT_LEN, VIEWPORTS_COUNT_LEN,
             "the two counts are different widths; that is the whole hazard"
         );
 
         // Two rects, and the *first* is the one this rail keeps.
-        let total = HEADER_LEN + SCISSOR_RECTS_COUNT_LEN + 2 * SCISSOR_PAYLOAD_LEN;
-        let mut v = hdr(OP_SET_SCISSOR_RECTS, total);
-        st64(&mut v[HEADER_LEN..], 2);
-        let e0 = HEADER_LEN + SCISSOR_RECTS_COUNT_LEN;
+        let total = OP_HEADER_LEN + SCISSOR_RECTS_COUNT_LEN + 2 * SCISSOR_PAYLOAD_LEN;
+        let mut v = hdr(wire::OPCODE_SET_SCISSOR_RECTS, total);
+        st64(&mut v[OP_HEADER_LEN..], 2);
+        let e0 = OP_HEADER_LEN + SCISSOR_RECTS_COUNT_LEN;
         for (i, val) in [0x11u64, 0x22, 0x33, 0x44].into_iter().enumerate() {
             st64(&mut v[e0 + i * 8..], val);
         }
@@ -3438,10 +3218,10 @@ mod tests {
         );
 
         // Two viewports, four-byte count.
-        let total = HEADER_LEN + VIEWPORTS_COUNT_LEN + 2 * 48;
-        let mut v = hdr(OP_SET_VIEWPORTS, total);
-        st32(&mut v[HEADER_LEN..], 2);
-        let e0 = HEADER_LEN + VIEWPORTS_COUNT_LEN;
+        let total = OP_HEADER_LEN + VIEWPORTS_COUNT_LEN + 2 * 48;
+        let mut v = hdr(wire::OPCODE_SET_VIEWPORTS, total);
+        st32(&mut v[OP_HEADER_LEN..], 2);
+        let e0 = OP_HEADER_LEN + VIEWPORTS_COUNT_LEN;
         for i in 0..6 {
             st64(&mut v[e0 + i * 8..], (1.0f64 + i as f64).to_bits());
         }
@@ -3455,16 +3235,25 @@ mod tests {
 
         // A count of zero names no rect, and a record that cannot hold the
         // count it claims is refused rather than read short.
-        let mut v = hdr(OP_SET_SCISSOR_RECTS, HEADER_LEN + SCISSOR_RECTS_COUNT_LEN);
-        st64(&mut v[HEADER_LEN..], 0);
+        let mut v = hdr(
+            wire::OPCODE_SET_SCISSOR_RECTS,
+            OP_HEADER_LEN + SCISSOR_RECTS_COUNT_LEN,
+        );
+        st64(&mut v[OP_HEADER_LEN..], 0);
         assert_eq!(decode(&v).unwrap_err(), DecodeStatus::ErrBadLength);
-        let mut v = hdr(OP_SET_VIEWPORTS, HEADER_LEN + VIEWPORTS_COUNT_LEN + 48);
-        st32(&mut v[HEADER_LEN..], 2);
+        let mut v = hdr(
+            wire::OPCODE_SET_VIEWPORTS,
+            OP_HEADER_LEN + VIEWPORTS_COUNT_LEN + 48,
+        );
+        st32(&mut v[OP_HEADER_LEN..], 2);
         assert_eq!(decode(&v).unwrap_err(), DecodeStatus::ErrShort);
 
         // The singular opcodes keep reading from offset zero and report one.
-        let mut v = hdr(OP_SET_SCISSOR, HEADER_LEN + SCISSOR_PAYLOAD_LEN);
-        st64(&mut v[HEADER_LEN..], 0x99);
+        let mut v = hdr(
+            wire::OPCODE_SET_SCISSOR,
+            OP_HEADER_LEN + SCISSOR_PAYLOAD_LEN,
+        );
+        st64(&mut v[OP_HEADER_LEN..], 0x99);
         let c = decode(&v).expect("singular scissor");
         assert_eq!(c.scissor_x, 0x99);
         assert_eq!(c.count, 1);
@@ -3483,24 +3272,27 @@ mod tests {
         use crate::contract::endian::st32;
         use reims_vgpu_wire::ops::render as wire;
 
-        assert_eq!(OP_SET_VERTEX_SAMPLER_LOD, wire::OPCODE_SET_VERTEX_SAMPLER_LOD);
         assert_eq!(
-            OP_SET_FRAGMENT_SAMPLER_LOD,
+            wire::OPCODE_SET_VERTEX_SAMPLER_LOD,
+            wire::OPCODE_SET_VERTEX_SAMPLER_LOD
+        );
+        assert_eq!(
+            wire::OPCODE_SET_FRAGMENT_SAMPLER_LOD,
             wire::OPCODE_SET_FRAGMENT_SAMPLER_LOD
         );
 
         for (op, stage) in [
-            (OP_SET_VERTEX_SAMPLER_LOD, Stage::Vertex),
-            (OP_SET_FRAGMENT_SAMPLER_LOD, Stage::Fragment),
+            (wire::OPCODE_SET_VERTEX_SAMPLER_LOD, Stage::Vertex),
+            (wire::OPCODE_SET_FRAGMENT_SAMPLER_LOD, Stage::Fragment),
         ] {
             const COUNT: u32 = 2;
             let total =
-                HEADER_LEN + BIND_ENTRIES + (COUNT as usize) * SAMPLER_LOD_BIND_ENTRY_SIZE;
+                OP_HEADER_LEN + BIND_ENTRIES + (COUNT as usize) * SAMPLER_LOD_BIND_ENTRY_SIZE;
             let mut v = hdr(op, total);
-            st32(&mut v[HEADER_LEN + BIND_FIRST..], 3);
-            st32(&mut v[HEADER_LEN + BIND_COUNT..], COUNT);
+            st32(&mut v[OP_HEADER_LEN + BIND_FIRST..], 3);
+            st32(&mut v[OP_HEADER_LEN + BIND_COUNT..], COUNT);
             for i in 0..COUNT as usize {
-                let e = HEADER_LEN + BIND_ENTRIES + i * SAMPLER_LOD_BIND_ENTRY_SIZE;
+                let e = OP_HEADER_LEN + BIND_ENTRIES + i * SAMPLER_LOD_BIND_ENTRY_SIZE;
                 st32(&mut v[e..], 0x6363 + i as u32);
                 // Clamps this decoder does not lift. They are here so a decoder
                 // reading at the plain four-byte stride would pick one up as a
@@ -3524,10 +3316,10 @@ mod tests {
 
         // The plain forms keep the four-byte stride and say they carry no
         // clamps, so the flag is the record's and not the family's.
-        let total = HEADER_LEN + BIND_ENTRIES + REF_BIND_ENTRY_SIZE;
-        let mut v = hdr(OP_SET_VERTEX_SAMPLER, total);
-        st32(&mut v[HEADER_LEN + BIND_COUNT..], 1);
-        st32(&mut v[HEADER_LEN + BIND_ENTRIES..], 0x6363);
+        let total = OP_HEADER_LEN + BIND_ENTRIES + REF_BIND_ENTRY_SIZE;
+        let mut v = hdr(wire::OPCODE_SET_VERTEX_SAMPLER, total);
+        st32(&mut v[OP_HEADER_LEN + BIND_COUNT..], 1);
+        st32(&mut v[OP_HEADER_LEN + BIND_ENTRIES..], 0x6363);
         let c = decode(&v).expect("plain sampler bind");
         assert!(!c.has_sampler_lod);
         assert_eq!(c.ref_binds, vec![0x6363]);
@@ -3536,15 +3328,10 @@ mod tests {
     /// The accepted-opcode window ends exactly where Apple's render manifest
     /// does, computed rather than transcribed.
     ///
-    /// [`OP_ACCEPTED_LAST`] now *is* `wire::OPCODE_SET_VERTEX_BUFFER_OFFSET_STRIDE`,
-    /// so the two cannot disagree. What that alone does not catch is the case
-    /// that put `0x98` there in the first place: a capture driving a selector
-    /// nobody had driven, producing an opcode above the current maximum. Then
-    /// the constant is still equal to the one it names and still too low, and
-    /// every record above it is refused as one Apple does not write.
-    ///
-    /// This reads the manifest instead, so a new higher opcode on the render
-    /// encoder fails here and names itself.
+    /// The accepted window ends at the highest opcode in the wire render
+    /// manifest (`OPCODE_SET_VERTEX_BUFFER_OFFSET_STRIDE`). A capture that
+    /// adds a higher opcode fails here and names itself, rather than leaving
+    /// a stale bound that refuses real records as "Apple does not write".
     #[test]
     fn the_accepted_window_ends_where_apples_render_manifest_does() {
         let highest = reims_vgpu_wire::manifest::MANIFEST
@@ -3554,7 +3341,8 @@ mod tests {
             .max()
             .expect("the render encoder has opcodes in the manifest");
         assert_eq!(
-            OP_ACCEPTED_LAST, highest,
+            wire::OPCODE_SET_VERTEX_BUFFER_OFFSET_STRIDE,
+            highest,
             "a render opcode above the accepted window would be refused as one \
              Apple does not write"
         );
@@ -3563,7 +3351,7 @@ mod tests {
     /// Every render opcode Apple's serializer emits has a constant here, and
     /// this module names no opcode Apple does not emit.
     ///
-    /// [`OP_ACCEPTED_LAST`] bounds the window and this fills it. The two catch
+    /// [`wire::OPCODE_SET_VERTEX_BUFFER_OFFSET_STRIDE`] bounds the window and this fills it. The two catch
     /// different failures, and the one this catches is the quieter: an opcode
     /// *inside* the accepted window that no arm claims does not get refused, it
     /// gets [`Kind::OtherAccepted`] — the catch-all whose `Ok` is not a decode,
@@ -3594,133 +3382,277 @@ mod tests {
     #[test]
     fn the_render_opcode_table_is_exactly_apples_render_manifest() {
         let device: &[(u32, &str)] = &[
-            (OP_DRAW_WIDE, "OP_DRAW_WIDE"),
-            (OP_DRAW, "OP_DRAW"),
-            (OP_DRAW_INST_WIDE, "OP_DRAW_INST_WIDE"),
-            (OP_DRAW_INST_COMPACT, "OP_DRAW_INST_COMPACT"),
-            (OP_DRAW_INST_BASE_WIDE, "OP_DRAW_INST_BASE_WIDE"),
-            (OP_DRAW_INST_BASE, "OP_DRAW_INST_BASE"),
-            (OP_DRAW_INDEXED_WIDE, "OP_DRAW_INDEXED_WIDE"),
-            (OP_DRAW_INDEXED, "OP_DRAW_INDEXED"),
-            (OP_DRAW_INDEXED_INST_WIDE, "OP_DRAW_INDEXED_INST_WIDE"),
-            (OP_DRAW_INDEXED_INST, "OP_DRAW_INDEXED_INST"),
-            (OP_DRAW_INDEXED_BASE_WIDE, "OP_DRAW_INDEXED_BASE_WIDE"),
-            (OP_DRAW_INDEXED_BASE, "OP_DRAW_INDEXED_BASE"),
-            (OP_DRAW_PATCHES_WIDE, "OP_DRAW_PATCHES_WIDE"),
-            (OP_DRAW_PATCHES, "OP_DRAW_PATCHES"),
-            (OP_DRAW_INDEXED_PATCHES, "OP_DRAW_INDEXED_PATCHES"),
-            (OP_DRAW_INDIRECT, "OP_DRAW_INDIRECT"),
-            (OP_DRAW_INDEXED_INDIRECT, "OP_DRAW_INDEXED_INDIRECT"),
-            (OP_DRAW_PATCHES_INDIRECT, "OP_DRAW_PATCHES_INDIRECT"),
+            (wire::OPCODE_DRAW_WIDE, "wire::OPCODE_DRAW_WIDE"),
+            (wire::OPCODE_DRAW, "wire::OPCODE_DRAW"),
             (
-                OP_DRAW_INDEXED_PATCHES_INDIRECT,
-                "OP_DRAW_INDEXED_PATCHES_INDIRECT",
+                wire::OPCODE_DRAW_INSTANCED_WIDE,
+                "wire::OPCODE_DRAW_INSTANCED_WIDE",
             ),
-            (OP_EXECUTE_COMMANDS_INDIRECT, "OP_EXECUTE_COMMANDS_INDIRECT"),
-            (OP_EXECUTE_COMMANDS_RANGE, "OP_EXECUTE_COMMANDS_RANGE"),
-            (OP_RESOURCE_BARRIER, "OP_RESOURCE_BARRIER"),
-            (OP_MEMORY_BARRIER, "OP_MEMORY_BARRIER"),
-            (OP_UPDATE_FENCE, "OP_UPDATE_FENCE"),
-            (OP_WAIT_FENCE, "OP_WAIT_FENCE"),
-            (OP_USE_HEAP, "OP_USE_HEAP"),
-            (OP_SET_BLEND_COLOR, "OP_SET_BLEND_COLOR"),
-            (OP_SET_COLOR_STORE_ACTION, "OP_SET_COLOR_STORE_ACTION"),
+            (wire::OPCODE_DRAW_INSTANCED, "wire::OPCODE_DRAW_INSTANCED"),
             (
-                OP_SET_COLOR_STORE_ACTION_OPTIONS,
-                "OP_SET_COLOR_STORE_ACTION_OPTIONS",
-            ),
-            (OP_SET_DEPTH_STENCIL, "OP_SET_DEPTH_STENCIL"),
-            (OP_SET_DEPTH_STORE_ACTION, "OP_SET_DEPTH_STORE_ACTION"),
-            (
-                OP_SET_DEPTH_STORE_ACTION_OPTIONS,
-                "OP_SET_DEPTH_STORE_ACTION_OPTIONS",
-            ),
-            (OP_SET_CULL_MODE, "OP_SET_CULL_MODE"),
-            (OP_SET_DEPTH_BIAS, "OP_SET_DEPTH_BIAS"),
-            (OP_SET_DEPTH_CLIP_MODE, "OP_SET_DEPTH_CLIP_MODE"),
-            (OP_SET_FRAGMENT_BUFFER, "OP_SET_FRAGMENT_BUFFER"),
-            (OP_SET_FRAGMENT_BUFFER_OFFSET, "OP_SET_FRAGMENT_BUFFER_OFFSET"),
-            (OP_SET_FRAGMENT_SAMPLER, "OP_SET_FRAGMENT_SAMPLER"),
-            (OP_SET_FRAGMENT_SAMPLER_LOD, "OP_SET_FRAGMENT_SAMPLER_LOD"),
-            (OP_SET_FRAGMENT_TEXTURE, "OP_SET_FRAGMENT_TEXTURE"),
-            (OP_SET_FRONT_FACING, "OP_SET_FRONT_FACING"),
-            (OP_SET_PIPELINE, "OP_SET_PIPELINE"),
-            (OP_SET_SCISSOR, "OP_SET_SCISSOR"),
-            (OP_SET_SCISSOR_RECTS, "OP_SET_SCISSOR_RECTS"),
-            (OP_SET_STENCIL_REF, "OP_SET_STENCIL_REF"),
-            (OP_SET_STENCIL_STORE_ACTION, "OP_SET_STENCIL_STORE_ACTION"),
-            (
-                OP_SET_STENCIL_STORE_ACTION_OPTIONS,
-                "OP_SET_STENCIL_STORE_ACTION_OPTIONS",
+                wire::OPCODE_DRAW_INSTANCED_BASE_WIDE,
+                "wire::OPCODE_DRAW_INSTANCED_BASE_WIDE",
             ),
             (
-                OP_SET_TESSELLATION_FACTOR_BUFFER,
-                "OP_SET_TESSELLATION_FACTOR_BUFFER",
+                wire::OPCODE_DRAW_INSTANCED_BASE,
+                "wire::OPCODE_DRAW_INSTANCED_BASE",
             ),
             (
-                OP_SET_TESSELLATION_FACTOR_SCALE,
-                "OP_SET_TESSELLATION_FACTOR_SCALE",
+                wire::OPCODE_DRAW_INDEXED_WIDE,
+                "wire::OPCODE_DRAW_INDEXED_WIDE",
             ),
-            (OP_SET_TRIANGLE_FILL_MODE, "OP_SET_TRIANGLE_FILL_MODE"),
-            (OP_SET_VERTEX_BUFFER, "OP_SET_VERTEX_BUFFER"),
-            (OP_SET_VERTEX_BUFFER_OFFSET, "OP_SET_VERTEX_BUFFER_OFFSET"),
-            (OP_SET_VERTEX_SAMPLER, "OP_SET_VERTEX_SAMPLER"),
-            (OP_SET_VERTEX_SAMPLER_LOD, "OP_SET_VERTEX_SAMPLER_LOD"),
-            (OP_SET_VERTEX_TEXTURE, "OP_SET_VERTEX_TEXTURE"),
-            (OP_SET_VIEWPORT, "OP_SET_VIEWPORT"),
-            (OP_SET_VIEWPORTS, "OP_SET_VIEWPORTS"),
-            (OP_SET_VISIBILITY_RESULT_MODE, "OP_SET_VISIBILITY_RESULT_MODE"),
-            (OP_TEXTURE_BARRIER, "OP_TEXTURE_BARRIER"),
-            (OP_SET_LINE_WIDTH, "OP_SET_LINE_WIDTH"),
-            (OP_USE_RESOURCE, "OP_USE_RESOURCE"),
+            (wire::OPCODE_DRAW_INDEXED, "wire::OPCODE_DRAW_INDEXED"),
             (
-                OP_SET_VERTEX_AMPLIFICATION_MODE,
-                "OP_SET_VERTEX_AMPLIFICATION_MODE",
+                wire::OPCODE_DRAW_INDEXED_INSTANCED_WIDE,
+                "wire::OPCODE_DRAW_INDEXED_INSTANCED_WIDE",
             ),
             (
-                OP_SET_VERTEX_AMPLIFICATION_COUNT,
-                "OP_SET_VERTEX_AMPLIFICATION_COUNT",
-            ),
-            (OP_DISPATCH_THREADS_PER_TILE, "OP_DISPATCH_THREADS_PER_TILE"),
-            (
-                OP_SET_TILE_THREADGROUP_MEMORY,
-                "OP_SET_TILE_THREADGROUP_MEMORY",
-            ),
-            (OP_SET_TILE_BUFFER, "OP_SET_TILE_BUFFER"),
-            (OP_SET_TILE_BUFFER_OFFSET, "OP_SET_TILE_BUFFER_OFFSET"),
-            (OP_SET_TILE_SAMPLER, "OP_SET_TILE_SAMPLER"),
-            (OP_SET_TILE_SAMPLER_LOD, "OP_SET_TILE_SAMPLER_LOD"),
-            (OP_SET_TILE_TEXTURE, "OP_SET_TILE_TEXTURE"),
-            (
-                OP_DISPATCH_THREADS_PER_TILE_IN_REGION,
-                "OP_DISPATCH_THREADS_PER_TILE_IN_REGION",
+                wire::OPCODE_DRAW_INDEXED_INSTANCED,
+                "wire::OPCODE_DRAW_INDEXED_INSTANCED",
             ),
             (
-                OP_DISPATCH_THREADS_PER_TILE_IN_REGION_RT_INDEX,
-                "OP_DISPATCH_THREADS_PER_TILE_IN_REGION_RT_INDEX",
-            ),
-            (OP_GET_TILE_DIMENSIONS, "OP_GET_TILE_DIMENSIONS"),
-            (OP_SET_VERTEX_BUFFER_STRIDE, "OP_SET_VERTEX_BUFFER_STRIDE"),
-            (
-                OP_SET_VERTEX_BUFFER_OFFSET_STRIDE,
-                "OP_SET_VERTEX_BUFFER_OFFSET_STRIDE",
-            ),
-            (OP_RENDER_PASS, "OP_RENDER_PASS"),
-            (
-                OP_PASS_DEFAULT_RASTER_SAMPLE_COUNT,
-                "OP_PASS_DEFAULT_RASTER_SAMPLE_COUNT",
-            ),
-            (OP_PASS_SAMPLE_POSITIONS, "OP_PASS_SAMPLE_POSITIONS"),
-            (OP_PASS_RATE_MAP, "OP_PASS_RATE_MAP"),
-            (
-                OP_PASS_IMAGEBLOCK_SAMPLE_LENGTH,
-                "OP_PASS_IMAGEBLOCK_SAMPLE_LENGTH",
+                wire::OPCODE_DRAW_INDEXED_INSTANCED_BASE_WIDE,
+                "wire::OPCODE_DRAW_INDEXED_INSTANCED_BASE_WIDE",
             ),
             (
-                OP_PASS_THREADGROUP_MEMORY_LENGTH,
-                "OP_PASS_THREADGROUP_MEMORY_LENGTH",
+                wire::OPCODE_DRAW_INDEXED_INSTANCED_BASE,
+                "wire::OPCODE_DRAW_INDEXED_INSTANCED_BASE",
             ),
-            (OP_PASS_TILE_SIZE, "OP_PASS_TILE_SIZE"),
+            (
+                wire::OPCODE_DRAW_PATCHES_WIDE,
+                "wire::OPCODE_DRAW_PATCHES_WIDE",
+            ),
+            (wire::OPCODE_DRAW_PATCHES, "wire::OPCODE_DRAW_PATCHES"),
+            (
+                wire::OPCODE_DRAW_INDEXED_PATCHES,
+                "wire::OPCODE_DRAW_INDEXED_PATCHES",
+            ),
+            (wire::OPCODE_DRAW_INDIRECT, "wire::OPCODE_DRAW_INDIRECT"),
+            (
+                wire::OPCODE_DRAW_INDEXED_INDIRECT,
+                "wire::OPCODE_DRAW_INDEXED_INDIRECT",
+            ),
+            (
+                wire::OPCODE_DRAW_PATCHES_INDIRECT,
+                "wire::OPCODE_DRAW_PATCHES_INDIRECT",
+            ),
+            (
+                wire::OPCODE_DRAW_INDEXED_PATCHES_INDIRECT,
+                "wire::OPCODE_DRAW_INDEXED_PATCHES_INDIRECT",
+            ),
+            (
+                wire::OPCODE_EXECUTE_COMMANDS_INDIRECT,
+                "wire::OPCODE_EXECUTE_COMMANDS_INDIRECT",
+            ),
+            (
+                wire::OPCODE_EXECUTE_COMMANDS_RANGE,
+                "wire::OPCODE_EXECUTE_COMMANDS_RANGE",
+            ),
+            (
+                wire::OPCODE_MEMORY_BARRIER_RESOURCES,
+                "wire::OPCODE_MEMORY_BARRIER_RESOURCES",
+            ),
+            (
+                wire::OPCODE_MEMORY_BARRIER_SCOPE,
+                "wire::OPCODE_MEMORY_BARRIER_SCOPE",
+            ),
+            (wire::OPCODE_UPDATE_FENCE, "wire::OPCODE_UPDATE_FENCE"),
+            (wire::OPCODE_WAIT_FOR_FENCE, "wire::OPCODE_WAIT_FOR_FENCE"),
+            (wire::OPCODE_USE_HEAP, "wire::OPCODE_USE_HEAP"),
+            (wire::OPCODE_SET_BLEND_COLOR, "wire::OPCODE_SET_BLEND_COLOR"),
+            (
+                wire::OPCODE_SET_COLOR_STORE_ACTION,
+                "wire::OPCODE_SET_COLOR_STORE_ACTION",
+            ),
+            (
+                wire::OPCODE_SET_COLOR_STORE_ACTION_OPTIONS,
+                "wire::OPCODE_SET_COLOR_STORE_ACTION_OPTIONS",
+            ),
+            (
+                wire::OPCODE_SET_DEPTH_STENCIL_STATE,
+                "wire::OPCODE_SET_DEPTH_STENCIL_STATE",
+            ),
+            (
+                wire::OPCODE_SET_DEPTH_STORE_ACTION,
+                "wire::OPCODE_SET_DEPTH_STORE_ACTION",
+            ),
+            (
+                wire::OPCODE_SET_DEPTH_STORE_ACTION_OPTIONS,
+                "wire::OPCODE_SET_DEPTH_STORE_ACTION_OPTIONS",
+            ),
+            (wire::OPCODE_SET_CULL_MODE, "wire::OPCODE_SET_CULL_MODE"),
+            (wire::OPCODE_SET_DEPTH_BIAS, "wire::OPCODE_SET_DEPTH_BIAS"),
+            (
+                wire::OPCODE_SET_DEPTH_CLIP_MODE,
+                "wire::OPCODE_SET_DEPTH_CLIP_MODE",
+            ),
+            (
+                wire::OPCODE_SET_FRAGMENT_BUFFER,
+                "wire::OPCODE_SET_FRAGMENT_BUFFER",
+            ),
+            (
+                wire::OPCODE_SET_FRAGMENT_BUFFER_OFFSET,
+                "wire::OPCODE_SET_FRAGMENT_BUFFER_OFFSET",
+            ),
+            (
+                wire::OPCODE_SET_FRAGMENT_SAMPLER,
+                "wire::OPCODE_SET_FRAGMENT_SAMPLER",
+            ),
+            (
+                wire::OPCODE_SET_FRAGMENT_SAMPLER_LOD,
+                "wire::OPCODE_SET_FRAGMENT_SAMPLER_LOD",
+            ),
+            (
+                wire::OPCODE_SET_FRAGMENT_TEXTURE,
+                "wire::OPCODE_SET_FRAGMENT_TEXTURE",
+            ),
+            (
+                wire::OPCODE_SET_FRONT_FACING,
+                "wire::OPCODE_SET_FRONT_FACING",
+            ),
+            (
+                wire::OPCODE_SET_RENDER_PIPELINE_STATE,
+                "wire::OPCODE_SET_RENDER_PIPELINE_STATE",
+            ),
+            (wire::OPCODE_SET_SCISSOR, "wire::OPCODE_SET_SCISSOR"),
+            (
+                wire::OPCODE_SET_SCISSOR_RECTS,
+                "wire::OPCODE_SET_SCISSOR_RECTS",
+            ),
+            (
+                wire::OPCODE_SET_STENCIL_REFERENCE,
+                "wire::OPCODE_SET_STENCIL_REFERENCE",
+            ),
+            (
+                wire::OPCODE_SET_STENCIL_STORE_ACTION,
+                "wire::OPCODE_SET_STENCIL_STORE_ACTION",
+            ),
+            (
+                wire::OPCODE_SET_STENCIL_STORE_ACTION_OPTIONS,
+                "wire::OPCODE_SET_STENCIL_STORE_ACTION_OPTIONS",
+            ),
+            (
+                wire::OPCODE_SET_TESSELLATION_FACTOR_BUFFER,
+                "wire::OPCODE_SET_TESSELLATION_FACTOR_BUFFER",
+            ),
+            (
+                wire::OPCODE_SET_TESSELLATION_FACTOR_SCALE,
+                "wire::OPCODE_SET_TESSELLATION_FACTOR_SCALE",
+            ),
+            (
+                wire::OPCODE_SET_TRIANGLE_FILL_MODE,
+                "wire::OPCODE_SET_TRIANGLE_FILL_MODE",
+            ),
+            (
+                wire::OPCODE_SET_VERTEX_BUFFER,
+                "wire::OPCODE_SET_VERTEX_BUFFER",
+            ),
+            (
+                wire::OPCODE_SET_VERTEX_BUFFER_OFFSET,
+                "wire::OPCODE_SET_VERTEX_BUFFER_OFFSET",
+            ),
+            (
+                wire::OPCODE_SET_VERTEX_SAMPLER,
+                "wire::OPCODE_SET_VERTEX_SAMPLER",
+            ),
+            (
+                wire::OPCODE_SET_VERTEX_SAMPLER_LOD,
+                "wire::OPCODE_SET_VERTEX_SAMPLER_LOD",
+            ),
+            (
+                wire::OPCODE_SET_VERTEX_TEXTURE,
+                "wire::OPCODE_SET_VERTEX_TEXTURE",
+            ),
+            (wire::OPCODE_SET_VIEWPORT, "wire::OPCODE_SET_VIEWPORT"),
+            (wire::OPCODE_SET_VIEWPORTS, "wire::OPCODE_SET_VIEWPORTS"),
+            (
+                wire::OPCODE_SET_VISIBILITY_RESULT_MODE,
+                "wire::OPCODE_SET_VISIBILITY_RESULT_MODE",
+            ),
+            (wire::OPCODE_TEXTURE_BARRIER, "wire::OPCODE_TEXTURE_BARRIER"),
+            (wire::OPCODE_SET_LINE_WIDTH, "wire::OPCODE_SET_LINE_WIDTH"),
+            (wire::OPCODE_USE_RESOURCE, "wire::OPCODE_USE_RESOURCE"),
+            (
+                wire::OPCODE_SET_VERTEX_AMPLIFICATION_MODE,
+                "wire::OPCODE_SET_VERTEX_AMPLIFICATION_MODE",
+            ),
+            (
+                wire::OPCODE_SET_VERTEX_AMPLIFICATION_COUNT,
+                "wire::OPCODE_SET_VERTEX_AMPLIFICATION_COUNT",
+            ),
+            (
+                wire_tile::OPCODE_DISPATCH_THREADS_PER_TILE,
+                "wire_tile::OPCODE_DISPATCH_THREADS_PER_TILE",
+            ),
+            (
+                wire_tile::OPCODE_SET_TILE_THREADGROUP_MEMORY,
+                "wire_tile::OPCODE_SET_TILE_THREADGROUP_MEMORY",
+            ),
+            (
+                wire_tile::OPCODE_SET_TILE_BUFFER,
+                "wire_tile::OPCODE_SET_TILE_BUFFER",
+            ),
+            (
+                wire_tile::OPCODE_SET_TILE_BUFFER_OFFSET,
+                "wire_tile::OPCODE_SET_TILE_BUFFER_OFFSET",
+            ),
+            (
+                wire_tile::OPCODE_SET_TILE_SAMPLER,
+                "wire_tile::OPCODE_SET_TILE_SAMPLER",
+            ),
+            (
+                wire_tile::OPCODE_SET_TILE_SAMPLER_LOD,
+                "wire_tile::OPCODE_SET_TILE_SAMPLER_LOD",
+            ),
+            (
+                wire_tile::OPCODE_SET_TILE_TEXTURE,
+                "wire_tile::OPCODE_SET_TILE_TEXTURE",
+            ),
+            (
+                wire_tile::OPCODE_DISPATCH_THREADS_PER_TILE_IN_REGION,
+                "wire_tile::OPCODE_DISPATCH_THREADS_PER_TILE_IN_REGION",
+            ),
+            (
+                wire_tile::OPCODE_DISPATCH_THREADS_PER_TILE_IN_REGION_RT_INDEX,
+                "wire_tile::OPCODE_DISPATCH_THREADS_PER_TILE_IN_REGION_RT_INDEX",
+            ),
+            (
+                wire_tile::OPCODE_GET_TILE_DIMENSIONS,
+                "wire_tile::OPCODE_GET_TILE_DIMENSIONS",
+            ),
+            (
+                wire::OPCODE_SET_VERTEX_BUFFER_STRIDE,
+                "wire::OPCODE_SET_VERTEX_BUFFER_STRIDE",
+            ),
+            (
+                wire::OPCODE_SET_VERTEX_BUFFER_OFFSET_STRIDE,
+                "wire::OPCODE_SET_VERTEX_BUFFER_OFFSET_STRIDE",
+            ),
+            (
+                wire_pass::OPCODE_RENDER_PASS,
+                "wire_pass::OPCODE_RENDER_PASS",
+            ),
+            (
+                wire_pass::OPCODE_DEFAULT_RASTER_SAMPLE_COUNT,
+                "wire_pass::OPCODE_DEFAULT_RASTER_SAMPLE_COUNT",
+            ),
+            (
+                wire_pass::OPCODE_SAMPLE_POSITIONS,
+                "wire_pass::OPCODE_SAMPLE_POSITIONS",
+            ),
+            (
+                wire_pass::OPCODE_RASTERIZATION_RATE_MAP,
+                "wire_pass::OPCODE_RASTERIZATION_RATE_MAP",
+            ),
+            (
+                wire_pass::OPCODE_IMAGEBLOCK_SAMPLE_LENGTH,
+                "wire_pass::OPCODE_IMAGEBLOCK_SAMPLE_LENGTH",
+            ),
+            (
+                wire_pass::OPCODE_THREADGROUP_MEMORY_LENGTH,
+                "wire_pass::OPCODE_THREADGROUP_MEMORY_LENGTH",
+            ),
+            (wire_pass::OPCODE_TILE_SIZE, "wire_pass::OPCODE_TILE_SIZE"),
         ];
 
         let mut apple: Vec<u32> = reims_vgpu_wire::manifest::MANIFEST
@@ -3753,22 +3685,16 @@ mod tests {
         );
     }
 
-    /// The two residency opcodes are the ones Apple's serializer writes.
-    ///
-    /// They are declared twice — here, and in `reims_vgpu_wire::ops::render`
-    /// where fixtures pin them against bytes the serializer produced. Nothing
-    /// in the toolchain compares the two declarations, which is exactly how
-    /// `0x86`/`0x87` survived here: they were numbers no capture ever supported
-    /// and no test could contradict.
+    /// Residency uses the wire opcodes Apple's serializer writes (`0x1b` /
+    /// `0x89`), not the old barrier-neighbourhood numbers `0x86`/`0x87`.
     #[test]
     fn the_residency_opcodes_are_the_ones_apples_serializer_writes() {
         use reims_vgpu_wire::ops::render as wire;
-        assert_eq!(OP_USE_HEAP, wire::OPCODE_USE_HEAP);
-        assert_eq!(OP_USE_RESOURCE, wire::OPCODE_USE_RESOURCE);
-        // The old numbers are in the barrier neighbourhood, one and two above
-        // `textureBarrier`. Nothing here may claim them as residency again.
-        assert_ne!(OP_USE_HEAP, 0x86);
-        assert_ne!(OP_USE_RESOURCE, 0x87);
+        assert_eq!(wire::OPCODE_USE_HEAP, 0x1b);
+        assert_eq!(wire::OPCODE_USE_RESOURCE, 0x89);
+        // Barrier neighbourhood: nothing here may claim these as residency.
+        assert_ne!(wire::OPCODE_USE_HEAP, 0x86);
+        assert_ne!(wire::OPCODE_USE_RESOURCE, 0x87);
     }
 
     /// The refs of a residency record start at a different offset on each form,
@@ -3780,12 +3706,16 @@ mod tests {
     #[test]
     fn a_residency_record_is_bounded_by_its_own_count() {
         for (op, refs_at, kind) in [
-            (OP_USE_RESOURCE, USE_RESOURCE_REFS, Kind::UseResource),
-            (OP_USE_HEAP, USE_HEAP_REFS, Kind::UseHeap),
+            (
+                wire::OPCODE_USE_RESOURCE,
+                USE_RESOURCE_REFS,
+                Kind::UseResource,
+            ),
+            (wire::OPCODE_USE_HEAP, USE_HEAP_REFS, Kind::UseHeap),
         ] {
             let body = |count: u32, entries: usize| {
-                let mut v = hdr(op, HEADER_LEN + refs_at + entries * REF_BIND_ENTRY_SIZE);
-                st32(&mut v[HEADER_LEN + RESIDENCY_COUNT..], count);
+                let mut v = hdr(op, OP_HEADER_LEN + refs_at + entries * REF_BIND_ENTRY_SIZE);
+                st32(&mut v[OP_HEADER_LEN + RESIDENCY_COUNT..], count);
                 v
             };
 
@@ -3815,7 +3745,7 @@ mod tests {
             );
             // The head itself, with no room for the array at all.
             assert_eq!(
-                decode(&hdr(op, HEADER_LEN + 4)).unwrap_err(),
+                decode(&hdr(op, OP_HEADER_LEN + 4)).unwrap_err(),
                 DecodeStatus::ErrShort,
                 "op {op:#x} accepted a record with no room for its refs"
             );
@@ -3832,7 +3762,8 @@ mod tests {
     #[test]
     fn the_barrier_neighbourhood_opcodes_are_not_claimed_as_residency() {
         for op in [0x86u32, 0x87] {
-            let c = decode(&hdr(op, HEADER_LEN + 16)).unwrap_or_else(|e| panic!("{op:#x}: {e:?}"));
+            let c =
+                decode(&hdr(op, OP_HEADER_LEN + 16)).unwrap_or_else(|e| panic!("{op:#x}: {e:?}"));
             assert_eq!(
                 c.kind,
                 Kind::OtherAccepted,

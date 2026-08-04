@@ -1427,15 +1427,13 @@ mod tests {
     /// flipping either silently exchanges R and B on a whole rail.
     #[test]
     fn only_a_surface_identity_carries_guest_scanout_order() {
-        assert!(
-            TargetIdentity::Surface {
-                id: 1,
-                width: 8,
-                height: 8,
-                generation: 0,
-            }
-            .is_bgra()
-        );
+        assert!(TargetIdentity::Surface {
+            id: 1,
+            width: 8,
+            height: 8,
+            generation: 0,
+        }
+        .is_bgra());
         for other in [
             TargetIdentity::Gva {
                 gva: 0x1000,

@@ -265,11 +265,13 @@ pub fn flush_mapping_for_guest_read<M: HostMemory + HostOps>(
     // `guest_read_dry` cannot say — the fence always empties the windows first,
     // so every declaration is dry either way. This split can, and it is the
     // number that decides whether the writeback could be demand-driven at all.
-    crate::runtime::drain::note_store_route(if state.fence_flushed_mappings.contains(&mapping_id) {
-        "guest_read_on_flushed_mid"
-    } else {
-        "guest_read_on_other_mid"
-    });
+    crate::runtime::drain::note_store_route(
+        if state.fence_flushed_mappings.contains(&mapping_id) {
+            "guest_read_on_flushed_mid"
+        } else {
+            "guest_read_on_other_mid"
+        },
+    );
     let keyed = state
         .compute_deferred_flush
         .keys()
@@ -1043,7 +1045,7 @@ pub fn flush_mapping_windows_before_fence<M: HostMemory + HostOps>(
     //
     // **Reading back less than the whole attachment is measured, and it is not a
     // lever.** The guest supplies a damage rect and this device carries it
-    // verbatim (`OP_SET_SCISSOR` -> `req.scissor`), so a damage-limited
+    // verbatim (`OPCODE_SET_SCISSOR` -> `req.scissor`), so a damage-limited
     // writeback would be the decoded contract rather than a guess — but
     // `note_store_damage_coverage` reads `store_damage_texels /
     // store_attach_texels` at **99.34%** on a driven probe, with half the Stores
@@ -2962,12 +2964,18 @@ mod render_flush_witness_tests {
         note_render_flush_cache_read(&mut state, 7);
         let scored = note_render_flush_landed(&mut state, 7, true).expect("second landing scores");
         assert!(!scored.cache_unread, "cache read must clear the cache leg");
-        assert!(scored.pages_unread, "cache read must not clear the pages leg");
+        assert!(
+            scored.pages_unread,
+            "cache read must not clear the pages leg"
+        );
 
         note_render_flush_pages_read(&mut state, 7);
         let scored = note_render_flush_landed(&mut state, 7, true).expect("third landing scores");
         assert!(!scored.pages_unread, "pages read must clear the pages leg");
-        assert!(scored.cache_unread, "pages read must not clear the cache leg");
+        assert!(
+            scored.cache_unread,
+            "pages read must not clear the cache leg"
+        );
     }
 
     /// A flush that stored no cache copy has no cache leg to score.

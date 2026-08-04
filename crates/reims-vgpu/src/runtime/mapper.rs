@@ -477,9 +477,8 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
                         // descriptor, and narrowing a FourCC produces a format
                         // nothing in the device accepts. See
                         // `objects::device_desc_format_to_mtl`.
-                        format = crate::runtime::objects::device_desc_format_to_mtl(
-                            surf.pixel_format,
-                        );
+                        format =
+                            crate::runtime::objects::device_desc_format_to_mtl(surf.pixel_format);
                         if let Some((_, _, end, _)) =
                             sample_window_prefer_device(Some(&desc), None, format, width, height)
                         {

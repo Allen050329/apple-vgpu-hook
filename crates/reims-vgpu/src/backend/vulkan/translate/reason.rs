@@ -271,7 +271,11 @@ mod tests {
         seen.sort_unstable();
         let listed = seen.len();
         seen.dedup();
-        assert_eq!(listed, seen.len(), "a variant appears in ALL more than once");
+        assert_eq!(
+            listed,
+            seen.len(),
+            "a variant appears in ALL more than once"
+        );
         assert_eq!(
             seen,
             (0..ALL.len()).collect::<Vec<_>>(),

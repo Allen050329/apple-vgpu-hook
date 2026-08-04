@@ -379,11 +379,7 @@ impl<'a> Builder<'a> {
     /// Panics if the slot is already occupied or if `pfn` has bit 31 set —
     /// exactly the two entries a guest cannot produce.
     pub fn set_entry(&mut self, node_pfn: u32, index: u32, pfn: u32, flag: bool) {
-        assert_eq!(
-            pfn & PTE_FLAG_MASK,
-            0,
-            "a PFN never has bit 31 already set"
-        );
+        assert_eq!(pfn & PTE_FLAG_MASK, 0, "a PFN never has bit 31 already set");
         let entry = pfn | if flag { PTE_FLAG_MASK } else { 0 };
         let slot = self.slot(node_pfn, index);
         assert_eq!(

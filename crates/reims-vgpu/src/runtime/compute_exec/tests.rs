@@ -337,7 +337,10 @@ fn a_nil_entry_clears_an_occupied_compute_slot() {
             ..Default::default()
         }],
     );
-    assert_eq!((acc.buffers.len(), acc.textures.len(), acc.samplers.len()), (1, 1, 1));
+    assert_eq!(
+        (acc.buffers.len(), acc.textures.len(), acc.samplers.len()),
+        (1, 1, 1)
+    );
 
     acc.bind_buffers(
         3,

@@ -540,7 +540,10 @@ pub(super) fn load_linear_texture_rgba_host<M: HostMemory + HostOps>(
 /// `BGRA8` qualifies only when the caller opts into a native BGRA8 upload
 /// (`native_bgra8`), otherwise it must be swapped to RGBA8. Every other format
 /// needs a real convert pass and returns `None`.
-pub(super) fn linear_native_upload_format(sample_format: u16, native_bgra8: bool) -> Option<TexelLayout> {
+pub(super) fn linear_native_upload_format(
+    sample_format: u16,
+    native_bgra8: bool,
+) -> Option<TexelLayout> {
     use pixel_format::SampledClass;
     // The decode contract's sampled class is the one rule for "which 8-bit
     // channel order is this"; it folds each sRGB format onto its linear

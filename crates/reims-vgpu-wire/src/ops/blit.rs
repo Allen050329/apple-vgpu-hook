@@ -848,7 +848,10 @@ mod tests {
             .into_iter()
             .filter(|hit| *hit)
             .count();
-            assert!(hits <= 1, "opcode {opcode:#x} answers {hits} shape predicates");
+            assert!(
+                hits <= 1,
+                "opcode {opcode:#x} answers {hits} shape predicates"
+            );
         }
     }
 

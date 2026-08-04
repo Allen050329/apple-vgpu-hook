@@ -384,7 +384,8 @@ impl HostSlabPool {
             Ok(true) => {}
             Ok(false) => return,
             Err(decline) => {
-                crate::observe::Emit::decline("host_slab", &decline).fail_once(u64::from(token.block));
+                crate::observe::Emit::decline("host_slab", &decline)
+                    .fail_once(u64::from(token.block));
                 return;
             }
         }
@@ -459,11 +460,7 @@ impl HostSlabPool {
     /// returned once idle settles, which is the same trade
     /// `SETTLED_PASSES_FOR_BUFFER_TRIM` already makes for the buffer pools it
     /// feeds, and for the same reason.
-    pub(crate) unsafe fn trim_empty_blocks(
-        &mut self,
-        device: &ash::Device,
-        keep: usize,
-    ) -> usize {
+    pub(crate) unsafe fn trim_empty_blocks(&mut self, device: &ash::Device, keep: usize) -> usize {
         let victims = self.empty_block_victims(keep);
         let mut freed = 0;
         for idx in victims {
@@ -609,7 +606,10 @@ mod tests {
         // And the trim still reclaims it once nothing is carved from it.
         unsafe { pool.release(&ctx.device, second) };
         let freed = unsafe { pool.trim_empty_blocks(&ctx.device, 0) };
-        assert_eq!(freed, 1, "a settled idle must be able to give the block back");
+        assert_eq!(
+            freed, 1,
+            "a settled idle must be able to give the block back"
+        );
         assert_eq!(pool.resident_bytes(), 0, "the block is still resident");
 
         unsafe { pool.destroy_all(&ctx.device) };
@@ -778,5 +778,4 @@ mod tests {
             Err(SlabDecline::ReleaseRangeAlreadyFree { .. })
         ));
     }
-
 }

@@ -135,8 +135,7 @@ fn apply_define_task2<H: HostMemory + HostOps>(
     // is a field every log reader resolves arbitrarily.
     crate::observe::off(format!(
         "define_task {site} raw={raw_id:#x} kernel={} len={length:#x} page_shift={} {walk}",
-        kernel_task as u8,
-        state.page_shift
+        kernel_task as u8, state.page_shift
     ));
 }
 
@@ -3261,7 +3260,7 @@ pub enum FlushRail {
 ///
 /// The obvious form of that lever does not pay, and the number is recorded here
 /// so it is not re-derived. The guest already supplies a damage rect —
-/// `OP_SET_SCISSOR`, decoded verbatim into `req.scissor` — so a writeback could
+/// `OPCODE_SET_SCISSOR`, decoded verbatim into `req.scissor` — so a writeback could
 /// land only the scissored region. A 30 s driven Safari probe on the
 /// x86/PCI/Vulkan pathway bucketed every window-arming Store by the fraction of
 /// its attachment the scissor covered: **99.34% of the texels a Store arms are
@@ -3559,7 +3558,9 @@ impl SurfaceWriteCensus {
             let n = self.count[i].swap(0, Relaxed);
             let max = self.max_us[i].swap(0, Relaxed);
             let label = phase.label();
-            body.push_str(&format!(" {label}_us={us} {label}={n} {label}_max_us={max}"));
+            body.push_str(&format!(
+                " {label}_us={us} {label}={n} {label}_max_us={max}"
+            ));
         }
         Some(format!(
             "write_split win_ms={win_ms} contig={contig} frag={frag} bytes={bytes}{body}"
@@ -3815,7 +3816,9 @@ impl DrainDutyCensus {
             let max = self.rail_max_us[i].swap(0, Relaxed);
             any |= n != 0;
             let label = rail.label();
-            body.push_str(&format!(" {label}_us={us} {label}={n} {label}_max_us={max}"));
+            body.push_str(&format!(
+                " {label}_us={us} {label}={n} {label}_max_us={max}"
+            ));
         }
         any.then(|| format!("flush_rails win_ms={win_ms}{body}"))
     }
@@ -3843,7 +3846,9 @@ impl DrainDutyCensus {
             let max = self.rb_max_us[i].swap(0, Relaxed);
             any |= n != 0;
             let label = phase.label();
-            body.push_str(&format!(" {label}_us={us} {label}={n} {label}_max_us={max}"));
+            body.push_str(&format!(
+                " {label}_us={us} {label}={n} {label}_max_us={max}"
+            ));
         }
         let bar_us = self.rb_bar_us.swap(0, Relaxed);
         let gpu_us = self.rb_gpu_us.swap(0, Relaxed);
@@ -4233,10 +4238,9 @@ impl DoorbellCensus {
         // Descending by count, capped, and the cap is reported rather than
         // silently applied: a register that misses the list because three others
         // out-counted it must not read as a register that never deferred.
-        let mut offsets: Vec<(u64, (u64, u64))> =
-            std::mem::take(&mut *self.queued_offsets.lock())
-                .into_iter()
-                .collect();
+        let mut offsets: Vec<(u64, (u64, u64))> = std::mem::take(&mut *self.queued_offsets.lock())
+            .into_iter()
+            .collect();
         offsets.sort_by_key(|(off, (count, _))| (std::cmp::Reverse(*count), *off));
         let distinct = offsets.len();
         let mut body = String::new();

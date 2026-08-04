@@ -480,10 +480,8 @@ mod tests {
         let mut tail = [0u8; 16];
         tail[0] = 0xaa;
         tail[15] = 0x01;
-        let p = exec_payload_with_table(&[
-            (0x2a, 0x0000_0001, [0u8; 16]),
-            (0x2b, 0x0000_0100, tail),
-        ]);
+        let p =
+            exec_payload_with_table(&[(0x2a, 0x0000_0001, [0u8; 16]), (0x2b, 0x0000_0100, tail)]);
         let descs = decode_exec_resource_table(&p).expect("decode");
         assert_eq!(descs.len(), 2);
         assert_eq!(descs[0].object_id, 0x2a);

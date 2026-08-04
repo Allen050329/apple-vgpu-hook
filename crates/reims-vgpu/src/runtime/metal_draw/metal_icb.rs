@@ -500,8 +500,8 @@ fn apply_icb_encoder_inheritance<M: HostMemory + HostOps>(
         }
         let mut err_buf = [0i8; 128];
         let err = (err_buf.as_mut_ptr() as *mut c_char, err_buf.len());
-        let reims_vgpu = load_sampler(state, host, req.task_id, s.sampler_ref, s.index).unwrap_or_else(
-            |error| {
+        let reims_vgpu = load_sampler(state, host, req.task_id, s.sampler_ref, s.index)
+            .unwrap_or_else(|error| {
                 crate::observe::Emit::decline("metal_icb_sampler_fallback", &error)
                     .field("task", req.task_id)
                     .field("pipe", req.pipeline_ref)
@@ -510,8 +510,7 @@ fn apply_icb_encoder_inheritance<M: HostMemory + HostOps>(
                         (u64::from(s.sampler_ref) << 32) | (1_u64 << 28) | u64::from(s.index),
                     );
                 default_sampler(s.index)
-            },
-        );
+            });
         let mtl = match make_explicit_sampler(device, &reims_vgpu, err) {
             Ok(st) => st,
             Err(status) => {
@@ -541,8 +540,8 @@ fn apply_icb_encoder_inheritance<M: HostMemory + HostOps>(
         }
         let mut err_buf = [0i8; 128];
         let err = (err_buf.as_mut_ptr() as *mut c_char, err_buf.len());
-        let reims_vgpu = load_sampler(state, host, req.task_id, s.sampler_ref, s.index).unwrap_or_else(
-            |error| {
+        let reims_vgpu = load_sampler(state, host, req.task_id, s.sampler_ref, s.index)
+            .unwrap_or_else(|error| {
                 crate::observe::Emit::decline("metal_icb_sampler_fallback", &error)
                     .field("task", req.task_id)
                     .field("pipe", req.pipeline_ref)
@@ -551,8 +550,7 @@ fn apply_icb_encoder_inheritance<M: HostMemory + HostOps>(
                         (u64::from(s.sampler_ref) << 32) | (1_u64 << 27) | u64::from(s.index),
                     );
                 default_sampler(s.index)
-            },
-        );
+            });
         let mtl = match make_explicit_sampler(device, &reims_vgpu, err) {
             Ok(st) => st,
             Err(status) => {

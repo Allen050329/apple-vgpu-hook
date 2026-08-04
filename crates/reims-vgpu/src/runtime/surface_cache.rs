@@ -490,11 +490,7 @@ pub enum LinearMaterializeDecline {
     /// wants cannot be computed.
     FormatUnsized { pixel_format: u16 },
     /// `width * height * bpp` overflowed `usize`.
-    TightSizeOverflow {
-        width: u32,
-        height: u32,
-        bpp: u32,
-    },
+    TightSizeOverflow { width: u32, height: u32, bpp: u32 },
     /// The engine returned fewer bytes than one tight image.
     ReadbackShort { got: usize, need: usize },
 }
@@ -1045,7 +1041,6 @@ fn cache_levels(state: &DeviceState) -> (CacheLevel, CacheLevel, CacheLevel) {
     )
 }
 
-
 /// GVA-keyed entries whose key no longer translates to the backing the pixels
 /// were produced from. Returns `(moved, unmapped, checked)`.
 ///
@@ -1275,7 +1270,6 @@ mod tests {
         assert_eq!(checked, 3);
     }
 
-
     /// The gauge has to separate the two shapes a growing cache can take, or it
     /// cannot tell "many small surfaces" from "a few 4K ones" — which is the
     /// distinction the no-size-cap question turns on, since a 4K entry is ~4x a
@@ -1479,7 +1473,10 @@ mod tests {
             Err(LinearMaterializeDecline::Superseded { resident_gen: 2 }),
             "the wrong generation is a supersede, not a lost frame"
         );
-        assert_eq!(materialize_linear_resident(&mut st, task, r, 2, &flushed), Ok(()));
+        assert_eq!(
+            materialize_linear_resident(&mut st, task, r, 2, &flushed),
+            Ok(())
+        );
         assert_eq!(
             linear_texture_resident_gen(&st, task, r, gva, MTL_FORMAT_RGBA16_FLOAT, w, h, stride),
             None
@@ -1912,8 +1909,6 @@ mod tests {
         let _ = host.write_gpa(root_gpa + index * 4, &pte);
     }
 
-
-
     /// An address that does not resolve records no backing, rather than a
     /// backing of zero.
     ///
@@ -1992,8 +1987,15 @@ mod tests {
         // denominator rather than counting as fresh.
         let px = vec![0xCD; (w * h * 4) as usize];
         store_gva_owned(&mut st, gva, w, h, px, 0, None);
-        assert_eq!(gva_backing_state(&st, &host, gva), GvaBackingState::Unrecorded);
-        assert_eq!(gva_backing_moved(&st, &host), (0, 0, 0), "and is not counted");
+        assert_eq!(
+            gva_backing_state(&st, &host, gva),
+            GvaBackingState::Unrecorded
+        );
+        assert_eq!(
+            gva_backing_moved(&st, &host),
+            (0, 0, 0),
+            "and is not counted"
+        );
 
         assert_eq!(
             gva_backing_state(&st, &host, gva + page),
@@ -2001,13 +2003,6 @@ mod tests {
             "a key that was never stored is not an answer about backing"
         );
     }
-
-
-
-
-
-
-
 }
 
 /// The GVA encode cache's byte cap: what it bounds, what it refuses to touch,

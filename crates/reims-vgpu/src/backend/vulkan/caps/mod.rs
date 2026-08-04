@@ -111,7 +111,6 @@ impl HostGpuCaps {
             self.device_type,
         )
     }
-
 }
 
 #[cfg(test)]

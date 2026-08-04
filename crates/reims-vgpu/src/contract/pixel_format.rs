@@ -1162,30 +1162,12 @@ mod tests {
         );
         assert_eq!(storage_selector(MTL_FORMAT_R32_SINT), None);
         assert_eq!(storage_selector(MTL_FORMAT_R32_FLOAT), None);
-        assert_eq!(
-            render_target_bpp(MTL_FORMAT_BGRA8_UNORM),
-            Some(4)
-        );
-        assert_eq!(
-            render_target_bpp(MTL_FORMAT_RGBA8_UNORM),
-            Some(4)
-        );
-        assert_eq!(
-            render_target_bpp(MTL_FORMAT_RGBA8_UNORM_SRGB),
-            Some(4)
-        );
-        assert_eq!(
-            render_target_bpp(MTL_FORMAT_BGRA8_UNORM_SRGB),
-            Some(4)
-        );
-        assert_eq!(
-            render_target_bpp(MTL_FORMAT_RGBA16_FLOAT),
-            Some(8)
-        );
-        assert_eq!(
-            render_target_bpp(MTL_FORMAT_RG16_FLOAT),
-            Some(4)
-        );
+        assert_eq!(render_target_bpp(MTL_FORMAT_BGRA8_UNORM), Some(4));
+        assert_eq!(render_target_bpp(MTL_FORMAT_RGBA8_UNORM), Some(4));
+        assert_eq!(render_target_bpp(MTL_FORMAT_RGBA8_UNORM_SRGB), Some(4));
+        assert_eq!(render_target_bpp(MTL_FORMAT_BGRA8_UNORM_SRGB), Some(4));
+        assert_eq!(render_target_bpp(MTL_FORMAT_RGBA16_FLOAT), Some(8));
+        assert_eq!(render_target_bpp(MTL_FORMAT_RG16_FLOAT), Some(4));
         // Integer / non-color formats stay fail-closed.
         assert_eq!(render_target_bpp(MTL_FORMAT_RGBA8_UINT), None);
         assert_eq!(render_target_bpp(MTL_FORMAT_R8_UNORM), None);

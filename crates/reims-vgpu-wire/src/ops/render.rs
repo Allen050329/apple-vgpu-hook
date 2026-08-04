@@ -85,19 +85,14 @@ pub const DRAW_WIDE_TOTAL_LEN: u32 = 28;
 
 /// Payload of a non-instanced draw whose counts do not fit 16 bits.
 ///
-/// **`reims_vgpu::runtime::decode::render` declines this opcode**
-/// (`OP_DRAW_WIDE => Err(DecodeStatus::ErrUnsupportedOpcode)`), which loses the
-/// guest's draw but says so. Its comment records the reasoning: the layout was
-/// *guessed* from the wide siblings as `u64 · u64 · u32 primitiveType@0x10`, and
-/// left undecoded because "consistent is not confirmed".
-///
-/// The guess was wrong in a way that guessing could not catch. `primitiveType`
-/// is **first and 32-bit**, exactly as in the compact [`Draw`], and the two
-/// counts follow it — the same field order as `0x01` with each count widened,
-/// not the instanced forms' order. Fixtures `render_draw_primitives_wide`
-/// (Triangle, `0x11111`, `0x22222`), `render_draw_primitives_count_over_16bit`
-/// and `render_draw_primitives_start_over_16bit`, the last two moving one count
-/// across the boundary at a time.
+/// Decode used to decline this opcode as unsupported while its comment guessed
+/// a layout of `u64 · u64 · u32 primitiveType@0x10`. That guess was wrong:
+/// `primitiveType` is **first and 32-bit**, exactly as in the compact [`Draw`],
+/// and the two counts follow it — the same field order as `0x01` with each
+/// count widened. Decode now maps this view. Fixtures
+/// `render_draw_primitives_wide` (Triangle, `0x11111`, `0x22222`),
+/// `render_draw_primitives_count_over_16bit` and
+/// `render_draw_primitives_start_over_16bit`.
 #[repr(C)]
 #[derive(Debug)]
 pub struct DrawWide {
@@ -126,10 +121,8 @@ pub const DRAW_INSTANCED_TOTAL_LEN: u32 = 16;
 /// `render_draw_primitives_instanced` (TriangleStrip, `0x1111`, `0x2222`,
 /// `0x3333`) and `render_draw_primitives_instances_over_16bit`.
 ///
-/// This is the one draw layout `reims_vgpu::runtime::decode::render` already
-/// derived independently — `OP_DRAW_INST_COMPACT`, field for field — from live
-/// WebKit bytes. Two derivations from unrelated evidence agreeing is why the
-/// compact form needed no re-checking.
+/// Decode maps this layout through [`draw_instanced`]; fixtures and live
+/// WebKit captures agree field for field.
 #[repr(C)]
 #[derive(Debug)]
 pub struct DrawInstanced {
@@ -805,7 +798,10 @@ pub fn is_ref_bind(opcode: u32) -> bool {
 
 #[inline]
 pub fn is_buffer_bind(opcode: u32) -> bool {
-    matches!(opcode, OPCODE_SET_VERTEX_BUFFER | OPCODE_SET_FRAGMENT_BUFFER)
+    matches!(
+        opcode,
+        OPCODE_SET_VERTEX_BUFFER | OPCODE_SET_FRAGMENT_BUFFER
+    )
 }
 
 // --- 0x80 / 0x71 the sampler binds that carry LOD clamps -------------------
@@ -1192,18 +1188,10 @@ pub const OPCODE_USE_HEAP: u32 = 0x1b;
 /// only an align-1 view can take. Fixture `render_use_heap` (the stub heap's
 /// ref 6565, stages 2).
 ///
-/// This paragraph used to say `reims_vgpu::runtime::decode::render` "has
-/// `OP_USE_HEAP = 0x86` and `OP_USE_RESOURCE = 0x87`, and decodes both with the
-/// bind-record layout". **That is fixed and has been for some time**: the device
-/// reads `0x1b` and `0x89`, matching this module, and
-/// `the_residency_opcodes_are_the_ones_apples_serializer_writes` there compares
-/// the two declarations so they cannot part again.
-///
-/// Left as a note rather than deleted, because a stale cross-crate claim is
-/// worse than no claim: it tells a reader the two crates disagree when they
-/// agree, and the natural response is to "fix" the side that is already right.
-/// `0x86`/`0x87` still exist in `decode::compute`, where they are a different
-/// encoder's numbers and are documented as unsupported by any selector.
+/// Decode consumes these opcodes through [`use_heap`] / [`use_resource`]
+/// (`0x1b` / `0x89`). The historical `0x86`/`0x87` pair is not residency; those
+/// numbers remain only on `decode::compute` as local no-export placeholders
+/// with no serializer selector behind them.
 #[repr(C)]
 #[derive(Debug)]
 pub struct UseHeap {
@@ -1721,9 +1709,7 @@ pub fn draw_indexed_patches<'a>(op: &Op<'a>) -> Result<&'a DrawIndexedPatches, W
     view::<DrawIndexedPatches>(op.payload)
 }
 
-pub fn draw_indexed_patches_wide<'a>(
-    op: &Op<'a>,
-) -> Result<&'a DrawIndexedPatchesWide, WireError> {
+pub fn draw_indexed_patches_wide<'a>(op: &Op<'a>) -> Result<&'a DrawIndexedPatchesWide, WireError> {
     debug_assert_eq!(op.opcode(), OPCODE_DRAW_PATCHES_WIDE);
     view::<DrawIndexedPatchesWide>(op.payload)
 }
@@ -1850,7 +1836,6 @@ pub fn set_tessellation_factor_buffer<'a>(
     view::<TessellationFactorBuffer>(op.payload)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1914,8 +1899,16 @@ mod tests {
             DRAW_INDEXED_INSTANCED_BASE_WIDE_TOTAL_LEN,
             size_of::<DrawIndexedInstancedBaseWide>(),
         ),
-        ("set_scissor", SET_SCISSOR_TOTAL_LEN, size_of::<ScissorRect>()),
-        ("set_viewport", SET_VIEWPORT_TOTAL_LEN, size_of::<Viewport>()),
+        (
+            "set_scissor",
+            SET_SCISSOR_TOTAL_LEN,
+            size_of::<ScissorRect>(),
+        ),
+        (
+            "set_viewport",
+            SET_VIEWPORT_TOTAL_LEN,
+            size_of::<Viewport>(),
+        ),
         ("set_mode", SET_MODE_TOTAL_LEN, size_of::<ModeState>()),
         ("set_float", SET_FLOAT_TOTAL_LEN, size_of::<FloatState>()),
         ("set_state", SET_STATE_TOTAL_LEN, size_of::<StateRef>()),
@@ -2132,7 +2125,10 @@ mod tests {
         // Spot-check the pair that motivated this.
         assert!(is_buffer_bind(OPCODE_SET_FRAGMENT_BUFFER));
         assert!(is_buffer_offset(OPCODE_SET_FRAGMENT_BUFFER_OFFSET));
-        assert_ne!(OPCODE_SET_FRAGMENT_BUFFER, OPCODE_SET_FRAGMENT_BUFFER_OFFSET);
+        assert_ne!(
+            OPCODE_SET_FRAGMENT_BUFFER,
+            OPCODE_SET_FRAGMENT_BUFFER_OFFSET
+        );
     }
 
     /// The two shape predicates must agree with the opcodes their views read,
@@ -2146,11 +2142,17 @@ mod tests {
             OPCODE_SET_DEPTH_CLIP_MODE,
             OPCODE_SET_TRIANGLE_FILL_MODE,
         ] {
-            assert!(is_mode_state(op), "{op:#x} is a mode state and is not claimed");
+            assert!(
+                is_mode_state(op),
+                "{op:#x} is a mode state and is not claimed"
+            );
             assert!(!is_float_state(op), "{op:#x} is claimed by both shapes");
         }
         for op in [OPCODE_SET_LINE_WIDTH, OPCODE_SET_TESSELLATION_FACTOR_SCALE] {
-            assert!(is_float_state(op), "{op:#x} is a float state and is not claimed");
+            assert!(
+                is_float_state(op),
+                "{op:#x} is a float state and is not claimed"
+            );
             assert!(!is_mode_state(op), "{op:#x} is claimed by both shapes");
         }
         for op in [
@@ -2162,7 +2164,10 @@ mod tests {
             OPCODE_SET_VISIBILITY_RESULT_MODE,
             OPCODE_DRAW,
         ] {
-            assert!(!is_mode_state(op) && !is_float_state(op), "{op:#x} over-claimed");
+            assert!(
+                !is_mode_state(op) && !is_float_state(op),
+                "{op:#x} over-claimed"
+            );
         }
     }
 
@@ -2195,7 +2200,10 @@ mod tests {
         // A buffer entry is 12 bytes, not 16, so the same record holds fewer.
         let mut buf = [0u8; 8 + 12];
         buf[4..8].copy_from_slice(&1u32.to_le_bytes());
-        assert_eq!(bind_entries::<BufferBind>(&buf).expect("one fits").1.len(), 1);
+        assert_eq!(
+            bind_entries::<BufferBind>(&buf).expect("one fits").1.len(),
+            1
+        );
         buf[4..8].copy_from_slice(&2u32.to_le_bytes());
         assert!(bind_entries::<BufferBind>(&buf).is_err());
     }
@@ -2317,7 +2325,10 @@ mod tests {
         // setScissorRects: claim one rect and supply none.
         let n = record(&mut buf, OPCODE_SET_SCISSOR_RECTS, &1u64.to_le_bytes(), 0);
         let o = crate::op::op(&buf[..n], 0).expect("header fits");
-        assert!(matches!(set_scissor_rects(&o), Err(WireError::Short { .. })));
+        assert!(matches!(
+            set_scissor_rects(&o),
+            Err(WireError::Short { .. })
+        ));
 
         // setViewports: same, at the other count width.
         let n = record(&mut buf, OPCODE_SET_VIEWPORTS, &1u32.to_le_bytes(), 0);
@@ -2325,7 +2336,12 @@ mod tests {
         assert!(matches!(set_viewports(&o), Err(WireError::Short { .. })));
 
         // And the multiply that produces the byte count must not wrap.
-        let n = record(&mut buf, OPCODE_SET_SCISSOR_RECTS, &u64::MAX.to_le_bytes(), 0);
+        let n = record(
+            &mut buf,
+            OPCODE_SET_SCISSOR_RECTS,
+            &u64::MAX.to_le_bytes(),
+            0,
+        );
         let o = crate::op::op(&buf[..n], 0).expect("header fits");
         assert!(matches!(
             set_scissor_rects(&o),

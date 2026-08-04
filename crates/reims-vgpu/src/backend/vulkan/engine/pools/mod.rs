@@ -12,9 +12,9 @@ use std::time::Instant;
 use super::compute_execution::ComputeExecutionDecline;
 use super::context::{DeviceContext, FENCE_TIMEOUT_NS};
 use super::counters::EngineCounters;
-use super::host_slab::{HostSlabToken, HOST_SLAB_IDLE_KEEP_EMPTY};
 use super::desc_arena::{DescriptorArena, DESC_BLOCK_MAX_SETS};
 use super::device_lost::{DeviceLostDecline, DeviceLostOp};
+use super::host_slab::{HostSlabToken, HOST_SLAB_IDLE_KEEP_EMPTY};
 use super::types::{DrawError, StorageImageFormat, TargetIdentity};
 use super::vk_call::{VkCall, VkOp};
 use crate::backend::vulkan::caps::{MappedMemoryKind, MemoryClass};
@@ -142,8 +142,7 @@ static RETURNED_READBACK_LEASES: parking_lot::Mutex<Vec<u64>> = parking_lot::Mut
 /// for that — a token sitting in [`RETURNED_READBACK_LEASES`] is a lease whose
 /// holder is gone but whose slot has not been collected yet. This counter moves
 /// with the *holder*, so zero means no pointer is outstanding.
-static READBACK_LEASES_OUT: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+static READBACK_LEASES_OUT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Distinct token per lease, so a return can name the slot it is giving back
 /// without carrying a Vulkan handle across the lock boundary.
@@ -1501,9 +1500,7 @@ pub(super) unsafe fn invalidate_slot_for_read(
 
 #[cfg(test)]
 mod staging_mapping_tests {
-    use super::{
-        readback_leases_outstanding, return_readback_lease, DeviceContext, ResourcePools,
-    };
+    use super::{readback_leases_outstanding, return_readback_lease, DeviceContext, ResourcePools};
     use crate::backend::vulkan::engine::counters::EngineCounters;
     use ash::vk;
 
@@ -1651,8 +1648,16 @@ mod staging_mapping_tests {
 
         let seen_a = unsafe { std::slice::from_raw_parts(a.mapped as *const u8, pa.len()) };
         let seen_b = unsafe { std::slice::from_raw_parts(b.mapped as *const u8, pb.len()) };
-        assert_eq!(seen_a, &pa[..], "slot a's mapping was overwritten by slot b");
-        assert_eq!(seen_b, &pb[..], "slot b's mapping was overwritten by slot a");
+        assert_eq!(
+            seen_a,
+            &pa[..],
+            "slot a's mapping was overwritten by slot b"
+        );
+        assert_eq!(
+            seen_b,
+            &pb[..],
+            "slot b's mapping was overwritten by slot a"
+        );
 
         // Same memory object is expected and fine; the same *bytes* are not.
         if a.memory == b.memory {

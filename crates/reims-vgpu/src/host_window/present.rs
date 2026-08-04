@@ -212,10 +212,7 @@ fn guest_resize_request(
 /// window system that ignores the request entirely emits no `Resized` at all
 /// (tiling or fullscreen by policy), so nothing calls this and the hold times
 /// out.
-fn guest_resize_settled(
-    pending: Option<(u32, u32)>,
-    applied: (u32, u32),
-) -> Option<&'static str> {
+fn guest_resize_settled(pending: Option<(u32, u32)>, applied: (u32, u32)) -> Option<&'static str> {
     let target = pending?;
     Some(if target == applied {
         "applied"
@@ -1314,7 +1311,10 @@ mod tests {
         let window = (1920, 1080);
 
         // The viewport's left edge is guest x=0 — not window x=0.
-        assert_eq!(pointer_report((240.0, 0.0), window, Some(guest)), (0, 0, 1440, 1080));
+        assert_eq!(
+            pointer_report((240.0, 0.0), window, Some(guest)),
+            (0, 0, 1440, 1080)
+        );
         // Window centre is guest centre.
         assert_eq!(
             pointer_report((960.0, 540.0), window, Some(guest)),

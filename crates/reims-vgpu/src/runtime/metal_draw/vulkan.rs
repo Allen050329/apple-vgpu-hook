@@ -1013,7 +1013,12 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
         // type-11 hit it can return: the resolve records the ref as live in the
         // task's object set and reports a typed failure when the descriptor is
         // unreadable. Both are wanted for any ref a draw sampled.
-        surface = surface.or(objects::resolve_type11_ref(state, host, task_id, texture_ref));
+        surface = surface.or(objects::resolve_type11_ref(
+            state,
+            host,
+            task_id,
+            texture_ref,
+        ));
     }
 
     if let Some(mid) = surface {
@@ -1125,8 +1130,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                     Some(GuestWriteSite::Pixels(ranges)) => Some(ranges.as_slice()),
                     _ => None,
                 };
-                let guest_replaced =
-                    !matches!(site, None | Some(GuestWriteSite::Elsewhere));
+                let guest_replaced = !matches!(site, None | Some(GuestWriteSite::Elsewhere));
 
                 // A ready resident target is authoritative after a product
                 // Store — but only while nothing has replaced the bytes it is a
@@ -2126,7 +2130,8 @@ fn task_gva_guest_run_window<M: HostMemory + HostOps>(
         return None;
     }
     let page = state.page_size();
-    let gpas = gva_mem::task_gva_page_gpas(host, &state.tasks, task_id, gva, span, state.page_shift);
+    let gpas =
+        gva_mem::task_gva_page_gpas(host, &state.tasks, task_id, gva, span, state.page_shift);
     if gpas.len() as u64 != gva_mem::pages_spanned(gva, span, page) {
         return None;
     }
@@ -2244,7 +2249,6 @@ fn mapping_window_guest_runs<M: HostMemory + HostOps>(
     let runs = coalesce_pages_to_runs(host, window, page, head_off, span)?;
     Some((window.to_vec(), runs))
 }
-
 
 /// Zero-copy draw-time buffer bind: resolve a type-1 buffer object's backing
 /// span (from `offset`) to guest-RAM runs and hand the engine a
@@ -2925,10 +2929,7 @@ fn note_guest_rung_blank<H: HostMemory>(
     // came out empty. 99.5 % of loads on this rung return content, so the
     // population that matters is small enough to name each member of, and the
     // geometry is what joins one of these to something on screen.
-    if crate::observe::first_sight(
-        "lin_rung_guest_blank",
-        gva ^ ((w as u64) << 32) ^ h as u64,
-    ) {
+    if crate::observe::first_sight("lin_rung_guest_blank", gva ^ ((w as u64) << 32) ^ h as u64) {
         crate::observe::off(format!(
             "lin_rung_guest_blank task={task_id} ref={texture_ref} gva={gva:#x} {w}x{h}"
         ));
@@ -3174,7 +3175,7 @@ fn note_type11_elision_extent(w: u32, h: u32) {
 /// a broken cell is a small block of content inside an otherwise empty square,
 /// and a scissor smaller than the target is the one mechanism here that can
 /// leave part of an attachment untouched by construction. Two readings retire
-/// it. The rect is the guest's own, decoded verbatim from `OP_SET_SCISSOR`
+/// it. The rect is the guest's own, decoded verbatim from `OPCODE_SET_SCISSOR`
 /// (`decode::render`, four u64 fields) and latched only when both extents are
 /// non-zero, so this device computes, clamps and derives nothing: a 12x40
 /// scissor over a 64x64 icon is the compositor's damage rect faithfully
@@ -6058,9 +6059,7 @@ fn sample_rung_gw_route(rung: &str, guest_write: GuestWriteVerdict) -> Option<&'
         ("t11rung_host_cache", GuestWriteVerdict::Clean) => "t11rung_host_cache_gw_clean",
         ("t11rung_host_cache", GuestWriteVerdict::NoMapping) => "t11rung_host_cache_gw_no_mapping",
         ("t11rung_host_cache", GuestWriteVerdict::NoStamp) => "t11rung_host_cache_gw_no_stamp",
-        ("t11rung_host_cache", GuestWriteVerdict::Unreadable) => {
-            "t11rung_host_cache_gw_unreadable"
-        }
+        ("t11rung_host_cache", GuestWriteVerdict::Unreadable) => "t11rung_host_cache_gw_unreadable",
         ("t11rung_host_cache", GuestWriteVerdict::Wrote) => "t11rung_host_cache_gw_wrote_elsewhere",
         // The rungs that read the guest's own pages do not care what the guest
         // wrote, because they read exactly that.
@@ -6562,7 +6561,9 @@ fn arm_surface_resident_store<M: HostMemory + HostOps>(
 /// not losses.
 enum SurfaceResidentArmDecline {
     PinRefused,
-    NoEpoch { epoch: u32 },
+    NoEpoch {
+        epoch: u32,
+    },
     StampRefused,
     /// The slot this arm would pin is not the slot the flush would look up —
     /// the pass extent and the attachment geometry disagree. Unlike the other
@@ -7174,13 +7175,13 @@ mod vulkan_split_tests {
         use crate::runtime::drain::store_route_count;
         // 1000x1000 target: the rect's area in pixels IS its percentage.
         let cases = [
-            (10u32, 10u32, "draw_scissor_area_lt1"),    // 0.01 %, rounds to 0
-            (100, 100, "draw_scissor_area_le5"),        // exactly 1 %, so not the sub-1 bucket
-            (200, 200, "draw_scissor_area_le5"),       // 4 %
-            (300, 300, "draw_scissor_area_le10"),      // 9 %
-            (500, 500, "draw_scissor_area_le25"),      // 25 %
-            (700, 700, "draw_scissor_area_le50"),      // 49 %
-            (800, 800, "draw_scissor_area_gt50"),      // 64 %
+            (10u32, 10u32, "draw_scissor_area_lt1"), // 0.01 %, rounds to 0
+            (100, 100, "draw_scissor_area_le5"),     // exactly 1 %, so not the sub-1 bucket
+            (200, 200, "draw_scissor_area_le5"),     // 4 %
+            (300, 300, "draw_scissor_area_le10"),    // 9 %
+            (500, 500, "draw_scissor_area_le25"),    // 25 %
+            (700, 700, "draw_scissor_area_le50"),    // 49 %
+            (800, 800, "draw_scissor_area_gt50"),    // 64 %
         ];
         for (sw, sh, slug) in cases {
             let before = store_route_count(slug);
@@ -7360,7 +7361,11 @@ mod vulkan_split_tests {
         );
 
         super::note_gva_resident_aliasing(&mut state, 0x8000, 64, 64, &a);
-        assert_eq!(store_route_count("gvares_first"), f0 + 1, "nothing to compare against yet");
+        assert_eq!(
+            store_route_count("gvares_first"),
+            f0 + 1,
+            "nothing to compare against yet"
+        );
 
         super::note_gva_resident_aliasing(&mut state, 0x8000, 64, 64, &a_reordered);
         assert_eq!(
@@ -7465,11 +7470,17 @@ mod vulkan_split_tests {
         // different page. Same task, same GVA, same geometry.
         map_one_gva_page(&mut host, 5);
         let gen_b = super::gva_alloc_generation(&state, &mut host, &req);
-        assert_ne!(gen_b, gen_a, "different guest pages are a different allocation");
+        assert_ne!(
+            gen_b, gen_a,
+            "different guest pages are a different allocation"
+        );
         req.gva_alloc_gen = gen_b;
         let id_b = super::gva_chain_identity(&req).expect("a GVA color0 has a chain identity");
 
-        assert_ne!(id_a, id_b, "two allocations at one address must not share one image");
+        assert_ne!(
+            id_a, id_b,
+            "two allocations at one address must not share one image"
+        );
         assert_eq!(
             (id_a.width(), id_a.height()),
             (id_b.width(), id_b.height()),

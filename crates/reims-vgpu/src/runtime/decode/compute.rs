@@ -1,26 +1,10 @@
 //! Compute command decoder (port of `host/utils/reims-vgpu-compute-decode`).
 
-use crate::contract::endian::{ld16, ld32, ld64};
+use crate::contract::endian::ld32;
 use reims_vgpu_wire::ops::compute as wire;
 
-/// Map a `reims-vgpu-wire` view onto a payload, translating its refusal.
-///
-/// Same arrangement as `decode::blit` and `decode::render`: the layout lives in
-/// that crate, derived from Apple's own serializer and pinned by a fixture, and
-/// this module reads it rather than restating it. A view that does not fit is a
-/// payload shorter than the record claims, which is `ErrShort`.
-#[inline]
-fn wire_view<T: reims_vgpu_wire::Wire>(payload: &[u8]) -> Result<&T, DecodeStatus> {
-    reims_vgpu_wire::view::<T>(payload).map_err(|_| DecodeStatus::ErrShort)
-}
-
-/// Bytes before a record's payload, from [`reims_vgpu_wire::OP_HEADER_LEN`].
-///
-/// One fact that used to be declared six times — here, in `render`, `compute`,
-/// `blit` and twice in `stream` — all agreeing, with nothing comparing them.
-/// Re-exporting makes drift impossible rather than merely detectable, which is
-/// the move `contract::gva` already made for the page-table format.
-pub use reims_vgpu_wire::OP_HEADER_LEN as HEADER_LEN;
+/// Shared serializer op-header length from `reims-vgpu-wire`.
+use reims_vgpu_wire::OP_HEADER_LEN;
 pub const SIZE3_SIZE: usize = 24;
 
 /// Residency on the compute rail, and the one pair here with no selector
@@ -44,65 +28,24 @@ pub const SIZE3_SIZE: usize = 24;
 /// capture.
 pub const OP_USE_HEAPS: u32 = 0x86;
 pub const OP_USE_RESOURCES: u32 = 0x87;
-pub const OP_DISPATCH_THREADGROUPS: u32 = wire::OPCODE_DISPATCH_THREADGROUPS;
-pub const OP_DISPATCH_THREADGROUPS_INDIRECT: u32 = wire::OPCODE_DISPATCH_THREADGROUPS_INDIRECT;
-pub const OP_DISPATCH_THREADS: u32 = wire::OPCODE_DISPATCH_THREADS;
-pub const OP_SET_BUFFERS: u32 = wire::OPCODE_SET_BUFFER;
-pub const OP_SET_SAMPLERS: u32 = wire::OPCODE_SET_SAMPLER;
-pub const OP_SET_SAMPLERS_LOD: u32 = wire::OPCODE_SET_SAMPLER_LOD;
-pub const OP_SET_TEXTURES: u32 = wire::OPCODE_SET_TEXTURE;
-pub const OP_SET_BUFFER_OFFSET: u32 = wire::OPCODE_SET_BUFFER_OFFSET;
-pub const OP_SET_PIPELINE: u32 = wire::OPCODE_SET_PIPELINE_STATE;
-pub const OP_SET_STAGE_IN_REGION: u32 = wire::OPCODE_SET_STAGE_IN_REGION;
-pub const OP_SET_STAGE_IN_REGION_INDIRECT: u32 = wire::OPCODE_SET_STAGE_IN_REGION_INDIRECT;
-pub const OP_SET_THREADGROUP_MEMORY_LENGTH: u32 = wire::OPCODE_SET_THREADGROUP_MEMORY_LENGTH;
-pub const OP_UPDATE_FENCE: u32 = wire::OPCODE_UPDATE_FENCE;
-pub const OP_WAIT_FENCE: u32 = wire::OPCODE_WAIT_FOR_FENCE;
-pub const OP_BARRIER_RESOURCES: u32 = wire::OPCODE_MEMORY_BARRIER_RESOURCES;
-pub const OP_BARRIER_SCOPE: u32 = wire::OPCODE_MEMORY_BARRIER_SCOPE;
-pub const OP_SET_IMAGEBLOCK_DIMENSIONS: u32 = wire::OPCODE_SET_IMAGEBLOCK_SIZE;
-pub const OP_SET_BUFFERS_ATTRIBUTE_STRIDE: u32 = wire::OPCODE_SET_BUFFER_STRIDE;
-pub const OP_SET_BUFFER_OFFSET_ATTRIBUTE_STRIDE: u32 = wire::OPCODE_SET_BUFFER_OFFSET_STRIDE;
-pub const OP_DISPATCH_TYPE: u32 = wire::OPCODE_WRITE_DESCRIPTOR;
-pub const OP_ENCODE_START_DO_WHILE: u32 = wire::OPCODE_START_DO_WHILE;
-pub const OP_ENCODE_END_DO_WHILE: u32 = wire::OPCODE_END_DO_WHILE;
-pub const OP_ENCODE_START_WHILE: u32 = wire::OPCODE_START_WHILE;
-pub const OP_ENCODE_END_WHILE: u32 = wire::OPCODE_END_WHILE;
-pub const OP_ENCODE_START_IF: u32 = wire::OPCODE_START_IF;
-pub const OP_ENCODE_START_ELSE: u32 = wire::OPCODE_START_ELSE;
-pub const OP_ENCODE_END_IF: u32 = wire::OPCODE_END_IF;
-pub const OP_INSERT_COMPRESSED_TEXTURE_FLUSH: u32 = wire::OPCODE_INSERT_COMPRESSED_TEXTURE_FLUSH;
-pub const OP_EXECUTE_COMMANDS_IN_BUFFER: u32 = wire::OPCODE_EXECUTE_COMMANDS_RANGE;
-pub const OP_EXECUTE_COMMANDS_IN_BUFFER_INDIRECT: u32 = wire::OPCODE_EXECUTE_COMMANDS_INDIRECT;
-pub const OP_DISPATCH_THREADS_INDIRECT: u32 = wire::OPCODE_DISPATCH_THREADS_INDIRECT;
 
 pub const REJECTED_85: u32 = 0x85;
 pub const REJECTED_88: u32 = 0x88;
 pub const REJECTED_C7: u32 = 0xc7;
 
-const COUNT_BASE: usize = HEADER_LEN + 4;
-const BIND_BASE: usize = HEADER_LEN + 8;
+const COUNT_BASE: usize = OP_HEADER_LEN + 4;
+const BIND_BASE: usize = OP_HEADER_LEN + 8;
 const REF_SIZE: usize = 4;
 const BUF_ENTRY: usize = 12;
 const BUF_STRIDE_ENTRY: usize = 20;
 const SAMPLER_LOD_ENTRY: usize = 12;
-const BUF_OFF_LEN: usize = wire::SET_BUFFER_OFFSET_TOTAL_LEN as usize;
-const BUF_OFF_STRIDE_LEN: usize = wire::SET_BUFFER_OFFSET_STRIDE_TOTAL_LEN as usize;
 /// Header plus two `Size3`, and taken from the crate that pins it.
 const DISPATCH_DIRECT_LEN: usize = wire::DISPATCH_TOTAL_LEN as usize;
 /// Header, one `Size3`, a `u64` offset and a `u32` ref.
-const DISPATCH_INDIRECT_LEN: usize = wire::DISPATCH_THREADGROUPS_INDIRECT_TOTAL_LEN as usize;
 /// Header, a `u64` offset and a `u32` ref — no threadgroup size, unlike its
 /// threadgroup-granular sibling. Taken from the crate that pins it.
-const DISPATCH_THREADS_INDIRECT_LEN: usize = wire::DISPATCH_THREADS_INDIRECT_TOTAL_LEN as usize;
 /// Header plus two `Size3` — the region's size and its origin.
-const STAGE_IN_LEN: usize = wire::SET_STAGE_IN_REGION_TOTAL_LEN as usize;
-const STAGE_IN_INDIRECT_LEN: usize = wire::SET_STAGE_IN_REGION_INDIRECT_TOTAL_LEN as usize;
-const TG_MEM_LEN: usize = wire::SET_THREADGROUP_MEMORY_LENGTH_TOTAL_LEN as usize;
-const FENCE_LEN: usize = wire::FENCE_TOTAL_LEN as usize;
 const BARRIER_SCOPE_LEN: usize = wire::MEMORY_BARRIER_SCOPE_TOTAL_LEN as usize;
-const IMAGEBLOCK_LEN: usize = wire::SET_IMAGEBLOCK_SIZE_TOTAL_LEN as usize;
-const DISPATCH_TYPE_LEN: usize = wire::WRITE_DESCRIPTOR_TOTAL_LEN as usize;
 /// The condition record's length, from the crate that derived it.
 ///
 /// Was `0x1c` written here. It is the same number, and that is the point: the
@@ -111,7 +54,6 @@ const DISPATCH_TYPE_LEN: usize = wire::WRITE_DESCRIPTOR_TOTAL_LEN as usize;
 /// seven control-flow selectors as emitting nothing at all.
 const CONDITION_LEN: usize = wire::CONTROL_FLOW_PREDICATE_TOTAL_LEN as usize;
 const EXECUTE_LEN: usize = wire::EXECUTE_COMMANDS_RANGE_TOTAL_LEN as usize;
-const EXECUTE_INDIRECT_LEN: usize = wire::EXECUTE_COMMANDS_INDIRECT_TOTAL_LEN as usize;
 /// A control-flow marker is the header alone; the crate that derived the
 /// predicate form derived this one beside it.
 ///
@@ -278,37 +220,37 @@ pub fn opcode_supported(opcode: u32) -> bool {
         opcode,
         OP_USE_HEAPS
             | OP_USE_RESOURCES
-            | OP_DISPATCH_THREADGROUPS
-            | OP_DISPATCH_THREADGROUPS_INDIRECT
-            | OP_DISPATCH_THREADS
-            | OP_SET_BUFFERS
-            | OP_SET_SAMPLERS
-            | OP_SET_SAMPLERS_LOD
-            | OP_SET_TEXTURES
-            | OP_SET_BUFFER_OFFSET
-            | OP_SET_PIPELINE
-            | OP_SET_STAGE_IN_REGION
-            | OP_SET_STAGE_IN_REGION_INDIRECT
-            | OP_SET_THREADGROUP_MEMORY_LENGTH
-            | OP_UPDATE_FENCE
-            | OP_WAIT_FENCE
-            | OP_BARRIER_RESOURCES
-            | OP_BARRIER_SCOPE
-            | OP_SET_IMAGEBLOCK_DIMENSIONS
-            | OP_SET_BUFFERS_ATTRIBUTE_STRIDE
-            | OP_SET_BUFFER_OFFSET_ATTRIBUTE_STRIDE
-            | OP_DISPATCH_TYPE
-            | OP_ENCODE_START_DO_WHILE
-            | OP_ENCODE_END_DO_WHILE
-            | OP_ENCODE_START_WHILE
-            | OP_ENCODE_END_WHILE
-            | OP_ENCODE_START_IF
-            | OP_ENCODE_START_ELSE
-            | OP_ENCODE_END_IF
-            | OP_INSERT_COMPRESSED_TEXTURE_FLUSH
-            | OP_EXECUTE_COMMANDS_IN_BUFFER
-            | OP_EXECUTE_COMMANDS_IN_BUFFER_INDIRECT
-            | OP_DISPATCH_THREADS_INDIRECT
+            | wire::OPCODE_DISPATCH_THREADGROUPS
+            | wire::OPCODE_DISPATCH_THREADGROUPS_INDIRECT
+            | wire::OPCODE_DISPATCH_THREADS
+            | wire::OPCODE_SET_BUFFER
+            | wire::OPCODE_SET_SAMPLER
+            | wire::OPCODE_SET_SAMPLER_LOD
+            | wire::OPCODE_SET_TEXTURE
+            | wire::OPCODE_SET_BUFFER_OFFSET
+            | wire::OPCODE_SET_PIPELINE_STATE
+            | wire::OPCODE_SET_STAGE_IN_REGION
+            | wire::OPCODE_SET_STAGE_IN_REGION_INDIRECT
+            | wire::OPCODE_SET_THREADGROUP_MEMORY_LENGTH
+            | wire::OPCODE_UPDATE_FENCE
+            | wire::OPCODE_WAIT_FOR_FENCE
+            | wire::OPCODE_MEMORY_BARRIER_RESOURCES
+            | wire::OPCODE_MEMORY_BARRIER_SCOPE
+            | wire::OPCODE_SET_IMAGEBLOCK_SIZE
+            | wire::OPCODE_SET_BUFFER_STRIDE
+            | wire::OPCODE_SET_BUFFER_OFFSET_STRIDE
+            | wire::OPCODE_WRITE_DESCRIPTOR
+            | wire::OPCODE_START_DO_WHILE
+            | wire::OPCODE_END_DO_WHILE
+            | wire::OPCODE_START_WHILE
+            | wire::OPCODE_END_WHILE
+            | wire::OPCODE_START_IF
+            | wire::OPCODE_START_ELSE
+            | wire::OPCODE_END_IF
+            | wire::OPCODE_INSERT_COMPRESSED_TEXTURE_FLUSH
+            | wire::OPCODE_EXECUTE_COMMANDS_RANGE
+            | wire::OPCODE_EXECUTE_COMMANDS_INDIRECT
+            | wire::OPCODE_DISPATCH_THREADS_INDIRECT
     )
 }
 
@@ -323,14 +265,6 @@ pub fn opcode_confidence(opcode: u32) -> OpcodeConfidence {
         OpcodeConfidence::AppleRejected
     } else {
         OpcodeConfidence::Unknown
-    }
-}
-
-fn decode_size3(p: &[u8]) -> Size3 {
-    Size3 {
-        x: ld64(&p[0..]),
-        y: ld64(&p[8..]),
-        z: ld64(&p[16..]),
     }
 }
 
@@ -383,32 +317,33 @@ fn var_len(cmd_len: usize, base: usize, count: u32, stride: usize) -> bool {
 }
 
 /// Transactional compute command decode.
+///
+/// Framing and covered layouts come from [`reims_vgpu_wire`]: [`reims_vgpu_wire::op`]
+/// for the shared header and the parsers in [`reims_vgpu_wire::ops::compute`] for
+/// each payload this encoder owns. Local residency opcodes (`OP_USE_HEAPS` /
+/// `OP_USE_RESOURCES`) have no wire export and stay hand-read.
 pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
-    if command.len() < HEADER_LEN {
-        return Err(DecodeStatus::ErrShort);
-    }
-    let opcode = ld32(&command[0..]);
-    let command_length = ld32(&command[4..]) as usize;
+    let op = reims_vgpu_wire::op(command, 0).map_err(|_| DecodeStatus::ErrShort)?;
+    let opcode = op.opcode();
+    let command_length = op.length() as usize;
     let confidence = opcode_confidence(opcode);
-    if command_length < HEADER_LEN || command_length > command.len() {
-        return Err(DecodeStatus::ErrShort);
-    }
     if confidence == OpcodeConfidence::Unknown {
         return Err(DecodeStatus::ErrUnknownOpcode);
     }
     if !opcode_supported(opcode) {
         return Err(DecodeStatus::ErrUnsupportedOpcode);
     }
-    let payload = &command[HEADER_LEN..command_length];
+    let payload = op.payload;
     let mut out = Command {
         opcode,
-        command_length: command_length as u32,
+        command_length: op.length(),
         confidence,
         ..Default::default()
     };
 
     match opcode {
         OP_USE_HEAPS => {
+            // No wire export: Apple's compute serializer has no useHeaps: selector.
             if command_length < COUNT_BASE {
                 return Err(DecodeStatus::ErrShort);
             }
@@ -426,6 +361,7 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             Ok(out)
         }
         OP_USE_RESOURCES => {
+            // No wire export: same gap as OP_USE_HEAPS.
             if command_length < BIND_BASE {
                 return Err(DecodeStatus::ErrShort);
             }
@@ -443,79 +379,71 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             }
             Ok(out)
         }
-        OP_SET_PIPELINE => {
-            if command_length != PIPELINE_LEN {
+        wire::OPCODE_SET_PIPELINE_STATE => {
+            if command_length != wire::SET_PIPELINE_STATE_TOTAL_LEN as usize {
                 return Err(DecodeStatus::ErrShort);
             }
+            let r = wire::set_pipeline_state(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::Pipeline;
-            out.pipeline_ref = ld32(payload);
+            out.pipeline_ref = r.object_ref.get();
             Ok(out)
         }
-        OP_SET_BUFFERS => {
-            if command_length < BIND_BASE {
-                return Err(DecodeStatus::ErrShort);
-            }
-            let count = ld32(&payload[4..]);
-            if !var_len(command_length, BIND_BASE, count, BUF_ENTRY) {
+        wire::OPCODE_SET_BUFFER => {
+            let (head, entries) = wire::buffer_binds(&op).map_err(|_| DecodeStatus::ErrShort)?;
+            if !var_len(command_length, BIND_BASE, head.count.get(), BUF_ENTRY) {
                 return Err(DecodeStatus::ErrShort);
             }
             out.kind = Kind::BufferBind;
-            out.first = ld32(&payload[0..]);
-            out.count = count;
-            for i in 0..count as usize {
-                let e = &payload[8 + i * BUF_ENTRY..];
+            out.first = head.first.get();
+            out.count = head.count.get();
+            for e in entries {
                 out.buffers.push(BufferBinding {
-                    ref_: ld32(&e[0..]),
-                    offset: ld64(&e[4..]),
+                    ref_: e.buffer_ref.get(),
+                    offset: e.offset.get(),
                     ..Default::default()
                 });
             }
             Ok(out)
         }
-        OP_SET_BUFFERS_ATTRIBUTE_STRIDE => {
-            if command_length < BIND_BASE {
-                return Err(DecodeStatus::ErrShort);
-            }
-            let count = ld32(&payload[4..]);
-            if !var_len(command_length, BIND_BASE, count, BUF_STRIDE_ENTRY) {
+        wire::OPCODE_SET_BUFFER_STRIDE => {
+            let (head, entries) =
+                wire::buffer_stride_binds(&op).map_err(|_| DecodeStatus::ErrShort)?;
+            if !var_len(
+                command_length,
+                BIND_BASE,
+                head.count.get(),
+                BUF_STRIDE_ENTRY,
+            ) {
                 return Err(DecodeStatus::ErrShort);
             }
             out.kind = Kind::BufferBindAttributeStride;
-            out.first = ld32(&payload[0..]);
-            out.count = count;
-            for i in 0..count as usize {
-                let e = &payload[8 + i * BUF_STRIDE_ENTRY..];
+            out.first = head.first.get();
+            out.count = head.count.get();
+            for e in entries {
                 out.buffers.push(BufferBinding {
-                    ref_: ld32(&e[0..]),
-                    offset: ld64(&e[4..]),
-                    attribute_stride: ld64(&e[12..]),
+                    ref_: e.buffer_ref.get(),
+                    offset: e.offset.get(),
+                    attribute_stride: e.attribute_stride.get(),
                     has_attribute_stride: true,
                 });
             }
             Ok(out)
         }
-        OP_SET_SAMPLERS | OP_SET_TEXTURES => {
-            // One record — [first:u32][count:u32][ ref:u32 × count ] — landing in
-            // whichever binding list the opcode names. Sampler entries carry LOD
-            // clamps this form does not set (`OP_SET_SAMPLERS_LOD` is the form
-            // that does), so they take their defaults.
-            if command_length < BIND_BASE {
+        wire::OPCODE_SET_SAMPLER | wire::OPCODE_SET_TEXTURE => {
+            let (head, entries) = wire::ref_binds(&op).map_err(|_| DecodeStatus::ErrShort)?;
+            if !var_len(command_length, BIND_BASE, head.count.get(), REF_SIZE) {
                 return Err(DecodeStatus::ErrShort);
             }
-            let count = ld32(&payload[4..]);
-            if !var_len(command_length, BIND_BASE, count, REF_SIZE) {
-                return Err(DecodeStatus::ErrShort);
-            }
-            let samplers = opcode == OP_SET_SAMPLERS;
+            let samplers = opcode == wire::OPCODE_SET_SAMPLER;
             out.kind = if samplers {
                 Kind::SamplerBind
             } else {
                 Kind::TextureBind
             };
-            out.first = ld32(&payload[0..]);
-            out.count = count;
-            for i in 0..count as usize {
-                let ref_ = ld32(&payload[8 + i * REF_SIZE..]);
+            out.first = head.first.get();
+            out.count = head.count.get();
+            for e in entries {
+                let ref_ = e.object_ref.get();
                 if samplers {
                     out.samplers.push(SamplerBinding {
                         ref_,
@@ -527,251 +455,245 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             }
             Ok(out)
         }
-        OP_SET_SAMPLERS_LOD => {
-            if command_length < BIND_BASE {
-                return Err(DecodeStatus::ErrShort);
-            }
-            let count = ld32(&payload[4..]);
-            if !var_len(command_length, BIND_BASE, count, SAMPLER_LOD_ENTRY) {
+        wire::OPCODE_SET_SAMPLER_LOD => {
+            let (head, entries) =
+                wire::sampler_lod_binds(&op).map_err(|_| DecodeStatus::ErrShort)?;
+            if !var_len(
+                command_length,
+                BIND_BASE,
+                head.count.get(),
+                SAMPLER_LOD_ENTRY,
+            ) {
                 return Err(DecodeStatus::ErrShort);
             }
             out.kind = Kind::SamplerLod;
-            out.first = ld32(&payload[0..]);
-            out.count = count;
-            for i in 0..count as usize {
-                let e = &payload[8 + i * SAMPLER_LOD_ENTRY..];
+            out.first = head.first.get();
+            out.count = head.count.get();
+            for e in entries {
                 out.samplers.push(SamplerBinding {
-                    ref_: ld32(&e[0..]),
-                    lod_min_bits: ld32(&e[4..]),
-                    lod_max_bits: ld32(&e[8..]),
+                    ref_: e.sampler_ref.get(),
+                    lod_min_bits: e.lod_min_clamp.get().to_bits(),
+                    lod_max_bits: e.lod_max_clamp.get().to_bits(),
                     has_lod_clamp: true,
                 });
             }
             Ok(out)
         }
-        OP_SET_BUFFER_OFFSET => {
-            if command_length != BUF_OFF_LEN {
+        wire::OPCODE_SET_BUFFER_OFFSET => {
+            if command_length != wire::SET_BUFFER_OFFSET_TOTAL_LEN as usize {
                 return Err(DecodeStatus::ErrShort);
             }
+            let b = wire::set_buffer_offset(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::BufferOffset;
-            out.first = ld32(&payload[0..]);
-            out.buffer_offset = ld64(&payload[4..]);
+            out.first = b.index.get();
+            out.buffer_offset = b.offset.get();
             Ok(out)
         }
-        OP_SET_BUFFER_OFFSET_ATTRIBUTE_STRIDE => {
-            if command_length != BUF_OFF_STRIDE_LEN {
+        wire::OPCODE_SET_BUFFER_OFFSET_STRIDE => {
+            if command_length != wire::SET_BUFFER_OFFSET_STRIDE_TOTAL_LEN as usize {
                 return Err(DecodeStatus::ErrShort);
             }
+            let b = wire::buffer_offset_stride(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::BufferOffsetAttributeStride;
-            out.first = ld32(&payload[0..]);
-            out.buffer_offset = ld64(&payload[4..]);
-            out.attribute_stride = ld64(&payload[12..]);
+            out.first = b.index.get();
+            out.buffer_offset = b.offset.get();
+            out.attribute_stride = b.attribute_stride.get();
             Ok(out)
         }
-        OP_DISPATCH_THREADGROUPS | OP_DISPATCH_THREADS => {
-            if command_length != DISPATCH_DIRECT_LEN {
+        wire::OPCODE_DISPATCH_THREADGROUPS | wire::OPCODE_DISPATCH_THREADS => {
+            if command_length != wire::DISPATCH_TOTAL_LEN as usize {
                 return Err(DecodeStatus::ErrShort);
             }
-            out.kind = if opcode == OP_DISPATCH_THREADGROUPS {
+            let d = wire::dispatch(&op).map_err(|_| DecodeStatus::ErrShort)?;
+            out.kind = if opcode == wire::OPCODE_DISPATCH_THREADGROUPS {
                 Kind::DispatchThreadgroups
             } else {
                 Kind::DispatchThreads
             };
-            out.grid = decode_size3(&payload[0..]);
-            out.threads_per_threadgroup = decode_size3(&payload[SIZE3_SIZE..]);
+            out.grid = Size3 {
+                x: d.groups_width.get(),
+                y: d.groups_height.get(),
+                z: d.groups_depth.get(),
+            };
+            out.threads_per_threadgroup = Size3 {
+                x: d.threads_width.get(),
+                y: d.threads_height.get(),
+                z: d.threads_depth.get(),
+            };
             Ok(out)
         }
-        OP_DISPATCH_THREADGROUPS_INDIRECT => {
-            if command_length != DISPATCH_INDIRECT_LEN {
+        wire::OPCODE_DISPATCH_THREADGROUPS_INDIRECT => {
+            if command_length != wire::DISPATCH_THREADGROUPS_INDIRECT_TOTAL_LEN as usize {
                 return Err(DecodeStatus::ErrShort);
             }
+            let d = wire::dispatch_indirect(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::DispatchThreadgroupsIndirect;
-            out.threads_per_threadgroup = decode_size3(&payload[0..]);
-            out.indirect_buffer_offset = ld64(&payload[SIZE3_SIZE..]);
-            out.indirect_buffer_ref = ld32(&payload[SIZE3_SIZE + 8..]);
+            out.threads_per_threadgroup = Size3 {
+                x: d.threads_width.get(),
+                y: d.threads_height.get(),
+                z: d.threads_depth.get(),
+            };
+            out.indirect_buffer_offset = d.indirect_buffer_offset.get();
+            out.indirect_buffer_ref = d.indirect_buffer_ref.get();
             Ok(out)
         }
-        OP_DISPATCH_THREADS_INDIRECT => {
-            if command_length != DISPATCH_THREADS_INDIRECT_LEN {
+        wire::OPCODE_DISPATCH_THREADS_INDIRECT => {
+            if command_length != wire::DISPATCH_THREADS_INDIRECT_TOTAL_LEN as usize {
                 return Err(DecodeStatus::ErrShort);
             }
-            // These offsets were ported with no derivation recorded and nothing
-            // could confirm them: the selector asserts at the default capability
-            // state, so no capture reached it. Driven under
-            // `-setSupportsDispatchThreadsIndirect:` they are right, and reading
-            // the derived view is what keeps them one declaration rather than
-            // two that happen to agree.
-            let d = wire_view::<wire::DispatchThreadsIndirect>(payload)?;
+            let d = wire::dispatch_threads_indirect(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::DispatchThreadsIndirect;
             out.indirect_buffer_offset = d.indirect_buffer_offset.get();
             out.indirect_buffer_ref = d.indirect_buffer_ref.get();
             Ok(out)
         }
-        OP_SET_STAGE_IN_REGION => {
-            if command_length != STAGE_IN_LEN {
+        wire::OPCODE_SET_STAGE_IN_REGION => {
+            if command_length != wire::SET_STAGE_IN_REGION_TOTAL_LEN as usize {
                 return Err(DecodeStatus::ErrShort);
             }
+            let r = wire::set_stage_in_region(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::StageInRegion;
-            out.stage_in_region.size = decode_size3(&payload[0..]);
-            out.stage_in_region.origin = decode_size3(&payload[SIZE3_SIZE..]);
+            out.stage_in_region.size = Size3 {
+                x: r.size_width.get(),
+                y: r.size_height.get(),
+                z: r.size_depth.get(),
+            };
+            out.stage_in_region.origin = Size3 {
+                x: r.origin_x.get(),
+                y: r.origin_y.get(),
+                z: r.origin_z.get(),
+            };
             Ok(out)
         }
-        OP_SET_STAGE_IN_REGION_INDIRECT => {
-            if command_length != STAGE_IN_INDIRECT_LEN {
+        wire::OPCODE_SET_STAGE_IN_REGION_INDIRECT => {
+            if command_length != wire::SET_STAGE_IN_REGION_INDIRECT_TOTAL_LEN as usize {
                 return Err(DecodeStatus::ErrShort);
             }
+            let r = wire::set_stage_in_region_indirect(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::StageInRegionIndirect;
-            out.stage_in_indirect_buffer_ref = ld32(&payload[0..]);
-            out.stage_in_indirect_buffer_offset = ld64(&payload[4..]);
+            out.stage_in_indirect_buffer_ref = r.indirect_buffer_ref.get();
+            out.stage_in_indirect_buffer_offset = r.indirect_buffer_offset.get();
             Ok(out)
         }
-        OP_SET_THREADGROUP_MEMORY_LENGTH => {
-            if command_length != TG_MEM_LEN {
+        wire::OPCODE_SET_THREADGROUP_MEMORY_LENGTH => {
+            if command_length != wire::SET_THREADGROUP_MEMORY_LENGTH_TOTAL_LEN as usize {
                 return Err(DecodeStatus::ErrShort);
             }
+            let t = wire::set_threadgroup_memory_length(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::ThreadgroupMemory;
-            out.threadgroup_memory_length = ld64(&payload[0..]);
-            out.threadgroup_memory_index = ld32(&payload[8..]);
+            out.threadgroup_memory_length = t.length.get();
+            out.threadgroup_memory_index = t.index.get();
             Ok(out)
         }
-        OP_UPDATE_FENCE | OP_WAIT_FENCE => {
-            if command_length != FENCE_LEN {
+        wire::OPCODE_UPDATE_FENCE | wire::OPCODE_WAIT_FOR_FENCE => {
+            if command_length != wire::FENCE_TOTAL_LEN as usize {
                 return Err(DecodeStatus::ErrShort);
             }
-            out.kind = if opcode == OP_UPDATE_FENCE {
+            let r = wire::fence(&op).map_err(|_| DecodeStatus::ErrShort)?;
+            out.kind = if opcode == wire::OPCODE_UPDATE_FENCE {
                 Kind::UpdateFence
             } else {
                 Kind::WaitFence
             };
-            out.fence_ref = ld32(payload);
+            out.fence_ref = r.object_ref.get();
             Ok(out)
         }
-        OP_BARRIER_RESOURCES => {
-            // `memoryBarrierWithResources:count:` is count-led with the refs
-            // immediately after, at [`COUNT_BASE`]. This arm used to start at
-            // [`BIND_BASE`], four bytes further on, and so demanded a record
-            // four bytes longer than the serializer writes -- which refused
-            // *every* compute resource barrier with `ErrShort` before any
-            // executor saw one. The four bytes it read as a usage mask were the
-            // first resource's ref: the compute selector takes no stage masks
-            // where the render encoder's does, and the record is shorter rather
-            // than zero-filled. Fixture `compute_memory_barrier_resources` in
-            // `reims-vgpu-wire`.
-            if command_length < COUNT_BASE {
-                return Err(DecodeStatus::ErrShort);
-            }
-            let count = ld32(&payload[0..]);
-            if !var_len(command_length, COUNT_BASE, count, REF_SIZE) {
+        wire::OPCODE_MEMORY_BARRIER_RESOURCES => {
+            let (head, refs) =
+                wire::memory_barrier_resources(&op).map_err(|_| DecodeStatus::ErrShort)?;
+            if !var_len(command_length, COUNT_BASE, head.count.get(), REF_SIZE) {
                 return Err(DecodeStatus::ErrShort);
             }
             out.kind = Kind::BarrierResources;
-            out.count = count;
-            for i in 0..count as usize {
+            out.count = head.count.get();
+            for r in refs {
                 out.resources.push(RefBinding {
-                    ref_: ld32(&payload[4 + i * REF_SIZE..]),
+                    ref_: r.object_ref.get(),
                 });
             }
             Ok(out)
         }
-        OP_BARRIER_SCOPE => {
-            // Two bytes of the four-byte payload are written and two are not:
-            // `compute_memory_barrier_scope` came back `04 00 AA AA` against
-            // the oracle's poison. On a real wire those two hold whatever the
-            // guest's ring last contained, so they belong to no field -- this
-            // arm used to lift them into `barrier_scope_reserved`, which was a
-            // decoder reading noise. The render encoder's scope barrier fills
-            // all four, because it has two stage masks to put there.
-            if command_length != BARRIER_SCOPE_LEN {
+        wire::OPCODE_MEMORY_BARRIER_SCOPE => {
+            if command_length != wire::MEMORY_BARRIER_SCOPE_TOTAL_LEN as usize {
                 return Err(DecodeStatus::ErrShort);
             }
+            let s = wire::memory_barrier_scope(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::BarrierScope;
-            out.barrier_scope = ld16(&payload[0..]);
+            out.barrier_scope = s.scope.get();
             Ok(out)
         }
-        OP_SET_IMAGEBLOCK_DIMENSIONS => {
-            if command_length != IMAGEBLOCK_LEN {
+        wire::OPCODE_SET_IMAGEBLOCK_SIZE => {
+            if command_length != wire::SET_IMAGEBLOCK_SIZE_TOTAL_LEN as usize {
                 return Err(DecodeStatus::ErrShort);
             }
+            let s = wire::set_imageblock_size(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::ImageblockDimensions;
-            out.imageblock_width = ld32(&payload[0..]);
-            out.imageblock_height = ld32(&payload[4..]);
+            out.imageblock_width = s.width.get();
+            out.imageblock_height = s.height.get();
             Ok(out)
         }
-        OP_DISPATCH_TYPE => {
-            if command_length != DISPATCH_TYPE_LEN {
+        wire::OPCODE_WRITE_DESCRIPTOR => {
+            if command_length != wire::WRITE_DESCRIPTOR_TOTAL_LEN as usize {
                 return Err(DecodeStatus::ErrShort);
             }
+            let d = wire::write_descriptor(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::DispatchType;
-            out.dispatch_type = ld32(payload);
+            out.dispatch_type = d.dispatch_type.get();
             Ok(out)
         }
-        // Condition payloads live on start-while / start-if / *end*-do-while;
-        // start-do-while is empty and its condition is on the record that ends
-        // the loop, which is the one asymmetry in the seven.
-        //
-        // The layout came from a ported header with no derivation recorded, and
-        // `compute_ctrl_seen` has never fired on a driven boot — so for a long
-        // time nothing said whether it was right. It now reads Apple's own
-        // struct: `-setSupportsCommandBufferJump:` gates these selectors, all
-        // seven were being captured with it off and so looked like records the
-        // serializer never writes, and driving them showed this arm had every
-        // offset and every width correct. Reading the view rather than
-        // restating the offsets is what keeps that true — one declaration,
-        // pinned by a fixture, instead of two that agree today.
-        OP_ENCODE_START_WHILE | OP_ENCODE_START_IF | OP_ENCODE_END_DO_WHILE => {
-            if command_length != CONDITION_LEN {
+        wire::OPCODE_START_WHILE | wire::OPCODE_START_IF | wire::OPCODE_END_DO_WHILE => {
+            if command_length != wire::CONTROL_FLOW_PREDICATE_TOTAL_LEN as usize {
                 return Err(DecodeStatus::ErrShort);
             }
-            let p = wire_view::<wire::ControlFlowPredicate>(payload)?;
+            let p = wire::control_flow_predicate(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = match opcode {
-                OP_ENCODE_START_WHILE => Kind::ControlStartWhile,
-                OP_ENCODE_START_IF => Kind::ControlStartIf,
+                wire::OPCODE_START_WHILE => Kind::ControlStartWhile,
+                wire::OPCODE_START_IF => Kind::ControlStartIf,
                 _ => Kind::ControlEndDoWhile,
             };
             out.condition_buffer_ref = p.buffer_ref.get();
             out.condition_buffer_offset = p.offset.get();
-            // `comparison` is declared `Q` on all three selectors and reaches
-            // the wire as a `u32`. The record's length settles it: 8 + 4 + 8 +
-            // 4 + 4 is exactly 28, with no room for a second `u64`.
             out.condition_comparison = p.comparison.get();
             out.condition_reference_value = p.reference_value.get();
             Ok(out)
         }
-        OP_ENCODE_START_DO_WHILE
-        | OP_ENCODE_END_WHILE
-        | OP_ENCODE_START_ELSE
-        | OP_ENCODE_END_IF
-        | OP_INSERT_COMPRESSED_TEXTURE_FLUSH => {
+        wire::OPCODE_START_DO_WHILE
+        | wire::OPCODE_END_WHILE
+        | wire::OPCODE_START_ELSE
+        | wire::OPCODE_END_IF
+        | wire::OPCODE_INSERT_COMPRESSED_TEXTURE_FLUSH => {
             if command_length != EMPTY_LEN {
                 return Err(DecodeStatus::ErrShort);
             }
             out.kind = match opcode {
-                OP_ENCODE_START_DO_WHILE => Kind::ControlStartDoWhile,
-                OP_ENCODE_END_WHILE => Kind::ControlEndWhile,
-                OP_ENCODE_START_ELSE => Kind::ControlStartElse,
-                OP_ENCODE_END_IF => Kind::ControlEndIf,
+                wire::OPCODE_START_DO_WHILE => Kind::ControlStartDoWhile,
+                wire::OPCODE_END_WHILE => Kind::ControlEndWhile,
+                wire::OPCODE_START_ELSE => Kind::ControlStartElse,
+                wire::OPCODE_END_IF => Kind::ControlEndIf,
                 _ => Kind::CompressedTextureFlush,
             };
             Ok(out)
         }
-        OP_EXECUTE_COMMANDS_IN_BUFFER => {
-            if command_length != EXECUTE_LEN {
+        wire::OPCODE_EXECUTE_COMMANDS_RANGE => {
+            if command_length != wire::EXECUTE_COMMANDS_RANGE_TOTAL_LEN as usize {
                 return Err(DecodeStatus::ErrShort);
             }
+            let e = wire::execute_commands_range(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::ExecuteCommandsInBuffer;
-            out.indirect_command_buffer_ref = ld32(&payload[0..]);
-            out.indirect_command_range_location = ld64(&payload[4..]);
-            out.indirect_command_range_length = ld64(&payload[12..]);
+            out.indirect_command_buffer_ref = e.icb_ref.get();
+            out.indirect_command_range_location = e.range_location.get();
+            out.indirect_command_range_length = e.range_length.get();
             Ok(out)
         }
-        OP_EXECUTE_COMMANDS_IN_BUFFER_INDIRECT => {
-            if command_length != EXECUTE_INDIRECT_LEN {
+        wire::OPCODE_EXECUTE_COMMANDS_INDIRECT => {
+            if command_length != wire::EXECUTE_COMMANDS_INDIRECT_TOTAL_LEN as usize {
                 return Err(DecodeStatus::ErrShort);
             }
+            let e = wire::execute_commands_indirect(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::ExecuteCommandsInBufferIndirect;
-            out.indirect_command_buffer_ref = ld32(&payload[0..]);
-            out.indirect_command_arguments_buffer_ref = ld32(&payload[4..]);
-            out.indirect_command_arguments_buffer_offset = ld64(&payload[8..]);
+            out.indirect_command_buffer_ref = e.icb_ref.get();
+            out.indirect_command_arguments_buffer_ref = e.indirect_buffer_ref.get();
+            out.indirect_command_arguments_buffer_offset = e.indirect_buffer_offset.get();
             Ok(out)
         }
         _ => Err(DecodeStatus::ErrUnknownOpcode),
@@ -829,7 +751,7 @@ mod tests {
     fn a_bind_larger_than_the_deleted_cap_decodes_every_entry() {
         const COUNT: u32 = 200;
         let len = BIND_BASE + COUNT as usize * REF_SIZE;
-        let mut v = hdr(OP_SET_TEXTURES, len);
+        let mut v = hdr(wire::OPCODE_SET_TEXTURE, len);
         st32(&mut v[8..], 0); // first
         st32(&mut v[12..], COUNT);
         for i in 0..COUNT as usize {
@@ -858,20 +780,20 @@ mod tests {
 
     #[test]
     fn pipeline_and_dispatch() {
-        let mut v = hdr(OP_SET_PIPELINE, PIPELINE_LEN);
+        let mut v = hdr(wire::OPCODE_SET_PIPELINE_STATE, PIPELINE_LEN);
         st32(&mut v[8..], 42);
         let c = decode(&v).unwrap();
         assert_eq!(c.kind, Kind::Pipeline);
         assert_eq!(c.pipeline_ref, 42);
 
-        let v = hdr(OP_DISPATCH_THREADGROUPS, DISPATCH_DIRECT_LEN);
+        let v = hdr(wire::OPCODE_DISPATCH_THREADGROUPS, DISPATCH_DIRECT_LEN);
         let c = decode(&v).unwrap();
         assert_eq!(c.kind, Kind::DispatchThreadgroups);
     }
 
     #[test]
     fn rejected_and_matrix() {
-        assert!(opcode_supported(OP_SET_PIPELINE));
+        assert!(opcode_supported(wire::OPCODE_SET_PIPELINE_STATE));
         assert!(opcode_apple_rejected(REJECTED_85));
         assert_eq!(
             decode(&hdr(REJECTED_85, 16)).unwrap_err(),
@@ -887,7 +809,7 @@ mod tests {
     fn set_buffers() {
         let count = 2u32;
         let len = BIND_BASE + (count as usize) * BUF_ENTRY;
-        let mut v = hdr(OP_SET_BUFFERS, len);
+        let mut v = hdr(wire::OPCODE_SET_BUFFER, len);
         st32(&mut v[8..], 1); // first
         st32(&mut v[12..], count);
         st32(&mut v[16..], 10);
@@ -910,11 +832,11 @@ mod tests {
     #[test]
     fn control_do_while_start_empty_end_condition() {
         // Wire contract: start-do-while is empty; end-do-while carries condition.
-        let v = hdr(OP_ENCODE_START_DO_WHILE, EMPTY_LEN);
+        let v = hdr(wire::OPCODE_START_DO_WHILE, EMPTY_LEN);
         let c = decode(&v).unwrap();
         assert_eq!(c.kind, Kind::ControlStartDoWhile);
 
-        let mut v = hdr(OP_ENCODE_END_DO_WHILE, CONDITION_LEN);
+        let mut v = hdr(wire::OPCODE_END_DO_WHILE, CONDITION_LEN);
         st32(&mut v[8..], 1201); // buffer ref
                                  // offset u64 @ +4 payload = absolute +12
         v[12..20].copy_from_slice(&0x640u64.to_le_bytes());
@@ -928,8 +850,8 @@ mod tests {
         assert_eq!(c.condition_reference_value, 0x1234_5678);
 
         // Swapped lengths must fail closed.
-        assert!(decode(&hdr(OP_ENCODE_START_DO_WHILE, CONDITION_LEN)).is_err());
-        assert!(decode(&hdr(OP_ENCODE_END_DO_WHILE, EMPTY_LEN)).is_err());
+        assert!(decode(&hdr(wire::OPCODE_START_DO_WHILE, CONDITION_LEN)).is_err());
+        assert!(decode(&hdr(wire::OPCODE_END_DO_WHILE, EMPTY_LEN)).is_err());
     }
 
     /// The control-flow layout this device uses is Apple's, field for field.
@@ -953,7 +875,7 @@ mod tests {
 
         assert_eq!(
             CONDITION_LEN,
-            HEADER_LEN + core::mem::size_of::<wire::ControlFlowPredicate>(),
+            OP_HEADER_LEN + core::mem::size_of::<wire::ControlFlowPredicate>(),
             "the condition record is its header plus the derived body"
         );
         assert_eq!(offset_of!(wire::ControlFlowPredicate, buffer_ref), 0);
@@ -965,15 +887,15 @@ mod tests {
         // opcode rather than generalized from one, because the three are
         // separate arms and only the `Kind` is supposed to differ.
         for (op, kind) in [
-            (OP_ENCODE_START_IF, Kind::ControlStartIf),
-            (OP_ENCODE_START_WHILE, Kind::ControlStartWhile),
-            (OP_ENCODE_END_DO_WHILE, Kind::ControlEndDoWhile),
+            (wire::OPCODE_START_IF, Kind::ControlStartIf),
+            (wire::OPCODE_START_WHILE, Kind::ControlStartWhile),
+            (wire::OPCODE_END_DO_WHILE, Kind::ControlEndDoWhile),
         ] {
             let mut v = hdr(op, CONDITION_LEN);
-            st32(&mut v[HEADER_LEN..], 5151);
-            v[HEADER_LEN + 4..HEADER_LEN + 12].copy_from_slice(&0x1111u64.to_le_bytes());
-            st32(&mut v[HEADER_LEN + 12..], 0x22);
-            st32(&mut v[HEADER_LEN + 16..], 0x89ab_cdef);
+            st32(&mut v[OP_HEADER_LEN..], 5151);
+            v[OP_HEADER_LEN + 4..OP_HEADER_LEN + 12].copy_from_slice(&0x1111u64.to_le_bytes());
+            st32(&mut v[OP_HEADER_LEN + 12..], 0x22);
+            st32(&mut v[OP_HEADER_LEN + 16..], 0x89ab_cdef);
             let c = decode(&v).unwrap_or_else(|e| panic!("op {op:#x}: {e:?}"));
             assert_eq!(c.kind, kind);
             assert_eq!(c.condition_buffer_ref, 5151);
@@ -989,22 +911,24 @@ mod tests {
 
     #[test]
     fn control_if_while_and_icb_lengths() {
-        let mut v = hdr(OP_ENCODE_START_IF, CONDITION_LEN);
+        let mut v = hdr(wire::OPCODE_START_IF, CONDITION_LEN);
         st32(&mut v[8..], 7);
         let c = decode(&v).unwrap();
         assert_eq!(c.kind, Kind::ControlStartIf);
         assert_eq!(c.condition_buffer_ref, 7);
 
         assert_eq!(
-            decode(&hdr(OP_ENCODE_START_ELSE, EMPTY_LEN)).unwrap().kind,
+            decode(&hdr(wire::OPCODE_START_ELSE, EMPTY_LEN))
+                .unwrap()
+                .kind,
             Kind::ControlStartElse
         );
         assert_eq!(
-            decode(&hdr(OP_ENCODE_END_IF, EMPTY_LEN)).unwrap().kind,
+            decode(&hdr(wire::OPCODE_END_IF, EMPTY_LEN)).unwrap().kind,
             Kind::ControlEndIf
         );
 
-        let mut v = hdr(OP_EXECUTE_COMMANDS_IN_BUFFER, EXECUTE_LEN);
+        let mut v = hdr(wire::OPCODE_EXECUTE_COMMANDS_RANGE, EXECUTE_LEN);
         st32(&mut v[8..], 1301);
         v[12..20].copy_from_slice(&3u64.to_le_bytes());
         v[20..28].copy_from_slice(&7u64.to_le_bytes());
@@ -1036,11 +960,11 @@ mod tests {
         assert_eq!(apple_len, 20, "the serializer's own record is 20 bytes");
 
         let mut v = vec![0u8; apple_len];
-        st32(&mut v[0..], OP_BARRIER_RESOURCES);
+        st32(&mut v[0..], wire::OPCODE_MEMORY_BARRIER_RESOURCES);
         st32(&mut v[4..], apple_len as u32);
-        st32(&mut v[HEADER_LEN..], COUNT);
-        st32(&mut v[HEADER_LEN + 4..], 5151);
-        st32(&mut v[HEADER_LEN + 8..], 4343);
+        st32(&mut v[OP_HEADER_LEN..], COUNT);
+        st32(&mut v[OP_HEADER_LEN + 4..], 5151);
+        st32(&mut v[OP_HEADER_LEN + 8..], 4343);
 
         let c = decode(&v).expect("the serializer's own record must decode");
         assert_eq!(c.kind, Kind::BarrierResources);
@@ -1056,9 +980,9 @@ mod tests {
         // not be the one that decodes.
         let old_len = BIND_BASE + (COUNT as usize) * REF_SIZE;
         let mut v = vec![0u8; old_len];
-        st32(&mut v[0..], OP_BARRIER_RESOURCES);
+        st32(&mut v[0..], wire::OPCODE_MEMORY_BARRIER_RESOURCES);
         st32(&mut v[4..], old_len as u32);
-        st32(&mut v[HEADER_LEN..], COUNT);
+        st32(&mut v[OP_HEADER_LEN..], COUNT);
         assert_eq!(decode(&v).unwrap_err(), DecodeStatus::ErrShort);
     }
 
@@ -1074,10 +998,10 @@ mod tests {
         use crate::contract::endian::st32;
 
         let mut v = vec![0xAAu8; BARRIER_SCOPE_LEN];
-        st32(&mut v[0..], OP_BARRIER_SCOPE);
+        st32(&mut v[0..], wire::OPCODE_MEMORY_BARRIER_SCOPE);
         st32(&mut v[4..], BARRIER_SCOPE_LEN as u32);
-        v[HEADER_LEN] = 4;
-        v[HEADER_LEN + 1] = 0;
+        v[OP_HEADER_LEN] = 4;
+        v[OP_HEADER_LEN + 1] = 0;
 
         let c = decode(&v).expect("the serializer's own record must decode");
         assert_eq!(c.kind, Kind::BarrierScope);
@@ -1152,61 +1076,91 @@ mod tests {
     #[test]
     fn the_compute_opcode_table_is_apples_compute_manifest_plus_four_named_exceptions() {
         let derived: &[(u32, &str)] = &[
-            (OP_DISPATCH_THREADGROUPS, "OP_DISPATCH_THREADGROUPS"),
             (
-                OP_DISPATCH_THREADGROUPS_INDIRECT,
-                "OP_DISPATCH_THREADGROUPS_INDIRECT",
-            ),
-            (OP_DISPATCH_THREADS, "OP_DISPATCH_THREADS"),
-            (OP_SET_BUFFERS, "OP_SET_BUFFERS"),
-            (OP_SET_SAMPLERS, "OP_SET_SAMPLERS"),
-            (OP_SET_SAMPLERS_LOD, "OP_SET_SAMPLERS_LOD"),
-            (OP_SET_TEXTURES, "OP_SET_TEXTURES"),
-            (OP_SET_BUFFER_OFFSET, "OP_SET_BUFFER_OFFSET"),
-            (OP_SET_PIPELINE, "OP_SET_PIPELINE"),
-            (OP_SET_STAGE_IN_REGION, "OP_SET_STAGE_IN_REGION"),
-            (
-                OP_SET_STAGE_IN_REGION_INDIRECT,
-                "OP_SET_STAGE_IN_REGION_INDIRECT",
+                wire::OPCODE_DISPATCH_THREADGROUPS,
+                "wire::OPCODE_DISPATCH_THREADGROUPS",
             ),
             (
-                OP_SET_THREADGROUP_MEMORY_LENGTH,
-                "OP_SET_THREADGROUP_MEMORY_LENGTH",
-            ),
-            (OP_UPDATE_FENCE, "OP_UPDATE_FENCE"),
-            (OP_WAIT_FENCE, "OP_WAIT_FENCE"),
-            (OP_BARRIER_RESOURCES, "OP_BARRIER_RESOURCES"),
-            (OP_BARRIER_SCOPE, "OP_BARRIER_SCOPE"),
-            (OP_SET_IMAGEBLOCK_DIMENSIONS, "OP_SET_IMAGEBLOCK_DIMENSIONS"),
-            (
-                OP_SET_BUFFERS_ATTRIBUTE_STRIDE,
-                "OP_SET_BUFFERS_ATTRIBUTE_STRIDE",
+                wire::OPCODE_DISPATCH_THREADGROUPS_INDIRECT,
+                "wire::OPCODE_DISPATCH_THREADGROUPS_INDIRECT",
             ),
             (
-                OP_SET_BUFFER_OFFSET_ATTRIBUTE_STRIDE,
-                "OP_SET_BUFFER_OFFSET_ATTRIBUTE_STRIDE",
+                wire::OPCODE_DISPATCH_THREADS,
+                "wire::OPCODE_DISPATCH_THREADS",
             ),
-            (OP_DISPATCH_TYPE, "OP_DISPATCH_TYPE"),
-            (OP_ENCODE_START_DO_WHILE, "OP_ENCODE_START_DO_WHILE"),
-            (OP_ENCODE_END_DO_WHILE, "OP_ENCODE_END_DO_WHILE"),
-            (OP_ENCODE_START_WHILE, "OP_ENCODE_START_WHILE"),
-            (OP_ENCODE_END_WHILE, "OP_ENCODE_END_WHILE"),
-            (OP_ENCODE_START_IF, "OP_ENCODE_START_IF"),
-            (OP_ENCODE_START_ELSE, "OP_ENCODE_START_ELSE"),
-            (OP_ENCODE_END_IF, "OP_ENCODE_END_IF"),
+            (wire::OPCODE_SET_BUFFER, "wire::OPCODE_SET_BUFFER"),
+            (wire::OPCODE_SET_SAMPLER, "wire::OPCODE_SET_SAMPLER"),
+            (wire::OPCODE_SET_SAMPLER_LOD, "wire::OPCODE_SET_SAMPLER_LOD"),
+            (wire::OPCODE_SET_TEXTURE, "wire::OPCODE_SET_TEXTURE"),
             (
-                OP_EXECUTE_COMMANDS_IN_BUFFER,
-                "OP_EXECUTE_COMMANDS_IN_BUFFER",
+                wire::OPCODE_SET_BUFFER_OFFSET,
+                "wire::OPCODE_SET_BUFFER_OFFSET",
             ),
             (
-                OP_EXECUTE_COMMANDS_IN_BUFFER_INDIRECT,
-                "OP_EXECUTE_COMMANDS_IN_BUFFER_INDIRECT",
+                wire::OPCODE_SET_PIPELINE_STATE,
+                "wire::OPCODE_SET_PIPELINE_STATE",
             ),
             (
-                OP_INSERT_COMPRESSED_TEXTURE_FLUSH,
-                "OP_INSERT_COMPRESSED_TEXTURE_FLUSH",
+                wire::OPCODE_SET_STAGE_IN_REGION,
+                "wire::OPCODE_SET_STAGE_IN_REGION",
             ),
-            (OP_DISPATCH_THREADS_INDIRECT, "OP_DISPATCH_THREADS_INDIRECT"),
+            (
+                wire::OPCODE_SET_STAGE_IN_REGION_INDIRECT,
+                "wire::OPCODE_SET_STAGE_IN_REGION_INDIRECT",
+            ),
+            (
+                wire::OPCODE_SET_THREADGROUP_MEMORY_LENGTH,
+                "wire::OPCODE_SET_THREADGROUP_MEMORY_LENGTH",
+            ),
+            (wire::OPCODE_UPDATE_FENCE, "wire::OPCODE_UPDATE_FENCE"),
+            (wire::OPCODE_WAIT_FOR_FENCE, "wire::OPCODE_WAIT_FOR_FENCE"),
+            (
+                wire::OPCODE_MEMORY_BARRIER_RESOURCES,
+                "wire::OPCODE_MEMORY_BARRIER_RESOURCES",
+            ),
+            (
+                wire::OPCODE_MEMORY_BARRIER_SCOPE,
+                "wire::OPCODE_MEMORY_BARRIER_SCOPE",
+            ),
+            (
+                wire::OPCODE_SET_IMAGEBLOCK_SIZE,
+                "wire::OPCODE_SET_IMAGEBLOCK_SIZE",
+            ),
+            (
+                wire::OPCODE_SET_BUFFER_STRIDE,
+                "wire::OPCODE_SET_BUFFER_STRIDE",
+            ),
+            (
+                wire::OPCODE_SET_BUFFER_OFFSET_STRIDE,
+                "wire::OPCODE_SET_BUFFER_OFFSET_STRIDE",
+            ),
+            (
+                wire::OPCODE_WRITE_DESCRIPTOR,
+                "wire::OPCODE_WRITE_DESCRIPTOR",
+            ),
+            (wire::OPCODE_START_DO_WHILE, "wire::OPCODE_START_DO_WHILE"),
+            (wire::OPCODE_END_DO_WHILE, "wire::OPCODE_END_DO_WHILE"),
+            (wire::OPCODE_START_WHILE, "wire::OPCODE_START_WHILE"),
+            (wire::OPCODE_END_WHILE, "wire::OPCODE_END_WHILE"),
+            (wire::OPCODE_START_IF, "wire::OPCODE_START_IF"),
+            (wire::OPCODE_START_ELSE, "wire::OPCODE_START_ELSE"),
+            (wire::OPCODE_END_IF, "wire::OPCODE_END_IF"),
+            (
+                wire::OPCODE_EXECUTE_COMMANDS_RANGE,
+                "wire::OPCODE_EXECUTE_COMMANDS_RANGE",
+            ),
+            (
+                wire::OPCODE_EXECUTE_COMMANDS_INDIRECT,
+                "wire::OPCODE_EXECUTE_COMMANDS_INDIRECT",
+            ),
+            (
+                wire::OPCODE_INSERT_COMPRESSED_TEXTURE_FLUSH,
+                "wire::OPCODE_INSERT_COMPRESSED_TEXTURE_FLUSH",
+            ),
+            (
+                wire::OPCODE_DISPATCH_THREADS_INDIRECT,
+                "wire::OPCODE_DISPATCH_THREADS_INDIRECT",
+            ),
         ];
 
         // Each exception names the selector that explains it, or `None` when

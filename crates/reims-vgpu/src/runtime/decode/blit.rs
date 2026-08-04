@@ -1,16 +1,10 @@
 //! Blit command decoder (port of `host/utils/reims-vgpu-blit-decode`).
 
-use crate::contract::endian::{ld16, ld32, ld64};
 use core::mem::offset_of;
 use reims_vgpu_wire::ops::blit as wire;
 
-/// Bytes before a record's payload, from [`reims_vgpu_wire::OP_HEADER_LEN`].
-///
-/// One fact that used to be declared six times — here, in `render`, `compute`,
-/// `blit` and twice in `stream` — all agreeing, with nothing comparing them.
-/// Re-exporting makes drift impossible rather than merely detectable, which is
-/// the move `contract::gva` already made for the page-table format.
-pub use reims_vgpu_wire::OP_HEADER_LEN as HEADER_LEN;
+/// Shared serializer op-header length from `reims-vgpu-wire`.
+use reims_vgpu_wire::OP_HEADER_LEN;
 
 /// Map a `reims-vgpu-wire` view onto a payload, translating its refusal.
 ///
@@ -43,26 +37,6 @@ fn wire_view<T: reims_vgpu_wire::Wire>(payload: &[u8]) -> Result<&T, DecodeStatu
 /// guest asked to be reset and `0x131` leaves a destination buffer holding
 /// whatever it held before. Two of the three are lost work and one is not.
 /// Decoding them lets `runtime::exec` say which; see the arms there.
-pub const OP_COPY_ICB: u32 = wire::OPCODE_COPY_ICB;
-pub const OP_OPTIMIZE_ICB: u32 = wire::OPCODE_OPTIMIZE_ICB;
-pub const OP_RESET_ICB: u32 = wire::OPCODE_RESET_ICB;
-
-pub const OP_COPY_BUFFER_TO_TEXTURE: u32 = wire::OPCODE_COPY_BUFFER_TO_TEXTURE;
-pub const OP_COPY_BUFFER_TO_BUFFER: u32 = wire::OPCODE_COPY_BUFFER_TO_BUFFER;
-pub const OP_COPY_TEXTURE_TO_BUFFER: u32 = wire::OPCODE_COPY_TEXTURE_TO_BUFFER;
-pub const OP_COPY_TEXTURE_TO_TEXTURE: u32 = wire::OPCODE_COPY_TEXTURE_REGION;
-pub const OP_COPY_TEXTURE_TO_TEXTURE_OPTIONS: u32 = wire::OPCODE_COPY_TEXTURE_REGION_OPTIONS;
-pub const OP_FILL_BUFFER: u32 = wire::OPCODE_FILL_BUFFER;
-pub const OP_GENERATE_MIPMAPS: u32 = wire::OPCODE_GENERATE_MIPMAPS;
-pub const OP_OPTIMIZE_CPU: u32 = wire::OPCODE_OPTIMIZE_FOR_CPU;
-pub const OP_OPTIMIZE_GPU: u32 = wire::OPCODE_OPTIMIZE_FOR_GPU;
-pub const OP_OPTIMIZE_IMAGE_CPU: u32 = wire::OPCODE_OPTIMIZE_FOR_CPU_SLICE_LEVEL;
-pub const OP_OPTIMIZE_IMAGE_GPU: u32 = wire::OPCODE_OPTIMIZE_FOR_GPU_SLICE_LEVEL;
-pub const OP_SYNCHRONIZE_RESOURCE: u32 = wire::OPCODE_SYNCHRONIZE_RESOURCE;
-pub const OP_SYNCHRONIZE_TEXTURE_IMAGE: u32 = wire::OPCODE_SYNCHRONIZE_TEXTURE;
-pub const OP_UPDATE_FENCE: u32 = wire::OPCODE_UPDATE_FENCE;
-pub const OP_WAIT_FENCE: u32 = wire::OPCODE_WAIT_FOR_FENCE;
-pub const OP_COPY_TEXTURE_TO_TEXTURE_SLICE_LEVEL: u32 = wire::OPCODE_COPY_TEXTURE_SLICES;
 
 /// The five records `-setSupportsBlitEncoderSPI:` gates.
 ///
@@ -83,12 +57,6 @@ pub const OP_COPY_TEXTURE_TO_TEXTURE_SLICE_LEVEL: u32 = wire::OPCODE_COPY_TEXTUR
 /// unconditional no-op, and a compressed-texture invalidate that silently
 /// joined them would be indistinguishable from a `synchronizeTexture:` that
 /// genuinely needs nothing done.
-pub const OP_FILL_BUFFER_PATTERN4: u32 = wire::OPCODE_FILL_BUFFER_PATTERN4;
-pub const OP_FILL_TEXTURE_BYTES: u32 = wire::OPCODE_FILL_TEXTURE_BYTES;
-pub const OP_FILL_TEXTURE_COLOR: u32 = wire::OPCODE_FILL_TEXTURE_COLOR;
-pub const OP_INVALIDATE_COMPRESSED_TEXTURE: u32 = wire::OPCODE_INVALIDATE_COMPRESSED_TEXTURE;
-pub const OP_INVALIDATE_COMPRESSED_TEXTURE_SLICE_LEVEL: u32 =
-    wire::OPCODE_INVALIDATE_COMPRESSED_TEXTURE_SLICE_LEVEL;
 
 // MTLBlitOption (Metal.framework Headers/MTLBlitCommandEncoder.h).
 pub const MTL_BLIT_OPTION_NONE: u32 = 0;
@@ -155,19 +123,7 @@ pub fn parse_blit_options(has_options: bool, options: u32) -> Result<BlitAspect,
 }
 
 // format offsets (payload-relative)
-const REF_SOURCE: usize = 0;
-const REF_DESTINATION: usize = 4;
-const POINT_X: usize = 0;
-const POINT_Y: usize = 8;
-const POINT_Z: usize = 16;
 
-const CBT_SRC_OFF: usize = offset_of!(wire::CopyBufferToTexture, source_offset);
-const CBT_SRC_BPR: usize = offset_of!(wire::CopyBufferToTexture, source_bytes_per_row);
-const CBT_SRC_BPI: usize = offset_of!(wire::CopyBufferToTexture, source_bytes_per_image);
-const CBT_SRC_SIZE: usize = offset_of!(wire::CopyBufferToTexture, size_width);
-const CBT_DST_ORIGIN: usize = offset_of!(wire::CopyBufferToTexture, dest_origin_x);
-const CBT_DST_SLICE: usize = offset_of!(wire::CopyBufferToTexture, dest_slice);
-const CBT_DST_LEVEL: usize = offset_of!(wire::CopyBufferToTexture, dest_level);
 const CBT_OPTIONS: usize = offset_of!(wire::CopyBufferToTexture, options);
 const CBT_LEN: usize = wire::COPY_BUFFER_TO_TEXTURE_TOTAL_LEN as usize;
 
@@ -176,34 +132,11 @@ const CBB_DST_OFF: usize = offset_of!(wire::BufferToBuffer, dest_offset);
 const CBB_SIZE: usize = offset_of!(wire::BufferToBuffer, size);
 const CBB_LEN: usize = wire::COPY_BUFFER_TO_BUFFER_TOTAL_LEN as usize;
 
-const CTB_SRC_ORIGIN: usize = offset_of!(wire::CopyTextureToBuffer, source_origin_x);
-const CTB_SRC_SIZE: usize = offset_of!(wire::CopyTextureToBuffer, size_width);
-const CTB_DST_OFF: usize = offset_of!(wire::CopyTextureToBuffer, dest_offset);
-const CTB_DST_BPR: usize = offset_of!(wire::CopyTextureToBuffer, dest_bytes_per_row);
-const CTB_DST_BPI: usize = offset_of!(wire::CopyTextureToBuffer, dest_bytes_per_image);
-const CTB_SRC_SLICE: usize = offset_of!(wire::CopyTextureToBuffer, source_slice);
-const CTB_SRC_LEVEL: usize = offset_of!(wire::CopyTextureToBuffer, source_level);
 const CTB_OPTIONS: usize = offset_of!(wire::CopyTextureToBuffer, options);
 const CTB_LEN: usize = wire::COPY_TEXTURE_TO_BUFFER_TOTAL_LEN as usize;
 
-const CTT_SRC_ORIGIN: usize = offset_of!(wire::CopyTextureRegion, source_origin_x);
-const CTT_SRC_SIZE: usize = offset_of!(wire::CopyTextureRegion, size_width);
-const CTT_DST_ORIGIN: usize = offset_of!(wire::CopyTextureRegion, dest_origin_x);
-const CTT_SRC_SLICE: usize = offset_of!(wire::CopyTextureRegion, source_slice);
-const CTT_SRC_LEVEL: usize = offset_of!(wire::CopyTextureRegion, source_level);
-const CTT_DST_SLICE: usize = offset_of!(wire::CopyTextureRegion, dest_slice);
-const CTT_DST_LEVEL: usize = offset_of!(wire::CopyTextureRegion, dest_level);
-const CTT_OPTIONS: usize = offset_of!(wire::CopyTextureRegionOptions, options);
 const CTT_LEN: usize = wire::COPY_TEXTURE_REGION_TOTAL_LEN as usize;
 const CTT_OPTIONS_LEN: usize = wire::COPY_TEXTURE_REGION_OPTIONS_TOTAL_LEN as usize;
-
-const CTTSL_SRC_SLICE: usize = offset_of!(wire::CopyTextureSlices, source_slice);
-const CTTSL_SRC_LEVEL: usize = offset_of!(wire::CopyTextureSlices, source_level);
-const CTTSL_DST_SLICE: usize = offset_of!(wire::CopyTextureSlices, dest_slice);
-const CTTSL_DST_LEVEL: usize = offset_of!(wire::CopyTextureSlices, dest_level);
-const CTTSL_SLICE_COUNT: usize = offset_of!(wire::CopyTextureSlices, slice_count);
-const CTTSL_LEVEL_COUNT: usize = offset_of!(wire::CopyTextureSlices, level_count);
-const CTTSL_LEN: usize = wire::COPY_TEXTURE_SLICES_TOTAL_LEN as usize;
 
 const FILL_REF: usize = offset_of!(wire::FillBuffer, buffer_ref);
 const FILL_RANGE_LOC: usize = offset_of!(wire::FillBuffer, range_location);
@@ -211,13 +144,7 @@ const FILL_RANGE_LEN: usize = offset_of!(wire::FillBuffer, range_length);
 const FILL_VALUE: usize = offset_of!(wire::FillBuffer, value);
 const FILL_LEN: usize = wire::FILL_BUFFER_TOTAL_LEN as usize;
 
-const RESOURCE_REF: usize = offset_of!(wire::Ref, object_ref);
 const RESOURCE_LEN: usize = wire::REF_TOTAL_LEN as usize;
-const IMAGE_TEXTURE: usize = offset_of!(wire::RefSliceLevel, texture_ref);
-const IMAGE_SLICE: usize = offset_of!(wire::RefSliceLevel, slice);
-const IMAGE_LEVEL: usize = offset_of!(wire::RefSliceLevel, level);
-const IMAGE_LEN: usize = wire::REF_SLICE_LEVEL_TOTAL_LEN as usize;
-const FENCE_REF: usize = offset_of!(wire::Ref, object_ref);
 const FENCE_LEN: usize = wire::REF_TOTAL_LEN as usize;
 
 /// Why the blit decoder refused a command.
@@ -428,221 +355,258 @@ pub struct Command {
     pub fill_bytes_length: u64,
 }
 
-fn decode_origin(p: &[u8]) -> Point {
-    Point {
-        x: ld64(&p[POINT_X..]),
-        y: ld64(&p[POINT_Y..]),
-        z: ld64(&p[POINT_Z..]),
-    }
-}
-
-fn decode_size(p: &[u8]) -> Size {
-    Size {
-        width: ld64(&p[POINT_X..]),
-        height: ld64(&p[POINT_Y..]),
-        depth: ld64(&p[POINT_Z..]),
-    }
-}
-
 /// Transactional decode of one blit command record.
+///
+/// Framing and field layout come from [`reims_vgpu_wire`]: [`reims_vgpu_wire::op`]
+/// for the shared header, and the parsers in [`reims_vgpu_wire::ops::blit`] for
+/// each covered payload. This module maps those views into the product
+/// [`Command`] / [`Kind`] model and names refusals; it does not restate offsets.
 pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
-    if command.len() < HEADER_LEN {
-        return Err(DecodeStatus::ErrShort);
-    }
-    let opcode = ld32(&command[0..]);
-    let command_length = ld32(&command[4..]) as usize;
-    if command_length < HEADER_LEN || command_length > command.len() {
-        return Err(DecodeStatus::ErrShort);
-    }
-    let payload = &command[HEADER_LEN..command_length];
+    let op = reims_vgpu_wire::op(command, 0).map_err(|_| DecodeStatus::ErrShort)?;
     let mut out = Command {
-        opcode,
-        command_length: command_length as u32,
+        opcode: op.opcode(),
+        command_length: op.length(),
         ..Default::default()
     };
+    let command_length = op.length() as usize;
 
-    match opcode {
-        OP_COPY_BUFFER_TO_TEXTURE => {
-            if command_length != CBT_LEN {
+    match op.opcode() {
+        wire::OPCODE_COPY_BUFFER_TO_TEXTURE => {
+            if command_length != wire::COPY_BUFFER_TO_TEXTURE_TOTAL_LEN as usize {
                 return Err(DecodeStatus::ErrShort);
             }
+            let c = wire::copy_buffer_to_texture(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::Copy;
             out.copy_kind = CopyKind::BufferToTexture;
             out.source_kind = RefKind::Buffer;
             out.destination_kind = RefKind::Texture;
-            out.source = ld32(&payload[REF_SOURCE..]);
-            out.destination = ld32(&payload[REF_DESTINATION..]);
-            out.source_offset = ld64(&payload[CBT_SRC_OFF..]);
-            out.source_bytes_per_row = ld64(&payload[CBT_SRC_BPR..]);
-            out.source_bytes_per_image = ld64(&payload[CBT_SRC_BPI..]);
-            out.source_size = decode_size(&payload[CBT_SRC_SIZE..]);
-            out.destination_origin = decode_origin(&payload[CBT_DST_ORIGIN..]);
-            out.destination_slice = ld16(&payload[CBT_DST_SLICE..]);
-            out.destination_level = ld16(&payload[CBT_DST_LEVEL..]);
+            out.source = c.source_ref.get();
+            out.destination = c.dest_ref.get();
+            out.source_offset = c.source_offset.get();
+            out.source_bytes_per_row = c.source_bytes_per_row.get();
+            out.source_bytes_per_image = c.source_bytes_per_image.get();
+            out.source_size = Size {
+                width: c.size_width.get(),
+                height: c.size_height.get(),
+                depth: c.size_depth.get(),
+            };
+            out.destination_origin = Point {
+                x: c.dest_origin_x.get(),
+                y: c.dest_origin_y.get(),
+                z: c.dest_origin_z.get(),
+            };
+            out.destination_slice = c.dest_slice.get();
+            out.destination_level = c.dest_level.get();
             out.has_options = true;
-            out.options = ld32(&payload[CBT_OPTIONS..]);
+            out.options = c.options.get();
             Ok(out)
         }
-        OP_COPY_BUFFER_TO_BUFFER => {
-            if command_length != CBB_LEN {
+        wire::OPCODE_COPY_BUFFER_TO_BUFFER => {
+            if command_length != wire::COPY_BUFFER_TO_BUFFER_TOTAL_LEN as usize {
                 return Err(DecodeStatus::ErrShort);
             }
+            let c = wire::copy_buffer_to_buffer(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::Copy;
             out.copy_kind = CopyKind::BufferToBuffer;
             out.source_kind = RefKind::Buffer;
             out.destination_kind = RefKind::Buffer;
-            out.source = ld32(&payload[REF_SOURCE..]);
-            out.destination = ld32(&payload[REF_DESTINATION..]);
-            out.source_offset = ld64(&payload[CBB_SRC_OFF..]);
-            out.destination_offset = ld64(&payload[CBB_DST_OFF..]);
-            out.size = ld64(&payload[CBB_SIZE..]);
+            out.source = c.source_ref.get();
+            out.destination = c.dest_ref.get();
+            out.source_offset = c.source_offset.get();
+            out.destination_offset = c.dest_offset.get();
+            out.size = c.size.get();
             Ok(out)
         }
-        OP_COPY_TEXTURE_TO_BUFFER => {
-            if command_length != CTB_LEN {
+        wire::OPCODE_COPY_TEXTURE_TO_BUFFER => {
+            if command_length != wire::COPY_TEXTURE_TO_BUFFER_TOTAL_LEN as usize {
                 return Err(DecodeStatus::ErrShort);
             }
+            let c = wire::copy_texture_to_buffer(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::Copy;
             out.copy_kind = CopyKind::TextureToBuffer;
             out.source_kind = RefKind::Texture;
             out.destination_kind = RefKind::Buffer;
-            out.source = ld32(&payload[REF_SOURCE..]);
-            out.destination = ld32(&payload[REF_DESTINATION..]);
-            out.source_origin = decode_origin(&payload[CTB_SRC_ORIGIN..]);
-            out.source_size = decode_size(&payload[CTB_SRC_SIZE..]);
-            out.destination_offset = ld64(&payload[CTB_DST_OFF..]);
-            out.destination_bytes_per_row = ld64(&payload[CTB_DST_BPR..]);
-            out.destination_bytes_per_image = ld64(&payload[CTB_DST_BPI..]);
-            out.source_slice = ld16(&payload[CTB_SRC_SLICE..]);
-            out.source_level = ld16(&payload[CTB_SRC_LEVEL..]);
+            out.source = c.source_ref.get();
+            out.destination = c.dest_ref.get();
+            out.source_origin = Point {
+                x: c.source_origin_x.get(),
+                y: c.source_origin_y.get(),
+                z: c.source_origin_z.get(),
+            };
+            out.source_size = Size {
+                width: c.size_width.get(),
+                height: c.size_height.get(),
+                depth: c.size_depth.get(),
+            };
+            out.destination_offset = c.dest_offset.get();
+            out.destination_bytes_per_row = c.dest_bytes_per_row.get();
+            out.destination_bytes_per_image = c.dest_bytes_per_image.get();
+            out.source_slice = c.source_slice.get();
+            out.source_level = c.source_level.get();
             out.has_options = true;
-            // **Two bytes, not four.** This is the one copy record that narrows
-            // `options`: `blit_copy_texture_to_buffer_options` came back
-            // `04 00 AA AA` at `+0x54` against the oracle's poison, where the
-            // buffer-to-texture and region forms both fill all four
-            // (`reims_vgpu_wire::ops::blit::CopyTextureToBuffer` reads a `u16`
-            // and its siblings a `u32`). Reading four here took two bytes of
-            // whatever the guest's ring last held into the high half, and
-            // `parse_blit_options` refuses any bit outside `MTLBlitOption`'s
-            // three — so a plain full-texel copy, whose two written bytes are
-            // zero, was declined whenever those stale bytes happened to be
-            // non-zero.
-            out.options = ld16(&payload[CTB_OPTIONS..]) as u32;
+            // Wire stores options as u16 on this record (see CopyTextureToBuffer).
+            out.options = c.options.get() as u32;
             Ok(out)
         }
-        OP_COPY_TEXTURE_TO_TEXTURE | OP_COPY_TEXTURE_TO_TEXTURE_OPTIONS => {
-            let want = if opcode == OP_COPY_TEXTURE_TO_TEXTURE_OPTIONS {
-                CTT_OPTIONS_LEN
-            } else {
-                CTT_LEN
-            };
-            if command_length != want {
+        wire::OPCODE_COPY_TEXTURE_REGION => {
+            if command_length != wire::COPY_TEXTURE_REGION_TOTAL_LEN as usize {
                 return Err(DecodeStatus::ErrShort);
             }
+            let c = wire::copy_texture_region(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::Copy;
             out.copy_kind = CopyKind::TextureToTexture;
             out.source_kind = RefKind::Texture;
             out.destination_kind = RefKind::Texture;
-            out.source = ld32(&payload[REF_SOURCE..]);
-            out.destination = ld32(&payload[REF_DESTINATION..]);
-            out.source_origin = decode_origin(&payload[CTT_SRC_ORIGIN..]);
-            out.source_size = decode_size(&payload[CTT_SRC_SIZE..]);
-            out.destination_origin = decode_origin(&payload[CTT_DST_ORIGIN..]);
-            out.source_slice = ld16(&payload[CTT_SRC_SLICE..]);
-            out.source_level = ld16(&payload[CTT_SRC_LEVEL..]);
-            out.destination_slice = ld16(&payload[CTT_DST_SLICE..]);
-            out.destination_level = ld16(&payload[CTT_DST_LEVEL..]);
-            if opcode == OP_COPY_TEXTURE_TO_TEXTURE_OPTIONS {
-                out.has_options = true;
-                out.options = ld32(&payload[CTT_OPTIONS..]);
-            }
+            out.source = c.source_ref.get();
+            out.destination = c.dest_ref.get();
+            out.source_origin = Point {
+                x: c.source_origin_x.get(),
+                y: c.source_origin_y.get(),
+                z: c.source_origin_z.get(),
+            };
+            out.source_size = Size {
+                width: c.size_width.get(),
+                height: c.size_height.get(),
+                depth: c.size_depth.get(),
+            };
+            out.destination_origin = Point {
+                x: c.dest_origin_x.get(),
+                y: c.dest_origin_y.get(),
+                z: c.dest_origin_z.get(),
+            };
+            out.source_slice = c.source_slice.get();
+            out.source_level = c.source_level.get();
+            out.destination_slice = c.dest_slice.get();
+            out.destination_level = c.dest_level.get();
             Ok(out)
         }
-        OP_COPY_TEXTURE_TO_TEXTURE_SLICE_LEVEL => {
-            if command_length != CTTSL_LEN {
+        wire::OPCODE_COPY_TEXTURE_REGION_OPTIONS => {
+            if command_length != wire::COPY_TEXTURE_REGION_OPTIONS_TOTAL_LEN as usize {
                 return Err(DecodeStatus::ErrShort);
             }
+            let c = wire::copy_texture_region_options(&op).map_err(|_| DecodeStatus::ErrShort)?;
+            let r = &c.region;
+            out.kind = Kind::Copy;
+            out.copy_kind = CopyKind::TextureToTexture;
+            out.source_kind = RefKind::Texture;
+            out.destination_kind = RefKind::Texture;
+            out.source = r.source_ref.get();
+            out.destination = r.dest_ref.get();
+            out.source_origin = Point {
+                x: r.source_origin_x.get(),
+                y: r.source_origin_y.get(),
+                z: r.source_origin_z.get(),
+            };
+            out.source_size = Size {
+                width: r.size_width.get(),
+                height: r.size_height.get(),
+                depth: r.size_depth.get(),
+            };
+            out.destination_origin = Point {
+                x: r.dest_origin_x.get(),
+                y: r.dest_origin_y.get(),
+                z: r.dest_origin_z.get(),
+            };
+            out.source_slice = r.source_slice.get();
+            out.source_level = r.source_level.get();
+            out.destination_slice = r.dest_slice.get();
+            out.destination_level = r.dest_level.get();
+            out.has_options = true;
+            out.options = c.options.get();
+            Ok(out)
+        }
+        wire::OPCODE_COPY_TEXTURE_SLICES => {
+            if command_length != wire::COPY_TEXTURE_SLICES_TOTAL_LEN as usize {
+                return Err(DecodeStatus::ErrShort);
+            }
+            let c = wire::copy_texture_slices(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::Copy;
             out.copy_kind = CopyKind::TextureToTextureSliceLevel;
             out.source_kind = RefKind::Texture;
             out.destination_kind = RefKind::Texture;
-            out.source = ld32(&payload[REF_SOURCE..]);
-            out.destination = ld32(&payload[REF_DESTINATION..]);
-            out.source_slice = ld16(&payload[CTTSL_SRC_SLICE..]);
-            out.source_level = ld16(&payload[CTTSL_SRC_LEVEL..]);
-            out.destination_slice = ld16(&payload[CTTSL_DST_SLICE..]);
-            out.destination_level = ld16(&payload[CTTSL_DST_LEVEL..]);
-            out.slice_count = ld16(&payload[CTTSL_SLICE_COUNT..]);
-            out.level_count = ld16(&payload[CTTSL_LEVEL_COUNT..]);
+            out.source = c.source_ref.get();
+            out.destination = c.dest_ref.get();
+            out.source_slice = c.source_slice.get();
+            out.source_level = c.source_level.get();
+            out.destination_slice = c.dest_slice.get();
+            out.destination_level = c.dest_level.get();
+            out.slice_count = c.slice_count.get();
+            out.level_count = c.level_count.get();
             Ok(out)
         }
-        OP_FILL_BUFFER => {
-            if command_length != FILL_LEN {
+        wire::OPCODE_FILL_BUFFER => {
+            if command_length != wire::FILL_BUFFER_TOTAL_LEN as usize {
                 return Err(DecodeStatus::ErrShort);
             }
+            let f = wire::fill_buffer(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::FillBuffer;
-            out.buffer = ld32(&payload[FILL_REF..]);
-            out.range_location = ld64(&payload[FILL_RANGE_LOC..]);
-            out.range_length = ld64(&payload[FILL_RANGE_LEN..]);
-            out.fill_value = payload[FILL_VALUE];
+            out.buffer = f.buffer_ref.get();
+            out.range_location = f.range_location.get();
+            out.range_length = f.range_length.get();
+            out.fill_value = f.value;
             Ok(out)
         }
-        OP_GENERATE_MIPMAPS | OP_OPTIMIZE_CPU | OP_OPTIMIZE_GPU => {
-            if command_length != RESOURCE_LEN {
+        wire::OPCODE_GENERATE_MIPMAPS
+        | wire::OPCODE_OPTIMIZE_FOR_CPU
+        | wire::OPCODE_OPTIMIZE_FOR_GPU => {
+            if command_length != wire::REF_TOTAL_LEN as usize {
                 return Err(DecodeStatus::ErrShort);
             }
+            let r = wire::object_ref(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::Resource;
             out.resource_kind = RefKind::Texture;
-            out.resource = ld32(&payload[RESOURCE_REF..]);
+            out.resource = r.object_ref.get();
             Ok(out)
         }
-        OP_OPTIMIZE_IMAGE_CPU | OP_OPTIMIZE_IMAGE_GPU | OP_SYNCHRONIZE_TEXTURE_IMAGE => {
-            if command_length != IMAGE_LEN {
+        wire::OPCODE_OPTIMIZE_FOR_CPU_SLICE_LEVEL
+        | wire::OPCODE_OPTIMIZE_FOR_GPU_SLICE_LEVEL
+        | wire::OPCODE_SYNCHRONIZE_TEXTURE => {
+            if command_length != wire::REF_SLICE_LEVEL_TOTAL_LEN as usize {
                 return Err(DecodeStatus::ErrShort);
             }
+            let r = wire::ref_slice_level(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::Image;
-            out.texture = ld32(&payload[IMAGE_TEXTURE..]);
-            out.slice = ld16(&payload[IMAGE_SLICE..]);
-            out.level = ld16(&payload[IMAGE_LEVEL..]);
+            out.texture = r.texture_ref.get();
+            out.slice = r.slice.get();
+            out.level = r.level.get();
             Ok(out)
         }
-        OP_SYNCHRONIZE_RESOURCE => {
-            if command_length != RESOURCE_LEN {
+        wire::OPCODE_SYNCHRONIZE_RESOURCE => {
+            if command_length != wire::REF_TOTAL_LEN as usize {
                 return Err(DecodeStatus::ErrShort);
             }
+            let r = wire::object_ref(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::Resource;
             out.resource_kind = RefKind::Resource;
-            out.resource = ld32(&payload[RESOURCE_REF..]);
+            out.resource = r.object_ref.get();
             Ok(out)
         }
-        OP_UPDATE_FENCE | OP_WAIT_FENCE => {
-            if command_length != FENCE_LEN {
+        wire::OPCODE_UPDATE_FENCE | wire::OPCODE_WAIT_FOR_FENCE => {
+            if command_length != wire::REF_TOTAL_LEN as usize {
                 return Err(DecodeStatus::ErrShort);
             }
+            let r = wire::object_ref(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::Fence;
-            out.fence = ld32(&payload[FENCE_REF..]);
+            out.fence = r.object_ref.get();
             Ok(out)
         }
-        OP_OPTIMIZE_ICB | OP_RESET_ICB => {
+        wire::OPCODE_OPTIMIZE_ICB | wire::OPCODE_RESET_ICB => {
             if command_length != wire::ICB_RANGE_TOTAL_LEN as usize {
                 return Err(DecodeStatus::ErrShort);
             }
-            let r = wire_view::<wire::IcbRange>(payload)?;
+            let r = wire::icb_range(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::IcbRange;
             out.resource_kind = RefKind::IndirectCommandBuffer;
             out.resource = r.icb_ref.get();
-            // Two `u64` in declaration order with no narrowing, which is what
-            // separates this shape from the ref-slice-level records that are
-            // also "a ref and two numbers".
             out.range_location = r.range_location.get();
             out.range_length = r.range_length.get();
             Ok(out)
         }
-        OP_COPY_ICB => {
+        wire::OPCODE_COPY_ICB => {
             if command_length != wire::COPY_ICB_TOTAL_LEN as usize {
                 return Err(DecodeStatus::ErrShort);
             }
-            let c = wire_view::<wire::CopyIcb>(payload)?;
+            let c = wire::copy_icb(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::IcbCopy;
             out.source_kind = RefKind::IndirectCommandBuffer;
             out.destination_kind = RefKind::IndirectCommandBuffer;
@@ -653,11 +617,11 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             out.destination_index = c.dest_index.get();
             Ok(out)
         }
-        OP_FILL_BUFFER_PATTERN4 => {
+        wire::OPCODE_FILL_BUFFER_PATTERN4 => {
             if command_length != wire::FILL_BUFFER_PATTERN4_TOTAL_LEN as usize {
                 return Err(DecodeStatus::ErrShort);
             }
-            let f = wire_view::<wire::FillBufferPattern4>(payload)?;
+            let f = wire::fill_buffer_pattern4(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::FillBufferPattern4;
             out.buffer = f.buffer_ref.get();
             out.range_location = f.range_location.get();
@@ -665,11 +629,11 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             out.fill_pattern = f.pattern.get();
             Ok(out)
         }
-        OP_FILL_TEXTURE_COLOR => {
+        wire::OPCODE_FILL_TEXTURE_COLOR => {
             if command_length != wire::FILL_TEXTURE_COLOR_TOTAL_LEN as usize {
                 return Err(DecodeStatus::ErrShort);
             }
-            let f = wire_view::<wire::FillTextureColor>(payload)?;
+            let f = wire::fill_texture_color(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::FillTexture;
             out.fill_source = FillSource::Color;
             out.texture = f.texture_ref.get();
@@ -694,11 +658,11 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             out.fill_pixel_format = f.pixel_format.get();
             Ok(out)
         }
-        OP_FILL_TEXTURE_BYTES => {
+        wire::OPCODE_FILL_TEXTURE_BYTES => {
             if command_length != wire::FILL_TEXTURE_BYTES_TOTAL_LEN as usize {
                 return Err(DecodeStatus::ErrShort);
             }
-            let f = wire_view::<wire::FillTextureBytes>(payload)?;
+            let f = wire::fill_texture_bytes(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::FillTexture;
             out.fill_source = FillSource::Bytes;
             out.texture = f.texture_ref.get();
@@ -719,20 +683,20 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             out.fill_bytes_length = f.length.get();
             Ok(out)
         }
-        OP_INVALIDATE_COMPRESSED_TEXTURE => {
+        wire::OPCODE_INVALIDATE_COMPRESSED_TEXTURE => {
             if command_length != wire::REF_TOTAL_LEN as usize {
                 return Err(DecodeStatus::ErrShort);
             }
-            let r = wire_view::<wire::Ref>(payload)?;
+            let r = wire::object_ref(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::InvalidateCompressedTexture;
             out.texture = r.object_ref.get();
             Ok(out)
         }
-        OP_INVALIDATE_COMPRESSED_TEXTURE_SLICE_LEVEL => {
+        wire::OPCODE_INVALIDATE_COMPRESSED_TEXTURE_SLICE_LEVEL => {
             if command_length != wire::REF_SLICE_LEVEL_TOTAL_LEN as usize {
                 return Err(DecodeStatus::ErrShort);
             }
-            let r = wire_view::<wire::RefSliceLevel>(payload)?;
+            let r = wire::ref_slice_level(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::InvalidateCompressedTexture;
             out.texture = r.texture_ref.get();
             out.slice = r.slice.get();
@@ -767,7 +731,11 @@ mod tests {
         assert_eq!(slugs.len(), ALL.len(), "every variant refuses");
         slugs.sort_unstable();
         slugs.dedup();
-        assert_eq!(slugs.len(), ALL.len(), "two blit decode checks share a slug");
+        assert_eq!(
+            slugs.len(),
+            ALL.len(),
+            "two blit decode checks share a slug"
+        );
         // The prefix is load-bearing: seven modules define a `DecodeStatus` and
         // five of them have an `ErrShort` meaning a different read.
         assert!(slugs.iter().all(|s| s.starts_with("blit_decode_")));
@@ -788,7 +756,7 @@ mod tests {
 
     #[test]
     fn buffer_to_buffer() {
-        let mut v = hdr(OP_COPY_BUFFER_TO_BUFFER, CBB_LEN as u32);
+        let mut v = hdr(wire::OPCODE_COPY_BUFFER_TO_BUFFER, CBB_LEN as u32);
         st32(&mut v[8..], 1);
         st32(&mut v[12..], 2);
         st64(&mut v[8 + CBB_SRC_OFF..], 0x10);
@@ -803,7 +771,7 @@ mod tests {
 
     #[test]
     fn fill_buffer() {
-        let mut v = hdr(OP_FILL_BUFFER, FILL_LEN as u32);
+        let mut v = hdr(wire::OPCODE_FILL_BUFFER, FILL_LEN as u32);
         st32(&mut v[8 + FILL_REF..], 9);
         st64(&mut v[8 + FILL_RANGE_LOC..], 4);
         st64(&mut v[8 + FILL_RANGE_LEN..], 8);
@@ -823,11 +791,11 @@ mod tests {
     #[test]
     fn fill_buffer_pattern4() {
         let total = wire::FILL_BUFFER_PATTERN4_TOTAL_LEN;
-        let mut v = hdr(OP_FILL_BUFFER_PATTERN4, total);
-        st32(&mut v[HEADER_LEN..], 9);
-        st64(&mut v[HEADER_LEN + 4..], 0x3300);
-        st64(&mut v[HEADER_LEN + 12..], 0x4400);
-        st32(&mut v[HEADER_LEN + 20..], 0x89ab_cdef);
+        let mut v = hdr(wire::OPCODE_FILL_BUFFER_PATTERN4, total);
+        st32(&mut v[OP_HEADER_LEN..], 9);
+        st64(&mut v[OP_HEADER_LEN + 4..], 0x3300);
+        st64(&mut v[OP_HEADER_LEN + 12..], 0x4400);
+        st32(&mut v[OP_HEADER_LEN + 20..], 0x89ab_cdef);
         let c = decode(&v).unwrap();
         assert_eq!(c.kind, Kind::FillBufferPattern4);
         assert_eq!(c.buffer, 9);
@@ -850,7 +818,7 @@ mod tests {
     #[test]
     fn both_texture_fills_decode_their_region_size_before_origin() {
         let region = |v: &mut [u8]| {
-            let p = HEADER_LEN;
+            let p = OP_HEADER_LEN;
             st32(&mut v[p..], 4242);
             st16(&mut v[p + 4..], 3);
             st16(&mut v[p + 6..], 5);
@@ -884,12 +852,15 @@ mod tests {
             );
         };
 
-        let mut v = hdr(OP_FILL_TEXTURE_COLOR, wire::FILL_TEXTURE_COLOR_TOTAL_LEN);
+        let mut v = hdr(
+            wire::OPCODE_FILL_TEXTURE_COLOR,
+            wire::FILL_TEXTURE_COLOR_TOTAL_LEN,
+        );
         region(&mut v);
         for (i, bits) in [0.25f64, 0.5, 0.75, 1.0].iter().enumerate() {
-            st64(&mut v[HEADER_LEN + 56 + i * 8..], bits.to_bits());
+            st64(&mut v[OP_HEADER_LEN + 56 + i * 8..], bits.to_bits());
         }
-        st16(&mut v[HEADER_LEN + 88..], 80);
+        st16(&mut v[OP_HEADER_LEN + 88..], 80);
         let c = decode(&v).unwrap();
         expect_shared(&c);
         assert_eq!(c.fill_source, FillSource::Color);
@@ -906,11 +877,14 @@ mod tests {
         assert_eq!(c.fill_pixel_format, 80);
         assert_eq!(c.fill_bytes_ref, 0);
 
-        let mut v = hdr(OP_FILL_TEXTURE_BYTES, wire::FILL_TEXTURE_BYTES_TOTAL_LEN);
+        let mut v = hdr(
+            wire::OPCODE_FILL_TEXTURE_BYTES,
+            wire::FILL_TEXTURE_BYTES_TOTAL_LEN,
+        );
         region(&mut v);
-        st32(&mut v[HEADER_LEN + 56..], 8181);
-        st64(&mut v[HEADER_LEN + 60..], 0x9999);
-        st64(&mut v[HEADER_LEN + 68..], 8);
+        st32(&mut v[OP_HEADER_LEN + 56..], 8181);
+        st64(&mut v[OP_HEADER_LEN + 60..], 0x9999);
+        st64(&mut v[OP_HEADER_LEN + 68..], 8);
         let c = decode(&v).unwrap();
         expect_shared(&c);
         assert_eq!(c.fill_source, FillSource::Bytes);
@@ -932,20 +906,23 @@ mod tests {
     /// invalidates" would be unprovable — so the kind is separate.
     #[test]
     fn both_compressed_texture_invalidates_are_their_own_kind() {
-        let mut v = hdr(OP_INVALIDATE_COMPRESSED_TEXTURE, wire::REF_TOTAL_LEN);
-        st32(&mut v[HEADER_LEN..], 4242);
+        let mut v = hdr(
+            wire::OPCODE_INVALIDATE_COMPRESSED_TEXTURE,
+            wire::REF_TOTAL_LEN,
+        );
+        st32(&mut v[OP_HEADER_LEN..], 4242);
         let c = decode(&v).unwrap();
         assert_eq!(c.kind, Kind::InvalidateCompressedTexture);
         assert_eq!(c.texture, 4242);
         assert_eq!((c.slice, c.level), (0, 0));
 
         let mut v = hdr(
-            OP_INVALIDATE_COMPRESSED_TEXTURE_SLICE_LEVEL,
+            wire::OPCODE_INVALIDATE_COMPRESSED_TEXTURE_SLICE_LEVEL,
             wire::REF_SLICE_LEVEL_TOTAL_LEN,
         );
-        st32(&mut v[HEADER_LEN..], 4242);
-        st16(&mut v[HEADER_LEN + 4..], 3);
-        st16(&mut v[HEADER_LEN + 6..], 5);
+        st32(&mut v[OP_HEADER_LEN..], 4242);
+        st16(&mut v[OP_HEADER_LEN + 4..], 3);
+        st16(&mut v[OP_HEADER_LEN + 6..], 5);
         let c = decode(&v).unwrap();
         assert_eq!(c.kind, Kind::InvalidateCompressedTexture);
         assert_eq!(c.texture, 4242);
@@ -954,7 +931,10 @@ mod tests {
         // Not folded into `Kind::Image`, which the same wire shape reaches for
         // three other opcodes. `opcode` is what tells the two forms apart,
         // because "slice 0, level 0" and "every slice, every level" read alike.
-        assert_eq!(c.opcode, OP_INVALIDATE_COMPRESSED_TEXTURE_SLICE_LEVEL);
+        assert_eq!(
+            c.opcode,
+            wire::OPCODE_INVALIDATE_COMPRESSED_TEXTURE_SLICE_LEVEL
+        );
     }
 
     /// Every one of the five refuses a record one byte short of its length.
@@ -967,14 +947,23 @@ mod tests {
     fn each_spi_record_refuses_a_length_one_byte_short() {
         for (op, total) in [
             (
-                OP_FILL_BUFFER_PATTERN4,
+                wire::OPCODE_FILL_BUFFER_PATTERN4,
                 wire::FILL_BUFFER_PATTERN4_TOTAL_LEN,
             ),
-            (OP_FILL_TEXTURE_BYTES, wire::FILL_TEXTURE_BYTES_TOTAL_LEN),
-            (OP_FILL_TEXTURE_COLOR, wire::FILL_TEXTURE_COLOR_TOTAL_LEN),
-            (OP_INVALIDATE_COMPRESSED_TEXTURE, wire::REF_TOTAL_LEN),
             (
-                OP_INVALIDATE_COMPRESSED_TEXTURE_SLICE_LEVEL,
+                wire::OPCODE_FILL_TEXTURE_BYTES,
+                wire::FILL_TEXTURE_BYTES_TOTAL_LEN,
+            ),
+            (
+                wire::OPCODE_FILL_TEXTURE_COLOR,
+                wire::FILL_TEXTURE_COLOR_TOTAL_LEN,
+            ),
+            (
+                wire::OPCODE_INVALIDATE_COMPRESSED_TEXTURE,
+                wire::REF_TOTAL_LEN,
+            ),
+            (
+                wire::OPCODE_INVALIDATE_COMPRESSED_TEXTURE_SLICE_LEVEL,
                 wire::REF_SLICE_LEVEL_TOTAL_LEN,
             ),
         ] {
@@ -1026,14 +1015,17 @@ mod tests {
     fn a_texture_to_buffer_copy_reads_no_byte_past_its_options() {
         for (written, want) in [
             (0u16, BlitAspect::Full),
-            (MTL_BLIT_OPTION_DEPTH_FROM_DEPTH_STENCIL as u16, BlitAspect::Depth),
+            (
+                MTL_BLIT_OPTION_DEPTH_FROM_DEPTH_STENCIL as u16,
+                BlitAspect::Depth,
+            ),
         ] {
-            let mut v = hdr(OP_COPY_TEXTURE_TO_BUFFER, CTB_LEN as u32);
+            let mut v = hdr(wire::OPCODE_COPY_TEXTURE_TO_BUFFER, CTB_LEN as u32);
             // Everything past the options field is ring content, not record.
-            for b in v.iter_mut().skip(HEADER_LEN + CTB_OPTIONS + 2) {
+            for b in v.iter_mut().skip(OP_HEADER_LEN + CTB_OPTIONS + 2) {
                 *b = 0xAA;
             }
-            st16(&mut v[HEADER_LEN + CTB_OPTIONS..], written);
+            st16(&mut v[OP_HEADER_LEN + CTB_OPTIONS..], written);
 
             let c = decode(&v).expect("a well-formed copy must decode");
             assert_eq!(
@@ -1045,8 +1037,8 @@ mod tests {
 
         // The sibling that really is four bytes wide keeps reading four, so
         // this is a per-record narrowing rather than a family rule.
-        let mut v = hdr(OP_COPY_BUFFER_TO_TEXTURE, CBT_LEN as u32);
-        st32(&mut v[HEADER_LEN + CBT_OPTIONS..], 0x0001_0000);
+        let mut v = hdr(wire::OPCODE_COPY_BUFFER_TO_TEXTURE, CBT_LEN as u32);
+        st32(&mut v[OP_HEADER_LEN + CBT_OPTIONS..], 0x0001_0000);
         assert_eq!(decode(&v).unwrap().options, 0x0001_0000);
     }
 
@@ -1063,17 +1055,22 @@ mod tests {
         use reims_vgpu_wire::ops::blit as wire;
 
         for (op, wire_op) in [
-            (OP_COPY_ICB, wire::OPCODE_COPY_ICB),
-            (OP_OPTIMIZE_ICB, wire::OPCODE_OPTIMIZE_ICB),
-            (OP_RESET_ICB, wire::OPCODE_RESET_ICB),
+            (wire::OPCODE_COPY_ICB, wire::OPCODE_COPY_ICB),
+            (wire::OPCODE_OPTIMIZE_ICB, wire::OPCODE_OPTIMIZE_ICB),
+            (wire::OPCODE_RESET_ICB, wire::OPCODE_RESET_ICB),
         ] {
             assert_eq!(op, wire_op, "the serializer writes a different opcode");
         }
         // Still inside this encoder's opcode space, which is why "a foreign
         // encoder's number arrived here" was never the explanation.
-        for op in [OP_COPY_ICB, OP_OPTIMIZE_ICB, OP_RESET_ICB] {
+        for op in [
+            wire::OPCODE_COPY_ICB,
+            wire::OPCODE_OPTIMIZE_ICB,
+            wire::OPCODE_RESET_ICB,
+        ] {
             assert!(
-                (OP_COPY_BUFFER_TO_TEXTURE..=OP_COPY_TEXTURE_TO_TEXTURE_SLICE_LEVEL).contains(&op),
+                (wire::OPCODE_COPY_BUFFER_TO_TEXTURE..=wire::OPCODE_COPY_TEXTURE_SLICES)
+                    .contains(&op),
                 "op {op:#x} is outside the blit opcode space"
             );
         }
@@ -1081,15 +1078,19 @@ mod tests {
         // The two range forms: a ref then two `u64` in declaration order. The
         // range values differ from each other so a record that carried the same
         // number twice could not read back correct.
-        for op in [OP_OPTIMIZE_ICB, OP_RESET_ICB] {
+        for op in [wire::OPCODE_OPTIMIZE_ICB, wire::OPCODE_RESET_ICB] {
             let total = wire::ICB_RANGE_TOTAL_LEN;
             let mut v = hdr(op, total);
-            st32(&mut v[HEADER_LEN..], 6161);
-            st64(&mut v[HEADER_LEN + 4..], 0x3300);
-            st64(&mut v[HEADER_LEN + 12..], 0x4400);
+            st32(&mut v[OP_HEADER_LEN..], 6161);
+            st64(&mut v[OP_HEADER_LEN + 4..], 0x3300);
+            st64(&mut v[OP_HEADER_LEN + 12..], 0x4400);
             let c = decode(&v).unwrap_or_else(|e| panic!("op {op:#x}: {e:?}"));
             assert_eq!(c.kind, Kind::IcbRange, "op {op:#x}");
-            assert_eq!(c.resource_kind, RefKind::IndirectCommandBuffer, "op {op:#x}");
+            assert_eq!(
+                c.resource_kind,
+                RefKind::IndirectCommandBuffer,
+                "op {op:#x}"
+            );
             assert_eq!(c.resource, 6161, "op {op:#x}");
             assert_eq!(
                 (c.range_location, c.range_length),
@@ -1108,12 +1109,12 @@ mod tests {
         // not subresources. Four distinct values, so no pair can be swapped
         // without the assertion seeing it.
         let total = wire::COPY_ICB_TOTAL_LEN;
-        let mut v = hdr(OP_COPY_ICB, total);
-        st32(&mut v[HEADER_LEN..], 7171);
-        st32(&mut v[HEADER_LEN + 4..], 7272);
-        st64(&mut v[HEADER_LEN + 8..], 0x1100);
-        st64(&mut v[HEADER_LEN + 16..], 0x2200);
-        st64(&mut v[HEADER_LEN + 24..], 0x3300);
+        let mut v = hdr(wire::OPCODE_COPY_ICB, total);
+        st32(&mut v[OP_HEADER_LEN..], 7171);
+        st32(&mut v[OP_HEADER_LEN + 4..], 7272);
+        st64(&mut v[OP_HEADER_LEN + 8..], 0x1100);
+        st64(&mut v[OP_HEADER_LEN + 16..], 0x2200);
+        st64(&mut v[OP_HEADER_LEN + 24..], 0x3300);
         let c = decode(&v).expect("copy icb");
         assert_eq!(c.kind, Kind::IcbCopy);
         assert_eq!((c.source, c.destination), (7171, 7272));
@@ -1125,7 +1126,7 @@ mod tests {
             "the destination index read one of the range words"
         );
         assert_eq!(
-            decode(&hdr(OP_COPY_ICB, total - 4)).unwrap_err(),
+            decode(&hdr(wire::OPCODE_COPY_ICB, total - 4)).unwrap_err(),
             DecodeStatus::ErrShort
         );
 
@@ -1137,10 +1138,10 @@ mod tests {
 
     #[test]
     fn fence_and_resource() {
-        let mut v = hdr(OP_UPDATE_FENCE, FENCE_LEN as u32);
+        let mut v = hdr(wire::OPCODE_UPDATE_FENCE, FENCE_LEN as u32);
         st32(&mut v[8..], 3);
         assert_eq!(decode(&v).unwrap().fence, 3);
-        let mut v = hdr(OP_GENERATE_MIPMAPS, RESOURCE_LEN as u32);
+        let mut v = hdr(wire::OPCODE_GENERATE_MIPMAPS, RESOURCE_LEN as u32);
         st32(&mut v[8..], 5);
         let c = decode(&v).unwrap();
         assert_eq!(c.resource, 5);
@@ -1149,11 +1150,14 @@ mod tests {
 
     #[test]
     fn texture_to_texture_options_len() {
-        let v = hdr(OP_COPY_TEXTURE_TO_TEXTURE_OPTIONS, CTT_OPTIONS_LEN as u32);
+        let v = hdr(
+            wire::OPCODE_COPY_TEXTURE_REGION_OPTIONS,
+            CTT_OPTIONS_LEN as u32,
+        );
         // zeros decode fine
         let c = decode(&v).unwrap();
         assert!(c.has_options);
-        let bad = hdr(OP_COPY_TEXTURE_TO_TEXTURE_OPTIONS, CTT_LEN as u32);
+        let bad = hdr(wire::OPCODE_COPY_TEXTURE_REGION_OPTIONS, CTT_LEN as u32);
         assert_eq!(decode(&bad).unwrap_err(), DecodeStatus::ErrShort);
     }
 
@@ -1174,41 +1178,83 @@ mod tests {
     #[test]
     fn the_blit_opcode_table_is_exactly_apples_blit_manifest() {
         let device: &[(u32, &str)] = &[
-            (OP_COPY_BUFFER_TO_TEXTURE, "OP_COPY_BUFFER_TO_TEXTURE"),
-            (OP_COPY_BUFFER_TO_BUFFER, "OP_COPY_BUFFER_TO_BUFFER"),
-            (OP_COPY_TEXTURE_TO_BUFFER, "OP_COPY_TEXTURE_TO_BUFFER"),
-            (OP_COPY_TEXTURE_TO_TEXTURE, "OP_COPY_TEXTURE_TO_TEXTURE"),
             (
-                OP_COPY_TEXTURE_TO_TEXTURE_OPTIONS,
-                "OP_COPY_TEXTURE_TO_TEXTURE_OPTIONS",
-            ),
-            (OP_COPY_ICB, "OP_COPY_ICB"),
-            (OP_FILL_BUFFER, "OP_FILL_BUFFER"),
-            (OP_GENERATE_MIPMAPS, "OP_GENERATE_MIPMAPS"),
-            (OP_OPTIMIZE_CPU, "OP_OPTIMIZE_CPU"),
-            (OP_OPTIMIZE_GPU, "OP_OPTIMIZE_GPU"),
-            (OP_OPTIMIZE_IMAGE_CPU, "OP_OPTIMIZE_IMAGE_CPU"),
-            (OP_OPTIMIZE_IMAGE_GPU, "OP_OPTIMIZE_IMAGE_GPU"),
-            (OP_OPTIMIZE_ICB, "OP_OPTIMIZE_ICB"),
-            (OP_RESET_ICB, "OP_RESET_ICB"),
-            (OP_SYNCHRONIZE_RESOURCE, "OP_SYNCHRONIZE_RESOURCE"),
-            (OP_SYNCHRONIZE_TEXTURE_IMAGE, "OP_SYNCHRONIZE_TEXTURE_IMAGE"),
-            (OP_UPDATE_FENCE, "OP_UPDATE_FENCE"),
-            (OP_WAIT_FENCE, "OP_WAIT_FENCE"),
-            (
-                OP_COPY_TEXTURE_TO_TEXTURE_SLICE_LEVEL,
-                "OP_COPY_TEXTURE_TO_TEXTURE_SLICE_LEVEL",
-            ),
-            (OP_FILL_BUFFER_PATTERN4, "OP_FILL_BUFFER_PATTERN4"),
-            (OP_FILL_TEXTURE_BYTES, "OP_FILL_TEXTURE_BYTES"),
-            (OP_FILL_TEXTURE_COLOR, "OP_FILL_TEXTURE_COLOR"),
-            (
-                OP_INVALIDATE_COMPRESSED_TEXTURE,
-                "OP_INVALIDATE_COMPRESSED_TEXTURE",
+                wire::OPCODE_COPY_BUFFER_TO_TEXTURE,
+                "wire::OPCODE_COPY_BUFFER_TO_TEXTURE",
             ),
             (
-                OP_INVALIDATE_COMPRESSED_TEXTURE_SLICE_LEVEL,
-                "OP_INVALIDATE_COMPRESSED_TEXTURE_SLICE_LEVEL",
+                wire::OPCODE_COPY_BUFFER_TO_BUFFER,
+                "wire::OPCODE_COPY_BUFFER_TO_BUFFER",
+            ),
+            (
+                wire::OPCODE_COPY_TEXTURE_TO_BUFFER,
+                "wire::OPCODE_COPY_TEXTURE_TO_BUFFER",
+            ),
+            (
+                wire::OPCODE_COPY_TEXTURE_REGION,
+                "wire::OPCODE_COPY_TEXTURE_REGION",
+            ),
+            (
+                wire::OPCODE_COPY_TEXTURE_REGION_OPTIONS,
+                "wire::OPCODE_COPY_TEXTURE_REGION_OPTIONS",
+            ),
+            (wire::OPCODE_COPY_ICB, "wire::OPCODE_COPY_ICB"),
+            (wire::OPCODE_FILL_BUFFER, "wire::OPCODE_FILL_BUFFER"),
+            (
+                wire::OPCODE_GENERATE_MIPMAPS,
+                "wire::OPCODE_GENERATE_MIPMAPS",
+            ),
+            (
+                wire::OPCODE_OPTIMIZE_FOR_CPU,
+                "wire::OPCODE_OPTIMIZE_FOR_CPU",
+            ),
+            (
+                wire::OPCODE_OPTIMIZE_FOR_GPU,
+                "wire::OPCODE_OPTIMIZE_FOR_GPU",
+            ),
+            (
+                wire::OPCODE_OPTIMIZE_FOR_CPU_SLICE_LEVEL,
+                "wire::OPCODE_OPTIMIZE_FOR_CPU_SLICE_LEVEL",
+            ),
+            (
+                wire::OPCODE_OPTIMIZE_FOR_GPU_SLICE_LEVEL,
+                "wire::OPCODE_OPTIMIZE_FOR_GPU_SLICE_LEVEL",
+            ),
+            (wire::OPCODE_OPTIMIZE_ICB, "wire::OPCODE_OPTIMIZE_ICB"),
+            (wire::OPCODE_RESET_ICB, "wire::OPCODE_RESET_ICB"),
+            (
+                wire::OPCODE_SYNCHRONIZE_RESOURCE,
+                "wire::OPCODE_SYNCHRONIZE_RESOURCE",
+            ),
+            (
+                wire::OPCODE_SYNCHRONIZE_TEXTURE,
+                "wire::OPCODE_SYNCHRONIZE_TEXTURE",
+            ),
+            (wire::OPCODE_UPDATE_FENCE, "wire::OPCODE_UPDATE_FENCE"),
+            (wire::OPCODE_WAIT_FOR_FENCE, "wire::OPCODE_WAIT_FOR_FENCE"),
+            (
+                wire::OPCODE_COPY_TEXTURE_SLICES,
+                "wire::OPCODE_COPY_TEXTURE_SLICES",
+            ),
+            (
+                wire::OPCODE_FILL_BUFFER_PATTERN4,
+                "wire::OPCODE_FILL_BUFFER_PATTERN4",
+            ),
+            (
+                wire::OPCODE_FILL_TEXTURE_BYTES,
+                "wire::OPCODE_FILL_TEXTURE_BYTES",
+            ),
+            (
+                wire::OPCODE_FILL_TEXTURE_COLOR,
+                "wire::OPCODE_FILL_TEXTURE_COLOR",
+            ),
+            (
+                wire::OPCODE_INVALIDATE_COMPRESSED_TEXTURE,
+                "wire::OPCODE_INVALIDATE_COMPRESSED_TEXTURE",
+            ),
+            (
+                wire::OPCODE_INVALIDATE_COMPRESSED_TEXTURE_SLICE_LEVEL,
+                "wire::OPCODE_INVALIDATE_COMPRESSED_TEXTURE_SLICE_LEVEL",
             ),
         ];
 

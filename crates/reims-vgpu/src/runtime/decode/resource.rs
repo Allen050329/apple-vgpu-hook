@@ -1,9 +1,9 @@
 //! Resource descriptor decode (port of `host/utils/reims-vgpu-resource-decode`).
 
 use crate::contract::endian::{ld16, ld32, ld64}; // ld64: texture-view level base/count
-use crate::runtime::heap_query;
 #[cfg(test)]
-use crate::contract::endian::{st16, st32}; // ICB layout fixture encoder only
+use crate::contract::endian::{st16, st32};
+use crate::runtime::heap_query; // ICB layout fixture encoder only
 
 use core::mem::{offset_of, size_of};
 use reims_vgpu_wire::ops::{
@@ -1080,7 +1080,10 @@ impl IndirectCommandBufferDescriptor {
         let mut out = Vec::new();
         // Default off: asking is setting the bit.
         for (bit, flag) in [
-            (ICB_FLAG_SUPPORT_RAY_TRACING, IcbUnappliedFlag::SupportRayTracing),
+            (
+                ICB_FLAG_SUPPORT_RAY_TRACING,
+                IcbUnappliedFlag::SupportRayTracing,
+            ),
             (
                 ICB_FLAG_SUPPORT_DYNAMIC_ATTRIBUTE_STRIDE,
                 IcbUnappliedFlag::SupportDynamicAttributeStride,
@@ -1099,12 +1102,18 @@ impl IndirectCommandBufferDescriptor {
                 ICB_FLAG_INHERIT_DEPTH_STENCIL_STATE,
                 IcbUnappliedFlag::InheritDepthStencilState,
             ),
-            (ICB_FLAG_INHERIT_DEPTH_BIAS, IcbUnappliedFlag::InheritDepthBias),
+            (
+                ICB_FLAG_INHERIT_DEPTH_BIAS,
+                IcbUnappliedFlag::InheritDepthBias,
+            ),
             (
                 ICB_FLAG_INHERIT_DEPTH_CLIP_MODE,
                 IcbUnappliedFlag::InheritDepthClipMode,
             ),
-            (ICB_FLAG_INHERIT_CULL_MODE, IcbUnappliedFlag::InheritCullMode),
+            (
+                ICB_FLAG_INHERIT_CULL_MODE,
+                IcbUnappliedFlag::InheritCullMode,
+            ),
             (
                 ICB_FLAG_INHERIT_FRONT_FACING_WINDING,
                 IcbUnappliedFlag::InheritFrontFacingWinding,
@@ -1567,75 +1576,64 @@ pub fn parse_vertex_block(
     Ok(attrs)
 }
 
-fn parse_depth_stencil_face(bytes: &[u8]) -> DepthStencilFace {
-    let bits = ld32(&bytes[0..]);
+fn face_from_wire(face: &w_ds::StencilFace) -> DepthStencilFace {
     DepthStencilFace {
-        compare_function: bits & 0x7,
-        stencil_failure_operation: (bits >> 3) & 0x7,
-        depth_failure_operation: (bits >> 6) & 0x7,
-        depth_stencil_pass_operation: (bits >> 9) & 0x7,
-        read_mask: ld32(&bytes[4..]),
-        write_mask: ld32(&bytes[8..]),
+        compare_function: face.compare_function() as u32,
+        stencil_failure_operation: face.stencil_failure_operation() as u32,
+        depth_failure_operation: face.depth_failure_operation() as u32,
+        depth_stencil_pass_operation: face.depth_stencil_pass_operation() as u32,
+        read_mask: face.read_mask.get(),
+        write_mask: face.write_mask.get(),
     }
 }
 
 pub fn decode_depth_stencil_descriptor(
     bytes: &[u8],
 ) -> Result<DepthStencilDescriptor, DecodeStatus> {
-    if bytes.len() < DEPTH_STENCIL_DESC_LEN {
-        return Err(DecodeStatus::ErrShort("res_depth_stencil_short"));
-    }
-    let tag = ld32(&bytes[0..]);
-    let declared = ld32(&bytes[4..]);
-    if tag != TYPE7_OBJECT_DEPTH_STENCIL || declared as usize != bytes.len() {
+    let op = reims_vgpu_wire::op(bytes, 0)
+        .map_err(|_| DecodeStatus::ErrShort("res_depth_stencil_short"))?;
+    if op.opcode() != TYPE7_OBJECT_DEPTH_STENCIL || op.length() as usize != bytes.len() {
         return Err(DecodeStatus::ErrUnsupported("res_depth_stencil_tag"));
     }
-    let state_bits = ld32(&bytes[DEPTH_STENCIL_DESC_STATE_BITS..]);
+    let body = w_ds::new_depth_stencil(&op)
+        .map_err(|_| DecodeStatus::ErrShort("res_depth_stencil_short"))?;
+    // Product still names bits [5:4] as face-enabled; wire records them as
+    // unidentified (Metal substitutes default faces before serialize). Keep the
+    // product field names; source the bit from the same byte the view exposes.
+    let state = body.depth_state;
     Ok(DepthStencilDescriptor {
-        depth_stencil_id: ld32(&bytes[DEPTH_STENCIL_DESC_ID..]),
-        depth_compare_function: state_bits & DEPTH_STENCIL_DEPTH_COMPARE_MASK,
-        depth_write_enabled: (state_bits & DEPTH_STENCIL_DEPTH_WRITE) != 0,
-        front_stencil_enabled: (state_bits & DEPTH_STENCIL_FRONT_STENCIL_ENABLED) != 0,
-        back_stencil_enabled: (state_bits & DEPTH_STENCIL_BACK_STENCIL_ENABLED) != 0,
-        front_face: parse_depth_stencil_face(&bytes[DEPTH_STENCIL_DESC_FRONT_FACE..]),
-        back_face: parse_depth_stencil_face(&bytes[DEPTH_STENCIL_DESC_BACK_FACE..]),
+        depth_stencil_id: body.object_ref.get(),
+        depth_compare_function: body.depth_compare_function() as u32,
+        depth_write_enabled: body.depth_write_enabled(),
+        front_stencil_enabled: (state & DEPTH_STENCIL_FRONT_STENCIL_ENABLED as u8) != 0,
+        back_stencil_enabled: (state & DEPTH_STENCIL_BACK_STENCIL_ENABLED as u8) != 0,
+        front_face: face_from_wire(&body.front),
+        back_face: face_from_wire(&body.back),
     })
 }
 
 pub fn decode_sampler_descriptor(bytes: &[u8]) -> Result<SamplerDescriptor, DecodeStatus> {
-    if bytes.len() < SAMPLER_DESC_LEN {
-        return Err(DecodeStatus::ErrShort("res_sampler_short"));
-    }
-    let tag = ld32(&bytes[SAMPLER_DESC_TAG..]);
-    let declared = ld32(&bytes[SAMPLER_DESC_DECLARED_LEN..]);
-    if tag != TYPE7_OBJECT_SAMPLER || declared as usize != bytes.len() {
+    let op =
+        reims_vgpu_wire::op(bytes, 0).map_err(|_| DecodeStatus::ErrShort("res_sampler_short"))?;
+    if op.opcode() != TYPE7_OBJECT_SAMPLER || op.length() as usize != bytes.len() {
         return Err(DecodeStatus::ErrUnsupported("res_sampler_tag"));
     }
-    let bits = ld32(&bytes[SAMPLER_DESC_STATE_BITS..]);
-    const MIN_MAG_MASK: u32 = 0x1;
-    const MIP_MASK: u32 = 0x3;
-    const COMPARE_MASK: u32 = 0x7;
-    const ADDR_MASK: u32 = 0x7;
-    const BORDER_MASK: u32 = 0x3;
-    const ANISO_MASK: u32 = 0x1f;
-    const LOD_AVERAGE: u32 = 1 << 4;
-    const NORM_COORDS: u32 = 0x8000_0000;
-    let word16 = ld32(&bytes[SAMPLER_DESC_WORD16..]);
+    let body = w_smp::new_sampler(&op).map_err(|_| DecodeStatus::ErrShort("res_sampler_short"))?;
     Ok(SamplerDescriptor {
-        min_filter: bits & MIN_MAG_MASK,
-        mag_filter: (bits >> 2) & MIN_MAG_MASK,
-        mip_filter: (bits >> 24) & MIP_MASK,
-        s_address: (bits >> 8) & ADDR_MASK,
-        t_address: (bits >> 12) & ADDR_MASK,
-        r_address: (bits >> 16) & ADDR_MASK,
-        max_anisotropy: ((bits >> 26) & ANISO_MASK).max(1),
-        lod_min_clamp: f32::from_bits(ld32(&bytes[SAMPLER_DESC_WORD20..])),
-        lod_max_clamp: f32::from_bits(ld32(&bytes[SAMPLER_DESC_LOD_MAX..])),
-        compare_function: (bits >> 5) & COMPARE_MASK,
-        border_color: (bits >> 20) & BORDER_MASK,
-        normalized_coordinates: (bits & NORM_COORDS) != 0,
-        support_argument_buffers: (word16 & 1) != 0,
-        lod_average: (bits & LOD_AVERAGE) != 0,
+        min_filter: body.min_filter() as u32,
+        mag_filter: body.mag_filter() as u32,
+        mip_filter: body.mip_filter() as u32,
+        s_address: body.s_address_mode() as u32,
+        t_address: body.t_address_mode() as u32,
+        r_address: body.r_address_mode() as u32,
+        max_anisotropy: (body.max_anisotropy() as u32).max(1),
+        lod_min_clamp: body.lod_min_clamp.get(),
+        lod_max_clamp: body.lod_max_clamp.get(),
+        compare_function: body.compare_function() as u32,
+        border_color: body.border_color() as u32,
+        normalized_coordinates: body.normalized_coordinates(),
+        support_argument_buffers: body.support_argument_buffers(),
+        lod_average: body.lod_average(),
     })
 }
 
@@ -1881,8 +1879,10 @@ fn parse_one_color_entry(
             // bind this entry's state to a slot the guest did not name, so the
             // entry is reported and left on its position rather than silently
             // aliasing a real attachment.
-            if crate::observe::first_sight("color_attachment_index_out_of_range", u64::from(declared))
-            {
+            if crate::observe::first_sight(
+                "color_attachment_index_out_of_range",
+                u64::from(declared),
+            ) {
                 crate::observe::Emit::decline(
                     "type7_color_attach",
                     &ColorAttachIndexOutOfRange { declared },
@@ -2118,53 +2118,53 @@ pub struct HeapTextureRecord<'a> {
 /// but [`HEAP_TEXTURE_USE_OFFSET_BIT`], and an open-coded read of it had no
 /// test and was wrong.
 pub fn decode_heap_texture(bytes: &[u8]) -> Result<HeapTextureRecord<'_>, DecodeStatus> {
-    if bytes.len() < OP_HDR {
-        return Err(DecodeStatus::ErrShort("res_heap_texture_len"));
-    }
+    let op = reims_vgpu_wire::op(bytes, 0)
+        .map_err(|_| DecodeStatus::ErrShort("res_heap_texture_len"))?;
     // Dispatch on the opcode, then require the length that opcode implies. The
-    // wide form is a *different opcode* rather than a longer record, so the
-    // other order — pick a layout from the length — would read a 68-byte record
-    // at the narrow offsets whenever the two ever collide.
-    let (len, heap_ref_at, desc_at, use_offset_at, offset_at, wide) =
-        match ld32(&bytes[TEXTURE_VIEW_DESC_OPCODE..]) {
-            HEAP_TEXTURE_OPCODE => (
-                HEAP_TEXTURE_LEN,
-                HEAP_TEXTURE_HEAP_REF,
-                HEAP_TEXTURE_DESCRIPTOR,
-                HEAP_TEXTURE_USE_OFFSET,
-                HEAP_TEXTURE_OFFSET,
-                false,
-            ),
-            HEAP_TEXTURE_WIDE_OPCODE => (
-                HEAP_TEXTURE_WIDE_LEN,
-                HEAP_TEXTURE_WIDE_HEAP_REF,
-                HEAP_TEXTURE_WIDE_DESCRIPTOR,
-                HEAP_TEXTURE_WIDE_USE_OFFSET,
-                HEAP_TEXTURE_WIDE_OFFSET,
-                true,
-            ),
-            _ => return Err(DecodeStatus::ErrUnsupported("res_heap_texture_opcode")),
-        };
-    if bytes.len() != len {
-        return Err(DecodeStatus::ErrShort("res_heap_texture_len"));
+    // wide form is a different opcode rather than a longer record.
+    match op.opcode() {
+        HEAP_TEXTURE_OPCODE => {
+            if bytes.len() != HEAP_TEXTURE_LEN {
+                return Err(DecodeStatus::ErrShort("res_heap_texture_len"));
+            }
+            let b = w_heap::new_heap_texture(&op)
+                .map_err(|_| DecodeStatus::ErrShort("res_heap_texture_len"))?;
+            let desc_at = OP_HDR + offset_of!(w_heap::NewHeapTextureBody, desc);
+            let use_offset_at = OP_HDR + offset_of!(w_heap::NewHeapTextureBody, use_offset_bits);
+            Ok(HeapTextureRecord {
+                heap_ref: b.heap_ref.get(),
+                use_offset: b.use_offset(),
+                offset: b.offset.get(),
+                descriptor: &bytes[desc_at..use_offset_at],
+                wide: false,
+            })
+        }
+        HEAP_TEXTURE_WIDE_OPCODE => {
+            if bytes.len() != HEAP_TEXTURE_WIDE_LEN {
+                return Err(DecodeStatus::ErrShort("res_heap_texture_len"));
+            }
+            let b = w_heap::new_heap_texture_wide(&op)
+                .map_err(|_| DecodeStatus::ErrShort("res_heap_texture_len"))?;
+            let desc_at = OP_HDR + offset_of!(w_heap::NewHeapTextureWideBody, desc);
+            let use_offset_at =
+                OP_HDR + offset_of!(w_heap::NewHeapTextureWideBody, use_offset_bits);
+            Ok(HeapTextureRecord {
+                heap_ref: b.heap_ref.get(),
+                use_offset: b.use_offset(),
+                offset: b.offset.get(),
+                descriptor: &bytes[desc_at..use_offset_at],
+                wide: true,
+            })
+        }
+        _ => Err(DecodeStatus::ErrUnsupported("res_heap_texture_opcode")),
     }
-    Ok(HeapTextureRecord {
-        heap_ref: ld32(&bytes[heap_ref_at..]),
-        // One bit. Everything else in this four-byte slot is the guest's stale
-        // ring, so a wider read here is a lost texture, not a stricter check.
-        use_offset: bytes[use_offset_at] & HEAP_TEXTURE_USE_OFFSET_BIT != 0,
-        offset: ld64(&bytes[offset_at..]),
-        descriptor: &bytes[desc_at..use_offset_at],
-        wide,
-    })
 }
 
 pub fn decode_texture_view_descriptor(bytes: &[u8]) -> Result<TextureViewDescriptor, DecodeStatus> {
-    if bytes.len() < TEXTURE_VIEW_MIN_SIMPLE {
-        return Err(DecodeStatus::ErrShort("res_texture_view_short"));
-    }
-    let view_opcode = ld32(&bytes[TEXTURE_VIEW_DESC_OPCODE..]);
-    let declared = ld32(&bytes[TEXTURE_VIEW_DESC_LEN..]) as usize;
+    let op = reims_vgpu_wire::op(bytes, 0)
+        .map_err(|_| DecodeStatus::ErrShort("res_texture_view_short"))?;
+    let view_opcode = op.opcode();
+    let declared = op.length() as usize;
     let min_len = match view_opcode {
         TEXTURE_VIEW_OPCODE_SIMPLE => TEXTURE_VIEW_MIN_SIMPLE,
         TEXTURE_VIEW_OPCODE_RANGED => TEXTURE_VIEW_MIN_RANGED,
@@ -2174,42 +2174,73 @@ pub fn decode_texture_view_descriptor(bytes: &[u8]) -> Result<TextureViewDescrip
     if declared < min_len || declared != bytes.len() {
         return Err(DecodeStatus::ErrShort("res_texture_view_declared_len"));
     }
-    let pixel_format = ld16(&bytes[TEXTURE_VIEW_DESC_PIXEL_FORMAT..]);
-    let mut out = TextureViewDescriptor {
-        view_opcode,
-        view_texture_ref: ld32(&bytes[TEXTURE_VIEW_DESC_TEXTURE_REF..]),
-        base_texture_ref: ld32(&bytes[TEXTURE_VIEW_DESC_BASE_REF..]),
-        pixel_format,
-        // `!= 0`, the same rule `decode_texture_descriptor` uses, and not the
-        // unconditional `true` this used to carry. `MTLPixelFormatInvalid` is 0,
-        // so a zero here is a format the descriptor did not state — and a flag
-        // named `has_pixel_format` that answers yes for a format nobody named is
-        // a trap for the first caller to gate on it. Every current reader of
-        // this flag is on `TextureDescriptor`, so the two must not disagree
-        // about what it means.
-        has_pixel_format: pixel_format != 0,
-        ..Default::default()
-    };
-    if view_opcode >= TEXTURE_VIEW_OPCODE_RANGED && bytes.len() >= TEXTURE_VIEW_MIN_RANGED {
-        out.has_texture_type = true;
-        out.texture_type = ld16(&bytes[TEXTURE_VIEW_DESC_TEXTURE_TYPE..]);
-        out.has_levels = true;
-        out.level_base = ld64(&bytes[TEXTURE_VIEW_DESC_LEVEL_BASE..]);
-        out.level_count = ld64(&bytes[TEXTURE_VIEW_DESC_LEVEL_COUNT..]);
-        out.has_slices = true;
-        out.slice_base = ld64(&bytes[TEXTURE_VIEW_DESC_SLICE_BASE..]);
-        out.slice_count = ld64(&bytes[TEXTURE_VIEW_DESC_SLICE_COUNT..]);
+
+    match view_opcode {
+        TEXTURE_VIEW_OPCODE_SIMPLE => {
+            let b = w_view::texture_view(&op)
+                .map_err(|_| DecodeStatus::ErrShort("res_texture_view_short"))?;
+            let pixel_format = b.pixel_format.get();
+            Ok(TextureViewDescriptor {
+                view_opcode,
+                view_texture_ref: b.object_ref.get(),
+                base_texture_ref: b.base_texture_ref.get(),
+                pixel_format,
+                has_pixel_format: pixel_format != 0,
+                ..Default::default()
+            })
+        }
+        TEXTURE_VIEW_OPCODE_RANGED => {
+            let b = w_view::texture_view_ranged(&op)
+                .map_err(|_| DecodeStatus::ErrShort("res_texture_view_short"))?;
+            let pixel_format = b.pixel_format.get();
+            Ok(TextureViewDescriptor {
+                view_opcode,
+                view_texture_ref: b.object_ref.get(),
+                base_texture_ref: b.base_texture_ref.get(),
+                pixel_format,
+                has_pixel_format: pixel_format != 0,
+                has_texture_type: true,
+                texture_type: b.texture_type.get(),
+                has_levels: true,
+                level_base: b.level_base.get(),
+                level_count: b.level_count.get(),
+                has_slices: true,
+                slice_base: b.slice_base.get(),
+                slice_count: b.slice_count.get(),
+                ..Default::default()
+            })
+        }
+        TEXTURE_VIEW_OPCODE_SWIZZLE => {
+            let b = w_view::texture_view_swizzle(&op)
+                .map_err(|_| DecodeStatus::ErrShort("res_texture_view_short"))?;
+            let r = &b.ranged;
+            let pixel_format = r.pixel_format.get();
+            Ok(TextureViewDescriptor {
+                view_opcode,
+                view_texture_ref: r.object_ref.get(),
+                base_texture_ref: r.base_texture_ref.get(),
+                pixel_format,
+                has_pixel_format: pixel_format != 0,
+                has_texture_type: true,
+                texture_type: r.texture_type.get(),
+                has_levels: true,
+                level_base: r.level_base.get(),
+                level_count: r.level_count.get(),
+                has_slices: true,
+                slice_base: r.slice_base.get(),
+                slice_count: r.slice_count.get(),
+                has_swizzle: true,
+                swizzle: [
+                    b.swizzle.red,
+                    b.swizzle.green,
+                    b.swizzle.blue,
+                    b.swizzle.alpha,
+                ],
+                ..Default::default()
+            })
+        }
+        _ => Err(DecodeStatus::ErrUnsupported("res_texture_view_opcode")),
     }
-    if view_opcode == TEXTURE_VIEW_OPCODE_SWIZZLE && bytes.len() >= TEXTURE_VIEW_MIN_SWIZZLE {
-        out.has_swizzle = true;
-        out.swizzle = [
-            bytes[TEXTURE_VIEW_DESC_SWIZZLE],
-            bytes[TEXTURE_VIEW_DESC_SWIZZLE + 1],
-            bytes[TEXTURE_VIEW_DESC_SWIZZLE + 2],
-            bytes[TEXTURE_VIEW_DESC_SWIZZLE + 3],
-        ];
-    }
-    Ok(out)
 }
 
 /// A texture aliased over an MTLBuffer's storage — object type 8, view_opcode 9
@@ -2251,44 +2282,56 @@ pub struct BufferTextureDescriptor {
 pub fn decode_buffer_texture_descriptor(
     bytes: &[u8],
 ) -> Result<BufferTextureDescriptor, DecodeStatus> {
-    if bytes.len() < OP_HDR {
-        return Err(DecodeStatus::ErrShort("res_buffer_texture_short"));
+    let op = reims_vgpu_wire::op(bytes, 0)
+        .map_err(|_| DecodeStatus::ErrShort("res_buffer_texture_short"))?;
+    // Exactly the length this opcode implies — see `decode_heap_texture`.
+    match op.opcode() {
+        TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE => {
+            if bytes.len() != BUF_TEX_MIN_LEN {
+                return Err(DecodeStatus::ErrShort("res_buffer_texture_short"));
+            }
+            if op.length() as usize != BUF_TEX_MIN_LEN {
+                return Err(DecodeStatus::ErrShort("res_buffer_texture_declared_len"));
+            }
+            let b = w_backed::buffer_texture(&op)
+                .map_err(|_| DecodeStatus::ErrShort("res_buffer_texture_short"))?;
+            let body_at = OP_HDR + offset_of!(w_backed::BufferTextureBody, desc);
+            let desc = heap_query::decode_serialized_texture_descriptor(
+                &bytes[body_at..body_at + heap_query::TEXTURE_BODY_LEN],
+            )
+            .map_err(|_| DecodeStatus::ErrShort("res_buffer_texture_body"))?;
+            Ok(BufferTextureDescriptor {
+                new_texture_ref: b.object_ref.get(),
+                buffer_ref: b.buffer_ref.get(),
+                offset: b.offset.get(),
+                bytes_per_row: b.bytes_per_row.get(),
+                desc,
+            })
+        }
+        TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE_WIDE => {
+            if bytes.len() != BUF_TEX_WIDE_LEN {
+                return Err(DecodeStatus::ErrShort("res_buffer_texture_short"));
+            }
+            if op.length() as usize != BUF_TEX_WIDE_LEN {
+                return Err(DecodeStatus::ErrShort("res_buffer_texture_declared_len"));
+            }
+            let b = w_backed::buffer_texture_wide(&op)
+                .map_err(|_| DecodeStatus::ErrShort("res_buffer_texture_short"))?;
+            let body_at = OP_HDR + offset_of!(w_backed::BufferTextureWideBody, desc);
+            let desc = heap_query::decode_wide_serialized_texture_descriptor(
+                &bytes[body_at..body_at + heap_query::WIDE_TEXTURE_BODY_LEN],
+            )
+            .map_err(|_| DecodeStatus::ErrShort("res_buffer_texture_body"))?;
+            Ok(BufferTextureDescriptor {
+                new_texture_ref: b.object_ref.get(),
+                buffer_ref: b.buffer_ref.get(),
+                offset: b.offset.get(),
+                bytes_per_row: b.bytes_per_row.get(),
+                desc,
+            })
+        }
+        _ => Err(DecodeStatus::ErrUnsupported("res_buffer_texture_opcode")),
     }
-    // Opcode first, then the length that opcode implies — see
-    // [`decode_heap_texture`] for why the reverse order is unsafe here.
-    let (record_len, body_at, wide) = match ld32(&bytes[TEXTURE_VIEW_DESC_OPCODE..]) {
-        TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE => (BUF_TEX_MIN_LEN, BUF_TEX_DESC_BODY, false),
-        TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE_WIDE => (BUF_TEX_WIDE_LEN, BUF_TEX_WIDE_DESC_BODY, true),
-        _ => return Err(DecodeStatus::ErrUnsupported("res_buffer_texture_opcode")),
-    };
-    // Exactly the length this opcode implies, not "at least" it. The two forms
-    // differ only in how wide their descriptor is, so a record accepted at a
-    // length its own opcode does not name is one whose body may be read eight
-    // bytes from where it lives — and until the wide opcode existed, nothing
-    // in the family could tell the two apart. `decode_heap_texture` has always
-    // required the exact length; this is the sibling agreeing with it.
-    if bytes.len() != record_len {
-        return Err(DecodeStatus::ErrShort("res_buffer_texture_short"));
-    }
-    let declared = ld32(&bytes[TEXTURE_VIEW_DESC_LEN..]) as usize;
-    if declared != record_len {
-        return Err(DecodeStatus::ErrShort("res_buffer_texture_declared_len"));
-    }
-    let desc = if wide {
-        let body = &bytes[body_at..body_at + heap_query::WIDE_TEXTURE_BODY_LEN];
-        heap_query::decode_wide_serialized_texture_descriptor(body)
-    } else {
-        let body = &bytes[body_at..body_at + heap_query::TEXTURE_BODY_LEN];
-        heap_query::decode_serialized_texture_descriptor(body)
-    }
-    .map_err(|_| DecodeStatus::ErrShort("res_buffer_texture_body"))?;
-    Ok(BufferTextureDescriptor {
-        new_texture_ref: ld32(&bytes[TEXTURE_VIEW_DESC_TEXTURE_REF..]),
-        buffer_ref: ld32(&bytes[BUF_TEX_DESC_BUFFER_REF..]),
-        offset: ld64(&bytes[BUF_TEX_DESC_OFFSET..]),
-        bytes_per_row: ld64(&bytes[BUF_TEX_DESC_BYTES_PER_ROW..]),
-        desc,
-    })
 }
 
 /// Peek the view_opcode of a type-8 descriptor (opcode 9 = buffer-backed texture,
@@ -2810,51 +2853,35 @@ pub fn icb_layout_attribute_stride_slot_count(layout: &IcbCommandLayout) -> u16 
 pub fn decode_icb_descriptor(
     bytes: &[u8],
 ) -> Result<IndirectCommandBufferDescriptor, DecodeStatus> {
-    if bytes.len() < ICB_DESC_LEN {
-        return Err(DecodeStatus::ErrShort("res_icb_desc_short"));
-    }
-    let tag = ld32(&bytes[ICB_DESC_TAG..]);
-    let declared = ld32(&bytes[ICB_DESC_DECLARED_LEN..]);
-    if tag != TYPE7_OBJECT_ICB
-        || declared as usize != ICB_DESC_LEN
-        || declared as usize != bytes.len()
+    let op =
+        reims_vgpu_wire::op(bytes, 0).map_err(|_| DecodeStatus::ErrShort("res_icb_desc_short"))?;
+    if op.opcode() != TYPE7_OBJECT_ICB
+        || op.length() as usize != ICB_DESC_LEN
+        || bytes.len() != ICB_DESC_LEN
     {
         return Err(DecodeStatus::ErrUnsupported("res_icb_desc_tag"));
     }
-    let command_types = ld32(&bytes[ICB_DESC_COMMAND_TYPES..]);
-    let max_vertex = bytes[ICB_DESC_MAX_VERTEX_BINDS] as u16;
-    let max_fragment = bytes[ICB_DESC_MAX_FRAGMENT_BINDS] as u16;
-    let max_kernel_byte = bytes[ICB_DESC_MAX_KERNEL_BINDS] as u16;
-    let max_object = bytes[ICB_DESC_MAX_OBJECT_BINDS] as u16;
-    let max_mesh = bytes[ICB_DESC_MAX_MESH_BINDS] as u16;
-    let max_kernel_tg = bytes[ICB_DESC_MAX_KERNEL_TG_BINDS] as u16;
-    let max_object_tg = bytes[ICB_DESC_MAX_OBJECT_TG_BINDS] as u16;
+    let body = w_icb::new_indirect_command_buffer(&op)
+        .map_err(|_| DecodeStatus::ErrShort("res_icb_desc_short"))?;
     // Bit 15 is never written by the serializer; see [`ICB_FLAG_NEVER_WRITTEN`].
-    let flags = ld16(&bytes[ICB_DESC_FLAGS..]) & !ICB_FLAG_NEVER_WRITTEN;
-    // `maxFragmentBufferBindCount` is reported as the guest wrote it at +0x0d.
-    // It used to be forced to 0 whenever `command_types` named a dispatch and no
-    // draw, on the reading that the guest "meant" a compute-only buffer. That is
-    // an inference about intent overriding a field the descriptor states
-    // outright, and it was silent — a decoded value was discarded with nothing
-    // recorded. The command layout at +0x1c independently carries
-    // `fragment_buffer_bind_offset`, so nothing downstream needs the count to be
-    // re-derived from the command mask.
-    // Create body packs maxKernel at +0x0e (third bind-count byte).
-    let max_kernel = max_kernel_byte;
-    let layout =
-        decode_icb_command_layout(&bytes[ICB_DESC_LAYOUT..ICB_DESC_LAYOUT + ICB_LAYOUT_LEN])?;
+    let flags = body.flags.get() & !ICB_FLAG_NEVER_WRITTEN;
+    // Layout remains a nested decode of the embedded layout block (same bytes).
+    let layout_at = OP_HDR + offset_of!(w_icb::NewIcbBody, layout);
+    let layout = decode_icb_command_layout(&bytes[layout_at..layout_at + ICB_LAYOUT_LEN])?;
     Ok(IndirectCommandBufferDescriptor {
-        command_types,
-        max_vertex_buffer_bind_count: max_vertex,
-        max_fragment_buffer_bind_count: max_fragment,
-        max_kernel_buffer_bind_count: max_kernel,
-        max_object_buffer_bind_count: max_object,
-        max_mesh_buffer_bind_count: max_mesh,
-        max_kernel_threadgroup_memory_bind_count: max_kernel_tg,
-        max_object_threadgroup_memory_bind_count: max_object_tg,
+        command_types: body.command_types.get(),
+        max_vertex_buffer_bind_count: body.max_vertex_buffer_bind_count as u16,
+        max_fragment_buffer_bind_count: body.max_fragment_buffer_bind_count as u16,
+        max_kernel_buffer_bind_count: body.max_kernel_buffer_bind_count as u16,
+        max_object_buffer_bind_count: body.max_object_buffer_bind_count as u16,
+        max_mesh_buffer_bind_count: body.max_mesh_buffer_bind_count as u16,
+        max_kernel_threadgroup_memory_bind_count: body.max_kernel_threadgroup_memory_bind_count
+            as u16,
+        max_object_threadgroup_memory_bind_count: body.max_object_threadgroup_memory_bind_count
+            as u16,
         flags,
-        max_command_count: ld32(&bytes[ICB_DESC_MAX_COMMAND_COUNT..]),
-        options: ld16(&bytes[ICB_DESC_OPTIONS..]),
+        max_command_count: body.max_command_count.get(),
+        options: body.options.get(),
         layout,
     })
 }
@@ -3245,7 +3272,11 @@ mod tests {
                 flag::INHERIT_PIPELINE_STATE,
                 "inherit_pipeline_state",
             ),
-            (ICB_FLAG_INHERIT_BUFFERS, flag::INHERIT_BUFFERS, "inherit_buffers"),
+            (
+                ICB_FLAG_INHERIT_BUFFERS,
+                flag::INHERIT_BUFFERS,
+                "inherit_buffers",
+            ),
             (
                 ICB_FLAG_SUPPORT_RAY_TRACING,
                 flag::SUPPORT_RAY_TRACING,

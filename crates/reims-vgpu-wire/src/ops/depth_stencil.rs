@@ -212,7 +212,15 @@ mod tests {
     }
 
     fn baseline() -> [u8; 40] {
-        synth(0x37, 7, 0xffff_ffff, 0xffff_ffff, 7, 0xffff_ffff, 0xffff_ffff)
+        synth(
+            0x37,
+            7,
+            0xffff_ffff,
+            0xffff_ffff,
+            7,
+            0xffff_ffff,
+            0xffff_ffff,
+        )
     }
 
     #[test]
@@ -341,10 +349,7 @@ mod tests {
         };
         assert!(matches!(
             new_depth_stencil(&short),
-            Err(WireError::Short {
-                need: 32,
-                have: 16
-            })
+            Err(WireError::Short { need: 32, have: 16 })
         ));
     }
 }

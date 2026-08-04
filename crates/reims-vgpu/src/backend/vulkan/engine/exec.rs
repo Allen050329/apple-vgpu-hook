@@ -13,9 +13,9 @@ use super::context::ContextOwner;
 use super::counters::EngineCounters;
 use super::device_lost::{DeviceLostDecline, DeviceLostOp};
 use super::draw_execution::DrawExecutionDecline;
-use super::stage_phase;
 use super::draw_validation::DrawValidationDecline;
 use super::pools::{BufferSlot, ResourcePools, SampledSlot, TargetKey};
+use super::stage_phase;
 use super::types::{
     BufferContent, ColorWriteMask, DrawError, DrawOutput, DrawRequest, SampledSource,
     ScissorResource, SeedOrder, VertexStepFunction, ViewportResource,
@@ -1108,8 +1108,7 @@ pub(crate) unsafe fn execute_draw_inner(
                 counters,
             )?
         };
-        let _s =
-            stage_phase::Span::moving(stage_phase::Part::Bytes, indexed.indices.len() as u64);
+        let _s = stage_phase::Span::moving(stage_phase::Part::Bytes, indexed.indices.len() as u64);
         pools.write_staging(ctx, &slot, &indexed.indices)?;
         drop(_s);
         index_slot = Some(slot);

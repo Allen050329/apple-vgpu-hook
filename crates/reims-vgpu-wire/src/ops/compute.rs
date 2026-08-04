@@ -74,7 +74,10 @@ unsafe impl Wire for Dispatch {}
 
 #[inline]
 pub fn is_dispatch(opcode: u32) -> bool {
-    matches!(opcode, OPCODE_DISPATCH_THREADGROUPS | OPCODE_DISPATCH_THREADS)
+    matches!(
+        opcode,
+        OPCODE_DISPATCH_THREADGROUPS | OPCODE_DISPATCH_THREADS
+    )
 }
 
 pub fn dispatch<'a>(op: &Op<'a>) -> Result<&'a Dispatch, WireError> {
