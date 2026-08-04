@@ -17,6 +17,11 @@
 //!   allocation names a [`MemoryClass`] and this module turns it into flags.
 //! * [`device_features`] — which optional device features are queried and
 //!   enabled, in one place, so no site can ask about one it did not request.
+//! * [`external_memory::DmaBufImport`] — whether guest pages can reach the GPU
+//!   as a dma-buf import. This is the *import* direction, and it satisfies the
+//!   rule the deleted export bit did not: the zero-copy upload and writeback
+//!   rails branch on it, and on a host where it reads anything but `Supported`
+//!   they take the staged path and say which rung refused.
 //! * [`DriverQuirk`] — the only place driver identity may change behavior.
 //!
 //! **Vulkan 1.2 is the baseline on every supported host.** See [`api_floor`]
@@ -37,9 +42,11 @@
 pub mod api_floor;
 pub mod device_features;
 pub mod device_select;
+pub mod external_memory;
 pub mod memory_topology;
 
 pub use device_select::{rank_physical_device, select_physical_device};
+pub use external_memory::DmaBufImport;
 pub use memory_topology::{
     MappedMemoryKind, MemoryClass, MemoryProfile, MemoryTopology, TopologySignal,
 };
@@ -79,6 +86,10 @@ impl DriverQuirk {
 pub struct HostGpuCaps {
     pub memory: MemoryProfile,
     pub quirks: DriverQuirk,
+    /// Whether guest pages may be imported as `VkDeviceMemory` through a
+    /// dma-buf fd. Read by the zero-copy rails to decide between a direct bind
+    /// and a staged copy, and by nothing else.
+    pub dma_buf_import: DmaBufImport,
     /// `VK_KHR_portability_subset` was advertised. Kept for the selection log
     /// line and for constructing [`DriverQuirk`] — never gate behavior on it
     /// directly.
@@ -100,13 +111,14 @@ impl HostGpuCaps {
     /// something the device reported.
     pub fn selection_line(&self, device_name: &str) -> String {
         format!(
-            "vk_caps api={} baseline={} memory={} memory_signal={} device_local_mb={} host_visible_device_local_mb={} portability_subset={} type={:?} name={device_name:?}",
+            "vk_caps api={} baseline={} memory={} memory_signal={} device_local_mb={} host_visible_device_local_mb={} dma_buf_import={} portability_subset={} type={:?} name={device_name:?}",
             api_floor::version_str(self.device_api_version),
             api_floor::version_str(api_floor::MIN_SUPPORTED_API),
             self.memory.topology.slug(),
             self.memory.signal.slug(),
             self.memory.device_local_bytes >> 20,
             self.memory.host_visible_device_local_bytes >> 20,
+            self.dma_buf_import.slug(),
             self.portability_subset,
             self.device_type,
         )
@@ -122,6 +134,7 @@ mod tests {
         HostGpuCaps {
             memory: memory_topology::classify_memory(props),
             quirks: DriverQuirk::default(),
+            dma_buf_import: DmaBufImport::Supported,
             portability_subset: false,
             device_api_version: api,
             device_type: vk::PhysicalDeviceType::DISCRETE_GPU,
@@ -141,6 +154,20 @@ mod tests {
         // The baseline is stated on every line so no reader mistakes the
         // device's reported version for a requirement.
         assert!(line.contains("baseline=1.2"), "{line}");
+        // Which rung the zero-copy rails are on. "This host is slow" and "this
+        // host cannot import guest pages" are the same report, and this is the
+        // field that separates them without a second boot.
+        assert!(line.contains("dma_buf_import=supported"), "{line}");
+    }
+
+    /// A host that cannot import guest pages says so on the same line, naming
+    /// the check that refused rather than just the absence.
+    #[test]
+    fn the_selection_line_names_the_rung_that_refused_the_import() {
+        let mut c = caps(vk::API_VERSION_1_2, &fixtures::apple_m3_max());
+        c.dma_buf_import = DmaBufImport::NoDmaBufExtension;
+        let line = c.selection_line("Apple M3 Max");
+        assert!(line.contains("dma_buf_import=no_dma_buf_extension"), "{line}");
     }
 
     /// The API version does not change the classification. Getting this wrong is

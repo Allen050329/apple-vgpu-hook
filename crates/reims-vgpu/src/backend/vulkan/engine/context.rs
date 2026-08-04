@@ -493,6 +493,14 @@ impl DeviceContext {
         // shader buffer access (index fetch, attachment access, and
         // encoder-level suspects remain open).
         let enabled = features.enabled_features();
+        // Whether guest pages can reach this device as a dma-buf import. Asked
+        // alongside the other capability queries, and — like them — the only
+        // producer of the extension strings its answer requires.
+        let dma_buf_import = crate::backend::vulkan::caps::external_memory::query(
+            &instance,
+            pd,
+            &has_device_extension,
+        );
         let portability_subset = has_device_extension(vk::KHR_PORTABILITY_SUBSET_NAME);
         let vertex_attribute_divisor = has_device_extension(vk::KHR_VERTEX_ATTRIBUTE_DIVISOR_NAME);
         #[cfg(feature = "host-window")]
@@ -559,6 +567,9 @@ impl DeviceContext {
         // pre-1.2 spelling of mirror-clamp-to-edge, on a device that has the
         // extension but not the core feature.
         enabled_device_extensions.extend(features.required_extensions());
+        // Only the `Supported` rung names any, so a host without dma-buf does
+        // not fail device creation asking for an extension it does not have.
+        enabled_device_extensions.extend(dma_buf_import.required_extensions());
         // These three are built in `caps` too. They are bound to locals here
         // only because `push_next` borrows them for the lifetime of `dci`.
         let mut en16 = features.enabled_16bit_storage();
@@ -615,6 +626,7 @@ impl DeviceContext {
         let caps = HostGpuCaps {
             memory: classify_memory(&memory_properties),
             quirks: DriverQuirk::for_portability_subset(portability_subset),
+            dma_buf_import,
             portability_subset,
             device_api_version: props.api_version,
             device_type: props.device_type,
