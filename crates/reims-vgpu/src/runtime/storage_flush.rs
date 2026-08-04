@@ -1735,6 +1735,56 @@ pub fn gva_window_identity(
 /// `host_gva_surfaces`/texture encode caches (always). Unpins the resident
 /// either way; a lost resident is fail-visible and leaves the guest window
 /// stale-but-coherent (pre-Store bytes).
+///
+/// # This rail is a GPU round trip that carries almost no bytes
+///
+/// It is the last fully-copying writeback: `read_target` submits a readback,
+/// waits its own fence, maps the staging buffer and copies it into a `Vec`;
+/// `write_gva_rgba8_within` then scatters that `Vec` into guest pages a row at
+/// a time; and the encode cache takes a third pass. The render rail retired
+/// exactly this shape by making the guest's pages the copy's destination
+/// (`render_flush_gpu_direct`), and nothing equivalent exists here.
+///
+/// What makes it worth a separate entry in the ledger is that its cost is not
+/// the bytes. One driven x86/Vulkan second, Safari window drag:
+///
+/// ```text
+/// flush_rails     render_us=377653 render=640      gva_us=99662 gva=960
+/// readback_split  fence=1680 fence_us=329043       gpu_us=205578 gpu=1680
+/// ```
+///
+/// `gpu` counts both rails, and 672 render flushes of a 1920x1080 frame at the
+/// measured PCIe rate account for **all** of `gpu_us` on its own — so this
+/// rail's ~1000 flushes a second contribute no measurable copy time and its
+/// ~104 µs apiece is submit-to-signal latency, a map, and three host passes over
+/// a small surface. Roughly 100 ms of a 913 ms busy second.
+///
+/// # Why recording it at arm time is open here and closed for the render rail
+///
+/// [`flush_mapping_windows_before_fence`] refutes "append the copy to the
+/// render's own command buffer" for the mapping-keyed rail, and one of its two
+/// reasons is arming rates: an icon workload measured 49 706 arms against
+/// 12 343 flushes, so recording at arm time would pay a DMA for four windows in
+/// five that nothing ever reads.
+///
+/// **That ratio is 1.000 on this rail, and it is not close.** Summed over a
+/// whole driven boot:
+///
+/// ```text
+/// gva_deferred 23177   gva_flush_guest_written 23177
+/// gvaw_fence_flush 23177   gvaw_stamp_same 23177
+/// ```
+///
+/// Every arm is flushed, by the very next fence, inside the stamp it was armed
+/// in — four counters that cannot agree by accident. So the objection that
+/// closes the door for the render rail does not reach this one, and the
+/// remaining question is the other half of that refutation: whether the wait
+/// itself can be avoided, given that the copy's bytes must be in guest pages
+/// before the stamp either way. The draw's own command buffer is submitted and
+/// deliberately *not* waited (`render_post_wait_skips` equals the draw count),
+/// so a copy recorded into it would be waited against a fence that has had the
+/// rest of the tranche to signal, rather than against one submitted a
+/// microsecond earlier. That is the part worth measuring before building.
 #[cfg(feature = "backend-vulkan")]
 pub fn flush_gva_one<M: HostMemory + HostOps>(
     state: &mut DeviceState,
