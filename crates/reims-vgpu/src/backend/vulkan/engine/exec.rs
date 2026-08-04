@@ -1466,6 +1466,28 @@ pub(crate) unsafe fn execute_draw_inner(
     // 2D path so nothing changes there.
     let mut transient_depth: Option<(vk::Image, vk::DeviceMemory, vk::ImageView, vk::Framebuffer)> =
         None;
+    // Mark everything this draw is about to read *before* resolving its own
+    // target, because resolving the target is what can take them away.
+    //
+    // `registry_ensure` below runs `evict_registry_to_cap`, and that walk's
+    // `protect` covers only the identity being resolved. So a draw arriving
+    // while the non-pinned population is at cap could evict one of its own
+    // sampled sources and then fail to find it a few hundred lines later — the
+    // gap between the `resident_content_ready` guard the resolver already
+    // performs and the lookup in `prepare_sampled`. Nothing about that race
+    // needs load to be heavy; heavy load only makes the registry sit at cap,
+    // which is when the walk evicts at all.
+    //
+    // Marking them used is enough to close it: the cap walk rotates past a
+    // recently-used resident exactly as it does a pinned one. That reuses the
+    // recency the sampled resolve already records rather than threading a
+    // second protected set through `registry_ensure`, and it protects these
+    // residents from the idle drain in the same breath.
+    for s in &req.sampled_images {
+        if let SampledSource::Target(identity) = &s.source {
+            pools.registry_note_sampled_use(identity);
+        }
+    }
     let (target_image, target_fb, target_old_layout, target_view) =
         if let Some(identity) = &req.target_identity {
             let gen = identity.generation();
