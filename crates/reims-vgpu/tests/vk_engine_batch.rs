@@ -339,6 +339,7 @@ fn batched_guest_runs_buffer_snapshots_at_record() {
             }]),
             total_len: backing.len() as u64,
             row_length_texels: 0,
+            pages: None,
         }),
     });
     match engine::execute_draw_request(&opener) {
@@ -491,6 +492,7 @@ fn sampled_guest_runs_land_the_guest_bytes_the_shader_samples() {
             ]),
             total_len: 16,
             row_length_texels: 0,
+            pages: None,
         }),
         format: ash::vk::Format::R8G8B8A8_UNORM,
         identity: None,

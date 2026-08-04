@@ -258,11 +258,10 @@ typedef struct ReimsVgpuHostOps {
      * is never recycled for other memory. 0 if the view is a transient mapping
      * that unmap_pages tears down.
      *
-     * Load-bearing for GPU-direct writeback: only a stable alias may be
-     * retained in a cached VK_EXT_external_memory_host import window. Caching
-     * an import of a transient view leaves the GPU writing into an address
-     * range the host has since unmapped or reused. Default (absent field /
-     * older shim) must be treated as 0.
+     * This is a claim about a CPU-side pointer and nothing else. No rail
+     * imports a host pointer into the GPU; guest pages reach it through
+     * dmabuf_for_pages, whose fd carries its own lifetime and needs no promise
+     * from this flag. Default (absent field / older shim) must be treated as 0.
      */
     int map_pages_stable;
     /*

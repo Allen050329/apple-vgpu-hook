@@ -2677,6 +2677,9 @@ mod tests {
                     }]),
                     total_len,
                     row_length_texels,
+                    // A fixture over a dummy host address has no guest
+                    // pages, so there is nothing a dma-buf could cover.
+                    pages: None,
                 }),
                 format: crate::backend::vulkan::translate::pixel::vk_texel_layout(
                     crate::contract::pixel_format::TexelLayout::Bgra8,
@@ -2886,6 +2889,8 @@ mod tests {
             ),
             total_len,
             row_length_texels,
+            // A fixture over a dummy host address has no guest pages.
+            pages: None,
         })
     }
 
@@ -3009,6 +3014,8 @@ mod tests {
             runs: std::sync::Arc::new(runs),
             total_len: 156,
             row_length_texels: 0,
+            // A fixture over a host `Vec` has no guest pages.
+            pages: None,
         });
         assert_eq!(content.len(), 156);
         let bytes = content.cpu_bytes();

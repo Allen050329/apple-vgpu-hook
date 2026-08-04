@@ -15,6 +15,7 @@ mod counters;
 mod desc_arena;
 mod device_lost;
 mod digest;
+mod dmabuf;
 mod draw_execution;
 mod draw_phase;
 mod draw_preparation;
@@ -49,7 +50,8 @@ pub use types::{
     BlendFactor, BlendOp, BlendStateResource, BufferContent, ColorWriteMask, ComputeBufferOutput,
     ComputeBufferResource, ComputeOutput, ComputeRequest, ComputeResidentSampleBind,
     ComputeSampledImageResource, ComputeStorageImageResource, ComputeStorageResidency, CullMode,
-    DepthState, DrawError, DrawOutput, DrawRequest, GuestRun, GuestRunSource, IndexType,
+    DepthState, DrawError, DrawOutput, DrawRequest, GuestDmaBuf, GuestPageWindow, GuestRun,
+    GuestRunSource, IndexType,
     IndexedDrawResource, PrimitiveTopology, SampledContentIdentity, SampledImageResource,
     SampledSource, SamplerAddressMode, SamplerBorderColor, SamplerCompareFunction, SamplerFilter,
     SamplerMipFilter, SamplerResource, ScissorResource, SecondaryColorTarget, SeedOrder,

@@ -257,6 +257,14 @@ pub(crate) struct DeviceContext {
     /// physical device, and the previous code re-queried it through the loader
     /// on every single allocation.
     pub memory_properties: vk::PhysicalDeviceMemoryProperties,
+    /// `VK_KHR_external_memory_fd` entry points, loaded only where
+    /// [`HostGpuCaps::dma_buf_import`] resolved to `Supported` — which is also
+    /// the only rung on which the extension was enabled, so loading it on any
+    /// other would resolve entry points the device was never asked for.
+    ///
+    /// `None` is the answer on every host without dma-buf, and
+    /// [`super::dmabuf::import_buffer`] declines by name when it sees one.
+    pub external_memory_fd: Option<ash::khr::external_memory_fd::Device>,
     /// Queue family used for all engine submits (graphics draws + compute).
     pub gq: u32,
     /// True when `gq` supports both GRAPHICS and COMPUTE (required for engine compute).
@@ -631,6 +639,12 @@ impl DeviceContext {
             device_api_version: props.api_version,
             device_type: props.device_type,
         };
+        // Loaded from the same answer that enabled the extension, so the two
+        // cannot disagree about whether these entry points are legal to call.
+        let external_memory_fd = caps
+            .dma_buf_import
+            .is_available()
+            .then(|| ash::khr::external_memory_fd::Device::new(&instance, &device));
         let device_name = CStr::from_ptr(props.device_name.as_ptr())
             .to_string_lossy()
             .into_owned();
@@ -698,6 +712,7 @@ impl DeviceContext {
             device,
             caps,
             memory_properties,
+            external_memory_fd,
             gq,
             compute_capable,
             storage_image_write_without_format: storage_image_write_without_format_bgra,

@@ -147,3 +147,70 @@ fn metal_no_copy_buffers_alias_host_memory_and_nothing_else() {
          for"
     );
 }
+
+/// Guest pages reach the GPU through exactly one door.
+///
+/// The dma-buf import is admissible where the host-pointer import is not, and
+/// the reasons are all properties of *how the fd is made and held*: it names an
+/// explicit page list, it is revoked by closing, and the kernel mediates the
+/// reference. None of those survive being spread across the tree. A second site
+/// that builds its own `VkImportMemoryFdInfoKHR` gets its own idea of which
+/// pages to name and its own idea of when to free — and the second one is
+/// always the one that outlives the resource.
+///
+/// So the invariant is structural rather than behavioural: the import surface
+/// appears in one module, and adding a second has to fail here first. That is
+/// also the only thing standing between "we import dma-bufs" and the previous
+/// rail's actual failure mode, which was never the mechanism but the six places
+/// that had learned to use it.
+///
+/// The needles are the two structs that *perform* an import. The handle-type
+/// flag is deliberately not among them: `caps::external_memory` names it to ask
+/// the device whether DMA_BUF is importable at all, and a capability query is
+/// not an import — it creates nothing and owns no lifetime. Including it would
+/// have made this test fire on the one site whose whole job is to decide
+/// whether the door may open.
+#[test]
+fn the_dma_buf_import_surface_lives_in_one_module() {
+    const NEEDLES: [&str; 2] = ["ImportMemoryFdInfoKHR", "ExternalMemoryBufferCreateInfo"];
+    /// The one module allowed to name them. It is `engine::dmabuf` because that
+    /// is where an import's lifetime is owned; a caller receives an
+    /// `ImportedDmaBuf` and cannot construct one.
+    const DOOR: &str = "backend/vulkan/engine/dmabuf.rs";
+
+    let root = crate_src();
+    let mut elsewhere = Vec::new();
+    let mut door_names_them = false;
+    for path in rust_files(&root) {
+        let relative = path
+            .strip_prefix(&root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let src = std::fs::read_to_string(&path).expect("read Rust source");
+        let folded: String = src.chars().filter(|c| !c.is_whitespace()).collect();
+        for needle in NEEDLES {
+            if !folded.contains(needle) {
+                continue;
+            }
+            if relative == DOOR {
+                door_names_them = true;
+            } else {
+                elsewhere.push(format!("{relative} names {needle}"));
+            }
+        }
+    }
+    assert!(
+        elsewhere.is_empty(),
+        "the dma-buf import surface must stay in {DOOR}; a second site owns a \
+         second lifetime for the same guest pages:\n  {}",
+        elsewhere.join("\n  ")
+    );
+    // The mirror image: a door that has stopped naming them means the import
+    // moved and this test is now guarding nothing.
+    assert!(
+        door_names_them,
+        "{DOOR} no longer performs the import — this test is pinning an empty \
+         file while the real import site goes unwatched"
+    );
+}

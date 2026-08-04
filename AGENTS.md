@@ -217,11 +217,31 @@ and that is a property of the mechanism rather than of how much of it is used �
 "never requested", not a budget. Both invariants are enforced by
 `crates/reims-vgpu/tests/guest_ram_isolation.rs`.
 
-The proposal recurs because the deferred-flush rail is the device's largest cost and a GPU-direct
-write into guest pages would erase it. It stays forbidden regardless; `storage_flush.rs` carries
-that reading, its own qualifier, and the routes that are *not* blocked. Note that
+**A dma-buf is the one mechanism that is allowed, and it is not that one wearing a new name.** The
+GPU reaches guest pages through `VK_EXT_external_memory_dma_buf`, gated on
+`caps::external_memory::DmaBufImport`. Three properties are why, and a proposal that loses any of
+them is the banned mechanism again:
+
+- **Bounded by construction.** The fd names an explicit list of page ranges chosen when it was
+  created. A page not named then is not reachable through it — there is no pointer to stray from
+  and no surrounding mapping to reach.
+- **Revocable.** Closing the fd and freeing the `VkDeviceMemory` ends the access. A host-pointer
+  import has no such handle, which is why "how much of it is used" was never the question.
+- **Kernel-mediated.** The importing driver takes a reference on pages the kernel is tracking,
+  rather than being handed a raw address it must trust.
+
+So the deferred-flush rail — the device's largest cost — is retired by writing into guest pages
+directly, which is what `storage_flush.rs` always said would retire it. Read that module's own
+qualifier and the routes that are *not* blocked before assuming a window is safe to skip. Note that
 `runtime/gva_view.rs::ensure_gva_view` hands back a host pointer but is not a window resolver — it
 requires the span to be one contiguous page run and returns `None` otherwise.
+
+Two consequences that are easy to miss. Guest RAM must be **fd-backed** for any of this to work
+(`memory-backend-memfd,share=on` in the boot scripts); a plain `-m` allocation refuses every export
+with `not_memfd` and the device silently falls back to copying, which is why that refusal is
+fail-visible. And a dma-buf **pins** the pages it names — they stop being swappable or migratable —
+so every cache holding one is bounded by *pinned bytes*, not by entry count. `runtime/guest_dmabuf.rs`
+carries that bound and its basis.
 
 ## Verification
 

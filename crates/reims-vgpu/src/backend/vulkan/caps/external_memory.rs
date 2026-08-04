@@ -75,8 +75,8 @@ pub enum DmaBufImport {
     #[default]
     Unqueried,
     /// `VK_KHR_external_memory_fd` absent. Without it there is no
-    /// `vkGetMemoryFdProperties` to ask which memory types accept the fd, and no
-    /// `VkImportMemoryFdInfoKHR` to import through.
+    /// `vkGetMemoryFdProperties` to ask which memory types accept the fd, and
+    /// nothing to chain onto `vkAllocateMemory` to import through.
     NoExternalMemoryFd,
     /// `VK_EXT_external_memory_dma_buf` absent. Expected on every non-Linux ICD,
     /// MoltenVK included — the handle type names a Linux kernel object.

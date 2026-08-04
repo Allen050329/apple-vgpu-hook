@@ -1275,6 +1275,58 @@ pub struct GuestRunSource {
     /// Guest row stride in texels for the buffer→image copy
     /// (`bufferRowLength`); 0 = tight rows.
     pub row_length_texels: u32,
+    /// The guest pages [`Self::runs`] were coalesced from, when the producer
+    /// resolved them and the host could export them.
+    ///
+    /// `None` is the honest answer for a synthetic source — a test fixture over
+    /// a host `Vec` has no guest pages — and for a host that cannot export. The
+    /// gather path needs only [`GuestRun::host_ptr`] and is unaffected either
+    /// way; this is what lets the GPU read the same bytes with no CPU gather at
+    /// all.
+    pub pages: Option<std::sync::Arc<GuestPageWindow>>,
+}
+
+/// One dma-buf over a guest page window, and the id an importer keys it by.
+#[derive(Debug)]
+pub struct GuestDmaBuf {
+    /// Process-unique and monotonic. An importer cannot key a cache on the fd
+    /// number instead: numbers are recycled the instant one closes, so a freed
+    /// window and a fresh one can wear the same number and the second would
+    /// bind the first's memory.
+    pub id: u64,
+    /// Owned. Dropping this closes the last reference this process holds, which
+    /// is what ends the GPU's access once every import of it is also gone.
+    pub fd: std::os::fd::OwnedFd,
+}
+
+/// The guest pages behind a [`GuestRunSource`], with the dma-buf over them.
+///
+/// Separate from [`GuestRun`] because a run is a *host-pointer* span that may
+/// start part-way into a page, while a dma-buf names whole pages. Keeping both
+/// lets the same source feed the CPU gather and the GPU-direct bind without
+/// either having to reconstruct the other's view.
+#[derive(Debug)]
+pub struct GuestPageWindow {
+    /// Page-aligned guest physical addresses, in order, covering the span.
+    pub gpas: Vec<u64>,
+    pub page_size: u32,
+    /// Byte offset of the span's first byte within `gpas[0]`. A dma-buf starts
+    /// at a page boundary, so a consumer binding the import must add this to
+    /// reach the first byte the guest actually named.
+    pub head_offset: u32,
+    /// The dma-buf over `gpas`. Not optional: a window with no dma-buf offers
+    /// nothing a `GuestRun` does not already, so "this host cannot export these
+    /// pages" is expressed once, by [`GuestRunSource::pages`] being `None`, and
+    /// a consumer holding a window never has to re-ask.
+    pub dmabuf: std::sync::Arc<GuestDmaBuf>,
+}
+
+impl GuestPageWindow {
+    /// Bytes the dma-buf covers — whole pages, so at least
+    /// `head_offset + total_len` of the span it was built for.
+    pub fn mapped_bytes(&self) -> u64 {
+        self.gpas.len() as u64 * u64::from(self.page_size)
+    }
 }
 
 /// Producer-assigned identity + generation for CPU-sourced sampled content.
