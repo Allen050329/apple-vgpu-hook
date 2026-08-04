@@ -88,22 +88,44 @@ collect() {
   say "$label: $(wc -l <"$WORK/$label.log") log lines over ${secs}s"
 }
 
-# Quit everything the previous phase opened, and wait for it to actually go. A
-# pane still tearing down while the next phase samples puts its own teardown
-# traffic in the window.
+# Quit every app with a window, not only the ones this probe opened, and wait
+# for them to actually go.
+#
+# Two reasons it has to be every app. A pane still tearing down while the next
+# phase samples puts its own teardown traffic in the window. And an app left
+# running from before the probe started — a snapshot that was captured with
+# Notes open is enough — sits in front of the pane the next phase raises, so the
+# screenshot photographs the wrong window and the visual verdict is lost. That
+# happened on a 240 s run: both census phases named the pane, `after` measured a
+# fully idle guest, and the PNG showed a Notes window.
+#
+# Finder is exempt because quitting it takes the desktop with it.
 quiesce() {
-  osa "tell application \"$PANE_PROC\" to quit" >/dev/null 2>&1 || true
-  osa 'tell application "Safari" to quit' >/dev/null 2>&1 || true
+  osa 'tell application "System Events" to set doomed to name of every process whose background only is false and name is not "Finder"' >/dev/null 2>&1 || true
+  osa 'tell application "System Events" to repeat with p in (name of every process whose background only is false and name is not "Finder")
+        try
+          tell application p to quit
+        end try
+      end repeat' >/dev/null 2>&1 || true
   sleep 6
 }
 
+# Open the pane and return only once it is the frontmost process — the vibrancy
+# pass runs on the window that is on screen and in front, so a phase that
+# samples before the raise lands measures whatever was there instead. Returns
+# nonzero when the raise never took, which the caller reports rather than
+# silently photographing another app's window.
 open_pane() {
-  # Opening the pane is not enough to make it composite: the vibrancy pass runs
-  # when the window is on screen and frontmost. Raise it explicitly.
   sh_guest "open -b '$PANE_BUNDLE'" >/dev/null || true
-  sleep 6
-  osa "tell application \"System Events\" to tell process \"$PANE_PROC\" to set frontmost to true" >/dev/null 2>&1 || true
-  sleep 3
+  local i front
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    sleep 2
+    osa "tell application \"System Events\" to tell process \"$PANE_PROC\" to set frontmost to true" >/dev/null 2>&1 || true
+    front=$(osa 'tell application "System Events" to get name of first process whose frontmost is true' || true)
+    [ "$front" = "$PANE_PROC" ] && { sleep 3; return 0; }
+  done
+  say "the pane never came to the front (frontmost is '${front:-unknown}')" >&2
+  return 1
 }
 
 say "work dir $WORK"
@@ -111,7 +133,8 @@ quiesce
 
 # ---- before -------------------------------------------------------------
 say "phase before: opening $PANE_PROC"
-open_pane
+open_pane || { say "the baseline pane never composited; there is nothing for \
+\`after\` to be compared against" >&2; exit 2; }
 "$SHOT" -o "$WORK/before.png" >/dev/null 2>&1 || say "before screenshot failed" >&2
 collect before "$CENSUS_SECONDS"
 quiesce
@@ -192,7 +215,12 @@ fi
 # ---- after --------------------------------------------------------------
 quiesce
 say "phase after: re-opening $PANE_PROC"
-open_pane
+# A pane that will not come to the front after the load is itself a finding —
+# but it is a different one from the see-through class, and an `after` window
+# sampled with the pane behind another app is an idle census, not a degraded
+# one. Say which happened rather than diffing the two.
+open_pane || say "the pane did not raise after the load; the \`after\` census \
+below is not of the pane and the diff is not about this bug" >&2
 "$SHOT" -o "$WORK/after.png" >/dev/null 2>&1 || say "after screenshot failed" >&2
 collect after "$CENSUS_SECONDS"
 
