@@ -2707,6 +2707,44 @@ mod revalidate_tests {
         assert_eq!(state.retired_views, vec![(0xdead, 4096)]);
     }
 
+    /// Invalidating a mapping's pages drops the host-side copy of those pages.
+    ///
+    /// The cached frame is keyed by `(mapping_id, geometry)` with no
+    /// `map_generation` in it, so the bump that disqualifies the resident, the
+    /// contiguous view and every armed window leaves this entry addressable and
+    /// still holding pixels read through the page list that just stopped being
+    /// the surface's. The sampled ladder's host-cache rung then serves it: its
+    /// only currency test is the guest-write witness, and the token this call
+    /// retires makes that witness answer `NoStamp`, which is deliberately not
+    /// treated as evidence of a guest write.
+    ///
+    /// Without the drop this asserts nothing about a rung — it asserts that a
+    /// copy of invalidated pages is still readable, which is the whole defect.
+    #[test]
+    fn invalidate_mapping_pages_drops_the_host_cache_of_those_pages() {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        state.map_surface(5);
+        {
+            let m = state.mappings.get_mut(&5).unwrap();
+            m.page_entries = vec![1];
+            m.has_geom = true;
+            m.width = 2;
+            m.height = 2;
+        }
+        crate::runtime::surface_cache::store(&mut state, 5, 2, 2, vec![0xab; 2 * 2 * 4]);
+        assert!(
+            crate::runtime::surface_cache::get_shared(&state, 5, 2, 2).is_some(),
+            "the cache entry under test was never stored"
+        );
+
+        state.invalidate_mapping_pages(5);
+
+        assert!(
+            crate::runtime::surface_cache::get_shared(&state, 5, 2, 2).is_none(),
+            "a host copy of the invalidated pages is still being served"
+        );
+    }
+
     /// The "cannot pack" verdict is derived once per page list, not once per
     /// call, and a new page list re-derives it.
     ///

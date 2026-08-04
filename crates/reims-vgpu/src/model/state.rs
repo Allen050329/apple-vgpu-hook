@@ -2676,6 +2676,32 @@ impl DeviceState {
     /// zone freelist; the next Store must re-resolve before any host write or
     /// import-present DMA (freelist `0xff000000ff000000` class).
     pub fn invalidate_mapping_pages(&mut self, mapping_id: u32) -> bool {
+        // The cached BGRA frame is a host-side copy of the pages this call is
+        // invalidating, and it is the only such copy whose key does not carry
+        // `map_generation`: the resident's does (`surface_identity`), the
+        // contiguous view and the guest-write token are retired below, and every
+        // armed window refuses on the generation check it already has. So the
+        // bump that disqualifies all of those leaves this entry addressable by
+        // `(mapping_id, geometry)` alone, still holding pixels read through the
+        // page list that just stopped being this surface's.
+        //
+        // Retiring the guest-write token is what makes that reachable rather
+        // than theoretical. The type-4 sampled ladder's host-cache rung serves
+        // its copy unless the witness reports `Wrote`, and a retired token
+        // reports `NoStamp` — deliberately not evidence, because "nobody armed
+        // this" is a statement about this device and not about the guest. The
+        // rung therefore reads the invalidation as *permission* to serve, and
+        // keeps serving until some later Store replaces the bytes. A surface
+        // composited once and then only sampled — a popup backdrop, a settings
+        // pane — never gets that Store, so the stale frame is held for the life
+        // of the guest.
+        //
+        // `condemn_surface_backing` already drops it for the same class of
+        // event, and the two sit in the same `if`/`else` in the ReplacePhysical
+        // teardown, so leaving it here made one arm of one decision correct.
+        if self.host_surfaces.remove(&mapping_id).is_some() {
+            crate::runtime::drain::note_store_route("invalidate_dropped_host_cache");
+        }
         let Some(e) = self.mappings.get_mut(&mapping_id) else {
             return false;
         };
