@@ -142,13 +142,25 @@ pub fn dmabuf_for<M: HostOps>(
     }
     cache.clock += 1;
     let clock = cache.clock;
-    if let Some(entry) = cache
-        .entries
-        .iter_mut()
-        .find(|e| e.key == key && e.gpas == gpas)
-    {
+    // The lookup is a linear scan, and this counts what it walked rather than
+    // how long it took: a step count survives a contended host where a
+    // microsecond reading does not, and it is the only thing that says whether
+    // the scan is the shape of this table's cost. Charged on hit *and* miss,
+    // because a miss walks the whole table and a hit walks half of it on
+    // average — so `steps / lookups` against `windows` is what separates "the
+    // table is small" from "the scan is the cost".
+    let mut steps: u64 = 0;
+    let found = cache.entries.iter_mut().find(|e| {
+        steps += 1;
+        e.key == key && e.gpas == gpas
+    });
+    crate::runtime::drain::note_store_route("guest_dmabuf_lookups");
+    crate::runtime::drain::note_store_route_n("guest_dmabuf_scan_steps", steps);
+    if let Some(entry) = found {
         entry.used = clock;
-        return Some(Arc::clone(&entry.dmabuf));
+        let dmabuf = Arc::clone(&entry.dmabuf);
+        crate::runtime::drain::note_store_route("guest_dmabuf_hits");
+        return Some(dmabuf);
     }
 
     let fd = match host.dmabuf_for_pages(gpas, page_size as usize) {
@@ -183,6 +195,26 @@ pub fn dmabuf_for<M: HostOps>(
     });
     cache.pinned_bytes += bytes;
     evict_to_bound(cache);
+    // The table's own size, sampled once per miss. `cached_windows` and
+    // `pinned_bytes` have existed since this cache did and nothing has ever
+    // called them, so the bound this table is held to — pinned bytes, not entry
+    // count — has never been read on a live boot. Both are needed: 512 MiB of
+    // 8 KiB vertex windows is 65 536 entries and 512 MiB of one framebuffer is
+    // one, and the scan above costs the entry count while the bound counts the
+    // bytes.
+    //
+    // These two are **sums, not gauges** — the census map adds. Divide each by
+    // `guest_dmabuf_misses` for the mean over the window; a reader quoting the
+    // raw field as "the cache holds N windows" is off by the miss count.
+    crate::runtime::drain::note_store_route("guest_dmabuf_misses");
+    crate::runtime::drain::note_store_route_n(
+        "guest_dmabuf_windows_sum",
+        cache.entries.len() as u64,
+    );
+    crate::runtime::drain::note_store_route_n(
+        "guest_dmabuf_pinned_kb_sum",
+        cache.pinned_bytes >> 10,
+    );
     Some(dmabuf)
 }
 
