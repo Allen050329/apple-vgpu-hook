@@ -1167,29 +1167,57 @@ mod pin_count_tests {
         );
     }
 
-    /// The capacity walk asks the same question the drain does, so a resident a
-    /// frame is reading cannot be evicted by whichever path happens to run.
+    /// The capacity walk evicts the least-recently-*used* resident, so a
+    /// backdrop a draw is reading is not taken merely for being old.
     ///
     /// `registry_order` is insertion order — nothing promotes an entry when a
-    /// draw reuses it — so the front is the oldest-*created* resident, which for
-    /// a session-long backdrop is permanent. Consulting recency is what stops
-    /// the cap walk from taking it; without it the two paths disagree and the
-    /// backdrop is protected from the drain but not from a burst.
+    /// draw reuses it — so popping its front evicted the oldest-*created*
+    /// resident, which for a session-long backdrop is permanently the front.
+    /// Choosing by `last_touch_ms` is what separates "created first" from "not
+    /// being used", and it keeps the cap hard: skipping recent entries instead
+    /// would let a burst touching more than `REGISTRY_CAP` targets inside the
+    /// age window evict nothing at all.
     #[test]
-    fn the_cap_walk_and_the_drain_agree_on_what_is_in_use() {
+    fn the_cap_walk_evicts_the_least_recently_used_not_the_oldest_created() {
         let mut pools = ResourcePools::new();
+        // surf(1) is created first and is therefore the front of insertion
+        // order — the old victim — but it is the one being read.
         admit(&mut pools, surf(1), 0, 0);
         admit(&mut pools, surf(2), 0, 0);
-        let now = IDLE_TARGET_AGE_MS + 1;
-        pools.plan_idle_drain(now, None);
+        admit(&mut pools, surf(3), 0, 0);
+        pools.idle_clock_ms = 5_000;
         pools.registry_note_sampled_use(&surf(1));
-        assert!(
-            pools.resident_recently_used(&surf(1)),
-            "the sampled resident is in use, so the cap walk rotates it past"
+        assert_eq!(
+            pools.cap_eviction_victim(None),
+            Some(surf(2)),
+            "the least-recently-used resident is the victim, not the first created"
         );
-        assert!(
-            !pools.resident_recently_used(&surf(2)),
-            "an untouched resident stays evictable, so the cap still has victims"
+        // Protection still applies, and the walk still finds someone else.
+        assert_eq!(
+            pools.cap_eviction_victim(Some(&surf(2))),
+            Some(surf(3)),
+            "a protected identity is passed over for the next-oldest use"
+        );
+    }
+
+    /// A pinned resident is never the victim, and a registry with nothing else
+    /// left reports no victim rather than dropping content whose only copy is on
+    /// the GPU — the soft-exceed the walk has always traded for.
+    #[test]
+    fn the_cap_walk_never_evicts_a_pinned_resident() {
+        let mut pools = ResourcePools::new();
+        admit(&mut pools, surf(1), 0, 1);
+        admit(&mut pools, surf(2), 0, 2);
+        assert_eq!(
+            pools.cap_eviction_victim(None),
+            None,
+            "every entry is pinned, so the cap soft-exceeds rather than evicting"
+        );
+        admit(&mut pools, surf(3), 10, 0);
+        assert_eq!(
+            pools.cap_eviction_victim(None),
+            Some(surf(3)),
+            "the one unpinned resident is the only candidate"
         );
     }
 

@@ -510,47 +510,38 @@ impl ResourcePools {
         protect: Option<&TargetIdentity>,
     ) {
         let mut non_pinned = self.non_pinned_registry_len();
-        let mut rotations = self.registry_order.len();
-        while non_pinned > REGISTRY_CAP && rotations > 0 {
-            rotations -= 1;
-            let Some(old_k) = self.registry_order.front().cloned() else {
+        while non_pinned > REGISTRY_CAP {
+            // Least-recently-used, for real. `registry_order` is insertion
+            // order — nothing promotes an entry when a draw reuses it — so
+            // popping its front evicted the oldest-*created* resident. A
+            // compositor backdrop is created early and lives for the whole
+            // session, which made it the permanent front and the first victim of
+            // every burst, however hard the current frame was reading it.
+            //
+            // Selecting the minimum `last_touch_ms` protects an in-use resident
+            // without giving up the hard bound: skipping recent entries instead
+            // would let a burst that touches more than `REGISTRY_CAP` targets
+            // inside `IDLE_TARGET_AGE_MS` evict nothing at all and grow the
+            // registry without limit. Here the cap always finds a victim while
+            // any evictable entry exists, and the victim is never more recently
+            // used than an alternative.
+            //
+            // Iterating `registry_order` rather than the map keeps the choice
+            // deterministic: `min_by_key` returns the first minimum, so ties
+            // fall to the oldest-created entry, which is what this walk did for
+            // every entry before. O(n) per eviction rather than O(1) amortised,
+            // and evictions are rare next to binds — the cost this avoids
+            // paying is a promotion on every sampled bind of every draw.
+            let victim = self.cap_eviction_victim(protect);
+            // Everything left is pinned or protected. Pinned residents are
+            // bounded separately by the rail that armed them, so the registry
+            // soft-exceeds the cap rather than dropping content whose only copy
+            // is on the GPU — the trade this walk has always made.
+            let Some(victim) = victim else {
                 break;
             };
-            // `registry_order` is insertion order, not use order: nothing
-            // promotes an entry when a draw reuses it, so the front is the
-            // oldest-*created* resident rather than the least-recently-used one.
-            // A compositor backdrop is created early and lives for the whole
-            // session, which put it permanently at the front — first victim of
-            // every burst, however hard the current frame is reading it.
-            //
-            // Recency is already tracked per slot, so the walk consults it
-            // rather than reordering the deque on every use (a promotion would
-            // be an O(cap) scan per sampled bind per draw; this is O(cap) only
-            // when the cap is actually exceeded). A resident used within
-            // `IDLE_TARGET_AGE_MS` rotates to the back exactly like a pinned
-            // one, which is what makes `registry_note_sampled_use` protect a
-            // backdrop from this path as well as from the idle drain.
-            //
-            // If every entry is recent the loop completes its rotation budget
-            // having evicted nothing and the registry soft-exceeds the cap. That
-            // is the same trade the pinned case already takes, and it is bounded
-            // in time rather than unbounded: whatever is recent now ages out of
-            // this test within `IDLE_TARGET_AGE_MS`, after which both this path
-            // and the idle drain can reclaim it.
-            let recently_used = self.resident_recently_used(&old_k);
-            if self
-                .registry
-                .get(&old_k)
-                .is_some_and(|slot| slot.pin_count > 0)
-                || recently_used
-                || protect == Some(&old_k)
-            {
-                self.registry_order.pop_front();
-                self.registry_order.push_back(old_k);
-                continue;
-            }
-            if let Some(old) = self.registry.remove(&old_k) {
-                self.note_resident_reclaimed(&old_k, ResidentReclaim::CapEvicted);
+            if let Some(old) = self.registry.remove(&victim) {
+                self.note_resident_reclaimed(&victim, ResidentReclaim::CapEvicted);
                 if old.framebuffer != vk::Framebuffer::null() {
                     self.dispose(&ctx.device, DeferredHandle::Framebuffer(old.framebuffer));
                 }
@@ -569,7 +560,7 @@ impl ResourcePools {
                     .target_evicts
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
-            self.registry_order.pop_front();
+            self.registry_order.retain(|k| k != &victim);
             non_pinned = non_pinned.saturating_sub(1);
         }
     }
@@ -641,19 +632,55 @@ impl ResourcePools {
     /// refusal repeats for the life of the boot. That is why this class survives
     /// closing the application that caused the pressure and why only a reboot
     /// clears it.
-    /// Has this resident been used within the idle drain's own age window?
+    /// The resident the capacity walk should evict next, or `None` when every
+    /// entry left is pinned or protected.
     ///
-    /// The single definition of "in use" both reclaim paths consult, so the
-    /// capacity walk and the idle drain cannot drift apart on it. Shares
-    /// `IDLE_TARGET_AGE_MS` with the drain deliberately: two windows would mean
-    /// a resident the drain still considers live could be taken by the cap, and
-    /// the whole point is that neither path takes something a frame is reading.
-    pub(crate) fn resident_recently_used(&self, identity: &TargetIdentity) -> bool {
-        self.registry.get(identity).is_some_and(|slot| {
-            self.idle_clock_ms.saturating_sub(slot.last_touch_ms) < IDLE_TARGET_AGE_MS
-        })
+    /// Least-recently-used, chosen by `last_touch_ms`. Split out from
+    /// [`Self::evict_registry_to_cap`] because that function needs a live
+    /// `DeviceContext` to dispose what it evicts, and the choice — the part with
+    /// the policy in it — is worth testing without a GPU.
+    ///
+    /// Iterates `registry_order` rather than the map so the result is
+    /// deterministic: `min_by_key` returns the first minimum, so equal stamps
+    /// fall to the oldest-created entry.
+    fn cap_eviction_victim(&self, protect: Option<&TargetIdentity>) -> Option<TargetIdentity> {
+        self.registry_order
+            .iter()
+            .filter_map(|k| self.registry.get(k).map(|slot| (k, slot)))
+            .filter(|(k, slot)| slot.pin_count == 0 && protect != Some(k))
+            .min_by_key(|(_, slot)| slot.last_touch_ms)
+            .map(|(k, _)| k.clone())
     }
 
+    /// Record that a draw is reading this resident as a **sampled source**, so
+    /// both reclaim paths count it as in use.
+    ///
+    /// Reading a resident was not a use. `last_touch_ms` was refreshed by
+    /// `registry_ensure` (a draw rendering *into* the target), by the present
+    /// touch, and by nothing else — while the sampled-source resolve in
+    /// `execute_draw_inner` goes through `registry_get`, which takes `&self` and
+    /// therefore cannot mark anything. A resident that every frame samples but
+    /// no frame draws into consequently aged as if it were abandoned.
+    ///
+    /// That is the shape of a compositor backdrop: the desktop behind a
+    /// translucent panel is rendered once and then read by every vibrancy draw
+    /// over it. After `IDLE_TARGET_AGE_MS` the idle drain took it, and the drain
+    /// is a terminal destroy rather than a recycle, so the pixels were gone. The
+    /// next draw to sample it refuses with
+    /// `vk_draw_exec_sampled_resident_missing`, and because the exec loop
+    /// abandons the remaining records of a packet once a record cannot encode,
+    /// one missing backdrop drops a whole packet of draws.
+    ///
+    /// Nothing recreates a resident except a draw rendering into that identity,
+    /// so a backdrop the guest considers still valid is never rebuilt: the
+    /// refusal repeats for the life of the boot. That is why this class survives
+    /// closing the application that caused the pressure and why only a reboot
+    /// clears it.
+    ///
+    /// The stamp this writes is the one both reclaim paths read — the idle drain
+    /// compares it against `IDLE_TARGET_AGE_MS`, and the capacity walk evicts
+    /// the smallest — so recording a read here is what protects a resident from
+    /// each of them.
     pub(crate) fn registry_note_sampled_use(&mut self, identity: &TargetIdentity) {
         let touch = self.idle_clock_ms;
         if let Some(slot) = self.registry.get_mut(identity) {
