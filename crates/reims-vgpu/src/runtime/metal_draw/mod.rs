@@ -3288,7 +3288,7 @@ fn host_cache_store_rgba8(
         return;
     }
     let bgra = swap_rb_channels(&rgba[..need]);
-    crate::runtime::surface_cache::store_texture(state, texture_ref, width, height, bgra);
+    crate::runtime::surface_cache::store_texture(state, texture_ref, width, height, bgra, 0);
 }
 
 /// Advance the guest-visible publish milestones for a type-11 Store whose
@@ -4422,6 +4422,40 @@ fn seed_color_load<M: HostMemory + HostOps>(
                     B::Moved => "gva_seed_backing_moved",
                 },
             );
+        }
+        // Which door served, and — for the ref door — whether the pixels it
+        // holds were produced over the address this seed is being served as.
+        //
+        // `load_seed_ok_color` counts both doors as one, so the ref door has
+        // never had a reading of its own. It matters because the two doors carry
+        // different guarantees: the GVA door's key *is* the allocation and the
+        // block above asks whether that allocation still names the same pages,
+        // while the ref door's key is an object-list slot the guest reuses and
+        // its entry carries no page identity at all. A ref-door serve whose
+        // `source_gva` differs from `target_gva` is this seed handing the pass
+        // another allocation's picture as its prior content — and because the
+        // matching Store writes the composite back, the next frame loads what
+        // this one stored.
+        //
+        // Census only. Refusing the serve would turn a LOAD into an unseeded
+        // one, which blanks every texel the pass does not draw, and that trade
+        // is not one to make before knowing the population.
+        let gva_served = target_gva != 0
+            && crate::runtime::surface_cache::has_gva(state, target_gva, width, height);
+        if gva_served {
+            crate::runtime::drain::note_store_route("load_seed_color_from_gva");
+        } else if texture_ref != 0 {
+            if let Some(source_gva) =
+                crate::runtime::surface_cache::texture_source_gva(state, texture_ref, width, height)
+            {
+                crate::runtime::drain::note_store_route(if source_gva == 0 {
+                    "load_seed_color_from_ref_no_gva"
+                } else if source_gva == target_gva {
+                    "load_seed_color_from_ref_same_gva"
+                } else {
+                    "load_seed_color_from_ref_other_gva"
+                });
+            }
         }
         let cached = if target_gva != 0 {
             crate::runtime::surface_cache::get_gva(state, target_gva, width, height)

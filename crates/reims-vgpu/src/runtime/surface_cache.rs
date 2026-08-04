@@ -321,12 +321,18 @@ pub fn get_shared(
 }
 
 /// Type-2/3 encode cache by texture object ref (not surface_id).
+///
+/// `source_gva` is the address the producing Store rendered into, kept so
+/// [`texture_source_gva`] can tell a later serve whether this entry's pixels
+/// came from the allocation it is about to be served as. Zero when the producer
+/// had no GVA.
 pub fn store_texture(
     state: &mut DeviceState,
     texture_ref: u32,
     width: u32,
     height: u32,
     bgra: Vec<u8>,
+    source_gva: u64,
 ) {
     let generation = state.next_sampled_content_generation();
     store_into(
@@ -337,6 +343,9 @@ pub fn store_texture(
         std::sync::Arc::new(bgra),
         generation,
     );
+    if let Some(e) = state.host_texture_surfaces.get_mut(&texture_ref) {
+        e.source_gva = source_gva;
+    }
 }
 
 pub fn get_texture(
@@ -346,6 +355,25 @@ pub fn get_texture(
     height: u32,
 ) -> Option<&[u8]> {
     get_from(&state.host_texture_surfaces, texture_ref, width, height)
+}
+
+/// The address the entry behind [`get_texture`] was produced over, or `None`
+/// when no entry answers at this geometry.
+///
+/// Separate from [`get_texture`] rather than returned beside it because the
+/// serve site holds a shared borrow of `state` across the pixel slice, and the
+/// question is asked once per serve while the slice is used per texel.
+pub fn texture_source_gva(
+    state: &DeviceState,
+    texture_ref: u32,
+    width: u32,
+    height: u32,
+) -> Option<u64> {
+    get_from(&state.host_texture_surfaces, texture_ref, width, height)?;
+    state
+        .host_texture_surfaces
+        .get(&texture_ref)
+        .map(|e| e.source_gva)
 }
 
 pub fn evict_texture(state: &mut DeviceState, texture_ref: u32) {
@@ -660,7 +688,7 @@ pub fn mirror_linear_color_cache<M: HostMemory + crate::runtime::host::HostOps>(
         MTL_FORMAT_BGRA8_UNORM | MTL_FORMAT_BGRA8_UNORM_SRGB => {}
         _ => return,
     }
-    store_texture(state, texture_ref, width, height, bgra.clone());
+    store_texture(state, texture_ref, width, height, bgra.clone(), gva);
     let backing = gva_backing(state, host, task_id, gva, width, height);
     store_gva_owned(state, gva, width, height, bgra, 0, backing);
 }
@@ -1356,7 +1384,7 @@ mod tests {
                 .expect("mid store")
                 .1,
         );
-        store_texture(&mut st, 9, 4, 4, px.clone());
+        store_texture(&mut st, 9, 4, 4, px.clone(), 0);
         seen.insert(
             get_from_with_gen(&st.host_texture_surfaces, 9, 4, 4)
                 .expect("ref store")
@@ -1624,9 +1652,43 @@ mod tests {
         let mut tex = vec![0u8; 16];
         tex[0] = 2;
         store(&mut st, 5, w, h, surface);
-        store_texture(&mut st, 5, w, h, tex);
+        store_texture(&mut st, 5, w, h, tex, 0);
         assert_eq!(get(&st, 5, w, h).unwrap()[0], 1);
         assert_eq!(get_texture(&st, 5, w, h).unwrap()[0], 2);
+    }
+
+    /// The ref cache remembers which address produced its pixels, and a store at
+    /// a new address replaces that answer rather than leaving the old one.
+    ///
+    /// This is the only thing that separates "the GVA entry aged out of its byte
+    /// cap and the ref door is serving the same allocation" from "the guest
+    /// re-pointed this texture and the ref door is serving the previous
+    /// allocation's picture". Both look identical at the serve site without it,
+    /// and only the second is a wrong LOAD seed.
+    #[test]
+    fn the_ref_cache_remembers_which_address_produced_its_pixels() {
+        let mut st = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let (w, h) = (2u32, 2u32);
+        assert_eq!(
+            texture_source_gva(&st, 5, w, h),
+            None,
+            "no entry, no answer — an absent entry must not read as address 0"
+        );
+        store_texture(&mut st, 5, w, h, vec![1u8; 16], 0x4000);
+        assert_eq!(texture_source_gva(&st, 5, w, h), Some(0x4000));
+        // The guest re-points the texture and stores again: the recorded address
+        // must move with the pixels, or a later serve compares against a stale one.
+        store_texture(&mut st, 5, w, h, vec![2u8; 16], 0x9000);
+        assert_eq!(texture_source_gva(&st, 5, w, h), Some(0x9000));
+        // A producer with no address records none, which is its own case at the
+        // serve site: unknowable, neither "same" nor "different".
+        store_texture(&mut st, 5, w, h, vec![3u8; 16], 0);
+        assert_eq!(texture_source_gva(&st, 5, w, h), Some(0));
+        assert_eq!(
+            texture_source_gva(&st, 5, w + 1, h),
+            None,
+            "a geometry the entry does not answer at answers nothing here either"
+        );
     }
 
     #[test]

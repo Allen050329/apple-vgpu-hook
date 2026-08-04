@@ -1203,6 +1203,18 @@ pub struct HostSurface {
     /// `None` on the surface_id/texture_ref caches (their key is not a guest
     /// virtual address) and on any GVA store whose walk did not resolve.
     pub backing: Option<GvaBacking>,
+    /// The target GVA the store that produced these bytes rendered into, for
+    /// texture_ref-keyed entries. Zero when the producer had none, and unused by
+    /// the GVA-keyed cache, whose key *is* that address.
+    ///
+    /// The ref cache is the fallback door of the colour LOAD seed, and a LOAD
+    /// seed is the attachment's *prior content* — so serving one produced at a
+    /// different address hands the pass another allocation's picture to
+    /// composite onto, and the Store writes the result back. That is a fixpoint:
+    /// the next frame loads what this one stored. This field is what lets the
+    /// serve site say whether that happened, which is the reading the door has
+    /// never had — `load_seed_ok_color` counts both doors as one.
+    pub source_gva: u64,
     // No guest-CPU-write witness sits here, and that is a known gap rather
     // than an omission. `surface_cache::gva_backing_state` answers whether this
     // GVA still *names* these pages; nothing answers whether the guest CPU

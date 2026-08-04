@@ -101,13 +101,20 @@ collect() {
 #
 # Finder is exempt because quitting it takes the desktop with it.
 quiesce() {
-  osa 'tell application "System Events" to set doomed to name of every process whose background only is false and name is not "Finder"' >/dev/null 2>&1 || true
-  osa 'tell application "System Events" to repeat with p in (name of every process whose background only is false and name is not "Finder")
+  # `tell application p` where p is a repeat variable binds an item reference,
+  # not the name, and the quit silently does nothing — which is how Safari
+  # survived a quiesce and stood behind the pane for the whole `after` phase.
+  # `(p as text)` is the fix, and the kill below is what makes the outcome
+  # independent of whether any app decided to argue about it.
+  osa 'tell application "System Events" to set doomed to name of every process whose background only is false and name is not "Finder"
+      repeat with p in doomed
         try
-          tell application p to quit
+          tell application (p as text) to quit
         end try
       end repeat' >/dev/null 2>&1 || true
-  sleep 6
+  sleep 5
+  sh_guest 'for a in $(osascript -e "tell application \"System Events\" to get name of every process whose background only is false and name is not \"Finder\"" | tr "," "\n" | sed "s/^ *//"); do killall "$a" 2>/dev/null; done' >/dev/null 2>&1 || true
+  sleep 3
 }
 
 # Open the pane and return only once it is the frontmost process — the vibrancy

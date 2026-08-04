@@ -3656,6 +3656,7 @@ pub(crate) fn host_cache_store_gva_layer<M: HostMemory + HostOps>(
             width,
             height,
             bgra.clone(),
+            gva,
         );
     }
     if gva != 0 {

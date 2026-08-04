@@ -3041,6 +3041,7 @@ fn color_load_seed_uses_provenance_and_preserves_black() {
         w,
         h,
         vec![0, 180, 0, 255, 0, 180, 0, 255],
+        target_gva,
     );
     crate::runtime::surface_cache::store_gva_owned(
         &mut state,
