@@ -57,6 +57,7 @@ import sys
 # leading token followed by `key=value` fields.
 EVENT_RE = re.compile(r"^([a-z][a-z0-9_]*)(?:\s|$)")
 KV_RE = re.compile(r"([a-z][a-z0-9_]*)=(\d+)\b")
+REASON_RE = re.compile(r"\breason=([a-z][a-z0-9_]*)")
 
 
 def open_log(path):
@@ -85,6 +86,14 @@ def parse_log(path):
             m = EVENT_RE.match(line)
             if m:
                 events[m.group(1)] = events.get(m.group(1), 0) + 1
+                # The event name alone merges unrelated defects: `linux_m2v_draw`
+                # is every engine rejection there is, and the one that matters
+                # here is a single `reason=`. Count the pair as its own metric so
+                # a class can be tracked without the noise of its siblings.
+                r = REASON_RE.search(line)
+                if r:
+                    key = f"{m.group(1)}/{r.group(1)}"
+                    events[key] = events.get(key, 0) + 1
 
     counters = {}
     for name, vals in series.items():
