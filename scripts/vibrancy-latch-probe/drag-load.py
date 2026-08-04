@@ -74,6 +74,9 @@ class Guest:
         self.proc(f"set position of window 1 to {{{x}, {y}}}")
         self.proc(f"set size of window 1 to {{{w}, {h}}}")
 
+    def raise_front(self):
+        self.proc("set frontmost to true")
+
     def open_app(self, name):
         sh(["ssh", "-o", "BatchMode=yes", self.host, f"open -a {shquote(name)}"])
 
@@ -153,8 +156,14 @@ def main() -> int:
             if i % 6 == 3:
                 guest.open_app(churn[i % len(churn)])
                 n_app += 1
+                # The launched app comes to the front, and the next grab point is
+                # computed from *this* window's origin — so without raising it
+                # back the drag would press on the other app's chrome and the
+                # tracked position would stop describing anything.
+                guest.raise_front()
             elif i % 6 == 0 and i:
                 guest.quit_app(churn[i % len(churn)])
+                guest.raise_front()
         if i == 2:
             moved_mid = guest.position()
         i += 1

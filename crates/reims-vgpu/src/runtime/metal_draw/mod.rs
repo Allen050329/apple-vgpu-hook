@@ -4440,21 +4440,32 @@ fn seed_color_load<M: HostMemory + HostOps>(
         // Census only. Refusing the serve would turn a LOAD into an unseeded
         // one, which blanks every texel the pass does not draw, and that trade
         // is not one to make before knowing the population.
+        //
+        // `_ref_asked` is the denominator, and without it the other three are
+        // unreadable. A ref door that served nothing because the GVA door always
+        // won and one that served nothing because it was asked and held nothing
+        // read identically at zero, and only the second says anything about
+        // whether the door is worth keeping.
         let gva_served = target_gva != 0
             && crate::runtime::surface_cache::has_gva(state, target_gva, width, height);
         if gva_served {
             crate::runtime::drain::note_store_route("load_seed_color_from_gva");
         } else if texture_ref != 0 {
-            if let Some(source_gva) =
-                crate::runtime::surface_cache::texture_source_gva(state, texture_ref, width, height)
+            crate::runtime::drain::note_store_route("load_seed_color_ref_asked");
+            match crate::runtime::surface_cache::texture_source_gva(state, texture_ref, width, height)
             {
-                crate::runtime::drain::note_store_route(if source_gva == 0 {
-                    "load_seed_color_from_ref_no_gva"
-                } else if source_gva == target_gva {
-                    "load_seed_color_from_ref_same_gva"
-                } else {
-                    "load_seed_color_from_ref_other_gva"
-                });
+                Some(source_gva) => {
+                    crate::runtime::drain::note_store_route(if source_gva == 0 {
+                        "load_seed_color_from_ref_no_gva"
+                    } else if source_gva == target_gva {
+                        "load_seed_color_from_ref_same_gva"
+                    } else {
+                        "load_seed_color_from_ref_other_gva"
+                    });
+                }
+                None => {
+                    crate::runtime::drain::note_store_route("load_seed_color_ref_empty");
+                }
             }
         }
         let cached = if target_gva != 0 {

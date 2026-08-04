@@ -1347,22 +1347,26 @@ fn record_type4_owner(state: &mut DeviceState, surface_id: u32, task_id: u32) {
 ///
 /// The ref-keyed reading is taken only when the direct one names no mapping at
 /// all. There is nothing to misroute in that case — the device holds no surface
-/// under that id — and what it recovers is the packet family this arm used to
-/// drop on the floor: 57 % of the re-points on a driven boot found no mapping
-/// under `object_id`, and every one of them was a re-point this device never
-/// applied to anything.
+/// under that id — and it is the only route this device has to a re-pointed
+/// type-11 texture.
 ///
-/// The cost of that silence outlives the workload that caused it. The cached
-/// page list stays trusted while naming pages that back something else,
-/// `mapping_page_drift` finds the move later and reports "no packet said so",
-/// the deferred paint riding the old plan dies on a generation check with no
-/// name attached, and every later compositor pass LOADs from a resident nothing
-/// refreshed. A surface composited once and then only sampled — a popup
-/// backdrop, a settings pane — never gets the Store that would replace those
-/// bytes, so what the guest sees is a layer that stopped being redrawn.
+/// **It has never answered.** Three driven x86/Vulkan boots read
+/// `replace_physical_routed_ref` at 0 while three quarters of the re-points
+/// named an id no mapping owned, and `exec.rs`'s resource-table census reports
+/// the same of the sibling packet's ids ("`texture_to_mapping` answered for
+/// exactly none"). So the ref id space these packets use is not the one that map
+/// is keyed on, and finding the route that does reach it is open work. The arm
+/// stays because it costs one lookup on a lifecycle packet and it is the only
+/// candidate route in the tree; it is not evidence that the id space is covered.
 ///
-/// A re-point that reaches nothing at all is therefore reported rather than
-/// counted as a no-op: it is the loss of the only notice there is.
+/// What the *unreached* re-points turn out to be is measured rather than
+/// assumed, and it is mostly benign: 44 of 46 on a driven boot were
+/// `replace_physical_unmapped_no_state` — this device holds nothing at all for
+/// the object, so the first resolve of that ref reads the page table the guest
+/// has already rewritten. Two held a ref-keyed host copy.
+/// [`note_replace_physical_unmapped`] is what separates those, and it exists
+/// because a bare "reached nothing" cannot: an announcement with nothing to
+/// apply it to and an announcement that missed a live host copy read the same.
 pub fn replace_physical<H: HostMemory + crate::runtime::host::HostOps>(
     state: &mut DeviceState,
     host: &mut H,
