@@ -4437,49 +4437,61 @@ fn seed_color_load<M: HostMemory + HostOps>(
         // matching Store writes the composite back, the next frame loads what
         // this one stored.
         //
-        // Census only. Refusing the serve would turn a LOAD into an unseeded
-        // one, which blanks every texel the pass does not draw, and that trade
-        // is not one to make before knowing the population.
+        // The ref door only answers for the allocation its pixels came from.
         //
-        // `_ref_asked` is the denominator, and without it the other three are
-        // unreadable. A ref door that served nothing because the GVA door always
-        // won and one that served nothing because it was asked and held nothing
-        // read identically at zero, and only the second says anything about
-        // whether the door is worth keeping.
+        // A LOAD seed is the attachment's *prior content*, and the matching Store
+        // writes the composite back — so a door that hands the pass another
+        // allocation's picture arms the next frame to load what this one stored.
+        // The GVA door cannot do that: its key *is* the allocation, and the block
+        // above asks whether that address still names the same pages. The ref
+        // door's key is an object-list slot the guest reuses, and its entry
+        // carries no page identity, so `source_gva` — the address the producing
+        // Store rendered into — is the only thing that can separate "the GVA
+        // entry aged out of its byte cap and this is the same allocation" from
+        // "the guest re-pointed this texture and this is the previous one".
+        //
+        // An entry that cannot say where its pixels came from is refused for the
+        // same reason, and so is a target with no address of its own: neither can
+        // establish that these are this attachment's bytes. Refusing costs a
+        // guest re-read below (`load_sampled_rgba_static`), never a lost seed —
+        // the guest's own pages are the authoritative source and any deferred
+        // window over this address was already landed at the top of this
+        // function.
+        //
+        // Measured on a driven x86/Vulkan boot: the ref door was asked twice in
+        // 3 066 seeds and held nothing both times, so the population this gates
+        // is small on this pathway. It is not measurable on Metal from here —
+        // `host_cache_store_gva_layer` is Vulkan-only, but the compute mirror in
+        // `surface_cache::mirror_linear_color_cache` is not — which is why this
+        // is a currency test rather than the removal the zero would otherwise
+        // invite.
         let gva_served = target_gva != 0
             && crate::runtime::surface_cache::has_gva(state, target_gva, width, height);
+        let ref_served = !gva_served
+            && texture_ref != 0
+            && target_gva != 0
+            && crate::runtime::surface_cache::texture_source_gva(state, texture_ref, width, height)
+                == Some(target_gva);
         if gva_served {
             crate::runtime::drain::note_store_route("load_seed_color_from_gva");
         } else if texture_ref != 0 {
+            // The denominator. A door that served nothing because the GVA door
+            // always won and one that was asked and refused read identically at
+            // zero, and only the second says what this gate costs.
             crate::runtime::drain::note_store_route("load_seed_color_ref_asked");
-            match crate::runtime::surface_cache::texture_source_gva(state, texture_ref, width, height)
-            {
-                Some(source_gva) => {
-                    crate::runtime::drain::note_store_route(if source_gva == 0 {
-                        "load_seed_color_from_ref_no_gva"
-                    } else if source_gva == target_gva {
-                        "load_seed_color_from_ref_same_gva"
-                    } else {
-                        "load_seed_color_from_ref_other_gva"
-                    });
-                }
-                None => {
-                    crate::runtime::drain::note_store_route("load_seed_color_ref_empty");
-                }
-            }
+            crate::runtime::drain::note_store_route(if ref_served {
+                "load_seed_color_from_ref"
+            } else {
+                "load_seed_color_ref_refused"
+            });
         }
-        let cached = if target_gva != 0 {
+        let cached = if gva_served {
             crate::runtime::surface_cache::get_gva(state, target_gva, width, height)
+        } else if ref_served {
+            crate::runtime::surface_cache::get_texture(state, texture_ref, width, height)
         } else {
             None
-        }
-        .or_else(|| {
-            (texture_ref != 0)
-                .then(|| {
-                    crate::runtime::surface_cache::get_texture(state, texture_ref, width, height)
-                })
-                .flatten()
-        });
+        };
         if let Some(bgra) = cached {
             return Some(swap_rb_channels(bgra));
         }

@@ -3018,6 +3018,14 @@ fn padded_bgra8_memoized_uploads_native_without_swizzle() {
 
 /// Black-load-seed-discard regression: GVA identity wins over colliding
 /// texture/surface namespaces, and a zero-RGB result remains valid.
+///
+/// The second half pins the ref door's currency test. A LOAD seed is the
+/// attachment's prior content and the matching Store writes the composite back,
+/// so a ref entry produced at another address must not be served as this one's
+/// — that hands the pass another allocation's picture and arms the next frame
+/// to load what this one stored. The same entry *is* served once the address
+/// agrees, which is the case the door exists for: the GVA entry aged out of its
+/// byte cap while the uncapped ref entry survived.
 #[test]
 fn color_load_seed_uses_provenance_and_preserves_black() {
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
@@ -3065,18 +3073,37 @@ fn color_load_seed_uses_provenance_and_preserves_black() {
     .expect("exact GVA cache seed");
     assert_eq!(seed, vec![0, 0, 0, 255, 0, 0, 0, 255]);
 
-    // Without a GVA match, use the texture namespace (green), never the
-    // colliding surface namespace (red).
+    // A different address with no GVA entry of its own must NOT be handed the
+    // ref entry: those pixels were produced over `target_gva`, and serving them
+    // here composites this pass onto another allocation's picture. The colliding
+    // surface namespace (red) must stay unreachable either way.
+    assert!(
+        seed_color_load(
+            &mut state,
+            &mut host,
+            task_id,
+            texture_ref,
+            target_gva + 0x1000,
+            w,
+            h,
+        )
+        .is_none(),
+        "a ref entry produced at another address is not this attachment's prior content"
+    );
+
+    // Same address, GVA entry gone: this is the case the ref door is for, and it
+    // serves green — never the colliding surface namespace's red.
+    crate::runtime::surface_cache::evict_gva(&mut state, target_gva);
     let texture_seed = seed_color_load(
         &mut state,
         &mut host,
         task_id,
         texture_ref,
-        target_gva + 0x1000,
+        target_gva,
         w,
         h,
     )
-    .expect("texture-ref cache seed");
+    .expect("texture-ref cache seed at the address that produced it");
     assert_eq!(texture_seed, vec![0, 180, 0, 255, 0, 180, 0, 255]);
 }
 
