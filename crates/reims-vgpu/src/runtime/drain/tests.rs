@@ -4277,6 +4277,9 @@ fn every_short_control_packet_names_itself() {
         (CHILD_OP_DELETE_OBJECT, 8),
         (CHILD_OP_CURSOR_SHOW, 8),
         (CHILD_OP_SETUP_SHARED_STATE, CHILD_SHARED_STATE_LEN),
+        // Both FIFOs carry DEFINE_TASK2 and one function handles both, so the
+        // root case above does not cover the child site.
+        (CHILD_OP_DEFINE_TASK2, DEFINE_TASK_LEN),
     ] {
         process_child_packet(&mut state, &mut host, 4, &short(opcode, need - 1));
     }
@@ -4297,6 +4300,7 @@ fn every_short_control_packet_names_itself() {
         "reason=delete_object_short site=ch4",
         "reason=cursor_show_short site=ch4",
         "reason=setup_shared_state_short site=ch4",
+        "reason=define_task2_short site=ch4",
     ] {
         assert!(
             log.contains(reason),

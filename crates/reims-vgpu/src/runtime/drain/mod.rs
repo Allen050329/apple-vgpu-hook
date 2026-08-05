@@ -90,27 +90,72 @@ fn packet_short(op: &'static str, channel: Option<u32>, have: usize, need: usize
     if have >= need {
         return false;
     }
-    let site = match channel {
-        Some(ch) => format!("ch{ch}"),
-        None => "root".to_string(),
-    };
     crate::observe::fail(format!(
-        "packet_short reason={op}_short site={site} plen={have} need={need}"
+        "packet_short reason={op}_short site={} plen={have} need={need}",
+        packet_site(channel)
     ));
     true
+}
+
+/// Which FIFO a packet arrived on, for a log line.
+///
+/// One spelling, because several opcodes are carried on **both** the root FIFO
+/// and a child channel and are handled by one function for each — so a reader
+/// filtering the log for a rail needs the two arms to name it the same way.
+/// `apply_define_task2` used to spell the child arm `child ch=4` against
+/// `packet_short`'s `ch4`, which is the whole reason this is a function.
+fn packet_site(channel: Option<u32>) -> String {
+    match channel {
+        Some(ch) => format!("ch{ch}"),
+        None => "root".to_string(),
+    }
+}
+
+/// `CmdDeleteTask` (0x20), from either FIFO.
+///
+/// The guest recycles task ids, so a delete that does not land leaves a later
+/// `DefineTask2` writing into a slot that still holds the previous task's page
+/// directory. A short payload is not refused: the live shape is a 12-byte header
+/// with a 4-byte id, and a packet carrying none names task 0 — which is the
+/// kernel task, so the length is reported on the line rather than guessed at.
+fn apply_delete_task(state: &mut DeviceState, payload: &[u8], channel: Option<u32>) {
+    let task_id = if payload.len() >= 4 {
+        ld32(&payload[0..])
+    } else {
+        0
+    };
+    let ok = state.delete_task(task_id);
+    crate::observe::off(format!(
+        "delete_task site={} task={task_id} ok={} plen={}",
+        packet_site(channel),
+        ok as u8,
+        payload.len()
+    ));
+}
+
+/// `CmdSetObjectList`, from either FIFO.
+fn apply_set_object_list(state: &mut DeviceState, payload: &[u8], channel: Option<u32>) {
+    if packet_short(
+        "set_object_list",
+        channel,
+        payload.len(),
+        SET_OBJECT_LIST_LEN,
+    ) {
+        return;
+    }
+    let task_id = ld32(&payload[SET_OBJECT_LIST_TASK_ID..]);
+    let pfn = ld32(&payload[SET_OBJECT_LIST_PFN..]);
+    let count = ld32(&payload[SET_OBJECT_LIST_COUNT..]);
+    let _ = state.set_object_list(task_id, pfn, count);
 }
 
 fn apply_define_task2<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut H,
     payload: &[u8],
-    site: &str,
+    channel: Option<u32>,
 ) {
-    if payload.len() < DEFINE_TASK_LEN {
-        crate::observe::fail(format!(
-            "packet_short reason=define_task2_short site={site} plen={} need={DEFINE_TASK_LEN}",
-            payload.len()
-        ));
+    if packet_short("define_task2", channel, payload.len(), DEFINE_TASK_LEN) {
         return;
     }
     let raw_id = ld32(&payload[DEFINE_TASK_RAW_ID..]);
@@ -134,8 +179,10 @@ fn apply_define_task2<H: HostMemory + HostOps>(
     // as `tid=` and the directory as `dir=`, and a key printed twice in one line
     // is a field every log reader resolves arbitrarily.
     crate::observe::off(format!(
-        "define_task {site} raw={raw_id:#x} kernel={} len={length:#x} page_shift={} {walk}",
-        kernel_task as u8, state.page_shift
+        "define_task site={} raw={raw_id:#x} kernel={} len={length:#x} page_shift={} {walk}",
+        packet_site(channel),
+        kernel_task as u8,
+        state.page_shift
     ));
 }
 
@@ -886,35 +933,9 @@ fn process_root_packet<H: HostMemory + HostOps>(
                 }
             }
         }
-        ROOT_OP_DEFINE_TASK2 => apply_define_task2(state, host, &packet.payload, "root"),
-        ROOT_OP_SET_OBJECT_LIST => {
-            if !packet_short(
-                "set_object_list",
-                None,
-                packet.payload.len(),
-                SET_OBJECT_LIST_LEN,
-            ) {
-                let task_id = ld32(&packet.payload[SET_OBJECT_LIST_TASK_ID..]);
-                let pfn = ld32(&packet.payload[SET_OBJECT_LIST_PFN..]);
-                let count = ld32(&packet.payload[SET_OBJECT_LIST_COUNT..]);
-                let _ = state.set_object_list(task_id, pfn, count);
-            }
-        }
-        // PVG CmdDeleteTask (0x20). Live: top UnknownRootOpcode was op 32 total_size=16
-        // (12-byte header + task_id u32). Guest reuses task ids — must clear.
-        ROOT_OP_DELETE_TASK => {
-            let task_id = if packet.payload.len() >= 4 {
-                ld32(&packet.payload[0..])
-            } else {
-                0
-            };
-            let ok = state.delete_task(task_id);
-            crate::observe::off(format!(
-                "delete_task root task={task_id} ok={} plen={}",
-                ok as u8,
-                packet.payload.len()
-            ));
-        }
+        ROOT_OP_DEFINE_TASK2 => apply_define_task2(state, host, &packet.payload, None),
+        ROOT_OP_SET_OBJECT_LIST => apply_set_object_list(state, &packet.payload, None),
+        ROOT_OP_DELETE_TASK => apply_delete_task(state, &packet.payload, None),
         _ => {
             state.record_fail(FailEvent::UnknownRootOpcode {
                 opcode: effective,
@@ -1909,28 +1930,13 @@ fn process_child_packet<H: HostMemory + HostOps>(
 ) -> ChildPacketDisposition {
     match packet.opcode {
         CHILD_OP_DEFINE_TASK2 => {
-            apply_define_task2(
-                state,
-                host,
-                &packet.payload,
-                &format!("child ch={channel_id}"),
-            );
+            apply_define_task2(state, host, &packet.payload, Some(channel_id));
         }
+        // A short SET_OBJECT_LIST leaves the task's object list unbound — every
+        // type-11 texture/object resolve on it then fails
+        // (object_list_count==0). Never on a well-formed boot.
         CHILD_OP_SET_OBJECT_LIST => {
-            // A short SET_OBJECT_LIST leaves the task's object list unbound —
-            // every type-11 texture/object resolve on it then fails
-            // (object_list_count==0). Never on a well-formed boot.
-            if !packet_short(
-                "set_object_list",
-                Some(channel_id),
-                packet.payload.len(),
-                SET_OBJECT_LIST_LEN,
-            ) {
-                let task_id = ld32(&packet.payload[SET_OBJECT_LIST_TASK_ID..]);
-                let pfn = ld32(&packet.payload[SET_OBJECT_LIST_PFN..]);
-                let count = ld32(&packet.payload[SET_OBJECT_LIST_COUNT..]);
-                let _ = state.set_object_list(task_id, pfn, count);
-            }
+            apply_set_object_list(state, &packet.payload, Some(channel_id));
         }
         CHILD_OP_DELETE_OBJECT => {
             if !packet_short("delete_object", Some(channel_id), packet.payload.len(), 8) {
@@ -1941,17 +1947,7 @@ fn process_child_packet<H: HostMemory + HostOps>(
         }
         // PVG CmdDeleteTask (0x20) on child channels too (was SMALL_ID alias only in decode).
         CHILD_OP_DELETE_TASK => {
-            let task_id = if packet.payload.len() >= 4 {
-                ld32(&packet.payload[0..])
-            } else {
-                0
-            };
-            let ok = state.delete_task(task_id);
-            crate::observe::off(format!(
-                "delete_task ch={channel_id} task={task_id} ok={} plen={}",
-                ok as u8,
-                packet.payload.len()
-            ));
+            apply_delete_task(state, &packet.payload, Some(channel_id));
         }
         CHILD_OP_SETUP_SHARED_STATE => {
             // A short SETUP_SHARED_STATE drops display registration:
