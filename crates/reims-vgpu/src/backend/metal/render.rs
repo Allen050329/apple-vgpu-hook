@@ -8,7 +8,7 @@ use crate::backend::metal::cache::{
 use crate::backend::metal::constants::*;
 use crate::backend::metal::format::{mtl_pixel_format_bpp, pixel_format_from_u32};
 use crate::backend::metal::function::load_only_function;
-use crate::backend::metal::hash::{hash_bytes, hash_u64};
+use crate::backend::metal::hash::{hash_bytes, hash_u64, FNV_OFFSET_BASIS};
 use crate::backend::metal::mtl_enum;
 use crate::backend::metal::raw_metal::{
     command_buffer_error_description, render_reflection_sampler_mask,
@@ -594,7 +594,7 @@ fn fill_render_pso_key(
     key.depth_pixel_format = depth_pixel_format;
     key.stencil_pixel_format = stencil_pixel_format;
 
-    let mut h = 0xcbf29ce484222325u64;
+    let mut h = FNV_OFFSET_BASIS;
     // Folded off the key's own fields rather than off parallel locals, so the
     // hash cannot describe a key different from the one it is returned with.
     h = hash_u64(h, key.vert_hash);
