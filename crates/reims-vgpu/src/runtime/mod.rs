@@ -322,6 +322,9 @@ mod arch_path_gate {
             // terms, and nothing else in the list proves that.
             "mapper/tests.rs",
             "mapper/revalidate_tests.rs",
+            "scanout/tests.rs",
+            "surface_cache/tests.rs",
+            "surface_cache/cap_tests.rs",
         ] {
             assert!(
                 is_out_of_line_test_module(&root.join(relative)),
