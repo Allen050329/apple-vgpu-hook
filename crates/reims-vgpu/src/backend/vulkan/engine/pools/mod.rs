@@ -813,6 +813,21 @@ impl ResidentTargetSlot {
     /// handle and does nothing with it, so the two that answered it wrong were
     /// neither a crash nor a log line — they spent a graveyard entry, which is
     /// a bounded ring shared with every destroy that is real.
+    ///
+    /// # A driven boot does not reach the `None` arm
+    ///
+    /// The desktop workload creates no framebuffer-less resident at all: on a
+    /// driven x86/Vulkan boot (Safari window drag, 2 892 posted events, ~37.5 Hz
+    /// median present) the `vk_alloc_sites` census reads `mrt_secondary=0:0:0`,
+    /// and only [`ResourcePools::registry_ensure_color`] allocates under that
+    /// site. So every slot the drain and the recreate arms retired that boot had
+    /// a real framebuffer, and all three disposal sites would have behaved
+    /// identically with the check and without it.
+    ///
+    /// That is why the guard is held by a device-free test rather than by a
+    /// boot, and why a green boot is not evidence about this arm. Whatever
+    /// workload does drive Apple's multiple-render-target path is what would
+    /// exercise it.
     pub(crate) fn owed_framebuffer(&self) -> Option<vk::Framebuffer> {
         (self.framebuffer != vk::Framebuffer::null()).then_some(self.framebuffer)
     }
