@@ -512,13 +512,7 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
             width = m.width;
             height = m.height;
             format = if m.format != 0 { m.format } else { format };
-            let desc_slice = device_desc.as_deref().or({
-                if m.device_desc.len() >= DEVICE_DESC_LEN {
-                    Some(m.device_desc.as_slice())
-                } else {
-                    None
-                }
-            });
+            let desc_slice = device_desc.as_deref().or(m.device_desc_complete());
             if let Some(end) = mapping_span_bound(desc_slice, format, width, height) {
                 min_size = min_size.max(end).max(guest_page);
             }
@@ -968,16 +962,8 @@ pub fn pages_cover_geom(state: &DeviceState, mapping_id: u32) -> bool {
         // Match scanout/writeback default when format not latched.
         crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM
     };
-    let Some(span_end) = mapping_span_bound(
-        if m.device_desc.len() >= DEVICE_DESC_LEN {
-            Some(m.device_desc.as_slice())
-        } else {
-            None
-        },
-        format,
-        m.width,
-        m.height,
-    ) else {
+    let Some(span_end) = mapping_span_bound(m.device_desc_complete(), format, m.width, m.height)
+    else {
         return false;
     };
     let page_size = crate::contract::iosurface_pages::page_size_of(state.page_shift);

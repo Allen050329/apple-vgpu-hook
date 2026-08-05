@@ -5,9 +5,7 @@
 //! `0xff000000ff000000` class). Always bumps [`DeviceState::mark_mapping_written`]
 //! on success.
 
-use crate::contract::iosurface_pages::{
-    packed_span_estimate, sample_window_from_device_desc, DEVICE_DESC_LEN,
-};
+use crate::contract::iosurface_pages::{packed_span_estimate, sample_window_from_device_desc};
 use crate::contract::pixel_format::{
     self, convert_rgba8_to_row, convert_row_to_rgba8, MTL_FORMAT_BGRA8_UNORM, RGBA8_BPP,
 };
@@ -214,7 +212,7 @@ fn sample_window(
     height: u32,
     format: u16,
 ) -> Option<(u64, u32, u64)> {
-    let Some(desc) = m.device_desc.get(..DEVICE_DESC_LEN) else {
+    let Some(desc) = m.device_desc_complete() else {
         let end = packed_span_estimate(format, width, height)?;
         // The estimate is a whole number of aligned rows, so dividing it back
         // out is the row it was built from rather than a second derivation.
@@ -4031,7 +4029,7 @@ mod tests {
         );
 
         // Publish a v0a8-shaped descriptor: planes 0 and 2 are both R8 4x2.
-        let mut desc = vec![0u8; DEVICE_DESC_LEN];
+        let mut desc = vec![0u8; crate::contract::iosurface_pages::DEVICE_DESC_LEN];
         st32(&mut desc[DEVICE_DESC_ALLOC_SIZE..], 0x2000);
         desc[DEVICE_DESC_PLANE_COUNT] = 3;
         let pack = |w: u32, h: u32| ((w as u64 & 0xffffff) << 8) | ((h as u64 & 0xffffff) << 40);

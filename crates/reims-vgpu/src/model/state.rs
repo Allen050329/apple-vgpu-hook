@@ -775,6 +775,27 @@ pub struct MappingEntry {
     pub type4_walk: Option<Type4Walk>,
 }
 
+impl MappingEntry {
+    /// The cached `sIOSurfaceDeviceDescriptor`, but only when a whole one is
+    /// there — `None` while nothing has published one, so a caller falls back
+    /// on its own terms instead of reading a partial record.
+    ///
+    /// Three callers asked this in three spellings, two of which handed
+    /// `device_desc.as_slice()` whole while the third handed
+    /// `device_desc.get(..DEVICE_DESC_LEN)`. Those agree only because
+    /// `mapper::resolve` reads into a `[0u8; DEVICE_DESC_LEN]` and so caches
+    /// exactly that many bytes; `set_mapping_device_desc` enforces nothing but
+    /// non-emptiness. `device_desc_plane` bounds every plane read against the
+    /// slice it is handed and the plane table runs to `0x240`, past the record's
+    /// own `0x200`, so a longer cached blob would make the whole-slice spelling
+    /// decode an eighth plane the truncating one refuses. Truncation is the
+    /// answer for all three: it is what the record declares.
+    pub fn device_desc_complete(&self) -> Option<&[u8]> {
+        self.device_desc
+            .get(..crate::contract::iosurface_pages::DEVICE_DESC_LEN)
+    }
+}
+
 /// Exact protocol-backed compute storage-image view eligible for residency.
 ///
 /// `map_generation` separates recycled mapping lifetimes. The remaining fields
@@ -3101,6 +3122,89 @@ impl DeviceState {
         crate::observe::Emit::decline("fail_event", &ev).fail();
         #[cfg(test)]
         self.fails.push(ev);
+    }
+}
+
+#[cfg(test)]
+mod device_desc_tests {
+    use super::*;
+    use crate::contract::iosurface_pages::{
+        device_desc_plane, DEVICE_DESC_LEN, DEVICE_DESC_PLANES, DEVICE_PLANE_DESC_LEN,
+    };
+
+    fn entry_with_desc(len: usize) -> MappingEntry {
+        MappingEntry {
+            device_desc: vec![0u8; len],
+            ..Default::default()
+        }
+    }
+
+    /// The completeness rule is all-or-nothing, and what it hands back is the
+    /// record's own length rather than whatever was cached.
+    #[test]
+    fn a_partial_device_descriptor_is_no_descriptor() {
+        assert!(entry_with_desc(0).device_desc_complete().is_none());
+        assert!(
+            entry_with_desc(DEVICE_DESC_LEN - 1)
+                .device_desc_complete()
+                .is_none(),
+            "one byte short is not a record"
+        );
+        assert_eq!(
+            entry_with_desc(DEVICE_DESC_LEN)
+                .device_desc_complete()
+                .map(<[u8]>::len),
+            Some(DEVICE_DESC_LEN)
+        );
+        assert_eq!(
+            entry_with_desc(DEVICE_DESC_LEN * 2)
+                .device_desc_complete()
+                .map(<[u8]>::len),
+            Some(DEVICE_DESC_LEN),
+            "a longer cached blob is still truncated to the record"
+        );
+    }
+
+    /// Why the truncation is the answer and not an arbitrary choice between two
+    /// spellings that happen to agree.
+    ///
+    /// `device_desc_plane` bounds each plane read against the slice it is
+    /// handed, and the eighth plane's record ends past `DEVICE_DESC_LEN`. So a
+    /// caller that passed `device_desc.as_slice()` whole would decode an eighth
+    /// plane out of an over-long cached blob while a caller that truncated
+    /// refused it — two readers of one mapping disagreeing about how many planes
+    /// the surface has. Truncating everywhere removes the disagreement, and this
+    /// pins that the boundary the two spellings differ at is real.
+    #[test]
+    fn the_eighth_plane_lies_past_the_record_the_completeness_rule_hands_back() {
+        let eighth = DEVICE_DESC_PLANES + 7 * DEVICE_PLANE_DESC_LEN;
+        assert!(
+            eighth + DEVICE_PLANE_DESC_LEN > DEVICE_DESC_LEN,
+            "the plane table must actually overrun the record, or there is \
+             nothing for the two spellings to disagree about"
+        );
+
+        // A descriptor declaring eight planes, cached over-long.
+        let mut over = vec![0u8; eighth + DEVICE_PLANE_DESC_LEN];
+        over[crate::contract::iosurface_pages::DEVICE_DESC_PLANE_COUNT] = 8;
+        assert!(
+            device_desc_plane(&over, 7).is_some(),
+            "the whole-slice spelling would have found an eighth plane"
+        );
+
+        let e = MappingEntry {
+            device_desc: over,
+            ..Default::default()
+        };
+        let truncated = e.device_desc_complete().expect("a full record is cached");
+        assert!(
+            device_desc_plane(truncated, 7).is_none(),
+            "and the rule this crate now uses everywhere refuses it"
+        );
+        assert!(
+            device_desc_plane(truncated, 6).is_some(),
+            "without refusing the seventh, which does fit"
+        );
     }
 }
 
