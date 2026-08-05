@@ -2959,6 +2959,14 @@ fn exec_copy_texture_to_texture_slice_level<M: HostMemory + HostOps>(
                 };
                 (src_bpi, dst_bpi, d as u64)
             } else if cmd.slice_count <= 1 {
+                // One image, so neither stride is ever stepped: both consumers
+                // scale it by `image_count - 1`, which is zero here —
+                // `strided_span`'s `last_image` term and `copy_region`'s `z`
+                // loop. That is why this arm may fall back on `row_bytes` where
+                // the volume arm above refuses a missing `bytes_per_image` by
+                // name: there the stride selects z planes and a wrong one reads
+                // the wrong plane, here it is multiplied away. The fallback is
+                // inert rather than a second opinion about the layout.
                 (
                     sl.bytes_per_image().unwrap_or(row_bytes),
                     dl.bytes_per_image().unwrap_or(row_bytes),
