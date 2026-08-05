@@ -156,6 +156,11 @@ pub fn store_rows(
     entry.host_gen = generation;
     entry.width = width;
     entry.height = height;
+    // The same reason [`store_into`] sets it: this map has no byte cap, so
+    // nothing reads the flag, but `false` is the value that means "the cap must
+    // not evict this" and an entry reaching it through `or_default` would be
+    // asserting something no store here has checked.
+    entry.guest_holds_bytes = true;
 }
 
 /// Copy `height` rows of `row` bytes out of `src` at `src_stride` pitch into a
