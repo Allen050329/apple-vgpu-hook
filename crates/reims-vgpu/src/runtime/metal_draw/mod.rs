@@ -3252,8 +3252,14 @@ pub fn writeback_chain_rgba<M: HostMemory + HostOps>(
     if att.texture_ref == 0 {
         return lost("unbound_texture_ref");
     }
-    let Some((mapping_id, gva, w, h, bpr, fmt)) =
-        lookup_render_target(state, host, task_id, att.texture_ref)
+    let Some(ResolvedRenderTarget {
+        mapping_id,
+        target_gva: gva,
+        width: w,
+        height: h,
+        row_stride: bpr,
+        format: fmt,
+    }) = lookup_render_target(state, host, task_id, att.texture_ref)
     else {
         return lost("render_target_unresolved");
     };
@@ -3428,12 +3434,34 @@ fn note_rt_type5_view(
 /// materialization (mip RT not supported). Without this, UI passes that bind a
 /// type-8 view as color attachment fail MRT (`mrt_request fail slots=[211]`) and
 /// drop entire draws (blank App Store sidebar / missing chrome labels).
+/// Where a colour attachment's `texture_ref` actually resolved to.
+///
+/// This was six loose positional values — `(u32, u64, u32, u32, u32, u16)` —
+/// and three of them are `u32` in a row, so every call site accepted the
+/// permutation that swaps width, height and row stride. The two sites that
+/// destructure it do so in different orders from the one that builds a
+/// [`ColorRtRequest`] out of it, which is where such a swap would have gone
+/// unnoticed: all three orders type-check.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ResolvedRenderTarget {
+    /// Non-zero ⇒ a host mapping; `0` with `target_gva` non-zero ⇒ type-2/3
+    /// linear guest VA. The two are exclusive, the same way
+    /// [`ColorRtRequest::target_gva`] documents.
+    pub(crate) mapping_id: u32,
+    pub(crate) target_gva: u64,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    /// Bytes per row of the target (archive `bpr`).
+    pub(crate) row_stride: u32,
+    pub(crate) format: u16,
+}
+
 fn lookup_render_target<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &M,
     task_id: u32,
     texture_ref: u32,
-) -> Option<(u32, u64, u32, u32, u32, u16)> {
+) -> Option<ResolvedRenderTarget> {
     if texture_ref == 0 {
         return None;
     }
@@ -3514,7 +3542,14 @@ fn lookup_render_target<M: HostMemory + HostOps>(
                 let fmt =
                     effective_view_sample_format(base_fmt, view_fmt_override).unwrap_or(base_fmt);
                 if pixel_format::render_target_bpp(fmt).is_some() {
-                    return Some((mapping_id, 0, m.width, m.height, 0, fmt));
+                    return Some(ResolvedRenderTarget {
+                        mapping_id,
+                        target_gva: 0,
+                        width: m.width,
+                        height: m.height,
+                        row_stride: 0,
+                        format: fmt,
+                    });
                 }
             }
         }
@@ -3574,7 +3609,14 @@ fn lookup_render_target<M: HostMemory + HostOps>(
         let fmt = effective_view_sample_format(base_fmt, view_fmt_override).unwrap_or(base_fmt);
         pixel_format::render_target_bpp(fmt)?;
         // mapping_id = surface_id; no linear GVA.
-        return Some((surface_id, 0, m.width, m.height, 0, fmt));
+        return Some(ResolvedRenderTarget {
+            mapping_id: surface_id,
+            target_gva: 0,
+            width: m.width,
+            height: m.height,
+            row_stride: 0,
+            format: fmt,
+        });
     }
     // type-2/3 linear GVA (wallpaper/background layers, UI intermediate RTs).
     let entry = live?;
@@ -3646,7 +3688,14 @@ fn lookup_render_target<M: HostMemory + HostOps>(
     if bpr < tight || w == 0 || h == 0 {
         return None;
     }
-    Some((0, gva, w, h, bpr, fmt))
+    Some(ResolvedRenderTarget {
+        mapping_id: 0,
+        target_gva: gva,
+        width: w,
+        height: h,
+        row_stride: bpr,
+        format: fmt,
+    })
 }
 
 /// Resolve color texture ref → mapping geometry for a draw request.
@@ -3666,17 +3715,16 @@ pub fn color_target_request<M: HostMemory + HostOps>(
     first_vertex: u32,
     base_instance: u32,
 ) -> Option<DrawEncodeRequest> {
-    let (mapping_id, gva, w, h, bpr, fmt) =
-        lookup_render_target(state, host, task_id, color_texture_ref)?;
+    let rt = lookup_render_target(state, host, task_id, color_texture_ref)?;
     let c0 = ColorRtRequest {
         slot: 0,
         texture_ref: color_texture_ref,
-        mapping_id,
-        target_gva: gva,
-        row_stride: bpr,
-        width: w,
-        height: h,
-        format: fmt,
+        mapping_id: rt.mapping_id,
+        target_gva: rt.target_gva,
+        row_stride: rt.row_stride,
+        width: rt.width,
+        height: rt.height,
+        format: rt.format,
         load_action: 0,
         store_action: PASS_STORE_ACTION_STORE,
         clear_color: [0.0; 4],
@@ -3719,8 +3767,14 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
         if att.texture_ref == 0 {
             continue;
         }
-        let Some((mapping_id, gva, mw, mh, bpr, mfmt)) =
-            lookup_render_target(state, host, task_id, att.texture_ref)
+        let Some(ResolvedRenderTarget {
+            mapping_id,
+            target_gva: gva,
+            width: mw,
+            height: mh,
+            row_stride: bpr,
+            format: mfmt,
+        }) = lookup_render_target(state, host, task_id, att.texture_ref)
         else {
             // One unresolvable color attachment drops the whole pass (Metal
             // would not form the encoder with a null RT). Fail-visible detail
