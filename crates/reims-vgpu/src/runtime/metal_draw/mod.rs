@@ -2869,7 +2869,13 @@ fn load_linear_texture_rgba_at_level<M: HostMemory + HostOps>(
         .checked_mul(h as u64)?
         .checked_mul(RGBA8_BPP as u64)?;
     let need_rgba = host_alloc_len(need_rgba)?;
-    let span = bpr.checked_mul(h as u64)?;
+    // The extent this actually reads: the loop below walks `gva + y * bpr` for
+    // `tight` bytes, so the last row's trailing padding is never touched.
+    // `row_stride * height` charges for it, and as a bound against the guest's
+    // own `allocation_size` that refuses images the guest sized correctly —
+    // `TextureLevelLayout::read_span` carries the measured case, a 27x27
+    // RG8Unorm window mask that this arm was rejecting whole.
+    let span = layout.read_span(tight)?;
     if tex.allocation_size != 0 && layout.offset.saturating_add(span) > tex.allocation_size {
         return None;
     }
@@ -3596,8 +3602,16 @@ fn lookup_render_target<M: HostMemory + HostOps>(
         if layout.row_stride > u32::MAX as u64 {
             return None;
         }
-        // Full level span must fit the allocation (same check as the sample
-        // path) — writing rows past it would corrupt adjacent guest memory.
+        // Full level span must fit the allocation — writing rows past it would
+        // corrupt adjacent guest memory.
+        //
+        // This is deliberately still `row_stride * height` and NOT
+        // `TextureLevelLayout::read_span`, which every *reader* of a level uses.
+        // The difference is one row of trailing padding, and whether this path
+        // touches it depends on what the render-target store writes per row —
+        // a question about the store, not about this bound. Until that is
+        // measured, the wider span is the safe direction here: it can only
+        // refuse a target, never let a write run past the allocation.
         let span = layout.row_stride.checked_mul(layout.height as u64)?;
         if tex.allocation_size != 0 && layout.offset.saturating_add(span) > tex.allocation_size {
             return None;

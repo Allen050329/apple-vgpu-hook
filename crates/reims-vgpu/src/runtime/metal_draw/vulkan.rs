@@ -2735,11 +2735,20 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
     let tight = pixel_format::tight_row_bytes(w, declared_format)? as u64;
     // Padded strides ride the same memo now — the native read below covers the
     // full `bpr*h` span (padding included, so a write anywhere is observed) and
-    // `native_scratch_to_upload` gathers the tight rows. Only a sub-tight stride
+    // `native_scratch_to_upload` gathers the tight rows. A sub-tight stride
     // (impossible geometry) or a zero dimension declines to the fallback.
     if bpr < tight || w == 0 || h == 0 {
         return None;
     }
+    // `bpr*h` and not `TextureLevelLayout::read_span`, which every reader that
+    // walks only the tight rows uses instead. This one really does read the last
+    // row's padding — that is what makes the memo's byte-for-byte compare able to
+    // notice a guest write into it — so it is charged for what it touches.
+    //
+    // The consequence is a third way to decline, and the one most worth knowing:
+    // an image the guest sized to `offset + read_span` exactly is refused here
+    // and served by the general loader below, which uses the tighter rule. That
+    // is a slower path, not lost work.
     let span = bpr.checked_mul(h as u64)?;
     let native_len = host_alloc_len(span)?;
     if tex.allocation_size != 0 && layout.offset.saturating_add(span) > tex.allocation_size {
