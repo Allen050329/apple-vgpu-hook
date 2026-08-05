@@ -1575,18 +1575,17 @@ fn type1_buffer_gva_size<M: HostMemory + HostOps>(
     buffer_ref: u32,
 ) -> Result<(u64, u64), IcbStatus> {
     use crate::runtime::decode::resource::{decode_buffer_descriptor, OBJECT_TYPE_BUFFER};
-    let entry = objects::lookup_list_entry(state, host, task_id, buffer_ref).ok_or(
-        IcbStatus::Missing(crate::observe::ladder_slug!("icb_type1", no_list_entry)),
-    )?;
-    if entry.object_type != OBJECT_TYPE_BUFFER {
-        return Err(IcbStatus::BadDescriptor(crate::observe::ladder_slug!(
-            "icb_type1",
-            wrong_type
-        )));
-    }
-    let desc_bytes = objects::read_descriptor(state, host, task_id, &entry).ok_or(
-        IcbStatus::Missing(crate::observe::ladder_slug!("icb_type1", desc_read)),
-    )?;
+    let (_entry, desc_bytes) =
+        objects::resolve_descriptor(state, host, task_id, buffer_ref, &[OBJECT_TYPE_BUFFER])
+            .map_err(|rung| {
+                let slug = crate::observe::ladder_slugs!("icb_type1")(rung);
+                match rung {
+                    objects::LadderRung::NoListEntry | objects::LadderRung::DescRead => {
+                        IcbStatus::Missing(slug)
+                    }
+                    objects::LadderRung::WrongType { .. } => IcbStatus::BadDescriptor(slug),
+                }
+            })?;
     let desc = decode_buffer_descriptor(&desc_bytes).map_err(|_| {
         IcbStatus::BadDescriptor(crate::observe::ladder_slug!("icb_type1", desc_decode))
     })?;
@@ -2019,21 +2018,22 @@ pub fn fill_render_command<M: HostMemory + HostOps>(
         if fill.pipeline_ref == 0 {
             return Err(IcbStatus::Args("icb_frc_pipeline_ref_zero"));
         }
-        let entry = objects::lookup_list_entry(state, host, task_id, fill.pipeline_ref).ok_or(
-            IcbStatus::Missing(crate::observe::ladder_slug!(
-                "icb_frc_pipeline",
-                no_list_entry
-            )),
-        )?;
-        if entry.object_type != OBJECT_TYPE_TYPE7 {
-            return Err(IcbStatus::BadDescriptor(crate::observe::ladder_slug!(
-                "icb_frc_pipeline",
-                wrong_type
-            )));
-        }
-        let desc_bytes = objects::read_descriptor(state, host, task_id, &entry).ok_or(
-            IcbStatus::Missing(crate::observe::ladder_slug!("icb_frc_pipeline", desc_read)),
-        )?;
+        let (_entry, desc_bytes) = objects::resolve_descriptor(
+            state,
+            host,
+            task_id,
+            fill.pipeline_ref,
+            &[OBJECT_TYPE_TYPE7],
+        )
+        .map_err(|rung| {
+            let slug = crate::observe::ladder_slugs!("icb_frc_pipeline")(rung);
+            match rung {
+                objects::LadderRung::NoListEntry | objects::LadderRung::DescRead => {
+                    IcbStatus::Missing(slug)
+                }
+                objects::LadderRung::WrongType { .. } => IcbStatus::BadDescriptor(slug),
+            }
+        })?;
         let rp = decode_render_pipeline_descriptor(&desc_bytes).map_err(|_| {
             IcbStatus::BadDescriptor(crate::observe::ladder_slug!(
                 "icb_frc_pipeline",
@@ -2041,21 +2041,22 @@ pub fn fill_render_command<M: HostMemory + HostOps>(
             ))
         })?;
         let load_fn = |func_ref: u32| -> Result<Vec<u8>, IcbStatus> {
-            let e = objects::lookup_list_entry(state, host, task_id, func_ref).ok_or(
-                IcbStatus::Missing(crate::observe::ladder_slug!(
-                    "icb_frc_function",
-                    no_list_entry
-                )),
-            )?;
-            if e.object_type != OBJECT_TYPE_FUNCTION {
-                return Err(IcbStatus::BadDescriptor(crate::observe::ladder_slug!(
-                    "icb_frc_function",
-                    wrong_type
-                )));
-            }
-            let d = objects::read_descriptor(state, host, task_id, &e).ok_or(
-                IcbStatus::Missing(crate::observe::ladder_slug!("icb_frc_function", desc_read)),
-            )?;
+            let (_entry, d) = objects::resolve_descriptor(
+                state,
+                host,
+                task_id,
+                func_ref,
+                &[OBJECT_TYPE_FUNCTION],
+            )
+            .map_err(|rung| {
+                let slug = crate::observe::ladder_slugs!("icb_frc_function")(rung);
+                match rung {
+                    objects::LadderRung::NoListEntry | objects::LadderRung::DescRead => {
+                        IcbStatus::Missing(slug)
+                    }
+                    objects::LadderRung::WrongType { .. } => IcbStatus::BadDescriptor(slug),
+                }
+            })?;
             let f: FunctionDescriptor = decode_function_descriptor(&d).map_err(|_| {
                 IcbStatus::BadDescriptor(crate::observe::ladder_slug!(
                     "icb_frc_function",

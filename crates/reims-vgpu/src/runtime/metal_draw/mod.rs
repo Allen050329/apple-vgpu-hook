@@ -269,13 +269,9 @@ fn load_depth_stencil_descriptor<M: HostMemory + HostOps>(
     task_id: u32,
     ds_ref: u32,
 ) -> Result<crate::runtime::decode::resource::DepthStencilDescriptor, &'static str> {
-    let entry = objects::lookup_list_entry(state, host, task_id, ds_ref)
-        .ok_or(crate::observe::ladder_slug!("depth_stencil", no_list_entry))?;
-    if entry.object_type != OBJECT_TYPE_TYPE7 {
-        return Err(crate::observe::ladder_slug!("depth_stencil", wrong_type));
-    }
-    let desc = objects::read_descriptor(state, host, task_id, &entry)
-        .ok_or(crate::observe::ladder_slug!("depth_stencil", desc_read))?;
+    let (_entry, desc) =
+        objects::resolve_descriptor(state, host, task_id, ds_ref, &[OBJECT_TYPE_TYPE7])
+            .map_err(crate::observe::ladder_slugs!("depth_stencil"))?;
     decode_depth_stencil_descriptor(&desc)
         .map_err(|_| crate::observe::ladder_slug!("depth_stencil", desc_decode))
 }
@@ -1094,12 +1090,20 @@ fn load_index_bytes_reason<M: HostMemory + HostOps>(
     if need == 0 {
         return Err(R::CountZero);
     }
-    let entry = objects::lookup_list_entry(state, host, task_id, info.index_buffer_ref)
-        .ok_or(R::EntryMissing)?;
-    if entry.object_type != OBJECT_TYPE_BUFFER {
-        return Err(R::ObjectType);
-    }
-    let desc_bytes = objects::read_descriptor(state, host, task_id, &entry).ok_or(R::DescRead)?;
+    // The rung this rail's own enum already mirrored, one-to-one, in the order
+    // it can only be asked in.
+    let (_entry, desc_bytes) = objects::resolve_descriptor(
+        state,
+        host,
+        task_id,
+        info.index_buffer_ref,
+        &[OBJECT_TYPE_BUFFER],
+    )
+    .map_err(|rung| match rung {
+        objects::LadderRung::NoListEntry => R::EntryMissing,
+        objects::LadderRung::WrongType { .. } => R::ObjectType,
+        objects::LadderRung::DescRead => R::DescRead,
+    })?;
     let desc = decode_buffer_descriptor(&desc_bytes).map_err(|_| R::DescDecode)?;
     let (gva, size) = desc
         .backing_gva_size(state.page_shift)
