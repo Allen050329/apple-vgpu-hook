@@ -275,3 +275,79 @@ fn no_two_checks_share_a_reason_slug() {
         collisions.join("\n  ")
     );
 }
+
+/// Every slug survives the grep `AGENTS.md` tells you to rank the fail log with.
+///
+/// That command is `grep -o 'reason=[a-z_0-9]*'`. It is not a suggestion about
+/// style: a slug with an uppercase letter, a dash or a dot is not *rejected* by
+/// it, it is **truncated** at the first character outside the class — so
+/// `reason=Foo-bar` ranks as `reason=` and merges with every other malformed
+/// slug in the tree, while looking like a perfectly ordinary row in the output.
+/// A slug containing whitespace is worse still: the fail line is a sequence of
+/// whitespace-separated `k=v` fields, so one splits into a reason and a token
+/// that parses as neither.
+///
+/// The per-module tests each assert this over a hand-written list of their own
+/// variants — `mipmap`, the index-load reasons, the Metal ICB checks. A variant
+/// added without being added to its list is simply not covered there. This says
+/// it once, for every slug the scan above already has in hand.
+#[test]
+fn every_slug_survives_the_documented_reason_grep() {
+    let owners = slug_owners(&workspace_root());
+    assert!(
+        owners.len() > 500,
+        "found {} slugs, which is not this crate's vocabulary",
+        owners.len()
+    );
+
+    // The scanner must be able to fail before its silence means anything.
+    assert!(
+        !is_greppable("no_such Slug"),
+        "the matcher must reject whitespace"
+    );
+    assert!(!is_greppable("NoSuchSlug"), "the matcher must reject case");
+    assert!(!is_greppable(""), "an empty slug ranks as nothing at all");
+    assert!(
+        is_greppable("mipmap_texture_ref_zero"),
+        "a real slug passes"
+    );
+
+    let mut bad: Vec<String> = Vec::new();
+    for (slug, sites) in &owners {
+        if is_greppable(slug) {
+            continue;
+        }
+        let where_ = sites
+            .first()
+            .map(|o| format!("{} ({})", o.ty, o.file))
+            .unwrap_or_default();
+        // The scan reads every string literal in a `refusal()` body, and one of
+        // them is a match *pattern* rather than a returned slug: `BlitStatus`
+        // carries its reason in a thread-local, and its body reads
+        // `"" => "blit_unattributed"` to turn an uninstrumented site into a
+        // named one. So the empty literal there is the thing that stops a bare
+        // `reason=` reaching the log, not an instance of it.
+        //
+        // Named by type, so this cannot quietly widen: a second empty slug
+        // anywhere else still fails.
+        if slug.is_empty() && sites.iter().all(|o| o.ty == "BlitStatus") {
+            continue;
+        }
+        bad.push(format!("`{slug}` in {where_}"));
+    }
+
+    assert!(
+        bad.is_empty(),
+        "these slugs are truncated or split by `grep -o 'reason=[a-z_0-9]*'`, \
+         which is how AGENTS.md says to rank the fail log:\n  {}",
+        bad.join("\n  ")
+    );
+}
+
+/// `[a-z_0-9]+`, the character class in `AGENTS.md`'s ranking command.
+fn is_greppable(slug: &str) -> bool {
+    !slug.is_empty()
+        && slug
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+}
