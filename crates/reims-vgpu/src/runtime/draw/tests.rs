@@ -2813,6 +2813,7 @@ fn gva_layer_host_cache_roundtrip_for_sample() {
         w,
         h,
         &rgba,
+        true,
     );
     let cached = crate::runtime::surface_cache::get_texture(&state, tex_ref, w, h)
         .expect("texture_ref encode cache");
@@ -3104,6 +3105,7 @@ fn color_load_seed_uses_provenance_and_preserves_black() {
         vec![0, 0, 0, 255, 0, 0, 0, 255],
         0,
         None,
+        true,
     );
 
     let seed = seed_color_load(

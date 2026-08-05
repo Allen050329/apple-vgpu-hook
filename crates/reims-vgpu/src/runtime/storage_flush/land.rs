@@ -346,6 +346,13 @@ pub fn flush_gva_one<M: HostMemory + HostOps>(
         entry.width,
         entry.height,
         &rgba,
+        // The four outcomes above that did not reach guest RAM are exactly the
+        // ones where this entry is the only copy, so they mark it unevictable.
+        // See `crate::model::HostSurface::guest_holds_bytes` — this is the
+        // condition the comment above ("on the four that did not reach guest
+        // RAM it is what holds the authoritative bytes") had stated but not
+        // recorded anywhere the byte cap could read.
+        guest == "written",
     );
     crate::runtime::drain::note_store_route_us(
         "gva_cache_us",

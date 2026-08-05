@@ -20,7 +20,7 @@ fn state_capped(cap: usize) -> DeviceState {
 }
 
 fn store_frame(state: &mut DeviceState, gva: u64, fill: u8) {
-    store_gva_owned(state, gva, W, H, vec![fill; FRAME_BYTES], 0, None);
+    store_gva_owned(state, gva, W, H, vec![fill; FRAME_BYTES], 0, None, true);
 }
 
 fn deferred_entry() -> GvaDeferredEntry {
@@ -312,7 +312,7 @@ fn an_entry_bigger_than_the_cap_is_admitted_alone_not_evicted_by_its_own_store()
     let big = (w * h * 4) as usize;
     let mut state = state_capped(big / 4);
     let gva = 0x8_0000u64;
-    store_gva_owned(&mut state, gva, w, h, vec![0x77; big], 0, None);
+    store_gva_owned(&mut state, gva, w, h, vec![0x77; big], 0, None, true);
 
     let served = get_gva(&state, gva, w, h)
         .expect("an oversized entry rides alone rather than being refused");
@@ -378,6 +378,7 @@ fn the_running_byte_total_equals_the_map_after_every_transition() {
         vec![0x5A; (w2 * h2 * 4) as usize],
         0,
         None,
+        true,
     );
     assert_eq!(state.gva_cache_bytes, truth(&state), "geometry change");
 
@@ -403,3 +404,135 @@ fn the_running_byte_total_equals_the_map_after_every_transition() {
 }
 
 use std::sync::atomic::Ordering::Relaxed;
+
+/// Store a frame whose bytes the guest's own pages do **not** hold — the shape
+/// `storage_flush::land` produces on each of its four non-`written` outcomes.
+fn store_unlanded_frame(state: &mut DeviceState, gva: u64, fill: u8) {
+    store_gva_owned(state, gva, W, H, vec![fill; FRAME_BYTES], 0, None, false);
+}
+
+/// The cap must not evict an entry whose bytes never reached guest RAM.
+///
+/// `storage_flush::guards::window_pages_still_ours` refuses a guest write when
+/// the address has been re-pointed, and argues the refusal is safe because "the
+/// caller keeps the content either way … so nothing renderable is lost by
+/// refusing". That is a claim about this map. Before
+/// `HostSurface::guest_holds_bytes` the cap was free to falsify it: the window
+/// exclusion only covers an address whose flush has not run, and a refused flush
+/// leaves no window behind.
+///
+/// Drive far past the cap with unlanded frames and require that every one
+/// survives — the map goes over its bound rather than take the only copy.
+#[test]
+fn the_cap_never_evicts_bytes_the_guest_does_not_have() {
+    let mut state = state_capped(FRAME_BYTES * 8);
+    for i in 0..64u64 {
+        store_unlanded_frame(&mut state, 0x1000 + i * 0x1000, i as u8);
+    }
+    assert_eq!(
+        state.host_gva_surfaces.len(),
+        64,
+        "no unlanded entry may be evicted, even eight times over the cap"
+    );
+    assert!(
+        state.gva_cache_bytes > state.gva_cache_byte_cap,
+        "the map is deliberately over its cap rather than lossy"
+    );
+    let (evicted, wanted, _) = state.gva_eviction_witness.counts();
+    assert_eq!((evicted, wanted), (0, 0), "and nothing was taken");
+}
+
+/// A landed entry is still evictable, and is chosen ahead of unlanded ones.
+///
+/// The exclusion has to be narrow: if it swallowed the whole cap the bound would
+/// stop working for the ordinary case, where the guest's pages hold the same
+/// bytes and an eviction costs a re-read.
+#[test]
+fn the_cap_still_evicts_what_the_guest_can_re_derive() {
+    let mut state = state_capped(FRAME_BYTES * 8);
+    // Four entries the guest cannot re-derive, pinned by their own truthfulness.
+    for i in 0..4u64 {
+        store_unlanded_frame(&mut state, 0x1_0000 + i * 0x1000, i as u8);
+    }
+    // Then a stream of ordinary landed ones, well past the cap.
+    for i in 0..32u64 {
+        store_frame(&mut state, 0x2_0000 + i * 0x1000, i as u8);
+    }
+    for i in 0..4u64 {
+        assert!(
+            state
+                .host_gva_surfaces
+                .contains_key(&(0x1_0000 + i * 0x1000)),
+            "unlanded entry {i} survived the landed stream"
+        );
+    }
+    let (evicted, _, _) = state.gva_eviction_witness.counts();
+    assert!(
+        evicted > 0,
+        "landed entries are still reclaimed, or the cap has stopped working"
+    );
+    assert!(
+        state.host_gva_surfaces.len() < 36,
+        "and the map did not simply keep everything: {}",
+        state.host_gva_surfaces.len()
+    );
+}
+
+/// A later flush that *does* reach guest RAM makes the entry evictable again.
+///
+/// Without this the exclusion would be a ratchet: the compute writeback rail
+/// caches before it writes, so every one of its entries would enter the map
+/// unevictable and stay that way through any number of successful writes.
+#[test]
+fn landing_in_guest_pages_returns_an_entry_to_the_caps_reach() {
+    let mut state = state_capped(FRAME_BYTES * 4);
+    let gva = 0x9_0000u64;
+    store_unlanded_frame(&mut state, gva, 0xAA);
+    note_gva_landed(&mut state, gva);
+    for i in 0..32u64 {
+        store_frame(&mut state, 0xB_0000 + i * 0x1000, i as u8);
+    }
+    assert!(
+        !state.host_gva_surfaces.contains_key(&gva),
+        "once the guest holds the bytes the entry is an ordinary candidate"
+    );
+}
+
+/// When the exclusions leave nothing to take, the cap says so.
+///
+/// A GPU with no free memory refuses; it does not discard a surface the client
+/// still holds. The refusal has to be visible or an over-cap map is
+/// indistinguishable from a cap that is holding.
+#[test]
+fn a_cap_with_nothing_evictable_reports_instead_of_going_quiet() {
+    let cap_bytes = FRAME_BYTES * 8;
+    let capture = crate::observe::FailCapture::start();
+    let mut state = state_capped(cap_bytes);
+    // 200 stores, of which ~192 land the map over its cap and none is evictable.
+    for i in 0..200u64 {
+        store_unlanded_frame(&mut state, 0x1000 + i * 0x1000, i as u8);
+    }
+    assert_eq!(state.host_gva_surfaces.len(), 200, "still nothing evicted");
+
+    let lines: Vec<String> = capture
+        .lines()
+        .into_iter()
+        .filter(|l| l.starts_with("gva_cache_cap "))
+        .collect();
+    assert!(
+        lines
+            .first()
+            .is_some_and(|l| l.contains("reason=gva_cache_cap_nothing_evictable")
+                && l.contains(&format!("cap={cap_bytes}"))),
+        "the refusal names itself and the bound it is over: {lines:?}"
+    );
+    // The latch is on the overshoot's binary magnitude, so the line count is
+    // the number of doublings — logarithmic in the overshoot, not one per
+    // store. Anything close to 192 here means the dedupe has stopped working
+    // and this decline has become a flood on the always-on channel.
+    assert!(
+        lines.len() <= 16,
+        "one line per doubling, not one per over-cap store: {} lines",
+        lines.len()
+    );
+}

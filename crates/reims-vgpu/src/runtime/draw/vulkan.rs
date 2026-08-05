@@ -596,6 +596,10 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                         c0.width,
                         c0.height,
                         &rgba,
+                        // Inside `if gva_ok`: this arm only runs when
+                        // `write_gva_rgba8_within` landed the same bytes in the
+                        // guest's pages, so they are re-derivable from there.
+                        true,
                     );
                 }
                 let (rgb_nz, max_rgb) = rgb_stats(&rgba);
@@ -3669,6 +3673,7 @@ pub(crate) fn host_cache_store_gva_layer<M: HostMemory + HostOps>(
     width: u32,
     height: u32,
     rgba: &[u8],
+    guest_holds_bytes: bool,
 ) {
     if width == 0 || height == 0 {
         return;
@@ -3701,6 +3706,7 @@ pub(crate) fn host_cache_store_gva_layer<M: HostMemory + HostOps>(
             bgra,
             object_type,
             backing,
+            guest_holds_bytes,
         );
     }
 }
@@ -7148,6 +7154,7 @@ mod vulkan_split_tests {
             vec![0x7f; (w * h * 4) as usize],
             0,
             None,
+            true,
         );
 
         let entries = store_route_count("lin_rung_host_entry");
@@ -7427,6 +7434,7 @@ mod vulkan_split_tests {
             vec![0x7f; (w * h * 4) as usize],
             0,
             None,
+            true,
         );
         // A span the device cached blank, read back blank: the two rails agree.
         let blank_gva = 0x60_0000u64;
@@ -7438,6 +7446,7 @@ mod vulkan_split_tests {
             vec![0u8; (w * h * 4) as usize],
             0,
             None,
+            true,
         );
 
         let agrees = store_route_count("lin_rung_blank_host_agrees");

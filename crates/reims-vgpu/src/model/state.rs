@@ -1236,6 +1236,35 @@ pub struct HostSurface {
     /// serve site say whether that happened, which is the reading the door has
     /// never had — `load_seed_ok_color` counts both doors as one.
     pub source_gva: u64,
+    /// Whether the guest's own pages already hold these pixels.
+    ///
+    /// This is the field that decides whether the byte cap may evict the entry,
+    /// and it exists because two rules in this device were relying on each other
+    /// without either saying so.
+    ///
+    /// `storage_flush::land` stores into this cache on **all five** of its
+    /// outcomes, and its own comment says why: "on the four that did not reach
+    /// guest RAM it is what holds the authoritative bytes". `storage_flush`'s
+    /// `window_pages_still_ours` then argues that *refusing* a guest write is
+    /// safe — permitting one would land pixels in whatever now owns those pages,
+    /// which has been observed as guest heap corruption — and closes with "the
+    /// caller keeps the content either way … so nothing renderable is lost by
+    /// refusing".
+    ///
+    /// That closing clause is a claim about this map, and
+    /// `surface_cache::enforce_gva_cache_cap` was free to falsify it. The cap
+    /// excludes an address with a live `gva_deferred_flush` window, but once the
+    /// flush has run and refused, the window is gone and the entry becomes an
+    /// ordinary eviction candidate — while still being the only copy of pixels
+    /// the guest never received.
+    ///
+    /// So `false` marks an entry the cap must not take: evicting it is the loss
+    /// the refusal was allowed on the promise that it would not happen. `true`
+    /// means the guest's pages have the same bytes, a later read can re-derive
+    /// them from guest RAM, and eviction costs a re-read and nothing else.
+    ///
+    /// `true` for the surface_id and texture_ref caches, which have no cap.
+    pub guest_holds_bytes: bool,
     // No guest-CPU-write witness sits here, and that is a known gap rather
     // than an omission. `surface_cache::gva_backing_state` answers whether this
     // GVA still *names* these pages; nothing answers whether the guest CPU

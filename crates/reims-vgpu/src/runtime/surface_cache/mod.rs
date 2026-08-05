@@ -48,6 +48,11 @@ fn store_into(
     entry.width = width;
     entry.height = height;
     entry.bgra = bgra;
+    // These two maps carry no byte cap, so nothing here ever consults the flag.
+    // Set anyway rather than left at `Default`: `false` is the value that makes
+    // the GVA cap refuse to evict, and an entry that inherits it from a derive
+    // would be claiming something no store here has checked.
+    entry.guest_holds_bytes = true;
 }
 
 fn get_from(
@@ -665,7 +670,27 @@ pub fn mirror_linear_color_cache<M: HostMemory + crate::runtime::host::HostOps>(
     }
     store_texture(state, w.texture_ref, w.width, w.height, bgra.clone(), w.gva);
     let backing = gva_backing(state, host, w.task_id, w.gva, w.width, w.height);
-    store_gva_owned(state, w.gva, w.width, w.height, bgra, 0, backing);
+    // `false`: this runs *before* the caller's guest write, so at this instant
+    // the guest's pages do not hold these bytes. The caller calls
+    // [`note_gva_landed`] once its write reports `Written`.
+    store_gva_owned(state, w.gva, w.width, w.height, bgra, 0, backing, false);
+}
+
+/// Record that the guest's own pages now hold the bytes cached at `gva`, so the
+/// byte cap may evict the entry.
+///
+/// The counterpart to storing with `guest_holds_bytes = false`. A writeback path
+/// that caches before it writes cannot know the outcome at store time, and
+/// leaving the entry permanently unevictable would turn every successful
+/// writeback into a permanent cap reservation. Call this on the success arm
+/// only — see [`crate::model::HostSurface::guest_holds_bytes`].
+///
+/// Quiet on a `gva` with no entry: a store that was refused upstream (zero
+/// geometry, short buffer) leaves nothing to mark, and that is not a failure.
+pub fn note_gva_landed(state: &mut DeviceState, gva: u64) {
+    if let Some(entry) = state.host_gva_surfaces.get_mut(&gva) {
+        entry.guest_holds_bytes = true;
+    }
 }
 
 /// The guest page currently backing `gva` under `task_id`, page-aligned.
@@ -730,6 +755,7 @@ pub fn store_gva_owned(
     bgra: Vec<u8>,
     object_type: u8,
     backing: Option<GvaBacking>,
+    guest_holds_bytes: bool,
 ) {
     if gva == 0 || !scanout_extent_ok(width, height) {
         return;
@@ -775,6 +801,10 @@ pub fn store_gva_owned(
     // is how that zero was read, but because no set this rail ever created
     // outlived its own arming window.
     entry.backing = backing;
+    // Per store, not sticky: a later flush that *does* reach guest RAM makes
+    // the same address evictable again, and a `true` left over from an earlier
+    // store would let the cap take pixels this one never landed.
+    entry.guest_holds_bytes = guest_holds_bytes;
     charge_gva_cache_bytes(state, reclaimed, charged);
     enforce_gva_cache_cap(state, gva);
 }
@@ -789,6 +819,71 @@ fn charge_gva_cache_bytes(state: &mut DeviceState, reclaimed: usize, charged: us
         .gva_cache_bytes
         .saturating_sub(reclaimed)
         .saturating_add(charged);
+}
+
+/// The GVA encode cache is over its byte cap and every entry is excluded from
+/// eviction.
+///
+/// Not a loss — the opposite. It is the cap declining to take the only copy of
+/// pixels the guest never received, which is what a GPU with no free memory
+/// does: refuse, rather than discard a surface the client still holds. It is on
+/// the fail channel because an over-cap map is a condition a reader has to be
+/// able to see; a silent one would be indistinguishable from a cap that is
+/// holding.
+///
+/// `bytes` above `cap` with a small `entries` means one or a few oversized
+/// surfaces (`MAX_SCANOUT_DIM` admits 256 MiB each, so a single entry can exceed
+/// the whole cap); with a large `entries` it means a workload whose unlanded
+/// working set genuinely exceeds the bound, which is the reading that would
+/// justify raising it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GvaCapDecline {
+    NothingEvictable {
+        bytes: usize,
+        cap: usize,
+        entries: usize,
+    },
+}
+
+impl crate::observe::Decline for GvaCapDecline {
+    fn slug(&self) -> &'static str {
+        match self {
+            Self::NothingEvictable { .. } => "gva_cache_cap_nothing_evictable",
+        }
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        match self {
+            Self::NothingEvictable {
+                bytes,
+                cap,
+                entries,
+            } => vec![
+                ("bytes", bytes.to_string()),
+                ("cap", cap.to_string()),
+                ("entries", entries.to_string()),
+            ],
+        }
+    }
+}
+
+impl GvaCapDecline {
+    /// Latched on the **binary magnitude** of the overshoot, not on the byte
+    /// total.
+    ///
+    /// The total moves on every store, so latching on it makes a map that is
+    /// steadily growing over its cap emit one line per store — the flood this
+    /// device's `fail_once` exists to prevent. The magnitude moves only when the
+    /// overshoot doubles, so the log gets a line at 1x over, 2x, 4x, and so on:
+    /// bounded to a few dozen lines for the life of the process, while still
+    /// showing a condition that is getting worse rather than one that has
+    /// settled.
+    fn emit(self) {
+        let Self::NothingEvictable { bytes, cap, .. } = self;
+        let over = bytes.saturating_sub(cap).max(1) as u64;
+        crate::observe::Emit::decline("gva_cache_cap", &self)
+            .fail_once(u64::from(over.next_power_of_two().trailing_zeros()));
+    }
 }
 
 /// Hold [`DeviceState::host_gva_surfaces`] at or under
@@ -809,6 +904,19 @@ fn charge_gva_cache_bytes(state: &mut DeviceState, reclaimed: usize, charged: us
 ///   dropping it would turn a memory bound into lost guest pixels, which is the
 ///   Goal 3 loss class. That is a correctness exclusion, not a heuristic — the
 ///   obligation is recorded, not guessed.
+/// - **It never evicts an entry the guest's pages do not also hold.** See
+///   [`crate::model::HostSurface::guest_holds_bytes`]. The window exclusion above
+///   only covers an address whose flush has not run yet; once the flush runs and
+///   *refuses* — which `storage_flush::guards` permits precisely because this
+///   cache keeps the content — the window is gone and the entry would otherwise
+///   become an ordinary candidate while still being the only copy. Same
+///   exclusion, one step later in the same lifetime.
+///
+/// When those exclusions leave nothing to take, the map stays over its cap and
+/// says so rather than evicting into them. That is the intended shape: a GPU
+/// whose memory is full refuses, it does not discard a surface the client still
+/// holds. The refusal is fail-visible so the over-cap condition is a reading
+/// rather than a silence.
 ///
 /// `protect` is the address the store that triggered this just wrote, and it is
 /// never evicted. Without it a single entry bigger than the low-water mark is
@@ -834,10 +942,21 @@ fn enforce_gva_cache_cap(state: &mut DeviceState, protect: u64) {
     let mut by_touch: Vec<(u64, u64)> = state
         .host_gva_surfaces
         .iter()
-        .filter(|(gva, _)| **gva != protect && !state.gva_deferred_flush.contains_key(gva))
+        .filter(|(gva, e)| {
+            **gva != protect && !state.gva_deferred_flush.contains_key(gva) && e.guest_holds_bytes
+        })
         .map(|(&gva, e)| (e.last_touch, gva))
         .collect();
     by_touch.sort_unstable();
+    if by_touch.is_empty() {
+        GvaCapDecline::NothingEvictable {
+            bytes: state.gva_cache_bytes,
+            cap,
+            entries: state.host_gva_surfaces.len(),
+        }
+        .emit();
+        return;
+    }
     for (_, gva) in by_touch {
         // `evict_gva` maintains the running total, so this reads the live
         // figure each round rather than tracking a second copy of it.

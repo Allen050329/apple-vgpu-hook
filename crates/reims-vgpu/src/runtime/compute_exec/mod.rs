@@ -2568,7 +2568,16 @@ fn writeback_texture<M: HostMemory + HostOps>(
                 &format!("bind={}", tex.binding),
                 (!pages.is_empty()).then_some(pages),
             ) {
-                LinearWrite::Written => Ok(()),
+                LinearWrite::Written => {
+                    // The mirror above cached these bytes as unevictable
+                    // because the write had not happened yet. It has, so the
+                    // guest can re-derive them and the byte cap may reclaim the
+                    // entry. The `Unmapped` arm below deliberately does not:
+                    // its own comment is that the host cache keeps the
+                    // authoritative bytes.
+                    crate::runtime::surface_cache::note_gva_landed(state, *gva);
+                    Ok(())
+                }
                 // Nothing resolves under this task, so there is nowhere to put
                 // the result. The host cache keeps the authoritative bytes and
                 // sampling still serves them, so failing the whole dispatch

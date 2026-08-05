@@ -1754,7 +1754,11 @@ pub fn parse_vertex_block(
             // which draws every vertex from element zero. Say so; a zero stride
             // is a valid pipeline and nothing further down can tell it from one
             // the guest asked for.
-            note_vertex_truncated("layout_buffer_index", buffer_index as usize, MAX_VERTEX_LAYOUTS);
+            note_vertex_truncated(
+                "layout_buffer_index",
+                buffer_index as usize,
+                MAX_VERTEX_LAYOUTS,
+            );
         } else if stride != 0 {
             strides[buffer_index as usize] = stride;
             have_stride[buffer_index as usize] = true;

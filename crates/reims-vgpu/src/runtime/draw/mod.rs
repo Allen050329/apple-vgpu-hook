@@ -4483,7 +4483,9 @@ mod load_action_contract_tests {
         let line = log
             .lines()
             .rev()
-            .find(|l| l.contains("reason=load_action_dont_care_cleared") && l.contains("pipe=53442"))
+            .find(|l| {
+                l.contains("reason=load_action_dont_care_cleared") && l.contains("pipe=53442")
+            })
             .expect("the substitution must name itself");
         assert!(
             line.starts_with("OFF pass_load_action "),

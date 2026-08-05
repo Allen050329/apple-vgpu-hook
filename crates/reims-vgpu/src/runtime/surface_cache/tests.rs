@@ -26,7 +26,7 @@ fn the_backing_probe_separates_a_reassigned_address_from_an_unmapped_one() {
     // own PTE currently names (PT_BASE + i, i.e. 5, 6, 7).
     for i in 1..=3u32 {
         let gva = (i as u64) << PAGE_SHIFT_ARM64E;
-        store_gva_owned(&mut st, gva, 2, 2, vec![0u8; 2 * 2 * 4], 0, None);
+        store_gva_owned(&mut st, gva, 2, 2, vec![0u8; 2 * 2 * 4], 0, None, true);
         st.host_gva_surfaces.get_mut(&gva).unwrap().backing = Some(GvaBacking {
             task_id: 1,
             first_gpa: ((4 + i) as u64) << PAGE_SHIFT_ARM64E,
@@ -106,7 +106,7 @@ fn a_gva_reused_after_eviction_never_repeats_a_generation() {
     let (gva, w, h) = (0xa4_c000u64, 2u32, 2u32);
 
     let px = vec![0x11; (w * h * 4) as usize];
-    store_gva_owned(&mut st, gva, w, h, px, 0, None);
+    store_gva_owned(&mut st, gva, w, h, px, 0, None, true);
     let (_, first) = get_gva_with_gen(&st, gva, w, h).expect("first store");
 
     evict_gva(&mut st, gva);
@@ -116,7 +116,7 @@ fn a_gva_reused_after_eviction_never_repeats_a_generation() {
     );
 
     let px = vec![0x22; (w * h * 4) as usize];
-    store_gva_owned(&mut st, gva, w, h, px, 0, None);
+    store_gva_owned(&mut st, gva, w, h, px, 0, None, true);
     let (bytes, second) = get_gva_with_gen(&st, gva, w, h).expect("second store");
 
     assert_eq!(bytes[0], 0x22, "the cache holds the new content");
@@ -149,7 +149,7 @@ fn every_host_cache_producer_draws_from_one_generation_source() {
             .expect("ref store")
             .1,
     );
-    store_gva_owned(&mut st, 0x5000, 4, 4, px, 0, None);
+    store_gva_owned(&mut st, 0x5000, 4, 4, px, 0, None, true);
     seen.insert(get_gva_with_gen(&st, 0x5000, 4, 4).expect("gva store").1);
     assert!(
         cede_surface_to_resident(&mut st, 7, 4, 4),
@@ -485,7 +485,7 @@ fn gva_cache_roundtrip() {
     let gva = 0x2c48000u64;
     let mut px = vec![0u8; 16];
     px[0] = 0xaa;
-    store_gva_owned(&mut st, gva, 2, 2, px, 0, None);
+    store_gva_owned(&mut st, gva, 2, 2, px, 0, None, true);
     assert_eq!(get_gva(&st, gva, 2, 2).unwrap()[0], 0xaa);
     let (got, generation) = get_gva_with_gen(&st, gva, 2, 2).unwrap();
     assert_eq!(got[0], 0xaa);
@@ -494,14 +494,14 @@ fn gva_cache_roundtrip() {
 
     let mut replacement = vec![0u8; 16];
     replacement[0] = 0xbb;
-    store_gva_owned(&mut st, gva, 2, 2, replacement, 0, None);
+    store_gva_owned(&mut st, gva, 2, 2, replacement, 0, None, true);
     let (got, generation) = get_gva_with_gen(&st, gva, 2, 2).unwrap();
     assert_eq!(got[0], 0xbb);
     assert_eq!(generation, 2);
 
     let mut owned = vec![0u8; 16];
     owned[0] = 0xcc;
-    store_gva_owned(&mut st, gva, 2, 2, owned, 2, None);
+    store_gva_owned(&mut st, gva, 2, 2, owned, 2, None, true);
     let (got, generation) = get_gva_with_gen(&st, gva, 2, 2).unwrap();
     assert_eq!(got[0], 0xcc);
     assert_eq!(generation, 3);
@@ -533,7 +533,7 @@ fn gva_encode_is_keyed_by_address_at_any_size() {
         chunk[2] = 81;
         chunk[3] = 255;
     }
-    store_gva_owned(&mut st, gva, w, h, px, 0, None);
+    store_gva_owned(&mut st, gva, w, h, px, 0, None, true);
     let got = get_gva(&st, gva, w, h).expect("retained on the VA key");
     assert_eq!(got[0], 185);
     assert_eq!(got[2], 81);
@@ -825,6 +825,7 @@ fn a_backing_the_probe_cannot_read_is_not_a_fresh_one() {
         vec![0xAB; (w * h * 4) as usize],
         0,
         Some(backing),
+        true,
     );
     assert_eq!(
         gva_backing_state(&st, &host, gva),
@@ -836,7 +837,7 @@ fn a_backing_the_probe_cannot_read_is_not_a_fresh_one() {
     // there is nothing to compare and the entry drops out of the census
     // denominator rather than counting as fresh.
     let px = vec![0xCD; (w * h * 4) as usize];
-    store_gva_owned(&mut st, gva, w, h, px, 0, None);
+    store_gva_owned(&mut st, gva, w, h, px, 0, None, true);
     assert_eq!(
         gva_backing_state(&st, &host, gva),
         GvaBackingState::Unrecorded
