@@ -4998,6 +4998,29 @@ pub fn try_display_online<H: HostMemory + HostOps>(state: &mut DeviceState, host
         return;
     }
     if state.display.online_tries >= DISPLAY_ONLINE_MAX_TRIES {
+        // Reaching the cap means this device has stopped asserting ONLINE and
+        // will not assert it again for the life of the boot. If the guest has
+        // not acked by now it never will, and the desktop the user is waiting
+        // for is not coming — with, until this line, nothing in the log to say
+        // so. A give-up is the loudest thing a device can do quietly.
+        //
+        // Latched on the display index rather than counted: the cap is crossed
+        // on every subsequent poll for the rest of the boot, so a per-crossing
+        // line would be a ~5 Hz flood of the same fact. `online_tries` is on the
+        // `display_online_signal` line at the other end of the same rail, so the
+        // pair brackets the whole handshake.
+        if crate::observe::first_sight(
+            "display_online_abandoned",
+            u64::from(state.display.display_index),
+        ) {
+            crate::observe::fail(format!(
+                "display_online_abandoned index={} tries={DISPLAY_ONLINE_MAX_TRIES} \
+                 divisor={DISPLAY_ONLINE_POLL_DIVISOR} \
+                 (the guest never enabled the display; ONLINE will not be \
+                 asserted again this boot)",
+                state.display.display_index
+            ));
+        }
         return;
     }
     // Cadence: skip most ticks (archive divisor); still run often enough via
@@ -5013,9 +5036,27 @@ pub fn try_display_online<H: HostMemory + HostOps>(state: &mut DeviceState, host
         .read_gpa(gpa + DISPLAY_SHARED_ENABLE_MASK, &mut mask_le)
         .is_err()
     {
+        // The guest published this page's address itself, so a read of it that
+        // the host cannot perform is not expected control flow — it is the
+        // handshake's only input becoming unreadable. Silently returning here
+        // spends one of the finite tries and then, at the cap, looks exactly
+        // like a guest that chose not to enable the display.
+        //
+        // Latched on the address, because whatever makes a GPA unreadable makes
+        // it unreadable on every poll.
+        if crate::observe::first_sight("display_online_mask_unreadable", gpa) {
+            crate::observe::fail(format!(
+                "display_online_mask_unreadable gpa={:#x} \
+                 (the shared enable mask the guest published cannot be read; \
+                 the ONLINE handshake is spending its tries against nothing)",
+                gpa + DISPLAY_SHARED_ENABLE_MASK
+            ));
+        }
         return;
     }
     let mask = ld32(&mask_le);
+    // Not a failure: the guest has published the page but not yet called
+    // `enable()`. This is the state the poll exists to wait out.
     if mask & DISPLAY_ONLINE_EVENT_MASK == 0 {
         return;
     }

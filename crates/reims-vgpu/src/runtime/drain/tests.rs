@@ -1895,6 +1895,77 @@ fn display_lifecycle_events_are_always_logged() {
     );
 }
 
+/// Both ways the ONLINE handshake can end without a display say so.
+///
+/// The rail has one success line (`display_online_signal`, on the first pulse)
+/// and two silent exits, and the silent ones are the states a user actually
+/// notices: a desktop that never appears. Neither is expected control flow —
+/// the guest published the shared page in both cases — so both are on the fail
+/// channel, and both are latched because each recurs on every poll for the rest
+/// of the boot.
+///
+/// The third exit, `mask & ONLINE == 0`, is deliberately absent from this test
+/// and from the log: that is the guest having published the page and not yet
+/// called `enable()`, which is exactly the state the poll exists to wait out.
+#[test]
+fn the_two_ways_online_gives_up_are_both_fail_visible() {
+    let index = 3u32;
+
+    // Exhaustion: the guest published the page and never enabled the display.
+    {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut host = FakeHost::new();
+        let gpa = 0x7c000000u64;
+        host.map_range(gpa, PAGE_SIZE_ARM64E as usize, 0);
+        state.display.shared_gpa = gpa;
+        state.display.display_index = index;
+        state.display.online_tries = DISPLAY_ONLINE_MAX_TRIES;
+        try_display_online(&mut state, &mut host);
+        assert!(
+            host.actions.is_empty(),
+            "past the cap nothing is asserted; only the reason is new"
+        );
+    }
+
+    // The enable mask itself unreadable: every try is spent against nothing,
+    // and at the cap that is indistinguishable from the case above.
+    //
+    // The address is chosen so the 4-byte read walks off the end of the address
+    // space and `read_gpa` answers `MemError::Overflow`. `FakeHost` returns
+    // zeroes for an address that is merely unmapped, which is a *readable* mask
+    // with no bits set — the third exit, not this one — so an unmapped GPA
+    // would test the wrong thing.
+    let unreadable = u64::MAX - DISPLAY_SHARED_ENABLE_MASK - 1;
+    {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut host = FakeHost::new();
+        state.display.shared_gpa = unreadable;
+        state.display.display_index = index;
+        state.display.poll_ctr = DISPLAY_ONLINE_POLL_DIVISOR - 1;
+        try_display_online(&mut state, &mut host);
+        assert!(host.actions.is_empty());
+        assert_eq!(
+            state.display.online_tries, 0,
+            "an unreadable mask is not an assert"
+        );
+    }
+
+    let log = std::fs::read_to_string(crate::observe::fail_log_path()).expect("fail log");
+    assert!(
+        log.contains(&format!(
+            "display_online_abandoned index={index} tries={DISPLAY_ONLINE_MAX_TRIES}"
+        )),
+        "giving up on ONLINE for the rest of the boot must name itself"
+    );
+    assert!(
+        log.contains(&format!(
+            "display_online_mask_unreadable gpa={:#x}",
+            unreadable + DISPLAY_SHARED_ENABLE_MASK
+        )),
+        "an unreadable enable mask must not look like a guest that declined"
+    );
+}
+
 /// The VBL census reports the delivered rate, and separates the two ways it can
 /// deliver nothing.
 ///
