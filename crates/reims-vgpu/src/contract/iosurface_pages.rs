@@ -59,6 +59,33 @@ pub const DEVICE_PLANE_DIMS: usize = 0x14;
 pub const DEVICE_PLANE_BPR: usize = 0x1c;
 pub const DEVICE_PLANE_BPE: usize = 0x20;
 
+/// Bit position of the width in a `dims` word.
+const DIMS_WIDTH_SHIFT: u32 = 8;
+/// Bit position of the height in a `dims` word.
+const DIMS_HEIGHT_SHIFT: u32 = 40;
+/// Both extents are 24 bits, so neither reaches its neighbouring byte.
+const DIMS_EXTENT_MASK: u64 = 0x00ff_ffff;
+
+/// The width and height packed into a device-surface or device-plane `dims`
+/// word.
+///
+/// One 64-bit word carrying four fields, one byte and three bytes twice over:
+/// element width at byte 0, width at bytes 1–3, element height at byte 4,
+/// height at bytes 5–7. This device reads only the two extents; the element
+/// sizes are the guest's own subsampling description and nothing here applies
+/// them.
+///
+/// Both record decoders below extract the pair, and until this existed each
+/// spelled the shifts itself — along with a test fixture that packs them and an
+/// inline literal in another test that packs them again. Four spellings of one
+/// layout, in a file whose whole subject is layouts.
+pub fn dims_extent(dims: u64) -> (u32, u32) {
+    (
+        ((dims >> DIMS_WIDTH_SHIFT) & DIMS_EXTENT_MASK) as u32,
+        ((dims >> DIMS_HEIGHT_SHIFT) & DIMS_EXTENT_MASK) as u32,
+    )
+}
+
 pub const DEVICE_DESC_LEN: usize = 0x200;
 pub const DEVICE_DESC_PIXEL_FORMAT: usize = 0x04;
 pub const DEVICE_DESC_BASE_OFFSET: usize = 0x08;
@@ -310,13 +337,13 @@ pub fn decode_device_surface(bytes: &[u8]) -> Option<DeviceSurfaceRecord> {
     if bytes.len() < DEVICE_DESC_LEN {
         return None;
     }
-    let dims = ld64(&bytes[DEVICE_DESC_DIMS..]);
+    let (width, height) = dims_extent(ld64(&bytes[DEVICE_DESC_DIMS..]));
     Some(DeviceSurfaceRecord {
         pixel_format: ld32(&bytes[DEVICE_DESC_PIXEL_FORMAT..]),
         base_offset: ld32(&bytes[DEVICE_DESC_BASE_OFFSET..]),
         alloc_size: ld32(&bytes[DEVICE_DESC_ALLOC_SIZE..]),
-        width: ((dims >> 8) & 0xffffff) as u32,
-        height: ((dims >> 40) & 0xffffff) as u32,
+        width,
+        height,
         bytes_per_row: ld32(&bytes[DEVICE_DESC_BPR..]),
         bytes_per_element: ld16(&bytes[DEVICE_DESC_BPE..]),
         plane_count: bytes[DEVICE_DESC_PLANE_COUNT],
@@ -327,13 +354,13 @@ pub fn decode_device_plane(bytes: &[u8]) -> Option<DevicePlaneRecord> {
     if bytes.len() < DEVICE_PLANE_DESC_LEN {
         return None;
     }
-    let dims = ld64(&bytes[DEVICE_PLANE_DIMS..]);
+    let (width, height) = dims_extent(ld64(&bytes[DEVICE_PLANE_DIMS..]));
     Some(DevicePlaneRecord {
         plane_offset: ld32(&bytes[DEVICE_PLANE_OFFSET..]),
         plane_base: ld32(&bytes[DEVICE_PLANE_BASE..]),
         plane_size: ld32(&bytes[DEVICE_PLANE_SIZE..]),
-        width: ((dims >> 8) & 0xffffff) as u32,
-        height: ((dims >> 40) & 0xffffff) as u32,
+        width,
+        height,
         bytes_per_row: ld32(&bytes[DEVICE_PLANE_BPR..]),
         bytes_per_element: ld16(&bytes[DEVICE_PLANE_BPE..]),
     })
@@ -1129,9 +1156,34 @@ mod tests {
         );
     }
 
-    /// Pack device-plane dims word: elemW@0, width u24@1, elemH@4, height u24@5.
+    /// The inverse of [`dims_extent`], for building a record to decode.
+    ///
+    /// Written from the same three constants, so the round trip is over one
+    /// declaration of the layout rather than two that could agree while both
+    /// being wrong. What pins the layout to the wire is
+    /// [`the_dims_word_puts_width_at_bit_eight_and_height_at_bit_forty`], which
+    /// uses a literal.
     fn pack_plane_dims(width: u32, height: u32) -> u64 {
-        ((width as u64 & 0xffffff) << 8) | ((height as u64 & 0xffffff) << 40)
+        ((width as u64 & DIMS_EXTENT_MASK) << DIMS_WIDTH_SHIFT)
+            | ((height as u64 & DIMS_EXTENT_MASK) << DIMS_HEIGHT_SHIFT)
+    }
+
+    /// The `dims` layout, against a word written out by hand.
+    ///
+    /// A round trip through [`pack_plane_dims`] cannot see a shift that moved,
+    /// because it moves with it; this literal cannot. 1280 is `0x500` at byte 1
+    /// and 720 is `0x2d0` at byte 5, which is the whole claim — and the guard
+    /// bytes are the other half of it, since the element sizes share the word
+    /// and a mask one bit too wide would read one of them into an extent.
+    #[test]
+    fn the_dims_word_puts_width_at_bit_eight_and_height_at_bit_forty() {
+        assert_eq!(dims_extent(0x0002_d000_0005_0000), (1280, 720));
+        assert_eq!(pack_plane_dims(1280, 720), 0x0002_d000_0005_0000);
+        // Element width at byte 0 and element height at byte 4, both set to
+        // every bit they have; neither may reach an extent.
+        assert_eq!(dims_extent(0x0002_d0ff_0005_00ff), (1280, 720));
+        // An extent that fills its 24 bits does not spill into the byte above.
+        assert_eq!(dims_extent(0xffff_ff00_ffff_ff00), (0xff_ffff, 0xff_ffff));
     }
 
     /// The page-sizing estimate must not reach past the wire `alloc_size`
@@ -1149,7 +1201,7 @@ mod tests {
             &mut desc[DEVICE_DESC_PIXEL_FORMAT..],
             MTL_FORMAT_BGRA8_UNORM as u32,
         );
-        let dims = ((1024u64) << 8) | ((1024u64) << 40);
+        let dims = pack_plane_dims(1024, 1024);
         st64(&mut desc[DEVICE_DESC_DIMS..], dims);
         // bpr too small for 1024 BGRA → the device-surface path rejects, so the
         // estimate is what answers and the allocation is what bounds it.
