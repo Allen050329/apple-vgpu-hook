@@ -212,7 +212,7 @@ impl IcbRenderBindStage {
     /// Each stage is a separate Metal argument table with its own maximum, taken
     /// at ICB create from the four sibling fields the type-7 body carries and
     /// pushed straight into the `MTLIndirectCommandBufferDescriptor` (see
-    /// [`materialize_icb`]). They are decoded per stage, so they are compared per
+    /// [`materialize_metal_icb`]). They are decoded per stage, so they are compared per
     /// stage: a guest that overruns the vertex table and one that overruns the
     /// mesh table have made different mistakes.
     fn declared_bind_count(self, desc: &IndirectCommandBufferDescriptor) -> u16 {

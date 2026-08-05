@@ -676,7 +676,7 @@ pub struct MappingEntry {
     pub surface_content_epoch: u32,
     /// Who has read what the last landed render flush of this mapping wrote.
     /// See [`RenderFlushWitness`]; reported by
-    /// [`crate::runtime::storage_flush::witness::note_render_flush_landed`].
+    /// [`crate::runtime::storage_flush::report::note_render_flush_landed`].
     pub render_flush: RenderFlushWitness,
     /// Bumped whenever the guest page list / map lifetime changes (MAP, UNMAP,
     /// ReplacePhysical, MappingInternal reattach, page-table refresh that

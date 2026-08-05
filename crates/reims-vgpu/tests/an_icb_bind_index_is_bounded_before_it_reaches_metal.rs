@@ -1,7 +1,7 @@
 //! An ICB command fill bounds every bind index against the create descriptor.
 //!
 //! `MTLIndirectCommandBufferDescriptor` takes one maximum bind count per stage,
-//! and `runtime::icb::materialize_icb` hands Metal all five the type-7 create
+//! and `runtime::icb::materialize_metal_icb` hands Metal all five the type-7 create
 //! body carries — vertex, fragment, object, mesh, kernel. A later fill that sets
 //! a buffer at an index past the maximum its stage declared is out of range for
 //! the setter, and Metal answers an out-of-range index with an exception that

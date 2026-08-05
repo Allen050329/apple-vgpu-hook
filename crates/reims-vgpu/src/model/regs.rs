@@ -9,7 +9,7 @@
 /// `include/reims_vgpu_qemu_abi.h` mirrors it and both shims size their region
 /// from the header — the sysbus gfx window on one, BAR0 on the other — so the
 /// window the guest can address and the bound Rust indexes cannot part without
-/// [`the_abi_header_agrees_on_the_gfx_window_size`] failing.
+/// `the_abi_header_agrees_on_the_gfx_window_size` failing.
 ///
 /// The iosfc window's size is not mirrored here. QEMU declares that region
 /// (`REIMS_VGPU_MMIO_IOSFC_MMIO_SIZE` in `reims-vgpu-mmio.c`) and Rust only
@@ -78,7 +78,7 @@ pub const IOSFC_REG_CONSUMER: u64 = 0x1020;
 /// header rather than from a private copy — because a shim painting at one
 /// geometry into a console this file refuses at another is a failure with the
 /// two numbers in different files.
-/// [`the_abi_header_agrees_on_the_efi_boot_mode`] fails if they part.
+/// `the_abi_header_agrees_on_the_efi_boot_mode` fails if they part.
 pub const EFI_BOOT_WIDTH: u32 = 1920;
 /// Height of the advertised EFI mode. See [`EFI_BOOT_WIDTH`].
 pub const EFI_BOOT_HEIGHT: u32 = 1080;
@@ -148,7 +148,7 @@ pub const fn is_mapping_id(mapping_id: u32) -> bool {
 ///
 /// This constant is the owner. `REIMS_VGPU_MAX_SCANOUT_DIM` in
 /// `include/reims_vgpu_qemu_abi.h` mirrors it for the two QEMU shims, and
-/// [`the_abi_header_agrees_on_the_scanout_bound`] fails if they drift.
+/// `the_abi_header_agrees_on_the_scanout_bound` fails if they drift.
 pub const MAX_SCANOUT_DIM: u32 = 8192;
 
 /// Which half of the scanout extent bound a `width`x`height` pair breaks.
