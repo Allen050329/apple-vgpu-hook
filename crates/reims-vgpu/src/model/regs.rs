@@ -5,12 +5,18 @@
 
 /// Gfx MMIO window size (16 KiB); bounds the sparse register store.
 ///
-/// The iosfc window's size is not mirrored here. QEMU declares both regions
-/// (`REIMS_VGPU_MMIO_{GFX,IOSFC}_MMIO_SIZE` in `reims-vgpu-mmio.c`) and Rust
-/// only needs a bound for state it keeps per offset, which the iosfc rail does
-/// not do — it decodes five named registers and ignores the rest. A second
-/// unread copy of the iosfc size would be a source of truth nothing checks
-/// against the one that actually sizes the `MemoryRegion`.
+/// This constant is the owner. `REIMS_VGPU_GFX_MMIO_SIZE` in
+/// `include/reims_vgpu_qemu_abi.h` mirrors it and both shims size their region
+/// from the header — the sysbus gfx window on one, BAR0 on the other — so the
+/// window the guest can address and the bound Rust indexes cannot part without
+/// [`the_abi_header_agrees_on_the_gfx_window_size`] failing.
+///
+/// The iosfc window's size is not mirrored here. QEMU declares that region
+/// (`REIMS_VGPU_MMIO_IOSFC_MMIO_SIZE` in `reims-vgpu-mmio.c`) and Rust only
+/// needs a bound for state it keeps per offset, which the iosfc rail does not do
+/// — it decodes five named registers and ignores the rest. A second unread copy
+/// of the iosfc size would be a source of truth nothing checks against the one
+/// that actually sizes the `MemoryRegion`.
 pub const GFX_MMIO_SIZE: u64 = 0x4000;
 
 /// Control block base inside the gfx window.
@@ -65,6 +71,14 @@ pub const IOSFC_REG_CONSUMER: u64 = 0x1020;
 /// pass scored the `width != EFI_BOOT_WIDTH` check as a high-confidence
 /// "special-cased for an observed pixel dimension" violation. The value is a
 /// choice, which is fine; a choice with no stated basis is what reads as a guess.
+///
+/// This constant and [`EFI_BOOT_HEIGHT`] are the owners.
+/// `REIMS_VGPU_EFI_BOOT_{WIDTH,HEIGHT}` in `include/reims_vgpu_qemu_abi.h`
+/// mirror them, and both shims size the pre-boot `DisplaySurface` from the
+/// header rather than from a private copy — because a shim painting at one
+/// geometry into a console this file refuses at another is a failure with the
+/// two numbers in different files.
+/// [`the_abi_header_agrees_on_the_efi_boot_mode`] fails if they part.
 pub const EFI_BOOT_WIDTH: u32 = 1920;
 /// Height of the advertised EFI mode. See [`EFI_BOOT_WIDTH`].
 pub const EFI_BOOT_HEIGHT: u32 = 1080;
@@ -710,6 +724,43 @@ mod tests {
             MAX_SCANOUT_DIM,
             "the QEMU shims bound guest geometry against the header's value; \
              it has drifted from the Rust constant that owns the bound"
+        );
+    }
+
+    /// The pre-boot console geometry, which both shims size a `DisplaySurface`
+    /// with and which `scanout::paint_efi_console` refuses a paint against.
+    ///
+    /// A drift does not degrade — it makes the refusal fire on every early
+    /// console paint, into a surface the shim itself just created at the other
+    /// size, with the two numbers never appearing in the same file.
+    #[test]
+    fn the_abi_header_agrees_on_the_efi_boot_mode() {
+        use crate::qemu::abi::header_define as define;
+        assert_eq!(
+            (
+                define("REIMS_VGPU_EFI_BOOT_WIDTH"),
+                define("REIMS_VGPU_EFI_BOOT_HEIGHT")
+            ),
+            (EFI_BOOT_WIDTH, EFI_BOOT_HEIGHT),
+            "the shims paint the early console at the header's mode; it has \
+             drifted from the mode this device advertises to the firmware"
+        );
+    }
+
+    /// The gfx window the guest can address, against the bound Rust indexes.
+    ///
+    /// One direction is the one that loses work: a window wider than
+    /// [`GFX_MMIO_SIZE`] is guest-addressable space whose accesses reach a
+    /// register store that has no slot for them. Asserted as equality because
+    /// the two have no reason to differ and an inequality check would let the
+    /// harmless direction hide the accumulation.
+    #[test]
+    fn the_abi_header_agrees_on_the_gfx_window_size() {
+        assert_eq!(
+            u64::from(crate::qemu::abi::header_define("REIMS_VGPU_GFX_MMIO_SIZE")),
+            GFX_MMIO_SIZE,
+            "the shims size the gfx MMIO region from the header; it has drifted \
+             from the bound Rust's sparse register store is indexed against"
         );
     }
 

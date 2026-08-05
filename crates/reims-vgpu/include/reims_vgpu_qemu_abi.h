@@ -140,6 +140,41 @@ extern "C" {
  */
 #define REIMS_VGPU_MAX_SCANOUT_DIM 8192u
 
+/*
+ * The single EFI pre-boot mode this device advertises, in pixels.
+ *
+ * Rust `model::regs::EFI_BOOT_{WIDTH,HEIGHT}` owns it. The device reports the
+ * pair to the firmware through `GFX_REG_EFI_MODE_SIZE` with a mode count of 1,
+ * so the pre-boot console geometry is this device's own declaration and the
+ * guest has no other mode to select — and `scanout::paint_efi_console` refuses
+ * a console paint whose width is not this one.
+ *
+ * A shim carrying its own copy is therefore not a convenience: it sizes the
+ * `DisplaySurface` the console is painted into, and a drift makes Rust refuse
+ * every paint into a surface the shim just created, silently and on whichever
+ * pathway drifted. Both shims had a private copy and nothing compared any of
+ * the three. `model::regs::the_abi_header_agrees_on_the_efi_boot_mode` does.
+ */
+#define REIMS_VGPU_EFI_BOOT_WIDTH 1920u
+#define REIMS_VGPU_EFI_BOOT_HEIGHT 1080u
+
+/*
+ * Gfx MMIO window size, in bytes: the sysbus region on the MMIO shim and BAR0
+ * on the PCI one.
+ *
+ * Rust `model::regs::GFX_MMIO_SIZE` owns it, because it is the bound on the
+ * sparse register store every `gfx_read`/`gfx_write` indexes. The two must
+ * agree in one direction that matters: a window larger than the Rust bound is
+ * guest-addressable space whose accesses Rust drops on the floor.
+ *
+ * The iosfc window is deliberately *not* here. Rust keeps no per-offset state
+ * for that rail — it decodes five named registers and ignores the rest — so a
+ * mirrored size would be a second source of truth nothing checks against the
+ * one that actually sizes the `MemoryRegion`.
+ * `model::regs::the_abi_header_agrees_on_the_gfx_window_size` fails on a drift.
+ */
+#define REIMS_VGPU_GFX_MMIO_SIZE 0x4000u
+
 /* HostAction kinds — match Rust HostActionKind / ReimsVgpuHostActionKind. */
 #define REIMS_VGPU_HOST_ACTION_NONE 0u
 #define REIMS_VGPU_HOST_ACTION_IRQ_GFX 1u

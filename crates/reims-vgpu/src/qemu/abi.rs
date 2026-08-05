@@ -737,26 +737,34 @@ pub unsafe extern "C" fn reims_vgpu_qemu_cursor_glyph_copy(
     )
 }
 
-/// Read `#define NAME <decimal>[u]` out of the shared ABI header.
+/// Read `#define NAME <decimal|0xhex>[u]` out of the shared ABI header.
 ///
 /// Test-only, and the only thing in the toolchain that reads the header at all:
 /// Rust does not include it and the shims do not read Rust, so every constant
 /// crossing the boundary exists as two copies with nothing comparing them. Each
 /// caller is the sole check that one of them has not drifted. Takes the first
 /// token after the name, because several of these carry a trailing `/* ... */`.
+///
+/// Hex is accepted because a register-window size is spelled `0x4000` on both
+/// sides and restating it in decimal on one of them would be a second
+/// transcription for a reader to get wrong — which is the defect this whole
+/// function exists to catch.
 #[cfg(test)]
 pub(crate) fn header_define(name: &str) -> u32 {
     const HEADER: &str = include_str!("../../include/reims_vgpu_qemu_abi.h");
-    HEADER
+    let tok = HEADER
         .lines()
         .find_map(|l| l.strip_prefix(&format!("#define {name} ")))
         .unwrap_or_else(|| panic!("the shared ABI header must define {name}"))
         .split_whitespace()
         .next()
         .unwrap_or_else(|| panic!("{name} must have a value"))
-        .trim_end_matches('u')
-        .parse()
-        .unwrap_or_else(|e| panic!("{name} must be a plain decimal literal: {e}"))
+        .trim_end_matches('u');
+    match tok.strip_prefix("0x") {
+        Some(hex) => u32::from_str_radix(hex, 16),
+        None => tok.parse(),
+    }
+    .unwrap_or_else(|e| panic!("{name} must be a plain decimal or 0x-hex literal: {e}"))
 }
 
 /// [`header_define`] for a `#define NAME <signed decimal>`.
