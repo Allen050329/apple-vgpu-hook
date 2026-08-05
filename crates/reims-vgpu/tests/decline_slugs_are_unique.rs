@@ -31,15 +31,10 @@
 //! on this pathway can construct one.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-fn workspace_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("the crate lives two levels below the workspace root")
-        .to_path_buf()
-}
+mod source_scan;
+use source_scan::{blank_comments, close_brace, rust_sources, strip_attributes, workspace_root};
 
 /// One `impl Decline`/`impl Refusal` block, identified by where it is written.
 ///
@@ -50,159 +45,6 @@ fn workspace_root() -> PathBuf {
 struct Owner {
     file: String,
     ty: String,
-}
-
-/// Blank out comments so neither the impl scan nor the literal scan reads one.
-///
-/// String literals are preserved verbatim, including raw strings, because the
-/// slugs *are* string literals. Everything a comment contained becomes spaces,
-/// which keeps every byte offset stable.
-fn blank_comments(text: &str) -> String {
-    let bytes: Vec<char> = text.chars().collect();
-    let mut out: Vec<char> = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        let c = bytes[i];
-        // Raw string: `r"…"` or `r#"…"#` with any number of hashes.
-        if c == 'r' && i + 1 < bytes.len() && (bytes[i + 1] == '"' || bytes[i + 1] == '#') {
-            let mut hashes = 0;
-            let mut j = i + 1;
-            while j < bytes.len() && bytes[j] == '#' {
-                hashes += 1;
-                j += 1;
-            }
-            if j < bytes.len() && bytes[j] == '"' {
-                out.push('r');
-                out.extend(std::iter::repeat_n('#', hashes));
-                out.push('"');
-                j += 1;
-                // Closing is `"` followed by exactly `hashes` hashes.
-                while j < bytes.len() {
-                    if bytes[j] == '"' && bytes[j + 1..].iter().take(hashes).all(|c| *c == '#') {
-                        out.push('"');
-                        out.extend(std::iter::repeat_n('#', hashes));
-                        j += 1 + hashes;
-                        break;
-                    }
-                    out.push(bytes[j]);
-                    j += 1;
-                }
-                i = j;
-                continue;
-            }
-        }
-        match c {
-            '"' => {
-                out.push('"');
-                i += 1;
-                while i < bytes.len() {
-                    if bytes[i] == '\\' && i + 1 < bytes.len() {
-                        out.push(bytes[i]);
-                        out.push(bytes[i + 1]);
-                        i += 2;
-                        continue;
-                    }
-                    out.push(bytes[i]);
-                    i += 1;
-                    if bytes[i - 1] == '"' {
-                        break;
-                    }
-                }
-            }
-            // Char literal, so an apostrophe in `'"'` cannot open a string.
-            // Lifetimes (`'a`) fall through harmlessly: they contain no quote.
-            '\'' if i + 2 < bytes.len() && bytes[i + 1] == '"' && bytes[i + 2] == '\'' => {
-                out.extend_from_slice(&bytes[i..i + 3]);
-                i += 3;
-            }
-            '/' if bytes.get(i + 1) == Some(&'/') => {
-                while i < bytes.len() && bytes[i] != '\n' {
-                    out.push(' ');
-                    i += 1;
-                }
-            }
-            '/' if bytes.get(i + 1) == Some(&'*') => {
-                let mut depth = 0usize;
-                while i < bytes.len() {
-                    if bytes[i] == '/' && bytes.get(i + 1) == Some(&'*') {
-                        depth += 1;
-                        out.push(' ');
-                        out.push(' ');
-                        i += 2;
-                    } else if bytes[i] == '*' && bytes.get(i + 1) == Some(&'/') {
-                        depth -= 1;
-                        out.push(' ');
-                        out.push(' ');
-                        i += 2;
-                        if depth == 0 {
-                            break;
-                        }
-                    } else {
-                        out.push(if bytes[i] == '\n' { '\n' } else { ' ' });
-                        i += 1;
-                    }
-                }
-            }
-            _ => {
-                out.push(c);
-                i += 1;
-            }
-        }
-    }
-    out.into_iter().collect()
-}
-
-/// Index of the `}` closing the `{` at `open`.
-fn close_brace(chars: &[char], open: usize) -> usize {
-    let mut depth = 0usize;
-    let mut i = open;
-    while i < chars.len() {
-        match chars[i] {
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return i;
-                }
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    chars.len()
-}
-
-/// Remove `#[…]` attribute spans, whose own string literals (`target_os =
-/// "macos"`) are not slugs. Without this the scan reports `macos` as a
-/// three-way collision between `ComputeStatus`, `EncodeStatus` and
-/// `MipmapStatus`.
-fn strip_attributes(chars: &[char]) -> String {
-    let mut out = String::new();
-    let mut i = 0;
-    while i < chars.len() {
-        if chars[i] == '#' && chars.get(i + 1) == Some(&'[') {
-            let mut depth = 0usize;
-            i += 1;
-            while i < chars.len() {
-                match chars[i] {
-                    '[' => depth += 1,
-                    ']' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            i += 1;
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
-                i += 1;
-            }
-            continue;
-        }
-        out.push(chars[i]);
-        i += 1;
-    }
-    out
 }
 
 /// Every string literal in `body`.
@@ -241,9 +83,7 @@ fn ident_ending_at(chars: &[char], end: usize) -> String {
 
 /// Every slug literal in the crate, mapped to the impl blocks that spell it.
 fn slug_owners(root: &Path) -> BTreeMap<String, Vec<Owner>> {
-    let mut sources = Vec::new();
-    collect_rs(&root.join("crates/reims-vgpu/src"), &mut sources);
-    sources.sort();
+    let sources = rust_sources(&root.join("crates/reims-vgpu/src"));
     assert!(
         sources.len() > 50,
         "walked {} files, which is not this crate",
@@ -319,17 +159,6 @@ fn slug_owners(root: &Path) -> BTreeMap<String, Vec<Owner>> {
         }
     }
     out
-}
-
-fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
-    for entry in std::fs::read_dir(dir).expect("crate src must be readable") {
-        let path = entry.expect("a readable dir entry").path();
-        if path.is_dir() {
-            collect_rs(&path, out);
-        } else if path.extension().is_some_and(|e| e == "rs") {
-            out.push(path);
-        }
-    }
 }
 
 #[test]

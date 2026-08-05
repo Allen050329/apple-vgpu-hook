@@ -177,6 +177,9 @@ simply the wrong number, a length four bytes off, or a field two bytes too wide:
 | Is a validity rule written out at every site instead of beside its constant? | `scripts/scattered-bound` |
 | Does a decoded record fail a guard and vanish into a no-op catch-all? | `scripts/silent-arms` |
 | Does a constant crossing the C boundary have the test this file asks for? | `scripts/abi-pins` |
+| Do two checks share a `reason=` slug, and so share `fail_once`'s latch? | `crates/reims-vgpu/tests/decline_slugs_are_unique.rs` |
+| Is a Vulkan value spelled outside the `translate/` table that owns it? | `crates/reims-vgpu/tests/vulkan_state_enums_live_in_translate.rs` |
+| Does anything reach a Vulkan 1.3 core name the 1.2 floor forbids? | `crates/reims-vgpu/tests/nothing_reaches_past_the_vulkan_api_floor.rs` |
 
 Do **not** answer that one by diffing `ls src/ops/` against a `grep` for
 `use reims_vgpu_wire` — that pair used to live here and it is wrong by 40 % on

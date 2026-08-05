@@ -35,9 +35,12 @@
 //!
 //! # Rules for adding a translation
 //!
-//! * Put it here, not at the call site. `gate.rs` enforces that by scanning for
-//!   Vulkan state-enum *variants* outside this module and `caps`; a bare
-//!   `vk::Format` return type is fine, spelling a specific format is not.
+//! * Put it here, not at the call site.
+//!   `tests/vulkan_state_enums_live_in_translate.rs` enforces that by scanning
+//!   for Vulkan state-enum *variants* outside this module and `caps`; a bare
+//!   `vk::Format` return type is fine, spelling a specific format is not. It
+//!   derives the set of types from what this module spells, so a new table
+//!   closes the door behind itself.
 //! * Make it total. No catch-all arm; add a [`TranslateReason`] variant with
 //!   its own slug instead.
 //! * Keep every co-varying property (byte size, texel size, aspect) in the same
