@@ -453,7 +453,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                             // under `writeback_guest`, which `multi_draw_store_plan`
                             // grants solely to the **last** record of a packet — so
                             // the returned pixels have no next record to seed
-                            // (`exec.rs` feeds `chain_rgba` into record N+1's
+                            // (`exec` feeds `chain_rgba` into record N+1's
                             // `target_seed_rgba` at line 1609), and every other
                             // reader of `chain_rgba` is an abandon arm inside a loop
                             // that has just ended. Returning the buffer forced this
@@ -650,7 +650,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                 // `None`: everything from here up is under `writeback_guest`,
                 // which `multi_draw_store_plan` grants only to `di == last_i`, so
                 // the chain value has no record N+1 to seed and every other
-                // reader of it in `exec.rs` sits inside the record loop that just
+                // reader of it in `exec` sits inside the record loop that just
                 // ended. The intermediate handoff that *is* live returned above,
                 // before the Store arms. Returning the frame here handed a whole
                 // framebuffer to a binding that is dropped unread.
@@ -1564,7 +1564,7 @@ impl crate::observe::Decline for Type5ViewDecline {
 /// Why a type-11 attachment `LOAD` could not be seeded with the surface's own
 /// prior contents.
 ///
-/// This is not a degradation the caller absorbs. `exec.rs` resolves the pass load
+/// This is not a degradation the caller absorbs. `exec` resolves the pass load
 /// action as "explicit `load_op` > `target_rgba8` > **Clear**", so a seed of
 /// `None` makes `PassKey::single(load = false)` and the render pass begins with
 /// `LoadOp::CLEAR` against the hardcoded `[0,0,0,0]` primary clear value. The
@@ -7909,7 +7909,7 @@ mod vulkan_split_tests {
     /// guest pages, and only refuses when those cannot serve the extent.
     ///
     /// Without the guest-pages rung this returns `None`, `target_rgba8` stays
-    /// unset, and `exec.rs` resolves the pass load action to `Clear` against the
+    /// unset, and `exec` resolves the pass load action to `Clear` against the
     /// hardcoded `[0,0,0,0]` — so the guest's request to preserve its surface
     /// became a transparent-black wipe that the matching Store published. One
     /// x86/Vulkan boot measured 121 distinct (mapping, geometry) instances of that

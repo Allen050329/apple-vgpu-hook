@@ -68,7 +68,7 @@ fn an_icb_refusal_keeps_its_slug_on_the_compute_rail() {
 
 /// The `0x1d1` backing-info decoder names which of its two checks refused.
 ///
-/// `exec.rs` used to fold both into a bare `icb_backing_fail` counter, so an
+/// `exec` used to fold both into a bare `icb_backing_fail` counter, so an
 /// ICB whose command memory never bound was indistinguishable from one whose
 /// record was truncated. These are the two slugs that counter now carries.
 #[test]

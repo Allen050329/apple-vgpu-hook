@@ -433,7 +433,7 @@ mod tests {
         assert_eq!(c.records[1].object_id, 11);
     }
 
-    /// The three descriptor offsets must tile the stride `exec.rs` uses to skip
+    /// The three descriptor offsets must tile the stride `exec` uses to skip
     /// the table. If they ever disagree, the decoded records and the cmdbuf
     /// section would be read from different places in the same payload.
     #[test]

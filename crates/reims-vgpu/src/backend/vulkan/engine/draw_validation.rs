@@ -2,7 +2,7 @@
 //!
 //! These checks run before context creation or GPU work. They used to be the
 //! largest single `DrawError::Invalid(String)` cluster: 41 constructors in
-//! `exec.rs`, with buffer and descriptor roles collapsed into identical prose.
+//! `exec`, with buffer and descriptor roles collapsed into identical prose.
 //! The typed vocabulary makes each request invariant enumerable and preserves
 //! the geometry/binding/range values needed to reproduce it.
 

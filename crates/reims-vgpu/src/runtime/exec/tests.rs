@@ -1,0 +1,3268 @@
+// Only the compute-preflight test names these opcodes, and that test is
+// Vulkan-only — this device compiles no compute preflight without it.
+#[cfg(feature = "backend-vulkan")]
+use reims_vgpu_wire::ops::compute as wire_compute;
+
+use reims_vgpu_wire::OP_HEADER_LEN;
+
+use super::*;
+use crate::contract::endian::{st16, st32, st64};
+use crate::model::{DeviceId, PAGE_SHIFT_ARM64E, PAGE_SHIFT_X86};
+use crate::runtime::decode::render::{
+    PASS_ATTACH_CLEAR_COLOR, PASS_ATTACH_LOAD_ACTION, PASS_ATTACH_STORE_ACTION, PASS_ATTACH_TEXREF,
+    PASS_COLOR_ATTACH_OFF, PASS_COLOR_ATTACH_STRIDE, PASS_LOAD_ACTION_CLEAR,
+    PASS_STORE_ACTION_STORE,
+};
+use crate::runtime::host::FakeHost;
+
+/// The abandon line must say how much guest work it dropped.
+///
+/// This break was silent, and the counter that would have caught it
+/// (`metal_draws_fail`) stays 0 on this path because the draw encoded
+/// `Ok` — so `packet_failed` is false and the packet-level line is
+/// suppressed too. The whole value of the line is the amount lost:
+/// breaking at 0 of 8 drops a whole composite, breaking at 7 of 8 drops
+/// one draw, and `di` alone does not distinguish them at a glance.
+#[test]
+fn chain_abandon_reports_how_many_draws_were_lost() {
+    let render = |index, total| {
+        crate::observe::Emit::decline(
+            "draw_chain_abandon",
+            &ChainAbandonDecline {
+                index,
+                total,
+                pipeline_ref: 0x41,
+            },
+        )
+        .render()
+    };
+
+    let first_of_eight = render(0, 8);
+    assert!(
+        first_of_eight.contains("reason=draw_chain_abandoned_without_color0"),
+        "{first_of_eight}"
+    );
+    assert!(first_of_eight.contains("di=0/8"), "{first_of_eight}");
+    assert!(first_of_eight.contains("lost=7"), "{first_of_eight}");
+    assert!(first_of_eight.contains("pipe=65"), "{first_of_eight}");
+
+    // The last record of a list abandons nothing after it. Reporting a
+    // loss here would send a reader hunting for draws that never existed.
+    assert!(render(7, 8).contains("lost=0"), "{}", render(7, 8));
+}
+
+#[test]
+fn short_payload_noop() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let r = process_exec_indirect2(&mut state, &mut host, &[0u8; 4]);
+    assert_eq!(r.streams_loaded, 0);
+}
+
+/// An exec packet naming a slot that is not live must be refused under the
+/// word the guest sent, not silently re-aimed at slot `word >> 1`.
+///
+/// Slot 3 is live and slot 6 is not, so word `6` names a dead slot whose
+/// halved form is live — the exact ambiguity the two boots that justified
+/// this deletion measured on every single exec decode. The old fallback
+/// answered `3` here, and `3` is a different task: everything the packet
+/// goes on to do, including its guest writes, would run against page tables
+/// the guest never named for this work.
+///
+/// `task_id` is the separator because it is what the crate acts as and what
+/// `exec_summary` reports. Asserting only "no streams loaded" would pass
+/// either way — with no page tables mapped nothing loads regardless, which
+/// is a probe that cannot distinguish the cases.
+#[test]
+fn an_exec_packet_naming_a_dead_slot_is_refused_not_aimed_at_its_neighbour() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+    assert!(state.define_task(3, 0x1_0000, 2), "slot 3 must be live");
+    assert!(state.tasks[3].active);
+    assert!(
+        !state.tasks[6].active,
+        "slot 6 must be dead for this to bite"
+    );
+
+    let mut payload = vec![0u8; CHILD_EXEC_INDIRECT_HEADER_LEN as usize];
+    st32(&mut payload[CHILD_EXEC_INDIRECT_TASK_ID as usize..], 6);
+    st32(&mut payload[CHILD_EXEC_INDIRECT_CMDBUF_COUNT as usize..], 1);
+
+    let r = process_exec_indirect2(&mut state, &mut host, &payload);
+    assert_eq!(
+        r.task_id, 6,
+        "the refusal must name the word the guest sent, not the slot we \
+         would have substituted"
+    );
+    assert_eq!(r.streams_loaded, 0);
+    assert!(!r.saw_draw);
+}
+
+/// Bytes `+0x08..0x18` of a resource-table record are zero on every build
+/// this project has measured, and their meaning is unrecovered. A guest that
+/// starts setting them is telling this device something it cannot act on, so
+/// the record must raise a line rather than pass unread.
+///
+/// The record with the populated tail is second, and the first is clean: a
+/// check that fired on the *table* rather than the record would pass this
+/// too, so the assertion names the object id.
+#[test]
+fn a_resource_record_that_populates_its_unrecovered_tail_says_so() {
+    use crate::runtime::decode::fifo::{
+        CHILD_EXEC_RESOURCE_OBJECT_ID, CHILD_EXEC_RESOURCE_TAIL, CHILD_EXEC_RESOURCE_VALIDITY_OPS,
+    };
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+    assert!(state.define_task(3, 0x1_0000, 2), "slot 3 must be live");
+
+    const N_RES: u32 = 2;
+    let table_len = N_RES as usize * CHILD_EXEC_INDIRECT_RESOURCE_DESC_LEN as usize;
+    let mut payload = vec![
+        0u8;
+        CHILD_EXEC_INDIRECT_HEADER_LEN as usize
+            + table_len
+            + CHILD_EXEC_INDIRECT_CMDBUF_DESC_LEN as usize
+    ];
+    st32(&mut payload[CHILD_EXEC_INDIRECT_TASK_ID as usize..], 3);
+    st32(
+        &mut payload[CHILD_EXEC_INDIRECT_RESOURCE_COUNT as usize..],
+        N_RES,
+    );
+    st32(&mut payload[CHILD_EXEC_INDIRECT_CMDBUF_COUNT as usize..], 1);
+    for (i, id) in [0x40u32, 0x41].into_iter().enumerate() {
+        let off = CHILD_EXEC_INDIRECT_HEADER_LEN as usize
+            + i * CHILD_EXEC_INDIRECT_RESOURCE_DESC_LEN as usize;
+        st32(
+            &mut payload[off + CHILD_EXEC_RESOURCE_OBJECT_ID as usize..],
+            id,
+        );
+        st32(
+            &mut payload[off + CHILD_EXEC_RESOURCE_VALIDITY_OPS as usize..],
+            0x0000_0001,
+        );
+    }
+    // One byte, in the last record, at the far end of the tail: the widest
+    // gap between "the decoder read the tail" and "the decoder read a dword
+    // it already had".
+    let last =
+        CHILD_EXEC_INDIRECT_HEADER_LEN as usize + CHILD_EXEC_INDIRECT_RESOURCE_DESC_LEN as usize;
+    payload[last + CHILD_EXEC_RESOURCE_TAIL as usize + 15] = 0xa5;
+
+    let cb = CHILD_EXEC_INDIRECT_HEADER_LEN as usize + table_len;
+    st64(
+        &mut payload[cb + CHILD_EXEC_INDIRECT_CMDBUF_GVA as usize..],
+        0xdead_0000,
+    );
+    st64(
+        &mut payload[cb + CHILD_EXEC_INDIRECT_CMDBUF_LENGTH as usize..],
+        64,
+    );
+
+    let cap = crate::observe::sink::FailCapture::start();
+    let r = process_exec_indirect2(&mut state, &mut host, &payload);
+    assert_eq!(r.task_id, 3);
+    assert_eq!(r.streams_loaded, 0, "no page table backs the cmdbuf gva");
+    let line = cap.one("exec_res_table");
+    assert!(line.contains("reason=exec_res_tail_populated"), "{line}");
+    assert!(line.contains(" object=65 "), "{line}");
+    assert!(line.contains(" tail_nz=1"), "{line}");
+}
+
+/// A submission whose table says the guest CPU-wrote a resource must not
+/// leave that resource's deferred window armed.
+///
+/// The window holds pixels the device rendered *before* the guest's write.
+/// Landing it afterwards replaces the guest's own bytes with a frame the
+/// guest has just declared stale — a full-extent clobber that no timing rail
+/// can prevent, because the question is not when the window lands but
+/// whether it may land at all.
+#[test]
+fn a_submission_that_says_the_guest_wrote_a_resource_drops_its_pending_window() {
+    use crate::runtime::decode::fifo::{
+        CHILD_EXEC_RESOURCE_OBJECT_ID, CHILD_EXEC_RESOURCE_VALIDITY_OPS,
+    };
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+    assert!(state.define_task(3, 0x1_0000, 2), "slot 3 must be live");
+    const MAPPING: u32 = 0x40;
+    state.mappings.entry(MAPPING).or_default().mapped = true;
+    let key = crate::model::ComputeStorageResidencyKey {
+        mapping_id: MAPPING,
+        map_generation: 0,
+        surface_offset: 0,
+        surface_bpr: 64 * 4,
+        span_end: 64 * 64 * 4,
+        width: 64,
+        height: 64,
+        pixel_format: 0x50,
+        texture_ref: 0,
+    };
+    state.compute_deferred_flush.insert(
+        key,
+        crate::model::DeferredOwner::Render {
+            armed_seq: 0,
+            armed_stamp_seq: 0,
+            source: crate::model::RenderWindowSource::Owned(std::sync::Arc::new(vec![
+                0u8;
+                64 * 64 * 4
+            ])),
+        },
+    );
+    assert_eq!(state.deferred_flush_window_count(MAPPING), 1);
+    let gen_before = state.mappings[&MAPPING].content_generation;
+
+    // One resource record: clear_host_valid, no command buffers to run.
+    let mut payload = vec![
+        0u8;
+        CHILD_EXEC_INDIRECT_HEADER_LEN as usize
+            + CHILD_EXEC_INDIRECT_RESOURCE_DESC_LEN as usize
+            + CHILD_EXEC_INDIRECT_CMDBUF_DESC_LEN as usize
+    ];
+    st32(&mut payload[CHILD_EXEC_INDIRECT_TASK_ID as usize..], 3);
+    st32(
+        &mut payload[CHILD_EXEC_INDIRECT_RESOURCE_COUNT as usize..],
+        1,
+    );
+    st32(&mut payload[CHILD_EXEC_INDIRECT_CMDBUF_COUNT as usize..], 1);
+    let res = CHILD_EXEC_INDIRECT_HEADER_LEN as usize;
+    st32(
+        &mut payload[res + CHILD_EXEC_RESOURCE_OBJECT_ID as usize..],
+        MAPPING,
+    );
+    st32(
+        &mut payload[res + CHILD_EXEC_RESOURCE_VALIDITY_OPS as usize..],
+        0x0000_0001,
+    );
+    let cb = res + CHILD_EXEC_INDIRECT_RESOURCE_DESC_LEN as usize;
+    st64(
+        &mut payload[cb + CHILD_EXEC_INDIRECT_CMDBUF_GVA as usize..],
+        0xdead_0000,
+    );
+    st64(
+        &mut payload[cb + CHILD_EXEC_INDIRECT_CMDBUF_LENGTH as usize..],
+        64,
+    );
+
+    process_exec_indirect2(&mut state, &mut host, &payload);
+    assert_eq!(
+        state.deferred_flush_window_count(MAPPING),
+        0,
+        "the guest said its own bytes are newer than ours; the window must go"
+    );
+    assert_eq!(
+        state.mappings[&MAPPING].content_generation,
+        gen_before + 1,
+        "the next read must re-take the guest pages"
+    );
+    let validity = state.mappings[&MAPPING].validity;
+    assert!(validity.host_stated && !validity.host_valid);
+}
+
+/// The mirror of the case above: a licence to write is not a reason to throw
+/// away the frame the device already produced.
+#[test]
+fn a_submission_that_only_licenses_a_resource_keeps_its_pending_window() {
+    use crate::runtime::decode::fifo::{
+        CHILD_EXEC_RESOURCE_OBJECT_ID, CHILD_EXEC_RESOURCE_VALIDITY_OPS,
+    };
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+    assert!(state.define_task(3, 0x1_0000, 2));
+    const MAPPING: u32 = 0x41;
+    state.mappings.entry(MAPPING).or_default().mapped = true;
+    state.compute_deferred_flush.insert(
+        crate::model::ComputeStorageResidencyKey {
+            mapping_id: MAPPING,
+            map_generation: 0,
+            surface_offset: 0,
+            surface_bpr: 64 * 4,
+            span_end: 64 * 64 * 4,
+            width: 64,
+            height: 64,
+            pixel_format: 0x50,
+            texture_ref: 0,
+        },
+        crate::model::DeferredOwner::Render {
+            armed_seq: 0,
+            armed_stamp_seq: 0,
+            source: crate::model::RenderWindowSource::Owned(std::sync::Arc::new(vec![
+                0u8;
+                64 * 64 * 4
+            ])),
+        },
+    );
+
+    let mut payload = vec![
+        0u8;
+        CHILD_EXEC_INDIRECT_HEADER_LEN as usize
+            + CHILD_EXEC_INDIRECT_RESOURCE_DESC_LEN as usize
+            + CHILD_EXEC_INDIRECT_CMDBUF_DESC_LEN as usize
+    ];
+    st32(&mut payload[CHILD_EXEC_INDIRECT_TASK_ID as usize..], 3);
+    st32(
+        &mut payload[CHILD_EXEC_INDIRECT_RESOURCE_COUNT as usize..],
+        1,
+    );
+    st32(&mut payload[CHILD_EXEC_INDIRECT_CMDBUF_COUNT as usize..], 1);
+    let res = CHILD_EXEC_INDIRECT_HEADER_LEN as usize;
+    st32(
+        &mut payload[res + CHILD_EXEC_RESOURCE_OBJECT_ID as usize..],
+        MAPPING,
+    );
+    st32(
+        &mut payload[res + CHILD_EXEC_RESOURCE_VALIDITY_OPS as usize..],
+        0x0000_0100,
+    );
+    let cb = res + CHILD_EXEC_INDIRECT_RESOURCE_DESC_LEN as usize;
+    st64(
+        &mut payload[cb + CHILD_EXEC_INDIRECT_CMDBUF_LENGTH as usize..],
+        64,
+    );
+
+    process_exec_indirect2(&mut state, &mut host, &payload);
+    assert_eq!(state.deferred_flush_window_count(MAPPING), 1);
+    assert!(state.mappings[&MAPPING].validity.host_valid);
+}
+
+/// One segment header whose declared length runs `overshoot` bytes past the
+/// buffer, followed by `tail` bytes of would-be records.
+fn truncated_segment(type_: u8, overshoot: usize, tail: usize) -> Vec<u8> {
+    use crate::runtime::decode::stream::SEGMENT_HEADER_LEN;
+    let mut stream = vec![0u8; SEGMENT_HEADER_LEN + tail];
+    st32(
+        &mut stream[0..4],
+        (SEGMENT_HEADER_LEN + tail + overshoot) as u32,
+    );
+    stream[4] = type_;
+    stream
+}
+
+fn sink_body() -> String {
+    std::fs::read_to_string(crate::observe::fail_log_path()).unwrap_or_default()
+}
+
+#[test]
+fn a_stream_that_will_not_frame_says_so_instead_of_executing_nothing() {
+    use crate::runtime::decode::stream::SEGMENT_TYPE_RENDER;
+    // The defect this pins: `walk_stream` opened with `Err(_) => return`, so a
+    // stream the framing decoder rejected executed zero records and produced
+    // zero log lines — byte-for-byte indistinguishable at the sink from an
+    // idle guest that submitted nothing.
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let mut out = ExecResult::default();
+    let mut acc = StreamAccum::default();
+    let before = sink_body().len();
+    // Task id doubles as the flood-latch discriminant, so it must be one no
+    // other test in this process has already burned.
+    let task_id = 0x5731_0001;
+    walk_stream(
+        &mut state,
+        &mut host,
+        task_id,
+        &truncated_segment(SEGMENT_TYPE_RENDER, 64, 0),
+        &mut out,
+        &mut acc,
+    );
+    let added = sink_body()[before..].to_string();
+    assert!(
+        added.contains("stream_frame_fail"),
+        "a stream that will not frame must reach the always-on sink, got:\n{added}"
+    );
+    assert!(
+        added.contains("reason=stream_seg_len_past_buffer_end"),
+        "the line must name which framing check refused, not just that one \
+         did — 17 checks shared `ErrBadLength`. got:\n{added}"
+    );
+    assert!(
+        added.contains(&format!("task={task_id}")),
+        "the line must carry the task whose work was dropped, got:\n{added}"
+    );
+}
+
+#[test]
+fn a_truncated_segment_names_the_check_rather_than_looking_like_end_of_records() {
+    use crate::runtime::decode::stream::{
+        segment_type_name, Segment, SEGMENT_HEADER_LEN, SEGMENT_TYPE_INFO,
+    };
+    // `Err(_) => break` treated a self-inconsistent segment exactly like
+    // `Done`: the remaining records went unexecuted with nothing logged.
+    let stream = vec![0u8; SEGMENT_HEADER_LEN + 4];
+    // A segment claiming a longer body than the buffer holds, handed straight
+    // to the record walker — the shape `iter_segments` would have rejected but
+    // that an already-parsed `Segment` can still carry.
+    let seg = Segment {
+        offset: 0,
+        length: (SEGMENT_HEADER_LEN + 64) as u32,
+        type_: SEGMENT_TYPE_INFO,
+        command_offset: SEGMENT_HEADER_LEN as u32,
+        command_length: 64,
+        ..Segment::default()
+    };
+    let before = sink_body().len();
+    let mut handled = 0usize;
+    walk_segment_records(&stream, &seg, |_, _| handled += 1);
+    let added = sink_body()[before..].to_string();
+    assert_eq!(handled, 0, "the malformed segment yields no records");
+    assert!(
+        added.contains("stream_record_fail"),
+        "dropping a segment's records must reach the sink, got:\n{added}"
+    );
+    assert!(
+        added.contains("reason=stream_reval_span_oob"),
+        "the line must name the failing re-validation check, got:\n{added}"
+    );
+    assert!(
+        added.contains(&format!(
+            "seg={}",
+            segment_type_name(u32::from(SEGMENT_TYPE_INFO))
+        )),
+        "the line must say which segment family lost its records, got:\n{added}"
+    );
+}
+
+#[test]
+fn walking_a_well_formed_segment_to_its_end_logs_nothing() {
+    use crate::runtime::decode::stream::{iter_segments, SEGMENT_HEADER_LEN, SEGMENT_TYPE_EVENT};
+    // The other half of the obligation: `Done` is how every segment ends, so
+    // if it produced a line the sink would carry one per segment per frame.
+    let mut records = [0u8; 8];
+    st32(&mut records[0..4], 0x190);
+    st32(&mut records[4..8], 8);
+    let mut stream = vec![0u8; SEGMENT_HEADER_LEN];
+    st32(
+        &mut stream[0..4],
+        (SEGMENT_HEADER_LEN + records.len()) as u32,
+    );
+    stream[4] = SEGMENT_TYPE_EVENT;
+    stream.extend_from_slice(&records);
+
+    let segs = iter_segments(&stream).expect("a well-formed stream frames");
+    let before = sink_body().len();
+    let mut handled = 0usize;
+    walk_segment_records(&stream, &segs[0], |_, _| handled += 1);
+    let added = sink_body()[before..].to_string();
+    assert_eq!(handled, 1, "the one record is handed over");
+    assert!(
+        !added.contains("stream_record_fail"),
+        "end-of-segment is control flow and must stay out of the log, got:\n{added}"
+    );
+}
+
+#[test]
+fn an_unknown_segment_family_is_refused_and_the_type_5_envelope_is_not() {
+    use crate::observe::Refusal;
+    use crate::runtime::decode::stream::{
+        segment_disposition, SegmentDisposition, SEGMENT_TYPE_BLIT, SEGMENT_TYPE_PROTECTION_OPTIONS,
+    };
+    // `walk_stream` ended in `_ => {}`, which gave one silence to two very
+    // different things. Type 5 is a contract-correct skip; type 6 is wire
+    // format the host has never seen.
+    assert_eq!(
+        segment_disposition(SEGMENT_TYPE_PROTECTION_OPTIONS),
+        SegmentDisposition::Envelope
+    );
+    assert_eq!(
+        segment_disposition(SEGMENT_TYPE_PROTECTION_OPTIONS).refusal(),
+        None,
+        "the envelope arrives on healthy frames; a line here is a flood"
+    );
+    assert_eq!(
+        segment_disposition(SEGMENT_TYPE_BLIT),
+        SegmentDisposition::Walk
+    );
+    assert_eq!(
+        segment_disposition(6).refusal(),
+        Some("stream_segment_type_unknown")
+    );
+    assert_eq!(
+        segment_disposition(0xff).refusal(),
+        Some("stream_segment_type_unknown")
+    );
+}
+
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn render_preflight_collects_content_pipelines_without_duplicates() {
+    use crate::runtime::decode::stream::{SEGMENT_HEADER_LEN, SEGMENT_TYPE_RENDER};
+    use wire_render::OPCODE_SET_RENDER_PIPELINE_STATE;
+
+    let mut records = Vec::new();
+    for pipeline in [41u32, 77, 41] {
+        let mut cmd = [0u8; 12];
+        st32(&mut cmd[0..4], OPCODE_SET_RENDER_PIPELINE_STATE);
+        st32(&mut cmd[4..8], 12);
+        st32(&mut cmd[8..12], pipeline);
+        records.extend_from_slice(&cmd);
+    }
+    let mut stream = vec![0u8; SEGMENT_HEADER_LEN];
+    let stream_len = stream.len() + records.len();
+    st32(&mut stream[0..4], stream_len as u32);
+    stream[4] = SEGMENT_TYPE_RENDER;
+    stream.extend_from_slice(&records);
+
+    assert_eq!(render_pipeline_refs(&stream), vec![41, 77]);
+}
+
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn compute_preflight_collects_pipeline_and_local_size_without_duplicates() {
+    use crate::runtime::decode::stream::{SEGMENT_HEADER_LEN, SEGMENT_TYPE_COMPUTE};
+
+    let mut records = Vec::new();
+    let mut pipeline = [0u8; 12];
+    st32(&mut pipeline[0..4], wire_compute::OPCODE_SET_PIPELINE_STATE);
+    st32(&mut pipeline[4..8], 12);
+    st32(&mut pipeline[8..12], 20);
+    records.extend_from_slice(&pipeline);
+    for opcode in [
+        wire_compute::OPCODE_DISPATCH_THREADGROUPS,
+        wire_compute::OPCODE_DISPATCH_THREADGROUPS,
+        wire_compute::OPCODE_DISPATCH_THREADS,
+    ] {
+        let mut dispatch = [0u8; 56];
+        st32(&mut dispatch[0..4], opcode);
+        st32(&mut dispatch[4..8], 56);
+        st64(&mut dispatch[8..16], 6);
+        st64(&mut dispatch[16..24], 11);
+        st64(&mut dispatch[24..32], 1);
+        st64(&mut dispatch[32..40], 16);
+        st64(&mut dispatch[40..48], 16);
+        st64(&mut dispatch[48..56], 1);
+        records.extend_from_slice(&dispatch);
+    }
+    let mut stream = vec![0u8; SEGMENT_HEADER_LEN];
+    let stream_len = stream.len() + records.len();
+    st32(&mut stream[0..4], stream_len as u32);
+    stream[4] = SEGMENT_TYPE_COMPUTE;
+    stream.extend_from_slice(&records);
+
+    assert_eq!(compute_translation_inputs(&stream), vec![(20, [16, 16, 1])]);
+}
+
+#[test]
+fn event_segment_signal_wait_in_stream() {
+    use crate::model::FENCE_DOMAIN_EVENT;
+    use crate::runtime::decode::event::SIGNAL_WAIT_PAYLOAD_LEN;
+    use crate::runtime::decode::stream::{SEGMENT_HEADER_LEN, SEGMENT_TYPE_EVENT};
+
+    fn push_segment(buf: &mut Vec<u8>, type_: u8, payload: &[u8]) {
+        let len = (SEGMENT_HEADER_LEN + payload.len()) as u32;
+        let mut hdr = [0u8; 8];
+        st32(&mut hdr[0..4], len);
+        hdr[4] = type_;
+        buf.extend_from_slice(&hdr);
+        buf.extend_from_slice(payload);
+    }
+    fn push_event_record(buf: &mut Vec<u8>, opcode: u32, event_ref: u32, value: u64) {
+        let mut payload = [0u8; SIGNAL_WAIT_PAYLOAD_LEN];
+        st32(&mut payload[0..4], event_ref);
+        st64(&mut payload[4..12], value);
+        let len = (OP_HEADER_LEN + SIGNAL_WAIT_PAYLOAD_LEN) as u32;
+        let mut hdr = [0u8; 8];
+        st32(&mut hdr[0..4], opcode);
+        st32(&mut hdr[4..8], len);
+        buf.extend_from_slice(&hdr);
+        buf.extend_from_slice(&payload);
+    }
+
+    let mut records = Vec::new();
+    push_event_record(&mut records, event_decode::OP_SIGNAL_EVENT, 11, 7);
+    push_event_record(&mut records, event_decode::OP_WAIT_EVENT, 11, 7);
+    push_event_record(&mut records, event_decode::OP_WAIT_EVENT, 11, 8); // pending
+    let mut stream = Vec::new();
+    push_segment(&mut stream, SEGMENT_TYPE_EVENT, &records);
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let mut out = ExecResult::default();
+    let mut acc = StreamAccum::default();
+    walk_stream(&mut state, &mut host, 1, &stream, &mut out, &mut acc);
+
+    // The signal landed, and the pending wait for 8 left it alone. The
+    // three per-op counters this used to assert had no product reader; the
+    // generation store is what the next wait actually reads.
+    assert_eq!(state.fence_generation(1, FENCE_DOMAIN_EVENT, 11), Some(7));
+}
+
+#[test]
+fn multi_attachment_decode_in_pass() {
+    let mut payload = vec![0u8; PASS_COLOR_ATTACH_OFF + PASS_COLOR_ATTACH_STRIDE * 2];
+    for (i, tex) in [(0u32, 41u32), (1u32, 42u32)] {
+        let slot = PASS_COLOR_ATTACH_OFF + i as usize * PASS_COLOR_ATTACH_STRIDE;
+        st32(&mut payload[slot + PASS_ATTACH_TEXREF..], tex);
+        st16(
+            &mut payload[slot + PASS_ATTACH_LOAD_ACTION..],
+            PASS_LOAD_ACTION_CLEAR,
+        );
+        st16(
+            &mut payload[slot + PASS_ATTACH_STORE_ACTION..],
+            PASS_STORE_ACTION_STORE,
+        );
+        st64(
+            &mut payload[slot + PASS_ATTACH_CLEAR_COLOR..],
+            1.0f64.to_bits(),
+        );
+        st64(
+            &mut payload[slot + PASS_ATTACH_CLEAR_COLOR + 8..],
+            0.0f64.to_bits(),
+        );
+        st64(
+            &mut payload[slot + PASS_ATTACH_CLEAR_COLOR + 16..],
+            0.0f64.to_bits(),
+        );
+        st64(
+            &mut payload[slot + PASS_ATTACH_CLEAR_COLOR + 24..],
+            1.0f64.to_bits(),
+        );
+    }
+    let a0 = decode_color_attachment(&payload, 0);
+    let a1 = decode_color_attachment(&payload, 1);
+    assert_eq!(a0.texture_ref, 41);
+    assert_eq!(a1.texture_ref, 42);
+    let mut cmd = vec![0u8; OP_HEADER_LEN + payload.len()];
+    st32(&mut cmd[0..], wire_pass::OPCODE_RENDER_PASS);
+    st32(&mut cmd[4..], (OP_HEADER_LEN + payload.len()) as u32);
+    cmd[OP_HEADER_LEN..].copy_from_slice(&payload);
+    let c = render::decode(&cmd).unwrap();
+    assert_eq!(c.kind, RenderKind::RenderPass);
+    assert_eq!(c.color0.texture_ref, 41);
+}
+
+/// An indexed draw whose record named no index buffer says so.
+///
+/// `count` takes `index_count` and `indexed` stays `None`, so the record
+/// executes as a non-indexed draw of `index_count` vertices — a draw call
+/// the guest never made, built from one it did. Metal has no such form:
+/// `drawIndexedPrimitives` takes its index buffer as an argument, so a zero
+/// ref has nothing to mean.
+///
+/// Asserts the line and, separately, that a well-formed indexed draw does
+/// not produce it — the counter is only useful if it is quiet on the path
+/// that works.
+#[test]
+fn an_indexed_draw_with_no_index_buffer_is_named() {
+    // ARM compact indexed payload: prim@0, indexBufferRef@4, count@8:u16,
+    // offset@0xa:u16 — total record 0x14.
+    let record = |index_buffer_ref: u32| {
+        let mut cmd = vec![0u8; 0x14];
+        st32(&mut cmd[0..], wire_render::OPCODE_DRAW_INDEXED);
+        st32(&mut cmd[4..], 0x14);
+        st32(&mut cmd[OP_HEADER_LEN..], 3); // primitiveType
+        st32(&mut cmd[OP_HEADER_LEN + 4..], index_buffer_ref);
+        cmd[OP_HEADER_LEN + 8..OP_HEADER_LEN + 10].copy_from_slice(&6u16.to_le_bytes());
+        cmd
+    };
+    let run = |cmd: &[u8]| {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let host = FakeHost::new();
+        let mut out = ExecResult::default();
+        let mut acc = StreamAccum {
+            pipeline_ref: 5,
+            ..Default::default()
+        };
+        handle_render_record(
+            &mut state,
+            &host,
+            1,
+            wire_render::OPCODE_DRAW_INDEXED,
+            cmd,
+            &mut out,
+            &mut acc,
+        );
+        acc
+    };
+
+    let good = run(&record(42));
+    assert!(
+        good.indexed.is_some(),
+        "a record naming an index buffer is an indexed draw"
+    );
+
+    let bad = run(&record(0));
+    assert!(
+        bad.indexed.is_none(),
+        "behaviour is unchanged: still no index buffer to draw with"
+    );
+
+    let log = std::fs::read_to_string(crate::observe::fail_log_path()).expect("fail log");
+    assert!(
+        log.contains("reason=indexed_without_index_buffer"),
+        "an indexed draw reinterpreted as non-indexed must say so"
+    );
+    assert!(
+        log.contains(&format!("op={:#x}", wire_render::OPCODE_DRAW_INDEXED)),
+        "the line must name which indexed form fired, since each reads the \
+         ref at a different offset"
+    );
+}
+
+/// A depth attachment this device cannot honour is dropped, and says so.
+///
+/// A non-zero `level` binds a mip of the depth texture and a non-zero
+/// `resolve_texture_ref` is a multisample depth resolve; both are real Metal
+/// and neither is implemented here. The gate that drops them was a bare `if`
+/// with no else, so the pass ran on with no depth attachment at all — depth
+/// testing gone for every draw in it, which reads as wrong occlusion rather
+/// than as a missing frame, and left nothing in the log to connect the two.
+///
+/// Both halves are asserted: the attachment is still refused (unchanged
+/// behaviour) and the refusal is now named.
+#[test]
+fn an_unsupported_depth_attachment_is_named_not_just_dropped() {
+    use crate::runtime::decode::render::{
+        PASS_ATTACH_DEPTH_PLANE, PASS_ATTACH_LEVEL, PASS_ATTACH_RESOLVEREF, PASS_ATTACH_SLICE,
+        PASS_ATTACH_TEXREF, PASS_DEPTH_ATTACH_OFF, PASS_STENCIL_ATTACH_OFF,
+    };
+    let pass = |level: u16, resolve: u32| {
+        let mut payload = vec![0u8; 0x200];
+        st32(
+            &mut payload[PASS_DEPTH_ATTACH_OFF + PASS_ATTACH_TEXREF..],
+            77,
+        );
+        payload[PASS_DEPTH_ATTACH_OFF + PASS_ATTACH_LEVEL
+            ..PASS_DEPTH_ATTACH_OFF + PASS_ATTACH_LEVEL + 2]
+            .copy_from_slice(&level.to_le_bytes());
+        st32(
+            &mut payload[PASS_DEPTH_ATTACH_OFF + PASS_ATTACH_RESOLVEREF..],
+            resolve,
+        );
+        // A stencil slot this device *can* honour, so the two aspects stay
+        // separable and the depth arm is the only one under test.
+        st32(
+            &mut payload[PASS_STENCIL_ATTACH_OFF + PASS_ATTACH_TEXREF..],
+            88,
+        );
+        let mut cmd = vec![0u8; OP_HEADER_LEN + payload.len()];
+        st32(&mut cmd[0..], wire_pass::OPCODE_RENDER_PASS);
+        st32(&mut cmd[4..], (OP_HEADER_LEN + payload.len()) as u32);
+        cmd[OP_HEADER_LEN..].copy_from_slice(&payload);
+        cmd
+    };
+    let run = |cmd: &[u8]| {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let host = FakeHost::new();
+        let mut out = ExecResult::default();
+        let mut acc = StreamAccum::default();
+        handle_render_record(
+            &mut state,
+            &host,
+            1,
+            wire_pass::OPCODE_RENDER_PASS,
+            cmd,
+            &mut out,
+            &mut acc,
+        );
+        acc
+    };
+
+    let ok = run(&pass(0, 0));
+    assert!(
+        ok.depth_attach.is_some() && ok.stencil_attach.is_some(),
+        "a level-0 depth attachment with no resolve is honoured"
+    );
+
+    for (level, resolve) in [(1u16, 0u32), (0, 99)] {
+        let acc = run(&pass(level, resolve));
+        assert!(
+            acc.depth_attach.is_none(),
+            "level={level} resolve={resolve} must still be refused"
+        );
+        assert!(
+            acc.stencil_attach.is_some(),
+            "refusing depth must not take the stencil attachment with it"
+        );
+    }
+
+    // `slice` and `depth_plane` are the two sixteen-bit fields above
+    // `level` in the shared attachment prefix, and this arm read neither
+    // until they were decodable. A depth buffer bound at slice 5 was read
+    // as slice 0 and silently accepted, which is a depth test against the
+    // wrong layer rather than a missing one.
+    //
+    // Driven from both slots, because "the two arms consume one wire form"
+    // is exactly the shape that drifts: the stencil arm is a second call to
+    // the same rule and nothing but this proves it is still the same one.
+    for (field, at) in [
+        ("slice", PASS_ATTACH_SLICE),
+        ("plane", PASS_ATTACH_DEPTH_PLANE),
+    ] {
+        let mut cmd = pass(0, 0);
+        let slot = OP_HEADER_LEN + PASS_DEPTH_ATTACH_OFF + at;
+        cmd[slot..slot + 2].copy_from_slice(&5u16.to_le_bytes());
+        let acc = run(&cmd);
+        assert!(
+            acc.depth_attach.is_none(),
+            "a depth attachment naming {field} 5 must be refused, not read as 0"
+        );
+        assert!(
+            acc.stencil_attach.is_some(),
+            "refusing depth for {field} must not take the stencil attachment with it"
+        );
+
+        let mut cmd = pass(0, 0);
+        let slot = OP_HEADER_LEN + PASS_STENCIL_ATTACH_OFF + at;
+        cmd[slot..slot + 2].copy_from_slice(&5u16.to_le_bytes());
+        let acc = run(&cmd);
+        assert!(
+            acc.stencil_attach.is_none(),
+            "a stencil attachment naming {field} 5 must be refused, not read as 0"
+        );
+        assert!(
+            acc.depth_attach.is_some(),
+            "refusing stencil for {field} must not take the depth attachment with it"
+        );
+    }
+
+    let log = std::fs::read_to_string(crate::observe::fail_log_path()).expect("fail log");
+    assert!(
+        log.contains("stream_depth_stencil_unsupported"),
+        "an unsupported depth attachment was dropped without naming itself"
+    );
+    assert!(
+        log.contains("aspect=depth") && log.contains("aspect=stencil"),
+        "the line must say which aspect was lost, and both arms must reach it"
+    );
+    assert!(
+        log.contains("slice=5"),
+        "the line must carry the slice; it was undecodable before the shared \
+         prefix was derived"
+    );
+}
+
+/// A colour attachment naming a mip, a slice or a depth plane says so.
+///
+/// Every consumer binds the texture whole, so the pass renders into level 0
+/// slice 0 plane 0 regardless — a guest drawing a cube face overwrites face
+/// 0. Nothing downstream can tell that happened, which is why the report is
+/// here and not in a backend.
+///
+/// The `slice` and `depth_plane` arms are the ones that could not have been
+/// written before: those fields did not exist, because the decoder read
+/// `level` thirty-two bits wide and swallowed the slice into it.
+#[test]
+fn a_colour_attachment_naming_a_subresource_this_device_cannot_bind_says_so() {
+    use crate::contract::endian::st32;
+    use crate::runtime::decode::render::{
+        PASS_ATTACH_DEPTH_PLANE, PASS_ATTACH_LEVEL, PASS_ATTACH_SLICE, PASS_ATTACH_TEXREF,
+        PASS_COLOR_ATTACH_OFF, PASS_MIN_PAYLOAD,
+    };
+
+    let pass = |level: u16, slice: u16, plane: u16| {
+        let total = OP_HEADER_LEN + PASS_MIN_PAYLOAD;
+        let mut cmd = vec![0u8; total];
+        st32(&mut cmd[0..], wire_pass::OPCODE_RENDER_PASS);
+        st32(&mut cmd[4..], total as u32);
+        let slot = OP_HEADER_LEN + PASS_COLOR_ATTACH_OFF;
+        st32(&mut cmd[slot + PASS_ATTACH_TEXREF..], 77);
+        cmd[slot + PASS_ATTACH_LEVEL..slot + PASS_ATTACH_LEVEL + 2]
+            .copy_from_slice(&level.to_le_bytes());
+        cmd[slot + PASS_ATTACH_SLICE..slot + PASS_ATTACH_SLICE + 2]
+            .copy_from_slice(&slice.to_le_bytes());
+        cmd[slot + PASS_ATTACH_DEPTH_PLANE..slot + PASS_ATTACH_DEPTH_PLANE + 2]
+            .copy_from_slice(&plane.to_le_bytes());
+        cmd
+    };
+    let run = |cmd: &[u8]| {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let host = FakeHost::new();
+        let mut out = ExecResult::default();
+        let mut acc = StreamAccum::default();
+        handle_render_record(
+            &mut state,
+            &host,
+            1,
+            wire_pass::OPCODE_RENDER_PASS,
+            cmd,
+            &mut out,
+            &mut acc,
+        );
+        acc
+    };
+
+    // Subresource 0/0/0 is what this device binds, so it reports nothing.
+    let acc = run(&pass(0, 0, 0));
+    assert_eq!(
+        acc.color_slots.len(),
+        1,
+        "the plain attachment still reaches the slot list"
+    );
+
+    for (level, slice, plane) in [(3u16, 0u16, 0u16), (0, 5, 0), (0, 0, 2)] {
+        let acc = run(&pass(level, slice, plane));
+        assert_eq!(
+            acc.color_slots.len(),
+            1,
+            "level={level} slice={slice} plane={plane}: the pass still runs -- \
+             reporting must not cost the guest its draw"
+        );
+    }
+
+    let log = std::fs::read_to_string(crate::observe::fail_log_path()).expect("fail log");
+    assert!(
+        log.contains("stream_color_subresource_unsupported"),
+        "a colour attachment bound at the wrong subresource said nothing"
+    );
+    assert!(
+        log.contains("slice=5"),
+        "the line must carry the slice; before the decode fix it was folded \
+         into the level and could not be reported"
+    );
+    assert!(
+        log.contains("plane=2"),
+        "the line must carry the depth plane"
+    );
+}
+
+/// The pass-extent census bands agree with the scissor-union census's.
+///
+/// The two answer the same question from two different sources — the pass
+/// descriptor and the draw stream — and the whole reason to have both is to
+/// read them side by side. Bands that drifted apart would make that
+/// comparison silently wrong rather than obviously so.
+///
+/// Declared twice because `coverage_band` is behind `backend-vulkan` and
+/// this census runs on every backend. This is the comparison that keeps the
+/// duplication honest.
+#[test]
+fn the_two_coverage_censuses_use_the_same_bands() {
+    // Every boundary of every band, plus one over the top.
+    for pct in [0u64, 1, 5, 6, 10, 11, 25, 26, 50, 51, 99, 100, 101] {
+        let band = pass_extent_band(pct);
+        assert!(
+            band < PASS_EXTENT_SLUGS.len(),
+            "pct {pct} banded out of range"
+        );
+        #[cfg(feature = "backend-vulkan")]
+        assert_eq!(
+            band,
+            crate::runtime::metal_draw::coverage_band_for_test(pct),
+            "pct {pct}: the two censuses band it differently"
+        );
+    }
+    // The bands are ordered, so a larger fraction never scores lower.
+    let mut last = 0usize;
+    for pct in 0..=100u64 {
+        let b = pass_extent_band(pct);
+        assert!(b >= last, "pct {pct} banded below its predecessor");
+        last = b;
+    }
+    assert_eq!(pass_extent_band(100), PASS_EXTENT_SLUGS.len() - 1);
+}
+
+/// A stated extent is scored against the attachment, and only when both are
+/// real.
+#[test]
+fn the_pass_extent_census_scores_a_fraction_and_clamps_it() {
+    use crate::runtime::drain::store_route_count;
+
+    // A pass covering a quarter of its attachment.
+    let before = store_route_count("pass_extent_le25");
+    note_pass_extent_coverage(960, 540, 1920, 1080);
+    assert_eq!(
+        store_route_count("pass_extent_le25"),
+        before + 1,
+        "960x540 of 1920x1080 is 25%"
+    );
+
+    // A pass stating more than the attachment holds. Metal permits it and
+    // the rasteriser clips, so this reads full rather than over 100%.
+    let before = store_route_count("pass_extent_full");
+    note_pass_extent_coverage(4096, 4096, 1920, 1080);
+    assert_eq!(store_route_count("pass_extent_full"), before + 1);
+
+    // Neither a missing extent nor a geometry-less attachment is scored:
+    // there is no fraction to take, and counting it as zero would put every
+    // unstated pass in the bottom band and make the census read as damage.
+    let before: u64 = PASS_EXTENT_SLUGS.iter().map(|s| store_route_count(s)).sum();
+    note_pass_extent_coverage(0, 0, 1920, 1080);
+    note_pass_extent_coverage(100, 100, 0, 0);
+    assert_eq!(
+        PASS_EXTENT_SLUGS
+            .iter()
+            .map(|s| store_route_count(s))
+            .sum::<u64>(),
+        before
+    );
+}
+
+/// The extent census scores whichever resolve arm supplied the mapping id,
+/// and only for slot 0.
+///
+/// This is the arm-parity test. The census used to hang off the type-11
+/// resolve alone, so on the x86/Vulkan pathway — where the workload takes
+/// the type-4 arm — every band read zero, which is indistinguishable from a
+/// guest that never states an extent. A type-4 attachment *is* its own
+/// mapping id, so the only difference between the two call sites is which
+/// id they pass, and this pins that the scoring does not care which.
+#[test]
+fn the_pass_extent_census_scores_either_resolve_arm() {
+    use crate::runtime::drain::store_route_count;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let cmd = crate::runtime::decode::render::Command {
+        pass_render_target_width: 960,
+        pass_render_target_height: 540,
+        ..Default::default()
+    };
+    // One mapping, reached by the id either arm would hand over.
+    assert!(state.map_surface(7));
+    let _ = state.set_mapping_geom(7, 1920, 1080, 0);
+
+    let before = store_route_count("pass_extent_le25");
+    note_pass_extent_for_slot(&state, 0, 7, &cmd);
+    assert_eq!(
+        store_route_count("pass_extent_le25"),
+        before + 1,
+        "slot 0 was not scored"
+    );
+
+    // A slot the device does not treat as the pass's attachment, and a
+    // mapping id with no geometry yet, are both silent — the first because
+    // the census is defined on slot 0, the second because there is no
+    // fraction to take.
+    let before: u64 = PASS_EXTENT_SLUGS.iter().map(|s| store_route_count(s)).sum();
+    note_pass_extent_for_slot(&state, 1, 7, &cmd);
+    note_pass_extent_for_slot(&state, 0, 4242, &cmd);
+    assert_eq!(
+        PASS_EXTENT_SLUGS
+            .iter()
+            .map(|s| store_route_count(s))
+            .sum::<u64>(),
+        before
+    );
+}
+
+#[test]
+fn stream_accum_upserts_buffer_and_viewport() {
+    // wire opcodes via wire_render import
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let host = FakeHost::new();
+    let mut out = ExecResult::default();
+    let mut acc = StreamAccum::default();
+
+    // setVertexBuffer multi-entry: first=2 count=1 ref=9 offset=16
+    // payload = first:u32 + count:u32 + {ref:u32, offset:u64}
+    let mut vb = vec![0u8; OP_HEADER_LEN + 8 + 12];
+    let vb_len = vb.len() as u32;
+    st32(&mut vb[0..], wire_render::OPCODE_SET_VERTEX_BUFFER);
+    st32(&mut vb[4..], vb_len);
+    st32(&mut vb[8..], 2); // first
+    st32(&mut vb[12..], 1); // count
+    st32(&mut vb[16..], 9); // ref
+    st64(&mut vb[20..], 16); // offset
+    handle_render_record(
+        &mut state,
+        &host,
+        0,
+        wire_render::OPCODE_SET_VERTEX_BUFFER,
+        &vb,
+        &mut out,
+        &mut acc,
+    );
+    assert_eq!(acc.vertex_buffers.len(), 1);
+    assert_eq!(acc.vertex_buffers[0].index, 2);
+    assert_eq!(acc.vertex_buffers[0].buffer_ref, 9);
+    assert_eq!(acc.vertex_buffers[0].offset, 16);
+
+    // overwrite same slot
+    st32(&mut vb[16..], 10);
+    handle_render_record(
+        &mut state,
+        &host,
+        0,
+        wire_render::OPCODE_SET_VERTEX_BUFFER,
+        &vb,
+        &mut out,
+        &mut acc,
+    );
+    assert_eq!(acc.vertex_buffers.len(), 1);
+    assert_eq!(acc.vertex_buffers[0].buffer_ref, 10);
+
+    // fragment buffer multi-entry: first=0 count=1 ref=7 offset=0
+    let mut fb = vec![0u8; OP_HEADER_LEN + 8 + 12];
+    let fb_len = fb.len() as u32;
+    st32(&mut fb[0..], wire_render::OPCODE_SET_FRAGMENT_BUFFER);
+    st32(&mut fb[4..], fb_len);
+    st32(&mut fb[8..], 0); // first
+    st32(&mut fb[12..], 1); // count
+    st32(&mut fb[16..], 7); // ref
+    st64(&mut fb[20..], 0); // offset
+    handle_render_record(
+        &mut state,
+        &host,
+        0,
+        wire_render::OPCODE_SET_FRAGMENT_BUFFER,
+        &fb,
+        &mut out,
+        &mut acc,
+    );
+    assert_eq!(acc.fragment_buffers.len(), 1);
+
+    // viewport
+    let mut vp = vec![0u8; OP_HEADER_LEN + 48];
+    st32(&mut vp[0..], wire_render::OPCODE_SET_VIEWPORT);
+    st32(&mut vp[4..], (OP_HEADER_LEN + 48) as u32);
+    for i in 0..6 {
+        let bits = (i as f64 + 1.0).to_bits();
+        st64(&mut vp[OP_HEADER_LEN + i * 8..], bits);
+    }
+    handle_render_record(
+        &mut state,
+        &host,
+        0,
+        wire_render::OPCODE_SET_VIEWPORT,
+        &vp,
+        &mut out,
+        &mut acc,
+    );
+    let v = acc.viewport.expect("viewport");
+    assert!((v[0] - 1.0).abs() < 1e-9);
+    assert!((v[5] - 6.0).abs() < 1e-9);
+}
+
+#[test]
+fn wide_indexed_draw_reaches_pending_draw() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let host = FakeHost::new();
+    let mut out = ExecResult::default();
+    let mut acc = StreamAccum {
+        pipeline_ref: 61,
+        ..Default::default()
+    };
+    let mut command = vec![0u8; 0x20];
+    let op = wire_render::OPCODE_DRAW_INDEXED_WIDE;
+    st32(&mut command[0..], op);
+    st32(&mut command[4..], 0x20);
+    st16(&mut command[8..], 3);
+    st16(&mut command[10..], 0);
+    st32(&mut command[12..], 0x3e);
+    st32(&mut command[16..], 6);
+    st32(&mut command[24..], 0x10100);
+    handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
+
+    assert!(acc.saw_draw);
+    assert!(out.saw_draw);
+    assert_eq!(acc.draws.len(), 1);
+    let indexed = acc.draws[0].indexed.as_ref().expect("indexed draw");
+    assert_eq!(indexed.index_type, 0);
+    assert_eq!(indexed.index_buffer_ref, 0x3e);
+    assert_eq!(indexed.index_count, 6);
+    assert_eq!(indexed.index_buffer_offset, 0x10100);
+    assert_eq!(
+        acc.draws[0].draw,
+        DrawArgs {
+            vertex_count: 6,
+            instance_count: 1,
+            primitive_type: 3,
+            first_vertex: 0,
+            base_instance: 0
+        }
+    );
+}
+
+/// A base vertex and a base instance survive the whole accumulator hop.
+///
+/// Both had a home in every backend already — Metal's `render_core_mrt`
+/// takes a base instance and `ReimsVgpuIndexedDraw` a base vertex, Vulkan's
+/// `DrawRequest` and `IndexedDrawResource` the same two — and both were fed
+/// a hardcoded zero from here, because nothing upstream decoded a draw form
+/// that carries them. This is the seam that was missing, so it is the seam
+/// worth pinning: a regression to a literal `0` anywhere between decode and
+/// `DrawEncodeRequest` fails here.
+#[test]
+fn a_base_vertex_and_base_instance_reach_the_pending_draw() {
+    use crate::contract::endian::st16;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let host = FakeHost::new();
+    let mut out = ExecResult::default();
+    let mut acc = StreamAccum {
+        pipeline_ref: 61,
+        ..Default::default()
+    };
+    let op = wire_render::OPCODE_DRAW_INDEXED_INSTANCED_BASE;
+    let total = reims_vgpu_wire::ops::render::DRAW_INDEXED_INSTANCED_BASE_TOTAL_LEN;
+    let mut command = vec![0u8; total as usize];
+    st32(&mut command[0..], op);
+    st32(&mut command[4..], total);
+    st16(&mut command[8..], 3); // primitiveType
+    st16(&mut command[10..], 1); // indexType UInt32
+    st32(&mut command[12..], 0x3e); // index buffer ref
+    st16(&mut command[16..], 0x40); // index buffer offset (first, on this form)
+    st16(&mut command[18..], 6); // index count
+    st16(&mut command[20..], 9); // instanceCount
+    st16(&mut command[22..], 0xfffb); // baseVertex = -5
+    st16(&mut command[24..], 7); // baseInstance
+    handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
+
+    assert_eq!(acc.draws.len(), 1, "the draw must not be dropped");
+    assert_eq!(acc.draws[0].draw.instance_count, 9);
+    assert_eq!(acc.draws[0].draw.base_instance, 7);
+    let indexed = acc.draws[0].indexed.as_ref().expect("indexed draw");
+    assert_eq!(indexed.index_count, 6);
+    assert_eq!(indexed.index_buffer_offset, 0x40);
+    assert_eq!(indexed.base_vertex, -5, "a negative base vertex survives");
+
+    // And onward into the request the backends receive. `retarget_render_
+    // pass_draw` is the path records 2+ of a chained pass take, and it
+    // rebuilds every draw argument from the template.
+    let template = metal_draw::DrawEncodeRequest::default();
+    let req = retarget_render_pass_draw(&template, &acc.draws[0]);
+    assert_eq!(req.base_instance, 7);
+    assert_eq!(req.instance_count, 9);
+}
+
+/// Every decoded draw in a stream reaches the draw list.
+///
+/// `MAX_DRAWS_PER_STREAM = 64` truncated `acc.draws` inside a bare `if` with
+/// no `else`, so a compositor stream with more records than that lost every
+/// draw past the 64th with nothing on any channel — no counter, no line, and
+/// an `ExecResult` describing the truncated list as a fully executed pass.
+/// 71 is chosen to straddle that old ceiling: this test fails on the capped
+/// code at exactly 64.
+#[test]
+fn every_decoded_draw_in_a_stream_reaches_the_draw_list() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let host = FakeHost::new();
+    let mut out = ExecResult::default();
+    let mut acc = StreamAccum {
+        pipeline_ref: 61,
+        ..Default::default()
+    };
+    let mut command = vec![0u8; 0x20];
+    let op = wire_render::OPCODE_DRAW_INDEXED_WIDE;
+    st32(&mut command[0..], op);
+    st32(&mut command[4..], 0x20);
+    st16(&mut command[8..], 3);
+    st32(&mut command[12..], 0x3e);
+    st32(&mut command[16..], 6);
+    let records = 71;
+    for _ in 0..records {
+        handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
+    }
+
+    assert_eq!(acc.draws.len(), records, "no draw may be truncated away");
+    assert_eq!(acc.dropped_unbound, 0, "all of these had a pipeline bound");
+
+    // With no pipeline latched the same record is the other arm: still not
+    // a `PendingDraw`, but counted rather than vanishing.
+    let mut unbound = StreamAccum::default();
+    handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut unbound);
+    assert_eq!(unbound.dropped_unbound, 1);
+    assert!(unbound.draws.is_empty());
+}
+
+/// Setting the render pipeline to ref 0 unbinds it rather than being ignored.
+///
+/// `SetPipeline` was guarded `if cmd.pipeline_ref != 0`, and the arm that
+/// caught the failed guard is the match's bare `_ => {}`. So a zero ref left
+/// whatever pipeline was latched before it in place, and every following draw
+/// encoded against a pipeline the guest had stopped asking for — a wrong
+/// frame, silently, with `dropped_unbound` reading zero because the draws
+/// were not dropped at all.
+///
+/// This asserts the outcome rather than the field: after a zero ref, a draw
+/// that would otherwise have been kept lands in `dropped_unbound` and no
+/// `PendingDraw` carries the stale ref. On the guarded code the draw is
+/// pushed with pipeline 61 and both assertions fail.
+#[test]
+fn setting_the_render_pipeline_to_ref_zero_unbinds_it() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let host = FakeHost::new();
+    let mut out = ExecResult::default();
+    let mut acc = StreamAccum {
+        pipeline_ref: 61,
+        ..Default::default()
+    };
+
+    let mut set_pipeline = vec![0u8; wire_render::SET_STATE_TOTAL_LEN as usize];
+    st32(
+        &mut set_pipeline[0..],
+        wire_render::OPCODE_SET_RENDER_PIPELINE_STATE,
+    );
+    st32(&mut set_pipeline[4..], wire_render::SET_STATE_TOTAL_LEN);
+    st32(&mut set_pipeline[8..], 0);
+    handle_render_record(
+        &mut state,
+        &host,
+        1,
+        wire_render::OPCODE_SET_RENDER_PIPELINE_STATE,
+        &set_pipeline,
+        &mut out,
+        &mut acc,
+    );
+    assert_eq!(
+        acc.pipeline_ref, 0,
+        "the decoded ref is what the accumulator latches"
+    );
+
+    let mut draw = vec![0u8; 0x20];
+    let op = wire_render::OPCODE_DRAW_INDEXED_WIDE;
+    st32(&mut draw[0..], op);
+    st32(&mut draw[4..], 0x20);
+    st16(&mut draw[8..], 3);
+    st32(&mut draw[12..], 0x3e);
+    st32(&mut draw[16..], 6);
+    handle_render_record(&mut state, &host, 1, op, &draw, &mut out, &mut acc);
+
+    assert_eq!(
+        acc.dropped_unbound, 1,
+        "a draw after an unbind is declined by name, not encoded against the old pipeline"
+    );
+    assert!(
+        acc.draws.is_empty(),
+        "no draw may carry the pipeline the guest unbound"
+    );
+}
+
+/// A stream that binds once and draws many times must not copy its bind
+/// tables per draw.
+///
+/// This is the property that makes an unbounded draw list affordable, and
+/// therefore the property the cap's removal rests on. It is asserted by
+/// pointer identity because that is the only thing that distinguishes a
+/// shared table from an equal copy — `assert_eq!` on the contents passes
+/// either way, which is exactly how a regression here would hide.
+#[test]
+fn draws_sharing_a_bind_table_share_its_allocation() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let host = FakeHost::new();
+    let mut out = ExecResult::default();
+    let mut acc = StreamAccum {
+        pipeline_ref: 61,
+        vertex_buffers: Arc::new(vec![BufferBind {
+            index: 0,
+            buffer_ref: 9,
+            offset: 0,
+        }]),
+        ..Default::default()
+    };
+    let mut command = vec![0u8; 0x20];
+    let op = wire_render::OPCODE_DRAW_INDEXED_WIDE;
+    st32(&mut command[0..], op);
+    st32(&mut command[4..], 0x20);
+    st16(&mut command[8..], 3);
+    st32(&mut command[12..], 0x3e);
+    st32(&mut command[16..], 6);
+    for _ in 0..100 {
+        handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
+    }
+
+    assert_eq!(acc.draws.len(), 100);
+    for (i, pd) in acc.draws.iter().enumerate() {
+        assert!(
+            Arc::ptr_eq(&pd.vertex_buffers, &acc.vertex_buffers),
+            "draw {i} copied a bind table nothing had changed"
+        );
+    }
+}
+
+/// A bind that changes after a draw must not reach back into that draw.
+///
+/// The other half of the copy-on-write contract: sharing is only safe if a
+/// later mutation forks. `Arc::make_mut` is what does that, and a mutation
+/// site that reached the `Vec` some other way would silently rewrite a
+/// snapshot the guest already committed to.
+#[test]
+fn a_bind_after_a_draw_does_not_rewrite_that_draws_snapshot() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let host = FakeHost::new();
+    let mut out = ExecResult::default();
+    let mut acc = StreamAccum {
+        pipeline_ref: 61,
+        vertex_buffers: Arc::new(vec![BufferBind {
+            index: 0,
+            buffer_ref: 9,
+            offset: 0,
+        }]),
+        ..Default::default()
+    };
+    let mut command = vec![0u8; 0x20];
+    let op = wire_render::OPCODE_DRAW_INDEXED_WIDE;
+    st32(&mut command[0..], op);
+    st32(&mut command[4..], 0x20);
+    st16(&mut command[8..], 3);
+    st32(&mut command[12..], 0x3e);
+    st32(&mut command[16..], 6);
+    handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
+
+    apply_binds(
+        &[(77u32, 0u64)],
+        0,
+        BindTarget {
+            stage: Stage::Vertex,
+            class: BindClass::Buffer,
+        },
+        &mut acc.vertex_buffers,
+        &mut acc.fragment_buffers,
+        |b| b.index,
+        |index, (buffer_ref, offset)| {
+            Some(BufferBind {
+                index,
+                buffer_ref,
+                offset,
+            })
+        },
+    );
+
+    assert_eq!(
+        acc.draws[0].vertex_buffers[0].buffer_ref, 9,
+        "the committed draw kept the buffer it was encoded with"
+    );
+    assert_eq!(acc.vertex_buffers[0].buffer_ref, 77);
+}
+
+#[test]
+fn accepted_render_without_executor_is_fail_visible() {
+    // The emit is deduped per opcode process-wide; hold the shared latch
+    // lock and clear it so this test always observes its first-sighting line.
+    let _guard = UNIMPL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    reset_unimplemented_opcode_dedup_for_test();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let host = FakeHost::new();
+    let mut out = ExecResult::default();
+    let mut acc = StreamAccum {
+        pipeline_ref: 0xface,
+        ..Default::default()
+    };
+    let task_id = 0xfeed;
+    let mut command = vec![0u8; OP_HEADER_LEN];
+    // An opcode inside the encoder's range that no arm claims, found rather
+    // than named. It used to be `wire_render::OPCODE_SET_VERTEX_BUFFER_OFFSET_STRIDE`, which stopped working
+    // the moment that bound was corrected to `0xa6` -- because `0xa6` is a
+    // record this rail now decodes. `0x99` was the replacement and lasted
+    // one commit, until `setVertexAmplificationMode:value:` turned out to be
+    // that number. The catch-all is what is under test, not any literal.
+    let op = render::unclaimed_accepted_opcode();
+    st32(&mut command[0..], op);
+    st32(&mut command[4..], OP_HEADER_LEN as u32);
+    handle_render_record(&mut state, &host, task_id, op, &command, &mut out, &mut acc);
+
+    let body = std::fs::read_to_string(crate::observe::fail_log_path())
+        .expect("reims-vgpu-fail.log readable");
+    let want = format!(
+        "render_unimplemented reason=accepted_without_executor task=65261 opcode={op:#x} len=8"
+    );
+    assert!(
+        body.lines()
+            .any(|line| line.contains(&want) && line.contains("pipeline=64206")),
+        "no line matching {want:?}"
+    );
+}
+
+/// Regression guard: the accepted-without-executor line is deduped to ONE
+/// emission per distinct opcode (a per-draw undecoded op must not flood the
+/// always-on sink), while distinct opcodes still each report once and the
+/// raw wire is captured. This locks the anti-flood behavior that replaced
+/// the ~2620-line-per-workload per-draw emit.
+#[test]
+fn unimplemented_render_opcode_dedups_per_opcode_with_wire() {
+    let _guard = UNIMPL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    reset_unimplemented_opcode_dedup_for_test();
+    let task = 0x5151u32;
+    let acc = StreamAccum {
+        pipeline_ref: 0x1234,
+        ..Default::default()
+    };
+    let wire: Vec<u8> = vec![0xde, 0xad, 0xbe, 0xef, 0x10, 0x00, 0x00, 0x00];
+
+    // First sighting of an opcode emits; every repeat is deduped (no flood).
+    assert!(
+        note_unimplemented_render_opcode(0x7c, &wire, task, &acc),
+        "first sighting must emit",
+    );
+    for _ in 0..24 {
+        assert!(
+            !note_unimplemented_render_opcode(0x7c, &wire, task, &acc),
+            "a repeated opcode must be deduped",
+        );
+    }
+    // A distinct opcode reports once independently of the first.
+    assert!(note_unimplemented_render_opcode(0x9a, &wire, task, &acc));
+    assert!(!note_unimplemented_render_opcode(0x9a, &wire, task, &acc));
+    // Out-of-range opcodes (decode desync) are also deduped, not flooded.
+    assert!(note_unimplemented_render_opcode(
+        0x1_0001, &wire, task, &acc
+    ));
+    assert!(!note_unimplemented_render_opcode(
+        0x1_0001, &wire, task, &acc
+    ));
+
+    // The first-sighting line captured the raw wire for offline decode.
+    let body = std::fs::read_to_string(crate::observe::fail_log_path())
+        .expect("reims-vgpu-fail.log readable");
+    assert!(
+        body.lines().any(|l| l.contains(&format!("task={task}"))
+            && l.contains("opcode=0x7c")
+            && l.contains("hex=deadbeef10000000")),
+        "the raw wire must be captured on first sighting",
+    );
+}
+
+/// The render rail's boundary counter must name the *check* that dropped the
+/// draw, not the class it was flattened into.
+///
+/// Before `EncodeStatus` carried its reason this line read
+/// `draw_encode_fail reason=bad_args`, and `bad_args` alone spoke for eight
+/// distinct refusals in `encode_draw_chain_inner` — a zero-size target, a
+/// vertexless draw, an MRT slot with no backing. A window that never painted
+/// gave you the class and never the cause.
+#[test]
+fn a_dropped_draw_names_which_check_refused_not_just_its_class() {
+    let task = 81u32;
+    // Distinct from every other pipeline in the suite: `fail_once` latches per
+    // (reason, pipeline) for the whole process.
+    let pipe = 249_001u32;
+    note_draw_encode_fail(
+        task,
+        pipe,
+        EncodeStatus::BadArgs("draw_mtl_zero_geom"),
+        1,
+        3,
+    );
+    let body = sink_body();
+    assert!(
+        body.lines().any(|l| l
+            .contains("draw_encode_fail reason=draw_mtl_zero_geom class=bad_args")
+            && l.contains(&format!("pipe={pipe}"))
+            && l.contains(&format!("task={task}"))
+            && l.contains("di=1/3")),
+        "the boundary line must carry the specific check and the class:\n{body}"
+    );
+
+    // Latched per (reason, pipeline): the guest re-submits the same failing
+    // draw every frame, so a repeat adds nothing the first line did not…
+    note_draw_encode_fail(
+        task,
+        pipe,
+        EncodeStatus::BadArgs("draw_mtl_zero_geom"),
+        2,
+        3,
+    );
+    // …but a *different* check on the same pipeline is a different event and
+    // must still be visible. Latching on the class would have hidden it, which
+    // is exactly the failure this migration removes.
+    note_draw_encode_fail(
+        task,
+        pipe,
+        EncodeStatus::MetalFailed("draw_mtl_core_failed"),
+        2,
+        3,
+    );
+    let body = sink_body();
+    assert_eq!(
+        body.matches("reason=draw_mtl_zero_geom").count(),
+        1,
+        "a re-attempted refusal must log once:\n{body}"
+    );
+    assert!(
+        body.contains("reason=draw_mtl_core_failed"),
+        "a second check on the same pipeline must not be latched away:\n{body}"
+    );
+
+    // Success never reaches the sink — `Emit::refusal` has no line to send for
+    // `Ok`, so the carve-out is enforced by the type rather than by a `return`
+    // a future arm could forget.
+    let before = sink_body().matches("draw_encode_fail").count();
+    note_draw_encode_fail(task, pipe, EncodeStatus::Ok, 0, 1);
+    assert_eq!(
+        sink_body().matches("draw_encode_fail").count(),
+        before,
+        "an Ok encode logged a failure line"
+    );
+}
+
+#[test]
+fn zero_ref_render_bind_unbinds_existing_slots() {
+    // wire opcodes via wire_render import
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let host = FakeHost::new();
+    let mut out = ExecResult::default();
+    let mut acc = StreamAccum::default();
+    let mut buffer = vec![0u8; OP_HEADER_LEN + 8 + 12];
+    st32(&mut buffer[0..], wire_render::OPCODE_SET_VERTEX_BUFFER);
+    st32(&mut buffer[4..], (OP_HEADER_LEN + 8 + 12) as u32);
+    st32(&mut buffer[8..], 0);
+    st32(&mut buffer[12..], 1);
+    st32(&mut buffer[16..], 41);
+    handle_render_record(
+        &mut state,
+        &host,
+        0,
+        wire_render::OPCODE_SET_VERTEX_BUFFER,
+        &buffer,
+        &mut out,
+        &mut acc,
+    );
+    st32(&mut buffer[16..], 0);
+    handle_render_record(
+        &mut state,
+        &host,
+        0,
+        wire_render::OPCODE_SET_VERTEX_BUFFER,
+        &buffer,
+        &mut out,
+        &mut acc,
+    );
+    assert!(acc.vertex_buffers.is_empty());
+
+    for (opcode, bound) in [
+        (wire_render::OPCODE_SET_FRAGMENT_TEXTURE, 42u32),
+        (wire_render::OPCODE_SET_FRAGMENT_SAMPLER, 43u32),
+    ] {
+        let mut command = vec![0u8; OP_HEADER_LEN + 8 + 4];
+        st32(&mut command[0..], opcode);
+        st32(&mut command[4..], (OP_HEADER_LEN + 8 + 4) as u32);
+        st32(&mut command[8..], 3);
+        st32(&mut command[12..], 1);
+        st32(&mut command[16..], bound);
+        handle_render_record(&mut state, &host, 0, opcode, &command, &mut out, &mut acc);
+        st32(&mut command[16..], 0);
+        handle_render_record(&mut state, &host, 0, opcode, &command, &mut out, &mut acc);
+    }
+    assert!(acc.fragment_textures.is_empty());
+    assert!(acc.fragment_samplers.is_empty());
+    assert_eq!(out.buffer_unbinds, 1);
+    assert_eq!(out.texture_unbinds, 1);
+    assert_eq!(out.sampler_unbinds, 1);
+}
+
+/// x86 type-4 display mid: clear-only stream must Store solid BGRA into pages.
+#[test]
+fn clear_only_type4_surface_writes_guest_pages() {
+    use crate::contract::endian::{st32, st64};
+    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::runtime::decode::render::ColorAttachment;
+    use crate::runtime::objects::{self, OBJECT_TYPE_SURFACE};
+
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    state.page_shift = PAGE_SHIFT_X86;
+    // Surface pages at pfn 0x40 (one 4K page is enough for 16×16).
+    let page = 0x40u64 << PAGE_SHIFT_X86;
+    host.map_range(page, 0x2000, 0);
+    // Task directory so object-list GVA reads work.
+    let dir_gpa = 2u64 << PAGE_SHIFT_X86;
+    let root_gpa = 3u64 << PAGE_SHIFT_X86;
+    let data_gpa = 4u64 << PAGE_SHIFT_X86;
+    host.map_range(dir_gpa, 0x20, 0);
+    host.map_range(root_gpa, 0x1000, 0);
+    host.map_range(data_gpa, 0x200, 0);
+    let mut d = [0u8; 8];
+    st32(&mut d[DIRECTORY_ROOT_PFN as usize..], 3);
+    st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
+    let _ = host.write_gpa(dir_gpa, &d);
+    st32(&mut d[..4], 4);
+    let _ = host.write_gpa(root_gpa, &d[..4]);
+    // Map the backing GVA page onto the surface pages. The device refuses a
+    // backing it cannot translate rather than reusing the GVA as a GPA, so
+    // the task's page table has to carry this the way a guest's does.
+    st32(&mut d[..4], 0x40);
+    let _ = host.write_gpa(root_gpa + 0x40 * 4, &d[..4]);
+    assert!(state.define_task(1, 0x1000, 2));
+    assert!(state.set_object_list(1, 0, 8));
+    // Type-4 at surface_id=5.
+    let mut entry = [0u8; 12];
+    st32(
+        &mut entry[0..],
+        (OBJECT_TYPE_SURFACE as u32) | (0x30u32 << 8),
+    );
+    entry[4..12].copy_from_slice(&0x80u64.to_le_bytes());
+    let _ = host.write_gpa(data_gpa + 5 * 12, &entry);
+    let mut desc = vec![0u8; 0x30];
+    st64(&mut desc[0..], 0x1000);
+    st32(&mut desc[8..], 0x40); // identity pfn
+    st32(&mut desc[0xc..], 0x4247_5241); // 'BGRA'
+    desc[0x10] = 1;
+    st32(&mut desc[0x18..], 16);
+    st32(&mut desc[0x1c..], 16);
+    st32(&mut desc[0x20..], 64);
+    let _ = host.write_gpa(data_gpa + 0x80, &desc);
+
+    assert!(objects::resolve_type4_surface(&mut state, &host, 5));
+    let mut out = ExecResult::default();
+    let mut acc = StreamAccum::default();
+    acc.clears.push(ColorAttachment {
+        texture_ref: 5,
+        resolve_texture_ref: 0,
+        level: 0,
+        slice: 0,
+        depth_plane: 0,
+        load_action: PASS_LOAD_ACTION_CLEAR,
+        store_action: PASS_STORE_ACTION_STORE,
+        clear_color: [1.0, 0.0, 0.0, 1.0], // red → BGRA (0,0,255,255)
+    });
+    finish_stream(&mut state, &mut host, 1, &mut out, &acc);
+    assert!(
+        out.clears_applied >= 1,
+        "type-4 clear must apply, got {}",
+        out.clears_applied
+    );
+    // Read first pixel from guest page (BGRA).
+    let mut px = [0u8; 4];
+    assert!(host.read_gpa(page, &mut px).is_ok());
+    assert_eq!(px, [0, 0, 255, 255], "expected opaque red BGRA, got {px:?}");
+    let m = state.mappings.get(&5).expect("mapping");
+    assert!(m.content_generation > 0 || m.mapped);
+    let _ = PAGE_ENTRY_VALID;
+    let _ = PAGE_ENTRY_PFN_SHIFT;
+}
+
+/// Archive DrawJob: clear-only packets store immediately; multi-draw packets
+/// keep CLEAR as private Metal seed (no pre-draw guest clear).
+#[test]
+fn finish_stream_clear_only_branch_without_draws() {
+    use crate::runtime::decode::render::ColorAttachment;
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let mut out = ExecResult::default();
+    let mut acc = StreamAccum::default();
+    acc.clears.push(ColorAttachment {
+        texture_ref: 99,
+        resolve_texture_ref: 0,
+        level: 0,
+        slice: 0,
+        depth_plane: 0,
+        load_action: PASS_LOAD_ACTION_CLEAR,
+        store_action: PASS_STORE_ACTION_STORE,
+        clear_color: [0.0, 0.0, 0.0, 1.0],
+    });
+    // No draws → clear-only branch (attempts apply_clear; unresolvable ref).
+    finish_stream(&mut state, &mut host, 1, &mut out, &acc);
+    assert_eq!(out.metal_draws_ok, 0);
+    assert_eq!(out.metal_draws_fail, 0);
+}
+
+#[test]
+fn finish_stream_with_draws_skips_guest_clear_prelude() {
+    use crate::runtime::decode::render::ColorAttachment;
+    use crate::runtime::metal_draw::BufferBind;
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let mut out = ExecResult::default();
+    let mut acc = StreamAccum::default();
+    let att = ColorAttachment {
+        texture_ref: 99,
+        resolve_texture_ref: 0,
+        level: 0,
+        slice: 0,
+        depth_plane: 0,
+        load_action: PASS_LOAD_ACTION_CLEAR,
+        store_action: PASS_STORE_ACTION_STORE,
+        clear_color: [1.0, 0.0, 0.0, 1.0],
+    };
+    acc.clears.push(att);
+    acc.saw_draw = true;
+    acc.color_slots.push((0, att));
+    acc.draws.push(PendingDraw {
+        pipeline_ref: 1,
+        draw: DrawArgs {
+            vertex_count: 3,
+            instance_count: 1,
+            primitive_type: 3,
+            first_vertex: 0,
+            base_instance: 0,
+        },
+        indexed: None,
+        vertex_buffers: Arc::new(vec![BufferBind {
+            index: 0,
+            buffer_ref: 1,
+            offset: 0,
+        }]),
+        fragment_buffers: Arc::default(),
+        vertex_textures: Arc::default(),
+        fragment_textures: Arc::default(),
+        vertex_samplers: Arc::default(),
+        fragment_samplers: Arc::default(),
+        viewport: None,
+        scissor: None,
+        blend_color: None,
+        cull_mode: None,
+        front_facing: None,
+        depth_bias: None,
+        depth_stencil_ref: 0,
+        stencil_ref: None,
+        depth_attach: None,
+        stencil_attach: None,
+    });
+    finish_stream(&mut state, &mut host, 1, &mut out, &acc);
+    // Unresolvable RT → mrt_request fail before encode (not NoMetal); no clear.
+    assert_eq!(
+        out.clears_applied, 0,
+        "unresolvable multi-draw must not guest-clear"
+    );
+}
+
+/// Linux NoMetal: draws fail but CLEAR seed still Stores into type-4 pages.
+#[test]
+fn nometal_draw_falls_back_to_type4_clear() {
+    use crate::contract::endian::{st32, st64};
+    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+    use crate::runtime::decode::render::ColorAttachment;
+    use crate::runtime::metal_draw::BufferBind;
+    use crate::runtime::objects::{self, OBJECT_TYPE_SURFACE};
+
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    state.page_shift = PAGE_SHIFT_X86;
+    let page = 0x50u64 << PAGE_SHIFT_X86;
+    host.map_range(page, 0x2000, 0);
+    let dir_gpa = 2u64 << PAGE_SHIFT_X86;
+    let root_gpa = 3u64 << PAGE_SHIFT_X86;
+    let data_gpa = 4u64 << PAGE_SHIFT_X86;
+    host.map_range(dir_gpa, 0x20, 0);
+    host.map_range(root_gpa, 0x1000, 0);
+    host.map_range(data_gpa, 0x200, 0);
+    let mut d = [0u8; 8];
+    st32(&mut d[DIRECTORY_ROOT_PFN as usize..], 3);
+    st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
+    let _ = host.write_gpa(dir_gpa, &d);
+    st32(&mut d[..4], 4);
+    let _ = host.write_gpa(root_gpa, &d[..4]);
+    // As above: the backing GVA has to translate, not be assumed identity.
+    st32(&mut d[..4], 0x50);
+    let _ = host.write_gpa(root_gpa + 0x50 * 4, &d[..4]);
+    assert!(state.define_task(1, 0x1000, 2));
+    assert!(state.set_object_list(1, 0, 8));
+    let mut entry = [0u8; 12];
+    st32(
+        &mut entry[0..],
+        (OBJECT_TYPE_SURFACE as u32) | (0x30u32 << 8),
+    );
+    entry[4..12].copy_from_slice(&0x80u64.to_le_bytes());
+    let _ = host.write_gpa(data_gpa + 5 * 12, &entry);
+    let mut desc = vec![0u8; 0x30];
+    st64(&mut desc[0..], 0x1000);
+    st32(&mut desc[8..], 0x50);
+    st32(&mut desc[0xc..], 0x4247_5241);
+    desc[0x10] = 1;
+    st32(&mut desc[0x18..], 16);
+    st32(&mut desc[0x1c..], 16);
+    st32(&mut desc[0x20..], 64);
+    let _ = host.write_gpa(data_gpa + 0x80, &desc);
+    assert!(objects::resolve_type4_surface(&mut state, &host, 5));
+
+    let mut out = ExecResult::default();
+    let mut acc = StreamAccum::default();
+    let att = ColorAttachment {
+        texture_ref: 5,
+        resolve_texture_ref: 0,
+        level: 0,
+        slice: 0,
+        depth_plane: 0,
+        load_action: PASS_LOAD_ACTION_CLEAR,
+        store_action: PASS_STORE_ACTION_STORE,
+        clear_color: [0.0, 1.0, 0.0, 1.0], // green
+    };
+    acc.clears.push(att);
+    acc.saw_draw = true;
+    acc.color_slots.push((0, att));
+    acc.draws.push(PendingDraw {
+        pipeline_ref: 7,
+        draw: DrawArgs {
+            vertex_count: 3,
+            instance_count: 1,
+            primitive_type: 3,
+            first_vertex: 0,
+            base_instance: 0,
+        },
+        indexed: None,
+        vertex_buffers: Arc::new(vec![BufferBind {
+            index: 0,
+            buffer_ref: 1,
+            offset: 0,
+        }]),
+        fragment_buffers: Arc::default(),
+        vertex_textures: Arc::default(),
+        fragment_textures: Arc::default(),
+        vertex_samplers: Arc::default(),
+        fragment_samplers: Arc::default(),
+        viewport: None,
+        scissor: None,
+        blend_color: None,
+        cull_mode: None,
+        front_facing: None,
+        depth_bias: None,
+        depth_stencil_ref: 0,
+        stencil_ref: None,
+        depth_attach: None,
+        stencil_attach: None,
+    });
+    let mut second = acc.draws[0].clone();
+    second.pipeline_ref = 8;
+    acc.draws.push(second);
+    finish_stream(&mut state, &mut host, 1, &mut out, &acc);
+    assert_eq!(
+        out.render_attachment_resolves, 1,
+        "one render stream resolves its fixed attachment set once"
+    );
+    // Non-Apple: Linux encode Stores CLEAR load into type-4 (Ok) or
+    // NoMetal clear fallback — either path must land green BGRA.
+    #[cfg(feature = "backend-vulkan")]
+    {
+        assert!(
+            out.metal_draws_ok >= 1 || out.clears_applied >= 1 || out.metal_draws_fail >= 1,
+            "expected clear store path: ok={} clear={} fail={}",
+            out.metal_draws_ok,
+            out.clears_applied,
+            out.metal_draws_fail
+        );
+        let mut px = [0u8; 4];
+        assert!(host.read_gpa(page, &mut px).is_ok());
+        // BGRA green = [0, 255, 0, 255]
+        assert_eq!(px, [0, 255, 0, 255], "got {px:?}");
+    }
+}
+
+/// Multi-draw packets force full-frame store on the final record even when
+/// that draw carries a partial scissor (dock damage over chained wallpaper).
+#[test]
+fn multi_draw_force_full_store_flag_for_chained_packet() {
+    assert_eq!(multi_draw_store_plan(0, 0), (false, false));
+    assert_eq!(multi_draw_store_plan(1, 0), (true, false));
+    assert_eq!(multi_draw_store_plan(3, 0), (false, false));
+    assert_eq!(multi_draw_store_plan(3, 1), (false, false));
+    assert_eq!(multi_draw_store_plan(3, 2), (true, true));
+}
+
+/// qemu-shim style: multi-draw plan is one guest writeback on the last record
+/// only, with force_full so a partial scissor cannot leave wallpaper only in
+/// host chain memory (archive DrawJob single completion writeback).
+#[test]
+fn multi_draw_store_plan_matches_archive_drawjob_writeback() {
+    // Every packet size and every record within it. The whole contract is two
+    // predicates over (draw_count, di), so stating it over a range costs
+    // nothing and covers the boundary at draw_count == 1, where force_full
+    // flips — which one packet of five does not reach.
+    for n in 1..8usize {
+        for di in 0..n {
+            let (wb, full) = multi_draw_store_plan(n, di);
+            let last = di + 1 == n;
+            assert_eq!(
+                wb, last,
+                "writeback is the last record only (n={n} di={di})"
+            );
+            assert_eq!(
+                full,
+                last && n > 1,
+                "force_full on the last record of a multi-draw packet only \
+                 (n={n} di={di}); a single-draw packet may keep a local scissor"
+            );
+        }
+    }
+    assert_eq!(
+        multi_draw_store_plan(0, 0),
+        (false, false),
+        "an empty packet writes nothing back"
+    );
+}
+
+#[test]
+fn multi_draw_chain_source_preserves_portable_unified_output() {
+    assert_eq!(
+        multi_draw_chain_source(true, false),
+        MultiDrawChainSource::Resident
+    );
+    assert_eq!(
+        multi_draw_chain_source(false, true),
+        MultiDrawChainSource::Cpu
+    );
+    assert_eq!(
+        multi_draw_chain_source(false, false),
+        MultiDrawChainSource::Missing
+    );
+}
+
+#[test]
+fn render_pass_template_reuses_attachment_without_load_seed() {
+    let first = metal_draw::DrawEncodeRequest {
+        task_id: 1,
+        pipeline_ref: 7,
+        vertex_count: 3,
+        instance_count: 1,
+        primitive_type: 3,
+        colors: vec![metal_draw::ColorRtRequest {
+            slot: 0,
+            texture_ref: 11,
+            mapping_id: 3,
+            target_gva: 0,
+            row_stride: 0,
+            width: 1920,
+            height: 1080,
+            format: 0x50,
+            load_action: PASS_LOAD_ACTION_CLEAR,
+            store_action: PASS_STORE_ACTION_STORE,
+            clear_color: [0.1, 0.2, 0.3, 1.0],
+            target_seed_rgba: Some(vec![0xbb; 16]),
+        }],
+        ..Default::default()
+    };
+    let template = render_pass_attachment_template(&first);
+    assert!(template.colors[0].target_seed_rgba.is_none());
+    assert_eq!(template.colors[0].load_action, PASS_LOAD_ACTION_LOAD);
+    assert_eq!(template.colors[0].mapping_id, 3);
+    assert_eq!(
+        (template.colors[0].width, template.colors[0].height),
+        (1920, 1080)
+    );
+
+    let draw = PendingDraw {
+        pipeline_ref: 42,
+        draw: DrawArgs {
+            vertex_count: 6,
+            instance_count: 2,
+            primitive_type: 4,
+            first_vertex: 9,
+            base_instance: 0,
+        },
+        ..Default::default()
+    };
+    let req = retarget_render_pass_draw(&template, &draw);
+    assert_eq!(req.pipeline_ref, 42);
+    assert_eq!(
+        (
+            req.vertex_count,
+            req.instance_count,
+            req.primitive_type,
+            req.first_vertex
+        ),
+        (6, 2, 4, 9)
+    );
+    assert_eq!(req.colors.len(), 1);
+    assert_eq!(req.colors[0].mapping_id, 3);
+    assert_eq!(
+        first.colors[0].target_seed_rgba.as_ref().map(Vec::len),
+        Some(16)
+    );
+}
+
+#[test]
+fn dropped_clear_logs_once_per_reason_target() {
+    // Unique keys per case so no shared-static reset is needed (the dedup set
+    // is process-global). First sighting of a (reason, tex_ref) emits (true);
+    // an immediate repeat is suppressed (false); a distinct target logs again.
+    assert!(note_clear_dropped(
+        "nonstore_store_action",
+        0x9001,
+        "store_action=0 load_action=clear"
+    ));
+    assert!(!note_clear_dropped(
+        "nonstore_store_action",
+        0x9001,
+        "store_action=0 load_action=clear"
+    ));
+    assert!(note_clear_dropped(
+        "nonstore_store_action",
+        0x9002,
+        "store_action=0 load_action=clear"
+    ));
+    // A different reason on the same target is a distinct blind spot and logs.
+    assert!(note_clear_dropped(
+        "target_unresolved",
+        0x9001,
+        "color_target_request=none"
+    ));
+    assert!(!note_clear_dropped(
+        "target_unresolved",
+        0x9001,
+        "color_target_request=none"
+    ));
+}
+
+/// A plural viewport or scissor applies its first entry and counts the rest.
+///
+/// Before `0x83`/`0x76` were decoded the whole record reached no arm, so a
+/// guest setting its viewport through `setViewports:count:` got none at all.
+/// Now it gets the first, and the counter says what a viewport-array model
+/// would have to hold.
+#[test]
+fn a_plural_viewport_or_scissor_applies_one_and_counts_the_rest() {
+    use crate::contract::endian::st64;
+    use crate::runtime::drain::store_route_count;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let host = FakeHost::new();
+    let mut out = ExecResult::default();
+    let mut acc = StreamAccum::default();
+
+    let op = wire_render::OPCODE_SET_SCISSOR_RECTS;
+    let total = reims_vgpu_wire::OP_HEADER_LEN
+        + render::SCISSOR_RECTS_COUNT_LEN
+        + 3 * render::SCISSOR_PAYLOAD_LEN;
+    let mut command = vec![0u8; total];
+    st32(&mut command[0..], op);
+    st32(&mut command[4..], total as u32);
+    st64(&mut command[reims_vgpu_wire::OP_HEADER_LEN..], 3);
+    let e0 = reims_vgpu_wire::OP_HEADER_LEN + render::SCISSOR_RECTS_COUNT_LEN;
+    for (i, val) in [11u64, 22, 33, 44].into_iter().enumerate() {
+        st64(&mut command[e0 + i * 8..], val);
+    }
+
+    let before = store_route_count("render_extra_scissors_dropped");
+    handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
+    assert_eq!(
+        acc.scissor,
+        Some(ScissorRect {
+            x: 11,
+            y: 22,
+            width: 33,
+            height: 44
+        }),
+        "the first rect must reach the accumulator"
+    );
+    assert_eq!(
+        store_route_count("render_extra_scissors_dropped") - before,
+        2,
+        "the counter must name the entries dropped, not the record"
+    );
+
+    // One entry is the singular record and drops nothing.
+    let before = store_route_count("render_extra_scissors_dropped");
+    let total = reims_vgpu_wire::OP_HEADER_LEN + render::SCISSOR_PAYLOAD_LEN;
+    let mut command = vec![0u8; total];
+    let op = wire_render::OPCODE_SET_SCISSOR;
+    st32(&mut command[0..], op);
+    st32(&mut command[4..], total as u32);
+    for (i, val) in [1u64, 2, 3, 4].into_iter().enumerate() {
+        st64(&mut command[reims_vgpu_wire::OP_HEADER_LEN + i * 8..], val);
+    }
+    handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
+    assert_eq!(
+        acc.scissor,
+        Some(ScissorRect {
+            x: 1,
+            y: 2,
+            width: 3,
+            height: 4
+        })
+    );
+    assert_eq!(store_route_count("render_extra_scissors_dropped"), before);
+}
+
+/// A bind past the table's last slot says how many slots it dropped, and
+/// which of the three tables lost them.
+///
+/// Apple's serializer produces `setVertexTextures:withRange:` over a range
+/// of 40, and `MAX_BIND_SLOTS` is 31 — Metal's *buffer* index cap, applied
+/// to a texture table whose real limit is 128. So the walk ends early on
+/// traffic a guest actually sends, and it used to end with a bare `break`.
+/// The count is the argument for widening the tables, so it has to be the
+/// number of slots lost rather than one event — and it has to name the
+/// table, because the three do not lose the same thing. The sibling slugs
+/// must stay still while the texture one moves; a shared counter that
+/// incremented for all three is what this replaced.
+#[test]
+fn a_bind_past_the_last_table_slot_reports_what_it_dropped() {
+    use crate::runtime::drain::store_route_count;
+
+    const COUNT: u32 = 40;
+    let entry = render::REF_BIND_ENTRY_SIZE;
+    let total = reims_vgpu_wire::OP_HEADER_LEN + render::BIND_ENTRIES + (COUNT as usize) * entry;
+    let mut command = vec![0u8; total];
+    let op = wire_render::OPCODE_SET_VERTEX_TEXTURE;
+    st32(&mut command[0..], op);
+    st32(&mut command[4..], total as u32);
+    st32(
+        &mut command[reims_vgpu_wire::OP_HEADER_LEN + render::BIND_FIRST..],
+        0,
+    );
+    st32(
+        &mut command[reims_vgpu_wire::OP_HEADER_LEN + render::BIND_COUNT..],
+        COUNT,
+    );
+    for i in 0..COUNT as usize {
+        let at = reims_vgpu_wire::OP_HEADER_LEN + render::BIND_ENTRIES + i * entry;
+        st32(&mut command[at..], 0x4000 + i as u32);
+    }
+
+    // The record itself must survive decode; a cap that refused it whole is
+    // what this counter exists to distinguish from.
+    let c = render::decode(&command).expect("forty texture binds must decode");
+    assert_eq!(c.ref_binds.len(), COUNT as usize);
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let host = FakeHost::new();
+    let mut out = ExecResult::default();
+    let mut acc = StreamAccum::default();
+    let before = store_route_count(BindClass::Texture.past_table_route());
+    let before_buf = store_route_count(BindClass::Buffer.past_table_route());
+    let before_smp = store_route_count(BindClass::Sampler.past_table_route());
+    handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
+    assert_eq!(
+        store_route_count(BindClass::Texture.past_table_route()) - before,
+        (COUNT - MAX_BIND_SLOTS) as u64,
+        "the counter must name every slot dropped, not the one event"
+    );
+    assert_eq!(
+        store_route_count(BindClass::Buffer.past_table_route()),
+        before_buf,
+        "a texture bind must not move the buffer table's counter"
+    );
+    assert_eq!(
+        store_route_count(BindClass::Sampler.past_table_route()),
+        before_smp,
+        "a texture bind must not move the sampler table's counter"
+    );
+    assert_eq!(
+        acc.vertex_textures.len(),
+        MAX_BIND_SLOTS as usize,
+        "every slot the table does hold must still be bound"
+    );
+}
+
+/// A bind at the last slot Apple's *sampler* table can name still binds.
+///
+/// The three classes now carry three counters, and the risk that creates is
+/// the opposite of the one it fixes: a per-class slug invites a per-class
+/// *bound*, and bounding a table by what Apple's serializer emits is the
+/// mistake [`reims_vgpu_wire::ops::bind_limit`]'s own doc names — it would
+/// refuse a guest that writes its own stream. So the bound stays one number
+/// and this pins that it did: a sampler at index 20, which is above Apple's
+/// 16-entry sampler table and below [`MAX_BIND_SLOTS`], binds rather than
+/// being counted away.
+#[test]
+fn a_sampler_above_apples_table_but_inside_ours_still_binds() {
+    use crate::runtime::drain::store_route_count;
+    use reims_vgpu_wire::ops::bind_limit;
+
+    const FIRST: u32 = 20;
+    const { assert!(FIRST >= bind_limit::SAMPLER && FIRST < MAX_BIND_SLOTS) };
+
+    let entry = render::REF_BIND_ENTRY_SIZE;
+    let total = reims_vgpu_wire::OP_HEADER_LEN + render::BIND_ENTRIES + entry;
+    let mut command = vec![0u8; total];
+    let op = wire_render::OPCODE_SET_VERTEX_SAMPLER;
+    st32(&mut command[0..], op);
+    st32(&mut command[4..], total as u32);
+    st32(
+        &mut command[reims_vgpu_wire::OP_HEADER_LEN + render::BIND_FIRST..],
+        FIRST,
+    );
+    st32(
+        &mut command[reims_vgpu_wire::OP_HEADER_LEN + render::BIND_COUNT..],
+        1,
+    );
+    st32(
+        &mut command[reims_vgpu_wire::OP_HEADER_LEN + render::BIND_ENTRIES..],
+        0x3333,
+    );
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let host = FakeHost::new();
+    let mut out = ExecResult::default();
+    let mut acc = StreamAccum::default();
+    let before = store_route_count(BindClass::Sampler.past_table_route());
+    handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
+
+    assert_eq!(
+        store_route_count(BindClass::Sampler.past_table_route()),
+        before,
+        "the bound is the host table, not Apple's — this slot is inside it"
+    );
+    assert_eq!(
+        acc.vertex_samplers
+            .iter()
+            .map(|s| s.index)
+            .collect::<Vec<_>>(),
+        vec![FIRST]
+    );
+}
+
+/// Every bind record lands in exactly one reach band, and the top band
+/// fires on the same records the drop counter counts slots for.
+///
+/// The bands are what make a zero from `*_bind_slot_past_table` readable: a
+/// workload whose every record stops at slot 4 and one whose every record
+/// stops at slot 30 both drop nothing, and only the second says the bound
+/// is nearly spent. So the band has to be chosen from the reach the guest
+/// *asked for*, before the walk truncates it — which is what the `le_table`
+/// case below would catch if the census moved inside the loop.
+#[test]
+fn every_bind_record_lands_in_one_reach_band_and_the_top_one_reconciles() {
+    use crate::runtime::drain::store_route_count;
+    use reims_vgpu_wire::ops::bind_limit;
+
+    let texture_record = |first: u32, count: u32| {
+        let entry = render::REF_BIND_ENTRY_SIZE;
+        let total =
+            reims_vgpu_wire::OP_HEADER_LEN + render::BIND_ENTRIES + (count as usize) * entry;
+        let mut command = vec![0u8; total];
+        let op = wire_render::OPCODE_SET_VERTEX_TEXTURE;
+        st32(&mut command[0..], op);
+        st32(&mut command[4..], total as u32);
+        st32(
+            &mut command[reims_vgpu_wire::OP_HEADER_LEN + render::BIND_FIRST..],
+            first,
+        );
+        st32(
+            &mut command[reims_vgpu_wire::OP_HEADER_LEN + render::BIND_COUNT..],
+            count,
+        );
+        for i in 0..count as usize {
+            let at = reims_vgpu_wire::OP_HEADER_LEN + render::BIND_ENTRIES + i * entry;
+            st32(&mut command[at..], 0x4000 + i as u32);
+        }
+        (op, command)
+    };
+
+    let bands = [
+        "render_bind_reach_texture_le16",
+        "render_bind_reach_texture_le_table",
+        "render_bind_reach_texture_over_table",
+    ];
+    let read = || bands.map(store_route_count);
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let host = FakeHost::new();
+    let mut out = ExecResult::default();
+    let mut acc = StreamAccum::default();
+
+    // Reach exactly Apple's sampler-table size: the lowest band, inclusive.
+    let before = read();
+    let (op, command) = texture_record(0, bind_limit::SAMPLER);
+    handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
+    assert_eq!(
+        read()
+            .iter()
+            .zip(before)
+            .map(|(a, b)| a - b)
+            .collect::<Vec<_>>(),
+        vec![1, 0, 0],
+        "a reach of exactly {} is inside every one of Apple's tables",
+        bind_limit::SAMPLER
+    );
+
+    // One past it, still inside this device's table.
+    let before = read();
+    let (op, command) = texture_record(0, bind_limit::SAMPLER + 1);
+    handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
+    assert_eq!(
+        read()
+            .iter()
+            .zip(before)
+            .map(|(a, b)| a - b)
+            .collect::<Vec<_>>(),
+        vec![0, 1, 0],
+        "one slot past Apple's sampler table is headroom being spent, not a loss"
+    );
+
+    // Past this device's table: the band and the slot counter must agree
+    // that the same record crossed, in their own units.
+    let before = read();
+    let before_slots = store_route_count(BindClass::Texture.past_table_route());
+    let (op, command) = texture_record(MAX_BIND_SLOTS - 1, 4);
+    handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
+    assert_eq!(
+        read()
+            .iter()
+            .zip(before)
+            .map(|(a, b)| a - b)
+            .collect::<Vec<_>>(),
+        vec![0, 0, 1],
+        "a record reaching past the bound is one record in the top band"
+    );
+    assert_eq!(
+        store_route_count(BindClass::Texture.past_table_route()) - before_slots,
+        3,
+        "and three slots in the drop counter — records here, slots there"
+    );
+}
+
+/// Two guarded arms used to drop a decoded record into the `_ => {}`
+/// catch-all, and both now name what they did instead.
+///
+/// The five `has_*` guards beside them are the decoder saying a field was
+/// absent, so falling through those costs nothing. These two tested decoded
+/// *values*, which is a different thing: an empty scissor leaves the
+/// previous rect clipping later draws, and an ICB execute naming no buffer
+/// loses the whole batch that buffer holds.
+#[test]
+fn a_decoded_record_that_no_arm_applies_names_what_happened_instead() {
+    use crate::runtime::drain::store_route_count;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let host = FakeHost::new();
+    let mut out = ExecResult::default();
+    let mut acc = StreamAccum::default();
+
+    // `MTLScissorRect` is four NSUInteger. Set a real rect, then replace it
+    // with an empty one and check the real one is what survives.
+    let scissor = |w: u64, h: u64| {
+        let total = wire_render::SET_SCISSOR_TOTAL_LEN as usize;
+        let mut command = vec![0u8; total];
+        let op = wire_render::OPCODE_SET_SCISSOR;
+        st32(&mut command[0..], op);
+        st32(&mut command[4..], total as u32);
+        let p = reims_vgpu_wire::OP_HEADER_LEN;
+        st64(&mut command[p..], 7);
+        st64(&mut command[p + 8..], 9);
+        st64(&mut command[p + 16..], w);
+        st64(&mut command[p + 24..], h);
+        (op, command)
+    };
+    let (op, command) = scissor(64, 32);
+    handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
+    assert_eq!(
+        acc.scissor,
+        Some(ScissorRect {
+            x: 7,
+            y: 9,
+            width: 64,
+            height: 32
+        })
+    );
+
+    let before = store_route_count("render_scissor_empty_kept_previous");
+    let (op, command) = scissor(0, 32);
+    handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
+    assert_eq!(
+        store_route_count("render_scissor_empty_kept_previous") - before,
+        1,
+        "an empty scissor must name itself"
+    );
+    assert_eq!(
+        acc.scissor,
+        Some(ScissorRect {
+            x: 7,
+            y: 9,
+            width: 64,
+            height: 32
+        }),
+        "and behaviour is unchanged: the previous rect is still what is kept"
+    );
+
+    // `executeCommandsInBuffer:` naming no buffer.
+    let before = store_route_count("render_icb_execute_unnamed");
+    let total = wire_render::EXECUTE_COMMANDS_INDIRECT_TOTAL_LEN as usize;
+    let mut command = vec![0u8; total];
+    let op = wire_render::OPCODE_EXECUTE_COMMANDS_INDIRECT;
+    st32(&mut command[0..], op);
+    st32(&mut command[4..], total as u32);
+    handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
+    assert_eq!(
+        store_route_count("render_icb_execute_unnamed") - before,
+        1,
+        "an ICB execute naming no buffer loses the whole batch and must say so"
+    );
+    assert!(
+        acc.execute_icb.is_none(),
+        "and still does not queue an execute against ref 0"
+    );
+
+    let log = std::fs::read_to_string(crate::observe::fail_log_path()).expect("fail log");
+    assert!(log.contains("reason=render_scissor_empty_kept_previous"));
+    assert!(log.contains("reason=render_icb_execute_unnamed"));
+}
+
+/// A buffer-offset record that lands on nothing says so, both ways.
+///
+/// `setVertexBufferOffset:atIndex:` is the second record the guest spends on
+/// a slot, and both of its miss paths were silent: an index past the table,
+/// and an index inside it whose slot this device never bound. The second is
+/// the sharper one — Metal requires a live bind at that index and encoder
+/// state does not outlive the encoder, so a firing means this device's table
+/// and the guest's disagree.
+#[test]
+fn a_buffer_offset_that_lands_on_nothing_reports_which_way_it_missed() {
+    use crate::runtime::drain::store_route_count;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let host = FakeHost::new();
+    let mut out = ExecResult::default();
+    let mut acc = StreamAccum::default();
+
+    // index:u32 @0, offset:u64 @4 — a different payload shape from the plural
+    // binds, which is why it takes its own offsets rather than `BIND_*`.
+    let offset_record = |index: u32| {
+        let total = reims_vgpu_wire::OP_HEADER_LEN + render::BUFFER_OFFSET_PAYLOAD_LEN;
+        let mut command = vec![0u8; total];
+        let op = wire_render::OPCODE_SET_VERTEX_BUFFER_OFFSET;
+        st32(&mut command[0..], op);
+        st32(&mut command[4..], total as u32);
+        st32(
+            &mut command[reims_vgpu_wire::OP_HEADER_LEN + render::BUFFER_OFFSET_INDEX..],
+            index,
+        );
+        st64(
+            &mut command[reims_vgpu_wire::OP_HEADER_LEN + render::BUFFER_OFFSET_VALUE..],
+            0x5555,
+        );
+        (op, command)
+    };
+
+    // Inside the table, but nothing is bound there.
+    let before_unbound = store_route_count("render_buffer_offset_slot_unbound");
+    let (op, command) = offset_record(3);
+    handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
+    assert_eq!(
+        store_route_count("render_buffer_offset_slot_unbound") - before_unbound,
+        1,
+        "an offset for a slot this device never bound must be named"
+    );
+
+    // Past the table entirely.
+    let before_past = store_route_count("render_buffer_offset_slot_past_table");
+    let (op, command) = offset_record(MAX_BIND_SLOTS + 4);
+    handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
+    assert_eq!(
+        store_route_count("render_buffer_offset_slot_past_table") - before_past,
+        1,
+        "an offset past the table bound must be named separately"
+    );
+    assert_eq!(
+        store_route_count("render_buffer_offset_slot_unbound") - before_unbound,
+        1,
+        "a slot past the table is not also an unbound slot inside it"
+    );
+}
+
+/// The records this rail answers by doing nothing still say they arrived.
+///
+/// `UseResource`, `UseHeap` and `Barrier` all reached the dispatch's
+/// catch-all, so a guest's residency declaration and its barriers were
+/// indistinguishable from a record that had been executed — the arm they
+/// fell into was shared with `Kind::Unknown` and with every guarded arm's
+/// else-case. Doing nothing is still the answer; being silent about it is
+/// not, and a counter nobody reads back cannot show it is wired up.
+#[test]
+fn a_residency_or_barrier_record_is_counted_rather_than_dropped_in_silence() {
+    use crate::runtime::drain::store_route_count;
+
+    for (op, route, payload_len) in [
+        (
+            wire_render::OPCODE_USE_RESOURCE,
+            "render_noop_residency_hint",
+            render::USE_RESOURCE_REFS + 4,
+        ),
+        (
+            wire_render::OPCODE_USE_HEAP,
+            "render_noop_residency_hint",
+            render::USE_HEAP_REFS + 4,
+        ),
+        (
+            wire_render::OPCODE_MEMORY_BARRIER_RESOURCES,
+            "render_noop_barrier",
+            0,
+        ),
+        (
+            wire_render::OPCODE_MEMORY_BARRIER_SCOPE,
+            "render_noop_barrier",
+            0,
+        ),
+    ] {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let host = FakeHost::new();
+        let mut out = ExecResult::default();
+        let mut acc = StreamAccum::default();
+
+        let total = reims_vgpu_wire::OP_HEADER_LEN + payload_len;
+        let mut command = vec![0u8; total];
+        st32(&mut command[0..], op);
+        st32(&mut command[4..], total as u32);
+        if payload_len > 0 {
+            // One resource named, so the count-led extent is satisfied.
+            st32(&mut command[reims_vgpu_wire::OP_HEADER_LEN..], 1);
+        }
+
+        let before = store_route_count(route);
+        handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
+        assert_eq!(
+            store_route_count(route),
+            before + 1,
+            "op {op:#x} did not reach {route}"
+        );
+    }
+}
+
+/// The three ICB blit records are told apart rather than refused as one.
+///
+/// They used to be declined before decode under a single shared reason,
+/// which said three different things with one word. Only two of them are
+/// losses: skipping Metal's optimize hint is semantically correct, while a
+/// dropped reset leaves commands live that the guest retired and a dropped
+/// copy leaves the destination holding what it held before. A counter that
+/// cannot tell those apart cannot answer the question they exist to answer.
+#[test]
+fn each_icb_blit_record_reaches_a_counter_that_names_which_one_it_is() {
+    use crate::contract::endian::st64;
+    use crate::runtime::drain::store_route_count;
+    use reims_vgpu_wire::ops::blit as wire;
+
+    let range = |op: u32| {
+        let total = wire::ICB_RANGE_TOTAL_LEN as usize;
+        let mut v = vec![0u8; total];
+        st32(&mut v[0..], op);
+        st32(&mut v[4..], total as u32);
+        st32(&mut v[reims_vgpu_wire::OP_HEADER_LEN..], 6161);
+        st64(&mut v[reims_vgpu_wire::OP_HEADER_LEN + 4..], 0x3300);
+        st64(&mut v[reims_vgpu_wire::OP_HEADER_LEN + 12..], 0x4400);
+        v
+    };
+    let copy = || {
+        let total = wire::COPY_ICB_TOTAL_LEN as usize;
+        let mut v = vec![0u8; total];
+        st32(&mut v[0..], wire_blit::OPCODE_COPY_ICB);
+        st32(&mut v[4..], total as u32);
+        st32(&mut v[reims_vgpu_wire::OP_HEADER_LEN..], 7171);
+        st32(&mut v[reims_vgpu_wire::OP_HEADER_LEN + 4..], 7272);
+        st64(&mut v[reims_vgpu_wire::OP_HEADER_LEN + 8..], 0x1100);
+        st64(&mut v[reims_vgpu_wire::OP_HEADER_LEN + 16..], 0x2200);
+        st64(&mut v[reims_vgpu_wire::OP_HEADER_LEN + 24..], 0x3300);
+        v
+    };
+
+    for (op, command, route) in [
+        (
+            wire_blit::OPCODE_OPTIMIZE_ICB,
+            range(wire_blit::OPCODE_OPTIMIZE_ICB),
+            "blit_noop_icb_optimize",
+        ),
+        (
+            wire_blit::OPCODE_RESET_ICB,
+            range(wire_blit::OPCODE_RESET_ICB),
+            "blit_icb_reset_dropped",
+        ),
+        (wire_blit::OPCODE_COPY_ICB, copy(), "blit_icb_copy_dropped"),
+    ] {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut host = FakeHost::new();
+        let before = store_route_count(route);
+        handle_blit_record(&mut state, &mut host, 1, op, &command);
+        assert_eq!(
+            store_route_count(route),
+            before + 1,
+            "op {op:#x} did not reach {route}"
+        );
+    }
+
+    // The optimize hint is the one that is *not* a loss, so it must not
+    // reach either of the dropped-work counters. Sharing one would put a
+    // correct no-op in the same bucket as stale commands executing.
+    for route in ["blit_icb_reset_dropped", "blit_icb_copy_dropped"] {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut host = FakeHost::new();
+        let before = store_route_count(route);
+        let command = range(wire_blit::OPCODE_OPTIMIZE_ICB);
+        handle_blit_record(
+            &mut state,
+            &mut host,
+            1,
+            wire_blit::OPCODE_OPTIMIZE_ICB,
+            &command,
+        );
+        assert_eq!(
+            store_route_count(route),
+            before,
+            "the optimize hint was counted as {route}"
+        );
+    }
+}
+
+/// The five `BlitEncoderSPI` records each reach a route that names them.
+///
+/// All five answered `blit_decode_unknown_opcode` until the wire capture
+/// drove this class with the capability forced on, and three of them are
+/// writes to guest-visible memory. The routes are not interchangeable and
+/// the test says so in both directions: the two texture fills are lost work
+/// and must not land on the invalidate's no-op counter, while the
+/// compressed-texture invalidate is a correct skip and must not land on
+/// either dropped-fill counter. Sharing one bucket would make a driven
+/// boot's reading unusable for deciding which executor to build.
+#[test]
+fn each_blit_spi_record_reaches_a_counter_that_names_which_one_it_is() {
+    use crate::contract::endian::st64;
+    use crate::runtime::drain::store_route_count;
+    use reims_vgpu_wire::ops::blit as wire;
+
+    // A texture fill of either form: identical through the region, then the
+    // tail that tells the two apart. Zero-filled past that, which is what
+    // the guest's staged-bytes fill of length 0 would look like — the
+    // routing under test is by opcode, not by any value in the tail.
+    let texture_fill = |op: u32, total: u32| {
+        let mut v = vec![0u8; total as usize];
+        st32(&mut v[0..], op);
+        st32(&mut v[4..], total);
+        let p = reims_vgpu_wire::OP_HEADER_LEN;
+        st32(&mut v[p..], 4242); // texture
+        st16(&mut v[p + 4..], 3); // level
+        st16(&mut v[p + 6..], 5); // slice
+        st64(&mut v[p + 8..], 0x44); // size w/h/d
+        st64(&mut v[p + 16..], 0x55);
+        st64(&mut v[p + 24..], 1);
+        st64(&mut v[p + 32..], 0x11); // origin x/y/z
+        st64(&mut v[p + 40..], 0x22);
+        st64(&mut v[p + 48..], 0x33);
+        v
+    };
+    let invalidate = |op: u32, total: u32| {
+        let mut v = vec![0u8; total as usize];
+        st32(&mut v[0..], op);
+        st32(&mut v[4..], total);
+        st32(&mut v[reims_vgpu_wire::OP_HEADER_LEN..], 4242);
+        v
+    };
+
+    const COLOR: &str = "blit_fill_texture_color_dropped";
+    const BYTES: &str = "blit_fill_texture_bytes_dropped";
+    const INVALID: &str = "blit_noop_invalidate_compressed";
+
+    for (op, command, route) in [
+        (
+            wire_blit::OPCODE_FILL_TEXTURE_COLOR,
+            texture_fill(
+                wire_blit::OPCODE_FILL_TEXTURE_COLOR,
+                wire::FILL_TEXTURE_COLOR_TOTAL_LEN,
+            ),
+            COLOR,
+        ),
+        (
+            wire_blit::OPCODE_FILL_TEXTURE_BYTES,
+            texture_fill(
+                wire_blit::OPCODE_FILL_TEXTURE_BYTES,
+                wire::FILL_TEXTURE_BYTES_TOTAL_LEN,
+            ),
+            BYTES,
+        ),
+        (
+            wire_blit::OPCODE_INVALIDATE_COMPRESSED_TEXTURE,
+            invalidate(
+                wire_blit::OPCODE_INVALIDATE_COMPRESSED_TEXTURE,
+                wire::REF_TOTAL_LEN,
+            ),
+            INVALID,
+        ),
+        (
+            wire_blit::OPCODE_INVALIDATE_COMPRESSED_TEXTURE_SLICE_LEVEL,
+            invalidate(
+                wire_blit::OPCODE_INVALIDATE_COMPRESSED_TEXTURE_SLICE_LEVEL,
+                wire::REF_SLICE_LEVEL_TOTAL_LEN,
+            ),
+            INVALID,
+        ),
+    ] {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut host = FakeHost::new();
+        let others: Vec<(&str, u64)> = [COLOR, BYTES, INVALID]
+            .into_iter()
+            .filter(|r| *r != route)
+            .map(|r| (r, store_route_count(r)))
+            .collect();
+        let before = store_route_count(route);
+        handle_blit_record(&mut state, &mut host, 1, op, &command);
+        assert_eq!(
+            store_route_count(route),
+            before + 1,
+            "op {op:#x} did not reach {route}"
+        );
+        for (other, was) in others {
+            assert_eq!(
+                store_route_count(other),
+                was,
+                "op {op:#x} also reached {other}; the two losses are not the \
+                 same loss and one counter cannot answer for both"
+            );
+        }
+    }
+
+    // The pattern fill is the one of the five that is *executed*, so it
+    // must not appear on any of the three counters above. It fails on a
+    // missing buffer here, which is the executor running rather than the
+    // record being dropped.
+    let mut v = vec![0u8; wire::FILL_BUFFER_PATTERN4_TOTAL_LEN as usize];
+    st32(&mut v[0..], wire_blit::OPCODE_FILL_BUFFER_PATTERN4);
+    st32(&mut v[4..], wire::FILL_BUFFER_PATTERN4_TOTAL_LEN);
+    st32(&mut v[reims_vgpu_wire::OP_HEADER_LEN..], 7);
+    st64(&mut v[reims_vgpu_wire::OP_HEADER_LEN + 4..], 0);
+    st64(&mut v[reims_vgpu_wire::OP_HEADER_LEN + 12..], 8);
+    st32(&mut v[reims_vgpu_wire::OP_HEADER_LEN + 20..], 0x89ab_cdef);
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let before: Vec<u64> = [COLOR, BYTES, INVALID]
+        .into_iter()
+        .map(store_route_count)
+        .collect();
+    handle_blit_record(
+        &mut state,
+        &mut host,
+        1,
+        wire_blit::OPCODE_FILL_BUFFER_PATTERN4,
+        &v,
+    );
+    for (route, was) in [COLOR, BYTES, INVALID].into_iter().zip(before) {
+        assert_eq!(
+            store_route_count(route),
+            was,
+            "the executed pattern fill was counted as {route}"
+        );
+    }
+}
+
+/// A strided vertex bind reaches the bind table *and* its own counter.
+///
+/// Both halves matter and they are different claims. The bind must land,
+/// because this record used to be refused before decode and the buffer
+/// never bound at all; the counter must fire, because the per-entry
+/// attribute stride still is not applied and the count is what says whether
+/// applying it is worth building.
+#[test]
+fn a_strided_vertex_bind_lands_in_the_table_and_still_reports_the_stride() {
+    use crate::contract::endian::st64;
+    use crate::runtime::drain::store_route_count;
+
+    const ROUTE: &str = "render_vertex_attribute_stride_dropped";
+    let total = reims_vgpu_wire::OP_HEADER_LEN
+        + render::BIND_ENTRIES
+        + render::BUFFER_STRIDE_BIND_ENTRY_SIZE;
+    let mut command = vec![0u8; total];
+    st32(
+        &mut command[0..],
+        wire_render::OPCODE_SET_VERTEX_BUFFER_STRIDE,
+    );
+    st32(&mut command[4..], total as u32);
+    st32(
+        &mut command[reims_vgpu_wire::OP_HEADER_LEN + render::BIND_FIRST..],
+        4,
+    );
+    st32(
+        &mut command[reims_vgpu_wire::OP_HEADER_LEN + render::BIND_COUNT..],
+        1,
+    );
+    let e = reims_vgpu_wire::OP_HEADER_LEN + render::BIND_ENTRIES;
+    st32(&mut command[e..], 5151);
+    st64(&mut command[e + 4..], 0x2345);
+    st64(&mut command[e + 12..], 0x3456);
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let host = FakeHost::new();
+    let mut out = ExecResult::default();
+    let mut acc = StreamAccum::default();
+    let before = store_route_count(ROUTE);
+    handle_render_record(
+        &mut state,
+        &host,
+        1,
+        wire_render::OPCODE_SET_VERTEX_BUFFER_STRIDE,
+        &command,
+        &mut out,
+        &mut acc,
+    );
+    assert_eq!(
+        store_route_count(ROUTE),
+        before + 1,
+        "the dropped stride was not counted"
+    );
+    assert_eq!(
+        acc.vertex_buffers.len(),
+        1,
+        "the buffer did not bind; this record used to be refused whole"
+    );
+    let b = &acc.vertex_buffers[0];
+    assert_eq!((b.index, b.buffer_ref, b.offset), (4, 5151, 0x2345));
+    assert!(
+        acc.fragment_buffers.is_empty(),
+        "a vertex bind reached the fragment table"
+    );
+
+    // The plain bind must not report a stride it never carried, or the
+    // counter reads as traffic on every ordinary vertex bind.
+    let plain_total =
+        reims_vgpu_wire::OP_HEADER_LEN + render::BIND_ENTRIES + render::BUFFER_BIND_ENTRY_SIZE;
+    let mut plain = vec![0u8; plain_total];
+    st32(&mut plain[0..], wire_render::OPCODE_SET_VERTEX_BUFFER);
+    st32(&mut plain[4..], plain_total as u32);
+    st32(
+        &mut plain[reims_vgpu_wire::OP_HEADER_LEN + render::BIND_COUNT..],
+        1,
+    );
+    st32(
+        &mut plain[reims_vgpu_wire::OP_HEADER_LEN + render::BIND_ENTRIES..],
+        5151,
+    );
+    let before = store_route_count(ROUTE);
+    handle_render_record(
+        &mut state,
+        &host,
+        1,
+        wire_render::OPCODE_SET_VERTEX_BUFFER,
+        &plain,
+        &mut out,
+        &mut acc,
+    );
+    assert_eq!(
+        store_route_count(ROUTE),
+        before,
+        "a plain vertex bind reported a stride it does not carry"
+    );
+}
+
+/// Every state this rail decodes and does not apply reaches its own counter,
+/// and the ones with an API default stay quiet when the guest asks for it.
+///
+/// The counters are the whole reason those opcodes are decoded: each is the
+/// measured argument for whether implementing that state is worth building,
+/// and a counter nobody reads back cannot be shown to be wired up. Nine of
+/// them had no such test until now.
+///
+/// The two indirect draws are deliberately not in the default half. They
+/// have no default to be at -- an indirect draw is geometry the guest asked
+/// for, so every one is a loss and is counted unconditionally.
+#[test]
+fn every_decoded_but_unapplied_render_state_reaches_its_own_counter() {
+    use crate::contract::endian::{st16, st64};
+    use crate::runtime::drain::store_route_count;
+
+    // (opcode, total length, payload writer, route, whether a default-valued
+    // record of the same opcode must NOT count).
+    type Writer = fn(&mut [u8]);
+    let non_default: Writer = |p| st64(p, 2);
+    let at_default: Writer = |p| st64(p, 0);
+    let float_non_default: Writer = |p| st32(p, 2.5f32.to_bits());
+    let float_at_default: Writer = |p| st32(p, 1.0f32.to_bits());
+
+    let cases: &[(u32, usize, Writer, Option<Writer>, &str)] = &[
+        (
+            wire_render::OPCODE_SET_TRIANGLE_FILL_MODE,
+            16,
+            non_default,
+            Some(at_default),
+            "render_fill_mode_dropped",
+        ),
+        (
+            wire_render::OPCODE_SET_DEPTH_CLIP_MODE,
+            16,
+            non_default,
+            Some(at_default),
+            "render_depth_clip_mode_dropped",
+        ),
+        (
+            wire_render::OPCODE_SET_LINE_WIDTH,
+            12,
+            float_non_default,
+            Some(float_at_default),
+            "render_line_width_dropped",
+        ),
+        (
+            wire_render::OPCODE_SET_TESSELLATION_FACTOR_SCALE,
+            12,
+            float_non_default,
+            Some(float_at_default),
+            "render_tessellation_scale_dropped",
+        ),
+        (
+            wire_render::OPCODE_SET_DEPTH_STORE_ACTION,
+            16,
+            non_default,
+            // No default to compare against: the record overrides the pass
+            // descriptor, so even a zero is a change this rail is not making.
+            None,
+            "render_store_action_override_dropped",
+        ),
+        (
+            wire_render::OPCODE_SET_VISIBILITY_RESULT_MODE,
+            24,
+            // The mode is the *second* field: this record puts the offset
+            // first, reversing its selector. Writing the mode at payload+0
+            // sets the offset instead and leaves the mode at Disabled, so
+            // the counter correctly stays quiet -- which is how this test
+            // first failed.
+            |p| {
+                st64(p, 0x1234);
+                st64(&mut p[8..], 2);
+            },
+            Some(|p| {
+                st64(p, 0x1234);
+                st64(&mut p[8..], 0);
+            }),
+            "render_visibility_result_mode_dropped",
+        ),
+        (
+            wire_render::OPCODE_SET_VERTEX_AMPLIFICATION_COUNT,
+            reims_vgpu_wire::OP_HEADER_LEN
+                + render::AMPLIFICATION_COUNT_LEN
+                + 2 * render::AMPLIFICATION_MAPPING_SIZE,
+            // Two views. One is Metal's default and means no amplification,
+            // so the default arm below asks for one and must not count.
+            |p| st32(p, 2),
+            Some(|p| st32(p, 1)),
+            "render_vertex_amplification_dropped",
+        ),
+        (
+            wire_render::OPCODE_SET_VERTEX_AMPLIFICATION_MODE,
+            reims_vgpu_wire::OP_HEADER_LEN + 8,
+            |p| {
+                st32(p, 0x5555);
+                st32(&mut p[4..], 0x6666);
+            },
+            Some(|p| {
+                st32(p, 0);
+                st32(&mut p[4..], 0);
+            }),
+            "render_vertex_amplification_dropped",
+        ),
+        (
+            wire_render::OPCODE_DRAW_INDIRECT,
+            24,
+            |p| {
+                st64(p, 0x1111);
+                st32(&mut p[8..], 5151);
+                st16(&mut p[12..], 3);
+            },
+            None,
+            "render_draw_indirect_dropped",
+        ),
+        (
+            wire_render::OPCODE_DRAW_INDEXED_INDIRECT,
+            36,
+            |p| {
+                st16(p, 4);
+                st16(&mut p[2..], 1);
+                st32(&mut p[4..], 5151);
+                st32(&mut p[8..], 5252);
+                st64(&mut p[12..], 0x1111);
+                st64(&mut p[20..], 0x2222);
+            },
+            None,
+            "render_draw_indexed_indirect_dropped",
+        ),
+        // The tile family. The four bind opcodes each get a one-slot record
+        // at their own entry stride, so a route that fired from the wrong
+        // arm would have to have accepted the wrong length first.
+        (
+            wire_tile::OPCODE_SET_TILE_BUFFER,
+            reims_vgpu_wire::OP_HEADER_LEN + render::BIND_ENTRIES + render::BUFFER_BIND_ENTRY_SIZE,
+            |p| {
+                st32(&mut p[render::BIND_FIRST..], 3);
+                st32(&mut p[render::BIND_COUNT..], 1);
+            },
+            None,
+            "render_tile_buffer_bind_dropped",
+        ),
+        (
+            wire_tile::OPCODE_SET_TILE_BUFFER_OFFSET,
+            20,
+            |p| {
+                st32(p, 4);
+                st64(&mut p[4..], 0x2345);
+            },
+            None,
+            "render_tile_buffer_bind_dropped",
+        ),
+        (
+            wire_tile::OPCODE_SET_TILE_TEXTURE,
+            reims_vgpu_wire::OP_HEADER_LEN + render::BIND_ENTRIES + render::REF_BIND_ENTRY_SIZE,
+            |p| {
+                st32(&mut p[render::BIND_FIRST..], 2);
+                st32(&mut p[render::BIND_COUNT..], 1);
+            },
+            None,
+            "render_tile_texture_bind_dropped",
+        ),
+        (
+            wire_tile::OPCODE_SET_TILE_SAMPLER,
+            reims_vgpu_wire::OP_HEADER_LEN + render::BIND_ENTRIES + render::REF_BIND_ENTRY_SIZE,
+            |p| {
+                st32(&mut p[render::BIND_FIRST..], 4);
+                st32(&mut p[render::BIND_COUNT..], 1);
+            },
+            None,
+            "render_tile_sampler_bind_dropped",
+        ),
+        (
+            wire_tile::OPCODE_SET_TILE_SAMPLER_LOD,
+            reims_vgpu_wire::OP_HEADER_LEN
+                + render::BIND_ENTRIES
+                + render::SAMPLER_LOD_BIND_ENTRY_SIZE,
+            |p| {
+                st32(&mut p[render::BIND_FIRST..], 5);
+                st32(&mut p[render::BIND_COUNT..], 1);
+            },
+            None,
+            "render_tile_sampler_bind_dropped",
+        ),
+        // The three dispatches. Their default arm is a grid with a zero
+        // dimension, which Metal dispatches nothing for -- dropping one
+        // loses no work, so counting it would inflate the very number this
+        // counter exists to be.
+        (
+            wire_tile::OPCODE_DISPATCH_THREADS_PER_TILE,
+            32,
+            |p| {
+                st64(p, 0x11);
+                st64(&mut p[8..], 0x22);
+                st64(&mut p[16..], 0x33);
+            },
+            Some(|p| {
+                st64(p, 0x11);
+                st64(&mut p[8..], 0x22);
+                st64(&mut p[16..], 0);
+            }),
+            "render_tile_dispatch_dropped",
+        ),
+        (
+            wire_tile::OPCODE_DISPATCH_THREADS_PER_TILE_IN_REGION,
+            84,
+            |p| {
+                st64(p, 0x11);
+                st64(&mut p[8..], 0x22);
+                st64(&mut p[16..], 0x33);
+            },
+            Some(|p| st64(&mut p[16..], 0)),
+            "render_tile_dispatch_dropped",
+        ),
+        (
+            wire_tile::OPCODE_DISPATCH_THREADS_PER_TILE_IN_REGION_RT_INDEX,
+            84,
+            |p| {
+                st64(p, 0x11);
+                st64(&mut p[8..], 0x22);
+                st64(&mut p[16..], 0x33);
+            },
+            Some(|p| st64(&mut p[16..], 0)),
+            "render_tile_dispatch_dropped",
+        ),
+        // Not a dropped command but an unanswered question, so it has no
+        // default arm: every one of these leaves the guest reading its own
+        // stale ring as a tile geometry.
+        (
+            wire_tile::OPCODE_GET_TILE_DIMENSIONS,
+            20,
+            |p| {
+                st32(p, 5151);
+                st64(&mut p[4..], 0x9999);
+            },
+            None,
+            "render_tile_dimensions_unanswered",
+        ),
+        (
+            wire_tile::OPCODE_SET_TILE_THREADGROUP_MEMORY,
+            28,
+            |p| {
+                st64(p, 0x1234);
+                st64(&mut p[8..], 0x2345);
+                st32(&mut p[16..], 5);
+            },
+            None,
+            "render_tile_threadgroup_memory_dropped",
+        ),
+        // The store-action options. Their record is four bytes longer on
+        // the colour form than on the other two, so a route reached from
+        // the wrong arm would have had to accept the wrong length first.
+        (
+            wire_render::OPCODE_SET_COLOR_STORE_ACTION_OPTIONS,
+            20,
+            |p| {
+                st64(p, 0x1111);
+                st32(&mut p[8..], 3);
+            },
+            None,
+            "render_store_action_options_dropped",
+        ),
+        (
+            wire_render::OPCODE_SET_DEPTH_STORE_ACTION_OPTIONS,
+            16,
+            |p| st64(p, 0x2222),
+            None,
+            "render_store_action_options_dropped",
+        ),
+        (
+            wire_render::OPCODE_SET_STENCIL_STORE_ACTION_OPTIONS,
+            16,
+            |p| st64(p, 0x3333),
+            None,
+            "render_store_action_options_dropped",
+        ),
+        (
+            wire_render::OPCODE_SET_TESSELLATION_FACTOR_BUFFER,
+            28,
+            |p| {
+                st32(p, 5151);
+                st64(&mut p[4..], 0x3456);
+                st64(&mut p[12..], 0x4567);
+            },
+            None,
+            "render_tessellation_factor_buffer_dropped",
+        ),
+        // The patch draws. The two `0x0c` rows are the point: one opcode,
+        // two lengths, and both must reach the counter -- a length-based
+        // dispatch that refused one of them would read as a healthy zero.
+        (
+            wire_render::OPCODE_DRAW_PATCHES,
+            24,
+            |_p| {},
+            None,
+            "render_draw_patches_dropped",
+        ),
+        (
+            wire_render::OPCODE_DRAW_PATCHES_WIDE,
+            56,
+            |_p| {},
+            None,
+            "render_draw_patches_dropped",
+        ),
+        (
+            wire_render::OPCODE_DRAW_PATCHES_WIDE,
+            68,
+            |_p| {},
+            None,
+            "render_draw_patches_dropped",
+        ),
+        (
+            wire_render::OPCODE_DRAW_INDEXED_PATCHES,
+            32,
+            |_p| {},
+            None,
+            "render_draw_patches_dropped",
+        ),
+        (
+            wire_render::OPCODE_DRAW_PATCHES_INDIRECT,
+            36,
+            |_p| {},
+            None,
+            "render_draw_patches_indirect_dropped",
+        ),
+        (
+            wire_render::OPCODE_DRAW_INDEXED_PATCHES_INDIRECT,
+            48,
+            |_p| {},
+            None,
+            "render_draw_patches_indirect_dropped",
+        ),
+    ];
+
+    let run = |op: u32, total: usize, write: Writer| {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let host = FakeHost::new();
+        let mut out = ExecResult::default();
+        let mut acc = StreamAccum::default();
+        let mut command = vec![0u8; total];
+        st32(&mut command[0..], op);
+        st32(&mut command[4..], total as u32);
+        write(&mut command[reims_vgpu_wire::OP_HEADER_LEN..]);
+        handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
+    };
+
+    for (op, total, write, default_write, route) in cases {
+        let before = store_route_count(route);
+        run(*op, *total, *write);
+        assert_eq!(
+            store_route_count(route),
+            before + 1,
+            "op {op:#x} did not reach {route}"
+        );
+        if let Some(default_write) = default_write {
+            let before = store_route_count(route);
+            run(*op, *total, *default_write);
+            assert_eq!(
+                store_route_count(route),
+                before,
+                "op {op:#x} counted a guest asking for the API default, which \
+                 is what this rail already does -- that turns the healthy \
+                 zero back into a flood"
+            );
+        }
+    }
+}

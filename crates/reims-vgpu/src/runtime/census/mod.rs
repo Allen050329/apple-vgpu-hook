@@ -51,7 +51,7 @@
 //! object-ref space and not the mapping space, and that the trailing 16 bytes
 //! are zero — then went on recounting all three for every submission of every
 //! boot after. The findings live where they are acted on, in
-//! `runtime/exec.rs:consume_resource_table`; the only one that could still
+//! `runtime/exec::consume_resource_table`; the only one that could still
 //! change is a guest that starts populating the tail, and that is now a typed
 //! decline raised at the record, not a counter nobody reads.
 //!

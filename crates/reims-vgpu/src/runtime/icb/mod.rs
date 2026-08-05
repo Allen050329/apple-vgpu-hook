@@ -110,7 +110,7 @@ impl crate::observe::Decline for IcbStatus {
 ///
 /// The compute rail is where an ICB refusal actually reaches the sink: the
 /// session hands a [`crate::runtime::compute_exec::ComputeStatus`] back to
-/// `exec.rs`, which logs it as `compute_record reason=<slug>`. Before this
+/// `exec`, which logs it as `compute_record reason=<slug>`. Before this
 /// conversion existed each boundary invented its own coarse literal —
 /// `icb_resolve_bad_descriptor_or_args` spoke for `BadDescriptor` *and* `Args`,
 /// i.e. for 93 of this file's checks at once — so the reason died one frame

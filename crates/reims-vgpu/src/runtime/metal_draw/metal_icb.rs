@@ -660,11 +660,11 @@ fn apply_icb_encoder_inheritance<M: HostMemory + HostOps>(
 
 /// Name an ICB refusal on the render rail, then collapse it to `EncodeStatus`.
 ///
-/// The ICB's own check — one of 153 — used to arrive at `exec.rs` as a bare
+/// The ICB's own check — one of 153 — used to arrive at `exec` as a bare
 /// `bad_args` or `metal_failed`, and the log could not tell a missing pipeline
 /// object from a mesh library that failed to build. Emitting here is what makes
 /// the ICB vocabulary reach the sink on the render path; the collapse now
-/// **carries** that slug onward, so the boundary counter in `exec.rs` names the
+/// **carries** that slug onward, so the boundary counter in `exec` names the
 /// ICB's check rather than re-stating the class it was flattened into.
 ///
 /// Latched per `(reason, icb_ref)`: the guest re-submits the same ICB every

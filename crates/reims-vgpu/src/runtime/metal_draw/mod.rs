@@ -623,7 +623,7 @@ fn degrade_log_first(pipeline_ref: u32, slug: &'static str) -> bool {
 /// How a render-encode attempt ended.
 ///
 /// Every refusal carries the registered slug of the check that produced it. The
-/// variant is the *class* the caller acts on — `NoMetal` makes `exec.rs` fall
+/// variant is the *class* the caller acts on — `NoMetal` makes `exec` fall
 /// back to the pass clear, `WritebackFailed` does not — and the payload is which
 /// of the rail's checks refused. Before this, six payload-free variants spoke for
 /// 27 checks: `BadArgs` alone covered eight, and `draw_encode_fail
@@ -640,7 +640,7 @@ pub enum EncodeStatus {
     WritebackFailed(&'static str),
     BadArgs(&'static str),
     /// Metal feature not built (vulkan boot), or nothing landed on the Vulkan
-    /// rail — `exec.rs` treats both as "honour the pass clear instead".
+    /// rail — `exec` treats both as "honour the pass clear instead".
     NoMetal(&'static str),
 }
 

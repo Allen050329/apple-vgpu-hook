@@ -365,7 +365,7 @@ fn depth_test_honored_compare_and_clear_wired() {
 /// Same depth wiring proof as `depth_test_honored_compare_and_clear_wired`, but
 /// through the RESIDENT target path — the product Store path (`target_identity`
 /// with `skip_readback` and `read_target`, which builds its own ad-hoc [color,depth]
-/// framebuffer in the registry_ensure branch (exec.rs) separate from the pooled
+/// framebuffer in the registry_ensure branch (exec) separate from the pooled
 /// path exercised above. Without this, the resident depth branch was reachable
 /// only in production; a dispose-order or framebuffer bug there (the exact class
 /// that caused the MRT/depth device-lost fixes) would surface as a device loss

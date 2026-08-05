@@ -1353,7 +1353,7 @@ fn record_type4_owner(state: &mut DeviceState, surface_id: u32, task_id: u32) {
 ///
 /// **It has never answered.** Three driven x86/Vulkan boots read
 /// `replace_physical_routed_ref` at 0 while three quarters of the re-points
-/// named an id no mapping owned, and `exec.rs`'s resource-table census reports
+/// named an id no mapping owned, and `exec`'s resource-table census reports
 /// the same of the sibling packet's ids ("`texture_to_mapping` answered for
 /// exactly none"). So the ref id space these packets use is not the one that map
 /// is keyed on, and finding the route that does reach it is open work. The arm

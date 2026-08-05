@@ -63,7 +63,7 @@ runs" came back with contract fidelity, and this instrument finds *more* of that
 class, not less.
 
 `runtime/icb/mod.rs` reads 0.00% — all 22 functions. That is the correct
-reading, and `runtime/icb/` is explicitly not a deletion; `runtime/exec.rs`
+reading, and `runtime/icb/` is explicitly not a deletion; `runtime/exec`
 prices it and AGENTS.md records five boots behind that call. The instrument
 agreeing with a conclusion already reached the expensive way is the reason to
 trust it, not a reason to act on it.

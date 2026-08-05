@@ -712,7 +712,7 @@ impl ResourcePools {
     /// # It does not recycle, and on this pathway it never runs
     ///
     /// Every sibling allocator here reuses before allocating; this one does not.
-    /// `exec.rs` creates one per draw that carries depth state and disposes it at
+    /// `exec` creates one per draw that carries depth state and disposes it at
     /// the end of that same draw. That was once by far the largest allocator in
     /// the engine: driven boots read `vk_alloc_sites transient_depth=5374:21225`
     /// and later `4623:18257` — thousands of `vkAllocateMemory` calls totalling
@@ -1490,7 +1490,7 @@ mod pin_count_tests {
     /// every site that removes a live registry entry") and that the MRT
     /// secondary recreate arm broke while it was a copy: it removed the entry
     /// and recorded nothing, so `prior_reclaim` answered `None` — which
-    /// `exec.rs` reports as "never existed" for a resident this device had just
+    /// `exec` reports as "never existed" for a resident this device had just
     /// taken. Routing all three sites through `unregister_resident` is what
     /// makes the record unconditional.
     #[test]
