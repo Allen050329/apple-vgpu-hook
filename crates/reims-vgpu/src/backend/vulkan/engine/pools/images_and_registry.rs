@@ -1,3 +1,21 @@
+//! The resident-image registry and the storage images beside it — the
+//! [`ResourcePools`] methods whose unit is a *guest identity* rather than a
+//! slot.
+//!
+//! A registry entry outlives any one submission. The guest names the same
+//! surface across frames, so an entry is keyed by `TargetIdentity`, held alive
+//! by a pin count, and reclaimed by an LRU cap walk rather than by a fence —
+//! which is why none of this sits with the ring in
+//! [`super::submission_and_buffers`].
+//!
+//! The two meet in one place: the idle-drain planner over there picks its
+//! victims out of the registry order maintained here.
+//!
+//! `use super::*` is the seam. This is an `impl` chapter of the module that
+//! declares `ResourcePools` and owns its fields, not a layer beneath it.
+
+use super::*;
+
 impl ResourcePools {
     pub(crate) unsafe fn acquire_storage_image(
         &mut self,
@@ -46,11 +64,9 @@ impl ResourcePools {
         let mt = ctx
             .memory_type_for(req.memory_type_bits, MemoryClass::DeviceLocal)
             .ok_or({
-                DrawError::Unsupported(
-                    super::reason::DrawReason::NoDeviceLocalMemoryForStorageImage {
-                        memory_type_bits: req.memory_type_bits,
-                    },
-                )
+                DrawError::Unsupported(reason::DrawReason::NoDeviceLocalMemoryForStorageImage {
+                    memory_type_bits: req.memory_type_bits,
+                })
             })?;
         let memory = allocate_memory_timed(
             ctx,
@@ -78,7 +94,7 @@ impl ResourcePools {
                     .image(image)
                     .view_type(vk::ImageViewType::TYPE_2D)
                     .format(format)
-                    .subresource_range(super::color_subresource_range()),
+                    .subresource_range(color_subresource_range()),
                 None,
             )
             .map_err(|e| {
@@ -493,7 +509,7 @@ impl ResourcePools {
                     .image(image)
                     .view_type(vk::ImageViewType::TYPE_2D)
                     .format(format)
-                    .subresource_range(super::color_subresource_range()),
+                    .subresource_range(color_subresource_range()),
                 None,
             ) {
                 Ok(v) => v,
@@ -633,11 +649,9 @@ impl ResourcePools {
                 .memory_type_for(ireq.memory_type_bits, MemoryClass::DeviceLocal)
                 .ok_or_else(|| {
                     ctx.device.destroy_image(image, None);
-                    DrawError::Unsupported(
-                        super::reason::DrawReason::NoDeviceLocalMemoryForMrtSecondary {
-                            memory_type_bits: ireq.memory_type_bits,
-                        },
-                    )
+                    DrawError::Unsupported(reason::DrawReason::NoDeviceLocalMemoryForMrtSecondary {
+                        memory_type_bits: ireq.memory_type_bits,
+                    })
                 })?;
             let memory = allocate_memory_timed(
                 ctx,
@@ -665,7 +679,7 @@ impl ResourcePools {
                         .image(image)
                         .view_type(vk::ImageViewType::TYPE_2D)
                         .format(format)
-                        .subresource_range(super::color_subresource_range()),
+                        .subresource_range(color_subresource_range()),
                     None,
                 )
                 .map_err(|e| {
@@ -794,7 +808,7 @@ impl ResourcePools {
             .memory_type_for(ireq.memory_type_bits, MemoryClass::DeviceLocal)
             .ok_or_else(|| {
                 ctx.device.destroy_image(image, None);
-                DrawError::Unsupported(super::reason::DrawReason::NoDeviceLocalMemoryForDepth {
+                DrawError::Unsupported(reason::DrawReason::NoDeviceLocalMemoryForDepth {
                     memory_type_bits: ireq.memory_type_bits,
                 })
             })?;
@@ -1564,7 +1578,11 @@ mod pin_count_tests {
             pools.note_resident_reclaimed(&surf(1000 + i), ResidentReclaim::CapEvicted);
         }
         assert!(pools.reclaimed_recent.len() <= RECLAIM_HISTORY);
-        assert_eq!(pools.prior_reclaim(&surf(2)), None, "aged out of the window");
+        assert_eq!(
+            pools.prior_reclaim(&surf(2)),
+            None,
+            "aged out of the window"
+        );
     }
 
     /// The reclaim pass is throttled to `IDLE_DRAIN_INTERVAL_MS`: a second call

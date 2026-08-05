@@ -1,21 +1,42 @@
+//! The submission ring, the buffer pools it refills, and the sampled cache —
+//! the [`ResourcePools`] methods whose unit is a *slot*.
+//!
+//! These three read as separate concerns and are one, because the ring's clock
+//! is what recycles the pools. A staging, readback, sampled or storage-image
+//! slot handed to a batch is not free when its caller is done with it; it rides
+//! `PendingGpuCleanup` until `retire_slot` has waited that batch's fence, and
+//! only then does `drain_cleanup` push it back onto a free list. The idle-drain
+//! planner in this file decides when the trims that shrink those lists may run
+//! at all.
+//!
+//! The image *registry* is keyed by identity rather than by slot and lives in
+//! [`super::images_and_registry`]; destroying everything here is
+//! [`super::teardown`]'s job.
+//!
+//! `use super::*` is the seam. This is an `impl` chapter of the module that
+//! declares `ResourcePools` and owns its fields, not a layer beneath it.
+
+use super::*;
+
 impl ResourcePools {
     pub(crate) fn guest_reset_counts(&self) -> (usize, usize, usize, usize) {
         let sampled = self.sampled_live.len() + self.sampled_free.len() + self.sampled_cache.len();
-        let storage =
-            self.storage_image_live.len() + self.storage_image_free.len() + self.compute_storage_registry.len();
+        let storage = self.storage_image_live.len()
+            + self.storage_image_free.len()
+            + self.compute_storage_registry.len();
         (self.registry.len(), self.targets.len(), sampled, storage)
     }
 
     /// The guest page-window import cache. `&mut` because every use of it can
     /// import or evict; there is no read-only question to ask of it.
-    pub(crate) fn dmabuf_imports_mut(&mut self) -> &mut super::dmabuf::ImportCache {
+    pub(crate) fn dmabuf_imports_mut(&mut self) -> &mut dmabuf::ImportCache {
         &mut self.dmabuf_imports
     }
 
     /// The bindable buffer over `window`'s guest pages, importing it if this is
     /// the first ask, and retiring whatever the pinned-bytes bound displaced.
     ///
-    /// This is the only way to reach [`super::dmabuf::ImportCache::get_or_import`]
+    /// This is the only way to reach [`dmabuf::ImportCache::get_or_import`]
     /// that is safe for a caller which submits without waiting: a displaced
     /// import goes to the graveyard, so its `vkFreeMemory` lands after every
     /// command buffer that could still be copying out of it has retired.
@@ -26,12 +47,14 @@ impl ResourcePools {
     pub(crate) unsafe fn import_guest_window(
         &mut self,
         ctx: &DeviceContext,
-        window: &std::sync::Arc<super::types::GuestDmaBuf>,
+        window: &std::sync::Arc<types::GuestDmaBuf>,
         size: u64,
-    ) -> Result<super::dmabuf::ImportedDmaBuf, super::dmabuf::DmaBufDecline> {
+    ) -> Result<dmabuf::ImportedDmaBuf, dmabuf::DmaBufDecline> {
         let mut displaced = Vec::new();
-        let result =
-            unsafe { self.dmabuf_imports.get_or_import(ctx, window, size, &mut displaced) };
+        let result = unsafe {
+            self.dmabuf_imports
+                .get_or_import(ctx, window, size, &mut displaced)
+        };
         for import in displaced {
             unsafe { self.dispose(&ctx.device, DeferredHandle::DmaBufImport(import)) };
         }
@@ -79,9 +102,9 @@ impl ResourcePools {
             graveyard: Vec::new(),
             target_free: FreePool::new(TARGET_FREE_CAP_PER_KEY, TARGET_FREE_CAP_TOTAL),
             open_batch: None,
-            slab: super::slab::SlabPool::new(),
-            host_slab: super::host_slab::HostSlabPool::new(),
-            dmabuf_imports: super::dmabuf::ImportCache::default(),
+            slab: slab::SlabPool::new(),
+            host_slab: host_slab::HostSlabPool::new(),
+            dmabuf_imports: dmabuf::ImportCache::default(),
             guest_reads_in_flight: false,
             initialized: false,
         }
@@ -102,7 +125,7 @@ impl ResourcePools {
     /// poll heartbeat still ticks this clock but no publish re-touches the frame —
     /// it would otherwise age out from under the display. Stamping it here every
     /// call makes it un-ageable while it is on screen.
-    fn plan_idle_drain(
+    pub(super) fn plan_idle_drain(
         &mut self,
         now_ms: u64,
         display: Option<&TargetIdentity>,
@@ -386,7 +409,7 @@ impl ResourcePools {
     /// directly instead of inferred. At true idle the guest stops publishing, no
     /// draw acquires staging, and the trim still fires and still returns the
     /// memory.
-    fn note_drain_settled(&mut self, drained: usize) -> bool {
+    pub(super) fn note_drain_settled(&mut self, drained: usize) -> bool {
         let acquires = self.staging_hits.wrapping_add(self.staging_misses);
         let uploads_ran = acquires != self.settled_staging_mark;
         self.settled_staging_mark = acquires;
@@ -628,7 +651,7 @@ impl ResourcePools {
     /// Returns the backing `VkDeviceMemory` (shared across the block's other
     /// images) for the pool's image struct; the image was bound at the slab
     /// offset, not offset 0.
-    unsafe fn bind_image_slab(
+    pub(super) unsafe fn bind_image_slab(
         &mut self,
         ctx: &DeviceContext,
         image: vk::Image,
@@ -659,7 +682,7 @@ impl ResourcePools {
     /// `image`/view handles). No-op for a non-slab image. This replaces the raw
     /// `vkFreeMemory` at every DEVICE_LOCAL-image free site: the memory belongs
     /// to a shared block, not the image.
-    unsafe fn free_image_slab(&mut self, device: &ash::Device, image: vk::Image) {
+    pub(super) unsafe fn free_image_slab(&mut self, device: &ash::Device, image: vk::Image) {
         self.slab.free_image(device, image);
     }
 
@@ -709,7 +732,7 @@ impl ResourcePools {
     /// is available, else `None`. Splits the reuse (`target_free_hits`) vs
     /// fresh-alloc (`target_free_allocs`) census so a boot can prove the
     /// per-frame realloc storm collapsed (allocs ≈ 0 under video).
-    fn take_free_target(
+    pub(super) fn take_free_target(
         &mut self,
         width: u32,
         height: u32,
@@ -757,7 +780,7 @@ impl ResourcePools {
     }
 
     /// Terminally handle every graveyard entry released by `retired` retiring.
-    unsafe fn release_graveyard(&mut self, device: &ash::Device, retired: SlotMask) {
+    pub(super) unsafe fn release_graveyard(&mut self, device: &ash::Device, retired: SlotMask) {
         for handle in self.take_released_graveyard(retired) {
             self.destroy_or_recycle(device, handle);
         }
@@ -1021,7 +1044,7 @@ impl ResourcePools {
 
     /// Wait a single already-submitted entry fence WITHOUT retiring the ring.
     ///
-    /// A synchronous reader (e.g. [`super::read_target_inner`]) that submitted
+    /// A synchronous reader (e.g. [`super::super::read_target_inner`]) that submitted
     /// its own copy CB with `fence` only needs *that* copy to finish before it
     /// maps the readback — it does not need to quiesce unrelated in-flight
     /// draws. The copy's `ALL_COMMANDS → TRANSFER` barrier plus single-queue
@@ -1309,7 +1332,7 @@ impl ResourcePools {
         let mt = ctx
             .memory_type_for(req.memory_type_bits, MemoryClass::Upload)
             .ok_or({
-                DrawError::Unsupported(super::reason::DrawReason::NoHostVisibleMemoryForStaging {
+                DrawError::Unsupported(reason::DrawReason::NoHostVisibleMemoryForStaging {
                     memory_type_bits: req.memory_type_bits,
                 })
             })?;
@@ -1478,7 +1501,7 @@ impl ResourcePools {
         &self,
         ctx: &DeviceContext,
         slot: &BufferSlot,
-        runs: &[super::types::GuestRun],
+        runs: &[types::GuestRun],
         total_len: u64,
     ) -> Result<(), DrawError> {
         let _slow = SlowStagingWrite::watch("guest_runs", total_len, runs.len());
@@ -1554,8 +1577,7 @@ impl ResourcePools {
                 &vk::BufferCreateInfo::default()
                     .size(bucket)
                     .usage(
-                        vk::BufferUsageFlags::TRANSFER_DST
-                            | vk::BufferUsageFlags::STORAGE_BUFFER,
+                        vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::STORAGE_BUFFER,
                     )
                     .sharing_mode(vk::SharingMode::EXCLUSIVE),
                 None,
@@ -1566,7 +1588,7 @@ impl ResourcePools {
         let mt = ctx
             .memory_type_for(req.memory_type_bits, MemoryClass::Readback)
             .ok_or({
-                DrawError::Unsupported(super::reason::DrawReason::NoHostVisibleMemoryForReadback {
+                DrawError::Unsupported(reason::DrawReason::NoHostVisibleMemoryForReadback {
                     memory_type_bits: req.memory_type_bits,
                 })
             })?;
@@ -1817,7 +1839,7 @@ impl ResourcePools {
                 .image(image)
                 .view_type(vk::ImageViewType::TYPE_2D)
                 .format(translate::pixel::RESIDENT_RGBA_FORMAT)
-                .subresource_range(super::color_subresource_range()),
+                .subresource_range(color_subresource_range()),
             None,
         ) {
             Ok(v) => v,
@@ -2138,8 +2160,7 @@ impl ResourcePools {
         let duplicate = self.sampled_cache.iter_mut().find(|entry| {
             entry.slot.key() == slot.key()
                 && entry.fingerprint == fingerprint
-                && (fingerprint != SampledFingerprint::Gathered
-                    || entry.identity == identity)
+                && (fingerprint != SampledFingerprint::Gathered || entry.identity == identity)
         });
         if let Some(existing) = duplicate {
             if identity.is_some() {
@@ -2166,7 +2187,8 @@ impl ResourcePools {
         while self.sampled_cache.len() > SAMPLED_CACHE_CAP
             || self.sampled_cache_bytes > SAMPLED_CACHE_BYTE_CAP
         {
-            if let Some(route) = sampled_evict_route(self.sampled_cache.len(), self.sampled_cache_bytes)
+            if let Some(route) =
+                sampled_evict_route(self.sampled_cache.len(), self.sampled_cache_bytes)
             {
                 crate::runtime::drain::note_store_route(route);
             }
@@ -2494,10 +2516,7 @@ mod recycle_tests {
                 "eviction {i} within cap must recycle"
             );
         }
-        assert_eq!(
-            pools.sampled_free.count_for(&hd),
-            SAMPLED_FREE_CAP_PER_KEY
-        );
+        assert_eq!(pools.sampled_free.count_for(&hd), SAMPLED_FREE_CAP_PER_KEY);
 
         // Over the cap: caller must destroy (returns the slot); free list is
         // bounded, not grown.
@@ -2505,10 +2524,7 @@ mod recycle_tests {
             pools.try_recycle_sampled(null_slot(1920, 1080)).is_some(),
             "over-cap eviction must not recycle"
         );
-        assert_eq!(
-            pools.sampled_free.count_for(&hd),
-            SAMPLED_FREE_CAP_PER_KEY
-        );
+        assert_eq!(pools.sampled_free.count_for(&hd), SAMPLED_FREE_CAP_PER_KEY);
 
         // A different geometry has an independent cap.
         let small = null_slot(64, 64).key();
@@ -2687,10 +2703,7 @@ mod recycle_tests {
                 "displacement {i} within cap must recycle"
             );
         }
-        assert_eq!(
-            pools.target_free.count_for(&key),
-            TARGET_FREE_CAP_PER_KEY
-        );
+        assert_eq!(pools.target_free.count_for(&key), TARGET_FREE_CAP_PER_KEY);
 
         assert!(
             pools
@@ -2698,10 +2711,7 @@ mod recycle_tests {
                 .is_some(),
             "over-cap displacement must not recycle"
         );
-        assert_eq!(
-            pools.target_free.count_for(&key),
-            TARGET_FREE_CAP_PER_KEY
-        );
+        assert_eq!(pools.target_free.count_for(&key), TARGET_FREE_CAP_PER_KEY);
 
         // A different format is an independent bucket (an RGBA image cannot back
         // a BGRA attachment).
@@ -2923,7 +2933,7 @@ mod recycle_tests {
 /// Copy `src` into `dst` with the R and B channels of every whole RGBA8 pixel
 /// exchanged, writing each destination byte exactly once.
 ///
-/// Split out of [`Pools::write_staging_swap_rb`] so the transformation has a
+/// Split out of [`ResourcePools::write_staging_swap_rb`] so the transformation has a
 /// test: that method's destination is a mapped Vulkan allocation, so nothing
 /// about it is reachable from a unit test, and the exchange is the part that can
 /// be wrong. `dst` is written and never read, which is what keeps the
@@ -2933,10 +2943,13 @@ mod recycle_tests {
 /// A trailing partial pixel is copied through unexchanged. Bytes of `dst` past
 /// `src.len()` are left alone; the caller owns whatever the mapped span needs
 /// beyond the source.
-pub(crate) fn exchange_rb_into(src: &[u8], dst: &mut [u8]) {
+fn exchange_rb_into(src: &[u8], dst: &mut [u8]) {
     let n = src.len().min(dst.len());
     let whole = n / 4 * 4;
-    for (s, d) in src[..whole].chunks_exact(4).zip(dst[..whole].chunks_exact_mut(4)) {
+    for (s, d) in src[..whole]
+        .chunks_exact(4)
+        .zip(dst[..whole].chunks_exact_mut(4))
+    {
         d.copy_from_slice(&[s[2], s[1], s[0], s[3]]);
     }
     dst[whole..n].copy_from_slice(&src[whole..n]);

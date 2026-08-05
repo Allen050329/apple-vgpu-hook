@@ -1,3 +1,15 @@
+//! `destroy_all` — the one ordered driver that takes every pool down.
+//!
+//! Kept apart from the two chapters that fill the pools because the order is
+//! the contract: quiesce the in-flight fences, fold each slot's owed transients
+//! back into the live lists, then destroy in an order no acquire path has any
+//! say in. A second teardown path would be a second order, so there is one.
+//!
+//! `use super::*` is the seam. This is an `impl` chapter of the module that
+//! declares `ResourcePools` and owns its fields, not a layer beneath it.
+
+use super::*;
+
 impl ResourcePools {
     pub(crate) unsafe fn destroy_all(&mut self, device: &ash::Device) {
         // An open (never-submitted) batch dies with the pool: its CB belongs

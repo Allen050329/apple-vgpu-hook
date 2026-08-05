@@ -17,6 +17,7 @@ use super::device_lost::{DeviceLostDecline, DeviceLostOp};
 use super::host_slab::{HostSlabToken, HOST_SLAB_IDLE_KEEP_EMPTY};
 use super::types::{DrawError, ResidentReclaim, StorageImageFormat, TargetIdentity};
 use super::vk_call::{VkCall, VkOp};
+use super::{color_subresource_range, dmabuf, host_slab, reason, slab, types};
 use crate::backend::vulkan::caps::{MappedMemoryKind, MemoryClass};
 use crate::backend::vulkan::translate;
 use crate::model::ComputeStorageResidencyKey;
@@ -84,7 +85,7 @@ pub(crate) enum BufferBacking {
     /// range to the carve first.
     Dedicated,
     /// The slot holds a sub-range of a shared HOST_VISIBLE block; releasing it
-    /// returns the range to [`super::host_slab::HostSlabPool`] and must never
+    /// returns the range to [`host_slab::HostSlabPool`] and must never
     /// call `vkFreeMemory`.
     HostSlab(HostSlabToken),
 }
@@ -99,7 +100,7 @@ pub(crate) enum BufferBacking {
 /// No in-flight command buffer may still reference `slot.buffer`.
 pub(crate) unsafe fn release_buffer_slot(
     device: &ash::Device,
-    host_slab: &mut super::host_slab::HostSlabPool,
+    host_slab: &mut host_slab::HostSlabPool,
     slot: BufferSlot,
 ) {
     device.destroy_buffer(slot.buffer, None);
@@ -303,18 +304,18 @@ pub(crate) struct ResourcePools {
     /// ([[present-thrash-proxies]] bug #2). Live sub-allocations are keyed by
     /// `vk::Image` handle, so the free path routes through it with just the
     /// image.
-    slab: super::slab::SlabPool,
+    slab: slab::SlabPool,
     /// Offset suballocator for the HOST_VISIBLE upload blocks every staging
     /// buffer is carved from. Same reason as `slab` one field up, against a
     /// different measurement: a staging miss cost ~0.4-0.6 ms of
     /// `vkAllocateMemory` whatever its size, and the pool takes ~1 500 of them
     /// a boot, clustered on the first composite after idle.
-    host_slab: super::host_slab::HostSlabPool,
+    host_slab: host_slab::HostSlabPool,
     /// Guest page windows imported as `VkBuffer`s, kept across frames. Lives
     /// here rather than beside its one consumer so it is destroyed by the same
     /// teardown that destroys every other device object, and so the bound is
-    /// enforced against the pool that owns it. See [`super::dmabuf::ImportCache`].
-    dmabuf_imports: super::dmabuf::ImportCache,
+    /// enforced against the pool that owns it. See [`dmabuf::ImportCache`].
+    dmabuf_imports: dmabuf::ImportCache,
     /// Whether any command buffer recorded or submitted since the last quiesce
     /// **reads** guest RAM when it executes.
     ///
@@ -434,12 +435,12 @@ pub(crate) enum DeferredHandle {
     RenderPass(vk::RenderPass),
     ShaderModule(vk::ShaderModule),
     Sampler(vk::Sampler),
-    /// A guest page-window import displaced from [`super::dmabuf::ImportCache`]
+    /// A guest page-window import displaced from [`dmabuf::ImportCache`]
     /// by its pinned-bytes bound. Freeing the `VkDeviceMemory` is what revokes
     /// the GPU's reach into those guest pages, and an in-flight command buffer
     /// may still be copying out of it, so the revocation waits for the ring
     /// exactly like every image destroy does.
-    DmaBufImport(super::dmabuf::ImportedDmaBuf),
+    DmaBufImport(dmabuf::ImportedDmaBuf),
 }
 
 impl ResourcePools {
@@ -560,7 +561,7 @@ impl SampledKey {
     /// the field it is overriding — the snapshot arm binds a resident under
     /// `resident_color` rather than the resource's own format, and that used to
     /// be visible only by counting to the eighth argument.
-    pub(crate) fn of(r: &super::types::SampledImageResource) -> Self {
+    pub(crate) fn of(r: &types::SampledImageResource) -> Self {
         Self {
             width: r.width,
             height: r.height,
@@ -1234,7 +1235,7 @@ const STAGING_MISS_EMIT_EVERY: u64 = 512;
 ///
 /// **1.77 against a ceiling of 8**, so raising this constant would change
 /// nothing — a batch almost never reaches it. What ends a batch is
-/// `Pools::begin_entry`, which calls `batch_flush` unconditionally before
+/// `ResourcePools::begin_entry`, which calls `batch_flush` unconditionally before
 /// claiming a ring slot, and every readback claims one. `batch_readback_joins`
 /// is that share measured rather than inferred: **58.8 % of batch flushes are a
 /// readback cutting a run of draws short**, not a batch filling up.
@@ -1315,7 +1316,7 @@ pub(crate) enum AllocSite {
     /// A HOST_VISIBLE upload block, not one staging buffer.
     ///
     /// Every staging bind is a sub-allocation out of one of these
-    /// ([`super::host_slab`]), so this counts blocks: a boot that once read
+    /// ([`host_slab`]), so this counts blocks: a boot that once read
     /// `staging=242:134:273` (count:MiB:ms) should read a single-digit count
     /// here. The name changed with the meaning deliberately — a reader
     /// comparing a new `staging_block` figure against an old `staging` one
@@ -1475,9 +1476,9 @@ impl Drop for SlowStagingWrite {
     }
 }
 
-include!("submission_and_buffers.rs");
-include!("images_and_registry.rs");
-include!("teardown.rs");
+mod images_and_registry;
+mod submission_and_buffers;
+mod teardown;
 
 #[cfg(test)]
 mod sampled_key_tests {
@@ -1833,7 +1834,7 @@ mod staging_mapping_tests {
     /// A cold burst of staging acquires costs a handful of `vkAllocateMemory`,
     /// not one per acquire.
     ///
-    /// This is the whole claim of [`super::super::host_slab`]. The staging pool
+    /// This is the whole claim of [`host_slab`]. The staging pool
     /// hits ~99.6 % of the time, so what it costs is decided by its misses, and
     /// a miss used to be a full allocation — measured at a ~0.4-0.6 ms floor
     /// whatever the size (a 64-byte miss read 421 us). Every acquire below is a
