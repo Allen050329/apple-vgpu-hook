@@ -262,7 +262,9 @@ pub fn write_task_gva<M: HostMemory>(
 /// `file:line` of whoever called the `#[track_caller]` function above this one.
 ///
 /// Rendered as the repo-relative tail so the field stays short enough to sit on
-/// an always-on line: `runtime/blit_exec.rs:1039`.
+/// an always-on line: `runtime/blit_exec/mod.rs:1039`. The tail is whatever
+/// `Location::file()` gives after `/src/`, so a module that becomes a
+/// directory changes what this field reads — as `blit_exec` just did.
 #[track_caller]
 fn via_caller() -> String {
     let loc = std::panic::Location::caller();
