@@ -8,7 +8,10 @@
 //! `guards` answers the other one — are its pages still ours.
 
 #[cfg(feature = "backend-vulkan")]
-use super::guards::{deferred_pages_still_ours, mapping_pages_still_ours, window_pages_still_ours};
+use super::guards::{
+    deferred_flush_lost, deferred_pages_still_ours, mapping_window_refusal,
+    window_pages_still_ours, WindowRefusal,
+};
 #[cfg(feature = "backend-vulkan")]
 use super::lifecycle::release_window_pin_for_key;
 use super::witness::note_mapping_window_against_fence;
@@ -694,41 +697,21 @@ fn flush_render_one<M: HostMemory + HostOps>(
     // landing a covered window costs a full-framebuffer write for nothing, not
     // because anything here has seen it pay.
     crate::runtime::drain::note_store_route("surface_flush");
-    // Whether this writeback is owed at all, before any question about where it
-    // would land. The guard below asks "are these still our pages"; this asks
-    // the prior question the guest itself answers on every submission — has it
-    // since declared its own bytes newer than the frame this window holds.
-    if crate::runtime::resource_validity::writeback_refused(state, key.mapping_id) {
-        release_window_pin_for_key(key, source);
-        crate::observe::fail(format!(
-            "deferred_flush_lost kind=render mapping={} {}x{} fmt={:#x} gen={} \
-             reason=host_copy_superseded (the guest declared its own pages \
-             authoritative after the Store this window defers)",
-            key.mapping_id, key.width, key.height, key.pixel_format, key.map_generation
-        ));
-        return false;
-    }
-    // Recycled-pages guard, identical in intent to the compute rail's below and
-    // to the GVA rail's `deferred_pages_still_ours`: a mapping rebound since
-    // arm time (ReplacePhysical, unmap/remap) points at pages this window's
-    // pixels do not belong in, and writing them there lands a framebuffer in
-    // whatever owns that memory now. Drop rather than write.
-    let current = state
-        .mappings
-        .get(&key.mapping_id)
-        .map(|m| m.map_generation);
-    if current != Some(key.map_generation) {
+    // The three questions every mapping-keyed window answers before its bytes
+    // may be written; `guards` owns the ladder and the compute rail asks the
+    // same one.
+    if let Some(refusal) = mapping_window_refusal(state, host, key) {
         // Release the pin first. This arm returns before touching the frame, and
         // a `Resident` window holds a registry pin that nothing else will drop —
         // `evict_registry_to_cap` and the idle drain both skip pinned slots by
         // design, so a pin leaked here strands a whole framebuffer for the guest
-        // lifetime. That is the "~260 stale residents (~516 MiB)" shape, and this
-        // drift is not rare: one in 85 s on a driven boot.
+        // lifetime. That is the "~260 stale residents (~516 MiB)" shape, and the
+        // generation drift is not rare: one in 85 s on a driven boot.
         release_window_pin_for_key(key, source);
-        // Counted, not just logged. The three resident-mismatch refusals below
-        // have carried census routes since they were split apart; these two
-        // drift refusals did not, and they are the ones that lose a painted
-        // tile. `flush_intersecting` has already TAKEN this window out of
+        // Counted, not just logged, for the two drift arms. The three
+        // resident-mismatch refusals below have carried census routes since they
+        // were split apart; these two did not, and they are the ones that lose a
+        // painted tile. `flush_intersecting` has already TAKEN this window out of
         // `compute_deferred_flush`, and `flush_mapping_windows_before_fence`
         // returns `()`, so the fence advances and nothing re-arms the
         // obligation: the pixels land nowhere, permanently.
@@ -737,22 +720,24 @@ fn flush_render_one<M: HostMemory + HostOps>(
         // `mapping_pages_drifted` is not a substitute — it is incremented inside
         // `mapping_pages_still_ours`, which several callers reach, so it counts
         // refusals rather than lost tiles.
-        crate::runtime::drain::note_store_route("rendflush_gen_drift");
-        crate::observe::fail(format!(
-            "deferred_flush_lost kind=render mapping={} {}x{} fmt={:#x} gen={} reason=map_generation_drift current={current:?}",
-            key.mapping_id, key.width, key.height, key.pixel_format, key.map_generation
-        ));
-        return false;
-    }
-    // `map_generation` is the guest's *declared* incarnation, and a type-4
-    // surface can be re-pointed with nothing declared at all. See
-    // `mapping_pages_still_ours`.
-    if !mapping_pages_still_ours(state, host, key.mapping_id) {
-        release_window_pin_for_key(key, source);
-        crate::runtime::drain::note_store_route("rendflush_page_drift");
-        crate::observe::fail(format!(
-            "deferred_flush_lost kind=render mapping={} {}x{} fmt={:#x} gen={} reason=mapping_page_drift",
-            key.mapping_id, key.width, key.height, key.pixel_format, key.map_generation
+        //
+        // `HostCopySuperseded` is deliberately uncounted: the guest asked for
+        // its own bytes to win, so no tile was lost. The compute rail counts
+        // none of the three, which is a gap on that rail and not a rule here.
+        match &refusal {
+            WindowRefusal::MapGenerationDrift { .. } => {
+                crate::runtime::drain::note_store_route("rendflush_gen_drift");
+            }
+            WindowRefusal::MappingPageDrift => {
+                crate::runtime::drain::note_store_route("rendflush_page_drift");
+            }
+            WindowRefusal::HostCopySuperseded => {}
+        }
+        crate::observe::fail(deferred_flush_lost(
+            "render",
+            key,
+            None,
+            &refusal.reason("Store"),
         ));
         return false;
     }
@@ -1156,47 +1141,23 @@ fn flush_storage_one<M: HostMemory + HostOps>(
     generation: u32,
 ) -> bool {
     let started = std::time::Instant::now();
-    // Two unrelated `u32` generations are in scope here and they must not be
-    // confused in the log: `key.map_generation` is the mapping's lifetime, the
-    // quantity this guard compares, and `generation` is the pinned resident's
-    // *content* generation, which only `read_resident_storage` uses. The fail
-    // line below printed `content_gen` in a field named `gen` next to
-    // `reason=map_generation_drift`, so a live boot read out as a mapping
-    // lifetime that had gone backwards (3 -> 2) when the two numbers were
-    // simply not comparable. `gen=` is the compared value; the other one says
-    // so in its name.
-    //
-    // Same recycled-pages guard as the render flush: a surface window whose
-    // defer-time map_generation no longer matches must not write through the
-    // rewired pages.
-    // Same prior question as the render rail: is this writeback owed at all.
-    if crate::runtime::resource_validity::writeback_refused(state, key.mapping_id) {
+    // The same three questions the render rail asks, from the one ladder that
+    // owns their order. Two unrelated `u32` generations are in scope while it
+    // runs and they must not be confused in the log: `key.map_generation` is
+    // the mapping's lifetime, which is what the drift arm compares, and
+    // `generation` is the pinned resident's *content* generation, which only
+    // `read_resident_storage` uses. `deferred_flush_lost` keeps them in
+    // separate fields for that reason.
+    if let Some(refusal) = mapping_window_refusal(state, host, key) {
+        // This rail holds a pinned resident rather than a registry pin, so its
+        // release is a different call from the render rail's — which is why the
+        // ladder returns the refusal instead of reporting it.
         crate::backend::vulkan::engine::unpin_resident_storage(key);
-        crate::observe::fail(format!(
-            "deferred_flush_lost kind=compute mapping={} {}x{} fmt={:#x} gen={} \
-             content_gen={generation} reason=host_copy_superseded (the guest declared \
-             its own pages authoritative after the dispatch this window defers)",
-            key.mapping_id, key.width, key.height, key.pixel_format, key.map_generation
-        ));
-        return false;
-    }
-    let current = state
-        .mappings
-        .get(&key.mapping_id)
-        .map(|m| m.map_generation);
-    if current != Some(key.map_generation) {
-        crate::backend::vulkan::engine::unpin_resident_storage(key);
-        crate::observe::fail(format!(
-            "deferred_flush_lost kind=compute mapping={} {}x{} fmt={:#x} gen={} content_gen={generation} reason=map_generation_drift current={current:?}",
-            key.mapping_id, key.width, key.height, key.pixel_format, key.map_generation
-        ));
-        return false;
-    }
-    if !mapping_pages_still_ours(state, host, key.mapping_id) {
-        crate::backend::vulkan::engine::unpin_resident_storage(key);
-        crate::observe::fail(format!(
-            "deferred_flush_lost kind=compute mapping={} {}x{} fmt={:#x} gen={} content_gen={generation} reason=mapping_page_drift",
-            key.mapping_id, key.width, key.height, key.pixel_format, key.map_generation
+        crate::observe::fail(deferred_flush_lost(
+            "compute",
+            key,
+            Some(generation),
+            &refusal.reason("dispatch"),
         ));
         return false;
     }

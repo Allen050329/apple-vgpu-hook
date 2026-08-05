@@ -2234,3 +2234,70 @@ fn take_deferred_windows_is_exact_intersection() {
     assert_eq!(state.compute_deferred_flush.len(), 1);
     assert!(state.compute_deferred_flush.contains_key(&key(8, 0, 256)));
 }
+
+/// The two rails' six `deferred_flush_lost` lines, spelled out.
+///
+/// The render and compute rails ask the same three questions and used to
+/// report them with six hand-written format strings. They now share one
+/// builder and one reason table, and the whole value of that is that the lines
+/// did not change: `/tmp/reims-vgpu-fail.log` is read by grep and by eye, and a
+/// field that quietly moves, gains a space or loses its `content_gen=` breaks
+/// every reading anyone has written down.
+///
+/// So this asserts the literals rather than round-tripping the builder against
+/// itself — a builder compared to its own output cannot notice that it now
+/// emits something no reader expects. The `defers` word and the presence of
+/// `content_gen=` are the only two things that may differ between the rails,
+/// and both are visible here.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn the_two_rails_report_the_three_shared_refusals_exactly_as_they_always_did() {
+    use super::guards::{deferred_flush_lost, WindowRefusal};
+
+    let k = key(7, 0, 256);
+    let refusals = [
+        WindowRefusal::HostCopySuperseded,
+        WindowRefusal::MapGenerationDrift { current: Some(2) },
+        WindowRefusal::MappingPageDrift,
+    ];
+
+    let render: Vec<String> = refusals
+        .iter()
+        .map(|r| deferred_flush_lost("render", &k, None, &r.reason("Store")))
+        .collect();
+    assert_eq!(
+        render,
+        vec![
+            "deferred_flush_lost kind=render mapping=7 4x4 fmt=0x46 gen=1 \
+             reason=host_copy_superseded (the guest declared its own pages \
+             authoritative after the Store this window defers)",
+            "deferred_flush_lost kind=render mapping=7 4x4 fmt=0x46 gen=1 \
+             reason=map_generation_drift current=Some(2)",
+            "deferred_flush_lost kind=render mapping=7 4x4 fmt=0x46 gen=1 \
+             reason=mapping_page_drift",
+        ]
+    );
+
+    let compute: Vec<String> = refusals
+        .iter()
+        .map(|r| deferred_flush_lost("compute", &k, Some(9), &r.reason("dispatch")))
+        .collect();
+    assert_eq!(
+        compute,
+        vec![
+            "deferred_flush_lost kind=compute mapping=7 4x4 fmt=0x46 gen=1 content_gen=9 \
+             reason=host_copy_superseded (the guest declared its own pages \
+             authoritative after the dispatch this window defers)",
+            "deferred_flush_lost kind=compute mapping=7 4x4 fmt=0x46 gen=1 content_gen=9 \
+             reason=map_generation_drift current=Some(2)",
+            "deferred_flush_lost kind=compute mapping=7 4x4 fmt=0x46 gen=1 content_gen=9 \
+             reason=mapping_page_drift",
+        ]
+    );
+
+    // `gen=` is the mapping lifetime and `content_gen=` is the resident's
+    // content generation. Reversing them once made a boot read as a mapping
+    // lifetime running backwards, so the distinction is asserted and not just
+    // documented: the two fields carry different values here.
+    assert!(compute[1].contains("gen=1 content_gen=9"));
+}

@@ -242,7 +242,7 @@ pub(crate) fn deferred_pages_still_ours<M: HostMemory + HostOps>(
 /// fabricated at its own GVA, refused when the live walk disagreed);
 /// `a_render_window_over_repointed_pages_is_refused_and_counted` is that boot
 /// turned into a test, and it fails on the collapsed version.
-pub(super) fn mapping_pages_still_ours<M: HostMemory + HostOps>(
+fn mapping_pages_still_ours<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     mapping_id: u32,
@@ -266,4 +266,104 @@ pub(super) fn mapping_pages_still_ours<M: HostMemory + HostOps>(
             false
         }
     }
+}
+
+/// Which of the three questions a mapping-keyed window failed.
+///
+/// Two rails land such a window — the render Store rail and the compute
+/// storage rail — and both must ask exactly these three, in exactly this
+/// order, before writing a byte. They used to ask them twice: two copies of
+/// the ladder, two copies of the fail line, and the copies had already parted
+/// in one visible way (only the render copy counts its refusals on the census).
+/// The order is the argument, so it belongs in one place.
+pub(super) enum WindowRefusal {
+    /// The guest declared its own pages authoritative after the work this
+    /// window defers, so nothing is owed. Asked first because it is the prior
+    /// question: the other two ask *where* the bytes would land, this asks
+    /// whether they are owed at all.
+    HostCopySuperseded,
+    /// The mapping was rebound since arm time (ReplacePhysical, unmap/remap),
+    /// so it points at pages this window's pixels do not belong in. Writing
+    /// them there lands a framebuffer in whatever owns that memory now.
+    MapGenerationDrift { current: Option<u32> },
+    /// `map_generation` is the guest's *declared* incarnation, and a type-4
+    /// surface can be re-pointed with nothing declared at all — so the pages
+    /// are re-walked even when the generation matches. See
+    /// [`mapping_pages_still_ours`].
+    MappingPageDrift,
+}
+
+impl WindowRefusal {
+    /// The `reason=` field, including whatever the reason itself carries.
+    ///
+    /// `defers` names the guest work this rail's window holds — a Store for the
+    /// render rail, a dispatch for the compute one. It is the only per-rail
+    /// word in any of the three, which is why it is a parameter rather than a
+    /// second copy of the sentence.
+    pub(super) fn reason(&self, defers: &str) -> String {
+        match self {
+            Self::HostCopySuperseded => format!(
+                "host_copy_superseded (the guest declared its own pages \
+                 authoritative after the {defers} this window defers)"
+            ),
+            Self::MapGenerationDrift { current } => {
+                format!("map_generation_drift current={current:?}")
+            }
+            Self::MappingPageDrift => "mapping_page_drift".to_string(),
+        }
+    }
+}
+
+/// Ask a mapping-keyed window's three questions, in order. `None` means the
+/// bytes are still owed and may still be written where the key says.
+///
+/// Nothing is released here. Both callers hold something that must be dropped
+/// on a refusal — a registry pin on the render rail, a pinned resident on the
+/// compute one — and they are not the same thing, so the release stays at the
+/// call site where the reader can see which one it is.
+pub(super) fn mapping_window_refusal<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    key: &crate::model::ComputeStorageResidencyKey,
+) -> Option<WindowRefusal> {
+    if crate::runtime::resource_validity::writeback_refused(state, key.mapping_id) {
+        return Some(WindowRefusal::HostCopySuperseded);
+    }
+    let current = state
+        .mappings
+        .get(&key.mapping_id)
+        .map(|m| m.map_generation);
+    if current != Some(key.map_generation) {
+        return Some(WindowRefusal::MapGenerationDrift { current });
+    }
+    if !mapping_pages_still_ours(state, host, key.mapping_id) {
+        return Some(WindowRefusal::MappingPageDrift);
+    }
+    None
+}
+
+/// The `deferred_flush_lost` line every mapping-keyed refusal writes.
+///
+/// Six copies of this prefix used to be spelled out, and the field set is
+/// exactly what a reader of the log reasons from: one of them printed the
+/// resident's *content* generation in a field named `gen`, next to
+/// `reason=map_generation_drift`, and a boot was read as showing a mapping
+/// lifetime running backwards (`gen=3 current=Some(2)`) when the two numbers
+/// were never comparable. `gen=` is the mapping lifetime — the quantity the
+/// drift guard compares — and `content_gen=`, when a rail has one, is the
+/// pinned resident's content generation.
+pub(super) fn deferred_flush_lost(
+    kind: &str,
+    key: &crate::model::ComputeStorageResidencyKey,
+    content_gen: Option<u32>,
+    reason: &str,
+) -> String {
+    let content = match content_gen {
+        Some(g) => format!(" content_gen={g}"),
+        None => String::new(),
+    };
+    format!(
+        "deferred_flush_lost kind={kind} mapping={} {}x{} fmt={:#x} gen={}{content} reason={reason}",
+        key.mapping_id, key.width, key.height, key.pixel_format, key.map_generation
+    )
 }
