@@ -580,12 +580,24 @@ fn apply_icb_encoder_inheritance<M: HostMemory + HostOps>(
                 pipeline_ref: req.pipeline_ref,
             },
         )?;
-        let Some(vert) = load_mtlb(state, host, req.task_id, pipeline.vertex_func_ref) else {
+        let Some(vert) = load_mtlb(
+            state,
+            host,
+            req.task_id,
+            pipeline.vertex_func_ref,
+            AirLoadRail::Draw,
+        ) else {
             return Err(MetalIcbInheritanceDecline::VertexMtlbMissing {
                 function_ref: pipeline.vertex_func_ref,
             });
         };
-        let Some(frag) = load_mtlb(state, host, req.task_id, pipeline.fragment_func_ref) else {
+        let Some(frag) = load_mtlb(
+            state,
+            host,
+            req.task_id,
+            pipeline.fragment_func_ref,
+            AirLoadRail::Draw,
+        ) else {
             return Err(MetalIcbInheritanceDecline::FragmentMtlbMissing {
                 function_ref: pipeline.fragment_func_ref,
             });

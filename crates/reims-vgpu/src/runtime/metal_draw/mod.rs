@@ -31,10 +31,9 @@ use crate::runtime::decode::resource::ListObjectEntry;
 use crate::runtime::decode::resource::TextureDescriptor;
 use crate::runtime::decode::resource::{
     decode_buffer_descriptor, decode_buffer_texture_descriptor, decode_depth_stencil_descriptor,
-    decode_function_descriptor, decode_render_pipeline_descriptor, decode_sampler_descriptor,
-    decode_texture_descriptor, texture_type8_opcode, BufferTextureDescriptor, DecodeStatus,
-    FunctionDescriptor, RenderPipelineDescriptor, OBJECT_TYPE_BUFFER, OBJECT_TYPE_FUNCTION,
-    OBJECT_TYPE_IOSURFACE, OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_VARIANT,
+    decode_render_pipeline_descriptor, decode_sampler_descriptor, decode_texture_descriptor,
+    texture_type8_opcode, BufferTextureDescriptor, DecodeStatus, RenderPipelineDescriptor,
+    OBJECT_TYPE_BUFFER, OBJECT_TYPE_IOSURFACE, OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_VARIANT,
     OBJECT_TYPE_TEXTURE_VIEW, OBJECT_TYPE_TYPE7, TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE,
     TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE_WIDE,
 };
@@ -44,6 +43,7 @@ use crate::runtime::mapper;
 #[cfg(feature = "backend-vulkan")]
 use crate::runtime::mapper::{mapping_guest_write_verdict, GuestWriteVerdict};
 use crate::runtime::mapping_write;
+use crate::runtime::mtlb::{load_mtlb, AirLoadRail};
 use crate::runtime::objects;
 
 // The Vulkan half of this path. Gated once here rather than per item, and
@@ -744,41 +744,6 @@ impl crate::observe::Decline for IndexLoadReason {
     }
 }
 
-fn load_mtlb<M: HostMemory + HostOps>(
-    state: &DeviceState,
-    host: &M,
-    task_id: u32,
-    func_ref: u32,
-) -> Option<Vec<u8>> {
-    if func_ref == 0 {
-        return None;
-    }
-    let entry = objects::lookup_list_entry(state, host, task_id, func_ref)?;
-    // Live object-list: function = type 6.
-    if entry.object_type != OBJECT_TYPE_FUNCTION {
-        return None;
-    }
-    let desc = objects::read_descriptor(state, host, task_id, &entry)?;
-    let f: FunctionDescriptor = decode_function_descriptor(&desc).ok()?;
-    if f.blob_gva == 0 || f.blob_size < 4 {
-        return None;
-    }
-    // Guest blob_size is authoritative — no product 1 MiB MTLB ceiling.
-    let len = host_alloc_len(f.blob_size as u64)?;
-    let mut mtlb = vec![0u8; len];
-    // Device page_shift (x86=12); unshifted helper defaults to arm14 and fails loads.
-    gva_mem::read_task_gva_by_id(
-        host,
-        &state.tasks,
-        task_id,
-        f.blob_gva,
-        &mut mtlb,
-        state.page_shift,
-    )
-    .ok()?;
-    Some(mtlb)
-}
-
 fn load_render_pipeline<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &M,
@@ -814,18 +779,23 @@ pub(crate) fn load_render_air_pair<M: HostMemory + HostOps>(
             pipeline_ref,
         },
     )?;
-    let v_mtlb = load_mtlb(state, host, task_id, pd.vertex_func_ref).ok_or(
+    let v_mtlb = load_mtlb(state, host, task_id, pd.vertex_func_ref, AirLoadRail::Draw).ok_or(
         DrawPreparationDecline::VertexMtlbMissing {
             task_id,
             function_ref: pd.vertex_func_ref,
         },
     )?;
-    let f_mtlb = load_mtlb(state, host, task_id, pd.fragment_func_ref).ok_or(
-        DrawPreparationDecline::FragmentMtlbMissing {
-            task_id,
-            function_ref: pd.fragment_func_ref,
-        },
-    )?;
+    let f_mtlb = load_mtlb(
+        state,
+        host,
+        task_id,
+        pd.fragment_func_ref,
+        AirLoadRail::Draw,
+    )
+    .ok_or(DrawPreparationDecline::FragmentMtlbMissing {
+        task_id,
+        function_ref: pd.fragment_func_ref,
+    })?;
     let v_air = crate::runtime::mtlb::extract_air(&v_mtlb)
         .map_err(|reason| DrawPreparationDecline::VertexAirExtract {
             function_ref: pd.vertex_func_ref,
@@ -1245,14 +1215,26 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
             None,
         );
     };
-    let Some(vert) = load_mtlb(state, host, req.task_id, pipeline.vertex_func_ref) else {
+    let Some(vert) = load_mtlb(
+        state,
+        host,
+        req.task_id,
+        pipeline.vertex_func_ref,
+        AirLoadRail::Draw,
+    ) else {
         crate::observe::fail(format!(
             "metal_draw MissingMtlb vert_func={} pipe={}",
             pipeline.vertex_func_ref, req.pipeline_ref
         ));
         return (EncodeStatus::MissingMtlb("draw_mtl_vertex_mtlb_load"), None);
     };
-    let Some(frag) = load_mtlb(state, host, req.task_id, pipeline.fragment_func_ref) else {
+    let Some(frag) = load_mtlb(
+        state,
+        host,
+        req.task_id,
+        pipeline.fragment_func_ref,
+        AirLoadRail::Draw,
+    ) else {
         crate::observe::fail(format!(
             "metal_draw MissingMtlb frag_func={} pipe={}",
             pipeline.fragment_func_ref, req.pipeline_ref

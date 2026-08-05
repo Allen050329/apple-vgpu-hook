@@ -4036,7 +4036,14 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             },
         )
     })?;
-    let v_mtlb = load_mtlb(state, host, req.task_id, pd.vertex_func_ref).ok_or({
+    let v_mtlb = load_mtlb(
+        state,
+        host,
+        req.task_id,
+        pd.vertex_func_ref,
+        AirLoadRail::Draw,
+    )
+    .ok_or({
         DrawError::DrawPreparation(
             crate::backend::vulkan::engine::DrawPreparationDecline::VertexMtlbMissing {
                 task_id: req.task_id,
@@ -4044,7 +4051,14 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             },
         )
     })?;
-    let f_mtlb = load_mtlb(state, host, req.task_id, pd.fragment_func_ref).ok_or({
+    let f_mtlb = load_mtlb(
+        state,
+        host,
+        req.task_id,
+        pd.fragment_func_ref,
+        AirLoadRail::Draw,
+    )
+    .ok_or({
         DrawError::DrawPreparation(
             crate::backend::vulkan::engine::DrawPreparationDecline::FragmentMtlbMissing {
                 task_id: req.task_id,

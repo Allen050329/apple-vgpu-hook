@@ -549,13 +549,14 @@ fn apply_icb_compute_encoder_inheritance<M: HostMemory + HostOps>(
     use crate::backend::metal::util::{image_len, valid_buffer_binding};
     use crate::contract::endian::ld32;
     use crate::runtime::compute_exec::{
-        load_compute_pipeline, load_mtlb, nested_job_from_icb_resources, split_staged_textures,
-        stage_buffer, stage_texture_raw,
+        load_compute_pipeline, nested_job_from_icb_resources, split_staged_textures, stage_buffer,
+        stage_texture_raw,
     };
     use crate::runtime::decode::resource::{
         decode_sampler_descriptor, OBJECT_TYPE_TYPE7, TYPE7_OBJECT_SAMPLER,
     };
     use crate::runtime::icb::new_icb_compute_pso;
+    use crate::runtime::mtlb::{load_mtlb, AirLoadRail};
     use crate::runtime::objects;
     use metal::{
         MTLRegion, MTLResourceUsage, MTLStorageMode, MTLTextureType, MTLTextureUsage,
@@ -572,8 +573,14 @@ fn apply_icb_compute_encoder_inheritance<M: HostMemory + HostOps>(
         let pipeline = load_compute_pipeline(state, host, task_id, acc.pipeline_ref).ok_or(
             ComputeStatus::MissingPipeline("compute_icb_inherit_pipeline_load"),
         )?;
-        let mtlb = load_mtlb(state, host, task_id, pipeline.kernel_func_ref)
-            .ok_or(ComputeStatus::MissingMtlb("compute_icb_inherit_mtlb_load"))?;
+        let mtlb = load_mtlb(
+            state,
+            host,
+            task_id,
+            pipeline.kernel_func_ref,
+            AirLoadRail::Compute,
+        )
+        .ok_or(ComputeStatus::MissingMtlb("compute_icb_inherit_mtlb_load"))?;
         let pso = new_icb_compute_pso(&session.device, &mtlb).map_err(ComputeStatus::from)?;
         session.encoder.set_compute_pipeline_state(&pso);
         session.retained_psos.push(pso);
@@ -654,9 +661,16 @@ fn apply_icb_compute_encoder_inheritance<M: HostMemory + HostOps>(
         let pipeline = load_compute_pipeline(state, host, task_id, acc.pipeline_ref).ok_or(
             ComputeStatus::MissingPipeline("compute_icb_inherit_tex_pipeline_load"),
         )?;
-        let mtlb = load_mtlb(state, host, task_id, pipeline.kernel_func_ref).ok_or(
-            ComputeStatus::MissingMtlb("compute_icb_inherit_tex_mtlb_load"),
-        )?;
+        let mtlb = load_mtlb(
+            state,
+            host,
+            task_id,
+            pipeline.kernel_func_ref,
+            AirLoadRail::Compute,
+        )
+        .ok_or(ComputeStatus::MissingMtlb(
+            "compute_icb_inherit_tex_mtlb_load",
+        ))?;
 
         let library = session
             .device

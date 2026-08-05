@@ -641,8 +641,13 @@ fn preflight_compute_translations<M: HostMemory + HostOps>(
         else {
             continue;
         };
-        let Some(mtlb) = compute_exec::load_mtlb(state, host, task_id, pipeline.kernel_func_ref)
-        else {
+        let Some(mtlb) = crate::runtime::mtlb::load_mtlb(
+            state,
+            host,
+            task_id,
+            pipeline.kernel_func_ref,
+            crate::runtime::mtlb::AirLoadRail::Compute,
+        ) else {
             continue;
         };
         let Ok(air) = crate::runtime::mtlb::extract_air(&mtlb) else {

@@ -75,8 +75,9 @@
 /// had ten spellings.
 ///
 /// A rail whose event name already carries the domain passes `""` — see
-/// `compute_exec`'s `compute_load_mtlb fail reason=…`, where the reason is
-/// bare on purpose because the event says which load it was.
+/// [`crate::runtime::mtlb::load_mtlb`]'s `{compute,draw}_load_mtlb fail
+/// reason=…`, where the reason is bare on purpose because the event says which
+/// load it was.
 ///
 /// ```ignore
 /// ladder_slug!("buf", no_list_entry)  // "buf_no_list_entry"

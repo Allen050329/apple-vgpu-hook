@@ -31,10 +31,9 @@ use crate::runtime::decode::compute::{
     BufferBinding, Command as ComputeCommand, Kind, RefBinding, SamplerBinding,
 };
 use crate::runtime::decode::resource::{
-    decode_function_descriptor, decode_heap_texture, decode_texture_descriptor,
-    decode_type7_descriptor, texture_type8_opcode, ComputeStageInputDescriptor,
-    Descriptor as ResourceDescriptor, HEAP_TEXTURE_OPCODE, HEAP_TEXTURE_WIDE_OPCODE,
-    OBJECT_TYPE_BUFFER, OBJECT_TYPE_FUNCTION, OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_VARIANT,
+    decode_heap_texture, decode_texture_descriptor, decode_type7_descriptor, texture_type8_opcode,
+    ComputeStageInputDescriptor, Descriptor as ResourceDescriptor, HEAP_TEXTURE_OPCODE,
+    HEAP_TEXTURE_WIDE_OPCODE, OBJECT_TYPE_BUFFER, OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_VARIANT,
     OBJECT_TYPE_TEXTURE_VIEW, OBJECT_TYPE_TYPE7, TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE,
     TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE_WIDE,
 };
@@ -45,6 +44,7 @@ use crate::runtime::host::{HostMemory, HostOps};
 use crate::runtime::mapper;
 use crate::runtime::mapping_write;
 use crate::runtime::metal_draw::host_alloc_len;
+use crate::runtime::mtlb::{load_mtlb, AirLoadRail};
 use crate::runtime::objects;
 
 /// Cap on Metal compute buffer slots (matches backend `REIMS_VGPU_METAL_MAX_BUFFERS`).
@@ -621,84 +621,6 @@ fn apply_record_inner<M: HostMemory + HostOps>(
         ),
         Kind::Unknown => None,
     }
-}
-
-pub(crate) fn load_mtlb<M: HostMemory + HostOps>(
-    state: &DeviceState,
-    host: &M,
-    task_id: u32,
-    func_ref: u32,
-) -> Option<Vec<u8>> {
-    // ref==0 is "no function bound" (legitimate, e.g. no fragment stage) — stay
-    // silent. Every other None is a bound function that failed to materialize,
-    // collapsing into the caller's coarse MissingMtlb; log the reason (audit).
-    if func_ref == 0 {
-        return None;
-    }
-    let miss = |reason: &str, detail: String| -> Option<Vec<u8>> {
-        crate::observe::fail(format!(
-            "compute_load_mtlb fail reason={reason} task={task_id} func_ref={func_ref} {detail}"
-        ));
-        None
-    };
-    // The detail the `wrong_type` line carries comes off the rung now: it is the
-    // only thing that still holds the tag once the entry is gone.
-    let (_entry, desc) = match objects::resolve_descriptor(
-        state,
-        host,
-        task_id,
-        func_ref,
-        &[OBJECT_TYPE_FUNCTION],
-    ) {
-        Ok(found) => found,
-        Err(rung) => {
-            return miss(
-                crate::observe::ladder_slugs!("")(rung),
-                match rung {
-                    objects::LadderRung::WrongType { got } => format!("ot={got}"),
-                    objects::LadderRung::NoListEntry | objects::LadderRung::DescRead { .. } => {
-                        String::new()
-                    }
-                },
-            )
-        }
-    };
-    let Ok(f) = decode_function_descriptor(&desc) else {
-        return miss(
-            crate::observe::ladder_slug!("", desc_decode),
-            format!("desc_len={}", desc.len()),
-        );
-    };
-    if f.blob_gva == 0 || f.blob_size < 4 {
-        return miss(
-            "bad_blob",
-            format!("blob_gva={:#x} blob_size={}", f.blob_gva, f.blob_size),
-        );
-    }
-    // Guest blob_size is authoritative — no product 1 MiB MTLB ceiling.
-    let Some(len) = host_alloc_len(f.blob_size as u64) else {
-        return miss(
-            "host_len",
-            format!("blob_gva={:#x} blob_size={}", f.blob_gva, f.blob_size),
-        );
-    };
-    let mut mtlb = vec![0u8; len];
-    if gva_mem::read_task_gva_by_id(
-        host,
-        &state.tasks,
-        task_id,
-        f.blob_gva,
-        &mut mtlb,
-        state.page_shift,
-    )
-    .is_err()
-    {
-        return miss(
-            "gva_read",
-            format!("blob_gva={:#x} blob_size={}", f.blob_gva, f.blob_size),
-        );
-    }
-    Some(mtlb)
 }
 
 pub(crate) struct LoadedComputePipeline {
@@ -3169,7 +3091,13 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
         }
     }
     // MTLB → AIR → SPIR-V (LocalSize = threadgroup dims).
-    let Some(mtlb) = load_mtlb(state, host, task_id, pipeline.kernel_func_ref) else {
+    let Some(mtlb) = load_mtlb(
+        state,
+        host,
+        task_id,
+        pipeline.kernel_func_ref,
+        AirLoadRail::Compute,
+    ) else {
         return ComputeStatus::MissingMtlb("compute_vk_mtlb_load");
     };
     // The function blob is an MTLB container; llvm-dis needs the wrapped AIR
@@ -4262,7 +4190,13 @@ fn execute_dispatch_metal<M: HostMemory + HostOps>(
     let Some(pipeline) = load_compute_pipeline(state, host, task_id, acc.pipeline_ref) else {
         return ComputeStatus::MissingPipeline("compute_mtl_pipeline_load");
     };
-    let Some(mtlb) = load_mtlb(state, host, task_id, pipeline.kernel_func_ref) else {
+    let Some(mtlb) = load_mtlb(
+        state,
+        host,
+        task_id,
+        pipeline.kernel_func_ref,
+        AirLoadRail::Compute,
+    ) else {
         return ComputeStatus::MissingMtlb("compute_mtl_mtlb_load");
     };
 

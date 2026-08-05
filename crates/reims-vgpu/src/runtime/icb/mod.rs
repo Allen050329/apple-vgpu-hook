@@ -2709,9 +2709,8 @@ pub fn fill_compute_command<M: HostMemory + HostOps>(
 ) -> Result<(), IcbStatus> {
     use crate::backend::metal::raw_metal::mtl_size;
     use crate::backend::metal::runtime::{new_buffer_from_host, system_device};
-    use crate::runtime::compute_exec::{
-        load_compute_pipeline, load_mtlb, stage_buffer, ComputeBufferBind,
-    };
+    use crate::runtime::compute_exec::{load_compute_pipeline, stage_buffer, ComputeBufferBind};
+    use crate::runtime::mtlb::{load_mtlb, AirLoadRail};
 
     if icb_ref == 0 {
         return Err(IcbStatus::Args("icb_fcc_ref_zero"));
@@ -2733,8 +2732,14 @@ pub fn fill_compute_command<M: HostMemory + HostOps>(
         }
         let pipeline = load_compute_pipeline(state, host, task_id, fill.pipeline_ref)
             .ok_or(IcbStatus::Missing("icb_fcc_pipeline_load"))?;
-        let mtlb = load_mtlb(state, host, task_id, pipeline.kernel_func_ref)
-            .ok_or(IcbStatus::Missing("icb_fcc_mtlb_load"))?;
+        let mtlb = load_mtlb(
+            state,
+            host,
+            task_id,
+            pipeline.kernel_func_ref,
+            AirLoadRail::Compute,
+        )
+        .ok_or(IcbStatus::Missing("icb_fcc_mtlb_load"))?;
         Some(new_icb_compute_pso(device, &mtlb)?)
     } else {
         None
