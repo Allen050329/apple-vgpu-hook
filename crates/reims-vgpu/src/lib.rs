@@ -1494,46 +1494,15 @@ pub fn device_scanout_copy(
             height,
             generation,
         );
-        // Entry-side waitForPendingFrames: paint frees held DisplaySwap packets
-        // at channel head (unpainted_presents cleared). Stamp of accepted
-        // presents already fired at retain — do not complete stamps here.
-        if matches!(
-            rc,
-            ScanoutCopyResult::Painted | ScanoutCopyResult::Unchanged
-        ) {
-            runtime::drain::note_present_paint_consumed(&mut device.state);
-            slot.present_action_pending.store(false, Ordering::Release);
-            host.schedule_bh();
-        } else if present_action {
-            // The host consumed this action even though the copy failed. Do
-            // not strand all later channels behind an action C cannot replay.
-            runtime::drain::note_present_paint_consumed(&mut device.state);
-            slot.present_action_pending.store(false, Ordering::Release);
-            host.schedule_bh();
-        }
+        note_scanout_copy_consumed(&mut device.state, &mut host, &slot, rc, present_action);
         rc
     } else {
-        // Unit tests / no host: GPA+KVA fail → black clear.
-        struct EmptyMem;
-        impl runtime::host::HostMemory for EmptyMem {
-            fn read_gpa(&self, _gpa: u64, _buf: &mut [u8]) -> Result<(), runtime::host::MemError> {
-                Err(runtime::host::MemError::Unmapped)
-            }
-            fn write_gpa(&mut self, _gpa: u64, _buf: &[u8]) -> Result<(), runtime::host::MemError> {
-                Err(runtime::host::MemError::Unmapped)
-            }
-        }
-        impl HostOps for EmptyMem {
-            fn mono_ns(&self) -> u64 {
-                0
-            }
-            fn enqueue(&mut self, _action: HostAction) {}
-            fn schedule_bh(&mut self) {}
-        }
-        let mut empty = EmptyMem;
+        // No QEMU ops table is bound (unit tests / headless create), so every
+        // guest read fails and the copy falls back to a black clear.
+        let mut host = NullHost;
         let rc = runtime::scanout::copy_to_bgra8(
             &mut d.device.state,
-            &mut empty,
+            &mut host,
             mapping_id,
             dst,
             dst_stride,
@@ -1541,17 +1510,45 @@ pub fn device_scanout_copy(
             height,
             generation,
         );
-        if matches!(
-            rc,
-            ScanoutCopyResult::Painted | ScanoutCopyResult::Unchanged
-        ) {
-            runtime::drain::note_present_paint_consumed(&mut d.device.state);
-        }
-        if present_action {
-            slot.present_action_pending.store(false, Ordering::Release);
-        }
+        note_scanout_copy_consumed(&mut d.device.state, &mut host, &slot, rc, present_action);
         rc
     }
+}
+
+/// Entry-side `waitForPendingFrames`: what one `copy_to_bgra8` owes the device
+/// once it returns.
+///
+/// Two conditions, one rule. A copy that painted — or that found nothing to
+/// redo — frees the DisplaySwap packet held at channel head. A copy that
+/// *failed* owes exactly the same whenever `present_action` was set, because
+/// the host consumed the action either way and C cannot replay it; leaving it
+/// outstanding strands every later channel behind it.
+///
+/// The stamp for accepted presents fires at retain, not here.
+///
+/// This lives apart from [`device_scanout_copy`] because that function picks
+/// between two hosts and the rule is the same under both. It was written out
+/// once per arm before, and the two copies had already drifted: the headless
+/// arm cleared the pending flag after a failed copy without recording the
+/// consumption, which is the stranding the paragraph above forbids.
+fn note_scanout_copy_consumed<H: HostOps>(
+    state: &mut crate::model::DeviceState,
+    host: &mut H,
+    slot: &BoundDevice,
+    rc: runtime::scanout::ScanoutCopyResult,
+    present_action: bool,
+) {
+    use runtime::scanout::ScanoutCopyResult;
+    let painted = matches!(
+        rc,
+        ScanoutCopyResult::Painted | ScanoutCopyResult::Unchanged
+    );
+    if !painted && !present_action {
+        return;
+    }
+    runtime::drain::note_present_paint_consumed(state);
+    slot.present_action_pending.store(false, Ordering::Release);
+    host.schedule_bh();
 }
 
 /// Cursor glyph metadata for the QEMU console.
@@ -1649,6 +1646,41 @@ mod tests {
         assert_eq!(device_gfx_read(id, 0x1034, 4), Some(0x3e));
         assert!(device_iosfc_write(id, 0x1008, 0x400, 4));
         assert_eq!(device_iosfc_read(id, 0x1008, 4), Some(0x400));
+        assert!(device_destroy(id));
+    }
+
+    /// A copy that fails still owes the consumption when a present action was
+    /// pending, whichever host ran it.
+    ///
+    /// The headless arm used to clear `present_action_pending` and leave
+    /// `unpainted_presents` standing, so the flag said "nothing outstanding"
+    /// while the backpressure counter said the opposite — the stranding
+    /// [`note_scanout_copy_consumed`] exists to prevent, on the one arm nobody
+    /// was reading.
+    #[test]
+    fn a_failed_copy_still_frees_a_consumed_present_action() {
+        let id = device_create(None, PAGE_SHIFT_ARM64E).expect("create");
+        let slot = device_slot(id).expect("slot");
+        slot.inner.lock().device.state.present.unpainted_presents = 3;
+        slot.present_action_pending.store(true, Ordering::Release);
+
+        let mut dst = [0u8; 4];
+        let rc = device_scanout_copy(id, 7, &mut dst, 4, 1, 1, 0);
+        assert_eq!(
+            rc,
+            runtime::scanout::ScanoutCopyResult::Failed,
+            "a headless device has no guest memory to paint from"
+        );
+
+        assert!(
+            !slot.present_action_pending.load(Ordering::Acquire),
+            "the host consumed the action; C cannot replay it"
+        );
+        assert_eq!(
+            slot.inner.lock().device.state.present.unpainted_presents,
+            0,
+            "and the backpressure counter must agree with the flag"
+        );
         assert!(device_destroy(id));
     }
 
