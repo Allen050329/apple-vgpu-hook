@@ -555,12 +555,17 @@ pub struct ColorRtKey {
 
 // Every argument is one component of the pipeline-state key, and the point of
 // the function is that the key is built from exactly these and nothing else.
+//
+// The two shader modules arrive as slices rather than as the four
+// `(hash, len)` words they contribute. Those words are each derived from one of
+// these two slices and are only correct paired with the slice they came from, so
+// deriving them here is what makes `hash_bytes(vert) , frag.len()` unspellable —
+// a mispairing that compiles, keys a pipeline nobody asked for, and then serves
+// it out of the cache to every draw with the same wrong key.
 #[allow(clippy::too_many_arguments)]
 fn fill_render_pso_key(
-    vert_hash: u64,
-    vert_len: usize,
-    frag_hash: u64,
-    frag_len: usize,
+    vert_mtlb: &[u8],
+    frag_mtlb: &[u8],
     attrs: &[ReimsVgpuVertexAttr],
     blend: Option<&ReimsVgpuBlendState>,
     color_rts: &[ColorRtKey],
@@ -569,10 +574,10 @@ fn fill_render_pso_key(
 ) -> RenderPsoKey {
     use crate::backend::metal::constants::REIMS_VGPU_METAL_MAX_COLOR_RTS;
     let mut key = RenderPsoKey {
-        vert_hash,
-        frag_hash,
-        vert_len,
-        frag_len,
+        vert_hash: hash_bytes(vert_mtlb),
+        frag_hash: hash_bytes(frag_mtlb),
+        vert_len: vert_mtlb.len(),
+        frag_len: frag_mtlb.len(),
         attr_count: attrs.len() as u32,
         ..Default::default()
     };
@@ -633,10 +638,12 @@ fn fill_render_pso_key(
     key.stencil_pixel_format = stencil_pixel_format;
 
     let mut h = 0xcbf29ce484222325u64;
-    h = hash_u64(h, vert_hash);
-    h = hash_u64(h, frag_hash);
-    h = hash_u64(h, vert_len as u64);
-    h = hash_u64(h, frag_len as u64);
+    // Folded off the key's own fields rather than off parallel locals, so the
+    // hash cannot describe a key different from the one it is returned with.
+    h = hash_u64(h, key.vert_hash);
+    h = hash_u64(h, key.frag_hash);
+    h = hash_u64(h, key.vert_len as u64);
+    h = hash_u64(h, key.frag_len as u64);
     h = hash_u64(h, key.attr_count as u64);
     for i in 0..key.attr_count as usize {
         h = hash_u64(h, key.attr_location[i] as u64);
@@ -1752,10 +1759,8 @@ pub fn render_core_mrt(
         })
         .collect();
     let pso_key = fill_render_pso_key(
-        hash_bytes(vert_mtlb),
-        vert_mtlb.len(),
-        hash_bytes(frag_mtlb),
-        frag_mtlb.len(),
+        vert_mtlb,
+        frag_mtlb,
         attrs,
         blend,
         &color_rt_keys,
