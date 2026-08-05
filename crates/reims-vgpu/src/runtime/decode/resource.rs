@@ -1780,6 +1780,13 @@ pub fn decode_depth_stencil_descriptor(
 /// refusal would drop a whole sampler over one out-of-range field; counted so
 /// the choice is not silent. This is the single site — the four `.max(1)`s
 /// downstream of it are gone, and with them the one consumer that had none.
+///
+/// `sampler_max_anisotropy_zero` **never fires** on a driven x86/Vulkan boot
+/// (25 s Safari window drag, 2 758 posted events, ~1 500 draws), which is the
+/// healthy reading and matches what the oracle says: every sampler this
+/// workload creates declares a value in range. A firing is the signal, and it
+/// would mean the field can be zero after all — at which point the question is
+/// whether the record deserves a refusal rather than a floor.
 fn wire_max_anisotropy(value: u8) -> u32 {
     if value != 0 {
         return u32::from(value);
