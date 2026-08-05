@@ -718,15 +718,6 @@ pub(crate) const HEAP_TEXTURE_DESCRIPTOR: usize = OP_HDR + offset_of!(w_heap::Ne
 pub const HEAP_TEXTURE_USE_OFFSET: usize =
     OP_HDR + offset_of!(w_heap::NewHeapTextureBody, use_offset_bits);
 pub const HEAP_TEXTURE_OFFSET: usize = OP_HDR + offset_of!(w_heap::NewHeapTextureBody, offset);
-/// `useOffset` is **one bit** of the byte at [`HEAP_TEXTURE_USE_OFFSET`].
-///
-/// Measured, not assumed: `reims_vgpu_wire::ops::heap_texture` captures this
-/// record under two complementary arena fills and the bits that agree are the
-/// ones the serializer wrote. Only bit 0 of that byte does. The seven bits
-/// above it and the three bytes to [`HEAP_TEXTURE_OFFSET`] are whatever the
-/// guest's ring last contained, so a 32-bit load here reads noise into 31 of
-/// its bits.
-pub const HEAP_TEXTURE_USE_OFFSET_BIT: u8 = 0x1;
 
 // The same record once the guest's serializer has `TextureDescriptor2` on. It
 // is a different opcode, not a longer one, and every field after the heap ref
@@ -2182,8 +2173,12 @@ pub struct HeapTextureRecord<'a> {
 /// The layout is pinned by `reims_vgpu_wire::ops::heap_texture` against bytes
 /// Apple's serializer produced. Split out of `compute_exec`, where it was open
 /// coded, so it can be tested at all: the interesting part is not the offsets
-/// but [`HEAP_TEXTURE_USE_OFFSET_BIT`], and an open-coded read of it had no
-/// test and was wrong.
+/// but `use_offset`, which is **one bit** of its byte rather than a word — the
+/// seven bits above it and the three bytes to [`HEAP_TEXTURE_OFFSET`] are
+/// whatever the guest's ring last contained, so a 32-bit load there reads noise
+/// into 31 of its bits. The open-coded read got that wrong and had no test.
+/// `NewHeapTextureBody::use_offset` applies the mask, and this decodes through
+/// it rather than restating it.
 pub fn decode_heap_texture(bytes: &[u8]) -> Result<HeapTextureRecord<'_>, DecodeStatus> {
     let op = reims_vgpu_wire::op(bytes, 0)
         .map_err(|_| DecodeStatus::ErrShort("res_heap_texture_len"))?;

@@ -29,10 +29,3 @@ pub struct Extent3 {
     pub y: u32,
     pub z: u32,
 }
-
-impl Extent3 {
-    /// Whether any dimension is zero, which is not a dispatch.
-    pub fn has_zero_dimension(self) -> bool {
-        self.x == 0 || self.y == 0 || self.z == 0
-    }
-}

@@ -1176,7 +1176,14 @@ pub fn census_reflection_wellformed(reflection: &ShaderReflection, pipeline_ref:
                 b.kind, b.metal_index
             ));
         }
-        let bind = binding.unwrap_or(0);
+        // Only the two malformed-reflection lines below read this, and a missing
+        // descriptor has already emitted its own. Rendering that case as `0`
+        // names a real binding index the reflection never carried, so the two
+        // failures downstream would read as being about binding 0.
+        let bind = match binding {
+            Some(bind) => bind.to_string(),
+            None => "none".to_string(),
+        };
         // Storage-vs-sampled must agree across the three encodings the consumer
         // and the translator both derive from the one `TextureShape`.
         let kind_storage = matches!(b.kind, ResourceKind::StorageImage);

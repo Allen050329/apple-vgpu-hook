@@ -2158,7 +2158,7 @@ fn process_child_packet<H: HostMemory + HostOps>(
                 }
             }
         }
-        crate::runtime::decode::fifo::CHILD_OP_CONFIG_40 => {
+        CHILD_OP_CONFIG_40 => {
             let _ = reply_heap_texture_size_and_align(state, host, &packet.payload);
         }
         // The one packet that says a cached page list has gone stale, and the

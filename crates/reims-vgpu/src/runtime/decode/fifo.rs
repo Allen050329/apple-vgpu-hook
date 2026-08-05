@@ -1,25 +1,24 @@
-//! Root/child FIFO wire constants, and the two child commands decoded here.
+//! Child FIFO record layouts, and the two child commands decoded here.
 //!
 //! This module holds the parts of the FIFO contract the live drain path reads:
-//! the child opcode table, the resource-list / invalidate / synchronize record
-//! layout, the display-descriptor timing entries, and the `EXEC_INDIRECT2`
-//! header offsets. Packet framing itself — reading a ring, walking headers and
-//! stamps, writing back head — lives in `runtime/drain/mod.rs`, which does it
-//! against live guest memory and reports each failure as a `PacketFault`.
+//! the resource-list / invalidate / synchronize record layout, the
+//! display-descriptor timing entries, and the `EXEC_INDIRECT2` header offsets.
+//!
+//! The **opcodes** those records belong to are not here. [`crate::model::regs`]
+//! holds one table for the whole device — root and child together — and this
+//! module used to restate five of its child entries, four of them byte-identical
+//! declarations that nothing imported while the drain's dispatch matched on
+//! `regs`. A second table of the same numbers cannot be kept honest by anything
+//! in the toolchain: a correction to an opcode the RE got wrong reaches whichever
+//! copy its author was reading, and the other one keeps compiling.
+//!
+//! Packet framing itself — reading a ring, walking headers and stamps, writing
+//! back head — lives in `runtime/drain/mod.rs`, which does it against live guest
+//! memory and reports each failure as a `PacketFault`.
 
 use crate::contract::endian::{ld32, st16, st32};
 
-// --- child opcodes and record layout, as the PVG command table numbers them ---
-
-/// PVG table: CmdUnmapMemory (not map — MapMemory2 is `0x39`).
-pub const CHILD_OP_UNMAP_MEMORY: u16 = 0x22;
-/// PVG: CmdInvalidateResources.
-pub const CHILD_OP_INVALIDATE_RESOURCES: u16 = 0x34;
-/// PVG: CmdSynchronizeResources.
-pub const CHILD_OP_SYNCHRONIZE_RESOURCES: u16 = 0x35;
-/// PVG: CmdMapMemory2 (task GPU-VA map).
-pub const CHILD_OP_MAP_MEMORY2: u16 = 0x39;
-pub const CHILD_OP_CONFIG_40: u16 = 0x40;
+// --- child record layout, as the PVG command table numbers them ---
 
 /// CmdInvalidateResources / CmdSynchronizeResources shared header.
 pub const CHILD_RESOURCE_LIST_TASK_ID: u32 = 0x00;

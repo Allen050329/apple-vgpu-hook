@@ -151,9 +151,9 @@ pub const CHILD_OP_PRESENT_X86: u16 = 0x06;
 /// x86 present-with-gamma (surface_id typically @+8).
 pub const CHILD_OP_PRESENT_GAMMA_X86: u16 = 0x07;
 pub const CHILD_OP_DISPLAY_SWAP: u16 = 0x08;
-/// PVG CmdUnmapMemory.
 /// PVG `CmdDeleteTask` (same opcode as root [`ROOT_OP_DELETE_TASK`]).
 pub const CHILD_OP_DELETE_TASK: u16 = 0x20;
+/// PVG `CmdUnmapMemory` (not map — [`CHILD_OP_MAP_MEMORY2`] is `0x39`).
 pub const CHILD_OP_UNMAP_MEMORY: u16 = 0x22;
 /// Display-channel flush: a fence carrying **stamps and no payload**.
 ///
@@ -190,6 +190,12 @@ pub const CHILD_OP_GET_COMPUTE_INFO: u16 = 0x3b;
 /// Live fail log: ch2 op 0x3c total_size=20 (header+payload). Stamp-complete;
 /// full rebind RE is open — accept so guest is not blocked on UnknownChildOpcode.
 pub const CHILD_OP_REPLACE_PHYSICAL: u16 = 0x3c;
+/// The guest asking what a heap texture would cost: its handler decodes a
+/// `heap_query` request and writes size and alignment back through the reply
+/// GVA the request names. A query rather than a state change — nothing in the
+/// device model moves — but the guest blocks on the reply, so a refusal is a
+/// stall and not a dropped command.
+pub const CHILD_OP_CONFIG_40: u16 = 0x40;
 
 /// `CmdDisplayTransaction3` (op 6) trailer `[pipe][surface][task]`: surface id
 /// offset. `CmdDisplaySwapMapping` (op 8) is a different command with a
@@ -767,6 +773,54 @@ mod tests {
             "the shims size the gfx MMIO region from the header; it has drifted \
              from the bound Rust's sparse register store is indexed against"
         );
+    }
+
+    /// No two child-command names may carry the same opcode.
+    ///
+    /// The drain dispatches on these in one `match`, so a collision makes the
+    /// later arm dead and hands one guest command to the other's handler —
+    /// silently, because a duplicated *constant* in a pattern is not what
+    /// `unreachable_patterns` is looking for. Every number here was assigned by
+    /// reading Apple's command table, which is exactly the process that produces
+    /// a transcription collision.
+    ///
+    /// Root and child are deliberately not crossed: they are separate spaces and
+    /// `CmdDeleteTask` really is `0x20` in both.
+    #[test]
+    fn no_two_child_opcodes_share_a_number() {
+        let table = [
+            ("SETUP_SHARED_STATE", CHILD_OP_SETUP_SHARED_STATE),
+            ("ONLINE_ACK", CHILD_OP_ONLINE_ACK),
+            ("CURSOR_GLYPH", CHILD_OP_CURSOR_GLYPH),
+            ("CURSOR_SHOW", CHILD_OP_CURSOR_SHOW),
+            ("PRESENT_X86", CHILD_OP_PRESENT_X86),
+            ("PRESENT_GAMMA_X86", CHILD_OP_PRESENT_GAMMA_X86),
+            ("DISPLAY_SWAP", CHILD_OP_DISPLAY_SWAP),
+            ("FLUSH_CHANNEL_EVENT", CHILD_OP_FLUSH_CHANNEL_EVENT),
+            ("DELETE_TASK", CHILD_OP_DELETE_TASK),
+            ("UNMAP_MEMORY", CHILD_OP_UNMAP_MEMORY),
+            ("DELETE_OBJECT", CHILD_OP_DELETE_OBJECT),
+            ("PRESENT_FRAME", CHILD_OP_PRESENT_FRAME),
+            ("SET_OBJECT_LIST", CHILD_OP_SET_OBJECT_LIST),
+            ("INVALIDATE_RESOURCES", CHILD_OP_INVALIDATE_RESOURCES),
+            ("SYNCHRONIZE_RESOURCES", CHILD_OP_SYNCHRONIZE_RESOURCES),
+            ("DELETE_IOSURFACE_BACKING2", CHILD_OP_DELETE_IOSURFACE_BACKING2),
+            ("EXEC_INDIRECT2", CHILD_OP_EXEC_INDIRECT2),
+            ("DEFINE_TASK2", CHILD_OP_DEFINE_TASK2),
+            ("MAP_MEMORY2", CHILD_OP_MAP_MEMORY2),
+            ("GET_COMPUTE_INFO", CHILD_OP_GET_COMPUTE_INFO),
+            ("REPLACE_PHYSICAL", CHILD_OP_REPLACE_PHYSICAL),
+            ("CONFIG_40", CHILD_OP_CONFIG_40),
+        ];
+        for (i, (name, op)) in table.iter().enumerate() {
+            for (other, other_op) in &table[i + 1..] {
+                assert_ne!(
+                    op, other_op,
+                    "CHILD_OP_{name} and CHILD_OP_{other} are both {op:#04x}; \
+                     the drain's match would give both commands one handler"
+                );
+            }
+        }
     }
 
     #[test]

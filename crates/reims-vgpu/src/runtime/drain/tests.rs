@@ -2983,7 +2983,7 @@ fn acked_stale_online_bit_is_suppressed_not_redelivered() {
 fn unmap_memory_retains_gva_host_cache_for_sample() {
     use crate::contract::endian::{st32, st64};
     use crate::model::GvaHostView;
-    use crate::runtime::decode::fifo::CHILD_OP_UNMAP_MEMORY;
+    use crate::model::CHILD_OP_UNMAP_MEMORY;
     use crate::runtime::surface_cache;
 
     let page_shift = PAGE_SHIFT_X86;
@@ -3047,9 +3047,8 @@ fn unmap_memory_retains_gva_host_cache_for_sample() {
 #[test]
 fn invalidate_resources_bumps_mapping_content_generation() {
     use crate::contract::endian::st32;
-    use crate::runtime::decode::fifo::{
-        CHILD_INVALIDATE_PAGEON_FLAGS, CHILD_OP_INVALIDATE_RESOURCES,
-    };
+    use crate::model::CHILD_OP_INVALIDATE_RESOURCES;
+    use crate::runtime::decode::fifo::CHILD_INVALIDATE_PAGEON_FLAGS;
 
     let mut host = FakeHost::new();
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
@@ -3085,7 +3084,7 @@ fn invalidate_resources_bumps_mapping_content_generation() {
 fn map_memory2_does_not_flush_gva_host_cache_on_wire() {
     use crate::contract::endian::{st32, st64};
     use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
-    use crate::runtime::decode::fifo::CHILD_OP_MAP_MEMORY2;
+    use crate::model::CHILD_OP_MAP_MEMORY2;
     use crate::runtime::surface_cache;
 
     let page_shift = PAGE_SHIFT_X86;
@@ -3145,7 +3144,7 @@ fn synchronize_resources_does_not_write_guest_pages() {
     use crate::contract::endian::st32;
     use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
     use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
-    use crate::runtime::decode::fifo::CHILD_OP_SYNCHRONIZE_RESOURCES;
+    use crate::model::CHILD_OP_SYNCHRONIZE_RESOURCES;
     use crate::runtime::surface_cache;
 
     let page_shift = PAGE_SHIFT_X86;
@@ -3203,7 +3202,7 @@ fn synchronize_resources_does_not_write_guest_pages() {
 #[test]
 fn invalidate_without_clr_host_does_not_bump_generation() {
     use crate::contract::endian::st32;
-    use crate::runtime::decode::fifo::CHILD_OP_INVALIDATE_RESOURCES;
+    use crate::model::CHILD_OP_INVALIDATE_RESOURCES;
 
     let mut host = FakeHost::new();
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
