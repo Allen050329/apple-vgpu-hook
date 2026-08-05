@@ -1800,9 +1800,9 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
 
     // For indexed draws, pass index_count as vertex_count for the early gate.
     let vertex_count = if is_indexed {
-        req.indexed.as_ref().map(|i| i.index_count).unwrap_or(0) as usize
+        req.indexed.as_ref().map(|i| i.index_count).unwrap_or(0)
     } else {
-        req.vertex_count as usize
+        req.vertex_count
     };
 
     // Type-11 color targets render into a host RT and are written back by the
@@ -1918,11 +1918,13 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
         &frag,
         width,
         height,
-        vertex_count,
-        req.first_vertex as usize,
-        req.instance_count.max(1) as usize,
-        req.base_instance as usize,
-        req.primitive_type,
+        crate::contract::draw::DrawArgs {
+            vertex_count,
+            instance_count: req.instance_count.max(1),
+            primitive_type: req.primitive_type,
+            first_vertex: req.first_vertex,
+            base_instance: req.base_instance,
+        },
         None,
         indexed_draw.as_ref(),
         &attrs,
@@ -3773,11 +3775,7 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
     pipeline_ref: u32,
     color_slots: &[(u32, crate::runtime::decode::render::ColorAttachment)],
     clears: &[crate::runtime::decode::render::ColorAttachment],
-    vertex_count: u32,
-    instance_count: u32,
-    primitive_type: u32,
-    first_vertex: u32,
-    base_instance: u32,
+    draw: crate::contract::draw::DrawArgs,
 ) -> Option<DrawEncodeRequest> {
     if color_slots.is_empty() {
         return None;
@@ -3872,11 +3870,11 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
     Some(DrawEncodeRequest {
         task_id,
         pipeline_ref,
-        vertex_count,
-        instance_count,
-        primitive_type,
-        first_vertex,
-        base_instance,
+        vertex_count: draw.vertex_count,
+        instance_count: draw.instance_count,
+        primitive_type: draw.primitive_type,
+        first_vertex: draw.first_vertex,
+        base_instance: draw.base_instance,
         colors,
         ..Default::default()
     })

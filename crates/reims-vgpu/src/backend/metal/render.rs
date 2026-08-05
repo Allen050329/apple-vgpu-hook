@@ -1565,11 +1565,7 @@ pub fn render_core_mrt(
     frag_mtlb: &[u8],
     width: u32,
     height: u32,
-    vertex_count: usize,
-    first_vertex: usize,
-    instance_count: usize,
-    base_instance: usize,
-    primitive_type: u32,
+    draw: crate::contract::draw::DrawArgs,
     primitive_indirect: Option<&ReimsVgpuPrimitiveIndirectDraw>,
     indexed: Option<&ReimsVgpuIndexedDraw>,
     attrs: &[ReimsVgpuVertexAttr],
@@ -1592,6 +1588,16 @@ pub fn render_core_mrt(
     err: ErrOut<'_>,
 ) -> Status {
     use crate::backend::metal::constants::REIMS_VGPU_METAL_MAX_COLOR_RTS;
+    // Widened here rather than at the call, so the `as usize` on each of these
+    // happens once and the caller passes the decoded draw whole. These were five
+    // positional parameters, four of them `usize`; the sole caller reached them
+    // through `mrt_draw_request`, which took the same five values in a different
+    // order.
+    let vertex_count = draw.vertex_count as usize;
+    let first_vertex = draw.first_vertex as usize;
+    let instance_count = draw.instance_count as usize;
+    let base_instance = draw.base_instance as usize;
+    let primitive_type = draw.primitive_type;
     let indexed_indirect = indexed.map(|i| !i.indirect.is_null()).unwrap_or(false);
     if colors.is_empty() {
         set_err(err, "invalid color render target count");

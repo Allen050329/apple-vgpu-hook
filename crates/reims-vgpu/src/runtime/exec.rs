@@ -4,6 +4,7 @@
 //! Draws try Metal encode when pipeline MTLBs resolve; otherwise color targets
 //! are still marked dirty for DisplaySwap.
 
+use crate::contract::draw::DrawArgs;
 use crate::contract::endian::{ld32, ld64};
 use crate::contract::pixel_format::{f64_to_unorm8, MTL_FORMAT_BGRA8_UNORM, RGBA8_BPP};
 use crate::model::DeviceState;
@@ -81,22 +82,6 @@ struct RenderIcbExecute {
 /// seeding draw N from draw N-1's writeback. Product previously kept only
 /// `last_draw`, which dropped the logo when the pill was the final draw in the
 /// same stream (journal: logo RG8 168×206 + pill → one type-11 FB).
-/// The arguments of one draw, as the guest issued them.
-///
-/// A named struct rather than the four-tuple this was: `base_instance` is a
-/// fifth `u32` joining four that were already told apart only by position, and
-/// the four sites that destructure it would each have been a silent swap away
-/// from drawing the wrong thing.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct DrawArgs {
-    vertex_count: u32,
-    instance_count: u32,
-    primitive_type: u32,
-    first_vertex: u32,
-    /// Metal `baseInstance` / Vulkan `firstInstance`.
-    base_instance: u32,
-}
-
 #[derive(Clone, Debug, Default)]
 struct PendingDraw {
     pipeline_ref: u32,
@@ -2834,11 +2819,7 @@ fn finish_stream<M: HostMemory + HostOps>(
                 pipeline,
                 &acc.color_slots,
                 &acc.clears,
-                args.vertex_count,
-                args.instance_count,
-                args.primitive_type,
-                args.first_vertex,
-                args.base_instance,
+                args,
             );
             if let Some(mut req) = req {
                 // ICB execute inherits stream bind state at end of stream.
@@ -2945,11 +2926,7 @@ fn finish_stream<M: HostMemory + HostOps>(
                 pd.pipeline_ref,
                 &acc.color_slots,
                 &acc.clears,
-                pd.draw.vertex_count,
-                pd.draw.instance_count,
-                pd.draw.primitive_type,
-                pd.draw.first_vertex,
-                pd.draw.base_instance,
+                pd.draw,
             )
         });
         // A serialized Metal render stream is one render pass: its attachment

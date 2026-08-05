@@ -43,10 +43,25 @@ fn clear_black_attachment(texture_ref: u32) -> crate::runtime::decode::render::C
     }
 }
 
-/// `mrt_draw_request` for the single-RT triangle these tests resolve targets
-/// with: attachment in slot 0, no depth, three vertices of one instance,
-/// primitive type 3, first vertex 0. Five bodies passed those seven trailing
-/// literals; only `pipeline_ref` and the attachment ever varied.
+/// The triangle every target-resolution test in this file draws: three vertices
+/// of one instance, primitive type 3, from vertex 0.
+///
+/// Named because it used to be spelled `3, 1, 3, 0, 0` at four call sites — five
+/// positional `u32`s with two `3`s among them, where a transposition compiles and
+/// draws something plausible.
+fn test_triangle() -> crate::contract::draw::DrawArgs {
+    crate::contract::draw::DrawArgs {
+        vertex_count: 3,
+        instance_count: 1,
+        primitive_type: 3,
+        first_vertex: 0,
+        base_instance: 0,
+    }
+}
+
+/// `mrt_draw_request` for the single-RT [`test_triangle`] these tests resolve
+/// targets with: attachment in slot 0, no depth. Five bodies passed those
+/// trailing literals; only `pipeline_ref` and the attachment ever varied.
 fn single_rt_draw_request<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -60,11 +75,7 @@ fn single_rt_draw_request<M: HostMemory + HostOps>(
         pipeline_ref,
         &[(0u32, att)],
         &[],
-        3,
-        1,
-        3,
-        0,
-        0,
+        test_triangle(),
     )
 }
 
@@ -2058,7 +2069,7 @@ fn mrt_draw_request_load_seed_miss_still_encodes() {
         clear_color: [1.0, 1.0, 1.0, 1.0], // would paint solid white if Clear invented
     };
     let slots = [(0u32, att)];
-    let req = mrt_draw_request(&mut state, &mut host, 1, 1, &slots, &[], 3, 1, 3, 0, 0);
+    let req = mrt_draw_request(&mut state, &mut host, 1, 1, &slots, &[], test_triangle());
     // Archive: seed miss still builds the job (NULL seed). Product must not
     // drop the pass — that freezes lagging dual-mid on stale logo.
     let req = req.expect("Load seed miss must still encode (archive NULL seed)");
@@ -2285,11 +2296,7 @@ fn mrt_draw_request_type8_swizzled_view_rejected_as_color_rt() {
             12,
             &[(0u32, att)],
             &[],
-            3,
-            1,
-            3,
-            0,
-            0
+            test_triangle()
         )
         .is_none(),
         "swizzled type-8 must not resolve as color RT"
@@ -2480,11 +2487,7 @@ fn mrt_draw_request_type8_nonzero_level_rejected_as_color_rt() {
             12,
             &[(0u32, att)],
             &[],
-            3,
-            1,
-            3,
-            0,
-            0
+            test_triangle()
         )
         .is_none(),
         "type-8 level_base!=0 must not resolve as color RT"
