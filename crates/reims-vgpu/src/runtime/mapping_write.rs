@@ -952,6 +952,19 @@ pub fn write_bgra8_from_resident_gpu<M: HostMemory + HostOps>(
     // own drift check does — and every value taken after it is taken against
     // whatever it left behind.
     crate::runtime::storage_flush::flush_intersecting(state, host, mapping_id, base_off, span_end);
+    // Nothing below can land a frame on a host whose GPU cannot import guest
+    // pages, so the walks below are skipped rather than run and discarded. Asked
+    // *after* `flush_intersecting` and not before it: that call is a side effect
+    // this rail owes whether or not it goes on to write anything, and the
+    // copying arm that takes over from this decline expects the state it leaves.
+    //
+    // Not a second gate — `guest_dmabuf::dmabuf_for` still decides, and would
+    // decline these same pages a few hundred microseconds later. This only
+    // declines sooner, and on the pathways where the answer never changes that
+    // is a page-table walk per flush for the life of the process.
+    if !crate::runtime::guest_dmabuf::export_available() {
+        return Err(GpuWritebackDecline::NoDmaBuf);
+    }
     // Timed on its own because it is the largest `O(pages)` step left and its
     // fix is not the other one's. `vouch_for_write` re-walks every page of the
     // mapping through the guest's page table — the check that licenses writing

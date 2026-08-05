@@ -111,6 +111,24 @@ fn backend_import_refusal() -> Option<crate::backend::vulkan::caps::DmaBufImport
     Some(rung)
 }
 
+/// Whether assembling a page list for [`dmabuf_for`] can lead anywhere.
+///
+/// The same answer [`dmabuf_for`] gates itself on, published so a rail can skip
+/// the work of *reaching* it. A caller that walks the guest's page table to
+/// build the list pays an `O(pages)` cost before it can be told no, and on a
+/// host that will never import — the MoltenVK pathway, an ICD without the
+/// extension, [`crate::env::DMABUF`] off — that cost repeats for the life of the
+/// process.
+///
+/// This is a shortcut and never the decision: every caller still routes on what
+/// [`dmabuf_for`] returns, so a rail that skips this check is slower and not
+/// wrong. Callers must keep any side effect that runs before them, because a
+/// decline is a routing answer and the copying rail behind it expects the same
+/// state it always did.
+pub fn export_available() -> bool {
+    backend_import_refusal().is_none()
+}
+
 /// Whether a refusal is a property of the host rather than of this window.
 ///
 /// The distinction decides whether asking again can ever produce a different
@@ -390,6 +408,33 @@ mod tests {
                 backend_import_refusal(),
                 Some(closed),
                 "{closed:?} must close the export and name itself"
+            );
+        }
+        latch(DmaBufImport::Unqueried);
+    }
+
+    /// The shortcut a rail takes before building a page list agrees with the
+    /// gate that decides. Two answers here would mean a rail declining work
+    /// `dmabuf_for` would have accepted, which is a silent loss of the rail on
+    /// exactly the hosts that can run it.
+    #[test]
+    fn the_published_shortcut_agrees_with_the_gate() {
+        use crate::backend::vulkan::caps::external_memory::latch;
+        use crate::backend::vulkan::caps::DmaBufImport;
+
+        for rung in [
+            DmaBufImport::Unqueried,
+            DmaBufImport::Supported,
+            DmaBufImport::NoExternalMemoryFd,
+            DmaBufImport::NoDmaBufExtension,
+            DmaBufImport::NotImportable,
+            DmaBufImport::DisabledByEnv,
+        ] {
+            latch(rung);
+            assert_eq!(
+                export_available(),
+                backend_import_refusal().is_none(),
+                "{rung:?}"
             );
         }
         latch(DmaBufImport::Unqueried);
