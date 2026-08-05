@@ -1881,7 +1881,19 @@ unsafe fn copy_image_level0_to_buffer(
 }
 
 /// Guest memory the device can currently reach through imported dma-bufs, and
-/// how many windows that is. Census only.
+/// how many windows that is.
+///
+/// # Nothing calls this, so the number it computes is in no log
+///
+/// Kept rather than deleted, because it is the only thing in the tree that can
+/// answer "how much guest RAM can the device reach right now" on the *importer*
+/// side. `runtime::guest_dmabuf` emits its own totals on every miss
+/// (`guest_dmabuf_pinned_kb_sum`, `guest_dmabuf_windows_sum`), so the exporter
+/// side of the isolation rail is measurable and this side is not — and the two
+/// are not the same population, because an export the runtime has cached can
+/// still be declined by the backend before it becomes an import. Wiring this
+/// into the census is a new emission, which is a behaviour change owed a driven
+/// boot; recorded here so the asymmetry is not mistaken for coverage.
 pub fn guest_import_census() -> (u64, usize) {
     let mut guard = lock_engine();
     let cache = guard.pools.dmabuf_imports_mut();

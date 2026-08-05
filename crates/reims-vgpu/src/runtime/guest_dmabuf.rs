@@ -343,15 +343,13 @@ fn evict_to_bound(cache: &mut Cache) {
     }
 }
 
-/// Guest memory currently held pinned through cached dma-bufs. Census only.
-pub fn pinned_bytes() -> u64 {
-    CACHE.lock().as_ref().map_or(0, |c| c.pinned_bytes)
-}
-
-/// Windows currently cached. Census only.
-pub fn cached_windows() -> usize {
-    CACHE.lock().as_ref().map_or(0, |c| c.entry_count)
-}
+// Two accessors used to sit here, `pinned_bytes` and `cached_windows`, each
+// documented "census only" and each with no caller. The census this module
+// actually takes is in `store_dmabuf` above, which reads `cache.pinned_bytes`
+// and `cache.entry_count` straight off the guard it is already holding and
+// emits them as `guest_dmabuf_pinned_kb_sum` and `guest_dmabuf_windows_sum`.
+// So the accessors were a second way to ask a question nothing asked, and
+// removing them loses no reading — both numbers are still on the counter set.
 
 #[cfg(test)]
 mod tests {
