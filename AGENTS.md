@@ -269,7 +269,7 @@ them is the banned mechanism again:
   rather than being handed a raw address it must trust.
 
 So the deferred-flush rail — the device's largest cost — is retired by writing into guest pages
-directly, which is what `storage_flush.rs` always said would retire it. Read that module's own
+directly, which is what `storage_flush` always said would retire it. Read that module's own
 qualifier and the routes that are *not* blocked before assuming a window is safe to skip. Note that
 `runtime/gva_view.rs::ensure_gva_view` hands back a host pointer but is not a window resolver — it
 requires the span to be one contiguous page run and returns `None` otherwise.

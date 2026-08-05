@@ -1,6 +1,6 @@
 //! A deferred window is armed only where the Vulkan engine exists.
 //!
-//! `runtime/storage_flush.rs` defers a guest writeback because a *pinned engine
+//! `runtime/storage_flush` defers a guest writeback because a *pinned engine
 //! resident* holds the authoritative content, and the engine is
 //! `backend::vulkan::engine`. On a build without `backend-vulkan` — every
 //! `backend-metal` build, since `lib.rs` requires exactly one — the rail's seven
@@ -88,7 +88,7 @@ fn no_arm_site_lives_outside_a_backend_vulkan_gate() {
             continue;
         }
         // Comments first, then test-module bodies: a fixture arming a window
-        // is not a production arm site, and `storage_flush.rs` alone arms one in
+        // is not a production arm site, and `storage_flush` alone arms one in
         // about thirty tests. Brace-matched rather than cut at the first marker,
         // because production code lives after test modules in this tree and a
         // cutoff would hide it — measured: appending an arm site to the end of

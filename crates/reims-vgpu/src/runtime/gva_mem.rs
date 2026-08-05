@@ -830,23 +830,38 @@ mod tests {
     #[test]
     fn row_loop_writers_take_the_bounded_form() {
         let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/runtime");
-        for relative in [
-            "blit_exec.rs",
-            "mipmap.rs",
-            "mapping_write.rs",
-            "storage_flush.rs",
-        ] {
-            let src = std::fs::read_to_string(root.join(relative))
-                .unwrap_or_else(|e| panic!("{relative}: {e}"));
-            // `_within` is the bounded form and shares this prefix, so match the
-            // open paren that only the unbounded form can present.
-            let unbounded = src.match_indices("write_task_gva_product(").count();
-            assert_eq!(
-                unbounded, 0,
-                "{relative} calls the unbounded write_task_gva_product; a row loop \
-                 that re-resolves its destination must capture dest_window once \
-                 up front and pass it to write_task_gva_product_within"
-            );
+        // The list names *modules*, not files, because a module here is a file
+        // or a directory and either spelling must be covered: splitting one into
+        // a directory would otherwise drop it out of the scan while every name
+        // below still read as watched.
+        for module in ["blit_exec", "mipmap", "mapping_write", "storage_flush"] {
+            let mut files = Vec::new();
+            let dir = root.join(module);
+            if dir.is_dir() {
+                for entry in std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("{module}: {e}")) {
+                    let path = entry.unwrap_or_else(|e| panic!("{module}: {e}")).path();
+                    if path.extension().is_some_and(|e| e == "rs") {
+                        files.push(path);
+                    }
+                }
+            } else {
+                files.push(root.join(format!("{module}.rs")));
+            }
+            assert!(!files.is_empty(), "{module}: no sources found to scan");
+            for path in files {
+                let relative = path.strip_prefix(&root).unwrap_or(&path).display();
+                let src =
+                    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{relative}: {e}"));
+                // `_within` is the bounded form and shares this prefix, so match
+                // the open paren that only the unbounded form can present.
+                let unbounded = src.match_indices("write_task_gva_product(").count();
+                assert_eq!(
+                    unbounded, 0,
+                    "{relative} calls the unbounded write_task_gva_product; a row loop \
+                     that re-resolves its destination must capture dest_window once \
+                     up front and pass it to write_task_gva_product_within"
+                );
+            }
         }
     }
 
