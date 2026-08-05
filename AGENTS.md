@@ -174,6 +174,7 @@ simply the wrong number, a length four bytes off, or a field two bytes too wide:
 | Is a wire constant still declared twice? | the two greps below |
 | Does a doc comment name a symbol that no longer exists? | `cargo doc`'s intra-doc link pass |
 | Does a value travel as loose parameters when a type for it exists? | `scripts/scattered-struct` |
+| Is a validity rule written out at every site instead of beside its constant? | `scripts/scattered-bound` |
 | Does a decoded record fail a guard and vanish into a no-op catch-all? | `scripts/silent-arms` |
 | Does a constant crossing the C boundary have the test this file asks for? | `scripts/abi-pins` |
 
