@@ -39,7 +39,7 @@
 use crate::contract::pixel_format::{self, MTL_FORMAT_BGRA8_UNORM};
 use crate::model::DeviceState;
 use crate::observe::Decline;
-use crate::runtime::decode::blit::{self, BlitAspect, Command, CopyKind, Kind};
+use crate::runtime::decode::blit::{self, BlitAspect, Command, CopyKind, Kind, Point};
 use crate::runtime::decode::resource::{
     decode_buffer_descriptor, decode_iosurface_texture_descriptor, decode_texture_descriptor,
     decode_texture_view_descriptor, texture_view_type_is_3d, texture_view_type_supported,
@@ -912,20 +912,23 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
 /// Read one texture row (tight `row_bytes`) at texel (ox, oy+row_i) plane z into `buf`.
 #[allow(
     clippy::too_many_arguments,
-    reason = "the row helper keeps texture origin and plane geometry explicit"
+    reason = "the row helper still names the plane geometry a row walk needs"
 )]
 fn read_texture_row<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
     tex: &TextureBacking,
-    ox: u64,
-    oy: u64,
-    oz: u64,
+    origin: Point,
     row_i: u64,
     row_bytes: u64,
     buf: &mut [u8],
 ) -> Result<(), BlitStatus> {
+    let Point {
+        x: ox,
+        y: oy,
+        z: oz,
+    } = origin;
     if row_bytes as usize > buf.len() {
         return Err(br(BlitStatus::Capacity, "rd_row_buf_cap"));
     }
@@ -1004,21 +1007,24 @@ fn read_texture_row<M: HostMemory + HostOps>(
 /// unbounded one.
 #[allow(
     clippy::too_many_arguments,
-    reason = "the row helper keeps texture origin and plane geometry explicit"
+    reason = "the row helper still names the plane geometry a row walk needs"
 )]
 fn write_texture_row<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
     tex: &TextureBacking,
-    ox: u64,
-    oy: u64,
-    oz: u64,
+    origin: Point,
     row_i: u64,
     row_bytes: u64,
     buf: &[u8],
     allowed: crate::runtime::gva_view::WindowPages<'_>,
 ) -> Result<(), BlitStatus> {
+    let Point {
+        x: ox,
+        y: oy,
+        z: oz,
+    } = origin;
     if row_bytes as usize > buf.len() {
         return Err(br(BlitStatus::Capacity, "wr_row_buf_cap"));
     }
@@ -1120,21 +1126,24 @@ use gva_mem::dest_window;
 /// command decoded; if it does not resolve, the command does not execute.
 #[allow(
     clippy::too_many_arguments,
-    reason = "the window mirrors the copy region the row loop walks"
+    reason = "the window mirrors the copy extent the row loop walks"
 )]
 fn texture_region_window<M: HostMemory>(
     state: &DeviceState,
     host: &M,
     task_id: u32,
     tex: &TextureBacking,
-    ox: u64,
-    oy: u64,
-    oz: u64,
+    origin: Point,
     copy_w: u32,
     copy_h: u64,
     copy_d: u64,
     bpp: u32,
 ) -> Result<Option<std::collections::HashSet<u64>>, BlitStatus> {
+    let Point {
+        x: ox,
+        y: oy,
+        z: oz,
+    } = origin;
     let TextureBacking::Linear(t) = tex else {
         return Ok(None);
     };
@@ -1608,14 +1617,17 @@ fn read_texture_storage_row<M: HostMemory + HostOps>(
     host: &mut M,
     task_id: u32,
     tex: &TextureBacking,
-    ox: u64,
-    oy: u64,
-    oz: u64,
+    origin: Point,
     row_i: u64,
     width: u32,
     storage_bpp: u32,
     buf: &mut [u8],
 ) -> Result<(), BlitStatus> {
+    let Point {
+        x: ox,
+        y: oy,
+        z: oz,
+    } = origin;
     let row_bytes = (width as u64)
         .checked_mul(storage_bpp as u64)
         .ok_or(BlitStatus::Capacity)?;
@@ -1624,7 +1636,20 @@ fn read_texture_storage_row<M: HostMemory + HostOps>(
     }
     // Reuse read_texture_row but with storage row size (not plane size).
     // Temporarily: call the same GVA path with storage row_bytes.
-    read_texture_row(state, host, task_id, tex, ox, oy, oz, row_i, row_bytes, buf)
+    read_texture_row(
+        state,
+        host,
+        task_id,
+        tex,
+        Point {
+            x: ox,
+            y: oy,
+            z: oz,
+        },
+        row_i,
+        row_bytes,
+        buf,
+    )
 }
 
 /// Write one packed texture row.
@@ -1637,20 +1662,35 @@ fn write_texture_storage_row<M: HostMemory + HostOps>(
     host: &mut M,
     task_id: u32,
     tex: &TextureBacking,
-    ox: u64,
-    oy: u64,
-    oz: u64,
+    origin: Point,
     row_i: u64,
     width: u32,
     storage_bpp: u32,
     buf: &[u8],
     allowed: crate::runtime::gva_view::WindowPages<'_>,
 ) -> Result<(), BlitStatus> {
+    let Point {
+        x: ox,
+        y: oy,
+        z: oz,
+    } = origin;
     let row_bytes = (width as u64)
         .checked_mul(storage_bpp as u64)
         .ok_or(BlitStatus::Capacity)?;
     write_texture_row(
-        state, host, task_id, tex, ox, oy, oz, row_i, row_bytes, buf, allowed,
+        state,
+        host,
+        task_id,
+        tex,
+        Point {
+            x: ox,
+            y: oy,
+            z: oz,
+        },
+        row_i,
+        row_bytes,
+        buf,
+        allowed,
     )
 }
 
@@ -1667,9 +1707,7 @@ fn copy_buffer_texture_rows_aspect<M: HostMemory + HostOps>(
     buf_row_stride: u64,
     buf_image_stride: u64,
     tex: &TextureBacking,
-    tex_ox: u64,
-    tex_oy: u64,
-    tex_oz: u64,
+    tex_origin: Point,
     copy_w: u32,
     copy_h: u64,
     copy_d: u64,
@@ -1677,6 +1715,11 @@ fn copy_buffer_texture_rows_aspect<M: HostMemory + HostOps>(
     aspect: BlitAspect,
     to_texture: bool,
 ) -> Result<(), BlitStatus> {
+    let Point {
+        x: tex_ox,
+        y: tex_oy,
+        z: tex_oz,
+    } = tex_origin;
     let fmt = tex.pixel_format();
     let repack = pixel_format::blit_aspect_needs_repack(fmt, aspect);
     let storage_bpp = if repack {
@@ -1702,9 +1745,11 @@ fn copy_buffer_texture_rows_aspect<M: HostMemory + HostOps>(
             host,
             task_id,
             tex,
-            tex_ox,
-            tex_oy,
-            tex_oz,
+            Point {
+                x: tex_ox,
+                y: tex_oy,
+                z: tex_oz,
+            },
             copy_w,
             copy_h,
             copy_d,
@@ -1751,9 +1796,11 @@ fn copy_buffer_texture_rows_aspect<M: HostMemory + HostOps>(
                         host,
                         task_id,
                         tex,
-                        tex_ox,
-                        tex_oy,
-                        tex_oz + z,
+                        Point {
+                            x: tex_ox,
+                            y: tex_oy,
+                            z: tex_oz + z,
+                        },
                         y,
                         copy_w,
                         storage_bpp,
@@ -1773,9 +1820,11 @@ fn copy_buffer_texture_rows_aspect<M: HostMemory + HostOps>(
                         host,
                         task_id,
                         tex,
-                        tex_ox,
-                        tex_oy,
-                        tex_oz + z,
+                        Point {
+                            x: tex_ox,
+                            y: tex_oy,
+                            z: tex_oz + z,
+                        },
                         y,
                         copy_w,
                         storage_bpp,
@@ -1788,9 +1837,11 @@ fn copy_buffer_texture_rows_aspect<M: HostMemory + HostOps>(
                         host,
                         task_id,
                         tex,
-                        tex_ox,
-                        tex_oy,
-                        tex_oz + z,
+                        Point {
+                            x: tex_ox,
+                            y: tex_oy,
+                            z: tex_oz + z,
+                        },
                         y,
                         plane_row as u64,
                         &plane,
@@ -1803,9 +1854,11 @@ fn copy_buffer_texture_rows_aspect<M: HostMemory + HostOps>(
                     host,
                     task_id,
                     tex,
-                    tex_ox,
-                    tex_oy,
-                    tex_oz + z,
+                    Point {
+                        x: tex_ox,
+                        y: tex_oy,
+                        z: tex_oz + z,
+                    },
                     y,
                     copy_w,
                     storage_bpp,
@@ -1838,9 +1891,11 @@ fn copy_buffer_texture_rows_aspect<M: HostMemory + HostOps>(
                     host,
                     task_id,
                     tex,
-                    tex_ox,
-                    tex_oy,
-                    tex_oz + z,
+                    Point {
+                        x: tex_ox,
+                        y: tex_oy,
+                        z: tex_oz + z,
+                    },
                     y,
                     plane_row as u64,
                     &mut plane,
@@ -1949,9 +2004,11 @@ fn exec_copy_buffer_to_texture<M: HostMemory + HostOps>(
             src_bpr,
             src_bpi,
             &dst,
-            ox,
-            oy,
-            oz,
+            Point {
+                x: ox,
+                y: oy,
+                z: oz,
+            },
             copy_w as u32,
             copy_h,
             copy_d,
@@ -2042,9 +2099,11 @@ fn exec_copy_buffer_to_texture<M: HostMemory + HostOps>(
         host,
         task_id,
         &dst,
-        ox,
-        oy,
-        oz,
+        Point {
+            x: ox,
+            y: oy,
+            z: oz,
+        },
         copy_w as u32,
         copy_h,
         copy_d,
@@ -2082,9 +2141,11 @@ fn exec_copy_buffer_to_texture<M: HostMemory + HostOps>(
                 host,
                 task_id,
                 &dst,
-                ox,
-                oy,
-                oz + z,
+                Point {
+                    x: ox,
+                    y: oy,
+                    z: oz + z,
+                },
                 y,
                 row_bytes,
                 &row,
@@ -2180,9 +2241,11 @@ fn exec_copy_texture_to_buffer<M: HostMemory + HostOps>(
             dst_bpr,
             dst_bpi,
             &src,
-            ox,
-            oy,
-            oz,
+            Point {
+                x: ox,
+                y: oy,
+                z: oz,
+            },
             copy_w as u32,
             copy_h,
             copy_d,
@@ -2274,9 +2337,11 @@ fn exec_copy_texture_to_buffer<M: HostMemory + HostOps>(
                 host,
                 task_id,
                 &src,
-                ox,
-                oy,
-                oz + z,
+                Point {
+                    x: ox,
+                    y: oy,
+                    z: oz + z,
+                },
                 y,
                 row_bytes,
                 &mut row,
@@ -2409,9 +2474,11 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
             host,
             task_id,
             &dst,
-            dox,
-            doy,
-            doz,
+            Point {
+                x: dox,
+                y: doy,
+                z: doz,
+            },
             copy_w as u32,
             copy_h,
             copy_d,
@@ -2431,9 +2498,11 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
                         host,
                         task_id,
                         &src,
-                        sox,
-                        soy,
-                        soz + z,
+                        Point {
+                            x: sox,
+                            y: soy,
+                            z: soz + z,
+                        },
                         y,
                         copy_w as u32,
                         src_storage,
@@ -2455,9 +2524,11 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
                     host,
                     task_id,
                     &src,
-                    sox,
-                    soy,
-                    soz + z,
+                    Point {
+                        x: sox,
+                        y: soy,
+                        z: soz + z,
+                    },
                     y,
                     row_bytes,
                     &mut plane,
@@ -2470,9 +2541,11 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
                         host,
                         task_id,
                         &dst,
-                        dox,
-                        doy,
-                        doz + z,
+                        Point {
+                            x: dox,
+                            y: doy,
+                            z: doz + z,
+                        },
                         y,
                         copy_w as u32,
                         dst_storage,
@@ -2494,9 +2567,11 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
                         host,
                         task_id,
                         &dst,
-                        dox,
-                        doy,
-                        doz + z,
+                        Point {
+                            x: dox,
+                            y: doy,
+                            z: doz + z,
+                        },
                         y,
                         copy_w as u32,
                         dst_storage,
@@ -2510,9 +2585,11 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
                     host,
                     task_id,
                     &dst,
-                    dox,
-                    doy,
-                    doz + z,
+                    Point {
+                        x: dox,
+                        y: doy,
+                        z: doz + z,
+                    },
                     y,
                     row_bytes,
                     &plane,
@@ -2634,9 +2711,11 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
         host,
         task_id,
         &dst,
-        dox,
-        doy,
-        doz,
+        Point {
+            x: dox,
+            y: doy,
+            z: doz,
+        },
         copy_w as u32,
         copy_h,
         copy_d,
@@ -2653,9 +2732,11 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
                 host,
                 task_id,
                 &src,
-                sox,
-                soy,
-                soz + z,
+                Point {
+                    x: sox,
+                    y: soy,
+                    z: soz + z,
+                },
                 y,
                 row_bytes,
                 &mut row,
@@ -2667,9 +2748,11 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
                 host,
                 task_id,
                 &dst,
-                dox,
-                doy,
-                doz + z,
+                Point {
+                    x: dox,
+                    y: doy,
+                    z: doz + z,
+                },
                 y,
                 row_bytes,
                 &row,
@@ -2906,15 +2989,30 @@ fn exec_copy_texture_to_texture_slice_level<M: HostMemory + HostOps>(
             }
             let mut row = vec![0u8; row_bytes as usize];
             let allowed = match texture_region_window(
-                state, host, task_id, &dst, 0, 0, 0, w, h as u64, 1, bpp,
+                state,
+                host,
+                task_id,
+                &dst,
+                Point { x: 0, y: 0, z: 0 },
+                w,
+                h as u64,
+                1,
+                bpp,
             ) {
                 Ok(v) => v,
                 Err(st) => return st,
             };
             for y in 0..h as u64 {
-                if let Err(st) =
-                    read_texture_row(state, host, task_id, &src, 0, 0, 0, y, row_bytes, &mut row)
-                {
+                if let Err(st) = read_texture_row(
+                    state,
+                    host,
+                    task_id,
+                    &src,
+                    Point { x: 0, y: 0, z: 0 },
+                    y,
+                    row_bytes,
+                    &mut row,
+                ) {
                     return st;
                 }
                 if let Err(st) = write_texture_row(
@@ -2922,9 +3020,7 @@ fn exec_copy_texture_to_texture_slice_level<M: HostMemory + HostOps>(
                     host,
                     task_id,
                     &dst,
-                    0,
-                    0,
-                    0,
+                    Point { x: 0, y: 0, z: 0 },
                     y,
                     row_bytes,
                     &row,
@@ -4370,6 +4466,14 @@ mod tests {
         };
         // (x=1,y=2) → 0x100 + 2*16 + 1*4 = 0x124
         assert_eq!(t.texel_offset(1, 2, 0), Some(0x124));
+        // The plane term, which nothing asserted before: one image is
+        // `row_stride * height` = 16 * 4 = 64 bytes, and `z` steps by that.
+        //
+        // Worth its own line now that the three coordinates arrive as one
+        // `Point`: `x`, `y` and `z` are three `u64`s that a destructure could
+        // cross. The strides here are 4, 16 and 64 — all different — so this
+        // one call tells every pair of them apart.
+        assert_eq!(t.texel_offset(1, 2, 1), Some(0x124 + 64));
         let mut t1 = t;
         t1.slice_index = 2;
         // + 2 * 64 slice stride
@@ -4409,7 +4513,17 @@ mod tests {
         let tex = TextureBacking::Linear(level(1 << 62));
         clear_blit_fail_reason();
         assert_eq!(
-            texture_region_window(&state, &host, 1, &tex, 0, 0, 0, 4, 8, 1, 4),
+            texture_region_window(
+                &state,
+                &host,
+                1,
+                &tex,
+                Point { x: 0, y: 0, z: 0 },
+                4,
+                8,
+                1,
+                4
+            ),
             Err(BlitStatus::Bounds),
             "an overflowing region must refuse the copy"
         );
@@ -4423,7 +4537,17 @@ mod tests {
         // `0..copy_h`, so they write nothing and no page is authorised.
         let tex = TextureBacking::Linear(level(16));
         assert_eq!(
-            texture_region_window(&state, &host, 1, &tex, 0, 0, 0, 4, 0, 1, 4),
+            texture_region_window(
+                &state,
+                &host,
+                1,
+                &tex,
+                Point { x: 0, y: 0, z: 0 },
+                4,
+                0,
+                1,
+                4
+            ),
             Ok(Some(std::collections::HashSet::new())),
             "an empty copy authorises no page"
         );
