@@ -1,6 +1,5 @@
 //! Compute encode path: PSO cache, binds, dispatch core, reflection.
 
-use crate::contract::extent::Extent3;
 use crate::backend::metal::abi::*;
 use crate::backend::metal::cache::{
     compute_pso_insert, compute_pso_lookup, reflect_insert, reflect_lookup,
@@ -25,6 +24,7 @@ use crate::backend::metal::util::{
     bytes_of, clear_err, f32_from_bits, image_len, sampler_index, set_err, texture_index,
     valid_buffer_binding, ErrOut, Status,
 };
+use crate::contract::extent::Extent3;
 use metal::*;
 use std::ptr;
 

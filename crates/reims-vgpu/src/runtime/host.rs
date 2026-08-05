@@ -1474,7 +1474,10 @@ mod tests {
         use crate::qemu::abi::header_define as define;
         for (name, kind) in [
             ("REIMS_VGPU_HOST_ACTION_NONE", HostActionKind::None),
-            ("REIMS_VGPU_HOST_ACTION_IRQ_GFX", HostActionKind::IrqGfxPulse),
+            (
+                "REIMS_VGPU_HOST_ACTION_IRQ_GFX",
+                HostActionKind::IrqGfxPulse,
+            ),
             (
                 "REIMS_VGPU_HOST_ACTION_IRQ_IOSFC",
                 HostActionKind::IrqIosfcPulse,
@@ -1483,7 +1486,10 @@ mod tests {
                 "REIMS_VGPU_HOST_ACTION_SCANOUT",
                 HostActionKind::ScanoutUpdate,
             ),
-            ("REIMS_VGPU_HOST_ACTION_CURSOR", HostActionKind::CursorUpdate),
+            (
+                "REIMS_VGPU_HOST_ACTION_CURSOR",
+                HostActionKind::CursorUpdate,
+            ),
             ("REIMS_VGPU_HOST_ACTION_TRACE", HostActionKind::Trace),
             (
                 "REIMS_VGPU_HOST_ACTION_CURSOR_GLYPH",
