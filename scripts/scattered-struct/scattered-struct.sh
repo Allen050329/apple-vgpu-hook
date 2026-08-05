@@ -36,7 +36,7 @@ ARM_TUPLE = re.compile(r'^\s*(?P<pat>[\w:]+(?:\s*\|\s*[\w:]+)*)\s*=>\s*\((?P<t>[
 LITERAL = re.compile(r'^(true|false|-?\d[\w.]*|None)$')
 
 def params_of(lines, i):
-    """Parameter names of the fn whose signature starts at line i."""
+    """(name, type) of each parameter of the fn whose signature starts at i."""
     depth, buf, j = 0, [], i
     while j < len(lines) and j < i + 60:
         buf.append(lines[j])
@@ -46,13 +46,14 @@ def params_of(lines, i):
         j += 1
     sig = ' '.join(buf)
     inner = sig[sig.find('(') + 1:]
-    names = []
+    typed = []
     for part in re.split(r',(?![^<>()\[\]]*[>)\]])', inner):
-        nm, sep, _ = part.partition(':')
+        nm, sep, ty = part.partition(':')
         nm = nm.strip().lstrip('&').strip()
+        ty = ty.split(')')[0].strip().rstrip(',')
         if sep and re.fullmatch(r'\w+', nm) and nm not in ('self',):
-            names.append(nm)
-    return names, j
+            typed.append((nm, ty))
+    return typed, j
 
 def body_range(lines, j):
     """Line range of the body whose opening brace is at or after line j."""
@@ -71,7 +72,26 @@ def body_range(lines, j):
         e += 1
     return None
 
-scatter, flattened = [], []
+NUMERIC = {'u16', 'u32', 'u64', 'usize', 'i32', 'f32'}
+
+def longest_same_type_run(typed):
+    """Longest run of adjacent parameters sharing one primitive type."""
+    best, run = [], []
+    for nm, ty in list(typed) + [(None, None)]:
+        if ty in NUMERIC or ty == 'bool':
+            if run and run[-1][1] == ty:
+                run.append((nm, ty))
+                continue
+            if len(run) > len(best):
+                best = run
+            run = [(nm, ty)]
+        else:
+            if len(run) > len(best):
+                best = run
+            run = []
+    return best
+
+scatter, flattened, runs = [], [], []
 
 for path in files:
     lines = path.read_text().splitlines()
@@ -79,9 +99,16 @@ for path in files:
         m = FN.match(line)
         if not m:
             continue
-        names, j = params_of(lines, i)
+        typed, j = params_of(lines, i)
+        names = [n for n, _ in typed]
         if len(names) < 4:
             continue
+        # Class 3: a run of adjacent parameters of one primitive type. Every
+        # permutation of the run compiles; nothing at any call site can object.
+        run = longest_same_type_run(typed)
+        if len(run) >= 4:
+            runs.append((path, i + 1, m.group('name'),
+                         run[0][1], [n for n, _ in run]))
         span = body_range(lines, j)
         if not span:
             continue
@@ -146,6 +173,13 @@ for path, rows in sorted(byfile.items()):
     for ln, pat, n in rows:
         print(f"      :{ln}  {pat} => {n} loose values")
 
+print("\n== a run of adjacent parameters of one primitive type ==")
+print("   (every permutation of the run compiles; sorted by run length)\n")
+if not runs:
+    print("   none")
+for path, ln, fn, ty, names in sorted(runs, key=lambda r: -len(r[4])):
+    print(f"  {path}:{ln}\n      fn {fn}  {len(names)} x {ty}: {', '.join(names)}")
+
 print(f"\n[scattered-struct] {len(scatter)} scattered constructions, "
-      f"{len(flattened)} flattened arms")
+      f"{len(flattened)} flattened arms, {len(runs)} same-typed runs")
 PY

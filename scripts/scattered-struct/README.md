@@ -46,6 +46,23 @@ Every consumer downstream then has to decide what the extra states mean, and
 they will not all decide the same way: five functions inheriting one such
 flattening had four different readings of the state that could not occur.
 
+### A run of adjacent parameters of one primitive type
+
+Four or more neighbouring parameters sharing one primitive type. Every
+permutation of the run compiles and no call site can object, so the run is the
+hazard whether or not a type is waiting for it.
+
+**The finding is a run repeated across a family**, not a long run on its own.
+`mapping_write`'s five rect functions all take `origin_x, origin_y, width,
+height` and four of them add `bpp`; that repetition says the rectangle is a
+thing the module keeps re-spelling. By contrast `compute_core`'s `grid_x,
+grid_y, grid_z, tg_x, tg_y, tg_z` is one function mirroring the shape of
+`dispatchThreadgroups:threadsPerThreadgroup:`, which is what the Metal API
+takes — the run is the SDK's, not ours.
+
+Sort the report by how many *signatures* share a run before sorting by run
+length.
+
 ## What a hit can legitimately be
 
 The report points at code; it does not convict it.
@@ -63,10 +80,34 @@ The report points at code; it does not convict it.
   to share an arm are not a flattened type. Look for the same arity in every arm
   and a struct built immediately after the `match`.
 
-The class that is always worth fixing is the third one: **callers that all hold
+- **The run mirrors an API this code does not own.** See the `compute_core`
+  case above. A run that reproduces an SDK call's parameter list is contract
+  fidelity; grouping it would put a translation step between the decoded values
+  and the call that consumes them.
+
+The class that is always worth fixing is the last one: **callers that all hold
 the same source value and spell its fields out**. Grep the call sites before
 deciding — if every one of them reads `f(x.a, x.b, x.c, x.d)`, the type is
 already there and the signature is the only thing that disagrees.
+
+## Standing findings
+
+Recorded so the next reader starts from the triage rather than the raw report.
+
+- **`mapping_write`'s rectangle** — `read_rect_raw`, `read_rect_raw_at`,
+  `write_rect_raw`, `write_rect_raw_at` and `write_rect_raw_at_impl` all take
+  `origin_x, origin_y, width, height`, and `mapping_geom_window` returns
+  `Option<(u64, u32, u64, u32)>` — an anonymous 4-tuple whose meaning
+  (`base_off, bpr, span_end, bpp`) exists only in the callers' destructuring
+  patterns — which the callers then splat into four of those parameters. Two
+  types are wanted: the rectangle, and that window. Roughly 31 call sites
+  across `mapping_write`, `blit_exec`, `compute_exec` and `metal_draw/vulkan`;
+  `read_rect_raw_at` alone has 14. Not yet done.
+- **`translate::blend::state`** — `src_rgb, dst_rgb, op_rgb, src_alpha,
+  dst_alpha, op_alpha` is two triples, and swapping the halves is silent. One
+  signature only, so by the rule above it is weaker evidence than the rect
+  family, but the two-triples shape makes the swap plausible rather than
+  theoretical. Not yet examined.
 
 ## Known limits
 
