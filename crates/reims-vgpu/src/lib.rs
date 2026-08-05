@@ -102,7 +102,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
-use crate::qemu::host_ops::{NullHost, QemuHost, ReimsVgpuHostAction, ReimsVgpuHostOps};
+use crate::qemu::host_ops::{NullHost, QemuHost, ReimsVgpuHostOps};
 
 #[cfg(feature = "backend-metal")]
 type SelectedBackend = backend::metal::MetalBackend;
@@ -1268,13 +1268,13 @@ fn vbl_contended_pulse(slot: &BoundDevice) {
 /// Prompt actions (IRQ pulses, cursor moves) pop without the device lock so
 /// they deliver mid-drain; lock-owning actions (scanout, cursor glyph) keep
 /// their after-drain semantics behind `try_lock`.
-pub fn device_pop_action(id: u64) -> Option<ReimsVgpuHostAction> {
+pub fn device_pop_action(id: u64) -> Option<HostAction> {
     let slot = device_slot(id)?;
     if let Some(a) = slot.prompt_actions.lock().pop_front() {
-        return Some(ReimsVgpuHostAction::from(a));
+        return Some(a);
     }
     let mut d = slot.inner.try_lock()?;
-    d.actions.pop_front().map(ReimsVgpuHostAction::from)
+    d.actions.pop_front()
 }
 
 /// Which source owns the host console right now.
@@ -1768,7 +1768,7 @@ mod tests {
         slot.prompt_actions.lock().push_back(HostAction::irq_gfx());
         let _drain_guard = slot.inner.lock();
         let a = device_pop_action(id).expect("prompt action pops mid-drain");
-        assert_eq!(a.kind, runtime::HostActionKind::IrqGfxPulse as u32);
+        assert_eq!(a.kind, runtime::HostActionKind::IrqGfxPulse);
         assert!(device_pop_action(id).is_none());
         drop(_drain_guard);
         assert!(device_destroy(id));

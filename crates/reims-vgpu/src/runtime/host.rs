@@ -157,6 +157,12 @@ pub trait HostMemory {
 }
 
 /// Typed actions for the QEMU main loop (or FakeHost log).
+///
+/// `#[repr(u32)]` because this enum *is* the `kind` word of the C
+/// `ReimsVgpuHostAction` the BH pops — there is no second FFI spelling to drift
+/// against. Every discriminant is pinned to its `REIMS_VGPU_HOST_ACTION_*`
+/// header define by `the_abi_header_agrees_on_the_host_action_table`.
+#[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HostActionKind {
     None = 0,
@@ -200,6 +206,14 @@ pub enum HostActionKind {
     WindowClosed = 11,
 }
 
+/// One queued action, in the exact layout the C `ReimsVgpuHostAction` declares.
+///
+/// `#[repr(C)]` so `reims_vgpu_qemu_device_pop_action` can write this type
+/// straight into the caller's out-pointer. The queue is write-only from Rust —
+/// the shim reads `kind` and dispatches — so no value the C side chose ever
+/// reaches [`HostActionKind`], and a `#[repr(u32)]` enum in the `kind` slot
+/// cannot be handed an out-of-range discriminant.
+#[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HostAction {
     pub kind: HostActionKind,
@@ -207,6 +221,18 @@ pub struct HostAction {
     pub a1: u64,
     pub a2: u64,
     pub a3: u64,
+}
+
+impl Default for HostAction {
+    fn default() -> Self {
+        Self {
+            kind: HostActionKind::None,
+            a0: 0,
+            a1: 0,
+            a2: 0,
+            a3: 0,
+        }
+    }
 }
 
 impl HostAction {

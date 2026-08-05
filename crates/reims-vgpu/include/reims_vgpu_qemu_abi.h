@@ -175,7 +175,7 @@ extern "C" {
  */
 #define REIMS_VGPU_GFX_MMIO_SIZE 0x4000u
 
-/* HostAction kinds — match Rust HostActionKind / ReimsVgpuHostActionKind. */
+/* HostAction kinds — match Rust HostActionKind (runtime::host). */
 #define REIMS_VGPU_HOST_ACTION_NONE 0u
 #define REIMS_VGPU_HOST_ACTION_IRQ_GFX 1u
 #define REIMS_VGPU_HOST_ACTION_IRQ_IOSFC 2u

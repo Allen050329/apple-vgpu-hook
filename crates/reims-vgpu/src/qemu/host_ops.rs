@@ -2,7 +2,8 @@
 //!
 //! Pattern mirrors apple-gfx ↔ ParavirtualizedGraphics.framework:
 //! QEMU C owns only the host-service callbacks; Rust owns protocol + drain and
-//! enqueues [`ReimsVgpuHostAction`]s for a QEMU BH to apply on the main loop.
+//! enqueues [`crate::runtime::host::HostAction`]s for a QEMU BH to apply on
+//! the main loop.
 
 use crate::runtime::host::{HostAction, HostActionKind, HostMemory, HostOps, MemError};
 use std::collections::VecDeque;
@@ -244,60 +245,6 @@ impl QemuHostDecline {
     }
 }
 
-/// Typed actions Rust enqueues for the QEMU BH to perform on the main loop.
-///
-/// Discriminants match [`HostActionKind`] and `REIMS_VGPU_HOST_ACTION_*` in the header.
-#[repr(u32)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReimsVgpuHostActionKind {
-    None = 0,
-    IrqGfxPulse = 1,
-    IrqIosfcPulse = 2,
-    ScanoutUpdate = 3,
-    CursorUpdate = 4,
-    Trace = 5,
-    CursorGlyph = 6,
-    // 7 is retired (the removed GL/dmabuf scanout action); the values below are
-    // spelled out so its removal did not renumber the wire.
-    InputKey = 8,
-    InputPointerMove = 9,
-    InputPointerButton = 10,
-    WindowClosed = 11,
-}
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct ReimsVgpuHostAction {
-    pub kind: u32,
-    pub a0: u64,
-    pub a1: u64,
-    pub a2: u64,
-    pub a3: u64,
-}
-
-impl Default for ReimsVgpuHostAction {
-    fn default() -> Self {
-        Self {
-            kind: ReimsVgpuHostActionKind::None as u32,
-            a0: 0,
-            a1: 0,
-            a2: 0,
-            a3: 0,
-        }
-    }
-}
-
-impl From<HostAction> for ReimsVgpuHostAction {
-    fn from(a: HostAction) -> Self {
-        Self {
-            kind: a.kind as u32,
-            a0: a.a0,
-            a1: a.a1,
-            a2: a.a2,
-            a3: a.a3,
-        }
-    }
-}
 
 /// Production host bridge: GPA/KVA via C callbacks, actions queued for the BH.
 ///
@@ -928,40 +875,4 @@ mod tests {
         assert_eq!(host.map_pages(&[0xc000], 0x4000), None);
     }
 
-    /// The two parallel action-kind enums (runtime `HostActionKind`, consumed by
-    /// `From<HostAction>` via `as u32`, and the FFI `ReimsVgpuHostActionKind` that
-    /// mirrors the C `REIMS_VGPU_HOST_ACTION_*` constants) must share discriminants, or
-    /// a wire-value drift would mislabel actions to the C shim. Locks every kind.
-    #[test]
-    fn action_kind_discriminants_match_ffi_and_wire() {
-        use crate::runtime::host::HostActionKind as K;
-        let pairs = [
-            (K::None, ReimsVgpuHostActionKind::None, 0u32),
-            (K::IrqGfxPulse, ReimsVgpuHostActionKind::IrqGfxPulse, 1),
-            (K::IrqIosfcPulse, ReimsVgpuHostActionKind::IrqIosfcPulse, 2),
-            (K::ScanoutUpdate, ReimsVgpuHostActionKind::ScanoutUpdate, 3),
-            (K::CursorUpdate, ReimsVgpuHostActionKind::CursorUpdate, 4),
-            (K::Trace, ReimsVgpuHostActionKind::Trace, 5),
-            (K::CursorGlyph, ReimsVgpuHostActionKind::CursorGlyph, 6),
-            // 7 is a retired wire value (the removed GL/dmabuf scanout action).
-            // The jump from 6 to 8 is deliberate: the input kinds keep the
-            // values the C shim already dispatches on.
-            (K::InputKey, ReimsVgpuHostActionKind::InputKey, 8),
-            (
-                K::InputPointerMove,
-                ReimsVgpuHostActionKind::InputPointerMove,
-                9,
-            ),
-            (
-                K::InputPointerButton,
-                ReimsVgpuHostActionKind::InputPointerButton,
-                10,
-            ),
-            (K::WindowClosed, ReimsVgpuHostActionKind::WindowClosed, 11),
-        ];
-        for (k, ak, wire) in pairs {
-            assert_eq!(k as u32, wire);
-            assert_eq!(ak as u32, wire);
-        }
-    }
 }

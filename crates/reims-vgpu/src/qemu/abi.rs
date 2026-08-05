@@ -16,7 +16,8 @@
     reason = "the shared QEMU C ABI safety contract is documented at module scope"
 )]
 
-use crate::qemu::host_ops::{ReimsVgpuHostAction, ReimsVgpuHostOps};
+use crate::qemu::host_ops::ReimsVgpuHostOps;
+use crate::runtime::host::HostAction;
 use crate::{
     backend_name, device_console_feed, device_create, device_cursor_glyph_copy,
     device_cursor_glyph_info, device_destroy, device_drain, device_efi_console_copy,
@@ -491,7 +492,7 @@ pub unsafe extern "C" fn reims_vgpu_qemu_device_poll(handle: u64) -> c_int {
 #[no_mangle]
 pub unsafe extern "C" fn reims_vgpu_qemu_device_pop_action(
     handle: u64,
-    out: *mut ReimsVgpuHostAction,
+    out: *mut HostAction,
 ) -> c_int {
     unwind_safe(
         || {
@@ -792,6 +793,61 @@ mod tests {
     use super::*;
     use crate::model::{PAGE_SHIFT_ARM64E, PAGE_SHIFT_X86};
 
+    /// `reims_vgpu_qemu_device_pop_action` writes a Rust [`HostAction`] straight
+    /// through the caller's `ReimsVgpuHostAction *`, so the two declarations are
+    /// one struct and the header is the only other place it is written down.
+    ///
+    /// There used to be a third: a `#[repr(C)] ReimsVgpuHostAction` beside a
+    /// `#[repr(u32)] ReimsVgpuHostActionKind`, both mirroring the runtime pair,
+    /// with a test that compared the two *Rust* spellings to each other. That
+    /// test could not see the header, which is the copy that can actually drift
+    /// away from the compiled shim. The mirrors are gone and this checks what
+    /// they were standing in for: the field names, their order, and the C types
+    /// the shim's compiler lays out from.
+    ///
+    /// The `u32` kind followed by four `u64`s is why `size_of` is 40 and not 36
+    /// — both compilers pad `kind` out to the 8-byte alignment `a0` demands.
+    #[test]
+    fn the_abi_header_agrees_on_the_host_action_layout() {
+        const HEADER: &str = include_str!("../../include/reims_vgpu_qemu_abi.h");
+        let body = HEADER
+            .split_once("typedef struct ReimsVgpuHostAction {")
+            .expect("the header must declare ReimsVgpuHostAction")
+            .1
+            .split_once('}')
+            .expect("the declaration must be closed")
+            .0;
+        let fields: Vec<&str> = body
+            .split(';')
+            .map(str::trim)
+            .filter(|f| !f.is_empty())
+            .collect();
+        assert_eq!(
+            fields,
+            vec![
+                "uint32_t kind",
+                "uint64_t a0",
+                "uint64_t a1",
+                "uint64_t a2",
+                "uint64_t a3",
+            ],
+            "the C declaration must stay the one Rust's #[repr(C)] HostAction lays out"
+        );
+
+        assert_eq!(std::mem::size_of::<HostAction>(), 40);
+        assert_eq!(std::mem::align_of::<HostAction>(), 8);
+        assert_eq!(std::mem::offset_of!(HostAction, kind), 0);
+        assert_eq!(std::mem::offset_of!(HostAction, a0), 8);
+        assert_eq!(std::mem::offset_of!(HostAction, a1), 16);
+        assert_eq!(std::mem::offset_of!(HostAction, a2), 24);
+        assert_eq!(std::mem::offset_of!(HostAction, a3), 32);
+        assert_eq!(
+            std::mem::size_of::<crate::runtime::host::HostActionKind>(),
+            4,
+            "the kind word is the u32 the shim switches on"
+        );
+    }
+
     /// The version is the handshake itself: `copy_host_ops` refuses an ops table
     /// whose `abi_version` is not this exact number, so a header and a staticlib
     /// that disagree do not degrade — every device_create fails and the guest
@@ -1038,7 +1094,7 @@ mod tests {
             unsafe { reims_vgpu_qemu_device_drain(dev.handle) },
             REIMS_VGPU_QEMU_OK
         );
-        let mut action = ReimsVgpuHostAction::default();
+        let mut action = HostAction::default();
         assert_eq!(
             unsafe { reims_vgpu_qemu_device_pop_action(dev.handle, &mut action) },
             REIMS_VGPU_QEMU_EMPTY
