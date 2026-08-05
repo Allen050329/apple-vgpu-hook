@@ -16,9 +16,10 @@ use crate::backend::metal::raw_metal::{
 use crate::backend::metal::runtime::{new_buffer_from_host, system_device, thread_queue};
 use crate::backend::metal::samplers::{make_default_sampler, make_explicit_sampler};
 use crate::backend::metal::util::{
-    bytes_of, clear_err, f32_from_bits, image_len, rgba_len, sampler_index, set_err, texture_index,
-    valid_buffer_binding, ErrOut, Status,
+    bytes_of, clear_err, sampler_index, set_err, texture_index, valid_buffer_binding, ErrOut,
+    Status,
 };
+use crate::contract::extent::tight_image_bytes;
 use crate::contract::fnv::FNV_OFFSET_BASIS;
 use foreign_types::ForeignType;
 use metal::*;
@@ -973,7 +974,11 @@ fn bind_sampled_images(
             }
             (pixel_format_from_u32(image.pixel_format), image.data, bpr)
         } else {
-            let Some(expected_len) = rgba_len(image.width, image.height) else {
+            let Some(expected_len) = tight_image_bytes(
+                image.width,
+                image.height,
+                crate::contract::pixel_format::RGBA8_BPP as usize,
+            ) else {
                 set_err(
                     err,
                     format!(
@@ -1092,7 +1097,7 @@ fn bind_samplers(
         };
         seen[index] = true;
         if s.has_lod_clamp != 0 {
-            let lod = f32_from_bits(s.clamp_lod_min_bits)..f32_from_bits(s.clamp_lod_max_bits);
+            let lod = f32::from_bits(s.clamp_lod_min_bits)..f32::from_bits(s.clamp_lod_max_bits);
             if fragment_stage {
                 encoder.set_fragment_sampler_state_with_lod(index as u64, Some(&sampler), lod);
             } else {
@@ -1199,7 +1204,7 @@ fn validate_depth_attachment(
         return Err(Status::args("metal_render_depth_store_action_unsupported")
             .field("store_action", depth.store_action));
     };
-    let Some(depth_len) = image_len(width, height, std::mem::size_of::<f32>()) else {
+    let Some(depth_len) = tight_image_bytes(width, height, std::mem::size_of::<f32>()) else {
         set_err(err, "invalid depth attachment dimensions");
         return Err(Status::args("metal_render_depth_geometry_invalid")
             .field("width", width)
@@ -1277,7 +1282,7 @@ fn validate_stencil_attachment(
                 .field("store_action", stencil.store_action),
         );
     };
-    let Some(stencil_len) = image_len(width, height, 1) else {
+    let Some(stencil_len) = tight_image_bytes(width, height, 1) else {
         set_err(err, "invalid stencil attachment dimensions");
         return Err(Status::args("metal_render_stencil_geometry_invalid")
             .field("width", width)

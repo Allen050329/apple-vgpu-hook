@@ -1,4 +1,14 @@
-//! Shared validation/helpers (error, lengths, binding bases).
+//! Shared validation/helpers for this backend: error write-back and the
+//! binding-band arithmetic.
+//!
+//! Image byte lengths used to live here too. They do not any more: the
+//! product `width * height * bpp` is not a Metal fact, this module is behind
+//! `feature = "backend-metal"`, and `runtime::compute_session` was reaching
+//! through that gate for it — so it is
+//! [`crate::contract::extent::tight_image_bytes`] now, where its test runs on
+//! every host instead of only on an Apple one. An `f32_from_bits` wrapper went
+//! with them: it forwarded `f32::from_bits` unchanged, and the test it carried
+//! asserted a property of the standard library.
 
 use crate::backend::metal::abi::{
     REIMS_VGPU_BINDING_SAMPLER_BASE, REIMS_VGPU_BINDING_TEXTURE_BASE,
@@ -26,28 +36,6 @@ pub fn clear_err(err: ErrOut<'_>) {
             *err.0 = 0;
         }
     }
-}
-
-pub fn rgba_len(width: u32, height: u32) -> Option<usize> {
-    if width == 0 || height == 0 {
-        return None;
-    }
-    (width as u64)
-        .checked_mul(height as u64)?
-        .checked_mul(4)?
-        .try_into()
-        .ok()
-}
-
-pub fn image_len(width: u32, height: u32, bytes_per_pixel: usize) -> Option<usize> {
-    if width == 0 || height == 0 || bytes_per_pixel == 0 {
-        return None;
-    }
-    (width as u64)
-        .checked_mul(height as u64)?
-        .checked_mul(bytes_per_pixel as u64)?
-        .try_into()
-        .ok()
 }
 
 pub fn valid_buffer_binding(binding: u32) -> bool {
@@ -78,10 +66,6 @@ pub fn sampler_index(binding: u32) -> Option<usize> {
     }
 }
 
-pub fn f32_from_bits(bits: u32) -> f32 {
-    f32::from_bits(bits)
-}
-
 /// As-bytes view of a `repr(C)` value for content hashing (matches ObjC `sizeof`).
 pub fn bytes_of<T>(v: &T) -> &[u8] {
     unsafe { std::slice::from_raw_parts((v as *const T).cast::<u8>(), std::mem::size_of::<T>()) }
@@ -90,14 +74,6 @@ pub fn bytes_of<T>(v: &T) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn image_lengths_reject_empty_geometry() {
-        assert_eq!(rgba_len(2, 3), Some(24));
-        assert_eq!(rgba_len(0, 3), None);
-        assert_eq!(image_len(2, 3, 8), Some(48));
-        assert_eq!(image_len(2, 3, 0), None);
-    }
 
     #[test]
     fn binding_bands_accept_exactly_the_backend_capacity() {
@@ -124,12 +100,5 @@ mod tests {
             sampler_index(REIMS_VGPU_BINDING_SAMPLER_BASE + REIMS_VGPU_METAL_MAX_SAMPLERS as u32),
             None
         );
-    }
-
-    #[test]
-    fn float_bits_are_preserved_exactly() {
-        for bits in [0, 1, f32::INFINITY.to_bits(), f32::NAN.to_bits(), u32::MAX] {
-            assert_eq!(f32_from_bits(bits).to_bits(), bits);
-        }
     }
 }

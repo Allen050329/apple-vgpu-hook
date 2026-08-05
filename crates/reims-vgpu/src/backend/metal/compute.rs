@@ -21,10 +21,10 @@ use crate::backend::metal::stage_input::{
     has_indexed_layout, layout_for_buffer, make_compute_stage_input_descriptor,
 };
 use crate::backend::metal::util::{
-    bytes_of, clear_err, f32_from_bits, image_len, sampler_index, set_err, texture_index,
-    valid_buffer_binding, ErrOut, Status,
+    bytes_of, clear_err, sampler_index, set_err, texture_index, valid_buffer_binding, ErrOut,
+    Status,
 };
-use crate::contract::extent::Extent3;
+use crate::contract::extent::{tight_image_bytes, Extent3};
 use metal::*;
 use std::ptr;
 
@@ -311,7 +311,7 @@ pub(crate) fn bind_storage_images(
                 .field("binding", image.binding)
                 .field("format", image.format);
         };
-        let Some(expected_len) = image_len(image.width, image.height, bpp) else {
+        let Some(expected_len) = tight_image_bytes(image.width, image.height, bpp) else {
             set_err(
                 err,
                 format!("invalid storage image binding {}", image.binding),
@@ -400,7 +400,7 @@ pub(crate) fn bind_compute_sampled_images(
                 .field("binding", image.binding)
                 .field("format", image.format);
         };
-        let Some(expected_len) = image_len(image.width, image.height, bpp) else {
+        let Some(expected_len) = tight_image_bytes(image.width, image.height, bpp) else {
             set_err(
                 err,
                 format!("invalid sampled compute image binding {}", image.binding),
@@ -544,7 +544,7 @@ pub(crate) fn bind_compute_samplers(
             encoder.set_sampler_state_with_lod(
                 index as u64,
                 Some(&sampler),
-                f32_from_bits(s.clamp_lod_min_bits)..f32_from_bits(s.clamp_lod_max_bits),
+                f32::from_bits(s.clamp_lod_min_bits)..f32::from_bits(s.clamp_lod_max_bits),
             );
         } else {
             encoder.set_sampler_state(index as u64, Some(&sampler));

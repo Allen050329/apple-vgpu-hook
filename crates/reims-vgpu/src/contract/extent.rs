@@ -1,5 +1,6 @@
-//! Extents the guest's API defines: a three-dimensional compute extent, and
-//! the size of one mip level of a texture.
+//! Extents the guest's API defines: a three-dimensional compute extent, the
+//! size of one mip level of a texture, and the byte length of a tightly-packed
+//! image.
 
 /// A grid or threadgroup size, as three dimensions that travel together.
 ///
@@ -57,6 +58,33 @@ pub fn mip_extent(base: u32, level: u32) -> u32 {
     (base >> level).max(1)
 }
 
+/// Bytes of a tightly-packed image of this geometry: `width * height * bpp`,
+/// with no row alignment.
+///
+/// "Tight" is the whole contract. Anything the guest has told us a pitch for
+/// must not come through here — [`crate::contract::iosurface_pages::packed_span_estimate`]
+/// is the row-aligned estimate for sizing a page table, and the two differ by
+/// exactly the alignment slack. Mixing them up reads short.
+///
+/// Zero on either axis, or a zero pixel size, returns `None` rather than 0. The
+/// callers are all length checks of the form "does the guest's buffer hold a
+/// whole image", and `0` would pass every one of them.
+///
+/// Here rather than in `backend::metal`, where it lived, for the reason
+/// [`mip_extent`] gives: it is arithmetic both rails need, `backend::metal` is
+/// behind a feature gate, and `runtime::compute_session` was already reaching
+/// through that gate to borrow it.
+pub fn tight_image_bytes(width: u32, height: u32, bytes_per_pixel: usize) -> Option<usize> {
+    if width == 0 || height == 0 || bytes_per_pixel == 0 {
+        return None;
+    }
+    (width as u64)
+        .checked_mul(height as u64)?
+        .checked_mul(bytes_per_pixel as u64)?
+        .try_into()
+        .ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -82,5 +110,24 @@ mod tests {
         assert_eq!(mip_extent(100, 1), 50);
         assert_eq!(mip_extent(100, 2), 25);
         assert_eq!(mip_extent(100, 3), 12);
+    }
+
+    /// Moved here from `backend::metal::util`, where it could only run on an
+    /// Apple host. Every case is one the callers actually guard against.
+    #[test]
+    fn a_tight_image_is_the_product_and_an_empty_one_has_no_length() {
+        assert_eq!(tight_image_bytes(2, 3, 4), Some(24));
+        assert_eq!(tight_image_bytes(2, 3, 8), Some(48));
+        assert_eq!(tight_image_bytes(1, 1, 1), Some(1));
+
+        // None, not Some(0) — a zero would satisfy every `len >= expected`
+        // check the callers make.
+        assert_eq!(tight_image_bytes(0, 3, 4), None);
+        assert_eq!(tight_image_bytes(2, 0, 4), None);
+        assert_eq!(tight_image_bytes(2, 3, 0), None);
+
+        // The product is taken in u64 and only then narrowed, so a geometry
+        // that overflows `usize` declines instead of wrapping.
+        assert_eq!(tight_image_bytes(u32::MAX, u32::MAX, usize::MAX), None);
     }
 }

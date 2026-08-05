@@ -546,8 +546,9 @@ fn apply_icb_compute_encoder_inheritance<M: HostMemory + HostOps>(
     };
     use crate::backend::metal::runtime::new_buffer_from_host;
     use crate::backend::metal::samplers::make_explicit_sampler;
-    use crate::backend::metal::util::{image_len, valid_buffer_binding};
+    use crate::backend::metal::util::valid_buffer_binding;
     use crate::contract::endian::ld32;
+    use crate::contract::extent::tight_image_bytes;
     use crate::runtime::compute_exec::{
         load_compute_pipeline, nested_job_from_icb_resources, split_staged_textures, stage_buffer,
         stage_texture_raw,
@@ -737,7 +738,7 @@ fn apply_icb_compute_encoder_inheritance<M: HostMemory + HostOps>(
                         "icb_texture_selector_unsupported",
                     ));
                 };
-                let Some(expected_len) = image_len(staged.width, staged.height, bpp) else {
+                let Some(expected_len) = tight_image_bytes(staged.width, staged.height, bpp) else {
                     return Err(ComputeStatus::Unsupported("icb_texture_image_len_overflow"));
                 };
                 if staged.bytes.len() < expected_len {
