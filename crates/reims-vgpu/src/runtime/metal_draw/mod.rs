@@ -17,9 +17,13 @@ use crate::observe::Decline;
 use crate::runtime::census::srgb_census;
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 use crate::runtime::decode::render::PASS_STORE_ACTION_DONT_CARE;
+// Only `vulkan` and the tests read it, through this module's `use super::*`;
+// the Metal arm tests the band instead (`load_action_in_contract`).
+#[cfg(any(test, feature = "backend-vulkan"))]
+use crate::runtime::decode::render::PASS_LOAD_ACTION_DONT_CARE;
 use crate::runtime::decode::render::{
-    DepthAttachment, ScissorRect, StencilAttachment, PASS_LOAD_ACTION_CLEAR,
-    PASS_LOAD_ACTION_DONT_CARE, PASS_LOAD_ACTION_LOAD, PASS_STORE_ACTION_STORE,
+    DepthAttachment, ScissorRect, StencilAttachment, PASS_LOAD_ACTION_CLEAR, PASS_LOAD_ACTION_LOAD,
+    PASS_STORE_ACTION_STORE,
 };
 use crate::runtime::decode::resource::ListObjectEntry;
 #[cfg(feature = "backend-vulkan")]
@@ -2152,40 +2156,45 @@ pub fn load_composite_premult_one_omsa(draw_rgba: &[u8], seed_rgba: &[u8]) -> (V
 /// something exotic — every alternative is equally a guess, and inventing
 /// semantics for an unknown wire value is what the ground rules forbid. What
 /// changes is that the guess is now visible.
+/// Whether a decoded load action is one of the three `MTLLoadAction` values,
+/// reporting the one case where it is not.
+///
+/// A fourth value is a corrupt or unsupported wire word, and both encode arms
+/// treat it as DontCare — which discards whatever the attachment held, so a
+/// pass the guest meant to composite onto goes blank. Only the Metal arm said
+/// so; the Vulkan arm took the same value into a `_ => {}`.
+#[cfg(any(
+    feature = "backend-vulkan",
+    all(feature = "backend-metal", target_os = "macos")
+))]
+pub(crate) fn load_action_in_contract(pipeline_ref: u32, load_action: u16) -> bool {
+    if load_action <= PASS_LOAD_ACTION_CLEAR {
+        return true;
+    }
+    if degrade_log_first(pipeline_ref, "load_action_unmapped") {
+        crate::observe::fail(format!(
+            "pass_state_degraded reason=load_action_unmapped \
+             pipe={pipeline_ref} load_action={load_action} \
+             (not one of MTLLoadAction 0/1/2; attachment treated as DontCare)"
+        ));
+    }
+    false
+}
+
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn map_load_action(pipeline_ref: u32, a: u16) -> u32 {
     use crate::backend::metal::abi::{
         REIMS_VGPU_MTL_LOAD_ACTION_CLEAR, REIMS_VGPU_MTL_LOAD_ACTION_DONT_CARE,
         REIMS_VGPU_MTL_LOAD_ACTION_LOAD,
     };
+    if !load_action_in_contract(pipeline_ref, a) {
+        return REIMS_VGPU_MTL_LOAD_ACTION_DONT_CARE;
+    }
     match a {
-        PASS_LOAD_ACTION_DONT_CARE => REIMS_VGPU_MTL_LOAD_ACTION_DONT_CARE,
         PASS_LOAD_ACTION_LOAD => REIMS_VGPU_MTL_LOAD_ACTION_LOAD,
         PASS_LOAD_ACTION_CLEAR => REIMS_VGPU_MTL_LOAD_ACTION_CLEAR,
-        other => {
-            if metal_degrade_log_first(pipeline_ref, "load_action_unmapped") {
-                crate::observe::fail(format!(
-                    "pass_state_degraded reason=load_action_unmapped \
-                     pipe={pipeline_ref} load_action={other} \
-                     (not one of MTLLoadAction 0/1/2; attachment treated as DontCare)"
-                ));
-            }
-            REIMS_VGPU_MTL_LOAD_ACTION_DONT_CARE
-        }
+        _ => REIMS_VGPU_MTL_LOAD_ACTION_DONT_CARE,
     }
-}
-
-/// `degrade_log_first`'s Metal-arm twin — the Vulkan one is cfg'd to the engine
-/// path, and a per-`(pipeline, slug)` latch is what keeps a recurring pass-state
-/// degradation from flooding `/tmp/reims-vgpu-fail.log` on every draw.
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-fn metal_degrade_log_first(pipeline_ref: u32, slug: &'static str) -> bool {
-    use std::collections::HashSet;
-    use std::sync::Mutex;
-    static SEEN: Mutex<Option<HashSet<(u32, &'static str)>>> = Mutex::new(None);
-    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-    seen.get_or_insert_with(HashSet::new)
-        .insert((pipeline_ref, slug))
 }
 
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
@@ -4499,6 +4508,51 @@ fn load_type11_rgba_memoized<M: HostMemory + HostOps>(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, feature = "backend-vulkan"))]
+mod load_action_contract_tests {
+    use super::load_action_in_contract;
+    use crate::runtime::decode::render::{
+        PASS_LOAD_ACTION_CLEAR, PASS_LOAD_ACTION_DONT_CARE, PASS_LOAD_ACTION_LOAD,
+    };
+
+    /// `MTLLoadAction` has three values, and a fourth is named rather than
+    /// swallowed.
+    ///
+    /// Both encode arms fall back to DontCare on an out-of-contract value,
+    /// which discards whatever the attachment held — so a pass the guest meant
+    /// to composite onto goes blank. The Metal arm reported that; the Vulkan
+    /// arm took the same value into a `_ => {}` and said nothing. One helper
+    /// now, so a third arm cannot reintroduce the silence.
+    #[test]
+    fn a_load_action_outside_mtlloadaction_is_named_not_swallowed() {
+        for (name, action) in [
+            ("DontCare", PASS_LOAD_ACTION_DONT_CARE),
+            ("Load", PASS_LOAD_ACTION_LOAD),
+            ("Clear", PASS_LOAD_ACTION_CLEAR),
+        ] {
+            assert!(
+                load_action_in_contract(0x10AD, action),
+                "MTLLoadAction{name} is in contract"
+            );
+        }
+        // Distinct pipeline refs, because the emitter latches per
+        // (pipeline, slug) and a second call on one ref would report nothing.
+        assert!(!load_action_in_contract(0xF001, PASS_LOAD_ACTION_CLEAR + 1));
+        assert!(!load_action_in_contract(0xF002, u16::MAX));
+
+        let log = std::fs::read_to_string(crate::observe::fail_log_path()).expect("fail log");
+        let line = log
+            .lines()
+            .rev()
+            .find(|l| l.contains("reason=load_action_unmapped") && l.contains("pipe=61442"))
+            .expect("an out-of-contract load action must name itself");
+        assert!(
+            line.starts_with("pass_state_degraded ") && line.contains("load_action=65535"),
+            "the line must carry the value that was refused: {line}"
+        );
+    }
+}
 
 #[cfg(all(test, feature = "backend-vulkan"))]
 mod memo_scratch_tests {

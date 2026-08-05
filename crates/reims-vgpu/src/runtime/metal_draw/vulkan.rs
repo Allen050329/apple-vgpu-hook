@@ -4879,15 +4879,24 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             }
         }
         if let Some(c0) = req.colors.first() {
-            match c0.load_action {
-                x if x == PASS_LOAD_ACTION_LOAD && chain_load_from_target => {
+            // Out of contract is DontCare here, same as on the Metal arm, and
+            // it says so through the same helper — this arm used to take an
+            // unknown load action into the `_ => {}` below and blank the
+            // attachment in silence.
+            let load_action = if super::load_action_in_contract(req.pipeline_ref, c0.load_action) {
+                c0.load_action
+            } else {
+                PASS_LOAD_ACTION_DONT_CARE
+            };
+            match load_action {
+                PASS_LOAD_ACTION_LOAD if chain_load_from_target => {
                     // Resident target carries the chain; no CPU seed bytes.
                 }
-                x if x == PASS_LOAD_ACTION_CLEAR => {
+                PASS_LOAD_ACTION_CLEAR => {
                     target_rgba8 =
                         Some(std::sync::Arc::new(solid_rgba_local(w, h, &c0.clear_color)));
                 }
-                x if x == PASS_LOAD_ACTION_LOAD => {
+                PASS_LOAD_ACTION_LOAD => {
                     // Which door this pass took, so a pass that ends with no
                     // seed says which source was supposed to have one. A LOAD
                     // means the guest is compositing *onto what is already
@@ -4924,6 +4933,8 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     // at that door in every one.
                     note_load_seed_outcome(seed_door, target_rgba8.is_some(), c0, w, h);
                 }
+                // DontCare: the guest declared the prior contents undefined, so
+                // arriving with no seed is the contract rather than a loss.
                 _ => {}
             }
         }
