@@ -467,6 +467,64 @@ pub fn apply_record<M: HostMemory + HostOps>(
     out
 }
 
+/// The `MTLDispatchType` the guest declared, or `Serial` with the substitution
+/// named in the always-on log.
+///
+/// `WRITE_DESCRIPTOR` carries this ordinal straight off the wire and nothing
+/// bounds it: the decoder stores `d.dispatch_type.get()` unexamined, and the
+/// accumulator used to store that. The narrowing lived at the far end of the
+/// rail instead — inside `execute_dispatch_metal`, as
+/// `if acc.dispatch_type == CONCURRENT { CONCURRENT } else { SERIAL }` — which
+/// is `Serial` for every value the device does not recognise, chosen silently.
+///
+/// Three things were wrong with it being there, and all three are why the rule
+/// now lives here, beside the field it constrains:
+///
+/// - **It was invisible.** A guest asking for a dispatch type this device has no
+///   contract for got a *serial* encoder and no line anywhere. Serial and
+///   concurrent differ in whether Metal may overlap the dispatches in a segment,
+///   so the substitution is a real change to what the guest asked for.
+/// - **It made a written refusal unreachable.** `backend::metal::compute`'s
+///   `mtl_dispatch_type` returns `None` for an unrecognised ordinal and its
+///   caller declines with `metal_compute_dispatch_type_invalid` — a typed
+///   refusal that could never fire, because the only producer feeding it had
+///   already replaced every unrecognised value with `Serial`.
+/// - **It only ran on one arm.** `execute_dispatch_metal` is
+///   `backend-metal`-gated, so on a Vulkan host the field was accepted, stored
+///   and then read by nobody. The value is a *guest contract* fact, not a
+///   backend one, so both arms now score it the same way and the check runs on
+///   the pathway this repository can boot.
+///
+/// The substitution is kept rather than turned into a decline, deliberately. The
+/// Metal SDK's `MTLDispatchType` has exactly `Serial` and `Concurrent`, so an
+/// out-of-range ordinal here is far more likely to be *this device* reading the
+/// wrong wire offset than a guest asking for something new — and declining the
+/// dispatch would turn a decode bug into lost guest work on a pathway no boot
+/// available here can exercise. So it is reported and counted first. If
+/// `compute_dispatch_type_unknown` is ever seen, the evidence to decide arrives
+/// before the behaviour change does.
+fn accepted_dispatch_type(task_id: u32, declared: u32) -> u32 {
+    use crate::contract::dispatch::{
+        is_declared_dispatch_type, MTL_DISPATCH_TYPE_CONCURRENT, MTL_DISPATCH_TYPE_SERIAL,
+    };
+    if is_declared_dispatch_type(declared) {
+        return declared;
+    }
+    // Counted per occurrence, reported once per value: the magnitude belongs to
+    // the counter, and a second line for the same ordinal says nothing the first
+    // did not.
+    crate::runtime::drain::note_store_route("compute_dispatch_type_unknown");
+    if crate::observe::first_sight("compute_dispatch_type_unknown", u64::from(declared)) {
+        crate::observe::fail(format!(
+            "compute_dispatch_type reason=compute_dispatch_type_unknown task={task_id} \
+             declared={declared} (the segment is encoded Serial; MTLDispatchType has only \
+             Serial={MTL_DISPATCH_TYPE_SERIAL} and \
+             Concurrent={MTL_DISPATCH_TYPE_CONCURRENT})"
+        ));
+    }
+    MTL_DISPATCH_TYPE_SERIAL
+}
+
 fn apply_record_inner<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -502,7 +560,7 @@ fn apply_record_inner<M: HostMemory + HostOps>(
             None
         }
         Kind::DispatchType => {
-            seg.acc.dispatch_type = cmd.dispatch_type;
+            seg.acc.dispatch_type = accepted_dispatch_type(task_id, cmd.dispatch_type);
             None
         }
         Kind::StageInRegion => {
@@ -4169,8 +4227,7 @@ fn execute_dispatch_metal<M: HostMemory + HostOps>(
         ReimsVgpuComputeStageInRegionIndirectArguments, ReimsVgpuComputeTextureUsage,
         ReimsVgpuSampler, ReimsVgpuThreadgroupMemory, REIMS_VGPU_BINDING_SAMPLER_BASE,
         REIMS_VGPU_BINDING_TEXTURE_BASE, REIMS_VGPU_COMPUTE_DISPATCH_KIND_THREADGROUPS,
-        REIMS_VGPU_COMPUTE_DISPATCH_KIND_THREADS, REIMS_VGPU_MTL_DISPATCH_TYPE_CONCURRENT,
-        REIMS_VGPU_MTL_DISPATCH_TYPE_SERIAL,
+        REIMS_VGPU_COMPUTE_DISPATCH_KIND_THREADS,
     };
     use crate::backend::metal::compute::{
         compute_core, compute_encode_on_encoder, reflect_compute_textures_mtlb,
@@ -4205,11 +4262,11 @@ fn execute_dispatch_metal<M: HostMemory + HostOps>(
     } else {
         REIMS_VGPU_COMPUTE_DISPATCH_KIND_THREADGROUPS
     };
-    let dispatch_type = if acc.dispatch_type == REIMS_VGPU_MTL_DISPATCH_TYPE_CONCURRENT {
-        REIMS_VGPU_MTL_DISPATCH_TYPE_CONCURRENT
-    } else {
-        REIMS_VGPU_MTL_DISPATCH_TYPE_SERIAL
-    };
+    // No narrowing here: `accepted_dispatch_type` scored this ordinal when the
+    // record was applied, on both arms, and named the substitution if it made
+    // one. Re-deciding it at the encode would be the same rule in a second
+    // place, and the second place is the one that could not report.
+    let dispatch_type = acc.dispatch_type;
 
     // Stage-input descriptor from pipeline (optional).
     let reims_vgpu_stage_input = pipeline.stage_input.as_ref().map(stage_input_to_apv);

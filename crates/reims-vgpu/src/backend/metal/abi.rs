@@ -30,6 +30,22 @@ pub const REIMS_VGPU_MTL_PRIMITIVE_TYPE_TRIANGLE_STRIP: u32 = 4;
 pub const REIMS_VGPU_MTL_DISPATCH_TYPE_SERIAL: u32 = 0;
 pub const REIMS_VGPU_MTL_DISPATCH_TYPE_CONCURRENT: u32 = 1;
 
+// The same pair is declared in `contract::dispatch`, which is where the shared
+// decode/exec path reads it: this module is `backend-metal`-gated, so a value
+// spelled only here is unreachable from the code that accepts the field off the
+// wire. These names stay because this file is a mirror of an archived C header
+// and the mirror is the provenance. The assertions are what stop the two
+// spellings from parting, which nothing else in the toolchain would notice —
+// and `rustc` evaluates them on every arm that compiles this file, including
+// the cross-compiled `--target aarch64-apple-darwin` clippy run.
+const _: () = assert!(
+    REIMS_VGPU_MTL_DISPATCH_TYPE_SERIAL == crate::contract::dispatch::MTL_DISPATCH_TYPE_SERIAL
+);
+const _: () = assert!(
+    REIMS_VGPU_MTL_DISPATCH_TYPE_CONCURRENT
+        == crate::contract::dispatch::MTL_DISPATCH_TYPE_CONCURRENT
+);
+
 pub const REIMS_VGPU_COMPUTE_DISPATCH_KIND_THREADGROUPS: u32 = 0;
 pub const REIMS_VGPU_COMPUTE_DISPATCH_KIND_THREADS: u32 = 1;
 

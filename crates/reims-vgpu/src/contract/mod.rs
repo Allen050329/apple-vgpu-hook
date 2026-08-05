@@ -4,6 +4,7 @@
 //! Source of truth for numbers that come from the wire/SDK/`*_format.h` contracts.
 
 pub mod checked;
+pub mod dispatch;
 pub mod draw;
 pub mod endian;
 pub mod extent;

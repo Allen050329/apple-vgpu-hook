@@ -2146,3 +2146,68 @@ fn a_resident_answer_is_a_seed_or_a_sample_and_never_both() {
     assert!(none.and_then(ResidentServe::seed_generation).is_none());
     assert!(none.and_then(ResidentServe::sample_source).is_none());
 }
+
+/// An `MTLDispatchType` the contract does not declare is named, counted, and
+/// substituted — and the two it does declare cross untouched and unremarked.
+///
+/// `WRITE_DESCRIPTOR` puts this ordinal on the wire unbounded: the decoder
+/// stores `d.dispatch_type.get()` with no range check, so whatever the guest
+/// wrote reaches the accumulator. What used to happen next was
+/// `if x == CONCURRENT { CONCURRENT } else { SERIAL }`, at the far end of the
+/// rail inside `execute_dispatch_metal` — so a guest asking for a dispatch type
+/// this device has no contract for got a *serial* encoder, silently, on the one
+/// arm that read the field at all.
+///
+/// Both halves are the test. A substitution nobody can see is the failure this
+/// commit exists to end; a line spent on the ordinary `Serial` and `Concurrent`
+/// records would be a flood on a per-segment path and would bury the one line
+/// that means something.
+#[test]
+fn an_undeclared_dispatch_type_is_named_and_counted_before_it_becomes_serial() {
+    use crate::contract::dispatch::{MTL_DISPATCH_TYPE_CONCURRENT, MTL_DISPATCH_TYPE_SERIAL};
+    use crate::runtime::drain::store_route_count;
+
+    let before = store_route_count("compute_dispatch_type_unknown");
+
+    let cap = crate::observe::FailCapture::start();
+    assert_eq!(
+        accepted_dispatch_type(3, MTL_DISPATCH_TYPE_SERIAL),
+        MTL_DISPATCH_TYPE_SERIAL
+    );
+    assert_eq!(
+        accepted_dispatch_type(3, MTL_DISPATCH_TYPE_CONCURRENT),
+        MTL_DISPATCH_TYPE_CONCURRENT
+    );
+    assert!(
+        cap.lines().is_empty(),
+        "a declared dispatch type must spend no line: {:?}",
+        cap.lines()
+    );
+    assert_eq!(
+        store_route_count("compute_dispatch_type_unknown"),
+        before,
+        "a declared dispatch type is not a substitution"
+    );
+    drop(cap);
+
+    // An ordinal outside the pair: substituted, named once, counted every time.
+    let cap = crate::observe::FailCapture::start();
+    for _ in 0..3 {
+        assert_eq!(
+            accepted_dispatch_type(3, 0x5e01),
+            MTL_DISPATCH_TYPE_SERIAL,
+            "an unrecognised dispatch type encodes Serial"
+        );
+    }
+    let line = cap.one("compute_dispatch_type");
+    assert!(
+        line.contains("reason=compute_dispatch_type_unknown")
+            && line.contains(" task=3 declared=24065"),
+        "the substitution must name the value that caused it: {line}"
+    );
+    assert_eq!(
+        store_route_count("compute_dispatch_type_unknown"),
+        before + 3,
+        "the line is deduped per value; the count is not"
+    );
+}
