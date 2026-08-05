@@ -46,6 +46,12 @@ const _: () = assert!(
         == crate::contract::dispatch::MTL_DISPATCH_TYPE_CONCURRENT
 );
 
+// Kept as mirror, deliberately unused by Rust. The dispatch kind reaches
+// `compute::compute_core` as a `bool` and never becomes an ordinal on this
+// side: it is produced as a `bool`, and widening it to `{0, 1}` to cross a call
+// put it beside `dispatch_type`, which is also `{0, 1}`. Deleting these two
+// would make the mirror disagree with the archived header, which is the one
+// thing this file is for.
 pub const REIMS_VGPU_COMPUTE_DISPATCH_KIND_THREADGROUPS: u32 = 0;
 pub const REIMS_VGPU_COMPUTE_DISPATCH_KIND_THREADS: u32 = 1;
 

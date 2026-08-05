@@ -639,7 +639,18 @@ pub fn compute_encode_on_encoder(
     stage_in_region_indirect: Option<&ReimsVgpuComputeStageInRegionIndirectArguments>,
     imageblock_dimensions: Option<&ReimsVgpuComputeImageblockDimensions>,
     stage_input: Option<&ReimsVgpuComputeStageInputDescriptor>,
-    dispatch_kind: u32,
+    // `dispatchThreads:` when true, `dispatchThreadgroups:` when false.
+    //
+    // A `bool` rather than the `REIMS_VGPU_COMPUTE_DISPATCH_KIND_*` ordinal the
+    // archived C header spells, because the only producer already holds a
+    // `bool` — `resolve_dispatch_dims_reported` returns one — and widening it
+    // to a `{0, 1}` ordinal to cross this call put it next to `dispatch_type`,
+    // which is also `{0, 1}`. Transposing that pair compiled, passed both
+    // validators, and changed whether the grid counts threads or threadgroups
+    // *and* whether Metal may overlap the segment. Two types cannot be
+    // transposed, so the `match` that used to guard the ordinal is gone with
+    // it: the state it refused is no longer representable.
+    dispatch_threads: bool,
     grid: Extent3,
     threadgroup: Extent3,
     err: ErrOut<'_>,
@@ -691,14 +702,6 @@ pub fn compute_encode_on_encoder(
         );
         return Err(Status::args("metal_compute_threadgroup_z_zero"));
     }
-    let dispatch_threads = match dispatch_kind {
-        REIMS_VGPU_COMPUTE_DISPATCH_KIND_THREADS => true,
-        REIMS_VGPU_COMPUTE_DISPATCH_KIND_THREADGROUPS => false,
-        other => {
-            set_err(err, format!("invalid compute dispatch kind {other}"));
-            return Err(Status::args("metal_compute_dispatch_kind_invalid").field("kind", other));
-        }
-    };
 
     let function = load_only_function(device, mtlb, "compute", err)?;
     let pso = new_compute_pipeline_state(device, &function, mtlb, stage_input, err)?;
@@ -853,7 +856,9 @@ pub fn compute_core(
     stage_in_region_indirect: Option<&ReimsVgpuComputeStageInRegionIndirectArguments>,
     imageblock_dimensions: Option<&ReimsVgpuComputeImageblockDimensions>,
     stage_input: Option<&ReimsVgpuComputeStageInputDescriptor>,
-    dispatch_kind: u32,
+    // A `bool`, and forwarded as one — see `compute_encode_on_encoder`, which
+    // consumes it. It sits beside `dispatch_type` here, which is why.
+    dispatch_threads: bool,
     dispatch_type: u32,
     grid: Extent3,
     threadgroup: Extent3,
@@ -890,7 +895,7 @@ pub fn compute_core(
         stage_in_region_indirect,
         imageblock_dimensions,
         stage_input,
-        dispatch_kind,
+        dispatch_threads,
         grid,
         threadgroup,
         err,

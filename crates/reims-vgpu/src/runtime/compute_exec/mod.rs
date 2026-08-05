@@ -4226,8 +4226,7 @@ fn execute_dispatch_metal<M: HostMemory + HostOps>(
         ReimsVgpuComputeImageblockDimensions, ReimsVgpuComputeStageInRegion,
         ReimsVgpuComputeStageInRegionIndirectArguments, ReimsVgpuComputeTextureUsage,
         ReimsVgpuSampler, ReimsVgpuThreadgroupMemory, REIMS_VGPU_BINDING_SAMPLER_BASE,
-        REIMS_VGPU_BINDING_TEXTURE_BASE, REIMS_VGPU_COMPUTE_DISPATCH_KIND_THREADGROUPS,
-        REIMS_VGPU_COMPUTE_DISPATCH_KIND_THREADS,
+        REIMS_VGPU_BINDING_TEXTURE_BASE,
     };
     use crate::backend::metal::compute::{
         compute_core, compute_encode_on_encoder, reflect_compute_textures_mtlb,
@@ -4257,11 +4256,6 @@ fn execute_dispatch_metal<M: HostMemory + HostOps>(
         Err(e) => return e,
     };
 
-    let dispatch_kind = if dispatch_threads {
-        REIMS_VGPU_COMPUTE_DISPATCH_KIND_THREADS
-    } else {
-        REIMS_VGPU_COMPUTE_DISPATCH_KIND_THREADGROUPS
-    };
     // No narrowing here: `accepted_dispatch_type` scored this ordinal when the
     // record was applied, on both arms, and named the substitution if it made
     // one. Re-deciding it at the encode would be the same rule in a second
@@ -4453,7 +4447,7 @@ fn execute_dispatch_metal<M: HostMemory + HostOps>(
             indirect_region_args.as_ref(),
             imageblock.as_ref(),
             reims_vgpu_stage_input.as_ref(),
-            dispatch_kind,
+            dispatch_threads,
             grid,
             tg,
             (err_buf.as_mut_ptr(), err_buf.len()),
@@ -4489,7 +4483,7 @@ fn execute_dispatch_metal<M: HostMemory + HostOps>(
         indirect_region_args.as_ref(),
         imageblock.as_ref(),
         reims_vgpu_stage_input.as_ref(),
-        dispatch_kind,
+        dispatch_threads,
         dispatch_type,
         grid,
         tg,
