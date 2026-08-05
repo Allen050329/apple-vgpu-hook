@@ -3147,7 +3147,7 @@ fn host_cache_store_rgba8(
 ///
 /// Route-independent: the synchronous `cpu_portability` Store calls it inline,
 /// and the deferred render rail calls it from the flush that finally performs
-/// the same write (`storage_flush::flush_render_one`). Both have just proved
+/// the same write (`storage_flush::land::flush_render_one`). Both have just proved
 /// the same thing — `write_rgba8_image_changed` verified geometry and landed a
 /// complete frame — and without it the `present_unbacked` gate is structurally
 /// dead on whichever route skips it, because no mapping's `dense_frame_seq`
@@ -3875,7 +3875,7 @@ pub(crate) fn sync_store_target_pages<M: HostMemory>(
 /// the armed set into the walk makes them one question, so the bytes cannot
 /// reach a page the window was not given, whatever the guest did in between.
 ///
-/// This is what closes the gap `storage_flush::deferred_pages_still_ours`
+/// This is what closes the gap `storage_flush::guards::deferred_pages_still_ours`
 /// leaves open. That guard walks, decides, and returns; the writer then walks
 /// again, and the guest runs on its own vCPUs between the two. The guard stays —
 /// it names the event in the always-on log with the counts a reader needs — but

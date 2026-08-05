@@ -3682,7 +3682,7 @@ enum M2vDrawSpan {
     /// `skip_readback`: the caller arms a `RenderWindowSource::Resident` window
     /// naming that image, so the GPU→host readback and the fence wait it implies
     /// are paid only if a guest-side reader ever asks for the pixels
-    /// (`storage_flush::flush_render_one`).
+    /// (`storage_flush::land::flush_render_one`).
     ///
     /// Distinct from [`Self::ResidentGvaStore`] because the two windows live in
     /// different indexes and flush through different readers: this one is keyed by

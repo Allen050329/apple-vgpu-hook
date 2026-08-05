@@ -12,7 +12,7 @@ use crate::model::{ComputeStorageResidencyKey, DeviceId, DeviceState, PAGE_SHIFT
 #[cfg(feature = "backend-vulkan")]
 #[test]
 fn the_fence_batch_bands_separate_one_from_many() {
-    use super::fence_batch_band;
+    use super::witness::fence_batch_band;
     assert_eq!(fence_batch_band(0), None, "an empty batch was banded");
     assert_eq!(fence_batch_band(1), Some("gvaw_fence_batch_1"));
     assert_eq!(fence_batch_band(2), Some("gvaw_fence_batch_2"));
@@ -382,7 +382,7 @@ fn a_render_window_over_repointed_pages_is_refused_and_counted() {
 /// before it), because `page_gen` is stamped at the harvest and not at the
 /// write, so a store the device's own render superseded can still be named
 /// "written since the Store". See
-/// [`super::note_render_flush_over_guest_write`], which returns nothing at
+/// [`super::witness::note_render_flush_over_guest_write`], which returns nothing at
 /// all now — "preserves nothing" is in its signature and no longer only in
 /// this assertion.
 #[cfg(feature = "backend-vulkan")]
@@ -414,7 +414,7 @@ fn a_render_window_landing_over_guest_writes_reports_them_and_preserves_nothing(
             host.guest_wrote_page(page);
         }
         let cap = crate::observe::FailCapture::start();
-        super::note_render_flush_over_guest_write(&state, &host, &key(9, 0, 256));
+        super::witness::note_render_flush_over_guest_write(&state, &host, &key(9, 0, 256));
         let clobbers: Vec<String> = cap
             .lines()
             .into_iter()
@@ -476,7 +476,7 @@ fn the_clobber_report_claims_no_ordering_against_the_store() {
     m.guest_write_gen_at_store = stamped;
 
     let cap = crate::observe::FailCapture::start();
-    super::note_render_flush_over_guest_write(&state, &host, &key(9, 0, 256));
+    super::witness::note_render_flush_over_guest_write(&state, &host, &key(9, 0, 256));
     let clobbers: Vec<String> = cap
         .lines()
         .into_iter()
@@ -1556,8 +1556,8 @@ fn each_mapping_rail_is_scored_against_the_fence_under_its_own_name() {
         store_route_count("rendw_stamp_outlived"),
         store_route_count("storw_stamp_outlived"),
     ];
-    super::note_mapping_window_against_fence(&state, &k, &render);
-    super::note_mapping_window_against_fence(&state, &k, &storage);
+    super::witness::note_mapping_window_against_fence(&state, &k, &render);
+    super::witness::note_mapping_window_against_fence(&state, &k, &storage);
     assert_eq!(
         [
             store_route_count("rendw_stamp_outlived"),
@@ -1570,7 +1570,7 @@ fn each_mapping_rail_is_scored_against_the_fence_under_its_own_name() {
     // Past the fence: each rail reports under its own counter, so a boot can
     // tell a render-Store window from a compute-storage one.
     state.completion_stamp_seq = 5;
-    super::note_mapping_window_against_fence(&state, &k, &render);
+    super::witness::note_mapping_window_against_fence(&state, &k, &render);
     assert_eq!(
         [
             store_route_count("rendw_stamp_outlived"),
@@ -1579,7 +1579,7 @@ fn each_mapping_rail_is_scored_against_the_fence_under_its_own_name() {
         [before[0] + 1, before[1]],
         "the render rail must not be counted under the storage rail's name"
     );
-    super::note_mapping_window_against_fence(&state, &k, &storage);
+    super::witness::note_mapping_window_against_fence(&state, &k, &storage);
     assert_eq!(
         [
             store_route_count("rendw_stamp_outlived"),
@@ -1719,7 +1719,7 @@ fn a_window_landed_after_its_fence_is_counted_apart_from_one_landed_inside_it() 
     inside.armed_stamp_seq = state.completion_stamp_seq;
     let same_before = store_route_count("gvaw_stamp_same");
     let outlived_before = store_route_count("gvaw_stamp_outlived");
-    super::note_window_outlived_its_stamp(&state, 0x1000, &inside, "rearm");
+    super::witness::note_window_outlived_its_stamp(&state, 0x1000, &inside, "rearm");
     assert_eq!(
         store_route_count("gvaw_stamp_same"),
         same_before + 1,
@@ -1734,7 +1734,7 @@ fn a_window_landed_after_its_fence_is_counted_apart_from_one_landed_inside_it() 
     // Positive control: the same window, landed after the guest was fenced.
     state.completion_stamp_seq = state.completion_stamp_seq.wrapping_add(3);
     let same_before = store_route_count("gvaw_stamp_same");
-    super::note_window_outlived_its_stamp(&state, 0x1000, &inside, "gva_alias");
+    super::witness::note_window_outlived_its_stamp(&state, 0x1000, &inside, "gva_alias");
     assert_eq!(
         store_route_count("gvaw_stamp_outlived"),
         outlived_before + 1,
@@ -1789,7 +1789,7 @@ fn window_page_drift_refuses_the_guest_write_and_is_silent_without_it() {
     // Negative control: armed on the page the GVA resolves to right now.
     let at = mark();
     assert!(
-        super::window_pages_still_ours(
+        super::guards::window_pages_still_ours(
             &state,
             &host,
             0,
@@ -1809,7 +1809,7 @@ fn window_page_drift_refuses_the_guest_write_and_is_silent_without_it() {
     // Positive control: same window, armed on a page it no longer maps to.
     let at = mark();
     assert!(
-        !super::window_pages_still_ours(
+        !super::guards::window_pages_still_ours(
             &state,
             &host,
             0,
@@ -1834,7 +1834,7 @@ fn window_page_drift_refuses_the_guest_write_and_is_silent_without_it() {
     // say has to happen.
     let at = mark();
     assert!(
-        !super::window_pages_still_ours(
+        !super::guards::window_pages_still_ours(
             &state,
             &host,
             0,
@@ -1857,7 +1857,7 @@ fn window_page_drift_refuses_the_guest_write_and_is_silent_without_it() {
     // sets.
     let at = mark();
     assert!(
-        super::window_pages_still_ours(
+        super::guards::window_pages_still_ours(
             &state,
             &host,
             0,
@@ -1929,7 +1929,7 @@ fn the_resident_load_reader_gets_the_same_drift_verdict_under_its_own_name() {
     // may take it. Refusing here would cost a seed on every chained pass.
     let at = mark();
     assert!(
-        super::window_pages_still_ours(
+        super::guards::window_pages_still_ours(
             &state,
             &host,
             0,
@@ -1951,7 +1951,7 @@ fn the_resident_load_reader_gets_the_same_drift_verdict_under_its_own_name() {
     // allocation's pixels.
     let at = mark();
     assert!(
-        !super::window_pages_still_ours(
+        !super::guards::window_pages_still_ours(
             &state,
             &host,
             0,
@@ -2035,7 +2035,7 @@ fn a_linear_window_whose_pages_moved_is_refused_and_reads_its_span_as_a_length()
     // Negative control: armed on the page GVA `page` resolves to right now.
     let at = mark();
     assert!(
-        super::deferred_pages_still_ours(
+        super::guards::deferred_pages_still_ours(
             &state,
             &host,
             1,
@@ -2058,7 +2058,7 @@ fn a_linear_window_whose_pages_moved_is_refused_and_reads_its_span_as_a_length()
     // This is also the assertion that the span is read as a length.
     let at = mark();
     assert!(
-        !super::deferred_pages_still_ours(
+        !super::guards::deferred_pages_still_ours(
             &state,
             &host,
             1,
@@ -2086,7 +2086,7 @@ fn a_linear_window_whose_pages_moved_is_refused_and_reads_its_span_as_a_length()
     let unwit_before = store_route_count("defw_unwit_no_live");
     let at = mark();
     assert!(
-        super::deferred_pages_still_ours(
+        super::guards::deferred_pages_still_ours(
             &state,
             &host,
             1,
@@ -2117,7 +2117,7 @@ fn a_linear_window_whose_pages_moved_is_refused_and_reads_its_span_as_a_length()
     // An empty armed set is the other unchecked exit, and it is its own slug
     // because it is a different gap.
     let no_armed_before = store_route_count("defw_unwit_no_armed");
-    assert!(super::deferred_pages_still_ours(
+    assert!(super::guards::deferred_pages_still_ours(
         &state,
         &host,
         1,

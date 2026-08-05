@@ -676,7 +676,7 @@ pub struct MappingEntry {
     pub surface_content_epoch: u32,
     /// Who has read what the last landed render flush of this mapping wrote.
     /// See [`RenderFlushWitness`]; reported by
-    /// [`crate::runtime::storage_flush::note_render_flush_landed`].
+    /// [`crate::runtime::storage_flush::witness::note_render_flush_landed`].
     pub render_flush: RenderFlushWitness,
     /// Bumped whenever the guest page list / map lifetime changes (MAP, UNMAP,
     /// ReplacePhysical, MappingInternal reattach, page-table refresh that
@@ -1093,7 +1093,7 @@ pub struct GvaDeferredEntry {
 /// [`GvaDeferredEntry`], and for the same reason: a type-2/3 linear texture has
 /// no mapping incarnation to name and the wire format carries no lifecycle
 /// notify for one. The mapping-keyed rails
-/// (`storage_flush::flush_render_one`/`flush_storage_one`) can refuse on
+/// (`storage_flush::land::flush_render_one`/`flush_storage_one`) can refuse on
 /// `map_generation` drift because the guest must MAP/UNMAP/ReplacePhysical to
 /// reclaim an IOSurface's storage; nothing of the sort exists here, which is why
 /// this entry carries the same fence stamp the GVA rail carries.
@@ -1108,7 +1108,7 @@ pub struct LinearDeferredEntry {
     /// Same hazard, same reading as [`GvaDeferredEntry::armed_stamp_seq`]: after
     /// the stamp the guest may free this texture's memory and its own allocator
     /// may hand those pages to anything without touching a page table, so
-    /// `storage_flush::deferred_pages_still_ours` still passes and the flush
+    /// `storage_flush::guards::deferred_pages_still_ours` still passes and the flush
     /// writes a compute-storage image over whatever moved in.
     pub armed_stamp_seq: u64,
     /// Defer-time physical page GPAs of the guest window — raw task-GVA reads
@@ -2107,7 +2107,7 @@ impl DeviceState {
     ///
     /// Returns the whole window, so a caller about to write those guest pages
     /// can check they still belong to this window (see
-    /// `runtime::storage_flush::deferred_pages_still_ours`) and can score the
+    /// `runtime::storage_flush::guards::deferred_pages_still_ours`) and can score the
     /// landing against the fence the window was armed under
     /// ([`LinearDeferredEntry::armed_stamp_seq`]). This used to return a bare
     /// `bool` and drop the pages on the floor, which left the flush with no way

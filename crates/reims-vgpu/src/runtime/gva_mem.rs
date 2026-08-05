@@ -447,7 +447,7 @@ pub fn write_task_gva_product_within<H: HostMemory + crate::runtime::host::HostO
 /// some *other* live task whose table happens to have something mapped there.
 ///
 /// Here the substitution was invisible rather than merely wrong, because
-/// `storage_flush::deferred_pages_still_ours` — the drift guard that decides
+/// `storage_flush::guards::deferred_pages_still_ours` — the drift guard that decides
 /// whether a deferred window may still be written to guest RAM — re-resolves
 /// through *this* function with the *same* task id the window was armed under.
 /// A window indexed under the neighbour's table was therefore re-indexed under
@@ -1204,7 +1204,7 @@ mod tests {
     /// the `>> 1` neighbour's table resolves the same address.
     ///
     /// This is the fourth and last `>> 1` arm, and the one whose substitution no
-    /// guard could see: `storage_flush::deferred_pages_still_ours` re-resolves an
+    /// guard could see: `storage_flush::guards::deferred_pages_still_ours` re-resolves an
     /// armed window through this same function under the same task id, so a
     /// window indexed under the neighbour's table was re-indexed under the
     /// neighbour's table and the drift check reported the pages "still ours".

@@ -1184,7 +1184,7 @@ pub enum Type4Witness {
 /// caller must not read it as "these pages were verified".
 ///
 /// The peer for the raw-GVA rails is
-/// [`crate::runtime::storage_flush::deferred_pages_still_ours`], which asks the
+/// [`crate::runtime::storage_flush::guards::deferred_pages_still_ours`], which asks the
 /// same question about a window's armed page set. This one asks it about a
 /// mapping's list, which is what the mapping-keyed rails write through.
 ///
@@ -1343,7 +1343,7 @@ pub fn type4_pages_witness<H: HostMemory>(
 /// # Why a token and not a call
 ///
 /// [`type4_pages_witness`] existed for a release with exactly one caller —
-/// [`crate::runtime::storage_flush::flush_render_one`] — while every other write
+/// [`crate::runtime::storage_flush::land::flush_render_one`] — while every other write
 /// through `MappingEntry::page_entries` went unchecked. That is not an oversight
 /// that a second call site fixes: the check has to be *reachable only through*
 /// the write, or the next rail added to this crate arrives unguarded too, and

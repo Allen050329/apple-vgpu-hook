@@ -1377,7 +1377,7 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
         // pair — the attachment LOAD elision always did, and the sampled ladder's
         // resident rung now does too. The caller that produced `src` must
         // therefore not hand the stamp back after a skipping write; see
-        // `storage_flush::flush_render_one`.
+        // `storage_flush::land::flush_render_one`.
         //
         // The guest-write stamp is re-taken, because the device has *adopted*
         // the guest's stores: they are in the pages it just wrote around.
