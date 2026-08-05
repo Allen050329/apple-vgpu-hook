@@ -35,6 +35,27 @@
 //! guest-page writers. Nothing in it is backend-specific — no `cfg` gate here,
 //! for the same reason [`super::texture_view`] carries none — and both arms take
 //! it on every draw.
+//!
+//! # Every refusal here is a healthy zero
+//!
+//! Measured so the next reader does not have to guess whether these paths are
+//! exercised. One driven x86/Vulkan boot (Safari window drag, 2 541 posted
+//! events, real motion from (320,180) to (678,124), ~38 Hz median present)
+//! produced **zero** `rt_resolve` records — the fail channel's whole reason set
+//! for the boot was five slugs, none of them this ladder's.
+//!
+//! A zero over an unstated amount of work is not a measurement, so: on the same
+//! boot `mrt_draw_single` counted **179 123** single-attachment draws reaching
+//! the Vulkan encode, every one of which is a colour attachment this ladder had
+//! already resolved, and `rt_type5_view_same` counted **23 951** attachments
+//! that reached the *bottom* of the type-4/5 rung. Both counters predate the
+//! typed refusals and sit on the success side, which is what makes them usable
+//! as a denominator here.
+//!
+//! So a green boot says the rungs still resolve and says nothing whatever about
+//! [`RenderTargetCause`]'s arms. Those are held by tests, not by booting — an
+//! `rt_resolve` line in the log is a real event worth reading rather than
+//! background noise.
 
 use super::*;
 /// The colour render target's base format for a **type-4** surface, or nothing.
