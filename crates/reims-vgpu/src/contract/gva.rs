@@ -15,7 +15,7 @@
 
 use reims_vgpu_wire::page_table as wire;
 
-pub use wire::{MAX_DEPTH, PTE_FLAG_MASK, PTE_PFN_MASK, PTE_SIZE};
+pub(crate) use wire::{MAX_DEPTH, PTE_FLAG_MASK, PTE_PFN_MASK, PTE_SIZE};
 
 /// Offsets within a task's directory page. Narrowed from the wire crate's `u64`
 /// because every consumer here indexes a `u32` field set.

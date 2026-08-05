@@ -46,8 +46,8 @@ pub mod device_select;
 pub mod external_memory;
 pub mod memory_topology;
 
-pub use external_memory::DmaBufImport;
-pub use memory_topology::{MappedMemoryKind, MemoryClass, MemoryProfile};
+pub(crate) use external_memory::DmaBufImport;
+pub(crate) use memory_topology::{MappedMemoryKind, MemoryClass, MemoryProfile};
 
 use ash::vk;
 

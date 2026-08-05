@@ -103,8 +103,8 @@ pub mod texture;
 /// The unit-test host double, gated with its definition. An ungated re-export
 /// would keep it reachable and so keep it in the staticlib.
 #[cfg(test)]
-pub use host::FakeHost;
-pub use host::{HostAction, HostActionKind, HostMemory, HostOps};
+pub(crate) use host::FakeHost;
+pub(crate) use host::{HostAction, HostOps};
 
 #[cfg(test)]
 mod arch_path_gate {

@@ -3505,7 +3505,7 @@ fn type5_sample_uses_serialized_rg8_view_over_unknown_surface_fourcc() {
         surface_id,
         0,
         texture_ref,
-        objects::TYPE5_RECORD_TAG_PLANE,
+        reims_vgpu_wire::device_desc::TYPE5_RECORD_TAG_PLANE,
     )
     .geometry(MTL_FORMAT_RG8_UNORM, width, height, 1);
     let desc = built.bytes();

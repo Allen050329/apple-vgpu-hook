@@ -56,5 +56,5 @@ pub mod sampler;
 pub mod support;
 pub mod vertex;
 
-pub use reason::TranslateReason;
-pub use support::VertexFormatSupport;
+pub(crate) use reason::TranslateReason;
+pub(crate) use support::VertexFormatSupport;

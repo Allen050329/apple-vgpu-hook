@@ -54,7 +54,9 @@ impl ConsoleFeed {
 /// Both QEMU shims used to reach this answer themselves, by calling
 /// `present_boundary_seen` and `early_scanout_target` and branching on the pair.
 /// That put the rule in C twice over, beside a third copy here
-/// ([`host_console_uses_bar1`], which the host-window pump uses) whose doc
+/// (`host_console_uses_bar1`, which the host-window pump uses — not a doc
+/// link, because that predicate is gated with the pump and so does not exist
+/// on a build without `host-window`) whose doc
 /// admitted as much — it said "shipped C mirrors this". Three copies of one
 /// display-ownership rule is three chances for a pathway to disagree about who
 /// owns the screen. This is the one copy; the shims paint what it returns.
@@ -153,6 +155,10 @@ pub fn device_scanout_may_paint(id: u64, mapping_id: u32) -> Option<bool> {
 /// `frame_flush_seen` and a console that re-armed on that flickered stale
 /// pre-boundary content. This predicate takes whatever its caller passes, and
 /// its caller passes the non-monotonic flag.
+///
+/// Gated with its caller: the pump lives in `window_publish`, which is behind
+/// `host-window`, so a build without that feature has nobody to ask.
+#[cfg(any(test, feature = "host-window"))]
 #[inline]
 pub fn host_console_uses_bar1(frame_flush_seen: bool, early_front_latched: bool) -> bool {
     !frame_flush_seen && !early_front_latched

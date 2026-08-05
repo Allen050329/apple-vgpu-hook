@@ -12,11 +12,18 @@ use crate::backend::metal::runtime::system_device;
 use crate::backend::Backend;
 
 /// Device lifecycle handle; product encode is the C ABI in `ffi`.
+///
+/// `ready` and `name` have no caller outside this file's test, and `ready` is
+/// kept anyway because `new`'s `system_device()` call is the side effect that
+/// first creates the process-global `MTLDevice`. Dropping the field to quiet
+/// the lint would move when that happens.
+#[allow(dead_code)]
 #[derive(Debug, Default)]
 pub struct MetalBackend {
     ready: bool,
 }
 
+#[allow(dead_code)] // `ready` and `name` — see the type's doc.
 impl MetalBackend {
     pub fn new() -> Self {
         Self {

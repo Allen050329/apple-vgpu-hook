@@ -3738,7 +3738,8 @@ pub(crate) fn write_gva_rgba8_within<M: HostMemory + HostOps>(
 /// Packed contig view when possible; else multi-import each rect row.
 ///
 /// Only the Metal encode path issues a scissored guest store today, but nothing
-/// here is Metal-specific: it is plain page-table walking over [`HostMemory`],
+/// here is Metal-specific: it is plain page-table walking over
+/// [`crate::runtime::host::HostMemory`],
 /// so it stays compiled and tested on every arm. Gating it behind the backend
 /// that happens to call it would put the guest-memory bound on the one matrix
 /// arm that cannot be built or run from a Linux host.

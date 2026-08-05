@@ -156,7 +156,7 @@ fn prompt_actions_pop_while_device_lock_held() {
     slot.prompt_actions.lock().push_back(HostAction::irq_gfx());
     let _drain_guard = slot.inner.lock();
     let a = device_pop_action(id).expect("prompt action pops mid-drain");
-    assert_eq!(a.kind, runtime::HostActionKind::IrqGfxPulse);
+    assert_eq!(a.kind, runtime::host::HostActionKind::IrqGfxPulse);
     assert!(device_pop_action(id).is_none());
     drop(_drain_guard);
     assert!(device_destroy(id));

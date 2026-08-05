@@ -80,16 +80,22 @@ pub(crate) mod land;
 pub(crate) mod lifecycle;
 pub(crate) mod report;
 
-pub use access::{
+pub(crate) use access::{
     flush_gva_exact, flush_intersecting, flush_intersecting_task_gva, flush_mapping_for_guest_read,
 };
-pub use fence::flush_all_windows_before_fence;
-pub use land::{flush_gva_one, flush_linear_one, retire_gva_windows, retire_linear_residents};
-pub use lifecycle::drop_windows;
-pub use report::{note_render_flush_cache_read, note_render_flush_pages_read};
+pub(crate) use fence::flush_all_windows_before_fence;
+pub(crate) use land::{retire_gva_windows, retire_linear_residents};
+pub(crate) use lifecycle::drop_windows;
+pub(crate) use report::{note_render_flush_cache_read, note_render_flush_pages_read};
 
+// The two landing entry points join the identity helpers behind this gate:
+// they are reached only from `backend-vulkan` code, because this whole
+// deferred-writeback rail is the Vulkan arm's — which is why the Metal
+// `*_before_fence` bodies are empty.
 #[cfg(feature = "backend-vulkan")]
-pub(crate) use land::{gva_window_identity, render_window_identity};
+pub(crate) use land::{
+    flush_gva_one, flush_linear_one, gva_window_identity, render_window_identity,
+};
 #[cfg(feature = "backend-vulkan")]
 pub(crate) use lifecycle::{release_window_pin, supersede_covered_render_windows};
 

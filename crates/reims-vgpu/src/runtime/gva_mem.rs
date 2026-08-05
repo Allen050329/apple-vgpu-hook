@@ -1,6 +1,7 @@
 //! Read task GPU-virtual addresses via the task page directory.
 //!
-//! Thin wrapper over [`crate::contract::gva_resolve`] + [`HostMemory`].
+//! Thin wrapper over [`crate::contract::gva_resolve`] +
+//! [`crate::runtime::host::HostMemory`].
 //! Geometry always requires an explicit create-time page_shift (12 = x86_64,
 //! 14 = arm64e). There is no arm-default overload — callers must choose.
 

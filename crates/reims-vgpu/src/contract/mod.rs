@@ -14,4 +14,4 @@ pub mod gva_resolve;
 pub mod iosurface_pages;
 pub mod pixel_format;
 
-pub use checked::*;
+pub(crate) use checked::*;

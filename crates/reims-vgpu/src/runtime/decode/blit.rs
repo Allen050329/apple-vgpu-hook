@@ -59,7 +59,7 @@ pub const MTL_BLIT_OPTION_KNOWN_MASK: u32 = MTL_BLIT_OPTION_DEPTH_FROM_DEPTH_STE
 /// of the choice lives, and re-exported here because this is where it is
 /// produced. One type, so the decoder's refusal of depth+stencil is the only
 /// place that state is ever considered.
-pub use crate::contract::pixel_format::BlitAspect;
+pub(crate) use crate::contract::pixel_format::BlitAspect;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BlitOptionError {

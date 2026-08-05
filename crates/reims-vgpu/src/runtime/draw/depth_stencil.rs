@@ -19,7 +19,8 @@ use crate::runtime::decode::render::{
     PASS_LOAD_ACTION_CLEAR, PASS_LOAD_ACTION_LOAD, PASS_STORE_ACTION_DONT_CARE,
     PASS_STORE_ACTION_STORE,
 };
-use crate::runtime::{mapper, mapping_write, objects, HostMemory, HostOps};
+use crate::runtime::host::HostMemory;
+use crate::runtime::{mapper, mapping_write, objects, HostOps};
 
 fn fill_depth32(buf: &mut [u8], depth: f32) {
     let bits = depth.to_bits().to_le_bytes();

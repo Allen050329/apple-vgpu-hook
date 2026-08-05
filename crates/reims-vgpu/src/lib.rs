@@ -92,22 +92,24 @@ pub mod host_window;
 /// the entry points keep a stub arm without the feature and the QEMU ABI
 /// surface must be the same shape either way.
 mod window_publish;
-pub use window_publish::{
+pub(crate) use window_publish::{
     device_window_run_main, device_window_set_early_fb, device_window_start, device_window_stop,
 };
 
 /// The display half of the QEMU ABI surface: console-feed ownership, scanout
 /// and EFI-console copies, and the cursor glyph.
 mod display_surface;
-pub use display_surface::{
+#[cfg(any(test, feature = "host-window"))]
+pub(crate) use display_surface::host_console_uses_bar1;
+pub(crate) use display_surface::{
     device_console_feed, device_cursor_glyph_copy, device_cursor_glyph_info,
-    device_efi_console_copy, device_scanout_copy, device_scanout_may_paint, host_console_uses_bar1,
-    ConsoleFeed, CursorGlyphInfo,
+    device_efi_console_copy, device_scanout_copy, device_scanout_may_paint, ConsoleFeed,
+    CursorGlyphInfo,
 };
 
 // Convenience re-exports used by qemu ABI and tests
-pub use model::{Device, DeviceId};
-pub use runtime::{HostAction, HostOps};
+pub(crate) use model::{Device, DeviceId};
+pub(crate) use runtime::{HostAction, HostOps};
 
 // --- Device lifecycle registry (used by qemu::abi) ---------------------------
 

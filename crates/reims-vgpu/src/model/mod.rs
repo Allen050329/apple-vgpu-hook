@@ -7,8 +7,8 @@ mod lru_memo;
 mod regs;
 mod state;
 
-pub use lru_memo::LruBytesMemo;
-pub use regs::*;
+pub(crate) use lru_memo::LruBytesMemo;
+pub(crate) use regs::*;
 // `GfxRegs` has no in-crate importer and is here for the five doc comments
 // that link `model::GfxRegs::child_doorbell_rung`. `state` is a private
 // `mod`, so this is the only path those links can name — and rustc's
@@ -119,7 +119,8 @@ mod tests {
     use super::*;
     use crate::backend::NullBackend;
     use crate::contract::endian::st32;
-    use crate::runtime::{FakeHost, HostActionKind, HostMemory};
+    use crate::runtime::host::{HostActionKind, HostMemory};
+    use crate::runtime::FakeHost;
 
     #[test]
     fn stamp_slot_offset_respects_guest_page_size() {

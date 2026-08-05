@@ -7,7 +7,7 @@ use crate::backend::metal::constants::{
     REIMS_VGPU_METAL_MAX_BUFFERS, REIMS_VGPU_METAL_MAX_SAMPLERS, REIMS_VGPU_METAL_MAX_TEXTURES,
 };
 use crate::backend::metal::error::write_err;
-pub use crate::backend::metal::error::Status;
+pub(crate) use crate::backend::metal::error::Status;
 use std::os::raw::c_char;
 
 pub type ErrOut<'a> = (*mut c_char, usize);

@@ -2,7 +2,8 @@
 //!
 //! These checks happen before [`super::DrawRequest`] validation: resolving the
 //! pipeline and its stage libraries, extracting AIR, and translating each stage.
-//! They therefore do not belong to [`super::DrawValidationDecline`], which owns
+//! They therefore do not belong to
+//! [`super::draw_validation::DrawValidationDecline`], which owns
 //! invariants of an already-built engine request.
 
 use crate::backend::vulkan::translate::TranslateReason;

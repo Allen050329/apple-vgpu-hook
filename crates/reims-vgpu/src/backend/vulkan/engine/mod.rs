@@ -19,7 +19,7 @@ mod dmabuf;
 mod draw_execution;
 mod draw_phase;
 mod draw_preparation;
-mod draw_validation;
+pub(crate) mod draw_validation;
 mod exec;
 mod exec_compute;
 mod facade_decline;
@@ -35,15 +35,10 @@ pub mod vk_call;
 mod window_present;
 
 pub use context::MAX_DEVICE_RECREATES;
-pub use counters::{CounterSnapshot, EngineCounters};
-pub use draw_phase::take_window as draw_phase_window;
-pub use draw_preparation::DrawPreparationDecline;
-// No in-crate importer: `draw_preparation`'s module doc links this name and
-// `draw_validation` is a private `mod`, so this re-export is the only path
-// that resolves. Rustc's unused-import lint does not read doc links, so it
-// will call this dead.
-pub use draw_validation::DrawValidationDecline;
-pub use facade_decline::EngineFacadeDecline;
+pub(crate) use counters::{CounterSnapshot, EngineCounters};
+pub(crate) use draw_phase::take_window as draw_phase_window;
+pub(crate) use draw_preparation::DrawPreparationDecline;
+pub(crate) use facade_decline::EngineFacadeDecline;
 pub use types::{
     BlendFactor, BlendOp, BlendStateResource, BufferContent, ColorWriteMask, ComputeBufferResource,
     ComputeOutput, ComputeRequest, ComputeResidentSampleBind, ComputeSampledImageResource,
@@ -56,9 +51,9 @@ pub use types::{
     TargetIdentity, VertexAttributeFormat, VertexAttributeResource, VertexStepFunction,
     ViewportResource, WindowPresentSource, COLOR_INPUT_BINDING,
 };
-pub use vk_call::{VkCall, VkOp};
+pub(crate) use vk_call::{VkCall, VkOp};
 #[cfg(feature = "host-window")]
-pub use window_present::{WindowCpuFrame, WindowPresentOutcome};
+pub(crate) use window_present::{WindowCpuFrame, WindowPresentOutcome};
 
 use caches::ObjectCaches;
 use context::ContextOwner;

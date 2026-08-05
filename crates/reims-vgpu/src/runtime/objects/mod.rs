@@ -167,9 +167,17 @@ pub const OBJECT_TYPE_REF_TEXTURE: u8 = 5;
 /// `Type5TextureRecord`, asserted there against the numbers this module used to
 /// state. The two record tags come with them, since a tag is part of the
 /// layout's identity and not of this device's policy.
-pub use reims_vgpu_wire::device_desc::{
-    TYPE5_ARGS, TYPE5_ARG_RECORD, TYPE5_OWNER_TASK, TYPE5_RECORD_PLANE,
-    TYPE5_RECORD_TAG_COLOR_VIEW, TYPE5_RECORD_TAG_PLANE, TYPE5_SURFACE_ID,
+pub(crate) use reims_vgpu_wire::device_desc::TYPE5_ARGS;
+// Only `TYPE5_ARGS` is still named by a product path — the decoders read the
+// rest through the wire views. These five are named only by the tests that
+// assert the layout, so they are gated with those tests rather than left
+// reachable from the staticlib. `TYPE5_RECORD_TAG_PLANE` is not among them:
+// its one caller builds the descriptor with `wire::device_desc::Type5Builder`
+// on the line above and now names the tag from the same module.
+#[cfg(test)]
+pub(crate) use reims_vgpu_wire::device_desc::{
+    TYPE5_ARG_RECORD, TYPE5_OWNER_TASK, TYPE5_RECORD_PLANE, TYPE5_RECORD_TAG_COLOR_VIEW,
+    TYPE5_SURFACE_ID,
 };
 
 /// Shortest type-5 descriptor: the header, with no args blob behind it.
@@ -196,7 +204,8 @@ pub struct Type5TextureView {
 /// Every type-4 surface this device has resolved lived in task 0 — measured
 /// (`type4_claimants`: `claims=1 winner=0` on every surface id of two driven
 /// boots) and structural, since the guest registers IOSurface backings in the
-/// accelerator's kernel task whose id is a hardcoded 0. [`TYPE5_OWNER_TASK`] is
+/// accelerator's kernel task whose id is a hardcoded 0.
+/// [`reims_vgpu_wire::device_desc::TYPE5_OWNER_TASK`] is
 /// the guest saying the same thing on the wire, so this reads 0 forever and
 /// stays on the quiet channel.
 ///
@@ -257,14 +266,17 @@ pub fn decode_type5_texture_view(desc: &[u8]) -> Option<Type5TextureView> {
     })
 }
 
+/// The stride is named only by the tests that walk a plane table by hand.
+#[cfg(test)]
+pub(crate) use reims_vgpu_wire::device_desc::TYPE4_PLANE_STRIDE;
 /// Type-4 descriptor geometry, from the wire crate's Tier-2 view of it.
 ///
 /// The eight offsets these used to be are now `offset_of!` on
 /// [`reims_vgpu_wire::device_desc::Type4SurfaceHeader`] and
 /// [`reims_vgpu_wire::device_desc::Type4PlaneRecord`], asserted there. Only the
-/// three the device still computes with are re-exported.
-pub use reims_vgpu_wire::device_desc::{
-    type4_len_for, TYPE4_MIN_LEN, TYPE4_PLANES, TYPE4_PLANE_CAP, TYPE4_PLANE_STRIDE,
+/// four the device still computes with are re-exported.
+pub(crate) use reims_vgpu_wire::device_desc::{
+    type4_len_for, TYPE4_MIN_LEN, TYPE4_PLANES, TYPE4_PLANE_CAP,
 };
 
 /// CoreVideo / IOSurface biplanar 420 full-range (`'420f'`).

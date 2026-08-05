@@ -10,8 +10,6 @@ mod constants;
 pub mod error;
 mod hash;
 
-pub use hash::{hash_bytes, hash_u64};
-
 // ---------------------------------------------------------------------------
 // Apple: real Metal encode
 // ---------------------------------------------------------------------------
@@ -44,4 +42,4 @@ mod stage_input;
 pub(crate) mod util;
 
 #[cfg(target_os = "macos")]
-pub use device::MetalBackend;
+pub(crate) use device::MetalBackend;

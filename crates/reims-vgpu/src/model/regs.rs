@@ -210,8 +210,13 @@ pub const fn scanout_extent_ok(width: u32, height: u32) -> bool {
 // the device's address arithmetic and its fixtures want. Both derive from the
 // one re-exported shift, so they cannot disagree in value — but the names do
 // collide, so import from one module or the other on purpose.
-pub use crate::contract::gva::{pfn_to_gpa, PAGE_SHIFT_ARM64E, PAGE_SHIFT_X86};
+pub(crate) use crate::contract::gva::{pfn_to_gpa, PAGE_SHIFT_ARM64E, PAGE_SHIFT_X86};
+// Gated with the fixtures that want them. That is the same statement the
+// comment above makes, now enforced rather than asserted: no product path
+// names either one, because product code goes through `state.page_size()`.
+#[cfg(test)]
 pub const PAGE_SIZE_ARM64E: u64 = 1u64 << PAGE_SHIFT_ARM64E;
+#[cfg(test)]
 pub const PAGE_SIZE_X86: u64 = 1u64 << PAGE_SHIFT_X86;
 
 pub const PACKET_OPCODE: usize = 0x00;
@@ -315,6 +320,7 @@ pub const CHILD_REG_HEAD: u64 = 0x04;
 /// from the register block's shape rather than from a decoded write, and no
 /// boot on this rig has sampled what the guest puts in it. `dead-state` reports
 /// it on both arms every run; this comment is the triage, not a licence to cut.
+#[allow(dead_code)] // named on purpose and read by nothing — see above.
 pub const CHILD_REG_CONTROL: u64 = 0x08;
 pub const CHILD_REG_STAMP_INDEX: u64 = 0x0c;
 pub const CHILD_REG_BASE_PFN: u64 = 0x10;
@@ -343,6 +349,7 @@ pub const SET_OBJECT_LIST_LEN: usize = 12;
 // ignored. Whether ignoring it is correct is not established — it needs the
 // display count this device advertises, which no boot on this rig has
 // measured. Its own length lives at `display_txn_trailer_len`.
+#[allow(dead_code)] // named on purpose and read by nothing — see above.
 pub const DISPLAY_SWAP_DISPLAY: usize = 0x00;
 pub const DISPLAY_SWAP_MAPPING: usize = 0x08;
 
