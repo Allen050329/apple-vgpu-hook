@@ -70,6 +70,8 @@ pub mod sink;
 pub(crate) use decline::decline_display;
 pub use decline::{Decline, Refusal};
 pub use emit::{first_sight, state_changed, Emit};
+/// The fail line a loader whose event name carries the domain emits for a rung.
+pub use ladder::RungReport;
 /// The four object-list resolution rungs, so a rail spells the condition the
 /// same way every other rail does. See [`ladder`] for why it is a macro.
 pub(crate) use ladder::{ladder_slug, ladder_slugs};

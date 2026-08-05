@@ -641,28 +641,18 @@ pub(crate) fn load_compute_pipeline<M: HostMemory + HostOps>(
     if pipeline_ref == 0 {
         return None;
     }
+    let report = crate::observe::RungReport::new("compute_load_pipeline", "pipe_ref");
     let miss = |reason: &str, detail: String| -> Option<LoadedComputePipeline> {
-        crate::observe::fail(format!(
-            "compute_load_pipeline fail reason={reason} task={task_id} pipe_ref={pipeline_ref} {detail}"
-        ));
+        report.reason(task_id, pipeline_ref, reason, &detail);
         None
     };
-    // The detail the `wrong_type` line carries comes off the rung now: it is the
-    // only thing that still holds the tag once the entry is gone.
     let (_entry, desc) =
         match objects::resolve_descriptor(state, host, task_id, pipeline_ref, &[OBJECT_TYPE_TYPE7])
         {
             Ok(found) => found,
             Err(rung) => {
-                return miss(
-                    crate::observe::ladder_slugs!("")(rung),
-                    match rung {
-                        objects::LadderRung::WrongType { got } => format!("ot={got}"),
-                        objects::LadderRung::NoListEntry | objects::LadderRung::DescRead { .. } => {
-                            String::new()
-                        }
-                    },
-                )
+                report.rung(task_id, pipeline_ref, rung);
+                return None;
             }
         };
     let Ok(decoded) = decode_type7_descriptor(&desc) else {

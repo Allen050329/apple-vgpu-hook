@@ -167,6 +167,60 @@ macro_rules! ladder_slugs {
 
 pub(crate) use {ladder_slug, ladder_slugs};
 
+/// The fail line a loader emits when it could not produce what a ref named.
+///
+/// This is for the loaders whose *event name* carries the domain — the ones that
+/// pass an empty role to [`ladder_slugs`] — because they all built the same line
+/// by hand:
+///
+/// ```text
+/// <event> fail reason=<slug> task=<task> <key>=<ref> <detail>
+/// ```
+///
+/// and, worse, all wrote out the same mapping from a
+/// [`LadderRung`](crate::runtime::objects::LadderRung) to its slug *and* to the
+/// one datum that explains it. The rungs carry those data precisely so a rail
+/// can report them after the entry is gone, and a mapping copied per rail is a
+/// mapping that can disagree per rail. Here it is written once.
+///
+/// `key` is the rail's own name for the ref it failed to resolve (`func_ref`,
+/// `pipe_ref`), which is the part that legitimately differs.
+#[derive(Clone, Copy)]
+pub struct RungReport {
+    event: &'static str,
+    key: &'static str,
+}
+
+impl RungReport {
+    pub const fn new(event: &'static str, key: &'static str) -> Self {
+        Self { event, key }
+    }
+
+    /// Report one of the first three rungs, with the datum it carries.
+    pub fn rung(self, task_id: u32, ref_: u32, rung: crate::runtime::objects::LadderRung) {
+        use crate::runtime::objects::LadderRung;
+        let detail = match rung {
+            LadderRung::NoListEntry => String::new(),
+            LadderRung::WrongType { got } => format!("ot={got}"),
+            LadderRung::DescRead { declared_len } => format!("desc_len={declared_len}"),
+        };
+        self.reason(task_id, ref_, ladder_slugs!("")(rung), &detail);
+    }
+
+    /// Report a refusal past the rungs — a decode that failed, or a decoded
+    /// descriptor the rail cannot use. Those stay in each rail's own vocabulary
+    /// (see this module's "What does not belong here"), so the slug comes in.
+    pub fn reason(self, task_id: u32, ref_: u32, slug: &str, detail: &str) {
+        let Self { event, key } = self;
+        let mut line = format!("{event} fail reason={slug} task={task_id} {key}={ref_}");
+        if !detail.is_empty() {
+            line.push(' ');
+            line.push_str(detail);
+        }
+        crate::observe::fail(line);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     /// The composition, stated once so a later edit to an arm is visible.
@@ -238,6 +292,58 @@ mod tests {
                 ladder_slug!("buf", wrong_type),
                 ladder_slug!("buf", desc_read),
             ],
+        );
+    }
+
+    /// The line the loaders emit, spelled out.
+    ///
+    /// It is asserted literally rather than by `contains`, because this is the
+    /// text a fail-log grep matches on and every field name in it is part of
+    /// that contract. Three rails built this line by hand before `RungReport`
+    /// took it, so a drift here used to be a drift between rails.
+    #[test]
+    fn a_rung_report_names_the_rung_and_the_datum_that_explains_it() {
+        use crate::runtime::objects::LadderRung;
+        let report = super::RungReport::new("draw_load_mtlb", "func_ref");
+
+        let cap = crate::observe::FailCapture::start();
+        report.rung(3, 9, LadderRung::WrongType { got: 11 });
+        assert_eq!(
+            cap.one("draw_load_mtlb"),
+            "draw_load_mtlb fail reason=wrong_type task=3 func_ref=9 ot=11"
+        );
+        drop(cap);
+
+        // The rung with nothing to add ends at the ref — no trailing space.
+        let cap = crate::observe::FailCapture::start();
+        report.rung(3, 9, LadderRung::NoListEntry);
+        assert_eq!(
+            cap.one("draw_load_mtlb"),
+            "draw_load_mtlb fail reason=no_list_entry task=3 func_ref=9"
+        );
+        drop(cap);
+
+        // The unreadable-descriptor rung carries the length the entry declared,
+        // which is the datum that says the ref was live and its bytes were not.
+        let cap = crate::observe::FailCapture::start();
+        report.rung(3, 9, LadderRung::DescRead { declared_len: 116 });
+        assert_eq!(
+            cap.one("draw_load_mtlb"),
+            "draw_load_mtlb fail reason=desc_read task=3 func_ref=9 desc_len=116"
+        );
+        drop(cap);
+
+        // A refusal past the rungs keeps the rail's own vocabulary and key.
+        let cap = crate::observe::FailCapture::start();
+        super::RungReport::new("compute_load_pipeline", "pipe_ref").reason(
+            1,
+            2,
+            "kernel_func_zero",
+            "",
+        );
+        assert_eq!(
+            cap.one("compute_load_pipeline"),
+            "compute_load_pipeline fail reason=kernel_func_zero task=1 pipe_ref=2"
         );
     }
 

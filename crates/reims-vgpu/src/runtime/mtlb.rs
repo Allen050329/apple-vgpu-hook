@@ -126,15 +126,11 @@ pub fn load_mtlb<M: HostMemory + HostOps>(
     if func_ref == 0 {
         return None;
     }
-    let event = rail.event();
+    let report = crate::observe::RungReport::new(rail.event(), "func_ref");
     let miss = |reason: &str, detail: String| -> Option<Vec<u8>> {
-        crate::observe::fail(format!(
-            "{event} fail reason={reason} task={task_id} func_ref={func_ref} {detail}"
-        ));
+        report.reason(task_id, func_ref, reason, &detail);
         None
     };
-    // The detail the `wrong_type` line carries comes off the rung: it is the
-    // only thing that still holds the tag once the entry is gone.
     let (_entry, desc) = match objects::resolve_descriptor(
         state,
         host,
@@ -144,15 +140,8 @@ pub fn load_mtlb<M: HostMemory + HostOps>(
     ) {
         Ok(found) => found,
         Err(rung) => {
-            return miss(
-                crate::observe::ladder_slugs!("")(rung),
-                match rung {
-                    objects::LadderRung::WrongType { got } => format!("ot={got}"),
-                    objects::LadderRung::NoListEntry | objects::LadderRung::DescRead { .. } => {
-                        String::new()
-                    }
-                },
-            )
+            report.rung(task_id, func_ref, rung);
+            return None;
         }
     };
     let Ok(f) = decode_function_descriptor(&desc) else {
