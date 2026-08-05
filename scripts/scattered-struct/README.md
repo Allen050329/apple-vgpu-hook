@@ -34,6 +34,26 @@ differ then says so by name — `SampledKey { format: resident_color(bgra),
 putting a different expression in the eighth slot, which nothing reading the
 call would notice.
 
+**Two shapes this class reports that the cure does not fit**, both adjudicated
+on this tree and both still in the report:
+
+- *The function creates most of what it packs.* `registry_ensure` builds a
+  `NewResident` out of four parameters — and out of the image, memory, view and
+  framebuffer it just created, which no caller has. Moving the construction up
+  is not available; what the type buys here is that the *other* four cannot be
+  transposed on the way in, and that a second creation arm cannot invent
+  different values for the fields neither of them is given.
+- *Whether the struct is built at all is decided inside.* `batch_append` opens a
+  batch or extends the open one, and only the opening arm constructs an
+  `OpenBatch`. A caller passing a finished one would be building a value that is
+  discarded on the path it cannot predict. Its five parameters also have five
+  distinct types, so the permutation hazard this script exists for is absent.
+
+The tell for both: ask what the call site would have to know to build the type.
+If the answer includes something the function has not created or decided yet,
+the report is describing the signature accurately and the cure still does not
+apply.
+
 ### An enum arm flattened into loose primitives
 
 A `match` whose arms are tuples of bare literals. The enum is the type; the
