@@ -107,7 +107,7 @@ static STATE: Mutex<ThrashState> = Mutex::new(ThrashState::new());
 ///
 /// `reason` is a stable slug for WHICH build check bailed; deduped on
 /// `(reason, w, h)` so it fires once per distinct combination per boot (never per
-/// frame). Runs on the render/drain worker (metal_draw), never the QEMU main loop.
+/// frame). Runs on the render/drain worker (`runtime::draw`), never the QEMU main loop.
 /// Measure-only — it does NOT change the fallback behavior, only reports it.
 pub fn note_secondary_mrt_drop(reason: MrtDrop, width: u32, height: u32) {
     let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());

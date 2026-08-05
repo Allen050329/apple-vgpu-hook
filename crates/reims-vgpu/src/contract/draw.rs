@@ -6,7 +6,7 @@
 /// Its own type for the same reason [`super::extent::Extent3`] is: the hazard is
 /// at the call boundary, not at construction. These five were decoded into a
 /// struct and then destructured back into loose `u32`s to cross two of them —
-/// `metal_draw::mrt_draw_request` took `(vertex_count, instance_count,
+/// `draw::mrt_draw_request` took `(vertex_count, instance_count,
 /// primitive_type, first_vertex, base_instance)` and
 /// `backend::metal::render::render_core_mrt`, one call further down the same
 /// draw, took the same five as `(vertex_count, first_vertex, instance_count,

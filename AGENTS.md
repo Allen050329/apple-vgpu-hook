@@ -425,7 +425,7 @@ cargo clippy --profile test --lib -- -D warnings           # the host-runnable l
 Expect zero from all three. **`scripts/feature-matrix` does not cover this**: it runs `cargo check`,
 so its `warnings=0` is a rustc count and it cannot see a clippy lint on any arm. That gap plus a
 "the Metal command is Apple-only" line that used to sit here is how a `clippy::question_mark` in
-`runtime/metal_draw/mod.rs` survived several commits that each said "clippy clean" — every one of
+`runtime/draw/mod.rs` survived several commits that each said "clippy clean" — every one of
 them was clean on the arms it ran, and nobody on a Linux host ran the Metal one.
 
 Do not hide warnings, skip an affected arm, or commit a dropped test

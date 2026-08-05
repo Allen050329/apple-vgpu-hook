@@ -38,8 +38,8 @@
 
 use crate::model::DeviceState;
 use crate::runtime::decode::resource::{decode_function_descriptor, OBJECT_TYPE_FUNCTION};
+use crate::runtime::draw::host_alloc_len;
 use crate::runtime::host::{HostMemory, HostOps};
-use crate::runtime::metal_draw::host_alloc_len;
 use crate::runtime::{gva_mem, objects};
 
 /// LLVM BitcodeWrapperHeader magic `0x0b17c0de` LE.

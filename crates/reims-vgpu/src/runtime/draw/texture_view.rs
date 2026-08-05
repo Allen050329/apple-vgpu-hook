@@ -4,7 +4,7 @@
 //!
 //! Backend-independent, so [`super`] declares this module ungated and
 //! re-exports its items flat — callers keep addressing them as
-//! `crate::runtime::metal_draw::<name>`. The two items that really are arm- or
+//! `crate::runtime::draw::<name>`. The two items that really are arm- or
 //! test-specific carry their own cfg. `use super::*` pulls in the parent's
 //! imports, which this module shares.
 

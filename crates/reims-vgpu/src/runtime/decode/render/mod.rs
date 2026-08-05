@@ -70,7 +70,7 @@ fn narrow_count(value: u64) -> Result<u32, DecodeStatus> {
 ///
 /// Because this is the single site, the count it guarantees is what let the
 /// three further `.max(1)`s downstream of it go: two in `runtime::exec` and one
-/// in `runtime::metal_draw`, each re-applying a rule already applied here.
+/// in `runtime::draw`, each re-applying a rule already applied here.
 #[inline]
 fn wire_instance_count(value: u64) -> Result<u32, DecodeStatus> {
     let count = narrow_count(value)?;

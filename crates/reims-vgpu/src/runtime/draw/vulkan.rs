@@ -4,7 +4,7 @@
 //!
 //! The whole module is gated on `backend-vulkan` at its declaration in
 //! [`super`], which also re-exports these items flat so callers keep addressing
-//! them as `crate::runtime::metal_draw::<name>`. `use super::*` pulls in the
+//! them as `crate::runtime::draw::<name>`. `use super::*` pulls in the
 //! parent's imports, which this half shares.
 
 use super::*;
@@ -2920,7 +2920,7 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
 /// ## What this does not license
 ///
 /// Serving the cache on the whole rung — making the order match
-/// [`crate::runtime::metal_draw::seed_color_load`]'s stated rule, "exact target
+/// [`crate::runtime::draw::seed_color_load`]'s stated rule, "exact target
 /// GVA is the strongest identity … Guest memory is last" — would change ~19 000
 /// serves to repair nothing. The two rails are not the same case: the seed's
 /// entry is for an attachment the pass is about to draw *onto*, while a sampled
@@ -3050,7 +3050,7 @@ pub(super) fn load_linear_from_host_caches<M: HostMemory + HostOps>(
     //
     // Still open, and a contract gap rather than a tuning one: that same cache
     // is read by the colour-LOAD seed paths (`try_metal2vulkan_draw`,
-    // `metal_draw::seed_color_load`), neither of which consults the write
+    // `draw::seed_color_load`), neither of which consults the write
     // witness. One boot held 397 entries over 105 MiB with 393/397 of their
     // backing pages unmapped — serving pixels for guest pages that are gone.
     // What the guest's statement of ownership is for a surface whose pages it
@@ -3530,7 +3530,7 @@ pub(super) fn note_pass_scissor_union(width: u32, height: u32) {
 fn note_load_seed_outcome(
     door: &'static str,
     seeded: bool,
-    c0: &crate::runtime::metal_draw::ColorRtRequest,
+    c0: &crate::runtime::draw::ColorRtRequest,
     w: u32,
     h: u32,
 ) {
@@ -5043,7 +5043,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 // this device's own decode is the only other source.
                 vertex_offset: i32::try_from(idx.base_vertex).map_err(|_| {
                     DrawError::DrawPreparation(DrawPreparationDecline::IndexLoad {
-                        reason: crate::runtime::metal_draw::IndexLoadReason::BaseVertexOutOfRange,
+                        reason: crate::runtime::draw::IndexLoadReason::BaseVertexOutOfRange,
                     })
                 })?,
                 indices,

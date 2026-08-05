@@ -1688,7 +1688,7 @@ fn reflected_static_sampler_descriptor_samples_texture() {
         swizzle: Default::default(),
     });
     req.samplers.push(
-        reims_vgpu::runtime::metal_draw::reflected_static_sampler_resource(
+        reims_vgpu::runtime::draw::reflected_static_sampler_resource(
             "fragment",
             descriptor.binding
                 + reims_vgpu::runtime::spirv_bind::FRAG_SAMPLED_RESOURCE_BINDING_OFFSET,
@@ -2179,8 +2179,7 @@ fn premult_one_omsa_gpu_blend_matches_software_oracle() {
     let over_black = engine::execute_draw_request(&black)
         .expect("over black")
         .pixels;
-    let (soft, _) =
-        reims_vgpu::runtime::metal_draw::load_composite_premult_one_omsa(&over_black, &seed);
+    let (soft, _) = reims_vgpu::runtime::draw::load_composite_premult_one_omsa(&over_black, &seed);
     // Allow ±1 LSB for unorm rounding differences between GPU blend and CPU composite.
     assert_eq!(gpu_px.len(), soft.len());
     for (i, (g, s)) in gpu_px.iter().zip(soft.iter()).enumerate() {

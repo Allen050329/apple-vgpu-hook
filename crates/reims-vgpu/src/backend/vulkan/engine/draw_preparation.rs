@@ -7,8 +7,8 @@
 
 use crate::backend::vulkan::translate::TranslateReason;
 use crate::observe::Decline;
+use crate::runtime::draw::IndexLoadReason;
 use crate::runtime::m2v_cache::M2vCacheDecline;
-use crate::runtime::metal_draw::IndexLoadReason;
 use crate::runtime::mtlb::MtlbDecline;
 
 /// A specific pipeline/stage preparation failure before engine request validation.
@@ -888,7 +888,7 @@ mod tests {
 
     #[test]
     fn index_load_preserves_the_shared_reason_and_fields() {
-        use crate::runtime::metal_draw::IndexLoadReason;
+        use crate::runtime::draw::IndexLoadReason;
 
         let decline = DrawPreparationDecline::IndexLoad {
             reason: IndexLoadReason::OutOfBounds,

@@ -47,12 +47,12 @@ use crate::runtime::decode::resource::{
     OBJECT_TYPE_IOSURFACE, OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_VARIANT,
     OBJECT_TYPE_TEXTURE_VIEW, TEXTURE_VIEW_MTL_TYPE_2D,
 };
+use crate::runtime::draw::{self, host_alloc_len};
 use crate::runtime::fence_exec::{self, FenceStatus};
 use crate::runtime::gva_mem;
 use crate::runtime::host::{HostMemory, HostOps};
 use crate::runtime::mapper;
 use crate::runtime::mapping_write;
-use crate::runtime::metal_draw::{self, host_alloc_len};
 use crate::runtime::objects;
 use crate::runtime::plan::event_sync::{Domain as FenceDomain, FenceAction};
 use reims_vgpu_wire::ops::blit as wire_blit;
@@ -666,7 +666,7 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
         // View pixel_format overrides base when bpp-compatible.
         if let Some(declared) = view.declared_pixel_format() {
             let base_fmt = backing.pixel_format();
-            let eff = metal_draw::effective_view_sample_format(base_fmt, Some(declared))
+            let eff = draw::effective_view_sample_format(base_fmt, Some(declared))
                 .ok_or_else(|| br(BlitStatus::Unsupported, "view_fmt_incompat"))?;
             match &mut backing {
                 TextureBacking::Linear(t) => {

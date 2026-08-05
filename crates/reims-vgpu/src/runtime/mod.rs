@@ -59,6 +59,12 @@ pub mod host_writes;
 /// Type-7 ICB (0x36) materialization, host command fills, execute writeback.
 pub mod icb;
 
+/// Metal draw encode + writeback when MTLBs resolve.
+// See the note on `backend::metal`: `Status` is a 264-byte `Copy` payload
+// carried on failure paths, and boxing it would cost the refusal vocabulary
+// that makes each one greppable.
+#[allow(clippy::result_large_err, clippy::large_enum_variant)]
+pub mod draw;
 pub mod input;
 /// Process-global metal2vulkan SPIR-V cache (AIR content hash → SPIR-V).
 pub mod m2v_cache;
@@ -66,12 +72,6 @@ pub mod m2v_cache;
 pub mod mapper;
 /// Write host BGRA into guest mapping pages (render writeback).
 pub mod mapping_write;
-/// Metal draw encode + writeback when MTLBs resolve.
-// See the note on `backend::metal`: `Status` is a 264-byte `Copy` payload
-// carried on failure paths, and boxing it would cost the refusal vocabulary
-// that makes each one greppable.
-#[allow(clippy::result_large_err, clippy::large_enum_variant)]
-pub mod metal_draw;
 /// generateMipmaps for multi-mip type-2/3 linear textures.
 pub mod mipmap;
 pub mod mmio;
@@ -305,7 +305,7 @@ mod arch_path_gate {
 
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/runtime");
         for relative in [
-            "metal_draw/tests.rs",
+            "draw/tests.rs",
             "compute_exec/tests.rs",
             "drain/tests.rs",
             "icb/tests.rs",
@@ -315,7 +315,7 @@ mod arch_path_gate {
                 "{relative} must be recognized through its parent's cfg(test) declaration"
             );
         }
-        assert!(!is_out_of_line_test_module(&root.join("metal_draw/mod.rs")));
+        assert!(!is_out_of_line_test_module(&root.join("draw/mod.rs")));
     }
 
     fn walkdir(dir: &std::path::Path) -> Vec<PathBuf> {

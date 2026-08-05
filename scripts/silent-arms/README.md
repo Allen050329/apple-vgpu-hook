@@ -80,7 +80,7 @@ entry below does. Fixed in the commit that added this section.
 
 Eight candidates on the current tree, all read and all legitimate:
 
-- `runtime/metal_draw/mod.rs` ×4 and `metal_draw/vulkan.rs` ×3 — the
+- `runtime/draw/mod.rs` ×4 and `draw/vulkan.rs` ×3 — the
   `PASS_LOAD_ACTION_*` ladders. The catch-all is `DONT_CARE`, whose whole
   meaning is "do nothing to this attachment", and the value is bounded upstream
   by `load_action <= PASS_LOAD_ACTION_CLEAR` so it cannot be an unknown action.

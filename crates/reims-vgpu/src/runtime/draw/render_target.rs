@@ -31,7 +31,7 @@
 //! # Why this is its own module
 //!
 //! It is 380 lines of one question with four answers, and it sat in the middle
-//! of `metal_draw`'s 4 700-line body between the ICB execute entry point and the
+//! of `runtime::draw`'s 4 700-line body between the ICB execute entry point and the
 //! guest-page writers. Nothing in it is backend-specific — no `cfg` gate here,
 //! for the same reason [`super::texture_view`] carries none — and both arms take
 //! it on every draw.
@@ -901,7 +901,7 @@ fn resolve_render_target<M: HostMemory + HostOps>(
 /// Both are pure given their arguments — one maps a decoded format to a decision
 /// and one scores a view against a base — so neither needs a device, a mapping,
 /// or a boot to hold. They moved here with the code they describe; they were
-/// written against it in `metal_draw`'s 4 700-line colocated test module, which
+/// written against it in `runtime::draw`'s 4 700-line colocated test module, which
 /// is the file the plan wants to stop growing.
 #[cfg(test)]
 mod tests {

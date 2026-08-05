@@ -936,7 +936,7 @@ fn the_two_coverage_censuses_use_the_same_bands() {
         #[cfg(feature = "backend-vulkan")]
         assert_eq!(
             band,
-            crate::runtime::metal_draw::coverage_band_for_test(pct),
+            crate::runtime::draw::coverage_band_for_test(pct),
             "pct {pct}: the two censuses band it differently"
         );
     }
@@ -1208,7 +1208,7 @@ fn a_base_vertex_and_base_instance_reach_the_pending_draw() {
     // And onward into the request the backends receive. `retarget_render_
     // pass_draw` is the path records 2+ of a chained pass take, and it
     // rebuilds every draw argument from the template.
-    let template = metal_draw::DrawEncodeRequest::default();
+    let template = draw::DrawEncodeRequest::default();
     let req = retarget_render_pass_draw(&template, &acc.draws[0]);
     assert_eq!(req.base_instance, 7);
     assert_eq!(req.instance_count, 9);
@@ -1740,7 +1740,7 @@ fn finish_stream_clear_only_branch_without_draws() {
 #[test]
 fn finish_stream_with_draws_skips_guest_clear_prelude() {
     use crate::runtime::decode::render::ColorAttachment;
-    use crate::runtime::metal_draw::BufferBind;
+    use crate::runtime::draw::BufferBind;
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     let mut out = ExecResult::default();
@@ -1803,7 +1803,7 @@ fn nometal_draw_falls_back_to_type4_clear() {
     use crate::contract::endian::{st32, st64};
     use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     use crate::runtime::decode::render::ColorAttachment;
-    use crate::runtime::metal_draw::BufferBind;
+    use crate::runtime::draw::BufferBind;
     use crate::runtime::objects::{self, OBJECT_TYPE_SURFACE};
 
     let mut host = FakeHost::new();
@@ -1979,13 +1979,13 @@ fn multi_draw_chain_source_preserves_portable_unified_output() {
 
 #[test]
 fn render_pass_template_reuses_attachment_without_load_seed() {
-    let first = metal_draw::DrawEncodeRequest {
+    let first = draw::DrawEncodeRequest {
         task_id: 1,
         pipeline_ref: 7,
         vertex_count: 3,
         instance_count: 1,
         primitive_type: 3,
-        colors: vec![metal_draw::ColorRtRequest {
+        colors: vec![draw::ColorRtRequest {
             slot: 0,
             texture_ref: 11,
             mapping_id: 3,

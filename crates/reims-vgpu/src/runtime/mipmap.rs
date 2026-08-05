@@ -15,9 +15,9 @@ use crate::runtime::decode::resource::{
     decode_texture_descriptor, OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_VARIANT,
     TEXTURE_MAX_MIP_LEVELS,
 };
+use crate::runtime::draw::host_alloc_len;
 use crate::runtime::gva_mem;
 use crate::runtime::host::{HostMemory, HostOps};
-use crate::runtime::metal_draw::host_alloc_len;
 use crate::runtime::objects;
 
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]

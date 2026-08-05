@@ -30,13 +30,13 @@ use crate::runtime::decode::stream::{
     self, decode_first_record, decode_next_record, SEGMENT_TYPE_BLIT, SEGMENT_TYPE_COMPUTE,
     SEGMENT_TYPE_EVENT, SEGMENT_TYPE_INFO, SEGMENT_TYPE_RENDER,
 };
+use crate::runtime::draw::{
+    self, BufferBind, EncodeStatus, IndexedDrawInfo, SamplerBind, TextureBind, MAX_BIND_SLOTS,
+};
 use crate::runtime::fence_exec;
 use crate::runtime::gva_mem;
 use crate::runtime::host::{HostMemory, HostOps};
 use crate::runtime::mapping_write;
-use crate::runtime::metal_draw::{
-    self, BufferBind, EncodeStatus, IndexedDrawInfo, SamplerBind, TextureBind, MAX_BIND_SLOTS,
-};
 use crate::runtime::mipmap::{self, MipmapStatus};
 use crate::runtime::objects;
 use crate::runtime::plan::event_sync::{Domain as FenceDomain, FenceAction};
@@ -392,7 +392,7 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
         }
         // Guest length is authoritative — no product MiB budget. Fail only if
         // the host process cannot address the allocation.
-        let Some(stream_len) = crate::runtime::metal_draw::host_alloc_len(length) else {
+        let Some(stream_len) = crate::runtime::draw::host_alloc_len(length) else {
             crate::observe::fail(format!(
                 "exec_cmdbuf skip task={task_id} i={i} gva={gva:#x} len={length} (host_len)"
             ));
@@ -567,8 +567,7 @@ fn preflight_render_translations<M: HostMemory + HostOps>(
     let pipelines = render_pipeline_refs(stream);
     let mut pending = false;
     for pipeline_ref in pipelines {
-        let Ok((v_air, f_air)) =
-            metal_draw::load_render_air_pair(state, host, task_id, pipeline_ref)
+        let Ok((v_air, f_air)) = draw::load_render_air_pair(state, host, task_id, pipeline_ref)
         else {
             // Normal execution emits the precise pipeline/MTLB failure. A
             // missing plan input is deterministic, not asynchronous work.
@@ -2278,7 +2277,7 @@ fn finish_stream<M: HostMemory + HostOps>(
                     },
                 )
             };
-            let req = metal_draw::mrt_draw_request(
+            let req = draw::mrt_draw_request(
                 state,
                 host,
                 task_id,
@@ -2319,7 +2318,7 @@ fn finish_stream<M: HostMemory + HostOps>(
                         }
                     }
                 };
-                match metal_draw::encode_icb_execute_and_writeback(
+                match draw::encode_icb_execute_and_writeback(
                     state,
                     host,
                     &req,
@@ -2385,7 +2384,7 @@ fn finish_stream<M: HostMemory + HostOps>(
         let first_draw = draw_list.first().copied();
         let mut first_req = first_draw.and_then(|pd| {
             out.render_attachment_resolves = out.render_attachment_resolves.saturating_add(1);
-            metal_draw::mrt_draw_request(
+            draw::mrt_draw_request(
                 state,
                 host,
                 task_id,
@@ -2475,13 +2474,8 @@ fn finish_stream<M: HostMemory + HostOps>(
                     out.render_guest_stores = out.render_guest_stores.saturating_add(1);
                 }
                 let draw_started = std::time::Instant::now();
-                let encode = metal_draw::encode_draw_chain(
-                    state,
-                    host,
-                    &mut req,
-                    do_writeback,
-                    force_full_store,
-                );
+                let encode =
+                    draw::encode_draw_chain(state, host, &mut req, do_writeback, force_full_store);
                 crate::runtime::drain::note_drain_phase(
                     crate::runtime::drain::DrainPhase::Draw,
                     draw_started,
@@ -2630,13 +2624,11 @@ impl crate::observe::Decline for ChainAbandonDecline {
 /// Seedless fixed-attachment template for records after the first draw in one
 /// serialized Metal render pass. Construct fields explicitly so a multi-MiB
 /// CPU LOAD seed is not cloned merely to reuse attachment identity/geometry.
-fn render_pass_attachment_template(
-    first: &metal_draw::DrawEncodeRequest,
-) -> metal_draw::DrawEncodeRequest {
+fn render_pass_attachment_template(first: &draw::DrawEncodeRequest) -> draw::DrawEncodeRequest {
     let colors = first
         .colors
         .iter()
-        .map(|c| metal_draw::ColorRtRequest {
+        .map(|c| draw::ColorRtRequest {
             slot: c.slot,
             texture_ref: c.texture_ref,
             mapping_id: c.mapping_id,
@@ -2651,7 +2643,7 @@ fn render_pass_attachment_template(
             target_seed_rgba: None,
         })
         .collect();
-    metal_draw::DrawEncodeRequest {
+    draw::DrawEncodeRequest {
         task_id: first.task_id,
         colors,
         ..Default::default()
@@ -2659,9 +2651,9 @@ fn render_pass_attachment_template(
 }
 
 fn retarget_render_pass_draw(
-    template: &metal_draw::DrawEncodeRequest,
+    template: &draw::DrawEncodeRequest,
     draw: &PendingDraw,
-) -> metal_draw::DrawEncodeRequest {
+) -> draw::DrawEncodeRequest {
     let mut req = template.clone();
     req.pipeline_ref = draw.pipeline_ref;
     req.vertex_count = draw.draw.vertex_count;
@@ -2719,7 +2711,7 @@ fn multi_draw_chain_source(resident_chain: bool, cpu_chain_ready: bool) -> Multi
     }
 }
 
-fn fill_draw_binds_from_pending(req: &mut metal_draw::DrawEncodeRequest, pd: &PendingDraw) {
+fn fill_draw_binds_from_pending(req: &mut draw::DrawEncodeRequest, pd: &PendingDraw) {
     req.vertex_buffers = pd.vertex_buffers.as_ref().clone();
     req.fragment_buffers = pd.fragment_buffers.as_ref().clone();
     req.vertex_textures = pd.vertex_textures.as_ref().clone();
@@ -2773,18 +2765,18 @@ fn land_chain_before_abandon<M: HostMemory + HostOps>(
     host: &mut M,
     task_id: u32,
     acc: &StreamAccum,
-    req: &metal_draw::DrawEncodeRequest,
+    req: &draw::DrawEncodeRequest,
     chain_rgba: &mut Option<Vec<u8>>,
     resident_chain: bool,
 ) {
     #[cfg(feature = "backend-vulkan")]
     if resident_chain && chain_rgba.is_none() {
-        *chain_rgba = metal_draw::read_resident_chain(state, req);
+        *chain_rgba = draw::read_resident_chain(state, req);
     }
     #[cfg(not(feature = "backend-vulkan"))]
     let _ = (req, resident_chain);
     if let Some(rgba) = chain_rgba.take() {
-        let _ = metal_draw::writeback_chain_rgba(state, host, task_id, &acc.color_slots, &rgba);
+        let _ = draw::writeback_chain_rgba(state, host, task_id, &acc.color_slots, &rgba);
     }
     dirty_color_targets(state, host, task_id, &acc.color_targets);
 }
@@ -2816,7 +2808,7 @@ fn apply_clear<M: HostMemory + HostOps>(
     let Some(req) =
         // A clear-only pass: no pipeline and no geometry, so every draw
         // argument including the base instance is zero by construction.
-        metal_draw::color_target_request(state, host, task_id, att.texture_ref, 0, 0, 1, 0, 0, 0)
+        draw::color_target_request(state, host, task_id, att.texture_ref, 0, 0, 1, 0, 0, 0)
     else {
         // A clear whose color target cannot resolve (mapping unresolved, geometry
         // missing) is dropped here with no other trace — the "background didn't
@@ -2833,8 +2825,8 @@ fn apply_clear<M: HostMemory + HostOps>(
     let h = c0.height;
     let rgba = solid_rgba(w, h, &att.clear_color);
     if c0.target_gva != 0 {
-        metal_draw::supersede_gva_window(state, host, c0.target_gva, w, h, "clear_store");
-        return metal_draw::write_gva_rgba8(
+        draw::supersede_gva_window(state, host, c0.target_gva, w, h, "clear_store");
+        return draw::write_gva_rgba8(
             state,
             host,
             task_id,

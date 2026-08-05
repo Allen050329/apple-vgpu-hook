@@ -26,16 +26,16 @@ use crate::runtime::decode::resource::{
     OBJECT_TYPE_BUFFER, OBJECT_TYPE_FUNCTION, PIPELINE_TAG_KERNEL_FUNC, TYPE7_FIRST_TLVS,
     TYPE7_OBJECT_COMPUTE_PIPELINE,
 };
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+use crate::runtime::draw::{
+    encode_icb_execute_and_writeback, BufferBind, ColorRtRequest, DrawEncodeRequest, EncodeStatus,
+};
 use crate::runtime::gva_mem;
 use crate::runtime::host::FakeHost;
 /// Readback, the draw encoder and the fixture directory. Every Metal-arm ICB
 /// test needs this same set; it was spelled inside 29 test bodies before.
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 use crate::runtime::mapping_write;
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-use crate::runtime::metal_draw::{
-    encode_icb_execute_and_writeback, BufferBind, ColorRtRequest, DrawEncodeRequest, EncodeStatus,
-};
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 use std::path::PathBuf;
 use std::sync::Mutex;

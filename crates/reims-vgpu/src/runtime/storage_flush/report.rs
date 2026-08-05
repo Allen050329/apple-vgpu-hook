@@ -8,7 +8,7 @@
 //! rails above stay readable as rails.
 //!
 //! Two of them are the crate's entry points for the read half: `scanout`,
-//! `drain` and `metal_draw` call [`note_render_flush_cache_read`] and
+//! `drain` and `runtime::draw` call [`note_render_flush_cache_read`] and
 //! [`note_render_flush_pages_read`] when they consume a landed surface, and
 //! `note_render_flush_landed` scores the previous landing against them.
 

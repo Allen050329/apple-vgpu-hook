@@ -203,7 +203,7 @@ pub fn strip_attributes(chars: &[char]) -> String {
 /// Blank every test module's body, keeping offsets stable.
 ///
 /// Both spellings of the attribute are read: `#[cfg(test)]` and the
-/// `#[cfg(all(test, feature = "…"))]` form that `metal_draw/vulkan.rs` uses for
+/// `#[cfg(all(test, feature = "…"))]` form that `draw/vulkan.rs` uses for
 /// `vulkan_split_tests`. Brace-matching each body rather than cutting at the
 /// first marker is what keeps production code *after* a test module visible — a
 /// first-marker cutoff hides it, and a scanner that hides code reports clean.

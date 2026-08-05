@@ -1,6 +1,6 @@
 //! Which sampled windows the engine may bind without reading a byte of guest RAM.
 //!
-//! The three zero-copy sampled producers ([`super::metal_draw::vulkan`]'s
+//! The three zero-copy sampled producers ([`super::draw::vulkan`]'s
 //! linear, type-11 and type-5 rails) hand the engine a
 //! [`crate::backend::vulkan::engine::SampledSource::GuestRuns`], and the engine's
 //! only byte-moving arm gathers the whole window out of guest RAM into a staging
@@ -58,7 +58,7 @@
 //! page above the first non-RAM byte, and nothing unwound it short of a reboot.
 //!
 //! It is worth recognising from the other side too, because the same step drives
-//! `metal_draw`'s type-11 sampled rung into
+//! `runtime::draw`'s type-11 sampled rung into
 //! `t11rung_resident_refused`, whose merge skips every page the witness claims
 //! and so leaves a GPU-side composite reading blank. Twelve recorded boots
 //! separated on this counter with no overlap — 155-186 clean against

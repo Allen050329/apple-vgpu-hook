@@ -96,7 +96,7 @@ impl<B: Backend> Device<B> {
     /// BH body: drain pending work.
     ///
     /// `state.texture_to_mapping` is the authoritative type-11 ref → mapping
-    /// table and is read directly by `runtime/metal_draw`. This used to also
+    /// table and is read directly by `runtime/draw`. This used to also
     /// copy it into the backend on every drain, into a map nothing ever read.
     pub fn drain<H: runtime::host::HostMemory + HostOps>(&mut self, host: &mut H) {
         runtime::drain::drain_pending(&mut self.state, host);

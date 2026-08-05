@@ -70,7 +70,7 @@
 //! A second driven boot (2 685 posted events, ~35 Hz median present) put a
 //! **denominator** on that zero, which is the part that makes it worth anything:
 //! `drain_duty` counted **177 746 draws**. Every one of them ran
-//! [`crate::runtime::metal_draw`]'s pipeline load and two
+//! [`crate::runtime::draw`]'s pipeline load and two
 //! [`crate::runtime::mtlb::load_mtlb`] calls, so the rungs were asked roughly
 //! half a million times and refused none. A zero over an unstated amount of work
 //! is not a measurement; this one is.

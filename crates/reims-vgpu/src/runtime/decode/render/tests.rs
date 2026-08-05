@@ -155,7 +155,7 @@ fn a_wide_count_that_cannot_fit_the_commands_field_is_refused_not_truncated() {
 /// `(TriangleStrip, count 0x1111, UInt32, ref, offset 0x2222)`; the wire
 /// Every selector that carries an instance count leaves it non-zero, which
 /// is the guarantee three `.max(1)`s downstream of here used to re-apply —
-/// two in `runtime::exec`, one in `runtime::metal_draw`. They are gone, so
+/// two in `runtime::exec`, one in `runtime::draw`. They are gone, so
 /// this is now the only thing holding that property up. A decode arm added
 /// without [`wire_instance_count`] fails here rather than in a boot.
 #[test]

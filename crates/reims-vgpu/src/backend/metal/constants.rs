@@ -47,7 +47,7 @@ const _: () = assert!(
 /// compute (`backend::metal::compute` via
 /// [`crate::backend::metal::util::valid_buffer_binding`], which reads
 /// `REIMS_VGPU_METAL_MAX_BUFFERS`), direct render and render ICB inheritance
-/// (both `metal_draw::MAX_BIND_SLOTS`), and compute ICB inheritance
+/// (both `draw::MAX_BIND_SLOTS`), and compute ICB inheritance
 /// (`valid_buffer_binding`). Letting the two constants drift would leave one
 /// pair of paths passing an index to `setBuffer:offset:atIndex:` that the other
 /// pair rejects, and Metal answers an out-of-range index with an exception that
@@ -66,5 +66,4 @@ const _: () = assert!(
 /// which includes the cross-compiled `--target aarch64-apple-darwin` clippy arm
 /// that `AGENTS.md` requires from Linux. Same guarantee, checked everywhere,
 /// and it fails the build rather than a suite nobody on this pathway runs.
-const _: () =
-    assert!(REIMS_VGPU_METAL_MAX_BUFFERS as u32 == crate::runtime::metal_draw::MAX_BIND_SLOTS);
+const _: () = assert!(REIMS_VGPU_METAL_MAX_BUFFERS as u32 == crate::runtime::draw::MAX_BIND_SLOTS);

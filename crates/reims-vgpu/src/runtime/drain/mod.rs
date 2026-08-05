@@ -1386,7 +1386,7 @@ fn load_cursor_glyph<H: HostMemory + HostOps>(
             format!("cursor_glyph_fail reason=cursor_glyph_mapped_len mapped_length={mapped_length} need={need} {width}x{height}"),
         );
     }
-    let Some(need_host) = crate::runtime::metal_draw::host_alloc_len(need) else {
+    let Some(need_host) = crate::runtime::draw::host_alloc_len(need) else {
         return cursor_glyph_fail(
             "cursor_glyph_alloc",
             format!("cursor_glyph_fail reason=cursor_glyph_alloc need={need}"),

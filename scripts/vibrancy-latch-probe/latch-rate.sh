@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # latch-rate.sh — how often does a boot come up with the vibrancy rail broken?
 #
-# `metal_draw/vulkan.rs`'s `note_gva_resident_aliasing` records the property that
+# `draw/vulkan.rs`'s `note_gva_resident_aliasing` records the property that
 # makes every single-boot reading of this class useless: pooled over five
 # 14-round boots on one binary the corruption was 0, 0, 0, 14, 0 — **all-or-
 # nothing per boot, never mixed**. Something latches once per boot and then holds

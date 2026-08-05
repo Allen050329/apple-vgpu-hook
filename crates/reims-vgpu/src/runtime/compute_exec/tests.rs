@@ -985,7 +985,7 @@ fn dispatch_missing_texture_fails() {
 }
 
 /// Live CI wallpaper: type-5 RefTexture → type-4 surface_id must stage via
-/// ensure_surface + mapping (same order as metal_draw sample). Without
+/// ensure_surface + mapping (same order as the `runtime::draw` sample). Without
 /// ensure, stage fell through to type-2/3 with the type-5 ref → always
 /// MissingTexture (`compute_stage_tex … ot=5`).
 #[test]
@@ -1483,7 +1483,7 @@ fn linear_writeback_retains_cache_when_guest_gva_is_unmapped() {
 #[test]
 fn compute_stage_admits_full_screen_wide_gamut_without_cap() {
     use crate::contract::pixel_format::{bytes_per_pixel, MTL_FORMAT_RGBA16_FLOAT};
-    use crate::runtime::metal_draw::host_alloc_len;
+    use crate::runtime::draw::host_alloc_len;
     let bpp = bytes_per_pixel(MTL_FORMAT_RGBA16_FLOAT).expect("rgba16f bpp") as u64;
     let need = 1928u64 * 1920 * bpp;
     assert!(

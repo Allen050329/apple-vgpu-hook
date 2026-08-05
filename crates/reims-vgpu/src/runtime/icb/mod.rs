@@ -2083,7 +2083,7 @@ pub fn fill_render_command<M: HostMemory + HostOps>(
 
     // Pipeline is required on the ICB command unless inheritPipelineState.
     // Mirrors fill_compute_command: when inherit, parent encoder supplies PSO
-    // at execute (metal_draw::apply_icb_encoder_inheritance).
+    // at execute (draw::apply_icb_encoder_inheritance).
     let pso = if !icb_desc.inherit_pipeline_state() {
         if fill.pipeline_ref == 0 {
             return Err(IcbStatus::Args("icb_frc_pipeline_ref_zero"));
@@ -2137,7 +2137,7 @@ pub fn fill_render_command<M: HostMemory + HostOps>(
                 return Err(IcbStatus::Args("icb_frc_function_blob_empty"));
             }
             // Guest blob_size is authoritative — no product 1 MiB MTLB ceiling.
-            let len = crate::runtime::metal_draw::host_alloc_len(f.blob_size as u64)
+            let len = crate::runtime::draw::host_alloc_len(f.blob_size as u64)
                 .ok_or(IcbStatus::Args("icb_frc_function_blob_too_large"))?;
             let mut mtlb = vec![0u8; len];
             gva_mem::read_task_gva_by_id(
@@ -2479,7 +2479,7 @@ pub fn fill_render_command<M: HostMemory + HostOps>(
         cmd.set_render_pipeline_state(pso);
     }
     // When inheritBuffers, vertex/fragment buffers come from the parent encoder
-    // at execute (see metal_draw::encode_icb_execute_and_writeback).
+    // at execute (see draw::encode_icb_execute_and_writeback).
     if !entry.desc.inherit_buffers() {
         // Every index is checked before any is bound, so a refusal leaves the
         // command slot as it was rather than half filled.

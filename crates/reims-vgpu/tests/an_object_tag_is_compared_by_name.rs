@@ -5,7 +5,7 @@
 //! forty sites across `runtime/` ask "is this entry the type I want" before
 //! reading its descriptor. Written as `entry.object_type != OBJECT_TYPE_BUFFER`
 //! the question answers itself; written as `entry.object_type != 1` it does not,
-//! and this crate had one of the latter (`metal_draw`'s index-buffer load) in a
+//! and this crate had one of the latter (`runtime::draw`'s index-buffer load) in a
 //! file that already imported the constant and already used it four times.
 //!
 //! Two reasons that is worth a gate rather than a fix.

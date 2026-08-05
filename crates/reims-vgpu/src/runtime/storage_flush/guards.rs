@@ -39,7 +39,7 @@ use crate::runtime::host::{HostMemory, HostOps};
 /// It returns `true` when the window may still be written to guest RAM. Drift
 /// means our own bookkeeping is the stale part: the window was armed against one
 /// set of guest pages, the guest has since re-pointed `[gva, gva+span)`
-/// somewhere else, and [`crate::runtime::metal_draw::write_gva_rgba8`] walks
+/// somewhere else, and [`crate::runtime::draw::write_gva_rgba8`] walks
 /// fresh — so the write lands in whatever owns those pages *now*. On this rail
 /// that has been observed as guest heap corruption: WindowServer aborting inside
 /// `small_free_list_remove_ptr_no_clear`, and the guest kernel panicking with

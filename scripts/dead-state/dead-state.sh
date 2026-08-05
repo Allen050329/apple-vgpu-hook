@@ -157,7 +157,7 @@ import os, re, sys
 root = sys.argv[1]
 # The `#[cfg(...)]` guard is required. A stub is appended at file scope and
 # carries no cfg of its own, so stubbing a cfg-gated struct emits an impl for a
-# type that does not exist on the other arm. `metal_draw/vulkan.rs` is full of
+# type that does not exist on the other arm. `draw/vulkan.rs` is full of
 # these; it is `include!`d rather than a module, so every item in it is
 # individually gated. `#[cfg(test)]` matters just as much: `--test-only`
 # compiles each arm a second time as a plain lib, where a stub for a

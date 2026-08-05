@@ -376,7 +376,7 @@ pub struct ReimsVgpuScissor {
 /// Two of the five `MTLRenderCommandEncoder` raster setters, and only two.
 /// Depth clip mode, triangle fill mode and line width had slots here too, and
 /// no guest action could reach them: the one producer
-/// ([`crate::runtime::metal_draw`]) hard-coded all three absent, because
+/// ([`crate::runtime::draw`]) hard-coded all three absent, because
 /// `runtime::exec` decodes those three records and *drops* them under
 /// `render_depth_clip_mode_dropped`, `render_fill_mode_dropped` and
 /// `render_line_width_dropped` — and the ICB descriptor drops its own

@@ -916,7 +916,7 @@ impl FreeTargetImage {
 /// Cap on the **non-pinned** (LRU-evictable) resident-target population — the
 /// active render working set. Pinned slots (deferred-write windows, each holding
 /// content only on the GPU, bounded separately by the arming rail's own window
-/// cap — `metal_draw::vulkan::GVA_DEFERRED_WINDOW_CAP` for the GVA Store rail)
+/// cap — `draw::vulkan::GVA_DEFERRED_WINDOW_CAP` for the GVA Store rail)
 /// are **excluded** from this count
 /// (see the eviction loops): counting them would force the still-in-use active
 /// targets out whenever a compositing burst pins hundreds, thrashing exactly the

@@ -607,7 +607,7 @@ pub fn storage_selector(format: u16) -> Option<StorageImageSelector> {
 ///
 /// The match arms *are* the renderable set — the answer to "may a colour
 /// attachment be this format" is `.is_some()`, which is how
-/// `runtime/metal_draw` asks it. There used to be a `RenderTargetClass` enum
+/// `runtime/draw` asks it. There used to be a `RenderTargetClass` enum
 /// returned alongside the width, one variant per arm below; every caller
 /// discarded it, so it named the same six formats a second time and could
 /// disagree with this list without anything noticing.

@@ -39,11 +39,11 @@ use crate::runtime::decode::resource::{
 };
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 use crate::runtime::decode::resource::{decode_sampler_descriptor, TYPE7_OBJECT_SAMPLER};
+use crate::runtime::draw::host_alloc_len;
 use crate::runtime::gva_mem;
 use crate::runtime::host::{HostMemory, HostOps};
 use crate::runtime::mapper;
 use crate::runtime::mapping_write;
-use crate::runtime::metal_draw::host_alloc_len;
 use crate::runtime::mtlb::{load_mtlb, AirLoadRail};
 use crate::runtime::objects;
 
@@ -1332,7 +1332,7 @@ pub(crate) fn resident_serve(
 /// Load tight raw texels for a compute texture binding (type-2/3, type-5→surface, or type-11).
 ///
 /// Type-5 (`RefTextureHandle`) is the live CI wallpaper path (`compute_stage_tex … ot=5`).
-/// RE (type-5 wire + metal_draw sample path): surfaceID@0 is a type-4 object id (= mapping
+/// RE (type-5 wire + `runtime::draw` sample path): surfaceID@0 is a type-4 object id (= mapping
 /// mid). Product draw samples call [`objects::ensure_surface_for_present`] on that id and
 /// stage from the **mapping registry**, never re-resolving the surface id through the
 /// compute task's object list (that list uses a separate texture-ref namespace — live
@@ -1447,7 +1447,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
                     "compute_buffer_texture_unsupported",
                 ));
             } else {
-                let view = match crate::runtime::metal_draw::resolve_texture_view_reasoned(
+                let view = match crate::runtime::draw::resolve_texture_view_reasoned(
                     state,
                     host,
                     task_id,
@@ -1779,7 +1779,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
         }
         // sRGB color-renderable surfaces stage as unorm storage (same bpp).
         let Some(view_format) =
-            crate::runtime::metal_draw::effective_view_sample_format(format, view_pixel_format)
+            crate::runtime::draw::effective_view_sample_format(format, view_pixel_format)
         else {
             crate::observe::fail(format!(
                 "compute_stage_tex view_fail reason=format_incompatible ref={texture_ref} base={stage_ref} base_fmt={format:#x} view_fmt={view_pixel_format:?} mapping={mapping_id}"
@@ -2062,10 +2062,9 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             String::new(),
         );
     }
-    let Some(stage_format) = crate::runtime::metal_draw::effective_view_sample_format(
-        tex.pixel_format,
-        view_pixel_format,
-    ) else {
+    let Some(stage_format) =
+        crate::runtime::draw::effective_view_sample_format(tex.pixel_format, view_pixel_format)
+    else {
         return linear_fail(
             ComputeStatus::Unsupported("linear_tex_view_format"),
             format!(
@@ -3604,7 +3603,7 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
         if !crate::runtime::spirv_bind::sampler_bindings(&spirv).contains(&binding) {
             continue;
         }
-        let mut sampler = match crate::runtime::metal_draw::load_vulkan_sampler(
+        let mut sampler = match crate::runtime::draw::load_vulkan_sampler(
             state,
             host,
             task_id,
@@ -4415,7 +4414,7 @@ fn execute_dispatch_metal<M: HostMemory + HostOps>(
                 ))
             }
         };
-        reims_vgpu_samplers.push(crate::runtime::metal_draw::sampler_record(
+        reims_vgpu_samplers.push(crate::runtime::draw::sampler_record(
             REIMS_VGPU_BINDING_SAMPLER_BASE + s.index,
             &sd,
             s.has_lod_clamp.then_some((s.lod_min_bits, s.lod_max_bits)),

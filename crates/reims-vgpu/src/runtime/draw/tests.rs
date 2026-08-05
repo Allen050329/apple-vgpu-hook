@@ -915,7 +915,7 @@ fn reorder_rb_in_place_is_a_no_op_when_the_orders_already_agree() {
         let src: Vec<u8> = (0..len).map(|i| (i * 7 + 3) as u8).collect();
         for order in [false, true] {
             let mut same = src.clone();
-            crate::runtime::metal_draw::reorder_rb_in_place(&mut same, order, order);
+            crate::runtime::draw::reorder_rb_in_place(&mut same, order, order);
             assert_eq!(
                 same, src,
                 "len={len} order={order}: agreement must not copy"
@@ -924,10 +924,10 @@ fn reorder_rb_in_place_is_a_no_op_when_the_orders_already_agree() {
         // Disagreement in either direction is exactly the established swizzle,
         // tail included.
         let mut to_bgra = src.clone();
-        crate::runtime::metal_draw::reorder_rb_in_place(&mut to_bgra, false, true);
+        crate::runtime::draw::reorder_rb_in_place(&mut to_bgra, false, true);
         assert_eq!(to_bgra, swap_rb_channels(&src), "len={len} rgba->bgra");
         let mut to_rgba = src.clone();
-        crate::runtime::metal_draw::reorder_rb_in_place(&mut to_rgba, true, false);
+        crate::runtime::draw::reorder_rb_in_place(&mut to_rgba, true, false);
         assert_eq!(to_rgba, swap_rb_channels(&src), "len={len} bgra->rgba");
     }
 }
@@ -4500,7 +4500,15 @@ fn type11_sample_resolves_geometry_before_reading_it() {
     put_u64(&mut host, internal + MAPPING_INTERNAL_DESC_PTR, desc_kva);
     put_u64(&mut host, page_obj + MAPPING_PAGE_TABLE_FROM_F48, table);
 
-    let pfn = 0x1e88c_u32;
+    // A PFN of this test's own. `resolve_mapping_backing` reports its adopted
+    // footprint through a process-global `first_sight` latch keyed on
+    // `span_first_sight_key(mapping_id, lo, hi, page_shift)` — so this fixture
+    // and `mapper::tests::resolve_builds_page_entries`, which share `mid == 3`,
+    // one arm64e page, and nothing else, compute the *same* key whenever they
+    // share a PFN. Whichever runs first claims it and the other's line never
+    // appears. That test asserts on the line; this one only needs a page, so
+    // the distinct value belongs here.
+    let pfn = 0x3b7a2_u32;
     let page_gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
     put_u32(
         &mut host,

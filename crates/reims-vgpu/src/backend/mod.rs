@@ -4,7 +4,7 @@
 //!   **self-contained** in this crate (Metal via `metal`; Vulkan via `ash` +
 //!   [`vulkan::engine`]).
 //! - Draws, compute and blits do **not** come through this module. The live
-//!   seams are `runtime/metal_draw::try_metal2vulkan_draw` → [`vulkan::engine`]
+//!   seams are `runtime/draw::try_metal2vulkan_draw` → [`vulkan::engine`]
 //!   on the Vulkan rail and `metal::render::render_core_mrt` /
 //!   `metal::compute::compute_core` on the Metal rail; the runtime drives them
 //!   directly.

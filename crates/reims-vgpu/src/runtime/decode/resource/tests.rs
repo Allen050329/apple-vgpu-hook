@@ -974,7 +974,7 @@ fn linear_texture_geometry() {
 /// A descriptor naming no extent is not a one-by-one texture, and the three
 /// call sites that used to ask `has_width && has_height` now ask this.
 ///
-/// The sampled-source path in `metal_draw::vulkan` clamped both fields up
+/// The sampled-source path in `draw::vulkan` clamped both fields up
 /// with `.max(1)`, which sized a four-byte payload — satisfied by almost any
 /// buffer — and bound a single texel of it. Nothing above that could tell
 /// the result from a real bind.

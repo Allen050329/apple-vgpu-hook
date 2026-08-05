@@ -20,7 +20,7 @@ use super::{ChainAbandonDecline, StreamAccum, StreamDrawDrop};
 use crate::runtime::compute_exec::ComputeStatus;
 use crate::runtime::decode::compute::Kind as ComputeKind;
 use crate::runtime::decode::render::{AttachSubresource, ScissorRect};
-use crate::runtime::metal_draw::EncodeStatus;
+use crate::runtime::draw::EncodeStatus;
 use reims_vgpu_wire::ops::render as wire_render;
 
 /// Name a compute refusal at the rail boundary.
@@ -290,7 +290,7 @@ pub(super) fn note_depth_stencil_unsupported(
 
 /// Bands for the stated pass extent as a fraction of its attachment's area.
 ///
-/// Same seven bands as the scissor-union census in `metal_draw::vulkan`, so the
+/// Same seven bands as the scissor-union census in `draw::vulkan`, so the
 /// two are readable side by side — they answer the same question from two
 /// different sources, and the whole point is which of the two carries damage the
 /// other does not.
@@ -400,7 +400,7 @@ pub(super) fn note_pass_extent_coverage(pass_w: u64, pass_h: u64, surf_w: u32, s
     crate::runtime::drain::note_store_route(PASS_EXTENT_SLUGS[pass_extent_band(pct)]);
 }
 
-/// The bands, matching `metal_draw::vulkan::coverage_band` exactly.
+/// The bands, matching `draw::vulkan::coverage_band` exactly.
 ///
 /// Declared here rather than shared because that one is behind
 /// `backend-vulkan` and this census runs on every backend; the two are pinned

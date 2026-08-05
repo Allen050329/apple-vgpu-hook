@@ -1,9 +1,29 @@
-//! Attempt Metal draw encode for a resolved pipeline + color target.
+//! Encode one decoded draw for a resolved pipeline + colour target, on whichever
+//! backend this build has.
 //!
 //! Loads per-function MTLB containers from the object list, materializes stream
 //! binds (vertex/fragment buffers, optional index buffer, viewport/scissor),
-//! calls [`crate::backend::metal::render::render_core_mrt`], and writes the RGBA
-//! result into the type-11 mapping via [`mapping_write`].
+//! hands them to the backend, and writes the RGBA result into the type-11
+//! mapping via [`mapping_write`]. The encode call is
+//! [`crate::backend::metal::render::render_core_mrt`] on the Metal arm and
+//! `try_metal2vulkan_draw` into `backend::vulkan::engine` on the Vulkan one.
+//!
+//! # This module is not Metal-only, and its name used to say it was
+//!
+//! It was `metal_draw` until the composition was counted. The gated Vulkan half
+//! (`vulkan.rs`) is the largest file here by a factor of two, and the
+//! backend-independent halves — [`texture_view`], [`render_target`], and this
+//! file's own bind materialization — run on both arms on every draw. Only
+//! `metal_icb` and `depth_stencil` are genuinely Metal-side, and both carry
+//! their own gates.
+//!
+//! The fail-log event names emitted from this file (`metal_draw MissingPipeline`
+//! and its siblings) and the counters that count them (`metal_draws_ok`,
+//! `metal_draws_fail`) deliberately kept their spelling through that rename.
+//! They are operator-facing vocabulary that appears in already-recorded
+//! measurements, so respelling them would silently invalidate every reading
+//! taken before it. The module path and the log vocabulary are two different
+//! names, and only one of them was wrong.
 
 #[cfg(feature = "backend-vulkan")]
 use crate::backend::vulkan::engine::{DrawError, DrawPreparationDecline};
@@ -48,7 +68,7 @@ use crate::runtime::objects;
 
 // The Vulkan half of this path. Gated once here rather than per item, and
 // re-exported flat so callers keep naming its items
-// `crate::runtime::metal_draw::<name>`.
+// `crate::runtime::draw::<name>`.
 #[cfg(feature = "backend-vulkan")]
 mod vulkan;
 // Only for `exec`'s pass-extent census, which declares its own copy of these
@@ -70,7 +90,7 @@ pub use metal_icb::*;
 
 // The host-side depth/stencil attachment buffers. Gated once here, and not
 // re-exported flat — its items are this module's own working parts, not part of
-// `metal_draw`'s surface.
+// `runtime::draw`'s surface.
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 mod depth_stencil;
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
@@ -395,7 +415,7 @@ pub struct DrawEncodeRequest {
     /// `row_stride * height` at `colors[0].target_gva`.
     ///
     /// Resolved once per draw, before any GPU work, by
-    /// `metal_draw::vulkan::gva_alloc_generation`, and carried here so every
+    /// `draw::vulkan::gva_alloc_generation`, and carried here so every
     /// `TargetIdentity::Gva` this draw builds — the pinned Store identity, the
     /// cross-pass Load identity, the deferred window's stored copy — agrees on
     /// one `generation`. Two guest allocations that reuse one address at one

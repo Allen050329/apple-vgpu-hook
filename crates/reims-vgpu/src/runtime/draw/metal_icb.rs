@@ -3,7 +3,7 @@
 //!
 //! The whole module is gated on `all(backend-metal, target_os = "macos")` at
 //! its declaration in [`super`], which also re-exports these items flat so
-//! callers keep addressing them as `crate::runtime::metal_draw::<name>`. The
+//! callers keep addressing them as `crate::runtime::draw::<name>`. The
 //! `backend-vulkan` arm of `encode_icb_execute_and_writeback` is a stub that
 //! lives in [`super`], since it is the other half of the same entry point.
 //! `use super::*` pulls in the parent's imports, which this module shares.

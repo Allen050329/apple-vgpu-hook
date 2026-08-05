@@ -33,8 +33,8 @@ use crate::runtime::host::{HostMemory, HostOps};
 /// window pinned, and the deferred frame would be lost instead of landing.
 ///
 /// Single spelling for every consumer that starts from a window
-/// ([`flush_gva_one`], `metal_draw::vulkan::supersede_gva_window`,
-/// `metal_draw::vulkan::try_sample_deferred_gva`) so the three cannot drift
+/// ([`flush_gva_one`], `draw::vulkan::supersede_gva_window`,
+/// `draw::vulkan::try_sample_deferred_gva`) so the three cannot drift
 /// apart from the producer or from each other.
 #[cfg(feature = "backend-vulkan")]
 pub fn gva_window_identity(
@@ -121,7 +121,7 @@ pub fn gva_window_identity(
 ///
 /// Giving this rail `render_flush_gpu_direct`'s shape — guest pages as the
 /// copy's destination — would delete `gva_write_us`, a quarter of the flush. It
-/// cannot be done, because [`crate::runtime::metal_draw::host_cache_store_gva_layer`]
+/// cannot be done, because [`crate::runtime::draw::host_cache_store_gva_layer`]
 /// below is not optional. `surface_cache`'s GVA entry is the *only* place the
 /// frame survives the guest unmapping the VA — the wallpaper-retain contract —
 /// and `enforce_gva_cache_cap` refuses to evict any entry that still owes a
@@ -274,7 +274,7 @@ pub fn flush_gva_one<M: HostMemory + HostOps>(
         // dma-buf destination would delete and the round trip above is the one
         // it would keep, so the two readings are what choose between the builds.
         let write_started = std::time::Instant::now();
-        let written = crate::runtime::metal_draw::write_gva_rgba8_within(
+        let written = crate::runtime::draw::write_gva_rgba8_within(
             state,
             host,
             entry.task_id,
@@ -336,7 +336,7 @@ pub fn flush_gva_one<M: HostMemory + HostOps>(
     // one that has to be answered for rather than simply removed. What it costs
     // is what a reader has to weigh against whatever replaces it.
     let cache_started = std::time::Instant::now();
-    crate::runtime::metal_draw::host_cache_store_gva_layer(
+    crate::runtime::draw::host_cache_store_gva_layer(
         state,
         host,
         entry.task_id,

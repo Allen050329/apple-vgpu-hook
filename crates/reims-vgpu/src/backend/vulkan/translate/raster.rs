@@ -231,7 +231,7 @@ mod tests {
     /// Injectivity below proves no two values collide; it does not prove the
     /// table is not *rotated*. A rotation still round-trips and still renders —
     /// it just inverts occlusion for every 3D draw — so the mapping is pinned
-    /// arm by arm. (Moved here from `runtime/metal_draw/mod.rs`, which held a second
+    /// arm by arm. (Moved here from `runtime/draw/mod.rs`, which held a second
     /// copy of this table; the assertion outlived the duplicate.)
     #[test]
     fn compare_function_matches_the_metal_abi_order() {

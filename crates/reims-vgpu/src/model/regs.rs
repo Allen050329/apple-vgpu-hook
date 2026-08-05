@@ -122,7 +122,7 @@ pub const MAX_MAPPINGS: usize = 4096;
 
 /// Whether `mapping_id` names a mapping slot rather than "no mapping".
 ///
-/// Zero is the device-wide sentinel for an unbound mapping — `metal_draw`
+/// Zero is the device-wide sentinel for an unbound mapping — `runtime::draw`
 /// branches on `mapping_id == 0` in more than a dozen places to mean the
 /// attachment is addressed by GVA instead — so a record naming 0 is not a
 /// record naming slot 0, and creating `mappings[0]` for it produces state no
@@ -895,7 +895,7 @@ mod tests {
     /// The five `DeviceState` mutators and `mapper::capture_published_request`
     /// bounded the id from above only, so a guest MAP naming mapping 0 — which
     /// the mapper decodes straight out of the iosfc ring — would have created
-    /// `mappings[0]`. Every `metal_draw` reader treats `mapping_id == 0` as "this
+    /// `mappings[0]`. Every `runtime::draw` reader treats `mapping_id == 0` as "this
     /// attachment is addressed by GVA", so that entry is state nothing goes on
     /// to consult.
     #[test]

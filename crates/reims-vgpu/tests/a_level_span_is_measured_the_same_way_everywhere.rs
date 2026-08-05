@@ -9,8 +9,8 @@
 //! The refusal that produced dropped the WindowServer's whole composite draw, so
 //! window corners rendered square.
 //!
-//! That was fixed once, in `metal_draw::texture_view` and `runtime::mipmap`. It
-//! was not fixed in `metal_draw::load_linear_texture_rgba_at_level`, which is the
+//! That was fixed once, in `draw::texture_view` and `runtime::mipmap`. It
+//! was not fixed in `draw::load_linear_texture_rgba_at_level`, which is the
 //! same row-by-row reader on the other backend arm and kept `bpr * h` for months
 //! afterwards. Nothing could see it: the two are twin functions behind different
 //! `cfg`s, so no build compiles both, and the arm carrying the stale copy is
@@ -43,7 +43,7 @@ use std::path::Path;
 /// and then argued, which is the only way one should.
 ///
 /// **Keyed by function, not by file, and that is load-bearing.** The first draft
-/// of this list keyed on the file alone. `runtime/metal_draw/mod.rs` then held
+/// of this list keyed on the file alone. `runtime/draw/mod.rs` then held
 /// both an exempt writer *and* the reader this whole test was written for, so
 /// the file-wide exemption covered the bug: restoring `bpr * h` at the reader
 /// left the test green. It was caught only by putting the bug back and watching
@@ -55,14 +55,14 @@ use std::path::Path;
 /// itself.
 const WIDE_SPAN_EXEMPTIONS: &[(&str, &str, &str)] = &[
     (
-        "runtime/metal_draw/render_target.rs",
+        "runtime/draw/render_target.rs",
         "resolve_render_target",
         "its mip>0 arm bounds a render-target WRITE; whether the store writes \
          the last row's padding is unmeasured, and the wider span is the \
          fail-closed direction for a write",
     ),
     (
-        "runtime/metal_draw/vulkan.rs",
+        "runtime/draw/vulkan.rs",
         "load_linear_guest_memoized",
         "deliberately READS the padding: its memo compares the full native span \
          byte for byte, so a guest write into a row's trailing bytes has to be \

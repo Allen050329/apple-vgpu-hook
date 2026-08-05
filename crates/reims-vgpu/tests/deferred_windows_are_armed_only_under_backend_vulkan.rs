@@ -49,13 +49,13 @@ const ARM_CALLS: &[&str] = &[
 /// relying on.
 const ARM_SITES: &[(&str, &str, &str)] = &[
     (
-        "runtime/metal_draw/vulkan.rs",
+        "runtime/draw/vulkan.rs",
         ".compute_deferred_flush.insert(",
-        "the whole module: `metal_draw/mod.rs` declares it \
+        "the whole module: `draw/mod.rs` declares it \
          `#[cfg(feature = \"backend-vulkan\")] mod vulkan;`",
     ),
     (
-        "runtime/metal_draw/vulkan.rs",
+        "runtime/draw/vulkan.rs",
         ".arm_gva_deferred_window(",
         "the same module gate.",
     ),

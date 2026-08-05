@@ -315,7 +315,7 @@ pub struct DrawRequest {
     pub front_face_ccw: bool,
     /// Depth test + transient depth attachment. `None` (default) = no depth
     /// buffer, byte-identical to the pre-depth 2D path. Set only for a draw that
-    /// bound a non-trivial `MTLDepthStencilState` (see `metal_draw`).
+    /// bound a non-trivial `MTLDepthStencilState` (see `runtime::draw`).
     pub depth: Option<DepthState>,
     /// Fragment shader reads its destination pixel (Metal framebuffer fetch:
     /// an `air.render_target` INPUT param, translated as a `SubpassData` image

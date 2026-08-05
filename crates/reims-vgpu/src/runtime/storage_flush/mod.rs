@@ -55,7 +55,7 @@
 //! **Nothing can arm a window on such a build**, which is why three of those
 //! stubs are silently empty and the other four are fail-visible. Every
 //! production site that arms one is inside `backend-vulkan`-gated code — the
-//! two render Stores in `metal_draw::vulkan` (behind that module's own gate) and
+//! two render Stores in `draw::vulkan` (behind that module's own gate) and
 //! the two compute-storage arms in `compute_exec::execute_dispatch_linux`
 //! (behind the function's) — so:
 //!
