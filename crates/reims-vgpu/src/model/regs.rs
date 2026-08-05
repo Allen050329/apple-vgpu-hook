@@ -117,7 +117,37 @@ pub const fn is_child_channel(channel_id: u32) -> bool {
 /// Task ids run from 0, unlike mapping ids — see [`is_mapping_id`]. Task 0 is
 /// the task every type-4 surface this device has resolved lived in, and
 /// `objects::type4_probe_order` probes it first by name.
+///
+/// # The number is not derived, and the measurement is why that is tolerable
+///
+/// Unlike [`MAX_CHANNELS`], which is 32 because `active_child_mask` is a `u32`
+/// and every producer reaches it with `1u32 << channel_id`, nothing forces 256.
+/// A task id is a full `u32` on the wire — `decode_replace_physical` and every
+/// resource-list command read it with `ld32` — and past this bound
+/// `DeviceState::define_task` returns `false` and the task never exists, which
+/// loses every guest command that would have needed it.
+///
+/// What makes that acceptable is distance, and distance is measured rather than
+/// assumed. `DeviceState::max_task_id_seen` bands the *requested* reach and the
+/// `host_cache_levels` census publishes it beside the cap, because a refusal
+/// counter alone cannot tell a boot that stopped at id 12 from one that stopped
+/// at 255 — both read zero.
+///
+/// Driven x86/PCI boot, window-drag probe against Safari:
+/// `task_id_max=10 task_id_cap=256 mapping_id_max=42 mapping_id_cap=4096`, and
+/// no `model_*_id_range` refusal of any kind. That is 25x headroom on the task
+/// table and 97x on the mapping table.
+///
+/// So the fixed `[TaskEntry; MAX_TASKS]` array stays. Replacing it with a map
+/// keyed by the full `u32` would remove the refusal entirely, and it is the
+/// architecturally correct shape — but it is 177 indexing sites plus every
+/// helper that takes `&state.tasks` as a slice, and this reading says the bound
+/// is nowhere near. Do that work when the census says it is needed; the census
+/// is there so the question has an answer instead of an argument.
 pub const MAX_TASKS: usize = 256;
+/// See [`MAX_TASKS`] for why this is a measured bound rather than a derived one,
+/// and for the reading. Mapping ids start at 1: zero is the device-wide
+/// unbound sentinel — see [`is_mapping_id`].
 pub const MAX_MAPPINGS: usize = 4096;
 
 /// Whether `mapping_id` names a mapping slot rather than "no mapping".
