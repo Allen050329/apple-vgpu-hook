@@ -624,7 +624,16 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
                 },
             ));
         }
-        if attribute.step_rate == 0 {
+        // The rate is only a rule under the step functions that consume it.
+        // `Constant` is fetched once for the whole draw and pairs with a rate of
+        // zero — that is the spelling Metal requires, the decoder deliberately
+        // preserves it, and this binding's divisor is 0 whatever the rate says.
+        // Asking `rate == 0` alone declined that guest's draw outright, for a
+        // field nothing downstream reads. `contract::vertex_step` owns the pair.
+        if !crate::contract::vertex_step::step_rate_in_contract(
+            attribute.step_function.mtl_ordinal(),
+            attribute.step_rate,
+        ) {
             return Err(DrawError::DrawValidation(
                 DrawValidationDecline::ZeroVertexStepRate {
                     location: attribute.location,
@@ -3394,6 +3403,56 @@ mod tests {
         // Same request with CPU bytes passes.
         req.vertex_attributes[0].content = vec![0u8; 48 * 4].into();
         assert!(validate_v1(&req).is_ok());
+    }
+
+    /// One attribute, one step function, one rate — three requests that differ
+    /// only in the pair.
+    fn step_pair_req(step_function: VertexStepFunction, step_rate: u32) -> DrawRequest {
+        let mut req = DrawRequest {
+            width: 8,
+            height: 8,
+            vert_spirv: std::sync::Arc::new(vec![0]),
+            frag_spirv: std::sync::Arc::new(vec![0]),
+            vertex_count: 3,
+            ..DrawRequest::default()
+        };
+        req.vertex_attributes
+            .push(super::super::types::VertexAttributeResource {
+                location: 0,
+                binding: 0,
+                format: super::super::types::VertexAttributeFormat::Float4,
+                offset: 0,
+                stride: 48,
+                step_function,
+                step_rate,
+                content: vec![0u8; 48 * 4].into(),
+            });
+        req
+    }
+
+    /// A constant-rate attribute is spelled with a zero rate, and that is the
+    /// only step function it is spelled with.
+    ///
+    /// `MTLVertexBufferLayoutDescriptor.stepRate` must be 0 under
+    /// `MTLVertexStepFunctionConstant`, the decoder preserves a declared zero
+    /// for exactly that reason, and this binding's divisor is 0 whatever the
+    /// rate says — so declining the pair lost the whole draw over a field
+    /// nothing downstream reads. The Metal arm always asked for the pair; this
+    /// arm asked `rate == 0` alone. The sibling half of the assertion is what
+    /// keeps the repair from becoming "stop checking the rate".
+    #[test]
+    fn a_zero_step_rate_declines_under_every_step_function_but_constant() {
+        assert!(validate_v1(&step_pair_req(VertexStepFunction::Constant, 0)).is_ok());
+        for step in [
+            VertexStepFunction::PerVertex,
+            VertexStepFunction::PerInstance,
+        ] {
+            assert_eq!(
+                validation_slug(&step_pair_req(step, 0)),
+                "vk_draw_validate_zero_vertex_step_rate",
+                "{step:?} consumes the rate, so zero is still out of contract"
+            );
+        }
     }
 
     #[test]

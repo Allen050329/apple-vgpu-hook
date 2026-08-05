@@ -21,6 +21,7 @@ use crate::backend::metal::util::{
 };
 use crate::contract::extent::tight_image_bytes;
 use crate::contract::fnv::FNV_OFFSET_BASIS;
+use crate::contract::vertex_step::{step_rate_in_contract, MTL_VERTEX_STEP_FUNCTION_PER_INSTANCE};
 use foreign_types::ForeignType;
 use metal::*;
 use std::ptr;
@@ -341,7 +342,7 @@ fn find_or_add_attr_slot(
     }
     let step_function = attr.step_function;
     let step_rate = attr.step_rate;
-    if step_function > MTLVertexStepFunction::PerInstance as u32 {
+    if step_function > MTL_VERTEX_STEP_FUNCTION_PER_INSTANCE {
         set_err(err, "unsupported vertex attribute step state");
         return Err(
             Status::args("metal_render_vertex_step_function_unsupported")
@@ -349,12 +350,11 @@ fn find_or_add_attr_slot(
                 .field("step", step_function),
         );
     }
-    // A rate of zero is legal for exactly one step function and required by it:
-    // `MTLVertexStepFunctionConstant` fetches the attribute once for the whole
-    // draw, and `MTLVertexBufferLayoutDescriptor.stepRate` must be 0 to say so.
-    // Under any other step function a zero rate advances nothing and Metal
-    // rejects the descriptor, so refuse it here by name instead.
-    if step_rate == 0 && step_function != MTLVertexStepFunction::Constant as u32 {
+    // A rate of zero is legal for exactly one step function and required by it,
+    // which `contract::vertex_step` states beside the ordinals. Under any other
+    // step function a zero rate advances nothing and `MTLVertexDescriptor`
+    // validation rejects the descriptor, so refuse it here by name instead.
+    if !step_rate_in_contract(step_function, step_rate) {
         set_err(err, "unsupported vertex attribute step state");
         return Err(Status::args("metal_render_vertex_step_rate_zero")
             .field("location", attr.location)

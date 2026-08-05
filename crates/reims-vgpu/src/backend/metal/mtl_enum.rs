@@ -201,6 +201,41 @@ checked_ordinal! {
     [Constant, PerVertex, PerInstance, PerPatch, PerPatchControlPoint]
 }
 
+// The generated block above proves this table self-consistent — that every
+// variant round-trips and no undeclared ordinal converts — and it cannot prove
+// a variant sits at the *number Apple assigned it*, because nothing outside the
+// `metal` crate is named in it. That gap is not hypothetical here: the sibling
+// `MTLStepFunction` below is measured to have six of its nine names on the wrong
+// discriminants in this very crate version, and `render.rs` used to express "no
+// step function above PerInstance" as `> MTLVertexStepFunction::PerInstance as
+// u32` — a band whose top was whatever the crate happened to say.
+//
+// The five ordinals come from `MTLVertexDescriptor.h` and are declared in
+// `contract::vertex_step`, where the shared step/rate rule reads them. Pinning
+// them here is what makes a `metal` bump that renumbers this enum a build
+// failure, on every arm that compiles the file including the cross-compiled
+// Metal clippy run.
+const _: () = assert!(
+    MTLVertexStepFunction::Constant as u32
+        == crate::contract::vertex_step::MTL_VERTEX_STEP_FUNCTION_CONSTANT
+);
+const _: () = assert!(
+    MTLVertexStepFunction::PerVertex as u32
+        == crate::contract::vertex_step::MTL_VERTEX_STEP_FUNCTION_PER_VERTEX
+);
+const _: () = assert!(
+    MTLVertexStepFunction::PerInstance as u32
+        == crate::contract::vertex_step::MTL_VERTEX_STEP_FUNCTION_PER_INSTANCE
+);
+const _: () = assert!(
+    MTLVertexStepFunction::PerPatch as u32
+        == crate::contract::vertex_step::MTL_VERTEX_STEP_FUNCTION_PER_PATCH
+);
+const _: () = assert!(
+    MTLVertexStepFunction::PerPatchControlPoint as u32
+        == crate::contract::vertex_step::MTL_VERTEX_STEP_FUNCTION_PER_PATCH_CONTROL_POINT
+);
+
 /// `MTLStepFunction` by ordinal, indexed by Apple's numbering.
 ///
 /// This is the one conversion here that cannot name its variants, because

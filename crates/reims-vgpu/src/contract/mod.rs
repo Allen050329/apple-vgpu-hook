@@ -14,5 +14,6 @@ pub mod gva_resolve;
 pub mod iosurface_pages;
 pub mod pass_action;
 pub mod pixel_format;
+pub mod vertex_step;
 
 pub(crate) use checked::*;
