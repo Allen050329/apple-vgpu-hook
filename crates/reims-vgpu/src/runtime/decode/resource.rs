@@ -94,9 +94,6 @@ pub const TYPE7_OBJECT_ICB: u32 = w_icb::OPCODE_NEW_INDIRECT_COMMAND_BUFFER;
 pub const TYPE7_FIRST_TLVS: usize = 16;
 /// Serialized ICB descriptor length (allocateOperationBytes 0x58).
 pub const ICB_DESC_LEN: usize = w_icb::NEW_INDIRECT_COMMAND_BUFFER_TOTAL_LEN as usize;
-pub const ICB_DESC_TAG: usize = 0;
-pub const ICB_DESC_DECLARED_LEN: usize = 4;
-pub const ICB_DESC_COMMAND_TYPES: usize = OP_HDR + offset_of!(w_icb::NewIcbBody, command_types);
 /// Per-stage max bind counts are single bytes (PGSerializer create body).
 /// `newIndirectCommandBufferWithDescriptor:…` strb order:
 /// +0xc vertex · +0xd fragment · +0xe kernel · +0xf object · +0x10 mesh ·
@@ -206,7 +203,8 @@ pub const ICB_DESC_MAX_COMMAND_COUNT: usize =
 pub const ICB_DESC_OPTIONS: usize = OP_HDR + offset_of!(w_icb::NewIcbBody, options);
 /// The two bytes above [`ICB_DESC_OPTIONS`], which the serializer never writes.
 /// Named so a future widening has to delete a constant that says why not.
-pub const ICB_DESC_OPTIONS_UNWRITTEN: usize =
+#[cfg(test)]
+const ICB_DESC_OPTIONS_UNWRITTEN: usize =
     OP_HDR + offset_of!(w_icb::NewIcbBody, never_written_tail);
 /// Command-type values written by PGSerializerIndirect*Command fills.
 pub const ICB_CMD_TYPE_DRAW: u32 = 0x1;
@@ -712,13 +710,17 @@ pub const HEAP_TEXTURE_USE_OFFSET_BIT: u8 = 0x1;
 // moves by the eight bytes the wide descriptor adds.
 pub const HEAP_TEXTURE_WIDE_OPCODE: u32 = w_heap::OPCODE_NEW_HEAP_TEXTURE_WIDE;
 pub const HEAP_TEXTURE_WIDE_LEN: usize = w_heap::NEW_HEAP_TEXTURE_WIDE_TOTAL_LEN as usize;
-pub const HEAP_TEXTURE_WIDE_HEAP_REF: usize =
+#[cfg(test)]
+const HEAP_TEXTURE_WIDE_HEAP_REF: usize =
     OP_HDR + offset_of!(w_heap::NewHeapTextureWideBody, heap_ref);
-pub const HEAP_TEXTURE_WIDE_DESCRIPTOR: usize =
+#[cfg(test)]
+const HEAP_TEXTURE_WIDE_DESCRIPTOR: usize =
     OP_HDR + offset_of!(w_heap::NewHeapTextureWideBody, desc);
-pub const HEAP_TEXTURE_WIDE_USE_OFFSET: usize =
+#[cfg(test)]
+const HEAP_TEXTURE_WIDE_USE_OFFSET: usize =
     OP_HDR + offset_of!(w_heap::NewHeapTextureWideBody, use_offset_bits);
-pub const HEAP_TEXTURE_WIDE_OFFSET: usize =
+#[cfg(test)]
+const HEAP_TEXTURE_WIDE_OFFSET: usize =
     OP_HDR + offset_of!(w_heap::NewHeapTextureWideBody, offset);
 
 // Opcode 9 is NOT a view: it is a buffer-backed texture (`newTextureWithBuffer:
@@ -728,23 +730,26 @@ pub const HEAP_TEXTURE_WIDE_OFFSET: usize =
 // self-ref@8, source-ref@0xc); the source ref @0xc is a BUFFER, not a texture,
 // and the body is {u64 offset, u64 bytesPerRow, embedded MTLTextureDescriptor}.
 pub const TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE: u32 = w_backed::OPCODE_BUFFER_TEXTURE;
-pub const BUF_TEX_DESC_BUFFER_REF: usize =
+#[cfg(test)]
+const BUF_TEX_DESC_BUFFER_REF: usize =
     OP_HDR + offset_of!(w_backed::BufferTextureBody, buffer_ref);
-pub const BUF_TEX_DESC_OFFSET: usize = OP_HDR + offset_of!(w_backed::BufferTextureBody, offset);
-pub const BUF_TEX_DESC_BYTES_PER_ROW: usize =
+#[cfg(test)]
+const BUF_TEX_DESC_OFFSET: usize = OP_HDR + offset_of!(w_backed::BufferTextureBody, offset);
+#[cfg(test)]
+const BUF_TEX_DESC_BYTES_PER_ROW: usize =
     OP_HDR + offset_of!(w_backed::BufferTextureBody, bytes_per_row);
-// Base of the embedded `PGSerializedTextureDescriptor`. One offset,
-// because there is one decoder: everything inside it is at that decoder's own
+// The embedded `PGSerializedTextureDescriptor` is not named here at all: there
+// is one decoder for it and everything inside it is at that decoder's own
 // offsets. The seven that used to be named here — flags, width, height, depth,
 // mip count, sample count, array length — were a second copy of a layout
 // `heap_query` already had, and a second copy is a second thing to get wrong.
-pub const BUF_TEX_DESC_BODY: usize = OP_HDR + offset_of!(w_backed::BufferTextureBody, desc);
 pub const BUF_TEX_MIN_LEN: usize = w_backed::BUFFER_TEXTURE_TOTAL_LEN as usize;
 
 // The buffer-backed record's `TextureDescriptor2` form. The three fields before
 // the descriptor keep their offsets; only the descriptor widens.
 pub const TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE_WIDE: u32 = w_backed::OPCODE_BUFFER_TEXTURE_WIDE;
-pub const BUF_TEX_WIDE_DESC_BODY: usize =
+#[cfg(test)]
+const BUF_TEX_WIDE_DESC_BODY: usize =
     OP_HDR + offset_of!(w_backed::BufferTextureWideBody, desc);
 pub const BUF_TEX_WIDE_LEN: usize = w_backed::BUFFER_TEXTURE_WIDE_TOTAL_LEN as usize;
 // MTLTextureType values (Metal.framework Headers/MTLTextureType.h).
@@ -851,7 +856,6 @@ pub const FUNCTION_DESC_BLOB_GVA: usize = 0;
 pub const FUNCTION_DESC_BLOB_SIZE: usize = 8;
 pub const FUNCTION_DESC_FUNCTION_ID: usize = 0x14;
 pub const FUNCTION_DESC_MIN_LEN: usize = 12;
-pub const FUNCTION_DESC_READ_LEN: usize = 32;
 
 /// Compact first-subrecord tags (u8) on type-7 pipelines.
 pub const PIPELINE_TAG_KERNEL_FUNC: u8 = 0x00;
@@ -937,11 +941,23 @@ pub struct DepthStencilDescriptor {
     pub back_face: DepthStencilFace,
 }
 
-pub const DEPTH_STENCIL_DESC_LEN: usize = 40;
-pub const DEPTH_STENCIL_DESC_STATE_BITS: usize = 12;
-pub const DEPTH_STENCIL_DESC_ID: usize = 8;
-pub const DEPTH_STENCIL_DESC_FRONT_FACE: usize = 16;
-pub const DEPTH_STENCIL_DESC_BACK_FACE: usize = 28;
+/// Where the depth-stencil creation record puts each field, for the synthetic
+/// buffers the tests below assemble.
+///
+/// Derived from the wire view `decode_depth_stencil_descriptor` reads, not
+/// restated beside it: these were five literals ported from a C header, and a
+/// literal cannot notice when the struct it transcribes is re-derived. Now a
+/// rename or a reordering in `w_ds` fails this build instead of silently
+/// leaving the tests assembling a record shaped like last year's.
+#[cfg(test)]
+const DEPTH_STENCIL_DESC_LEN: usize = w_ds::NEW_DEPTH_STENCIL_TOTAL_LEN as usize;
+#[cfg(test)]
+const DEPTH_STENCIL_DESC_STATE_BITS: usize =
+    OP_HDR + offset_of!(w_ds::DepthStencilBody, depth_state);
+#[cfg(test)]
+const DEPTH_STENCIL_DESC_ID: usize = OP_HDR + offset_of!(w_ds::DepthStencilBody, object_ref);
+#[cfg(test)]
+const DEPTH_STENCIL_DESC_FRONT_FACE: usize = OP_HDR + offset_of!(w_ds::DepthStencilBody, front);
 pub const DEPTH_STENCIL_DEPTH_COMPARE_MASK: u32 = 0x7;
 pub const DEPTH_STENCIL_DEPTH_WRITE: u32 = 1 << 3;
 pub const DEPTH_STENCIL_FRONT_STENCIL_ENABLED: u32 = 1 << 4;
