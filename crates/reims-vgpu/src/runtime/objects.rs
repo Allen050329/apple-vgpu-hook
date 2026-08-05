@@ -828,6 +828,65 @@ fn synthesize_device_desc_from_type4(surf: &Type4Surface) -> Vec<u8> {
     device_desc
 }
 
+/// Name the object-list geometry behind a refused entry read.
+///
+/// `gva_mem::read_task_gva_by_id` already reports the refusal and which of the
+/// walk's checks produced it, but it is generic over every caller and can only
+/// name the address. For this caller the address is *derived* — `(pfn <<
+/// page_shift) + ref * entry_len` — and the address alone cannot say which of
+/// its three inputs is the surprising one.
+///
+/// That distinction was the question, and this line answered it. A driven x86
+/// boot emits `gva_zero_pfn` from this site for tasks 2..=9, and the geometry
+/// behind every one is `list_pfn=1 list_count=1048576` — the guest's own
+/// `SetObjectList` values, taken straight off the wire by
+/// `drain::apply_set_object_list`, which invents nothing. So the guest reserves
+/// a million-slot object list at task-virtual page 1 and maps its pages lazily,
+/// and a lookup that lands on an unpopulated page is the resolver saying "the
+/// guest has not said yet". That is expected control flow, `None` is the right
+/// answer, and no guest work is lost.
+///
+/// Worth knowing because the address alone reads like the opposite. `pfn = 1`
+/// with a million slots is precisely the pair `TaskEntry::define` used to
+/// *fabricate* for tasks with no list — `model::state` documents removing it,
+/// after it caused this device to walk a neighbouring task's page table and
+/// decode its entry as this task's. Seeing those two numbers again invites the
+/// conclusion that the fabrication is back. It is not: they are what the guest
+/// publishes, which is presumably where the fabricated defaults were copied from.
+///
+/// Off-channel and latched per task: expected control flow stays quiet, and the
+/// measurement above is what establishes it is expected. One line per task per
+/// boot (eight on that run), alongside the one the walker already emits per
+/// (reason, task, site).
+fn note_list_entry_unreadable(
+    task_id: u32,
+    ref_: u32,
+    task: &crate::model::TaskEntry,
+    entry_gva: u64,
+) {
+    if !crate::observe::first_sight("object_list_entry_unreadable", u64::from(task_id)) {
+        return;
+    }
+    crate::observe::off(list_entry_unreadable_detail(task_id, ref_, task, entry_gva));
+}
+
+/// The line [`note_list_entry_unreadable`] emits, built separately so a test can
+/// assert the geometry reaches it without going through the always-on sink.
+fn list_entry_unreadable_detail(
+    task_id: u32,
+    ref_: u32,
+    task: &crate::model::TaskEntry,
+    entry_gva: u64,
+) -> String {
+    format!(
+        "object_list_entry_unreadable task={task_id} ref={ref_} gva={entry_gva:#x} \
+         list_pfn={} list_count={} entry_len={OBJECT_LIST_ENTRY_LEN} \
+         (the walker's own refusal names the check; this names the three inputs \
+          the address was built from, which it cannot see)",
+        task.object_list_pfn, task.object_list_count
+    )
+}
+
 /// Lookup one object-list slot for `task_id` / `ref_`.
 pub fn lookup_list_entry<M: HostMemory>(
     state: &DeviceState,
@@ -845,7 +904,7 @@ pub fn lookup_list_entry<M: HostMemory>(
     let off = list_object_entry_offset(ref_, task.object_list_count)?;
     let entry_gva = ((task.object_list_pfn as u64) << state.page_shift).checked_add(off)?;
     let mut raw = [0u8; OBJECT_LIST_ENTRY_LEN];
-    gva_mem::read_task_gva_by_id(
+    if gva_mem::read_task_gva_by_id(
         host,
         &state.tasks,
         task_id,
@@ -853,7 +912,11 @@ pub fn lookup_list_entry<M: HostMemory>(
         &mut raw,
         state.page_shift,
     )
-    .ok()?;
+    .is_err()
+    {
+        note_list_entry_unreadable(task_id, ref_, task, entry_gva);
+        return None;
+    }
     let e = decode_list_object_entry(&raw).ok()?;
     if e.descriptor_length == 0 || e.descriptor_gva == 0 {
         return None;
@@ -2519,6 +2582,48 @@ mod tests {
         assert!(
             line.contains(&format!("walk=[{walk}]")),
             "the refusal must carry the walk diagnosis verbatim, got {line}"
+        );
+    }
+
+    /// A refused object-list entry read names the three inputs its address came
+    /// from, not just the address.
+    ///
+    /// `gva_mem`'s own refusal can only print the gva, because it is generic over
+    /// every caller. Here the gva is derived — `(list_pfn << page_shift) +
+    /// ref * entry_len` — and a driven x86 boot emits ten of these all reading
+    /// `gva=0x11b0`, which is `pfn = 1, ref = 36` and is equally consistent with
+    /// the guest not having mapped its list yet and with this device resolving a
+    /// ref against the wrong task. The address alone cannot separate those; the
+    /// inputs can, which is why they have to be on the line.
+    ///
+    /// Asserts the fields rather than the prose, so rewording the parenthetical
+    /// does not fail it.
+    #[test]
+    fn a_refused_object_list_entry_names_the_geometry_behind_its_address() {
+        let task = crate::model::TaskEntry {
+            active: true,
+            length: 0x1000,
+            directory_pfn: 2,
+            object_list_pfn: 1,
+            object_list_count: 64,
+        };
+        let entry_gva = (1u64 << PAGE_SHIFT_X86) + 36 * OBJECT_LIST_ENTRY_LEN as u64;
+        let line = list_entry_unreadable_detail(3, 36, &task, entry_gva);
+
+        assert!(line.contains("task=3"), "{line}");
+        assert!(line.contains("ref=36"), "{line}");
+        assert!(line.contains("gva=0x11b0"), "{line}");
+        assert!(
+            line.contains("list_pfn=1"),
+            "the pfn the address was built from must be on the line: {line}"
+        );
+        assert!(
+            line.contains("list_count=64"),
+            "the count that admitted this ref must be on the line: {line}"
+        );
+        assert!(
+            line.contains("entry_len=12"),
+            "the stride the offset was scaled by must be on the line: {line}"
         );
     }
 
