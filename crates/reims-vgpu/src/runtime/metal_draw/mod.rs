@@ -2046,21 +2046,17 @@ fn load_linear_raw<M: HostMemory + HostOps>(
     if texture_ref == 0 || width == 0 || height == 0 || row_bytes == 0 || dst_stride < row_bytes {
         return false;
     }
-    let entry = match objects::lookup_list_entry(state, host, task_id, texture_ref) {
-        Some(e) => e,
-        None => return false,
-    };
-    if entry.object_type != OBJECT_TYPE_TEXTURE && entry.object_type != OBJECT_TYPE_TEXTURE_VARIANT
-    {
+    let Ok((_entry, desc_bytes)) = objects::resolve_descriptor(
+        state,
+        host,
+        task_id,
+        texture_ref,
+        &[OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_VARIANT],
+    ) else {
         return false;
-    }
-    let desc_bytes = match objects::read_descriptor(state, host, task_id, &entry) {
-        Some(d) => d,
-        None => return false,
     };
-    let tex = match decode_texture_descriptor(&desc_bytes) {
-        Ok(t) => t,
-        Err(_) => return false,
+    let Ok(tex) = decode_texture_descriptor(&desc_bytes) else {
+        return false;
     };
     let stride_covers_row = tex
         .declared_row_stride()
@@ -2842,12 +2838,14 @@ fn load_linear_texture_rgba_at_level<M: HostMemory + HostOps>(
     level: u32,
     format_override: Option<u16>,
 ) -> Option<(u32, u32, Vec<u8>)> {
-    let entry = objects::lookup_list_entry(state, host, task_id, texture_ref)?;
-    if entry.object_type != OBJECT_TYPE_TEXTURE && entry.object_type != OBJECT_TYPE_TEXTURE_VARIANT
-    {
-        return None;
-    }
-    let desc_bytes = objects::read_descriptor(state, host, task_id, &entry)?;
+    let (_entry, desc_bytes) = objects::resolve_descriptor(
+        state,
+        host,
+        task_id,
+        texture_ref,
+        &[OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_VARIANT],
+    )
+    .ok()?;
     let tex = decode_texture_descriptor(&desc_bytes).ok()?;
     // A descriptor that declares no pixel format is not a texture this can
     // sample; the field's own value is read below only once that is settled.

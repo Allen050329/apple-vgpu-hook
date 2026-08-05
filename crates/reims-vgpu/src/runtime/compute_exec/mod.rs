@@ -694,11 +694,9 @@ fn buffer_gva_size<M: HostMemory + HostOps>(
     if buffer_ref == 0 {
         return None;
     }
-    let entry = objects::lookup_list_entry(state, host, task_id, buffer_ref)?;
-    if entry.object_type != OBJECT_TYPE_BUFFER {
-        return None;
-    }
-    let desc_bytes = objects::read_descriptor(state, host, task_id, &entry)?;
+    let (_entry, desc_bytes) =
+        objects::resolve_descriptor(state, host, task_id, buffer_ref, &[OBJECT_TYPE_BUFFER])
+            .ok()?;
     let desc = crate::runtime::decode::resource::decode_buffer_descriptor(&desc_bytes).ok()?;
     // Product x86 page_shift=12; arm64e=14. Never use arm-only RESOURCE_PAGE_SHIFT
     // default on the live path (compute GuestIo Unmapped class serial-234118).
