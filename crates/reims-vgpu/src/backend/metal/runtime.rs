@@ -26,6 +26,16 @@ pub fn system_device() -> Option<&'static Device> {
         .ok()
 }
 
+/// The selected `MTLDevice`'s name.
+///
+/// Gated with the test that reads it, because **no product path on this arm
+/// reports which GPU was selected.** The Vulkan arm emits it in its `vk_caps`
+/// line (`caps::Snapshot::selection_line`); this arm has the string available
+/// and never says it, so a Metal boot's log cannot answer "which device did we
+/// pick" at all. That is an observability gap on a pathway no Linux host can
+/// boot — recorded here rather than filled, since adding an emission is a
+/// behaviour change that would land unverified.
+#[cfg(test)]
 pub fn system_device_name() -> Option<String> {
     system_device().map(|d| d.name().to_string())
 }
