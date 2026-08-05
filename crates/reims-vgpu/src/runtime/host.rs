@@ -1455,6 +1455,64 @@ pub fn read_u32<M: HostMemory>(mem: &M, gpa: u64) -> Result<u32, MemError> {
 mod tests {
     use super::*;
 
+    /// The ABI header's action table agrees with [`HostActionKind`], and still
+    /// leaves 7 retired.
+    ///
+    /// This is the discriminant both shims switch on in `apply_action`, and it
+    /// is the highest-stakes table crossing the boundary: a drift does not fail
+    /// the pop, it runs the *wrong handler* for a real action — an IRQ pulse
+    /// taken as a scanout, a window close taken as a cursor update. Nothing
+    /// compared the two spellings until this test.
+    ///
+    /// 7 is asserted absent rather than skipped. It named a pre-host-window
+    /// GL/dmabuf scanout action that exists on neither side now, and every
+    /// discriminant above it is written out precisely so removing it did not
+    /// renumber the wire. A header that quietly reuses 7 for something new would
+    /// reintroduce the renumbering this enum's comment exists to prevent.
+    #[test]
+    fn the_abi_header_agrees_on_the_host_action_table() {
+        use crate::qemu::abi::header_define as define;
+        for (name, kind) in [
+            ("REIMS_VGPU_HOST_ACTION_NONE", HostActionKind::None),
+            ("REIMS_VGPU_HOST_ACTION_IRQ_GFX", HostActionKind::IrqGfxPulse),
+            (
+                "REIMS_VGPU_HOST_ACTION_IRQ_IOSFC",
+                HostActionKind::IrqIosfcPulse,
+            ),
+            (
+                "REIMS_VGPU_HOST_ACTION_SCANOUT",
+                HostActionKind::ScanoutUpdate,
+            ),
+            ("REIMS_VGPU_HOST_ACTION_CURSOR", HostActionKind::CursorUpdate),
+            ("REIMS_VGPU_HOST_ACTION_TRACE", HostActionKind::Trace),
+            (
+                "REIMS_VGPU_HOST_ACTION_CURSOR_GLYPH",
+                HostActionKind::CursorGlyph,
+            ),
+            ("REIMS_VGPU_HOST_ACTION_INPUT_KEY", HostActionKind::InputKey),
+            (
+                "REIMS_VGPU_HOST_ACTION_INPUT_POINTER_MOVE",
+                HostActionKind::InputPointerMove,
+            ),
+            (
+                "REIMS_VGPU_HOST_ACTION_INPUT_POINTER_BUTTON",
+                HostActionKind::InputPointerButton,
+            ),
+            (
+                "REIMS_VGPU_HOST_ACTION_WINDOW_CLOSED",
+                HostActionKind::WindowClosed,
+            ),
+        ] {
+            assert_eq!(
+                define(name),
+                kind as u32,
+                "{name} has drifted from HostActionKind::{kind:?}; the shims \
+                 would run the wrong handler for this action"
+            );
+            assert_ne!(define(name), 7, "{name} took the retired wire value 7");
+        }
+    }
+
     /// A generation, not a consumed flag: reading it twice must not change the
     /// answer.
     ///
