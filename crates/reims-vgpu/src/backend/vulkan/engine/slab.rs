@@ -275,9 +275,19 @@ const SMALL_CLASS_MAX: u64 = 256 << 10;
 /// re-allocate, and iGPU-friendly (every resident block is real RAM).
 const SMALL_SLAB_SIZE: u64 = 8 << 20;
 
-/// Keep at most this many fully-empty shared blocks resident before freeing the
-/// next emptied block back to the driver. Absorbs steady-state churn without
-/// letting the reverse of a fullscreen toggle re-pay the block allocation.
+/// Keep at most this many fully-empty shared blocks **of each size class**
+/// resident before freeing the next emptied block back to the driver. Absorbs
+/// steady-state churn without letting the reverse of a fullscreen toggle re-pay
+/// the block allocation.
+///
+/// Per class, because a carve only reuses a block of its own class
+/// ([`MemBlock::small`]). A budget counted across both let two empty 64 MiB
+/// large blocks satisfy it while the next emptied small block was handed
+/// straight back — so the small working set, which
+/// [`MemBlock::small`] describes as the *stable* one, re-paid an 8 MiB
+/// `vkAllocateMemory` on its next carve. That is the allocation this budget
+/// exists to prevent. [`super::host_slab`] reached the same conclusion first and
+/// states it at its own `empty_block_victims`.
 const SLAB_KEEP_EMPTY: usize = 2;
 
 /// A live sub-allocation handed out by [`SlabPool::acquire`]: which block, at
@@ -601,45 +611,41 @@ impl SlabPool {
             .as_mut()
             .expect("release preflight proved the slab block exists");
         b.plan.release(offset, size);
-        let (empty, dedicated) = (b.plan.is_empty(), b.dedicated);
+        let (empty, dedicated, small) = (b.plan.is_empty(), b.dedicated, b.small);
         if !self.check_block(idx) {
             // A corrupt release poisoned the block; leak it (already logged).
             return;
         }
-        if empty {
-            let empties = self
-                .blocks
-                .iter()
-                .filter(
-                    |s| matches!(s, Some(b) if !b.dedicated && !b.poisoned && b.plan.is_empty()),
-                )
-                .count();
-            if dedicated || empties > SLAB_KEEP_EMPTY {
-                if let Some(b) = self.blocks[idx].take() {
-                    device.free_memory(b.memory, None);
-                    self.block_frees += 1;
-                    crate::observe::off(format!(
-                        "slab_block ev=free block_allocs={} block_frees={} sub_allocs={} live={}",
-                        self.block_allocs,
-                        self.block_frees,
-                        self.sub_allocs,
-                        self.live.len(),
-                    ));
-                }
+        if empty && (dedicated || self.empty_spares(small) > SLAB_KEEP_EMPTY) {
+            if let Some(b) = self.blocks[idx].take() {
+                device.free_memory(b.memory, None);
+                self.block_frees += 1;
+                crate::observe::off(format!(
+                    "slab_block ev=free block_allocs={} block_frees={} sub_allocs={} live={}",
+                    self.block_allocs,
+                    self.block_frees,
+                    self.sub_allocs,
+                    self.live.len(),
+                ));
             }
         }
     }
 
     /// Free fully-empty shared blocks beyond `keep`, returning the count freed.
     ///
-    /// [`release_range`] retains `SLAB_KEEP_EMPTY` empty blocks to absorb
-    /// steady-state churn without re-paying a `vkAllocateMemory` on the reverse
-    /// of a fullscreen toggle — but it only runs on an image *release*, so at
-    /// settled idle (no releases) those empty blocks sit resident forever (each a
-    /// whole `SLAB_SIZE` of held VRAM). The idle drain calls this to release them
-    /// down to a single spare. Keeping one empty means a workload that cycles a
+    /// `keep` is per size class, matching [`Self::empty_block_victims`].
+    ///
+    /// [`release_range`] retains `SLAB_KEEP_EMPTY` empty blocks per class to
+    /// absorb steady-state churn without re-paying a `vkAllocateMemory` on the
+    /// reverse of a fullscreen toggle — but it only runs on an image *release*,
+    /// so at settled idle (no releases) those empty blocks sit resident forever
+    /// (each a whole `SLAB_SIZE` of held VRAM). The idle drain calls this to
+    /// release them. Keeping one empty per class means a workload that cycles a
     /// single block empty↔full (one fullscreen toggle) never re-allocates; only
-    /// genuinely surplus empties are returned to the driver.
+    /// genuinely surplus empties are returned to the driver. The engine passes
+    /// `IDLE_SLAB_KEEP_EMPTY`, which is 0 — at that value every empty block goes
+    /// and the class split decides nothing, so the split is load-bearing on the
+    /// release path rather than here.
     ///
     /// Never touches dedicated or poisoned blocks (a dedicated block already
     /// frees itself the moment it empties; a poisoned one is deliberately leaked).
@@ -666,23 +672,44 @@ impl SlabPool {
         freed
     }
 
-    /// Indices of surplus empty shared blocks to free (every empty non-dedicated,
-    /// non-poisoned block beyond the first `keep`). Pure — split out so the
-    /// selection is unit-testable without a device.
-    fn empty_block_victims(&self, keep: usize) -> Vec<usize> {
-        let empties: Vec<usize> = self
-            .blocks
+    /// How many fully-empty shared blocks of one size class are resident.
+    ///
+    /// The class is the point. [`MemBlock::small`]'s own doc records that a
+    /// carve only reuses a block of its own class, so an empty block of the
+    /// other class is not a spare for this one — counting it lets the budget be
+    /// satisfied by memory the next carve cannot touch. The classes are also
+    /// nothing alike in cost: [`SLAB_SIZE`] is 64 MiB against
+    /// [`SMALL_SLAB_SIZE`]'s 8 MiB.
+    fn empty_spares(&self, small: bool) -> usize {
+        self.blocks
             .iter()
-            .enumerate()
-            .filter_map(|(i, s)| match s {
-                Some(b) if !b.dedicated && !b.poisoned && b.plan.is_empty() => Some(i),
-                _ => None,
+            .filter(|s| {
+                matches!(s, Some(b)
+                    if !b.dedicated && !b.poisoned && b.small == small && b.plan.is_empty())
             })
-            .collect();
-        if empties.len() <= keep {
-            return Vec::new();
+            .count()
+    }
+
+    /// Indices of surplus empty shared blocks to free — `keep` spares **of each
+    /// size class**, not `keep` in total.
+    ///
+    /// Same rule and same reason as
+    /// [`super::host_slab::HostSlabPool::empty_block_victims`], which is where
+    /// it was written down first. Pure — split out so the selection is
+    /// unit-testable without a device.
+    fn empty_block_victims(&self, keep: usize) -> Vec<usize> {
+        let mut victims = Vec::new();
+        for class in [true, false] {
+            let empties = self.blocks.iter().enumerate().filter_map(|(i, s)| match s {
+                Some(b) if !b.dedicated && !b.poisoned && b.small == class && b.plan.is_empty() => {
+                    Some(i)
+                }
+                _ => None,
+            });
+            victims.extend(empties.skip(keep));
         }
-        empties[keep..].to_vec()
+        victims.sort_unstable();
+        victims
     }
 
     /// Verify the block's free-list invariant after a mutation; on violation,
@@ -848,6 +875,83 @@ crate::observe::decline_display!(SlabDecline);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A spare of one size class is not a spare for the other.
+    ///
+    /// `MemBlock::small` says a carve only reuses a block of its own class, so
+    /// an empty large block does nothing for a small carve. The budget used to
+    /// be counted across both: two empty 64 MiB large blocks satisfied
+    /// `SLAB_KEEP_EMPTY`, and the next emptied 8 MiB small block was handed back
+    /// to the driver — so the small working set, which `MemBlock::small` calls
+    /// the stable one, re-paid a `vkAllocateMemory` on its next carve. That is
+    /// the allocation the budget exists to prevent.
+    ///
+    /// The same assertions `host_slab`'s `the_empty_spare_budget_is_per_size_class`
+    /// makes, on the allocator that did not have them.
+    #[test]
+    fn the_empty_spare_budget_is_per_size_class() {
+        let block = |small: bool| {
+            Some(MemBlock {
+                memory: vk::DeviceMemory::null(),
+                plan: BlockPlan::new(1024),
+                mem_type: 0,
+                dedicated: false,
+                small,
+                poisoned: false,
+            })
+        };
+        let pool = SlabPool {
+            blocks: vec![block(true), block(false), block(true), block(false)],
+            live: HashMap::new(),
+            granularity: 0,
+            block_allocs: 4,
+            block_frees: 0,
+            sub_allocs: 0,
+            invariant_violations: 0,
+        };
+
+        // Two of each class, all empty: one of each survives, the other two go.
+        assert_eq!(pool.empty_block_victims(1), vec![2, 3]);
+        assert_eq!(pool.empty_block_victims(0), vec![0, 1, 2, 3]);
+        assert!(pool.empty_block_victims(2).is_empty());
+
+        // And the release path counts the same way. Four empties across two
+        // classes is two per class, so neither class is over a budget of two —
+        // a total count would read four and free the block being released.
+        assert_eq!(pool.empty_spares(true), 2);
+        assert_eq!(pool.empty_spares(false), 2);
+        assert!(pool.empty_spares(true) <= SLAB_KEEP_EMPTY);
+    }
+
+    /// A dedicated or poisoned block is not a spare, on either path.
+    #[test]
+    fn dedicated_and_poisoned_blocks_are_not_spares() {
+        let block = |dedicated: bool, poisoned: bool| {
+            Some(MemBlock {
+                memory: vk::DeviceMemory::null(),
+                plan: BlockPlan::new(1024),
+                mem_type: 0,
+                dedicated,
+                small: true,
+                poisoned,
+            })
+        };
+        let pool = SlabPool {
+            blocks: vec![block(true, false), block(false, true), block(false, false)],
+            live: HashMap::new(),
+            granularity: 0,
+            block_allocs: 3,
+            block_frees: 0,
+            sub_allocs: 0,
+            invariant_violations: 0,
+        };
+        assert_eq!(
+            pool.empty_spares(true),
+            1,
+            "only the plain shared block counts"
+        );
+        assert_eq!(pool.empty_block_victims(0), vec![2]);
+    }
 
     #[test]
     fn new_block_is_empty_and_full() {
