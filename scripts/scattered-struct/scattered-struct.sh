@@ -161,14 +161,20 @@ for path, ln, fn, ty, hit, total in sorted(scatter, key=lambda r: -r[4]):
 
 print("\n== an enum arm flattened into loose primitives ==")
 print("   (grouped by file; a run of arms over one enum is the finding)\n")
-if not flattened:
-    print("   none")
+# A lone arm is not a finding — one `X => (0, 1)` is as likely to be a pair of
+# unrelated numbers as a flattened enum — so a file contributes only when it
+# holds two. Count what is reported, not what was matched: the two used to
+# differ, and a footer reading "1 flattened arms" over a section that printed
+# nothing sent a reader looking for a finding this script had already decided
+# was below its own bar.
 byfile = {}
 for path, ln, pat, n in flattened:
     byfile.setdefault(path, []).append((ln, pat, n))
-for path, rows in sorted(byfile.items()):
-    if len(rows) < 2:
-        continue
+reported = {path: rows for path, rows in byfile.items() if len(rows) >= 2}
+flattened_reported = sum(len(rows) for rows in reported.values())
+if not reported:
+    print("   none")
+for path, rows in sorted(reported.items()):
     print(f"  {path}")
     for ln, pat, n in rows:
         print(f"      :{ln}  {pat} => {n} loose values")
@@ -181,5 +187,5 @@ for path, ln, fn, ty, names in sorted(runs, key=lambda r: -len(r[4])):
     print(f"  {path}:{ln}\n      fn {fn}  {len(names)} x {ty}: {', '.join(names)}")
 
 print(f"\n[scattered-struct] {len(scatter)} scattered constructions, "
-      f"{len(flattened)} flattened arms, {len(runs)} same-typed runs")
+      f"{flattened_reported} flattened arms, {len(runs)} same-typed runs")
 PY
