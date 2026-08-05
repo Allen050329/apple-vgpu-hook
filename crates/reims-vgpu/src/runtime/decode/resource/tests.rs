@@ -55,6 +55,12 @@ fn a_sampler_carries_its_own_anisotropy_and_only_zero_is_repaired() {
 /// property the guest set, so an empty slice is the record an app that
 /// touched neither produces.
 fn vertex_block(step_tags: &[(u8, u32)]) -> Vec<u8> {
+    vertex_block_on_buffer(step_tags, 0)
+}
+
+/// [`vertex_block`] with the buffer index both the layout entry and the
+/// attribute name, so a test can drive one at or above [`MAX_VERTEX_LAYOUTS`].
+fn vertex_block_on_buffer(step_tags: &[(u8, u32)], buffer_index: u32) -> Vec<u8> {
     // Root entry: 1 count byte + two 6-byte (tag, len, u32) fields.
     const ROOT_LEN: usize = 1 + 2 * 6;
     let layout_rel = ROOT_LEN;
@@ -78,7 +84,7 @@ fn vertex_block(step_tags: &[(u8, u32)]) -> Vec<u8> {
     b[le] = layout_fields as u8;
     let mut p = le + 1;
     for (tag, value) in [
-        (VERTEX_LAYOUT_TAG_BUFFER_INDEX, 0u32),
+        (VERTEX_LAYOUT_TAG_BUFFER_INDEX, buffer_index),
         (VERTEX_LAYOUT_TAG_STRIDE, 16),
     ]
     .iter()
@@ -99,7 +105,7 @@ fn vertex_block(step_tags: &[(u8, u32)]) -> Vec<u8> {
         (VERTEX_ATTR_TAG_LOCATION, 0u32),
         (VERTEX_ATTR_TAG_FORMAT, 31), // MTLVertexFormatFloat4
         (VERTEX_ATTR_TAG_OFFSET, 0),
-        (VERTEX_ATTR_TAG_BUFFER_INDEX, 0),
+        (VERTEX_ATTR_TAG_BUFFER_INDEX, buffer_index),
     ] {
         b[p] = tag;
         b[p + 1] = 4;
@@ -147,6 +153,76 @@ fn a_declared_zero_step_rate_is_not_a_missing_one() {
     let three = vertex_block(&[(VERTEX_LAYOUT_TAG_STEP_RATE, 3)]);
     let attrs = parse_vertex_block(&three, 0, three.len()).expect("declared rate");
     assert_eq!(attrs[0].step_rate(), 3);
+}
+
+/// A layout naming a buffer index past `MAX_VERTEX_LAYOUTS` contributes no
+/// stride, so its attributes fetch element zero for every vertex — and the
+/// decoder used to reach that state without saying anything.
+///
+/// The stride-0 outcome is the loss being pinned here; the decline is what makes
+/// it distinguishable from a guest that asked for stride 0. Its sibling
+/// `color_attachment_table_truncated` has reported the same class since it was
+/// written, and these two loops did not.
+#[test]
+fn a_layout_buffer_index_past_the_bound_reports_the_stride_it_drops() {
+    let cap = crate::observe::FailCapture::start();
+
+    let past = vertex_block_on_buffer(&[], MAX_VERTEX_LAYOUTS as u32);
+    let attrs = parse_vertex_block(&past, 0, past.len()).expect("decodes past the bound");
+    assert_eq!(attrs.len(), 1, "the attribute is still decoded");
+    assert_eq!(
+        attrs[0].buffer_index, MAX_VERTEX_LAYOUTS as u32,
+        "and still names the buffer the guest gave it"
+    );
+    assert_eq!(
+        attrs[0].stride, 0,
+        "but no stride survived, which is the loss the line below has to name"
+    );
+    assert_eq!(
+        cap.one("res_vertex_block"),
+        "res_vertex_block reason=vertex_descriptor_truncated \
+         what=layout_buffer_index declared=31 max=31",
+        "the drop reaches the fail log instead of vanishing"
+    );
+
+    // The in-range control: the same block one index lower keeps its stride,
+    // and says nothing.
+    let quiet = crate::observe::FailCapture::start();
+    let last = vertex_block_on_buffer(&[], MAX_VERTEX_LAYOUTS as u32 - 1);
+    let attrs = parse_vertex_block(&last, 0, last.len()).expect("decodes at the bound");
+    assert_eq!(attrs[0].stride, 16);
+    assert!(
+        quiet
+            .lines()
+            .iter()
+            .all(|l| !l.contains("vertex_descriptor_truncated")),
+        "a descriptor inside the bound is quiet: {:?}",
+        quiet.lines()
+    );
+}
+
+/// A descriptor naming more attributes than `MAX_VERTEX_ATTRS` loses the
+/// surplus, and now says how many it was asked for.
+///
+/// Driven through the `Decline` rendering rather than a 32-attribute fixture:
+/// the count is read straight off the wire word, so what needs pinning is that
+/// both numbers reach the line — a report naming only the bound cannot say how
+/// much was lost.
+#[test]
+fn an_attribute_count_past_the_bound_names_both_numbers() {
+    use crate::observe::Decline as _;
+
+    let decline = VertexDescriptorTruncated {
+        what: "attribute_count",
+        declared: 64,
+        max: MAX_VERTEX_ATTRS,
+    };
+    assert_eq!(decline.slug(), "vertex_descriptor_truncated");
+    assert_eq!(
+        crate::observe::Emit::decline("res_vertex_block", &decline).render(),
+        "res_vertex_block reason=vertex_descriptor_truncated \
+         what=attribute_count declared=64 max=31"
+    );
 }
 
 /// A well-formed heap-texture record, with the bytes the serializer does

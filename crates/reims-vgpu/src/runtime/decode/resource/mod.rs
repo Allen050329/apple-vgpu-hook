@@ -1036,8 +1036,78 @@ pub const VERTEX_LAYOUT_TAG_BUFFER_INDEX: u8 = 0x00;
 pub const VERTEX_LAYOUT_TAG_STEP_FUNCTION: u8 = 0x01;
 pub const VERTEX_LAYOUT_TAG_STEP_RATE: u8 = 0x02;
 pub const VERTEX_LAYOUT_TAG_STRIDE: u8 = 0x03;
+/// `MTLVertexDescriptor.attributes` is a 31-slot array, so a descriptor naming
+/// more is malformed rather than something we chose not to read. The same
+/// number is [`crate::backend::metal::constants::REIMS_VGPU_METAL_MAX_ATTRS`],
+/// which is the Metal limit itself; this is the decode side of it, stated here
+/// because the Vulkan arm decodes the same descriptor and must lose the same
+/// attributes or none.
 pub const MAX_VERTEX_ATTRS: usize = 31;
+/// `MTLVertexDescriptor.layouts` is the matching 31-slot array. A layout naming
+/// a buffer index at or above this contributes no stride, and every attribute
+/// pointing at it then reads at stride 0 — every vertex fetching the same
+/// element. See [`VertexDescriptorTruncated`].
 pub const MAX_VERTEX_LAYOUTS: usize = 31;
+
+/// A vertex descriptor that named more attributes or layout buffer indices than
+/// [`MAX_VERTEX_ATTRS`] / [`MAX_VERTEX_LAYOUTS`] admit.
+///
+/// Both losses are silent downstream and neither is recoverable. A dropped
+/// attribute is indistinguishable from a guest that declared fewer, so the draw
+/// runs with a stage input the shader expects and never receives. A dropped
+/// layout is worse than indistinguishable: the attributes that named its buffer
+/// fall through to `stride = 0`, which is a well-formed pipeline that fetches
+/// element zero for every vertex — geometry collapsed to a point, with nothing
+/// refusing.
+///
+/// Named for the same reason [`ColorAttachTableTruncated`] is, and it is the
+/// sibling this decoder was missing: the colour-attachment table 500 lines below
+/// has reported its truncation since it was written, while the two loops here
+/// bounded themselves with a bare `break` and an `if` and said nothing.
+struct VertexDescriptorTruncated {
+    /// Which array overflowed.
+    what: &'static str,
+    /// What the descriptor asked for — an attribute count, or the buffer index a
+    /// layout entry named.
+    declared: usize,
+    /// The bound that refused it.
+    max: usize,
+}
+
+impl crate::observe::Decline for VertexDescriptorTruncated {
+    fn slug(&self) -> &'static str {
+        "vertex_descriptor_truncated"
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("what", self.what.to_string()),
+            ("declared", self.declared.to_string()),
+            ("max", self.max.to_string()),
+        ]
+    }
+}
+
+/// Report a vertex descriptor that lost attributes or a layout stride.
+///
+/// Deduped per distinct `(what, declared)` pair — a malformed descriptor is
+/// re-decoded on every pipeline bind, so an undeduped line would arrive once per
+/// draw.
+fn note_vertex_truncated(what: &'static str, declared: usize, max: usize) {
+    let disc = ((what.len() as u64) << 56) | declared as u64;
+    if !crate::observe::first_sight("vertex_descriptor_truncated", disc) {
+        return;
+    }
+    crate::observe::Emit::decline(
+        "res_vertex_block",
+        &VertexDescriptorTruncated {
+            what,
+            declared,
+            max,
+        },
+    )
+    .fail();
+}
 pub const VERTEX_LABEL_MIN_ASCII: u8 = 0x20;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -1679,7 +1749,13 @@ pub fn parse_vertex_block(
             entry_tag_u32_present(bytes, block_end, entry, VERTEX_LAYOUT_TAG_STEP_FUNCTION);
         let declared_step_rate =
             entry_tag_u32_present(bytes, block_end, entry, VERTEX_LAYOUT_TAG_STEP_RATE);
-        if (buffer_index as usize) < MAX_VERTEX_LAYOUTS && stride != 0 {
+        if (buffer_index as usize) >= MAX_VERTEX_LAYOUTS {
+            // Every attribute naming this buffer falls through to stride 0 below,
+            // which draws every vertex from element zero. Say so; a zero stride
+            // is a valid pipeline and nothing further down can tell it from one
+            // the guest asked for.
+            note_vertex_truncated("layout_buffer_index", buffer_index as usize, MAX_VERTEX_LAYOUTS);
+        } else if stride != 0 {
             strides[buffer_index as usize] = stride;
             have_stride[buffer_index as usize] = true;
         }
@@ -1692,6 +1768,9 @@ pub fn parse_vertex_block(
     }
     let attr_count = ld32(&bytes[attr_section..]) as usize;
     let mut attrs = Vec::new();
+    if attr_count > MAX_VERTEX_ATTRS {
+        note_vertex_truncated("attribute_count", attr_count, MAX_VERTEX_ATTRS);
+    }
     for i in 0..attr_count {
         if attrs.len() >= MAX_VERTEX_ATTRS {
             break;
