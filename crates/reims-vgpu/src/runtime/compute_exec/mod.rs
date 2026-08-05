@@ -1014,16 +1014,21 @@ pub(crate) struct StagedTexture {
     pub is_storage: bool,
     #[cfg(feature = "backend-vulkan")]
     residency: Option<ComputeStorageResidencyCandidate>,
-    /// Stage-time guest read skipped (resident generation verified); `bytes`
-    /// is a zero placeholder the engine must never seed.
+    /// What the engine could already serve for this binding, so the stage-time
+    /// guest read was skipped and `bytes` is a zero placeholder.
+    ///
+    /// [`ResidentServe::Seed`] — a storage binding whose resident the engine
+    /// holds at a verified generation; it must never be seeded from the
+    /// placeholder. [`ResidentServe::Sample`] — a sampled input whose window is
+    /// a prior dispatch's storage output; the engine seeds the sampled image by
+    /// copy-on-sample from that resident, again never from the bytes.
+    ///
+    /// One field rather than the `bool` and `Option` pair it replaces: those
+    /// were the variant tag and the payload of this enum stored apart, so every
+    /// producer had to rebuild both halves and nothing made a producer that set
+    /// one without the other fail to compile.
     #[cfg(feature = "backend-vulkan")]
-    seed_skipped: bool,
-    /// Sampled input whose window the engine already holds GPU-resident (a
-    /// prior dispatch's storage output at this generation): the guest read was
-    /// skipped, `bytes` is a zero placeholder, and the engine must seed the
-    /// sampled image by copy-on-sample from the resident (never the bytes).
-    #[cfg(feature = "backend-vulkan")]
-    sample_resident: Option<(crate::model::ComputeStorageResidencyKey, u32)>,
+    serve: Option<ResidentServe>,
     writeback: TextureWriteback,
 }
 
@@ -1245,11 +1250,47 @@ fn log_storage_image_access(pipe: u32, binding: u32, access: &str, bytes: u64) {
 /// `Seed` means a storage binding's output is already GPU-resident at this
 /// generation, so the guest read that would seed it is unnecessary. `Sample`
 /// names the resident key a sampled binding reads directly instead.
-#[cfg(feature = "backend-vulkan")]
+///
+/// Which variant a binding can receive is fixed by `is_storage`, not chosen:
+/// [`resident_serve`]'s two arms are the two variants. That is why the
+/// consumers split the same way — the storage rail reads only the seed and the
+/// sampled rail only the source.
+///
+/// Declared unconditionally although only the Vulkan backend can produce one,
+/// so the rails that carry the answer through a `backend-metal` build can still
+/// name its type. Each used to substitute its own loose tuple of the same
+/// fields under `cfg(not(backend-vulkan))`, spelled out once per rail.
+/// [`resident_serve`] is the only producer and it is gated on the Vulkan
+/// backend, so on a `backend-metal` build both variants are constructed
+/// nowhere. The rails still read the type — `serve` is `None` there and their
+/// accessor calls compile unchanged — which is the whole point of declaring it
+/// unconditionally.
+#[cfg_attr(not(feature = "backend-vulkan"), allow(dead_code))]
 #[derive(Clone, Copy)]
 pub(crate) enum ResidentServe {
     Seed(u32),
     Sample(crate::model::ComputeStorageResidencyKey, u32),
+}
+
+impl ResidentServe {
+    /// The generation a seeded resident is held at, or `None` for a sampled
+    /// one — whose generation belongs to its key rather than to the guest read
+    /// this binding skipped.
+    pub(crate) fn seed_generation(self) -> Option<u32> {
+        match self {
+            Self::Seed(generation) => Some(generation),
+            Self::Sample(..) => None,
+        }
+    }
+
+    /// The resident a sampled binding reads directly, or `None` for a seeded
+    /// one.
+    pub(crate) fn sample_source(self) -> Option<(crate::model::ComputeStorageResidencyKey, u32)> {
+        match self {
+            Self::Sample(key, generation) => Some((key, generation)),
+            Self::Seed(_) => None,
+        }
+    }
 }
 
 /// The gate every staging rail applies before falling back to a guest read.
@@ -1486,19 +1527,15 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             height,
             format,
         );
-        // A heap texture has no guest window to re-read: once the mirror claims
-        // a resident, the engine's copy is the only content, so a resident the
-        // engine can no longer serve is a loss, not a fallback.
         #[cfg(feature = "backend-vulkan")]
-        let (seed_generation, seed_skipped, sample_resident) = match state
-            .compute_storage_residency
-            .get(&key)
-            .copied()
-        {
-            None => (0, false, None),
+        let serve = match state.compute_storage_residency.get(&key).copied() {
+            None => None,
             Some(generation) => match resident_serve(key, generation, is_storage, format) {
-                Some(ResidentServe::Seed(generation)) => (generation, true, None),
-                Some(ResidentServe::Sample(key, generation)) => (0, false, Some((key, generation))),
+                // A heap texture has no guest window to re-read: once the mirror
+                // claims a resident, the engine's copy is the only content, so a
+                // resident the engine can no longer serve is a loss, not a
+                // fallback. The window-backed rails below fall through to the
+                // guest read here instead; this is the arm that must not.
                 None => {
                     crate::observe::fail(format!(
                             "compute_stage_tex heap_fail reason=resident_lost ref={texture_ref} heap={heap_ref} fmt={format:#x} {width}x{height} gen={generation} use_offset={} offset={offset:#x}",
@@ -1508,17 +1545,16 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
                         "compute_stage_tex_heap_resident_lost",
                     ));
                 }
+                serve => serve,
             },
         };
         #[cfg(not(feature = "backend-vulkan"))]
-        let (seed_generation, sample_resident): (
-            u32,
-            Option<(crate::model::ComputeStorageResidencyKey, u32)>,
-        ) = (0, None);
+        let serve: Option<ResidentServe> = None;
+        let seed_generation = serve.and_then(ResidentServe::seed_generation).unwrap_or(0);
         crate::observe::off(format!(
             "compute_stage_tex heap_ok ref={texture_ref} heap={heap_ref} fmt={format:#x} {width}x{height} storage={} seed_gen={seed_generation} resident_sample={} use_offset={} offset={offset:#x}",
             is_storage as u8,
-            sample_resident.is_some() as u8,
+            serve.and_then(ResidentServe::sample_source).is_some() as u8,
             use_offset as u8
         ));
         return Ok(StagedTexture {
@@ -1537,9 +1573,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
                 seed_generation,
             }),
             #[cfg(feature = "backend-vulkan")]
-            seed_skipped,
-            #[cfg(feature = "backend-vulkan")]
-            sample_resident,
+            serve,
             writeback: TextureWriteback::None,
         });
     }
@@ -1877,36 +1911,33 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
         // dispatch's storage output — live class: the dispatch samples the very
         // window it storage-writes) never needs the guest read either.
         #[cfg(feature = "backend-vulkan")]
-        let (seed_skipped, sample_resident) = match state
+        let serve = state
             .compute_storage_residency
             .get(&residency_key)
             .copied()
             .and_then(|mirror_generation| {
                 resident_serve(residency_key, mirror_generation, is_storage, stage_fmt)
-            }) {
-            Some(ResidentServe::Seed(generation)) => {
-                seed_generation = generation;
-                crate::observe::off(format!(
-                    "compute_stage_resident_skip mapping={mapping_id} {width}x{height} fmt={stage_fmt:#x} gen={seed_generation} bytes={need}"
-                ));
-                (true, None)
-            }
-            Some(ResidentServe::Sample(key, generation)) => {
-                crate::observe::off(format!(
-                    "compute_stage_resident_sample mapping={mapping_id} {width}x{height} fmt={stage_fmt:#x} gen={generation} bytes={need}"
-                ));
-                (false, Some((key, generation)))
-            }
-            None => (false, None),
-        };
+            });
         #[cfg(not(feature = "backend-vulkan"))]
-        let (seed_skipped, sample_resident): (
-            bool,
-            Option<(crate::model::ComputeStorageResidencyKey, u32)>,
-        ) = (false, None);
+        let serve: Option<ResidentServe> = None;
+        // Unlike the heap and linear rails, this one's fallback generation is
+        // the mapping's own content generation rather than zero, so a seed
+        // overwrites it and anything else leaves it alone. Gated with the
+        // generation it writes: `serve` is unconditionally `None` without the
+        // Vulkan backend, so this is a no-op there rather than a second policy.
+        #[cfg(feature = "backend-vulkan")]
+        if let Some(generation) = serve.and_then(ResidentServe::seed_generation) {
+            seed_generation = generation;
+            crate::observe::off(format!(
+                "compute_stage_resident_skip mapping={mapping_id} {width}x{height} fmt={stage_fmt:#x} gen={seed_generation} bytes={need}"
+            ));
+        } else if let Some((_, generation)) = serve.and_then(ResidentServe::sample_source) {
+            crate::observe::off(format!(
+                "compute_stage_resident_sample mapping={mapping_id} {width}x{height} fmt={stage_fmt:#x} gen={generation} bytes={need}"
+            ));
+        }
         let mut bytes = vec![0u8; need];
-        if !seed_skipped
-            && sample_resident.is_none()
+        if serve.is_none()
             && !mapping_write::read_rect_raw_at(
                 state,
                 host,
@@ -1969,9 +2000,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
                 seed_generation,
             }),
             #[cfg(feature = "backend-vulkan")]
-            seed_skipped,
-            #[cfg(feature = "backend-vulkan")]
-            sample_resident,
+            serve,
             writeback,
         });
     }
@@ -2139,28 +2168,20 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
         _ => None,
     };
     #[cfg(feature = "backend-vulkan")]
-    let (seed_skipped, seed_generation, sample_resident) = match resident {
-        Some((_, _, Some(ResidentServe::Seed(generation)))) => {
-            crate::observe::off(format!(
-                "compute_stage_linear_resident_seed task={task_id} ref={texture_ref} gva={gva:#x} fmt={:#x} dims={w}x{h} gen={generation}",
-                tex.pixel_format
-            ));
-            (true, generation, None)
-        }
-        Some((_, _, Some(ResidentServe::Sample(key, generation)))) => {
-            crate::observe::off(format!(
-                "compute_stage_linear_resident_sample task={task_id} ref={texture_ref} gva={gva:#x} fmt={:#x} dims={w}x{h} gen={generation}",
-                stage_format
-            ));
-            (false, 0u32, Some((key, generation)))
-        }
-        _ => (false, 0u32, None),
-    };
+    let serve = resident.and_then(|(_, _, serve)| serve);
     #[cfg(not(feature = "backend-vulkan"))]
-    let (seed_skipped, sample_resident): (
-        bool,
-        Option<(crate::model::ComputeStorageResidencyKey, u32)>,
-    ) = (false, None);
+    let serve: Option<ResidentServe> = None;
+    if let Some(generation) = serve.and_then(ResidentServe::seed_generation) {
+        crate::observe::off(format!(
+            "compute_stage_linear_resident_seed task={task_id} ref={texture_ref} gva={gva:#x} fmt={:#x} dims={w}x{h} gen={generation}",
+            tex.pixel_format
+        ));
+    } else if let Some((_, generation)) = serve.and_then(ResidentServe::sample_source) {
+        crate::observe::off(format!(
+            "compute_stage_linear_resident_sample task={task_id} ref={texture_ref} gva={gva:#x} fmt={:#x} dims={w}x{h} gen={generation}",
+            stage_format
+        ));
+    }
     #[cfg(feature = "backend-vulkan")]
     if let Some((key, resident_gen, None)) = resident {
         // A bytes consumer (format-mismatched view, non-vulkan reuse):
@@ -2190,7 +2211,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             }
         }
     }
-    if seed_skipped || sample_resident.is_some() || have_bytes {
+    if serve.is_some() || have_bytes {
         // Engine resident serves this window; no cache/guest read.
     } else if let Some(cached) = crate::runtime::surface_cache::get_linear_texture(state, &window) {
         bytes.copy_from_slice(cached);
@@ -2284,15 +2305,15 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
     if is_storage {
         if let Some(key) = linear_key {
             if !crate::runtime::surface_cache::linear_mirrorable(stage_format) {
-                let seed = if seed_skipped {
-                    seed_generation
-                } else {
-                    state
-                        .host_linear_textures
-                        .get(&(task_id, stage_ref))
-                        .map(|e| e.host_gen)
-                        .unwrap_or(0)
-                };
+                let seed = serve
+                    .and_then(ResidentServe::seed_generation)
+                    .unwrap_or_else(|| {
+                        state
+                            .host_linear_textures
+                            .get(&(task_id, stage_ref))
+                            .map(|e| e.host_gen)
+                            .unwrap_or(0)
+                    });
                 residency = Some(ComputeStorageResidencyCandidate {
                     key,
                     seed_generation: seed,
@@ -2313,9 +2334,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
         #[cfg(feature = "backend-vulkan")]
         residency,
         #[cfg(feature = "backend-vulkan")]
-        seed_skipped,
-        #[cfg(feature = "backend-vulkan")]
-        sample_resident,
+        serve,
         writeback,
     })
 }
@@ -3530,7 +3549,7 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
                         ),
                     }
                 }),
-                seed_skipped: t.seed_skipped,
+                seed_skipped: t.serve.and_then(ResidentServe::seed_generation).is_some(),
                 defer_readback,
             });
         } else {
@@ -3547,12 +3566,14 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
                 width: t.width,
                 height: t.height,
                 bytes: std::mem::take(&mut t.bytes),
-                resident_bind: t.sample_resident.map(|(identity, generation)| {
-                    crate::backend::vulkan::engine::ComputeResidentSampleBind {
-                        identity,
-                        generation,
-                    }
-                }),
+                resident_bind: t.serve.and_then(ResidentServe::sample_source).map(
+                    |(identity, generation)| {
+                        crate::backend::vulkan::engine::ComputeResidentSampleBind {
+                            identity,
+                            generation,
+                        }
+                    },
+                ),
             });
         }
     }

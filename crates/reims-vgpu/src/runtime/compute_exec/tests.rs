@@ -1416,8 +1416,7 @@ fn linear_writeback_retains_cache_when_guest_gva_is_unmapped() {
         bytes: rgba.clone(),
         is_storage: true,
         residency: None,
-        seed_skipped: false,
-        sample_resident: None,
+        serve: None,
         writeback: TextureWriteback::Linear {
             pages: Default::default(),
             texture_ref,
@@ -2078,4 +2077,50 @@ fn a_staged_buffer_carries_the_pages_its_writeback_is_bounded_to() {
     // so the writeback stays unbounded and the writer fails closed itself.
     assert!(staged_span_pages(&state, &host, 1, 0, 0x100).is_empty());
     assert!(staged_span_pages(&state, &host, 1, page, 0).is_empty());
+}
+
+/// The two halves of a resident answer partition; neither rail can see both.
+///
+/// `StagedTexture` used to carry this enum as a `bool` and an `Option` side by
+/// side, rebuilt independently by all three staging rails. Nothing then stopped
+/// a rail from setting both — and the two consumers read one field each, so a
+/// binding claiming to be seeded *and* sampled would have been dispatched as
+/// both a storage seed skip and a copy-on-sample, seeding one image from a
+/// placeholder. The state is unrepresentable now; this pins the accessors that
+/// replaced the two fields so a later variant cannot answer to both consumers
+/// or to neither.
+#[test]
+fn a_resident_answer_is_a_seed_or_a_sample_and_never_both() {
+    let key = crate::model::ComputeStorageResidencyKey {
+        mapping_id: 7,
+        map_generation: 3,
+        surface_offset: 0,
+        surface_bpr: 16,
+        span_end: 64,
+        width: 4,
+        height: 4,
+        pixel_format: 0x50,
+        texture_ref: 9,
+    };
+    for (serve, what) in [
+        (ResidentServe::Seed(11), "seed"),
+        (ResidentServe::Sample(key, 12), "sample"),
+    ] {
+        assert_eq!(
+            serve.seed_generation().is_some(),
+            serve.sample_source().is_none(),
+            "exactly one accessor must answer for the {what} variant"
+        );
+    }
+    assert_eq!(ResidentServe::Seed(11).seed_generation(), Some(11));
+    assert_eq!(
+        ResidentServe::Sample(key, 12).sample_source(),
+        Some((key, 12))
+    );
+
+    // And "no resident" answers neither, which is what makes `serve.is_none()`
+    // the one gate the rails use to decide they must read the guest window.
+    let none: Option<ResidentServe> = None;
+    assert!(none.and_then(ResidentServe::seed_generation).is_none());
+    assert!(none.and_then(ResidentServe::sample_source).is_none());
 }
