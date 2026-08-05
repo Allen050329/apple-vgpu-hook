@@ -637,7 +637,10 @@ fn the_buffer_paths_refuse_under_their_own_names() {
     let staged = stage_buffer(&state, &host, 1, &bind);
     assert_eq!(
         staged.err().and_then(|e| e.refusal()),
-        Some("compute_stage_buf_no_entry")
+        Some(crate::observe::ladder_slug!(
+            "compute_stage_buf",
+            no_list_entry
+        ))
     );
 }
 

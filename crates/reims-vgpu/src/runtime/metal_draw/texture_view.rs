@@ -71,9 +71,15 @@ pub(crate) enum TextureViewDecline {
 impl Decline for TextureViewDecline {
     fn slug(&self) -> &'static str {
         match self {
-            Self::HopEntryMissing { .. } => "texture_view_hop_entry_missing",
-            Self::HopObjectNotView { .. } => "texture_view_hop_object_not_view",
-            Self::HopDescriptorMissing { .. } => "texture_view_hop_descriptor_missing",
+            Self::HopEntryMissing { .. } => {
+                crate::observe::ladder_slug!("texture_view_hop", no_list_entry)
+            }
+            Self::HopObjectNotView { .. } => {
+                crate::observe::ladder_slug!("texture_view_hop", wrong_type)
+            }
+            Self::HopDescriptorMissing { .. } => {
+                crate::observe::ladder_slug!("texture_view_hop", desc_read)
+            }
             // Keep the descriptor decoder's exact registered reason primary.
             Self::HopDecode { reason, .. } => reason.slug(),
             Self::HopZeroBase { .. } => "texture_view_hop_zero_base",

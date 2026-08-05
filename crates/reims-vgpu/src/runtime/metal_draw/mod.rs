@@ -270,13 +270,14 @@ fn load_depth_stencil_descriptor<M: HostMemory + HostOps>(
     ds_ref: u32,
 ) -> Result<crate::runtime::decode::resource::DepthStencilDescriptor, &'static str> {
     let entry = objects::lookup_list_entry(state, host, task_id, ds_ref)
-        .ok_or("depth_stencil_entry_missing")?;
+        .ok_or(crate::observe::ladder_slug!("depth_stencil", no_list_entry))?;
     if entry.object_type != OBJECT_TYPE_TYPE7 {
-        return Err("depth_stencil_object_type");
+        return Err(crate::observe::ladder_slug!("depth_stencil", wrong_type));
     }
-    let desc =
-        objects::read_descriptor(state, host, task_id, &entry).ok_or("depth_stencil_desc_read")?;
-    decode_depth_stencil_descriptor(&desc).map_err(|_| "depth_stencil_desc_decode")
+    let desc = objects::read_descriptor(state, host, task_id, &entry)
+        .ok_or(crate::observe::ladder_slug!("depth_stencil", desc_read))?;
+    decode_depth_stencil_descriptor(&desc)
+        .map_err(|_| crate::observe::ladder_slug!("depth_stencil", desc_decode))
 }
 
 /// One slot of a render encoder's vertex or fragment buffer table.
@@ -734,10 +735,10 @@ impl crate::observe::Decline for IndexLoadReason {
             Self::TypeUnsupported => "draw_index_type_unsupported",
             Self::CountOverflow => "draw_index_count_overflow",
             Self::CountZero => "draw_index_count_zero",
-            Self::EntryMissing => "draw_index_entry_missing",
-            Self::ObjectType => "draw_index_object_type",
-            Self::DescRead => "draw_index_desc_read",
-            Self::DescDecode => "draw_index_desc_decode",
+            Self::EntryMissing => crate::observe::ladder_slug!("draw_index", no_list_entry),
+            Self::ObjectType => crate::observe::ladder_slug!("draw_index", wrong_type),
+            Self::DescRead => crate::observe::ladder_slug!("draw_index", desc_read),
+            Self::DescDecode => crate::observe::ladder_slug!("draw_index", desc_decode),
             Self::BackingMissing => "draw_index_backing_missing",
             Self::OffsetOverflow => "draw_index_offset_overflow",
             Self::OutOfBounds => "draw_index_out_of_bounds",
@@ -2261,13 +2262,25 @@ enum MetalStateDecline {
 impl crate::observe::Decline for MetalStateDecline {
     fn slug(&self) -> &'static str {
         match self {
-            Self::SamplerEntryMissing { .. } => "metal_sampler_entry_missing",
-            Self::SamplerObjectType { .. } => "metal_sampler_object_type",
-            Self::SamplerDescriptorMissing { .. } => "metal_sampler_descriptor_missing",
+            Self::SamplerEntryMissing { .. } => {
+                crate::observe::ladder_slug!("metal_sampler", no_list_entry)
+            }
+            Self::SamplerObjectType { .. } => {
+                crate::observe::ladder_slug!("metal_sampler", wrong_type)
+            }
+            Self::SamplerDescriptorMissing { .. } => {
+                crate::observe::ladder_slug!("metal_sampler", desc_read)
+            }
             Self::SamplerDecode { reason, .. } => reason.slug(),
-            Self::DepthStencilEntryMissing { .. } => "metal_depth_stencil_entry_missing",
-            Self::DepthStencilObjectType { .. } => "metal_depth_stencil_object_type",
-            Self::DepthStencilDescriptorMissing { .. } => "metal_depth_stencil_descriptor_missing",
+            Self::DepthStencilEntryMissing { .. } => {
+                crate::observe::ladder_slug!("metal_depth_stencil", no_list_entry)
+            }
+            Self::DepthStencilObjectType { .. } => {
+                crate::observe::ladder_slug!("metal_depth_stencil", wrong_type)
+            }
+            Self::DepthStencilDescriptorMissing { .. } => {
+                crate::observe::ladder_slug!("metal_depth_stencil", desc_read)
+            }
             Self::DepthStencilDecode { reason, .. } => reason.slug(),
             Self::IcbDepthStencilUnsupported { .. } => "metal_icb_depth_stencil_unsupported",
         }

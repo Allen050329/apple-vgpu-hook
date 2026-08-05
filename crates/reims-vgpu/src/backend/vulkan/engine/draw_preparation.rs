@@ -277,9 +277,15 @@ impl Decline for DrawPreparationDecline {
             Self::ChainResidentIdentityMissing { .. } => {
                 "draw_prepare_chain_resident_identity_missing"
             }
-            Self::SamplerEntryMissing { .. } => "draw_prepare_sampler_entry_missing",
-            Self::SamplerObjectType { .. } => "draw_prepare_sampler_object_type",
-            Self::SamplerDescriptorMissing { .. } => "draw_prepare_sampler_descriptor_missing",
+            Self::SamplerEntryMissing { .. } => {
+                crate::observe::ladder_slug!("draw_prepare_sampler", no_list_entry)
+            }
+            Self::SamplerObjectType { .. } => {
+                crate::observe::ladder_slug!("draw_prepare_sampler", wrong_type)
+            }
+            Self::SamplerDescriptorMissing { .. } => {
+                crate::observe::ladder_slug!("draw_prepare_sampler", desc_read)
+            }
             Self::SamplerDescriptorShort { .. } => "draw_prepare_sampler_descriptor_short",
             Self::SamplerDescriptorUnknownType { .. } => {
                 "draw_prepare_sampler_descriptor_unknown_type"

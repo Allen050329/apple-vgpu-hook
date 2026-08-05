@@ -47,6 +47,48 @@ struct Owner {
     ty: String,
 }
 
+/// Rewrite every `ladder_slug!("role", rung)` into the slug it expands to.
+///
+/// This scan reads source text, so a macro-composed slug is invisible to it —
+/// `ladder_slug!("draw_index", desc_read)` offers one string literal, `"draw_index"`,
+/// and four arms using four rungs all looked like four arms returning the same
+/// slug. That reported a collision where there was none, and the dangerous half
+/// is the other direction: had the role happened to be unique per arm, the scan
+/// would have passed while comparing roles instead of slugs, and a genuine
+/// collision between two composed slugs would have been invisible.
+///
+/// Expanding here rather than special-casing the shape in [`literals`] keeps
+/// this file honest about what it is comparing: after this pass, every literal
+/// the scan sees is a slug that reaches the log.
+fn expand_ladder_slugs(body: &str) -> String {
+    const MACRO: &str = "ladder_slug!(";
+    let mut out = String::with_capacity(body.len());
+    let mut rest = body;
+    while let Some(at) = rest.find(MACRO) {
+        let (before, tail) = rest.split_at(at);
+        out.push_str(before);
+        let args = &tail[MACRO.len()..];
+        let Some(close) = args.find(')') else {
+            // Not a call this scan understands; leave it as text so the slug it
+            // would have produced is missing rather than silently wrong.
+            out.push_str(tail);
+            return out;
+        };
+        let (inner, after) = args.split_at(close);
+        let mut parts = inner.splitn(2, ',');
+        let role = parts.next().unwrap_or("").trim().trim_matches('"');
+        let rung = parts.next().unwrap_or("").trim();
+        if role.is_empty() {
+            out.push_str(&format!("\"{rung}\""));
+        } else {
+            out.push_str(&format!("\"{role}_{rung}\""));
+        }
+        rest = &after[1..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Every string literal in `body`.
 fn literals(body: &str) -> Vec<String> {
     let chars: Vec<char> = body.chars().collect();
@@ -145,7 +187,8 @@ fn slug_owners(root: &Path) -> BTreeMap<String, Vec<Owner>> {
                     let body_chars: Vec<char> = body.chars().collect();
                     let brace_ci = body[..brace].chars().count();
                     let fn_end = close_brace(&body_chars, brace_ci);
-                    let fn_body = strip_attributes(&body_chars[brace_ci..fn_end]);
+                    let fn_body =
+                        expand_ladder_slugs(&strip_attributes(&body_chars[brace_ci..fn_end]));
                     for slug in literals(&fn_body) {
                         out.entry(slug).or_default().push(Owner {
                             file: rel_path.clone(),

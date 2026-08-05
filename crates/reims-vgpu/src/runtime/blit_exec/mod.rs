@@ -486,16 +486,28 @@ fn resolve_buffer<M: HostMemory + HostOps>(
         return Err(br(BlitStatus::MissingResource, "buf_ref_zero"));
     }
     let Some(entry) = objects::lookup_list_entry(state, host, task_id, buffer_ref) else {
-        return Err(br(BlitStatus::MissingResource, "buf_no_list_entry"));
+        return Err(br(
+            BlitStatus::MissingResource,
+            crate::observe::ladder_slug!("buf", no_list_entry),
+        ));
     };
     if entry.object_type != OBJECT_TYPE_BUFFER {
-        return Err(br(BlitStatus::MissingResource, "buf_wrong_type"));
+        return Err(br(
+            BlitStatus::MissingResource,
+            crate::observe::ladder_slug!("buf", wrong_type),
+        ));
     }
     let Some(bytes) = objects::read_descriptor(state, host, task_id, &entry) else {
-        return Err(br(BlitStatus::MissingResource, "buf_desc_read"));
+        return Err(br(
+            BlitStatus::MissingResource,
+            crate::observe::ladder_slug!("buf", desc_read),
+        ));
     };
     let Ok(buf) = decode_buffer_descriptor(&bytes) else {
-        return Err(br(BlitStatus::MissingResource, "buf_desc_decode"));
+        return Err(br(
+            BlitStatus::MissingResource,
+            crate::observe::ladder_slug!("buf", desc_decode),
+        ));
     };
     let Some((gva, size)) = buf.backing_gva_size(state.page_shift) else {
         return Err(br(BlitStatus::MissingResource, "buf_no_backing"));
@@ -530,16 +542,25 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
         return Err(br(BlitStatus::Unsupported, "tex_view_depth_cap"));
     }
     let Some(entry) = objects::lookup_list_entry(state, host, task_id, texture_ref) else {
-        return Err(br(BlitStatus::MissingResource, "tex_no_list_entry"));
+        return Err(br(
+            BlitStatus::MissingResource,
+            crate::observe::ladder_slug!("tex", no_list_entry),
+        ));
     };
 
     // Type-8 view → base texture (unswizzled; multi-level / array / non-2D allowed).
     if entry.object_type == OBJECT_TYPE_TEXTURE_VIEW {
         let Some(bytes) = objects::read_descriptor(state, host, task_id, &entry) else {
-            return Err(br(BlitStatus::MissingResource, "view_desc_read"));
+            return Err(br(
+                BlitStatus::MissingResource,
+                crate::observe::ladder_slug!("view", desc_read),
+            ));
         };
         let Ok(view) = decode_texture_view_descriptor(&bytes) else {
-            return Err(br(BlitStatus::MissingResource, "view_desc_decode"));
+            return Err(br(
+                BlitStatus::MissingResource,
+                crate::observe::ladder_slug!("view", desc_decode),
+            ));
         };
         if view.base_texture_ref == 0 {
             return Err(br(BlitStatus::MissingResource, "view_base_ref_zero"));
@@ -681,7 +702,10 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
             return Err(br(BlitStatus::Unsupported, "t11_level_slice"));
         }
         let Some(bytes) = objects::read_descriptor(state, host, task_id, &entry) else {
-            return Err(br(BlitStatus::MissingResource, "t11_desc_read"));
+            return Err(br(
+                BlitStatus::MissingResource,
+                crate::observe::ladder_slug!("t11", desc_read),
+            ));
         };
         let Ok(ResourceDescriptor::IOSurfaceTexture {
             mapping_id,
@@ -691,7 +715,10 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
             ..
         }) = decode_iosurface_texture_descriptor(&bytes)
         else {
-            return Err(br(BlitStatus::MissingResource, "t11_desc_decode"));
+            return Err(br(
+                BlitStatus::MissingResource,
+                crate::observe::ladder_slug!("t11", desc_decode),
+            ));
         };
         if mapping_id == 0 || tex_w == 0 || tex_h == 0 {
             return Err(br(BlitStatus::MissingResource, "t11_zero_geom"));
@@ -752,7 +779,10 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
             return Err(br(BlitStatus::Unsupported, "t5_level_slice"));
         }
         let Some(bytes) = objects::read_descriptor(state, host, task_id, &entry) else {
-            return Err(br(BlitStatus::MissingResource, "t5_desc_read"));
+            return Err(br(
+                BlitStatus::MissingResource,
+                crate::observe::ladder_slug!("t5", desc_read),
+            ));
         };
         let Ok(t5) = reims_vgpu_wire::device_desc::type5_header(&bytes) else {
             return Err(br(BlitStatus::MissingResource, "t5_desc_short"));
@@ -819,13 +849,22 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
     if entry.object_type != OBJECT_TYPE_TEXTURE && entry.object_type != OBJECT_TYPE_TEXTURE_VARIANT
     {
         let _ = note_tex_wrong_type(task_id, texture_ref, entry.object_type, level, slice);
-        return Err(br(BlitStatus::MissingResource, "tex_wrong_type"));
+        return Err(br(
+            BlitStatus::MissingResource,
+            crate::observe::ladder_slug!("tex", wrong_type),
+        ));
     }
     let Some(bytes) = objects::read_descriptor(state, host, task_id, &entry) else {
-        return Err(br(BlitStatus::MissingResource, "tex_desc_read"));
+        return Err(br(
+            BlitStatus::MissingResource,
+            crate::observe::ladder_slug!("tex", desc_read),
+        ));
     };
     let Ok(tex) = decode_texture_descriptor(&bytes) else {
-        return Err(br(BlitStatus::MissingResource, "tex_desc_decode"));
+        return Err(br(
+            BlitStatus::MissingResource,
+            crate::observe::ladder_slug!("tex", desc_decode),
+        ));
     };
     if tex.declared_pixel_format().is_none() {
         crate::observe::fail(format!(

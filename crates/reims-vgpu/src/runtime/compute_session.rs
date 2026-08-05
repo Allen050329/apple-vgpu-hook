@@ -774,15 +774,22 @@ fn apply_icb_compute_encoder_inheritance<M: HostMemory + HostOps>(
             let mut mtl_samps: Vec<metal::SamplerState> = Vec::new();
             for s in &stream_samp {
                 let entry = objects::lookup_list_entry(state, host, task_id, s.sampler_ref).ok_or(
-                    ComputeStatus::MissingSampler("compute_icb_inherit_ab_sampler_no_entry"),
+                    ComputeStatus::MissingSampler(crate::observe::ladder_slug!(
+                        "compute_icb_inherit_ab_sampler",
+                        no_list_entry
+                    )),
                 )?;
                 if entry.object_type != OBJECT_TYPE_TYPE7 {
-                    return Err(ComputeStatus::MissingSampler(
-                        "compute_icb_inherit_ab_sampler_wrong_type",
-                    ));
+                    return Err(ComputeStatus::MissingSampler(crate::observe::ladder_slug!(
+                        "compute_icb_inherit_ab_sampler",
+                        wrong_type
+                    )));
                 }
                 let desc_bytes = objects::read_descriptor(state, host, task_id, &entry).ok_or(
-                    ComputeStatus::MissingSampler("compute_icb_inherit_ab_sampler_no_desc"),
+                    ComputeStatus::MissingSampler(crate::observe::ladder_slug!(
+                        "compute_icb_inherit_ab_sampler",
+                        desc_read
+                    )),
                 )?;
                 if desc_bytes.len() < 4 || ld32(&desc_bytes) != TYPE7_OBJECT_SAMPLER {
                     return Err(ComputeStatus::MissingSampler(
@@ -790,7 +797,10 @@ fn apply_icb_compute_encoder_inheritance<M: HostMemory + HostOps>(
                     ));
                 }
                 let sd = decode_sampler_descriptor(&desc_bytes).map_err(|_| {
-                    ComputeStatus::MissingSampler("compute_icb_inherit_ab_sampler_decode")
+                    ComputeStatus::MissingSampler(crate::observe::ladder_slug!(
+                        "compute_icb_inherit_ab_sampler",
+                        desc_decode
+                    ))
                 })?;
                 // AB-resident samplers must support argument buffers.
                 let reims_vgpu = crate::runtime::metal_draw::sampler_record(
@@ -945,16 +955,21 @@ fn apply_icb_compute_encoder_inheritance<M: HostMemory + HostOps>(
                         continue;
                     }
                     let entry = objects::lookup_list_entry(state, host, task_id, s.sampler_ref)
-                        .ok_or(ComputeStatus::MissingSampler(
-                            "compute_icb_inherit_sampler_no_entry",
-                        ))?;
+                        .ok_or(ComputeStatus::MissingSampler(crate::observe::ladder_slug!(
+                            "compute_icb_inherit_sampler",
+                            no_list_entry
+                        )))?;
                     if entry.object_type != OBJECT_TYPE_TYPE7 {
-                        return Err(ComputeStatus::MissingSampler(
-                            "compute_icb_inherit_sampler_wrong_type",
-                        ));
+                        return Err(ComputeStatus::MissingSampler(crate::observe::ladder_slug!(
+                            "compute_icb_inherit_sampler",
+                            wrong_type
+                        )));
                     }
                     let desc_bytes = objects::read_descriptor(state, host, task_id, &entry).ok_or(
-                        ComputeStatus::MissingSampler("compute_icb_inherit_sampler_no_desc"),
+                        ComputeStatus::MissingSampler(crate::observe::ladder_slug!(
+                            "compute_icb_inherit_sampler",
+                            desc_read
+                        )),
                     )?;
                     if desc_bytes.len() < 4 || ld32(&desc_bytes) != TYPE7_OBJECT_SAMPLER {
                         return Err(ComputeStatus::MissingSampler(
@@ -962,7 +977,10 @@ fn apply_icb_compute_encoder_inheritance<M: HostMemory + HostOps>(
                         ));
                     }
                     let sd = decode_sampler_descriptor(&desc_bytes).map_err(|_| {
-                        ComputeStatus::MissingSampler("compute_icb_inherit_sampler_decode")
+                        ComputeStatus::MissingSampler(crate::observe::ladder_slug!(
+                            "compute_icb_inherit_sampler",
+                            desc_decode
+                        ))
                     })?;
                     reims_vgpu_samplers.push(crate::runtime::metal_draw::sampler_record(
                         REIMS_VGPU_BINDING_SAMPLER_BASE + s.index,

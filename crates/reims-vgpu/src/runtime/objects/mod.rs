@@ -907,7 +907,7 @@ pub fn resolve_type11_ref<M: HostMemory>(
         note_type11_fail(
             task_id,
             ref_,
-            "type11_desc_read",
+            crate::observe::ladder_slug!("type11", desc_read),
             format!(
                 "type11_resolve_fail reason=type11_desc_read task={task_id} ref={ref_} obj_type={} desc_gva={:#x} desc_len={}",
                 entry.object_type, entry.descriptor_gva, entry.descriptor_length
@@ -1667,7 +1667,7 @@ fn resolve_type4_surface_ex<M: HostMemory>(
         let Some(desc) = read_descriptor(state, host, task_id, &entry) else {
             defer_type4_fail(
                 surface_id,
-                "desc_read",
+                crate::observe::ladder_slug!("", desc_read),
                 format!(
                     "type4_backing_fail reason=desc_read sid={surface_id} task={task_id} desc_gva={:#x} desc_len={}",
                     entry.descriptor_gva, entry.descriptor_length
@@ -1679,7 +1679,7 @@ fn resolve_type4_surface_ex<M: HostMemory>(
         let Some(surf) = decode_type4_surface(&desc) else {
             defer_type4_fail(
                 surface_id,
-                "desc_decode",
+                crate::observe::ladder_slug!("", desc_decode),
                 format!(
                     "type4_backing_fail reason=desc_decode sid={surface_id} task={task_id} desc_len={} backing_pfn={:#x} length={:#x}",
                     desc.len(),

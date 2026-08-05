@@ -642,16 +642,25 @@ pub(crate) fn load_mtlb<M: HostMemory + HostOps>(
         None
     };
     let Some(entry) = objects::lookup_list_entry(state, host, task_id, func_ref) else {
-        return miss("no_entry", String::new());
+        return miss(
+            crate::observe::ladder_slug!("", no_list_entry),
+            String::new(),
+        );
     };
     if entry.object_type != OBJECT_TYPE_FUNCTION {
-        return miss("wrong_type", format!("ot={}", entry.object_type));
+        return miss(
+            crate::observe::ladder_slug!("", wrong_type),
+            format!("ot={}", entry.object_type),
+        );
     }
     let Some(desc) = objects::read_descriptor(state, host, task_id, &entry) else {
-        return miss("no_desc", String::new());
+        return miss(crate::observe::ladder_slug!("", desc_read), String::new());
     };
     let Ok(f) = decode_function_descriptor(&desc) else {
-        return miss("decode", format!("desc_len={}", desc.len()));
+        return miss(
+            crate::observe::ladder_slug!("", desc_decode),
+            format!("desc_len={}", desc.len()),
+        );
     };
     if f.blob_gva == 0 || f.blob_size < 4 {
         return miss(
@@ -710,16 +719,25 @@ pub(crate) fn load_compute_pipeline<M: HostMemory + HostOps>(
         None
     };
     let Some(entry) = objects::lookup_list_entry(state, host, task_id, pipeline_ref) else {
-        return miss("no_entry", String::new());
+        return miss(
+            crate::observe::ladder_slug!("", no_list_entry),
+            String::new(),
+        );
     };
     if entry.object_type != OBJECT_TYPE_TYPE7 {
-        return miss("wrong_type", format!("ot={}", entry.object_type));
+        return miss(
+            crate::observe::ladder_slug!("", wrong_type),
+            format!("ot={}", entry.object_type),
+        );
     }
     let Some(desc) = objects::read_descriptor(state, host, task_id, &entry) else {
-        return miss("no_desc", String::new());
+        return miss(crate::observe::ladder_slug!("", desc_read), String::new());
     };
     let Ok(decoded) = decode_type7_descriptor(&desc) else {
-        return miss("decode", format!("desc_len={}", desc.len()));
+        return miss(
+            crate::observe::ladder_slug!("", desc_decode),
+            format!("desc_len={}", desc.len()),
+        );
     };
     match decoded {
         ResourceDescriptor::ComputePipeline(cp) if cp.kernel_func_ref != 0 => {
@@ -832,25 +850,37 @@ pub(crate) fn stage_buffer<M: HostMemory + HostOps>(
     };
     let Some(entry) = objects::lookup_list_entry(state, host, task_id, bind.buffer_ref) else {
         return miss(
-            ComputeStatus::MissingBuffer("compute_stage_buf_no_entry"),
+            ComputeStatus::MissingBuffer(crate::observe::ladder_slug!(
+                "compute_stage_buf",
+                no_list_entry
+            )),
             String::new(),
         );
     };
     if entry.object_type != OBJECT_TYPE_BUFFER {
         return miss(
-            ComputeStatus::MissingBuffer("compute_stage_buf_wrong_type"),
+            ComputeStatus::MissingBuffer(crate::observe::ladder_slug!(
+                "compute_stage_buf",
+                wrong_type
+            )),
             format!("ot={}", entry.object_type),
         );
     }
     let Some(desc_bytes) = objects::read_descriptor(state, host, task_id, &entry) else {
         return miss(
-            ComputeStatus::MissingBuffer("compute_stage_buf_no_desc"),
+            ComputeStatus::MissingBuffer(crate::observe::ladder_slug!(
+                "compute_stage_buf",
+                desc_read
+            )),
             String::new(),
         );
     };
     let Ok(desc) = crate::runtime::decode::resource::decode_buffer_descriptor(&desc_bytes) else {
         return miss(
-            ComputeStatus::MissingBuffer("compute_stage_buf_decode"),
+            ComputeStatus::MissingBuffer(crate::observe::ladder_slug!(
+                "compute_stage_buf",
+                desc_decode
+            )),
             format!("desc_len={}", desc_bytes.len()),
         );
     };
@@ -1367,9 +1397,10 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
                     "compute_stage_tex view_fail reason=no_desc ref={texture_ref} desc_len={}",
                     entry.descriptor_length
                 ));
-                return Err(ComputeStatus::MissingTexture(
-                    "compute_stage_tex_view_no_desc",
-                ));
+                return Err(ComputeStatus::MissingTexture(crate::observe::ladder_slug!(
+                    "compute_stage_tex_view",
+                    desc_read
+                )));
             };
             let opcode = texture_type8_opcode(&desc).unwrap_or(0);
             // Both opcodes are the same record: the wide one is what the guest's
@@ -1418,9 +1449,10 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
                             .field("use_offset", use_offset)
                             .field("offset", format!("{offset:#x}"))
                             .fail();
-                        return Err(ComputeStatus::MissingTexture(
-                            "compute_stage_tex_heap_desc_decode",
-                        ));
+                        return Err(ComputeStatus::MissingTexture(crate::observe::ladder_slug!(
+                            "compute_stage_tex_heap",
+                            desc_decode
+                        )));
                     }
                 };
                 heap_texture = Some((heap_ref, use_offset, offset, descriptor));
@@ -2019,7 +2051,10 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
     };
     let Some(entry) = objects::lookup_list_entry(state, host, task_id, stage_ref) else {
         return linear_fail(
-            ComputeStatus::MissingTexture("compute_linear_tex_no_entry"),
+            ComputeStatus::MissingTexture(crate::observe::ladder_slug!(
+                "compute_linear_tex",
+                no_list_entry
+            )),
             String::new(),
         );
     };
@@ -2032,13 +2067,19 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
     }
     let Some(desc_bytes) = objects::read_descriptor(state, host, task_id, &entry) else {
         return linear_fail(
-            ComputeStatus::MissingTexture("compute_linear_tex_no_desc"),
+            ComputeStatus::MissingTexture(crate::observe::ladder_slug!(
+                "compute_linear_tex",
+                desc_read
+            )),
             String::new(),
         );
     };
     let Ok(tex) = decode_texture_descriptor(&desc_bytes) else {
         return linear_fail(
-            ComputeStatus::MissingTexture("compute_linear_tex_desc_decode"),
+            ComputeStatus::MissingTexture(crate::observe::ladder_slug!(
+                "compute_linear_tex",
+                desc_decode
+            )),
             format!("len={}", desc_bytes.len()),
         );
     };
@@ -4362,21 +4403,39 @@ fn execute_dispatch_metal<M: HostMemory + HostOps>(
     for s in &acc.samplers {
         let entry = match objects::lookup_list_entry(state, host, task_id, s.sampler_ref) {
             Some(e) => e,
-            None => return ComputeStatus::MissingSampler("compute_mtl_sampler_no_entry"),
+            None => {
+                return ComputeStatus::MissingSampler(crate::observe::ladder_slug!(
+                    "compute_mtl_sampler",
+                    no_list_entry
+                ))
+            }
         };
         if entry.object_type != OBJECT_TYPE_TYPE7 {
-            return ComputeStatus::MissingSampler("compute_mtl_sampler_wrong_type");
+            return ComputeStatus::MissingSampler(crate::observe::ladder_slug!(
+                "compute_mtl_sampler",
+                wrong_type
+            ));
         }
         let desc = match objects::read_descriptor(state, host, task_id, &entry) {
             Some(d) => d,
-            None => return ComputeStatus::MissingSampler("compute_mtl_sampler_no_desc"),
+            None => {
+                return ComputeStatus::MissingSampler(crate::observe::ladder_slug!(
+                    "compute_mtl_sampler",
+                    desc_read
+                ))
+            }
         };
         if desc.len() < 4 || ld32(&desc) != TYPE7_OBJECT_SAMPLER {
             return ComputeStatus::MissingSampler("compute_mtl_sampler_bad_tag");
         }
         let sd = match decode_sampler_descriptor(&desc) {
             Ok(v) => v,
-            Err(_) => return ComputeStatus::MissingSampler("compute_mtl_sampler_decode"),
+            Err(_) => {
+                return ComputeStatus::MissingSampler(crate::observe::ladder_slug!(
+                    "compute_mtl_sampler",
+                    desc_decode
+                ))
+            }
         };
         reims_vgpu_samplers.push(crate::runtime::metal_draw::sampler_record(
             REIMS_VGPU_BINDING_SAMPLER_BASE + s.index,

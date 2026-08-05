@@ -1123,20 +1123,27 @@ pub fn load_icb_descriptor<M: HostMemory + HostOps>(
     if icb_ref == 0 {
         return Err(IcbStatus::Missing("icb_desc_ref_zero"));
     }
-    let entry = objects::lookup_list_entry(state, host, task_id, icb_ref)
-        .ok_or(IcbStatus::Missing("icb_desc_no_list_entry"))?;
+    let entry = objects::lookup_list_entry(state, host, task_id, icb_ref).ok_or(
+        IcbStatus::Missing(crate::observe::ladder_slug!("icb", no_list_entry)),
+    )?;
     if entry.object_type != OBJECT_TYPE_TYPE7 {
-        return Err(IcbStatus::BadDescriptor("icb_desc_wrong_type"));
+        return Err(IcbStatus::BadDescriptor(crate::observe::ladder_slug!(
+            "icb", wrong_type
+        )));
     }
-    let desc = objects::read_descriptor(state, host, task_id, &entry)
-        .ok_or(IcbStatus::Missing("icb_desc_read"))?;
+    let desc = objects::read_descriptor(state, host, task_id, &entry).ok_or(IcbStatus::Missing(
+        crate::observe::ladder_slug!("icb", desc_read),
+    ))?;
     match decode_type7_descriptor(&desc) {
         Ok(ResourceDescriptor::IndirectCommandBuffer(icb)) => {
             note_unapplied_icb_flags(task_id, icb_ref, &icb);
             Ok(icb)
         }
         Ok(_) => Err(IcbStatus::BadDescriptor("icb_desc_not_icb_body")),
-        Err(_) => Err(IcbStatus::BadDescriptor("icb_desc_type7_decode")),
+        Err(_) => Err(IcbStatus::BadDescriptor(crate::observe::ladder_slug!(
+            "icb",
+            desc_decode
+        ))),
     }
 }
 
@@ -1563,15 +1570,21 @@ fn type1_buffer_gva_size<M: HostMemory + HostOps>(
     buffer_ref: u32,
 ) -> Result<(u64, u64), IcbStatus> {
     use crate::runtime::decode::resource::{decode_buffer_descriptor, OBJECT_TYPE_BUFFER};
-    let entry = objects::lookup_list_entry(state, host, task_id, buffer_ref)
-        .ok_or(IcbStatus::Missing("icb_type1_no_list_entry"))?;
+    let entry = objects::lookup_list_entry(state, host, task_id, buffer_ref).ok_or(
+        IcbStatus::Missing(crate::observe::ladder_slug!("icb_type1", no_list_entry)),
+    )?;
     if entry.object_type != OBJECT_TYPE_BUFFER {
-        return Err(IcbStatus::BadDescriptor("icb_type1_wrong_type"));
+        return Err(IcbStatus::BadDescriptor(crate::observe::ladder_slug!(
+            "icb_type1",
+            wrong_type
+        )));
     }
-    let desc_bytes = objects::read_descriptor(state, host, task_id, &entry)
-        .ok_or(IcbStatus::Missing("icb_type1_desc_read"))?;
-    let desc = decode_buffer_descriptor(&desc_bytes)
-        .map_err(|_| IcbStatus::BadDescriptor("icb_type1_desc_decode"))?;
+    let desc_bytes = objects::read_descriptor(state, host, task_id, &entry).ok_or(
+        IcbStatus::Missing(crate::observe::ladder_slug!("icb_type1", desc_read)),
+    )?;
+    let desc = decode_buffer_descriptor(&desc_bytes).map_err(|_| {
+        IcbStatus::BadDescriptor(crate::observe::ladder_slug!("icb_type1", desc_decode))
+    })?;
     desc.backing_gva_size(state.page_shift)
         .ok_or(IcbStatus::Missing("icb_type1_no_backing"))
 }
@@ -2001,25 +2014,49 @@ pub fn fill_render_command<M: HostMemory + HostOps>(
         if fill.pipeline_ref == 0 {
             return Err(IcbStatus::Args("icb_frc_pipeline_ref_zero"));
         }
-        let entry = objects::lookup_list_entry(state, host, task_id, fill.pipeline_ref)
-            .ok_or(IcbStatus::Missing("icb_frc_pipeline_no_list_entry"))?;
+        let entry = objects::lookup_list_entry(state, host, task_id, fill.pipeline_ref).ok_or(
+            IcbStatus::Missing(crate::observe::ladder_slug!(
+                "icb_frc_pipeline",
+                no_list_entry
+            )),
+        )?;
         if entry.object_type != OBJECT_TYPE_TYPE7 {
-            return Err(IcbStatus::BadDescriptor("icb_frc_pipeline_wrong_type"));
+            return Err(IcbStatus::BadDescriptor(crate::observe::ladder_slug!(
+                "icb_frc_pipeline",
+                wrong_type
+            )));
         }
-        let desc_bytes = objects::read_descriptor(state, host, task_id, &entry)
-            .ok_or(IcbStatus::Missing("icb_frc_pipeline_desc_read"))?;
-        let rp = decode_render_pipeline_descriptor(&desc_bytes)
-            .map_err(|_| IcbStatus::BadDescriptor("icb_frc_pipeline_desc_decode"))?;
+        let desc_bytes = objects::read_descriptor(state, host, task_id, &entry).ok_or(
+            IcbStatus::Missing(crate::observe::ladder_slug!("icb_frc_pipeline", desc_read)),
+        )?;
+        let rp = decode_render_pipeline_descriptor(&desc_bytes).map_err(|_| {
+            IcbStatus::BadDescriptor(crate::observe::ladder_slug!(
+                "icb_frc_pipeline",
+                desc_decode
+            ))
+        })?;
         let load_fn = |func_ref: u32| -> Result<Vec<u8>, IcbStatus> {
-            let e = objects::lookup_list_entry(state, host, task_id, func_ref)
-                .ok_or(IcbStatus::Missing("icb_frc_function_no_list_entry"))?;
+            let e = objects::lookup_list_entry(state, host, task_id, func_ref).ok_or(
+                IcbStatus::Missing(crate::observe::ladder_slug!(
+                    "icb_frc_function",
+                    no_list_entry
+                )),
+            )?;
             if e.object_type != OBJECT_TYPE_FUNCTION {
-                return Err(IcbStatus::BadDescriptor("icb_frc_function_wrong_type"));
+                return Err(IcbStatus::BadDescriptor(crate::observe::ladder_slug!(
+                    "icb_frc_function",
+                    wrong_type
+                )));
             }
-            let d = objects::read_descriptor(state, host, task_id, &e)
-                .ok_or(IcbStatus::Missing("icb_frc_function_desc_read"))?;
-            let f: FunctionDescriptor = decode_function_descriptor(&d)
-                .map_err(|_| IcbStatus::BadDescriptor("icb_frc_function_desc_decode"))?;
+            let d = objects::read_descriptor(state, host, task_id, &e).ok_or(
+                IcbStatus::Missing(crate::observe::ladder_slug!("icb_frc_function", desc_read)),
+            )?;
+            let f: FunctionDescriptor = decode_function_descriptor(&d).map_err(|_| {
+                IcbStatus::BadDescriptor(crate::observe::ladder_slug!(
+                    "icb_frc_function",
+                    desc_decode
+                ))
+            })?;
             if f.blob_gva == 0 || f.blob_size < 4 {
                 return Err(IcbStatus::Args("icb_frc_function_blob_empty"));
             }

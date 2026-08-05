@@ -61,6 +61,7 @@
 pub mod decline;
 pub mod emit;
 pub mod footprint;
+pub mod ladder;
 pub mod phase_clock;
 pub mod sink;
 
@@ -69,6 +70,9 @@ pub mod sink;
 pub(crate) use decline::decline_display;
 pub use decline::{Decline, Refusal};
 pub use emit::{first_sight, state_changed, Emit};
+/// The four object-list resolution rungs, so a rail spells the condition the
+/// same way every other rail does. See [`ladder`] for why it is a macro.
+pub(crate) use ladder::ladder_slug;
 
 // The sink's surface is re-exported flat so call sites read `observe::fail(…)`
 // rather than `observe::sink::fail(…)`. `sink` stays public for readers who

@@ -430,12 +430,15 @@ fn bound_depth_stencil_that_cannot_resolve_returns_named_reason() {
     // draw silently disables the depth test otherwise, and every other
     // depth/stencil degradation on this path is already fail-visible. With an
     // empty state the lookup misses → the entry-missing reason, which the caller
-    // logs as `shader_state_degraded reason=depth_stencil_entry_missing`.
+    // logs as `shader_state_degraded reason=depth_stencil_no_list_entry`.
     let state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
     let host = FakeHost::new();
     let err = load_depth_stencil_descriptor(&state, &host, /*task*/ 4, /*ds_ref*/ 9)
         .expect_err("unresolvable bound depth-stencil must report a reason");
-    assert_eq!(err, "depth_stencil_entry_missing");
+    assert_eq!(
+        err,
+        crate::observe::ladder_slug!("depth_stencil", no_list_entry)
+    );
 }
 
 #[test]
@@ -1802,7 +1805,10 @@ fn vulkan_sampler_missing_entry_returns_exact_decline() {
     let host = FakeHost::new();
     let error = load_vulkan_sampler(&state, &host, 7, 11, 64)
         .expect_err("an empty object list cannot resolve sampler 11");
-    assert_eq!(error.slug(), "draw_prepare_sampler_entry_missing");
+    assert_eq!(
+        error.slug(),
+        crate::observe::ladder_slug!("draw_prepare_sampler", no_list_entry)
+    );
     assert_eq!(
         error.fields(),
         vec![("sampler_ref", "11".into()), ("binding", "64".into()),]
