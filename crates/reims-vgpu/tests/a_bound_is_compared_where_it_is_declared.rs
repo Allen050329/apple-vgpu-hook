@@ -68,7 +68,7 @@ const BOUNDS: &[Bound] = &[
             ),
             (
                 "backend/metal/constants.rs",
-                "assert!(REIMS_VGPU_METAL_MAX_BUFFERS as u32 <= REIMS_VGPU_BINDING_TEXTURE_BASE);",
+                "const _: () = assert!(REIMS_VGPU_METAL_MAX_BUFFERS as u32 <= REIMS_VGPU_BINDING_TEXTURE_BASE);",
                 "relates two constants to each other, not a decoded index to a \
                  bound: it pins that the buffer band ends before the texture \
                  band begins, so no binding can name a slot in both. A predicate \
