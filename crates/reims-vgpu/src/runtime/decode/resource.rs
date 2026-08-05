@@ -98,26 +98,34 @@ pub const ICB_DESC_LEN: usize = w_icb::NEW_INDIRECT_COMMAND_BUFFER_TOTAL_LEN as 
 /// `newIndirectCommandBufferWithDescriptor:…` strb order:
 /// +0xc vertex · +0xd fragment · +0xe kernel · +0xf object · +0x10 mesh ·
 /// +0x11 kernelTG · +0x12 objectTG.
-pub const ICB_DESC_MAX_VERTEX_BINDS: usize =
+#[cfg(test)]
+pub(crate) const ICB_DESC_MAX_VERTEX_BINDS: usize =
     OP_HDR + offset_of!(w_icb::NewIcbBody, max_vertex_buffer_bind_count);
-pub const ICB_DESC_MAX_FRAGMENT_BINDS: usize =
+#[cfg(test)]
+pub(crate) const ICB_DESC_MAX_FRAGMENT_BINDS: usize =
     OP_HDR + offset_of!(w_icb::NewIcbBody, max_fragment_buffer_bind_count);
 /// maxKernelBufferBindCount.
-pub const ICB_DESC_MAX_KERNEL_BINDS: usize =
+#[cfg(test)]
+pub(crate) const ICB_DESC_MAX_KERNEL_BINDS: usize =
     OP_HDR + offset_of!(w_icb::NewIcbBody, max_kernel_buffer_bind_count);
 /// maxObjectBufferBindCount (mesh object stage).
-pub const ICB_DESC_MAX_OBJECT_BINDS: usize =
+#[cfg(test)]
+pub(crate) const ICB_DESC_MAX_OBJECT_BINDS: usize =
     OP_HDR + offset_of!(w_icb::NewIcbBody, max_object_buffer_bind_count);
 /// maxMeshBufferBindCount.
-pub const ICB_DESC_MAX_MESH_BINDS: usize =
+#[cfg(test)]
+pub(crate) const ICB_DESC_MAX_MESH_BINDS: usize =
     OP_HDR + offset_of!(w_icb::NewIcbBody, max_mesh_buffer_bind_count);
 /// maxKernelThreadgroupMemoryBindCount.
-pub const ICB_DESC_MAX_KERNEL_TG_BINDS: usize =
+#[cfg(test)]
+pub(crate) const ICB_DESC_MAX_KERNEL_TG_BINDS: usize =
     OP_HDR + offset_of!(w_icb::NewIcbBody, max_kernel_threadgroup_memory_bind_count);
 /// maxObjectThreadgroupMemoryBindCount.
-pub const ICB_DESC_MAX_OBJECT_TG_BINDS: usize =
+#[cfg(test)]
+pub(crate) const ICB_DESC_MAX_OBJECT_TG_BINDS: usize =
     OP_HDR + offset_of!(w_icb::NewIcbBody, max_object_threadgroup_memory_bind_count);
-pub const ICB_DESC_FLAGS: usize = OP_HDR + offset_of!(w_icb::NewIcbBody, flags);
+#[cfg(test)]
+pub(crate) const ICB_DESC_FLAGS: usize = OP_HDR + offset_of!(w_icb::NewIcbBody, flags);
 /// Bytes per ICB kernel-threadgroup-memory length slot (`u64` length at index).
 pub const ICB_TG_MEMORY_STRIDE: usize = 8;
 /// Bytes per ICB attribute-stride table entry (`u64` stride at buffer index).
@@ -185,11 +193,14 @@ pub const ICB_FLAG_NEVER_WRITTEN: u16 = 1 << 15;
 /// six of the counters in
 /// [`IndirectCommandBufferDescriptor::unapplied_flags`] on every test that used
 /// it.
-pub const ICB_FLAGS_DEFAULT: u16 = 0x7ff0;
+#[cfg(test)]
+pub(crate) const ICB_FLAGS_DEFAULT: u16 = 0x7ff0;
 /// Embedded ICB command layout (52 B) at +0x1c in the create body.
-pub const ICB_DESC_LAYOUT: usize = OP_HDR + offset_of!(w_icb::NewIcbBody, layout);
+#[cfg(test)]
+pub(crate) const ICB_DESC_LAYOUT: usize = OP_HDR + offset_of!(w_icb::NewIcbBody, layout);
 pub const ICB_LAYOUT_LEN: usize = size_of::<w_icb::IcbLayout>();
-pub const ICB_DESC_MAX_COMMAND_COUNT: usize =
+#[cfg(test)]
+pub(crate) const ICB_DESC_MAX_COMMAND_COUNT: usize =
     OP_HDR + offset_of!(w_icb::NewIcbBody, max_command_count);
 /// `MTLResourceOptions`, and it is a **`u16`**: the serializer narrows the `Q`
 /// its selector declares, and `+0x56`/`+0x57` are never written at all.
@@ -437,7 +448,8 @@ pub const TEXTURE_LEVEL_WIDTH: usize = 24;
 pub const TEXTURE_LEVEL_HEIGHT: usize = 28;
 pub const TEXTURE_LEVEL_DEPTH: usize = 32;
 pub const TEXTURE_DESC_PIXEL_FORMAT: usize = 86;
-pub const TEXTURE_DESC_BASE_LEN: usize = 116;
+#[cfg(test)]
+pub(crate) const TEXTURE_DESC_BASE_LEN: usize = 116;
 pub const TEXTURE_MAX_MIP_LEVELS: usize = 16;
 
 /// Vertex attribute from a type-7 render-pipeline vertex-input block.
@@ -656,23 +668,32 @@ pub const TEXTURE_VIEW_DESC_LEN: usize = offset_of!(reims_vgpu_wire::OpHeader, l
 // The `*_MIN_*` names are historical: each is the record's *total* length, not
 // a floor. Apple's serializer writes exactly one length per opcode, which is
 // what the wire crate's `*_TOTAL_LEN` names say.
-pub const TEXTURE_VIEW_DESC_TEXTURE_REF: usize =
+#[cfg(test)]
+pub(crate) const TEXTURE_VIEW_DESC_TEXTURE_REF: usize =
     OP_HDR + offset_of!(w_view::TextureViewBody, object_ref);
-pub const TEXTURE_VIEW_DESC_BASE_REF: usize =
+#[cfg(test)]
+pub(crate) const TEXTURE_VIEW_DESC_BASE_REF: usize =
     OP_HDR + offset_of!(w_view::TextureViewBody, base_texture_ref);
-pub const TEXTURE_VIEW_DESC_PIXEL_FORMAT: usize =
+#[cfg(test)]
+pub(crate) const TEXTURE_VIEW_DESC_PIXEL_FORMAT: usize =
     OP_HDR + offset_of!(w_view::TextureViewBody, pixel_format);
-pub const TEXTURE_VIEW_DESC_TEXTURE_TYPE: usize =
+#[cfg(test)]
+pub(crate) const TEXTURE_VIEW_DESC_TEXTURE_TYPE: usize =
     OP_HDR + offset_of!(w_view::TextureViewRangedBody, texture_type);
-pub const TEXTURE_VIEW_DESC_LEVEL_BASE: usize =
+#[cfg(test)]
+pub(crate) const TEXTURE_VIEW_DESC_LEVEL_BASE: usize =
     OP_HDR + offset_of!(w_view::TextureViewRangedBody, level_base);
-pub const TEXTURE_VIEW_DESC_LEVEL_COUNT: usize =
+#[cfg(test)]
+pub(crate) const TEXTURE_VIEW_DESC_LEVEL_COUNT: usize =
     OP_HDR + offset_of!(w_view::TextureViewRangedBody, level_count);
-pub const TEXTURE_VIEW_DESC_SLICE_BASE: usize =
+#[cfg(test)]
+pub(crate) const TEXTURE_VIEW_DESC_SLICE_BASE: usize =
     OP_HDR + offset_of!(w_view::TextureViewRangedBody, slice_base);
-pub const TEXTURE_VIEW_DESC_SLICE_COUNT: usize =
+#[cfg(test)]
+pub(crate) const TEXTURE_VIEW_DESC_SLICE_COUNT: usize =
     OP_HDR + offset_of!(w_view::TextureViewRangedBody, slice_count);
-pub const TEXTURE_VIEW_DESC_SWIZZLE: usize =
+#[cfg(test)]
+pub(crate) const TEXTURE_VIEW_DESC_SWIZZLE: usize =
     OP_HDR + offset_of!(w_view::TextureViewSwizzleBody, swizzle);
 pub const TEXTURE_VIEW_MIN_SIMPLE: usize = w_view::TEXTURE_VIEW_TOTAL_LEN as usize;
 pub const TEXTURE_VIEW_MIN_RANGED: usize = w_view::TEXTURE_VIEW_RANGED_TOTAL_LEN as usize;
@@ -690,8 +711,10 @@ pub const TEXTURE_VIEW_OPCODE_SWIZZLE: u32 = w_view::OPCODE_TEXTURE_VIEW_SWIZZLE
 // leaving two readings that agree only by habit.
 pub const HEAP_TEXTURE_OPCODE: u32 = w_heap::OPCODE_NEW_HEAP_TEXTURE;
 pub const HEAP_TEXTURE_LEN: usize = w_heap::NEW_HEAP_TEXTURE_TOTAL_LEN as usize;
-pub const HEAP_TEXTURE_HEAP_REF: usize = OP_HDR + offset_of!(w_heap::NewHeapTextureBody, heap_ref);
-pub const HEAP_TEXTURE_DESCRIPTOR: usize = OP_HDR + offset_of!(w_heap::NewHeapTextureBody, desc);
+#[cfg(test)]
+pub(crate) const HEAP_TEXTURE_HEAP_REF: usize = OP_HDR + offset_of!(w_heap::NewHeapTextureBody, heap_ref);
+#[cfg(test)]
+pub(crate) const HEAP_TEXTURE_DESCRIPTOR: usize = OP_HDR + offset_of!(w_heap::NewHeapTextureBody, desc);
 pub const HEAP_TEXTURE_USE_OFFSET: usize =
     OP_HDR + offset_of!(w_heap::NewHeapTextureBody, use_offset_bits);
 pub const HEAP_TEXTURE_OFFSET: usize = OP_HDR + offset_of!(w_heap::NewHeapTextureBody, offset);
@@ -757,7 +780,8 @@ pub const TEXTURE_VIEW_MTL_TYPE_1D: u16 = 0;
 pub const TEXTURE_VIEW_MTL_TYPE_1D_ARRAY: u16 = 1;
 pub const TEXTURE_VIEW_MTL_TYPE_2D: u16 = 2;
 pub const TEXTURE_VIEW_MTL_TYPE_2D_ARRAY: u16 = 3;
-pub const TEXTURE_VIEW_MTL_TYPE_2D_MULTISAMPLE: u16 = 4;
+#[cfg(test)]
+pub(crate) const TEXTURE_VIEW_MTL_TYPE_2D_MULTISAMPLE: u16 = 4;
 pub const TEXTURE_VIEW_MTL_TYPE_CUBE: u16 = 5;
 pub const TEXTURE_VIEW_MTL_TYPE_CUBE_ARRAY: u16 = 6;
 pub const TEXTURE_VIEW_MTL_TYPE_3D: u16 = 7;
@@ -834,6 +858,11 @@ pub const BLEND_OP_ADD: u32 = 0;
 // `MTLColorWriteMask` (Metal.framework Headers/MTLRenderPipeline.h). The bits
 // run alpha-first from the low end, which is the reverse of the RGBA reading
 // order the name suggests — `Red` is `1 << 3`, not `1 << 0`.
+//
+// This is an SDK mirror, so the table is the whole enum and stays `pub` even
+// where a member has no reader. `_NONE` has one on the Vulkan arm only, and
+// gating it on that arm would make the mirror's completeness depend on which
+// backend is compiled — which is the property a mirror exists to not have.
 pub const MTL_COLOR_WRITE_MASK_NONE: u32 = 0;
 pub const MTL_COLOR_WRITE_MASK_ALPHA: u32 = 1 << 0;
 pub const MTL_COLOR_WRITE_MASK_BLUE: u32 = 1 << 1;
@@ -897,9 +926,11 @@ pub const PIPELINE_TAG_COLOR_ATTACH_OFFSET: u8 = 0x08;
 /// this tag selects the mesh role map for tags 0x01/0x02/0x03.
 pub const PIPELINE_TAG_MESH_SECTION_OFFSET: u8 = 0x14;
 /// Mesh object-stage function — same wire tag as classic vertex (`0x01`).
-pub const PIPELINE_TAG_OBJECT_FUNC: u8 = PIPELINE_TAG_VERTEX_FUNC;
+#[cfg(test)]
+pub(crate) const PIPELINE_TAG_OBJECT_FUNC: u8 = PIPELINE_TAG_VERTEX_FUNC;
 /// Mesh mesh-stage function — same wire tag as classic fragment (`0x02`).
-pub const PIPELINE_TAG_MESH_FUNC: u8 = PIPELINE_TAG_FRAGMENT_FUNC;
+#[cfg(test)]
+pub(crate) const PIPELINE_TAG_MESH_FUNC: u8 = PIPELINE_TAG_FRAGMENT_FUNC;
 
 pub const VERTEX_DESC_TAG_ATTRIBUTES: u8 = 0x00;
 pub const VERTEX_DESC_TAG_LAYOUTS: u8 = 0x01;
@@ -980,8 +1011,8 @@ const DEPTH_STENCIL_DESC_STATE_BITS: usize =
 const DEPTH_STENCIL_DESC_ID: usize = OP_HDR + offset_of!(w_ds::DepthStencilBody, object_ref);
 #[cfg(test)]
 const DEPTH_STENCIL_DESC_FRONT_FACE: usize = OP_HDR + offset_of!(w_ds::DepthStencilBody, front);
-pub const DEPTH_STENCIL_DEPTH_COMPARE_MASK: u32 = 0x7;
-pub const DEPTH_STENCIL_DEPTH_WRITE: u32 = 1 << 3;
+#[cfg(test)]
+pub(crate) const DEPTH_STENCIL_DEPTH_WRITE: u32 = 1 << 3;
 pub const DEPTH_STENCIL_FRONT_STENCIL_ENABLED: u32 = 1 << 4;
 pub const DEPTH_STENCIL_BACK_STENCIL_ENABLED: u32 = 1 << 5;
 
