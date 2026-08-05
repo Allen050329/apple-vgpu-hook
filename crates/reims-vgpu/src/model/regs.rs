@@ -209,6 +209,20 @@ pub const CHILD_REG_BLOCK_OFFSET: u64 = 0x400;
 pub const CHILD_REG_BLOCK_STRIDE: u64 = 0x14;
 pub const CHILD_REG_TAIL: u64 = 0x00;
 pub const CHILD_REG_HEAD: u64 = 0x04;
+/// The one word of the five-word child block nothing reads.
+///
+/// `drain::child` takes head, tail, stamp index and base PFN out of this block
+/// every doorbell; this word sits between head and stamp index and no product
+/// path touches it. It stays named for the reason [`DISPLAY_SWAP_DISPLAY`]
+/// does — a guest field with no name is the one nobody notices being ignored —
+/// and because deleting it leaves the block map skipping `0x08` with nothing
+/// saying what lives there, which is how a later offset gets read from the
+/// wrong word.
+///
+/// Whether ignoring it is correct is **not established**. It is named `CONTROL`
+/// from the register block's shape rather than from a decoded write, and no
+/// boot on this rig has sampled what the guest puts in it. `dead-state` reports
+/// it on both arms every run; this comment is the triage, not a licence to cut.
 pub const CHILD_REG_CONTROL: u64 = 0x08;
 pub const CHILD_REG_STAMP_INDEX: u64 = 0x0c;
 pub const CHILD_REG_BASE_PFN: u64 = 0x10;
@@ -316,7 +330,6 @@ pub const CURSOR_GLYPH_PAYLOAD_LEN: usize = 0x2c;
 
 pub const MMIO_U32: u32 = 4;
 pub const MMIO_U64: u32 = 8;
-
 
 /// Highest protocol version this host implements.
 ///
@@ -840,7 +853,10 @@ mod tests {
             ("SET_OBJECT_LIST", CHILD_OP_SET_OBJECT_LIST),
             ("INVALIDATE_RESOURCES", CHILD_OP_INVALIDATE_RESOURCES),
             ("SYNCHRONIZE_RESOURCES", CHILD_OP_SYNCHRONIZE_RESOURCES),
-            ("DELETE_IOSURFACE_BACKING2", CHILD_OP_DELETE_IOSURFACE_BACKING2),
+            (
+                "DELETE_IOSURFACE_BACKING2",
+                CHILD_OP_DELETE_IOSURFACE_BACKING2,
+            ),
             ("EXEC_INDIRECT2", CHILD_OP_EXEC_INDIRECT2),
             ("DEFINE_TASK2", CHILD_OP_DEFINE_TASK2),
             ("MAP_MEMORY2", CHILD_OP_MAP_MEMORY2),
