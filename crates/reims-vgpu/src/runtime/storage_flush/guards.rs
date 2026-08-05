@@ -293,6 +293,17 @@ pub(super) enum WindowRefusal {
     MappingPageDrift,
 }
 
+/// Which rail is landing the window.
+///
+/// The two ask the same three questions and their drift refusals lose the same
+/// thing — guest work that nothing will re-arm — so the census names for those
+/// losses come from one table rather than from each rail's own call site.
+#[derive(Clone, Copy)]
+pub(super) enum Rail {
+    Render,
+    Compute,
+}
+
 impl WindowRefusal {
     /// The `reason=` field, including whatever the reason itself carries.
     ///
@@ -310,6 +321,37 @@ impl WindowRefusal {
                 format!("map_generation_drift current={current:?}")
             }
             Self::MappingPageDrift => "mapping_page_drift".to_string(),
+        }
+    }
+
+    /// The store-route name for a refusal that loses guest work, or `None`
+    /// when nothing was lost.
+    ///
+    /// A lost tile has to be countable, not just loggable. `flush_intersecting`
+    /// has already TAKEN the window out of `compute_deferred_flush` by the time
+    /// either rail refuses, and `flush_mapping_windows_before_fence` returns
+    /// `()`, so the fence advances and nothing re-arms the obligation: the
+    /// pixels land nowhere, permanently. That is the event a census has to be
+    /// able to score an arm against.
+    ///
+    /// `mapping_pages_drifted` is not a substitute for either rail — it is
+    /// incremented inside [`mapping_pages_still_ours`], which more than one
+    /// caller reaches, so it counts refusals rather than lost work.
+    ///
+    /// The render rail carried its two names and the compute rail carried
+    /// none, which was not a decision anybody made: the two ladders were 400
+    /// lines apart and each looked complete. Both are here now, so a third
+    /// refusal added to the enum has to say what it costs on *both* rails
+    /// before it compiles.
+    pub(super) fn lost_work_route(&self, rail: Rail) -> Option<&'static str> {
+        match (rail, self) {
+            // Not a loss: the guest declared its own pages authoritative, so
+            // it asked for these bytes to be dropped.
+            (_, Self::HostCopySuperseded) => None,
+            (Rail::Render, Self::MapGenerationDrift { .. }) => Some("rendflush_gen_drift"),
+            (Rail::Render, Self::MappingPageDrift) => Some("rendflush_page_drift"),
+            (Rail::Compute, Self::MapGenerationDrift { .. }) => Some("compflush_gen_drift"),
+            (Rail::Compute, Self::MappingPageDrift) => Some("compflush_page_drift"),
         }
     }
 }

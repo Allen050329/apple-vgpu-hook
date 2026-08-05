@@ -10,7 +10,7 @@
 #[cfg(feature = "backend-vulkan")]
 use super::guards::{
     deferred_flush_lost, deferred_pages_still_ours, mapping_window_refusal,
-    window_pages_still_ours, WindowRefusal,
+    window_pages_still_ours, Rail,
 };
 #[cfg(feature = "backend-vulkan")]
 use super::lifecycle::release_window_pin_for_key;
@@ -708,30 +708,13 @@ fn flush_render_one<M: HostMemory + HostOps>(
         // lifetime. That is the "~260 stale residents (~516 MiB)" shape, and the
         // generation drift is not rare: one in 85 s on a driven boot.
         release_window_pin_for_key(key, source);
-        // Counted, not just logged, for the two drift arms. The three
-        // resident-mismatch refusals below have carried census routes since they
-        // were split apart; these two did not, and they are the ones that lose a
-        // painted tile. `flush_intersecting` has already TAKEN this window out of
-        // `compute_deferred_flush`, and `flush_mapping_windows_before_fence`
-        // returns `()`, so the fence advances and nothing re-arms the
-        // obligation: the pixels land nowhere, permanently.
-        //
-        // That is the Goal 3 event, and until now a census could not count it.
-        // `mapping_pages_drifted` is not a substitute — it is incremented inside
-        // `mapping_pages_still_ours`, which several callers reach, so it counts
-        // refusals rather than lost tiles.
-        //
-        // `HostCopySuperseded` is deliberately uncounted: the guest asked for
-        // its own bytes to win, so no tile was lost. The compute rail counts
-        // none of the three, which is a gap on that rail and not a rule here.
-        match &refusal {
-            WindowRefusal::MapGenerationDrift { .. } => {
-                crate::runtime::drain::note_store_route("rendflush_gen_drift");
-            }
-            WindowRefusal::MappingPageDrift => {
-                crate::runtime::drain::note_store_route("rendflush_page_drift");
-            }
-            WindowRefusal::HostCopySuperseded => {}
+        // Counted, not just logged, when the refusal loses a painted tile. Which
+        // of the three do is `WindowRefusal`'s answer and not this rail's, so
+        // the compute rail below cannot end up scoring the same losses
+        // differently. The three resident-mismatch refusals further down carry
+        // their own routes.
+        if let Some(route) = refusal.lost_work_route(Rail::Render) {
+            crate::runtime::drain::note_store_route(route);
         }
         crate::observe::fail(deferred_flush_lost(
             "render",
@@ -1153,6 +1136,12 @@ fn flush_storage_one<M: HostMemory + HostOps>(
         // release is a different call from the render rail's — which is why the
         // ladder returns the refusal instead of reporting it.
         crate::backend::vulkan::engine::unpin_resident_storage(key);
+        // Same census as the render rail, from the same table. This rail used
+        // to count none of its three refusals while losing the dispatch output
+        // just as permanently.
+        if let Some(route) = refusal.lost_work_route(Rail::Compute) {
+            crate::runtime::drain::note_store_route(route);
+        }
         crate::observe::fail(deferred_flush_lost(
             "compute",
             key,

@@ -2301,3 +2301,109 @@ fn the_two_rails_report_the_three_shared_refusals_exactly_as_they_always_did() {
     // documented: the two fields carry different values here.
     assert!(compute[1].contains("gen=1 content_gen=9"));
 }
+
+/// Both rails score a lost window, and they score it from one table.
+///
+/// The render rail counted its two drift refusals and the compute rail counted
+/// none, while losing its dispatch output just as permanently — the window is
+/// already out of `compute_deferred_flush` when either refuses, and nothing
+/// re-arms it. That was not a decision anybody made; the two ladders were 400
+/// lines apart and each looked complete.
+///
+/// So this asserts the table, not one rail's call site. A refusal that costs
+/// guest work must name a route on *both* rails, and the one that costs
+/// nothing must name a route on neither — `HostCopySuperseded` is the guest
+/// asking for its own bytes to win. Adding a fourth `WindowRefusal` fails here
+/// until someone has said what it costs on each rail.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn a_refusal_that_loses_guest_work_is_counted_on_both_rails_or_on_neither() {
+    use super::guards::{Rail, WindowRefusal};
+
+    let costs_work = [
+        WindowRefusal::MapGenerationDrift { current: Some(2) },
+        WindowRefusal::MappingPageDrift,
+    ];
+    for refusal in &costs_work {
+        let render = refusal.lost_work_route(Rail::Render);
+        let compute = refusal.lost_work_route(Rail::Compute);
+        assert!(
+            render.is_some() && compute.is_some(),
+            "{} loses guest work on both rails but is counted on {}",
+            refusal.reason("Store"),
+            match (render, compute) {
+                (Some(_), None) => "only the render one",
+                (None, Some(_)) => "only the compute one",
+                _ => "neither",
+            }
+        );
+        // Two rails sharing one route name would add their losses together and
+        // no reader could tell which rail dropped the frame.
+        assert_ne!(
+            render, compute,
+            "the two rails must not share a route name: {render:?}"
+        );
+    }
+
+    assert_eq!(
+        WindowRefusal::HostCopySuperseded.lost_work_route(Rail::Render),
+        None
+    );
+    assert_eq!(
+        WindowRefusal::HostCopySuperseded.lost_work_route(Rail::Compute),
+        None
+    );
+}
+
+/// The compute rail's generation-drift loss reaches the census.
+///
+/// The sibling assertion for the render rail lives in
+/// `a_render_window_flushes_through_the_shared_trigger_and_names_its_rail`.
+/// This one is the rail that used to count nothing: it takes the same window
+/// through `flush_intersecting` with a compute owner and checks both halves —
+/// the fail line names the rail, and the route moved.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn a_compute_window_over_a_rebound_mapping_is_counted_not_only_logged() {
+    use crate::runtime::host::FakeHost;
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+    let m = state.mappings.entry(11).or_default();
+    m.mapped = true;
+    // The window latched map_generation 1 (from `key`); the mapping has since
+    // moved to 4, so its pages are not the ones the dispatch wrote for.
+    m.map_generation = 4;
+    state.compute_deferred_flush.insert(
+        key(11, 0, 256),
+        crate::model::DeferredOwner::Storage {
+            generation: 1,
+            armed_stamp_seq: 0,
+        },
+    );
+    // Route counts are process-global and this suite runs serially, so take a
+    // baseline rather than assuming this is the first window to drift.
+    let before = crate::runtime::drain::store_route_count("compflush_gen_drift");
+    let cap = crate::observe::FailCapture::start();
+    assert!(
+        !super::flush_intersecting(&mut state, &mut host, 11, 0, u64::MAX),
+        "a window that cannot be written must report the loss"
+    );
+    let line = cap.one("deferred_flush_lost");
+    assert!(
+        line.contains("kind=compute"),
+        "a compute window must not be reported as a render one: {line}"
+    );
+    assert!(
+        line.contains("reason=map_generation_drift") && line.contains("current=Some(4)"),
+        "the rebound mapping must be the stated refusal: {line}"
+    );
+    assert!(
+        state.compute_deferred_flush.is_empty(),
+        "the trigger must consume the window it took, which is why the loss is permanent"
+    );
+    assert_eq!(
+        crate::runtime::drain::store_route_count("compflush_gen_drift"),
+        before + 1,
+        "the compute rail's generation-drift loss must reach the store-route census"
+    );
+}
