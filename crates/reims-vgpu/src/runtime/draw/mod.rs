@@ -115,10 +115,46 @@ pub(crate) use texture_view::*;
 mod render_target;
 use render_target::{lookup_render_target, ResolvedRenderTarget};
 
-/// Upper bound on a single buffer materialization (pathological pooled allocs).
-/// Metal buffer/texture bind **index** cap (`REIMS_VGPU_METAL_MAX_BUFFERS`) — API slot
-/// count, not a byte-size budget. Resource byte sizes follow the guest
-/// descriptor / page-table span (zero-copy direction: no host MiB cap).
+/// Bind **index** cap for all three argument tables — buffers, textures and
+/// samplers — applied once in [`crate::runtime::exec`]'s `apply_binds`.
+///
+/// A slot count, not a byte budget. Resource byte sizes follow the guest
+/// descriptor and page-table span; nothing here caps them.
+///
+/// # 31 is Metal's *buffer* table, and it is the wrong number for the other two
+///
+/// `reims_vgpu_wire::ops::bind_limit` measures Apple's three tables at 128
+/// textures, 31 buffers and 16 samplers, and three `const` assertions beside
+/// `apply_binds` pin this constant's relation to each. So:
+///
+/// * **Buffers** — exact. 31 is the serializer's own bound, so this fits with no
+///   loss and no margin at all.
+/// * **Samplers** — Apple truncates at 16, well below this, so a drop cannot
+///   come from a stream Apple's serializer wrote.
+/// * **Textures** — a real gap. `setVertexTextures:withRange:` over a range of
+///   40 is a record Apple can produce and this device drops from slot 31 on.
+///
+/// It has not been observed to fire: two driven x86/PCI boots read every one of
+/// 18 044 and then 575 041 bind records at slot 16 or below, inside the
+/// *smallest* of the three tables. `apply_binds` reports a drop on the fail
+/// channel and counts the slots, and `render_bind_reach_texture_le_table` is the
+/// leading indicator — it moves one band earlier, at slot 17.
+///
+/// # Widening the texture band is blocked outside this repository
+///
+/// Not by effort here, which is why the reading is not the whole argument. The
+/// Vulkan arm's binding numbers are `metal2vulkan`'s output, not this crate's
+/// choice: the translator emits `OpDecorate Binding` at `32 + N` for Metal
+/// texture index `N` and `64 + N` for sampler `N`, and
+/// [`crate::runtime::spirv_bind`] only *relocates* those numbers within the
+/// bands it finds. A texture at index 40 would be emitted at binding 72, which
+/// is sampler 8 in the same scheme — so the 32-wide texture band is a property
+/// of the pinned `metal2vulkan` dependency, and no in-tree change widens it.
+///
+/// The Metal-direct arm has no such constraint (its own table is 128), but this
+/// bound is applied during stream accumulation, before either backend, so
+/// splitting it would mean the two arms accepting different guest streams.
+/// Whoever takes this on starts in the translator, not here.
 pub const MAX_BIND_SLOTS: u32 = 31;
 
 /// Convert a guest-declared byte length to a host allocation size.

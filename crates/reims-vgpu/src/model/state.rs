@@ -2586,7 +2586,7 @@ impl DeviceState {
     ///
     /// So a `task_id >> 1` arm here matched no window this task owns and did
     /// match every window owned by slots `2 * task_id` and `2 * task_id + 1`.
-    /// Slots run densely from 0 out of [`MAX_TASKS`] = 256, and boots use ids
+    /// Task ids run densely from 0 and boots use ids
     /// well past 14, so those are live tasks: deleting task 5 retired tasks 10
     /// and 11's pending frames. Cache-only landing writes no guest pages, so the
     /// effect was a live task silently losing rendered pixels out of guest RAM
