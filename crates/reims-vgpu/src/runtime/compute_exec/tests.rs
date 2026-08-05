@@ -21,6 +21,7 @@ use crate::runtime::decode::resource::{
 use crate::runtime::gva_mem;
 use crate::runtime::gva_mem::write_task_gva_arm64e;
 use crate::runtime::host::FakeHost;
+use reims_vgpu_wire::device_desc::Type5Builder;
 
 #[cfg(feature = "backend-vulkan")]
 #[test]
@@ -151,59 +152,14 @@ fn stage_texture_type5_plane_index_beats_the_ambiguous_geometry_scan() {
     // 56-byte type-5 blob: 8-byte head, then kind/blob_len/own_ref and a 0x24
     // record whose `+0x20` carries the plane index.
     let desc_gva = (4u64 + 2) << PAGE_SHIFT_ARM64E;
-    let mut type5_desc = vec![0u8; 8];
-    st32(&mut type5_desc[objects::TYPE5_SURFACE_ID..], sid);
-    type5_desc.extend_from_slice(&[
-        0x2f,
-        0,
-        0,
-        0, // kind
-        0x30,
-        0,
-        0,
-        0, // blob_len
-        10,
-        0,
-        0,
-        0, // own_ref
-        0x42,
-        0x01,
-        MTL_FORMAT_R8_UNORM as u8,
-        (MTL_FORMAT_R8_UNORM >> 8) as u8,
-        4,
-        0,
-        0,
-        0, // view width
-        4,
-        0,
-        0,
-        0, // view height
-        1,
-        0,
-        0,
-        0, // depth
-        1,
-        0,
-        1,
-        0,
-        1,
-        0,
-        0x10,
-        0, // trailer
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0, // reserved
-        2,
-        0,
-        0,
-        0, // IOSurface plane index = 2 (alpha)
-    ]);
-    write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, &type5_desc);
+    let type5_desc = Type5Builder::new(sid, 0, 10, 0x42)
+        .unknown(0x01)
+        .geometry(MTL_FORMAT_R8_UNORM, 4, 4, 1)
+        .trailer([1, 0, 1, 0, 1, 0, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+        // IOSurface plane index = 2 (alpha)
+        .plane_index(2);
+    let type5_desc = type5_desc.bytes();
+    write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, type5_desc);
     let off = list_object_entry_offset(type5_ref, 32).unwrap();
     let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
     let packed = (objects::OBJECT_TYPE_REF_TEXTURE as u32) | ((type5_desc.len() as u32) << 8);
@@ -1039,9 +995,9 @@ fn stage_texture_type5_ref_resolves_surface_mapping() {
 
     // Object-list: type-5 at ref 10 → surface_id=3 (mapping already seeded).
     let desc_gva = (4u64 + 2) << PAGE_SHIFT_ARM64E; // data pfn base 4 + 2
-    let mut type5_desc = vec![0u8; 16];
-    st32(&mut type5_desc[objects::TYPE5_SURFACE_ID..], sid);
-    write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, &type5_desc);
+    let type5_desc = Type5Builder::new(sid, 0, 0, 0).with_len(16);
+    let type5_desc = type5_desc.bytes();
+    write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, type5_desc);
     let off = list_object_entry_offset(type5_ref, 32).unwrap();
     let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
     let packed = (objects::OBJECT_TYPE_REF_TEXTURE as u32) | ((16u32) << 8);
@@ -1093,47 +1049,12 @@ fn stage_texture_type5_record_reshapes_stageable_single_plane_surface() {
 
     // Same 16 bytes per logical row: 4 BGRA8 texels = one RGBA32Uint texel.
     let desc_gva = (4u64 + 2) << PAGE_SHIFT_ARM64E;
-    let mut type5_desc = vec![0u8; 8];
-    st32(&mut type5_desc[objects::TYPE5_SURFACE_ID..], sid);
-    type5_desc.extend_from_slice(&[
-        0x2f,
-        0,
-        0,
-        0,
-        0x30,
-        0,
-        0,
-        0,
-        10,
-        0,
-        0,
-        0, // kind, blob_len, own_ref
-        0x42,
-        0x02,
-        MTL_FORMAT_RGBA32_UINT as u8,
-        (MTL_FORMAT_RGBA32_UINT >> 8) as u8,
-        1,
-        0,
-        0,
-        0, // view width
-        4,
-        0,
-        0,
-        0, // view height
-        1,
-        0,
-        0,
-        0, // depth
-        1,
-        0,
-        1,
-        0,
-        1,
-        0,
-        0x10,
-        0, // trailer
-    ]);
-    write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, &type5_desc);
+    let type5_desc = Type5Builder::new(sid, 0, 10, 0x42)
+        .unknown(0x02)
+        .geometry(MTL_FORMAT_RGBA32_UINT, 1, 4, 1)
+        .trailer([1, 0, 1, 0, 1, 0, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    let type5_desc = type5_desc.bytes();
+    write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, type5_desc);
     let off = list_object_entry_offset(type5_ref, 32).unwrap();
     let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
     let packed = (objects::OBJECT_TYPE_REF_TEXTURE as u32) | ((type5_desc.len() as u32) << 8);
@@ -1171,11 +1092,11 @@ fn stage_texture_type5_record_reshapes_stageable_single_plane_surface() {
     // path), so `storage_selector` is populated — but it is inert here: this
     // view is staged sampled (`is_storage=false`, binding 32), and the
     // selector is only consulted on the storage-bind path.
-    let format_at = objects::TYPE5_ARG_RECORD + objects::TYPE5_RECORD_FORMAT;
-    type5_desc[format_at..format_at + 2].copy_from_slice(&MTL_FORMAT_R32_UINT.to_le_bytes());
-    let width_at = objects::TYPE5_ARG_RECORD + objects::TYPE5_RECORD_WIDTH;
-    st32(&mut type5_desc[width_at..], 4);
-    write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, &type5_desc);
+    let reshaped = Type5Builder::new(sid, 0, 10, 0x42)
+        .unknown(0x02)
+        .geometry(MTL_FORMAT_R32_UINT, 4, 4, 1)
+        .trailer([1, 0, 1, 0, 1, 0, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, reshaped.bytes());
     let sampled = stage_texture_raw(&mut state, &mut host, 1, type5_ref, 32, false)
         .expect("sample-only R32Uint view must stage from the same IOSurface bytes");
     assert_eq!((sampled.width, sampled.height), (4, 4));
@@ -1252,16 +1173,12 @@ fn stage_texture_type5_record_stages_biplanar_y_plane() {
 
     // Type-5 descriptor: sid + args blob carrying the R8 16×8 plane record.
     let desc_gva = (4u64 + 2) << PAGE_SHIFT_ARM64E;
-    let mut type5_desc = vec![0u8; 8];
-    st32(&mut type5_desc[objects::TYPE5_SURFACE_ID..], sid);
-    type5_desc.extend_from_slice(&[
-        0x2f, 0, 0, 0, 0x30, 0, 0, 0, 10, 0, 0, 0, // kind, blob_len, own_ref
-        0x42, 0x01, 0x0a, 0x00, // tag, unk, fmt=R8
-        16, 0, 0, 0, // width
-        8, 0, 0, 0, // height
-        1, 0, 0, 0, // depth
-    ]);
-    write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, &type5_desc);
+    // tag, unk, fmt=R8
+    let type5_desc = Type5Builder::new(sid, 0, 10, 0x42)
+        .unknown(0x01)
+        .geometry(0x0a, 16, 8, 1);
+    let type5_desc = type5_desc.bytes();
+    write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, type5_desc);
     let off = list_object_entry_offset(type5_ref, 32).unwrap();
     let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
     let packed = (objects::OBJECT_TYPE_REF_TEXTURE as u32) | ((type5_desc.len() as u32) << 8);
@@ -1335,9 +1252,9 @@ fn stage_texture_type5_multiplanar_without_record_fails_closed() {
 
     // Type-5 descriptor with sid but NO args record.
     let desc_gva = (4u64 + 2) << PAGE_SHIFT_ARM64E;
-    let mut type5_desc = vec![0u8; 8];
-    st32(&mut type5_desc[objects::TYPE5_SURFACE_ID..], sid);
-    write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, &type5_desc);
+    let type5_desc = Type5Builder::new(sid, 0, 0, 0).with_len(8);
+    let type5_desc = type5_desc.bytes();
+    write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, type5_desc);
     let off = list_object_entry_offset(type5_ref, 32).unwrap();
     let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
     let packed = (objects::OBJECT_TYPE_REF_TEXTURE as u32) | ((type5_desc.len() as u32) << 8);
@@ -1600,9 +1517,9 @@ fn stage_texture_type5_ignores_task_object_list_slot_collision() {
 
     // type-5 at ref 10 → surface_id 3
     let desc_gva = (4u64 + 2) << PAGE_SHIFT_ARM64E;
-    let mut type5_desc = vec![0u8; 16];
-    st32(&mut type5_desc[objects::TYPE5_SURFACE_ID..], sid);
-    write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, &type5_desc);
+    let type5_desc = Type5Builder::new(sid, 0, 0, 0).with_len(16);
+    let type5_desc = type5_desc.bytes();
+    write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, type5_desc);
     let off = list_object_entry_offset(type5_ref, 32).unwrap();
     let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
     let packed = (objects::OBJECT_TYPE_REF_TEXTURE as u32) | ((16u32) << 8);
@@ -1633,9 +1550,9 @@ fn stage_texture_type5_without_surface_is_missing() {
     let type5_ref = 11u32;
     let sid = 99u32; // no mapping
     let desc_gva = (4u64 + 3) << PAGE_SHIFT_ARM64E;
-    let mut type5_desc = vec![0u8; 16];
-    st32(&mut type5_desc[objects::TYPE5_SURFACE_ID..], sid);
-    write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, &type5_desc);
+    let type5_desc = Type5Builder::new(sid, 0, 0, 0).with_len(16);
+    let type5_desc = type5_desc.bytes();
+    write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, type5_desc);
     let off = list_object_entry_offset(type5_ref, 32).unwrap();
     let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
     let packed = (objects::OBJECT_TYPE_REF_TEXTURE as u32) | ((16u32) << 8);

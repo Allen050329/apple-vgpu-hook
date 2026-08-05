@@ -754,10 +754,10 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
         let Some(bytes) = objects::read_descriptor(state, host, task_id, &entry) else {
             return Err(br(BlitStatus::MissingResource, "t5_desc_read"));
         };
-        if bytes.len() < objects::TYPE5_MIN_LEN {
+        let Ok(t5) = reims_vgpu_wire::device_desc::type5_header(&bytes) else {
             return Err(br(BlitStatus::MissingResource, "t5_desc_short"));
-        }
-        let sid = crate::contract::endian::ld32(&bytes[objects::TYPE5_SURFACE_ID..]);
+        };
+        let sid = t5.surface_id.get();
         if sid == 0 {
             return Err(br(BlitStatus::MissingResource, "t5_no_sid"));
         }
@@ -3980,20 +3980,18 @@ mod tests {
         assert!(state.set_mapping_geom(mapping_id, width, height, format));
         // Type-5 descriptor: 56-byte blob, 0x62 color-view record.
         assert!(state.set_object_list(1, 0, 16));
-        let desc_len = 56usize;
-        let mut desc = vec![0u8; desc_len];
-        st32(&mut desc[objects::TYPE5_SURFACE_ID..], mapping_id);
-        st32(&mut desc[objects::TYPE5_ARG_KIND..], 0x2f);
-        st32(&mut desc[objects::TYPE5_ARG_BLOB_LEN..], 0x30);
-        st32(&mut desc[objects::TYPE5_ARG_OWN_REF..], obj_ref);
-        let rec = objects::TYPE5_ARG_RECORD;
-        desc[rec] = objects::TYPE5_RECORD_TAG_COLOR_VIEW;
-        st16(&mut desc[rec + objects::TYPE5_RECORD_FORMAT..], format);
-        st32(&mut desc[rec + objects::TYPE5_RECORD_WIDTH..], width);
-        st32(&mut desc[rec + objects::TYPE5_RECORD_HEIGHT..], height);
-        st32(&mut desc[rec + objects::TYPE5_RECORD_DEPTH..], 1);
+        let built = reims_vgpu_wire::device_desc::Type5Builder::new(
+            mapping_id,
+            0,
+            obj_ref,
+            objects::TYPE5_RECORD_TAG_COLOR_VIEW,
+        )
+        .geometry(format, width, height, 1)
+        .with_len(56);
+        let desc = built.bytes();
+        let desc_len = desc.len();
         let desc_gva = 0x180u64 + (obj_ref as u64) * 0x40;
-        write_task_gva_arm64e(host, &state.tasks[1], desc_gva, &desc);
+        write_task_gva_arm64e(host, &state.tasks[1], desc_gva, desc);
         write_list_entry(
             host,
             state,

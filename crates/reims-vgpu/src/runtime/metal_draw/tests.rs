@@ -3148,10 +3148,11 @@ fn type5_sample_uses_descriptor_surface_id_not_ref_collision() {
     let texture_ref = 2u32;
     let surface_id = 71u32;
     let desc_gva = 0x1000u64;
-    let mut desc = vec![0u8; objects::TYPE5_MIN_LEN];
-    st32(&mut desc[objects::TYPE5_SURFACE_ID..], surface_id);
+    let built = reims_vgpu_wire::device_desc::Type5Builder::new(surface_id, 0, 0, 0)
+        .with_len(objects::TYPE5_MIN_LEN);
+    let desc = built.bytes();
     assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], desc_gva, &desc, PAGE_SHIFT_X86,)
+        gva_mem::write_task_gva(&mut host, &state.tasks[1], desc_gva, desc, PAGE_SHIFT_X86,)
             .is_ok()
     );
     let list_off = list_object_entry_offset(texture_ref, 32).unwrap();
@@ -3284,10 +3285,11 @@ fn type11_host_cache_rung_identity_tracks_the_cached_frame() {
     let texture_ref = 2u32;
     let surface_id = 71u32;
     let desc_gva = 0x1000u64;
-    let mut desc = vec![0u8; objects::TYPE5_MIN_LEN];
-    st32(&mut desc[objects::TYPE5_SURFACE_ID..], surface_id);
+    let built = reims_vgpu_wire::device_desc::Type5Builder::new(surface_id, 0, 0, 0)
+        .with_len(objects::TYPE5_MIN_LEN);
+    let desc = built.bytes();
     assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], desc_gva, &desc, PAGE_SHIFT_X86,)
+        gva_mem::write_task_gva(&mut host, &state.tasks[1], desc_gva, desc, PAGE_SHIFT_X86,)
             .is_ok()
     );
     let list_off = list_object_entry_offset(texture_ref, 32).unwrap();
@@ -3457,29 +3459,17 @@ fn type5_sample_uses_serialized_rg8_view_over_unknown_surface_fourcc() {
     let height = 154u32;
     let surface_bpr = 320u32;
     let desc_gva = 0x1000u64;
-    let desc_len = objects::TYPE5_ARG_RECORD + objects::TYPE5_RECORD_MIN_LEN;
-    let mut desc = vec![0u8; desc_len];
-    st32(&mut desc[objects::TYPE5_SURFACE_ID..], surface_id);
-    st32(&mut desc[objects::TYPE5_ARG_OWN_REF..], texture_ref);
-    desc[objects::TYPE5_ARG_RECORD] = objects::TYPE5_RECORD_TAG;
-    st16(
-        &mut desc[objects::TYPE5_ARG_RECORD + objects::TYPE5_RECORD_FORMAT..],
-        MTL_FORMAT_RG8_UNORM,
-    );
-    st32(
-        &mut desc[objects::TYPE5_ARG_RECORD + objects::TYPE5_RECORD_WIDTH..],
-        width,
-    );
-    st32(
-        &mut desc[objects::TYPE5_ARG_RECORD + objects::TYPE5_RECORD_HEIGHT..],
-        height,
-    );
-    st32(
-        &mut desc[objects::TYPE5_ARG_RECORD + objects::TYPE5_RECORD_DEPTH..],
-        1,
-    );
+    let built = reims_vgpu_wire::device_desc::Type5Builder::new(
+        surface_id,
+        0,
+        texture_ref,
+        objects::TYPE5_RECORD_TAG_PLANE,
+    )
+    .geometry(MTL_FORMAT_RG8_UNORM, width, height, 1);
+    let desc = built.bytes();
+    let desc_len = desc.len();
     assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], desc_gva, &desc, PAGE_SHIFT_X86,)
+        gva_mem::write_task_gva(&mut host, &state.tasks[1], desc_gva, desc, PAGE_SHIFT_X86,)
             .is_ok()
     );
     let list_off = list_object_entry_offset(texture_ref, 256).unwrap();

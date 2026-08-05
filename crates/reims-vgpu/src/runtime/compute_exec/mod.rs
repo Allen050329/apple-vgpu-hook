@@ -1552,8 +1552,8 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
     if let Some(entry) = stage_entry {
         if entry.object_type == objects::OBJECT_TYPE_REF_TEXTURE {
             if let Some(desc) = objects::read_descriptor(state, host, task_id, &entry) {
-                if desc.len() >= objects::TYPE5_MIN_LEN {
-                    let sid = ld32(&desc[objects::TYPE5_SURFACE_ID..]);
+                if let Ok(t5) = reims_vgpu_wire::device_desc::type5_header(&desc) {
+                    let sid = t5.surface_id.get();
                     if sid != 0 {
                         stage_ref = sid;
                         from_type5 = true;
@@ -1571,10 +1571,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
                             // The owner task the view names. `note_type5_owner_task`
                             // is the always-on check on its value; this echo carries
                             // it beside the descriptor it came out of.
-                            let owner_task = desc
-                                .get(objects::TYPE5_OWNER_TASK..objects::TYPE5_OWNER_TASK + 4)
-                                .map(ld32)
-                                .unwrap_or(0);
+                            let owner_task = t5.owner_task.get();
                             let args_n = desc.len().saturating_sub(objects::TYPE5_ARGS);
                             let mut args_hex = String::new();
                             if args_n > 0 {

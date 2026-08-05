@@ -9,6 +9,7 @@
 use crate::backend::vulkan::engine::{DrawError, DrawPreparationDecline};
 #[cfg(feature = "backend-vulkan")]
 use crate::backend::vulkan::translate;
+#[cfg(feature = "backend-vulkan")]
 use crate::contract::endian::ld32;
 use crate::contract::pixel_format::{self, TexelLayout, MTL_FORMAT_BGRA8_UNORM, RGBA8_BPP};
 use crate::model::DeviceState;
@@ -2585,11 +2586,13 @@ fn sample_miss_detail<M: HostMemory + HostOps>(
         objects::OBJECT_TYPE_REF_TEXTURE => {
             match objects::read_descriptor(state, host, task_id, &entry) {
                 None => format!("type=5 desc_len={desc_len} reason=no_desc"),
-                Some(d) if d.len() < objects::TYPE5_MIN_LEN => {
+                Some(d) if reims_vgpu_wire::device_desc::type5_header(&d).is_err() => {
                     format!("type=5 desc_len={desc_len} reason=short_desc")
                 }
                 Some(d) => {
-                    let sid = ld32(&d[objects::TYPE5_SURFACE_ID..]);
+                    let sid = reims_vgpu_wire::device_desc::type5_header(&d)
+                        .map(|h| h.surface_id.get())
+                        .unwrap_or(0);
                     match objects::decode_type5_texture_view(&d) {
                         Some(view) => format!(
                             "type=5 desc_len={desc_len} surface_id={sid} view={}x{} fmt={:#x} reason=ref_texture_view",
@@ -3480,10 +3483,10 @@ fn lookup_render_target<M: HostMemory + HostOps>(
     } else if live_type == Some(objects::OBJECT_TYPE_REF_TEXTURE) {
         let entry = live.as_ref()?;
         let desc = objects::read_descriptor(state, host, task_id, entry)?;
-        if desc.len() < objects::TYPE5_MIN_LEN {
-            return None;
-        }
-        let sid = ld32(&desc[objects::TYPE5_SURFACE_ID..]);
+        let sid = reims_vgpu_wire::device_desc::type5_header(&desc)
+            .ok()?
+            .surface_id
+            .get();
         if sid == 0 {
             return None;
         }

@@ -8,10 +8,11 @@
 //! `AppleParavirtResource::allocateBackingHandle` calls
 //! `ResourceHeap::addObject(type=4, objectId=IOSurface::getSurfaceID(), …)` so
 //! the object-list index for a surface-backed resource **is** the present
-//! `surface_id`. Descriptor layout:
-//! length@0, backing_pfn@8, format@0xc, plane_count@0x10, planes@0x14.
+//! `surface_id`. The descriptor's own layout is
+//! [`reims_vgpu_wire::device_desc`], which states it once with `offset_of!`
+//! rather than as the eight literal offsets that used to sit in this module.
 
-use crate::contract::endian::{ld32, ld64, st16, st32, st64};
+use crate::contract::endian::{st16, st32, st64};
 use crate::contract::iosurface_pages::{
     entry_gpa_shift, page_size_of, DEVICE_DESC_ALLOC_SIZE, DEVICE_DESC_BASE_OFFSET,
     DEVICE_DESC_BPE, DEVICE_DESC_BPR, DEVICE_DESC_DIMS, DEVICE_DESC_LEN, DEVICE_DESC_PIXEL_FORMAT,
@@ -159,71 +160,20 @@ pub const OBJECT_TYPE_REF_TEXTURE: u8 = 5;
 ///   stream for the **plane** view; plane is applied guest-side before serialize)
 ///
 /// See [[reims-vgpu-resource-paging]] type-5 section.
-pub const TYPE5_SURFACE_ID: usize = 0x00;
-/// The task the guest names as the surface's owner, and the answer to the
-/// question [`resolve_type4_surface_ex`]'s search is asking.
+/// Type-5 descriptor geometry, from the wire crate's Tier-2 view of it.
 ///
-/// This field used to be documented as a "device-side field dword", i.e. as
-/// opaque. It is not. `allocateRefTextureHandle` writes it from the *accelerator's*
-/// task rather than from its own — the same field the type-4 registration path
-/// reads its heap out of — so a type-5 view carries the id of the task whose
-/// object list holds the surface it references, not the id of the task that
-/// created the view. Those differ by construction: an IOSurface backing is
-/// registered in the accelerator's kernel task, while the view is registered in
-/// the calling client's, which is why threading the *naming* task into type-4
-/// resolution regresses the boot (`AGENTS.md` records that dead end).
-///
-/// The kernel task's id is an immediate 0 and index 0 is reserved out of the
-/// 256-entry task id allocator before any client task exists, so every value
-/// seen here is expected to be 0 — which is why the search's "task 0 first" probe
-/// order works, and why it is a decoded fact rather than a lucky constant.
-/// [`note_type5_owner_task`] is the standing check on that.
-pub const TYPE5_OWNER_TASK: usize = 0x04;
-pub const TYPE5_ARGS: usize = 0x08;
-pub const TYPE5_MIN_LEN: usize = 0x08;
+/// The ten offsets these used to be are `offset_of!` on
+/// [`reims_vgpu_wire::device_desc::Type5Header`], `Type5ArgsHeader` and
+/// `Type5TextureRecord`, asserted there against the numbers this module used to
+/// state. The two record tags come with them, since a tag is part of the
+/// layout's identity and not of this device's policy.
+pub use reims_vgpu_wire::device_desc::{
+    TYPE5_ARGS, TYPE5_ARG_RECORD, TYPE5_OWNER_TASK, TYPE5_RECORD_MIN_LEN, TYPE5_RECORD_PLANE,
+    TYPE5_RECORD_TAG_COLOR_VIEW, TYPE5_RECORD_TAG_PLANE, TYPE5_SURFACE_ID,
+};
 
-/// Type-5 args blob layout (live wire census 2026-07-14, `compute_stage_tex
-/// type5 … args_hex`; 48-byte blob on Ventura 13.7.8 x86):
-/// - `+0` u32 kind tag (`0x2f` observed)
-/// - `+4` u32 blob length (== `desc_len - TYPE5_ARGS`)
-/// - `+8` u32 the type-5 object's **own ref** (same convention as the type-11
-///   texture descriptor's object-ref field)
-/// - `+12` serialized **plane texture record** — the guest-side
-///   `newTextureWithDescriptor:iosurface:plane:` view (plane already applied
-///   before serialization; see the `TYPE5_ARGS` doc above):
-///   `[+0 u8 tag=0x42][+1 u8 unknown][+2 u16 MTLPixelFormat][+4 u32 width]`
-///   `[+8 u32 height][+12 u32 depth][+0x10 trailer][+0x20 u32 IOSurface plane]`
-///   Live: `R8 1024×1024 depth=1` = Y plane of a `'420f'` 1024×1024 surface;
-///   `BGRA8 68×58`, `RGBA32Uint 482×1928` (uint4 view of a BGRA 1928×1928
-///   surface — byte-identical rows) also observed.
-///   The **plane index at record `+0x20`** is the
-///   `newTextureWithDescriptor:iosurface:plane:` plane argument — live v0a8
-///   3-plane blob census (boot 20260717-063043, 10 mappings): Y blobs carry 0,
-///   the RG8 chroma blob carries 1, and the second R8 view of identical
-///   geometry carries 2 (the alpha plane). Geometry cannot disambiguate Y from
-///   alpha; this field is the only wire key. (The type-11 texture descriptor
-///   carries no such field — that finding is unchanged.)
-#[cfg(test)]
-pub(crate) const TYPE5_ARG_KIND: usize = TYPE5_ARGS;
-#[cfg(test)]
-pub(crate) const TYPE5_ARG_BLOB_LEN: usize = TYPE5_ARGS + 0x04;
-#[cfg(test)]
-pub(crate) const TYPE5_ARG_OWN_REF: usize = TYPE5_ARGS + 0x08;
-pub const TYPE5_ARG_RECORD: usize = TYPE5_ARGS + 0x0c;
-pub const TYPE5_RECORD_TAG: u8 = 0x42;
-/// Sibling record tag observed live on the blit copy-source path (x86 Ventura
-/// 13.7.8, 2026-07-19 six-app launch): full-color texture views (BGRA8_sRGB
-/// 1024×768 window backings) carry tag `0x62` where biplanar plane views carry
-/// `0x42`. The record layout (format@+2, width@+4, height@+8, depth@+0xc) is
-/// byte-identical — the tag distinguishes a variant, not a different geometry
-/// encoding — so both decode through the same field offsets.
-pub const TYPE5_RECORD_TAG_COLOR_VIEW: u8 = 0x62;
-pub const TYPE5_RECORD_FORMAT: usize = 0x02;
-pub const TYPE5_RECORD_WIDTH: usize = 0x04;
-pub const TYPE5_RECORD_HEIGHT: usize = 0x08;
-pub const TYPE5_RECORD_DEPTH: usize = 0x0c;
-pub const TYPE5_RECORD_PLANE: usize = 0x20;
-pub const TYPE5_RECORD_MIN_LEN: usize = 0x10;
+/// Shortest type-5 descriptor: the header, with no args blob behind it.
+pub const TYPE5_MIN_LEN: usize = TYPE5_ARGS;
 
 /// Texture view named by a type-5 descriptor's serialized args record.
 ///
@@ -256,10 +206,10 @@ pub struct Type5TextureView {
 /// meaning is wrong. `first_sight` is keyed on the value alone, so the whole
 /// boot costs one line whichever way it goes.
 fn note_type5_owner_task(desc: &[u8]) {
-    let Some(bytes) = desc.get(TYPE5_OWNER_TASK..TYPE5_OWNER_TASK + 4) else {
+    let Ok(h) = reims_vgpu_wire::device_desc::type5_header(desc) else {
         return;
     };
-    let task = ld32(bytes);
+    let task = h.owner_task.get();
     if !crate::observe::first_sight("type5_owner_task", task as u64) {
         return;
     }
@@ -282,47 +232,40 @@ fn note_type5_owner_task(desc: &[u8]) {
 /// geometry merely because the surface itself is otherwise stageable.
 pub fn decode_type5_texture_view(desc: &[u8]) -> Option<Type5TextureView> {
     note_type5_owner_task(desc);
-    if desc.len() < TYPE5_ARG_RECORD + TYPE5_RECORD_MIN_LEN {
+    let rec = reims_vgpu_wire::device_desc::type5_texture_record(desc).ok()?;
+    // Both the biplanar-plane tag and the full-colour view variant share the
+    // field layout; any other tag stays unknown → fail closed (no invented
+    // geometry).
+    if !rec.tag_is_known() {
         return None;
     }
-    let rec = &desc[TYPE5_ARG_RECORD..];
-    // Accept both the biplanar-plane record tag (0x42) and the full-color
-    // texture-view variant (0x62); both share the field layout below. Any other
-    // tag stays unknown → fail closed (no invented geometry).
-    if rec[0] != TYPE5_RECORD_TAG && rec[0] != TYPE5_RECORD_TAG_COLOR_VIEW {
-        return None;
-    }
-    let pixel_format = u16::from_le_bytes([rec[TYPE5_RECORD_FORMAT], rec[TYPE5_RECORD_FORMAT + 1]]);
-    let width = ld32(&rec[TYPE5_RECORD_WIDTH..]);
-    let height = ld32(&rec[TYPE5_RECORD_HEIGHT..]);
-    let depth = ld32(&rec[TYPE5_RECORD_DEPTH..]);
+    let pixel_format = rec.pixel_format.get();
+    let width = rec.width.get();
+    let height = rec.height.get();
+    let depth = rec.depth.get();
     if pixel_format == 0 || width == 0 || height == 0 || depth != 1 {
         return None;
     }
-    let plane_index = if rec.len() >= TYPE5_RECORD_PLANE + 4 {
-        ld32(&rec[TYPE5_RECORD_PLANE..])
-    } else {
-        0
-    };
     Some(Type5TextureView {
         pixel_format,
         width,
         height,
         depth,
-        plane_index,
+        // `None` is a blob that stops before the field — pre-plane descriptors
+        // and fixtures — which this rail reads as plane 0.
+        plane_index: reims_vgpu_wire::device_desc::type5_record_plane_index(desc).unwrap_or(0),
     })
 }
 
-/// Type-4 descriptor field offsets (RE allocateBackingHandle / tahoe §9.4).
-pub const TYPE4_LEN: usize = 0x00;
-pub const TYPE4_BACKING_PFN: usize = 0x08;
-pub const TYPE4_PIXEL_FORMAT: usize = 0x0c;
-pub const TYPE4_PLANE_COUNT: usize = 0x10;
-pub const TYPE4_PLANES: usize = 0x14;
-pub const TYPE4_PLANE_STRIDE: usize = 0x10;
-pub const TYPE4_MIN_LEN: usize = 0x24;
-/// Max plane records in type-4 wire / device desc (IOSurface getPlaneCount cap).
-pub const TYPE4_PLANE_CAP: usize = 8;
+/// Type-4 descriptor geometry, from the wire crate's Tier-2 view of it.
+///
+/// The eight offsets these used to be are now `offset_of!` on
+/// [`reims_vgpu_wire::device_desc::Type4SurfaceHeader`] and
+/// [`reims_vgpu_wire::device_desc::Type4PlaneRecord`], asserted there. Only the
+/// three the device still computes with are re-exported.
+pub use reims_vgpu_wire::device_desc::{
+    type4_len_for, TYPE4_MIN_LEN, TYPE4_PLANES, TYPE4_PLANE_CAP, TYPE4_PLANE_STRIDE,
+};
 
 /// CoreVideo / IOSurface biplanar 420 full-range (`'420f'`).
 pub const IOSURFACE_FOURCC_420F: u32 = 0x3432_3066;
@@ -467,24 +410,15 @@ pub fn iosurface_pixel_format_to_mtl(pixel_format: u32) -> u16 {
     }
 }
 
-/// Decode one type-4 plane at `TYPE4_PLANES + i*TYPE4_PLANE_STRIDE`.
+/// Decode one type-4 plane record.
 fn decode_type4_plane(desc: &[u8], plane_index: usize) -> Option<Type4Plane> {
-    let base = TYPE4_PLANES + plane_index * TYPE4_PLANE_STRIDE;
-    if desc.len() < base + TYPE4_PLANE_STRIDE {
-        return None;
-    }
-    let offset = ld32(&desc[base..]);
-    let width = ld32(&desc[base + 4..]);
-    let height = ld32(&desc[base + 8..]);
-    let packed = ld32(&desc[base + 12..]);
-    let bytes_per_row = packed & 0x00ff_ffff;
-    let bytes_per_element = ((packed >> 24) & 0xff) as u8;
+    let r = reims_vgpu_wire::device_desc::type4_plane(desc, plane_index).ok()?;
     Some(Type4Plane {
-        offset,
-        width,
-        height,
-        bytes_per_row,
-        bytes_per_element,
+        offset: r.offset.get(),
+        width: r.width.get(),
+        height: r.height.get(),
+        bytes_per_row: r.bytes_per_row(),
+        bytes_per_element: r.bytes_per_element(),
     })
 }
 
@@ -534,10 +468,17 @@ pub fn undecoded_type4_surface_bytes(desc: &[u8]) -> Vec<u8> {
     if desc.len() < TYPE4_MIN_LEN {
         return Vec::new();
     }
-    let plane_count = (desc[TYPE4_PLANE_COUNT] as usize).min(TYPE4_PLANE_CAP);
-    let planes_end = TYPE4_PLANES + plane_count * TYPE4_PLANE_STRIDE;
+    let Ok(h) = reims_vgpu_wire::device_desc::type4_header(desc) else {
+        return Vec::new();
+    };
+    let plane_count = (h.plane_count as usize).min(TYPE4_PLANE_CAP);
+    let planes_end = type4_len_for(plane_count);
     let mut out = Vec::new();
-    out.extend_from_slice(&desc[0x11..TYPE4_PLANES]);
+    // The header's undecoded interior, named by the field rather than by the
+    // literal it used to be: a field added before it moves this with it.
+    let reserved =
+        core::mem::offset_of!(reims_vgpu_wire::device_desc::Type4SurfaceHeader, reserved);
+    out.extend_from_slice(&desc[reserved..TYPE4_PLANES]);
     if planes_end < desc.len() {
         out.extend_from_slice(&desc[planes_end..]);
     }
@@ -587,15 +528,16 @@ fn note_type4_surface_shape(desc: &[u8]) {
         ));
         return;
     }
-    let (w, h, fmt, pc) = if desc.len() >= TYPE4_MIN_LEN {
-        (
-            ld32(&desc[TYPE4_PLANES + 4..]),
-            ld32(&desc[TYPE4_PLANES + 8..]),
-            ld32(&desc[TYPE4_PIXEL_FORMAT..]),
-            desc[TYPE4_PLANE_COUNT],
-        )
-    } else {
-        (0, 0, 0, 0)
+    // Plane 0's geometry through the plane decoder, not through `TYPE4_PLANES
+    // + 4` and `+ 8`. Those two literals were the plane record's interior
+    // restated at a second site, so the stride was declared once and its
+    // contents twice.
+    let (w, h, fmt, pc) = match (
+        reims_vgpu_wire::device_desc::type4_header(desc),
+        decode_type4_plane(desc, 0),
+    ) {
+        (Ok(h), Some(p0)) => (p0.width, p0.height, h.pixel_format.get(), h.plane_count),
+        _ => (0, 0, 0, 0),
     };
     let hex: String = desc
         .iter()
@@ -654,10 +596,11 @@ pub fn decode_type4_surface(desc: &[u8]) -> Option<Type4Surface> {
     if desc.len() < TYPE4_MIN_LEN {
         return None;
     }
-    let length = ld64(&desc[TYPE4_LEN..]);
-    let backing_pfn = ld32(&desc[TYPE4_BACKING_PFN..]);
-    let pixel_format = ld32(&desc[TYPE4_PIXEL_FORMAT..]);
-    let plane_count_raw = desc[TYPE4_PLANE_COUNT];
+    let h = reims_vgpu_wire::device_desc::type4_header(desc).ok()?;
+    let length = h.length.get();
+    let backing_pfn = h.backing_pfn.get();
+    let pixel_format = h.pixel_format.get();
+    let plane_count_raw = h.plane_count;
     if backing_pfn == 0 || length == 0 {
         return None;
     }
@@ -1740,11 +1683,11 @@ fn resolve_type4_surface_ex<M: HostMemory>(
                 format!(
                     "type4_backing_fail reason=desc_decode sid={surface_id} task={task_id} desc_len={} backing_pfn={:#x} length={:#x}",
                     desc.len(),
-                    desc.get(TYPE4_BACKING_PFN..TYPE4_BACKING_PFN + 4)
-                        .map(ld32)
+                    reims_vgpu_wire::device_desc::type4_header(&desc)
+                        .map(|h| h.backing_pfn.get())
                         .unwrap_or(0),
-                    desc.get(TYPE4_LEN..TYPE4_LEN + 8)
-                        .map(ld64)
+                    reims_vgpu_wire::device_desc::type4_header(&desc)
+                        .map(|h| h.length.get())
                         .unwrap_or(0)
                 ),
             );
@@ -1861,6 +1804,7 @@ pub fn ensure_surface_for_present<M: HostMemory + crate::runtime::host::HostOps>
 
 #[cfg(test)]
 mod tests {
+    use reims_vgpu_wire::device_desc::Type4Builder;
 
     use super::*;
     use crate::contract::endian::{ld32, st16, st32, st64};
@@ -1959,15 +1903,12 @@ mod tests {
     fn the_type4_decoder_reports_what_it_drops() {
         // `desc` reaches only plane 0's record, so planes 1..=7 are declared
         // and unreachable, and plane 8+ is over the cap.
-        let mut desc = vec![0u8; 0x24];
-        st64(&mut desc[TYPE4_LEN..], 0x1000);
-        st32(&mut desc[TYPE4_BACKING_PFN..], 0x100);
-        st32(&mut desc[TYPE4_PIXEL_FORMAT..], 0x4247_5241); // 'BGRA'
-        desc[TYPE4_PLANE_COUNT] = 12;
+        let built = Type4Builder::new(0x1000, 0x100, 0x4247_5241, 12).with_len(0x24); // 'BGRA'
+        let desc = built.bytes();
 
         reset_type4_decode_drops();
         let cap = crate::observe::FailCapture::start();
-        let s = decode_type4_surface(&desc).expect("type4 decodes");
+        let s = decode_type4_surface(desc).expect("type4 decodes");
         assert_eq!(s.plane_count, TYPE4_PLANE_CAP as u8, "still clamped");
         // Two distinct drops on this descriptor, so select by reason rather
         // than by slug: the surplus planes over the cap, and — separately —
@@ -1985,7 +1926,7 @@ mod tests {
         // Same reason twice is one line — the latch is what keeps a per-surface
         // stream from flooding the always-on channel.
         let cap2 = crate::observe::FailCapture::start();
-        let _ = decode_type4_surface(&desc);
+        let _ = decode_type4_surface(desc);
         assert!(
             cap2.lines()
                 .iter()
@@ -1997,7 +1938,7 @@ mod tests {
         // A declared plane whose record the blob does not reach.
         reset_type4_decode_drops();
         let cap3 = crate::observe::FailCapture::start();
-        let _ = decode_type4_surface(&desc);
+        let _ = decode_type4_surface(desc);
         let short = cap3
             .lines()
             .into_iter()
@@ -2007,15 +1948,9 @@ mod tests {
 
         // A surface larger than the 32-bit `allocSize` field can express.
         reset_type4_decode_drops();
-        let mut big = vec![0u8; 0x30];
-        st64(&mut big[TYPE4_LEN..], (u32::MAX as u64) + 1);
-        st32(&mut big[TYPE4_BACKING_PFN..], 0x100);
-        st32(&mut big[TYPE4_PIXEL_FORMAT..], 0x4247_5241);
-        big[TYPE4_PLANE_COUNT] = 1;
-        st32(&mut big[TYPE4_PLANES + 4..], 64);
-        st32(&mut big[TYPE4_PLANES + 8..], 32);
-        st32(&mut big[TYPE4_PLANES + 12..], 256);
-        let surf = decode_type4_surface(&big).expect("type4 decodes");
+        let big = Type4Builder::new((u32::MAX as u64) + 1, 0x100, 0x4247_5241, 1)
+            .plane(0, 0, 64, 32, 256, 0);
+        let surf = decode_type4_surface(big.bytes()).expect("type4 decodes");
         let cap4 = crate::observe::FailCapture::start();
         let _ = synthesize_device_desc_from_type4(&surf);
         let sat = cap4
@@ -3186,27 +3121,18 @@ mod tests {
     #[test]
     fn undecoded_type4_span_is_exactly_what_the_decoder_skips() {
         // One plane: the decoder consumes 0x14..0x24, so the tail starts there.
-        let mut a = vec![0u8; 0x40];
-        st64(&mut a[TYPE4_LEN..], 0x800000);
-        st32(&mut a[TYPE4_BACKING_PFN..], 0x1234);
-        st32(&mut a[TYPE4_PIXEL_FORMAT..], 0x4247_5241); // 'BGRA'
-        a[TYPE4_PLANE_COUNT] = 1;
-        st32(&mut a[TYPE4_PLANES..], 0); // plane0 offset
-        st32(&mut a[TYPE4_PLANES + 4..], 1920);
-        st32(&mut a[TYPE4_PLANES + 8..], 1080);
-        st32(&mut a[TYPE4_PLANES + 12..], 1920 * 4);
+        let built = Type4Builder::new(0x800000, 0x1234, 0x4247_5241, 1) // 'BGRA'
+            .plane(0, 0, 1920, 1080, 1920 * 4, 0)
+            .with_len(0x40);
+        let a = built.bytes().to_vec();
 
         // Every decoded field can change without moving the undecoded span.
-        let mut b = a.clone();
-        st64(&mut b[TYPE4_LEN..], 0x900000);
-        st32(&mut b[TYPE4_BACKING_PFN..], 0x9999);
-        st32(&mut b[TYPE4_PIXEL_FORMAT..], 0x4c31_3062);
-        st32(&mut b[TYPE4_PLANES + 4..], 1280);
-        st32(&mut b[TYPE4_PLANES + 8..], 720);
-        st32(&mut b[TYPE4_PLANES + 12..], 1280 * 4);
+        let b = Type4Builder::new(0x900000, 0x9999, 0x4c31_3062, 1)
+            .plane(0, 0, 1280, 720, 1280 * 4, 0)
+            .with_len(0x40);
         assert_eq!(
             undecoded_type4_surface_bytes(&a),
-            undecoded_type4_surface_bytes(&b),
+            undecoded_type4_surface_bytes(b.bytes()),
             "changing only decoded fields must not look like a new shape"
         );
 
@@ -3237,10 +3163,11 @@ mod tests {
         }
 
         // A second plane moves the boundary: 0x24..0x34 becomes decoded.
-        let mut two = a.clone();
-        two[TYPE4_PLANE_COUNT] = 2;
+        let two = Type4Builder::new(0x800000, 0x1234, 0x4247_5241, 2)
+            .plane(0, 0, 1920, 1080, 1920 * 4, 0)
+            .with_len(0x40);
         assert_eq!(
-            undecoded_type4_surface_bytes(&two).len(),
+            undecoded_type4_surface_bytes(two.bytes()).len(),
             undecoded_type4_surface_bytes(&a).len() - TYPE4_PLANE_STRIDE,
             "the span shrinks by exactly one plane record"
         );

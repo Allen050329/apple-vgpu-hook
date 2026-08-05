@@ -1003,8 +1003,8 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
         if entry.object_type == objects::OBJECT_TYPE_REF_TEXTURE {
             is_type5 = true;
             if let Some(desc) = objects::read_descriptor(state, host, task_id, &entry) {
-                if desc.len() >= objects::TYPE5_MIN_LEN {
-                    let sid = crate::contract::endian::ld32(&desc[objects::TYPE5_SURFACE_ID..]);
+                if let Ok(t5) = reims_vgpu_wire::device_desc::type5_header(&desc) {
+                    let sid = t5.surface_id.get();
                     if sid != 0 {
                         type5_view = objects::decode_type5_texture_view(&desc);
                         surface = Some(sid);
