@@ -48,12 +48,29 @@ testing:
   the answer is "nothing should happen", the arm is right and wants a comment,
   not a counter.
 
+## An adjudication that was wrong, and how
+
+The `SetPipeline if cmd.pipeline_ref != 0` arm was on this list as legitimate,
+reasoned as "a zero ref is an intentional unbind, which `AGENTS.md` names as
+expected control flow". The premise was right and the conclusion did not follow.
+A zero ref *is* an intentional unbind — but the arm did not perform one. Falling
+through to `_ => {}` left the **previous** pipeline latched, so the following
+draws were encoded against a pipeline the guest had stopped asking for, and
+`dropped_unbound` read zero because they were executed rather than dropped.
+
+The trap is that "expected control flow" answers a question about the *guest*
+("is the guest allowed to send this?") and the arm is a statement about the
+*device* ("what does this device then do?"). Reading the first as settling the
+second is what put it on the list.
+
+So the rule for this list: an entry is only adjudicated once it names **what the
+device does instead**, not just why the guest's record is unremarkable. Every
+entry below does. Fixed in the commit that added this section.
+
 ## Already adjudicated — do not re-report these
 
-Nine candidates on the current tree, all read and all legitimate:
+Eight candidates on the current tree, all read and all legitimate:
 
-- `runtime/exec.rs` `SetPipeline if cmd.pipeline_ref != 0` — a zero ref is an
-  intentional unbind, which `AGENTS.md` names as expected control flow.
 - `runtime/metal_draw/mod.rs` ×4 and `metal_draw/vulkan.rs` ×3 — the
   `PASS_LOAD_ACTION_*` ladders. The catch-all is `DONT_CARE`, whose whole
   meaning is "do nothing to this attachment", and the value is bounded upstream
@@ -76,10 +93,13 @@ git show f18608a^:crates/reims-vgpu/src/runtime/exec.rs > /tmp/pre/runtime/exec.
 scripts/silent-arms/silent-arms.sh /tmp/pre
 ```
 
-Three candidates, five presence-guards suppressed. Two of the three were the
-real losses: an empty `SetScissor` that left the *previous* rectangle clipping
-later draws, and an `ExecuteCommands` with `ref == 0` that dropped a whole ICB
-batch. The third is the `SetPipeline` arm above.
+Three candidates, five presence-guards suppressed. All three were real losses.
+Two were fixed by `f18608a`: an empty `SetScissor` that left the *previous*
+rectangle clipping later draws, and an `ExecuteCommands` with `ref == 0` that
+dropped a whole ICB batch. The third was the `SetPipeline` arm, which is the same
+shape as the `SetScissor` one — a guard that reads as a drop and is really a
+carry-forward of the last value — and which this list initially cleared. It is
+fixed now.
 
 ## Known weakness
 
