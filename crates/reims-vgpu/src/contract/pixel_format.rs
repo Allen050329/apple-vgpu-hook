@@ -316,51 +316,67 @@ pub fn depth_stencil_packing(format: u16) -> Option<DepthStencilPacking> {
     }
 }
 
+/// Selected texture aspect for a buffer↔texture / options-bearing copy.
+///
+/// Three states, and exactly three: `MTLBlitOption`'s depth and stencil bits
+/// are mutually exclusive, and
+/// [`crate::runtime::decode::blit::parse_blit_options`] refuses the pair with
+/// `ConflictingAspects` rather than producing one.
+///
+/// Lives here, below the decoder, because every consumer of the choice is a
+/// pure format question — which plane of a packed texel, and how wide. The
+/// decoder re-exports it under its own name.
+///
+/// This whole family used to travel as `(depth_aspect: bool, stencil_aspect:
+/// bool)`, which spells a fourth state the decoder cannot emit, and the five
+/// functions below did not agree on what it meant: two rejected `(true,
+/// true)`, one treated it as a repack, and two read it as depth. One enum is
+/// what makes that disagreement unwritable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlitAspect {
+    /// Full texel (options None / zero).
+    Full,
+    /// Depth plane of a depth or depth-stencil texture.
+    Depth,
+    /// Stencil plane of a stencil or depth-stencil texture.
+    Stencil,
+}
+
 /// Bytes per texel for a blit aspect selection.
 ///
 /// Pure depth/stencil formats: aspect matches full bpp (option is identity).
 /// Combined formats: Full uses packed `full_bpp`; depth plane is 4 B; stencil is 1 B.
-pub fn blit_aspect_bytes_per_pixel(
-    format: u16,
-    depth_aspect: bool,
-    stencil_aspect: bool,
-) -> Option<u32> {
-    if depth_aspect && stencil_aspect {
-        return None;
+pub fn blit_aspect_bytes_per_pixel(format: u16, aspect: BlitAspect) -> Option<u32> {
+    match aspect {
+        BlitAspect::Depth => {
+            if !format_has_depth_aspect(format) {
+                return None;
+            }
+            if let Some(p) = depth_stencil_packing(format) {
+                return (p.depth_plane_bpp != 0).then_some(p.depth_plane_bpp);
+            }
+            match format {
+                MTL_FORMAT_DEPTH16_UNORM => Some(2),
+                MTL_FORMAT_DEPTH32_FLOAT => Some(4),
+                _ => None,
+            }
+        }
+        BlitAspect::Stencil => {
+            if !format_has_stencil_aspect(format) {
+                return None;
+            }
+            if let Some(p) = depth_stencil_packing(format) {
+                return Some(p.stencil_plane_bpp);
+            }
+            Some(1)
+        }
+        BlitAspect::Full => bytes_per_pixel(format),
     }
-    if depth_aspect {
-        if !format_has_depth_aspect(format) {
-            return None;
-        }
-        if let Some(p) = depth_stencil_packing(format) {
-            return if p.depth_plane_bpp != 0 {
-                Some(p.depth_plane_bpp)
-            } else {
-                None
-            };
-        }
-        return Some(match format {
-            MTL_FORMAT_DEPTH16_UNORM => 2,
-            MTL_FORMAT_DEPTH32_FLOAT => 4,
-            _ => return None,
-        });
-    }
-    if stencil_aspect {
-        if !format_has_stencil_aspect(format) {
-            return None;
-        }
-        if let Some(p) = depth_stencil_packing(format) {
-            return Some(p.stencil_plane_bpp);
-        }
-        return Some(1);
-    }
-    // Full texel.
-    bytes_per_pixel(format)
 }
 
 /// Whether a plane extract/insert pass is required (combined DS + aspect option).
-pub fn blit_aspect_needs_repack(format: u16, depth_aspect: bool, stencil_aspect: bool) -> bool {
-    if !depth_aspect && !stencil_aspect {
+pub fn blit_aspect_needs_repack(format: u16, aspect: BlitAspect) -> bool {
+    if aspect == BlitAspect::Full {
         return false;
     }
     depth_stencil_packing(format).is_some()
@@ -369,12 +385,11 @@ pub fn blit_aspect_needs_repack(format: u16, depth_aspect: bool, stencil_aspect:
 /// Extract one plane from a packed depth-stencil texel into `dst` (plane-native size).
 pub fn extract_depth_stencil_plane(
     format: u16,
-    depth_aspect: bool,
-    stencil_aspect: bool,
+    aspect: BlitAspect,
     texel: &[u8],
     dst: &mut [u8],
 ) -> bool {
-    if depth_aspect == stencil_aspect {
+    if aspect == BlitAspect::Full {
         return false;
     }
     let Some(p) = depth_stencil_packing(format) else {
@@ -383,7 +398,7 @@ pub fn extract_depth_stencil_plane(
     if texel.len() < p.full_bpp as usize {
         return false;
     }
-    if depth_aspect {
+    if aspect == BlitAspect::Depth {
         if p.depth_plane_bpp == 0 || dst.len() < p.depth_plane_bpp as usize {
             return false;
         }
@@ -416,12 +431,11 @@ pub fn extract_depth_stencil_plane(
 /// `texel` holds the current full cell (updated in place). `src` is plane-native.
 pub fn insert_depth_stencil_plane(
     format: u16,
-    depth_aspect: bool,
-    stencil_aspect: bool,
+    aspect: BlitAspect,
     src: &[u8],
     texel: &mut [u8],
 ) -> bool {
-    if depth_aspect == stencil_aspect {
+    if aspect == BlitAspect::Full {
         return false;
     }
     let Some(p) = depth_stencil_packing(format) else {
@@ -430,7 +444,7 @@ pub fn insert_depth_stencil_plane(
     if texel.len() < p.full_bpp as usize {
         return false;
     }
-    if depth_aspect {
+    if aspect == BlitAspect::Depth {
         if p.depth_plane_bpp == 0 || src.len() < p.depth_plane_bpp as usize {
             return false;
         }
@@ -460,8 +474,7 @@ pub fn insert_depth_stencil_plane(
 /// Extract a tight plane row from a strided packed texture row.
 pub fn extract_plane_row(
     format: u16,
-    depth_aspect: bool,
-    stencil_aspect: bool,
+    aspect: BlitAspect,
     src_row: &[u8],
     width: u32,
     dst_plane: &mut [u8],
@@ -469,12 +482,10 @@ pub fn extract_plane_row(
     let Some(p) = depth_stencil_packing(format) else {
         return false;
     };
-    let plane_bpp = if depth_aspect {
-        p.depth_plane_bpp
-    } else if stencil_aspect {
-        p.stencil_plane_bpp
-    } else {
-        return false;
+    let plane_bpp = match aspect {
+        BlitAspect::Depth => p.depth_plane_bpp,
+        BlitAspect::Stencil => p.stencil_plane_bpp,
+        BlitAspect::Full => return false,
     } as usize;
     let full = p.full_bpp as usize;
     let w = width as usize;
@@ -490,7 +501,7 @@ pub fn extract_plane_row(
     for x in 0..w {
         let t = &src_row[x * full..x * full + full];
         let d = &mut dst_plane[x * plane_bpp..x * plane_bpp + plane_bpp];
-        if !extract_depth_stencil_plane(format, depth_aspect, stencil_aspect, t, d) {
+        if !extract_depth_stencil_plane(format, aspect, t, d) {
             return false;
         }
     }
@@ -500,8 +511,7 @@ pub fn extract_plane_row(
 /// Insert a tight plane row into a strided packed texture row (RMW per texel).
 pub fn insert_plane_row(
     format: u16,
-    depth_aspect: bool,
-    stencil_aspect: bool,
+    aspect: BlitAspect,
     src_plane: &[u8],
     width: u32,
     dst_row: &mut [u8],
@@ -509,12 +519,10 @@ pub fn insert_plane_row(
     let Some(p) = depth_stencil_packing(format) else {
         return false;
     };
-    let plane_bpp = if depth_aspect {
-        p.depth_plane_bpp
-    } else if stencil_aspect {
-        p.stencil_plane_bpp
-    } else {
-        return false;
+    let plane_bpp = match aspect {
+        BlitAspect::Depth => p.depth_plane_bpp,
+        BlitAspect::Stencil => p.stencil_plane_bpp,
+        BlitAspect::Full => return false,
     } as usize;
     let full = p.full_bpp as usize;
     let w = width as usize;
@@ -530,7 +538,7 @@ pub fn insert_plane_row(
     for x in 0..w {
         let s = &src_plane[x * plane_bpp..x * plane_bpp + plane_bpp];
         let t = &mut dst_row[x * full..x * full + full];
-        if !insert_depth_stencil_plane(format, depth_aspect, stencil_aspect, s, t) {
+        if !insert_depth_stencil_plane(format, aspect, s, t) {
             return false;
         }
     }
@@ -1056,49 +1064,47 @@ mod tests {
     fn blit_aspect_bpp_depth_stencil() {
         // Pure depth + depth option.
         assert_eq!(
-            blit_aspect_bytes_per_pixel(MTL_FORMAT_DEPTH32_FLOAT, true, false),
+            blit_aspect_bytes_per_pixel(MTL_FORMAT_DEPTH32_FLOAT, BlitAspect::Depth),
             Some(4)
         );
         assert_eq!(
-            blit_aspect_bytes_per_pixel(MTL_FORMAT_DEPTH32_FLOAT, false, false),
+            blit_aspect_bytes_per_pixel(MTL_FORMAT_DEPTH32_FLOAT, BlitAspect::Full),
             Some(4)
         );
         // Pure depth cannot take stencil option.
         assert_eq!(
-            blit_aspect_bytes_per_pixel(MTL_FORMAT_DEPTH32_FLOAT, false, true),
+            blit_aspect_bytes_per_pixel(MTL_FORMAT_DEPTH32_FLOAT, BlitAspect::Stencil),
             None
         );
         // Pure stencil.
         assert_eq!(
-            blit_aspect_bytes_per_pixel(MTL_FORMAT_STENCIL8, false, true),
+            blit_aspect_bytes_per_pixel(MTL_FORMAT_STENCIL8, BlitAspect::Stencil),
             Some(1)
         );
         // Combined: depth plane 4 B, stencil 1 B, full = packing full_bpp.
         assert_eq!(
-            blit_aspect_bytes_per_pixel(MTL_FORMAT_DEPTH32_FLOAT_STENCIL8, true, false),
+            blit_aspect_bytes_per_pixel(MTL_FORMAT_DEPTH32_FLOAT_STENCIL8, BlitAspect::Depth),
             Some(4)
         );
         assert_eq!(
-            blit_aspect_bytes_per_pixel(MTL_FORMAT_DEPTH32_FLOAT_STENCIL8, false, true),
+            blit_aspect_bytes_per_pixel(MTL_FORMAT_DEPTH32_FLOAT_STENCIL8, BlitAspect::Stencil),
             Some(1)
         );
         assert_eq!(
-            blit_aspect_bytes_per_pixel(MTL_FORMAT_DEPTH32_FLOAT_STENCIL8, false, false),
+            blit_aspect_bytes_per_pixel(MTL_FORMAT_DEPTH32_FLOAT_STENCIL8, BlitAspect::Full),
             Some(8)
         );
         assert!(blit_aspect_needs_repack(
             MTL_FORMAT_DEPTH32_FLOAT_STENCIL8,
-            true,
-            false
+            BlitAspect::Depth
         ));
         assert!(!blit_aspect_needs_repack(
             MTL_FORMAT_DEPTH32_FLOAT,
-            true,
-            false
+            BlitAspect::Depth
         ));
         // Color cannot take DS options.
         assert_eq!(
-            blit_aspect_bytes_per_pixel(MTL_FORMAT_BGRA8_UNORM, true, false),
+            blit_aspect_bytes_per_pixel(MTL_FORMAT_BGRA8_UNORM, BlitAspect::Depth),
             None
         );
     }
@@ -1479,32 +1485,100 @@ mod tests {
         texel[4] = 0xab;
         let mut depth = [0u8; 4];
         assert!(extract_depth_stencil_plane(
-            fmt, true, false, &texel, &mut depth
+            fmt,
+            BlitAspect::Depth,
+            &texel,
+            &mut depth
         ));
         assert_eq!(depth, 1.0f32.to_bits().to_le_bytes());
         let mut st = [0u8; 1];
         assert!(extract_depth_stencil_plane(
-            fmt, false, true, &texel, &mut st
+            fmt,
+            BlitAspect::Stencil,
+            &texel,
+            &mut st
         ));
         assert_eq!(st[0], 0xab);
         // Insert new depth, keep stencil.
         let mut t2 = texel;
         let new_d = 0.5f32.to_bits().to_le_bytes();
         assert!(insert_depth_stencil_plane(
-            fmt, true, false, &new_d, &mut t2
+            fmt,
+            BlitAspect::Depth,
+            &new_d,
+            &mut t2
         ));
         assert_eq!(t2[4], 0xab);
         let mut d2 = [0u8; 4];
-        assert!(extract_depth_stencil_plane(fmt, true, false, &t2, &mut d2));
+        assert!(extract_depth_stencil_plane(
+            fmt,
+            BlitAspect::Depth,
+            &t2,
+            &mut d2
+        ));
         assert_eq!(d2, new_d);
         // Row extract 2 pixels.
         let mut row = [0u8; 16];
         row[..8].copy_from_slice(&texel);
         row[8..16].copy_from_slice(&t2);
         let mut planes = [0u8; 8];
-        assert!(extract_plane_row(fmt, true, false, &row, 2, &mut planes));
+        assert!(extract_plane_row(
+            fmt,
+            BlitAspect::Depth,
+            &row,
+            2,
+            &mut planes
+        ));
         assert_eq!(&planes[0..4], &1.0f32.to_bits().to_le_bytes());
         assert_eq!(&planes[4..8], &new_d);
+    }
+
+    /// `Full` is not a plane, and every plane entry point refuses it.
+    ///
+    /// The aspect used to travel as `(depth: bool, stencil: bool)`, where
+    /// "neither" and "both" were two distinct values that had to be refused
+    /// separately — and the five functions did not agree on how. Two rejected
+    /// `(true, true)`, `blit_aspect_needs_repack` read it as a plane pass, and
+    /// the two row helpers read it as depth. Collapsing to three states makes
+    /// "both" unwritable; this pins the one refusal that is left.
+    #[test]
+    fn the_full_aspect_is_not_a_plane_at_any_entry_point() {
+        let fmt = MTL_FORMAT_DEPTH32_FLOAT_STENCIL8;
+        let texel = [0u8; 8];
+        let mut out = [0u8; 8];
+        assert!(!extract_depth_stencil_plane(
+            fmt,
+            BlitAspect::Full,
+            &texel,
+            &mut out
+        ));
+        let mut t = texel;
+        assert!(!insert_depth_stencil_plane(
+            fmt,
+            BlitAspect::Full,
+            &out,
+            &mut t
+        ));
+        let row = [0u8; 16];
+        let mut planes = [0u8; 8];
+        assert!(!extract_plane_row(
+            fmt,
+            BlitAspect::Full,
+            &row,
+            2,
+            &mut planes
+        ));
+        let mut dst_row = [0u8; 16];
+        assert!(!insert_plane_row(
+            fmt,
+            BlitAspect::Full,
+            &planes,
+            2,
+            &mut dst_row
+        ));
+        assert!(!blit_aspect_needs_repack(fmt, BlitAspect::Full));
+        // And `Full` is still the aspect that asks for the whole packed texel.
+        assert_eq!(blit_aspect_bytes_per_pixel(fmt, BlitAspect::Full), Some(8));
     }
 
     #[test]
@@ -1516,26 +1590,30 @@ mod tests {
         let texel = packed.to_le_bytes();
         let mut depth = [0u8; 4];
         assert!(extract_depth_stencil_plane(
-            fmt, true, false, &texel, &mut depth
+            fmt,
+            BlitAspect::Depth,
+            &texel,
+            &mut depth
         ));
         assert_eq!(u32::from_le_bytes(depth), depth24);
         let mut st = [0u8; 1];
         assert!(extract_depth_stencil_plane(
-            fmt, false, true, &texel, &mut st
+            fmt,
+            BlitAspect::Stencil,
+            &texel,
+            &mut st
         ));
         assert_eq!(st[0], 0x11);
         let mut t2 = [0u8; 4];
         assert!(insert_depth_stencil_plane(
             fmt,
-            false,
-            true,
+            BlitAspect::Stencil,
             &[0x22],
             &mut t2
         ));
         assert!(insert_depth_stencil_plane(
             fmt,
-            true,
-            false,
+            BlitAspect::Depth,
             &depth24.to_le_bytes(),
             &mut t2
         ));

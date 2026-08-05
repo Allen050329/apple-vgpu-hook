@@ -1573,21 +1573,16 @@ fn clamp_extent(requested: u64, max: u64) -> u64 {
 fn copy_aspect_for_options(
     texture_format: u16,
     cmd: &Command,
-) -> Result<(bool, bool, u32), BlitStatus> {
+) -> Result<(BlitAspect, u32), BlitStatus> {
     // The three option checks used to collapse into a bare `Unsupported` with
     // the reason discarded by `map_err(|_| ..)`. The blit reason channel carries
     // the specific slug to the dispatch-site line, so an unknown option bit and
     // a depth+stencil conflict no longer read identically.
     let aspect = blit::parse_blit_options(cmd.has_options, cmd.options)
         .map_err(|e: blit::BlitOptionError| br(BlitStatus::Unsupported, e.slug()))?;
-    let (want_depth, want_stencil) = match aspect {
-        BlitAspect::Full => (false, false),
-        BlitAspect::Depth => (true, false),
-        BlitAspect::Stencil => (false, true),
-    };
-    let bpp = pixel_format::blit_aspect_bytes_per_pixel(texture_format, want_depth, want_stencil)
+    let bpp = pixel_format::blit_aspect_bytes_per_pixel(texture_format, aspect)
         .ok_or(BlitStatus::Unsupported)?;
-    Ok((want_depth, want_stencil, bpp))
+    Ok((aspect, bpp))
 }
 
 /// Texture-side full texel bpp (storage). Plane copies use this for GVA strides.
@@ -1671,12 +1666,11 @@ fn copy_buffer_texture_rows_aspect<M: HostMemory + HostOps>(
     copy_h: u64,
     copy_d: u64,
     plane_bpp: u32,
-    want_depth: bool,
-    want_stencil: bool,
+    aspect: BlitAspect,
     to_texture: bool,
 ) -> Result<(), BlitStatus> {
     let fmt = tex.pixel_format();
-    let repack = pixel_format::blit_aspect_needs_repack(fmt, want_depth, want_stencil);
+    let repack = pixel_format::blit_aspect_needs_repack(fmt, aspect);
     let storage_bpp = if repack {
         texture_storage_bpp(fmt)?
     } else {
@@ -1759,8 +1753,7 @@ fn copy_buffer_texture_rows_aspect<M: HostMemory + HostOps>(
                     )?;
                     if !pixel_format::insert_plane_row(
                         fmt,
-                        want_depth,
-                        want_stencil,
+                        aspect,
                         &plane,
                         copy_w,
                         &mut packed[..storage_row],
@@ -1812,8 +1805,7 @@ fn copy_buffer_texture_rows_aspect<M: HostMemory + HostOps>(
                 )?;
                 if !pixel_format::extract_plane_row(
                     fmt,
-                    want_depth,
-                    want_stencil,
+                    aspect,
                     &packed[..storage_row],
                     copy_w,
                     &mut plane,
@@ -1884,13 +1876,11 @@ fn exec_copy_buffer_to_texture<M: HostMemory + HostOps>(
         Ok(t) => t,
         Err(st) => return st,
     };
-    let (want_depth, want_stencil, copy_bpp) =
-        match copy_aspect_for_options(dst.pixel_format(), cmd) {
-            Ok(v) => v,
-            Err(st) => return st,
-        };
-    let repack =
-        pixel_format::blit_aspect_needs_repack(dst.pixel_format(), want_depth, want_stencil);
+    let (aspect, copy_bpp) = match copy_aspect_for_options(dst.pixel_format(), cmd) {
+        Ok(v) => v,
+        Err(st) => return st,
+    };
+    let repack = pixel_format::blit_aspect_needs_repack(dst.pixel_format(), aspect);
     // Type-11 is 2D only.
     if dst.is_type11() && (cmd.destination_origin.z != 0 || cmd.source_size.depth > 1) {
         if cmd.source_size.depth == 0 {
@@ -1958,8 +1948,7 @@ fn exec_copy_buffer_to_texture<M: HostMemory + HostOps>(
             copy_h,
             copy_d,
             copy_bpp,
-            want_depth,
-            want_stencil,
+            aspect,
             true,
         ) {
             Ok(()) => BlitStatus::Ok,
@@ -2117,13 +2106,11 @@ fn exec_copy_texture_to_buffer<M: HostMemory + HostOps>(
         Ok(t) => t,
         Err(st) => return st,
     };
-    let (want_depth, want_stencil, copy_bpp) =
-        match copy_aspect_for_options(src.pixel_format(), cmd) {
-            Ok(v) => v,
-            Err(st) => return st,
-        };
-    let repack =
-        pixel_format::blit_aspect_needs_repack(src.pixel_format(), want_depth, want_stencil);
+    let (aspect, copy_bpp) = match copy_aspect_for_options(src.pixel_format(), cmd) {
+        Ok(v) => v,
+        Err(st) => return st,
+    };
+    let repack = pixel_format::blit_aspect_needs_repack(src.pixel_format(), aspect);
     let dst = match resolve_buffer(state, host, task_id, cmd.destination) {
         Ok(b) => b,
         Err(st) => return st,
@@ -2192,8 +2179,7 @@ fn exec_copy_texture_to_buffer<M: HostMemory + HostOps>(
             copy_h,
             copy_d,
             copy_bpp,
-            want_depth,
-            want_stencil,
+            aspect,
             false,
         ) {
             Ok(()) => BlitStatus::Ok,
@@ -2342,12 +2328,11 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
         Err(st) => return st,
     };
     // Options apply to both ends; plane bpp must agree under the selected aspect.
-    let (want_depth, want_stencil, src_bpp) = match copy_aspect_for_options(src.pixel_format(), cmd)
-    {
+    let (aspect, src_bpp) = match copy_aspect_for_options(src.pixel_format(), cmd) {
         Ok(v) => v,
         Err(st) => return st,
     };
-    let (_, _, dst_bpp) = match copy_aspect_for_options(dst.pixel_format(), cmd) {
+    let (_, dst_bpp) = match copy_aspect_for_options(dst.pixel_format(), cmd) {
         Ok(v) => v,
         Err(st) => return st,
     };
@@ -2361,10 +2346,8 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
         return br(BlitStatus::Unsupported, "t2t_format_mismatch");
     }
     let copy_bpp = src_bpp;
-    let repack_src =
-        pixel_format::blit_aspect_needs_repack(src.pixel_format(), want_depth, want_stencil);
-    let repack_dst =
-        pixel_format::blit_aspect_needs_repack(dst.pixel_format(), want_depth, want_stencil);
+    let repack_src = pixel_format::blit_aspect_needs_repack(src.pixel_format(), aspect);
+    let repack_dst = pixel_format::blit_aspect_needs_repack(dst.pixel_format(), aspect);
     let any_t11 = src.is_type11() || dst.is_type11();
     if any_t11 && (cmd.source_origin.z != 0 || cmd.destination_origin.z != 0) {
         return br(BlitStatus::Unsupported, "t2t_t11_z");
@@ -2452,8 +2435,7 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
                     }
                     if !pixel_format::extract_plane_row(
                         src.pixel_format(),
-                        want_depth,
-                        want_stencil,
+                        aspect,
                         &src_packed,
                         copy_w as u32,
                         &mut plane,
@@ -2492,8 +2474,7 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
                     }
                     if !pixel_format::insert_plane_row(
                         dst.pixel_format(),
-                        want_depth,
-                        want_stencil,
+                        aspect,
                         &plane,
                         copy_w as u32,
                         &mut dst_packed,
@@ -5114,7 +5095,7 @@ mod tests {
             "unknown format must fail visibly, not invent a stride",
         );
 
-        // copy_aspect_for_options: option bit -> (want_depth, want_stencil, bpp).
+        // copy_aspect_for_options: option bit -> (aspect, bpp).
         let with_opts = |opts: u32| {
             let mut cmd = Command::default();
             cmd.has_options = true;
@@ -5124,7 +5105,7 @@ mod tests {
         // No option on a color format -> full aspect, no plane routing.
         assert_eq!(
             copy_aspect_for_options(MTL_FORMAT_BGRA8_UNORM, &with_opts(MTL_BLIT_OPTION_NONE)),
-            Ok((false, false, 4)),
+            Ok((BlitAspect::Full, 4)),
         );
         // Depth option on a depth-stencil format -> depth plane (4 B), no stencil.
         assert_eq!(
@@ -5132,7 +5113,7 @@ mod tests {
                 MTL_FORMAT_DEPTH32_FLOAT_STENCIL8,
                 &with_opts(MTL_BLIT_OPTION_DEPTH_FROM_DEPTH_STENCIL),
             ),
-            Ok((true, false, 4)),
+            Ok((BlitAspect::Depth, 4)),
         );
         // Stencil option -> stencil plane (1 B), no depth.
         assert_eq!(
@@ -5140,7 +5121,7 @@ mod tests {
                 MTL_FORMAT_DEPTH32_FLOAT_STENCIL8,
                 &with_opts(MTL_BLIT_OPTION_STENCIL_FROM_DEPTH_STENCIL),
             ),
-            Ok((false, true, 1)),
+            Ok((BlitAspect::Stencil, 1)),
         );
         // Unknown option bit -> visible failure (no invented aspect).
         assert_eq!(

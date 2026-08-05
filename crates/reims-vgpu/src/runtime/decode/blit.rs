@@ -54,15 +54,12 @@ pub const MTL_BLIT_OPTION_KNOWN_MASK: u32 = MTL_BLIT_OPTION_DEPTH_FROM_DEPTH_STE
     | MTL_BLIT_OPTION_ROW_LINEAR_PVRTC;
 
 /// Selected texture aspect for a buffer↔texture / options-bearing copy.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BlitAspect {
-    /// Full texel (options None / zero).
-    Full,
-    /// Depth plane of a depth or depth-stencil texture.
-    Depth,
-    /// Stencil plane of a stencil or depth-stencil texture.
-    Stencil,
-}
+///
+/// Defined in [`crate::contract::pixel_format`], which is where every consumer
+/// of the choice lives, and re-exported here because this is where it is
+/// produced. One type, so the decoder's refusal of depth+stencil is the only
+/// place that state is ever considered.
+pub use crate::contract::pixel_format::BlitAspect;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BlitOptionError {
