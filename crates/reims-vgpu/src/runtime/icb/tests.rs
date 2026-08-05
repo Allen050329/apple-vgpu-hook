@@ -5,10 +5,10 @@ use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
 /// as the compute-pipeline block below.
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+use crate::contract::pass_action::MTL_STORE_ACTION_STORE;
 use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
 use crate::model::{DeviceId, PAGE_SHIFT_ARM64E};
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-use crate::runtime::decode::render::PASS_STORE_ACTION_STORE;
 use crate::runtime::decode::resource::{
     compute_only_icb_layout, encode_icb_command_layout, list_object_entry_offset,
     render_icb_layout, ICB_DESC_FLAGS, ICB_DESC_LAYOUT, ICB_DESC_LEN, ICB_DESC_MAX_COMMAND_COUNT,
@@ -761,7 +761,7 @@ fn draw_request(mapping_id: u32) -> DrawEncodeRequest {
             width: 4,
             height: 4,
             format: crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM,
-            store_action: PASS_STORE_ACTION_STORE,
+            store_action: MTL_STORE_ACTION_STORE,
             target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
             ..Default::default()
         }],

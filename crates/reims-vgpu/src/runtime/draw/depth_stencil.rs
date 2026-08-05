@@ -14,10 +14,12 @@
 //! could not carry vanished with nothing in the log.
 
 use super::{degrade_log_first, load_linear_raw, DeviceState, DrawEncodeRequest};
+use crate::contract::pass_action::{
+    is_declared_load_action, is_declared_store_action, MTL_LOAD_ACTION_CLEAR, MTL_LOAD_ACTION_LOAD,
+    MTL_STORE_ACTION_STORE,
+};
 use crate::runtime::decode::render::{
     depth_stencil_is_bindable, AttachSubresource, DepthAttachment, StencilAttachment,
-    PASS_LOAD_ACTION_CLEAR, PASS_LOAD_ACTION_LOAD, PASS_STORE_ACTION_DONT_CARE,
-    PASS_STORE_ACTION_STORE,
 };
 use crate::runtime::host::HostMemory;
 use crate::runtime::{mapper, mapping_write, objects, HostOps};
@@ -130,7 +132,7 @@ impl HostDepthStencil {
         host: &mut M,
         extent: (u32, u32),
     ) {
-        if self.store_action != PASS_STORE_ACTION_STORE || self.mapping_id == 0 {
+        if self.store_action != MTL_STORE_ACTION_STORE || self.mapping_id == 0 {
             return;
         }
         let (width, height) = extent;
@@ -168,9 +170,12 @@ pub(super) fn seed_host_depth_stencil<M: HostMemory + HostOps>(
     if attach.texture_ref == 0 {
         return None;
     }
-    let actions_ok = attach.load_action <= PASS_LOAD_ACTION_CLEAR
-        && (attach.store_action == PASS_STORE_ACTION_DONT_CARE
-            || attach.store_action == PASS_STORE_ACTION_STORE);
+    // The same admission the colour rail applies, asked through the predicates
+    // beside the constants: this site used to spell the store half as
+    // `== DONT_CARE || == STORE` while `draw::store_action_in_contract` spelled
+    // it as `<= STORE`, one rule in two forms with nothing comparing them.
+    let actions_ok = is_declared_load_action(attach.load_action)
+        && is_declared_store_action(attach.store_action);
     if !depth_stencil_is_bindable(attach.sub) || !actions_ok {
         if degrade_log_first(req.pipeline_ref, spec.actions_refused) {
             crate::observe::fail(format!(
@@ -203,8 +208,8 @@ pub(super) fn seed_host_depth_stencil<M: HostMemory + HostOps>(
         let _ = mapper::ensure_resolved_for_scanout(state, host, mapping_id);
     }
     match attach.load_action {
-        PASS_LOAD_ACTION_CLEAR => aspect.fill_clear(&mut data),
-        PASS_LOAD_ACTION_LOAD => {
+        MTL_LOAD_ACTION_CLEAR => aspect.fill_clear(&mut data),
+        MTL_LOAD_ACTION_LOAD => {
             let ok = if mapping_id != 0 {
                 mapping_write::read_raw_rows(
                     state, host, mapping_id, &mut data, row_bytes, row_bytes, width, height,

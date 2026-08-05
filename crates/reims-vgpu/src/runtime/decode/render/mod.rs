@@ -172,11 +172,10 @@ pub(crate) const PASS_TAIL_ARRAY_LENGTH: usize = 0x04;
 pub(crate) const PASS_TAIL_TARGET_WIDTH: usize = 0x0c;
 #[cfg(test)]
 pub(crate) const PASS_TAIL_TARGET_HEIGHT: usize = 0x14;
-pub const PASS_LOAD_ACTION_DONT_CARE: u16 = 0;
-pub const PASS_LOAD_ACTION_LOAD: u16 = 1;
-pub const PASS_LOAD_ACTION_CLEAR: u16 = 2;
-pub const PASS_STORE_ACTION_DONT_CARE: u16 = 0;
-pub const PASS_STORE_ACTION_STORE: u16 = 1;
+// The five load/store ordinals this record carries are declared in
+// `contract::pass_action`, not here: both backends and the Metal C ABI mirror
+// consume them, and while they lived in this decoder the mirror's copy was the
+// only spelling the encode path could reach.
 pub const PASS_MIN_PAYLOAD: usize = PASS_COLOR_ATTACH_OFF + PASS_COLOR_ATTACH_STRIDE;
 /// Count width of `setScissorRects:count:` — eight bytes, not the four used by
 /// `setViewports:count:`. The element is the singular scissor payload.

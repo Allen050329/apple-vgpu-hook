@@ -101,11 +101,10 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
             // it is the site that disagrees with this module's writeback loop
             // about what such a value means. See `super::store_action_in_contract`.
             let _ = super::store_action_in_contract(req.pipeline_ref, c.store_action);
-            if c.store_action != PASS_STORE_ACTION_STORE {
+            if c.store_action != MTL_STORE_ACTION_STORE {
                 continue;
             }
-            if c.load_action != PASS_LOAD_ACTION_CLEAR
-                && c.load_action != PASS_LOAD_ACTION_DONT_CARE
+            if c.load_action != MTL_LOAD_ACTION_CLEAR && c.load_action != MTL_LOAD_ACTION_DONT_CARE
             {
                 // Load/composite needs real encode (metal2vulkan) — skip Store.
                 continue;
@@ -782,12 +781,12 @@ pub(super) fn fragment_attachment_alias_sample<'a>(
         .checked_mul(color.height as usize)?
         .checked_mul(RGBA8_BPP as usize)?;
     match color.load_action {
-        PASS_LOAD_ACTION_CLEAR => Some((
+        MTL_LOAD_ACTION_CLEAR => Some((
             color.width,
             color.height,
             AttachmentAliasSample::Clear(color.clear_color),
         )),
-        PASS_LOAD_ACTION_LOAD => {
+        MTL_LOAD_ACTION_LOAD => {
             if let Some(seed) = color
                 .target_seed_rgba
                 .as_deref()
@@ -1650,7 +1649,7 @@ impl Type11SeedRung {
 /// Every outcome reports, because a zero on the miss arm has to be readable. A
 /// probe that only fires on failure cannot separate "the cache always hit" from
 /// "this branch never ran", and the branch is reached only for `mapping_id != 0`
-/// under `PASS_LOAD_ACTION_LOAD` with no caller-supplied seed. With the served
+/// under `MTL_LOAD_ACTION_LOAD` with no caller-supplied seed. With the served
 /// arms beside it, an absent miss line next to present hit lines is evidence
 /// rather than silence.
 ///
@@ -1720,7 +1719,7 @@ fn note_type11_load_seed(
         .fail();
 }
 
-/// The prior contents of a type-11 attachment under `PASS_LOAD_ACTION_LOAD`,
+/// The prior contents of a type-11 attachment under `MTL_LOAD_ACTION_LOAD`,
 /// with the byte order they are in.
 ///
 /// Two rungs, in freshness order:
@@ -3272,11 +3271,11 @@ fn note_draw_coverage(
     //   clear         — CLEAR was asked for. Destroying them is the contract.
     //   dontcare      — undefined outside the scissor by declaration.
     crate::runtime::drain::note_store_route(match load_action {
-        Some(PASS_LOAD_ACTION_LOAD) if from_target => "draw_partial_load_from_target",
-        Some(PASS_LOAD_ACTION_LOAD) if seeded => "draw_partial_load_seeded",
-        Some(PASS_LOAD_ACTION_LOAD) => "draw_partial_load_unseeded",
-        Some(PASS_LOAD_ACTION_CLEAR) => "draw_partial_clear",
-        Some(PASS_LOAD_ACTION_DONT_CARE) => "draw_partial_dontcare",
+        Some(MTL_LOAD_ACTION_LOAD) if from_target => "draw_partial_load_from_target",
+        Some(MTL_LOAD_ACTION_LOAD) if seeded => "draw_partial_load_seeded",
+        Some(MTL_LOAD_ACTION_LOAD) => "draw_partial_load_unseeded",
+        Some(MTL_LOAD_ACTION_CLEAR) => "draw_partial_clear",
+        Some(MTL_LOAD_ACTION_DONT_CARE) => "draw_partial_dontcare",
         _ => "draw_partial_load_unknown",
     });
     // How much of the surface this draw's scissor actually covers.
@@ -3931,7 +3930,7 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
             );
             return Vec::new();
         }
-        let load = c.load_action == PASS_LOAD_ACTION_LOAD;
+        let load = c.load_action == MTL_LOAD_ACTION_LOAD;
         let clear = [
             c.clear_color[0] as f32,
             c.clear_color[1] as f32,
@@ -4905,17 +4904,17 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             let load_action = if super::load_action_in_contract(req.pipeline_ref, c0.load_action) {
                 c0.load_action
             } else {
-                PASS_LOAD_ACTION_DONT_CARE
+                MTL_LOAD_ACTION_DONT_CARE
             };
             match load_action {
-                PASS_LOAD_ACTION_LOAD if chain_load_from_target => {
+                MTL_LOAD_ACTION_LOAD if chain_load_from_target => {
                     // Resident target carries the chain; no CPU seed bytes.
                 }
-                PASS_LOAD_ACTION_CLEAR => {
+                MTL_LOAD_ACTION_CLEAR => {
                     target_rgba8 =
                         Some(std::sync::Arc::new(solid_rgba_local(w, h, &c0.clear_color)));
                 }
-                PASS_LOAD_ACTION_LOAD => {
+                MTL_LOAD_ACTION_LOAD => {
                     // Which door this pass took, so a pass that ends with no
                     // seed says which source was supposed to have one. A LOAD
                     // means the guest is compositing *onto what is already
@@ -5063,7 +5062,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         let store_is_store = req
             .colors
             .first()
-            .map(|c| c.store_action == PASS_STORE_ACTION_STORE)
+            .map(|c| c.store_action == MTL_STORE_ACTION_STORE)
             .unwrap_or(true);
         resources.target_rgba8 = target_rgba8;
         resources.target_seed_order = seed_order;
@@ -5274,11 +5273,11 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                                 .depth_attach
                                 .as_ref()
                                 .map(|d| (d.clear_depth as f32, d.load_action))
-                                .unwrap_or((1.0, PASS_LOAD_ACTION_CLEAR));
+                                .unwrap_or((1.0, MTL_LOAD_ACTION_CLEAR));
                             // The transient depth buffer supports CLEAR only; a
                             // guest depth LOAD needs a persistent depth resident
                             // (deferred). Degrade to CLEAR, fail-visible.
-                            if load_action == PASS_LOAD_ACTION_LOAD
+                            if load_action == MTL_LOAD_ACTION_LOAD
                                 && degrade_log_first(
                                     req.pipeline_ref,
                                     "depth_load_unsupported_transient",
@@ -5723,7 +5722,7 @@ fn type11_render_identity(
     req: &DrawEncodeRequest,
 ) -> Option<crate::backend::vulkan::engine::TargetIdentity> {
     let c0 = req.colors.first()?;
-    if c0.mapping_id == 0 || c0.store_action != PASS_STORE_ACTION_STORE {
+    if c0.mapping_id == 0 || c0.store_action != MTL_STORE_ACTION_STORE {
         return None;
     }
     render_chain_identity(state, req)
@@ -5734,7 +5733,7 @@ fn type11_render_identity(
 /// it by RT provenance. Separate from the currency question so the two counters
 /// on the branch below divide candidates, not all draws.
 fn type11_load_is_a_seed_candidate(c0: &ColorRtRequest) -> bool {
-    c0.load_action == PASS_LOAD_ACTION_LOAD && c0.target_seed_rgba.is_none()
+    c0.load_action == MTL_LOAD_ACTION_LOAD && c0.target_seed_rgba.is_none()
 }
 
 /// The `(resident, mapping epoch)` pair a record's type-11 LOAD has to compare to
@@ -7904,7 +7903,7 @@ mod vulkan_split_tests {
     #[test]
     fn an_explicitly_seeded_load_is_not_an_elision_candidate() {
         let mut c0 = ColorRtRequest {
-            load_action: PASS_LOAD_ACTION_LOAD,
+            load_action: MTL_LOAD_ACTION_LOAD,
             ..Default::default()
         };
         assert!(type11_load_is_a_seed_candidate(&c0));
@@ -7918,7 +7917,7 @@ mod vulkan_split_tests {
     #[test]
     fn a_clear_is_not_an_elision_candidate() {
         let c0 = ColorRtRequest {
-            load_action: PASS_LOAD_ACTION_CLEAR,
+            load_action: MTL_LOAD_ACTION_CLEAR,
             ..Default::default()
         };
         assert!(!type11_load_is_a_seed_candidate(&c0));

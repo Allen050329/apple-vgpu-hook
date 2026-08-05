@@ -34,18 +34,23 @@ use crate::contract::endian::ld32;
 use crate::contract::pixel_format::{self, TexelLayout, MTL_FORMAT_BGRA8_UNORM, RGBA8_BPP};
 use crate::model::DeviceState;
 // `Decline::slug` on typed draw, coverage, and translation reasons.
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+use crate::contract::pass_action::MTL_STORE_ACTION_DONT_CARE;
 use crate::observe::Decline;
 use crate::runtime::census::srgb_census;
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-use crate::runtime::decode::render::PASS_STORE_ACTION_DONT_CARE;
 // Only `vulkan` and the tests read it, through this module's `use super::*`;
 // the Metal arm tests the band instead (`load_action_in_contract`).
 #[cfg(any(test, feature = "backend-vulkan"))]
-use crate::runtime::decode::render::PASS_LOAD_ACTION_DONT_CARE;
-use crate::runtime::decode::render::{
-    DepthAttachment, ScissorRect, StencilAttachment, PASS_LOAD_ACTION_CLEAR, PASS_LOAD_ACTION_LOAD,
-    PASS_STORE_ACTION_STORE,
+use crate::contract::pass_action::MTL_LOAD_ACTION_DONT_CARE;
+#[cfg(any(
+    feature = "backend-vulkan",
+    all(feature = "backend-metal", target_os = "macos")
+))]
+use crate::contract::pass_action::{is_declared_load_action, is_declared_store_action};
+use crate::contract::pass_action::{
+    MTL_LOAD_ACTION_CLEAR, MTL_LOAD_ACTION_LOAD, MTL_STORE_ACTION_STORE,
 };
+use crate::runtime::decode::render::{DepthAttachment, ScissorRect, StencilAttachment};
 use crate::runtime::decode::resource::ListObjectEntry;
 #[cfg(feature = "backend-vulkan")]
 use crate::runtime::decode::resource::TextureDescriptor;
@@ -1768,7 +1773,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
         if c.mapping_id == 0 {
             continue;
         }
-        if c.load_action == PASS_LOAD_ACTION_LOAD && color_seeds[i].is_none() {
+        if c.load_action == MTL_LOAD_ACTION_LOAD && color_seeds[i].is_none() {
             color_seeds[i] =
                 seed_color_load(state, host, req.task_id, c.texture_ref, 0, width, height);
             if color_seeds[i].is_none() {
@@ -1923,7 +1928,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
         return (EncodeStatus::Ok, color_outs.first().cloned());
     }
     for (i, c) in color_list.iter().enumerate() {
-        if c.store_action == PASS_STORE_ACTION_DONT_CARE {
+        if c.store_action == MTL_STORE_ACTION_DONT_CARE {
             continue;
         }
         let out_rgba = &color_outs[i];
@@ -2135,7 +2140,7 @@ pub(crate) fn store_seed_policy(
     load_action: u16,
     load_seed: Option<&[u8]>,
 ) -> Option<&[u8]> {
-    if force_full_store || load_action != PASS_LOAD_ACTION_LOAD {
+    if force_full_store || load_action != MTL_LOAD_ACTION_LOAD {
         None
     } else {
         load_seed
@@ -2200,7 +2205,7 @@ pub fn load_composite_premult_one_omsa(draw_rgba: &[u8], seed_rgba: &[u8]) -> (V
     all(feature = "backend-metal", target_os = "macos")
 ))]
 pub(crate) fn load_action_in_contract(pipeline_ref: u32, load_action: u16) -> bool {
-    if load_action <= PASS_LOAD_ACTION_CLEAR {
+    if is_declared_load_action(load_action) {
         return true;
     }
     if degrade_log_first(pipeline_ref, "load_action_unmapped") {
@@ -2243,7 +2248,7 @@ pub(crate) fn load_action_in_contract(pipeline_ref: u32, load_action: u16) -> bo
     all(feature = "backend-metal", target_os = "macos")
 ))]
 pub(crate) fn store_action_in_contract(pipeline_ref: u32, store_action: u16) -> bool {
-    if store_action <= PASS_STORE_ACTION_STORE {
+    if is_declared_store_action(store_action) {
         return true;
     }
     if degrade_log_first(pipeline_ref, "store_action_unmapped") {
@@ -2258,14 +2263,21 @@ pub(crate) fn store_action_in_contract(pipeline_ref: u32, store_action: u16) -> 
 
 /// Decoded `MTLLoadAction` → the Metal C ABI value.
 ///
-/// `MTLLoadAction` has exactly three values, so all three are spelled out and
-/// there is no catch-all. There used to be one, `_ => DONT_CARE`, and it was
-/// the most destructive default available: DONT_CARE tells Metal the previous
-/// attachment contents may be discarded, so a decode that read the wrong offset
-/// produced a *discarded framebuffer* and no log line at all. An unrecognised
-/// value now says so once per `(pipeline, slug)`.
+/// This maps nothing. `contract::pass_action` and `backend::metal::abi` declare
+/// the same three ordinals, in `u16` and `u32`, and `const` assertions in the
+/// mirror pin them equal — so every arm below is a widening. It reads as a
+/// translation table because it had to be one: until those two declarations
+/// were related, this `match` was the only thing in the tree claiming they
+/// agreed, and it claimed it on this arm alone.
 ///
-/// The fallback stays DONT_CARE rather than becoming LOAD or CLEAR. Out of
+/// What the function is really for is the guard above it. An out-of-contract
+/// value used to fall out of a `_ => DONT_CARE` catch-all, the most destructive
+/// default available: DONT_CARE tells Metal the previous attachment contents may
+/// be discarded, so a decode that read the wrong offset produced a *discarded
+/// framebuffer* and no log line at all. An unrecognised value now says so once
+/// per `(pipeline, slug)`.
+///
+/// The answer stays DONT_CARE rather than becoming LOAD or CLEAR. Out of
 /// contract means this crate misread the field, not that the guest asked for
 /// something exotic — every alternative is equally a guess, and inventing
 /// semantics for an unknown wire value is what the ground rules forbid. What
@@ -2280,8 +2292,10 @@ fn map_load_action(pipeline_ref: u32, a: u16) -> u32 {
         return REIMS_VGPU_MTL_LOAD_ACTION_DONT_CARE;
     }
     match a {
-        PASS_LOAD_ACTION_LOAD => REIMS_VGPU_MTL_LOAD_ACTION_LOAD,
-        PASS_LOAD_ACTION_CLEAR => REIMS_VGPU_MTL_LOAD_ACTION_CLEAR,
+        MTL_LOAD_ACTION_LOAD => REIMS_VGPU_MTL_LOAD_ACTION_LOAD,
+        MTL_LOAD_ACTION_CLEAR => REIMS_VGPU_MTL_LOAD_ACTION_CLEAR,
+        // DontCare, and — because `a` is a `u16` and the contract is three
+        // ordinals of it — the values the guard above has already reported.
         _ => REIMS_VGPU_MTL_LOAD_ACTION_DONT_CARE,
     }
 }
@@ -2294,7 +2308,7 @@ fn map_store_action(pipeline_ref: u32, a: u16) -> u32 {
     // Reports and returns; the answer for an out-of-contract value is the same
     // DontCare it always was.
     let _ = store_action_in_contract(pipeline_ref, a);
-    if a == PASS_STORE_ACTION_STORE {
+    if a == MTL_STORE_ACTION_STORE {
         REIMS_VGPU_MTL_STORE_ACTION_STORE
     } else {
         REIMS_VGPU_MTL_STORE_ACTION_DONT_CARE
@@ -3412,7 +3426,7 @@ pub fn color_target_request<M: HostMemory + HostOps>(
         height: rt.height,
         format: rt.format,
         load_action: 0,
-        store_action: PASS_STORE_ACTION_STORE,
+        store_action: MTL_STORE_ACTION_STORE,
         clear_color: [0.0; 4],
         target_seed_rgba: None,
     };
@@ -3499,16 +3513,16 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
         let mut seed = None;
         if let Some(cl) = clears.iter().find(|a| a.texture_ref == att.texture_ref) {
             // Clear-only stream record for this attachment: real Metal Clear.
-            load_action = PASS_LOAD_ACTION_CLEAR;
+            load_action = MTL_LOAD_ACTION_CLEAR;
             clear_color = cl.clear_color;
             if mapping_id == 0 {
                 seed = Some(solid_rgba_local(mw, mh, &cl.clear_color));
             }
-        } else if att.load_action == PASS_LOAD_ACTION_CLEAR {
+        } else if att.load_action == MTL_LOAD_ACTION_CLEAR {
             if mapping_id == 0 {
                 seed = Some(solid_rgba_local(mw, mh, &att.clear_color));
             }
-        } else if att.load_action == PASS_LOAD_ACTION_LOAD && mapping_id == 0 {
+        } else if att.load_action == MTL_LOAD_ACTION_LOAD && mapping_id == 0 {
             // GVA linear target: ephemeral host RT needs a CPU seed (archive
             // reims_vgpu_backend_metal; NULL seed → Metal Clear invent, still encode).
             // Type-11 is seeded later instead, at the attachment site in
@@ -3657,7 +3671,7 @@ pub(crate) fn sync_store_target_pages<M: HostMemory>(
     c: &ColorRtRequest,
 ) -> Option<std::collections::HashSet<u64>> {
     if c.target_gva == 0
-        || c.store_action != PASS_STORE_ACTION_STORE
+        || c.store_action != MTL_STORE_ACTION_STORE
         || c.width == 0
         || c.height == 0
     {
@@ -4332,8 +4346,8 @@ mod tests;
 #[cfg(all(test, feature = "backend-vulkan"))]
 mod load_action_contract_tests {
     use super::load_action_in_contract;
-    use crate::runtime::decode::render::{
-        PASS_LOAD_ACTION_CLEAR, PASS_LOAD_ACTION_DONT_CARE, PASS_LOAD_ACTION_LOAD,
+    use crate::contract::pass_action::{
+        MTL_LOAD_ACTION_CLEAR, MTL_LOAD_ACTION_DONT_CARE, MTL_LOAD_ACTION_LOAD,
     };
 
     /// `MTLLoadAction` has three values, and a fourth is named rather than
@@ -4347,9 +4361,9 @@ mod load_action_contract_tests {
     #[test]
     fn a_load_action_outside_mtlloadaction_is_named_not_swallowed() {
         for (name, action) in [
-            ("DontCare", PASS_LOAD_ACTION_DONT_CARE),
-            ("Load", PASS_LOAD_ACTION_LOAD),
-            ("Clear", PASS_LOAD_ACTION_CLEAR),
+            ("DontCare", MTL_LOAD_ACTION_DONT_CARE),
+            ("Load", MTL_LOAD_ACTION_LOAD),
+            ("Clear", MTL_LOAD_ACTION_CLEAR),
         ] {
             assert!(
                 load_action_in_contract(0x10AD, action),
@@ -4358,7 +4372,7 @@ mod load_action_contract_tests {
         }
         // Distinct pipeline refs, because the emitter latches per
         // (pipeline, slug) and a second call on one ref would report nothing.
-        assert!(!load_action_in_contract(0xF001, PASS_LOAD_ACTION_CLEAR + 1));
+        assert!(!load_action_in_contract(0xF001, MTL_LOAD_ACTION_CLEAR + 1));
         assert!(!load_action_in_contract(0xF002, u16::MAX));
 
         let log = std::fs::read_to_string(crate::observe::fail_log_path()).expect("fail log");
@@ -4377,7 +4391,7 @@ mod load_action_contract_tests {
 #[cfg(all(test, feature = "backend-vulkan"))]
 mod store_action_contract_tests {
     use super::store_action_in_contract;
-    use crate::runtime::decode::render::{PASS_STORE_ACTION_DONT_CARE, PASS_STORE_ACTION_STORE};
+    use crate::contract::pass_action::{MTL_STORE_ACTION_DONT_CARE, MTL_STORE_ACTION_STORE};
 
     /// The sibling of `a_load_action_outside_mtlloadaction_is_named_not_swallowed`,
     /// and it did not exist while that one did.
@@ -4390,8 +4404,8 @@ mod store_action_contract_tests {
     #[test]
     fn a_store_action_outside_mtlstoreaction_is_named_not_swallowed() {
         for (name, action) in [
-            ("DontCare", PASS_STORE_ACTION_DONT_CARE),
-            ("Store", PASS_STORE_ACTION_STORE),
+            ("DontCare", MTL_STORE_ACTION_DONT_CARE),
+            ("Store", MTL_STORE_ACTION_STORE),
         ] {
             assert!(
                 store_action_in_contract(0x570E, action),
@@ -4402,7 +4416,7 @@ mod store_action_contract_tests {
         // (pipeline, slug) and a second call on one ref would report nothing.
         assert!(!store_action_in_contract(
             0xF101,
-            PASS_STORE_ACTION_STORE + 1
+            MTL_STORE_ACTION_STORE + 1
         ));
         assert!(!store_action_in_contract(0xF102, u16::MAX));
 

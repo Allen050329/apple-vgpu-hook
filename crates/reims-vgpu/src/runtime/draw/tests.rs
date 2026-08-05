@@ -36,8 +36,8 @@ fn clear_black_attachment(texture_ref: u32) -> crate::runtime::decode::render::C
         level: 0,
         slice: 0,
         depth_plane: 0,
-        load_action: PASS_LOAD_ACTION_CLEAR,
-        store_action: PASS_STORE_ACTION_STORE,
+        load_action: MTL_LOAD_ACTION_CLEAR,
+        store_action: MTL_STORE_ACTION_STORE,
         clear_color: [0.0, 0.0, 0.0, 1.0],
     }
 }
@@ -1053,8 +1053,8 @@ fn a_chained_composite_store_names_the_resident_it_loads_from() {
         mapping_id: 7,
         width: 128,
         height: 64,
-        load_action: PASS_LOAD_ACTION_LOAD,
-        store_action: PASS_STORE_ACTION_STORE,
+        load_action: MTL_LOAD_ACTION_LOAD,
+        store_action: MTL_STORE_ACTION_STORE,
         ..Default::default()
     });
 
@@ -1085,13 +1085,13 @@ fn a_chained_composite_store_names_the_resident_it_loads_from() {
         None,
         "an intermediate record stores nothing guest-visible"
     );
-    req.colors[0].store_action = crate::runtime::decode::render::PASS_STORE_ACTION_DONT_CARE;
+    req.colors[0].store_action = crate::contract::pass_action::MTL_STORE_ACTION_DONT_CARE;
     assert_eq!(
         type11_store_identity(&state, &req, true),
         None,
         "a record that discards its target has no frame to defer"
     );
-    req.colors[0].store_action = PASS_STORE_ACTION_STORE;
+    req.colors[0].store_action = MTL_STORE_ACTION_STORE;
     req.colors[0].mapping_id = 0;
     assert_eq!(
         type11_store_identity(&state, &req, true),
@@ -1124,8 +1124,8 @@ fn an_intermediate_record_can_still_ask_about_the_resident_it_renders_into() {
         mapping_id: 7,
         width: 128,
         height: 64,
-        load_action: PASS_LOAD_ACTION_LOAD,
-        store_action: PASS_STORE_ACTION_STORE,
+        load_action: MTL_LOAD_ACTION_LOAD,
+        store_action: MTL_STORE_ACTION_STORE,
         ..Default::default()
     });
 
@@ -1159,24 +1159,24 @@ fn an_intermediate_record_can_still_ask_about_the_resident_it_renders_into() {
 
     // The refusals. A LOAD the resident cannot serve must not produce a query at
     // all, or the counters below it would divide all draws instead of candidates.
-    req.colors[0].load_action = crate::runtime::decode::render::PASS_LOAD_ACTION_CLEAR;
+    req.colors[0].load_action = crate::contract::pass_action::MTL_LOAD_ACTION_CLEAR;
     assert!(
         type11_load_currency_query(&state, &req).is_none(),
         "a CLEAR has no prior content to be current"
     );
-    req.colors[0].load_action = PASS_LOAD_ACTION_LOAD;
+    req.colors[0].load_action = MTL_LOAD_ACTION_LOAD;
     req.colors[0].target_seed_rgba = Some(vec![0u8; 128 * 64 * 4]);
     assert!(
         type11_load_currency_query(&state, &req).is_none(),
         "an explicit seed was already selected by RT provenance"
     );
     req.colors[0].target_seed_rgba = None;
-    req.colors[0].store_action = crate::runtime::decode::render::PASS_STORE_ACTION_DONT_CARE;
+    req.colors[0].store_action = crate::contract::pass_action::MTL_STORE_ACTION_DONT_CARE;
     assert!(
         type11_load_currency_query(&state, &req).is_none(),
         "a record that discards its target renders into no resident worth naming"
     );
-    req.colors[0].store_action = PASS_STORE_ACTION_STORE;
+    req.colors[0].store_action = MTL_STORE_ACTION_STORE;
     req.colors[0].mapping_id = 0;
     assert!(
         type11_load_currency_query(&state, &req).is_none(),
@@ -1480,7 +1480,7 @@ fn attachment_alias_resident_chain_selection() {
         target_gva: 0x9000,
         width: 8,
         height: 8,
-        load_action: PASS_LOAD_ACTION_LOAD,
+        load_action: MTL_LOAD_ACTION_LOAD,
         ..Default::default()
     });
     assert_eq!(
@@ -1591,7 +1591,7 @@ fn gva_attachment_alias_samples_the_in_process_chain() {
             target_gva,
             width: 2,
             height: 1,
-            load_action: PASS_LOAD_ACTION_LOAD,
+            load_action: MTL_LOAD_ACTION_LOAD,
             target_seed_rgba: Some(seed.clone()),
             ..Default::default()
         }],
@@ -1611,9 +1611,9 @@ fn gva_attachment_alias_samples_the_in_process_chain() {
     req.colors[0].mapping_id = 9;
     assert!(fragment_attachment_alias_sample(&req, 0, texture_ref).is_none());
     req.colors[0].mapping_id = 0;
-    req.colors[0].load_action = PASS_LOAD_ACTION_DONT_CARE;
+    req.colors[0].load_action = MTL_LOAD_ACTION_DONT_CARE;
     assert!(fragment_attachment_alias_sample(&req, 0, texture_ref).is_none());
-    req.colors[0].load_action = PASS_LOAD_ACTION_CLEAR;
+    req.colors[0].load_action = MTL_LOAD_ACTION_CLEAR;
     req.colors[0].clear_color = [0.25, 0.5, 0.75, 1.0];
     assert_eq!(
         fragment_attachment_alias_sample(&req, 0, texture_ref),
@@ -1766,8 +1766,8 @@ fn color_target_diag_names_every_mrt_slot() {
             width: 1920,
             height: 1080,
             format: MTL_FORMAT_BGRA8_UNORM,
-            load_action: PASS_LOAD_ACTION_LOAD,
-            store_action: PASS_STORE_ACTION_STORE,
+            load_action: MTL_LOAD_ACTION_LOAD,
+            store_action: MTL_STORE_ACTION_STORE,
             ..Default::default()
         },
         ColorRtRequest {
@@ -1777,8 +1777,8 @@ fn color_target_diag_names_every_mrt_slot() {
             width: 960,
             height: 540,
             format: pixel_format::MTL_FORMAT_RGBA16_FLOAT,
-            load_action: PASS_LOAD_ACTION_CLEAR,
-            store_action: PASS_STORE_ACTION_STORE,
+            load_action: MTL_LOAD_ACTION_CLEAR,
+            store_action: MTL_STORE_ACTION_STORE,
             ..Default::default()
         },
     ];
@@ -1808,7 +1808,7 @@ fn missing_pipeline_is_soft() {
             width: 4,
             height: 4,
             format: MTL_FORMAT_BGRA8_UNORM,
-            store_action: PASS_STORE_ACTION_STORE,
+            store_action: MTL_STORE_ACTION_STORE,
             ..Default::default()
         }],
         ..Default::default()
@@ -1997,14 +1997,14 @@ fn vulkan_sampler_preserves_guest_coordinate_and_filter_state() {
 #[test]
 fn store_seed_policy_clear_full_load_diff() {
     let seed = [1u8, 2, 3, 4];
-    assert!(store_seed_policy(false, PASS_LOAD_ACTION_CLEAR, Some(&seed)).is_none());
-    assert!(store_seed_policy(false, PASS_LOAD_ACTION_DONT_CARE, Some(&seed)).is_none());
-    assert!(store_seed_policy(true, PASS_LOAD_ACTION_LOAD, Some(&seed)).is_none());
+    assert!(store_seed_policy(false, MTL_LOAD_ACTION_CLEAR, Some(&seed)).is_none());
+    assert!(store_seed_policy(false, MTL_LOAD_ACTION_DONT_CARE, Some(&seed)).is_none());
+    assert!(store_seed_policy(true, MTL_LOAD_ACTION_LOAD, Some(&seed)).is_none());
     assert_eq!(
-        store_seed_policy(false, PASS_LOAD_ACTION_LOAD, Some(&seed)),
+        store_seed_policy(false, MTL_LOAD_ACTION_LOAD, Some(&seed)),
         Some(seed.as_slice())
     );
-    assert!(store_seed_policy(false, PASS_LOAD_ACTION_LOAD, None).is_none());
+    assert!(store_seed_policy(false, MTL_LOAD_ACTION_LOAD, None).is_none());
 }
 
 /// Premult One/OneMinusSrcAlpha Load: transparent draw keeps seed; opaque black wins.
@@ -2103,8 +2103,8 @@ fn mrt_draw_request_load_seed_miss_still_encodes() {
         level: 0,
         slice: 0,
         depth_plane: 0,
-        load_action: PASS_LOAD_ACTION_LOAD,
-        store_action: PASS_STORE_ACTION_STORE,
+        load_action: MTL_LOAD_ACTION_LOAD,
+        store_action: MTL_STORE_ACTION_STORE,
         clear_color: [1.0, 1.0, 1.0, 1.0], // would paint solid white if Clear invented
     };
     let slots = [(0u32, att)];
@@ -2116,7 +2116,7 @@ fn mrt_draw_request_load_seed_miss_still_encodes() {
         req.colors[0].target_seed_rgba.is_none(),
         "seed miss leaves seed None (Metal Clear invent, full Store)"
     );
-    assert_eq!(req.colors[0].load_action, PASS_LOAD_ACTION_LOAD);
+    assert_eq!(req.colors[0].load_action, MTL_LOAD_ACTION_LOAD);
 }
 
 /// qemu-shim: type-8 view of type-11 is a valid color RT (archive
@@ -4245,8 +4245,8 @@ fn a_synchronous_gva_store_is_bounded_to_the_pages_the_command_named() {
         width: 64,
         height: 64,
         format: crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM,
-        load_action: PASS_LOAD_ACTION_LOAD,
-        store_action: PASS_STORE_ACTION_STORE,
+        load_action: MTL_LOAD_ACTION_LOAD,
+        store_action: MTL_STORE_ACTION_STORE,
         clear_color: [0.0; 4],
         target_seed_rgba: None,
     };
@@ -4347,8 +4347,8 @@ fn a_scissored_gva_store_is_bounded_on_both_its_rails() {
         width: W,
         height: H,
         format: fmt,
-        load_action: PASS_LOAD_ACTION_LOAD,
-        store_action: PASS_STORE_ACTION_STORE,
+        load_action: MTL_LOAD_ACTION_LOAD,
+        store_action: MTL_STORE_ACTION_STORE,
         clear_color: [0.0; 4],
         target_seed_rgba: None,
     };

@@ -67,6 +67,34 @@ pub const REIMS_VGPU_MTL_LOAD_ACTION_CLEAR: u32 = 2;
 pub const REIMS_VGPU_MTL_STORE_ACTION_DONT_CARE: u32 = 0;
 pub const REIMS_VGPU_MTL_STORE_ACTION_STORE: u32 = 1;
 
+// The same five ordinals are declared in `contract::pass_action`, as the `u16`
+// the render-pass attachment prefix carries them in — same reason as the
+// dispatch pair above, with one more edge: the encode path *converts* between
+// the two spellings, so until these assertions existed the only thing claiming
+// they agreed was an identity `match` in `runtime::draw`, on the Metal arm
+// alone. The width is the whole difference between the two families, which is
+// why each cast narrows the mirror rather than widening the contract — an
+// ordinal that stopped fitting `u16` would fail here instead of truncating
+// silently at the call.
+const _: () = assert!(
+    REIMS_VGPU_MTL_LOAD_ACTION_DONT_CARE as u16
+        == crate::contract::pass_action::MTL_LOAD_ACTION_DONT_CARE
+);
+const _: () = assert!(
+    REIMS_VGPU_MTL_LOAD_ACTION_LOAD as u16 == crate::contract::pass_action::MTL_LOAD_ACTION_LOAD
+);
+const _: () = assert!(
+    REIMS_VGPU_MTL_LOAD_ACTION_CLEAR as u16 == crate::contract::pass_action::MTL_LOAD_ACTION_CLEAR
+);
+const _: () = assert!(
+    REIMS_VGPU_MTL_STORE_ACTION_DONT_CARE as u16
+        == crate::contract::pass_action::MTL_STORE_ACTION_DONT_CARE
+);
+const _: () = assert!(
+    REIMS_VGPU_MTL_STORE_ACTION_STORE as u16
+        == crate::contract::pass_action::MTL_STORE_ACTION_STORE
+);
+
 pub const REIMS_VGPU_COMPUTE_TEXTURE_ACCESS_READ: u32 = 0;
 pub const REIMS_VGPU_COMPUTE_TEXTURE_ACCESS_READ_WRITE: u32 = 1;
 pub const REIMS_VGPU_COMPUTE_TEXTURE_ACCESS_WRITE: u32 = 2;

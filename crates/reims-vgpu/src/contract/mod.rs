@@ -12,6 +12,7 @@ pub mod fnv;
 pub mod gva;
 pub mod gva_resolve;
 pub mod iosurface_pages;
+pub mod pass_action;
 pub mod pixel_format;
 
 pub(crate) use checked::*;

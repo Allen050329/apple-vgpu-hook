@@ -874,7 +874,7 @@ pub fn encode_icb_execute_and_writeback<M: HostMemory + HostOps>(
     let mut any_write = false;
     for (i, (mapping_id, tex, seed)) in color_tex.iter().enumerate() {
         let c = &color_list[i];
-        if c.store_action == PASS_STORE_ACTION_DONT_CARE {
+        if c.store_action == MTL_STORE_ACTION_DONT_CARE {
             continue;
         }
         let mut pixels = seed.clone();

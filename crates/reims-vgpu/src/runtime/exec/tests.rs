@@ -7,11 +7,11 @@ use reims_vgpu_wire::OP_HEADER_LEN;
 
 use super::*;
 use crate::contract::endian::{st16, st32, st64};
+use crate::contract::pass_action::{MTL_LOAD_ACTION_CLEAR, MTL_STORE_ACTION_STORE};
 use crate::model::{DeviceId, PAGE_SHIFT_ARM64E, PAGE_SHIFT_X86};
 use crate::runtime::decode::render::{
     PASS_ATTACH_CLEAR_COLOR, PASS_ATTACH_LOAD_ACTION, PASS_ATTACH_STORE_ACTION, PASS_ATTACH_TEXREF,
-    PASS_COLOR_ATTACH_OFF, PASS_COLOR_ATTACH_STRIDE, PASS_LOAD_ACTION_CLEAR,
-    PASS_STORE_ACTION_STORE,
+    PASS_COLOR_ATTACH_OFF, PASS_COLOR_ATTACH_STRIDE,
 };
 use crate::runtime::host::FakeHost;
 
@@ -593,11 +593,11 @@ fn multi_attachment_decode_in_pass() {
         st32(&mut payload[slot + PASS_ATTACH_TEXREF..], tex);
         st16(
             &mut payload[slot + PASS_ATTACH_LOAD_ACTION..],
-            PASS_LOAD_ACTION_CLEAR,
+            MTL_LOAD_ACTION_CLEAR,
         );
         st16(
             &mut payload[slot + PASS_ATTACH_STORE_ACTION..],
-            PASS_STORE_ACTION_STORE,
+            MTL_STORE_ACTION_STORE,
         );
         st64(
             &mut payload[slot + PASS_ATTACH_CLEAR_COLOR..],
@@ -1692,8 +1692,8 @@ fn clear_only_type4_surface_writes_guest_pages() {
         level: 0,
         slice: 0,
         depth_plane: 0,
-        load_action: PASS_LOAD_ACTION_CLEAR,
-        store_action: PASS_STORE_ACTION_STORE,
+        load_action: MTL_LOAD_ACTION_CLEAR,
+        store_action: MTL_STORE_ACTION_STORE,
         clear_color: [1.0, 0.0, 0.0, 1.0], // red → BGRA (0,0,255,255)
     });
     finish_stream(&mut state, &mut host, 1, &mut out, &acc);
@@ -1727,8 +1727,8 @@ fn finish_stream_clear_only_branch_without_draws() {
         level: 0,
         slice: 0,
         depth_plane: 0,
-        load_action: PASS_LOAD_ACTION_CLEAR,
-        store_action: PASS_STORE_ACTION_STORE,
+        load_action: MTL_LOAD_ACTION_CLEAR,
+        store_action: MTL_STORE_ACTION_STORE,
         clear_color: [0.0, 0.0, 0.0, 1.0],
     });
     // No draws → clear-only branch (attempts apply_clear; unresolvable ref).
@@ -1751,8 +1751,8 @@ fn finish_stream_with_draws_skips_guest_clear_prelude() {
         level: 0,
         slice: 0,
         depth_plane: 0,
-        load_action: PASS_LOAD_ACTION_CLEAR,
-        store_action: PASS_STORE_ACTION_STORE,
+        load_action: MTL_LOAD_ACTION_CLEAR,
+        store_action: MTL_STORE_ACTION_STORE,
         clear_color: [1.0, 0.0, 0.0, 1.0],
     };
     acc.clears.push(att);
@@ -1854,8 +1854,8 @@ fn nometal_draw_falls_back_to_type4_clear() {
         level: 0,
         slice: 0,
         depth_plane: 0,
-        load_action: PASS_LOAD_ACTION_CLEAR,
-        store_action: PASS_STORE_ACTION_STORE,
+        load_action: MTL_LOAD_ACTION_CLEAR,
+        store_action: MTL_STORE_ACTION_STORE,
         clear_color: [0.0, 1.0, 0.0, 1.0], // green
     };
     acc.clears.push(att);
@@ -1994,8 +1994,8 @@ fn render_pass_template_reuses_attachment_without_load_seed() {
             width: 1920,
             height: 1080,
             format: 0x50,
-            load_action: PASS_LOAD_ACTION_CLEAR,
-            store_action: PASS_STORE_ACTION_STORE,
+            load_action: MTL_LOAD_ACTION_CLEAR,
+            store_action: MTL_STORE_ACTION_STORE,
             clear_color: [0.1, 0.2, 0.3, 1.0],
             target_seed_rgba: Some(vec![0xbb; 16]),
         }],
@@ -2003,7 +2003,7 @@ fn render_pass_template_reuses_attachment_without_load_seed() {
     };
     let template = render_pass_attachment_template(&first);
     assert!(template.colors[0].target_seed_rgba.is_none());
-    assert_eq!(template.colors[0].load_action, PASS_LOAD_ACTION_LOAD);
+    assert_eq!(template.colors[0].load_action, MTL_LOAD_ACTION_LOAD);
     assert_eq!(template.colors[0].mapping_id, 3);
     assert_eq!(
         (template.colors[0].width, template.colors[0].height),

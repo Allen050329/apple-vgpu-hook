@@ -6,6 +6,9 @@
 
 use crate::contract::draw::DrawArgs;
 use crate::contract::endian::{ld32, ld64};
+use crate::contract::pass_action::{
+    MTL_LOAD_ACTION_CLEAR, MTL_LOAD_ACTION_LOAD, MTL_STORE_ACTION_STORE,
+};
 use crate::contract::pixel_format::{f64_to_unorm8, MTL_FORMAT_BGRA8_UNORM, RGBA8_BPP};
 use crate::model::DeviceState;
 use crate::runtime::blit_exec::{self, BlitStatus};
@@ -23,8 +26,7 @@ use crate::runtime::decode::fifo::{
 use crate::runtime::decode::render::{
     self, decode_color_attachment, decode_depth_attachment, decode_stencil_attachment,
     depth_stencil_is_bindable, ColorAttachment, DepthAttachment, Kind as RenderKind, ScissorRect,
-    Stage, StencilAttachment, PASS_LOAD_ACTION_CLEAR, PASS_LOAD_ACTION_LOAD,
-    PASS_MAX_COLOR_ATTACHMENTS, PASS_STORE_ACTION_STORE,
+    Stage, StencilAttachment, PASS_MAX_COLOR_ATTACHMENTS,
 };
 use crate::runtime::decode::stream::{
     self, decode_first_record, decode_next_record, SEGMENT_TYPE_BLIT, SEGMENT_TYPE_COMPUTE,
@@ -1586,8 +1588,8 @@ fn handle_render_record<M: HostMemory + HostOps>(
                             out.type11_mappings.push(att.texture_ref);
                         }
                     }
-                    if att.load_action == PASS_LOAD_ACTION_CLEAR {
-                        if att.store_action == PASS_STORE_ACTION_STORE {
+                    if att.load_action == MTL_LOAD_ACTION_CLEAR {
+                        if att.store_action == MTL_STORE_ACTION_STORE {
                             acc.clears.push(att);
                         } else {
                             // Metal Clear + non-Store (e.g. DontCare): the clear
@@ -1608,8 +1610,8 @@ fn handle_render_record<M: HostMemory + HostOps>(
             }
             // Also keep color0 from command for convenience.
             if cmd.color0.texture_ref != 0
-                && cmd.color0.load_action == PASS_LOAD_ACTION_CLEAR
-                && cmd.color0.store_action == PASS_STORE_ACTION_STORE
+                && cmd.color0.load_action == MTL_LOAD_ACTION_CLEAR
+                && cmd.color0.store_action == MTL_STORE_ACTION_STORE
                 && !acc
                     .clears
                     .iter()
@@ -2441,7 +2443,7 @@ fn finish_stream<M: HostMemory + HostOps>(
                 // mid peak 10.9M native → 2.5M after later records).
                 if di > 0 {
                     for c in &mut req.colors {
-                        c.load_action = PASS_LOAD_ACTION_LOAD;
+                        c.load_action = MTL_LOAD_ACTION_LOAD;
                     }
                     // Chain from the engine resident when available; otherwise
                     // seed from the prior encode output (archive "thread each
@@ -2637,7 +2639,7 @@ fn render_pass_attachment_template(first: &draw::DrawEncodeRequest) -> draw::Dra
             width: c.width,
             height: c.height,
             format: c.format,
-            load_action: PASS_LOAD_ACTION_LOAD,
+            load_action: MTL_LOAD_ACTION_LOAD,
             store_action: c.store_action,
             clear_color: c.clear_color,
             target_seed_rgba: None,
@@ -2801,7 +2803,7 @@ fn apply_clear<M: HostMemory + HostOps>(
     task_id: u32,
     att: &ColorAttachment,
 ) -> bool {
-    if att.texture_ref == 0 || att.store_action != PASS_STORE_ACTION_STORE {
+    if att.texture_ref == 0 || att.store_action != MTL_STORE_ACTION_STORE {
         return false;
     }
     // Prefer full draw-path resolve (type-11 or type-2/3 GVA wallpaper targets).

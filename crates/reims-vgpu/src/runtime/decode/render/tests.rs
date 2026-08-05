@@ -472,6 +472,7 @@ fn execute_commands_range_and_indirect() {
 #[test]
 fn depth_and_stencil_pass_slots() {
     use crate::contract::endian::{st16, st32, st64};
+    use crate::contract::pass_action::{MTL_LOAD_ACTION_CLEAR, MTL_STORE_ACTION_STORE};
     let mut payload = vec![0u8; PASS_MIN_PAYLOAD];
     // depth @0
     st32(
@@ -480,11 +481,11 @@ fn depth_and_stencil_pass_slots() {
     );
     st16(
         &mut payload[PASS_DEPTH_ATTACH_OFF + PASS_ATTACH_LOAD_ACTION..],
-        PASS_LOAD_ACTION_CLEAR,
+        MTL_LOAD_ACTION_CLEAR,
     );
     st16(
         &mut payload[PASS_DEPTH_ATTACH_OFF + PASS_ATTACH_STORE_ACTION..],
-        PASS_STORE_ACTION_STORE,
+        MTL_STORE_ACTION_STORE,
     );
     st64(
         &mut payload[PASS_DEPTH_ATTACH_OFF + PASS_DEPTH_ATTACH_CLEAR_DEPTH..],
