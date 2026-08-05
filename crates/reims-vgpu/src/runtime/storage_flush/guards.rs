@@ -166,7 +166,8 @@ pub(crate) fn deferred_pages_still_ours<M: HostMemory + HostOps>(
 ///
 /// The check is [`crate::runtime::mapper::type4_pages_witness`]; this is the
 /// deferred rails' use of it, and it is the missing half of a guarantee the
-/// raw-GVA rails already have. `gva_view::write_span` re-walks the task page
+/// raw-GVA rails already have. [`crate::runtime::gva_view::write_span_within`]
+/// re-walks the task page
 /// table at write time and fails closed, stating outright that a write through a
 /// cached view "lands in whatever now owns those host pages (guest heap
 /// corruption: the 2026-07-19 WindowServer SIGSEGV class)". The mapping-keyed

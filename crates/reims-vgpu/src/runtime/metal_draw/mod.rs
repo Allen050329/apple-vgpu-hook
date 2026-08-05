@@ -3754,7 +3754,7 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
 
 /// Archive `apple_pv_gpu_write_gva_rgba`: tight RGBA8 → native rows at GVA.
 /// Packed contig HostOps view when possible; else multi-import per row
-/// ([`gva_view::write_span`]) — no `write_gpa` walk.
+/// ([`crate::runtime::gva_view::write_span_within`]) — no `write_gpa` walk.
 ///
 /// Carries the refusal out rather than collapsing to `false`: a caller has to be
 /// able to tell "the guest tore this target down" (`MemError::is_guest_teardown`)
@@ -3914,7 +3914,8 @@ pub(crate) fn write_gva_rgba8_within<M: HostMemory + HostOps>(
     let span = (height as u64).saturating_mul(bpr as u64);
     let mut row = vec![0u8; tight as usize];
     // Guest writes resolve through a fresh PT walk at write time — never a
-    // cached view (stale-view heap-corruption class; see gva_view::write_span) —
+    // cached view (stale-view heap-corruption class; see
+    // `gva_view::write_span_within`) —
     // and that walk carries `allowed`, so a deferred window cannot alias a page
     // outside itself even if the guest re-points the range mid-flush.
     if let Some(span_map) =
@@ -3941,7 +3942,7 @@ pub(crate) fn write_gva_rgba8_within<M: HostMemory + HostOps>(
         crate::runtime::gva_view::unmap_fresh_span(host, span_map);
         return res;
     }
-    // Fragmented GVA: multi-import each converted row via write_span.
+    // Fragmented GVA: multi-import each converted row via `write_span_within`.
     for y in 0..height as usize {
         let src = &rgba[y * rgba_row..y * rgba_row + rgba_row];
         if !pixel_format::convert_rgba8_to_row(format, src, width, &mut row) {
