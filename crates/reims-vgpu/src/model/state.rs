@@ -448,17 +448,33 @@ impl std::ops::IndexMut<u32> for TaskTable {
     }
 }
 
+/// Why a `DeviceState` mutator refused a decoded guest record.
+///
+/// # The `*IdSentinel` five were `*IdRange`
+///
+/// Five of these named a *range* check, because `is_mapping_id` used to be
+/// `id >= 1 && id < MAX_MAPPINGS` and one variant covered both halves. The
+/// ceiling is gone — `mappings` is a `BTreeMap` keyed by the full `u32`, so it
+/// refused ids its own storage would have held — and the only value these can
+/// now refuse is 0, the device-wide "no mapping" sentinel that `runtime::draw`
+/// reads as "this attachment is addressed by GVA".
+///
+/// So the slugs say `_id_sentinel`. A name that still said `_id_range` would
+/// tell a reader ranking the fail log that the guest overran a table, and send
+/// them looking for a bound that does not exist. Four sibling `*TaskIdRange`
+/// variants were deleted outright in the same move, for the same reason: the
+/// task table is a map too, and there is no id it refuses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StateMutationDecline {
     SetObjectListTaskInactive { task_id: u32 },
     InsertObjectTaskInactive { task_id: u32, object_ref: u32 },
-    MapSurfaceIdRange { mapping_id: u32 },
-    UnmapSurfaceIdRange { mapping_id: u32 },
-    AttachMappingIdRange { mapping_id: u32 },
+    MapSurfaceIdSentinel { mapping_id: u32 },
+    UnmapSurfaceIdSentinel { mapping_id: u32 },
+    AttachMappingIdSentinel { mapping_id: u32 },
     AttachMappingInternalZero { mapping_id: u32 },
-    MappingDeviceDescIdRange { mapping_id: u32 },
+    MappingDeviceDescIdSentinel { mapping_id: u32 },
     MappingDeviceDescEmpty { mapping_id: u32 },
-    MappingGeomIdRange { mapping_id: u32 },
+    MappingGeomIdSentinel { mapping_id: u32 },
     MappingGeomWidthZero { mapping_id: u32 },
     MappingGeomHeightZero { mapping_id: u32 },
     MappingGeomWidthRange { mapping_id: u32, width: u32 },
@@ -470,13 +486,13 @@ impl crate::observe::Decline for StateMutationDecline {
         match self {
             Self::SetObjectListTaskInactive { .. } => "model_set_object_list_task_inactive",
             Self::InsertObjectTaskInactive { .. } => "model_insert_object_task_inactive",
-            Self::MapSurfaceIdRange { .. } => "model_map_surface_id_range",
-            Self::UnmapSurfaceIdRange { .. } => "model_unmap_surface_id_range",
-            Self::AttachMappingIdRange { .. } => "model_attach_mapping_id_range",
+            Self::MapSurfaceIdSentinel { .. } => "model_map_surface_id_sentinel",
+            Self::UnmapSurfaceIdSentinel { .. } => "model_unmap_surface_id_sentinel",
+            Self::AttachMappingIdSentinel { .. } => "model_attach_mapping_id_sentinel",
             Self::AttachMappingInternalZero { .. } => "model_attach_mapping_internal_zero",
-            Self::MappingDeviceDescIdRange { .. } => "model_mapping_device_desc_id_range",
+            Self::MappingDeviceDescIdSentinel { .. } => "model_mapping_device_desc_id_sentinel",
             Self::MappingDeviceDescEmpty { .. } => "model_mapping_device_desc_empty",
-            Self::MappingGeomIdRange { .. } => "model_mapping_geom_id_range",
+            Self::MappingGeomIdSentinel { .. } => "model_mapping_geom_id_sentinel",
             Self::MappingGeomWidthZero { .. } => "model_mapping_geom_width_zero",
             Self::MappingGeomHeightZero { .. } => "model_mapping_geom_height_zero",
             Self::MappingGeomWidthRange { .. } => "model_mapping_geom_width_range",
@@ -496,13 +512,13 @@ impl crate::observe::Decline for StateMutationDecline {
                 ("task", task_id.to_string()),
                 ("ref", object_ref.to_string()),
             ],
-            Self::MapSurfaceIdRange { mapping_id }
-            | Self::UnmapSurfaceIdRange { mapping_id }
-            | Self::AttachMappingIdRange { mapping_id }
+            Self::MapSurfaceIdSentinel { mapping_id }
+            | Self::UnmapSurfaceIdSentinel { mapping_id }
+            | Self::AttachMappingIdSentinel { mapping_id }
             | Self::AttachMappingInternalZero { mapping_id }
-            | Self::MappingDeviceDescIdRange { mapping_id }
+            | Self::MappingDeviceDescIdSentinel { mapping_id }
             | Self::MappingDeviceDescEmpty { mapping_id }
-            | Self::MappingGeomIdRange { mapping_id }
+            | Self::MappingGeomIdSentinel { mapping_id }
             | Self::MappingGeomWidthZero { mapping_id }
             | Self::MappingGeomHeightZero { mapping_id }
             | Self::MappingGeomWidthRange { mapping_id, .. }
@@ -1842,33 +1858,24 @@ pub struct DeviceState {
     pub pending: PendingWork,
     pub child_rings: [ChannelRing; MAX_CHANNELS],
     pub tasks: TaskTable,
-    /// Highest task id and mapping id the guest has ever named, whether or not
-    /// the slot table could hold it.
+    /// Highest task id the guest has ever named.
     ///
-    /// The reach census for [`MAX_TASKS`], and it exists because that is the last
-    /// bound in this device that hard-refuses a guest call without a derivation
-    /// behind the number. A task id is a full `u32` on the wire —
-    /// `decode_replace_physical` and the resource-list commands all read it with
-    /// `ld32` — so nothing in the protocol says 256, and past it `define_task`
-    /// returns `false` and the task never exists.
+    /// # It measured a bound, and the bound is gone
     ///
-    /// [`Self::max_mapping_id_seen`] was the same instrument for a `MAX_MAPPINGS`
-    /// that no longer exists: `mappings` is a `BTreeMap` keyed by the full `u32`,
-    /// so the bound refused ids its own storage would have held and it is gone
-    /// rather than measured. The mark stays as an occupancy reading — it is the
-    /// only thing that says how far the guest spreads that map — but it is no
-    /// longer a distance to a refusal, and nothing should turn it back into one.
+    /// This and [`Self::max_mapping_id_seen`] were added as reach censuses for
+    /// `MAX_TASKS` (256) and `MAX_MAPPINGS` (4096), because a refusal counter
+    /// alone cannot say whether a bound is close: a boot stopping at id 12 and
+    /// one stopping at 255 both report zero refusals, and only one of them says
+    /// there is room. What they measured was 25x and 97x of headroom, and
+    /// headroom is not a derivation — so both bounds were removed rather than
+    /// defended, and [`TaskTable`] and `mappings` are maps keyed by the guest's
+    /// own `u32`.
     ///
-    /// The refusal counters (`model_define_task_id_range` and friends) cannot
-    /// answer whether that is close: a boot where the guest stops at id 12 and
-    /// one where it stops at id 255 both report zero refusals, and only one of
-    /// them says the bound has room. That is the same rule the bind tables'
-    /// `reach_route` bands follow, and the same reason. Read these two together
-    /// with the refusal counters, never instead of them.
-    ///
-    /// Recorded before the bound is applied, so a refused id still moves the
-    /// mark — a high-water figure that only counted ids we accepted would be
-    /// capped by the very bound it is measuring.
+    /// So these are **occupancy readings** now, not distances to a refusal.
+    /// They are the only thing that says how far the guest spreads either id
+    /// space, which is worth publishing for a map with no removal path — but
+    /// there is no cap to read them against, and the census prints `none` where
+    /// it used to print one. Nothing should turn either back into a bound.
     pub max_task_id_seen: u32,
     /// See [`Self::max_task_id_seen`].
     pub max_mapping_id_seen: u32,
@@ -2949,7 +2956,7 @@ impl DeviceState {
     pub fn map_surface(&mut self, mapping_id: u32) -> bool {
         self.max_mapping_id_seen = self.max_mapping_id_seen.max(mapping_id);
         if !crate::model::is_mapping_id(mapping_id) {
-            StateMutationDecline::MapSurfaceIdRange { mapping_id }.emit(u64::from(mapping_id));
+            StateMutationDecline::MapSurfaceIdSentinel { mapping_id }.emit(u64::from(mapping_id));
             return false;
         }
         let e = self.mappings.entry(mapping_id).or_default();
@@ -3000,7 +3007,7 @@ impl DeviceState {
     pub fn unmap_surface(&mut self, mapping_id: u32) -> bool {
         self.max_mapping_id_seen = self.max_mapping_id_seen.max(mapping_id);
         if !crate::model::is_mapping_id(mapping_id) {
-            StateMutationDecline::UnmapSurfaceIdRange { mapping_id }.emit(u64::from(mapping_id));
+            StateMutationDecline::UnmapSurfaceIdSentinel { mapping_id }.emit(u64::from(mapping_id));
             return false;
         }
         self.forget_compositor_mapping(mapping_id);
@@ -3035,7 +3042,7 @@ impl DeviceState {
     pub fn attach_mapping_internal(&mut self, mapping_id: u32, mapping_internal: u64) -> bool {
         self.max_mapping_id_seen = self.max_mapping_id_seen.max(mapping_id);
         if !crate::model::is_mapping_id(mapping_id) {
-            StateMutationDecline::AttachMappingIdRange { mapping_id }.emit(u64::from(mapping_id));
+            StateMutationDecline::AttachMappingIdSentinel { mapping_id }.emit(u64::from(mapping_id));
             return false;
         }
         if mapping_internal == 0 {
@@ -3084,7 +3091,7 @@ impl DeviceState {
     pub fn set_mapping_device_desc(&mut self, mapping_id: u32, desc: &[u8]) -> bool {
         self.max_mapping_id_seen = self.max_mapping_id_seen.max(mapping_id);
         if !crate::model::is_mapping_id(mapping_id) {
-            StateMutationDecline::MappingDeviceDescIdRange { mapping_id }
+            StateMutationDecline::MappingDeviceDescIdSentinel { mapping_id }
                 .emit(u64::from(mapping_id));
             return false;
         }
@@ -3105,7 +3112,7 @@ impl DeviceState {
         format: u16,
     ) -> bool {
         if !crate::model::is_mapping_id(mapping_id) {
-            StateMutationDecline::MappingGeomIdRange { mapping_id }.emit(u64::from(mapping_id));
+            StateMutationDecline::MappingGeomIdSentinel { mapping_id }.emit(u64::from(mapping_id));
             return false;
         }
         // The bound itself lives once, in `regs::scanout_extent_fault`; this is
@@ -3561,13 +3568,13 @@ mod fail_vocabulary_tests {
                 task_id: 1,
                 object_ref: 3,
             },
-            StateMutationDecline::MapSurfaceIdRange { mapping_id: 8192 },
-            StateMutationDecline::UnmapSurfaceIdRange { mapping_id: 8192 },
-            StateMutationDecline::AttachMappingIdRange { mapping_id: 8192 },
+            StateMutationDecline::MapSurfaceIdSentinel { mapping_id: 8192 },
+            StateMutationDecline::UnmapSurfaceIdSentinel { mapping_id: 8192 },
+            StateMutationDecline::AttachMappingIdSentinel { mapping_id: 8192 },
             StateMutationDecline::AttachMappingInternalZero { mapping_id: 1 },
-            StateMutationDecline::MappingDeviceDescIdRange { mapping_id: 8192 },
+            StateMutationDecline::MappingDeviceDescIdSentinel { mapping_id: 8192 },
             StateMutationDecline::MappingDeviceDescEmpty { mapping_id: 1 },
-            StateMutationDecline::MappingGeomIdRange { mapping_id: 8192 },
+            StateMutationDecline::MappingGeomIdSentinel { mapping_id: 8192 },
             StateMutationDecline::MappingGeomWidthZero { mapping_id: 1 },
             StateMutationDecline::MappingGeomHeightZero { mapping_id: 1 },
             StateMutationDecline::MappingGeomWidthRange {
