@@ -1814,7 +1814,11 @@ fn missing_pipeline_is_soft() {
         ..Default::default()
     };
     let mut req = req;
-    let st = encode_draw_and_writeback(&mut state, &mut host, &mut req);
+    // Spelled here rather than behind a wrapper, because the two arms' wrappers
+    // used to pass *different* `force_full_store` values for the same call.
+    // These are the arguments `exec` passes for a single-record draw that owns
+    // its writeback.
+    let st = encode_draw_chain(&mut state, &mut host, &mut req, true, false).0;
     assert!(matches!(
         st,
         EncodeStatus::MissingPipeline(_) | EncodeStatus::MissingMtlb(_) | EncodeStatus::NoMetal(_)

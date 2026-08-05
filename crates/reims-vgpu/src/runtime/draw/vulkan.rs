@@ -62,14 +62,6 @@ fn sampled_image_shape(
     })
 }
 
-pub fn encode_draw_and_writeback<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
-    host: &mut M,
-    req: &mut DrawEncodeRequest,
-) -> EncodeStatus {
-    encode_draw_chain(state, host, req, true, true).0
-}
-
 /// Linux / non-Apple product rail: metal2vulkan + Vulkan offscreen, then Store.
 ///
 /// `writeback_guest` is the archive multi-draw store plan (only the last record

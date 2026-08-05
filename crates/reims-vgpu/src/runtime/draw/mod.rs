@@ -1186,16 +1186,6 @@ fn null_apv_buffer() -> crate::backend::metal::abi::ReimsVgpuBuffer {
     }
 }
 
-/// Encode one draw with Metal when vert/frag MTLBs resolve; writeback BGRA to mapping.
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-pub fn encode_draw_and_writeback<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
-    host: &mut M,
-    req: &mut DrawEncodeRequest,
-) -> EncodeStatus {
-    encode_draw_chain(state, host, req, true, false).0
-}
-
 /// Encode one draw; optionally store to guest. Returns color0 tight RGBA8 for
 /// multi-draw chaining (archive DrawJob threads output → next initial content).
 ///
