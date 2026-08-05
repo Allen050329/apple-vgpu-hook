@@ -248,16 +248,6 @@ enum StreamDrawDrop {
         slice: u32,
         depth_plane: u32,
     },
-    /// The pass named an explicit render target extent and this device used the
-    /// attachment's.
-    ///
-    /// Unlike its three siblings on the pass tail this is **not** a healthy
-    /// zero: a driven arm64/Vulkan boot reads it on essentially every pass. The
-    /// line carries the extent because the count alone cannot say whether it
-    /// matters — a pass whose stated extent equals its attachment's is asking
-    /// for what already happens, and one that states less is a region this
-    /// device renders outside of.
-    TargetExtentUnapplied { width: u64, height: u64 },
 }
 
 impl crate::observe::Decline for StreamDrawDrop {
@@ -266,7 +256,6 @@ impl crate::observe::Decline for StreamDrawDrop {
             Self::Unbound { .. } => "stream_draw_dropped_unbound",
             Self::DepthStencilUnsupported { .. } => "stream_depth_stencil_unsupported",
             Self::ColorSubresourceUnsupported { .. } => "stream_color_subresource_unsupported",
-            Self::TargetExtentUnapplied { .. } => "stream_pass_target_extent_unapplied",
         }
     }
 
@@ -297,9 +286,6 @@ impl crate::observe::Decline for StreamDrawDrop {
                 ("slice", slice.to_string()),
                 ("plane", depth_plane.to_string()),
             ],
-            Self::TargetExtentUnapplied { width, height } => {
-                vec![("width", width.to_string()), ("height", height.to_string())]
-            }
         }
     }
 }
@@ -1515,8 +1501,9 @@ fn handle_render_record<M: HostMemory + HostOps>(
             // colour subresource all read 0 — so the macOS window server states
             // an explicit pass extent on essentially every pass, and this
             // device renders at the attachment's instead. Whether that is a
-            // defect depends on whether the two agree, which is why the extent
-            // is reported with its *values* rather than only counted.
+            // loss is settled by `note_pass_extent_coverage`'s bands and not by
+            // this count: the two agree, so this is the denominator of a
+            // measurement rather than an alarm.
             if cmd.pass_visibility_result_buffer_ref != 0 {
                 crate::runtime::drain::note_store_route("render_pass_visibility_buffer_dropped");
             }
@@ -1524,11 +1511,7 @@ fn handle_render_record<M: HostMemory + HostOps>(
                 crate::runtime::drain::note_store_route("render_pass_array_length_dropped");
             }
             if cmd.pass_render_target_width != 0 || cmd.pass_render_target_height != 0 {
-                note_pass_target_extent(
-                    task_id,
-                    cmd.pass_render_target_width,
-                    cmd.pass_render_target_height,
-                );
+                note_pass_target_extent();
             }
             // Full multi-attachment: re-decode all color slots from payload.
             if cmd_bytes.len() >= 8 {
@@ -2546,34 +2529,28 @@ fn pass_extent_band(pct: u64) -> usize {
     }
 }
 
-/// The pass extent the guest asked for, which this device does not apply.
+/// Count a pass that stated an explicit render target extent, which this device
+/// does not apply.
 ///
-/// `renderTargetWidth`/`Height` are the guest's explicit statement about how
-/// much of each attachment the pass covers, and every consumer here uses the
-/// attachment's own extent instead. That is only a defect when the two differ,
-/// and nothing at this point knows the attachment's size — so what this reports
-/// is the *value*, deduped on the pair, and the comparison is left to a reader
-/// with the surface geometry beside it.
+/// This is the **denominator** for [`note_pass_extent_coverage`]'s bands and
+/// nothing more. It used to also put the extent's raw values on the fail
+/// channel, so that a reader who had the surface geometry beside them could
+/// decide whether ignoring the extent lost anything. That reader is now
+/// `note_pass_extent_coverage`, it has the geometry, and it has answered:
+/// `pass_extent_full` takes 11 826 of 11 827 scored passes on arm64/Vulkan and
+/// every scored pass on x86/Vulkan. The extent is the attachment restated.
 ///
-/// **That reader is [`note_pass_extent_coverage`], and it says the two do not
-/// differ**: 11 826 of 11 827 scored passes state exactly the attachment's
-/// geometry. So this is a census of a value the device is right to discard, not
-/// a queued defect — which matters because it is the highest-volume reason in
-/// the fail log and its raw values (242x5, 1920x24) read like damage rects. They
-/// are small surfaces. Read the bands, not these numbers.
+/// The line is gone because it was reporting a non-loss on the channel reserved
+/// for lost guest work, and doing so at 85 % of that channel's whole volume —
+/// while its own text told the reader to disregard the numbers it carried. Its
+/// raw values (242x5, 1920x24) read like damage rects and are small surfaces,
+/// so the line's net effect on a reader ranking `reason=` was to mislead.
 ///
-/// Deduped rather than counted per pass for the reason the resource table's
-/// `TailPopulated` gives: a statement this device discards is a property of the
-/// guest build, not of the pass that happened to carry it first. A driven boot
-/// produces 1 575 of these and a handful of distinct extents.
-fn note_pass_target_extent(task_id: u32, width: u64, height: u64) {
+/// Keep the gap between this count and the bands' sum in view: a pass counted
+/// here and not scored there is one whose attachment had no geometry yet, and
+/// the two numbers are only comparable when that gap is understood.
+fn note_pass_target_extent() {
     crate::runtime::drain::note_store_route("render_pass_target_extent_unapplied");
-    crate::observe::Emit::decline(
-        "stream_pass",
-        &StreamDrawDrop::TargetExtentUnapplied { width, height },
-    )
-    .field("task", task_id)
-    .fail_once(width << 32 | (height & 0xffff_ffff));
 }
 
 /// A colour attachment naming a mip, a slice or a depth plane this device
