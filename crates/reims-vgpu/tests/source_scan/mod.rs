@@ -200,7 +200,13 @@ pub fn strip_attributes(chars: &[char]) -> String {
     out
 }
 
-/// Blank every `#[cfg(test)] mod … { … }` body, keeping offsets stable.
+/// Blank every test module's body, keeping offsets stable.
+///
+/// Both spellings of the attribute are read: `#[cfg(test)]` and the
+/// `#[cfg(all(test, feature = "…"))]` form that `metal_draw/vulkan.rs` uses for
+/// `vulkan_split_tests`. Brace-matching each body rather than cutting at the
+/// first marker is what keeps production code *after* a test module visible — a
+/// first-marker cutoff hides it, and a scanner that hides code reports clean.
 ///
 /// A test module's contents are fixtures: `pools/mod.rs` builds a
 /// `SampledImageResource` with a literal `vk::Format::R8G8B8A8_UNORM` and
@@ -214,9 +220,13 @@ pub fn blank_test_modules(text: &str) -> String {
     let chars: Vec<char> = text.chars().collect();
     let mut out = chars.clone();
     let mut at = 0usize;
-    while let Some(rel) = text[at..].find("#[cfg(test)]") {
+    while let Some((rel, marker_len)) = ["#[cfg(test)]", "#[cfg(all(test,"]
+        .iter()
+        .filter_map(|m| text[at..].find(m).map(|i| (i, m.len())))
+        .min()
+    {
         let marker = at + rel;
-        at = marker + "#[cfg(test)]".len();
+        at = marker + marker_len;
         // Only a module has a body worth blanking; a `#[cfg(test)]` on a `use`
         // or a `const` is a declaration the product side never sees anyway.
         let after: String = text[at..].chars().take(200).collect();

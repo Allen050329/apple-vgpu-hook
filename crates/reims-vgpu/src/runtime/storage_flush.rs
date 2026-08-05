@@ -18,6 +18,35 @@
 //! measurement before it is a mechanism. Choke points: `mapping_write` read/write entries,
 //! `mapper::read/write_mapping_bytes`, and the drain unmap/ReplacePhysical
 //! sites (which drop-with-fail instead of writing through recycled pages).
+//!
+//! # This entire rail is Vulkan-only
+//!
+//! It is the largest architectural fact about this file and it used to be
+//! spelled nowhere but in thirty separate `#[cfg]` attributes. Nothing here
+//! names `backend::metal`; what a window defers is a *pinned engine resident*,
+//! and the engine is `backend::vulkan::engine`. On a `backend-metal` build —
+//! which is every build without `backend-vulkan`, since `lib.rs` requires
+//! exactly one — the seven entry points below compile to stubs.
+//!
+//! **Nothing can arm a window on such a build**, which is why three of those
+//! stubs are silently empty and the other four are fail-visible. Every
+//! production site that arms one is inside `backend-vulkan`-gated code — the
+//! two render Stores in `metal_draw::vulkan` (behind that module's own gate) and
+//! the two compute-storage arms in `compute_exec::execute_dispatch_linux`
+//! (behind the function's) — so:
+//!
+//! * `flush_gva_windows_before_fence`, `flush_linear_windows_before_fence` and
+//!   `flush_mapping_windows_before_fence` land *every armed window*, and on this
+//!   arm the set is empty by construction. An empty pass loses nothing, so
+//!   saying nothing is correct.
+//! * `flush_gva_one`, `flush_linear_one`, `flush_render_one` and
+//!   `flush_storage_one` are handed one key a caller believes is armed. Reaching
+//!   one here means someone believed in an obligation that cannot exist, so each
+//!   reports `deferred_flush_lost … reason=no_backend`.
+//!
+//! `tests/deferred_windows_are_armed_only_under_backend_vulkan.rs` holds the
+//! premise: a new arm site outside a `backend-vulkan` gate turns those three
+//! silent stubs into silent losses, and nothing else would notice.
 
 use crate::model::DeviceState;
 use crate::runtime::host::{HostMemory, HostOps};
