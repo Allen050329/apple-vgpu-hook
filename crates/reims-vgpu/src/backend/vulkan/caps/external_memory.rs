@@ -385,9 +385,7 @@ mod tests {
         assert_eq!(with_env(Some("0")), Some(DmaBufImport::DisabledByEnv));
         assert_eq!(with_env(Some("off")), Some(DmaBufImport::DisabledByEnv));
         assert!(!DmaBufImport::DisabledByEnv.is_available());
-        assert!(DmaBufImport::DisabledByEnv
-            .required_extensions()
-            .is_empty());
+        assert!(DmaBufImport::DisabledByEnv.required_extensions().is_empty());
         assert_eq!(DmaBufImport::DisabledByEnv.slug(), "disabled_by_env");
     }
 

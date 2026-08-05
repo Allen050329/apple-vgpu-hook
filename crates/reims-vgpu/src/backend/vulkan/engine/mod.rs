@@ -1173,7 +1173,9 @@ unsafe fn copy_image_level0_to_host_delivered(
     let appended = pools.batch_open_recording();
     let (cb, fence) = match appended {
         Some(pair) => {
-            counters.batch_readback_joins.fetch_add(1, Ordering::Relaxed);
+            counters
+                .batch_readback_joins
+                .fetch_add(1, Ordering::Relaxed);
             pair
         }
         None => pools.begin_entry(ctx, counters)?,
@@ -1713,7 +1715,9 @@ unsafe fn copy_image_level0_to_buffer(
     let appended = pools.batch_open_recording();
     let (cb, fence) = match appended {
         Some(pair) => {
-            counters.batch_readback_joins.fetch_add(1, Ordering::Relaxed);
+            counters
+                .batch_readback_joins
+                .fetch_add(1, Ordering::Relaxed);
             pair
         }
         None => pools.begin_entry(ctx, counters)?,
