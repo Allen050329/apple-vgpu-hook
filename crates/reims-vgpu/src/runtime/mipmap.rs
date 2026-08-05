@@ -27,8 +27,18 @@ use crate::backend::metal::mipmap as metal_mip;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MipmapStatus {
     Ok,
-    /// Missing object, wrong kind, short descriptor, or zero base ref.
+    /// The base ref resolved to no usable texture: absent from the object
+    /// list, holding some other kind, or naming a descriptor that would not
+    /// read or decode. Which one is named separately on the fail channel by
+    /// [`resolve_multi_mip_texture`]; this class is what the caller acts on.
     MissingTexture,
+    /// The blit named base ref 0, so there is no texture to generate from.
+    ///
+    /// Split out of [`Self::MissingTexture`] because it is a different
+    /// statement — nothing was bound, as against something bound that would not
+    /// resolve — and because the dispatch site reports every non-`Ok` status, so
+    /// an unbound ref was reaching the log as a missing texture.
+    UnboundTexture,
     /// `mipmapLevelCount <= 1` — not a valid Metal no-op.
     SingleLevel,
     /// Level layouts incomplete / out of range / zero geometry.
@@ -56,6 +66,7 @@ impl crate::observe::Refusal for MipmapStatus {
         Some(match self {
             Self::Ok => return None,
             Self::MissingTexture => "mipmap_missing_texture",
+            Self::UnboundTexture => "mipmap_texture_ref_zero",
             Self::SingleLevel => "mipmap_single_level",
             Self::IncompleteLayout => "mipmap_incomplete_layout",
             Self::UnsupportedFormat => "mipmap_unsupported_format",
@@ -153,12 +164,15 @@ fn resolve_multi_mip_texture<M: HostMemory + HostOps>(
     texture_ref: u32,
 ) -> Result<ResolvedTexture, MipmapStatus> {
     if texture_ref == 0 {
-        return Err(MipmapStatus::MissingTexture);
+        return Err(MipmapStatus::UnboundTexture);
     }
-    // All three rungs answer with the one coarse class, which is what the four
-    // checks around them already do — see the decode arm below, which is the
-    // only one this rail singles out. Collapsing them here at least says so in
-    // one place instead of three identical `else` blocks.
+    // The three rungs still collapse into one coarse *status*, because the
+    // caller's four surrounding checks do too and nothing downstream would act
+    // differently on them. What they no longer share is a *name*: the rung is
+    // reported here, so the fail log distinguishes a ref the guest never bound
+    // from one holding a buffer from one whose descriptor would not read. That
+    // costs nothing on a healthy guest — a driven boot of 177 746 draws fired no
+    // rung at all — so a line from here is an event, not noise.
     let (_entry, desc_bytes) = objects::resolve_descriptor(
         state,
         host,
@@ -166,7 +180,14 @@ fn resolve_multi_mip_texture<M: HostMemory + HostOps>(
         texture_ref,
         &[OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_VARIANT],
     )
-    .map_err(|_| MipmapStatus::MissingTexture)?;
+    .map_err(|rung| {
+        crate::observe::RungReport::new("mipmap_resolve", "tex_ref").rung(
+            task_id,
+            texture_ref,
+            rung,
+        );
+        MipmapStatus::MissingTexture
+    })?;
     let tex = match decode_texture_descriptor(&desc_bytes) {
         Ok(t) => t,
         Err(e) => {
@@ -509,6 +530,7 @@ mod tests {
         const ALL: &[MipmapStatus] = &[
             MipmapStatus::Ok,
             MipmapStatus::MissingTexture,
+            MipmapStatus::UnboundTexture,
             MipmapStatus::SingleLevel,
             MipmapStatus::IncompleteLayout,
             MipmapStatus::UnsupportedFormat,
@@ -536,6 +558,48 @@ mod tests {
                 "the runtime wrapper must retain the Metal leaf's structured facts"
             );
         }
+    }
+
+    /// The two ways a base ref yields no texture are different statements, and
+    /// the fail channel now says which.
+    ///
+    /// `ref == 0` is the guest binding nothing; a ref naming an empty object-list
+    /// slot is the guest naming something that is not there. Both used to answer
+    /// `MissingTexture`, and the dispatch site reports every non-`Ok` status, so
+    /// an unbound ref reached the log claiming a texture was missing. The rung is
+    /// reported separately from the status, so the coarse class the caller acts
+    /// on is unchanged.
+    #[test]
+    fn an_unbound_base_ref_is_not_a_missing_texture() {
+        use crate::model::{DeviceId, PAGE_SHIFT_X86};
+        use crate::runtime::host::FakeHost;
+
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+
+        let cap = crate::observe::FailCapture::start();
+        assert_eq!(
+            generate_mipmaps_linear(&mut state, &mut host, 1, 0),
+            MipmapStatus::UnboundTexture
+        );
+        assert!(
+            cap.lines().is_empty(),
+            "an unbound ref resolves nothing, so it reports no rung: {:?}",
+            cap.lines()
+        );
+        drop(cap);
+
+        // A bound-looking ref against an empty task: the first rung refuses, and
+        // says so under this rail's own event.
+        let cap = crate::observe::FailCapture::start();
+        assert_eq!(
+            generate_mipmaps_linear(&mut state, &mut host, 1, 9),
+            MipmapStatus::MissingTexture
+        );
+        assert_eq!(
+            cap.one("mipmap_resolve"),
+            "mipmap_resolve fail reason=no_list_entry task=1 tex_ref=9"
+        );
     }
 
     #[test]
