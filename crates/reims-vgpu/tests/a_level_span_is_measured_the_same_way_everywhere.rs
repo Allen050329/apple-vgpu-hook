@@ -56,7 +56,7 @@ use std::path::Path;
 const WIDE_SPAN_EXEMPTIONS: &[(&str, &str, &str)] = &[
     (
         "runtime/metal_draw/render_target.rs",
-        "lookup_render_target",
+        "resolve_render_target",
         "its mip>0 arm bounds a render-target WRITE; whether the store writes \
          the last row's padding is unmeasured, and the wider span is the \
          fail-closed direction for a write",
