@@ -118,8 +118,9 @@ mod tests {
     ///
     /// Bare, `cpu_remap` and `resident_direct_bind` say nothing about which
     /// subsystem refused — the same argument that prefixed the slate reasons.
-    /// Crate-wide distinctness is `observe::gate`'s job; the prefix is this
-    /// module's.
+    /// This asserts the prefix only. Crate-wide slug distinctness is nothing's
+    /// job since `observe/gate.rs` went; see [`crate::observe`] for why that
+    /// obligation now rests with the author.
     #[test]
     fn both_swizzle_slugs_name_their_rail() {
         use crate::observe::Decline as _;

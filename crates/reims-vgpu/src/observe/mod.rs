@@ -68,8 +68,8 @@ pub use decline::{Decline, Refusal};
 pub use emit::{first_sight, state_changed, Emit};
 
 // The sink's surface is re-exported flat so call sites read `observe::fail(…)`
-// rather than `observe::sink::fail(…)`. `sink` stays public for the gate and
-// for readers who want the machinery.
+// rather than `observe::sink::fail(…)`. `sink` stays public for readers who
+// want the machinery.
 pub use sink::{
     bgra_present_stats, bgra_present_stats_scalar, bgra_rgb_stats, fail, line, nonzero_stats, off,
     redirect_logs_for_tests, rgba_rgb_stats,

@@ -45,12 +45,12 @@ removing them does not compile — so a field on a struct whose `clone()` is
 actually called will not be reported.
 
 So a field hit is strong evidence; an empty field report is not proof. The
-worked example: `PresentState::mapping_id`, written at five sites and read at
-none, was found by hand and never by this script, because `PresentState`
-derives `Clone` and `DeviceState` is cloned.
-`observe::gate::no_present_state_field_is_write_only` covers that one struct
-directly and has no such blind spot; extend that pattern to any other struct
-where this matters.
+worked example: a write-only `mapping_id` on `PresentState`, written at five
+sites and read at none, was found by hand and never by this script, because
+`PresentState` derives `Clone` and `DeviceState` is cloned. Nothing covers that
+blind spot now — the source-scanning test that did was deleted with the rest of
+`observe/gate.rs` in `db80389`. Read a `Clone`-deriving struct's fields by hand
+when it matters.
 
 ## Reached only from tests
 

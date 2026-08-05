@@ -35,10 +35,11 @@
 # report permanently empty. `Clone`, `PartialEq` and `Hash` are NOT neutralised
 # — removing them does not compile — so a field on a struct whose `clone()` is
 # actually called will not be reported. An empty field report is therefore weak
-# evidence, and a hit is strong evidence. `PresentState::mapping_id`, written at
-# five sites and read at none, was found by hand and never by this script, for
-# exactly that reason; `observe::gate::no_present_state_field_is_write_only`
-# covers that one struct directly and does not have this blind spot.
+# evidence, and a hit is strong evidence. A write-only `mapping_id` on
+# `PresentState`, written at five sites and read at none, was found by hand and
+# never by this script, for exactly that reason. Nothing covers that blind spot
+# now: the source-scanning test that did went with `observe/gate.rs` in
+# `db80389`. Read a `Clone`-deriving struct's fields by hand when it matters.
 #
 # Item results — functions, methods, constants, variants, type aliases — carry
 # no such caveat.
