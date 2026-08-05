@@ -493,18 +493,6 @@ pub fn execute_commands_in_buffer_indirect(
     }
 }
 
-pub fn set_line_width(encoder: &Object, width: f32) -> bool {
-    unsafe {
-        let sel = sel!(setLineWidth:);
-        let responds: BOOL = msg_send![encoder, respondsToSelector: sel];
-        if responds == NO {
-            return false;
-        }
-        let _: () = msg_send![encoder, setLineWidth: width];
-        true
-    }
-}
-
 /// A Metal compute-pipeline reflection call that returned no pipeline state.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MetalPipelineDecline {

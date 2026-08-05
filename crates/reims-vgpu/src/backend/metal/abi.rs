@@ -307,19 +307,28 @@ pub struct ReimsVgpuScissor {
     pub height: u32,
 }
 
+/// The encoder raster state this device applies.
+///
+/// Two of the five `MTLRenderCommandEncoder` raster setters, and only two.
+/// Depth clip mode, triangle fill mode and line width had slots here too, and
+/// no guest action could reach them: the one producer
+/// ([`crate::runtime::metal_draw`]) hard-coded all three absent, because
+/// `runtime::exec` decodes those three records and *drops* them under
+/// `render_depth_clip_mode_dropped`, `render_fill_mode_dropped` and
+/// `render_line_width_dropped` — and the ICB descriptor drops its own
+/// inherit-flag equivalents the same way. Two mechanisms claimed the same three
+/// states and only the counted one ran.
+///
+/// Those counters are what says whether to build the other, and they are the
+/// place to add the fields back: a reading above zero is the measured argument,
+/// and re-plumbing a state is one `Option` on the request plus one setter here.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct ReimsVgpuRasterState {
     pub has_cull_mode: u32,
     pub cull_mode: u32,
-    pub has_depth_clip_mode: u32,
-    pub depth_clip_mode: u32,
     pub has_front_facing_winding: u32,
     pub front_facing_winding: u32,
-    pub has_triangle_fill_mode: u32,
-    pub triangle_fill_mode: u32,
-    pub has_line_width: u32,
-    pub line_width: f32,
 }
 
 #[repr(C)]

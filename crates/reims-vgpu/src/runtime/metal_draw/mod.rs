@@ -1549,14 +1549,8 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
     let mut raster = ReimsVgpuRasterState {
         has_cull_mode: 0,
         cull_mode: 0,
-        has_depth_clip_mode: 0,
-        depth_clip_mode: 0,
         has_front_facing_winding: 0,
         front_facing_winding: 0,
-        has_triangle_fill_mode: 0,
-        triangle_fill_mode: 0,
-        has_line_width: 0,
-        line_width: 1.0,
     };
     if let Some(c) = req.cull_mode {
         raster.has_cull_mode = 1;

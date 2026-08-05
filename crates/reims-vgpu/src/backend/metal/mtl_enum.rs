@@ -51,10 +51,9 @@
 
 use metal::{
     MTLAttributeFormat, MTLBlendFactor, MTLBlendOperation, MTLCompareFunction, MTLCullMode,
-    MTLDepthClipMode, MTLIndexType, MTLLoadAction, MTLPrimitiveType, MTLSamplerAddressMode,
-    MTLSamplerBorderColor, MTLSamplerMinMagFilter, MTLSamplerMipFilter, MTLStencilOperation,
-    MTLStepFunction, MTLStoreAction, MTLTriangleFillMode, MTLVertexFormat, MTLVertexStepFunction,
-    MTLWinding,
+    MTLIndexType, MTLLoadAction, MTLPrimitiveType, MTLSamplerAddressMode, MTLSamplerBorderColor,
+    MTLSamplerMinMagFilter, MTLSamplerMipFilter, MTLStencilOperation, MTLStepFunction,
+    MTLStoreAction, MTLVertexFormat, MTLVertexStepFunction, MTLWinding,
 };
 
 /// Define a checked ordinal to enum conversion plus its declared-variant table.
@@ -255,27 +254,11 @@ checked_ordinal! {
 }
 
 checked_ordinal! {
-    /// `MTLDepthClipMode` for the render encoder's raster state.
-    fn depth_clip_mode -> MTLDepthClipMode;
-    const DEPTH_CLIP_MODES;
-    test every_declared_depth_clip_mode_converts_and_nothing_else_does;
-    [Clip, Clamp]
-}
-
-checked_ordinal! {
     /// `MTLWinding` for the render encoder's raster state.
     fn winding -> MTLWinding;
     const WINDINGS;
     test every_declared_winding_converts_and_nothing_else_does;
     [Clockwise, CounterClockwise]
-}
-
-checked_ordinal! {
-    /// `MTLTriangleFillMode` for the render encoder's raster state.
-    fn triangle_fill_mode -> MTLTriangleFillMode;
-    const TRIANGLE_FILL_MODES;
-    test every_declared_triangle_fill_mode_converts_and_nothing_else_does;
-    [Fill, Lines]
 }
 
 checked_ordinal! {
@@ -478,9 +461,7 @@ mod tests {
         past_end!(blend_factor, BLEND_FACTORS);
         past_end!(blend_operation, BLEND_OPERATIONS);
         past_end!(cull_mode, CULL_MODES);
-        past_end!(depth_clip_mode, DEPTH_CLIP_MODES);
         past_end!(winding, WINDINGS);
-        past_end!(triangle_fill_mode, TRIANGLE_FILL_MODES);
         past_end!(compare_function, COMPARE_FUNCTIONS);
         past_end!(stencil_operation, STENCIL_OPERATIONS);
         past_end!(load_action, LOAD_ACTIONS);

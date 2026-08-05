@@ -10,7 +10,7 @@ use crate::backend::metal::function::load_only_function;
 use crate::backend::metal::hash::{hash_bytes, hash_u64};
 use crate::backend::metal::mtl_enum;
 use crate::backend::metal::raw_metal::{
-    command_buffer_error_description, render_reflection_sampler_mask, set_line_width,
+    command_buffer_error_description, render_reflection_sampler_mask,
 };
 use crate::backend::metal::runtime::{new_buffer_from_host, system_device, thread_queue};
 use crate::backend::metal::samplers::{make_default_sampler, make_explicit_sampler};
@@ -112,8 +112,8 @@ fn apply_raster_state(
         return Status::OK;
     };
     // Convert every word the record carries before touching the encoder, the
-    // way the four range checks this replaced all ran first: a refusal on the
-    // fill mode must not leave the cull mode already applied.
+    // way the range checks this replaced all ran first: a refusal on the
+    // winding must not leave the cull mode already applied.
     //
     // Each `has_` flag guards its own conversion, so a word the guest never set
     // is not read at all — converting unconditionally would refuse a raster
@@ -140,13 +140,6 @@ fn apply_raster_state(
         "metal_render_cull_mode_unsupported",
         "cull_mode"
     );
-    let depth_clip = optional!(
-        has_depth_clip_mode,
-        depth_clip_mode,
-        depth_clip_mode,
-        "metal_render_depth_clip_mode_unsupported",
-        "depth_clip_mode"
-    );
     let front_facing = optional!(
         has_front_facing_winding,
         front_facing_winding,
@@ -154,37 +147,11 @@ fn apply_raster_state(
         "metal_render_winding_unsupported",
         "winding"
     );
-    let fill = optional!(
-        has_triangle_fill_mode,
-        triangle_fill_mode,
-        triangle_fill_mode,
-        "metal_render_fill_mode_unsupported",
-        "fill_mode"
-    );
     if let Some(cull) = cull {
         encoder.set_cull_mode(cull);
     }
-    if let Some(depth_clip) = depth_clip {
-        encoder.set_depth_clip_mode(depth_clip);
-    }
     if let Some(front_facing) = front_facing {
         encoder.set_front_facing_winding(front_facing);
-    }
-    if let Some(fill) = fill {
-        encoder.set_triangle_fill_mode(fill);
-    }
-    if raster.has_line_width != 0 {
-        // RenderCommandEncoder is a Message object.
-        let ok = unsafe {
-            set_line_width(
-                &*(encoder as *const RenderCommandEncoderRef as *const objc::runtime::Object),
-                raster.line_width,
-            )
-        };
-        if !ok {
-            set_err(err, "Metal encoder lacks setLineWidth:");
-            return Status::execute("metal_render_line_width_api_unavailable");
-        }
     }
     Status::OK
 }
