@@ -128,7 +128,11 @@ impl<E: CacheEntry> ContentCache<E> {
     }
 
     /// Live entries across every bucket.
-    #[cfg(test)]
+    ///
+    /// This is the level the `object_cache_levels` census publishes, and the
+    /// reading that can falsify the module header's argument: a count still
+    /// climbing minutes into a boot means some key is carrying per-frame state
+    /// rather than guest state.
     pub(crate) fn len(&self) -> usize {
         self.buckets.values().map(Vec::len).sum()
     }

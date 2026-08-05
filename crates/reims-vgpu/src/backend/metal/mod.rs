@@ -16,6 +16,11 @@ mod hash;
 
 #[cfg(target_os = "macos")]
 mod cache;
+/// Live entries in each compiled-object cache. See
+/// [`cache::cache_levels`] — re-exported because `cache` is private to this
+/// module and the census that publishes the reading is in `runtime::drain`.
+#[cfg(target_os = "macos")]
+pub(crate) use cache::cache_levels;
 #[cfg(target_os = "macos")]
 pub(crate) mod compute;
 #[cfg(target_os = "macos")]

@@ -1601,10 +1601,35 @@ fn emit_stage_phase() {
 #[cfg(not(feature = "backend-vulkan"))]
 fn emit_engine_delta() {}
 
-/// The Metal arm keeps its compiled objects in `backend::metal::cache`, which
-/// has no reader for its levels yet. Silent rather than partial: emitting the
-/// `m2v` count alone under a name that promises six more would read as six zeros.
-#[cfg(not(feature = "backend-vulkan"))]
+/// The Metal arm's counterpart. Same question, same cadence, different tables:
+/// this arm builds `MTLFunction` / `MTLRenderPipelineState` /
+/// `MTLComputePipelineState` / `MTLSamplerState` / `MTLDepthStencilState` and
+/// compute reflections, and holds them in `backend::metal::cache`.
+///
+/// No `m2v` field: AIR reaches Metal directly on this arm, so
+/// `runtime::m2v_cache` is never populated and a zero there would read as an
+/// empty cache rather than an absent rail.
+#[cfg(all(
+    not(feature = "backend-vulkan"),
+    feature = "backend-metal",
+    target_os = "macos"
+))]
+fn emit_object_cache_levels() {
+    let [functions, render_pso, compute_pso, samplers, depth_stencil, reflections] =
+        crate::backend::metal::cache_levels();
+    crate::observe::off(format!(
+        "object_cache_levels (levels, not per-interval) functions={functions} \
+         render_pso={render_pso} compute_pso={compute_pso} samplers={samplers} \
+         depth_stencil={depth_stencil} reflections={reflections}"
+    ));
+}
+
+/// No compiled-object caches on this build: either no backend, or the Metal
+/// feature without the Apple target that carries `backend::metal::cache`.
+#[cfg(not(any(
+    feature = "backend-vulkan",
+    all(feature = "backend-metal", target_os = "macos")
+)))]
 fn emit_object_cache_levels() {}
 
 /// The engine mutex's wait and hold time over the same window, split by which

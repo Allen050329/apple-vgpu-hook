@@ -417,6 +417,29 @@ fn with_caches<R>(f: impl FnOnce(&mut GlobalCaches) -> R) -> R {
     f(guard.get_or_insert_with(GlobalCaches::new))
 }
 
+/// Live entries in each cache, in the order
+/// `(functions, render_pso, compute_pso, samplers, depth_stencil, reflections)`.
+///
+/// The Metal counterpart of the Vulkan engine's `object_cache_levels`, and the
+/// reading that closes a gap this arm has carried since the caps came off:
+/// [`crate::model::content_cache`] argues these tables settle at the guest's
+/// distinct object set, and cites `pipelines=92` measured on the Vulkan arm
+/// against the 64-slot render-PSO table this arm used to hold. That is the other
+/// arm's count for the same command stream. This is how an Apple host reads its
+/// own.
+pub fn cache_levels() -> [usize; 6] {
+    with_caches(|c| {
+        [
+            c.fn_cache.len(),
+            c.render_pso.len(),
+            c.compute_pso.len(),
+            c.sampler.len(),
+            c.depth_stencil.len(),
+            c.reflect.len(),
+        ]
+    })
+}
+
 pub fn fn_cache_lookup(key: &BlobKey) -> Option<Function> {
     with_caches(|c| c.fn_cache.find(key).map(|e| e.function.clone()))
 }
