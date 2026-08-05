@@ -2024,24 +2024,27 @@ pub(crate) fn note_mapping_write_footprint(
     }
 }
 
-/// Which way a mapping-rail run copy moves bytes.
+/// Which way a guest-page run copy moves bytes.
 ///
-/// The direction is the only thing the write and read walks disagree about, so
-/// it is the only thing that is a parameter.
-enum RunCopy<'a> {
+/// The direction is the only thing a write walk and a read walk disagree about,
+/// so it is the only thing that is a parameter. Two rails hold such a pair — the
+/// mapping rail here and the GVA rail in [`super::gva_view`] — and both split
+/// into twin functions before this type existed, with the read side of each
+/// drifting from its write side in the same way: fewer named refusals.
+pub(crate) enum RunCopy<'a> {
     Write(&'a [u8]),
     Read(&'a mut [u8]),
 }
 
 impl RunCopy<'_> {
-    fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         match self {
             Self::Write(buf) => buf.len(),
             Self::Read(buf) => buf.len(),
         }
     }
 
-    fn is_write(&self) -> bool {
+    pub(crate) fn is_write(&self) -> bool {
         matches!(self, Self::Write(_))
     }
 
@@ -2053,7 +2056,13 @@ impl RunCopy<'_> {
     /// `host_ptr` must be a live mapping of at least `host_off + n` bytes, and
     /// `buf_off + n` must be within the caller's buffer. The single caller
     /// checks both against the run's mapped total before calling.
-    unsafe fn apply(&mut self, host_ptr: usize, host_off: usize, buf_off: usize, n: usize) {
+    pub(crate) unsafe fn apply(
+        &mut self,
+        host_ptr: usize,
+        host_off: usize,
+        buf_off: usize,
+        n: usize,
+    ) {
         match self {
             Self::Write(buf) => unsafe {
                 std::ptr::copy_nonoverlapping(

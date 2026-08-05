@@ -18,6 +18,7 @@ use crate::contract::gva_resolve::{read_task_root, translate_root, Cache, Resolv
 use crate::model::{DeviceState, GvaHostView, TaskEntry};
 use crate::runtime::gva_mem::geometry_for_page_shift;
 use crate::runtime::host::{HostMemory, HostOps, MemError};
+use crate::runtime::mapper::RunCopy;
 
 /// Dedup key for a fragmented-span decline: the span identity plus its shape.
 ///
@@ -535,7 +536,7 @@ pub fn write_span_within<H: HostMemory + HostOps>(
     if buf.is_empty() {
         return Ok(());
     }
-    write_span_multi(state, host, task_id, gva, buf, allowed)
+    span_multi(state, host, task_id, gva, RunCopy::Write(buf), allowed)
 }
 
 /// Ephemeral fresh-walk host mapping of `[gva, gva+length)` for guest writes.
@@ -667,27 +668,61 @@ pub fn read_span<H: HostMemory + HostOps>(
             return true;
         }
     }
-    read_span_multi(state, host, task_id, gva, buf)
+    let len = buf.len();
+    let Err(err) = span_multi(state, host, task_id, gva, RunCopy::Read(buf), None) else {
+        return true;
+    };
+    // A refused read hands its caller a buffer indistinguishable from a
+    // successful one, and every caller of this returns a bare `bool` upward, so
+    // this is the last place that still holds the reason. Emitted the same way
+    // and on the same channel as the write direction's `gva_write` — the two
+    // lose the guest's bytes equally, and the read side only looked cheaper
+    // because it had nothing to say. Undeduped for the same reason `gva_write`
+    // is: the sink's flood detector is what bounds a repeating failure, and a
+    // latch here would hide a span that starts refusing after a rewire.
+    crate::observe::Emit::decline("gva_read_span", &err)
+        .field("task", task_id)
+        .field("gva", format!("{gva:#x}"))
+        .field("len", format!("{len:#x}"))
+        .fail();
+    false
 }
 
-/// Multi-import write: map each packed GPA run, copy, unmap. No write_gpa.
+/// Multi-import span copy: map each packed GPA run, move bytes, unmap. No
+/// `write_gpa`/`read_gpa`.
 ///
 /// Ephemeral per-run maps (do not register partial views — Darwin unmap needs
 /// the full map_pages base; product Linux alias is a no-op unmap).
 ///
-/// Every refusal here names its own check. Fragmentation is **not** one of them:
+/// **This is the only implementation of the GVA rail's run walk.** The write and
+/// read directions were two functions, ~57 % identical, and the read one had
+/// already drifted: it returned a bare `false` at six sites where the write one
+/// named six [`MemError`]s — including at `collect_span_gpas`, where it threw
+/// away a refusal the walk had already computed. Every one of those loses the
+/// caller's bytes, so every one is now named. The `buf_off`/`host_off`/`n`
+/// arithmetic and the bound that guards it existed once per direction too, and
+/// one of those directions writes guest memory.
+///
+/// Every refusal names its own check. Fragmentation is **not** one of them:
 /// a gapped span is split into packed runs and mapped a run at a time, so a
 /// caller reporting "not contiguous" for a failure of this function is reporting
 /// a condition the function does not test.
-fn write_span_multi<H: HostMemory + HostOps>(
+///
+/// Three steps are write-only and are keyed on the direction, not duplicated:
+/// the [`WindowPages`] containment check, which only a deferred write carries an
+/// authorisation set for; [`DeviceState::note_host_wrote_pages`], which
+/// invalidates what the hypervisor's dirty bitmap cannot witness; and the
+/// per-run footprint mark. `allowed` is ignored in the read direction because a
+/// read authorises nothing.
+fn span_multi<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut H,
     task_id: u32,
     gva: u64,
-    buf: &[u8],
+    mut copy: RunCopy<'_>,
     allowed: WindowPages<'_>,
 ) -> Result<(), MemError> {
-    let length = buf.len() as u64;
+    let length = copy.len() as u64;
     let page_shift = state.page_shift;
     let page_size = state.page_size();
     let page_sz = page_size as usize;
@@ -697,13 +732,15 @@ fn write_span_multi<H: HostMemory + HostOps>(
         };
         collect_span_gpas(host, task, gva, length, page_shift)?
     };
-    // Puts bytes into guest pages the hypervisor's dirty bitmap cannot witness.
-    // Recorded here, after the walk that names them and before any of them is
-    // written, so a refusal below costs a spurious invalidation rather than a
-    // missing one.
-    state.note_host_wrote_pages(gpas.clone());
-    if !span_within_window(&gpas, allowed) {
-        return Err(MemError::WriteOutsideWindow);
+    if copy.is_write() {
+        // Puts bytes into guest pages the hypervisor's dirty bitmap cannot
+        // witness. Recorded here, after the walk that names them and before any
+        // of them is written, so a refusal below costs a spurious invalidation
+        // rather than a missing one.
+        state.note_host_wrote_pages(gpas.clone());
+        if !span_within_window(&gpas, allowed) {
+            return Err(MemError::WriteOutsideWindow);
+        }
     }
     if gpas.iter().any(|&g| !host.is_ram_gpa(g)) {
         return Err(MemError::NotRam);
@@ -732,93 +769,25 @@ fn write_span_multi<H: HostMemory + HostOps>(
         let buf_off = (copy_lo - gva) as usize;
         let host_off = (copy_lo - run_gva) as usize;
         let n = (copy_hi - copy_lo) as usize;
-        if host_off + n > total || buf_off + n > buf.len() {
+        if host_off + n > total || buf_off + n > copy.len() {
             host.unmap_pages(ptr, total);
             return Err(MemError::RunOutOfRange);
         }
-        // SAFETY: map_pages packed `total` bytes; host_off+n in range.
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                buf.as_ptr().add(buf_off),
-                (ptr as *mut u8).add(host_off),
-                n,
+        // SAFETY: map_pages packed `total` bytes, and the bound above puts
+        // `host_off + n` inside it and `buf_off + n` inside the caller's buffer.
+        unsafe { copy.apply(ptr, host_off, buf_off, n) };
+        if copy.is_write() {
+            // A run is packed by construction, so the `n` bytes at `host_off`
+            // are the `n` bytes at `run_gpas[0] + host_off` in guest-physical
+            // space — the exact destination, not the run's hull.
+            crate::observe::footprint::note_written_range(
+                run_gpas[0].saturating_add(host_off as u64),
+                n as u64,
             );
         }
-        // A run is packed by construction, so the `n` bytes at `host_off` are
-        // the `n` bytes at `run_gpas[0] + host_off` in guest-physical space —
-        // the exact destination, not the run's hull.
-        crate::observe::footprint::note_written_range(
-            run_gpas[0].saturating_add(host_off as u64),
-            n as u64,
-        );
         host.unmap_pages(ptr, total);
     }
     Ok(())
-}
-
-/// Multi-import read: map each packed GPA run, copy out, unmap.
-fn read_span_multi<H: HostMemory + HostOps>(
-    state: &mut DeviceState,
-    host: &mut H,
-    task_id: u32,
-    gva: u64,
-    buf: &mut [u8],
-) -> bool {
-    let length = buf.len() as u64;
-    let page_shift = state.page_shift;
-    let page_size = state.page_size();
-    let page_sz = page_size as usize;
-    let gpas = {
-        let Some((_tid, task)) = resolve_task_for_walk(&state.tasks, task_id) else {
-            return false;
-        };
-        let Ok(gpas) = collect_span_gpas(host, task, gva, length, page_shift) else {
-            return false;
-        };
-        gpas
-    };
-    if gpas.iter().any(|&g| !host.is_ram_gpa(g)) {
-        return false;
-    }
-    let runs = contig_page_runs(&gpas, page_size);
-    if runs.is_empty() {
-        return false;
-    }
-    crate::runtime::mapper::flush_retired_views(state, host);
-    let span_page_base = gva & !(page_size - 1);
-    let end = gva.saturating_add(length);
-    for run in &runs {
-        let run_gpas = &gpas[run.clone()];
-        let Some(ptr) = host.map_pages(run_gpas, page_sz) else {
-            return false;
-        };
-        let total = run_gpas.len().saturating_mul(page_sz);
-        let run_gva = span_page_base.saturating_add((run.start as u64).saturating_mul(page_size));
-        let run_end = run_gva.saturating_add(total as u64);
-        let copy_lo = gva.max(run_gva);
-        let copy_hi = end.min(run_end);
-        if copy_lo >= copy_hi {
-            host.unmap_pages(ptr, total);
-            continue;
-        }
-        let buf_off = (copy_lo - gva) as usize;
-        let host_off = (copy_lo - run_gva) as usize;
-        let n = (copy_hi - copy_lo) as usize;
-        if host_off + n > total || buf_off + n > buf.len() {
-            host.unmap_pages(ptr, total);
-            return false;
-        }
-        // SAFETY: map covers total bytes.
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                (ptr as *const u8).add(host_off),
-                buf.as_mut_ptr().add(buf_off),
-                n,
-            );
-        }
-        host.unmap_pages(ptr, total);
-    }
-    true
 }
 
 #[cfg(test)]
@@ -1383,7 +1352,7 @@ mod tests {
     }
 
     /// The product guest-write path must name the check that refused, not
-    /// assume contiguity. `write_span_multi` has six distinct refusals — no
+    /// assume contiguity. [`span_multi`] has six distinct refusals — no
     /// task, an unresolved page, a non-RAM GPA, an empty run list, a `map_pages`
     /// refusal and an out-of-range run window — and every one of them used to
     /// reach the always-on log as `mem_not_contiguous`. That is the same "one
@@ -1425,7 +1394,47 @@ mod tests {
         );
     }
 
-    /// The three refusals `write_span_multi` owns must stay distinguishable
+    /// The read direction must name the check that refused, exactly as the
+    /// write direction does.
+    ///
+    /// It did not: `read_span_multi` returned a bare `false` at six sites where
+    /// its write twin named a [`MemError`], and at the walk it threw away a
+    /// refusal that had already been computed. Every caller of [`read_span`]
+    /// returns a `bool` upward, so those bytes went missing with nothing in the
+    /// log to say why. This is the read-side mirror of
+    /// [`product_gva_write_reports_the_check_that_refused`], on the same fixture
+    /// and the same straddling span, and it fails on any tree where the read
+    /// walk drops the reason again.
+    #[test]
+    fn product_gva_read_reports_the_check_that_refused() {
+        let page_shift = PAGE_SHIFT_X86;
+        let (mut host, _root_gpa, _data0, _data1, page) = pt_fixture(page_shift);
+        let mut state = state_x86();
+        assert!(state.define_task(1, page, 2));
+        crate::observe::redirect_logs_for_tests();
+        let before = std::fs::read_to_string(crate::observe::fail_log_path())
+            .unwrap_or_default()
+            .len();
+        // pt_fixture wires PTE[0] only, so page 1 of this two-page span is
+        // unresolved. `page - 4` straddles the boundary.
+        let mut buf = [0u8; 8];
+        assert!(
+            !read_span(&mut state, &mut host, 1, page - 4, &mut buf),
+            "a span whose second page has no PTE cannot be read"
+        );
+        let body = std::fs::read_to_string(crate::observe::fail_log_path()).unwrap_or_default();
+        let tail = &body[before.min(body.len())..];
+        let line = tail
+            .lines()
+            .find(|l| l.starts_with("gva_read_span "))
+            .expect("a refused product guest read is always-on");
+        assert!(
+            line.contains("reason=gva_zero_pfn"),
+            "the walk's own check must be the reason: {line}"
+        );
+    }
+
+    /// The three refusals [`span_multi`] owns must stay distinguishable
     /// from each other and from the walk's. Asserted as "no two share a slug"
     /// rather than by naming each, because the property that matters is the
     /// absence of aliasing — the same shape
