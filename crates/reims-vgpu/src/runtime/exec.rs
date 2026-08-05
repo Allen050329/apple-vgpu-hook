@@ -1309,7 +1309,30 @@ fn handle_render_record<M: HostMemory + HostOps>(
         }
     };
     match cmd.kind {
-        RenderKind::SetPipeline if cmd.pipeline_ref != 0 => {
+        RenderKind::SetPipeline => {
+            // Apply what the record decoded, ref 0 included. This used to be
+            // guarded `if cmd.pipeline_ref != 0`, and the match's last arm is a
+            // bare `_ => {}`, so a zero ref left the *previous* pipeline latched
+            // and the next draw encoded against it — a wrong frame with nothing
+            // on any channel. Dropping the record is not the neutral choice it
+            // looks like: `acc.pipeline_ref == 0` is already a state the draw arm
+            // knows, where it declines as `dropped_unbound` and says so. Letting
+            // the zero through routes this into that named decline instead of
+            // into a stale bind.
+            //
+            // A healthy zero: `setRenderPipelineState:` takes a non-null
+            // pipeline, so Apple's serializer has no reason to emit this record
+            // with ref 0 and it is expected never to fire. That is what makes
+            // applying the decoded value safe — on a stream that never sends it,
+            // the two behaviors are identical — and it is why a firing is worth a
+            // line rather than a silent drop.
+            if cmd.pipeline_ref == 0 && crate::observe::first_sight("render_set_pipeline_zero", 0) {
+                crate::observe::fail(
+                    "stream_set_pipeline reason=render_set_pipeline_zero_ref \
+                     (a render pipeline was set to ref 0; the pass is now unbound \
+                     and its draws decline as dropped_unbound)",
+                );
+            }
             acc.pipeline_ref = cmd.pipeline_ref;
         }
         RenderKind::SetBuffer => {
@@ -4685,6 +4708,66 @@ mod tests {
         handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut unbound);
         assert_eq!(unbound.dropped_unbound, 1);
         assert!(unbound.draws.is_empty());
+    }
+
+    /// Setting the render pipeline to ref 0 unbinds it rather than being ignored.
+    ///
+    /// `SetPipeline` was guarded `if cmd.pipeline_ref != 0`, and the arm that
+    /// caught the failed guard is the match's bare `_ => {}`. So a zero ref left
+    /// whatever pipeline was latched before it in place, and every following draw
+    /// encoded against a pipeline the guest had stopped asking for — a wrong
+    /// frame, silently, with `dropped_unbound` reading zero because the draws
+    /// were not dropped at all.
+    ///
+    /// This asserts the outcome rather than the field: after a zero ref, a draw
+    /// that would otherwise have been kept lands in `dropped_unbound` and no
+    /// `PendingDraw` carries the stale ref. On the guarded code the draw is
+    /// pushed with pipeline 61 and both assertions fail.
+    #[test]
+    fn setting_the_render_pipeline_to_ref_zero_unbinds_it() {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let host = FakeHost::new();
+        let mut out = ExecResult::default();
+        let mut acc = StreamAccum {
+            pipeline_ref: 61,
+            ..Default::default()
+        };
+
+        let mut set_pipeline = vec![0u8; wire_render::SET_STATE_TOTAL_LEN as usize];
+        st32(&mut set_pipeline[0..], wire_render::OPCODE_SET_RENDER_PIPELINE_STATE);
+        st32(&mut set_pipeline[4..], wire_render::SET_STATE_TOTAL_LEN);
+        st32(&mut set_pipeline[8..], 0);
+        handle_render_record(
+            &mut state,
+            &host,
+            1,
+            wire_render::OPCODE_SET_RENDER_PIPELINE_STATE,
+            &set_pipeline,
+            &mut out,
+            &mut acc,
+        );
+        assert_eq!(
+            acc.pipeline_ref, 0,
+            "the decoded ref is what the accumulator latches"
+        );
+
+        let mut draw = vec![0u8; 0x20];
+        let op = wire_render::OPCODE_DRAW_INDEXED_WIDE;
+        st32(&mut draw[0..], op);
+        st32(&mut draw[4..], 0x20);
+        st16(&mut draw[8..], 3);
+        st32(&mut draw[12..], 0x3e);
+        st32(&mut draw[16..], 6);
+        handle_render_record(&mut state, &host, 1, op, &draw, &mut out, &mut acc);
+
+        assert_eq!(
+            acc.dropped_unbound, 1,
+            "a draw after an unbind is declined by name, not encoded against the old pipeline"
+        );
+        assert!(
+            acc.draws.is_empty(),
+            "no draw may carry the pipeline the guest unbound"
+        );
     }
 
     /// A stream that binds once and draws many times must not copy its bind
