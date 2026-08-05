@@ -4286,7 +4286,6 @@ mod tests {
             let m = state.mappings.get(&9).unwrap();
             crate::runtime::mapping_write::type11_sample_window(
                 m,
-                9,
                 4,
                 4,
                 crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM,

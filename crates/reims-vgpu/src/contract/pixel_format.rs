@@ -1257,13 +1257,14 @@ mod tests {
     }
 
     /// The 128-byte-aligned IOSurface row lives in
-    /// [`crate::contract::iosurface_pages::sample_window`], which is the one the
-    /// mapper rail reads. A second `iosurface_row_bytes` here computed the same
-    /// rule from its own copy of the alignment and served nothing but this test.
+    /// [`crate::contract::iosurface_pages::packed_span_estimate`], which is the
+    /// one the mapper rail reads. A second `iosurface_row_bytes` here computed
+    /// the same rule from its own copy of the alignment and served nothing but
+    /// this test. At height 1 the estimate is exactly one aligned row.
     #[test]
     fn rows_and_image_size() {
-        use crate::contract::iosurface_pages::sample_window;
-        let bpr = |w, fmt| sample_window(0, fmt, w, 1).map(|(_, bpr, _)| bpr);
+        use crate::contract::iosurface_pages::packed_span_estimate;
+        let bpr = |w, fmt| packed_span_estimate(fmt, w, 1);
         assert_eq!(bpr(200, MTL_FORMAT_BGRA8_UNORM), Some(896));
         assert_eq!(bpr(64, MTL_FORMAT_BGRA8_UNORM), Some(256));
         assert_eq!(bpr(250, MTL_FORMAT_BGRA8_UNORM), Some(1024));

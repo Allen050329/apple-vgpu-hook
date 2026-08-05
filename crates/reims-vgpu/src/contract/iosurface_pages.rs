@@ -277,12 +277,23 @@ pub fn format_bytes_per_pixel(pixel_format: u16) -> Option<u32> {
     pixel_format::bytes_per_pixel(pixel_format)
 }
 
-pub fn sample_window(
-    _plane_index: u32,
-    pixel_format: u16,
-    width: u32,
-    height: u32,
-) -> Option<(u64, u32, u64)> {
+/// Estimated byte reach of a texture of this geometry, for **sizing a mapping's
+/// page table** — never for addressing pixels.
+///
+/// The guest's `sIOSurfaceDeviceDescriptor` is the only thing that knows a
+/// surface's real base offset and pitch, and when it has not arrived yet the
+/// mapper still has to decide how many pages to walk. This answers that and
+/// only that, so it returns a byte count rather than a window: there is no
+/// offset and no pitch here to bind, which is the point. A texture bind whose
+/// descriptor has not resolved declines by name — see
+/// [`sample_window_from_device_desc`].
+///
+/// `ROW_BYTES_ALIGN` makes the estimate the *tight* row rounded up rather than
+/// the tight row itself, so the count errs long. It is not a derivation of what
+/// IOSurface actually chose: a surface aligned more coarsely than this reaches
+/// further, which is why `alloc_size` bounds the result wherever it is known
+/// and why nothing may read a pitch back out of this.
+pub fn packed_span_estimate(pixel_format: u16, width: u32, height: u32) -> Option<u64> {
     if width == 0 || height == 0 {
         return None;
     }
@@ -292,8 +303,7 @@ pub fn sample_window(
     if bpr > u32::MAX as u64 {
         return None;
     }
-    let span_end = checked_mul_u64(bpr, height as u64)?;
-    Some((0, bpr as u32, span_end))
+    checked_mul_u64(bpr, height as u64)
 }
 
 pub fn decode_device_surface(bytes: &[u8]) -> Option<DeviceSurfaceRecord> {
@@ -401,36 +411,52 @@ pub fn sample_window_from_device_surface(
     Some((surf.base_offset as u64, surf.bytes_per_row, span_end))
 }
 
-pub fn sample_window_prefer_device(
+/// The window a texture of this geometry occupies inside its IOSurface, taken
+/// from the guest's own device descriptor and from nowhere else.
+///
+/// Returns `(surface_offset, bytes_per_row, span_end)`, or `None` when the
+/// descriptor is absent, too short, or names no plane this texture can be. That
+/// `None` is the whole contract: the base offset and pitch of an IOSurface are
+/// facts the guest owns, and a device that supplies its own when they are
+/// missing has bound the wrong bytes with nothing able to notice. Callers
+/// decline by name instead — a lost bind is visible, wrong pixels are not.
+///
+/// Three ways a window is derived, in order:
+///
+/// - **A wire-carried plane index** (type-5 record `+0x20`) names its plane
+///   record directly. It is the only key that separates same-geometry planes:
+///   a v0a8 surface's Y plane 0 and alpha plane 2 are both R8 at the luma
+///   geometry, so the scan below matches two and takes neither.
+/// - **A single-plane surface** uses the surface-level base and pitch.
+/// - **A multi-plane surface with no wire index** (type-11) matches width,
+///   height and bytes-per-element, and takes the plane only when *exactly one*
+///   matches.
+pub fn sample_window_from_device_desc(
     desc: Option<&[u8]>,
     plane_index: Option<u32>,
     pixel_format: u16,
     width: u32,
     height: u32,
-) -> Option<(u64, u32, u64, bool)> {
+) -> Option<(u64, u32, u64)> {
     if let Some(desc) = desc {
         if desc.len() >= DEVICE_DESC_LEN {
             if let Some(surf) = decode_device_surface(desc) {
-                // A wire-carried plane index (type-5 record `+0x20`) names its
-                // record directly — the only key that separates same-geometry
-                // planes (v0a8 Y plane 0 vs alpha plane 2). Geometry scan
-                // below stays for callers whose wire has no index (type-11).
                 if let Some(p) = plane_index {
                     if surf.plane_count > 0 {
                         if let Some((cand, _)) = device_desc_plane(desc, p) {
-                            if let Some((off, bpr, end)) =
+                            if let Some(w) =
                                 sample_window_from_device_plane(&cand, pixel_format, width, height)
                             {
-                                return Some((off, bpr, end, true));
+                                return Some(w);
                             }
                         }
                     }
                 }
                 if surf.plane_count == 0 {
-                    if let Some((off, bpr, end)) =
+                    if let Some(w) =
                         sample_window_from_device_surface(&surf, pixel_format, width, height)
                     {
-                        return Some((off, bpr, end, true));
+                        return Some(w);
                     }
                 } else if let Some(bpp) = format_bytes_per_pixel(pixel_format) {
                     let mut matches = 0u32;
@@ -448,30 +474,45 @@ pub fn sample_window_prefer_device(
                         }
                     }
                     if matches == 1 {
-                        if let Some((off, bpr, end)) =
+                        if let Some(w) =
                             sample_window_from_device_plane(&plane, pixel_format, width, height)
                         {
-                            return Some((off, bpr, end, true));
+                            return Some(w);
                         }
                     }
                 }
             }
         }
     }
-    // Invent fallback. RE (`allocateBackingHandle`): type-4 `length` is the
-    // page-aligned allocation written at desc+0 (independent of plane w/h/bpr
-    // filled from per-plane getters). We stash that as device_desc.alloc_size.
-    // The device-surface path already rejects span_end > alloc_size; invent must
-    // not invent a larger span past that wire allocation (old invent ignored it
-    // → host claimed a plane-sized window over fewer mapped pages).
-    //
-    // This `None` is therefore the *only* place the allocation bound is applied,
-    // and no caller may answer it by calling `sample_window` itself: the two
-    // differ by exactly this check, so a `sample_window_prefer_device(..) else
-    // sample_window(..)` ladder re-takes the span that was just rejected, and
-    // does so only when the span overruns the guest's own allocation. Three such
-    // ladders existed in `mapper.rs` and are gone.
-    let (off, bpr, end) = sample_window(plane_index.unwrap_or(0), pixel_format, width, height)?;
+    None
+}
+
+/// How many bytes of a mapping a texture of this geometry can reach, for sizing
+/// its page table.
+///
+/// The descriptor answers this exactly when it has arrived; otherwise
+/// [`packed_span_estimate`] gives a count that errs long. Either way the guest's
+/// own allocation bounds it: RE (`allocateBackingHandle`) writes the
+/// page-aligned allocation length at type-4 desc `+0`, independent of the plane
+/// width/height/pitch filled from the per-plane getters, and we stash it as
+/// `device_desc.alloc_size`. A span past that is a span past the pages the guest
+/// allocated, so it is refused rather than clamped.
+///
+/// This is the only place the allocation bound is applied, and it is why nothing
+/// may reach for [`packed_span_estimate`] directly and then take the span this
+/// refused.
+pub fn mapping_span_bound(
+    desc: Option<&[u8]>,
+    pixel_format: u16,
+    width: u32,
+    height: u32,
+) -> Option<u64> {
+    if let Some((_, _, end)) =
+        sample_window_from_device_desc(desc, None, pixel_format, width, height)
+    {
+        return Some(end);
+    }
+    let end = packed_span_estimate(pixel_format, width, height)?;
     if let Some(desc) = desc {
         if desc.len() >= DEVICE_DESC_LEN {
             if let Some(surf) = decode_device_surface(desc) {
@@ -481,7 +522,7 @@ pub fn sample_window_prefer_device(
             }
         }
     }
-    Some((off, bpr, end, false))
+    Some(end)
 }
 
 pub fn entry_gpa_shift(entry: u32, page_shift: u32) -> Option<u64> {
@@ -995,11 +1036,13 @@ mod tests {
     }
 
     #[test]
-    fn sample_window_packed() {
-        let (off, bpr, end) = sample_window(0, MTL_FORMAT_BGRA8_UNORM, 200, 100).unwrap();
-        assert_eq!(off, 0);
-        assert_eq!(bpr, 896);
-        assert_eq!(end, 896 * 100);
+    fn packed_span_estimate_rounds_the_row_up() {
+        // 200 BGRA = 800 tight, rounded to 896; the estimate is that row times
+        // the height, and it is a byte count with no offset or pitch to bind.
+        assert_eq!(
+            packed_span_estimate(MTL_FORMAT_BGRA8_UNORM, 200, 100),
+            Some(896 * 100)
+        );
     }
 
     #[test]
@@ -1053,17 +1096,37 @@ mod tests {
     }
 
     #[test]
-    fn property_fuzz_sample_window() {
+    fn property_fuzz_packed_span_estimate() {
         for w in [1u32, 2, 64, 200, 1920] {
             for h in [1u32, 2, 100] {
-                let r = sample_window(0, MTL_FORMAT_BGRA8_UNORM, w, h);
-                if let Some((off, bpr, end)) = r {
-                    assert_eq!(off, 0);
-                    assert_eq!(bpr % 128, 0);
-                    assert!(end >= w as u64 * 4);
+                if let Some(end) = packed_span_estimate(MTL_FORMAT_BGRA8_UNORM, w, h) {
+                    // Errs long: never below the tight extent it stands in for.
+                    assert!(end >= w as u64 * 4 * h as u64);
+                    assert_eq!(end % 128, 0);
                 }
             }
         }
+    }
+
+    /// A texture bind takes its window from the guest's descriptor or not at
+    /// all. With no descriptor there is nothing to derive a base offset or a
+    /// pitch from, and supplying one would be a wrong bind that reads as success
+    /// at every layer above — so this declines, and only the page-sizing
+    /// estimate answers.
+    #[test]
+    fn a_bind_without_a_descriptor_declines_where_page_sizing_still_answers() {
+        assert!(
+            sample_window_from_device_desc(None, None, MTL_FORMAT_BGRA8_UNORM, 200, 100).is_none()
+        );
+        assert!(
+            sample_window_from_device_desc(Some(&[0u8; 4]), None, MTL_FORMAT_BGRA8_UNORM, 200, 100)
+                .is_none(),
+            "a descriptor shorter than a full record is no descriptor"
+        );
+        assert_eq!(
+            mapping_span_bound(None, MTL_FORMAT_BGRA8_UNORM, 200, 100),
+            Some(896 * 100)
+        );
     }
 
     /// Pack device-plane dims word: elemW@0, width u24@1, elemH@4, height u24@5.
@@ -1071,10 +1134,11 @@ mod tests {
         ((width as u64 & 0xffffff) << 8) | ((height as u64 & 0xffffff) << 40)
     }
 
-    /// Invent must not invent past wire alloc_size (type-4 `length`).
-    /// RE: allocateBackingHandle writes length@0 independently of plane dims.
+    /// The page-sizing estimate must not reach past the wire `alloc_size`
+    /// (type-4 `length`). RE: allocateBackingHandle writes length@0
+    /// independently of plane dims.
     #[test]
-    fn sample_window_invent_rejects_span_past_alloc_size() {
+    fn mapping_span_bound_rejects_a_span_past_alloc_size() {
         use crate::contract::endian::{st32, st64};
         use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
 
@@ -1087,27 +1151,32 @@ mod tests {
         );
         let dims = ((1024u64) << 8) | ((1024u64) << 40);
         st64(&mut desc[DEVICE_DESC_DIMS..], dims);
-        // bpr too small for 1024 BGRA → device-surface path rejects → invent.
+        // bpr too small for 1024 BGRA → the device-surface path rejects, so the
+        // estimate is what answers and the allocation is what bounds it.
         st32(&mut desc[DEVICE_DESC_BPR..], 64);
         desc[DEVICE_DESC_PLANE_COUNT] = 0;
 
-        // Invent would need 1024*4096 > alloc → None (fail closed, no height lie).
-        assert!(
-            sample_window_prefer_device(Some(&desc), None, MTL_FORMAT_BGRA8_UNORM, 1024, 1024)
-                .is_none()
+        // 1024*4096 > alloc → None (fail closed, no height lie).
+        assert!(mapping_span_bound(Some(&desc), MTL_FORMAT_BGRA8_UNORM, 1024, 1024).is_none());
+        // Within alloc: the estimate stands.
+        assert_eq!(
+            mapping_span_bound(Some(&desc), MTL_FORMAT_BGRA8_UNORM, 1024, 384),
+            Some(384 * 4096)
         );
-        // Within alloc: invent ok.
-        let (off, bpr, end, from_dev) =
-            sample_window_prefer_device(Some(&desc), None, MTL_FORMAT_BGRA8_UNORM, 1024, 384)
-                .expect("within alloc");
-        assert!(!from_dev);
-        assert_eq!(off, 0);
-        assert_eq!(bpr, 4096);
-        assert_eq!(end, 384 * 4096);
+        // A descriptor this texture cannot be placed against sizes pages but
+        // never sources a bind.
+        assert!(sample_window_from_device_desc(
+            Some(&desc),
+            None,
+            MTL_FORMAT_BGRA8_UNORM,
+            1024,
+            384
+        )
+        .is_none());
     }
 
     #[test]
-    fn sample_window_prefer_device_biplanar_geometry() {
+    fn the_geometry_scan_picks_a_plane_only_when_exactly_one_matches() {
         use crate::contract::endian::{st16, st32, st64};
         use crate::contract::pixel_format::{MTL_FORMAT_R8_UNORM, MTL_FORMAT_RG8_UNORM};
 
@@ -1129,27 +1198,23 @@ mod tests {
         st32(&mut desc[p1 + DEVICE_PLANE_BPR..], 64);
         st16(&mut desc[p1 + DEVICE_PLANE_BPE..], 2);
 
-        let (off_y, bpr_y, end_y, from_dev) =
-            sample_window_prefer_device(Some(&desc), None, MTL_FORMAT_R8_UNORM, 16, 8).unwrap();
-        assert!(from_dev);
+        let (off_y, bpr_y, end_y) =
+            sample_window_from_device_desc(Some(&desc), None, MTL_FORMAT_R8_UNORM, 16, 8).unwrap();
         assert_eq!(off_y, 512);
         assert_eq!(bpr_y, 64);
         // exclusive last-row end: 512 + 7*64 + 16
         assert_eq!(end_y, 512 + 7 * 64 + 16);
 
-        let (off_uv, bpr_uv, end_uv, from_dev_uv) =
-            sample_window_prefer_device(Some(&desc), None, MTL_FORMAT_RG8_UNORM, 8, 4).unwrap();
-        assert!(from_dev_uv);
+        let (off_uv, bpr_uv, end_uv) =
+            sample_window_from_device_desc(Some(&desc), None, MTL_FORMAT_RG8_UNORM, 8, 4).unwrap();
         assert_eq!(off_uv, 1024);
         assert_eq!(bpr_uv, 64);
         assert_eq!(end_uv, 1024 + 3 * 64 + 16);
 
-        // Ambiguous dims → invent (zero matches if dims don't hit a plane).
-        let (off_inv, bpr_inv, _, from_inv) =
-            sample_window_prefer_device(Some(&desc), None, MTL_FORMAT_R8_UNORM, 4, 4).unwrap();
-        assert!(!from_inv);
-        assert_eq!(off_inv, 0);
-        assert_eq!(bpr_inv % 128, 0);
+        // Dims that hit no plane record: zero matches, so nothing is bound.
+        assert!(
+            sample_window_from_device_desc(Some(&desc), None, MTL_FORMAT_R8_UNORM, 4, 4).is_none()
+        );
     }
 
     /// v0a8 (biplanar video + alpha) shape from the live apple.com hero: the
@@ -1184,28 +1249,34 @@ mod tests {
         }
 
         // Indexed selection: each plane record by its wire index.
-        let y = sample_window_prefer_device(Some(&desc), Some(0), MTL_FORMAT_R8_UNORM, 946, 350)
+        let y = sample_window_from_device_desc(Some(&desc), Some(0), MTL_FORMAT_R8_UNORM, 946, 350)
             .unwrap();
-        assert_eq!((y.0, y.1, y.3), (32, 960, true));
-        let uv = sample_window_prefer_device(Some(&desc), Some(1), MTL_FORMAT_RG8_UNORM, 473, 175)
-            .unwrap();
-        assert_eq!((uv.0, uv.1, uv.3), (336_032, 960, true));
-        let a = sample_window_prefer_device(Some(&desc), Some(2), MTL_FORMAT_R8_UNORM, 946, 350)
-            .unwrap();
-        assert_eq!((a.0, a.1, a.3), (504_992, 960, true));
-
-        // No index: Y geometry matches plane 0 AND plane 2 → ambiguity rule
-        // falls back to invent (never a silent wrong-plane bind).
-        let (off_inv, bpr_inv, _, from_inv) =
-            sample_window_prefer_device(Some(&desc), None, MTL_FORMAT_R8_UNORM, 946, 350).unwrap();
-        assert!(!from_inv);
-        assert_eq!(off_inv, 0);
-        assert_eq!(bpr_inv, 1024);
-
-        // Out-of-range index falls back the same way, never a wrong record.
-        let (_, _, _, from_bad) =
-            sample_window_prefer_device(Some(&desc), Some(7), MTL_FORMAT_R8_UNORM, 946, 350)
+        assert_eq!((y.0, y.1), (32, 960));
+        let uv =
+            sample_window_from_device_desc(Some(&desc), Some(1), MTL_FORMAT_RG8_UNORM, 473, 175)
                 .unwrap();
-        assert!(!from_bad);
+        assert_eq!((uv.0, uv.1), (336_032, 960));
+        let a = sample_window_from_device_desc(Some(&desc), Some(2), MTL_FORMAT_R8_UNORM, 946, 350)
+            .unwrap();
+        assert_eq!((a.0, a.1), (504_992, 960));
+
+        // No index: Y geometry matches plane 0 AND plane 2. Two matches is not
+        // "pick the first" — the scan cannot tell them apart, so it declines and
+        // the caller reports a lost bind rather than sampling luma for alpha.
+        assert!(
+            sample_window_from_device_desc(Some(&desc), None, MTL_FORMAT_R8_UNORM, 946, 350)
+                .is_none()
+        );
+
+        // An index past the plane count names no record, so it resolves nothing
+        // — not the geometry scan's answer, and not plane 0's bytes.
+        assert!(sample_window_from_device_desc(
+            Some(&desc),
+            Some(7),
+            MTL_FORMAT_R8_UNORM,
+            946,
+            350
+        )
+        .is_none());
     }
 }

@@ -5,7 +5,9 @@
 //! `0xff000000ff000000` class). Always bumps [`DeviceState::mark_mapping_written`]
 //! on success.
 
-use crate::contract::iosurface_pages::{sample_window_prefer_device, DEVICE_DESC_LEN};
+use crate::contract::iosurface_pages::{
+    packed_span_estimate, sample_window_from_device_desc, DEVICE_DESC_LEN,
+};
 use crate::contract::pixel_format::{
     self, convert_rgba8_to_row, convert_row_to_rgba8, MTL_FORMAT_BGRA8_UNORM, RGBA8_BPP,
 };
@@ -172,137 +174,77 @@ fn refuse(mapping_id: u32, why: SurfaceWriteRefusal) -> bool {
     false
 }
 
-/// Resolve sample window for a type-11 texture binding on a mapping.
+/// Resolve the sample window a texture of this geometry occupies inside its
+/// mapping, for both wire families.
 ///
-/// Prefers the guest `sIOSurfaceDeviceDescriptor` when cached: single-plane
-/// uses surface-level base/bpr; multi-plane selects the unique plane whose
-/// dims and bpe match the texture (`sample_window_prefer_device`). Falls back
-/// to packed invent `ALIGN_UP(w×bpp, 128)` when the descriptor is missing or
-/// rejects. Returns `(surface_offset, bytes_per_row, span_end)`.
+/// Two states the device used to answer identically, and the whole point of this
+/// function is that they are not the same:
 ///
-/// # The invent fallback is reported
+/// - **The mapping has published no descriptor.** `MappingInternal.descriptor`
+///   reads zero until the guest fills it, which `mapper::resolve` documents as a
+///   real state rather than a failure, and the geometry then comes from the
+///   type-11 texture object instead. There are no plane records to confuse here;
+///   the single unknown is the pitch, and [`packed_span_estimate`]'s aligned row
+///   stands in for it over a surface starting at offset 0.
+/// - **The descriptor is published and resolves nothing.** Here the guest *has*
+///   told us the layout and the texture cannot be placed in it: its geometry
+///   matched no plane record, or — the case that matters — it matched more than
+///   one. A v0a8 surface's Y and alpha planes are both R8 at the luma geometry,
+///   so the scan cannot tell them apart *by construction*, and the packed window
+///   over plane 0 is a coin flip that reads as success at every layer above.
 ///
-/// Type-11 is the case with **no wire plane index** — unlike
-/// [`type5_sample_window`], nothing on the wire names which plane the texture
-/// wants, so a multi-plane surface is resolved by matching width, height and
-/// bytes-per-element. That scan takes the plane only when **exactly one**
-/// matches; zero matches and two-or-more matches both fall through to the
-/// invented packed window, which is plane 0's bytes at offset 0. On a
-/// multi-plane surface that is a bind of the wrong plane, and it is the case the
-/// geometry scan cannot detect by construction.
-///
-/// So the fallback is not silent. `type11_window_invent` is emitted through the
-/// always-on channel, deduped per (mapping, geometry, format), carrying the
-/// surface's plane count so a reader can tell "no descriptor yet" (plane_count
-/// unknown) from "the scan could not pick a plane" (plane_count > 1). The three
-/// `mapper.rs` callers of `sample_window_prefer_device` legitimately ignore this
-/// — they want `span_end` only, as a floor on how many pages to map.
-pub fn type11_sample_window(
+/// The second case declines, and callers answer it with a named refusal. That is
+/// the difference between a bind that is lost visibly and one that samples luma
+/// for alpha with nothing in the device able to say so.
+fn sample_window(
     m: &MappingEntry,
-    mapping_id: u32,
+    plane_index: Option<u32>,
     width: u32,
     height: u32,
     format: u16,
 ) -> Option<(u64, u32, u64)> {
-    let desc = if m.device_desc.len() >= DEVICE_DESC_LEN {
-        Some(m.device_desc.as_slice())
-    } else {
-        None
+    let Some(desc) = m.device_desc.get(..DEVICE_DESC_LEN) else {
+        let end = packed_span_estimate(format, width, height)?;
+        // The estimate is a whole number of aligned rows, so dividing it back
+        // out is the row it was built from rather than a second derivation.
+        return Some((0, (end / u64::from(height)) as u32, end));
     };
-    let (offset, bpr, end, from_device) =
-        sample_window_prefer_device(desc, None, format, width, height)?;
-    if !from_device
-        && crate::observe::first_sight(
-            "type11_window_invent",
-            u64::from(mapping_id) << 48
-                | u64::from(width) << 32
-                | u64::from(height) << 16
-                | u64::from(format),
-        )
-    {
-        let planes = desc
-            .and_then(crate::contract::iosurface_pages::decode_device_surface)
-            .map(|s| i64::from(s.plane_count))
-            .unwrap_or(-1);
-        crate::observe::off(format!(
-            "type11_window_invent mapping={mapping_id} {width}x{height} fmt={format:#x} \
-             planes={planes} offset={offset} bpr={bpr} span_end={end} (no wire plane index and \
-             the device descriptor did not resolve one; this window is plane 0 packed)"
-        ));
-    }
-    Some((offset, bpr, end))
+    sample_window_from_device_desc(Some(desc), plane_index, format, width, height)
 }
 
-/// Sample window for a type-5 serialized view, which — unlike type-11 —
-/// carries the IOSurface plane index on the wire (type-5 record `+0x20`).
-/// The index names the device plane record directly; same-geometry planes
-/// (v0a8 Y plane 0 vs alpha plane 2) are indistinguishable by geometry scan.
+/// Resolve the sample window for a type-11 texture binding on a mapping.
+///
+/// Type-11 is the case with **no wire plane index**: nothing on the wire names
+/// which plane the texture wants, so a multi-plane surface is resolved by
+/// matching width, height and bytes-per-element, and the plane is taken only
+/// when exactly one matches. See [`sample_window`] for what each outcome means.
+pub fn type11_sample_window(
+    m: &MappingEntry,
+    width: u32,
+    height: u32,
+    format: u16,
+) -> Option<(u64, u32, u64)> {
+    sample_window(m, None, width, height, format)
+}
+
+/// Resolve the sample window for a type-5 serialized view, which — unlike
+/// type-11 — carries the IOSurface plane index on the wire (type-5 record
+/// `+0x20`).
 ///
 /// Every type-5 consumer must come through here rather than through
-/// [`type11_sample_window`], and the distinction is not cosmetic: type-11's
-/// window resolves the plane by matching width, height and bytes-per-element,
-/// and on a surface whose planes share all three (v0a8 Y and alpha are both R8
-/// at the luma geometry) the scan matches two, takes neither, and returns the
-/// invented packed window — plane 0's bytes at offset 0. Handing a type-5 view's
-/// geometry to it therefore reads the *luma* plane for a bind the wire said was
-/// alpha, and the geometry scan cannot detect that by construction.
-///
-/// The `from_device` flag it returns is the caller's obligation, not a detail:
-/// `false` means the descriptor resolved no plane and the window is the invented
-/// packed one over plane 0. A caller that then *binds* that window while the wire
-/// named a non-zero plane has bound the wrong plane, and must say so through
-/// [`note_type5_plane_invent`].
+/// [`type11_sample_window`], and the distinction is not cosmetic: the wire index
+/// names the plane record directly, and it is the only key that separates
+/// same-geometry planes. Handing a type-5 view's geometry to the type-11 scan
+/// drops that index, so a bind the wire said was alpha resolves against
+/// whichever same-geometry plane the scan happens to reach.
 pub fn type5_sample_window(
     m: &MappingEntry,
     plane_index: u32,
     width: u32,
     height: u32,
     format: u16,
-) -> Option<(u64, u32, u64, bool)> {
-    let desc = if m.device_desc.len() >= DEVICE_DESC_LEN {
-        Some(m.device_desc.as_slice())
-    } else {
-        None
-    };
-    sample_window_prefer_device(desc, Some(plane_index), format, width, height)
-}
-
-/// Report a type-5 bind that fell through to the invented packed window after
-/// the wire named a plane.
-///
-/// The invent is always plane 0's bytes at offset 0, so this is a guaranteed
-/// wrong bind — the window came back, the copy succeeds, and nothing else in the
-/// device will ever say the pixels are the wrong plane's. That makes it a
-/// failure line rather than a census.
-///
-/// Owned here rather than written out at each consumer because there are three
-/// of them (compute staging, blit texture backing, the CPU type-5 draw load) and
-/// the blit one was added after a spell resolving type-5 views through
-/// [`type11_sample_window`], which drops the wire plane index entirely and so
-/// could not have reported anything. `site` is what tells the three apart.
-///
-/// Call it only where the window is bound. The zero-copy sampled path checks
-/// `from_device` and refuses the invent, falling through to the CPU load that
-/// does bind it; reporting at both would double-count one bind.
-pub fn note_type5_plane_invent(
-    mapping_id: u32,
-    plane_index: u32,
-    width: u32,
-    height: u32,
-    format: u16,
-    window: (u64, u32),
-    site: &str,
-) {
-    if plane_index == 0 {
-        return;
-    }
-    let (offset, bpr) = window;
-    crate::observe::fail(format!(
-        "plane_invent site={site} mapping={mapping_id} plane={plane_index} \
-         {width}x{height} fmt={format:#x} offset={offset} bpr={bpr} \
-         (the wire named a plane and the device descriptor did not resolve one, \
-         so this window is plane 0 packed)"
-    ));
+) -> Option<(u64, u32, u64)> {
+    sample_window(m, Some(plane_index), width, height, format)
 }
 
 /// Revalidate + packed contig host view covering at least `span_end` bytes.
@@ -925,8 +867,7 @@ pub fn write_bgra8_from_resident_gpu<M: HostMemory + HostOps>(
     if format != MTL_FORMAT_BGRA8_UNORM && format != pixel_format::MTL_FORMAT_BGRA8_UNORM_SRGB {
         return Err(GpuWritebackDecline::FormatNeedsConversion { format });
     }
-    let Some((base_off, bpr, span_end)) = type11_sample_window(m, mapping_id, mw, mh, format)
-    else {
+    let Some((base_off, bpr, span_end)) = type11_sample_window(m, mw, mh, format) else {
         return Err(GpuWritebackDecline::WindowUnresolved {
             width: mw,
             height: mh,
@@ -1053,7 +994,7 @@ pub fn flush_windows_under_bgra8_write<M: HostMemory + HostOps>(
         return false;
     };
     let (mw, mh, format) = mapping_write_geometry(m, width, height);
-    let Some((base_off, _, span_end)) = type11_sample_window(m, mapping_id, mw, mh, format) else {
+    let Some((base_off, _, span_end)) = type11_sample_window(m, mw, mh, format) else {
         return false;
     };
     crate::runtime::storage_flush::flush_intersecting(state, host, mapping_id, base_off, span_end);
@@ -1136,8 +1077,7 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
             },
         );
     }
-    let Some((base_off, bpr_u32, span_end)) = type11_sample_window(m, mapping_id, mw, mh, format)
-    else {
+    let Some((base_off, bpr_u32, span_end)) = type11_sample_window(m, mw, mh, format) else {
         return refuse(
             mapping_id,
             SurfaceWriteRefusal::WindowUnresolved {
@@ -1550,8 +1490,7 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
             },
         );
     }
-    let Some((base_off, bpr_u32, span_end)) = type11_sample_window(m, mapping_id, mw, mh, format)
-    else {
+    let Some((base_off, bpr_u32, span_end)) = type11_sample_window(m, mw, mh, format) else {
         return refuse(
             mapping_id,
             SurfaceWriteRefusal::WindowUnresolved {
@@ -1961,7 +1900,7 @@ fn mapping_geom_window(state: &DeviceState, mapping_id: u32, rect: Rect) -> Opti
     } else {
         MTL_FORMAT_BGRA8_UNORM
     };
-    let (base_off, bpr, span_end) = type11_sample_window(m, mapping_id, m.width, m.height, format)?;
+    let (base_off, bpr, span_end) = type11_sample_window(m, m.width, m.height, format)?;
     let bpp = pixel_format::bytes_per_pixel(format)?;
     if origin_x.saturating_add(width) > m.width || origin_y.saturating_add(height) > m.height {
         return None;
@@ -4057,6 +3996,76 @@ mod tests {
         )));
     }
 
+    /// A published descriptor that resolves no plane is not the same state as no
+    /// descriptor at all, and the device must not answer them alike.
+    ///
+    /// Both used to return the packed window over offset 0. For the second that
+    /// is the only layout information anyone has; for the first the guest has
+    /// already said where its planes are and this texture matched two of them —
+    /// a v0a8 surface's Y and alpha planes share format and geometry, so the
+    /// scan cannot separate them and plane 0's bytes would be bound for a sample
+    /// the wire meant for alpha, silently.
+    #[test]
+    fn an_ambiguous_descriptor_declines_where_an_absent_one_still_sizes_a_window() {
+        use crate::contract::endian::{st16, st32, st64};
+        use crate::contract::iosurface_pages::{
+            DEVICE_DESC_ALLOC_SIZE, DEVICE_DESC_PLANES, DEVICE_DESC_PLANE_COUNT, DEVICE_PLANE_BPE,
+            DEVICE_PLANE_BPR, DEVICE_PLANE_DESC_LEN, DEVICE_PLANE_DIMS, DEVICE_PLANE_OFFSET,
+            DEVICE_PLANE_SIZE,
+        };
+        use crate::contract::pixel_format::MTL_FORMAT_R8_UNORM;
+
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        state.map_surface(8);
+
+        // No descriptor yet: geometry came from the type-11 texture object and
+        // the aligned row stands in for the pitch. 4 R8 texels align to 128.
+        let m = state.mappings.get(&8).expect("mapping");
+        assert_eq!(
+            type11_sample_window(m, 4, 2, MTL_FORMAT_R8_UNORM),
+            Some((0, 128, 256)),
+            "with nothing published there are no planes to confuse"
+        );
+
+        // Publish a v0a8-shaped descriptor: planes 0 and 2 are both R8 4x2.
+        let mut desc = vec![0u8; DEVICE_DESC_LEN];
+        st32(&mut desc[DEVICE_DESC_ALLOC_SIZE..], 0x2000);
+        desc[DEVICE_DESC_PLANE_COUNT] = 3;
+        let pack = |w: u32, h: u32| ((w as u64 & 0xffffff) << 8) | ((h as u64 & 0xffffff) << 40);
+        for (i, (off, w, h, bpe)) in [(512u32, 4u32, 2u32, 1u16), (1024, 2, 1, 2), (1536, 4, 2, 1)]
+            .iter()
+            .enumerate()
+        {
+            let p = DEVICE_DESC_PLANES + i * DEVICE_PLANE_DESC_LEN;
+            st32(&mut desc[p + DEVICE_PLANE_OFFSET..], *off);
+            st32(&mut desc[p + DEVICE_PLANE_SIZE..], 256);
+            st64(&mut desc[p + DEVICE_PLANE_DIMS..], pack(*w, *h));
+            st32(&mut desc[p + DEVICE_PLANE_BPR..], 64);
+            st16(&mut desc[p + DEVICE_PLANE_BPE..], *bpe);
+        }
+        assert!(state.set_mapping_device_desc(8, &desc));
+
+        let m = state.mappings.get(&8).expect("mapping");
+        assert_eq!(
+            type11_sample_window(m, 4, 2, MTL_FORMAT_R8_UNORM),
+            None,
+            "two planes match and neither is the answer, so nothing is bound"
+        );
+        // The wire index is the only thing that separates them, and it reaches
+        // each of the two directly.
+        assert_eq!(
+            type5_sample_window(m, 0, 4, 2, MTL_FORMAT_R8_UNORM).map(|w| w.0),
+            Some(512)
+        );
+        assert_eq!(
+            type5_sample_window(m, 2, 4, 2, MTL_FORMAT_R8_UNORM).map(|w| w.0),
+            Some(1536)
+        );
+        // An index past the plane count resolves nothing rather than falling
+        // back onto plane 0's bytes.
+        assert_eq!(type5_sample_window(m, 7, 4, 2, MTL_FORMAT_R8_UNORM), None);
+    }
+
     /// qemu-shim: guest page write IS the surface content (unified memory) —
     /// bytes land in pages and the generation advances; nothing else exists.
     #[test]
@@ -4656,7 +4665,6 @@ mod tests {
             let m = state.mappings.get(&mid).unwrap();
             type11_sample_window(
                 m,
-                mid,
                 4,
                 4,
                 crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM,

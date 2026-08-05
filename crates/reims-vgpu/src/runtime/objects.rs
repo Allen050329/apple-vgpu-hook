@@ -715,7 +715,7 @@ pub fn decode_type4_surface(desc: &[u8]) -> Option<Type4Surface> {
 ///
 /// Multi-plane: plane records from type-4 planes; sample path selects by
 /// geometry. Single-plane: surface-level fields only
-/// (`plane_count==0` path in `sample_window_prefer_device`).
+/// (`plane_count==0` path in `sample_window_from_device_desc`).
 fn synthesize_device_desc_from_type4(surf: &Type4Surface) -> Vec<u8> {
     let mut device_desc = vec![0u8; DEVICE_DESC_LEN];
     let multi = type4_is_multiplanar(surf);
@@ -758,8 +758,9 @@ fn synthesize_device_desc_from_type4(surf: &Type4Surface) -> Vec<u8> {
         st32(&mut device_desc[DEVICE_DESC_BPR..], surf.bytes_per_row);
     }
     if multi && surf.plane_count > 0 {
-        // Multi-plane: publish plane records; sample_window_prefer_device matches
-        // type-11 R8/RG8 binds by (w,h,bpe). Do not invent bases from format alone.
+        // Multi-plane: publish plane records; sample_window_from_device_desc
+        // matches type-11 R8/RG8 binds by (w,h,bpe), and declines when two
+        // planes share all three. Do not invent bases from format alone.
         let n = (surf.plane_count as usize).min(TYPE4_PLANE_CAP);
         device_desc[DEVICE_DESC_PLANE_COUNT] = n as u8;
         // Surface-level bpe: plane0 element size when wire provides it.
@@ -2123,7 +2124,8 @@ mod tests {
         let dev = synthesize_device_desc_from_type4(&s);
         assert_eq!(dev[DEVICE_DESC_PLANE_COUNT], 2);
         use crate::contract::iosurface_pages::{
-            decode_device_surface, sample_window_prefer_device, DEVICE_DESC_PIXEL_FORMAT,
+            decode_device_surface, mapping_span_bound, sample_window_from_device_desc,
+            DEVICE_DESC_PIXEL_FORMAT,
         };
         assert_eq!(
             ld32(&dev[DEVICE_DESC_PIXEL_FORMAT..]),
@@ -2133,7 +2135,7 @@ mod tests {
         assert_eq!(surf.plane_count, 2);
         assert_eq!(surf.alloc_size, 0x180000);
         // Type-11 Y plane: R8 1024×1024 matches plane0 (contract geometry key).
-        let y = sample_window_prefer_device(
+        let y = sample_window_from_device_desc(
             Some(&dev),
             None,
             crate::contract::pixel_format::MTL_FORMAT_R8_UNORM,
@@ -2143,9 +2145,8 @@ mod tests {
         .expect("Y window");
         assert_eq!(y.0, 0); // offset
         assert_eq!(y.1, 1024); // bpr
-        assert!(y.3); // from device
-                      // UV plane: RG8 half res.
-        let uv = sample_window_prefer_device(
+                               // UV plane: RG8 half res.
+        let uv = sample_window_from_device_desc(
             Some(&dev),
             None,
             crate::contract::pixel_format::MTL_FORMAT_RG8_UNORM,
@@ -2155,10 +2156,18 @@ mod tests {
         .expect("UV window");
         assert_eq!(uv.0, 1024 * 1024);
         assert_eq!(uv.1, 1024);
-        // BGRA invent of full 1024² must still reject (alloc < invent span).
-        assert!(sample_window_prefer_device(
+        // A full 1024² BGRA matches no plane record, so it binds nothing, and
+        // its page-sizing estimate still rejects on the wire allocation.
+        assert!(sample_window_from_device_desc(
             Some(&dev),
             None,
+            crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM,
+            1024,
+            1024,
+        )
+        .is_none());
+        assert!(mapping_span_bound(
+            Some(&dev),
             crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM,
             1024,
             1024,
@@ -3031,7 +3040,7 @@ mod tests {
     #[test]
     fn a_single_plane_backing_publishes_the_offset_its_pixels_start_at() {
         use crate::contract::iosurface_pages::{
-            decode_device_surface, sample_window_prefer_device,
+            decode_device_surface, sample_window_from_device_desc,
         };
         use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
         const BASE: u32 = 0x800;
@@ -3068,10 +3077,9 @@ mod tests {
 
         // The consumer, not just the field: the sample window must start at the
         // offset and its span must end past it, or publishing it bought nothing.
-        let (off, got_bpr, end, from_device) =
-            sample_window_prefer_device(Some(&desc), None, MTL_FORMAT_BGRA8_UNORM, w, h)
+        let (off, got_bpr, end) =
+            sample_window_from_device_desc(Some(&desc), None, MTL_FORMAT_BGRA8_UNORM, w, h)
                 .expect("surface-level window");
-        assert!(from_device, "the window must come from the descriptor");
         assert_eq!(off, BASE as u64);
         assert_eq!(got_bpr, bpr);
         assert_eq!(

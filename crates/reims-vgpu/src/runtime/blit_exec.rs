@@ -716,7 +716,7 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
             return Err(br(BlitStatus::Unsupported, "t11_fmt_bpp"));
         };
         let Some((surface_offset, surface_bpr, span_end)) =
-            mapping_write::type11_sample_window(m, mapping_id, tex_w, tex_h, format)
+            mapping_write::type11_sample_window(m, tex_w, tex_h, format)
         else {
             return Err(br(BlitStatus::Bounds, "t11_sample_window"));
         };
@@ -745,8 +745,8 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
     // by matching geometry and bytes-per-element and so cannot tell two planes
     // that share both apart. A biplanar COPY names exactly such a pair, so this
     // is the path where dropping the index lands. `type5_sample_window` states
-    // the case and `note_type5_plane_invent` reports the one way it can still go
-    // wrong.
+    // the case; a plane it cannot resolve declines here rather than binding
+    // whichever plane shares the geometry.
     if entry.object_type == objects::OBJECT_TYPE_REF_TEXTURE {
         if level != 0 || slice != 0 {
             return Err(br(BlitStatus::Unsupported, "t5_level_slice"));
@@ -782,47 +782,28 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
         let Some(bpp) = pixel_format::bytes_per_pixel(format) else {
             return Err(br(BlitStatus::Unsupported, "t5_fmt_bpp"));
         };
-        let Some((surface_offset, surface_bpr, span_end, from_device)) =
-            mapping_write::type5_sample_window(
-                m,
-                view.plane_index,
-                view.width,
-                view.height,
-                format,
-            )
-        else {
+        let Some((surface_offset, surface_bpr, span_end)) = mapping_write::type5_sample_window(
+            m,
+            view.plane_index,
+            view.width,
+            view.height,
+            format,
+        ) else {
             return Err(br(BlitStatus::Bounds, "t5_sample_window"));
         };
-        // Whether this arm runs at all, and on which side of the plane
-        // resolution. Without it a change to the window this arm resolves cannot
-        // be attributed: an unchanged screen and an arm that never executed look
-        // identical, and so do a repaired blit and a blit that never happened.
+        // Whether this arm runs at all. Without it a change to the window this
+        // arm resolves cannot be attributed: an unchanged screen and an arm that
+        // never executed look identical, and so do a repaired blit and a blit
+        // that never happened.
         //
         // Read on a driven x86/Vulkan boot (Safari window drag + two
-        // web-content-probe runs): **both counters 0** — this arm does not
-        // execute on that workload at all, while `blit_dest_bound` reads 26, so
-        // the blit path itself does run and it is the type-5 source that is
-        // absent. The plane-index resolution above is therefore contract
-        // fidelity, not a repair of anything this workload does, and a screen
-        // that looks the same after changing it says nothing either way. It also
-        // means this arm cannot be blamed for a display defect seen on a boot
-        // where these read zero, which is what they were added to establish.
-        crate::runtime::drain::note_store_route(if from_device {
-            "blit_t5_plane_device"
-        } else {
-            "blit_t5_plane_invent"
-        });
-        if !from_device {
-            mapping_write::note_type5_plane_invent(
-                sid,
-                view.plane_index,
-                view.width,
-                view.height,
-                format,
-                (surface_offset, surface_bpr),
-                "blit_texture",
-            );
-        }
+        // web-content-probe runs): **0** — this arm does not execute on that
+        // workload at all, while `blit_dest_bound` reads 26, so the blit path
+        // itself does run and it is the type-5 source that is absent. The
+        // plane-index resolution above is therefore contract fidelity, not a
+        // repair of anything this workload does, and a screen that looks the
+        // same after changing it says nothing either way.
+        crate::runtime::drain::note_store_route("blit_t5_plane_device");
         return Ok(TextureBacking::Type11(Type11Texture {
             mapping_id: sid,
             width: view.width,
@@ -4088,14 +4069,13 @@ mod tests {
             .device_desc = desc;
 
         // The scan is genuinely ambiguous on this descriptor: without the index
-        // it lands on the invent, which is what this test exists to exclude.
+        // it resolves nothing at all, which is what this test exists to exclude.
         let ambiguous = {
             let m = state.mappings.get(&mapping_id).unwrap();
-            mapping_write::type11_sample_window(m, mapping_id, w, h, MTL_FORMAT_R8_UNORM)
+            mapping_write::type11_sample_window(m, w, h, MTL_FORMAT_R8_UNORM)
         };
-        assert_eq!(
-            ambiguous.map(|(off, _, _)| off),
-            Some(0),
+        assert!(
+            ambiguous.is_none(),
             "fixture must be ambiguous by geometry, or it proves nothing"
         );
         // Sanity: plane 1 is a different geometry, so the ambiguity is between
@@ -4104,14 +4084,14 @@ mod tests {
             let m = state.mappings.get(&mapping_id).unwrap();
             mapping_write::type5_sample_window(m, 1, 4, 2, MTL_FORMAT_RG8_UNORM)
         };
-        assert_eq!(uv.map(|(off, _, _, dev)| (off, dev)), Some((64, true)));
+        assert_eq!(uv.map(|(off, _, _)| off), Some(64));
 
         let backing = resolve_texture_backing(&mut state, &mut host, 1, obj_ref, 0, 0)
             .expect("type-5 blit source must resolve");
         match backing {
             TextureBacking::Type11(t) => assert_eq!(
                 t.surface_offset, ALPHA_OFFSET as u64,
-                "the wire named plane 2; offset 0 is plane 0's invented window"
+                "the wire named plane 2, and only the wire index can reach it"
             ),
             TextureBacking::Linear(_) => panic!("expected Type11 backing, got Linear"),
         }

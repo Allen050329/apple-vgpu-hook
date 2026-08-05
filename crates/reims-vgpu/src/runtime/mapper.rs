@@ -7,8 +7,8 @@
 
 use crate::contract::iosurface_pages::{
     self, build_table_plan, decode_device_surface, decode_mapper_request_entry, guest_kernel_va,
-    mapper_request_published_entry_offset, read_internal_desc_ptr, read_mapper_identity,
-    read_mapper_internal, sample_window_prefer_device, validate_mapper_internal, PagesMemory,
+    mapper_request_published_entry_offset, mapping_span_bound, read_internal_desc_ptr,
+    read_mapper_identity, read_mapper_internal, validate_mapper_internal, PagesMemory,
     DEVICE_DESC_LEN, MAPPER_CAPTURE_REG_MAPPER_DEVICE, MAPPER_CAPTURE_REG_MAPPING_INTERNAL,
     MAPPER_CAPTURE_REG_REQUEST_TYPE, MAPPER_REQUEST_ENTRY_LEN, MAPPER_REQUEST_MAP,
     MAPPER_REQUEST_UNMAP,
@@ -439,7 +439,7 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
     }
 
     // Geometry from device descriptor when present; cache full 0x200 for
-    // biplanar plane selection (sample_window_prefer_device).
+    // biplanar plane selection (mapping_span_bound).
     let mut width = 0u32;
     let mut height = 0u32;
     let mut format = 0u16;
@@ -479,9 +479,7 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
                         // `objects::device_desc_format_to_mtl`.
                         format =
                             crate::runtime::objects::device_desc_format_to_mtl(surf.pixel_format);
-                        if let Some((_, _, end, _)) =
-                            sample_window_prefer_device(Some(&desc), None, format, width, height)
-                        {
+                        if let Some(end) = mapping_span_bound(Some(&desc), format, width, height) {
                             min_size = min_size.max(end).max(guest_page);
                         }
                     }
@@ -521,9 +519,7 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
                     None
                 }
             });
-            if let Some((_, _, end, _)) =
-                sample_window_prefer_device(desc_slice, None, format, width, height)
-            {
+            if let Some(end) = mapping_span_bound(desc_slice, format, width, height) {
                 min_size = min_size.max(end).max(guest_page);
             }
         }
@@ -972,13 +968,12 @@ pub fn pages_cover_geom(state: &DeviceState, mapping_id: u32) -> bool {
         // Match scanout/writeback default when format not latched.
         crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM
     };
-    let Some((_, _, span_end, _)) = sample_window_prefer_device(
+    let Some(span_end) = mapping_span_bound(
         if m.device_desc.len() >= DEVICE_DESC_LEN {
             Some(m.device_desc.as_slice())
         } else {
             None
         },
-        None,
         format,
         m.width,
         m.height,
@@ -3979,12 +3974,13 @@ mod tests {
     /// A page table cannot make a window the guest's own allocation does not
     /// contain, however many pages it holds.
     ///
-    /// `sample_window_prefer_device` refuses when the invented packed span runs
-    /// past `device_desc.alloc_size` — that refusal is the only place the wire
-    /// allocation bounds the window. This case is the one where a caller could
-    /// answer it by calling `sample_window` directly and getting the rejected
-    /// span back: the descriptor says 1.5 MiB, the packed 1024² BGRA window is
-    /// 4 MiB, and the table is deliberately sized to cover the 4 MiB. Falling
+    /// `mapping_span_bound` refuses when the estimated packed span runs past
+    /// `device_desc.alloc_size` — that refusal is the only place the wire
+    /// allocation bounds the span. This case is the one where a caller could
+    /// answer it by calling `packed_span_estimate` directly and getting the
+    /// rejected span back: the descriptor says 1.5 MiB, the packed 1024² BGRA
+    /// window is 4 MiB, and the table is deliberately sized to cover the 4 MiB.
+    /// Falling
     /// back would report "covered" for a surface whose own descriptor says it is
     /// a third of that size.
     #[test]

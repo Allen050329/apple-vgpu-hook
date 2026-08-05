@@ -835,8 +835,7 @@ fn paint_mapping<M: HostMemory + crate::runtime::host::HostOps>(
         return fail(CaptureDecline::TightRowUnknown { format });
     };
     // Same sample window as writeback (device descriptor base/bpr when present).
-    let Some((base_off, bpr_u32, span_end)) = type11_sample_window(m, mapping_id, mw, mh, format)
-    else {
+    let Some((base_off, bpr_u32, span_end)) = type11_sample_window(m, mw, mh, format) else {
         return fail(CaptureDecline::NoSampleWindow);
     };
     let bpr = bpr_u32 as usize;

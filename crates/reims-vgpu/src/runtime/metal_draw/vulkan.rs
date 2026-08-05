@@ -1833,19 +1833,17 @@ pub(super) fn load_type5_view_rgba<M: HostMemory + HostOps>(
     let Some(bpp) = pixel_format::bytes_per_pixel(view.pixel_format) else {
         return fail(Type5ViewDecline::FormatBpp);
     };
-    let (base_off, surface_bpr, span_end, pages_n, base_w, base_h, base_fmt, map_gen, from_device) = {
+    let (base_off, surface_bpr, span_end, pages_n, base_w, base_h, base_fmt, map_gen) = {
         let Some(m) = state.mappings.get(&mapping_id) else {
             return fail(Type5ViewDecline::NoMapping);
         };
-        let Some((base_off, surface_bpr, span_end, from_device)) =
-            mapping_write::type5_sample_window(
-                m,
-                view.plane_index,
-                view.width,
-                view.height,
-                view.pixel_format,
-            )
-        else {
+        let Some((base_off, surface_bpr, span_end)) = mapping_write::type5_sample_window(
+            m,
+            view.plane_index,
+            view.width,
+            view.height,
+            view.pixel_format,
+        ) else {
             let desc =
                 crate::contract::iosurface_pages::decode_device_surface(&m.device_desc).map(|d| {
                     (
@@ -1872,23 +1870,8 @@ pub(super) fn load_type5_view_rgba<M: HostMemory + HostOps>(
             m.height,
             m.format,
             m.map_generation,
-            from_device,
         )
     };
-    // This path binds whatever window came back, invented or not — the per-bind
-    // `invent=` echo below is behind `REIMS_VGPU_DRAW_LOG`, so on a normal boot a
-    // wrong-plane bind here would be silent.
-    if !from_device {
-        mapping_write::note_type5_plane_invent(
-            mapping_id,
-            view.plane_index,
-            view.width,
-            view.height,
-            view.pixel_format,
-            (base_off, surface_bpr),
-            "type5_draw_view",
-        );
-    }
     let page_bytes = (pages_n as u64).saturating_mul(1u64 << state.page_shift);
     if page_bytes < span_end {
         return fail(Type5ViewDecline::Span {
@@ -1971,11 +1954,10 @@ pub(super) fn load_type5_view_rgba<M: HostMemory + HostOps>(
         }
         let (nz, max, _) = crate::observe::rgba_rgb_stats(rgba);
         crate::observe::line(format!(
-            "type5_draw_view ok task={task_id} ref={texture_ref} sid={mapping_id} map_gen={map_gen} view={}x{} fmt={:#x} bpp={bpp} base={base_w}x{base_h} base_fmt={base_fmt:#x} off={base_off} bpr={surface_bpr} span_end={span_end} invent={} src={generation_source} rgb_nz={nz} max_rgb={max}",
+            "type5_draw_view ok task={task_id} ref={texture_ref} sid={mapping_id} map_gen={map_gen} view={}x{} fmt={:#x} bpp={bpp} base={base_w}x{base_h} base_fmt={base_fmt:#x} off={base_off} bpr={surface_bpr} span_end={span_end} src={generation_source} rgb_nz={nz} max_rgb={max}",
             view.width,
             view.height,
             view.pixel_format,
-            (!from_device) as u8
         ));
     };
     if let Some(m) = state.type5_view_memo.get_touch(&memo_key) {
@@ -2535,7 +2517,7 @@ pub(super) fn try_type11_sample_zero_copy<M: HostMemory + HostOps>(
             }
             _ => return None,
         };
-        let (base_off, bpr_u32, _span_end) = type11_sample_window(m, mid, w, h, format)?;
+        let (base_off, bpr_u32, _span_end) = type11_sample_window(m, w, h, format)?;
         (native, base_off, bpr_u32 as u64)
     };
     // From the layout the translation chose, as the type-5 rail does, so the
@@ -2619,14 +2601,8 @@ fn try_type5_sample_zero_copy<M: HostMemory + HostOps>(
             }
             Err(_) => return None,
         };
-        // Only a real device-descriptor plane window rides zero copy; the
-        // invented packed fallback over a stale multiplanar mapping (menu-strip
-        // residual class) stays on the CPU path.
-        let (base_off, bpr_u32, _span_end, from_device) =
+        let (base_off, bpr_u32, _span_end) =
             type5_sample_window(m, view.plane_index, w, h, view.pixel_format)?;
-        if !from_device {
-            return None;
-        }
         (native, bpp, base_off, bpr_u32 as u64)
     };
     let (span, row_length_texels) = strided_window_extent(w, h, bpp as u64, bpr)?;
@@ -5901,7 +5877,7 @@ fn guest_write_site<M: HostOps>(
         pixel_format::MTL_FORMAT_BGRA8_UNORM
     };
     let Some((base_off, _bpr, span_end)) =
-        crate::runtime::mapping_write::type11_sample_window(m, mapping_id, width, height, format)
+        crate::runtime::mapping_write::type11_sample_window(m, width, height, format)
     else {
         return GuestWriteSite::Unknown;
     };
@@ -6373,7 +6349,7 @@ fn surface_store_defer_eligible(
     // is going to be refused just moves the refusal somewhere it reads as a
     // lost flush, so gate on the same thing up front.
     let (surface_offset, surface_bpr, span_end) =
-        crate::runtime::mapping_write::type11_sample_window(m, c0.mapping_id, w, h, c0.format)?;
+        crate::runtime::mapping_write::type11_sample_window(m, w, h, c0.format)?;
     Some(crate::model::ComputeStorageResidencyKey {
         mapping_id: c0.mapping_id,
         map_generation: m.map_generation,

@@ -1700,44 +1700,33 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
         // plane is decided, not inferred. Type-11 carries no such field and must
         // still match a plane record by geometry — which is ambiguous whenever
         // two planes share dims and bytes-per-element (v0a8 Y and alpha), and
-        // resolves to the invented packed window over plane 0 or to nothing at
-        // all. The draw path already binds type-5 views by index; this is the
-        // same resolution on the staging path.
+        // declines rather than picking one. The draw path already binds type-5
+        // views by index; this is the same resolution on the staging path.
         let window = match type5_record {
             Some(rec) => {
                 mapping_write::type5_sample_window(m, rec.plane_index, width, height, stage_fmt)
-                    .map(|(offset, bpr, end, from_device)| {
-                        if !from_device {
-                            mapping_write::note_type5_plane_invent(
-                                mapping_id,
-                                rec.plane_index,
-                                width,
-                                height,
-                                stage_fmt,
-                                (offset, bpr),
-                                "compute_stage_tex",
-                            );
-                        }
-                        (offset, bpr, end)
-                    })
             }
-            None => mapping_write::type11_sample_window(m, mapping_id, width, height, stage_fmt),
+            None => mapping_write::type11_sample_window(m, width, height, stage_fmt),
         };
         let (surface_offset, surface_bpr, span_end) = match window {
             Some(w) => w,
             None => {
-                // Measure type4_len_vs_plane: which window path rejected (device bpr vs invent span).
+                // What the descriptor said, so a refusal names which of its
+                // fields the texture could not be placed against. `reach` is the
+                // byte count this geometry needs; a descriptor whose alloc is
+                // smaller is a different failure from one whose plane records
+                // matched nothing.
                 let ds = crate::contract::iosurface_pages::decode_device_surface(&m.device_desc);
                 let (dw, dh, dbpr, dalloc) = ds
                     .as_ref()
                     .map(|s| (s.width, s.height, s.bytes_per_row, s.alloc_size))
                     .unwrap_or((0, 0, 0, 0));
-                let invent_end =
-                    crate::contract::iosurface_pages::sample_window(0, stage_fmt, width, height)
-                        .map(|(_, _, e)| e)
-                        .unwrap_or(0);
+                let reach = crate::contract::iosurface_pages::packed_span_estimate(
+                    stage_fmt, width, height,
+                )
+                .unwrap_or(0);
                 crate::observe::fail(format!(
-                    "compute_stage_tex type11_fail reason=window mapping={mapping_id} {width}x{height} fmt={stage_fmt:#x} pages={pages_n} wire_len={wire_len} desc={dw}x{dh} bpr={dbpr} alloc={dalloc} invent_end={invent_end}"
+                    "compute_stage_tex type11_fail reason=window mapping={mapping_id} {width}x{height} fmt={stage_fmt:#x} pages={pages_n} wire_len={wire_len} desc={dw}x{dh} bpr={dbpr} alloc={dalloc} reach={reach}"
                 ));
                 return Err(ComputeStatus::MissingTexture(
                     "compute_stage_tex_type11_window",

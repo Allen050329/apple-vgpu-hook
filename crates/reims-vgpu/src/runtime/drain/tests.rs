@@ -3974,7 +3974,6 @@ fn a_completion_stamp_lands_a_type11_render_window_in_guest_memory() {
         let m = state.mappings.get(&9).unwrap();
         crate::runtime::mapping_write::type11_sample_window(
             m,
-            9,
             4,
             4,
             crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM,
