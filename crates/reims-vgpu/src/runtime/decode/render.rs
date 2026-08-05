@@ -49,20 +49,14 @@ pub const DRAW_COMPACT_CMD_LEN: usize = OP_HEADER_LEN + DRAW_COMPACT_PAYLOAD_LEN
 /// reason. These were eight literals with a note beside them saying to prefer
 /// `wire::EXECUTE_COMMANDS_*_TOTAL_LEN` at new call sites — which leaves the old
 /// sites reading a second transcription, and a note is not a mechanism.
-pub const EXECUTE_INDIRECT_CMD_LEN: usize = wire::EXECUTE_COMMANDS_INDIRECT_TOTAL_LEN as usize;
-pub const EXECUTE_RANGE_CMD_LEN: usize = wire::EXECUTE_COMMANDS_RANGE_TOTAL_LEN as usize;
-pub const EXECUTE_INDIRECT_COMMAND_BUFFER_REF: usize =
-    core::mem::offset_of!(wire::ExecuteCommandsIndirect, icb_ref);
-pub const EXECUTE_INDIRECT_BUFFER_REF: usize =
-    core::mem::offset_of!(wire::ExecuteCommandsIndirect, indirect_buffer_ref);
-pub const EXECUTE_INDIRECT_BUFFER_OFFSET: usize =
-    core::mem::offset_of!(wire::ExecuteCommandsIndirect, indirect_buffer_offset);
-pub const EXECUTE_RANGE_COMMAND_BUFFER_REF: usize =
-    core::mem::offset_of!(wire::ExecuteCommandsRange, icb_ref);
-pub const EXECUTE_RANGE_LOCATION: usize =
-    core::mem::offset_of!(wire::ExecuteCommandsRange, range_location);
-pub const EXECUTE_RANGE_LENGTH: usize =
-    core::mem::offset_of!(wire::ExecuteCommandsRange, range_length);
+#[cfg(test)]
+pub(crate) const EXECUTE_INDIRECT_CMD_LEN: usize = wire::EXECUTE_COMMANDS_INDIRECT_TOTAL_LEN as usize;
+#[cfg(test)]
+pub(crate) const EXECUTE_RANGE_CMD_LEN: usize = wire::EXECUTE_COMMANDS_RANGE_TOTAL_LEN as usize;
+// The two records' *field* offsets are not named here at all: both arms decode
+// through `wire::execute_commands_indirect` / `_range` and read the fields off
+// the view, so an offset beside them would be a name for something no code
+// asks. The lengths above stay because the arms length-check before viewing.
 
 /// Render-pass attachment layout, taken from the wire structs' own fields.
 ///
@@ -78,28 +72,38 @@ pub const EXECUTE_RANGE_LENGTH: usize =
 /// bodies rather than hand-loading fields; `level` is sixteen bits with `slice`
 /// immediately above it (a former product colour-arm u32 load swallowed the
 /// slice).
-pub const PASS_DEPTH_ATTACH_OFF: usize = 0x00;
+#[cfg(test)]
+pub(crate) const PASS_DEPTH_ATTACH_OFF: usize = 0x00;
 pub const PASS_STENCIL_ATTACH_OFF: usize = core::mem::size_of::<wire_pass::DepthAttachmentBody>();
 pub const PASS_COLOR_ATTACH_OFF: usize =
     PASS_STENCIL_ATTACH_OFF + core::mem::size_of::<wire_pass::StencilAttachmentBody>();
 pub const PASS_COLOR_ATTACH_STRIDE: usize = core::mem::size_of::<wire_pass::ColorAttachmentBody>();
-pub const PASS_ATTACH_TEXREF: usize =
+#[cfg(test)]
+pub(crate) const PASS_ATTACH_TEXREF: usize =
     core::mem::offset_of!(wire_pass::AttachmentPrefix, texture_ref);
-pub const PASS_ATTACH_RESOLVEREF: usize =
+#[cfg(test)]
+pub(crate) const PASS_ATTACH_RESOLVEREF: usize =
     core::mem::offset_of!(wire_pass::AttachmentPrefix, resolve_texture_ref);
 pub const PASS_ATTACH_LEVEL: usize = core::mem::offset_of!(wire_pass::AttachmentPrefix, level);
-pub const PASS_ATTACH_SLICE: usize = core::mem::offset_of!(wire_pass::AttachmentPrefix, slice);
-pub const PASS_ATTACH_DEPTH_PLANE: usize =
+#[cfg(test)]
+pub(crate) const PASS_ATTACH_SLICE: usize = core::mem::offset_of!(wire_pass::AttachmentPrefix, slice);
+#[cfg(test)]
+pub(crate) const PASS_ATTACH_DEPTH_PLANE: usize =
     core::mem::offset_of!(wire_pass::AttachmentPrefix, depth_plane);
-pub const PASS_ATTACH_LOAD_ACTION: usize =
+#[cfg(test)]
+pub(crate) const PASS_ATTACH_LOAD_ACTION: usize =
     core::mem::offset_of!(wire_pass::AttachmentPrefix, load_action);
-pub const PASS_ATTACH_STORE_ACTION: usize =
+#[cfg(test)]
+pub(crate) const PASS_ATTACH_STORE_ACTION: usize =
     core::mem::offset_of!(wire_pass::AttachmentPrefix, store_action);
-pub const PASS_ATTACH_CLEAR_COLOR: usize =
+#[cfg(test)]
+pub(crate) const PASS_ATTACH_CLEAR_COLOR: usize =
     core::mem::offset_of!(wire_pass::ColorAttachmentBody, clear_color_bits);
-pub const PASS_DEPTH_ATTACH_CLEAR_DEPTH: usize =
+#[cfg(test)]
+pub(crate) const PASS_DEPTH_ATTACH_CLEAR_DEPTH: usize =
     core::mem::offset_of!(wire_pass::DepthAttachmentBody, clear_depth_bits);
-pub const PASS_STENCIL_ATTACH_CLEAR_STENCIL: usize =
+#[cfg(test)]
+pub(crate) const PASS_STENCIL_ATTACH_CLEAR_STENCIL: usize =
     core::mem::offset_of!(wire_pass::StencilAttachmentBody, clear_stencil);
 pub const PASS_MAX_COLOR_ATTACHMENTS: usize = wire_pass::RENDER_PASS_COLOR_ATTACHMENTS;
 
@@ -109,12 +113,17 @@ pub const PASS_MAX_COLOR_ATTACHMENTS: usize = wire_pass::RENDER_PASS_COLOR_ATTAC
 /// explicit statement about the pass's extent and its occlusion query buffer,
 /// and none of them can be recovered from the attachments: a guest may bind a
 /// 4096-wide texture and ask for a 640-wide pass.
-pub const PASS_TAIL_OFF: usize =
+#[cfg(test)]
+pub(crate) const PASS_TAIL_OFF: usize =
     PASS_COLOR_ATTACH_OFF + PASS_MAX_COLOR_ATTACHMENTS * PASS_COLOR_ATTACH_STRIDE;
-pub const PASS_TAIL_VISIBILITY_BUFFER_REF: usize = 0x00;
-pub const PASS_TAIL_ARRAY_LENGTH: usize = 0x04;
-pub const PASS_TAIL_TARGET_WIDTH: usize = 0x0c;
-pub const PASS_TAIL_TARGET_HEIGHT: usize = 0x14;
+#[cfg(test)]
+pub(crate) const PASS_TAIL_VISIBILITY_BUFFER_REF: usize = 0x00;
+#[cfg(test)]
+pub(crate) const PASS_TAIL_ARRAY_LENGTH: usize = 0x04;
+#[cfg(test)]
+pub(crate) const PASS_TAIL_TARGET_WIDTH: usize = 0x0c;
+#[cfg(test)]
+pub(crate) const PASS_TAIL_TARGET_HEIGHT: usize = 0x14;
 pub const PASS_LOAD_ACTION_DONT_CARE: u16 = 0;
 pub const PASS_LOAD_ACTION_LOAD: u16 = 1;
 pub const PASS_LOAD_ACTION_CLEAR: u16 = 2;
@@ -127,27 +136,33 @@ pub const SCISSOR_RECTS_COUNT_LEN: usize = core::mem::size_of::<wire::SetScissor
 /// Bytes one LOD-bearing sampler entry occupies: ref, then two `f32` clamps.
 pub const SAMPLER_LOD_BIND_ENTRY_SIZE: usize = core::mem::size_of::<wire::SamplerLodBind>();
 /// Count width of `setViewports:count:` — four bytes (see [`SCISSOR_RECTS_COUNT_LEN`]).
-pub const VIEWPORTS_COUNT_LEN: usize = core::mem::size_of::<wire::SetViewports>();
+#[cfg(test)]
+pub(crate) const VIEWPORTS_COUNT_LEN: usize = core::mem::size_of::<wire::SetViewports>();
 
 /// Residency record head: `count:u32` at `+0` on both forms.
 ///
 /// Wire opcodes are `wire::OPCODE_USE_HEAP` (`0x1b`) and
 /// `wire::OPCODE_USE_RESOURCE` (`0x89`); the old `0x86`/`0x87` pair is not
 /// residency (see `the_residency_opcodes_are_the_ones_apples_serializer_writes`).
-pub const RESIDENCY_COUNT: usize = core::mem::offset_of!(wire::UseResource, count);
+#[cfg(test)]
+pub(crate) const RESIDENCY_COUNT: usize = core::mem::offset_of!(wire::UseResource, count);
 /// `useResource:` packs `usage` and `stages` into the word at `+4` as two
 /// `u16`s, so its refs begin at `+8` — the size of the head the view declares.
-pub const USE_RESOURCE_REFS: usize = core::mem::size_of::<wire::UseResource>();
+#[cfg(test)]
+pub(crate) const USE_RESOURCE_REFS: usize = core::mem::size_of::<wire::UseResource>();
 /// `useHeap:` has no `usage` at all: `stages` sits alone at `+4` as a `u16` and
 /// the refs begin at `+6`. That offset is deliberately not a multiple of four —
 /// reading this record with the resource record's layout skips the first heap.
 /// Two heads that differ by one field is exactly the pair that must not be two
 /// numbers here, so both are the view's own size.
-pub const USE_HEAP_REFS: usize = core::mem::size_of::<wire::UseHeap>();
+#[cfg(test)]
+pub(crate) const USE_HEAP_REFS: usize = core::mem::size_of::<wire::UseHeap>();
 
 /// Multi-entry bind header: `first:u32 @0`, `count:u32 @4`, entries after it.
-pub const BIND_FIRST: usize = core::mem::offset_of!(wire::BindHeader, first);
-pub const BIND_COUNT: usize = core::mem::offset_of!(wire::BindHeader, count);
+#[cfg(test)]
+pub(crate) const BIND_FIRST: usize = core::mem::offset_of!(wire::BindHeader, first);
+#[cfg(test)]
+pub(crate) const BIND_COUNT: usize = core::mem::offset_of!(wire::BindHeader, count);
 pub const BIND_ENTRIES: usize = core::mem::size_of::<wire::BindHeader>();
 pub const BUFFER_BIND_ENTRY_SIZE: usize = core::mem::size_of::<wire::BufferBind>();
 /// The same entry with a `u64` attribute stride appended. See
@@ -155,10 +170,10 @@ pub const BUFFER_BIND_ENTRY_SIZE: usize = core::mem::size_of::<wire::BufferBind>
 pub const BUFFER_STRIDE_BIND_ENTRY_SIZE: usize = core::mem::size_of::<wire::BufferStrideBind>();
 /// `setVertexAmplificationCount:viewMappings:`: a four-byte count, then one
 /// `MTLVertexAmplificationViewMapping` (two `u32`) per view.
-pub const AMPLIFICATION_COUNT_LEN: usize = core::mem::size_of::<wire::VertexAmplificationHeader>();
-pub const AMPLIFICATION_MAPPING_SIZE: usize = core::mem::size_of::<wire::ViewMapping>();
-pub const BUFFER_BIND_ENTRY_REF: usize = core::mem::offset_of!(wire::BufferBind, buffer_ref);
-pub const BUFFER_BIND_ENTRY_OFFSET: usize = core::mem::offset_of!(wire::BufferBind, offset);
+#[cfg(test)]
+pub(crate) const AMPLIFICATION_COUNT_LEN: usize = core::mem::size_of::<wire::VertexAmplificationHeader>();
+#[cfg(test)]
+pub(crate) const AMPLIFICATION_MAPPING_SIZE: usize = core::mem::size_of::<wire::ViewMapping>();
 pub const REF_BIND_ENTRY_SIZE: usize = core::mem::size_of::<wire::RefBind>();
 
 /// Bytes a bind record needs for `count` entries of `entry_size`, or `None` if
@@ -182,15 +197,16 @@ pub fn bind_record_len(count: u32, entry_size: usize) -> Option<usize> {
         .and_then(|n| n.checked_add(BIND_ENTRIES))
 }
 /// set*BufferOffset: index:u32 @0, offset:u64 @4 (payload 12; full cmd 0x14).
-pub const BUFFER_OFFSET_INDEX: usize = core::mem::offset_of!(wire::BufferOffset, index);
-pub const BUFFER_OFFSET_VALUE: usize = core::mem::offset_of!(wire::BufferOffset, offset);
-pub const BUFFER_OFFSET_PAYLOAD_LEN: usize = core::mem::size_of::<wire::BufferOffset>();
-/// setScissorRect: the four `u64` fields of one scissor rectangle.
-pub const SCISSOR_X: usize = core::mem::offset_of!(wire::ScissorRect, x);
-pub const SCISSOR_Y: usize = core::mem::offset_of!(wire::ScissorRect, y);
-pub const SCISSOR_WIDTH: usize = core::mem::offset_of!(wire::ScissorRect, width);
-pub const SCISSOR_HEIGHT: usize = core::mem::offset_of!(wire::ScissorRect, height);
-pub const SCISSOR_PAYLOAD_LEN: usize = core::mem::size_of::<wire::ScissorRect>();
+#[cfg(test)]
+pub(crate) const BUFFER_OFFSET_INDEX: usize = core::mem::offset_of!(wire::BufferOffset, index);
+#[cfg(test)]
+pub(crate) const BUFFER_OFFSET_VALUE: usize = core::mem::offset_of!(wire::BufferOffset, offset);
+#[cfg(test)]
+pub(crate) const BUFFER_OFFSET_PAYLOAD_LEN: usize = core::mem::size_of::<wire::BufferOffset>();
+/// One scissor rectangle's extent. Its four fields are not named here: both
+/// scissor arms read them off `wire::ScissorRect` through the view.
+#[cfg(test)]
+pub(crate) const SCISSOR_PAYLOAD_LEN: usize = core::mem::size_of::<wire::ScissorRect>();
 
 // Supported window is the full C-accepted encoder range 0x00..=0x98 minus rejected.
 
