@@ -1307,10 +1307,16 @@ fn handle_render_record<M: HostMemory + HostOps>(
             //
             // A healthy zero: `setRenderPipelineState:` takes a non-null
             // pipeline, so Apple's serializer has no reason to emit this record
-            // with ref 0 and it is expected never to fire. That is what makes
-            // applying the decoded value safe — on a stream that never sends it,
-            // the two behaviors are identical — and it is why a firing is worth a
-            // line rather than a silent drop.
+            // with ref 0. That is what makes applying the decoded value safe — on
+            // a stream that never sends it, the two behaviors are identical — and
+            // it is why a firing is worth a line rather than a silent drop.
+            //
+            // Measured zero on a driven x86/PCI boot (Ventura guest, 25 s Safari
+            // window drag, ~500 host-window draws), which is the reading that
+            // makes this arm's removal of the old `if cmd.pipeline_ref != 0`
+            // guard inert on that workload rather than merely argued. One boot on
+            // one pathway: it does not prove the arm never fires, it says the
+            // desktop compositor does not take it.
             if cmd.pipeline_ref == 0 && crate::observe::first_sight("render_set_pipeline_zero", 0) {
                 crate::observe::fail(
                     "stream_set_pipeline reason=render_set_pipeline_zero_ref \
