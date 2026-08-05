@@ -19,7 +19,7 @@ those four `bool`s and the compiler objects to none of them. Every commit this
 script was written out of found the same shape, and in each the type that should
 have travelled was already declared somewhere in the crate.
 
-Two report classes.
+Three report classes.
 
 ### A type built out of the parameters passed to build it
 
@@ -82,11 +82,12 @@ The report points at code; it does not convict it.
 - **The enum arm carries genuinely unrelated values.** Two literals that happen
   to share an arm are not a flattened type. Look for the same arity in every arm
   and a struct built immediately after the `match`.
-
-- **The run mirrors an API this code does not own.** See the `compute_core`
-  case above. A run that reproduces an SDK call's parameter list is contract
-  fidelity; grouping it would put a translation step between the decoded values
-  and the call that consumes them.
+- **The run mirrors an API this code does not own, *and arrives loose*.** A run
+  reproducing an SDK call's parameter list is contract fidelity, and grouping it
+  would put a translation step between the decoded values and the call that
+  consumes them. Both halves are required: `compute_core` satisfies the first
+  and fails the second, which is why it is a standing finding below rather than
+  an example here.
 
 The class that is always worth fixing is the last one: **callers that all hold
 the same source value and spell its fields out**. Grep the call sites before
@@ -106,7 +107,6 @@ Recorded so the next reader starts from the triage rather than the raw report.
 - **`translate::blend::state`** — *done*. Two triples where a half-swap returns
   `Ok` with the wrong channels blended, so there is nothing for the fail
   channel to say. Now takes the decoded `&PipelineColorAttachment`.
-
 - **The compute dispatch dimensions** — open, and a correction to this file's
   own earlier triage. `compute_core` and `compute_encode_on_encoder` were
   called SDK mirrors here because `grid_x, grid_y, grid_z, tg_x, tg_y, tg_z`
