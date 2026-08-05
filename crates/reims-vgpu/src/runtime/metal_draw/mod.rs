@@ -1095,7 +1095,7 @@ fn load_index_bytes_reason<M: HostMemory + HostOps>(
     }
     let entry = objects::lookup_list_entry(state, host, task_id, info.index_buffer_ref)
         .ok_or(R::EntryMissing)?;
-    if entry.object_type != 1 {
+    if entry.object_type != OBJECT_TYPE_BUFFER {
         return Err(R::ObjectType);
     }
     let desc_bytes = objects::read_descriptor(state, host, task_id, &entry).ok_or(R::DescRead)?;
