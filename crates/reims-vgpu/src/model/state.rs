@@ -1743,6 +1743,29 @@ pub struct DeviceState {
     pub pending: PendingWork,
     pub child_rings: [ChannelRing; MAX_CHANNELS],
     pub tasks: [TaskEntry; MAX_TASKS],
+    /// Highest task id and mapping id the guest has ever named, whether or not
+    /// the slot table could hold it.
+    ///
+    /// The reach census for [`MAX_TASKS`] and [`MAX_MAPPINGS`], and it exists
+    /// because those two are the only bounds left in this device that hard-refuse
+    /// a guest call without a derivation behind the number. A task id is a full
+    /// `u32` on the wire — `decode_replace_physical` and the resource-list
+    /// commands all read it with `ld32` — so nothing in the protocol says 256,
+    /// and past it `define_task` returns `false` and the task never exists.
+    ///
+    /// The refusal counters (`model_define_task_id_range` and friends) cannot
+    /// answer whether that is close: a boot where the guest stops at id 12 and
+    /// one where it stops at id 255 both report zero refusals, and only one of
+    /// them says the bound has room. That is the same rule the bind tables'
+    /// `reach_route` bands follow, and the same reason. Read these two together
+    /// with the refusal counters, never instead of them.
+    ///
+    /// Recorded before the bound is applied, so a refused id still moves the
+    /// mark — a high-water figure that only counted ids we accepted would be
+    /// capped by the very bound it is measuring.
+    pub max_task_id_seen: u32,
+    /// See [`Self::max_task_id_seen`].
+    pub max_mapping_id_seen: u32,
     /// Count of MapMemory2/UnmapMemory packets (measure census).
     pub map_family_events: u64,
     /// Live object refs per task, as `(task_id, ref)`.
@@ -2053,6 +2076,8 @@ impl DeviceState {
             present_translation_hold_mask: 0,
             pending: PendingWork::default(),
             child_rings: std::array::from_fn(|_| ChannelRing::default()),
+            max_task_id_seen: 0,
+            max_mapping_id_seen: 0,
             tasks: std::array::from_fn(|_| TaskEntry::default()),
             map_family_events: 0,
             objects: std::collections::BTreeSet::new(),
@@ -2495,6 +2520,7 @@ impl DeviceState {
     }
 
     pub fn define_task(&mut self, task_id: u32, length: u64, directory_pfn: u32) -> bool {
+        self.max_task_id_seen = self.max_task_id_seen.max(task_id);
         if task_id as usize >= MAX_TASKS {
             StateMutationDecline::DefineTaskIdRange { task_id }.emit(u64::from(task_id));
             return false;
@@ -2535,6 +2561,7 @@ impl DeviceState {
     /// PVG `CmdDeleteTask` (op `0x20`): drop task directory + object list entries.
     /// Guest reuses task ids; leaving stale active tasks corrupts GVA walks.
     pub fn delete_task(&mut self, task_id: u32) -> bool {
+        self.max_task_id_seen = self.max_task_id_seen.max(task_id);
         if task_id as usize >= MAX_TASKS {
             StateMutationDecline::DeleteTaskIdRange { task_id }.emit(u64::from(task_id));
             return false;
@@ -2568,6 +2595,7 @@ impl DeviceState {
     }
 
     pub fn set_object_list(&mut self, task_id: u32, pfn: u32, count: u32) -> bool {
+        self.max_task_id_seen = self.max_task_id_seen.max(task_id);
         if task_id as usize >= MAX_TASKS {
             StateMutationDecline::SetObjectListTaskIdRange { task_id }.emit(u64::from(task_id));
             return false;
@@ -2583,6 +2611,7 @@ impl DeviceState {
 
     pub fn insert_object(&mut self, task_id: u32, ref_: u32) -> bool {
         let discriminant = (u64::from(task_id) << 32) | u64::from(ref_);
+        self.max_task_id_seen = self.max_task_id_seen.max(task_id);
         if task_id as usize >= MAX_TASKS {
             StateMutationDecline::InsertObjectTaskIdRange {
                 task_id,
@@ -2825,6 +2854,7 @@ impl DeviceState {
     }
 
     pub fn map_surface(&mut self, mapping_id: u32) -> bool {
+        self.max_mapping_id_seen = self.max_mapping_id_seen.max(mapping_id);
         if !crate::model::is_mapping_id(mapping_id) {
             StateMutationDecline::MapSurfaceIdRange { mapping_id }.emit(u64::from(mapping_id));
             return false;
@@ -2875,6 +2905,7 @@ impl DeviceState {
     }
 
     pub fn unmap_surface(&mut self, mapping_id: u32) -> bool {
+        self.max_mapping_id_seen = self.max_mapping_id_seen.max(mapping_id);
         if !crate::model::is_mapping_id(mapping_id) {
             StateMutationDecline::UnmapSurfaceIdRange { mapping_id }.emit(u64::from(mapping_id));
             return false;
@@ -2909,6 +2940,7 @@ impl DeviceState {
 
     /// Attach directed MappingInternal capture to a mapped slot.
     pub fn attach_mapping_internal(&mut self, mapping_id: u32, mapping_internal: u64) -> bool {
+        self.max_mapping_id_seen = self.max_mapping_id_seen.max(mapping_id);
         if !crate::model::is_mapping_id(mapping_id) {
             StateMutationDecline::AttachMappingIdRange { mapping_id }.emit(u64::from(mapping_id));
             return false;
@@ -2957,6 +2989,7 @@ impl DeviceState {
 
     /// Cache the 0x200-byte guest device descriptor for plane/surface sample windows.
     pub fn set_mapping_device_desc(&mut self, mapping_id: u32, desc: &[u8]) -> bool {
+        self.max_mapping_id_seen = self.max_mapping_id_seen.max(mapping_id);
         if !crate::model::is_mapping_id(mapping_id) {
             StateMutationDecline::MappingDeviceDescIdRange { mapping_id }
                 .emit(u64::from(mapping_id));
@@ -3513,6 +3546,93 @@ mod fail_vocabulary_tests {
             let now = state.host_writes.epoch();
             assert_ne!(now, epoch, "a host write into guest RAM went unannounced");
             epoch = now;
+        }
+    }
+}
+
+#[cfg(test)]
+mod slot_table_reach_tests {
+    use super::*;
+    use crate::model::{DeviceId, MAX_MAPPINGS, PAGE_SHIFT_X86};
+
+    /// A task id the slot table cannot hold must still move the high-water mark.
+    ///
+    /// This is the whole point of the instrument. `MAX_TASKS` is 256 with nothing
+    /// behind the number — a task id is a full `u32` on the wire — and past it
+    /// `define_task` refuses and the task never exists. The refusal counter alone
+    /// cannot say whether the bound is close, because a boot stopping at id 12
+    /// and one stopping at id 255 both report zero refusals.
+    ///
+    /// So the mark is recorded *before* the bound is applied. A high-water figure
+    /// that only counted ids we accepted would be capped by the very bound it is
+    /// there to measure, and would read 255 forever no matter how far past the
+    /// guest went.
+    #[test]
+    fn a_refused_task_id_still_moves_the_reach_mark() {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        assert_eq!(state.max_task_id_seen, 0);
+
+        assert!(
+            state.define_task(12, 0x1000, 2),
+            "an ordinary id is accepted"
+        );
+        assert_eq!(state.max_task_id_seen, 12);
+
+        let past = MAX_TASKS as u32 + 4096;
+        assert!(
+            !state.define_task(past, 0x1000, 2),
+            "past the table, refused"
+        );
+        assert_eq!(
+            state.max_task_id_seen, past,
+            "and the reach still records how far past the guest asked"
+        );
+
+        // High-water, not last-seen: a later smaller id does not lower it.
+        assert!(state.define_task(3, 0x1000, 2));
+        assert_eq!(state.max_task_id_seen, past);
+    }
+
+    /// The mapping table has the same shape and the same missing derivation.
+    #[test]
+    fn a_refused_mapping_id_still_moves_the_reach_mark() {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        assert_eq!(state.max_mapping_id_seen, 0);
+
+        assert!(state.map_surface(39), "an ordinary id is accepted");
+        assert_eq!(state.max_mapping_id_seen, 39);
+
+        let past = MAX_MAPPINGS as u32 + 1;
+        assert!(!state.map_surface(past), "past the table, refused");
+        assert_eq!(state.max_mapping_id_seen, past);
+    }
+
+    /// Every mutator that refuses on the bound feeds the mark, not just the one
+    /// that creates the slot — a guest that only ever calls `set_object_list` or
+    /// `insert_object` on a high id would otherwise be invisible.
+    #[test]
+    fn every_bounded_mutator_feeds_the_reach_mark() {
+        let past = MAX_TASKS as u32 + 1;
+        for (name, mut state) in [
+            ("delete_task", DeviceState::new(DeviceId(1), PAGE_SHIFT_X86)),
+            (
+                "set_object_list",
+                DeviceState::new(DeviceId(1), PAGE_SHIFT_X86),
+            ),
+            (
+                "insert_object",
+                DeviceState::new(DeviceId(1), PAGE_SHIFT_X86),
+            ),
+        ] {
+            match name {
+                "delete_task" => assert!(!state.delete_task(past)),
+                "set_object_list" => assert!(!state.set_object_list(past, 1, 1)),
+                _ => assert!(!state.insert_object(past, 7)),
+            }
+            assert_eq!(
+                state.max_task_id_seen, past,
+                "{name} refused without recording the reach"
+            );
         }
     }
 }

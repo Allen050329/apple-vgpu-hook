@@ -1326,7 +1326,8 @@ pub fn note_cache_levels<H: HostMemory>(state: &DeviceState, host: &H) {
          gva_cap_bytes={} gva_cap_drift={cap_drift} \
          gva_cap_evicted={cap_evicted} gva_cap_wanted={cap_wanted} \
          gva_cap_forgotten={cap_forgotten} \
-         linear={} linear_bytes={} linear_largest={}",
+         linear={} linear_bytes={} linear_largest={} \
+         task_id_max={} task_id_cap={} mapping_id_max={} mapping_id_cap={}",
         surfaces.entries,
         surfaces.bytes,
         surfaces.largest,
@@ -1337,6 +1338,15 @@ pub fn note_cache_levels<H: HostMemory>(state: &DeviceState, host: &H) {
         linear.entries,
         linear.bytes,
         linear.largest,
+        // The reach census for the two slot tables — see
+        // [`DeviceState::max_task_id_seen`]. Here rather than in a line of their
+        // own because this is already the device's "levels, not per-interval"
+        // line, and these are levels: the highest id the guest has named, beside
+        // the bound that would have refused it.
+        state.max_task_id_seen,
+        crate::model::MAX_TASKS,
+        state.max_mapping_id_seen,
+        crate::model::MAX_MAPPINGS,
     ));
 }
 
