@@ -26,7 +26,7 @@ use crate::contract::pixel_format::{
     self, convert_rgba8_to_row, convert_row_to_rgba8, MTL_FORMAT_BGRA8_UNORM,
     MTL_FORMAT_RGBA16_FLOAT, MTL_FORMAT_RGBA8_UNORM, RGBA8_BPP,
 };
-use crate::model::{DeviceState, EFI_BOOT_HEIGHT, EFI_BOOT_WIDTH, MAX_SCANOUT_DIM};
+use crate::model::{scanout_extent_ok, DeviceState, EFI_BOOT_HEIGHT, EFI_BOOT_WIDTH};
 use crate::runtime::host::HostMemory;
 
 /// Type-11 color formats that may be the compositor front before DisplaySwap.
@@ -69,12 +69,7 @@ pub fn read_mapping_bgra8<M: HostMemory + crate::runtime::host::HostOps>(
     width: u32,
     height: u32,
 ) -> bool {
-    if width == 0
-        || height == 0
-        || width > MAX_SCANOUT_DIM
-        || height > MAX_SCANOUT_DIM
-        || dst_stride < width.saturating_mul(RGBA8_BPP)
-    {
+    if !scanout_extent_ok(width, height) || dst_stride < width.saturating_mul(RGBA8_BPP) {
         return false;
     }
     let need = (height as u64).saturating_mul(dst_stride as u64) as usize;
@@ -171,12 +166,7 @@ pub fn capture_present_frame(
     // Test isolation: exclude proxy-sequence assertions running in parallel.
     #[cfg(test)]
     let _proxy_shared = crate::runtime::census::present_proxy::test_shared();
-    if mapping_id == 0
-        || width == 0
-        || height == 0
-        || width > MAX_SCANOUT_DIM
-        || height > MAX_SCANOUT_DIM
-    {
+    if mapping_id == 0 || !scanout_extent_ok(width, height) {
         return false;
     }
     let stride = width.saturating_mul(RGBA8_BPP);
@@ -428,12 +418,7 @@ pub fn copy_to_bgra8<M: HostMemory + crate::runtime::host::HostOps>(
     height: u32,
     expected_generation: u32,
 ) -> ScanoutCopyResult {
-    if width == 0
-        || height == 0
-        || width > MAX_SCANOUT_DIM
-        || height > MAX_SCANOUT_DIM
-        || dst_stride < width.saturating_mul(RGBA8_BPP)
-    {
+    if !scanout_extent_ok(width, height) || dst_stride < width.saturating_mul(RGBA8_BPP) {
         return ScanoutCopyResult::Failed;
     }
     let need = (height as u64).saturating_mul(dst_stride as u64) as usize;
@@ -995,10 +980,7 @@ pub fn note_front_buffer_writeback<M: HostMemory + crate::runtime::host::HostOps
 ) {
     use crate::runtime::host::HostAction;
 
-    if mapping_id == 0 || width == 0 || height == 0 {
-        return;
-    }
-    if width > MAX_SCANOUT_DIM || height > MAX_SCANOUT_DIM {
+    if mapping_id == 0 || !scanout_extent_ok(width, height) {
         return;
     }
     let (map_fmt, mapped_ok, has_geom, map_w, map_h, gen) = match state.mappings.get(&mapping_id) {
@@ -1061,7 +1043,7 @@ pub fn note_front_buffer_writeback<M: HostMemory + crate::runtime::host::HostOps
     } else {
         (width, height)
     };
-    if paint_w == 0 || paint_h == 0 || paint_w > MAX_SCANOUT_DIM || paint_h > MAX_SCANOUT_DIM {
+    if !scanout_extent_ok(paint_w, paint_h) {
         return;
     }
 

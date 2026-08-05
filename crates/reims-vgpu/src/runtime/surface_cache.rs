@@ -18,7 +18,7 @@
 //! cache content when present so scanout matches what the host executed.
 
 use crate::contract::pixel_format::RGBA8_BPP;
-use crate::model::{DeviceState, GvaBacking, HostSurface, MAX_SCANOUT_DIM};
+use crate::model::{scanout_extent_ok, DeviceState, GvaBacking, HostSurface};
 use crate::runtime::host::HostMemory;
 
 /// `generation` is issued by
@@ -34,7 +34,7 @@ fn store_into(
     bgra: std::sync::Arc<Vec<u8>>,
     generation: u64,
 ) {
-    if id == 0 || width == 0 || height == 0 || width > MAX_SCANOUT_DIM || height > MAX_SCANOUT_DIM {
+    if id == 0 || !scanout_extent_ok(width, height) {
         return;
     }
     let need = (height as usize)
@@ -131,12 +131,7 @@ pub fn store_rows(
     src_stride: u32,
 ) {
     let generation = state.next_sampled_content_generation();
-    if surface_id == 0
-        || width == 0
-        || height == 0
-        || width > MAX_SCANOUT_DIM
-        || height > MAX_SCANOUT_DIM
-    {
+    if surface_id == 0 || !scanout_extent_ok(width, height) {
         return;
     }
     let row = (width as usize).saturating_mul(RGBA8_BPP as usize);
@@ -240,12 +235,7 @@ pub fn cede_surface_to_resident(
     width: u32,
     height: u32,
 ) -> bool {
-    if surface_id == 0
-        || width == 0
-        || height == 0
-        || width > MAX_SCANOUT_DIM
-        || height > MAX_SCANOUT_DIM
-    {
+    if surface_id == 0 || !scanout_extent_ok(width, height) {
         return false;
     }
     let generation = state.next_sampled_content_generation();
@@ -741,8 +731,7 @@ pub fn store_gva_owned(
     object_type: u8,
     backing: Option<GvaBacking>,
 ) {
-    if gva == 0 || width == 0 || height == 0 || width > MAX_SCANOUT_DIM || height > MAX_SCANOUT_DIM
-    {
+    if gva == 0 || !scanout_extent_ok(width, height) {
         return;
     }
     let need = (height as usize)
@@ -1878,7 +1867,7 @@ mod tests {
             &mut state,
             7,
             w,
-            MAX_SCANOUT_DIM + 1
+            crate::model::MAX_SCANOUT_DIM + 1
         ));
 
         // The flush's republish ends it.

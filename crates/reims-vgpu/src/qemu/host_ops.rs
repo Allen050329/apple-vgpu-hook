@@ -245,7 +245,6 @@ impl QemuHostDecline {
     }
 }
 
-
 /// Production host bridge: GPA/KVA via C callbacks, actions queued for the BH.
 ///
 /// Two action rails:
@@ -874,5 +873,4 @@ mod tests {
         let mut host = QemuHost::new(&ops, &mut actions, &prompt);
         assert_eq!(host.map_pages(&[0xc000], 0x4000), None);
     }
-
 }

@@ -11,7 +11,7 @@ use crate::contract::iosurface_pages::{
 use crate::contract::pixel_format::{
     self, convert_rgba8_to_row, convert_row_to_rgba8, MTL_FORMAT_BGRA8_UNORM, RGBA8_BPP,
 };
-use crate::model::{DeviceState, MappingEntry, MAX_SCANOUT_DIM};
+use crate::model::{scanout_extent_ok, DeviceState, MappingEntry, MAX_SCANOUT_DIM};
 use crate::runtime::host::{HostMemory, HostOps};
 use crate::runtime::mapper;
 
@@ -853,7 +853,7 @@ pub fn write_bgra8_from_resident_gpu<M: HostMemory + HostOps>(
     width: u32,
     height: u32,
 ) -> Result<u64, GpuWritebackDecline> {
-    if width == 0 || height == 0 || width > MAX_SCANOUT_DIM || height > MAX_SCANOUT_DIM {
+    if !scanout_extent_ok(width, height) {
         return Err(GpuWritebackDecline::NotWritable);
     }
     let Some(m) = state.mappings.get(&mapping_id) else {
@@ -1061,7 +1061,7 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
     height: u32,
     skip: SkipRanges<'_>,
 ) -> bool {
-    if width == 0 || height == 0 || width > MAX_SCANOUT_DIM || height > MAX_SCANOUT_DIM {
+    if !scanout_extent_ok(width, height) {
         return refuse(mapping_id, SurfaceWriteRefusal::Geometry { width, height });
     }
     if src_stride < width.saturating_mul(RGBA8_BPP) {
@@ -1457,7 +1457,7 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
     width: u32,
     height: u32,
 ) -> bool {
-    if width == 0 || height == 0 || width > MAX_SCANOUT_DIM || height > MAX_SCANOUT_DIM {
+    if !scanout_extent_ok(width, height) {
         return refuse(mapping_id, SurfaceWriteRefusal::Geometry { width, height });
     }
     let rgba_stride = width.saturating_mul(RGBA8_BPP);
@@ -1704,7 +1704,7 @@ pub fn write_raw_rows<M: HostMemory + HostOps>(
     width: u32,
     height: u32,
 ) -> bool {
-    if width == 0 || height == 0 || width > MAX_SCANOUT_DIM || height > MAX_SCANOUT_DIM {
+    if !scanout_extent_ok(width, height) {
         return refuse(mapping_id, SurfaceWriteRefusal::Geometry { width, height });
     }
     if row_bytes == 0 || src_stride < row_bytes {
@@ -1799,13 +1799,7 @@ pub fn read_raw_rows<M: HostMemory + HostOps>(
     width: u32,
     height: u32,
 ) -> bool {
-    if width == 0
-        || height == 0
-        || width > MAX_SCANOUT_DIM
-        || height > MAX_SCANOUT_DIM
-        || row_bytes == 0
-        || dst_stride < row_bytes
-    {
+    if !scanout_extent_ok(width, height) || row_bytes == 0 || dst_stride < row_bytes {
         return false;
     }
     let need = (height as u64).saturating_mul(dst_stride as u64) as usize;
@@ -1968,8 +1962,7 @@ pub fn read_rect_raw_at<M: HostMemory + HostOps>(
         width,
         height,
     } = rect;
-    if width == 0 || height == 0 || width > MAX_SCANOUT_DIM || height > MAX_SCANOUT_DIM || bpp == 0
-    {
+    if !scanout_extent_ok(width, height) || bpp == 0 {
         return false;
     }
     // Deferred-writeback flush-on-access, for the same reason
@@ -2244,8 +2237,7 @@ fn write_rect_raw_at_impl<M: HostMemory + HostOps>(
         width,
         height,
     } = rect;
-    if width == 0 || height == 0 || width > MAX_SCANOUT_DIM || height > MAX_SCANOUT_DIM || bpp == 0
-    {
+    if !scanout_extent_ok(width, height) || bpp == 0 {
         return false;
     }
     let Some(m) = state.mappings.get(&mapping_id) else {

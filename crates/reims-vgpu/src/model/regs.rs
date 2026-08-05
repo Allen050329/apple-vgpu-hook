@@ -107,6 +107,54 @@ pub const MAX_MAPPINGS: usize = 4096;
 /// [`the_abi_header_agrees_on_the_scanout_bound`] fails if they drift.
 pub const MAX_SCANOUT_DIM: u32 = 8192;
 
+/// Which half of the scanout extent bound a `width`x`height` pair breaks.
+///
+/// Named rather than boolean because exactly one caller — `set_mapping_geom` —
+/// has to say *which*, and it is the only one on a path where a typed decline
+/// reaches the fail log. Every other caller asks
+/// [`scanout_extent_fault`]`(..).is_none()`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScanoutExtentFault {
+    WidthZero,
+    HeightZero,
+    WidthAboveBound,
+    HeightAboveBound,
+}
+
+/// Whether a `width`x`height` pair is an extent this device will hold, and the
+/// named reason when it is not.
+///
+/// One rule: an edge is at least one pixel and at most [`MAX_SCANOUT_DIM`].
+/// It was written out eight times — the surface cache's four entry points, the
+/// two scanout copies, `mapping_write::read_raw_rows`, and `set_mapping_geom` —
+/// as a four-term `||` chain in seven of them and as four typed refusals in the
+/// eighth. Eight copies of a bound whose whole job is to keep a corrupt 16-bit
+/// guest word from sizing a 16 GiB allocation is eight places for the ceiling to
+/// be raised in seven.
+///
+/// The zero test belongs here with the ceiling and not beside each caller's own
+/// argument checks: a zero edge is not a small image, it is one whose row count
+/// or row length makes every downstream `need` computation zero, so a buffer of
+/// any size "fits" it and the copy silently writes nothing.
+pub const fn scanout_extent_fault(width: u32, height: u32) -> Option<ScanoutExtentFault> {
+    if width == 0 {
+        Some(ScanoutExtentFault::WidthZero)
+    } else if height == 0 {
+        Some(ScanoutExtentFault::HeightZero)
+    } else if width > MAX_SCANOUT_DIM {
+        Some(ScanoutExtentFault::WidthAboveBound)
+    } else if height > MAX_SCANOUT_DIM {
+        Some(ScanoutExtentFault::HeightAboveBound)
+    } else {
+        None
+    }
+}
+
+/// Shorthand for the seven callers that only need the verdict.
+pub const fn scanout_extent_ok(width: u32, height: u32) -> bool {
+    scanout_extent_fault(width, height).is_none()
+}
+
 // Single source of truth for the shifts: `contract::gva::PAGE_SHIFT_*`,
 // re-exported rather than restated. There is **no** bare `PAGE_SIZE` /
 // `PAGE_SHIFT` — those names defaulted to arm16K and caused x86 wild writes
@@ -746,6 +794,97 @@ mod tests {
             "the QEMU shims bound guest geometry against the header's value; \
              it has drifted from the Rust constant that owns the bound"
         );
+    }
+
+    /// The bound rejects both edges at both ends, and names which broke.
+    ///
+    /// `MAX_SCANOUT_DIM` itself is legal and one past it is not — the edge is a
+    /// ceiling, not an exclusive limit, and seven of the eight copies this
+    /// replaced spelled it `>` while nothing checked that they all did.
+    #[test]
+    fn the_scanout_extent_bound_holds_at_both_edges() {
+        use ScanoutExtentFault as F;
+        assert_eq!(scanout_extent_fault(1, 1), None);
+        assert_eq!(
+            scanout_extent_fault(MAX_SCANOUT_DIM, MAX_SCANOUT_DIM),
+            None,
+            "the largest edge the device accepts must be accepted"
+        );
+        assert_eq!(scanout_extent_fault(0, 16), Some(F::WidthZero));
+        assert_eq!(scanout_extent_fault(16, 0), Some(F::HeightZero));
+        assert_eq!(
+            scanout_extent_fault(MAX_SCANOUT_DIM + 1, 16),
+            Some(F::WidthAboveBound)
+        );
+        assert_eq!(
+            scanout_extent_fault(16, MAX_SCANOUT_DIM + 1),
+            Some(F::HeightAboveBound)
+        );
+        assert!(!scanout_extent_ok(0, 0));
+        assert!(scanout_extent_ok(1920, 1080));
+    }
+
+    /// No file outside this one compares an edge against `MAX_SCANOUT_DIM`.
+    ///
+    /// The consolidation this guards was worth doing because the rule had eight
+    /// copies; it is worth *keeping* only if the ninth cannot be written without
+    /// noticing. A relational comparison against the bound anywhere but here is
+    /// the shape every one of those copies had, so the source is the only place
+    /// that can see it — the compiler is perfectly happy with nine.
+    ///
+    /// `set_mapping_geom` is not exempted: it reads
+    /// [`scanout_extent_fault`] and matches on the answer, so it names the
+    /// bound nowhere. Doc comments and the header-drift test above may still
+    /// mention the constant; only `<`/`>`/`<=`/`>=` against it are refused.
+    #[test]
+    fn the_scanout_extent_bound_is_compared_in_exactly_one_place() {
+        let mut offenders = Vec::new();
+        for entry in walk_crate_sources() {
+            let source = std::fs::read_to_string(&entry).expect("crate source must be readable");
+            if entry.ends_with("regs.rs") {
+                continue;
+            }
+            for (n, line) in source.lines().enumerate() {
+                let code = line.split("//").next().unwrap_or("");
+                if !code.contains("MAX_SCANOUT_DIM") {
+                    continue;
+                }
+                if code.contains('>') || code.contains('<') {
+                    offenders.push(format!("{}:{}: {}", entry.display(), n + 1, line.trim()));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "the scanout extent bound must be compared only by \
+             regs::scanout_extent_fault; these compare it themselves:\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    /// Every `.rs` file under the crate's `src/`.
+    fn walk_crate_sources() -> Vec<std::path::PathBuf> {
+        fn push(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("crate src must be readable") {
+                let path = entry.expect("a readable dir entry").path();
+                if path.is_dir() {
+                    push(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        push(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut out,
+        );
+        assert!(
+            out.len() > 50,
+            "the walk found {} files, which is not this crate",
+            out.len()
+        );
+        out
     }
 
     /// The pre-boot console geometry, which both shims size a `DisplaySurface`

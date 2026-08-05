@@ -2932,22 +2932,25 @@ impl DeviceState {
             StateMutationDecline::MappingGeomIdRange { mapping_id }.emit(u64::from(mapping_id));
             return false;
         }
-        if width == 0 {
-            StateMutationDecline::MappingGeomWidthZero { mapping_id }.emit(u64::from(mapping_id));
-            return false;
-        }
-        if height == 0 {
-            StateMutationDecline::MappingGeomHeightZero { mapping_id }.emit(u64::from(mapping_id));
-            return false;
-        }
-        if width > crate::model::MAX_SCANOUT_DIM {
-            StateMutationDecline::MappingGeomWidthRange { mapping_id, width }
-                .emit((u64::from(mapping_id) << 32) | u64::from(width));
-            return false;
-        }
-        if height > crate::model::MAX_SCANOUT_DIM {
-            StateMutationDecline::MappingGeomHeightRange { mapping_id, height }
-                .emit((u64::from(mapping_id) << 32) | u64::from(height));
+        // The bound itself lives once, in `regs::scanout_extent_fault`; this is
+        // the only caller that has to name which half of it broke, so it is the
+        // only one that reads the fault rather than the verdict.
+        if let Some(fault) = crate::model::scanout_extent_fault(width, height) {
+            use crate::model::ScanoutExtentFault as F;
+            match fault {
+                F::WidthZero => StateMutationDecline::MappingGeomWidthZero { mapping_id }
+                    .emit(u64::from(mapping_id)),
+                F::HeightZero => StateMutationDecline::MappingGeomHeightZero { mapping_id }
+                    .emit(u64::from(mapping_id)),
+                F::WidthAboveBound => {
+                    StateMutationDecline::MappingGeomWidthRange { mapping_id, width }
+                        .emit((u64::from(mapping_id) << 32) | u64::from(width))
+                }
+                F::HeightAboveBound => {
+                    StateMutationDecline::MappingGeomHeightRange { mapping_id, height }
+                        .emit((u64::from(mapping_id) << 32) | u64::from(height))
+                }
+            }
             return false;
         }
         let e = self.mappings.entry(mapping_id).or_default();
