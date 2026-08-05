@@ -194,7 +194,7 @@ fn note_view_slice_range_dropped(
     opcode: u32,
     view: &crate::runtime::decode::resource::TextureViewDescriptor,
 ) {
-    if !view.has_slices || (view.slice_base == 0 && view.slice_count <= 1) {
+    if !view.carries_range() || (view.slice_base == 0 && view.slice_count <= 1) {
         return;
     }
     let state = view.slice_base.rotate_left(32) ^ view.slice_count;
@@ -269,7 +269,7 @@ fn decode_texture_view_hop_reasoned<M: HostMemory + HostOps>(
         });
     }
     note_view_slice_range_dropped(texture_ref, opcode, &view);
-    let level = if view.has_levels {
+    let level = if view.carries_range() {
         // level_base is a mip index (u64 on wire); reject pathological values.
         if view.level_base > u32::MAX as u64 {
             return Err(TextureViewDecline::HopLevelOverflow {
@@ -281,7 +281,7 @@ fn decode_texture_view_hop_reasoned<M: HostMemory + HostOps>(
     } else {
         0
     };
-    let swizzle = if view.has_swizzle {
+    let swizzle = if view.carries_swizzle() {
         // Malformed selectors (not in 0..5) fail the resolve — visible soft miss on sample.
         Some(pixel_format::swizzle_plan(&view.swizzle).ok_or(
             TextureViewDecline::HopSwizzleInvalid {
@@ -293,11 +293,7 @@ fn decode_texture_view_hop_reasoned<M: HostMemory + HostOps>(
         None
     };
     // Zero pixel_format means inherit base (serializer always writes a real format when set).
-    let pixel_format = if view.pixel_format != 0 {
-        Some(view.pixel_format)
-    } else {
-        None
-    };
+    let pixel_format = view.declared_pixel_format();
     Ok((view.base_texture_ref, level, swizzle, pixel_format))
 }
 
@@ -898,8 +894,8 @@ mod texture_view_split_tests {
 
     fn ranged_view(slice_base: u64, slice_count: u64) -> TextureViewDescriptor {
         TextureViewDescriptor {
+            view_opcode: crate::runtime::decode::resource::TEXTURE_VIEW_OPCODE_RANGED,
             base_texture_ref: 9,
-            has_slices: true,
             slice_base,
             slice_count,
             ..Default::default()
@@ -945,9 +941,12 @@ mod texture_view_split_tests {
         note_view_slice_range_dropped(
             0x2003,
             7,
+            // Slice words set to what a ranged record would put there: the
+            // gate must turn on the opcode alone, not on the words being
+            // non-zero.
             &TextureViewDescriptor {
+                view_opcode: crate::runtime::decode::resource::TEXTURE_VIEW_OPCODE_SIMPLE,
                 base_texture_ref: 9,
-                has_slices: false,
                 slice_base: 5,
                 slice_count: 4,
                 ..Default::default()

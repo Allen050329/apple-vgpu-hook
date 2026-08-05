@@ -545,14 +545,14 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
             return Err(br(BlitStatus::MissingResource, "view_base_ref_zero"));
         }
         // Blit rejects swizzled materialization (contract).
-        if view.has_swizzle {
+        if view.carries_swizzle() {
             let plan = pixel_format::swizzle_plan(&view.swizzle)
                 .ok_or_else(|| br(BlitStatus::Unsupported, "view_swizzle_plan"))?;
             if !pixel_format::swizzle_is_identity(&plan) {
                 return Err(br(BlitStatus::Unsupported, "view_swizzle_nonident"));
             }
         }
-        let view_type = if view.has_texture_type {
+        let view_type = if view.carries_range() {
             if !texture_view_type_supported(view.texture_type) {
                 return Err(br(BlitStatus::Unsupported, "view_type_unsupported"));
             }
@@ -562,7 +562,7 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
         };
         // Relative command level → absolute on the base (multi-level ranges ok).
         let rel_level = level as u64;
-        let level_count = if view.has_levels {
+        let level_count = if view.carries_range() {
             if view.level_count == 0 {
                 1
             } else {
@@ -572,10 +572,10 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
             // Simple form: no level range; command level is absolute on base.
             u64::MAX
         };
-        if view.has_levels && rel_level >= level_count {
+        if view.carries_range() && rel_level >= level_count {
             return Err(br(BlitStatus::Bounds, "view_level_oob"));
         }
-        let abs_level = if view.has_levels {
+        let abs_level = if view.carries_range() {
             view.level_base
                 .checked_add(rel_level)
                 .ok_or_else(|| br(BlitStatus::Bounds, "view_level_overflow"))?
@@ -587,7 +587,7 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
         }
         // Relative command slice → absolute (array / cube faces).
         let rel_slice = slice as u64;
-        let slice_count = if view.has_slices {
+        let slice_count = if view.carries_range() {
             if view.slice_count == 0 {
                 1
             } else {
@@ -596,10 +596,10 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
         } else {
             u64::MAX
         };
-        if view.has_slices && rel_slice >= slice_count {
+        if view.carries_range() && rel_slice >= slice_count {
             return Err(br(BlitStatus::Bounds, "view_slice_oob"));
         }
-        let abs_slice = if view.has_slices {
+        let abs_slice = if view.carries_range() {
             view.slice_base
                 .checked_add(rel_slice)
                 .ok_or_else(|| br(BlitStatus::Bounds, "view_slice_overflow"))?
@@ -653,9 +653,9 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
             }
         }
         // View pixel_format overrides base when bpp-compatible.
-        if view.pixel_format != 0 {
+        if let Some(declared) = view.declared_pixel_format() {
             let base_fmt = backing.pixel_format();
-            let eff = metal_draw::effective_view_sample_format(base_fmt, Some(view.pixel_format))
+            let eff = metal_draw::effective_view_sample_format(base_fmt, Some(declared))
                 .ok_or_else(|| br(BlitStatus::Unsupported, "view_fmt_incompat"))?;
             match &mut backing {
                 TextureBacking::Linear(t) => {

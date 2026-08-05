@@ -684,24 +684,58 @@ pub const COMPUTE_STAGE_INPUT_ATTR_BITS_FORMAT_MASK: u32 = 0x3f;
 pub const COMPUTE_STAGE_INPUT_ATTR_OFFSET: usize = 4;
 
 /// Type-8 texture view (base texture + optional format/level/slice/swizzle).
+///
+/// Which fields the wire carried is a property of `view_opcode` and nothing
+/// else: the three forms are three distinct records, and the swizzle body
+/// embeds the ranged one whole. So the question is asked of the opcode through
+/// [`Self::carries_range`] and [`Self::carries_swizzle`], rather than answered
+/// by booleans set beside the fields they describe. Five such booleans used to
+/// live here, written at all three decode sites — fifteen assignments that
+/// could disagree with the opcode, and one of them (`has_pixel_format`) that no
+/// consumer ever read, because both of them spelled its rule again themselves.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TextureViewDescriptor {
     pub view_opcode: u32,
     pub view_texture_ref: u32,
     pub base_texture_ref: u32,
     pub pixel_format: u16,
-    pub has_pixel_format: bool,
-    /// `MTLTextureType` when present on ranged/swizzle forms (`@18`).
+    /// `MTLTextureType`, on the forms [`Self::carries_range`] names (`@18`).
     pub texture_type: u16,
-    pub has_texture_type: bool,
     pub level_base: u64,
     pub level_count: u64,
-    pub has_levels: bool,
     pub slice_base: u64,
     pub slice_count: u64,
-    pub has_slices: bool,
     pub swizzle: [u8; 4],
-    pub has_swizzle: bool,
+}
+
+impl TextureViewDescriptor {
+    /// Whether this form carries `texture_type`, the level range and the slice
+    /// range — the ranged body, which the swizzle form embeds whole.
+    ///
+    /// The three travel together because they are one record. Reading them off
+    /// a simple view would take `MTLTextureType1D` (which is 0) and a
+    /// zero-length level range for things the guest asked for.
+    pub fn carries_range(&self) -> bool {
+        matches!(
+            self.view_opcode,
+            TEXTURE_VIEW_OPCODE_RANGED | TEXTURE_VIEW_OPCODE_SWIZZLE
+        )
+    }
+
+    /// Whether this form carries per-channel swizzles.
+    pub fn carries_swizzle(&self) -> bool {
+        self.view_opcode == TEXTURE_VIEW_OPCODE_SWIZZLE
+    }
+
+    /// The view's own pixel format, where it declared one.
+    ///
+    /// All three forms carry the field, and `MTLPixelFormatInvalid` is 0 — so a
+    /// zero is a view that reinterprets nothing and keeps its base texture's
+    /// format, which is why this is the one presence question the opcode does
+    /// not answer.
+    pub fn declared_pixel_format(&self) -> Option<u16> {
+        (self.pixel_format != 0).then_some(self.pixel_format)
+    }
 }
 
 // The record header every type-8 blob starts with. Named here because this
@@ -2288,7 +2322,6 @@ pub fn decode_texture_view_descriptor(bytes: &[u8]) -> Result<TextureViewDescrip
                 view_texture_ref: b.object_ref.get(),
                 base_texture_ref: b.base_texture_ref.get(),
                 pixel_format,
-                has_pixel_format: pixel_format != 0,
                 ..Default::default()
             })
         }
@@ -2301,13 +2334,9 @@ pub fn decode_texture_view_descriptor(bytes: &[u8]) -> Result<TextureViewDescrip
                 view_texture_ref: b.object_ref.get(),
                 base_texture_ref: b.base_texture_ref.get(),
                 pixel_format,
-                has_pixel_format: pixel_format != 0,
-                has_texture_type: true,
                 texture_type: b.texture_type.get(),
-                has_levels: true,
                 level_base: b.level_base.get(),
                 level_count: b.level_count.get(),
-                has_slices: true,
                 slice_base: b.slice_base.get(),
                 slice_count: b.slice_count.get(),
                 ..Default::default()
@@ -2323,16 +2352,11 @@ pub fn decode_texture_view_descriptor(bytes: &[u8]) -> Result<TextureViewDescrip
                 view_texture_ref: r.object_ref.get(),
                 base_texture_ref: r.base_texture_ref.get(),
                 pixel_format,
-                has_pixel_format: pixel_format != 0,
-                has_texture_type: true,
                 texture_type: r.texture_type.get(),
-                has_levels: true,
                 level_base: r.level_base.get(),
                 level_count: r.level_count.get(),
-                has_slices: true,
                 slice_base: r.slice_base.get(),
                 slice_count: r.slice_count.get(),
-                has_swizzle: true,
                 swizzle: [
                     b.swizzle.red,
                     b.swizzle.green,
@@ -4661,8 +4685,9 @@ mod tests {
         assert_eq!(v.base_texture_ref, 3);
         assert_eq!(v.view_texture_ref, 10);
         assert_eq!(v.pixel_format, 0x50);
-        assert!(v.has_pixel_format);
-        assert!(!v.has_swizzle);
+        assert_eq!(v.declared_pixel_format(), Some(0x50));
+        assert!(!v.carries_range());
+        assert!(!v.carries_swizzle());
 
         // A view that states no format must not claim one. This used to be an
         // unconditional `true`, which disagreed with `decode_texture_descriptor`
@@ -4672,8 +4697,9 @@ mod tests {
         st16(&mut b[TEXTURE_VIEW_DESC_PIXEL_FORMAT..], 0);
         let none = decode_texture_view_descriptor(&b).unwrap();
         assert_eq!(none.pixel_format, 0);
-        assert!(
-            !none.has_pixel_format,
+        assert_eq!(
+            none.declared_pixel_format(),
+            None,
             "format 0 is MTLPixelFormatInvalid, not a format the view named"
         );
     }
@@ -4709,13 +4735,11 @@ mod tests {
         let v = decode_texture_view_descriptor(&b).unwrap();
         assert_eq!(v.view_opcode, TEXTURE_VIEW_OPCODE_SWIZZLE);
         assert_eq!(v.base_texture_ref, 4);
-        assert!(v.has_levels);
+        assert!(v.carries_range());
         assert_eq!(v.level_base, 1);
-        assert!(v.has_slices);
         assert_eq!((v.slice_base, v.slice_count), (0, 1));
-        assert!(v.has_texture_type);
         assert_eq!(v.texture_type, TEXTURE_VIEW_MTL_TYPE_2D);
-        assert!(v.has_swizzle);
+        assert!(v.carries_swizzle());
         assert_eq!(v.swizzle, [4, 3, 2, 5]);
     }
 
@@ -4746,7 +4770,8 @@ mod tests {
         assert_eq!(v.view_opcode, TEXTURE_VIEW_OPCODE_RANGED);
         assert_eq!(v.level_base, 2);
         assert_eq!(v.level_count, 1);
-        assert!(!v.has_swizzle);
+        assert!(v.carries_range());
+        assert!(!v.carries_swizzle());
     }
 
     #[test]
