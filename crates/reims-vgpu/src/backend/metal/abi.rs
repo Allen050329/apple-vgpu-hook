@@ -1,7 +1,17 @@
 //! `repr(C)` ABI types matching `host/archive/.../reims-vgpu-backend-vulkan/reims_vgpu_backend.h` (archived).
 //! C ABI type mirrors for reims_vgpu_backend.h (Metal encode path).
+//!
+//! The layout pins below are `const` assertions rather than `#[test]`s, for the
+//! reason spelled out in [`crate::backend::metal::constants`]: this module is
+//! `backend-metal`-gated, so a `#[cfg(test)]` block in it is compiled out of the
+//! Vulkan arm and its `--lib` suite is run on Apple hosts only — the pins were
+//! live on no machine anybody edits this code from. `rustc` evaluates a `const`
+//! assertion on every arm that compiles the file, including the cross-compiled
+//! `--target aarch64-apple-darwin` clippy run `AGENTS.md` requires from Linux.
 
 #![allow(non_camel_case_types)]
+
+use core::mem::offset_of;
 
 pub const REIMS_VGPU_OK: i32 = 0;
 pub const REIMS_VGPU_ERR_ARGS: i32 = 1;
@@ -73,6 +83,9 @@ pub struct ReimsVgpuComputeStageInputAttribute {
     pub reserved0: u32,
 }
 
+const _: () = assert!(size_of::<ReimsVgpuComputeStageInputAttribute>() == 6 * size_of::<u32>());
+const _: () = assert!(align_of::<ReimsVgpuComputeStageInputAttribute>() == align_of::<u32>());
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct ReimsVgpuComputeStageInputLayout {
@@ -82,6 +95,12 @@ pub struct ReimsVgpuComputeStageInputLayout {
     pub step_rate: u32,
     pub stride: u64,
 }
+
+// Four `u32`s then a `u64`, so `stride` is 8-aligned and the record is 24 and
+// not 20. A field reordered ahead of `stride` moves it and changes every offset
+// the descriptor below inherits.
+const _: () = assert!(size_of::<ReimsVgpuComputeStageInputLayout>() == 24);
+const _: () = assert!(offset_of!(ReimsVgpuComputeStageInputLayout, stride) == 16);
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -98,6 +117,14 @@ pub struct ReimsVgpuComputeStageInputDescriptor {
     pub layouts: [ReimsVgpuComputeStageInputLayout; REIMS_VGPU_COMPUTE_STAGE_INPUT_MAX_LAYOUTS],
 }
 
+// The literal size and both array offsets are what the tests these replaced
+// asserted, kept literal on purpose: derived from the two caps they would stay
+// true across a cap change, and a cap change is exactly the edit that has to be
+// walked to the sites reading the arrays.
+const _: () = assert!(size_of::<ReimsVgpuComputeStageInputDescriptor>() == 800);
+const _: () = assert!(offset_of!(ReimsVgpuComputeStageInputDescriptor, attributes) == 28);
+const _: () = assert!(offset_of!(ReimsVgpuComputeStageInputDescriptor, layouts) == 416);
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct ReimsVgpuBuffer {
@@ -112,6 +139,15 @@ pub struct ReimsVgpuBuffer {
     pub backing_offset: usize,
 }
 
+// The pointer-bearing records are 64-bit shaped: every `u32` ahead of a pointer
+// or `usize` is padded up to the 8-byte slot the next field starts on. Reading
+// these offsets as if they packed is what a 32-bit assumption looks like here.
+const _: () = assert!(size_of::<usize>() == 8, "Metal backend ABI is 64-bit");
+const _: () = assert!(size_of::<ReimsVgpuBuffer>() == 64);
+const _: () = assert!(offset_of!(ReimsVgpuBuffer, data) == 8);
+const _: () = assert!(offset_of!(ReimsVgpuBuffer, backing_data) == 40);
+const _: () = assert!(offset_of!(ReimsVgpuBuffer, backing_offset) == 56);
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct ReimsVgpuStorageImage {
@@ -122,6 +158,9 @@ pub struct ReimsVgpuStorageImage {
     pub data: *mut u8,
     pub len: usize,
 }
+
+const _: () = assert!(size_of::<ReimsVgpuStorageImage>() == 32);
+const _: () = assert!(offset_of!(ReimsVgpuStorageImage, data) == 16);
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -137,6 +176,9 @@ pub struct ReimsVgpuComputeSampledImage {
     /// Build through [`Self::unswizzled`] rather than filling it in by hand.
     pub swizzle: [u8; 4],
 }
+
+const _: () = assert!(size_of::<ReimsVgpuComputeSampledImage>() == 40);
+const _: () = assert!(offset_of!(ReimsVgpuComputeSampledImage, swizzle) == 36);
 
 impl ReimsVgpuComputeSampledImage {
     /// A binding whose texels are consumed in their declared channel order.
@@ -463,7 +505,6 @@ pub struct ReimsVgpuVertexAttr {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::mem::{align_of, offset_of, size_of};
 
     /// The rule two call sites held a copy of each, in the direction that cannot
     /// lose a shader's writes.
@@ -494,41 +535,5 @@ mod tests {
         // both take the default, and it is storage.
         assert!(texture_binds_as_storage(&usages, 7));
         assert!(texture_binds_as_storage(&[], 4));
-    }
-
-    #[test]
-    fn stage_input_abi_preserves_c_layout() {
-        assert_eq!(
-            size_of::<ReimsVgpuComputeStageInputAttribute>(),
-            6 * size_of::<u32>()
-        );
-        assert_eq!(
-            align_of::<ReimsVgpuComputeStageInputAttribute>(),
-            align_of::<u32>()
-        );
-        assert_eq!(size_of::<ReimsVgpuComputeStageInputLayout>(), 24);
-        assert_eq!(offset_of!(ReimsVgpuComputeStageInputLayout, stride), 16);
-        assert_eq!(size_of::<ReimsVgpuComputeStageInputDescriptor>(), 800);
-        assert_eq!(
-            offset_of!(ReimsVgpuComputeStageInputDescriptor, attributes),
-            28
-        );
-        assert_eq!(
-            offset_of!(ReimsVgpuComputeStageInputDescriptor, layouts),
-            416
-        );
-    }
-
-    #[test]
-    fn pointer_bearing_abi_preserves_64_bit_offsets() {
-        assert_eq!(size_of::<usize>(), 8, "Metal backend ABI is 64-bit");
-        assert_eq!(size_of::<ReimsVgpuBuffer>(), 64);
-        assert_eq!(offset_of!(ReimsVgpuBuffer, data), 8);
-        assert_eq!(offset_of!(ReimsVgpuBuffer, backing_data), 40);
-        assert_eq!(offset_of!(ReimsVgpuBuffer, backing_offset), 56);
-        assert_eq!(size_of::<ReimsVgpuStorageImage>(), 32);
-        assert_eq!(offset_of!(ReimsVgpuStorageImage, data), 16);
-        assert_eq!(size_of::<ReimsVgpuComputeSampledImage>(), 40);
-        assert_eq!(offset_of!(ReimsVgpuComputeSampledImage, swizzle), 36);
     }
 }
