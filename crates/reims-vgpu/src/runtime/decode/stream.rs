@@ -9,6 +9,7 @@ use crate::contract::size_fits_u32;
 // `SEGMENT_TYPE_INFO` is 4, not the next integer in sequence — a guess would
 // write 3, which is `SEGMENT_TYPE_EVENT` and stays local below. Protection
 // options joined once the capture drove that envelope.
+use reims_vgpu_wire::ops::segment as wire_segment;
 pub use reims_vgpu_wire::ops::segment::{
     PROTECTION_OPTIONS_ENVELOPE_LEN as PROTECTION_OPTIONS_PAYLOAD_LEN, SEGMENT_HEADER_LEN,
     SEGMENT_TYPE_BLIT, SEGMENT_TYPE_COMPUTE, SEGMENT_TYPE_INFO, SEGMENT_TYPE_PROTECTION_OPTIONS,
@@ -16,28 +17,35 @@ pub use reims_vgpu_wire::ops::segment::{
 };
 
 // The one type the wire crate deliberately does not name, because its capture
-// has never driven the encoder that writes it, plus this device's own
-// not-a-segment sentinel. Keeping them here rather than pushing them upstream
-// is the honest split: `reims-vgpu-wire` names what Apple's serializer was
-// observed to emit, and an unobserved value has no place in it.
+// has never driven the encoder that writes it. Keeping it here rather than
+// pushing it upstream is the honest split: `reims-vgpu-wire` names what Apple's
+// serializer was observed to emit, and an unobserved value has no place in it.
 pub const SEGMENT_TYPE_EVENT: u8 = 3;
-pub const SEGMENT_TYPE_UNKNOWN: u8 = 0xff;
 
-pub const SEGMENT_LENGTH_OFFSET: usize = 0;
-pub const SEGMENT_TYPE_OFFSET: usize = 4;
-pub const SEGMENT_CONT_OFFSET: usize = 5;
-pub const SEGMENT_CHAIN_OFFSET: usize = 6;
-pub const SEGMENT_PAD_OFFSET: usize = 7;
+/// Segment-header field offsets, from the view that derived them.
+///
+/// `SEGMENT_UNWRITTEN_OFFSET` is `size_of` rather than `offset_of` because the
+/// wire struct deliberately stops at seven bytes: the eighth is the one the
+/// serializer never writes, so it is the byte *after* the header rather than a
+/// field in it, and saying so here is the whole difference between reading it
+/// as ring contents and reading it as padding.
+pub const SEGMENT_LENGTH_OFFSET: usize = core::mem::offset_of!(wire_segment::SegmentHeader, length);
+pub const SEGMENT_TYPE_OFFSET: usize =
+    core::mem::offset_of!(wire_segment::SegmentHeader, segment_type);
+pub const SEGMENT_BEGIN_FLAG_OFFSET: usize =
+    core::mem::offset_of!(wire_segment::SegmentHeader, begin_flag);
+pub const SEGMENT_UNIDENTIFIED_OFFSET: usize =
+    core::mem::offset_of!(wire_segment::SegmentHeader, unidentified_u8);
+pub const SEGMENT_UNWRITTEN_OFFSET: usize = core::mem::size_of::<wire_segment::SegmentHeader>();
 
-pub const RECORD_OPCODE_OFFSET: usize = 0;
-pub const RECORD_LENGTH_OFFSET: usize = 4;
+/// Record-header field offsets. This is the serializer's op header, a different
+/// protocol level from the segment header above — see [`SEGMENT_HEADER_LEN`].
+pub const RECORD_OPCODE_OFFSET: usize = core::mem::offset_of!(reims_vgpu_wire::OpHeader, opcode);
+pub const RECORD_LENGTH_OFFSET: usize = core::mem::offset_of!(reims_vgpu_wire::OpHeader, length);
 /// Serializer op-header length ([`reims_vgpu_wire::OP_HEADER_LEN`]). Distinct
 /// from [`SEGMENT_HEADER_LEN`]: both are 8, but they frame different protocol
 /// levels — do not treat them as interchangeable.
 use reims_vgpu_wire::OP_HEADER_LEN;
-
-pub const INFO_RECORD_OPCODE: u32 = 0x180;
-pub const INFO_RECORD_LEN: u32 = 0x10;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DecodeStatus {
@@ -71,14 +79,30 @@ impl crate::observe::Refusal for DecodeStatus {
     }
 }
 
+/// One segment of the command stream, as decoded from its header.
+///
+/// The three bytes after `type_` are carried but never acted on: the device
+/// reads the length and the type and nothing else, and their only reader is
+/// `validate_segment`, which re-reads the header and refuses a stream whose
+/// bytes moved under it. They are named for what the oracle measured, because
+/// the names they had were three claims it has since settled — `cont` for the
+/// `BOOL` argument of `-beginSegment:protectionOptions:`, `chain` for a byte
+/// that has never been made to move, and `pad` for one the serializer does not
+/// write at all. See [`reims_vgpu_wire::ops::segment::SegmentHeader`], which
+/// records what each was perturbed with.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct Segment {
     pub offset: u32,
     pub length: u32,
     pub type_: u8,
-    pub cont: u8,
-    pub chain: u8,
-    pub pad: u8,
+    /// `-beginSegment:`'s unnamed `BOOL` first argument, verbatim.
+    pub begin_flag: u8,
+    /// Written, always `0` in every fixture, and not identified.
+    pub unidentified_u8: u8,
+    /// The eighth header byte, which neither `-beginSegment:` call writes. On a
+    /// real wire it is whatever the ring last contained, so it is not padding
+    /// and nothing may read it as a value.
+    pub unwritten_u8: u8,
     pub command_offset: u32,
     pub command_length: u32,
     pub index: u32,
@@ -234,9 +258,9 @@ pub fn decode_next_segment(bytes: &[u8], cursor: &mut usize) -> Result<Segment, 
         offset: *cursor as u32,
         length: segment_len as u32,
         type_: header[SEGMENT_TYPE_OFFSET],
-        cont: header[SEGMENT_CONT_OFFSET],
-        chain: header[SEGMENT_CHAIN_OFFSET],
-        pad: header[SEGMENT_PAD_OFFSET],
+        begin_flag: header[SEGMENT_BEGIN_FLAG_OFFSET],
+        unidentified_u8: header[SEGMENT_UNIDENTIFIED_OFFSET],
+        unwritten_u8: header[SEGMENT_UNWRITTEN_OFFSET],
         command_offset: (*cursor + SEGMENT_HEADER_LEN) as u32,
         command_length: (segment_len - SEGMENT_HEADER_LEN) as u32,
         index: segment_index,
@@ -261,9 +285,9 @@ fn validate_segment(bytes: &[u8], segment: &Segment) -> Result<usize, DecodeStat
     let header = &bytes[segment.offset as usize..];
     if ld32(&header[SEGMENT_LENGTH_OFFSET..]) != segment.length
         || header[SEGMENT_TYPE_OFFSET] != segment.type_
-        || header[SEGMENT_CONT_OFFSET] != segment.cont
-        || header[SEGMENT_CHAIN_OFFSET] != segment.chain
-        || header[SEGMENT_PAD_OFFSET] != segment.pad
+        || header[SEGMENT_BEGIN_FLAG_OFFSET] != segment.begin_flag
+        || header[SEGMENT_UNIDENTIFIED_OFFSET] != segment.unidentified_u8
+        || header[SEGMENT_UNWRITTEN_OFFSET] != segment.unwritten_u8
     {
         return Err(DecodeStatus::ErrBadLength("stream_reval_header_mismatch"));
     }
