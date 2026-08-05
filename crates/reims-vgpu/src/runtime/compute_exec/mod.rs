@@ -2002,6 +2002,18 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             format!("{w}x{h} bpp={bpp}"),
         );
     };
+    // The identity every cache question below asks about. Built once so the
+    // resident probe, the flush-and-serve, and the plain serve cannot drift
+    // from each other.
+    let window = crate::runtime::surface_cache::LinearWindow {
+        task_id,
+        texture_ref: stage_ref,
+        gva,
+        pixel_format: stage_format,
+        width: w,
+        height: h,
+        row_stride: layout.row_stride,
+    };
     // Linear-window residency identity — mirrors the host_linear_textures
     // entry exactly. Absent when the stride overflows the key field (no live
     // class; such a window simply stays on the bytes path).
@@ -2036,16 +2048,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
     #[cfg(feature = "backend-vulkan")]
     let resident = match (
         linear_key,
-        crate::runtime::surface_cache::linear_texture_resident_gen(
-            state,
-            task_id,
-            stage_ref,
-            gva,
-            stage_format,
-            w,
-            h,
-            layout.row_stride,
-        ),
+        crate::runtime::surface_cache::linear_texture_resident_gen(state, &window),
     ) {
         (Some(key), Some(resident_gen)) => Some((
             key,
@@ -2083,16 +2086,8 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
         // land the resident into the cache entry (and any owed guest
         // write) through the one flush path, then serve the bytes.
         if crate::runtime::storage_flush::flush_linear_one(state, host, &key, resident_gen) {
-            if let Some(cached) = crate::runtime::surface_cache::get_linear_texture(
-                state,
-                task_id,
-                stage_ref,
-                gva,
-                stage_format,
-                w,
-                h,
-                layout.row_stride,
-            ) {
+            if let Some(cached) = crate::runtime::surface_cache::get_linear_texture(state, &window)
+            {
                 bytes.copy_from_slice(cached);
                 have_bytes = true;
                 crate::observe::off(format!(
@@ -2116,16 +2111,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
     }
     if seed_skipped || sample_resident.is_some() || have_bytes {
         // Engine resident serves this window; no cache/guest read.
-    } else if let Some(cached) = crate::runtime::surface_cache::get_linear_texture(
-        state,
-        task_id,
-        stage_ref,
-        gva,
-        stage_format,
-        w,
-        h,
-        layout.row_stride,
-    ) {
+    } else if let Some(cached) = crate::runtime::surface_cache::get_linear_texture(state, &window) {
         bytes.copy_from_slice(cached);
         crate::observe::off(format!(
             "compute_stage_tex linear_cache task={task_id} ref={texture_ref} gva={gva:#x} fmt={:#x} dims={w}x{h} row_stride={}",
@@ -2397,17 +2383,16 @@ fn writeback_texture<M: HostMemory + HostOps>(
                 ));
                 return Err(ComputeStatus::GuestIo("compute_wb_tex_linear_layout"));
             }
-            if !crate::runtime::surface_cache::store_linear_texture(
-                state,
+            let window = crate::runtime::surface_cache::LinearWindow {
                 task_id,
-                *texture_ref,
-                *gva,
-                *pixel_format,
-                *width,
-                *height,
-                *row_stride,
-                &tex.bytes,
-            ) {
+                texture_ref: *texture_ref,
+                gva: *gva,
+                pixel_format: *pixel_format,
+                width: *width,
+                height: *height,
+                row_stride: *row_stride,
+            };
+            if !crate::runtime::surface_cache::store_linear_texture(state, &window, &tex.bytes) {
                 crate::observe::fail(format!(
                     "compute_writeback_tex fail reason=linear_cache_store task={task_id} ref={texture_ref} bind={} gva={gva:#x} fmt={pixel_format:#x} dims={}x{} bpp={} row_stride={} bytes={}",
                     tex.binding,
@@ -2420,15 +2405,7 @@ fn writeback_texture<M: HostMemory + HostOps>(
                 return Err(ComputeStatus::GuestIo("compute_wb_tex_linear_cache_store"));
             }
             crate::runtime::surface_cache::mirror_linear_color_cache(
-                state,
-                host,
-                task_id,
-                *texture_ref,
-                *gva,
-                *pixel_format,
-                *width,
-                *height,
-                &tex.bytes,
+                state, host, &window, &tex.bytes,
             );
             // Kept although the span is no longer needed here: the overflow is
             // a real refusal with a name, and `write_linear_guest` would only
@@ -3614,16 +3591,17 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
             ) = (t.residency, &t.writeback)
             {
                 let generation = next_mapping_content_generation(candidate.seed_generation);
-                if !crate::runtime::surface_cache::note_linear_texture_resident(
-                    state,
+                let window = crate::runtime::surface_cache::LinearWindow {
                     task_id,
-                    *texture_ref,
-                    *gva,
-                    *pixel_format,
-                    *width,
-                    *height,
-                    *row_stride,
-                    generation,
+                    texture_ref: *texture_ref,
+                    gva: *gva,
+                    pixel_format: *pixel_format,
+                    width: *width,
+                    height: *height,
+                    row_stride: *row_stride,
+                };
+                if !crate::runtime::surface_cache::note_linear_texture_resident(
+                    state, &window, generation,
                 ) {
                     crate::observe::fail(format!(
                         "compute_writeback_deferred fail reason=linear_note task={task_id} ref={texture_ref} gva={gva:#x} fmt={pixel_format:#x} dims={width}x{height} gen={generation}"

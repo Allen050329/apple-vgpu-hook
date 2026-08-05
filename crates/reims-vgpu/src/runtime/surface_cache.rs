@@ -380,122 +380,128 @@ pub fn evict_texture(state: &mut DeviceState, texture_ref: u32) {
     state.host_texture_surfaces.remove(&texture_ref);
 }
 
+/// The identity of one linear compute window: which object it is, where its
+/// guest backing sits, and the shape the guest declared over it.
+///
+/// Every `DeviceState::host_linear_textures` entry is *keyed* by
+/// `(task_id, texture_ref)` and *described* by the remaining five fields, and
+/// the cache serves an entry only while the asking window still describes it.
+/// A window the guest re-declared at another address, format or geometry is a
+/// different window; serving the old bytes for it hands a shader the content of
+/// something else.
+///
+/// It travels as one value because the five descriptor fields are meaningless
+/// apart — every operation here needs all of them, and the four that used to
+/// take them positionally could be, and were, called with two of them swapped
+/// without anything noticing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LinearWindow {
+    pub task_id: u32,
+    pub texture_ref: u32,
+    pub gva: u64,
+    pub pixel_format: u16,
+    pub width: u32,
+    pub height: u32,
+    pub row_stride: u64,
+}
+
+impl LinearWindow {
+    /// The `host_linear_textures` key this window addresses.
+    fn key(&self) -> (u32, u32) {
+        (self.task_id, self.texture_ref)
+    }
+
+    /// Bytes per pixel, but only for a window that can hold content at all:
+    /// a named object over a real address, with a nonzero extent and a stride
+    /// that reaches at least one tight row.
+    ///
+    /// This is the whole precondition both store paths share. `None` is a
+    /// refusal to create an entry, not a missing format lookup.
+    fn storable_bpp(&self) -> Option<u32> {
+        let bpp = crate::contract::pixel_format::bytes_per_pixel(self.pixel_format)?;
+        let ok = self.texture_ref != 0
+            && self.gva != 0
+            && self.width != 0
+            && self.height != 0
+            && self.row_stride >= (self.width as u64).saturating_mul(bpp as u64);
+        ok.then_some(bpp)
+    }
+
+    /// Length of one tightly packed image of this window, or `None` on overflow.
+    fn tight_len(&self, bpp: u32) -> Option<usize> {
+        (self.width as usize)
+            .checked_mul(self.height as usize)?
+            .checked_mul(bpp as usize)
+    }
+
+    /// Whether `entry` is the window this describes, rather than a later one
+    /// the guest re-declared over the same `(task, ref)` key.
+    fn describes(&self, entry: &crate::model::HostLinearTexture) -> bool {
+        entry.gva == self.gva
+            && entry.pixel_format == self.pixel_format
+            && entry.width == self.width
+            && entry.height == self.height
+            && entry.row_stride == self.row_stride
+    }
+
+    /// Take this window as `entry`'s descriptor, dropping whatever content the
+    /// previous descriptor held. Both store paths then set their own
+    /// generations; nothing else may reach these fields.
+    fn adopt(&self, entry: &mut crate::model::HostLinearTexture) {
+        entry.gva = self.gva;
+        entry.pixel_format = self.pixel_format;
+        entry.width = self.width;
+        entry.height = self.height;
+        entry.row_stride = self.row_stride;
+        entry.bytes.clear();
+    }
+}
+
 /// Store tight raw compute content for a type-2/3 texture object.
 ///
 /// This is the discrete GPU-private body. It deliberately survives
 /// MapMemory2/UnmapMemory; the guest GVA pages are only a pageable alias.
-#[allow(clippy::too_many_arguments)]
-pub fn store_linear_texture(
-    state: &mut DeviceState,
-    task_id: u32,
-    texture_ref: u32,
-    gva: u64,
-    pixel_format: u16,
-    width: u32,
-    height: u32,
-    row_stride: u64,
-    bytes: &[u8],
-) -> bool {
-    let Some(bpp) = crate::contract::pixel_format::bytes_per_pixel(pixel_format) else {
+pub fn store_linear_texture(state: &mut DeviceState, w: &LinearWindow, bytes: &[u8]) -> bool {
+    let Some(need) = w.storable_bpp().and_then(|bpp| w.tight_len(bpp)) else {
         return false;
     };
-    let Some(need) = (width as usize)
-        .checked_mul(height as usize)
-        .and_then(|n| n.checked_mul(bpp as usize))
-    else {
-        return false;
-    };
-    if texture_ref == 0
-        || gva == 0
-        || width == 0
-        || height == 0
-        || row_stride < (width as u64).saturating_mul(bpp as u64)
-        || bytes.len() < need
-    {
+    if bytes.len() < need {
         return false;
     }
-    let entry = state
-        .host_linear_textures
-        .entry((task_id, texture_ref))
-        .or_default();
+    let entry = state.host_linear_textures.entry(w.key()).or_default();
     entry.host_gen = entry.host_gen.wrapping_add(1);
     if entry.host_gen == 0 {
         entry.host_gen = 1;
     }
-    entry.gva = gva;
-    entry.pixel_format = pixel_format;
-    entry.width = width;
-    entry.height = height;
-    entry.row_stride = row_stride;
-    entry.bytes.clear();
+    w.adopt(entry);
     entry.bytes.extend_from_slice(&bytes[..need]);
     entry.resident_gen = 0;
     true
 }
 
 /// Deferred linear writeback: the engine's pinned resident storage image at
-/// `generation` becomes the authoritative content for this (task, ref) window;
-/// no bytes are stored. Same validation as [`store_linear_texture`].
-#[allow(clippy::too_many_arguments)]
+/// `generation` becomes the authoritative content for this window; no bytes are
+/// stored. Same window precondition as [`store_linear_texture`].
 pub fn note_linear_texture_resident(
     state: &mut DeviceState,
-    task_id: u32,
-    texture_ref: u32,
-    gva: u64,
-    pixel_format: u16,
-    width: u32,
-    height: u32,
-    row_stride: u64,
+    w: &LinearWindow,
     generation: u32,
 ) -> bool {
-    let Some(bpp) = crate::contract::pixel_format::bytes_per_pixel(pixel_format) else {
-        return false;
-    };
-    if texture_ref == 0
-        || gva == 0
-        || width == 0
-        || height == 0
-        || generation == 0
-        || row_stride < (width as u64).saturating_mul(bpp as u64)
-    {
+    if generation == 0 || w.storable_bpp().is_none() {
         return false;
     }
-    let entry = state
-        .host_linear_textures
-        .entry((task_id, texture_ref))
-        .or_default();
+    let entry = state.host_linear_textures.entry(w.key()).or_default();
     entry.host_gen = generation;
-    entry.gva = gva;
-    entry.pixel_format = pixel_format;
-    entry.width = width;
-    entry.height = height;
-    entry.row_stride = row_stride;
-    entry.bytes.clear();
+    w.adopt(entry);
     entry.resident_gen = generation;
     true
 }
 
-/// Resident generation of a linear window when the current descriptor still
-/// matches and the entry is resident-authoritative (deferred writeback).
-#[allow(clippy::too_many_arguments)]
-pub fn linear_texture_resident_gen(
-    state: &DeviceState,
-    task_id: u32,
-    texture_ref: u32,
-    gva: u64,
-    pixel_format: u16,
-    width: u32,
-    height: u32,
-    row_stride: u64,
-) -> Option<u32> {
-    let entry = state.host_linear_textures.get(&(task_id, texture_ref))?;
-    if entry.resident_gen == 0
-        || entry.gva != gva
-        || entry.pixel_format != pixel_format
-        || entry.width != width
-        || entry.height != height
-        || entry.row_stride != row_stride
-    {
+/// Resident generation of a linear window when the entry is still the one this
+/// window describes and is resident-authoritative (deferred writeback).
+pub fn linear_texture_resident_gen(state: &DeviceState, w: &LinearWindow) -> Option<u32> {
+    let entry = state.host_linear_textures.get(&w.key())?;
+    if entry.resident_gen == 0 || !w.describes(entry) {
         return None;
     }
     Some(entry.resident_gen)
@@ -603,31 +609,15 @@ pub fn materialize_linear_resident(
     Ok(())
 }
 
-/// Borrow a raw compute encode only when the current descriptor still matches.
-#[allow(clippy::too_many_arguments)]
-pub fn get_linear_texture(
-    state: &DeviceState,
-    task_id: u32,
-    texture_ref: u32,
-    gva: u64,
-    pixel_format: u16,
-    width: u32,
-    height: u32,
-    row_stride: u64,
-) -> Option<&[u8]> {
-    let entry = state.host_linear_textures.get(&(task_id, texture_ref))?;
-    if entry.gva != gva
-        || entry.pixel_format != pixel_format
-        || entry.width != width
-        || entry.height != height
-        || entry.row_stride != row_stride
-    {
+/// Borrow a raw compute encode only while the entry is still the window this
+/// describes.
+pub fn get_linear_texture<'a>(state: &'a DeviceState, w: &LinearWindow) -> Option<&'a [u8]> {
+    let entry = state.host_linear_textures.get(&w.key())?;
+    if !w.describes(entry) {
         return None;
     }
-    let bpp = crate::contract::pixel_format::bytes_per_pixel(pixel_format)? as usize;
-    let need = (width as usize)
-        .checked_mul(height as usize)?
-        .checked_mul(bpp)?;
+    let bpp = crate::contract::pixel_format::bytes_per_pixel(w.pixel_format)?;
+    let need = w.tight_len(bpp)?;
     (entry.bytes.len() >= need).then(|| &entry.bytes[..need])
 }
 
@@ -650,28 +640,23 @@ pub fn linear_mirrorable(pixel_format: u16) -> bool {
 
 /// Mirror normalized 8-bit compute output into the established BGRA sample
 /// caches so a later render view over the same object/GVA observes the encode.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the mirrored identity is the object, GVA, format, geometry, and guest backing"
-)]
+///
+/// Reads every field of `w` but `row_stride`: the mirrored caches hold tight
+/// rows, so the source stride is the one part of the window identity that does
+/// not travel with the content.
 pub fn mirror_linear_color_cache<M: HostMemory + crate::runtime::host::HostOps>(
     state: &mut DeviceState,
     host: &mut M,
-    task_id: u32,
-    texture_ref: u32,
-    gva: u64,
-    pixel_format: u16,
-    width: u32,
-    height: u32,
+    w: &LinearWindow,
     bytes: &[u8],
 ) {
     use crate::contract::pixel_format::{
         MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_BGRA8_UNORM_SRGB, MTL_FORMAT_RGBA8_UNORM,
         MTL_FORMAT_RGBA8_UNORM_SRGB,
     };
-    let Some(need) = (width as usize)
-        .checked_mul(height as usize)
-        .and_then(|n| n.checked_mul(4))
+    let Some(need) = (w.width as usize)
+        .checked_mul(w.height as usize)
+        .and_then(|n| n.checked_mul(RGBA8_BPP as usize))
     else {
         return;
     };
@@ -679,18 +664,18 @@ pub fn mirror_linear_color_cache<M: HostMemory + crate::runtime::host::HostOps>(
         return;
     }
     let mut bgra = bytes[..need].to_vec();
-    match pixel_format {
+    match w.pixel_format {
         MTL_FORMAT_RGBA8_UNORM | MTL_FORMAT_RGBA8_UNORM_SRGB => {
-            for px in bgra.chunks_exact_mut(4) {
+            for px in bgra.chunks_exact_mut(RGBA8_BPP as usize) {
                 px.swap(0, 2);
             }
         }
         MTL_FORMAT_BGRA8_UNORM | MTL_FORMAT_BGRA8_UNORM_SRGB => {}
         _ => return,
     }
-    store_texture(state, texture_ref, width, height, bgra.clone(), gva);
-    let backing = gva_backing(state, host, task_id, gva, width, height);
-    store_gva_owned(state, gva, width, height, bgra, 0, backing);
+    store_texture(state, w.texture_ref, w.width, w.height, bgra.clone(), w.gva);
+    let backing = gva_backing(state, host, w.task_id, w.gva, w.width, w.height);
+    store_gva_owned(state, w.gva, w.width, w.height, bgra, 0, backing);
 }
 
 /// The guest page currently backing `gva` under `task_id`, page-aligned.
@@ -1418,22 +1403,20 @@ mod tests {
     fn a_short_resident_readback_is_distinguishable_from_a_supersede() {
         use crate::contract::pixel_format::MTL_FORMAT_RGBA16_FLOAT;
         let mut st = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        let (task, r, gva, w, h, stride) = (6u32, 21u32, 0x30_2000u64, 4u32, 2u32, 32u64);
-        assert!(note_linear_texture_resident(
-            &mut st,
-            task,
-            r,
-            gva,
-            MTL_FORMAT_RGBA16_FLOAT,
-            w,
-            h,
-            stride,
-            2,
-        ));
-        let need = (w * h * 8) as usize;
+        let win = LinearWindow {
+            task_id: 6,
+            texture_ref: 21,
+            gva: 0x30_2000,
+            pixel_format: MTL_FORMAT_RGBA16_FLOAT,
+            width: 4,
+            height: 2,
+            row_stride: 32,
+        };
+        assert!(note_linear_texture_resident(&mut st, &win, 2));
+        let need = (win.width * win.height * 8) as usize;
         let short = vec![0xabu8; need - 1];
         assert_eq!(
-            materialize_linear_resident(&mut st, task, r, 2, &short),
+            materialize_linear_resident(&mut st, win.task_id, win.texture_ref, 2, &short),
             Err(LinearMaterializeDecline::ReadbackShort {
                 got: need - 1,
                 need,
@@ -1441,7 +1424,7 @@ mod tests {
             "a live entry that could not be filled is a loss, not a supersede"
         );
         assert_eq!(
-            linear_texture_resident_gen(&st, task, r, gva, MTL_FORMAT_RGBA16_FLOAT, w, h, stride),
+            linear_texture_resident_gen(&st, &win),
             Some(2),
             "the entry is still resident-authoritative, so the frame is in neither place"
         );
@@ -1455,47 +1438,44 @@ mod tests {
     fn linear_resident_note_materialize_and_store_clear() {
         use crate::contract::pixel_format::{MTL_FORMAT_RGBA16_FLOAT, MTL_FORMAT_RGBA8_UNORM};
         let mut st = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        let (task, r, gva, w, h, stride) = (6u32, 21u32, 0x30_2000u64, 4u32, 2u32, 32u64);
-        assert!(note_linear_texture_resident(
-            &mut st,
-            task,
-            r,
-            gva,
-            MTL_FORMAT_RGBA16_FLOAT,
-            w,
-            h,
-            stride,
-            2,
-        ));
-        assert_eq!(
-            linear_texture_resident_gen(&st, task, r, gva, MTL_FORMAT_RGBA16_FLOAT, w, h, stride),
-            Some(2)
-        );
+        let win = LinearWindow {
+            task_id: 6,
+            texture_ref: 21,
+            gva: 0x30_2000,
+            pixel_format: MTL_FORMAT_RGBA16_FLOAT,
+            width: 4,
+            height: 2,
+            row_stride: 32,
+        };
+        let (task, r) = (win.task_id, win.texture_ref);
+        assert!(note_linear_texture_resident(&mut st, &win, 2));
+        assert_eq!(linear_texture_resident_gen(&st, &win), Some(2));
         // Bytes consumers see nothing while resident-authoritative.
-        assert!(
-            get_linear_texture(&st, task, r, gva, MTL_FORMAT_RGBA16_FLOAT, w, h, stride).is_none()
-        );
+        assert!(get_linear_texture(&st, &win).is_none());
         // Any descriptor drift invalidates the resident claim.
         assert_eq!(
-            linear_texture_resident_gen(&st, task, r, gva, MTL_FORMAT_RGBA8_UNORM, w, h, stride),
+            linear_texture_resident_gen(
+                &st,
+                &LinearWindow {
+                    pixel_format: MTL_FORMAT_RGBA8_UNORM,
+                    ..win
+                }
+            ),
             None
         );
         assert_eq!(
             linear_texture_resident_gen(
                 &st,
-                task,
-                r,
-                gva + 0x1000,
-                MTL_FORMAT_RGBA16_FLOAT,
-                w,
-                h,
-                stride
+                &LinearWindow {
+                    gva: win.gva + 0x1000,
+                    ..win
+                }
             ),
             None
         );
         // Materialize with the wrong generation is refused; the right one
         // lands bytes and clears the marker.
-        let flushed = vec![0xabu8; (w * h * 8) as usize];
+        let flushed = vec![0xabu8; (win.width * win.height * 8) as usize];
         assert_eq!(
             materialize_linear_resident(&mut st, task, r, 9, &flushed),
             Err(LinearMaterializeDecline::Superseded { resident_gen: 2 }),
@@ -1505,41 +1485,88 @@ mod tests {
             materialize_linear_resident(&mut st, task, r, 2, &flushed),
             Ok(())
         );
-        assert_eq!(
-            linear_texture_resident_gen(&st, task, r, gva, MTL_FORMAT_RGBA16_FLOAT, w, h, stride),
-            None
-        );
-        let got = get_linear_texture(&st, task, r, gva, MTL_FORMAT_RGBA16_FLOAT, w, h, stride)
-            .expect("materialized bytes");
+        assert_eq!(linear_texture_resident_gen(&st, &win), None);
+        let got = get_linear_texture(&st, &win).expect("materialized bytes");
         assert!(got.iter().all(|&b| b == 0xab));
         // A later resident note supersedes; a plain store clears again.
-        assert!(note_linear_texture_resident(
-            &mut st,
-            task,
-            r,
-            gva,
-            MTL_FORMAT_RGBA16_FLOAT,
-            w,
-            h,
-            stride,
-            3,
-        ));
-        let px = vec![0x5au8; (w * h * 8) as usize];
-        assert!(store_linear_texture(
-            &mut st,
-            task,
-            r,
-            gva,
-            MTL_FORMAT_RGBA16_FLOAT,
-            w,
-            h,
-            stride,
-            &px,
-        ));
-        assert_eq!(
-            linear_texture_resident_gen(&st, task, r, gva, MTL_FORMAT_RGBA16_FLOAT, w, h, stride),
-            None
-        );
+        assert!(note_linear_texture_resident(&mut st, &win, 3));
+        let px = vec![0x5au8; (win.width * win.height * 8) as usize];
+        assert!(store_linear_texture(&mut st, &win, &px));
+        assert_eq!(linear_texture_resident_gen(&st, &win), None);
+    }
+
+    /// The two store paths admit exactly the same windows.
+    ///
+    /// They used to carry a copy each of this test, and the copies were not
+    /// identical — a divergence would have meant a window the bytes path
+    /// created but the deferred path refused, or the reverse, with the caller
+    /// choosing between them for reasons that have nothing to do with the
+    /// window. Both now ask `storable_bpp`; this fails if either grows its own
+    /// again.
+    #[test]
+    fn both_linear_store_paths_admit_the_same_windows() {
+        use crate::contract::pixel_format::MTL_FORMAT_RGBA16_FLOAT;
+        let ok = LinearWindow {
+            task_id: 6,
+            texture_ref: 21,
+            gva: 0x30_2000,
+            pixel_format: MTL_FORMAT_RGBA16_FLOAT,
+            width: 4,
+            height: 2,
+            row_stride: 32,
+        };
+        // Every way a window can fail to name storable content, plus the
+        // baseline that must still be admitted.
+        let cases = [
+            ("ok", ok, true),
+            (
+                "no object",
+                LinearWindow {
+                    texture_ref: 0,
+                    ..ok
+                },
+                false,
+            ),
+            ("no address", LinearWindow { gva: 0, ..ok }, false),
+            ("zero width", LinearWindow { width: 0, ..ok }, false),
+            ("zero height", LinearWindow { height: 0, ..ok }, false),
+            // 4 px × 8 bytes = 32, so 31 cannot hold one row.
+            (
+                "stride under one tight row",
+                LinearWindow {
+                    row_stride: 31,
+                    ..ok
+                },
+                false,
+            ),
+            (
+                "unsized format",
+                LinearWindow {
+                    pixel_format: 0xffff,
+                    ..ok
+                },
+                false,
+            ),
+        ];
+        for (name, win, admits) in cases {
+            let mut st = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+            let px = vec![0u8; (win.width.max(1) * win.height.max(1) * 8) as usize];
+            assert_eq!(
+                store_linear_texture(&mut st, &win, &px),
+                admits,
+                "bytes store disagrees on {name}"
+            );
+            let mut st = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+            assert_eq!(
+                note_linear_texture_resident(&mut st, &win, 7),
+                admits,
+                "deferred store disagrees on {name}"
+            );
+        }
+        // The one precondition the deferred path holds alone: generation 0 is
+        // its "no resident" value, so it can never be stored as one.
+        let mut st = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        assert!(!note_linear_texture_resident(&mut st, &ok, 0));
     }
 
     /// Task/object deletion of a resident-authoritative entry queues the
@@ -1549,17 +1576,16 @@ mod tests {
         use crate::contract::pixel_format::MTL_FORMAT_RGBA16_FLOAT;
         let mut st = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         st.define_task(6, 0x1000, 1);
-        assert!(note_linear_texture_resident(
-            &mut st,
-            6,
-            21,
-            0x30_2000,
-            MTL_FORMAT_RGBA16_FLOAT,
-            4,
-            2,
-            32,
-            2,
-        ));
+        let win = LinearWindow {
+            task_id: 6,
+            texture_ref: 21,
+            gva: 0x30_2000,
+            pixel_format: MTL_FORMAT_RGBA16_FLOAT,
+            width: 4,
+            height: 2,
+            row_stride: 32,
+        };
+        assert!(note_linear_texture_resident(&mut st, &win, 2));
         // A pending guest-flush obligation dies with the entry (boot-16 rule:
         // never write guest pages at a lifetime boundary).
         let obligation_key = crate::model::ComputeStorageResidencyKey::linear(
@@ -1589,17 +1615,7 @@ mod tests {
 
         st.define_task(6, 0x1000, 1);
         st.insert_object(6, 21);
-        assert!(note_linear_texture_resident(
-            &mut st,
-            6,
-            21,
-            0x30_2000,
-            MTL_FORMAT_RGBA16_FLOAT,
-            4,
-            2,
-            32,
-            5,
-        ));
+        assert!(note_linear_texture_resident(&mut st, &win, 5));
         assert!(st.delete_object(6, 21));
         assert_eq!(st.retired_linear_residents.len(), 1);
         assert_eq!(st.retired_linear_residents[0].texture_ref, 21);
@@ -1609,13 +1625,11 @@ mod tests {
         st.insert_object(6, 22);
         assert!(store_linear_texture(
             &mut st,
-            6,
-            22,
-            0x40_0000,
-            MTL_FORMAT_RGBA16_FLOAT,
-            4,
-            2,
-            32,
+            &LinearWindow {
+                texture_ref: 22,
+                gva: 0x40_0000,
+                ..win
+            },
             &px,
         ));
         assert!(st.delete_object(6, 22));

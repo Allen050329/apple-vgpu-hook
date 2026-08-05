@@ -1374,13 +1374,15 @@ fn linear_writeback_retains_cache_when_guest_gva_is_unmapped() {
     assert_eq!(
         surface_cache::get_linear_texture(
             &state,
-            task_id,
-            texture_ref,
-            gva,
-            MTL_FORMAT_RGBA8_UNORM,
-            2,
-            2,
-            8,
+            &surface_cache::LinearWindow {
+                task_id,
+                texture_ref,
+                gva,
+                pixel_format: MTL_FORMAT_RGBA8_UNORM,
+                width: 2,
+                height: 2,
+                row_stride: 8,
+            },
         ),
         Some(rgba.as_slice())
     );
