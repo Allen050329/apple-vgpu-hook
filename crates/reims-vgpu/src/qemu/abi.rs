@@ -807,6 +807,37 @@ mod tests {
         );
     }
 
+    /// The five entry-point return codes agree with the shim header.
+    ///
+    /// `REIMS_VGPU_QEMU_OK` is the one that matters most and reads the most
+    /// harmless. Both shims' `deliver_actions` drain the action queue with
+    /// `while (rc = pop_action(..)) == REIMS_VGPU_QEMU_OK`, so a drift there does
+    /// not misreport anything — the loop simply never runs, every HostAction the
+    /// device queues is silently left in it, and IRQ pulses, scanout updates and
+    /// window input all stop reaching the guest with no failure on any channel.
+    /// `_EMPTY` is its partner: the value that legitimately ends that loop.
+    ///
+    /// All five rather than the two the shims name today, on the same reasoning
+    /// as the guest-page family — the error codes are what a new entry point
+    /// reaches for next, and pinning only what is read now leaves the rest to
+    /// drift until something depends on them.
+    #[test]
+    fn the_abi_header_agrees_on_the_entry_point_return_codes() {
+        for (name, ours) in [
+            ("REIMS_VGPU_QEMU_OK", REIMS_VGPU_QEMU_OK),
+            ("REIMS_VGPU_QEMU_ERR_ARGS", REIMS_VGPU_QEMU_ERR_ARGS),
+            ("REIMS_VGPU_QEMU_ERR_STATE", REIMS_VGPU_QEMU_ERR_STATE),
+            ("REIMS_VGPU_QEMU_ERR_PANIC", REIMS_VGPU_QEMU_ERR_PANIC),
+            ("REIMS_VGPU_QEMU_EMPTY", REIMS_VGPU_QEMU_EMPTY),
+        ] {
+            assert_eq!(
+                header_define_i32(name),
+                ours,
+                "{name} has drifted from the staticlib's value"
+            );
+        }
+    }
+
     /// Every dma-buf refusal code exists twice — once here, once in the shim
     /// header — and nothing in the build compares them. A drift makes the shim
     /// say "guest RAM is not fd-backed" and the staticlib hear "this list is
