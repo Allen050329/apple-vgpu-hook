@@ -50,8 +50,6 @@ impl crate::observe::Decline for VertexFormatWidenDecline {
 }
 use crate::backend::vulkan::translate;
 
-const CAP_DEFAULT: usize = 1024;
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct AttrKey {
     pub location: u32,
@@ -200,32 +198,71 @@ pub(crate) struct ComputePipelineKey {
     pub layout: LayoutKey,
 }
 
-struct FifoCache<K, V> {
+/// How many distinct never-creatable keys a cache remembers the refusal for.
+///
+/// This bounds the **negative** map only, and it is the one bound in this file
+/// that is not a fidelity question: an evicted negative entry costs a re-attempt
+/// of a create that has already been measured to fail, never a dropped guest
+/// object. The positive maps are deliberately unbounded — see [`ObjectCache`].
+const NEGATIVE_CAP: usize = 1024;
+
+/// A content-keyed cache of immutable Vulkan objects, plus the typed refusal for
+/// keys whose create failed.
+///
+/// **The positive map is unbounded, and that is the contract.** Every key here
+/// is a content digest or a full descriptor of guest-decoded state — a shader's
+/// SPIR-V digest, a pipeline's complete key, a sampler's state. So the live
+/// entry count is the number of *distinct* objects the guest has asked for,
+/// which is a property of its own program and state set rather than of how long
+/// the device has run.
+///
+/// It used to hold 1024 (64 for render passes) and evict in **insertion** order.
+/// Insertion order is the worst possible choice here for the same reason it was
+/// in `runtime::m2v_cache`: the first pipeline a boot creates is the
+/// compositor's, and it is bound on every frame until the guest shuts down, so
+/// the first thing a cap crossing discards is the entry that is still hot. The
+/// re-create is `vkCreateGraphicsPipelines` — a driver-side shader compile, not
+/// a lookup — so a thrashing cache pays one compile per frame per evicted
+/// pipeline, forever.
+///
+/// The bound also never engaged. A driven Safari boot sums 86 `pipeline_misses`
+/// over its whole life, so the live pipeline map peaks an order of magnitude
+/// under the cap it carried; the cap only stood ready to evict the hot set on a
+/// heavier guest.
+///
+/// Unbounded is also the faithful failure mode. When a guest really does ask for
+/// more distinct pipelines than the host can hold, the create itself returns
+/// `VK_ERROR_OUT_OF_DEVICE_MEMORY`, which lands in `negative` as a typed
+/// [`DrawError`] and is reported. That is a GPU refusing because its memory is
+/// full — the behavior we are emulating — rather than a device that silently
+/// forgets an object the guest still has bound.
+struct ObjectCache<K, V> {
     map: HashMap<K, V>,
-    order: VecDeque<K>,
-    cap: usize,
     negative: HashMap<K, DrawError>,
-    /// FIFO order for `negative`, bounded by the same `cap` as the positive
-    /// map. Negative entries are only added on genuine create failures — a
-    /// Vulkan create call refusing (a typed [`VkCall`]) or a device-capability
-    /// refusal (`DrawError::Unsupported`, e.g. an unsupported vertex divisor) —
-    /// empty on a healthy boot, but a guest that keeps submitting distinct
+    /// FIFO order for `negative`, bounded by [`NEGATIVE_CAP`]. Negative entries
+    /// are only added on genuine create failures — a Vulkan create call refusing
+    /// (a typed [`VkCall`]) or a device-capability refusal
+    /// (`DrawError::Unsupported`, e.g. an unsupported vertex divisor) — empty on
+    /// a healthy boot, but a guest that keeps submitting distinct
     /// never-creatable objects would grow `negative` without limit if it were
-    /// unbounded. Evicting the oldest negative entry only means the next attempt
-    /// re-tries the (cheap) create. The value is the exact typed [`DrawError`]
-    /// the create refused with, so the cheap re-attempt replays that reason —
-    /// slug and all — rather than a re-formatted `Vulkan(String)` that dropped it.
+    /// unbounded. The value is the exact typed [`DrawError`] the create refused
+    /// with, so the cheap re-attempt replays that reason — slug and all — rather
+    /// than a re-formatted `Vulkan(String)` that dropped it.
     negative_order: VecDeque<K>,
+    negative_cap: usize,
 }
 
-impl<K: Clone + Eq + std::hash::Hash, V> FifoCache<K, V> {
-    fn new(cap: usize) -> Self {
+impl<K: Clone + Eq + std::hash::Hash, V> ObjectCache<K, V> {
+    fn new() -> Self {
+        Self::with_negative_cap(NEGATIVE_CAP)
+    }
+
+    fn with_negative_cap(negative_cap: usize) -> Self {
         Self {
             map: HashMap::new(),
-            order: VecDeque::new(),
-            cap,
             negative: HashMap::new(),
             negative_order: VecDeque::new(),
+            negative_cap,
         }
     }
 
@@ -237,22 +274,12 @@ impl<K: Clone + Eq + std::hash::Hash, V> FifoCache<K, V> {
         self.negative.get(k).cloned()
     }
 
-    /// Insert; returns any FIFO-evicted value so the caller can destroy the Vulkan object.
+    /// Insert. Returns the value a *replace* displaced, so the caller can
+    /// destroy the Vulkan object it owned; a fresh key returns `None`. Nothing
+    /// is ever displaced for capacity.
     fn insert(&mut self, k: K, v: V) -> Option<V> {
-        if let Some(existing) = self.map.get_mut(&k) {
-            *existing = v;
-            return None;
-        }
-        let mut evicted = None;
-        if self.order.len() >= self.cap {
-            if let Some(old) = self.order.pop_front() {
-                evicted = self.map.remove(&old);
-            }
-        }
         self.negative.remove(&k);
-        self.order.push_back(k.clone());
-        self.map.insert(k, v);
-        evicted
+        self.map.insert(k, v)
     }
 
     fn insert_negative(&mut self, k: K, err: DrawError) {
@@ -261,9 +288,9 @@ impl<K: Clone + Eq + std::hash::Hash, V> FifoCache<K, V> {
             return;
         }
         self.negative_order.push_back(k);
-        // Bound the negative map by `cap`, oldest-first. Pops skip stale order
-        // entries (keys since promoted into the positive map by `insert`).
-        while self.negative.len() > self.cap {
+        // Bound the negative map, oldest-first. Pops skip stale order entries
+        // (keys since promoted into the positive map by `insert`).
+        while self.negative.len() > self.negative_cap {
             match self.negative_order.pop_front() {
                 Some(old) => {
                     self.negative.remove(&old);
@@ -273,7 +300,7 @@ impl<K: Clone + Eq + std::hash::Hash, V> FifoCache<K, V> {
         }
         // Compact the order deque if promotions left many stale entries, so it
         // can never itself grow unbounded (rare; error path only).
-        if self.negative_order.len() > self.cap.saturating_mul(2) {
+        if self.negative_order.len() > self.negative_cap.saturating_mul(2) {
             self.negative_order
                 .retain(|key| self.negative.contains_key(key));
         }
@@ -281,13 +308,11 @@ impl<K: Clone + Eq + std::hash::Hash, V> FifoCache<K, V> {
 
     fn clear(&mut self) {
         self.map.clear();
-        self.order.clear();
         self.negative.clear();
         self.negative_order.clear();
     }
 
     fn take_all(&mut self) -> Vec<V> {
-        self.order.clear();
         self.negative.clear();
         self.negative_order.clear();
         self.map.drain().map(|(_, v)| v).collect()
@@ -295,24 +320,24 @@ impl<K: Clone + Eq + std::hash::Hash, V> FifoCache<K, V> {
 }
 
 pub(crate) struct ObjectCaches {
-    shaders: FifoCache<Digest128, vk::ShaderModule>,
-    layouts: FifoCache<LayoutKey, (vk::DescriptorSetLayout, vk::PipelineLayout)>,
-    passes: FifoCache<PassKey, vk::RenderPass>,
-    pipelines: FifoCache<PipelineKey, vk::Pipeline>,
-    samplers: FifoCache<SamplerStateKey, vk::Sampler>,
+    shaders: ObjectCache<Digest128, vk::ShaderModule>,
+    layouts: ObjectCache<LayoutKey, (vk::DescriptorSetLayout, vk::PipelineLayout)>,
+    passes: ObjectCache<PassKey, vk::RenderPass>,
+    pipelines: ObjectCache<PipelineKey, vk::Pipeline>,
+    samplers: ObjectCache<SamplerStateKey, vk::Sampler>,
     /// Lc: compute pipelines (content digest + entry + layout).
-    compute_pipelines: FifoCache<ComputePipelineKey, vk::Pipeline>,
+    compute_pipelines: ObjectCache<ComputePipelineKey, vk::Pipeline>,
 }
 
 impl ObjectCaches {
     pub(crate) fn new() -> Self {
         Self {
-            shaders: FifoCache::new(CAP_DEFAULT),
-            layouts: FifoCache::new(CAP_DEFAULT),
-            passes: FifoCache::new(64),
-            pipelines: FifoCache::new(CAP_DEFAULT),
-            samplers: FifoCache::new(CAP_DEFAULT),
-            compute_pipelines: FifoCache::new(CAP_DEFAULT),
+            shaders: ObjectCache::new(),
+            layouts: ObjectCache::new(),
+            passes: ObjectCache::new(),
+            pipelines: ObjectCache::new(),
+            samplers: ObjectCache::new(),
+            compute_pipelines: ObjectCache::new(),
         }
     }
 
@@ -1149,7 +1174,7 @@ impl ObjectCaches {
 }
 
 #[cfg(test)]
-mod fifo_cache_tests {
+mod object_cache_tests {
     use super::*;
 
     #[test]
@@ -1179,7 +1204,7 @@ mod fifo_cache_tests {
         // Negative entries (create failures) must not grow without bound: a
         // guest submitting endless distinct never-creatable objects would
         // otherwise leak one entry per distinct key forever.
-        let mut c: FifoCache<u32, u32> = FifoCache::new(4);
+        let mut c: ObjectCache<u32, u32> = ObjectCache::with_negative_cap(4);
         for k in 0..100u32 {
             c.insert_negative(
                 k,
@@ -1202,11 +1227,49 @@ mod fifo_cache_tests {
         assert!(c.get_negative(&0).is_none(), "oldest negative evicted");
     }
 
+    /// The first pipeline a boot creates is the compositor's, and it stays bound
+    /// for the life of the guest. Under the retired insertion-order cap it was
+    /// also the first thing a cap crossing threw away. Drive far past every cap
+    /// this file used to carry (1024, and 64 for render passes) and assert the
+    /// first key is still served and nothing was displaced for capacity.
+    #[test]
+    fn the_first_key_survives_far_past_every_retired_capacity() {
+        let mut c: ObjectCache<u32, u32> = ObjectCache::new();
+        c.insert(0, 0xC0FFEE);
+        for k in 1..4096u32 {
+            assert!(
+                c.insert(k, k).is_none(),
+                "a fresh key displaces nothing: {k}"
+            );
+        }
+        assert_eq!(
+            c.get(&0),
+            Some(&0xC0FFEE),
+            "the hot first entry is still served after 4095 later ones"
+        );
+        assert_eq!(c.map.len(), 4096, "every distinct key retained");
+    }
+
+    /// A replace hands the displaced handle back so the caller can destroy it.
+    /// The retired implementation overwrote in place and returned `None`, which
+    /// leaked the Vulkan object it had just dropped the last reference to.
+    #[test]
+    fn replacing_a_key_returns_the_displaced_value_to_destroy() {
+        let mut c: ObjectCache<u32, u32> = ObjectCache::new();
+        assert_eq!(c.insert(1, 10), None);
+        assert_eq!(
+            c.insert(1, 20),
+            Some(10),
+            "the displaced handle comes back for disposal"
+        );
+        assert_eq!(c.get(&1), Some(&20));
+    }
+
     #[test]
     fn positive_insert_clears_negative_for_the_key() {
         // A key that failed then later succeeds must not keep serving the stale
         // negative error.
-        let mut c: FifoCache<u32, u32> = FifoCache::new(4);
+        let mut c: ObjectCache<u32, u32> = ObjectCache::with_negative_cap(4);
         c.insert_negative(
             7,
             DrawError::VkCall(VkCall::new(
@@ -1222,7 +1285,7 @@ mod fifo_cache_tests {
 
     #[test]
     fn reinserting_same_negative_does_not_duplicate_order() {
-        let mut c: FifoCache<u32, u32> = FifoCache::new(4);
+        let mut c: ObjectCache<u32, u32> = ObjectCache::with_negative_cap(4);
         let a = DrawError::VkCall(VkCall::new(
             VkOp::CachesCreateShaderModule,
             vk::Result::ERROR_OUT_OF_HOST_MEMORY,
