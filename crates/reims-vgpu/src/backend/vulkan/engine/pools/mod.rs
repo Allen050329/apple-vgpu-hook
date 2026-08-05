@@ -796,6 +796,27 @@ impl ResidentTargetSlot {
         self.color_format == translate::pixel::SCANOUT_FORMAT
     }
 
+    /// The framebuffer this slot owes the deferred-destroy path, or `None` when
+    /// it has none to give.
+    ///
+    /// **Only a resident's framebuffer is optional.** The MRT-secondary arm
+    /// builds no per-slot framebuffer — a secondary attachment is only ever
+    /// bound as attachment N of an ad-hoc MRT framebuffer or sampled through
+    /// its view — so every slot it creates stores `VK_NULL_HANDLE` here, while
+    /// the target pool creates a framebuffer beside every slot it hands out and
+    /// can never store a null one.
+    ///
+    /// A question rather than a field for the same reason as
+    /// [`Self::scanout_order`] one method up: the same identity can be created
+    /// by either arm and then destroyed by any of three paths, and each of the
+    /// three answered this separately. `vkDestroyFramebuffer` accepts the null
+    /// handle and does nothing with it, so the two that answered it wrong were
+    /// neither a crash nor a log line — they spent a graveyard entry, which is
+    /// a bounded ring shared with every destroy that is real.
+    pub(crate) fn owed_framebuffer(&self) -> Option<vk::Framebuffer> {
+        (self.framebuffer != vk::Framebuffer::null()).then_some(self.framebuffer)
+    }
+
     /// Whether this slot's image may be re-used for a request of this geometry,
     /// generation and attachment format.
     ///

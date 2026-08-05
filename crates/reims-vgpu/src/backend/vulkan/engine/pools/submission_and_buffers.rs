@@ -448,12 +448,12 @@ impl ResourcePools {
         };
         let drained = victims.len();
         for k in victims {
-            if let Some(pos) = self.registry_order.iter().position(|x| x == &k) {
-                self.registry_order.remove(pos);
-            }
-            if let Some(old) = self.registry.remove(&k) {
-                self.note_resident_reclaimed(&k, ResidentReclaim::IdleDrained);
-                self.dispose(&ctx.device, DeferredHandle::Framebuffer(old.framebuffer));
+            // The same bookkeeping exit the eviction and recreate paths take.
+            // This loop used to hand-write it, and had already parted from the
+            // others in the way `retire_resident`'s doc says copies here part:
+            // it disposed `old.framebuffer` unconditionally.
+            if let Some(old) = self.unregister_resident(&k, ResidentReclaim::IdleDrained) {
+                self.dispose_owed_framebuffer(&ctx.device, old.owed_framebuffer());
                 // Terminal DESTROY, not RecycleTarget: an idle-drained resident is
                 // stale by `IDLE_TARGET_AGE_MS` — it is not being actively recycled
                 // (that is the capacity-eviction path's job for a per-frame video

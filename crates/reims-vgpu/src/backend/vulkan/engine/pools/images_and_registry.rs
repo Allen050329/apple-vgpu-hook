@@ -16,6 +16,32 @@
 
 use super::*;
 
+/// Everything a creation site knows about a resident it has just built.
+///
+/// The stored [`ResidentTargetSlot`] is this plus what the registry owns and a
+/// creation site does not: the birth state and the two LRU clocks. Handing over
+/// this rather than a finished slot is what stops an arm getting either wrong,
+/// and it is why [`ResourcePools::register_resident`] takes no `&mut` slot to
+/// patch afterwards.
+struct NewResident {
+    image: vk::Image,
+    memory: vk::DeviceMemory,
+    view: vk::ImageView,
+    /// `vk::Framebuffer::null()` for a resident that is never bound as a
+    /// standalone single-RT target — see
+    /// [`ResidentTargetSlot::owed_framebuffer`], which is what every destroy
+    /// path asks instead of testing this field itself.
+    framebuffer: vk::Framebuffer,
+    /// Null exactly when `framebuffer` is: the pass a per-slot framebuffer was
+    /// built against, and the thing `registry_ensure` compares to decide
+    /// whether a reused image needs its framebuffer rebuilt.
+    render_pass: vk::RenderPass,
+    width: u32,
+    height: u32,
+    generation: u64,
+    color_format: vk::Format,
+}
+
 impl ResourcePools {
     pub(crate) unsafe fn acquire_storage_image(
         &mut self,
@@ -309,12 +335,18 @@ impl ResourcePools {
     /// dispose what it removes, and the bookkeeping — which is the part that was
     /// diverging — is worth testing without a GPU.
     ///
+    /// Every path that removes a live entry comes through here, including the
+    /// idle drain in [`super::submission_and_buffers`], which disposes on its
+    /// own terms and so is not a [`Self::retire_resident`] caller. It is the
+    /// death counterpart of [`Self::register_resident`], and the pair is why
+    /// `registry` and `registry_order` cannot fall out of step.
+    ///
     /// `registry_order` is pruned whether or not the map held the entry, which
     /// is what every caller did around its own copy. Nothing is recorded for an
     /// identity that held no resident: [`Self::prior_reclaim`] deliberately does
     /// not guess between "never held one" and "reclaimed too long ago", and a
     /// record for a removal that did not happen would make it guess wrong.
-    fn unregister_resident(
+    pub(super) fn unregister_resident(
         &mut self,
         identity: &TargetIdentity,
         why: ResidentReclaim,
@@ -326,22 +358,93 @@ impl ResourcePools {
         Some(old)
     }
 
+    /// Hand a resident's framebuffer to the deferred-destroy path, if it has
+    /// one. [`ResidentTargetSlot::owed_framebuffer`] is where "if" is decided,
+    /// and why.
+    ///
+    /// # Safety
+    /// The caller must already have taken this framebuffer out of the registry,
+    /// or be about to overwrite the field it came from. The graveyard frees it
+    /// once the ring says no command buffer still references it.
+    pub(super) unsafe fn dispose_owed_framebuffer(
+        &mut self,
+        device: &ash::Device,
+        owed: Option<vk::Framebuffer>,
+    ) {
+        if let Some(fb) = owed {
+            self.dispose(device, DeferredHandle::Framebuffer(fb));
+        }
+    }
+
+    /// Store a newly created resident under `identity` and put it at the back
+    /// of the LRU order.
+    ///
+    /// One home for a resident's *birth*, as [`Self::unregister_resident`] is
+    /// one home for its death. Both `registry_ensure*` arms wrote all of this
+    /// out, and it is three rules rather than one:
+    ///
+    /// - **The birth state.** Nothing has drawn into an image created a line
+    ///   ago, so it carries no content stamp and no epoch; nothing has
+    ///   transitioned it, so its layout is `UNDEFINED`; and no window holds it,
+    ///   so it is unpinned. These are not defaults a creation site may pick —
+    ///   `registry_mark_ready`, the type-11 LOAD gate and the idle drain each
+    ///   read one of them, and an arm that guessed differently would be
+    ///   answering a question the others think they already asked.
+    /// - **The LRU clocks belong to the registry.** `use_seq` comes from
+    ///   `use_clock`, which has to advance exactly once per registration or the
+    ///   cap walk's ordering ties break arbitrarily. A creation site does not
+    ///   own that counter and cannot see the other arm's registrations.
+    /// - **`registry` and `registry_order` are written together.** They are one
+    ///   structure split for lookup and for order. An entry in the map but not
+    ///   the order is a resident no sweep can ever choose; one in the order but
+    ///   not the map is a victim that frees nothing.
+    fn register_resident(&mut self, identity: &TargetIdentity, new: NewResident) {
+        self.use_clock += 1;
+        let (last_touch_ms, use_seq) = (self.idle_clock_ms, self.use_clock);
+        self.registry.insert(
+            identity.clone(),
+            ResidentTargetSlot {
+                image: new.image,
+                memory: new.memory,
+                view: new.view,
+                framebuffer: new.framebuffer,
+                render_pass: new.render_pass,
+                width: new.width,
+                height: new.height,
+                generation: new.generation,
+                content_ready: false,
+                content_epoch: None,
+                layout: vk::ImageLayout::UNDEFINED,
+                color_format: new.color_format,
+                pin_count: 0,
+                last_touch_ms,
+                use_seq,
+            },
+        );
+        self.registry_order.push_back(identity.clone());
+    }
+
     /// Drop the resident registered under `identity`, recording `why`, returning
     /// its image/memory/view to `target_free` and its framebuffer to the
     /// graveyard. Returns the slot that was removed, or `None` when nothing was
     /// registered.
     ///
-    /// The single exit for a live registry entry. All three callers — the two
-    /// `registry_ensure*` recreate arms and [`Self::evict_registry_to_cap`] —
-    /// were copies of one another, and copies diverge. The MRT secondary path
-    /// recorded no reclaim reason at all, so a later draw whose sampled source
-    /// that path had recreated could not be told "taken from under you" from
-    /// "never existed", which is the whole point of
+    /// The recycling exit for a live registry entry: the two `registry_ensure*`
+    /// recreate arms and [`Self::evict_registry_to_cap`] all take it, and were
+    /// copies of one another before they did. The MRT-secondary path recorded
+    /// no reclaim reason at all, so a later draw whose sampled source that path
+    /// had recreated could not be told "taken from under you" from "never
+    /// existed", which is the whole point of
     /// [`Self::note_resident_reclaimed`]. The primary path was the one that
-    /// disposed `old.framebuffer` without checking it for null — a slot created
-    /// by `registry_ensure_color` carries no framebuffer, so an identity that
-    /// crossed from the secondary path to the primary one spent a graveyard
-    /// entry on a null handle.
+    /// disposed `old.framebuffer` without asking whether the slot had one.
+    ///
+    /// It is not the *only* exit, and reading it as one is how the fourth stayed
+    /// out of step. The idle drain destroys rather than recycles and does not
+    /// count a `target_evict`, both deliberately, so it cannot come through
+    /// here — what it shares is [`Self::unregister_resident`] and
+    /// [`ResidentTargetSlot::owed_framebuffer`], which is why the bookkeeping
+    /// and the null question are each their own function rather than lines in
+    /// this body.
     unsafe fn retire_resident(
         &mut self,
         ctx: &DeviceContext,
@@ -350,9 +453,7 @@ impl ResourcePools {
         counters: &EngineCounters,
     ) -> Option<ResidentTargetSlot> {
         let old = self.unregister_resident(identity, why)?;
-        if old.framebuffer != vk::Framebuffer::null() {
-            self.dispose(&ctx.device, DeferredHandle::Framebuffer(old.framebuffer));
-        }
+        self.dispose_owed_framebuffer(&ctx.device, old.owed_framebuffer());
         self.dispose(
             &ctx.device,
             DeferredHandle::RecycleTarget(FreeTargetImage {
@@ -411,7 +512,7 @@ impl ResourcePools {
                 }
                 // Same image, new pass → recreate framebuffer only.
                 let view = slot.view;
-                let old_fb = slot.framebuffer;
+                let old_fb = slot.owed_framebuffer();
                 let attachments = [view];
                 let framebuffer = ctx
                     .device
@@ -428,7 +529,7 @@ impl ResourcePools {
                         DrawError::VkCall(VkCall::new(VkOp::PoolsCreateRegistryFramebuffer, e))
                     })?;
                 counters.note_create();
-                self.dispose(&ctx.device, DeferredHandle::Framebuffer(old_fb));
+                self.dispose_owed_framebuffer(&ctx.device, old_fb);
                 let slot = self.registry.get_mut(&identity).unwrap();
                 slot.framebuffer = framebuffer;
                 slot.render_pass = render_pass;
@@ -547,12 +648,9 @@ impl ResourcePools {
             }
         };
         counters.note_create();
-        let touch_ms = self.idle_clock_ms;
-        self.use_clock += 1;
-        let use_seq = self.use_clock;
-        self.registry.insert(
-            identity.clone(),
-            ResidentTargetSlot {
+        self.register_resident(
+            &identity,
+            NewResident {
                 image,
                 memory,
                 view,
@@ -561,16 +659,9 @@ impl ResourcePools {
                 width,
                 height,
                 generation,
-                content_ready: false,
-                content_epoch: None,
-                layout: vk::ImageLayout::UNDEFINED,
                 color_format: format,
-                pin_count: 0,
-                last_touch_ms: touch_ms,
-                use_seq,
             },
         );
-        self.registry_order.push_back(identity.clone());
         Ok(self.registry.get(&identity).unwrap())
     }
 
@@ -690,30 +781,23 @@ impl ResourcePools {
             counters.note_create();
             (image, memory, view)
         };
-        let touch_ms = self.idle_clock_ms;
-        self.use_clock += 1;
-        let use_seq = self.use_clock;
-        self.registry.insert(
-            identity.clone(),
-            ResidentTargetSlot {
+        self.register_resident(
+            &identity,
+            NewResident {
                 image,
                 memory,
                 view,
+                // No per-slot framebuffer and so no pass it was built against:
+                // this arm's residents are bound as attachment N of an ad-hoc
+                // MRT framebuffer, or sampled through the view.
                 framebuffer: vk::Framebuffer::null(),
                 render_pass: vk::RenderPass::null(),
                 width,
                 height,
                 generation,
-                content_ready: false,
-                content_epoch: None,
-                layout: vk::ImageLayout::UNDEFINED,
                 color_format: format,
-                pin_count: 0,
-                last_touch_ms: touch_ms,
-                use_seq,
             },
         );
-        self.registry_order.push_back(identity.clone());
         Ok((image, view))
     }
 
@@ -1347,13 +1431,143 @@ mod pin_count_tests {
         }
     }
 
+    /// A resident shaped like the one an arm builds, for the registration tests.
+    ///
+    /// The two arms differ in exactly these two handles, so they are the
+    /// parameters: `registry_ensure` passes a real framebuffer and the pass it
+    /// was built against, `registry_ensure_color` passes neither.
+    fn new_resident(framebuffer: vk::Framebuffer, render_pass: vk::RenderPass) -> NewResident {
+        NewResident {
+            image: vk::Image::null(),
+            memory: vk::DeviceMemory::null(),
+            view: vk::ImageView::null(),
+            framebuffer,
+            render_pass,
+            width: 16,
+            height: 16,
+            generation: 1,
+            color_format: translate::pixel::SCANOUT_FORMAT,
+        }
+    }
+
+    /// A framebuffer handle that is merely non-null. Nothing dereferences it —
+    /// every test here asks only whether the slot has one.
+    fn some_framebuffer() -> vk::Framebuffer {
+        vk::Framebuffer::from_raw(1)
+    }
+
     /// Admit a resident with an explicit last-touch stamp and pin count.
+    ///
+    /// Registers through the product path rather than writing the map and the
+    /// order itself, so this helper cannot be the copy that keeps them in step
+    /// by accident while the product one stops.
     fn admit(pools: &mut ResourcePools, id: TargetIdentity, last_touch_ms: u64, pin: u32) {
-        let mut slot = dummy_slot(true);
+        pools.register_resident(
+            &id,
+            new_resident(some_framebuffer(), vk::RenderPass::null()),
+        );
+        let slot = pools.registry.get_mut(&id).expect("just registered");
+        slot.content_ready = true;
         slot.last_touch_ms = last_touch_ms;
         slot.pin_count = pin;
-        pools.registry_order.push_back(id.clone());
-        pools.registry.insert(id, slot);
+    }
+
+    /// The MRT-secondary arm builds no per-slot framebuffer, so the residents it
+    /// creates owe the graveyard nothing — and the deferred-handle ring is
+    /// bounded, so a destroy path that enqueued their null handle would be
+    /// spending a slot every real destroy has to wait behind.
+    ///
+    /// `vkDestroyFramebuffer` accepts `VK_NULL_HANDLE` and does nothing with it.
+    /// That is why the two paths which asked this question wrong produced no
+    /// crash, no validation error and no log line, and why the answer is worth
+    /// a test rather than an assertion at each site.
+    #[test]
+    fn a_resident_built_without_a_framebuffer_owes_the_graveyard_none() {
+        let mut pools = ResourcePools::new();
+        pools.register_resident(
+            &surf(1),
+            new_resident(vk::Framebuffer::null(), vk::RenderPass::null()),
+        );
+        pools.register_resident(
+            &surf(2),
+            new_resident(some_framebuffer(), vk::RenderPass::null()),
+        );
+
+        assert_eq!(
+            pools.registry.get(&surf(1)).unwrap().owed_framebuffer(),
+            None,
+            "an MRT-secondary resident has no framebuffer to destroy"
+        );
+        assert_eq!(
+            pools.registry.get(&surf(2)).unwrap().owed_framebuffer(),
+            Some(some_framebuffer()),
+            "a single-RT resident owes the one it was built with"
+        );
+    }
+
+    /// A resident is born with nothing drawn into it, nothing vouching for its
+    /// pixels, no layout transition behind it and no window holding it.
+    ///
+    /// Each of these four is read by a different rail — `registry_mark_ready`,
+    /// the type-11 LOAD gate's epoch check, the barrier tracker and the idle
+    /// drain — so an arm that registered a slot with any of them set differently
+    /// would be answering a question the other rails believe they already asked.
+    #[test]
+    fn a_registered_resident_is_born_undrawn_unvouched_untransitioned_and_unpinned() {
+        let mut pools = ResourcePools::new();
+        pools.register_resident(
+            &surf(1),
+            new_resident(some_framebuffer(), vk::RenderPass::null()),
+        );
+
+        let slot = pools.registry.get(&surf(1)).expect("registered");
+        assert!(!slot.content_ready, "nothing has drawn into it yet");
+        assert_eq!(
+            slot.content_epoch, None,
+            "nothing has vouched for its pixels"
+        );
+        assert_eq!(
+            slot.layout,
+            vk::ImageLayout::UNDEFINED,
+            "nothing has transitioned it yet"
+        );
+        assert_eq!(slot.pin_count, 0, "no deferred window holds it yet");
+    }
+
+    /// Registration writes the map and the order together, and stamps a use
+    /// sequence that strictly advances.
+    ///
+    /// `registry` and `registry_order` are one structure split for lookup and
+    /// for order: an entry in the map alone is a resident no sweep can choose,
+    /// and one in the order alone is a victim that frees nothing. The sequence
+    /// is what `cap_eviction_victim` breaks ties on, so two registrations inside
+    /// one clock tick must still be ordered.
+    #[test]
+    fn registration_writes_both_halves_and_advances_the_use_sequence() {
+        let mut pools = ResourcePools::new();
+        pools.register_resident(
+            &surf(1),
+            new_resident(some_framebuffer(), vk::RenderPass::null()),
+        );
+        pools.register_resident(
+            &surf(2),
+            new_resident(some_framebuffer(), vk::RenderPass::null()),
+        );
+
+        assert_eq!(
+            pools.registry_order.iter().cloned().collect::<Vec<_>>(),
+            vec![surf(1), surf(2)],
+            "the order holds both, in registration order"
+        );
+        assert!(
+            pools.registry.contains_key(&surf(1)) && pools.registry.contains_key(&surf(2)),
+            "the map holds both"
+        );
+        assert!(
+            pools.registry.get(&surf(1)).unwrap().use_seq
+                < pools.registry.get(&surf(2)).unwrap().use_seq,
+            "the second registration is later even inside one clock tick"
+        );
     }
 
     /// A non-pinned resident untouched for `IDLE_TARGET_AGE_MS` is selected; a
