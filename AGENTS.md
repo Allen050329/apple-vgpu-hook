@@ -175,6 +175,7 @@ simply the wrong number, a length four bytes off, or a field two bytes too wide:
 | Does a doc comment name a symbol that no longer exists? | `cargo doc`'s intra-doc link pass |
 | Does a value travel as loose parameters when a type for it exists? | `scripts/scattered-struct` |
 | Does a decoded record fail a guard and vanish into a no-op catch-all? | `scripts/silent-arms` |
+| Does a constant crossing the C boundary have the test this file asks for? | `scripts/abi-pins` |
 
 ```sh
 ls crates/reims-vgpu-wire/src/ops/*.rs | xargs -n1 basename | sed 's/.rs$//'
