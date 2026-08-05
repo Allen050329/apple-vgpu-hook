@@ -66,8 +66,47 @@ pub const DIRECTORY_ROOT_PFN: u64 = 0x00;
 /// to say 3, but the field exists and a hardcoded depth would be a guess.
 pub const DIRECTORY_DEPTH: u64 = 0x04;
 
-/// Upper bound on tree depth, as a sanity bound rather than the depth itself.
+/// Upper bound on the tree depth read from a task's directory page.
+///
+/// Not the depth itself — that is [`DIRECTORY_DEPTH`], read per task. This is
+/// the bound a corrupt or hostile directory word is refused against, and it is
+/// derived from the address space rather than picked: a walk of `d` levels
+/// resolves `d * index_bits + page_shift` bits of guest virtual address, and
+/// `index_bits` is `page_shift - 2` because a node is one page of four-byte
+/// entries ([`Geometry::index_bits`]).
+///
+/// | geometry | index bits | depth 3 | depth 4 | depth 5 |
+/// |---|---|---|---|---|
+/// | x86_64, `page_shift` 12 | 10 | 42 bits | **52 bits** | 62 bits |
+/// | arm64e, `page_shift` 14 | 12 | 50 bits | **62 bits** | 74 bits |
+///
+/// Four is the first depth that covers a 48-bit virtual address on **both**
+/// geometries, which is the whole address space either guest can form: macOS
+/// user VAs are 47-bit and the wire carries a `u64` that no guest fills. Depth 3
+/// does not reach it on x86 (42 bits), so the bound cannot be lowered to the
+/// only depth either guest has been observed to declare; depth 5 could not
+/// describe an address the guest can construct, so nothing is lost by refusing
+/// it.
+///
+/// Observed: a driven x86 boot reads `depth=3` on every task directory it walks
+/// (32 of 32), and `WalkError::DepthTooDeep` has never been seen. The headroom
+/// is one level, and it is the level that separates "enough for the address
+/// space" from "enough for the guest we have measured".
 pub const MAX_DEPTH: u32 = 4;
+
+// The derivation above, as a build gate. Depth `MAX_DEPTH` must reach a 48-bit
+// address on both pathways, and `MAX_DEPTH - 1` must not — the first half is the
+// property the bound exists for, and the second is what keeps it the *smallest*
+// such depth rather than a number that merely happens to be large enough.
+const _: () = {
+    const VA_BITS: u32 = 48;
+    const fn reach(page_shift: u32, depth: u32) -> u32 {
+        depth * (page_shift - 2) + page_shift
+    }
+    assert!(reach(12, MAX_DEPTH) >= VA_BITS);
+    assert!(reach(14, MAX_DEPTH) >= VA_BITS);
+    assert!(reach(12, MAX_DEPTH - 1) < VA_BITS);
+};
 
 /// Page-table shape for one guest pathway.
 ///
