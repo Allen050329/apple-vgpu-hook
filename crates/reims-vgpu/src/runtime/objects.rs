@@ -1233,15 +1233,6 @@ fn apply_type4_backing<M: HostMemory>(
                 ));
             }
         }
-        // The type-4 peer of the adoption in `mapper::resolve_mapping_backing`:
-        // these pages are a surface's again, so the write-after-teardown
-        // detector must stop reporting writes into them.
-        crate::observe::footprint::note_pages_authorized(
-            entries.iter().filter_map(|&e| {
-                crate::contract::iosurface_pages::entry_gpa_shift(e, state_page_shift)
-            }),
-            crate::contract::iosurface_pages::page_size_of(state_page_shift),
-        );
         m.page_entries = entries;
         m.mapped = true;
         m.page_table_kva = 0;

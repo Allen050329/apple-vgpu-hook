@@ -593,9 +593,6 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
     // Read before the `get_mut` below takes `state` mutably.
     let page_shift = state.page_shift;
     let mut retired = None;
-    // The superseded incarnation's page list, kept for the write-after-teardown
-    // detector. See the `incarnation_changed` arm below.
-    let mut superseded_pages: Vec<u32> = Vec::new();
     let mut incarnation_changed = false;
     let mut reprieved = false;
     let mut pages_changed = false;
@@ -609,11 +606,6 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
         let prev_pages = m.page_entries.len();
         (pages_changed, incarnation_changed, reprieved) =
             plan_adoption_decision(condemned.as_deref(), &m.page_entries, &plan.entries);
-        if incarnation_changed {
-            if let Some(ref c) = condemned {
-                superseded_pages = c.clone();
-            }
-        }
         // New page table ⇒ the contiguous view (and any Metal texture aliasing
         // it) describe the old pages; retire them before adopting the plan.
         if m.contig_ptr != 0 && pages_changed {
@@ -687,17 +679,6 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
                 ));
             }
         }
-        // Adoption is the other half of the write-after-teardown detector: these
-        // pages are a surface's again, so a write into them is ordinary. Without
-        // this the retired set would only ever grow, and since the guest recycles
-        // physical pages between surfaces constantly it would end up flagging
-        // every one of those perfectly ordinary reuses.
-        crate::observe::footprint::note_pages_authorized(
-            plan.entries
-                .iter()
-                .filter_map(|&e| crate::contract::iosurface_pages::entry_gpa_shift(e, page_shift)),
-            crate::contract::iosurface_pages::page_size_of(page_shift),
-        );
         m.page_entries = plan.entries;
         m.page_table_kva = plan.page_table_kva;
         m.mapping_internal = internal;
@@ -714,26 +695,6 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
         // surface: drop the prior incarnation's deferred windows before any
         // access could flush old content through the new pages.
         crate::runtime::storage_flush::drop_windows(state, mapping_id, "incarnation_changed");
-        // And tell the write-after-teardown detector, because this is the most
-        // common way a backing dies and it was invisible to it.
-        //
-        // The other retire point is `unmap_surface`, which needs the guest to
-        // delete a backing TWICE with no resolve between — a rare shape. Here
-        // the device has the same evidence by a different route and it is at
-        // least as strong: the guest deleted the backing, and the re-resolve
-        // came back with a different page list, which is exactly what
-        // `plan_adoption_decision` means by a new incarnation. On one 600 s
-        // driven boot the unmap route ran 10 times; this one is the ordinary
-        // per-surface teardown.
-        //
-        // `skip: None` is load-bearing. This mapping is still live and its
-        // `page_entries` now hold the NEW plan, so leaving it in the live set is
-        // what keeps a page carried over from the old backing into the new one
-        // out of the retired set — it really is still a surface's. Adoption has
-        // already run for the new plan just above, so the two agree either way,
-        // and stating it here means the order is not what makes it correct.
-        let going = std::mem::take(&mut superseded_pages);
-        state.retire_pages_no_live_mapping_holds(&going, None);
     } else if reprieved {
         // Stale trailing delete on a live incarnation — the exact black-band
         // trigger. Only note when content was actually at stake (an armed
@@ -2077,11 +2038,7 @@ pub(crate) fn note_mapping_write_footprint(
         let lo = off.max(page_lo);
         let hi = end.min(page_lo.saturating_add(page_size));
         if lo < hi {
-            crate::observe::footprint::note_written_range(
-                crate::observe::footprint::Rail::Mapping,
-                gpa + (lo - page_lo),
-                hi - lo,
-            );
+            crate::observe::footprint::note_written_range(gpa + (lo - page_lo), hi - lo);
         }
     }
 }
@@ -2290,7 +2247,6 @@ fn copy_mapping_runs<H: HostMemory + HostOps>(
                 // over the whole range because the runs are what is contiguous;
                 // the mapping's list between them is not.
                 crate::observe::footprint::note_written_range(
-                    crate::observe::footprint::Rail::Mapping,
                     run_gpas[0].saturating_add(host_off as u64),
                     n as u64,
                 );
@@ -2964,226 +2920,6 @@ mod revalidate_tests {
             footprint::counts(),
             (2, 0),
             "two frames total, not the span between them"
-        );
-    }
-
-    /// Unmapping one of two mappings that name the same guest pages must not
-    /// make the survivor's writes look like write-after-teardown.
-    ///
-    /// This is the false positive that decides whether the detector is usable
-    /// at all. Mappings genuinely alias — planes of one surface, a slot the
-    /// guest re-presents under a second id — so a retire that walked only the
-    /// dying mapping's list would mark pages a live surface is still writing
-    /// every frame, and `write_after_retire` would read in the thousands on a
-    /// healthy boot. A detector whose first finding is its own bookkeeping gets
-    /// switched off before it ever reports a real one.
-    #[test]
-    fn unmapping_one_of_two_mappings_that_alias_does_not_retire_the_survivors_pages() {
-        use crate::observe::footprint;
-
-        let _fp = footprint::exclusive_for_tests();
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-        let page = 1u64 << PAGE_SHIFT_X86;
-        let shared = 0x6000_0000u64;
-        let only_mine = 0x6000_0000u64 + page;
-        let entry = |gpa: u64| {
-            (((gpa >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID
-        };
-
-        for mid in [20u32, 21] {
-            state.map_surface(mid);
-            let m = state.mappings.get_mut(&mid).unwrap();
-            m.mapped = true;
-            m.page_entries = if mid == 20 {
-                vec![entry(shared), entry(only_mine)]
-            } else {
-                vec![entry(shared)]
-            };
-        }
-
-        assert!(state.unmap_surface(20));
-        assert_eq!(
-            footprint::retired_counts().0,
-            1,
-            "only the page mapping 20 held alone"
-        );
-
-        // The survivor writes its own page: not a finding.
-        footprint::note_written_range(footprint::Rail::Mapping, shared, 16);
-        assert_eq!(
-            footprint::retired_counts().1,
-            0,
-            "mapping 21 still names this page, so writing it is ordinary"
-        );
-
-        // The page nobody holds any more: the finding.
-        footprint::note_written_range(footprint::Rail::Mapping, only_mine, 16);
-        assert_eq!(footprint::retired_counts().1, 1);
-    }
-
-    /// The guest teardown production actually performs — condemn, then unmap —
-    /// must retire the pages, and reading `page_entries` alone never could.
-    ///
-    /// `DeleteIOSurfaceBacking2` calls `condemn_surface_backing` first, which
-    /// *moves* the list into `condemned_entries`. Every subsequent route into
-    /// `unmap_surface` therefore sees an empty `page_entries`: the second delete
-    /// takes the `mapping_backing_condemned` branch, and the fall-through branch
-    /// is reached only because `condemn_surface_backing` returned `false`, which
-    /// it does precisely when the list was already empty. So the retire path was
-    /// unreachable on the delete route by construction, and a 600 s driven boot
-    /// duly reported `retire_scans=0` — an UNMEASURED detector reading like a
-    /// clean one.
-    #[test]
-    fn the_condemn_then_unmap_teardown_retires_the_condemned_pages() {
-        use crate::observe::footprint;
-
-        let _fp = footprint::exclusive_for_tests();
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-        let page = 1u64 << PAGE_SHIFT_X86;
-        let gpa = 0x6100_0000u64;
-        let entry = (((gpa >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
-
-        state.map_surface(30);
-        let m = state.mappings.get_mut(&30).unwrap();
-        m.mapped = true;
-        m.page_entries = vec![entry];
-
-        // First delete: the list moves to `condemned_entries`, and nothing is
-        // retired yet — a resolve may still reprieve it.
-        assert!(state.condemn_surface_backing(30));
-        assert!(state.mappings.get(&30).unwrap().page_entries.is_empty());
-        assert_eq!(
-            footprint::retired_counts().0,
-            0,
-            "a condemned list can still be handed back by the reprieve path"
-        );
-
-        // Second delete with no resolve between: genuinely dead.
-        assert!(state.unmap_surface(30));
-        assert_eq!(
-            footprint::retire_scan_counts().0,
-            1,
-            "the retire scan must run; a zero here is what made the detector \
-             UNMEASURED on every driven boot"
-        );
-        assert_eq!(
-            footprint::retired_counts().0,
-            1,
-            "the condemned page retires"
-        );
-
-        footprint::note_written_range(footprint::Rail::Mapping, gpa, 16);
-        assert_eq!(
-            footprint::retired_counts().1,
-            1,
-            "a write into a twice-deleted surface's pages is the finding"
-        );
-
-        // Re-adoption clears it, or the set would only ever grow.
-        footprint::note_pages_authorized([gpa], page);
-        assert_eq!(footprint::retired_counts().0, 0);
-    }
-
-    /// A superseded incarnation's pages retire, and one carried into the new
-    /// plan does not.
-    ///
-    /// `unmap_surface` needs the guest to delete a backing *twice* with no
-    /// resolve between, which is rare — 10 times in a 600 s driven boot. The
-    /// ordinary teardown is a delete followed by a re-resolve that comes back
-    /// with a different page list, and that was invisible to the detector. The
-    /// evidence there is at least as strong: the guest deleted the backing and
-    /// the device then proved the backing changed.
-    ///
-    /// The carried-over page is the half that can go wrong silently. A new plan
-    /// that keeps some of the old pages must not retire them — they really are
-    /// still a surface's — which is what leaving this mapping in the live set
-    /// buys.
-    #[test]
-    fn a_superseded_incarnation_retires_its_pages_but_not_one_the_new_plan_kept() {
-        use crate::observe::footprint;
-
-        let _fp = footprint::exclusive_for_tests();
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-        let gone = 0x7000_0000u64;
-        let kept = 0x7100_0000u64;
-        let entry = |gpa: u64| {
-            (((gpa >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID
-        };
-
-        state.map_surface(70);
-        {
-            let m = state.mappings.get_mut(&70).unwrap();
-            m.mapped = true;
-            m.page_entries = vec![entry(gone), entry(kept)];
-        }
-        // The guest deletes the backing: the list moves to `condemned_entries`.
-        assert!(state.condemn_surface_backing(70));
-        let condemned = state.mappings.get(&70).unwrap().condemned_entries.clone();
-
-        // The re-resolve comes back with a different plan that keeps one page.
-        let plan = vec![entry(kept), entry(0x7200_0000)];
-        let (_, incarnation_changed, _) = plan_adoption_decision(condemned.as_deref(), &[], &plan);
-        assert!(incarnation_changed, "a different plan is a new incarnation");
-        {
-            let m = state.mappings.get_mut(&70).unwrap();
-            m.page_entries = plan;
-            m.condemned_entries = None;
-        }
-
-        state.retire_pages_no_live_mapping_holds(&condemned.unwrap(), None);
-        assert_eq!(
-            footprint::retire_scan_counts().0,
-            1,
-            "the ordinary teardown must reach the detector at all"
-        );
-        assert_eq!(footprint::retired_counts().0, 1, "only the abandoned page");
-
-        footprint::note_written_range(footprint::Rail::Mapping, kept, 16);
-        assert_eq!(
-            footprint::retired_counts().1,
-            0,
-            "the new plan kept this page, so writing it is ordinary"
-        );
-        footprint::note_written_range(footprint::Rail::Mapping, gone, 16);
-        assert_eq!(
-            footprint::retired_counts().1,
-            1,
-            "the abandoned page is the finding"
-        );
-    }
-
-    /// A condemned list on a *surviving* mapping is still-held, so tearing down
-    /// a mapping that aliases it retires nothing.
-    ///
-    /// The conservative direction, and deliberately so: the survivor is awaiting
-    /// its fingerprint compare and may be reprieved, at which point its writes
-    /// through those pages are ordinary. Counting them as free would give the
-    /// detector a false positive out of this device's own bookkeeping.
-    #[test]
-    fn a_survivors_condemned_list_still_holds_its_pages() {
-        use crate::observe::footprint;
-
-        let _fp = footprint::exclusive_for_tests();
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-        let shared = 0x6200_0000u64;
-        let entry =
-            (((shared >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
-
-        for mid in [40u32, 41] {
-            state.map_surface(mid);
-            let m = state.mappings.get_mut(&mid).unwrap();
-            m.mapped = true;
-            m.page_entries = vec![entry];
-        }
-        // 41 survives, condemned rather than live.
-        assert!(state.condemn_surface_backing(41));
-
-        assert!(state.unmap_surface(40));
-        assert_eq!(footprint::retire_scan_counts().0, 1, "the scan ran");
-        assert_eq!(
-            footprint::retired_counts().0,
-            0,
-            "mapping 41's reprieve may hand this page straight back"
         );
     }
 

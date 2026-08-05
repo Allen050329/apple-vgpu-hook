@@ -626,11 +626,7 @@ pub fn map_fresh_span_within<H: HostMemory + HostOps>(
     // never wrote there" that this whole set exists to be trusted for.
     //
     // The span is contiguous in guest-physical space: `runs != 1` returned above.
-    crate::observe::footprint::note_written_range(
-        crate::observe::footprint::Rail::RawGva,
-        gpas[0].saturating_add(off as u64),
-        length,
-    );
+    crate::observe::footprint::note_written_range(gpas[0].saturating_add(off as u64), length);
     // Same reasoning as the footprint mark above, for the other reader of these
     // writes: what this hands back is a writable alias of guest pages, and every
     // caller of it writes. Recorded on the acquisition rather than in each caller
@@ -752,7 +748,6 @@ fn write_span_multi<H: HostMemory + HostOps>(
         // the `n` bytes at `run_gpas[0] + host_off` in guest-physical space —
         // the exact destination, not the run's hull.
         crate::observe::footprint::note_written_range(
-            crate::observe::footprint::Rail::RawGva,
             run_gpas[0].saturating_add(host_off as u64),
             n as u64,
         );

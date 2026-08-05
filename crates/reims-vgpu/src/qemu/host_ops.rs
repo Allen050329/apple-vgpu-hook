@@ -397,11 +397,7 @@ impl HostMemory for QemuHost<'_> {
             // does not mark: a fixture's writes are not this device's, and
             // counting them would put test addresses in a set whose entire
             // purpose is to be compared against a live guest's panic.
-            crate::observe::footprint::note_written_range(
-                crate::observe::footprint::Rail::Gpa,
-                gpa,
-                buf.len() as u64,
-            );
+            crate::observe::footprint::note_written_range(gpa, buf.len() as u64);
             Ok(())
         } else {
             Err(Self::callback_decline(

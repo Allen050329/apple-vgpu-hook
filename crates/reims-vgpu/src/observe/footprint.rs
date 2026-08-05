@@ -72,6 +72,34 @@
 //! being full of `0xff`. The payload carries no information the frame set does
 //! not, and the census that measured it was deleted rather than left sampling
 //! every rail's payload forever to re-derive its own negative result.
+//!
+//! # This records where writes went; it does not adjudicate them
+//!
+//! A second companion — a write-after-retire detector — kept a parallel bit set
+//! of frames the guest had said were no longer a surface's, and raised an alarm
+//! when a write landed in one. It is gone, for three reasons that compound:
+//!
+//! - **It could not attribute its own findings.** Only the mapping rail's hits
+//!   were ever a claim about this device; a raw-GVA write into a page some other
+//!   surface used to own is ordinary guest page recycling with no event that
+//!   could have cleared the bit. Its one live outing read 12 432 hits on
+//!   essentially a single frame and was recorded as UNATTRIBUTED.
+//! - **On the pathway that can be measured it never ran.** A 25 s driven
+//!   x86/PCI Safari boot reported `retire_scans=0` over all 73 census samples,
+//!   as did a 600 s boot before it — the same reading that had already once been
+//!   traced to a structurally unreachable delete path and "repaired".
+//! - **It was the most expensive thing in this module.** Excluding an aliased
+//!   page needs every other live mapping's page list, so each Unmap built a
+//!   `HashSet` of every mapped GPA in the device, on the drain worker that
+//!   `drain_duty` shows at 0.93-0.99.
+//!
+//! The class it watched for — a write through a page list the guest tore down —
+//! is refused rather than merely observed, by guards that already fail loudly:
+//! `mapping_write`'s `vouch_stale`, `storage_flush`'s `backing_condemned` hold,
+//! and the drain unmap / ReplacePhysical sites that drop-with-fail instead of
+//! writing through recycled pages. Those are product behaviour; this module is
+//! not, and a second opinion that could not read its own answer is not worth a
+//! per-Unmap scan of the whole mapping table.
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -130,7 +158,7 @@ impl Footprint {
         }
     }
 
-    fn mark(&self, rail: Rail, frame: u64) {
+    fn mark(&self, frame: u64) {
         if frame >= MAX_FRAME {
             self.dropped.fetch_add(1, Ordering::Relaxed);
             return;
@@ -144,63 +172,6 @@ impl Footprint {
         let prev = self.bits[word].fetch_or(bit, Ordering::Relaxed);
         if prev & bit == 0 {
             self.pages.fetch_add(1, Ordering::Relaxed);
-        }
-        // Every guest write in the device funnels through here, which is what
-        // makes this the right place for the check: a rail cannot reach guest
-        // RAM without being asked whether the frame is still a surface's.
-        if let Some((rword, rbit)) = retired_word(frame) {
-            if rword.load(Ordering::Relaxed) & rbit != 0 {
-                RETIRE_HITS_BY_RAIL[rail as usize].fetch_add(1, Ordering::Relaxed);
-                // Only the mapping rail's hits are a claim about this device.
-                // A raw-GVA write into a page some other surface used to own is
-                // ordinary guest page recycling with no adoption event that
-                // could have cleared the bit, so giving it a fail line would
-                // fill the log with the detector's own blind spot.
-                //
-                // `hits` is therefore counted on this side of the gate, not
-                // above it. Counted above, the headline `write_after_retire`
-                // read 11 737 across nine driven boots with not one
-                // `write_after_retire` fail line to go with it, because every
-                // one of those hits was the blind spot — the exact "meaningless
-                // rail and finding rail in one counter" the split below was
-                // introduced to end, left in place on the field a reader sees
-                // first. An alarm nobody can act on is one they learn to skip.
-                if rail != Rail::Mapping {
-                    return;
-                }
-                RETIRED.hits.fetch_add(1, Ordering::Relaxed);
-                // Latched per frame AND capped in total. Per-frame alone is not
-                // enough: a rail writing a whole 1080p surface into retired
-                // pages has ~2 000 distinct frames to report, all of them the
-                // same finding, and both the log and `first_sight`'s own set
-                // would grow with the defect rather than with the information.
-                //
-                // The cap is on the *lines*, never on the counting — the census
-                // keeps every hit — and the boundary line says the suppression
-                // happened, because a log that quietly stopped reporting would
-                // understate a defect exactly when it is worst.
-                let logged = RETIRED.logged.fetch_add(1, Ordering::Relaxed);
-                if logged < MAX_RETIRE_LINES {
-                    if crate::observe::first_sight("write_after_retire", frame) {
-                        crate::observe::fail(format!(
-                            "write_after_retire frame={frame:#x} gpa={:#x} \
-                             (the guest said these pages stopped being a \
-                             surface's, and no mapping has adopted them since)",
-                            frame << FRAME_SHIFT
-                        ));
-                    } else {
-                        // A repeat of a frame already reported is not a new
-                        // line, so it must not spend one of the budget.
-                        RETIRED.logged.fetch_sub(1, Ordering::Relaxed);
-                    }
-                } else if logged == MAX_RETIRE_LINES {
-                    crate::observe::fail(format!(
-                        "write_after_retire suppressed after {MAX_RETIRE_LINES} \
-                         distinct frames; the count continues in \
-                         guest_write_footprint write_after_retire="
-                    ));
-                }
-            }
         }
     }
 
@@ -310,200 +281,8 @@ fn runs_added(now: &[(u64, u64)], prev: &[(u64, u64)]) -> Vec<(u64, u64)> {
 
 static FOOTPRINT: std::sync::LazyLock<Footprint> = std::sync::LazyLock::new(Footprint::new);
 
-/// Frames this device has been told are no longer any surface's, and has not
-/// since been told are a surface's again.
-///
-/// # Why this is not the drift guard again
-///
-/// The page-drift witness asks the *guest's page table* whether a mapping's
-/// cached list still resolves the same way. That is the right question and it
-/// has a blind spot with exactly the shape of the crash class: a surface the
-/// guest has destroyed can keep its translations for as long as the address
-/// space lives, so the walk agrees, the guard passes, and a write lands in
-/// memory the guest handed to something else. `mapping_pages_verdict` cannot see
-/// that, because nothing in the page table changed.
-///
-/// This asks a different question, out of this device's own bookkeeping: the
-/// guest *told* us those pages stopped being a surface's, in a packet. A write
-/// to one of them afterwards is write-after-teardown, and it is detectable on a
-/// live boot with no panic, no guest crash and no post-mortem — which is what
-/// every other instrument here has needed.
-///
-/// # Aliases are the false positive to avoid
-///
-/// Two mappings can name the same guest pages, so tearing one down does not
-/// retire pages the other still holds. Frames still in any live mapping's list
-/// are excluded at retire time; marking them would report the survivor's own
-/// legitimate writes as a defect, and a detector whose first finding is noise
-/// gets switched off.
-struct Retired {
-    bits: Box<[AtomicU64]>,
-    frames: AtomicU64,
-    /// [`Rail::Mapping`] writes that landed in a retired frame. The finding,
-    /// and the only rail whose hits are one — see [`Rail`]. Every increment has
-    /// a `write_after_retire` fail line beside it, up to [`MAX_RETIRE_LINES`]
-    /// distinct frames.
-    hits: AtomicU64,
-    /// Retire events, and the total pages walked to answer them.
-    ///
-    /// Excluding an aliased page needs the *other* live mappings' lists, so a
-    /// retire costs one pass over everything currently mapped. That runs on the
-    /// drain worker, which `drain_duty` already shows at 0.93-0.99, and this
-    /// project's standing rule is not to add work there on the assumption it is
-    /// small. These two say how much it actually is: `scan_pages / scans` is the
-    /// per-Unmap cost and `scans` is the rate. If the product turns out to
-    /// matter, it is measured before it is optimised rather than after.
-    scans: AtomicU64,
-    scan_pages: AtomicU64,
-    /// Distinct frames already reported by a fail line. See the cap at the
-    /// emission site.
-    logged: AtomicU64,
-}
-
-static RETIRED: std::sync::LazyLock<Retired> = std::sync::LazyLock::new(|| {
-    let mut bits = Vec::with_capacity(WORDS);
-    bits.resize_with(WORDS, || AtomicU64::new(0));
-    Retired {
-        bits: bits.into_boxed_slice(),
-        frames: AtomicU64::new(0),
-        hits: AtomicU64::new(0),
-        scans: AtomicU64::new(0),
-        scan_pages: AtomicU64::new(0),
-        logged: AtomicU64::new(0),
-    }
-});
-
-/// Distinct `write_after_retire` frames that get their own fail line before the
-/// rest are suppressed.
-///
-/// This detector has never fired outside a unit test, so it is landing without a
-/// live upper bound on how often it *could* fire. Sixty-four lines is enough to
-/// see the shape of a real finding — which surfaces, which addresses — and few
-/// enough that a detector that turns out to be wrong cannot take the log, the
-/// census or `first_sight`'s set down with it.
-const MAX_RETIRE_LINES: u64 = 64;
-
-/// One Unmap's retire scan: how many pages it had to walk to exclude aliases.
-pub fn note_retire_scan(pages_walked: u64) {
-    RETIRED.scans.fetch_add(1, Ordering::Relaxed);
-    RETIRED
-        .scan_pages
-        .fetch_add(pages_walked, Ordering::Relaxed);
-}
-
-fn retired_word(frame: u64) -> Option<(&'static AtomicU64, u64)> {
-    if frame >= MAX_FRAME {
-        return None;
-    }
-    Some((&RETIRED.bits[(frame / 64) as usize], 1u64 << (frame % 64)))
-}
-
-/// The guest said these pages stopped being a surface's. Call with the pages a
-/// mapping is losing, already filtered to those no live mapping still holds.
-pub fn note_pages_retired<I: IntoIterator<Item = u64>>(gpas: I, page_size: u64) {
-    let step = page_size.max(1 << FRAME_SHIFT);
-    for gpa in gpas {
-        let first = gpa >> FRAME_SHIFT;
-        let last = gpa.saturating_add(step - 1) >> FRAME_SHIFT;
-        for frame in first..=last {
-            if let Some((word, bit)) = retired_word(frame) {
-                if word.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
-                    RETIRED.frames.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-        }
-    }
-}
-
-/// A mapping adopted these pages, so they are a surface's again.
-///
-/// Un-retiring on adoption is what keeps this from decaying into "every frame
-/// the boot ever used": the guest recycles physical pages between surfaces
-/// constantly, and a set that only ever grew would flag every one of those
-/// perfectly ordinary reuses.
-pub fn note_pages_authorized<I: IntoIterator<Item = u64>>(gpas: I, page_size: u64) {
-    let step = page_size.max(1 << FRAME_SHIFT);
-    for gpa in gpas {
-        let first = gpa >> FRAME_SHIFT;
-        let last = gpa.saturating_add(step - 1) >> FRAME_SHIFT;
-        for frame in first..=last {
-            if let Some((word, bit)) = retired_word(frame) {
-                if word.fetch_and(!bit, Ordering::Relaxed) & bit != 0 {
-                    RETIRED.frames.fetch_sub(1, Ordering::Relaxed);
-                }
-            }
-        }
-    }
-}
-
-/// `(frames currently retired, [`Rail::Mapping`] writes that landed in one)`.
-///
-/// The second is the alarm, not a total: the other two rails' hits are counted
-/// separately by [`retired_hits_by_rail`] and are not evidence of anything.
-pub fn retired_counts() -> (u64, u64) {
-    (
-        RETIRED.frames.load(Ordering::Relaxed),
-        RETIRED.hits.load(Ordering::Relaxed),
-    )
-}
-
-/// `(retire scans, pages walked by them)`.
-pub fn retire_scan_counts() -> (u64, u64) {
-    (
-        RETIRED.scans.load(Ordering::Relaxed),
-        RETIRED.scan_pages.load(Ordering::Relaxed),
-    )
-}
-
-/// How a write chose its destination address.
-///
-/// A `write_after_retire` hit means nothing until this is known, because the
-/// three rails have *different* claims on a retired page and only one of them is
-/// a defect:
-///
-/// - [`Rail::Mapping`] resolves through a mapping's adopted page list, and
-///   adoption is exactly what un-retires a frame. A hit here is a write through
-///   a list the guest tore down and nothing re-adopted — the write-after-teardown
-///   class the page-drift guard structurally cannot see.
-/// - [`Rail::RawGva`] resolves through a fresh walk of a task's page table at
-///   write time and announces no adoption. The guest recycles physical pages
-///   between surfaces and tasks constantly, so a raw write into a page some
-///   *other* surface used to own is ordinary, and there is no event that could
-///   have cleared the bit. Hits here are **expected** and are not evidence.
-///   This is the same asymmetry that makes extending the *retire* side to the
-///   raw rails unsound.
-/// - [`Rail::Gpa`] names a guest-physical address directly through
-///   `HostMemory::write_gpa`, mostly control plane.
-///
-/// Without the split, a rail whose hits are meaningless and a rail whose hits
-/// are the finding land in one counter — and the first live reading did exactly
-/// that, at 2 352 hits on a single frame.
-#[derive(PartialEq, Eq, Debug, Clone, Copy)]
-pub enum Rail {
-    Mapping = 0,
-    RawGva = 1,
-    Gpa = 2,
-}
-
-/// `write_after_retire` hits, indexed by [`Rail`].
-static RETIRE_HITS_BY_RAIL: [AtomicU64; 3] =
-    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
-
-/// `(mapping, raw-GVA, direct-GPA)` writes that landed in a retired frame.
-pub fn retired_hits_by_rail() -> (u64, u64, u64) {
-    (
-        RETIRE_HITS_BY_RAIL[0].load(Ordering::Relaxed),
-        RETIRE_HITS_BY_RAIL[1].load(Ordering::Relaxed),
-        RETIRE_HITS_BY_RAIL[2].load(Ordering::Relaxed),
-    )
-}
-
-/// Record that `len` bytes starting at guest-physical `gpa` were written.
-///
-/// Every frame the byte range touches is marked, including a partial first and
-/// last: the question is which frames this device put bytes into, not how many
 /// bytes it put in each.
-pub fn note_written_range(rail: Rail, gpa: u64, len: u64) {
+pub fn note_written_range(gpa: u64, len: u64) {
     if len == 0 {
         return;
     }
@@ -511,7 +290,7 @@ pub fn note_written_range(rail: Rail, gpa: u64, len: u64) {
     let last = gpa.saturating_add(len - 1) >> FRAME_SHIFT;
     let fp = &*FOOTPRINT;
     for frame in first..=last {
-        fp.mark(rail, frame);
+        fp.mark(frame);
     }
 }
 
@@ -539,27 +318,12 @@ pub fn census_lines(now_ms: u64) -> Vec<String> {
     let fp = &*FOOTPRINT;
     let (pages, dropped) = counts();
     let kib = (pages << FRAME_SHIFT) / 1024;
-    // Levels, not per-interval: these are running totals for the boot, like the
-    // frame count beside them and unlike `store_routes`. Summing them across
-    // census lines multiplies by the cadence — the 100x error AGENTS.md records.
-    let (retired_frames, retired_hits) = retired_counts();
-    let (retire_scans, retire_scan_pages) = retire_scan_counts();
-    // `write_after_retire` is now the mapping rail's count on its own, so the
-    // `war_mapping` that used to sit beside it is the same number twice.
-    //
-    // The other two stay, and reading zero is not what would license cutting
-    // them: they are how a reader tells "no write landed in a retired frame"
-    // from "no frame was ever retired, so nothing was tested". `retire_scans=0`
-    // once made this detector read clean while it was doing nothing at all
-    // (`model/state.rs`), and a rail whose hits are expected is the cheapest
-    // standing witness that the bitmap is populated and being consulted.
-    let (_, war_raw, war_gpa) = retired_hits_by_rail();
+    // Levels, not per-interval: running totals for the boot, unlike
+    // `store_routes`. Summing them across census lines multiplies by the
+    // cadence — the 100x error AGENTS.md records.
     let mut out = vec![format!(
         "guest_write_footprint pages={pages} kib={kib} dropped={dropped} \
-         frame_shift={FRAME_SHIFT} retired={retired_frames} \
-         write_after_retire={retired_hits} \
-         war_rawgva={war_raw} war_gpa={war_gpa} retire_scans={retire_scans} \
-         retire_scan_pages={retire_scan_pages} (levels, not per-interval)"
+         frame_shift={FRAME_SHIFT} (levels, not per-interval)"
     )];
 
     let last_ms = fp.last_dump_ms.load(Ordering::Relaxed);
@@ -620,17 +384,6 @@ static TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 pub(crate) fn exclusive_for_tests() -> std::sync::MutexGuard<'static, ()> {
     let g = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
     FOOTPRINT.reset();
-    for cell in RETIRED.bits.iter() {
-        cell.store(0, Ordering::Relaxed);
-    }
-    RETIRED.frames.store(0, Ordering::Relaxed);
-    RETIRED.hits.store(0, Ordering::Relaxed);
-    RETIRED.scans.store(0, Ordering::Relaxed);
-    RETIRED.scan_pages.store(0, Ordering::Relaxed);
-    RETIRED.logged.store(0, Ordering::Relaxed);
-    for cell in RETIRE_HITS_BY_RAIL.iter() {
-        cell.store(0, Ordering::Relaxed);
-    }
     g
 }
 
@@ -645,7 +398,7 @@ mod tests {
         let _g = fresh();
         // Starts mid-frame and ends mid-frame: 0x1800..=0x37ff is three frames,
         // not the one the start address names.
-        note_written_range(Rail::Mapping, 0x1800, 0x2000);
+        note_written_range(0x1800, 0x2000);
         assert!(wrote_gpa(0x1000), "the partial first frame counts");
         assert!(wrote_gpa(0x2000));
         assert!(wrote_gpa(0x3000), "the partial last frame counts");
@@ -659,7 +412,7 @@ mod tests {
         let _g = fresh();
         // Without the guard, `first..=last` with last == first claims a frame no
         // byte reached — inflating the footprint, which weakens every later hit.
-        note_written_range(Rail::Mapping, 0x9000, 0);
+        note_written_range(0x9000, 0);
         assert_eq!(counts(), (0, 0));
         assert!(!wrote_gpa(0x9000));
     }
@@ -667,9 +420,9 @@ mod tests {
     #[test]
     fn marking_the_same_frame_twice_counts_it_once() {
         let _g = fresh();
-        note_written_range(Rail::Mapping, 0x5000, 0x1000);
-        note_written_range(Rail::Mapping, 0x5000, 0x1000);
-        note_written_range(Rail::Mapping, 0x5fff, 1);
+        note_written_range(0x5000, 0x1000);
+        note_written_range(0x5000, 0x1000);
+        note_written_range(0x5fff, 1);
         assert_eq!(counts().0, 1, "distinct frames, not marks");
     }
 
@@ -680,7 +433,7 @@ mod tests {
         // 0x2000..0x8000 as well, which is memory belonging to someone else —
         // and every one of those frames would then read as a hit.
         for gpa in [0x1000u64, 0x9000] {
-            note_written_range(Rail::Mapping, gpa, 0x1000);
+            note_written_range(gpa, 0x1000);
         }
         assert_eq!(counts().0, 2);
         assert!(!wrote_gpa(0x5000), "the gap is not ours to claim");
@@ -689,7 +442,7 @@ mod tests {
     #[test]
     fn an_arm64_page_marks_its_four_frames_exactly() {
         let _g = fresh();
-        note_written_range(Rail::Mapping, 0x4000, 1 << 14);
+        note_written_range(0x4000, 1 << 14);
         assert_eq!(counts().0, 4, "16 KiB is four 4 KiB frames");
         for f in 4..8u64 {
             assert!(wrote_gpa(f << 12));
@@ -701,7 +454,7 @@ mod tests {
     fn a_frame_past_the_end_of_the_set_is_dropped_loudly_and_never_reads_back_as_written() {
         let _g = fresh();
         let past = MAX_FRAME << FRAME_SHIFT;
-        note_written_range(Rail::Mapping, past, 0x1000);
+        note_written_range(past, 0x1000);
         assert_eq!(counts(), (0, 1), "counted as dropped, not as a page");
         assert!(
             !wrote_gpa(past),
@@ -722,9 +475,9 @@ mod tests {
         // finds as 60..=63 and 64..=70. Reported unjoined, the dump would claim
         // a fragmentation the device never produced.
         for frame in 60u64..=70 {
-            note_written_range(Rail::Mapping, frame << FRAME_SHIFT, 1);
+            note_written_range(frame << FRAME_SHIFT, 1);
         }
-        note_written_range(Rail::Mapping, 200 << FRAME_SHIFT, 1);
+        note_written_range(200 << FRAME_SHIFT, 1);
         assert_eq!(FOOTPRINT.runs(), vec![(60, 70), (200, 200)]);
     }
 
@@ -734,7 +487,7 @@ mod tests {
         // `len == 64` is the case where the shift clearing the consumed bits
         // would be undefined. A wrong guard here hangs the census thread rather
         // than reporting a wrong number, which is the worse failure.
-        note_written_range(Rail::Mapping, 0, 128 << FRAME_SHIFT);
+        note_written_range(0, 128 << FRAME_SHIFT);
         assert_eq!(FOOTPRINT.runs(), vec![(0, 127)]);
         assert_eq!(counts().0, 128);
     }
@@ -744,201 +497,14 @@ mod tests {
         let _g = fresh();
         // Sets bits 32..=63 of word 0 and nothing in word 1: the scan must stop
         // at the end of the word rather than shifting past it.
-        note_written_range(Rail::Mapping, 32 << FRAME_SHIFT, 32 << FRAME_SHIFT);
+        note_written_range(32 << FRAME_SHIFT, 32 << FRAME_SHIFT);
         assert_eq!(FOOTPRINT.runs(), vec![(32, 63)]);
-    }
-
-    #[test]
-    fn a_write_into_a_retired_frame_is_counted_and_adoption_stops_it() {
-        let _g = fresh();
-        note_pages_retired([0x8000u64], 0x1000);
-        assert_eq!(retired_counts(), (1, 0));
-
-        // A write elsewhere is not a finding.
-        note_written_range(Rail::Mapping, 0x9000, 0x1000);
-        assert_eq!(retired_counts().1, 0);
-
-        note_written_range(Rail::Mapping, 0x8000, 0x10);
-        assert_eq!(retired_counts().1, 1, "the write into it is the finding");
-
-        // Adoption puts the frame back in service. Without this the set only
-        // grows, and the guest recycles physical pages between surfaces
-        // constantly, so every ordinary reuse would read as a defect.
-        note_pages_authorized([0x8000u64], 0x1000);
-        assert_eq!(retired_counts().0, 0);
-        note_written_range(Rail::Mapping, 0x8000, 0x10);
-        assert_eq!(retired_counts().1, 1, "no new hit after adoption");
-    }
-
-    /// A retired-frame hit is only a claim about this device when the mapping
-    /// rail made it, and the counters have to say which rail did.
-    ///
-    /// The first live outing of this detector read `write_after_retire=12432`
-    /// with a single fail line — 12 432 hits on essentially one frame. That is
-    /// far more like a page the guest recycled and a raw-GVA rail then wrote,
-    /// which is ordinary and has no adoption event that could ever have cleared
-    /// the bit, than like a write through a torn-down mapping. Undifferentiated,
-    /// the two are one number and the finding is unreadable.
-    #[test]
-    fn a_retired_frame_hit_is_attributed_to_the_rail_that_made_it() {
-        let _g = fresh();
-        note_pages_retired([0x8000u64], 0x1000);
-
-        note_written_range(Rail::RawGva, 0x8000, 0x10);
-        note_written_range(Rail::Gpa, 0x8000, 0x10);
-        note_written_range(Rail::Mapping, 0x8000, 0x10);
-
-        assert_eq!(
-            retired_hits_by_rail(),
-            (1, 1, 1),
-            "every rail's hit is still counted, each against the rail that wrote it"
-        );
-        assert_eq!(
-            retired_counts().1,
-            1,
-            "but the headline alarm is the mapping rail alone"
-        );
-    }
-
-    /// Only the mapping rail spends a fail line.
-    ///
-    /// The raw rails hit retired frames as ordinary guest page recycling, so
-    /// letting them write lines would fill the log with the detector's own blind
-    /// spot — and it is the blind spot that is loud: 12 432 hits against 3 278
-    /// retired frames on the first live boot.
-    #[test]
-    fn only_the_mapping_rail_spends_a_fail_line_on_a_retired_hit() {
-        let _g = fresh();
-        let frames: Vec<u64> = (0..8u64).map(|i| (i + 0x2_0000) << FRAME_SHIFT).collect();
-        note_pages_retired(frames.clone(), 1 << FRAME_SHIFT);
-
-        for f in &frames {
-            note_written_range(Rail::RawGva, *f, 8);
-        }
-        assert_eq!(
-            RETIRED.logged.load(Ordering::Relaxed),
-            0,
-            "raw-GVA hits are counted but must not spend the line budget"
-        );
-
-        for f in &frames {
-            note_written_range(Rail::Mapping, *f, 8);
-        }
-        assert_eq!(
-            RETIRED.logged.load(Ordering::Relaxed),
-            frames.len() as u64,
-            "one line per distinct frame the mapping rail hit"
-        );
-    }
-
-    #[test]
-    fn the_line_cap_bounds_the_log_without_bounding_the_count() {
-        let _g = fresh();
-        // A rail writing a whole 1080p surface into retired pages has ~2 000
-        // distinct frames to report and every one is the same finding. This
-        // detector has never fired on a live boot, so it lands without any
-        // measured upper bound on how often it *could* — and an unverified
-        // detector that can take the log down with it is worse than none.
-        let n = MAX_RETIRE_LINES + 500;
-        let frames: Vec<u64> = (0..n).map(|i| (i + 0x1_0000) << FRAME_SHIFT).collect();
-        note_pages_retired(frames.iter().copied(), 1 << FRAME_SHIFT);
-        for &gpa in &frames {
-            note_written_range(Rail::Mapping, gpa, 8);
-        }
-        assert_eq!(
-            retired_counts().1,
-            n,
-            "every hit is counted; the cap is on lines, never on the census"
-        );
-        assert!(
-            RETIRED.logged.load(Ordering::Relaxed) > MAX_RETIRE_LINES,
-            "the counter must pass the cap so the boundary line fires exactly once"
-        );
-    }
-
-    /// The rails that cannot name a mapping must still be counted, and must stay
-    /// in their own buckets: only a mapping-rail hit is evidence about this
-    /// device, so a raw-GVA or direct-GPA hit must never land in that bucket.
-    #[test]
-    fn only_the_mapping_rail_is_attributed() {
-        let _g = fresh();
-        note_pages_retired([0x50000u64], 1 << FRAME_SHIFT);
-        note_written_range(Rail::RawGva, 0x50000, 8);
-        note_written_range(Rail::Gpa, 0x50000, 8);
-        assert_eq!(
-            retired_hits_by_rail(),
-            (0, 1, 1),
-            "both hits are counted, and neither may land in the mapping bucket"
-        );
-        // The regression this pins: `write_after_retire` used to be the sum of
-        // all three rails, so it reported an alarm on traffic that is expected
-        // by construction and that never gets a fail line to explain it. Nine
-        // driven boots read 11 737 there with no line at all. A reader who
-        // greps for the line and finds none has to decide the log is lying or
-        // the alarm is — and both readings cost more than the field is worth.
-        assert_eq!(
-            retired_counts().1,
-            0,
-            "no rail but the mapping rail may raise the alarm"
-        );
-        note_written_range(Rail::Mapping, 0x50000, 8);
-        assert_eq!(retired_hits_by_rail(), (1, 1, 1));
-        assert_eq!(retired_counts().1, 1, "and the mapping rail does");
-    }
-
-    #[test]
-    fn a_repeat_hit_on_a_reported_frame_does_not_spend_a_line_of_the_budget() {
-        let _g = fresh();
-        // Rewriting one retired frame every frame of a boot is one finding, not
-        // thousands. If a repeat consumed budget, a single stuck surface would
-        // exhaust the cap and suppress every *other* frame's line — losing the
-        // spread, which is the part of this class that has always been the
-        // diagnosis.
-        note_pages_retired([0x30000u64], 1 << FRAME_SHIFT);
-        for _ in 0..(MAX_RETIRE_LINES * 4) {
-            note_written_range(Rail::Mapping, 0x30000, 8);
-        }
-        assert_eq!(
-            RETIRED.logged.load(Ordering::Relaxed),
-            1,
-            "one distinct frame, one line spent"
-        );
-        assert_eq!(retired_counts().1, MAX_RETIRE_LINES * 4);
-    }
-
-    #[test]
-    fn retiring_a_frame_twice_counts_it_once_and_adopting_an_unretired_one_is_a_no_op() {
-        let _g = fresh();
-        // Both directions of the counter have to be idempotent, or the level
-        // drifts against the bits and `retired=` on the census stops meaning
-        // "frames currently retired".
-        note_pages_retired([0x2000u64, 0x2000], 0x1000);
-        assert_eq!(retired_counts().0, 1);
-        note_pages_authorized([0x7000u64], 0x1000);
-        assert_eq!(
-            retired_counts().0,
-            1,
-            "adopting a live frame changes nothing"
-        );
-        note_pages_authorized([0x2000u64, 0x2000], 0x1000);
-        assert_eq!(retired_counts().0, 0);
-    }
-
-    #[test]
-    fn a_guest_page_larger_than_a_frame_retires_all_of_its_frames() {
-        let _g = fresh();
-        // arm64. Retiring only the first frame of a 16 KiB page would leave
-        // three quarters of every torn-down surface undetectable.
-        note_pages_retired([0x4000u64], 1 << 14);
-        assert_eq!(retired_counts().0, 4);
-        note_written_range(Rail::Mapping, 0x4000 + 3 * 0x1000, 4);
-        assert_eq!(retired_counts().1, 1);
     }
 
     #[test]
     fn the_dump_is_rate_limited_but_the_summary_is_not() {
         let _g = fresh();
-        note_written_range(Rail::Mapping, 0x1000, 0x1000);
+        note_written_range(0x1000, 0x1000);
         let first = census_lines(0);
         assert!(
             first
@@ -948,7 +514,7 @@ mod tests {
              nothing to be scored against: {first:?}"
         );
 
-        note_written_range(Rail::Mapping, 0x9000, 0x1000);
+        note_written_range(0x9000, 0x1000);
         let soon = census_lines(1_000);
         assert_eq!(soon.len(), 1, "summary only inside the interval: {soon:?}");
         assert!(soon[0].contains("pages=2"), "{}", soon[0]);
@@ -963,11 +529,11 @@ mod tests {
     #[test]
     fn a_dump_is_skipped_when_the_set_did_not_grow() {
         let _g = fresh();
-        note_written_range(Rail::Mapping, 0x1000, 0x1000);
+        note_written_range(0x1000, 0x1000);
         let _ = census_lines(0);
         // The same frame again leaves the set unchanged, so re-emitting an
         // identical run list every 30 s would be pure log volume.
-        note_written_range(Rail::Mapping, 0x1000, 0x1000);
+        note_written_range(0x1000, 0x1000);
         let idle = census_lines(10 * DUMP_INTERVAL_MS);
         assert_eq!(idle.len(), 1, "{idle:?}");
     }
@@ -978,7 +544,7 @@ mod tests {
         // More runs than fit on one line, so reassembly is what is under test.
         let n = RUNS_PER_LINE as u64 * 2 + 5;
         for i in 0..n {
-            note_written_range(Rail::Mapping, (i * 4) << FRAME_SHIFT, 1);
+            note_written_range((i * 4) << FRAME_SHIFT, 1);
         }
         let lines = census_lines(0);
         let parts: Vec<&String> = lines
@@ -1010,8 +576,8 @@ mod tests {
     #[test]
     fn a_later_dump_reports_only_what_it_adds() {
         let _g = fresh();
-        note_written_range(Rail::Mapping, 0x1000, 0x1000);
-        note_written_range(Rail::Mapping, 0x9000, 0x1000);
+        note_written_range(0x1000, 0x1000);
+        note_written_range(0x9000, 0x1000);
         let first = census_lines(0);
         let first_spans = spans_of(&first);
         assert_eq!(first_spans, vec![(1, 1), (9, 9)]);
@@ -1020,9 +586,9 @@ mod tests {
         // merges 0x1 and 0x9 into one run once 0x2..=0x8 fill in, so a naive
         // diff of run *lists* would re-report frames 1 and 9.
         for f in 2..=8u64 {
-            note_written_range(Rail::Mapping, f << FRAME_SHIFT, 1);
+            note_written_range(f << FRAME_SHIFT, 1);
         }
-        note_written_range(Rail::Mapping, 0x20 << FRAME_SHIFT, 1);
+        note_written_range(0x20 << FRAME_SHIFT, 1);
         let second = census_lines(DUMP_INTERVAL_MS);
         let second_spans = spans_of(&second);
         assert_eq!(

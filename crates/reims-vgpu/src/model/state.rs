@@ -2824,116 +2824,11 @@ impl DeviceState {
         true
     }
 
-    /// Tell [`crate::observe::footprint`] that a mapping's pages have stopped
-    /// being a surface's, so a later write into them is reportable.
-    ///
-    /// Only the guest's own Unmap calls this. The device's internal
-    /// invalidations — a resolve that failed, a condemned list awaiting a
-    /// fingerprint compare — are *this device* deciding it no longer trusts a
-    /// list, not the guest saying the memory is no longer a surface's, and the
-    /// reprieve path can hand the same list straight back. Retiring on those
-    /// would flag the reprieve's own legitimate writes, and a detector whose
-    /// first finding is its own bookkeeping gets switched off before it ever
-    /// reports a real one.
-    ///
-    /// Frames another live mapping still names are excluded: two mappings can
-    /// alias the same guest pages, and the survivor's writes are not a defect.
-    ///
-    /// # The condemned list is part of the doomed set, and reading only
-    /// `page_entries` made this dead code
-    ///
-    /// Both routes into [`Self::unmap_surface`] from a guest teardown arrive
-    /// with `page_entries` already **empty**, because the list was moved into
-    /// `condemned_entries` by the step before:
-    ///
-    /// - `DeleteIOSurfaceBacking2` first calls [`Self::condemn_surface_backing`],
-    ///   which does exactly that move. A second delete with no resolve between
-    ///   then takes the `mapping_backing_condemned` branch to `unmap_surface` —
-    ///   where the only list is the condemned one.
-    /// - The same delete falls through to `unmap_surface` directly when
-    ///   `condemn_surface_backing` returns `false`, and it returns `false`
-    ///   *precisely when* `page_entries` is empty.
-    /// - [`Self::map_surface`] moves the list the same way, so a fresh MAP
-    ///   followed by an Unmap is the third case.
-    ///
-    /// So an `is_empty()` bail on `page_entries` alone could never retire a page
-    /// on the delete path. Measured: a 600 s driven boot reported
-    /// `retire_scans=0`, which made its `write_after_retire=0` UNMEASURED rather
-    /// than clean — the failure direction this project's rules call out, a
-    /// detector reading zero because it never ran.
-    ///
-    /// Retiring the condemned list *here* is not the same as retiring at
-    /// condemn time, which would be wrong for the reason above: at condemn the
-    /// reprieve can still hand the list straight back. By the time this runs the
-    /// guest has said the backing is gone and no resolve has re-adopted it —
-    /// `resolve_mapping_backing` takes `condemned_entries` and calls
-    /// `note_pages_authorized` on whatever it adopts, so a reprieved list is
-    /// un-retired through the ordinary adoption path before it can be written.
-    ///
-    /// Other mappings' condemned lists count as still-held for the same reason,
-    /// in the conservative direction: a slot awaiting its fingerprint compare
-    /// may be reprieved, and its writes would then be legitimate.
-    fn note_mapping_pages_retired(&self, mapping_id: u32) {
-        let Some(doomed) = self.mappings.get(&mapping_id) else {
-            return;
-        };
-        let mut going: Vec<u32> = doomed.page_entries.clone();
-        going.extend_from_slice(doomed.condemned_entries.as_deref().unwrap_or(&[]));
-        self.retire_pages_no_live_mapping_holds(&going, Some(mapping_id));
-    }
-
-    /// Retire every page in `going` that no still-live mapping names.
-    ///
-    /// `skip` is the mapping whose own lists are the doomed ones and must not
-    /// therefore count as holding them. Pass `None` when the pages are being
-    /// abandoned by a mapping that is *still live under a new backing* — a
-    /// superseded incarnation — because there the mapping's current
-    /// `page_entries` are the new plan, and a page carried over into it is
-    /// genuinely still a surface's and must be kept out of the retired set.
-    ///
-    /// Other mappings' *condemned* lists count as held, deliberately in the
-    /// conservative direction: a slot awaiting its fingerprint compare may be
-    /// reprieved, and its writes would then be legitimate.
-    pub(crate) fn retire_pages_no_live_mapping_holds(&self, going: &[u32], skip: Option<u32>) {
-        if going.is_empty() {
-            return;
-        }
-        let shift = self.page_shift;
-        let gpas_of = |entries: &[u32]| -> Vec<u64> {
-            entries
-                .iter()
-                .filter_map(|&e| crate::contract::iosurface_pages::entry_gpa_shift(e, shift))
-                .collect()
-        };
-        let mut still_held: std::collections::HashSet<u64> = Default::default();
-        let mut walked = 0u64;
-        for (&other, m) in self.mappings.iter() {
-            if Some(other) == skip {
-                continue;
-            }
-            let condemned = m.condemned_entries.as_deref().unwrap_or(&[]);
-            walked += (m.page_entries.len() + condemned.len()) as u64;
-            still_held.extend(gpas_of(&m.page_entries));
-            still_held.extend(gpas_of(condemned));
-        }
-        // Reported rather than assumed small. This runs on the drain worker,
-        // which `drain_duty` already shows at 0.93-0.99, and the alias exclusion
-        // costs one pass over everything currently mapped per retire.
-        crate::observe::footprint::note_retire_scan(walked);
-        let retiring: Vec<u64> = gpas_of(going)
-            .into_iter()
-            .filter(|g| !still_held.contains(g))
-            .collect();
-        crate::observe::footprint::note_pages_retired(retiring, self.page_size());
-    }
-
     pub fn unmap_surface(&mut self, mapping_id: u32) -> bool {
         if mapping_id as usize >= MAX_MAPPINGS {
             StateMutationDecline::UnmapSurfaceIdRange { mapping_id }.emit(u64::from(mapping_id));
             return false;
         }
-        // Before the list is cleared, while the pages are still nameable.
-        self.note_mapping_pages_retired(mapping_id);
         self.forget_compositor_mapping(mapping_id);
         if let Some(e) = self.mappings.get_mut(&mapping_id) {
             e.mapped = false;
