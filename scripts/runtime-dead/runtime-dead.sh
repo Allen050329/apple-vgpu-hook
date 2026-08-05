@@ -67,14 +67,30 @@ QEMU_BIN="$REPO_ROOT/vendor/qemu/build/qemu-system-x86_64"
 # and fails the whole boot before QEMU starts.
 export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C instrument-coverage"
 export REIMS_VGPU_COVERAGE="$PROFILE_RT"
-export LLVM_PROFILE_FILE="$OUT_DIR/reims.profraw"
+
+# `%p` per process, and every raw file merged at the end.
+#
+# A single fixed path is what made this instrument report 0 % for the whole
+# crate on a boot that demonstrably drew: `-C instrument-coverage` also
+# instruments the crate's build scripts, they run during the build below, and
+# each one writes to `LLVM_PROFILE_FILE` on exit. The last writer before QEMU's
+# own atexit won, so the merge saw a build script's counters — all zero for
+# every function in the device — and QEMU's were never read. The two are told
+# apart by process id, and the sweep after the build removes the build's.
+export LLVM_PROFILE_FILE="$OUT_DIR/reims-%p.profraw"
 
 echo "runtime-dead: profile runtime $PROFILE_RT"
 
 # A QEMU still holding :2222 makes the new boot fail its hostfwd and exit
 # immediately, and every later step then measures — or SIGTERMs — the OLD,
 # uninstrumented VM. Refuse rather than guess which one is ours.
-stale="$(ps -eo pid,args | grep '[q]emu-system-x86_64' | awk '{print $1}')"
+#
+# `|| true` because the healthy case is grep finding nothing, which is exit 1 —
+# and under `set -o pipefail` that is the whole pipeline's status, so `set -e`
+# aborted the run here whenever no VM was up. The script therefore only got past
+# this guard when the very condition it refuses on was true, and it exited after
+# its one banner line with status 0 every other time.
+stale="$(ps -eo pid,args | grep '[q]emu-system-x86_64' | awk '{print $1}' || true)"
 if [ -n "$stale" ]; then
     echo "runtime-dead: a qemu-system-x86_64 is already running (pid $(echo "$stale" | tr '\n' ' '))." >&2
     echo "runtime-dead: it holds localhost:2222; this boot would fail and the run" >&2
@@ -82,12 +98,23 @@ if [ -n "$stale" ]; then
     exit 1
 fi
 
+# Built here rather than left to `boot-x86.sh`, so the raw files the build
+# writes can be swept before the one that matters is produced. The boot's own
+# build call then finds everything current and adds nothing.
+echo "runtime-dead: building (instrumented) ..."
+"$REPO_ROOT/scripts/qemu-build/qemu-build.sh" --target x86_64 --backend vulkan \
+    > "$OUT_DIR/build.log" 2>&1 || {
+    echo "runtime-dead: instrumented build failed; see $OUT_DIR/build.log" >&2
+    exit 1
+}
+rm -f "$OUT_DIR"/reims-*.profraw
+
 echo "runtime-dead: booting (instrumented) ..."
 "$REPO_ROOT/vm/boot-x86.sh" --device reims-vgpu-pci --testing > "$OUT_DIR/boot.log" 2>&1 &
 
 qemu_pid=""
 for _ in $(seq 1 180); do
-    qemu_pid="$(ps -eo pid,args | grep '[q]emu-system-x86_64' | awk '{print $1}' | head -1)"
+    qemu_pid="$(ps -eo pid,args | grep '[q]emu-system-x86_64' | awk '{print $1}' | head -1 || true)"
     [ -n "$qemu_pid" ] && break
     sleep 2
 done
@@ -103,6 +130,11 @@ for _ in $(seq 1 120); do
         guest_up=1
         break
     fi
+    # A refused connection returns at once — `ConnectTimeout` only bounds a
+    # connection that is being *accepted slowly*, and QEMU's hostfwd refuses
+    # instantly until the guest is listening. Without this the whole loop ran in
+    # under a second and reported a guest that had another twenty to go.
+    sleep 2
 done
 if [ "$guest_up" -eq 0 ]; then
     echo "runtime-dead: guest never answered on macos-vm; see $OUT_DIR/boot.log" >&2
@@ -127,13 +159,14 @@ for _ in $(seq 1 60); do
     sleep 2
 done
 
-if [ ! -s "$LLVM_PROFILE_FILE" ]; then
+mapfile -t raws < <(find "$OUT_DIR" -name 'reims-*.profraw' -size +0c)
+if [ "${#raws[@]}" -eq 0 ]; then
     echo "runtime-dead: no profile data — QEMU did not exit cleanly" >&2
     exit 1
 fi
 
-echo "runtime-dead: merging ..."
-llvm-profdata merge -sparse "$LLVM_PROFILE_FILE" -o "$OUT_DIR/merged.profdata"
+echo "runtime-dead: merging ${#raws[@]} raw profile(s) ..."
+llvm-profdata merge -sparse "${raws[@]}" -o "$OUT_DIR/merged.profdata"
 
 # The coverage mapping lives in the linked QEMU binary, not the archive.
 mapfile -t sources < <(find "$REPO_ROOT/crates/reims-vgpu/src" -name '*.rs')
