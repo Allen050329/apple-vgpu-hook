@@ -355,7 +355,7 @@ tiers, by what evidence is available.
 
 Everything the userspace serializer emits: the selectors in [`INVENTORY`], covering object creation
 (`PGSerializer`) and every encoder record (render, compute, blit, info). This is the bulk of
-`decode/{render,compute,blit,event,stream}.rs` plus the creation half of `decode/resource.rs`.
+`decode/{render,compute,blit,event,stream}.rs` plus the creation half of `decode/resource`.
 
 `runtime::exec` decodes exactly these, so this tier is where the crate earns its place. Follow
 "Adding an operation"; every entry gets a fixture.

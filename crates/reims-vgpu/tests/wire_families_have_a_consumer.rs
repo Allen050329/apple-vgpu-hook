@@ -163,7 +163,7 @@ fn every_wire_family_is_consumed_or_listed_as_a_gap() {
     assert!(
         consumed.contains("texture_view") && consumed.contains("depth_stencil"),
         "the scan cannot see `ops::{{ .. as w_view, .. as w_ds }}` in \
-         runtime/decode/resource.rs, so its notion of `unconsumed` is the \
+         runtime/decode/resource/mod.rs, so its notion of `unconsumed` is the \
          grep's and not worth reading: {consumed:?}"
     );
 

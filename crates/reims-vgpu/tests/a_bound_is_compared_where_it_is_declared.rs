@@ -78,7 +78,7 @@ const BOUNDS: &[Bound] = &[
     },
     Bound {
         name: "TEXTURE_VIEW_MIN_SIMPLE",
-        owner: "runtime/decode/resource.rs",
+        owner: "runtime/decode/resource/mod.rs",
         exempt: &[],
     },
 ];
