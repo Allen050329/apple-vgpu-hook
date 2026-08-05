@@ -744,20 +744,57 @@ impl crate::observe::Decline for IndexLoadReason {
     }
 }
 
+/// Load the render pipeline a draw named, or say why it could not be loaded.
+///
+/// The sibling of `compute_exec::load_compute_pipeline`, and until now the half
+/// of that pair that named none of its five failures: every caller collapses a
+/// `None` into one coarse `MissingPipeline`, so a draw that lost its pipeline
+/// said only that, on the rail that runs every frame.
+///
+/// `pipeline_ref == 0` is "no pipeline bound" and stays silent, matching the
+/// compute sibling and the rest of the crate — `exec` filters it at both draw
+/// call sites and `metal_icb` tests it directly, so nothing reaches here with a
+/// zero today. The guard is what keeps that true if one ever does: ref 0 is a
+/// valid object-list index, so without it an unbound ref would read entry 0 and
+/// then report a rung for it.
 fn load_render_pipeline<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &M,
     task_id: u32,
     pipeline_ref: u32,
 ) -> Option<RenderPipelineDescriptor> {
-    let entry = objects::lookup_list_entry(state, host, task_id, pipeline_ref)?;
-    // Live object-list: render pipeline is type-7 with subtype 0x0e.
-    if entry.object_type != OBJECT_TYPE_TYPE7 {
+    if pipeline_ref == 0 {
         return None;
     }
-    let desc = objects::read_descriptor(state, host, task_id, &entry)?;
-    let p = decode_render_pipeline_descriptor(&desc).ok()?;
-    if p.vertex_func_ref == 0 || p.fragment_func_ref == 0 {
+    let report = crate::observe::RungReport::new("draw_load_pipeline", "pipe_ref");
+    // Live object-list: render pipeline is type-7 with subtype 0x0e.
+    let (_entry, desc) =
+        match objects::resolve_descriptor(state, host, task_id, pipeline_ref, &[OBJECT_TYPE_TYPE7])
+        {
+            Ok(found) => found,
+            Err(rung) => {
+                report.rung(task_id, pipeline_ref, rung);
+                return None;
+            }
+        };
+    let Ok(p) = decode_render_pipeline_descriptor(&desc) else {
+        report.reason(
+            task_id,
+            pipeline_ref,
+            crate::observe::ladder_slug!("", desc_decode),
+            &format!("desc_len={}", desc.len()),
+        );
+        return None;
+    };
+    // Both stages are required to build a pipeline, and the two are reported
+    // apart because they are different guest mistakes — the compute sibling
+    // names its one stage the same way, as `kernel_func_zero`.
+    if p.vertex_func_ref == 0 {
+        report.reason(task_id, pipeline_ref, "vertex_func_zero", "");
+        return None;
+    }
+    if p.fragment_func_ref == 0 {
+        report.reason(task_id, pipeline_ref, "fragment_func_zero", "");
         return None;
     }
     Some(p)

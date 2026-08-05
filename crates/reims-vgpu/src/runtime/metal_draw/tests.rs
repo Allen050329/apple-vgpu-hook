@@ -441,6 +441,37 @@ fn bound_depth_stencil_that_cannot_resolve_returns_named_reason() {
     );
 }
 
+/// A draw that cannot load its pipeline says why, and an unbound ref says
+/// nothing.
+///
+/// `load_render_pipeline` used to return a bare `None` from all five of its
+/// failure points while its compute sibling named all of its own, so every
+/// caller's coarse `MissingPipeline` was the whole story on the rail that runs
+/// per frame. The silent half is the one worth a test: `pipeline_ref == 0` is
+/// "no pipeline bound", and ref 0 is a *valid* object-list index, so without the
+/// guard an unbound ref would read entry 0 and report a rung for it.
+#[test]
+fn a_pipeline_that_cannot_load_names_the_rung_and_an_unbound_ref_stays_quiet() {
+    let state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let host = FakeHost::new();
+
+    let cap = crate::observe::FailCapture::start();
+    assert!(load_render_pipeline(&state, &host, /*task*/ 4, /*pipe*/ 9).is_none());
+    assert_eq!(
+        cap.one("draw_load_pipeline"),
+        "draw_load_pipeline fail reason=no_list_entry task=4 pipe_ref=9"
+    );
+    drop(cap);
+
+    let cap = crate::observe::FailCapture::start();
+    assert!(load_render_pipeline(&state, &host, 4, 0).is_none());
+    assert!(
+        cap.lines().is_empty(),
+        "an unbound pipeline ref must spend no line: {:?}",
+        cap.lines()
+    );
+}
+
 #[test]
 fn index_load_failures_report_the_specific_reason() {
     // The Vulkan indexed-draw path collapsed eleven distinct load failures into
