@@ -280,7 +280,7 @@ pub fn device_reset(id: u64) -> bool {
         let seq = slot.reset_count.fetch_add(1, Ordering::Relaxed) + 1;
         let state = &d.device.state;
         let mappings = state.mappings.len();
-        let tasks = state.tasks.iter().filter(|task| task.active).count();
+        let tasks = state.tasks.live_count();
         let host_surfaces = state.host_surfaces.len();
         let host_textures = state.host_texture_surfaces.len();
         let host_gvas = state.host_gva_surfaces.len();

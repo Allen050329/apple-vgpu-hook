@@ -464,7 +464,7 @@ fn clear_only_present_captures_the_surface_the_transaction_names() {
 fn delete_task_root_clears_active_task() {
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
-    assert!(state.define_task(3, 0x1000, 2));
+    state.define_task(3, 0x1000, 2);
     assert!(state.tasks[3].active);
     process_root_packet(
         &mut state,
@@ -478,7 +478,10 @@ fn delete_task_root_clears_active_task() {
             next_head: 0,
         },
     );
-    assert!(!state.tasks[3].active, "DeleteTask must deactivate task 3");
+    assert!(
+        !state.tasks.is_active(3),
+        "DeleteTask must leave no live task 3"
+    );
     assert!(
         !state
             .fails
@@ -3105,7 +3108,7 @@ fn map_memory2_does_not_flush_gva_host_cache_on_wire() {
     let _ = host.write_gpa(root_gpa + 4, &d[..4]);
 
     let mut state = DeviceState::new(DeviceId(1), page_shift);
-    assert!(state.define_task(1, 0x1000, 2));
+    state.define_task(1, 0x1000, 2);
     let gva = 1u64 << page_shift;
     let mut bgra = vec![0u8; 16];
     bgra[0] = 185;
@@ -4134,7 +4137,7 @@ fn deleting_a_task_retires_its_own_deferred_windows_and_not_its_doubles() {
     };
     // Task 5 is the one deleted; 10 and 11 are its doubles and 2 is its half.
     for id in [2u32, 5, 10, 11] {
-        assert!(state.define_task(id, 0x1_0000, 2), "slot {id} must be live");
+        state.define_task(id, 0x1_0000, 2);
         state.arm_gva_deferred_window(u64::from(id) << 16, window(id));
     }
     assert_eq!(state.gva_deferred_flush.len(), 4);

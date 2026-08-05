@@ -15,7 +15,7 @@
 //! See [[map-memory2]] GPU-import model and HostOps `map_pages` / `unmap_pages`.
 
 use crate::contract::gva_resolve::{read_task_root, translate_root, Cache, ResolveStatus, Task};
-use crate::model::{DeviceState, GvaHostView, TaskEntry};
+use crate::model::{DeviceState, GvaHostView, TaskEntry, TaskTable};
 use crate::runtime::gva_mem::geometry_for_page_shift;
 use crate::runtime::host::{HostMemory, HostOps, MemError};
 use crate::runtime::mapper::RunCopy;
@@ -180,8 +180,8 @@ fn find_covering_view(
 /// live task, and walking it would return that task's bytes on a read and put
 /// host bytes at a GPA the named task does not own on a write. Callers turn the
 /// `None` into a typed, always-on refusal (`MemError::NoSuchTask`).
-fn resolve_task_for_walk(tasks: &[TaskEntry], task_id: u32) -> Option<(u32, &TaskEntry)> {
-    let t = tasks.get(task_id as usize)?;
+fn resolve_task_for_walk(tasks: &TaskTable, task_id: u32) -> Option<(u32, &TaskEntry)> {
+    let t = tasks.get(task_id)?;
     (t.active && t.directory_pfn != 0).then_some((task_id, t))
 }
 
@@ -869,7 +869,7 @@ mod tests {
         st32(&mut pte, 10);
         host.write_gpa(root_gpa + 4, &pte).unwrap();
         let mut state = state_x86();
-        assert!(state.define_task(1, page, 2));
+        state.define_task(1, page, 2);
 
         let before = host.map_pages_calls;
         assert_eq!(
@@ -908,7 +908,7 @@ mod tests {
         // must be in range): `first_sight` is process-global, so sharing an id
         // would let another test's span consume this one's first sight.
         let task = 200u32;
-        assert!(state.define_task(task, page, 2));
+        state.define_task(task, page, 2);
 
         let cap = crate::observe::FailCapture::start();
         let lines = || -> Vec<String> {
@@ -986,7 +986,7 @@ mod tests {
             host.write_gpa(root_gpa + (i as u64) * 4, &pte).unwrap();
         }
         let mut state = state_x86();
-        assert!(state.define_task(1, page, 2));
+        state.define_task(1, page, 2);
 
         let (ptr, ptr_len) = ensure_gva_view(&mut state, &mut host, 1, page, 3 * page)
             .expect("three packed pages map as one view");
@@ -1073,7 +1073,7 @@ mod tests {
         }
 
         let mut state = state_x86();
-        assert!(state.define_task(1, page, 2));
+        state.define_task(1, page, 2);
         let payload = [0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
         // Write 4 bytes at end of page0 + 4 at start of page1 (crosses gap).
         let gva = page - 4;
@@ -1131,7 +1131,7 @@ mod tests {
         let _fp = footprint::exclusive_for_tests();
         let (mut host, _root_gpa, data0, data1, page) = pt_fixture(PAGE_SHIFT_X86);
         let mut state = state_x86();
-        assert!(state.define_task(1, page, 2));
+        state.define_task(1, page, 2);
 
         let gva = 0x100u64;
         write_span_within(&mut state, &mut host, 1, gva, &[0x7Eu8; 64], None)
@@ -1173,7 +1173,7 @@ mod tests {
         let page_shift = PAGE_SHIFT_X86;
         let (mut host, root_gpa, data0, data1, page) = pt_fixture(page_shift);
         let mut state = state_x86();
-        assert!(state.define_task(1, page, 2));
+        state.define_task(1, page, 2);
         let armed: std::collections::HashSet<u64> = [data0].into_iter().collect();
 
         // Control: while the GVA still resolves inside the window, the write
@@ -1284,8 +1284,8 @@ mod tests {
         let page_shift = PAGE_SHIFT_X86;
         let (mut host, _root_gpa, _data0, _data1, page) = pt_fixture(page_shift);
         let mut state = state_x86();
-        assert!(state.define_task(4, page, 2));
-        assert!(state.define_task(9, page, 2));
+        state.define_task(4, page, 2);
+        state.define_task(9, page, 2);
         let before = log_mark();
         assert!(write_span_within(&mut state, &mut host, 9, 8, &[1, 2, 3, 4], None).is_ok());
         let tail = log_tail(before);
@@ -1309,7 +1309,7 @@ mod tests {
         let page_shift = PAGE_SHIFT_X86;
         let (mut host, _root_gpa, _data0, _data1, page) = pt_fixture(page_shift);
         let mut state = state_x86();
-        assert!(state.define_task(4, page, 2));
+        state.define_task(4, page, 2);
         let before = log_mark();
         let err = write_span_within(&mut state, &mut host, 9, 8, &[1, 2, 3, 4], None)
             .expect_err("slot 9 is not live, so this write has no address space");
@@ -1329,7 +1329,7 @@ mod tests {
         let page_shift = PAGE_SHIFT_X86;
         let (mut host, root_gpa, data0, data1, page) = pt_fixture(page_shift);
         let mut state = state_x86();
-        assert!(state.define_task(1, page, 2));
+        state.define_task(1, page, 2);
         let gva = 8u64;
         assert!(write_span_within(&mut state, &mut host, 1, gva, &[1, 2, 3, 4], None).is_ok());
         let mut back = [0u8; 4];
@@ -1367,7 +1367,7 @@ mod tests {
         let page_shift = PAGE_SHIFT_X86;
         let (mut host, _root_gpa, _data0, _data1, page) = pt_fixture(page_shift);
         let mut state = state_x86();
-        assert!(state.define_task(1, page, 2));
+        state.define_task(1, page, 2);
         crate::observe::redirect_logs_for_tests();
         let before = std::fs::read_to_string(crate::observe::fail_log_path())
             .unwrap_or_default()
@@ -1410,7 +1410,7 @@ mod tests {
         let page_shift = PAGE_SHIFT_X86;
         let (mut host, _root_gpa, _data0, _data1, page) = pt_fixture(page_shift);
         let mut state = state_x86();
-        assert!(state.define_task(1, page, 2));
+        state.define_task(1, page, 2);
         crate::observe::redirect_logs_for_tests();
         let before = std::fs::read_to_string(crate::observe::fail_log_path())
             .unwrap_or_default()
@@ -1472,7 +1472,7 @@ mod tests {
         st32(&mut pte, 10);
         host.write_gpa(root_gpa + 4, &pte).unwrap();
         let mut state = state_x86();
-        assert!(state.define_task(1, page, 2));
+        state.define_task(1, page, 2);
         assert!(
             write_span_within(
                 &mut state,
@@ -1506,7 +1506,7 @@ mod tests {
         st32(&mut pte, 10);
         host.write_gpa(root_gpa + 4, &pte).unwrap();
         let mut state = state_x86();
-        assert!(state.define_task(1, page, 2));
+        state.define_task(1, page, 2);
 
         let before = host.map_pages_calls;
         assert!(
@@ -1534,7 +1534,7 @@ mod tests {
         let page_shift = PAGE_SHIFT_X86;
         let (mut host, root_gpa, data0, data1, page) = pt_fixture(page_shift);
         let mut state = state_x86();
-        assert!(state.define_task(1, page, 2));
+        state.define_task(1, page, 2);
         let gva = 8u64;
         let s = map_fresh_span_within(&mut state, &mut host, 1, gva, 16, None).unwrap();
         assert!(s.avail >= 16);
@@ -1566,7 +1566,7 @@ mod tests {
         let page_shift = PAGE_SHIFT_X86;
         let (mut host, root_gpa, data0, data1, page) = pt_fixture(page_shift);
         let mut state = state_x86();
-        assert!(state.define_task(1, page, 2));
+        state.define_task(1, page, 2);
         let gva = 8u64;
         let (p0, _) = ensure_gva_view(&mut state, &mut host, 1, gva, 16).unwrap();
         assert_eq!(state.gva_host_views.len(), 1);
@@ -1656,7 +1656,7 @@ mod tests {
     #[test]
     fn delete_task_retires_views() {
         let mut state = state_x86();
-        assert!(state.define_task(1, 0x1_0000, 0x100));
+        state.define_task(1, 0x1_0000, 0x100);
         state.gva_host_views.push(GvaHostView {
             task_id: 1,
             gva: 0x3000,

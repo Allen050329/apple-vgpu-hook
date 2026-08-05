@@ -77,10 +77,10 @@ fn short_payload_noop() {
 fn an_exec_packet_naming_a_dead_slot_is_refused_not_aimed_at_its_neighbour() {
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
     let mut host = FakeHost::new();
-    assert!(state.define_task(3, 0x1_0000, 2), "slot 3 must be live");
+    state.define_task(3, 0x1_0000, 2);
     assert!(state.tasks[3].active);
     assert!(
-        !state.tasks[6].active,
+        !state.tasks.is_active(6),
         "slot 6 must be dead for this to bite"
     );
 
@@ -113,7 +113,7 @@ fn a_resource_record_that_populates_its_unrecovered_tail_says_so() {
     };
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
     let mut host = FakeHost::new();
-    assert!(state.define_task(3, 0x1_0000, 2), "slot 3 must be live");
+    state.define_task(3, 0x1_0000, 2);
 
     const N_RES: u32 = 2;
     let table_len = N_RES as usize * CHILD_EXEC_INDIRECT_RESOURCE_DESC_LEN as usize;
@@ -183,7 +183,7 @@ fn a_submission_that_says_the_guest_wrote_a_resource_drops_its_pending_window() 
     };
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
     let mut host = FakeHost::new();
-    assert!(state.define_task(3, 0x1_0000, 2), "slot 3 must be live");
+    state.define_task(3, 0x1_0000, 2);
     const MAPPING: u32 = 0x40;
     state.mappings.entry(MAPPING).or_default().mapped = true;
     let key = crate::model::ComputeStorageResidencyKey {
@@ -267,7 +267,7 @@ fn a_submission_that_only_licenses_a_resource_keeps_its_pending_window() {
     };
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
     let mut host = FakeHost::new();
-    assert!(state.define_task(3, 0x1_0000, 2));
+    state.define_task(3, 0x1_0000, 2);
     const MAPPING: u32 = 0x41;
     state.mappings.entry(MAPPING).or_default().mapped = true;
     state.compute_deferred_flush.insert(
@@ -1663,7 +1663,7 @@ fn clear_only_type4_surface_writes_guest_pages() {
     // the task's page table has to carry this the way a guest's does.
     st32(&mut d[..4], 0x40);
     let _ = host.write_gpa(root_gpa + 0x40 * 4, &d[..4]);
-    assert!(state.define_task(1, 0x1000, 2));
+    state.define_task(1, 0x1000, 2);
     assert!(state.set_object_list(1, 0, 8));
     // Type-4 at surface_id=5.
     let mut entry = [0u8; 12];
@@ -1826,7 +1826,7 @@ fn nometal_draw_falls_back_to_type4_clear() {
     // As above: the backing GVA has to translate, not be assumed identity.
     st32(&mut d[..4], 0x50);
     let _ = host.write_gpa(root_gpa + 0x50 * 4, &d[..4]);
-    assert!(state.define_task(1, 0x1000, 2));
+    state.define_task(1, 0x1000, 2);
     assert!(state.set_object_list(1, 0, 8));
     let mut entry = [0u8; 12];
     st32(

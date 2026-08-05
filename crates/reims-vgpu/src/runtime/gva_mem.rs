@@ -9,7 +9,7 @@ use crate::contract::gva_resolve::{
     read_task_root, resolve_status_name, translate_root, Cache, Geometry, PhysReader,
     ResolveStatus, Task, ARM64E_GEOMETRY, X86_64_GEOMETRY,
 };
-use crate::model::TaskEntry;
+use crate::model::{TaskEntry, TaskTable};
 use crate::runtime::host::{HostMemory, MemError};
 
 struct HostPhys<'a, M: HostMemory>(&'a M);
@@ -106,14 +106,14 @@ pub fn read_task_gva<M: HostMemory>(
 #[track_caller]
 pub fn read_task_gva_by_id<M: HostMemory>(
     host: &M,
-    tasks: &[TaskEntry],
+    tasks: &TaskTable,
     task_id: u32,
     gva: u64,
     buf: &mut [u8],
     page_shift: u32,
 ) -> Result<(), MemError> {
-    let named = if (task_id as usize) < tasks.len() {
-        match read_task_gva(host, &tasks[task_id as usize], gva, buf, page_shift) {
+    let named = if let Some(task) = tasks.get(task_id) {
+        match read_task_gva(host, task, gva, buf, page_shift) {
             Ok(()) => return Ok(()),
             Err(e) => e,
         }
@@ -204,7 +204,7 @@ pub fn define_task_pages_arm64e(
         st32(&mut pte, pfn);
         let _ = host.write_gpa(root_gpa + (i as u64) * 4, &pte);
     }
-    assert!(state.define_task(1, 0x1000, dir_pfn));
+    state.define_task(1, 0x1000, dir_pfn);
 }
 
 /// Translate `gva` under `task` and write `buf` into guest RAM via `write_gpa`.
@@ -303,7 +303,7 @@ fn latch_key(task_id: u32, other: u32, loc: &std::panic::Location<'_>) -> u64 {
 /// one translate rather than a walk of the whole span.
 pub fn any_task_gva_page_resolves<M: HostMemory>(
     host: &M,
-    tasks: &[TaskEntry],
+    tasks: &TaskTable,
     task_id: u32,
     gva: u64,
     span: u64,
@@ -467,7 +467,7 @@ pub fn write_task_gva_product_within<H: HostMemory + crate::runtime::host::HostO
 )]
 pub fn visit_task_gva_page_gpas<M: HostMemory>(
     host: &M,
-    tasks: &[TaskEntry],
+    tasks: &TaskTable,
     task_id: u32,
     gva: u64,
     span: u64,
@@ -510,7 +510,7 @@ pub fn pages_spanned(gva: u64, span: u64, page_size: u64) -> u64 {
 /// anything was dropped.
 pub fn task_gva_page_gpas<M: HostMemory>(
     host: &M,
-    tasks: &[TaskEntry],
+    tasks: &TaskTable,
     task_id: u32,
     gva: u64,
     span: u64,
@@ -532,7 +532,7 @@ pub fn task_gva_page_gpas<M: HostMemory>(
 /// pages walked; that is what every caller compares against [`pages_spanned`].
 pub fn task_gva_page_gpa_set<M: HostMemory>(
     host: &M,
-    tasks: &[TaskEntry],
+    tasks: &TaskTable,
     task_id: u32,
     gva: u64,
     span: u64,
@@ -556,7 +556,7 @@ pub fn task_gva_page_gpa_set<M: HostMemory>(
 )]
 fn visit_task_gva_pages<M: HostMemory>(
     host: &M,
-    tasks: &[TaskEntry],
+    tasks: &TaskTable,
     task_id: u32,
     gva: u64,
     span: u64,
@@ -571,7 +571,7 @@ fn visit_task_gva_pages<M: HostMemory>(
         return;
     };
     let reader = HostPhys(host);
-    let Some(task) = tasks.get(task_id as usize) else {
+    let Some(task) = tasks.get(task_id) else {
         return;
     };
     if !task.active || task.directory_pfn == 0 {
@@ -645,7 +645,7 @@ fn visit_task_gva_pages<M: HostMemory>(
 /// treating a quiet return as agreement.
 pub fn visit_task_gva_pages_in_order<M: HostMemory>(
     host: &M,
-    tasks: &[TaskEntry],
+    tasks: &TaskTable,
     task_id: u32,
     gva: u64,
     span: u64,
@@ -744,7 +744,7 @@ pub fn diagnose_task_slot<M: HostMemory>(
 /// Compact multi-clause string for one fail-log line (MapMemory2 / stage Unmapped).
 pub fn diagnose_gva_walk<M: HostMemory>(
     host: &M,
-    tasks: &[TaskEntry],
+    tasks: &TaskTable,
     task_id: u32,
     gva: u64,
     page_shift: u32,
@@ -755,32 +755,28 @@ pub fn diagnose_gva_walk<M: HostMemory>(
         if !tried.insert(id) {
             return;
         }
-        if (id as usize) >= tasks.len() {
-            parts.push(format!("tid={id} st=oob"));
+        let Some(task) = tasks.get(id) else {
+            // No task under this id at all. `st=undefined` rather than the
+            // `st=oob` this printed against the old fixed array: there is no
+            // range to be outside of now, and the two say different things —
+            // one was "the id is too large", this is "the guest never defined
+            // it", which is the only way to reach here.
+            parts.push(format!("tid={id} st=undefined"));
             return;
-        }
-        parts.push(diagnose_task_slot(
-            host,
-            &tasks[id as usize],
-            id,
-            gva,
-            page_shift,
-        ));
+        };
+        parts.push(diagnose_task_slot(host, task, id, gva, page_shift));
     };
     try_id(task_id, &mut parts, &mut tried);
     try_id(task_id >> 1, &mut parts, &mut tried);
     // Peer scan: active tasks with a directory (cap 4 extras) — catches wrong-task walks.
-    let mut peers = 0u32;
-    for (i, t) in tasks.iter().enumerate() {
-        if peers >= 4 {
-            break;
-        }
-        let id = i as u32;
-        if tried.contains(&id) || !t.active || t.directory_pfn == 0 {
-            continue;
-        }
+    let peer_ids: Vec<u32> = tasks
+        .live()
+        .filter(|(id, t)| !tried.contains(id) && t.directory_pfn != 0)
+        .map(|(id, _)| id)
+        .take(4)
+        .collect();
+    for id in peer_ids {
         try_id(id, &mut parts, &mut tried);
-        peers += 1;
     }
     format!(
         "gva={gva:#x} page_shift={page_shift} | {}",
@@ -789,12 +785,9 @@ pub fn diagnose_gva_walk<M: HostMemory>(
 }
 
 /// Snapshot of active task directories (for periodic map census).
-pub fn format_active_tasks(tasks: &[TaskEntry]) -> String {
+pub fn format_active_tasks(tasks: &TaskTable) -> String {
     let mut bits = Vec::new();
-    for (i, t) in tasks.iter().enumerate() {
-        if !t.active {
-            continue;
-        }
+    for (i, t) in tasks.live() {
         bits.push(format!(
             "t{i}:dir={:#x},len={:#x},ol_pfn={:#x},ol_n={}",
             t.directory_pfn, t.length, t.object_list_pfn, t.object_list_count
@@ -992,8 +985,8 @@ mod tests {
         let mut pte = [0u8; 4];
         st32(&mut pte, 4);
         host.write_gpa(root_gpa, &pte).unwrap();
-        let mut tasks: [TaskEntry; 4] = std::array::from_fn(|_| TaskEntry::default());
-        tasks[1] = TaskEntry::define(0x1000, 2);
+        let mut tasks = TaskTable::default();
+        tasks.define(1, TaskEntry::define(0x1000, 2));
         let ok = diagnose_gva_walk(&host, &tasks, 1, 0, PAGE_SHIFT_X86);
         assert!(ok.contains("st=ok"), "{ok}");
         assert!(
@@ -1028,7 +1021,7 @@ mod tests {
         let _ = host.write_gpa(root_gpa, &d[..4]);
 
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        assert!(state.define_task(1, 0x1000, 2));
+        state.define_task(1, 0x1000, 2);
         let mut buf = [0u8; 4];
         assert!(read_task_gva(&host, &state.tasks[1], 0, &mut buf, PAGE_SHIFT_ARM64E).is_ok());
         assert_eq!(buf, [0xab; 4]);
@@ -1058,7 +1051,7 @@ mod tests {
         let _ = host.write_gpa(root_gpa, &d[..4]);
 
         let mut state = DeviceState::new(DeviceId(1), page_shift);
-        assert!(state.define_task(1, 0x1000, 2));
+        state.define_task(1, 0x1000, 2);
         let mut buf = [0u8; 4];
         assert!(read_task_gva(&host, &state.tasks[1], 0, &mut buf, page_shift).is_ok());
         assert_eq!(buf, [0xcd; 4]);
@@ -1179,8 +1172,8 @@ mod tests {
         host.write_gpa(root_gpa + 4, &pte).unwrap();
 
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-        assert!(state.define_task(2, 0x1_0000, 2));
-        assert!(state.define_task(5, 0x1_0000, 9));
+        state.define_task(2, 0x1_0000, 2);
+        state.define_task(5, 0x1_0000, 9);
 
         // The donor really can serve it — otherwise this test would pass for
         // the wrong reason.
@@ -1233,10 +1226,10 @@ mod tests {
         host.write_gpa(root_gpa + 4, &pte).unwrap();
 
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-        assert!(state.define_task(2, 0x1_0000, 2));
-        assert!(state.define_task(5, 0x1_0000, 0));
+        state.define_task(2, 0x1_0000, 2);
+        state.define_task(5, 0x1_0000, 0);
         assert!(
-            state.tasks[5].active,
+            state.tasks.is_active(5),
             "the slot is live; only the page table is missing"
         );
 
@@ -1289,9 +1282,9 @@ mod tests {
     fn a_failed_fallback_read_carries_the_named_tasks_own_refusal() {
         let host = FakeHost::new();
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-        assert!(state.define_task(6, 0x1_0000, 0));
+        state.define_task(6, 0x1_0000, 0);
         assert!(
-            state.tasks[6].active,
+            state.tasks.is_active(6),
             "the slot is live; only the walk fails"
         );
         let mut buf = [0u8; 4];
@@ -1304,16 +1297,22 @@ mod tests {
         );
     }
 
-    /// A word naming no slot at all still reports `NoSuchTask` — that one IS
+    /// A word naming no task at all still reports `NoSuchTask` — that one IS
     /// the check that refused.
+    ///
+    /// `u32::MAX` rather than "one past the table": there is no table to be past
+    /// now, and an undefined id is the only way to reach this. The largest id
+    /// the wire can carry is the strongest case, and it would have been refused
+    /// by a range check before, which is a different refusal wearing this one's
+    /// name.
     #[test]
-    fn a_fallback_read_for_an_out_of_range_word_still_reports_no_such_task() {
+    fn a_read_for_an_undefined_task_word_still_reports_no_such_task() {
         let host = FakeHost::new();
         let state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
         let mut buf = [0u8; 4];
-        let oob = state.tasks.len() as u32 + 4;
-        let err = read_task_gva_by_id(&host, &state.tasks, oob, 0x1000, &mut buf, PAGE_SHIFT_X86)
-            .unwrap_err();
+        let err =
+            read_task_gva_by_id(&host, &state.tasks, u32::MAX, 0x1000, &mut buf, PAGE_SHIFT_X86)
+                .unwrap_err();
         assert_eq!(err, MemError::NoSuchTask);
     }
 }

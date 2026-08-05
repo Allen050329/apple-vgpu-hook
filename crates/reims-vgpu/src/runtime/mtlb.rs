@@ -269,7 +269,7 @@ mod tests {
         st32(&mut d[..4], 4);
         let _ = host.write_gpa(root_gpa, &d[..4]);
 
-        assert!(state.define_task(1, 0x1000, 2));
+        state.define_task(1, 0x1000, 2);
         assert!(state.set_object_list(1, 0, 8));
         let mut entry = [0u8; 12];
         st32(

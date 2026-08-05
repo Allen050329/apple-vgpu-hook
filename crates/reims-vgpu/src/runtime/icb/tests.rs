@@ -123,7 +123,7 @@ fn setup_task(host: &mut FakeHost, state: &mut DeviceState) {
         st32(&mut pte, pfn);
         let _ = host.write_gpa(root_gpa + (i as u64) * 4, &pte);
     }
-    assert!(state.define_task(1, 0x1000, dir_pfn));
+    state.define_task(1, 0x1000, dir_pfn);
     assert!(state.set_object_list(1, 0, 32));
 }
 

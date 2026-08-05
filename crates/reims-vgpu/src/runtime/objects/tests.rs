@@ -53,7 +53,7 @@ fn setup_task_with_list(host: &mut FakeHost, state: &mut DeviceState) {
     st32(&mut d[..4], 4);
     let _ = host.write_gpa(root_gpa, &d[..4]);
 
-    assert!(state.define_task(1, 0x1000, 2));
+    state.define_task(1, 0x1000, 2);
     // list base GVA 0 (pfn field 0 allowed)
     assert!(state.set_object_list(1, 0, 8));
     let mut entry = [0u8; 12];
@@ -332,7 +332,7 @@ fn resolve_type4_refuses_to_substitute_the_gva_when_the_walk_fails() {
     // backing GVA page — is left unmapped, so the backing walk fails.
     st32(&mut d[..4], 4);
     let _ = host.write_gpa(root_gpa, &d[..4]);
-    assert!(state.define_task(1, 0x1000, 2));
+    state.define_task(1, 0x1000, 2);
     assert!(state.set_object_list(1, 0, 8));
     let mut entry = [0u8; 12];
     st32(&mut entry[0..], 4u32 | (0x30u32 << 8));
@@ -409,9 +409,9 @@ fn the_task_search_reaches_the_owner_when_task_zero_cannot_translate() {
     st32(&mut d[..4], 9);
     let _ = host.write_gpa(root1_gpa + 0x20 * 4, &d[..4]);
 
-    assert!(state.define_task(0, 0x1000, 2));
+    state.define_task(0, 0x1000, 2);
     assert!(state.set_object_list(0, 0, 8));
-    assert!(state.define_task(1, 0x1000, 7));
+    state.define_task(1, 0x1000, 7);
     assert!(state.set_object_list(1, 0, 8));
 
     let mut entry = [0u8; 12];
@@ -486,9 +486,9 @@ fn a_surface_id_claimed_by_two_tasks_is_counted_as_two() {
     st32(&mut d[..4], 9);
     let _ = host.write_gpa(root1_gpa, &d[..4]);
 
-    assert!(state.define_task(0, 0x1000, 2));
+    state.define_task(0, 0x1000, 2);
     assert!(state.set_object_list(0, 0, 8));
-    assert!(state.define_task(1, 0x1000, 7));
+    state.define_task(1, 0x1000, 7);
     assert!(state.set_object_list(1, 0, 8));
 
     // Slot 3 of task 0 is the surface. Both entries carry a descriptor GVA
@@ -562,7 +562,7 @@ fn resolve_type4_force_rebuilds_when_task_translation_moves() {
     let _ = host.write_gpa(root_gpa, &d[..4]);
     st32(&mut d[..4], 5);
     let _ = host.write_gpa(root_gpa + 4, &d[..4]);
-    assert!(state.define_task(1, 0x1000, 2));
+    state.define_task(1, 0x1000, 2);
     assert!(state.set_object_list(1, 0, 8));
     // Type-4 entry at surface_id=3, descriptor at GVA 0x80.
     let mut entry = [0u8; 12];
@@ -807,9 +807,9 @@ fn a_task_with_no_object_list_resolves_nothing_not_its_neighbours_list() {
 
     // Task 2 owns a real list at pfn 1. Task 5 has a directory that maps
     // nothing, and `5 >> 1 == 2`.
-    assert!(state.define_task(2, 0x1000, 2));
+    state.define_task(2, 0x1000, 2);
     assert!(state.set_object_list(2, 1, 4));
-    assert!(state.define_task(5, 0x1000, 9));
+    state.define_task(5, 0x1000, 9);
 
     let donor = lookup_list_entry(&state, &host, 2, 0);
     assert!(
@@ -851,7 +851,7 @@ fn setup_type4_candidate(
     let _ = host.write_gpa(dir_gpa, &d);
     st32(&mut d[..4], 4);
     let _ = host.write_gpa(root_gpa, &d[..4]);
-    assert!(state.define_task(1, 0x1000, 2));
+    state.define_task(1, 0x1000, 2);
     assert!(state.set_object_list(1, 0, surface_id + 1));
 
     let mut entry = [0u8; OBJECT_LIST_ENTRY_LEN];
@@ -1271,43 +1271,65 @@ fn the_device_descriptor_format_word_survives_both_of_its_encodings() {
 }
 
 /// The type-4 probe order must visit task 0 first, the hint next, and every
-/// other task exactly once.
+/// **live** task exactly once.
 ///
 /// It is the thing that makes the search terminate on the first probe for
 /// every surface this device has ever resolved, so its shape is the whole
 /// cost of the search. Two properties are load-bearing and neither is
 /// obvious from the iterator chain: no task may be probed **twice** (a
-/// duplicate is a wasted guest read on the hot present path, and with a
-/// misbehaving hint it would be 256 of them), and no task may be **missed**
-/// (a missed one is a surface that cannot be found at all).
+/// duplicate is a wasted guest read on the hot present path), and no live task
+/// may be **missed** (a missed one is a surface that cannot be found at all).
+///
+/// The tail used to be `1..MAX_TASKS`, and this test asserted a length of
+/// exactly 256. It now walks the live ids, so the assertions are about the
+/// task set rather than about a constant — which is the point of the change,
+/// and is why a length assertion against a number would silently stop meaning
+/// anything.
 #[test]
-fn the_type4_probe_order_visits_task_zero_first_and_every_task_once() {
+fn the_type4_probe_order_visits_task_zero_first_and_every_live_task_once() {
     use std::collections::HashSet;
 
-    for hint in [0u32, 1, 7, MAX_TASKS as u32 - 1] {
-        let order: Vec<u32> = type4_probe_order(hint).collect();
+    let mut state = DeviceState::new(DeviceId(1), crate::model::PAGE_SHIFT_X86);
+    // Deliberately sparse, and one id far past the retired 256 ceiling: the
+    // probe must reach a task the old fixed range could not even name.
+    let live = [0u32, 1, 7, 300, 70_000];
+    for id in live {
+        state.define_task(id, 0x1000, 2);
+    }
+
+    for hint in [0u32, 1, 7, 70_000] {
+        let order = type4_probe_order(&state.tasks, hint);
         assert_eq!(order[0], 0, "task 0 leads for hint {hint}");
         if hint != 0 {
             assert_eq!(order[1], hint, "the hint is probed second");
         }
-        assert_eq!(
-            order.len(),
-            MAX_TASKS,
-            "every task exactly once, no duplicate for hint {hint}"
-        );
         let seen: HashSet<u32> = order.iter().copied().collect();
-        assert_eq!(seen.len(), MAX_TASKS);
-        assert!((0..MAX_TASKS as u32).all(|t| seen.contains(&t)));
+        assert_eq!(
+            seen.len(),
+            order.len(),
+            "no task probed twice for hint {hint}: {order:?}"
+        );
+        assert!(
+            live.iter().all(|t| seen.contains(t)),
+            "every live task probed for hint {hint}: {order:?}"
+        );
     }
 
-    // A hint outside the id space must not add a probe or lose one. It
-    // cannot be found, so admitting it would cost a wasted read and — worse
-    // — leave the `!= hint` filter matching nothing real.
-    for bad in [MAX_TASKS as u32, u32::MAX] {
-        let order: Vec<u32> = type4_probe_order(bad).collect();
-        assert_eq!(order.len(), MAX_TASKS);
-        assert_eq!(order, type4_probe_order(0).collect::<Vec<_>>());
-    }
+    // A dead task is not probed. It never could be — the probe's own liveness
+    // test refused it — so yielding it only ever cost a guest read's worth of
+    // work per present.
+    let order = type4_probe_order(&state.tasks, 0);
+    assert!(
+        !order.contains(&9),
+        "an id nothing defined must not be probed: {order:?}"
+    );
+
+    // A hint naming no live task adds a probe that the liveness test at the
+    // probe then refuses, and must not lose a live one or duplicate task 0.
+    let order = type4_probe_order(&state.tasks, u32::MAX);
+    let seen: HashSet<u32> = order.iter().copied().collect();
+    assert_eq!(seen.len(), order.len(), "{order:?}");
+    assert!(live.iter().all(|t| seen.contains(t)), "{order:?}");
 }
 
 #[test]

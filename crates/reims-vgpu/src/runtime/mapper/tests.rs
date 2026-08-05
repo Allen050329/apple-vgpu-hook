@@ -101,7 +101,7 @@ fn the_page_witness_sees_a_rewire_no_packet_announced() {
     host.write_gpa(root_gpa, &pte).unwrap();
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-    assert!(state.define_task(1, page, 2));
+    state.define_task(1, page, 2);
     state.map_surface(6);
     {
         let m = state.mappings.get_mut(&6).unwrap();
@@ -266,7 +266,7 @@ fn a_page_the_task_cannot_translate_is_not_reported_as_a_move() {
     host.write_gpa(root_gpa, &pte).unwrap();
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-    assert!(state.define_task(1, page, 2));
+    state.define_task(1, page, 2);
     state.map_surface(6);
     {
         let m = state.mappings.get_mut(&6).unwrap();
@@ -354,7 +354,7 @@ fn a_page_moved_in_the_middle_of_a_run_still_refuses_the_write() {
     }
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-    assert!(state.define_task(1, page, 2));
+    state.define_task(1, page, 2);
     state.map_surface(6);
     {
         let m = state.mappings.get_mut(&6).unwrap();
@@ -1079,7 +1079,7 @@ fn render_pages_reject_known_device_and_task_control_pages() {
     let mut state = DeviceState::new(DeviceId(1), crate::model::PAGE_SHIFT_X86);
     state.gfx.root_page = 0x120;
     state.child_rings[2].page_gpas = vec![0x330_000];
-    assert!(state.define_task(1, 0x4000_0000, 0x440));
+    state.define_task(1, 0x4000_0000, 0x440);
     assert!(state.set_object_list(1, 0x550, 1024));
 
     assert_eq!(
@@ -1155,7 +1155,7 @@ fn the_main_fifo_is_probed_over_every_page_the_guest_declared() {
 #[test]
 fn an_object_list_gva_is_not_compared_against_surface_physical_pages() {
     let mut state = DeviceState::new(DeviceId(1), crate::model::PAGE_SHIFT_X86);
-    assert!(state.define_task(1, 0x4000_0000, 0x440));
+    state.define_task(1, 0x4000_0000, 0x440);
     assert!(state.set_object_list(1, 0x550, 1024));
 
     // The exact numeric coincidence: a surface page at the GPA that equals
@@ -1188,8 +1188,8 @@ fn a_surface_colliding_with_several_control_structures_names_the_first() {
     state.gfx.fifo_base_page = 0x220;
     state.iosfc.ring_base = 0x300_000;
     state.child_rings[2].page_gpas = vec![0x330_000];
-    assert!(state.define_task(1, 0x4000_0000, 0x440));
-    assert!(state.define_task(2, 0x4000_0000, 0x660));
+    state.define_task(1, 0x4000_0000, 0x440);
+    state.define_task(2, 0x4000_0000, 0x660);
 
     let all = [
         0x660_000, 0x440_000, 0x330_000, 0x300_000, 0x220_000, 0x120_000,

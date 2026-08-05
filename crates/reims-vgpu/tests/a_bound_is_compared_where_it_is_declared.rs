@@ -11,15 +11,18 @@
 //! | `MAX_SCANOUT_DIM` | 14 in 4 files | seven spelled the ceiling `>` and nothing checked the other seven did |
 //! | `MAX_CHANNELS` | 7 in 4 files | three wrote `id == 0 \|\| id >= MAX`, four wrote the exact negation |
 //! | `MAX_MAPPINGS` | 10 in 4 files | six omitted the zero test, and zero is the "no mapping" sentinel |
-//!
-//! `MAX_MAPPINGS` is no longer in [`BOUNDS`] because it no longer exists.
-//! Consolidating it into `is_mapping_id` is what made it readable that the
-//! ceiling half of the rule bounded nothing — `DeviceState::mappings` is a
-//! `BTreeMap` keyed by the full `u32` — so the rule kept its zero test and lost
-//! its ceiling. The row stays in this table: the drift it records is why the
-//! predicate exists, and the predicate is what the remaining callers use.
 //! | `REIMS_VGPU_METAL_MAX_BUFFERS` | 8 in 4 files | a helper stating the rule existed, and five sites did not call it |
 //! | `TEXTURE_VIEW_MIN_SIMPLE` | 2 in 2 files | both guarded an 8-byte header peek with one type-8 variant's *total* length |
+//!
+//! Two of those rows name constants that no longer exist, and the rows stay
+//! because consolidating each is what made its removal readable. Gathering
+//! `MAX_MAPPINGS`'s ten copies into `is_mapping_id` is what exposed that the
+//! ceiling half bounded nothing — `DeviceState::mappings` is a `BTreeMap` keyed
+//! by the full `u32` — so the rule kept its zero test and lost its ceiling.
+//! `MAX_TASKS` went the same way one step further: its storage really was an
+//! array, so removing the bound meant replacing the array, and `DeviceState::tasks`
+//! is now a `TaskTable` over a map. A scattered bound is worth consolidating
+//! even when the answer turns out to be that it should not exist.
 //!
 //! # Two tests, because there are two questions
 //!
@@ -233,12 +236,6 @@ const RECORDED: &[Recorded] = &[
               admission. Not consolidated here because the sites do not agree on what \
               happens after: `draw::vulkan` skips the bind (`continue`), `draw::metal_icb` \
               refuses the record. One predicate would have to return which.",
-    },
-    Recorded {
-        name: "MAX_TASKS",
-        why: "5 sites refuse a task id at or above the cap; the sixth asks whether a \
-              nonzero *hint* is usable, which is a different question and is why the \
-              polarity differs.",
     },
     // Slice-bound checks. The constant is a record's length and each site bounds
     // a different read at a different offset, so the rule is `offset + LEN

@@ -1215,11 +1215,7 @@ pub fn type4_pages_witness<H: HostMemory>(
     // Checked here as well as by the visitor below, which visits nothing for an
     // inactive task: the two answers are the same refusal, and only this one can
     // say *why* without the reader having to know the visitor's early returns.
-    if !state
-        .tasks
-        .get(walk.task_id as usize)
-        .is_some_and(|t| t.active)
-    {
+    if !state.tasks.is_active(walk.task_id) {
         // The task that owned the translation is gone. Its page table is gone
         // with it, so the cached GPAs are unbacked by anything this device can
         // still read — which is exactly the state a write must not proceed in.
@@ -1887,10 +1883,7 @@ fn first_control_page_collision(state: &DeviceState, gpas: &[u64]) -> Option<(u6
             }
         }
     }
-    for task in &state.tasks {
-        if !task.active {
-            continue;
-        }
+    for (_, task) in state.tasks.live() {
         if task.directory_pfn != 0 {
             let gpa = (task.directory_pfn as u64) << state.page_shift;
             if holds(gpa) {

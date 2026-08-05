@@ -350,7 +350,7 @@ fn a_render_window_over_repointed_pages_is_refused_and_counted() {
         .unwrap();
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-    assert!(state.define_task(1, page, 2));
+    state.define_task(1, page, 2);
     {
         let m = state.mappings.entry(9).or_default();
         m.mapped = true;
@@ -1045,7 +1045,7 @@ fn gva_alias_takes_only_aliased_windows() {
     host.write_gpa(root_gpa, &pte).unwrap();
 
     let mut state = DeviceState::new(DeviceId(1), page_shift);
-    assert!(state.define_task(1, 0x1000, 2));
+    state.define_task(1, 0x1000, 2);
     // Mapping 9 is backed by pfn 0x2000 (the page the GVA span resolves
     // to); mapping 10 is backed by pfn 0x2001 (disjoint).
     let page_entry = |pfn: u32| (pfn << 2) | 1;
@@ -1245,7 +1245,7 @@ fn task_gva_alias_takes_gva_store_windows() {
     host.write_gpa(root_gpa, &pte).unwrap();
 
     let mut state = DeviceState::new(DeviceId(1), page_shift);
-    assert!(state.define_task(1, 0x1000, 2));
+    state.define_task(1, 0x1000, 2);
     // Window A aliases the page the span resolves to; window B does not.
     state.arm_gva_deferred_window(0x9000_0000, gva_entry(1, 4, 4, &[0x2000u64 << page_shift]));
     state.arm_gva_deferred_window(0x9100_0000, gva_entry(1, 4, 4, &[0x3000u64 << page_shift]));
@@ -1295,7 +1295,7 @@ fn alias_pt_fixture() -> (crate::runtime::host::FakeHost, DeviceState, u64, u32)
     st32(&mut pte, 0x2000);
     host.write_gpa(root_gpa, &pte).unwrap();
     let mut state = DeviceState::new(DeviceId(1), page_shift);
-    assert!(state.define_task(1, 0x1000, 2));
+    state.define_task(1, 0x1000, 2);
     (host, state, root_gpa, page_shift)
 }
 
@@ -1793,7 +1793,7 @@ fn window_page_drift_refuses_the_guest_write_and_is_silent_without_it() {
     st32(&mut pte, 4);
     host.write_gpa(root_gpa, &pte).unwrap();
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-    assert!(state.define_task(1, page, 2));
+    state.define_task(1, page, 2);
 
     crate::observe::redirect_logs_for_tests();
     let drift_lines = |from: usize| -> usize {
@@ -1930,7 +1930,7 @@ fn the_resident_load_reader_gets_the_same_drift_verdict_under_its_own_name() {
     st32(&mut pte, 4);
     host.write_gpa(root_gpa, &pte).unwrap();
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-    assert!(state.define_task(1, page, 2));
+    state.define_task(1, page, 2);
 
     crate::observe::redirect_logs_for_tests();
     let tail = |from: usize| -> String {
@@ -2037,7 +2037,7 @@ fn a_linear_window_whose_pages_moved_is_refused_and_reads_its_span_as_a_length()
     st32(&mut ptes[4..], 5);
     host.write_gpa(root_gpa, &ptes).unwrap();
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-    assert!(state.define_task(1, 8 * page, 2));
+    state.define_task(1, 8 * page, 2);
 
     crate::observe::redirect_logs_for_tests();
     let drift_lines = |from: usize| -> usize {
@@ -2166,7 +2166,7 @@ fn task_delete_retires_gva_windows_cache_only() {
     use crate::runtime::host::FakeHost;
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
     let mut host = FakeHost::new();
-    assert!(state.define_task(6, 0x1000, 2));
+    state.define_task(6, 0x1000, 2);
     state.arm_gva_deferred_window(0x9000_0000, gva_entry(6, 4, 4, &[]));
     state.arm_gva_deferred_window(0x9100_0000, gva_entry(7, 4, 4, &[]));
     assert!(state.delete_task(6));

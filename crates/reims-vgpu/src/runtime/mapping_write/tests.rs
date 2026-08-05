@@ -922,7 +922,7 @@ fn a_repointed_surface_refuses_the_write_and_leaves_the_new_owner_alone() {
     host.write_gpa(root_gpa, &pte).unwrap();
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-    assert!(state.define_task(1, page, 2));
+    state.define_task(1, page, 2);
     let mid = 6;
     state.map_surface(mid);
     {

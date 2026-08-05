@@ -1928,7 +1928,7 @@ fn setup_linear_task_x86(host: &mut FakeHost, state: &mut DeviceState, pfns: &[u
         st32(&mut pte, *pfn);
         host.write_gpa(root_gpa + (i as u64) * 4, &pte).unwrap();
     }
-    assert!(state.define_task(1, page, 2));
+    state.define_task(1, page, 2);
 }
 
 #[test]
@@ -2137,7 +2137,7 @@ fn a_staged_buffer_carries_the_pages_its_writeback_is_bounded_to() {
         st32(&mut pte, pfn);
         let _ = host.write_gpa(root_gpa + (i as u64) * 4, &pte);
     }
-    assert!(state.define_task(1, 0x1000, dir_pfn));
+    state.define_task(1, 0x1000, dir_pfn);
 
     let page = 1u64 << PAGE_SHIFT_ARM64E;
     let pages = staged_span_pages(&state, &host, 1, page, 0x100);

@@ -19,7 +19,7 @@ pub use state::{
     FailEvent, GfxRegs, GuestLinearMemo, GvaBacking, GvaDeferredEntry, GvaEvictionWitness,
     GvaHostView, HostLinearTexture, HostSurface, LinearDeferredEntry, MapperCapture, MappingEntry,
     PacketFault, PresentBacking, PresentState, RenderFlushWitness, RenderWindowSource,
-    ResourceValidity, SurfaceWriteKind, TaskEntry, Type4Walk, FENCE_DOMAIN_BLIT,
+    ResourceValidity, SurfaceWriteKind, TaskEntry, TaskTable, Type4Walk, FENCE_DOMAIN_BLIT,
     FENCE_DOMAIN_COMPUTE, FENCE_DOMAIN_EVENT, FENCE_DOMAIN_RENDER, GVA_ENCODE_CACHE_BYTE_CAP,
     GVA_EVICTION_WITNESS_KEYS,
 };
@@ -405,7 +405,9 @@ mod tests {
         });
         d.reset();
         assert_eq!(d.gfx_read(GFX_REG_VERSION, MMIO_U32), 0);
-        assert!(!d.state.tasks[1].active);
+        // A reset removes the task entirely rather than clearing a slot in
+        // place, so the question is liveness and not a flag on a resident entry.
+        assert!(!d.state.tasks.is_active(1));
         assert!(d.state.mappings.is_empty());
         assert!(d.fails().is_empty());
     }
@@ -413,7 +415,7 @@ mod tests {
     #[test]
     fn resource_lifecycle() {
         let mut d = dev();
-        assert!(d.state.define_task(2, 0x2000, 9));
+        d.state.define_task(2, 0x2000, 9);
         assert!(d.state.set_object_list(2, 3, 64));
         assert!(d.state.insert_object(2, 10));
         assert!(d.state.objects.contains(&(2, 10)));

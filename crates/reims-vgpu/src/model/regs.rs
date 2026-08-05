@@ -114,45 +114,6 @@ pub const fn is_child_channel(channel_id: u32) -> bool {
     channel_id >= 1 && (channel_id as usize) < MAX_CHANNELS
 }
 
-/// Task ids run from 0, unlike mapping ids — see [`is_mapping_id`]. Task 0 is
-/// the task every type-4 surface this device has resolved lived in, and
-/// `objects::type4_probe_order` probes it first by name.
-///
-/// # The number is not derived, and the measurement is why that is tolerable
-///
-/// Unlike [`MAX_CHANNELS`], which is 32 because `active_child_mask` is a `u32`
-/// and every producer reaches it with `1u32 << channel_id`, nothing forces 256.
-/// A task id is a full `u32` on the wire — `decode_replace_physical` and every
-/// resource-list command read it with `ld32` — and past this bound
-/// `DeviceState::define_task` returns `false` and the task never exists, which
-/// loses every guest command that would have needed it.
-///
-/// What makes that acceptable is distance, and distance is measured rather than
-/// assumed. `DeviceState::max_task_id_seen` bands the *requested* reach and the
-/// `host_cache_levels` census publishes it beside the cap, because a refusal
-/// counter alone cannot tell a boot that stopped at id 12 from one that stopped
-/// at 255 — both read zero.
-///
-/// Driven x86/PCI boot, window-drag probe against Safari:
-/// `task_id_max=10 task_id_cap=256`, and no `model_*_id_range` refusal of any
-/// kind. That is 25x headroom.
-///
-/// So the fixed `[TaskEntry; MAX_TASKS]` array stays. Replacing it with a map
-/// keyed by the full `u32` would remove the refusal entirely, and it is the
-/// architecturally correct shape — but it is 177 indexing sites plus every
-/// helper that takes `&state.tasks` as a slice, and this reading says the bound
-/// is nowhere near. Do that work when the census says it is needed; the census
-/// is there so the question has an answer instead of an argument.
-///
-/// The sibling bound this constant used to be paired with is gone. `MAX_MAPPINGS`
-/// was 4096 with the same "measured distance" justification, and the
-/// justification was not the point: `DeviceState::mappings` is a
-/// `BTreeMap<u32, MappingEntry>`, so there was never a slot to run out of. It
-/// refused ids the map would have held. The task table is not that — its
-/// storage really is `[TaskEntry; 256]` — which is why the same argument keeps
-/// one and not the other.
-pub const MAX_TASKS: usize = 256;
-
 /// Whether `mapping_id` names a mapping rather than "no mapping".
 ///
 /// Zero is the device-wide sentinel for an unbound mapping — `runtime::draw`

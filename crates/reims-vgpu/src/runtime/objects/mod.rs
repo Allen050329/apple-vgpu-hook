@@ -20,7 +20,7 @@ use crate::contract::iosurface_pages::{
     DEVICE_PLANE_DESC_LEN, DEVICE_PLANE_DIMS, DEVICE_PLANE_OFFSET, DEVICE_PLANE_SIZE,
     PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID,
 };
-use crate::model::{DeviceState, MappingEntry, MAX_TASKS};
+use crate::model::{DeviceState, MappingEntry, TaskTable};
 use crate::runtime::decode::resource::{
     decode_list_object_entry, list_object_entry_offset, ListObjectEntry, OBJECT_LIST_ENTRY_LEN,
     OBJECT_TYPE_IOSURFACE,
@@ -850,10 +850,7 @@ pub fn lookup_list_entry<M: HostMemory>(
     task_id: u32,
     ref_: u32,
 ) -> Option<ListObjectEntry> {
-    if task_id as usize >= MAX_TASKS {
-        return None;
-    }
-    let task = &state.tasks[task_id as usize];
+    let task = state.tasks.get(task_id)?;
     if !task.active || task.object_list_count == 0 {
         return None;
     }
@@ -1174,7 +1171,7 @@ fn apply_type4_backing<M: HostMemory>(
         );
         return false;
     }
-    let task = match state.tasks.get(task_id as usize) {
+    let task = match state.tasks.get(task_id) {
         Some(t) if t.active => t,
         _ => {
             defer_type4_fail(
@@ -1619,7 +1616,13 @@ fn note_replace_physical_unmapped<M: HostMemory>(
 /// and an entry with no descriptor, so a task reaching the type test is one with
 /// a real object at that slot.
 fn type4_claimant_tasks<M: HostMemory>(state: &DeviceState, host: &M, surface_id: u32) -> Vec<u32> {
-    (0..MAX_TASKS as u32)
+    // The live ids, not a fixed range. This walked `0..256` while the task table
+    // was an array; `lookup_list_entry` refuses an inactive task before reading
+    // anything, so the ids in between were never claimants and the answer is
+    // unchanged. The walk is now the size of the guest's task set.
+    state
+        .tasks
+        .live_ids()
         .filter(|&task_id| {
             lookup_list_entry(state, host, task_id, surface_id)
                 .is_some_and(|e| e.object_type == OBJECT_TYPE_SURFACE)
@@ -1729,19 +1732,22 @@ fn backing_matches_latched_geom(m: &MappingEntry, surf: &Type4Surface) -> bool {
 /// from `ensure_surface_for_present` on every present for every resident
 /// mapping — thousands of times a boot to read element 0 and stop.
 ///
-/// A hint of 0, or one outside the task id space, contributes nothing: 0 is
-/// already first, and an out-of-range id would be skipped by the liveness test
-/// at the probe anyway, so admitting it here would only cost the `!= hint`
-/// filter its meaning.
-fn type4_probe_order(hint: u32) -> impl Iterator<Item = u32> {
-    let hint = if hint != 0 && (hint as usize) < MAX_TASKS {
-        hint
-    } else {
-        0
-    };
+/// A hint of 0 contributes nothing: 0 is already first, so admitting it would
+/// only cost the `!= hint` filter its meaning. A hint naming no live task is
+/// admitted and then skipped by the liveness test at the probe, which is where
+/// that question was always answered.
+///
+/// The tail is the **live** ids rather than `1..256`. It walked the fixed range
+/// while the task table was an array; the probe refuses an inactive task, so
+/// those ids were only ever skipped, and yielding them cost the caller a
+/// liveness test per id per present. Task 0 leads whether or not it is live —
+/// see the caller for why the guest's kernel task is named rather than found —
+/// so it is filtered out of the tail rather than left to `live_ids` to omit.
+fn type4_probe_order(tasks: &TaskTable, hint: u32) -> Vec<u32> {
     std::iter::once(0)
         .chain(Some(hint).filter(|&h| h != 0))
-        .chain((1..MAX_TASKS as u32).filter(move |&tid| tid != hint))
+        .chain(tasks.live_ids().filter(move |&tid| tid != 0 && tid != hint))
+        .collect()
 }
 
 /// Take `task_id` as the owner of `surface_id` and report the search's exposure.
@@ -1791,13 +1797,7 @@ fn resolve_type4_surface_ex<M: HostMemory>(
         .map(|m| m.owner_task_hint)
         .unwrap_or(0);
 
-    for task_id in type4_probe_order(hint) {
-        if task_id as usize >= state.tasks.len() {
-            continue;
-        }
-        if !state.tasks[task_id as usize].active {
-            continue;
-        }
+    for task_id in type4_probe_order(&state.tasks, hint) {
         // Count the guest-read cost of one active-task object-list probe.
         let Some(entry) = lookup_list_entry(state, host, task_id, surface_id) else {
             continue;
@@ -1867,7 +1867,7 @@ fn resolve_type4_surface_ex<M: HostMemory>(
                 let page_size = page_size_of(page_shift);
                 let need = ((surf.length.saturating_sub(1)) / page_size) + 1;
                 if m.page_entries.len() as u64 == need && backing_matches_latched_geom(m, &surf) {
-                    let task = state.tasks.get(task_id as usize).filter(|t| t.active);
+                    let task = state.tasks.get(task_id).filter(|t| t.active);
                     let entry_fresh = |idx: u64, entry: u32| -> bool {
                         let gva = ((surf.backing_pfn as u64) + idx) << page_shift;
                         let cached = entry_gpa_shift(entry, page_shift);

@@ -722,7 +722,7 @@ pub fn gva_backing<M: HostMemory>(
     // (`visit_task_gva_pages`) and what `gva_backing_state` does when it
     // re-asks. `translate_task_gva` applies the `active`/`directory_pfn` test
     // itself.
-    let task = state.tasks.get(task_id as usize)?;
+    let task = state.tasks.get(task_id)?;
     let gpa = crate::runtime::gva_mem::translate_task_gva(host, task, gva, state.page_shift)?;
     Some(GvaBacking {
         task_id,
@@ -1269,7 +1269,7 @@ pub fn gva_backing_state<H: HostMemory>(
     // flagged active. A dead task's page table cannot answer the question.
     let Some(task) = state
         .tasks
-        .get(backing.task_id as usize)
+        .get(backing.task_id)
         .filter(|t| t.active)
     else {
         return GvaBackingState::Unrecorded;
@@ -1327,7 +1327,7 @@ pub fn note_cache_levels<H: HostMemory>(state: &DeviceState, host: &H) {
          gva_cap_evicted={cap_evicted} gva_cap_wanted={cap_wanted} \
          gva_cap_forgotten={cap_forgotten} \
          linear={} linear_bytes={} linear_largest={} \
-         task_id_max={} task_id_cap={} mapping_id_max={} mapping_id_cap=none",
+         task_id_max={} task_id_cap=none mapping_id_max={} mapping_id_cap=none",
         surfaces.entries,
         surfaces.bytes,
         surfaces.largest,
@@ -1344,12 +1344,13 @@ pub fn note_cache_levels<H: HostMemory>(state: &DeviceState, host: &H) {
         // line, and these are levels: the highest id the guest has named, beside
         // the bound that would have refused it.
         //
-        // `mapping_id_cap` reads the literal `none` because there is no longer a
-        // bound to compare against — `is_mapping_id` refuses only the unbound
-        // sentinel. The reach itself stays, and is now a level reading on the
-        // `mappings` map rather than a distance to a refusal.
+        // Both caps read the literal `none` because neither bound exists any
+        // more: `is_mapping_id` refuses only the unbound sentinel, and the task
+        // table is a map keyed by the guest's `u32`. The two reaches stay, and
+        // are now occupancy readings on those maps rather than distances to a
+        // refusal — they are the only thing that says how far the guest spreads
+        // either id space.
         state.max_task_id_seen,
-        crate::model::MAX_TASKS,
         state.max_mapping_id_seen,
     ));
 }

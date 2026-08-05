@@ -1,6 +1,6 @@
 //! Device-owned state: registers, rings, tasks, mapper, present, fail log.
 
-use crate::model::{LruBytesMemo, GFX_MMIO_SIZE, MAX_CHANNELS, MAX_TASKS};
+use crate::model::{LruBytesMemo, GFX_MMIO_SIZE, MAX_CHANNELS};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -334,13 +334,123 @@ pub struct TaskEntry {
     pub object_list_count: u32,
 }
 
+/// The device's tasks, keyed by the guest's own task id.
+///
+/// # It is a map because a task id is a `u32`
+///
+/// This was `[TaskEntry; MAX_TASKS]` with `MAX_TASKS = 256`, and the number was
+/// never derived from anything: a task id is a full `u32` on the wire —
+/// `decode_replace_physical` and every resource-list command read it with `ld32`
+/// — and past 256 `define_task` returned `false`, the task never existed, and
+/// every guest command that needed it was lost. The bound was defended by
+/// distance rather than by a derivation: [`DeviceState::max_task_id_seen`]
+/// measured a driven boot stopping at id 10, which is 25x of headroom and no
+/// answer at all to what a heavier guest does.
+///
+/// Absence and inactivity are the same state here, which is what makes the
+/// translation from the array safe. The array wrote `TaskEntry::default()` on
+/// delete — `active: false` — and every reader tested `active` before using an
+/// entry; this returns `None` for an id nothing defined, and those readers now
+/// get `None` where they used to get an inactive entry. There is no third state
+/// for one of them to have branched on.
+///
+/// The two full-range probes in `runtime::objects` are the visible win.
+/// `type4_claimant_tasks` walked all 256 ids and `type4_probe_order` chained
+/// `1..256`; both now walk the live ids, because the ids in between were
+/// refused by the liveness test at the probe and contributed nothing. Same
+/// answer, and the walk is the size of the guest's task set instead of a
+/// constant.
+#[derive(Clone, Debug, Default)]
+pub struct TaskTable(BTreeMap<u32, TaskEntry>);
+
+impl TaskTable {
+    pub const fn new() -> Self {
+        Self(BTreeMap::new())
+    }
+
+    /// The task `id` names, or `None` if the guest never defined it.
+    ///
+    /// Note the entry may still be present and inactive — `delete_task` removes
+    /// it, but a caller that cares about liveness should keep its own `active`
+    /// test rather than assume `Some` means live.
+    pub fn get(&self, id: u32) -> Option<&TaskEntry> {
+        self.0.get(&id)
+    }
+
+    pub fn get_mut(&mut self, id: u32) -> Option<&mut TaskEntry> {
+        self.0.get_mut(&id)
+    }
+
+    /// Whether `id` names a task this device will walk a page table for.
+    ///
+    /// The single spelling of the liveness test. It had a dozen copies as
+    /// `tasks[id].active` against an array that answered for every id in range,
+    /// and each of those is now a `get` that can also answer `None`.
+    pub fn is_active(&self, id: u32) -> bool {
+        self.get(id).is_some_and(|t| t.active)
+    }
+
+    /// Install a task under `id`, replacing whatever was there.
+    pub fn define(&mut self, id: u32, entry: TaskEntry) {
+        self.0.insert(id, entry);
+    }
+
+    pub fn remove(&mut self, id: u32) {
+        self.0.remove(&id);
+    }
+
+    /// Every live task with its id, ascending.
+    ///
+    /// Ascending because the array it replaced was walked in id order and two
+    /// probes in `runtime::objects` depend on that order deciding which of
+    /// several claimant tasks a surface resolves against.
+    pub fn live(&self) -> impl Iterator<Item = (u32, &TaskEntry)> {
+        self.0.iter().filter(|(_, t)| t.active).map(|(&id, t)| (id, t))
+    }
+
+    /// [`Self::live`] without the entries.
+    pub fn live_ids(&self) -> impl Iterator<Item = u32> + '_ {
+        self.live().map(|(id, _)| id)
+    }
+
+    /// How many tasks are live. Not the size of the id space — there is none.
+    pub fn live_count(&self) -> usize {
+        self.live_ids().count()
+    }
+}
+
+/// `tasks[id]` for a task the caller has already defined. **Tests only.**
+///
+/// 167 test sites index a fixture's task 1, and rewriting each into
+/// `get(1).unwrap()` would trade the thing they are asserting for ceremony.
+/// Production has no such impl, deliberately: every id there comes off the wire,
+/// so it may name no task, and [`TaskTable::get`] is the accessor that says so.
+/// A panicking index reachable from a decode path is a guest-triggerable abort,
+/// which is why this is `#[cfg(test)]` rather than documented as "do not use".
+#[cfg(test)]
+impl std::ops::Index<u32> for TaskTable {
+    type Output = TaskEntry;
+
+    fn index(&self, id: u32) -> &TaskEntry {
+        self.get(id)
+            .unwrap_or_else(|| panic!("test indexed task {id}, which nothing defined"))
+    }
+}
+
+/// See [`TaskTable`]'s `Index`. Tests that mutate a fixture's task in place —
+/// clearing `active` or zeroing a directory to build the state a refusal path
+/// needs — reach through this.
+#[cfg(test)]
+impl std::ops::IndexMut<u32> for TaskTable {
+    fn index_mut(&mut self, id: u32) -> &mut TaskEntry {
+        self.get_mut(id)
+            .unwrap_or_else(|| panic!("test indexed task {id}, which nothing defined"))
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StateMutationDecline {
-    DefineTaskIdRange { task_id: u32 },
-    DeleteTaskIdRange { task_id: u32 },
-    SetObjectListTaskIdRange { task_id: u32 },
     SetObjectListTaskInactive { task_id: u32 },
-    InsertObjectTaskIdRange { task_id: u32, object_ref: u32 },
     InsertObjectTaskInactive { task_id: u32, object_ref: u32 },
     MapSurfaceIdRange { mapping_id: u32 },
     UnmapSurfaceIdRange { mapping_id: u32 },
@@ -358,11 +468,7 @@ enum StateMutationDecline {
 impl crate::observe::Decline for StateMutationDecline {
     fn slug(&self) -> &'static str {
         match self {
-            Self::DefineTaskIdRange { .. } => "model_define_task_id_range",
-            Self::DeleteTaskIdRange { .. } => "model_delete_task_id_range",
-            Self::SetObjectListTaskIdRange { .. } => "model_set_object_list_task_id_range",
             Self::SetObjectListTaskInactive { .. } => "model_set_object_list_task_inactive",
-            Self::InsertObjectTaskIdRange { .. } => "model_insert_object_task_id_range",
             Self::InsertObjectTaskInactive { .. } => "model_insert_object_task_inactive",
             Self::MapSurfaceIdRange { .. } => "model_map_surface_id_range",
             Self::UnmapSurfaceIdRange { .. } => "model_unmap_surface_id_range",
@@ -380,17 +486,10 @@ impl crate::observe::Decline for StateMutationDecline {
 
     fn fields(&self) -> Vec<(&'static str, String)> {
         let mut fields = match self {
-            Self::DefineTaskIdRange { task_id }
-            | Self::DeleteTaskIdRange { task_id }
-            | Self::SetObjectListTaskIdRange { task_id }
-            | Self::SetObjectListTaskInactive { task_id } => {
+            Self::SetObjectListTaskInactive { task_id } => {
                 vec![("task", task_id.to_string())]
             }
-            Self::InsertObjectTaskIdRange {
-                task_id,
-                object_ref,
-            }
-            | Self::InsertObjectTaskInactive {
+            Self::InsertObjectTaskInactive {
                 task_id,
                 object_ref,
             } => vec![
@@ -1742,7 +1841,7 @@ pub struct DeviceState {
     pub present_translation_hold_mask: u32,
     pub pending: PendingWork,
     pub child_rings: [ChannelRing; MAX_CHANNELS],
-    pub tasks: [TaskEntry; MAX_TASKS],
+    pub tasks: TaskTable,
     /// Highest task id and mapping id the guest has ever named, whether or not
     /// the slot table could hold it.
     ///
@@ -2085,7 +2184,7 @@ impl DeviceState {
             child_rings: std::array::from_fn(|_| ChannelRing::default()),
             max_task_id_seen: 0,
             max_mapping_id_seen: 0,
-            tasks: std::array::from_fn(|_| TaskEntry::default()),
+            tasks: TaskTable::new(),
             map_family_events: 0,
             objects: std::collections::BTreeSet::new(),
             texture_to_mapping: BTreeMap::new(),
@@ -2526,12 +2625,16 @@ impl DeviceState {
         Some((gva, entry))
     }
 
-    pub fn define_task(&mut self, task_id: u32, length: u64, directory_pfn: u32) -> bool {
+    /// Install the guest's task under `task_id`, replacing any previous one.
+    ///
+    /// Returns nothing: it used to return `bool`, and the only `false` it could
+    /// produce was `task_id >= MAX_TASKS`. With the task table keyed by the
+    /// guest's own `u32` there is no id this can refuse, so a `bool` here would
+    /// be a value 81 call sites asserted on and none of them could ever see
+    /// false — the shape that makes a later real failure easy to add and easy to
+    /// ignore.
+    pub fn define_task(&mut self, task_id: u32, length: u64, directory_pfn: u32) {
         self.max_task_id_seen = self.max_task_id_seen.max(task_id);
-        if task_id as usize >= MAX_TASKS {
-            StateMutationDecline::DefineTaskIdRange { task_id }.emit(u64::from(task_id));
-            return false;
-        }
         // Drop objects for this task on redefine.
         self.objects.retain(|&(t, _)| t != task_id);
         self.retire_task_linear_residents(task_id);
@@ -2539,8 +2642,7 @@ impl DeviceState {
         self.host_linear_textures.retain(|&(t, _), _| t != task_id);
         // New directory ⇒ old GVA HostOps views alias the wrong PT — retire.
         self.retire_task_gva_views(task_id);
-        self.tasks[task_id as usize] = TaskEntry::define(length, directory_pfn);
-        true
+        self.tasks.define(task_id, TaskEntry::define(length, directory_pfn));
     }
 
     /// Retire every GVA HostOps view registered under `task_id`.
@@ -2569,11 +2671,7 @@ impl DeviceState {
     /// Guest reuses task ids; leaving stale active tasks corrupts GVA walks.
     pub fn delete_task(&mut self, task_id: u32) -> bool {
         self.max_task_id_seen = self.max_task_id_seen.max(task_id);
-        if task_id as usize >= MAX_TASKS {
-            StateMutationDecline::DeleteTaskIdRange { task_id }.emit(u64::from(task_id));
-            return false;
-        }
-        if !self.tasks[task_id as usize].active {
+        if !self.tasks.is_active(task_id) {
             return false;
         }
         self.objects.retain(|&(t, _)| t != task_id);
@@ -2597,37 +2695,25 @@ impl DeviceState {
         // HostOps views we held (does not touch host_gva_surfaces encode).
         // Runtime flushes retired_views via HostOps::unmap_pages.
         self.retire_task_gva_views(task_id);
-        self.tasks[task_id as usize] = TaskEntry::default();
+        self.tasks.remove(task_id);
         true
     }
 
     pub fn set_object_list(&mut self, task_id: u32, pfn: u32, count: u32) -> bool {
         self.max_task_id_seen = self.max_task_id_seen.max(task_id);
-        if task_id as usize >= MAX_TASKS {
-            StateMutationDecline::SetObjectListTaskIdRange { task_id }.emit(u64::from(task_id));
-            return false;
-        }
-        if !self.tasks[task_id as usize].active {
+        let Some(task) = self.tasks.get_mut(task_id).filter(|t| t.active) else {
             StateMutationDecline::SetObjectListTaskInactive { task_id }.emit(u64::from(task_id));
             return false;
-        }
-        self.tasks[task_id as usize].object_list_pfn = pfn;
-        self.tasks[task_id as usize].object_list_count = count;
+        };
+        task.object_list_pfn = pfn;
+        task.object_list_count = count;
         true
     }
 
     pub fn insert_object(&mut self, task_id: u32, ref_: u32) -> bool {
         let discriminant = (u64::from(task_id) << 32) | u64::from(ref_);
         self.max_task_id_seen = self.max_task_id_seen.max(task_id);
-        if task_id as usize >= MAX_TASKS {
-            StateMutationDecline::InsertObjectTaskIdRange {
-                task_id,
-                object_ref: ref_,
-            }
-            .emit(discriminant);
-            return false;
-        }
-        if !self.tasks[task_id as usize].active {
+        if !self.tasks.is_active(task_id) {
             StateMutationDecline::InsertObjectTaskInactive {
                 task_id,
                 object_ref: ref_,
@@ -3470,14 +3556,7 @@ mod fail_vocabulary_tests {
     #[test]
     fn every_state_mutation_check_has_its_own_registered_reason() {
         let declines = [
-            StateMutationDecline::DefineTaskIdRange { task_id: 64 },
-            StateMutationDecline::DeleteTaskIdRange { task_id: 64 },
-            StateMutationDecline::SetObjectListTaskIdRange { task_id: 64 },
             StateMutationDecline::SetObjectListTaskInactive { task_id: 1 },
-            StateMutationDecline::InsertObjectTaskIdRange {
-                task_id: 64,
-                object_ref: 3,
-            },
             StateMutationDecline::InsertObjectTaskInactive {
                 task_id: 1,
                 object_ref: 3,
@@ -3506,7 +3585,7 @@ mod fail_vocabulary_tests {
         }
         assert_eq!(
             slugs.len(),
-            17,
+            13,
             "every state mutation check has its own slug"
         );
         assert_eq!(
@@ -3563,42 +3642,44 @@ mod slot_table_reach_tests {
     use super::*;
     use crate::model::{DeviceId, PAGE_SHIFT_X86};
 
-    /// A task id the slot table cannot hold must still move the high-water mark.
+    /// No task id is out of range, and the mark records how far the guest went.
     ///
-    /// This is the whole point of the instrument. `MAX_TASKS` is 256 with nothing
-    /// behind the number — a task id is a full `u32` on the wire — and past it
-    /// `define_task` refuses and the task never exists. The refusal counter alone
-    /// cannot say whether the bound is close, because a boot stopping at id 12
-    /// and one stopping at id 255 both report zero refusals.
+    /// This test used to assert the opposite: that `MAX_TASKS + 4096` was
+    /// *refused* and still moved the mark. The mark existed to say whether that
+    /// bound was close, because a refusal counter cannot — a boot stopping at id
+    /// 12 and one stopping at 255 both report zero refusals. The answer it gave
+    /// was 25x of headroom, which is not a derivation, and `DeviceState::tasks`
+    /// is a `TaskTable` over a map now. `u32::MAX` is the largest id the wire can
+    /// carry, so defining a task there is the strongest form of "nothing is out
+    /// of range".
     ///
-    /// So the mark is recorded *before* the bound is applied. A high-water figure
-    /// that only counted ids we accepted would be capped by the very bound it is
-    /// there to measure, and would read 255 forever no matter how far past the
-    /// guest went.
+    /// The mark stays, as an occupancy reading on that map rather than a
+    /// distance to a refusal.
     #[test]
-    fn a_refused_task_id_still_moves_the_reach_mark() {
+    fn no_task_id_is_out_of_range() {
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
         assert_eq!(state.max_task_id_seen, 0);
 
-        assert!(
-            state.define_task(12, 0x1000, 2),
-            "an ordinary id is accepted"
-        );
+        state.define_task(12, 0x1000, 2);
+        assert!(state.tasks.is_active(12), "an ordinary id is accepted");
         assert_eq!(state.max_task_id_seen, 12);
 
-        let past = MAX_TASKS as u32 + 4096;
+        let past = u32::MAX;
+        state.define_task(past, 0x1000, 2);
         assert!(
-            !state.define_task(past, 0x1000, 2),
-            "past the table, refused"
+            state.tasks.is_active(past),
+            "a task id is a full u32 on the wire and its storage is a map"
         );
-        assert_eq!(
-            state.max_task_id_seen, past,
-            "and the reach still records how far past the guest asked"
-        );
+        assert_eq!(state.max_task_id_seen, past);
 
         // High-water, not last-seen: a later smaller id does not lower it.
-        assert!(state.define_task(3, 0x1000, 2));
+        state.define_task(3, 0x1000, 2);
         assert_eq!(state.max_task_id_seen, past);
+        assert_eq!(
+            state.tasks.live_count(),
+            3,
+            "sparse ids do not create the entries between them"
+        );
     }
 
     /// The mapping id space has no ceiling, and this is the test that says so.
@@ -3634,12 +3715,16 @@ mod slot_table_reach_tests {
         assert!(!state.mappings.contains_key(&0));
     }
 
-    /// Every mutator that refuses on the bound feeds the mark, not just the one
-    /// that creates the slot — a guest that only ever calls `set_object_list` or
-    /// `insert_object` on a high id would otherwise be invisible.
+    /// Every task mutator feeds the mark, not just the one that creates the
+    /// task — a guest that only ever calls `set_object_list` or `insert_object`
+    /// on a high id would otherwise be invisible.
+    ///
+    /// These three still refuse `past`, but for the reason they always should
+    /// have: no task is defined there. That is a liveness answer, not a range
+    /// one, and it is the same answer they would give for any undefined id.
     #[test]
-    fn every_bounded_mutator_feeds_the_reach_mark() {
-        let past = MAX_TASKS as u32 + 1;
+    fn every_task_mutator_feeds_the_reach_mark() {
+        let past = u32::MAX;
         for (name, mut state) in [
             ("delete_task", DeviceState::new(DeviceId(1), PAGE_SHIFT_X86)),
             (
@@ -3659,6 +3744,10 @@ mod slot_table_reach_tests {
             assert_eq!(
                 state.max_task_id_seen, past,
                 "{name} refused without recording the reach"
+            );
+            assert!(
+                !state.tasks.is_active(past),
+                "{name} must not have defined the task it refused"
             );
         }
     }

@@ -748,7 +748,7 @@ fn setup_depth1_task(host: &mut FakeHost, state: &mut DeviceState) -> u64 {
         st32(&mut pte, pfn);
         let _ = host.write_gpa(root_gpa + (i as u64) * 4, &pte);
     }
-    assert!(state.define_task(1, 0x1000, DIR_PFN));
+    state.define_task(1, 0x1000, DIR_PFN);
     root_gpa
 }
 

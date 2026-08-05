@@ -1792,7 +1792,7 @@ s2:r17:mid0:gva=0x12345000:960x540:fmt=0x73:l2:s1"
 #[test]
 fn missing_pipeline_is_soft() {
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-    assert!(state.define_task(1, 0x1000, 2));
+    state.define_task(1, 0x1000, 2);
     let mut host = FakeHost::new();
     let req = DrawEncodeRequest {
         task_id: 1,
@@ -2090,7 +2090,7 @@ fn mrt_draw_request_load_seed_miss_still_encodes() {
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
-    assert!(state.define_task(1, 0x1000, 2));
+    state.define_task(1, 0x1000, 2);
     // Type-11 registered with geom but empty page table → seed read fails.
     assert!(state.map_surface(9));
     assert!(state.set_mapping_geom(9, 8, 8, MTL_FORMAT_BGRA8_UNORM));
@@ -2432,7 +2432,7 @@ fn mrt_draw_request_type11_live_mapping_overrides_stale_latch() {
     let _ = host.write_gpa(dir_gpa, &d);
     st32(&mut d[..4], 4);
     let _ = host.write_gpa(root_gpa, &d[..4]);
-    assert!(state.define_task(1, 0x1000, 2));
+    state.define_task(1, 0x1000, 2);
     assert!(state.set_object_list(1, 0, 8));
     // Live type-11 at ref=1 → mapping_id=4 (descriptor first u32).
     let mut entry = [0u8; 12];
@@ -2739,7 +2739,7 @@ fn write_gva_rgba8_uses_device_page_shift_x86() {
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     state.page_shift = page_shift;
-    assert!(state.define_task(1, 0x1000, 2));
+    state.define_task(1, 0x1000, 2);
 
     let gva = 1u64 << page_shift; // 0x1000
                                   // Baseline walker under x86 tables.
@@ -2867,7 +2867,7 @@ fn guest_linear_memo_reuses_arc_and_observes_guest_writes() {
         st32(&mut pte, pfn);
         assert!(host.write_gpa(root_gpa + (i as u64) * 4, &pte).is_ok());
     }
-    assert!(state.define_task(1, 0x1000, dir_pfn));
+    state.define_task(1, 0x1000, dir_pfn);
     assert!(state.set_object_list(1, 0, 32));
 
     // Tight 4x2 BGRA8: bpr 16, texels at handle-page 1 (gva 0x4000).
@@ -2976,7 +2976,7 @@ fn padded_bgra8_memoized_uploads_native_without_swizzle() {
         st32(&mut pte, pfn);
         assert!(host.write_gpa(root_gpa + (i as u64) * 4, &pte).is_ok());
     }
-    assert!(state.define_task(1, 0x1000, dir_pfn));
+    state.define_task(1, 0x1000, dir_pfn);
     assert!(state.set_object_list(1, 0, 32));
 
     // 4x2 BGRA8 with a PADDED row stride: tight = 16, bpr = 24 (8 pad bytes
@@ -3186,7 +3186,7 @@ fn type5_sample_uses_descriptor_surface_id_not_ref_collision() {
         st32(&mut pte, pfn);
         assert!(host.write_gpa(root_gpa + (i as u64) * 4, &pte).is_ok());
     }
-    assert!(state.define_task(1, 0x1000, dir_pfn));
+    state.define_task(1, 0x1000, dir_pfn);
     assert!(state.set_object_list(1, 0, 32));
 
     let texture_ref = 2u32;
@@ -3323,7 +3323,7 @@ fn type11_host_cache_rung_identity_tracks_the_cached_frame() {
         st32(&mut pte, pfn);
         assert!(host.write_gpa(root_gpa + (i as u64) * 4, &pte).is_ok());
     }
-    assert!(state.define_task(1, 0x1000, dir_pfn));
+    state.define_task(1, 0x1000, dir_pfn);
     assert!(state.set_object_list(1, 0, 32));
 
     let texture_ref = 2u32;
@@ -3494,7 +3494,7 @@ fn type5_sample_uses_serialized_rg8_view_over_unknown_surface_fourcc() {
         st32(&mut pte, pfn);
         assert!(host.write_gpa(root_gpa + (i as u64) * 4, &pte).is_ok());
     }
-    assert!(state.define_task(1, 0x1000, dir_pfn));
+    state.define_task(1, 0x1000, dir_pfn);
     assert!(state.set_object_list(1, 0, 256));
 
     let texture_ref = 248u32;
@@ -4135,7 +4135,7 @@ fn guest_runs_decline_on_unstable_host_mappings() {
         host.write_gpa(root_gpa, &pte).unwrap();
 
         let mut state = DeviceState::new(DeviceId(1), page_shift);
-        assert!(state.define_task(1, page, 2));
+        state.define_task(1, page, 2);
         task_gva_guest_run_window(&state, &mut host, 1, gva, 16).map(|(_, runs)| runs)
     };
 
@@ -4204,7 +4204,7 @@ impl StoreRig {
                 .map_range(Self::frame_gpa(STORE_RIG_PT_BASE + i), 0x4000, 0);
             rig.point(i, STORE_RIG_PT_BASE + i);
         }
-        assert!(rig.state.define_task(1, 0x1000, dir_pfn));
+        rig.state.define_task(1, 0x1000, dir_pfn);
         rig
     }
 
@@ -4676,7 +4676,7 @@ fn a_sampled_ref_naming_another_object_kind_is_reported_and_still_resolves() {
         st32(&mut pte, pfn);
         assert!(host.write_gpa(root_gpa + (i as u64) * 4, &pte).is_ok());
     }
-    assert!(state.define_task(1, 0x1000, dir_pfn));
+    state.define_task(1, 0x1000, dir_pfn);
     assert!(state.set_object_list(1, 0, 32));
 
     let body = TEXTURE_DESC_BASE_LEN;

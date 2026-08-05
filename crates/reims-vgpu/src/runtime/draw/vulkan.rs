@@ -7653,7 +7653,7 @@ mod vulkan_split_tests {
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
         let mut host = FakeHost::new();
         map_one_gva_page(&mut host, 4);
-        assert!(state.define_task(1, 0x1_0000, 2));
+        state.define_task(1, 0x1_0000, 2);
 
         let mut req = one_page_gva_request();
         let gen_a = super::gva_alloc_generation(&state, &mut host, &req);
@@ -7704,7 +7704,7 @@ mod vulkan_split_tests {
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
         let mut host = FakeHost::new();
         map_one_gva_page(&mut host, 4);
-        assert!(state.define_task(1, 0x1_0000, 2));
+        state.define_task(1, 0x1_0000, 2);
 
         let mut req = one_page_gva_request();
         req.gva_alloc_gen = super::gva_alloc_generation(&state, &mut host, &req);
@@ -8459,7 +8459,7 @@ mod vulkan_split_tests {
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
         let mut host = FakeHost::new();
         map_one_gva_page(&mut host, 4);
-        assert!(state.define_task(1, 0x1_0000, 2));
+        state.define_task(1, 0x1_0000, 2);
 
         let pipeline = RenderPipelineDescriptor {
             color_attachments: vec![

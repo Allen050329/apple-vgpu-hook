@@ -335,7 +335,7 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
         out.task_id = raw_task;
         crate::observe::fail(format!(
             "exec_indirect2 no_such_task task={raw_task} tasks={} plen={}",
-            state.tasks.len(),
+            state.tasks.live_count(),
             payload.len()
         ));
         return out;

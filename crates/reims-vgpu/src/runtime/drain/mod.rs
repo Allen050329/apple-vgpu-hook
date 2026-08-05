@@ -175,11 +175,11 @@ fn apply_define_task2<H: HostMemory + HostOps>(
     // class registered rather than leaving the bit unaccounted for.
     let task_id = raw_id >> DEFINE_TASK_ID_SHIFT;
     let kernel_task = raw_id & 1 != 0;
-    if !state.define_task(task_id, length, dir) || task_id as usize >= state.tasks.len() {
-        return;
-    }
+    state.define_task(task_id, length, dir);
     // Capture directory + root/depth so one boot shows the page-table identity.
-    let slot = &state.tasks[task_id as usize];
+    let Some(slot) = state.tasks.get(task_id) else {
+        return;
+    };
     let walk =
         crate::runtime::gva_mem::diagnose_task_slot(host, slot, task_id, 0, state.page_shift);
     // `task=`/`dir=` are not repeated here: `walk` already carries the task id
