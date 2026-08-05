@@ -2214,6 +2214,56 @@ fn a_bind_past_the_last_table_slot_reports_what_it_dropped() {
     );
 }
 
+/// The dropped slots reach the **fail channel**, not only the census.
+///
+/// The counter above is per-window and cumulative and lives in an `OFF` line
+/// among a hundred routes, where a zero route is simply absent. That is not the
+/// always-on failure path a dropped guest record is owed, and the compute rail
+/// gives the identical loss one — so the shape of the line is asserted here
+/// rather than left to whoever next reads the log.
+///
+/// `apple_table` is the field that makes a reading actionable: 128 against a
+/// table of 31 says the serializer is entitled to emit what we dropped.
+#[test]
+fn a_bind_past_the_table_renders_a_fail_line_naming_the_table() {
+    use crate::observe::Emit;
+
+    let line = Emit::decline(
+        "render_bind_overflow",
+        &BindSlotPastTable {
+            class: BindClass::Texture,
+            stage: render::Stage::Vertex,
+            index: MAX_BIND_SLOTS,
+            slots: 9,
+        },
+    )
+    .render();
+    assert_eq!(
+        line,
+        "render_bind_overflow reason=render_texture_bind_slot_past_table \
+         stage=vertex index=31 slots=9 table=31 apple_table=128"
+    );
+
+    // The slug is the class's, so a buffer drop cannot be mistaken for a
+    // texture one — that split is the whole reason there are three routes.
+    let buffers = Emit::decline(
+        "render_bind_overflow",
+        &BindSlotPastTable {
+            class: BindClass::Buffer,
+            stage: render::Stage::Fragment,
+            index: MAX_BIND_SLOTS,
+            slots: 1,
+        },
+    )
+    .render();
+    assert!(
+        buffers.contains("reason=render_buffer_bind_slot_past_table")
+            && buffers.contains("stage=fragment")
+            && buffers.contains("apple_table=31"),
+        "{buffers}"
+    );
+}
+
 /// A bind at the last slot Apple's *sampler* table can name still binds.
 ///
 /// The three classes now carry three counters, and the risk that creates is

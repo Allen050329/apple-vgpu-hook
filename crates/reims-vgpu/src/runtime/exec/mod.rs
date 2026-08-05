@@ -2000,11 +2000,34 @@ enum BindClass {
 
 impl BindClass {
     /// The census name for slots this class lost to [`MAX_BIND_SLOTS`].
+    ///
+    /// Also the `reason=` slug of [`BindSlotPastTable`], deliberately: the two
+    /// name one event, and a reader who greps the fail log for a slug should
+    /// find the same string beside a running total in the census. What they
+    /// count differs — one line per distinct `(stage, slot)` this boot against a
+    /// cumulative per-window slot count — which is exactly why both exist.
     fn past_table_route(self) -> &'static str {
         match self {
             BindClass::Buffer => "render_buffer_bind_slot_past_table",
             BindClass::Texture => "render_texture_bind_slot_past_table",
             BindClass::Sampler => "render_sampler_bind_slot_past_table",
+        }
+    }
+
+    /// The size of Apple's own argument table for this class, as measured in
+    /// [`reims_vgpu_wire::ops::bind_limit`].
+    ///
+    /// On the line because it is what makes a reading actionable without going
+    /// back to the source: `table=31 apple_table=128` is guest work Apple's
+    /// serializer is entitled to emit and this device cannot hold, while
+    /// `table=31 apple_table=16` cannot come from an Apple guest at all and
+    /// points at a decode that mis-sized the record.
+    fn apple_table(self) -> u32 {
+        use reims_vgpu_wire::ops::bind_limit;
+        match self {
+            BindClass::Buffer => bind_limit::BUFFER,
+            BindClass::Texture => bind_limit::TEXTURE,
+            BindClass::Sampler => bind_limit::SAMPLER,
         }
     }
 
@@ -2074,6 +2097,68 @@ impl BindClass {
             (BindClass::Sampler, r) if r <= MAX_BIND_SLOTS => "render_bind_reach_sampler_le_table",
             (BindClass::Sampler, _) => "render_bind_reach_sampler_over_table",
         }
+    }
+}
+
+/// A render bind record whose slot run reached past [`MAX_BIND_SLOTS`], so the
+/// walk stopped and the rest of the record was dropped.
+///
+/// # Why this is on the fail channel and not only in the census
+///
+/// The sibling counter [`BindClass::past_table_route`] has always been here, and
+/// a census counter is not the always-on failure path: it lands in a one-second
+/// `OFF` line among a hundred other routes, and a route reading zero is simply
+/// absent from it. So the first time a guest lost a texture bind, nothing in
+/// `/tmp/reims-vgpu-fail.log` would have said so — the reader had to already
+/// suspect it and diff two census lines to find out.
+///
+/// The compute rail reached the opposite conclusion about the identical loss:
+/// `compute_exec::note_compute_bind_overflow` puts a slot past
+/// `MAX_COMPUTE_*_SLOTS` on the fail channel, deduped per `(table, index)`,
+/// with the comment "wrong compute output with no other symptom, previously
+/// silent". Two arms, one rule about one wire form, and the arm that a boot
+/// actually walks was the quiet one. This closes that.
+///
+/// Latched per `(stage, first refused slot)` rather than per record: a guest
+/// that binds a 40-slot texture range does it every frame, and the second line
+/// carries nothing the first did not. Magnitude is what the counter is for.
+///
+/// **A reading here is the argument for widening the table**, for the class
+/// named by the slug — see [`BindClass::reach_route`] for what a driven boot
+/// measured and why one workload's zero is not a reason to leave it unwatched.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BindSlotPastTable {
+    class: BindClass,
+    stage: Stage,
+    /// The first slot the walk refused — the guest's own index, not the
+    /// position within the record, so it can be read against the table size.
+    index: u32,
+    /// Entries dropped with it, this record. The record is walked in slot
+    /// order, so everything from `index` on is lost together.
+    slots: u32,
+}
+
+impl crate::observe::Decline for BindSlotPastTable {
+    fn slug(&self) -> &'static str {
+        self.class.past_table_route()
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        vec![
+            (
+                "stage",
+                match self.stage {
+                    Stage::Vertex => "vertex",
+                    Stage::Fragment => "fragment",
+                    Stage::Unknown => "unknown",
+                }
+                .to_string(),
+            ),
+            ("index", self.index.to_string()),
+            ("slots", self.slots.to_string()),
+            ("table", MAX_BIND_SLOTS.to_string()),
+            ("apple_table", self.class.apple_table().to_string()),
+        ]
     }
 }
 
@@ -2180,10 +2265,24 @@ fn apply_binds<T: Copy, B: Clone>(
             // which fires one band earlier and is the leading indicator — is the
             // argument for doing the widening, for the table [`BindClass`]
             // names, which is why there are three slugs rather than one.
-            crate::runtime::drain::note_store_route_n(
-                class.past_table_route(),
-                (entries.len() - i) as u64,
-            );
+            //
+            // The counter alone was still not the always-on failure path, which
+            // is what `AGENTS.md` asks a dropped guest record for, and which the
+            // compute rail already gives the same loss. Both, now: the line says
+            // *which* bind was lost the first time it happens, the counter says
+            // how much. See [`BindSlotPastTable`].
+            let slots = (entries.len() - i) as u32;
+            crate::runtime::drain::note_store_route_n(class.past_table_route(), u64::from(slots));
+            crate::observe::Emit::decline(
+                "render_bind_overflow",
+                &BindSlotPastTable {
+                    class,
+                    stage,
+                    index,
+                    slots,
+                },
+            )
+            .fail_once((u64::from(stage as u32) << 32) | u64::from(index));
             break;
         }
         let bind = make(index, entry);
