@@ -270,7 +270,8 @@ fn bind_compute_buffers(
 
     if let Some(indexed_stage_input) = stage_input.filter(|_| needs_index) {
         let idx = indexed_stage_input.index_buffer_index as usize;
-        if idx >= REIMS_VGPU_METAL_MAX_BUFFERS || !seen[idx] {
+        // `valid_buffer_binding` first: it is what keeps `seen[idx]` in range.
+        if !valid_buffer_binding(indexed_stage_input.index_buffer_index) || !seen[idx] {
             set_err(
                 err,
                 format!("missing compute stageInputDescriptor index buffer {idx}"),

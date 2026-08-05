@@ -9,7 +9,7 @@ use crate::backend::metal::constants::{
     MTL_BUFFER_LAYOUT_STRIDE_DYNAMIC, REIMS_VGPU_METAL_MAX_ATTRS, REIMS_VGPU_METAL_MAX_BUFFERS,
 };
 use crate::backend::metal::mtl_enum;
-use crate::backend::metal::util::{set_err, ErrOut, Status};
+use crate::backend::metal::util::{set_err, valid_buffer_binding, ErrOut, Status};
 use metal::{MTLAttributeFormat, StageInputOutputDescriptor};
 
 // Apple Metal.framework MTLStepFunction raw values (MTLStageInputOutputDescriptor.h).
@@ -104,7 +104,7 @@ pub fn make_compute_stage_input_descriptor(
 
     for i in 0..stage_input.layout_count as usize {
         let layout = &stage_input.layouts[i];
-        if layout.buffer_index as usize >= REIMS_VGPU_METAL_MAX_BUFFERS {
+        if !valid_buffer_binding(layout.buffer_index) {
             set_err(
                 err,
                 format!(
@@ -186,7 +186,7 @@ pub fn make_compute_stage_input_descriptor(
             return Err(Status::args("metal_stage_input_index_type_unsupported")
                 .field("index_type", stage_input.index_type));
         };
-        if stage_input.index_buffer_index as usize >= REIMS_VGPU_METAL_MAX_BUFFERS {
+        if !valid_buffer_binding(stage_input.index_buffer_index) {
             set_err(
                 err,
                 format!(
@@ -228,7 +228,7 @@ pub fn make_compute_stage_input_descriptor(
             return Err(Status::args("metal_stage_input_attribute_duplicate")
                 .field("location", attr.location));
         }
-        if attr.buffer_index as usize >= REIMS_VGPU_METAL_MAX_BUFFERS {
+        if !valid_buffer_binding(attr.buffer_index) {
             set_err(
                 err,
                 format!(

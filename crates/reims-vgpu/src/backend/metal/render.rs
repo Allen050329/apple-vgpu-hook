@@ -436,7 +436,7 @@ fn make_vertex_descriptor(
                     .field("limit", REIMS_VGPU_METAL_MAX_ATTRS),
             );
         }
-        if attr.buffer_index as usize >= REIMS_VGPU_METAL_MAX_BUFFERS {
+        if !valid_buffer_binding(attr.buffer_index) {
             set_err(
                 err,
                 format!(
