@@ -347,6 +347,36 @@ fn present_surface_id(opcode: u16, payload: &[u8]) -> Option<u32> {
 /// second boot — and diff the seven words. Whatever tracks width, height or
 /// stride identifies itself immediately. Nothing short of that should turn
 /// these into named fields.
+/// Report a `CmdInvalidateResources` / `CmdSynchronizeResources` payload that
+/// did not decode, naming the check that refused it.
+///
+/// Both arms used to hand-roll the same line: `… decode_fail w0=… w1=…`, the
+/// first two words of the payload and no `reason=`. Two problems with that, and
+/// the second is the one that cost. Without a slug the line cannot be ranked —
+/// `AGENTS.md`'s own recipe for reading the log is to rank `reason=` on the fail
+/// channel, and a line with none is invisible to it. And `w0`/`w1` are the
+/// task id and the count, which is the *input* to the check rather than its
+/// verdict: a short header and a count the payload cannot carry produced
+/// identical-looking lines, so the reader had to re-derive which had happened.
+///
+/// One helper for both commands, because the decoder's error type is one type.
+/// The command name stays a field so the two stay separable in a grep.
+///
+/// Latched per `(reason, opcode)`: the guest re-sends these on a cadence, and a
+/// malformed one is malformed every time. Magnitude belongs to a counter.
+fn note_resource_list_decode_fail(
+    op: &'static str,
+    opcode: u16,
+    channel_id: u32,
+    error: crate::runtime::decode::fifo::ResourceListDecodeError,
+) {
+    crate::observe::Emit::decline("map_family", &error)
+        .field("op", op)
+        .field("opcode", format!("{opcode:#x}"))
+        .field("ch", channel_id)
+        .fail_once(u64::from(opcode));
+}
+
 fn note_display_txn_payload(state: &mut DeviceState, channel_id: u32, packet: &Packet) {
     let plen = packet.payload.len();
     let trailer = display_txn_trailer_len(packet.opcode);
@@ -2395,7 +2425,7 @@ fn process_child_packet<H: HostMemory + HostOps>(
                 };
                 use crate::runtime::resource_validity::{apply, ValiditySite};
                 match decode_invalidate_resources(&packet.payload) {
-                    Some(cmd) => {
+                    Ok(cmd) => {
                         let mut bumped = 0u32;
                         let mut miss = 0u32;
                         let mut windows_dropped = 0u32;
@@ -2463,22 +2493,16 @@ fn process_child_packet<H: HostMemory + HostOps>(
                             ));
                         }
                     }
-                    None => {
-                        let w0 = if plen >= 4 {
-                            crate::contract::endian::ld32(&packet.payload[0..])
-                        } else {
-                            0
-                        };
-                        let w1 = if plen >= 8 {
-                            crate::contract::endian::ld32(&packet.payload[4..])
-                        } else {
-                            0
-                        };
-                        crate::observe::fail(format!(
-                            "map_family op=InvalidateResources opcode={:#x} ch={channel_id} plen={plen} decode_fail w0={w0:#x} w1={w1:#x}",
-                            packet.opcode
-                        ));
-                    }
+                    // A refused Invalidate leaves this device serving
+                    // host-cached pixels for a resource the guest has just
+                    // CPU-written, so the line has to say which check refused
+                    // and not only that one did.
+                    Err(e) => note_resource_list_decode_fail(
+                        "InvalidateResources",
+                        packet.opcode,
+                        channel_id,
+                        e,
+                    ),
                 }
             } else if packet.opcode == CHILD_OP_SYNCHRONIZE_RESOURCES {
                 // RE synchronizeForUnwire → FIFO 0x35: {task,count}+{oid} only.
@@ -2488,7 +2512,7 @@ fn process_child_packet<H: HostMemory + HostOps>(
                 // were stamp-only). Keep decode + wait_surface; no guest write.
                 use crate::runtime::decode::fifo::decode_synchronize_resources;
                 match decode_synchronize_resources(&packet.payload) {
-                    Some(cmd) => {
+                    Ok(cmd) => {
                         // The guest is about to CPU-read these resources
                         // (pageoff/unwire): land every deferred writeback
                         // (render/compute/linear-alias) into guest pages first
@@ -2542,22 +2566,15 @@ fn process_child_packet<H: HostMemory + HostOps>(
                             ));
                         }
                     }
-                    None => {
-                        let w0 = if plen >= 4 {
-                            crate::contract::endian::ld32(&packet.payload[0..])
-                        } else {
-                            0
-                        };
-                        let w1 = if plen >= 8 {
-                            crate::contract::endian::ld32(&packet.payload[4..])
-                        } else {
-                            0
-                        };
-                        crate::observe::fail(format!(
-                            "map_family op=SynchronizeResources opcode={:#x} ch={channel_id} plen={plen} decode_fail w0={w0:#x} w1={w1:#x}",
-                            packet.opcode
-                        ));
-                    }
+                    // A refused Synchronize lets the guest CPU-read pages whose
+                    // deferred writeback never landed — the class the accepting
+                    // arm above still names "boot-25 black-wallpaper".
+                    Err(e) => note_resource_list_decode_fail(
+                        "SynchronizeResources",
+                        packet.opcode,
+                        channel_id,
+                        e,
+                    ),
                 }
             } else {
                 let w0 = if plen >= 4 {
