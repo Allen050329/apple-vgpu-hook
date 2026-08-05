@@ -752,7 +752,10 @@ impl ObjectCaches {
             self.samplers.insert_negative(*key, err.clone());
             return Err(err);
         }
-        let max_anisotropy = (key.max_anisotropy.max(1) as f32).min(ctx.max_sampler_anisotropy);
+        // Not floored here: every producer of this key either writes a literal
+        // 1 (the reflected static sampler) or carries a decoded
+        // `SamplerDescriptor`, which `decode_sampler_descriptor` already floors.
+        let max_anisotropy = (key.max_anisotropy as f32).min(ctx.max_sampler_anisotropy);
         let sampler = ctx
             .device
             .create_sampler(

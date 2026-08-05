@@ -1055,6 +1055,11 @@ pub struct SamplerDescriptor {
     pub s_address: u32,
     pub t_address: u32,
     pub r_address: u32,
+    /// `MTLSamplerDescriptor.maxAnisotropy`, already floored at 1 by
+    /// [`decode_sampler_descriptor`], which is the only producer of this type.
+    /// Every consumer may bind it straight through; four of them used to floor
+    /// it again and a fifth did not, which is the shape that leaves one arm
+    /// disagreeing about a value none of them owned.
     pub max_anisotropy: u32,
     pub lod_min_clamp: f32,
     pub lod_max_clamp: f32,
@@ -1763,6 +1768,26 @@ pub fn decode_depth_stencil_descriptor(
     })
 }
 
+/// `MTLSamplerDescriptor.maxAnisotropy` from the state word's five-bit field.
+///
+/// Metal documents the range as 1 through 16, which is exactly what five bits
+/// hold, and the wire crate's oracle fixture for a sampler with nothing set
+/// reports 1 — Apple's serializer writes the API default rather than leaving
+/// the field clear. So zero is not a value this field carries, and a zero here
+/// is a malformed record rather than a guest asking for something.
+///
+/// Floored rather than refused, because the record is otherwise complete and a
+/// refusal would drop a whole sampler over one out-of-range field; counted so
+/// the choice is not silent. This is the single site — the four `.max(1)`s
+/// downstream of it are gone, and with them the one consumer that had none.
+fn wire_max_anisotropy(value: u8) -> u32 {
+    if value != 0 {
+        return u32::from(value);
+    }
+    crate::runtime::drain::note_store_route("sampler_max_anisotropy_zero");
+    1
+}
+
 pub fn decode_sampler_descriptor(bytes: &[u8]) -> Result<SamplerDescriptor, DecodeStatus> {
     let op =
         reims_vgpu_wire::op(bytes, 0).map_err(|_| DecodeStatus::ErrShort("res_sampler_short"))?;
@@ -1777,7 +1802,7 @@ pub fn decode_sampler_descriptor(bytes: &[u8]) -> Result<SamplerDescriptor, Deco
         s_address: body.s_address_mode() as u32,
         t_address: body.t_address_mode() as u32,
         r_address: body.r_address_mode() as u32,
-        max_anisotropy: (body.max_anisotropy() as u32).max(1),
+        max_anisotropy: wire_max_anisotropy(body.max_anisotropy()),
         lod_min_clamp: body.lod_min_clamp.get(),
         lod_max_clamp: body.lod_max_clamp.get(),
         compare_function: body.compare_function() as u32,
@@ -3076,6 +3101,51 @@ mod tests {
 
     use super::*;
     use crate::contract::endian::st32;
+
+    /// A `newSampler` record carrying `state`, at the layout the wire crate's
+    /// own fixtures use.
+    fn sampler_record(state: u32) -> Vec<u8> {
+        use reims_vgpu_wire::ops::sampler::NEW_SAMPLER_TOTAL_LEN;
+        let mut b = vec![0u8; NEW_SAMPLER_TOTAL_LEN as usize];
+        st32(&mut b[0..], TYPE7_OBJECT_SAMPLER);
+        st32(&mut b[4..], NEW_SAMPLER_TOTAL_LEN);
+        st32(&mut b[8..], 7);
+        st32(&mut b[12..], state);
+        b
+    }
+
+    /// The five anisotropy bits are read verbatim, and only a record outside
+    /// Metal's range is repaired.
+    ///
+    /// `MTLSamplerDescriptor.maxAnisotropy` runs 1 through 16 — exactly what
+    /// five bits hold — and the wire crate's oracle baseline (a sampler with
+    /// nothing set) already reports 1, so Apple's serializer writes the API
+    /// default rather than leaving the field clear. A zero is therefore a
+    /// malformed record, and the decoder is the one place that says what to do
+    /// about it: four consumers used to floor it again for themselves and a
+    /// fifth did not.
+    #[test]
+    fn a_sampler_carries_its_own_anisotropy_and_only_zero_is_repaired() {
+        // 0x84000000 is the oracle baseline: anisotropy 1, everything else at
+        // its default. Bits 26..31 hold the value.
+        let baseline = decode_sampler_descriptor(&sampler_record(0x8400_0000)).expect("baseline");
+        assert_eq!(baseline.max_anisotropy, 1);
+
+        for declared in [2u32, 13, 16] {
+            let state = 0x8400_0000 & !(0x1f << 26) | (declared << 26);
+            let sd = decode_sampler_descriptor(&sampler_record(state)).expect("declared");
+            assert_eq!(
+                sd.max_anisotropy, declared,
+                "a declared anisotropy is carried, not clamped"
+            );
+        }
+
+        // Zero is out of Metal's range; the floor is the whole repair and it is
+        // not applied to anything else.
+        let zeroed = 0x8400_0000 & !(0x1f << 26);
+        let sd = decode_sampler_descriptor(&sampler_record(zeroed)).expect("zeroed anisotropy");
+        assert_eq!(sd.max_anisotropy, 1);
+    }
 
     /// A one-attribute vertex-input block whose single buffer layout carries
     /// exactly the step tags asked for.

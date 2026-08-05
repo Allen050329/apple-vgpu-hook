@@ -2597,7 +2597,7 @@ pub(crate) fn sampler_record(
         compare_function: sd.compare_function,
         lod_min_bits: lod_min,
         lod_max_bits: lod_max,
-        max_anisotropy: sd.max_anisotropy.max(1),
+        max_anisotropy: sd.max_anisotropy,
         lod_average: if sd.lod_average { 1 } else { 0 },
         support_argument_buffers: if argument_buffers || sd.support_argument_buffers {
             1
@@ -2622,7 +2622,7 @@ mod sampler_record_tests {
             s_address: 3,
             t_address: 4,
             r_address: 5,
-            max_anisotropy: 0,
+            max_anisotropy: 1,
             lod_min_clamp: 0.25,
             lod_max_clamp: 8.0,
             compare_function: 6,
@@ -2671,15 +2671,12 @@ mod sampler_record_tests {
         );
     }
 
-    /// Anisotropy of zero is not a Metal value; every encoder floored it at one
-    /// and the shared record keeps doing so.
+    /// The record binds the descriptor's anisotropy through, because
+    /// `decode_sampler_descriptor` is where the floor lives and this type has
+    /// no other producer.
     #[test]
-    fn anisotropy_is_floored_at_one() {
+    fn anisotropy_is_carried_from_the_descriptor() {
         let mut sd = descriptor();
-        assert_eq!(
-            super::sampler_record(64, &sd, None, false).max_anisotropy,
-            1
-        );
         sd.max_anisotropy = 4;
         assert_eq!(
             super::sampler_record(64, &sd, None, false).max_anisotropy,
@@ -3086,7 +3083,7 @@ fn vulkan_sampler_resource(
         )?,
         lod_min: sampler.lod_min_clamp.to_bits(),
         lod_max: sampler.lod_max_clamp.to_bits(),
-        max_anisotropy: sampler.max_anisotropy.max(1),
+        max_anisotropy: sampler.max_anisotropy,
         unnormalized_coordinates: !sampler.normalized_coordinates,
     })
 }
