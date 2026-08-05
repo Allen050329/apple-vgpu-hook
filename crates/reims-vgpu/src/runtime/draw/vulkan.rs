@@ -3976,6 +3976,12 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
             );
             return Vec::new();
         }
+        // Same three-into-two collapse as the primary slot below: a secondary
+        // attachment's DontCare reaches the engine as "no seed", which its pass
+        // key spells as CLEAR.
+        if c.load_action == MTL_LOAD_ACTION_DONT_CARE {
+            super::note_load_action_dont_care(pipeline.object_id, c.width, c.height);
+        }
         let load = c.load_action == MTL_LOAD_ACTION_LOAD;
         let clear = [
             c.clear_color[0] as f32,
@@ -4998,7 +5004,15 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     note_load_seed_outcome(seed_door, target_rgba8.is_some(), c0, w, h);
                 }
                 // DontCare: the guest declared the prior contents undefined, so
-                // arriving with no seed is the contract rather than a loss.
+                // arriving with no seed is the contract rather than a loss. It
+                // is still not what the guest asked for — no seed makes this
+                // pass key indistinguishable from a Clear, and `caches.rs`
+                // resolves that key to `AttachmentLoadOp::CLEAR`. Its own arm,
+                // so the third value of a three-valued enum stops sharing the
+                // catch-all with the out-of-contract one two lines above.
+                MTL_LOAD_ACTION_DONT_CARE => {
+                    super::note_load_action_dont_care(req.pipeline_ref, w, h);
+                }
                 _ => {}
             }
         }
