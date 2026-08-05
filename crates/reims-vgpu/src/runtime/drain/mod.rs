@@ -4,6 +4,10 @@
 //! control-plane ops update device state; unknown opcodes are recorded visibly.
 
 use crate::contract::endian::{ld16, ld32, ld64, st16, st32};
+use crate::contract::iosurface_pages::{
+    MAPPER_REQUEST_ENTRY_LEN, MAPPER_REQUEST_MAP, MAPPER_REQUEST_MAPPING_ID, MAPPER_REQUEST_TYPE,
+    MAPPER_REQUEST_UNMAP,
+};
 use crate::model::*;
 use crate::model::{DeviceState, ExecFault, FailEvent, PacketFault};
 use crate::observe::Emit;
@@ -2826,8 +2830,8 @@ pub fn drain_iosfc<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut 
             {
                 break;
             }
-            let rtype = ld32(&e[0..]);
-            let mapping_id = ld32(&e[4..]);
+            let rtype = ld32(&e[MAPPER_REQUEST_TYPE..]);
+            let mapping_id = ld32(&e[MAPPER_REQUEST_MAPPING_ID..]);
             // Capture was taken at producer write for published entry (idx+1).
             let cap = match state.mapper_capture {
                 Some(c) if c.producer == idx + 1 => state.mapper_capture.take(),

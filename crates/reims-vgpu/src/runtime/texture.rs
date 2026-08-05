@@ -4,7 +4,7 @@
 //! on the mapping when a texture descriptor is resolved. Device-desc geom
 //! (mapper path) and texture-path geom share [`DeviceState::set_mapping_geom`].
 
-use crate::contract::iosurface_pages::{decode_texture_descriptor, TEXTURE_DESC_MIN_LEN};
+use crate::contract::iosurface_pages::{decode_texture_descriptor, TYPE11_DESC_MIN_LEN};
 use crate::model::{DeviceState, MAX_MAPPINGS};
 use crate::runtime::decode::resource::{decode_descriptor, Descriptor};
 
@@ -35,7 +35,7 @@ pub fn register_from_descriptor_bytes(
 ) -> bool {
     // Also accept the raw iosurface texture layout without a type byte.
     let headerless = |state: &mut DeviceState| {
-        if desc.len() >= TEXTURE_DESC_MIN_LEN {
+        if desc.len() >= TYPE11_DESC_MIN_LEN {
             if let Ok(t) = decode_texture_descriptor(desc) {
                 return register_type11_geom(
                     state,

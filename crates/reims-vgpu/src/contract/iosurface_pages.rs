@@ -10,13 +10,30 @@ pub const U32_SIZE: usize = 4;
 /// Live blobs are often longer (0x38/0x58) with an unused/constant tail.
 /// There is no multi-mip level-record layout on type-11: Metal rejects
 /// mipmapped IOSurface textures (`mipmapLevelCount > 1`).
-pub const TEXTURE_DESC_MIN_LEN: usize = 0x20;
-pub const TEXTURE_DESC_MAPPING_ID: usize = 0x00;
-pub const TEXTURE_DESC_OBJECT_REF: usize = 0x10;
-pub const TEXTURE_DESC_PIXEL_FORMAT: usize = 0x16;
-pub const TEXTURE_DESC_WIDTH: usize = 0x18;
-pub const TEXTURE_DESC_HEIGHT: usize = 0x1c;
+///
+/// `TYPE11_` rather than `TEXTURE_DESC_`, which is what these were called.
+/// `runtime::decode::resource` declares a `TEXTURE_DESC_WIDTH`, a
+/// `TEXTURE_DESC_HEIGHT` and a `TEXTURE_DESC_PIXEL_FORMAT` of its own for the
+/// serialized `MTLTextureDescriptor` — a different record, at 60, 64 and 86
+/// against the 0x18, 0x1c and 0x16 here. Two records under one set of names, and
+/// `runtime::texture` imports from both modules in the same file. Neither value
+/// is out of range for the other's record, so picking the wrong import yields a
+/// plausible width rather than a bounds failure.
+pub const TYPE11_DESC_MIN_LEN: usize = 0x20;
+pub const TYPE11_DESC_MAPPING_ID: usize = 0x00;
+pub const TYPE11_DESC_OBJECT_REF: usize = 0x10;
+pub const TYPE11_DESC_PIXEL_FORMAT: usize = 0x16;
+pub const TYPE11_DESC_WIDTH: usize = 0x18;
+pub const TYPE11_DESC_HEIGHT: usize = 0x1c;
 
+/// One entry of the guest's mapper request array: `{type, mapping_id, reserved}`.
+///
+/// The length, the two request types and the three field offsets describe one
+/// record and belong together. They did not: `model::regs` carried its own
+/// `MAPPER_REQUEST_MAP` / `_UNMAP` / `_ENTRY_LEN` at the same values and none of
+/// the offsets, so `runtime::mapper` decoded this record through the constants
+/// here while `runtime::drain` decoded the same guest bytes through those.
+/// Neither copy could tell the other it had moved.
 pub const MAPPER_REQUEST_ENTRY_LEN: usize = 16;
 pub const MAPPER_REQUEST_TYPE: usize = 0x00;
 pub const MAPPER_REQUEST_MAPPING_ID: usize = 0x04;
@@ -513,18 +530,18 @@ pub fn required_entry_count(
 }
 
 pub fn decode_texture_descriptor(bytes: &[u8]) -> Result<TextureDescriptor, Status> {
-    if bytes.len() < TEXTURE_DESC_MIN_LEN {
+    if bytes.len() < TYPE11_DESC_MIN_LEN {
         return Err(Status::ErrShortDescriptor(
             "iosurface_texture_descriptor_short",
         ));
     }
     Ok(TextureDescriptor {
-        mapping_id64: ld64(&bytes[TEXTURE_DESC_MAPPING_ID..]),
-        mapping_id: ld32(&bytes[TEXTURE_DESC_MAPPING_ID..]),
-        object_ref: ld32(&bytes[TEXTURE_DESC_OBJECT_REF..]),
-        pixel_format: ld16(&bytes[TEXTURE_DESC_PIXEL_FORMAT..]),
-        width: ld32(&bytes[TEXTURE_DESC_WIDTH..]),
-        height: ld32(&bytes[TEXTURE_DESC_HEIGHT..]),
+        mapping_id64: ld64(&bytes[TYPE11_DESC_MAPPING_ID..]),
+        mapping_id: ld32(&bytes[TYPE11_DESC_MAPPING_ID..]),
+        object_ref: ld32(&bytes[TYPE11_DESC_OBJECT_REF..]),
+        pixel_format: ld16(&bytes[TYPE11_DESC_PIXEL_FORMAT..]),
+        width: ld32(&bytes[TYPE11_DESC_WIDTH..]),
+        height: ld32(&bytes[TYPE11_DESC_HEIGHT..]),
     })
 }
 

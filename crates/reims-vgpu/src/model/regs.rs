@@ -317,9 +317,6 @@ pub const CURSOR_GLYPH_PAYLOAD_LEN: usize = 0x2c;
 pub const MMIO_U32: u32 = 4;
 pub const MMIO_U64: u32 = 8;
 
-pub const MAPPER_REQUEST_MAP: u32 = 1;
-pub const MAPPER_REQUEST_UNMAP: u32 = 2;
-pub const MAPPER_REQUEST_ENTRY_LEN: usize = 16;
 
 /// Highest protocol version this host implements.
 ///
