@@ -8148,7 +8148,7 @@ mod vulkan_split_tests {
         // The recovered arm is its own outcome, not folded into `cache_hit`: its
         // rate is the only thing that prices the guest-pages fallback, and fusing
         // it would make the fix unmeasurable the moment it worked.
-        let cap = crate::observe::sink::FailCapture::start();
+        let cap = crate::observe::sink::FailCapture::resume();
         note_type11_load_seed(&state, mid, 4, 4, Some(Type11SeedRung::GuestPages));
         let pages = only(&cap);
         assert!(pages.contains("outcome=guest_pages"), "{pages}");
@@ -8157,7 +8157,7 @@ mod vulkan_split_tests {
         // Same mapping, a geometry the cache does not hold: the entry's own
         // geometry is the load-bearing field, since it says a Store at another
         // extent orphaned every window still living at this one.
-        let cap = crate::observe::sink::FailCapture::start();
+        let cap = crate::observe::sink::FailCapture::resume();
         note_type11_load_seed(&state, mid, 8, 1, None);
         let geom = only(&cap);
         assert!(geom.contains("reason=type11_seed_cache_geom"), "{geom}");
@@ -8166,7 +8166,7 @@ mod vulkan_split_tests {
         drop(cap);
 
         // A mapping the cache has never held reports absence, not a geometry.
-        let cap = crate::observe::sink::FailCapture::start();
+        let cap = crate::observe::sink::FailCapture::resume();
         note_type11_load_seed(&state, 910, 8, 4, None);
         let absent = only(&cap);
         assert!(
@@ -8177,8 +8177,11 @@ mod vulkan_split_tests {
         drop(cap);
 
         // Latched per (mapping, geometry, outcome): a repeat of any of the three
-        // above emits nothing, so the branch is safe to leave on forever.
-        let cap = crate::observe::sink::FailCapture::start();
+        // above emits nothing, so the branch is safe to leave on forever. Every
+        // window after the first is a `resume`, because the claims the earlier
+        // ones made are exactly what this last one asserts, and `start` would
+        // clear them and see all four lines again.
+        let cap = crate::observe::sink::FailCapture::resume();
         note_type11_load_seed(&state, mid, 8, 4, Some(Type11SeedRung::Cache));
         note_type11_load_seed(&state, mid, 4, 4, Some(Type11SeedRung::GuestPages));
         note_type11_load_seed(&state, mid, 8, 1, None);

@@ -4500,15 +4500,7 @@ fn type11_sample_resolves_geometry_before_reading_it() {
     put_u64(&mut host, internal + MAPPING_INTERNAL_DESC_PTR, desc_kva);
     put_u64(&mut host, page_obj + MAPPING_PAGE_TABLE_FROM_F48, table);
 
-    // A PFN of this test's own. `resolve_mapping_backing` reports its adopted
-    // footprint through a process-global `first_sight` latch keyed on
-    // `span_first_sight_key(mapping_id, lo, hi, page_shift)` — so this fixture
-    // and `mapper::tests::resolve_builds_page_entries`, which share `mid == 3`,
-    // one arm64e page, and nothing else, compute the *same* key whenever they
-    // share a PFN. Whichever runs first claims it and the other's line never
-    // appears. That test asserts on the line; this one only needs a page, so
-    // the distinct value belongs here.
-    let pfn = 0x3b7a2_u32;
+    let pfn = 0x1e88c_u32;
     let page_gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
     put_u32(
         &mut host,

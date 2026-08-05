@@ -1383,8 +1383,10 @@ fn an_unconsumed_colour_attachment_field_reports_its_tag_and_value() {
         drop[0]
     );
 
-    // Latched: a second identical entry reports neither line again.
-    let cap2 = crate::observe::FailCapture::start();
+    // Latched: a second identical entry reports neither line again. `resume`,
+    // not `start`: the claim the window above made is the thing under test, and
+    // `start` would clear it and see both lines a second time.
+    let cap2 = crate::observe::FailCapture::resume();
     let _ = parse_color_attachments(&buf, buf.len(), off);
     assert!(
         cap2.lines().is_empty(),

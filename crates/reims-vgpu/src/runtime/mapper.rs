@@ -3800,11 +3800,13 @@ mod tests {
     /// below swallows it and `cap.one("OFF")` finds nothing to return.
     #[test]
     fn the_type4_span_latch_does_not_suppress_the_mapper_span() {
-        // A PFN of this test's own, so the sibling span test's latch — claimed
-        // under the same namespace on whichever of the two runs first — cannot
-        // decide this one.
         let pfn = 0x2c4d1_u32;
         let (mut state, host, page_gpa) = span_fixture(pfn);
+
+        // The claim has to be taken *after* `start()`, which drops every latch
+        // precisely so no test inherits another's. Taking it before would be
+        // undone, and this test would then pass without ever contending.
+        let cap = crate::observe::sink::FailCapture::start();
 
         // The fixture's single page is both ends of the span. Same discriminant
         // the emitter will compute, taken from the shared helper so this cannot
@@ -3815,7 +3817,6 @@ mod tests {
             "the type-4 latch must be unclaimed at the start of this test"
         );
 
-        let cap = crate::observe::sink::FailCapture::start();
         assert!(resolve_mapping_backing(&mut state, &host, 3));
         let span = cap.one("OFF");
         assert!(
