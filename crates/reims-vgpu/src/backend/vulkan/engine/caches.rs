@@ -225,10 +225,18 @@ const NEGATIVE_CAP: usize = 1024;
 /// a lookup — so a thrashing cache pays one compile per frame per evicted
 /// pipeline, forever.
 ///
-/// The bound also never engaged. A driven Safari boot sums 86 `pipeline_misses`
-/// over its whole life, so the live pipeline map peaks an order of magnitude
-/// under the cap it carried; the cap only stood ready to evict the hot set on a
-/// heavier guest.
+/// The bound also never engaged on this arm. A driven x86 boot, window-drag
+/// probe against Safari, settles at `pipelines=92 shaders=75 layouts=33
+/// passes=4 samplers=14 compute_pipelines=16` — read directly off
+/// [`ObjectCaches::levels`], which is what the `object_cache_levels` census
+/// publishes. Every level is flat from roughly 38 s in through the end of the
+/// run, including across the drag probe's compositing, so the caps only stood
+/// ready to evict the hot set on a heavier guest.
+///
+/// Two of those numbers matter beyond this arm. `passes=4` against the 64 this
+/// cache carried is the widest margin here; and `pipelines=92` is *above* the
+/// 64-slot render-pipeline table the Metal arm carried, which is how that arm's
+/// cap was shown to be binding — see [`crate::model::content_cache`].
 ///
 /// Unbounded is also the faithful failure mode. When a guest really does ask for
 /// more distinct pipelines than the host can hold, the create itself returns

@@ -223,9 +223,11 @@ impl CachedShader {
 ///
 /// **Deliberately unbounded.** The key is content, so the live entry count is the
 /// number of *distinct* shaders the guest has ever compiled — a property of the
-/// guest's own program set, not of how long the device has run. A driven Safari
-/// boot reaches 75-80; an idle boot the same. That is the same bound a real
-/// driver's pipeline cache has, and it is why no reclaim rule is needed here.
+/// guest's own program set, not of how long the device has run. A driven x86
+/// boot with a window-drag probe against Safari settles at 75 and stays there
+/// for the rest of the run, read off the `object_cache_levels` census; an idle
+/// boot reaches the same. That is the same bound a real driver's pipeline cache
+/// has, and it is why no reclaim rule is needed here.
 ///
 /// It used to hold 256 entries and evict in insertion order. Both halves were
 /// wrong for this workload. Insertion order makes the *first* shader compiled —

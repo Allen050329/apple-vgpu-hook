@@ -15,14 +15,24 @@
 //! regardless of whether the guest was still drawing with it.
 //!
 //! The caps were 96 functions, 64 render pipeline states, 64 compute pipeline
-//! states, 64 reflections, 32 samplers and 16 depth-stencil states. The Vulkan
-//! arm gives an independent reading of what one guest actually asks for, because
-//! it decodes the same command stream into the same object identities: a driven
-//! Safari boot sums 86 distinct graphics pipelines. Against a 64-slot table that
-//! is not headroom, it is sustained thrash — and the object a rotating hand
-//! evicts from a compositing desktop is, more often than not, one that will be
-//! bound again on the next frame. Rebuilding it is
-//! `newRenderPipelineStateWithDescriptor:`, a shader compile.
+//! states, 64 reflections, 32 samplers and 16 depth-stencil states.
+//!
+//! **The render-pipeline cap was below what this guest asks for.** The Vulkan
+//! arm decodes the same command stream into the same object identities, so its
+//! `object_cache_levels` census is a direct reading of the guest's distinct
+//! object set. A driven x86 boot, window-drag probe against Safari, settles at:
+//!
+//! ```text
+//!   m2v=75  shaders=75  layouts=33  passes=4  pipelines=92  samplers=14
+//!   compute_pipelines=16
+//! ```
+//!
+//! 92 distinct render pipelines against a 64-slot table is not headroom, it is
+//! sustained thrash: 28 pipelines more than the table holds, every one of them
+//! live, with a rotating hand choosing the victim. On a compositing desktop the
+//! object it picks is more often than not one that will be bound again on the
+//! next frame, and rebuilding it is `newRenderPipelineStateWithDescriptor:` —
+//! a shader compile.
 //!
 //! So the bound was not protecting the host from the guest; it was capping the
 //! guest below what it had already been observed to need. The live entry count
