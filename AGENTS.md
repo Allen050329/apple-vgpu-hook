@@ -412,6 +412,16 @@ cargo clippy -p reims-vgpu --all-targets --no-default-features --features backen
 cargo clippy -p reims-vgpu --target x86_64-unknown-linux-gnu --all-targets --no-default-features --features backend-vulkan,host-window -- -D warnings
 ```
 
+A commit touching `crates/reims-vgpu-efi` — its own workspace, so the commands above do not reach it
+— adds two more, both from the crate directory. `--all-targets` cannot be used on either: the bin is
+`#![no_main]` with the `uefi` crate's panic handler, so building a libtest harness for it collides
+with `std`'s (E0152) on every target.
+
+```sh
+cargo clippy --target x86_64-unknown-uefi -- -D warnings   # the shipping artifact
+cargo clippy --profile test --lib -- -D warnings           # the host-runnable lib and its tests
+```
+
 Expect zero from all three. **`scripts/feature-matrix` does not cover this**: it runs `cargo check`,
 so its `warnings=0` is a rustc count and it cannot see a clippy lint on any arm. That gap plus a
 "the Metal command is Apple-only" line that used to sit here is how a `clippy::question_mark` in

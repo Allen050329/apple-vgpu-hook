@@ -158,7 +158,7 @@ unsafe extern "efiapi" fn gop_blt(
         }
         let row_px = if delta == 0 {
             width
-        } else if delta % size_of::<BltPixel>() != 0 {
+        } else if !delta.is_multiple_of(size_of::<BltPixel>()) {
             return Status::INVALID_PARAMETER;
         } else {
             delta / size_of::<BltPixel>()
