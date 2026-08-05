@@ -5,7 +5,7 @@
 //! (mapper path) and texture-path geom share [`DeviceState::set_mapping_geom`].
 
 use crate::contract::iosurface_pages::{decode_texture_descriptor, TYPE11_DESC_MIN_LEN};
-use crate::model::{DeviceState, MAX_MAPPINGS};
+use crate::model::{is_mapping_id, DeviceState};
 use crate::runtime::decode::resource::{decode_descriptor, Descriptor};
 
 /// Register geometry from a decoded type-11 / IOSurface texture descriptor.
@@ -16,7 +16,7 @@ pub fn register_type11_geom(
     height: u32,
     format: u16,
 ) -> bool {
-    if mapping_id == 0 || mapping_id as usize >= MAX_MAPPINGS {
+    if !is_mapping_id(mapping_id) {
         return false;
     }
     if let Some(m) = state.mappings.get(&mapping_id) {

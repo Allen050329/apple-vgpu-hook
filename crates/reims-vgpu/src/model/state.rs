@@ -1,6 +1,6 @@
 //! Device-owned state: registers, rings, tasks, mapper, present, fail log.
 
-use crate::model::{LruBytesMemo, GFX_MMIO_SIZE, MAX_CHANNELS, MAX_MAPPINGS, MAX_TASKS};
+use crate::model::{LruBytesMemo, GFX_MMIO_SIZE, MAX_CHANNELS, MAX_TASKS};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -2775,7 +2775,7 @@ impl DeviceState {
     }
 
     pub fn map_surface(&mut self, mapping_id: u32) -> bool {
-        if mapping_id as usize >= MAX_MAPPINGS {
+        if !crate::model::is_mapping_id(mapping_id) {
             StateMutationDecline::MapSurfaceIdRange { mapping_id }.emit(u64::from(mapping_id));
             return false;
         }
@@ -2825,7 +2825,7 @@ impl DeviceState {
     }
 
     pub fn unmap_surface(&mut self, mapping_id: u32) -> bool {
-        if mapping_id as usize >= MAX_MAPPINGS {
+        if !crate::model::is_mapping_id(mapping_id) {
             StateMutationDecline::UnmapSurfaceIdRange { mapping_id }.emit(u64::from(mapping_id));
             return false;
         }
@@ -2859,7 +2859,7 @@ impl DeviceState {
 
     /// Attach directed MappingInternal capture to a mapped slot.
     pub fn attach_mapping_internal(&mut self, mapping_id: u32, mapping_internal: u64) -> bool {
-        if mapping_id as usize >= MAX_MAPPINGS {
+        if !crate::model::is_mapping_id(mapping_id) {
             StateMutationDecline::AttachMappingIdRange { mapping_id }.emit(u64::from(mapping_id));
             return false;
         }
@@ -2907,7 +2907,7 @@ impl DeviceState {
 
     /// Cache the 0x200-byte guest device descriptor for plane/surface sample windows.
     pub fn set_mapping_device_desc(&mut self, mapping_id: u32, desc: &[u8]) -> bool {
-        if mapping_id as usize >= MAX_MAPPINGS {
+        if !crate::model::is_mapping_id(mapping_id) {
             StateMutationDecline::MappingDeviceDescIdRange { mapping_id }
                 .emit(u64::from(mapping_id));
             return false;
@@ -2928,7 +2928,7 @@ impl DeviceState {
         height: u32,
         format: u16,
     ) -> bool {
-        if mapping_id as usize >= MAX_MAPPINGS {
+        if !crate::model::is_mapping_id(mapping_id) {
             StateMutationDecline::MappingGeomIdRange { mapping_id }.emit(u64::from(mapping_id));
             return false;
         }
@@ -3353,7 +3353,7 @@ mod fail_vocabulary_tests {
     #[test]
     fn invalid_mapping_geometry_cannot_create_an_out_of_range_slot() {
         let mut state = DeviceState::new(DeviceId(1), crate::model::PAGE_SHIFT_X86);
-        let bad_mapping = MAX_MAPPINGS as u32;
+        let bad_mapping = crate::model::MAX_MAPPINGS as u32;
         assert!(!state.set_mapping_geom(bad_mapping, 64, 64, 0x50));
         assert!(!state.mappings.contains_key(&bad_mapping));
         assert!(!state.set_mapping_geom(1, 0, 64, 0x50));

@@ -114,8 +114,27 @@ pub const fn is_child_channel(channel_id: u32) -> bool {
     channel_id >= 1 && (channel_id as usize) < MAX_CHANNELS
 }
 
+/// Task ids run from 0, unlike mapping ids — see [`is_mapping_id`]. Task 0 is
+/// the task every type-4 surface this device has resolved lived in, and
+/// `objects::type4_probe_order` probes it first by name.
 pub const MAX_TASKS: usize = 256;
 pub const MAX_MAPPINGS: usize = 4096;
+
+/// Whether `mapping_id` names a mapping slot rather than "no mapping".
+///
+/// Zero is the device-wide sentinel for an unbound mapping — `metal_draw`
+/// branches on `mapping_id == 0` in more than a dozen places to mean the
+/// attachment is addressed by GVA instead — so a record naming 0 is not a
+/// record naming slot 0, and creating `mappings[0]` for it produces state no
+/// sentinel-aware reader will ever consult.
+///
+/// Four callers knew that and six did not: `runtime::texture` and the two
+/// type-4 backing paths in `runtime::objects` refused zero, while the five
+/// `DeviceState` mutators and `mapper::capture_published_request` bounded the
+/// id from above only.
+pub const fn is_mapping_id(mapping_id: u32) -> bool {
+    mapping_id >= 1 && (mapping_id as usize) < MAX_MAPPINGS
+}
 
 /// Largest scanout / surface edge the device accepts, in pixels.
 ///
@@ -868,6 +887,33 @@ mod tests {
         assert!(!is_child_channel(u32::MAX));
         assert_eq!(child_reg_block_offset(0), None);
         assert_eq!(child_reg_block_offset(MAX_CHANNELS as u32), None);
+    }
+
+    /// Zero is refused because it is the "no mapping" sentinel, not because it
+    /// is out of range.
+    ///
+    /// The five `DeviceState` mutators and `mapper::capture_published_request`
+    /// bounded the id from above only, so a guest MAP naming mapping 0 — which
+    /// the mapper decodes straight out of the iosfc ring — would have created
+    /// `mappings[0]`. Every `metal_draw` reader treats `mapping_id == 0` as "this
+    /// attachment is addressed by GVA", so that entry is state nothing goes on
+    /// to consult.
+    #[test]
+    fn the_mapping_id_bound_refuses_the_no_mapping_sentinel() {
+        assert!(
+            !is_mapping_id(0),
+            "0 names no mapping; it must not open a slot"
+        );
+        assert!(is_mapping_id(1));
+        assert!(is_mapping_id(MAX_MAPPINGS as u32 - 1));
+        assert!(!is_mapping_id(MAX_MAPPINGS as u32));
+        assert!(!is_mapping_id(u32::MAX));
+    }
+
+    /// No file outside this one compares a mapping id against `MAX_MAPPINGS`.
+    #[test]
+    fn the_mapping_id_bound_is_compared_in_exactly_one_place() {
+        assert_compared_only_in_regs("MAX_MAPPINGS", "regs::is_mapping_id");
     }
 
     /// No file outside this one compares an edge against `MAX_SCANOUT_DIM`.

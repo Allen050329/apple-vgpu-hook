@@ -1058,7 +1058,7 @@ fn apply_type4_backing<M: HostMemory>(
     surface_id: u32,
     surf: &Type4Surface,
 ) -> bool {
-    if surface_id == 0 || surface_id as usize >= MAX_MAPPINGS {
+    if !crate::model::is_mapping_id(surface_id) {
         defer_type4_fail(
             surface_id,
             "sid_oob",
@@ -1678,7 +1678,7 @@ fn resolve_type4_surface_ex<M: HostMemory>(
     surface_id: u32,
     force: bool,
 ) -> bool {
-    if surface_id == 0 || surface_id as usize >= MAX_MAPPINGS {
+    if !crate::model::is_mapping_id(surface_id) {
         return false;
     }
     // Task probe order: task 0 first, then the cached owner-task hint (so a hot

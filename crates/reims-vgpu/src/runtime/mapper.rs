@@ -13,7 +13,7 @@ use crate::contract::iosurface_pages::{
     MAPPER_CAPTURE_REG_REQUEST_TYPE, MAPPER_REQUEST_ENTRY_LEN, MAPPER_REQUEST_MAP,
     MAPPER_REQUEST_UNMAP,
 };
-use crate::model::{DeviceState, MapperCapture, MAX_MAPPINGS};
+use crate::model::{DeviceState, MapperCapture};
 use crate::runtime::host::{HostMemory, HostOps, MemError};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -205,7 +205,7 @@ pub fn capture_at_producer<H: HostMemory + HostOps>(
     if request.request_type != MAPPER_REQUEST_MAP && request.request_type != MAPPER_REQUEST_UNMAP {
         return None;
     }
-    if request.mapping_id as usize >= MAX_MAPPINGS {
+    if !crate::model::is_mapping_id(request.mapping_id) {
         return None;
     }
 
