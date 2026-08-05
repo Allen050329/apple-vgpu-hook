@@ -171,17 +171,18 @@ simply the wrong number, a length four bytes off, or a field two bytes too wide:
 | What compiles but is never referenced? | `scripts/dead-state/dead-state.sh` |
 | What is reachable but never runs? | `scripts/runtime-dead` — coverage-instrumented driven boot |
 | Does a decoder refuse or drop a record Apple emits? | `crates/reims-vgpu/tests/wire_fixtures_reach_the_decoders.rs` |
-| Is a wire constant still declared twice? | the two greps below |
+| Is a wire family declared twice, or read by nobody? | `crates/reims-vgpu/tests/wire_families_have_a_consumer.rs` |
 | Does a doc comment name a symbol that no longer exists? | `cargo doc`'s intra-doc link pass |
 | Does a value travel as loose parameters when a type for it exists? | `scripts/scattered-struct` |
 | Is a validity rule written out at every site instead of beside its constant? | `scripts/scattered-bound` |
 | Does a decoded record fail a guard and vanish into a no-op catch-all? | `scripts/silent-arms` |
 | Does a constant crossing the C boundary have the test this file asks for? | `scripts/abi-pins` |
 
-```sh
-ls crates/reims-vgpu-wire/src/ops/*.rs | xargs -n1 basename | sed 's/.rs$//'
-grep -rh 'use reims_vgpu_wire' --include='*.rs' crates/reims-vgpu/src
-```
+Do **not** answer that one by diffing `ls src/ops/` against a `grep` for
+`use reims_vgpu_wire` — that pair used to live here and it is wrong by 40 % on
+this tree, because a family imported as `ops::{texture_view as w_view, ..}`
+never puts its own name after the token `ops::`. The test above parses the brace
+group, and refuses to report anything until it has proved it can see one.
 
 ```sh
 RUSTDOCFLAGS="-A rustdoc::private_intra_doc_links" cargo doc -p reims-vgpu \
