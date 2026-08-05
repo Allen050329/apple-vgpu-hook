@@ -12,7 +12,7 @@
 //!
 //! It was `metal_draw` until the composition was counted. The gated Vulkan half
 //! (`vulkan.rs`) is the largest file here by a factor of two, and the
-//! backend-independent halves — [`texture_view`], [`render_target`], and this
+//! backend-independent halves — `texture_view`, `render_target`, and this
 //! file's own bind materialization — run on both arms on every draw. Only
 //! `metal_icb` and `depth_stencil` are genuinely Metal-side, and both carry
 //! their own gates.

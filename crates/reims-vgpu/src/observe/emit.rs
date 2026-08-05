@@ -159,7 +159,10 @@ pub fn first_sight(reason: &'static str, discriminant: u64) -> bool {
 
 /// Every `(reason, discriminant)` [`first_sight`] has been asked about.
 ///
-/// A file-level static rather than a `fn`-local one so [`forget_all_latches`]
+// A code span below, not a link: `forget_all_latches` is `#[cfg(test)]`, and
+// rustdoc documents no `cfg(test)` item, so a link to it cannot resolve on any
+// arm and reads as rot in the intra-doc pass.
+/// A file-level static rather than a `fn`-local one so `forget_all_latches`
 /// can reach it. Nothing outside this module touches it directly.
 static SEEN: OnceLock<Mutex<HashSet<(&'static str, u64)>>> = OnceLock::new();
 

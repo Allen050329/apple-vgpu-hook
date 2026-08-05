@@ -386,7 +386,10 @@ impl FailCapture {
     /// The latches outlive individual tests — one process runs the whole suite —
     /// so without this a test's emitter can decide it has already said its line
     /// on behalf of a test that ran earlier and picked the same discriminant.
-    /// See [`super::emit::forget_all_latches`] for what that costs and why the
+    // A code span, not a link: `forget_all_latches` is `#[cfg(test)]` and
+    // rustdoc never documents a `cfg(test)` item, so a link to it cannot
+    // resolve on any arm and would read as rot in the intra-doc pass.
+    /// See `super::emit::forget_all_latches` for what that costs and why the
     /// clearing belongs here rather than at each fixture.
     pub(crate) fn start() -> Self {
         super::emit::forget_all_latches();
