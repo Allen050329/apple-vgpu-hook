@@ -328,13 +328,8 @@ pub unsafe extern "C" fn reims_vgpu_qemu_backend_name(buf: *mut c_char, buf_len:
             if buf.is_null() || buf_len == 0 {
                 return REIMS_VGPU_QEMU_ERR_ARGS;
             }
-            let name = backend_name().as_bytes();
-            let n = name.len().min(buf_len - 1);
-            // SAFETY: buf valid for buf_len.
-            unsafe {
-                std::ptr::copy_nonoverlapping(name.as_ptr(), buf as *mut u8, n);
-                *buf.add(n) = 0;
-            }
+            // SAFETY: the header requires `buf` valid for `buf_len` bytes.
+            unsafe { crate::qemu::cstr::write_c_str(buf, buf_len, backend_name()) };
             REIMS_VGPU_QEMU_OK
         },
         REIMS_VGPU_QEMU_ERR_PANIC,
