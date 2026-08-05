@@ -923,18 +923,10 @@ impl ResourcePools {
     /// per-draw submit+fence cost N-fold.
     pub(crate) fn batch_slot(
         &self,
-        identity: &TargetIdentity,
-        width: u32,
-        height: u32,
-        bgra: bool,
+        target: &BatchTarget,
     ) -> Option<(vk::CommandBuffer, vk::Fence)> {
         let b = self.open_batch.as_ref()?;
-        (b.draws < BATCH_MAX_DRAWS
-            && b.identity == *identity
-            && b.width == width
-            && b.height == height
-            && b.bgra == bgra)
-            .then_some((b.cb, b.fence))
+        (b.draws < BATCH_MAX_DRAWS && b.target == *target).then_some((b.cb, b.fence))
     }
 
     /// Record a batch-deferred draw's completion: open the batch on its ring
@@ -942,18 +934,11 @@ impl ResourcePools {
     /// descriptor set and sampled-cache admissions for the single flush-time
     /// seal. The CB stays in recording state; submit happens at
     /// [`Self::batch_flush`].
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "batch ownership tracks every Vulkan object and resident pin explicitly"
-    )]
     pub(crate) fn batch_append(
         &mut self,
         cb: vk::CommandBuffer,
         fence: vk::Fence,
-        identity: TargetIdentity,
-        width: u32,
-        height: u32,
-        bgra: bool,
+        target: BatchTarget,
         dset: Option<(vk::DescriptorSet, vk::DescriptorPool)>,
         sampled_retains: Vec<SampledRetain>,
         counters: &EngineCounters,
@@ -974,10 +959,7 @@ impl ResourcePools {
                 self.open_batch = Some(OpenBatch {
                     cb,
                     fence,
-                    identity,
-                    width,
-                    height,
-                    bgra,
+                    target,
                     draws: 1,
                     dsets: dset.into_iter().collect(),
                     sampled_retains,
@@ -2880,10 +2862,12 @@ mod recycle_tests {
         pools.open_batch = Some(OpenBatch {
             cb: vk::CommandBuffer::null(),
             fence: vk::Fence::null(),
-            identity: TargetIdentity::Anonymous { slot: 0 },
-            width: 16,
-            height: 16,
-            bgra: false,
+            target: BatchTarget {
+                identity: TargetIdentity::Anonymous { slot: 0 },
+                width: 16,
+                height: 16,
+                bgra: false,
+            },
             draws: 1,
             dsets: Vec::new(),
             sampled_retains: Vec::new(),

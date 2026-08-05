@@ -14,7 +14,7 @@ use super::counters::EngineCounters;
 use super::device_lost::{DeviceLostDecline, DeviceLostOp};
 use super::draw_execution::DrawExecutionDecline;
 use super::draw_validation::DrawValidationDecline;
-use super::pools::{BufferSlot, ResourcePools, SampledKey, SampledSlot, TargetKey};
+use super::pools::{BatchTarget, BufferSlot, ResourcePools, SampledKey, SampledSlot, TargetKey};
 use super::stage_phase;
 use super::types::{
     BufferContent, ColorWriteMask, DrawError, DrawOutput, DrawRequest, SampledSource,
@@ -1087,28 +1087,31 @@ pub(crate) unsafe fn execute_draw_inner(
             (SampledSource::Target(t), Some(own)) if t == own
         )
     });
+    // Built once and asked twice: the join test below and the append at the end
+    // of this function are the same four words, and a `BatchTarget` is how they
+    // stay the same four words.
+    let batch_target = req.target_identity.as_ref().map(|id| BatchTarget {
+        identity: id.clone(),
+        width: req.width,
+        height: req.height,
+        bgra: output_bgra,
+    });
     let joins = batch_eligible
         && req.load_from_target
         && req.target_rgba8.is_none()
         && req.seed_from_target.is_none()
         && !samples_own_target
-        && req
-            .target_identity
+        && batch_target
             .as_ref()
-            .and_then(|id| pools.batch_slot(id, req.width, req.height, output_bgra))
+            .and_then(|t| pools.batch_slot(t))
             .is_some();
     // Claim the next ring slot — BEFORE any pool acquire, so a recycled slot
     // can never alias a still-in-flight CB. Blocks (retire) only when every
     // slot is still in flight; the wait lands in retire_wait_us. A batch
     // joiner reuses the open batch's slot instead (its CB is still recording).
     let (cb, fence) = if joins {
-        let id = req
-            .target_identity
-            .as_ref()
-            .expect("joins requires identity");
-        pools
-            .batch_slot(id, req.width, req.height, output_bgra)
-            .expect("joins checked batch_slot")
+        let target = batch_target.as_ref().expect("joins requires identity");
+        pools.batch_slot(target).expect("joins checked batch_slot")
     } else {
         // A fresh command buffer, so the guest-window imports the previous one
         // pinned against eviction may be displaced again. A *joiner*
@@ -2688,17 +2691,11 @@ pub(crate) unsafe fn execute_draw_inner(
     // tracked layouts describe what the recorded CB produces, and every
     // consumer path flushes the batch before touching the GPU.
     if defer_submit {
-        let identity = req
-            .target_identity
-            .clone()
-            .expect("batch_eligible requires target identity");
+        let target = batch_target.expect("batch_eligible requires target identity");
         pools.batch_append(
             cb,
             fence,
-            identity,
-            req.width,
-            req.height,
-            output_bgra,
+            target,
             dset.zip(dset_pool),
             sampled_retains,
             counters,

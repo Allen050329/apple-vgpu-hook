@@ -332,13 +332,30 @@ pub(crate) struct ResourcePools {
 /// opener's ring slot CB stays in recording state across joinable same-target
 /// draws; per-draw descriptor sets and sampled-cache admissions accumulate
 /// here and seal as ONE entry at flush.
+/// What a deferred-submit batch is a batch *of*.
+///
+/// One value rather than four parameters, because these four decide two
+/// different things in two places — whether a draw may join the open batch
+/// (`batch_slot`) and what the batch records when one opens (`batch_append`) —
+/// and they were spelled out at both. Two of them are adjacent `u32`s, so a
+/// `width`/`height` transposition between the question and the answer compiles
+/// and produces a batch that admits draws of the wrong shape.
+///
+/// Derived `PartialEq` is the join test, so the fields it turns on cannot drift
+/// from the fields the batch carries: adding one here makes it decide joins
+/// without a second edit.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct BatchTarget {
+    pub identity: TargetIdentity,
+    pub width: u32,
+    pub height: u32,
+    pub bgra: bool,
+}
+
 pub(crate) struct OpenBatch {
     cb: vk::CommandBuffer,
     fence: vk::Fence,
-    identity: TargetIdentity,
-    width: u32,
-    height: u32,
-    bgra: bool,
+    target: BatchTarget,
     draws: u64,
     /// Per-draw descriptor sets paired with the arena block they were allocated
     /// from, so the flush-time free routes each set to its owning pool.
