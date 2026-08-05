@@ -97,6 +97,10 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
     // (last of a serialized chain, or unified always-writeback).
     if writeback_guest {
         for (i, c) in colors.iter().enumerate() {
+            // Reports an out-of-contract value; the gate below is unchanged, and
+            // it is the site that disagrees with this module's writeback loop
+            // about what such a value means. See `super::store_action_in_contract`.
+            let _ = super::store_action_in_contract(req.pipeline_ref, c.store_action);
             if c.store_action != PASS_STORE_ACTION_STORE {
                 continue;
             }

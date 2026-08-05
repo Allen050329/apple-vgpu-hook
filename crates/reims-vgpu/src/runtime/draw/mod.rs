@@ -1672,7 +1672,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
         depth_attach_api = Some(ReimsVgpuDepthAttachment {
             pixel_format: REIMS_VGPU_MTL_PIXEL_FORMAT_DEPTH32_FLOAT,
             load_action: map_load_action(req.pipeline_ref, da.load_action),
-            store_action: map_store_action(da.store_action),
+            store_action: map_store_action(req.pipeline_ref, da.store_action),
             clear_depth: da.clear_depth,
             data: seeded.data.as_mut_ptr(),
             len: seeded.data.len(),
@@ -1695,7 +1695,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
         stencil_attach_api = Some(ReimsVgpuStencilAttachment {
             pixel_format: REIMS_VGPU_MTL_PIXEL_FORMAT_STENCIL8,
             load_action: map_load_action(req.pipeline_ref, sa.load_action),
-            store_action: map_store_action(sa.store_action),
+            store_action: map_store_action(req.pipeline_ref, sa.store_action),
             clear_stencil: sa.clear_stencil,
             data: seeded.data.as_mut_ptr(),
             len: seeded.data.len(),
@@ -2188,20 +2188,6 @@ pub fn load_composite_premult_one_omsa(draw_rgba: &[u8], seed_rgba: &[u8]) -> (V
     (out, blended)
 }
 
-/// Decoded `MTLLoadAction` → the Metal C ABI value.
-///
-/// `MTLLoadAction` has exactly three values, so all three are spelled out and
-/// there is no catch-all. There used to be one, `_ => DONT_CARE`, and it was
-/// the most destructive default available: DONT_CARE tells Metal the previous
-/// attachment contents may be discarded, so a decode that read the wrong offset
-/// produced a *discarded framebuffer* and no log line at all. An unrecognised
-/// value now says so once per `(pipeline, slug)`.
-///
-/// The fallback stays DONT_CARE rather than becoming LOAD or CLEAR. Out of
-/// contract means this crate misread the field, not that the guest asked for
-/// something exotic — every alternative is equally a guess, and inventing
-/// semantics for an unknown wire value is what the ground rules forbid. What
-/// changes is that the guess is now visible.
 /// Whether a decoded load action is one of the three `MTLLoadAction` values,
 /// reporting the one case where it is not.
 ///
@@ -2227,6 +2213,63 @@ pub(crate) fn load_action_in_contract(pipeline_ref: u32, load_action: u16) -> bo
     false
 }
 
+/// Whether a decoded store action is one of the two `MTLStoreAction` values
+/// this device implements, reporting the one case where it is not.
+///
+/// The sibling of [`load_action_in_contract`], and it was missing while that one
+/// existed — the two fields are decoded from adjacent words of the same
+/// attachment prefix, so a decode that misreads one misreads the other, and only
+/// half of that was visible.
+///
+/// A third value discards the attachment's result. `MTLStoreAction` really does
+/// have more than two (`MultisampleResolve` and friends), so unlike the load
+/// case an out-of-contract value here is not necessarily our misread — it can be
+/// a guest asking for something this device does not implement. Either way the
+/// frame the guest drew is dropped, which is exactly the loss the ground rules
+/// say must not be silent. Nothing about the decision changes: every caller
+/// already treats not-STORE as no-store, and picking a different answer needs a
+/// boot on the arm that would show it.
+///
+/// # The two consumers do not agree, and that is not settled here
+///
+/// `draw::vulkan`'s store gate asks `!= STORE`, so an out-of-contract value
+/// stores nothing. The writeback loop in this module asks `== DONT_CARE`, so the
+/// same value falls through and *does* store. One wire word, two opposite
+/// answers, and neither site said so. Left as it is on purpose — changing either
+/// is a behaviour change on a pathway this host cannot boot, and the first thing
+/// needed is a reading of whether a guest ever sends one.
+#[cfg(any(
+    feature = "backend-vulkan",
+    all(feature = "backend-metal", target_os = "macos")
+))]
+pub(crate) fn store_action_in_contract(pipeline_ref: u32, store_action: u16) -> bool {
+    if store_action <= PASS_STORE_ACTION_STORE {
+        return true;
+    }
+    if degrade_log_first(pipeline_ref, "store_action_unmapped") {
+        crate::observe::fail(format!(
+            "pass_state_degraded reason=store_action_unmapped \
+             pipe={pipeline_ref} store_action={store_action} \
+             (not one of MTLStoreAction 0/1; attachment result may be dropped)"
+        ));
+    }
+    false
+}
+
+/// Decoded `MTLLoadAction` → the Metal C ABI value.
+///
+/// `MTLLoadAction` has exactly three values, so all three are spelled out and
+/// there is no catch-all. There used to be one, `_ => DONT_CARE`, and it was
+/// the most destructive default available: DONT_CARE tells Metal the previous
+/// attachment contents may be discarded, so a decode that read the wrong offset
+/// produced a *discarded framebuffer* and no log line at all. An unrecognised
+/// value now says so once per `(pipeline, slug)`.
+///
+/// The fallback stays DONT_CARE rather than becoming LOAD or CLEAR. Out of
+/// contract means this crate misread the field, not that the guest asked for
+/// something exotic — every alternative is equally a guess, and inventing
+/// semantics for an unknown wire value is what the ground rules forbid. What
+/// changes is that the guess is now visible.
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn map_load_action(pipeline_ref: u32, a: u16) -> u32 {
     use crate::backend::metal::abi::{
@@ -2244,10 +2287,13 @@ fn map_load_action(pipeline_ref: u32, a: u16) -> u32 {
 }
 
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-fn map_store_action(a: u16) -> u32 {
+fn map_store_action(pipeline_ref: u32, a: u16) -> u32 {
     use crate::backend::metal::abi::{
         REIMS_VGPU_MTL_STORE_ACTION_DONT_CARE, REIMS_VGPU_MTL_STORE_ACTION_STORE,
     };
+    // Reports and returns; the answer for an out-of-contract value is the same
+    // DontCare it always was.
+    let _ = store_action_in_contract(pipeline_ref, a);
     if a == PASS_STORE_ACTION_STORE {
         REIMS_VGPU_MTL_STORE_ACTION_STORE
     } else {
@@ -4323,6 +4369,51 @@ mod load_action_contract_tests {
             .expect("an out-of-contract load action must name itself");
         assert!(
             line.starts_with("pass_state_degraded ") && line.contains("load_action=65535"),
+            "the line must carry the value that was refused: {line}"
+        );
+    }
+}
+
+#[cfg(all(test, feature = "backend-vulkan"))]
+mod store_action_contract_tests {
+    use super::store_action_in_contract;
+    use crate::runtime::decode::render::{PASS_STORE_ACTION_DONT_CARE, PASS_STORE_ACTION_STORE};
+
+    /// The sibling of `a_load_action_outside_mtlloadaction_is_named_not_swallowed`,
+    /// and it did not exist while that one did.
+    ///
+    /// The two fields are adjacent words of one attachment prefix, so a decode
+    /// that misreads the load action misreads the store action too — and only
+    /// the load half said anything. An out-of-contract store action drops the
+    /// frame the guest drew, which is the loss the ground rules say must be
+    /// visible.
+    #[test]
+    fn a_store_action_outside_mtlstoreaction_is_named_not_swallowed() {
+        for (name, action) in [
+            ("DontCare", PASS_STORE_ACTION_DONT_CARE),
+            ("Store", PASS_STORE_ACTION_STORE),
+        ] {
+            assert!(
+                store_action_in_contract(0x570E, action),
+                "MTLStoreAction{name} is in contract"
+            );
+        }
+        // Distinct pipeline refs, because the emitter latches per
+        // (pipeline, slug) and a second call on one ref would report nothing.
+        assert!(!store_action_in_contract(
+            0xF101,
+            PASS_STORE_ACTION_STORE + 1
+        ));
+        assert!(!store_action_in_contract(0xF102, u16::MAX));
+
+        let log = std::fs::read_to_string(crate::observe::fail_log_path()).expect("fail log");
+        let line = log
+            .lines()
+            .rev()
+            .find(|l| l.contains("reason=store_action_unmapped") && l.contains("pipe=61698"))
+            .expect("an out-of-contract store action must name itself");
+        assert!(
+            line.starts_with("pass_state_degraded ") && line.contains("store_action=65535"),
             "the line must carry the value that was refused: {line}"
         );
     }
