@@ -22,7 +22,7 @@ const MTL_STEP_THREAD_POS_IN_GRID_Y: u32 = 6;
 const MTL_STEP_THREAD_POS_IN_GRID_X_INDEXED: u32 = 7;
 const MTL_STEP_THREAD_POS_IN_GRID_Y_INDEXED: u32 = 8;
 
-pub fn step_supported(step_function: u32) -> bool {
+pub const fn step_supported(step_function: u32) -> bool {
     matches!(
         step_function,
         MTL_STEP_THREAD_POS_IN_GRID_X
@@ -32,12 +32,49 @@ pub fn step_supported(step_function: u32) -> bool {
     )
 }
 
-pub fn step_indexed(step_function: u32) -> bool {
+pub const fn step_indexed(step_function: u32) -> bool {
     matches!(
         step_function,
         MTL_STEP_THREAD_POS_IN_GRID_X_INDEXED | MTL_STEP_THREAD_POS_IN_GRID_Y_INDEXED
     )
 }
+
+// The two lists of `MTLStepFunction` in this crate, related.
+//
+// `make_compute_stage_input_descriptor` runs `step_supported` and then converts
+// through [`mtl_enum::step_function`], and it carries a distinct refusal
+// (`metal_stage_input_step_function_unconvertible`) for the case where the first
+// admits an ordinal the second cannot convert — a divergence between two lists
+// of one enum rather than a guest sending something unsupported. That refusal is
+// a healthy-zero alarm and stays, because the conversion returns an `Option` and
+// something must handle `None`. But the property it watches for does not need a
+// boot to observe: both functions are `const`, so the implication is decidable
+// here, on every arm that compiles the file.
+//
+// The four ordinals above are Apple's, read off `MTLStageInputOutputDescriptor.h`
+// because `metal` 0.33's names for them are wrong. Nothing else in the tree
+// relates them to `STEP_FUNCTION_BY_ORDINAL`, which is indexed by those same
+// Apple numbers — so an edit to that table's length or contents could move the
+// convertible set out from under this one silently.
+//
+// Swept past the top of the enum rather than over the four: the implication is
+// what is being pinned, and a fifth ordinal added to `step_supported` without a
+// table entry is exactly the mistake it exists to catch.
+const _: () = {
+    let mut ordinal = 0u32;
+    while ordinal <= 64 {
+        assert!(
+            !step_supported(ordinal) || mtl_enum::step_function(ordinal).is_some(),
+            "step_supported admits a step function mtl_enum cannot convert",
+        );
+        assert!(
+            !step_indexed(ordinal) || step_supported(ordinal),
+            "an indexed step function must be a supported one",
+        );
+        ordinal += 1;
+    }
+    assert!(!step_supported(u32::MAX));
+};
 
 pub fn has_indexed_layout(stage_input: Option<&ReimsVgpuComputeStageInputDescriptor>) -> bool {
     let Some(stage_input) = stage_input else {
