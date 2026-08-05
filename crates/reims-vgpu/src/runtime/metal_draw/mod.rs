@@ -3407,13 +3407,28 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
         }) = lookup_render_target(state, host, task_id, att.texture_ref)
         else {
             // One unresolvable color attachment drops the whole pass (Metal
-            // would not form the encoder with a null RT). Fail-visible detail
-            // (type-8 view/base, type-11 geom, linear GVA) for residual slots.
-            crate::observe::fail(format!(
-                "mrt color RT resolve fail task={task_id} pipe={pipeline_ref} slot={slot} ref={} {}",
-                att.texture_ref,
-                sample_miss_detail(state, host, task_id, att.texture_ref)
-            ));
+            // would not form the encoder with a null RT).
+            //
+            // The *reason* is deliberately not restated here. This used to call
+            // `sample_miss_detail`, which walks the object list a second time
+            // and guesses at why the resolve failed — a second implementation
+            // of a question `lookup_render_target` had just answered, in the
+            // *sampled*-texture vocabulary (`reason=ref_texture_view`,
+            // `reason=type11_resolve`), attached to a render-target failure. It
+            // could disagree with the resolve it was explaining and nothing
+            // compared them. The resolve now emits its own typed refusal naming
+            // the check that refused, on the line immediately above this one.
+            //
+            // Nor is a third line spent on the loss itself. Both callers
+            // already report this `None` with a reason of their own —
+            // `render_icb fail reason=mrt_request` and `metal_draw mrt_request
+            // fail … slots=[…]`, the latter listing every attachment ref in the
+            // pass — so between them and the `rt_resolve` line above, the check,
+            // the ref and the pass are all named. What none of them carried is
+            // *magnitude*: both caller lines are undeduped, and neither
+            // separates "a slot would not resolve" from the other ways this
+            // builder returns nothing. That is a counter's job.
+            crate::runtime::drain::note_store_route("mrt_slot_unresolved");
             return None;
         };
         if base_w == 0 {

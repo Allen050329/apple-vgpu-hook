@@ -4556,6 +4556,44 @@ fn type11_sample_resolves_geometry_before_reading_it() {
     );
 }
 
+/// A pass dropped because one of its colour slots would not resolve is
+/// counted, and counted per occurrence.
+///
+/// This builder used to spend a fail line here carrying a reason re-derived by
+/// `sample_miss_detail` — a second walk of the object list, in the sampled
+/// vocabulary, guessing at what `lookup_render_target` had just decided. Both
+/// callers already report the `None` with a reason, and the resolve now reports
+/// the check, so the line went and the counter stayed: it is the only thing
+/// that separates "a slot would not resolve" from the other ways this builder
+/// returns nothing, and the only one of the three that carries magnitude, since
+/// both caller lines are per-occurrence but neither is per-slot.
+#[test]
+fn a_pass_dropped_for_an_unresolvable_colour_slot_is_counted_every_time() {
+    use crate::runtime::drain::store_route_count;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+    let before = store_route_count("mrt_slot_unresolved");
+
+    // An unbound slot is not this: it is skipped, and a pass of nothing but
+    // unbound slots resolves to a request with no colours rather than a loss.
+    assert!(single_rt_draw_request(&mut state, &mut host, 7, clear_black_attachment(0)).is_none());
+    assert_eq!(
+        store_route_count("mrt_slot_unresolved"),
+        before,
+        "an unbound colour slot is not an unresolvable one"
+    );
+
+    // A bound ref with nothing under it drops the whole pass, every time.
+    for _ in 0..3 {
+        assert!(
+            single_rt_draw_request(&mut state, &mut host, 7, clear_black_attachment(0x5d1))
+                .is_none()
+        );
+    }
+    assert_eq!(store_route_count("mrt_slot_unresolved"), before + 3);
+}
+
 /// The degradation dedupe is keyed by `(pipeline_ref, slug)`, and both encode
 /// arms depend on that being true.
 ///
