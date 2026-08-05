@@ -243,6 +243,28 @@ fail-visible. And a dma-buf **pins** the pages it names — they stop being swap
 so every cache holding one is bounded by *pinned bytes*, not by entry count. `runtime/guest_dmabuf.rs`
 carries that bound and its basis.
 
+**Neither extension is ever required.** A host that lacks them creates a device that asks for
+neither and runs every guest-memory rail through the copying path, so the copying rails are not a
+legacy arm — they are the only arm on most hosts and must keep working. Both halves are gated:
+the import site on `HostGpuCaps::dma_buf_import`, and the export in `runtime/guest_dmabuf.rs` on the
+rung `caps::external_memory` publishes, because exporting first and declining after pins guest pages
+for nothing.
+
+### Environment overrides
+
+Every variable the crate reads is named in `crates/reims-vgpu/src/env.rs`, which also owns the parse.
+Read a variable through it or the second spelling of "off" is a divergence nothing can find.
+
+**An override may only narrow what the device does; it may never widen it.** A switch can turn off a
+rail the host could have run. It can never turn on one the host reported it cannot: capability is
+measured from the device, and binding an extension a host does not advertise fails `vkCreateDevice`
+while importing a handle type it declines is undefined behavior inside the driver. Add a switch as a
+new refusal reason, never as a new permission.
+
+`REIMS_VGPU_DMABUF=off` is the one that matters for verification: it takes a capable host down to the
+`disabled_by_env` rung, which is how the copying rails get exercised without hunting for hardware
+that lacks the extension.
+
 ## Verification
 
 Pick the pathway your change affects.
@@ -251,6 +273,15 @@ Pick the pathway your change affects.
   `scripts/screenshot-when-macos-host/screenshot-when-macos-host.sh /tmp/screen.png`
 - x86: `vm/boot-x86.sh --device reims-vgpu-pci --testing`, then
   `scripts/screenshot-when-kde-plasma-host/screenshot-when-kde-plasma-host.sh -o /tmp/screen.png`
+
+### A boot on a capable host does not exercise the copying rails
+
+Where the import works, every guest window takes it, and the copying rails run zero times — so a
+green boot says nothing about them, and they are the only rails on a host without the extension. A
+change touching guest-memory upload, writeback or bind needs the boot a second time with
+`REIMS_VGPU_DMABUF=off`. Confirm it took: `vk_caps` reports `dma_buf_import=disabled_by_env`, and
+`guest_dmabuf_export off reason=backend_cannot_import` appears once. `guest_dmabuf_*` counters
+should then read zero — a non-zero one means an export ran past a closed gate.
 
 ### An undriven boot measures an idle device
 
