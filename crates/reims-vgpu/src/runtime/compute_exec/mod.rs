@@ -684,25 +684,6 @@ pub(crate) fn load_compute_pipeline<M: HostMemory + HostOps>(
     }
 }
 
-/// Resolve a type-1 buffer GVA base + size for task-local reads.
-fn buffer_gva_size<M: HostMemory + HostOps>(
-    state: &DeviceState,
-    host: &M,
-    task_id: u32,
-    buffer_ref: u32,
-) -> Option<(u64, u64)> {
-    if buffer_ref == 0 {
-        return None;
-    }
-    let (_entry, desc_bytes) =
-        objects::resolve_descriptor(state, host, task_id, buffer_ref, &[OBJECT_TYPE_BUFFER])
-            .ok()?;
-    let desc = crate::runtime::decode::resource::decode_buffer_descriptor(&desc_bytes).ok()?;
-    // Product x86 page_shift=12; arm64e=14. Never use arm-only RESOURCE_PAGE_SHIFT
-    // default on the live path (compute GuestIo Unmapped class serial-234118).
-    desc.backing_gva_size(state.page_shift)
-}
-
 /// Read `len` bytes from a type-1 buffer at `offset` (product + session helpers).
 pub(crate) fn read_buffer_window<M: HostMemory + HostOps>(
     state: &DeviceState,
@@ -712,8 +693,30 @@ pub(crate) fn read_buffer_window<M: HostMemory + HostOps>(
     offset: u64,
     len: usize,
 ) -> Result<Vec<u8>, ComputeStatus> {
-    let (base, size) = buffer_gva_size(state, host, task_id, buffer_ref)
-        .ok_or(ComputeStatus::MissingBuffer("compute_buf_win_no_backing"))?;
+    // `ref == 0` is the crate-wide unbound sentinel, not object-list index 0 —
+    // every sibling loader guards it and `objects::resolve_descriptor`'s doc says
+    // so. Kept as its own refusal rather than folded into the rungs: "the guest
+    // bound no buffer" and "the guest named a buffer that is not there" are
+    // different statements, and only the second is a resolution failure.
+    if buffer_ref == 0 {
+        return Err(ComputeStatus::MissingBuffer("compute_buf_win_ref_unbound"));
+    }
+    // Every other refusal gets its own name too. This used to call a local
+    // `Option`-returning helper and label all four `compute_buf_win_no_backing` —
+    // the *last* of the four, and so wrong about a ref that names nothing, a ref
+    // holding some other object, and a descriptor that would not read or decode.
+    let (base, size) =
+        objects::resolve_buffer_span(state, host, task_id, buffer_ref).map_err(|refusal| {
+            ComputeStatus::MissingBuffer(match refusal {
+                objects::BufferSpanRefusal::Rung(rung) => {
+                    crate::observe::ladder_slugs!("compute_buf_win")(rung)
+                }
+                objects::BufferSpanRefusal::Decode => {
+                    crate::observe::ladder_slug!("compute_buf_win", desc_decode)
+                }
+                objects::BufferSpanRefusal::NoBacking => "compute_buf_win_no_backing",
+            })
+        })?;
     if offset
         .checked_add(len as u64)
         .map(|e| e > size)

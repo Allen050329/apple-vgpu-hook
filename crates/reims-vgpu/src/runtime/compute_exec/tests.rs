@@ -610,8 +610,14 @@ fn a_compute_refusal_names_its_check_and_ok_names_nothing() {
 }
 
 /// Two different buffer-staging checks, two different slugs — the property
-/// that a shared `MissingBuffer` could not express. `ref=0` never resolves,
-/// so both paths refuse on their first gate.
+/// that a shared `MissingBuffer` could not express.
+///
+/// The window path's assertion used to read `compute_buf_win_no_backing`, and
+/// this comment used to say `ref=0` made "both paths refuse on their first
+/// gate". Only one of them did. `no_backing` is the *last* of that path's four
+/// refusals and was returned for all four, so the slug named the fourth gate for
+/// a record that never reached the first — and this test asserted that as the
+/// intended behaviour. Each refusal now answers under its own name.
 #[test]
 fn the_buffer_paths_refuse_under_their_own_names() {
     use crate::observe::Refusal;
@@ -621,10 +627,23 @@ fn the_buffer_paths_refuse_under_their_own_names() {
     gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
     assert!(state.set_object_list(1, 0, 32));
 
+    // `ref=0` is the unbound sentinel, and the window path now says that rather
+    // than reporting the outcome of a resolution it never attempted.
     let window = read_buffer_window(&state, &host, 1, 0, 0, 4);
     assert_eq!(
         window.err().and_then(|e| e.refusal()),
-        Some("compute_buf_win_no_backing")
+        Some("compute_buf_win_ref_unbound")
+    );
+
+    // A bound-looking ref naming an empty list slot refuses on the first rung,
+    // under this rail's own role — distinct from both of the above.
+    let unresolvable = read_buffer_window(&state, &host, 1, 7, 0, 4);
+    assert_eq!(
+        unresolvable.err().and_then(|e| e.refusal()),
+        Some(crate::observe::ladder_slug!(
+            "compute_buf_win",
+            no_list_entry
+        ))
     );
 
     let bind = ComputeBufferBind {

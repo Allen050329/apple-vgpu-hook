@@ -1574,10 +1574,9 @@ fn type1_buffer_gva_size<M: HostMemory + HostOps>(
     task_id: u32,
     buffer_ref: u32,
 ) -> Result<(u64, u64), IcbStatus> {
-    use crate::runtime::decode::resource::{decode_buffer_descriptor, OBJECT_TYPE_BUFFER};
-    let (_entry, desc_bytes) =
-        objects::resolve_descriptor(state, host, task_id, buffer_ref, &[OBJECT_TYPE_BUFFER])
-            .map_err(|rung| {
+    objects::resolve_buffer_span(state, host, task_id, buffer_ref).map_err(
+        |refusal| match refusal {
+            objects::BufferSpanRefusal::Rung(rung) => {
                 let slug = crate::observe::ladder_slugs!("icb_type1")(rung);
                 match rung {
                     objects::LadderRung::NoListEntry | objects::LadderRung::DescRead { .. } => {
@@ -1585,12 +1584,13 @@ fn type1_buffer_gva_size<M: HostMemory + HostOps>(
                     }
                     objects::LadderRung::WrongType { .. } => IcbStatus::BadDescriptor(slug),
                 }
-            })?;
-    let desc = decode_buffer_descriptor(&desc_bytes).map_err(|_| {
-        IcbStatus::BadDescriptor(crate::observe::ladder_slug!("icb_type1", desc_decode))
-    })?;
-    desc.backing_gva_size(state.page_shift)
-        .ok_or(IcbStatus::Missing("icb_type1_no_backing"))
+            }
+            objects::BufferSpanRefusal::Decode => {
+                IcbStatus::BadDescriptor(crate::observe::ladder_slug!("icb_type1", desc_decode))
+            }
+            objects::BufferSpanRefusal::NoBacking => IcbStatus::Missing("icb_type1_no_backing"),
+        },
+    )
 }
 
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]

@@ -959,6 +959,60 @@ pub fn resolve_descriptor<M: HostMemory>(
     Ok((entry, bytes))
 }
 
+/// Why a type-1 buffer ref did not yield a backing span.
+///
+/// The three ways past [`resolve_descriptor`]'s rungs, which is the whole of
+/// what [`resolve_buffer_span`] can refuse for.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BufferSpanRefusal {
+    /// One of the first three object-list rungs.
+    Rung(LadderRung),
+    /// The descriptor bytes read, and are not a buffer descriptor.
+    Decode,
+    /// The descriptor decoded and names no backing allocation — a zero handle
+    /// or a zero size. The resource exists; it has nowhere to read from.
+    NoBacking,
+}
+
+/// Resolve a type-1 buffer ref to its `(guest base address, allocation size)`.
+///
+/// Two rails needed this and each wrote it out: `compute_exec`'s buffer-window
+/// read and `icb`'s type-1 bind. They agreed on the four steps — resolve as
+/// `OBJECT_TYPE_BUFFER`, decode, derive the span from the handle and the
+/// device's own `page_shift` — and disagreed on what to say afterwards. The ICB
+/// copy named all four refusals; the compute copy returned `Option` and its
+/// caller labelled every one of them `no_backing`, which is the *last* of the
+/// four and therefore wrong about the other three.
+///
+/// So the refusal is returned as a value and each rail maps it into its own
+/// status vocabulary, rather than one rail's answer being the other's guess.
+///
+/// `page_shift` comes from the device (x86 12, arm64e 14) and never from the
+/// resource decoder's arm-only default; the two place the handle differently.
+///
+/// `buffer_ref == 0` is not handled here, for the reason [`resolve_descriptor`]
+/// gives: an unbound ref is a different statement from a ref naming nothing, and
+/// callers that care test it first.
+pub fn resolve_buffer_span<M: HostMemory>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    buffer_ref: u32,
+) -> Result<(u64, u64), BufferSpanRefusal> {
+    let (_entry, desc_bytes) = resolve_descriptor(
+        state,
+        host,
+        task_id,
+        buffer_ref,
+        &[crate::runtime::decode::resource::OBJECT_TYPE_BUFFER],
+    )
+    .map_err(BufferSpanRefusal::Rung)?;
+    let desc = crate::runtime::decode::resource::decode_buffer_descriptor(&desc_bytes)
+        .map_err(|_| BufferSpanRefusal::Decode)?;
+    desc.backing_gva_size(state.page_shift)
+        .ok_or(BufferSpanRefusal::NoBacking)
+}
+
 /// Resolve object ref and, if type-11, latch mapping geometry + cache the entry.
 ///
 /// Returns the mapping_id for type-11 textures, or None.
