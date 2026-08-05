@@ -1377,17 +1377,16 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
     }
 
     // Linear / view path returns only RGBA; the geometry comes from the decoded
-    // texture descriptor and from nowhere else. A payload shorter than the
-    // descriptor's own `width * height * 4` is not a geometry this call may
-    // invent one for: the caller turns `None` into a typed
-    // `DrawPreparationDecline::TextureResolveMissing`, which names the ref and
-    // the stage.
+    // texture descriptor and from nowhere else. Neither a payload shorter than
+    // the descriptor's own `width * height * 4` nor a descriptor naming no
+    // extent at all is a geometry this call may invent one for: the caller turns
+    // `None` into a typed `DrawPreparationDecline::TextureResolveMissing`, which
+    // names the ref and the stage. `TextureDescriptor::extent` owns the second
+    // check and says what clamping the two fields up would have bound instead.
     let mut rgba = load_sampled_rgba_static(state, host, task_id, texture_ref)?;
     let entry = objects::lookup_list_entry(state, host, task_id, texture_ref)?;
     let desc = objects::read_descriptor(state, host, task_id, &entry)?;
-    let td = decode_texture_descriptor(&desc).ok()?;
-    let w = td.width.max(1);
-    let h = td.height.max(1);
+    let (w, h) = decode_texture_descriptor(&desc).ok()?.extent()?;
     let need = (w as usize).saturating_mul(h as usize).saturating_mul(4);
     if rgba.len() < need {
         return None;

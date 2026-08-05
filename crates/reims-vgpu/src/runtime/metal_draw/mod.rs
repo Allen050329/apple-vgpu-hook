@@ -2163,13 +2163,7 @@ fn load_linear_raw<M: HostMemory + HostOps>(
         Ok(t) => t,
         Err(_) => return false,
     };
-    if !tex.has_width
-        || !tex.has_height
-        || !tex.has_row_stride
-        || tex.width != width
-        || tex.height != height
-        || tex.row_stride < row_bytes
-    {
+    if tex.extent() != Some((width, height)) || !tex.has_row_stride || tex.row_stride < row_bytes {
         return false;
     }
     let (gva, alloc) = match tex.backing_gva_size(state.page_shift) {
@@ -3663,7 +3657,7 @@ fn lookup_render_target<M: HostMemory + HostOps>(
     }
     let desc_bytes = objects::read_descriptor(state, host, task_id, &entry)?;
     let tex = decode_texture_descriptor(&desc_bytes).ok()?;
-    if !tex.has_pixel_format || !tex.has_width || !tex.has_height || !tex.has_row_stride {
+    if !tex.has_pixel_format || tex.extent().is_none() || !tex.has_row_stride {
         return None;
     }
     let base_fmt = tex.pixel_format;

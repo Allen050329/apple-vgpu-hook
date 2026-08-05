@@ -380,14 +380,33 @@ pub struct TextureDescriptor {
     pub depth: u32,
     pub pixel_format: u16,
     pub has_row_stride: bool,
-    pub has_width: bool,
-    pub has_height: bool,
     pub has_pixel_format: bool,
     /// Per-mip layouts (index 0 = L0). Empty if geometry incomplete.
     pub levels: Vec<TextureLevelLayout>,
 }
 
 impl TextureDescriptor {
+    /// The extent this descriptor names, or `None` when it names none.
+    ///
+    /// The decoder reads each geometry field only if the record is long enough
+    /// to carry it, so a short record and a record of zeroes both arrive here as
+    /// zero. Neither is a texture, and neither is a 1x1 one: a caller that
+    /// clamps the two fields up sizes a four-byte payload, finds any buffer long
+    /// enough, and binds a single texel of whatever the read returned — which is
+    /// indistinguishable from a real bind at every layer above.
+    ///
+    /// This replaced a `has_width` and a `has_height` field, each set to
+    /// `field != 0` beside the field it described and each read as a zero check
+    /// by three call sites. Storing a predicate next to its own input lets the
+    /// two disagree; there is nothing here for a future decode arm to forget to
+    /// set. Callers wanting only the handle or the format read those directly.
+    pub fn extent(&self) -> Option<(u32, u32)> {
+        if self.width == 0 || self.height == 0 {
+            return None;
+        }
+        Some((self.width, self.height))
+    }
+
     /// Allocation base GVA (`handle << page_shift`), not including data_offset.
     /// `page_shift` must be chosen explicitly (12 or 14).
     pub fn allocation_base_gva(&self, page_shift: u32) -> Option<u64> {
@@ -712,9 +731,11 @@ pub const TEXTURE_VIEW_OPCODE_SWIZZLE: u32 = w_view::OPCODE_TEXTURE_VIEW_SWIZZLE
 pub const HEAP_TEXTURE_OPCODE: u32 = w_heap::OPCODE_NEW_HEAP_TEXTURE;
 pub const HEAP_TEXTURE_LEN: usize = w_heap::NEW_HEAP_TEXTURE_TOTAL_LEN as usize;
 #[cfg(test)]
-pub(crate) const HEAP_TEXTURE_HEAP_REF: usize = OP_HDR + offset_of!(w_heap::NewHeapTextureBody, heap_ref);
+pub(crate) const HEAP_TEXTURE_HEAP_REF: usize =
+    OP_HDR + offset_of!(w_heap::NewHeapTextureBody, heap_ref);
 #[cfg(test)]
-pub(crate) const HEAP_TEXTURE_DESCRIPTOR: usize = OP_HDR + offset_of!(w_heap::NewHeapTextureBody, desc);
+pub(crate) const HEAP_TEXTURE_DESCRIPTOR: usize =
+    OP_HDR + offset_of!(w_heap::NewHeapTextureBody, desc);
 pub const HEAP_TEXTURE_USE_OFFSET: usize =
     OP_HDR + offset_of!(w_heap::NewHeapTextureBody, use_offset_bits);
 pub const HEAP_TEXTURE_OFFSET: usize = OP_HDR + offset_of!(w_heap::NewHeapTextureBody, offset);
@@ -734,8 +755,7 @@ const HEAP_TEXTURE_WIDE_DESCRIPTOR: usize =
 const HEAP_TEXTURE_WIDE_USE_OFFSET: usize =
     OP_HDR + offset_of!(w_heap::NewHeapTextureWideBody, use_offset_bits);
 #[cfg(test)]
-const HEAP_TEXTURE_WIDE_OFFSET: usize =
-    OP_HDR + offset_of!(w_heap::NewHeapTextureWideBody, offset);
+const HEAP_TEXTURE_WIDE_OFFSET: usize = OP_HDR + offset_of!(w_heap::NewHeapTextureWideBody, offset);
 
 // Opcode 9 is NOT a view: it is a buffer-backed texture (`newTextureWithBuffer:
 // descriptor:offset:bytesPerRow:`) serialized by `-[PGSerializer newTextureWith
@@ -745,8 +765,7 @@ const HEAP_TEXTURE_WIDE_OFFSET: usize =
 // and the body is {u64 offset, u64 bytesPerRow, embedded MTLTextureDescriptor}.
 pub const TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE: u32 = w_backed::OPCODE_BUFFER_TEXTURE;
 #[cfg(test)]
-const BUF_TEX_DESC_BUFFER_REF: usize =
-    OP_HDR + offset_of!(w_backed::BufferTextureBody, buffer_ref);
+const BUF_TEX_DESC_BUFFER_REF: usize = OP_HDR + offset_of!(w_backed::BufferTextureBody, buffer_ref);
 #[cfg(test)]
 const BUF_TEX_DESC_OFFSET: usize = OP_HDR + offset_of!(w_backed::BufferTextureBody, offset);
 #[cfg(test)]
@@ -763,8 +782,7 @@ pub const BUF_TEX_MIN_LEN: usize = w_backed::BUFFER_TEXTURE_TOTAL_LEN as usize;
 // the descriptor keep their offsets; only the descriptor widens.
 pub const TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE_WIDE: u32 = w_backed::OPCODE_BUFFER_TEXTURE_WIDE;
 #[cfg(test)]
-const BUF_TEX_WIDE_DESC_BODY: usize =
-    OP_HDR + offset_of!(w_backed::BufferTextureWideBody, desc);
+const BUF_TEX_WIDE_DESC_BODY: usize = OP_HDR + offset_of!(w_backed::BufferTextureWideBody, desc);
 pub const BUF_TEX_WIDE_LEN: usize = w_backed::BUFFER_TEXTURE_WIDE_TOTAL_LEN as usize;
 // MTLTextureType values (Metal.framework Headers/MTLTextureType.h).
 pub const TEXTURE_VIEW_MTL_TYPE_1D: u16 = 0;
@@ -1292,11 +1310,9 @@ pub fn decode_texture_descriptor(bytes: &[u8]) -> Result<TextureDescriptor, Deco
     }
     if bytes.len() >= TEXTURE_DESC_WIDTH + 4 {
         out.width = ld32(&bytes[TEXTURE_DESC_WIDTH..]);
-        out.has_width = out.width != 0;
     }
     if bytes.len() >= TEXTURE_DESC_HEIGHT + 4 {
         out.height = ld32(&bytes[TEXTURE_DESC_HEIGHT..]);
-        out.has_height = out.height != 0;
     }
     if bytes.len() >= TEXTURE_DESC_DEPTH + 4 {
         out.depth = ld32(&bytes[TEXTURE_DESC_DEPTH..]);
@@ -1313,7 +1329,7 @@ pub fn decode_texture_descriptor(bytes: &[u8]) -> Result<TextureDescriptor, Deco
     } else {
         1
     };
-    if out.has_width && out.has_height {
+    if out.extent().is_some() {
         // `size` is the level's *allocated* span, not the bytes a reader
         // touches. The two differ by the padding after the final row, and the
         // difference is load-bearing in both directions: `blit_exec` compares
@@ -3815,6 +3831,48 @@ mod tests {
         );
         assert_eq!(d.levels.len(), 1);
         assert_eq!(d.level(0).unwrap().width, 64);
+    }
+
+    /// A descriptor naming no extent is not a one-by-one texture, and the three
+    /// call sites that used to ask `has_width && has_height` now ask this.
+    ///
+    /// The sampled-source path in `metal_draw::vulkan` clamped both fields up
+    /// with `.max(1)`, which sized a four-byte payload — satisfied by almost any
+    /// buffer — and bound a single texel of it. Nothing above that could tell
+    /// the result from a real bind.
+    #[test]
+    fn a_descriptor_naming_no_extent_is_not_a_one_by_one_texture() {
+        use crate::contract::endian::st64;
+        let mut b = vec![0u8; TEXTURE_DESC_BASE_LEN];
+        st64(&mut b[0..], 0x10000);
+        st32(&mut b[8..], 0x10);
+        st32(&mut b[TEXTURE_DESC_ROW_STRIDE..], 256);
+
+        // A full-length record of zeroed geometry decodes; it names no extent.
+        let d = decode_texture_descriptor(&b).unwrap();
+        assert_eq!(d.extent(), None);
+        assert!(
+            d.levels.is_empty(),
+            "no extent means no level layout to build one from"
+        );
+
+        // Either field alone leaves it no extent.
+        st32(&mut b[TEXTURE_DESC_WIDTH..], 64);
+        assert_eq!(decode_texture_descriptor(&b).unwrap().extent(), None);
+        st32(&mut b[TEXTURE_DESC_HEIGHT..], 32);
+        assert_eq!(
+            decode_texture_descriptor(&b).unwrap().extent(),
+            Some((64, 32))
+        );
+
+        // A record too short to carry the fields never reaches the extent
+        // question: the decoder refuses it by name first, so the zero geometry
+        // above is a record that was long enough and said nothing.
+        let short = b[..TEXTURE_DESC_WIDTH].to_vec();
+        assert!(matches!(
+            decode_texture_descriptor(&short),
+            Err(DecodeStatus::ErrShort("res_texture_desc_short"))
+        ));
     }
 
     #[test]
