@@ -1925,7 +1925,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             format!("len={}", desc_bytes.len()),
         );
     };
-    if !tex.has_pixel_format {
+    if tex.declared_pixel_format().is_none() {
         return linear_fail(
             ComputeStatus::Unsupported("linear_tex_no_fmt"),
             String::new(),

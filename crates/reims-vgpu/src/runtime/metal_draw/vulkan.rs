@@ -2392,9 +2392,7 @@ fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
     // The object-list entry + descriptor are resolved+decoded once by the caller
     // (`resolve_sampled_source`'s linear branch) and threaded in as `tex`; the
     // cache fallback shares the same decode.
-    if !tex.has_pixel_format {
-        return None;
-    }
+    let declared_format = tex.declared_pixel_format()?;
     // sRGB variants ride the same rail as their linear siblings: the layout is
     // identical and the CPU loaders never decoded either. The qualifier is
     // still lost, so the census records it rather than letting the fold be
@@ -2405,7 +2403,7 @@ fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
     // additionally needs the optional linear-filter feature — LUTs are sampled
     // with interpolation — so it is gated on the host capability and otherwise
     // declines here, leaving the sample fail-visible (no CPU float loader arm).
-    let native = match translate::pixel::sampled_pixels(tex.pixel_format) {
+    let native = match translate::pixel::sampled_pixels(declared_format) {
         Ok((layout, decline))
             if layout.is_four_byte_color()
                 || layout == TexelLayout::R16Float
@@ -2415,7 +2413,7 @@ fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
             if decline.is_some() {
                 srgb_census::note_downgrade(
                     srgb_census::site::LINEAR_SAMPLE_ZERO_COPY,
-                    tex.pixel_format,
+                    declared_format,
                 );
             }
             layout
@@ -2730,13 +2728,11 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
     Option<LinearSampleIdentity>,
     TexelLayout,
 )> {
-    if !tex.has_pixel_format {
-        return None;
-    }
-    let sample_fmt = effective_view_sample_format(tex.pixel_format, None)?;
+    let declared_format = tex.declared_pixel_format()?;
+    let sample_fmt = effective_view_sample_format(declared_format, None)?;
     let (_, layout) = tex.level_gva(0, state.page_shift)?;
     let bpr = layout.row_stride;
-    let tight = pixel_format::tight_row_bytes(w, tex.pixel_format)? as u64;
+    let tight = pixel_format::tight_row_bytes(w, declared_format)? as u64;
     // Padded strides ride the same memo now — the native read below covers the
     // full `bpr*h` span (padding included, so a write anywhere is observed) and
     // `native_scratch_to_upload` gathers the tight rows. Only a sub-tight stride

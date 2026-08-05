@@ -379,8 +379,6 @@ pub struct TextureDescriptor {
     pub height: u32,
     pub depth: u32,
     pub pixel_format: u16,
-    pub has_row_stride: bool,
-    pub has_pixel_format: bool,
     /// Per-mip layouts (index 0 = L0). Empty if geometry incomplete.
     pub levels: Vec<TextureLevelLayout>,
 }
@@ -405,6 +403,28 @@ impl TextureDescriptor {
             return None;
         }
         Some((self.width, self.height))
+    }
+
+    /// The row stride this descriptor names, or `None` when it names none.
+    ///
+    /// Same shape as [`Self::extent`] and for the same reason: this replaced a
+    /// `has_row_stride` field assigned `row_stride != 0` two lines after
+    /// `row_stride` itself, which three readers then spelled back out as a zero
+    /// check. A stride of zero is a record that carried no stride, and the
+    /// consequence — how far a row read may reach — is not something to guess.
+    pub fn declared_row_stride(&self) -> Option<u32> {
+        (self.row_stride != 0).then_some(self.row_stride)
+    }
+
+    /// The pixel format this descriptor names, or `None` when it names none.
+    ///
+    /// `MTLPixelFormatInvalid` is 0, so a zero is an absent format rather than
+    /// a format, and the gates downstream of it fail closed. Named the same as
+    /// [`TextureViewDescriptor::declared_pixel_format`] because it is the same
+    /// question: the two decoders once disagreed about what an absent format
+    /// meant, one storing `!= 0` and the other an unconditional `true`.
+    pub fn declared_pixel_format(&self) -> Option<u16> {
+        (self.pixel_format != 0).then_some(self.pixel_format)
     }
 
     /// Allocation base GVA (`handle << page_shift`), not including data_offset.
@@ -1371,7 +1391,6 @@ pub fn decode_texture_descriptor(bytes: &[u8]) -> Result<TextureDescriptor, Deco
     }
     if bytes.len() >= TEXTURE_DESC_ROW_STRIDE + 4 {
         out.row_stride = ld32(&bytes[TEXTURE_DESC_ROW_STRIDE..]);
-        out.has_row_stride = out.row_stride != 0;
     }
     if bytes.len() >= TEXTURE_DESC_WIDTH + 4 {
         out.width = ld32(&bytes[TEXTURE_DESC_WIDTH..]);
@@ -1407,7 +1426,7 @@ pub fn decode_texture_descriptor(bytes: &[u8]) -> Result<TextureDescriptor, Deco
         // from the wire at `TEXTURE_LEVEL_SIZE` and mean the same padded span.
         let l0_size = if out.used_size != 0 {
             out.used_size as u64
-        } else if out.has_row_stride && out.height > 0 {
+        } else if out.declared_row_stride().is_some() && out.height > 0 {
             (out.row_stride as u64).saturating_mul(out.height as u64)
         } else {
             0
@@ -1483,7 +1502,6 @@ pub fn decode_texture_descriptor(bytes: &[u8]) -> Result<TextureDescriptor, Deco
     let pf_off = TEXTURE_DESC_PIXEL_FORMAT + format_shift;
     if bytes.len() >= pf_off + 2 {
         out.pixel_format = ld16(&bytes[pf_off..]);
-        out.has_pixel_format = out.pixel_format != 0;
     } else if crate::observe::first_sight("texture_desc_format_unreachable", levels as u64) {
         // No fallback to the unshifted offset. The fallback's own length test
         // was `TEXTURE_DESC_PIXEL_FORMAT + 2`, so for a single-mip body it
@@ -4115,7 +4133,11 @@ mod tests {
         );
         // Same body: the format trailer sits past the end, so there is no
         // format rather than two bytes read out of a level record.
-        assert!(!d.has_pixel_format, "no format is better than a wrong one");
+        assert_eq!(
+            d.declared_pixel_format(),
+            None,
+            "no format is better than a wrong one"
+        );
     }
 
     #[test]

@@ -827,7 +827,7 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
     let Ok(tex) = decode_texture_descriptor(&bytes) else {
         return Err(br(BlitStatus::MissingResource, "tex_desc_decode"));
     };
-    if !tex.has_pixel_format {
+    if tex.declared_pixel_format().is_none() {
         crate::observe::fail(format!(
             "blit tex no_pixel_format ref={texture_ref} w={} h={} fmt={}",
             tex.width, tex.height, tex.pixel_format

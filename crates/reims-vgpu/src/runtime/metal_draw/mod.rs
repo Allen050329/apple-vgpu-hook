@@ -1332,8 +1332,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
             // A plain vertex descriptor's layouts default to `PerVertex`; the
             // post-tessellation default belongs to the ICB path, which names it
             // itself.
-            step_function: a
-                .step_function_ordinal(metal::MTLVertexStepFunction::PerVertex as u32),
+            step_function: a.step_function_ordinal(metal::MTLVertexStepFunction::PerVertex as u32),
             step_rate: a.step_rate(),
         });
     }
@@ -2165,7 +2164,10 @@ fn load_linear_raw<M: HostMemory + HostOps>(
         Ok(t) => t,
         Err(_) => return false,
     };
-    if tex.extent() != Some((width, height)) || !tex.has_row_stride || tex.row_stride < row_bytes {
+    let stride_covers_row = tex
+        .declared_row_stride()
+        .is_some_and(|stride| stride >= row_bytes);
+    if tex.extent() != Some((width, height)) || !stride_covers_row {
         return false;
     }
     let (gva, alloc) = match tex.backing_gva_size(state.page_shift) {
@@ -2788,7 +2790,7 @@ fn sample_miss_detail<M: HostMemory + HostOps>(
                     let l0 = tex.level(0);
                     format!(
                         "type={ot} desc_len={desc_len} has_fmt={} fmt={:#x} mips={} handle={:#x} alloc={} L0={}x{} bpr={} reason=linear_sample",
-                        tex.has_pixel_format as u8,
+                        u8::from(tex.declared_pixel_format().is_some()),
                         tex.pixel_format,
                         tex.mipmap_level_count,
                         tex.handle,
@@ -2930,7 +2932,7 @@ fn load_linear_texture_rgba_at_level<M: HostMemory + HostOps>(
     }
     let desc_bytes = objects::read_descriptor(state, host, task_id, &entry)?;
     let tex = decode_texture_descriptor(&desc_bytes).ok()?;
-    if !tex.has_pixel_format {
+    if tex.declared_pixel_format().is_none() {
         return None;
     }
     let base_fmt = tex.pixel_format;
@@ -3659,7 +3661,10 @@ fn lookup_render_target<M: HostMemory + HostOps>(
     }
     let desc_bytes = objects::read_descriptor(state, host, task_id, &entry)?;
     let tex = decode_texture_descriptor(&desc_bytes).ok()?;
-    if !tex.has_pixel_format || tex.extent().is_none() || !tex.has_row_stride {
+    if tex.declared_pixel_format().is_none()
+        || tex.extent().is_none()
+        || tex.declared_row_stride().is_none()
+    {
         return None;
     }
     let base_fmt = tex.pixel_format;

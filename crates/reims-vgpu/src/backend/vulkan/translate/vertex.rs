@@ -330,10 +330,7 @@ mod tests {
 
     #[test]
     fn every_vertex_step_function_maps_and_absence_is_per_vertex() {
-        assert_eq!(
-            step_function(None).unwrap(),
-            VertexStepFunction::PerVertex
-        );
+        assert_eq!(step_function(None).unwrap(), VertexStepFunction::PerVertex);
         assert_eq!(
             step_function(Some(0)).unwrap(),
             VertexStepFunction::Constant

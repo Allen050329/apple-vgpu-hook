@@ -586,7 +586,7 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
     let desc_bytes =
         objects::read_descriptor(state, host, task_id, &entry).ok_or(R::DescriptorUnreadable)?;
     let tex = decode_texture_descriptor(&desc_bytes).map_err(|_| R::DescriptorUndecodable)?;
-    if !tex.has_pixel_format {
+    if tex.declared_pixel_format().is_none() {
         return Err(R::NoPixelFormat);
     }
     let base_fmt = tex.pixel_format;

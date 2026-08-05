@@ -180,7 +180,7 @@ fn resolve_multi_mip_texture<M: HostMemory + HostOps>(
             return Err(MipmapStatus::MissingTexture);
         }
     };
-    if !tex.has_pixel_format {
+    if tex.declared_pixel_format().is_none() {
         return Err(MipmapStatus::UnsupportedFormat);
     }
     let levels = if tex.mipmap_level_count > 0 {
