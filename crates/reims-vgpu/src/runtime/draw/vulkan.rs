@@ -823,6 +823,54 @@ pub(super) fn deferred_gva_sample_eligible(
         && gva_cache_owner_allows_object_type(win.producer_object_type, sampler_object_type)
 }
 
+/// The object-list entry and descriptor bytes behind a sampled `texture_ref`,
+/// reporting when the ref names something that is not a texture.
+///
+/// Four rails resolve a texture ref through the second rung of the object-list
+/// ladder — `mipmap`, `draw::texture_view` and `compute_exec` name
+/// `[OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_VARIANT]` to
+/// [`objects::resolve_descriptor`], and `draw::render_target` writes the pair
+/// out — and the two sampled-path sites in this file did not. They went
+/// `lookup_list_entry` -> `read_descriptor` -> `decode_texture_descriptor`, so
+/// **any** object whose descriptor is at least `TEXTURE_DESC_GEOMETRY_LEN`
+/// bytes decodes as a texture and yields a plausible extent rather than a
+/// refusal. That is the hazard `contract::iosurface_pages` documents for the
+/// `TEXTURE_DESC_WIDTH` name collision, reached a different way.
+///
+/// # It reports and does not refuse, on purpose
+///
+/// Adding the rung as a *decline* would turn a resolve that currently produces
+/// geometry into `DrawPreparationDecline::TextureResolveMissing`, which loses
+/// the draw — a behaviour change on the pathway this device is verified on,
+/// justified by nothing yet measured. Whether a guest ever binds a non-texture
+/// ref here is exactly what is not known, and the four rails that do check
+/// cannot answer it because they refuse before anything is counted. So the
+/// answer stays what it was and the log now says when it was reached; a driven
+/// boot reading this slug is what decides whether the rung becomes a refusal.
+pub(super) fn sampled_texture_descriptor<M: HostMemory>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    texture_ref: u32,
+) -> Option<(crate::runtime::decode::resource::ListObjectEntry, Vec<u8>)> {
+    let entry = objects::lookup_list_entry(state, host, task_id, texture_ref)?;
+    use crate::runtime::decode::resource::{OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_VARIANT};
+    if entry.object_type != OBJECT_TYPE_TEXTURE && entry.object_type != OBJECT_TYPE_TEXTURE_VARIANT
+    {
+        let slug = crate::observe::ladder_slug!("draw_sampled_texture", wrong_type);
+        if degrade_log_first(texture_ref, slug) {
+            crate::observe::fail(format!(
+                "sampled_source_degraded reason={slug} task={task_id} ref={texture_ref} \
+                 object_type={} (decoded as a texture descriptor anyway; geometry \
+                 comes from a record of another kind)",
+                entry.object_type
+            ));
+        }
+    }
+    let bytes = objects::read_descriptor(state, host, task_id, &entry)?;
+    Some((entry, bytes))
+}
+
 /// Bind a still-deferred GVA render Store's resident target for a type-2/3
 /// sampled bind instead of flushing it to guest memory and re-uploading.
 ///
@@ -843,8 +891,7 @@ fn try_sample_deferred_gva<M: HostMemory + HostOps>(
     if state.gva_deferred_flush.is_empty() {
         return None;
     }
-    let entry = objects::lookup_list_entry(state, host, task_id, texture_ref)?;
-    let desc_bytes = objects::read_descriptor(state, host, task_id, &entry)?;
+    let (entry, desc_bytes) = sampled_texture_descriptor(state, host, task_id, texture_ref)?;
     let tex = decode_texture_descriptor(&desc_bytes).ok()?;
     let (gva, layout) = tex.level_gva(0, state.page_shift)?;
     // Every rung below this point declines to a bare `None`, and the caller then
@@ -1379,8 +1426,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
     // names the ref and the stage. `TextureDescriptor::extent` owns the second
     // check and says what clamping the two fields up would have bound instead.
     let mut rgba = load_sampled_rgba_static(state, host, task_id, texture_ref)?;
-    let entry = objects::lookup_list_entry(state, host, task_id, texture_ref)?;
-    let desc = objects::read_descriptor(state, host, task_id, &entry)?;
+    let (_entry, desc) = sampled_texture_descriptor(state, host, task_id, texture_ref)?;
     let (w, h) = decode_texture_descriptor(&desc).ok()?.extent()?;
     let need = (w as usize).saturating_mul(h as usize).saturating_mul(4);
     if rgba.len() < need {

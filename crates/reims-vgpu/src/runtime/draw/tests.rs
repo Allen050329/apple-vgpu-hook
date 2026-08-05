@@ -4631,3 +4631,100 @@ fn a_degradation_reports_once_per_pipeline_and_slug() {
         "the same degradation on a different pipeline is a different report"
     );
 }
+
+/// A sampled bind naming an object that is not a texture is reported, and the
+/// answer it gets does not change.
+///
+/// The two sampled-source sites in `draw::vulkan` resolved a `texture_ref`
+/// without the second ladder rung, so a ref naming any object with a long
+/// enough descriptor decoded as a texture and produced a plausible extent —
+/// while `mipmap`, `draw::texture_view`, `compute_exec` and
+/// `draw::render_target` all ask the type for the same field. Turning the rung
+/// into a refusal here would lose a draw on the pathway this device is verified
+/// on, so it reports; this pins both halves of that, because a probe that
+/// quietly started refusing would be the bug it was added to measure.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn a_sampled_ref_naming_another_object_kind_is_reported_and_still_resolves() {
+    use crate::contract::endian::{st32, st64};
+    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+    use crate::runtime::decode::resource::{
+        list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_TEXTURE, TEXTURE_DESC_BASE_LEN,
+    };
+    use crate::runtime::gva_mem::write_task_gva_arm64e;
+    use crate::runtime::objects::OBJECT_TYPE_REF_TEXTURE;
+
+    // One task, one object list, and two refs into it — same descriptor bytes,
+    // different object type in the entry.
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let (dir_pfn, root_pfn) = (2u32, 3u32);
+    let dir_gpa = (dir_pfn as u64) << PAGE_SHIFT_ARM64E;
+    let root_gpa = (root_pfn as u64) << PAGE_SHIFT_ARM64E;
+    host.map_range(dir_gpa, 0x20, 0);
+    host.map_range(root_gpa, 0x4000, 0);
+    let mut d = [0u8; 8];
+    st32(&mut d[DIRECTORY_ROOT_PFN as usize..], root_pfn);
+    st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
+    assert!(host.write_gpa(dir_gpa, &d).is_ok());
+    for i in 0..4u32 {
+        let pfn = 4 + i;
+        host.map_range((pfn as u64) << PAGE_SHIFT_ARM64E, 0x4000, 0);
+        let mut pte = [0u8; 4];
+        st32(&mut pte, pfn);
+        assert!(host.write_gpa(root_gpa + (i as u64) * 4, &pte).is_ok());
+    }
+    assert!(state.define_task(1, 0x1000, dir_pfn));
+    assert!(state.set_object_list(1, 0, 32));
+
+    let body = TEXTURE_DESC_BASE_LEN;
+    let mut desc = vec![0u8; body];
+    st64(&mut desc[0..], 0x1000);
+    st32(&mut desc[8..], 1);
+    let desc_gva = 0x200u64;
+    write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, &desc);
+    let put_entry = |host: &mut FakeHost, obj_ref: u32, object_type: u8| {
+        let off = list_object_entry_offset(obj_ref, 32).expect("entry in range");
+        let mut le = [0u8; OBJECT_LIST_ENTRY_LEN];
+        st32(&mut le[0..], (object_type as u32) | ((body as u32) << 8));
+        le[4..12].copy_from_slice(&desc_gva.to_le_bytes());
+        write_task_gva_arm64e(host, &state.tasks[1], off, &le);
+    };
+    let (texture_ref, view_ref) = (6u32, 7u32);
+    put_entry(&mut host, texture_ref, OBJECT_TYPE_TEXTURE);
+    put_entry(&mut host, view_ref, OBJECT_TYPE_REF_TEXTURE);
+
+    crate::observe::redirect_logs_for_tests();
+    let before = std::fs::read_to_string(crate::observe::fail_log_path())
+        .unwrap_or_default()
+        .len();
+
+    // A real texture resolves and says nothing.
+    assert!(
+        super::vulkan::sampled_texture_descriptor(&state, &host, 1, texture_ref).is_some(),
+        "a texture ref resolves"
+    );
+    // Another kind resolves exactly the same way — the bytes are the bytes —
+    // and the rung is named.
+    let (entry, bytes) = super::vulkan::sampled_texture_descriptor(&state, &host, 1, view_ref)
+        .expect("the answer does not change: the descriptor still resolves");
+    assert_eq!(entry.object_type, OBJECT_TYPE_REF_TEXTURE);
+    assert_eq!(bytes.len(), body);
+
+    let log = std::fs::read_to_string(crate::observe::fail_log_path()).unwrap_or_default();
+    let tail = &log[before.min(log.len())..];
+    let line = tail
+        .lines()
+        .find(|l| l.contains("draw_sampled_texture_wrong_type"))
+        .expect("the second ladder rung must name itself");
+    assert!(
+        line.contains(&format!("ref={view_ref}")) && line.contains("object_type=5"),
+        "the line must name the ref and what it found: {line}"
+    );
+    assert!(
+        !tail
+            .lines()
+            .any(|l| l.contains("draw_sampled_texture_wrong_type") && l.contains("ref=6")),
+        "a texture ref must not be reported"
+    );
+}
