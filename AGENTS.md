@@ -173,6 +173,7 @@ simply the wrong number, a length four bytes off, or a field two bytes too wide:
 | Does a decoder refuse or drop a record Apple emits? | `crates/reims-vgpu/tests/wire_fixtures_reach_the_decoders.rs` |
 | Is a wire constant still declared twice? | the two greps below |
 | Does a doc comment name a symbol that no longer exists? | `cargo doc`'s intra-doc link pass |
+| Does a value travel as loose parameters when a type for it exists? | `scripts/scattered-struct` |
 
 ```sh
 ls crates/reims-vgpu-wire/src/ops/*.rs | xargs -n1 basename | sed 's/.rs$//'
