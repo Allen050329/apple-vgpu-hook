@@ -1121,15 +1121,13 @@ impl IndirectCommandBufferDescriptor {
         self.flags & ICB_FLAG_INHERIT_BUFFERS != 0
     }
 
-    /// `supportRayTracing`, bit 2.
-    pub fn support_ray_tracing(&self) -> bool {
-        self.flags & ICB_FLAG_SUPPORT_RAY_TRACING != 0
-    }
-
-    /// `supportDynamicAttributeStride`, bit 3.
-    pub fn support_dynamic_attribute_stride(&self) -> bool {
-        self.flags & ICB_FLAG_SUPPORT_DYNAMIC_ATTRIBUTE_STRIDE != 0
-    }
+    // `supportRayTracing` (bit 2) and `supportDynamicAttributeStride` (bit 3)
+    // have no accessor, and that is the rule rather than an omission: an
+    // accessor here means the device acts on the bit, and those two it does not.
+    // Both are read by `unapplied_flags` instead, which names each one the guest
+    // asked for so the request is measured rather than dropped in silence. An
+    // accessor beside that would be a second reader of the same bit whose only
+    // effect is to make the two kinds of flag look alike.
 
     /// The bits no `MTLIndirectCommandBufferDescriptor` property moves.
     ///
