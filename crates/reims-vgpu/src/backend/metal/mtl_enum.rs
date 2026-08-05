@@ -63,7 +63,32 @@ use metal::{
 /// is *not* listed converts at all, sweeping to four past the highest listed
 /// discriminant so interior holes and the upper edge are both covered.
 ///
+/// # The trailing `apple_numbers_them_from_zero;` clause
+///
+/// Everything above is stated in terms of `<$ty>::$variant as u32` and nothing
+/// else, so **it names no number.** It proves a table agrees with itself, which
+/// leaves the accepted *set* — the ordinals a guest may send — defined entirely
+/// by whatever discriminants the `metal` crate happens to assign. A crate bump
+/// that renumbers one of these enums keeps every assertion green while moving
+/// the set: the Metal arm would start refusing an ordinal Apple declares (and
+/// the Vulkan arm still accepts, since `translate::raster` spells Apple's
+/// numbers itself), and nothing in the tree would say so.
+///
+/// The clause closes that for the tables whose variants Apple numbers `0..n`
+/// with no holes, in the order they are listed here. It asserts each variant's
+/// discriminant equals its index, which is the whole accepted set stated as one
+/// claim. Add it only after reading the SDK header — it is an assertion about
+/// Apple's numbering that the compiler checks against `metal`'s, so writing it
+/// on a table with a hole (`vertex_format`, `attribute_format`) is false, and
+/// writing it on a table listed out of Apple's order pins the wrong thing.
+///
 /// # What this cannot catch
+///
+/// **A renaming.** The clause constrains discriminants, not names, and this
+/// crate version is measured to put six of `MTLStepFunction`'s nine names on
+/// the wrong numbers while numbering the enum `0..8` contiguously — so a table
+/// of it would satisfy the clause and still be wrong. That enum is converted
+/// through `STEP_FUNCTION_BY_ORDINAL` below for exactly this reason.
 ///
 /// **A variant the `metal` crate declares and this invocation omits.** The list
 /// is the only statement of the accepted set, so an omitted variant is absent
@@ -78,6 +103,38 @@ use metal::{
 /// re-reading them. An earlier version of this doc claimed omission "fails its
 /// own test"; it never did.
 macro_rules! checked_ordinal {
+    (
+        $(#[$outer:meta])*
+        fn $fn_name:ident -> $ty:ty;
+        [ $($variant:ident),+ $(,)? ]
+        apple_numbers_them_from_zero;
+    ) => {
+        checked_ordinal! {
+            $(#[$outer])*
+            fn $fn_name -> $ty;
+            [ $($variant),+ ]
+        }
+
+        // Each variant sits at the number its position in the list claims, which
+        // for a hole-free enum listed in Apple's order is the accepted set
+        // stated once. Without it the set is whatever `metal` says it is, and a
+        // renumbering there is a silent cross-arm divergence rather than a build
+        // failure — see the macro's own doc.
+        const _: () = {
+            let declared = [ $(<$ty>::$variant as u32),+ ];
+            let mut index = 0usize;
+            while index < declared.len() {
+                assert!(
+                    declared[index] == index as u32,
+                    concat!(
+                        stringify!($fn_name),
+                        " has a variant off the number Apple assigned it",
+                    ),
+                );
+                index += 1;
+            }
+        };
+    };
     (
         $(#[$outer:meta])*
         fn $fn_name:ident -> $ty:ty;
@@ -199,22 +256,23 @@ checked_ordinal! {
     /// `MTLVertexStepFunction` for a vertex-descriptor buffer layout.
     fn vertex_step_function -> MTLVertexStepFunction;
     [Constant, PerVertex, PerInstance, PerPatch, PerPatchControlPoint]
+    apple_numbers_them_from_zero;
 }
 
-// The generated block above proves this table self-consistent — that every
-// variant round-trips and no undeclared ordinal converts — and it cannot prove
-// a variant sits at the *number Apple assigned it*, because nothing outside the
-// `metal` crate is named in it. That gap is not hypothetical here: the sibling
-// `MTLStepFunction` below is measured to have six of its nine names on the wrong
-// discriminants in this very crate version, and `render.rs` used to express "no
-// step function above PerInstance" as `> MTLVertexStepFunction::PerInstance as
-// u32` — a band whose top was whatever the crate happened to say.
+// The clause above pins the five discriminants to `0..=4`, and these five pin
+// them to the names the rest of the tree reads them by. Both are wanted: the
+// clause states the accepted *set* and would still hold if this list and
+// `contract::vertex_step` drifted apart together, which is the failure these
+// catch. The gap is not hypothetical — the sibling `MTLStepFunction` below is
+// measured to have six of its nine names on the wrong discriminants in this very
+// crate version, and `render.rs` used to express "no step function above
+// PerInstance" as `> MTLVertexStepFunction::PerInstance as u32`, a band whose
+// top was whatever the crate happened to say.
 //
 // The five ordinals come from `MTLVertexDescriptor.h` and are declared in
-// `contract::vertex_step`, where the shared step/rate rule reads them. Pinning
-// them here is what makes a `metal` bump that renumbers this enum a build
-// failure, on every arm that compiles the file including the cross-compiled
-// Metal clippy run.
+// `contract::vertex_step`, where the shared step/rate rule reads them. Every
+// assertion here is evaluated on each arm that compiles the file, including the
+// cross-compiled Metal clippy run.
 const _: () = assert!(
     MTLVertexStepFunction::Constant as u32
         == crate::contract::vertex_step::MTL_VERTEX_STEP_FUNCTION_CONSTANT
@@ -298,30 +356,35 @@ checked_ordinal! {
         BlendColor, OneMinusBlendColor, BlendAlpha, OneMinusBlendAlpha,
         Source1Color, OneMinusSource1Color, Source1Alpha, OneMinusSource1Alpha,
     ]
+    apple_numbers_them_from_zero;
 }
 
 checked_ordinal! {
     /// `MTLBlendOperation` for one color attachment's blend state.
     fn blend_operation -> MTLBlendOperation;
     [Add, Subtract, ReverseSubtract, Min, Max]
+    apple_numbers_them_from_zero;
 }
 
 checked_ordinal! {
     /// `MTLCullMode` for the render encoder's raster state.
     fn cull_mode -> MTLCullMode;
     [None, Front, Back]
+    apple_numbers_them_from_zero;
 }
 
 checked_ordinal! {
     /// `MTLWinding` for the render encoder's raster state.
     fn winding -> MTLWinding;
     [Clockwise, CounterClockwise]
+    apple_numbers_them_from_zero;
 }
 
 checked_ordinal! {
     /// `MTLCompareFunction` for a depth or stencil test.
     fn compare_function -> MTLCompareFunction;
     [Never, Less, Equal, LessEqual, Greater, NotEqual, GreaterEqual, Always]
+    apple_numbers_them_from_zero;
 }
 
 checked_ordinal! {
@@ -331,12 +394,14 @@ checked_ordinal! {
         Keep, Zero, Replace, IncrementClamp, DecrementClamp, Invert,
         IncrementWrap, DecrementWrap,
     ]
+    apple_numbers_them_from_zero;
 }
 
 checked_ordinal! {
     /// `MTLLoadAction` for a render pass attachment.
     fn load_action -> MTLLoadAction;
     [DontCare, Load, Clear]
+    apple_numbers_them_from_zero;
 }
 
 checked_ordinal! {
@@ -346,30 +411,35 @@ checked_ordinal! {
         DontCare, Store, MultisampleResolve, StoreAndMultisampleResolve,
         Unknown, CustomSampleDepthStore,
     ]
+    apple_numbers_them_from_zero;
 }
 
 checked_ordinal! {
     /// `MTLIndexType` for an indexed draw or a stage-input index buffer.
     fn index_type -> MTLIndexType;
     [UInt16, UInt32]
+    apple_numbers_them_from_zero;
 }
 
 checked_ordinal! {
     /// `MTLPrimitiveType` for a draw.
     fn primitive_type -> MTLPrimitiveType;
     [Point, Line, LineStrip, Triangle, TriangleStrip]
+    apple_numbers_them_from_zero;
 }
 
 checked_ordinal! {
     /// `MTLSamplerMinMagFilter` for a sampler's minification or magnification.
     fn sampler_min_mag_filter -> MTLSamplerMinMagFilter;
     [Nearest, Linear]
+    apple_numbers_them_from_zero;
 }
 
 checked_ordinal! {
     /// `MTLSamplerMipFilter` for a sampler's mip selection.
     fn sampler_mip_filter -> MTLSamplerMipFilter;
     [NotMipmapped, Nearest, Linear]
+    apple_numbers_them_from_zero;
 }
 
 checked_ordinal! {
@@ -379,12 +449,14 @@ checked_ordinal! {
         ClampToEdge, MirrorClampToEdge, Repeat, MirrorRepeat, ClampToZero,
         ClampToBorderColor,
     ]
+    apple_numbers_them_from_zero;
 }
 
 checked_ordinal! {
     /// `MTLSamplerBorderColor` for a sampler clamping to a border.
     fn sampler_border_color -> MTLSamplerBorderColor;
     [TransparentBlack, OpaqueBlack, OpaqueWhite]
+    apple_numbers_them_from_zero;
 }
 
 /// Assert a conversion answers `ordinal` with exactly `variant`, at compile time.
