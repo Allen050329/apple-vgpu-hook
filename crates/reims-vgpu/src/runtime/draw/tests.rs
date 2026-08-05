@@ -4728,3 +4728,61 @@ fn a_sampled_ref_naming_another_object_kind_is_reported_and_still_resolves() {
         "a texture ref must not be reported"
     );
 }
+
+/// Every way a buffer ref fails names itself, distinctly, in the counted
+/// vocabulary.
+///
+/// The five conditions used to be five `observe::fail` lines with **no
+/// `reason=` field**, which is the one field the fail log is ranked by — so
+/// "how often did a draw fail to resolve a buffer" had no answer, and the first
+/// rung was invisible to the grep that finds every other rail's. Distinctness
+/// is the other half: two conditions sharing a slug share `fail_once`'s latch
+/// wherever one is used with it, and the five are five different findings.
+#[test]
+fn every_buffer_span_refusal_has_its_own_reason_slug() {
+    use crate::runtime::objects::{BufferSpanRefusal, LadderRung};
+
+    let all = [
+        BufferSpanRefusal::Rung(LadderRung::NoListEntry),
+        BufferSpanRefusal::Rung(LadderRung::WrongType { got: 2 }),
+        BufferSpanRefusal::Rung(LadderRung::DescRead { declared_len: 96 }),
+        BufferSpanRefusal::Decode,
+        BufferSpanRefusal::NoBacking,
+    ];
+    let slugs: Vec<&str> = all.iter().map(|r| super::buffer_refusal_slug(*r)).collect();
+    let mut sorted = slugs.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(
+        sorted.len(),
+        all.len(),
+        "five conditions, five slugs: {slugs:?}"
+    );
+    for slug in &slugs {
+        assert!(
+            slug.starts_with("draw_buffer"),
+            "the role says which rail failed: {slug}"
+        );
+    }
+    // The three ladder rungs must be spelled by the macro, not by hand — this
+    // is what keeps a sixth spelling of "the guest named nothing" from existing.
+    assert_eq!(
+        slugs[0],
+        crate::observe::ladder_slug!("draw_buffer", no_list_entry)
+    );
+    assert_eq!(
+        slugs[1],
+        crate::observe::ladder_slug!("draw_buffer", wrong_type)
+    );
+    assert_eq!(
+        slugs[2],
+        crate::observe::ladder_slug!("draw_buffer", desc_read)
+    );
+
+    // The detail field carries what each refusal knows and nothing it does not.
+    assert_eq!(super::buffer_refusal_detail(all[1], 12), "ty=2");
+    assert_eq!(super::buffer_refusal_detail(all[2], 12), "desc_len=96");
+    assert_eq!(super::buffer_refusal_detail(all[4], 12), "shift=12");
+    assert!(super::buffer_refusal_detail(all[0], 12).is_empty());
+    assert!(super::buffer_refusal_detail(all[3], 12).is_empty());
+}

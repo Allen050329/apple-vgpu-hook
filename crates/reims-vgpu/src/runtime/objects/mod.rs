@@ -988,8 +988,11 @@ pub enum BufferSpanRefusal {
 
 /// Resolve a type-1 buffer ref to its `(guest base address, allocation size)`.
 ///
-/// Two rails needed this and each wrote it out: `compute_exec`'s buffer-window
-/// read and `icb`'s type-1 bind. They agreed on the four steps — resolve as
+/// Three rails needed this and each wrote it out: `compute_exec`'s buffer-window
+/// read, `icb`'s type-1 bind, and `draw`'s vertex/fragment buffer load — which
+/// was found last, after this function already existed, and whose five refusals
+/// carried no `reason=` field at all, so none of them was in the log's ranking.
+/// They agreed on the four steps — resolve as
 /// `OBJECT_TYPE_BUFFER`, decode, derive the span from the handle and the
 /// device's own `page_shift` — and disagreed on what to say afterwards. The ICB
 /// copy named all four refusals; the compute copy returned `Option` and its

@@ -901,6 +901,48 @@ struct BufferBacking {
     size: u64,
 }
 
+/// The slug for each way a type-1 buffer ref fails to yield a span.
+///
+/// Five refusals, one per condition, in the vocabulary `observe::ladder`
+/// declares — because the five lines this replaced carried **no `reason=` at
+/// all**. `AGENTS.md` says the fail log is ranked by `reason=`; a line without
+/// one is not in the ranking, and "load_buffer miss lookup" was not findable by
+/// the grep that finds every other rail's first rung either.
+fn buffer_refusal_slug(refusal: objects::BufferSpanRefusal) -> &'static str {
+    match refusal {
+        objects::BufferSpanRefusal::Rung(rung) => {
+            crate::observe::ladder_slugs!("draw_buffer")(rung)
+        }
+        objects::BufferSpanRefusal::Decode => {
+            crate::observe::ladder_slug!("draw_buffer", desc_decode)
+        }
+        // Not a rung: the descriptor decoded and names no allocation. The
+        // resource exists and has nowhere to read from, which is a different
+        // finding from a malformed record — see `observe::ladder`'s own note on
+        // what does not belong in the ladder.
+        objects::BufferSpanRefusal::NoBacking => "draw_buffer_no_backing",
+    }
+}
+
+/// The one field each refusal is worth reporting beyond the ref.
+///
+/// Kept because the five lines this replaced each carried one and losing them
+/// would make the consolidation a downgrade: a declared length says whether the
+/// entry or the read is wrong, and the page shift says which geometry the
+/// backing was computed against.
+fn buffer_refusal_detail(refusal: objects::BufferSpanRefusal, page_shift: u32) -> String {
+    match refusal {
+        objects::BufferSpanRefusal::Rung(objects::LadderRung::WrongType { got }) => {
+            format!("ty={got}")
+        }
+        objects::BufferSpanRefusal::Rung(objects::LadderRung::DescRead { declared_len }) => {
+            format!("desc_len={declared_len}")
+        }
+        objects::BufferSpanRefusal::NoBacking => format!("shift={page_shift}"),
+        _ => String::new(),
+    }
+}
+
 /// Resolve a type-1 buffer `ref` to its backing `(gva, size)` (object-list
 /// entry read + descriptor read + decode). Fail-visible per failing site —
 /// this is the single owner of the `load_buffer *` reason slugs; the ZC and CPU
@@ -914,40 +956,17 @@ fn resolve_buffer_backing<M: HostMemory>(
     if buffer_ref == 0 {
         return None;
     }
-    let Some(entry) = objects::lookup_list_entry(state, host, task_id, buffer_ref) else {
-        crate::observe::fail(format!(
-            "load_buffer miss lookup task={task_id} ref={buffer_ref}"
-        ));
-        return None;
-    };
-    if entry.object_type != OBJECT_TYPE_BUFFER {
-        crate::observe::fail(format!(
-            "load_buffer bad type task={task_id} ref={buffer_ref} ty={}",
-            entry.object_type
-        ));
-        return None;
+    match objects::resolve_buffer_span(state, host, task_id, buffer_ref) {
+        Ok((gva, size)) => Some(BufferBacking { gva, size }),
+        Err(refusal) => {
+            crate::observe::fail(format!(
+                "load_buffer fail reason={} task={task_id} ref={buffer_ref} {}",
+                buffer_refusal_slug(refusal),
+                buffer_refusal_detail(refusal, state.page_shift),
+            ));
+            None
+        }
     }
-    let Some(desc_bytes) = objects::read_descriptor(state, host, task_id, &entry) else {
-        crate::observe::fail(format!(
-            "load_buffer miss desc task={task_id} ref={buffer_ref}"
-        ));
-        return None;
-    };
-    let Ok(desc) = decode_buffer_descriptor(&desc_bytes) else {
-        crate::observe::fail(format!(
-            "load_buffer decode fail task={task_id} ref={buffer_ref} desc_len={}",
-            desc_bytes.len()
-        ));
-        return None;
-    };
-    let Some((gva, size)) = desc.backing_gva_size(state.page_shift) else {
-        crate::observe::fail(format!(
-            "load_buffer no backing task={task_id} ref={buffer_ref} shift={}",
-            state.page_shift
-        ));
-        return None;
-    };
-    Some(BufferBacking { gva, size })
 }
 
 /// CPU staging read of a pre-resolved buffer backing at `offset`. Reads guest
