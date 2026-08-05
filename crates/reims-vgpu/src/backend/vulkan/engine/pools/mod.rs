@@ -767,6 +767,41 @@ pub(crate) struct ResidentTargetSlot {
     pub use_seq: u64,
 }
 
+impl ResidentTargetSlot {
+    /// Whether this slot's image may be re-used for a request of this geometry,
+    /// generation and attachment format.
+    ///
+    /// One predicate for both `registry_ensure*` arms, which share `registry`
+    /// and so can hand each other a slot. They did not share this question: the
+    /// primary arm compared `bgra`, a one-bit summary of the format, while the
+    /// secondary arm compared `color_format`, which is what the slot's image was
+    /// actually created with and what its own doc says reuse is keyed on. An
+    /// identity crossing from the secondary path to the primary one is not
+    /// hypothetical — `retire_resident`'s doc records having had to handle
+    /// exactly that — and a secondary slot's `bgra` is stored as
+    /// `format == SCANOUT_FORMAT`, so an `RG16Float` mask slot reads `false` and
+    /// matched a primary request for RGBA8. The primary arm would then build a
+    /// framebuffer with an RGBA8 render pass over an `RG16Float` view, which
+    /// Vulkan does not allow the attachment formats to disagree on.
+    ///
+    /// `color_format` decides it for both, and it subsumes the `bgra` test:
+    /// `translate::pixel::resident_color` maps the two `bgra` values onto two
+    /// distinct formats, so equal formats implies equal `bgra` for anything the
+    /// primary arm created.
+    pub(crate) fn reusable_for(
+        &self,
+        width: u32,
+        height: u32,
+        generation: u64,
+        format: vk::Format,
+    ) -> bool {
+        self.width == width
+            && self.height == height
+            && self.generation == generation
+            && self.color_format == format
+    }
+}
+
 /// Geometry+format key for the resident-target recycle pool (`target_free`).
 /// The registry keys targets by [`TargetIdentity`], which folds `generation`
 /// into Hash/Eq — a per-frame content-changing target (video output, a live
@@ -1964,5 +1999,86 @@ mod staging_mapping_tests {
         pools.recycle_readback();
         unsafe { pools.destroy_all(&ctx.device) };
         unsafe { ctx.destroy() };
+    }
+}
+
+#[cfg(test)]
+mod resident_reuse_tests {
+    use super::ResidentTargetSlot;
+    use crate::backend::vulkan::translate;
+    use ash::vk;
+
+    /// A slot with nothing in it but the words reuse turns on.
+    fn slot(width: u32, height: u32, generation: u64, format: vk::Format) -> ResidentTargetSlot {
+        ResidentTargetSlot {
+            image: vk::Image::null(),
+            memory: vk::DeviceMemory::null(),
+            view: vk::ImageView::null(),
+            framebuffer: vk::Framebuffer::null(),
+            render_pass: vk::RenderPass::null(),
+            width,
+            height,
+            generation,
+            content_ready: false,
+            content_epoch: None,
+            layout: vk::ImageLayout::UNDEFINED,
+            // Stored exactly as `registry_ensure_color` stores it, which is what
+            // makes the secondary slot below read `bgra == false`.
+            bgra: format == translate::pixel::SCANOUT_FORMAT,
+            color_format: format,
+            pin_count: 0,
+            last_touch_ms: 0,
+            use_seq: 0,
+        }
+    }
+
+    /// The MRT secondary path's slot is not re-usable as a primary attachment,
+    /// however well its geometry lines up.
+    ///
+    /// Both `registry_ensure*` arms write one `registry` keyed by identity, and
+    /// an identity does cross between them. The primary arm used to test
+    /// `slot.bgra`, and a secondary slot created for an `RG16Float` vibrancy
+    /// mask stores `bgra == false` because its format is not the scanout one —
+    /// so it matched a primary request for RGBA8, whose format is *also* not the
+    /// scanout one, and the arm went on to build a framebuffer with an RGBA8
+    /// render pass over an `RG16Float` view. Vulkan requires those to agree.
+    #[test]
+    fn a_secondary_format_slot_is_not_reused_as_a_primary_attachment() {
+        let rgba = translate::pixel::resident_color(false);
+        let bgra = translate::pixel::resident_color(true);
+        assert_ne!(rgba, bgra, "the two bgra values must name two formats");
+
+        let secondary = slot(64, 32, 7, vk::Format::R16G16_SFLOAT);
+        assert!(
+            !secondary.bgra,
+            "a non-scanout secondary format stores bgra=false, which is what \
+             made the one-bit test match"
+        );
+        assert!(
+            !secondary.reusable_for(64, 32, 7, rgba),
+            "an RG16Float image must not be handed to an RGBA8 attachment"
+        );
+        assert!(!secondary.reusable_for(64, 32, 7, bgra));
+        assert!(
+            secondary.reusable_for(64, 32, 7, vk::Format::R16G16_SFLOAT),
+            "the secondary path must still get its own slot back"
+        );
+    }
+
+    /// The format test is a strengthening, not a replacement: everything the
+    /// geometry and generation tests rejected is still rejected, and a primary
+    /// slot still matches its own request.
+    #[test]
+    fn geometry_generation_and_format_all_still_decide_reuse() {
+        let rgba = translate::pixel::resident_color(false);
+        let s = slot(64, 32, 7, rgba);
+        assert!(s.reusable_for(64, 32, 7, rgba));
+        assert!(!s.reusable_for(65, 32, 7, rgba), "width");
+        assert!(!s.reusable_for(64, 33, 7, rgba), "height");
+        assert!(!s.reusable_for(64, 32, 8, rgba), "generation");
+        assert!(
+            !s.reusable_for(64, 32, 7, translate::pixel::resident_color(true)),
+            "format still separates the two bgra orders"
+        );
     }
 }

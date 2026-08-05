@@ -376,14 +376,11 @@ impl ResourcePools {
         counters: &EngineCounters,
     ) -> Result<&ResidentTargetSlot, DrawError> {
         // Compatible geometry + gen + format: reuse image; rebuild FB if pass
-        // changed. A format (bgra) change must recreate the image, not just the
+        // changed. A format change must recreate the image, not just the
         // framebuffer — an RGBA image under a BGRA pass is invalid.
+        let format = translate::pixel::resident_color(bgra);
         if let Some(slot) = self.registry.get(&identity) {
-            if slot.width == width
-                && slot.height == height
-                && slot.generation == generation
-                && slot.bgra == bgra
-            {
+            if slot.reusable_for(width, height, generation, format) {
                 if slot.render_pass == render_pass {
                     counters
                         .gpu_load_hits
@@ -443,7 +440,6 @@ impl ResourcePools {
             | vk::ImageUsageFlags::TRANSFER_SRC
             | vk::ImageUsageFlags::TRANSFER_DST
             | vk::ImageUsageFlags::SAMPLED;
-        let format = translate::pixel::resident_color(bgra);
         // Reuse a recycled image+memory+view of identical (geometry, format)
         // before allocating a fresh one — the usage set is identical across all
         // registry targets, so a recycled image of the same geometry/format is
@@ -581,11 +577,7 @@ impl ResourcePools {
         counters: &EngineCounters,
     ) -> Result<(vk::Image, vk::ImageView), DrawError> {
         if let Some(slot) = self.registry.get(&identity) {
-            if slot.width == width
-                && slot.height == height
-                && slot.generation == generation
-                && slot.color_format == format
-            {
+            if slot.reusable_for(width, height, generation, format) {
                 counters
                     .gpu_load_hits
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
