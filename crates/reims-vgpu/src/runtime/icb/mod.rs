@@ -1123,17 +1123,22 @@ pub fn load_icb_descriptor<M: HostMemory + HostOps>(
     if icb_ref == 0 {
         return Err(IcbStatus::Missing("icb_desc_ref_zero"));
     }
-    let entry = objects::lookup_list_entry(state, host, task_id, icb_ref).ok_or(
-        IcbStatus::Missing(crate::observe::ladder_slug!("icb", no_list_entry)),
-    )?;
-    if entry.object_type != OBJECT_TYPE_TYPE7 {
-        return Err(IcbStatus::BadDescriptor(crate::observe::ladder_slug!(
-            "icb", wrong_type
-        )));
-    }
-    let desc = objects::read_descriptor(state, host, task_id, &entry).ok_or(IcbStatus::Missing(
-        crate::observe::ladder_slug!("icb", desc_read),
-    ))?;
+    // The two statuses this rail splits the ladder into, stated once: a tag that
+    // is not type-7 means the guest described something, wrongly, while a
+    // missing entry or unreadable bytes mean it described nothing this device
+    // can see yet.
+    let (_entry, desc) =
+        objects::resolve_descriptor(state, host, task_id, icb_ref, &[OBJECT_TYPE_TYPE7]).map_err(
+            |rung| {
+                let slug = crate::observe::ladder_slugs!("icb")(rung);
+                match rung {
+                    objects::LadderRung::NoListEntry | objects::LadderRung::DescRead => {
+                        IcbStatus::Missing(slug)
+                    }
+                    objects::LadderRung::WrongType { .. } => IcbStatus::BadDescriptor(slug),
+                }
+            },
+        )?;
     match decode_type7_descriptor(&desc) {
         Ok(ResourceDescriptor::IndirectCommandBuffer(icb)) => {
             note_unapplied_icb_flags(task_id, icb_ref, &icb);

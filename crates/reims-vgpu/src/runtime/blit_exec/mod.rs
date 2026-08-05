@@ -485,24 +485,14 @@ fn resolve_buffer<M: HostMemory + HostOps>(
     if buffer_ref == 0 {
         return Err(br(BlitStatus::MissingResource, "buf_ref_zero"));
     }
-    let Some(entry) = objects::lookup_list_entry(state, host, task_id, buffer_ref) else {
-        return Err(br(
-            BlitStatus::MissingResource,
-            crate::observe::ladder_slug!("buf", no_list_entry),
-        ));
-    };
-    if entry.object_type != OBJECT_TYPE_BUFFER {
-        return Err(br(
-            BlitStatus::MissingResource,
-            crate::observe::ladder_slug!("buf", wrong_type),
-        ));
-    }
-    let Some(bytes) = objects::read_descriptor(state, host, task_id, &entry) else {
-        return Err(br(
-            BlitStatus::MissingResource,
-            crate::observe::ladder_slug!("buf", desc_read),
-        ));
-    };
+    let (_entry, bytes) =
+        objects::resolve_descriptor(state, host, task_id, buffer_ref, &[OBJECT_TYPE_BUFFER])
+            .map_err(|rung| {
+                br(
+                    BlitStatus::MissingResource,
+                    crate::observe::ladder_slugs!("buf")(rung),
+                )
+            })?;
     let Ok(buf) = decode_buffer_descriptor(&bytes) else {
         return Err(br(
             BlitStatus::MissingResource,

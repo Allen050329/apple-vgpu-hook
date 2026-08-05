@@ -93,7 +93,40 @@ macro_rules! ladder_slug {
     };
 }
 
-pub(crate) use ladder_slug;
+/// The slug one role gives each rung of
+/// [`crate::runtime::objects::resolve_descriptor`]'s refusal.
+///
+/// Expands to a closure, so a call site that has just been handed a
+/// [`LadderRung`](crate::runtime::objects::LadderRung) turns it into that
+/// rail's own `&'static str` in one expression:
+///
+/// ```ignore
+/// objects::resolve_descriptor(state, host, task_id, buffer_ref, &[OBJECT_TYPE_BUFFER])
+///     .map_err(|rung| br(BlitStatus::MissingResource, ladder_slugs!("buf")(rung)))?
+/// ```
+///
+/// The match is exhaustive over the rungs, so adding one to the enum breaks
+/// every rail here rather than letting a rail fall through to a catch-all —
+/// which is the whole reason the rung is a value and not a string.
+macro_rules! ladder_slugs {
+    ($role:literal) => {
+        |rung: $crate::runtime::objects::LadderRung| -> &'static str {
+            match rung {
+                $crate::runtime::objects::LadderRung::NoListEntry => {
+                    $crate::observe::ladder_slug!($role, no_list_entry)
+                }
+                $crate::runtime::objects::LadderRung::WrongType { .. } => {
+                    $crate::observe::ladder_slug!($role, wrong_type)
+                }
+                $crate::runtime::objects::LadderRung::DescRead => {
+                    $crate::observe::ladder_slug!($role, desc_read)
+                }
+            }
+        }
+    };
+}
+
+pub(crate) use {ladder_slug, ladder_slugs};
 
 #[cfg(test)]
 mod tests {

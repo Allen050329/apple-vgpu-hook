@@ -891,6 +891,67 @@ pub fn read_descriptor<M: HostMemory>(
     Some(buf)
 }
 
+/// Which rung of the object-list ladder refused, as a value rather than a
+/// spelling.
+///
+/// [`crate::observe::ladder_slug`] made the four rungs share one *vocabulary*;
+/// this makes the first three share one *implementation*. A rail that matches on
+/// this cannot skip the type check, cannot ask the three questions out of order,
+/// and cannot invent a fourth condition between them — all three of which a
+/// hand-written ladder can do silently.
+///
+/// The decode rung is deliberately absent. Its decoder differs per object type
+/// and returns that decoder's own error, so folding it in here would mean either
+/// one resolver per type or a decoder trait, and neither buys anything the call
+/// site does not already have.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LadderRung {
+    /// The guest has put nothing under this ref. Ordinary while a task's list is
+    /// still being populated, which is why several rails answer it quietly.
+    NoListEntry,
+    /// Something is under the ref and it is not a type this caller accepts.
+    ///
+    /// Carries the tag it found, because every rail that reports this rung was
+    /// formatting `ot={}` by hand from the entry it no longer has by then.
+    WrongType { got: u8 },
+    /// The entry names descriptor bytes that could not be read — the ref is
+    /// live, and its descriptor GVA is not mapped right now.
+    DescRead,
+}
+
+/// Look `obj_ref` up in `task_id`'s list, require its type to be one of `want`,
+/// and read its descriptor bytes.
+///
+/// The first three rungs of the ladder about twenty rails open with, in the one
+/// order they can be asked: a type tag cannot be checked before the entry is
+/// found, and a descriptor cannot be read before the entry says where it is.
+///
+/// `want` is a slice because several rails accept more than one tag —
+/// `OBJECT_TYPE_TEXTURE` and `OBJECT_TYPE_TEXTURE_VARIANT` are the standing
+/// pair — and a single-tag caller passes a one-element slice rather than a
+/// second entry point that would drift from this one.
+///
+/// `ref_ == 0` is **not** handled here. An unbound ref is a different statement
+/// from a ref naming nothing, several rails treat it as expected control flow
+/// and stay silent, and `AGENTS.md` names it as one of the things that must not
+/// be logged. Callers that care test it before calling.
+pub fn resolve_descriptor<M: HostMemory>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    obj_ref: u32,
+    want: &[u8],
+) -> Result<(ListObjectEntry, Vec<u8>), LadderRung> {
+    let entry = lookup_list_entry(state, host, task_id, obj_ref).ok_or(LadderRung::NoListEntry)?;
+    if !want.contains(&entry.object_type) {
+        return Err(LadderRung::WrongType {
+            got: entry.object_type,
+        });
+    }
+    let bytes = read_descriptor(state, host, task_id, &entry).ok_or(LadderRung::DescRead)?;
+    Ok((entry, bytes))
+}
+
 /// Resolve object ref and, if type-11, latch mapping geometry + cache the entry.
 ///
 /// Returns the mapping_id for type-11 textures, or None.

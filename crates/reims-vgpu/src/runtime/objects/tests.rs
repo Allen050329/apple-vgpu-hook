@@ -1368,3 +1368,61 @@ fn undecoded_type4_span_is_exactly_what_the_decoder_skips() {
     // span that would compare unequal against every real one.
     assert!(undecoded_type4_surface_bytes(&a[..TYPE4_MIN_LEN - 1]).is_empty());
 }
+
+/// The shared ladder asks its three questions in the only order they can be
+/// asked, and names which one refused.
+///
+/// The order is the point, not an implementation detail: a type tag cannot be
+/// checked before the entry is found, and a descriptor cannot be read before the
+/// entry says where it is. Twenty rails wrote this out by hand and any of them
+/// could have reordered or dropped a rung without the compiler noticing — which
+/// is what [`LadderRung`] being a value rather than three separate `else`
+/// branches removes.
+#[test]
+fn the_shared_ladder_names_the_rung_that_refused() {
+    use crate::runtime::decode::resource::{OBJECT_TYPE_BUFFER, OBJECT_TYPE_IOSURFACE};
+
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task_with_list(&mut host, &mut state);
+
+    // Ref 1 is a type-11 entry whose descriptor is mapped: all three rungs pass.
+    let (entry, bytes) =
+        resolve_descriptor(&state, &host, 1, 1, &[OBJECT_TYPE_IOSURFACE]).expect("all rungs pass");
+    assert_eq!(entry.object_type, OBJECT_TYPE_IOSURFACE);
+    assert!(!bytes.is_empty(), "the descriptor bytes come back with it");
+
+    // Same ref, asked for as a buffer: the tag it found travels with the
+    // refusal, so a rail no longer re-formats `ot=` from an entry it has
+    // already dropped.
+    assert_eq!(
+        resolve_descriptor(&state, &host, 1, 1, &[OBJECT_TYPE_BUFFER]),
+        Err(LadderRung::WrongType {
+            got: OBJECT_TYPE_IOSURFACE
+        })
+    );
+
+    // A ref past the end of the list. Asked for *no* acceptable type at all, so
+    // a resolver that checked the tag first would have to answer `WrongType`;
+    // answering `NoListEntry` is what proves the lookup runs first.
+    assert_eq!(
+        resolve_descriptor(&state, &host, 1, 9999, &[]),
+        Err(LadderRung::NoListEntry)
+    );
+
+    // An entry whose descriptor GVA is not mapped: found, right type, unreadable
+    // — the rung that separates "the guest never registered this" from "the
+    // guest registered it and its descriptor is not resident right now".
+    let data_gpa = 4u64 << PAGE_SHIFT_ARM64E;
+    let mut entry = [0u8; 12];
+    st32(
+        &mut entry[0..],
+        u32::from(OBJECT_TYPE_IOSURFACE) | (0x20u32 << 8),
+    );
+    entry[4..12].copy_from_slice(&0xdead_0000u64.to_le_bytes());
+    let _ = host.write_gpa(data_gpa + 24, &entry);
+    assert_eq!(
+        resolve_descriptor(&state, &host, 1, 2, &[OBJECT_TYPE_IOSURFACE]),
+        Err(LadderRung::DescRead)
+    );
+}
