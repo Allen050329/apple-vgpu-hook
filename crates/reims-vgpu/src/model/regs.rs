@@ -225,9 +225,14 @@ pub const SET_OBJECT_LIST_PFN: usize = 0x04;
 pub const SET_OBJECT_LIST_COUNT: usize = 0x08;
 pub const SET_OBJECT_LIST_LEN: usize = 12;
 
+// `CmdDisplaySwapMapping`'s trailer is `[display][_][mapping]`. Only the
+// mapping is read; the display index has no reader here, and it stays named
+// because a decoded guest field with no name is the one nobody notices being
+// ignored. Whether ignoring it is correct is not established — it needs the
+// display count this device advertises, which no boot on this rig has
+// measured. Its own length lives at `display_txn_trailer_len`.
 pub const DISPLAY_SWAP_DISPLAY: usize = 0x00;
 pub const DISPLAY_SWAP_MAPPING: usize = 0x08;
-pub const DISPLAY_SWAP_MIN_LEN: usize = 12;
 
 pub const CHILD_SHARED_STATE_INDEX: usize = 0x00;
 pub const CHILD_SHARED_STATE_PFN: usize = 0x04;

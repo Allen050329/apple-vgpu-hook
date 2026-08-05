@@ -203,9 +203,12 @@ pub const TYPE5_MIN_LEN: usize = 0x08;
 ///   geometry carries 2 (the alpha plane). Geometry cannot disambiguate Y from
 ///   alpha; this field is the only wire key. (The type-11 texture descriptor
 ///   carries no such field — that finding is unchanged.)
-pub const TYPE5_ARG_KIND: usize = TYPE5_ARGS;
-pub const TYPE5_ARG_BLOB_LEN: usize = TYPE5_ARGS + 0x04;
-pub const TYPE5_ARG_OWN_REF: usize = TYPE5_ARGS + 0x08;
+#[cfg(test)]
+pub(crate) const TYPE5_ARG_KIND: usize = TYPE5_ARGS;
+#[cfg(test)]
+pub(crate) const TYPE5_ARG_BLOB_LEN: usize = TYPE5_ARGS + 0x04;
+#[cfg(test)]
+pub(crate) const TYPE5_ARG_OWN_REF: usize = TYPE5_ARGS + 0x08;
 pub const TYPE5_ARG_RECORD: usize = TYPE5_ARGS + 0x0c;
 pub const TYPE5_RECORD_TAG: u8 = 0x42;
 /// Sibling record tag observed live on the blit copy-source path (x86 Ventura

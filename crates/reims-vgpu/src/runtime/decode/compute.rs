@@ -5,7 +5,6 @@ use reims_vgpu_wire::ops::compute as wire;
 
 /// Shared serializer op-header length from `reims-vgpu-wire`.
 use reims_vgpu_wire::OP_HEADER_LEN;
-pub const SIZE3_SIZE: usize = 24;
 
 /// Residency on the compute rail, and the one pair here with no selector
 /// behind it.
