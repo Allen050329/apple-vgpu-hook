@@ -43,17 +43,26 @@ fn narrow_count(value: u64) -> Result<u32, DecodeStatus> {
 pub const DRAW_COMPACT_PAYLOAD_LEN: usize = 8;
 /// Compact draw total length including the shared op header.
 pub const DRAW_COMPACT_CMD_LEN: usize = OP_HEADER_LEN + DRAW_COMPACT_PAYLOAD_LEN;
-/// Fixed total lengths for ICB execute records (header + payload). Prefer
-/// `wire::EXECUTE_COMMANDS_*_TOTAL_LEN` at new call sites; these remain for
-/// historical tests and local checks that already use them.
-pub const EXECUTE_INDIRECT_CMD_LEN: usize = 0x18;
-pub const EXECUTE_RANGE_CMD_LEN: usize = 0x1c;
-pub const EXECUTE_INDIRECT_COMMAND_BUFFER_REF: usize = 0;
-pub const EXECUTE_INDIRECT_BUFFER_REF: usize = 4;
-pub const EXECUTE_INDIRECT_BUFFER_OFFSET: usize = 8;
-pub const EXECUTE_RANGE_COMMAND_BUFFER_REF: usize = 0;
-pub const EXECUTE_RANGE_LOCATION: usize = 4;
-pub const EXECUTE_RANGE_LENGTH: usize = 0x0c;
+/// Fixed total lengths and field offsets for the two ICB execute records.
+///
+/// From the wire views, like the draw layouts above them and for the same
+/// reason. These were eight literals with a note beside them saying to prefer
+/// `wire::EXECUTE_COMMANDS_*_TOTAL_LEN` at new call sites — which leaves the old
+/// sites reading a second transcription, and a note is not a mechanism.
+pub const EXECUTE_INDIRECT_CMD_LEN: usize = wire::EXECUTE_COMMANDS_INDIRECT_TOTAL_LEN as usize;
+pub const EXECUTE_RANGE_CMD_LEN: usize = wire::EXECUTE_COMMANDS_RANGE_TOTAL_LEN as usize;
+pub const EXECUTE_INDIRECT_COMMAND_BUFFER_REF: usize =
+    core::mem::offset_of!(wire::ExecuteCommandsIndirect, icb_ref);
+pub const EXECUTE_INDIRECT_BUFFER_REF: usize =
+    core::mem::offset_of!(wire::ExecuteCommandsIndirect, indirect_buffer_ref);
+pub const EXECUTE_INDIRECT_BUFFER_OFFSET: usize =
+    core::mem::offset_of!(wire::ExecuteCommandsIndirect, indirect_buffer_offset);
+pub const EXECUTE_RANGE_COMMAND_BUFFER_REF: usize =
+    core::mem::offset_of!(wire::ExecuteCommandsRange, icb_ref);
+pub const EXECUTE_RANGE_LOCATION: usize =
+    core::mem::offset_of!(wire::ExecuteCommandsRange, range_location);
+pub const EXECUTE_RANGE_LENGTH: usize =
+    core::mem::offset_of!(wire::ExecuteCommandsRange, range_length);
 
 /// Render-pass attachment layout, taken from the wire structs' own fields.
 ///
@@ -114,41 +123,43 @@ pub const PASS_STORE_ACTION_STORE: u16 = 1;
 pub const PASS_MIN_PAYLOAD: usize = PASS_COLOR_ATTACH_OFF + PASS_COLOR_ATTACH_STRIDE;
 /// Count width of `setScissorRects:count:` — eight bytes, not the four used by
 /// `setViewports:count:`. The element is the singular scissor payload.
-pub const SCISSOR_RECTS_COUNT_LEN: usize = 8;
+pub const SCISSOR_RECTS_COUNT_LEN: usize = core::mem::size_of::<wire::SetScissorRects>();
 /// Bytes one LOD-bearing sampler entry occupies: ref, then two `f32` clamps.
-pub const SAMPLER_LOD_BIND_ENTRY_SIZE: usize = 12;
+pub const SAMPLER_LOD_BIND_ENTRY_SIZE: usize = core::mem::size_of::<wire::SamplerLodBind>();
 /// Count width of `setViewports:count:` — four bytes (see [`SCISSOR_RECTS_COUNT_LEN`]).
-pub const VIEWPORTS_COUNT_LEN: usize = 4;
+pub const VIEWPORTS_COUNT_LEN: usize = core::mem::size_of::<wire::SetViewports>();
 
 /// Residency record head: `count:u32` at `+0` on both forms.
 ///
 /// Wire opcodes are `wire::OPCODE_USE_HEAP` (`0x1b`) and
 /// `wire::OPCODE_USE_RESOURCE` (`0x89`); the old `0x86`/`0x87` pair is not
 /// residency (see `the_residency_opcodes_are_the_ones_apples_serializer_writes`).
-pub const RESIDENCY_COUNT: usize = 0;
+pub const RESIDENCY_COUNT: usize = core::mem::offset_of!(wire::UseResource, count);
 /// `useResource:` packs `usage` and `stages` into the word at `+4` as two
-/// `u16`s, so its refs begin at `+8`.
-pub const USE_RESOURCE_REFS: usize = 8;
+/// `u16`s, so its refs begin at `+8` — the size of the head the view declares.
+pub const USE_RESOURCE_REFS: usize = core::mem::size_of::<wire::UseResource>();
 /// `useHeap:` has no `usage` at all: `stages` sits alone at `+4` as a `u16` and
 /// the refs begin at `+6`. That offset is deliberately not a multiple of four —
 /// reading this record with the resource record's layout skips the first heap.
-pub const USE_HEAP_REFS: usize = 6;
+/// Two heads that differ by one field is exactly the pair that must not be two
+/// numbers here, so both are the view's own size.
+pub const USE_HEAP_REFS: usize = core::mem::size_of::<wire::UseHeap>();
 
-/// Multi-entry bind header (reims_vgpu_render_format.h): first:u32 @0, count:u32 @4.
-pub const BIND_FIRST: usize = 0;
-pub const BIND_COUNT: usize = 4;
-pub const BIND_ENTRIES: usize = 8;
-pub const BUFFER_BIND_ENTRY_SIZE: usize = 12;
+/// Multi-entry bind header: `first:u32 @0`, `count:u32 @4`, entries after it.
+pub const BIND_FIRST: usize = core::mem::offset_of!(wire::BindHeader, first);
+pub const BIND_COUNT: usize = core::mem::offset_of!(wire::BindHeader, count);
+pub const BIND_ENTRIES: usize = core::mem::size_of::<wire::BindHeader>();
+pub const BUFFER_BIND_ENTRY_SIZE: usize = core::mem::size_of::<wire::BufferBind>();
 /// The same entry with a `u64` attribute stride appended. See
 /// [`wire::OPCODE_SET_VERTEX_BUFFER_STRIDE`].
-pub const BUFFER_STRIDE_BIND_ENTRY_SIZE: usize = 20;
+pub const BUFFER_STRIDE_BIND_ENTRY_SIZE: usize = core::mem::size_of::<wire::BufferStrideBind>();
 /// `setVertexAmplificationCount:viewMappings:`: a four-byte count, then one
 /// `MTLVertexAmplificationViewMapping` (two `u32`) per view.
-pub const AMPLIFICATION_COUNT_LEN: usize = 4;
-pub const AMPLIFICATION_MAPPING_SIZE: usize = 8;
-pub const BUFFER_BIND_ENTRY_REF: usize = 0;
-pub const BUFFER_BIND_ENTRY_OFFSET: usize = 4;
-pub const REF_BIND_ENTRY_SIZE: usize = 4;
+pub const AMPLIFICATION_COUNT_LEN: usize = core::mem::size_of::<wire::VertexAmplificationHeader>();
+pub const AMPLIFICATION_MAPPING_SIZE: usize = core::mem::size_of::<wire::ViewMapping>();
+pub const BUFFER_BIND_ENTRY_REF: usize = core::mem::offset_of!(wire::BufferBind, buffer_ref);
+pub const BUFFER_BIND_ENTRY_OFFSET: usize = core::mem::offset_of!(wire::BufferBind, offset);
+pub const REF_BIND_ENTRY_SIZE: usize = core::mem::size_of::<wire::RefBind>();
 
 /// Bytes a bind record needs for `count` entries of `entry_size`, or `None` if
 /// no record could be that long.
@@ -171,15 +182,15 @@ pub fn bind_record_len(count: u32, entry_size: usize) -> Option<usize> {
         .and_then(|n| n.checked_add(BIND_ENTRIES))
 }
 /// set*BufferOffset: index:u32 @0, offset:u64 @4 (payload 12; full cmd 0x14).
-pub const BUFFER_OFFSET_INDEX: usize = 0;
-pub const BUFFER_OFFSET_VALUE: usize = 4;
-pub const BUFFER_OFFSET_PAYLOAD_LEN: usize = 12;
-/// setScissorRect: four u64 fields (archive REIMS_VGPU_RENDER_SCISSOR_*).
-pub const SCISSOR_X: usize = 0;
-pub const SCISSOR_Y: usize = 8;
-pub const SCISSOR_WIDTH: usize = 0x10;
-pub const SCISSOR_HEIGHT: usize = 0x18;
-pub const SCISSOR_PAYLOAD_LEN: usize = 0x20;
+pub const BUFFER_OFFSET_INDEX: usize = core::mem::offset_of!(wire::BufferOffset, index);
+pub const BUFFER_OFFSET_VALUE: usize = core::mem::offset_of!(wire::BufferOffset, offset);
+pub const BUFFER_OFFSET_PAYLOAD_LEN: usize = core::mem::size_of::<wire::BufferOffset>();
+/// setScissorRect: the four `u64` fields of one scissor rectangle.
+pub const SCISSOR_X: usize = core::mem::offset_of!(wire::ScissorRect, x);
+pub const SCISSOR_Y: usize = core::mem::offset_of!(wire::ScissorRect, y);
+pub const SCISSOR_WIDTH: usize = core::mem::offset_of!(wire::ScissorRect, width);
+pub const SCISSOR_HEIGHT: usize = core::mem::offset_of!(wire::ScissorRect, height);
+pub const SCISSOR_PAYLOAD_LEN: usize = core::mem::size_of::<wire::ScissorRect>();
 
 // Supported window is the full C-accepted encoder range 0x00..=0x98 minus rejected.
 
