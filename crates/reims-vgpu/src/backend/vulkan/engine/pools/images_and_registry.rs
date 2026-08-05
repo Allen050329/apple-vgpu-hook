@@ -960,6 +960,203 @@ impl ResourcePools {
             slot.layout = layout;
         }
     }
+
+    /// Count of registry residents NOT held by a deferred-write pin — the
+    /// LRU-evictable (active) working set the `REGISTRY_CAP` bounds. Pinned slots
+    /// are bounded separately (by the arming rail's own window cap) and excluded
+    /// so a pinned burst cannot force the active set into eviction thrash.
+    fn non_pinned_registry_len(&self) -> usize {
+        let pinned = self
+            .registry
+            .values()
+            .filter(|slot| slot.pin_count > 0)
+            .count();
+        self.registry_order.len().saturating_sub(pinned)
+    }
+
+    /// Evict non-pinned resident targets (LRU, oldest at the front of
+    /// `registry_order`) until the non-pinned population is at or below
+    /// [`REGISTRY_CAP`]. Pinned slots (deferred render Stores whose only copy is
+    /// on the GPU) and an optional `protect`ed identity rotate to the back
+    /// instead of evicting — they are bounded separately and must not count
+    /// toward the cap, or a pinned burst would force the active set out (thrash).
+    /// One full rotation is the budget. `registry_order` is a `VecDeque`, so each
+    /// front pop / rotate-to-back is O(1) and the whole sweep is O(n) — not the
+    /// O(n²) a `Vec` front-`remove(0)` per rotation would cost under a large
+    /// pinned population (`reg=512` measured under multi-4K load).
+    ///
+    /// Shared by both admit paths (`registry_ensure` passes the just-resolved
+    /// identity as `protect`; `registry_ensure_color` passes `None`).
+    unsafe fn evict_registry_to_cap(
+        &mut self,
+        ctx: &DeviceContext,
+        counters: &EngineCounters,
+        protect: Option<&TargetIdentity>,
+    ) {
+        let mut non_pinned = self.non_pinned_registry_len();
+        while non_pinned > REGISTRY_CAP {
+            // Least-recently-used, for real. `registry_order` is insertion
+            // order — nothing promotes an entry when a draw reuses it — so
+            // popping its front evicted the oldest-*created* resident. A
+            // compositor backdrop is created early and lives for the whole
+            // session, which made it the permanent front and the first victim of
+            // every burst, however hard the current frame was reading it.
+            //
+            // Selecting the minimum `last_touch_ms` protects an in-use resident
+            // without giving up the hard bound: skipping recent entries instead
+            // would let a burst that touches more than `REGISTRY_CAP` targets
+            // inside `IDLE_TARGET_AGE_MS` evict nothing at all and grow the
+            // registry without limit. Here the cap always finds a victim while
+            // any evictable entry exists, and the victim is never more recently
+            // used than an alternative.
+            //
+            // Iterating `registry_order` rather than the map keeps the choice
+            // deterministic: `min_by_key` returns the first minimum, so ties
+            // fall to the oldest-created entry, which is what this walk did for
+            // every entry before. O(n) per eviction rather than O(1) amortised,
+            // and evictions are rare next to binds — the cost this avoids
+            // paying is a promotion on every sampled bind of every draw.
+            let victim = self.cap_eviction_victim(protect);
+            // Everything left is pinned or protected. Pinned residents are
+            // bounded separately by the rail that armed them, so the registry
+            // soft-exceeds the cap rather than dropping content whose only copy
+            // is on the GPU — the trade this walk has always made.
+            let Some(victim) = victim else {
+                break;
+            };
+            self.retire_resident(ctx, &victim, ResidentReclaim::CapEvicted, counters);
+            non_pinned = non_pinned.saturating_sub(1);
+        }
+    }
+
+    /// Refresh a resident's idle-drain timestamp to at least `now_ms`. Used by
+    /// host-window direct present before the export attempt so offscreen
+    /// compositor peers needed for route-B tile compositing do not age out while
+    /// the displayed member remains active.
+    pub(crate) fn registry_touch_at(&mut self, identity: &TargetIdentity, now_ms: u64) {
+        if now_ms > self.idle_clock_ms {
+            self.idle_clock_ms = now_ms;
+        }
+        let touch = self.idle_clock_ms;
+        self.use_clock += 1;
+        let seq = self.use_clock;
+        if let Some(slot) = self.registry.get_mut(identity) {
+            slot.last_touch_ms = touch;
+            slot.use_seq = seq;
+        }
+    }
+
+    /// Remember that `identity`'s resident was reclaimed, and by which path.
+    ///
+    /// Called from every site that removes a live registry entry, so a later
+    /// draw sampling it can distinguish "taken from under you" from "never
+    /// existed". Bounded FIFO; the oldest record is dropped rather than letting
+    /// a diagnostic grow without limit.
+    pub(crate) fn note_resident_reclaimed(
+        &mut self,
+        identity: &TargetIdentity,
+        why: ResidentReclaim,
+    ) {
+        if self.reclaimed_recent.len() >= RECLAIM_HISTORY {
+            self.reclaimed_recent.pop_front();
+        }
+        self.reclaimed_recent.push_back((identity.clone(), why));
+    }
+
+    /// The most recent thing this device did with `identity`'s resident, if it
+    /// is still inside the history window. `None` means no record — which covers
+    /// both "never held one" and "reclaimed longer ago than the window reaches",
+    /// two cases this deliberately does not guess between.
+    pub(crate) fn prior_reclaim(&self, identity: &TargetIdentity) -> Option<ResidentReclaim> {
+        self.reclaimed_recent
+            .iter()
+            .rev()
+            .find(|(k, _)| k == identity)
+            .map(|(_, why)| *why)
+    }
+
+    /// Record that a draw is reading this resident as a **sampled source**, so
+    /// both reclaim paths count it as in use.
+    ///
+    /// Reading a resident was not a use. `last_touch_ms` was refreshed by
+    /// `registry_ensure` (a draw rendering *into* the target), by the present
+    /// touch, and by nothing else — while the sampled-source resolve in
+    /// `execute_draw_inner` goes through `registry_get`, which takes `&self` and
+    /// therefore cannot mark anything. A resident that every frame samples but
+    /// no frame draws into consequently aged as if it were abandoned.
+    ///
+    /// That is the shape of a compositor backdrop: the desktop behind a
+    /// translucent panel is rendered once and then read by every vibrancy draw
+    /// over it. After `IDLE_TARGET_AGE_MS` the idle drain took it, and the drain
+    /// is a terminal destroy rather than a recycle, so the pixels were gone. The
+    /// next draw to sample it refuses with
+    /// `vk_draw_exec_sampled_resident_missing`, and because the exec loop
+    /// abandons the remaining records of a packet once a record cannot encode,
+    /// one missing backdrop drops a whole packet of draws.
+    ///
+    /// Nothing recreates a resident except a draw rendering into that identity,
+    /// so a backdrop the guest considers still valid is never rebuilt: the
+    /// refusal repeats for the life of the boot. That is why this class survives
+    /// closing the application that caused the pressure and why only a reboot
+    /// clears it.
+    /// The resident the capacity walk should evict next, or `None` when every
+    /// entry left is pinned or protected.
+    ///
+    /// Least-recently-used, chosen by `last_touch_ms`. Split out from
+    /// [`Self::evict_registry_to_cap`] because that function needs a live
+    /// `DeviceContext` to dispose what it evicts, and the choice — the part with
+    /// the policy in it — is worth testing without a GPU.
+    ///
+    /// Iterates `registry_order` rather than the map so the result is
+    /// deterministic: `min_by_key` returns the first minimum, so equal stamps
+    /// fall to the oldest-created entry.
+    fn cap_eviction_victim(&self, protect: Option<&TargetIdentity>) -> Option<TargetIdentity> {
+        self.registry_order
+            .iter()
+            .filter_map(|k| self.registry.get(k).map(|slot| (k, slot)))
+            .filter(|(k, slot)| slot.pin_count == 0 && protect != Some(k))
+            .min_by_key(|(_, slot)| slot.use_seq)
+            .map(|(k, _)| k.clone())
+    }
+
+    /// Record that a draw is reading this resident as a **sampled source**, so
+    /// both reclaim paths count it as in use.
+    ///
+    /// Reading a resident was not a use. `last_touch_ms` was refreshed by
+    /// `registry_ensure` (a draw rendering *into* the target), by the present
+    /// touch, and by nothing else — while the sampled-source resolve in
+    /// `execute_draw_inner` goes through `registry_get`, which takes `&self` and
+    /// therefore cannot mark anything. A resident that every frame samples but
+    /// no frame draws into consequently aged as if it were abandoned.
+    ///
+    /// That is the shape of a compositor backdrop: the desktop behind a
+    /// translucent panel is rendered once and then read by every vibrancy draw
+    /// over it. After `IDLE_TARGET_AGE_MS` the idle drain took it, and the drain
+    /// is a terminal destroy rather than a recycle, so the pixels were gone. The
+    /// next draw to sample it refuses with
+    /// `vk_draw_exec_sampled_resident_missing`, and because the exec loop
+    /// abandons the remaining records of a packet once a record cannot encode,
+    /// one missing backdrop drops a whole packet of draws.
+    ///
+    /// Nothing recreates a resident except a draw rendering into that identity,
+    /// so a backdrop the guest considers still valid is never rebuilt: the
+    /// refusal repeats for the life of the boot. That is why this class survives
+    /// closing the application that caused the pressure and why only a reboot
+    /// clears it.
+    ///
+    /// The stamp this writes is the one both reclaim paths read — the idle drain
+    /// compares it against `IDLE_TARGET_AGE_MS`, and the capacity walk evicts
+    /// the smallest — so recording a read here is what protects a resident from
+    /// each of them.
+    pub(crate) fn registry_note_sampled_use(&mut self, identity: &TargetIdentity) {
+        let touch = self.idle_clock_ms;
+        self.use_clock += 1;
+        let seq = self.use_clock;
+        if let Some(slot) = self.registry.get_mut(identity) {
+            slot.last_touch_ms = touch;
+            slot.use_seq = seq;
+        }
+    }
 }
 
 #[cfg(test)]
