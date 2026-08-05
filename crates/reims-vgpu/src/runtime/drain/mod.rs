@@ -2198,16 +2198,33 @@ fn process_child_packet<H: HostMemory + HostOps>(
                 }
             }
         }
-        // PVG bookkeeping family: accept + stamp (already below). Full PT/map
-        // semantics land with metal2vulkan encode; until then fail-visible
-        // UnknownChildOpcode flooded /tmp/reims-vgpu-fail and hid draw telemetry.
+        // The guest's memory-lifecycle family. All five share this arm because
+        // they share one obligation — say what the device owes the guest *before*
+        // the guest touches those pages itself — and each discharges it
+        // differently in the branches below:
+        //
+        // - `MapMemory2` / `UnmapMemory` retire the host views that alias the
+        //   pages whose PTEs just changed, and land any deferred render-Store
+        //   window overlapping the range cache-only.
+        // - `InvalidateResources` applies the guest's validity quad through the
+        //   same consumer the EXEC_INDIRECT2 resource table uses.
+        // - `SynchronizeResources` lands every deferred writeback for the named
+        //   objects: the guest is about to CPU-read them, and this is the only
+        //   host-visible choke point before it does.
+        // - `DeleteIOSurfaceBacking2` flushes the retired views at the backing's
+        //   own lifetime boundary.
+        //
+        // None of them writes a page the guest did not ask for. That restraint
+        // is the recurring finding here, stated at each branch: what looks like
+        // a missing implementation is usually the device declining to invent.
         CHILD_OP_UNMAP_MEMORY
         | CHILD_OP_MAP_MEMORY2
         | CHILD_OP_INVALIDATE_RESOURCES
         | CHILD_OP_SYNCHRONIZE_RESOURCES
         | CHILD_OP_DELETE_IOSURFACE_BACKING2 => {
-            // Stamp-complete for PT wire (no invent). Unmap/Map retire
-            // gva_host_views; verbose-gated map_probe census for stage Unmapped.
+            // Every branch below stamps the packet complete whatever it did with
+            // it: the guest is waiting on the stamp, and a lifecycle event this
+            // device chose not to act on is still an event the guest performed.
             //
             // Live MapMemory2 plen=20 layout lead (not yet contract-final):
             //   task_id@0 u32, gva@4 u64, length@12 u64  (matches fifo MapMemoryCommand).
