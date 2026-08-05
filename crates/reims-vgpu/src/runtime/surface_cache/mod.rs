@@ -1327,7 +1327,7 @@ pub fn note_cache_levels<H: HostMemory>(state: &DeviceState, host: &H) {
          gva_cap_evicted={cap_evicted} gva_cap_wanted={cap_wanted} \
          gva_cap_forgotten={cap_forgotten} \
          linear={} linear_bytes={} linear_largest={} \
-         task_id_max={} task_id_cap={} mapping_id_max={} mapping_id_cap={}",
+         task_id_max={} task_id_cap={} mapping_id_max={} mapping_id_cap=none",
         surfaces.entries,
         surfaces.bytes,
         surfaces.largest,
@@ -1338,15 +1338,19 @@ pub fn note_cache_levels<H: HostMemory>(state: &DeviceState, host: &H) {
         linear.entries,
         linear.bytes,
         linear.largest,
-        // The reach census for the two slot tables — see
+        // The reach census for the id spaces — see
         // [`DeviceState::max_task_id_seen`]. Here rather than in a line of their
         // own because this is already the device's "levels, not per-interval"
         // line, and these are levels: the highest id the guest has named, beside
         // the bound that would have refused it.
+        //
+        // `mapping_id_cap` reads the literal `none` because there is no longer a
+        // bound to compare against — `is_mapping_id` refuses only the unbound
+        // sentinel. The reach itself stays, and is now a level reading on the
+        // `mappings` map rather than a distance to a refusal.
         state.max_task_id_seen,
         crate::model::MAX_TASKS,
         state.max_mapping_id_seen,
-        crate::model::MAX_MAPPINGS,
     ));
 }
 

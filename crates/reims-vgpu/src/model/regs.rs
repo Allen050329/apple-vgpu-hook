@@ -134,9 +134,8 @@ pub const fn is_child_channel(channel_id: u32) -> bool {
 /// at 255 — both read zero.
 ///
 /// Driven x86/PCI boot, window-drag probe against Safari:
-/// `task_id_max=10 task_id_cap=256 mapping_id_max=42 mapping_id_cap=4096`, and
-/// no `model_*_id_range` refusal of any kind. That is 25x headroom on the task
-/// table and 97x on the mapping table.
+/// `task_id_max=10 task_id_cap=256`, and no `model_*_id_range` refusal of any
+/// kind. That is 25x headroom.
 ///
 /// So the fixed `[TaskEntry; MAX_TASKS]` array stays. Replacing it with a map
 /// keyed by the full `u32` would remove the refusal entirely, and it is the
@@ -144,26 +143,46 @@ pub const fn is_child_channel(channel_id: u32) -> bool {
 /// helper that takes `&state.tasks` as a slice, and this reading says the bound
 /// is nowhere near. Do that work when the census says it is needed; the census
 /// is there so the question has an answer instead of an argument.
+///
+/// The sibling bound this constant used to be paired with is gone. `MAX_MAPPINGS`
+/// was 4096 with the same "measured distance" justification, and the
+/// justification was not the point: `DeviceState::mappings` is a
+/// `BTreeMap<u32, MappingEntry>`, so there was never a slot to run out of. It
+/// refused ids the map would have held. The task table is not that — its
+/// storage really is `[TaskEntry; 256]` — which is why the same argument keeps
+/// one and not the other.
 pub const MAX_TASKS: usize = 256;
-/// See [`MAX_TASKS`] for why this is a measured bound rather than a derived one,
-/// and for the reading. Mapping ids start at 1: zero is the device-wide
-/// unbound sentinel — see [`is_mapping_id`].
-pub const MAX_MAPPINGS: usize = 4096;
 
-/// Whether `mapping_id` names a mapping slot rather than "no mapping".
+/// Whether `mapping_id` names a mapping rather than "no mapping".
 ///
 /// Zero is the device-wide sentinel for an unbound mapping — `runtime::draw`
 /// branches on `mapping_id == 0` in more than a dozen places to mean the
 /// attachment is addressed by GVA instead — so a record naming 0 is not a
-/// record naming slot 0, and creating `mappings[0]` for it produces state no
+/// record naming mapping 0, and creating `mappings[0]` for it produces state no
 /// sentinel-aware reader will ever consult.
 ///
 /// Four callers knew that and six did not: `runtime::texture` and the two
 /// type-4 backing paths in `runtime::objects` refused zero, while the five
 /// `DeviceState` mutators and `mapper::capture_published_request` bounded the
 /// id from above only.
+///
+/// # There is no upper bound, and there never should have been one
+///
+/// This used to also require `mapping_id < MAX_MAPPINGS` (4096). Nothing was
+/// indexed by that number. Every one of the five `DeviceState` mutators reaches
+/// `self.mappings.entry(mapping_id).or_default()` on a `BTreeMap` keyed by the
+/// full `u32`, and no other structure in the device is sized by mapping id — so
+/// the bound allocated nothing, protected nothing, and its only effect was that
+/// a guest naming id 4096 had its MAP, UNMAP, MappingInternal attach, device
+/// descriptor and geometry silently refused, and every type-4 surface backing
+/// with it. A mapping id is a full `u32` on the wire; the guest chooses it and
+/// the device is not entitled to an opinion about how large it is.
+///
+/// Zero stays refused because it is a *meaning*, not a size: the sentinel is
+/// read as "unbound" by the draw path, so a mapping stored under it could never
+/// be served.
 pub const fn is_mapping_id(mapping_id: u32) -> bool {
-    mapping_id >= 1 && (mapping_id as usize) < MAX_MAPPINGS
+    mapping_id >= 1
 }
 
 /// Largest scanout / surface edge the device accepts, in pixels.
@@ -926,8 +945,8 @@ mod tests {
         assert_eq!(child_reg_block_offset(MAX_CHANNELS as u32), None);
     }
 
-    /// Zero is refused because it is the "no mapping" sentinel, not because it
-    /// is out of range.
+    /// Zero is refused because it is the "no mapping" sentinel — and that is the
+    /// *only* id this predicate refuses.
     ///
     /// The five `DeviceState` mutators and `mapper::capture_published_request`
     /// bounded the id from above only, so a guest MAP naming mapping 0 — which
@@ -935,16 +954,22 @@ mod tests {
     /// `mappings[0]`. Every `runtime::draw` reader treats `mapping_id == 0` as "this
     /// attachment is addressed by GVA", so that entry is state nothing goes on
     /// to consult.
+    ///
+    /// The upper half of this test used to assert a 4096 ceiling. Its storage is
+    /// a `BTreeMap` keyed by the full `u32`, so the ceiling refused ids the map
+    /// would have held; `u32::MAX` is asserted *accepted* now, in the same place
+    /// it was once asserted refused, so a reinstated bound fails here.
     #[test]
-    fn the_mapping_id_bound_refuses_the_no_mapping_sentinel() {
+    fn the_mapping_id_bound_refuses_only_the_no_mapping_sentinel() {
         assert!(
             !is_mapping_id(0),
-            "0 names no mapping; it must not open a slot"
+            "0 names no mapping; it must not open an entry"
         );
         assert!(is_mapping_id(1));
-        assert!(is_mapping_id(MAX_MAPPINGS as u32 - 1));
-        assert!(!is_mapping_id(MAX_MAPPINGS as u32));
-        assert!(!is_mapping_id(u32::MAX));
+        assert!(
+            is_mapping_id(u32::MAX),
+            "a mapping id is a full u32 on the wire and its storage is a map"
+        );
     }
 
     /// The pre-boot console geometry, which both shims size a `DisplaySurface`

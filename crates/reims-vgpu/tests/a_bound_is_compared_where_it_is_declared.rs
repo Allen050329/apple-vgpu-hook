@@ -11,6 +11,13 @@
 //! | `MAX_SCANOUT_DIM` | 14 in 4 files | seven spelled the ceiling `>` and nothing checked the other seven did |
 //! | `MAX_CHANNELS` | 7 in 4 files | three wrote `id == 0 \|\| id >= MAX`, four wrote the exact negation |
 //! | `MAX_MAPPINGS` | 10 in 4 files | six omitted the zero test, and zero is the "no mapping" sentinel |
+//!
+//! `MAX_MAPPINGS` is no longer in [`BOUNDS`] because it no longer exists.
+//! Consolidating it into `is_mapping_id` is what made it readable that the
+//! ceiling half of the rule bounded nothing — `DeviceState::mappings` is a
+//! `BTreeMap` keyed by the full `u32` — so the rule kept its zero test and lost
+//! its ceiling. The row stays in this table: the drift it records is why the
+//! predicate exists, and the predicate is what the remaining callers use.
 //! | `REIMS_VGPU_METAL_MAX_BUFFERS` | 8 in 4 files | a helper stating the rule existed, and five sites did not call it |
 //! | `TEXTURE_VIEW_MIN_SIMPLE` | 2 in 2 files | both guarded an 8-byte header peek with one type-8 variant's *total* length |
 //!
@@ -63,11 +70,6 @@ const BOUNDS: &[Bound] = &[
     },
     Bound {
         name: "MAX_CHANNELS",
-        owner: "model/regs.rs",
-        exempt: &[],
-    },
-    Bound {
-        name: "MAX_MAPPINGS",
         owner: "model/regs.rs",
         exempt: &[],
     },

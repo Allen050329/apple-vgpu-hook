@@ -20,7 +20,7 @@ use crate::contract::iosurface_pages::{
     DEVICE_PLANE_DESC_LEN, DEVICE_PLANE_DIMS, DEVICE_PLANE_OFFSET, DEVICE_PLANE_SIZE,
     PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID,
 };
-use crate::model::{DeviceState, MappingEntry, MAX_MAPPINGS, MAX_TASKS};
+use crate::model::{DeviceState, MappingEntry, MAX_TASKS};
 use crate::runtime::decode::resource::{
     decode_list_object_entry, list_object_entry_offset, ListObjectEntry, OBJECT_LIST_ENTRY_LEN,
     OBJECT_TYPE_IOSURFACE,
@@ -1141,8 +1141,12 @@ fn apply_type4_backing<M: HostMemory>(
     if !crate::model::is_mapping_id(surface_id) {
         defer_type4_fail(
             surface_id,
-            "sid_oob",
-            format!("type4_backing_fail reason=sid_oob sid={surface_id} task={task_id} max={MAX_MAPPINGS}"),
+            "sid_zero",
+            format!(
+                "type4_backing_fail reason=sid_zero sid={surface_id} task={task_id} \
+                 (0 is the unbound-mapping sentinel; backing it would store pixels \
+                 no attachment reader can address)"
+            ),
         );
         return false;
     }

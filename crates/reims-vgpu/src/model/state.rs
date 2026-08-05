@@ -1746,12 +1746,19 @@ pub struct DeviceState {
     /// Highest task id and mapping id the guest has ever named, whether or not
     /// the slot table could hold it.
     ///
-    /// The reach census for [`MAX_TASKS`] and [`MAX_MAPPINGS`], and it exists
-    /// because those two are the only bounds left in this device that hard-refuse
-    /// a guest call without a derivation behind the number. A task id is a full
-    /// `u32` on the wire — `decode_replace_physical` and the resource-list
-    /// commands all read it with `ld32` — so nothing in the protocol says 256,
-    /// and past it `define_task` returns `false` and the task never exists.
+    /// The reach census for [`MAX_TASKS`], and it exists because that is the last
+    /// bound in this device that hard-refuses a guest call without a derivation
+    /// behind the number. A task id is a full `u32` on the wire —
+    /// `decode_replace_physical` and the resource-list commands all read it with
+    /// `ld32` — so nothing in the protocol says 256, and past it `define_task`
+    /// returns `false` and the task never exists.
+    ///
+    /// [`Self::max_mapping_id_seen`] was the same instrument for a `MAX_MAPPINGS`
+    /// that no longer exists: `mappings` is a `BTreeMap` keyed by the full `u32`,
+    /// so the bound refused ids its own storage would have held and it is gone
+    /// rather than measured. The mark stays as an occupancy reading — it is the
+    /// only thing that says how far the guest spreads that map — but it is no
+    /// longer a distance to a refusal, and nothing should turn it back into one.
     ///
     /// The refusal counters (`model_define_task_id_range` and friends) cannot
     /// answer whether that is close: a boot where the guest stops at id 12 and
@@ -3516,12 +3523,13 @@ mod fail_vocabulary_tests {
         );
     }
 
+    /// A refused geometry must leave no entry behind — and a refusal is only ever
+    /// about the sentinel id or the extent, never about how large the id is.
     #[test]
-    fn invalid_mapping_geometry_cannot_create_an_out_of_range_slot() {
+    fn invalid_mapping_geometry_cannot_create_an_entry() {
         let mut state = DeviceState::new(DeviceId(1), crate::model::PAGE_SHIFT_X86);
-        let bad_mapping = crate::model::MAX_MAPPINGS as u32;
-        assert!(!state.set_mapping_geom(bad_mapping, 64, 64, 0x50));
-        assert!(!state.mappings.contains_key(&bad_mapping));
+        assert!(!state.set_mapping_geom(0, 64, 64, 0x50));
+        assert!(!state.mappings.contains_key(&0));
         assert!(!state.set_mapping_geom(1, 0, 64, 0x50));
         assert!(!state.set_mapping_geom(1, 64, 0, 0x50));
         assert!(!state.mappings.contains_key(&1));
@@ -3553,7 +3561,7 @@ mod fail_vocabulary_tests {
 #[cfg(test)]
 mod slot_table_reach_tests {
     use super::*;
-    use crate::model::{DeviceId, MAX_MAPPINGS, PAGE_SHIFT_X86};
+    use crate::model::{DeviceId, PAGE_SHIFT_X86};
 
     /// A task id the slot table cannot hold must still move the high-water mark.
     ///
@@ -3593,18 +3601,37 @@ mod slot_table_reach_tests {
         assert_eq!(state.max_task_id_seen, past);
     }
 
-    /// The mapping table has the same shape and the same missing derivation.
+    /// The mapping id space has no ceiling, and this is the test that says so.
+    ///
+    /// It used to assert the opposite half of the same line — that one past
+    /// `MAX_MAPPINGS` was refused and still moved the reach mark. That bound
+    /// refused ids its own storage would have held: `mappings` is a `BTreeMap`.
+    /// `u32::MAX` is the largest id the wire can carry, so accepting it here is
+    /// the strongest form of "nothing is out of range", and a reinstated
+    /// ceiling fails on the first assertion.
+    ///
+    /// The mark still moves, because it is an occupancy reading on the map now
+    /// rather than a distance to a refusal.
     #[test]
-    fn a_refused_mapping_id_still_moves_the_reach_mark() {
+    fn no_mapping_id_is_out_of_range() {
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
         assert_eq!(state.max_mapping_id_seen, 0);
 
         assert!(state.map_surface(39), "an ordinary id is accepted");
         assert_eq!(state.max_mapping_id_seen, 39);
 
-        let past = MAX_MAPPINGS as u32 + 1;
-        assert!(!state.map_surface(past), "past the table, refused");
-        assert_eq!(state.max_mapping_id_seen, past);
+        assert!(
+            state.map_surface(u32::MAX),
+            "a mapping id is a full u32 on the wire and its storage is a map"
+        );
+        assert!(state.mappings.contains_key(&u32::MAX));
+        assert_eq!(state.max_mapping_id_seen, u32::MAX);
+
+        assert!(
+            !state.map_surface(0),
+            "0 is the unbound sentinel and is the one id that stays refused"
+        );
+        assert!(!state.mappings.contains_key(&0));
     }
 
     /// Every mutator that refuses on the bound feeds the mark, not just the one
