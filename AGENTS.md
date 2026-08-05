@@ -172,11 +172,33 @@ simply the wrong number, a length four bytes off, or a field two bytes too wide:
 | What is reachable but never runs? | `scripts/runtime-dead` — coverage-instrumented driven boot |
 | Does a decoder refuse or drop a record Apple emits? | `crates/reims-vgpu/tests/wire_fixtures_reach_the_decoders.rs` |
 | Is a wire constant still declared twice? | the two greps below |
+| Does a doc comment name a symbol that no longer exists? | `cargo doc`'s intra-doc link pass |
 
 ```sh
 ls crates/reims-vgpu-wire/src/ops/*.rs | xargs -n1 basename | sed 's/.rs$//'
 grep -rh 'use reims_vgpu_wire' --include='*.rs' crates/reims-vgpu/src
 ```
+
+```sh
+RUSTDOCFLAGS="-A rustdoc::private_intra_doc_links" cargo doc -p reims-vgpu \
+  --no-deps --document-private-items \
+  --no-default-features --features backend-vulkan,host-window
+```
+
+Triage its output before editing anything, because most of it is not rot. Three classes, and only
+the first is:
+
+- **The symbol exists nowhere.** Real rot, and the only class worth a commit. Confirm with a grep
+  for the leaf name; run the doc build on the Metal arm too (`--target aarch64-apple-darwin
+  --features backend-metal`) and take the intersection, or a `backend-metal`-gated target will read
+  as missing on the Vulkan arm.
+- **A bare name inside a `//!` module doc.** These never resolve here whatever they name — a
+  `pub fn` in that same module fails exactly as a deleted one does, and `self::` does not help.
+  Only a fully-qualified `crate::…` path resolves from a `//!` doc. Cosmetic; the reference is
+  correct, it just does not become a hyperlink.
+- **An accurate path to a private item**, or to anything under `engine::pools` (a private `mod`).
+  `--document-private-items` does not make these linkable across modules. Correct as prose; do not
+  "fix" one by deleting a true reference.
 
 A wire module with no importer is either a real gap or a family still declared twice. Where a device
 offset names a field a wire struct already declares, reach for `offset_of!` rather than a re-exported
