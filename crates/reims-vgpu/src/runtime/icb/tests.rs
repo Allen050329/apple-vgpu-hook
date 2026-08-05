@@ -4282,28 +4282,21 @@ fn put_type2_texture(
 /// Minimal type-7 sampler (36 B): clamp-to-edge, nearest, normalized coords.
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn put_type7_sampler(host: &mut FakeHost, state: &DeviceState, obj_ref: u32, normalized: bool) {
-    use crate::runtime::decode::resource::{
-        SAMPLER_DESC_DECLARED_LEN, SAMPLER_DESC_ID, SAMPLER_DESC_LEN, SAMPLER_DESC_LOD_MAX,
-        SAMPLER_DESC_STATE_BITS, SAMPLER_DESC_TAG, SAMPLER_DESC_WORD16, SAMPLER_DESC_WORD20,
-        TYPE7_OBJECT_SAMPLER,
-    };
-    let mut desc = vec![0u8; SAMPLER_DESC_LEN];
-    st32(&mut desc[SAMPLER_DESC_TAG..], TYPE7_OBJECT_SAMPLER);
-    st32(
-        &mut desc[SAMPLER_DESC_DECLARED_LEN..],
-        SAMPLER_DESC_LEN as u32,
-    );
-    st32(&mut desc[SAMPLER_DESC_ID..], obj_ref);
+    use crate::runtime::decode::resource::{sampler_desc as off, TYPE7_OBJECT_SAMPLER};
+    let mut desc = vec![0u8; off::LEN];
+    st32(&mut desc[off::TAG..], TYPE7_OBJECT_SAMPLER);
+    st32(&mut desc[off::DECLARED_LEN..], off::LEN as u32);
+    st32(&mut desc[off::ID..], obj_ref);
     // Address modes ClampToEdge=0 at bits 8/12/16; filters nearest=0.
     // Normalized coords bit 31 when requested.
     let mut bits = 0u32;
     if normalized {
         bits |= 0x8000_0000;
     }
-    st32(&mut desc[SAMPLER_DESC_STATE_BITS..], bits);
-    st32(&mut desc[SAMPLER_DESC_WORD16..], 0);
-    st32(&mut desc[SAMPLER_DESC_WORD20..], 0f32.to_bits()); // lod min
-    st32(&mut desc[SAMPLER_DESC_LOD_MAX..], f32::MAX.to_bits());
+    st32(&mut desc[off::STATE_BITS..], bits);
+    st32(&mut desc[off::FLAGS..], 0);
+    st32(&mut desc[off::LOD_MIN..], 0f32.to_bits());
+    st32(&mut desc[off::LOD_MAX..], f32::MAX.to_bits());
     let desc_gva = 0x300u64 + (obj_ref as u64) * 0x40;
     put_object(host, state, obj_ref, OBJECT_TYPE_TYPE7, desc_gva, &desc);
 }

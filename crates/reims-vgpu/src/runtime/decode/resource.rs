@@ -841,15 +841,37 @@ pub const MTL_COLOR_WRITE_MASK_GREEN: u32 = 1 << 2;
 pub const MTL_COLOR_WRITE_MASK_RED: u32 = 1 << 3;
 pub const MTL_COLOR_WRITE_MASK_ALL: u32 = 0xf;
 
-/// Sampler descriptor length (type-7 subtype 0x03).
-pub const SAMPLER_DESC_LEN: usize = 36;
-pub const SAMPLER_DESC_TAG: usize = 0;
-pub const SAMPLER_DESC_DECLARED_LEN: usize = 4;
-pub const SAMPLER_DESC_ID: usize = 8;
-pub const SAMPLER_DESC_STATE_BITS: usize = 12;
-pub const SAMPLER_DESC_WORD16: usize = 16;
-pub const SAMPLER_DESC_WORD20: usize = 20;
-pub const SAMPLER_DESC_LOD_MAX: usize = 24;
+/// Where the sampler-creation record (type-7 subtype 0x03) puts each field, for
+/// the synthetic buffers the tests below assemble.
+///
+/// Derived from the view `decode_sampler_descriptor` actually reads. These were
+/// eight literals from a ported C header, and `ops::sampler`'s module doc says
+/// the two derivations agree — which was worth stating precisely because until
+/// the fixtures existed nothing had compared them. Deriving them is how that
+/// stays true without anyone re-checking it.
+///
+/// Two of them were also *anonymous*: `SAMPLER_DESC_WORD16` and `_WORD20` named
+/// their own offsets because the C header did not know what was there. The
+/// oracle does — `flags`, whose low nibble is the only written part, and
+/// `lodMinClamp` — so they are named for the fields now.
+///
+/// The cfg is their one consumer's, `icb::tests::put_type7_sampler`, which
+/// builds a sampler for the Metal ICB encoder and is gated the same way. Naming
+/// that cfg here rather than reaching for `allow(dead_code)` is what keeps the
+/// Vulkan arm able to say these are unreferenced if the consumer ever goes.
+#[cfg(all(test, feature = "backend-metal", target_os = "macos"))]
+pub(crate) mod sampler_desc {
+    use super::{offset_of, w_smp, OP_HDR};
+
+    pub(crate) const LEN: usize = w_smp::NEW_SAMPLER_TOTAL_LEN as usize;
+    pub(crate) const TAG: usize = offset_of!(reims_vgpu_wire::OpHeader, opcode);
+    pub(crate) const DECLARED_LEN: usize = offset_of!(reims_vgpu_wire::OpHeader, length);
+    pub(crate) const ID: usize = OP_HDR + offset_of!(w_smp::SamplerBody, object_ref);
+    pub(crate) const STATE_BITS: usize = OP_HDR + offset_of!(w_smp::SamplerBody, state);
+    pub(crate) const FLAGS: usize = OP_HDR + offset_of!(w_smp::SamplerBody, flags);
+    pub(crate) const LOD_MIN: usize = OP_HDR + offset_of!(w_smp::SamplerBody, lod_min_clamp);
+    pub(crate) const LOD_MAX: usize = OP_HDR + offset_of!(w_smp::SamplerBody, lod_max_clamp);
+}
 
 /// Live function descriptor (reims_vgpu_resource_format.h).
 pub const FUNCTION_DESC_BLOB_GVA: usize = 0;
