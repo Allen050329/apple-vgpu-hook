@@ -202,6 +202,76 @@ pub enum IcbRenderBindStage {
     Mesh,
 }
 
+#[cfg_attr(
+    not(all(feature = "backend-metal", target_os = "macos")),
+    allow(dead_code)
+)]
+impl IcbRenderBindStage {
+    /// The bind count the create descriptor declared for this stage.
+    ///
+    /// Each stage is a separate Metal argument table with its own maximum, taken
+    /// at ICB create from the four sibling fields the type-7 body carries and
+    /// pushed straight into the `MTLIndirectCommandBufferDescriptor` (see
+    /// [`materialize_icb`]). They are decoded per stage, so they are compared per
+    /// stage: a guest that overruns the vertex table and one that overruns the
+    /// mesh table have made different mistakes.
+    fn declared_bind_count(self, desc: &IndirectCommandBufferDescriptor) -> u16 {
+        match self {
+            Self::Vertex => desc.max_vertex_buffer_bind_count,
+            Self::Fragment => desc.max_fragment_buffer_bind_count,
+            Self::Object => desc.max_object_buffer_bind_count,
+            Self::Mesh => desc.max_mesh_buffer_bind_count,
+        }
+    }
+
+    /// The refusal slug for a bind past [`Self::declared_bind_count`].
+    fn bind_past_max_slug(self) -> &'static str {
+        match self {
+            Self::Vertex => "icb_frc_vertex_bind_index_past_max",
+            Self::Fragment => "icb_frc_fragment_bind_index_past_max",
+            Self::Object => "icb_frc_object_bind_index_past_max",
+            Self::Mesh => "icb_frc_mesh_bind_index_past_max",
+        }
+    }
+}
+
+/// Refuse a render ICB bind whose index is past what the create descriptor
+/// declared for its stage.
+///
+/// The compute fill path has held this rule since it was written — see
+/// `icb_fcc_bind_index_past_max` in [`fill_compute_command`] — and the render
+/// path did not, although it decodes all four sibling maxima and hands every one
+/// of them to Metal at create. `MTLIndirectRenderCommand`'s `set*Buffer:` family
+/// answers an index past the declared count the way every other out-of-range
+/// Metal index does: an exception that aborts the process rather than a status
+/// this device can decline. That is the same hazard
+/// [`crate::backend::metal::constants`] documents for the direct bind paths.
+///
+/// Pure, and separated from the fill body on purpose: the fill needs a Metal
+/// device and so cannot run on a Vulkan host, while the rule it applies is
+/// arithmetic over decoded guest fields and is tested on every arm.
+///
+/// Its only production caller is therefore `backend-metal`-gated and this is
+/// dead code on a Vulkan build — deliberately, because gating the rule to match
+/// would take its tests off the one host that runs them. That the gated caller
+/// still calls it is held by
+/// `tests/an_icb_bind_index_is_bounded_before_it_reaches_metal.rs`, which reads
+/// source and so sees across the `cfg`.
+#[cfg_attr(
+    not(all(feature = "backend-metal", target_os = "macos")),
+    allow(dead_code)
+)]
+pub(crate) fn refuse_render_bind_past_declared_max(
+    stage: IcbRenderBindStage,
+    index: u32,
+    desc: &IndirectCommandBufferDescriptor,
+) -> Result<(), IcbStatus> {
+    if u64::from(index) >= u64::from(stage.declared_bind_count(desc)) {
+        return Err(IcbStatus::Args(stage.bind_past_max_slug()));
+    }
+    Ok(())
+}
+
 /// One buffer bind for a render ICB command fill.
 #[derive(Clone, Debug, Default)]
 pub struct IcbRenderBufferBind {
@@ -2411,6 +2481,11 @@ pub fn fill_render_command<M: HostMemory + HostOps>(
     // When inheritBuffers, vertex/fragment buffers come from the parent encoder
     // at execute (see metal_draw::encode_icb_execute_and_writeback).
     if !entry.desc.inherit_buffers() {
+        // Every index is checked before any is bound, so a refusal leaves the
+        // command slot as it was rather than half filled.
+        for (idx, stage, _, _, _) in &staged {
+            refuse_render_bind_past_declared_max(*stage, *idx, &entry.desc)?;
+        }
         for (idx, stage, has_stride, stride, mtl) in &staged {
             match stage {
                 IcbRenderBindStage::Fragment => {

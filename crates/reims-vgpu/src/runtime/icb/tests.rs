@@ -4858,3 +4858,73 @@ fn buffer_backed_nonzero_wire_va_offset() {
 
     assert_stagein_solid(&mut state, &mut host, mapping_id, sid, "wire_va offset");
 }
+
+/// Each render bind stage is bounded by its own field of the create descriptor.
+///
+/// The four maxima are decoded separately and handed to Metal separately, so
+/// mapping them onto one bound would report the wrong table for three stages out
+/// of four — the failure mode `8ad945e` found on the type-1 buffer span.
+#[test]
+fn a_render_icb_bind_is_bounded_by_the_count_its_own_stage_declared() {
+    use crate::observe::Decline;
+
+    let desc = IndirectCommandBufferDescriptor {
+        max_vertex_buffer_bind_count: 4,
+        max_fragment_buffer_bind_count: 2,
+        max_object_buffer_bind_count: 3,
+        max_mesh_buffer_bind_count: 1,
+        ..Default::default()
+    };
+
+    // The last in-range index of each stage is accepted, and the first
+    // out-of-range one is refused under that stage's own slug.
+    for (stage, declared, slug) in [
+        (
+            IcbRenderBindStage::Vertex,
+            4u32,
+            "icb_frc_vertex_bind_index_past_max",
+        ),
+        (
+            IcbRenderBindStage::Fragment,
+            2,
+            "icb_frc_fragment_bind_index_past_max",
+        ),
+        (
+            IcbRenderBindStage::Object,
+            3,
+            "icb_frc_object_bind_index_past_max",
+        ),
+        (
+            IcbRenderBindStage::Mesh,
+            1,
+            "icb_frc_mesh_bind_index_past_max",
+        ),
+    ] {
+        assert!(
+            refuse_render_bind_past_declared_max(stage, declared - 1, &desc).is_ok(),
+            "{stage:?} refused its own last declared index"
+        );
+        let refusal = refuse_render_bind_past_declared_max(stage, declared, &desc)
+            .expect_err("index past the declared count must refuse");
+        assert_eq!(refusal.slug(), slug);
+    }
+}
+
+/// A stage the guest declared no binds for admits no index at all, including 0.
+///
+/// `max_* == 0` is the common case for stages a pipeline does not use, and `0`
+/// is the index a zeroed fill record carries, so this is the arm a malformed
+/// record reaches first.
+#[test]
+fn a_render_icb_stage_declaring_no_binds_refuses_index_zero() {
+    let desc = IndirectCommandBufferDescriptor::default();
+    for stage in [
+        IcbRenderBindStage::Vertex,
+        IcbRenderBindStage::Fragment,
+        IcbRenderBindStage::Object,
+        IcbRenderBindStage::Mesh,
+    ] {
+        assert_eq!(stage.declared_bind_count(&desc), 0, "{stage:?}");
+        assert!(refuse_render_bind_past_declared_max(stage, 0, &desc).is_err());
+    }
+}
