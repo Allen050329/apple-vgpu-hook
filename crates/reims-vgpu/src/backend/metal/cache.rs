@@ -171,61 +171,58 @@ pub struct ComputePsoEntry {
     pub pso: ComputePipelineState,
 }
 
-pub struct SamplerCacheEntry {
-    pub key_hash: u64,
-    pub unnormalized: u32,
-    pub min_filter: u32,
-    pub mag_filter: u32,
-    pub mip_filter: u32,
-    pub s_address_mode: u32,
-    pub t_address_mode: u32,
-    pub r_address_mode: u32,
-    pub border_color: u32,
-    pub compare_function: u32,
-    pub lod_min_bits: u32,
-    pub lod_max_bits: u32,
-    pub max_anisotropy: u32,
-    pub lod_average: u32,
-    pub support_argument_buffers: u32,
-    pub state: SamplerState,
+/// Every `MTLSamplerDescriptor` property this device sets, and nothing else, as
+/// the words that decide `MTLSamplerState` identity.
+///
+/// One list, because it used to be four: the same fourteen fields were
+/// transcribed into `SamplerCacheEntry`, again into its `matches`, again into
+/// `sampler_key_hash`, and again into the entry's construction. A property
+/// added to the descriptor in [`super::samplers::make_explicit_sampler`] and
+/// forgotten in any one of them is a cache *hit* on a state built from
+/// different words, which nothing reports and which shows up only as a texture
+/// filtered the way some earlier bind asked for.
+///
+/// The three `ReimsVgpuSampler` words that are absent are absent by rule rather
+/// than by omission: `has_lod_clamp` and the two `clamp_lod_*` words are the
+/// encoder call `setSamplerState:lodMinClamp:lodMaxClamp:atIndex:`, applied per
+/// bind and never baked into the state, so two binds differing only there share
+/// one state and must hit. `binding` is per bind for the same reason.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct SamplerDescriptorKey {
+    /// First so the derived comparison rejects on it before the words, which is
+    /// the prefilter the separate `key_hash` field used to be.
+    hash: u64,
+    words: [u32; 14],
 }
 
-impl SamplerCacheEntry {
-    pub fn matches(&self, s: &ReimsVgpuSampler) -> bool {
-        self.unnormalized == s.unnormalized
-            && self.min_filter == s.min_filter
-            && self.mag_filter == s.mag_filter
-            && self.mip_filter == s.mip_filter
-            && self.s_address_mode == s.s_address_mode
-            && self.t_address_mode == s.t_address_mode
-            && self.r_address_mode == s.r_address_mode
-            && self.border_color == s.border_color
-            && self.compare_function == s.compare_function
-            && self.lod_min_bits == s.lod_min_bits
-            && self.lod_max_bits == s.lod_max_bits
-            && self.max_anisotropy == s.max_anisotropy
-            && self.lod_average == s.lod_average
-            && self.support_argument_buffers == s.support_argument_buffers
+impl SamplerDescriptorKey {
+    pub fn new(s: &ReimsVgpuSampler) -> Self {
+        let words = [
+            s.unnormalized,
+            s.min_filter,
+            s.mag_filter,
+            s.mip_filter,
+            s.s_address_mode,
+            s.t_address_mode,
+            s.r_address_mode,
+            s.border_color,
+            s.compare_function,
+            s.lod_min_bits,
+            s.lod_max_bits,
+            s.max_anisotropy,
+            s.lod_average,
+            s.support_argument_buffers,
+        ];
+        let hash = words
+            .iter()
+            .fold(0xcbf2_9ce4_8422_2325u64, |h, &w| hash_u64(h, w as u64));
+        Self { hash, words }
     }
 }
 
-pub fn sampler_key_hash(s: &ReimsVgpuSampler) -> u64 {
-    let mut h = 0xcbf29ce484222325u64;
-    h = hash_u64(h, s.unnormalized as u64);
-    h = hash_u64(h, s.min_filter as u64);
-    h = hash_u64(h, s.mag_filter as u64);
-    h = hash_u64(h, s.mip_filter as u64);
-    h = hash_u64(h, s.s_address_mode as u64);
-    h = hash_u64(h, s.t_address_mode as u64);
-    h = hash_u64(h, s.r_address_mode as u64);
-    h = hash_u64(h, s.border_color as u64);
-    h = hash_u64(h, s.compare_function as u64);
-    h = hash_u64(h, s.lod_min_bits as u64);
-    h = hash_u64(h, s.lod_max_bits as u64);
-    h = hash_u64(h, s.max_anisotropy as u64);
-    h = hash_u64(h, s.lod_average as u64);
-    h = hash_u64(h, s.support_argument_buffers as u64);
-    h
+pub struct SamplerCacheEntry {
+    pub key: SamplerDescriptorKey,
+    pub state: SamplerState,
 }
 
 pub struct DepthStencilEntry {
@@ -420,10 +417,10 @@ pub fn render_pso_insert(
     })
 }
 
-pub fn sampler_lookup(key: u64, s: &ReimsVgpuSampler) -> Option<SamplerState> {
+pub fn sampler_lookup(key: &SamplerDescriptorKey) -> Option<SamplerState> {
     with_caches(|c| {
         for e in c.sampler.iter().flatten() {
-            if e.key_hash == key && e.matches(s) {
+            if e.key == *key {
                 return Some(e.state.clone());
             }
         }
@@ -431,29 +428,15 @@ pub fn sampler_lookup(key: u64, s: &ReimsVgpuSampler) -> Option<SamplerState> {
     })
 }
 
-pub fn sampler_insert(key: u64, s: &ReimsVgpuSampler, state: SamplerState) -> SamplerState {
+pub fn sampler_insert(key: SamplerDescriptorKey, state: SamplerState) -> SamplerState {
     with_caches(|c| {
         for e in c.sampler.iter().flatten() {
-            if e.key_hash == key && e.matches(s) {
+            if e.key == key {
                 return e.state.clone();
             }
         }
         let entry = SamplerCacheEntry {
-            key_hash: key,
-            unnormalized: s.unnormalized,
-            min_filter: s.min_filter,
-            mag_filter: s.mag_filter,
-            mip_filter: s.mip_filter,
-            s_address_mode: s.s_address_mode,
-            t_address_mode: s.t_address_mode,
-            r_address_mode: s.r_address_mode,
-            border_color: s.border_color,
-            compare_function: s.compare_function,
-            lod_min_bits: s.lod_min_bits,
-            lod_max_bits: s.lod_max_bits,
-            max_anisotropy: s.max_anisotropy,
-            lod_average: s.lod_average,
-            support_argument_buffers: s.support_argument_buffers,
+            key,
             state: state.clone(),
         };
         if c.sampler.len() < REIMS_VGPU_SAMPLER_CACHE_CAP {
