@@ -98,3 +98,94 @@ fn a_wrapped_abi_entry_point_has_exactly_one_caller() {
         );
     }
 }
+
+/// The body of the `if`/`else if` chain each shim branches on a console-feed
+/// kind with, one entry per arm, in source order.
+///
+/// Brace-matched rather than line-scanned, because an arm's body contains
+/// nested blocks and the closing brace that ends it is not the first one.
+fn console_feed_arm_bodies(code: &str) -> Vec<String> {
+    const KIND: &str = "REIMS_VGPU_CONSOLE_FEED_";
+    let mut bodies = Vec::new();
+    for (at, _) in code.match_indices(KIND) {
+        // The kind names also appear where the feed's own macros are compared
+        // against nothing; only a comparison opening a block is an arm.
+        let Some(open) = code[at..].find('{').map(|n| at + n) else {
+            continue;
+        };
+        if code[at..open].contains(';') || code[at..open].contains('}') {
+            continue;
+        }
+        let mut depth = 0usize;
+        let mut end = None;
+        for (i, c) in code[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(open + i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some(end) = end {
+            bodies.push(code[open + 1..end].to_string());
+        }
+    }
+    bodies
+}
+
+/// The last statement of an arm body, or `None` if it has none.
+///
+/// Everything up to the final `}` is skipped first, because a `return` nested
+/// inside the arm's own `if` is exactly the shape being ruled out: the x86 shim
+/// returned from inside its paint check and fell out of the arm when the paint
+/// failed. "Contains a return" passes on that; "ends in a return" does not.
+fn last_statement(body: &str) -> Option<&str> {
+    let tail = match body.rfind('}') {
+        Some(close) => &body[close + 1..],
+        None => body,
+    };
+    tail.split(';').map(str::trim).rfind(|s| !s.is_empty())
+}
+
+/// A shim that has observed a console-feed kind must not reach the re-push
+/// below it, whatever the paint it attempted did.
+///
+/// Every named kind means Rust has said who owns the host console, and the
+/// re-push at the bottom of `fb_update` pushes the last *product* frame. Pushing
+/// that while Rust names the firmware or early console is the pre-boundary steal
+/// the feed exists to prevent, so each arm terminates rather than falling
+/// through — which is a policy, and the reason it is checked here is that it is
+/// a policy held in C twice with nothing comparing the copies.
+///
+/// This is the third time this exact class has cost something. The module doc
+/// records the first two, both on console ownership. The third was the x86
+/// shim's `_EARLY` arm returning only when its paint *succeeded* and otherwise
+/// falling through to the re-push, while the arm64 shim returned either way —
+/// invisible on any single-pathway boot, because each host builds one shim.
+#[test]
+fn a_console_feed_arm_never_falls_through_to_the_product_re_push() {
+    for device in ["reims-vgpu-pci.c", "reims-vgpu-mmio.c"] {
+        let bodies = console_feed_arm_bodies(&shim_code(device));
+        assert!(
+            !bodies.is_empty(),
+            "{device} must still branch on a console-feed kind, else this test \
+             passes by finding nothing to check"
+        );
+        for (n, body) in bodies.iter().enumerate() {
+            let last = last_statement(body);
+            assert!(
+                last.is_some_and(|s| s.starts_with("return")),
+                "{device} console-feed arm {n} can fall through to the product \
+                 re-push. Rust has named who owns the console; the arm must \
+                 terminate whether or not its paint landed, so its last \
+                 statement is a return rather than a return nested in the paint \
+                 check. Ends in: {last:?}"
+            );
+        }
+    }
+}
