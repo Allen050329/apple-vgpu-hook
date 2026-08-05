@@ -143,13 +143,28 @@ Recorded so the next reader starts from the triage rather than the raw report.
   now a struct of two `Extent3`s. `Size3` itself could not be reused: it is
   `u64` on the wire and the resolve narrows each component through `u32_dim`.
 
-  The consumer half is still open: `compute_core` and
-  `compute_encode_on_encoder` take the six as loose `u32`s. Left for a session
-  that can do better than clippy on it — their bodies are `backend-metal`,
-  which is Apple-only, so a Linux host can cross-compile and lint them but
-  cannot run their tests. Note also that `dispatch_kind` and `dispatch_type`
-  sit inside the same run while belonging to neither extent, which is part of
-  why it reads as eight interchangeable `u32`s.
+  **The consumer half is done too**, at `cf4d41c`: `compute_core` and
+  `compute_encode_on_encoder` take `grid: Extent3, threadgroup: Extent3`. This
+  entry said otherwise for eight hours after that landed — it was written before
+  the fix and not revisited when the file was next edited — and the next reader
+  to trust it spent a detour confirming code that was already correct. If you
+  are about to record a finding as open here, check the tree first; that is the
+  whole reason this file exists.
+
+  **What the detour did find**, and the reason this entry is worth keeping: with
+  the six extents gone, `dispatch_kind` and `dispatch_type` are the *only* run
+  left at that call — two adjacent `u32`s, one call site, and the script no
+  longer reports them because its threshold is four. Both are `{0, 1}`:
+  `THREADGROUPS`/`THREADS` and `SERIAL`/`CONCURRENT`. So a transposition
+  compiles, passes *both* validators (every value of one is a valid value of the
+  other), and silently changes two things at once — `dispatchThreads` versus
+  `dispatchThreadgroups`, and whether Metal may overlap the segment.
+
+  The lesson for this script's triage: **fixing part of a long run can hide the
+  rest of it.** A run of eight shortened to two is not a run that got safer, it
+  is a run that dropped below the report threshold — and a two-run whose members
+  share a value domain is more dangerous than an eight-run of distinct ones. When
+  closing one of these, re-read what is left rather than re-running the script.
 
 ## Known limits
 
