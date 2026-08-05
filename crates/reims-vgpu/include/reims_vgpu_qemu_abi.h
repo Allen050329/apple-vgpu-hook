@@ -244,7 +244,7 @@ typedef struct ReimsVgpuHostOps {
     int (*read_xreg)(void *ctx, uint32_t index, uint64_t *out);
     /*
      * Build one contiguous host-VA view of `count` guest pages (each
-     * REIMS_VGPU_GUEST_PAGE_SIZE, page-aligned GPAs into guest RAM) via
+     * REIMS_VGPU_GUEST_PAGE_SIZE_ARM64E, page-aligned GPAs into guest RAM) via
      * mach_vm_remap — the ParavirtualizedGraphics mapMemory model: the view
      * aliases guest RAM, so CPU/GPU writes through it *are* guest memory.
      * 0 = success, fills *out_ptr (view length = count * page size).
@@ -345,8 +345,18 @@ typedef struct ReimsVgpuHostOps {
                                    uint64_t *out, size_t max);
 } ReimsVgpuHostOps;
 
-/* Default guest page size for arm64e / vmapple (create may override). */
-#define REIMS_VGPU_GUEST_PAGE_SIZE 16384u
+/*
+ * Guest page geometry, arch-qualified. There is deliberately no bare
+ * `REIMS_VGPU_GUEST_PAGE_SIZE`: that name reads as "the guest's page size", is
+ * 16 KiB whatever the guest is, and the Rust side records the same spelling as
+ * the cause of x86 wild writes into stamp slots (`model::regs`, which carries
+ * the same prohibition for the same reason). A shim that needs one of these
+ * names the arch it is; a shim that cannot must take the page shift from the
+ * device.
+ *
+ * `..._pinned_to_the_rust_page_geometry` fails if any of the four drifts.
+ */
+#define REIMS_VGPU_GUEST_PAGE_SIZE_ARM64E 16384u
 #define REIMS_VGPU_GUEST_PAGE_SHIFT_ARM64E 14u
 #define REIMS_VGPU_GUEST_PAGE_SHIFT_X86_64 12u
 #define REIMS_VGPU_GUEST_PAGE_SIZE_X86_64 4096u

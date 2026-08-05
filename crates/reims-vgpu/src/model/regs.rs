@@ -772,6 +772,45 @@ mod tests {
         );
     }
 
+    /// The header's four guest-page constants agree with Rust's page geometry.
+    ///
+    /// These cross the boundary and nothing in the toolchain compared them:
+    /// `reims-vgpu-mmio.c` sizes its `mach_vm_remap` view, its alignment mask
+    /// and its packed-contiguity stride from the header's arm64e page size,
+    /// while every Rust reader derives the same number from
+    /// `contract::gva::PAGE_SHIFT_ARM64E`. A drift is a view built at one
+    /// stride and addressed at another, on one pathway, with no failure at the
+    /// seam.
+    ///
+    /// Four rather than the two the shims read today: the shift pair is what a
+    /// portable caller is supposed to take, so pinning only the sizes would
+    /// leave the names most likely to be reached for next unchecked.
+    #[test]
+    fn the_abi_header_is_pinned_to_the_rust_page_geometry() {
+        use crate::qemu::abi::header_define;
+        assert_eq!(
+            header_define("REIMS_VGPU_GUEST_PAGE_SHIFT_ARM64E"),
+            PAGE_SHIFT_ARM64E,
+            "the arm64e page shift has drifted from the contract"
+        );
+        assert_eq!(
+            header_define("REIMS_VGPU_GUEST_PAGE_SHIFT_X86_64"),
+            PAGE_SHIFT_X86,
+            "the x86_64 page shift has drifted from the contract"
+        );
+        assert_eq!(
+            u64::from(header_define("REIMS_VGPU_GUEST_PAGE_SIZE_ARM64E")),
+            PAGE_SIZE_ARM64E,
+            "the arm64e page size has drifted; the mmio shim strides its \
+             mach_vm_remap view by this"
+        );
+        assert_eq!(
+            u64::from(header_define("REIMS_VGPU_GUEST_PAGE_SIZE_X86_64")),
+            PAGE_SIZE_X86,
+            "the x86_64 page size has drifted from the contract"
+        );
+    }
+
     /// No two child-command names may carry the same opcode.
     ///
     /// The drain dispatches on these in one `match`, so a collision makes the
