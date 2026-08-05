@@ -2386,9 +2386,6 @@ pub fn write_mapping_bytes_only<H: HostMemory + HostOps>(
         ));
         return false;
     }
-    // Sampled payload shape, taken once for the call rather than per run, so a
-    // fragmented write and a packed one of the same bytes count the same.
-    crate::observe::footprint::note_written_payload(buf);
     copy_mapping_runs(
         state,
         host,

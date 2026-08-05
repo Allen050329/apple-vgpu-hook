@@ -2336,11 +2336,6 @@ fn write_linear_texture_bulk<M: HostMemory + HostOps>(
         return false;
     };
     let ptr = span_map.ptr;
-    // Sampled payload shape, once for the call. This rail writes rows through a
-    // `FreshSpan`, so it reaches neither `mapper::write_mapping_bytes` nor
-    // `gva_view::write_gva_bytes` and would otherwise be absent from a census
-    // whose only use is answering whether a `0xff`-filled victim could be ours.
-    crate::observe::footprint::note_written_payload(bytes);
     for y in 0..height as usize {
         let src = y * tight;
         let dst = (y as u64).saturating_mul(row_stride) as usize;

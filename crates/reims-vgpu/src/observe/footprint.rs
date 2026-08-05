@@ -58,6 +58,20 @@
 //! that is counted in `dropped` and reported on every summary line, because a
 //! footprint that quietly failed to record a write produces exactly the "miss"
 //! that reads as an exoneration.
+//!
+//! # The address is the discriminator; the payload is not
+//!
+//! A companion census used to sample one write in 64 and score the longest run
+//! of `0xff` bytes in it, on the theory that a device which rarely writes white
+//! would make a white victim a sharp signal. A two-phase boot — 300 s of a page
+//! with no white, then 300 s of an overwhelmingly white one — answered it: the
+//! `0xff`-run rate tracked the guest's own content by about 99x, and the longest
+//! run reached 4 961 bytes, longer than either poisoned `kalloc` element the
+//! panic reports name. So this device does write those runs, whenever the guest
+//! paints white, and a victim full of `0xff` is no more likely to be ours for
+//! being full of `0xff`. The payload carries no information the frame set does
+//! not, and the census that measured it was deleted rather than left sampling
+//! every rail's payload forever to re-derive its own negative result.
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -501,161 +515,6 @@ pub fn note_written_range(rail: Rail, gpa: u64, len: u64) {
     }
 }
 
-/// One in this many guest writes is scanned for its payload shape.
-///
-/// Sampled rather than exhaustive because the scan spans the whole payload —
-/// framebuffer-sized on the store rails, at the 28-111 stores/s `store_routes`
-/// measures, on a drain worker `drain_duty` already shows at duty 0.93-0.99.
-/// A deterministic counter rather than a random draw so two boots of the same
-/// workload sample the same writes.
-const PAYLOAD_SAMPLE_EVERY: u64 = 64;
-
-/// The shortest all-`0xff` run that could have produced a report in the panic
-/// census, and therefore the shortest one worth counting.
-///
-/// The two `kalloc` poison reports in `AGENTS.md` read "element modified after
-/// free (off:0, val:0xffffffffffffffff, sz:6144)" and the same at `sz:256`: the
-/// kernel found a **whole freed element** filled with `0xff` from offset 0. So a
-/// write that could have produced the smaller of them put at least 256
-/// consecutive `0xff` bytes into guest RAM. The number is that element size, not
-/// a threshold picked to fit an observation.
-/// Emitted as `ff_run_counted_from`, not `ff_run_min`. It was the latter, next
-/// to the measured `ff_run_max`, and the pair reads as a range that was
-/// observed — `min 256, max 4953`. It is not: 256 is the floor below which a
-/// run is not looked for at all, so no observation of it exists. A field whose
-/// name says "measurement" and whose value is a compile-time constant is the
-/// shape `scripts/constant-fields/constant-fields.sh` reports, and it is the
-/// one shape on that report that is fixed by renaming rather than by deleting.
-const FF_RUN_MIN: usize = 256;
-
-struct PayloadCensus {
-    calls: AtomicU64,
-    sampled: AtomicU64,
-    bytes_sampled: AtomicU64,
-    /// Sampled buffers carrying at least one run of [`FF_RUN_MIN`] `0xff` bytes.
-    ff_run: AtomicU64,
-    /// The longest such run seen. Exact at and above [`FF_RUN_MIN`]; shorter
-    /// runs are deliberately not searched for, so a value below the threshold
-    /// never appears.
-    ff_run_max: AtomicU64,
-}
-
-static PAYLOAD: PayloadCensus = PayloadCensus {
-    calls: AtomicU64::new(0),
-    sampled: AtomicU64::new(0),
-    bytes_sampled: AtomicU64::new(0),
-    ff_run: AtomicU64::new(0),
-    ff_run_max: AtomicU64::new(0),
-};
-
-/// The longest run of `0xff` bytes in `buf`, searched only for runs of at least
-/// [`FF_RUN_MIN`]; `0` when there is none.
-///
-/// Probing every [`FF_RUN_MIN`]th byte is exact for the runs being looked for
-/// and costs `len / 256` loads on a buffer that has none: any run of
-/// `FF_RUN_MIN` consecutive bytes contains at least one index that is a multiple
-/// of `FF_RUN_MIN`, so a run long enough to matter cannot hide between probes.
-/// Only a probe that lands on `0xff` pays to expand.
-fn longest_ff_run(buf: &[u8]) -> usize {
-    let mut best = 0usize;
-    // Exclusive end of the run last expanded. Probes stay on the fixed
-    // `FF_RUN_MIN` grid — moving them to the end of a run would break the
-    // alignment the correctness argument rests on — so this is what stops a
-    // long run being re-expanded once per probe that lands inside it.
-    let mut measured_end = 0usize;
-    let mut i = 0usize;
-    while i < buf.len() {
-        if buf[i] == 0xFF && i >= measured_end {
-            let mut lo = i;
-            while lo > 0 && buf[lo - 1] == 0xFF {
-                lo -= 1;
-            }
-            let mut hi = i + 1;
-            while hi < buf.len() && buf[hi] == 0xFF {
-                hi += 1;
-            }
-            if hi - lo >= FF_RUN_MIN {
-                best = best.max(hi - lo);
-            }
-            measured_end = hi;
-        }
-        i += FF_RUN_MIN;
-    }
-    best
-}
-
-/// Record the *shape* of a guest write's payload, sampled.
-///
-/// # The assumption this exists to test
-///
-/// The panic census in `AGENTS.md` finds its victims filled with
-/// `0xffffffffffffffff`, and the standing reading is that this is "almost
-/// certainly a legitimate white frame landing at the wrong address — the defect
-/// is *where*, not *what*, so do not go looking for a source of white".
-///
-/// That is a reasonable inference and it has never been measured. It is also
-/// load-bearing: if this device writes long `0xff` payloads constantly — a
-/// white browser page is exactly that — then the payload tells a reader nothing,
-/// and a victim full of `0xff` is no more likely to be ours than any other. If
-/// it almost never does, the payload is a far sharper discriminator than the
-/// footprint alone, which is only as strong as its density.
-///
-/// That answer is worth having and is not available from the footprint, so this
-/// counts rather than concluding.
-///
-/// # A run, not a whole-buffer test
-///
-/// A uniform test asks whether the **whole** buffer is `0xff`, and the rails
-/// here hand over whole frames and whole source images. A white browser page has
-/// a menu bar, a scrollbar and text in it, so a device faithfully writing
-/// megabytes of white still scores zero uniform buffers. A live two-phase boot
-/// showed exactly that: not one uniform buffer across all 36 618 samples, on a
-/// boot where `ff_run` fired 258 times and reached a longest run of 4 961 bytes.
-/// That makes every uniform reading taken before it void rather than merely
-/// weak, so there is nothing left to keep comparable and no uniform counter here.
-///
-/// [`FF_RUN_MIN`] is the predicate the panic census actually implies: a run long
-/// enough to have filled the smaller of the two poisoned `kalloc` elements. It
-/// is the number to read, and the only shape counted.
-///
-/// The run probe costs `len / 256` loads on a buffer with no long white span, so
-/// a photograph pays almost nothing, and nothing here walks a whole payload.
-pub fn note_written_payload(buf: &[u8]) {
-    if buf.is_empty() {
-        return;
-    }
-    let n = PAYLOAD.calls.fetch_add(1, Ordering::Relaxed);
-    if !n.is_multiple_of(PAYLOAD_SAMPLE_EVERY) {
-        return;
-    }
-    PAYLOAD.sampled.fetch_add(1, Ordering::Relaxed);
-    PAYLOAD
-        .bytes_sampled
-        .fetch_add(buf.len() as u64, Ordering::Relaxed);
-    let run = longest_ff_run(buf) as u64;
-    if run > 0 {
-        PAYLOAD.ff_run.fetch_add(1, Ordering::Relaxed);
-        PAYLOAD.ff_run_max.fetch_max(run, Ordering::Relaxed);
-    }
-}
-
-/// `(calls, sampled, bytes_sampled)`.
-pub fn payload_counts() -> (u64, u64, u64) {
-    (
-        PAYLOAD.calls.load(Ordering::Relaxed),
-        PAYLOAD.sampled.load(Ordering::Relaxed),
-        PAYLOAD.bytes_sampled.load(Ordering::Relaxed),
-    )
-}
-
-/// `(sampled buffers carrying a run of at least [`FF_RUN_MIN`], longest run)`.
-pub fn ff_run_counts() -> (u64, u64) {
-    (
-        PAYLOAD.ff_run.load(Ordering::Relaxed),
-        PAYLOAD.ff_run_max.load(Ordering::Relaxed),
-    )
-}
-
 /// Whether this device has written the frame containing `gpa` at any point in
 /// this boot. The scorer's question, exposed so a test can ask it directly.
 pub fn wrote_gpa(gpa: u64) -> bool {
@@ -680,13 +539,11 @@ pub fn census_lines(now_ms: u64) -> Vec<String> {
     let fp = &*FOOTPRINT;
     let (pages, dropped) = counts();
     let kib = (pages << FRAME_SHIFT) / 1024;
-    let (calls, sampled, bytes_sampled) = payload_counts();
     // Levels, not per-interval: these are running totals for the boot, like the
     // frame count beside them and unlike `store_routes`. Summing them across
     // census lines multiplies by the cadence — the 100x error AGENTS.md records.
     let (retired_frames, retired_hits) = retired_counts();
     let (retire_scans, retire_scan_pages) = retire_scan_counts();
-    let (ff_run, ff_run_max) = ff_run_counts();
     // `write_after_retire` is now the mapping rail's count on its own, so the
     // `war_mapping` that used to sit beside it is the same number twice.
     //
@@ -699,9 +556,7 @@ pub fn census_lines(now_ms: u64) -> Vec<String> {
     let (_, war_raw, war_gpa) = retired_hits_by_rail();
     let mut out = vec![format!(
         "guest_write_footprint pages={pages} kib={kib} dropped={dropped} \
-         frame_shift={FRAME_SHIFT} writes={calls} sampled={sampled} \
-         samp_bytes={bytes_sampled} ff_run={ff_run} ff_run_max={ff_run_max} \
-         ff_run_counted_from={FF_RUN_MIN} retired={retired_frames} \
+         frame_shift={FRAME_SHIFT} retired={retired_frames} \
          write_after_retire={retired_hits} \
          war_rawgva={war_raw} war_gpa={war_gpa} retire_scans={retire_scans} \
          retire_scan_pages={retire_scan_pages} (levels, not per-interval)"
@@ -774,15 +629,6 @@ pub(crate) fn exclusive_for_tests() -> std::sync::MutexGuard<'static, ()> {
     RETIRED.scan_pages.store(0, Ordering::Relaxed);
     RETIRED.logged.store(0, Ordering::Relaxed);
     for cell in RETIRE_HITS_BY_RAIL.iter() {
-        cell.store(0, Ordering::Relaxed);
-    }
-    for cell in [
-        &PAYLOAD.calls,
-        &PAYLOAD.sampled,
-        &PAYLOAD.bytes_sampled,
-        &PAYLOAD.ff_run,
-        &PAYLOAD.ff_run_max,
-    ] {
         cell.store(0, Ordering::Relaxed);
     }
     g
@@ -900,130 +746,6 @@ mod tests {
         // at the end of the word rather than shifting past it.
         note_written_range(Rail::Mapping, 32 << FRAME_SHIFT, 32 << FRAME_SHIFT);
         assert_eq!(FOOTPRINT.runs(), vec![(32, 63)]);
-    }
-
-    #[test]
-    fn the_payload_census_samples_one_write_per_block_and_totals_their_bytes() {
-        let _g = fresh();
-        // The sampler takes call 0 and then every 64th, so drive it in blocks of
-        // PAYLOAD_SAMPLE_EVERY and assert on what it sampled, not on what it saw.
-        // `samp_bytes` is the denominator every rate read off this census uses,
-        // so it has to count the sampled buffers only, never the calls skipped.
-        let white = vec![0xFFu8; 4096];
-        let black = vec![0x00u8; 4096];
-        let mut content = vec![0xFFu8; 4096];
-        content[4095] = 0xFE;
-        for buf in [&white, &black, &content] {
-            for _ in 0..PAYLOAD_SAMPLE_EVERY {
-                note_written_payload(buf);
-            }
-        }
-        let (calls, sampled, samp_bytes) = payload_counts();
-        assert_eq!(calls, 3 * PAYLOAD_SAMPLE_EVERY);
-        assert_eq!(sampled, 3, "one sample per block of {PAYLOAD_SAMPLE_EVERY}");
-        assert_eq!(samp_bytes, 3 * 4096);
-    }
-
-    /// The case a whole-buffer test is blind to, and the reason the run
-    /// predicate is the one counted.
-    ///
-    /// A white browser page has a menu bar, a scrollbar and text in it, so the
-    /// frame this device writes is never uniform — and a uniform test reads zero
-    /// on exactly the workload the white-frame hypothesis is about. A run of
-    /// [`FF_RUN_MIN`] is what the `kalloc` poison reports imply, and it is
-    /// present in that frame by the megabyte.
-    #[test]
-    fn a_mostly_white_frame_scores_a_long_ff_run() {
-        let _g = fresh();
-        let mut frame = vec![0xFFu8; 64 * 1024];
-        // Chrome at the top and a scrollbar column: enough to break uniformity,
-        // nowhere near enough to break up the white.
-        for b in frame.iter_mut().take(1024) {
-            *b = 0x20;
-        }
-        frame[40_000] = 0x00;
-        note_written_payload(&frame);
-        let (ff_run, ff_run_max) = ff_run_counts();
-        assert_eq!(ff_run, 1);
-        assert_eq!(
-            ff_run_max,
-            (40_000 - 1024) as u64,
-            "the longer of the two white spans the dark pixel splits: chrome to \
-             it (38 976) beats it to the end (25 535)"
-        );
-    }
-
-    /// The negative, and it has to be checked at the probe stride: a scan that
-    /// steps 256 bytes must not report a run assembled from separate ones.
-    #[test]
-    fn short_ff_runs_and_content_score_nothing() {
-        let _g = fresh();
-        // Runs of 255 — one byte short — at every probe point, so a scan that
-        // rounded up or joined across the gap would score them.
-        let mut buf = vec![0x11u8; 64 * FF_RUN_MIN];
-        for chunk in buf.chunks_mut(FF_RUN_MIN + 1) {
-            let n = chunk.len().min(FF_RUN_MIN - 1);
-            for b in chunk.iter_mut().take(n) {
-                *b = 0xFF;
-            }
-        }
-        assert_eq!(longest_ff_run(&buf), 0, "255 is not 256");
-        note_written_payload(&buf);
-        assert_eq!(ff_run_counts(), (0, 0));
-
-        // And a photograph: no long uniform anything.
-        let noise: Vec<u8> = (0..8192u32)
-            .map(|i| (i.wrapping_mul(37) % 251) as u8)
-            .collect();
-        assert_eq!(longest_ff_run(&noise), 0);
-    }
-
-    /// Exactly at the threshold, and unaligned to the probe grid.
-    ///
-    /// The correctness argument for probing every [`FF_RUN_MIN`]th byte is that
-    /// any run that long contains a multiple of [`FF_RUN_MIN`]. A run placed to
-    /// straddle two probes with its start between them is where an off-by-one in
-    /// that argument would show, so it is checked at every offset in a stride.
-    #[test]
-    fn a_threshold_length_run_is_found_at_every_alignment() {
-        for off in 0..FF_RUN_MIN {
-            let mut buf = vec![0x00u8; FF_RUN_MIN * 4];
-            for b in buf.iter_mut().skip(off).take(FF_RUN_MIN) {
-                *b = 0xFF;
-            }
-            assert_eq!(
-                longest_ff_run(&buf),
-                FF_RUN_MIN,
-                "a {FF_RUN_MIN}-byte run starting at {off} must be found"
-            );
-        }
-    }
-
-    /// Two long runs in one buffer report the longer, and neither is double
-    /// counted into a length that was never written.
-    #[test]
-    fn the_longest_of_several_runs_is_reported_and_none_are_joined() {
-        let _g = fresh();
-        let mut buf = vec![0x00u8; 4096];
-        for b in buf.iter_mut().skip(100).take(300) {
-            *b = 0xFF;
-        }
-        for b in buf.iter_mut().skip(1000).take(900) {
-            *b = 0xFF;
-        }
-        assert_eq!(longest_ff_run(&buf), 900);
-        note_written_payload(&buf);
-        assert_eq!(ff_run_counts(), (1, 900), "one buffer, longest run 900");
-    }
-
-    #[test]
-    fn an_empty_payload_is_not_counted_at_all() {
-        let _g = fresh();
-        // A zero-length write carries no shape to sample. Counting it would
-        // spend sampling slots on nothing and walk the 1-in-64 phase off the
-        // pixel writes this census exists to shape.
-        note_written_payload(&[]);
-        assert_eq!(payload_counts(), (0, 0, 0));
     }
 
     #[test]

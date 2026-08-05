@@ -716,8 +716,6 @@ fn write_span_multi<H: HostMemory + HostOps>(
     if runs.is_empty() {
         return Err(MemError::BadArgs);
     }
-    // Once for the call, not per run: see the mapping rail's peer.
-    crate::observe::footprint::note_written_payload(buf);
     crate::runtime::mapper::flush_retired_views(state, host);
     let span_page_base = gva & !(page_size - 1);
     let end = gva.saturating_add(length);

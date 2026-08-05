@@ -410,7 +410,6 @@ fn contig_for_write<H: HostMemory + HostOps>(
     mapping_id: u32,
     span_end: u64,
     vouched: &mapper::PagesVouched,
-    src: &[u8],
 ) -> Option<(usize, usize)> {
     if !vouched.covers(state, mapping_id) {
         crate::observe::fail(format!(
@@ -439,19 +438,6 @@ fn contig_for_write<H: HostMemory + HostOps>(
     // the footprint mark rather than in each caller, so the two cannot drift and
     // a new caller inherits both.
     state.note_host_wrote_mapping(mapping_id);
-    // And the payload census, for the same reason and with the same blind spot
-    // if it is left out. The peer rails sample once per call in
-    // `mapper::write_mapping_bytes` and `gva_view::write_gva_bytes`; this file
-    // reaches neither, so without this the census reporting "no white payload in
-    // any sample" would be reporting it about every rail except the one carrying
-    // the pixels.
-    //
-    // `src` is the whole source image, and a partial write — skip ranges, a
-    // changed-span pass — puts only some of it in guest RAM. That over-reports,
-    // and the direction is deliberate: over-reporting a white run makes the
-    // payload a *weaker* discriminator, while under-reporting would manufacture
-    // the "we do not write white" that would clear this device on no evidence.
-    crate::observe::footprint::note_written_payload(src);
     Some(view)
 }
 
@@ -1220,7 +1206,7 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
     let frame_bytes = (mh as u64).saturating_mul(tight as u64);
 
     // Fast path: one packed view, poke rows in place.
-    if let Some((ptr, _)) = contig_for_write(state, host, mapping_id, span_end, &vouched, src) {
+    if let Some((ptr, _)) = contig_for_write(state, host, mapping_id, span_end, &vouched) {
         note_surface_write_path(true, frame_bytes);
         let land_started = std::time::Instant::now();
         // SAFETY: contig covers span_end; revalidated in ensure_contig_view.
@@ -1599,7 +1585,7 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
     let Some(vouched) = vouch_for_write(state, host, mapping_id, "rgba8_changed") else {
         return refuse(mapping_id, SurfaceWriteRefusal::PagesNotOurs);
     };
-    let contig = contig_for_write(state, host, mapping_id, span_end, &vouched, rgba);
+    let contig = contig_for_write(state, host, mapping_id, span_end, &vouched);
     // SAFETY: when Some, contig covers span_end.
     let base = contig.map(|(ptr, _)| unsafe { (ptr as *mut u8).add(base_off as usize) });
     for y in 0..mh as usize {
@@ -1813,7 +1799,7 @@ pub fn write_raw_rows<M: HostMemory + HostOps>(
     let Some(vouched) = vouch_for_write(state, host, mapping_id, "raw_rows") else {
         return refuse(mapping_id, SurfaceWriteRefusal::PagesNotOurs);
     };
-    if let Some((ptr, _)) = contig_for_write(state, host, mapping_id, span_end, &vouched, src) {
+    if let Some((ptr, _)) = contig_for_write(state, host, mapping_id, span_end, &vouched) {
         // SAFETY: contig covers span_end from offset 0.
         let base = ptr as *mut u8;
         for y in 0..height as usize {
@@ -2366,7 +2352,7 @@ fn write_rect_raw_at_impl<M: HostMemory + HostOps>(
     let Some(vouched) = vouch_for_write(state, host, mapping_id, "rect_raw") else {
         return false;
     };
-    if let Some((ptr, _)) = contig_for_write(state, host, mapping_id, span_end, &vouched, src) {
+    if let Some((ptr, _)) = contig_for_write(state, host, mapping_id, span_end, &vouched) {
         // SAFETY: contig covers span_end, and write_end ≤ span_end (checked).
         let base = unsafe { (ptr as *mut u8).add(base_off as usize) };
         if x_off == 0 && rb == bpr && src_stride as usize == rb {

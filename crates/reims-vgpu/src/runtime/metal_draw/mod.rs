@@ -4050,15 +4050,6 @@ pub(crate) fn write_gva_rgba8_within<M: HostMemory + HostOps>(
     if let Some(span_map) =
         crate::runtime::gva_view::map_fresh_span_within(state, host, task_id, gva, span, allowed)
     {
-        // The payload census, sampled: the run of `0xff` bytes this device puts
-        // into guest RAM is the predicate the panic census implies, and a rail
-        // that skips this is missing from a count whose whole use is saying
-        // whether white is ours. Read off the RGBA8 source rather than the
-        // converted rows because that is where the whole image is in one piece;
-        // the conversion is per-channel and full-scale maps to full-scale, so an
-        // all-`0xff` source region is all-`0xff` in guest RAM for every format
-        // here, and a source that is not white cannot become white.
-        crate::observe::footprint::note_written_payload(rgba);
         let (base, avail) = (span_map.ptr, span_map.avail);
         let mut res = Ok(());
         for y in 0..height as usize {
@@ -4179,15 +4170,6 @@ pub(crate) fn write_gva_rgba8_rect<M: HostMemory + HostOps>(
     if let Some(span_map) =
         crate::runtime::gva_view::map_fresh_span_within(state, host, task_id, gva, span, allowed)
     {
-        // The payload census, sampled: the run of `0xff` bytes this device puts
-        // into guest RAM is the predicate the panic census implies, and a rail
-        // that skips this is missing from a count whose whole use is saying
-        // whether white is ours. Read off the RGBA8 source rather than the
-        // converted rows because that is where the whole image is in one piece;
-        // the conversion is per-channel and full-scale maps to full-scale, so an
-        // all-`0xff` source region is all-`0xff` in guest RAM for every format
-        // here, and a source that is not white cannot become white.
-        crate::observe::footprint::note_written_payload(rgba);
         let (base, avail) = (span_map.ptr, span_map.avail);
         let mut ok = true;
         for dy in 0..rect_h as usize {
