@@ -532,9 +532,8 @@ fn apply_icb_compute_encoder_inheritance<M: HostMemory + HostOps>(
     range_length: u64,
 ) -> Result<Option<compute_exec::NestedDispatchJob>, ComputeStatus> {
     use crate::backend::metal::abi::{
-        ReimsVgpuComputeSampledImage, ReimsVgpuSampler, ReimsVgpuStorageImage,
-        REIMS_VGPU_BINDING_SAMPLER_BASE, REIMS_VGPU_BINDING_TEXTURE_BASE,
-        REIMS_VGPU_COMPUTE_TEXTURE_ACCESS_READ, REIMS_VGPU_COMPUTE_TEXTURE_ACCESS_READ_WRITE,
+        texture_binds_as_storage, ReimsVgpuComputeSampledImage, ReimsVgpuSampler,
+        ReimsVgpuStorageImage, REIMS_VGPU_BINDING_SAMPLER_BASE, REIMS_VGPU_BINDING_TEXTURE_BASE,
     };
     use crate::backend::metal::compute::{
         bind_compute_sampled_images, bind_compute_samplers, bind_storage_images,
@@ -885,22 +884,13 @@ fn apply_icb_compute_encoder_inheritance<M: HostMemory + HostOps>(
                     return Err(ComputeStatus::MetalBackend(st));
                 }
                 usages.truncate(usage_count);
-                let access_for = |binding: u32| -> Option<u32> {
-                    usages
-                        .iter()
-                        .find(|u| u.binding == binding)
-                        .map(|u| u.access)
-                };
-
                 let mut staged_tex = Vec::new();
                 for t in &acc.textures {
                     if t.texture_ref == 0 {
                         continue;
                     }
                     let binding = REIMS_VGPU_BINDING_TEXTURE_BASE + t.index;
-                    let access =
-                        access_for(binding).unwrap_or(REIMS_VGPU_COMPUTE_TEXTURE_ACCESS_READ_WRITE);
-                    let is_storage = access != REIMS_VGPU_COMPUTE_TEXTURE_ACCESS_READ;
+                    let is_storage = texture_binds_as_storage(&usages, binding);
                     staged_tex.push(stage_texture_raw(
                         state,
                         host,

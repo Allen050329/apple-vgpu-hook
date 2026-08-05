@@ -176,6 +176,30 @@ pub struct ReimsVgpuComputeTextureUsage {
     pub access: u32,
 }
 
+/// Whether a compute texture binding materializes as a storage image, from the
+/// shader's own reflected usage.
+///
+/// A binding the reflection does not mention defaults to read-write, and so to
+/// storage. That is deliberate and it is the permissive direction: this answer
+/// picks the descriptor the texture is *bound* as, and a shader that writes
+/// through a binding materialized as sampled-only writes nothing, silently.
+/// Materializing a read-only texture as storage costs a descriptor type, not a
+/// result. When the two errors are not symmetric, take the one that cannot lose
+/// guest work.
+///
+/// One function because it was two — `compute_exec` and `compute_session` each
+/// reflected the `.mtlb`, each built the same `access_for` closure over the
+/// result, and each applied this rule in the same three lines. They agreed, but
+/// by copy: nothing compared them, and the rule is a decision about what the
+/// guest's shader does rather than a lookup.
+pub fn texture_binds_as_storage(usages: &[ReimsVgpuComputeTextureUsage], binding: u32) -> bool {
+    usages
+        .iter()
+        .find(|u| u.binding == binding)
+        .map_or(REIMS_VGPU_COMPUTE_TEXTURE_ACCESS_READ_WRITE, |u| u.access)
+        != REIMS_VGPU_COMPUTE_TEXTURE_ACCESS_READ
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct ReimsVgpuSampledImage {
@@ -421,6 +445,37 @@ pub struct ReimsVgpuVertexAttr {
 mod tests {
     use super::*;
     use std::mem::{align_of, offset_of, size_of};
+
+    /// The rule two call sites held a copy of each, in the direction that cannot
+    /// lose a shader's writes.
+    #[test]
+    fn an_unreflected_texture_binding_materializes_as_storage() {
+        let usages = [
+            ReimsVgpuComputeTextureUsage {
+                binding: 4,
+                access: REIMS_VGPU_COMPUTE_TEXTURE_ACCESS_READ,
+            },
+            ReimsVgpuComputeTextureUsage {
+                binding: 5,
+                access: REIMS_VGPU_COMPUTE_TEXTURE_ACCESS_WRITE,
+            },
+            ReimsVgpuComputeTextureUsage {
+                binding: 6,
+                access: REIMS_VGPU_COMPUTE_TEXTURE_ACCESS_READ_WRITE,
+            },
+        ];
+        // Read-only is the only access that is not storage; both writing
+        // accesses are, which is why the test names all three rather than the
+        // one the default happens to equal.
+        assert!(!texture_binds_as_storage(&usages, 4));
+        assert!(texture_binds_as_storage(&usages, 5));
+        assert!(texture_binds_as_storage(&usages, 6));
+
+        // A binding the reflection never mentioned, and the empty reflection —
+        // both take the default, and it is storage.
+        assert!(texture_binds_as_storage(&usages, 7));
+        assert!(texture_binds_as_storage(&[], 4));
+    }
 
     #[test]
     fn stage_input_abi_preserves_c_layout() {

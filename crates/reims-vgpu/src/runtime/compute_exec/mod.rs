@@ -4090,14 +4090,14 @@ fn execute_dispatch_metal<M: HostMemory + HostOps>(
     cmd: &ComputeCommand,
     session: Option<&mut crate::runtime::compute_session::ComputeSession>,
 ) -> ComputeStatus {
+    use crate::backend::metal::abi::texture_binds_as_storage;
     use crate::backend::metal::abi::{
         ReimsVgpuComputeImageblockDimensions, ReimsVgpuComputeSampledImage,
         ReimsVgpuComputeStageInRegion, ReimsVgpuComputeStageInRegionIndirectArguments,
         ReimsVgpuComputeTextureUsage, ReimsVgpuSampler, ReimsVgpuStorageImage,
         ReimsVgpuThreadgroupMemory, REIMS_VGPU_BINDING_SAMPLER_BASE,
         REIMS_VGPU_BINDING_TEXTURE_BASE, REIMS_VGPU_COMPUTE_DISPATCH_KIND_THREADGROUPS,
-        REIMS_VGPU_COMPUTE_DISPATCH_KIND_THREADS, REIMS_VGPU_COMPUTE_TEXTURE_ACCESS_READ,
-        REIMS_VGPU_COMPUTE_TEXTURE_ACCESS_READ_WRITE, REIMS_VGPU_MTL_DISPATCH_TYPE_CONCURRENT,
+        REIMS_VGPU_COMPUTE_DISPATCH_KIND_THREADS, REIMS_VGPU_MTL_DISPATCH_TYPE_CONCURRENT,
         REIMS_VGPU_MTL_DISPATCH_TYPE_SERIAL,
     };
     use crate::backend::metal::compute::{
@@ -4220,18 +4220,10 @@ fn execute_dispatch_metal<M: HostMemory + HostOps>(
         usages.clear();
     }
 
-    let access_for = |binding: u32| -> Option<u32> {
-        usages
-            .iter()
-            .find(|u| u.binding == binding)
-            .map(|u| u.access)
-    };
-
     let mut staged_tex: Vec<StagedTexture> = Vec::new();
     for t in &acc.textures {
         let binding = REIMS_VGPU_BINDING_TEXTURE_BASE + t.index;
-        let access = access_for(binding).unwrap_or(REIMS_VGPU_COMPUTE_TEXTURE_ACCESS_READ_WRITE);
-        let is_storage = access != REIMS_VGPU_COMPUTE_TEXTURE_ACCESS_READ;
+        let is_storage = texture_binds_as_storage(&usages, binding);
         let stage_call_started = std::time::Instant::now();
         match stage_texture_raw(state, host, task_id, t.texture_ref, binding, is_storage) {
             Ok(s) => {
