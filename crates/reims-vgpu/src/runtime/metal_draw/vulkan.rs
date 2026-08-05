@@ -3989,15 +3989,7 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
             .find(|a| a.slot == c.slot)
             .filter(|a| a.blending_enabled)
             .and_then(|a| {
-                match translate::blend::state(
-                    a.src_rgb,
-                    a.dst_rgb,
-                    a.op_rgb,
-                    a.src_alpha,
-                    a.dst_alpha,
-                    a.op_alpha,
-                    blend_constants,
-                ) {
+                match translate::blend::state(a, blend_constants) {
                     Ok(state) => Some(state),
                     // An out-of-contract blend factor or op on a secondary
                     // slot: the attachment still renders, unblended, and the
@@ -5214,15 +5206,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         resources.color_write_mask = pd.color0.write_mask;
         if pd.color0.blending_enabled {
             let constants = req.blend_color.unwrap_or([0.0; 4]);
-            match translate::blend::state(
-                pd.color0.src_rgb,
-                pd.color0.dst_rgb,
-                pd.color0.op_rgb,
-                pd.color0.src_alpha,
-                pd.color0.dst_alpha,
-                pd.color0.op_alpha,
-                constants,
-            ) {
+            match translate::blend::state(&pd.color0, constants) {
                 Ok(b) => {
                     resources.blend = Some(b);
                 }

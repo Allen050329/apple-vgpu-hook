@@ -2000,12 +2000,15 @@ fn a8_sample_preserves_alpha_coverage() {
 #[test]
 fn blend_state_maps_src_alpha_one_minus() {
     let b = translate::blend::state(
-        4, // SrcAlpha
-        5, // OneMinusSrcAlpha
-        0, // Add
-        1, // One
-        5, // OneMinusSrcAlpha
-        0, // Add
+        &crate::runtime::decode::resource::PipelineColorAttachment {
+            src_rgb: 4,   // SrcAlpha
+            dst_rgb: 5,   // OneMinusSrcAlpha
+            op_rgb: 0,    // Add
+            src_alpha: 1, // One
+            dst_alpha: 5, // OneMinusSrcAlpha
+            op_alpha: 0,  // Add
+            ..Default::default()
+        },
         [0.0; 4],
     )
     .expect("map");
