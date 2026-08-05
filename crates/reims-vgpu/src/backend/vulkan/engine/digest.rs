@@ -1,4 +1,15 @@
 //! ≥128-bit content digests for cache keys (never bare DefaultHasher u64 alone).
+//!
+//! # This rule is this backend's, and the other backend does not follow it
+//!
+//! Stated here so the asymmetry is visible from the side that has the rule.
+//! `backend::metal::cache::RenderPsoKey` identifies a shader by a 64-bit
+//! non-keyed FNV-1a fingerprint plus its length and never compares the bytes —
+//! the same "matches by fingerprint alone" shape that
+//! `engine::pools::sampled_content_hash` argues needs 128 bits. That struct's
+//! doc carries the full account, including why it was recorded rather than
+//! changed. Do not read the rule above as crate-wide: it holds on the Vulkan arm
+//! only, and a reader who assumes otherwise will mis-price a Metal cache.
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};

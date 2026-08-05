@@ -14,6 +14,42 @@ pub struct FnEntry {
     pub function: Function,
 }
 
+/// Identity of a cached `MTLRenderPipelineState`.
+///
+/// # The shader is identified by fingerprint, and the fingerprint is 64 bits
+///
+/// [`RenderPsoKey::equal`] compares `vert_hash`/`frag_hash` and the two lengths.
+/// **The shader bytes themselves are never compared** — they are not retained to
+/// compare against. So two distinct blobs of equal length whose
+/// [`super::hash::hash_bytes`] outputs collide are one pipeline as far as this
+/// cache is concerned, and a draw gets an `MTLRenderPipelineState` built from
+/// the other blob's shader. Nothing refuses; the frame is simply wrong.
+/// `render_key_hash_and_shader_lengths_are_identity_fields` pins that these
+/// really are the identity fields.
+///
+/// # The other backend has a written rule against exactly this
+///
+/// `backend::vulkan::engine::digest` opens "≥128-bit content digests for cache
+/// keys (never bare `DefaultHasher` u64 alone)", and
+/// `engine::pools::sampled_content_hash` quantifies why: once a cache matches a
+/// blob to a retained image "by this fingerprint alone — it no longer keeps a
+/// byte copy to `memcmp` against", the width has to make an accidental
+/// collision astronomically unlikely, which at 128 bits it puts at ~2^-116 over
+/// that cache. This cache meets that description and uses 64 bits of non-keyed
+/// FNV-1a. Neither site knew about the other.
+///
+/// Recorded rather than fixed, deliberately. The fix is a behaviour change on a
+/// pathway no Linux host can boot, and half of it is worse than none: a second
+/// fold added at the producer but missed at one of the sites that build a key
+/// through [`RenderPsoKey::default`] would make two paths' keys never match,
+/// turning every cache hit into a pipeline rebuild — a performance collapse only
+/// an Apple host can see.
+///
+/// What would settle it, cheapest first. The live distinct-shader count sets the
+/// birthday bound and is a counter an Apple boot could read. Whether a collision
+/// is reachable at all is harder: equal-length collisions exist only above eight
+/// bytes, and finding one is a 2^32 meet-in-the-middle, so this is not a hazard
+/// a test can demonstrate.
 pub struct RenderPsoKey {
     pub key_hash: u64,
     pub vert_hash: u64,
@@ -38,7 +74,10 @@ pub struct RenderPsoKey {
     pub blend_src_alpha: u32,
     pub blend_dst_alpha: u32,
     pub blend_op_alpha: u32,
-    /// Number of active color RTs (0..=REIMS_VGPU_METAL_MAX_COLOR_RTS). Slot i uses color_formats[i].
+    /// Number of active color RTs (`0..=REIMS_VGPU_METAL_MAX_COLOR_RTS`). Slot
+    /// `i` uses `color_formats[i]` — backticked because a bare `[i]` is link
+    /// syntax, and rustdoc was reporting an unresolved link to `i`. The sibling
+    /// field below already spelled it this way.
     pub color_count: u32,
     pub color_formats: [u32; REIMS_VGPU_METAL_MAX_COLOR_RTS],
     pub color_slot: [u8; REIMS_VGPU_METAL_MAX_COLOR_RTS],
