@@ -51,11 +51,22 @@ fn narrow_count(value: u64) -> Result<u32, DecodeStatus> {
 /// device already ships a zero instance count to Metal on the path that happens
 /// not to come through here.
 ///
-/// The clamp stays until the case is measured — a zero is counted here and
-/// nowhere else, so `draw_instance_count_zero` is what would license honouring
-/// the guest's argument on this path as the ICB path already does. It is a
-/// census rather than a failure because a guest that culled every instance is
-/// expected control flow, not lost work.
+/// A zero is counted here and nowhere else, as `draw_instance_count_zero` — a
+/// census rather than a failure, because a guest that culled every instance
+/// would be expected control flow rather than lost work.
+///
+/// **It reads zero.** Driven x86/Vulkan boot, Ventura desktop, Safari window
+/// drag: never fired against `mrt_draw_single` in the thousands. So no guest
+/// command on this workload reaches the clamp, and it is inert rather than
+/// load-bearing — which is also why it has not been replaced. Both candidate
+/// replacements (pass the zero through as the ICB path does, or refuse it as
+/// `backend::metal::render` does) would be unobservable here, so the reading
+/// cannot choose between them, and Metal's own validation rejects
+/// `instanceCount:0` outright — which is the reason to doubt any guest emits it.
+///
+/// A firing is the signal. It would mean a real selector carries zero, and the
+/// arm that receives it decides the pixels: this one draws one instance, the
+/// Metal backend refuses the draw, the ICB path draws nothing.
 ///
 /// Because this is the single site, the count it guarantees is what let the
 /// three further `.max(1)`s downstream of it go: two in `runtime::exec` and one
