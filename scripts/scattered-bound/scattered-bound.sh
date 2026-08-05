@@ -39,9 +39,18 @@ CONST = re.compile(r'\b([A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+)\b')
 # array length never produce a bare `<`/`>` token at all.
 
 
+# The name may arrive through a path: `opcode > wire::OPCODE_DRAW_PATCHES` is a
+# comparison, and looking only at what precedes the name finds a colon. Both this
+# script and `a_bound_is_compared_where_it_is_declared.rs` missed every qualified
+# comparison until the two were made to agree on this.
+PATH_PREFIX = r'(?:[A-Za-z_][A-Za-z0-9_]*::)*'
+
+
 def relations(code, name):
     out = []
-    for m in re.finditer(r'(?<![<>=])(<=|>=|<|>)(?![<>=])\s*' + re.escape(name) + r'\b', code):
+    for m in re.finditer(
+        r'(?<![<>=])(<=|>=|<|>)(?![<>=])\s*' + PATH_PREFIX + re.escape(name) + r'\b', code
+    ):
         out.append(m.group(1))
     for m in re.finditer(r'\b' + re.escape(name) + r'\s*(?<![<>=])(<=|>=|<|>)(?![<>=])', code):
         out.append(m.group(1))
@@ -62,9 +71,11 @@ declared_in = {}
 for path in files:
     # A fixture restating a bound is not a second rule — nothing ships it, and
     # the sites that write page-table entries by hand would otherwise drown the
-    # report. Both spellings of "this file is tests" are skipped: a whole
-    # `tests.rs` module and an inline `#[cfg(test)] mod`.
-    if path.name == 'tests.rs' or path.parent.name == 'tests':
+    # report. Three spellings of "this file is tests" are skipped — a whole
+    # `tests.rs` module, a `*_tests.rs` one whose `#[cfg(test)] mod` is written
+    # by its parent, and a `tests/` directory — plus the inline
+    # `#[cfg(test)] mod` handled below.
+    if path.name == 'tests.rs' or path.name.endswith('_tests.rs') or path.parent.name == 'tests':
         continue
     try:
         text = path.read_text(errors='replace')

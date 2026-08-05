@@ -89,9 +89,27 @@ A relational operator is required, so a range (`1..MAX_CHANNELS`) and an array
 length (`[T; MAX_CHANNELS]`) never appear — neither restates a rule. Shifts
 (`pfn << PAGE_ENTRY_PFN_SHIFT`), generic arguments (`Vec<MAX_THING>`) and match
 arms (`Foo => MAX_THING,`) are excluded by lookaround, because each produced a
-whole page of report before it was. Test modules are skipped in both spellings —
-a whole `tests.rs` and an inline `#[cfg(test)] mod` — since a fixture restating
-a bound ships nothing.
+whole page of report before it was. Test modules are skipped in three spellings
+— a whole `tests.rs`, a `*_tests.rs` whose `#[cfg(test)] mod` is written by its
+parent, and an inline `#[cfg(test)] mod` — since a fixture restating a bound
+ships nothing.
+
+A qualified name (`opcode > wire::OPCODE_DRAW_PATCHES`) *is* seen, but only
+since the census was pinned by a test: both this script and that test looked at
+the character before the name, found a colon, and reported nothing. The first
+run after the repair found one — `decode::render`'s opcode window, compared
+twice in one function where the second comparison was the exact negation of the
+first and could not be false.
+
+## The census is a test now
+
+`crates/reims-vgpu/tests/a_bound_is_compared_where_it_is_declared.rs` runs this
+same census in Rust and fails on a name that is not in its recorded list. A
+discovery instrument nobody runs reports a clean tree by never being asked, and
+that was this script's status. The two scans were written independently and are
+kept in agreement — same 24 names today — which is the reason to believe either.
+Run this one to *read* the report: it ranks by polarity and prints the sites,
+which is what tells you which row to look at first.
 
 ## Fixing one
 

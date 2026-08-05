@@ -711,12 +711,15 @@ pub fn opcode_above_the_encoder_window(opcode: u32) -> bool {
     opcode > wire::OPCODE_SET_VERTEX_BUFFER_OFFSET_STRIDE
 }
 
+/// The full accepted window, from `reims_vgpu_render_decode.h`'s enum range.
+///
+/// One comparison, in [`opcode_above_the_encoder_window`]. This used to end with
+/// `opcode <= wire::OPCODE_SET_VERTEX_BUFFER_OFFSET_STRIDE` after the early
+/// return above it — the exact negation of the test just made, so it could not
+/// be false, while reading like a second admission rule that a later edit would
+/// have to keep in step.
 pub fn opcode_supported(opcode: u32) -> bool {
-    if opcode_above_the_encoder_window(opcode) {
-        return false;
-    }
-    // Full accepted window from reims_vgpu_render_decode.h enum range.
-    opcode <= wire::OPCODE_SET_VERTEX_BUFFER_OFFSET_STRIDE
+    !opcode_above_the_encoder_window(opcode)
 }
 
 /// Decode color attachment slot `index` from a render-pass payload.

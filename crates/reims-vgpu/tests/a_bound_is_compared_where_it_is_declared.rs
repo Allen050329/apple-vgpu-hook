@@ -14,17 +14,34 @@
 //! | `REIMS_VGPU_METAL_MAX_BUFFERS` | 8 in 4 files | a helper stating the rule existed, and five sites did not call it |
 //! | `TEXTURE_VIEW_MIN_SIMPLE` | 2 in 2 files | both guarded an 8-byte header peek with one type-8 variant's *total* length |
 //!
-//! `scripts/scattered-bound` finds this shape across the crate. It is a
-//! discovery instrument and cannot replace this test: it only reports a bound
-//! compared at two or more sites, so once a bound is consolidated a *single*
-//! reintroduced copy is invisible to it — that copy is then the only comparison
-//! left. Measured, not assumed. This test names the file and line instead.
+//! # Two tests, because there are two questions
+//!
+//! [`every_bound_is_compared_only_where_it_is_declared`] answers the strong one
+//! for the five bounds above: *no* comparison outside the owning file, with each
+//! survivor exempted by name and reason. It is the only shape that catches a
+//! **single** reintroduced copy — once a bound is consolidated, a lone new
+//! comparison is the only one left, and no census of "compared at two or more
+//! sites" can see it. Measured, not assumed.
+//!
+//! [`no_bound_becomes_scattered_without_being_looked_at`] answers the weak one
+//! for every constant in both crates: which bounds are compared away from where
+//! they are declared *at all*. That is the census `scripts/scattered-bound`
+//! prints, and it was wired to nothing — a discovery instrument nobody runs
+//! reports a clean tree by never being asked. [`RECORDED`] freezes what it says
+//! today, so a bound that becomes scattered tomorrow fails the build.
+//!
+//! The script stays: it ranks by polarity, which is the signal for *which* of
+//! these to look at first, and a report is easier to read than an assertion.
+//! The scan here was written independently and agrees with it exactly — same 24
+//! names — which is the only reason to believe either.
 //!
 //! An integration test rather than a `#[cfg(test)]` module because it reads
 //! source text and must run on every arm, including `backend-metal`, which this
 //! development host can compile but cannot execute.
 
 use std::path::{Path, PathBuf};
+
+mod source_scan;
 
 /// A bound, the file allowed to compare it, and the sites that legitimately
 /// compare it anyway.
@@ -184,5 +201,370 @@ fn every_bound_is_compared_only_where_it_is_declared() {
         failures.is_empty(),
         "a bound is one rule and these restate it:\n{}",
         failures.join("\n")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The property, not the list.
+// ---------------------------------------------------------------------------
+
+/// A bound compared away from the file that declares it, and what was found
+/// when it was looked at.
+///
+/// This is a **ratchet, not a certificate**. Each row records that the shape was
+/// measured and left alone, with the reason it is not (or not yet) a finding;
+/// none of them is a claim that the copies agree — that claim is what [`BOUNDS`]
+/// above makes, for the five bounds where it was established site by site. What
+/// the row buys is that a bound becoming scattered *after* this was written
+/// fails the build instead of waiting for somebody to run a script.
+struct Recorded {
+    name: &'static str,
+    why: &'static str,
+}
+
+const RECORDED: &[Recorded] = &[
+    // The one the polarity ranking puts first, and the standing candidate for
+    // the treatment the five bounds above got.
+    Recorded {
+        name: "MAX_BIND_SLOTS",
+        why: "29 comparisons in 4 runtime files, in both polarities — the bind-slot \
+              admission. Not consolidated here because the sites do not agree on what \
+              happens after: `draw::vulkan` skips the bind (`continue`), `draw::metal_icb` \
+              refuses the record. One predicate would have to return which.",
+    },
+    Recorded {
+        name: "MAX_TASKS",
+        why: "5 sites refuse a task id at or above the cap; the sixth asks whether a \
+              nonzero *hint* is usable, which is a different question and is why the \
+              polarity differs.",
+    },
+    // Slice-bound checks. The constant is a record's length and each site bounds
+    // a different read at a different offset, so the rule is `offset + LEN
+    // <= buf.len()` and not a predicate over one value. Consolidating these
+    // means checked accessors in `reims-vgpu-wire`, which is where that work
+    // belongs and how the wire crate already states it.
+    Recorded {
+        name: "OP_HEADER_LEN",
+        why: "record-header floor before a header read, at each decode entry point",
+    },
+    Recorded {
+        name: "SEGMENT_HEADER_LEN",
+        why: "segment-header floor, four reads in `decode::stream` plus the wire crate's own",
+    },
+    Recorded {
+        name: "PACKET_HEADER_LEN",
+        why: "FIFO packet-header floor in `drain`; the two polarities are \
+              'too short to read' and 'long enough to snapshot'",
+    },
+    Recorded {
+        name: "HEADER_WORDS",
+        why: "SPIR-V header floor before indexing `words`, at four `spirv_bind` entries",
+    },
+    Recorded {
+        name: "CHILD_EXEC_INDIRECT_HEADER_LEN",
+        why: "one header floor asked in `decode::fifo` and again in `exec` on the payload it \
+              hands on",
+    },
+    Recorded {
+        name: "ICB_BUFFER_BIND_STRIDE",
+        why: "`off + STRIDE > slot.len()` before two different ICB body reads",
+    },
+    Recorded {
+        name: "ICB_CONCURRENT_DISPATCH_ARGS_LEN",
+        why: "`args + LEN > len` before two different ICB body reads",
+    },
+    Recorded {
+        name: "ICB_TESSELLATION_FACTOR_LEN",
+        why: "`off + LEN > slot.len()` twice in one ICB decoder, at two offsets",
+    },
+    Recorded {
+        name: "TYPE4_MIN_LEN",
+        why: "descriptor-length floor before two different type-4 field reads",
+    },
+    // Capacity versus index: one site asks whether a decoded index is in the
+    // band, another whether a list is full. `backend/metal/util.rs` holds the
+    // index predicates; the same distinction is already written out as a named
+    // exemption for `REIMS_VGPU_METAL_MAX_BUFFERS` in `BOUNDS` above.
+    Recorded {
+        name: "REIMS_VGPU_METAL_MAX_BUFFERS",
+        why: "index band in `util`, list capacity in `render` — see the BOUNDS exemptions",
+    },
+    Recorded {
+        name: "REIMS_VGPU_METAL_MAX_TEXTURES",
+        why: "index band in `util`, list capacity and a usage cap in `compute`",
+    },
+    Recorded {
+        name: "REIMS_VGPU_METAL_MAX_SAMPLERS",
+        why: "index band in `util`, list capacity in `compute`",
+    },
+    Recorded {
+        name: "REIMS_VGPU_METAL_MAX_ATTRS",
+        why: "attribute-location band in `render` and in `stage_input`, plus a list capacity; \
+              the two files narrow the same field for two descriptors",
+    },
+    Recorded {
+        name: "REIMS_VGPU_METAL_MAX_COLOR_RTS",
+        why: "list capacity and slot index, two lines apart in one function",
+    },
+    // A band's own edges, related to each other rather than to a decoded value.
+    Recorded {
+        name: "REIMS_VGPU_BINDING_TEXTURE_BASE",
+        why: "`util`'s band predicate, and a `const` assertion in `constants` pinning the \
+              buffer band to end before this one begins — the exemption `BOUNDS` already names",
+    },
+    Recorded {
+        name: "REIMS_VGPU_BINDING_SAMPLER_BASE",
+        why: "same pair as the texture base, one band up",
+    },
+    // The wire crate validates its own record and the device re-asks over the
+    // type it built from it. Two crates, so no predicate is shared without one
+    // depending on the other.
+    Recorded {
+        name: "MAX_DEPTH",
+        why: "`wire::page_table` validates the declared depth; `contract::gva_resolve` re-asks \
+              over the geometry it assembled",
+    },
+    Recorded {
+        name: "TYPE4_PLANE_CAP",
+        why: "`wire::device_desc` bounds a plane index, `objects` bounds a decoded plane count",
+    },
+    // Single-file pairs.
+    Recorded {
+        name: "CURSOR_MAX_DIM",
+        why: "width and height on adjacent lines of one guard — one rule over two fields",
+    },
+    Recorded {
+        name: "REG_BASE",
+        why: "the MMIO read path and the write path each ask whether an offset is below the \
+              register window",
+    },
+    Recorded {
+        name: "SAMPLED_CACHE_CAP",
+        why: "admission and the eviction loop, in the pool that owns both",
+    },
+    Recorded {
+        name: "SAMPLED_CACHE_BYTE_CAP",
+        why: "one entry's size, the running total, and the eviction loop, all in that pool",
+    },
+];
+
+/// Where each constant is declared, by name.
+type DeclaredIn = std::collections::BTreeMap<String, String>;
+/// Every `(file, line)` a constant is compared at, by name.
+type ComparedAt = std::collections::BTreeMap<String, Vec<(String, usize)>>;
+
+/// Every `(name, file, line)` where a `SCREAMING_CASE` constant is related to
+/// something by `<`, `>`, `<=` or `>=`.
+fn comparison_census() -> (DeclaredIn, ComparedAt) {
+    let root = source_scan::workspace_root();
+    let mut declared: DeclaredIn = Default::default();
+    let mut sites: ComparedAt = Default::default();
+
+    for tree in ["crates/reims-vgpu/src", "crates/reims-vgpu-wire/src"] {
+        for path in source_scan::rust_sources(&root.join(tree)) {
+            // Three spellings of "this file is tests", all of which restate a
+            // bound as a fixture: a whole `tests.rs` sibling, a `*_tests.rs`
+            // one (`cap_tests.rs`, `revalidate_tests.rs`,
+            // `render_flush_witness_tests.rs` — declared `#[cfg(test)] mod` by
+            // their parent, so the marker is not in the file), and a `tests/`
+            // directory. An inline `#[cfg(test)] mod` is blanked below.
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            if name == "tests.rs"
+                || name.ends_with("_tests.rs")
+                || path.parent().is_some_and(|p| p.ends_with("tests"))
+            {
+                continue;
+            }
+            let rel = path
+                .strip_prefix(&root)
+                .expect("under the workspace")
+                .to_string_lossy()
+                .into_owned();
+            let text = std::fs::read_to_string(&path).expect("source must be readable");
+            let code = source_scan::blank_test_modules(&source_scan::blank_comments(&text));
+            for (n, line) in code.lines().enumerate() {
+                if let Some(name) = declares_const(line) {
+                    declared.insert(name, rel.clone());
+                }
+                for name in compared_names(line) {
+                    sites.entry(name).or_default().push((rel.clone(), n + 1));
+                }
+            }
+        }
+    }
+    (declared, sites)
+}
+
+/// The constant a line declares, if it declares one.
+fn declares_const(line: &str) -> Option<String> {
+    let rest = line.trim_start();
+    let rest = rest.strip_prefix("pub").map_or(rest, |r| {
+        let r = r.trim_start();
+        r.strip_prefix('(')
+            .and_then(|r| r.split_once(')'))
+            .map_or(r, |(_, after)| after.trim_start())
+    });
+    let rest = rest.strip_prefix("const ")?.trim_start();
+    let name: String = rest.chars().take_while(|c| is_ident_char(*c)).collect();
+    let after = rest[name.len()..].trim_start();
+    (after.starts_with(':') && is_screaming(&name)).then_some(name)
+}
+
+fn is_ident_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
+}
+
+/// `MAX_THING` yes, `Max`, `MAX`, `max_thing` no — the shape a bound is spelled
+/// in, which is also what keeps a type parameter or a field name out.
+fn is_screaming(name: &str) -> bool {
+    name.starts_with(|c: char| c.is_ascii_uppercase())
+        && name.contains('_')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+}
+
+/// The constants this line *relates* to something, as opposed to naming.
+///
+/// Four neighbouring shapes are not comparisons and each is a page of false
+/// report: `pfn << PAGE_ENTRY_PFN_SHIFT` (a shift — by far the largest source,
+/// every page-table fixture writes one), `Foo => MAX_THING` (a match arm; the
+/// fat arrow is not a `>`), `1..MAX_CHANNELS` and `[T; MAX_CHANNELS]` (a range
+/// and an array length, neither of which states a rule). The first two are
+/// refused by requiring the operator to be undoubled and not preceded by `=`;
+/// the last two never produce a bare `<`/`>` beside the name at all.
+fn compared_names(line: &str) -> Vec<String> {
+    let b: Vec<char> = line.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if !is_ident_char(b[i]) || (i > 0 && is_ident_char(b[i - 1])) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < b.len() && is_ident_char(b[i]) {
+            i += 1;
+        }
+        let name: String = b[start..i].iter().collect();
+        if is_screaming(&name)
+            && (relation_before(&b, path_start(&b, start)) || relation_after(&b, i))
+        {
+            out.push(name);
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Where the path leading to the name at `at` begins.
+///
+/// `x > wire::OPCODE_DRAW_PATCHES` is a comparison, and looking only at the
+/// character before the name finds a colon. Both this scan and
+/// `scripts/scattered-bound` missed every qualified comparison until this
+/// existed; `decode::render` has two, on the opcode band that decides whether a
+/// record is a draw at all.
+fn path_start(b: &[char], name_start: usize) -> usize {
+    let mut at = name_start;
+    while at >= 2 && b[at - 1] == ':' && b[at - 2] == ':' {
+        let mut seg = at - 2;
+        while seg > 0 && is_ident_char(b[seg - 1]) {
+            seg -= 1;
+        }
+        if seg == at - 2 {
+            break;
+        }
+        at = seg;
+    }
+    at
+}
+
+/// A relational operator immediately to the left of `at`, ignoring spaces.
+fn relation_before(b: &[char], at: usize) -> bool {
+    let mut j = at;
+    while j > 0 && b[j - 1] == ' ' {
+        j -= 1;
+    }
+    if j == 0 {
+        return false;
+    }
+    // `<=` / `>=`, then the bare `<` / `>`.
+    let (op_start, ok) = if b[j - 1] == '=' && j >= 2 && (b[j - 2] == '<' || b[j - 2] == '>') {
+        (j - 2, true)
+    } else if b[j - 1] == '<' || b[j - 1] == '>' {
+        (j - 1, true)
+    } else {
+        (j, false)
+    };
+    ok && (op_start == 0 || !matches!(b[op_start - 1], '<' | '>' | '='))
+}
+
+/// A relational operator immediately to the right of `at`, ignoring spaces.
+fn relation_after(b: &[char], at: usize) -> bool {
+    let mut j = at;
+    while j < b.len() && b[j] == ' ' {
+        j += 1;
+    }
+    if j >= b.len() || !matches!(b[j], '<' | '>') {
+        return false;
+    }
+    // `<<`, `>>` and `<=`-that-is-really-`<==` cannot occur; a doubled operator
+    // is a shift and `=` after is the two-character form, which is a relation.
+    !matches!(b.get(j + 1), Some('<') | Some('>'))
+}
+
+#[test]
+fn no_bound_becomes_scattered_without_being_looked_at() {
+    let (declared, sites) = comparison_census();
+    assert!(
+        declared.len() > 200,
+        "found {} declared constants, which is not these two crates",
+        declared.len()
+    );
+
+    let mut found: Vec<(&String, &Vec<(String, usize)>)> = Vec::new();
+    for (name, occ) in &sites {
+        let owner = declared.get(name);
+        let away = occ.iter().any(|(f, _)| Some(f) != owner);
+        if away && occ.len() >= 2 {
+            found.push((name, occ));
+        }
+    }
+
+    let recorded: std::collections::BTreeSet<&str> = RECORDED.iter().map(|r| r.name).collect();
+    let new: Vec<String> = found
+        .iter()
+        .filter(|(n, _)| !recorded.contains(n.as_str()))
+        .map(|(n, occ)| {
+            let where_ = occ
+                .iter()
+                .take(4)
+                .map(|(f, l)| format!("{f}:{l}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("  {n}  ({} comparisons) {where_}", occ.len())
+        })
+        .collect();
+    assert!(
+        new.is_empty(),
+        "these bounds are compared away from the file that declares them, and \
+         nobody has looked:\n{}\nConsolidate the rule beside its constant, or \
+         add a `Recorded` row saying what you found.",
+        new.join("\n")
+    );
+
+    let names: std::collections::BTreeSet<&str> = found.iter().map(|(n, _)| n.as_str()).collect();
+    let stale: Vec<String> = RECORDED
+        .iter()
+        .filter(|r| !names.contains(r.name))
+        .map(|r| format!("  {}  (recorded as: {})", r.name, r.why))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "these rows describe a shape that is gone — the bound was consolidated, \
+         renamed, or its second comparison deleted. Delete the row so the list \
+         keeps meaning something:\n{}",
+        stale.join("\n")
     );
 }
