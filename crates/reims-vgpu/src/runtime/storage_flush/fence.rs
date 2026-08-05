@@ -4,14 +4,14 @@
 //! the guest is entitled to read the bytes through its own mapping — a path no
 //! host-side choke point in [`super::access`] can intercept. Each of the four
 //! deferred rails therefore lands every window it still holds before the fence
-//! is signalled. What each pass measured is recorded by [`super::witness`].
+//! is signalled. What each pass measured is recorded by [`super::report`].
 
 #[cfg(feature = "backend-vulkan")]
 use super::access::flush_intersecting;
 #[cfg(feature = "backend-vulkan")]
 use super::land::{flush_gva_one, flush_linear_one};
 #[cfg(feature = "backend-vulkan")]
-use super::witness::note_fence_batch_band;
+use super::report::note_fence_batch_band;
 use crate::model::DeviceState;
 use crate::runtime::host::{HostMemory, HostOps};
 
@@ -146,7 +146,7 @@ pub fn flush_linear_windows_before_fence<M: HostMemory + HostOps>(
 /// not this rail's position: `land::flush_render_one` and `land::flush_storage_one`
 /// compare the mapping's live `map_generation` against `key.map_generation` and
 /// refuse before reading, and `map_generation` moves on exactly the events that
-/// let a guest reuse an IOSurface's storage. [`note_mapping_window_against_fence`](crate::runtime::storage_flush::witness::note_mapping_window_against_fence)
+/// let a guest reuse an IOSurface's storage. [`note_mapping_window_against_fence`](crate::runtime::storage_flush::report::note_mapping_window_against_fence)
 /// records that argument in full and still holds.
 ///
 /// # This rail is bound because the guest is entitled to the bytes at the fence
@@ -217,7 +217,7 @@ pub fn flush_linear_windows_before_fence<M: HostMemory + HostOps>(
 /// bounding what a flush copies is now motivated by its byte cost rather than
 /// by this correctness hazard.
 ///
-/// [`note_render_flush_over_guest_write`](crate::runtime::storage_flush::witness::note_render_flush_over_guest_write) states why the obvious repair —
+/// [`note_render_flush_over_guest_write`](crate::runtime::storage_flush::report::note_render_flush_over_guest_write) states why the obvious repair —
 /// preserve the pages the guest wrote — is not available: `page_gen[p]` is
 /// stamped at the *harvest* that saw page `p` dirty, not at the write, so the
 /// witness cannot say whether a store happened before or after the Store this

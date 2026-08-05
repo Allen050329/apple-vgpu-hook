@@ -14,9 +14,9 @@ use super::guards::{
 };
 #[cfg(feature = "backend-vulkan")]
 use super::lifecycle::release_window_pin_for_key;
-use super::witness::note_mapping_window_against_fence;
+use super::report::note_mapping_window_against_fence;
 #[cfg(feature = "backend-vulkan")]
-use super::witness::{
+use super::report::{
     note_linear_window_outlived_its_stamp, note_render_flush_landed,
     note_render_flush_over_guest_write, note_window_outlived_its_stamp,
 };

@@ -1,6 +1,7 @@
 //! What the rail measured: batch sizes, stamp order, and who read a landing.
 //!
-//! None of this decides anything. Every function here records a reading the
+//! None of this decides anything — the same membership rule, and the same
+//! module name, as `runtime::exec::report`. Every function here records a reading the
 //! rail's own cost arguments are built from — how many windows a fence pass
 //! landed, whether a window outlived the stamp it was armed under, whether
 //! anybody ever read what a landing wrote — and they live together so that the

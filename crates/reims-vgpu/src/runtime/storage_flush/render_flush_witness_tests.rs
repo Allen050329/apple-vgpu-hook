@@ -1,4 +1,4 @@
-use super::witness::{
+use super::report::{
     note_render_flush_cache_read, note_render_flush_landed, note_render_flush_pages_read,
 };
 use crate::model::{DeviceId, DeviceState, MappingEntry, PAGE_SHIFT_X86};

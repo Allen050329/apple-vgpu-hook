@@ -38,8 +38,9 @@
 //! * [`lifecycle`] — the three ways a window ends *without* landing: torn
 //!   down, superseded, or unpinned.
 //!
-//! [`witness`] sits beside them all and decides nothing: it holds the readings
-//! this rail's cost arguments are built from.
+//! [`report`] sits beside them all and decides nothing: it holds the readings
+//! this rail's cost arguments are built from. It shares that membership rule,
+//! and its name, with `runtime::exec::report`.
 //!
 //! # This entire rail is Vulkan-only
 //!
@@ -77,7 +78,7 @@ pub(crate) mod fence;
 pub(crate) mod guards;
 pub(crate) mod land;
 pub(crate) mod lifecycle;
-pub(crate) mod witness;
+pub(crate) mod report;
 
 pub use access::{
     flush_gva_exact, flush_intersecting, flush_intersecting_task_gva, flush_mapping_for_guest_read,
@@ -85,7 +86,7 @@ pub use access::{
 pub use fence::{flush_all_windows_before_fence, flush_mapping_windows_before_fence};
 pub use land::{flush_gva_one, flush_linear_one, retire_gva_windows, retire_linear_residents};
 pub use lifecycle::drop_windows;
-pub use witness::{note_render_flush_cache_read, note_render_flush_pages_read};
+pub use report::{note_render_flush_cache_read, note_render_flush_pages_read};
 
 #[cfg(feature = "backend-vulkan")]
 pub(crate) use land::{gva_window_identity, render_window_identity};
