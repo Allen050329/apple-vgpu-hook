@@ -220,10 +220,8 @@ fn decode_texture_view_hop_reasoned<M: HostMemory + HostOps>(
     task_id: u32,
     texture_ref: u32,
 ) -> Result<(u32, u32, Option<pixel_format::SwizzlePlan>, Option<u16>), TextureViewDecline> {
-    use crate::contract::endian::ld32;
     use crate::runtime::decode::resource::{
-        decode_texture_view_descriptor, OBJECT_TYPE_TEXTURE_VIEW, TEXTURE_VIEW_DESC_LEN,
-        TEXTURE_VIEW_DESC_OPCODE, TEXTURE_VIEW_MIN_SIMPLE,
+        decode_texture_view_descriptor, texture_type8_header, OBJECT_TYPE_TEXTURE_VIEW,
     };
     let entry = objects::lookup_list_entry(state, host, task_id, texture_ref)
         .ok_or(TextureViewDecline::HopEntryMissing { texture_ref })?;
@@ -240,14 +238,7 @@ fn decode_texture_view_hop_reasoned<M: HostMemory + HostOps>(
         },
     )?;
     // Bytes visible before decode, for the len-mismatch / bad-opcode census.
-    let (opcode, declared) = if desc.len() >= TEXTURE_VIEW_MIN_SIMPLE {
-        (
-            ld32(&desc[TEXTURE_VIEW_DESC_OPCODE..]),
-            ld32(&desc[TEXTURE_VIEW_DESC_LEN..]),
-        )
-    } else {
-        (0, 0)
-    };
+    let (opcode, declared) = texture_type8_header(&desc).unwrap_or((0, 0));
     let view = decode_texture_view_descriptor(&desc).map_err(|reason| {
         // Dump the full wire blob for an unknown texture-view opcode: this is the
         // only signal that reveals a new serializer variant (off the hot path —

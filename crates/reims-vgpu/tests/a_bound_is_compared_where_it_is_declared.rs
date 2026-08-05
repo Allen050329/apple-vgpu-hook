@@ -12,6 +12,7 @@
 //! | `MAX_CHANNELS` | 7 in 4 files | three wrote `id == 0 \|\| id >= MAX`, four wrote the exact negation |
 //! | `MAX_MAPPINGS` | 10 in 4 files | six omitted the zero test, and zero is the "no mapping" sentinel |
 //! | `REIMS_VGPU_METAL_MAX_BUFFERS` | 8 in 4 files | a helper stating the rule existed, and five sites did not call it |
+//! | `TEXTURE_VIEW_MIN_SIMPLE` | 2 in 2 files | both guarded an 8-byte header peek with one type-8 variant's *total* length |
 //!
 //! `scripts/scattered-bound` finds this shape across the crate. It is a
 //! discovery instrument and cannot replace this test: it only reports a bound
@@ -74,6 +75,11 @@ const BOUNDS: &[Bound] = &[
                  over one index cannot express that.",
             ),
         ],
+    },
+    Bound {
+        name: "TEXTURE_VIEW_MIN_SIMPLE",
+        owner: "runtime/decode/resource.rs",
+        exempt: &[],
     },
 ];
 

@@ -2510,13 +2510,36 @@ pub fn decode_buffer_texture_descriptor(
     }
 }
 
-/// Peek the view_opcode of a type-8 descriptor (opcode 9 = buffer-backed texture,
-/// 7/8/0x1b = texture view). Returns `None` for a blob too short to hold a header.
-pub fn texture_type8_opcode(bytes: &[u8]) -> Option<u32> {
-    if bytes.len() < TEXTURE_VIEW_MIN_SIMPLE {
+/// Peek the raw `(view_opcode, declared length)` header of a type-8 descriptor
+/// (opcode 9 = buffer-backed texture, 7/8/0x1b = texture view). `None` only for
+/// a blob too short to hold the header.
+///
+/// The bound is [`OP_HDR`] — the bytes this actually reads — and not any one
+/// variant's total length. The type-8 forms do not share a length (20 / 36 / 44
+/// / 64 / 72 …), so guarding a header peek with one of those totals hides every
+/// shorter variant behind `None` before its own decoder ever sees the opcode.
+/// That is the same mistake `compute_stage_tex` had to unpick at its call site,
+/// where checking the narrow heap-texture length would have rejected every wide
+/// record.
+///
+/// Neither word is validated against the blob, deliberately: the callers that
+/// want both use them for the length-mismatch and unknown-opcode census, which
+/// needs the guest's declared value precisely when it disagrees with what
+/// arrived. [`decode_texture_view_descriptor`] is the checked reader.
+pub fn texture_type8_header(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.len() < OP_HDR {
         return None;
     }
-    Some(ld32(&bytes[TEXTURE_VIEW_DESC_OPCODE..]))
+    Some((
+        ld32(&bytes[TEXTURE_VIEW_DESC_OPCODE..]),
+        ld32(&bytes[TEXTURE_VIEW_DESC_LEN..]),
+    ))
+}
+
+/// The opcode half of [`texture_type8_header`], for callers routing on the
+/// variant alone.
+pub fn texture_type8_opcode(bytes: &[u8]) -> Option<u32> {
+    texture_type8_header(bytes).map(|(opcode, _)| opcode)
 }
 
 const TYPE7_MIN_LEN: usize = 17;
@@ -4938,6 +4961,37 @@ mod tests {
             texture_type8_opcode(&b1),
             Some(TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE)
         );
+    }
+
+    /// The header peek is bounded by the header, not by one variant's total.
+    ///
+    /// A truncated type-8 blob still names which variant the guest meant, and
+    /// that name is what routes it to the decoder that can report the
+    /// truncation. Bounding the peek by the *simple view's* total length (20)
+    /// instead returned `None` for every blob of 8..20 bytes, so a short record
+    /// of any other variant read as "no opcode" and was refused by whichever
+    /// caller's fallback ran first, naming the wrong reason.
+    #[test]
+    fn the_type8_header_peek_is_bounded_by_the_header_it_reads() {
+        // Exactly the header, declaring a 64-byte buffer-backed texture: the
+        // shortest blob that carries an opcode at all.
+        let mut short = vec![0u8; OP_HDR];
+        crate::contract::endian::st32(
+            &mut short[TEXTURE_VIEW_DESC_OPCODE..],
+            TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE,
+        );
+        crate::contract::endian::st32(&mut short[TEXTURE_VIEW_DESC_LEN..], BUF_TEX_MIN_LEN as u32);
+        assert_eq!(
+            texture_type8_header(&short),
+            Some((TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE, BUF_TEX_MIN_LEN as u32)),
+            "a header-length blob must still name its variant and its declared length"
+        );
+        // And the checked reader is still the one that refuses it.
+        assert!(decode_buffer_texture_descriptor(&short).is_err());
+
+        // One byte short of a header is the only case with nothing to read.
+        assert_eq!(texture_type8_header(&short[..OP_HDR - 1]), None);
+        assert_eq!(texture_type8_opcode(&short[..OP_HDR - 1]), None);
     }
 
     fn hex_to_bytes(s: &str) -> Vec<u8> {
