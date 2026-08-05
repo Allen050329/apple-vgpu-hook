@@ -2054,30 +2054,27 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
         ));
         Err(st)
     };
-    let Some(entry) = objects::lookup_list_entry(state, host, task_id, stage_ref) else {
-        return linear_fail(
-            ComputeStatus::MissingTexture(crate::observe::ladder_slug!(
-                "compute_linear_tex",
-                no_list_entry
-            )),
-            String::new(),
-        );
-    };
-    if entry.object_type != OBJECT_TYPE_TEXTURE && entry.object_type != OBJECT_TYPE_TEXTURE_VARIANT
-    {
-        return linear_fail(
-            ComputeStatus::MissingTexture("compute_linear_tex_not_texture"),
-            format!("ot={}", entry.object_type),
-        );
-    }
-    let Some(desc_bytes) = objects::read_descriptor(state, host, task_id, &entry) else {
-        return linear_fail(
-            ComputeStatus::MissingTexture(crate::observe::ladder_slug!(
-                "compute_linear_tex",
-                desc_read
-            )),
-            String::new(),
-        );
+    let (_entry, desc_bytes) = match objects::resolve_descriptor(
+        state,
+        host,
+        task_id,
+        stage_ref,
+        &[OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_VARIANT],
+    ) {
+        Ok(found) => found,
+        Err(rung) => {
+            return linear_fail(
+                ComputeStatus::MissingTexture(crate::observe::ladder_slugs!("compute_linear_tex")(
+                    rung,
+                )),
+                match rung {
+                    objects::LadderRung::WrongType { got } => format!("ot={got}"),
+                    objects::LadderRung::NoListEntry | objects::LadderRung::DescRead => {
+                        String::new()
+                    }
+                },
+            );
+        }
     };
     let Ok(tex) = decode_texture_descriptor(&desc_bytes) else {
         return linear_fail(

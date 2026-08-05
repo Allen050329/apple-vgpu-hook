@@ -155,16 +155,18 @@ fn resolve_multi_mip_texture<M: HostMemory + HostOps>(
     if texture_ref == 0 {
         return Err(MipmapStatus::MissingTexture);
     }
-    let Some(entry) = objects::lookup_list_entry(state, host, task_id, texture_ref) else {
-        return Err(MipmapStatus::MissingTexture);
-    };
-    if entry.object_type != OBJECT_TYPE_TEXTURE && entry.object_type != OBJECT_TYPE_TEXTURE_VARIANT
-    {
-        return Err(MipmapStatus::MissingTexture);
-    }
-    let Some(desc_bytes) = objects::read_descriptor(state, host, task_id, &entry) else {
-        return Err(MipmapStatus::MissingTexture);
-    };
+    // All three rungs answer with the one coarse class, which is what the four
+    // checks around them already do — see the decode arm below, which is the
+    // only one this rail singles out. Collapsing them here at least says so in
+    // one place instead of three identical `else` blocks.
+    let (_entry, desc_bytes) = objects::resolve_descriptor(
+        state,
+        host,
+        task_id,
+        texture_ref,
+        &[OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_VARIANT],
+    )
+    .map_err(|_| MipmapStatus::MissingTexture)?;
     let tex = match decode_texture_descriptor(&desc_bytes) {
         Ok(t) => t,
         Err(e) => {
