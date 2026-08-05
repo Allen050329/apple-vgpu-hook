@@ -158,9 +158,17 @@ root = sys.argv[1]
 # carries no cfg of its own, so stubbing a cfg-gated struct emits an impl for a
 # type that does not exist on the other arm. `metal_draw/vulkan.rs` is full of
 # these; it is `include!`d rather than a module, so every item in it is
-# individually gated.
+# individually gated. `#[cfg(test)]` matters just as much: `--test-only`
+# compiles each arm a second time as a plain lib, where a stub for a
+# test-only type names a type that does not exist.
+#
+# The whole leading attribute-and-doc block is therefore captured, not just the
+# line directly above the `derive`. A doc comment between the two — which is how
+# `runtime/host.rs` writes `RealRange`, `FakeHost`, `GuestWriteSet` and
+# `Rewire` — otherwise hides the `#[cfg(test)]` from the guard below.
+ATTR_OR_DOC = r'(?:^(?:#!?\[[^\n]*\]|///[^\n]*|//![^\n]*)\n)*'
 pat = re.compile(
-    r'((?:^#\[cfg[^\n]*\]\n)?^#\[derive\(([^)]*)\)\]\n(?:^#\[[^\n]*\]\n)*'
+    r'(' + ATTR_OR_DOC + r'^#\[derive\(([^)]*)\)\]\n' + ATTR_OR_DOC +
     r'^(?:pub(?:\(crate\))?\s+)?struct\s+(\w+)\s*(?=[{(;]))',
     re.M,
 )
