@@ -309,6 +309,14 @@ mod arch_path_gate {
             "compute_exec/tests.rs",
             "drain/tests.rs",
             "icb/tests.rs",
+            // `mapping_write` was a single `.rs` until its tests moved out; it
+            // became a directory precisely so this predicate could see it,
+            // since the predicate reads `parent/mod.rs` and nothing else. A
+            // `foo.rs` beside a `foo/tests.rs` is valid Rust and invisible
+            // here — a real blind spot, and this entry is what would catch
+            // someone re-flattening the module and taking recognition away
+            // with it.
+            "mapping_write/tests.rs",
         ] {
             assert!(
                 is_out_of_line_test_module(&root.join(relative)),

@@ -220,7 +220,7 @@ fn no_two_checks_share_a_reason_slug() {
         ),
         (
             "surface_write_mapping_absent",
-            "runtime/mapping_write.rs, `impl crate::observe::decline::Decline`",
+            "runtime/mapping_write/mod.rs, `impl crate::observe::decline::Decline`",
         ),
     ] {
         assert!(
