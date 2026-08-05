@@ -185,8 +185,9 @@ pub enum WritebackLicence {
 /// last publish, never a latch on `host_valid`. See [`ResourceValidity`] for the
 /// measurement that forced that distinction.
 ///
-/// Pure — the counting is [`note_writeback_licence`]'s job, so a caller that
-/// only wants to attribute a write does not inflate the flush census.
+/// Pure — the counting is [`writeback_refused`]'s job, which is the caller that
+/// stamps `note_store_route`, so a caller that only wants to attribute a write
+/// does not inflate the flush census.
 fn writeback_licence(state: &DeviceState, mapping_id: u32) -> WritebackLicence {
     licence_of(
         state

@@ -788,7 +788,7 @@ pub fn flush_linear_windows_before_fence<M: HostMemory + HostOps>(
 /// bounding what a flush copies is now motivated by its byte cost rather than
 /// by this correctness hazard.
 ///
-/// [`render_flush_guest_written_ranges`] states why the obvious repair —
+/// [`note_render_flush_over_guest_write`] states why the obvious repair —
 /// preserve the pages the guest wrote — is not available: `page_gen[p]` is
 /// stamped at the *harvest* that saw page `p` dirty, not at the write, so the
 /// witness cannot say whether a store happened before or after the Store this
@@ -2640,7 +2640,7 @@ pub fn render_window_identity(
 /// hole that need not exist. The verdict is `guest_write_gen(token) !=
 /// guest_write_gen_at_store`, and that generation moves at the *harvest* that
 /// saw the page dirty, not at the write —
-/// [`render_flush_guest_written_ranges`] states the same rule for the same
+/// [`note_render_flush_over_guest_write`] states the same rule for the same
 /// reason. `reims_vgpu_dirty_gen` returns the value as of the last harvest and
 /// only marks a read as owed; `reims_vgpu_dirty_harvest` then returns early
 /// unless a read is owed, and runs at the drain tail. So a guest store made

@@ -4009,16 +4009,12 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
     out
 }
 
-/// Translate guest MTLB stages via metal2vulkan and raster with the internal Vulkan engine.
+/// Translate one decoded vertex attribute's Metal format to the engine's.
 ///
-/// Builds engine [`DrawRequest`] resources from stream binds (stage-in attrs, SSBOs,
-/// sampled images) — bare `render_offscreen` without binds yields black alpha-only
-/// frames that wipe CLEAR stores. Archive `render_draw_core` is the contract model.
-///
-/// Type-11 Stores return [`M2vDrawSpan::ResidentBgra`] for zero-copy import
-/// (revalidate + strided host ptr) on backends that can keep guest-visible
-/// content resident. Portability-subset devices take the synchronous CPU
-/// writeback path so guest pages remain authoritative across device recreates.
+/// The decline names the attribute that could not be translated — location and
+/// buffer index, plus the raw ordinal — because a draw refused for an
+/// untranslatable format is otherwise indistinguishable from one refused for the
+/// attribute next to it.
 pub(super) fn prepare_vertex_attribute_format(
     attribute: &crate::runtime::decode::resource::VertexAttribute,
 ) -> Result<crate::backend::vulkan::engine::VertexAttributeFormat, DrawPreparationDecline> {
@@ -6017,9 +6013,10 @@ fn ranges_touch_window(ranges: &[(u64, u64)], base_off: u64, span_end: u64) -> b
 /// why the GVA cache's identical defect had to be found through a probe-gated
 /// byte compare instead of read off a boot.
 ///
-/// `t11rung_resident_refused` counts binds where a ready resident existed and
-/// [`guest_replaced_host_copies`] sent the bind to the guest's pages instead.
-/// It is the direct measure of how much wrong content that rung used to serve.
+/// `t11rung_resident_refused` counts binds where a ready resident existed and a
+/// guest write to its pages sent the bind to the guest's pages instead — the
+/// `guest_replaced` gate in [`resolve_sampled_source`]. It is the direct measure
+/// of how much wrong content that rung used to serve.
 ///
 /// # Baseline, before the resident rung was gated
 ///

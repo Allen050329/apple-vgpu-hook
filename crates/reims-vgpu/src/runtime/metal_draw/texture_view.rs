@@ -210,8 +210,10 @@ fn note_view_slice_range_dropped(
 
 /// Decode one type-8 hop (does not walk nested bases).
 ///
-/// The `Result` carries a specific failure slug for the always-on fail log; the
-/// [`decode_texture_view_hop`] wrapper collapses it to `Option` for the hot path.
+/// The `Result` carries a specific failure slug for the always-on fail log. No
+/// wrapper collapses it at this level: the slug travels up through
+/// [`resolve_texture_view_reasoned`]'s `?`, and [`resolve_texture_view`] is what
+/// turns the whole walk into an `Option` for the hot path.
 fn decode_texture_view_hop_reasoned<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &M,

@@ -225,8 +225,9 @@ pub(crate) struct ResourcePools {
     /// this alone would make a session-long resident the permanent front and the
     /// first victim of every burst. Recency lives on the slot
     /// ([`ResidentTargetSlot::last_touch_ms`]) and the sweep consults it through
-    /// [`ResourcePools::resident_recently_used`] rather than reordering here,
-    /// which keeps a promotion off the per-bind path.
+    /// `ResourcePools::cap_eviction_victim`, which takes the minimum stamp over
+    /// this list rather than reordering it — so a promotion stays off the
+    /// per-bind path while this order still makes ties deterministic.
     registry_order: VecDeque<TargetIdentity>,
     /// Recently reclaimed identities and which path took each, so a draw that
     /// samples a missing resident can say whether this device ever held one.
