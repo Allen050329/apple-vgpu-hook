@@ -1458,9 +1458,13 @@ fn handle_render_record<M: HostMemory + HostOps>(
             note_extra_state_entries("viewport", cmd.count);
             acc.viewport = Some(cmd.viewport);
         }
-        RenderKind::SetScissor if cmd.scissor_w > 0 && cmd.scissor_h > 0 => {
+        RenderKind::SetScissor => {
             note_extra_state_entries("scissor", cmd.count);
-            acc.scissor = Some((cmd.scissor_x, cmd.scissor_y, cmd.scissor_w, cmd.scissor_h));
+            if cmd.scissor_w > 0 && cmd.scissor_h > 0 {
+                acc.scissor = Some((cmd.scissor_x, cmd.scissor_y, cmd.scissor_w, cmd.scissor_h));
+            } else {
+                note_empty_scissor(task_id, cmd.scissor_w, cmd.scissor_h);
+            }
         }
         RenderKind::SetBlendColor if cmd.has_blend_color => {
             acc.blend_color = Some(cmd.blend_color);
@@ -1688,7 +1692,11 @@ fn handle_render_record<M: HostMemory + HostOps>(
                 });
             }
         }
-        RenderKind::ExecuteCommands if cmd.indirect_command_buffer_ref != 0 => {
+        RenderKind::ExecuteCommands => {
+            if cmd.indirect_command_buffer_ref == 0 {
+                note_unnamed_icb_execute(task_id, &cmd);
+                return;
+            }
             acc.execute_icb = Some(RenderIcbExecute {
                 icb_ref: cmd.indirect_command_buffer_ref,
                 is_range: cmd.icb_is_range,
@@ -2076,6 +2084,64 @@ fn note_extra_state_entries(what: &'static str, count: u32) {
         },
         extra as u64,
     );
+}
+
+/// A `setScissorRect:` naming a rect with no area.
+///
+/// The five `has_*` guards beside this one in the render dispatch are the
+/// decoder saying a record did not carry a field, so falling through them costs
+/// nothing. This guard was not that: it tested a *decoded* value, and a record
+/// that failed it reached the match's `_ => {}` and left `acc.scissor` holding
+/// the **previous** rect. So every draw after it clipped to a region the guest
+/// had just replaced, which is wrong pixels rather than missing ones — the
+/// class that nothing downstream can detect.
+///
+/// Behaviour is unchanged: an empty rect still does not become the scissor,
+/// because this rail has no way to express "clip everything" and adopting a
+/// zero rect would make the *next* draw's clip depend on how the backend
+/// handles a degenerate one. What changes is that the substitution is now
+/// visible. Deduped on the pair, because a guest emitting one emits it for a
+/// reason that does not vary per record.
+fn note_empty_scissor(task_id: u32, w: u32, h: u32) {
+    crate::runtime::drain::note_store_route("render_scissor_empty_kept_previous");
+    if crate::observe::first_sight("render_scissor_empty", (u64::from(w) << 32) | u64::from(h)) {
+        crate::observe::fail(format!(
+            "render_scissor_empty reason=render_scissor_empty_kept_previous \
+             task={task_id} w={w} h={h} \
+             (the guest replaced its scissor with an empty rect; this rail kept \
+             the previous one, so later draws clip to a region the guest \
+             retired)"
+        ));
+    }
+}
+
+/// An `executeCommandsInBuffer:` naming no buffer.
+///
+/// Unlike a `setTexture:atIndex:` with `ref == 0` — an unbind, which is a
+/// meaning — an ICB execute has no argument to unbind. A zero ref is either a
+/// record this device decoded short or a stream that named a buffer it never
+/// defined, and either way the entire batch of commands that ICB holds is not
+/// executed. That is the largest single loss any one render record can carry,
+/// and it used to fall through the arm's guard into `_ => {}`.
+///
+/// The other fields are on the line because they are what says which of the two
+/// it is: a record whose range and args buffer are also zero was probably never
+/// populated, and one carrying a plausible range with a zero ICB names a
+/// resource the stream lost.
+fn note_unnamed_icb_execute(task_id: u32, cmd: &crate::runtime::decode::render::Command) {
+    crate::runtime::drain::note_store_route("render_icb_execute_unnamed");
+    if crate::observe::first_sight("render_icb_execute_unnamed", u64::from(task_id)) {
+        crate::observe::fail(format!(
+            "render_icb_execute reason=render_icb_execute_unnamed task={task_id} \
+             is_range={} range_loc={} range_len={} args={} args_off={:#x} \
+             (executeCommandsInBuffer named no buffer; the whole batch is lost)",
+            cmd.icb_is_range as u8,
+            cmd.icb_range_location,
+            cmd.icb_range_length,
+            cmd.icb_args_buffer_ref,
+            cmd.icb_args_buffer_offset
+        ));
+    }
 }
 
 /// Which of the three argument tables a bind record names.
@@ -5666,6 +5732,79 @@ mod tests {
             3,
             "and three slots in the drop counter — records here, slots there"
         );
+    }
+
+    /// Two guarded arms used to drop a decoded record into the `_ => {}`
+    /// catch-all, and both now name what they did instead.
+    ///
+    /// The five `has_*` guards beside them are the decoder saying a field was
+    /// absent, so falling through those costs nothing. These two tested decoded
+    /// *values*, which is a different thing: an empty scissor leaves the
+    /// previous rect clipping later draws, and an ICB execute naming no buffer
+    /// loses the whole batch that buffer holds.
+    #[test]
+    fn a_decoded_record_that_no_arm_applies_names_what_happened_instead() {
+        use crate::runtime::drain::store_route_count;
+
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let host = FakeHost::new();
+        let mut out = ExecResult::default();
+        let mut acc = StreamAccum::default();
+
+        // `MTLScissorRect` is four NSUInteger. Set a real rect, then replace it
+        // with an empty one and check the real one is what survives.
+        let scissor = |w: u64, h: u64| {
+            let total = wire_render::SET_SCISSOR_TOTAL_LEN as usize;
+            let mut command = vec![0u8; total];
+            let op = wire_render::OPCODE_SET_SCISSOR;
+            st32(&mut command[0..], op);
+            st32(&mut command[4..], total as u32);
+            let p = reims_vgpu_wire::OP_HEADER_LEN;
+            st64(&mut command[p..], 7);
+            st64(&mut command[p + 8..], 9);
+            st64(&mut command[p + 16..], w);
+            st64(&mut command[p + 24..], h);
+            (op, command)
+        };
+        let (op, command) = scissor(64, 32);
+        handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
+        assert_eq!(acc.scissor, Some((7, 9, 64, 32)));
+
+        let before = store_route_count("render_scissor_empty_kept_previous");
+        let (op, command) = scissor(0, 32);
+        handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
+        assert_eq!(
+            store_route_count("render_scissor_empty_kept_previous") - before,
+            1,
+            "an empty scissor must name itself"
+        );
+        assert_eq!(
+            acc.scissor,
+            Some((7, 9, 64, 32)),
+            "and behaviour is unchanged: the previous rect is still what is kept"
+        );
+
+        // `executeCommandsInBuffer:` naming no buffer.
+        let before = store_route_count("render_icb_execute_unnamed");
+        let total = wire_render::EXECUTE_COMMANDS_INDIRECT_TOTAL_LEN as usize;
+        let mut command = vec![0u8; total];
+        let op = wire_render::OPCODE_EXECUTE_COMMANDS_INDIRECT;
+        st32(&mut command[0..], op);
+        st32(&mut command[4..], total as u32);
+        handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
+        assert_eq!(
+            store_route_count("render_icb_execute_unnamed") - before,
+            1,
+            "an ICB execute naming no buffer loses the whole batch and must say so"
+        );
+        assert!(
+            acc.execute_icb.is_none(),
+            "and still does not queue an execute against ref 0"
+        );
+
+        let log = std::fs::read_to_string(crate::observe::fail_log_path()).expect("fail log");
+        assert!(log.contains("reason=render_scissor_empty_kept_previous"));
+        assert!(log.contains("reason=render_icb_execute_unnamed"));
     }
 
     /// A buffer-offset record that lands on nothing says so, both ways.
