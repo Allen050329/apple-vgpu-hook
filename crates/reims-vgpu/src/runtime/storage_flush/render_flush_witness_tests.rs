@@ -34,9 +34,29 @@ fn the_first_landing_of_a_mapping_scores_nothing() {
 #[test]
 fn a_landing_stamps_the_time_it_landed() {
     let mut state = state_with_mapping(7);
+
+    // `Default`'s zero is indistinguishable from a live reading while the
+    // process clock itself still reads zero, which it does for the first
+    // microsecond of the run. Wait for it to leave zero rather than assume it
+    // has: this test asserted `first > 0` and passed only because the suite
+    // always ran thousands of tests ahead of it, so it failed the first time it
+    // ran alone — on correct code.
+    while crate::observe::elapsed_us() == 0 {
+        std::thread::sleep(std::time::Duration::from_micros(50));
+    }
+
+    // Bracketing the call is strictly stronger than `> 0`. It also rejects a
+    // stamp taken from a different clock, or a constant that happens to be
+    // nonzero, neither of which `> 0` can see.
+    let before = crate::observe::elapsed_us();
     note_render_flush_landed(&mut state, 7, true);
+    let after = crate::observe::elapsed_us();
     let first = state.mappings[&7].render_flush.landed_us;
-    assert!(first > 0, "landing must stamp a live clock reading");
+    assert!(
+        (before..=after).contains(&first),
+        "the stamp must be the clock read during the landing, not `Default`'s \
+         zero: {before} <= {first} <= {after}"
+    );
     note_render_flush_landed(&mut state, 7, true);
     assert!(
         state.mappings[&7].render_flush.landed_us >= first,

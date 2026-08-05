@@ -467,8 +467,20 @@ mod tests {
         );
         // The remainder belongs to the phase that was open. `Acquire` closed
         // when the sampled loop opened, so it must not have absorbed it.
-        assert_eq!(
-            w.acquire_us, 0,
+        //
+        // A ceiling, not zero. `Acquire` was genuinely open across one `enter`
+        // call, so its slot legitimately carries however long that took — under
+        // a microsecond in a warm process, but 8 µs the first time this test ran
+        // as the only test in a cold one. `== 0` was therefore an assertion a
+        // correct implementation could fail, and it passed only because the rest
+        // of the suite warmed the process first. The bound is half the sleep, so
+        // it is derived from the one constant here and cannot be satisfied by a
+        // slot that absorbed it: an `Acquire` that swallowed the sampled loop
+        // reads the full `SAMPLED_SLEEP`, and one that merely timed an `enter`
+        // cannot approach half of it.
+        let absorbed_the_sleep = (SAMPLED_SLEEP.as_micros() / 2) as u64;
+        assert!(
+            w.acquire_us < absorbed_the_sleep,
             "target acquisition charged time the sampled loop spent: {w:?}"
         );
         // Nor may the readback buffer, which is the slot the sampled loop's own
