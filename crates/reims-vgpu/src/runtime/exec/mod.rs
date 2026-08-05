@@ -2144,17 +2144,41 @@ fn apply_binds<T: Copy, B: Clone>(
         let index = first.saturating_add(i as u32);
         if index >= MAX_BIND_SLOTS {
             // The walk stops here, and it used to stop in silence — a `break`
-            // that dropped every remaining slot with nothing to say so. The
-            // guest really does bind past this: `setVertexTextures:withRange:`
-            // over a range of 40 is a record Apple's serializer produces, and
+            // that dropped every remaining slot with nothing to say so.
+            //
             // `MAX_BIND_SLOTS` is 31 because it is Metal's *buffer* index cap,
-            // where the texture limit is 128. So this fires on real traffic and
-            // the binds it drops are real.
+            // and it is applied to all three tables, where Apple's texture limit
+            // is 128 and its sampler limit 16. So the bound is the wrong one for
+            // two of the three classes by construction, and
+            // `setVertexTextures:withRange:` over a range of 40 is a record
+            // Apple's serializer can produce.
+            //
+            // **This has not been observed to fire.** Driven x86/PCI boot,
+            // window-drag probe against Safari, `reach_route` census over 18 044
+            // bind records:
+            //
+            //     texture  le16=5519  le_table=0  over_table=0
+            //     buffer   le16=9275  le_table=0  over_table=0
+            //     sampler  le16=3250  le_table=0  over_table=0
+            //
+            // and all three `*_bind_slot_past_table` counters absent. Every
+            // record this guest issued ended at slot 16 or below — not merely
+            // inside the bound, but inside the *smallest* of Apple's three
+            // tables, with 15 slots of headroom nothing touched. Read the reach
+            // bands and not just the drop counters: a zero drop count alone
+            // cannot tell a record stopping at slot 4 from one stopping at 30,
+            // which is why the bands are here.
+            //
+            // So "the serializer can emit a range of 40" is a statement about
+            // Apple's encoder, not a reading of this workload, and it is not on
+            // its own an argument for widening. One workload on one pathway
+            // proves one workload on one pathway; a heavier guest may differ.
             //
             // Raising the cap means widening the backends' tables, which is a
-            // change with its own measurement; naming the loss is not. The
-            // counter says how much is at stake, and a non-zero reading is the
-            // argument for doing the widening — for the table [`BindClass`]
+            // change with its own measurement; naming the loss is not. A
+            // non-zero reading from the counter below — or from `le_table`,
+            // which fires one band earlier and is the leading indicator — is the
+            // argument for doing the widening, for the table [`BindClass`]
             // names, which is why there are three slugs rather than one.
             crate::runtime::drain::note_store_route_n(
                 class.past_table_route(),
