@@ -2313,10 +2313,10 @@ fn a_fragmented_writeback_stages_nothing_when_the_staged_frame_is_the_source() {
     // is invisible against a frame of identical bytes.
     let frame: Vec<u8> = (0..need).map(|i| (i % 251) as u8).collect();
     // Drain whatever earlier tests in this binary left in the shared census.
-    let _ = super::SURFACE_WRITE.take(0);
+    let _ = super::census::SURFACE_WRITE.take(0);
     assert!(write_bgra8(&mut state, &mut host, 9, &frame, stride, w, h));
 
-    let line = super::SURFACE_WRITE
+    let line = super::census::SURFACE_WRITE
         .take(1_000)
         .expect("a writeback must report");
     assert!(
@@ -2674,7 +2674,8 @@ fn the_vcpu_lock_census_reports_the_blocked_side_and_separates_free_acquisitions
 /// measures.
 #[test]
 fn the_doorbell_census_separates_a_deferred_apply_from_a_direct_one() {
-    use crate::runtime::drain::{DoorbellCensus, UNCONTENDED_POLL};
+    use crate::runtime::drain::census::UNCONTENDED_POLL;
+    use crate::runtime::drain::DoorbellCensus;
     let c = DoorbellCensus::default();
     assert!(
         c.note_queued(0x100c, 1, 5_000).is_none(),
@@ -2742,7 +2743,8 @@ fn the_doorbell_census_separates_a_deferred_apply_from_a_direct_one() {
 /// `uncontended`) is something the log can actually say.
 #[test]
 fn the_vcpu_lock_census_reports_a_window_that_never_blocked() {
-    use crate::runtime::drain::{VcpuLockCensus, UNCONTENDED_POLL};
+    use crate::runtime::drain::census::UNCONTENDED_POLL;
+    use crate::runtime::drain::VcpuLockCensus;
     let c = VcpuLockCensus::default();
     let mut line = None;
     // The clock is only read at a poll, so the window spans exactly one poll
