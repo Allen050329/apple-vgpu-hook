@@ -89,6 +89,31 @@ pub const EFI_DISPLAY_PORT_COUNT: u32 = 1;
 pub const EFI_BUILTIN_CONNECTED: u32 = 1;
 
 pub const MAX_CHANNELS: usize = 32;
+
+/// `active_child_mask`, `pending.child_mask` and `child_doorbell_rung` are each
+/// a `u32` carrying one bit per channel, and every producer reaches them with a
+/// bare `1u32 << channel_id`. That is only defined because a channel id is
+/// bounded by 32 — a `MAX_CHANNELS` above `u32::BITS` would make every one of
+/// those shifts overflow, which Rust panics on in debug and wraps in release.
+/// The masks would have to widen with the constant, so this refuses the change
+/// at the constant rather than at the four shift sites.
+const _: () = assert!(MAX_CHANNELS <= u32::BITS as usize);
+
+/// Whether `channel_id` names a child channel this device has.
+///
+/// Channel 0 is the root/main FIFO, not a child, so it is refused here for the
+/// same reason an id past the end is: neither indexes `child_rings` and neither
+/// has a mask bit.
+///
+/// The rule had seven copies in four files and two mutually inverted spellings
+/// — `channel_id == 0 || channel_id as usize >= MAX_CHANNELS` in three places
+/// and `ch >= 1 && (ch as usize) < MAX_CHANNELS` in four. An inverted copy is
+/// the worst kind: reading the two side by side proves nothing about the two
+/// you did not put side by side.
+pub const fn is_child_channel(channel_id: u32) -> bool {
+    channel_id >= 1 && (channel_id as usize) < MAX_CHANNELS
+}
+
 pub const MAX_TASKS: usize = 256;
 pub const MAX_MAPPINGS: usize = 4096;
 
@@ -559,7 +584,7 @@ pub const DEVICE_INFO_CAPS: &[(u32, u32)] = &[
 
 #[inline]
 pub fn child_reg_block_offset(channel_id: u32) -> Option<u64> {
-    if channel_id == 0 || channel_id as usize >= MAX_CHANNELS {
+    if !is_child_channel(channel_id) {
         return None;
     }
     Some(CHILD_REG_BLOCK_OFFSET + (channel_id as u64 - 1) * CHILD_REG_BLOCK_STRIDE)
@@ -824,6 +849,27 @@ mod tests {
         assert!(scanout_extent_ok(1920, 1080));
     }
 
+    /// Channel 0 and channel `MAX_CHANNELS` are both refused, and the last real
+    /// channel is not.
+    ///
+    /// The off-by-one at the top matters more than it looks: the id is used
+    /// directly as both a `child_rings` index and a `1u32 <<` shift distance, so
+    /// admitting `MAX_CHANNELS` would index one past a fixed-size array and
+    /// shift a `u32` by 32.
+    #[test]
+    fn the_channel_id_bound_refuses_the_root_and_the_end() {
+        assert!(
+            !is_child_channel(0),
+            "channel 0 is the root FIFO, not a child"
+        );
+        assert!(is_child_channel(1));
+        assert!(is_child_channel(MAX_CHANNELS as u32 - 1));
+        assert!(!is_child_channel(MAX_CHANNELS as u32));
+        assert!(!is_child_channel(u32::MAX));
+        assert_eq!(child_reg_block_offset(0), None);
+        assert_eq!(child_reg_block_offset(MAX_CHANNELS as u32), None);
+    }
+
     /// No file outside this one compares an edge against `MAX_SCANOUT_DIM`.
     ///
     /// The consolidation this guards was worth doing because the rule had eight
@@ -832,32 +878,48 @@ mod tests {
     /// the shape every one of those copies had, so the source is the only place
     /// that can see it — the compiler is perfectly happy with nine.
     ///
-    /// `set_mapping_geom` is not exempted: it reads
-    /// [`scanout_extent_fault`] and matches on the answer, so it names the
-    /// bound nowhere. Doc comments and the header-drift test above may still
-    /// mention the constant; only `<`/`>`/`<=`/`>=` against it are refused.
+    /// `set_mapping_geom` is not exempted: it reads [`scanout_extent_fault`] and
+    /// matches on the answer, so it names the bound nowhere.
     #[test]
     fn the_scanout_extent_bound_is_compared_in_exactly_one_place() {
+        assert_compared_only_in_regs("MAX_SCANOUT_DIM", "regs::scanout_extent_fault");
+    }
+
+    /// No file outside this one compares a channel id against `MAX_CHANNELS`.
+    ///
+    /// Same guard, harder case: this rule's seven copies were written in two
+    /// mutually inverted forms, so the drift a reader would have had to catch
+    /// was between `!(a || b)` in one file and `c && d` in another. Whichever
+    /// form the eighth copy takes, it has to compare the constant.
+    #[test]
+    fn the_channel_id_bound_is_compared_in_exactly_one_place() {
+        assert_compared_only_in_regs("MAX_CHANNELS", "regs::is_child_channel");
+    }
+
+    /// Fail naming every line outside `regs.rs` that relates `constant` to
+    /// anything with `<`, `>`, `<=` or `>=`.
+    ///
+    /// Comment text is stripped before the scan, so a doc comment may still name
+    /// the constant; a `for ch in 1..MAX_CHANNELS` range and an array length
+    /// `[T; MAX_CHANNELS]` are not comparisons and are not refused.
+    fn assert_compared_only_in_regs(constant: &str, owner: &str) {
         let mut offenders = Vec::new();
         for entry in walk_crate_sources() {
-            let source = std::fs::read_to_string(&entry).expect("crate source must be readable");
             if entry.ends_with("regs.rs") {
                 continue;
             }
+            let source = std::fs::read_to_string(&entry).expect("crate source must be readable");
             for (n, line) in source.lines().enumerate() {
                 let code = line.split("//").next().unwrap_or("");
-                if !code.contains("MAX_SCANOUT_DIM") {
-                    continue;
-                }
-                if code.contains('>') || code.contains('<') {
+                if code.contains(constant) && (code.contains('>') || code.contains('<')) {
                     offenders.push(format!("{}:{}: {}", entry.display(), n + 1, line.trim()));
                 }
             }
         }
         assert!(
             offenders.is_empty(),
-            "the scanout extent bound must be compared only by \
-             regs::scanout_extent_fault; these compare it themselves:\n{}",
+            "{constant} must be compared only by {owner}; \
+             these compare it themselves:\n{}",
             offenders.join("\n")
         );
     }

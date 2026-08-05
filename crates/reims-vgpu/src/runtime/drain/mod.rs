@@ -912,7 +912,7 @@ fn process_root_packet<H: HostMemory + HostOps>(
         ROOT_OP_DEFINE_FIFO => {
             if !packet_short("define_fifo", None, packet.payload.len(), 4) {
                 let ch = ld32(&packet.payload[0..]);
-                if ch >= 1 && (ch as usize) < MAX_CHANNELS {
+                if is_child_channel(ch) {
                     let bit = 1u32 << ch;
                     state.active_child_mask |= bit;
                     state.translation_deferred_mask &= !bit;
@@ -926,7 +926,7 @@ fn process_root_packet<H: HostMemory + HostOps>(
         ROOT_OP_FREE_FIFO => {
             if !packet_short("free_fifo", None, packet.payload.len(), 4) {
                 let ch = ld32(&packet.payload[0..]);
-                if ch >= 1 && (ch as usize) < MAX_CHANNELS {
+                if is_child_channel(ch) {
                     let bit = 1u32 << ch;
                     state.active_child_mask &= !bit;
                     state.pending.child_mask &= !bit;
@@ -1128,7 +1128,7 @@ fn ensure_child_ring<M: HostMemory>(
     channel_id: u32,
     base_pfn: u32,
 ) -> u32 {
-    if channel_id == 0 || channel_id as usize >= MAX_CHANNELS || base_pfn == 0 {
+    if !is_child_channel(channel_id) || base_pfn == 0 {
         return 0;
     }
     let page_shift = state.page_shift;
@@ -2594,9 +2594,12 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
     host: &mut H,
     channel_id: u32,
 ) {
-    if state.gfx.root_page == 0 || channel_id == 0 || channel_id as usize >= MAX_CHANNELS {
+    if state.gfx.root_page == 0 {
         return;
     }
+    // `child_reg_block_offset` is the channel-id bound: it is `None` for exactly
+    // the ids `is_child_channel` refuses, so re-testing them here would be the
+    // same rule twice one line apart.
     let Some(regs_off) = child_reg_block_offset(channel_id) else {
         return;
     };

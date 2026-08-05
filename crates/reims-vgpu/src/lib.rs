@@ -970,7 +970,7 @@ pub fn device_gfx_write(id: u64, offset: u64, data: u64, size: u32) -> bool {
         if offset == model::GFX_REG_CHILD_DOORBELL || offset == model::GFX_REG_CHILD_REPLAY_DOORBELL
         {
             let channel = data as u32;
-            if channel >= 1 && (channel as usize) < model::MAX_CHANNELS {
+            if model::is_child_channel(channel) {
                 slot.child_doorbell_rung
                     .fetch_or(1u32 << channel, Ordering::AcqRel);
                 runtime::drain::note_doorbell_lock_free();
