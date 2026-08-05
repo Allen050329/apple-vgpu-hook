@@ -656,7 +656,7 @@ pub(crate) fn load_mtlb<M: HostMemory + HostOps>(
                 crate::observe::ladder_slugs!("")(rung),
                 match rung {
                     objects::LadderRung::WrongType { got } => format!("ot={got}"),
-                    objects::LadderRung::NoListEntry | objects::LadderRung::DescRead => {
+                    objects::LadderRung::NoListEntry | objects::LadderRung::DescRead { .. } => {
                         String::new()
                     }
                 },
@@ -736,7 +736,7 @@ pub(crate) fn load_compute_pipeline<M: HostMemory + HostOps>(
                     crate::observe::ladder_slugs!("")(rung),
                     match rung {
                         objects::LadderRung::WrongType { got } => format!("ot={got}"),
-                        objects::LadderRung::NoListEntry | objects::LadderRung::DescRead => {
+                        objects::LadderRung::NoListEntry | objects::LadderRung::DescRead { .. } => {
                             String::new()
                         }
                     },
@@ -873,7 +873,7 @@ pub(crate) fn stage_buffer<M: HostMemory + HostOps>(
                 )),
                 match rung {
                     objects::LadderRung::WrongType { got } => format!("ot={got}"),
-                    objects::LadderRung::NoListEntry | objects::LadderRung::DescRead => {
+                    objects::LadderRung::NoListEntry | objects::LadderRung::DescRead { .. } => {
                         String::new()
                     }
                 },
@@ -2069,7 +2069,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
                 )),
                 match rung {
                     objects::LadderRung::WrongType { got } => format!("ot={got}"),
-                    objects::LadderRung::NoListEntry | objects::LadderRung::DescRead => {
+                    objects::LadderRung::NoListEntry | objects::LadderRung::DescRead { .. } => {
                         String::new()
                     }
                 },

@@ -1132,7 +1132,7 @@ pub fn load_icb_descriptor<M: HostMemory + HostOps>(
             |rung| {
                 let slug = crate::observe::ladder_slugs!("icb")(rung);
                 match rung {
-                    objects::LadderRung::NoListEntry | objects::LadderRung::DescRead => {
+                    objects::LadderRung::NoListEntry | objects::LadderRung::DescRead { .. } => {
                         IcbStatus::Missing(slug)
                     }
                     objects::LadderRung::WrongType { .. } => IcbStatus::BadDescriptor(slug),
@@ -1580,7 +1580,7 @@ fn type1_buffer_gva_size<M: HostMemory + HostOps>(
             .map_err(|rung| {
                 let slug = crate::observe::ladder_slugs!("icb_type1")(rung);
                 match rung {
-                    objects::LadderRung::NoListEntry | objects::LadderRung::DescRead => {
+                    objects::LadderRung::NoListEntry | objects::LadderRung::DescRead { .. } => {
                         IcbStatus::Missing(slug)
                     }
                     objects::LadderRung::WrongType { .. } => IcbStatus::BadDescriptor(slug),
@@ -2028,7 +2028,7 @@ pub fn fill_render_command<M: HostMemory + HostOps>(
         .map_err(|rung| {
             let slug = crate::observe::ladder_slugs!("icb_frc_pipeline")(rung);
             match rung {
-                objects::LadderRung::NoListEntry | objects::LadderRung::DescRead => {
+                objects::LadderRung::NoListEntry | objects::LadderRung::DescRead { .. } => {
                     IcbStatus::Missing(slug)
                 }
                 objects::LadderRung::WrongType { .. } => IcbStatus::BadDescriptor(slug),
@@ -2051,7 +2051,7 @@ pub fn fill_render_command<M: HostMemory + HostOps>(
             .map_err(|rung| {
                 let slug = crate::observe::ladder_slugs!("icb_frc_function")(rung);
                 match rung {
-                    objects::LadderRung::NoListEntry | objects::LadderRung::DescRead => {
+                    objects::LadderRung::NoListEntry | objects::LadderRung::DescRead { .. } => {
                         IcbStatus::Missing(slug)
                     }
                     objects::LadderRung::WrongType { .. } => IcbStatus::BadDescriptor(slug),

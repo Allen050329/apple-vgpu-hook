@@ -1421,8 +1421,10 @@ fn the_shared_ladder_names_the_rung_that_refused() {
     );
     entry[4..12].copy_from_slice(&0xdead_0000u64.to_le_bytes());
     let _ = host.write_gpa(data_gpa + 24, &entry);
+    // The declared length travels with the rung: the entry above says 0x20
+    // bytes, and by the time a rail reports this the entry is gone.
     assert_eq!(
         resolve_descriptor(&state, &host, 1, 2, &[OBJECT_TYPE_IOSURFACE]),
-        Err(LadderRung::DescRead)
+        Err(LadderRung::DescRead { declared_len: 0x20 })
     );
 }

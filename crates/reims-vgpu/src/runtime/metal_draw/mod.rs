@@ -1102,7 +1102,7 @@ fn load_index_bytes_reason<M: HostMemory + HostOps>(
     .map_err(|rung| match rung {
         objects::LadderRung::NoListEntry => R::EntryMissing,
         objects::LadderRung::WrongType { .. } => R::ObjectType,
-        objects::LadderRung::DescRead => R::DescRead,
+        objects::LadderRung::DescRead { .. } => R::DescRead,
     })?;
     let desc = decode_buffer_descriptor(&desc_bytes).map_err(|_| R::DescDecode)?;
     let (gva, size) = desc
@@ -2378,23 +2378,25 @@ fn load_depth_stencil_state<M: HostMemory + HostOps>(
     ds_ref: u32,
 ) -> Result<crate::backend::metal::abi::ReimsVgpuDepthStencilState, MetalStateDecline> {
     use crate::backend::metal::abi::{ReimsVgpuDepthStencilFaceState, ReimsVgpuDepthStencilState};
-    let (_entry, desc) =
-        objects::resolve_descriptor(state, host, task_id, ds_ref, &[OBJECT_TYPE_TYPE7]).map_err(
-            |rung| match rung {
-                objects::LadderRung::NoListEntry => MetalStateDecline::DepthStencilEntryMissing {
-                    depth_stencil_ref: ds_ref,
-                },
-                objects::LadderRung::WrongType { got } => {
-                    MetalStateDecline::DepthStencilObjectType {
-                        depth_stencil_ref: ds_ref,
-                        object_type: got,
-                    }
-                }
-                objects::LadderRung::DescRead => MetalStateDecline::DepthStencilDescriptorMissing {
-                    depth_stencil_ref: ds_ref,
-                },
-            },
-        )?;
+    let (_entry, desc) = objects::resolve_descriptor(
+        state,
+        host,
+        task_id,
+        ds_ref,
+        &[OBJECT_TYPE_TYPE7],
+    )
+    .map_err(|rung| match rung {
+        objects::LadderRung::NoListEntry => MetalStateDecline::DepthStencilEntryMissing {
+            depth_stencil_ref: ds_ref,
+        },
+        objects::LadderRung::WrongType { got } => MetalStateDecline::DepthStencilObjectType {
+            depth_stencil_ref: ds_ref,
+            object_type: got,
+        },
+        objects::LadderRung::DescRead { .. } => MetalStateDecline::DepthStencilDescriptorMissing {
+            depth_stencil_ref: ds_ref,
+        },
+    })?;
     let d = decode_depth_stencil_descriptor(&desc).map_err(|reason| {
         MetalStateDecline::DepthStencilDecode {
             depth_stencil_ref: ds_ref,
@@ -2889,10 +2891,12 @@ fn load_sampler<M: HostMemory + HostOps>(
                     index: slot,
                     object_type: got,
                 },
-                objects::LadderRung::DescRead => MetalStateDecline::SamplerDescriptorMissing {
-                    sampler_ref,
-                    index: slot,
-                },
+                objects::LadderRung::DescRead { .. } => {
+                    MetalStateDecline::SamplerDescriptorMissing {
+                        sampler_ref,
+                        index: slot,
+                    }
+                }
             })?;
     let s =
         decode_sampler_descriptor(&desc).map_err(|reason| MetalStateDecline::SamplerDecode {
@@ -3093,10 +3097,12 @@ pub(crate) fn load_vulkan_sampler<M: HostMemory + HostOps>(
                         object_type: got,
                     }
                 }
-                objects::LadderRung::DescRead => DrawPreparationDecline::SamplerDescriptorMissing {
-                    sampler_ref,
-                    binding,
-                },
+                objects::LadderRung::DescRead { .. } => {
+                    DrawPreparationDecline::SamplerDescriptorMissing {
+                        sampler_ref,
+                        binding,
+                    }
+                }
             })?;
     let descriptor_len = desc.len();
     let tag = desc.get(..4).map(ld32);

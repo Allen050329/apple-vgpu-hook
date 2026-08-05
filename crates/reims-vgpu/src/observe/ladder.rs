@@ -118,7 +118,7 @@ macro_rules! ladder_slugs {
                 $crate::runtime::objects::LadderRung::WrongType { .. } => {
                     $crate::observe::ladder_slug!($role, wrong_type)
                 }
-                $crate::runtime::objects::LadderRung::DescRead => {
+                $crate::runtime::objects::LadderRung::DescRead { .. } => {
                     $crate::observe::ladder_slug!($role, desc_read)
                 }
             }

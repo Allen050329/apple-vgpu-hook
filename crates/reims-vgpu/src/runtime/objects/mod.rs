@@ -916,7 +916,12 @@ pub enum LadderRung {
     WrongType { got: u8 },
     /// The entry names descriptor bytes that could not be read — the ref is
     /// live, and its descriptor GVA is not mapped right now.
-    DescRead,
+    ///
+    /// Carries the length the entry declared, for the same reason
+    /// [`Self::WrongType`] carries the tag: it is the datum that explains this
+    /// rung — "the entry said this many bytes at that GVA and they could not be
+    /// read" — and the entry it came from is gone by the time a caller reports.
+    DescRead { declared_len: u32 },
 }
 
 /// Look `obj_ref` up in `task_id`'s list, require its type to be one of `want`,
@@ -948,7 +953,9 @@ pub fn resolve_descriptor<M: HostMemory>(
             got: entry.object_type,
         });
     }
-    let bytes = read_descriptor(state, host, task_id, &entry).ok_or(LadderRung::DescRead)?;
+    let bytes = read_descriptor(state, host, task_id, &entry).ok_or(LadderRung::DescRead {
+        declared_len: entry.descriptor_length,
+    })?;
     Ok((entry, bytes))
 }
 

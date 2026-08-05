@@ -229,20 +229,26 @@ fn decode_texture_view_hop_reasoned<M: HostMemory + HostOps>(
     use crate::runtime::decode::resource::{
         decode_texture_view_descriptor, texture_type8_header, OBJECT_TYPE_TEXTURE_VIEW,
     };
-    let entry = objects::lookup_list_entry(state, host, task_id, texture_ref)
-        .ok_or(TextureViewDecline::HopEntryMissing { texture_ref })?;
-    if entry.object_type != OBJECT_TYPE_TEXTURE_VIEW {
-        return Err(TextureViewDecline::HopObjectNotView {
+    let (_entry, desc) = objects::resolve_descriptor(
+        state,
+        host,
+        task_id,
+        texture_ref,
+        &[OBJECT_TYPE_TEXTURE_VIEW],
+    )
+    .map_err(|rung| match rung {
+        objects::LadderRung::NoListEntry => TextureViewDecline::HopEntryMissing { texture_ref },
+        objects::LadderRung::WrongType { got } => TextureViewDecline::HopObjectNotView {
             texture_ref,
-            object_type: entry.object_type,
-        });
-    }
-    let desc = objects::read_descriptor(state, host, task_id, &entry).ok_or(
-        TextureViewDecline::HopDescriptorMissing {
-            texture_ref,
-            descriptor_length: entry.descriptor_length,
+            object_type: got,
         },
-    )?;
+        objects::LadderRung::DescRead { declared_len } => {
+            TextureViewDecline::HopDescriptorMissing {
+                texture_ref,
+                descriptor_length: declared_len,
+            }
+        }
+    })?;
     // Bytes visible before decode, for the len-mismatch / bad-opcode census.
     let (opcode, declared) = texture_type8_header(&desc).unwrap_or((0, 0));
     let view = decode_texture_view_descriptor(&desc).map_err(|reason| {
@@ -582,7 +588,7 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
     .map_err(|rung| match rung {
         objects::LadderRung::NoListEntry => R::ObjectListMiss,
         objects::LadderRung::WrongType { got } => R::NotATexture { object_type: got },
-        objects::LadderRung::DescRead => R::DescriptorUnreadable,
+        objects::LadderRung::DescRead { .. } => R::DescriptorUnreadable,
     })?;
     let tex = decode_texture_descriptor(&desc_bytes).map_err(|_| R::DescriptorUndecodable)?;
     if tex.declared_pixel_format().is_none() {
