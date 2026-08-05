@@ -44,6 +44,18 @@
 //! backing" are different findings and collapsing them would lose the one that
 //! matters. `blit_exec`'s `buf_no_backing` is the example: it follows a
 //! successful decode and is deliberately not a rung.
+//!
+//! # A healthy boot fires no rung at all
+//!
+//! Measured, so the next reader does not have to guess whether these paths are
+//! exercised: a driven x86/Vulkan boot (Safari window drag, 2 752 posted events,
+//! real motion, ~35 Hz median present) produces **zero** records matching any
+//! of the four conditions. Every object reference the guest named resolved.
+//!
+//! So a green boot says the rails still work and says nothing whatever about the
+//! rungs — they are held by tests, not by booting. A rung appearing in the fail
+//! log is a real event worth reading, not background noise, and the fail
+//! channel's whole reason set on that boot was three unrelated slugs.
 
 /// Compose a ladder slug from a rail's role and one of the four rungs.
 ///
