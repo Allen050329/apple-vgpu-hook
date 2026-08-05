@@ -11,9 +11,8 @@ use crate::contract::size_fits_u32;
 // options joined once the capture drove that envelope.
 use reims_vgpu_wire::ops::segment as wire_segment;
 pub use reims_vgpu_wire::ops::segment::{
-    PROTECTION_OPTIONS_ENVELOPE_LEN as PROTECTION_OPTIONS_PAYLOAD_LEN, SEGMENT_HEADER_LEN,
-    SEGMENT_TYPE_BLIT, SEGMENT_TYPE_COMPUTE, SEGMENT_TYPE_INFO, SEGMENT_TYPE_PROTECTION_OPTIONS,
-    SEGMENT_TYPE_RENDER,
+    SEGMENT_HEADER_LEN, SEGMENT_TYPE_BLIT, SEGMENT_TYPE_COMPUTE, SEGMENT_TYPE_INFO,
+    SEGMENT_TYPE_PROTECTION_OPTIONS, SEGMENT_TYPE_RENDER,
 };
 
 // The one type the wire crate deliberately does not name, because its capture

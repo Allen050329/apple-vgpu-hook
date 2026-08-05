@@ -105,8 +105,6 @@ pub use display_surface::{
     ConsoleFeed, CursorGlyphInfo,
 };
 
-pub use backend::Backend;
-pub use contract::pixel_format;
 // Convenience re-exports used by qemu ABI and tests
 pub use model::{Device, DeviceId};
 pub use runtime::{HostAction, HostOps};

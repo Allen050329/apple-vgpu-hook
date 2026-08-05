@@ -620,7 +620,7 @@ impl SurfaceWriteCensus {
 ///
 /// - **Removing bytes is worth ~1:1 against 90% of the largest cost in the
 ///   device.** The four levers the deferred-flush ledger in
-///   [`crate::runtime::storage_flush::flush_mapping_windows_before_fence`] prices
+///   [`crate::runtime::storage_flush::fence::flush_mapping_windows_before_fence`] prices
 ///   in bytes are the ones that would pay, and they were not being weighed
 ///   against the right number.
 /// - **Removing the second submission is worth the other ~11%** — a stable

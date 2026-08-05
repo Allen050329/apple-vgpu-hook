@@ -3511,7 +3511,7 @@ pub fn publish_stranded_fifos<H: HostMemory + HostOps>(
 /// been observed to hit it — worth knowing if one ever does.
 ///
 /// The cost is inside the render flush, not in the scheduling around it. See
-/// [`crate::runtime::storage_flush::flush_mapping_windows_before_fence`].
+/// [`crate::runtime::storage_flush::fence::flush_mapping_windows_before_fence`].
 ///
 /// # What that refutation does *not* cover, and the measurement that separates them
 ///

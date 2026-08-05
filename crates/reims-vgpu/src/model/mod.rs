@@ -9,14 +9,18 @@ mod state;
 
 pub use lru_memo::LruBytesMemo;
 pub use regs::*;
+// `GfxRegs` has no in-crate importer and is here for the five doc comments
+// that link `model::GfxRegs::child_doorbell_rung`. `state` is a private
+// `mod`, so this is the only path those links can name — and rustc's
+// unused-import lint cannot see a doc link, so it will call this dead.
 pub use state::{
-    ChannelRing, ComputeStorageResidencyKey, CursorState, DeferredOwner, DeviceId, DeviceState,
-    DisplayHandshake, ExecFault, FailEvent, GfxRegs, GuestLinearMemo, GvaBacking, GvaDeferredEntry,
-    GvaEvictionWitness, GvaHostView, HostLinearTexture, HostSurface, IosfcRegs,
-    LinearDeferredEntry, MapperCapture, MappingEntry, PacketFault, PendingWork, PresentBacking,
-    PresentState, RenderFlushWitness, RenderWindowSource, ResourceValidity, SurfaceWriteKind,
-    TaskEntry, Type4Walk, FENCE_DOMAIN_BLIT, FENCE_DOMAIN_COMPUTE, FENCE_DOMAIN_EVENT,
-    FENCE_DOMAIN_RENDER, GVA_ENCODE_CACHE_BYTE_CAP, GVA_EVICTION_WITNESS_KEYS,
+    ChannelRing, ComputeStorageResidencyKey, DeferredOwner, DeviceId, DeviceState, ExecFault,
+    FailEvent, GfxRegs, GuestLinearMemo, GvaBacking, GvaDeferredEntry, GvaEvictionWitness,
+    GvaHostView, HostLinearTexture, HostSurface, LinearDeferredEntry, MapperCapture, MappingEntry,
+    PacketFault, PresentBacking, PresentState, RenderFlushWitness, RenderWindowSource,
+    ResourceValidity, SurfaceWriteKind, TaskEntry, Type4Walk, FENCE_DOMAIN_BLIT,
+    FENCE_DOMAIN_COMPUTE, FENCE_DOMAIN_EVENT, FENCE_DOMAIN_RENDER, GVA_ENCODE_CACHE_BYTE_CAP,
+    GVA_EVICTION_WITNESS_KEYS,
 };
 
 use crate::backend::Backend;

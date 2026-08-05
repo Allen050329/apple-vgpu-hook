@@ -631,7 +631,7 @@ pub struct RenderFlushWitness {
     /// almost no headroom to absorb anything, so a hitch is the flush rail's
     /// cost showing up as latency rather than a separate defect — and the only
     /// remaining route to that cost is the one
-    /// [`crate::runtime::storage_flush::flush_mapping_windows_before_fence`]
+    /// [`crate::runtime::storage_flush::fence::flush_mapping_windows_before_fence`]
     /// names: making the undeclared guest read observable.
     pub landed_us: u64,
 }

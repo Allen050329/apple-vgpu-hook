@@ -168,7 +168,7 @@ pub const OBJECT_TYPE_REF_TEXTURE: u8 = 5;
 /// state. The two record tags come with them, since a tag is part of the
 /// layout's identity and not of this device's policy.
 pub use reims_vgpu_wire::device_desc::{
-    TYPE5_ARGS, TYPE5_ARG_RECORD, TYPE5_OWNER_TASK, TYPE5_RECORD_MIN_LEN, TYPE5_RECORD_PLANE,
+    TYPE5_ARGS, TYPE5_ARG_RECORD, TYPE5_OWNER_TASK, TYPE5_RECORD_PLANE,
     TYPE5_RECORD_TAG_COLOR_VIEW, TYPE5_RECORD_TAG_PLANE, TYPE5_SURFACE_ID,
 };
 

@@ -83,7 +83,7 @@ pub(crate) mod report;
 pub use access::{
     flush_gva_exact, flush_intersecting, flush_intersecting_task_gva, flush_mapping_for_guest_read,
 };
-pub use fence::{flush_all_windows_before_fence, flush_mapping_windows_before_fence};
+pub use fence::flush_all_windows_before_fence;
 pub use land::{flush_gva_one, flush_linear_one, retire_gva_windows, retire_linear_residents};
 pub use lifecycle::drop_windows;
 pub use report::{note_render_flush_cache_read, note_render_flush_pages_read};

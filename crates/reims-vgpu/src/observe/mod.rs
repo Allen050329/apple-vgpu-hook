@@ -80,8 +80,8 @@ pub(crate) use ladder::{ladder_slug, ladder_slugs};
 // rather than `observe::sink::fail(…)`. `sink` stays public for readers who
 // want the machinery.
 pub use sink::{
-    bgra_present_stats, bgra_present_stats_scalar, bgra_rgb_stats, fail, line, nonzero_stats, off,
-    redirect_logs_for_tests, rgba_rgb_stats,
+    bgra_present_stats, bgra_rgb_stats, fail, line, nonzero_stats, off, redirect_logs_for_tests,
+    rgba_rgb_stats,
 };
 pub(crate) use sink::{draw_log_enabled, elapsed_ms, elapsed_us};
 

@@ -57,4 +57,4 @@ pub mod support;
 pub mod vertex;
 
 pub use reason::TranslateReason;
-pub use support::{VertexBinding, VertexFormatSupport};
+pub use support::VertexFormatSupport;

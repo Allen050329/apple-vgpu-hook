@@ -46,11 +46,8 @@ pub mod device_select;
 pub mod external_memory;
 pub mod memory_topology;
 
-pub use device_select::{rank_physical_device, select_physical_device};
 pub use external_memory::DmaBufImport;
-pub use memory_topology::{
-    MappedMemoryKind, MemoryClass, MemoryProfile, MemoryTopology, TopologySignal,
-};
+pub use memory_topology::{MappedMemoryKind, MemoryClass, MemoryProfile};
 
 use ash::vk;
 

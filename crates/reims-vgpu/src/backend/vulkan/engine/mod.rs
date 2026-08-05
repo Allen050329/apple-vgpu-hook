@@ -34,30 +34,27 @@ pub mod vk_call;
 #[cfg(feature = "host-window")]
 mod window_present;
 
-pub use compute_execution::ComputeExecutionDecline;
-pub use compute_validation::ComputeValidationDecline;
-pub use context::{FENCE_TIMEOUT_NS, MAX_DEVICE_RECREATES};
+pub use context::MAX_DEVICE_RECREATES;
 pub use counters::{CounterSnapshot, EngineCounters};
-pub use device_lost::{DeviceLostDecline, DeviceLostOp};
-pub use draw_execution::DrawExecutionDecline;
-pub use draw_phase::{take_window as draw_phase_window, DrawPhaseWindow};
+pub use draw_phase::take_window as draw_phase_window;
 pub use draw_preparation::DrawPreparationDecline;
+// No in-crate importer: `draw_preparation`'s module doc links this name and
+// `draw_validation` is a private `mod`, so this re-export is the only path
+// that resolves. Rustc's unused-import lint does not read doc links, so it
+// will call this dead.
 pub use draw_validation::DrawValidationDecline;
 pub use facade_decline::EngineFacadeDecline;
-pub use init_decline::InitDecline;
-pub use reason::DrawReason;
 pub use types::{
-    BlendFactor, BlendOp, BlendStateResource, BufferContent, ColorWriteMask, ComputeBufferOutput,
-    ComputeBufferResource, ComputeOutput, ComputeRequest, ComputeResidentSampleBind,
-    ComputeSampledImageResource, ComputeStorageImageResource, ComputeStorageResidency, CullMode,
-    DepthState, DrawError, DrawOutput, DrawRequest, GuestDmaBuf, GuestPageWindow, GuestRun,
-    GuestRunSource, IndexType, IndexedDrawResource, PrimitiveTopology, SampledContentIdentity,
-    SampledImageResource, SampledSource, SamplerAddressMode, SamplerBorderColor,
-    SamplerCompareFunction, SamplerFilter, SamplerMipFilter, SamplerResource, ScissorResource,
-    SecondaryColorTarget, SeedOrder, StencilFaceOps, StencilOp, StencilState,
-    StorageBufferResource, StorageImageFormat, TargetIdentity, VertexAttributeFormat,
-    VertexAttributeResource, VertexStepFunction, ViewportResource, WindowPresentSource,
-    COLOR_INPUT_BINDING,
+    BlendFactor, BlendOp, BlendStateResource, BufferContent, ColorWriteMask, ComputeBufferResource,
+    ComputeOutput, ComputeRequest, ComputeResidentSampleBind, ComputeSampledImageResource,
+    ComputeStorageImageResource, ComputeStorageResidency, CullMode, DepthState, DrawError,
+    DrawOutput, DrawRequest, GuestDmaBuf, GuestPageWindow, GuestRun, GuestRunSource, IndexType,
+    IndexedDrawResource, PrimitiveTopology, SampledContentIdentity, SampledImageResource,
+    SampledSource, SamplerAddressMode, SamplerBorderColor, SamplerCompareFunction, SamplerFilter,
+    SamplerMipFilter, SamplerResource, ScissorResource, SecondaryColorTarget, SeedOrder,
+    StencilFaceOps, StencilOp, StencilState, StorageBufferResource, StorageImageFormat,
+    TargetIdentity, VertexAttributeFormat, VertexAttributeResource, VertexStepFunction,
+    ViewportResource, WindowPresentSource, COLOR_INPUT_BINDING,
 };
 pub use vk_call::{VkCall, VkOp};
 #[cfg(feature = "host-window")]

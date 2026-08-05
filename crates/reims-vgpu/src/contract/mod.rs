@@ -15,4 +15,3 @@ pub mod iosurface_pages;
 pub mod pixel_format;
 
 pub use checked::*;
-pub use endian::*;
