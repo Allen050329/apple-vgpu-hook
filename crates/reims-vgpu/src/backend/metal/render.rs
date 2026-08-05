@@ -366,16 +366,8 @@ fn find_or_add_attr_slot(
             .field("location", attr.location)
             .field("buffer", attr.buffer_index));
     }
-    let step_function = if attr.has_step_function != 0 {
-        attr.step_function
-    } else {
-        MTLVertexStepFunction::PerVertex as u32
-    };
-    let step_rate = if attr.has_step_rate != 0 {
-        attr.step_rate
-    } else {
-        1
-    };
+    let step_function = attr.step_function;
+    let step_rate = attr.step_rate;
     if step_function > MTLVertexStepFunction::PerInstance as u32 {
         set_err(err, "unsupported vertex attribute step state");
         return Err(
@@ -384,11 +376,16 @@ fn find_or_add_attr_slot(
                 .field("step", step_function),
         );
     }
-    if step_rate == 0 {
+    // A rate of zero is legal for exactly one step function and required by it:
+    // `MTLVertexStepFunctionConstant` fetches the attribute once for the whole
+    // draw, and `MTLVertexBufferLayoutDescriptor.stepRate` must be 0 to say so.
+    // Under any other step function a zero rate advances nothing and Metal
+    // rejects the descriptor, so refuse it here by name instead.
+    if step_rate == 0 && step_function != MTLVertexStepFunction::Constant as u32 {
         set_err(err, "unsupported vertex attribute step state");
-        return Err(
-            Status::args("metal_render_vertex_step_rate_zero").field("location", attr.location)
-        );
+        return Err(Status::args("metal_render_vertex_step_rate_zero")
+            .field("location", attr.location)
+            .field("step", step_function));
     }
     for s in slots.iter() {
         if s.index == attr.buffer_index as u64
@@ -501,11 +498,7 @@ fn make_vertex_descriptor(
                     .field("format", attr.format),
             );
         };
-        let step_ordinal = if attr.has_step_function != 0 {
-            attr.step_function
-        } else {
-            MTLVertexStepFunction::PerVertex as u32
-        };
+        let step_ordinal = attr.step_function;
         let Some(step) = mtl_enum::vertex_step_function(step_ordinal) else {
             set_err(
                 err,
@@ -527,12 +520,7 @@ fn make_vertex_descriptor(
         if let Some(layout) = descriptor.layouts().object_at(attr.buffer_index as u64) {
             layout.set_stride(attr.stride as u64);
             layout.set_step_function(step);
-            let rate = if attr.has_step_rate != 0 {
-                attr.step_rate
-            } else {
-                1
-            };
-            layout.set_step_rate(rate as u64);
+            layout.set_step_rate(attr.step_rate as u64);
         }
         any_layout = true;
     }
@@ -587,9 +575,7 @@ fn fill_render_pso_key(
         key.attr_offset[i] = attr.offset;
         key.attr_buffer_index[i] = attr.buffer_index;
         key.attr_stride[i] = attr.stride;
-        key.attr_has_step_function[i] = if attr.has_step_function != 0 { 1 } else { 0 };
         key.attr_step_function[i] = attr.step_function;
-        key.attr_has_step_rate[i] = if attr.has_step_rate != 0 { 1 } else { 0 };
         key.attr_step_rate[i] = attr.step_rate;
     }
     // Global blend (stream blend color path / color0 fallback).
@@ -653,8 +639,6 @@ fn fill_render_pso_key(
         h = hash_u64(h, key.attr_stride[i] as u64);
         h = hash_u64(h, key.attr_step_function[i] as u64);
         h = hash_u64(h, key.attr_step_rate[i] as u64);
-        h = hash_u64(h, key.attr_has_step_function[i] as u64);
-        h = hash_u64(h, key.attr_has_step_rate[i] as u64);
     }
     h = hash_u64(h, key.blend_enable as u64);
     h = hash_u64(h, key.blend_src_rgb as u64);
@@ -784,8 +768,6 @@ impl RenderPsoKeyClone for RenderPsoKey {
             attr_stride: self.attr_stride,
             attr_step_function: self.attr_step_function,
             attr_step_rate: self.attr_step_rate,
-            attr_has_step_function: self.attr_has_step_function,
-            attr_has_step_rate: self.attr_has_step_rate,
             blend_enable: self.blend_enable,
             blend_src_rgb: self.blend_src_rgb,
             blend_dst_rgb: self.blend_dst_rgb,

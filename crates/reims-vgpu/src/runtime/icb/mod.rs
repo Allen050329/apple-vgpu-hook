@@ -1858,13 +1858,11 @@ pub(crate) fn metal_vertex_descriptor_from_attrs_for_draw(
             );
             continue;
         };
-        let step_ordinal = if a.has_step_function {
-            a.step_function
-        } else if for_patches {
+        let step_ordinal = a.step_function_ordinal(if for_patches {
             MTLVertexStepFunction::PerPatchControlPoint as u32
         } else {
             MTLVertexStepFunction::PerVertex as u32
-        };
+        });
         let Some(step) = mtl_enum::vertex_step_function(step_ordinal) else {
             note_dropped_vertex_attribute(
                 "icb_vertex_attr_step_function_unsupported",
@@ -1882,12 +1880,7 @@ pub(crate) fn metal_vertex_descriptor_from_attrs_for_draw(
         if let Some(layout) = vd.layouts().object_at(a.buffer_index as u64) {
             layout.set_stride(a.stride as u64);
             layout.set_step_function(step);
-            let rate = if a.has_step_rate {
-                a.step_rate.max(1)
-            } else {
-                1
-            };
-            layout.set_step_rate(rate as u64);
+            layout.set_step_rate(a.step_rate() as u64);
         }
     }
     if any {

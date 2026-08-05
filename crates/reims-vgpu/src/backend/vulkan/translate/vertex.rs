@@ -215,7 +215,7 @@ pub fn attribute_format(mtl: u32) -> Result<F, TranslateReason> {
     })
 }
 
-/// A decoded `MTLVertexStepFunction` plus its presence bit → engine step mode.
+/// A layout entry's declared `MTLVertexStepFunction` → engine step mode.
 ///
 /// The serializer omits the field for Metal's default `PerVertex` behavior, so
 /// absence is part of this translation rather than a caller-side fallback.
@@ -225,10 +225,10 @@ pub fn attribute_format(mtl: u32) -> Result<F, TranslateReason> {
 /// (`PerPatchControlPoint`) decline, but under their own reason rather than as
 /// unrecognised values. They are recognised; this backend builds no
 /// tessellation pipeline for them to belong to.
-pub fn step_function(is_present: bool, mtl: u32) -> Result<VertexStepFunction, TranslateReason> {
-    if !is_present {
+pub fn step_function(declared: Option<u32>) -> Result<VertexStepFunction, TranslateReason> {
+    let Some(mtl) = declared else {
         return Ok(VertexStepFunction::PerVertex);
-    }
+    };
     match mtl {
         0 => Ok(VertexStepFunction::Constant),
         1 => Ok(VertexStepFunction::PerVertex),
@@ -331,23 +331,23 @@ mod tests {
     #[test]
     fn every_vertex_step_function_maps_and_absence_is_per_vertex() {
         assert_eq!(
-            step_function(false, 99).unwrap(),
+            step_function(None).unwrap(),
             VertexStepFunction::PerVertex
         );
         assert_eq!(
-            step_function(true, 0).unwrap(),
+            step_function(Some(0)).unwrap(),
             VertexStepFunction::Constant
         );
         assert_eq!(
-            step_function(true, 1).unwrap(),
+            step_function(Some(1)).unwrap(),
             VertexStepFunction::PerVertex
         );
         assert_eq!(
-            step_function(true, 2).unwrap(),
+            step_function(Some(2)).unwrap(),
             VertexStepFunction::PerInstance
         );
         assert_eq!(
-            step_function(true, 5).unwrap_err(),
+            step_function(Some(5)).unwrap_err(),
             TranslateReason::UnknownVertexStepFunction(5)
         );
     }
@@ -367,7 +367,7 @@ mod tests {
     fn the_two_tessellation_step_rates_decline_by_their_own_name() {
         for mtl in [3u32, 4] {
             assert_eq!(
-                step_function(true, mtl).unwrap_err(),
+                step_function(Some(mtl)).unwrap_err(),
                 TranslateReason::VertexStepFunctionPerPatch(mtl),
                 "MTLVertexStepFunction {mtl}"
             );
@@ -381,12 +381,9 @@ mod tests {
             TranslateReason::VertexStepFunctionPerPatch(3).slug(),
             TranslateReason::UnknownVertexStepFunction(5).slug()
         );
-        // Absence still means `PerVertex` whatever the word holds, so a record
-        // that never carried the field cannot reach either refusal.
-        assert_eq!(
-            step_function(false, 3).unwrap(),
-            VertexStepFunction::PerVertex
-        );
+        // Absence is its own state now rather than a flag beside a word, so a
+        // record that never carried the field cannot reach either refusal.
+        assert_eq!(step_function(None).unwrap(), VertexStepFunction::PerVertex);
     }
 
     /// **L2's co-location invariant.** The byte size must equal the Vulkan

@@ -4015,13 +4015,13 @@ pub(super) fn prepare_vertex_attribute_format(
 pub(super) fn prepare_vertex_step_function(
     attribute: &crate::runtime::decode::resource::VertexAttribute,
 ) -> Result<crate::backend::vulkan::engine::VertexStepFunction, DrawPreparationDecline> {
-    translate::vertex::step_function(attribute.has_step_function, attribute.step_function).map_err(
-        |reason| DrawPreparationDecline::VertexStepFunctionUnsupported {
+    translate::vertex::step_function(attribute.declared_step_function).map_err(|reason| {
+        DrawPreparationDecline::VertexStepFunctionUnsupported {
             location: attribute.location,
             buffer_index: attribute.buffer_index,
             reason,
-        },
-    )
+        }
+    })
 }
 
 fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
@@ -4160,7 +4160,10 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             .vertex_attributes
             .iter()
             .filter(|a| {
-                a.format != 0 && a.stride != 0 && a.has_step_function && a.step_function == 0
+                a.format != 0
+                    && a.stride != 0
+                    && translate::vertex::step_function(a.declared_step_function)
+                        == Ok(crate::backend::vulkan::engine::VertexStepFunction::Constant)
             })
             .map(|a| a.buffer_index)
             .collect();
@@ -4242,11 +4245,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 ));
             }
             let step = prepare_vertex_step_function(a).map_err(DrawError::DrawPreparation)?;
-            let step_rate = if a.has_step_rate {
-                a.step_rate.max(1)
-            } else {
-                1
-            };
+            let step_rate = a.step_rate();
             attrs.push(crate::backend::vulkan::engine::VertexAttributeResource {
                 location: a.location,
                 // One Vulkan binding per location (archive render_draw_core).

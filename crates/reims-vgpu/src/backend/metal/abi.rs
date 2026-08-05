@@ -425,6 +425,18 @@ pub struct ReimsVgpuIndexedDraw {
     pub indirect: *const ReimsVgpuIndexedIndirectDraw,
 }
 
+/// One vertex attribute as the Metal encoder wants it.
+///
+/// `step_function` and `step_rate` are the *resolved* values rather than the
+/// tagged record's optionals: the caller applies
+/// [`VertexAttribute::step_function_ordinal`] and [`VertexAttribute::step_rate`]
+/// once and this side sets what it is given. Carrying the presence bits across
+/// instead made two functions in [`super::render`] re-derive the same defaults,
+/// and put both bits in the pipeline cache key beside the values they had
+/// already been folded into.
+///
+/// [`VertexAttribute::step_function_ordinal`]: crate::runtime::decode::resource::VertexAttribute::step_function_ordinal
+/// [`VertexAttribute::step_rate`]: crate::runtime::decode::resource::VertexAttribute::step_rate
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct ReimsVgpuVertexAttr {
@@ -435,9 +447,7 @@ pub struct ReimsVgpuVertexAttr {
     pub stride: u32,
     pub data: *const u8,
     pub len: usize,
-    pub has_step_function: u32,
     pub step_function: u32,
-    pub has_step_rate: u32,
     pub step_rate: u32,
 }
 

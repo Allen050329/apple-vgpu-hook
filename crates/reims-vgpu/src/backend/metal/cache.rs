@@ -27,10 +27,11 @@ pub struct RenderPsoKey {
     pub attr_offset: [u32; REIMS_VGPU_METAL_MAX_ATTRS],
     pub attr_buffer_index: [u32; REIMS_VGPU_METAL_MAX_ATTRS],
     pub attr_stride: [u32; REIMS_VGPU_METAL_MAX_ATTRS],
+    /// Resolved step state, not the record's optionals: the caller has already
+    /// applied the absent-field defaults, so the presence bits that used to sit
+    /// beside these could only ever repeat what they had been folded into.
     pub attr_step_function: [u32; REIMS_VGPU_METAL_MAX_ATTRS],
     pub attr_step_rate: [u32; REIMS_VGPU_METAL_MAX_ATTRS],
-    pub attr_has_step_function: [u8; REIMS_VGPU_METAL_MAX_ATTRS],
-    pub attr_has_step_rate: [u8; REIMS_VGPU_METAL_MAX_ATTRS],
     pub blend_enable: u8,
     pub blend_src_rgb: u32,
     pub blend_dst_rgb: u32,
@@ -77,8 +78,6 @@ impl Default for RenderPsoKey {
             attr_stride: [0; REIMS_VGPU_METAL_MAX_ATTRS],
             attr_step_function: [0; REIMS_VGPU_METAL_MAX_ATTRS],
             attr_step_rate: [0; REIMS_VGPU_METAL_MAX_ATTRS],
-            attr_has_step_function: [0; REIMS_VGPU_METAL_MAX_ATTRS],
-            attr_has_step_rate: [0; REIMS_VGPU_METAL_MAX_ATTRS],
             blend_enable: 0,
             blend_src_rgb: 0,
             blend_dst_rgb: 0,
@@ -149,8 +148,6 @@ impl RenderPsoKey {
                 || self.attr_stride[i] != other.attr_stride[i]
                 || self.attr_step_function[i] != other.attr_step_function[i]
                 || self.attr_step_rate[i] != other.attr_step_rate[i]
-                || self.attr_has_step_function[i] != other.attr_has_step_function[i]
-                || self.attr_has_step_rate[i] != other.attr_has_step_rate[i]
             {
                 return false;
             }

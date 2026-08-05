@@ -1836,8 +1836,7 @@ fn vertex_attribute_preparation_returns_exact_declines() {
     );
 
     attribute.format = 30;
-    attribute.has_step_function = true;
-    attribute.step_function = 9;
+    attribute.declared_step_function = Some(9);
     let step = prepare_vertex_step_function(&attribute)
         .expect_err("unknown MTLVertexStepFunction must be typed before request validation");
     assert_eq!(step.slug(), "draw_prepare_vertex_step_function_unsupported");
@@ -1862,7 +1861,7 @@ fn vertex_attribute_preparation_returns_exact_declines() {
     // comparison of the two rather than a check of one: a fixed string passes
     // any single-slug assertion.
     for mtl in [3u32, 4] {
-        attribute.step_function = mtl;
+        attribute.declared_step_function = Some(mtl);
         let patch = prepare_vertex_step_function(&attribute)
             .expect_err("a per-patch step rate has no VkVertexInputRate");
         assert_eq!(

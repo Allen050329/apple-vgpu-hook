@@ -472,6 +472,14 @@ pub(crate) const TEXTURE_DESC_BASE_LEN: usize = 116;
 pub const TEXTURE_MAX_MIP_LEVELS: usize = 16;
 
 /// Vertex attribute from a type-7 render-pipeline vertex-input block.
+///
+/// The two step fields are `Option` rather than a value beside its own presence
+/// bit. The serializer writes a layout's `stepFunction` and `stepRate` as tagged
+/// entries and omits the tag the guest never set, so absence is a state of the
+/// record — and a pair of fields that can spell "absent, 7" is a state the wire
+/// cannot produce. Resolve them through [`VertexAttribute::step_rate`] and
+/// [`VertexAttribute::step_function_ordinal`]; the raw `Option` is what the
+/// record said, and the methods are what Metal does with it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct VertexAttribute {
     pub location: u32,
@@ -479,10 +487,33 @@ pub struct VertexAttribute {
     pub offset: u32,
     pub buffer_index: u32,
     pub stride: u32,
-    pub has_step_function: bool,
-    pub step_function: u32,
-    pub has_step_rate: bool,
-    pub step_rate: u32,
+    /// `MTLVertexStepFunction` ordinal the layout entry declared, if it did.
+    pub declared_step_function: Option<u32>,
+    /// `MTLVertexBufferLayoutDescriptor.stepRate` the layout entry declared.
+    pub declared_step_rate: Option<u32>,
+}
+
+impl VertexAttribute {
+    /// The step rate this attribute's buffer layout runs at.
+    ///
+    /// `MTLVertexBufferLayoutDescriptor.stepRate` defaults to 1, so a layout
+    /// that declared none steps once per vertex or instance. A layout that
+    /// declared **zero** means zero — that is what `MTLVertexStepFunctionConstant`
+    /// pairs with — so nothing here clamps it up. Two call sites used to, which
+    /// turned a constant-rate attribute into a per-instance one that advanced,
+    /// while the third passed the zero through: one wire field, two answers.
+    pub fn step_rate(&self) -> u32 {
+        self.declared_step_rate.unwrap_or(1)
+    }
+
+    /// The `MTLVertexStepFunction` ordinal this attribute's layout runs at.
+    ///
+    /// `when_absent` is the caller's default because it genuinely differs: a
+    /// plain vertex descriptor defaults to `PerVertex`, and a post-tessellation
+    /// one indexes control points instead.
+    pub fn step_function_ordinal(&self, when_absent: u32) -> u32 {
+        self.declared_step_function.unwrap_or(when_absent)
+    }
 }
 
 /// `MTLColorWriteMask` for one attachment, in Metal's own bit order.
@@ -1566,7 +1597,9 @@ pub fn parse_vertex_block(
 
     let mut strides = [0u32; MAX_VERTEX_LAYOUTS];
     let mut have_stride = [false; MAX_VERTEX_LAYOUTS];
-    let mut layout_steps: Vec<(u32, bool, u32, bool, u32)> = Vec::new(); // bi, has_sf, sf, has_sr, sr
+    // Buffer index, and the step function / step rate that buffer's layout
+    // entry declared — `None` where the entry carried no such tag.
+    let mut layout_steps: Vec<(u32, Option<u32>, Option<u32>)> = Vec::new();
 
     let layout_section = bo.saturating_add(layout_off as usize);
     if layout_section + 4 > block_end {
@@ -1585,21 +1618,15 @@ pub fn parse_vertex_block(
         let buffer_index =
             entry_tag_u32(bytes, block_end, entry, VERTEX_LAYOUT_TAG_BUFFER_INDEX, 0);
         let stride = entry_tag_u32(bytes, block_end, entry, VERTEX_LAYOUT_TAG_STRIDE, 0);
-        let has_step_function =
+        let declared_step_function =
             entry_tag_u32_present(bytes, block_end, entry, VERTEX_LAYOUT_TAG_STEP_FUNCTION);
-        let has_step_rate =
+        let declared_step_rate =
             entry_tag_u32_present(bytes, block_end, entry, VERTEX_LAYOUT_TAG_STEP_RATE);
         if (buffer_index as usize) < MAX_VERTEX_LAYOUTS && stride != 0 {
             strides[buffer_index as usize] = stride;
             have_stride[buffer_index as usize] = true;
         }
-        layout_steps.push((
-            buffer_index,
-            has_step_function.is_some(),
-            has_step_function.unwrap_or(0),
-            has_step_rate.is_some(),
-            has_step_rate.unwrap_or(0),
-        ));
+        layout_steps.push((buffer_index, declared_step_function, declared_step_rate));
     }
 
     let attr_section = bo.saturating_add(attr_off as usize);
@@ -1630,21 +1657,19 @@ pub fn parse_vertex_block(
             } else {
                 0
             };
-        let (has_sf, sf, has_sr, sr) = layout_steps
+        let (sf, sr) = layout_steps
             .iter()
             .find(|(bi, ..)| *bi == buffer_index)
-            .map(|(_, has_sf, sf, has_sr, sr)| (*has_sf, *sf, *has_sr, *sr))
-            .unwrap_or((false, 0, false, 0));
+            .map(|(_, sf, sr)| (*sf, *sr))
+            .unwrap_or((None, None));
         attrs.push(VertexAttribute {
             location,
             format,
             offset,
             buffer_index,
             stride,
-            has_step_function: has_sf,
-            step_function: sf,
-            has_step_rate: has_sr,
-            step_rate: sr,
+            declared_step_function: sf,
+            declared_step_rate: sr,
         });
     }
     Ok(attrs)
@@ -3009,6 +3034,107 @@ mod tests {
 
     use super::*;
     use crate::contract::endian::st32;
+
+    /// A one-attribute vertex-input block whose single buffer layout carries
+    /// exactly the step tags asked for.
+    ///
+    /// `step_tags` is what the serializer wrote: it emits a tag only for a
+    /// property the guest set, so an empty slice is the record an app that
+    /// touched neither produces.
+    fn vertex_block(step_tags: &[(u8, u32)]) -> Vec<u8> {
+        // Root entry: 1 count byte + two 6-byte (tag, len, u32) fields.
+        const ROOT_LEN: usize = 1 + 2 * 6;
+        let layout_rel = ROOT_LEN;
+        let layout_entry_rel = 8usize; // past the count and the one offset word
+        let layout_fields = 2 + step_tags.len();
+        let layout_len = layout_entry_rel + 1 + layout_fields * 6;
+        let attr_rel = layout_rel + layout_len;
+        let mut b = vec![0u8; attr_rel + 8 + 1 + 4 * 6];
+
+        b[0] = 2;
+        b[1] = VERTEX_DESC_TAG_ATTRIBUTES;
+        b[2] = 4;
+        st32(&mut b[3..], attr_rel as u32);
+        b[7] = VERTEX_DESC_TAG_LAYOUTS;
+        b[8] = 4;
+        st32(&mut b[9..], layout_rel as u32);
+
+        st32(&mut b[layout_rel..], 1);
+        st32(&mut b[layout_rel + 4..], layout_entry_rel as u32);
+        let le = layout_rel + layout_entry_rel;
+        b[le] = layout_fields as u8;
+        let mut p = le + 1;
+        for (tag, value) in [
+            (VERTEX_LAYOUT_TAG_BUFFER_INDEX, 0u32),
+            (VERTEX_LAYOUT_TAG_STRIDE, 16),
+        ]
+        .iter()
+        .chain(step_tags.iter())
+        {
+            b[p] = *tag;
+            b[p + 1] = 4;
+            st32(&mut b[p + 2..], *value);
+            p += 6;
+        }
+
+        st32(&mut b[attr_rel..], 1);
+        st32(&mut b[attr_rel + 4..], 8);
+        let ae = attr_rel + 8;
+        b[ae] = 4;
+        let mut p = ae + 1;
+        for (tag, value) in [
+            (VERTEX_ATTR_TAG_LOCATION, 0u32),
+            (VERTEX_ATTR_TAG_FORMAT, 31), // MTLVertexFormatFloat4
+            (VERTEX_ATTR_TAG_OFFSET, 0),
+            (VERTEX_ATTR_TAG_BUFFER_INDEX, 0),
+        ] {
+            b[p] = tag;
+            b[p + 1] = 4;
+            st32(&mut b[p + 2..], value);
+            p += 6;
+        }
+        b
+    }
+
+    /// A layout that declared `stepRate` 0 means 0, and one that declared none
+    /// means 1.
+    ///
+    /// `MTLVertexBufferLayoutDescriptor.stepRate` defaults to 1, and
+    /// `MTLVertexStepFunctionConstant` is the one step function that requires 0
+    /// — it fetches the attribute once for the whole draw. Two of the four
+    /// consumers of this record used to clamp the declared zero up to 1, which
+    /// turned that attribute into a per-instance stream that advanced, while a
+    /// third refused the zero outright and a fourth passed it through. The rule
+    /// lives on the record now, so there is one answer to compare against.
+    #[test]
+    fn a_declared_zero_step_rate_is_not_a_missing_one() {
+        let declared = vertex_block(&[
+            (VERTEX_LAYOUT_TAG_STEP_FUNCTION, 0),
+            (VERTEX_LAYOUT_TAG_STEP_RATE, 0),
+        ]);
+        let attrs = parse_vertex_block(&declared, 0, declared.len()).expect("declared step state");
+        assert_eq!(attrs.len(), 1);
+        assert_eq!(attrs[0].declared_step_rate, Some(0));
+        assert_eq!(attrs[0].step_rate(), 0);
+        assert_eq!(attrs[0].declared_step_function, Some(0));
+        assert_eq!(attrs[0].step_function_ordinal(7), 0);
+
+        let absent = vertex_block(&[]);
+        let attrs = parse_vertex_block(&absent, 0, absent.len()).expect("absent step state");
+        assert_eq!(attrs.len(), 1);
+        assert_eq!(attrs[0].declared_step_rate, None);
+        assert_eq!(attrs[0].step_rate(), 1);
+        assert_eq!(attrs[0].declared_step_function, None);
+        // The absent step function has no one default: a plain vertex
+        // descriptor wants `PerVertex` and a post-tessellation one wants
+        // `PerPatchControlPoint`, so the caller names it and this returns it.
+        assert_eq!(attrs[0].step_function_ordinal(7), 7);
+
+        // A declared rate above the default is neither of the two above.
+        let three = vertex_block(&[(VERTEX_LAYOUT_TAG_STEP_RATE, 3)]);
+        let attrs = parse_vertex_block(&three, 0, three.len()).expect("declared rate");
+        assert_eq!(attrs[0].step_rate(), 3);
+    }
 
     /// A well-formed heap-texture record, with the bytes the serializer does
     /// not write left as the caller asks.

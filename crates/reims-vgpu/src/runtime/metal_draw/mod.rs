@@ -1329,10 +1329,12 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
             stride: a.stride,
             data: data_ptr,
             len,
-            has_step_function: if a.has_step_function { 1 } else { 0 },
-            step_function: a.step_function,
-            has_step_rate: if a.has_step_rate { 1 } else { 0 },
-            step_rate: a.step_rate,
+            // A plain vertex descriptor's layouts default to `PerVertex`; the
+            // post-tessellation default belongs to the ICB path, which names it
+            // itself.
+            step_function: a
+                .step_function_ordinal(metal::MTLVertexStepFunction::PerVertex as u32),
+            step_rate: a.step_rate(),
         });
     }
 
