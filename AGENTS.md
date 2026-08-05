@@ -372,6 +372,13 @@ Before and after long Rust test runs, sweep orphaned test binaries:
 pkill -9 -f 'target/debug/deps/reims_vgp[u]-'
 ```
 
+**The only layout-truth tests do not run on a checkout without Apple's captured fixtures**, which is
+every non-Apple checkout — `crates/reims-vgpu-wire/fixtures/` is gitignored. They report `ignored`
+rather than `ok`, so the run says so, and the ignored count is the one to read. Nothing else in
+either suite covers what they cover, so a green run is not evidence about a wire layout. Regenerate
+with `scripts/wire-oracle/wire-oracle.sh` on an Apple host, and set `REIMS_WIRE_FIXTURES_REQUIRED=1`
+there so their absence fails the build.
+
 The `backend-metal` `--lib` arm has six pre-existing failures, all in
 `runtime::storage_flush::tests` and all exercising `flush_render_one`, which is a fail-visible stub
 on a build without `backend-vulkan`. They are Vulkan-rail tests compiled unconditionally rather than
