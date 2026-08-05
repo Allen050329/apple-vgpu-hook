@@ -529,6 +529,7 @@ fn every_index_load_failure_has_its_own_namespaced_name() {
         IndexLoadReason::OffsetOverflow,
         IndexLoadReason::OutOfBounds,
         IndexLoadReason::ReadFail,
+        IndexLoadReason::BaseVertexOutOfRange,
     ];
     let mut slugs: Vec<&str> = ALL.iter().map(|r| r.slug()).collect();
     for s in &slugs {

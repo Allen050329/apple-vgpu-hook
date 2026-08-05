@@ -274,6 +274,7 @@ mod tests {
         DrawReason::SwapchainLacksTransferDst,
         DrawReason::SwapchainNoSurfaceFormat,
         DrawReason::SwapchainNoCompositeAlpha,
+        DrawReason::DualSourceBlendUnsupported,
     ];
 
     /// The rule this enum exists to enforce: two checks sharing a slug means a

@@ -623,6 +623,10 @@ mod tests {
         VkOp::WindowSubmitPresent,
         VkOp::WindowQueuePresent,
         VkOp::WindowDestroyQueueWaitIdle,
+        VkOp::WindowCreateStagingImage,
+        VkOp::WindowAllocateStagingMemory,
+        VkOp::WindowBindStagingMemory,
+        VkOp::WindowMapStagingMemory,
     ];
 
     /// Two calls sharing a slug means a grep of the fail log cannot tell which
