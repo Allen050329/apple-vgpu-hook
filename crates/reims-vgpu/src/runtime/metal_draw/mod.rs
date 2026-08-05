@@ -3421,19 +3421,6 @@ fn note_rt_type5_view(
     }
 }
 
-/// Archive `apple_pv_gpu_lookup_render_target`: type-11 first, else type-2/3 GVA.
-///
-/// Wallpaper/background intermediates are type-2/3 guest-VA; type-11-only resolve
-/// drops those passes (black wallpaper). Color RT formats are the Metal color-
-/// renderable set admitted by [`pixel_format::render_target_bpp`] (RGBA8 family,
-/// BGRA8 family, RGBA16Float) — bring-up only listed compositor BGRA8/0x73.
-///
-/// Type-8 texture views (archive `resource_resolve_texture` view chain): resolve
-/// to the base texture. Swizzled views are rejected as RTs (archive
-/// `resolve_texture` requires `!has_swizzle`). Level 0 only for color RT
-/// materialization (mip RT not supported). Without this, UI passes that bind a
-/// type-8 view as color attachment fail MRT (`mrt_request fail slots=[211]`) and
-/// drop entire draws (blank App Store sidebar / missing chrome labels).
 /// Where a colour attachment's `texture_ref` actually resolved to.
 ///
 /// This was six loose positional values — `(u32, u64, u32, u32, u32, u16)` —
@@ -3456,6 +3443,19 @@ pub(crate) struct ResolvedRenderTarget {
     pub(crate) format: u16,
 }
 
+/// Archive `apple_pv_gpu_lookup_render_target`: type-11 first, else type-2/3 GVA.
+///
+/// Wallpaper/background intermediates are type-2/3 guest-VA; type-11-only resolve
+/// drops those passes (black wallpaper). Color RT formats are the Metal color-
+/// renderable set admitted by [`pixel_format::render_target_bpp`] (RGBA8 family,
+/// BGRA8 family, RGBA16Float) — bring-up only listed compositor BGRA8/0x73.
+///
+/// Type-8 texture views (archive `resource_resolve_texture` view chain): resolve
+/// to the base texture. Swizzled views are rejected as RTs (archive
+/// `resolve_texture` requires `!has_swizzle`). Level 0 only for color RT
+/// materialization (mip RT not supported). Without this, UI passes that bind a
+/// type-8 view as color attachment fail MRT (`mrt_request fail slots=[211]`) and
+/// drop entire draws (blank App Store sidebar / missing chrome labels).
 fn lookup_render_target<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &M,
