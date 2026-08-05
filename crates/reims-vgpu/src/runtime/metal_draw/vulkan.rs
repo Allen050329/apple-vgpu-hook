@@ -3226,22 +3226,15 @@ fn note_type11_elision_extent(w: u32, h: u32) {
 /// trace in a census this large will not be found by adding another counter to
 /// these rails; the next instrument has to observe surface *content* across the
 /// transition, not the routes taken to produce it.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the census joins the scissor rect, the target, and how the attachment was loaded"
-)]
 fn note_draw_coverage(
-    x: u32,
-    y: u32,
-    sw: u32,
-    sh: u32,
+    scissor: ScissorRect,
     target_w: u32,
     target_h: u32,
     load_action: Option<u16>,
     seeded: bool,
     from_target: bool,
 ) {
-    let covers = x == 0 && y == 0 && sw >= target_w && sh >= target_h;
+    let covers = scissor.covers(target_w, target_h);
     crate::runtime::drain::note_store_route(if covers {
         "draw_scissor_full"
     } else {
@@ -3250,12 +3243,12 @@ fn note_draw_coverage(
     // Into the union before the early return, and clamped to the target: a
     // full-coverage draw is exactly the case that makes a pass's union total,
     // so leaving it out would measure only the passes that were already cheap.
-    note_pass_scissor_rect(
-        x.min(target_w),
-        y.min(target_h),
-        sw.min(target_w),
-        sh.min(target_h),
-    );
+    note_pass_scissor_rect(ScissorRect {
+        x: scissor.x.min(target_w),
+        y: scissor.y.min(target_h),
+        width: scissor.width.min(target_w),
+        height: scissor.height.min(target_h),
+    });
     if covers || target_w == 0 || target_h == 0 {
         return;
     }
@@ -3320,7 +3313,7 @@ fn note_draw_coverage(
     // arm point rather than at the flush: the fraction a pass drew is known
     // when the window is armed, and asking there needs no state that has to
     // survive until the deferred landing.
-    let area = (sw as u64).saturating_mul(sh as u64);
+    let area = (scissor.width as u64).saturating_mul(scissor.height as u64);
     let full = (target_w as u64).saturating_mul(target_h as u64);
     let pct = area.saturating_mul(100) / full.max(1);
     crate::runtime::drain::note_store_route(DRAW_AREA_SLUGS[coverage_band(pct)]);
@@ -3403,11 +3396,11 @@ static PASS_SCISSOR_UNION: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(u64::MAX);
 
 /// Fold one draw's rect into the union above.
-fn note_pass_scissor_rect(x: u32, y: u32, w: u32, h: u32) {
+fn note_pass_scissor_rect(rect: ScissorRect) {
     use std::sync::atomic::Ordering;
-    let (x0, y0) = (x.min(u16::MAX as u32), y.min(u16::MAX as u32));
-    let x1 = x.saturating_add(w).min(u16::MAX as u32);
-    let y1 = y.saturating_add(h).min(u16::MAX as u32);
+    let (x0, y0) = (rect.x.min(u16::MAX as u32), rect.y.min(u16::MAX as u32));
+    let x1 = rect.x.saturating_add(rect.width).min(u16::MAX as u32);
+    let y1 = rect.y.saturating_add(rect.height).min(u16::MAX as u32);
     let mut cur = PASS_SCISSOR_UNION.load(Ordering::Relaxed);
     loop {
         let next = if cur == u64::MAX {
@@ -4979,12 +4972,9 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     min_depth: vp[4] as f32,
                     max_depth: vp[5] as f32,
                 });
-        if let Some((x, y, sw, sh)) = req.scissor {
+        if let Some(scissor) = req.scissor {
             note_draw_coverage(
-                x,
-                y,
-                sw,
-                sh,
+                scissor,
                 w,
                 h,
                 req.colors.first().map(|c| c.load_action),
@@ -4992,10 +4982,10 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 chain_load_from_target,
             );
             resources.scissor = Some(crate::backend::vulkan::engine::ScissorResource {
-                x,
-                y,
-                width: sw,
-                height: sh,
+                x: scissor.x,
+                y: scissor.y,
+                width: scissor.width,
+                height: scissor.height,
             });
         }
         if let Some(idx) = req.indexed.as_ref() {
@@ -7143,8 +7133,32 @@ mod vulkan_split_tests {
         // Two disjoint quarter-width strips: 20 % each, union 60 % because the
         // bounding box spans them. A "last draw wins" accumulator says 20 %.
         let n = store_route_count("pass_scissor_union_le99");
-        note_draw_coverage(0, 0, 200, 1000, 1000, 1000, None, false, false);
-        note_draw_coverage(400, 0, 200, 1000, 1000, 1000, None, false, false);
+        note_draw_coverage(
+            ScissorRect {
+                x: 0,
+                y: 0,
+                width: 200,
+                height: 1000,
+            },
+            1000,
+            1000,
+            None,
+            false,
+            false,
+        );
+        note_draw_coverage(
+            ScissorRect {
+                x: 400,
+                y: 0,
+                width: 200,
+                height: 1000,
+            },
+            1000,
+            1000,
+            None,
+            false,
+            false,
+        );
         note_pass_scissor_union(1000, 1000);
         assert_eq!(
             store_route_count("pass_scissor_union_le99"),
@@ -7154,7 +7168,19 @@ mod vulkan_split_tests {
 
         // The reset landed: a fresh single 4 % draw reads as 4 %, not 64 %.
         let n = store_route_count("pass_scissor_union_le5");
-        note_draw_coverage(0, 0, 200, 200, 1000, 1000, None, false, false);
+        note_draw_coverage(
+            ScissorRect {
+                x: 0,
+                y: 0,
+                width: 200,
+                height: 200,
+            },
+            1000,
+            1000,
+            None,
+            false,
+            false,
+        );
         note_pass_scissor_union(1000, 1000);
         assert_eq!(
             store_route_count("pass_scissor_union_le5"),
@@ -7165,8 +7191,32 @@ mod vulkan_split_tests {
         // A full-coverage draw takes the per-draw early return but must still
         // reach the union - it is the case that makes a pass unbounded.
         let n = store_route_count("pass_scissor_union_full");
-        note_draw_coverage(0, 0, 40, 40, 1000, 1000, None, false, false);
-        note_draw_coverage(0, 0, 1000, 1000, 1000, 1000, None, false, false);
+        note_draw_coverage(
+            ScissorRect {
+                x: 0,
+                y: 0,
+                width: 40,
+                height: 40,
+            },
+            1000,
+            1000,
+            None,
+            false,
+            false,
+        );
+        note_draw_coverage(
+            ScissorRect {
+                x: 0,
+                y: 0,
+                width: 1000,
+                height: 1000,
+            },
+            1000,
+            1000,
+            None,
+            false,
+            false,
+        );
         note_pass_scissor_union(1000, 1000);
         assert_eq!(
             store_route_count("pass_scissor_union_full"),
@@ -7203,7 +7253,19 @@ mod vulkan_split_tests {
         ];
         for (sw, sh, slug) in cases {
             let before = store_route_count(slug);
-            note_draw_coverage(0, 0, sw, sh, 1000, 1000, None, false, false);
+            note_draw_coverage(
+                ScissorRect {
+                    x: 0,
+                    y: 0,
+                    width: sw,
+                    height: sh,
+                },
+                1000,
+                1000,
+                None,
+                false,
+                false,
+            );
             assert_eq!(
                 store_route_count(slug),
                 before + 1,
@@ -7214,7 +7276,19 @@ mod vulkan_split_tests {
         // The same rect against a target it fully covers is not a partial draw
         // at all, so it takes the `covers` early return and reaches no bucket.
         let before = store_route_count("draw_scissor_area_gt50");
-        note_draw_coverage(0, 0, 800, 800, 800, 800, None, false, false);
+        note_draw_coverage(
+            ScissorRect {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 800,
+            },
+            800,
+            800,
+            None,
+            false,
+            false,
+        );
         assert_eq!(
             store_route_count("draw_scissor_area_gt50"),
             before,
@@ -7222,7 +7296,19 @@ mod vulkan_split_tests {
         );
 
         // A degenerate target must not divide by zero.
-        note_draw_coverage(0, 0, 4, 4, 0, 0, None, false, false);
+        note_draw_coverage(
+            ScissorRect {
+                x: 0,
+                y: 0,
+                width: 4,
+                height: 4,
+            },
+            0,
+            0,
+            None,
+            false,
+            false,
+        );
     }
 
     /// A blank guest read is only a loss if the cache holds pixels to lose.

@@ -445,6 +445,36 @@ pub struct DepthAttachment {
     pub clear_depth: f64,
 }
 
+/// A scissor rectangle in target texels, as `MTLScissorRect` declares one.
+///
+/// A type because the four numbers used to travel as four loose fields here, as
+/// an `Option<(u32, u32, u32, u32)>` through two request structs, and as four
+/// and then six adjacent `u32` parameters into the coverage census — where the
+/// rect sat next to the target extent and every permutation of the six
+/// compiled. `ScissorResource` and `MTLScissorRect` are the two backends' own
+/// ABI shapes and stay; this is the one the decode produces and the device
+/// carries.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ScissorRect {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl ScissorRect {
+    /// Whether this rect reaches every texel of a `target_w` x `target_h`
+    /// attachment. A draw that does could have written anywhere in it, so
+    /// nothing downstream can bound its writes by the scissor.
+    pub fn covers(&self, target_w: u32, target_h: u32) -> bool {
+        self.x == 0 && self.y == 0 && self.width >= target_w && self.height >= target_h
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.width == 0 || self.height == 0
+    }
+}
+
 /// The subresource coordinates and resolve target shared by all three
 /// attachment shapes, lifted so the arms that read them cannot drift apart.
 ///
@@ -567,10 +597,7 @@ pub struct Command {
     /// offset read as unsigned becomes a large index rather than an error.
     pub base_vertex: i64,
     pub viewport: [f64; 6],
-    pub scissor_x: u32,
-    pub scissor_y: u32,
-    pub scissor_w: u32,
-    pub scissor_h: u32,
+    pub scissor: ScissorRect,
     pub fence_ref: u32,
     /// Value of a [`Kind::SetRasterState`], [`Kind::SetStoreAction`] or
     /// [`Kind::SetVisibilityResultMode`] record.
@@ -1207,10 +1234,12 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             let r = wire::set_scissor(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::SetScissor;
             out.count = 1;
-            out.scissor_x = r.x.get() as u32;
-            out.scissor_y = r.y.get() as u32;
-            out.scissor_w = r.width.get() as u32;
-            out.scissor_h = r.height.get() as u32;
+            out.scissor = ScissorRect {
+                x: r.x.get() as u32,
+                y: r.y.get() as u32,
+                width: r.width.get() as u32,
+                height: r.height.get() as u32,
+            };
             Ok(out)
         }
         wire::OPCODE_SET_SCISSOR_RECTS => {
@@ -1225,10 +1254,12 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             let r = rects.first().ok_or(DecodeStatus::ErrShort)?;
             out.kind = Kind::SetScissor;
             out.count = count;
-            out.scissor_x = r.x.get() as u32;
-            out.scissor_y = r.y.get() as u32;
-            out.scissor_w = r.width.get() as u32;
-            out.scissor_h = r.height.get() as u32;
+            out.scissor = ScissorRect {
+                x: r.x.get() as u32,
+                y: r.y.get() as u32,
+                width: r.width.get() as u32,
+                height: r.height.get() as u32,
+            };
             Ok(out)
         }
         wire::OPCODE_SET_BLEND_COLOR => {
@@ -2256,6 +2287,58 @@ mod tests {
             "stencil record is complete at {PASS_COLOR_ATTACH_OFF} bytes"
         );
         assert_eq!(s.clear_stencil, 0xfe);
+    }
+
+    /// Whether a scissor reaches the whole target is one rule, and it had been
+    /// written twice in opposite polarities.
+    ///
+    /// The draw-coverage census asked
+    /// `x == 0 && y == 0 && w >= target_w && h >= target_h`; the partial-store
+    /// path asked `x > 0 || y > 0 || w < width || h < height` and acted on the
+    /// negation. Two spellings of one predicate, in two files, over four
+    /// numbers that travelled loose. Each row below is a case where a term
+    /// dropped from either spelling would change the answer.
+    #[test]
+    fn a_scissor_covers_its_target_only_when_every_term_says_so() {
+        let full = ScissorRect {
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+        };
+        assert!(full.covers(800, 600), "an exact fit covers");
+        assert!(
+            ScissorRect {
+                width: 900,
+                height: 700,
+                ..full
+            }
+            .covers(800, 600),
+            "a scissor larger than the target still covers it"
+        );
+        for (name, rect) in [
+            ("offset x", ScissorRect { x: 1, ..full }),
+            ("offset y", ScissorRect { y: 1, ..full }),
+            ("narrow", ScissorRect { width: 799, ..full }),
+            (
+                "short",
+                ScissorRect {
+                    height: 599,
+                    ..full
+                },
+            ),
+        ] {
+            assert!(
+                !rect.covers(800, 600),
+                "a scissor {name} must not read as covering the target"
+            );
+        }
+
+        // A zero-extent rect draws nothing; the stream decode drops it and
+        // keeps the previous scissor rather than binding an empty one.
+        assert!(!full.is_empty());
+        assert!(ScissorRect { width: 0, ..full }.is_empty());
+        assert!(ScissorRect { height: 0, ..full }.is_empty());
     }
 
     /// All four fields of the prefix decide bindability, and both attachment
@@ -3458,8 +3541,13 @@ mod tests {
         assert_eq!(c.kind, Kind::SetScissor);
         assert_eq!(c.count, 2);
         assert_eq!(
-            (c.scissor_x, c.scissor_y, c.scissor_w, c.scissor_h),
-            (0x11, 0x22, 0x33, 0x44),
+            c.scissor,
+            ScissorRect {
+                x: 0x11,
+                y: 0x22,
+                width: 0x33,
+                height: 0x44
+            },
             "the record was read at the viewport record's count width"
         );
 
@@ -3501,7 +3589,7 @@ mod tests {
         );
         st64(&mut v[OP_HEADER_LEN..], 0x99);
         let c = decode(&v).expect("singular scissor");
-        assert_eq!(c.scissor_x, 0x99);
+        assert_eq!(c.scissor.x, 0x99);
         assert_eq!(c.count, 1);
     }
 

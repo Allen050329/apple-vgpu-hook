@@ -23,8 +23,8 @@ use crate::runtime::decode::fifo::{
 use crate::runtime::decode::render::{
     self, decode_color_attachment, decode_depth_attachment, decode_stencil_attachment,
     depth_stencil_is_bindable, AttachSubresource, ColorAttachment, DepthAttachment,
-    Kind as RenderKind, Stage, StencilAttachment, PASS_LOAD_ACTION_CLEAR, PASS_LOAD_ACTION_LOAD,
-    PASS_MAX_COLOR_ATTACHMENTS, PASS_STORE_ACTION_STORE,
+    Kind as RenderKind, ScissorRect, Stage, StencilAttachment, PASS_LOAD_ACTION_CLEAR,
+    PASS_LOAD_ACTION_LOAD, PASS_MAX_COLOR_ATTACHMENTS, PASS_STORE_ACTION_STORE,
 };
 use crate::runtime::decode::stream::{
     self, decode_first_record, decode_next_record, SEGMENT_TYPE_BLIT, SEGMENT_TYPE_COMPUTE,
@@ -94,7 +94,7 @@ struct PendingDraw {
     vertex_samplers: BindTable<SamplerBind>,
     fragment_samplers: BindTable<SamplerBind>,
     viewport: Option<[f64; 6]>,
-    scissor: Option<(u32, u32, u32, u32)>,
+    scissor: Option<ScissorRect>,
     blend_color: Option<[f32; 4]>,
     cull_mode: Option<u32>,
     front_facing: Option<u32>,
@@ -125,7 +125,7 @@ struct StreamAccum {
     vertex_samplers: BindTable<SamplerBind>,
     fragment_samplers: BindTable<SamplerBind>,
     viewport: Option<[f64; 6]>,
-    scissor: Option<(u32, u32, u32, u32)>,
+    scissor: Option<ScissorRect>,
     indexed: Option<IndexedDrawInfo>,
     blend_color: Option<[f32; 4]>,
     cull_mode: Option<u32>,
@@ -1474,10 +1474,10 @@ fn handle_render_record<M: HostMemory + HostOps>(
         }
         RenderKind::SetScissor => {
             note_extra_state_entries("scissor", cmd.count);
-            if cmd.scissor_w > 0 && cmd.scissor_h > 0 {
-                acc.scissor = Some((cmd.scissor_x, cmd.scissor_y, cmd.scissor_w, cmd.scissor_h));
+            if cmd.scissor.is_empty() {
+                note_empty_scissor(task_id, cmd.scissor);
             } else {
-                note_empty_scissor(task_id, cmd.scissor_w, cmd.scissor_h);
+                acc.scissor = Some(cmd.scissor);
             }
         }
         // No `if cmd.has_blend_color` on these five. Each of the five kinds has
@@ -2115,7 +2115,8 @@ fn note_extra_state_entries(what: &'static str, count: u32) {
 /// handles a degenerate one. What changes is that the substitution is now
 /// visible. Deduped on the pair, because a guest emitting one emits it for a
 /// reason that does not vary per record.
-fn note_empty_scissor(task_id: u32, w: u32, h: u32) {
+fn note_empty_scissor(task_id: u32, rect: ScissorRect) {
+    let (w, h) = (rect.width, rect.height);
     crate::runtime::drain::note_store_route("render_scissor_empty_kept_previous");
     if crate::observe::first_sight("render_scissor_empty", (u64::from(w) << 32) | u64::from(h)) {
         crate::observe::fail(format!(
@@ -5514,7 +5515,12 @@ mod tests {
         handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
         assert_eq!(
             acc.scissor,
-            Some((11, 22, 33, 44)),
+            Some(ScissorRect {
+                x: 11,
+                y: 22,
+                width: 33,
+                height: 44
+            }),
             "the first rect must reach the accumulator"
         );
         assert_eq!(
@@ -5534,7 +5540,15 @@ mod tests {
             st64(&mut command[reims_vgpu_wire::OP_HEADER_LEN + i * 8..], val);
         }
         handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
-        assert_eq!(acc.scissor, Some((1, 2, 3, 4)));
+        assert_eq!(
+            acc.scissor,
+            Some(ScissorRect {
+                x: 1,
+                y: 2,
+                width: 3,
+                height: 4
+            })
+        );
         assert_eq!(store_route_count("render_extra_scissors_dropped"), before);
     }
 
@@ -5802,7 +5816,15 @@ mod tests {
         };
         let (op, command) = scissor(64, 32);
         handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
-        assert_eq!(acc.scissor, Some((7, 9, 64, 32)));
+        assert_eq!(
+            acc.scissor,
+            Some(ScissorRect {
+                x: 7,
+                y: 9,
+                width: 64,
+                height: 32
+            })
+        );
 
         let before = store_route_count("render_scissor_empty_kept_previous");
         let (op, command) = scissor(0, 32);
@@ -5814,7 +5836,12 @@ mod tests {
         );
         assert_eq!(
             acc.scissor,
-            Some((7, 9, 64, 32)),
+            Some(ScissorRect {
+                x: 7,
+                y: 9,
+                width: 64,
+                height: 32
+            }),
             "and behaviour is unchanged: the previous rect is still what is kept"
         );
 

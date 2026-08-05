@@ -18,8 +18,8 @@ use crate::runtime::census::srgb_census;
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 use crate::runtime::decode::render::PASS_STORE_ACTION_DONT_CARE;
 use crate::runtime::decode::render::{
-    DepthAttachment, StencilAttachment, PASS_LOAD_ACTION_CLEAR, PASS_LOAD_ACTION_DONT_CARE,
-    PASS_LOAD_ACTION_LOAD, PASS_STORE_ACTION_STORE,
+    DepthAttachment, ScissorRect, StencilAttachment, PASS_LOAD_ACTION_CLEAR,
+    PASS_LOAD_ACTION_DONT_CARE, PASS_LOAD_ACTION_LOAD, PASS_STORE_ACTION_STORE,
 };
 use crate::runtime::decode::resource::ListObjectEntry;
 #[cfg(feature = "backend-vulkan")]
@@ -362,7 +362,7 @@ pub struct DrawEncodeRequest {
     pub vertex_samplers: Vec<SamplerBind>,
     pub fragment_samplers: Vec<SamplerBind>,
     pub viewport: Option<[f64; 6]>,
-    pub scissor: Option<(u32, u32, u32, u32)>,
+    pub scissor: Option<ScissorRect>,
     pub indexed: Option<IndexedDrawInfo>,
     pub blend_color: Option<[f32; 4]>,
     pub cull_mode: Option<u32>,
@@ -1516,12 +1516,12 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
         .unwrap_or_default();
     let scissors: Vec<ReimsVgpuScissor> = req
         .scissor
-        .map(|(x, y, w, h)| {
+        .map(|r| {
             vec![ReimsVgpuScissor {
-                x,
-                y,
-                width: w,
-                height: h,
+                x: r.x,
+                y: r.y,
+                width: r.width,
+                height: r.height,
             }]
         })
         .unwrap_or_default();
@@ -1876,14 +1876,13 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
         // Type-2/3 GVA keeps archive image_changed via store_seed_policy.
         let load_seed = color_seeds.get(i).and_then(|s| s.as_deref());
         let seed_for_store = store_seed_policy(force_full_store, c.load_action, load_seed);
-        let gva_partial = seed_for_store.is_some()
-            && req
-                .scissor
-                .map(|(x, y, w, h)| x > 0 || y > 0 || w < width || h < height)
-                .unwrap_or(false);
+        // The same coverage question the draw census asks, from the same
+        // helper: a scissor that reaches every texel is not a partial store.
+        let gva_partial =
+            seed_for_store.is_some() && req.scissor.is_some_and(|r| !r.covers(width, height));
         let wrote = if c.mapping_id != 0 {
             if gva_partial {
-                let (sx, sy, sw, sh) = req.scissor.unwrap();
+                let r = req.scissor.expect("gva_partial implies a scissor");
                 write_mapping_rgba8_rect(
                     state,
                     host,
@@ -1893,10 +1892,10 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
                     c.format,
                     out_rgba,
                     mapping_write::Rect {
-                        origin_x: sx,
-                        origin_y: sy,
-                        width: sw,
-                        height: sh,
+                        origin_x: r.x,
+                        origin_y: r.y,
+                        width: r.width,
+                        height: r.height,
                     },
                 )
             } else {
@@ -1913,7 +1912,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
         } else if c.target_gva != 0 {
             let allowed = sync_store_pages.get(i).and_then(|p| p.as_ref());
             if gva_partial {
-                let (sx, sy, sw, sh) = req.scissor.unwrap();
+                let r = req.scissor.expect("gva_partial implies a scissor");
                 write_gva_rgba8_rect(
                     state,
                     host,
@@ -1925,10 +1924,10 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
                     c.format,
                     out_rgba,
                     mapping_write::Rect {
-                        origin_x: sx,
-                        origin_y: sy,
-                        width: sw,
-                        height: sh,
+                        origin_x: r.x,
+                        origin_y: r.y,
+                        width: r.width,
+                        height: r.height,
                     },
                     allowed,
                 )

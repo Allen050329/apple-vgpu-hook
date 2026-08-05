@@ -311,12 +311,12 @@ fn apply_icb_encoder_inheritance<M: HostMemory + HostOps>(
         znear: vp[4],
         zfar: vp[5],
     });
-    if let Some((x, y, w, h)) = req.scissor {
+    if let Some(r) = req.scissor {
         enc.set_scissor_rect(MTLScissorRect {
-            x: x as u64,
-            y: y as u64,
-            width: w as u64,
-            height: h as u64,
+            x: r.x as u64,
+            y: r.y as u64,
+            width: r.width as u64,
+            height: r.height as u64,
         });
     }
     if let Some(c) = req.blend_color {
