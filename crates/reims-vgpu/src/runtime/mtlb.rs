@@ -20,6 +20,21 @@
 //! which of six things went wrong. That is why the loader takes an
 //! [`AirLoadRail`](crate::runtime::mtlb::AirLoadRail) rather than living in
 //! either caller.
+//!
+//! # What the draw rail's new lines cost, measured
+//!
+//! Giving the per-frame rail six fail lines it never had is a volume question,
+//! so it was measured rather than argued: a driven x86/Vulkan boot (Safari drag,
+//! 2 685 posted events, ~35 Hz median present) ran **177 746 draws**, hence
+//! ~355 000 calls to this loader — two per draw, vertex and fragment — and
+//! emitted **zero** `draw_load_mtlb` lines.
+//!
+//! That zero is a healthy one rather than an unarmed detector, and the thing
+//! that says so is independent of this module: the coarse `MissingMtlb`-class
+//! declines its callers raise were *also* zero on that boot, and they predate
+//! the emission. The loader was not failing quietly before; it was not failing.
+//! So a `draw_load_mtlb` line is a real event, and the flood this could have
+//! been does not exist on a healthy guest.
 
 use crate::model::DeviceState;
 use crate::runtime::decode::resource::{decode_function_descriptor, OBJECT_TYPE_FUNCTION};

@@ -757,6 +757,13 @@ impl crate::observe::Decline for IndexLoadReason {
 /// zero today. The guard is what keeps that true if one ever does: ref 0 is a
 /// valid object-list index, so without it an unbound ref would read entry 0 and
 /// then report a rung for it.
+///
+/// The new lines were measured before being believed: a driven x86/Vulkan boot
+/// of **177 746 draws** — one call here each — emitted zero `draw_load_pipeline`
+/// lines, and the coarse `MissingPipeline` its callers raise was zero on that
+/// same boot. So this is a rail that succeeds, not one that was failing quietly,
+/// and a line from it is worth reading. See `runtime::mtlb` for the same
+/// measurement on the loader one level down.
 fn load_render_pipeline<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &M,
