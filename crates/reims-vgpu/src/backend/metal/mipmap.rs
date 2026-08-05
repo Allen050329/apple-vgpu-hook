@@ -124,14 +124,6 @@ pub fn filterable_format(format: u16) -> Option<(MTLPixelFormat, u32)> {
     }
 }
 
-/// Metal's standard 2D mip dimension for `base` at `level` (floor divide by 2 each step).
-pub fn metal_mip_extent(base: u32, level: u32) -> u32 {
-    if base == 0 {
-        return 0;
-    }
-    (base >> level).max(1)
-}
-
 /// Upload L0, run Metal-filtered mip generation, return levels `[0..levels)`.
 ///
 /// `level0` must be tightly packed native rows (`width * bpp` per row). `levels`
@@ -211,8 +203,8 @@ pub fn generate_mipmaps_filtered(
 
     let mut out = Vec::with_capacity(levels as usize);
     for level in 0..levels {
-        let w = metal_mip_extent(width, level);
-        let h = metal_mip_extent(height, level);
+        let w = crate::contract::extent::mip_extent(width, level);
+        let h = crate::contract::extent::mip_extent(height, level);
         // Both factors are u32, so their product always fits in u64.
         let bpr = (w as u64) * (bpp as u64);
         let need = bpr
@@ -253,16 +245,6 @@ mod tests {
         assert!(filterable_format(pixel_format::MTL_FORMAT_BGRA8_UNORM).is_some());
         assert!(filterable_format(pixel_format::MTL_FORMAT_RGBA8_UINT).is_none());
         assert!(filterable_format(pixel_format::MTL_FORMAT_RGBA16_UINT).is_none());
-    }
-
-    #[test]
-    fn metal_mip_extent_chain() {
-        assert_eq!(metal_mip_extent(8, 0), 8);
-        assert_eq!(metal_mip_extent(8, 1), 4);
-        assert_eq!(metal_mip_extent(8, 3), 1);
-        assert_eq!(metal_mip_extent(5, 1), 2);
-        assert_eq!(metal_mip_extent(5, 2), 1);
-        assert_eq!(metal_mip_extent(3, 1), 1);
     }
 
     #[test]

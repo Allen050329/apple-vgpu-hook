@@ -202,8 +202,8 @@ fn resolve_multi_mip_texture<M: HostMemory + HostOps>(
     let l0 = tex.levels[0];
     for level in 0..levels {
         let layout = &tex.levels[level];
-        let exp_w = metal_mip_extent_local(l0.width, level as u32);
-        let exp_h = metal_mip_extent_local(l0.height, level as u32);
+        let exp_w = crate::contract::extent::mip_extent(l0.width, level as u32);
+        let exp_h = crate::contract::extent::mip_extent(l0.height, level as u32);
         if layout.width != exp_w
             || layout.height != exp_h
             || layout.width == 0
@@ -213,21 +213,6 @@ fn resolve_multi_mip_texture<M: HostMemory + HostOps>(
         }
     }
     Ok(ResolvedTexture { tex, levels, fmt })
-}
-
-fn metal_mip_extent_local(base: u32, level: u32) -> u32 {
-    #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-    {
-        metal_mip::metal_mip_extent(base, level)
-    }
-    #[cfg(feature = "backend-vulkan")]
-    {
-        if base == 0 {
-            0
-        } else {
-            (base >> level).max(1)
-        }
-    }
 }
 
 /// Load one level as tightly packed native-format bytes.
@@ -411,8 +396,8 @@ fn generate_via_box_filter(
     let mut prev_w = width;
     let mut prev_h = height;
     for level in 1..levels {
-        let dw = metal_mip_extent_local(width, level as u32);
-        let dh = metal_mip_extent_local(height, level as u32);
+        let dw = crate::contract::extent::mip_extent(width, level as u32);
+        let dh = crate::contract::extent::mip_extent(height, level as u32);
         let Some(next_rgba) = downsample_rgba8_box(&prev, prev_w, prev_h, dw, dh) else {
             return Err(MipmapStatus::IncompleteLayout);
         };
@@ -623,39 +608,5 @@ mod tests {
         assert_eq!(chain[2].0, 1);
         assert_eq!(chain[2].1, 1);
         assert_eq!(chain[2].2, vec![100, 150, 200, 255]);
-    }
-
-    /// Regression guard for `metal_mip_extent_local` (the Vulkan-build mip
-    /// sizing formula). This computes each level's expected dimension and the
-    /// resolver rejects any layout whose stored extent disagrees, so a wrong
-    /// formula either falsely rejects valid mip chains (IncompleteLayout) or
-    /// accepts a mismatched layout that then samples out of bounds. Lock the
-    /// Metal contract `max(1, base >> level)` with the base==0 degenerate case.
-    #[test]
-    fn metal_mip_extent_local_halves_and_floors_at_one() {
-        // Degenerate base stays zero (an empty axis has no levels).
-        assert_eq!(metal_mip_extent_local(0, 0), 0);
-        assert_eq!(metal_mip_extent_local(0, 3), 0);
-
-        // Power-of-two base halves each level and floors at 1, never 0.
-        assert_eq!(metal_mip_extent_local(8, 0), 8);
-        assert_eq!(metal_mip_extent_local(8, 1), 4);
-        assert_eq!(metal_mip_extent_local(8, 2), 2);
-        assert_eq!(metal_mip_extent_local(8, 3), 1);
-        assert_eq!(
-            metal_mip_extent_local(8, 4),
-            1,
-            "past the last level clamps to 1"
-        );
-        assert_eq!(
-            metal_mip_extent_local(8, 20),
-            1,
-            "huge level never underflows to 0"
-        );
-
-        // Non-power-of-two base uses integer right-shift (floor), matching Metal.
-        assert_eq!(metal_mip_extent_local(100, 1), 50);
-        assert_eq!(metal_mip_extent_local(100, 2), 25);
-        assert_eq!(metal_mip_extent_local(100, 3), 12);
     }
 }
