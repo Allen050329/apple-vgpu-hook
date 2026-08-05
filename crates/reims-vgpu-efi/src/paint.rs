@@ -208,7 +208,7 @@ impl BltRect {
     /// read — and the last index it computes is `(y + h - 1) * row_px +
     /// (x + w - 1)`, which is exactly the arithmetic a copy gets subtly wrong.
     #[inline]
-    fn buffer_pixels_needed(&self, buffer_x: usize, buffer_y: usize, row_px: usize) -> usize {
+    pub fn buffer_pixels_needed(&self, buffer_x: usize, buffer_y: usize, row_px: usize) -> usize {
         buffer_y
             .saturating_add(self.height.saturating_sub(1))
             .saturating_mul(row_px)
@@ -220,6 +220,31 @@ impl BltRect {
 ///
 /// `delta` is bytes per BltBuffer row (0 ⇒ `width * sizeof(BltPixel)`), used for
 /// VideoToBltBuffer and BltBufferToVideo only (UEFI Spec).
+/// The BltBuffer's row pitch in pixels, or `None` if `delta` cannot describe a
+/// row this wide.
+///
+/// UEFI states `Delta` in *bytes* and gives `0` the meaning "rows are exactly
+/// `Width` pixels", so three refusals live in one conversion: a delta that is
+/// not a whole number of pixels, a delta that describes a row narrower than the
+/// rectangle being copied, and — through the `width == 0` its callers check
+/// first — a pitch of zero.
+///
+/// It is a free function rather than a method because `gop::gop_blt` needs the
+/// same answer *before* it has a rectangle: it sizes the `BltBuffer` slice from
+/// the pitch, and it used to reach that number with its own copy of this
+/// conversion that omitted the `rp < width` refusal and papered over the
+/// zero-pitch case with a `.max(1)`.
+pub fn row_pitch_pixels(delta: usize, width: usize) -> Option<usize> {
+    if delta == 0 {
+        return Some(width);
+    }
+    if !delta.is_multiple_of(size_of::<BltPixel>()) {
+        return None;
+    }
+    let row_px = delta / size_of::<BltPixel>();
+    (row_px >= width).then_some(row_px)
+}
+
 // The parameter run mirrors `EFI_GRAPHICS_OUTPUT_PROTOCOL.Blt` — same names,
 // same order, `fb` where the protocol passes `This` — so that `gop_blt` can
 // forward its arguments without reordering them. Collapsing them into
@@ -246,17 +271,8 @@ pub fn blt(
         return GopStatus::DeviceError;
     }
 
-    let row_px = if delta == 0 {
-        width
-    } else {
-        if !delta.is_multiple_of(size_of::<BltPixel>()) {
-            return GopStatus::InvalidParameter;
-        }
-        let rp = delta / size_of::<BltPixel>();
-        if rp < width {
-            return GopStatus::InvalidParameter;
-        }
-        rp
+    let Some(row_px) = row_pitch_pixels(delta, width) else {
+        return GopStatus::InvalidParameter;
     };
 
     let rect = BltRect {
@@ -654,6 +670,36 @@ mod tests {
             assert_eq!(code & EFI_ERROR, EFI_ERROR, "{status:?} is not an error");
             assert_eq!(code & !EFI_ERROR, ordinal, "{status:?} ordinal");
         }
+    }
+
+    /// The three refusals in the pitch conversion, and the `delta == 0` default.
+    ///
+    /// `gop::gop_blt` reads this same function to size the `BltBuffer` slice it
+    /// builds from a raw firmware pointer, so a divergence here would be a
+    /// slice length disagreeing with the check that guards it.
+    #[test]
+    fn a_row_pitch_is_whole_pixels_and_at_least_the_rect() {
+        assert_eq!(row_pitch_pixels(0, 64), Some(64), "delta 0 means width");
+        assert_eq!(
+            row_pitch_pixels(64 * size_of::<BltPixel>(), 64),
+            Some(64),
+            "an exact fit is a fit"
+        );
+        assert_eq!(
+            row_pitch_pixels(80 * size_of::<BltPixel>(), 64),
+            Some(80),
+            "a wider pitch than the rect is what delta is for"
+        );
+        assert_eq!(
+            row_pitch_pixels(size_of::<BltPixel>() + 1, 1),
+            None,
+            "a delta that is not whole pixels describes no row"
+        );
+        assert_eq!(
+            row_pitch_pixels(32 * size_of::<BltPixel>(), 64),
+            None,
+            "a pitch narrower than the rect cannot hold one of its rows"
+        );
     }
 
     #[test]
