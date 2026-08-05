@@ -4348,11 +4348,13 @@ fn a_scissored_gva_store_is_bounded_on_both_its_rails() {
                 BPR,
                 fmt,
                 &rgba,
-                x,
-                y,
-                rw,
-                rh,
-                Some(&armed),
+                mapping_write::Rect {
+                    origin_x: x,
+                    origin_y: y,
+                    width: rw,
+                    height: rh
+                },
+                Some(&armed)
             ),
             "packed={packed}: a page the command never named must be refused"
         );
@@ -4379,11 +4381,13 @@ fn a_scissored_gva_store_is_bounded_on_both_its_rails() {
                 BPR,
                 fmt,
                 &rgba,
-                x,
-                y,
-                rw,
-                rh,
-                None,
+                mapping_write::Rect {
+                    origin_x: x,
+                    origin_y: y,
+                    width: rw,
+                    height: rh
+                },
+                None
             ),
             "packed={packed}: without the bound the same write succeeds"
         );

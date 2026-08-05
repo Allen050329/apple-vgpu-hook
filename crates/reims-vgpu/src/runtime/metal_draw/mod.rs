@@ -1993,10 +1993,12 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
                     height,
                     c.format,
                     out_rgba,
-                    sx,
-                    sy,
-                    sw,
-                    sh,
+                    mapping_write::Rect {
+                        origin_x: sx,
+                        origin_y: sy,
+                        width: sw,
+                        height: sh,
+                    },
                 )
             } else {
                 mapping_write::write_rgba8_image_changed(
@@ -2023,10 +2025,12 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
                     c.row_stride,
                     c.format,
                     out_rgba,
-                    sx,
-                    sy,
-                    sw,
-                    sh,
+                    mapping_write::Rect {
+                        origin_x: sx,
+                        origin_y: sy,
+                        width: sw,
+                        height: sh,
+                    },
                     allowed,
                 )
             } else {
@@ -4116,7 +4120,7 @@ pub(crate) fn write_gva_rgba8_within<M: HostMemory + HostOps>(
 )]
 #[allow(
     clippy::too_many_arguments,
-    reason = "the archive writer mirrors the target GVA, native row geometry and the scissor rect"
+    reason = "the archive writer mirrors the target GVA and its native row geometry"
 )]
 pub(crate) fn write_gva_rgba8_rect<M: HostMemory + HostOps>(
     state: &mut DeviceState,
@@ -4128,12 +4132,15 @@ pub(crate) fn write_gva_rgba8_rect<M: HostMemory + HostOps>(
     bpr: u32,
     format: u16,
     rgba: &[u8],
-    origin_x: u32,
-    origin_y: u32,
-    rect_w: u32,
-    rect_h: u32,
+    rect: mapping_write::Rect,
     allowed: crate::runtime::gva_view::WindowPages<'_>,
 ) -> bool {
+    let mapping_write::Rect {
+        origin_x,
+        origin_y,
+        width: rect_w,
+        height: rect_h,
+    } = rect;
     if gva == 0
         || full_w == 0
         || full_h == 0
@@ -4235,9 +4242,15 @@ pub(crate) fn write_gva_rgba8_rect<M: HostMemory + HostOps>(
 
 /// Store scissor rect of tight RGBA8 into a type-11 mapping (BGRA host → guest fmt).
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-// Source geometry, destination geometry and the scissor rect, which are three
-// independent rectangles; collapsing them into one struct would invite exactly
-// the mix-up the separate names prevent.
+// Source geometry, destination geometry and the scissor rect are three
+// independent rectangles and stay three: collapsing them into one struct would
+// invite exactly the mix-up the separate names prevent.
+//
+// Giving the scissor one a `Rect` serves that same argument rather than
+// undoing it. Its four fields used to sit adjacent to `full_w`/`full_h` as six
+// interchangeable `u32`s, so the mix-up the comment warns about was writable at
+// every call; now the scissor rectangle is the one thing here with a type, and
+// the destination extent is what remains loose beside it.
 #[allow(clippy::too_many_arguments)]
 fn write_mapping_rgba8_rect<M: HostMemory + HostOps>(
     state: &mut DeviceState,
@@ -4247,11 +4260,14 @@ fn write_mapping_rgba8_rect<M: HostMemory + HostOps>(
     full_h: u32,
     format: u16,
     rgba: &[u8],
-    origin_x: u32,
-    origin_y: u32,
-    rect_w: u32,
-    rect_h: u32,
+    rect: mapping_write::Rect,
 ) -> bool {
+    let mapping_write::Rect {
+        origin_x,
+        origin_y,
+        width: rect_w,
+        height: rect_h,
+    } = rect;
     if origin_x.saturating_add(rect_w) > full_w || origin_y.saturating_add(rect_h) > full_h {
         return false;
     }
