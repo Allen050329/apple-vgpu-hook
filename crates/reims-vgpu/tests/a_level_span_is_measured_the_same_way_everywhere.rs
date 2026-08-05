@@ -43,14 +43,19 @@ use std::path::Path;
 /// and then argued, which is the only way one should.
 ///
 /// **Keyed by function, not by file, and that is load-bearing.** The first draft
-/// of this list keyed on the file alone. `runtime/metal_draw/mod.rs` holds both
-/// an exempt writer *and* the reader this whole test was written for, so the
-/// file-wide exemption covered the bug: restoring `bpr * h` at the reader left
-/// the test green. It was caught only by putting the bug back and watching for
-/// red, which is the one step that separates a gate from a decoration.
+/// of this list keyed on the file alone. `runtime/metal_draw/mod.rs` then held
+/// both an exempt writer *and* the reader this whole test was written for, so
+/// the file-wide exemption covered the bug: restoring `bpr * h` at the reader
+/// left the test green. It was caught only by putting the bug back and watching
+/// for red, which is the one step that separates a gate from a decoration.
+///
+/// The writer has since moved to `render_target.rs`, so today the two are not
+/// even in the same file — which is exactly why the key must not be one. A move
+/// is not an argument, and the next pair to share a file will not announce
+/// itself.
 const WIDE_SPAN_EXEMPTIONS: &[(&str, &str, &str)] = &[
     (
-        "runtime/metal_draw/mod.rs",
+        "runtime/metal_draw/render_target.rs",
         "lookup_render_target",
         "its mip>0 arm bounds a render-target WRITE; whether the store writes \
          the last row's padding is unmeasured, and the wider span is the \
