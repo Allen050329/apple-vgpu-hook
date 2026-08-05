@@ -5,6 +5,7 @@ use crate::backend::metal::abi::{
 };
 use crate::backend::metal::constants::*;
 use crate::backend::metal::hash::hash_u64;
+use crate::contract::fnv::FNV_OFFSET_BASIS;
 use crate::runtime::decode::resource::MTL_COLOR_WRITE_MASK_ALL;
 use metal::{ComputePipelineState, DepthStencilState, Function, RenderPipelineState, SamplerState};
 use parking_lot::Mutex;
@@ -270,7 +271,7 @@ impl SamplerDescriptorKey {
         ];
         let hash = words
             .iter()
-            .fold(0xcbf2_9ce4_8422_2325u64, |h, &w| hash_u64(h, w as u64));
+            .fold(FNV_OFFSET_BASIS, |h, &w| hash_u64(h, w as u64));
         Self { hash, words }
     }
 }

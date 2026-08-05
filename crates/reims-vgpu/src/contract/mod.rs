@@ -8,6 +8,7 @@ pub mod dispatch;
 pub mod draw;
 pub mod endian;
 pub mod extent;
+pub mod fnv;
 pub mod gva;
 pub mod gva_resolve;
 pub mod iosurface_pages;

@@ -8,7 +8,7 @@ use crate::backend::metal::cache::{
 use crate::backend::metal::constants::*;
 use crate::backend::metal::format::{mtl_pixel_format_bpp, pixel_format_from_u32};
 use crate::backend::metal::function::load_only_function;
-use crate::backend::metal::hash::{hash_bytes, hash_u64, FNV_OFFSET_BASIS};
+use crate::backend::metal::hash::{hash_bytes, hash_u64};
 use crate::backend::metal::mtl_enum;
 use crate::backend::metal::raw_metal::{
     command_buffer_error_description, render_reflection_sampler_mask,
@@ -19,6 +19,7 @@ use crate::backend::metal::util::{
     bytes_of, clear_err, f32_from_bits, image_len, rgba_len, sampler_index, set_err, texture_index,
     valid_buffer_binding, ErrOut, Status,
 };
+use crate::contract::fnv::FNV_OFFSET_BASIS;
 use foreign_types::ForeignType;
 use metal::*;
 use std::ptr;

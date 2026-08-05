@@ -36,6 +36,7 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 
 use crate::backend::vulkan::engine::GuestDmaBuf;
+use crate::contract::fnv;
 use crate::runtime::host::{DmaBufExportError, HostOps};
 
 /// Most guest memory this device will hold pinned through dma-bufs at once.
@@ -151,17 +152,11 @@ fn is_permanent(error: DmaBufExportError) -> bool {
 /// dma-buf for another's pages, so the full list is compared on hit rather than
 /// trusting the digest — the digest only narrows the search.
 fn digest(gpas: &[u64], page_size: u32) -> u64 {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    let mut mix = |value: u64| {
-        for byte in value.to_le_bytes() {
-            hash ^= u64::from(byte);
-            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-    };
-    mix(u64::from(page_size));
-    mix(gpas.len() as u64);
+    let mut hash = fnv::FNV_OFFSET_BASIS;
+    hash = fnv::fold_u64(hash, u64::from(page_size));
+    hash = fnv::fold_u64(hash, gpas.len() as u64);
     for gpa in gpas {
-        mix(*gpa);
+        hash = fnv::fold_u64(hash, *gpa);
     }
     hash
 }

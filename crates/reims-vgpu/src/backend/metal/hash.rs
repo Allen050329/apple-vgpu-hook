@@ -1,4 +1,9 @@
-//! FNV-1a style content hash, used to key the pipeline and shader caches.
+//! The two content hashes this backend's caches key on.
+//!
+//! Both are built from the FNV-1a parameters in [`crate::contract::fnv`], which
+//! is where the constants live so that the runtime's own FNV callers — behind
+//! no feature gate, and therefore unable to see anything in this module — can
+//! name them instead of writing them out.
 //!
 //! # What constrains these numbers
 //!
@@ -14,35 +19,28 @@
 //! obligation than an ABI, and worth stating plainly rather than leaving a
 //! reader to infer an external contract that is not there.
 
-/// FNV-1a's 64-bit offset basis, and the value every fold here starts from.
-///
-/// Named because it was written at three sites in **two different bases** —
-/// twice in decimal in this file and once as `0xcbf29ce484222325` seeding the
-/// render pipeline key in [`super::render`] — and no grep finds the two
-/// spellings together. They are equal today; this name is what keeps them
-/// equal, since a hash whose two seeds diverge does not fail loudly, it just
-/// stops sharing cache entries.
-pub const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
-
-/// FNV-1a's 64-bit prime.
-pub const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+use crate::contract::fnv::{fold_bytes, FNV_OFFSET_BASIS, FNV_PRIME};
 
 /// Fold `data` into a 64-bit content hash.
 ///
 /// The trailing length mix is not stock FNV-1a: it makes a run of zero bytes
 /// hash differently from a shorter one, which matters because these keys are
-/// compared against shader blobs that can share a prefix.
+/// compared against shader blobs that can share a prefix. That extra step is
+/// why this stays here rather than joining [`fold_bytes`] in `contract` — a
+/// caller that reached for the shared fold and got this one would silently
+/// produce keys from a different keyspace.
 pub fn hash_bytes(data: &[u8]) -> u64 {
-    let mut h: u64 = FNV_OFFSET_BASIS;
-    for &b in data {
-        h ^= u64::from(b);
-        h = h.wrapping_mul(FNV_PRIME);
-    }
-    h ^= data.len() as u64;
-    h = h.wrapping_mul(FNV_PRIME);
-    h
+    let h = fold_bytes(FNV_OFFSET_BASIS, data);
+    (h ^ data.len() as u64).wrapping_mul(FNV_PRIME)
 }
 
+/// Fold one `u64` into a running hash.
+///
+/// Not FNV-1a despite the basis its callers seed it with: this is the
+/// golden-ratio mix, which combines a whole word per step where FNV-1a takes
+/// eight. Cache keys here are built from dozens of small integer fields, so the
+/// per-word form is the one they want; the shared basis only means the two
+/// hashes in this module start from the same place.
 pub fn hash_u64(mut h: u64, v: u64) -> u64 {
     h ^= v
         .wrapping_add(0x9e3779b97f4a7c15)
@@ -68,15 +66,6 @@ mod tests {
     #[test]
     fn the_empty_input_hashes_to_fnv1a_of_one_zero_byte() {
         assert_eq!(hash_bytes(b""), 0xaf63_bd4c_8601_b7df);
-    }
-
-    /// The two constants are the published FNV-1a ones, whichever base a site
-    /// happens to spell them in. Cheap, and it is what makes the literal above
-    /// a pin on the algorithm rather than on this implementation of it.
-    #[test]
-    fn the_constants_are_the_published_fnv1a_pair() {
-        assert_eq!(FNV_OFFSET_BASIS, 14695981039346656037);
-        assert_eq!(FNV_PRIME, 1099511628211);
     }
 
     #[test]

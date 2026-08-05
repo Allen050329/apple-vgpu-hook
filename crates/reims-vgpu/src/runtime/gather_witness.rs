@@ -93,6 +93,8 @@
 
 use std::collections::BTreeMap;
 
+use crate::contract::fnv;
+
 /// Which zero-copy sampled producer built the window.
 ///
 /// The 2x2 below says whether the witness is sound; this says whose gathers it
@@ -146,14 +148,10 @@ impl GatherKey {
     /// *stable* for one window, so that a window's own binds find each other.
     pub fn content_key(self) -> u64 {
         // FNV-1a over the discriminant and fields. A hash rather than a packing
-        // because both shapes carry more than 64 bits.
-        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-        let mut eat = |v: u64| {
-            for b in v.to_le_bytes() {
-                h ^= b as u64;
-                h = h.wrapping_mul(0x100_0000_01b3);
-            }
-        };
+        // because both shapes carry more than 64 bits. The discriminant is
+        // folded first so the two shapes cannot alias each other.
+        let mut h = fnv::FNV_OFFSET_BASIS;
+        let mut eat = |v: u64| h = fnv::fold_u64(h, v);
         match self {
             Self::TaskGva { task_id, gva } => {
                 eat(1);
