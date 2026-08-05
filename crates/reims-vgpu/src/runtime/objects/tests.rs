@@ -1,0 +1,1370 @@
+use reims_vgpu_wire::device_desc::Type4Builder;
+
+use super::*;
+use crate::contract::endian::{ld32, st16, st32, st64};
+use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+use crate::contract::iosurface_pages::DEVICE_DESC_PLANE_COUNT;
+use crate::model::{DeviceId, PAGE_SHIFT_ARM64E, PAGE_SHIFT_X86};
+use crate::runtime::host::FakeHost;
+
+#[test]
+fn type11_fail_latch_dedups_per_task_ref_and_rearms_on_clear() {
+    // Flood guard for the per-draw-per-ref resolve path: a genuinely-broken
+    // type-11 ref logs each reason once, isolates per (task,ref), and
+    // re-arms on resolve. Unique ids so this never races real refs across
+    // the process-global latch.
+    let (t, r, r2) = (0xAB01u32, 0xCD01u32, 0xCD02u32);
+    clear_type11_fail(t, r);
+    clear_type11_fail(t, r2);
+    let seen = |task: u32, rf: u32, reason: &'static str| {
+        type11_fail_latch()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&(task, rf, reason))
+    };
+    note_type11_fail(t, r, "type11_register", "x".into());
+    assert!(seen(t, r, "type11_register"));
+    // Distinct reason on the same ref tracked independently.
+    note_type11_fail(t, r, "type11_desc_read", "x".into());
+    assert!(seen(t, r, "type11_desc_read"));
+    // A different ref is untouched.
+    assert!(!seen(t, r2, "type11_register"));
+    note_type11_fail(t, r2, "type11_register", "x".into());
+    // Clearing r re-arms only r, leaves r2.
+    clear_type11_fail(t, r);
+    assert!(!seen(t, r, "type11_register"));
+    assert!(!seen(t, r, "type11_desc_read"));
+    assert!(seen(t, r2, "type11_register"));
+    clear_type11_fail(t, r2);
+}
+
+fn setup_task_with_list(host: &mut FakeHost, state: &mut DeviceState) {
+    // Same 1-level map as gva_mem test: GVA page 0 → data pfn 4.
+    let dir_gpa = 2u64 << PAGE_SHIFT_ARM64E;
+    let root_gpa = 3u64 << PAGE_SHIFT_ARM64E;
+    let data_gpa = 4u64 << PAGE_SHIFT_ARM64E;
+    host.map_range(dir_gpa, 0x20, 0);
+    host.map_range(root_gpa, 0x4000, 0);
+    host.map_range(data_gpa, 0x200, 0);
+    let mut d = [0u8; 8];
+    st32(&mut d[DIRECTORY_ROOT_PFN as usize..], 3);
+    st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
+    let _ = host.write_gpa(dir_gpa, &d);
+    st32(&mut d[..4], 4);
+    let _ = host.write_gpa(root_gpa, &d[..4]);
+
+    assert!(state.define_task(1, 0x1000, 2));
+    // list base GVA 0 (pfn field 0 allowed)
+    assert!(state.set_object_list(1, 0, 8));
+    let mut entry = [0u8; 12];
+    st32(&mut entry[0..], 11u32 | (0x20u32 << 8));
+    entry[4..12].copy_from_slice(&0x40u64.to_le_bytes());
+    let _ = host.write_gpa(data_gpa + 12, &entry);
+    let mut desc = [0u8; 0x20];
+    st32(&mut desc[0..], 9);
+    st16(&mut desc[0x16..], 0x50);
+    st32(&mut desc[0x18..], 64);
+    st32(&mut desc[0x1c..], 32);
+    let _ = host.write_gpa(data_gpa + 0x40, &desc);
+}
+
+#[test]
+fn resolve_type11_from_list() {
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task_with_list(&mut host, &mut state);
+    // Sanity: list entry readable
+    let e = lookup_list_entry(&state, &host, 1, 1).expect("list entry");
+    assert_eq!(e.object_type, 11);
+    assert_eq!(e.descriptor_gva, 0x40);
+    let mid = resolve_type11_ref(&mut state, &host, 1, 1).expect("type11");
+    assert_eq!(mid, 9);
+    let m = state.mappings.get(&9).unwrap();
+    assert!(m.has_geom);
+    assert_eq!((m.width, m.height, m.format), (64, 32, 0x50));
+}
+
+/// The type-4 decoder says so when it drops what the guest declared.
+///
+/// All three of these bounds are correct — IOSurface caps `getPlaneCount`
+/// at eight, a plane record the blob does not reach cannot be decoded, and
+/// the device descriptor's `allocSize` really is 32 bits. What was wrong is
+/// that each one applied in silence, so a surface whose ninth plane this
+/// device will never look at, or whose size it cannot express, reached every
+/// later reader as a surface that simply had eight planes and that size.
+/// Never Fail Silently: a bound the guest crossed is a bound worth naming.
+#[test]
+fn the_type4_decoder_reports_what_it_drops() {
+    // `desc` reaches only plane 0's record, so planes 1..=7 are declared
+    // and unreachable, and plane 8+ is over the cap.
+    let built = Type4Builder::new(0x1000, 0x100, 0x4247_5241, 12).with_len(0x24); // 'BGRA'
+    let desc = built.bytes();
+
+    reset_type4_decode_drops();
+    let cap = crate::observe::FailCapture::start();
+    let s = decode_type4_surface(desc).expect("type4 decodes");
+    assert_eq!(s.plane_count, TYPE4_PLANE_CAP as u8, "still clamped");
+    // Two distinct drops on this descriptor, so select by reason rather
+    // than by slug: the surplus planes over the cap, and — separately —
+    // the declared planes whose records the blob does not reach.
+    let over = cap
+        .lines()
+        .into_iter()
+        .find(|l| l.contains("reason=plane_count_over_cap"))
+        .expect("an over-cap plane count must be reported");
+    assert!(
+        over.contains("declared=12") && over.contains("cap=8"),
+        "the line must name what the guest asked for and what it got: {over}"
+    );
+
+    // Same reason twice is one line — the latch is what keeps a per-surface
+    // stream from flooding the always-on channel.
+    let cap2 = crate::observe::FailCapture::start();
+    let _ = decode_type4_surface(desc);
+    assert!(
+        cap2.lines()
+            .iter()
+            .all(|l| !l.contains("reason=plane_count_over_cap")),
+        "a repeat must not spend a second line: {:?}",
+        cap2.lines()
+    );
+
+    // A declared plane whose record the blob does not reach.
+    reset_type4_decode_drops();
+    let cap3 = crate::observe::FailCapture::start();
+    let _ = decode_type4_surface(desc);
+    let short = cap3
+        .lines()
+        .into_iter()
+        .find(|l| l.contains("reason=plane_record_short"))
+        .expect("an unreachable plane record must be reported");
+    assert!(short.contains("plane=1"), "{short}");
+
+    // A surface larger than the 32-bit `allocSize` field can express.
+    reset_type4_decode_drops();
+    let big =
+        Type4Builder::new((u32::MAX as u64) + 1, 0x100, 0x4247_5241, 1).plane(0, 0, 64, 32, 256, 0);
+    let surf = decode_type4_surface(big.bytes()).expect("type4 decodes");
+    let cap4 = crate::observe::FailCapture::start();
+    let _ = synthesize_device_desc_from_type4(&surf);
+    let sat = cap4
+        .lines()
+        .into_iter()
+        .find(|l| l.contains("reason=alloc_size_over_u32"))
+        .expect("a length the 32-bit allocSize cannot hold must be reported");
+    assert!(sat.contains("length=4294967296"), "{sat}");
+}
+
+#[test]
+fn decode_type4_plane0() {
+    let mut desc = vec![0u8; 0x30];
+    st64(&mut desc[0..], 0x1000);
+    st32(&mut desc[8..], 0x100); // backing pfn
+    st32(&mut desc[0xc..], 0x4247_5241); // 'BGRA'
+    desc[0x10] = 1;
+    st32(&mut desc[0x14..], 0); // plane offset
+    st32(&mut desc[0x18..], 64);
+    st32(&mut desc[0x1c..], 32);
+    st32(&mut desc[0x20..], 256); // bpr
+    let s = decode_type4_surface(&desc).expect("type4");
+    assert_eq!(s.length, 0x1000);
+    assert_eq!(s.backing_pfn, 0x100);
+    assert_eq!((s.width, s.height, s.bytes_per_row), (64, 32, 256));
+    assert_eq!(s.plane_count, 1);
+    assert_eq!(s.planes[0].offset, 0);
+    assert!(!type4_is_multiplanar(&s));
+    assert_eq!(
+        iosurface_pixel_format_to_mtl(s.pixel_format),
+        crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM
+    );
+}
+
+#[test]
+fn fourcc_420f_not_bgra_and_multiplanar() {
+    assert_eq!(iosurface_pixel_format_to_mtl(IOSURFACE_FOURCC_420F), 0);
+    assert_eq!(iosurface_pixel_format_to_mtl(IOSURFACE_FOURCC_420V), 0);
+    assert!(iosurface_fourcc_is_biplanar(IOSURFACE_FOURCC_420F));
+    // Unknown FourCC must not invent BGRA.
+    assert_eq!(iosurface_pixel_format_to_mtl(0xdead_beef), 0);
+}
+
+/// A small value is not an MTLPixelFormat ordinal in disguise.
+///
+/// The converter used to return `pixel_format as u16` for anything at or
+/// below 0x200, deciding which encoding the field was in from how big the
+/// number was. Every caller passes a type-4 `pixelFormat` (+0x0c), which is
+/// an IOSurface OSType and therefore never below `'    '` (0x20202020), so
+/// a small value arriving here is a bad read — and passing it through
+/// published a format the guest never named. Fail closed instead, which is
+/// what this function already does for every FourCC it does not know.
+#[test]
+fn a_small_value_is_not_read_as_an_mtl_ordinal() {
+    // 0x50 is MTLPixelFormatBGRA8Unorm. As a type-4 OSType it is nonsense,
+    // and the old magnitude test would have handed it back as a format.
+    assert_eq!(iosurface_pixel_format_to_mtl(0x50), 0);
+    assert_eq!(iosurface_pixel_format_to_mtl(0x200), 0);
+    // Known FourCCs are unaffected — this is the boundary the old test sat
+    // on, not a narrowing of what the converter accepts.
+    assert_eq!(
+        iosurface_pixel_format_to_mtl(0x4247_5241),
+        crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM
+    );
+}
+
+#[test]
+fn decode_type4_biplanar_420f_planes() {
+    // Wire: plane0 Y 1024×1024 bpr=1024 bpe=1; plane1 UV 512×512 bpr=1024 bpe=2.
+    // Live boot: fmt='420f' len=0x180000 plane0 bpr=1024.
+    let mut desc = vec![0u8; 0x14 + 2 * 0x10];
+    st64(&mut desc[0..], 0x180000);
+    st32(&mut desc[8..], 0x200);
+    st32(&mut desc[0xc..], IOSURFACE_FOURCC_420F);
+    desc[0x10] = 2;
+    // plane0
+    st32(&mut desc[0x14..], 0); // offset
+    st32(&mut desc[0x18..], 1024);
+    st32(&mut desc[0x1c..], 1024);
+    st32(&mut desc[0x20..], 1024 | (1 << 24)); // bpr | bpe<<24
+                                               // plane1
+    st32(&mut desc[0x24..], 1024 * 1024); // offset after Y
+    st32(&mut desc[0x28..], 512);
+    st32(&mut desc[0x2c..], 512);
+    st32(&mut desc[0x30..], 1024 | (2 << 24));
+    let s = decode_type4_surface(&desc).expect("type4 420f");
+    assert!(type4_is_multiplanar(&s));
+    assert_eq!(s.plane_count, 2);
+    assert_eq!(
+        (
+            s.planes[0].width,
+            s.planes[0].height,
+            s.planes[0].bytes_per_row
+        ),
+        (1024, 1024, 1024)
+    );
+    assert_eq!(s.planes[0].bytes_per_element, 1);
+    assert_eq!(
+        (
+            s.planes[1].width,
+            s.planes[1].height,
+            s.planes[1].bytes_per_element
+        ),
+        (512, 512, 2)
+    );
+    let dev = synthesize_device_desc_from_type4(&s);
+    assert_eq!(dev[DEVICE_DESC_PLANE_COUNT], 2);
+    use crate::contract::iosurface_pages::{
+        decode_device_surface, mapping_span_bound, sample_window_from_device_desc,
+        DEVICE_DESC_PIXEL_FORMAT,
+    };
+    assert_eq!(
+        ld32(&dev[DEVICE_DESC_PIXEL_FORMAT..]),
+        IOSURFACE_FOURCC_420F
+    );
+    let surf = decode_device_surface(&dev).expect("device");
+    assert_eq!(surf.plane_count, 2);
+    assert_eq!(surf.alloc_size, 0x180000);
+    // Type-11 Y plane: R8 1024×1024 matches plane0 (contract geometry key).
+    let y = sample_window_from_device_desc(
+        Some(&dev),
+        None,
+        crate::contract::pixel_format::MTL_FORMAT_R8_UNORM,
+        1024,
+        1024,
+    )
+    .expect("Y window");
+    assert_eq!(y.0, 0); // offset
+    assert_eq!(y.1, 1024); // bpr
+                           // UV plane: RG8 half res.
+    let uv = sample_window_from_device_desc(
+        Some(&dev),
+        None,
+        crate::contract::pixel_format::MTL_FORMAT_RG8_UNORM,
+        512,
+        512,
+    )
+    .expect("UV window");
+    assert_eq!(uv.0, 1024 * 1024);
+    assert_eq!(uv.1, 1024);
+    // A full 1024² BGRA matches no plane record, so it binds nothing, and
+    // its page-sizing estimate still rejects on the wire allocation.
+    assert!(sample_window_from_device_desc(
+        Some(&dev),
+        None,
+        crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM,
+        1024,
+        1024,
+    )
+    .is_none());
+    assert!(mapping_span_bound(
+        Some(&dev),
+        crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM,
+        1024,
+        1024,
+    )
+    .is_none());
+}
+
+/// A failed page-table walk is not an address. The device used to answer it
+/// with the backing *virtual* address used as a physical one whenever that
+/// number happened to be RAM, which put a fabricated PFN into
+/// `page_entries` — the list every later reader and writer resolves
+/// through. Here the walk cannot resolve the backing GVA and the identity
+/// candidate *is* mapped RAM, so the old path would have accepted it.
+#[test]
+fn resolve_type4_refuses_to_substitute_the_gva_when_the_walk_fails() {
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    state.page_shift = PAGE_SHIFT_X86;
+    // The identity candidate is backed RAM: `read_gpa` succeeds on it, which
+    // is the whole of what the old gate checked.
+    host.map_range(0x20u64 << PAGE_SHIFT_X86, 0x2000, 0x5a);
+    let dir_gpa = 2u64 << PAGE_SHIFT_X86;
+    let root_gpa = 3u64 << PAGE_SHIFT_X86;
+    let data_gpa = 4u64 << PAGE_SHIFT_X86;
+    host.map_range(dir_gpa, 0x20, 0);
+    host.map_range(root_gpa, 0x1000, 0);
+    host.map_range(data_gpa, 0x200, 0);
+    let mut d = [0u8; 8];
+    st32(&mut d[DIRECTORY_ROOT_PFN as usize..], 3);
+    st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
+    let _ = host.write_gpa(dir_gpa, &d);
+    // root[0] carries the object list and descriptors. root[0x20] — the
+    // backing GVA page — is left unmapped, so the backing walk fails.
+    st32(&mut d[..4], 4);
+    let _ = host.write_gpa(root_gpa, &d[..4]);
+    assert!(state.define_task(1, 0x1000, 2));
+    assert!(state.set_object_list(1, 0, 8));
+    let mut entry = [0u8; 12];
+    st32(&mut entry[0..], 4u32 | (0x30u32 << 8));
+    entry[4..12].copy_from_slice(&0x80u64.to_le_bytes());
+    let _ = host.write_gpa(data_gpa + 3 * 12, &entry);
+    let mut desc = vec![0u8; 0x30];
+    st64(&mut desc[0..], 0x1000);
+    st32(&mut desc[8..], 0x20); // backing GVA page — unmapped in this task
+    st32(&mut desc[0xc..], 0x50);
+    desc[0x10] = 1;
+    st32(&mut desc[0x18..], 16);
+    st32(&mut desc[0x1c..], 16);
+    st32(&mut desc[0x20..], 64);
+    let _ = host.write_gpa(data_gpa + 0x80, &desc);
+
+    assert!(
+        !resolve_type4_surface(&mut state, &host, 3),
+        "an untranslatable backing must not resolve"
+    );
+    // The refusal happens before any mutation, so no fabricated entry is
+    // left behind for a later writer to aim at.
+    let fabricated = state
+        .mappings
+        .get(&3)
+        .map(|m| m.mapped || !m.page_entries.is_empty())
+        .unwrap_or(false);
+    assert!(!fabricated, "refusal must not cache a fabricated backing");
+}
+
+/// `resolve_type4_surface_ex` probes task 0 first and returns on the first
+/// task whose backing applies. The identity guess made task 0 succeed for
+/// surfaces it could not translate, so the search stopped there and the
+/// owning task was never tried — the surface was then backed by an address
+/// derived from a virtual one. Refusing is what lets the loop continue.
+///
+/// Both tasks list the surface, as task 0 (the kernel/global list) and the
+/// owner do in production; only the owner can translate the backing.
+#[test]
+fn the_task_search_reaches_the_owner_when_task_zero_cannot_translate() {
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    state.page_shift = PAGE_SHIFT_X86;
+    let dir0_gpa = 2u64 << PAGE_SHIFT_X86;
+    let root0_gpa = 3u64 << PAGE_SHIFT_X86;
+    let data_gpa = 4u64 << PAGE_SHIFT_X86;
+    let dir1_gpa = 7u64 << PAGE_SHIFT_X86;
+    let root1_gpa = 8u64 << PAGE_SHIFT_X86;
+    let real_page = 9u64 << PAGE_SHIFT_X86;
+    for (gpa, len) in [
+        (dir0_gpa, 0x20),
+        (root0_gpa, 0x1000),
+        (data_gpa, 0x200),
+        (dir1_gpa, 0x20),
+        (root1_gpa, 0x1000),
+        (real_page, 0x1000),
+    ] {
+        host.map_range(gpa, len, 0);
+    }
+    // The identity candidate for the backing GVA is RAM, so the old path
+    // would have taken it on task 0 rather than moving on.
+    host.map_range(0x20u64 << PAGE_SHIFT_X86, 0x1000, 0x5a);
+
+    let mut d = [0u8; 8];
+    st32(&mut d[DIRECTORY_ROOT_PFN as usize..], 3);
+    st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
+    let _ = host.write_gpa(dir0_gpa, &d);
+    st32(&mut d[DIRECTORY_ROOT_PFN as usize..], 8);
+    let _ = host.write_gpa(dir1_gpa, &d);
+    // Both roots reach the object list at GVA 0; only task 1's maps the
+    // backing GVA page 0x20, and it maps it to `real_page`.
+    st32(&mut d[..4], 4);
+    let _ = host.write_gpa(root0_gpa, &d[..4]);
+    let _ = host.write_gpa(root1_gpa, &d[..4]);
+    st32(&mut d[..4], 9);
+    let _ = host.write_gpa(root1_gpa + 0x20 * 4, &d[..4]);
+
+    assert!(state.define_task(0, 0x1000, 2));
+    assert!(state.set_object_list(0, 0, 8));
+    assert!(state.define_task(1, 0x1000, 7));
+    assert!(state.set_object_list(1, 0, 8));
+
+    let mut entry = [0u8; 12];
+    st32(&mut entry[0..], 4u32 | (0x30u32 << 8));
+    entry[4..12].copy_from_slice(&0x80u64.to_le_bytes());
+    let _ = host.write_gpa(data_gpa + 3 * 12, &entry);
+    let mut desc = vec![0u8; 0x30];
+    st64(&mut desc[0..], 0x1000);
+    st32(&mut desc[8..], 0x20);
+    st32(&mut desc[0xc..], 0x50);
+    desc[0x10] = 1;
+    st32(&mut desc[0x18..], 16);
+    st32(&mut desc[0x1c..], 16);
+    st32(&mut desc[0x20..], 64);
+    let _ = host.write_gpa(data_gpa + 0x80, &desc);
+
+    assert!(
+        resolve_type4_surface(&mut state, &host, 3),
+        "the owning task can translate the backing, so the resolve must succeed"
+    );
+    let m = state.mappings.get(&3).unwrap();
+    assert_eq!(m.page_entries.len(), 1);
+    assert_eq!(
+        entry_gpa_shift(m.page_entries[0], PAGE_SHIFT_X86),
+        Some(real_page),
+        "the backing must come from the task that could translate it, \
+         not from task 0's untranslatable GVA"
+    );
+}
+
+/// The search stops on the first task that can back a surface, so whether
+/// that choice was ever a choice is the thing to count. Nothing on the wire
+/// can verify a candidate — the object-list entry carries no identity and
+/// the type-4 descriptor is fully decoded — so the claimant count is the
+/// only available reading of the search's exposure, and it has to
+/// distinguish "one task lists this id" from "two do".
+#[test]
+fn a_surface_id_claimed_by_two_tasks_is_counted_as_two() {
+    // Two tasks, each with its own directory and root, both listing eight
+    // object slots at GVA 0. Task 0's list page holds a type-4 surface at
+    // slot 3; task 1's holds a type-5 there until the second half of the
+    // test rewrites it.
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    state.page_shift = PAGE_SHIFT_X86;
+    let dir0_gpa = 2u64 << PAGE_SHIFT_X86;
+    let root0_gpa = 3u64 << PAGE_SHIFT_X86;
+    let list0_gpa = 4u64 << PAGE_SHIFT_X86;
+    let dir1_gpa = 7u64 << PAGE_SHIFT_X86;
+    let root1_gpa = 8u64 << PAGE_SHIFT_X86;
+    let list1_gpa = 9u64 << PAGE_SHIFT_X86;
+    for (gpa, len) in [
+        (dir0_gpa, 0x20),
+        (root0_gpa, 0x1000),
+        (list0_gpa, 0x200),
+        (dir1_gpa, 0x20),
+        (root1_gpa, 0x1000),
+        (list1_gpa, 0x200),
+    ] {
+        host.map_range(gpa, len, 0);
+    }
+
+    let mut d = [0u8; 8];
+    st32(&mut d[DIRECTORY_ROOT_PFN as usize..], 3);
+    st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
+    let _ = host.write_gpa(dir0_gpa, &d);
+    st32(&mut d[DIRECTORY_ROOT_PFN as usize..], 8);
+    let _ = host.write_gpa(dir1_gpa, &d);
+    // Each task's GVA page 0 reaches its own list page.
+    st32(&mut d[..4], 4);
+    let _ = host.write_gpa(root0_gpa, &d[..4]);
+    st32(&mut d[..4], 9);
+    let _ = host.write_gpa(root1_gpa, &d[..4]);
+
+    assert!(state.define_task(0, 0x1000, 2));
+    assert!(state.set_object_list(0, 0, 8));
+    assert!(state.define_task(1, 0x1000, 7));
+    assert!(state.set_object_list(1, 0, 8));
+
+    // Slot 3 of task 0 is the surface. Both entries carry a descriptor GVA
+    // and length, which is what `lookup_list_entry` requires before the type
+    // is even looked at.
+    let mut entry = [0u8; 12];
+    st32(&mut entry[0..], OBJECT_TYPE_SURFACE as u32 | (0x30u32 << 8));
+    entry[4..12].copy_from_slice(&0x80u64.to_le_bytes());
+    let _ = host.write_gpa(list0_gpa + 3 * 12, &entry);
+
+    // Task 1 lists a *different object type* at the same slot, so it is not
+    // a claimant even though the slot is populated.
+    let mut other = [0u8; 12];
+    st32(
+        &mut other[0..],
+        OBJECT_TYPE_REF_TEXTURE as u32 | (0x30u32 << 8),
+    );
+    other[4..12].copy_from_slice(&0x80u64.to_le_bytes());
+    let _ = host.write_gpa(list1_gpa + 3 * 12, &other);
+
+    assert_eq!(
+        type4_claimant_tasks(&state, &host, 3),
+        vec![0],
+        "a populated slot of another object type is not a claim on this id"
+    );
+
+    // Now task 1 lists a type-4 surface at the same slot. The id spaces are
+    // per task, so this is a second, unrelated surface wearing the same id —
+    // and the search would have to break the tie by probe order alone.
+    let _ = host.write_gpa(list1_gpa + 3 * 12, &entry);
+    assert_eq!(
+        type4_claimant_tasks(&state, &host, 3),
+        vec![0, 1],
+        "both tasks list a type-4 surface at slot 3, so both are claimants"
+    );
+
+    // An inactive task cannot be the one the search stops on, so it is not
+    // counted either.
+    state.tasks[1].active = false;
+    assert_eq!(
+        type4_claimant_tasks(&state, &host, 3),
+        vec![0],
+        "an inactive task is not a claimant"
+    );
+}
+
+/// Force-resolve must rebuild the cached page table when the task PT
+/// translation of the backing GVA moved (same surface id, same geometry,
+/// new physical pages — the early-boot FB vs WindowServer reallocation).
+#[test]
+fn resolve_type4_force_rebuilds_when_task_translation_moves() {
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    state.page_shift = PAGE_SHIFT_X86;
+    let dir_gpa = 2u64 << PAGE_SHIFT_X86;
+    let root_gpa = 3u64 << PAGE_SHIFT_X86;
+    let data_gpa = 4u64 << PAGE_SHIFT_X86;
+    let old_page = 5u64 << PAGE_SHIFT_X86;
+    let new_page = 6u64 << PAGE_SHIFT_X86;
+    host.map_range(dir_gpa, 0x20, 0);
+    host.map_range(root_gpa, 0x1000, 0);
+    host.map_range(data_gpa, 0x200, 0);
+    host.map_range(old_page, 0x1000, 0x11);
+    host.map_range(new_page, 0x1000, 0x22);
+    let mut d = [0u8; 8];
+    st32(&mut d[DIRECTORY_ROOT_PFN as usize..], 3);
+    st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
+    let _ = host.write_gpa(dir_gpa, &d);
+    // root[0] = data page (object list + descriptors), root[1] = old backing.
+    st32(&mut d[..4], 4);
+    let _ = host.write_gpa(root_gpa, &d[..4]);
+    st32(&mut d[..4], 5);
+    let _ = host.write_gpa(root_gpa + 4, &d[..4]);
+    assert!(state.define_task(1, 0x1000, 2));
+    assert!(state.set_object_list(1, 0, 8));
+    // Type-4 entry at surface_id=3, descriptor at GVA 0x80.
+    let mut entry = [0u8; 12];
+    st32(&mut entry[0..], 4u32 | (0x30u32 << 8));
+    entry[4..12].copy_from_slice(&0x80u64.to_le_bytes());
+    let _ = host.write_gpa(data_gpa + 3 * 12, &entry);
+    let mut desc = vec![0u8; 0x30];
+    st64(&mut desc[0..], 0x1000);
+    st32(&mut desc[8..], 1); // backing_pfn = GVA page 1
+    st32(&mut desc[0xc..], 0x50);
+    desc[0x10] = 1;
+    st32(&mut desc[0x18..], 16);
+    st32(&mut desc[0x1c..], 16);
+    st32(&mut desc[0x20..], 64);
+    let _ = host.write_gpa(data_gpa + 0x80, &desc);
+
+    assert!(resolve_type4_surface(&mut state, &host, 3));
+    {
+        let m = state.mappings.get(&3).unwrap();
+        assert_eq!(m.page_entries.len(), 1);
+        assert_eq!(
+            entry_gpa_shift(m.page_entries[0], PAGE_SHIFT_X86),
+            Some(old_page)
+        );
+        assert_eq!(m.map_generation, 1);
+    }
+    // Guest remaps GVA page 1 onto a new physical page (same id/geometry).
+    st32(&mut d[..4], 6);
+    let _ = host.write_gpa(root_gpa + 4, &d[..4]);
+    assert!(resolve_type4_surface_force(&mut state, &host, 3));
+    {
+        let m = state.mappings.get(&3).unwrap();
+        assert_eq!(
+            entry_gpa_shift(m.page_entries[0], PAGE_SHIFT_X86),
+            Some(new_page),
+            "force-resolve must follow the moved translation"
+        );
+        assert_eq!(m.map_generation, 2, "page move bumps map_generation");
+    }
+    // Unchanged translation: force keeps the table without a rebuild.
+    assert!(resolve_type4_surface_force(&mut state, &host, 3));
+    let m = state.mappings.get(&3).unwrap();
+    assert_eq!(m.map_generation, 2);
+    assert_eq!(
+        entry_gpa_shift(m.page_entries[0], PAGE_SHIFT_X86),
+        Some(new_page)
+    );
+}
+
+/// A genuine backing failure (a surface whose descriptor decoded fine but
+/// whose page-backing construction fails) must be fail-visible with a
+/// `reason=` slug, deduped per `(surface_id, reason)`, and re-armed when the
+/// surface next backs cleanly — never a silent `return false` that paints
+/// stale/black with no log. Locks the type-4 backing blind-spot closure.
+#[test]
+fn apply_type4_backing_fail_latches_reason_and_rearms() {
+    let host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    state.page_shift = PAGE_SHIFT_X86;
+    // A surface_id other type-4 tests do not touch (they use 3).
+    let sid = 11u32;
+    clear_type4_fail(sid);
+    assert!(!type4_fail_latch()
+        .lock()
+        .unwrap()
+        .contains(&(sid, "task_inactive")));
+    // Small valid length (page_count = 1) so the alloc-guard passes, then an
+    // undefined/inactive task_id hits the `task_inactive` site — the drain
+    // race where a decoded surface's owning task died before backing landed.
+    let surf = Type4Surface {
+        length: 0x1000,
+        backing_pfn: 0x20,
+        pixel_format: 0,
+        plane_count: 1,
+        planes: [Type4Plane::default(); TYPE4_PLANE_CAP],
+        width: 16,
+        height: 16,
+        bytes_per_row: 64,
+    };
+    assert!(!apply_type4_backing(&mut state, &host, 5, sid, &surf));
+    assert!(
+        !type4_fail_latch()
+            .lock()
+            .unwrap()
+            .contains(&(sid, "task_inactive")),
+        "one task's probe is not a backing failure: the search has other \
+         tasks to try, and reporting here is what put `reason=translate` \
+         lines under surfaces that then backed cleanly"
+    );
+    // The search running out of tasks is what turns the probe's reason into
+    // a reported failure.
+    flush_type4_fail(sid);
+    assert!(
+        type4_fail_latch()
+            .lock()
+            .unwrap()
+            .contains(&(sid, "task_inactive")),
+        "an exhausted search must report the first probe's reason slug"
+    );
+    // A clean backing on the same surface re-arms the latch.
+    clear_type4_fail(sid);
+    assert!(
+        !type4_fail_latch()
+            .lock()
+            .unwrap()
+            .contains(&(sid, "task_inactive")),
+        "clear_type4_fail must re-arm so a later failure logs again"
+    );
+}
+
+/// A refused walk must say **which** of the walk's checks refused.
+///
+/// The walk distinguishes fifteen refusals and this rail reported one word,
+/// `translate`, for all of them — so "the guest has not filled in this leaf
+/// PTE yet" and "this device could not read the task root at all" produced
+/// identical log lines while wanting opposite responses. Both halves are
+/// locked here: the walk names its failing check, and the detail line
+/// carries that name verbatim.
+///
+/// The fixture maps GVA page 0 and nothing else, so the *same* task walks
+/// clean for one address and refuses for the next. Asserting the clean case
+/// too is what keeps this from passing vacuously: a fixture in which every
+/// walk fails would satisfy the refusal assertions on its own.
+#[test]
+fn a_refused_type4_walk_names_the_check_that_refused() {
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task_with_list(&mut host, &mut state);
+    let task = state.tasks.get(1).expect("fixture defines task 1");
+
+    // Control: the address the fixture does map walks all the way down.
+    let mapped = gva_mem::diagnose_task_slot(&host, task, 1, 0, PAGE_SHIFT_ARM64E);
+    assert!(
+        mapped.contains("st=ok"),
+        "fixture must be able to translate, got {mapped:?}"
+    );
+
+    // The case the rig produces: a backing whose leaf entry the guest has
+    // not written. Page 1 shares the fixture's root and has no PTE.
+    let gva = 1u64 << PAGE_SHIFT_ARM64E;
+    let walk = gva_mem::diagnose_task_slot(&host, task, 1, gva, PAGE_SHIFT_ARM64E);
+    assert!(
+        walk.contains("st=zero-pfn"),
+        "an unwritten leaf must be reported as zero-pfn, got {walk:?}"
+    );
+    assert!(
+        walk.contains("lvl=") && walk.contains("idx="),
+        "the refusal must name where in the walk it stopped, got {walk:?}"
+    );
+
+    let line = type4_translate_fail_detail(202, 1, 0, 640, gva, &walk);
+    assert!(line.contains("reason=translate"), "{line}");
+    assert!(line.contains("sid=202"), "{line}");
+    assert!(line.contains("page=0/640"), "{line}");
+    assert!(
+        line.contains(&format!("walk=[{walk}]")),
+        "the refusal must carry the walk diagnosis verbatim, got {line}"
+    );
+}
+
+/// A refused object-list entry read names the three inputs its address came
+/// from, not just the address.
+///
+/// `gva_mem`'s own refusal can only print the gva, because it is generic over
+/// every caller. Here the gva is derived — `(list_pfn << page_shift) +
+/// ref * entry_len` — and a driven x86 boot emits ten of these all reading
+/// `gva=0x11b0`, which is `pfn = 1, ref = 36` and is equally consistent with
+/// the guest not having mapped its list yet and with this device resolving a
+/// ref against the wrong task. The address alone cannot separate those; the
+/// inputs can, which is why they have to be on the line.
+///
+/// Asserts the fields rather than the prose, so rewording the parenthetical
+/// does not fail it.
+#[test]
+fn a_refused_object_list_entry_names_the_geometry_behind_its_address() {
+    let task = crate::model::TaskEntry {
+        active: true,
+        length: 0x1000,
+        directory_pfn: 2,
+        object_list_pfn: 1,
+        object_list_count: 64,
+    };
+    let entry_gva = (1u64 << PAGE_SHIFT_X86) + 36 * OBJECT_LIST_ENTRY_LEN as u64;
+    let line = list_entry_unreadable_detail(3, 36, &task, entry_gva);
+
+    assert!(line.contains("task=3"), "{line}");
+    assert!(line.contains("ref=36"), "{line}");
+    assert!(line.contains("gva=0x11b0"), "{line}");
+    assert!(
+        line.contains("list_pfn=1"),
+        "the pfn the address was built from must be on the line: {line}"
+    );
+    assert!(
+        line.contains("list_count=64"),
+        "the count that admitted this ref must be on the line: {line}"
+    );
+    assert!(
+        line.contains("entry_len=12"),
+        "the stride the offset was scaled by must be on the line: {line}"
+    );
+}
+
+/// A task the guest has defined but never given an object list to must
+/// resolve **nothing** — not another task's list.
+///
+/// This reproduces, at unit scale, what the rail was measured doing on every
+/// boot. `TaskEntry::define` used to invent `object_list_pfn = 1` and
+/// `count = 0x100000`, so a task with no `SetObjectList` still computed an
+/// entry address of `0x1000 + off`. Nothing is mapped there for that task,
+/// the walk failed `gva_zero_pfn`, and `read_task_gva_by_id` then walked
+/// task `5 >> 1 == 2`'s page table at the same address — where task 2's
+/// object list genuinely lives — and decoded task 2's entry as task 5's.
+///
+/// Task 2's own lookup is asserted first so the fixture is known to be real:
+/// a test where the donor list is unreadable would pass for the wrong reason.
+#[test]
+fn a_task_with_no_object_list_resolves_nothing_not_its_neighbours_list() {
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let dir_gpa = 2u64 << PAGE_SHIFT_X86;
+    let root_gpa = 3u64 << PAGE_SHIFT_X86;
+    let data_gpa = 4u64 << PAGE_SHIFT_X86;
+    host.map_range(dir_gpa, 0x20, 0);
+    host.map_range(root_gpa, 0x1000, 0);
+    host.map_range(data_gpa, 0x1000, 0);
+    let mut d = [0u8; 8];
+    st32(&mut d[DIRECTORY_ROOT_PFN as usize..], 3);
+    st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
+    let _ = host.write_gpa(dir_gpa, &d);
+    // PTE for GVA page 1 (0x1000) → pfn 4, so task 2's list is readable.
+    let mut pte = [0u8; 4];
+    st32(&mut pte, 4);
+    let _ = host.write_gpa(root_gpa + 4, &pte);
+
+    let mut entry = [0u8; OBJECT_LIST_ENTRY_LEN];
+    st32(
+        &mut entry[0..],
+        (OBJECT_TYPE_SURFACE as u32) | (0x40u32 << 8),
+    );
+    entry[4..12].copy_from_slice(&0xdead_0000u64.to_le_bytes());
+    let _ = host.write_gpa(data_gpa, &entry);
+
+    // Task 2 owns a real list at pfn 1. Task 5 has a directory that maps
+    // nothing, and `5 >> 1 == 2`.
+    assert!(state.define_task(2, 0x1000, 2));
+    assert!(state.set_object_list(2, 1, 4));
+    assert!(state.define_task(5, 0x1000, 9));
+
+    let donor = lookup_list_entry(&state, &host, 2, 0);
+    assert!(
+        donor.is_some(),
+        "fixture is not real: task 2's own list must be readable"
+    );
+
+    // The behavioural claim first, so a regression fails on the corruption
+    // itself rather than on the field that causes it.
+    assert_eq!(
+        lookup_list_entry(&state, &host, 5, 0),
+        None,
+        "task 5 has no object list, so it must resolve nothing — returning \
+         Some here is task 2's entry answering for task 5"
+    );
+    assert_eq!(
+        state.tasks[5].object_list_pfn, 0,
+        "a defined task has no list until SetObjectList says so"
+    );
+    assert_eq!(state.tasks[5].object_list_count, 0);
+}
+
+fn setup_type4_candidate(
+    host: &mut FakeHost,
+    state: &mut DeviceState,
+    surface_id: u32,
+    desc_gva: u64,
+    desc_len: u32,
+) -> u64 {
+    let dir_gpa = 2u64 << PAGE_SHIFT_X86;
+    let root_gpa = 3u64 << PAGE_SHIFT_X86;
+    let data_gpa = 4u64 << PAGE_SHIFT_X86;
+    host.map_range(dir_gpa, 0x20, 0);
+    host.map_range(root_gpa, 0x1000, 0);
+    host.map_range(data_gpa, 0x1000, 0);
+    let mut d = [0u8; 8];
+    st32(&mut d[DIRECTORY_ROOT_PFN as usize..], 3);
+    st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
+    let _ = host.write_gpa(dir_gpa, &d);
+    st32(&mut d[..4], 4);
+    let _ = host.write_gpa(root_gpa, &d[..4]);
+    assert!(state.define_task(1, 0x1000, 2));
+    assert!(state.set_object_list(1, 0, surface_id + 1));
+
+    let mut entry = [0u8; OBJECT_LIST_ENTRY_LEN];
+    st32(
+        &mut entry[0..],
+        (OBJECT_TYPE_SURFACE as u32) | (desc_len << 8),
+    );
+    entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
+    let entry_gpa = data_gpa + surface_id as u64 * OBJECT_LIST_ENTRY_LEN as u64;
+    let _ = host.write_gpa(entry_gpa, &entry);
+    data_gpa
+}
+
+/// Once task-scan lookup finds an actual type-4 candidate, descriptor read
+/// failure is no longer speculative: the surface has an owner but cannot get
+/// backing. It must be fail-visible with a stable reason slug.
+#[test]
+fn resolve_type4_candidate_logs_descriptor_read_failure() {
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let sid = 17u32;
+    clear_type4_fail(sid);
+    let _ = setup_type4_candidate(&mut host, &mut state, sid, 0x3000, 0x30);
+
+    assert!(!resolve_type4_surface(&mut state, &host, sid));
+    assert!(
+        type4_fail_latch()
+            .lock()
+            .unwrap()
+            .contains(&(sid, "desc_read")),
+        "surface-type candidate with unreadable descriptor must name desc_read"
+    );
+    clear_type4_fail(sid);
+}
+
+/// A readable but invalid type-4 descriptor used to fall through to the
+/// resolver tail with no site reason. Keep it fail-visible without logging
+/// absent/non-surface speculative probes.
+#[test]
+fn resolve_type4_candidate_logs_descriptor_decode_failure() {
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let sid = 18u32;
+    clear_type4_fail(sid);
+    let data_gpa = setup_type4_candidate(&mut host, &mut state, sid, 0x80, 0x30);
+    let bad_desc = vec![0u8; 0x30];
+    let _ = host.write_gpa(data_gpa + 0x80, &bad_desc);
+
+    assert!(!resolve_type4_surface(&mut state, &host, sid));
+    assert!(
+        type4_fail_latch()
+            .lock()
+            .unwrap()
+            .contains(&(sid, "desc_decode")),
+        "surface-type candidate with invalid descriptor must name desc_decode"
+    );
+    clear_type4_fail(sid);
+}
+
+/// Live wire bytes (boot 093019 `compute_stage_tex type5 … args_hex`):
+/// R8 1024×1024 = Y plane view of a biplanar 1024×1024 surface.
+#[test]
+fn decode_type5_texture_view_live_r8_y_plane() {
+    let mut desc = vec![0u8; 8];
+    st32(&mut desc[TYPE5_SURFACE_ID..], 8);
+    // args blob: kind 0x2f, len 0x30, own_ref 0x15, record R8 1024×1024 d=1.
+    let args = [
+        0x2fu8, 0, 0, 0, 0x30, 0, 0, 0, 0x15, 0, 0, 0, // kind, blob_len, own_ref
+        0x42, 0x01, 0x0a, 0x00, // tag, unk, fmt=R8
+        0x00, 0x04, 0x00, 0x00, // width 1024
+        0x00, 0x04, 0x00, 0x00, // height 1024
+        0x01, 0x00, 0x00, 0x00, // depth 1
+        0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x10, 0x00, // trailer (unconsumed)
+    ];
+    desc.extend_from_slice(&args);
+    let rec = decode_type5_texture_view(&desc).expect("live R8 record decodes");
+    assert_eq!(rec.pixel_format, 0x0a);
+    assert_eq!((rec.width, rec.height, rec.depth), (1024, 1024, 1));
+    // Short record (no +0x20 field) defaults to plane 0.
+    assert_eq!(rec.plane_index, 0);
+}
+
+/// Live 56-byte wire blob from the BLIT copy-source path (x86 Ventura
+/// 13.7.8, 2026-07-19 `blit t5_view_decode sid=34`): a full-color
+/// texture view (BGRA8_sRGB 1024×768 window backing) carries the sibling
+/// record tag `0x62`, not the biplanar `0x42`. Same field layout — must
+/// decode, or the blit path drops the copy.
+#[test]
+fn decode_type5_texture_view_live_0x62_color_window_view() {
+    // Exact leading 40 bytes observed, zero-padded to the 56-byte desc_len.
+    let head: [u8; 40] = [
+        0x22, 0x00, 0x00, 0x00, // surface_id = 34
+        0x00, 0x00, 0x00, 0x00, // field
+        0x2f, 0x00, 0x00, 0x00, // kind 0x2f
+        0x30, 0x00, 0x00, 0x00, // blob_len 0x30
+        0x0b, 0x00, 0x00, 0x00, // own_ref 0x0b
+        0x62, 0x00, 0x51, 0x00, // tag=0x62, unk, fmt=0x51 BGRA8_sRGB
+        0x00, 0x04, 0x00, 0x00, // width 1024
+        0x00, 0x03, 0x00, 0x00, // height 768
+        0x01, 0x00, 0x00, 0x00, // depth 1
+        0x01, 0x00, 0x01, 0x00, // trailer
+    ];
+    let mut desc = head.to_vec();
+    desc.resize(56, 0); // plane field (+0x20 in record) reads 0
+    let rec = decode_type5_texture_view(&desc).expect("0x62 color view must decode");
+    assert_eq!(rec.pixel_format, 0x51);
+    assert_eq!((rec.width, rec.height, rec.depth), (1024, 768, 1));
+    assert_eq!(rec.plane_index, 0);
+}
+
+/// Live 56-byte wire blob (boot 20260717-063043, v0a8 hero): the record
+/// carries the `newTextureWithDescriptor:iosurface:plane:` plane at
+/// `+0x20` — Y views carry 0, the RG8 chroma view 1, the same-geometry
+/// alpha view 2. Geometry cannot separate Y from alpha; this field does.
+#[test]
+fn decode_type5_texture_view_live_v0a8_alpha_plane_index() {
+    let mut desc = vec![0u8; 8];
+    st32(&mut desc[TYPE5_SURFACE_ID..], 0x6d);
+    let args = [
+        0x2fu8, 0, 0, 0, 0x30, 0, 0, 0, 0x82, 0x01, 0, 0, // kind, blob_len, own_ref
+        0x42, 0x01, 0x0a, 0x00, // tag, unk, fmt=R8
+        0xb2, 0x03, 0x00, 0x00, // width 946
+        0x5e, 0x01, 0x00, 0x00, // height 350
+        0x01, 0x00, 0x00, 0x00, // depth 1
+        0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x10, 0x00, // trailer
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // reserved
+        0x02, 0x00, 0x00, 0x00, // IOSurface plane index = 2 (alpha)
+    ];
+    desc.extend_from_slice(&args);
+    let rec = decode_type5_texture_view(&desc).expect("live v0a8 alpha record decodes");
+    assert_eq!(rec.pixel_format, 0x0a);
+    assert_eq!((rec.width, rec.height, rec.depth), (946, 350, 1));
+    assert_eq!(rec.plane_index, 2);
+}
+
+/// The owner-task census must read the dword the guest wrote, and must be
+/// able to tell 0 from anything else.
+///
+/// A census whose extraction is wrong reports 0 forever whatever the wire
+/// says, and 0 is the answer this device already assumes — so the failing
+/// case would be indistinguishable from the healthy one, which is the whole
+/// point of having it. Pinning the offset against a descriptor whose *other*
+/// leading dword is non-zero is what makes an off-by-four visible.
+#[test]
+fn the_type5_owner_task_is_read_from_its_own_dword() {
+    let mut desc = [0u8; TYPE5_MIN_LEN];
+    st32(&mut desc[TYPE5_SURFACE_ID..], 0xabcd);
+    assert_eq!(
+        ld32(&desc[TYPE5_OWNER_TASK..]),
+        0,
+        "the surface id must not be read as the owner task"
+    );
+    st32(&mut desc[TYPE5_OWNER_TASK..], 7);
+    assert_eq!(ld32(&desc[TYPE5_OWNER_TASK..]), 7);
+    assert_eq!(
+        ld32(&desc[TYPE5_SURFACE_ID..]),
+        0xabcd,
+        "writing the owner task must not disturb the surface id"
+    );
+    // Both fields sit inside the minimum descriptor — the array above is
+    // exactly `TYPE5_MIN_LEN` and indexing it proves that — so the census can
+    // never be silently skipped on a well-formed record.
+    assert_eq!(TYPE5_OWNER_TASK, TYPE5_SURFACE_ID + 4);
+}
+
+#[test]
+fn decode_type5_texture_view_fail_closed() {
+    // Short descriptor (no record).
+    let mut short = vec![0u8; 8];
+    st32(&mut short[TYPE5_SURFACE_ID..], 8);
+    assert!(decode_type5_texture_view(&short).is_none());
+    // Wrong record tag.
+    let mut bad_tag = vec![0u8; 8];
+    st32(&mut bad_tag[TYPE5_SURFACE_ID..], 8);
+    bad_tag.extend_from_slice(&[0u8; 12]);
+    bad_tag.extend_from_slice(&[
+        0x41, 0x01, 0x0a, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x01, 0, 0, 0,
+    ]);
+    assert!(decode_type5_texture_view(&bad_tag).is_none());
+    // Non-2D (depth != 1) fails closed.
+    let mut vol = vec![0u8; 8];
+    st32(&mut vol[TYPE5_SURFACE_ID..], 8);
+    vol.extend_from_slice(&[0u8; 12]);
+    vol.extend_from_slice(&[
+        0x42, 0x07, 0x50, 0x00, 0x40, 0, 0, 0, 0x40, 0, 0, 0, 0x40, 0, 0, 0,
+    ]);
+    assert!(decode_type5_texture_view(&vol).is_none());
+    // Zero width fails closed.
+    let mut zw = vec![0u8; 8];
+    st32(&mut zw[TYPE5_SURFACE_ID..], 8);
+    zw.extend_from_slice(&[0u8; 12]);
+    zw.extend_from_slice(&[
+        0x42, 0x01, 0x0a, 0x00, 0, 0, 0, 0, 0x00, 0x04, 0, 0, 0x01, 0, 0, 0,
+    ]);
+    assert!(decode_type5_texture_view(&zw).is_none());
+}
+
+/// The probe's notion of "undecoded" must be exactly the bytes
+/// `decode_type4_surface` skips, and it must distinguish two surfaces on
+/// those bytes alone.
+///
+/// This is the measurement that blocks the largest deletion in the present
+/// path: nothing decoded at surface-create time separates a desktop
+/// swapchain buffer from a same-geometry offscreen tile, so membership is
+/// reconstructed by half a dozen downstream mechanisms. If the guest is
+/// telling us in the undecoded span, the probe has to be able to see it.
+/// The two arms of the type-4 freshness test must accept exactly the same
+/// backings, because only one of them rebuilds when it says no.
+///
+/// The force arm returns through `win_type4_search` **without** calling
+/// `apply_type4_backing`, so `set_mapping_geom` and
+/// `synthesize_device_desc_from_type4` are both skipped. It used to compare
+/// width alone while the non-force arm compared width and height, and
+/// `ensure_surface_for_present` calls the force arm precisely to catch a
+/// wire geometry change — so a height change that stayed inside the same
+/// page count left the mapping describing the previous incarnation, on the
+/// path whose job was to notice.
+///
+/// Neither arm compared format, and a surface id recycled at identical
+/// dimensions with a different pixel format keeps the old bytes-per-pixel
+/// for every read window built over it.
+#[test]
+fn a_latched_backing_is_stale_when_any_of_geometry_or_format_moved() {
+    use crate::contract::pixel_format::{MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_RGBA8_UNORM};
+    let surf = |w: u32, h: u32, fourcc: u32| Type4Surface {
+        length: 0x1000,
+        backing_pfn: 1,
+        pixel_format: fourcc,
+        plane_count: 1,
+        planes: Default::default(),
+        width: w,
+        height: h,
+        bytes_per_row: w * 4,
+    };
+    // 'BGRA' and 'RGBA' are distinct single-plane FourCCs at one bpp, so a
+    // swap between them is invisible to a dimensions-only test.
+    const BGRA: u32 = 0x4247_5241;
+    const RGBA: u32 = 0x5247_4241;
+    assert_eq!(
+        latched_mapping_format(&surf(8, 4, BGRA)),
+        MTL_FORMAT_BGRA8_UNORM
+    );
+    assert_eq!(
+        latched_mapping_format(&surf(8, 4, RGBA)),
+        MTL_FORMAT_RGBA8_UNORM
+    );
+
+    let m = MappingEntry {
+        width: 8,
+        height: 4,
+        format: MTL_FORMAT_BGRA8_UNORM,
+        ..Default::default()
+    };
+    assert!(backing_matches_latched_geom(&m, &surf(8, 4, BGRA)));
+    assert!(
+        !backing_matches_latched_geom(&m, &surf(8, 5, BGRA)),
+        "a height change must be stale on both arms"
+    );
+    assert!(!backing_matches_latched_geom(&m, &surf(9, 4, BGRA)));
+    assert!(
+        !backing_matches_latched_geom(&m, &surf(8, 4, RGBA)),
+        "same dimensions, different format: every read window's bpp comes from it"
+    );
+}
+
+/// A multi-plane backing must compare equal to itself.
+///
+/// The latch stores `0` for it — the decoder's refusal to name a single
+/// colour format — while the raw FourCC conversion may well return a real
+/// format. A freshness test that compared the raw conversion would find
+/// `0 != BGRA8` on every present and rebuild the backing forever, which is
+/// the failure a shared `latched_mapping_format` exists to make impossible.
+#[test]
+fn a_multiplane_backing_compares_equal_to_the_zero_it_latched() {
+    let mut surf = Type4Surface {
+        length: 0x1000,
+        backing_pfn: 1,
+        pixel_format: 0x4247_5241, // 'BGRA' — a format the converter knows
+        plane_count: 2,
+        planes: Default::default(),
+        width: 8,
+        height: 4,
+        bytes_per_row: 32,
+    };
+    assert_ne!(
+        iosurface_pixel_format_to_mtl(surf.pixel_format),
+        0,
+        "the fixture only means something if the raw conversion resolves"
+    );
+    assert_eq!(latched_mapping_format(&surf), 0, "multi-plane latches 0");
+
+    let m = MappingEntry {
+        width: 8,
+        height: 4,
+        format: 0,
+        ..Default::default()
+    };
+    assert!(backing_matches_latched_geom(&m, &surf));
+    // Dropping to one plane makes it a single-plane BGRA8 surface, which is
+    // a real change of what the mapping describes.
+    surf.plane_count = 1;
+    assert!(!backing_matches_latched_geom(&m, &surf));
+}
+
+/// A single-plane surface must publish plane 0's offset, because both its
+/// consumers fold it in and one of them is the other pathway.
+///
+/// `decode_type4_plane` reads four fields; the surface-level convenience
+/// copies on `Type4Surface` take three, and the synthesizer's single-plane
+/// arm used to publish only those three. A surface whose pixels start past
+/// the base of its allocation was then read and written at 0 — the
+/// multi-plane arm has always published each plane's offset, and
+/// `sample_window_from_device_surface` treats `base_offset` exactly as
+/// `sample_window_from_device_plane` treats a plane's.
+#[test]
+fn a_single_plane_backing_publishes_the_offset_its_pixels_start_at() {
+    use crate::contract::iosurface_pages::{decode_device_surface, sample_window_from_device_desc};
+    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    const BASE: u32 = 0x800;
+    let (w, h, bpr) = (8u32, 4u32, 32u32);
+    let mut surf = Type4Surface {
+        length: 0x4000,
+        backing_pfn: 1,
+        pixel_format: 0x4247_5241, // 'BGRA'
+        plane_count: 1,
+        planes: Default::default(),
+        width: w,
+        height: h,
+        bytes_per_row: bpr,
+    };
+    surf.planes[0] = Type4Plane {
+        offset: BASE,
+        width: w,
+        height: h,
+        bytes_per_row: bpr,
+        bytes_per_element: 4,
+    };
+    assert!(
+        !type4_is_multiplanar(&surf),
+        "the single-plane arm is the one under test"
+    );
+
+    let desc = synthesize_device_desc_from_type4(&surf);
+    let decoded = decode_device_surface(&desc).expect("device descriptor");
+    assert_eq!(
+        decoded.plane_count, 0,
+        "single-plane publishes no plane records"
+    );
+    assert_eq!(decoded.base_offset, BASE);
+
+    // The consumer, not just the field: the sample window must start at the
+    // offset and its span must end past it, or publishing it bought nothing.
+    let (off, got_bpr, end) =
+        sample_window_from_device_desc(Some(&desc), None, MTL_FORMAT_BGRA8_UNORM, w, h)
+            .expect("surface-level window");
+    assert_eq!(off, BASE as u64);
+    assert_eq!(got_bpr, bpr);
+    assert_eq!(
+        end,
+        BASE as u64 + (h as u64 - 1) * bpr as u64 + (w as u64 * 4)
+    );
+
+    // Zero stays zero — the ordinary case must not gain an offset.
+    surf.planes[0].offset = 0;
+    let zero = synthesize_device_desc_from_type4(&surf);
+    assert_eq!(decode_device_surface(&zero).expect("desc").base_offset, 0);
+}
+
+/// The device descriptor's format word must survive both of the encodings
+/// it is written in.
+///
+/// The x86 synthesizer writes an MTL ordinal for a known single-plane
+/// surface and the raw OSType otherwise; the arm64 mapper reads the guest's
+/// own descriptor, where media surfaces carry a FourCC. Narrowing with
+/// `as u16` is correct for one of those and destroys the other — `'BGRA'`
+/// becomes `0x5241`, which no format table accepts, so the mapping ends up
+/// with a format that refuses every sample window and every render target.
+#[test]
+fn the_device_descriptor_format_word_survives_both_of_its_encodings() {
+    use crate::contract::pixel_format::{
+        bytes_per_pixel, MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_RGBA16_FLOAT,
+    };
+
+    const BGRA_FOURCC: u32 = 0x4247_5241;
+
+    // The failure the narrowing produced, stated as the thing not to return.
+    assert!(
+        bytes_per_pixel((BGRA_FOURCC & 0xffff) as u16).is_none(),
+        "the truncation's output is not a format, which is why it was a bug"
+    );
+    assert_eq!(
+        device_desc_format_to_mtl(BGRA_FOURCC),
+        MTL_FORMAT_BGRA8_UNORM
+    );
+
+    // An ordinal fits in the descriptor's own 16-bit format fields and is
+    // passed through as itself — including one above the old 0x200
+    // magnitude boundary, which is why the test is width and not size.
+    assert_eq!(
+        device_desc_format_to_mtl(MTL_FORMAT_BGRA8_UNORM as u32),
+        MTL_FORMAT_BGRA8_UNORM
+    );
+    assert_eq!(
+        device_desc_format_to_mtl(MTL_FORMAT_RGBA16_FLOAT as u32),
+        MTL_FORMAT_RGBA16_FLOAT
+    );
+    // MTLPixelFormatBGRA10_XR is 552, above the 0x200 boundary an earlier
+    // magnitude test used and which `iosurface_pixel_format_to_mtl` records
+    // as having been wrong for exactly this format. It still fits in 16
+    // bits, so the width test carries it where a size test did not.
+    assert_eq!(device_desc_format_to_mtl(552), 552);
+
+    // Fail closed, not BGRA8: a multi-plane OSType and an unknown one.
+    assert_eq!(device_desc_format_to_mtl(IOSURFACE_FOURCC_420F), 0);
+    assert_eq!(device_desc_format_to_mtl(0x5A5A_5A5A), 0);
+    assert_eq!(device_desc_format_to_mtl(0), 0);
+}
+
+/// The type-4 probe order must visit task 0 first, the hint next, and every
+/// other task exactly once.
+///
+/// It is the thing that makes the search terminate on the first probe for
+/// every surface this device has ever resolved, so its shape is the whole
+/// cost of the search. Two properties are load-bearing and neither is
+/// obvious from the iterator chain: no task may be probed **twice** (a
+/// duplicate is a wasted guest read on the hot present path, and with a
+/// misbehaving hint it would be 256 of them), and no task may be **missed**
+/// (a missed one is a surface that cannot be found at all).
+#[test]
+fn the_type4_probe_order_visits_task_zero_first_and_every_task_once() {
+    use std::collections::HashSet;
+
+    for hint in [0u32, 1, 7, MAX_TASKS as u32 - 1] {
+        let order: Vec<u32> = type4_probe_order(hint).collect();
+        assert_eq!(order[0], 0, "task 0 leads for hint {hint}");
+        if hint != 0 {
+            assert_eq!(order[1], hint, "the hint is probed second");
+        }
+        assert_eq!(
+            order.len(),
+            MAX_TASKS,
+            "every task exactly once, no duplicate for hint {hint}"
+        );
+        let seen: HashSet<u32> = order.iter().copied().collect();
+        assert_eq!(seen.len(), MAX_TASKS);
+        assert!((0..MAX_TASKS as u32).all(|t| seen.contains(&t)));
+    }
+
+    // A hint outside the id space must not add a probe or lose one. It
+    // cannot be found, so admitting it would cost a wasted read and — worse
+    // — leave the `!= hint` filter matching nothing real.
+    for bad in [MAX_TASKS as u32, u32::MAX] {
+        let order: Vec<u32> = type4_probe_order(bad).collect();
+        assert_eq!(order.len(), MAX_TASKS);
+        assert_eq!(order, type4_probe_order(0).collect::<Vec<_>>());
+    }
+}
+
+#[test]
+fn undecoded_type4_span_is_exactly_what_the_decoder_skips() {
+    // One plane: the decoder consumes 0x14..0x24, so the tail starts there.
+    let built = Type4Builder::new(0x800000, 0x1234, 0x4247_5241, 1) // 'BGRA'
+        .plane(0, 0, 1920, 1080, 1920 * 4, 0)
+        .with_len(0x40);
+    let a = built.bytes().to_vec();
+
+    // Every decoded field can change without moving the undecoded span.
+    let b = Type4Builder::new(0x900000, 0x9999, 0x4c31_3062, 1)
+        .plane(0, 0, 1280, 720, 1280 * 4, 0)
+        .with_len(0x40);
+    assert_eq!(
+        undecoded_type4_surface_bytes(&a),
+        undecoded_type4_surface_bytes(b.bytes()),
+        "changing only decoded fields must not look like a new shape"
+    );
+
+    // The span covers the three bytes after plane_count and the whole tail
+    // past the plane records the decoder consumed.
+    for probe in [0x11usize, 0x13, 0x24, 0x3f] {
+        let mut c = a.clone();
+        c[probe] ^= 0xff;
+        assert_ne!(
+            undecoded_type4_surface_bytes(&a),
+            undecoded_type4_surface_bytes(&c),
+            "byte {probe:#x} is undecoded and must be visible to the probe"
+        );
+    }
+
+    // Bytes the decoder DOES read must not be in the span, or ordinary
+    // surface-to-surface variation would look like a new shape forever.
+    // `plane_count` (+0x10) is excluded on purpose: it is decoded AND it
+    // moves the span's own boundary, which the two-plane case below pins.
+    for probe in [0x00usize, 0x08, 0x0c, 0x14, 0x23] {
+        let mut c = a.clone();
+        c[probe] ^= 0xff;
+        assert_eq!(
+            undecoded_type4_surface_bytes(&a),
+            undecoded_type4_surface_bytes(&c),
+            "byte {probe:#x} is decoded and must stay out of the span"
+        );
+    }
+
+    // A second plane moves the boundary: 0x24..0x34 becomes decoded.
+    let two = Type4Builder::new(0x800000, 0x1234, 0x4247_5241, 2)
+        .plane(0, 0, 1920, 1080, 1920 * 4, 0)
+        .with_len(0x40);
+    assert_eq!(
+        undecoded_type4_surface_bytes(two.bytes()).len(),
+        undecoded_type4_surface_bytes(&a).len() - TYPE4_PLANE_STRIDE,
+        "the span shrinks by exactly one plane record"
+    );
+
+    // A record too short to decode reports nothing rather than a partial
+    // span that would compare unequal against every real one.
+    assert!(undecoded_type4_surface_bytes(&a[..TYPE4_MIN_LEN - 1]).is_empty());
+}

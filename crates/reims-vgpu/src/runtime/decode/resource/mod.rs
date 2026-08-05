@@ -2548,7 +2548,7 @@ const TYPE7_MIN_LEN: usize = 17;
 /// — before the length check, so a short record would also report — emitted
 /// nothing across a full interactive session. Type-11 geometry on that pathway
 /// is latched from the **type-4** surface backing descriptor instead
-/// (`runtime/objects.rs`, `decode_type4_surface` -> `set_mapping_geom`). Do not
+/// (`runtime/objects`, `decode_type4_surface` -> `set_mapping_geom`). Do not
 /// reason about what the guest tells us at surface-create time from this
 /// decoder without re-confirming it runs; measure `decode_type4_surface`.
 /// Offsets in the type-11 IOSurface-texture descriptor. Named rather than
