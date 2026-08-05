@@ -340,26 +340,11 @@ fn find_or_add_attr_slot(
             .field("location", attr.location)
             .field("buffer", attr.buffer_index));
     }
+    // The step pair is admitted by the caller, for every attribute rather than
+    // only the ones with host bytes: this function returns above when the
+    // attribute carries none, and the descriptor is built from all of them.
     let step_function = attr.step_function;
     let step_rate = attr.step_rate;
-    if step_function > MTL_VERTEX_STEP_FUNCTION_PER_INSTANCE {
-        set_err(err, "unsupported vertex attribute step state");
-        return Err(
-            Status::args("metal_render_vertex_step_function_unsupported")
-                .field("location", attr.location)
-                .field("step", step_function),
-        );
-    }
-    // A rate of zero is legal for exactly one step function and required by it,
-    // which `contract::vertex_step` states beside the ordinals. Under any other
-    // step function a zero rate advances nothing and `MTLVertexDescriptor`
-    // validation rejects the descriptor, so refuse it here by name instead.
-    if !step_rate_in_contract(step_function, step_rate) {
-        set_err(err, "unsupported vertex attribute step state");
-        return Err(Status::args("metal_render_vertex_step_rate_zero")
-            .field("location", attr.location)
-            .field("step", step_function));
-    }
     for s in slots.iter() {
         if s.index == attr.buffer_index as u64
             && s.data == attr.data
@@ -483,6 +468,34 @@ fn make_vertex_descriptor(
                     .field("step", step_ordinal),
             );
         };
+        // Recognised, and this pipeline is not one they belong to. `PerPatch`
+        // and `PerPatchControlPoint` describe a post-tessellation vertex
+        // function; `MTLRenderPipelineDescriptor` validation rejects a vertex
+        // descriptor that names one without a tessellation stage, so the draw is
+        // lost either way and the only question is whether the log says which
+        // kind of loss it was. It is a separate slug from the conversion refusal
+        // above for the reason `translate::vertex` gives on the Vulkan arm,
+        // where the same split already exists: one reads "the guest ran a
+        // tessellation pipeline", the other "something is wrong upstream".
+        if step_ordinal > MTL_VERTEX_STEP_FUNCTION_PER_INSTANCE {
+            set_err(err, "unsupported vertex attribute step state");
+            return Err(Status::args("metal_render_vertex_step_function_per_patch")
+                .field("location", attr.location)
+                .field("step", step_ordinal));
+        }
+        // A rate of zero is legal for exactly one step function and required by
+        // it, which `contract::vertex_step` states beside the ordinals. Under
+        // any other, a zero rate advances nothing and `MTLVertexDescriptor`
+        // validation rejects the descriptor, so refuse it here by name instead.
+        // Asked here rather than where the buffer slot is allocated, because
+        // that runs only for an attribute carrying host bytes while every
+        // attribute reaches `set_step_function` below.
+        if !step_rate_in_contract(step_ordinal, attr.step_rate) {
+            set_err(err, "unsupported vertex attribute step state");
+            return Err(Status::args("metal_render_vertex_step_rate_zero")
+                .field("location", attr.location)
+                .field("step", step_ordinal));
+        }
         // Optional host bytes → Metal buffer slot for encode-time bind.
         find_or_add_attr_slot(device, &mut slots, attr, err)?;
         if let Some(a) = descriptor.attributes().object_at(attr.location as u64) {

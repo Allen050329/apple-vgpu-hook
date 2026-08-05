@@ -158,6 +158,14 @@ pub fn make_compute_stage_input_descriptor(
         // `step_supported` above already narrows to the four compute forms, so
         // this cannot be `None`; it is converted rather than transmuted so the
         // two are not a cross-function soundness invariant.
+        //
+        // Its own slug, and not the one that guard uses: the two ask different
+        // questions and this one firing means they *disagree* — an ordinal
+        // `step_supported` admitted that `mtl_enum`'s table cannot convert,
+        // which is a divergence between two lists of the same enum rather than
+        // a guest sending something unsupported. Sharing a slug with the guard
+        // also shared `fail_once`'s latch, so whichever fired first silenced the
+        // other for that pipeline.
         let Some(step) = mtl_enum::step_function(layout.step_function) else {
             set_err(
                 err,
@@ -166,8 +174,10 @@ pub fn make_compute_stage_input_descriptor(
                     layout.step_function
                 ),
             );
-            return Err(Status::args("metal_stage_input_step_function_unsupported")
-                .field("step", layout.step_function));
+            return Err(
+                Status::args("metal_stage_input_step_function_unconvertible")
+                    .field("step", layout.step_function),
+            );
         };
         metal_layout.set_step_function(step);
         metal_layout.set_step_rate(layout.step_rate as u64);
