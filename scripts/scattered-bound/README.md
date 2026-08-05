@@ -52,8 +52,36 @@ Both `MAX_CHANNELS` and `MAX_MAPPINGS` were found this way.
   walk asks it at three points in one loop. Moving it would buy a name and lose
   the loop.
 
+- **A multi-line predicate, reported by the line that carries the constant.**
+  The scan is line-based, so a `||` chain shows only its relational lines. That
+  makes a complete copy look like a partial one, which is the most alarming way
+  this report can be wrong: an entry reading `|| geometry.max_depth > MAX_DEPTH`
+  against an owner that writes `max_depth == 0 || max_depth > MAX_DEPTH` looks
+  exactly like the `MAX_MAPPINGS` defect — a copy that dropped the sentinel
+  test. `contract/gva_resolve.rs` is this; the `== 0` is the line above and the
+  report cannot show it. **Open the file before believing an omission**, every
+  time. A real dropped-sentinel finding survives that check; this class does not.
+
 The rule of thumb: **name the second question.** If both sites are asking one
 question, one of them is a copy. If they are asking two, they are two.
+
+## The polarity flag, as of the sweep that added this section
+
+All four bounds the report currently marks `<-- two spellings, one of them
+inverted` have been adjudicated, so a reader arriving at that flag should start
+below it rather than at it:
+
+- `MAX_BIND_SLOTS` and `MAX_TASKS` — refuted in an earlier sweep; the plan's
+  mined-out list names both. Do not reopen without new evidence.
+- `REIMS_VGPU_METAL_MAX_BUFFERS` — consolidated, and already held by
+  `tests/a_bound_is_compared_where_it_is_declared.rs` with its exemptions
+  written out. The report still shows it because the owner's own comparison
+  counts toward the polarity test.
+- `PACKET_HEADER_LEN` — a predicate and its else-branch, which is the first
+  not-a-finding class above and is named there.
+
+The flag is still the right thing to read first. It just has nothing left in it
+until something new lands.
 
 ## Two shapes the scan deliberately does not see
 
