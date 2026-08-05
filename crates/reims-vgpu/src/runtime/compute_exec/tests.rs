@@ -794,6 +794,80 @@ fn dispatch_missing_pipeline_not_nometal() {
     );
 }
 
+/// One condition, one line, one refusal slug — from every rail that asks.
+///
+/// Three sites used to ask whether a staged texture's format has a storage
+/// selector, and each answered with its own event name, its own `reason=` and
+/// its own `Unsupported(..)` string, dropping a different field apiece. A grep
+/// for any one of them found a third of the losses and could not say which rail
+/// it came from. The assertions below are on the line's shape, so a fourth
+/// spelling has to fail here before it can reach the log.
+#[test]
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+fn a_format_with_no_storage_selector_refuses_the_same_way_from_every_rail() {
+    use crate::runtime::compute_exec::{split_staged_textures, ComputeStatus, StagedTexture};
+
+    let mut no_selector = StagedTexture {
+        binding: 33,
+        texture_ref: 44,
+        // A sample-only format: `contract::pixel_format::storage_selector` has
+        // no entry for it by design, which is exactly the class this refuses.
+        pixel_format: crate::contract::pixel_format::MTL_FORMAT_R32_FLOAT,
+        storage_selector: None,
+        width: 4,
+        height: 4,
+        bytes: vec![0; 64],
+        is_storage: true,
+        #[cfg(feature = "backend-vulkan")]
+        residency: None,
+        #[cfg(feature = "backend-vulkan")]
+        seed_skipped: false,
+        #[cfg(feature = "backend-vulkan")]
+        sample_resident: None,
+        writeback: TextureWriteback::None,
+    };
+
+    assert_eq!(
+        no_selector.storage_selector_or_refuse(7, 9),
+        Err(ComputeStatus::Unsupported("compute_no_backend_selector")),
+        "the refusal slug is one string, not one per rail"
+    );
+    assert_eq!(
+        split_staged_textures(std::slice::from_mut(&mut no_selector), 7, 9).err(),
+        Some(ComputeStatus::Unsupported("compute_no_backend_selector")),
+        "the split refuses through the same helper, not a second copy of it"
+    );
+
+    let log = std::fs::read_to_string(crate::observe::fail_log_path()).expect("fail log");
+    let line = log
+        .lines()
+        .rev()
+        .find(|l| l.starts_with("compute_texture_format "))
+        .expect("a lost bind must name itself");
+    for field in [
+        "reason=no_backend_selector",
+        "task=7",
+        "pipe=9",
+        "bind=33",
+        "ref=44",
+        "storage=1",
+    ] {
+        assert!(
+            line.contains(field),
+            "the line must carry {field}; one of the three copies dropped it: {line}"
+        );
+    }
+
+    // And a format that does have a selector goes through.
+    let mut ok = StagedTexture {
+        storage_selector: Some(5),
+        ..no_selector
+    };
+    let (storage, sampled) =
+        split_staged_textures(std::slice::from_mut(&mut ok), 7, 9).expect("selector present");
+    assert_eq!((storage.len(), sampled.len()), (1, 0));
+}
+
 #[test]
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn dispatch_buffer_kernel_mul3add1() {
@@ -1416,6 +1490,8 @@ fn linear_writeback_retains_cache_when_guest_gva_is_unmapped() {
     let rgba = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
     let staged = StagedTexture {
         binding: 32,
+        #[cfg(all(feature = "backend-metal", target_os = "macos"))]
+        texture_ref: 44,
         pixel_format: MTL_FORMAT_RGBA8_UNORM,
         storage_selector: Some(5),
         width: 2,

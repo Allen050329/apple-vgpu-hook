@@ -532,8 +532,8 @@ fn apply_icb_compute_encoder_inheritance<M: HostMemory + HostOps>(
     range_length: u64,
 ) -> Result<Option<compute_exec::NestedDispatchJob>, ComputeStatus> {
     use crate::backend::metal::abi::{
-        texture_binds_as_storage, ReimsVgpuComputeSampledImage, ReimsVgpuSampler,
-        ReimsVgpuStorageImage, REIMS_VGPU_BINDING_SAMPLER_BASE, REIMS_VGPU_BINDING_TEXTURE_BASE,
+        texture_binds_as_storage, ReimsVgpuSampler, REIMS_VGPU_BINDING_SAMPLER_BASE,
+        REIMS_VGPU_BINDING_TEXTURE_BASE,
     };
     use crate::backend::metal::compute::{
         bind_compute_sampled_images, bind_compute_samplers, bind_storage_images,
@@ -549,8 +549,8 @@ fn apply_icb_compute_encoder_inheritance<M: HostMemory + HostOps>(
     use crate::backend::metal::util::{image_len, valid_buffer_binding};
     use crate::contract::endian::ld32;
     use crate::runtime::compute_exec::{
-        load_compute_pipeline, load_mtlb, nested_job_from_icb_resources, stage_buffer,
-        stage_texture_raw,
+        load_compute_pipeline, load_mtlb, nested_job_from_icb_resources, split_staged_textures,
+        stage_buffer, stage_texture_raw,
     };
     use crate::runtime::decode::resource::{
         decode_sampler_descriptor, OBJECT_TYPE_TYPE7, TYPE7_OBJECT_SAMPLER,
@@ -713,17 +713,7 @@ fn apply_icb_compute_encoder_inheritance<M: HostMemory + HostOps>(
                 let staged =
                     stage_texture_raw(state, host, task_id, st.texture_ref, binding, is_storage)?;
                 // Materialize Metal texture (not set_texture on encoder — only AB).
-                let Some(selector) = staged.storage_selector else {
-                    crate::observe::fail(format!(
-                        "compute_icb_texture fail reason=metal_selector_missing task={task_id} pipe={} bind={} ref={} fmt={:#x} storage={}",
-                        acc.pipeline_ref,
-                        binding,
-                        st.texture_ref,
-                        staged.pixel_format,
-                        is_storage as u8
-                    ));
-                    return Err(ComputeStatus::Unsupported("icb_texture_selector_missing"));
-                };
+                let selector = staged.storage_selector_or_refuse(task_id, acc.pipeline_ref)?;
                 let Some((pixel_format, bpp)) = storage_image_format(selector) else {
                     crate::observe::fail(format!(
                         "compute_icb_texture fail reason=metal_selector_unsupported task={task_id} pipe={} bind={} ref={} fmt={:#x} selector={selector}",
@@ -901,39 +891,8 @@ fn apply_icb_compute_encoder_inheritance<M: HostMemory + HostOps>(
                     )?);
                 }
 
-                let mut storage: Vec<ReimsVgpuStorageImage> = Vec::new();
-                let mut sampled: Vec<ReimsVgpuComputeSampledImage> = Vec::new();
-                for t in &mut staged_tex {
-                    let Some(selector) = t.storage_selector else {
-                        crate::observe::fail(format!(
-                            "compute_icb_texture fail reason=metal_selector_missing task={task_id} pipe={} bind={} fmt={:#x} storage={}",
-                            acc.pipeline_ref,
-                            t.binding,
-                            t.pixel_format,
-                            t.is_storage as u8
-                        ));
-                        return Err(ComputeStatus::Unsupported("icb_storage_selector_missing"));
-                    };
-                    if t.is_storage {
-                        storage.push(ReimsVgpuStorageImage {
-                            binding: t.binding,
-                            format: selector,
-                            width: t.width,
-                            height: t.height,
-                            data: t.bytes.as_mut_ptr(),
-                            len: t.bytes.len(),
-                        });
-                    } else {
-                        sampled.push(ReimsVgpuComputeSampledImage::unswizzled(
-                            t.binding,
-                            selector,
-                            t.width,
-                            t.height,
-                            t.bytes.as_ptr(),
-                            t.bytes.len(),
-                        ));
-                    }
-                }
+                let (mut storage, sampled) =
+                    split_staged_textures(&mut staged_tex, task_id, acc.pipeline_ref)?;
 
                 let mut err_buf = [0i8; 256];
                 let err = (err_buf.as_mut_ptr(), err_buf.len());

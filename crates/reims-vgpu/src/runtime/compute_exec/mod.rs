@@ -997,6 +997,12 @@ fn staged_span_pages<M: HostMemory>(
 
 pub(crate) struct StagedTexture {
     pub binding: u32,
+    /// The guest ref this was staged from. Carried so a refusal downstream can
+    /// name the object the guest bound and not only the slot it bound it to.
+    /// Read by the direct-Metal rail's format refusal; the Vulkan arm reaches
+    /// its images by another route and never asks.
+    #[cfg(all(feature = "backend-metal", target_os = "macos"))]
+    pub texture_ref: u32,
     /// Raw Metal pixel format from the exact texture/view descriptor.
     pub pixel_format: u16,
     /// Product storage-selector ABI when this Metal format is storage-capable.
@@ -1019,6 +1025,87 @@ pub(crate) struct StagedTexture {
     #[cfg(feature = "backend-vulkan")]
     sample_resident: Option<(crate::model::ComputeStorageResidencyKey, u32)>,
     writeback: TextureWriteback,
+}
+
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+use crate::backend::metal::abi::{ReimsVgpuComputeSampledImage, ReimsVgpuStorageImage};
+
+impl StagedTexture {
+    /// The Metal storage-image selector for this texture's guest pixel format,
+    /// or a named refusal.
+    ///
+    /// Sample-only formats such as `RGB9E5Float` have no selector by design, so
+    /// this is a real class rather than an internal error — a guest binding one
+    /// into a compute slot loses that bind, and the line has to say which
+    /// object at which slot in which format.
+    ///
+    /// Three sites asked this one question and each carried its own answer:
+    /// `reason=metal_selector_missing` twice and `reason=no_backend_selector`
+    /// once, under two event names, returning three different refusal slugs,
+    /// with one line carrying `ref`, another `storage` and the third neither.
+    /// A grep for any of the three names found a third of the occurrences.
+    #[cfg(all(feature = "backend-metal", target_os = "macos"))]
+    pub(crate) fn storage_selector_or_refuse(
+        &self,
+        task_id: u32,
+        pipeline_ref: u32,
+    ) -> Result<u32, ComputeStatus> {
+        self.storage_selector.ok_or_else(|| {
+            crate::observe::fail(format!(
+                "compute_texture_format fail reason=no_backend_selector task={task_id} \
+                 pipe={pipeline_ref} bind={} ref={} fmt={:#x} storage={}",
+                self.binding, self.texture_ref, self.pixel_format, self.is_storage as u8
+            ));
+            ComputeStatus::Unsupported("compute_no_backend_selector")
+        })
+    }
+}
+
+/// Split staged compute textures into the two ABI image lists Metal binds.
+///
+/// A storage-capable bind becomes a `ReimsVgpuStorageImage` the kernel writes
+/// through; everything else becomes a sampled image. Both rails that reach the
+/// direct-Metal encoder — the ICB session's inherited binds and the standalone
+/// dispatch — carried a copy of this, byte-identical apart from the refusal
+/// above.
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+#[allow(clippy::type_complexity)]
+pub(crate) fn split_staged_textures(
+    staged: &mut [StagedTexture],
+    task_id: u32,
+    pipeline_ref: u32,
+) -> Result<
+    (
+        Vec<ReimsVgpuStorageImage>,
+        Vec<ReimsVgpuComputeSampledImage>,
+    ),
+    ComputeStatus,
+> {
+    let mut storage: Vec<ReimsVgpuStorageImage> = Vec::new();
+    let mut sampled: Vec<ReimsVgpuComputeSampledImage> = Vec::new();
+    for t in staged {
+        let selector = t.storage_selector_or_refuse(task_id, pipeline_ref)?;
+        if t.is_storage {
+            storage.push(ReimsVgpuStorageImage {
+                binding: t.binding,
+                format: selector,
+                width: t.width,
+                height: t.height,
+                data: t.bytes.as_mut_ptr(),
+                len: t.bytes.len(),
+            });
+        } else {
+            sampled.push(ReimsVgpuComputeSampledImage::unswizzled(
+                t.binding,
+                selector,
+                t.width,
+                t.height,
+                t.bytes.as_ptr(),
+                t.bytes.len(),
+            ));
+        }
+    }
+    Ok((storage, sampled))
 }
 
 #[cfg(feature = "backend-vulkan")]
@@ -1436,6 +1523,8 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
         ));
         return Ok(StagedTexture {
             binding,
+            #[cfg(all(feature = "backend-metal", target_os = "macos"))]
+            texture_ref,
             pixel_format: format,
             storage_selector,
             width,
@@ -1869,6 +1958,8 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
         }
         return Ok(StagedTexture {
             binding,
+            #[cfg(all(feature = "backend-metal", target_os = "macos"))]
+            texture_ref,
             pixel_format: stage_fmt,
             storage_selector,
             width,
@@ -2214,6 +2305,8 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
     }
     Ok(StagedTexture {
         binding,
+        #[cfg(all(feature = "backend-metal", target_os = "macos"))]
+        texture_ref,
         pixel_format: stage_format,
         storage_selector,
         width: w,
@@ -4092,10 +4185,9 @@ fn execute_dispatch_metal<M: HostMemory + HostOps>(
 ) -> ComputeStatus {
     use crate::backend::metal::abi::texture_binds_as_storage;
     use crate::backend::metal::abi::{
-        ReimsVgpuComputeImageblockDimensions, ReimsVgpuComputeSampledImage,
-        ReimsVgpuComputeStageInRegion, ReimsVgpuComputeStageInRegionIndirectArguments,
-        ReimsVgpuComputeTextureUsage, ReimsVgpuSampler, ReimsVgpuStorageImage,
-        ReimsVgpuThreadgroupMemory, REIMS_VGPU_BINDING_SAMPLER_BASE,
+        ReimsVgpuComputeImageblockDimensions, ReimsVgpuComputeStageInRegion,
+        ReimsVgpuComputeStageInRegionIndirectArguments, ReimsVgpuComputeTextureUsage,
+        ReimsVgpuSampler, ReimsVgpuThreadgroupMemory, REIMS_VGPU_BINDING_SAMPLER_BASE,
         REIMS_VGPU_BINDING_TEXTURE_BASE, REIMS_VGPU_COMPUTE_DISPATCH_KIND_THREADGROUPS,
         REIMS_VGPU_COMPUTE_DISPATCH_KIND_THREADS, REIMS_VGPU_MTL_DISPATCH_TYPE_CONCURRENT,
         REIMS_VGPU_MTL_DISPATCH_TYPE_SERIAL,
@@ -4278,37 +4370,12 @@ fn execute_dispatch_metal<M: HostMemory + HostOps>(
 
     let mut reims_vgpu_bufs = abi_buffers(&mut staged_bufs);
 
-    let mut storage: Vec<ReimsVgpuStorageImage> = Vec::new();
-    let mut sampled: Vec<ReimsVgpuComputeSampledImage> = Vec::new();
     // Keep raw pointers valid: build storage/sampled from staged_tex after mut split.
-    for t in &mut staged_tex {
-        let Some(selector) = t.storage_selector else {
-            crate::observe::fail(format!(
-                "compute_metal texture_format fail reason=no_backend_selector pipe={} bind={} fmt={:#x}",
-                acc.pipeline_ref, t.binding, t.pixel_format
-            ));
-            return ComputeStatus::Unsupported("metal_no_backend_selector");
+    let (mut storage, sampled) =
+        match split_staged_textures(&mut staged_tex, task_id, acc.pipeline_ref) {
+            Ok(split) => split,
+            Err(e) => return e,
         };
-        if t.is_storage {
-            storage.push(ReimsVgpuStorageImage {
-                binding: t.binding,
-                format: selector,
-                width: t.width,
-                height: t.height,
-                data: t.bytes.as_mut_ptr(),
-                len: t.bytes.len(),
-            });
-        } else {
-            sampled.push(ReimsVgpuComputeSampledImage::unswizzled(
-                t.binding,
-                selector,
-                t.width,
-                t.height,
-                t.bytes.as_ptr(),
-                t.bytes.len(),
-            ));
-        }
-    }
 
     // Nested: encode onto open session encoder; writeback after segment commit.
     if let Some(sess) = session {
