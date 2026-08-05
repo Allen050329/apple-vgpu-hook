@@ -5,6 +5,7 @@
 
 pub mod checked;
 pub mod endian;
+pub mod extent;
 pub mod gva;
 pub mod gva_resolve;
 pub mod iosurface_pages;

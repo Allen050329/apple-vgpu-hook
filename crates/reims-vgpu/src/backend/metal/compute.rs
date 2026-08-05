@@ -1,5 +1,6 @@
 //! Compute encode path: PSO cache, binds, dispatch core, reflection.
 
+use crate::contract::extent::Extent3;
 use crate::backend::metal::abi::*;
 use crate::backend::metal::cache::{
     compute_pso_insert, compute_pso_lookup, reflect_insert, reflect_lookup,
@@ -639,14 +640,15 @@ pub fn compute_encode_on_encoder(
     imageblock_dimensions: Option<&ReimsVgpuComputeImageblockDimensions>,
     stage_input: Option<&ReimsVgpuComputeStageInputDescriptor>,
     dispatch_kind: u32,
-    grid_x: u32,
-    grid_y: u32,
-    grid_z: u32,
-    tg_x: u32,
-    tg_y: u32,
-    tg_z: u32,
+    grid: Extent3,
+    threadgroup: Extent3,
     err: ErrOut<'_>,
 ) -> Result<ComputeEncodeRetain, Status> {
+    // Unpacked once, here, so the body below keeps reading the six names it
+    // always did. The pair crosses the call as two extents because that is
+    // where a transposition stops being a compile error.
+    let (grid_x, grid_y, grid_z) = (grid.x, grid.y, grid.z);
+    let (tg_x, tg_y, tg_z) = (threadgroup.x, threadgroup.y, threadgroup.z);
     if grid_x == 0 {
         set_err(
             err,
@@ -853,12 +855,8 @@ pub fn compute_core(
     stage_input: Option<&ReimsVgpuComputeStageInputDescriptor>,
     dispatch_kind: u32,
     dispatch_type: u32,
-    grid_x: u32,
-    grid_y: u32,
-    grid_z: u32,
-    tg_x: u32,
-    tg_y: u32,
-    tg_z: u32,
+    grid: Extent3,
+    threadgroup: Extent3,
     err: ErrOut<'_>,
 ) -> Status {
     let Some(metal_dispatch_type) = mtl_dispatch_type(dispatch_type) else {
@@ -893,12 +891,8 @@ pub fn compute_core(
         imageblock_dimensions,
         stage_input,
         dispatch_kind,
-        grid_x,
-        grid_y,
-        grid_z,
-        tg_x,
-        tg_y,
-        tg_z,
+        grid,
+        threadgroup,
         err,
     ) {
         Ok(r) => r,

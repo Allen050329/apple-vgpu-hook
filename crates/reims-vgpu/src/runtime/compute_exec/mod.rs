@@ -2823,19 +2823,13 @@ pub(crate) fn flush_nested_jobs<M: HostMemory + HostOps>(
     ComputeStatus::Ok
 }
 
-/// A dispatch extent, narrowed from the wire's `u64` by [`u32_dim`].
+/// The dispatch extents, narrowed from the wire's `u64` by [`u32_dim`].
 ///
-/// Its own type rather than three `u32`s because the two extents below are
-/// built beside each other from sources that look alike — three consecutive
-/// little-endian words for the indirect arms — and a transposition between
-/// them dispatches a valid grid of the wrong shape, which nothing downstream
-/// can tell from the right one.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Extent3 {
-    x: u32,
-    y: u32,
-    z: u32,
-}
+/// The type is [`crate::contract::extent::Extent3`], which both this decoder
+/// and the Metal backend it dispatches through now name. It used to be private
+/// here, which protected construction and stopped at the backend call — see its
+/// doc for why that was the wrong half of the journey to protect.
+use crate::contract::extent::Extent3;
 
 impl Extent3 {
     /// From a decoded wire `Size3`, refusing each component out of range.
@@ -4138,8 +4132,6 @@ fn execute_dispatch_metal<M: HostMemory + HostOps>(
         Ok(v) => v,
         Err(e) => return e,
     };
-    let (grid_x, grid_y, grid_z) = (grid.x, grid.y, grid.z);
-    let (tg_x, tg_y, tg_z) = (tg.x, tg.y, tg.z);
 
     let dispatch_kind = if dispatch_threads {
         REIMS_VGPU_COMPUTE_DISPATCH_KIND_THREADS
@@ -4353,12 +4345,8 @@ fn execute_dispatch_metal<M: HostMemory + HostOps>(
             imageblock.as_ref(),
             reims_vgpu_stage_input.as_ref(),
             dispatch_kind,
-            grid_x,
-            grid_y,
-            grid_z,
-            tg_x,
-            tg_y,
-            tg_z,
+            grid,
+            tg,
             (err_buf.as_mut_ptr(), err_buf.len()),
         ) {
             Ok(r) => r,
@@ -4394,12 +4382,8 @@ fn execute_dispatch_metal<M: HostMemory + HostOps>(
         reims_vgpu_stage_input.as_ref(),
         dispatch_kind,
         dispatch_type,
-        grid_x,
-        grid_y,
-        grid_z,
-        tg_x,
-        tg_y,
-        tg_z,
+        grid,
+        tg,
         (err_buf.as_mut_ptr(), err_buf.len()),
     );
     if !st.is_ok() {
