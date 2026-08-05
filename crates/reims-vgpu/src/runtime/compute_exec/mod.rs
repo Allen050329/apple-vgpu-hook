@@ -641,20 +641,27 @@ pub(crate) fn load_mtlb<M: HostMemory + HostOps>(
         ));
         None
     };
-    let Some(entry) = objects::lookup_list_entry(state, host, task_id, func_ref) else {
-        return miss(
-            crate::observe::ladder_slug!("", no_list_entry),
-            String::new(),
-        );
-    };
-    if entry.object_type != OBJECT_TYPE_FUNCTION {
-        return miss(
-            crate::observe::ladder_slug!("", wrong_type),
-            format!("ot={}", entry.object_type),
-        );
-    }
-    let Some(desc) = objects::read_descriptor(state, host, task_id, &entry) else {
-        return miss(crate::observe::ladder_slug!("", desc_read), String::new());
+    // The detail the `wrong_type` line carries comes off the rung now: it is the
+    // only thing that still holds the tag once the entry is gone.
+    let (_entry, desc) = match objects::resolve_descriptor(
+        state,
+        host,
+        task_id,
+        func_ref,
+        &[OBJECT_TYPE_FUNCTION],
+    ) {
+        Ok(found) => found,
+        Err(rung) => {
+            return miss(
+                crate::observe::ladder_slugs!("")(rung),
+                match rung {
+                    objects::LadderRung::WrongType { got } => format!("ot={got}"),
+                    objects::LadderRung::NoListEntry | objects::LadderRung::DescRead => {
+                        String::new()
+                    }
+                },
+            )
+        }
     };
     let Ok(f) = decode_function_descriptor(&desc) else {
         return miss(
@@ -718,21 +725,24 @@ pub(crate) fn load_compute_pipeline<M: HostMemory + HostOps>(
         ));
         None
     };
-    let Some(entry) = objects::lookup_list_entry(state, host, task_id, pipeline_ref) else {
-        return miss(
-            crate::observe::ladder_slug!("", no_list_entry),
-            String::new(),
-        );
-    };
-    if entry.object_type != OBJECT_TYPE_TYPE7 {
-        return miss(
-            crate::observe::ladder_slug!("", wrong_type),
-            format!("ot={}", entry.object_type),
-        );
-    }
-    let Some(desc) = objects::read_descriptor(state, host, task_id, &entry) else {
-        return miss(crate::observe::ladder_slug!("", desc_read), String::new());
-    };
+    // The detail the `wrong_type` line carries comes off the rung now: it is the
+    // only thing that still holds the tag once the entry is gone.
+    let (_entry, desc) =
+        match objects::resolve_descriptor(state, host, task_id, pipeline_ref, &[OBJECT_TYPE_TYPE7])
+        {
+            Ok(found) => found,
+            Err(rung) => {
+                return miss(
+                    crate::observe::ladder_slugs!("")(rung),
+                    match rung {
+                        objects::LadderRung::WrongType { got } => format!("ot={got}"),
+                        objects::LadderRung::NoListEntry | objects::LadderRung::DescRead => {
+                            String::new()
+                        }
+                    },
+                )
+            }
+        };
     let Ok(decoded) = decode_type7_descriptor(&desc) else {
         return miss(
             crate::observe::ladder_slug!("", desc_decode),
@@ -848,32 +858,27 @@ pub(crate) fn stage_buffer<M: HostMemory + HostOps>(
         ));
         Err(st)
     };
-    let Some(entry) = objects::lookup_list_entry(state, host, task_id, bind.buffer_ref) else {
-        return miss(
-            ComputeStatus::MissingBuffer(crate::observe::ladder_slug!(
-                "compute_stage_buf",
-                no_list_entry
-            )),
-            String::new(),
-        );
-    };
-    if entry.object_type != OBJECT_TYPE_BUFFER {
-        return miss(
-            ComputeStatus::MissingBuffer(crate::observe::ladder_slug!(
-                "compute_stage_buf",
-                wrong_type
-            )),
-            format!("ot={}", entry.object_type),
-        );
-    }
-    let Some(desc_bytes) = objects::read_descriptor(state, host, task_id, &entry) else {
-        return miss(
-            ComputeStatus::MissingBuffer(crate::observe::ladder_slug!(
-                "compute_stage_buf",
-                desc_read
-            )),
-            String::new(),
-        );
+    let (_entry, desc_bytes) = match objects::resolve_descriptor(
+        state,
+        host,
+        task_id,
+        bind.buffer_ref,
+        &[OBJECT_TYPE_BUFFER],
+    ) {
+        Ok(found) => found,
+        Err(rung) => {
+            return miss(
+                ComputeStatus::MissingBuffer(crate::observe::ladder_slugs!("compute_stage_buf")(
+                    rung,
+                )),
+                match rung {
+                    objects::LadderRung::WrongType { got } => format!("ot={got}"),
+                    objects::LadderRung::NoListEntry | objects::LadderRung::DescRead => {
+                        String::new()
+                    }
+                },
+            )
+        }
     };
     let Ok(desc) = crate::runtime::decode::resource::decode_buffer_descriptor(&desc_bytes) else {
         return miss(
