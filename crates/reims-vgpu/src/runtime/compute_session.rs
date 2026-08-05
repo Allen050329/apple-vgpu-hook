@@ -773,24 +773,18 @@ fn apply_icb_compute_encoder_inheritance<M: HostMemory + HostOps>(
             // Samplers for AB.
             let mut mtl_samps: Vec<metal::SamplerState> = Vec::new();
             for s in &stream_samp {
-                let entry = objects::lookup_list_entry(state, host, task_id, s.sampler_ref).ok_or(
-                    ComputeStatus::MissingSampler(crate::observe::ladder_slug!(
-                        "compute_icb_inherit_ab_sampler",
-                        no_list_entry
-                    )),
-                )?;
-                if entry.object_type != OBJECT_TYPE_TYPE7 {
-                    return Err(ComputeStatus::MissingSampler(crate::observe::ladder_slug!(
-                        "compute_icb_inherit_ab_sampler",
-                        wrong_type
-                    )));
-                }
-                let desc_bytes = objects::read_descriptor(state, host, task_id, &entry).ok_or(
-                    ComputeStatus::MissingSampler(crate::observe::ladder_slug!(
-                        "compute_icb_inherit_ab_sampler",
-                        desc_read
-                    )),
-                )?;
+                let (_entry, desc_bytes) = objects::resolve_descriptor(
+                    state,
+                    host,
+                    task_id,
+                    s.sampler_ref,
+                    &[OBJECT_TYPE_TYPE7],
+                )
+                .map_err(|rung| {
+                    ComputeStatus::MissingSampler(crate::observe::ladder_slugs!(
+                        "compute_icb_inherit_ab_sampler"
+                    )(rung))
+                })?;
                 if desc_bytes.len() < 4 || ld32(&desc_bytes) != TYPE7_OBJECT_SAMPLER {
                     return Err(ComputeStatus::MissingSampler(
                         "compute_icb_inherit_ab_sampler_bad_tag",
@@ -954,23 +948,18 @@ fn apply_icb_compute_encoder_inheritance<M: HostMemory + HostOps>(
                     if s.sampler_ref == 0 {
                         continue;
                     }
-                    let entry = objects::lookup_list_entry(state, host, task_id, s.sampler_ref)
-                        .ok_or(ComputeStatus::MissingSampler(crate::observe::ladder_slug!(
-                            "compute_icb_inherit_sampler",
-                            no_list_entry
-                        )))?;
-                    if entry.object_type != OBJECT_TYPE_TYPE7 {
-                        return Err(ComputeStatus::MissingSampler(crate::observe::ladder_slug!(
-                            "compute_icb_inherit_sampler",
-                            wrong_type
-                        )));
-                    }
-                    let desc_bytes = objects::read_descriptor(state, host, task_id, &entry).ok_or(
-                        ComputeStatus::MissingSampler(crate::observe::ladder_slug!(
-                            "compute_icb_inherit_sampler",
-                            desc_read
-                        )),
-                    )?;
+                    let (_entry, desc_bytes) = objects::resolve_descriptor(
+                        state,
+                        host,
+                        task_id,
+                        s.sampler_ref,
+                        &[OBJECT_TYPE_TYPE7],
+                    )
+                    .map_err(|rung| {
+                        ComputeStatus::MissingSampler(crate::observe::ladder_slugs!(
+                            "compute_icb_inherit_sampler"
+                        )(rung))
+                    })?;
                     if desc_bytes.len() < 4 || ld32(&desc_bytes) != TYPE7_OBJECT_SAMPLER {
                         return Err(ComputeStatus::MissingSampler(
                             "compute_icb_inherit_sampler_bad_tag",

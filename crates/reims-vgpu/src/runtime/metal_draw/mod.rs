@@ -2876,25 +2876,23 @@ fn load_sampler<M: HostMemory + HostOps>(
     slot: u32,
 ) -> Result<crate::backend::metal::abi::ReimsVgpuSampler, MetalStateDecline> {
     use crate::backend::metal::abi::REIMS_VGPU_BINDING_SAMPLER_BASE;
-    let entry = objects::lookup_list_entry(state, host, task_id, sampler_ref).ok_or(
-        MetalStateDecline::SamplerEntryMissing {
-            sampler_ref,
-            index: slot,
-        },
-    )?;
-    if entry.object_type != OBJECT_TYPE_TYPE7 {
-        return Err(MetalStateDecline::SamplerObjectType {
-            sampler_ref,
-            index: slot,
-            object_type: entry.object_type,
-        });
-    }
-    let desc = objects::read_descriptor(state, host, task_id, &entry).ok_or(
-        MetalStateDecline::SamplerDescriptorMissing {
-            sampler_ref,
-            index: slot,
-        },
-    )?;
+    let (_entry, desc) =
+        objects::resolve_descriptor(state, host, task_id, sampler_ref, &[OBJECT_TYPE_TYPE7])
+            .map_err(|rung| match rung {
+                objects::LadderRung::NoListEntry => MetalStateDecline::SamplerEntryMissing {
+                    sampler_ref,
+                    index: slot,
+                },
+                objects::LadderRung::WrongType { got } => MetalStateDecline::SamplerObjectType {
+                    sampler_ref,
+                    index: slot,
+                    object_type: got,
+                },
+                objects::LadderRung::DescRead => MetalStateDecline::SamplerDescriptorMissing {
+                    sampler_ref,
+                    index: slot,
+                },
+            })?;
     let s =
         decode_sampler_descriptor(&desc).map_err(|reason| MetalStateDecline::SamplerDecode {
             sampler_ref,
@@ -3080,25 +3078,25 @@ pub(crate) fn load_vulkan_sampler<M: HostMemory + HostOps>(
     sampler_ref: u32,
     binding: u32,
 ) -> Result<crate::backend::vulkan::engine::SamplerResource, DrawPreparationDecline> {
-    let entry = objects::lookup_list_entry(state, host, task_id, sampler_ref).ok_or(
-        DrawPreparationDecline::SamplerEntryMissing {
-            sampler_ref,
-            binding,
-        },
-    )?;
-    if entry.object_type != OBJECT_TYPE_TYPE7 {
-        return Err(DrawPreparationDecline::SamplerObjectType {
-            sampler_ref,
-            binding,
-            object_type: entry.object_type,
-        });
-    }
-    let desc = objects::read_descriptor(state, host, task_id, &entry).ok_or(
-        DrawPreparationDecline::SamplerDescriptorMissing {
-            sampler_ref,
-            binding,
-        },
-    )?;
+    let (_entry, desc) =
+        objects::resolve_descriptor(state, host, task_id, sampler_ref, &[OBJECT_TYPE_TYPE7])
+            .map_err(|rung| match rung {
+                objects::LadderRung::NoListEntry => DrawPreparationDecline::SamplerEntryMissing {
+                    sampler_ref,
+                    binding,
+                },
+                objects::LadderRung::WrongType { got } => {
+                    DrawPreparationDecline::SamplerObjectType {
+                        sampler_ref,
+                        binding,
+                        object_type: got,
+                    }
+                }
+                objects::LadderRung::DescRead => DrawPreparationDecline::SamplerDescriptorMissing {
+                    sampler_ref,
+                    binding,
+                },
+            })?;
     let descriptor_len = desc.len();
     let tag = desc.get(..4).map(ld32);
     let declared_len = desc.get(4..8).map(ld32);
