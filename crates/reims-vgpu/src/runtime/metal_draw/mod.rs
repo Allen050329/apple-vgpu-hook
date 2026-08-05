@@ -2923,9 +2923,9 @@ fn load_linear_texture_rgba_at_level<M: HostMemory + HostOps>(
     }
     let desc_bytes = objects::read_descriptor(state, host, task_id, &entry)?;
     let tex = decode_texture_descriptor(&desc_bytes).ok()?;
-    if tex.declared_pixel_format().is_none() {
-        return None;
-    }
+    // A descriptor that declares no pixel format is not a texture this can
+    // sample; the field's own value is read below only once that is settled.
+    tex.declared_pixel_format()?;
     let base_fmt = tex.pixel_format;
     let sample_fmt = effective_view_sample_format(base_fmt, format_override)?;
     let (gva, layout) = tex.level_gva(level, state.page_shift)?;

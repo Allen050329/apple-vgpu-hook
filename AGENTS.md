@@ -393,15 +393,22 @@ Each commit should have a detailed message body that states:
 - What was not verified, if anything.
 
 Rust commits should be warning-free under clippy with `-D warnings` for every affected matrix arm.
-Use the appropriate subset for the host and change; the Metal command is Apple-only:
+**All three run on a Linux host** — the Metal arm needs its `--target`, and with it clippy analyses
+the `backend-metal` code without an Apple machine:
 
 ```sh
-cargo clippy -p reims-vgpu --all-targets --features backend-metal -- -D warnings
+cargo clippy -p reims-vgpu --target aarch64-apple-darwin --all-targets --no-default-features --features backend-metal -- -D warnings
 cargo clippy -p reims-vgpu --all-targets --no-default-features --features backend-vulkan,host-window -- -D warnings
 cargo clippy -p reims-vgpu --target x86_64-unknown-linux-gnu --all-targets --no-default-features --features backend-vulkan,host-window -- -D warnings
 ```
 
-Expect zero from all three. Do not hide warnings, skip an affected arm, or commit a dropped test
+Expect zero from all three. **`scripts/feature-matrix` does not cover this**: it runs `cargo check`,
+so its `warnings=0` is a rustc count and it cannot see a clippy lint on any arm. That gap plus a
+"the Metal command is Apple-only" line that used to sit here is how a `clippy::question_mark` in
+`runtime/metal_draw/mod.rs` survived several commits that each said "clippy clean" — every one of
+them was clean on the arms it ran, and nobody on a Linux host ran the Metal one.
+
+Do not hide warnings, skip an affected arm, or commit a dropped test
 count without calling it out — and **do not read "clippy clean" in a commit body as covering every
 arm**; it means the arms that commit ran.
 
