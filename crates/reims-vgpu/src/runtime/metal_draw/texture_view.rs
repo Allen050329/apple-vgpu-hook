@@ -572,16 +572,18 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
     native_bgra8: bool,
 ) -> Result<(Vec<u8>, TexelLayout), LinearLoadRefusal> {
     use LinearLoadRefusal as R;
-    let entry =
-        objects::lookup_list_entry(state, host, task_id, texture_ref).ok_or(R::ObjectListMiss)?;
-    if entry.object_type != OBJECT_TYPE_TEXTURE && entry.object_type != OBJECT_TYPE_TEXTURE_VARIANT
-    {
-        return Err(R::NotATexture {
-            object_type: entry.object_type,
-        });
-    }
-    let desc_bytes =
-        objects::read_descriptor(state, host, task_id, &entry).ok_or(R::DescriptorUnreadable)?;
+    let (_entry, desc_bytes) = objects::resolve_descriptor(
+        state,
+        host,
+        task_id,
+        texture_ref,
+        &[OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_VARIANT],
+    )
+    .map_err(|rung| match rung {
+        objects::LadderRung::NoListEntry => R::ObjectListMiss,
+        objects::LadderRung::WrongType { got } => R::NotATexture { object_type: got },
+        objects::LadderRung::DescRead => R::DescriptorUnreadable,
+    })?;
     let tex = decode_texture_descriptor(&desc_bytes).map_err(|_| R::DescriptorUndecodable)?;
     if tex.declared_pixel_format().is_none() {
         return Err(R::NoPixelFormat);

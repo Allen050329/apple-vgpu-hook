@@ -2378,22 +2378,23 @@ fn load_depth_stencil_state<M: HostMemory + HostOps>(
     ds_ref: u32,
 ) -> Result<crate::backend::metal::abi::ReimsVgpuDepthStencilState, MetalStateDecline> {
     use crate::backend::metal::abi::{ReimsVgpuDepthStencilFaceState, ReimsVgpuDepthStencilState};
-    let entry = objects::lookup_list_entry(state, host, task_id, ds_ref).ok_or(
-        MetalStateDecline::DepthStencilEntryMissing {
-            depth_stencil_ref: ds_ref,
-        },
-    )?;
-    if entry.object_type != OBJECT_TYPE_TYPE7 {
-        return Err(MetalStateDecline::DepthStencilObjectType {
-            depth_stencil_ref: ds_ref,
-            object_type: entry.object_type,
-        });
-    }
-    let desc = objects::read_descriptor(state, host, task_id, &entry).ok_or(
-        MetalStateDecline::DepthStencilDescriptorMissing {
-            depth_stencil_ref: ds_ref,
-        },
-    )?;
+    let (_entry, desc) =
+        objects::resolve_descriptor(state, host, task_id, ds_ref, &[OBJECT_TYPE_TYPE7]).map_err(
+            |rung| match rung {
+                objects::LadderRung::NoListEntry => MetalStateDecline::DepthStencilEntryMissing {
+                    depth_stencil_ref: ds_ref,
+                },
+                objects::LadderRung::WrongType { got } => {
+                    MetalStateDecline::DepthStencilObjectType {
+                        depth_stencil_ref: ds_ref,
+                        object_type: got,
+                    }
+                }
+                objects::LadderRung::DescRead => MetalStateDecline::DepthStencilDescriptorMissing {
+                    depth_stencil_ref: ds_ref,
+                },
+            },
+        )?;
     let d = decode_depth_stencil_descriptor(&desc).map_err(|reason| {
         MetalStateDecline::DepthStencilDecode {
             depth_stencil_ref: ds_ref,
