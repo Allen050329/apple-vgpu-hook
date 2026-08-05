@@ -63,6 +63,14 @@ mod metal_icb;
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 pub use metal_icb::*;
 
+// The host-side depth/stencil attachment buffers. Gated once here, and not
+// re-exported flat — its items are this module's own working parts, not part of
+// `metal_draw`'s surface.
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+mod depth_stencil;
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+use depth_stencil::{seed_host_depth_stencil, DepthStencilAspect, HostAttachment};
+
 // Type-8 texture-view resolution and linear texture loads. Backend-independent,
 // so the module carries no gate of its own; the two items inside it that are
 // arm- or test-specific keep theirs.
@@ -1595,157 +1603,51 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
     let stencil_ref_opt = stencil_ref_state.as_ref();
 
     // Host-side depth/stencil attachment buffers (guest LOAD / clear seed, STORE writeback).
-    let mut depth_storage: Option<Vec<u8>> = None;
     let mut depth_attach_api: Option<ReimsVgpuDepthAttachment> = None;
-    let mut depth_mapping_id = 0u32;
-    if let Some(da) = &req.depth_attach {
-        if da.present
-            && da.level == 0
-            && da.resolve_texture_ref == 0
-            && da.load_action <= PASS_LOAD_ACTION_CLEAR
-            && (da.store_action == PASS_STORE_ACTION_DONT_CARE
-                || da.store_action == PASS_STORE_ACTION_STORE)
-        {
-            // The pass extent, same as every other attachment in it — the depth
-            // buffer's rows and its row count have to come from one geometry.
-            let row = width.saturating_mul(4);
-            let depth_len = (row as usize).saturating_mul(height as usize);
-            let mut buf = vec![0u8; depth_len];
-            let mid =
-                objects::resolve_type11_ref(state, host, req.task_id, da.texture_ref).unwrap_or(0);
-            if mid != 0 {
-                let _ = mapper::ensure_resolved_for_scanout(state, host, mid);
-            }
-            match da.load_action {
-                x if x == PASS_LOAD_ACTION_CLEAR => {
-                    fill_depth32(&mut buf, da.clear_depth as f32);
-                }
-                x if x == PASS_LOAD_ACTION_LOAD => {
-                    let ok = if mid != 0 {
-                        mapping_write::read_raw_rows(
-                            state, host, mid, &mut buf, row, row, width, height,
-                        )
-                    } else {
-                        load_linear_raw(
-                            state,
-                            host,
-                            req.task_id,
-                            da.texture_ref,
-                            &mut buf,
-                            row,
-                            row,
-                            width,
-                            height,
-                        )
-                    };
-                    if !ok {
-                        // The guest asked to load prior depth and this device
-                        // could not read it, so the pass runs against clear
-                        // values instead: depth tests decide against content the
-                        // guest never wrote. The load action deliberately stays
-                        // LOAD — the seeded buffer *is* what Metal loads, so
-                        // switching it to CLEAR would describe the same bytes
-                        // twice — but the substitution is a loss of guest state
-                        // and says so. The Vulkan arm reports the same class
-                        // through `shader_state_degraded`; this one did not.
-                        fill_depth32(&mut buf, da.clear_depth as f32);
-                        if degrade_log_first(req.pipeline_ref, "depth_load_readback_failed") {
-                            crate::observe::fail(format!(
-                                "shader_state_degraded reason=depth_load_readback_failed \
-                                 pipe={} task={} ds_ref={} mid={mid} {width}x{height} \
-                                 (guest depth unreadable; pass seeded with clear_depth)",
-                                req.pipeline_ref, req.task_id, da.texture_ref
-                            ));
-                        }
-                    }
-                }
-                _ => {}
-            }
-            let data_ptr = buf.as_mut_ptr();
-            depth_storage = Some(buf);
-            depth_mapping_id = mid;
-            depth_attach_api = Some(ReimsVgpuDepthAttachment {
-                pixel_format: REIMS_VGPU_MTL_PIXEL_FORMAT_DEPTH32_FLOAT,
-                load_action: map_load_action(req.pipeline_ref, da.load_action),
-                store_action: map_store_action(da.store_action),
-                clear_depth: da.clear_depth,
-                data: data_ptr,
-                len: depth_len,
-            });
-        }
-    }
+    let depth_storage = req.depth_attach.as_ref().and_then(|da| {
+        let mut seeded = seed_host_depth_stencil(
+            state,
+            host,
+            req,
+            DepthStencilAspect::Depth {
+                clear: da.clear_depth,
+            },
+            HostAttachment::from(*da),
+            (width, height),
+        )?;
+        depth_attach_api = Some(ReimsVgpuDepthAttachment {
+            pixel_format: REIMS_VGPU_MTL_PIXEL_FORMAT_DEPTH32_FLOAT,
+            load_action: map_load_action(req.pipeline_ref, da.load_action),
+            store_action: map_store_action(da.store_action),
+            clear_depth: da.clear_depth,
+            data: seeded.data.as_mut_ptr(),
+            len: seeded.data.len(),
+        });
+        Some(seeded)
+    });
 
-    let mut stencil_storage: Option<Vec<u8>> = None;
     let mut stencil_attach_api: Option<ReimsVgpuStencilAttachment> = None;
-    let mut stencil_mapping_id = 0u32;
-    if let Some(sa) = &req.stencil_attach {
-        if sa.present
-            && sa.level == 0
-            && sa.resolve_texture_ref == 0
-            && sa.load_action <= PASS_LOAD_ACTION_CLEAR
-            && (sa.store_action == PASS_STORE_ACTION_DONT_CARE
-                || sa.store_action == PASS_STORE_ACTION_STORE)
-        {
-            let stencil_len = (width as usize).saturating_mul(height as usize);
-            let mut buf = vec![0u8; stencil_len];
-            let mid =
-                objects::resolve_type11_ref(state, host, req.task_id, sa.texture_ref).unwrap_or(0);
-            if mid != 0 {
-                let _ = mapper::ensure_resolved_for_scanout(state, host, mid);
-            }
-            match sa.load_action {
-                x if x == PASS_LOAD_ACTION_CLEAR => {
-                    buf.fill(sa.clear_stencil as u8);
-                }
-                x if x == PASS_LOAD_ACTION_LOAD => {
-                    let ok = if mid != 0 {
-                        mapping_write::read_raw_rows(
-                            state, host, mid, &mut buf, width, width, width, height,
-                        )
-                    } else {
-                        load_linear_raw(
-                            state,
-                            host,
-                            req.task_id,
-                            sa.texture_ref,
-                            &mut buf,
-                            width,
-                            width,
-                            width,
-                            height,
-                        )
-                    };
-                    if !ok {
-                        // Same substitution and the same loss as the depth arm
-                        // above: the guest's stencil contents are replaced by
-                        // clear_stencil, so every stencil test in the pass reads
-                        // state the guest never wrote.
-                        buf.fill(sa.clear_stencil as u8);
-                        if degrade_log_first(req.pipeline_ref, "stencil_load_readback_failed") {
-                            crate::observe::fail(format!(
-                                "shader_state_degraded reason=stencil_load_readback_failed \
-                                 pipe={} task={} ds_ref={} mid={mid} {width}x{height} \
-                                 (guest stencil unreadable; pass seeded with clear_stencil)",
-                                req.pipeline_ref, req.task_id, sa.texture_ref
-                            ));
-                        }
-                    }
-                }
-                _ => {}
-            }
-            let data_ptr = buf.as_mut_ptr();
-            stencil_storage = Some(buf);
-            stencil_mapping_id = mid;
-            stencil_attach_api = Some(ReimsVgpuStencilAttachment {
-                pixel_format: REIMS_VGPU_MTL_PIXEL_FORMAT_STENCIL8,
-                load_action: map_load_action(req.pipeline_ref, sa.load_action),
-                store_action: map_store_action(sa.store_action),
-                clear_stencil: sa.clear_stencil,
-                data: data_ptr,
-                len: stencil_len,
-            });
-        }
-    }
+    let stencil_storage = req.stencil_attach.as_ref().and_then(|sa| {
+        let mut seeded = seed_host_depth_stencil(
+            state,
+            host,
+            req,
+            DepthStencilAspect::Stencil {
+                clear: sa.clear_stencil,
+            },
+            HostAttachment::from(*sa),
+            (width, height),
+        )?;
+        stencil_attach_api = Some(ReimsVgpuStencilAttachment {
+            pixel_format: REIMS_VGPU_MTL_PIXEL_FORMAT_STENCIL8,
+            load_action: map_load_action(req.pipeline_ref, sa.load_action),
+            store_action: map_store_action(sa.store_action),
+            clear_stencil: sa.clear_stencil,
+            data: seeded.data.as_mut_ptr(),
+            len: seeded.data.len(),
+        });
+        Some(seeded)
+    });
 
     let mut index_storage: Option<Vec<u8>> = None;
     let indexed_draw: Option<ReimsVgpuIndexedDraw> = if let Some(info) = &req.indexed {
@@ -2080,47 +1982,14 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
     }
 
     // Optional depth/stencil store writeback into type-11 mappings.
-    if let (Some(da), Some(buf)) = (&req.depth_attach, &depth_storage) {
-        if da.store_action == PASS_STORE_ACTION_STORE && depth_mapping_id != 0 {
-            let row = width.saturating_mul(4);
-            let _ = mapper::ensure_resolved_for_scanout(state, host, depth_mapping_id);
-            let _ = mapping_write::write_raw_rows(
-                state,
-                host,
-                depth_mapping_id,
-                buf,
-                row,
-                row,
-                width,
-                height,
-            );
-        }
-    }
-    if let (Some(sa), Some(buf)) = (&req.stencil_attach, &stencil_storage) {
-        if sa.store_action == PASS_STORE_ACTION_STORE && stencil_mapping_id != 0 {
-            let _ = mapper::ensure_resolved_for_scanout(state, host, stencil_mapping_id);
-            let _ = mapping_write::write_raw_rows(
-                state,
-                host,
-                stencil_mapping_id,
-                buf,
-                width,
-                width,
-                width,
-                height,
-            );
-        }
+    for seeded in [depth_storage.as_ref(), stencil_storage.as_ref()]
+        .into_iter()
+        .flatten()
+    {
+        seeded.store_back(state, host, (width, height));
     }
     let color0_rgba = color_outs.first().cloned();
     (EncodeStatus::Ok, color0_rgba)
-}
-
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-fn fill_depth32(buf: &mut [u8], depth: f32) {
-    let bits = depth.to_bits().to_le_bytes();
-    for i in 0..(buf.len() / 4) {
-        buf[i * 4..i * 4 + 4].copy_from_slice(&bits);
-    }
 }
 
 /// Type-2/3 linear GVA raw image read (tight dst rows of `row_bytes`).
@@ -2461,11 +2330,11 @@ fn icb_depth_stencil_decline(req: &DrawEncodeRequest) -> Option<MetalStateDeclin
     let depth_attachment = req
         .depth_attach
         .as_ref()
-        .is_some_and(|attachment| attachment.present);
+        .is_some_and(|attachment| attachment.texture_ref != 0);
     let stencil_attachment = req
         .stencil_attach
         .as_ref()
-        .is_some_and(|attachment| attachment.present);
+        .is_some_and(|attachment| attachment.texture_ref != 0);
     (req.depth_stencil_ref != 0 || depth_attachment || stencil_attachment).then_some(
         MetalStateDecline::IcbDepthStencilUnsupported {
             depth_stencil_ref: req.depth_stencil_ref,

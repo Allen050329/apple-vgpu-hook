@@ -399,9 +399,19 @@ pub enum Kind {
 }
 
 /// One color attachment from a render-pass descriptor (0x1a).
+///
+/// # Whether a slot is bound is `texture_ref != 0`, and only that
+///
+/// All three attachment shapes carried a `present: bool` beside `texture_ref`
+/// that every decode path set to `texture_ref != 0` — the derived copy of a
+/// field sitting next to the field it is derived from. The two could disagree
+/// only by construction, and did: a bound-but-textureless attachment is not a
+/// thing this decoder can produce, yet a caller could build one and a consumer
+/// reading `present` would honour it. One call site had already written both
+/// halves in one expression (`!att.present || att.texture_ref == 0`), which is
+/// the same test twice.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct ColorAttachment {
-    pub present: bool,
     pub texture_ref: u32,
     pub resolve_texture_ref: u32,
     pub level: u32,
@@ -418,7 +428,6 @@ pub struct ColorAttachment {
 /// Depth attachment from a render-pass descriptor (slot @0x00).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct DepthAttachment {
-    pub present: bool,
     pub texture_ref: u32,
     pub resolve_texture_ref: u32,
     pub level: u32,
@@ -436,10 +445,62 @@ pub struct DepthAttachment {
     pub clear_depth: f64,
 }
 
+/// The subresource coordinates and resolve target shared by all three
+/// attachment shapes, lifted so the arms that read them cannot drift apart.
+///
+/// They are one 28-byte prefix on the wire
+/// ([`reims_vgpu_wire::ops::render_pass::AttachmentPrefix`]), and this device
+/// had two arms reading it with two copies of the same four-line check. A
+/// third copy is what the colour arm would have needed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AttachSubresource {
+    pub level: u32,
+    pub slice: u32,
+    pub depth_plane: u32,
+    pub resolve_texture_ref: u32,
+}
+
+impl From<DepthAttachment> for AttachSubresource {
+    fn from(a: DepthAttachment) -> Self {
+        Self {
+            level: a.level,
+            slice: a.slice,
+            depth_plane: a.depth_plane,
+            resolve_texture_ref: a.resolve_texture_ref,
+        }
+    }
+}
+
+impl From<StencilAttachment> for AttachSubresource {
+    fn from(a: StencilAttachment) -> Self {
+        Self {
+            level: a.level,
+            slice: a.slice,
+            depth_plane: a.depth_plane,
+            resolve_texture_ref: a.resolve_texture_ref,
+        }
+    }
+}
+
+/// Whether this device can honour a depth or stencil attachment as decoded.
+///
+/// Only the whole texture at level 0, slice 0, plane 0 with no multisample
+/// resolve. `slice` and `depth_plane` joined the test when they became
+/// decodable: a depth buffer bound at slice 5 was previously read as slice 0 and
+/// silently accepted, which is the same defect the colour arm had.
+///
+/// It lives beside the structs it reads because two modules apply it — the
+/// stream decode that admits an attachment into a pass, and the Metal rail that
+/// builds a host-side buffer for one. The rail used to carry its own copy
+/// testing `level` and `resolve_texture_ref` only, so the two `u16` fields above
+/// `level` were checked in one place and not the other.
+pub fn depth_stencil_is_bindable(s: AttachSubresource) -> bool {
+    s.level == 0 && s.slice == 0 && s.depth_plane == 0 && s.resolve_texture_ref == 0
+}
+
 /// Stencil attachment from a render-pass descriptor (slot @0x28).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct StencilAttachment {
-    pub present: bool,
     pub texture_ref: u32,
     pub resolve_texture_ref: u32,
     pub level: u32,
@@ -647,9 +708,8 @@ pub fn opcode_supported(opcode: u32) -> bool {
 /// Both are decoded now.
 fn color_from_wire(c: &wire_pass::ColorAttachmentBody) -> ColorAttachment {
     let p = &c.prefix;
-    let texture_ref = p.texture_ref.get();
     ColorAttachment {
-        texture_ref,
+        texture_ref: p.texture_ref.get(),
         resolve_texture_ref: p.resolve_texture_ref.get(),
         level: u32::from(p.level.get()),
         slice: u32::from(p.slice.get()),
@@ -657,15 +717,13 @@ fn color_from_wire(c: &wire_pass::ColorAttachmentBody) -> ColorAttachment {
         load_action: p.load_action.get(),
         store_action: p.store_action.get(),
         clear_color: c.clear_color(),
-        present: texture_ref != 0,
     }
 }
 
 fn depth_from_wire(d: &wire_pass::DepthAttachmentBody) -> DepthAttachment {
     let p = &d.prefix;
-    let texture_ref = p.texture_ref.get();
     DepthAttachment {
-        texture_ref,
+        texture_ref: p.texture_ref.get(),
         resolve_texture_ref: p.resolve_texture_ref.get(),
         level: u32::from(p.level.get()),
         slice: u32::from(p.slice.get()),
@@ -673,15 +731,13 @@ fn depth_from_wire(d: &wire_pass::DepthAttachmentBody) -> DepthAttachment {
         load_action: p.load_action.get(),
         store_action: p.store_action.get(),
         clear_depth: d.clear_depth(),
-        present: texture_ref != 0,
     }
 }
 
 fn stencil_from_wire(s: &wire_pass::StencilAttachmentBody) -> StencilAttachment {
     let p = &s.prefix;
-    let texture_ref = p.texture_ref.get();
     StencilAttachment {
-        texture_ref,
+        texture_ref: p.texture_ref.get(),
         resolve_texture_ref: p.resolve_texture_ref.get(),
         level: u32::from(p.level.get()),
         slice: u32::from(p.slice.get()),
@@ -689,7 +745,6 @@ fn stencil_from_wire(s: &wire_pass::StencilAttachmentBody) -> StencilAttachment 
         load_action: p.load_action.get(),
         store_action: p.store_action.get(),
         clear_stencil: s.clear_stencil.get(),
-        present: texture_ref != 0,
     }
 }
 
@@ -2153,11 +2208,9 @@ mod tests {
             9,
         );
         let d = decode_depth_attachment(&payload);
-        assert!(d.present);
         assert_eq!(d.texture_ref, 77);
         assert!((d.clear_depth - 0.5).abs() < 1e-9);
         let s = decode_stencil_attachment(&payload);
-        assert!(s.present);
         assert_eq!(s.texture_ref, 88);
         assert_eq!(s.clear_stencil, 9);
     }
@@ -2192,19 +2245,101 @@ mod tests {
             0xfe,
         );
         let d = decode_depth_attachment(&payload);
-        assert!(
-            d.present,
+        assert_eq!(
+            d.texture_ref, 31,
             "depth record is complete at {PASS_STENCIL_ATTACH_OFF} bytes"
         );
-        assert_eq!(d.texture_ref, 31);
         assert!((d.clear_depth - 0.25).abs() < 1e-9);
         let s = decode_stencil_attachment(&payload);
-        assert!(
-            s.present,
+        assert_eq!(
+            s.texture_ref, 32,
             "stencil record is complete at {PASS_COLOR_ATTACH_OFF} bytes"
         );
-        assert_eq!(s.texture_ref, 32);
         assert_eq!(s.clear_stencil, 0xfe);
+    }
+
+    /// All four fields of the prefix decide bindability, and both attachment
+    /// shapes hand all four to the rule.
+    ///
+    /// The rule had two consumers and the second carried its own copy testing
+    /// `level` and `resolve_texture_ref` only — so a depth buffer bound at
+    /// slice 5 was refused by the stream decode and would have been accepted by
+    /// the Metal rail. This drives each field on its own, from both shapes, so
+    /// a consumer that reconstructs three of the four fails here rather than at
+    /// a guest that binds an array layer.
+    #[test]
+    fn every_field_of_the_attachment_prefix_decides_bindability() {
+        assert!(
+            depth_stencil_is_bindable(AttachSubresource::default()),
+            "the whole texture at level 0, slice 0, plane 0 with no resolve is bindable"
+        );
+
+        for (name, sub) in [
+            (
+                "level",
+                AttachSubresource {
+                    level: 1,
+                    ..AttachSubresource::default()
+                },
+            ),
+            (
+                "slice",
+                AttachSubresource {
+                    slice: 5,
+                    ..AttachSubresource::default()
+                },
+            ),
+            (
+                "depth_plane",
+                AttachSubresource {
+                    depth_plane: 2,
+                    ..AttachSubresource::default()
+                },
+            ),
+            (
+                "resolve_texture_ref",
+                AttachSubresource {
+                    resolve_texture_ref: 99,
+                    ..AttachSubresource::default()
+                },
+            ),
+        ] {
+            assert!(
+                !depth_stencil_is_bindable(sub),
+                "a non-default {name} must refuse the attachment on its own"
+            );
+        }
+
+        // And both shapes hand all four to the rule: a field a conversion drops
+        // arrives as 0, which is the value that admits.
+        let all_four = AttachSubresource {
+            level: 1,
+            slice: 5,
+            depth_plane: 2,
+            resolve_texture_ref: 99,
+        };
+        assert_eq!(
+            AttachSubresource::from(DepthAttachment {
+                texture_ref: 77,
+                level: 1,
+                slice: 5,
+                depth_plane: 2,
+                resolve_texture_ref: 99,
+                ..DepthAttachment::default()
+            }),
+            all_four
+        );
+        assert_eq!(
+            AttachSubresource::from(StencilAttachment {
+                texture_ref: 88,
+                level: 1,
+                slice: 5,
+                depth_plane: 2,
+                resolve_texture_ref: 99,
+                ..StencilAttachment::default()
+            }),
+            all_four
+        );
     }
 
     #[test]

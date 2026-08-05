@@ -932,12 +932,16 @@ mod metal_icb_split_tests {
 
         let req = DrawEncodeRequest {
             depth_stencil_ref: 61,
+            // A bound attachment is one naming a texture. These used to say
+            // `present: true` over a zero `texture_ref`, which is a pair the
+            // decoder cannot produce — so the preflight was being proved
+            // against a state no guest can reach.
             depth_attach: Some(DepthAttachment {
-                present: true,
+                texture_ref: 41,
                 ..DepthAttachment::default()
             }),
             stencil_attach: Some(StencilAttachment {
-                present: true,
+                texture_ref: 42,
                 ..StencilAttachment::default()
             }),
             ..DrawEncodeRequest::default()

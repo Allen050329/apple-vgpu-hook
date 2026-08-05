@@ -22,9 +22,9 @@ use crate::runtime::decode::fifo::{
 };
 use crate::runtime::decode::render::{
     self, decode_color_attachment, decode_depth_attachment, decode_stencil_attachment,
-    ColorAttachment, DepthAttachment, Kind as RenderKind, Stage, StencilAttachment,
-    PASS_LOAD_ACTION_CLEAR, PASS_LOAD_ACTION_LOAD, PASS_MAX_COLOR_ATTACHMENTS,
-    PASS_STORE_ACTION_STORE,
+    depth_stencil_is_bindable, AttachSubresource, ColorAttachment, DepthAttachment,
+    Kind as RenderKind, Stage, StencilAttachment, PASS_LOAD_ACTION_CLEAR, PASS_LOAD_ACTION_LOAD,
+    PASS_MAX_COLOR_ATTACHMENTS, PASS_STORE_ACTION_STORE,
 };
 use crate::runtime::decode::stream::{
     self, decode_first_record, decode_next_record, SEGMENT_TYPE_BLIT, SEGMENT_TYPE_COMPUTE,
@@ -1544,26 +1544,16 @@ fn handle_render_record<M: HostMemory + HostOps>(
             if cmd_bytes.len() >= 8 {
                 let payload = &cmd_bytes[8..];
                 let depth = decode_depth_attachment(payload);
-                if depth.present {
-                    if depth_stencil_is_bindable(
-                        depth.level,
-                        depth.slice,
-                        depth.depth_plane,
-                        depth.resolve_texture_ref,
-                    ) {
+                if depth.texture_ref != 0 {
+                    if depth_stencil_is_bindable(depth.into()) {
                         acc.depth_attach = Some(depth);
                     } else {
                         note_depth_stencil_unsupported(task_id, "depth", &depth.into());
                     }
                 }
                 let stencil = decode_stencil_attachment(payload);
-                if stencil.present {
-                    if depth_stencil_is_bindable(
-                        stencil.level,
-                        stencil.slice,
-                        stencil.depth_plane,
-                        stencil.resolve_texture_ref,
-                    ) {
+                if stencil.texture_ref != 0 {
+                    if depth_stencil_is_bindable(stencil.into()) {
                         acc.stencil_attach = Some(stencil);
                     } else {
                         note_depth_stencil_unsupported(task_id, "stencil", &stencil.into());
@@ -1571,7 +1561,7 @@ fn handle_render_record<M: HostMemory + HostOps>(
                 }
                 for i in 0..PASS_MAX_COLOR_ATTACHMENTS {
                     let att = decode_color_attachment(payload, i);
-                    if !att.present || att.texture_ref == 0 {
+                    if att.texture_ref == 0 {
                         continue;
                     }
                     let slot = i as u32;
@@ -1638,7 +1628,7 @@ fn handle_render_record<M: HostMemory + HostOps>(
                 }
             }
             // Also keep color0 from command for convenience.
-            if cmd.color0.present
+            if cmd.color0.texture_ref != 0
                 && cmd.color0.load_action == PASS_LOAD_ACTION_CLEAR
                 && cmd.color0.store_action == PASS_STORE_ACTION_STORE
                 && !acc
@@ -2421,53 +2411,6 @@ fn note_indexed_draw_without_buffer(task_id: u32, opcode: u32, index_count: u32)
 /// otherwise emit on every pass in every stream. One line per distinct
 /// (aspect, level, resolve-present) combination is what answers the question
 /// the arm exists to answer — whether any guest asks for this at all.
-/// The subresource coordinates and resolve target shared by all three
-/// attachment shapes, lifted so the depth and stencil arms cannot drift apart.
-///
-/// They are one 28-byte prefix on the wire
-/// (`reims_vgpu_wire::ops::render_pass::AttachmentPrefix`), and this device had
-/// two arms reading it with two copies of the same four-line check. A third
-/// copy is what the colour arm would have needed.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct AttachSubresource {
-    level: u32,
-    slice: u32,
-    depth_plane: u32,
-    resolve_texture_ref: u32,
-}
-
-impl From<crate::runtime::decode::render::DepthAttachment> for AttachSubresource {
-    fn from(a: crate::runtime::decode::render::DepthAttachment) -> Self {
-        Self {
-            level: a.level,
-            slice: a.slice,
-            depth_plane: a.depth_plane,
-            resolve_texture_ref: a.resolve_texture_ref,
-        }
-    }
-}
-
-impl From<crate::runtime::decode::render::StencilAttachment> for AttachSubresource {
-    fn from(a: crate::runtime::decode::render::StencilAttachment) -> Self {
-        Self {
-            level: a.level,
-            slice: a.slice,
-            depth_plane: a.depth_plane,
-            resolve_texture_ref: a.resolve_texture_ref,
-        }
-    }
-}
-
-/// Whether this device can honour a depth or stencil attachment as decoded.
-///
-/// Only the whole texture at level 0, slice 0, plane 0 with no multisample
-/// resolve. `slice` and `depth_plane` joined the test when they became
-/// decodable: a depth buffer bound at slice 5 was previously read as slice 0 and
-/// silently accepted, which is the same defect the colour arm had.
-fn depth_stencil_is_bindable(level: u32, slice: u32, depth_plane: u32, resolve: u32) -> bool {
-    level == 0 && slice == 0 && depth_plane == 0 && resolve == 0
-}
-
 fn note_depth_stencil_unsupported(task_id: u32, aspect: &'static str, s: &AttachSubresource) {
     crate::observe::Emit::decline(
         "stream_pass",
@@ -4244,6 +4187,10 @@ mod tests {
         // until they were decodable. A depth buffer bound at slice 5 was read
         // as slice 0 and silently accepted, which is a depth test against the
         // wrong layer rather than a missing one.
+        //
+        // Driven from both slots, because "the two arms consume one wire form"
+        // is exactly the shape that drifts: the stencil arm is a second call to
+        // the same rule and nothing but this proves it is still the same one.
         for (field, at) in [
             ("slice", PASS_ATTACH_SLICE),
             ("plane", PASS_ATTACH_DEPTH_PLANE),
@@ -4256,6 +4203,23 @@ mod tests {
                 acc.depth_attach.is_none(),
                 "a depth attachment naming {field} 5 must be refused, not read as 0"
             );
+            assert!(
+                acc.stencil_attach.is_some(),
+                "refusing depth for {field} must not take the stencil attachment with it"
+            );
+
+            let mut cmd = pass(0, 0);
+            let slot = OP_HEADER_LEN + PASS_STENCIL_ATTACH_OFF + at;
+            cmd[slot..slot + 2].copy_from_slice(&5u16.to_le_bytes());
+            let acc = run(&cmd);
+            assert!(
+                acc.stencil_attach.is_none(),
+                "a stencil attachment naming {field} 5 must be refused, not read as 0"
+            );
+            assert!(
+                acc.depth_attach.is_some(),
+                "refusing stencil for {field} must not take the depth attachment with it"
+            );
         }
 
         let log = std::fs::read_to_string(crate::observe::fail_log_path()).expect("fail log");
@@ -4264,8 +4228,8 @@ mod tests {
             "an unsupported depth attachment was dropped without naming itself"
         );
         assert!(
-            log.contains("aspect=depth"),
-            "the line must say which aspect was lost"
+            log.contains("aspect=depth") && log.contains("aspect=stencil"),
+            "the line must say which aspect was lost, and both arms must reach it"
         );
         assert!(
             log.contains("slice=5"),
@@ -5131,7 +5095,6 @@ mod tests {
         let mut out = ExecResult::default();
         let mut acc = StreamAccum::default();
         acc.clears.push(ColorAttachment {
-            present: true,
             texture_ref: 5,
             resolve_texture_ref: 0,
             level: 0,
@@ -5167,7 +5130,6 @@ mod tests {
         let mut out = ExecResult::default();
         let mut acc = StreamAccum::default();
         acc.clears.push(ColorAttachment {
-            present: true,
             texture_ref: 99,
             resolve_texture_ref: 0,
             level: 0,
@@ -5192,7 +5154,6 @@ mod tests {
         let mut out = ExecResult::default();
         let mut acc = StreamAccum::default();
         let att = ColorAttachment {
-            present: true,
             texture_ref: 99,
             resolve_texture_ref: 0,
             level: 0,
@@ -5296,7 +5257,6 @@ mod tests {
         let mut out = ExecResult::default();
         let mut acc = StreamAccum::default();
         let att = ColorAttachment {
-            present: true,
             texture_ref: 5,
             resolve_texture_ref: 0,
             level: 0,

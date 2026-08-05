@@ -31,7 +31,6 @@ fn m2v_draw_boundary_preserves_the_engine_vk_call_slug() {
 fn clear_black_attachment(texture_ref: u32) -> crate::runtime::decode::render::ColorAttachment {
     use crate::runtime::decode::render::ColorAttachment;
     ColorAttachment {
-        present: true,
         texture_ref,
         resolve_texture_ref: 0,
         level: 0,
@@ -2057,7 +2056,6 @@ fn mrt_draw_request_load_seed_miss_still_encodes() {
     state.mappings.get_mut(&9).unwrap().content_generation = 1;
     state.texture_to_mapping.insert((1, 42), 9);
     let att = ColorAttachment {
-        present: true,
         texture_ref: 42,
         resolve_texture_ref: 0,
         level: 0,
