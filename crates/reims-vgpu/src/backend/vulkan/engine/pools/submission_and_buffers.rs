@@ -541,27 +541,7 @@ impl ResourcePools {
             let Some(victim) = victim else {
                 break;
             };
-            if let Some(old) = self.registry.remove(&victim) {
-                self.note_resident_reclaimed(&victim, ResidentReclaim::CapEvicted);
-                if old.framebuffer != vk::Framebuffer::null() {
-                    self.dispose(&ctx.device, DeferredHandle::Framebuffer(old.framebuffer));
-                }
-                self.dispose(
-                    &ctx.device,
-                    DeferredHandle::RecycleTarget(FreeTargetImage {
-                        image: old.image,
-                        memory: old.memory,
-                        view: old.view,
-                        width: old.width,
-                        height: old.height,
-                        format: old.color_format,
-                    }),
-                );
-                counters
-                    .target_evicts
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-            self.registry_order.retain(|k| k != &victim);
+            self.retire_resident(ctx, &victim, ResidentReclaim::CapEvicted, counters);
             non_pinned = non_pinned.saturating_sub(1);
         }
     }

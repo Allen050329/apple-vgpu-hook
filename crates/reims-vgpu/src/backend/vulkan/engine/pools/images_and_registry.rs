@@ -284,6 +284,76 @@ impl ResourcePools {
         self.registry.get(identity)
     }
 
+    /// Forget the resident registered under `identity`, recording `why`, and
+    /// hand back the slot that was removed.
+    ///
+    /// Split out from [`Self::retire_resident`] for the same reason
+    /// [`Self::cap_eviction_victim`] is split out of
+    /// [`Self::evict_registry_to_cap`]: retiring needs a live `DeviceContext` to
+    /// dispose what it removes, and the bookkeeping — which is the part that was
+    /// diverging — is worth testing without a GPU.
+    ///
+    /// `registry_order` is pruned whether or not the map held the entry, which
+    /// is what every caller did around its own copy. Nothing is recorded for an
+    /// identity that held no resident: [`Self::prior_reclaim`] deliberately does
+    /// not guess between "never held one" and "reclaimed too long ago", and a
+    /// record for a removal that did not happen would make it guess wrong.
+    fn unregister_resident(
+        &mut self,
+        identity: &TargetIdentity,
+        why: ResidentReclaim,
+    ) -> Option<ResidentTargetSlot> {
+        let old = self.registry.remove(identity);
+        self.registry_order.retain(|k| k != identity);
+        let old = old?;
+        self.note_resident_reclaimed(identity, why);
+        Some(old)
+    }
+
+    /// Drop the resident registered under `identity`, recording `why`, returning
+    /// its image/memory/view to `target_free` and its framebuffer to the
+    /// graveyard. Returns the slot that was removed, or `None` when nothing was
+    /// registered.
+    ///
+    /// The single exit for a live registry entry. All three callers — the two
+    /// `registry_ensure*` recreate arms and [`Self::evict_registry_to_cap`] —
+    /// were copies of one another, and copies diverge. The MRT secondary path
+    /// recorded no reclaim reason at all, so a later draw whose sampled source
+    /// that path had recreated could not be told "taken from under you" from
+    /// "never existed", which is the whole point of
+    /// [`Self::note_resident_reclaimed`]. The primary path was the one that
+    /// disposed `old.framebuffer` without checking it for null — a slot created
+    /// by `registry_ensure_color` carries no framebuffer, so an identity that
+    /// crossed from the secondary path to the primary one spent a graveyard
+    /// entry on a null handle.
+    unsafe fn retire_resident(
+        &mut self,
+        ctx: &DeviceContext,
+        identity: &TargetIdentity,
+        why: ResidentReclaim,
+        counters: &EngineCounters,
+    ) -> Option<ResidentTargetSlot> {
+        let old = self.unregister_resident(identity, why)?;
+        if old.framebuffer != vk::Framebuffer::null() {
+            self.dispose(&ctx.device, DeferredHandle::Framebuffer(old.framebuffer));
+        }
+        self.dispose(
+            &ctx.device,
+            DeferredHandle::RecycleTarget(FreeTargetImage {
+                image: old.image,
+                memory: old.memory,
+                view: old.view,
+                width: old.width,
+                height: old.height,
+                format: old.color_format,
+            }),
+        );
+        counters
+            .target_evicts
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Some(old)
+    }
+
     /// Ensure a resident target exists for `identity` with the given geometry + pass.
     /// Image/memory persist across Load vs Clear render-pass changes; only the
     /// framebuffer is rebuilt when the pass handle differs.
@@ -355,30 +425,15 @@ impl ResourcePools {
                 return Ok(self.registry.get(&identity).unwrap());
             }
             // Geometry/gen mismatch → destroy and recreate.
-            if let Some(old) = self.registry.remove(&identity) {
-                self.note_resident_reclaimed(&identity, ResidentReclaim::Recreated);
-                self.dispose(&ctx.device, DeferredHandle::Framebuffer(old.framebuffer));
-                self.dispose(
-                    &ctx.device,
-                    DeferredHandle::RecycleTarget(FreeTargetImage {
-                        image: old.image,
-                        memory: old.memory,
-                        view: old.view,
-                        width: old.width,
-                        height: old.height,
-                        format: old.color_format,
-                    }),
-                );
-                counters
-                    .target_evicts
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if let Some(old) =
+                self.retire_resident(ctx, &identity, ResidentReclaim::Recreated, counters)
+            {
                 if old.generation != generation {
                     counters
                         .gen_mismatch
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
             }
-            self.registry_order.retain(|k| k != &identity);
         }
         // Cap the *non-pinned* (evictable) population at REGISTRY_CAP, shielding
         // the just-resolved `protect` identity from its own eviction.
@@ -537,26 +592,7 @@ impl ResourcePools {
                 return Ok((slot.image, slot.view));
             }
             // Geometry / gen / format mismatch → destroy and recreate.
-            if let Some(old) = self.registry.remove(&identity) {
-                if old.framebuffer != vk::Framebuffer::null() {
-                    self.dispose(&ctx.device, DeferredHandle::Framebuffer(old.framebuffer));
-                }
-                self.dispose(
-                    &ctx.device,
-                    DeferredHandle::RecycleTarget(FreeTargetImage {
-                        image: old.image,
-                        memory: old.memory,
-                        view: old.view,
-                        width: old.width,
-                        height: old.height,
-                        format: old.color_format,
-                    }),
-                );
-                counters
-                    .target_evicts
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-            self.registry_order.retain(|k| k != &identity);
+            self.retire_resident(ctx, &identity, ResidentReclaim::Recreated, counters);
         }
         // Cap the *non-pinned* population (skip pinned slots), same LRU
         // discipline as the primary `registry_ensure` — pinned deferred windows
@@ -1260,6 +1296,48 @@ mod pin_count_tests {
             Some(surf(3)),
             "the one unpinned resident is the only candidate"
         );
+    }
+
+    /// Every removal of a live registry entry leaves a record naming the path.
+    ///
+    /// This is the invariant `note_resident_reclaimed` claims ("called from
+    /// every site that removes a live registry entry") and that the MRT
+    /// secondary recreate arm broke while it was a copy: it removed the entry
+    /// and recorded nothing, so `prior_reclaim` answered `None` — which
+    /// `exec.rs` reports as "never existed" for a resident this device had just
+    /// taken. Routing all three sites through `unregister_resident` is what
+    /// makes the record unconditional.
+    #[test]
+    fn unregistering_a_resident_always_names_why_and_leaves_the_order_clean() {
+        let mut pools = ResourcePools::new();
+        admit(&mut pools, surf(1), 0, 0);
+        admit(&mut pools, surf(2), 0, 0);
+
+        assert!(pools
+            .unregister_resident(&surf(1), ResidentReclaim::Recreated)
+            .is_some());
+        assert_eq!(
+            pools.prior_reclaim(&surf(1)),
+            Some(ResidentReclaim::Recreated),
+            "a removed resident must say which path took it"
+        );
+        assert!(!pools.registry.contains_key(&surf(1)));
+        assert!(
+            !pools.registry_order.contains(&surf(1)),
+            "the order list must not keep a key the map no longer holds"
+        );
+        assert!(
+            pools.registry_order.contains(&surf(2)),
+            "an untouched resident keeps its place"
+        );
+
+        // An identity that held nothing is not a removal, so it gets no record.
+        // Writing one would make `prior_reclaim` claim this device took a
+        // resident that never existed — the exact confusion it exists to avoid.
+        assert!(pools
+            .unregister_resident(&surf(3), ResidentReclaim::CapEvicted)
+            .is_none());
+        assert_eq!(pools.prior_reclaim(&surf(3)), None);
     }
 
     /// The reclaim history answers which path took a resident, and says "no
