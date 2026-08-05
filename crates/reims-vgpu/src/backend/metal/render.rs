@@ -2,7 +2,8 @@
 
 use crate::backend::metal::abi::*;
 use crate::backend::metal::cache::{
-    depth_stencil_insert, depth_stencil_lookup, render_pso_insert, render_pso_lookup, RenderPsoKey,
+    depth_stencil_insert, depth_stencil_lookup, render_pso_insert, render_pso_lookup,
+    DepthStencilKey, RenderPsoKey,
 };
 use crate::backend::metal::constants::*;
 use crate::backend::metal::format::{mtl_pixel_format_bpp, pixel_format_from_u32};
@@ -230,8 +231,11 @@ fn apply_depth_stencil_state(
                 .field("depth_fail", ds.back_face.depth_failure_operation)
                 .field("pass", ds.back_face.depth_stencil_pass_operation);
         };
-        let ds_key = hash_bytes(bytes_of(ds));
-        let state = if let Some(hit) = depth_stencil_lookup(ds_key, ds) {
+        let ds_key = DepthStencilKey {
+            hash: hash_bytes(bytes_of(ds)),
+            desc: *ds,
+        };
+        let state = if let Some(hit) = depth_stencil_lookup(&ds_key) {
             hit
         } else {
             let descriptor = DepthStencilDescriptor::new();
@@ -248,7 +252,7 @@ fn apply_depth_stencil_state(
                 descriptor.set_back_face_stencil(Some(&face));
             }
             let state = device.new_depth_stencil_state(&descriptor);
-            depth_stencil_insert(ds_key, *ds, state)
+            depth_stencil_insert(ds_key, state)
         };
         encoder.set_depth_stencil_state(&state);
     }

@@ -2,7 +2,7 @@
 
 use crate::backend::metal::abi::*;
 use crate::backend::metal::cache::{
-    compute_pso_insert, compute_pso_lookup, reflect_insert, reflect_lookup,
+    compute_pso_insert, compute_pso_lookup, reflect_insert, reflect_lookup, BlobKey, ComputePsoKey,
 };
 use crate::backend::metal::constants::*;
 use crate::backend::metal::format::storage_image_format;
@@ -68,20 +68,19 @@ pub fn new_compute_pipeline_state(
     stage_input: Option<&ReimsVgpuComputeStageInputDescriptor>,
     err: ErrOut<'_>,
 ) -> Result<ComputePipelineState, Status> {
-    let mtlb_hash = hash_bytes(mtlb);
-    let stage_hash = hash_compute_stage_input(stage_input);
-    let has_stage = if stage_input.is_some() { 1u8 } else { 0u8 };
-    if let Some(hit) = compute_pso_lookup(mtlb_hash, mtlb.len(), stage_hash, has_stage) {
+    let key = ComputePsoKey {
+        mtlb: BlobKey {
+            hash: hash_bytes(mtlb),
+            len: mtlb.len(),
+        },
+        stage_hash: hash_compute_stage_input(stage_input),
+        has_stage_input: u8::from(stage_input.is_some()),
+    };
+    if let Some(hit) = compute_pso_lookup(&key) {
         return Ok(hit);
     }
     let pso = new_compute_pipeline_state_uncached(device, function, stage_input, err)?;
-    Ok(compute_pso_insert(
-        mtlb_hash,
-        mtlb.len(),
-        stage_hash,
-        has_stage,
-        pso,
-    ))
+    Ok(compute_pso_insert(key, pso))
 }
 
 fn compute_buffer_backing(buffer: &ReimsVgpuBuffer) -> Result<(*mut u8, usize, usize), Status> {
@@ -942,8 +941,11 @@ pub fn reflect_compute_textures_mtlb(
         return Status::args("metal_compute_reflection_mtlb_empty");
     }
 
-    let mtlb_hash = hash_bytes(mtlb);
-    if let Some(cached) = reflect_lookup(mtlb_hash, mtlb.len()) {
+    let key = BlobKey {
+        hash: hash_bytes(mtlb),
+        len: mtlb.len(),
+    };
+    if let Some(cached) = reflect_lookup(&key) {
         if cached.len() > usage_cap {
             set_err(err, "too many compute texture bindings");
             return Status::args("metal_compute_reflection_cached_capacity_exceeded")
@@ -976,17 +978,17 @@ pub fn reflect_compute_textures_mtlb(
         Ok(v) => v,
         Err(e) => {
             crate::observe::Emit::decline("metal_compute_reflection_pso", &e)
-                .field("mtlb_hash", format!("{mtlb_hash:#x}"))
-                .fail_once(mtlb_hash);
+                .field("mtlb_hash", format!("{:#x}", key.hash))
+                .fail_once(key.hash);
             set_err(err, format!("compute reflection PSO failed: {e}"));
             return Status::execute("metal_compute_reflection_pso_create_failed")
-                .field("mtlb_hash", mtlb_hash);
+                .field("mtlb_hash", key.hash);
         }
     };
     if reflection.is_null() {
         set_err(err, "compute pipeline reflection unavailable");
         return Status::execute("metal_compute_reflection_unavailable")
-            .field("mtlb_hash", mtlb_hash);
+            .field("mtlb_hash", key.hash);
     }
 
     let bindings = reflection_bindings(reflection);
@@ -1046,7 +1048,7 @@ pub fn reflect_compute_textures_mtlb(
         }
     }
 
-    reflect_insert(mtlb_hash, mtlb.len(), local.clone());
+    reflect_insert(key, local.clone());
     if !usages.is_null() && !local.is_empty() {
         unsafe {
             ptr::copy_nonoverlapping(local.as_ptr(), usages, local.len());
