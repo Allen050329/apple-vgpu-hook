@@ -4313,16 +4313,14 @@ fn execute_dispatch_metal<M: HostMemory + HostOps>(
                 len: t.bytes.len(),
             });
         } else {
-            sampled.push(ReimsVgpuComputeSampledImage {
-                binding: t.binding,
-                format: selector,
-                width: t.width,
-                height: t.height,
-                data: t.bytes.as_ptr(),
-                len: t.bytes.len(),
-                has_swizzle: 0,
-                swizzle: [2, 3, 4, 5], // identity RGBA selectors
-            });
+            sampled.push(ReimsVgpuComputeSampledImage::unswizzled(
+                t.binding,
+                selector,
+                t.width,
+                t.height,
+                t.bytes.as_ptr(),
+                t.bytes.len(),
+            ));
         }
     }
 

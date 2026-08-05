@@ -133,7 +133,40 @@ pub struct ReimsVgpuComputeSampledImage {
     pub data: *const u8,
     pub len: usize,
     pub has_swizzle: u32,
+    /// Read by [`super::compute`] only when `has_swizzle != 0`; inert otherwise.
+    /// Build through [`Self::unswizzled`] rather than filling it in by hand.
     pub swizzle: [u8; 4],
+}
+
+impl ReimsVgpuComputeSampledImage {
+    /// A binding whose texels are consumed in their declared channel order.
+    ///
+    /// `has_swizzle` is 0, so the consumer never reads `swizzle` — which is
+    /// exactly why the two call sites that build these had drifted to writing
+    /// different dead values into it, one `[0; 4]` and one `[2, 3, 4, 5]`
+    /// carrying an "identity RGBA selectors" comment. Both were inert and the
+    /// pair reads as a behavioral divergence to anyone diffing them. Naming the
+    /// case removes the field from the call site, so there is nothing left to
+    /// disagree about.
+    pub fn unswizzled(
+        binding: u32,
+        format: u32,
+        width: u32,
+        height: u32,
+        data: *const u8,
+        len: usize,
+    ) -> Self {
+        Self {
+            binding,
+            format,
+            width,
+            height,
+            data,
+            len,
+            has_swizzle: 0,
+            swizzle: [0; 4],
+        }
+    }
 }
 
 #[repr(C)]
