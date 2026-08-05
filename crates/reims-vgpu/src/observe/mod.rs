@@ -45,11 +45,14 @@
 //! emitters, and the silence it produced had already been written up as a
 //! finding about the device before the collision was noticed.
 //!
-//! A scan of every `Decline::slug` body reads 609 distinct slugs and no
-//! duplicate. That is a measurement of one tree state, not a guarantee about
-//! the next one; a `gate` module that checked it by scanning source text was
-//! removed in `db80389` because the check was over text rather than behaviour,
-//! and it has not been replaced.
+//! `tests/decline_slugs_are_unique.rs` holds that door shut. It reads every
+//! `slug()` and `refusal()` body in the crate — 655 distinct slugs across 85
+//! impls today, no duplicate — and fails on two shapes: one slug claimed by two
+//! impls, and one slug returned by two arms of the same impl. Both are the same
+//! defect at different radii. A `gate` module used to check this alongside a
+//! 2 700-line restatement of the vocabulary and was removed whole in `db80389`;
+//! the check came back without the restatement, so it cannot drift from the
+//! arms it reads.
 //!
 //! The judgement no gate can make stays with the author: do **not** log
 //! speculative returns (a resolver legitimately answering "not ready yet" every
