@@ -7,7 +7,7 @@
 //! surface is the same shape on a build without the feature.
 //!
 //! `use super::*` rather than a named import list, for the reason
-//! `runtime::draw::vulkan` gives: this is a chapter of the crate root that was
+//! `crate::runtime::draw::vulkan` gives: this is a chapter of the crate root that was
 //! lifted out whole, and it reaches back for the registry (`DEVICES`,
 //! `device_slot`, `BoundDevice`) that is the root's own job to own. Naming
 //! forty root items here would make the move look like a redesign and would go
@@ -43,7 +43,7 @@ fn window_frame_key(present: &crate::model::PresentState) -> WindowFrameKey {
 #[cfg(feature = "host-window")]
 pub(crate) struct WindowLink {
     /// Shared latest-frame slot the window thread reads each redraw.
-    frames: host_window::present::FrameSlot,
+    frames: crate::host_window::present::FrameSlot,
     /// `(mapping_id, generation, present_epoch)` of the last frame published.
     ///
     /// The resource generation alone is insufficient: the guest can update a
@@ -67,15 +67,15 @@ pub(crate) struct WindowLink {
     /// after a device reset) is normal on macOS too.
     bgra_short_geom: Option<(u32, u32)>,
     /// Set to ask the window thread to exit (VM teardown); the thread polls it.
-    stop: host_window::present::StopFlag,
+    stop: crate::host_window::present::StopFlag,
     /// Window thread handle. `device_window_stop` sets `stop` and joins it, so
     /// the window's Vulkan objects tear down before QEMU teardown proceeds
     /// (avoids the driver-unload-during-exit crash class).
-    thread: Option<std::thread::JoinHandle<Result<(), host_window::present::WindowError>>>,
+    thread: Option<std::thread::JoinHandle<Result<(), crate::host_window::present::WindowError>>>,
     /// Published after the process-main AppKit loop has destroyed the native
     /// window and its Vulkan objects.
     #[cfg(target_os = "macos")]
-    exited: host_window::present::ExitedFlag,
+    exited: crate::host_window::present::ExitedFlag,
 }
 
 /// Registered early-boot framebuffer (BAR1 GOP host RAM) the C shim hands the
@@ -100,7 +100,7 @@ pub(crate) struct EarlyFb {
 /// [`publish_window_frame`], called by the drain. Idempotent; `true` on success.
 #[cfg(feature = "host-window")]
 pub fn device_window_start(id: u64, width: u32, height: u32) -> bool {
-    use host_window::present::{FrameSlot, InputSink, WindowConfig};
+    use crate::host_window::present::{FrameSlot, InputSink, WindowConfig};
     let Some(slot) = device_slot(id) else {
         return false;
     };
@@ -132,22 +132,23 @@ pub fn device_window_start(id: u64, width: u32, height: u32) -> bool {
     let cfg = WindowConfig {
         title: "Reims vGPU".to_string(),
         width: if width == 0 {
-            model::EFI_BOOT_WIDTH
+            crate::model::EFI_BOOT_WIDTH
         } else {
             width
         },
         height: if height == 0 {
-            model::EFI_BOOT_HEIGHT
+            crate::model::EFI_BOOT_HEIGHT
         } else {
             height
         },
     };
-    let stop: host_window::present::StopFlag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop: crate::host_window::present::StopFlag =
+        Arc::new(std::sync::atomic::AtomicBool::new(false));
     #[cfg(target_os = "macos")]
     let (thread, exited) = {
-        let exited: host_window::present::ExitedFlag =
+        let exited: crate::host_window::present::ExitedFlag =
             Arc::new(std::sync::atomic::AtomicBool::new(false));
-        if let Err(error) = host_window::present::start_main_thread(
+        if let Err(error) = crate::host_window::present::start_main_thread(
             id,
             cfg,
             on_input,
@@ -155,7 +156,7 @@ pub fn device_window_start(id: u64, width: u32, height: u32) -> bool {
             Arc::clone(&stop),
             Arc::clone(&exited),
         ) {
-            observe::Emit::decline("host_window_start", &error)
+            crate::observe::Emit::decline("host_window_start", &error)
                 .field("id", id)
                 .fail();
             return false;
@@ -163,7 +164,7 @@ pub fn device_window_start(id: u64, width: u32, height: u32) -> bool {
         (None, exited)
     };
     #[cfg(not(target_os = "macos"))]
-    let thread = Some(host_window::present::spawn(
+    let thread = Some(crate::host_window::present::spawn(
         cfg,
         on_input,
         Arc::clone(&frames),
@@ -179,15 +180,15 @@ pub fn device_window_start(id: u64, width: u32, height: u32) -> bool {
         #[cfg(target_os = "macos")]
         exited,
     });
-    observe::off(format!(
+    crate::observe::off(format!(
         "host_window_start id={id} {}x{}",
         if width == 0 {
-            model::EFI_BOOT_WIDTH
+            crate::model::EFI_BOOT_WIDTH
         } else {
             width
         },
         if height == 0 {
-            model::EFI_BOOT_HEIGHT
+            crate::model::EFI_BOOT_HEIGHT
         } else {
             height
         }
@@ -206,10 +207,10 @@ pub fn device_window_start(_id: u64, _width: u32, _height: u32) -> bool {
 /// UI entry after device realize; it blocks until the window exits.
 #[cfg(all(feature = "host-window", target_os = "macos"))]
 pub fn device_window_run_main(id: u64) -> bool {
-    match host_window::present::run_main_thread(id) {
+    match crate::host_window::present::run_main_thread(id) {
         Ok(()) => true,
         Err(error) => {
-            observe::Emit::decline("host_window_main", &error)
+            crate::observe::Emit::decline("host_window_main", &error)
                 .field("id", id)
                 .fail();
             false
@@ -311,7 +312,7 @@ pub(crate) fn publish_window_frame(slot: &BoundDevice, state: &mut crate::model:
         // present (no flood).
         if link.bgra_short_geom != Some((width, height)) {
             link.bgra_short_geom = Some((width, height));
-            observe::off(format!(
+            crate::observe::off(format!(
                 "publish_window_frame DROP reason=frame_bgra_short mid={} {}x{} \
                  have={} need={need} gen={}",
                 mapping,
@@ -348,7 +349,7 @@ fn window_write_frame(
     resident: Option<crate::backend::vulkan::engine::WindowPresentSource>,
 ) -> bool {
     link.seq = link.seq.wrapping_add(1);
-    let frame = std::sync::Arc::new(host_window::present::Frame {
+    let frame = std::sync::Arc::new(crate::host_window::present::Frame {
         seq: link.seq,
         width,
         height,
@@ -386,7 +387,7 @@ pub fn device_window_stop(id: u64) -> bool {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
         if !link.exited.load(Ordering::Acquire) {
-            observe::fail(format!(
+            crate::observe::fail(format!(
                 "host_window_stop FAIL reason=main_thread_teardown_timeout id={id}"
             ));
             return false;
@@ -401,7 +402,7 @@ pub fn device_window_stop(id: u64) -> bool {
         match thread.join() {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
-                observe::Emit::decline("host_window_run", &error)
+                crate::observe::Emit::decline("host_window_run", &error)
                     .field("id", id)
                     .fail();
             }
@@ -479,7 +480,7 @@ pub(crate) fn publish_window_early_frame<M: crate::runtime::host::HostMemory>(
     // Console-ownership gate (mirror of host_console_uses_bar1): only feed the
     // window while it is on the early console, never after the product present
     // owns it or a same-geom early front is latched (the drain publishes those).
-    let early_latched = runtime::scanout::early_scanout_target(state).is_some();
+    let early_latched = crate::runtime::scanout::early_scanout_target(state).is_some();
     if !host_console_uses_bar1(state.present.frame_flush_seen, early_latched) {
         return;
     }
@@ -488,15 +489,15 @@ pub(crate) fn publish_window_early_frame<M: crate::runtime::host::HostMemory>(
     if now_ns.saturating_sub(last) < 33_000_000 {
         return;
     }
-    let w = model::EFI_BOOT_WIDTH;
-    let h = model::EFI_BOOT_HEIGHT;
+    let w = crate::model::EFI_BOOT_WIDTH;
+    let h = crate::model::EFI_BOOT_HEIGHT;
     let stride = w.saturating_mul(4);
     let mut buf = vec![0u8; (stride as usize).saturating_mul(h as usize)];
     // Prefer the guest-programmed EFI FB (kernel-relocated console), else the
     // BAR1 GOP framebuffer the option ROM drives — the same order as C's
     // reims_vgpu_pci_copy_early_console.
     let painted = if state.gfx.efi_fb_start != 0 {
-        runtime::scanout::paint_efi_console(state, host, &mut buf, stride, w, h)
+        crate::runtime::scanout::paint_efi_console(state, host, &mut buf, stride, w, h)
     } else {
         false
     };

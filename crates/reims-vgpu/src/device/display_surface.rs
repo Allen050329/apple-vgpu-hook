@@ -3,14 +3,14 @@
 //! and the cursor glyph.
 //!
 //! One of the four jobs the crate root used to hold. Every item here is an
-//! entry point `qemu::abi` calls or a type it passes across the C boundary, so
+//! entry point `crate::qemu::abi` calls or a type it passes across the C boundary, so
 //! the whole module is the display half of the QEMU ABI surface and nothing
 //! else. It reaches back into the root for the registry only — `device_slot`,
 //! `BoundDevice`, `DeviceInner` — which is why the seam is here: three symbols
 //! out, and, before the move, three prose mentions of `device_scanout_copy` in.
 //!
 //! `use super::*` rather than a named list, for the reason
-//! `runtime::draw::vulkan` gives and `window_publish` repeats: a chapter of the
+//! `crate::runtime::draw::vulkan` gives and `window_publish` repeats: a chapter of the
 //! root lifted out whole should not read as a redesign.
 
 use super::*;
@@ -81,7 +81,7 @@ pub fn device_console_feed(id: u64) -> Option<ConsoleFeed> {
         return Some(ConsoleFeed::Firmware);
     };
     Some(
-        match runtime::scanout::early_scanout_target(&d.device.state) {
+        match crate::runtime::scanout::early_scanout_target(&d.device.state) {
             // `Early` guarantees a paintable target, so the shims do not re-test
             // the geometry — both used to, which is a decode rule living in C.
             // A zero here is not a target, it is the absence of one.
@@ -188,7 +188,7 @@ pub fn device_efi_console_copy(
     };
     let DeviceInner { device, actions } = &mut *d;
     let host = QemuHost::new(&ops, actions, &slot.prompt_actions);
-    runtime::scanout::paint_efi_console(&device.state, &host, dst, dst_stride, width, height)
+    crate::runtime::scanout::paint_efi_console(&device.state, &host, dst, dst_stride, width, height)
 }
 
 /// Fill a host BGRA8 framebuffer from the named guest mapping (or EFI FB).
@@ -204,8 +204,8 @@ pub fn device_scanout_copy(
     width: u32,
     height: u32,
     generation: u32,
-) -> runtime::scanout::ScanoutCopyResult {
-    use runtime::scanout::ScanoutCopyResult;
+) -> crate::runtime::scanout::ScanoutCopyResult {
+    use crate::runtime::scanout::ScanoutCopyResult;
     let Some(slot) = device_slot(id) else {
         return ScanoutCopyResult::Failed;
     };
@@ -228,7 +228,7 @@ pub fn device_scanout_copy(
         // installed and must be blitted once. `copy_to_bgra8` distinguishes
         // that case from capture-fail retry without draining guest commands in
         // this QEMU display context; do not discard the only scanout action.
-        let rc = runtime::scanout::copy_to_bgra8(
+        let rc = crate::runtime::scanout::copy_to_bgra8(
             &mut device.state,
             &mut host,
             mapping_id,
@@ -244,7 +244,7 @@ pub fn device_scanout_copy(
         // No QEMU ops table is bound (unit tests / headless create), so every
         // guest read fails and the copy falls back to a black clear.
         let mut host = NullHost;
-        let rc = runtime::scanout::copy_to_bgra8(
+        let rc = crate::runtime::scanout::copy_to_bgra8(
             &mut d.device.state,
             &mut host,
             mapping_id,
@@ -279,10 +279,10 @@ fn note_scanout_copy_consumed<H: HostOps>(
     state: &mut crate::model::DeviceState,
     host: &mut H,
     slot: &BoundDevice,
-    rc: runtime::scanout::ScanoutCopyResult,
+    rc: crate::runtime::scanout::ScanoutCopyResult,
     present_action: bool,
 ) {
-    use runtime::scanout::ScanoutCopyResult;
+    use crate::runtime::scanout::ScanoutCopyResult;
     let painted = matches!(
         rc,
         ScanoutCopyResult::Painted | ScanoutCopyResult::Unchanged
@@ -290,7 +290,7 @@ fn note_scanout_copy_consumed<H: HostOps>(
     if !painted && !present_action {
         return;
     }
-    runtime::drain::note_present_paint_consumed(state);
+    crate::runtime::drain::note_present_paint_consumed(state);
     slot.present_action_pending.store(false, Ordering::Release);
     host.schedule_bh();
 }

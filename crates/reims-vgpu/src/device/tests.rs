@@ -57,7 +57,7 @@ fn a_failed_copy_still_frees_a_consumed_present_action() {
     let rc = device_scanout_copy(id, 7, &mut dst, 4, 1, 1, 0);
     assert_eq!(
         rc,
-        runtime::scanout::ScanoutCopyResult::Failed,
+        crate::runtime::scanout::ScanoutCopyResult::Failed,
         "a headless device has no guest memory to paint from"
     );
 
@@ -156,14 +156,14 @@ fn prompt_actions_pop_while_device_lock_held() {
     slot.prompt_actions.lock().push_back(HostAction::irq_gfx());
     let _drain_guard = slot.inner.lock();
     let a = device_pop_action(id).expect("prompt action pops mid-drain");
-    assert_eq!(a.kind, runtime::host::HostActionKind::IrqGfxPulse);
+    assert_eq!(a.kind, crate::runtime::host::HostActionKind::IrqGfxPulse);
     assert!(device_pop_action(id).is_none());
     drop(_drain_guard);
     assert!(device_destroy(id));
 }
 
 /// The interrupt-status atomics stay wired to the same slot across reset
-/// ([`model::DeviceState::reset`] must preserve the shared `Arc`s and only
+/// ([`crate::model::DeviceState::reset`] must preserve the shared `Arc`s and only
 /// zero the values they hold).
 #[test]
 fn intr_status_atomics_survive_reset() {
@@ -418,7 +418,7 @@ fn a_child_doorbell_never_queues_behind_the_render_worker() {
 /// A ring naming no channel is dropped, not shifted by.
 ///
 /// `1u32 << channel` is undefined past the word, and the locked handler in
-/// `runtime::mmio` has always range-checked before shifting. The lock-free
+/// `crate::runtime::mmio` has always range-checked before shifting. The lock-free
 /// path is a second implementation of that same guard, so it gets its own
 /// assertion rather than inheriting the first one's.
 #[test]
@@ -481,7 +481,7 @@ fn present_action_owns_worker_boundary_until_scanout_copy() {
     let mut dst = vec![0u8; 16];
     assert_eq!(
         device_scanout_copy(id, 4, &mut dst, 8, 2, 2, 7),
-        runtime::scanout::ScanoutCopyResult::Painted
+        crate::runtime::scanout::ScanoutCopyResult::Painted
     );
     assert!(!slot.present_action_pending.load(Ordering::Acquire));
     assert!(!slot.inner.lock().device.state.pending.host_action_yield);
