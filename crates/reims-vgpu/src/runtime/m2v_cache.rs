@@ -219,15 +219,26 @@ impl CachedShader {
     }
 }
 
-/// Cap entries so a long session cannot grow without bound (research host).
-const MAX_ENTRIES: usize = 256;
-
+/// Translated shaders, keyed by the content hash of the AIR the guest supplied.
+///
+/// **Deliberately unbounded.** The key is content, so the live entry count is the
+/// number of *distinct* shaders the guest has ever compiled — a property of the
+/// guest's own program set, not of how long the device has run. A driven Safari
+/// boot reaches 75-80; an idle boot the same. That is the same bound a real
+/// driver's pipeline cache has, and it is why no reclaim rule is needed here.
+///
+/// It used to hold 256 entries and evict in insertion order. Both halves were
+/// wrong for this workload. Insertion order makes the *first* shader compiled —
+/// the compositor's, drawn every frame for the life of the boot — the first
+/// victim, so crossing the cap evicts the hot set and nothing else. And a miss is
+/// not free: the module header above records why re-translating on the doorbell
+/// vCPU holds guest CPUs long enough to trip `pmap_flush_tlbs` IPI-timeout
+/// panics. A cap whose crossing degrades the guest is a failure mode bought for
+/// a bound the workload never approached.
 #[derive(Default)]
 struct Cache {
     /// key = hash(stage_tag || air_bytes) → SPIR-V bytes
     entries: HashMap<u64, Entry>,
-    /// Insertion order for crude eviction (FIFO).
-    order: Vec<u64>,
     hits: u64,
     misses: u64,
     async_queue: VecDeque<TranslationTask>,
@@ -399,20 +410,6 @@ fn repair_layout(
     Ok(spirv)
 }
 
-fn evict_one(c: &mut Cache) {
-    if c.entries.len() < MAX_ENTRIES {
-        return;
-    }
-    if let Some(pos) = c
-        .order
-        .iter()
-        .position(|key| !matches!(c.entries.get(key), Some(Entry::Loading)))
-    {
-        let old = c.order.remove(pos);
-        c.entries.remove(&old);
-    }
-}
-
 /// Start translating a render stage without holding protocol state or the
 /// sole FIFO scheduler. Returns true when the content is already resolved
 /// (success or deterministic failure), false while the background worker owns
@@ -448,9 +445,7 @@ fn ensure_cached_async_keyed(
             Some(Entry::Loading) => return false,
             None => {}
         }
-        evict_one(&mut c);
         c.entries.insert(key, Entry::Loading);
-        c.order.push(key);
         c.misses = c.misses.saturating_add(1);
         c.async_queue.push_back(TranslationTask {
             key,
@@ -650,9 +645,7 @@ pub fn translate_cached_reflected(
     {
         let mut c = global().lock().unwrap_or_else(|e| e.into_inner());
         c.misses = c.misses.saturating_add(1);
-        evict_one(&mut c);
         c.entries.insert(key, Entry::Ready(Arc::clone(&shader)));
-        c.order.push(key);
         let hits = c.hits;
         let misses = c.misses;
         drop(c);
@@ -710,9 +703,7 @@ pub fn translate_cached_kernel_reflected(
     {
         let mut c = global().lock().unwrap_or_else(|e| e.into_inner());
         c.misses = c.misses.saturating_add(1);
-        evict_one(&mut c);
         c.entries.insert(key, Entry::Ready(Arc::clone(&shader)));
-        c.order.push(key);
         let hits = c.hits;
         let misses = c.misses;
         drop(c);
@@ -740,7 +731,6 @@ pub fn stats() -> (u64, u64, usize) {
 pub fn reset_for_test() {
     let mut c = global().lock().unwrap_or_else(|e| e.into_inner());
     c.entries.clear();
-    c.order.clear();
     c.hits = 0;
     c.misses = 0;
     c.async_queue.clear();
@@ -859,7 +849,6 @@ mod tests {
                 key,
                 Entry::Ready(synth_shader(Stage::Vertex, vec![0x03, 0x02, 0x23, 0x07])),
             );
-            c.order.push(key);
         }
         // One hit total, carrying the bytes plus the (empty) reflection.
         let shader = translate_cached_reflected(air, Stage::Vertex, 99).expect("hit");
@@ -895,7 +884,6 @@ mod tests {
         {
             let mut c = global().lock().unwrap();
             c.entries.insert(key, Entry::Loading);
-            c.order.push(key);
         }
         assert!(!ensure_cached_async(air, Stage::Fragment, 7));
         assert!(global().lock().unwrap().async_queue.is_empty());
@@ -920,6 +908,48 @@ mod tests {
         reset_for_test();
     }
 
+    /// The shader a boot compiles first is the compositor's, and it is drawn
+    /// every frame for the life of the boot. Under the entry cap this cache used
+    /// to carry it was also the first eviction victim, because the order was
+    /// insertion rather than use — so crossing the bound threw away exactly the
+    /// entry that was still hot. Drive far past the old 256-entry bound and
+    /// assert the first key is still resolved.
+    #[test]
+    fn a_hot_first_shader_survives_far_past_the_old_entry_cap() {
+        let _guard = test_lock();
+        reset_for_test();
+        let hot = b"the-compositor-shader-compiled-first".to_vec();
+        let hot_key = air_key(Stage::Fragment, &hot);
+        {
+            let mut c = global().lock().unwrap();
+            c.entries.insert(
+                hot_key,
+                Entry::Ready(synth_shader(Stage::Fragment, vec![1, 2, 3, 4])),
+            );
+        }
+        // Four times the retired bound, so a cap of any nearby size would have
+        // reached the first key several times over.
+        for i in 0..1024u32 {
+            let air = format!("cold-shader-{i}").into_bytes();
+            let key = air_key(Stage::Fragment, &air);
+            let mut c = global().lock().unwrap();
+            c.entries.insert(
+                key,
+                Entry::Ready(synth_shader(Stage::Fragment, vec![0, 0, 0, 0])),
+            );
+        }
+        assert!(
+            ensure_cached_async(&hot, Stage::Fragment, 1),
+            "the first-compiled shader is still resolved after 1024 later ones"
+        );
+        assert_eq!(
+            global().lock().unwrap().entries.len(),
+            1025,
+            "every distinct shader is retained; nothing is evicted for count"
+        );
+        reset_for_test();
+    }
+
     #[test]
     fn async_kernel_cache_uses_local_size_key() {
         let _guard = test_lock();
@@ -929,7 +959,6 @@ mod tests {
         {
             let mut c = global().lock().unwrap();
             c.entries.insert(key, Entry::Loading);
-            c.order.push(key);
         }
         assert!(!ensure_cached_kernel_async(air, [16, 16, 1], 20));
         assert!(global().lock().unwrap().async_queue.is_empty());
