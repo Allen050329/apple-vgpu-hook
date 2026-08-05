@@ -1706,7 +1706,7 @@ fn handle_render_record<M: HostMemory + HostOps>(
                     pipeline_ref: acc.pipeline_ref,
                     draw: DrawArgs {
                         vertex_count: count,
-                        instance_count: cmd.instance_count.max(1),
+                        instance_count: cmd.instance_count,
                         primitive_type: cmd.primitive_type,
                         first_vertex: cmd.vertex_start,
                         base_instance: cmd.base_instance,
@@ -2799,11 +2799,7 @@ fn finish_stream<M: HostMemory + HostOps>(
                         first_vertex: 0,
                         base_instance: 0,
                     },
-                    |pd| DrawArgs {
-                        vertex_count: pd.draw.vertex_count.max(1),
-                        instance_count: pd.draw.instance_count.max(1),
-                        ..pd.draw
-                    },
+                    |pd| pd.draw,
                 );
                 (acc.pipeline_ref, args)
             } else {
@@ -4726,7 +4722,10 @@ mod tests {
         };
 
         let mut set_pipeline = vec![0u8; wire_render::SET_STATE_TOTAL_LEN as usize];
-        st32(&mut set_pipeline[0..], wire_render::OPCODE_SET_RENDER_PIPELINE_STATE);
+        st32(
+            &mut set_pipeline[0..],
+            wire_render::OPCODE_SET_RENDER_PIPELINE_STATE,
+        );
         st32(&mut set_pipeline[4..], wire_render::SET_STATE_TOTAL_LEN);
         st32(&mut set_pipeline[8..], 0);
         handle_render_record(

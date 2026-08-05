@@ -35,6 +35,41 @@ fn narrow_count(value: u64) -> Result<u32, DecodeStatus> {
     u32::try_from(value).map_err(|_| DecodeStatus::ErrCountOutOfRange)
 }
 
+/// The instance count a selector that carries one on the wire asked for.
+///
+/// Eight decode arms wrote `(…get() as u32).max(1)` and none of them said why.
+/// The clamp only does anything when the guest serialized `instanceCount:0`, and
+/// there it draws one instance against whatever the instance buffers happen to
+/// hold — the selector's own argument, overruled.
+///
+/// Three arms of this device disagree about that value and were never diffed
+/// against each other. This one clamps it. `backend::metal::render` refuses it
+/// by name as `metal_render_instance_count_zero` — a refusal this clamp makes
+/// unreachable, so the two cannot both be describing the contract. And
+/// `runtime::icb` decodes the same argument out of an ICB slot and hands it
+/// straight to `drawPrimitives:…:instanceCount:` with no clamp at all, so the
+/// device already ships a zero instance count to Metal on the path that happens
+/// not to come through here.
+///
+/// The clamp stays until the case is measured — a zero is counted here and
+/// nowhere else, so `draw_instance_count_zero` is what would license honouring
+/// the guest's argument on this path as the ICB path already does. It is a
+/// census rather than a failure because a guest that culled every instance is
+/// expected control flow, not lost work.
+///
+/// Because this is the single site, the count it guarantees is what let the
+/// three further `.max(1)`s downstream of it go: two in `runtime::exec` and one
+/// in `runtime::metal_draw`, each re-applying a rule already applied here.
+#[inline]
+fn wire_instance_count(value: u64) -> Result<u32, DecodeStatus> {
+    let count = narrow_count(value)?;
+    if count == 0 {
+        crate::runtime::drain::note_store_route("draw_instance_count_zero");
+        return Ok(1);
+    }
+    Ok(count)
+}
+
 // Layout lengths for fixed-size records and bind tables. Opcodes live in
 // `reims_vgpu_wire::ops::{render,render_pass,tile}`; this module maps them into
 // product `Kind`/`Command` and does not re-export wire opcode constants.
@@ -50,7 +85,8 @@ pub const DRAW_COMPACT_CMD_LEN: usize = OP_HEADER_LEN + DRAW_COMPACT_PAYLOAD_LEN
 /// `wire::EXECUTE_COMMANDS_*_TOTAL_LEN` at new call sites — which leaves the old
 /// sites reading a second transcription, and a note is not a mechanism.
 #[cfg(test)]
-pub(crate) const EXECUTE_INDIRECT_CMD_LEN: usize = wire::EXECUTE_COMMANDS_INDIRECT_TOTAL_LEN as usize;
+pub(crate) const EXECUTE_INDIRECT_CMD_LEN: usize =
+    wire::EXECUTE_COMMANDS_INDIRECT_TOTAL_LEN as usize;
 #[cfg(test)]
 pub(crate) const EXECUTE_RANGE_CMD_LEN: usize = wire::EXECUTE_COMMANDS_RANGE_TOTAL_LEN as usize;
 // The two records' *field* offsets are not named here at all: both arms decode
@@ -86,7 +122,8 @@ pub(crate) const PASS_ATTACH_RESOLVEREF: usize =
     core::mem::offset_of!(wire_pass::AttachmentPrefix, resolve_texture_ref);
 pub const PASS_ATTACH_LEVEL: usize = core::mem::offset_of!(wire_pass::AttachmentPrefix, level);
 #[cfg(test)]
-pub(crate) const PASS_ATTACH_SLICE: usize = core::mem::offset_of!(wire_pass::AttachmentPrefix, slice);
+pub(crate) const PASS_ATTACH_SLICE: usize =
+    core::mem::offset_of!(wire_pass::AttachmentPrefix, slice);
 #[cfg(test)]
 pub(crate) const PASS_ATTACH_DEPTH_PLANE: usize =
     core::mem::offset_of!(wire_pass::AttachmentPrefix, depth_plane);
@@ -171,7 +208,8 @@ pub const BUFFER_STRIDE_BIND_ENTRY_SIZE: usize = core::mem::size_of::<wire::Buff
 /// `setVertexAmplificationCount:viewMappings:`: a four-byte count, then one
 /// `MTLVertexAmplificationViewMapping` (two `u32`) per view.
 #[cfg(test)]
-pub(crate) const AMPLIFICATION_COUNT_LEN: usize = core::mem::size_of::<wire::VertexAmplificationHeader>();
+pub(crate) const AMPLIFICATION_COUNT_LEN: usize =
+    core::mem::size_of::<wire::VertexAmplificationHeader>();
 #[cfg(test)]
 pub(crate) const AMPLIFICATION_MAPPING_SIZE: usize = core::mem::size_of::<wire::ViewMapping>();
 pub const REF_BIND_ENTRY_SIZE: usize = core::mem::size_of::<wire::RefBind>();
@@ -883,7 +921,7 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             out.kind = Kind::Draw;
             out.vertex_start = d.vertex_start.get() as u32;
             out.vertex_count = d.vertex_count.get() as u32;
-            out.instance_count = (d.instance_count.get() as u32).max(1);
+            out.instance_count = wire_instance_count(d.instance_count.get() as u64)?;
             out.primitive_type = d.primitive_type.get() as u32;
             Ok(out)
         }
@@ -898,7 +936,7 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             out.kind = Kind::Draw;
             out.vertex_start = narrow_count(d.vertex_start.get())?;
             out.vertex_count = narrow_count(d.vertex_count.get())?;
-            out.instance_count = narrow_count(d.instance_count.get())?.max(1);
+            out.instance_count = wire_instance_count(d.instance_count.get())?;
             out.primitive_type = d.primitive_type.get() as u32;
             Ok(out)
         }
@@ -916,7 +954,7 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             out.kind = Kind::Draw;
             out.vertex_start = d.vertex_start.get() as u32;
             out.vertex_count = d.vertex_count.get() as u32;
-            out.instance_count = (d.instance_count.get() as u32).max(1);
+            out.instance_count = wire_instance_count(d.instance_count.get() as u64)?;
             out.base_instance = d.base_instance.get() as u32;
             out.primitive_type = d.primitive_type.get() as u32;
             Ok(out)
@@ -929,7 +967,7 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             out.kind = Kind::Draw;
             out.vertex_start = narrow_count(d.vertex_start.get())?;
             out.vertex_count = narrow_count(d.vertex_count.get())?;
-            out.instance_count = narrow_count(d.instance_count.get())?.max(1);
+            out.instance_count = wire_instance_count(d.instance_count.get())?;
             out.base_instance = narrow_count(d.base_instance.get())?;
             out.primitive_type = d.primitive_type.get() as u32;
             Ok(out)
@@ -983,7 +1021,7 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             out.index_buffer_offset = d.index_buffer_offset.get() as u64;
             out.instance_count = if opcode == wire::OPCODE_DRAW_INDEXED_INSTANCED {
                 let i = wire::draw_indexed_instanced(&op).map_err(|_| DecodeStatus::ErrShort)?;
-                (i.instance_count.get() as u32).max(1)
+                wire_instance_count(i.instance_count.get() as u64)?
             } else {
                 1
             };
@@ -1000,7 +1038,7 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             out.index_buffer_ref = d.index_buffer_ref.get();
             out.index_count = narrow_count(d.index_count.get())?;
             out.index_buffer_offset = d.index_buffer_offset.get();
-            out.instance_count = narrow_count(d.instance_count.get())?.max(1);
+            out.instance_count = wire_instance_count(d.instance_count.get())?;
             Ok(out)
         }
         // The full indexed draw, with a base vertex and a base instance.
@@ -1021,7 +1059,7 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             out.index_buffer_ref = d.index_buffer_ref.get();
             out.index_count = d.index_count.get() as u32;
             out.index_buffer_offset = d.index_buffer_offset.get() as u64;
-            out.instance_count = (d.instance_count.get() as u32).max(1);
+            out.instance_count = wire_instance_count(d.instance_count.get() as u64)?;
             out.base_instance = d.base_instance.get() as u32;
             out.base_vertex = d.base_vertex.get() as i64;
             Ok(out)
@@ -1038,7 +1076,7 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             out.index_buffer_ref = d.index_buffer_ref.get();
             out.index_count = narrow_count(d.index_count.get())?;
             out.index_buffer_offset = d.index_buffer_offset.get();
-            out.instance_count = narrow_count(d.instance_count.get())?.max(1);
+            out.instance_count = wire_instance_count(d.instance_count.get())?;
             out.base_instance = narrow_count(d.base_instance.get())?;
             out.base_vertex = d.base_vertex.get();
             Ok(out)
@@ -1757,6 +1795,54 @@ mod tests {
     /// — no such Metal primitive — while separately reporting UInt16 for a
     /// 32-bit index buffer. Apple's serializer emits exactly these bytes for
     /// `(TriangleStrip, count 0x1111, UInt32, ref, offset 0x2222)`; the wire
+    /// Every selector that carries an instance count leaves it non-zero, which
+    /// is the guarantee three `.max(1)`s downstream of here used to re-apply —
+    /// two in `runtime::exec`, one in `runtime::metal_draw`. They are gone, so
+    /// this is now the only thing holding that property up. A decode arm added
+    /// without [`wire_instance_count`] fails here rather than in a boot.
+    #[test]
+    fn no_decoded_draw_leaves_a_zero_instance_count() {
+        use crate::contract::endian::st16;
+
+        // The two compact instanced forms, each with the wire carrying zero.
+        let mut inst = hdr(
+            wire::OPCODE_DRAW_INSTANCED,
+            wire::DRAW_INSTANCED_TOTAL_LEN as usize,
+        );
+        st16(&mut inst[8..], 0); // vertexStart
+        st16(&mut inst[10..], 3); // vertexCount
+        st16(&mut inst[12..], 0); // instanceCount — the case under test
+        st16(&mut inst[14..], 3); // primitiveType
+        assert_eq!(
+            decode(&inst).expect("instanced draw").instance_count,
+            1,
+            "a wire zero is clamped here or nowhere"
+        );
+
+        let mut ix = hdr(
+            wire::OPCODE_DRAW_INDEXED_INSTANCED,
+            wire::DRAW_INDEXED_INSTANCED_TOTAL_LEN as usize,
+        );
+        st16(&mut ix[8..], 3); // primitiveType
+        st16(&mut ix[10..], 0); // indexType
+        st32(&mut ix[12..], 1); // index buffer ref
+        st16(&mut ix[16..], 3); // index count
+        st16(&mut ix[18..], 0); // index buffer offset
+        st16(&mut ix[20..], 0); // instanceCount — the case under test
+        assert_eq!(
+            decode(&ix).expect("indexed instanced draw").instance_count,
+            1
+        );
+
+        // And the non-instanced selectors, which carry no count at all: the
+        // API's own default is one instance, not zero.
+        let mut compact = hdr(wire::OPCODE_DRAW, DRAW_COMPACT_CMD_LEN);
+        st32(&mut compact[8..], 3);
+        st16(&mut compact[12..], 0);
+        st16(&mut compact[14..], 3);
+        assert_eq!(decode(&compact).expect("compact draw").instance_count, 1);
+    }
+
     /// crate's `render_draw_indexed_uint32` fixture is the same capture.
     #[test]
     fn a_compact_indexed_draw_reads_its_index_type_from_the_wire() {

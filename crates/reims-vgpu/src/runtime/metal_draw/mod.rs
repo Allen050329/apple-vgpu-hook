@@ -1920,7 +1920,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
         height,
         crate::contract::draw::DrawArgs {
             vertex_count,
-            instance_count: req.instance_count.max(1),
+            instance_count: req.instance_count,
             primitive_type: req.primitive_type,
             first_vertex: req.first_vertex,
             base_instance: req.base_instance,
