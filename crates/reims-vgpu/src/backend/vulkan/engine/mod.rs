@@ -2093,6 +2093,14 @@ pub fn maintain_idle_residents(display: Option<&TargetIdentity>, now_ms: u64) {
 }
 
 /// Snapshot of create/alloc/hit-miss counters (for tests and thrash proxies).
+/// Live entries in each immutable-object cache:
+/// `(shaders, layouts, passes, pipelines, samplers, compute_pipelines)`.
+///
+/// See [`caches::ObjectCaches::levels`] for what reading it answers.
+pub fn object_cache_levels() -> [usize; 6] {
+    lock_engine().caches.levels()
+}
+
 pub fn counter_snapshot() -> CounterSnapshot {
     let eng = lock_engine();
     let mut snap = eng.counters.snapshot();

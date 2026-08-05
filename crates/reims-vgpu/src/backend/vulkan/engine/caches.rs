@@ -306,6 +306,10 @@ impl<K: Clone + Eq + std::hash::Hash, V> ObjectCache<K, V> {
         }
     }
 
+    fn len(&self) -> usize {
+        self.map.len()
+    }
+
     fn clear(&mut self) {
         self.map.clear();
         self.negative.clear();
@@ -363,6 +367,26 @@ impl ObjectCaches {
         for s in self.samplers.take_all() {
             device.destroy_sampler(s, None);
         }
+    }
+
+    /// Live entries in each cache, in the order
+    /// `(shaders, layouts, passes, pipelines, samplers, compute_pipelines)`.
+    ///
+    /// Published because [`ObjectCache`] is unbounded on the argument that its
+    /// entry count is the guest's distinct object set and therefore plateaus.
+    /// That is a claim about a running guest, and this is the reading that can
+    /// falsify it: a level that climbs for the life of a boot instead of
+    /// settling means some key is carrying per-frame state and the argument is
+    /// wrong for that cache. Levels, not deltas — the census line says so.
+    pub(crate) fn levels(&self) -> [usize; 6] {
+        [
+            self.shaders.len(),
+            self.layouts.len(),
+            self.passes.len(),
+            self.pipelines.len(),
+            self.samplers.len(),
+            self.compute_pipelines.len(),
+        ]
     }
 
     pub(crate) fn clear_logical(&mut self) {

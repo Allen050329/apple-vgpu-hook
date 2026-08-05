@@ -1380,7 +1380,33 @@ pub fn note_drain_tranche(drain_us: u64, publish_us: u64) {
         // the timer is runtime-side and the Metal arm can adopt it without a
         // second census.
         emit_chain_phase();
+        emit_object_cache_levels();
     }
+}
+
+/// Live entry counts of the caches that hold one entry per distinct guest
+/// object, as **levels** rather than per-window deltas.
+///
+/// These caches carry no capacity and no replacement rule. The argument for that
+/// is that each key is a content digest or a complete descriptor of guest state,
+/// so the count is the guest's own distinct object set and settles once the
+/// guest has finished compiling. That is a claim about a running guest, and this
+/// line is what can falsify it: a level still climbing minutes into a boot means
+/// some key is carrying per-frame state, and the argument is wrong for that
+/// cache. A settling level is the argument holding.
+///
+/// `m2v` counts translated shaders (`runtime::m2v_cache`); the rest are the
+/// Vulkan engine's immutable-object caches.
+#[cfg(feature = "backend-vulkan")]
+fn emit_object_cache_levels() {
+    let [shaders, layouts, passes, pipelines, samplers, compute_pipelines] =
+        crate::backend::vulkan::engine::object_cache_levels();
+    let (_, _, m2v) = crate::runtime::m2v_cache::stats();
+    crate::observe::off(format!(
+        "object_cache_levels (levels, not per-interval) m2v={m2v} shaders={shaders} \
+         layouts={layouts} passes={passes} pipelines={pipelines} samplers={samplers} \
+         compute_pipelines={compute_pipelines}"
+    ));
 }
 
 #[cfg(feature = "backend-vulkan")]
@@ -1574,6 +1600,12 @@ fn emit_stage_phase() {
 
 #[cfg(not(feature = "backend-vulkan"))]
 fn emit_engine_delta() {}
+
+/// The Metal arm keeps its compiled objects in `backend::metal::cache`, which
+/// has no reader for its levels yet. Silent rather than partial: emitting the
+/// `m2v` count alone under a name that promises six more would read as six zeros.
+#[cfg(not(feature = "backend-vulkan"))]
+fn emit_object_cache_levels() {}
 
 /// The engine mutex's wait and hold time over the same window, split by which
 /// thread class asked for it.
