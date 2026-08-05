@@ -36,6 +36,16 @@
 //! is not a compile error message about style — it does not compile at all,
 //! because no arm matches it.
 //!
+//! With one qualification, learned the hard way: that guarantee covers the
+//! *condition* half, not the composition. `ladder_slugs!` forwarded its role as
+//! a `literal` fragment, which is opaque to the token match that selects the
+//! bare-role arms, so the empty role silently composed into `_wrong_type` and
+//! two more like it — three fresh spellings, produced by the very macro meant to
+//! stop them, all with a leading underscore that matched no documented grep. A
+//! macro rules out the spellings a *call site* can write; what it expands to
+//! still has to be asserted. `both_macros_spell_a_rung_the_same_way` is that
+//! assertion, and it is why every wrapper around these macros needs one.
+//!
 //! # What does not belong here
 //!
 //! Only the four rungs above. A rail's *semantic* refusals — the descriptor
@@ -120,8 +130,24 @@ macro_rules! ladder_slug {
 /// The match is exhaustive over the rungs, so adding one to the enum breaks
 /// every rail here rather than letting a rail fall through to a catch-all —
 /// which is the whole reason the rung is a value and not a string.
+///
+/// # Why `$role:tt` and not `$role:literal`
+///
+/// Because `ladder_slug!` selects its bare-role arms by matching the *token*
+/// `""`, and a fragment captured as `literal` is an opaque AST node that no
+/// longer matches a token pattern. Written `$role:literal`, this macro's
+/// `ladder_slugs!("")` therefore fell past those arms into the composing ones
+/// and emitted `_wrong_type`, `_no_list_entry`, `_desc_read` — leading
+/// underscore and all. That is precisely the failure this module exists to
+/// prevent: three more spellings of the four conditions, matching none of the
+/// documented ones, so a `reason=wrong_type` grep of the fail log returned
+/// every rail *except* the ones routing through here.
+///
+/// `tt` is one of the three fragment kinds that stay transparent to later token
+/// matching, so the bare arms are reachable again. The composition is pinned
+/// below for both macros; a change back to `literal` turns those tests red.
 macro_rules! ladder_slugs {
-    ($role:literal) => {
+    ($role:tt) => {
         |rung: $crate::runtime::objects::LadderRung| -> &'static str {
             match rung {
                 $crate::runtime::objects::LadderRung::NoListEntry => {
@@ -162,6 +188,56 @@ mod tests {
         assert_eq!(ladder_slug!("", wrong_type), "wrong_type");
         assert_eq!(ladder_slug!("", desc_read), "desc_read");
         assert_eq!(ladder_slug!("", desc_decode), "desc_decode");
+    }
+
+    /// The plural macro must agree with the singular one for every role it can
+    /// be given — including the empty one.
+    ///
+    /// It did not. `ladder_slugs!` captured its role as a `literal` fragment and
+    /// handed it to `ladder_slug!`, whose bare-role arms select on the *token*
+    /// `""`; a captured fragment is opaque to token matching, so the empty role
+    /// fell through to the composing arms and every rail using `ladder_slugs!("")`
+    /// emitted `_wrong_type` rather than `wrong_type`. The test above passed
+    /// throughout, because it only ever exercised the singular macro — the arm
+    /// that was already right.
+    ///
+    /// So this asserts the *composition* both spellings produce, which is the
+    /// thing the fail log actually receives.
+    #[test]
+    fn both_macros_spell_a_rung_the_same_way() {
+        use crate::runtime::objects::LadderRung;
+        let rungs = [
+            LadderRung::NoListEntry,
+            LadderRung::WrongType { got: 7 },
+            LadderRung::DescRead { declared_len: 32 },
+        ];
+
+        let bare = ladder_slugs!("");
+        assert_eq!(
+            rungs.map(bare),
+            [
+                ladder_slug!("", no_list_entry),
+                ladder_slug!("", wrong_type),
+                ladder_slug!("", desc_read),
+            ],
+            "a rail whose event name carries the domain gets the bare condition"
+        );
+        for slug in rungs.map(bare) {
+            assert!(
+                !slug.starts_with('_'),
+                "`{slug}` is a spelling of a rung that no documented grep finds"
+            );
+        }
+
+        let roled = ladder_slugs!("buf");
+        assert_eq!(
+            rungs.map(roled),
+            [
+                ladder_slug!("buf", no_list_entry),
+                ladder_slug!("buf", wrong_type),
+                ladder_slug!("buf", desc_read),
+            ],
+        );
     }
 
     /// Every slug is a `&'static str` usable where a `const` is required, which
