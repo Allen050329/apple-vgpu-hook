@@ -282,6 +282,45 @@ fn note_t2t_overlap(
     true
 }
 
+/// `(task, side, format)` — what `repack_storage_assumed` reports once per.
+type RepackAssumedKey = (u32, &'static str, u16);
+
+/// Dedup set for `blit repack_storage_assumed`.
+static REPACK_STORAGE_ASSUMED_SEEN: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashSet<RepackAssumedKey>>,
+> = std::sync::OnceLock::new();
+
+/// Name an aspect repack whose storage stride could not be derived.
+///
+/// `bytes_per_pixel` refused this texture's format — in practice a zero, which
+/// the texture-to-texture format check deliberately admits — so the repack runs
+/// with the copied aspect's own width instead. That is right whenever the two
+/// widths agree and reads the wrong bytes when they do not, and nothing
+/// downstream can tell which happened. This is a **healthy zero**: a firing says
+/// a real guest workload reached a combined depth/stencil repack against a
+/// texture whose format this device never learned, which is the evidence that
+/// would justify deriving the storage width from the backing instead of
+/// assuming it. Deduped per task, side and format so a per-blit repeat cannot
+/// flood.
+fn note_repack_storage_assumed(
+    task_id: u32,
+    side: &'static str,
+    format: u16,
+    assumed_bpp: u32,
+) -> bool {
+    let set = REPACK_STORAGE_ASSUMED_SEEN.get_or_init(|| std::sync::Mutex::new(Default::default()));
+    if let Ok(mut g) = set.lock() {
+        if !g.insert((task_id, side, format)) {
+            return false;
+        }
+    }
+    crate::observe::fail(format!(
+        "blit repack_storage_assumed task={task_id} side={side} format={format} \
+         assumed_bpp={assumed_bpp} (storage width underivable; aspect width used)"
+    ));
+    true
+}
+
 /// Dedup set for the `copy_region_*_io` enrichment, keyed by
 /// `(task, gva_page, is_write)`.
 static COPY_REGION_IO_SEEN: std::sync::OnceLock<
@@ -2463,8 +2502,23 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
     };
     // Combined DS + aspect: extract plane from src, insert into dst (RMW).
     if repack_src || repack_dst {
-        let src_storage = texture_storage_bpp(src.pixel_format()).unwrap_or(copy_bpp);
-        let dst_storage = texture_storage_bpp(dst.pixel_format()).unwrap_or(copy_bpp);
+        // The repack strides are the two textures' *storage* widths, which for a
+        // combined depth/stencil format is wider than the aspect being copied.
+        // Either side may still be format 0 here: the mismatch check above lets a
+        // zero through, so a format-less texture can pair with a combined one and
+        // only the combined side sets its `repack_*`. `bytes_per_pixel` cannot
+        // answer for a zero, and the aspect's own `copy_bpp` is then a guess at a
+        // stride this device is about to read guest bytes with. It stays the
+        // guess — refusing would drop a copy that is correct whenever the two
+        // widths agree — but it is a guess about guest data, so it says so.
+        let src_storage = texture_storage_bpp(src.pixel_format()).unwrap_or_else(|_| {
+            note_repack_storage_assumed(task_id, "src", src.pixel_format(), copy_bpp);
+            copy_bpp
+        });
+        let dst_storage = texture_storage_bpp(dst.pixel_format()).unwrap_or_else(|_| {
+            note_repack_storage_assumed(task_id, "dst", dst.pixel_format(), copy_bpp);
+            copy_bpp
+        });
         let plane_row = row_bytes as usize;
         let mut plane = vec![0u8; plane_row];
         let mut src_packed = vec![0u8; (copy_w as usize).saturating_mul(src_storage as usize)];
@@ -5365,6 +5419,41 @@ mod tests {
         }
         // A distinct destination ref is a distinct failure -> reports once.
         assert!(note_t2t_overlap(3, 0x10, 0x11, 0, 4096, 256, 1024, 8, 1));
+    }
+
+    /// The precondition the `repack_storage_assumed` enrichment exists for.
+    ///
+    /// The texture-to-texture format check deliberately admits a zero on either
+    /// side, so a format-less texture can pair with a combined depth/stencil one
+    /// and reach the aspect repack. `bytes_per_pixel` cannot answer for a zero,
+    /// which is what makes the repack fall back to the aspect's own width. If a
+    /// zero ever became derivable this assertion fails, and the enrichment
+    /// beside it would be measuring nothing.
+    #[test]
+    fn a_zero_pixel_format_has_no_derivable_storage_width() {
+        assert!(texture_storage_bpp(0).is_err());
+        // A real format does answer, so the refusal above is about the zero and
+        // not about the helper being broken for everything.
+        assert_eq!(texture_storage_bpp(MTL_FORMAT_BGRA8_UNORM), Ok(4));
+    }
+
+    /// Regression guard: the `repack_storage_assumed` enrichment dedups per
+    /// `(task, side, format)` — a repack re-issued every frame must not flood —
+    /// while each side and each distinct format reports once, so a source and a
+    /// destination assuming their width are two findings rather than one.
+    #[test]
+    fn repack_storage_assumed_enrichment_dedups_per_side_and_format() {
+        // Unique task namespace (7) so the process-global dedup set never
+        // collides with other tests; the set starts empty so first-insert is
+        // deterministic without a reset.
+        assert!(note_repack_storage_assumed(7, "src", 0, 4));
+        for _ in 0..20 {
+            assert!(!note_repack_storage_assumed(7, "src", 0, 4));
+        }
+        // The other side of the same copy is a distinct finding.
+        assert!(note_repack_storage_assumed(7, "dst", 0, 4));
+        // So is a different format that could not be derived.
+        assert!(note_repack_storage_assumed(7, "src", 0x99, 4));
     }
 
     /// Regression guard: the `copy_region_io` enrichment dedups per
