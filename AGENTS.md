@@ -178,6 +178,7 @@ simply the wrong number, a length four bytes off, or a field two bytes too wide:
 | Does a decoded record fail a guard and vanish into a no-op catch-all? | `scripts/silent-arms` |
 | Does a constant crossing the C boundary have the test this file asks for? | `scripts/abi-pins` |
 | Do two checks share a `reason=` slug, and so share `fail_once`'s latch? | `crates/reims-vgpu/tests/decline_slugs_are_unique.rs` |
+| Does a test pass only because of what ran before it? | `scripts/test-isolation` |
 | Is a Vulkan value spelled outside the `translate/` table that owns it? | `crates/reims-vgpu/tests/vulkan_state_enums_live_in_translate.rs` |
 | Does anything reach a Vulkan 1.3 core name the 1.2 floor forbids? | `crates/reims-vgpu/tests/nothing_reaches_past_the_vulkan_api_floor.rs` |
 
