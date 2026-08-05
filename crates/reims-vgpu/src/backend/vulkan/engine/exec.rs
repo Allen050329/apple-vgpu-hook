@@ -14,7 +14,7 @@ use super::counters::EngineCounters;
 use super::device_lost::{DeviceLostDecline, DeviceLostOp};
 use super::draw_execution::DrawExecutionDecline;
 use super::draw_validation::DrawValidationDecline;
-use super::pools::{BufferSlot, ResourcePools, SampledSlot, TargetKey};
+use super::pools::{BufferSlot, ResourcePools, SampledKey, SampledSlot, TargetKey};
 use super::stage_phase;
 use super::types::{
     BufferContent, ColorWriteMask, DrawError, DrawOutput, DrawRequest, SampledSource,
@@ -1674,15 +1674,7 @@ pub(crate) unsafe fn execute_draw_inner(
         match &resource.source {
             SampledSource::Bytes(bytes) => {
                 if let Some(image) = pools.find_cached_sampled(
-                    resource.width,
-                    resource.height,
-                    resource.layers,
-                    resource.volume,
-                    resource.cube,
-                    resource.arrayed,
-                    resource.one_dim,
-                    resource.format,
-                    resource.swizzle,
+                    SampledKey::of(resource),
                     bytes,
                     resource.identity,
                     counters,
@@ -1693,19 +1685,7 @@ pub(crate) unsafe fn execute_draw_inner(
                     });
                     continue;
                 }
-                let img = pools.acquire_sampled(
-                    ctx,
-                    resource.width,
-                    resource.height,
-                    resource.layers,
-                    resource.volume,
-                    resource.cube,
-                    resource.arrayed,
-                    resource.one_dim,
-                    resource.format,
-                    resource.swizzle,
-                    counters,
-                )?;
+                let img = pools.acquire_sampled(ctx, SampledKey::of(resource), counters)?;
                 let st = pools.acquire_staging(
                     ctx,
                     bytes.len() as u64,
@@ -1774,15 +1754,12 @@ pub(crate) unsafe fn execute_draw_inner(
                 if req.target_identity.as_ref() == Some(identity) {
                     let image = pools.acquire_sampled(
                         ctx,
-                        resource.width,
-                        resource.height,
-                        resource.layers,
-                        resource.volume,
-                        resource.cube,
-                        resource.arrayed,
-                        resource.one_dim,
-                        super::super::translate::pixel::resident_color(source_bgra),
-                        resource.swizzle,
+                        SampledKey {
+                            // The snapshot binds the *resident's* format, not
+                            // the one the binding declared.
+                            format: super::super::translate::pixel::resident_color(source_bgra),
+                            ..SampledKey::of(resource)
+                        },
                         counters,
                     )?;
                     sampled.push(PreparedSampled::Snapshot {
@@ -1814,15 +1791,7 @@ pub(crate) unsafe fn execute_draw_inner(
                 // nothing compared — which is the whole point, since reading
                 // the bytes to compare them is the cost being removed.
                 if let Some(image) = pools.find_gathered_sampled(
-                    resource.width,
-                    resource.height,
-                    resource.layers,
-                    resource.volume,
-                    resource.cube,
-                    resource.arrayed,
-                    resource.one_dim,
-                    resource.format,
-                    resource.swizzle,
+                    SampledKey::of(resource),
                     resource.identity,
                     counters,
                 ) {
@@ -1833,19 +1802,7 @@ pub(crate) unsafe fn execute_draw_inner(
                     });
                     continue;
                 }
-                let img = pools.acquire_sampled(
-                    ctx,
-                    resource.width,
-                    resource.height,
-                    resource.layers,
-                    resource.volume,
-                    resource.cube,
-                    resource.arrayed,
-                    resource.one_dim,
-                    resource.format,
-                    resource.swizzle,
-                    counters,
-                )?;
+                let img = pools.acquire_sampled(ctx, SampledKey::of(resource), counters)?;
                 // Everything from here to the end of this arm moves bytes;
                 // everything above it in `AcquireSampled` decides which image
                 // to move them into. The split is what separates "the driver

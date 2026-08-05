@@ -1901,25 +1901,13 @@ impl ResourcePools {
         Ok(self.targets.get(&map_key).unwrap())
     }
 
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "sampled-image acquisition mirrors its Vulkan format and content identity"
-    )]
     pub(crate) unsafe fn acquire_sampled(
         &mut self,
         ctx: &DeviceContext,
-        width: u32,
-        height: u32,
-        layers: u32,
-        volume: bool,
-        cube: bool,
-        arrayed: bool,
-        one_dim: bool,
-        format: ash::vk::Format,
-        swizzle: crate::contract::pixel_format::SwizzlePlan,
+        sk: SampledKey,
         counters: &EngineCounters,
     ) -> Result<SampledSlot, DrawError> {
-        let sk = SampledKey {
+        let SampledKey {
             width,
             height,
             layers,
@@ -1929,7 +1917,7 @@ impl ResourcePools {
             one_dim,
             format,
             swizzle,
-        };
+        } = sk;
         // A hit reuses a recycled slot — no vkAllocateMemory this acquire. A miss
         // is counted here, at the empty free list, rather than after the create
         // succeeds: the census question is whether the pool had one, not whether
@@ -2074,74 +2062,26 @@ impl ResourcePools {
 
     /// The guest-gather rail's lookup: the complete image key, and identity as
     /// the only content evidence there is.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "mirrors the complete image key, as its content-bearing sibling does"
-    )]
     pub(crate) fn find_gathered_sampled(
         &mut self,
-        width: u32,
-        height: u32,
-        layers: u32,
-        volume: bool,
-        cube: bool,
-        arrayed: bool,
-        one_dim: bool,
-        format: ash::vk::Format,
-        swizzle: crate::contract::pixel_format::SwizzlePlan,
+        key: SampledKey,
         identity: Option<crate::backend::vulkan::engine::SampledContentIdentity>,
         counters: &EngineCounters,
     ) -> Option<SampledSlot> {
-        let handles = self.find_sampled_by_identity(
-            SampledKey {
-                width,
-                height,
-                layers,
-                volume,
-                cube,
-                arrayed,
-                one_dim,
-                format,
-                swizzle,
-            },
-            identity,
-        )?;
+        let handles = self.find_sampled_by_identity(key, identity)?;
         counters
             .sampled_identity_hits
             .fetch_add(1, Ordering::Relaxed);
         Some(handles)
     }
 
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "sampled-cache lookup mirrors the complete image and content key"
-    )]
     pub(crate) fn find_cached_sampled(
         &mut self,
-        width: u32,
-        height: u32,
-        layers: u32,
-        volume: bool,
-        cube: bool,
-        arrayed: bool,
-        one_dim: bool,
-        format: ash::vk::Format,
-        swizzle: crate::contract::pixel_format::SwizzlePlan,
+        key: SampledKey,
         content: &[u8],
         identity: Option<crate::backend::vulkan::engine::SampledContentIdentity>,
         counters: &EngineCounters,
     ) -> Option<SampledSlot> {
-        let key = SampledKey {
-            width,
-            height,
-            layers,
-            volume,
-            cube,
-            arrayed,
-            one_dim,
-            format,
-            swizzle,
-        };
         if let Some(handles) = self.find_sampled_by_identity(key, identity) {
             counters
                 .sampled_identity_hits

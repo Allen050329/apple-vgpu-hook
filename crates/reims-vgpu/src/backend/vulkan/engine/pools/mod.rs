@@ -514,17 +514,48 @@ pub(crate) struct SampledSlot {
     pub swizzle: crate::contract::pixel_format::SwizzlePlan,
 }
 
+/// Everything that has to match for one sampled image to stand in for another:
+/// the extent, the Vulkan image and view types the four shape flags select, the
+/// format, and the view's component mapping.
+///
+/// Travels as one value all the way from the call site. The four flags are the
+/// reason — they are adjacent, all `bool`, and `SampledImageResource` happens to
+/// declare them in a different order than this does, so a positional call had
+/// to reorder them by hand and nothing would have caught it getting that wrong.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-struct SampledKey {
-    width: u32,
-    height: u32,
-    layers: u32,
-    volume: bool,
-    cube: bool,
-    arrayed: bool,
-    one_dim: bool,
-    format: ash::vk::Format,
-    swizzle: crate::contract::pixel_format::SwizzlePlan,
+pub(crate) struct SampledKey {
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) layers: u32,
+    pub(crate) volume: bool,
+    pub(crate) cube: bool,
+    pub(crate) arrayed: bool,
+    pub(crate) one_dim: bool,
+    pub(crate) format: ash::vk::Format,
+    pub(crate) swizzle: crate::contract::pixel_format::SwizzlePlan,
+}
+
+impl SampledKey {
+    /// The key a decoded sampled binding asks for.
+    ///
+    /// A caller that needs one field to differ says so with struct-update
+    /// syntax (`SampledKey { format: .., ..SampledKey::of(r) }`), which names
+    /// the field it is overriding — the snapshot arm binds a resident under
+    /// `resident_color` rather than the resource's own format, and that used to
+    /// be visible only by counting to the eighth argument.
+    pub(crate) fn of(r: &super::types::SampledImageResource) -> Self {
+        Self {
+            width: r.width,
+            height: r.height,
+            layers: r.layers,
+            volume: r.volume,
+            cube: r.cube,
+            arrayed: r.arrayed,
+            one_dim: r.one_dim,
+            format: r.format,
+            swizzle: r.swizzle,
+        }
+    }
 }
 
 impl SampledSlot {
@@ -1378,6 +1409,84 @@ impl Drop for SlowStagingWrite {
 include!("submission_and_buffers.rs");
 include!("images_and_registry.rs");
 include!("teardown.rs");
+
+#[cfg(test)]
+mod sampled_key_tests {
+    use super::SampledKey;
+    use crate::backend::vulkan::engine::types::{SampledImageResource, SampledSource};
+    use crate::contract::pixel_format::SwizzlePlan;
+
+    fn resource(arrayed: bool, volume: bool, cube: bool, one_dim: bool) -> SampledImageResource {
+        SampledImageResource {
+            binding: 0,
+            width: 7,
+            height: 5,
+            layers: 3,
+            arrayed,
+            volume,
+            cube,
+            one_dim,
+            source: SampledSource::Bytes(std::sync::Arc::new(Vec::new())),
+            format: ash::vk::Format::R8G8B8A8_UNORM,
+            identity: None,
+            swizzle: SwizzlePlan::default(),
+        }
+    }
+
+    /// Each shape flag reaches the key field of its own name.
+    ///
+    /// The four are adjacent, all `bool`, and declared in a different order on
+    /// the resource (`arrayed, volume, cube, one_dim`) than on the key
+    /// (`volume, cube, arrayed, one_dim`), so any permutation of them compiles
+    /// and none of the callers could have noticed. One flag set at a time is
+    /// the only pattern that pins all four: with two set, a swap between them
+    /// is invisible.
+    #[test]
+    fn every_shape_flag_reaches_the_key_field_of_its_own_name() {
+        // Set on the resource as (arrayed, volume, cube, one_dim); read back
+        // off the key as (volume, cube, arrayed, one_dim).
+        let one_hot = [
+            (
+                "arrayed",
+                (true, false, false, false),
+                (false, false, true, false),
+            ),
+            (
+                "volume",
+                (false, true, false, false),
+                (true, false, false, false),
+            ),
+            (
+                "cube",
+                (false, false, true, false),
+                (false, true, false, false),
+            ),
+            (
+                "one_dim",
+                (false, false, false, true),
+                (false, false, false, true),
+            ),
+        ];
+        for (name, (arrayed, volume, cube, one_dim), want) in one_hot {
+            let k = SampledKey::of(&resource(arrayed, volume, cube, one_dim));
+            assert_eq!(
+                (k.volume, k.cube, k.arrayed, k.one_dim),
+                want,
+                "{name} did not reach the key field of its own name"
+            );
+        }
+    }
+
+    /// The extent and view fields carry across too, so a flag test passing
+    /// cannot hide a crossed `width`/`height` beside it.
+    #[test]
+    fn the_extent_and_view_fields_carry_across() {
+        let k = SampledKey::of(&resource(false, false, false, false));
+        assert_eq!((k.width, k.height, k.layers), (7, 5, 3));
+        assert_eq!(k.format, ash::vk::Format::R8G8B8A8_UNORM);
+        assert_eq!(k.swizzle, SwizzlePlan::default());
+    }
+}
 
 #[cfg(test)]
 mod content_hash_tests {
