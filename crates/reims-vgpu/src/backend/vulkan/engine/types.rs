@@ -307,7 +307,7 @@ pub struct DrawRequest {
     /// Face culling (Metal `MTLCullMode`). `None` (default) draws both faces —
     /// the 2D UI path. `Front`/`Back` reproduce Metal culling; which winding is
     /// "front" is `front_face_ccw`, mapped to a Vulkan winding by
-    /// [`crate::backend::vulkan::engine::caches::metal_front_face`].
+    /// [`crate::backend::vulkan::translate::raster::vk_front_face`].
     pub cull_mode: CullMode,
     /// Metal front-facing winding: `true` = counter-clockwise (`MTLWinding`
     /// CounterClockwise), `false` = the Metal default clockwise. Only affects

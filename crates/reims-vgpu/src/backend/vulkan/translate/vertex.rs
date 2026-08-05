@@ -238,6 +238,21 @@ pub fn step_function(declared: Option<u32>) -> Result<VertexStepFunction, Transl
     }
 }
 
+/// `VertexStepFunction` → the Vulkan input rate the binding is created with.
+///
+/// `Constant` has no Vulkan spelling of its own: Metal advances a constant-rate
+/// attribute per instance with a divisor, so it lowers to `INSTANCE` and the
+/// divisor carries the rest. The divisor is chosen beside the binding it
+/// belongs to; this decides only the rate.
+pub fn vk_input_rate(step: VertexStepFunction) -> vk::VertexInputRate {
+    match step {
+        VertexStepFunction::PerVertex => vk::VertexInputRate::VERTEX,
+        VertexStepFunction::Constant | VertexStepFunction::PerInstance => {
+            vk::VertexInputRate::INSTANCE
+        }
+    }
+}
+
 #[cfg(test)]
 pub(super) const ALL_FORMATS: &[F] = &[
     F::UChar2,

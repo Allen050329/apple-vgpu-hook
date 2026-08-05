@@ -166,7 +166,7 @@ pub(crate) struct PipelineKey {
     /// its own pipeline rather than aliasing the no-cull one.
     pub cull_mode: CullMode,
     /// Metal front-facing winding (`true` = counter-clockwise), mapped to a
-    /// Vulkan `FrontFace` by [`metal_front_face`].
+    /// Vulkan `FrontFace` by [`crate::backend::vulkan::translate::raster::vk_front_face`].
     pub front_face_ccw: bool,
     /// Depth-test pipeline state. Meaningful only when `pass.depth.is_some()`;
     /// otherwise all-default (test/write off) and no depth-stencil state is
@@ -189,34 +189,6 @@ pub(crate) struct PipelineKey {
 pub(crate) struct StencilKey {
     pub front: super::types::StencilFaceOps,
     pub back: super::types::StencilFaceOps,
-}
-
-/// Map a Metal cull mode to Vulkan raster flags.
-pub(crate) fn metal_cull_flags(mode: CullMode) -> vk::CullModeFlags {
-    match mode {
-        CullMode::None => vk::CullModeFlags::NONE,
-        CullMode::Front => vk::CullModeFlags::FRONT,
-        CullMode::Back => vk::CullModeFlags::BACK,
-    }
-}
-
-/// Pick the Vulkan `FrontFace` that reproduces Metal front-face selection.
-///
-/// Metal evaluates winding in its window space (origin top-left, Y down) and its
-/// default front-facing winding is clockwise. We emulate Metal's Y-up NDC on
-/// Vulkan (Y-down NDC) with a negative-height viewport, which makes the
-/// rasterized framebuffer image — and therefore the apparent triangle winding —
-/// match Metal's. The mapping is therefore direct: a Metal clockwise front is
-/// `FrontFace::CLOCKWISE`. Every draw on this rail is emitted Y-flipped (the
-/// guest is always Metal), so there is no un-flipped case in which the
-/// framebuffer would mirror and invert the effective winding. Verified on-GPU
-/// by the `cull_*` parity tests.
-pub(crate) fn metal_front_face(front_face_ccw: bool) -> vk::FrontFace {
-    if front_face_ccw {
-        vk::FrontFace::COUNTER_CLOCKWISE
-    } else {
-        vk::FrontFace::CLOCKWISE
-    }
 }
 
 /// Lc: compute pipeline cache key — SPIR-V content digest + entry name + layout.
@@ -935,12 +907,7 @@ impl ObjectCaches {
                 vk::VertexInputBindingDescription::default()
                     .binding(attribute.binding)
                     .stride(attribute.stride)
-                    .input_rate(match attribute.step_function {
-                        VertexStepFunction::PerVertex => vk::VertexInputRate::VERTEX,
-                        VertexStepFunction::Constant | VertexStepFunction::PerInstance => {
-                            vk::VertexInputRate::INSTANCE
-                        }
-                    })
+                    .input_rate(translate::vertex::vk_input_rate(attribute.step_function))
             })
             .collect();
         let vertex_binding_divisors: Vec<_> = key
@@ -1007,8 +974,8 @@ impl ObjectCaches {
         // Same for depth clipping, which has no `depth_clamp_enable` here.
         let raster = vk::PipelineRasterizationStateCreateInfo::default()
             .polygon_mode(vk::PolygonMode::FILL)
-            .cull_mode(metal_cull_flags(key.cull_mode))
-            .front_face(metal_front_face(key.front_face_ccw))
+            .cull_mode(translate::raster::vk_cull_mode(key.cull_mode))
+            .front_face(translate::raster::vk_front_face(key.front_face_ccw))
             .line_width(1.0);
         // Likewise pinned rather than known: the pipeline sample count is not
         // on the wire, and every render target this backend allocates is
@@ -1268,35 +1235,5 @@ mod fifo_cache_tests {
         c.insert_negative(1, b.clone());
         assert_eq!(c.negative_order.len(), 1, "same key tracked once");
         assert_eq!(c.get_negative(&1), Some(b), "error refreshed");
-    }
-}
-
-#[cfg(test)]
-mod cull_mapping_tests {
-    use super::*;
-
-    #[test]
-    fn cull_flags_map_metal_modes() {
-        assert_eq!(metal_cull_flags(CullMode::None), vk::CullModeFlags::NONE);
-        assert_eq!(metal_cull_flags(CullMode::Front), vk::CullModeFlags::FRONT);
-        assert_eq!(metal_cull_flags(CullMode::Back), vk::CullModeFlags::BACK);
-    }
-
-    #[test]
-    fn front_face_matches_metal_under_yflip() {
-        // Every draw is emitted through a negative-height viewport, so the
-        // rasterized framebuffer winding matches Metal and the mapping is
-        // direct — Metal's clockwise default front maps to FrontFace::CLOCKWISE,
-        // CCW to CCW.
-        assert_eq!(
-            metal_front_face(false),
-            vk::FrontFace::CLOCKWISE,
-            "Metal CW front under Y-flip"
-        );
-        assert_eq!(
-            metal_front_face(true),
-            vk::FrontFace::COUNTER_CLOCKWISE,
-            "Metal CCW front under Y-flip"
-        );
     }
 }

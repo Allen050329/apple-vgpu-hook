@@ -132,9 +132,61 @@ pub fn vk_index_type(index: IndexType) -> vk::IndexType {
     }
 }
 
+pub fn vk_cull_mode(mode: CullMode) -> vk::CullModeFlags {
+    match mode {
+        CullMode::None => vk::CullModeFlags::NONE,
+        CullMode::Front => vk::CullModeFlags::FRONT,
+        CullMode::Back => vk::CullModeFlags::BACK,
+    }
+}
+
+/// The Vulkan `FrontFace` that reproduces Metal front-face selection.
+///
+/// Metal evaluates winding in its window space (origin top-left, Y down) and its
+/// default front-facing winding is clockwise. This backend emulates Metal's Y-up
+/// NDC on Vulkan's Y-down NDC with a negative-height viewport, which makes the
+/// rasterized framebuffer image — and therefore the apparent triangle winding —
+/// match Metal's. The mapping is therefore direct: a Metal clockwise front is
+/// `FrontFace::CLOCKWISE`. Every draw on this rail is emitted Y-flipped (the
+/// guest is always Metal), so there is no un-flipped case in which the
+/// framebuffer would mirror and invert the effective winding. Verified on-GPU
+/// by the `cull_*` parity tests.
+pub fn vk_front_face(front_face_ccw: bool) -> vk::FrontFace {
+    if front_face_ccw {
+        vk::FrontFace::COUNTER_CLOCKWISE
+    } else {
+        vk::FrontFace::CLOCKWISE
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cull_flags_map_metal_modes() {
+        assert_eq!(vk_cull_mode(CullMode::None), vk::CullModeFlags::NONE);
+        assert_eq!(vk_cull_mode(CullMode::Front), vk::CullModeFlags::FRONT);
+        assert_eq!(vk_cull_mode(CullMode::Back), vk::CullModeFlags::BACK);
+    }
+
+    #[test]
+    fn front_face_matches_metal_under_yflip() {
+        // Every draw is emitted through a negative-height viewport, so the
+        // rasterized framebuffer winding matches Metal and the mapping is
+        // direct — Metal's clockwise default front maps to FrontFace::CLOCKWISE,
+        // CCW to CCW.
+        assert_eq!(
+            vk_front_face(false),
+            vk::FrontFace::CLOCKWISE,
+            "Metal CW front under Y-flip"
+        );
+        assert_eq!(
+            vk_front_face(true),
+            vk::FrontFace::COUNTER_CLOCKWISE,
+            "Metal CCW front under Y-flip"
+        );
+    }
 
     /// Every SDK value in range maps, and the first one past the end declines
     /// by its own slug rather than a shared one.
