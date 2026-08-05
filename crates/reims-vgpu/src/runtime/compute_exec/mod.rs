@@ -53,6 +53,26 @@ pub const MAX_COMPUTE_BUFFER_SLOTS: u32 = 31;
 pub const MAX_COMPUTE_TEXTURE_SLOTS: u32 = 31;
 /// Cap on compute sampler stream indices (Metal bind = 64 + index).
 pub const MAX_COMPUTE_SAMPLER_SLOTS: u32 = 16;
+
+// The two caps above are what keeps a stream index inside its own descriptor
+// band: this rail binds a texture at `TEXTURE_BINDING_BASE + index` and a
+// sampler at `SAMPLER_BINDING_BASE + index`, so a cap that let an index reach
+// the next base would make a texture resolve against a sampler's reflection
+// entry — and `reflected_compute_texture` would answer `Absent` for it, which
+// this rail treats as "the shader does not use this binding" and skips. A
+// silent drop, from two constants that never name each other.
+//
+// `backend::metal::constants` states the same relation for the Metal argument
+// tables, in the same form and for the same reason; this side had the caps and
+// the bands in two modules with nothing between them.
+const _: () = assert!(
+    crate::runtime::spirv_bind::TEXTURE_BINDING_BASE + MAX_COMPUTE_TEXTURE_SLOTS
+        <= crate::runtime::spirv_bind::SAMPLER_BINDING_BASE
+);
+const _: () = assert!(
+    crate::runtime::spirv_bind::SAMPLER_BINDING_BASE + MAX_COMPUTE_SAMPLER_SLOTS
+        <= crate::runtime::spirv_bind::COLOR_INPUT_BINDING_BASE
+);
 /// Cap on threadgroup-memory indices (plan `REIMS_VGPU_COMPUTE_PLAN_MAX_THREADGROUP_MEMORY`).
 pub const MAX_THREADGROUP_MEMORY_SLOTS: u32 = 16;
 /// `MTLDispatchThreadgroupsIndirectArguments` = three `uint32_t` (12 bytes).
@@ -3081,8 +3101,6 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
         ComputeStorageImageResource, DrawError,
     };
 
-    const TEXTURE_BIND_BASE: u32 = 32;
-
     if acc.pipeline_ref == 0 {
         return ComputeStatus::MissingPipeline("compute_vk_pipeline_ref_zero");
     }
@@ -3229,7 +3247,7 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
         use crate::runtime::spirv_bind::{
             ImageAccess, ReflectedComputeTexture, StorageImageAccess,
         };
-        let binding = TEXTURE_BIND_BASE + t.index;
+        let binding = crate::runtime::spirv_bind::TEXTURE_BINDING_BASE + t.index;
         // Both the sampled-vs-storage class and the shape come solely from the
         // translator's reflection — the declared Metal texture type, exact at
         // translate time. The always-on `census_reflection_wellformed` guard
