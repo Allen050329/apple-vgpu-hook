@@ -1927,14 +1927,45 @@ pub fn read_raw_rows<M: HostMemory + HostOps>(
 /// `(base_offset, bytes_per_row, span_end, bytes_per_texel)`, or `None` when
 /// the mapping is gone, carries no latched geometry, has no decodable window,
 /// has an unknown format, or the rectangle leaves the surface.
-fn mapping_geom_window(
-    state: &DeviceState,
-    mapping_id: u32,
-    origin_x: u32,
-    origin_y: u32,
-    width: u32,
-    height: u32,
-) -> Option<(u64, u32, u64, u32)> {
+/// Where a mapped type-11 surface's texels sit, and how wide one is.
+///
+/// `mapping_geom_window` used to return this as `Option<(u64, u32, u64, u32)>`,
+/// a shape whose meaning existed only in the destructuring patterns of the two
+/// callers that unpacked it — and which they then splatted straight into four
+/// parameters of the `_at` functions, split around the rectangle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SurfaceWindow {
+    /// Byte offset of the plane's first texel within the mapping.
+    pub base_off: u64,
+    /// Bytes per row of the surface, which is not `width * bpp`.
+    pub bpr: u32,
+    /// One past the last byte the window may touch.
+    pub span_end: u64,
+    /// Bytes per texel.
+    pub bpp: u32,
+}
+
+/// A texel rectangle within a surface.
+///
+/// The four fields are `u32` and were adjacent in five signatures here, so
+/// every permutation of them compiled and no call site could object. One test
+/// call read `..., 0, 0, 4, 1, 1, ...` — five bare numbers spanning the origin,
+/// the extent and the bytes per texel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Rect {
+    pub origin_x: u32,
+    pub origin_y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+fn mapping_geom_window(state: &DeviceState, mapping_id: u32, rect: Rect) -> Option<SurfaceWindow> {
+    let Rect {
+        origin_x,
+        origin_y,
+        width,
+        height,
+    } = rect;
     let m = state.mappings.get(&mapping_id)?;
     if !m.has_geom {
         return None;
@@ -1949,36 +1980,29 @@ fn mapping_geom_window(
     if origin_x.saturating_add(width) > m.width || origin_y.saturating_add(height) > m.height {
         return None;
     }
-    Some((base_off, bpr, span_end, bpp))
+    Some(SurfaceWindow {
+        base_off,
+        bpr,
+        span_end,
+        bpp,
+    })
 }
 
 /// Read a rectangular texel region from a mapped type-11 IOSurface.
 /// Contig HostOps view when possible; else multi-import.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the mapping API mirrors the decoded texture rectangle"
-)]
 #[cfg(test)]
 pub fn read_rect_raw<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     mapping_id: u32,
-    origin_x: u32,
-    origin_y: u32,
-    width: u32,
-    height: u32,
+    rect: Rect,
     dst: &mut [u8],
     dst_stride: u32,
 ) -> bool {
-    let Some((base_off, bpr, span_end, bpp)) =
-        mapping_geom_window(state, mapping_id, origin_x, origin_y, width, height)
-    else {
+    let Some(window) = mapping_geom_window(state, mapping_id, rect) else {
         return false;
     };
-    read_rect_raw_at(
-        state, host, mapping_id, base_off, bpr, span_end, origin_x, origin_y, width, height, bpp,
-        dst, dst_stride,
-    )
+    read_rect_raw_at(state, host, mapping_id, window, rect, dst, dst_stride)
 }
 
 /// Read a rect using an explicit sample window (plane base + bpr + span).
@@ -1991,17 +2015,23 @@ pub fn read_rect_raw_at<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     mapping_id: u32,
-    base_off: u64,
-    surface_bpr: u32,
-    span_end: u64,
-    origin_x: u32,
-    origin_y: u32,
-    width: u32,
-    height: u32,
-    bpp: u32,
+    window: SurfaceWindow,
+    rect: Rect,
     dst: &mut [u8],
     dst_stride: u32,
 ) -> bool {
+    let SurfaceWindow {
+        base_off,
+        bpr: surface_bpr,
+        span_end,
+        bpp,
+    } = window;
+    let Rect {
+        origin_x,
+        origin_y,
+        width,
+        height,
+    } = rect;
     if width == 0 || height == 0 || width > MAX_SCANOUT_DIM || height > MAX_SCANOUT_DIM || bpp == 0
     {
         return false;
@@ -2155,22 +2185,14 @@ pub fn write_rect_raw<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     mapping_id: u32,
-    origin_x: u32,
-    origin_y: u32,
-    width: u32,
-    height: u32,
+    rect: Rect,
     src: &[u8],
     src_stride: u32,
 ) -> bool {
-    let Some((base_off, bpr, span_end, bpp)) =
-        mapping_geom_window(state, mapping_id, origin_x, origin_y, width, height)
-    else {
+    let Some(window) = mapping_geom_window(state, mapping_id, rect) else {
         return false;
     };
-    write_rect_raw_at(
-        state, host, mapping_id, base_off, bpr, span_end, origin_x, origin_y, width, height, bpp,
-        src, src_stride,
-    )
+    write_rect_raw_at(state, host, mapping_id, window, rect, src, src_stride)
 }
 
 /// Write a rect using an explicit sample window (plane base + bpr + span).
@@ -2183,29 +2205,39 @@ pub fn write_rect_raw_at<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     mapping_id: u32,
-    base_off: u64,
-    surface_bpr: u32,
-    span_end: u64,
-    origin_x: u32,
-    origin_y: u32,
-    width: u32,
-    height: u32,
-    bpp: u32,
+    window: SurfaceWindow,
+    rect: Rect,
     src: &[u8],
     src_stride: u32,
 ) -> bool {
-    write_rect_raw_at_impl(
-        state,
-        host,
-        mapping_id,
+    let SurfaceWindow {
         base_off,
-        surface_bpr,
+        bpr: surface_bpr,
         span_end,
+        bpp,
+    } = window;
+    let Rect {
         origin_x,
         origin_y,
         width,
         height,
-        bpp,
+    } = rect;
+    write_rect_raw_at_impl(
+        state,
+        host,
+        mapping_id,
+        SurfaceWindow {
+            base_off,
+            bpr: surface_bpr,
+            span_end,
+            bpp,
+        },
+        Rect {
+            origin_x,
+            origin_y,
+            width,
+            height,
+        },
         src,
         src_stride,
         false,
@@ -2235,14 +2267,18 @@ pub fn write_full_rect_raw_at<M: HostMemory + HostOps>(
         state,
         host,
         mapping_id,
-        base_off,
-        surface_bpr,
-        span_end,
-        0,
-        0,
-        width,
-        height,
-        bpp,
+        SurfaceWindow {
+            base_off,
+            bpr: surface_bpr,
+            span_end,
+            bpp,
+        },
+        Rect {
+            origin_x: 0,
+            origin_y: 0,
+            width,
+            height,
+        },
         src,
         src_stride,
         true,
@@ -2254,18 +2290,24 @@ fn write_rect_raw_at_impl<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     mapping_id: u32,
-    base_off: u64,
-    surface_bpr: u32,
-    span_end: u64,
-    origin_x: u32,
-    origin_y: u32,
-    width: u32,
-    height: u32,
-    bpp: u32,
+    window: SurfaceWindow,
+    rect: Rect,
     src: &[u8],
     src_stride: u32,
     full_plane: bool,
 ) -> bool {
+    let SurfaceWindow {
+        base_off,
+        bpr: surface_bpr,
+        span_end,
+        bpp,
+    } = window;
+    let Rect {
+        origin_x,
+        origin_y,
+        width,
+        height,
+    } = rect;
     if width == 0 || height == 0 || width > MAX_SCANOUT_DIM || height > MAX_SCANOUT_DIM || bpp == 0
     {
         return false;
@@ -2471,6 +2513,69 @@ mod tests {
     use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
     use crate::model::{DeviceId, PAGE_SHIFT_ARM64E};
     use crate::runtime::host::FakeHost;
+
+    /// `mapping_geom_window` puts each measurement in the field of its own name.
+    ///
+    /// `SurfaceWindow`'s four fields are two `u64`s and two `u32`s, so
+    /// `base_off`/`span_end` can cross silently and so can `bpr`/`bpp`. The
+    /// mapping below is chosen so all four read differently, which is what
+    /// makes a crossing observable at all.
+    ///
+    /// The row pitch is asserted by its relationships, not as a number: a
+    /// 4-wide BGRA8 surface reports `bpr = 128` against a tight row of 16,
+    /// because `type11_sample_window` aligns the pitch up. Hard-coding either
+    /// value would make this a test of that alignment rather than of which
+    /// field holds what.
+    #[test]
+    fn the_surface_window_names_which_measurement_is_which() {
+        use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mid = 30u32;
+        state.map_surface(mid);
+        {
+            let m = state.mappings.get_mut(&mid).unwrap();
+            m.mapped = true;
+            m.mapping_internal = 1;
+            m.map_generation = 1;
+            m.has_geom = true;
+            m.width = 4;
+            m.height = 4;
+            m.format = MTL_FORMAT_BGRA8_UNORM;
+        }
+        let rect = Rect {
+            origin_x: 0,
+            origin_y: 0,
+            width: 4,
+            height: 4,
+        };
+        let w = mapping_geom_window(&state, mid, rect).expect("a geometry window");
+        assert_eq!(w.bpp, 4, "BGRA8 is four bytes per texel");
+        assert!(
+            w.bpr >= 4 * w.bpp,
+            "a row holds at least the four texels: bpr={} bpp={}",
+            w.bpr,
+            w.bpp
+        );
+        assert_ne!(
+            w.bpr, w.bpp,
+            "the two must differ here or this test could not see them swapped"
+        );
+        assert_eq!(
+            w.span_end - w.base_off,
+            u64::from(w.bpr) * 4,
+            "the span reaches exactly the four rows the rectangle asked for"
+        );
+        // A rectangle past the declared extent has no window at all.
+        assert!(mapping_geom_window(
+            &state,
+            mid,
+            Rect {
+                origin_x: 1,
+                ..rect
+            }
+        )
+        .is_none());
+    }
 
     /// A tight full-page-aligned surface names exactly the pages its bytes
     /// occupy, and no more.
@@ -2692,14 +2797,18 @@ mod tests {
                         &mut state,
                         &mut host,
                         5,
-                        0,
-                        BPR,
-                        (W * H * 4) as u64,
-                        0,
-                        0,
-                        W,
-                        H,
-                        4,
+                        SurfaceWindow {
+                            base_off: 0,
+                            bpr: BPR,
+                            span_end: (W * H * 4) as u64,
+                            bpp: 4,
+                        },
+                        Rect {
+                            origin_x: 0,
+                            origin_y: 0,
+                            width: W,
+                            height: H,
+                        },
                         &src,
                         BPR,
                     ),
@@ -2765,7 +2874,23 @@ mod tests {
 
             assert!(
                 !write_rect_raw_at(
-                    &mut state, &mut host, 5, 0, BPR, span_end, 0, 0, W, over, 4, &src, BPR,
+                    &mut state,
+                    &mut host,
+                    5,
+                    SurfaceWindow {
+                        base_off: 0,
+                        bpr: BPR,
+                        span_end,
+                        bpp: 4
+                    },
+                    Rect {
+                        origin_x: 0,
+                        origin_y: 0,
+                        width: W,
+                        height: over
+                    },
+                    &src,
+                    BPR
                 ),
                 "packed={packed}: a rect past the window's last row must be refused"
             );
@@ -3763,16 +3888,20 @@ mod tests {
             &mut state,
             &mut host,
             mid,
-            0,
-            page as u32,
-            page + row1.len() as u64,
-            0,
-            0,
-            2,
-            2,
-            4,
+            SurfaceWindow {
+                base_off: 0,
+                bpr: page as u32,
+                span_end: page + row1.len() as u64,
+                bpp: 4
+            },
+            Rect {
+                origin_x: 0,
+                origin_y: 0,
+                width: 2,
+                height: 2
+            },
             &mut dst,
-            8,
+            8
         ));
         assert_eq!(&dst[..8], &row0);
         assert_eq!(&dst[8..], &row1);
@@ -3831,14 +3960,18 @@ mod tests {
                 &mut state,
                 &mut host,
                 mid,
-                0,
-                page as u32,
-                page,
-                0,
-                0,
-                2,
-                4,
-                4,
+                SurfaceWindow {
+                    base_off: 0,
+                    bpr: page as u32,
+                    span_end: page,
+                    bpp: 4,
+                },
+                Rect {
+                    origin_x: 0,
+                    origin_y: 0,
+                    width: 2,
+                    height: 4,
+                },
                 &mut dst,
                 8,
             );
@@ -3891,16 +4024,20 @@ mod tests {
             &mut state,
             &mut host,
             mid,
-            0,
-            bpr,
-            span,
-            0,
-            0,
-            bpr / 4,
-            2,
-            4,
+            SurfaceWindow {
+                base_off: 0,
+                bpr,
+                span_end: span,
+                bpp: 4
+            },
+            Rect {
+                origin_x: 0,
+                origin_y: 0,
+                width: bpr / 4,
+                height: 2
+            },
             &mut tight,
-            bpr,
+            bpr
         ));
         assert!(tight[..page as usize].iter().all(|&v| v == 0x31));
         assert!(tight[page as usize..].iter().all(|&v| v == 0x42));
@@ -4031,7 +4168,23 @@ mod tests {
         let cap = crate::observe::FailCapture::start();
         assert!(
             !read_rect_raw_at(
-                &mut state, &mut host, 11, 0, bpr, span_end, 0, 0, width, 100, bpp, &mut big, bpr,
+                &mut state,
+                &mut host,
+                11,
+                SurfaceWindow {
+                    base_off: 0,
+                    bpr,
+                    span_end,
+                    bpp
+                },
+                Rect {
+                    origin_x: 0,
+                    origin_y: 0,
+                    width,
+                    height: 100
+                },
+                &mut big,
+                bpr
             ),
             "an oversized-height read must be rejected"
         );
@@ -4049,7 +4202,23 @@ mod tests {
         let mut ok = vec![0u8; 2 * bpr as usize];
         assert!(
             read_rect_raw_at(
-                &mut state, &mut host, 11, 0, bpr, span_end, 0, 0, width, 2, bpp, &mut ok, bpr,
+                &mut state,
+                &mut host,
+                11,
+                SurfaceWindow {
+                    base_off: 0,
+                    bpr,
+                    span_end,
+                    bpp
+                },
+                Rect {
+                    origin_x: 0,
+                    origin_y: 0,
+                    width,
+                    height: 2
+                },
+                &mut ok,
+                bpr
             ),
             "a read whose extent equals span_end must succeed"
         );
@@ -4143,7 +4312,17 @@ mod tests {
         ));
         let mut row = vec![0u8; 16];
         assert!(read_rect_raw(
-            &mut state, &mut host, 7, 0, 0, 4, 1, &mut row, 16
+            &mut state,
+            &mut host,
+            7,
+            Rect {
+                origin_x: 0,
+                origin_y: 0,
+                width: 4,
+                height: 1
+            },
+            &mut row,
+            16
         ));
         // Outside scissor pixel 0 must be clear (not logo).
         assert_eq!(
@@ -4369,7 +4548,17 @@ mod tests {
         // Read back first row of mapping (BGRA native).
         let mut row = vec![0u8; 16];
         assert!(read_rect_raw(
-            &mut state, &mut host, 6, 0, 0, 4, 1, &mut row, 16
+            &mut state,
+            &mut host,
+            6,
+            Rect {
+                origin_x: 0,
+                origin_y: 0,
+                width: 4,
+                height: 1
+            },
+            &mut row,
+            16
         ));
         // Pixel 1 is red in BGRA: B=0 G=0 R=255 A=255
         assert_eq!(&row[4..8], &[0, 0, 255, 255]);
@@ -4395,16 +4584,46 @@ mod tests {
         // Write a 2x1 rect at (1,1): two BGRA pixels.
         let src = [0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
         assert!(write_rect_raw(
-            &mut state, &mut host, 5, 1, 1, 2, 1, &src, 8
+            &mut state,
+            &mut host,
+            5,
+            Rect {
+                origin_x: 1,
+                origin_y: 1,
+                width: 2,
+                height: 1
+            },
+            &src,
+            8
         ));
         let mut dst = [0u8; 8];
         assert!(read_rect_raw(
-            &mut state, &mut host, 5, 1, 1, 2, 1, &mut dst, 8
+            &mut state,
+            &mut host,
+            5,
+            Rect {
+                origin_x: 1,
+                origin_y: 1,
+                width: 2,
+                height: 1
+            },
+            &mut dst,
+            8
         ));
         assert_eq!(dst, src);
         // OOB origin fails.
         assert!(!write_rect_raw(
-            &mut state, &mut host, 5, 3, 0, 2, 1, &src, 8
+            &mut state,
+            &mut host,
+            5,
+            Rect {
+                origin_x: 3,
+                origin_y: 0,
+                width: 2,
+                height: 1
+            },
+            &src,
+            8
         ));
     }
 
@@ -4481,7 +4700,23 @@ mod tests {
 
         let mut dst = vec![0u8; 4 * 4 * 4];
         assert!(read_rect_raw_at(
-            &mut state, &mut host, mid, base_off, bpr, span_end, 0, 0, 4, 4, 4, &mut dst, 16,
+            &mut state,
+            &mut host,
+            mid,
+            SurfaceWindow {
+                base_off,
+                bpr,
+                span_end,
+                bpp: 4
+            },
+            Rect {
+                origin_x: 0,
+                origin_y: 0,
+                width: 4,
+                height: 4
+            },
+            &mut dst,
+            16
         ));
         assert_eq!(
             dst, frame,

@@ -4280,10 +4280,12 @@ fn write_mapping_rgba8_rect<M: HostMemory + HostOps>(
         state,
         host,
         mapping_id,
-        origin_x,
-        origin_y,
-        rect_w,
-        rect_h,
+        mapping_write::Rect {
+            origin_x,
+            origin_y,
+            width: rect_w,
+            height: rect_h,
+        },
         &raw,
         tight as u32,
     )

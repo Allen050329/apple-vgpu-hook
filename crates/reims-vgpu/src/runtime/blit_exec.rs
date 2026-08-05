@@ -972,14 +972,18 @@ fn read_texture_row<M: HostMemory + HostOps>(
                 state,
                 host,
                 t.mapping_id,
-                t.surface_offset,
-                t.row_stride as u32,
-                t.span_end,
-                ox as u32,
-                y as u32,
-                pixels,
-                1,
-                t.bpp,
+                mapping_write::SurfaceWindow {
+                    base_off: t.surface_offset,
+                    bpr: t.row_stride as u32,
+                    span_end: t.span_end,
+                    bpp: t.bpp,
+                },
+                mapping_write::Rect {
+                    origin_x: ox as u32,
+                    origin_y: y as u32,
+                    width: pixels,
+                    height: 1,
+                },
                 &mut buf[..row_bytes as usize],
                 row_bytes as u32,
             ) {
@@ -1061,14 +1065,18 @@ fn write_texture_row<M: HostMemory + HostOps>(
                 state,
                 host,
                 t.mapping_id,
-                t.surface_offset,
-                t.row_stride as u32,
-                t.span_end,
-                ox as u32,
-                y as u32,
-                pixels,
-                1,
-                t.bpp,
+                mapping_write::SurfaceWindow {
+                    base_off: t.surface_offset,
+                    bpr: t.row_stride as u32,
+                    span_end: t.span_end,
+                    bpp: t.bpp,
+                },
+                mapping_write::Rect {
+                    origin_x: ox as u32,
+                    origin_y: y as u32,
+                    width: pixels,
+                    height: 1,
+                },
                 &buf[..row_bytes as usize],
                 row_bytes as u32,
             ) {
@@ -3583,7 +3591,17 @@ mod tests {
         // Read back the written row via mapping_write.
         let mut back = [0u8; 8];
         assert!(mapping_write::read_rect_raw(
-            &mut state, &mut host, mapping_id, 0, 1, 2, 1, &mut back, 8
+            &mut state,
+            &mut host,
+            mapping_id,
+            mapping_write::Rect {
+                origin_x: 0,
+                origin_y: 1,
+                width: 2,
+                height: 1
+            },
+            &mut back,
+            8
         ));
         assert_eq!(back, pat);
         // Blit again — unified memory: pages are the only content; gen advances.
@@ -3601,7 +3619,17 @@ mod tests {
         // Seed source mid=3 pages with a known pattern.
         let src_pat = [9u8, 8, 7, 6, 5, 4, 3, 2, 1, 0, 11, 12, 13, 14, 15, 16];
         assert!(mapping_write::write_rect_raw(
-            &mut state, &mut host, 3, 0, 0, 2, 2, &src_pat, 8
+            &mut state,
+            &mut host,
+            3,
+            mapping_write::Rect {
+                origin_x: 0,
+                origin_y: 0,
+                width: 2,
+                height: 2
+            },
+            &src_pat,
+            8
         ));
         // Origins default to zero: this is the whole 2×2 surface.
         let mut cmd = copy_cmd(CopyKind::TextureToTexture, 3, 4);
@@ -3613,7 +3641,17 @@ mod tests {
         assert_eq!(execute_blit(&mut state, &mut host, 1, &cmd), BlitStatus::Ok);
         let mut back = [0u8; 16];
         assert!(mapping_write::read_rect_raw(
-            &mut state, &mut host, 4, 0, 0, 2, 2, &mut back, 8
+            &mut state,
+            &mut host,
+            4,
+            mapping_write::Rect {
+                origin_x: 0,
+                origin_y: 0,
+                width: 2,
+                height: 2
+            },
+            &mut back,
+            8
         ));
         assert_eq!(back, src_pat, "dest pages hold blit content (one copy)");
     }
@@ -4074,14 +4112,18 @@ mod tests {
             &mut state,
             &mut host,
             mapping_id,
-            512,
-            64,
-            512 + 64 + 4,
-            0,
-            0,
-            4,
-            1,
-            1,
+            mapping_write::SurfaceWindow {
+                base_off: 512,
+                bpr: 64,
+                span_end: 512 + 64 + 4,
+                bpp: 1
+            },
+            mapping_write::Rect {
+                origin_x: 0,
+                origin_y: 0,
+                width: 4,
+                height: 1
+            },
             &mut row0,
             4
         ));
@@ -4089,14 +4131,18 @@ mod tests {
             &mut state,
             &mut host,
             mapping_id,
-            512,
-            64,
-            512 + 64 + 4,
-            0,
-            1,
-            4,
-            1,
-            1,
+            mapping_write::SurfaceWindow {
+                base_off: 512,
+                bpr: 64,
+                span_end: 512 + 64 + 4,
+                bpp: 1
+            },
+            mapping_write::Rect {
+                origin_x: 0,
+                origin_y: 1,
+                width: 4,
+                height: 1
+            },
             &mut row1,
             4
         ));
@@ -4123,14 +4169,18 @@ mod tests {
             &mut state,
             &mut host,
             mapping_id,
-            1024,
-            64,
-            1024 + 4,
-            0,
-            0,
-            2,
-            1,
-            2,
+            mapping_write::SurfaceWindow {
+                base_off: 1024,
+                bpr: 64,
+                span_end: 1024 + 4,
+                bpp: 2
+            },
+            mapping_write::Rect {
+                origin_x: 0,
+                origin_y: 0,
+                width: 2,
+                height: 1
+            },
             &mut uv,
             4
         ));
@@ -4140,14 +4190,18 @@ mod tests {
             &mut state,
             &mut host,
             mapping_id,
-            512,
-            64,
-            512 + 64 + 4,
-            0,
-            0,
-            4,
-            1,
-            1,
+            mapping_write::SurfaceWindow {
+                base_off: 512,
+                bpr: 64,
+                span_end: 512 + 64 + 4,
+                bpp: 1
+            },
+            mapping_write::Rect {
+                origin_x: 0,
+                origin_y: 0,
+                width: 4,
+                height: 1
+            },
             &mut row0,
             4
         ));
@@ -4228,7 +4282,17 @@ mod tests {
         assert_eq!(execute_blit(&mut state, &mut host, 1, &cmd), BlitStatus::Ok);
         let mut back = [0u8; 8];
         assert!(mapping_write::read_rect_raw(
-            &mut state, &mut host, mapping_id, 0, 0, 2, 1, &mut back, 8
+            &mut state,
+            &mut host,
+            mapping_id,
+            mapping_write::Rect {
+                origin_x: 0,
+                origin_y: 0,
+                width: 2,
+                height: 1
+            },
+            &mut back,
+            8
         ));
         assert_eq!(back, pat);
     }

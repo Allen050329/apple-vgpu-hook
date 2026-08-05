@@ -94,15 +94,12 @@ already there and the signature is the only thing that disagrees.
 
 Recorded so the next reader starts from the triage rather than the raw report.
 
-- **`mapping_write`'s rectangle** — `read_rect_raw`, `read_rect_raw_at`,
-  `write_rect_raw`, `write_rect_raw_at` and `write_rect_raw_at_impl` all take
-  `origin_x, origin_y, width, height`, and `mapping_geom_window` returns
-  `Option<(u64, u32, u64, u32)>` — an anonymous 4-tuple whose meaning
-  (`base_off, bpr, span_end, bpp`) exists only in the callers' destructuring
-  patterns — which the callers then splat into four of those parameters. Two
-  types are wanted: the rectangle, and that window. Roughly 31 call sites
-  across `mapping_write`, `blit_exec`, `compute_exec` and `metal_draw/vulkan`;
-  `read_rect_raw_at` alone has 14. Not yet done.
+- **`mapping_write`'s rectangle** — *done*, see the commit that introduced
+  `SurfaceWindow` and `Rect`. Worth keeping the method: the 29 call sites were
+  rewritten by a script that split each argument list at top-level commas and
+  regrouped by position, rather than by hand. Hand-editing 29 sites where four
+  of the arguments are same-typed `u32`s is how a crossing gets introduced by
+  the very commit that exists to prevent one.
 - **`translate::blend::state`** — `src_rgb, dst_rgb, op_rgb, src_alpha,
   dst_alpha, op_alpha` is two triples, and swapping the halves is silent. One
   signature only, so by the rule above it is weaker evidence than the rect

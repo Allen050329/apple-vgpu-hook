@@ -717,7 +717,17 @@ fn assert_target_texels(
 ) {
     let mut back = vec![0u8; 4 * 4 * 4];
     assert!(mapping_write::read_rect_raw(
-        state, host, mapping_id, 0, 0, 4, 4, &mut back, 16
+        state,
+        host,
+        mapping_id,
+        mapping_write::Rect {
+            origin_x: 0,
+            origin_y: 0,
+            width: 4,
+            height: 4
+        },
+        &mut back,
+        16
     ));
     let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= tol;
     for (p, px) in back.chunks_exact(4).enumerate() {
