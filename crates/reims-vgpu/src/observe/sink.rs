@@ -57,9 +57,12 @@ enum Sink {
 
 pub(crate) fn enabled() -> bool {
     if !INIT.swap(true, Ordering::Relaxed) {
-        let on = std::env::var_os("REIMS_VGPU_DRAW_LOG")
-            .map(|v| v == "1")
-            .unwrap_or(false);
+        // Through the shared parse, and read once. Nothing is emitted for an
+        // unrecognized value: this is the emit path itself, so a report from
+        // here would recurse into the sink that is being asked whether it is
+        // enabled. Such a value reads as off, which is what every
+        // non-affirmative value already did.
+        let on = crate::env::switch(crate::env::DRAW_LOG) == crate::env::Switch::On;
         ENABLED.store(on, Ordering::Relaxed);
     }
     ENABLED.load(Ordering::Relaxed)

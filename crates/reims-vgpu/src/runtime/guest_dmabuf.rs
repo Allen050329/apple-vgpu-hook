@@ -87,6 +87,30 @@ struct Cache {
 
 static CACHE: Mutex<Option<Cache>> = Mutex::new(None);
 
+/// Whether the importing device can take a dma-buf at all, asked before this
+/// host is asked to make one.
+///
+/// The export is not free and not reversible in the way a refused import is: it
+/// walks the run list, takes a kernel reference on every page, and leaves those
+/// pages unswappable and unmigratable for as long as the cache holds the fd.
+/// Doing that and *then* learning the device cannot import it costs the guest up
+/// to [`MAX_PINNED_BYTES`] of its own RAM for nothing — on Apple hosts, on a
+/// Linux ICD without the extension, and whenever [`crate::env::DMABUF`] is off.
+/// So the import side's answer is consulted first.
+///
+/// [`DmaBufImport::Unqueried`] is not a refusal. No device exists yet, so the
+/// answer is not settled; the export goes ahead and the import site decides, as
+/// it did before this gate. Nothing is latched on that rung either — the very
+/// next window may get a real answer.
+fn backend_import_refusal() -> Option<crate::backend::vulkan::caps::DmaBufImport> {
+    use crate::backend::vulkan::caps::DmaBufImport;
+    let rung = crate::backend::vulkan::caps::external_memory::latched();
+    if rung.is_available() || rung == DmaBufImport::Unqueried {
+        return None;
+    }
+    Some(rung)
+}
+
 /// Whether a refusal is a property of the host rather than of this window.
 ///
 /// The distinction decides whether asking again can ever produce a different
@@ -176,6 +200,22 @@ pub fn dmabuf_for<M: HostOps>(
     page_size: u32,
 ) -> Option<Arc<GuestDmaBuf>> {
     if gpas.is_empty() || page_size == 0 {
+        return None;
+    }
+    if let Some(rung) = backend_import_refusal() {
+        // Once: the rung is a property of the physical device and does not move
+        // while the process runs. The line is on the fail channel because a
+        // reader asking why this boot copies every guest window needs to find
+        // the answer without a second boot — and `disabled_by_env` here is how
+        // they discover a switch someone left set.
+        static NOTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !NOTED.swap(true, Ordering::Relaxed) {
+            crate::observe::fail(format!(
+                "guest_dmabuf_export off reason=backend_cannot_import rung={} \
+                 (guest windows take the copying rails; no guest pages are pinned)",
+                rung.slug()
+            ));
+        }
         return None;
     }
     let key = digest(gpas, page_size);
@@ -320,6 +360,71 @@ mod tests {
         // dma-buf's ranges are sized from it.
         assert_ne!(digest(&a, 4096), digest(&a, 16384));
         assert_eq!(digest(&a, 4096), digest(&a, 4096));
+    }
+
+    /// A device that cannot import closes the export side, and one that has not
+    /// been created yet does not.
+    ///
+    /// The asymmetry is the point. A settled negative rung means no window will
+    /// ever be imported, so exporting one only pins guest pages; `Unqueried`
+    /// means no device exists yet and says nothing about what it will report, so
+    /// treating it as a refusal would turn the first frames of every boot into
+    /// copies on a host that is fully capable.
+    #[test]
+    fn a_settled_negative_rung_closes_the_export_and_unqueried_does_not() {
+        use crate::backend::vulkan::caps::external_memory::latch;
+        use crate::backend::vulkan::caps::DmaBufImport;
+
+        latch(DmaBufImport::Unqueried);
+        assert_eq!(backend_import_refusal(), None, "no device yet is not a no");
+        latch(DmaBufImport::Supported);
+        assert_eq!(backend_import_refusal(), None);
+        for closed in [
+            DmaBufImport::NoExternalMemoryFd,
+            DmaBufImport::NoDmaBufExtension,
+            DmaBufImport::NotImportable,
+            DmaBufImport::DisabledByEnv,
+        ] {
+            latch(closed);
+            assert_eq!(
+                backend_import_refusal(),
+                Some(closed),
+                "{closed:?} must close the export and name itself"
+            );
+        }
+        latch(DmaBufImport::Unqueried);
+    }
+
+    /// With the import side closed, the host is never asked to make a dma-buf.
+    ///
+    /// The witness is the cache's own permanent-refusal latch: [`NullHost`]
+    /// answers `CallbackMissing`, which [`is_permanent`] settles for the life of
+    /// the process. So a gate that let the call through would leave that latch
+    /// set, and its staying clear is proof the ioctl — and the page pin behind
+    /// it — never happened.
+    #[test]
+    fn a_closed_import_side_never_asks_the_host_to_pin_anything() {
+        use crate::backend::vulkan::caps::external_memory::latch;
+        use crate::backend::vulkan::caps::DmaBufImport;
+
+        // Start from a cache that has not already given up on this host, so the
+        // early return under test is the one being witnessed.
+        *CACHE.lock() = Some(Cache::default());
+        latch(DmaBufImport::NoDmaBufExtension);
+        let mut host = crate::qemu::host_ops::NullHost;
+        assert!(dmabuf_for(&mut host, &[0x1000, 0x2000], 4096).is_none());
+        {
+            let guard = CACHE.lock();
+            let cache = guard.as_ref().expect("cache was seeded above");
+            assert!(
+                cache.host_refusal.is_none(),
+                "the host was asked to export despite a closed import side"
+            );
+            assert_eq!(cache.entry_count, 0);
+            assert_eq!(cache.pinned_bytes, 0);
+        }
+        latch(DmaBufImport::Unqueried);
+        *CACHE.lock() = None;
     }
 
     /// A host that cannot export at all is asked once. The alternative is an

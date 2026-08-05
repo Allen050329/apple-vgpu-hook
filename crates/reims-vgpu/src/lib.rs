@@ -67,6 +67,9 @@ compile_error!(
 );
 
 pub mod contract;
+/// Every environment variable this device reads, and the rule that an override
+/// may only narrow what it does — see the module doc.
+pub mod env;
 pub mod model;
 /// Crate-wide observability: the always-on fail sink and the decline
 /// vocabulary. Above `runtime/` because every subsystem owes the reader a

@@ -522,6 +522,12 @@ impl DeviceContext {
             pd,
             &has_device_extension,
         );
+        // Published for the guest-page export side, which decides whether to ask
+        // the host for a dma-buf at all and has no device context to read. Set
+        // here rather than at the end of this function so a later failure leaves
+        // the export side knowing the answer too — it is a property of the
+        // physical device, and nothing below can change it.
+        crate::backend::vulkan::caps::external_memory::latch(dma_buf_import);
         let portability_subset = has_device_extension(vk::KHR_PORTABILITY_SUBSET_NAME);
         let vertex_attribute_divisor = has_device_extension(vk::KHR_VERTEX_ATTRIBUTE_DIVISOR_NAME);
         #[cfg(feature = "host-window")]
