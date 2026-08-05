@@ -2226,42 +2226,18 @@ pub(crate) fn store_seed_policy(
     }
 }
 
-// A six-way type-11 Load resolver stood here — `Type11LoadChoice`,
-// `Type11LoadDecision` and `resolve_type11_load_decision` — deciding whether a
-// LOAD should read the resident target, upload a CPU seed, or clear black, and
-// naming *which* check decided so the always-on census could separate the three
-// routes to a seed.
-//
-// It existed because a type-11 Store that landed by host-pointer import left the
-// attachment resident-only with no CPU bytes, so a later LOAD had to work out
-// which resident held the frame the guest's compositor computes its damage
-// against. Stores read back and seed from guest pages now, so every LOAD has its
-// bytes and there is nothing to resolve. Its one caller was inside the
-// `try_import` branch and went out with it.
-//
-// Worth noting what this resolver was for, because it was the honest half of a
-// problem that is now moot: its `PresentBoundary` arm was derived from live
-// forensics rather than any decoded field — the guest sends no "re-seed from the
-// front buffer" instruction — and the typed decisions existed so that arm could
-// be told apart from the two legitimate seed paths and weighed for deletion.
-
-/// Premultiplied `src` over `dst` with Metal factors **One / OneMinusSrcAlpha**.
+/// Premultiplied `src` over `dst` with Metal factors **One / OneMinusSrcAlpha**,
+/// in software.
 ///
-/// Live x86 class (2026-07-13 serial-210321): pipe-17 Load fills mid=1 solid gray
-/// (`rgb_nz=2073600`), then pipe-26 Load+blend seeds correctly but stores chrome-
-/// only (`rgb_nz=6018`) — engine fragment coverage is opaque black (A=255)
-/// outside chrome so alpha0-hole composite fills 0 and wipes the desktop base.
+/// When color0 blend is One/OneMinusSrcAlpha, the attachment Load composite is
+/// `src + dst*(1 - src.a)`. A fully transparent fragment leaves the seed
+/// untouched and an opaque one replaces it; only the partial alphas mix, which
+/// is what `blended_texels` counts. Returns `(pixels, blended_texels)`.
 ///
-/// Contract: when color0 blend is One/OneMinusSrcAlpha, the **attachment Load
-/// composite** is `src + dst*(1-src.a)` (premult). Applying that in software to
-/// the pure fragment color (draw over black clear) recovers seed under true
-/// transparent fragments. Opaque black still wins (intentional Clear-like black).
-///
-/// Returns `(pixels, blended_texels)` where blended counts texels with `src.a < 255`.
-/// Software premult One/OMSA composite. **The product path does not call this**
-/// — the hardware does Load+blend — and its two unit tests only check it against
-/// hand-written constants, so it reads as dead on both of the obvious checks.
-/// It is not. `premult_one_omsa_gpu_matches_software_composite` in
+/// **The product path does not call this** — the hardware does Load+blend — and
+/// its two unit tests only check it against hand-written constants, so it reads
+/// as dead on both of the obvious checks. It is not.
+/// `premult_one_omsa_gpu_blend_matches_software_oracle` in
 /// `tests/vk_engine_parity.rs` runs the real GPU blend and asserts it agrees
 /// with this function to within 1 LSB, which makes this the only independent
 /// statement of what that blend is supposed to compute. Deleting it deletes the

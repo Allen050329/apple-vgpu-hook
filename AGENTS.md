@@ -130,6 +130,14 @@ State exactly what you verified. A single green boot does not prove an entire cl
 claims such as "zero-copy everywhere" or "no fallback remains" require an audit of every place that
 could falsify them. One workload on one pathway proves one workload on one pathway.
 
+### A Subagent Shares Your Working Tree
+
+A delegated agent runs in this same checkout, so anything it does to git happens to you. Brief every
+one of them read-only, by name: no `checkout`, `switch`, `stash`, `reset`, `restore` or `commit`.
+The failure is quiet — an agent that runs `git checkout HEAD~1` to get a "clean build" and does not
+return leaves HEAD detached, and the next commit lands off the branch where nothing but the reflog
+can find it. Check `git status` after any delegated run before committing.
+
 ## Before A Broad Sweep
 
 Deletion and audit sweeps over this crate have been run many times. What each concluded lives next
