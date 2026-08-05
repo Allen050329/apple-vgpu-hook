@@ -125,7 +125,14 @@ echo "[dead-state] scratch copy: $SCRATCH"
 mkdir -p "$SCRATCH/crates"
 cp "$REPO/Cargo.toml" "$SCRATCH/"
 [ -f "$REPO/Cargo.lock" ] && cp "$REPO/Cargo.lock" "$SCRATCH/"
-(cd "$REPO/crates" && tar --exclude=target -cf - reims-vgpu) | (cd "$SCRATCH/crates" && tar -xf -)
+# Both workspace members are copied. `reims-vgpu-wire` is a path dependency of
+# `reims-vgpu` and a member of the root workspace, so omitting it makes cargo
+# refuse the whole manifest before it compiles anything. Only `reims-vgpu` is
+# rewritten below: the wire crate is a real dependency here, its `pub` surface
+# is what `reims-vgpu` consumes, and downgrading it would break the build
+# rather than measure anything.
+(cd "$REPO/crates" && tar --exclude=target -cf - reims-vgpu reims-vgpu-wire) |
+  (cd "$SCRATCH/crates" && tar -xf -)
 
 # 1. Downgrade every `pub` that opens an item. Leaves the restricted forms
 #    alone; an item declaration always starts its line in this crate.
