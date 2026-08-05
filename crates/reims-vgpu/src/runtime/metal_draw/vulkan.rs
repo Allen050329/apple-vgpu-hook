@@ -32,20 +32,33 @@ fn sampled_image_shape(
     kind: crate::runtime::spirv_bind::SampledImageKind,
 ) -> Option<SampledImageShape> {
     use crate::runtime::spirv_bind::SampledImageKind;
-    let (arrayed, volume, cube, one_dim) = match kind {
-        SampledImageKind::D1 => (false, false, false, true),
-        SampledImageKind::D1Array => (true, false, false, true),
-        SampledImageKind::D2 => (false, false, false, false),
-        SampledImageKind::D2Array => (true, false, false, false),
-        SampledImageKind::D3 => (false, true, false, false),
-        SampledImageKind::Cube | SampledImageKind::CubeArray => return None,
-    };
-    Some(SampledImageShape {
-        arrayed,
-        volume,
-        cube,
-        one_dim,
+    // Plain 2D, which every other shape is a single flag away from. `cube` is
+    // false in all of them: the two cube kinds decline below rather than
+    // reaching here, so nothing this function returns ever sets it.
+    let d2 = SampledImageShape {
+        arrayed: false,
+        volume: false,
+        cube: false,
+        one_dim: false,
         layers: 1,
+    };
+    Some(match kind {
+        SampledImageKind::D1 => SampledImageShape {
+            one_dim: true,
+            ..d2
+        },
+        SampledImageKind::D1Array => SampledImageShape {
+            one_dim: true,
+            arrayed: true,
+            ..d2
+        },
+        SampledImageKind::D2 => d2,
+        SampledImageKind::D2Array => SampledImageShape {
+            arrayed: true,
+            ..d2
+        },
+        SampledImageKind::D3 => SampledImageShape { volume: true, ..d2 },
+        SampledImageKind::Cube | SampledImageKind::CubeArray => return None,
     })
 }
 
@@ -8247,17 +8260,32 @@ mod vulkan_split_tests {
         assert_eq!(d1_array.layers, 1);
     }
 
+    /// Every kind reaches its whole flag set, not just its 1D-ness.
+    ///
+    /// This asserted `!one_dim` and nothing else, which left `D2Array`'s
+    /// `arrayed` and `D3`'s `volume` unpinned — and those two are adjacent
+    /// `bool`s of a five-field shape, so swapping them compiles and would have
+    /// bound a 3D image for an array and vice versa with the test still green.
     #[test]
-    fn sampled_image_shape_keeps_two_dimensional_shapes_flat() {
+    fn sampled_image_shape_gives_each_kind_its_whole_flag_set() {
         use crate::runtime::spirv_bind::SampledImageKind;
 
-        for kind in [
-            SampledImageKind::D2,
-            SampledImageKind::D2Array,
-            SampledImageKind::D3,
+        // (kind, arrayed, volume, one_dim). `cube` is false throughout — the
+        // cube kinds decline instead of producing a shape.
+        for (kind, arrayed, volume, one_dim) in [
+            (SampledImageKind::D2, false, false, false),
+            (SampledImageKind::D2Array, true, false, false),
+            (SampledImageKind::D3, false, true, false),
+            (SampledImageKind::D1, false, false, true),
+            (SampledImageKind::D1Array, true, false, true),
         ] {
-            let shape = sampled_image_shape(kind).expect("2D/3D shapes stay expressible");
-            assert!(!shape.one_dim, "{kind:?} must not be a 1D image");
+            let shape = sampled_image_shape(kind).expect("expressible shape");
+            assert_eq!(
+                (shape.arrayed, shape.volume, shape.cube, shape.one_dim),
+                (arrayed, volume, false, one_dim),
+                "{kind:?} did not map to its own flags"
+            );
+            assert_eq!(shape.layers, 1, "{kind:?} layers");
         }
     }
 
