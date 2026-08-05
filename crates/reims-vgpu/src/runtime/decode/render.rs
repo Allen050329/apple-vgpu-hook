@@ -516,22 +516,17 @@ pub struct Command {
     pub pass_render_target_height: u64,
     /// setBlendColor RGBA floats (when kind is SetBlendColor).
     pub blend_color: [f32; 4],
-    pub has_blend_color: bool,
     /// setCullMode
     pub cull_mode: u32,
-    pub has_cull_mode: bool,
     /// setFrontFacingWinding
     pub front_facing: u32,
-    pub has_front_facing: bool,
     /// setDepthBias (depthBias, slopeScale, clamp) as f32.
     pub depth_bias: [f32; 3],
-    pub has_depth_bias: bool,
     /// setDepthStencilState object ref
     pub depth_stencil_ref: u32,
     /// setStencilReference front/back
     pub stencil_ref_front: u32,
     pub stencil_ref_back: u32,
-    pub has_stencil_ref: bool,
     /// `0x14`/`0x15` executeCommandsInBuffer.
     pub indirect_command_buffer_ref: u32,
     /// `0x15` range form (unaligned after ICB ref).
@@ -1135,28 +1130,24 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
         wire::OPCODE_SET_BLEND_COLOR => {
             let b = wire::set_blend_color(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::SetBlendColor;
-            out.has_blend_color = true;
             out.blend_color = [b.red.get(), b.green.get(), b.blue.get(), b.alpha.get()];
             Ok(out)
         }
         wire::OPCODE_SET_CULL_MODE => {
             let m = wire::set_cull_mode(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::SetCullMode;
-            out.has_cull_mode = true;
             out.cull_mode = m.mode.get() as u32;
             Ok(out)
         }
         wire::OPCODE_SET_FRONT_FACING => {
             let m = wire::set_front_facing(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::SetFrontFacing;
-            out.has_front_facing = true;
             out.front_facing = m.mode.get() as u32;
             Ok(out)
         }
         wire::OPCODE_SET_DEPTH_BIAS => {
             let d = wire::set_depth_bias(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::SetDepthBias;
-            out.has_depth_bias = true;
             out.depth_bias = [d.bias.get(), d.slope_scale.get(), d.clamp.get()];
             Ok(out)
         }
@@ -1169,7 +1160,6 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
         wire::OPCODE_SET_STENCIL_REFERENCE => {
             let s = wire::set_stencil_reference(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::SetStencilReference;
-            out.has_stencil_ref = true;
             out.stencil_ref_front = s.front.get();
             out.stencil_ref_back = s.back.get();
             Ok(out)
@@ -2129,7 +2119,7 @@ mod tests {
         st32(&mut v[16..], 0.0f32.to_bits());
         st32(&mut v[20..], 1.0f32.to_bits());
         let c = decode(&v).unwrap();
-        assert!(c.has_blend_color);
+        assert_eq!(c.kind, Kind::SetBlendColor);
         assert!((c.blend_color[0] - 1.0).abs() < 1e-6);
 
         // Mode state is one NSUInteger on the wire (SET_MODE_TOTAL_LEN = 16).
@@ -2139,7 +2129,7 @@ mod tests {
         );
         st32(&mut v[8..], 2);
         let c = decode(&v).unwrap();
-        assert!(c.has_cull_mode);
+        assert_eq!(c.kind, Kind::SetCullMode);
         assert_eq!(c.cull_mode, 2);
     }
 

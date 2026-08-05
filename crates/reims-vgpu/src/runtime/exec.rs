@@ -1489,22 +1489,31 @@ fn handle_render_record<M: HostMemory + HostOps>(
                 note_empty_scissor(task_id, cmd.scissor_w, cmd.scissor_h);
             }
         }
-        RenderKind::SetBlendColor if cmd.has_blend_color => {
+        // No `if cmd.has_blend_color` on these five. Each of the five kinds has
+        // exactly one producer in `decode::render`, which sets the kind and the
+        // flag in the same block, so the flag was true whenever the arm was
+        // reached and the guard could not fail. It was not free: the match's last
+        // arm is a bare `_ => {}`, so the shape said a guest could set a cull mode
+        // this device then discarded, and `scripts/silent-arms` had to suppress
+        // all five as presence-guards to stay quiet. A record too short to hold
+        // the field never gets here at all — the wire view refuses it and
+        // `decode` returns `ErrShort` before a kind is assigned.
+        RenderKind::SetBlendColor => {
             acc.blend_color = Some(cmd.blend_color);
         }
-        RenderKind::SetCullMode if cmd.has_cull_mode => {
+        RenderKind::SetCullMode => {
             acc.cull_mode = Some(cmd.cull_mode);
         }
-        RenderKind::SetFrontFacing if cmd.has_front_facing => {
+        RenderKind::SetFrontFacing => {
             acc.front_facing = Some(cmd.front_facing);
         }
-        RenderKind::SetDepthBias if cmd.has_depth_bias => {
+        RenderKind::SetDepthBias => {
             acc.depth_bias = Some(cmd.depth_bias);
         }
         RenderKind::SetDepthStencil => {
             acc.depth_stencil_ref = cmd.depth_stencil_ref;
         }
-        RenderKind::SetStencilReference if cmd.has_stencil_ref => {
+        RenderKind::SetStencilReference => {
             acc.stencil_ref = Some((cmd.stencil_ref_front, cmd.stencil_ref_back));
         }
         RenderKind::RenderPass => {

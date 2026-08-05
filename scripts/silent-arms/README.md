@@ -33,11 +33,20 @@ usually hundreds of lines apart.
 **Most hits are not findings.** The question to ask is what the guard is
 testing:
 
-- **A guard on decoder presence is not a finding.** `if cmd.has_cull_mode`,
-  `if x.is_some()`, `if word_count >= 3` — these ask whether the decoder saw the
-  field at all, or whether the record was long enough to hold it. The arm not
-  running means the guest did not send the thing, so there is nothing to lose.
-  The script counts these and suppresses them.
+- **A guard on decoder presence is not a finding.** `if x.is_some()`,
+  `if word_count >= 3` — these ask whether the decoder saw the field at all, or
+  whether the record was long enough to hold it. The arm not running means the
+  guest did not send the thing, so there is nothing to lose. The script counts
+  these and suppresses them.
+- **A presence guard that cannot fail is worth deleting, not suppressing.** Check
+  where the flag is set. If the decoder assigns it in the *same block* that
+  assigns the kind the arm matches, and that kind has one producer, the guard is
+  true whenever the arm is reached. It still costs something: the reader — and
+  this script — sees a shape that says the device may discard a state the guest
+  set, so it has to be re-triaged every run. The five `has_blend_color` /
+  `has_cull_mode` / `has_front_facing` / `has_depth_bias` / `has_stencil_ref`
+  guards in `runtime/exec.rs` were this, along with the five `Command` fields
+  behind them; the suppressed count went 30 to 25 when they went.
 - **A guard on a decoded value is a candidate.** `if cmd.scissor_w > 0`,
   `if cmd.indirect_command_buffer_ref != 0` — the guest sent a record and said
   something specific in it. Falling through means the device read the guest's
