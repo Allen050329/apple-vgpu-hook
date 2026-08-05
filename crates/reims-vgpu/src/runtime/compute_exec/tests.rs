@@ -201,8 +201,9 @@ fn compute_bind_overflow_drops_the_bind_but_keeps_in_cap_and_unbinds() {
     assert_eq!(acc.buffers[0].index, 5);
 
     // Over-cap buffer bind (index 40 > MAX_COMPUTE_BUFFER_SLOTS) is dropped —
-    // the drop is fail-visible via note_compute_bind_overflow (the log itself is
-    // a global sink, not asserted here). No new buffer slot appears.
+    // the drop is fail-visible via `ComputeBindOverflow` (the log itself is a
+    // global sink; the line's shape is asserted by
+    // `every_compute_bind_table_renders_its_own_slug`). No new buffer slot appears.
     acc.bind_buffers(
         MAX_COMPUTE_BUFFER_SLOTS + 9,
         &[BufferBinding {
@@ -258,6 +259,81 @@ fn compute_bind_overflow_drops_the_bind_but_keeps_in_cap_and_unbinds() {
     assert!(
         acc.threadgroup_memory.is_empty(),
         "over-cap threadgroup memory must not be stored"
+    );
+}
+
+/// Each argument table renders its own `reason=`, and the line keeps the shape
+/// the log has always carried.
+///
+/// The four slugs used to live inside a `format!` string, where
+/// `decline_slugs_are_unique` could not read them — a later decline spelling
+/// one of them would have shared this path's `fail_once` latch and silenced one
+/// of the two for the boot, with nothing failing. They are `slug()` bodies now,
+/// so that test sees them; this one pins that moving them did not change what a
+/// reader greps for, and that the four tables stay distinguishable.
+#[test]
+fn every_compute_bind_table_renders_its_own_slug() {
+    use crate::observe::Emit;
+    use crate::runtime::compute_exec::ComputeBindOverflow as O;
+
+    assert_eq!(
+        Emit::decline(
+            "compute_bind_overflow",
+            &O::Buffer {
+                index: 40,
+                arg: 9,
+                cap: MAX_COMPUTE_BUFFER_SLOTS,
+            },
+        )
+        .render(),
+        "compute_bind_overflow reason=buffer_index_overflow index=40 arg=9 cap=31"
+    );
+
+    // `arg` is a length here rather than a ref — the one table whose payload is
+    // bytes, which is why the variant is separate.
+    assert_eq!(
+        Emit::decline(
+            "compute_bind_overflow",
+            &O::Threadgroup {
+                index: 18,
+                arg: 256,
+                cap: MAX_THREADGROUP_MEMORY_SLOTS,
+            },
+        )
+        .render(),
+        "compute_bind_overflow reason=threadgroup_index_overflow index=18 arg=256 cap=16"
+    );
+
+    let slugs: Vec<&str> = [
+        O::Buffer {
+            index: 0,
+            arg: 0,
+            cap: 0,
+        },
+        O::Texture {
+            index: 0,
+            arg: 0,
+            cap: 0,
+        },
+        O::Sampler {
+            index: 0,
+            arg: 0,
+            cap: 0,
+        },
+        O::Threadgroup {
+            index: 0,
+            arg: 0,
+            cap: 0,
+        },
+    ]
+    .iter()
+    .map(|o| crate::observe::Decline::slug(o))
+    .collect();
+    let unique: std::collections::BTreeSet<&str> = slugs.iter().copied().collect();
+    assert_eq!(
+        unique.len(),
+        slugs.len(),
+        "two tables sharing a slug would share fail_once's latch: {slugs:?}"
     );
 }
 

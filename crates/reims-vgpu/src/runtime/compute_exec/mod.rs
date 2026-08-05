@@ -82,32 +82,86 @@ pub const INDIRECT_THREADS_ARGS_LEN: usize = 24;
 /// `MTLStageInRegionIndirectArguments` = six `uint32_t` (24 bytes).
 pub const STAGE_IN_INDIRECT_ARGS_LEN: usize = 24;
 
-/// Fail-visible, deduped record of a compute resource bind dropped because its
-/// slot index exceeds the argument-table cap. The guest bound a real resource
-/// (`ref != 0`, or a non-empty threadgroup allocation) at a slot we cannot
-/// represent, so the dispatch runs *missing that bind* — wrong compute output
-/// with no other symptom, previously silent. Runs on the drain worker (off the
-/// QEMU main core). Deduped per `(table, index)` so a repeating dispatch cannot
-/// flood, and a healthy guest — which binds within the Metal argument-table caps —
-/// never fires it. The cap comparison is exclusive (`index >= MAX_*`) to match the
-/// backend, which sizes its argument-table arrays to exactly these counts
-/// (`[false; REIMS_VGPU_METAL_MAX_BUFFERS]`) and guards `idx >= REIMS_VGPU_METAL_MAX_*` before
-/// indexing — so slot `MAX` is out of range and a bind there is a genuine drop, not
-/// a boundary the accum should have accepted.
-fn note_compute_bind_overflow(table: &'static str, index: u32, resource_ref: u32, cap: u32) {
-    use std::collections::HashSet;
-    use std::sync::{Mutex, OnceLock};
-    static SEEN: OnceLock<Mutex<HashSet<(&'static str, u32)>>> = OnceLock::new();
-    let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
-    if seen
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert((table, index))
-    {
-        crate::observe::fail(format!(
-            "compute_bind_overflow reason={table}_index_overflow index={index} \
-             arg={resource_ref} cap={cap} (bind dropped; dispatch runs without it)"
-        ));
+/// A compute resource bind dropped because its slot index exceeds the
+/// argument-table cap.
+///
+/// The guest bound a real resource (`ref != 0`, or a non-empty threadgroup
+/// allocation) at a slot this device cannot represent, so the dispatch runs
+/// *missing that bind* — wrong compute output with no other symptom.
+///
+/// The cap comparison is exclusive (`index >= MAX_*`) to match the backend,
+/// which sizes its argument-table arrays to exactly these counts
+/// (`[false; REIMS_VGPU_METAL_MAX_BUFFERS]`) and guards
+/// `idx >= REIMS_VGPU_METAL_MAX_*` before indexing — so slot `MAX` is out of
+/// range and a bind there is a genuine drop, not a boundary the accum should
+/// have accepted.
+///
+/// # It is a `Decline` rather than a `format!`, and that is the point
+///
+/// This was a hand-rolled line: `observe::fail(format!(…))` behind a private
+/// `Mutex<HashSet<(table, index)>>`. Both halves were a second spelling of
+/// something the crate already owns — `Emit::fail_once` latches on
+/// `(slug, discriminant)` in one process-global set, which is the same dedup
+/// with the same shape.
+///
+/// Keeping a private one had a cost beyond the duplication.
+/// `decline_slugs_are_unique` reads `slug()` and `refusal()` bodies, so the four
+/// slugs below were **invisible to it** while they lived inside a format string:
+/// a future decline spelling `sampler_index_overflow` would have shared this
+/// path's latch and silenced one of the two for the life of the boot, and
+/// nothing would have failed. That is the exact shape the collision test was
+/// written about.
+///
+/// The rendered line is unchanged but for the trailing parenthetical, which the
+/// `k=v` shape has no room for and which this doc now carries instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ComputeBindOverflow {
+    Buffer { index: u32, arg: u32, cap: u32 },
+    Texture { index: u32, arg: u32, cap: u32 },
+    Sampler { index: u32, arg: u32, cap: u32 },
+    /// `arg` is the requested allocation length, not a resource ref — a
+    /// threadgroup slot names bytes rather than an object.
+    Threadgroup { index: u32, arg: u32, cap: u32 },
+}
+
+impl ComputeBindOverflow {
+    fn parts(&self) -> (u32, u32, u32) {
+        match *self {
+            Self::Buffer { index, arg, cap }
+            | Self::Texture { index, arg, cap }
+            | Self::Sampler { index, arg, cap }
+            | Self::Threadgroup { index, arg, cap } => (index, arg, cap),
+        }
+    }
+
+    /// Emit on the fail channel, once per `(table, slot)` this boot.
+    ///
+    /// Runs on the drain worker (off the QEMU main core). The latch is what
+    /// keeps a repeating dispatch from flooding; a healthy guest — one binding
+    /// within the Metal argument-table caps — never reaches here at all.
+    fn emit(self) {
+        let (index, ..) = self.parts();
+        crate::observe::Emit::decline("compute_bind_overflow", &self).fail_once(u64::from(index));
+    }
+}
+
+impl crate::observe::Decline for ComputeBindOverflow {
+    fn slug(&self) -> &'static str {
+        match self {
+            Self::Buffer { .. } => "buffer_index_overflow",
+            Self::Texture { .. } => "texture_index_overflow",
+            Self::Sampler { .. } => "sampler_index_overflow",
+            Self::Threadgroup { .. } => "threadgroup_index_overflow",
+        }
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        let (index, arg, cap) = self.parts();
+        vec![
+            ("index", index.to_string()),
+            ("arg", arg.to_string()),
+            ("cap", cap.to_string()),
+        ]
     }
 }
 
@@ -205,7 +259,12 @@ impl ComputeAccum {
                 continue;
             }
             if index >= MAX_COMPUTE_BUFFER_SLOTS {
-                note_compute_bind_overflow("buffer", index, e.ref_, MAX_COMPUTE_BUFFER_SLOTS);
+                ComputeBindOverflow::Buffer {
+                    index,
+                    arg: e.ref_,
+                    cap: MAX_COMPUTE_BUFFER_SLOTS,
+                }
+                .emit();
                 continue;
             }
             let bind = ComputeBufferBind {
@@ -245,7 +304,12 @@ impl ComputeAccum {
                 continue;
             }
             if index >= MAX_COMPUTE_TEXTURE_SLOTS {
-                note_compute_bind_overflow("texture", index, e.ref_, MAX_COMPUTE_TEXTURE_SLOTS);
+                ComputeBindOverflow::Texture {
+                    index,
+                    arg: e.ref_,
+                    cap: MAX_COMPUTE_TEXTURE_SLOTS,
+                }
+                .emit();
                 continue;
             }
             let bind = ComputeTextureBind {
@@ -270,7 +334,12 @@ impl ComputeAccum {
                 continue;
             }
             if index >= MAX_COMPUTE_SAMPLER_SLOTS {
-                note_compute_bind_overflow("sampler", index, e.ref_, MAX_COMPUTE_SAMPLER_SLOTS);
+                ComputeBindOverflow::Sampler {
+                    index,
+                    arg: e.ref_,
+                    cap: MAX_COMPUTE_SAMPLER_SLOTS,
+                }
+                .emit();
                 continue;
             }
             let bind = ComputeSamplerBind {
@@ -294,12 +363,12 @@ impl ComputeAccum {
             // (the kernel expects threadgroup memory here); a zero length is an
             // unbind, expected control flow. `arg` carries the requested length.
             if length != 0 {
-                note_compute_bind_overflow(
-                    "threadgroup",
+                ComputeBindOverflow::Threadgroup {
                     index,
-                    length.min(u32::MAX as u64) as u32,
-                    MAX_THREADGROUP_MEMORY_SLOTS,
-                );
+                    arg: length.min(u32::MAX as u64) as u32,
+                    cap: MAX_THREADGROUP_MEMORY_SLOTS,
+                }
+                .emit();
             }
             return;
         }
