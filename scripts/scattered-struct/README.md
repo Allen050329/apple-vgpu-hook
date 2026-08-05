@@ -53,15 +53,18 @@ permutation of the run compiles and no call site can object, so the run is the
 hazard whether or not a type is waiting for it.
 
 **The finding is a run repeated across a family**, not a long run on its own.
-`mapping_write`'s five rect functions all take `origin_x, origin_y, width,
-height` and four of them add `bpp`; that repetition says the rectangle is a
-thing the module keeps re-spelling. By contrast `compute_core`'s `grid_x,
-grid_y, grid_z, tg_x, tg_y, tg_z` is one function mirroring the shape of
-`dispatchThreadgroups:threadsPerThreadgroup:`, which is what the Metal API
-takes — the run is the SDK's, not ours.
+`mapping_write`'s five rect functions all took `origin_x, origin_y, width,
+height` and four of them added `bpp`; that repetition says the rectangle is a
+thing the module keeps re-spelling.
 
 Sort the report by how many *signatures* share a run before sorting by run
-length.
+length — but do not stop there. A run that looks like an SDK's parameter list
+still needs its *callers* checked: `compute_core`'s six dispatch dimensions
+read as a mirror of `dispatchThreadgroups:threadsPerThreadgroup:` and were
+triaged away here on that basis, until the producer turned out to be a function
+returning an anonymous seven-tuple over a type that already existed. See the
+standing findings below. The SDK-mirror exemption is about where a value is
+*going*, and this class is about where it has been.
 
 ## What a hit can legitimately be
 
@@ -100,11 +103,26 @@ Recorded so the next reader starts from the triage rather than the raw report.
   regrouped by position, rather than by hand. Hand-editing 29 sites where four
   of the arguments are same-typed `u32`s is how a crossing gets introduced by
   the very commit that exists to prevent one.
-- **`translate::blend::state`** — `src_rgb, dst_rgb, op_rgb, src_alpha,
-  dst_alpha, op_alpha` is two triples, and swapping the halves is silent. One
-  signature only, so by the rule above it is weaker evidence than the rect
-  family, but the two-triples shape makes the swap plausible rather than
-  theoretical. Not yet examined.
+- **`translate::blend::state`** — *done*. Two triples where a half-swap returns
+  `Ok` with the wrong channels blended, so there is nothing for the fail
+  channel to say. Now takes the decoded `&PipelineColorAttachment`.
+
+- **The compute dispatch dimensions** — open, and a correction to this file's
+  own earlier triage. `compute_core` and `compute_encode_on_encoder` were
+  called SDK mirrors here because `grid_x, grid_y, grid_z, tg_x, tg_y, tg_z`
+  reproduces `dispatchThreadgroups:threadsPerThreadgroup:`. That is true of the
+  *Metal call at the bottom*, but not of how the values arrive:
+  `compute_exec::resolve_dispatch_dims_reported` returns
+  `(u32, u32, u32, u32, u32, u32, bool)` — an anonymous seven-tuple destructured
+  by two callers — and `decode::compute::Size3` already exists as the type for
+  each half. So this is the `Point` shape after all, with an SDK-shaped call
+  only at the far end.
+
+  Left for a session that can do better than clippy on it: `compute_core`'s body
+  is `backend-metal`, which is Apple-only, so a Linux host can cross-compile and
+  lint it but cannot run its tests. Note also that `dispatch_kind` and
+  `dispatch_type` sit inside the same run while belonging to neither `Size3`,
+  which is part of why the run reads as eight interchangeable `u32`s.
 
 ## Known limits
 
