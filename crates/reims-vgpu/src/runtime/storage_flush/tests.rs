@@ -1,3 +1,22 @@
+//! Tests for the deferred-flush rail.
+//!
+//! Nineteen of these carry `#[cfg(feature = "backend-vulkan")]` and the rest
+//! do not, and the line between them is not a matter of taste: on a build
+//! without the engine, the rail's seven entry points are stubs, so a test that
+//! asserts a window's bytes reached guest memory is asserting something the
+//! build cannot do. Those tests are Vulkan-rail tests and say so.
+//!
+//! The other twenty-one exercise decisions the rail makes before it reaches an
+//! entry point — key identity, window bookkeeping, the refusals, the bands —
+//! and hold on both arms.
+//!
+//! The split was measured rather than guessed. Compiling the seven entry
+//! points to their non-Vulkan stubs on a `backend-vulkan` build and removing
+//! the already-gated tests reproduces exactly what the Metal arm runs: it
+//! reported 27 passed and 6 failed, and those six are the ones the gate was
+//! added to. Re-running the same probe after gating them reports 27 passed and
+//! none failed.
+
 use crate::model::{ComputeStorageResidencyKey, DeviceId, DeviceState, PAGE_SHIFT_X86};
 
 /// The fence-batch bands cover every count, start at one, and separate the
@@ -179,6 +198,7 @@ fn map_notify_stashes_fingerprint_instead_of_bumping() {
 /// `gen`, adjacent to `reason=map_generation_drift current=…`, and a boot
 /// was read as showing a mapping lifetime running backwards (`gen=3
 /// current=Some(2)`) when the two numbers were never comparable.
+#[cfg(feature = "backend-vulkan")]
 #[test]
 fn the_compute_drift_line_names_the_generation_it_compared() {
     use crate::runtime::host::FakeHost;
@@ -240,6 +260,7 @@ fn the_compute_drift_line_names_the_generation_it_compared() {
 /// decisive branch with no engine present. It doubles as coverage of the
 /// recycled-pages guard: a mapping rebound since arm time must never have a
 /// stale framebuffer written through its new pages.
+#[cfg(feature = "backend-vulkan")]
 #[test]
 fn a_render_window_flushes_through_the_shared_trigger_and_names_its_rail() {
     use crate::runtime::host::FakeHost;
@@ -300,6 +321,7 @@ fn a_render_window_flushes_through_the_shared_trigger_and_names_its_rail() {
 /// disagreed. Both refusals are correct and both lose the tile, so both have
 /// to be countable apart; testing only the sibling would leave the branch a
 /// live boot exercises uncovered.
+#[cfg(feature = "backend-vulkan")]
 #[test]
 fn a_render_window_over_repointed_pages_is_refused_and_counted() {
     use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
@@ -517,6 +539,7 @@ fn the_clobber_report_claims_no_ordering_against_the_store() {
 ///
 /// The assertion that matters either way is the *guest memory*: a decline
 /// that still wrote would pass a log-only check.
+#[cfg(feature = "backend-vulkan")]
 #[test]
 fn a_resident_window_that_cannot_be_vouched_for_declines_without_writing() {
     use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
@@ -614,6 +637,7 @@ fn a_render_windows_key_rebuilds_the_identity_the_draw_rendered_into() {
 /// guest kept its stale pixels. One boot lost 15 whole layers that way —
 /// including a 1920x1080 desktop surface and a 1920x24 menu bar — which on
 /// screen is a compositing layer rendering solid black.
+#[cfg(feature = "backend-vulkan")]
 #[test]
 fn a_render_window_lands_its_own_pixels_after_the_cache_moved_geometry() {
     use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
@@ -897,6 +921,7 @@ fn flush_holds_windows_while_the_backing_is_condemned() {
 /// extent with a copy the guest has already said is stale. Every other guard
 /// on this path asks where the bytes would land; this one asks whether they
 /// are owed at all, which is why it runs first.
+#[cfg(feature = "backend-vulkan")]
 #[test]
 fn a_window_the_guest_superseded_is_refused_by_name() {
     use crate::runtime::host::FakeHost;

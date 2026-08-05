@@ -382,11 +382,11 @@ either suite covers what they cover, so a green run is not evidence about a wire
 with `scripts/wire-oracle/wire-oracle.sh` on an Apple host, and set `REIMS_WIRE_FIXTURES_REQUIRED=1`
 there so their absence fails the build.
 
-The `backend-metal` `--lib` arm has six pre-existing failures, all in
-`runtime::storage_flush::tests` and all exercising `flush_render_one`, which is a fail-visible stub
-on a build without `backend-vulkan`. They are Vulkan-rail tests compiled unconditionally rather than
-a Metal defect. Check the failing *module and count*, not the pass count — the pass count moves
-whenever anyone adds a test. Do not "fix" them by weakening what they assert.
+**The `backend-metal` `--lib` arm is expected to be green.** It used to carry six standing failures
+in `runtime::storage_flush::tests`, and this file used to tell you to expect them; they were
+Vulkan-rail tests compiled unconditionally, and they now carry the gate. A red there is a real
+result again — do not restore the exception, and do not silence a new one by weakening what it
+asserts.
 
 ## Commit Guidelines
 
