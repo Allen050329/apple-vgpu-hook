@@ -486,9 +486,79 @@ fn resolve_indirect_threadgroups_from_buffer() {
     cmd.indirect_buffer_ref = 7;
     cmd.indirect_buffer_offset = 0;
     cmd.threads_per_threadgroup = compute::Size3 { x: 8, y: 1, z: 1 };
-    let (gx, gy, gz, tx, ty, tz, threads) =
-        resolve_dispatch_dims(&mut state, &host, 1, &cmd).unwrap();
-    assert_eq!((gx, gy, gz, tx, ty, tz, threads), (2, 3, 1, 8, 1, 1, false));
+    let dims = resolve_dispatch_dims(&mut state, &host, 1, &cmd).unwrap();
+    // The grid comes from the indirect buffer and the threadgroup from the
+    // wire, which is the whole point of this arm — asserting them as one flat
+    // septuple could not say which source each half came from.
+    assert_eq!(dims.grid, Extent3 { x: 2, y: 3, z: 1 });
+    assert_eq!(dims.threadgroup, Extent3 { x: 8, y: 1, z: 1 });
+    assert!(!dims.dispatch_threads);
+}
+
+/// `DispatchThreadsIndirect` reads both extents from the buffer, at the two
+/// halves of `MTLDispatchThreadsIndirectArguments`.
+///
+/// Six distinct values, because this arm used to be six
+/// `u32_dim(ld32(&raw[N..]))` calls differing only by the literals
+/// `0, 4, 8, 12, 16, 20`. A transposition among those dispatches a valid grid
+/// of the wrong shape, which nothing downstream can tell from the right one —
+/// so every component here differs from every other, and `threads_per_threadgroup`
+/// on the wire is set to a value appearing nowhere in the buffer, because this
+/// arm must not read it.
+#[test]
+fn dispatch_threads_indirect_reads_both_extents_from_the_buffer() {
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+    assert!(state.set_object_list(1, 0, 32));
+
+    // threadsPerGrid[3] then threadsPerThreadgroup[3], LE u32 each.
+    let args = [11u32, 22, 33, 44, 55, 66];
+    let arg_bytes: Vec<u8> = args.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let buf_gva = 5u64 << RESOURCE_PAGE_SHIFT;
+    write_task_gva_arm64e(&mut host, &state.tasks[1], buf_gva, &arg_bytes);
+    let mut bdesc = vec![0u8; 16];
+    st64(&mut bdesc[0..], 24);
+    st32(&mut bdesc[8..], 5);
+    let bdesc_gva = 0x180u64;
+    write_task_gva_arm64e(&mut host, &state.tasks[1], bdesc_gva, &bdesc);
+    {
+        let off = list_object_entry_offset(7, 32).unwrap();
+        let mut le = [0u8; OBJECT_LIST_ENTRY_LEN];
+        let packed = (OBJECT_TYPE_BUFFER as u32) | (16u32 << 8);
+        st32(&mut le[0..], packed);
+        le[4..12].copy_from_slice(&bdesc_gva.to_le_bytes());
+        write_task_gva_arm64e(&mut host, &state.tasks[1], off, &le);
+    }
+
+    let mut cmd = ComputeCommand::default();
+    cmd.kind = Kind::DispatchThreadsIndirect;
+    cmd.indirect_buffer_ref = 7;
+    cmd.indirect_buffer_offset = 0;
+    cmd.threads_per_threadgroup = compute::Size3 {
+        x: 99,
+        y: 99,
+        z: 99,
+    };
+
+    let dims = resolve_dispatch_dims(&mut state, &host, 1, &cmd).unwrap();
+    assert_eq!(
+        dims.grid,
+        Extent3 {
+            x: 11,
+            y: 22,
+            z: 33
+        }
+    );
+    assert_eq!(
+        dims.threadgroup,
+        Extent3 {
+            x: 44,
+            y: 55,
+            z: 66
+        }
+    );
+    assert!(dims.dispatch_threads);
 }
 
 /// The wire shape that used to be "recovered" is now a named refusal.

@@ -2828,7 +2828,52 @@ pub(crate) fn flush_nested_jobs<M: HostMemory + HostOps>(
     ComputeStatus::Ok
 }
 
-type DispatchDims = (u32, u32, u32, u32, u32, u32, bool);
+/// A dispatch extent, narrowed from the wire's `u64` by [`u32_dim`].
+///
+/// Its own type rather than three `u32`s because the two extents below are
+/// built beside each other from sources that look alike — three consecutive
+/// little-endian words for the indirect arms — and a transposition between
+/// them dispatches a valid grid of the wrong shape, which nothing downstream
+/// can tell from the right one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Extent3 {
+    x: u32,
+    y: u32,
+    z: u32,
+}
+
+impl Extent3 {
+    /// From a decoded wire `Size3`, refusing each component out of range.
+    fn from_wire(s: crate::runtime::decode::compute::Size3) -> Result<Self, ComputeStatus> {
+        Ok(Self {
+            x: u32_dim(s.x)?,
+            y: u32_dim(s.y)?,
+            z: u32_dim(s.z)?,
+        })
+    }
+
+    /// From three consecutive LE `u32`s of an indirect-arguments buffer at
+    /// `at`. One stride expression rather than six offset literals: the
+    /// literals were `0, 4, 8` and `12, 16, 20` written out, where a
+    /// transposition is invisible.
+    fn from_indirect(raw: &[u8], at: usize) -> Result<Self, ComputeStatus> {
+        Ok(Self {
+            x: u32_dim(u64::from(ld32(&raw[at..])))?,
+            y: u32_dim(u64::from(ld32(&raw[at + 4..])))?,
+            z: u32_dim(u64::from(ld32(&raw[at + 8..])))?,
+        })
+    }
+}
+
+/// Grid and threadgroup extents for one dispatch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DispatchDims {
+    grid: Extent3,
+    threadgroup: Extent3,
+    /// The guest asked for `dispatchThreads` — an exact thread count — rather
+    /// than whole threadgroups.
+    dispatch_threads: bool,
+}
 
 /// [`resolve_dispatch_dims`], with the refusal named on the always-on log.
 ///
@@ -2869,24 +2914,16 @@ fn resolve_dispatch_dims<M: HostMemory + HostOps>(
         // Every dimension comes from the wire. `u32_dim` refuses `0` and
         // anything past `u32::MAX` with `BadGrid("compute_grid_dim_range")`, so
         // a malformed grid is a named refusal rather than a substitution.
-        Kind::DispatchThreadgroups => Ok((
-            u32_dim(cmd.grid.x)?,
-            u32_dim(cmd.grid.y)?,
-            u32_dim(cmd.grid.z)?,
-            u32_dim(cmd.threads_per_threadgroup.x)?,
-            u32_dim(cmd.threads_per_threadgroup.y)?,
-            u32_dim(cmd.threads_per_threadgroup.z)?,
-            false,
-        )),
-        Kind::DispatchThreads => Ok((
-            u32_dim(cmd.grid.x)?,
-            u32_dim(cmd.grid.y)?,
-            u32_dim(cmd.grid.z)?,
-            u32_dim(cmd.threads_per_threadgroup.x)?,
-            u32_dim(cmd.threads_per_threadgroup.y)?,
-            u32_dim(cmd.threads_per_threadgroup.z)?,
-            true,
-        )),
+        Kind::DispatchThreadgroups => Ok(DispatchDims {
+            grid: Extent3::from_wire(cmd.grid)?,
+            threadgroup: Extent3::from_wire(cmd.threads_per_threadgroup)?,
+            dispatch_threads: false,
+        }),
+        Kind::DispatchThreads => Ok(DispatchDims {
+            grid: Extent3::from_wire(cmd.grid)?,
+            threadgroup: Extent3::from_wire(cmd.threads_per_threadgroup)?,
+            dispatch_threads: true,
+        }),
         Kind::DispatchThreadgroupsIndirect => {
             let raw = read_buffer_window(
                 state,
@@ -2896,18 +2933,11 @@ fn resolve_dispatch_dims<M: HostMemory + HostOps>(
                 cmd.indirect_buffer_offset,
                 INDIRECT_THREADGROUPS_ARGS_LEN,
             )?;
-            let gx = ld32(&raw[0..]);
-            let gy = ld32(&raw[4..]);
-            let gz = ld32(&raw[8..]);
-            Ok((
-                u32_dim(gx as u64)?,
-                u32_dim(gy as u64)?,
-                u32_dim(gz as u64)?,
-                u32_dim(cmd.threads_per_threadgroup.x)?,
-                u32_dim(cmd.threads_per_threadgroup.y)?,
-                u32_dim(cmd.threads_per_threadgroup.z)?,
-                false,
-            ))
+            Ok(DispatchDims {
+                grid: Extent3::from_indirect(&raw, 0)?,
+                threadgroup: Extent3::from_wire(cmd.threads_per_threadgroup)?,
+                dispatch_threads: false,
+            })
         }
         Kind::DispatchThreadsIndirect => {
             let raw = read_buffer_window(
@@ -2919,15 +2949,11 @@ fn resolve_dispatch_dims<M: HostMemory + HostOps>(
                 INDIRECT_THREADS_ARGS_LEN,
             )?;
             // MTLDispatchThreadsIndirectArguments: threadsPerGrid[3], threadsPerThreadgroup[3].
-            Ok((
-                u32_dim(ld32(&raw[0..]) as u64)?,
-                u32_dim(ld32(&raw[4..]) as u64)?,
-                u32_dim(ld32(&raw[8..]) as u64)?,
-                u32_dim(ld32(&raw[12..]) as u64)?,
-                u32_dim(ld32(&raw[16..]) as u64)?,
-                u32_dim(ld32(&raw[20..]) as u64)?,
-                true,
-            ))
+            Ok(DispatchDims {
+                grid: Extent3::from_indirect(&raw, 0)?,
+                threadgroup: Extent3::from_indirect(&raw, 12)?,
+                dispatch_threads: true,
+            })
         }
         _ => Err(ComputeStatus::Unsupported("resolve_dims_unknown_kind")),
     }
@@ -2973,11 +2999,16 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
         return ComputeStatus::Unsupported("linux_stage_in_imageblock");
     }
     // Dims first (cheap; proves sentinel recovery without m2v/vk).
-    let (grid_x, grid_y, grid_z, tg_x, tg_y, tg_z, dispatch_threads) =
-        match resolve_dispatch_dims_reported(state, host, task_id, cmd, acc) {
-            Ok(v) => v,
-            Err(e) => return e,
-        };
+    let DispatchDims {
+        grid,
+        threadgroup: tg,
+        dispatch_threads,
+    } = match resolve_dispatch_dims_reported(state, host, task_id, cmd, acc) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let (grid_x, grid_y, grid_z) = (grid.x, grid.y, grid.z);
+    let (tg_x, tg_y, tg_z) = (tg.x, tg.y, tg.z);
     if tg_x == 0 || tg_y == 0 || tg_z == 0 || grid_x == 0 || grid_y == 0 || grid_z == 0 {
         return ComputeStatus::BadGrid("compute_vk_zero_dims");
     }
@@ -4104,11 +4135,16 @@ fn execute_dispatch_metal<M: HostMemory + HostOps>(
         return ComputeStatus::MissingMtlb("compute_mtl_mtlb_load");
     };
 
-    let (grid_x, grid_y, grid_z, tg_x, tg_y, tg_z, dispatch_threads) =
-        match resolve_dispatch_dims_reported(state, host, task_id, cmd, acc) {
-            Ok(v) => v,
-            Err(e) => return e,
-        };
+    let DispatchDims {
+        grid,
+        threadgroup: tg,
+        dispatch_threads,
+    } = match resolve_dispatch_dims_reported(state, host, task_id, cmd, acc) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let (grid_x, grid_y, grid_z) = (grid.x, grid.y, grid.z);
+    let (tg_x, tg_y, tg_z) = (tg.x, tg.y, tg.z);
 
     let dispatch_kind = if dispatch_threads {
         REIMS_VGPU_COMPUTE_DISPATCH_KIND_THREADS

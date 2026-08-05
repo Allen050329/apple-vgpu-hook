@@ -118,11 +118,18 @@ Recorded so the next reader starts from the triage rather than the raw report.
   each half. So this is the `Point` shape after all, with an SDK-shaped call
   only at the far end.
 
-  Left for a session that can do better than clippy on it: `compute_core`'s body
-  is `backend-metal`, which is Apple-only, so a Linux host can cross-compile and
-  lint it but cannot run its tests. Note also that `dispatch_kind` and
-  `dispatch_type` sit inside the same run while belonging to neither `Size3`,
-  which is part of why the run reads as eight interchangeable `u32`s.
+  **The producer half is done.** `DispatchDims` was a type alias over
+  `(u32, u32, u32, u32, u32, u32, bool)` — it had a name but no type — and is
+  now a struct of two `Extent3`s. `Size3` itself could not be reused: it is
+  `u64` on the wire and the resolve narrows each component through `u32_dim`.
+
+  The consumer half is still open: `compute_core` and
+  `compute_encode_on_encoder` take the six as loose `u32`s. Left for a session
+  that can do better than clippy on it — their bodies are `backend-metal`,
+  which is Apple-only, so a Linux host can cross-compile and lint them but
+  cannot run their tests. Note also that `dispatch_kind` and `dispatch_type`
+  sit inside the same run while belonging to neither extent, which is part of
+  why it reads as eight interchangeable `u32`s.
 
 ## Known limits
 
