@@ -6,7 +6,7 @@ use crate::backend::metal::abi::{
 use crate::backend::metal::constants::*;
 use crate::backend::metal::hash::hash_u64;
 use crate::contract::fnv::FNV_OFFSET_BASIS;
-use crate::model::clock_cache::{CacheEntry, ClockCache};
+use crate::model::content_cache::{CacheEntry, ContentCache};
 use crate::runtime::decode::resource::MTL_COLOR_WRITE_MASK_ALL;
 use metal::{ComputePipelineState, DepthStencilState, Function, RenderPipelineState, SamplerState};
 use parking_lot::Mutex;
@@ -311,6 +311,11 @@ impl CacheEntry for FnEntry {
     fn matches(&self, key: &BlobKey) -> bool {
         self.key == *key
     }
+    /// The blob's content hash. `len` is left to `matches`, which is what
+    /// keeps two equal-hash blobs of different lengths distinct entries.
+    fn bucket(key: &BlobKey) -> u64 {
+        key.hash
+    }
 }
 
 impl CacheEntry for ComputePsoEntry {
@@ -320,6 +325,12 @@ impl CacheEntry for ComputePsoEntry {
     }
     fn matches(&self, key: &ComputePsoKey) -> bool {
         self.key == *key
+    }
+    /// The kernel blob's hash folded with the stage-input hash, so two PSOs
+    /// specialized from one blob against different stage inputs do not pile
+    /// into one bucket.
+    fn bucket(key: &ComputePsoKey) -> u64 {
+        hash_u64(key.mtlb.hash, key.stage_hash)
     }
 }
 
@@ -331,6 +342,11 @@ impl CacheEntry for RenderPsoEntry {
     fn matches(&self, key: &RenderPsoKey) -> bool {
         self.key.equal(key)
     }
+    /// The key hash the descriptor is already folded into. `equal` still
+    /// decides the hit; this only chooses which entries it is asked about.
+    fn bucket(key: &RenderPsoKey) -> u64 {
+        key.key_hash
+    }
 }
 
 impl CacheEntry for SamplerCacheEntry {
@@ -340,6 +356,9 @@ impl CacheEntry for SamplerCacheEntry {
     }
     fn matches(&self, key: &SamplerDescriptorKey) -> bool {
         self.key == *key
+    }
+    fn bucket(key: &SamplerDescriptorKey) -> u64 {
+        key.hash
     }
 }
 
@@ -351,6 +370,9 @@ impl CacheEntry for DepthStencilEntry {
     fn matches(&self, key: &DepthStencilKey) -> bool {
         self.key.hash == key.hash && depth_stencil_eq(&self.key.desc, &key.desc)
     }
+    fn bucket(key: &DepthStencilKey) -> u64 {
+        key.hash
+    }
 }
 
 impl CacheEntry for ReflectEntry {
@@ -361,26 +383,29 @@ impl CacheEntry for ReflectEntry {
     fn matches(&self, key: &BlobKey) -> bool {
         self.key == *key
     }
+    fn bucket(key: &BlobKey) -> u64 {
+        key.hash
+    }
 }
 
 struct GlobalCaches {
-    fn_cache: ClockCache<FnEntry>,
-    render_pso: ClockCache<RenderPsoEntry>,
-    compute_pso: ClockCache<ComputePsoEntry>,
-    sampler: ClockCache<SamplerCacheEntry>,
-    depth_stencil: ClockCache<DepthStencilEntry>,
-    reflect: ClockCache<ReflectEntry>,
+    fn_cache: ContentCache<FnEntry>,
+    render_pso: ContentCache<RenderPsoEntry>,
+    compute_pso: ContentCache<ComputePsoEntry>,
+    sampler: ContentCache<SamplerCacheEntry>,
+    depth_stencil: ContentCache<DepthStencilEntry>,
+    reflect: ContentCache<ReflectEntry>,
 }
 
 impl GlobalCaches {
     const fn new() -> Self {
         Self {
-            fn_cache: ClockCache::new(REIMS_VGPU_FN_CACHE_CAP),
-            render_pso: ClockCache::new(REIMS_VGPU_RENDER_PSO_CACHE_CAP),
-            compute_pso: ClockCache::new(REIMS_VGPU_COMPUTE_PSO_CACHE_CAP),
-            sampler: ClockCache::new(REIMS_VGPU_SAMPLER_CACHE_CAP),
-            depth_stencil: ClockCache::new(REIMS_VGPU_DEPTH_STENCIL_CACHE_CAP),
-            reflect: ClockCache::new(REIMS_VGPU_COMPUTE_REFLECT_CACHE_CAP),
+            fn_cache: ContentCache::new(),
+            render_pso: ContentCache::new(),
+            compute_pso: ContentCache::new(),
+            sampler: ContentCache::new(),
+            depth_stencil: ContentCache::new(),
+            reflect: ContentCache::new(),
         }
     }
 }

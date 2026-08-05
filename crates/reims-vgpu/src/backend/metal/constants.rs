@@ -11,23 +11,6 @@ pub const REIMS_VGPU_METAL_MAX_SAMPLERS: usize = 16;
 /// Metal max color attachments per render pass / PSO.
 pub const REIMS_VGPU_METAL_MAX_COLOR_RTS: usize = 8;
 
-// Each cap is the `cap` of a `ClockCache`, whose replacement arm computes its
-// slot as `clock % cap`. A zero would divide by zero there rather than merely
-// caching nothing, so the pin sits beside each declaration — the constant is
-// what a future edit touches, and this is the check that edit has to survive.
-pub const REIMS_VGPU_FN_CACHE_CAP: usize = 96;
-const _: () = assert!(REIMS_VGPU_FN_CACHE_CAP > 0);
-pub const REIMS_VGPU_RENDER_PSO_CACHE_CAP: usize = 64;
-const _: () = assert!(REIMS_VGPU_RENDER_PSO_CACHE_CAP > 0);
-pub const REIMS_VGPU_COMPUTE_PSO_CACHE_CAP: usize = 64;
-const _: () = assert!(REIMS_VGPU_COMPUTE_PSO_CACHE_CAP > 0);
-pub const REIMS_VGPU_SAMPLER_CACHE_CAP: usize = 32;
-const _: () = assert!(REIMS_VGPU_SAMPLER_CACHE_CAP > 0);
-pub const REIMS_VGPU_DEPTH_STENCIL_CACHE_CAP: usize = 16;
-const _: () = assert!(REIMS_VGPU_DEPTH_STENCIL_CACHE_CAP > 0);
-pub const REIMS_VGPU_COMPUTE_REFLECT_CACHE_CAP: usize = 64;
-const _: () = assert!(REIMS_VGPU_COMPUTE_REFLECT_CACHE_CAP > 0);
-
 /// Metal `MTLBufferLayoutStrideDynamic` == `NSUIntegerMax`.
 pub const MTL_BUFFER_LAYOUT_STRIDE_DYNAMIC: u64 = u64::MAX;
 const _: () = assert!(MTL_BUFFER_LAYOUT_STRIDE_DYNAMIC == u64::MAX);

@@ -3,7 +3,7 @@
 //! Registers, rings, tasks/objects, mapper, present/cursor, stamps — the
 //! ApplePV-shaped model. No parsing of wire bytes here; no backend execution.
 
-pub(crate) mod clock_cache;
+pub(crate) mod content_cache;
 mod lru_memo;
 mod regs;
 mod state;
