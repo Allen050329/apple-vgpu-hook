@@ -1655,11 +1655,11 @@ pub(crate) unsafe fn execute_draw_inner(
                     },
                 ));
             }
-            if slot.bgra != output_bgra {
+            if slot.scanout_order() != output_bgra {
                 return Err(DrawError::DrawExecution(
                     DrawExecutionDecline::SeedFormatMismatch {
                         identity: seed_identity.clone(),
-                        resident_bgra: slot.bgra,
+                        resident_bgra: slot.scanout_order(),
                         draw_bgra: output_bgra,
                     },
                 ));
@@ -1721,7 +1721,7 @@ pub(crate) unsafe fn execute_draw_inner(
                                 slot.image,
                                 slot.view,
                                 slot.layout,
-                                slot.bgra,
+                                slot.scanout_order(),
                                 slot.content_ready,
                                 slot.width,
                                 slot.height,

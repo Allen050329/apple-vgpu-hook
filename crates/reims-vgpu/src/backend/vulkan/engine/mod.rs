@@ -964,12 +964,12 @@ pub fn read_resident_bgra(identity: &TargetIdentity, need: usize) -> Option<Vec<
     {
         let guard = lock_engine();
         let slot = guard.pools.registry_get(identity)?;
-        if !slot.content_ready || !slot.bgra {
+        if !slot.content_ready || !slot.scanout_order() {
             return None;
         }
     }
     let mut px = match read_target_inner(identity) {
-        // The `slot.bgra` gate above already established the order, so the
+        // The `scanout_order` gate above already established the order, so the
         // reported one cannot disagree and the bytes pass through untouched.
         Ok(rb) => rb.pixels,
         Err(e) => {
@@ -1949,7 +1949,7 @@ fn resident_read_snapshot(
         width: slot.width,
         height: slot.height,
         layout: slot.layout,
-        bgra: slot.bgra,
+        bgra: slot.scanout_order(),
     })
 }
 

@@ -722,7 +722,7 @@ struct ResidentStorageImageSlot {
 /// with no CPU pixels behind it, and no single site able to see the
 /// disagreement.
 pub(crate) fn slot_presentable(slot: &ResidentTargetSlot, width: u32, height: u32) -> bool {
-    slot.content_ready && slot.bgra && slot.width == width && slot.height == height
+    slot.content_ready && slot.scanout_order() && slot.width == width && slot.height == height
 }
 
 pub(crate) struct ResidentTargetSlot {
@@ -748,13 +748,10 @@ pub(crate) struct ResidentTargetSlot {
     pub content_epoch: Option<u32>,
     /// Last known layout (tracked for correct barriers).
     pub layout: vk::ImageLayout,
-    /// Attachment format: true = B8G8R8A8_UNORM (guest scanout order), false =
-    /// R8G8B8A8_UNORM. A format change forces image recreate (not just FB).
-    pub bgra: bool,
-    /// Concrete Vulkan attachment format. For the primary single-RT path this
-    /// is derived from `bgra`; MRT secondary residents (e.g. the RG16Float
-    /// vibrancy mask) carry a format `bgra` cannot express, so reuse is keyed
-    /// on this exact format.
+    /// Concrete Vulkan attachment format the image was created with. Every
+    /// question about this resident's channel order is asked of this field,
+    /// through [`ResidentTargetSlot::scanout_order`] — a format change forces an
+    /// image recreate, not just a framebuffer rebuild.
     pub color_format: vk::Format,
     /// Deferred render-Store pin count: this target's content exists only on
     /// the GPU (guest pages stale). The registry LRU sweep skips slots with a
@@ -785,6 +782,19 @@ pub(crate) struct ResidentTargetSlot {
 }
 
 impl ResidentTargetSlot {
+    /// Whether this image's texels are already in the byte order the guest
+    /// scanout and the host window blit both read.
+    ///
+    /// Derived rather than stored. The bool used to sit beside `color_format`,
+    /// written by the primary arm as the `bgra` it was asked for and by the MRT
+    /// secondary arm as `format == SCANOUT_FORMAT`; the same identity can be
+    /// created by either arm, so two spellings of one fact could disagree about
+    /// one slot. `resident_color` maps the two `bgra` values onto two distinct
+    /// formats, so this test answers both arms identically.
+    pub(crate) fn scanout_order(&self) -> bool {
+        self.color_format == translate::pixel::SCANOUT_FORMAT
+    }
+
     /// Whether this slot's image may be re-used for a request of this geometry,
     /// generation and attachment format.
     ///
@@ -2046,9 +2056,6 @@ mod resident_reuse_tests {
             content_ready: false,
             content_epoch: None,
             layout: vk::ImageLayout::UNDEFINED,
-            // Stored exactly as `registry_ensure_color` stores it, which is what
-            // makes the secondary slot below read `bgra == false`.
-            bgra: format == translate::pixel::SCANOUT_FORMAT,
             color_format: format,
             pin_count: 0,
             last_touch_ms: 0,
@@ -2060,12 +2067,15 @@ mod resident_reuse_tests {
     /// however well its geometry lines up.
     ///
     /// Both `registry_ensure*` arms write one `registry` keyed by identity, and
-    /// an identity does cross between them. The primary arm used to test
-    /// `slot.bgra`, and a secondary slot created for an `RG16Float` vibrancy
-    /// mask stores `bgra == false` because its format is not the scanout one —
-    /// so it matched a primary request for RGBA8, whose format is *also* not the
-    /// scanout one, and the arm went on to build a framebuffer with an RGBA8
-    /// render pass over an `RG16Float` view. Vulkan requires those to agree.
+    /// an identity does cross between them. The primary arm used to test a
+    /// stored `bgra` bool, and a secondary slot created for an `RG16Float`
+    /// vibrancy mask reads `false` there because its format is not the scanout
+    /// one — so it matched a primary request for RGBA8, whose format is *also*
+    /// not the scanout one, and the arm went on to build a framebuffer with an
+    /// RGBA8 render pass over an `RG16Float` view. Vulkan requires those to
+    /// agree. The bool is gone; [`ResidentTargetSlot::scanout_order`] is now
+    /// derived from `color_format`, so it cannot answer for a slot the format
+    /// test would refuse.
     #[test]
     fn a_secondary_format_slot_is_not_reused_as_a_primary_attachment() {
         let rgba = translate::pixel::resident_color(false);
@@ -2074,9 +2084,9 @@ mod resident_reuse_tests {
 
         let secondary = slot(64, 32, 7, vk::Format::R16G16_SFLOAT);
         assert!(
-            !secondary.bgra,
-            "a non-scanout secondary format stores bgra=false, which is what \
-             made the one-bit test match"
+            !secondary.scanout_order(),
+            "a non-scanout secondary format reads scanout_order()=false, which \
+             is what made the one-bit test match"
         );
         assert!(
             !secondary.reusable_for(64, 32, 7, rgba),

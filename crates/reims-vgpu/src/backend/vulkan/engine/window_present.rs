@@ -948,7 +948,7 @@ impl WindowPresenter {
                 .map_or(CandidateState::default(), |slot| CandidateState {
                     resident: true,
                     content_ready: slot.content_ready,
-                    bgra: slot.bgra,
+                    bgra: slot.scanout_order(),
                     width: slot.width,
                     height: slot.height,
                 });

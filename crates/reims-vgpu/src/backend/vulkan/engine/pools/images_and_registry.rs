@@ -548,7 +548,6 @@ impl ResourcePools {
                 content_ready: false,
                 content_epoch: None,
                 layout: vk::ImageLayout::UNDEFINED,
-                bgra,
                 color_format: format,
                 pin_count: 0,
                 last_touch_ms: touch_ms,
@@ -694,7 +693,6 @@ impl ResourcePools {
                 content_ready: false,
                 content_epoch: None,
                 layout: vk::ImageLayout::UNDEFINED,
-                bgra: format == translate::pixel::SCANOUT_FORMAT,
                 color_format: format,
                 pin_count: 0,
                 last_touch_ms: touch_ms,
@@ -1168,7 +1166,6 @@ mod pin_count_tests {
             content_ready,
             content_epoch: None,
             layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-            bgra: true,
             color_format: translate::pixel::SCANOUT_FORMAT,
             pin_count: 0,
             last_touch_ms: 0,
@@ -1204,7 +1201,7 @@ mod pin_count_tests {
         );
 
         let mut rgba = dummy_slot(true);
-        rgba.bgra = false;
+        rgba.color_format = translate::pixel::RESIDENT_RGBA_FORMAT;
         assert!(
             !slot_presentable(&rgba, 16, 16),
             "the blit does no channel swap; RGBA would present with red and blue exchanged"
