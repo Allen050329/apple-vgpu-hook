@@ -317,6 +317,11 @@ mod arch_path_gate {
             // someone re-flattening the module and taking recognition away
             // with it.
             "mapping_write/tests.rs",
+            // Both of `mapper`'s, because the predicate keys on the file stem:
+            // a module not named `tests` is recognised on exactly the same
+            // terms, and nothing else in the list proves that.
+            "mapper/tests.rs",
+            "mapper/revalidate_tests.rs",
         ] {
             assert!(
                 is_out_of_line_test_module(&root.join(relative)),
