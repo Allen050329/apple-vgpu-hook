@@ -196,6 +196,17 @@ fn refuse(mapping_id: u32, why: SurfaceWriteRefusal) -> bool {
 /// The second case declines, and callers answer it with a named refusal. That is
 /// the difference between a bind that is lost visibly and one that samples luma
 /// for alpha with nothing in the device able to say so.
+///
+/// Neither case is reached on a healthy x86 desktop. Measured on driven Ventura
+/// boots with a Safari window drag, both with the dma-buf import available and
+/// with `REIMS_VGPU_DMABUF=off` — which is the run that matters here, because a
+/// capable host takes the import for every guest window and leaves the copying
+/// rails at zero. With the gate closed (`dma_buf_import=disabled_by_env`,
+/// `guest_dmabuf_*` absent) the copying rails carried the whole workload —
+/// `rt_type5_view_same` 7396, `t11rung_resident` 19177, `surface_flush` 7396
+/// against 55080 draws — and **no window failed to resolve**. Every bind came
+/// from a published descriptor, so the estimate above is the state before the
+/// guest fills one rather than a rung this device leans on.
 fn sample_window(
     m: &MappingEntry,
     plane_index: Option<u32>,
