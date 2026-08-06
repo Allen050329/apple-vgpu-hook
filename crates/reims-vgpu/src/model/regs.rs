@@ -626,6 +626,13 @@ pub const DEVICE_INFO_KEY_LINEAR_TEXTURE_ALIGN: u32 = 13;
 /// `f` is a feature bool selected by the negotiated protocol version. So neither
 /// key alone turns heaps on and neither alone turns them off; what key 14
 /// separately means, if anything, is **not established**.
+///
+/// `f` is the term that decides today. [`PROTOCOL_VERSION_MAX`] records that a
+/// stock guest lands on rung 4, where the guest's own switch leaves `metalHeaps`
+/// off — so this key, [`DEVICE_INFO_KEY_HEAP_TEXTURES`] and
+/// [`DEVICE_INFO_KEY_HEAP_BUFFER_GRANULARITY`] are all inert at the rung this
+/// device negotiates, on both pathways. They are what the guest would read if a
+/// later rung turned heaps on, not what it reads now.
 pub const DEVICE_INFO_KEY_HEAPS: u32 = 14;
 
 /// Wire key 15 — the granularity `heapBufferSizeAndAlignWithLength:options:`
@@ -644,7 +651,9 @@ pub const DEVICE_INFO_KEY_HEAP_BUFFER_GRANULARITY: u32 = 15;
 pub const DEVICE_INFO_KEY_HEAP_TEXTURES: u32 = 16;
 
 /// Wire key 17 — `supportsBufferWithIOSurface`, gated on a protocol-version
-/// feature bool as well.
+/// feature bool as well, and that bool is off at the rung this device
+/// negotiates for the same reason the heap keys' is — see
+/// [`DEVICE_INFO_KEY_HEAPS`] and [`PROTOCOL_VERSION_MAX`].
 pub const DEVICE_INFO_KEY_BUFFER_WITH_IOSURFACE: u32 = 17;
 
 /// Wire key 10 — the **serializer feature version**, and the widest-reaching
