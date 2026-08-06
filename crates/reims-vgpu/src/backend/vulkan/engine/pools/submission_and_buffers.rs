@@ -95,6 +95,7 @@ impl ResourcePools {
             registry_non_pinned: NonPinnedTotals::default(),
             registry_non_pinned_peak_bytes: 0,
             registry_cap_evictions: 0,
+            compute_storage_cap_evictions: 0,
             idle_clock_ms: 0,
             last_drain_ms: 0,
             settled_drain_passes: 0,
@@ -772,6 +773,16 @@ impl ResourcePools {
             self.registry_cap_evictions,
             self.registry_non_pinned_peak_bytes,
         )
+    }
+
+    /// Residents the compute-storage capacity sweep destroyed, cumulative for
+    /// the life of the pools.
+    ///
+    /// Reported separately from [`Self::registry_pressure_stats`] because the
+    /// two registries are bounded by different constants over different
+    /// populations, and a boot needs to know which one bit.
+    pub(crate) fn compute_storage_cap_evictions(&self) -> u64 {
+        self.compute_storage_cap_evictions
     }
 
     /// Cumulative compute-storage recycle diagnostics: `(admits, cap_drops)`.
@@ -2664,6 +2675,110 @@ mod recycle_tests {
         admit(&mut pools, 6, 0, false);
         admit(&mut pools, 7, 0, false);
         assert_eq!(pools.take_aged_storage_residents(cutoff, 2).len(), 2);
+    }
+
+    fn admit_compute_resident(
+        pools: &mut ResourcePools,
+        tex: u32,
+        touch: u64,
+        pinned: bool,
+    ) -> ComputeStorageResidencyKey {
+        let id = ComputeStorageResidencyKey::linear(0, tex, 0, 0, 0, 8, 8, 0);
+        pools.compute_storage_registry.insert(
+            id,
+            ResidentStorageImageSlot {
+                slot: null_storage_slot(8, 8),
+                generation: 0,
+                layout: vk::ImageLayout::UNDEFINED,
+                pinned,
+                last_touch_ms: touch,
+            },
+        );
+        pools.compute_storage_order.push_back(id);
+        id
+    }
+
+    /// The compute-storage capacity sweep evicts the least-recently-*used*
+    /// resident, not the oldest-*created* one.
+    ///
+    /// `compute_storage_order` is insertion order — nothing promotes an entry
+    /// when a dispatch reuses it — so taking its front evicted whichever
+    /// resident was registered first, which for a long-lived compute output is
+    /// permanently the front however hard the current chain is reading it. This
+    /// is the same defect the sibling target registry carries
+    /// `the_cap_walk_evicts_the_least_recently_used_not_the_oldest_created`
+    /// against, and the field doc called this order LRU while it was not.
+    ///
+    /// Fails without the fix: the victim is the front of insertion order, which
+    /// is `tex 1` — the one being read.
+    #[test]
+    fn the_compute_storage_cap_evicts_the_least_recently_used_not_the_oldest_created() {
+        let mut pools = ResourcePools::new();
+        // tex 1 is created first and is therefore the front of insertion order
+        // — the old victim — but it is the one being read.
+        let first = admit_compute_resident(&mut pools, 1, 0, false);
+        let second = admit_compute_resident(&mut pools, 2, 0, false);
+        admit_compute_resident(&mut pools, 3, 0, false);
+        pools.idle_clock_ms = 5_000;
+        // A read through the product accessor, which is how a copy-on-sample
+        // consumer touches a resident it never dispatches into again.
+        assert!(pools.compute_resident_snapshot(&first).is_some());
+        assert_eq!(
+            pools.compute_storage_eviction_victim(),
+            Some(second),
+            "the resident being read is not the victim; the next-oldest untouched one is"
+        );
+    }
+
+    /// A resident that is only ever *read* survives the age drain.
+    ///
+    /// The produce-once/sample-many case: a compute chain writes an image and
+    /// later chains sample it without dispatching into it again. All three
+    /// read-only accessors took `&self` and refreshed nothing, so such a
+    /// resident looked stone-cold to both reclaim rules — the cap sweep takes
+    /// the minimum `last_touch_ms` and the drain compares it against a cutoff —
+    /// and its loss is a refused dispatch, not a re-upload.
+    ///
+    /// Fails without the fix: `tex 1` is reclaimed alongside its untouched peer.
+    #[test]
+    fn a_read_only_compute_storage_resident_is_not_aged_out() {
+        let mut pools = ResourcePools::new();
+        let read = admit_compute_resident(&mut pools, 1, 1_000, false);
+        let untouched = admit_compute_resident(&mut pools, 2, 1_000, false);
+        // The drain's clock has to be current before a read can be recorded
+        // against it; the real caller advances it from the poll heartbeat.
+        pools.idle_clock_ms = 10_000;
+        assert!(pools.compute_resident_sample_source(&read).is_some());
+
+        let cutoff = 10_000u64.saturating_sub(IDLE_TARGET_AGE_MS);
+        pools.take_aged_storage_residents(cutoff, IDLE_RECYCLE_TRIM_PER_PASS);
+
+        assert!(
+            pools.compute_storage_registry.contains_key(&read),
+            "a resident a chain is reading is in use and must not be destroyed"
+        );
+        assert!(
+            !pools.compute_storage_registry.contains_key(&untouched),
+            "its untouched peer is still reclaimed — the fix must not disable the drain"
+        );
+    }
+
+    /// With every remaining resident pinned there is no victim, so the caller's
+    /// sweep loop terminates and the registry soft-exceeds its cap rather than
+    /// destroying content whose only copy is on the GPU. Same trade the sibling
+    /// target registry's walk makes.
+    #[test]
+    fn an_all_pinned_compute_storage_registry_offers_no_victim() {
+        let mut pools = ResourcePools::new();
+        admit_compute_resident(&mut pools, 1, 0, true);
+        admit_compute_resident(&mut pools, 2, 0, true);
+        assert_eq!(pools.compute_storage_eviction_victim(), None);
+        let evictable = admit_compute_resident(&mut pools, 3, 0, false);
+        assert_eq!(
+            pools.compute_storage_eviction_victim(),
+            Some(evictable),
+            "the one unpinned resident is the only candidate"
+        );
     }
 
     /// The recycle diagnostics (`recycle_stats`) count admits vs cap-drops so a

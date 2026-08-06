@@ -210,9 +210,20 @@ pub(crate) struct ResourcePools {
     storage_image_live: Vec<StorageImageSlot>,
     /// Protocol-identity keyed compute storage images retained across calls.
     compute_storage_registry: HashMap<ComputeStorageResidencyKey, ResidentStorageImageSlot>,
-    /// LRU order for [`Self::compute_storage_registry`], oldest at the front.
-    /// A `VecDeque` for the same reason as [`Self::registry_order`]: the cap
-    /// sweep's front pop / rotate-to-back is O(1), keeping the sweep O(n).
+    /// Insertion order for [`Self::compute_storage_registry`], oldest *created*
+    /// at the front. A `VecDeque` for the same reason as [`Self::registry_order`].
+    ///
+    /// **Not use order**, and it was documented as LRU while it was not. Nothing
+    /// promotes an entry when a dispatch reuses it, so selecting the front
+    /// evicted the oldest-*created* resident however hard the current chain was
+    /// reading it — the identical defect the sibling target registry carries a
+    /// test against
+    /// (`the_cap_walk_evicts_the_least_recently_used_not_the_oldest_created`).
+    /// Recency lives on the slot
+    /// ([`ResidentStorageImageSlot::last_touch_ms`]) and the cap sweep consults
+    /// it through `ResourcePools::compute_storage_eviction_victim`, which takes
+    /// the minimum stamp over this list rather than reordering it, so this order
+    /// now only makes ties deterministic.
     compute_storage_order: VecDeque<ComputeStorageResidencyKey>,
     /// Identity-keyed resident target registry (workstream D).
     registry: HashMap<TargetIdentity, ResidentTargetSlot>,
@@ -252,6 +263,15 @@ pub(crate) struct ResourcePools {
     /// atomic to pay for. `engine::counter_snapshot` merges them in.
     registry_non_pinned_peak: u64,
     registry_cap_evictions: u64,
+    /// Residents `COMPUTE_STORAGE_REGISTRY_CAP` destroyed.
+    ///
+    /// The sibling count for the compute-storage registry, and it existed
+    /// nowhere until this line: that cap swept, disposed and moved on without
+    /// incrementing anything, so no boot could answer whether 64 had ever bound.
+    /// Its loss is not a re-upload — a dispatch that later reads the identity
+    /// refuses with `ResidentSampleAbsent` or `ResidentSeedGenerationLost` — so
+    /// this counts lost guest work, exactly as `registry_cap_evictions` does.
+    compute_storage_cap_evictions: u64,
     /// The live non-pinned population and what it occupies, maintained rather
     /// than walked. Both readings come off this, and
     /// `ResourcePools::registry_non_pinned_adjust` is the only writer — see

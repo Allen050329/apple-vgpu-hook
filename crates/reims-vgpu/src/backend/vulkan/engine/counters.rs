@@ -374,6 +374,22 @@ engine_counters! {
         /// draw rendering into the same identity, so a non-zero reading here is
         /// guest content destroyed rather than a cache asked to refill.
         target_registry_cap_evictions,
+        /// Compute-storage residents destroyed by `COMPUTE_STORAGE_REGISTRY_CAP`,
+        /// cumulative.
+        ///
+        /// The same quantity as `target_registry_cap_evictions` over the other
+        /// registry, and it counts the same thing: lost guest work. Nothing
+        /// recreates a compute-storage resident's content either, so a dispatch
+        /// that later reads a destroyed identity refuses with
+        /// `ResidentSampleAbsent` or `ResidentSeedGenerationLost`.
+        ///
+        /// It exists because that sweep incremented nothing at all, which left
+        /// its 64 unfalsifiable — the cap could have been biting on every
+        /// compute-heavy boot and no counter, route or log line would have
+        /// moved. Kept separate from the target count rather than summed with
+        /// it: the two registries are bounded by different constants over
+        /// different populations, and a boot needs to know which one bit.
+        compute_storage_cap_evictions,
         /// The same high-water in attachment bytes, sampled from the same
         /// population at the same instant as `registry_non_pinned_peak`.
         ///

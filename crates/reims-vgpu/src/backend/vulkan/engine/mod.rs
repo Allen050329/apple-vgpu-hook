@@ -866,7 +866,7 @@ fn engine_probe_decline(probe: EngineProbe, error: &DrawError) -> crate::observe
 pub fn compute_resident_storage_generation(
     identity: &crate::model::ComputeStorageResidencyKey,
 ) -> Option<u32> {
-    let guard = lock_engine();
+    let mut guard = lock_engine();
     guard.pools.compute_resident_generation(identity)
 }
 
@@ -882,7 +882,7 @@ pub fn compute_resident_storage_generation(
 pub fn compute_resident_sample_source(
     identity: &crate::model::ComputeStorageResidencyKey,
 ) -> Option<(u32, StorageImageFormat)> {
-    let guard = lock_engine();
+    let mut guard = lock_engine();
     guard.pools.compute_resident_sample_source(identity)
 }
 
@@ -2124,6 +2124,7 @@ pub fn counter_snapshot() -> CounterSnapshot {
     snap.registry_non_pinned_peak = reg_peak;
     snap.target_registry_cap_evictions = reg_evictions;
     snap.registry_non_pinned_peak_bytes = reg_peak_bytes;
+    snap.compute_storage_cap_evictions = eng.pools.compute_storage_cap_evictions();
     snap
 }
 

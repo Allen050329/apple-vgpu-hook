@@ -182,27 +182,17 @@ impl ResourcePools {
             });
         }
 
-        // LRU sweep skips pinned residents (deferred-writeback content whose
-        // only copy is on the GPU). Bounded by one full rotation; if every
-        // entry is pinned the registry soft-exceeds the cap rather than lose
-        // unflushed content.
-        let mut rotations = self.compute_storage_order.len();
-        while self.compute_storage_registry.len() >= COMPUTE_STORAGE_REGISTRY_CAP && rotations > 0 {
-            rotations -= 1;
-            let Some(oldest) = self.compute_storage_order.front().copied() else {
+        // Least-recently-used, skipping pinned residents (deferred-writeback
+        // content whose only copy is on the GPU). When everything left is
+        // pinned there is no victim and the registry soft-exceeds the cap
+        // rather than lose unflushed content — the same trade the sibling
+        // target registry's walk makes.
+        while self.compute_storage_registry.len() >= COMPUTE_STORAGE_REGISTRY_CAP {
+            let Some(victim) = self.compute_storage_eviction_victim() else {
                 break;
             };
-            if self
-                .compute_storage_registry
-                .get(&oldest)
-                .is_some_and(|resident| resident.pinned)
-            {
-                self.compute_storage_order.pop_front();
-                self.compute_storage_order.push_back(oldest);
-                continue;
-            }
-            self.compute_storage_order.pop_front();
-            if let Some(old) = self.compute_storage_registry.remove(&oldest) {
+            self.compute_storage_order.retain(|entry| entry != &victim);
+            if let Some(old) = self.compute_storage_registry.remove(&victim) {
                 self.dispose(
                     &ctx.device,
                     DeferredHandle::Image {
@@ -212,6 +202,7 @@ impl ResourcePools {
                     },
                 );
             }
+            self.compute_storage_cap_evictions += 1;
         }
 
         // Reuse the common allocator, then detach its bookkeeping copy from
@@ -242,6 +233,58 @@ impl ResourcePools {
             layout: vk::ImageLayout::UNDEFINED,
             generation_match: false,
         })
+    }
+
+    /// Least-recently-used evictable compute-storage resident, or `None` when
+    /// every remaining entry is pinned.
+    ///
+    /// Selected by minimum `last_touch_ms` rather than by the front of
+    /// [`ResourcePools::compute_storage_order`], for the reason the sibling
+    /// target registry's `cap_eviction_victim` states: insertion order makes a
+    /// long-lived resident the permanent front and so the first victim of every
+    /// burst, however hard the current chain is reading it. Iterating the order
+    /// rather than the map keeps the choice deterministic — `min_by_key` returns
+    /// the first minimum, so ties fall to the oldest-created entry, which is
+    /// what this walk did for every entry before.
+    ///
+    /// O(n) per eviction rather than O(1) amortised. That is the same trade the
+    /// target registry made and for the same reason: evictions are rare next to
+    /// the reads this avoids promoting on.
+    pub(crate) fn compute_storage_eviction_victim(&self) -> Option<ComputeStorageResidencyKey> {
+        self.compute_storage_order
+            .iter()
+            .filter_map(|identity| {
+                self.compute_storage_registry
+                    .get(identity)
+                    .filter(|resident| !resident.pinned)
+                    .map(|resident| (identity, resident.last_touch_ms))
+            })
+            .min_by_key(|(_, touch)| *touch)
+            .map(|(identity, _)| *identity)
+    }
+
+    /// Record that something read this resident, refreshing its reclaim stamp.
+    ///
+    /// Reading a resident is using it. The three read-only accessors below all
+    /// mean "a guest chain is about to consume this image" — the stage-time
+    /// guest-read skip, the copy-on-sample gate, and the flush/sample snapshot —
+    /// so a produce-once/sample-many resident that is never dispatched into
+    /// again is in continuous use while looking stone-cold to both reclaim
+    /// rules, which read `last_touch_ms`: the cap sweep takes the minimum and
+    /// the age drain compares it against its cutoff.
+    ///
+    /// The sibling target registry had exactly this defect and names it at its
+    /// own call site: "aging it out between two attempts is how a recoverable
+    /// not-ready became a permanent missing." Here the loss is a refused
+    /// dispatch — `ResidentSampleAbsent` or `ResidentSeedGenerationLost` — so
+    /// the stamp is written by the accessors themselves rather than by their
+    /// callers, because a caller that forgets is indistinguishable from this
+    /// bug.
+    fn note_compute_resident_use(&mut self, identity: &ComputeStorageResidencyKey) {
+        let touch = self.idle_clock_ms;
+        if let Some(resident) = self.compute_storage_registry.get_mut(identity) {
+            resident.last_touch_ms = touch;
+        }
     }
 
     pub(crate) fn mark_resident_storage_image(
@@ -281,11 +324,17 @@ impl ResourcePools {
     }
 
     /// Generation of a resident compute storage image, if one is registered.
-    /// Read-only — used by the runtime to decide a stage-time guest-read skip.
+    /// Used by the runtime to decide a stage-time guest-read skip.
+    ///
+    /// Takes `&mut self` to record the read — see
+    /// [`ResourcePools::note_compute_resident_use`]. A skip taken against this
+    /// answer means the dispatch is about to consume the resident, which is the
+    /// definition of using it.
     pub(crate) fn compute_resident_generation(
-        &self,
+        &mut self,
         identity: &ComputeStorageResidencyKey,
     ) -> Option<u32> {
+        self.note_compute_resident_use(identity);
         self.compute_storage_registry
             .get(identity)
             .map(|resident| resident.generation)
@@ -296,20 +345,22 @@ impl ResourcePools {
     /// copy-on-sample skip (the format must match what the sampled view will
     /// bind, or the engine's resident-bind shape guard would fail every run).
     pub(crate) fn compute_resident_sample_source(
-        &self,
+        &mut self,
         identity: &ComputeStorageResidencyKey,
     ) -> Option<(u32, StorageImageFormat)> {
+        self.note_compute_resident_use(identity);
         self.compute_storage_registry
             .get(identity)
             .map(|resident| (resident.generation, resident.slot.key.format))
     }
 
     /// Snapshot of a resident storage image for a copy-on-sample source:
-    /// `(image, key, generation, current layout)`. Read-only.
+    /// `(image, key, generation, current layout)`.
     pub(crate) fn compute_resident_snapshot(
-        &self,
+        &mut self,
         identity: &ComputeStorageResidencyKey,
     ) -> Option<(vk::Image, StorageImageKey, u32, vk::ImageLayout)> {
+        self.note_compute_resident_use(identity);
         self.compute_storage_registry.get(identity).map(|resident| {
             (
                 resident.slot.image,
