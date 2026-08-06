@@ -78,15 +78,28 @@ entry below does. Fixed in the commit that added this section.
 
 ## Already adjudicated — do not re-report these
 
-Eight candidates on the current tree, all read and all legitimate:
+**Two** candidates on the current tree, both read and both legitimate. The
+`PASS_LOAD_ACTION_*` ladders below no longer reach the script — the seven arms
+this list used to carry were rewritten into shapes it does not match — so the
+count moved from eight to two without anything being adjudicated away. Line
+numbers drift; match on the arm text.
 
-- `runtime/draw/mod.rs` ×4 and `draw/vulkan.rs` ×3 — the
-  `PASS_LOAD_ACTION_*` ladders. The catch-all is `DONT_CARE`, whose whole
-  meaning is "do nothing to this attachment", and the value is bounded upstream
-  by `load_action <= PASS_LOAD_ACTION_CLEAR` so it cannot be an unknown action.
-- `runtime/spirv_bind.rs:531` — the taint scan's `_ if …any(is_derived)`. The
-  catch-all is an instruction that touches no derived value, which is the
-  scan's normal case rather than a drop.
+- `runtime/spirv_bind.rs` — the taint scan's
+  `_ if …any(is_derived) => unknown = true`. The catch-all is an instruction that
+  touches no derived value, which is the scan's normal case rather than a drop.
+  Note the arm itself is the *fail-closed* direction: anything unrecognised that
+  touches a derived image forces `StorageImageAccess::Unknown`, so the catch-all
+  is reached only by instructions that provably touch nothing tracked.
+- `runtime/draw/vulkan.rs` — `MTL_LOAD_ACTION_LOAD if chain_load_from_target`.
+  What the device does instead: nothing, deliberately, and that *is* the LOAD.
+  The guard means the resident render target already holds the previous frame's
+  contents, so the attachment loads from itself and no CPU seed has to be staged
+  — the `type11_seed_elided` counter above it is the same decision, counted. The
+  un-guarded `MTL_LOAD_ACTION_LOAD` arm directly below performs the seed for
+  every other case, so falling past this arm is served rather than dropped.
+  Unknown actions never reach the ladder at all: the lines above coerce anything
+  failing `load_action_in_contract` to `MTL_LOAD_ACTION_DONT_CARE` first, which
+  is the fix for an earlier bug of exactly this shape.
 
 Re-check them when the surrounding code changes; do not spend a second session
 rediscovering that they are fine.
