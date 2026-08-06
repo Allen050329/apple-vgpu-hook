@@ -11,7 +11,8 @@ pub use crate::runtime::decode::resource::ColorWriteMask;
 /// Named engine failure. Stable prefixes for observe greps (`vk_engine_*`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DrawError {
-    /// Init / ICD / device selection failed (negative-cached).
+    /// Init / ICD / device selection failed. Latched by `ContextOwner`, except
+    /// when it is out of memory — see `ContextOwner::note_init_failure`.
     Init(super::init_decline::InitDecline),
     /// Understood but declined — a capability this device or this engine does
     /// not have. Typed so each distinct check carries its own `reason=` slug;
@@ -68,14 +69,26 @@ impl DrawError {
     /// right response to either. `ERROR_DEVICE_LOST` deliberately is not: it has
     /// its own variant and is answered by recreating the context, and retrying
     /// an allocation against a lost device would only fail again.
+    ///
+    /// [`Self::Init`] answers here too, and it is the arm with the widest blast
+    /// radius. `vkCreateInstance` and `vkCreateDevice` both refuse with
+    /// `ERROR_OUT_OF_HOST_MEMORY`, and bring-up is latched by
+    /// `ContextOwner::init_error` — so a host that was momentarily short of RAM
+    /// at the first draw would otherwise take the whole Vulkan engine down for
+    /// the life of the process. The bring-up checks this device decides itself
+    /// (no loader, no device, no graphics queue, below the API floor) carry no
+    /// result and are correctly permanent.
     pub fn out_of_memory(&self) -> bool {
-        match self {
-            Self::VkCall(c) => {
-                c.result == ash::vk::Result::ERROR_OUT_OF_DEVICE_MEMORY
-                    || c.result == ash::vk::Result::ERROR_OUT_OF_HOST_MEMORY
-            }
-            _ => false,
-        }
+        let result = match self {
+            Self::VkCall(c) => Some(c.result),
+            Self::Init(d) => d.vk_result(),
+            _ => None,
+        };
+        matches!(
+            result,
+            Some(ash::vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)
+                | Some(ash::vk::Result::ERROR_OUT_OF_HOST_MEMORY)
+        )
     }
 }
 

@@ -257,16 +257,19 @@ const NEGATIVE_CAP: usize = 1024;
 ///
 /// Unbounded is also the faithful failure mode. When a guest really does ask for
 /// more distinct pipelines than the host can hold, the create itself returns
-/// `VK_ERROR_OUT_OF_DEVICE_MEMORY`, which lands in `negative` as a typed
-/// [`DrawError`] and is reported. That is a GPU refusing because its memory is
-/// full — the behavior we are emulating — rather than a device that silently
-/// forgets an object the guest still has bound.
+/// `VK_ERROR_OUT_OF_DEVICE_MEMORY` and that is reported as a typed [`DrawError`].
+/// That is a GPU refusing because its memory is full — the behavior we are
+/// emulating — rather than a device that silently forgets an object the guest
+/// still has bound. It is deliberately *not* remembered; see
+/// [`ObjectCache::insert_negative`] for why a refusal about this instant must not
+/// outlive the instant.
 struct ObjectCache<K, V> {
     map: HashMap<K, V>,
     negative: HashMap<K, DrawError>,
     /// FIFO order for `negative`, bounded by [`NEGATIVE_CAP`]. Negative entries
-    /// are only added on genuine create failures — a Vulkan create call refusing
-    /// (a typed [`VkCall`]) or a device-capability refusal
+    /// are only added on create failures that a second identical attempt would
+    /// meet again — a Vulkan create call refusing for a reason inherent to the
+    /// request (a typed [`VkCall`]) or a device-capability refusal
     /// (`DrawError::Unsupported`, e.g. an unsupported vertex divisor) — empty on
     /// a healthy boot, but a guest that keeps submitting distinct
     /// never-creatable objects would grow `negative` without limit if it were
@@ -307,7 +310,34 @@ impl<K: Clone + Eq + std::hash::Hash, V> ObjectCache<K, V> {
         self.map.insert(k, v)
     }
 
+    /// Remember a create failure so the next identical ask replays it without
+    /// paying the driver call again.
+    ///
+    /// **A refusal about this instant is not remembered at all.** Out of memory
+    /// describes how much the device is holding right now, not anything about
+    /// the request — the guest can free a texture atlas and ask for the very
+    /// same pipeline a frame later, and by then the create succeeds. Memoizing
+    /// one turns a GPU that refuses while full into a GPU that refuses forever,
+    /// which is the failure a real one does not have: nothing here can clear a
+    /// negative entry short of device teardown, because the lookup consults
+    /// `negative` before the create and so the create that would displace it
+    /// never runs.
+    ///
+    /// The predicate is [`DrawError::out_of_memory`], the crate's single
+    /// statement of which refusals a second attempt could answer differently;
+    /// the resident image and command-buffer allocators already reclaim and
+    /// retry on it. Deciding it here rather than at the call sites is
+    /// deliberate — thirteen of them insert negatives, and a rule spread over
+    /// thirteen sites is a rule that will be half-applied.
+    ///
+    /// Declining to memoize costs a repeated failing create while the device
+    /// stays full. That is the same bargain the resident allocators take, and
+    /// it is bounded by the guest's own retry rate rather than by anything
+    /// here.
     fn insert_negative(&mut self, k: K, err: DrawError) {
+        if err.out_of_memory() {
+            return;
+        }
         if self.negative.insert(k.clone(), err).is_some() {
             // Already tracked (error refreshed); order stays as-is.
             return;
@@ -1334,18 +1364,104 @@ mod object_cache_tests {
 
     #[test]
     fn reinserting_same_negative_does_not_duplicate_order() {
+        // Both results here are inherent to the request, so both are remembered.
+        // They used to be the two out-of-memory results, which no longer reach
+        // the map at all — see `an_out_of_memory_refusal_is_never_remembered`.
         let mut c: ObjectCache<u32, u32> = ObjectCache::with_negative_cap(4);
         let a = DrawError::VkCall(VkCall::new(
             VkOp::CachesCreateShaderModule,
-            vk::Result::ERROR_OUT_OF_HOST_MEMORY,
+            vk::Result::ERROR_UNKNOWN,
         ));
         let b = DrawError::VkCall(VkCall::new(
             VkOp::CachesCreateShaderModule,
-            vk::Result::ERROR_OUT_OF_DEVICE_MEMORY,
+            vk::Result::ERROR_INITIALIZATION_FAILED,
         ));
         c.insert_negative(1, a);
         c.insert_negative(1, b.clone());
         assert_eq!(c.negative_order.len(), 1, "same key tracked once");
         assert_eq!(c.get_negative(&1), Some(b), "error refreshed");
+    }
+
+    /// Out of memory says what the device holds *now*. The lookup consults
+    /// `negative` before the create, so a remembered one is never displaced by a
+    /// later success — the create that would displace it never runs. Remembering
+    /// it turns "refused while full" into "refused forever", which is the failure
+    /// mode a real GPU does not have.
+    #[test]
+    fn an_out_of_memory_refusal_is_never_remembered() {
+        for result in [
+            vk::Result::ERROR_OUT_OF_DEVICE_MEMORY,
+            vk::Result::ERROR_OUT_OF_HOST_MEMORY,
+        ] {
+            let mut c: ObjectCache<u32, u32> = ObjectCache::with_negative_cap(4);
+            let err = DrawError::VkCall(VkCall::new(VkOp::CachesCreateGraphicsPipelines, result));
+            assert!(err.out_of_memory(), "{result:?} is the retryable class");
+            c.insert_negative(1, err);
+            assert_eq!(
+                c.get_negative(&1),
+                None,
+                "{result:?} must not short-circuit the next create"
+            );
+            assert!(c.negative.is_empty(), "{result:?} left no entry");
+            assert!(c.negative_order.is_empty(), "{result:?} left no order slot");
+        }
+    }
+
+    /// The converse, so the test above cannot pass by disabling the map. A
+    /// refusal inherent to the request — malformed SPIR-V, or a capability this
+    /// host does not have — is worth remembering, because a second identical
+    /// attempt meets it again.
+    #[test]
+    fn a_refusal_inherent_to_the_request_is_still_remembered() {
+        let mut c: ObjectCache<u32, u32> = ObjectCache::with_negative_cap(4);
+
+        let bad_shader = DrawError::VkCall(VkCall::new(
+            VkOp::CachesCreateShaderModule,
+            vk::Result::ERROR_INVALID_SHADER_NV,
+        ));
+        assert!(!bad_shader.out_of_memory());
+        c.insert_negative(1, bad_shader.clone());
+        assert_eq!(c.get_negative(&1), Some(bad_shader));
+
+        let unsupported = DrawError::Unsupported(
+            super::super::reason::DrawReason::InstanceRateDivisorUnsupported { step_rate: 3 },
+        );
+        assert!(!unsupported.out_of_memory());
+        c.insert_negative(2, unsupported.clone());
+        assert_eq!(c.get_negative(&2), Some(unsupported));
+    }
+
+    /// A pipeline the guest still wants is asked for again after the memory it
+    /// needed came back. This is the whole point of the rule, written as the
+    /// sequence a guest actually produces: create fails while an atlas is
+    /// resident, the guest frees the atlas, the guest re-binds the same
+    /// pipeline. Before the rule, step three replayed a stale error and the
+    /// driver was never asked.
+    #[test]
+    fn a_key_that_ran_out_of_memory_is_created_on_the_next_ask() {
+        let mut c: ObjectCache<u32, u32> = ObjectCache::with_negative_cap(4);
+        let key = 0xB0BAu32;
+
+        // Frame N: the create refuses because the device is full.
+        c.insert_negative(
+            key,
+            DrawError::VkCall(VkCall::new(
+                VkOp::CachesCreateGraphicsPipelines,
+                vk::Result::ERROR_OUT_OF_DEVICE_MEMORY,
+            )),
+        );
+
+        // Frame N+1: the guest asks again. Nothing short-circuits it, so the
+        // caller reaches its create.
+        assert_eq!(
+            c.get_negative(&key),
+            None,
+            "the second ask must reach the driver"
+        );
+        assert_eq!(c.get(&key), None, "and it is still a miss, not a stale hit");
+
+        // The memory came back, so this time the create succeeds.
+        c.insert(key, 0x5EED);
+        assert_eq!(c.get(&key), Some(&0x5EED));
     }
 }

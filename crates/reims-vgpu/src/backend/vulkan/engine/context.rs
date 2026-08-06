@@ -937,12 +937,39 @@ impl ContextOwner {
             match unsafe { DeviceContext::create() } {
                 Ok(c) => self.ctx = Some(c),
                 Err(e) => {
-                    self.init_error = Some(e.clone());
+                    self.note_init_failure(&e);
                     return Err(e);
                 }
             }
         }
         Ok(self.ctx.as_ref().unwrap())
+    }
+
+    /// Decide whether a failed bring-up becomes the permanent answer.
+    ///
+    /// [`Self::ensure`] consults `init_error` before it consults anything else,
+    /// and nothing clears it, so whatever lands here answers every later draw
+    /// for the life of the process. That is right for the verdicts bring-up
+    /// reaches about the machine — no Vulkan loader, no physical device, none
+    /// above the API floor, no graphics queue — because a second attempt walks
+    /// the same host and reaches the same one.
+    ///
+    /// It is wrong for out of memory. `vkCreateInstance` and `vkCreateDevice`
+    /// both refuse with `ERROR_OUT_OF_HOST_MEMORY`, which describes what the
+    /// host had free at that instant; latching it would answer a draw a minute
+    /// later, after whatever was holding the memory had exited, from a machine
+    /// state that no longer exists. So it is returned to this caller — the
+    /// guest sees the refusal — and forgotten, and the next draw asks the
+    /// loader again.
+    ///
+    /// Split out from `ensure` so the rule is reachable without a Vulkan
+    /// device: it is the one part of bring-up that is a decision rather than a
+    /// driver call.
+    fn note_init_failure(&mut self, error: &DrawError) {
+        if error.out_of_memory() {
+            return;
+        }
+        self.init_error = Some(error.clone());
     }
 
     fn try_recreate(&mut self, counters: &EngineCounters) -> Result<(), DrawError> {
@@ -1255,5 +1282,96 @@ mod pipeline_cache_blob_tests {
             }
         }
         std::fs::remove_dir_all(&root).ok();
+    }
+}
+
+#[cfg(test)]
+mod init_latch_tests {
+    use super::*;
+
+    /// Bring-up refusing for want of memory must not become the permanent
+    /// answer. `ensure` reads `init_error` before it reads anything else and
+    /// nothing clears it, so a latched one would answer every draw for the life
+    /// of the process from a host state that has since changed.
+    #[test]
+    fn an_out_of_memory_bring_up_is_not_latched() {
+        for decline in [
+            InitDecline::CreateInstance {
+                result: vk::Result::ERROR_OUT_OF_HOST_MEMORY,
+            },
+            InitDecline::CreateDevice {
+                result: vk::Result::ERROR_OUT_OF_HOST_MEMORY,
+            },
+            InitDecline::CreateDevice {
+                result: vk::Result::ERROR_OUT_OF_DEVICE_MEMORY,
+            },
+        ] {
+            let mut owner = ContextOwner::new();
+            let error = DrawError::Init(decline.clone());
+            assert!(error.out_of_memory(), "{decline:?} is the retryable class");
+            owner.note_init_failure(&error);
+            assert!(
+                owner.init_error.is_none(),
+                "{decline:?} must leave the next draw free to ask the loader again"
+            );
+        }
+    }
+
+    /// The converse, so the test above cannot pass by never latching at all. A
+    /// verdict about the machine is reached identically by the next attempt, so
+    /// it is worth keeping — and re-walking bring-up on every draw to rediscover
+    /// that the host has no Vulkan at all is the cost the latch exists to avoid.
+    #[test]
+    fn a_verdict_about_the_machine_is_still_latched() {
+        for decline in [
+            InitDecline::NoPhysicalDevice,
+            InitDecline::NoGraphicsQueueFamily,
+            InitDecline::LoadVulkanLoader {
+                detail: "no loader".to_string(),
+            },
+            InitDecline::BelowApiFloor {
+                minimum: vk::API_VERSION_1_2,
+                found: vec![vk::API_VERSION_1_0],
+            },
+            InitDecline::CreateDevice {
+                result: vk::Result::ERROR_EXTENSION_NOT_PRESENT,
+            },
+        ] {
+            let mut owner = ContextOwner::new();
+            let error = DrawError::Init(decline.clone());
+            assert!(!error.out_of_memory(), "{decline:?} is not about memory");
+            owner.note_init_failure(&error);
+            assert_eq!(
+                owner.init_error.as_ref(),
+                Some(&error),
+                "{decline:?} is reached again by the next attempt, so it is kept"
+            );
+        }
+    }
+
+    /// `out_of_memory` had to learn to look inside `Init` for any of this to
+    /// work; before it did, every arm above answered `false` and bring-up
+    /// latched unconditionally. Pin that it reads the result the variant
+    /// carries rather than the variant's identity.
+    #[test]
+    fn out_of_memory_reads_the_result_not_the_variant() {
+        let oom = DrawError::Init(InitDecline::CreatePipelineCache {
+            result: vk::Result::ERROR_OUT_OF_HOST_MEMORY,
+        });
+        let same_variant_other_result = DrawError::Init(InitDecline::CreatePipelineCache {
+            result: vk::Result::ERROR_INITIALIZATION_FAILED,
+        });
+        assert!(oom.out_of_memory());
+        assert!(!same_variant_other_result.out_of_memory());
+
+        // A check this device decides itself carries no result at all.
+        assert_eq!(InitDecline::NoPhysicalDevice.vk_result(), None);
+        assert_eq!(
+            InitDecline::CreateDevice {
+                result: vk::Result::ERROR_OUT_OF_DEVICE_MEMORY,
+            }
+            .vk_result(),
+            Some(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)
+        );
     }
 }
