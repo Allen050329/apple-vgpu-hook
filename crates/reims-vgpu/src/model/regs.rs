@@ -401,19 +401,25 @@ pub const CHILD_RING_PFN_ENTRY_LEN: u64 = 4;
 
 pub const DEVICE_INFO_REPLY_PAIR_LEN: usize = 8;
 
-/// The guest's parse ceiling, and it is **exclusive**: it asks for every key
-/// strictly below this word.
+/// How many arms the guest's key walker has, counting the terminator — so the
+/// reply may name every key **strictly below** this word.
 ///
-/// The guest writes a literal here, and it is `highest_key_it_parses + 1` — 18
-/// against a walker whose jump table ends at 17. The sibling `CmdGetComputeInfo`
-/// carries the same field for the same reason and writes 5 against a table
-/// ending at 4, which is what settles the polarity: read inclusively, the
-/// compute reply would carry a key 5 that guest has no arm for.
+/// **It is a table length, not a highest key**, and the difference is the whole
+/// reason it is spelled this way. The guest writes a literal, and the literal is
+/// `highest_key_it_parses + 1`: 18 against a walker whose jump table runs
+/// `case 0` (the terminator) through `case 17`. The sibling `CmdGetComputeInfo`
+/// carries the same field and writes 5 against a table of `case 0` through
+/// `case 4`. Read as a maximum, that 5 invents a key 5 that has no arm, no
+/// field and no meaning — the guest's walker sends it to the same skip arm as
+/// key 900.
 ///
-/// It is a separate word from [`DEVICE_INFO_TAHOE_COUNT`] and means a different
-/// thing — this bounds *which* keys the reply may name, that one bounds *how
-/// many* pairs fit. A reply is correct only when it respects both.
-pub const DEVICE_INFO_TAHOE_MAX_KEY: usize = 0x00;
+/// Apple's own host writes the reply under `keyLimit > K`, which is this
+/// polarity exactly.
+///
+/// A separate word from [`DEVICE_INFO_TAHOE_COUNT`], bounding a different thing:
+/// this bounds *which* keys the reply may name, that one bounds *how many* pairs
+/// fit. A reply is correct only when it respects both.
+pub const DEVICE_INFO_TAHOE_KEY_TABLE_LEN: usize = 0x00;
 
 /// How many 8-byte pairs the guest's reply buffer holds — its allocation size in
 /// bytes, shifted right by three. One page, so 512 on a 4 KiB guest.
@@ -830,7 +836,7 @@ pub fn device_info_caps(limits: &DeviceInfoLimits, version: u32) -> Vec<(u32, u3
 /// removing values whose meaning is not established would be trading one guess
 /// for another. They are not *sent* to a guest that has not asked for them:
 /// every request carries the guest's own exclusive parse ceiling
-/// ([`DEVICE_INFO_TAHOE_MAX_KEY`]), and `reply_device_info` names only the keys
+/// ([`DEVICE_INFO_TAHOE_KEY_TABLE_LEN`]), and `reply_device_info` names only the keys
 /// below it. So this table is the set this device *can* answer, and the guest
 /// picks the prefix of it that it understands.
 ///

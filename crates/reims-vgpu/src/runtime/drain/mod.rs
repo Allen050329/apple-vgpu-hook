@@ -714,20 +714,28 @@ fn device_info_limits() -> crate::model::DeviceInfoLimits {
 /// Answer `CmdGetDeviceInfo` into the guest's reply page.
 ///
 /// Two guest words bound this reply and they bound different things.
-/// `max_key` is the guest's parse ceiling, exclusive — see
-/// [`DEVICE_INFO_TAHOE_MAX_KEY`] for the polarity and what settles it — and
-/// `count` is how many 8-byte pairs its buffer holds. A key at or above the
-/// ceiling costs a pair slot for a value the guest discards on arrival; a pair
-/// past `count` would be written past the buffer.
+/// `key_table_len` is how many arms the guest's key walker has, so the reply may
+/// name every key strictly below it — see [`DEVICE_INFO_TAHOE_KEY_TABLE_LEN`]
+/// for why that is a table length rather than a highest key. `count` is how many
+/// 8-byte pairs its buffer holds. A key at or above the table length costs a
+/// pair slot for a value the guest discards on arrival; a pair past `count`
+/// would be written past the buffer.
 ///
 /// The guest asks **once**, when its accelerator starts, and never again: it
 /// frees the reply buffer right after the single parse, and every later reader
 /// is served out of the struct that parse filled. So whatever this reply omits
 /// is omitted for the life of the boot, which is why the tail it could not carry
 /// is reported rather than dropped quietly.
+///
+/// Omission is the *safe* direction and not a neutral one. The guest zeroes that
+/// struct at allocation and its accessors never consult the per-key "was this
+/// defined" flags the walker sets, so an unanswered key reads back as 0 — which
+/// for `maxThreadsPerThreadgroup` or `maxThreadgroupMemoryLength` is a device
+/// that can run nothing. Answering too much is a lie the guest acts on;
+/// answering too little is a zero it also acts on.
 fn reply_device_info<H: HostMemory + HostOps>(
     host: &mut H,
-    max_key: u32,
+    key_table_len: u32,
     count: u32,
     reply_pfn: u32,
     page_shift: u32,
@@ -755,7 +763,7 @@ fn reply_device_info<H: HostMemory + HostOps>(
     let caps: Vec<(u32, u32)> = served
         .iter()
         .copied()
-        .filter(|&(key, _)| key < max_key)
+        .filter(|&(key, _)| key < key_table_len)
         .collect();
     let above_ceiling = served.len() - caps.len();
     // Printed on every reply, not only when something changed. A host that
@@ -777,9 +785,9 @@ fn reply_device_info<H: HostMemory + HostOps>(
         .map(|((key, answer), (_, table))| format!("key{key}={answer}(was {table})"))
         .collect();
     crate::observe::off(format!(
-        "device_info version={} max_key={} above_ceiling={} dual_plane={} host_samples={} host_d24s8={} host_threads={}x{}x{} host_tg_mem={} host_fp16={} derived=[{}]",
+        "device_info version={} key_table_len={} above_ceiling={} dual_plane={} host_samples={} host_d24s8={} host_threads={}x{}x{} host_tg_mem={} host_fp16={} derived=[{}]",
         version,
-        max_key,
+        key_table_len,
         above_ceiling,
         u8::from(crate::model::protocol_dual_plane_textures(version)),
         limits.max_sample_count,
@@ -802,7 +810,7 @@ fn reply_device_info<H: HostMemory + HostOps>(
     }
     // The tail this reply could not carry, named key by key.
     //
-    // Every key still in `caps` is one the guest's own `max_key` says it parses,
+    // Every key still in `caps` is one the guest's own `key_table_len` says it parses,
     // so anything dropped here is a capability that guest spends the rest of the
     // boot without — it asks once and there is no larger re-ask. A healthy boot
     // never emits this: the guest's buffer is a whole page, 512 pairs against a
@@ -811,7 +819,7 @@ fn reply_device_info<H: HostMemory + HostOps>(
     if (n as usize) < caps.len() {
         let dropped: Vec<u32> = caps[n as usize..].iter().map(|&(key, _)| key).collect();
         crate::observe::fail(format!(
-            "device_info truncated reason=reply_pairs_exhausted max_key={max_key} count={count} max_pairs={max_pairs} wrote={n} have={} dropped={dropped:?}",
+            "device_info truncated reason=reply_pairs_exhausted key_table_len={key_table_len} count={count} max_pairs={max_pairs} wrote={n} have={} dropped={dropped:?}",
             caps.len()
         ));
     }
@@ -839,9 +847,44 @@ fn reply_device_info<H: HostMemory + HostOps>(
     Ok(())
 }
 
-/// Wire keys of the `CmdGetComputeInfo` reply the guest reads back
-/// (kb tahoe-x86 + texture-ref 29-06-26).
+/// Wire keys of the `CmdGetComputeInfo` reply the guest reads back.
+///
+/// The guest's walker has four arms and a terminator, and it sends 5 as its
+/// [`DEVICE_INFO_TAHOE_KEY_TABLE_LEN`]-shaped table length. Each arm stores into
+/// one field of a five-word struct its `MTLComputePipelineState` answers from —
+/// so, as with the device-info table, a value here is an instruction to the
+/// guest rather than a description of this device.
+///
+/// **There are four keys and this device answers three.** The one it does not is
+/// key 2, and it is named below rather than left as a hole, because "the guest
+/// asked about five keys and we answered three" invites the wrong repair twice:
+/// there is no key 5 to add, and key 2 must not be answered the obvious way.
 const COMPUTE_INFO_KEY_MAX_TOTAL_THREADS: u32 = 1;
+
+/// Key 2 — `SupportsIndirectCommandBuffers`, and this device deliberately
+/// answers nothing.
+///
+/// The guest's walker stores it into the second word of the struct, and **no
+/// accessor in either Metal plugin ever reads that word**. It cannot: the same
+/// plugin's `newIndirectCommandBufferWithDescriptor:maxCount:options:` returns
+/// nil unconditionally, and its serializer's `executeCommandsInBuffer:` reports
+/// "Not supported" — so the guest has no path to an `MTLIndirectCommandBuffer`
+/// whatever this key says. (That is not the same thing as this device decoding
+/// no ICB records; `runtime::icb` decodes plenty, and they arrive by another
+/// route.)
+///
+/// Omitting it and answering 0 are therefore indistinguishable — the guest
+/// zeroes the struct and never consults the walker's per-key "defined" flags —
+/// and omitting it costs one fewer pair. Answering **1** is the one wrong move:
+/// it would be a promise about a capability the guest cannot exercise and this
+/// device has never been asked for through this door.
+///
+/// Named and unused on purpose. A future guest that grows a reader for the word
+/// is what would make this an answer worth sending, and then the value is a
+/// question about `runtime::icb`, not about this table.
+#[allow(dead_code)] // named so a later session does not read the gap as an omission.
+const COMPUTE_INFO_KEY_SUPPORTS_ICB: u32 = 2;
+
 const COMPUTE_INFO_KEY_THREAD_EXECUTION_WIDTH: u32 = 3;
 const COMPUTE_INFO_KEY_STATIC_THREADGROUP_MEMORY: u32 = 4;
 
@@ -857,6 +900,17 @@ const COMPUTE_INFO_KEY_STATIC_THREADGROUP_MEMORY: u32 = 4;
 /// `staticThreadgroupMemoryLength` is a property of the *pipeline*, not the
 /// device — the threadgroup memory the kernel declares — so no device limit
 /// answers it and it stays 0 until pipeline reflection carries it.
+///
+/// A 0 there is not a silent omission but it is not free either. The guest's own
+/// default for an unanswered key is also 0, so this reply and no reply are
+/// indistinguishable to it, and its plugin does no arithmetic with the value —
+/// `setThreadgroupMemoryLength:atIndex:` validates against nothing before
+/// serializing. Whether Metal.framework itself checks a declared static length
+/// against the device budget this table's key 6 supplies is **not established**,
+/// so "answering 0 lets an app over-allocate dynamic threadgroup memory" is an
+/// open question rather than a known cost. What is established is that the 0 is
+/// wrong for any kernel that declares threadgroup memory, and that only
+/// reflection can make it right.
 fn compute_info_caps() -> [(u32, u32); 3] {
     // Apple GPUs report 1024 and 32 across every family the arm64 pathway
     // targets, and the Metal backend serves an Apple GPU to an Apple guest.
@@ -876,7 +930,7 @@ fn compute_info_caps() -> [(u32, u32); 3] {
 }
 
 /// Child `CmdGetComputeInfo` (0x3b): 24B payload
-/// `[task_id@0][pipeline_ref@4][max_key@8][count@12][reply_gva@16]`.
+/// `[task_id@0][pipeline_ref@4][key_table_len@8][count@12][reply_gva@16]`.
 /// Host writes key/value pairs at reply_gva before stamp (Apple host contract).
 fn reply_compute_info<H: HostMemory + HostOps>(
     state: &mut DeviceState,
@@ -888,12 +942,12 @@ fn reply_compute_info<H: HostMemory + HostOps>(
     }
     let raw_task = ld32(&payload[0..]);
     let pipeline_ref = ld32(&payload[4..]);
-    let max_key = ld32(&payload[8..]);
+    let key_table_len = ld32(&payload[8..]);
     let count = ld32(&payload[12..]);
     let reply_gva = u64::from_le_bytes(payload[16..24].try_into().unwrap_or([0; 8]));
     if reply_gva == 0 || count == 0 {
         crate::observe::fail(format!(
-            "get_compute_info empty task={raw_task} pipe={pipeline_ref} max_key={max_key} count={count} gva={reply_gva:#x}"
+            "get_compute_info empty task={raw_task} pipe={pipeline_ref} key_table_len={key_table_len} count={count} gva={reply_gva:#x}"
         ));
         return false;
     }
@@ -911,8 +965,8 @@ fn reply_compute_info<H: HostMemory + HostOps>(
         // `highest_key_it_parses + 1` here, and its parser's own table stops one
         // below. It sends 5 against a table whose arms are keys 1..=4, so an
         // inclusive read would spend a pair slot on a key 5 that guest discards.
-        // See `DEVICE_INFO_TAHOE_MAX_KEY`, which carries the argument for both.
-        if key >= max_key {
+        // See `DEVICE_INFO_TAHOE_KEY_TABLE_LEN`, which carries the argument for both.
+        if key >= key_table_len {
             continue;
         }
         if wrote >= count {
@@ -953,7 +1007,7 @@ fn reply_compute_info<H: HostMemory + HostOps>(
     // in the log but leaves the curated real-error view clean; the genuine
     // failures (`empty`/`bad_task`/`write_fail`/`short`) above stay `fail()`.
     crate::observe::off(format!(
-        "get_compute_info ok task={task_id} pipe={pipeline_ref} max_key={max_key} count={count} wrote={wrote} gva={reply_gva:#x}"
+        "get_compute_info ok task={task_id} pipe={pipeline_ref} key_table_len={key_table_len} count={count} wrote={wrote} gva={reply_gva:#x}"
     ));
     true
 }
@@ -1069,12 +1123,12 @@ fn process_root_packet<H: HostMemory + HostOps>(
                 packet.payload.len(),
                 DEVICE_INFO_TAHOE_REPLY_PFN + 4,
             ) {
-                let max_key = ld32(&packet.payload[DEVICE_INFO_TAHOE_MAX_KEY..]);
+                let key_table_len = ld32(&packet.payload[DEVICE_INFO_TAHOE_KEY_TABLE_LEN..]);
                 let count = ld32(&packet.payload[DEVICE_INFO_TAHOE_COUNT..]);
                 let pfn = ld32(&packet.payload[DEVICE_INFO_TAHOE_REPLY_PFN..]);
                 let _ = reply_device_info(
                     host,
-                    max_key,
+                    key_table_len,
                     count,
                     pfn,
                     state.page_shift,

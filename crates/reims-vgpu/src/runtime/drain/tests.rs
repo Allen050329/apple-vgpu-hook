@@ -4284,7 +4284,7 @@ fn device_info_reply(max_key: u32, count: u32) -> Vec<(u32, u32)> {
     let mut host = FakeHost::new();
 
     let mut payload = vec![0u8; DEVICE_INFO_TAHOE_REPLY_PFN + 4];
-    st32(&mut payload[DEVICE_INFO_TAHOE_MAX_KEY..], max_key);
+    st32(&mut payload[DEVICE_INFO_TAHOE_KEY_TABLE_LEN..], max_key);
     st32(&mut payload[DEVICE_INFO_TAHOE_COUNT..], count);
     st32(&mut payload[DEVICE_INFO_TAHOE_REPLY_PFN..], REPLY_PFN);
     process_root_packet(
@@ -4319,38 +4319,89 @@ fn device_info_reply(max_key: u32, count: u32) -> Vec<(u32, u32)> {
     out
 }
 
-/// The guest's `max_key` is a parse ceiling, and it is exclusive.
+/// The guest's first request word is its key-table *length*, not a highest key.
 ///
-/// The guest writes `highest_key_it_parses + 1` — 18, against a walker whose
-/// jump table ends at 17 — and a key at or above it is discarded on arrival. It
-/// used to be read as an opcode and never consulted, so the reply named every
-/// key in the table whatever the guest said it could take. That costs a pair
-/// slot per key on a reply the guest asks for exactly once.
+/// It writes `highest_key_it_parses + 1` — 18, against a walker whose jump table
+/// runs `case 0` through `case 17` — so a key at or above it is discarded on
+/// arrival. The word used to be read as an opcode and never consulted, so the
+/// reply named every key in the table whatever the guest said it could take,
+/// spending a pair slot per key on a reply the guest asks for exactly once.
 ///
-/// Drive a ceiling of 4 and assert only keys 1..=3 come back, then the real 18
-/// and assert the reply stops at 17 — the boundary is what makes this a test of
-/// polarity rather than of filtering.
+/// Read as a maximum rather than a length it invents a key that does not exist,
+/// which is why the boundary is the assertion: drive a length of 4 and the reply
+/// must stop at key 3, not key 4.
 #[test]
-fn the_device_info_reply_stops_below_the_guests_exclusive_parse_ceiling() {
-    let keys: Vec<u32> = device_info_reply(4, 512).into_iter().map(|p| p.0).collect();
-    assert_eq!(
-        keys,
-        vec![1, 2, 3],
-        "a ceiling of 4 admits keys strictly below it; a key 4 would be inclusive"
-    );
-
-    let full: Vec<u32> = device_info_reply(18, 512)
+fn the_device_info_reply_stops_below_the_guests_key_table_length() {
+    const PAIRS_PER_PAGE: u32 = (PAGE_SIZE_ARM64E as usize / DEVICE_INFO_REPLY_PAIR_LEN) as u32;
+    let keys: Vec<u32> = device_info_reply(4, PAIRS_PER_PAGE)
         .into_iter()
         .map(|p| p.0)
         .collect();
     assert_eq!(
+        keys,
+        vec![1, 2, 3],
+        "a table of four arms is cases 0..=3, so key 3 is the last one worth \
+         sending; a key 4 here would be the length read as a maximum"
+    );
+
+    let full: Vec<u32> =
+        device_info_reply(DEVICE_INFO_KEY_BUFFER_WITH_IOSURFACE + 1, PAIRS_PER_PAGE)
+            .into_iter()
+            .map(|p| p.0)
+            .collect();
+    assert_eq!(
         full.last().copied(),
         Some(DEVICE_INFO_KEY_BUFFER_WITH_IOSURFACE),
-        "the ceiling this guest sends admits every key its walker has an arm for"
+        "the length this guest sends admits every key its walker has an arm for"
     );
     assert!(
-        !full.contains(&18),
-        "and nothing above it: the guest discards those on arrival"
+        !full.contains(&(DEVICE_INFO_KEY_BUFFER_WITH_IOSURFACE + 1)),
+        "and nothing at or above it: the guest discards those on arrival"
+    );
+}
+
+/// `CmdGetComputeInfo` carries the same word and it means the same thing.
+///
+/// Its guest sends 5 against a walker of `case 0` through `case 4`, so the reply
+/// may name keys 1..=4 and no more — there is no key 5, and reading that 5 as a
+/// maximum is how "the guest asked about five keys, we answer three" becomes a
+/// two-key gap when it is a one-key one.
+///
+/// That one key is 2, `SupportsIndirectCommandBuffers`, left out on purpose:
+/// nothing in either Metal plugin reads the word the guest stores it in. Pinned
+/// here so the absence stays a decision instead of looking like an oversight.
+#[test]
+fn the_compute_info_reply_answers_three_of_the_guests_four_keys() {
+    let answered: Vec<u32> = compute_info_caps().iter().map(|&(k, _)| k).collect();
+    assert_eq!(
+        answered,
+        vec![
+            COMPUTE_INFO_KEY_MAX_TOTAL_THREADS,
+            COMPUTE_INFO_KEY_THREAD_EXECUTION_WIDTH,
+            COMPUTE_INFO_KEY_STATIC_THREADGROUP_MEMORY,
+        ],
+        "key 2 is deliberately absent; adding it means answering it 0, never 1"
+    );
+
+    // Under the guest's own table length every answered key is sendable, and one
+    // arm shorter drops the last of them. An inclusive read would keep it.
+    let sendable = |table_len: u32| -> Vec<u32> {
+        answered
+            .iter()
+            .copied()
+            .filter(|&key| key < table_len)
+            .collect()
+    };
+    assert_eq!(
+        sendable(COMPUTE_INFO_KEY_STATIC_THREADGROUP_MEMORY + 1),
+        answered
+    );
+    assert_eq!(
+        sendable(COMPUTE_INFO_KEY_STATIC_THREADGROUP_MEMORY),
+        vec![
+            COMPUTE_INFO_KEY_MAX_TOTAL_THREADS,
+            COMPUTE_INFO_KEY_THREAD_EXECUTION_WIDTH
+        ]
     );
 }
 
@@ -4360,7 +4411,7 @@ fn the_device_info_reply_stops_below_the_guests_exclusive_parse_ceiling() {
 /// Ask for fewer than the table offers and the tail is simply not written — and
 /// the guest issues this command once, frees the buffer, and answers every later
 /// reader from what it parsed, so there is no second, larger ask. Every key still
-/// offered at that point is one `max_key` says the guest parses, so a key dropped
+/// offered at that point is the guest's own key-table length says it parses, so a key dropped
 /// here is a capability it spends the rest of the boot without.
 ///
 /// The loss used to be silent, which read exactly like a table with nothing more

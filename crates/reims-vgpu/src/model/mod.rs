@@ -368,7 +368,7 @@ mod tests {
         // 13.7.8 guest writes. It read 0 here for as long as the offset was
         // thought to be unused, and a ceiling of 0 admits no key at all.
         st32(
-            &mut payload[DEVICE_INFO_TAHOE_MAX_KEY..],
+            &mut payload[DEVICE_INFO_TAHOE_KEY_TABLE_LEN..],
             DEVICE_INFO_KEY_BUFFER_WITH_IOSURFACE + 1,
         );
         // A whole page of pair slots, as the guest sends. A short count here
