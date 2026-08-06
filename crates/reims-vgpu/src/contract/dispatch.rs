@@ -1,12 +1,18 @@
-//! What a decoded compute dispatch record means: its `MTLDispatchType`, and the
-//! threadgroup counts its grid resolves to.
+//! What a decoded dispatch record means: its `MTLDispatchType`, the threadgroup
+//! counts a compute grid resolves to, and the three extents a mesh draw encodes.
 //!
-//! Both are read off the wire and neither is backend-specific, so both are
-//! answered here once rather than at each backend's encode site. Each is a
+//! All three are read off the wire and none is backend-specific, so each is
+//! answered here once rather than at every backend's encode site. Each is a
 //! *closed* rule with a substitution behind it, which is why they are functions
 //! and not open-coded comparisons — see
 //! [`crate::contract::dispatch::workgroup_counts`] for what the split version of
 //! the second one cost.
+//!
+//! The two dimension rules are deliberately neighbours, because they disagree
+//! and the disagreement is the contract. A compute dispatch may substitute
+//! nothing: every extent is the guest's. A mesh draw may substitute exactly one
+//! thing, the object threadgroup Metal demands even with no object stage, and it
+//! reports having done so. Read either alone and the other looks like a bug.
 //!
 //! # The dispatch type
 //!
@@ -86,6 +92,70 @@ pub fn workgroup_counts(grid: [u32; 3], tg: [u32; 3], grid_is_threads: bool) -> 
     ])
 }
 
+/// The three `MTLSize`s a mesh draw encodes, or `None` if it has no work.
+///
+/// A mesh draw carries a grid, an object threadgroup size and a mesh
+/// threadgroup size, and Metal takes all three as `MTLSize` — a plain struct it
+/// validates as strictly positive in every dimension. So a zero reaching
+/// `drawMeshThreads:` or `drawMeshThreadgroups:` is not a small dispatch; it is
+/// a validation assert on a debug layer and undefined driver behaviour without
+/// one. There is no reading under which this device may pass one through, which
+/// is why this returns `None` rather than clamping.
+///
+/// # Why `object_tg` is the one that may be zero
+///
+/// Metal requires `threadsPerObjectThreadgroup` to be supplied even when the
+/// pipeline's `objectFunction` is nil, and there is no object stage to size in
+/// that case. A guest that omits it leaves the field zero, and `MTLSize`'s own
+/// convention for an unused dimension is 1 — so 1 is what the record means, not
+/// a number invented to get past a check. Substituting it is reported by the
+/// `object_tg_defaulted` flag rather than done silently, because the
+/// substitution is only correct when there is no object stage: a pipeline that
+/// *has* one and a record that sizes it at zero is a guest disagreeing with
+/// itself, and this function cannot see the pipeline to tell the two apart.
+///
+/// # Why a triple's first component is not the triple
+///
+/// The check this replaces tested `grid[0]` and `mesh_tg[0]` and nothing else,
+/// which reads as thorough and samples one third of each. It is the same trap
+/// `AGENTS.md` records for a range guard that checks two endpoints and calls it
+/// a span — the granularity the answer varies at is per-component, so the walk
+/// has to be per-component.
+#[must_use]
+pub fn mesh_draw_dims(
+    grid: [u32; 3],
+    object_tg: [u32; 3],
+    mesh_tg: [u32; 3],
+) -> Option<MeshDrawDims> {
+    if grid.iter().chain(&mesh_tg).any(|&d| d == 0) {
+        return None;
+    }
+    let object_tg_defaulted = object_tg.contains(&0);
+    Some(MeshDrawDims {
+        grid,
+        object_tg: object_tg.map(|d| if d == 0 { 1 } else { d }),
+        mesh_tg,
+        object_tg_defaulted,
+    })
+}
+
+/// The dimensions a mesh draw encodes, after [`mesh_draw_dims`] has accepted it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MeshDrawDims {
+    /// `threadsPerGrid` or `threadgroupsPerGrid`, per the record's opcode.
+    pub grid: [u32; 3],
+    /// `threadsPerObjectThreadgroup`, with any zero component read as 1.
+    pub object_tg: [u32; 3],
+    /// `threadsPerMeshThreadgroup`.
+    pub mesh_tg: [u32; 3],
+    /// Whether any `object_tg` component was zero and has been read as 1.
+    ///
+    /// Carried rather than discarded so the substitution stays countable. It is
+    /// correct only for a pipeline with no object stage, and this type cannot
+    /// see the pipeline — so a caller that can, can say so.
+    pub object_tg_defaulted: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -151,6 +221,68 @@ mod tests {
             Some([u32::MAX, 1, 1]),
             "the widest grid a u32 can carry divides without wrapping"
         );
+    }
+
+    /// A zero in any component of `grid` or `mesh_tg` refuses the draw.
+    ///
+    /// Exhaustive over all six, which is the whole point: the check this
+    /// replaced tested component `[0]` of each and would pass a test that
+    /// zeroed only that one. Every case here except two is a regression the old
+    /// check let through to Metal as a zero `MTLSize`.
+    #[test]
+    fn a_mesh_draw_with_a_zero_extent_encodes_nothing() {
+        for i in 0..6 {
+            let mut grid = [4u32, 4, 4];
+            let mut mesh_tg = [2u32, 2, 2];
+            if i < 3 {
+                grid[i] = 0
+            } else {
+                mesh_tg[i - 3] = 0
+            }
+            assert_eq!(
+                mesh_draw_dims(grid, [1, 1, 1], mesh_tg),
+                None,
+                "grid={grid:?} mesh_tg={mesh_tg:?}"
+            );
+        }
+    }
+
+    /// A zero object threadgroup is read as 1, and the substitution is reported.
+    ///
+    /// The asymmetry with `grid` and `mesh_tg` is the contract: Metal wants the
+    /// argument even with no object stage, so absent means 1 rather than
+    /// invalid. `object_tg_defaulted` is what keeps that from being a silent
+    /// fabrication — it is the only one of the three this device may supply.
+    #[test]
+    fn an_absent_object_threadgroup_is_read_as_one_and_says_so() {
+        let all_zero = mesh_draw_dims([4, 4, 4], [0, 0, 0], [2, 2, 2]).expect("accepted");
+        assert_eq!(all_zero.object_tg, [1, 1, 1]);
+        assert!(all_zero.object_tg_defaulted);
+
+        // A partially-sized object threadgroup: only the zero components move.
+        let partial = mesh_draw_dims([4, 4, 4], [8, 0, 0], [2, 2, 2]).expect("accepted");
+        assert_eq!(partial.object_tg, [8, 1, 1]);
+        assert!(partial.object_tg_defaulted);
+
+        let stated = mesh_draw_dims([4, 4, 4], [8, 2, 1], [2, 2, 2]).expect("accepted");
+        assert_eq!(stated.object_tg, [8, 2, 1]);
+        assert!(
+            !stated.object_tg_defaulted,
+            "nothing was substituted, so nothing may be reported as substituted"
+        );
+    }
+
+    /// An accepted draw passes `grid` and `mesh_tg` through untouched.
+    ///
+    /// The counterpart to the clamp that `workgroup_counts` refuses to make:
+    /// these two are the guest's own extents and this device may not round,
+    /// clamp or default either of them.
+    #[test]
+    fn an_accepted_mesh_draw_alters_neither_extent() {
+        let dims = mesh_draw_dims([7, 3, 1], [1, 1, 1], [32, 1, 1]).expect("accepted");
+        assert_eq!(dims.grid, [7, 3, 1]);
+        assert_eq!(dims.mesh_tg, [32, 1, 1]);
+        assert!(!dims.object_tg_defaulted);
     }
 
     /// The accepted set is exactly the two declared ordinals.

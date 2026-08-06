@@ -2663,18 +2663,36 @@ pub fn fill_render_command<M: HostMemory + HostOps>(
         IcbRenderDraw::MeshThreads(mesh) | IcbRenderDraw::MeshThreadgroups(mesh) => {
             use crate::backend::metal::raw_metal;
             let threads = matches!(fill.draw, IcbRenderDraw::MeshThreads(_));
-            if mesh.grid[0] == 0 || mesh.mesh_tg[0] == 0 {
+            // All three extents are checked per component, not by their first
+            // one: Metal validates an `MTLSize` in every dimension, so a zero in
+            // `grid[1]` is as unencodable as one in `grid[0]` and used to reach
+            // the selector. See `contract::dispatch::mesh_draw_dims`, which also
+            // owns the one substitution allowed here — an absent object
+            // threadgroup read as 1.
+            let Some(dims) =
+                crate::contract::dispatch::mesh_draw_dims(mesh.grid, mesh.object_tg, mesh.mesh_tg)
+            else {
                 return Err(IcbStatus::Args(if threads {
                     "icb_frc_mesh_threads_zero_dims"
                 } else {
                     "icb_frc_mesh_threadgroups_zero_dims"
                 }));
+            };
+            if dims.object_tg_defaulted {
+                // Correct when the pipeline has no object stage, and wrong when
+                // it has one — which this site cannot tell apart either, so the
+                // reliance is reported rather than assumed. A reading here beside
+                // a mesh pipeline that declares an object function is the bug.
+                crate::observe::fail(format!(
+                    "icb_mesh_object_tg_defaulted threads={threads} \
+                     object_tg={:?} (read as 1; correct only with no object stage)",
+                    mesh.object_tg
+                ));
             }
             let size = |d: [u32; 3]| raw_metal::mtl_size(d[0] as u64, d[1] as u64, d[2] as u64);
-            let grid = size(mesh.grid);
-            // object TG size is still required by the selector when objectFunction is nil.
-            let obj_tg = size(mesh.object_tg.map(|d| d.max(1)));
-            let mesh_tg = size(mesh.mesh_tg);
+            let grid = size(dims.grid);
+            let obj_tg = size(dims.object_tg);
+            let mesh_tg = size(dims.mesh_tg);
             if threads {
                 raw_metal::icb_draw_mesh_threads(cmd, grid, obj_tg, mesh_tg);
             } else {
