@@ -252,25 +252,32 @@ fn compute_bind_overflow_drops_the_bind_but_keeps_in_cap_and_unbinds() {
     );
     assert_eq!(acc.buffers.len(), 2, "unbind (ref==0) adds no slot");
 
-    // Threadgroup memory over-cap with a real length is dropped (kept empty);
-    // a zero-length over-cap request is an unbind and stays silent.
-    acc.set_threadgroup_memory(MAX_THREADGROUP_MEMORY_SLOTS + 2, 256);
-    acc.set_threadgroup_memory(MAX_THREADGROUP_MEMORY_SLOTS + 3, 0);
-    assert!(
-        acc.threadgroup_memory.is_empty(),
-        "over-cap threadgroup memory must not be stored"
+    // Threadgroup memory has no cap here: the accumulator keeps whatever slot
+    // the guest names, and the one backend with an argument table refuses at its
+    // own encoder. A cap here would also have bound the Vulkan rail, which
+    // consumes none of these binds.
+    acc.set_threadgroup_memory(u32::MAX, 256);
+    acc.set_threadgroup_memory(64, 512);
+    assert_eq!(
+        acc.threadgroup_memory.len(),
+        2,
+        "a slot past any host table is still recorded, not dropped here"
     );
 }
 
 /// Each argument table renders its own `reason=`, and the line keeps the shape
 /// the log has always carried.
 ///
-/// The four slugs used to live inside a `format!` string, where
+/// The slugs used to live inside a `format!` string, where
 /// `decline_slugs_are_unique` could not read them — a later decline spelling
 /// one of them would have shared this path's `fail_once` latch and silenced one
 /// of the two for the boot, with nothing failing. They are `slug()` bodies now,
 /// so that test sees them; this one pins that moving them did not change what a
-/// reader greps for, and that the four tables stay distinguishable.
+/// reader greps for, and that the three tables stay distinguishable.
+///
+/// There were four. The threadgroup-memory table left this enum when its cap
+/// did: it is bounded by a Metal argument table rather than by the protocol, so
+/// the refusal belongs to the encoder that owns the table and is named there.
 #[test]
 fn every_compute_bind_table_renders_its_own_slug() {
     use crate::observe::Emit;
@@ -289,21 +296,6 @@ fn every_compute_bind_table_renders_its_own_slug() {
         "compute_bind_overflow reason=buffer_index_overflow index=40 arg=9 cap=31"
     );
 
-    // `arg` is a length here rather than a ref — the one table whose payload is
-    // bytes, which is why the variant is separate.
-    assert_eq!(
-        Emit::decline(
-            "compute_bind_overflow",
-            &O::Threadgroup {
-                index: 18,
-                arg: 256,
-                cap: MAX_THREADGROUP_MEMORY_SLOTS,
-            },
-        )
-        .render(),
-        "compute_bind_overflow reason=threadgroup_index_overflow index=18 arg=256 cap=16"
-    );
-
     let slugs: Vec<&str> = [
         O::Buffer {
             index: 0,
@@ -316,11 +308,6 @@ fn every_compute_bind_table_renders_its_own_slug() {
             cap: 0,
         },
         O::Sampler {
-            index: 0,
-            arg: 0,
-            cap: 0,
-        },
-        O::Threadgroup {
             index: 0,
             arg: 0,
             cap: 0,

@@ -22,6 +22,35 @@ pub const REIMS_VGPU_METAL_MAX_BUFFERS: usize = 31;
 /// band assertion below is what holds the two in step.
 pub const REIMS_VGPU_METAL_MAX_TEXTURES: usize = 128;
 pub const REIMS_VGPU_METAL_MAX_SAMPLERS: usize = 16;
+/// The threadgroup-memory argument table.
+///
+/// The one table here that is **not** also a serializer truncation limit.
+/// `reims_vgpu_wire::ops::bind_limit` captured the guest clamping a plural bind
+/// at 31 buffers / 128 textures / 16 samplers, and there is no fourth capture to
+/// read: `setThreadgroupMemoryLength:atIndex:` is a singular record carrying a
+/// full `u32`, and the guest applies no bound to it on the way out. The
+/// negotiated device info describes threadgroup memory in *bytes* and never in
+/// slots, so the protocol does not state this bound either.
+///
+/// It is Metal's, and Metal states it as `maxComputeLocalMemorySizes` — the
+/// entry the framework's own limits table fills from the same value it gives
+/// `maxComputeBuffers`, on every GPU family, which is why this equals
+/// [`REIMS_VGPU_METAL_MAX_BUFFERS`] rather than being a second reading of it.
+/// The rule the framework enforces is `index < maxComputeLocalMemorySizes`, and
+/// it enforces it by *throwing*, so an over-range index is a process abort
+/// rather than a status this device can decline.
+///
+/// That is what this constant stands in front of, and it is why the accumulator
+/// no longer carries a cap of its own. A `MAX_THREADGROUP_MEMORY_SLOTS` of 16
+/// used to refuse the bind during stream accumulation: safe against the abort,
+/// unjustified as a number, and — being applied before the backend split — it
+/// took slots 16..=30 away from the Vulkan arm as well, which does not consume
+/// threadgroup-memory binds at all.
+///
+/// Equal to [`REIMS_VGPU_METAL_MAX_BUFFERS`] and deliberately not written as it:
+/// they are two Metal limits that hold the same number, not one limit spelled
+/// twice, and nothing says a future family moves them together.
+pub const REIMS_VGPU_METAL_MAX_THREADGROUP_MEMORY: usize = 31;
 // The sampler table is also carried as a bitmask: `render_reflection_sampler_mask`
 // packs one bit per slot into a `u32` and `bind_samplers` reads it back to supply
 // a default sampler for every slot the pipeline reflection says is used. A table

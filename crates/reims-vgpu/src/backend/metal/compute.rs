@@ -21,8 +21,8 @@ use crate::backend::metal::stage_input::{
     has_indexed_layout, layout_for_buffer, make_compute_stage_input_descriptor,
 };
 use crate::backend::metal::util::{
-    bytes_of, clear_err, sampler_index, set_err, texture_index, valid_buffer_binding, ErrOut,
-    Status,
+    bytes_of, clear_err, sampler_index, set_err, texture_index, valid_buffer_binding,
+    valid_threadgroup_memory_index, ErrOut, Status,
 };
 use crate::contract::extent::{tight_image_bytes, Extent3};
 use metal::*;
@@ -553,10 +553,27 @@ pub(crate) fn bind_compute_samplers(
     Status::OK
 }
 
-fn bind_threadgroup_memory(encoder: &ComputeCommandEncoderRef, tg: &[ReimsVgpuThreadgroupMemory]) {
+/// Bind the dispatch's threadgroup-memory allocations.
+///
+/// The one bind path where an out-of-range index is not a wrong result but a
+/// **process abort**: Metal answers an index at or past
+/// `maxComputeLocalMemorySizes` by throwing, and there is no status to catch.
+/// So this refuses first, by name, and the dispatch is declined rather than the
+/// VM taken down — which is also what the accumulator no longer does, having
+/// carried an unjustified 16 for the same job.
+fn bind_threadgroup_memory(
+    encoder: &ComputeCommandEncoderRef,
+    tg: &[ReimsVgpuThreadgroupMemory],
+) -> Status {
     for entry in tg {
+        if !valid_threadgroup_memory_index(entry.index) {
+            return Status::args("metal_compute_threadgroup_memory_index_over_table")
+                .field("index", entry.index)
+                .field("limit", REIMS_VGPU_METAL_MAX_THREADGROUP_MEMORY as u32);
+        }
         encoder.set_threadgroup_memory_length(entry.index as u64, entry.length);
     }
+    Status::OK
 }
 
 fn bind_stage_in_region(
@@ -741,7 +758,14 @@ pub fn compute_encode_on_encoder(
     if !rc.is_ok() {
         return Err(rc);
     }
-    bind_threadgroup_memory(encoder, threadgroup_memory);
+    let rc = bind_threadgroup_memory(encoder, threadgroup_memory);
+    if !rc.is_ok() {
+        set_err(
+            err,
+            "threadgroup memory index past the Metal argument table",
+        );
+        return Err(rc);
+    }
     bind_stage_in_region(encoder, stage_in_region);
     let mut retained_indirect = Vec::new();
     bind_stage_in_region_indirect(

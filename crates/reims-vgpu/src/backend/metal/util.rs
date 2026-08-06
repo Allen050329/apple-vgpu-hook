@@ -15,6 +15,7 @@ use crate::backend::metal::abi::{
 };
 use crate::backend::metal::constants::{
     REIMS_VGPU_METAL_MAX_BUFFERS, REIMS_VGPU_METAL_MAX_SAMPLERS, REIMS_VGPU_METAL_MAX_TEXTURES,
+    REIMS_VGPU_METAL_MAX_THREADGROUP_MEMORY,
 };
 use crate::backend::metal::error::write_err;
 pub(crate) use crate::backend::metal::error::Status;
@@ -40,6 +41,16 @@ pub fn clear_err(err: ErrOut<'_>) {
 
 pub fn valid_buffer_binding(binding: u32) -> bool {
     (binding as usize) < REIMS_VGPU_METAL_MAX_BUFFERS
+}
+
+/// Is `index` a slot the threadgroup-memory argument table actually has?
+///
+/// Stated on a raw index rather than a descriptor binding, because threadgroup
+/// memory has no band: the guest's record carries the Metal argument-table index
+/// directly. `REIMS_VGPU_METAL_MAX_THREADGROUP_MEMORY` says why answering `false`
+/// here is the only thing between a decoded guest index and a process abort.
+pub fn valid_threadgroup_memory_index(index: u32) -> bool {
+    (index as usize) < REIMS_VGPU_METAL_MAX_THREADGROUP_MEMORY
 }
 
 pub fn texture_index(binding: u32) -> Option<usize> {

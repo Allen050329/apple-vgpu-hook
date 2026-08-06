@@ -101,58 +101,6 @@ const _: () = assert!(
 const _: () = assert!(reims_vgpu_wire::ops::bind_limit::BUFFER <= MAX_COMPUTE_BUFFER_SLOTS);
 const _: () = assert!(reims_vgpu_wire::ops::bind_limit::TEXTURE <= MAX_COMPUTE_TEXTURE_SLOTS);
 const _: () = assert!(reims_vgpu_wire::ops::bind_limit::SAMPLER <= MAX_COMPUTE_SAMPLER_SLOTS);
-/// Cap on threadgroup-memory indices.
-///
-/// # The protocol does not bound this, and that makes it the odd one of the four
-///
-/// The three caps above each hold a bound the protocol states.
-/// [`reims_vgpu_wire::ops::bind_limit`] measured the serializer truncating a
-/// *plural* bind at 128 textures, 31 buffers and 16 samplers, and the `const`
-/// assertions above hold this device to those. Three things say this cap is not
-/// the same kind of number:
-///
-/// * **The record carries a full `u32` index and nothing narrows it.**
-///   `setThreadgroupMemoryLength:atIndex:` serializes as a singular record —
-///   [`reims_vgpu_wire::ops::compute::ThreadgroupMemoryLength`], a `u64` length
-///   followed by a `u32` index — with no range to truncate and no bound applied
-///   to the index on the way out.
-/// * **The plural bound is not a constant, so there is no fourth one to read.**
-///   The three values `bind_limit` carries are not literals in the encoder; the
-///   plural bind path reads the stage's own binding-table size at encode time
-///   and clamps `location + length` to it. That is why those three had to be
-///   *captured*, and why the technique has nothing to say here.
-/// * **The negotiated device info describes threadgroup memory in bytes, never
-///   in slots.** It carries a maximum and a static threadgroup memory *length*;
-///   no field in it counts entries. So "how many threadgroup memory slots exist"
-///   is not a protocol quantity at all — it is a property of the host's argument
-///   table.
-///
-/// # Which makes this the mistake [`crate::runtime::draw::MAX_SAMPLER_BIND_SLOTS`] declines to repeat
-///
-/// A presumed *Metal* table size, applied during stream accumulation, takes the
-/// slot away from the Vulkan arm as well — which is exactly what that constant's
-/// doc refuses to do with Metal's 16-entry sampler table, on the grounds that the
-/// bound belongs to one backend and that backend should refuse at its own encoder.
-/// The same argument applies here and has not been acted on, for one reason: the
-/// Metal side has nowhere to refuse. `backend::metal::compute::bind_threadgroup_memory`
-/// passes the index straight to the encoder with no guard, and Metal answers an
-/// out-of-range argument-table index by aborting the process — so this cap is
-/// currently the only thing standing in front of that, and it cannot be moved
-/// until the backend that owns the real table checks it.
-///
-/// So 16 is safe in one direction and unjustified in the other. Any bound at or
-/// below Metal's real table prevents the abort, and a low one is the conservative
-/// error; but nothing states that table *ends* at 16, so a kernel binding
-/// threadgroup memory above slot 15 loses that bind. It is not silent —
-/// [`ComputeBindOverflow`]'s `Threadgroup` arm reports it on the fail channel, and
-/// a reading there is the evidence that this is costing a real guest something.
-///
-/// Retiring it needs the host table size, from the backend rather than from the
-/// guest protocol, and a refusal at the Metal encoder to replace it. Do not
-/// meanwhile raise the number to fit a guess: the direction that is currently
-/// wrong is reported, and the direction a guess could get wrong aborts the
-/// process.
-pub const MAX_THREADGROUP_MEMORY_SLOTS: u32 = 16;
 /// `MTLDispatchThreadgroupsIndirectArguments` = three `uint32_t` (12 bytes).
 pub const INDIRECT_THREADGROUPS_ARGS_LEN: usize = 12;
 /// `MTLDispatchThreadsIndirectArguments` = six `uint32_t` (24 bytes).
@@ -197,9 +145,6 @@ enum ComputeBindOverflow {
     Buffer { index: u32, arg: u32, cap: u32 },
     Texture { index: u32, arg: u32, cap: u32 },
     Sampler { index: u32, arg: u32, cap: u32 },
-    /// `arg` is the requested allocation length, not a resource ref — a
-    /// threadgroup slot names bytes rather than an object.
-    Threadgroup { index: u32, arg: u32, cap: u32 },
 }
 
 impl ComputeBindOverflow {
@@ -207,8 +152,7 @@ impl ComputeBindOverflow {
         match *self {
             Self::Buffer { index, arg, cap }
             | Self::Texture { index, arg, cap }
-            | Self::Sampler { index, arg, cap }
-            | Self::Threadgroup { index, arg, cap } => (index, arg, cap),
+            | Self::Sampler { index, arg, cap } => (index, arg, cap),
         }
     }
 
@@ -229,7 +173,6 @@ impl crate::observe::Decline for ComputeBindOverflow {
             Self::Buffer { .. } => "buffer_index_overflow",
             Self::Texture { .. } => "texture_index_overflow",
             Self::Sampler { .. } => "sampler_index_overflow",
-            Self::Threadgroup { .. } => "threadgroup_index_overflow",
         }
     }
 
@@ -435,21 +378,24 @@ impl ComputeAccum {
         }
     }
 
+    /// Record a `setThreadgroupMemoryLength:atIndex:` for the next dispatch.
+    ///
+    /// **No bound here, on purpose.** The three bind setters above each refuse a
+    /// slot past a cap because the protocol states one — the guest's serializer
+    /// truncates a plural bind at exactly those counts, so a record naming a
+    /// higher slot cannot have come from a well-formed guest. This record is
+    /// singular, carries a full `u32`, and the guest applies no bound to it, so
+    /// there is no protocol cap to compare against.
+    ///
+    /// What does bound it is the *host's* argument table, and only one backend
+    /// has one: `backend::metal::compute::bind_threadgroup_memory` refuses at
+    /// `REIMS_VGPU_METAL_MAX_THREADGROUP_MEMORY` and names the check. The Vulkan
+    /// rail consumes none of these binds — SPIR-V declares workgroup shared
+    /// memory statically — so a cap applied here would have taken slots away
+    /// from an arm that has no table to run out of. That is the mistake
+    /// [`crate::runtime::draw::MAX_SAMPLER_BIND_SLOTS`]' doc names, and a cap of
+    /// 16 sat here making it until the host table size was known.
     pub fn set_threadgroup_memory(&mut self, index: u32, length: u64) {
-        if index >= MAX_THREADGROUP_MEMORY_SLOTS {
-            // A non-empty allocation at an over-cap slot is a genuine dropped bind
-            // (the kernel expects threadgroup memory here); a zero length is an
-            // unbind, expected control flow. `arg` carries the requested length.
-            if length != 0 {
-                ComputeBindOverflow::Threadgroup {
-                    index,
-                    arg: length.min(u32::MAX as u64) as u32,
-                    cap: MAX_THREADGROUP_MEMORY_SLOTS,
-                }
-                .emit();
-            }
-            return;
-        }
         let bind = ThreadgroupMemoryBind { index, length };
         if let Some(slot) = self
             .threadgroup_memory

@@ -2528,6 +2528,13 @@ pub fn fill_render_command<M: HostMemory + HostOps>(
         if tg.length != 0 && tg.length % 16 != 0 {
             return Err(IcbStatus::Args("icb_frc_object_tg_length_alignment"));
         }
+        // The index is a Metal argument-table slot and Metal answers an
+        // over-range one by throwing, which aborts the process rather than
+        // failing this fill. Same table and same reason as the direct compute
+        // encoder's bind; see `REIMS_VGPU_METAL_MAX_THREADGROUP_MEMORY`.
+        if !crate::backend::metal::util::valid_threadgroup_memory_index(tg.index) {
+            return Err(IcbStatus::Args("icb_frc_object_tg_index_over_table"));
+        }
         crate::backend::metal::raw_metal::icb_set_object_threadgroup_memory_length(
             cmd,
             tg.length,
