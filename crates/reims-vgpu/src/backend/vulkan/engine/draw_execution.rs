@@ -94,6 +94,18 @@ pub enum DrawExecutionDecline {
         size: u64,
         slot_size: u64,
     },
+    /// A readback asked for more bytes than the slot it is reading from holds.
+    ///
+    /// The mirror of [`Self::StagingWriteBeyondSlot`], and the same hole in the
+    /// same shape: `read_back_slot`'s `vkMapMemory` arm is bounded by the
+    /// driver and its persistent-mapping arm is not. It is the worse of the two
+    /// to leave unchecked — the bytes past the slot belong to whatever the host
+    /// slab carved next in the shared block, and the read copies them into a
+    /// `Vec` that leaves this device.
+    ReadBackBeyondSlot {
+        len: u64,
+        slot_size: u64,
+    },
 }
 
 impl Decline for DrawExecutionDecline {
@@ -120,6 +132,7 @@ impl Decline for DrawExecutionDecline {
             }
             Self::UnsupportedTrackedLayout { .. } => "vk_draw_exec_unsupported_tracked_layout",
             Self::StagingWriteBeyondSlot { .. } => "vk_draw_exec_staging_write_beyond_slot",
+            Self::ReadBackBeyondSlot { .. } => "vk_draw_exec_read_back_beyond_slot",
         }
     }
 
@@ -211,6 +224,10 @@ impl Decline for DrawExecutionDecline {
             }
             Self::StagingWriteBeyondSlot { size, slot_size } => vec![
                 ("size", size.to_string()),
+                ("slot_size", slot_size.to_string()),
+            ],
+            Self::ReadBackBeyondSlot { len, slot_size } => vec![
+                ("len", len.to_string()),
                 ("slot_size", slot_size.to_string()),
             ],
         }

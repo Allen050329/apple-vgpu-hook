@@ -2072,29 +2072,31 @@ mod content_hash_tests {
 }
 
 #[cfg(test)]
-mod staging_write_extent_tests {
-    use super::staging_write_fits;
+mod slot_span_extent_tests {
+    use super::slot_span_fits;
 
-    /// A staging write may reach the end of its slot and not one byte past it.
+    /// A slot span may reach the end of its slot and not one byte past it.
     ///
     /// The boundary is the whole test. `size == slot_size` is the common case —
     /// `acquire_staging` rounds the request up to a power-of-two bucket and
-    /// records the *bucket* as the slot's size, so an exact-bucket write is
-    /// every write that happens to land on one — and a check spelled `<` rather
-    /// than `<=` would refuse those while still passing any test that only
-    /// tried a clearly-too-large size.
+    /// records the *bucket* as the slot's size, so an exact-bucket span is every
+    /// one that lands on a bucket — and a check spelled `<` rather than `<=`
+    /// would refuse those while still passing any test that only tried a
+    /// clearly-too-large size. Both directions ask this one function, so a `<`
+    /// here would have broken every full-bucket staging write and every
+    /// full-bucket readback at once.
     #[test]
-    fn a_staging_write_may_fill_its_slot_and_not_pass_it() {
-        assert!(staging_write_fits(0, 64));
-        assert!(staging_write_fits(63, 64));
-        assert!(staging_write_fits(64, 64), "an exact-bucket write must fit");
-        assert!(!staging_write_fits(65, 64));
-        assert!(!staging_write_fits(u64::MAX, 64));
+    fn a_slot_span_may_fill_its_slot_and_not_pass_it() {
+        assert!(slot_span_fits(0, 64));
+        assert!(slot_span_fits(63, 64));
+        assert!(slot_span_fits(64, 64), "an exact-bucket write must fit");
+        assert!(!slot_span_fits(65, 64));
+        assert!(!slot_span_fits(u64::MAX, 64));
         // A slot of zero bytes takes no write. `acquire_staging` raises every
         // request to at least four, so this is unreachable through the pool —
         // it is here because the rule must not depend on that.
-        assert!(!staging_write_fits(1, 0));
-        assert!(staging_write_fits(0, 0));
+        assert!(!slot_span_fits(1, 0));
+        assert!(slot_span_fits(0, 0));
     }
 }
 
@@ -2148,14 +2150,20 @@ mod pool_trim_order_tests {
     }
 }
 
-/// Whether a slot of `slot_size` bytes can be written for `size` bytes.
+/// Whether a span of `size` bytes lies inside a slot of `slot_size` bytes.
 ///
-/// Split out from [`staging_write_ptr`] so the rule is reachable without a
-/// Vulkan device, which is the same reason `ContextOwner::note_init_failure` is
-/// its own function: it is the one part of that call that is a decision rather
-/// than a driver call, and the test below is the only thing that runs it on a
-/// host with no GPU.
-pub(crate) fn staging_write_fits(size: u64, slot_size: u64) -> bool {
+/// One rule for both directions. [`staging_write_ptr`] and [`read_back_slot`]
+/// have the same shape and had the same hole — a `vkMapMemory` arm the driver
+/// bounds and a persistent-mapping arm that inherits nothing — so they ask this
+/// one question rather than each spelling it, and a third rail added later
+/// cannot spell it differently.
+///
+/// Split out as a plain function so the rule is reachable without a Vulkan
+/// device, which is the same reason `ContextOwner::note_init_failure` is its
+/// own: it is the one part of either call that is a decision rather than a
+/// driver call, and the test below is the only thing that runs it on a host
+/// with no GPU.
+pub(crate) fn slot_span_fits(size: u64, slot_size: u64) -> bool {
     size <= slot_size
 }
 
@@ -2187,7 +2195,7 @@ unsafe fn staging_write_ptr(
     slot: &BufferSlot,
     size: u64,
 ) -> Result<*mut u8, DrawError> {
-    if !staging_write_fits(size, slot.size) {
+    if !slot_span_fits(size, slot.size) {
         return Err(DrawError::DrawExecution(
             super::draw_execution::DrawExecutionDecline::StagingWriteBeyondSlot {
                 size,
@@ -2238,6 +2246,17 @@ unsafe fn staging_write_ptr(
 ///
 /// `map_op` and `invalidate_op` stay per-rail so an exhaustion or a driver
 /// refusal still names which readback failed.
+///
+/// # The length is checked for the reason the write direction's is
+///
+/// The mirror holds all the way down, including the hole. `vkMapMemory` cannot
+/// map past its memory object, so the mapping arm is bounded by the driver; the
+/// persistent arm is a field read that inherits nothing, and
+/// `copy_mapped_output` then reads the full `len` from it. Reading past the slot
+/// is worse than writing past it in one respect — the bytes beyond belong to
+/// whatever the host slab carved next in the shared block, and they end up in a
+/// `Vec` this device hands back — so this refuses before the pointer is formed,
+/// on both arms, through [`slot_span_fits`].
 pub(super) unsafe fn read_back_slot(
     ctx: &DeviceContext,
     slot: &BufferSlot,
@@ -2245,6 +2264,14 @@ pub(super) unsafe fn read_back_slot(
     map_op: VkOp,
     invalidate_op: VkOp,
 ) -> Result<Vec<u8>, DrawError> {
+    if !slot_span_fits(len, slot.size) {
+        return Err(DrawError::DrawExecution(
+            super::draw_execution::DrawExecutionDecline::ReadBackBeyondSlot {
+                len,
+                slot_size: slot.size,
+            },
+        ));
+    }
     let persistent = slot.mapped != 0;
     let ptr = if persistent {
         slot.mapped as *const u8
