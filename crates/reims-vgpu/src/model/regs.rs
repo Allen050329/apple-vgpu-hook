@@ -553,8 +553,9 @@ pub const MMIO_U64: u32 = 8;
 /// the guest **above** the 4 it asked for. Apple's own host does not: it clamps
 /// down and never up, so a stock guest runs at rung 4 with `metalHeaps` and
 /// `bufferFromIOSurface` off. Raising it is therefore in-mechanism but
-/// out-of-contract, and it does not reach Metal's device families — see
-/// `AGENTS.md`, "What The Guest Driver Puts Out Of Reach".
+/// out-of-contract, and it does not reach Metal's device families: the guest's
+/// Metal plugin answers those from its own tables, not from anything this rung
+/// unlocks.
 pub const PROTOCOL_VERSION_MAX: u32 = 62;
 
 /// What this host writes back for a guest-requested protocol version.

@@ -339,11 +339,11 @@ pub(super) fn note_pass_extent_for_slot(
 
 /// Score the guest's stated pass extent against the attachment it names.
 ///
-/// This is the number the flush rail has been missing. The root `AGENTS.md`
-/// records that bounding a writeback by the *draw stream's* scissors saves
-/// nothing — 99.92 % of armed windows have a per-pass scissor union of 100 % —
-/// and concludes that "a damage-bounded flush needs a different source of damage
-/// than the draw stream, and none is currently decoded". `renderTargetWidth` and
+/// This is the number the flush rail has been missing. Bounding a writeback by
+/// the *draw stream's* scissors was measured to save nothing — 99.92 % of armed
+/// windows have a per-pass scissor union of 100 % — and the conclusion drawn
+/// then was that a damage-bounded flush needs a different source of damage than
+/// the draw stream, and that none is currently decoded. `renderTargetWidth` and
 /// `renderTargetHeight` are decoded now, and a driven boot shows the window
 /// server naming extents like 170x12 and 32x32 rather than the display's
 /// 1920x1080.
@@ -370,9 +370,9 @@ pub(super) fn note_pass_extent_for_slot(
 /// Two things follow, and both are conclusions rather than leads:
 ///
 /// - **There is nothing to bound.** The pass extent is not a second source of
-///   damage; it is the attachment's own geometry restated on the wire. The
-///   `AGENTS.md` conclusion that "a damage-bounded flush needs a different
-///   source of damage than the draw stream, and none is currently decoded"
+///   damage; it is the attachment's own geometry restated on the wire. That
+///   earlier conclusion — a damage-bounded flush needs a different source of
+///   damage than the draw stream, and none is currently decoded —
 ///   survives having this one decoded and measured. Do not re-open damage
 ///   bounding on the strength of the raw extent values in the fail log — they
 ///   look like damage and are not.

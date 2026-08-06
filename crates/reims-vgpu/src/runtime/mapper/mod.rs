@@ -611,8 +611,9 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
         // A guest kernel panic names a *physical page* (`pmap_page_protect()
         // ... pn=0x46b53b`), and nothing this device emitted could be compared
         // against it — so "did we write there?" was unanswerable, and the
-        // random-victim panic class in AGENTS.md stayed a signature with no way
-        // to confirm or clear this device. Every mapping-rail write is bounded
+        // random-victim panic class this project has recorded stayed a signature
+        // with no way to confirm or clear this device — see
+        // `observe::footprint`, which carries that account. Every mapping-rail write is bounded
         // to the page list adopted here, so the union of these spans over a boot
         // is exactly the set of pages those writes can reach. A `pn` inside it
         // is evidence; a `pn` outside every one of them exonerates the rail.
@@ -624,7 +625,8 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
         // incarnation, against an O(pages) table build that just ran.
         // Keyed on the ADOPTION, not on `pages_changed`. Two earlier cuts of
         // this line were silent for entire boots, and both were the
-        // instrument-the-branch trap from AGENTS.md committed by a change that
+        // branch-versus-arm trap `runtime::draw::vulkan`'s store-route reporter
+        // states, committed by a change that
         // cites it. The first logged only when a span resolved, so it could not
         // distinguish "no span" from "never ran". The second moved to
         // `pages_changed` on the reasoning that `map_gen` climbing past 100

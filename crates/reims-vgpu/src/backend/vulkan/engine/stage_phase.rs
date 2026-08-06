@@ -43,7 +43,7 @@
 //! per draw — a draw with many distinct vertex streams opens several. Measured
 //! against the sum: if `acquire + bytes + runs + swap + shift` starts exceeding
 //! `draw_phase`'s `stage_us`, the census is the difference and should be read as
-//! such. `AGENTS.md` records an audit that moved `land_us` 328 → 380 µs by
+//! such. An audit on this project once moved `land_us` from 328 to 380 µs by
 //! reading its own subject, so this is not hypothetical.
 
 use std::sync::atomic::{AtomicU64, Ordering};

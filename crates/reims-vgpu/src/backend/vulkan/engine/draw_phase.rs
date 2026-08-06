@@ -147,10 +147,10 @@
 //!
 //! The bytes are the finding. **842 MB/s of guest memory read into staging, at
 //! 2.34 MB per bind**, every second, for a Safari page that is only animating.
-//! `AGENTS.md` calls the render deferred-flush writeback "the single largest
-//! cost in the device" at ~1 GB/s into guest pages; this is a second rail of
-//! the same order running the other way, and it was undocumented because the
-//! arm that drives it was uncounted.
+//! The render deferred-flush writeback is this device's largest single cost at
+//! ~1 GB/s into guest pages — `AGENTS.md` says as much where it explains what
+//! retires that rail. This is a second rail of the same order running the other
+//! way, and it was undocumented because the arm that drives it was uncounted.
 //!
 //! Note what the constancy says: 360 and 842.4 MB repeat to the digit across
 //! all eight windows, so this is the *same* content re-gathered every frame

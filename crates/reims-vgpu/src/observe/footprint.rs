@@ -2,14 +2,18 @@
 //!
 //! # The question this exists to answer
 //!
-//! `AGENTS.md` records twelve guest kernel panics whose victims are unrelated
-//! subsystems — an apfs btree node, an ifnet function pointer, a HID driver's
-//! heap element, a malloc small-zone free list — several of them filled with
-//! `0xffffffffffffffff`, which is what opaque white BGRA looks like to a reader
-//! who is not expecting pixels. The standing reading is that some write of this
-//! device's landed at an address it did not own. That reading has never been
-//! more than a shape match, and the document says so in as many words: "This is
-//! a coincidence of shape, not an attribution."
+//! Twelve guest kernel panics have been recorded on this project whose victims
+//! are unrelated subsystems — an apfs btree node, an ifnet function pointer, a
+//! HID driver's heap element, a malloc small-zone free list — several of them
+//! filled with `0xffffffffffffffff`, which is what opaque white BGRA looks like
+//! to a reader who is not expecting pixels. The standing reading is that some
+//! write of this device's landed at an address it did not own. **That reading
+//! has never been more than a shape match**, and it must not be quoted as an
+//! attribution.
+//!
+//! That account used to be cited from the root `AGENTS.md`, which no longer
+//! carries findings; it is restated here because this module exists to settle
+//! it, and a reader who meets the citation and not the finding cannot.
 //!
 //! It stayed that way because nothing this device emitted could be compared
 //! against what a panic actually names. XNU's `pmap_page_protect` panic prints a
@@ -320,7 +324,10 @@ pub fn census_lines(now_ms: u64) -> Vec<String> {
     let kib = (pages << FRAME_SHIFT) / 1024;
     // Levels, not per-interval: running totals for the boot, unlike
     // `store_routes`. Summing them across census lines multiplies by the
-    // cadence — the 100x error AGENTS.md records.
+    // cadence, which is the error `AGENTS.md` describes for the opposite
+    // mistake — a per-window series read as a boot total. Both directions are
+    // wrong and neither is visible in the number, which is why the line says
+    // which kind it is.
     let mut out = vec![format!(
         "guest_write_footprint pages={pages} kib={kib} dropped={dropped} \
          frame_shift={FRAME_SHIFT} (levels, not per-interval)"
