@@ -2716,13 +2716,131 @@ fn a_decoded_record_that_no_arm_applies_names_what_happened_instead() {
         "an ICB execute naming no buffer loses the whole batch and must say so"
     );
     assert!(
-        acc.execute_icb.is_none(),
+        acc.execute_icb.is_empty(),
         "and still does not queue an execute against ref 0"
     );
 
     let log = std::fs::read_to_string(crate::observe::fail_log_path()).expect("fail log");
     assert!(log.contains("reason=render_scissor_empty_kept_previous"));
     assert!(log.contains("reason=render_icb_execute_unnamed"));
+}
+
+/// Every `executeCommandsInBuffer:` in a stream is kept, in stream order.
+///
+/// This is work, not state. The field behind it was an `Option` assigned with
+/// `=`, so the stream's capacity for these was one and a second record
+/// overwrote the first — the first ICB's commands never ran, and nothing
+/// counted it or logged it. A bound of one with no constant anywhere, which is
+/// why none of the five bound scans could see it.
+///
+/// Both wire forms are driven, because they reach the same field through
+/// different payloads: `0x14` names an args buffer whose contents carry the
+/// range, `0x15` carries the range literally.
+#[test]
+fn every_icb_execute_in_a_stream_is_kept_in_order() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let host = FakeHost::new();
+    let mut out = ExecResult::default();
+    let mut acc = StreamAccum::default();
+
+    // `0x14`: icb_ref @0, indirect_buffer_ref @4, indirect_buffer_offset @8.
+    let mut indirect = |icb: u32, args: u32, off: u64| {
+        let total = wire_render::EXECUTE_COMMANDS_INDIRECT_TOTAL_LEN as usize;
+        let op = wire_render::OPCODE_EXECUTE_COMMANDS_INDIRECT;
+        let mut command = vec![0u8; total];
+        st32(&mut command[0..], op);
+        st32(&mut command[4..], total as u32);
+        let p = reims_vgpu_wire::OP_HEADER_LEN;
+        st32(&mut command[p..], icb);
+        st32(&mut command[p + 4..], args);
+        st64(&mut command[p + 8..], off);
+        handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
+    };
+    indirect(7171, 5151, 0x1111);
+    indirect(7172, 5152, 0x2222);
+
+    // `0x15`: icb_ref @0, range_location @4, range_length @12 — unaligned
+    // after the ref, which is why it is its own struct rather than the above
+    // with a wider tail.
+    {
+        let total = wire_render::EXECUTE_COMMANDS_RANGE_TOTAL_LEN as usize;
+        let op = wire_render::OPCODE_EXECUTE_COMMANDS_RANGE;
+        let mut command = vec![0u8; total];
+        st32(&mut command[0..], op);
+        st32(&mut command[4..], total as u32);
+        let p = reims_vgpu_wire::OP_HEADER_LEN;
+        st32(&mut command[p..], 7173);
+        st64(&mut command[p + 4..], 0x1100);
+        st64(&mut command[p + 12..], 0x2200);
+        handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
+    }
+
+    let refs: Vec<u32> = acc.execute_icb.iter().map(|e| e.icb_ref).collect();
+    assert_eq!(
+        refs,
+        vec![7171, 7172, 7173],
+        "three executes went in and the stream must hold three, in the order \
+         the guest wrote them"
+    );
+    assert!(!acc.execute_icb[0].is_range, "0x14 is the indirect form");
+    assert_eq!(acc.execute_icb[0].args_buffer_ref, 5151);
+    assert_eq!(acc.execute_icb[0].args_buffer_offset, 0x1111);
+    assert_eq!(acc.execute_icb[1].args_buffer_ref, 5152);
+    assert!(acc.execute_icb[2].is_range, "0x15 is the literal-range form");
+    assert_eq!(acc.execute_icb[2].range_location, 0x1100);
+    assert_eq!(acc.execute_icb[2].range_length, 0x2200);
+}
+
+/// The pass opens once, so only the first execute in it may clear.
+///
+/// Each ICB execute opens its own host pass over the same attachments. Leaving
+/// the stream's `CLEAR` on the later ones re-runs the clear inside what Metal
+/// treats as one pass, wiping whatever the execute before it drew — the same
+/// failure the multi-draw chain describes at `di > 0` and forces `LOAD` for.
+#[test]
+fn a_later_icb_execute_opens_its_pass_with_load() {
+    let slots = vec![
+        (
+            0u32,
+            ColorAttachment {
+                texture_ref: 11,
+                load_action: MTL_LOAD_ACTION_CLEAR,
+                store_action: MTL_STORE_ACTION_STORE,
+                clear_color: [0.25, 0.5, 0.75, 1.0],
+                ..Default::default()
+            },
+        ),
+        (
+            1u32,
+            ColorAttachment {
+                texture_ref: 12,
+                load_action: crate::contract::pass_action::MTL_LOAD_ACTION_DONT_CARE,
+                store_action: MTL_STORE_ACTION_STORE,
+                clear_color: [0.0; 4],
+                // A second attachment whose action is *not* CLEAR, so the
+                // helper is shown rewriting every slot rather than only the
+                // one that would have re-cleared.
+                slice: 3,
+                ..Default::default()
+            },
+        ),
+    ];
+    let loading = color_slots_loading(&slots);
+    assert_eq!(loading.len(), slots.len(), "no attachment is dropped");
+    for ((slot, att), (orig_slot, orig)) in loading.iter().zip(slots.iter()) {
+        assert_eq!(slot, orig_slot, "the slot index is the pass's, not an index");
+        assert_eq!(att.load_action, MTL_LOAD_ACTION_LOAD);
+        // Everything else is the stream's own. The clear colour in particular
+        // is carried rather than blanked: it is unread on this path, and a
+        // zero here would be an invented value in a decoded record.
+        assert_eq!(att.texture_ref, orig.texture_ref);
+        assert_eq!(att.store_action, orig.store_action);
+        assert_eq!(att.clear_color, orig.clear_color);
+        assert_eq!(att.slice, orig.slice);
+        assert_eq!(att.level, orig.level);
+        assert_eq!(att.depth_plane, orig.depth_plane);
+        assert_eq!(att.resolve_texture_ref, orig.resolve_texture_ref);
+    }
 }
 
 /// A buffer-offset record that lands on nothing says so, both ways.

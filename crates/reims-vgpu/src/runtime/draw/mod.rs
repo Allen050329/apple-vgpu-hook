@@ -3716,6 +3716,21 @@ pub fn writeback_chain_rgba<M: HostMemory + HostOps>(
 }
 
 /// Builds without a Metal encode path have no host ICB to execute.
+///
+/// **Every `executeCommandsInBuffer:` on the Vulkan arm lands here and is
+/// lost.** That is two of the three first-class pathways, so this is a gap in
+/// the rail rather than a portability footnote — it is fail-visible (the
+/// caller turns `NoMetal` into a `render_icb` refusal, latched per ICB ref)
+/// and it is still the guest's draws not running.
+///
+/// It has never been measured firing: `icb_exec_seen` reads zero on every
+/// driven x86 boot taken so far, most recently a 25-second Safari window drag.
+/// So the argument for building it is contract, not a reading.
+///
+/// What it would take: [`crate::runtime::icb::fill_icb_from_command_memory`]
+/// already decodes an ICB's command memory for the Metal arm, so the missing
+/// half is replaying those decoded commands as draws through the Vulkan
+/// engine rather than a second decoder.
 #[cfg(feature = "backend-vulkan")]
 pub fn encode_icb_execute_and_writeback<M: HostMemory + HostOps>(
     _state: &mut DeviceState,

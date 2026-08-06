@@ -124,8 +124,14 @@ struct StreamAccum {
     /// All draws in stream order (archive multi-draw job).
     draws: Vec<PendingDraw>,
     saw_draw: bool,
-    /// Last render ICB execute (`0x14`/`0x15`) in this stream.
-    execute_icb: Option<RenderIcbExecute>,
+    /// Every render ICB execute (`0x14`/`0x15`) in this stream, in stream
+    /// order.
+    ///
+    /// A list rather than a latch because `executeCommandsInBuffer:` is work,
+    /// not state: a second record does not replace the first, it asks for a
+    /// second execution. See the loop that drains this in [`finish_stream`] for
+    /// what a capacity of one used to cost.
+    execute_icb: Vec<RenderIcbExecute>,
     vertex_buffers: BindTable<BufferBind>,
     fragment_buffers: BindTable<BufferBind>,
     vertex_textures: BindTable<TextureBind>,
@@ -1851,7 +1857,7 @@ fn handle_render_record<M: HostMemory + HostOps>(
                 note_unnamed_icb_execute(task_id, &cmd);
                 return;
             }
-            acc.execute_icb = Some(RenderIcbExecute {
+            acc.execute_icb.push(RenderIcbExecute {
                 icb_ref: cmd.indirect_command_buffer_ref,
                 is_range: cmd.icb_is_range,
                 range_location: cmd.icb_range_location,
@@ -2730,10 +2736,29 @@ fn finish_stream<M: HostMemory + HostOps>(
     // decode on speculation rather than on decoded fields.
     //
     // arm64 is unmeasured; these are x86 / Vulkan readings only.
-    if acc.execute_icb.is_some() {
+    //
+    // # A stream may ask for several, and every one of them runs
+    //
+    // `executeCommandsInBuffer:` is not a state a later record replaces — it is
+    // work, and Metal's ordinary ICB shape is one buffer per object batch, so
+    // several in one encoder is the expected case rather than the odd one.
+    // This used to be an `Option` assigned with `=`, which made the stream's
+    // capacity for them **one**: a second record overwrote the first and the
+    // first's commands never ran, with no counter and no line. That is a bound
+    // with no constant to name it, which is why none of the five bound scans
+    // could see it.
+    //
+    // The list is bounded by the stream the way [`StreamDrawDrop`] describes
+    // for `draws`: a record has a minimum encoded length, so the count cannot
+    // exceed the stream bytes already in memory.
+    //
+    // Records 2+ open their pass with `MTL_LOAD_ACTION_LOAD` and no clears.
+    // Each execute writes back before the next builds its request, so the LOAD
+    // seed is the previous execute's output — the clear belongs to the pass,
+    // which began at the first one, and re-running it would wipe what the ICB
+    // before it drew.
+    for (icb_index, exec) in acc.execute_icb.iter().enumerate() {
         crate::runtime::drain::note_store_route("icb_exec_seen");
-    }
-    if let Some(exec) = &acc.execute_icb {
         if !acc.color_slots.is_empty() {
             // `mrt_draw_request` gates on a non-zero pipeline ref, and an
             // ICB-only execute has none in the stream — its PSO lives inside
@@ -2766,15 +2791,18 @@ fn finish_stream<M: HostMemory + HostOps>(
                     },
                 )
             };
-            let req = draw::mrt_draw_request(
-                state,
-                host,
-                task_id,
-                pipeline,
-                &acc.color_slots,
-                &acc.clears,
-                args,
-            );
+            // The first execute opens the pass, so it takes the stream's load
+            // actions and its clears. Every later one composites onto what the
+            // pass already holds.
+            let loading_slots;
+            let (slots, clears): (&[(u32, ColorAttachment)], &[ColorAttachment]) =
+                if icb_index == 0 {
+                    (&acc.color_slots, &acc.clears)
+                } else {
+                    loading_slots = color_slots_loading(&acc.color_slots);
+                    (&loading_slots, &[])
+                };
+            let req = draw::mrt_draw_request(state, host, task_id, pipeline, slots, clears, args);
             // ICB execute inherits stream bind state at end of stream, and both
             // branches below inherit the same six tables — the last draw's
             // snapshot is those tables as they stood when it was recorded, and
@@ -2812,7 +2840,13 @@ fn finish_stream<M: HostMemory + HostOps>(
                             ));
                             out.render_icb_fail += 1;
                             dirty_color_targets(state, host, task_id, &acc.color_targets);
-                            return;
+                            // `continue`, not `return`. One execute whose range
+                            // could not be read is one execute lost; it says
+                            // nothing about the next one's args buffer, and it
+                            // used to abandon the whole packet — including the
+                            // stream's own draws below — because there could
+                            // only ever be one of these.
+                            continue;
                         }
                     }
                 };
@@ -3197,6 +3231,35 @@ enum MultiDrawChainSource {
     Resident,
     Cpu,
     Missing,
+}
+
+/// The same colour slots, opening with `LOAD` instead of whatever the stream
+/// asked for.
+///
+/// One render pass has one load action per attachment, taken when the pass
+/// begins. This device opens a fresh host pass per ICB execute, so the second
+/// and later ones have to be told that their pass is a continuation — the
+/// alternative is a `CLEAR` re-running mid-pass and wiping what the execute
+/// before it drew, which is the same failure the multi-draw chain describes at
+/// `di > 0`.
+///
+/// The clear colour is carried through untouched. It is not read on the `LOAD`
+/// path, and blanking it here would put an invented value in the record that a
+/// later reader of the request would have no way to distinguish from a decoded
+/// one.
+fn color_slots_loading(slots: &[(u32, ColorAttachment)]) -> Vec<(u32, ColorAttachment)> {
+    slots
+        .iter()
+        .map(|&(slot, att)| {
+            (
+                slot,
+                ColorAttachment {
+                    load_action: MTL_LOAD_ACTION_LOAD,
+                    ..att
+                },
+            )
+        })
+        .collect()
 }
 
 fn multi_draw_chain_source(resident_chain: bool, cpu_chain_ready: bool) -> MultiDrawChainSource {
