@@ -374,7 +374,14 @@ struct Type11Texture {
     /// Byte offset of this texture/plane in the mapping allocation.
     surface_offset: u64,
     /// IOSurface-aligned surface row stride (bytes).
-    row_stride: u64,
+    ///
+    /// `u32` to match both ends it sits between: `type11_sample_window` and
+    /// `type5_sample_window` each return it as one, and its only readers hand
+    /// it to [`mapping_write::SurfaceWindow::bpr`], which is one. It was `u64`,
+    /// so both construction sites widened and both readers narrowed straight
+    /// back — a round trip that reads exactly like an unchecked truncation of a
+    /// 64-bit guest field and has been mistaken for one.
+    row_stride: u32,
     /// Exclusive end of the sample window (for page-span planning).
     span_end: u64,
     bpp: u32,
@@ -730,7 +737,7 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
             width: tex_w,
             height: tex_h,
             surface_offset,
-            row_stride: surface_bpr as u64,
+            row_stride: surface_bpr,
             span_end,
             bpp,
             pixel_format: format,
@@ -817,7 +824,7 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
             width: view.width,
             height: view.height,
             surface_offset,
-            row_stride: surface_bpr as u64,
+            row_stride: surface_bpr,
             span_end,
             bpp,
             pixel_format: format,
@@ -1014,7 +1021,7 @@ fn read_texture_row<M: HostMemory + HostOps>(
                 t.mapping_id,
                 mapping_write::SurfaceWindow {
                     base_off: t.surface_offset,
-                    bpr: t.row_stride as u32,
+                    bpr: t.row_stride,
                     span_end: t.span_end,
                     bpp: t.bpp,
                 },
@@ -1110,7 +1117,7 @@ fn write_texture_row<M: HostMemory + HostOps>(
                 t.mapping_id,
                 mapping_write::SurfaceWindow {
                     base_off: t.surface_offset,
-                    bpr: t.row_stride as u32,
+                    bpr: t.row_stride,
                     span_end: t.span_end,
                     bpp: t.bpp,
                 },

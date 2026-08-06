@@ -954,8 +954,8 @@ fn type5_ref_texture_resolves_as_type11_blit_backing() {
             assert_eq!((t.width, t.height), (w, h), "view geometry, not base");
             assert_eq!(t.pixel_format, fmt);
             assert_eq!(t.bpp, bytes_per_pixel(fmt).unwrap());
-            assert!(t.row_stride >= (w as u64) * (t.bpp as u64));
-            assert!(t.span_end >= t.row_stride * (h as u64));
+            assert!(u64::from(t.row_stride) >= u64::from(w) * u64::from(t.bpp));
+            assert!(t.span_end >= u64::from(t.row_stride) * u64::from(h));
         }
         TextureBacking::Linear(_) => panic!("expected Type11 backing, got Linear"),
     }
