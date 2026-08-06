@@ -909,6 +909,10 @@ impl ResourcePools {
                 // draw while holding it is not the same thing as the heap being
                 // full. Once only, and only for this result — a retry on a
                 // driver error that is not about memory would just fail twice.
+                //
+                // Here rather than inside `bind_image_slab`, where one wrapper
+                // would cover every allocation site. That was tried and it
+                // segfaults — see `reclaim_for_allocation_retry`.
                 Err(error) if error.out_of_memory() => {
                     let given_back = self.reclaim_for_allocation_retry(ctx, counters);
                     match (given_back > 0)
@@ -1622,14 +1626,40 @@ impl ResourcePools {
     /// every `bind_image_slab` caller and the sampled-image bind has no retry, so
     /// seven draws died there as `linux_m2v_draw reason=vk_pools_bind_sampled`
     /// `vk_result=A_device_memory_allocation_has_failed`, at geometries up to
-    /// 1920x1080. That is the measured argument for extending the retry to the
-    /// other allocation sites, and also the reason it was not simply done here:
-    /// this site inherits its safety from `evict_registry_to_cap`, which already
-    /// retires residents at this exact point in `registry_ensure_color`. The
-    /// sampled and storage binds have no such precedent, and reclaiming under
-    /// them could recycle an image the command buffer being recorded still
-    /// references. That analysis is the work, not the wiring.
-    unsafe fn reclaim_for_allocation_retry(
+    /// 1920x1080.
+    ///
+    /// # It cannot be hoisted into `bind_image_slab`, and that is measured too
+    ///
+    /// Those seven look like an argument for one wrapper around
+    /// `bind_image_slab`, covering every allocation site at once. **That was
+    /// implemented and it segfaults QEMU**, on the same injected boot, ~27 s in.
+    /// It does remove the class it was aimed at — zero draws lost to the injected
+    /// failure, against seven — and then the process dies, so the fix is worse
+    /// than the bug.
+    ///
+    /// The reasoning that said it was safe is wrong in one specific way, and it
+    /// is worth stating because it is convincing: [`ResourcePools::dispose`]
+    /// parks a retired resident in the graveyard whenever `open_slot_mask` is
+    /// non-zero, and that mask counts the *recording* batch's slot, so a resident
+    /// released mid-draw cannot be handed back to a later allocation in the same
+    /// draw. True — but it only holds once a batch is open. The sampled binds run
+    /// early in `execute_draw_inner`, before the batch exists, so the mask can be
+    /// **0** there and `dispose` destroys immediately. The caller is by then
+    /// holding raw `vk::Image`/`vk::ImageView` handles for the target it resolved
+    /// and the residents it is about to sample, and the reclaim frees them under
+    /// it.
+    ///
+    /// This site is safe for a reason that does not generalise: it runs inside
+    /// `registry_ensure_color`, at the same point `evict_registry_to_cap` has
+    /// always retired residents, before the caller holds anything and before any
+    /// sampled source has been resolved.
+    ///
+    /// So extending the recovery to the other sites is not a wiring change. It
+    /// needs the reclaim to know what the in-progress draw is holding — either by
+    /// shielding those identities the way `protect` already shields one, or by
+    /// opening the batch before the first allocation so the graveyard gate is
+    /// armed for the whole draw. Neither is attempted here.
+    pub(super) unsafe fn reclaim_for_allocation_retry(
         &mut self,
         ctx: &DeviceContext,
         counters: &EngineCounters,
