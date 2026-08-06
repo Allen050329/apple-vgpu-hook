@@ -1536,3 +1536,119 @@ fn the_shared_ladder_names_the_rung_that_refused() {
         Err(LadderRung::DescRead { declared_len: 0x20 })
     );
 }
+
+/// A re-point over a ref-keyed host copy drops that copy, so the next resolve
+/// reads the pages the guest just rewired instead of bytes read from the old
+/// ones.
+///
+/// `ReplacePhysical` says by its own contract that the PFNs under this object
+/// have changed. The mapping rail discharges that through
+/// `invalidate_mapping_pages`, but `host_texture_surfaces` and
+/// `host_linear_textures` are keyed by object-list ref and carry no page list,
+/// so nothing in them can notice — and this device holds a copy under exactly
+/// those keys for ids no mapping owns. Measured on a driven x86/PCI boot under
+/// `web-content-probe`: 7 texture and 1 linear against 32 that held nothing, so
+/// the guest was being served stale content on an ordinary browsing workload.
+///
+/// Fails without the fix: both entries survive the packet.
+#[test]
+fn a_repoint_drops_the_ref_keyed_host_copies_of_the_object() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+    let (task, object) = (7u32, 4242u32);
+
+    state.host_texture_surfaces.insert(
+        object,
+        crate::model::HostSurface {
+            width: 4,
+            height: 4,
+            bgra: std::sync::Arc::new(vec![0xAB; 4 * 4 * 4]),
+            host_gen: 1,
+            producer_object_type: 0,
+            last_touch: 0,
+            backing: None,
+            guest_holds_bytes: false,
+            source_gva: 0,
+        },
+    );
+    state.host_linear_textures.insert(
+        (task, object),
+        crate::model::HostLinearTexture {
+            gva: 0x1000,
+            pixel_format: 0,
+            width: 4,
+            height: 4,
+            row_stride: 16,
+            bytes: vec![0xCD; 64],
+            host_gen: 1,
+            resident_gen: 0,
+        },
+    );
+    // No mapping owns the id, which is the route this covers: three quarters of
+    // the re-points on a driven boot take it.
+    assert!(!state.mappings.contains_key(&object));
+
+    super::replace_physical(&mut state, &mut host, task, object);
+
+    assert!(
+        !state.host_texture_surfaces.contains_key(&object),
+        "the ref-keyed texture copy was read from pages the guest has re-pointed"
+    );
+    assert!(
+        !state.host_linear_textures.contains_key(&(task, object)),
+        "the ref-keyed linear copy was read from pages the guest has re-pointed"
+    );
+}
+
+/// A re-point that reaches nothing changes nothing, and does not invent a
+/// removal for a neighbouring ref.
+///
+/// The counterpart to the test above and the reason the repair is keyed on
+/// `(task, ref)` rather than on the ref alone for the linear map: 32 of 40
+/// re-points on the measured boot held no state at all, and one that started
+/// evicting its neighbours would turn a benign majority into a new loss.
+#[test]
+fn a_repoint_of_an_object_this_device_holds_nothing_for_touches_no_neighbour() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+    let (task, object, neighbour) = (7u32, 4242u32, 4243u32);
+
+    state.host_linear_textures.insert(
+        (task, neighbour),
+        crate::model::HostLinearTexture {
+            gva: 0x1000,
+            pixel_format: 0,
+            width: 4,
+            height: 4,
+            row_stride: 16,
+            bytes: vec![0xCD; 64],
+            host_gen: 1,
+            resident_gen: 0,
+        },
+    );
+    // The same ref under a different task must also survive.
+    state.host_linear_textures.insert(
+        (task + 1, object),
+        crate::model::HostLinearTexture {
+            gva: 0x2000,
+            pixel_format: 0,
+            width: 4,
+            height: 4,
+            row_stride: 16,
+            bytes: vec![0xEF; 64],
+            host_gen: 1,
+            resident_gen: 0,
+        },
+    );
+
+    super::replace_physical(&mut state, &mut host, task, object);
+
+    assert!(
+        state.host_linear_textures.contains_key(&(task, neighbour)),
+        "a different ref in the same task is a different object"
+    );
+    assert!(
+        state.host_linear_textures.contains_key(&(task + 1, object)),
+        "the same ref in a different task is a different object"
+    );
+}

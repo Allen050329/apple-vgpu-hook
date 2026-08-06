@@ -2735,13 +2735,40 @@ impl DeviceState {
     pub fn delete_object(&mut self, task_id: u32, ref_: u32) -> bool {
         let removed = self.objects.remove(&(task_id, ref_));
         if removed {
-            self.host_texture_surfaces.remove(&ref_);
-            if let Some(e) = self.host_linear_textures.remove(&(task_id, ref_)) {
-                self.retire_linear_resident(task_id, ref_, &e);
-            }
+            self.invalidate_object_host_copies(task_id, ref_);
             self.texture_to_mapping.remove(&(task_id, ref_));
         }
         removed
+    }
+
+    /// Drop this device's ref-keyed host copies of an object's *contents*, for a
+    /// packet saying the guest memory under it has changed. Returns which of the
+    /// two held something, `(texture, linear)`.
+    ///
+    /// The two caches this covers are keyed by object-list ref rather than by
+    /// mapping id, and neither carries a page list, so nothing in them can
+    /// notice that the pages they were read from are no longer the object's.
+    /// `invalidate_mapping_pages` is the same obligation on the mapping rail; a
+    /// packet that reaches only one of the two rails still has to discharge it
+    /// on that one.
+    ///
+    /// Contents only. The object stays alive, and so does its `texture_to_mapping`
+    /// association — a re-point moves the bytes, it does not unname the resource.
+    /// [`Self::delete_object`] takes both halves and calls this for its first.
+    ///
+    /// A live linear resident goes through [`Self::retire_linear_resident`], so
+    /// it is unpinned and its deferred window dropped rather than left to write
+    /// pixels read from the old pages into the new ones.
+    pub fn invalidate_object_host_copies(&mut self, task_id: u32, ref_: u32) -> (bool, bool) {
+        let had_texture = self.host_texture_surfaces.remove(&ref_).is_some();
+        let had_linear = match self.host_linear_textures.remove(&(task_id, ref_)) {
+            Some(e) => {
+                self.retire_linear_resident(task_id, ref_, &e);
+                true
+            }
+            None => false,
+        };
+        (had_texture, had_linear)
     }
 
     /// Bump [`MappingEntry::map_generation`] (never 0 after first bump).

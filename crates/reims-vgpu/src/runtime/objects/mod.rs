@@ -1631,12 +1631,29 @@ pub fn replace_physical<H: HostMemory + crate::runtime::host::HostOps>(
 /// the re-point had anything to invalidate. It only settles that the *mapping*
 /// rail had nothing.
 ///
-/// The counters split three ways, because the three call for different repairs:
-/// `_unmapped_no_state` is a re-point of a resource this device holds nothing
-/// for, which is genuinely a no-op — the first resolve of that ref will read the
-/// page table the guest has already rewritten. `_unmapped_texture_cache` and
-/// `_unmapped_linear_cache` are re-points over a host copy that stays trusted,
-/// which is the loss.
+/// The counters split three ways. `_unmapped_no_state` is a re-point of a
+/// resource this device holds nothing for, which is genuinely a no-op — the
+/// first resolve of that ref will read the page table the guest has already
+/// rewritten. `_unmapped_texture_invalidated` and `_unmapped_linear_invalidated`
+/// are the re-points that reached a live host copy, and they now name a repair
+/// rather than a loss.
+///
+/// They used to be `_unmapped_texture_cache` / `_unmapped_linear_cache` and to
+/// count only. A host copy whose pages the guest has re-pointed is a copy of
+/// memory that is no longer the object's, and leaving it trusted served the
+/// guest a stale frame from bytes it had already rewired — with nothing refusing
+/// and nothing to read but these two counters. That is what they were added to
+/// measure, and they measured it: a driven x86/PCI boot under
+/// `web-content-probe` read 7 and 1 against 32 no-state, so the class is live on
+/// an ordinary browsing workload rather than theoretical.
+///
+/// `invalidate_object_host_copies` is the discharge, and it is the same one
+/// `delete_object` has always performed for the same two maps — the difference
+/// being that a delete also unnames the object while a re-point only moves its
+/// bytes. Kept fail-visible after the repair so the reliance stays measurable;
+/// a rising count is now this device correctly following the guest, and its
+/// disappearance would mean the packet stopped arriving, not that the bug was
+/// fixed twice.
 ///
 /// The guest's own object list supplies the type, which is the only authority on
 /// what the id names: `lookup_list_entry` reads it at use time and this device
@@ -1644,22 +1661,21 @@ pub fn replace_physical<H: HostMemory + crate::runtime::host::HostOps>(
 /// because the interesting reading is which types show up at all, and that is a
 /// small set a boot enumerates in a handful of lines.
 fn note_replace_physical_unmapped<M: HostMemory>(
-    state: &DeviceState,
+    state: &mut DeviceState,
     host: &M,
     task_id: u32,
     object_id: u32,
 ) {
     let object_type = lookup_list_entry(state, host, task_id, object_id).map(|e| e.object_type);
-    let texture_cache = state.host_texture_surfaces.contains_key(&object_id);
-    let linear_cache = state
-        .host_linear_textures
-        .contains_key(&(task_id, object_id));
+    // Read by taking, not by asking: the re-point says these pages are no longer
+    // the object's, so a copy read from them cannot go on answering for it.
+    let (texture_cache, linear_cache) = state.invalidate_object_host_copies(task_id, object_id);
     crate::runtime::drain::note_store_route("replace_physical_unknown_object");
     if texture_cache {
-        crate::runtime::drain::note_store_route("replace_physical_unmapped_texture_cache");
+        crate::runtime::drain::note_store_route("replace_physical_unmapped_texture_invalidated");
     }
     if linear_cache {
-        crate::runtime::drain::note_store_route("replace_physical_unmapped_linear_cache");
+        crate::runtime::drain::note_store_route("replace_physical_unmapped_linear_invalidated");
     }
     if !texture_cache && !linear_cache {
         crate::runtime::drain::note_store_route("replace_physical_unmapped_no_state");
@@ -1675,8 +1691,8 @@ fn note_replace_physical_unmapped<M: HostMemory>(
             .unwrap_or_else(|| "absent".to_string());
         crate::observe::fail(format!(
             "replace_physical_unknown_object task={task_id} object={object_id} \
-             obj_type={kind} tex_cache={} lin_cache={} \
-             (no mapping owns this id; the re-point reached no page list)",
+             obj_type={kind} tex_dropped={} lin_dropped={} \
+             (no mapping owns this id; ref-keyed host copies dropped)",
             texture_cache as u8, linear_cache as u8
         ));
     }
