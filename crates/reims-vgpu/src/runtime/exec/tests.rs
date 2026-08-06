@@ -1395,8 +1395,11 @@ fn a_bind_after_a_draw_does_not_rewrite_that_draws_snapshot() {
             stage: Stage::Vertex,
             class: BindClass::Buffer,
         },
-        &mut acc.vertex_buffers,
-        &mut acc.fragment_buffers,
+        BindTables {
+            vertex: &mut acc.vertex_buffers,
+            fragment: &mut acc.fragment_buffers,
+            refused: &mut acc.refused_bind,
+        },
         |b| b.index,
         |index, (buffer_ref, offset)| {
             Some(BufferBind {
@@ -3552,5 +3555,110 @@ fn every_declared_command_buffer_is_visited_not_just_the_first_sixteen() {
             .iter()
             .any(|l| l.contains(&format!("i={}", N_CB - 1))),
         "the final declared command buffer was never reached: {visited:?}"
+    );
+}
+
+/// A bind the stream's tables could not hold refuses the draws that read it,
+/// and leaves the ones recorded before it alone.
+///
+/// The walk has always stopped at the first slot past its class's argument
+/// table and said so. What followed was the bug: the six tables kept the state
+/// they could represent, and every later draw in the stream was encoded against
+/// it — a frame computed from state the guest never asked for, with nothing
+/// downstream able to notice, because a shader that does not sample the missing
+/// slot is indistinguishable from one whose bind landed.
+///
+/// [`crate::runtime::draw::first_bind_past_table`] cannot cover this and says
+/// so: it reads the six tables of a built request, and the refused bind is
+/// exactly the one that never entered them.
+///
+/// Driven through `handle_render_record` for all three records rather than by
+/// setting the field, because the field is bookkeeping and the refusal is the
+/// behaviour. The three assertions that matter are separate on purpose — a
+/// refusal that also dropped the earlier draw would pass a test that only
+/// counted the later one.
+#[test]
+fn a_bind_past_the_table_refuses_the_draws_that_would_read_it() {
+    use crate::runtime::drain::store_route_count;
+
+    /// Past Apple's buffer table and past this device's, which are the same
+    /// number — see the `const` assertion beside [`BindClass`].
+    const FIRST: u32 = MAX_BUFFER_BIND_SLOTS + 4;
+
+    let draw = |acc: &mut StreamAccum| {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let host = FakeHost::new();
+        let mut out = ExecResult::default();
+        let mut command = vec![0u8; 0x20];
+        let op = wire_render::OPCODE_DRAW_INDEXED_WIDE;
+        st32(&mut command[0..], op);
+        st32(&mut command[4..], 0x20);
+        st16(&mut command[8..], 3);
+        st32(&mut command[12..], 0x3e);
+        st32(&mut command[16..], 6);
+        handle_render_record(&mut state, &host, 1, op, &command, &mut out, acc);
+    };
+
+    let mut acc = StreamAccum {
+        pipeline_ref: 61,
+        ..Default::default()
+    };
+    draw(&mut acc);
+    assert_eq!(
+        acc.draws.len(),
+        1,
+        "a draw with complete bind state is recorded"
+    );
+    assert!(acc.bind_snapshot().is_ok());
+
+    // One buffer bind whose whole run sits past the table.
+    let entry = render::BUFFER_BIND_ENTRY_SIZE;
+    let total = reims_vgpu_wire::OP_HEADER_LEN + render::BIND_ENTRIES + entry;
+    let mut command = vec![0u8; total];
+    let op = wire_render::OPCODE_SET_VERTEX_BUFFER;
+    st32(&mut command[0..], op);
+    st32(&mut command[4..], total as u32);
+    st32(
+        &mut command[reims_vgpu_wire::OP_HEADER_LEN + render::BIND_FIRST..],
+        FIRST,
+    );
+    st32(
+        &mut command[reims_vgpu_wire::OP_HEADER_LEN + render::BIND_COUNT..],
+        1,
+    );
+    st32(
+        &mut command[reims_vgpu_wire::OP_HEADER_LEN + render::BIND_ENTRIES..],
+        0x4444,
+    );
+    {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let host = FakeHost::new();
+        let mut out = ExecResult::default();
+        handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
+    }
+
+    let over = acc
+        .refused_bind
+        .expect("the walk recorded the bind it could not hold");
+    assert_eq!(over.index, FIRST);
+    assert!(matches!(over.class, BindClass::Buffer));
+    assert!(acc.bind_snapshot().is_err());
+
+    let before = store_route_count("render_draw_refused_bind_past_table");
+    draw(&mut acc);
+    assert_eq!(
+        acc.draws.len(),
+        1,
+        "the draw after the refused bind is not recorded"
+    );
+    assert_eq!(
+        store_route_count("render_draw_refused_bind_past_table"),
+        before + 1,
+        "and the refusal is counted"
+    );
+
+    assert_eq!(
+        acc.draws[0].pipeline_ref, 61,
+        "the draw recorded before the refused bind still stands"
     );
 }

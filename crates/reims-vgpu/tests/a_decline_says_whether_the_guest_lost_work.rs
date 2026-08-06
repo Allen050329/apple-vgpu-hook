@@ -98,7 +98,7 @@ struct Row {
 /// How many types may answer [`Loss::ExecutedModified`].
 ///
 /// Not a budget. A ratchet: see [`the_executed_modified_census_only_shrinks`].
-const EXECUTED_MODIFIED_CEILING: usize = 11;
+const EXECUTED_MODIFIED_CEILING: usize = 10;
 
 /// Every `impl Decline`/`impl Refusal` in the crate, and what its worst arm
 /// costs the guest.
@@ -658,13 +658,15 @@ const ROWS: &[Row] = &[
     Row {
         file: "crates/reims-vgpu/src/runtime/exec/mod.rs",
         ty: "BindSlotPastTable",
-        loss: Loss::ExecutedModified,
-        why: "the bind loop breaks at the first slot past the table, so the \
-              rest of a plural bind record never lands and the draws that \
-              follow run against the partial state. All three tables now meet \
-              or exceed Apple's own, so a firing is a record Apple's serializer \
-              cannot emit — retired by refusing that record rather than by \
-              widening anything",
+        loss: Loss::Refused,
+        why: "the bind loop still breaks at the first slot past the table — \
+              there is no slot to put it in — but it now records the bind on \
+              `StreamAccum::refused_bind`, and `bind_snapshot` refuses both \
+              consumers of the stream's bind state: a decoded draw and an \
+              end-of-stream ICB execute. Draws recorded before it snapshotted \
+              tables that were still complete and still stand. All three tables \
+              meet or exceed Apple's own, so a firing is a record Apple's \
+              serializer cannot emit",
     },
     Row {
         file: "crates/reims-vgpu/src/runtime/exec/mod.rs",

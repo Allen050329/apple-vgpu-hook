@@ -140,17 +140,57 @@ struct StreamAccum {
     /// Draw records this stream decoded but did not keep. See
     /// [`StreamDrawDrop`]; reported once per stream by [`note_stream_draw_drops`].
     dropped_unbound: u32,
+    /// A bind this stream's tables could not hold, and so do not carry.
+    ///
+    /// [`apply_binds`] stops a record's walk at the first slot past its class's
+    /// argument table — forced, there is no slot to put it in — and that used to
+    /// be the whole of it: the walk broke, the six tables kept the state they
+    /// could represent, and every later draw in the stream ran against it. The
+    /// guest was never told, and nothing downstream could tell it: a fragment
+    /// shader that does not sample the missing texture is indistinguishable from
+    /// one whose bind landed, so the frame comes back looking finished and is
+    /// wrong.
+    ///
+    /// [`crate::runtime::draw::first_bind_past_table`] cannot catch that. It
+    /// reads the six tables of a built request, and this bind is precisely the
+    /// one that never entered them — which is why that check calls itself a
+    /// backstop and why the refusal has to be recorded here instead.
+    ///
+    /// Recording it lets [`StreamAccum::bind_snapshot`] refuse. That is the
+    /// funnel both consumers of the stream's bind state pass through — a decoded
+    /// draw and an end-of-stream ICB execute — which is why the refusal lives
+    /// there and not in either backend's encoder.
+    ///
+    /// **Sticky, and it cannot go stale.** There is no retirement path and none
+    /// is needed: this field describes the six bind tables beside it, a
+    /// `StreamAccum` is built fresh per stream and dropped at [`finish_stream`],
+    /// so the refusal and the state it describes have exactly the same life. The
+    /// compute rail's equivalent needs a `clear_refusal_at` because a
+    /// `ComputeAccum` outlives many dispatches; a render pass's bind state does
+    /// not outlive the pass.
+    refused_bind: Option<BindSlotPastTable>,
 }
 
 impl StreamAccum {
-    /// The stream's bind state as a `PendingDraw`, with no pipeline and no
-    /// draw call attached.
+    /// The stream's bind state as a `PendingDraw`, or the bind that makes it
+    /// unrepresentable.
     ///
     /// Two things need it and must not disagree: a decoded draw, which fills
     /// in `pipeline_ref` and `draw` on top, and an ICB execute, which inherits
-    /// the state as it stands at end of stream and supplies neither.
-    fn bind_snapshot(&self) -> PendingDraw {
-        PendingDraw {
+    /// the state as it stands at end of stream and supplies neither. Both must
+    /// also refuse on the same terms, which is why the check is here rather than
+    /// at either of them: a snapshot of tables that are missing a bind the guest
+    /// asked for is not this stream's state, and a draw encoded from it computes
+    /// the wrong pixels with nothing to say so.
+    ///
+    /// Draws recorded *before* the refused bind are untouched. They snapshotted
+    /// tables that were still complete, so they are the guest's own work and
+    /// they stand; only the ones that would read the gap are refused.
+    fn bind_snapshot(&self) -> Result<PendingDraw, BindSlotPastTable> {
+        if let Some(refused) = self.refused_bind {
+            return Err(refused);
+        }
+        Ok(PendingDraw {
             indexed: self.indexed.clone(),
             vertex_buffers: self.vertex_buffers.clone(),
             fragment_buffers: self.fragment_buffers.clone(),
@@ -169,7 +209,7 @@ impl StreamAccum {
             depth_attach: self.depth_attach,
             stencil_attach: self.stencil_attach,
             ..Default::default()
-        }
+        })
     }
 }
 
@@ -1341,8 +1381,11 @@ fn handle_render_record<M: HostMemory + HostOps>(
                     stage: cmd.stage,
                     class: BindClass::Buffer,
                 },
-                &mut acc.vertex_buffers,
-                &mut acc.fragment_buffers,
+                BindTables {
+                    vertex: &mut acc.vertex_buffers,
+                    fragment: &mut acc.fragment_buffers,
+                    refused: &mut acc.refused_bind,
+                },
                 |b| b.index,
                 |index, (buffer_ref, offset)| {
                     (buffer_ref != 0).then_some(BufferBind {
@@ -1402,8 +1445,11 @@ fn handle_render_record<M: HostMemory + HostOps>(
                     stage: cmd.stage,
                     class: BindClass::Texture,
                 },
-                &mut acc.vertex_textures,
-                &mut acc.fragment_textures,
+                BindTables {
+                    vertex: &mut acc.vertex_textures,
+                    fragment: &mut acc.fragment_textures,
+                    refused: &mut acc.refused_bind,
+                },
                 |b| b.index,
                 |index, texture_ref| {
                     if texture_ref == 0 {
@@ -1446,8 +1492,11 @@ fn handle_render_record<M: HostMemory + HostOps>(
                     stage: cmd.stage,
                     class: BindClass::Sampler,
                 },
-                &mut acc.vertex_samplers,
-                &mut acc.fragment_samplers,
+                BindTables {
+                    vertex: &mut acc.vertex_samplers,
+                    fragment: &mut acc.fragment_samplers,
+                    refused: &mut acc.refused_bind,
+                },
                 |b| b.index,
                 |index, sampler_ref| {
                     (sampler_ref != 0).then_some(SamplerBind { index, sampler_ref })
@@ -1684,17 +1733,20 @@ fn handle_render_record<M: HostMemory + HostOps>(
             if acc.pipeline_ref == 0 || count == 0 {
                 acc.dropped_unbound = acc.dropped_unbound.saturating_add(1);
             } else {
-                acc.draws.push(PendingDraw {
-                    pipeline_ref: acc.pipeline_ref,
-                    draw: DrawArgs {
-                        vertex_count: count,
-                        instance_count: cmd.instance_count,
-                        primitive_type: cmd.primitive_type,
-                        first_vertex: cmd.vertex_start,
-                        base_instance: cmd.base_instance,
-                    },
-                    ..acc.bind_snapshot()
-                });
+                match acc.bind_snapshot() {
+                    Ok(snapshot) => acc.draws.push(PendingDraw {
+                        pipeline_ref: acc.pipeline_ref,
+                        draw: DrawArgs {
+                            vertex_count: count,
+                            instance_count: cmd.instance_count,
+                            primitive_type: cmd.primitive_type,
+                            first_vertex: cmd.vertex_start,
+                            base_instance: cmd.base_instance,
+                        },
+                        ..snapshot
+                    }),
+                    Err(over) => note_draw_refused_past_table(over, acc.pipeline_ref, "draw"),
+                }
             }
         }
         RenderKind::ExecuteCommands => {
@@ -2186,6 +2238,28 @@ impl crate::observe::Decline for BindSlotPastTable {
     }
 }
 
+/// Report a draw refused because the stream's bind tables are missing a slot.
+///
+/// The same [`BindSlotPastTable`] the walk already emitted, re-emitted under a
+/// different tag: the walk's line says a bind was lost, this one says what the
+/// loss then cost, and the two share a slug on purpose so one grep finds both
+/// halves of one event.
+///
+/// Latched per refused slot, not per draw. A stream that binds past the table
+/// once refuses every draw after it, and the second line carries nothing the
+/// first did not; `render_draw_refused_bind_past_table` is the magnitude.
+///
+/// `site` separates the two consumers of the stream's bind state, because what
+/// the guest loses differs: a decoded draw loses one draw, and an ICB execute
+/// loses whatever the command buffer held.
+fn note_draw_refused_past_table(over: BindSlotPastTable, pipeline_ref: u32, site: &'static str) {
+    crate::runtime::drain::note_store_route("render_draw_refused_bind_past_table");
+    crate::observe::Emit::decline("render_draw", &over)
+        .field("site", site)
+        .field("pipeline_ref", pipeline_ref)
+        .fail_once((u64::from(over.stage as u32) << 32) | u64::from(over.index));
+}
+
 // The three relations that make each `*_bind_slot_past_table` slug readable in a
 // driven boot's census, pinned at build time because both sides can move
 // independently: a new macOS serializer can change Apple's argument tables, and
@@ -2233,6 +2307,21 @@ struct BindTarget {
     class: BindClass,
 }
 
+/// The [`StreamAccum`] state one bind record writes: the two stage tables a
+/// slot may land in, and the place a slot that lands in neither is recorded.
+///
+/// The three travel as one because they are written together and no caller has
+/// a reason to pass two of them. They are also three disjoint fields of one
+/// accumulator, which is what lets a caller hand out all three at once.
+struct BindTables<'a, B> {
+    vertex: &'a mut BindTable<B>,
+    fragment: &'a mut BindTable<B>,
+    /// Where [`apply_binds`] leaves a slot past [`BindClass::table`]. See
+    /// [`StreamAccum::refused_bind`] for why it is recorded rather than only
+    /// counted.
+    refused: &'a mut Option<BindSlotPastTable>,
+}
+
 /// Apply one `Set{Buffer,Texture,Sampler}` record to a stage's bind table.
 ///
 /// All three carry the same wire form: `count` consecutive slots starting at
@@ -2252,12 +2341,16 @@ fn apply_binds<T: Copy, B: Clone>(
     entries: &[T],
     first: u32,
     target: BindTarget,
-    vertex: &mut BindTable<B>,
-    fragment: &mut BindTable<B>,
+    tables: BindTables<'_, B>,
     slot: impl Fn(&B) -> u32,
     mut make: impl FnMut(u32, T) -> Option<B>,
 ) -> u32 {
     let BindTarget { stage, class } = target;
+    let BindTables {
+        vertex,
+        fragment,
+        refused,
+    } = tables;
     // Once per record, before the walk, so it reports what the guest asked for
     // rather than what survived the bound. An empty entry list is not a request
     // and `first` alone is not a reach.
@@ -2315,16 +2408,20 @@ fn apply_binds<T: Copy, B: Clone>(
             // how much. See [`BindSlotPastTable`].
             let slots = (entries.len() - i) as u32;
             crate::runtime::drain::note_store_route_n(class.past_table_route(), u64::from(slots));
-            crate::observe::Emit::decline(
-                "render_bind_overflow",
-                &BindSlotPastTable {
-                    class,
-                    stage,
-                    index,
-                    slots,
-                },
-            )
-            .fail_once((u64::from(stage as u32) << 32) | u64::from(index));
+            let over = BindSlotPastTable {
+                class,
+                stage,
+                index,
+                slots,
+            };
+            crate::observe::Emit::decline("render_bind_overflow", &over)
+                .fail_once((u64::from(stage as u32) << 32) | u64::from(index));
+            // The walk cannot refuse anything — a bind record has no draw to
+            // refuse — so it records, and [`StreamAccum::bind_snapshot`] refuses
+            // every draw that would have read the gap. The first one is kept
+            // rather than the last: it is the bind whose absence the earliest
+            // later draw would read, and the rest are the same record.
+            refused.get_or_insert(over);
             break;
         }
         let bind = make(index, entry);
@@ -2453,12 +2550,21 @@ fn finish_stream<M: HostMemory + HostOps>(
                 &acc.clears,
                 args,
             );
-            if let Some(mut req) = req {
-                // ICB execute inherits stream bind state at end of stream.
+            // ICB execute inherits stream bind state at end of stream, and both
+            // branches below inherit the same six tables — the last draw's
+            // snapshot is those tables as they stood when it was recorded, and
+            // nothing between then and here can have refilled a slot the walk
+            // refused. So a bind the tables could not hold is asked about once,
+            // ahead of both, rather than only on the second branch.
+            let inherited = acc.bind_snapshot();
+            if let Err(over) = inherited {
+                out.render_icb_fail += 1;
+                note_draw_refused_past_table(over, pipeline, "icb_execute");
+            } else if let (Some(mut req), Ok(snapshot)) = (req, inherited) {
                 if let Some(pd) = acc.draws.last() {
                     fill_draw_binds_from_pending(&mut req, pd);
                 } else {
-                    fill_draw_binds_from_pending(&mut req, &acc.bind_snapshot());
+                    fill_draw_binds_from_pending(&mut req, &snapshot);
                 }
                 let (loc, len) = if exec.is_range {
                     (exec.range_location, exec.range_length)
