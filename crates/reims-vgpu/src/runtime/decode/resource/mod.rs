@@ -2064,12 +2064,39 @@ pub fn decode_render_pipeline_descriptor(
     Ok(out)
 }
 
-/// A colour-attachment TLV field this decoder does not read.
+/// A colour-attachment TLV field this decoder does not read, and the pipeline
+/// it refuses.
 ///
-/// The entry is `[field_count][tag][len][value…]*` and ten tags are consumed:
-/// the entry's own index (`COLOR_ATTACHMENT_TAG_INDEX`) and the nine properties
-/// of `MTLRenderPipelineColorAttachmentDescriptor`. Anything else is a field
-/// the guest serialized and we dropped on the floor.
+/// The entry is `[field_count][tag][len][value…]*` and the consumed tags are
+/// exactly `0x00..=0x09`: the entry's own index (`COLOR_ATTACHMENT_TAG_INDEX`)
+/// and the nine properties of `MTLRenderPipelineColorAttachmentDescriptor`, in
+/// the order `MTLRenderPipeline.h` declares them. So the consumed set is not a
+/// subset this device chose — it is the whole descriptor, and an eleventh tag is
+/// a property the decoder has no name for.
+///
+/// # Why this refuses rather than building the pipeline anyway
+///
+/// It used to emit this line and continue, so the pipeline was built with
+/// Metal's default wherever the guest had set something else. That is the same
+/// wrong-content-over-refusal trade this file already rejected twice in
+/// `parse_one_color_entry` alone — for an attachment index past the table, and
+/// for a write mask wider than four bits — and both rejections give the reason:
+/// there is no second-best. A property is either the one the guest serialized or
+/// it is a guess, and a guess reaches the frame with nothing to say it was one.
+///
+/// The refusal is not deduped even though the line is. `first_sight` latches the
+/// emission so a repeating unknown tag names itself once; every pipeline
+/// carrying one is still refused, because a refusal that fired once and then let
+/// the same descriptor through would be worse than never refusing.
+///
+/// # What licenses it
+///
+/// A bare zero would not. `type7_color_attach_shape` is the sibling that fires:
+/// it reports every entry's tag sequence and stars the unread ones, and across
+/// every driven boot in the record it appears 4–13 times per boot, each one
+/// `unconsumed=0`, over the tag set `00,01,02,04,07`. So the walk runs on a live
+/// guest, reads the tags, and this guest sends none outside the descriptor. The
+/// zero is measured rather than unreached, which is what makes refusing safe.
 struct ColorAttachDropped {
     tag: u8,
 }
@@ -2159,9 +2186,9 @@ const COLOR_ATTACH_DROP_VALUE_CAP: u32 = 64;
 ///
 /// Pipeline descriptors are decoded once per distinct pipeline and cached, so
 /// this walk is not on a per-draw path.
-fn note_color_entry_fields(bytes: &[u8], entry: usize, slot: u32) {
+fn note_color_entry_fields(bytes: &[u8], entry: usize, slot: u32) -> Result<(), DecodeStatus> {
     if entry >= bytes.len() {
-        return;
+        return Ok(());
     }
     let field_count = bytes[entry] as usize;
     let mut p = entry + 1;
@@ -2204,6 +2231,7 @@ fn note_color_entry_fields(bytes: &[u8], entry: usize, slot: u32) {
             dropped.len()
         ));
     }
+    let unread = !dropped.is_empty();
     for (tag, field_len, value) in dropped {
         let keyed_value = if value <= COLOR_ATTACH_DROP_VALUE_CAP {
             u64::from(value)
@@ -2220,6 +2248,12 @@ fn note_color_entry_fields(bytes: &[u8], entry: usize, slot: u32) {
             .field("value", value)
             .fail();
     }
+    // Outside the loop, so the refusal does not inherit `first_sight`'s latch:
+    // the line names a tag once, the pipeline is refused every time.
+    if unread {
+        return Err(DecodeStatus::ErrUnsupported("res_color_field_unread"));
+    }
+    Ok(())
 }
 
 /// `position` is the entry's index in the section's offset table, used only
@@ -2264,7 +2298,7 @@ fn parse_one_color_entry(
         }
         None => position,
     };
-    note_color_entry_fields(bytes, entry, slot);
+    note_color_entry_fields(bytes, entry, slot)?;
     let mut out = PipelineColorAttachment {
         slot,
         src_rgb: BLEND_FACTOR_ONE,

@@ -1607,11 +1607,17 @@ fn a_colour_attachment_slot_past_the_array_refuses_instead_of_taking_a_position(
     );
 }
 
-/// A colour-attachment field this decoder does not read is guest intent
-/// dropped, and the shape line beside it is what makes a boot with *no*
-/// drops readable as a measurement rather than as silence.
+/// A colour-attachment field this decoder does not read refuses the pipeline,
+/// and the shape line beside it is what makes a boot with *no* drops readable
+/// as a measurement rather than as silence.
+///
+/// This test used to `.expect("a well-formed table decodes")` and assert only
+/// that the drop was reported. Reporting is not the bar: the ten consumed tags
+/// are the whole of `MTLRenderPipelineColorAttachmentDescriptor`, so an
+/// eleventh is a property this decoder cannot place, and building the pipeline
+/// without it puts Metal's default where the guest set its own.
 #[test]
-fn an_unconsumed_colour_attachment_field_reports_its_tag_and_value() {
+fn an_unconsumed_colour_attachment_field_refuses_the_pipeline() {
     use crate::contract::endian::st32;
     use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     // A tag no other test in this process uses, so `first_sight` cannot
@@ -1632,13 +1638,12 @@ fn an_unconsumed_colour_attachment_field_reports_its_tag_and_value() {
     st32(&mut buf[entry + 9..], UNKNOWN_VALUE);
 
     let cap = crate::observe::FailCapture::start();
-    let all = parse_color_attachments(&buf, buf.len(), off).expect("a well-formed table decodes");
-    let lines = cap.lines();
-    // The consumed field still decodes; the census does not disturb it.
     assert_eq!(
-        all.first().map(|c| c.pixel_format),
-        Some(u32::from(MTL_FORMAT_BGRA8_UNORM))
+        parse_color_attachments(&buf, buf.len(), off),
+        Err(DecodeStatus::ErrUnsupported("res_color_field_unread")),
+        "a tag outside the descriptor is refused, not defaulted"
     );
+    let lines = cap.lines();
 
     let shape: Vec<&String> = lines
         .iter()
@@ -1667,11 +1672,15 @@ fn an_unconsumed_colour_attachment_field_reports_its_tag_and_value() {
         drop[0]
     );
 
-    // Latched: a second identical entry reports neither line again. `resume`,
-    // not `start`: the claim the window above made is the thing under test, and
-    // `start` would clear it and see both lines a second time.
+    // The line is latched and the refusal is not. `resume`, not `start`: the
+    // claim the window above made is the thing under test, and `start` would
+    // clear it and see both lines a second time.
     let cap2 = crate::observe::FailCapture::resume();
-    let _ = parse_color_attachments(&buf, buf.len(), off);
+    assert_eq!(
+        parse_color_attachments(&buf, buf.len(), off),
+        Err(DecodeStatus::ErrUnsupported("res_color_field_unread")),
+        "every pipeline carrying the tag is refused, not just the first"
+    );
     assert!(
         cap2.lines().is_empty(),
         "the census is deduped per shape and per (tag, len, value): {:?}",

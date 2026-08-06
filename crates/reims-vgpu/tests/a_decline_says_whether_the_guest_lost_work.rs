@@ -98,7 +98,7 @@ struct Row {
 /// How many types may answer [`Loss::ExecutedModified`].
 ///
 /// Not a budget. A ratchet: see [`the_executed_modified_census_only_shrinks`].
-const EXECUTED_MODIFIED_CEILING: usize = 9;
+const EXECUTED_MODIFIED_CEILING: usize = 8;
 
 /// Every `impl Decline`/`impl Refusal` in the crate, and what its worst arm
 /// costs the guest.
@@ -512,11 +512,18 @@ const ROWS: &[Row] = &[
     Row {
         file: "crates/reims-vgpu/src/runtime/decode/resource/mod.rs",
         ty: "ColorAttachDropped",
-        loss: Loss::ExecutedModified,
-        why: "a colour-attachment field is discarded and parsing continues, so \
-              the attachment is built without the value the guest set. Retired \
-              by refusing the pipeline as `ColorAttachIndexOutOfRange` beside \
-              it already does",
+        loss: Loss::Refused,
+        why: "a colour-attachment TLV tag outside `0x00..=0x09`. Those ten are \
+              the entry's index plus every property of \
+              `MTLRenderPipelineColorAttachmentDescriptor`, so an eleventh is a \
+              property this decoder has no name for, and the pipeline is refused \
+              `res_color_field_unread` rather than built with Metal's default \
+              where the guest set its own. It used to report and continue. What \
+              licensed the change is the sibling that fires: \
+              `type7_color_attach_shape` appears 4-13 times on every driven boot \
+              in the record, each `unconsumed=0`, so this zero is measured and \
+              not unreached. The line stays `first_sight`-latched and the \
+              refusal does not",
     },
     Row {
         file: "crates/reims-vgpu/src/runtime/decode/resource/mod.rs",

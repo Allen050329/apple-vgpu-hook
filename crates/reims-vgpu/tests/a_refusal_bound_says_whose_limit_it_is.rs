@@ -360,12 +360,23 @@ const ROWS: &[Row] = &[
               same basis `wire::ops::bind_limit::SAMPLER` carries.",
     },
     Row {
-        at: "reims-vgpu/src/runtime/decode/resource/mod.rs:2471",
+        at: "reims-vgpu/src/runtime/decode/resource/mod.rs:2505",
         bound: "MAX_COLOR_ATTACHMENTS",
         verdict: Verdict::WireField,
         why: "The declared colour-attachment count against the width of the slot \
               array in Apple's serialized record, which is the same eight Metal \
               itself stops at.",
+    },
+    Row {
+        at: "reims-vgpu/src/runtime/decode/resource/mod.rs:2269",
+        bound: "MAX_COLOR_ATTACHMENTS",
+        verdict: Verdict::WireField,
+        why: "The same eight, one entry down: the guard admits a declared slot \
+              inside the array and the arm beside it refuses `res_color_slot_over` \
+              rather than aliasing the entry onto its table position. New to this \
+              population because the function it guards now returns `Err` for a \
+              second reason — an unread attachment tag — and not because the \
+              bound moved.",
     },
     Row {
         at: "reims-vgpu/src/runtime/mipmap.rs:222",
