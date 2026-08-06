@@ -36,10 +36,19 @@
 //!
 //! A boot cannot answer it. An eviction path that never fires on the workload
 //! anyone drives reads exactly like one that fires and costs nothing — the
-//! target pool's cap of 32 has never been observed to bind, and that is not
-//! evidence about what happens when it does. Source also answers for both
-//! backends at once: the Vulkan sites are `#[cfg]`-ed out of the Metal build and
-//! vice versa, so no single compilation sees them all.
+//! target pool's cap of 32 is the standing example, and that its evictions were
+//! never seen is not evidence about what happens when they do. Source also
+//! answers for both backends at once: the Vulkan sites are `#[cfg]`-ed out of
+//! the Metal build and vice versa, so no single compilation sees them all.
+//!
+//! That example used to read "has never been observed to bind", which was
+//! stronger than the evidence: the pool's occupancy had one sampling point,
+//! `vulkan_guest_reset`, and it fires when the pool is empty by construction.
+//! `TARGET_POOL_MAX_ENTRIES` now carries `target_pool_depth_*` bands taken where
+//! the cap is consulted and a `target_pool_evict` count, so the reach is a
+//! reading. **What this test asserts is unchanged** — a cost per site, from
+//! source — because a measured reach still cannot say what an eviction costs,
+//! and a cap that does not bind today is one workload away from binding.
 
 mod source_scan;
 use source_scan::{guest_facing_sources, is_bound};

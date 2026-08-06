@@ -1896,6 +1896,13 @@ impl ResourcePools {
         render_pass: vk::RenderPass,
         counters: &EngineCounters,
     ) -> Result<&TargetSlot, DrawError> {
+        // Band the pool's occupancy on **every** call, hit or miss, and before
+        // anything can return. Sited here rather than beside the cap because a
+        // band taken after the hit early-return counts only misses, and a zero
+        // from it then means either "never called" or "always hit" — two states
+        // a reader cannot separate, which is the sampling-point trap this exists
+        // to escape. Taken here, a zero means the function did not run.
+        crate::runtime::drain::note_store_route(target_pool_depth_band(self.target_order.len()));
         let map_key = (key, render_pass.as_raw());
         if self.targets.contains_key(&map_key) {
             return Ok(self.targets.get(&map_key).unwrap());
@@ -1979,10 +1986,15 @@ impl ResourcePools {
             }
         };
         counters.note_create();
-        // Cap target pool
-        if self.target_order.len() >= 32 {
+        if self.target_order.len() >= TARGET_POOL_MAX_ENTRIES {
             if let Some(old_k) = self.target_order.first().cloned() {
                 if let Some(old) = self.targets.remove(&old_k) {
+                    // Counted, not logged. The eviction costs a re-create and
+                    // nothing else — the key is geometry plus render pass, so
+                    // this slot is scratch and holds no guest resource's content
+                    // — but an uncounted eviction is one nobody can rank against
+                    // the re-creates it causes.
+                    crate::runtime::drain::note_store_route("target_pool_evict");
                     self.dispose(&ctx.device, DeferredHandle::Framebuffer(old.framebuffer));
                     self.dispose(
                         &ctx.device,
@@ -2394,6 +2406,68 @@ fn sampled_evict_route(len: usize, bytes: usize) -> Option<&'static str> {
         Some("sampled_evict_byte_cap")
     } else {
         None
+    }
+}
+
+/// Which quarter of [`TARGET_POOL_MAX_ENTRIES`] the scratch target pool is
+/// occupying, as a census route name.
+///
+/// The bands are quarters of the cap rather than fixed sizes, so a change to the
+/// cap moves them with it and a series taken before the change stays comparable
+/// in the only terms that matter — how close the pool came to its bound. Split
+/// out from `acquire_target` so the naming is testable without a device: that
+/// function is `unsafe` and takes a live `DeviceContext`, and an instrument
+/// nobody can test is one whose zero nobody should believe.
+fn target_pool_depth_band(len: usize) -> &'static str {
+    let quarter = TARGET_POOL_MAX_ENTRIES / 4;
+    if len < quarter {
+        "target_pool_depth_q1"
+    } else if len < quarter * 2 {
+        "target_pool_depth_q2"
+    } else if len < quarter * 3 {
+        "target_pool_depth_q3"
+    } else {
+        "target_pool_depth_q4"
+    }
+}
+
+#[cfg(test)]
+mod target_pool_band_tests {
+    use super::*;
+
+    /// Each quarter, at both of its ends. A band that is right in the middle and
+    /// wrong at a boundary reads as working for as long as the pool stays shallow.
+    #[test]
+    fn each_band_covers_its_quarter_of_the_cap() {
+        let q = TARGET_POOL_MAX_ENTRIES / 4;
+        assert_eq!(target_pool_depth_band(0), "target_pool_depth_q1");
+        assert_eq!(target_pool_depth_band(q - 1), "target_pool_depth_q1");
+        assert_eq!(target_pool_depth_band(q), "target_pool_depth_q2");
+        assert_eq!(target_pool_depth_band(q * 2 - 1), "target_pool_depth_q2");
+        assert_eq!(target_pool_depth_band(q * 2), "target_pool_depth_q3");
+        assert_eq!(target_pool_depth_band(q * 3 - 1), "target_pool_depth_q3");
+        assert_eq!(target_pool_depth_band(q * 3), "target_pool_depth_q4");
+    }
+
+    /// The band the cap acts in must be the top one, or a boot could sit at the
+    /// bound and report headroom.
+    #[test]
+    fn the_band_at_the_cap_is_the_top_one() {
+        assert_eq!(
+            target_pool_depth_band(TARGET_POOL_MAX_ENTRIES),
+            "target_pool_depth_q4"
+        );
+        assert_eq!(
+            target_pool_depth_band(TARGET_POOL_MAX_ENTRIES - 1),
+            "target_pool_depth_q4"
+        );
+        // Past the cap is not reachable — `acquire_target` evicts down to it —
+        // but a band that stopped naming the top quarter there would be a silent
+        // hole if it ever were.
+        assert_eq!(
+            target_pool_depth_band(TARGET_POOL_MAX_ENTRIES * 4),
+            "target_pool_depth_q4"
+        );
     }
 }
 

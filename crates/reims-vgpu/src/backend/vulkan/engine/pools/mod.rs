@@ -1393,6 +1393,58 @@ const TARGET_FREE_CAP_PER_KEY: usize = 4;
 /// **Global** cap on `target_free` across all keys — same diverse-burst reasoning
 /// as `SAMPLED_FREE_CAP_TOTAL`.
 const TARGET_FREE_CAP_TOTAL: usize = 32;
+/// Live entries in the scratch target pool `targets`, past which
+/// `acquire_target` evicts the oldest and destroys its image, view and
+/// framebuffer.
+///
+/// **What the eviction costs is settled; what the number should be is not.**
+/// `an_eviction_says_what_it_costs` records this site as `Cost::Recomputable`,
+/// and the key is why: `(TargetKey, render_pass)` is geometry plus pass
+/// identity, carrying no guest resource id, so a slot here is scratch for one
+/// draw rather than any resource's content. Evicting one costs an image
+/// creation, never a pixel.
+///
+/// The number was a bare `32` written inline with the comment `// Cap target
+/// pool`, and no basis for it survives anywhere. It is left at 32 deliberately:
+/// moving a bound whose reach has never been measured trades one arbitrary
+/// number for another, and this one is at least the number every boot so far
+/// ran on.
+///
+/// **The reach is now measurable and was not before.** The pool's occupancy had
+/// exactly one sampling point, `vulkan_guest_reset`'s `pooled_targets=`, which
+/// fires at guest reset when the pool is empty by construction — so its zero was
+/// an artifact of where it was sampled, and reading it as "the cap never binds"
+/// is the trap `AGENTS.md` names. `acquire_target` now bands the occupancy on
+/// entry — `target_pool_depth_q1..q4`, quarters of this constant, so a series
+/// taken before a change to it stays comparable in the terms that matter — and
+/// counts each eviction as `target_pool_evict`. Band the requested reach from a
+/// driven boot before moving this.
+///
+/// The band is on entry rather than beside the cap on purpose: taken after the
+/// hit early-return it would count only misses, and its zero would mean either
+/// "never called" or "always hit", which a reader cannot separate. Taken on
+/// entry, **all four bands reading zero means the function did not run**.
+///
+/// **First reading, driven x86/PCI boot, web-content probe: all four bands
+/// absent.** Not zero — absent, the route never appearing in any of the 71
+/// census windows, while `mrt_draw_single` summed 21642 over 58 of them. So the
+/// engine drew hard and `acquire_target` was never called once: on this workload
+/// every draw takes the resident-target path and this pool is never populated at
+/// all. The cap does not merely fail to bind; there is nothing for it to bind.
+///
+/// That is a narrower claim than it looks. It is one workload on one pathway,
+/// and it says nothing about the arm/Metal pathway or about a guest that drives
+/// the `else` branch in `exec.rs` — a draw with no resident target. Anyone
+/// moving this number needs a workload that reaches here first, because on the
+/// evidence available today the number is unexercised rather than adequate.
+///
+/// One property to weigh when it is moved: the eviction is **FIFO, not LRU** —
+/// `target_order.first()` is the oldest *created*, not the least recently used.
+/// If the cap ever binds, a hot geometry that was created early is evicted
+/// while still in use every frame, and then re-created and pushed to the back.
+/// That is a thrash rather than a cache, and it is a policy question the bands
+/// above are what decide is worth answering.
+const TARGET_POOL_MAX_ENTRIES: usize = 32;
 /// Max recycled transient compute-storage images retained per geometry key in
 /// `storage_image_free`. Same reuse logic as the render recycle pools: a
 /// same-geometry compute dispatch reuses a pooled image instead of a fresh
