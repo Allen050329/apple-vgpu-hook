@@ -77,7 +77,61 @@ const _: () = assert!(
     crate::runtime::spirv_bind::SAMPLER_BINDING_BASE + MAX_COMPUTE_SAMPLER_SLOTS
         <= crate::runtime::spirv_bind::COLOR_INPUT_BINDING_BASE
 );
-/// Cap on threadgroup-memory indices (plan `REIMS_VGPU_COMPUTE_PLAN_MAX_THREADGROUP_MEMORY`).
+
+// The three caps above hold the same three measured numbers as
+// `reims_vgpu_wire::ops::bind_limit`, and until this gate nothing compared them.
+// `bind_limit`'s own module doc says the truncation "is a property of the
+// stage's argument table, not of an encoder" and names
+// `compute_set_textures_over_bind_limit`, `compute_set_buffers_over_bind_limit`
+// and `compute_set_samplers_over_bind_limit` as the captures it was read from —
+// so these are compute-rail measurements, not render ones borrowed.
+//
+// Only one direction is a bug. A cap **below** Apple's table is guest work this
+// device refuses: `ComputeBindOverflow` reports it, but a dispatch still runs
+// missing that bind, and the render rail already carries the identical gate
+// (`exec::apply_binds`' three `const` assertions) for the identical fact. A cap
+// **above** it is headroom, which costs nothing and is why this is `<=` rather
+// than the render rail's `==` — the other direction, a slot this device accepts
+// but cannot name in the descriptor band, is what the two assertions directly
+// above already refuse.
+//
+// A drift here would otherwise surface only as dropped compute binds on a live
+// guest, with correct-looking output everywhere the kernel happened not to read
+// the missing slot.
+const _: () = assert!(reims_vgpu_wire::ops::bind_limit::BUFFER <= MAX_COMPUTE_BUFFER_SLOTS);
+const _: () = assert!(reims_vgpu_wire::ops::bind_limit::TEXTURE <= MAX_COMPUTE_TEXTURE_SLOTS);
+const _: () = assert!(reims_vgpu_wire::ops::bind_limit::SAMPLER <= MAX_COMPUTE_SAMPLER_SLOTS);
+/// Cap on threadgroup-memory indices.
+///
+/// # This number has no derivation on record, and it is the only cap here without one
+///
+/// Its three siblings above each read from a measurement:
+/// [`reims_vgpu_wire::ops::bind_limit`] captured Apple's serializer truncating a
+/// plural bind at 128 textures, 31 buffers and 16 samplers, and the `const`
+/// assertions above hold this device to those. There is no fourth capture, and
+/// the technique cannot produce one — `setThreadgroupMemoryLength:atIndex:` is a
+/// *singular* selector, so the serializer never truncates a range for it. That is
+/// why the gap survived: nothing that measured the other three was ever going to
+/// measure this.
+///
+/// So 16 is safe in one direction and unjustified in the other:
+///
+/// * **Safe against the abort.** `backend::metal::compute::bind_threadgroup_memory`
+///   passes the index straight to `setThreadgroupMemoryLength:atIndex:` with no
+///   guard of its own, so this constant is the *only* thing between a decoded
+///   guest index and a Metal call that answers an out-of-range index by aborting
+///   the process. Any bound at or below Metal's real table is correct here, and
+///   a low one is the conservative error.
+/// * **Unjustified as a ceiling.** Nothing on record says Metal's threadgroup
+///   memory argument table *ends* at 16, so a kernel binding threadgroup memory
+///   above slot 15 loses that bind. It is not silent — [`ComputeBindOverflow`]'s
+///   `Threadgroup` arm reports it on the fail channel, and a reading there is the
+///   evidence that would settle this — but a dispatch does run missing the
+///   allocation the kernel expects.
+///
+/// What would settle it is a capture of a guest kernel binding threadgroup memory
+/// at a high index, read the way `bind_limit` was read. Until then the counter is
+/// the instrument; do not raise the number to fit a guess about the table's size.
 pub const MAX_THREADGROUP_MEMORY_SLOTS: u32 = 16;
 /// `MTLDispatchThreadgroupsIndirectArguments` = three `uint32_t` (12 bytes).
 pub const INDIRECT_THREADGROUPS_ARGS_LEN: usize = 12;
