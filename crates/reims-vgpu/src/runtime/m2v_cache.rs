@@ -9,7 +9,8 @@
 //!
 //! The cache key is the AIR blob itself plus its stage — not the pipeline object
 //! id, which recycles, and not a hash of the AIR, which can collide. A content
-//! hash narrows the bucket; [`Slot::is`] decides the hit. See [`ShaderId`].
+//! hash narrows the bucket and `Slot::is` decides the hit; `ShaderId` carries
+//! the argument for why the digest is not allowed to.
 //! Measure-only hit/miss counters for fail-log census.
 
 use std::collections::{HashMap, VecDeque};

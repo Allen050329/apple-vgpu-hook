@@ -40,18 +40,43 @@ pub struct FnEntry {
 /// that cache. This cache meets that description and uses 64 bits of non-keyed
 /// FNV-1a. Neither site knew about the other.
 ///
-/// Recorded rather than fixed, deliberately. The fix is a behaviour change on a
-/// pathway no Linux host can boot, and half of it is worse than none: a second
-/// fold added at the producer but missed at one of the sites that build a key
-/// through [`RenderPsoKey::default`] would make two paths' keys never match,
-/// turning every cache hit into a pipeline rebuild — a performance collapse only
-/// an Apple host can see.
+/// # The sibling hole has been fixed, and what that settled
 ///
-/// What would settle it, cheapest first. The live distinct-shader count sets the
-/// birthday bound and is a counter an Apple boot could read. Whether a collision
-/// is reachable at all is harder: equal-length collisions exist only above eight
-/// bytes, and finding one is a 2^32 meet-in-the-middle, so this is not a hazard
-/// a test can demonstrate.
+/// `runtime::m2v_cache` had the identical shape — a `u64` digest as the whole
+/// key, no copy of the AIR retained, a wrong-shader hazard priced at the
+/// birthday bound and left. It now buckets on the digest and compares the AIR
+/// bytes on every hit, which removes the class rather than moving the exponent,
+/// and it cost one retained blob per distinct shader. That is the shape this
+/// cache wants too, and the argument that it is affordable no longer needs
+/// making: a `RenderPsoEntry` already retains an `MTLRenderPipelineState` built
+/// from those blobs.
+///
+/// **Do not port it without doing the enabling step first, in this order.**
+///
+/// 1. `render::fill_render_pso_key` — the only site in product code that builds
+///    one of these — closes with `..Default::default()`. So a `vert_mtlb` field
+///    added to this struct would be filled from `Default` there and left empty,
+///    the stored key would compare unequal to every later lookup key, and every
+///    cache hit would become a pipeline rebuild. That is a performance collapse
+///    only an Apple host can see, and it is why this was recorded rather than
+///    fixed. Make that literal exhaustive first and the compiler catches it;
+///    `render::RenderPsoKeyClone::clone_key` is already exhaustive.
+/// 2. This struct names nothing from the `metal` crate — every field is a scalar
+///    or an array of them — so it belongs outside the gated tree for the reason
+///    [`crate::backend::hash`]'s declaration gives, and moving it is what makes
+///    the identity compare testable on a host that can run a test. It reaches
+///    `REIMS_VGPU_METAL_MAX_ATTRS` and `REIMS_VGPU_METAL_MAX_COLOR_RTS`, which
+///    live in a `constants` module that *does* name `metal`, so that split comes
+///    first and it touches `REIMS_VGPU_`-prefixed names the ABI tests pin.
+///
+/// What would settle the hazard's *size* rather than remove it: the live
+/// distinct-shader count sets the birthday bound and is a counter an Apple boot
+/// could read. Whether a collision is reachable at all is harder — equal-length
+/// collisions exist only above eight bytes, and finding one is a 2^32
+/// meet-in-the-middle, so this is not a hazard a test can demonstrate. The m2v
+/// fix's own test does not try: it forces two entries into one bucket and asks
+/// through the real lookup, which is exactly the state a natural collision
+/// produces.
 pub struct RenderPsoKey {
     pub key_hash: u64,
     pub vert_hash: u64,
