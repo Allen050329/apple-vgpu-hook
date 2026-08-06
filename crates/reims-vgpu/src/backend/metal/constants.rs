@@ -80,6 +80,28 @@ const _: () =
 const _: () =
     assert!(REIMS_VGPU_METAL_MAX_TEXTURES as u32 == crate::runtime::draw::MAX_TEXTURE_BIND_SLOTS);
 
+// The vertex-attribute table and the decoder's bound on an `MTLVertexDescriptor`
+// are one number, and here the cost of them parting is not a dropped attribute
+// but a panic.
+//
+// `fill_render_pso_key` stores the **untruncated** `attrs.len()` as `attr_count`,
+// which is right — clamping it would let two descriptors differing only past the
+// table collide on one cache key, and the wrong pipeline is worse than a refused
+// one. But the key's hash and `RenderPsoKey`'s equality then both walk
+// `0..attr_count` over arrays that are `REIMS_VGPU_METAL_MAX_ATTRS` long, so an
+// `attrs` longer than this constant indexes off the end of five of them.
+//
+// The colour-attachment sibling does not need this: `color_count` is `.min`ed at
+// the same site precisely because it indexes the same way. Attributes are the one
+// class whose safety rests entirely on the decoder having refused first, and it
+// does — `parse_vertex_block` answers `res_vertex_attr_count_over` above
+// `MAX_VERTEX_ATTRS` rather than truncating. This pins the number it refuses at
+// to the width of the arrays that refusal is protecting, so the two cannot drift
+// into a process abort. Same reasoning, and same `const`-assertion form, as the
+// buffer and texture pins above.
+const _: () =
+    assert!(REIMS_VGPU_METAL_MAX_ATTRS == crate::runtime::decode::resource::MAX_VERTEX_ATTRS);
+
 // This backend's two band bases are mirrors of `runtime::spirv_bind`'s, which is
 // where the widening that set them is written. A mirror that drifts would have
 // the two arms encode the same guest bind as two different descriptor bindings,
