@@ -98,7 +98,7 @@ struct Row {
 /// How many types may answer [`Loss::ExecutedModified`].
 ///
 /// Not a budget. A ratchet: see [`the_executed_modified_census_only_shrinks`].
-const EXECUTED_MODIFIED_CEILING: usize = 10;
+const EXECUTED_MODIFIED_CEILING: usize = 9;
 
 /// Every `impl Decline`/`impl Refusal` in the crate, and what its worst arm
 /// costs the guest.
@@ -698,19 +698,23 @@ const ROWS: &[Row] = &[
     Row {
         file: "crates/reims-vgpu/src/runtime/exec/mod.rs",
         ty: "StreamDrawDrop",
-        loss: Loss::ExecutedModified,
+        loss: Loss::Refused,
         why: "the two arms that used to continue no longer do: a dropped \
               depth/stencil attachment and an unbindable colour subresource \
-              both now set `StreamAccum::unrepresentable`, and `bind_snapshot` \
+              both set `StreamAccum::unrepresentable`, and `bind_snapshot` \
               refuses the stream's draws rather than running the pass without \
-              depth or into the base level. What is left is the `Unbound` arm, \
-              which keeps the draw out of `acc.draws` entirely — a refusal \
-              where the record is a guest's own pipeline-less draw, and a lost \
-              draw where it is a `SetPipeline` this decoder failed to latch. \
-              The verdict is the second reading, because nothing here proves it \
-              is the first. Retired by proving every `SetPipeline` wire form \
-              reaches the latch, after which a zero `pipeline_ref` at a draw is \
-              the guest's own record",
+              depth or into the base level. The `Unbound` arm keeps the draw \
+              out of `acc.draws` entirely, and its ambiguity is now closed \
+              structurally rather than by a rate: \
+              `a_pipeline_reaches_the_latch_by_one_wire_form` pins that exactly \
+              one wire constant sets a render pipeline state, and its exec arm \
+              assigns `acc.pipeline_ref` unconditionally. Every way this device \
+              could have caused the zero is separately fail-visible — a `0x74` \
+              that fails to decode is an `ErrShort` on that opcode, an opcode \
+              nobody enumerated is reported by `note_unimplemented_render_opcode`, \
+              and a guest that sets ref 0 itself emits \
+              `render_set_pipeline_zero_ref`. So a bare `Unbound` is a draw with \
+              no pipeline bound, which Metal refuses too",
     },
     Row {
         file: "crates/reims-vgpu/src/runtime/exec/mod.rs",
