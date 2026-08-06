@@ -89,18 +89,23 @@ pub(crate) const DESC_BLOCK_MAX_SETS: u32 = 64;
 ///
 /// One render set merges both stages: `exec` builds a single binding list from
 /// `req.storage_buffers`, `req.sampled_images` and `req.samplers`, and each
-/// stage binds at most [`crate::runtime::draw::MAX_BIND_SLOTS`] of each. So the
-/// worst case is two stages' worth. The compute path is single-stage and its
-/// three slot caps are all at or below `MAX_BIND_SLOTS`, so it stays under this.
-const MAX_SET_DESCRIPTORS_PER_TYPE: u32 = 2 * crate::runtime::draw::MAX_BIND_SLOTS;
+/// stage binds at most that class's own bound of each. So the worst case is two
+/// stages' worth of [`crate::runtime::draw::MAX_ANY_BIND_SLOTS`], the widest of
+/// the three, since a descriptor type is served by exactly one class and this
+/// budget is per type. The compute path is single-stage and its three slot caps
+/// are all at or below these, so it stays under this.
+const MAX_SET_DESCRIPTORS_PER_TYPE: u32 = 2 * crate::runtime::draw::MAX_ANY_BIND_SLOTS;
 /// Per-type descriptor budget within one block, matched to `DESC_BLOCK_MAX_SETS`
 /// so a block of single-binding sets exhausts `max_sets` and per-type budget
 /// together. A draw that binds N sampled images consumes N of this type's
 /// budget; exhausting it before `max_sets` still triggers a clean grow.
 const DESC_BLOCK_PER_TYPE: u32 = DESC_BLOCK_MAX_SETS;
 /// Widening a bind table without widening a block is a dropped draw, not a
-/// slower one, so it fails the build here instead. The margin is deliberately
-/// not spent: at `MAX_BIND_SLOTS = 31` this is 62 against 64.
+/// slower one, so it fails the build here instead. There is no margin left: the
+/// widest class bound is 32, so this is 64 against 64, and the next widening of
+/// any of the three fails this assertion rather than dropping a draw at runtime.
+/// That is the assertion doing its job — raise [`DESC_BLOCK_PER_TYPE`] with the
+/// table, and note that it is no longer then equal to [`DESC_BLOCK_MAX_SETS`].
 const _: () = assert!(DESC_BLOCK_PER_TYPE >= MAX_SET_DESCRIPTORS_PER_TYPE);
 
 /// A growable set of same-sized descriptor-pool blocks. `blocks[0]` is created

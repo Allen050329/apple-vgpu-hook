@@ -115,65 +115,93 @@ pub(crate) use texture_view::*;
 mod render_target;
 use render_target::{lookup_render_target, ResolvedRenderTarget};
 
-/// Bind **index** cap for all three argument tables — buffers, textures and
-/// samplers — applied once in [`crate::runtime::exec`]'s `apply_binds`.
+/// Bind **index** cap for the buffer argument table.
+///
+/// Two independent derivations of one number, which is why it is the one bound
+/// of the three that costs nothing: Metal's buffer argument table ends at 31
+/// (`REIMS_VGPU_METAL_MAX_BUFFERS`, pinned equal to this by a `const` assertion
+/// in `backend::metal::constants`), and Apple's own serializer truncates a
+/// plural buffer bind there too (`reims_vgpu_wire::ops::bind_limit::BUFFER`).
+/// A guest bind past it cannot come from an Apple stream, and no backend could
+/// hold it if it did.
+pub const MAX_BUFFER_BIND_SLOTS: u32 = 31;
+
+/// Bind **index** cap for the texture argument table.
 ///
 /// A slot count, not a byte budget. Resource byte sizes follow the guest
 /// descriptor and page-table span; nothing here caps them.
 ///
-/// # 31 is Metal's *buffer* table, and it is the wrong number for the other two
+/// # The bound is the flat binding encoding, not a table
 ///
-/// `reims_vgpu_wire::ops::bind_limit` measures Apple's three tables at 128
-/// textures, 31 buffers and 16 samplers, and three `const` assertions beside
-/// `apply_binds` pin this constant's relation to each. So:
+/// The device names a bound resource by a single `u32` descriptor binding that
+/// packs class and index into bands 32 apart —
+/// [`crate::runtime::spirv_bind::TEXTURE_BINDING_BASE`] `= 32` and
+/// [`crate::runtime::spirv_bind::SAMPLER_BINDING_BASE`] `= 64`. So texture index
+/// 32 and sampler index 0 are both binding 64, and the *number* cannot say which
+/// is which. 32 is therefore the widest texture index this encoding can name.
 ///
-/// * **Buffers** — exact. 31 is the serializer's own bound, so this fits with no
-///   loss and no margin at all.
-/// * **Samplers** — Apple truncates at 16, well below this, so a drop cannot
-///   come from a stream Apple's serializer wrote.
-/// * **Textures** — a real gap. `setVertexTextures:withRange:` over a range of
-///   40 is a record Apple can produce and this device drops from slot 31 on.
+/// On the Vulkan arm the numbering is not this crate's choice: `metal2vulkan`
+/// emits `OpDecorate Binding` at `TEXTURE_BINDING_BASE + N` with no clamp, so a
+/// module using texture 40 would decorate binding 72 — the same number it gives
+/// sampler 8. On the Metal arm the bands are this crate's own encoding, mirrored
+/// from an archived C backend header; nothing outside Rust reads them.
 ///
-/// It has not been observed to fire: two driven x86/PCI boots read every one of
-/// 18 044 and then 575 041 bind records at slot 16 or below, inside the
-/// *smallest* of the three tables. `apply_binds` reports a drop on the fail
-/// channel and counts the slots, and `render_bind_reach_texture_le_table` is the
-/// leading indicator — it moves one band earlier, at slot 17.
+/// # What is still lost, and to what
 ///
-/// # What widening the texture band costs
-///
-/// The Vulkan arm's binding numbers are `metal2vulkan`'s output, not this
-/// crate's choice: the translator emits `OpDecorate Binding` at `32 + N` for
-/// Metal texture index `N` and `64 + N` for sampler `N`, bases 32 apart. So a
-/// texture at index 40 and a sampler at index 8 are both binding 72, and the
-/// *number* cannot say which is which.
-///
-/// The *variable* can. A texture is an `OpTypeImage` and a sampler an
-/// `OpTypeSampler`, and `spirv_bind::variable_classes` resolves each descriptor
-/// through its type to a class; both fragment relocations already select on that
-/// rather than on the band. metal2vulkan's own reflection carries `kind` and
-/// `metal_index` as separate fields, so the mapping is recoverable twice over,
-/// and nothing in the translator rejects an index at or above 32. This bound is
-/// therefore load-bearing for the *current* numbering rather than forced by the
-/// dependency: while it holds, no index can reach a neighbouring band.
-///
-/// What remains is a re-band, and it is not small. Every consumer keyed on the
-/// un-relocated `TEXTURE_BINDING_BASE + N` number moves with it
-/// (`storage_image_access`, `image_format`, `specialize_image_formats`,
+/// Apple's texture table is 128 (`bind_limit::TEXTURE`), so indices 32..127
+/// remain unreachable and stay counted under
+/// `render_texture_bind_slot_past_table`. Recovering them is a re-band: every
+/// consumer keyed on the un-relocated `TEXTURE_BINDING_BASE + N` number moves
+/// with it (`storage_image_access`, `image_format`, `specialize_image_formats`,
 /// `reflected_sampled_kind`, `texture_shape_for_binding`, and the engine's
-/// descriptor writes), and `MAX_BIND_SLOTS` splits into the three
-/// `bind_limit` values. Two things make it affordable: the descriptor set
-/// layout is built from the bindings a draw actually provides rather than a
-/// dense table, so a wider *number* space costs no descriptors; and the
-/// relocation is cached per shader variant, so the classification is off the
-/// draw path. Nothing yet queries `maxPerStageDescriptorSampledImages`, which a
-/// widened band would need.
+/// descriptor writes). The class is recoverable twice over — a texture is an
+/// `OpTypeImage` and a sampler an `OpTypeSampler`, which
+/// `spirv_bind::variable_classes` already resolves, and the translator's own
+/// reflection carries `kind` and `metal_index` as separate fields — so what
+/// blocks it is the flat number, not missing information. Two things would make
+/// it affordable: the descriptor set layout is built from the bindings a draw
+/// actually provides rather than a dense table, so a wider *number* space costs
+/// no descriptors; and the relocation is cached per shader variant, so the
+/// classification is off the draw path. Nothing yet queries
+/// `maxPerStageDescriptorSampledImages`, which a widened band would need.
+pub const MAX_TEXTURE_BIND_SLOTS: u32 = 32;
+
+/// Bind **index** cap for the sampler argument table.
 ///
-/// The Metal-direct arm has no numbering constraint at all (its own table is
-/// 128), but this bound is applied during stream accumulation, before either
-/// backend, so splitting it would mean the two arms accepting different guest
-/// streams.
-pub const MAX_BIND_SLOTS: u32 = 31;
+/// The sampler band is `[64, 96)` — [`crate::runtime::spirv_bind::SAMPLER_BINDING_BASE`]
+/// up to [`crate::runtime::spirv_bind::COLOR_INPUT_BINDING_BASE`] — so this is
+/// the same encoding bound [`MAX_TEXTURE_BIND_SLOTS`] documents, applied to the
+/// next band up.
+///
+/// The *table* that actually runs out first is Metal's, at 16
+/// (`REIMS_VGPU_METAL_MAX_SAMPLERS`), and Apple's serializer truncates there too
+/// (`bind_limit::SAMPLER`). That bound is not applied here on purpose: it
+/// belongs to one backend, and the backend that owns it refuses at its own
+/// encoder, fail-visibly, with `metal_render_sampler_binding_invalid` naming the
+/// binding. Applying a Metal table size during stream accumulation would take
+/// the slot away from the Vulkan arm as well, which is exactly the mistake the
+/// single shared `MAX_BIND_SLOTS` made for two of its three classes.
+pub const MAX_SAMPLER_BIND_SLOTS: u32 = 32;
+
+/// The widest of the three bind bounds.
+///
+/// For sizing something one *descriptor type* draws from, where the type is
+/// served by exactly one class and the caller does not know which — the Vulkan
+/// descriptor arena's per-type block budget is the case. Declared beside the
+/// three constants rather than at the site, so the three-way comparison is not
+/// a fourth copy of the rule.
+pub const MAX_ANY_BIND_SLOTS: u32 = {
+    let widest = if MAX_TEXTURE_BIND_SLOTS > MAX_SAMPLER_BIND_SLOTS {
+        MAX_TEXTURE_BIND_SLOTS
+    } else {
+        MAX_SAMPLER_BIND_SLOTS
+    };
+    if widest > MAX_BUFFER_BIND_SLOTS {
+        widest
+    } else {
+        MAX_BUFFER_BIND_SLOTS
+    }
+};
 
 /// Convert a guest-declared byte length to a host allocation size.
 ///
@@ -1393,7 +1421,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
     let mut vtx_bind_idx: Vec<u32> = Vec::new();
     let mut frag_bind_idx: Vec<u32> = Vec::new();
     for b in &req.vertex_buffers {
-        if b.index >= MAX_BIND_SLOTS || b.buffer_ref == 0 {
+        if b.index >= MAX_BUFFER_BIND_SLOTS || b.buffer_ref == 0 {
             continue;
         }
         let Some(bytes) = load_buffer_bytes(state, host, req.task_id, b.buffer_ref, b.offset)
@@ -1411,7 +1439,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
         vtx_storage.push(bytes);
     }
     for b in &req.fragment_buffers {
-        if b.index >= MAX_BIND_SLOTS || b.buffer_ref == 0 {
+        if b.index >= MAX_BUFFER_BIND_SLOTS || b.buffer_ref == 0 {
             continue;
         }
         let Some(bytes) = load_buffer_bytes(state, host, req.task_id, b.buffer_ref, b.offset)
@@ -1515,7 +1543,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
     let mut vtx_tex_items: Vec<TexItem> = Vec::new();
     let mut frag_tex_items: Vec<TexItem> = Vec::new();
     for t in &req.vertex_textures {
-        if t.index >= MAX_BIND_SLOTS {
+        if t.index >= MAX_TEXTURE_BIND_SLOTS {
             continue;
         }
         let Some((w, h, rgba)) = load_sampled_rgba(state, host, req.task_id, t.texture_ref) else {
@@ -1537,7 +1565,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
         });
     }
     for t in &req.fragment_textures {
-        if t.index >= MAX_BIND_SLOTS {
+        if t.index >= MAX_TEXTURE_BIND_SLOTS {
             continue;
         }
         let Some((w, h, rgba)) = load_sampled_rgba(state, host, req.task_id, t.texture_ref) else {
@@ -1601,7 +1629,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
     let mut vtx_samps: Vec<ReimsVgpuSampler> = Vec::new();
     let mut frag_samps: Vec<ReimsVgpuSampler> = Vec::new();
     for s in &req.vertex_samplers {
-        if s.index < MAX_BIND_SLOTS && s.sampler_ref != 0 {
+        if s.index < MAX_SAMPLER_BIND_SLOTS && s.sampler_ref != 0 {
             let sampler = load_sampler(state, host, req.task_id, s.sampler_ref, s.index)
                 .unwrap_or_else(|error| {
                     crate::observe::Emit::decline("metal_draw_sampler_fallback", &error)
@@ -1617,7 +1645,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
         }
     }
     for s in &req.fragment_samplers {
-        if s.index < MAX_BIND_SLOTS && s.sampler_ref != 0 {
+        if s.index < MAX_SAMPLER_BIND_SLOTS && s.sampler_ref != 0 {
             let sampler = load_sampler(state, host, req.task_id, s.sampler_ref, s.index)
                 .unwrap_or_else(|error| {
                     crate::observe::Emit::decline("metal_draw_sampler_fallback", &error)

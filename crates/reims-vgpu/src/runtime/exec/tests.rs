@@ -2147,9 +2147,10 @@ fn a_plural_viewport_or_scissor_applies_one_and_counts_the_rest() {
 /// which of the three tables lost them.
 ///
 /// Apple's serializer produces `setVertexTextures:withRange:` over a range
-/// of 40, and `MAX_BIND_SLOTS` is 31 — Metal's *buffer* index cap, applied
-/// to a texture table whose real limit is 128. So the walk ends early on
-/// traffic a guest actually sends, and it used to end with a bare `break`.
+/// of 40, and `MAX_TEXTURE_BIND_SLOTS` is 32 — the descriptor binding band's
+/// width, against a texture table whose real limit is 128. So the walk ends
+/// early on traffic a guest actually sends, and it used to end with a bare
+/// `break`.
 /// The count is the argument for widening the tables, so it has to be the
 /// number of slots lost rather than one event — and it has to name the
 /// table, because the three do not lose the same thing. The sibling slugs
@@ -2194,7 +2195,7 @@ fn a_bind_past_the_last_table_slot_reports_what_it_dropped() {
     handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
     assert_eq!(
         store_route_count(BindClass::Texture.past_table_route()) - before,
-        (COUNT - MAX_BIND_SLOTS) as u64,
+        (COUNT - MAX_TEXTURE_BIND_SLOTS) as u64,
         "the counter must name every slot dropped, not the one event"
     );
     assert_eq!(
@@ -2209,7 +2210,7 @@ fn a_bind_past_the_last_table_slot_reports_what_it_dropped() {
     );
     assert_eq!(
         acc.vertex_textures.len(),
-        MAX_BIND_SLOTS as usize,
+        MAX_TEXTURE_BIND_SLOTS as usize,
         "every slot the table does hold must still be bound"
     );
 }
@@ -2223,7 +2224,9 @@ fn a_bind_past_the_last_table_slot_reports_what_it_dropped() {
 /// rather than left to whoever next reads the log.
 ///
 /// `apple_table` is the field that makes a reading actionable: 128 against a
-/// table of 31 says the serializer is entitled to emit what we dropped.
+/// table of 32 says the serializer is entitled to emit what we dropped. And
+/// `table=` is the *class's* own bound, so the two lines below carry different
+/// numbers for the same field — which is the point of splitting the constant.
 #[test]
 fn a_bind_past_the_table_renders_a_fail_line_naming_the_table() {
     use crate::observe::Emit;
@@ -2233,7 +2236,7 @@ fn a_bind_past_the_table_renders_a_fail_line_naming_the_table() {
         &BindSlotPastTable {
             class: BindClass::Texture,
             stage: render::Stage::Vertex,
-            index: MAX_BIND_SLOTS,
+            index: MAX_TEXTURE_BIND_SLOTS,
             slots: 9,
         },
     )
@@ -2241,7 +2244,7 @@ fn a_bind_past_the_table_renders_a_fail_line_naming_the_table() {
     assert_eq!(
         line,
         "render_bind_overflow reason=render_texture_bind_slot_past_table \
-         stage=vertex index=31 slots=9 table=31 apple_table=128"
+         stage=vertex index=32 slots=9 table=32 apple_table=128"
     );
 
     // The slug is the class's, so a buffer drop cannot be mistaken for a
@@ -2251,7 +2254,7 @@ fn a_bind_past_the_table_renders_a_fail_line_naming_the_table() {
         &BindSlotPastTable {
             class: BindClass::Buffer,
             stage: render::Stage::Fragment,
-            index: MAX_BIND_SLOTS,
+            index: MAX_BUFFER_BIND_SLOTS,
             slots: 1,
         },
     )
@@ -2259,6 +2262,7 @@ fn a_bind_past_the_table_renders_a_fail_line_naming_the_table() {
     assert!(
         buffers.contains("reason=render_buffer_bind_slot_past_table")
             && buffers.contains("stage=fragment")
+            && buffers.contains("table=31")
             && buffers.contains("apple_table=31"),
         "{buffers}"
     );
@@ -2266,21 +2270,21 @@ fn a_bind_past_the_table_renders_a_fail_line_naming_the_table() {
 
 /// A bind at the last slot Apple's *sampler* table can name still binds.
 ///
-/// The three classes now carry three counters, and the risk that creates is
-/// the opposite of the one it fixes: a per-class slug invites a per-class
-/// *bound*, and bounding a table by what Apple's serializer emits is the
-/// mistake [`reims_vgpu_wire::ops::bind_limit`]'s own doc names — it would
-/// refuse a guest that writes its own stream. So the bound stays one number
-/// and this pins that it did: a sampler at index 20, which is above Apple's
-/// 16-entry sampler table and below [`MAX_BIND_SLOTS`], binds rather than
-/// being counted away.
+/// The three classes carry three counters and three bounds, and the risk that
+/// creates is the opposite of the one it fixes: a per-class bound invites
+/// bounding each table by what Apple's serializer emits, which is the mistake
+/// [`reims_vgpu_wire::ops::bind_limit`]'s own doc names — it would refuse a
+/// guest that writes its own stream. So each bound is a *host* fact, and this
+/// pins the case where the two differ most: a sampler at index 20, above
+/// Apple's 16-entry sampler table and below [`MAX_SAMPLER_BIND_SLOTS`], binds
+/// rather than being counted away.
 #[test]
 fn a_sampler_above_apples_table_but_inside_ours_still_binds() {
     use crate::runtime::drain::store_route_count;
     use reims_vgpu_wire::ops::bind_limit;
 
     const FIRST: u32 = 20;
-    const { assert!(FIRST >= bind_limit::SAMPLER && FIRST < MAX_BIND_SLOTS) };
+    const { assert!(FIRST >= bind_limit::SAMPLER && FIRST < MAX_SAMPLER_BIND_SLOTS) };
 
     let entry = render::REF_BIND_ENTRY_SIZE;
     let total = reims_vgpu_wire::OP_HEADER_LEN + render::BIND_ENTRIES + entry;
@@ -2319,6 +2323,92 @@ fn a_sampler_above_apples_table_but_inside_ours_still_binds() {
             .map(|s| s.index)
             .collect::<Vec<_>>(),
         vec![FIRST]
+    );
+}
+
+/// The last slot of the texture band binds, and the same index in the buffer
+/// table does not.
+///
+/// One constant used to bound all three classes at Metal's buffer table, so
+/// texture index 31 — a slot the descriptor binding band has room for and every
+/// backend can hold — was dropped because a *buffer* runs out there. Splitting
+/// the bound recovers it, and the way to see that the split is real rather than
+/// a rename is that the same index now gets two different answers.
+#[test]
+fn the_last_texture_slot_binds_where_the_same_buffer_slot_does_not() {
+    use crate::runtime::drain::store_route_count;
+
+    const LAST_TEXTURE: u32 = MAX_TEXTURE_BIND_SLOTS - 1;
+    // The premise of the test: the two bounds disagree at exactly this index.
+    const { assert!(LAST_TEXTURE >= MAX_BUFFER_BIND_SLOTS) };
+
+    let one_bind = |op: u32, first: u32, obj: u32| {
+        let total =
+            reims_vgpu_wire::OP_HEADER_LEN + render::BIND_ENTRIES + render::REF_BIND_ENTRY_SIZE;
+        let mut command = vec![0u8; total];
+        st32(&mut command[0..], op);
+        st32(&mut command[4..], total as u32);
+        st32(
+            &mut command[reims_vgpu_wire::OP_HEADER_LEN + render::BIND_FIRST..],
+            first,
+        );
+        st32(
+            &mut command[reims_vgpu_wire::OP_HEADER_LEN + render::BIND_COUNT..],
+            1,
+        );
+        st32(
+            &mut command[reims_vgpu_wire::OP_HEADER_LEN + render::BIND_ENTRIES..],
+            obj,
+        );
+        command
+    };
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let host = FakeHost::new();
+    let mut out = ExecResult::default();
+    let mut acc = StreamAccum::default();
+
+    let tex_before = store_route_count(BindClass::Texture.past_table_route());
+    let op = wire_render::OPCODE_SET_VERTEX_TEXTURE;
+    let command = one_bind(op, LAST_TEXTURE, 0x7001);
+    handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
+    assert_eq!(
+        acc.vertex_textures
+            .iter()
+            .map(|t| t.index)
+            .collect::<Vec<_>>(),
+        vec![LAST_TEXTURE],
+        "the last slot of the texture band is inside the band and must bind"
+    );
+    assert_eq!(
+        store_route_count(BindClass::Texture.past_table_route()),
+        tex_before,
+        "and nothing may be counted as lost for it"
+    );
+
+    // The buffer table really does end one slot earlier, so the same index
+    // there is still a refusal — the split is a split, not a widening of all
+    // three. A buffer entry is `{ref:u32, offset:u64}`, not the bare ref the
+    // texture and sampler records carry, so it is built here rather than shared.
+    let buf_before = store_route_count(BindClass::Buffer.past_table_route());
+    let op = wire_render::OPCODE_SET_VERTEX_BUFFER;
+    let mut command = vec![0u8; OP_HEADER_LEN + 8 + 12];
+    let total = command.len() as u32;
+    st32(&mut command[0..], op);
+    st32(&mut command[4..], total);
+    st32(&mut command[8..], LAST_TEXTURE); // first
+    st32(&mut command[12..], 1); // count
+    st32(&mut command[16..], 0x7002); // ref
+    st64(&mut command[20..], 0); // offset
+    handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
+    assert!(
+        acc.vertex_buffers.is_empty(),
+        "the buffer argument table ends at {MAX_BUFFER_BIND_SLOTS}"
+    );
+    assert_eq!(
+        store_route_count(BindClass::Buffer.past_table_route()) - buf_before,
+        1,
+        "and the slot it refused must be counted against the buffer table"
     );
 }
 
@@ -2404,7 +2494,7 @@ fn every_bind_record_lands_in_one_reach_band_and_the_top_one_reconciles() {
     // that the same record crossed, in their own units.
     let before = read();
     let before_slots = store_route_count(BindClass::Texture.past_table_route());
-    let (op, command) = texture_record(MAX_BIND_SLOTS - 1, 4);
+    let (op, command) = texture_record(MAX_TEXTURE_BIND_SLOTS - 1, 4);
     handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
     assert_eq!(
         read()
@@ -2556,7 +2646,7 @@ fn a_buffer_offset_that_lands_on_nothing_reports_which_way_it_missed() {
 
     // Past the table entirely.
     let before_past = store_route_count("render_buffer_offset_slot_past_table");
-    let (op, command) = offset_record(MAX_BIND_SLOTS + 4);
+    let (op, command) = offset_record(MAX_BUFFER_BIND_SLOTS + 4);
     handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
     assert_eq!(
         store_route_count("render_buffer_offset_slot_past_table") - before_past,

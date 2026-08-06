@@ -1826,9 +1826,37 @@ fn missing_pipeline_is_soft() {
     let _ = pixel_format::RGBA8_BPP;
 }
 
+/// The three bind bounds, each against the thing that sets it.
+///
+/// They were one constant, and it was Metal's *buffer* table — so the texture
+/// bound was a buffer fact and the sampler bound was a buffer fact, and neither
+/// could move without moving the other two. Asserting the values alone would
+/// re-freeze exactly that; what has to hold is that each equals its own basis,
+/// so the test reads each from where it comes from.
 #[test]
-fn buffer_bind_slot_count() {
-    assert_eq!(MAX_BIND_SLOTS, 31);
+fn each_bind_slot_bound_equals_its_own_basis() {
+    use crate::runtime::spirv_bind::{
+        COLOR_INPUT_BINDING_BASE, SAMPLER_BINDING_BASE, TEXTURE_BINDING_BASE,
+    };
+
+    // Buffers: an argument table, and the one class where Apple's serializer
+    // and Metal's encoder name the same number.
+    assert_eq!(MAX_BUFFER_BIND_SLOTS, reims_vgpu_wire::ops::bind_limit::BUFFER);
+
+    // Textures and samplers: band widths in the flat descriptor binding space,
+    // not tables. A texture at the bound would carry sampler 0's binding.
+    assert_eq!(
+        MAX_TEXTURE_BIND_SLOTS,
+        SAMPLER_BINDING_BASE - TEXTURE_BINDING_BASE
+    );
+    assert_eq!(
+        MAX_SAMPLER_BIND_SLOTS,
+        COLOR_INPUT_BINDING_BASE - SAMPLER_BINDING_BASE
+    );
+
+    // The texture bound is *not* the buffer table, which is what it used to be.
+    assert_ne!(MAX_TEXTURE_BIND_SLOTS, MAX_BUFFER_BIND_SLOTS);
+
     // No product byte-size budget: host_alloc_len only rejects >usize/isize.
     assert_eq!(host_alloc_len(64 << 20), Some(64 << 20));
     assert_eq!(host_alloc_len(0), Some(0));

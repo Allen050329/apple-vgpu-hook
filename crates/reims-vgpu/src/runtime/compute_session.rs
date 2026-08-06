@@ -605,8 +605,9 @@ fn apply_icb_compute_encoder_inheritance<M: HostMemory + HostOps>(
             //
             // The three sibling bind paths all gate on this limit already: direct
             // compute through `valid_buffer_binding`, and both render paths
-            // (direct draw and ICB inheritance) through `MAX_BIND_SLOTS`, which is
-            // the same 31. This path had no device-limit gate at all — only the
+            // (direct draw and ICB inheritance) through
+            // `draw::MAX_BUFFER_BIND_SLOTS`, which a `const` assertion beside
+            // `REIMS_VGPU_METAL_MAX_BUFFERS` pins equal to it. This path had no device-limit gate at all — only the
             // descriptor check below, which the guest disables outright by leaving
             // `max_kernel_buffer_bind_count` at 0.
             if !valid_buffer_binding(b.index) {

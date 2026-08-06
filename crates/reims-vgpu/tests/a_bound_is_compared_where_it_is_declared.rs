@@ -228,14 +228,37 @@ struct Recorded {
 }
 
 const RECORDED: &[Recorded] = &[
-    // The one the polarity ranking puts first, and the standing candidate for
-    // the treatment the five bounds above got.
+    // The bind-slot admission, one constant per argument-table class. These were
+    // a single `MAX_BIND_SLOTS`, which the polarity ranking put first and which
+    // was Metal's *buffer* table applied to all three classes — so the texture
+    // and sampler bounds were buffer facts and could not move independently.
+    // Still not consolidated behind one predicate, for the reason the shared
+    // constant had: the sites do not agree on what happens after a refusal —
+    // `draw::vulkan` skips the bind (`continue`), `draw::metal_icb` refuses the
+    // whole record — so one predicate would have to return which.
     Recorded {
-        name: "MAX_BIND_SLOTS",
-        why: "29 comparisons in 4 runtime files, in both polarities — the bind-slot \
-              admission. Not consolidated here because the sites do not agree on what \
-              happens after: `draw::vulkan` skips the bind (`continue`), `draw::metal_icb` \
-              refuses the record. One predicate would have to return which.",
+        name: "MAX_BUFFER_BIND_SLOTS",
+        why: "8 comparisons across the three render bind paths. Metal's buffer argument \
+              table, pinned equal to it by a `const` assertion beside \
+              `REIMS_VGPU_METAL_MAX_BUFFERS`, and independently equal to Apple's own \
+              `bind_limit::BUFFER` — so the sites cannot disagree about the number, only \
+              about what they do when it is exceeded.",
+    },
+    Recorded {
+        name: "MAX_TEXTURE_BIND_SLOTS",
+        why: "11 comparisons across the three render bind paths. Not a table size: it is \
+              the width of the descriptor binding band between `TEXTURE_BINDING_BASE` and \
+              `SAMPLER_BINDING_BASE`, held there by a `const` assertion, because a flat \
+              binding number cannot say which class wrote it.",
+    },
+    Recorded {
+        name: "MAX_SAMPLER_BIND_SLOTS",
+        why: "9 comparisons across the three render bind paths. The same band-width \
+              basis as the texture bound, applied to `SAMPLER_BINDING_BASE`..\
+              `COLOR_INPUT_BINDING_BASE`. Metal's own 16-entry sampler table is tighter \
+              and is enforced in the backend that owns it, fail-visibly, rather than \
+              here — a Metal table size applied during stream accumulation would take \
+              the slot from the Vulkan arm too.",
     },
     // Slice-bound checks. The constant is a record's length and each site bounds
     // a different read at a different offset, so the rule is `offset + LEN

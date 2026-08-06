@@ -369,7 +369,7 @@ fn apply_icb_encoder_inheritance<M: HostMemory + HostOps>(
             if b.buffer_ref == 0 {
                 continue;
             }
-            if b.index >= MAX_BIND_SLOTS {
+            if b.index >= MAX_BUFFER_BIND_SLOTS {
                 return Err(MetalIcbInheritanceDecline::VertexBufferIndexOutOfRange {
                     buffer_ref: b.buffer_ref,
                     index: b.index,
@@ -391,7 +391,7 @@ fn apply_icb_encoder_inheritance<M: HostMemory + HostOps>(
             if b.buffer_ref == 0 {
                 continue;
             }
-            if b.index >= MAX_BIND_SLOTS {
+            if b.index >= MAX_BUFFER_BIND_SLOTS {
                 return Err(MetalIcbInheritanceDecline::FragmentBufferIndexOutOfRange {
                     buffer_ref: b.buffer_ref,
                     index: b.index,
@@ -417,7 +417,7 @@ fn apply_icb_encoder_inheritance<M: HostMemory + HostOps>(
         if t.texture_ref == 0 {
             continue;
         }
-        if t.index >= MAX_BIND_SLOTS {
+        if t.index >= MAX_TEXTURE_BIND_SLOTS {
             return Err(MetalIcbInheritanceDecline::VertexTextureIndexOutOfRange {
                 texture_ref: t.texture_ref,
                 index: t.index,
@@ -454,7 +454,7 @@ fn apply_icb_encoder_inheritance<M: HostMemory + HostOps>(
         if t.texture_ref == 0 {
             continue;
         }
-        if t.index >= MAX_BIND_SLOTS {
+        if t.index >= MAX_TEXTURE_BIND_SLOTS {
             return Err(MetalIcbInheritanceDecline::FragmentTextureIndexOutOfRange {
                 texture_ref: t.texture_ref,
                 index: t.index,
@@ -492,7 +492,7 @@ fn apply_icb_encoder_inheritance<M: HostMemory + HostOps>(
         if s.sampler_ref == 0 {
             continue;
         }
-        if s.index >= MAX_BIND_SLOTS {
+        if s.index >= MAX_SAMPLER_BIND_SLOTS {
             return Err(MetalIcbInheritanceDecline::VertexSamplerIndexOutOfRange {
                 sampler_ref: s.sampler_ref,
                 index: s.index,
@@ -532,7 +532,7 @@ fn apply_icb_encoder_inheritance<M: HostMemory + HostOps>(
         if s.sampler_ref == 0 {
             continue;
         }
-        if s.index >= MAX_BIND_SLOTS {
+        if s.index >= MAX_SAMPLER_BIND_SLOTS {
             return Err(MetalIcbInheritanceDecline::FragmentSamplerIndexOutOfRange {
                 sampler_ref: s.sampler_ref,
                 index: s.index,

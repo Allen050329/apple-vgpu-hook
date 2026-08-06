@@ -33,7 +33,8 @@ use crate::runtime::decode::stream::{
     SEGMENT_TYPE_EVENT, SEGMENT_TYPE_INFO, SEGMENT_TYPE_RENDER,
 };
 use crate::runtime::draw::{
-    self, BufferBind, EncodeStatus, IndexedDrawInfo, SamplerBind, TextureBind, MAX_BIND_SLOTS,
+    self, BufferBind, EncodeStatus, IndexedDrawInfo, SamplerBind, TextureBind,
+    MAX_BUFFER_BIND_SLOTS, MAX_SAMPLER_BIND_SLOTS, MAX_TEXTURE_BIND_SLOTS,
 };
 use crate::runtime::fence_exec;
 use crate::runtime::gva_mem;
@@ -1356,7 +1357,7 @@ fn handle_render_record<M: HostMemory + HostOps>(
                 crate::runtime::drain::note_store_route("render_vertex_attribute_stride_dropped");
             }
             // Archive apply_buffer_offset: update offset on an already-bound slot.
-            if cmd.first >= MAX_BIND_SLOTS {
+            if cmd.first >= MAX_BUFFER_BIND_SLOTS {
                 // The slot is outside the table, so the bind that would have
                 // occupied it was already dropped by `apply_binds` and counted
                 // under `render_buffer_bind_slot_past_table`. This is the
@@ -1979,20 +1980,24 @@ fn handle_render_record<M: HostMemory + HostOps>(
 
 /// Which of the three argument tables a bind record names.
 ///
-/// [`apply_binds`] gates all three on the single [`MAX_BIND_SLOTS`], and that
-/// is defensible as a *bound* — it is the smallest of the three host tables —
-/// but it is not defensible as a *counter*. Apple's serializer truncates a
-/// plural bind at the stage's argument table, and
+/// [`apply_binds`] gates each class on [`BindClass::host_table`], its own bound.
+/// It used to gate all three on one constant, which was Metal's *buffer* table
+/// applied to buffers, textures and samplers alike — defensible as a *bound*,
+/// since it was the smallest of the three, but the wrong number for two classes
+/// by construction and never defensible as a *counter*.
+///
+/// Apple's serializer truncates a plural bind at the stage's argument table, and
 /// [`reims_vgpu_wire::ops::bind_limit`] measured those three tables at 128
 /// textures, 31 buffers and 16 samplers, so a slot dropped here means something
 /// different in each class:
 ///
-/// * **Texture** — real loss. Apple emits up to 128, this device holds 31, so
-///   slots 31..127 are guest work with nowhere to go.
+/// * **Texture** — real loss. Apple emits up to 128 and this device holds 32,
+///   the width of a descriptor binding band, so slots 32..127 are guest work
+///   with nowhere to go.
 /// * **Buffer** — cannot fire from an Apple guest. 31 is exactly the serializer's
 ///   own buffer bound, so a non-zero reading is either a guest writing its own
 ///   stream or a decode that mis-sized the table.
-/// * **Sampler** — same, one step further: Apple truncates at 16, well below the
+/// * **Sampler** — same, one step further: Apple truncates at 16, half the
 ///   bound, so this can only fire on a stream Apple's serializer did not write.
 ///
 /// One slug for all three said "31 slots were lost" and could not say which
@@ -2007,7 +2012,7 @@ enum BindClass {
 }
 
 impl BindClass {
-    /// The census name for slots this class lost to [`MAX_BIND_SLOTS`].
+    /// The census name for slots this class lost to [`BindClass::host_table`].
     ///
     /// Also the `reason=` slug of [`BindSlotPastTable`], deliberately: the two
     /// name one event, and a reader who greps the fail log for a slug should
@@ -2019,6 +2024,26 @@ impl BindClass {
             BindClass::Buffer => "render_buffer_bind_slot_past_table",
             BindClass::Texture => "render_texture_bind_slot_past_table",
             BindClass::Sampler => "render_sampler_bind_slot_past_table",
+        }
+    }
+
+    /// This device's own bind-index bound for the class.
+    ///
+    /// One constant per class, because they have three different bases: the
+    /// buffer bound is Metal's argument table (and, independently, Apple's own),
+    /// while the texture and sampler bounds are the width of a descriptor
+    /// binding band. A single shared constant made two of the three the wrong
+    /// number by construction — it was Metal's *buffer* table applied to all
+    /// three — which is what [`crate::runtime::draw::MAX_TEXTURE_BIND_SLOTS`]
+    /// records.
+    fn host_table(self) -> u32 {
+        use crate::runtime::draw::{
+            MAX_BUFFER_BIND_SLOTS, MAX_SAMPLER_BIND_SLOTS, MAX_TEXTURE_BIND_SLOTS,
+        };
+        match self {
+            BindClass::Buffer => MAX_BUFFER_BIND_SLOTS,
+            BindClass::Texture => MAX_TEXTURE_BIND_SLOTS,
+            BindClass::Sampler => MAX_SAMPLER_BIND_SLOTS,
         }
     }
 
@@ -2055,7 +2080,7 @@ impl BindClass {
     /// * `le16` — inside all three of Apple's tables, so inside any bound this
     ///   device could plausibly adopt.
     /// * `le_table` — above Apple's 16-entry sampler table, inside its buffer
-    ///   table and inside [`MAX_BIND_SLOTS`]. This is headroom being spent.
+    ///   table and inside this class's own bound. This is headroom being spent.
     /// * `over_table` — past this device's bound. Fires on exactly the records
     ///   the sibling `*_bind_slot_past_table` counts slots for, so the two
     ///   reconcile: records here, slots there.
@@ -2073,7 +2098,7 @@ impl BindClass {
     /// | texture | 84 692 | 0 | 0 |
     /// | sampler | 47 655 | 0 | 0 |
     ///
-    /// **The texture table's 31-against-128 gap costs this workload nothing.**
+    /// **The texture table's 32-against-128 gap costs this workload nothing.**
     /// Not one texture bind reaches even slot 17, so widening it — which on the
     /// Vulkan arm means re-laying every band in
     /// [`crate::runtime::spirv_bind`], whose texture band is exactly 32 wide and
@@ -2096,19 +2121,19 @@ impl BindClass {
         use reims_vgpu_wire::ops::bind_limit;
         match (self, reach) {
             (BindClass::Buffer, r) if r <= bind_limit::SAMPLER => "render_bind_reach_buffer_le16",
-            (BindClass::Buffer, r) if r <= MAX_BIND_SLOTS => "render_bind_reach_buffer_le_table",
+            (BindClass::Buffer, r) if r <= MAX_BUFFER_BIND_SLOTS => "render_bind_reach_buffer_le_table",
             (BindClass::Buffer, _) => "render_bind_reach_buffer_over_table",
             (BindClass::Texture, r) if r <= bind_limit::SAMPLER => "render_bind_reach_texture_le16",
-            (BindClass::Texture, r) if r <= MAX_BIND_SLOTS => "render_bind_reach_texture_le_table",
+            (BindClass::Texture, r) if r <= MAX_TEXTURE_BIND_SLOTS => "render_bind_reach_texture_le_table",
             (BindClass::Texture, _) => "render_bind_reach_texture_over_table",
             (BindClass::Sampler, r) if r <= bind_limit::SAMPLER => "render_bind_reach_sampler_le16",
-            (BindClass::Sampler, r) if r <= MAX_BIND_SLOTS => "render_bind_reach_sampler_le_table",
+            (BindClass::Sampler, r) if r <= MAX_SAMPLER_BIND_SLOTS => "render_bind_reach_sampler_le_table",
             (BindClass::Sampler, _) => "render_bind_reach_sampler_over_table",
         }
     }
 }
 
-/// A render bind record whose slot run reached past [`MAX_BIND_SLOTS`], so the
+/// A render bind record whose slot run reached past [`BindClass::host_table`], so the
 /// walk stopped and the rest of the record was dropped.
 ///
 /// # Why this is on the fail channel and not only in the census
@@ -2164,7 +2189,7 @@ impl crate::observe::Decline for BindSlotPastTable {
             ),
             ("index", self.index.to_string()),
             ("slots", self.slots.to_string()),
-            ("table", MAX_BIND_SLOTS.to_string()),
+            ("table", self.class.host_table().to_string()),
             ("apple_table", self.class.apple_table().to_string()),
         ]
     }
@@ -2173,20 +2198,34 @@ impl crate::observe::Decline for BindSlotPastTable {
 // The three relations that make each `*_bind_slot_past_table` slug readable in a
 // driven boot's census, pinned at build time because both sides can move
 // independently: a new macOS serializer can change Apple's argument tables, and
-// widening the host tables changes [`MAX_BIND_SLOTS`]. Either would silently
+// widening a host table moves that class's constant. Either would silently
 // re-point what the census means, so this is a build gate rather than a test —
 // the same reason `reims_vgpu_wire::Wire::ASSERT_ALIGN_1` is one.
 //
 // Textures: Apple emits above the bound, so a reading is lost guest work and is
 // the argument for widening.
-const _: () = assert!(reims_vgpu_wire::ops::bind_limit::TEXTURE > MAX_BIND_SLOTS);
+const _: () = assert!(reims_vgpu_wire::ops::bind_limit::TEXTURE > MAX_TEXTURE_BIND_SLOTS);
 // Buffers: two independent derivations of one table size — Apple's serializer
 // truncates there and Metal's `REIMS_VGPU_METAL_MAX_BUFFERS` stops there.
-const _: () = assert!(reims_vgpu_wire::ops::bind_limit::BUFFER == MAX_BIND_SLOTS);
+const _: () = assert!(reims_vgpu_wire::ops::bind_limit::BUFFER == MAX_BUFFER_BIND_SLOTS);
 // Samplers: Apple truncates well below the bound, so this slug cannot fire on a
 // stream Apple's serializer wrote. A reading is a guest writing its own stream,
 // or a decode that mis-sized the table.
-const _: () = assert!(reims_vgpu_wire::ops::bind_limit::SAMPLER < MAX_BIND_SLOTS);
+const _: () = assert!(reims_vgpu_wire::ops::bind_limit::SAMPLER < MAX_SAMPLER_BIND_SLOTS);
+// The two band bounds are the *encoding's*, so they must stay equal to the
+// distance between the bands they name. A texture index at
+// `MAX_TEXTURE_BIND_SLOTS` would carry sampler 0's descriptor binding, and a
+// sampler index at `MAX_SAMPLER_BIND_SLOTS` would carry the first ColorInput's;
+// either collision is silent, because a flat binding number cannot say which
+// class wrote it.
+const _: () = assert!(
+    crate::runtime::spirv_bind::TEXTURE_BINDING_BASE + MAX_TEXTURE_BIND_SLOTS
+        == crate::runtime::spirv_bind::SAMPLER_BINDING_BASE
+);
+const _: () = assert!(
+    crate::runtime::spirv_bind::SAMPLER_BINDING_BASE + MAX_SAMPLER_BIND_SLOTS
+        == crate::runtime::spirv_bind::COLOR_INPUT_BINDING_BASE
+);
 
 /// Which bind table a record names: the stage picks vertex or fragment, the
 /// class picks buffer, texture or sampler.
@@ -2204,8 +2243,8 @@ struct BindTarget {
 ///
 /// All three carry the same wire form: `count` consecutive slots starting at
 /// `first`, where a zero object ref clears the slot it names and any other ref
-/// replaces whatever occupied it. Slots at or past [`MAX_BIND_SLOTS`] are
-/// outside the encoder's table and end the walk. Only the vertex and fragment
+/// replaces whatever occupied it. Slots at or past the class's own
+/// [`BindClass::host_table`] are outside the encoder's table and end the walk. Only the vertex and fragment
 /// stages have tables here; a record for any other stage still counts its
 /// clears, because a slot the guest cleared is cleared whether or not we model
 /// the table it lived in.
@@ -2235,16 +2274,17 @@ fn apply_binds<T: Copy, B: Clone>(
     let mut cleared = 0u32;
     for (i, entry) in entries.iter().copied().enumerate() {
         let index = first.saturating_add(i as u32);
-        if index >= MAX_BIND_SLOTS {
+        if index >= class.host_table() {
             // The walk stops here, and it used to stop in silence — a `break`
             // that dropped every remaining slot with nothing to say so.
             //
-            // `MAX_BIND_SLOTS` is 31 because it is Metal's *buffer* index cap,
-            // and it is applied to all three tables, where Apple's texture limit
-            // is 128 and its sampler limit 16. So the bound is the wrong one for
-            // two of the three classes by construction, and
-            // `setVertexTextures:withRange:` over a range of 40 is a record
-            // Apple's serializer can produce.
+            // The bound is `class.host_table()`, one constant per class. It
+            // used to be a single 31 — Metal's *buffer* index cap — applied to
+            // all three tables, where Apple's texture limit is 128 and its
+            // sampler limit 16, so it was the wrong number for two of the three
+            // by construction. What still refuses a texture is the descriptor
+            // binding band's width, and `setVertexTextures:withRange:` over a
+            // range of 40 is a record Apple's serializer can produce.
             //
             // **This has not been observed to fire.** Driven x86/PCI boot,
             // window-drag probe against Safari, `reach_route` census over 18 044

@@ -1,4 +1,9 @@
-//! Caps matching `reims_vgpu_backend_metal.m`.
+//! Metal argument-table caps.
+//!
+//! These are the sizes this backend's encoders accept, and each is checked
+//! before the `setBuffer:`/`setTexture:`/`setSamplerState:` call it guards —
+//! Metal answers an out-of-range index with an exception that aborts the
+//! process rather than a status this device can decline.
 
 use crate::backend::metal::abi::{
     REIMS_VGPU_BINDING_SAMPLER_BASE, REIMS_VGPU_BINDING_TEXTURE_BASE,
@@ -6,7 +11,14 @@ use crate::backend::metal::abi::{
 
 pub const REIMS_VGPU_METAL_MAX_ATTRS: usize = 31;
 pub const REIMS_VGPU_METAL_MAX_BUFFERS: usize = 31;
-pub const REIMS_VGPU_METAL_MAX_TEXTURES: usize = 31;
+/// The texture argument table.
+///
+/// 32, not Metal's own 128, because this backend names a bound resource by the
+/// flat descriptor binding the bands below define: a texture at index 32 would
+/// carry [`REIMS_VGPU_BINDING_SAMPLER_BASE`], sampler 0's number, and
+/// [`texture_index`](crate::backend::metal::util::texture_index) could not tell
+/// the two apart. The band assertion below is what holds the two in step.
+pub const REIMS_VGPU_METAL_MAX_TEXTURES: usize = 32;
 pub const REIMS_VGPU_METAL_MAX_SAMPLERS: usize = 16;
 /// Metal max color attachments per render pass / PSO.
 pub const REIMS_VGPU_METAL_MAX_COLOR_RTS: usize = 8;
@@ -30,7 +42,7 @@ const _: () = assert!(
 /// compute (`backend::metal::compute` via
 /// [`crate::backend::metal::util::valid_buffer_binding`], which reads
 /// `REIMS_VGPU_METAL_MAX_BUFFERS`), direct render and render ICB inheritance
-/// (both `draw::MAX_BIND_SLOTS`), and compute ICB inheritance
+/// (both `draw::MAX_BUFFER_BIND_SLOTS`), and compute ICB inheritance
 /// (`valid_buffer_binding`). Letting the two constants drift would leave one
 /// pair of paths passing an index to `setBuffer:offset:atIndex:` that the other
 /// pair rejects, and Metal answers an out-of-range index with an exception that
@@ -49,4 +61,12 @@ const _: () = assert!(
 /// which includes the cross-compiled `--target aarch64-apple-darwin` clippy arm
 /// that `AGENTS.md` requires from Linux. Same guarantee, checked everywhere,
 /// and it fails the build rather than a suite nobody on this pathway runs.
-const _: () = assert!(REIMS_VGPU_METAL_MAX_BUFFERS as u32 == crate::runtime::draw::MAX_BIND_SLOTS);
+const _: () =
+    assert!(REIMS_VGPU_METAL_MAX_BUFFERS as u32 == crate::runtime::draw::MAX_BUFFER_BIND_SLOTS);
+
+// The texture table and the accumulator's texture bound are one number — the
+// band width — reached from two directions. `apply_binds` keeps a slot this
+// table cannot hold, or this table holds one no bind record can reach, if they
+// part.
+const _: () =
+    assert!(REIMS_VGPU_METAL_MAX_TEXTURES as u32 == crate::runtime::draw::MAX_TEXTURE_BIND_SLOTS);
