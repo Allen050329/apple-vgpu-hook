@@ -2432,6 +2432,17 @@ const _: () =
 /// because a pipeline built from a short table is a *valid* pipeline whose
 /// missing attachments read as a guest that declared fewer — the wrong blend or
 /// the absent render target arrives with nothing naming it.
+///
+/// `len` is a **reach within `bytes`**, not a second name for its length: this
+/// function and its helpers stop at `len` so a section may be bounded short of
+/// the record's end. Everything below therefore checks against `len` and indexes
+/// `bytes`, and the two are only the same thing while `len <= bytes.len()` —
+/// which is why that is checked here rather than assumed. [`parse_vertex_block`]
+/// takes the same shape of bound and has always carried the equivalent clause;
+/// this one did not, so a `len` past the end passed every guard and then
+/// panicked on the first `ld32`. Nothing guest-side could produce it — the one
+/// caller has already required `declared == bytes.len()` — but this is a `pub fn`
+/// whose totality rested on an invariant stated nowhere.
 pub fn parse_color_attachments(
     bytes: &[u8],
     len: usize,
@@ -2440,6 +2451,9 @@ pub fn parse_color_attachments(
     let mut out = Vec::new();
     if section_off == 0 {
         return Ok(out);
+    }
+    if len > bytes.len() {
+        return Err(DecodeStatus::ErrShort("res_color_reach_past_record"));
     }
     // The header is the count plus the first entry's offset word. A section the
     // descriptor cannot contain loses an unreadable number of attachments, which

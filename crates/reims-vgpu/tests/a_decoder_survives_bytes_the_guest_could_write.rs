@@ -7,12 +7,12 @@
 //! could emit is not a faithful GPU. Real hardware refuses a malformed command;
 //! it does not stop answering.
 //!
-//! Every decoder in `runtime/decode/` and `runtime/heap_query.rs` reads bytes
-//! the guest wrote into a ring or a descriptor page. Nothing between the guest
-//! and them re-validates: the ring is guest RAM, the guest CPU can rewrite it
-//! after the doorbell and before the decode, and a length field is whatever is
-//! in memory when it is read. So each of these is a parser over untrusted
-//! input, and "the observed driver never emits that" is not a bound.
+//! Every `pub fn` here that takes a `&[u8]` reads bytes the guest wrote into a
+//! ring, a descriptor page or a shader blob. Nothing between the guest and them
+//! re-validates: the ring is guest RAM, the guest CPU can rewrite it after the
+//! doorbell and before the decode, and a length field is whatever is in memory
+//! when it is read. So each of these is a parser over untrusted input, and "the
+//! observed driver never emits that" is not a bound.
 //!
 //! # What this drives
 //!
@@ -55,27 +55,52 @@
 //! target's *acceptances* are counted, and the set of decoders that accept
 //! nothing is asserted against a written list.
 //!
-//! That check earned itself immediately: the first corpus reached **8 of 34**
-//! decoders not at all. Five of them dispatch on a tag word and then demand an
-//! exact record length, so a guessed `u32` reaches them with probability ~0 —
-//! fixed by taking the tags and lengths from the crate's own `pub const`s
-//! (`Target::frames`). The three stream decoders were unreachable for a
-//! different reason: `validate_segment` re-reads the segment header out of the
-//! buffer and compares it field by field, so an invented `Segment` cannot pass
-//! and a real stream had to be built.
+//! That check earned itself immediately, and then again when the surface was
+//! widened. Four distinct reasons a parser was unreachable, none of which a
+//! larger corpus would have fixed:
+//!
+//! - **A tag word plus an exact length.** Five resource decoders want, say,
+//!   `TYPE7_OBJECT_ICB` and precisely `ICB_DESC_LEN` bytes. A guessed `u32`
+//!   reaches that with probability ~0. Fixed by taking the tags and lengths
+//!   from the crate's own `pub const`s — see `Target::frames`.
+//! - **A re-validated header.** `validate_segment` re-reads the segment header
+//!   out of the buffer and compares it field by field, so no invented `Segment`
+//!   passes; a real stream had to be built (`Shape::Streamed`).
+//! - **Interior words that must point inside the record.** `extract_air`'s
+//!   wrapper header needs `bc_off + bc_size` to land inside the blob. Fixed by
+//!   `plant_plausible_words`, which biases a third of the interior `u32` slots
+//!   to in-record values.
+//! - **A value from a small named set.** The `iosurface_pages` entries refuse
+//!   any format `format_bytes_per_pixel` does not know, and any geometry too
+//!   large for the descriptor's own pitch — `sample_window_from_device_desc`
+//!   wants `bytes_per_row >= width * bytes_per_pixel`, which a width near 2^31
+//!   makes unsatisfiable. Fixed by *asking* the crate which formats are real
+//!   rather than listing them, and by drawing plausible surface edges while
+//!   keeping a quarter of the draws wild — that quarter is the `u32 * u32`
+//!   overflow case and dropping it would take it out of this harness.
+//!
+//! What it found once it could reach: `parse_color_attachments` panicked on a
+//! two-byte buffer. It takes a reach `len` within `bytes` and checks every
+//! bound against it while indexing `bytes`, and unlike its sibling
+//! `parse_vertex_block` it never checked `len <= bytes.len()`.
 //!
 //! # Why the population is scanned rather than listed
 //!
-//! A hand-written list of decoders is a list that stops being complete the
-//! first time someone adds one. [`every_public_decoder_is_driven`] reads
-//! `runtime/decode/` and `heap_query.rs` for `pub fn decode*` and fails if any
-//! of them is missing from the table below — so a new decoder cannot enter the
-//! tree without either being fuzzed or being given a written reason not to be.
-//! It fails on an empty scan too: a structural check that stops matching
-//! reports green while looking at nothing.
+//! A hand-written list is a list that stops being complete the first time
+//! someone adds a parser. [`every_public_parser_is_driven`] scans the guest-byte
+//! trees for every `pub fn` **whose signature takes a `&[u8]`** and fails if one
+//! is missing from the table below.
+//!
+//! The criterion is the signature, not the name, and that matters: a prefix rule
+//! (`decode*`, `parse*`) would have reported `texture_type8_header`,
+//! `extract_air` and `mapping_span_bound` not as unadjudicated but not at all —
+//! the same hole `a_bound_in_a_cut_is_named_like_one` exists to hold shut for
+//! bounds. It fails in both directions, and on an empty scan: a structural check
+//! that stops matching reports green while looking at nothing.
 
+use reims_vgpu::contract::iosurface_pages;
 use reims_vgpu::runtime::decode::{blit, compute, event, render, resource, stream};
-use reims_vgpu::runtime::heap_query;
+use reims_vgpu::runtime::{heap_query, icb, mtlb};
 use std::collections::BTreeSet;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
@@ -143,6 +168,11 @@ const SEGMENT_TYPES: [u8; 6] = [
     stream::SEGMENT_TYPE_EVENT,
     stream::SEGMENT_TYPE_PROTECTION_OPTIONS,
 ];
+
+/// The one frame `mtlb::extract_air` needs: the wrapper magic it scans for, as
+/// the leading word. A named `const` rather than an inline literal only because
+/// `Target::frames` is `&'static` and a temporary array cannot be.
+const AIR_MAGIC_FRAME: [Frame; 1] = [(u32::from_le_bytes(mtlb::AIR_WRAP_MAGIC), None)];
 
 /// The values a guest length, count or offset field goes wrong at.
 const EDGE_WORDS: [u32; 6] = [0, 1, 2, 0x7FFF_FFFF, 0x8000_0000, 0xFFFF_FFFF];
@@ -229,6 +259,7 @@ fn generate(shape: Shape, len: usize, rng: &mut Rng, tag: Option<u32>) -> Vec<u8
                     _ => len as u32,
                 };
                 bytes[4..8].copy_from_slice(&declared.to_le_bytes());
+                plant_plausible_words(&mut bytes, 8, rng);
             }
         }
         Shape::Streamed => {
@@ -276,6 +307,31 @@ fn generate(shape: Shape, len: usize, rng: &mut Rng, tag: Option<u32>) -> Vec<u8
 /// The record header this tree frames every command with, from the wire type
 /// rather than as a literal 8.
 const OP_HEADER_LEN: usize = stream::RECORD_LENGTH_OFFSET + 4;
+
+/// Overwrite about a third of the `u32` slots from `from` with a value that
+/// could plausibly be an offset, count or size *within this record*.
+///
+/// A record's header gets a decoder past its first guard; its interior words
+/// decide whether anything below that runs. Those words are offsets and sizes,
+/// and a uniformly-drawn `u32` is out of range for every one of them, so a body
+/// decoder reads one, refuses, and the walk it guards never happens. Two
+/// concrete cases this was written for: `extract_air`'s wrapper header, whose
+/// `bc_off + bc_size` must land inside the blob, and the tag walks in
+/// `resource`, whose field lengths must fit the entry.
+///
+/// A third, not all: an in-range word next to a wild one is the mix that finds
+/// a bound applied to one and not the other.
+fn plant_plausible_words(bytes: &mut [u8], from: usize, rng: &mut Rng) {
+    let len = bytes.len();
+    let mut at = from;
+    while at + 4 <= len {
+        if rng.one_in(3) {
+            let word = (rng.next_u64() as u32) % (len as u32 + 1);
+            bytes[at..at + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        at += 4;
+    }
+}
 
 /// Every length the corpus is generated at.
 ///
@@ -512,7 +568,167 @@ fn targets() -> Vec<Target> {
             // entry, so every one of the 256 is reachable.
             resource::decode_descriptor(r.next_u32() as u8, b).accepted()
         }),
+        // --- runtime/decode/stream.rs -------------------------------------
+        target("stream::iter_segments", |b, _| {
+            // Walks the whole buffer segment by segment. Fuzzed as much for
+            // termination and allocation as for panics: a segment length the
+            // walk does not advance past would hang here rather than fail.
+            stream::iter_segments(b).accepted()
+        }),
+        // --- runtime/decode/resource: the body parsers --------------------
+        target("resource::parse_vertex_block", |b, r| {
+            // Both bounds come off a decoded descriptor, so a hostile record
+            // can put the end before the start or either past the buffer.
+            let start = r.next_u64() as usize % (b.len() + 1);
+            let end = r.next_u64() as usize % (b.len() + 8);
+            resource::parse_vertex_block(b, start, end).accepted()
+        }),
+        target("resource::parse_color_attachments", |b, r| {
+            let len = r.next_u64() as usize % (b.len() + 8);
+            let off = r.next_u64() as usize % (b.len() + 1);
+            resource::parse_color_attachments(b, len, off).accepted()
+        }),
+        target("resource::parse_compute_stage_input_block", |b, r| {
+            let start = r.next_u64() as usize % (b.len() + 1);
+            resource::parse_compute_stage_input_block(b, start).accepted()
+        }),
+        target("resource::texture_type8_header", |b, _| {
+            resource::texture_type8_header(b).accepted()
+        }),
+        target("resource::texture_type8_opcode", |b, _| {
+            resource::texture_type8_opcode(b).accepted()
+        }),
+        // --- runtime/icb ---------------------------------------------------
+        target("icb::decode_compute_command_slot", |b, r| {
+            // The layout is itself decoded from guest bytes, so it is taken
+            // from the same buffer rather than invented — the product reaches
+            // this decoder no other way.
+            let Ok(layout) = resource::decode_icb_command_layout(b) else {
+                return false;
+            };
+            icb::decode_compute_command_slot(&layout, b, r.next_u32() as u16).accepted()
+        }),
+        target("icb::decode_render_command_slot", |b, r| {
+            let Ok(layout) = resource::decode_icb_command_layout(b) else {
+                return false;
+            };
+            icb::decode_render_command_slot(&layout, b, r.next_u32() as u16, r.next_u32() as u16)
+                .accepted()
+        }),
+        target("icb::decode_icb_host_resource_info", |b, _| {
+            icb::decode_icb_host_resource_info(b).accepted()
+        }),
+        // --- runtime/mtlb --------------------------------------------------
+        framed(
+            "mtlb::extract_air",
+            // The scan is for a 4-byte magic, so uniform bytes never get past
+            // it and the wrapper-header arithmetic below — a `bc_off + bc_size`
+            // taken from the blob — would go undriven. The frame plants the
+            // crate's own constant rather than the four bytes again.
+            &AIR_MAGIC_FRAME,
+            |b, _| mtlb::extract_air(b).accepted(),
+        ),
+        // --- contract/iosurface_pages --------------------------------------
+        target("iosurface_pages::decode_device_surface", |b, _| {
+            iosurface_pages::decode_device_surface(b).accepted()
+        }),
+        target("iosurface_pages::decode_device_plane", |b, _| {
+            iosurface_pages::decode_device_plane(b).accepted()
+        }),
+        target("iosurface_pages::device_desc_plane", |b, r| {
+            // The plane index comes off the guest's own descriptor.
+            iosurface_pages::device_desc_plane(b, r.next_u32() % 8).accepted()
+        }),
+        target("iosurface_pages::decode_texture_descriptor", |b, _| {
+            iosurface_pages::decode_texture_descriptor(b).accepted()
+        }),
+        target("iosurface_pages::decode_mapper_request_entry", |b, _| {
+            iosurface_pages::decode_mapper_request_entry(b).accepted()
+        }),
+        target("iosurface_pages::sample_window_from_device_desc", |b, r| {
+            // Format and geometry all arrive decoded from the guest, and this
+            // multiplies them into a byte span — the product-widening class.
+            iosurface_pages::sample_window_from_device_desc(
+                Some(b),
+                if r.one_in(4) {
+                    None
+                } else {
+                    Some(r.next_u32() % 8)
+                },
+                a_pixel_format(r),
+                a_dimension(r),
+                a_dimension(r),
+            )
+            .accepted()
+        }),
+        target("iosurface_pages::mapping_span_bound", |b, r| {
+            iosurface_pages::mapping_span_bound(
+                Some(b),
+                a_pixel_format(r),
+                a_dimension(r),
+                a_dimension(r),
+            )
+            .accepted()
+        }),
     ]
+}
+
+/// One past the largest edge any surface this device presents has: 16K, which
+/// is above every display mode and every texture bound the tree carries.
+///
+/// A dimension is not an opcode and cannot be enumerated, but it is not a
+/// uniform `u32` either. `sample_window_from_device_desc` returns a window only
+/// when `bytes_per_row >= width * bytes_per_pixel`, and `bytes_per_row` comes
+/// out of a descriptor whose own words are bounded by the record — so a width
+/// of ~2^31 makes that inequality unsatisfiable and the whole span calculation
+/// unreachable.
+const MAX_PLAUSIBLE_EDGE: u32 = 16384;
+
+/// A surface edge: usually plausible, one draw in four wild.
+///
+/// The wild draw is not a leftover. A `u32` width multiplied by a `u32` height
+/// is the overflow shape `a_product_is_widened_before_it_is_taken` exists for,
+/// and dropping it here would take that case out of this harness entirely.
+fn a_dimension(rng: &mut Rng) -> u32 {
+    if rng.one_in(4) {
+        rng.next_u32()
+    } else {
+        rng.next_u32() % MAX_PLAUSIBLE_EDGE
+    }
+}
+
+/// A pixel format, usually one the device actually knows.
+///
+/// Both `iosurface_pages` entries below refuse immediately on a format
+/// `format_bytes_per_pixel` does not recognise, and a `u16` drawn uniformly is
+/// unrecognised almost always — so the span arithmetic they exist for would
+/// never run. The recognised set is *asked for* rather than listed: the crate
+/// already exposes the predicate, so the harness cannot drift from it and no
+/// format ordinal is written out here.
+///
+/// One draw in eight stays wild, because refusing an unknown format is itself a
+/// path worth driving.
+fn a_pixel_format(rng: &mut Rng) -> u16 {
+    if rng.one_in(8) {
+        return rng.next_u32() as u16;
+    }
+    let known = known_pixel_formats();
+    known[(rng.next_u64() as usize) % known.len()]
+}
+
+/// Every `u16` the device admits as a pixel format, computed once.
+fn known_pixel_formats() -> &'static [u16] {
+    static KNOWN: std::sync::OnceLock<Vec<u16>> = std::sync::OnceLock::new();
+    KNOWN.get_or_init(|| {
+        let all: Vec<u16> = (0..=u16::MAX)
+            .filter(|f| iosurface_pages::format_bytes_per_pixel(*f).is_some())
+            .collect();
+        assert!(
+            !all.is_empty(),
+            "no pixel format is recognised at all; the predicate moved and this draw is now blind"
+        );
+        all
+    })
 }
 
 /// A segment and a matching cursor for the two record decoders that take one.
@@ -671,15 +887,26 @@ fn no_decoder_panics_on_bytes_the_guest_could_write() {
     );
 }
 
-/// Decoders no generated input is accepted by, and why that is the contract
+/// Parsers no generated input is accepted by, and why that is the contract
 /// rather than a gap in the corpus.
 ///
 /// `heap_query::decode_request` reads a 24-byte task/reply header whose first
 /// word must be one of a handful of query opcodes *and* whose declared length
-/// must agree with a per-opcode table, so the corpus would have to guess a pair
-/// rather than a value. Its body decoders —
-/// `decode_serialized_texture_descriptor` and the wide form — are driven
-/// directly and do reach, which is where the arithmetic lives.
+/// must agree with a per-opcode table. That is a joint constraint on two fields
+/// the corpus draws independently, so it cannot be reached by drawing harder —
+/// it would have to guess a consistent pair. Its body decoders,
+/// `decode_serialized_texture_descriptor` and the wide form, are driven directly
+/// and do reach, and that is where the arithmetic is.
+///
+/// It is still fuzzed for panics on every input; what it does not have is an
+/// *acceptance*, which is what this list records.
+///
+/// `iosurface_pages::sample_window_from_device_desc` was briefly written down
+/// here as a second joint constraint. It is not one — it reaches as soon as the
+/// format and the geometry are drawn from plausible sets, and the entry was
+/// added while the code that draws them was still dead. A verdict about a
+/// generator is worth what the generator was actually doing when it was
+/// written; this list is short on purpose.
 const NO_REACH: [&str; 1] = ["heap_query::decode_request"];
 
 fn hex(bytes: &[u8]) -> String {
@@ -690,20 +917,50 @@ fn hex(bytes: &[u8]) -> String {
     s
 }
 
-/// Files whose `pub fn decode*` must all be driven above.
-///
-/// `runtime/decode/` is walked whole, so a new module under it is covered the
-/// day it lands. `heap_query.rs` sits outside that tree and is named here
-/// because it is a decoder by every property that matters — it parses a
-/// serializer record straight out of a guest descriptor page — and it is the
-/// only one of those outside `decode/`.
-const EXTRA_DECODER_FILE: &str = "crates/reims-vgpu/src/runtime/heap_query.rs";
+/// Directories walked whole for guest-byte parsers, so a new module under one
+/// of them is covered the day it lands.
+const PARSER_TREES: [&str; 2] = [
+    "crates/reims-vgpu/src/runtime/decode",
+    "crates/reims-vgpu/src/runtime/icb",
+];
 
-/// `module::function` for every `pub fn decode*` on the scanned surface.
-fn declared_decoders() -> BTreeSet<String> {
+/// Guest-byte parsers that sit outside those trees, each named with what makes
+/// it one.
+///
+/// - `heap_query.rs` parses a serializer record straight out of a guest
+///   descriptor page.
+/// - `mtlb.rs` walks an MTLB container the guest wrote, searching it for a
+///   magic, which is a parse over attacker-chosen bytes by any definition.
+/// - `contract/iosurface_pages.rs` reads the IOSurface device descriptor the
+///   guest lays out, and derives page spans from it.
+///
+/// `runtime/spirv_layout.rs` belongs to this class and is **not** here: it is a
+/// private `mod`, so an integration test cannot name it. Its parser is reached
+/// only through `spirv_bind`, which exposes no `&[u8]` entry of its own, and
+/// its own tests live in-module. Making it `pub` to fuzz it would widen the
+/// crate's surface to suit a test.
+const PARSER_FILES: [&str; 3] = [
+    "crates/reims-vgpu/src/runtime/heap_query.rs",
+    "crates/reims-vgpu/src/runtime/mtlb.rs",
+    "crates/reims-vgpu/src/contract/iosurface_pages.rs",
+];
+
+/// `module::function` for every `pub fn` on the scanned surface that takes a
+/// byte slice.
+///
+/// The criterion is the **signature**, not the name. A name prefix — `decode*`,
+/// `parse*` — is the same trap the bound scans hit: a parser called
+/// `texture_type8_header` or `extract_air` reads guest bytes exactly as hard as
+/// one called `decode_something`, and a prefix rule reports it not as
+/// unadjudicated but not at all. Taking `&[u8]` is what makes a function a
+/// parser here, so that is what is matched.
+fn declared_parsers() -> BTreeSet<String> {
     let root = source_scan::workspace_root();
-    let mut files = source_scan::rust_sources(&root.join("crates/reims-vgpu/src/runtime/decode"));
-    files.push(root.join(EXTRA_DECODER_FILE));
+    let mut files: Vec<std::path::PathBuf> = PARSER_TREES
+        .iter()
+        .flat_map(|d| source_scan::rust_sources(&root.join(d)))
+        .collect();
+    files.extend(PARSER_FILES.iter().map(|f| root.join(f)));
 
     let mut found = BTreeSet::new();
     for path in files {
@@ -711,7 +968,7 @@ fn declared_decoders() -> BTreeSet<String> {
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or_default();
-        // A `tests.rs` sibling declares fixture encoders, not device decoders.
+        // A `tests.rs` sibling declares fixture encoders, not device parsers.
         if name == "tests" || name.ends_with("_tests") {
             continue;
         }
@@ -729,45 +986,86 @@ fn declared_decoders() -> BTreeSet<String> {
             continue;
         };
         let text = source_scan::blank_comments(&raw);
-        for line in text.lines() {
-            let line = line.trim_start();
-            let Some(rest) = line.strip_prefix("pub fn decode") else {
-                continue;
-            };
-            let leaf: String = rest
-                .chars()
-                .take_while(|c| c.is_alphanumeric() || *c == '_')
-                .collect();
-            found.insert(format!("{module}::decode{leaf}"));
+        for (leaf, args) in public_fn_signatures(&text) {
+            if args.contains("&[u8]") {
+                found.insert(format!("{module}::{leaf}"));
+            }
         }
     }
     found
 }
 
+/// `(name, argument list)` for every item-level `pub fn` in `text`.
+///
+/// Item-level: the declaration must start the line, so a `pub fn` inside an
+/// `impl` block indented under it is not mistaken for a free function the test
+/// could call by path.
+fn public_fn_signatures(text: &str) -> Vec<(String, String)> {
+    let bytes: Vec<char> = text.chars().collect();
+    let mut out = Vec::new();
+    let mut at = 0usize;
+    while let Some(rel) = text[at..].find("\npub fn ") {
+        let start = at + rel + "\npub fn ".len();
+        at = start;
+        let leaf: String = text[start..]
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        if leaf.is_empty() {
+            continue;
+        }
+        // Skip any generic parameter list, then take the parenthesised args.
+        let Some(open) = text[start..].find('(') else {
+            continue;
+        };
+        let open = start + open;
+        let mut depth = 0usize;
+        let mut close = open;
+        for (i, c) in bytes.iter().enumerate().skip(open) {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if close > open {
+            out.push((leaf, text[open..close].to_string()));
+        }
+    }
+    out
+}
+
 #[test]
-fn every_public_decoder_is_driven() {
-    let declared = declared_decoders();
+fn every_public_parser_is_driven() {
+    let declared = declared_parsers();
     let driven: BTreeSet<String> = targets().into_iter().map(|t| t.name.to_string()).collect();
 
     assert!(
         !declared.is_empty(),
-        "the scan found no `pub fn decode*` at all; it is reading the wrong shape or the wrong tree"
+        "the scan found no `pub fn` taking `&[u8]` at all; it is reading the wrong shape or the \
+         wrong tree"
     );
 
     let missing: Vec<&String> = declared.difference(&driven).collect();
     assert!(
         missing.is_empty(),
-        "these decoders read guest bytes and nothing proves they survive them — add each to \
-         `targets()` or state in this test why it is exempt: {missing:?}"
+        "these read guest bytes and nothing proves they survive them — add each to `targets()` \
+         or state in this test why it is exempt: {missing:?}"
     );
 
     // The other direction is just as load-bearing: a target naming a function
-    // that no longer exists means the table is describing a decoder the tree
+    // that no longer exists means the table is describing a parser the tree
     // does not have, and the missing check above would still pass.
     let stale: Vec<&String> = driven.difference(&declared).collect();
     assert!(
         stale.is_empty(),
-        "these targets name no `pub fn decode*` on the scanned surface; the table has drifted \
-         from the tree: {stale:?}"
+        "these targets name no `pub fn` taking `&[u8]` on the scanned surface; the table has \
+         drifted from the tree: {stale:?}"
     );
 }

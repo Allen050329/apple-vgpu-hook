@@ -1500,6 +1500,46 @@ fn a_colour_attachment_table_that_cannot_deliver_its_count_refuses() {
     );
 }
 
+/// `len` is a reach *within* `bytes`, and a reach past the end of `bytes` is
+/// not a reach at all.
+///
+/// Every bound in this function and its helpers is checked against `len` while
+/// the reads index `bytes`, so the two agreeing is what makes the whole family
+/// total. [`parse_vertex_block`] has always carried the equivalent clause
+/// (`block_end > bytes.len()`); this one did not, and a `len` past the end
+/// therefore passed `section_off + 8 > len` and then panicked on the first
+/// `ld32`. Two bytes were enough.
+///
+/// Not guest-reachable today — `decode_render_pipeline_descriptor` requires
+/// `declared == bytes.len()` before it calls this — but this is a `pub fn` in a
+/// `pub mod` whose totality rested on an invariant stated nowhere, and the next
+/// caller does not inherit that check.
+#[test]
+fn a_colour_table_reach_past_the_record_refuses_instead_of_indexing_past_it() {
+    let bytes = [0x36u8, 0xd2];
+    assert_eq!(
+        parse_color_attachments(&bytes, 9, 1),
+        Err(DecodeStatus::ErrShort("res_color_reach_past_record")),
+        "a reach past the record is refused, not read"
+    );
+
+    // The refusal is about the reach, not about the section: a reach that does
+    // fit still gets the ordinary short-section verdict.
+    assert_eq!(
+        parse_color_attachments(&bytes, bytes.len(), 1),
+        Err(DecodeStatus::ErrShort("res_color_section_oob")),
+        "a reach inside the record still reports the section it cannot hold"
+    );
+
+    // And `section_off == 0` stays the quiet no-section case whatever the reach
+    // says, because that arm returns before either check.
+    assert_eq!(
+        parse_color_attachments(&bytes, usize::MAX, 0),
+        Ok(Vec::new()),
+        "no colour section at all is still expected control flow"
+    );
+}
+
 /// A count above `MTLRenderPipelineDescriptor.colorAttachments`' eight
 /// subscripts refuses, rather than binding the first eight and dropping the
 /// rest onto nothing.
