@@ -43,27 +43,31 @@
 //! local fact, and writing down which refusal holds it is the only thing that
 //! notices when the refusal moves.
 //!
-//! # What this scan cannot see, measured rather than guessed
+//! # The blind spot this used to have, and why prose did not hold it
 //!
-//! Writing the verdicts first and then running the scan found one bound the
-//! shared vocabulary misses: `drain::census`'s `DOORBELL_OFFSETS_REPORTED`,
-//! which caps how many distinct doorbell offsets a census line names. It is a
-//! bound by every meaning of the word and contains none of [`BOUND_WORDS`], so
-//! nothing here matches it.
+//! Filtering by name means a bound named for **what it limits** rather than for
+//! **the fact that it limits** is invisible here. This file used to name one
+//! such constant — `drain::census`'s `DOORBELL_OFFSETS_REPORTED` — and argue it
+//! was safe to leave missed, since widening [`source_scan::BOUND_WORDS`] for a class that
+//! bounds only a log line would have to be done in three places at once.
 //!
-//! It is left missed on purpose. Adding `REPORTED` to the vocabulary would
-//! either fork it from the two sibling scans — and their agreement about what a
-//! bound is called is what keeps a renamed constant from vanishing out of one
-//! scan while staying in another — or widen all three for a class that by
-//! construction bounds only a log line. The honest fix is to name the miss here
-//! so the next reader does not conclude the scan is exhaustive.
+//! The argument was fine and the count was wrong. There were **two**:
+//! `model::state`'s `UNKNOWN_OPCODE_ECHO_WORDS` cut a walk in exactly the same
+//! position and no sentence anywhere mentioned it. That is the failure mode a
+//! documented exception has and an assertion does not — prose records the
+//! misses somebody happened to find, and reads as a complete list.
 //!
-//! The general shape of the blind spot: a bound named for **what it limits**
-//! rather than for **the fact that it limits**. If you add one, give it a `MAX`
-//! or `CAP` in the name and all three scans pick it up for free.
+//! Both now carry `MAX`, so this scan sees them and they are adjudicated in
+//! [`SKIPS`] like everything else. What keeps the hole shut is
+//! `a_bound_in_a_cut_is_named_like_one`: it reads the *same* positions through
+//! the same [`cut_arguments`], keeps the shouty arguments [`is_bound`] rejects,
+//! and fails until each is renamed or exempted with a reason. So this scan is
+//! now exhaustive over its own position by construction rather than by
+//! anybody's reading, and the general shape of the blind spot survives only
+//! where a bound is not spelled as a constant at all.
 
 mod source_scan;
-use source_scan::guest_facing_sources;
+use source_scan::{cut_arguments, guest_facing_sources, is_bound};
 
 /// What a walk that stops at its bound fails to reach.
 #[allow(
@@ -272,41 +276,32 @@ const SKIPS: &[(&str, &str, usize, Skip, &str)] = &[
          it, as Recomputable: dropping a residency-mirror entry sends the next \
          read back to the guest pages the writeback had just written",
     ),
+    (
+        "reims-vgpu/src/runtime/drain/census.rs",
+        "DOORBELL_OFFSETS_REPORTED_MAX",
+        2,
+        Skip::Observability,
+        "how many deferred register offsets `gfx_doorbell_delay` names, and the \
+         `shown=` that reports the same number back. The census line has to stay \
+         one line and the offsets are sorted descending by count, so the head is \
+         the answer to the question it asks. `offsets=` carries the true distinct \
+         count beside `shown=`, which is the property that makes this \
+         Observability rather than a truncation: a register that missed the list \
+         cannot read as one that never deferred",
+    ),
+    (
+        "reims-vgpu/src/model/state.rs",
+        "UNKNOWN_OPCODE_ECHO_WORDS_MAX",
+        1,
+        Skip::Observability,
+        "the leading payload words an unknown child opcode echoes into its fail \
+         line. Four covers every unknown packet a driven boot has produced whole, \
+         and `plen` reports the true length beside the echo, so a cut echo is \
+         distinguishable from a complete one. Nothing is executed from this walk \
+         — the packet was already unknown when it reached here, and refusing it \
+         is the event",
+    ),
 ];
-
-/// Words that make an identifier a statement about how many of something is
-/// allowed.
-///
-/// Deliberately identical to both siblings' vocabulary, so the three directions
-/// cannot disagree about what a bound is called.
-const BOUND_WORDS: &[&str] = &[
-    "CAP", "MAX", "LIMIT", "BUDGET", "RING", "HISTORY", "KEYS", "PER_", "WINDOWS",
-];
-
-/// Ways a walk is cut short by a value rather than by the data running out.
-const CUT: &[&str] = &[".take(", ".min("];
-
-/// Whether `token` names how many of something is allowed.
-fn is_bound(token: &str) -> bool {
-    if token.is_empty() {
-        return false;
-    }
-    let shouty = token.len() >= 3
-        && token.chars().any(|c| c.is_ascii_uppercase())
-        && token
-            .chars()
-            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
-    if shouty && BOUND_WORDS.iter().any(|w| token.contains(w)) {
-        return true;
-    }
-    let lower = token.to_ascii_lowercase();
-    matches!(lower.as_str(), "cap" | "capacity" | "limit" | "budget")
-        || lower.contains("_cap")
-        || lower.contains("cap_")
-        || lower.contains("_limit")
-        || lower.contains("_budget")
-        || lower.contains("_max")
-}
 
 #[derive(Debug)]
 struct Site {
@@ -317,36 +312,14 @@ struct Site {
 
 /// The capacity constants a line cuts a walk with.
 ///
-/// Only a bare path argument counts — `.min(a.len())` and `.take(over_cap)` are
-/// arithmetic over a runtime value, not a policy, and the type's own `MAX` is
-/// excluded by the `::`-qualified test so `u32::MAX` never reads as one.
+/// [`cut_arguments`] finds the positions; [`is_bound`] decides which of them are
+/// policy. The split is what lets `a_bound_in_a_cut_is_named_like_one` ask about
+/// the arguments this filter *rejects*, over provably the same population.
 fn cuts(line: &str) -> Vec<String> {
-    let mut found = Vec::new();
-    for cut in CUT {
-        let mut from = 0;
-        while let Some(at) = line[from..].find(cut) {
-            let open = from + at + cut.len();
-            from = open;
-            let arg: String = line[open..]
-                .chars()
-                .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == ':')
-                .collect();
-            // `u32::MAX` names a type's extreme, not this device's policy. Take
-            // the last path segment and require the path to be a bare name.
-            if arg.contains("::") {
-                continue;
-            }
-            // The argument must be the whole argument: `MAX_FOO)` not `MAX_FOO -
-            // 1)` or `MAX_FOO as usize)`, both of which are arithmetic.
-            if !line[open + arg.len()..].starts_with(')') {
-                continue;
-            }
-            if is_bound(&arg) {
-                found.push(arg);
-            }
-        }
-    }
-    found
+    cut_arguments(line)
+        .into_iter()
+        .filter(|arg| is_bound(arg))
+        .collect()
 }
 
 fn find_sites(sources: &[(String, String)]) -> Vec<Site> {

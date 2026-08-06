@@ -1222,14 +1222,14 @@ impl DoorbellCensus {
         offsets.sort_by_key(|(off, (count, _))| (std::cmp::Reverse(*count), *off));
         let distinct = offsets.len();
         let mut body = String::new();
-        for (off, (count, max_us)) in offsets.iter().take(DOORBELL_OFFSETS_REPORTED) {
+        for (off, (count, max_us)) in offsets.iter().take(DOORBELL_OFFSETS_REPORTED_MAX) {
             body.push_str(&format!(" off_{off:#x}={count}/{max_us}"));
         }
         Some(format!(
             "gfx_doorbell_delay win_ms={win_ms} queued={queued} direct={direct} \
              lockfree={lockfree} age_us={total} max_age_us={max} frame_late={late} \
              slow_us={DRAIN_TRANCHE_SLOW_US} offsets={distinct} shown={}{body}",
-            distinct.min(DOORBELL_OFFSETS_REPORTED)
+            distinct.min(DOORBELL_OFFSETS_REPORTED_MAX)
         ))
     }
 }
@@ -1241,7 +1241,14 @@ impl DoorbellCensus {
 /// distribution: a register deferring twice a second is not what costs a frame.
 /// `offsets=` states how many distinct ones there were, so a truncated tail is
 /// visible rather than implied.
-const DOORBELL_OFFSETS_REPORTED: usize = 4;
+///
+/// The `_MAX` is load-bearing rather than decoration: it is what puts this
+/// constant inside the vocabulary the three bound scans share, so the walk
+/// direction adjudicates it alongside every other cut instead of passing over
+/// it. `a_bound_in_a_cut_is_named_like_one` fails if it is renamed without one.
+/// Under its previous name it *was* that scan's documented blind spot — and the
+/// blind spot turned out to have a second occupant nobody had written down.
+const DOORBELL_OFFSETS_REPORTED_MAX: usize = 4;
 
 static DOORBELL: std::sync::LazyLock<DoorbellCensus> =
     std::sync::LazyLock::new(DoorbellCensus::default);

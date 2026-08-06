@@ -62,6 +62,113 @@ pub fn guest_facing_sources() -> Vec<(String, String)> {
         .collect()
 }
 
+/// Words that make an identifier a statement about how many of something is
+/// allowed, rather than about any particular one.
+///
+/// The vocabulary the three bound scans share. It lived in three copies, one per
+/// scan, each carrying a comment claiming the three were "deliberately
+/// identical" — and nothing compared them, which is the exact failure
+/// `a_bound_is_compared_where_it_is_declared` exists to name. They had already
+/// parted: two spelled [`is_bound`] without the path-qualified test that keeps
+/// `u64::MAX` from reading as a policy, so a `.min(u64::MAX)` would have been a
+/// bound to two scans and not to the third.
+///
+/// One definition, so a constant renamed out of the vocabulary disappears from
+/// all three at once rather than from one — which is what makes a site that
+/// moves between the three directions impossible to lose.
+pub const BOUND_WORDS: &[&str] = &[
+    "CAP", "MAX", "LIMIT", "BUDGET", "RING", "HISTORY", "KEYS", "PER_", "WINDOWS",
+];
+
+/// Whether `token` names how many of something is allowed.
+///
+/// A path-qualified token is never one: `u64::MAX` names a type's extreme, not
+/// this device's policy. Callers that tokenize bare identifiers out of a window
+/// must decide qualification themselves — that is an extraction question, and
+/// only the vocabulary belongs here — but a token that still carries its `::`
+/// is rejected here so a caller cannot forget.
+///
+/// The bare lowercase words are in the vocabulary because a real bound is very
+/// often a parameter called exactly `cap`; leaving them out was measured, by
+/// injecting a `while self.recent.len() > cap { … }` into `host_writes` and
+/// watching the eviction scan stay green. Bare `max` is deliberately absent in
+/// any position: it is the name of two std methods and sits beside almost every
+/// arithmetic clamp in this crate, and a `max_` *prefix* was tried and reverted
+/// in the same hour — its only catch was `delete_task`'s `retain`, next to the
+/// `max_task_id_seen` high-water counter, which is a lifetime removal and not a
+/// bound at all. `MAX_` in a shouty constant is the spelling a real bound uses
+/// here, and the shouty rule already has it.
+pub fn is_bound(token: &str) -> bool {
+    if token.is_empty() || token.contains("::") {
+        return false;
+    }
+    if is_shouty(token) && BOUND_WORDS.iter().any(|w| token.contains(w)) {
+        return true;
+    }
+    let lower = token.to_ascii_lowercase();
+    matches!(lower.as_str(), "cap" | "capacity" | "limit" | "budget")
+        || lower.contains("_cap")
+        || lower.contains("cap_")
+        || lower.contains("_limit")
+        || lower.contains("_budget")
+        || lower.contains("_max")
+}
+
+/// Ways a walk is cut short by a value rather than by the data running out.
+pub const CUT: &[&str] = &[".take(", ".min("];
+
+/// Every bare identifier standing as the whole argument of a [`CUT`] on `line`.
+///
+/// The extraction half of the walk direction, published apart from the
+/// vocabulary half so two tests can ask different questions of one population.
+/// `a_bounded_walk_says_what_it_skips` keeps the arguments [`is_bound`] accepts
+/// and demands a verdict for each; `a_bound_in_a_cut_is_named_like_one` keeps
+/// the shouty ones it *rejects* and demands they be renamed. Sharing this
+/// function is what makes the second a gate on the first rather than a second
+/// opinion about it — if this drifted, the gate would certify a population the
+/// scan does not read.
+///
+/// Only a bare whole argument counts. `.min(a.len())` and `.take(over_cap + 1)`
+/// are arithmetic over a runtime value rather than a policy, and a `::`-carrying
+/// path is dropped here so `u32::MAX` never reaches either question.
+pub fn cut_arguments(line: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    for cut in CUT {
+        let mut from = 0;
+        while let Some(at) = line[from..].find(cut) {
+            let open = from + at + cut.len();
+            from = open;
+            let arg: String = line[open..]
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == ':')
+                .collect();
+            if arg.contains("::") {
+                continue;
+            }
+            // The argument must be the whole argument: `MAX_FOO)` not `MAX_FOO -
+            // 1)` or `MAX_FOO as usize)`, both of which are arithmetic.
+            if !line[open + arg.len()..].starts_with(')') {
+                continue;
+            }
+            found.push(arg);
+        }
+    }
+    found
+}
+
+/// Whether `token` is spelled like a constant: `SCREAMING_SNAKE_CASE`.
+///
+/// Published beside [`is_bound`] because the naming gate needs the same answer
+/// for the opposite purpose — [`is_bound`] asks whether a constant says it is a
+/// bound, and the gate asks which constants had to.
+pub fn is_shouty(token: &str) -> bool {
+    token.len() >= 3
+        && token.chars().any(|c| c.is_ascii_uppercase())
+        && token
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+}
+
 /// Every `.rs` file under `dir`, recursively, in a stable order.
 pub fn rust_sources(dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();

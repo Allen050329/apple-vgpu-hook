@@ -94,7 +94,15 @@ impl ExecFault {
 /// bytes of which 64 are payload) while bounding the line for a command that
 /// carries a large buffer; `plen` always reports the true length, so a reader
 /// can tell an echo that was cut from one that was complete.
-const UNKNOWN_OPCODE_ECHO_WORDS: usize = 4;
+///
+/// The `_MAX` is load-bearing rather than decoration: it is what puts this
+/// constant inside the vocabulary the three bound scans share, so the walk
+/// direction adjudicates it alongside every other cut.
+/// `a_bound_in_a_cut_is_named_like_one` fails if it is renamed without one.
+/// Without it this cut was invisible to every one of them, and — unlike the one
+/// other constant in that position — invisible to the prose recording the gap
+/// as well.
+const UNKNOWN_OPCODE_ECHO_WORDS_MAX: usize = 4;
 
 /// Fail-visible protocol event (unknown/malformed). Never invents semantics.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -189,7 +197,7 @@ impl crate::observe::Decline for FailEvent {
                 if !payload.is_empty() {
                     let words = payload
                         .chunks_exact(4)
-                        .take(UNKNOWN_OPCODE_ECHO_WORDS)
+                        .take(UNKNOWN_OPCODE_ECHO_WORDS_MAX)
                         .map(|word| format!("{:#010x}", crate::contract::endian::ld32(word)))
                         .collect::<Vec<_>>()
                         .join(":");
@@ -3588,7 +3596,7 @@ mod fail_vocabulary_tests {
         assert!(long.contains("plen=40"), "{long}");
         assert_eq!(
             long.matches("0x").count(),
-            UNKNOWN_OPCODE_ECHO_WORDS + 1,
+            UNKNOWN_OPCODE_ECHO_WORDS_MAX + 1,
             "the echo is bounded, and the opcode is the one other hex field: {long}"
         );
 

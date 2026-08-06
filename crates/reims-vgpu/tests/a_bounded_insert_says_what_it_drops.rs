@@ -56,7 +56,7 @@
 //! [`an_eviction_says_what_it_costs`]: ../an_eviction_says_what_it_costs/index.html
 
 mod source_scan;
-use source_scan::guest_facing_sources;
+use source_scan::{guest_facing_sources, is_bound};
 
 /// What is lost when this site declines to record something.
 ///
@@ -156,13 +156,6 @@ const DROPS: &[(&str, &str, usize, Drop_, &str)] = &[
 /// Ways a collection grows.
 const INSERT: &[&str] = &["push", "push_back", "push_front", "insert", "extend"];
 
-/// Words that make an identifier a statement about how many of something is
-/// allowed. Deliberately the same vocabulary as the eviction scan's, so the two
-/// directions cannot disagree about what a bound is called.
-const BOUND_WORDS: &[&str] = &[
-    "CAP", "MAX", "LIMIT", "BUDGET", "RING", "HISTORY", "KEYS", "PER_", "WINDOWS",
-];
-
 /// How far above an insertion to look for the comparison that gates it.
 ///
 /// Much tighter than the eviction scan's twenty. A capacity gate on an insert is
@@ -215,28 +208,6 @@ fn capacity_gate(line: &str) -> Option<(String, String)> {
         return None;
     }
     Some((recv, token))
-}
-
-/// Whether `token` names how many of something is allowed.
-fn is_bound(token: &str) -> bool {
-    if token.is_empty() {
-        return false;
-    }
-    let shouty = token.len() >= 3
-        && token.chars().any(|c| c.is_ascii_uppercase())
-        && token
-            .chars()
-            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
-    if shouty && BOUND_WORDS.iter().any(|w| token.contains(w)) {
-        return true;
-    }
-    let lower = token.to_ascii_lowercase();
-    matches!(lower.as_str(), "cap" | "capacity" | "limit" | "budget")
-        || lower.contains("_cap")
-        || lower.contains("cap_")
-        || lower.contains("_limit")
-        || lower.contains("_budget")
-        || lower.contains("_max")
 }
 
 fn find_sites(sources: &[(String, String)]) -> Vec<Site> {

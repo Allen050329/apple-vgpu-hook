@@ -42,7 +42,7 @@
 //! vice versa, so no single compilation sees them all.
 
 mod source_scan;
-use source_scan::guest_facing_sources;
+use source_scan::{guest_facing_sources, is_bound};
 
 /// What is lost when this site drops an entry it had already admitted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -241,12 +241,6 @@ const SHRINK: &[&str] = &[
     "remove",
 ];
 
-/// Words that make an identifier a statement about how many of something is
-/// allowed, rather than about any particular one.
-const BOUND_WORDS: &[&str] = &[
-    "CAP", "MAX", "LIMIT", "BUDGET", "RING", "HISTORY", "KEYS", "PER_", "WINDOWS",
-];
-
 /// Ways a fragment of source says "how many / how much".
 const SIZE_TERMS: &[&str] = &[".len()", ".count()", "_bytes", "_count", ".bytes"];
 
@@ -266,6 +260,13 @@ struct Site {
 }
 
 /// The capacity term in `window`, if it has one.
+///
+/// This scan is the one of the three whose bound is not an argument but a token
+/// somewhere in a twenty-line window, so it does its own tokenizing and asks
+/// [`is_bound`] about each token in turn. Qualification is decided here, from
+/// the characters before the token, because by the time a bare `MAX` has been
+/// split out of `u64::MAX` the `::` is gone — that is an extraction fact, and
+/// the vocabulary it feeds is the shared one.
 fn bound_term(window: &str) -> Option<String> {
     let bytes: Vec<char> = window.chars().collect();
     let mut i = 0;
@@ -281,34 +282,7 @@ fn bound_term(window: &str) -> Option<String> {
         let token: String = bytes[start..i].iter().collect();
         // `u64::MAX` names a type's extreme, not this device's policy.
         let path_qualified = start >= 2 && bytes[start - 1] == ':' && bytes[start - 2] == ':';
-        let shouty = token.len() >= 3
-            && token.chars().any(|c| c.is_ascii_uppercase())
-            && token
-                .chars()
-                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
-        if shouty && !path_qualified && BOUND_WORDS.iter().any(|w| token.contains(w)) {
-            return Some(token);
-        }
-        let lower = token.to_ascii_lowercase();
-        // The bare words are here because a bound is very often a parameter
-        // called exactly `cap`. Leaving them out was measured, by injecting a
-        // `while self.recent.len() > cap { … }` into `host_writes` and watching
-        // this test stay green.
-        //
-        // `max` is deliberately not among them, in any position. Bare, it is
-        // the name of two std methods and sits beside almost every arithmetic
-        // clamp in this crate. A `max_` *prefix* was tried and reverted in the
-        // same hour: its only catch was `delete_task`'s `retain`, next to the
-        // `max_task_id_seen` high-water counter, which is a lifetime removal
-        // and not a bound at all. `MAX_` in a shouty constant is the spelling a
-        // real bound uses here, and the rule above already has it.
-        if matches!(lower.as_str(), "cap" | "capacity" | "limit" | "budget")
-            || lower.contains("_cap")
-            || lower.contains("cap_")
-            || lower.contains("_limit")
-            || lower.contains("_budget")
-            || lower.contains("_max")
-        {
+        if !path_qualified && is_bound(&token) {
             return Some(token);
         }
     }
