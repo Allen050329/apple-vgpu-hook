@@ -2120,9 +2120,10 @@ pub fn counter_snapshot() -> CounterSnapshot {
     snap.target_free_allocs = t_allocs;
     snap.target_recycle_admits = t_admits;
     snap.target_recycle_cap_drops = t_cap_drops;
-    let (reg_peak, reg_evictions) = eng.pools.registry_pressure_stats();
+    let (reg_peak, reg_evictions, reg_peak_bytes) = eng.pools.registry_pressure_stats();
     snap.registry_non_pinned_peak = reg_peak;
     snap.target_registry_cap_evictions = reg_evictions;
+    snap.registry_non_pinned_peak_bytes = reg_peak_bytes;
     snap
 }
 

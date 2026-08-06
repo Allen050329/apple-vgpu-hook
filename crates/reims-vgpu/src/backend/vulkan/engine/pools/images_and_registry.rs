@@ -1062,6 +1062,36 @@ impl ResourcePools {
         self.registry_order.len().saturating_sub(pinned)
     }
 
+    /// Attachment bytes the same non-pinned set occupies: `w × h × texel` summed
+    /// over every slot [`Self::non_pinned_registry_len`] counts.
+    ///
+    /// The number [`REGISTRY_CAP`]'s doc argues from — it says "slots are cheap;
+    /// the real VRAM guard is per-image bytes", and then bounds the slots. It
+    /// also quotes ~516 MiB for a burst and a ~1005 MiB idle baseline, both from
+    /// a `vram` census line that no longer exists anywhere in this crate, so
+    /// until this function there was nothing in the device that could say what a
+    /// count of 320 costs. 320 slots is 5 MiB of 16x16 scratch or 10 GiB of 4K.
+    ///
+    /// Attachment footprint, not allocation footprint: it does not know tiling
+    /// padding or the slab's rounding, and a format
+    /// [`crate::backend::vulkan::translate::pixel::bytes_per_texel`] declines
+    /// (block-compressed, multi-planar — neither of which a colour attachment
+    /// uses) contributes nothing rather than a guessed size. So it is a lower
+    /// bound on VRAM, which is the safe direction for a figure that exists to
+    /// decide whether a bound is too loose.
+    fn non_pinned_registry_bytes(&self) -> u64 {
+        self.registry
+            .values()
+            .filter(|slot| slot.pin_count == 0)
+            .filter_map(|slot| {
+                let texel = crate::backend::vulkan::translate::pixel::bytes_per_texel(
+                    slot.color_format,
+                )?;
+                Some(u64::from(slot.width) * u64::from(slot.height) * u64::from(texel))
+            })
+            .sum()
+    }
+
     /// Fold the current non-pinned population into the high-water band and
     /// return it.
     ///
@@ -1076,9 +1106,15 @@ impl ResourcePools {
     /// one point every admission passes through, and it is where the population
     /// is at its highest. Sampling after the walk would record the cap back
     /// rather than the demand that crossed it.
+    /// Both bands are folded here, from the same sample, so `peak` and
+    /// `peak_bytes` describe one population rather than two moments — the two
+    /// together are what say whether a slot count is a sane proxy for VRAM.
     fn note_registry_reach(&mut self) -> usize {
         let non_pinned = self.non_pinned_registry_len();
         self.registry_non_pinned_peak = self.registry_non_pinned_peak.max(non_pinned as u64);
+        self.registry_non_pinned_peak_bytes = self
+            .registry_non_pinned_peak_bytes
+            .max(self.non_pinned_registry_bytes());
         non_pinned
     }
 
@@ -1970,6 +2006,68 @@ mod pin_count_tests {
         );
     }
 
+    /// The byte band is not the slot band scaled, and a boot needs both.
+    ///
+    /// `REGISTRY_CAP` bounds slots while saying the resource it protects is
+    /// bytes. This drives the difference directly: two populations of the same
+    /// size, one of 16x16 scratch and one of 4K attachments, are indistinguishable
+    /// to the slot band and four orders of magnitude apart in VRAM. A cap that
+    /// cannot see that gap is the reason this counter exists.
+    ///
+    /// Fails without `non_pinned_registry_bytes`: with the byte band left at the
+    /// slot band's population, the two asserts on `.2` read the same number.
+    #[test]
+    fn the_registry_byte_band_separates_populations_the_slot_band_cannot() {
+        const TEXEL: u64 = 4; // SCANOUT_FORMAT, the shape `new_resident` builds
+        let mut pools = ResourcePools::new();
+        for i in 1..=3u32 {
+            admit(&mut pools, surf(i), 10, 0);
+        }
+        pools.note_registry_reach();
+        let (slots_small, _, bytes_small) = pools.registry_pressure_stats();
+        assert_eq!(slots_small, 3);
+        assert_eq!(bytes_small, 3 * 16 * 16 * TEXEL);
+
+        // The same slot count at 4K geometry. Pinned peers stay excluded from
+        // both bands, or the byte reading would count VRAM the cap never bounds.
+        let mut big = ResourcePools::new();
+        for i in 1..=3u32 {
+            admit(&mut big, surf(i), 10, 0);
+            let slot = big.registry.get_mut(&surf(i)).expect("just admitted");
+            slot.width = 3840;
+            slot.height = 2160;
+        }
+        admit(&mut big, surf(9), 10, 1);
+        let pinned = big.registry.get_mut(&surf(9)).expect("just admitted");
+        pinned.width = 3840;
+        pinned.height = 2160;
+        big.note_registry_reach();
+        let (slots_big, _, bytes_big) = big.registry_pressure_stats();
+        assert_eq!(
+            slots_big, slots_small,
+            "the slot band cannot tell the two populations apart"
+        );
+        assert_eq!(
+            bytes_big,
+            3 * 3840 * 2160 * TEXEL,
+            "the byte band can, and the pinned 4K peer is not in it"
+        );
+
+        // A high-water mark, like its sibling: the population falling does not
+        // lower it, or a burst that drains between two census samples reads as
+        // if it never happened.
+        for i in 1..=3u32 {
+            big.registry.remove(&surf(i));
+            big.registry_order.retain(|k| k != &surf(i));
+        }
+        big.note_registry_reach();
+        assert_eq!(
+            big.registry_pressure_stats().2,
+            bytes_big,
+            "the byte band holds its peak"
+        );
+    }
+
     /// The registry reach band records the highest population, and does not
     /// fall back when residents go away.
     ///
@@ -1993,8 +2091,8 @@ mod pin_count_tests {
         let mut pools = ResourcePools::new();
         assert_eq!(
             pools.registry_pressure_stats(),
-            (0, 0),
-            "a fresh pools has neither reach nor loss"
+            (0, 0, 0),
+            "a fresh pools has neither reach, loss, nor footprint"
         );
 
         admit(&mut pools, surf(1), 10, 0);

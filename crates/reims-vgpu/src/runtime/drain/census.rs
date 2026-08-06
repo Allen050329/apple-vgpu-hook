@@ -1503,10 +1503,11 @@ fn emit_engine_delta() {
 #[cfg(feature = "backend-vulkan")]
 fn emit_registry_pressure(now: &crate::backend::vulkan::engine::CounterSnapshot) {
     crate::observe::off(format!(
-        "registry_pressure (levels, not per-interval) peak={} cap={} evicts={}",
+        "registry_pressure (levels, not per-interval) peak={} cap={} evicts={} peak_mib={}",
         now.registry_non_pinned_peak,
         crate::backend::vulkan::engine::REGISTRY_CAP,
         now.target_registry_cap_evictions,
+        now.registry_non_pinned_peak_bytes >> 20,
     ));
 }
 

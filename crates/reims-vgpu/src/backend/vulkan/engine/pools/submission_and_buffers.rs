@@ -92,6 +92,7 @@ impl ResourcePools {
             reclaimed_recent: VecDeque::new(),
             use_clock: 0,
             registry_non_pinned_peak: 0,
+            registry_non_pinned_peak_bytes: 0,
             registry_cap_evictions: 0,
             idle_clock_ms: 0,
             last_drain_ms: 0,
@@ -754,15 +755,22 @@ impl ResourcePools {
         self.target_free.stats()
     }
 
-    /// `(non_pinned_peak, cap_evictions)` for the resident registry — the reach
-    /// and the loss, which only answer the question together.
+    /// `(non_pinned_peak, cap_evictions, non_pinned_peak_bytes)` for the
+    /// resident registry — the reach, the loss, and what the reach costs. None
+    /// of the three answers the question alone.
     ///
-    /// Both are cumulative for the life of the pools. The peak is the reading
-    /// that makes a zero eviction count mean something: without it, a boot that
-    /// never came near `REGISTRY_CAP` and a boot that stopped one resident short
-    /// of it report identically.
-    pub(crate) fn registry_pressure_stats(&self) -> (u64, u64) {
-        (self.registry_non_pinned_peak, self.registry_cap_evictions)
+    /// All three are cumulative for the life of the pools. The peak is the
+    /// reading that makes a zero eviction count mean something: without it, a
+    /// boot that never came near `REGISTRY_CAP` and a boot that stopped one
+    /// resident short of it report identically. The bytes are what say whether
+    /// the cap is measuring the resource it claims to protect — see
+    /// [`ResourcePools::non_pinned_registry_bytes`].
+    pub(crate) fn registry_pressure_stats(&self) -> (u64, u64, u64) {
+        (
+            self.registry_non_pinned_peak,
+            self.registry_cap_evictions,
+            self.registry_non_pinned_peak_bytes,
+        )
     }
 
     /// Cumulative compute-storage recycle diagnostics: `(admits, cap_drops)`.

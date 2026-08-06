@@ -252,6 +252,11 @@ pub(crate) struct ResourcePools {
     /// atomic to pay for. `engine::counter_snapshot` merges them in.
     registry_non_pinned_peak: u64,
     registry_cap_evictions: u64,
+    /// The same high-water in attachment bytes rather than slots, sampled from
+    /// the same population at the same instant. See
+    /// [`ResourcePools::non_pinned_registry_bytes`] for why a slot count cannot
+    /// stand in for it and why this reads as a lower bound.
+    registry_non_pinned_peak_bytes: u64,
     /// Monotonic wall-clock milliseconds for the resident-target idle drain, fed
     /// from the poll heartbeat and each publish ([`Self::advance_registry_touch_and_drain`]).
     /// Each admit/hit/present stamps its slot's `last_touch_ms` with this value;

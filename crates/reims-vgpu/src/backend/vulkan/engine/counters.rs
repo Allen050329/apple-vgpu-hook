@@ -374,6 +374,18 @@ engine_counters! {
         /// draw rendering into the same identity, so a non-zero reading here is
         /// guest content destroyed rather than a cache asked to refill.
         target_registry_cap_evictions,
+        /// The same high-water in attachment bytes, sampled from the same
+        /// population at the same instant as `registry_non_pinned_peak`.
+        ///
+        /// `REGISTRY_CAP` bounds slots while its own doc says "slots are cheap;
+        /// the real VRAM guard is per-image bytes" — so the cap does not measure
+        /// the resource it is defending. 320 slots is 5 MiB of 16x16 scratch or
+        /// 10 GiB of 4K, and nothing in this device could tell those apart until
+        /// this counter. A lower bound on VRAM (attachment footprint, no tiling
+        /// padding, and a format with no single texel size contributes nothing),
+        /// which is the safe direction for a figure that exists to decide
+        /// whether a bound is too loose.
+        registry_non_pinned_peak_bytes,
     }
 }
 /// The `note_*` helpers: the increments that are not a bare `fetch_add(1)` at
