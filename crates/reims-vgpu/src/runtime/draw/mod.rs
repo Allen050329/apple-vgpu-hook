@@ -140,21 +140,39 @@ use render_target::{lookup_render_target, ResolvedRenderTarget};
 /// channel and counts the slots, and `render_bind_reach_texture_le_table` is the
 /// leading indicator — it moves one band earlier, at slot 17.
 ///
-/// # Widening the texture band is blocked outside this repository
+/// # What widening the texture band costs
 ///
-/// Not by effort here, which is why the reading is not the whole argument. The
-/// Vulkan arm's binding numbers are `metal2vulkan`'s output, not this crate's
-/// choice: the translator emits `OpDecorate Binding` at `32 + N` for Metal
-/// texture index `N` and `64 + N` for sampler `N`, and
-/// [`crate::runtime::spirv_bind`] only *relocates* those numbers within the
-/// bands it finds. A texture at index 40 would be emitted at binding 72, which
-/// is sampler 8 in the same scheme — so the 32-wide texture band is a property
-/// of the pinned `metal2vulkan` dependency, and no in-tree change widens it.
+/// The Vulkan arm's binding numbers are `metal2vulkan`'s output, not this
+/// crate's choice: the translator emits `OpDecorate Binding` at `32 + N` for
+/// Metal texture index `N` and `64 + N` for sampler `N`, bases 32 apart. So a
+/// texture at index 40 and a sampler at index 8 are both binding 72, and the
+/// *number* cannot say which is which.
 ///
-/// The Metal-direct arm has no such constraint (its own table is 128), but this
-/// bound is applied during stream accumulation, before either backend, so
-/// splitting it would mean the two arms accepting different guest streams.
-/// Whoever takes this on starts in the translator, not here.
+/// The *variable* can. A texture is an `OpTypeImage` and a sampler an
+/// `OpTypeSampler`, and `spirv_bind::variable_classes` resolves each descriptor
+/// through its type to a class; both fragment relocations already select on that
+/// rather than on the band. metal2vulkan's own reflection carries `kind` and
+/// `metal_index` as separate fields, so the mapping is recoverable twice over,
+/// and nothing in the translator rejects an index at or above 32. This bound is
+/// therefore load-bearing for the *current* numbering rather than forced by the
+/// dependency: while it holds, no index can reach a neighbouring band.
+///
+/// What remains is a re-band, and it is not small. Every consumer keyed on the
+/// un-relocated `TEXTURE_BINDING_BASE + N` number moves with it
+/// (`storage_image_access`, `image_format`, `specialize_image_formats`,
+/// `reflected_sampled_kind`, `texture_shape_for_binding`, and the engine's
+/// descriptor writes), and `MAX_BIND_SLOTS` splits into the three
+/// `bind_limit` values. Two things make it affordable: the descriptor set
+/// layout is built from the bindings a draw actually provides rather than a
+/// dense table, so a wider *number* space costs no descriptors; and the
+/// relocation is cached per shader variant, so the classification is off the
+/// draw path. Nothing yet queries `maxPerStageDescriptorSampledImages`, which a
+/// widened band would need.
+///
+/// The Metal-direct arm has no numbering constraint at all (its own table is
+/// 128), but this bound is applied during stream accumulation, before either
+/// backend, so splitting it would mean the two arms accepting different guest
+/// streams.
 pub const MAX_BIND_SLOTS: u32 = 31;
 
 /// Convert a guest-declared byte length to a host allocation size.
