@@ -1511,30 +1511,34 @@ fn emit_engine_delta() {
 /// observed a destroyed one, and a zero missing-count is a null instrument
 /// rather than a pass.
 ///
-/// This is not hypothetical. The cap was once driven six times over its bound on
-/// a compositing workload and reported `evicts=1591` against
-/// `sampled_resident_missing=0`, and that pair was read as evidence the LRU had
-/// protected the residents still being read. It could not have been: the LRU's
-/// recency bump (`registry_note_sampled_use`) is called from that same
-/// Target-only arm, and the same class of boot reports `sampled_gpu_binds=0`
-/// across every window measured. Neither the harm nor the protection against it
-/// was reachable on the workload that ran, so the experiment's success criterion
-/// could not have failed.
+/// This field exists because that denominator was once argued about from two
+/// boots that had never been compared. The cap was driven six times over its
+/// bound and reported `evicts=1591` against `sampled_resident_missing=0`; a
+/// later reading of `sampled_gpu_binds=0` — taken on a *different* workload —
+/// was used to call that pair a null instrument. Printing the denominator beside
+/// the pair settled it in one boot: `web-content-probe --churn 1` reports
+/// `resident_samples=11742`, so the arm does run, the zero was a real
+/// measurement, and the null-instrument objection was itself the unfounded claim.
 ///
-/// Emitting the denominator beside the pair is what stops that reading from
-/// being made again — `evicts=N missing=0` with `resident_samples=0` says the
-/// question was not asked, and only `resident_samples>0` makes the zero mean
-/// anything.
+/// Which is the point of the field either way. `evicts=N missing=0` with
+/// `resident_samples=0` says the question was not asked; only
+/// `resident_samples>0` makes the zero mean anything — and now nobody has to
+/// join two boots to find out which they are looking at.
+///
+/// `compute_storage_evicts` is the sibling registry's loss count, on this line
+/// because it is the same quantity over the other population and had no emitter
+/// at all — a counter no boot could read is not an instrument.
 #[cfg(feature = "backend-vulkan")]
 fn emit_registry_pressure(now: &crate::backend::vulkan::engine::CounterSnapshot) {
     crate::observe::off(format!(
         "registry_pressure (levels, not per-interval) peak={} cap={} evicts={} peak_mib={} \
-         resident_samples={}",
+         resident_samples={} compute_storage_evicts={}",
         now.registry_non_pinned_peak,
         crate::backend::vulkan::engine::REGISTRY_CAP,
         now.target_registry_cap_evictions,
         now.registry_non_pinned_peak_bytes >> 20,
         now.sampled_gpu_binds,
+        now.compute_storage_cap_evictions,
     ));
 }
 

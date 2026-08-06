@@ -1049,57 +1049,68 @@ impl FreeTargetImage {
 ///   probe regions not measuring their declared colour 0
 /// ```
 ///
-/// That was read as **1591 evictions, no measured loss** — the LRU protecting
-/// residents still being read, because `cap_eviction_victim` orders by `use_seq`
-/// and [`ResourcePools::registry_note_sampled_use`] bumps it on a *read* rather
-/// than only on a render-into.
+/// **1591 evictions, no measured loss.** Not one of them destroyed a resident
+/// that anything later sampled, and the desktop screenshotted intact. The LRU is
+/// why: `cap_eviction_victim` orders by `use_seq`, which
+/// [`ResourcePools::registry_note_sampled_use`] bumps on a *read* and not only
+/// on a render-into, so a resident that is still being sampled cannot become the
+/// minimum.
 ///
-/// # That reading does not hold, because both counters are Target-only
+/// # The denominator that reading needs, and why it was once doubted
 ///
 /// `sampled_resident_missing` is raised at exactly one site, in the
 /// `SampledSource::Target` arm of the engine's sampled loop. So is the
 /// `registry_note_sampled_use` call the LRU explanation rests on, and so is the
-/// sole increment of `sampled_gpu_binds`. All three are the same arm.
+/// sole increment of `sampled_gpu_binds`. All three are the same arm — so if
+/// that arm never ran, a zero missing-count would be a null instrument rather
+/// than a pass, and the LRU could not have been what spared those victims.
 ///
-/// And that arm does not run on this workload. The same class of driven x86/PCI
-/// boot reports `sampled_gpu_binds=0` across every window measured — see the
-/// `draw_phase` module doc, where a zero there is what identified `GuestRuns` as
-/// the arm actually paying the sampled loop's cost. Zero Target binds means:
+/// That objection was raised here, on the strength of the `draw_phase` module
+/// doc's `sampled_gpu_binds=0`, and **it was wrong**. That zero was measured on
+/// a window-drag/Safari boot; the 1591-eviction run was `web-content-probe
+/// --churn 1`, a different workload, and generalising one to the other is
+/// exactly the step this file's own rules forbid.
 ///
-/// - no draw ever asked for a resident as a texture, so no eviction *could* have
-///   surfaced as a missing one — `sampled_resident_missing=0` was a null
-///   instrument, not a pass;
-/// - `registry_note_sampled_use` never fired either, so the LRU's read-recency
-///   protection was not what spared those 1591 victims. Nothing was sampling
-///   them to protect.
+/// Measured directly rather than inferred, driven x86/PCI, `web-content-probe
+/// --churn 1`, with the denominator now printed on the census line:
 ///
-/// The run therefore establishes something much weaker than "the cap is safe at
-/// six times over": it establishes that this workload never reads a resident
-/// back, which is why it cannot be harmed by destroying one. That is a property
-/// of the workload, not of the cap.
+/// ```text
+///   registry_pressure peak=192 cap=320 evicts=0 peak_mib=220 resident_samples=11742
+/// ```
 ///
-/// # What still stands, and what the signal actually is
+/// `resident_samples` rises monotonically 5 → 253 → 6009 → 11742 across the run.
+/// The Target arm runs about eleven thousand times on this workload, so
+/// `registry_note_sampled_use` fires that often, the LRU's read-recency
+/// protection is genuinely active, and `sampled_resident_missing=0` at cap 32
+/// was a real measurement against a real denominator. The original conclusion
+/// stands, and now on firmer ground than when it was drawn: the reason it could
+/// not be trusted before was that nothing reported how many resident samples had
+/// occurred, and both readings that bore on it came from boots nobody had
+/// compared.
 ///
-/// - The cap is expressed in the wrong quantity. 320 slots is ~350 MiB at the
-///   burst's mix and 10 GiB at 4K, on a heap measured in gigabytes. Unchanged by
-///   any of the above.
-/// - The failure mode is real in the code and reachable in principle. Nothing
-///   measured has yet reached it, and now nothing measured *could* have.
-/// - The workload that would reach it is one that samples a resident:
-///   `AttachmentAliasSample::ResidentChain`, a fragment shader reading the
-///   target it is also attached to. Naming it is what the "never-firing branch"
-///   rule asks for, and it is a real Apple behaviour this probe does not drive.
+/// # What survives, and what the signal is
 ///
-/// So the reopen signal is not `evicts` with `sampled_resident_missing`, because
-/// the second term is unreachable whenever the first is cheap to produce. It is
-/// **`resident_samples` (`sampled_gpu_binds`) becoming non-zero at all** — that
-/// is the moment this cap acquires a way to destroy something observable, and
-/// the moment the pair above starts meaning what it was read as meaning.
-/// `emit_registry_pressure` prints it on this line for that reason.
+/// - The cap is still expressed in the wrong quantity. 320 slots is ~350 MiB at
+///   the burst's mix and 10 GiB at 4K, on a heap measured in gigabytes. Nothing
+///   above touches that, and it is a reason to change what the bound measures
+///   rather than a measured harm.
+/// - `evicts=1591` at cap 32 against `evicts=0` at cap 320 (peak 192 of 320 on
+///   the run above) says the margin at 320 is not thin in practice: the
+///   population that reached 192 was mostly *replaceable*, not live, even though
+///   ~11742 resident samples were taken across it.
+/// - The remaining unknown is a workload whose live sampled set exceeds the cap.
+///   Nothing here produced one. Until something does, replacing this policy
+///   trades a failure mode measured at zero for one that has never been measured
+///   at all, which is the wrong direction.
 ///
-/// Until then the honest statement is that the cap's harm is unmeasured rather
-/// than measured-at-zero, and the argument for moving the bound onto the
-/// allocator (above) is untouched by the 1591-eviction run.
+/// So: keep the cap, keep the `peak_mib` instrument pointed at it, and treat a
+/// non-zero `evicts` **together with** a non-zero `sampled_resident_missing` as
+/// the signal that reopens this — read against `resident_samples`, which is what
+/// says the pair means anything at all. A non-zero `evicts` alone is not it.
+///
+/// The other prerequisite landed anyway and is worth keeping on its own terms:
+/// both readings come off [`NonPinnedTotals`], maintained at the three sites that
+/// can change them, so neither reading is an O(n) registry walk on every admit.
 ///
 /// The other prerequisite landed anyway and is worth keeping on its own terms:
 /// both readings come off [`NonPinnedTotals`], maintained at the three sites that
