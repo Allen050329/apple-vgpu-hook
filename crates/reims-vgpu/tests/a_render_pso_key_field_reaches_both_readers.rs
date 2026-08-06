@@ -28,6 +28,28 @@
 //! *output*, assigned at the end, and folding it into itself is not a thing.
 //! `equal` reads it like any other field and this test requires that.
 //!
+//! # Why only this key, of the six on `ContentCache`
+//!
+//! Because it is the only one whose comparison is transcribed by hand. The six
+//! `CacheEntry` impls in `backend::metal::cache` were read against each other:
+//!
+//! * `FnEntry`, `ReflectEntry`, `SamplerCacheEntry` and `ComputePsoEntry` all
+//!   compare with `self.key == *key` — derived `PartialEq`, which the compiler
+//!   generates over every field. A field added to one of those keys is covered
+//!   the moment it is declared, and no test can improve on that.
+//! * `DepthStencilEntry` compares `depth_stencil_eq`, which is a byte
+//!   comparison of the whole `ReimsVgpuDepthStencilState`. Also complete by
+//!   construction, and its failure direction is the safe one: any disagreement
+//!   the bytes carry produces a *miss*, so at worst a state is rebuilt.
+//! * `RenderPsoEntry` compares `RenderPsoKey::equal`, thirty-three fields
+//!   written out by hand, against a fold written out by hand in another file.
+//!
+//! So the scan is narrow on purpose rather than by omission. `SamplerCacheEntry`
+//! still has `metal_sampler_key_covers_the_descriptor`, which asks the different
+//! question this one cannot: whether the key names what the *descriptor* reads.
+//! Derived equality guarantees a key is compared completely; it says nothing
+//! about whether the key holds the right fields in the first place.
+//!
 //! # Why source text
 //!
 //! `backend::metal` does not compile on a host without an Apple linker, so a
