@@ -135,6 +135,34 @@ pub const INVENTORY: &[ClassInventory] = &[
 /// encoder and abort. The oracle catches that, records the selector under
 /// `unsupported`, and carries on, so the exclusion is evidence rather than an
 /// assumption and is re-checked on every capture.
+///
+/// # It is the weakest of the three reasons, for the same cause twice
+///
+/// An assertion is a refusal by the *capability state the capture ran in*, not
+/// by Apple. `runtime::decode::compute` records the first instance: `0xe3`/`0xe6`
+/// sat here as refused, and both selectors emit the moment their gate is on.
+///
+/// The render encoder carries a second, larger instance, and this doc is where
+/// it is written down because nothing executable catches it yet. Eight of the
+/// rows below are structured as *"if the device supports OpenGL, emit; otherwise
+/// assert"* — the assertion the oracle observed is the else-branch of a
+/// capability test, and behind it each has a fixed opcode and body:
+/// `setAlphaTestReferenceValue:` `0x8a`, `setPointSize:` `0x8b`,
+/// `setClipPlane:p2:p3:p4:atIndex:` `0x8c`, `setViewportTransformEnabled:`
+/// `0x8f`, `setProvokingVertexMode:` `0x90`, `setPrimitiveRestartEnabled:index:`
+/// `0x91`, `setTriangleFrontFillMode:backFillMode:` `0x92`,
+/// `setTransformFeedbackState:` `0x93`.
+///
+/// They stay `Excluded` here rather than being promoted on that reading: this
+/// crate's rule is that a row's opcode comes from a capture, and no capture has
+/// run with that gate on. What the reading does establish is that the *reason*
+/// is wrong — these are gated, not refused — so
+/// `every_capability_gated_selector_names_the_flag_that_unlocks_it` cannot see
+/// them, and a guest on an OpenGL-compatibility path would send eight render
+/// states this device does not decode. Two of them, primitive restart and
+/// two-sided fill mode, change what a draw produces. They would reach
+/// `runtime::exec`'s unimplemented-opcode report rather than vanish, which is
+/// the one part of this that is already right.
 pub const REFUSED_BY_SERIALIZER: &str =
     "the serializer fails an assertion instead of emitting an operation";
 
