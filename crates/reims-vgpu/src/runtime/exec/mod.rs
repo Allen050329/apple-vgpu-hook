@@ -2081,12 +2081,20 @@ impl BindClass {
     /// | texture | 84 692 | 0 | 0 |
     /// | sampler | 47 655 | 0 | 0 |
     ///
-    /// **The texture table's 32-against-128 gap costs this workload nothing.**
-    /// Not one texture bind reaches even slot 17, so widening it — which on the
-    /// Vulkan arm means re-laying every band in
-    /// [`crate::runtime::spirv_bind`], whose texture band is exactly 32 wide and
-    /// abuts the sampler band — would buy zero. That is the measured argument
-    /// the drop counter was added to produce, and it argues against.
+    /// **No class has a gap left to widen.** All three of this device's tables
+    /// now meet or exceed Apple's own — texture 128 against 128, buffer 31
+    /// against 31, sampler 32 against 16 — so a record reaching past one is a
+    /// record Apple's serializer cannot emit, and `over_table` is a healthy
+    /// zero rather than headroom being measured. The texture band that closed
+    /// the last of it lives in [`crate::runtime::spirv_bind`] as `[32,160)`,
+    /// held there by a `const` assertion that
+    /// [`crate::runtime::draw::MAX_TEXTURE_BIND_SLOTS`] reads its value from,
+    /// so the two cannot part without failing the build.
+    ///
+    /// Not one texture bind in the table above reaches even slot 17, which is
+    /// why this cost nothing to confirm — but the reading that matters is the
+    /// pin, not the counter: a zero here would look identical if the band were
+    /// still 32 wide.
     ///
     /// **The table actually running near its ceiling is the buffer one**, which
     /// no reading of the loss counters could have said: 2.6 % of buffer binds

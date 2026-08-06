@@ -640,8 +640,10 @@ const ROWS: &[Row] = &[
         loss: Loss::ExecutedModified,
         why: "the bind loop breaks at the first slot past the table, so the \
               rest of a plural bind record never lands and the draws that \
-              follow run against the partial state. Retired by refusing the \
-              record",
+              follow run against the partial state. All three tables now meet \
+              or exceed Apple's own, so a firing is a record Apple's serializer \
+              cannot emit — retired by refusing that record rather than by \
+              widening anything",
     },
     Row {
         file: "crates/reims-vgpu/src/runtime/exec/mod.rs",
