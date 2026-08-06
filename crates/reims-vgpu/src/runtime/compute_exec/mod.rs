@@ -103,35 +103,55 @@ const _: () = assert!(reims_vgpu_wire::ops::bind_limit::TEXTURE <= MAX_COMPUTE_T
 const _: () = assert!(reims_vgpu_wire::ops::bind_limit::SAMPLER <= MAX_COMPUTE_SAMPLER_SLOTS);
 /// Cap on threadgroup-memory indices.
 ///
-/// # This number has no derivation on record, and it is the only cap here without one
+/// # The protocol does not bound this, and that makes it the odd one of the four
 ///
-/// Its three siblings above each read from a measurement:
-/// [`reims_vgpu_wire::ops::bind_limit`] captured Apple's serializer truncating a
-/// plural bind at 128 textures, 31 buffers and 16 samplers, and the `const`
-/// assertions above hold this device to those. There is no fourth capture, and
-/// the technique cannot produce one — `setThreadgroupMemoryLength:atIndex:` is a
-/// *singular* selector, so the serializer never truncates a range for it. That is
-/// why the gap survived: nothing that measured the other three was ever going to
-/// measure this.
+/// The three caps above each hold a bound the protocol states.
+/// [`reims_vgpu_wire::ops::bind_limit`] measured the serializer truncating a
+/// *plural* bind at 128 textures, 31 buffers and 16 samplers, and the `const`
+/// assertions above hold this device to those. Three things say this cap is not
+/// the same kind of number:
 ///
-/// So 16 is safe in one direction and unjustified in the other:
+/// * **The record carries a full `u32` index and nothing narrows it.**
+///   `setThreadgroupMemoryLength:atIndex:` serializes as a singular record —
+///   [`reims_vgpu_wire::ops::compute::ThreadgroupMemoryLength`], a `u64` length
+///   followed by a `u32` index — with no range to truncate and no bound applied
+///   to the index on the way out.
+/// * **The plural bound is not a constant, so there is no fourth one to read.**
+///   The three values `bind_limit` carries are not literals in the encoder; the
+///   plural bind path reads the stage's own binding-table size at encode time
+///   and clamps `location + length` to it. That is why those three had to be
+///   *captured*, and why the technique has nothing to say here.
+/// * **The negotiated device info describes threadgroup memory in bytes, never
+///   in slots.** It carries a maximum and a static threadgroup memory *length*;
+///   no field in it counts entries. So "how many threadgroup memory slots exist"
+///   is not a protocol quantity at all — it is a property of the host's argument
+///   table.
 ///
-/// * **Safe against the abort.** `backend::metal::compute::bind_threadgroup_memory`
-///   passes the index straight to `setThreadgroupMemoryLength:atIndex:` with no
-///   guard of its own, so this constant is the *only* thing between a decoded
-///   guest index and a Metal call that answers an out-of-range index by aborting
-///   the process. Any bound at or below Metal's real table is correct here, and
-///   a low one is the conservative error.
-/// * **Unjustified as a ceiling.** Nothing on record says Metal's threadgroup
-///   memory argument table *ends* at 16, so a kernel binding threadgroup memory
-///   above slot 15 loses that bind. It is not silent — [`ComputeBindOverflow`]'s
-///   `Threadgroup` arm reports it on the fail channel, and a reading there is the
-///   evidence that would settle this — but a dispatch does run missing the
-///   allocation the kernel expects.
+/// # Which makes this the mistake [`crate::runtime::draw::MAX_SAMPLER_BIND_SLOTS`] declines to repeat
 ///
-/// What would settle it is a capture of a guest kernel binding threadgroup memory
-/// at a high index, read the way `bind_limit` was read. Until then the counter is
-/// the instrument; do not raise the number to fit a guess about the table's size.
+/// A presumed *Metal* table size, applied during stream accumulation, takes the
+/// slot away from the Vulkan arm as well — which is exactly what that constant's
+/// doc refuses to do with Metal's 16-entry sampler table, on the grounds that the
+/// bound belongs to one backend and that backend should refuse at its own encoder.
+/// The same argument applies here and has not been acted on, for one reason: the
+/// Metal side has nowhere to refuse. `backend::metal::compute::bind_threadgroup_memory`
+/// passes the index straight to the encoder with no guard, and Metal answers an
+/// out-of-range argument-table index by aborting the process — so this cap is
+/// currently the only thing standing in front of that, and it cannot be moved
+/// until the backend that owns the real table checks it.
+///
+/// So 16 is safe in one direction and unjustified in the other. Any bound at or
+/// below Metal's real table prevents the abort, and a low one is the conservative
+/// error; but nothing states that table *ends* at 16, so a kernel binding
+/// threadgroup memory above slot 15 loses that bind. It is not silent —
+/// [`ComputeBindOverflow`]'s `Threadgroup` arm reports it on the fail channel, and
+/// a reading there is the evidence that this is costing a real guest something.
+///
+/// Retiring it needs the host table size, from the backend rather than from the
+/// guest protocol, and a refusal at the Metal encoder to replace it. Do not
+/// meanwhile raise the number to fit a guess: the direction that is currently
+/// wrong is reported, and the direction a guess could get wrong aborts the
+/// process.
 pub const MAX_THREADGROUP_MEMORY_SLOTS: u32 = 16;
 /// `MTLDispatchThreadgroupsIndirectArguments` = three `uint32_t` (12 bytes).
 pub const INDIRECT_THREADGROUPS_ARGS_LEN: usize = 12;
