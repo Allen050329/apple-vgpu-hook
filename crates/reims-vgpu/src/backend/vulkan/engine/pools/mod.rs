@@ -248,7 +248,7 @@ pub(crate) struct ResourcePools {
     /// identity that has fallen out of the window is reported as no record
     /// rather than guessed at. Diagnostic only — nothing reads it to decide
     /// anything.
-    reclaimed_recent: VecDeque<(TargetIdentity, ResidentReclaim)>,
+    reclaimed_recent: VecDeque<(TargetIdentity, ResidentReclaim, u64)>,
     /// Source of [`ResidentTargetSlot::use_seq`]. Monotonic for the life of the
     /// pools; at one bump per bind it cannot wrap in any realistic session.
     use_clock: u64,
@@ -1210,6 +1210,44 @@ pub(crate) const REGISTRY_CAP: usize = 320;
 /// Reopen signal: `past_cutoff` non-zero in the `resident_resample_*` bands, or
 /// `resample_peak_ms` reaching this value, both of which mean a resident
 /// survived only because the drain is throttled and had not reached it yet.
+///
+/// # Uncensored, this value is 3-5x too short — and the peak above could not
+/// have said so
+///
+/// `resident_resample_peak_ms` measures the interval between two reads of a
+/// resident that survived both, so it structurally cannot report a gap longer
+/// than this constant: past it the resident is gone, and the read that would
+/// have closed the interval falls through to the guest's pages instead. Every
+/// reading taken from that peak is therefore truncated by the very policy it is
+/// being used to judge, and will always make this value look *just barely*
+/// adequate.
+///
+/// `draw::vulkan::reclaimed_resample_band` closes the interval from the other
+/// side, using the time the reclaim itself is now stamped with: a resident read
+/// `since` ms after being destroyed had gone at least
+/// `IDLE_TARGET_AGE_MS + since` between uses. Driven x86/PCI,
+/// `web-content-probe --churn 1`, 26 fall-throughs:
+///
+/// ```text
+///   t11sample_reclaimed_within_1x_cutoff    0     (<2 s after the destroy)
+///   t11sample_reclaimed_within_2x_cutoff    2     (2-4 s after)
+///   t11sample_reclaimed_within_4x_cutoff   24     (4-8 s after)
+///   t11sample_reclaimed_past_4x_cutoff      0
+/// ```
+///
+/// Not one came back within a further cutoff's worth of time, and 24 of 26 came
+/// back **4-8 s after being destroyed** — so their true interval between uses is
+/// `2 s + 4-8 s` = **6-10 seconds**. Individual lines put it exactly:
+/// `since_reclaim_ms=4117` and `4521` on menu-bar strips, ~6.1-6.5 s. On the
+/// same boot a *surviving* resident recorded `resample_peak_ms=6445`, which
+/// confirms the interval directly on a resident the policy did not truncate.
+///
+/// So this is not a value with a thin margin. It is between three and five times
+/// shorter than the re-use interval of the surfaces it destroys, and a strip
+/// redrawn every several seconds is not an exotic guest behaviour. Raising it is
+/// now a decision with a basis rather than a guess; it has not been raised here
+/// because doing so needs its own before/after on VRAM, which `peak_mib` — the
+/// registry's attachment bytes, not the device's footprint — cannot supply.
 pub(crate) const IDLE_TARGET_AGE_MS: u64 = 2000;
 /// Non-pinned population below which the idle drain destroys nothing.
 ///

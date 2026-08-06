@@ -654,12 +654,24 @@ pub fn resident_content_ready(identity: &TargetIdentity) -> bool {
 /// deciding whether falling through to the guest's pages is sound — a resident
 /// that is merely not ready still exists and can be merged from, and one this
 /// device destroyed cannot.
-pub fn resident_absent_after_reclaim(identity: &TargetIdentity) -> Option<types::ResidentReclaim> {
+///
+/// The second half of the pair is how many milliseconds ago the reclaim
+/// happened, which is what makes the reading uncensored: a resident read `since`
+/// ms after being destroyed had gone at least `IDLE_TARGET_AGE_MS + since`
+/// between uses, and that tail is invisible to `resident_resample_peak_ms`
+/// because the resident it would have been measured on no longer exists.
+pub fn resident_absent_after_reclaim(
+    identity: &TargetIdentity,
+) -> Option<(types::ResidentReclaim, u64)> {
     let guard = lock_engine();
     if guard.pools.registry_get(identity).is_some() {
         return None;
     }
-    guard.pools.prior_reclaim(identity)
+    let now = guard.pools.idle_clock_ms();
+    guard
+        .pools
+        .prior_reclaim_at(identity)
+        .map(|(why, at)| (why, now.saturating_sub(at)))
 }
 
 /// The mapping content epoch this resident's pixels were stamped with, or

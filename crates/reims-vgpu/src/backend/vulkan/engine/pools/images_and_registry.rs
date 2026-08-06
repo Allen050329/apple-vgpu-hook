@@ -1258,6 +1258,11 @@ impl ResourcePools {
         self.registry_non_pinned.count
     }
 
+    /// The drain's wall clock, for a caller measuring an age against it.
+    pub(crate) fn idle_clock_ms(&self) -> u64 {
+        self.idle_clock_ms
+    }
+
     /// Attachment bytes the same non-pinned set occupies: `w x h x texel` summed
     /// over every slot [`Self::non_pinned_registry_len`] counts.
     ///
@@ -1432,7 +1437,30 @@ impl ResourcePools {
         if self.reclaimed_recent.len() >= RECLAIM_HISTORY {
             self.reclaimed_recent.pop_front();
         }
-        self.reclaimed_recent.push_back((identity.clone(), why));
+        let at = self.idle_clock_ms;
+        self.reclaimed_recent.push_back((identity.clone(), why, at));
+    }
+
+    /// [`ResourcePools::prior_reclaim`] with the idle-clock time the reclaim
+    /// happened, for a caller that needs to know how long ago rather than only
+    /// what.
+    ///
+    /// This is what uncensors `resident_resample_peak_ms`. That peak can only
+    /// observe gaps for residents that *survived* to be read, so a reclaim
+    /// policy tuned from it is tuned from data it destroyed the tail of — every
+    /// gap longer than the cutoff shows up as an absence, not as a longer gap.
+    /// Pairing this with `IDLE_TARGET_AGE_MS` recovers the missing side: a
+    /// resident read `since` ms after being reclaimed had gone at least
+    /// `IDLE_TARGET_AGE_MS + since` ms between uses.
+    pub(crate) fn prior_reclaim_at(
+        &self,
+        identity: &TargetIdentity,
+    ) -> Option<(ResidentReclaim, u64)> {
+        self.reclaimed_recent
+            .iter()
+            .rev()
+            .find(|(k, _, _)| k == identity)
+            .map(|(_, why, at)| (*why, *at))
     }
 
     /// The most recent thing this device did with `identity`'s resident, if it
@@ -1443,8 +1471,8 @@ impl ResourcePools {
         self.reclaimed_recent
             .iter()
             .rev()
-            .find(|(k, _)| k == identity)
-            .map(|(_, why)| *why)
+            .find(|(k, _, _)| k == identity)
+            .map(|(_, why, _)| *why)
     }
 
     /// The resident the capacity walk should evict next, or `None` when every
@@ -1916,6 +1944,50 @@ mod pin_count_tests {
         let victims = pools.plan_idle_drain(now, None).expect("pass due");
         assert_eq!(victims, vec![surf(1)], "only the aged non-pinned resident");
         assert_eq!(pools.idle_clock_ms, now, "clock advanced to wall time");
+    }
+
+    /// A reclaim records *when*, so the gap the drain censored can be recovered.
+    ///
+    /// `resident_resample_peak_ms` measures the interval between two reads of a
+    /// resident that survived both, so it structurally cannot observe a gap
+    /// longer than `IDLE_TARGET_AGE_MS`: past that the resident is gone and the
+    /// closing read falls through to the guest's pages, recording an absence
+    /// rather than a longer interval. Tuning the cutoff from that peak means
+    /// tuning it from a distribution the policy itself truncates.
+    ///
+    /// The reclaim stamp is what closes the interval from the other side — a
+    /// resident read `since` ms after being destroyed had gone at least
+    /// `IDLE_TARGET_AGE_MS + since` between uses.
+    ///
+    /// Fails without the stamp: `reclaimed_recent` carries no time at all.
+    #[test]
+    fn a_reclaim_records_when_so_the_censored_gap_can_be_recovered() {
+        let mut pools = ResourcePools::new();
+        admit(&mut pools, surf(1), 0, 0);
+        pools.idle_clock_ms = 5_000;
+        pools.unregister_resident(&surf(1), ResidentReclaim::IdleDrained);
+
+        let (why, at) = pools
+            .prior_reclaim_at(&surf(1))
+            .expect("a reclaim is recorded with its time");
+        assert_eq!(why, ResidentReclaim::IdleDrained);
+        assert_eq!(at, 5_000, "stamped with the drain's own clock");
+
+        // The guest comes back 3 s after the destroy, so it had gone at least
+        // IDLE_TARGET_AGE_MS + 3000 between uses — a gap the surviving-resident
+        // peak could never have reported.
+        pools.idle_clock_ms = 8_000;
+        assert_eq!(
+            pools.idle_clock_ms().saturating_sub(at),
+            3_000,
+            "the elapsed side of the pair the facade returns"
+        );
+
+        assert_eq!(
+            pools.prior_reclaim_at(&surf(2)),
+            None,
+            "an identity never reclaimed has no stamp, and is not guessed at"
+        );
     }
 
     /// Below `IDLE_DRAIN_PRESSURE_FLOOR` the drain destroys nothing, however
