@@ -4173,6 +4173,18 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
     // Only the final record of a portability render-pass chain reads back CPU
     // pixels; used by the resident-chain rail below (harmless on other paths).
     let _ = &writeback_guest;
+    // Before anything is resolved or uploaded: a bind naming a slot past its
+    // argument table refuses the draw, once, for all three classes and both
+    // stages. Every consumer below therefore takes the slot as in-range and
+    // spells no bound of its own.
+    if let Some(bind) = crate::runtime::draw::first_bind_past_table(req) {
+        return Err(DrawError::DrawPreparation(
+            crate::backend::vulkan::engine::DrawPreparationDecline::BindSlotPastTable {
+                pipeline_ref: req.pipeline_ref,
+                bind,
+            },
+        ));
+    }
     crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Pipeline);
     // Name the color0 GVA target's allocation before anything can render into
     // it, and once: the pinned Store identity, the cross-pass Load identity and
@@ -4329,7 +4341,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         let vertex_span =
             crate::runtime::bind_phase::Span::open(crate::runtime::bind_phase::Part::VertexLoad);
         for b in &req.vertex_buffers {
-            if b.index >= MAX_BUFFER_BIND_SLOTS || b.buffer_ref == 0 {
+            if b.buffer_ref == 0 {
                 continue;
             }
             let allow_zc = !constant_step_bufs.contains(&b.index);
@@ -4352,7 +4364,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         let fragment_span =
             crate::runtime::bind_phase::Span::open(crate::runtime::bind_phase::Part::FragmentLoad);
         for b in &req.fragment_buffers {
-            if b.index >= MAX_BUFFER_BIND_SLOTS || b.buffer_ref == 0 {
+            if b.buffer_ref == 0 {
                 continue;
             }
             let Some(content) =
@@ -4418,14 +4430,8 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         let vtx_idx: std::collections::BTreeSet<u32> =
             vtx_storage.iter().map(|(i, _)| *i).collect();
         let buf_collide = frag_storage.iter().any(|(i, _)| vtx_idx.contains(i));
-        let has_vtx_tex = req
-            .vertex_textures
-            .iter()
-            .any(|t| t.index < MAX_TEXTURE_BIND_SLOTS && t.texture_ref != 0);
-        let has_frag_tex = req
-            .fragment_textures
-            .iter()
-            .any(|t| t.index < MAX_TEXTURE_BIND_SLOTS && t.texture_ref != 0);
+        let has_vtx_tex = req.vertex_textures.iter().any(|t| t.texture_ref != 0);
+        let has_frag_tex = req.fragment_textures.iter().any(|t| t.texture_ref != 0);
         let reflected_sampled_collision =
             reflected_sampled_binding_collision(&v_shader.reflection, &f_shader.reflection);
         let separate_sampled =
@@ -4504,12 +4510,12 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 |i| {
                     req.fragment_textures
                         .iter()
-                        .any(|t| t.index == i && t.index < MAX_TEXTURE_BIND_SLOTS && t.texture_ref != 0)
+                        .any(|t| t.index == i && t.texture_ref != 0)
                 },
                 |i| {
                     req.fragment_samplers
                         .iter()
-                        .any(|s| s.index == i && s.index < MAX_SAMPLER_BIND_SLOTS && s.sampler_ref != 0)
+                        .any(|s| s.index == i && s.sampler_ref != 0)
                 },
             );
             if !unbound.is_empty() {
@@ -4519,13 +4525,13 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 let texs: std::collections::BTreeSet<u32> = req
                     .fragment_textures
                     .iter()
-                    .filter(|t| t.index < MAX_TEXTURE_BIND_SLOTS && t.texture_ref != 0)
+                    .filter(|t| t.texture_ref != 0)
                     .map(|t| t.index)
                     .collect();
                 let smps: std::collections::BTreeSet<u32> = req
                     .fragment_samplers
                     .iter()
-                    .filter(|s| s.index < MAX_SAMPLER_BIND_SLOTS && s.sampler_ref != 0)
+                    .filter(|s| s.sampler_ref != 0)
                     .map(|s| s.index)
                     .collect();
                 crate::observe::fail(format!(
@@ -4586,7 +4592,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                                 texture_ref: u32,
                                 frag_stage: bool|
              -> Result<(), DrawError> {
-                if index >= MAX_TEXTURE_BIND_SLOTS || texture_ref == 0 {
+                if texture_ref == 0 {
                     return Ok(());
                 }
                 // Measure-only setup_tex sub-split (off-main-core): time the full
@@ -4801,9 +4807,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         {
             let mut push_smp =
                 |index: u32, sampler_ref: u32, frag_stage: bool| -> Result<(), DrawError> {
-                    if index >= MAX_SAMPLER_BIND_SLOTS {
-                        return Ok(());
-                    }
                     let base_off = if frag_stage && separate_sampled {
                         FRAG_SAMPLED_RESOURCE_BINDING_OFFSET
                     } else {
@@ -8453,6 +8456,59 @@ mod vulkan_split_tests {
              prim=0 first=0 idx=0 colors=[] vbuf=[] fbuf=[] vtex=[] ftex=[] \
              viewport=None scissor=None"
         );
+    }
+
+    /// A bind past its class's table refuses the whole draw, before the pipeline
+    /// is even resolved.
+    ///
+    /// The order is the assertion. `pipeline_ref` here names nothing an empty
+    /// state can resolve, so the sibling test above gets
+    /// `draw_prepare_pipeline_missing` from the identical request — and this one
+    /// must not, or the check has drifted below the resolves it is supposed to
+    /// stand in front of. The reported class is the texture table's, not a
+    /// shared bound: 31 buffer slots would have refused this index too.
+    #[test]
+    fn a_bind_past_its_table_refuses_the_draw_before_anything_resolves() {
+        use crate::observe::Decline as _;
+        use crate::runtime::draw::MAX_TEXTURE_BIND_SLOTS;
+
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+        let mut req = DrawEncodeRequest {
+            pipeline_ref: 41,
+            fragment_textures: vec![TextureBind {
+                index: MAX_TEXTURE_BIND_SLOTS,
+                texture_ref: 9,
+            }],
+            ..DrawEncodeRequest::default()
+        };
+
+        let err = match try_metal2vulkan_draw(&mut state, &mut host, &mut req, true) {
+            Err(err) => err,
+            Ok(_) => panic!("a texture bind past the table cannot encode"),
+        };
+        assert_eq!(err.slug(), "draw_prepare_bind_slot_past_table");
+        assert_eq!(
+            err.fields(),
+            vec![
+                ("pipeline_ref", "41".to_string()),
+                ("class", "texture".to_string()),
+                ("stage", "fragment".to_string()),
+                ("index", MAX_TEXTURE_BIND_SLOTS.to_string()),
+                ("table", MAX_TEXTURE_BIND_SLOTS.to_string()),
+                ("ref", "9".to_string()),
+            ]
+        );
+
+        // The same request with the slot cleared reaches the pipeline resolve,
+        // which is what says the refusal is about live guest work and not about
+        // the index alone.
+        req.fragment_textures[0].texture_ref = 0;
+        let err = match try_metal2vulkan_draw(&mut state, &mut host, &mut req, true) {
+            Err(err) => err,
+            Ok(_) => panic!("an empty state cannot resolve pipeline 41"),
+        };
+        assert_eq!(err.slug(), "draw_prepare_pipeline_missing");
     }
 
     /// The branch line is only worth leaving on forever if it is bounded, and

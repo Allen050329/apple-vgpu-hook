@@ -193,6 +193,160 @@ pub const MAX_ANY_BIND_SLOTS: u32 = {
     }
 };
 
+/// Which of the three argument tables a bind record names.
+///
+/// The three constants above are compared against a guest slot index in exactly
+/// one place — [`BindTableClass::table`] — and every consumer asks it rather
+/// than spelling its own comparison. Before that, the same rule was written out
+/// at twenty-two sites across four files in two spellings, one of them inverted,
+/// and the three arms consuming one wire form had drifted into three different
+/// behaviors for the identical input: the ICB arm refused with a typed reason,
+/// the direct-Metal and Vulkan arms dropped the bind in silence.
+///
+/// [`crate::runtime::exec`] adds the census vocabulary — Apple's own table size
+/// for the class, the reach bands, the drop slug — as its own `impl` on this
+/// type, because those describe how a loss is *reported* rather than what the
+/// table *is*.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BindTableClass {
+    Buffer,
+    Texture,
+    Sampler,
+}
+
+impl BindTableClass {
+    /// This device's bind-index bound for the class.
+    ///
+    /// One constant per class, because the three have different bases: the
+    /// buffer bound is Metal's argument table (and, independently, Apple's own),
+    /// while the texture and sampler bounds are the width of a descriptor
+    /// binding band. A single shared constant made two of the three the wrong
+    /// number by construction — it was Metal's *buffer* table applied to all
+    /// three — which is what [`MAX_TEXTURE_BIND_SLOTS`] records.
+    pub fn table(self) -> u32 {
+        match self {
+            BindTableClass::Buffer => MAX_BUFFER_BIND_SLOTS,
+            BindTableClass::Texture => MAX_TEXTURE_BIND_SLOTS,
+            BindTableClass::Sampler => MAX_SAMPLER_BIND_SLOTS,
+        }
+    }
+
+    /// The name this class carries on a fail line.
+    pub fn name(self) -> &'static str {
+        match self {
+            BindTableClass::Buffer => "buffer",
+            BindTableClass::Texture => "texture",
+            BindTableClass::Sampler => "sampler",
+        }
+    }
+}
+
+/// A live bind in one draw request whose slot no argument table of its class can
+/// name.
+///
+/// Carries the object ref as well as the slot, because the two say different
+/// things: the slot names which table ran out, and the ref is what the guest
+/// still believes is bound there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PastTableBind {
+    pub class: BindTableClass,
+    pub stage: crate::runtime::decode::render::Stage,
+    /// The guest's own slot index, so it reads against [`BindTableClass::table`].
+    pub index: u32,
+    /// The object bound there. Never zero — see [`first_bind_past_table`].
+    pub resource_ref: u32,
+}
+
+impl PastTableBind {
+    pub fn stage_name(&self) -> &'static str {
+        match self.stage {
+            crate::runtime::decode::render::Stage::Vertex => "vertex",
+            crate::runtime::decode::render::Stage::Fragment => "fragment",
+            crate::runtime::decode::render::Stage::Unknown => "unknown",
+        }
+    }
+}
+
+/// The first live bind in `req` that names a slot past its class's table, if any.
+///
+/// # Why every backend calls this once instead of checking at each consumer
+///
+/// A slot past the table is not a bind that can be degraded: no encoder of
+/// either backend has an argument-table entry to put it in, and Metal answers an
+/// out-of-range argument-table index with a process-aborting exception rather
+/// than an error. So the only faithful answer is to refuse the whole draw and
+/// say which slot did it — the same answer for all three classes, both stages
+/// and both backends, which is why it is one function.
+///
+/// It is asked once, before any resource is resolved, so a refused draw does no
+/// upload work first and the reported slot is the guest's own rather than
+/// whichever consumer happened to notice.
+///
+/// **A zero ref is not reported.** Clearing a slot the device does not model
+/// loses no guest work, and expected control flow stays quiet.
+///
+/// # This is a backstop, and it is meant to stay one
+///
+/// `runtime::exec::apply_binds` is the only writer of these six tables and
+/// already stops a record's walk at the same bound, fail-visibly and with the
+/// reach census beside it. So a `Some` here means that gate was bypassed, not
+/// that a guest asked for something new. It is kept because the cost of being
+/// wrong is a Metal exception that takes the process down, and because the check
+/// that once stood at each consumer had already drifted three ways.
+pub fn first_bind_past_table(req: &DrawEncodeRequest) -> Option<PastTableBind> {
+    use crate::runtime::decode::render::Stage;
+
+    let buffers = [
+        (Stage::Vertex, &req.vertex_buffers),
+        (Stage::Fragment, &req.fragment_buffers),
+    ];
+    for (stage, binds) in buffers {
+        for b in binds.iter() {
+            if b.buffer_ref != 0 && b.index >= BindTableClass::Buffer.table() {
+                return Some(PastTableBind {
+                    class: BindTableClass::Buffer,
+                    stage,
+                    index: b.index,
+                    resource_ref: b.buffer_ref,
+                });
+            }
+        }
+    }
+    let textures = [
+        (Stage::Vertex, &req.vertex_textures),
+        (Stage::Fragment, &req.fragment_textures),
+    ];
+    for (stage, binds) in textures {
+        for t in binds.iter() {
+            if t.texture_ref != 0 && t.index >= BindTableClass::Texture.table() {
+                return Some(PastTableBind {
+                    class: BindTableClass::Texture,
+                    stage,
+                    index: t.index,
+                    resource_ref: t.texture_ref,
+                });
+            }
+        }
+    }
+    let samplers = [
+        (Stage::Vertex, &req.vertex_samplers),
+        (Stage::Fragment, &req.fragment_samplers),
+    ];
+    for (stage, binds) in samplers {
+        for s in binds.iter() {
+            if s.sampler_ref != 0 && s.index >= BindTableClass::Sampler.table() {
+                return Some(PastTableBind {
+                    class: BindTableClass::Sampler,
+                    stage,
+                    index: s.index,
+                    resource_ref: s.sampler_ref,
+                });
+            }
+        }
+    }
+    None
+}
+
 /// Convert a guest-declared byte length to a host allocation size.
 ///
 /// Only fails when the length does not fit `usize` (process addressability) —
@@ -1322,6 +1476,24 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
     if req.colors.is_empty() {
         return (EncodeStatus::BadArgs("draw_mtl_no_color_target"), None);
     }
+    // Before anything is resolved or staged: a bind naming a slot past its
+    // argument table refuses the draw, once, for all three classes and both
+    // stages. Metal answers an out-of-range argument-table index with a
+    // process-aborting exception, so this is the one place the encode may not
+    // continue past. Every consumer below therefore takes the slot as in-range.
+    if let Some(bind) = first_bind_past_table(req) {
+        crate::observe::fail(format!(
+            "metal_draw reason=draw_mtl_bind_slot_past_table pipe={} class={} stage={} \
+             index={} table={} ref={}",
+            req.pipeline_ref,
+            bind.class.name(),
+            bind.stage_name(),
+            bind.index,
+            bind.class.table(),
+            bind.resource_ref
+        ));
+        return (EncodeStatus::BadArgs("draw_mtl_bind_slot_past_table"), None);
+    }
     // Move multi-MiB Load seeds out **before** cloning color metadata so multi-draw
     // chain frames are not duplicated (clone of empty Option is cheap).
     let mut color_seeds: Vec<Option<Vec<u8>>> = req
@@ -1411,7 +1583,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
     let mut vtx_bind_idx: Vec<u32> = Vec::new();
     let mut frag_bind_idx: Vec<u32> = Vec::new();
     for b in &req.vertex_buffers {
-        if b.index >= MAX_BUFFER_BIND_SLOTS || b.buffer_ref == 0 {
+        if b.buffer_ref == 0 {
             continue;
         }
         let Some(bytes) = load_buffer_bytes(state, host, req.task_id, b.buffer_ref, b.offset)
@@ -1429,7 +1601,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
         vtx_storage.push(bytes);
     }
     for b in &req.fragment_buffers {
-        if b.index >= MAX_BUFFER_BIND_SLOTS || b.buffer_ref == 0 {
+        if b.buffer_ref == 0 {
             continue;
         }
         let Some(bytes) = load_buffer_bytes(state, host, req.task_id, b.buffer_ref, b.offset)
@@ -1533,7 +1705,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
     let mut vtx_tex_items: Vec<TexItem> = Vec::new();
     let mut frag_tex_items: Vec<TexItem> = Vec::new();
     for t in &req.vertex_textures {
-        if t.index >= MAX_TEXTURE_BIND_SLOTS {
+        if t.texture_ref == 0 {
             continue;
         }
         let Some((w, h, rgba)) = load_sampled_rgba(state, host, req.task_id, t.texture_ref) else {
@@ -1555,7 +1727,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
         });
     }
     for t in &req.fragment_textures {
-        if t.index >= MAX_TEXTURE_BIND_SLOTS {
+        if t.texture_ref == 0 {
             continue;
         }
         let Some((w, h, rgba)) = load_sampled_rgba(state, host, req.task_id, t.texture_ref) else {
@@ -1619,7 +1791,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
     let mut vtx_samps: Vec<ReimsVgpuSampler> = Vec::new();
     let mut frag_samps: Vec<ReimsVgpuSampler> = Vec::new();
     for s in &req.vertex_samplers {
-        if s.index < MAX_SAMPLER_BIND_SLOTS && s.sampler_ref != 0 {
+        if s.sampler_ref != 0 {
             let sampler = load_sampler(state, host, req.task_id, s.sampler_ref, s.index)
                 .unwrap_or_else(|error| {
                     crate::observe::Emit::decline("metal_draw_sampler_fallback", &error)
@@ -1635,7 +1807,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
         }
     }
     for s in &req.fragment_samplers {
-        if s.index < MAX_SAMPLER_BIND_SLOTS && s.sampler_ref != 0 {
+        if s.sampler_ref != 0 {
             let sampler = load_sampler(state, host, req.task_id, s.sampler_ref, s.index)
                 .unwrap_or_else(|error| {
                     crate::observe::Emit::decline("metal_draw_sampler_fallback", &error)

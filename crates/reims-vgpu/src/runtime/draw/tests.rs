@@ -679,13 +679,13 @@ fn every_metal_icb_inheritance_check_is_unique_namespaced_and_log_safe() {
     let all = vec![
         MetalIcbInheritanceDecline::CullModeUnsupported { value: 3 },
         MetalIcbInheritanceDecline::FrontFacingUnsupported { value: 2 },
-        MetalIcbInheritanceDecline::VertexBufferIndexOutOfRange {
-            buffer_ref: 1,
-            index: 31,
-        },
-        MetalIcbInheritanceDecline::FragmentBufferIndexOutOfRange {
-            buffer_ref: 2,
-            index: 32,
+        MetalIcbInheritanceDecline::BindSlotPastTable {
+            bind: PastTableBind {
+                class: BindTableClass::Buffer,
+                stage: crate::runtime::decode::render::Stage::Vertex,
+                index: MAX_BUFFER_BIND_SLOTS,
+                resource_ref: 1,
+            },
         },
         MetalIcbInheritanceDecline::VertexBufferMissing {
             buffer_ref: 3,
@@ -697,14 +697,6 @@ fn every_metal_icb_inheritance_check_is_unique_namespaced_and_log_safe() {
             index: 7,
             offset: 8,
         },
-        MetalIcbInheritanceDecline::VertexTextureIndexOutOfRange {
-            texture_ref: 9,
-            index: 33,
-        },
-        MetalIcbInheritanceDecline::FragmentTextureIndexOutOfRange {
-            texture_ref: 10,
-            index: 34,
-        },
         MetalIcbInheritanceDecline::VertexTextureMissing {
             texture_ref: 11,
             index: 12,
@@ -714,14 +706,6 @@ fn every_metal_icb_inheritance_check_is_unique_namespaced_and_log_safe() {
             texture_ref: 13,
             index: 14,
             detail: "guest\nread failed".into(),
-        },
-        MetalIcbInheritanceDecline::VertexSamplerIndexOutOfRange {
-            sampler_ref: 15,
-            index: 35,
-        },
-        MetalIcbInheritanceDecline::FragmentSamplerIndexOutOfRange {
-            sampler_ref: 16,
-            index: 36,
         },
         MetalIcbInheritanceDecline::PipelineRefZero,
         MetalIcbInheritanceDecline::PipelineMissing { pipeline_ref: 17 },
@@ -1860,6 +1844,167 @@ fn each_bind_slot_bound_equals_its_own_basis() {
     // No product byte-size budget: host_alloc_len only rejects >usize/isize.
     assert_eq!(host_alloc_len(64 << 20), Some(64 << 20));
     assert_eq!(host_alloc_len(0), Some(0));
+}
+
+/// Each class's bound reaches every consumer through one accessor.
+///
+/// The value is not the assertion — [`each_bind_slot_bound_equals_its_own_basis`]
+/// owns that. What this holds is that [`BindTableClass::table`] answers with the
+/// class's *own* constant, so a consumer asking the accessor cannot silently get
+/// another class's table the way twenty-two hand-written comparisons could.
+#[test]
+fn the_bind_table_accessor_answers_with_each_class_own_bound() {
+    assert_eq!(BindTableClass::Buffer.table(), MAX_BUFFER_BIND_SLOTS);
+    assert_eq!(BindTableClass::Texture.table(), MAX_TEXTURE_BIND_SLOTS);
+    assert_eq!(BindTableClass::Sampler.table(), MAX_SAMPLER_BIND_SLOTS);
+    // The three are distinct numbers, which is the whole reason one shared
+    // constant was wrong for two of them.
+    assert_ne!(
+        BindTableClass::Buffer.table(),
+        BindTableClass::Texture.table()
+    );
+    assert_ne!(
+        BindTableClass::Texture.table(),
+        BindTableClass::Sampler.table()
+    );
+}
+
+/// A live bind past its class's table is reported, naming the class and stage;
+/// an in-range bind and a cleared slot are not.
+///
+/// The cleared-slot case is the one worth pinning: a zero ref past the table
+/// loses no guest work, and reporting it would turn expected control flow into a
+/// refused draw.
+#[test]
+fn a_live_bind_past_its_table_is_reported_and_a_cleared_one_is_not() {
+    use crate::runtime::decode::render::Stage;
+
+    let in_range = DrawEncodeRequest {
+        vertex_buffers: vec![BufferBind {
+            index: MAX_BUFFER_BIND_SLOTS - 1,
+            buffer_ref: 7,
+            offset: 0,
+        }],
+        fragment_textures: vec![TextureBind {
+            index: MAX_TEXTURE_BIND_SLOTS - 1,
+            texture_ref: 9,
+        }],
+        vertex_samplers: vec![SamplerBind {
+            index: MAX_SAMPLER_BIND_SLOTS - 1,
+            sampler_ref: 11,
+        }],
+        ..Default::default()
+    };
+    assert_eq!(first_bind_past_table(&in_range), None);
+
+    // One slot further in each class, still live: each is reported, and the
+    // report names the class whose table it crossed rather than a shared one.
+    for (req, class, stage, index, resource_ref) in [
+        (
+            DrawEncodeRequest {
+                fragment_buffers: vec![BufferBind {
+                    index: MAX_BUFFER_BIND_SLOTS,
+                    buffer_ref: 7,
+                    offset: 0,
+                }],
+                ..Default::default()
+            },
+            BindTableClass::Buffer,
+            Stage::Fragment,
+            MAX_BUFFER_BIND_SLOTS,
+            7,
+        ),
+        (
+            DrawEncodeRequest {
+                vertex_textures: vec![TextureBind {
+                    index: MAX_TEXTURE_BIND_SLOTS,
+                    texture_ref: 9,
+                }],
+                ..Default::default()
+            },
+            BindTableClass::Texture,
+            Stage::Vertex,
+            MAX_TEXTURE_BIND_SLOTS,
+            9,
+        ),
+        (
+            DrawEncodeRequest {
+                fragment_samplers: vec![SamplerBind {
+                    index: MAX_SAMPLER_BIND_SLOTS,
+                    sampler_ref: 11,
+                }],
+                ..Default::default()
+            },
+            BindTableClass::Sampler,
+            Stage::Fragment,
+            MAX_SAMPLER_BIND_SLOTS,
+            11,
+        ),
+    ] {
+        assert_eq!(
+            first_bind_past_table(&req),
+            Some(PastTableBind {
+                class,
+                stage,
+                index,
+                resource_ref,
+            }),
+            "{} slot {index} past a {}-entry table",
+            class.name(),
+            class.table()
+        );
+    }
+
+    // A cleared slot, at an index no table can name, in every class.
+    let cleared = DrawEncodeRequest {
+        vertex_buffers: vec![BufferBind {
+            index: MAX_BUFFER_BIND_SLOTS + 4,
+            buffer_ref: 0,
+            offset: 0,
+        }],
+        fragment_textures: vec![TextureBind {
+            index: MAX_TEXTURE_BIND_SLOTS + 4,
+            texture_ref: 0,
+        }],
+        vertex_samplers: vec![SamplerBind {
+            index: MAX_SAMPLER_BIND_SLOTS + 4,
+            sampler_ref: 0,
+        }],
+        ..Default::default()
+    };
+    assert_eq!(first_bind_past_table(&cleared), None);
+}
+
+/// The direct-Metal draw path refuses a past-table bind instead of encoding
+/// without it.
+///
+/// Metal-only, because the refusal is inside `encode_draw_chain`'s Metal body.
+/// The Vulkan arm asks the same question at the head of `try_metal2vulkan_draw`,
+/// covered by `a_bind_past_its_table_refuses_the_draw_before_anything_resolves`
+/// in that module — and that one does run on a Linux host, so the shared check
+/// is exercised even though this case cannot be.
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+#[test]
+fn the_metal_draw_arm_refuses_a_bind_past_its_table() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+    let mut req = DrawEncodeRequest {
+        colors: vec![ColorRtRequest {
+            width: 64,
+            height: 64,
+            ..Default::default()
+        }],
+        vertex_textures: vec![TextureBind {
+            index: MAX_TEXTURE_BIND_SLOTS,
+            texture_ref: 9,
+        }],
+        ..Default::default()
+    };
+    let st = encode_draw_chain(&mut state, &mut host, &mut req, false, false).0;
+    assert!(
+        matches!(st, EncodeStatus::BadArgs("draw_mtl_bind_slot_past_table")),
+        "expected a past-table refusal, got {st:?}"
+    );
 }
 
 #[cfg(feature = "backend-vulkan")]

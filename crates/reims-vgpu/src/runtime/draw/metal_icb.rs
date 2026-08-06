@@ -33,13 +33,14 @@ pub(super) enum MetalIcbInheritanceDecline {
     FrontFacingUnsupported {
         value: u32,
     },
-    VertexBufferIndexOutOfRange {
-        buffer_ref: u32,
-        index: u32,
-    },
-    FragmentBufferIndexOutOfRange {
-        buffer_ref: u32,
-        index: u32,
+    /// A live bind names a slot past its class's argument table. One variant
+    /// for all three classes and both stages, because
+    /// [`crate::runtime::draw::first_bind_past_table`] is one check: six
+    /// variants here meant six copies of one bound at six call sites, and the
+    /// two sibling draw arms had each drifted to a different answer for the
+    /// identical input.
+    BindSlotPastTable {
+        bind: crate::runtime::draw::PastTableBind,
     },
     VertexBufferMissing {
         buffer_ref: u32,
@@ -51,14 +52,6 @@ pub(super) enum MetalIcbInheritanceDecline {
         index: u32,
         offset: u64,
     },
-    VertexTextureIndexOutOfRange {
-        texture_ref: u32,
-        index: u32,
-    },
-    FragmentTextureIndexOutOfRange {
-        texture_ref: u32,
-        index: u32,
-    },
     VertexTextureMissing {
         texture_ref: u32,
         index: u32,
@@ -68,14 +61,6 @@ pub(super) enum MetalIcbInheritanceDecline {
         texture_ref: u32,
         index: u32,
         detail: String,
-    },
-    VertexSamplerIndexOutOfRange {
-        sampler_ref: u32,
-        index: u32,
-    },
-    FragmentSamplerIndexOutOfRange {
-        sampler_ref: u32,
-        index: u32,
     },
     PipelineRefZero,
     PipelineMissing {
@@ -126,28 +111,11 @@ impl crate::observe::Decline for MetalIcbInheritanceDecline {
         match self {
             Self::CullModeUnsupported { .. } => "metal_icb_inherit_cull_mode_unsupported",
             Self::FrontFacingUnsupported { .. } => "metal_icb_inherit_front_facing_unsupported",
-            Self::VertexBufferIndexOutOfRange { .. } => {
-                "metal_icb_inherit_vertex_buffer_index_out_of_range"
-            }
-            Self::FragmentBufferIndexOutOfRange { .. } => {
-                "metal_icb_inherit_fragment_buffer_index_out_of_range"
-            }
+            Self::BindSlotPastTable { .. } => "metal_icb_inherit_bind_slot_past_table",
             Self::VertexBufferMissing { .. } => "metal_icb_inherit_vertex_buffer_missing",
             Self::FragmentBufferMissing { .. } => "metal_icb_inherit_fragment_buffer_missing",
-            Self::VertexTextureIndexOutOfRange { .. } => {
-                "metal_icb_inherit_vertex_texture_index_out_of_range"
-            }
-            Self::FragmentTextureIndexOutOfRange { .. } => {
-                "metal_icb_inherit_fragment_texture_index_out_of_range"
-            }
             Self::VertexTextureMissing { .. } => "metal_icb_inherit_vertex_texture_missing",
             Self::FragmentTextureMissing { .. } => "metal_icb_inherit_fragment_texture_missing",
-            Self::VertexSamplerIndexOutOfRange { .. } => {
-                "metal_icb_inherit_vertex_sampler_index_out_of_range"
-            }
-            Self::FragmentSamplerIndexOutOfRange { .. } => {
-                "metal_icb_inherit_fragment_sampler_index_out_of_range"
-            }
             Self::PipelineRefZero => "metal_icb_inherit_pipeline_ref_zero",
             Self::PipelineMissing { .. } => "metal_icb_inherit_pipeline_missing",
             Self::VertexMtlbMissing { .. } => "metal_icb_inherit_vertex_mtlb_missing",
@@ -172,10 +140,12 @@ impl crate::observe::Decline for MetalIcbInheritanceDecline {
             Self::CullModeUnsupported { value } | Self::FrontFacingUnsupported { value } => {
                 vec![("value", value.to_string())]
             }
-            Self::VertexBufferIndexOutOfRange { buffer_ref, index }
-            | Self::FragmentBufferIndexOutOfRange { buffer_ref, index } => vec![
-                ("buffer_ref", buffer_ref.to_string()),
-                ("index", index.to_string()),
+            Self::BindSlotPastTable { bind } => vec![
+                ("class", bind.class.name().to_string()),
+                ("stage", bind.stage_name().to_string()),
+                ("index", bind.index.to_string()),
+                ("table", bind.class.table().to_string()),
+                ("ref", bind.resource_ref.to_string()),
             ],
             Self::VertexBufferMissing {
                 buffer_ref,
@@ -191,11 +161,6 @@ impl crate::observe::Decline for MetalIcbInheritanceDecline {
                 ("index", index.to_string()),
                 ("offset", offset.to_string()),
             ],
-            Self::VertexTextureIndexOutOfRange { texture_ref, index }
-            | Self::FragmentTextureIndexOutOfRange { texture_ref, index } => vec![
-                ("texture_ref", texture_ref.to_string()),
-                ("index", index.to_string()),
-            ],
             Self::VertexTextureMissing {
                 texture_ref,
                 index,
@@ -209,11 +174,6 @@ impl crate::observe::Decline for MetalIcbInheritanceDecline {
                 ("texture_ref", texture_ref.to_string()),
                 ("index", index.to_string()),
                 ("detail", token(detail)),
-            ],
-            Self::VertexSamplerIndexOutOfRange { sampler_ref, index }
-            | Self::FragmentSamplerIndexOutOfRange { sampler_ref, index } => vec![
-                ("sampler_ref", sampler_ref.to_string()),
-                ("index", index.to_string()),
             ],
             Self::PipelineRefZero => Vec::new(),
             Self::PipelineMissing { pipeline_ref }
@@ -297,6 +257,13 @@ fn apply_icb_encoder_inheritance<M: HostMemory + HostOps>(
     use metal::*;
     use std::os::raw::c_char;
 
+    // One bound for all three classes and both stages, asked before any resource
+    // is resolved. Metal answers an out-of-range argument-table index with a
+    // process-aborting exception, so this is where the inheritance stops.
+    if let Some(bind) = first_bind_past_table(req) {
+        return Err(MetalIcbInheritanceDecline::BindSlotPastTable { bind });
+    }
+
     // Viewport: stream absolute, or full pass when absent (Metal default is not
     // a full drawable — product sets an explicit full RT viewport when the
     // guest stream never issued setViewport).
@@ -369,12 +336,6 @@ fn apply_icb_encoder_inheritance<M: HostMemory + HostOps>(
             if b.buffer_ref == 0 {
                 continue;
             }
-            if b.index >= MAX_BUFFER_BIND_SLOTS {
-                return Err(MetalIcbInheritanceDecline::VertexBufferIndexOutOfRange {
-                    buffer_ref: b.buffer_ref,
-                    index: b.index,
-                });
-            }
             let Some(bytes) = load_buffer_bytes(state, host, req.task_id, b.buffer_ref, b.offset)
             else {
                 return Err(MetalIcbInheritanceDecline::VertexBufferMissing {
@@ -390,12 +351,6 @@ fn apply_icb_encoder_inheritance<M: HostMemory + HostOps>(
         for b in &req.fragment_buffers {
             if b.buffer_ref == 0 {
                 continue;
-            }
-            if b.index >= MAX_BUFFER_BIND_SLOTS {
-                return Err(MetalIcbInheritanceDecline::FragmentBufferIndexOutOfRange {
-                    buffer_ref: b.buffer_ref,
-                    index: b.index,
-                });
             }
             let Some(bytes) = load_buffer_bytes(state, host, req.task_id, b.buffer_ref, b.offset)
             else {
@@ -416,12 +371,6 @@ fn apply_icb_encoder_inheritance<M: HostMemory + HostOps>(
     for t in &req.vertex_textures {
         if t.texture_ref == 0 {
             continue;
-        }
-        if t.index >= MAX_TEXTURE_BIND_SLOTS {
-            return Err(MetalIcbInheritanceDecline::VertexTextureIndexOutOfRange {
-                texture_ref: t.texture_ref,
-                index: t.index,
-            });
         }
         let Some((w, h, rgba)) = load_sampled_rgba(state, host, req.task_id, t.texture_ref) else {
             return Err(MetalIcbInheritanceDecline::VertexTextureMissing {
@@ -454,12 +403,6 @@ fn apply_icb_encoder_inheritance<M: HostMemory + HostOps>(
         if t.texture_ref == 0 {
             continue;
         }
-        if t.index >= MAX_TEXTURE_BIND_SLOTS {
-            return Err(MetalIcbInheritanceDecline::FragmentTextureIndexOutOfRange {
-                texture_ref: t.texture_ref,
-                index: t.index,
-            });
-        }
         let Some((w, h, rgba)) = load_sampled_rgba(state, host, req.task_id, t.texture_ref) else {
             return Err(MetalIcbInheritanceDecline::FragmentTextureMissing {
                 texture_ref: t.texture_ref,
@@ -491,12 +434,6 @@ fn apply_icb_encoder_inheritance<M: HostMemory + HostOps>(
     for s in &req.vertex_samplers {
         if s.sampler_ref == 0 {
             continue;
-        }
-        if s.index >= MAX_SAMPLER_BIND_SLOTS {
-            return Err(MetalIcbInheritanceDecline::VertexSamplerIndexOutOfRange {
-                sampler_ref: s.sampler_ref,
-                index: s.index,
-            });
         }
         let mut err_buf = [0i8; 128];
         let err = (err_buf.as_mut_ptr() as *mut c_char, err_buf.len());
@@ -531,12 +468,6 @@ fn apply_icb_encoder_inheritance<M: HostMemory + HostOps>(
     for s in &req.fragment_samplers {
         if s.sampler_ref == 0 {
             continue;
-        }
-        if s.index >= MAX_SAMPLER_BIND_SLOTS {
-            return Err(MetalIcbInheritanceDecline::FragmentSamplerIndexOutOfRange {
-                sampler_ref: s.sampler_ref,
-                index: s.index,
-            });
         }
         let mut err_buf = [0i8; 128];
         let err = (err_buf.as_mut_ptr() as *mut c_char, err_buf.len());

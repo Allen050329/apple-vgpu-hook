@@ -47,6 +47,14 @@ pub enum DrawPreparationDecline {
         width: u32,
         height: u32,
     },
+    /// A live bind names a slot past its class's argument table, so no encoder
+    /// of this backend has anywhere to put it. See
+    /// [`crate::runtime::draw::first_bind_past_table`] for why the whole draw is
+    /// refused rather than the one bind dropped.
+    BindSlotPastTable {
+        pipeline_ref: u32,
+        bind: crate::runtime::draw::PastTableBind,
+    },
     VertexBufferMissing {
         index: u32,
         buffer_ref: u32,
@@ -230,6 +238,7 @@ impl Decline for DrawPreparationDecline {
                 reason.slug()
             }
             Self::GeometryUnsupported { .. } => "draw_prepare_geometry_unsupported",
+            Self::BindSlotPastTable { .. } => "draw_prepare_bind_slot_past_table",
             Self::VertexBufferMissing { .. } => "draw_prepare_vertex_buffer_missing",
             Self::FragmentBufferMissing { .. } => "draw_prepare_fragment_buffer_missing",
             Self::VertexAttributeFormat { .. } => "draw_prepare_vertex_attribute_format",
@@ -341,6 +350,14 @@ impl Decline for DrawPreparationDecline {
             } => vec![
                 ("task_id", task_id.to_string()),
                 ("pipeline_ref", pipeline_ref.to_string()),
+            ],
+            Self::BindSlotPastTable { pipeline_ref, bind } => vec![
+                ("pipeline_ref", pipeline_ref.to_string()),
+                ("class", bind.class.name().to_string()),
+                ("stage", bind.stage_name().to_string()),
+                ("index", bind.index.to_string()),
+                ("table", bind.class.table().to_string()),
+                ("ref", bind.resource_ref.to_string()),
             ],
             Self::VertexMtlbMissing {
                 task_id,

@@ -1357,7 +1357,7 @@ fn handle_render_record<M: HostMemory + HostOps>(
                 crate::runtime::drain::note_store_route("render_vertex_attribute_stride_dropped");
             }
             // Archive apply_buffer_offset: update offset on an already-bound slot.
-            if cmd.first >= MAX_BUFFER_BIND_SLOTS {
+            if cmd.first >= BindClass::Buffer.table() {
                 // The slot is outside the table, so the bind that would have
                 // occupied it was already dropped by `apply_binds` and counted
                 // under `render_buffer_bind_slot_past_table`. This is the
@@ -1978,24 +1978,32 @@ fn handle_render_record<M: HostMemory + HostOps>(
     }
 }
 
-/// Which of the three argument tables a bind record names.
+use crate::runtime::draw::BindTableClass as BindClass;
+
+/// The census vocabulary for a bind slot this device's argument table could not
+/// hold.
 ///
-/// [`apply_binds`] gates each class on [`BindClass::host_table`], its own bound.
-/// It used to gate all three on one constant, which was Metal's *buffer* table
-/// applied to buffers, textures and samplers alike — defensible as a *bound*,
-/// since it was the smallest of the three, but the wrong number for two classes
-/// by construction and never defensible as a *counter*.
+/// The type and its bound live in [`crate::runtime::draw`], beside the three
+/// constants; this `impl` is this module's own addition — the census
+/// vocabulary for a slot the table could not hold. [`apply_binds`] gates each
+/// class on [`BindClass::table`], its own bound. It used to gate all three on
+/// one constant, which was Metal's *buffer* table applied to buffers, textures
+/// and samplers alike — defensible as a *bound*, since it was the smallest of
+/// the three, but the wrong number for two classes by construction and never
+/// defensible as a *counter*.
 ///
 /// Apple's serializer truncates a plural bind at the stage's argument table, and
 /// [`reims_vgpu_wire::ops::bind_limit`] measured those three tables at 128
-/// textures, 31 buffers and 16 samplers, so a slot dropped here means something
-/// different in each class:
+/// textures, 31 buffers and 16 samplers. All three of this device's bounds now
+/// sit at or above Apple's, pinned by the `const` assertions below, so a slot
+/// dropped here cannot come from a conforming Apple stream in any class — but
+/// what a reading would *mean* still differs by class:
 ///
-/// * **Texture** — real loss. Apple emits up to 128 and this device holds 32,
-///   the width of a descriptor binding band, so slots 32..127 are guest work
-///   with nowhere to go.
-/// * **Buffer** — cannot fire from an Apple guest. 31 is exactly the serializer's
-///   own buffer bound, so a non-zero reading is either a guest writing its own
+/// * **Texture** — the bound is Apple's whole 128-entry table. It was 32, the
+///   width of a descriptor binding band, and slots 32..127 were guest work with
+///   nowhere to go until `spirv_bind::widen_sampled_bands` closed the gap.
+/// * **Buffer** — 31 is exactly the serializer's own buffer bound, with no
+///   margin at all, so a non-zero reading is either a guest writing its own
 ///   stream or a decode that mis-sized the table.
 /// * **Sampler** — same, one step further: Apple truncates at 16, half the
 ///   bound, so this can only fire on a stream Apple's serializer did not write.
@@ -2004,15 +2012,8 @@ fn handle_render_record<M: HostMemory + HostOps>(
 /// table to widen, which is the whole reason the counter exists. Splitting it is
 /// the same lesson `BlitEncoderSPI` taught one layer up — a family is not
 /// uniform in what its loss means.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum BindClass {
-    Buffer,
-    Texture,
-    Sampler,
-}
-
 impl BindClass {
-    /// The census name for slots this class lost to [`BindClass::host_table`].
+    /// The census name for slots this class lost to [`BindClass::table`].
     ///
     /// Also the `reason=` slug of [`BindSlotPastTable`], deliberately: the two
     /// name one event, and a reader who greps the fail log for a slug should
@@ -2024,26 +2025,6 @@ impl BindClass {
             BindClass::Buffer => "render_buffer_bind_slot_past_table",
             BindClass::Texture => "render_texture_bind_slot_past_table",
             BindClass::Sampler => "render_sampler_bind_slot_past_table",
-        }
-    }
-
-    /// This device's own bind-index bound for the class.
-    ///
-    /// One constant per class, because they have three different bases: the
-    /// buffer bound is Metal's argument table (and, independently, Apple's own),
-    /// while the texture and sampler bounds are the width of a descriptor
-    /// binding band. A single shared constant made two of the three the wrong
-    /// number by construction — it was Metal's *buffer* table applied to all
-    /// three — which is what [`crate::runtime::draw::MAX_TEXTURE_BIND_SLOTS`]
-    /// records.
-    fn host_table(self) -> u32 {
-        use crate::runtime::draw::{
-            MAX_BUFFER_BIND_SLOTS, MAX_SAMPLER_BIND_SLOTS, MAX_TEXTURE_BIND_SLOTS,
-        };
-        match self {
-            BindClass::Buffer => MAX_BUFFER_BIND_SLOTS,
-            BindClass::Texture => MAX_TEXTURE_BIND_SLOTS,
-            BindClass::Sampler => MAX_SAMPLER_BIND_SLOTS,
         }
     }
 
@@ -2133,7 +2114,7 @@ impl BindClass {
     }
 }
 
-/// A render bind record whose slot run reached past [`BindClass::host_table`], so the
+/// A render bind record whose slot run reached past [`BindClass::table`], so the
 /// walk stopped and the rest of the record was dropped.
 ///
 /// # Why this is on the fail channel and not only in the census
@@ -2189,7 +2170,7 @@ impl crate::observe::Decline for BindSlotPastTable {
             ),
             ("index", self.index.to_string()),
             ("slots", self.slots.to_string()),
-            ("table", self.class.host_table().to_string()),
+            ("table", self.class.table().to_string()),
             ("apple_table", self.class.apple_table().to_string()),
         ]
     }
@@ -2247,7 +2228,7 @@ struct BindTarget {
 /// All three carry the same wire form: `count` consecutive slots starting at
 /// `first`, where a zero object ref clears the slot it names and any other ref
 /// replaces whatever occupied it. Slots at or past the class's own
-/// [`BindClass::host_table`] are outside the encoder's table and end the walk. Only the vertex and fragment
+/// [`BindClass::table`] are outside the encoder's table and end the walk. Only the vertex and fragment
 /// stages have tables here; a record for any other stage still counts its
 /// clears, because a slot the guest cleared is cleared whether or not we model
 /// the table it lived in.
@@ -2277,11 +2258,11 @@ fn apply_binds<T: Copy, B: Clone>(
     let mut cleared = 0u32;
     for (i, entry) in entries.iter().copied().enumerate() {
         let index = first.saturating_add(i as u32);
-        if index >= class.host_table() {
+        if index >= class.table() {
             // The walk stops here, and it used to stop in silence — a `break`
             // that dropped every remaining slot with nothing to say so.
             //
-            // The bound is `class.host_table()`, one constant per class. It
+            // The bound is `class.table()`, one constant per class. It
             // used to be a single 31 — Metal's *buffer* index cap — applied to
             // all three tables, where Apple's texture limit is 128 and its
             // sampler limit 16, so it was the wrong number for two of the three
