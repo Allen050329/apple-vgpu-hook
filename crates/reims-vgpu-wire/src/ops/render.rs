@@ -1485,6 +1485,21 @@ pub struct MemoryBarrierScope {
     /// **What would settle it:** a scope with bit 8 set. Metal defines none, so
     /// on this API the question may have no answer — which is itself the
     /// finding, and is why the field is named rather than folded into `scope`.
+    ///
+    /// **What does not settle it, and looks as though it should:** the encoder
+    /// writes bytes `+0` and `+1` with a single 16-bit store, and `+2` and `+3`
+    /// with a byte store each. That is why this byte is reliably `0` here while
+    /// the compute sibling — which stores only two bytes of its four — leaves
+    /// ring residue in the rest, and it is the asymmetry
+    /// [`crate::ops::compute::MemoryBarrierScope`] describes. It is *not*
+    /// evidence of a `u16` field: a one-byte value zero-extended into a
+    /// two-byte store is the same instruction, and "declared `Q`, narrowed on
+    /// the wire" is what this whole record does. Do not fold the two on the
+    /// strength of the store width.
+    ///
+    /// Keeping it separate also keeps the alarm. The fixture asserts this byte
+    /// is still `0`; folded into `scope`, an Apple build that started using it
+    /// would be absorbed into a larger scope value with nothing to report.
     pub unidentified_u8: u8,
     /// `MTLRenderStages` the barrier waits on.
     pub after_stages: u8,
