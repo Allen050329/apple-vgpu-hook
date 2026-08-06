@@ -2017,7 +2017,7 @@ pub fn decode_render_pipeline_descriptor(
             out.vertex_attributes = parse_vertex_block(bytes, first_tlv_end, color_abs)?;
         }
         if color_abs < declared {
-            out.color_attachments = parse_color_attachments(bytes, declared, color_abs);
+            out.color_attachments = parse_color_attachments(bytes, declared, color_abs)?;
             if let Some(c0) = out.color_attachments.first().copied() {
                 out.color0 = c0;
             }
@@ -2193,7 +2193,7 @@ fn parse_one_color_entry(
     len: usize,
     entry: usize,
     position: u32,
-) -> PipelineColorAttachment {
+) -> Result<PipelineColorAttachment, DecodeStatus> {
     let slot = match entry_tag_u32_present(bytes, len, entry, COLOR_ATTACHMENT_TAG_INDEX) {
         Some(declared) if (declared as usize) < MAX_COLOR_ATTACHMENTS => {
             if declared != position {
@@ -2206,10 +2206,11 @@ fn parse_one_color_entry(
             declared
         }
         Some(declared) => {
-            // A slot this device cannot represent. Keeping the position would
-            // bind this entry's state to a slot the guest did not name, so the
-            // entry is reported and left on its position rather than silently
-            // aliasing a real attachment.
+            // A slot this device cannot represent, and there is no second-best.
+            // Falling back to `position` is exactly the aliasing to avoid — a
+            // position is itself a slot 0..7, so this entry's blend state, write
+            // mask and pixel format would be bound to a real attachment the guest
+            // named nothing about. Refuse the pipeline instead.
             if crate::observe::first_sight(
                 "color_attachment_index_out_of_range",
                 u64::from(declared),
@@ -2222,7 +2223,7 @@ fn parse_one_color_entry(
                 .field("max", MAX_COLOR_ATTACHMENTS)
                 .fail();
             }
-            position
+            return Err(DecodeStatus::ErrUnsupported("res_color_slot_over"));
         }
         None => position,
     };
@@ -2299,9 +2300,8 @@ fn parse_one_color_entry(
                 .fail();
         }
     }
-    out
+    Ok(out)
 }
-
 /// A color-attachment section that named more entries than it delivered.
 ///
 /// The section is `[count:u32][entry_offset:u32 × count]`, each offset relative
@@ -2375,41 +2375,55 @@ const MAX_COLOR_ATTACHMENTS: usize = 8;
 /// does not, and every consumer of the result selects by `slot`.
 ///
 /// `section_off == 0` is the descriptor saying it has no color section at all —
-/// expected control flow, and quiet. Every other early exit is a loss and says
-/// so through [`ColorAttachTableTruncated`].
+/// expected control flow, and quiet, and the only way to get an empty table.
+/// Every other way of ending up with fewer attachments than the count promised
+/// is a loss: it says so through [`ColorAttachTableTruncated`] and then refuses,
+/// because a pipeline built from a short table is a *valid* pipeline whose
+/// missing attachments read as a guest that declared fewer — the wrong blend or
+/// the absent render target arrives with nothing naming it.
 pub fn parse_color_attachments(
     bytes: &[u8],
     len: usize,
     section_off: usize,
-) -> Vec<PipelineColorAttachment> {
+) -> Result<Vec<PipelineColorAttachment>, DecodeStatus> {
     let mut out = Vec::new();
     if section_off == 0 {
-        return out;
+        return Ok(out);
     }
     // The header is the count plus the first entry's offset word. A section the
     // descriptor cannot contain loses an unreadable number of attachments, which
     // the count mismatch below cannot see, so it is reported here.
     if section_off + 8 > len {
         note_color_table_truncated(None, 0, section_off, len);
-        return out;
+        return Err(DecodeStatus::ErrShort("res_color_section_oob"));
     }
     let declared = ld32(&bytes[section_off..]) as usize;
-    for i in 0..declared.min(MAX_COLOR_ATTACHMENTS) {
+    // `MTLRenderPipelineDescriptor.colorAttachments` has eight subscripts, so a
+    // ninth is a descriptor Metal cannot hold and this decoder cannot place.
+    if declared > MAX_COLOR_ATTACHMENTS {
+        note_color_table_truncated(Some(declared), MAX_COLOR_ATTACHMENTS, section_off, len);
+        return Err(DecodeStatus::ErrUnsupported("res_color_count_over"));
+    }
+    for i in 0..declared {
+        // Two ways the table can stop short of what the count promised: its own
+        // offset word runs past the descriptor, or the entry that word points at
+        // does. Both used to `break`, which left a shorter table and one line
+        // saying so; both now carry that line and refuse.
         let offloc = section_off + 4 + i * 4;
-        if offloc + 4 > len {
-            break;
-        }
-        let entry_rel = ld32(&bytes[offloc..]) as usize;
-        let entry = match section_off.checked_add(entry_rel) {
-            Some(e) if e < len => e,
-            _ => break,
+        let entry = if offloc + 4 > len {
+            None
+        } else {
+            section_off
+                .checked_add(ld32(&bytes[offloc..]) as usize)
+                .filter(|e| *e < len)
         };
-        out.push(parse_one_color_entry(bytes, len, entry, i as u32));
+        let Some(entry) = entry else {
+            note_color_table_truncated(Some(declared), out.len(), section_off, len);
+            return Err(DecodeStatus::ErrShort("res_color_entry_oob"));
+        };
+        out.push(parse_one_color_entry(bytes, len, entry, i as u32)?);
     }
-    if out.len() != declared {
-        note_color_table_truncated(Some(declared), out.len(), section_off, len);
-    }
-    out
+    Ok(out)
 }
 
 /// A heap-placed texture record, opcode [`HEAP_TEXTURE_OPCODE`].

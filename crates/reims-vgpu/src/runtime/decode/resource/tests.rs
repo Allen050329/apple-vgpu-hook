@@ -1301,7 +1301,13 @@ fn compact_render_pipeline_object_mesh_funcs() {
     use crate::contract::endian::st32;
     // Mesh SPI shape: tag 0x14 section offset + 0x01 object / 0x02 mesh / 0x03 frag.
     // (Host serializeMeshRenderPipelineDescriptor differentials, 2026-07-12.)
-    let mut b = vec![0u8; 16 + 1 + 6 * 4];
+    //
+    // The colour section the tag points at is present and empty. It has to be:
+    // an offset naming a section the descriptor does not contain loses an
+    // unreadable number of attachments and `parse_color_attachments` refuses it,
+    // which is the whole point of that refusal — so a fixture that declares the
+    // offset must carry the eight header bytes a real descriptor carries.
+    let mut b = vec![0u8; 16 + 24 + 8];
     let blen = b.len() as u32;
     st32(&mut b[0..], TYPE7_OBJECT_RENDER_PIPELINE);
     st32(&mut b[4..], blen);
@@ -1373,7 +1379,7 @@ fn color_attachment0_blend_section() {
     buf[entry + 13] = COLOR_ATTACHMENT_TAG_DST_RGB;
     buf[entry + 14] = 4;
     st32(&mut buf[entry + 15..], 5); // OneMinusSourceAlpha
-    let all = parse_color_attachments(&buf, buf.len(), off);
+    let all = parse_color_attachments(&buf, buf.len(), off).expect("a well-formed table decodes");
     let c = all.first().copied().unwrap_or_default();
     assert!(c.has_pixel_format);
     assert_eq!(c.pixel_format, MTL_FORMAT_BGRA8_UNORM as u32);
@@ -1381,7 +1387,7 @@ fn color_attachment0_blend_section() {
     assert_eq!(c.dst_rgb, 5);
     assert_eq!(c.src_rgb, BLEND_FACTOR_ONE);
     assert_eq!(c.slot, 0);
-    let all = parse_color_attachments(&buf, buf.len(), off);
+    let all = parse_color_attachments(&buf, buf.len(), off).expect("a well-formed table decodes");
     assert_eq!(all.len(), 1);
 }
 
@@ -1419,7 +1425,7 @@ fn colour_attachment_slots_are_their_own_index_and_carry_their_own_state() {
         // Distinct per slot: 10, 11, 12.
         st32(&mut buf[entry + 3..], 10 + i as u32);
     }
-    let all = parse_color_attachments(&buf, buf.len(), off);
+    let all = parse_color_attachments(&buf, buf.len(), off).expect("a well-formed table decodes");
     assert_eq!(all.len(), 3, "all three entries are in range");
     for (i, a) in all.iter().enumerate() {
         assert_eq!(
@@ -1440,15 +1446,21 @@ fn colour_attachment_slots_are_their_own_index_and_carry_their_own_state() {
     assert_eq!(by_slot(5), None);
 }
 
-/// A section that declares three attachments and delivers one is a pipeline
-/// whose other two slots take opaque `ONE`/`ZERO` defaults, which downstream
-/// cannot tell from a guest that declared one. The loss has to say so.
+/// A section that declares three attachments and can deliver one refuses,
+/// naming both numbers.
 ///
-/// The entry offset for slot 1 points past the descriptor, so the walk stops
-/// after slot 0 — the same `break` the truncated-offset-word and
-/// out-of-range-entry cases take.
+/// Delivering the one is what this used to do, and the result is a pipeline
+/// whose other two slots take opaque `ONE`/`ZERO` defaults — downstream cannot
+/// tell that from a guest that declared one, so the wrong blend or the absent
+/// render target arrives with nothing but this line behind it. The line is not
+/// enough on its own: a refusal is what stops the wrong pipeline from being
+/// built at all.
+///
+/// The entry offset for slot 1 points past the descriptor, which is one of the
+/// two ways the walk can stop short; the other is an offset word that does not
+/// fit, and both take the same exit.
 #[test]
-fn a_colour_attachment_table_that_loses_entries_says_how_many() {
+fn a_colour_attachment_table_that_cannot_deliver_its_count_refuses() {
     use crate::contract::endian::st32;
     use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     let off = 16usize;
@@ -1465,9 +1477,12 @@ fn a_colour_attachment_table_that_loses_entries_says_how_many() {
     st32(&mut buf[entry + 3..], MTL_FORMAT_BGRA8_UNORM as u32);
 
     let cap = crate::observe::FailCapture::start();
-    let all = parse_color_attachments(&buf, buf.len(), off);
+    assert_eq!(
+        parse_color_attachments(&buf, buf.len(), off),
+        Err(DecodeStatus::ErrShort("res_color_entry_oob")),
+        "a table that cannot deliver its count refuses the descriptor"
+    );
     let lines = cap.lines();
-    assert_eq!(all.len(), 1, "only slot 0's entry is in range");
 
     let truncated: Vec<&String> = lines
         .iter()
@@ -1482,6 +1497,73 @@ fn a_colour_attachment_table_that_loses_entries_says_how_many() {
         truncated[0].contains("declared=3") && truncated[0].contains("decoded=1"),
         "the decline names how many were promised and how many arrived: {}",
         truncated[0]
+    );
+}
+
+/// A count above `MTLRenderPipelineDescriptor.colorAttachments`' eight
+/// subscripts refuses, rather than binding the first eight and dropping the
+/// rest onto nothing.
+#[test]
+fn a_colour_attachment_count_past_the_eight_slot_array_refuses() {
+    use crate::contract::endian::st32;
+    let off = 16usize;
+    let declared = MAX_COLOR_ATTACHMENTS + 1;
+    // Only the header needs to be well formed: the count is refused before any
+    // entry is read, which is the point — the surplus entries need not exist for
+    // the descriptor to be unbuildable.
+    let mut buf = vec![0u8; off + 4 + 4 * declared];
+    st32(&mut buf[off..], declared as u32);
+    let cap = crate::observe::FailCapture::start();
+    assert_eq!(
+        parse_color_attachments(&buf, buf.len(), off),
+        Err(DecodeStatus::ErrUnsupported("res_color_count_over"))
+    );
+    assert!(
+        cap.lines()
+            .iter()
+            .any(|l| l.contains("reason=color_attachment_table_truncated")
+                && l.contains(&format!("declared={declared}"))),
+        "and says which count it refused on: {:?}",
+        cap.lines()
+    );
+}
+
+/// An entry naming a slot the eight-slot array has no subscript for refuses,
+/// because the fallback it used to take was itself the aliasing to avoid.
+///
+/// Falling back to the table position puts this entry's blend state, write mask
+/// and pixel format on a slot 0..7 — a real attachment the guest named nothing
+/// about. There is no correct slot to place it on, so there is no correct
+/// pipeline to build.
+#[test]
+fn a_colour_attachment_slot_past_the_array_refuses_instead_of_taking_a_position() {
+    use crate::contract::endian::st32;
+    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    let off = 16usize;
+    let mut buf = vec![0u8; off + 8 + 1 + 2 * 6];
+    st32(&mut buf[off..], 1);
+    st32(&mut buf[off + 4..], 8);
+    let entry = off + 8;
+    buf[entry] = 2;
+    buf[entry + 1] = COLOR_ATTACHMENT_TAG_INDEX;
+    buf[entry + 2] = 4;
+    // The first index with no subscript, so position 0 is what it would alias.
+    st32(&mut buf[entry + 3..], MAX_COLOR_ATTACHMENTS as u32);
+    buf[entry + 7] = COLOR_ATTACHMENT_TAG_PIXEL_FORMAT;
+    buf[entry + 8] = 4;
+    st32(&mut buf[entry + 9..], MTL_FORMAT_BGRA8_UNORM as u32);
+
+    let cap = crate::observe::FailCapture::start();
+    assert_eq!(
+        parse_color_attachments(&buf, buf.len(), off),
+        Err(DecodeStatus::ErrUnsupported("res_color_slot_over"))
+    );
+    assert!(
+        cap.lines()
+            .iter()
+            .any(|l| l.contains("reason=color_attachment_index_out_of_range")),
+        "the refusal keeps its existing line: {:?}",
+        cap.lines()
     );
 }
 
@@ -1510,7 +1592,7 @@ fn an_unconsumed_colour_attachment_field_reports_its_tag_and_value() {
     st32(&mut buf[entry + 9..], UNKNOWN_VALUE);
 
     let cap = crate::observe::FailCapture::start();
-    let all = parse_color_attachments(&buf, buf.len(), off);
+    let all = parse_color_attachments(&buf, buf.len(), off).expect("a well-formed table decodes");
     let lines = cap.lines();
     // The consumed field still decodes; the census does not disturb it.
     assert_eq!(
@@ -1594,7 +1676,7 @@ fn a_colour_attachment_takes_the_slot_the_guest_declared() {
     put(off + 12, 3, MTL_FORMAT_BGRA8_UNORM as u32);
     put(off + 12 + entry_len, 1, MTL_FORMAT_RGBA8_UNORM as u32);
 
-    let got = parse_color_attachments(&buf, buf.len(), off);
+    let got = parse_color_attachments(&buf, buf.len(), off).expect("a well-formed table decodes");
     assert_eq!(got.len(), 2);
     assert_eq!(
         (got[0].slot, got[1].slot),
@@ -1645,7 +1727,7 @@ fn a_colour_attachment_write_mask_decodes_and_defaults_to_all() {
     buf[entry + 7] = COLOR_ATTACHMENT_TAG_WRITE_MASK;
     buf[entry + 8] = 4;
     st32(&mut buf[entry + 9..], MTL_COLOR_WRITE_MASK_ALPHA);
-    let masked = parse_color_attachments(&buf, buf.len(), off);
+    let masked = parse_color_attachments(&buf, buf.len(), off).expect("a well-formed table decodes");
     assert_eq!(
         masked.first().map(|c| c.write_mask),
         Some(ColorWriteMask::new(MTL_COLOR_WRITE_MASK_ALPHA).unwrap())
@@ -1656,7 +1738,7 @@ fn a_colour_attachment_write_mask_decodes_and_defaults_to_all() {
     // a derived `Default` on a bare `u32` would have made a black
     // attachment, and every pipeline in the tree takes it.
     buf[entry] = 1;
-    let plain = parse_color_attachments(&buf, buf.len(), off);
+    let plain = parse_color_attachments(&buf, buf.len(), off).expect("a well-formed table decodes");
     assert_eq!(plain[0].write_mask.bits, MTL_COLOR_WRITE_MASK_ALL);
     assert_eq!(plain[0].write_mask, ColorWriteMask::default());
 }
@@ -1679,7 +1761,7 @@ fn a_write_mask_outside_the_four_bits_refuses_by_name() {
     st32(&mut buf[entry + 3..], 0x1234_5678);
 
     let cap = crate::observe::FailCapture::start();
-    let all = parse_color_attachments(&buf, buf.len(), off);
+    let all = parse_color_attachments(&buf, buf.len(), off).expect("a well-formed table decodes");
     assert!(
         all[0].write_mask.bits == MTL_COLOR_WRITE_MASK_ALL,
         "a refused mask leaves the attachment writing every channel, \
