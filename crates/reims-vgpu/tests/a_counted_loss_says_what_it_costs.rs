@@ -7,7 +7,7 @@
 //! `drain::note_store_route("…_dropped")` — a name and a count, no type, and so
 //! no row in that census and no line on the fail channel either.
 //!
-//! Thirty-three slugs in this crate are spelled that way, and twenty-eight of
+//! Thirty-one slugs in this crate are spelled that way, and twenty-six of
 //! them name a decoded guest command or a decoded piece of render state that
 //! this device did not apply. They are exactly the `Loss::ExecutedModified`
 //! class, wearing a spelling the census cannot see — and there are more than
@@ -181,15 +181,6 @@ const ROWS: &[(&str, Counted, &str)] = &[
          literal, not whether it wrote something close to it",
     ),
     (
-        "render_draw_indexed_indirect_dropped",
-        Counted::WorkNotExecuted,
-        "an indexed indirect draw: geometry the guest asked for and did not get, \
-         so this arm keeps a fail-visible line on top of the count. It cannot be \
-         executed from the record — the vertex and instance counts live in the \
-         indirect buffer, written by the GPU or by a compute pass, and this rail \
-         replays counts it has read",
-    ),
-    (
         "render_tile_dispatch_dropped",
         Counted::WorkNotExecuted,
         "a tile shader the guest asked to run, so work rather than state, and it \
@@ -233,14 +224,6 @@ const ROWS: &[(&str, Counted, &str)] = &[
          of the line width above and compared exactly for the same reason. It \
          scales geometry this device does not tessellate at all, so it tracks \
          the patch draws rather than standing alone",
-    ),
-    (
-        "render_draw_indirect_dropped",
-        Counted::WorkNotExecuted,
-        "the unindexed half of the indirect draw beside it, and the same \
-         reasoning: the counts live in a buffer written by the GPU or a compute \
-         pass, and this rail replays counts it has read. Keeps a fail-visible \
-         line as well as the count",
     ),
     (
         "render_draw_patches_dropped",
@@ -524,7 +507,7 @@ fn no_counted_loss_is_unread() {
 /// population without changing anything the guest sees.
 #[test]
 fn the_counted_loss_census_only_shrinks() {
-    const COUNTED_LOSS_CEILING: usize = 28;
+    const COUNTED_LOSS_CEILING: usize = 26;
     let losses = ROWS
         .iter()
         .filter(|(_, c, _)| matches!(c, Counted::StateNotApplied | Counted::WorkNotExecuted))

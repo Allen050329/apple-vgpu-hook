@@ -2725,6 +2725,156 @@ fn a_decoded_record_that_no_arm_applies_names_what_happened_instead() {
     assert!(log.contains("reason=render_icb_execute_unnamed"));
 }
 
+/// An indirect draw reaches the draw list with the counts its buffer holds.
+///
+/// Both forms used to raise a counter and reach
+/// `note_unimplemented_render_opcode`, so the geometry never rendered. The
+/// counts are now read from the guest buffer the same way the compute rail's
+/// `DispatchThreadgroupsIndirect` already reads its grid — which is what makes
+/// the render rail's old "it cannot be executed from the record" a divergence
+/// between two arms rather than a property of the protocol.
+///
+/// Every value in each argument block differs from every other, because they
+/// are all 32-bit and a transposition draws a valid primitive of the wrong
+/// shape. The indexed block additionally must not put `indexStart` where
+/// `first_vertex` goes: that would shift the vertex fetch instead of the index
+/// fetch, and both still render.
+#[test]
+fn an_indirect_draw_takes_its_counts_from_the_guest_buffer() {
+    use crate::runtime::decode::resource::{
+        list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_BUFFER, RESOURCE_PAGE_SHIFT,
+    };
+    use crate::runtime::gva_mem::{self, write_task_gva_arm64e};
+
+    // A type-1 buffer at ref 7 holding `words`, resolvable through the task's
+    // own page table — the shape `resolve_indirect_threadgroups_from_buffer`
+    // uses on the compute rail.
+    let build = |words: &[u32]| {
+        let mut host = FakeHost::new();
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+        assert!(state.set_object_list(1, 0, 32));
+        let bytes: Vec<u8> = words.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let buf_gva = 5u64 << RESOURCE_PAGE_SHIFT;
+        write_task_gva_arm64e(&mut host, &state.tasks[1], buf_gva, &bytes);
+        let mut bdesc = vec![0u8; 16];
+        st64(&mut bdesc[0..], bytes.len() as u64);
+        st32(&mut bdesc[8..], 5);
+        let bdesc_gva = 0x180u64;
+        write_task_gva_arm64e(&mut host, &state.tasks[1], bdesc_gva, &bdesc);
+        let off = list_object_entry_offset(7, 32).unwrap();
+        let mut le = [0u8; OBJECT_LIST_ENTRY_LEN];
+        st32(&mut le[0..], (OBJECT_TYPE_BUFFER as u32) | (16u32 << 8));
+        le[4..12].copy_from_slice(&bdesc_gva.to_le_bytes());
+        write_task_gva_arm64e(&mut host, &state.tasks[1], off, &le);
+        (host, state)
+    };
+
+    // --- 0x10, unindexed. Offset first on the wire, then buffer, then type.
+    {
+        let (host, mut state) = build(&[11, 22, 33, 44]);
+        let mut acc = StreamAccum {
+            pipeline_ref: 0x41,
+            ..Default::default()
+        };
+        let mut out = ExecResult::default();
+        let total = wire_render::DRAW_INDIRECT_TOTAL_LEN as usize;
+        let op = wire_render::OPCODE_DRAW_INDIRECT;
+        let mut command = vec![0u8; total];
+        st32(&mut command[0..], op);
+        st32(&mut command[4..], total as u32);
+        let p = OP_HEADER_LEN;
+        st64(&mut command[p..], 0); // indirect_buffer_offset
+        st32(&mut command[p + 8..], 7); // indirect_buffer_ref
+        st16(&mut command[p + 12..], 4); // MTLPrimitiveTypeTriangleStrip
+        handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
+
+        assert_eq!(acc.draws.len(), 1, "the draw the guest asked for is recorded");
+        assert_eq!(
+            acc.draws[0].draw,
+            crate::contract::draw::DrawArgs {
+                vertex_count: 11,
+                instance_count: 22,
+                primitive_type: 4,
+                first_vertex: 33,
+                base_instance: 44,
+            }
+        );
+        assert!(acc.saw_draw);
+        assert!(
+            acc.draws[0].indexed.is_none(),
+            "an unindexed indirect draw must not carry an index buffer"
+        );
+    }
+
+    // --- 0x11, indexed. `indexStart` counts indices, so it scales the byte
+    // offset by the width `index_type` declares rather than landing raw.
+    {
+        let (host, mut state) = build(&[11, 22, 33, 44, 55]);
+        let mut acc = StreamAccum {
+            pipeline_ref: 0x41,
+            ..Default::default()
+        };
+        let mut out = ExecResult::default();
+        let total = wire_render::DRAW_INDEXED_INDIRECT_TOTAL_LEN as usize;
+        let op = wire_render::OPCODE_DRAW_INDEXED_INDIRECT;
+        let mut command = vec![0u8; total];
+        st32(&mut command[0..], op);
+        st32(&mut command[4..], total as u32);
+        let p = OP_HEADER_LEN;
+        st16(&mut command[p..], 3); // primitive_type
+        st16(&mut command[p + 2..], 1); // MTLIndexTypeUInt32
+        st32(&mut command[p + 4..], 0x3e); // index_buffer_ref
+        st32(&mut command[p + 8..], 7); // indirect_buffer_ref
+        st64(&mut command[p + 12..], 0x100); // index_buffer_offset
+        st64(&mut command[p + 20..], 0); // indirect_buffer_offset
+        handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
+
+        assert_eq!(acc.draws.len(), 1);
+        let pd = &acc.draws[0];
+        assert_eq!(pd.draw.vertex_count, 11, "indexCount");
+        assert_eq!(pd.draw.instance_count, 22);
+        assert_eq!(pd.draw.primitive_type, 3, "from the record, not the block");
+        assert_eq!(
+            pd.draw.first_vertex, 0,
+            "indexStart offsets the index buffer, never the vertex fetch"
+        );
+        assert_eq!(pd.draw.base_instance, 55);
+        let idx = pd.indexed.as_ref().expect("the indexed form carries one");
+        assert_eq!(idx.index_buffer_ref, 0x3e);
+        assert_eq!(idx.index_count, 11);
+        assert_eq!(idx.base_vertex, 44, "baseVertex, the block's signed field");
+        assert_eq!(
+            idx.index_buffer_offset,
+            0x100 + 33 * 4,
+            "indexStart 33 at four bytes per UInt32 index, past the record's own offset"
+        );
+    }
+
+    // --- A buffer this device cannot read is a refused draw, not a zero one.
+    // There is no count in the record to fall back to.
+    {
+        let (host, mut state) = build(&[11, 22, 33, 44]);
+        let mut acc = StreamAccum {
+            pipeline_ref: 0x41,
+            ..Default::default()
+        };
+        let mut out = ExecResult::default();
+        let total = wire_render::DRAW_INDIRECT_TOTAL_LEN as usize;
+        let op = wire_render::OPCODE_DRAW_INDIRECT;
+        let mut command = vec![0u8; total];
+        st32(&mut command[0..], op);
+        st32(&mut command[4..], total as u32);
+        st32(&mut command[OP_HEADER_LEN + 8..], 0x5151); // a ref nothing holds
+        handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
+        assert!(
+            acc.draws.is_empty(),
+            "a draw whose counts could not be read must not be recorded with invented ones"
+        );
+        assert!(!acc.saw_draw, "and must not claim the stream has draws in it");
+    }
+}
+
 /// Every `executeCommandsInBuffer:` in a stream is kept, in stream order.
 ///
 /// This is work, not state. The field behind it was an `Option` assigned with
@@ -3292,9 +3442,14 @@ fn a_strided_vertex_bind_lands_in_the_table_and_still_reports_the_stride() {
 /// and a counter nobody reads back cannot be shown to be wired up. Nine of
 /// them had no such test until now.
 ///
-/// The two indirect draws are deliberately not in the default half. They
-/// have no default to be at -- an indirect draw is geometry the guest asked
-/// for, so every one is a loss and is counted unconditionally.
+/// The tessellated patch draws are deliberately not in the default half. They
+/// have no default to be at -- a patch draw is geometry the guest asked for,
+/// so every one is a loss and is counted unconditionally.
+///
+/// The two *indirect* draws used to be here on the same reading and are not
+/// any more: both now read their counts out of the guest buffer and reach the
+/// draw list, which is what
+/// [`an_indirect_draw_takes_its_counts_from_the_guest_buffer`] holds.
 ///
 /// `setTriangleFillMode:` and `setDepthClipMode:` used to be the first two
 /// rows here and are not any more: both now reach a backend, and
@@ -3302,7 +3457,7 @@ fn a_strided_vertex_bind_lands_in_the_table_and_still_reports_the_stride() {
 /// replaced their rows.
 #[test]
 fn every_decoded_but_unapplied_render_state_reaches_its_own_counter() {
-    use crate::contract::endian::{st16, st64};
+    use crate::contract::endian::st64;
     use crate::runtime::drain::store_route_count;
 
     // (opcode, total length, payload writer, route, whether a default-valued
@@ -3381,31 +3536,6 @@ fn every_decoded_but_unapplied_render_state_reaches_its_own_counter() {
                 st32(&mut p[4..], 0);
             }),
             "render_vertex_amplification_dropped",
-        ),
-        (
-            wire_render::OPCODE_DRAW_INDIRECT,
-            24,
-            |p| {
-                st64(p, 0x1111);
-                st32(&mut p[8..], 5151);
-                st16(&mut p[12..], 3);
-            },
-            None,
-            "render_draw_indirect_dropped",
-        ),
-        (
-            wire_render::OPCODE_DRAW_INDEXED_INDIRECT,
-            36,
-            |p| {
-                st16(p, 4);
-                st16(&mut p[2..], 1);
-                st32(&mut p[4..], 5151);
-                st32(&mut p[8..], 5252);
-                st64(&mut p[12..], 0x1111);
-                st64(&mut p[20..], 0x2222);
-            },
-            None,
-            "render_draw_indexed_indirect_dropped",
         ),
         // The tile family. The four bind opcodes each get a one-slot record
         // at their own entry stride, so a route that fired from the wrong

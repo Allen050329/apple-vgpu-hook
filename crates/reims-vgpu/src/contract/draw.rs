@@ -66,9 +66,143 @@ pub struct DrawArgs {
     pub base_instance: u32,
 }
 
+/// The indirect draw argument blocks, as Metal lays them out in a buffer.
+///
+/// `drawPrimitives:indirectBuffer:indirectBufferOffset:` and its indexed
+/// sibling put the counts in guest memory instead of in the record. What sits
+/// at that offset is one of two structs from `MTLRenderCommandEncoder.h`, all
+/// 32-bit fields in declaration order:
+///
+/// ```text
+/// MTLDrawPrimitivesIndirectArguments        { vertexCount, instanceCount, vertexStart, baseInstance }
+/// MTLDrawIndexedPrimitivesIndirectArguments { indexCount, instanceCount, indexStart, baseVertex, baseInstance }
+/// ```
+///
+/// `baseVertex` is the one signed field, for the same reason
+/// [`crate::runtime::draw::IndexedDrawInfo::base_vertex`] is: read as
+/// unsigned, a negative one becomes a huge index rather than an error.
+///
+/// Nothing here is a `#[repr(C)]` view over guest bytes — the block is loaded
+/// field by field out of a byte window. That is deliberate:
+/// `reims-vgpu-wire`'s invariant 4 forbids a wire struct holding a field an
+/// out-of-range guest value would make invalid, and five little-endian loads
+/// cost nothing.
+pub mod indirect {
+    use crate::contract::endian::ld32;
+
+    /// Bytes `MTLDrawPrimitivesIndirectArguments` occupies: four `uint32_t`.
+    pub const UNINDEXED_LEN: usize = 16;
+    /// Bytes `MTLDrawIndexedPrimitivesIndirectArguments` occupies: five 32-bit
+    /// fields, the fourth of them signed.
+    pub const INDEXED_LEN: usize = 20;
+
+    /// What an unindexed indirect draw's argument block says, as the same
+    /// [`super::DrawArgs`] a direct record decodes to.
+    ///
+    /// `primitive_type` is *not* in the block — Metal takes it as an argument
+    /// to the selector — so it comes off the record and is passed in here.
+    /// `None` when the window is short, which is the caller's cue to refuse
+    /// rather than to draw a zero.
+    pub fn unindexed(block: &[u8], primitive_type: u32) -> Option<super::DrawArgs> {
+        if block.len() < UNINDEXED_LEN {
+            return None;
+        }
+        Some(super::DrawArgs {
+            vertex_count: ld32(block),
+            instance_count: ld32(&block[4..]),
+            primitive_type,
+            first_vertex: ld32(&block[8..]),
+            base_instance: ld32(&block[12..]),
+        })
+    }
+
+    /// What an indexed indirect draw's argument block says.
+    ///
+    /// The [`super::DrawArgs`] half carries `indexCount` in `vertex_count`,
+    /// which is what every indexed path in this crate already does — a direct
+    /// `drawIndexedPrimitives` record fills the same field the same way. The
+    /// two trailing values are the index-buffer half: `(index_start,
+    /// base_vertex)`.
+    pub fn indexed(block: &[u8], primitive_type: u32) -> Option<(super::DrawArgs, u32, i32)> {
+        if block.len() < INDEXED_LEN {
+            return None;
+        }
+        let args = super::DrawArgs {
+            vertex_count: ld32(block),
+            instance_count: ld32(&block[4..]),
+            primitive_type,
+            // `indexStart` indexes the index buffer, not the vertex buffer, so
+            // it is *not* `first_vertex`. It is returned beside the args and
+            // applied to the index-buffer offset by the caller.
+            first_vertex: 0,
+            base_instance: ld32(&block[16..]),
+        };
+        Some((args, ld32(&block[8..]), ld32(&block[12..]) as i32))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Both indirect argument blocks read their fields in Metal's declared
+    /// order, and a short window refuses instead of reading zeros.
+    ///
+    /// Field order is the whole hazard, exactly as it is for [`DrawArgs`]:
+    /// every field is 32 bits, so a transposition compiles and draws the right
+    /// vertices of the wrong instance. Each field gets a distinct value so no
+    /// pair can swap and still read back correct.
+    #[test]
+    fn an_indirect_argument_block_reads_metals_field_order() {
+        let mut block = Vec::new();
+        for w in [11u32, 22, 33, 44, 55] {
+            block.extend_from_slice(&w.to_le_bytes());
+        }
+
+        let un = indirect::unindexed(&block, 3).expect("16 bytes is a full block");
+        assert_eq!(
+            un,
+            DrawArgs {
+                vertex_count: 11,
+                instance_count: 22,
+                primitive_type: 3,
+                first_vertex: 33,
+                base_instance: 44,
+            },
+            "MTLDrawPrimitivesIndirectArguments order"
+        );
+
+        let (args, index_start, base_vertex) =
+            indirect::indexed(&block, 4).expect("20 bytes is a full block");
+        assert_eq!(
+            args,
+            DrawArgs {
+                vertex_count: 11,
+                instance_count: 22,
+                primitive_type: 4,
+                // `indexStart` is returned separately rather than here: it
+                // offsets the index buffer, and putting it in `first_vertex`
+                // would shift the vertex fetch instead.
+                first_vertex: 0,
+                base_instance: 55,
+            },
+            "MTLDrawIndexedPrimitivesIndirectArguments order"
+        );
+        assert_eq!(index_start, 33);
+        assert_eq!(base_vertex, 44);
+
+        // `baseVertex` is signed. Read as unsigned it becomes a vertex index
+        // near four billion, which fetches out of every buffer rather than
+        // failing.
+        let mut negative = block.clone();
+        negative[12..16].copy_from_slice(&(-7i32).to_le_bytes());
+        assert_eq!(indirect::indexed(&negative, 3).unwrap().2, -7);
+
+        // One byte short of each block refuses. Reading a partial block as
+        // zeros is a draw of nothing that reports success.
+        assert!(indirect::unindexed(&block[..indirect::UNINDEXED_LEN - 1], 3).is_none());
+        assert!(indirect::indexed(&block[..indirect::INDEXED_LEN - 1], 3).is_none());
+    }
 
     /// The mask names the public `MTLPrimitiveType` enum and nothing above it.
     ///

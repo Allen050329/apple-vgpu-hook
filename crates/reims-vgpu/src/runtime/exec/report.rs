@@ -558,3 +558,31 @@ pub(super) fn note_clear_dropped(reason: &'static str, tex_ref: u32, detail: &st
     }
     first
 }
+
+/// Name an indirect draw whose argument buffer this device could not read.
+///
+/// The buffer *is* the draw: unlike a direct record there is no count in the
+/// wire to fall back to, so a failed read is geometry the guest asked for and
+/// did not get. `ComputeStatus`'s slug already names which rung of the buffer
+/// resolve refused — the ref was unbound, named nothing, named some other
+/// object, or the window ran past the buffer's end — so this adds the record's
+/// own fields and nothing else.
+///
+/// Latched per buffer ref, not per task: a guest re-issues the same indirect
+/// draw every frame, and one line per distinct buffer is what says whether any
+/// guest asks for this at all. The latch guards only the line — the draw is
+/// refused every time, which is the rule
+/// `a_dedup_latch_guards_only_its_own_line` exists to hold.
+pub(super) fn note_indirect_draw_refused(
+    task_id: u32,
+    cmd: &crate::runtime::decode::render::Command,
+    status: crate::runtime::compute_exec::ComputeStatus,
+) {
+    if let Some(e) = crate::observe::Emit::refusal("render_draw_indirect", &status) {
+        e.field("task", task_id)
+            .field("op", format!("{:#x}", cmd.opcode))
+            .field("args_ref", cmd.indirect_buffer_ref)
+            .field("args_off", cmd.indirect_buffer_offset)
+            .fail_once(u64::from(cmd.indirect_buffer_ref));
+    }
+}

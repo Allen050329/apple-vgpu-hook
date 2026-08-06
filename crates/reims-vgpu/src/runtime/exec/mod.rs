@@ -2001,21 +2001,7 @@ fn handle_render_record<M: HostMemory + HostOps>(
             }
         }
         RenderKind::DrawIndirect => {
-            // Not one of those states, and not a healthy zero. An indirect draw
-            // is geometry the guest asked for, so every one of these is a
-            // dropped draw rather than a state left at its default — which is
-            // why this arm keeps the fail-visible line the catch-all used to
-            // give it, on top of the count.
-            //
-            // It cannot be executed from the record: the vertex and instance
-            // counts are in the indirect buffer, written by the GPU or by a
-            // compute pass, and this rail replays counts it has read. The count
-            // is what decides whether resolving that buffer is worth building.
-            crate::runtime::drain::note_store_route(match cmd.opcode {
-                wire_render::OPCODE_DRAW_INDEXED_INDIRECT => "render_draw_indexed_indirect_dropped",
-                _ => "render_draw_indirect_dropped",
-            });
-            note_unimplemented_render_opcode(cmd.opcode, cmd_bytes, task_id, acc);
+            execute_indirect_draw(state, host, task_id, &cmd, acc);
         }
         RenderKind::UseResource | RenderKind::UseHeap => {
             crate::runtime::drain::note_store_route("render_noop_residency_hint");
@@ -3196,6 +3182,122 @@ fn retarget_render_pass_draw(
     req
 }
 
+/// Record a draw whose counts live in a guest buffer rather than in the record.
+///
+/// `drawPrimitives:indirectBuffer:indirectBufferOffset:` and its indexed
+/// sibling. Both used to raise a counter and reach
+/// `note_unimplemented_render_opcode`, so the geometry the guest asked for was
+/// never drawn — the arm's own comment said it could not be, "because the
+/// vertex and instance counts are in the indirect buffer … and this rail
+/// replays counts it has read".
+///
+/// It can be, and the reason is the argument the comment did not follow
+/// through: **this rail needs the count on the CPU whatever it does.** The
+/// vertex buffers are staged by extent, and the extent is a function of the
+/// vertex count, so even a real `vkCmdDrawIndirect` would have had to read the
+/// block to know how many bytes to stage. Once it is read, the draw is an
+/// ordinary one and takes every rail an ordinary one takes.
+///
+/// What that costs, stated rather than assumed: the counts are a **snapshot**
+/// taken when this record is decoded. A guest that writes them from a compute
+/// kernel in the same submission is relying on this device having executed and
+/// written back that dispatch first, which it does — compute segments complete
+/// before the render stream that follows them — but it is an ordering property
+/// of the device rather than of the Metal API, and a design that stopped
+/// completing compute before render would break this silently.
+fn execute_indirect_draw<M: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    cmd: &render::Command,
+    acc: &mut StreamAccum,
+) {
+    use crate::contract::draw::indirect;
+
+    let indexed_form = cmd.opcode == wire_render::OPCODE_DRAW_INDEXED_INDIRECT;
+    let block_len = if indexed_form {
+        indirect::INDEXED_LEN
+    } else {
+        indirect::UNINDEXED_LEN
+    };
+    let block = match crate::runtime::compute_exec::read_buffer_window(
+        state,
+        host,
+        task_id,
+        cmd.indirect_buffer_ref,
+        cmd.indirect_buffer_offset,
+        block_len,
+    ) {
+        Ok(block) => block,
+        Err(status) => {
+            // The buffer is the whole draw here — there is no fallback count in
+            // the record to fall back to — so a read that fails is a refused
+            // draw, and `read_buffer_window`'s status already names which rung
+            // of the resolve refused. Latched per buffer ref because a guest
+            // re-issues the same indirect draw every frame.
+            note_indirect_draw_refused(task_id, cmd, status);
+            return;
+        }
+    };
+
+    let (args, index_start, base_vertex) = if indexed_form {
+        match indirect::indexed(&block, cmd.primitive_type) {
+            Some(v) => (v.0, v.1, v.2),
+            None => return,
+        }
+    } else {
+        match indirect::unindexed(&block, cmd.primitive_type) {
+            Some(args) => (args, 0, 0),
+            None => return,
+        }
+    };
+
+    acc.saw_draw = true;
+    if indexed_form {
+        // `indexStart` counts indices, not bytes. The loader is given a byte
+        // offset, so it is scaled here by the width the record's own
+        // `index_type` declares — the same two widths `translate::raster::
+        // index_type` accepts, and an unknown one is left to the loader's
+        // typed refusal rather than being guessed at as 2.
+        let stride = match cmd.index_type {
+            1 => 4u64, // MTLIndexTypeUInt32
+            _ => 2,    // MTLIndexTypeUInt16, and Metal's default
+        };
+        acc.indexed = Some(IndexedDrawInfo {
+            index_type: cmd.index_type,
+            index_count: args.vertex_count,
+            index_buffer_ref: cmd.index_buffer_ref,
+            index_buffer_offset: cmd
+                .index_buffer_offset
+                .saturating_add(u64::from(index_start).saturating_mul(stride)),
+            base_vertex: i64::from(base_vertex),
+        });
+    } else {
+        // Not `None`-by-omission: an unindexed indirect draw arriving after an
+        // indexed one in the same stream must not inherit its index buffer,
+        // which is the same rule the direct draw arm applies in its `else`.
+        acc.indexed = None;
+    }
+
+    // A zero count here is the guest's own, read from its own buffer, and it is
+    // a legal empty draw rather than a record this device failed to decode —
+    // so it takes `dropped_unbound` the way a zero-count direct draw does, and
+    // that counter's two readings ("an empty draw" / "a pipeline we failed to
+    // latch") are unchanged by this arm joining it.
+    if acc.pipeline_ref == 0 || args.vertex_count == 0 {
+        acc.dropped_unbound = acc.dropped_unbound.saturating_add(1);
+        return;
+    }
+    match acc.bind_snapshot() {
+        Ok(snapshot) => acc.draws.push(PendingDraw {
+            pipeline_ref: acc.pipeline_ref,
+            draw: args,
+            ..snapshot
+        }),
+        Err(over) => note_draw_refused(over, acc.pipeline_ref, "draw_indirect"),
+    }
+}
+
 fn read_icb_exec_range<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &M,
@@ -3416,7 +3518,8 @@ use report::{
     is_indexed_draw_opcode, note_clear_dropped, note_color_subresource_unsupported,
     note_compute_refusal, note_depth_stencil_unsupported, note_draw_encode_fail,
     note_empty_scissor, note_extra_state_entries, note_indexed_draw_without_buffer,
-    note_pass_extent_for_slot, note_pass_target_extent, note_stream_draw_drops,
+    note_indirect_draw_refused, note_pass_extent_for_slot, note_pass_target_extent,
+    note_stream_draw_drops,
     note_unimplemented_render_opcode, note_unnamed_icb_execute,
 };
 // The unimplemented-opcode latch is test-only on both sides, so its import has
