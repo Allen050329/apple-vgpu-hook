@@ -1077,6 +1077,23 @@ fn relocate_by_class(
 /// Rewrite fragment SPIR-V: buffer bindings += [`FRAG_BUFFER_BINDING_OFFSET`]
 /// (source band `[0,32)`, destination `[104,136)`, clear of the `[96,104)`
 /// ColorInput band).
+///
+/// # Neither relocation ran on a driven x86/PCI boot
+///
+/// `m2v_cache::fragment_words` returns the unrelocated words when both
+/// `separate_sampled` and `buf_collide` are false, and on a driven boot
+/// (web-content probe, 10 captures, 494 draws in a census window) that was every
+/// shader: 160 `linux_m2v_async` lines and **zero** `frag_sampled_reloc` or
+/// `frag_buf_reloc` lines. Both are `observe::line` on the same channel and gate
+/// as the `linux_m2v_async` lines that did appear, so the absence is a reading
+/// and not a suppressed sink.
+///
+/// So this guest's WindowServer/Safari compositing does not put textures in both
+/// stages, nor collide a buffer index across them. That is what the relocation
+/// exists for, and it is a real Metal shape rather than a dead arm — but it
+/// means a boot on this workload cannot regression-test either function, and the
+/// unit tests are the only coverage. Do not read a green boot as exercising
+/// them.
 pub fn offset_fragment_buffer_bindings(words: &mut [u32]) -> usize {
     relocate_by_class(
         words,
