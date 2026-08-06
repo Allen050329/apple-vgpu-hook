@@ -639,6 +639,29 @@ pub fn resident_content_ready(identity: &TargetIdentity) -> bool {
         .is_some_and(|s| s.content_ready)
 }
 
+/// Why this identity has no resident, when the reason is that this device
+/// destroyed one it was holding.
+///
+/// `Some` means the registry does not hold this identity **and** a reclaim
+/// record for it is still inside `RECLAIM_HISTORY`. `None` means either the
+/// resident is present, or this device has no record of ever having held one —
+/// which for a surface the guest has simply not been drawn into yet is the
+/// ordinary case and not a defect.
+///
+/// [`resident_content_ready`] cannot answer this: it is
+/// `is_some_and(content_ready)`, so it collapses "absent" and "held but not
+/// ready yet" into the same `false`. Those are opposite situations for a caller
+/// deciding whether falling through to the guest's pages is sound — a resident
+/// that is merely not ready still exists and can be merged from, and one this
+/// device destroyed cannot.
+pub fn resident_absent_after_reclaim(identity: &TargetIdentity) -> Option<types::ResidentReclaim> {
+    let guard = lock_engine();
+    if guard.pools.registry_get(identity).is_some() {
+        return None;
+    }
+    guard.pools.prior_reclaim(identity)
+}
+
 /// The mapping content epoch this resident's pixels were stamped with, or
 /// `None` when the identity is absent, evicted, or has not been vouched for
 /// since its last draw.

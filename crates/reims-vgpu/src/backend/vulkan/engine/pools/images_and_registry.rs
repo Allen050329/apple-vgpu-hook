@@ -1929,6 +1929,55 @@ mod pin_count_tests {
         }
     }
 
+    /// "This device destroyed a resident for this identity" and "this device
+    /// never held one" must be distinguishable, and a re-created resident must
+    /// report neither.
+    ///
+    /// These are the three states behind `resident_absent_after_reclaim`, whose
+    /// body is `if present { None } else { prior_reclaim(..) }`. The composition
+    /// is what matters: `prior_reclaim` alone keeps answering for the life of
+    /// `RECLAIM_HISTORY`, so consulting it without the presence check would make
+    /// a resident that was reclaimed and then re-created keep reporting itself
+    /// as destroyed — and the caller uses that answer to decide whether falling
+    /// through to the guest's pages is sound.
+    ///
+    /// The facade itself needs the engine lock and so cannot be unit-tested; the
+    /// logic it composes is here.
+    #[test]
+    fn a_recreated_resident_no_longer_reports_the_reclaim_that_took_it() {
+        let mut pools = ResourcePools::new();
+        admit(&mut pools, surf(1), 0, 0);
+
+        // Never held: no record, and nothing to mistake for one.
+        assert_eq!(pools.prior_reclaim(&surf(2)), None);
+        assert!(!pools.registry.contains_key(&surf(2)));
+
+        // Held: present, so the facade short-circuits before prior_reclaim.
+        assert!(pools.registry.contains_key(&surf(1)));
+
+        // Destroyed: absent, and the cause survives.
+        pools.unregister_resident(&surf(1), ResidentReclaim::IdleDrained);
+        assert!(!pools.registry.contains_key(&surf(1)));
+        assert_eq!(
+            pools.prior_reclaim(&surf(1)),
+            Some(ResidentReclaim::IdleDrained)
+        );
+
+        // Re-created: the record is still in history, so only the presence
+        // check keeps this from reading as destroyed.
+        admit(&mut pools, surf(1), 0, 0);
+        assert!(
+            pools.registry.contains_key(&surf(1)),
+            "the presence check is the only thing separating this from the case above"
+        );
+        assert_eq!(
+            pools.prior_reclaim(&surf(1)),
+            Some(ResidentReclaim::IdleDrained),
+            "history is deliberately not cleared on re-admit, which is why the \
+             presence check cannot be dropped"
+        );
+    }
+
     /// The resample peak is the worst gap the boot ever saw, not the last one.
     ///
     /// A high-water, so a large gap early is not erased by a run of small ones

@@ -1023,9 +1023,34 @@ impl FreeTargetImage {
 /// And crossing it is not a cache miss. `evict_registry_to_cap` retires a
 /// resident whose pixels exist only on the GPU — `retire_resident` recycles the
 /// image without writing anything back — and nothing recreates a resident except
-/// a draw rendering into that identity, so every later draw sampling it refuses
-/// with `vk_draw_exec_sampled_resident_missing prior=cap_evicted` for the rest of
-/// the boot.
+/// a draw rendering into that identity.
+///
+/// **The consequence is not the permanent refusal this used to claim, and the
+/// truth is worse.** `vk_draw_exec_sampled_resident_missing` is raised in the
+/// engine, but the type-11 sampled planner never gets that far: it asks
+/// `resident_content_ready` first (`draw::vulkan::resolve_sampled_source`) and,
+/// on `false`, falls through to the host cache and then to the surface's own
+/// guest pages. So a reclaimed `Surface` resident is *silently re-served from
+/// somewhere else* rather than refused.
+///
+/// For a surface whose pages the flush rails have written, that is correct and
+/// is the same principle `resolve_type11_load_seed` states — the cache is an
+/// accelerator, and a miss is a reason to read the pages. For a resident whose
+/// pixels were never written to those pages it is not: an **MRT secondary
+/// attachment** is never pinned, never read back, and still carries a real
+/// `Gva`/`Surface` identity, so reading its pages substitutes an unrelated
+/// earlier frame. The stale-resident branch immediately above that fall-through
+/// knows this — it merges the resident's half into the pages first and refuses
+/// when the merge does not land, because otherwise "the pages below hold only
+/// the guest's half, which for a composite the Store deliberately left GPU-side
+/// is nothing at all". A reclaimed resident has exactly that property and has
+/// nothing left to merge from.
+///
+/// `t11sample_reclaimed_from_pages` counts how often that fall-through is taken,
+/// and `sampled_resident_reclaimed` names the first one per mapping. Until that
+/// route reads non-zero, how much of this is reached is unmeasured — which is
+/// why it is reported rather than refused, since refusing would also reject the
+/// flushed-surface case that is the common one and works today.
 ///
 /// `evicts=0` on both boots above and on every boot measured before them, so
 /// nothing has yet paid this. The reading that matters is not the zero; it is

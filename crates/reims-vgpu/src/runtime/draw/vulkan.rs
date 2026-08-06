@@ -1276,6 +1276,52 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                     }
                 }
 
+                // Falling through because the resident is *gone* is not the same
+                // as falling through because it is stale, and until this line
+                // the two were indistinguishable here —
+                // `resident_content_ready` is `is_some_and(content_ready)`, so
+                // absent and not-ready-yet are both `false`.
+                //
+                // The stale case above is sound because it merges the
+                // resident's half into the pages first, and refuses when that
+                // merge does not land, for the reason its own comment gives: the
+                // pages below then hold only the guest's half, "which for a
+                // composite the Store deliberately left GPU-side is nothing at
+                // all". A reclaimed resident has exactly that property and there
+                // is nothing left to merge from — the image is destroyed — yet
+                // it takes this fall-through with no merge and no refusal.
+                //
+                // For most surfaces that is still correct: a type-11 surface's
+                // pages are its content, the flush rails write them, and reading
+                // them back is what `resolve_type11_load_seed` already calls "a
+                // cache miss is a reason to read them". It is *not* correct for
+                // a resident whose pixels were never written to those pages at
+                // all — an MRT secondary attachment is never pinned, never
+                // written back, and still carries a real `Gva`/`Surface`
+                // identity, so serving it from its pages substitutes an
+                // unrelated earlier frame.
+                //
+                // Reported rather than refused, because refusing would also
+                // reject the flushed-surface case that is the common one and
+                // works today. This is the reading that says how often the
+                // unsound case is reached; nothing in the tree could ask before.
+                if !resident_ready {
+                    if let Some(cause) =
+                        crate::backend::vulkan::engine::resident_absent_after_reclaim(&resident_id)
+                    {
+                        crate::runtime::drain::note_store_route("t11sample_reclaimed_from_pages");
+                        if crate::observe::first_sight("sampled_resident_reclaimed", u64::from(mid))
+                        {
+                            crate::observe::fail(format!(
+                                "sampled_resident_reclaimed reason=sampled_resident_reclaimed \
+                                 mid={mid} {w}x{h} prior={} \
+                                 (this device destroyed the resident; sampling its guest pages instead)",
+                                cause.slug()
+                            ));
+                        }
+                    }
+                }
+
                 // 1) Host cache — the other host-side copy of these pages, and
                 // so gated on exactly the same witness as the resident above.
                 // It sits above both rungs that read the guest's own pages, so a
