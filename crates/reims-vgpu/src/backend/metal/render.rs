@@ -1123,11 +1123,13 @@ fn bind_samplers(
         }
     }
 
-    for (index, seen) in seen
-        .iter_mut()
-        .enumerate()
-        .take(REIMS_VGPU_METAL_MAX_SAMPLERS)
-    {
+    // `seen` is already exactly the argument table's width, so its own length is
+    // the bound — the `.take(REIMS_VGPU_METAL_MAX_SAMPLERS)` that used to sit
+    // here re-stated that in a second place while truncating nothing, and read
+    // as though the mask could name a slot this loop declines to serve. It
+    // cannot: `render_reflection_sampler_mask` sets no bit outside the table and
+    // says so fail-visibly if the reflection ever asks it to.
+    for (index, seen) in seen.iter_mut().enumerate() {
         if (sampler_mask & (1u32 << index)) == 0 || *seen {
             continue;
         }

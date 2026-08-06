@@ -760,13 +760,57 @@ pub fn render_reflection_sampler_mask(reflection: *mut Object, vertex: bool) -> 
                 continue;
             }
             let index: NSUInteger = msg_send![b, index];
-            if index < 16 {
-                mask |= 1u32 << index;
+            let index = index as usize;
+            if !crate::backend::metal::util::valid_sampler_index(index) {
+                // A healthy zero: Metal's sampler argument table is what this
+                // bound *is*, so its own reflection should never name a slot
+                // outside it. A firing means this backend's idea of the table
+                // has parted from the driver's, and the bit would otherwise be
+                // dropped with nothing said — the shader then samples a slot
+                // that never receives its default sampler.
+                crate::observe::Emit::decline(
+                    "metal_render_reflection",
+                    &MetalSamplerMaskOverflow {
+                        index,
+                        vertex,
+                    },
+                )
+                .fail_once(index as u64);
+                continue;
             }
+            mask |= 1u32 << index;
         }
         mask
     }
 }
+
+/// Metal's own pipeline reflection named a used sampler at a slot the sampler
+/// argument table does not have.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MetalSamplerMaskOverflow {
+    /// The slot the reflection reported.
+    pub index: usize,
+    /// Which stage's binding list it came from.
+    pub vertex: bool,
+}
+
+impl crate::observe::Decline for MetalSamplerMaskOverflow {
+    fn slug(&self) -> &'static str {
+        "metal_reflection_sampler_index_past_table"
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("index", self.index.to_string()),
+            (
+                "stage",
+                if self.vertex { "vertex" } else { "fragment" }.to_string(),
+            ),
+        ]
+    }
+}
+
+crate::observe::decline_display!(MetalSamplerMaskOverflow);
 
 /// Helper: MTLSize constructor.
 pub fn mtl_size(x: u64, y: u64, z: u64) -> MTLSize {

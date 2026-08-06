@@ -54,16 +54,22 @@ pub fn texture_index(binding: u32) -> Option<usize> {
     }
 }
 
+/// Is `index` a slot the sampler argument table actually has?
+///
+/// The band rule stated on a **raw** sampler index, where [`sampler_index`]
+/// states it on a descriptor binding. Both spellings are needed — Metal's own
+/// pipeline reflection reports raw indices, while the bind paths carry bindings
+/// — and both live here so the bound keeps being compared in one file.
+pub fn valid_sampler_index(index: usize) -> bool {
+    index < REIMS_VGPU_METAL_MAX_SAMPLERS
+}
+
 pub fn sampler_index(binding: u32) -> Option<usize> {
     if binding < REIMS_VGPU_BINDING_SAMPLER_BASE {
         return None;
     }
     let raw = (binding - REIMS_VGPU_BINDING_SAMPLER_BASE) as usize;
-    if raw >= REIMS_VGPU_METAL_MAX_SAMPLERS {
-        None
-    } else {
-        Some(raw)
-    }
+    valid_sampler_index(raw).then_some(raw)
 }
 
 /// As-bytes view of a `repr(C)` value for content hashing (matches ObjC `sizeof`).
@@ -100,5 +106,26 @@ mod tests {
             sampler_index(REIMS_VGPU_BINDING_SAMPLER_BASE + REIMS_VGPU_METAL_MAX_SAMPLERS as u32),
             None
         );
+    }
+
+    /// The sampler band is stated twice — on a binding and on a raw index — and
+    /// the two callers are on opposite sides of one encode.
+    ///
+    /// `render_reflection_sampler_mask` builds the default-sampler mask from raw
+    /// reflection indices; `bind_samplers` refuses an explicit bind by binding.
+    /// If the raw spelling ever accepted a slot the binding spelling refuses,
+    /// the mask would name a slot the bind path declines and the loop that reads
+    /// it would set a default sampler Metal has no table entry for.
+    #[test]
+    fn the_two_spellings_of_the_sampler_band_accept_the_same_slots() {
+        for raw in 0..REIMS_VGPU_METAL_MAX_SAMPLERS + 4 {
+            assert_eq!(
+                valid_sampler_index(raw),
+                sampler_index(REIMS_VGPU_BINDING_SAMPLER_BASE + raw as u32).is_some(),
+                "raw sampler index {raw}"
+            );
+        }
+        assert!(valid_sampler_index(REIMS_VGPU_METAL_MAX_SAMPLERS - 1));
+        assert!(!valid_sampler_index(REIMS_VGPU_METAL_MAX_SAMPLERS));
     }
 }

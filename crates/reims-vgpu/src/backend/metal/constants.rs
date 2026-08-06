@@ -22,6 +22,13 @@ pub const REIMS_VGPU_METAL_MAX_BUFFERS: usize = 31;
 /// band assertion below is what holds the two in step.
 pub const REIMS_VGPU_METAL_MAX_TEXTURES: usize = 128;
 pub const REIMS_VGPU_METAL_MAX_SAMPLERS: usize = 16;
+// The sampler table is also carried as a bitmask: `render_reflection_sampler_mask`
+// packs one bit per slot into a `u32` and `bind_samplers` reads it back to supply
+// a default sampler for every slot the pipeline reflection says is used. A table
+// wider than the mask would shift past the end — undefined behaviour rather than
+// a slot quietly missing its default — so the mask's width is a bound on this
+// constant, stated here rather than at the shift.
+const _: () = assert!(REIMS_VGPU_METAL_MAX_SAMPLERS <= u32::BITS as usize);
 /// Metal max color attachments per render pass / PSO.
 pub const REIMS_VGPU_METAL_MAX_COLOR_RTS: usize = 8;
 
