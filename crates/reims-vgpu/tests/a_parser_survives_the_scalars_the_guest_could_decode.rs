@@ -2,12 +2,16 @@
 //!
 //! `a_decoder_survives_bytes_the_guest_could_write` fuzzes every `pub fn` on the
 //! parser surface that takes a `&[u8]`. That is the front door, and it is not
-//! the whole surface: **on the same files, 27 more `pub fn` take nothing but
-//! plain scalars**, and every one of those scalars is a field some byte-slice
-//! parser has already pulled out of a guest record. A `u32` opcode, a `u16`
-//! pixel format, a `u64` address, a page shift, a count and an entry size. The
-//! byte-slice fuzzer reaches them only where a decoder happens to route to one,
-//! with whatever values that route happens to produce.
+//! the whole surface: **53 more `pub fn` on that surface and in `contract` take
+//! nothing but plain scalars**, and every one of those scalars is a field some
+//! byte-slice parser has already pulled out of a guest record. A `u32` opcode, a
+//! `u16` pixel format, a `u64` address, a mip level, a page shift, a count and
+//! an entry size. The byte-slice fuzzer reaches them only where a decoder
+//! happens to route to one, with whatever values that route happens to produce.
+//!
+//! `contract` is in the population and not only the decoders, because `contract`
+//! *is* the decoded API contract — pixel formats, pass actions, extents, page
+//! geometry — and it is backend-independent, so it can be driven on both arms.
 //!
 //! They are the arithmetic half of the parser. Between them these compute
 //! shifts, products, offsets and extents out of guest values, which is where a
@@ -17,15 +21,16 @@
 //!
 //! # What this drives
 //!
-//! Twenty-four of the 27 are called under `catch_unwind` against a cross-product
+//! Forty-nine of the 53 are called under `catch_unwind` against a cross-product
 //! of adversarial scalars. The assertion is only that it **returns** — any
 //! value, any `None`, any refusal is a pass. What fails is an unwind. The other
-//! three are [`EXEMPT`], which is a checked claim rather than a written one.
+//! four are [`EXEMPT`], which is a checked claim rather than a written one.
 //!
-//! It earned itself on its first run, which is the argument for it: three
-//! `page_shift` functions in `contract::iosurface_pages` unwound with
-//! "attempt to shift left with overflow". Those three are the exemptions, and
-//! what makes them safe is stated and driven rather than asserted.
+//! It earned itself twice, which is the argument for it. On the decoder surface,
+//! three `page_shift` functions in `contract::iosurface_pages` unwound with
+//! "attempt to shift left with overflow"; on `contract`, a fourth
+//! (`gva::pfn_to_gpa`) did the same, and `extent::mip_extent` unwound on a mip
+//! **level** — a decoded guest field with no such excuse, which is now total.
 //!
 //! The corpus is not random. Uniform `u64`s never produce 63, 64, 65 or
 //! `u32::MAX` in a slot that matters, and those are the whole population of
@@ -305,6 +310,211 @@ fn targets() -> Vec<ScalarTarget> {
                 let _ = reims_vgpu::runtime::decode::stream::segment_disposition(v[0] as u8);
             },
         },
+        ScalarTarget {
+            name: "checked::checked_add_u64",
+            arity: 2,
+            run: &|v| {
+                let _ = reims_vgpu::contract::checked::checked_add_u64(v[0], v[1]);
+            },
+        },
+        ScalarTarget {
+            name: "checked::checked_mul_u64",
+            arity: 2,
+            run: &|v| {
+                let _ = reims_vgpu::contract::checked::checked_mul_u64(v[0], v[1]);
+            },
+        },
+        ScalarTarget {
+            name: "checked::align_up_u64",
+            arity: 2,
+            run: &|v| {
+                let _ = reims_vgpu::contract::checked::align_up_u64(v[0], v[1]);
+            },
+        },
+        ScalarTarget {
+            name: "checked::size_fits_u32",
+            arity: 1,
+            run: &|v| {
+                let _ = reims_vgpu::contract::checked::size_fits_u32(v[0] as usize);
+            },
+        },
+        ScalarTarget {
+            name: "dispatch::is_declared_dispatch_type",
+            arity: 1,
+            run: &|v| {
+                let _ = reims_vgpu::contract::dispatch::is_declared_dispatch_type(v[0] as u32);
+            },
+        },
+        ScalarTarget {
+            name: "extent::mip_extent",
+            arity: 2,
+            run: &|v| {
+                let _ = reims_vgpu::contract::extent::mip_extent(v[0] as u32, v[1] as u32);
+            },
+        },
+        ScalarTarget {
+            name: "extent::tight_image_bytes",
+            arity: 3,
+            run: &|v| {
+                let _ = reims_vgpu::contract::extent::tight_image_bytes(
+                    v[0] as u32,
+                    v[1] as u32,
+                    v[2] as usize,
+                );
+            },
+        },
+        ScalarTarget {
+            name: "extent::tight_layered_image_bytes",
+            arity: 4,
+            run: &|v| {
+                let _ = reims_vgpu::contract::extent::tight_layered_image_bytes(
+                    v[0] as u32,
+                    v[1] as u32,
+                    v[2] as u32,
+                    v[3] as usize,
+                );
+            },
+        },
+        ScalarTarget {
+            name: "extent::tight_image_layout",
+            arity: 3,
+            run: &|v| {
+                let _ = reims_vgpu::contract::extent::tight_image_layout(
+                    v[0] as u32,
+                    v[1] as u32,
+                    v[2] as u32,
+                );
+            },
+        },
+        ScalarTarget {
+            name: "fnv::fold_u64",
+            arity: 2,
+            run: &|v| {
+                let _ = reims_vgpu::contract::fnv::fold_u64(v[0], v[1]);
+            },
+        },
+        ScalarTarget {
+            name: "mipmap::filterable_bpp",
+            arity: 1,
+            run: &|v| {
+                let _ = reims_vgpu::contract::mipmap::filterable_bpp(v[0] as u16);
+            },
+        },
+        ScalarTarget {
+            name: "mipmap::plan_level0",
+            arity: 5,
+            run: &|v| {
+                let _ = reims_vgpu::contract::mipmap::plan_level0(
+                    v[0] as u16,
+                    v[1] as u32,
+                    v[2] as u32,
+                    v[3] as u32,
+                    v[4] as usize,
+                );
+            },
+        },
+        ScalarTarget {
+            name: "pass_action::is_declared_load_action",
+            arity: 1,
+            run: &|v| {
+                let _ = reims_vgpu::contract::pass_action::is_declared_load_action(v[0] as u16);
+            },
+        },
+        ScalarTarget {
+            name: "pass_action::is_declared_store_action",
+            arity: 1,
+            run: &|v| {
+                let _ = reims_vgpu::contract::pass_action::is_declared_store_action(v[0] as u16);
+            },
+        },
+        ScalarTarget {
+            name: "pixel_format::bytes_per_pixel",
+            arity: 1,
+            run: &|v| {
+                let _ = reims_vgpu::contract::pixel_format::bytes_per_pixel(v[0] as u16);
+            },
+        },
+        ScalarTarget {
+            name: "pixel_format::format_has_depth_aspect",
+            arity: 1,
+            run: &|v| {
+                let _ = reims_vgpu::contract::pixel_format::format_has_depth_aspect(v[0] as u16);
+            },
+        },
+        ScalarTarget {
+            name: "pixel_format::format_has_stencil_aspect",
+            arity: 1,
+            run: &|v| {
+                let _ = reims_vgpu::contract::pixel_format::format_has_stencil_aspect(v[0] as u16);
+            },
+        },
+        ScalarTarget {
+            name: "pixel_format::depth_stencil_packing",
+            arity: 1,
+            run: &|v| {
+                let _ = reims_vgpu::contract::pixel_format::depth_stencil_packing(v[0] as u16);
+            },
+        },
+        ScalarTarget {
+            name: "pixel_format::is_srgb",
+            arity: 1,
+            run: &|v| {
+                let _ = reims_vgpu::contract::pixel_format::is_srgb(v[0] as u16);
+            },
+        },
+        ScalarTarget {
+            name: "pixel_format::sampled_class",
+            arity: 1,
+            run: &|v| {
+                let _ = reims_vgpu::contract::pixel_format::sampled_class(v[0] as u16);
+            },
+        },
+        ScalarTarget {
+            name: "pixel_format::storage_selector",
+            arity: 1,
+            run: &|v| {
+                let _ = reims_vgpu::contract::pixel_format::storage_selector(v[0] as u16);
+            },
+        },
+        ScalarTarget {
+            name: "pixel_format::render_target_bpp",
+            arity: 1,
+            run: &|v| {
+                let _ = reims_vgpu::contract::pixel_format::render_target_bpp(v[0] as u16);
+            },
+        },
+        ScalarTarget {
+            name: "pixel_format::tight_row_bytes",
+            arity: 2,
+            run: &|v| {
+                let _ =
+                    reims_vgpu::contract::pixel_format::tight_row_bytes(v[0] as u32, v[1] as u16);
+            },
+        },
+        ScalarTarget {
+            name: "pixel_format::f64_to_unorm8",
+            arity: 1,
+            run: &|v| {
+                let _ = reims_vgpu::contract::pixel_format::f64_to_unorm8(f64::from_bits(v[0]));
+            },
+        },
+        ScalarTarget {
+            name: "pixel_format::f16_to_f32",
+            arity: 1,
+            run: &|v| {
+                let _ = reims_vgpu::contract::pixel_format::f16_to_f32(v[0] as u16);
+            },
+        },
+        ScalarTarget {
+            name: "vertex_step::step_rate_in_contract",
+            arity: 2,
+            run: &|v| {
+                let _ = reims_vgpu::contract::vertex_step::step_rate_in_contract(
+                    v[0] as u32,
+                    v[1] as u32,
+                );
+            },
+        },
     ]
 }
 
@@ -385,14 +595,20 @@ fn declared_scalar_parsers() -> BTreeSet<String> {
         "u8", "u16", "u32", "u64", "usize", "i8", "i16", "i32", "i64", "isize", "bool", "f32",
         "f64",
     ];
-    const TREES: [&str; 2] = [
+    const TREES: [&str; 3] = [
         "crates/reims-vgpu/src/runtime/decode",
         "crates/reims-vgpu/src/runtime/icb",
+        // `contract` is the decoded API contract itself — pixel formats, pass
+        // actions, extents, page geometry. Every argument it takes is a field
+        // some decoder has already lifted out of a guest record, and it is
+        // backend-independent, so it can be driven on both arms.
+        // `iosurface_pages.rs` lives here and was already named below; it stays
+        // named there so the two harnesses agree on that file's surface.
+        "crates/reims-vgpu/src/contract",
     ];
-    const FILES: [&str; 3] = [
+    const FILES: [&str; 2] = [
         "crates/reims-vgpu/src/runtime/heap_query.rs",
         "crates/reims-vgpu/src/runtime/mtlb.rs",
-        "crates/reims-vgpu/src/contract/iosurface_pages.rs",
     ];
     let root = source_scan::workspace_root();
     let mut files: Vec<std::path::PathBuf> = TREES
@@ -516,7 +732,7 @@ fn public_fn_signatures(text: &str) -> Vec<(String, String)> {
 /// [`the_exemptions_rest_on_a_check_that_still_runs`] runs that check rather
 /// than trusting this sentence.
 ///
-/// All three take a `page_shift: u32`, and all three shift by it. A shift of 64
+/// All four take a `page_shift: u32`, and all four shift by it. A shift of 64
 /// or more is a panic in a debug build and, worse, a *masked* shift in a release
 /// one — Rust does not trap it, so the release consequence is an offset into
 /// somewhere else rather than a crash. There is no total form: making
@@ -540,6 +756,11 @@ const EXEMPT: &[(&str, &str)] = &[
     (
         "iosurface_pages::entry_gpa_shift",
         "`(pfn as u64) << page_shift`; same domain, same constructor",
+    ),
+    (
+        "gva::pfn_to_gpa",
+        "`(pfn as u64) << page_shift`, the same shift one module down; same \
+         domain, same constructor",
     ),
 ];
 

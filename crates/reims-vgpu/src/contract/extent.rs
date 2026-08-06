@@ -55,7 +55,17 @@ pub fn mip_extent(base: u32, level: u32) -> u32 {
     if base == 0 {
         return 0;
     }
-    (base >> level).max(1)
+    // `base >> level` is a panic in a debug build for any level at or past 32,
+    // and a *masked* shift in a release one — Rust does not trap an over-wide
+    // shift, so `mip_extent(1024, 32)` answered 1024 where 1 is right. The
+    // `checked_shr` is not a guard bolted on to survive a hostile level: past
+    // the width of the type the chain has bottomed out, so shifting to zero and
+    // then clamping to one is the same formula continued, and it agrees with
+    // every level below. The level is a decoded guest field —
+    // `TEXTURE_MAX_MIP_LEVELS` bounds the ones the decoder admits, but this is
+    // `pub` in `contract` and the Metal generator reaches it directly, so it
+    // states its own domain rather than borrowing the decoder's.
+    base.checked_shr(level).unwrap_or(0).max(1)
 }
 
 /// Bytes of a tightly-packed image of this geometry: `width * height * bpp`,
@@ -259,6 +269,18 @@ mod tests {
         assert_eq!(mip_extent(8, 3), 1);
         assert_eq!(mip_extent(8, 4), 1, "past the last level clamps to 1");
         assert_eq!(mip_extent(8, 20), 1, "huge level never underflows to 0");
+
+        // Past the width of the type. `20` above is inside it and says nothing
+        // about these: `base >> 32` is a panic in a debug build and answers
+        // `base` unchanged in a release one, so a level here used to give the
+        // *base* extent — a full-size read charged to the smallest level of the
+        // chain. The three boundary values, plus a base wide enough that a
+        // masked shift would be obvious.
+        assert_eq!(mip_extent(1024, 31), 1);
+        assert_eq!(mip_extent(1024, 32), 1, "at the width, not through it");
+        assert_eq!(mip_extent(1024, 33), 1);
+        assert_eq!(mip_extent(u32::MAX, u32::MAX), 1);
+        assert_eq!(mip_extent(0, u32::MAX), 0, "no texels, still no levels");
 
         // Non-power-of-two base right-shifts (floors), matching Metal.
         assert_eq!(mip_extent(5, 1), 2);
