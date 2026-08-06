@@ -891,6 +891,46 @@ pub(crate) struct ResidentTargetSlot {
     /// default is protection, and a copy-out site nobody has taught about this
     /// costs retained VRAM rather than a lost frame. Add sites as they are
     /// proven, never to make a number look better.
+    ///
+    /// # What it costs, measured
+    ///
+    /// The standing worry about protecting a class from reclaim is that it
+    /// becomes a population nothing can trim. Driven x86/PCI boot,
+    /// `web-content-probe -n 10 --churn 1`, quiesced host:
+    ///
+    /// ```text
+    ///   registry_pressure  peak=262/320  evicts=0  peak_mib=209
+    ///                      sole_copy=173/44mib  cap_no_victim=0
+    ///                      slab_mib settled 59 carved / 208 held
+    ///   t11sample_reclaimed_from_pages   12      (36-44 before this field)
+    /// ```
+    ///
+    /// Three readings, and the third is the one that settles it:
+    ///
+    /// - **`cap_no_victim=0`.** Not once did the capacity walk want a victim and
+    ///   find every candidate protected. The registry never exceeded its cap on
+    ///   account of this field, so the ceiling this could have introduced was not
+    ///   approached.
+    /// - **173 slots but 44 MiB.** 66 % of the peak population and 21 % of its
+    ///   bytes: the protected set is small surfaces. A slot count alone would
+    ///   have made this look three times worse than it is, which is why the
+    ///   totals carry bytes.
+    /// - **Settled VRAM did not move.** 59 MiB carved against the 64 MiB the
+    ///   ungated drain settled at in the experiment recorded on
+    ///   [`IDLE_TARGET_AGE_MS`]. The correctness this buys is close to free —
+    ///   where the population gate tried for the same class by holding 464 MiB.
+    ///
+    /// `t11sample_reclaimed_from_pages` falls to 12 rather than 0, and that is
+    /// the intended shape rather than a residue. Every remaining one is a
+    /// resident this field says was copied out, so its guest pages hold its
+    /// content and the fall-through re-serves the right pixels — redundant work,
+    /// not a lost frame. Driving that to 0 is a throughput question for the drain
+    /// cutoff and has nothing to do with this field.
+    ///
+    /// Not established by that run: whether the host-window present path ever
+    /// composites into a resident without passing `registry_mark_ready*`. If it
+    /// does, such a slot is unprotected here — the same gap that existed before
+    /// this field, narrowed rather than closed.
     pub gpu_only_content: bool,
     /// Value of `ResourcePools::idle_clock_ms` (wall-clock ms) at this target's
     /// last use (admit, `registry_ensure` hit, or present touch). The idle drain
