@@ -2328,3 +2328,79 @@ fn a_truncated_stage_input_is_not_the_same_as_an_absent_one() {
         StageInputVerdict::OverCap
     );
 }
+
+/// A heap texture's residency mirror is never evicted by the per-mapping cap.
+///
+/// `compute_storage_residency` holds three keyings and only one of them has a
+/// guest fallback. A mapping-backed entry dropped by the cap costs the next read
+/// its resident and sends it back to that mapping's guest pages. A **heap**
+/// texture has no guest pages at all — it is host-only — so an absent entry
+/// stages `vec![0; need]` and the kernel reads a blank texture.
+///
+/// The two are kept apart by `note_storage_residency_writeback` returning before
+/// the cap runs, not by the cap's own filter: `ComputeStorageResidencyKey::heap`
+/// and `::linear` both set `mapping_id` to 0, so they would share one bucket if
+/// the eviction ever saw them. An audit that read the filter alone concluded
+/// heap textures were already being evicted into zero-filled binds. It was
+/// wrong, and it was wrong by one early return.
+///
+/// So drive well past `STORAGE_RESIDENCY_WINDOWS_PER_MAPPING` distinct heap
+/// textures and assert every one is still there. This fails the moment that
+/// early return moves.
+#[test]
+#[cfg(feature = "backend-vulkan")]
+fn a_heap_texture_mirror_outlives_the_per_mapping_cap() {
+    use super::{
+        note_storage_residency_writeback, ComputeStorageResidencyCandidate, StagedTexture,
+        TextureWriteback, STORAGE_RESIDENCY_WINDOWS_PER_MAPPING,
+    };
+    use crate::model::ComputeStorageResidencyKey;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    // Four times the cap, so this stays a real margin if the cap is retuned.
+    const HEAP_TEXTURES: u32 = 4 * STORAGE_RESIDENCY_WINDOWS_PER_MAPPING as u32;
+
+    let staged = |key: ComputeStorageResidencyKey| StagedTexture {
+        binding: 33,
+        #[cfg(all(feature = "backend-metal", target_os = "macos"))]
+        texture_ref: key.texture_ref,
+        pixel_format: key.pixel_format,
+        storage_selector: Some(0),
+        width: key.width,
+        height: key.height,
+        bytes: Vec::new(),
+        // The mirror is only armed for a storage output, which is what makes a
+        // heap texture's engine copy the sole content.
+        is_storage: true,
+        residency: Some(ComputeStorageResidencyCandidate {
+            key,
+            seed_generation: 1,
+        }),
+        serve: None,
+        writeback: TextureWriteback::None,
+    };
+
+    for tex in 0..HEAP_TEXTURES {
+        let key = ComputeStorageResidencyKey::heap(1, tex, 16, 16, 0x50);
+        assert_eq!(
+            key.mapping_id, 0,
+            "a heap key sits in the same bucket a linear key does; that is the \
+             whole reason this test exists"
+        );
+        note_storage_residency_writeback(&mut state, &staged(key));
+    }
+
+    assert_eq!(
+        state.compute_storage_residency.len(),
+        HEAP_TEXTURES as usize,
+        "every heap texture's mirror is retained; the per-mapping cap must not \
+         reach a key whose loss stages a blank texture"
+    );
+    for tex in 0..HEAP_TEXTURES {
+        let key = ComputeStorageResidencyKey::heap(1, tex, 16, 16, 0x50);
+        assert!(
+            state.compute_storage_residency.contains_key(&key),
+            "heap texture {tex} lost its mirror"
+        );
+    }
+}

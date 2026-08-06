@@ -2021,9 +2021,46 @@ pub struct DeviceState {
     pub type11_memo: LruBytesMemo<(u32, u32, u32), GuestLinearMemo>,
     /// Reusable native BGRA read buffer for the type-11 memo re-read.
     pub type11_memo_scratch: Vec<u8>,
-    /// Measurement-only: last guest-visible generation produced by a compute
-    /// storage-image writeback for an exact type-11 view. This does not select
-    /// engine behavior; it measures safe residency opportunities.
+    /// Last guest-visible generation produced by a compute storage-image
+    /// writeback, keyed by the exact window it was produced for.
+    ///
+    /// **It selects behaviour.** `compute_exec`'s texture staging reads it to
+    /// decide whether the engine's resident answers a bind, and for a
+    /// [`ComputeStorageResidencyKey::heap`] texture that decision has no
+    /// fallback: a heap texture is host-only, so there is no guest window to
+    /// re-read. An entry present but unservable is refused by name
+    /// (`compute_stage_tex_heap_resident_lost`); an entry *absent* stages a
+    /// zero-filled texture, which is why what may remove one matters.
+    ///
+    /// This doc used to say "measurement-only … does not select engine
+    /// behavior", which was true of an earlier rail and invites exactly the two
+    /// wrong conclusions: that a bound on it is free, and that it can be cut.
+    ///
+    /// # What may remove an entry, and why the cap cannot reach the two that
+    /// # have no fallback
+    ///
+    /// Three keyings share this map, and only one of them is subject to the
+    /// per-mapping population cap in `compute_exec`:
+    ///
+    /// - **Mapping-backed** (`mapping_id != 0`) — the only kind the cap's
+    ///   sibling walk can select, because it filters on an equal `mapping_id`.
+    ///   Dropping one costs the next read its resident and sends it back to the
+    ///   mapping's guest pages, which is a cost and not a loss.
+    /// - **Linear** ([`ComputeStorageResidencyKey::linear`]) — `mapping_id` is
+    ///   0, and `note_storage_residency_writeback` returns before the insert:
+    ///   authority for these lives in the `host_linear_textures` entry's
+    ///   `resident_gen`, never here.
+    /// - **Heap** ([`ComputeStorageResidencyKey::heap`]) — `mapping_id` is also
+    ///   0, and that function inserts and returns *before* the cap runs.
+    ///
+    /// So the cap is genuinely per-mapping, and the two keyings with no guest
+    /// fallback are outside it — but only because of an early return two
+    /// modules away, not because the filter distinguishes them. Both set
+    /// `mapping_id` to 0, so they would share one bucket if the eviction ever
+    /// saw them. An audit read the filter alone and concluded heap textures
+    /// were being evicted into zero-filled binds; that is wrong today and would
+    /// be right the moment a caller reached the cap with a zero-keyed
+    /// candidate. Anything that changes when the cap runs must re-check this.
     pub compute_storage_residency: BTreeMap<ComputeStorageResidencyKey, u32>,
     /// Deferred mapping-keyed writebacks: windows whose guest pages are STALE —
     /// a pinned engine resident is the authoritative content. Every host-side
