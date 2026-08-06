@@ -36,7 +36,7 @@
 use std::collections::BTreeMap;
 
 mod source_scan;
-use source_scan::{blank_comments, blank_test_modules, rust_sources, workspace_root};
+use source_scan::{blank_comments, blank_test_items, rust_sources, workspace_root};
 
 fn crate_src() -> std::path::PathBuf {
     workspace_root().join("crates/reims-vgpu/src")
@@ -192,7 +192,7 @@ fn every_object_tag_is_compared_by_name() {
             continue;
         }
         let text = std::fs::read_to_string(&path).expect("crate source must be readable");
-        let code = blank_test_modules(&blank_comments(&text));
+        let code = blank_test_items(&blank_comments(&text));
         for (n, line) in code.lines().enumerate() {
             let Some(value) = numeric_tag_comparison(line) else {
                 continue;

@@ -29,7 +29,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 mod source_scan;
-use source_scan::{blank_comments, blank_test_modules, rust_sources, workspace_root};
+use source_scan::{blank_comments, blank_test_items, rust_sources, workspace_root};
 
 /// Production sites outside `translate/` and `caps/` that spell a variant of a
 /// type `translate/` owns, and why each one is not a second copy of a table.
@@ -98,7 +98,7 @@ fn variant_spellings(text: &str) -> Vec<(String, String)> {
 /// Production text of one file: comments and `#[cfg(test)]` module bodies gone.
 fn production_text(path: &std::path::Path) -> String {
     let raw = std::fs::read_to_string(path).expect("crate source must be readable");
-    blank_test_modules(&blank_comments(&raw))
+    blank_test_items(&blank_comments(&raw))
 }
 
 #[test]

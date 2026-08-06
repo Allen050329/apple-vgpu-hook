@@ -42,16 +42,29 @@ pub fn workspace_root() -> PathBuf {
 /// `*/tests.rs` is this workspace's spelling for a unit-test module in its own
 /// file; its fixtures shrink and cap collections constantly and none of it is
 /// device behaviour, so it is dropped here rather than in each caller.
+///
+/// So is `*_tests.rs`, which is the same thing under a longer name — the filter
+/// used to be an exact `!= "tests.rs"` and let three of them through:
+/// `surface_cache/cap_tests.rs`, `mapper/revalidate_tests.rs` and
+/// `storage_flush/render_flush_witness_tests.rs`, some 1270 lines of fixtures
+/// that every scan in this directory read as device behaviour. Their own
+/// declarations say what they are — `storage_flush/mod.rs` reaches
+/// `render_flush_witness_tests` through a `#[cfg(all(test, …))]` — which is the
+/// same gate [`blank_test_items`] was silently failing to honour inline.
 pub fn guest_facing_sources() -> Vec<(String, String)> {
     let root = workspace_root();
     let crates = root.join("crates");
     ["reims-vgpu", "reims-vgpu-wire"]
         .into_iter()
         .flat_map(|name| rust_sources(&crates.join(name).join("src")))
-        .filter(|p| p.file_name().is_some_and(|n| n != "tests.rs"))
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n != "tests.rs" && !n.ends_with("_tests.rs"))
+        })
         .map(|p| {
             let raw = std::fs::read_to_string(&p).expect("read source");
-            let text = blank_test_modules(&blank_comments(&raw));
+            let text = blank_test_items(&blank_comments(&raw));
             let rel = p
                 .strip_prefix(&crates)
                 .unwrap_or(&p)
@@ -343,63 +356,149 @@ pub fn strip_attributes(chars: &[char]) -> String {
     out
 }
 
-/// Blank every test module's body, keeping offsets stable.
+/// Blank the body of every item gated on `test`, keeping offsets stable.
 ///
-/// Both spellings of the attribute are read: `#[cfg(test)]` and the
-/// `#[cfg(all(test, feature = "…"))]` form that `draw/vulkan.rs` uses for
-/// `vulkan_split_tests`. Brace-matching each body rather than cutting at the
-/// first marker is what keeps production code *after* a test module visible — a
-/// first-marker cutoff hides it, and a scanner that hides code reports clean.
+/// Brace-matching each body rather than cutting at the first marker is what
+/// keeps production code *after* a test item visible — a first-marker cutoff
+/// hides it, and a scanner that hides code reports clean.
 ///
-/// A test module's contents are fixtures: `pools/mod.rs` builds a
+/// A test body's contents are fixtures: `pools/mod.rs` builds a
 /// `SampledImageResource` with a literal `vk::Format::R8G8B8A8_UNORM` and
 /// asserts it survives a key round-trip. That is not the product spelling a
 /// format, and a scanner that counts it will report erosion where there is a
 /// test doing its job.
 ///
+/// # Why this parses the attribute instead of matching its text
+///
+/// It used to look for two literal prefixes, `#[cfg(test)]` and
+/// `#[cfg(all(test,`, and its doc named `draw/vulkan.rs`'s `vulkan_split_tests`
+/// as the reason the second was there. **The second spelling never once
+/// matched.** Cutting at the literal leaves the rest of the attribute —
+/// ` feature = "backend-vulkan"))]` — between the marker and the `mod`, and the
+/// guard below it allowed only whitespace and bracket characters there, so every
+/// `#[cfg(all(test, …))]` module fell out through the `continue`. Seven inline
+/// modules were being read as product code by every scan in this directory,
+/// `vulkan_split_tests` alone being some fourteen hundred lines of fixtures.
+///
+/// That is the failure mode this module's own header warns about, in the
+/// direction that is harder to notice: a scanner reading *too much* does not go
+/// quiet, it reports confidently about lines that are not the product. The fix
+/// is to find the attribute's own closing bracket and ask what is inside it,
+/// which costs a bracket walk and cannot be fooled by a predicate's contents.
+///
+/// # Any braced item, not only a module
+///
+/// This was `blank_test_items` and blanked exactly `mod`, on the argument that
+/// "only a module has a body worth blanking". That is not true of this tree.
+/// `runtime::host` reaches `FakeHost` — the host under all of these tests —
+/// through `#[cfg(test)] impl HostMemory for FakeHost` and two more like it, some
+/// 690 lines of emulated device behaviour that is emphatically not the device,
+/// and there are three dozen test-gated free functions besides. An `impl` body
+/// and a `mod` body are the same thing to a text scan.
+///
+/// So the rule is the body, not the keyword: whatever the item is, if a test
+/// `cfg` gates it and it opens a brace before it ends, the brace's contents are
+/// fixtures. A declaration that reaches `;` first — `use`, a `const`, a
+/// `mod foo;` naming a file — has no body and is left alone, which is what it
+/// always did.
+///
 /// Run this **after** [`blank_comments`], so an attribute written inside a doc
 /// comment cannot open a region.
-pub fn blank_test_modules(text: &str) -> String {
+pub fn blank_test_items(text: &str) -> String {
     let chars: Vec<char> = text.chars().collect();
     let mut out = chars.clone();
-    let mut at = 0usize;
-    while let Some((rel, marker_len)) = ["#[cfg(test)]", "#[cfg(all(test,"]
-        .iter()
-        .filter_map(|m| text[at..].find(m).map(|i| (i, m.len())))
-        .min()
-    {
-        let marker = at + rel;
-        at = marker + marker_len;
-        // Only a module has a body worth blanking; a `#[cfg(test)]` on a `use`
-        // or a `const` is a declaration the product side never sees anyway.
-        let after: String = text[at..].chars().take(200).collect();
-        let Some(mod_rel) = after.find("mod ") else {
-            continue;
-        };
-        // Nothing but whitespace and further attributes may sit between the
-        // marker and its `mod`, or this is a different item that merely has one
-        // nearby.
-        if after[..mod_rel]
-            .chars()
-            .any(|c| !c.is_whitespace() && c != '#' && c != '[' && c != ']' && c != '(' && c != ')')
-        {
+    let mut i = 0usize;
+    while i < chars.len() {
+        if !(chars[i] == '#' && chars.get(i + 1) == Some(&'[')) {
+            i += 1;
             continue;
         }
-        let Some(brace_rel) = text[at..].find('{') else {
+        let attr_end = close_bracket(&chars, i + 1);
+        let attr: String = chars[i + 2..attr_end.min(chars.len())].iter().collect();
+        if !gates_on_test(&attr) {
+            i = attr_end + 1;
+            continue;
+        }
+        // Skip any attributes stacked above the same item, then take whichever
+        // comes first: a brace, which opens the item's body, or a semicolon,
+        // which means the item has none.
+        let mut j = attr_end + 1;
+        loop {
+            while j < chars.len() && chars[j].is_whitespace() {
+                j += 1;
+            }
+            if chars.get(j) == Some(&'#') && chars.get(j + 1) == Some(&'[') {
+                j = close_bracket(&chars, j + 1) + 1;
+                continue;
+            }
+            break;
+        }
+        // A `use` is the one item whose braces are not a body — `use a::{b, c}`
+        // is a group, and blanking it deletes an import rather than a fixture.
+        // Everything else that reaches a brace before a semicolon has one.
+        if chars[j..].starts_with(&['u', 's', 'e', ' ']) {
+            i = (j..chars.len()).find(|&k| chars[k] == ';').unwrap_or(j) + 1;
+            continue;
+        }
+        let Some(open) = (j..chars.len()).find(|&k| chars[k] == '{' || chars[k] == ';') else {
             break;
         };
-        let open = text[..at + brace_rel].chars().count();
+        if chars[open] == ';' {
+            i = open + 1;
+            continue;
+        }
         let end = close_brace(&chars, open);
         for slot in out.iter_mut().take(end).skip(open) {
             if *slot != '\n' {
                 *slot = ' ';
             }
         }
-        at = text
-            .char_indices()
-            .nth(end)
-            .map(|(byte, _)| byte)
-            .unwrap_or(text.len());
+        i = end + 1;
     }
     out.into_iter().collect()
+}
+
+/// Index of the `]` closing the `[` at `open`.
+fn close_bracket(chars: &[char], open: usize) -> usize {
+    let mut depth = 0usize;
+    let mut i = open;
+    while i < chars.len() {
+        match chars[i] {
+            '[' => depth += 1,
+            ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return i;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    chars.len()
+}
+
+/// Whether an attribute's body is a `cfg` that requires `test`.
+///
+/// `cfg(test)`, `cfg(all(test, …))` and any nesting of them. `cfg(any(test, …))`
+/// deliberately does **not** count: an `any` compiles in a non-test build too,
+/// so its body is product code on some arm and blanking it would hide exactly
+/// the half a scan is for. Nothing in either crate spells one today; the rule is
+/// here so the first one is handled rather than discovered.
+fn gates_on_test(attr: &str) -> bool {
+    let flat: String = attr.chars().filter(|c| !c.is_whitespace()).collect();
+    let Some(rest) = flat.strip_prefix("cfg(") else {
+        return false;
+    };
+    // A bare `test` predicate, at the top level or under any depth of `all(`.
+    let mut scan = rest;
+    loop {
+        if scan.starts_with("test)") || scan.starts_with("test,") {
+            return true;
+        }
+        match scan.strip_prefix("all(") {
+            Some(inner) => scan = inner,
+            None => return false,
+        }
+    }
 }

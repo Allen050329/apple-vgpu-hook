@@ -30,7 +30,7 @@
 use std::collections::BTreeMap;
 
 mod source_scan;
-use source_scan::{blank_comments, blank_test_modules, rust_sources, workspace_root};
+use source_scan::{blank_comments, blank_test_items, rust_sources, workspace_root};
 
 /// The `Status` constructors that take a slug.
 ///
@@ -66,7 +66,7 @@ fn slug_sites() -> Vec<(String, String, usize)> {
             continue;
         }
         let text = std::fs::read_to_string(&path).expect("crate source must be readable");
-        let code = blank_test_modules(&blank_comments(&text));
+        let code = blank_test_items(&blank_comments(&text));
         for (n, line) in code.lines().enumerate() {
             for ctor in CONSTRUCTORS {
                 let mut from = 0;
@@ -137,7 +137,7 @@ fn no_two_checks_construct_the_same_status_slug() {
 /// The scan reaches the vocabulary it claims to check.
 ///
 /// A scanner that matched nothing would pass the test above forever, and every
-/// way of breaking it is quiet: a constructor renamed, `blank_test_modules`
+/// way of breaking it is quiet: a constructor renamed, `blank_test_items`
 /// blanking more than it should, the walk rooted at the wrong directory. The
 /// floor is deliberately loose about the exact number and strict about the
 /// order of magnitude, and it names both constructors so a class that stops

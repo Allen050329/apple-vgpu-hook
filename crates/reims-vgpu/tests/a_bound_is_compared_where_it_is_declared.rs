@@ -303,18 +303,20 @@ const RECORDED: &[Recorded] = &[
         why: "one header floor asked in `decode::fifo` and again in `exec` on the payload it \
               hands on",
     },
-    Recorded {
-        name: "ICB_BUFFER_BIND_STRIDE",
-        why: "`off + STRIDE > slot.len()` before two different ICB body reads",
-    },
-    Recorded {
-        name: "ICB_CONCURRENT_DISPATCH_ARGS_LEN",
-        why: "`args + LEN > len` before two different ICB body reads",
-    },
-    Recorded {
-        name: "ICB_TESSELLATION_FACTOR_LEN",
-        why: "`off + LEN > slot.len()` twice in one ICB decoder, at two offsets",
-    },
+    // Three ICB rows stood here — `ICB_BUFFER_BIND_STRIDE`,
+    // `ICB_CONCURRENT_DISPATCH_ARGS_LEN` and `ICB_TESSELLATION_FACTOR_LEN`, each
+    // recorded as a length floor asked "before two different ICB body reads".
+    // None of them was ever scattered. The second comparison was in
+    // `write_tessellation_factor` and `encode_render_command_slot`, which are
+    // `#[cfg(test)]` fixture *encoders* in `runtime::icb` — they write the slot
+    // bytes the real decoders then read, so of course they check the same floor.
+    // `source_scan::blank_test_items` did not blank a test-gated `fn`, only a
+    // `mod`, so all three read as product code. The decoders' own comparisons
+    // are single and sit where they should.
+    //
+    // Left as a comment rather than deleted outright: this list's value is that
+    // a row means somebody looked, and "these three were an artifact of what the
+    // scanner counted as product" is the finding, not the absence of a row.
     Recorded {
         name: "TYPE4_MIN_LEN",
         why: "descriptor-length floor before two different type-4 field reads",
@@ -420,7 +422,7 @@ fn comparison_census() -> (DeclaredIn, ComparedAt) {
                 .to_string_lossy()
                 .into_owned();
             let text = std::fs::read_to_string(&path).expect("source must be readable");
-            let code = source_scan::blank_test_modules(&source_scan::blank_comments(&text));
+            let code = source_scan::blank_test_items(&source_scan::blank_comments(&text));
             for (n, line) in code.lines().enumerate() {
                 if let Some(name) = declares_const(line) {
                     declared.insert(name, rel.clone());

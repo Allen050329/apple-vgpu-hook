@@ -148,7 +148,7 @@ fn every_allocation_bound_derives_its_span_from_read_span() {
             continue;
         }
         let text = std::fs::read_to_string(file).expect("a readable source file");
-        let text = source_scan::blank_test_modules(&source_scan::blank_comments(&text));
+        let text = source_scan::blank_test_items(&source_scan::blank_comments(&text));
         let lines: Vec<&str> = text.lines().collect();
 
         for (i, line) in lines.iter().enumerate() {

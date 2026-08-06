@@ -28,7 +28,7 @@
 //! of the Vulkan build, so no single compilation sees both — but both are text.
 
 mod source_scan;
-use source_scan::{blank_comments, blank_test_modules, rust_sources, workspace_root};
+use source_scan::{blank_comments, blank_test_items, rust_sources, workspace_root};
 
 /// The one function allowed to decide it, by the file it is written in.
 const DECIDING_FILE: &str = "src/runtime/decode/render/mod.rs";
@@ -100,7 +100,7 @@ fn no_file_outside_the_decoder_floors_an_instance_count() {
         // Comments name the rule on purpose — the pass-through in
         // `runtime::draw::vulkan` explains itself by quoting it — and a test
         // module may build one deliberately.
-        let body = blank_test_modules(&blank_comments(&text));
+        let body = blank_test_items(&blank_comments(&text));
         for hit in clamps_instance_count(&body) {
             offenders.push(format!("{rel}: {hit}"));
         }

@@ -23,7 +23,7 @@
 use std::collections::BTreeSet;
 
 mod source_scan;
-use source_scan::{blank_comments, blank_test_modules, rust_sources, workspace_root};
+use source_scan::{blank_comments, blank_test_items, rust_sources, workspace_root};
 
 /// The calls that put a window into `DeviceState`'s deferred maps.
 ///
@@ -93,7 +93,7 @@ fn no_arm_site_lives_outside_a_backend_vulkan_gate() {
         // because production code lives after test modules in this tree and a
         // cutoff would hide it — measured: appending an arm site to the end of
         // `mapper.rs` was invisible to the cutoff version of this scan.
-        let production = blank_test_modules(&blank_comments(
+        let production = blank_test_items(&blank_comments(
             &std::fs::read_to_string(&path).expect("readable"),
         ));
         let production = production.as_str();

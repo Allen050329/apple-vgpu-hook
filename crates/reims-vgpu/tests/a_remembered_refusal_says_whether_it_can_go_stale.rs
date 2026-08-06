@@ -40,7 +40,7 @@
 //! all, but both are text.
 
 mod source_scan;
-use source_scan::{blank_comments, blank_test_modules, rust_sources, workspace_root};
+use source_scan::{blank_comments, blank_test_items, rust_sources, workspace_root};
 
 /// How a stored refusal answers the question.
 ///
@@ -357,7 +357,7 @@ fn every_stored_refusal_carries_a_verdict() {
         .into_iter()
         .map(|p| {
             let raw = std::fs::read_to_string(&p).expect("read source");
-            let text = blank_test_modules(&blank_comments(&raw));
+            let text = blank_test_items(&blank_comments(&raw));
             let rel = p
                 .strip_prefix(root.join("crates/reims-vgpu"))
                 .unwrap_or(&p)
@@ -545,7 +545,7 @@ fn every_budget_refills_or_argues_for_not_refilling() {
         .into_iter()
         .map(|p| {
             let raw = std::fs::read_to_string(&p).expect("read source");
-            let text = blank_test_modules(&blank_comments(&raw));
+            let text = blank_test_items(&blank_comments(&raw));
             let rel = p
                 .strip_prefix(root.join("crates/reims-vgpu"))
                 .unwrap_or(&p)
