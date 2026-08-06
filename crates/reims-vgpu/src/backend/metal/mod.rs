@@ -8,7 +8,6 @@
 pub mod abi;
 mod constants;
 pub mod error;
-mod hash;
 
 // ---------------------------------------------------------------------------
 // Apple: real Metal encode

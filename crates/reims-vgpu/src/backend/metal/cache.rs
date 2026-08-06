@@ -1,10 +1,10 @@
 //! Process-global content-hash caches.
 
+use crate::backend::hash::hash_u64;
 use crate::backend::metal::abi::{
     ReimsVgpuComputeTextureUsage, ReimsVgpuDepthStencilState, ReimsVgpuSampler,
 };
 use crate::backend::metal::constants::*;
-use crate::backend::metal::hash::hash_u64;
 use crate::contract::fnv::FNV_OFFSET_BASIS;
 use crate::model::content_cache::{CacheEntry, ContentCache};
 use crate::runtime::decode::resource::MTL_COLOR_WRITE_MASK_ALL;
@@ -23,7 +23,7 @@ pub struct FnEntry {
 /// [`RenderPsoKey::equal`] compares `vert_hash`/`frag_hash` and the two lengths.
 /// **The shader bytes themselves are never compared** — they are not retained to
 /// compare against. So two distinct blobs of equal length whose
-/// [`super::hash::hash_bytes`] outputs collide are one pipeline as far as this
+/// [`crate::backend::hash::hash_bytes`] outputs collide are one pipeline as far as this
 /// cache is concerned, and a draw gets an `MTLRenderPipelineState` built from
 /// the other blob's shader. Nothing refuses; the frame is simply wrong.
 /// `render_key_hash_and_shader_lengths_are_identity_fields` pins that these

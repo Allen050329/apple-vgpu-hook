@@ -12,6 +12,30 @@
 //! Metal indices/semantics are canonical (guest wire is serialized Metal).
 //! Vulkan-only binding rewrites live only in [`vulkan`].
 
+/// Content hashes for the Metal backend's compiled-object caches.
+///
+/// Declared here rather than inside `metal` — not a doc link, because that
+/// module does not exist on the Vulkan arm, which is the point — and ungated,
+/// for one reason: it
+/// names nothing from the `metal` crate, and gating it made two test functions
+/// that any host can execute run on none of them. Everything under
+/// `backend/metal/` is `cfg`-ed out of the arm a Linux host builds, and
+/// `cargo test --target aarch64-apple-darwin --no-run` fails at the link step —
+/// so while this was a `mod hash` in that tree, the only way to run its tests
+/// was to copy the file to `/tmp` and invoke `rustc --test` by hand. That is not
+/// a gate, and AGENTS.md recorded it as a workaround rather than as the bug it
+/// was.
+///
+/// The cost is a Vulkan build compiling twenty lines of arithmetic it never
+/// calls, which is not a reason to hide a test from the only machine that can
+/// run it. `scripts/dead-state` takes the intersection of both arms, so it does
+/// not read as dead.
+///
+/// It stays out of `contract::fnv` for the reason its own doc gives: the fold
+/// here is not the shared one, and a caller reaching for the wrong one would
+/// produce keys in a different keyspace without anything failing.
+pub mod hash;
+
 #[cfg(feature = "backend-metal")]
 // `Status` is 264 bytes — six inline `(key, value)` fields, no allocation — and
 // it is the `Err` of most of this module's functions, so `result_large_err` and

@@ -53,7 +53,13 @@ use source_scan::{blank_comments, rust_sources, workspace_root};
 /// pin is a `const` assertion **rather than** a `#[test]`. So the number
 /// describing the untested arm was itself produced by reading prose as code, and
 /// blanking comments before counting is why this one is not.
-const METAL_ARM_TEST_FUNCTIONS: usize = 35;
+///
+/// It went 35 → 33 the moment this test existed, and that is the intended use:
+/// `backend::hash` moved up out of the gated tree because it names nothing from
+/// the `metal` crate, so its two tests now run on every arm instead of none.
+/// Every further reduction should have that shape — a test that *runs* somewhere
+/// — and not a deletion.
+const METAL_ARM_TEST_FUNCTIONS: usize = 33;
 
 #[test]
 fn the_metal_arm_test_functions_are_counted_because_this_build_may_not_run_them() {

@@ -1,5 +1,6 @@
 //! Compute encode path: PSO cache, binds, dispatch core, reflection.
 
+use crate::backend::hash::hash_bytes;
 use crate::backend::metal::abi::*;
 use crate::backend::metal::cache::{
     compute_pso_insert, compute_pso_lookup, reflect_insert, reflect_lookup, BlobKey, ComputePsoKey,
@@ -7,7 +8,6 @@ use crate::backend::metal::cache::{
 use crate::backend::metal::constants::*;
 use crate::backend::metal::format::storage_image_format;
 use crate::backend::metal::function::load_only_function;
-use crate::backend::metal::hash::hash_bytes;
 use crate::backend::metal::raw_metal::{
     command_buffer_error_description, mtl_size, new_compute_pso_with_function_reflection,
     new_texture_view_swizzled, reflection_bindings, set_buffer_with_attribute_stride,

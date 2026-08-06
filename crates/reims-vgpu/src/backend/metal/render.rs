@@ -1,5 +1,6 @@
 //! Render encode path: PSO cache, stage-in, textured, fixed-function state.
 
+use crate::backend::hash::{hash_bytes, hash_u64};
 use crate::backend::metal::abi::*;
 use crate::backend::metal::cache::{
     depth_stencil_insert, depth_stencil_lookup, render_pso_insert, render_pso_lookup,
@@ -8,7 +9,6 @@ use crate::backend::metal::cache::{
 use crate::backend::metal::constants::*;
 use crate::backend::metal::format::mtl_pixel_format_bpp;
 use crate::backend::metal::function::load_only_function;
-use crate::backend::metal::hash::{hash_bytes, hash_u64};
 use crate::backend::metal::mtl_enum;
 use crate::backend::metal::raw_metal::{
     command_buffer_error_description, render_reflection_sampler_mask,

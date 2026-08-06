@@ -1,9 +1,13 @@
-//! The two content hashes this backend's caches key on.
+//! The two content hashes the Metal backend's compiled-object caches key on.
 //!
-//! Both are built from the FNV-1a parameters in [`crate::contract::fnv`], which
-//! is where the constants live so that the runtime's own FNV callers — behind
-//! no feature gate, and therefore unable to see anything in this module — can
-//! name them instead of writing them out.
+//! Both are built from the FNV-1a parameters in [`crate::contract::fnv`]. The
+//! constants live there rather than here because three of the crate's four
+//! FNV callers are not backends at all, and this module was behind
+//! `feature = "backend-metal"` when they were written — so they could not name
+//! these and wrote the basis and the prime out as literals instead. Its
+//! declaration in [`crate::backend`] says why it is no longer gated; the
+//! constants stay where they are, because that split is about who can *see*
+//! them and moving the module did not change who needs them.
 //!
 //! # What constrains these numbers
 //!

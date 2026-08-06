@@ -395,11 +395,15 @@ the arm you *can* build, so adding or deleting one of them stops being invisible
 paragraph used to carry the number itself and it was wrong by four — a bare `grep` for `#[test]`
 counts the sentences that say "a `const` assertion rather than a `#[test]`". Read the constant.
 
-Where a file under `backend/metal/` is pure logic, you can still execute its tests: copy it to
-`/tmp`, strip the `//!` module doc if it links outside the file, and build with bare
-`rustc --test`. `backend/metal/hash.rs` needed exactly that and nothing else. A file that reaches
-`crate::` for more than constants needs its dependency closure copied too, which is usually the
-point at which the logic belongs in `contract/` instead.
+Where a file under `backend/metal/` is pure logic, **move it out of the gated tree** rather than
+working around the gate — `backend::hash` is the worked example, and its two tests now run on every
+arm instead of on none. The bar is that it names nothing from the `metal` crate; state in the
+module's own doc why it sits outside `metal`, or the next reader moves it back.
+
+Copying the file to `/tmp` and building with bare `rustc --test` still works for a one-off reading,
+and needs the `//!` module doc stripped if it links outside the file. It is not a gate: nothing
+re-runs it. A file that reaches `crate::` for more than constants needs its dependency closure
+copied too, which is usually the point at which the logic belongs in `contract/` instead.
 
 ```sh
 scripts/feature-matrix/feature-matrix.sh

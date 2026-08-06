@@ -6,11 +6,11 @@
 //! backend: the dma-buf window cache keys its page lists with it, the sampled
 //! gather witness names a window with it, and the Metal pipeline and sampler
 //! caches key shaders and descriptors with it. The constants used to be
-//! declared inside `backend::metal::hash` (not a doc link: that module does not
-//! exist on the Vulkan arm, which is the point), behind
+//! declared inside the Metal backend's own hash module, behind
 //! `feature = "backend-metal"` — so the two runtime sites *could not* name them
 //! even if their authors had looked, and both wrote the basis and the prime out
-//! as literals instead.
+//! as literals instead. (That module is [`crate::backend::hash`] now, and
+//! ungated, for a different reason its own doc gives.)
 //!
 //! They wrote them out in different shapes. Before this module existed the
 //! basis appeared as `0xcbf2_9ce4_8422_2325` at three sites and as

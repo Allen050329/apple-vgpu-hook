@@ -1,7 +1,7 @@
 //! MTLB sole-function load with content-hash cache.
 
+use crate::backend::hash::hash_bytes;
 use crate::backend::metal::cache::{fn_cache_insert, fn_cache_lookup, BlobKey};
-use crate::backend::metal::hash::hash_bytes;
 use crate::backend::metal::util::{set_err, ErrOut, Status};
 use metal::{Device, Function};
 
