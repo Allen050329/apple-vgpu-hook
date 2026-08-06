@@ -895,38 +895,152 @@ pub fn sampler_bindings(words: &[u32]) -> Vec<u32> {
     bindings
 }
 
-/// Rewrite fragment SPIR-V: buffer bindings in `[0,32)` += [`FRAG_BUFFER_BINDING_OFFSET`]
-/// (destination band `[104,136)`, clear of the `[96,104)` ColorInput band).
-pub fn offset_fragment_buffer_bindings(words: &mut [u32]) -> usize {
-    let mut rewritten = 0usize;
+/// SPIR-V `Dim` operand value `SubpassData` — the framebuffer-fetch image.
+const DIM_SUBPASS_DATA: u32 = 6;
+
+/// Which Metal argument class a set-0 descriptor variable was translated from.
+///
+/// metal2vulkan numbers each class from its own base — [`TEXTURE_BINDING_BASE`]
+/// `+ N` for texture `N`, [`SAMPLER_BINDING_BASE`] `+ N` for sampler `N` — and
+/// those bases sit 32 apart. So a binding number names its class only while
+/// every Metal index stays under 32: texture 40 and sampler 8 are both binding
+/// 72. The class is therefore read from the SPIR-V *type* behind the variable,
+/// which is exact and stays exact however wide the index gets.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BindingClass {
+    /// `[[texture(n)]]` — an `OpTypeImage` that is not `SubpassData`, sampled or
+    /// storage alike.
+    Texture,
+    /// `[[sampler(n)]]`, including an AIR constexpr sampler. `OpTypeSampler`,
+    /// and `OpTypeSampledImage` for the combined form.
+    Sampler,
+    /// `[[color(n)]]` framebuffer fetch: an `OpTypeImage` whose `Dim` is
+    /// `SubpassData`. Held apart from [`Self::Texture`] because the engine binds
+    /// the input attachment at its un-relocated number.
+    ColorInput,
+    /// A descriptor whose type resolved to none of the above — a `[[buffer(n)]]`
+    /// uniform or storage buffer.
+    Buffer,
+}
+
+/// Resolve every SPIR-V id in `words` to the [`BindingClass`] of the type behind
+/// it, indexed by id.
+///
+/// `None` at an id means either "not a descriptor variable" or "the
+/// variable → pointer → pointee chain did not resolve", and the two are the same
+/// answer to the only question asked here: this walk cannot name that variable's
+/// class. Callers must not treat `None` as a class.
+fn variable_classes(words: &[u32]) -> Vec<Option<BindingClass>> {
+    let Some(&bound) = words.get(3) else {
+        return Vec::new();
+    };
+    let bound = bound as usize;
+    if words.len() < HEADER_WORDS || bound == 0 {
+        return Vec::new();
+    }
+    // Class of a *type* id, the pointee a descriptor pointer names.
+    let mut type_class: Vec<Option<BindingClass>> = vec![None; bound];
+    let mut pointee: Vec<Option<usize>> = vec![None; bound];
+    let mut var_type: Vec<Option<usize>> = vec![None; bound];
+
     let mut i = HEADER_WORDS;
     while i < words.len() {
         let word0 = words[i];
         let word_count = (word0 >> 16) as usize;
         let opcode = (word0 & 0xffff) as u16;
-        if word_count == 0 {
+        if word_count == 0 || i + word_count > words.len() {
             break;
         }
-        if opcode == OP_DECORATE && word_count >= 4 && i + 3 < words.len() {
-            let decoration = words[i + 2];
-            let binding = words[i + 3];
-            if decoration == DECORATION_BINDING && binding < BUFFER_BINDING_LIMIT {
-                words[i + 3] = binding + FRAG_BUFFER_BINDING_OFFSET;
-                rewritten += 1;
+        let mut set_type = |id: u32, class: BindingClass| {
+            if (id as usize) < bound {
+                type_class[id as usize] = Some(class);
             }
+        };
+        match opcode {
+            // Dim is the third operand; SubpassData is the framebuffer-fetch
+            // image and everything else is a Metal texture.
+            OP_TYPE_IMAGE if word_count >= 9 => {
+                let class = if words[i + 3] == DIM_SUBPASS_DATA {
+                    BindingClass::ColorInput
+                } else {
+                    BindingClass::Texture
+                };
+                set_type(words[i + 1], class);
+            }
+            OP_TYPE_SAMPLER | OP_TYPE_SAMPLED_IMAGE if word_count >= 2 => {
+                set_type(words[i + 1], BindingClass::Sampler);
+            }
+            OP_TYPE_POINTER if word_count >= 4 => {
+                let id = words[i + 1] as usize;
+                if id < bound {
+                    pointee[id] = Some(words[i + 3] as usize);
+                }
+            }
+            OP_VARIABLE if word_count >= 4 => {
+                let id = words[i + 2] as usize;
+                if id < bound {
+                    var_type[id] = Some(words[i + 1] as usize);
+                }
+            }
+            _ => {}
         }
         i += word_count;
     }
-    rewritten
+
+    (0..bound)
+        .map(|id| {
+            let pointer = var_type[id]?;
+            let pointee = pointee.get(pointer).copied().flatten()?;
+            // A resolved chain that named no image or sampler type is a buffer;
+            // an unresolved one is `None` and stays unnamed.
+            Some(
+                type_class
+                    .get(pointee)
+                    .copied()
+                    .flatten()
+                    .unwrap_or(BindingClass::Buffer),
+            )
+        })
+        .collect()
 }
 
-/// Rewrite fragment SPIR-V: sampled bindings `[32,96)` += [`FRAG_SAMPLED_RESOURCE_BINDING_OFFSET`].
+/// A `Binding` decoration whose variable [`variable_classes`] could not name, so
+/// the relocation fell back to the binding number's band.
 ///
-/// The `[96,104)` ColorInput band ([`COLOR_INPUT_BINDING_BASE`]) is deliberately
-/// NOT relocated: the engine binds the framebuffer-fetch input attachment by its
-/// un-relocated number, exactly like the storage/descriptor reflectors key on
-/// un-relocated bindings.
-pub fn offset_fragment_sampled_resource_bindings(words: &mut [u32]) -> usize {
+/// The fallback is only correct while every Metal index is under 32, which is
+/// what makes this worth reporting rather than absorbing: it is the one input
+/// shape that would make a widened band mis-relocate.
+struct UnclassifiedBinding {
+    binding: u32,
+    variable: u32,
+}
+
+impl crate::observe::Decline for UnclassifiedBinding {
+    fn slug(&self) -> &'static str {
+        "spirv_reloc_unclassified_binding"
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("binding", self.binding.to_string()),
+            ("variable", self.variable.to_string()),
+        ]
+    }
+}
+
+/// Add `offset` to every `Binding` decoration whose variable is in `classes`.
+///
+/// The class comes from the variable's SPIR-V type ([`variable_classes`]); the
+/// `band` predicate is consulted only for a variable that walk could not name,
+/// and each such fallback is reported. Both rules agree for every Metal index
+/// under 32 — the type rule is the one that keeps agreeing above it.
+fn relocate_by_class(
+    words: &mut [u32],
+    classes: &[BindingClass],
+    band: impl Fn(u32) -> bool,
+    offset: u32,
+) -> usize {
+    let by_variable = variable_classes(words);
     let mut rewritten = 0usize;
     let mut i = HEADER_WORDS;
     while i < words.len() {
@@ -937,19 +1051,59 @@ pub fn offset_fragment_sampled_resource_bindings(words: &mut [u32]) -> usize {
             break;
         }
         if opcode == OP_DECORATE && word_count >= 4 && words[i + 2] == DECORATION_BINDING {
+            let variable = words[i + 1];
             let binding = words[i + 3];
-            if (SAMPLED_RESOURCE_BINDING_BASE..SAMPLED_RESOURCE_BINDING_LIMIT).contains(&binding) {
-                // The contract bands make overflow impossible: `binding < 96`
-                // and the relocation is 128, so the largest result is 223.
-                // Keeping a fallible branch here would register a decline the
-                // product cannot produce.
-                words[i + 3] = binding + FRAG_SAMPLED_RESOURCE_BINDING_OFFSET;
+            let wanted = match by_variable.get(variable as usize).copied().flatten() {
+                Some(class) => classes.contains(&class),
+                None => {
+                    crate::observe::Emit::decline(
+                        "spirv_reloc",
+                        &UnclassifiedBinding { binding, variable },
+                    )
+                    .fail_once(u64::from(binding));
+                    band(binding)
+                }
+            };
+            if wanted {
+                words[i + 3] = binding + offset;
                 rewritten += 1;
             }
         }
         i += word_count;
     }
     rewritten
+}
+
+/// Rewrite fragment SPIR-V: buffer bindings += [`FRAG_BUFFER_BINDING_OFFSET`]
+/// (source band `[0,32)`, destination `[104,136)`, clear of the `[96,104)`
+/// ColorInput band).
+pub fn offset_fragment_buffer_bindings(words: &mut [u32]) -> usize {
+    relocate_by_class(
+        words,
+        &[BindingClass::Buffer],
+        |binding| binding < BUFFER_BINDING_LIMIT,
+        FRAG_BUFFER_BINDING_OFFSET,
+    )
+}
+
+/// Rewrite fragment SPIR-V: texture and sampler bindings +=
+/// [`FRAG_SAMPLED_RESOURCE_BINDING_OFFSET`] (source band `[32,96)`).
+///
+/// The ColorInput band ([`COLOR_INPUT_BINDING_BASE`]) is deliberately NOT
+/// relocated: the engine binds the framebuffer-fetch input attachment by its
+/// un-relocated number, exactly like the storage/descriptor reflectors key on
+/// un-relocated bindings. That exclusion is now the image's `SubpassData` `Dim`
+/// rather than its binding number, so it holds for a texture index that reaches
+/// the band numerically.
+pub fn offset_fragment_sampled_resource_bindings(words: &mut [u32]) -> usize {
+    relocate_by_class(
+        words,
+        &[BindingClass::Texture, BindingClass::Sampler],
+        |binding| {
+            (SAMPLED_RESOURCE_BINDING_BASE..SAMPLED_RESOURCE_BINDING_LIMIT).contains(&binding)
+        },
+        FRAG_SAMPLED_RESOURCE_BINDING_OFFSET,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1672,6 +1826,154 @@ mod tests {
         assert_eq!(
             COLOR_INPUT_BINDING_BASE,
             crate::backend::vulkan::engine::COLOR_INPUT_BINDING
+        );
+    }
+
+    /// Build a set-0 descriptor variable with a real type chain:
+    /// `OpVariable` → `OpTypePointer(UniformConstant)` → the given type id, plus
+    /// its `Binding` decoration. Ids are derived from `var` so callers only pick
+    /// one number per variable.
+    fn typed_descriptor(var: u32, pointee: u32, binding: u32) -> Vec<u32> {
+        let pointer = var + 100;
+        let mut w = vec![
+            (4u32 << 16) | OP_TYPE_POINTER as u32,
+            pointer,
+            STORAGE_CLASS_UNIFORM_CONSTANT,
+            pointee,
+        ];
+        w.extend([
+            (4u32 << 16) | OP_VARIABLE as u32,
+            pointer,
+            var,
+            STORAGE_CLASS_UNIFORM_CONSTANT,
+        ]);
+        w.extend([
+            (4u32 << 16) | OP_DECORATE as u32,
+            var,
+            DECORATION_BINDING,
+            binding,
+        ]);
+        w
+    }
+
+    /// `OpTypeImage` with the given result id and `Dim`. The remaining operands
+    /// are a plain sampled 2D image; only `Dim` selects the class.
+    fn image_type(id: u32, dim: u32) -> Vec<u32> {
+        vec![
+            (9u32 << 16) | OP_TYPE_IMAGE as u32,
+            id,
+            1, // sampled type
+            dim,
+            0, // depth
+            0, // arrayed
+            0, // multisampled
+            1, // sampled
+            0, // format
+        ]
+    }
+
+    /// A module header whose id bound clears every id these tests use.
+    fn module_header() -> Vec<u32> {
+        vec![0x0723_0203, 0x0001_0000, 0, 512, 0]
+    }
+
+    /// The collision that bounds the texture table at 31.
+    ///
+    /// metal2vulkan puts texture `N` at `32+N` and sampler `N` at `64+N`, so
+    /// texture 40 and sampler 8 are both binding 72 and the number cannot say
+    /// which is which. The SPIR-V type can, and this is the reading that says the
+    /// 32-wide band is a property of the numbering rather than of the
+    /// information available — a widened band has to be told apart this way.
+    #[test]
+    fn a_texture_and_a_sampler_sharing_one_binding_are_told_apart_by_type() {
+        const IMAGE: u32 = 10;
+        const SAMPLER: u32 = 11;
+        const COLLIDING: u32 = TEXTURE_BINDING_BASE + 40;
+        const _: () = assert!(COLLIDING == SAMPLER_BINDING_BASE + 8);
+
+        let mut words = module_header();
+        words.extend(image_type(IMAGE, 1));
+        words.extend([(2u32 << 16) | OP_TYPE_SAMPLER as u32, SAMPLER]);
+        words.extend(typed_descriptor(30, IMAGE, COLLIDING));
+        words.extend(typed_descriptor(31, SAMPLER, COLLIDING));
+
+        let classes = variable_classes(&words);
+        assert_eq!(classes[30], Some(BindingClass::Texture));
+        assert_eq!(classes[31], Some(BindingClass::Sampler));
+    }
+
+    /// A framebuffer-fetch input is an `OpTypeImage` too, and the exclusion that
+    /// keeps it un-relocated must not be its binding number: `Dim SubpassData`
+    /// is what separates it from a texture.
+    #[test]
+    fn subpass_data_is_color_input_and_a_plain_image_is_a_texture() {
+        const SUBPASS: u32 = 10;
+        const SAMPLED: u32 = 11;
+        let mut words = module_header();
+        words.extend(image_type(SUBPASS, DIM_SUBPASS_DATA));
+        words.extend(image_type(SAMPLED, 1));
+        words.extend(typed_descriptor(30, SUBPASS, COLOR_INPUT_BINDING_BASE + 1));
+        words.extend(typed_descriptor(31, SAMPLED, TEXTURE_BINDING_BASE + 3));
+
+        let classes = variable_classes(&words);
+        assert_eq!(classes[30], Some(BindingClass::ColorInput));
+        assert_eq!(classes[31], Some(BindingClass::Texture));
+    }
+
+    /// The type rule replaces the band rule, so on the layout the band rule was
+    /// written for the two must produce identical bindings. A module with one of
+    /// each class, every index below the collision, relocated by both fragment
+    /// passes.
+    #[test]
+    fn the_type_rule_relocates_a_typed_module_exactly_as_the_band_rule_did() {
+        const IMAGE: u32 = 10;
+        const SAMPLER: u32 = 11;
+        const SUBPASS: u32 = 12;
+        // A buffer's pointee resolves to no image or sampler type, which is what
+        // makes it a buffer; id 13 is never declared as a type.
+        const BUFFER_STRUCT: u32 = 13;
+
+        let mut words = module_header();
+        words.extend(image_type(IMAGE, 1));
+        words.extend([(2u32 << 16) | OP_TYPE_SAMPLER as u32, SAMPLER]);
+        words.extend(image_type(SUBPASS, DIM_SUBPASS_DATA));
+        words.extend(typed_descriptor(30, BUFFER_STRUCT, 3));
+        words.extend(typed_descriptor(31, IMAGE, TEXTURE_BINDING_BASE + 3));
+        words.extend(typed_descriptor(32, SAMPLER, SAMPLER_BINDING_BASE + 2));
+        words.extend(typed_descriptor(33, SUBPASS, COLOR_INPUT_BINDING_BASE + 1));
+
+        assert_eq!(offset_fragment_sampled_resource_bindings(&mut words), 2);
+        assert_eq!(offset_fragment_buffer_bindings(&mut words), 1);
+
+        // Each `typed_descriptor` ends with its 4-word decoration, so the
+        // binding is the last word of each block.
+        let binding_of = |var: u32| {
+            let mut i = HEADER_WORDS;
+            while i < words.len() {
+                let word_count = (words[i] >> 16) as usize;
+                if (words[i] & 0xffff) as u16 == OP_DECORATE
+                    && words[i + 2] == DECORATION_BINDING
+                    && words[i + 1] == var
+                {
+                    return words[i + 3];
+                }
+                i += word_count;
+            }
+            unreachable!("every variable in this module carries a Binding");
+        };
+        assert_eq!(binding_of(30), 3 + FRAG_BUFFER_BINDING_OFFSET);
+        assert_eq!(
+            binding_of(31),
+            TEXTURE_BINDING_BASE + 3 + FRAG_SAMPLED_RESOURCE_BINDING_OFFSET
+        );
+        assert_eq!(
+            binding_of(32),
+            SAMPLER_BINDING_BASE + 2 + FRAG_SAMPLED_RESOURCE_BINDING_OFFSET
+        );
+        assert_eq!(
+            binding_of(33),
+            COLOR_INPUT_BINDING_BASE + 1,
+            "the ColorInput band never moves"
         );
     }
 
