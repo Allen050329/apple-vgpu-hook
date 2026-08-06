@@ -323,6 +323,15 @@ pub(crate) struct ResourcePools {
     /// under pressure; one where this rises without bound is the population
     /// growing with nothing able to trim it, which is a VRAM ceiling coming.
     registry_cap_no_victim: u64,
+    /// The compute-storage counterparts of [`Self::registry_sole_copy`],
+    /// [`Self::registry_sole_copy_peak`] and [`Self::registry_cap_no_victim`],
+    /// over the other registry. Kept separate rather than summed for the reason
+    /// `compute_storage_cap_evictions` is: the two registries are bounded by
+    /// different constants over different populations, and a boot needs to know
+    /// which one bit.
+    compute_storage_sole_copy: NonPinnedTotals,
+    compute_storage_sole_copy_peak: NonPinnedTotals,
+    compute_storage_cap_no_victim: u64,
     /// Monotonic wall-clock milliseconds for the resident-target idle drain, fed
     /// from the poll heartbeat and each publish ([`Self::advance_registry_touch_and_drain`]).
     /// Each admit/hit/present stamps its slot's `last_touch_ms` with this value;
@@ -778,6 +787,28 @@ struct ResidentStorageImageSlot {
     /// (guest pages are stale) — LRU eviction must skip it until the caller
     /// flushes and unpins.
     pinned: bool,
+    /// This image holds dispatch output that exists nowhere else. Both reclaim
+    /// paths skip it, at any age and any population.
+    ///
+    /// [`ResidentTargetSlot::gpu_only_content`] on the sibling registry, for the
+    /// same reason and against the same defect: `pinned == false` covers both
+    /// "the writeback landed, the guest's pages hold this" and "no writeback was
+    /// ever armed, so nothing outside this image ever held it". A dispatch that
+    /// produces a storage image and is only ever *read* from — never re-armed —
+    /// sits in the second state for its whole life.
+    ///
+    /// The loss here is louder than on the sibling and no less real: a later
+    /// dispatch reading a destroyed identity refuses with `ResidentSampleAbsent`
+    /// or `ResidentSeedGenerationLost`, so the guest's compute work is dropped
+    /// rather than silently mis-served.
+    ///
+    /// Set by `mark_resident_storage_image` — the call every executed dispatch
+    /// makes for the image it wrote — and cleared where the content has
+    /// demonstrably left the image: a landed readback, or the guest deleting the
+    /// object it belonged to. Not cleared by an unpin: `flush_storage_one`'s
+    /// abort path and `lifecycle`'s window-cleared path both unpin without
+    /// having written anything.
+    gpu_only_content: bool,
     /// Value of `ResourcePools::idle_clock_ms` (wall-clock ms) at this resident's
     /// last use (admit or `acquire_resident_storage_image` hit). The idle drain
     /// ([`ResourcePools::advance_registry_touch_and_drain`]) reclaims a non-pinned

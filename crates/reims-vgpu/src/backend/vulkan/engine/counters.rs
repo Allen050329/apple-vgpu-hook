@@ -451,6 +451,13 @@ engine_counters! {
         /// eviction count flat, and only one of them means the cap is under
         /// pressure it is deliberately declining to relieve.
         registry_cap_no_victim,
+        /// The three above over the compute-storage registry. Separate rather
+        /// than summed for the reason `compute_storage_cap_evictions` is: the
+        /// two registries are bounded by different constants over different
+        /// populations, and a boot needs to know which one bit.
+        compute_storage_sole_copy_peak,
+        compute_storage_sole_copy_peak_bytes,
+        compute_storage_cap_no_victim,
     }
 }
 /// The `note_*` helpers: the increments that are not a bare `fetch_add(1)` at

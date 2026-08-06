@@ -590,6 +590,11 @@ pub fn retire_linear_residents(state: &mut DeviceState) {
         #[cfg(feature = "backend-vulkan")]
         {
             crate::backend::vulkan::engine::unpin_resident_storage(key);
+            // The guest deleted the object, so the image's content is not guest
+            // work any more and the reclaim paths must be able to take it. An
+            // unpin alone would trade this function's pinned-VRAM leak for a
+            // sole-copy one.
+            crate::backend::vulkan::engine::retire_resident_storage_content(key);
             crate::observe::off(format!(
                 "linear_resident_retired task={} ref={} gva={:#x} {}x{} fmt={:#x}",
                 key.map_generation,

@@ -940,6 +940,20 @@ pub fn unpin_resident_storage(identity: &crate::model::ComputeStorageResidencyKe
     guard.pools.pin_resident_storage(identity, false);
 }
 
+/// Release a compute-storage resident's claim on being unreclaimable because the
+/// guest deleted the object its content belonged to.
+///
+/// Paired with `unpin_resident_storage` at the teardown sites only. An unpin
+/// alone stopped being enough once the reclaim paths learned to refuse a
+/// sole-copy resident: `retire_linear_residents` exists to keep a dead cache
+/// entry from leaking its pinned VRAM image for the boot, and without this the
+/// leak would simply change its name. Never call it on a live object — the whole
+/// point of the flag is that content nobody has copied out is not disposable.
+pub fn retire_resident_storage_content(identity: &crate::model::ComputeStorageResidencyKey) {
+    let mut guard = lock_engine();
+    guard.pools.note_compute_storage_content_retired(identity);
+}
+
 /// True when the device supports format-less storage-image writes
 /// (`shaderStorageImageWriteWithoutFormat`). The compute path needs this to
 /// composite a guest `BGRA8Unorm` storage surface into a `B8G8R8A8_UNORM` view
@@ -2108,6 +2122,10 @@ pub fn read_resident_storage(
             },
         )?;
         pools.set_resident_storage_layout(identity, ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+        // The readback above landed — `copy_image_level0_to_host` returned the
+        // bytes rather than an error — so this image has stopped being the only
+        // place the dispatch's output exists and the reclaim paths may take it.
+        pools.note_compute_storage_copied_out(identity);
         pools.pin_resident_storage(identity, false);
         counters.note_compute_deferred_flush(rb_size);
         Ok((out, texel))
@@ -2174,6 +2192,10 @@ pub fn counter_snapshot() -> CounterSnapshot {
     snap.registry_sole_copy_peak = sole_peak;
     snap.registry_sole_copy_peak_bytes = sole_peak_bytes;
     snap.registry_cap_no_victim = cap_no_victim;
+    let (cs_sole, cs_sole_bytes, cs_no_victim) = eng.pools.compute_storage_sole_copy_stats();
+    snap.compute_storage_sole_copy_peak = cs_sole;
+    snap.compute_storage_sole_copy_peak_bytes = cs_sole_bytes;
+    snap.compute_storage_cap_no_victim = cs_no_victim;
     snap.compute_storage_cap_evictions = eng.pools.compute_storage_cap_evictions();
     snap.resident_resample_peak_ms = eng.pools.resident_resample_peak_ms();
     let (slab_held, slab_carved) = eng.pools.slab_held_bytes();

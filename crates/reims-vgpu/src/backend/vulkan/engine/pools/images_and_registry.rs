@@ -253,7 +253,7 @@ impl ResourcePools {
             .get(&identity)
             .is_some_and(|resident| resident.slot.key != key)
         {
-            if let Some(old) = self.compute_storage_registry.remove(&identity) {
+            if let Some(old) = self.remove_compute_storage_resident(&identity) {
                 self.dispose(
                     &ctx.device,
                     DeferredHandle::Image {
@@ -263,8 +263,6 @@ impl ResourcePools {
                     },
                 );
             }
-            self.compute_storage_order
-                .retain(|entry| entry != &identity);
         }
         let now = self.idle_clock_ms;
         if let Some(resident) = self.compute_storage_registry.get_mut(&identity) {
@@ -281,12 +279,13 @@ impl ResourcePools {
         // pinned there is no victim and the registry soft-exceeds the cap
         // rather than lose unflushed content — the same trade the sibling
         // target registry's walk makes.
+        self.note_compute_storage_reach();
         while self.compute_storage_registry.len() >= COMPUTE_STORAGE_REGISTRY_CAP {
             let Some(victim) = self.compute_storage_eviction_victim() else {
+                self.compute_storage_cap_no_victim += 1;
                 break;
             };
-            self.compute_storage_order.retain(|entry| entry != &victim);
-            if let Some(old) = self.compute_storage_registry.remove(&victim) {
+            if let Some(old) = self.remove_compute_storage_resident(&victim) {
                 self.dispose(
                     &ctx.device,
                     DeferredHandle::Image {
@@ -318,6 +317,8 @@ impl ResourcePools {
                 generation: 0,
                 layout: vk::ImageLayout::UNDEFINED,
                 pinned: false,
+                // No dispatch has written it, so it holds no guest work to lose.
+                gpu_only_content: false,
                 last_touch_ms: now,
             },
         );
@@ -377,11 +378,52 @@ impl ResourcePools {
             .filter_map(|identity| {
                 self.compute_storage_registry
                     .get(identity)
-                    .filter(|resident| !resident.pinned)
+                    .filter(|resident| !resident.pinned && !resident.gpu_only_content)
                     .map(|resident| (identity, resident.last_touch_ms))
             })
             .min_by_key(|(_, touch)| *touch)
             .map(|(identity, _)| *identity)
+    }
+
+    /// Drop the compute-storage resident under `identity` from both halves of
+    /// the registry, folding it out of the maintained totals, and hand the slot
+    /// back so the caller can dispose or recycle it.
+    ///
+    /// The one removal path, for the reason [`Self::unregister_resident`] is the
+    /// one on the sibling registry: the map and the order are a single structure
+    /// split for lookup and for order, and three call sites each doing their own
+    /// pair is how one of them comes to forget the totals. Removal is the only
+    /// way a sole-copy resident leaves — both reclaim paths refuse to select
+    /// one, so what arrives here carrying the flag is a re-key or a guest-side
+    /// delete.
+    pub(super) fn remove_compute_storage_resident(
+        &mut self,
+        identity: &ComputeStorageResidencyKey,
+    ) -> Option<ResidentStorageImageSlot> {
+        let old = self.compute_storage_registry.remove(identity);
+        self.compute_storage_order.retain(|entry| entry != identity);
+        let old = old?;
+        if old.gpu_only_content {
+            let bytes = Self::storage_slot_bytes(&old);
+            Self::fold_totals(&mut self.compute_storage_sole_copy, bytes, false);
+        }
+        Some(old)
+    }
+
+    /// Fold the current compute-storage sole-copy population into its high-water
+    /// band. Called at the top of the capacity walk — the one point every
+    /// admission passes — for the reason [`Self::note_registry_reach`] is.
+    fn note_compute_storage_reach(&mut self) {
+        self.compute_storage_sole_copy_peak = NonPinnedTotals {
+            count: self
+                .compute_storage_sole_copy_peak
+                .count
+                .max(self.compute_storage_sole_copy.count),
+            bytes: self
+                .compute_storage_sole_copy_peak
+                .bytes
+                .max(self.compute_storage_sole_copy.bytes),
+        };
     }
 
     /// Record that something read this resident, refreshing its reclaim stamp.
@@ -418,6 +460,69 @@ impl ResourcePools {
             resident.generation = generation;
             resident.layout = layout;
         }
+        // The dispatch just wrote this image, so nothing outside it holds the
+        // result yet.
+        self.set_compute_sole_copy(identity, true);
+    }
+
+    /// Set a compute-storage resident's
+    /// [`ResidentStorageImageSlot::gpu_only_content`] and keep the maintained
+    /// totals in step. The single writer of that field on a live slot, for the
+    /// reason [`Self::set_sole_copy`] is on the sibling registry.
+    fn set_compute_sole_copy(
+        &mut self,
+        identity: &ComputeStorageResidencyKey,
+        sole: bool,
+    ) -> bool {
+        let Some(resident) = self.compute_storage_registry.get_mut(identity) else {
+            return false;
+        };
+        if resident.gpu_only_content == sole {
+            return true;
+        }
+        resident.gpu_only_content = sole;
+        let bytes = Self::storage_slot_bytes(resident);
+        Self::fold_totals(&mut self.compute_storage_sole_copy, bytes, sole);
+        true
+    }
+
+    /// Level-0 bytes of a compute-storage resident's image.
+    ///
+    /// The same lower bound `slot_attachment_bytes` is on the sibling registry —
+    /// texel footprint from the decoded geometry, blind to tiling padding and
+    /// allocator rounding — and quoted for the same purpose, which is deciding
+    /// whether a bound is too loose. A lower bound is the safe direction there.
+    pub(super) fn storage_slot_bytes(resident: &ResidentStorageImageSlot) -> u64 {
+        let key = resident.slot.key;
+        u64::from(key.width) * u64::from(key.height) * key.format.bytes_per_texel() as u64
+    }
+
+    /// Record that a compute-storage resident's pixels have been copied out to
+    /// the host, so the reclaim paths may take it.
+    ///
+    /// Only for a readback that actually landed. Both unpin paths that abort —
+    /// `flush_storage_one`'s failure arm and `lifecycle`'s window-cleared arm —
+    /// leave the flag set, because nothing wrote anything.
+    pub(crate) fn note_compute_storage_copied_out(
+        &mut self,
+        identity: &ComputeStorageResidencyKey,
+    ) -> bool {
+        self.set_compute_sole_copy(identity, false)
+    }
+
+    /// Record that the guest deleted the object this resident's content belonged
+    /// to, so there is no longer any guest work here to protect.
+    ///
+    /// Distinct from [`Self::note_compute_storage_copied_out`] because the reason
+    /// is opposite — nothing was written anywhere, the content simply stopped
+    /// mattering — and because without it `retire_linear_residents` would unpin a
+    /// resident that the reclaim paths then refuse forever, turning a fix for a
+    /// pinned-VRAM leak into a sole-copy one.
+    pub(crate) fn note_compute_storage_content_retired(
+        &mut self,
+        identity: &ComputeStorageResidencyKey,
+    ) -> bool {
+        self.set_compute_sole_copy(identity, false)
     }
 
     /// Pin/unpin a resident against LRU eviction (deferred-writeback content

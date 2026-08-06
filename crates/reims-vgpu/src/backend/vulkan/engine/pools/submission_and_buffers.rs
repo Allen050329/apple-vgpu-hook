@@ -100,6 +100,9 @@ impl ResourcePools {
             registry_cap_evictions: 0,
             resident_resample_peak_ms: 0,
             compute_storage_cap_evictions: 0,
+            compute_storage_sole_copy: NonPinnedTotals::default(),
+            compute_storage_sole_copy_peak: NonPinnedTotals::default(),
+            compute_storage_cap_no_victim: 0,
             idle_clock_ms: 0,
             last_drain_ms: 0,
             settled_drain_passes: 0,
@@ -379,17 +382,22 @@ impl ResourcePools {
             .compute_storage_order
             .iter()
             .filter(|k| {
+                // `gpu_only_content` is dispatch output that exists nowhere but
+                // this image, and no age makes destroying one anything but a
+                // refused dispatch later — see
+                // `ResidentStorageImageSlot::gpu_only_content`.
                 self.compute_storage_registry
                     .get(*k)
-                    .is_some_and(|r| !r.pinned && r.last_touch_ms <= cutoff)
+                    .is_some_and(|r| {
+                        !r.pinned && !r.gpu_only_content && r.last_touch_ms <= cutoff
+                    })
             })
             .take(max)
             .copied()
             .collect();
         let mut taken = Vec::with_capacity(victims.len());
         for k in victims {
-            self.compute_storage_order.retain(|entry| entry != &k);
-            if let Some(resident) = self.compute_storage_registry.remove(&k) {
+            if let Some(resident) = self.remove_compute_storage_resident(&k) {
                 taken.push(resident.slot);
             }
         }
@@ -805,6 +813,17 @@ impl ResourcePools {
     /// populations, and a boot needs to know which one bit.
     pub(crate) fn compute_storage_cap_evictions(&self) -> u64 {
         self.compute_storage_cap_evictions
+    }
+
+    /// `(sole_copy_peak_slots, sole_copy_peak_bytes, cap_walks_with_no_victim)`
+    /// for the compute-storage registry — the sibling of
+    /// [`Self::registry_sole_copy_stats`] over the other population.
+    pub(crate) fn compute_storage_sole_copy_stats(&self) -> (u64, u64, u64) {
+        (
+            self.compute_storage_sole_copy_peak.count as u64,
+            self.compute_storage_sole_copy_peak.bytes,
+            self.compute_storage_cap_no_victim,
+        )
     }
 
     /// `VkDeviceMemory` the image slab holds right now, and the carved half of
@@ -2668,6 +2687,7 @@ mod recycle_tests {
                     generation: 0,
                     layout: vk::ImageLayout::UNDEFINED,
                     pinned,
+                    gpu_only_content: false,
                     last_touch_ms: touch,
                 },
             );
@@ -2713,6 +2733,150 @@ mod recycle_tests {
         assert_eq!(pools.take_aged_storage_residents(cutoff, 2).len(), 2);
     }
 
+    /// A compute-storage resident holding dispatch output nothing has copied out
+    /// is never aged out, however long it sits — and becomes reclaimable the
+    /// moment a readback lands.
+    ///
+    /// This is the produce-once/sample-many shape: a dispatch writes the image,
+    /// later chains only *read* it, and no deferred writeback is ever armed — so
+    /// `pinned` stays false for its whole life while the image is the only place
+    /// its content exists. Destroying it is not a re-upload here; the next
+    /// dispatch naming the identity refuses with `ResidentSampleAbsent`.
+    ///
+    /// Fails without the gate: the resident is taken on the first call.
+    #[test]
+    fn a_compute_resident_that_is_the_only_copy_of_its_output_is_never_aged_out() {
+        let mut pools = ResourcePools::new();
+        let id = admit_compute_resident(&mut pools, 1, 1_000, false);
+        // The dispatch wrote it. Nothing else holds the result.
+        pools.mark_resident_storage_image(&id, 7, vk::ImageLayout::GENERAL);
+
+        let cutoff = 10_000u64.saturating_sub(IDLE_TARGET_AGE_MS);
+        assert!(
+            pools.take_aged_storage_residents(cutoff, 4).is_empty(),
+            "aged past the cutoff and unpinned, but it is the only copy"
+        );
+        assert!(
+            pools.take_aged_storage_residents(cutoff * 10, 4).is_empty(),
+            "no age makes destroying the only copy anything but a refused dispatch"
+        );
+
+        // A readback lands and the same resident is reclaimable like any other.
+        assert!(pools.note_compute_storage_copied_out(&id));
+        assert_eq!(
+            pools.take_aged_storage_residents(cutoff, 4).len(),
+            1,
+            "with the output held elsewhere, reclaiming costs redundant work only"
+        );
+    }
+
+    /// The capacity walk's victim choice steps past a sole-copy resident, and
+    /// returns `None` rather than destroy one when nothing else is left.
+    ///
+    /// Fails without the gate: the first resident is returned as the victim.
+    #[test]
+    fn the_compute_capacity_walk_finds_no_victim_rather_than_destroy_the_only_copy() {
+        let mut pools = ResourcePools::new();
+        let a = admit_compute_resident(&mut pools, 1, 1_000, false);
+        let b = admit_compute_resident(&mut pools, 2, 2_000, false);
+        assert_eq!(
+            pools.compute_storage_eviction_victim(),
+            Some(a),
+            "least recently used, while both are re-servable"
+        );
+
+        pools.mark_resident_storage_image(&a, 1, vk::ImageLayout::GENERAL);
+        assert_eq!(
+            pools.compute_storage_eviction_victim(),
+            Some(b),
+            "the walk moves past the sole copy to the next-least-recently-used"
+        );
+
+        pools.mark_resident_storage_image(&b, 1, vk::ImageLayout::GENERAL);
+        assert_eq!(
+            pools.compute_storage_eviction_victim(),
+            None,
+            "nothing left that can be destroyed without refusing a later dispatch"
+        );
+    }
+
+    /// The maintained compute-storage sole-copy totals agree with a walk at
+    /// every transition, including the ones that move nothing and the removal
+    /// that is the only way such a resident leaves.
+    #[test]
+    fn the_maintained_compute_sole_copy_totals_track_the_walk() {
+        let mut pools = ResourcePools::new();
+        let check = |pools: &ResourcePools, what: &str| {
+            let walk = {
+                let sole = || {
+                    pools
+                        .compute_storage_registry
+                        .values()
+                        .filter(|r| r.gpu_only_content)
+                };
+                NonPinnedTotals {
+                    count: sole().count(),
+                    bytes: sole().map(ResourcePools::storage_slot_bytes).sum(),
+                }
+            };
+            assert_eq!(
+                pools.compute_storage_sole_copy, walk,
+                "maintained compute sole-copy totals disagree with the walk after {what}"
+            );
+        };
+        check(&pools, "construction");
+
+        let a = admit_compute_resident(&mut pools, 1, 0, false);
+        let b = admit_compute_resident(&mut pools, 2, 0, false);
+        check(&pools, "two admits");
+        assert_eq!(
+            pools.compute_storage_sole_copy.count, 0,
+            "a resident no dispatch has written holds no guest work"
+        );
+
+        pools.mark_resident_storage_image(&a, 1, vk::ImageLayout::GENERAL);
+        check(&pools, "a dispatch wrote the first");
+        assert_eq!(pools.compute_storage_sole_copy.count, 1);
+        // A second dispatch into the same resident is still one resident.
+        pools.mark_resident_storage_image(&a, 2, vk::ImageLayout::GENERAL);
+        check(&pools, "a second dispatch into the same resident");
+        assert_eq!(pools.compute_storage_sole_copy.count, 1);
+
+        pools.mark_resident_storage_image(&b, 1, vk::ImageLayout::GENERAL);
+        check(&pools, "a dispatch wrote the second");
+        assert_eq!(pools.compute_storage_sole_copy.count, 2);
+
+        assert!(pools.note_compute_storage_copied_out(&a));
+        check(&pools, "a landed readback");
+        assert_eq!(pools.compute_storage_sole_copy.count, 1);
+        assert!(pools.note_compute_storage_copied_out(&a));
+        check(&pools, "a redundant copy-out");
+        assert_eq!(pools.compute_storage_sole_copy.count, 1);
+
+        // The guest deleting the object is the other way the flag clears, and
+        // without it `retire_linear_residents` would strand the image.
+        assert!(pools.note_compute_storage_content_retired(&b));
+        check(&pools, "the guest retiring the object");
+        assert_eq!(pools.compute_storage_sole_copy.count, 0);
+
+        // Removal folds a still-sole-copy resident out — the re-key path.
+        pools.mark_resident_storage_image(&b, 3, vk::ImageLayout::GENERAL);
+        check(&pools, "the second written again");
+        assert_eq!(pools.compute_storage_sole_copy.count, 1);
+        assert!(pools.remove_compute_storage_resident(&b).is_some());
+        check(&pools, "removing a sole-copy resident");
+        assert_eq!(
+            pools.compute_storage_sole_copy,
+            NonPinnedTotals::default()
+        );
+
+        assert!(
+            !pools.note_compute_storage_copied_out(&b),
+            "an identity holding no resident reports the miss rather than inventing a subtraction"
+        );
+        check(&pools, "a copy-out for an absent identity");
+    }
+
     fn admit_compute_resident(
         pools: &mut ResourcePools,
         tex: u32,
@@ -2727,6 +2891,7 @@ mod recycle_tests {
                 generation: 0,
                 layout: vk::ImageLayout::UNDEFINED,
                 pinned,
+                gpu_only_content: false,
                 last_touch_ms: touch,
             },
         );
