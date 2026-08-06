@@ -761,6 +761,10 @@ fn an_unsupported_depth_attachment_is_named_not_just_dropped() {
         ok.depth_attach.is_some() && ok.stencil_attach.is_some(),
         "a level-0 depth attachment with no resolve is honoured"
     );
+    assert!(
+        ok.bind_snapshot().is_ok(),
+        "a pass this device can bind whole refuses nothing"
+    );
 
     for (level, resolve) in [(1u16, 0u32), (0, 99)] {
         let acc = run(&pass(level, resolve));
@@ -771,6 +775,22 @@ fn an_unsupported_depth_attachment_is_named_not_just_dropped() {
         assert!(
             acc.stencil_attach.is_some(),
             "refusing depth must not take the stencil attachment with it"
+        );
+        // Leaving the attachment out is not enough on its own. A pass that
+        // then *runs* has depth testing off for every draw in it, so the near
+        // geometry stops occluding the far and the colour target — which was
+        // correct before the pass — is overwritten with a picture assembled in
+        // the wrong order. A pass with no depth attachment is also exactly what
+        // a guest that wanted none produces, so nothing downstream can tell.
+        assert!(
+            matches!(
+                acc.bind_snapshot(),
+                Err(StreamRefusal::Pass(
+                    StreamDrawDrop::DepthStencilUnsupported { .. }
+                ))
+            ),
+            "level={level} resolve={resolve}: dropping the attachment must \
+             also refuse the draws that would run without it"
         );
     }
 
@@ -830,18 +850,27 @@ fn an_unsupported_depth_attachment_is_named_not_just_dropped() {
     );
 }
 
-/// A colour attachment naming a mip, a slice or a depth plane says so.
+/// A colour attachment naming a mip, a slice or a depth plane refuses the
+/// stream's draws.
 ///
-/// Every consumer binds the texture whole, so the pass renders into level 0
-/// slice 0 plane 0 regardless — a guest drawing a cube face overwrites face
-/// 0. Nothing downstream can tell that happened, which is why the report is
-/// here and not in a backend.
+/// Every consumer binds the texture whole, so a pass this device ran would go
+/// into level 0 slice 0 plane 0 regardless — a guest drawing a cube face
+/// overwrites face 0, and a guest drawing a mip overwrites the image every
+/// other level is sampled from. Nothing downstream can tell that happened,
+/// because a pass into the base level is exactly what a guest that asked for
+/// the base level also produces.
+///
+/// This used to assert the opposite, on the argument that "the pass still runs
+/// -- reporting must not cost the guest its draw". That argument does not
+/// survive asking *whose* pixels: the guest does not lose a draw and get a
+/// blurry one, it loses a **different subresource** that was correct before the
+/// pass and that the pass never named as its target.
 ///
 /// The `slice` and `depth_plane` arms are the ones that could not have been
 /// written before: those fields did not exist, because the decoder read
 /// `level` thirty-two bits wide and swallowed the slice into it.
 #[test]
-fn a_colour_attachment_naming_a_subresource_this_device_cannot_bind_says_so() {
+fn a_colour_attachment_naming_a_subresource_this_device_cannot_bind_refuses_the_draws() {
     use crate::contract::endian::st32;
     use crate::runtime::decode::render::{
         PASS_ATTACH_DEPTH_PLANE, PASS_ATTACH_LEVEL, PASS_ATTACH_SLICE, PASS_ATTACH_TEXREF,
@@ -880,21 +909,35 @@ fn a_colour_attachment_naming_a_subresource_this_device_cannot_bind_says_so() {
         acc
     };
 
-    // Subresource 0/0/0 is what this device binds, so it reports nothing.
+    // Subresource 0/0/0 is what this device binds, so it reports nothing and
+    // the stream stays representable.
     let acc = run(&pass(0, 0, 0));
     assert_eq!(
         acc.color_slots.len(),
         1,
         "the plain attachment still reaches the slot list"
     );
+    assert!(
+        acc.bind_snapshot().is_ok(),
+        "the base subresource is what this device binds; nothing is refused"
+    );
 
     for (level, slice, plane) in [(3u16, 0u16, 0u16), (0, 5, 0), (0, 0, 2)] {
         let acc = run(&pass(level, slice, plane));
-        assert_eq!(
-            acc.color_slots.len(),
-            1,
-            "level={level} slice={slice} plane={plane}: the pass still runs -- \
-             reporting must not cost the guest its draw"
+        // The attachment still reaches the slot list, because the refusal is
+        // the stream's and not the attachment's: what is refused is encoding
+        // draws against a target this device would bind at the wrong place.
+        assert_eq!(acc.color_slots.len(), 1);
+        assert!(
+            matches!(
+                acc.bind_snapshot(),
+                Err(StreamRefusal::Pass(
+                    StreamDrawDrop::ColorSubresourceUnsupported { .. }
+                ))
+            ),
+            "level={level} slice={slice} plane={plane}: a pass this device \
+             would render into the base of must refuse its draws rather than \
+             overwrite a subresource the guest did not name"
         );
     }
 
@@ -1398,7 +1441,7 @@ fn a_bind_after_a_draw_does_not_rewrite_that_draws_snapshot() {
         BindTables {
             vertex: &mut acc.vertex_buffers,
             fragment: &mut acc.fragment_buffers,
-            refused: &mut acc.refused_bind,
+            refused: &mut acc.unrepresentable,
         },
         |b| b.index,
         |index, (buffer_ref, offset)| {
@@ -3637,14 +3680,17 @@ fn a_bind_past_the_table_refuses_the_draws_that_would_read_it() {
         handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
     }
 
-    let over = acc
-        .refused_bind
-        .expect("the walk recorded the bind it could not hold");
+    let StreamRefusal::Bind(over) = acc
+        .unrepresentable
+        .expect("the walk recorded the bind it could not hold")
+    else {
+        panic!("a bind past the table is not a pass refusal");
+    };
     assert_eq!(over.index, FIRST);
     assert!(matches!(over.class, BindClass::Buffer));
     assert!(acc.bind_snapshot().is_err());
 
-    let before = store_route_count("render_draw_refused_bind_past_table");
+    let before = store_route_count("render_draw_refused_unrepresentable");
     draw(&mut acc);
     assert_eq!(
         acc.draws.len(),
@@ -3652,7 +3698,7 @@ fn a_bind_past_the_table_refuses_the_draws_that_would_read_it() {
         "the draw after the refused bind is not recorded"
     );
     assert_eq!(
-        store_route_count("render_draw_refused_bind_past_table"),
+        store_route_count("render_draw_refused_unrepresentable"),
         before + 1,
         "and the refusal is counted"
     );

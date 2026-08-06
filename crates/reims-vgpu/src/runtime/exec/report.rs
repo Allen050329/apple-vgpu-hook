@@ -263,29 +263,24 @@ pub(super) fn note_indexed_draw_without_buffer(task_id: u32, opcode: u32, index_
 /// otherwise emit on every pass in every stream. One line per distinct
 /// (aspect, level, resolve-present) combination is what answers the question
 /// the arm exists to answer — whether any guest asks for this at all.
+/// Returns the drop it reported, so the caller can refuse the stream's draws
+/// with it rather than rebuilding the same arm from the same fields.
 pub(super) fn note_depth_stencil_unsupported(
     task_id: u32,
     aspect: &'static str,
     s: &AttachSubresource,
-) {
-    crate::observe::Emit::decline(
-        "stream_pass",
-        &StreamDrawDrop::DepthStencilUnsupported {
-            aspect,
-            level: s.level,
-            slice: s.slice,
-            depth_plane: s.depth_plane,
-            resolve_texture_ref: s.resolve_texture_ref,
-        },
-    )
-    .field("task", task_id)
-    .fail_once(
-        u64::from(s.level) << 32
-            | u64::from(s.slice) << 16
-            | u64::from(s.depth_plane) << 8
-            | u64::from(s.resolve_texture_ref != 0) << 1
-            | u64::from(aspect == "stencil"),
-    );
+) -> StreamDrawDrop {
+    let drop = StreamDrawDrop::DepthStencilUnsupported {
+        aspect,
+        level: s.level,
+        slice: s.slice,
+        depth_plane: s.depth_plane,
+        resolve_texture_ref: s.resolve_texture_ref,
+    };
+    crate::observe::Emit::decline("stream_pass", &drop)
+        .field("task", task_id)
+        .fail_once(drop.latch());
+    drop
 }
 
 /// Bands for the stated pass extent as a fraction of its attachment's area.
@@ -447,29 +442,25 @@ pub(super) fn note_pass_target_extent() {
 /// Deduped on the three coordinates and the slot rather than on the texture,
 /// because the question is which *shape* of subresource a guest asks for, not
 /// how many textures it asks for it on.
+/// Returns the drop it reported, so the caller can refuse the stream's draws
+/// with it rather than rebuilding the same arm from the same fields.
 pub(super) fn note_color_subresource_unsupported(
     task_id: u32,
     slot: u32,
     att: &crate::runtime::decode::render::ColorAttachment,
-) {
+) -> StreamDrawDrop {
     crate::runtime::drain::note_store_route("render_color_subresource_unsupported");
-    crate::observe::Emit::decline(
-        "stream_pass",
-        &StreamDrawDrop::ColorSubresourceUnsupported {
-            slot,
-            level: att.level,
-            slice: att.slice,
-            depth_plane: att.depth_plane,
-        },
-    )
-    .field("task", task_id)
-    .field("texture", att.texture_ref)
-    .fail_once(
-        u64::from(slot) << 48
-            | u64::from(att.level) << 32
-            | u64::from(att.slice) << 16
-            | u64::from(att.depth_plane),
-    );
+    let drop = StreamDrawDrop::ColorSubresourceUnsupported {
+        slot,
+        level: att.level,
+        slice: att.slice,
+        depth_plane: att.depth_plane,
+    };
+    crate::observe::Emit::decline("stream_pass", &drop)
+        .field("task", task_id)
+        .field("texture", att.texture_ref)
+        .fail_once(drop.latch());
+    drop
 }
 
 /// Report what this stream's draw list cost, and anything it lost building it.

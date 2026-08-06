@@ -140,54 +140,45 @@ struct StreamAccum {
     /// Draw records this stream decoded but did not keep. See
     /// [`StreamDrawDrop`]; reported once per stream by [`note_stream_draw_drops`].
     dropped_unbound: u32,
-    /// A bind this stream's tables could not hold, and so do not carry.
+    /// Something the guest asked this stream for that its state cannot carry.
     ///
-    /// [`apply_binds`] stops a record's walk at the first slot past its class's
-    /// argument table — forced, there is no slot to put it in — and that used to
-    /// be the whole of it: the walk broke, the six tables kept the state they
-    /// could represent, and every later draw in the stream ran against it. The
-    /// guest was never told, and nothing downstream could tell it: a fragment
-    /// shader that does not sample the missing texture is indistinguishable from
-    /// one whose bind landed, so the frame comes back looking finished and is
-    /// wrong.
-    ///
-    /// [`crate::runtime::draw::first_bind_past_table`] cannot catch that. It
-    /// reads the six tables of a built request, and this bind is precisely the
-    /// one that never entered them — which is why that check calls itself a
-    /// backstop and why the refusal has to be recorded here instead.
+    /// Every arm that sets this used to note its loss and carry on, and all of
+    /// them cost the same thing: the pass ran, the guest was told nothing, and
+    /// the pixels are not the ones it asked for. See [`StreamRefusal`] for what
+    /// each arm loses and why none of them can be told apart downstream.
     ///
     /// Recording it lets [`StreamAccum::bind_snapshot`] refuse. That is the
-    /// funnel both consumers of the stream's bind state pass through — a decoded
-    /// draw and an end-of-stream ICB execute — which is why the refusal lives
-    /// there and not in either backend's encoder.
+    /// funnel both consumers of the stream's state pass through — a decoded draw
+    /// and an end-of-stream ICB execute — which is why the refusal lives there
+    /// and not in either backend's encoder.
     ///
     /// **Sticky, and it cannot go stale.** There is no retirement path and none
-    /// is needed: this field describes the six bind tables beside it, a
+    /// is needed: this field describes the accumulator beside it, a
     /// `StreamAccum` is built fresh per stream and dropped at [`finish_stream`],
     /// so the refusal and the state it describes have exactly the same life. The
     /// compute rail's equivalent needs a `clear_refusal_at` because a
-    /// `ComputeAccum` outlives many dispatches; a render pass's bind state does
-    /// not outlive the pass.
-    refused_bind: Option<BindSlotPastTable>,
+    /// `ComputeAccum` outlives many dispatches; a render pass's state does not
+    /// outlive the pass.
+    unrepresentable: Option<StreamRefusal>,
 }
 
 impl StreamAccum {
-    /// The stream's bind state as a `PendingDraw`, or the bind that makes it
+    /// The stream's bind state as a `PendingDraw`, or what makes it
     /// unrepresentable.
     ///
     /// Two things need it and must not disagree: a decoded draw, which fills
     /// in `pipeline_ref` and `draw` on top, and an ICB execute, which inherits
     /// the state as it stands at end of stream and supplies neither. Both must
     /// also refuse on the same terms, which is why the check is here rather than
-    /// at either of them: a snapshot of tables that are missing a bind the guest
-    /// asked for is not this stream's state, and a draw encoded from it computes
-    /// the wrong pixels with nothing to say so.
+    /// at either of them: a snapshot of state that is missing something the
+    /// guest asked for is not this stream's state, and a draw encoded from it
+    /// computes the wrong pixels with nothing to say so.
     ///
-    /// Draws recorded *before* the refused bind are untouched. They snapshotted
-    /// tables that were still complete, so they are the guest's own work and
-    /// they stand; only the ones that would read the gap are refused.
-    fn bind_snapshot(&self) -> Result<PendingDraw, BindSlotPastTable> {
-        if let Some(refused) = self.refused_bind {
+    /// Draws recorded *before* the refusal are untouched. They snapshotted state
+    /// that was still complete, so they are the guest's own work and they stand;
+    /// only the ones that would read the gap are refused.
+    fn bind_snapshot(&self) -> Result<PendingDraw, StreamRefusal> {
+        if let Some(refused) = self.unrepresentable {
             return Err(refused);
         }
         Ok(PendingDraw {
@@ -313,6 +304,54 @@ impl crate::observe::Decline for StreamDrawDrop {
                 ("slice", slice.to_string()),
                 ("plane", depth_plane.to_string()),
             ],
+        }
+    }
+}
+
+impl StreamDrawDrop {
+    /// The `fail_once` latch for this drop.
+    ///
+    /// Keyed on the fields that decide the arm and not on the task or the
+    /// texture, because the question every one of these answers is which
+    /// *shape* a guest asks for, not how many objects it asks for it on. A
+    /// per-task latch would emit on every pass in every stream of a guest that
+    /// uses mip-1 depth throughout.
+    ///
+    /// One definition for three emitters. The two pass arms had a copy each at
+    /// their own emitter and [`note_draw_refused`] would have been the third —
+    /// which is exactly where a latch quietly stops matching its sibling and
+    /// one of them starts emitting per pass.
+    ///
+    /// [`Self::Unbound`] carries the stream's own count and is reported once per
+    /// stream rather than latched, so its latch is the count: a stream that
+    /// dropped a different number of draws is a different reading.
+    pub(super) fn latch(self) -> u64 {
+        match self {
+            Self::Unbound { dropped } => u64::from(dropped),
+            Self::DepthStencilUnsupported {
+                aspect,
+                level,
+                slice,
+                depth_plane,
+                resolve_texture_ref,
+            } => {
+                u64::from(level) << 32
+                    | u64::from(slice) << 16
+                    | u64::from(depth_plane) << 8
+                    | u64::from(resolve_texture_ref != 0) << 1
+                    | u64::from(aspect == "stencil")
+            }
+            Self::ColorSubresourceUnsupported {
+                slot,
+                level,
+                slice,
+                depth_plane,
+            } => {
+                u64::from(slot) << 48
+                    | u64::from(level) << 32
+                    | u64::from(slice) << 16
+                    | u64::from(depth_plane)
+            }
         }
     }
 }
@@ -1384,7 +1423,7 @@ fn handle_render_record<M: HostMemory + HostOps>(
                 BindTables {
                     vertex: &mut acc.vertex_buffers,
                     fragment: &mut acc.fragment_buffers,
-                    refused: &mut acc.refused_bind,
+                    refused: &mut acc.unrepresentable,
                 },
                 |b| b.index,
                 |index, (buffer_ref, offset)| {
@@ -1448,7 +1487,7 @@ fn handle_render_record<M: HostMemory + HostOps>(
                 BindTables {
                     vertex: &mut acc.vertex_textures,
                     fragment: &mut acc.fragment_textures,
-                    refused: &mut acc.refused_bind,
+                    refused: &mut acc.unrepresentable,
                 },
                 |b| b.index,
                 |index, texture_ref| {
@@ -1495,7 +1534,7 @@ fn handle_render_record<M: HostMemory + HostOps>(
                 BindTables {
                     vertex: &mut acc.vertex_samplers,
                     fragment: &mut acc.fragment_samplers,
-                    refused: &mut acc.refused_bind,
+                    refused: &mut acc.unrepresentable,
                 },
                 |b| b.index,
                 |index, sampler_ref| {
@@ -1584,12 +1623,23 @@ fn handle_render_record<M: HostMemory + HostOps>(
             // Full multi-attachment: re-decode all color slots from payload.
             if cmd_bytes.len() >= 8 {
                 let payload = &cmd_bytes[8..];
+                // A depth or stencil attachment this device cannot bind used to
+                // be left out and the pass run without it, which turns depth
+                // testing off for every draw in it: the near geometry stops
+                // occluding the far, and the colour target — which was correct
+                // before the pass — is overwritten with a picture assembled in
+                // the wrong order. That is not a degraded frame, it is wrong
+                // content written over right content, and nothing downstream can
+                // tell because a pass with no depth attachment is exactly what a
+                // guest that wanted none also produces.
                 let depth = decode_depth_attachment(payload);
                 if depth.texture_ref != 0 {
                     if depth_stencil_is_bindable(depth.into()) {
                         acc.depth_attach = Some(depth);
                     } else {
-                        note_depth_stencil_unsupported(task_id, "depth", &depth.into());
+                        let drop = note_depth_stencil_unsupported(task_id, "depth", &depth.into());
+                        acc.unrepresentable
+                            .get_or_insert(StreamRefusal::Pass(drop));
                     }
                 }
                 let stencil = decode_stencil_attachment(payload);
@@ -1597,7 +1647,10 @@ fn handle_render_record<M: HostMemory + HostOps>(
                     if depth_stencil_is_bindable(stencil.into()) {
                         acc.stencil_attach = Some(stencil);
                     } else {
-                        note_depth_stencil_unsupported(task_id, "stencil", &stencil.into());
+                        let drop =
+                            note_depth_stencil_unsupported(task_id, "stencil", &stencil.into());
+                        acc.unrepresentable
+                            .get_or_insert(StreamRefusal::Pass(drop));
                     }
                 }
                 for i in 0..PASS_MAX_COLOR_ATTACHMENTS {
@@ -1608,13 +1661,28 @@ fn handle_render_record<M: HostMemory + HostOps>(
                     let slot = i as u32;
                     // Every consumer of a colour attachment binds the texture
                     // whole, so a subresource the guest named is rendered past
-                    // rather than into. Reported and then rendered anyway: the
-                    // pass carries real guest work and dropping it would trade
-                    // wrong pixels for none, which is worse. The count is what
-                    // decides whether a subresource-aware bind is worth
-                    // building.
+                    // rather than into. This used to be reported and then
+                    // rendered anyway, on the argument that dropping the pass
+                    // "would trade wrong pixels for none, which is worse". That
+                    // argument does not survive asking *whose* pixels: the pass
+                    // does not land in the guest's mip 3 and come out blurry, it
+                    // lands in **base level 0 of the same texture**, overwriting
+                    // the image the guest is sampling at LOD 0 and every other
+                    // level's source. A cube face becomes face 0 every time.
+                    // That is wrong content written over right content, which is
+                    // worse than none — and unlike none it also corrupts a
+                    // resource the guest did not name in this pass.
+                    //
+                    // Refusing costs a measured zero: `render_color_subresource_
+                    // unsupported` and the sibling `render_pass_array_length_
+                    // dropped` are absent from every driven boot recorded here,
+                    // while `render_pass_target_extent_unapplied` — decoded from
+                    // the same record — fires in the thousands, so the fields are
+                    // being read and are genuinely zero rather than unreached.
                     if att.level != 0 || att.slice != 0 || att.depth_plane != 0 {
-                        note_color_subresource_unsupported(task_id, slot, &att);
+                        let drop = note_color_subresource_unsupported(task_id, slot, &att);
+                        acc.unrepresentable
+                            .get_or_insert(StreamRefusal::Pass(drop));
                     }
                     if !acc
                         .color_slots
@@ -1745,7 +1813,7 @@ fn handle_render_record<M: HostMemory + HostOps>(
                         },
                         ..snapshot
                     }),
-                    Err(over) => note_draw_refused_past_table(over, acc.pipeline_ref, "draw"),
+                    Err(over) => note_draw_refused(over, acc.pipeline_ref, "draw"),
                 }
             }
         }
@@ -2238,26 +2306,45 @@ impl crate::observe::Decline for BindSlotPastTable {
     }
 }
 
-/// Report a draw refused because the stream's bind tables are missing a slot.
+/// Report a draw refused because the stream's state is missing something the
+/// guest asked for.
 ///
-/// The same [`BindSlotPastTable`] the walk already emitted, re-emitted under a
-/// different tag: the walk's line says a bind was lost, this one says what the
-/// loss then cost, and the two share a slug on purpose so one grep finds both
-/// halves of one event.
+/// The same decline the decode already emitted, re-emitted under a different
+/// tag: the first line says what was lost, this one says what the loss then
+/// cost, and the two share a slug on purpose so one grep finds both halves of
+/// one event.
 ///
-/// Latched per refused slot, not per draw. A stream that binds past the table
-/// once refuses every draw after it, and the second line carries nothing the
-/// first did not; `render_draw_refused_bind_past_table` is the magnitude.
+/// Latched per refusal, not per draw. A stream refuses once and then refuses
+/// every draw after it, and the second line carries nothing the first did not;
+/// `render_draw_refused_unrepresentable` is the magnitude.
 ///
-/// `site` separates the two consumers of the stream's bind state, because what
-/// the guest loses differs: a decoded draw loses one draw, and an ICB execute
-/// loses whatever the command buffer held.
-fn note_draw_refused_past_table(over: BindSlotPastTable, pipeline_ref: u32, site: &'static str) {
-    crate::runtime::drain::note_store_route("render_draw_refused_bind_past_table");
-    crate::observe::Emit::decline("render_draw", &over)
-        .field("site", site)
+/// `site` separates the two consumers of the stream's state, because what the
+/// guest loses differs: a decoded draw loses one draw, and an ICB execute loses
+/// whatever the command buffer held.
+fn note_draw_refused(refusal: StreamRefusal, pipeline_ref: u32, site: &'static str) {
+    crate::runtime::drain::note_store_route("render_draw_refused_unrepresentable");
+    let emit = match refusal {
+        StreamRefusal::Bind(over) => crate::observe::Emit::decline("render_draw", &over),
+        StreamRefusal::Pass(drop) => crate::observe::Emit::decline("render_draw", &drop),
+    };
+    emit.field("site", site)
         .field("pipeline_ref", pipeline_ref)
-        .fail_once((u64::from(over.stage as u32) << 32) | u64::from(over.index));
+        .fail_once(refusal.latch());
+}
+
+impl StreamRefusal {
+    /// The `fail_once` latch for this refusal.
+    ///
+    /// Distinct per *condition* rather than per stream, so a guest that binds
+    /// past the table on every frame gets one line and a guest that then also
+    /// names a mip gets a second. The two arms cannot collide: the pass arm sets
+    /// the top bit, which the bind arm's `(stage, index)` pair cannot reach.
+    fn latch(self) -> u64 {
+        match self {
+            Self::Bind(over) => (u64::from(over.stage as u32) << 32) | u64::from(over.index),
+            Self::Pass(drop) => 1 << 63 | drop.latch(),
+        }
+    }
 }
 
 // The three relations that make each `*_bind_slot_past_table` slug readable in a
@@ -2307,6 +2394,44 @@ struct BindTarget {
     class: BindClass,
 }
 
+/// Why one stream's state cannot be encoded as the guest described it.
+///
+/// The three arms are decoded at three different points and none of them can be
+/// noticed downstream, which is what they have in common and why they share one
+/// field. A shader that does not sample the missing texture, a pass that draws
+/// into the base level of the texture it was given, a pass with no depth
+/// attachment — each is byte-for-byte indistinguishable from the state the guest
+/// asked for, right up until the pixels are wrong.
+///
+/// Each arm used to note its loss and let the pass run. What that bought, in
+/// every case, was **wrong content written over content that was right**: the
+/// subresource arm overwrites base level 0 of a texture whose mip the guest
+/// named, and the depth arm draws with occlusion turned off into a colour target
+/// that was correct before. Refusing leaves the guest's own bytes where they
+/// are, which is the answer a GPU gives and the answer that can be seen in a
+/// log.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StreamRefusal {
+    /// A bind slot past its class's argument table.
+    ///
+    /// [`apply_binds`] stops a record's walk there — forced, there is no slot to
+    /// put it in — and the six tables then carry state the guest did not ask
+    /// for.
+    ///
+    /// [`crate::runtime::draw::first_bind_past_table`] cannot catch this. It
+    /// reads the six tables of a *built request*, and this bind is precisely the
+    /// one that never entered them, which is why that check calls itself a
+    /// backstop and why the refusal has to be recorded here instead.
+    Bind(BindSlotPastTable),
+    /// A pass attachment this device would have bound past: a colour
+    /// subresource it renders into the base of, or a depth/stencil form it
+    /// leaves out of the pass entirely.
+    ///
+    /// Carried as the [`StreamDrawDrop`] arm that decoded it, so the refusal
+    /// line names the same fields the pass census already reports.
+    Pass(StreamDrawDrop),
+}
+
 /// The [`StreamAccum`] state one bind record writes: the two stage tables a
 /// slot may land in, and the place a slot that lands in neither is recorded.
 ///
@@ -2317,9 +2442,9 @@ struct BindTables<'a, B> {
     vertex: &'a mut BindTable<B>,
     fragment: &'a mut BindTable<B>,
     /// Where [`apply_binds`] leaves a slot past [`BindClass::table`]. See
-    /// [`StreamAccum::refused_bind`] for why it is recorded rather than only
+    /// [`StreamAccum::unrepresentable`] for why it is recorded rather than only
     /// counted.
-    refused: &'a mut Option<BindSlotPastTable>,
+    refused: &'a mut Option<StreamRefusal>,
 }
 
 /// Apply one `Set{Buffer,Texture,Sampler}` record to a stage's bind table.
@@ -2419,9 +2544,9 @@ fn apply_binds<T: Copy, B: Clone>(
             // The walk cannot refuse anything — a bind record has no draw to
             // refuse — so it records, and [`StreamAccum::bind_snapshot`] refuses
             // every draw that would have read the gap. The first one is kept
-            // rather than the last: it is the bind whose absence the earliest
-            // later draw would read, and the rest are the same record.
-            refused.get_or_insert(over);
+            // rather than the last: it is the refusal the earliest later draw
+            // would read, and the rest are the same record.
+            refused.get_or_insert(StreamRefusal::Bind(over));
             break;
         }
         let bind = make(index, entry);
@@ -2559,7 +2684,7 @@ fn finish_stream<M: HostMemory + HostOps>(
             let inherited = acc.bind_snapshot();
             if let Err(over) = inherited {
                 out.render_icb_fail += 1;
-                note_draw_refused_past_table(over, pipeline, "icb_execute");
+                note_draw_refused(over, pipeline, "icb_execute");
             } else if let (Some(mut req), Ok(snapshot)) = (req, inherited) {
                 if let Some(pd) = acc.draws.last() {
                     fill_draw_binds_from_pending(&mut req, pd);

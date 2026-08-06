@@ -699,12 +699,18 @@ const ROWS: &[Row] = &[
         file: "crates/reims-vgpu/src/runtime/exec/mod.rs",
         ty: "StreamDrawDrop",
         loss: Loss::ExecutedModified,
-        why: "a depth or stencil attachment that cannot be bound is left out \
-              and the pass renders without it; an unsupported colour \
-              subresource is noted and the attachment added anyway, so the pass \
-              draws to the wrong level or slice. The `Unbound` arm is not this \
-              — it keeps the draw out of `acc.draws` entirely. Retired by \
-              refusing the draw on the two arms that continue",
+        why: "the two arms that used to continue no longer do: a dropped \
+              depth/stencil attachment and an unbindable colour subresource \
+              both now set `StreamAccum::unrepresentable`, and `bind_snapshot` \
+              refuses the stream's draws rather than running the pass without \
+              depth or into the base level. What is left is the `Unbound` arm, \
+              which keeps the draw out of `acc.draws` entirely — a refusal \
+              where the record is a guest's own pipeline-less draw, and a lost \
+              draw where it is a `SetPipeline` this decoder failed to latch. \
+              The verdict is the second reading, because nothing here proves it \
+              is the first. Retired by proving every `SetPipeline` wire form \
+              reaches the latch, after which a zero `pipeline_ref` at a draw is \
+              the guest's own record",
     },
     Row {
         file: "crates/reims-vgpu/src/runtime/exec/mod.rs",
