@@ -1517,6 +1517,12 @@ impl ResourcePools {
             slot.last_touch_ms = touch;
             slot.use_seq = seq;
             crate::runtime::drain::note_store_route(resident_resample_band(idle_ms));
+            // The bands give the distribution; this gives the margin. They
+            // answer different questions, and the bands alone could not say
+            // whether their one sample above the half mark sat at 1.0 s or at
+            // 1.9 s against a 2 s cutoff — which is the difference between
+            // comfortable and one slow frame from a permanent loss.
+            self.resident_resample_peak_ms = self.resident_resample_peak_ms.max(idle_ms);
         }
     }
 }
@@ -1921,6 +1927,46 @@ mod pin_count_tests {
                 "idle_ms={idle} against cutoff={c}"
             );
         }
+    }
+
+    /// The resample peak is the worst gap the boot ever saw, not the last one.
+    ///
+    /// A high-water, so a large gap early is not erased by a run of small ones
+    /// after it — which is the whole reason it is not a windowed reading. The
+    /// margin question is "how close did this boot ever come to
+    /// `IDLE_TARGET_AGE_MS`", and a gap that peaks between two census samples is
+    /// exactly what an instantaneous value misses.
+    ///
+    /// Fails without the fix: nothing records the gap at all.
+    #[test]
+    fn the_resample_peak_holds_the_worst_gap_not_the_latest() {
+        let mut pools = ResourcePools::new();
+        admit(&mut pools, surf(1), 0, 0);
+        assert_eq!(pools.resident_resample_peak_ms(), 0);
+
+        // A 900 ms gap, then a 100 ms one. The peak must keep the 900.
+        pools.idle_clock_ms = 900;
+        pools.registry_note_sampled_use(&surf(1));
+        assert_eq!(pools.resident_resample_peak_ms(), 900);
+        pools.idle_clock_ms = 1_000;
+        pools.registry_note_sampled_use(&surf(1));
+        assert_eq!(
+            pools.resident_resample_peak_ms(),
+            900,
+            "a smaller later gap must not lower the high-water"
+        );
+
+        // And a larger one does raise it.
+        pools.idle_clock_ms = 1_000 + IDLE_TARGET_AGE_MS;
+        pools.registry_note_sampled_use(&surf(1));
+        assert_eq!(pools.resident_resample_peak_ms(), IDLE_TARGET_AGE_MS);
+
+        // A read of an identity the registry does not hold records nothing —
+        // there is no gap to measure, and counting it as one would report a
+        // margin that no resident ever spent.
+        pools.idle_clock_ms = u64::MAX;
+        pools.registry_note_sampled_use(&surf(99));
+        assert_eq!(pools.resident_resample_peak_ms(), IDLE_TARGET_AGE_MS);
     }
 
     /// A resident that a draw only ever *samples* survives the idle drain.

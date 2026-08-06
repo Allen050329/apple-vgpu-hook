@@ -390,6 +390,19 @@ engine_counters! {
         /// it: the two registries are bounded by different constants over
         /// different populations, and a boot needs to know which one bit.
         compute_storage_cap_evictions,
+        /// Worst gap, in milliseconds, between a resident being touched and
+        /// being read again — the margin against `IDLE_TARGET_AGE_MS`, the age
+        /// at which the idle drain destroys a resident terminally.
+        ///
+        /// Cumulative high-water, like `registry_non_pinned_peak` and for the
+        /// same reason: the question is how close this boot ever came, and a gap
+        /// that peaks between two census samples is what an instantaneous
+        /// reading misses.
+        ///
+        /// Read beside the `resident_resample_*` bands, which give the shape of
+        /// the distribution this is the tail of. The bands alone could not tell
+        /// a worst case of 1.0 s from one of 1.9 s against a 2 s cutoff.
+        resident_resample_peak_ms,
         /// The same high-water in attachment bytes, sampled from the same
         /// population at the same instant as `registry_non_pinned_peak`.
         ///

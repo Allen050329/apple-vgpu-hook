@@ -263,6 +263,21 @@ pub(crate) struct ResourcePools {
     /// atomic to pay for. `engine::counter_snapshot` merges them in.
     registry_non_pinned_peak: u64,
     registry_cap_evictions: u64,
+    /// Longest a resident had gone untouched before something read it, in
+    /// milliseconds of the idle clock, for the life of the pools.
+    ///
+    /// The margin against `IDLE_TARGET_AGE_MS`, which is the age at which the
+    /// drain destroys a resident terminally. `resident_resample_band`'s bands
+    /// give the distribution and this gives the worst case; the bands could not
+    /// distinguish their one over-half-cutoff sample sitting at 1.0 s from
+    /// sitting at 1.9 s, and those are opposite answers to whether this cutoff
+    /// has room.
+    ///
+    /// A high-water rather than a windowed value for the same reason
+    /// `registry_non_pinned_peak` is: the question is "how close did this boot
+    /// ever come", and a gap that peaks between two census samples is exactly
+    /// what an instantaneous reading misses.
+    resident_resample_peak_ms: u64,
     /// Residents `COMPUTE_STORAGE_REGISTRY_CAP` destroyed.
     ///
     /// The sibling count for the compute-storage registry, and it existed
@@ -1129,7 +1144,48 @@ pub(crate) const REGISTRY_CAP: usize = 320;
 /// static page — measured at zero publishes per second — so a burst's ~260 stale
 /// residents (~516 MiB) never aged out and VRAM never returned to the ~1005 MiB
 /// idle baseline. Real time keeps advancing regardless of guest activity.
-const IDLE_TARGET_AGE_MS: u64 = 2000;
+///
+/// # This value has 20 % margin on a routine workload, and that is measured
+///
+/// Reclaim here is terminal — `retire_resident` writes nothing back and nothing
+/// recreates a resident's content — so a resident aged out and then sampled
+/// refuses permanently. What keeps that from happening is that reading a
+/// resident touches it, which only works while the gap *between* reads stays
+/// under this value. Nothing reported that gap until
+/// `resident_resample_peak_ms` did.
+///
+/// Driven x86/PCI, `web-content-probe --churn 1`:
+///
+/// ```text
+///   registry_pressure ... resample_peak_ms=1609/2000
+/// ```
+///
+/// **1609 ms of a 2000 ms budget.** Not a contrived workload — a web page
+/// loading and churning. The distribution is not the reassuring part either:
+/// ~25 000 resamples land under 250 ms and then a handful jump straight to the
+/// top band, so the tail is not a gentle slope this value sits far above. It is
+/// a rare long gap that came within 391 ms of destroying a resident something
+/// was about to read.
+///
+/// Two things follow, and neither is "make the number bigger":
+///
+/// - A zero `sampled_resident_missing` on this workload is a near miss, not
+///   headroom. The margin is ~20 %, and a slower host, a heavier page or a
+///   contended machine eats that — every `us=` number this device reports is
+///   wall clock on a shared machine, and this cutoff is measured in the same
+///   wall clock.
+/// - The reclaim runs on a timer with no reference to memory pressure at all.
+///   On an idle desktop (~56 residents) it destroys terminally while freeing
+///   VRAM nobody wants back, which is pure downside; the burst it was written
+///   for is the only time the risk buys anything. Gating the drain on the
+///   non-pinned *bytes* it is defending — `NonPinnedTotals` already carries
+///   them — is the change that keeps what this constant is for and drops what it
+///   costs.
+///
+/// Reopen signal: `past_cutoff` non-zero in the `resident_resample_*` bands, or
+/// `resample_peak_ms` reaching this value, both of which mean a resident
+/// survived only because the drain is throttled and had not reached it yet.
+pub(crate) const IDLE_TARGET_AGE_MS: u64 = 2000;
 /// Minimum wall-clock spacing between reclaim passes. The poll path calls the
 /// drain ~244×/s; without this it would empty the whole registry in well under a
 /// second. At `IDLE_TARGET_DRAIN_MAX_PER_CALL` per pass this bounds reclaim to

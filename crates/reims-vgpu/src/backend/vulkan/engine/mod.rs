@@ -29,7 +29,7 @@ mod pools;
 /// The ceiling `registry_non_pinned_peak` is read against. Re-exported because
 /// `pools` is private and the census that reports the band lives outside this
 /// module: a peak with no cap beside it is a number, not a reading.
-pub(crate) use pools::REGISTRY_CAP;
+pub(crate) use pools::{IDLE_TARGET_AGE_MS, REGISTRY_CAP};
 pub mod reason;
 mod slab;
 pub mod stage_phase;
@@ -2125,6 +2125,7 @@ pub fn counter_snapshot() -> CounterSnapshot {
     snap.target_registry_cap_evictions = reg_evictions;
     snap.registry_non_pinned_peak_bytes = reg_peak_bytes;
     snap.compute_storage_cap_evictions = eng.pools.compute_storage_cap_evictions();
+    snap.resident_resample_peak_ms = eng.pools.resident_resample_peak_ms();
     snap
 }
 

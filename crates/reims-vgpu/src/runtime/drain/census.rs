@@ -1532,13 +1532,15 @@ fn emit_engine_delta() {
 fn emit_registry_pressure(now: &crate::backend::vulkan::engine::CounterSnapshot) {
     crate::observe::off(format!(
         "registry_pressure (levels, not per-interval) peak={} cap={} evicts={} peak_mib={} \
-         resident_samples={} compute_storage_evicts={}",
+         resident_samples={} compute_storage_evicts={} resample_peak_ms={}/{}",
         now.registry_non_pinned_peak,
         crate::backend::vulkan::engine::REGISTRY_CAP,
         now.target_registry_cap_evictions,
         now.registry_non_pinned_peak_bytes >> 20,
         now.sampled_gpu_binds,
         now.compute_storage_cap_evictions,
+        now.resident_resample_peak_ms,
+        crate::backend::vulkan::engine::IDLE_TARGET_AGE_MS,
     ));
 }
 

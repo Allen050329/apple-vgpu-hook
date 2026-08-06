@@ -95,6 +95,7 @@ impl ResourcePools {
             registry_non_pinned: NonPinnedTotals::default(),
             registry_non_pinned_peak_bytes: 0,
             registry_cap_evictions: 0,
+            resident_resample_peak_ms: 0,
             compute_storage_cap_evictions: 0,
             idle_clock_ms: 0,
             last_drain_ms: 0,
@@ -783,6 +784,14 @@ impl ResourcePools {
     /// populations, and a boot needs to know which one bit.
     pub(crate) fn compute_storage_cap_evictions(&self) -> u64 {
         self.compute_storage_cap_evictions
+    }
+
+    /// The worst gap between a resident being touched and being read again, for
+    /// the life of the pools. See
+    /// [`ResourcePools::resident_resample_peak_ms`] for what it is the margin
+    /// against.
+    pub(crate) fn resident_resample_peak_ms(&self) -> u64 {
+        self.resident_resample_peak_ms
     }
 
     /// Cumulative compute-storage recycle diagnostics: `(admits, cap_drops)`.
