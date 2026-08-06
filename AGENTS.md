@@ -153,7 +153,10 @@ Four rules survive every sweep:
   guest takes it.
 - **A zero can be an artifact of where it is sampled.** Find a census field's sampling point before
   cutting it; `scripts/constant-fields/README.md` lists the ways a constant reading is legitimate.
-  A zero hit rate on one pathway is not a dead cache either — page shift alone changes it.
+  A zero hit rate on one pathway is not a dead cache either — page shift alone changes it. The same
+  trap applies to a *check*, where it is easier to miss: a guard that tests two endpoints of a range
+  reads as thorough and samples two bytes of it. Ask what granularity the underlying answer varies
+  at, and walk the range at that granularity or ask the host for a span verdict.
 - **A drop counter reading zero is not a measurement.** A record stopping at slot 4 and one stopping
   at slot 30 both read zero, and only one says the bound has headroom. Band the *requested* reach
   before widening or narrowing any table.
@@ -182,6 +185,8 @@ simply the wrong number, a length four bytes off, or a field two bytes too wide:
 | Does a test pass only because of what ran before it? | `scripts/test-isolation` |
 | Is a Vulkan value spelled outside the `translate/` table that owns it? | `crates/reims-vgpu/tests/vulkan_state_enums_live_in_translate.rs` |
 | Does anything reach a Vulkan 1.3 core name the 1.2 floor forbids? | `crates/reims-vgpu/tests/nothing_reaches_past_the_vulkan_api_floor.rs` |
+| Does a stored refusal outlive the instant it described? | `crates/reims-vgpu/tests/a_remembered_refusal_says_whether_it_can_go_stale.rs` |
+| Does a cap drop an entry the device had already admitted? | `crates/reims-vgpu/tests/an_eviction_says_what_it_costs.rs` |
 
 Do **not** answer that one by diffing `ls src/ops/` against a `grep` for
 `use reims_vgpu_wire` — that pair used to live here and it is wrong by 40 % on
