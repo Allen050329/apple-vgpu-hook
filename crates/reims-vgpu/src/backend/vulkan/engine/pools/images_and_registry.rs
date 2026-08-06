@@ -1163,37 +1163,22 @@ impl ResourcePools {
             .map(|(_, why)| *why)
     }
 
-    /// Record that a draw is reading this resident as a **sampled source**, so
-    /// both reclaim paths count it as in use.
-    ///
-    /// Reading a resident was not a use. `last_touch_ms` was refreshed by
-    /// `registry_ensure` (a draw rendering *into* the target), by the present
-    /// touch, and by nothing else — while the sampled-source resolve in
-    /// `execute_draw_inner` goes through `registry_get`, which takes `&self` and
-    /// therefore cannot mark anything. A resident that every frame samples but
-    /// no frame draws into consequently aged as if it were abandoned.
-    ///
-    /// That is the shape of a compositor backdrop: the desktop behind a
-    /// translucent panel is rendered once and then read by every vibrancy draw
-    /// over it. After `IDLE_TARGET_AGE_MS` the idle drain took it, and the drain
-    /// is a terminal destroy rather than a recycle, so the pixels were gone. The
-    /// next draw to sample it refuses with
-    /// `vk_draw_exec_sampled_resident_missing`, and because the exec loop
-    /// abandons the remaining records of a packet once a record cannot encode,
-    /// one missing backdrop drops a whole packet of draws.
-    ///
-    /// Nothing recreates a resident except a draw rendering into that identity,
-    /// so a backdrop the guest considers still valid is never rebuilt: the
-    /// refusal repeats for the life of the boot. That is why this class survives
-    /// closing the application that caused the pressure and why only a reboot
-    /// clears it.
     /// The resident the capacity walk should evict next, or `None` when every
     /// entry left is pinned or protected.
     ///
-    /// Least-recently-used, chosen by `last_touch_ms`. Split out from
-    /// [`Self::evict_registry_to_cap`] because that function needs a live
-    /// `DeviceContext` to dispose what it evicts, and the choice — the part with
-    /// the policy in it — is worth testing without a GPU.
+    /// Least-recently-used, chosen by `use_seq` — **not** by `last_touch_ms`,
+    /// which is the other reclaim path's clock. The two are deliberately
+    /// different: `last_touch_ms` is wall clock and answers "has this gone
+    /// untouched for `IDLE_TARGET_AGE_MS`", which is what the idle drain needs;
+    /// `use_seq` is a monotonic use counter and answers "which of these is
+    /// least recently used", which is the only question with an answer when
+    /// every entry was touched inside the same millisecond. A capacity walk on
+    /// the wall clock cannot order a burst that arrives faster than the clock
+    /// ticks, and a burst is exactly when it runs.
+    ///
+    /// Split out from [`Self::evict_registry_to_cap`] because that function
+    /// needs a live `DeviceContext` to dispose what it evicts, and the choice —
+    /// the part with the policy in it — is worth testing without a GPU.
     ///
     /// Iterates `registry_order` rather than the map so the result is
     /// deterministic: `min_by_key` returns the first minimum, so equal stamps
