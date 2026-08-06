@@ -226,18 +226,24 @@ const ROWS: &[Row] = &[
         at: "reims-vgpu/src/backend/metal/render.rs:1748",
         bound: "REIMS_VGPU_BACKEND_MAX_VIEWPORTS",
         verdict: Verdict::NeverReached,
-        why: "The list is built in draw::mod from DrawRequest::viewport, an Option, \
-              so it holds nought or one. The guest's extra viewports were already \
-              dropped at decode and counted as render_extra_viewports_dropped; this \
-              bound stands in front of a truncation that has happened.",
+        why: "The list is built in draw::mod from DrawEncodeRequest::viewport, an \
+              Option, so it holds nought or one. The extra viewports were dropped at \
+              decode and counted as render_extra_viewports_dropped. Raising the \
+              carriage to an array would render the same pixels: selecting a \
+              viewport past 0 needs a shader writing the view index, which arrives \
+              as setVertexAmplificationCount: and is itself dropped \
+              (render_vertex_amplification_dropped). The gap is multi-view \
+              rendering, not this bound.",
     },
     Row {
         at: "reims-vgpu/src/backend/metal/render.rs:1754",
         bound: "REIMS_VGPU_BACKEND_MAX_SCISSORS",
         verdict: Verdict::NeverReached,
-        why: "The scissor twin of the viewport row above, and unreachable for the \
-              same reason: one rect is modelled and the rest of a setScissorRects: \
-              record is counted as render_extra_scissors_dropped.",
+        why: "The scissor twin of the viewport row above, unreachable for the same \
+              reason and blocked behind the same feature: Metal's setScissorRects: \
+              is one rect per viewport, so rects past the first are dropped and \
+              counted as render_extra_scissors_dropped for want of multi-view, not \
+              for want of room.",
     },
     Row {
         at: "reims-vgpu/src/backend/metal/stage_input.rs:125",
