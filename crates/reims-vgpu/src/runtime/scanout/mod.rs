@@ -633,6 +633,12 @@ pub fn paint_efi_console<M: HostMemory + crate::runtime::host::HostOps>(
     // answering RAM, which is the sampled bound doing precisely what it looks
     // like it cannot. `first_non_ram_page` walks every page and short-circuits,
     // so the usual shut door still costs one call.
+    //
+    // A driven boot on the same guest image, with the same `efi_fb_start
+    // 0x80000000` and `efi_fb_stride 0x1e00`, then read zero of that refusal and
+    // zero of the alarm below — so the hole is interior and the two host doors
+    // agree. Neither boot produced a `scanout paint FAIL`, so refusing earlier
+    // cost the console nothing it was getting.
     let span_len = (efi_h.saturating_sub(1) as u64)
         .saturating_mul(stride as u64)
         .saturating_add(row_bytes as u64);
