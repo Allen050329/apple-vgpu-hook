@@ -1240,6 +1240,40 @@ impl FreeTargetImage {
 /// same boot a *surviving* resident recorded `resample_peak_ms=6445`, which
 /// confirms the interval directly on a resident the policy did not truncate.
 ///
+/// ## Two later boots put more of the mass past the last band, not less
+///
+/// The reading above has a floor built into it — the top band was empty, so it
+/// could only say "at least 4-8 s". Two driven x86/PCI boots taken after the
+/// resident-registry slot counts were retired, same probe at `-n 10 --churn 1`,
+/// summing the per-window route counters rather than quoting one window:
+///
+/// ```text
+///                                   26-event boot   boot A   boot B
+///   t11sample_reclaimed_from_pages              26       54       66
+///     ...within_1x_cutoff                        0        1        0
+///     ...within_2x_cutoff                        2        0        0
+///     ...within_4x_cutoff                       24        9        5
+///     ...past_4x_cutoff                          0       44       61
+/// ```
+///
+/// **The mass moved to the top band**, which is open-ended: 44 of 54 and 61 of
+/// 66 came back more than 8 s after being destroyed, so their true interval
+/// between uses is over 10 s and the bands no longer bound it from above. The
+/// conclusion below is unchanged in direction and stronger in degree.
+///
+/// **Not attributable to retiring the slot counts.** Those walks reported
+/// `evicts=0` on every boot ever measured, so they were removing nothing and the
+/// idle drain — the only thing that reclaims here — is untouched. The non-pinned
+/// peak moved 194 -> 223 across the same change with `evicts=0` on both sides,
+/// which is workload variance rather than a count that had been holding the
+/// population down. What is *not* established is how much of 26 -> 54/66 is
+/// variance either; three boots is not a distribution, and the earlier one was
+/// taken in a different session.
+///
+/// None of it is lost work: `sampled_resident_missing` is 0 on both boots and
+/// the fall-through re-serves from the guest's own pages. It is redundant
+/// upload, and the count of it roughly doubled.
+///
 /// So this is not a value with a thin margin. It is between three and five times
 /// shorter than the re-use interval of the surfaces it destroys, and a strip
 /// redrawn every several seconds is not an exotic guest behaviour.
