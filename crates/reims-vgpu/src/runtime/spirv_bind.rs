@@ -1217,8 +1217,26 @@ pub fn offset_fragment_buffer_bindings(words: &mut [u32]) -> usize {
 ///
 /// The band predicate is the fallback for a variable the type walk could not
 /// name, and it is only consulted then; each such fallback is reported as
-/// `spirv_reloc_unclassified_binding`. Two driven boots covering 160 shader
-/// translations report none.
+/// `spirv_reloc_unclassified_binding`. Three driven boots covering 160 shader
+/// translations each report none, so the type rule names every variable in every
+/// shader this guest ships.
+///
+/// # What a driven boot says about it, and what it cannot
+///
+/// Driven x86/PCI boot after this pass landed (web-content probe, 10 captures):
+/// 10 of 10 regions measured their declared colour, `spirv_reloc_unclassified_binding`
+/// and `m2v_reflect_malformed` both absent, and the fail-channel reason ranking
+/// unchanged in shape from the boot before it. That is a regression check on the
+/// relocation over 160 real guest shaders — it says the widened numbering did not
+/// break the shaders that already worked.
+///
+/// It is **not** evidence about the widening itself. The same boot reads every
+/// one of its bind records in the `le16` band: `render_bind_reach_texture_le16`
+/// = 9 290, with `le_table` and `over_table` both absent. This guest's
+/// WindowServer/Safari compositing never binds a texture above slot 16, so no
+/// boot on this workload can exercise slots 32..127 at all. The coverage for
+/// those is `exec::tests::a_texture_bind_past_the_old_band_binds_and_keeps_its_own_descriptor`
+/// and the `const` assertions on the band map.
 pub fn widen_sampled_bands(words: &mut [u32]) -> usize {
     relocate_by_class(
         words,
