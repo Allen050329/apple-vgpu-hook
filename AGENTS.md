@@ -138,6 +138,12 @@ The failure is quiet — an agent that runs `git checkout HEAD~1` to get a "clea
 return leaves HEAD detached, and the next commit lands off the branch where nothing but the reflog
 can find it. Check `git status` after any delegated run before committing.
 
+**The same rule binds you, and the likeliest way to break it is reverting a probe.** Stubbing a gate
+out to prove a test really fails without it is the right habit; undoing it with `git checkout --
+<file>` takes every uncommitted edit in that file with it, including the change you were probing.
+Copy the file aside and copy it back, or edit the stub out the way you edited it in. Never reach for
+git to undo a probe.
+
 ## Before A Broad Sweep
 
 Deletion and audit sweeps over this crate have been run many times. What each concluded lives next
@@ -179,6 +185,12 @@ reported not at all. That hole is now held shut by a fourth test rather than by 
 matters: the prose named one such constant and there were two. **Name a new bound with a `MAX` or a
 `CAP` and all three pick it up for free**; name it otherwise and the build tells you.
 
+There is a fourth way, and it has no constant at all to name: a **bitmask standing in for a set**.
+`mask |= 1u32 << index` bounds the set to 32 members with nothing declared anywhere, and it does not
+fail like the other three — a shift past the width panics in debug and *wraps* in release, so the
+write lands on another member's bit and the set reports the wrong slots from then on. It has its own
+test below; adding a mask means writing down what bounds the shift and where the width is pinned.
+
 Prefer an instrument over a reading. Reading an audit against itself cannot see an opcode that is
 simply the wrong number, a length four bytes off, or a field two bytes too wide:
 
@@ -204,6 +216,8 @@ simply the wrong number, a length four bytes off, or a field two bytes too wide:
 | Does a cap stop one being recorded in the first place? | `crates/reims-vgpu/tests/a_bounded_insert_says_what_it_drops.rs` |
 | Does a cap stop a walk before the guest's data runs out? | `crates/reims-vgpu/tests/a_bounded_walk_says_what_it_skips.rs` |
 | Is a bound named so those three can see it at all? | `crates/reims-vgpu/tests/a_bound_in_a_cut_is_named_like_one.rs` |
+| Does a bitmask used as a set say what bounds it and how wide it is? | `crates/reims-vgpu/tests/a_mask_used_as_a_set_says_how_wide_it_is.rs` |
+| Could a draw be lost because a second pipeline opcode has no exec arm? | `crates/reims-vgpu/tests/a_pipeline_reaches_the_latch_by_one_wire_form.rs` |
 | Is a product widened by a cast that comes too late to help? | `crates/reims-vgpu/tests/a_product_is_widened_before_it_is_taken.rs` |
 | Do the source scans read the product half, or its fixtures? | `crates/reims-vgpu/tests/the_source_scanner_reads_the_product_and_not_its_fixtures.rs` |
 | Can a guest record panic a parser instead of being refused? | `crates/reims-vgpu/tests/a_decoder_survives_bytes_the_guest_could_write.rs` |
