@@ -14,6 +14,29 @@
 //! [`Coverage::Unimplemented`], which is honest; silence is not an option,
 //! because a selector missing from the manifest entirely is indistinguishable
 //! from one that does not exist.
+//!
+//! # Absent from here does not mean absent from the class
+//!
+//! `class_copyMethodList` returns the methods a class **declares itself**. It
+//! does not walk superclasses, and the encoder classes have one: they all derive
+//! from a shared `PGSerializerCommandEncoder` that [`INVENTORY`] has no row for.
+//! So a selector defined only on that base is invisible here while being
+//! callable on every encoder, and the rule above — missing means non-existent —
+//! does not hold for it.
+//!
+//! This is not hypothetical; it has already produced two wrong conclusions in
+//! this workspace. Residency is declared on the base class in two forms, an
+//! unqualified `useHeaps:count:` / `useResources:count:usage:` pair and their
+//! singular siblings, with only the `stages:`-qualified overrides declared on the
+//! render encoder. Reading "residency is not among the compute encoder's
+//! selectors" as "a compute encoder cannot receive a residency call" is exactly
+//! the inference this hole invites, and `runtime::decode::compute` drew it —
+//! concluding that its own opcodes had no producer when the base class inherits
+//! them one.
+//!
+//! Until the base class has an [`INVENTORY`] row and rows here, treat a selector
+//! that is absent as *untriaged with respect to inheritance*, and check the base
+//! class before concluding a call cannot reach an encoder.
 
 /// What this crate has done about a selector.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

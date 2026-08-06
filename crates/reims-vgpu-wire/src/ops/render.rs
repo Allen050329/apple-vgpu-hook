@@ -1189,9 +1189,17 @@ pub const OPCODE_USE_HEAP: u32 = 0x1b;
 /// ref 6565, stages 2).
 ///
 /// Decode consumes these opcodes through [`use_heap`] / [`use_resource`]
-/// (`0x1b` / `0x89`). The historical `0x86`/`0x87` pair is not residency; those
-/// numbers remain only on `decode::compute` as local no-export placeholders
-/// with no serializer selector behind them.
+/// (`0x1b` / `0x89`).
+///
+/// **They are half the family.** `0x1b` and `0x89` are the `stages:`-qualified
+/// forms, which the render encoder declares itself. The unqualified
+/// `useHeaps:count:` / `useResources:count:usage:` are declared on the encoder
+/// base class and inherited by every encoder including this one; they emit
+/// `0x86` / `0x87`, with a four-byte and an eight-byte head respectively, and
+/// this module has no view for either. `runtime::decode::compute` does decode
+/// them; see the inheritance caveat in [`crate::manifest`] for why the coverage
+/// instrument cannot see the selectors behind them, and why a reader checking
+/// only the render encoder's own method list concludes they have none.
 #[repr(C)]
 #[derive(Debug)]
 pub struct UseHeap {
