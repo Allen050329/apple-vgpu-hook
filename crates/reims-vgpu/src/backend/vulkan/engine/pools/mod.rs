@@ -1449,10 +1449,51 @@ pub(crate) const REGISTRY_CAP: usize = 320;
 ///
 /// So this is not a value with a thin margin. It is between three and five times
 /// shorter than the re-use interval of the surfaces it destroys, and a strip
-/// redrawn every several seconds is not an exotic guest behaviour. Raising it is
-/// now a decision with a basis rather than a guess; it has not been raised here
-/// because doing so needs its own before/after on VRAM, which `peak_mib` — the
-/// registry's attachment bytes, not the device's footprint — cannot supply.
+/// redrawn every several seconds is not an exotic guest behaviour.
+///
+/// # The VRAM before/after, and why the value stays at 2000 anyway
+///
+/// The paragraph above used to end "raising it needs its own before/after on
+/// VRAM, which `peak_mib` — the registry's attachment bytes, not the device's
+/// footprint — cannot supply". That measurement has now been taken, against the
+/// host driver's own accounting (`nvidia-smi --query-gpu=memory.used`, sampled
+/// every 2 s, minus a flat 1025 MiB idle-desktop baseline). Three driven
+/// x86/PCI boots, `web-content-probe -n 10 --churn 1`, QEMU relinked between
+/// arms, nothing else running:
+///
+/// ```text
+///   age_ms   peak Δ   mean Δ   at-rest Δ   reclaims   registry peak_mib
+///     2000   546 MiB  249 MiB    279 MiB          6              190
+///     7000   834 MiB  413 MiB    778 MiB          5              396
+///    12000   886 MiB  426 MiB    883 MiB          0              441
+/// ```
+///
+/// **Raising it buys almost nothing until it buys everything, and the price is
+/// paid at rest.** 2000 → 7000 more than doubles the at-rest footprint (+499
+/// MiB) and removes one reclaim out of six. Only at 12000 does the class close,
+/// for +604 MiB held for the life of the guest. The reuse-interval distribution
+/// has a long tail — at 7000 the survivors came back with `since_reclaim_ms` of
+/// 86 and 1010, i.e. true intervals of ~7.1 and ~8.0 s — so each increment
+/// chases the tail rather than clearing it.
+///
+/// That trade is the one `af70d69f` already rejected once, for the same reason
+/// and at a similar magnitude: a gate holding 400 MiB at rest was reverted. Six
+/// avoided re-uploads across a ~90 s driven run does not pay for half a
+/// gigabyte of resident VRAM, and the fall-through is not a loss — the guest's
+/// own pages still hold the pixels, which `ResidentTargetSlot::gpu_only_content`
+/// is what guarantees. So this stays at 2000, now as a measured decision rather
+/// than an unexamined one.
+///
+/// One reading worth keeping separately: the registry's `peak_mib` moved
+/// 190 → 441 (+251 MiB) across the same span the device footprint moved
+/// 279 → 883 (+604 MiB). It understates the real cost by ~2.4x, which is the
+/// concrete form of the warning that it is attachment bytes and not the
+/// device's footprint. Do not size this constant from it.
+///
+/// What would change the answer is a workload with a working set large enough
+/// that the drain is reclaiming under real pressure rather than on a timer; the
+/// counts here (6, 5, 0) are small enough that only the 12000 arm's zero is
+/// clearly outside run-to-run noise.
 pub(crate) const IDLE_TARGET_AGE_MS: u64 = 2000;
 /// Minimum wall-clock spacing between reclaim passes. The poll path calls the
 /// drain ~244×/s; without this it would empty the whole registry in well under a
