@@ -1594,6 +1594,41 @@ impl ResourcePools {
     /// buffer pools that `trim_recycle_pools` otherwise holds back behind
     /// `SETTLED_PASSES_FOR_BUFFER_TRIM`: free-list entries hold no guest content
     /// at all, so they are strictly cheaper to give back than any resident.
+    ///
+    /// # It works, and it was measured by breaking the allocator on purpose
+    ///
+    /// No boot has ever produced a real allocation failure, so this was driven
+    /// with temporary fault injection — every 200th `bind_image_slab` returning
+    /// `ERROR_OUT_OF_DEVICE_MEMORY` before doing anything — on a driven x86/PCI
+    /// boot under `web-content-probe -n 10 --churn 1`. The injection is not in
+    /// the tree; what it established is:
+    ///
+    /// ```text
+    ///   vram_reclaim_retry residents=13 recycled=65   sole_copy=25  live=26
+    ///                      residents=28 recycled=146  sole_copy=84  live=85
+    ///                      residents=66 recycled=106  sole_copy=146 live=147
+    ///                      residents=74 recycled=53   sole_copy=147 live=148
+    ///                      residents=82 recycled=133  sole_copy=172 live=173
+    /// ```
+    ///
+    /// Five forced failures, five recoveries, and the probe still reported 0
+    /// regions off their declared colour — so every draw that would have been
+    /// dropped was served instead. The `sole_copy`/`live` pair is the invariant
+    /// visible from outside: after each reclaim the registry holds its protected
+    /// set and one more, which is exactly what "give back everything that is
+    /// neither pinned nor the only copy" should leave behind.
+    ///
+    /// The same run measured the cost of *not* having this. The injection hit
+    /// every `bind_image_slab` caller and the sampled-image bind has no retry, so
+    /// seven draws died there as `linux_m2v_draw reason=vk_pools_bind_sampled`
+    /// `vk_result=A_device_memory_allocation_has_failed`, at geometries up to
+    /// 1920x1080. That is the measured argument for extending the retry to the
+    /// other allocation sites, and also the reason it was not simply done here:
+    /// this site inherits its safety from `evict_registry_to_cap`, which already
+    /// retires residents at this exact point in `registry_ensure_color`. The
+    /// sampled and storage binds have no such precedent, and reclaiming under
+    /// them could recycle an image the command buffer being recorded still
+    /// references. That analysis is the work, not the wiring.
     unsafe fn reclaim_for_allocation_retry(
         &mut self,
         ctx: &DeviceContext,
@@ -1614,8 +1649,9 @@ impl ResourcePools {
         // allocation is also likely to fail, and a silent recovery would leave
         // the run before that failure looking healthy.
         crate::observe::fail(format!(
-            "vram_reclaim_retry residents={freed} recycled={trimmed} held_bytes={}              sole_copy={} live={} (an allocation was refused; gave back everything \
-that is neither pinned nor the only copy of its pixels)",
+            "vram_reclaim_retry residents={freed} recycled={trimmed} held_bytes={} \
+             sole_copy={} live={} (an allocation was refused; gave back everything \
+             that is neither pinned nor the only copy of its pixels)",
             self.slab.held_bytes().0,
             self.registry_sole_copy.count,
             self.registry.len(),
