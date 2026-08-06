@@ -297,6 +297,32 @@ pub(crate) struct ResourcePools {
     /// [`ResourcePools::non_pinned_registry_bytes`] for why a slot count cannot
     /// stand in for it and why this reads as a lower bound.
     registry_non_pinned_peak_bytes: u64,
+    /// The live population both reclaim paths refuse to take because this image
+    /// is the only place its pixels exist, and what it occupies. Maintained, not
+    /// walked, for the same reason [`NonPinnedTotals`] is.
+    ///
+    /// This is the instrument that says whether protecting that class is
+    /// affordable. It is the one number that can turn "never lose a frame" into
+    /// "hold every frame forever": a workload whose residents are all
+    /// [`ResidentTargetSlot::gpu_only_content`] gives the reclaim paths nothing
+    /// to take, and the registry then grows until the allocator refuses. Read
+    /// the peak against `registry_non_pinned_peak` — a ratio near 1 means the
+    /// reclaim paths have stopped working and the copy-out sites, not the cap,
+    /// are what needs the attention.
+    registry_sole_copy: NonPinnedTotals,
+    /// High-water of [`Self::registry_sole_copy`], in slots and in attachment
+    /// bytes, sampled where every admission passes.
+    registry_sole_copy_peak: NonPinnedTotals,
+    /// Times the capacity walk wanted a victim and every remaining resident was
+    /// pinned, protected, or the sole copy of its pixels — so `REGISTRY_CAP` was
+    /// deliberately exceeded rather than guest work destroyed.
+    ///
+    /// The counterpart to `registry_cap_evictions`: that one counts what the cap
+    /// took, this one counts what it declined to take. A boot where this rises
+    /// and `registry_cap_evictions` stays flat is the cap doing the right thing
+    /// under pressure; one where this rises without bound is the population
+    /// growing with nothing able to trim it, which is a VRAM ceiling coming.
+    registry_cap_no_victim: u64,
     /// Monotonic wall-clock milliseconds for the resident-target idle drain, fed
     /// from the poll heartbeat and each publish ([`Self::advance_registry_touch_and_drain`]).
     /// Each admit/hit/present stamps its slot's `last_touch_ms` with this value;
@@ -829,6 +855,43 @@ pub(crate) struct ResidentTargetSlot {
     /// the first member's flush must not expose the image to eviction while
     /// a peer's window is still armed.
     pub pin_count: u32,
+    /// This image holds pixels that exist **nowhere else** — not in the guest's
+    /// pages, not in any host-side copy. Destroying it destroys guest work.
+    ///
+    /// Both reclaim paths skip a slot carrying this, at any population and at
+    /// any age. That is not an optimisation; it is the difference between a
+    /// reclaim that costs redundant work and one that loses a frame.
+    ///
+    /// # Why `pin_count == 0` was not already this test
+    ///
+    /// It reads as though it were — the field above says "content exists only on
+    /// the GPU" — but a pin is *armed* by the deferred-Store rail and released
+    /// when that rail is done, so `pin_count == 0` conflates two opposite states:
+    ///
+    /// - was pinned, the flush landed, the guest's pages now hold these pixels.
+    ///   Reclaiming costs a re-upload and nothing else.
+    /// - was **never** pinned, because no writeback rail was ever armed for it.
+    ///   The guest's pages hold whatever they held before, which is a different
+    ///   frame or nothing at all.
+    ///
+    /// An MRT secondary attachment is the standing case of the second: it is
+    /// registered like any colour target, rendered into, marked ready at
+    /// `COLOR_ATTACHMENT_OPTIMAL`, sampled by the consumer pass — and never
+    /// pinned, never stamped, never written back. Reclaimed, it does not refuse:
+    /// `resolve_sampled_source` finds no resident and falls through to the
+    /// mapping's guest pages, which substitutes an unrelated earlier frame with
+    /// no failure anywhere. That is the class this field closes.
+    ///
+    /// # Polarity
+    ///
+    /// Set by `registry_mark_ready*` — the two calls every path leaving new
+    /// pixels in a resident goes through — and cleared only by
+    /// [`ResourcePools::registry_note_content_copied_out`], at a site that has
+    /// just copied those pixels somewhere that outlives the image. So the
+    /// default is protection, and a copy-out site nobody has taught about this
+    /// costs retained VRAM rather than a lost frame. Add sites as they are
+    /// proven, never to make a number look better.
+    pub gpu_only_content: bool,
     /// Value of `ResourcePools::idle_clock_ms` (wall-clock ms) at this target's
     /// last use (admit, `registry_ensure` hit, or present touch). The idle drain
     /// ([`ResourcePools::advance_registry_touch_and_drain`]) reclaims a non-pinned
@@ -2425,6 +2488,7 @@ mod resident_reuse_tests {
             layout: vk::ImageLayout::UNDEFINED,
             color_format: format,
             pin_count: 0,
+            gpu_only_content: false,
             last_touch_ms: 0,
             use_seq: 0,
         }

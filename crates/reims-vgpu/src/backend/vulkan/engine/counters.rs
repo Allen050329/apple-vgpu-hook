@@ -430,6 +430,27 @@ engine_counters! {
         /// which is the safe direction for a figure that exists to decide
         /// whether a bound is too loose.
         registry_non_pinned_peak_bytes,
+        /// High-water of the population both reclaim paths refuse to take
+        /// because the image is the only place its pixels exist, in slots and in
+        /// the same attachment bytes as `registry_non_pinned_peak_bytes`.
+        ///
+        /// Read as a ratio against `registry_non_pinned_peak`. That ratio is the
+        /// price of never losing a frame: near 0 the reclaim paths have their
+        /// usual freedom and the protection costs nothing; near 1 they have
+        /// nothing left to take and the registry is a population that only grows
+        /// — at which point the copy-out sites, not `REGISTRY_CAP`, are what
+        /// needs work.
+        registry_sole_copy_peak,
+        registry_sole_copy_peak_bytes,
+        /// Times the capacity walk wanted a victim and every remaining resident
+        /// was pinned, protected, or the sole copy of its pixels, so
+        /// `REGISTRY_CAP` was exceeded rather than guest work destroyed.
+        ///
+        /// The half of the walk `target_registry_cap_evictions` cannot see. A
+        /// break out of that loop and a loop that never ran both leave the
+        /// eviction count flat, and only one of them means the cap is under
+        /// pressure it is deliberately declining to relieve.
+        registry_cap_no_victim,
     }
 }
 /// The `note_*` helpers: the increments that are not a bare `fetch_add(1)` at

@@ -741,6 +741,17 @@ pub fn stamp_resident_content_epoch(identity: &TargetIdentity, epoch: u32) -> bo
     guard.pools.registry_stamp_content_epoch(identity, epoch)
 }
 
+/// Record that this resident's pixels now exist somewhere that outlives the
+/// image, so the reclaim paths may take it. Returns whether a slot was found.
+///
+/// Call this only where the copy has actually landed. Not calling it costs
+/// retained VRAM; calling it wrongly costs the frame — see
+/// [`crate::backend::vulkan::engine::pools::ResidentTargetSlot::gpu_only_content`].
+pub fn note_resident_content_copied_out(identity: &TargetIdentity) -> bool {
+    let mut guard = lock_engine();
+    guard.pools.registry_note_content_copied_out(identity)
+}
+
 /// Whether this backend may leave guest-visible content only in GPU-resident
 /// engine state.
 ///
@@ -2159,6 +2170,10 @@ pub fn counter_snapshot() -> CounterSnapshot {
     snap.registry_non_pinned_peak = reg_peak;
     snap.target_registry_cap_evictions = reg_evictions;
     snap.registry_non_pinned_peak_bytes = reg_peak_bytes;
+    let (sole_peak, sole_peak_bytes, cap_no_victim) = eng.pools.registry_sole_copy_stats();
+    snap.registry_sole_copy_peak = sole_peak;
+    snap.registry_sole_copy_peak_bytes = sole_peak_bytes;
+    snap.registry_cap_no_victim = cap_no_victim;
     snap.compute_storage_cap_evictions = eng.pools.compute_storage_cap_evictions();
     snap.resident_resample_peak_ms = eng.pools.resident_resample_peak_ms();
     let (slab_held, slab_carved) = eng.pools.slab_held_bytes();

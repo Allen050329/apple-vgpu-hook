@@ -94,6 +94,9 @@ impl ResourcePools {
             registry_non_pinned_peak: 0,
             registry_non_pinned: NonPinnedTotals::default(),
             registry_non_pinned_peak_bytes: 0,
+            registry_sole_copy: NonPinnedTotals::default(),
+            registry_sole_copy_peak: NonPinnedTotals::default(),
+            registry_cap_no_victim: 0,
             registry_cap_evictions: 0,
             resident_resample_peak_ms: 0,
             compute_storage_cap_evictions: 0,
@@ -157,11 +160,13 @@ impl ResourcePools {
             if victims.len() >= IDLE_TARGET_DRAIN_MAX_PER_CALL {
                 break;
             }
-            if self
-                .registry
-                .get(k)
-                .is_some_and(|s| s.pin_count == 0 && s.last_touch_ms <= cutoff)
-            {
+            // Age is a reason to reclaim only what something else still holds.
+            // `gpu_only_content` is the slot whose pixels exist nowhere but this
+            // image, and no age makes destroying one anything but a lost frame —
+            // see `ResidentTargetSlot::gpu_only_content`.
+            if self.registry.get(k).is_some_and(|s| {
+                s.pin_count == 0 && !s.gpu_only_content && s.last_touch_ms <= cutoff
+            }) {
                 victims.push(k.clone());
             }
         }
@@ -773,6 +778,22 @@ impl ResourcePools {
             self.registry_non_pinned_peak,
             self.registry_cap_evictions,
             self.registry_non_pinned_peak_bytes,
+        )
+    }
+
+    /// `(sole_copy_peak_slots, sole_copy_peak_bytes, cap_walks_with_no_victim)`
+    /// — what protecting unreproducible content costs, and how often that
+    /// protection is what stopped the capacity walk.
+    ///
+    /// Returned together because neither half is readable alone: a peak with no
+    /// no-victim count cannot say whether the cap ever wanted those slots, and a
+    /// no-victim count with no peak cannot say how much was being held. See
+    /// [`ResourcePools::registry_sole_copy`].
+    pub(crate) fn registry_sole_copy_stats(&self) -> (u64, u64, u64) {
+        (
+            self.registry_sole_copy_peak.count as u64,
+            self.registry_sole_copy_peak.bytes,
+            self.registry_cap_no_victim,
         )
     }
 

@@ -6296,6 +6296,18 @@ fn stamp_type11_resident<M: HostMemory + HostOps>(
 ) {
     if let Some(identity) = type11_store_identity(state, req, writeback_guest) {
         crate::backend::vulkan::engine::stamp_resident_content_epoch(&identity, epoch);
+        // Both callers reach here only on a route that has already put these
+        // pixels outside the image — the synchronous one through `write_bgra8`
+        // into the mapping's guest pages, the deferred-readback one through
+        // `publish_surface_store` into `surface_cache` plus the window's own
+        // `Arc`. So the resident is no longer the sole copy and the reclaim
+        // paths may take it, which is the whole reason those routes pay a
+        // readback.
+        //
+        // Deliberately not on `arm_surface_resident_store`: that route skips the
+        // readback precisely so no copy is made, keeps the frame in the image
+        // alone, and holds it with a pin instead.
+        crate::backend::vulkan::engine::note_resident_content_copied_out(&identity);
     }
     if let Some(mapping_id) = req.colors.first().map(|c| c.mapping_id).filter(|m| *m != 0) {
         crate::runtime::mapper::stamp_guest_write_gen(state, host, mapping_id);

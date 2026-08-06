@@ -529,6 +529,14 @@ impl ResourcePools {
         if old.pin_count == 0 {
             self.registry_non_pinned_adjust(Self::slot_attachment_bytes(&old), false);
         }
+        // A sole-copy slot never leaves here through a *reclaim* — both reclaim
+        // paths skip it — but it does leave through the recreate arms, where the
+        // guest itself replaced the resource under this identity. Not folding it
+        // out there would leak the population upward until it read as a ceiling
+        // that was never reached.
+        if old.gpu_only_content {
+            self.registry_sole_copy_adjust(Self::slot_attachment_bytes(&old), false);
+        }
         self.note_resident_reclaimed(identity, why);
         Some(old)
     }
@@ -592,6 +600,10 @@ impl ResourcePools {
                 layout: vk::ImageLayout::UNDEFINED,
                 color_format: new.color_format,
                 pin_count: 0,
+                // Nothing has drawn into it, so it holds no guest work to lose.
+                // A recycled image arrives here too, and its stale contents are
+                // not this identity's content.
+                gpu_only_content: false,
                 last_touch_ms,
                 use_seq,
             },
@@ -1164,6 +1176,7 @@ impl ResourcePools {
             slot.content_epoch = None;
             slot.layout = layout;
         }
+        self.set_sole_copy(identity, true);
     }
 
     /// Pin/unpin a resident render target against LRU eviction (deferred
@@ -1212,6 +1225,24 @@ impl ResourcePools {
             // Draw pass final_layout is TRANSFER_SRC_OPTIMAL.
             slot.layout = vk::ImageLayout::TRANSFER_SRC_OPTIMAL;
         }
+        self.set_sole_copy(identity, true);
+    }
+
+    /// Record that this resident's current pixels have been copied somewhere
+    /// that outlives the image — the guest's own pages — so reclaiming it now
+    /// costs redundant work rather than the frame.
+    ///
+    /// Returns whether a slot was found and cleared, so a caller that believes
+    /// it just wrote a resident back can say so; a silent no-op here would let
+    /// the belief and the registry drift apart with nothing able to read it.
+    ///
+    /// Clears exactly the flag. It does not touch `content_epoch`, which answers
+    /// the different question of whether these pixels are *current* for the
+    /// mapping — a resident can be faithfully written back and then superseded
+    /// by a guest CPU write, which makes it stale but does not make destroying
+    /// it a loss.
+    pub(crate) fn registry_note_content_copied_out(&mut self, identity: &TargetIdentity) -> bool {
+        self.set_sole_copy(identity, false)
     }
 
     /// Record that this resident's pixels are the mapping's content as of
@@ -1314,7 +1345,22 @@ impl ResourcePools {
     /// and the bytes cannot move apart from each other, or be updated at two
     /// sites and forgotten at a third.
     fn registry_non_pinned_adjust(&mut self, slot_bytes: u64, joined: bool) {
-        let totals = &mut self.registry_non_pinned;
+        Self::fold_totals(&mut self.registry_non_pinned, slot_bytes, joined);
+    }
+
+    /// Fold one slot into or out of the maintained sole-copy totals.
+    ///
+    /// Same shape and same reason as [`Self::registry_non_pinned_adjust`], over
+    /// the population [`ResidentTargetSlot::gpu_only_content`] describes. Kept as
+    /// its own call rather than a flag on that one so a site cannot update the
+    /// wrong population by passing a bool.
+    fn registry_sole_copy_adjust(&mut self, slot_bytes: u64, joined: bool) {
+        Self::fold_totals(&mut self.registry_sole_copy, slot_bytes, joined);
+    }
+
+    /// The arithmetic both maintained populations share: a count and its bytes
+    /// move together or the pair stops describing one population.
+    fn fold_totals(totals: &mut NonPinnedTotals, slot_bytes: u64, joined: bool) {
         if joined {
             totals.count += 1;
             totals.bytes += slot_bytes;
@@ -1322,6 +1368,31 @@ impl ResourcePools {
             totals.count = totals.count.saturating_sub(1);
             totals.bytes = totals.bytes.saturating_sub(slot_bytes);
         }
+    }
+
+    /// Set a slot's [`ResidentTargetSlot::gpu_only_content`] and keep the
+    /// maintained totals in step.
+    ///
+    /// The single writer of that field on a live slot, so the flag and the
+    /// population that reports it cannot be updated at two sites and forgotten
+    /// at a third — the defect `registry_non_pinned_adjust` exists to prevent on
+    /// the other population. Registration sets the field directly because there
+    /// is no slot to read yet, and it sets it to the default that counts for
+    /// nothing.
+    fn set_sole_copy(&mut self, identity: &TargetIdentity, sole: bool) -> bool {
+        let Some(slot) = self.registry.get(identity) else {
+            return false;
+        };
+        if slot.gpu_only_content == sole {
+            return true;
+        }
+        let bytes = Self::slot_attachment_bytes(slot);
+        self.registry
+            .get_mut(identity)
+            .expect("read one statement ago")
+            .gpu_only_content = sole;
+        self.registry_sole_copy_adjust(bytes, sole);
+        true
     }
 
     /// Fold the current non-pinned population into the high-water band and
@@ -1347,6 +1418,12 @@ impl ResourcePools {
         self.registry_non_pinned_peak_bytes = self
             .registry_non_pinned_peak_bytes
             .max(self.non_pinned_registry_bytes());
+        // Sampled from the same instant as the two above, so the ratio between
+        // them describes one population and not two moments.
+        self.registry_sole_copy_peak = NonPinnedTotals {
+            count: self.registry_sole_copy_peak.count.max(self.registry_sole_copy.count),
+            bytes: self.registry_sole_copy_peak.bytes.max(self.registry_sole_copy.bytes),
+        };
         non_pinned
     }
 
@@ -1393,11 +1470,18 @@ impl ResourcePools {
             // and evictions are rare next to binds — the cost this avoids
             // paying is a promotion on every sampled bind of every draw.
             let victim = self.cap_eviction_victim(protect);
-            // Everything left is pinned or protected. Pinned residents are
-            // bounded separately by the rail that armed them, so the registry
-            // soft-exceeds the cap rather than dropping content whose only copy
-            // is on the GPU — the trade this walk has always made.
+            // Everything left is pinned, protected, or the sole copy of its
+            // pixels. Each of those is bounded by something other than this cap,
+            // so the registry soft-exceeds rather than dropping content that
+            // exists nowhere else — the trade this walk has always made for
+            // pinned slots, now extended to every slot for which it is true.
+            //
+            // Counted, because a break is otherwise indistinguishable from a
+            // walk that had nothing to do. `registry_cap_no_victim` rising while
+            // `registry_cap_evictions` stays flat is this working; rising
+            // without bound is a population nothing can trim.
             let Some(victim) = victim else {
+                self.registry_cap_no_victim += 1;
                 break;
             };
             self.retire_resident(ctx, &victim, ResidentReclaim::CapEvicted, counters);
@@ -1476,7 +1560,12 @@ impl ResourcePools {
     }
 
     /// The resident the capacity walk should evict next, or `None` when every
-    /// entry left is pinned or protected.
+    /// entry left is pinned, protected, or the sole copy of its pixels.
+    ///
+    /// `None` makes the walk exceed `REGISTRY_CAP` rather than destroy guest
+    /// work, which is the behaviour a GPU running out of memory has: it refuses
+    /// the next allocation, it does not silently drop a client's render target.
+    /// See [`ResidentTargetSlot::gpu_only_content`].
     ///
     /// Least-recently-used, chosen by `use_seq` — **not** by `last_touch_ms`,
     /// which is the other reclaim path's clock. The two are deliberately
@@ -1499,7 +1588,9 @@ impl ResourcePools {
         self.registry_order
             .iter()
             .filter_map(|k| self.registry.get(k).map(|slot| (k, slot)))
-            .filter(|(k, slot)| slot.pin_count == 0 && protect != Some(k))
+            .filter(|(k, slot)| {
+                slot.pin_count == 0 && !slot.gpu_only_content && protect != Some(k)
+            })
             .min_by_key(|(_, slot)| slot.use_seq)
             .map(|(k, _)| k.clone())
     }
@@ -1574,6 +1665,7 @@ mod pin_count_tests {
             layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
             color_format: translate::pixel::SCANOUT_FORMAT,
             pin_count: 0,
+            gpu_only_content: false,
             last_touch_ms: 0,
             use_seq: 0,
         }
@@ -1906,6 +1998,165 @@ mod pin_count_tests {
                 < pools.registry.get(&surf(2)).unwrap().use_seq,
             "the second registration is later even inside one clock tick"
         );
+    }
+
+    /// A resident whose pixels exist nowhere else is never aged out, however
+    /// long it sits — and becomes reclaimable the moment something copies them
+    /// out.
+    ///
+    /// This is the MRT-secondary shape exactly: `registry_mark_ready_at` is the
+    /// call the secondary attachments take, it is the only thing that ever
+    /// happens to them, and they are never pinned and never written back. Aged
+    /// out, such a resident does not refuse — `resolve_sampled_source` finds no
+    /// resident and falls through to the mapping's guest pages, which hold a
+    /// different frame — so the destroy is silent guest-work loss.
+    ///
+    /// Fails without the gate: `surf(1)` is selected on the first pass, because
+    /// `pin_count == 0` is true of a resident that was written back *and* of one
+    /// that never was.
+    #[test]
+    fn a_resident_that_is_the_only_copy_of_its_pixels_is_never_aged_out() {
+        let mut pools = ResourcePools::new();
+        admit(&mut pools, surf(1), 10, 0);
+        // The MRT-secondary path: rendered into, marked ready at the pass's
+        // final layout, never pinned, never stamped, never flushed.
+        pools.registry_mark_ready_at(&surf(1), vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+        pools.registry_touch_at(&surf(1), 10);
+
+        let now = 10 + IDLE_TARGET_AGE_MS + 1;
+        assert_eq!(
+            pools.plan_idle_drain(now, None),
+            Some(Vec::new()),
+            "aged past the cutoff and unpinned, but destroying it destroys the frame"
+        );
+
+        // Ten more cutoffs' worth of idleness changes nothing: this is not a
+        // longer timer, it is a different question.
+        let much_later = now + IDLE_TARGET_AGE_MS * 10;
+        assert_eq!(
+            pools.plan_idle_drain(much_later, None),
+            Some(Vec::new()),
+            "no age makes destroying the only copy anything but a loss"
+        );
+
+        // Something copies the pixels out — a landed flush, a writeback Store —
+        // and the same resident is now exactly as reclaimable as any other.
+        assert!(
+            pools.registry_note_content_copied_out(&surf(1)),
+            "the slot is there to be cleared"
+        );
+        let later_still = much_later + IDLE_DRAIN_INTERVAL_MS + 1;
+        assert_eq!(
+            pools.plan_idle_drain(later_still, None),
+            Some(vec![surf(1)]),
+            "with the pixels held elsewhere, reclaiming costs redundant work only"
+        );
+    }
+
+    /// The capacity walk exceeds `REGISTRY_CAP` rather than destroy a resident
+    /// that is the only copy of its pixels — the behaviour a GPU out of memory
+    /// has, which is to refuse the next allocation rather than silently drop a
+    /// client's render target.
+    ///
+    /// Asserted on [`ResourcePools::cap_eviction_victim`] rather than on the
+    /// walk, because the walk is `unsafe` and needs a live `DeviceContext` to
+    /// dispose what it chooses; the choice is the part with the policy in it.
+    ///
+    /// Fails without the gate: `surf(1)` is returned as the victim.
+    #[test]
+    fn the_capacity_walk_finds_no_victim_rather_than_destroy_the_only_copy() {
+        let mut pools = ResourcePools::new();
+        admit(&mut pools, surf(1), 0, 0);
+        admit(&mut pools, surf(2), 0, 0);
+        assert_eq!(
+            pools.cap_eviction_victim(None),
+            Some(surf(1)),
+            "least recently used, while both are re-servable"
+        );
+
+        pools.registry_mark_ready(&surf(1));
+        assert_eq!(
+            pools.cap_eviction_victim(None),
+            Some(surf(2)),
+            "the walk moves past the sole copy to the one behind it"
+        );
+
+        pools.registry_mark_ready(&surf(2));
+        assert_eq!(
+            pools.cap_eviction_victim(None),
+            None,
+            "nothing left that can be destroyed without losing a frame"
+        );
+    }
+
+    /// The maintained sole-copy totals agree with a walk of the registry at
+    /// every transition, including the ones that move nothing.
+    ///
+    /// The same defect class as `the_maintained_non_pinned_totals_track_the_walk`
+    /// and it matters more here: this population is what says whether protecting
+    /// unreproducible content is affordable, so a total that drifts high reads as
+    /// a VRAM ceiling that was never approached, and one that drifts low hides
+    /// one that was.
+    #[test]
+    fn the_maintained_sole_copy_totals_track_the_walk() {
+        let mut pools = ResourcePools::new();
+        let check = |pools: &ResourcePools, what: &str| {
+            let walk = {
+                let sole = || pools.registry.values().filter(|s| s.gpu_only_content);
+                NonPinnedTotals {
+                    count: sole().count(),
+                    bytes: sole().map(ResourcePools::slot_attachment_bytes).sum(),
+                }
+            };
+            assert_eq!(
+                pools.registry_sole_copy, walk,
+                "maintained sole-copy totals disagree with the walk after {what}"
+            );
+        };
+        check(&pools, "construction");
+
+        admit_sized(&mut pools, surf(1), 0, 0, (16, 16));
+        admit_sized(&mut pools, surf(2), 0, 0, (64, 32));
+        check(&pools, "two admits");
+        assert_eq!(
+            pools.registry_sole_copy,
+            NonPinnedTotals::default(),
+            "a registered slot nothing has drawn into holds no guest work"
+        );
+
+        pools.registry_mark_ready(&surf(1));
+        check(&pools, "a draw stored into the first");
+        assert_eq!(pools.registry_sole_copy.count, 1);
+        // A second store into the same slot is still one slot.
+        pools.registry_mark_ready(&surf(1));
+        check(&pools, "a second store into the same slot");
+        assert_eq!(pools.registry_sole_copy.count, 1);
+
+        pools.registry_mark_ready_at(&surf(2), vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+        check(&pools, "the MRT-secondary arm on the second");
+        assert_eq!(pools.registry_sole_copy.count, 2);
+
+        assert!(pools.registry_note_content_copied_out(&surf(1)));
+        check(&pools, "a copy-out");
+        assert_eq!(pools.registry_sole_copy.count, 1);
+        // A second copy-out of an already-copied slot must not double-subtract.
+        assert!(pools.registry_note_content_copied_out(&surf(1)));
+        check(&pools, "a redundant copy-out");
+        assert_eq!(pools.registry_sole_copy.count, 1);
+
+        // Death of a sole-copy slot and of a copied-out one. Only the first was
+        // ever in the totals, and the guest replacing a resource is the one way
+        // a sole-copy slot leaves the registry.
+        pools.unregister_resident(&surf(2), ResidentReclaim::CapEvicted);
+        check(&pools, "unregistering the sole-copy slot");
+        pools.unregister_resident(&surf(1), ResidentReclaim::CapEvicted);
+        check(&pools, "unregistering the copied-out slot");
+        assert_eq!(pools.registry_sole_copy, NonPinnedTotals::default());
+
+        // A copy-out against an identity holding no resident reports the miss
+        // rather than inventing a subtraction.
+        assert!(!pools.registry_note_content_copied_out(&surf(1)));
+        check(&pools, "a copy-out for an absent identity");
     }
 
     /// A non-pinned resident untouched for `IDLE_TARGET_AGE_MS` is selected; a

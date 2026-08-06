@@ -1062,6 +1062,13 @@ fn finish_render_flush(
             {
                 crate::backend::vulkan::engine::stamp_resident_content_epoch(&identity, epoch);
             }
+            // The flush above copied this resident's pixels into the mapping's
+            // guest pages, so the image has stopped being the only place they
+            // exist and the reclaim paths may take it. Under `ok` only: a
+            // refused write leaves the guest pages holding the previous frame,
+            // and telling the registry otherwise would license destroying the
+            // one copy of this one.
+            crate::backend::vulkan::engine::note_resident_content_copied_out(&identity);
         }
         // Every copy this flush just made is unread until something reads it;
         // whatever was left of the previous flush's is scored now.

@@ -1533,7 +1533,7 @@ fn emit_registry_pressure(now: &crate::backend::vulkan::engine::CounterSnapshot)
     crate::observe::off(format!(
         "registry_pressure (levels, not per-interval) peak={} cap={} evicts={} peak_mib={} \
          resident_samples={} compute_storage_evicts={} resample_peak_ms={}/{} \
-         slab_mib={}/{}",
+         slab_mib={}/{} sole_copy={}/{}mib cap_no_victim={}",
         now.registry_non_pinned_peak,
         crate::backend::vulkan::engine::REGISTRY_CAP,
         now.target_registry_cap_evictions,
@@ -1544,6 +1544,9 @@ fn emit_registry_pressure(now: &crate::backend::vulkan::engine::CounterSnapshot)
         crate::backend::vulkan::engine::IDLE_TARGET_AGE_MS,
         now.slab_carved_bytes >> 20,
         now.slab_held_bytes >> 20,
+        now.registry_sole_copy_peak,
+        now.registry_sole_copy_peak_bytes >> 20,
+        now.registry_cap_no_victim,
     ));
 }
 
