@@ -390,13 +390,15 @@ pub fn device_gfx_write(id: u64, offset: u64, data: u64, size: u32) -> bool {
         //
         // The channel-number check mirrors that handler rather than trusting
         // the guest: a value outside the channel range names no channel, and
-        // shifting by it would be undefined. An out-of-range ring is dropped
-        // here as it is there, and deliberately still schedules nothing.
+        // shifting by it would be undefined. An out-of-range ring still
+        // schedules nothing here, as it does there — but it is reported rather
+        // than dropped in silence, through the one spelling of the rule that
+        // both handlers share.
         if offset == crate::model::GFX_REG_CHILD_DOORBELL
             || offset == crate::model::GFX_REG_CHILD_REPLAY_DOORBELL
         {
             let channel = data as u32;
-            if crate::model::is_child_channel(channel) {
+            if crate::model::accept_child_channel(channel, "lock_free_child_doorbell") {
                 slot.child_doorbell_rung
                     .fetch_or(1u32 << channel, Ordering::AcqRel);
                 crate::runtime::drain::note_doorbell_lock_free();

@@ -114,6 +114,43 @@ pub const fn is_child_channel(channel_id: u32) -> bool {
     channel_id >= 1 && (channel_id as usize) < MAX_CHANNELS
 }
 
+/// [`is_child_channel`], reporting the refusal when the answer is no.
+///
+/// The three sites that gate on a channel id are the two doorbell handlers
+/// (locked and lock-free) and `ensure_child_ring`, and all three used to answer
+/// this question and then say nothing: an `if` with no `else` at the first two,
+/// and a `0` return at the third that is indistinguishable from "ring not valid
+/// yet". A guest ringing channel 32 therefore set no mask bit, scheduled no
+/// bottom half, and was never told — every command it queued there sits in the
+/// ring forever, which is a stalled channel rather than a dropped record and so
+/// does not even look like corruption from the guest's side.
+///
+/// `MAX_CHANNELS` is a bound this device imposes, not one the protocol states.
+/// It is pinned from above by the three `u32` masks that carry one bit per
+/// channel (see the assert beside the constant), while the MMIO child register
+/// blocks — `0x400 + (ch - 1) * 0x14` inside a `GFX_MMIO_SIZE` of `0x4000` —
+/// have room for far more, and `DEVICE_INFO_CAPS` advertises no channel count
+/// for the guest to read. So nothing tells a guest that 32 is the limit, and
+/// nothing in this device could tell whether one has ever crossed it. That is
+/// what this reports, and widening the constant is a question for after a boot
+/// answers it rather than before.
+///
+/// Latched per channel id, so a guest hammering one out-of-range doorbell costs
+/// one line rather than one per ring; the census route counts every occurrence.
+pub fn accept_child_channel(channel_id: u32, site: &'static str) -> bool {
+    if is_child_channel(channel_id) {
+        return true;
+    }
+    crate::runtime::drain::census::note_store_route("child_channel_out_of_range");
+    if crate::observe::first_sight("channel_outside_device_range", u64::from(channel_id)) {
+        crate::observe::fail(format!(
+            "child_channel_out_of_range reason=channel_outside_device_range \
+             site={site} channel={channel_id} max_channels={MAX_CHANNELS}"
+        ));
+    }
+    false
+}
+
 /// Whether `mapping_id` names a mapping rather than "no mapping".
 ///
 /// Zero is the device-wide sentinel for an unbound mapping — `runtime::draw`

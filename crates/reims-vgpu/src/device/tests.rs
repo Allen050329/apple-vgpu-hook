@@ -415,14 +415,25 @@ fn a_child_doorbell_never_queues_behind_the_render_worker() {
     assert!(device_destroy(id));
 }
 
-/// A ring naming no channel is dropped, not shifted by.
+/// A ring naming no channel is dropped, not shifted by — and says so.
 ///
 /// `1u32 << channel` is undefined past the word, and the locked handler in
 /// `crate::runtime::mmio` has always range-checked before shifting. The lock-free
 /// path is a second implementation of that same guard, so it gets its own
 /// assertion rather than inheriting the first one's.
+///
+/// Ringing nothing is the correct action and is not the whole contract. The
+/// guest is not told, and the commands it queued on that channel sit in the ring
+/// forever — a stalled channel, which from the guest's side does not look like a
+/// dropped record at all. So the refusal has to reach the fail channel, and it
+/// has to name the channel, or no boot can say whether a guest has ever crossed
+/// `MAX_CHANNELS` — a bound this device imposes and the protocol never states.
+///
+/// Fails without the fix: all three sites answered `is_child_channel` and said
+/// nothing, so the capture is empty.
 #[test]
-fn a_child_doorbell_outside_the_channel_range_rings_nothing() {
+fn a_child_doorbell_outside_the_channel_range_rings_nothing_and_reports_it() {
+    let cap = crate::observe::FailCapture::start();
     let id = device_create(None, PAGE_SHIFT_ARM64E).expect("create");
     let slot = device_slot(id).expect("device");
     for channel in [0u64, crate::model::MAX_CHANNELS as u64, 0xffff_ffff] {
@@ -439,6 +450,50 @@ fn a_child_doorbell_outside_the_channel_range_rings_nothing() {
         "channel 0 is the main FIFO and the rest name nothing"
     );
     assert_eq!(slot.gfx_ingress.lock().len(), 0, "and none of them queue");
+
+    let reported: Vec<String> = cap
+        .lines()
+        .into_iter()
+        .filter(|l| l.split_whitespace().next() == Some("child_channel_out_of_range"))
+        .collect();
+    assert_eq!(
+        reported.len(),
+        3,
+        "one line per distinct refused channel — the latch is per channel id, \
+         not per reason, so three ids are three lines: {reported:?}"
+    );
+    for (channel, line) in [0u32, crate::model::MAX_CHANNELS as u32, 0xffff_ffff]
+        .iter()
+        .zip(&reported)
+    {
+        assert!(
+            line.contains(&format!("channel={channel}")),
+            "the line must name the channel that was refused: {line}"
+        );
+        assert!(
+            line.contains("reason=channel_outside_device_range"),
+            "and carry a reason= so it ranks in the fail-channel queue: {line}"
+        );
+    }
+
+    // Re-ringing the same channels is latched: the magnitude belongs to the
+    // census route, not to a repeated line.
+    for channel in [0u64, crate::model::MAX_CHANNELS as u64, 0xffff_ffff] {
+        assert!(device_gfx_write(
+            id,
+            crate::model::GFX_REG_CHILD_DOORBELL,
+            channel,
+            crate::model::MMIO_U32,
+        ));
+    }
+    assert_eq!(
+        cap.lines()
+            .iter()
+            .filter(|l| l.split_whitespace().next() == Some("child_channel_out_of_range"))
+            .count(),
+        3,
+        "a guest hammering an out-of-range doorbell costs one line per channel"
+    );
     assert!(device_destroy(id));
 }
 

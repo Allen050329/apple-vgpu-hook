@@ -1200,7 +1200,11 @@ fn ensure_child_ring<M: HostMemory>(
     channel_id: u32,
     base_pfn: u32,
 ) -> u32 {
-    if !is_child_channel(channel_id) || base_pfn == 0 {
+    // `base_pfn == 0` is a ring the guest has not published yet — expected
+    // control flow, and quiet. An out-of-range channel is not: it returns the
+    // same `0` and so reads as "not published yet" forever, which is why it is
+    // reported through the rule's own spelling rather than folded in here.
+    if !crate::model::accept_child_channel(channel_id, "ensure_child_ring") || base_pfn == 0 {
         return 0;
     }
     let page_shift = state.page_shift;
