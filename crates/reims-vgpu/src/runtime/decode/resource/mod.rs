@@ -1757,23 +1757,23 @@ fn compact_tlv_u32(fields: &[CompactTlv], tag: u8) -> Option<u32> {
 /// The two used to be written out separately, with identical control flow and
 /// five identical bounds checks, differing only in what they returned when the
 /// walk fell through. A walk written twice is a walk that can be fixed once.
-fn entry_tag_u32(bytes: &[u8], len: usize, entry_off: usize, tag: u8, default: u32) -> u32 {
-    entry_tag_u32_present(bytes, len, entry_off, tag).unwrap_or(default)
+fn entry_tag_u32(bytes: &[u8], entry_off: usize, tag: u8, default: u32) -> u32 {
+    entry_tag_u32_present(bytes, entry_off, tag).unwrap_or(default)
 }
 
-fn entry_tag_u32_present(bytes: &[u8], len: usize, entry_off: usize, tag: u8) -> Option<u32> {
-    if entry_off >= len {
+fn entry_tag_u32_present(bytes: &[u8], entry_off: usize, tag: u8) -> Option<u32> {
+    if entry_off >= bytes.len() {
         return None;
     }
     let field_count = bytes[entry_off] as usize;
     let mut p = entry_off + 1;
     for _ in 0..field_count {
-        if p + 2 > len {
+        if p + 2 > bytes.len() {
             return None;
         }
         let t = bytes[p];
         let field_len = bytes[p + 1] as usize;
-        if p + 2 + field_len > len {
+        if p + 2 + field_len > bytes.len() {
             return None;
         }
         if t == tag && field_len >= 4 {
@@ -1784,13 +1784,13 @@ fn entry_tag_u32_present(bytes: &[u8], len: usize, entry_off: usize, tag: u8) ->
     None
 }
 
-fn skip_optional_label_and_pad(bytes: &[u8], end: usize, mut off: usize) -> usize {
-    if off < end && bytes[off] >= VERTEX_LABEL_MIN_ASCII {
-        while off < end && bytes[off] != 0 {
+fn skip_optional_label_and_pad(bytes: &[u8], mut off: usize) -> usize {
+    if off < bytes.len() && bytes[off] >= VERTEX_LABEL_MIN_ASCII {
+        while off < bytes.len() && bytes[off] != 0 {
             off += 1;
         }
     }
-    while off < end && bytes[off] == 0 {
+    while off < bytes.len() && bytes[off] == 0 {
         off += 1;
     }
     off
@@ -1802,15 +1802,20 @@ pub fn parse_vertex_block(
     block_start: usize,
     block_end: usize,
 ) -> Result<Vec<VertexAttribute>, DecodeStatus> {
-    if block_start >= block_end || block_end > bytes.len() {
+    if block_start >= block_end {
         return Ok(Vec::new());
     }
-    let bo = skip_optional_label_and_pad(bytes, block_end, block_start);
-    if bo >= block_end {
+    // The block's declared end becomes the slice, so `block_end` stops being a
+    // second number the body has to remember to compare against.
+    let Some(bytes) = bytes.get(..block_end) else {
+        return Ok(Vec::new());
+    };
+    let bo = skip_optional_label_and_pad(bytes, block_start);
+    if bo >= bytes.len() {
         return Ok(Vec::new());
     }
-    let attr_off = entry_tag_u32(bytes, block_end, bo, VERTEX_DESC_TAG_ATTRIBUTES, u32::MAX);
-    let layout_off = entry_tag_u32(bytes, block_end, bo, VERTEX_DESC_TAG_LAYOUTS, u32::MAX);
+    let attr_off = entry_tag_u32(bytes, bo, VERTEX_DESC_TAG_ATTRIBUTES, u32::MAX);
+    let layout_off = entry_tag_u32(bytes, bo, VERTEX_DESC_TAG_LAYOUTS, u32::MAX);
     if attr_off == u32::MAX || layout_off == u32::MAX {
         return Ok(Vec::new());
     }
@@ -1822,26 +1827,24 @@ pub fn parse_vertex_block(
     let mut layout_steps: Vec<(u32, Option<u32>, Option<u32>)> = Vec::new();
 
     let layout_section = bo.saturating_add(layout_off as usize);
-    if layout_section + 4 > block_end {
+    if layout_section + 4 > bytes.len() {
         return Err(DecodeStatus::ErrShort("res_vertex_layout_count_oob"));
     }
     let layout_count = ld32(&bytes[layout_section..]) as usize;
     for i in 0..layout_count {
         let offloc = layout_section + 4 + i * 4;
-        if offloc + 4 > block_end {
+        if offloc + 4 > bytes.len() {
             return Err(DecodeStatus::ErrShort("res_vertex_layout_offset_oob"));
         }
         let entry = layout_section + ld32(&bytes[offloc..]) as usize;
-        if entry >= block_end {
+        if entry >= bytes.len() {
             return Err(DecodeStatus::ErrShort("res_vertex_layout_entry_oob"));
         }
-        let buffer_index =
-            entry_tag_u32(bytes, block_end, entry, VERTEX_LAYOUT_TAG_BUFFER_INDEX, 0);
-        let stride = entry_tag_u32(bytes, block_end, entry, VERTEX_LAYOUT_TAG_STRIDE, 0);
+        let buffer_index = entry_tag_u32(bytes, entry, VERTEX_LAYOUT_TAG_BUFFER_INDEX, 0);
+        let stride = entry_tag_u32(bytes, entry, VERTEX_LAYOUT_TAG_STRIDE, 0);
         let declared_step_function =
-            entry_tag_u32_present(bytes, block_end, entry, VERTEX_LAYOUT_TAG_STEP_FUNCTION);
-        let declared_step_rate =
-            entry_tag_u32_present(bytes, block_end, entry, VERTEX_LAYOUT_TAG_STEP_RATE);
+            entry_tag_u32_present(bytes, entry, VERTEX_LAYOUT_TAG_STEP_FUNCTION);
+        let declared_step_rate = entry_tag_u32_present(bytes, entry, VERTEX_LAYOUT_TAG_STEP_RATE);
         if (buffer_index as usize) >= MAX_VERTEX_LAYOUTS {
             // `MTLVertexDescriptor.layouts` has no such subscript, so this is a
             // descriptor no Apple driver produces and one this decoder cannot
@@ -1865,7 +1868,7 @@ pub fn parse_vertex_block(
     }
 
     let attr_section = bo.saturating_add(attr_off as usize);
-    if attr_section + 4 > block_end {
+    if attr_section + 4 > bytes.len() {
         return Err(DecodeStatus::ErrShort("res_vertex_attr_count_oob"));
     }
     let attr_count = ld32(&bytes[attr_section..]) as usize;
@@ -1880,17 +1883,17 @@ pub fn parse_vertex_block(
     }
     for i in 0..attr_count {
         let offloc = attr_section + 4 + i * 4;
-        if offloc + 4 > block_end {
+        if offloc + 4 > bytes.len() {
             return Err(DecodeStatus::ErrShort("res_vertex_attr_offset_oob"));
         }
         let entry = attr_section + ld32(&bytes[offloc..]) as usize;
-        if entry >= block_end {
+        if entry >= bytes.len() {
             return Err(DecodeStatus::ErrShort("res_vertex_attr_entry_oob"));
         }
-        let location = entry_tag_u32(bytes, block_end, entry, VERTEX_ATTR_TAG_LOCATION, i as u32);
-        let format = entry_tag_u32(bytes, block_end, entry, VERTEX_ATTR_TAG_FORMAT, 0);
-        let offset = entry_tag_u32(bytes, block_end, entry, VERTEX_ATTR_TAG_OFFSET, 0);
-        let buffer_index = entry_tag_u32(bytes, block_end, entry, VERTEX_ATTR_TAG_BUFFER_INDEX, 0);
+        let location = entry_tag_u32(bytes, entry, VERTEX_ATTR_TAG_LOCATION, i as u32);
+        let format = entry_tag_u32(bytes, entry, VERTEX_ATTR_TAG_FORMAT, 0);
+        let offset = entry_tag_u32(bytes, entry, VERTEX_ATTR_TAG_OFFSET, 0);
+        let buffer_index = entry_tag_u32(bytes, entry, VERTEX_ATTR_TAG_BUFFER_INDEX, 0);
         let stride =
             if (buffer_index as usize) < MAX_VERTEX_LAYOUTS && have_stride[buffer_index as usize] {
                 strides[buffer_index as usize]
@@ -2156,8 +2159,8 @@ const COLOR_ATTACH_DROP_VALUE_CAP: u32 = 64;
 ///
 /// Pipeline descriptors are decoded once per distinct pipeline and cached, so
 /// this walk is not on a per-draw path.
-fn note_color_entry_fields(bytes: &[u8], len: usize, entry: usize, slot: u32) {
-    if entry >= len {
+fn note_color_entry_fields(bytes: &[u8], entry: usize, slot: u32) {
+    if entry >= bytes.len() {
         return;
     }
     let field_count = bytes[entry] as usize;
@@ -2166,12 +2169,12 @@ fn note_color_entry_fields(bytes: &[u8], len: usize, entry: usize, slot: u32) {
     let mut shape_key: u64 = 0;
     let mut dropped: Vec<(u8, u8, u32)> = Vec::new();
     for _ in 0..field_count {
-        if p + 2 > len {
+        if p + 2 > bytes.len() {
             break;
         }
         let tag = bytes[p];
         let field_len = bytes[p + 1] as usize;
-        if p + 2 + field_len > len {
+        if p + 2 + field_len > bytes.len() {
             break;
         }
         let value = if field_len >= 4 {
@@ -2225,11 +2228,10 @@ fn note_color_entry_fields(bytes: &[u8], len: usize, entry: usize, slot: u32) {
 /// attachment onto slot 0, which is worse than the position it replaces.
 fn parse_one_color_entry(
     bytes: &[u8],
-    len: usize,
     entry: usize,
     position: u32,
 ) -> Result<PipelineColorAttachment, DecodeStatus> {
-    let slot = match entry_tag_u32_present(bytes, len, entry, COLOR_ATTACHMENT_TAG_INDEX) {
+    let slot = match entry_tag_u32_present(bytes, entry, COLOR_ATTACHMENT_TAG_INDEX) {
         Some(declared) if (declared as usize) < MAX_COLOR_ATTACHMENTS => {
             if declared != position {
                 // The case this decoder could not previously see: the guest's
@@ -2262,7 +2264,7 @@ fn parse_one_color_entry(
         }
         None => position,
     };
-    note_color_entry_fields(bytes, len, entry, slot);
+    note_color_entry_fields(bytes, entry, slot);
     let mut out = PipelineColorAttachment {
         slot,
         src_rgb: BLEND_FACTOR_ONE,
@@ -2273,59 +2275,37 @@ fn parse_one_color_entry(
         op_alpha: BLEND_OP_ADD,
         ..Default::default()
     };
-    let pf = entry_tag_u32(
-        bytes,
-        len,
-        entry,
-        COLOR_ATTACHMENT_TAG_PIXEL_FORMAT,
-        u32::MAX,
-    );
+    let pf = entry_tag_u32(bytes, entry, COLOR_ATTACHMENT_TAG_PIXEL_FORMAT, u32::MAX);
     if pf != u32::MAX {
         out.has_pixel_format = true;
         out.pixel_format = pf;
     }
-    out.blending_enabled =
-        entry_tag_u32(bytes, len, entry, COLOR_ATTACHMENT_TAG_BLEND_ENABLE, 0) != 0;
-    out.src_rgb = entry_tag_u32(
-        bytes,
-        len,
-        entry,
-        COLOR_ATTACHMENT_TAG_SRC_RGB,
-        BLEND_FACTOR_ONE,
-    );
+    out.blending_enabled = entry_tag_u32(bytes, entry, COLOR_ATTACHMENT_TAG_BLEND_ENABLE, 0) != 0;
+    out.src_rgb = entry_tag_u32(bytes, entry, COLOR_ATTACHMENT_TAG_SRC_RGB, BLEND_FACTOR_ONE);
     out.dst_rgb = entry_tag_u32(
         bytes,
-        len,
         entry,
         COLOR_ATTACHMENT_TAG_DST_RGB,
         BLEND_FACTOR_ZERO,
     );
-    out.op_rgb = entry_tag_u32(bytes, len, entry, COLOR_ATTACHMENT_TAG_RGB_OP, BLEND_OP_ADD);
+    out.op_rgb = entry_tag_u32(bytes, entry, COLOR_ATTACHMENT_TAG_RGB_OP, BLEND_OP_ADD);
     out.src_alpha = entry_tag_u32(
         bytes,
-        len,
         entry,
         COLOR_ATTACHMENT_TAG_SRC_ALPHA,
         BLEND_FACTOR_ONE,
     );
     out.dst_alpha = entry_tag_u32(
         bytes,
-        len,
         entry,
         COLOR_ATTACHMENT_TAG_DST_ALPHA,
         BLEND_FACTOR_ZERO,
     );
-    out.op_alpha = entry_tag_u32(
-        bytes,
-        len,
-        entry,
-        COLOR_ATTACHMENT_TAG_ALPHA_OP,
-        BLEND_OP_ADD,
-    );
+    out.op_alpha = entry_tag_u32(bytes, entry, COLOR_ATTACHMENT_TAG_ALPHA_OP, BLEND_OP_ADD);
     // An entry that omits the tag left the property at its default, which for
     // `MTLColorWriteMask` is `all` — the same thing `ColorWriteMask::default()`
     // says, so the absent case needs no branch.
-    if let Some(mask) = entry_tag_u32_present(bytes, len, entry, COLOR_ATTACHMENT_TAG_WRITE_MASK) {
+    if let Some(mask) = entry_tag_u32_present(bytes, entry, COLOR_ATTACHMENT_TAG_WRITE_MASK) {
         if let Some(decoded) = ColorWriteMask::new(mask) {
             out.write_mask = decoded;
         } else if crate::observe::first_sight("color_write_mask_out_of_range", u64::from(mask)) {
@@ -2433,16 +2413,24 @@ const _: () =
 /// missing attachments read as a guest that declared fewer — the wrong blend or
 /// the absent render target arrives with nothing naming it.
 ///
-/// `len` is a **reach within `bytes`**, not a second name for its length: this
-/// function and its helpers stop at `len` so a section may be bounded short of
-/// the record's end. Everything below therefore checks against `len` and indexes
-/// `bytes`, and the two are only the same thing while `len <= bytes.len()` —
-/// which is why that is checked here rather than assumed. [`parse_vertex_block`]
-/// takes the same shape of bound and has always carried the equivalent clause;
-/// this one did not, so a `len` past the end passed every guard and then
+/// `len` is a **reach within `bytes`**, not a second name for its length: a
+/// section may be bounded short of the record's end, and the caller is the only
+/// thing that knows where.
+///
+/// It is applied by narrowing — `bytes.get(..len)` — rather than by being
+/// carried alongside the slice, and that is the whole of the fix here. This
+/// family used to thread `len` down through four helpers, each of which
+/// compared an offset against `len` and then indexed `bytes`; the two are the
+/// same thing only while `len <= bytes.len()`, and nothing checked it.
+/// [`parse_vertex_block`] takes the same shape of bound and had always carried
+/// the equivalent clause, so a `len` past the end passed every guard here and
 /// panicked on the first `ld32`. Nothing guest-side could produce it — the one
-/// caller has already required `declared == bytes.len()` — but this is a `pub fn`
-/// whose totality rested on an invariant stated nowhere.
+/// caller has already required `declared == bytes.len()` — but a `pub fn` whose
+/// totality rests on an invariant stated nowhere is one caller away from it.
+///
+/// After the narrowing there is exactly one length in scope and it is the
+/// slice's own, so the class cannot come back by someone adding a check against
+/// the wrong number.
 pub fn parse_color_attachments(
     bytes: &[u8],
     len: usize,
@@ -2452,21 +2440,29 @@ pub fn parse_color_attachments(
     if section_off == 0 {
         return Ok(out);
     }
-    if len > bytes.len() {
+    // Narrow to the reach *once*, here, and every check below is against a slice
+    // Rust bounds for us. Threading `len` down instead is what let this family
+    // check one number and index another.
+    let Some(bytes) = bytes.get(..len) else {
         return Err(DecodeStatus::ErrShort("res_color_reach_past_record"));
-    }
+    };
     // The header is the count plus the first entry's offset word. A section the
     // descriptor cannot contain loses an unreadable number of attachments, which
     // the count mismatch below cannot see, so it is reported here.
-    if section_off + 8 > len {
-        note_color_table_truncated(None, 0, section_off, len);
+    if section_off + 8 > bytes.len() {
+        note_color_table_truncated(None, 0, section_off, bytes.len());
         return Err(DecodeStatus::ErrShort("res_color_section_oob"));
     }
     let declared = ld32(&bytes[section_off..]) as usize;
     // `MTLRenderPipelineDescriptor.colorAttachments` has eight subscripts, so a
     // ninth is a descriptor Metal cannot hold and this decoder cannot place.
     if declared > MAX_COLOR_ATTACHMENTS {
-        note_color_table_truncated(Some(declared), MAX_COLOR_ATTACHMENTS, section_off, len);
+        note_color_table_truncated(
+            Some(declared),
+            MAX_COLOR_ATTACHMENTS,
+            section_off,
+            bytes.len(),
+        );
         return Err(DecodeStatus::ErrUnsupported("res_color_count_over"));
     }
     for i in 0..declared {
@@ -2475,18 +2471,18 @@ pub fn parse_color_attachments(
         // does. Both used to `break`, which left a shorter table and one line
         // saying so; both now carry that line and refuse.
         let offloc = section_off + 4 + i * 4;
-        let entry = if offloc + 4 > len {
+        let entry = if offloc + 4 > bytes.len() {
             None
         } else {
             section_off
                 .checked_add(ld32(&bytes[offloc..]) as usize)
-                .filter(|e| *e < len)
+                .filter(|e| *e < bytes.len())
         };
         let Some(entry) = entry else {
-            note_color_table_truncated(Some(declared), out.len(), section_off, len);
+            note_color_table_truncated(Some(declared), out.len(), section_off, bytes.len());
             return Err(DecodeStatus::ErrShort("res_color_entry_oob"));
         };
-        out.push(parse_one_color_entry(bytes, len, entry, i as u32)?);
+        out.push(parse_one_color_entry(bytes, entry, i as u32)?);
     }
     Ok(out)
 }
@@ -2856,7 +2852,7 @@ pub fn parse_compute_stage_input_block(
     if block_start >= bytes.len() {
         return Ok(None);
     }
-    let bo = skip_optional_label_and_pad(bytes, bytes.len(), block_start);
+    let bo = skip_optional_label_and_pad(bytes, block_start);
     if bo >= bytes.len() {
         return Ok(None);
     }
