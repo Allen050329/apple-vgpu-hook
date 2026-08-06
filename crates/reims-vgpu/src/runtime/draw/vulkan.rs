@@ -3037,8 +3037,10 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
 /// 13 distinct spans, backing=Same and fmt=Bgra8 on every one
 /// ```
 ///
-/// A second driven boot on the same workload read 28 / 28 / 0 — the same
-/// partition, so the zero is not one boot's luck.
+/// A second driven boot on the same workload read 28 / 28 / 0 and a third
+/// 32 / 32 / 0 — the same partition three times, so the zero is not one boot's
+/// luck. The identity to check is `with_host_entry == host_agrees +
+/// host_content`; it is what catches a miscount before the zero is believed.
 ///
 /// So the two rails agree on every occurrence. The dominant blank class is
 /// elsewhere — 98.8 % of blank samples have no cache entry for the span at all,
