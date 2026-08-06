@@ -73,9 +73,26 @@ pub(crate) struct LayoutKey {
     pub bindings: Vec<BindingSig>,
 }
 
-/// Max secondary color attachments (MRT slot 1..). Metal caps color
-/// attachments at 8, so 7 beyond the primary slot 0.
+/// Max secondary color attachments (MRT slot 1..): every colour slot Apple's
+/// serialized render pass can carry, less the primary at slot 0.
+///
+/// The fourth spelling of one number, and the last one to be pinned. The wire
+/// record's colour-slot array is the truth,
+/// [`crate::runtime::decode::render::PASS_MAX_COLOR_ATTACHMENTS`] derives from
+/// it, and `backend::metal::REIMS_VGPU_METAL_MAX_COLOR_RTS` is held equal to it
+/// by an assertion beside itself. This one is that bound minus one, on the arm
+/// the other assertion cannot reach — `REIMS_VGPU_METAL_MAX_COLOR_RTS` is behind
+/// `feature = "backend-metal"`, so nothing in a Vulkan build compared the two.
+///
+/// A drift here is refused rather than lost: `execute_draw_inner` returns
+/// [`super::reason::DrawReason::SecondaryAttachmentCap`] for a request past this
+/// count, so a shortfall costs the whole draw and says so. That makes the
+/// failure loud and still wrong — a guest sending the eighth colour slot the
+/// wire format allows would have every MRT draw refused — which is what this
+/// assertion is for.
 pub(crate) const MAX_SECONDARY_ATTACH: usize = 7;
+const _: () =
+    assert!(1 + MAX_SECONDARY_ATTACH == crate::runtime::decode::render::PASS_MAX_COLOR_ATTACHMENTS);
 
 /// A secondary MRT attachment's contribution to the render-pass / pipeline key.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Default)]
