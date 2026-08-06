@@ -2182,11 +2182,9 @@ pub fn counter_snapshot() -> CounterSnapshot {
     let (sole_peak, sole_peak_bytes) = eng.pools.registry_sole_copy_stats();
     snap.registry_sole_copy_peak = sole_peak;
     snap.registry_sole_copy_peak_bytes = sole_peak_bytes;
-    let (cs_sole, cs_sole_bytes, cs_no_victim) = eng.pools.compute_storage_sole_copy_stats();
+    let (cs_sole, cs_sole_bytes) = eng.pools.compute_storage_sole_copy_stats();
     snap.compute_storage_sole_copy_peak = cs_sole;
     snap.compute_storage_sole_copy_peak_bytes = cs_sole_bytes;
-    snap.compute_storage_cap_no_victim = cs_no_victim;
-    snap.compute_storage_cap_evictions = eng.pools.compute_storage_cap_evictions();
     snap.resident_resample_peak_ms = eng.pools.resident_resample_peak_ms();
     let (slab_held, slab_carved) = eng.pools.slab_held_bytes();
     snap.slab_held_bytes = slab_held;

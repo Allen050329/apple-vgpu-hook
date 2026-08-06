@@ -363,21 +363,6 @@ engine_counters! {
         /// in the tree emitted them, so they are historical probe output rather
         /// than something a boot can be asked for. That is the gap this closes.
         registry_non_pinned_peak,
-        /// Compute-storage residents destroyed by `COMPUTE_STORAGE_REGISTRY_CAP`,
-        /// cumulative.
-        ///
-        /// It counts lost guest work: nothing recreates a compute-storage
-        /// resident's content, so a dispatch that later reads a destroyed
-        /// identity refuses with `ResidentSampleAbsent` or
-        /// `ResidentSeedGenerationLost`.
-        ///
-        /// It exists because that sweep incremented nothing at all, which left
-        /// its 64 unfalsifiable — the cap could have been biting on every
-        /// compute-heavy boot and no counter, route or log line would have
-        /// moved. Kept separate from the target count rather than summed with
-        /// it: the two registries are bounded differently over different
-        /// populations, and a boot needs to know which one bit.
-        compute_storage_cap_evictions,
         /// Worst gap, in milliseconds, between a resident being touched and
         /// being read again — the margin against `IDLE_TARGET_AGE_MS`, the age
         /// at which the idle drain destroys a resident terminally.
@@ -428,15 +413,12 @@ engine_counters! {
         /// give back, and the copy-out sites are what needs work.
         registry_sole_copy_peak,
         registry_sole_copy_peak_bytes,
-        /// The two above over the compute-storage registry, plus the times that
-        /// registry's capacity walk wanted a victim and found every remaining
-        /// resident pinned or the sole copy of its pixels. Separate rather than
-        /// summed for the reason `compute_storage_cap_evictions` is: the two
-        /// registries are bounded differently over different populations, and a
-        /// boot needs to know which one bit.
+        /// The two above over the compute-storage registry. Separate rather than
+        /// summed with them: that registry holds standalone `VkDeviceMemory`
+        /// where this one holds slab suballocations, and a boot needs to know
+        /// which of the two an allocation failure would have found something in.
         compute_storage_sole_copy_peak,
         compute_storage_sole_copy_peak_bytes,
-        compute_storage_cap_no_victim,
     }
 }
 /// The `note_*` helpers: the increments that are not a bare `fetch_add(1)` at

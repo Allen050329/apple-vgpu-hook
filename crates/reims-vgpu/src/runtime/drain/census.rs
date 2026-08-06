@@ -1522,20 +1522,25 @@ fn emit_engine_delta() {
 /// was itself the unfounded claim. The reading still matters: it is what says a
 /// draw would have noticed had anything gone missing.
 ///
-/// `compute_storage_evicts` is the sibling registry's loss count. That registry
-/// still has a slot cap and its evictions are terminal, so this is the one
-/// number on the line that counts destroyed guest work.
+/// `cs_sole_copy` is the same protected-population reading over the
+/// compute-storage registry. It is worth reading separately rather than summed:
+/// that registry holds standalone `VkDeviceMemory` where the target registry
+/// holds slab suballocations, so the two say different things about what an
+/// allocation failure would have found to give back.
+///
+/// Neither registry publishes an eviction count any more, because neither has a
+/// slot count to evict for. `vram_reclaim_retry` and
+/// `vram_compute_storage_reclaim_retry` on the fail channel are what report a
+/// reclaim now, and they fire only when an allocation was actually refused.
 #[cfg(feature = "backend-vulkan")]
 fn emit_registry_pressure(now: &crate::backend::vulkan::engine::CounterSnapshot) {
     crate::observe::off(format!(
         "registry_pressure (levels, not per-interval) peak={} peak_mib={} \
-         resident_samples={} compute_storage_evicts={} resample_peak_ms={}/{} \
-         slab_mib={}/{} sole_copy={}/{}mib \
-         cs_sole_copy={}/{}mib cs_cap_no_victim={}",
+         resident_samples={} resample_peak_ms={}/{} \
+         slab_mib={}/{} sole_copy={}/{}mib cs_sole_copy={}/{}mib",
         now.registry_non_pinned_peak,
         now.registry_non_pinned_peak_bytes >> 20,
         now.sampled_gpu_binds,
-        now.compute_storage_cap_evictions,
         now.resident_resample_peak_ms,
         crate::backend::vulkan::engine::IDLE_TARGET_AGE_MS,
         now.slab_carved_bytes >> 20,
@@ -1544,7 +1549,6 @@ fn emit_registry_pressure(now: &crate::backend::vulkan::engine::CounterSnapshot)
         now.registry_sole_copy_peak_bytes >> 20,
         now.compute_storage_sole_copy_peak,
         now.compute_storage_sole_copy_peak_bytes >> 20,
-        now.compute_storage_cap_no_victim,
     ));
 }
 

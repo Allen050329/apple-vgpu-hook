@@ -274,15 +274,6 @@ pub(crate) struct ResourcePools {
     /// ever come", and a gap that peaks between two census samples is exactly
     /// what an instantaneous reading misses.
     resident_resample_peak_ms: u64,
-    /// Residents `COMPUTE_STORAGE_REGISTRY_CAP` destroyed.
-    ///
-    /// The sibling count for the compute-storage registry, and it existed
-    /// nowhere until this line: that cap swept, disposed and moved on without
-    /// incrementing anything, so no boot could answer whether 64 had ever bound.
-    /// Its loss is not a re-upload — a dispatch that later reads the identity
-    /// refuses with `ResidentSampleAbsent` or `ResidentSeedGenerationLost` — so
-    /// this counts lost guest work.
-    compute_storage_cap_evictions: u64,
     /// The live non-pinned population and what it occupies, maintained rather
     /// than walked. Both readings come off this, and
     /// `ResourcePools::registry_non_pinned_adjust` is the only writer — see
@@ -310,15 +301,12 @@ pub(crate) struct ResourcePools {
     /// bytes, sampled where every admission passes.
     registry_sole_copy_peak: NonPinnedTotals,
     /// The compute-storage counterparts of [`Self::registry_sole_copy`] and
-    /// [`Self::registry_sole_copy_peak`], plus the times that registry's
-    /// capacity walk wanted a victim and found every remaining resident pinned
-    /// or the sole copy of its pixels. Kept separate rather than summed for the
-    /// reason `compute_storage_cap_evictions` is: the two registries are bounded
-    /// differently over different populations, and a boot needs to know which
-    /// one bit.
+    /// [`Self::registry_sole_copy_peak`]. Kept separate rather than summed with
+    /// them: the two registries hold different resources — slab suballocations
+    /// against standalone `VkDeviceMemory` — and a boot needs to know which one
+    /// an allocation failure would have found something in.
     compute_storage_sole_copy: NonPinnedTotals,
     compute_storage_sole_copy_peak: NonPinnedTotals,
-    compute_storage_cap_no_victim: u64,
     /// Monotonic wall-clock milliseconds for the resident-target idle drain, fed
     /// from the poll heartbeat and each publish ([`Self::advance_registry_touch_and_drain`]).
     /// Each admit/hit/present stamps its slot's `last_touch_ms` with this value;
@@ -806,17 +794,17 @@ struct ResidentStorageImageSlot {
     /// compute workload, and one resident against a 64 cap says the registry was
     /// nearly empty for the whole run. The reading that would mean something
     /// comes from a guest doing sustained compute — a video decode or filter
-    /// chain — and `cs_sole_copy` against `COMPUTE_STORAGE_REGISTRY_CAP` is what
-    /// to look at when one is available. `cs_cap_no_victim` rising is the signal
-    /// that this protection has started to bind.
+    /// chain — and `cs_sole_copy` against the live population is what to look at
+    /// when one is available. A ratio near 1 means an allocation failure would
+    /// find nothing here to give back.
     gpu_only_content: bool,
     /// Value of `ResourcePools::idle_clock_ms` (wall-clock ms) at this resident's
     /// last use (admit or `acquire_resident_storage_image` hit). The idle drain
     /// ([`ResourcePools::advance_registry_touch_and_drain`]) reclaims a non-pinned
     /// resident once its touch falls `IDLE_TARGET_AGE_MS` behind the clock — so a
     /// compute-heavy burst's stale residents (a settled page's blur/decode storage
-    /// images) are returned to the driver instead of pinning up to
-    /// `COMPUTE_STORAGE_REGISTRY_CAP` standalone VkDeviceMemory allocations for the
+    /// images) are returned to the driver instead of pinning standalone
+    /// VkDeviceMemory allocations for the
     /// guest lifetime, while an actively-dispatched resident (touched every pass)
     /// never ages out. Mirrors [`ResidentTargetSlot::last_touch_ms`].
     last_touch_ms: u64,
@@ -1310,18 +1298,6 @@ const IDLE_DRAIN_INTERVAL_MS: u64 = 100;
 /// pass so a large stale set (a ~600-target burst) drains gradually instead of
 /// stalling one call with hundreds of image destroys.
 const IDLE_TARGET_DRAIN_MAX_PER_CALL: usize = 4;
-/// Cap for the separate compute-storage resident registry.
-///
-/// The target registry's equivalent slot count is retired — that population is
-/// bounded by the allocator refusing, see
-/// [`ResourcePools::recoverable_residents`]. This one is **not**, and the reason
-/// is a gap rather than a decision: `reclaim_for_allocation_retry` gives back
-/// target residents and recycle pools and nothing from this registry, so removing
-/// this count would leave the population with only the age drain trimming it and
-/// nothing to hand back when an allocation fails. Its evictions are terminal and
-/// counted (`compute_storage_cap_evictions`); closing this needs the reclaim
-/// extended to this registry first.
-const COMPUTE_STORAGE_REGISTRY_CAP: usize = 64;
 /// Reclaimed identities remembered for [`ResourcePools::reclaimed_recent`].
 ///
 /// Sized to comfortably span one burst's reclamations so the answer is still

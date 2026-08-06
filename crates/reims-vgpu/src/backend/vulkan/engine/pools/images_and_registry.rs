@@ -295,33 +295,30 @@ impl ResourcePools {
             });
         }
 
-        // Least-recently-used, skipping pinned residents (deferred-writeback
-        // content whose only copy is on the GPU). When everything left is
-        // pinned there is no victim and the registry soft-exceeds the cap
-        // rather than lose unflushed content — the same trade the sibling
-        // target registry's walk makes.
+        // Census only. A slot count used to trim this population here and its
+        // losses were terminal — see `recoverable_compute_storage_residents`.
         self.note_compute_storage_reach();
-        while self.compute_storage_registry.len() >= COMPUTE_STORAGE_REGISTRY_CAP {
-            let Some(victim) = self.compute_storage_eviction_victim() else {
-                self.compute_storage_cap_no_victim += 1;
-                break;
-            };
-            if let Some(old) = self.remove_compute_storage_resident(&victim) {
-                self.dispose(
-                    &ctx.device,
-                    DeferredHandle::Image {
-                        image: old.slot.image,
-                        view: old.slot.view,
-                        memory: old.slot.memory,
-                    },
-                );
-            }
-            self.compute_storage_cap_evictions += 1;
-        }
 
         // Reuse the common allocator, then detach its bookkeeping copy from
         // the transient live list: the registry now owns this allocation.
-        let slot = self.acquire_storage_image(ctx, key, counters)?;
+        //
+        // Out of memory is the one refusal worth a second attempt, exactly as at
+        // the sibling target registry's admission: this device is usually still
+        // holding residents it was entitled to give back. This is also the point
+        // the retired cap sweep destroyed residents at, which is what makes
+        // retiring live ones safe here — the caller holds no handle from this
+        // acquire yet, and no sampled source has been resolved.
+        let slot = match self.acquire_storage_image(ctx, key, counters) {
+            Ok(slot) => slot,
+            Err(error) if error.out_of_memory() => {
+                if self.reclaim_compute_storage_for_allocation_retry(ctx) == 0 {
+                    return Err(error);
+                }
+                self.acquire_storage_image(ctx, key, counters)
+                    .map_err(|_| error)?
+            }
+            Err(error) => return Err(error),
+        };
         let live = self.storage_image_live.pop().ok_or({
             DrawError::ComputeExecution(ComputeExecutionDecline::ResidentAllocatorLiveSlotMissing {
                 identity,
@@ -378,32 +375,92 @@ impl ResourcePools {
         })
     }
 
-    /// Least-recently-used evictable compute-storage resident, or `None` when
-    /// every remaining entry is pinned.
+    /// Every compute-storage resident the device may destroy without losing
+    /// guest work: not pinned, and not the only copy of its own contents.
     ///
-    /// Selected by minimum `last_touch_ms` rather than by the front of
-    /// [`ResourcePools::compute_storage_order`], for the reason the sibling
-    /// target registry's `cap_eviction_victim` states: insertion order makes a
-    /// long-lived resident the permanent front and so the first victim of every
-    /// burst, however hard the current chain is reading it. Iterating the order
-    /// rather than the map keeps the choice deterministic — `min_by_key` returns
-    /// the first minimum, so ties fall to the oldest-created entry, which is
-    /// what this walk did for every entry before.
+    /// The sibling of [`Self::recoverable_residents`] over the other registry,
+    /// and it answers the same question — what could be given back if it had to
+    /// be, which is what an allocation failure asks.
     ///
-    /// O(n) per eviction rather than O(1) amortised. That is the same trade the
-    /// target registry made and for the same reason: evictions are rare next to
-    /// the reads this avoids promoting on.
-    pub(crate) fn compute_storage_eviction_victim(&self) -> Option<ComputeStorageResidencyKey> {
+    /// # This population used to be trimmed by a slot count, and that lost work
+    ///
+    /// `COMPUTE_STORAGE_REGISTRY_CAP = 64` swept the least-recently-used entry
+    /// on every admission past the count. Its losses were **terminal and worse
+    /// than the target registry's**: nothing recreates a compute-storage
+    /// resident's contents, so a dispatch that later reads a destroyed identity
+    /// refuses with `ResidentSampleAbsent` or `ResidentSeedGenerationLost`
+    /// rather than paying a re-upload. `compute_storage_cap_evictions` counted
+    /// exactly that, and it counted destroyed guest work.
+    ///
+    /// The count is gone and the allocation is the bound, as on the sibling. The
+    /// prerequisite that was missing — and the reason the two registries did not
+    /// change together — is that `reclaim_for_allocation_retry` gave back target
+    /// residents and recycle pools and nothing from here, so removing the count
+    /// alone would have left this population with the age drain trimming it and
+    /// nothing to hand back when an allocation failed.
+    /// [`Self::reclaim_compute_storage_for_allocation_retry`] is that half.
+    ///
+    /// Ordering is `compute_storage_order`, so the result is deterministic and
+    /// oldest-created first. Nothing selects a single victim any more: the
+    /// reclaim takes the whole set at once, because by the time it runs the
+    /// question is whether the dispatch survives at all.
+    pub(super) fn recoverable_compute_storage_residents(
+        &self,
+    ) -> Vec<ComputeStorageResidencyKey> {
         self.compute_storage_order
             .iter()
-            .filter_map(|identity| {
+            .filter(|identity| {
                 self.compute_storage_registry
-                    .get(identity)
-                    .filter(|resident| !resident.pinned && !resident.gpu_only_content)
-                    .map(|resident| (identity, resident.last_touch_ms))
+                    .get(*identity)
+                    .is_some_and(|resident| !resident.pinned && !resident.gpu_only_content)
             })
-            .min_by_key(|(_, touch)| *touch)
-            .map(|(identity, _)| *identity)
+            .copied()
+            .collect()
+    }
+
+    /// Give back every compute-storage resident that is neither pinned nor the
+    /// only copy of its contents, plus the recycle pools, for a retry after the
+    /// device refused an allocation. Returns how many were released.
+    ///
+    /// Deliberately *not* folded into [`Self::reclaim_for_allocation_retry`],
+    /// and not the reverse either. Each registry's reclaim runs only at its own
+    /// admission, which is the one point where the caller provably holds no
+    /// handle it is about to use — the property `333c126e` established the hard
+    /// way when hoisting the fuller reclaim to every allocation site segfaulted
+    /// QEMU. A draw can bind a compute-storage resident as a sampled source, so
+    /// a target admission reclaiming this registry would have exactly that
+    /// defect.
+    unsafe fn reclaim_compute_storage_for_allocation_retry(
+        &mut self,
+        ctx: &DeviceContext,
+    ) -> usize {
+        let trimmed = self.reclaim_pools_for_allocation_retry(ctx);
+        let victims = self.recoverable_compute_storage_residents();
+        let mut freed = 0;
+        for victim in &victims {
+            if let Some(old) = self.remove_compute_storage_resident(victim) {
+                self.dispose(
+                    &ctx.device,
+                    DeferredHandle::Image {
+                        image: old.slot.image,
+                        view: old.slot.view,
+                        memory: old.slot.memory,
+                    },
+                );
+                freed += 1;
+            }
+        }
+        // Always visible, for the reason the sibling's line is: a device that has
+        // had to do this is one whose next allocation is also likely to fail.
+        crate::observe::fail(format!(
+            "vram_compute_storage_reclaim_retry residents={freed} recycled={trimmed} \
+             held_bytes={} sole_copy={} live={} (an allocation was refused; gave \
+             back everything that is neither pinned nor the only copy of its contents)",
+            self.slab.held_bytes().0,
+            self.compute_storage_sole_copy.count,
+            self.compute_storage_registry.len(),
+        ));
+        freed + trimmed
     }
 
     /// Drop the compute-storage resident under `identity` from both halves of
