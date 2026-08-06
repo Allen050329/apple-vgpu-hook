@@ -2072,6 +2072,33 @@ mod content_hash_tests {
 }
 
 #[cfg(test)]
+mod staging_write_extent_tests {
+    use super::staging_write_fits;
+
+    /// A staging write may reach the end of its slot and not one byte past it.
+    ///
+    /// The boundary is the whole test. `size == slot_size` is the common case —
+    /// `acquire_staging` rounds the request up to a power-of-two bucket and
+    /// records the *bucket* as the slot's size, so an exact-bucket write is
+    /// every write that happens to land on one — and a check spelled `<` rather
+    /// than `<=` would refuse those while still passing any test that only
+    /// tried a clearly-too-large size.
+    #[test]
+    fn a_staging_write_may_fill_its_slot_and_not_pass_it() {
+        assert!(staging_write_fits(0, 64));
+        assert!(staging_write_fits(63, 64));
+        assert!(staging_write_fits(64, 64), "an exact-bucket write must fit");
+        assert!(!staging_write_fits(65, 64));
+        assert!(!staging_write_fits(u64::MAX, 64));
+        // A slot of zero bytes takes no write. `acquire_staging` raises every
+        // request to at least four, so this is unreachable through the pool —
+        // it is here because the rule must not depend on that.
+        assert!(!staging_write_fits(1, 0));
+        assert!(staging_write_fits(0, 0));
+    }
+}
+
+#[cfg(test)]
 mod pool_trim_order_tests {
     use super::{pop_any_pool_entry, pop_largest_pool_entry};
     use std::collections::HashMap;
@@ -2121,6 +2148,17 @@ mod pool_trim_order_tests {
     }
 }
 
+/// Whether a slot of `slot_size` bytes can be written for `size` bytes.
+///
+/// Split out from [`staging_write_ptr`] so the rule is reachable without a
+/// Vulkan device, which is the same reason `ContextOwner::note_init_failure` is
+/// its own function: it is the one part of that call that is a decision rather
+/// than a driver call, and the test below is the only thing that runs it on a
+/// host with no GPU.
+pub(crate) fn staging_write_fits(size: u64, slot_size: u64) -> bool {
+    size <= slot_size
+}
+
 /// Host write pointer for a staging slot's first `size` bytes.
 ///
 /// Staging slots are mapped for their lifetime at allocation, so this is a field
@@ -2128,11 +2166,35 @@ mod pool_trim_order_tests {
 /// mapping or was built by a path that does not map — it is the same
 /// map-per-write the pools used to do everywhere, and it leaks nothing because
 /// `vkFreeMemory` unmaps implicitly.
+///
+/// # Why the length is checked here and not left to the caller
+///
+/// The two arms did not answer the same question. `vkMapMemory` cannot map past
+/// its memory object, so while that was the only arm every over-long write was
+/// refused by the driver and no code here had to say so. The persistent mapping
+/// is a field read and inherits nothing: it hands back a pointer good for
+/// `slot.size` bytes to a caller that asked for `size`, and the three callers
+/// then `copy_nonoverlapping` or `write_bytes` for the full `size` — past the
+/// slot, into whatever the shared HOST_VISIBLE block put next to it. Their own
+/// comments state the span "is exactly `bytes.len()`" and "is at least
+/// `rgba.len()`", which is a claim about their callers rather than a check.
+///
+/// So the bound the driver used to enforce is enforced here, on both arms, and
+/// a violation is a named refusal instead of a host-memory overrun. It costs one
+/// comparison per staging write.
 unsafe fn staging_write_ptr(
     ctx: &DeviceContext,
     slot: &BufferSlot,
     size: u64,
 ) -> Result<*mut u8, DrawError> {
+    if !staging_write_fits(size, slot.size) {
+        return Err(DrawError::DrawExecution(
+            super::draw_execution::DrawExecutionDecline::StagingWriteBeyondSlot {
+                size,
+                slot_size: slot.size,
+            },
+        ));
+    }
     if slot.mapped != 0 {
         return Ok(slot.mapped as *mut u8);
     }

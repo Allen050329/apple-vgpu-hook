@@ -75,6 +75,25 @@ pub enum DrawExecutionDecline {
     UnsupportedTrackedLayout {
         layout: vk::ImageLayout,
     },
+    /// A staging write asked for more bytes than the slot it is writing into
+    /// holds.
+    ///
+    /// Every staging write reaches the mapped span through `staging_write_ptr`,
+    /// which has two arms. The `vkMapMemory` arm cannot exceed the allocation —
+    /// Vulkan refuses a map longer than the memory object — so for as long as
+    /// that was the only arm, the bound was the driver's and no code here had to
+    /// state it. The persistent-mapping arm is a field read and inherits no such
+    /// check, so the same call that used to fail now hands back a pointer good
+    /// for fewer bytes than the caller asked for, and the caller writes past the
+    /// slot's memory into whatever the slab put next to it.
+    ///
+    /// This is that bound written down, so both arms answer the same. It is a
+    /// device-side invariant rather than anything a guest can reach: every
+    /// caller acquires its slot for the size it is about to write.
+    StagingWriteBeyondSlot {
+        size: u64,
+        slot_size: u64,
+    },
 }
 
 impl Decline for DrawExecutionDecline {
@@ -100,6 +119,7 @@ impl Decline for DrawExecutionDecline {
                 "vk_draw_exec_sampled_resident_geometry_mismatch"
             }
             Self::UnsupportedTrackedLayout { .. } => "vk_draw_exec_unsupported_tracked_layout",
+            Self::StagingWriteBeyondSlot { .. } => "vk_draw_exec_staging_write_beyond_slot",
         }
     }
 
@@ -189,6 +209,10 @@ impl Decline for DrawExecutionDecline {
             Self::UnsupportedTrackedLayout { layout } => {
                 vec![("layout", format!("{layout:?}"))]
             }
+            Self::StagingWriteBeyondSlot { size, slot_size } => vec![
+                ("size", size.to_string()),
+                ("slot_size", slot_size.to_string()),
+            ],
         }
     }
 }
