@@ -979,6 +979,38 @@ impl FreeTargetImage {
 /// nothing has yet paid this. The reading that matters is not the zero; it is
 /// that the margin between a measured burst and permanent loss is 126 slots, and
 /// that the number of slots says nothing about how much of the heap they hold.
+///
+/// # What replaces it, and what that needs first
+///
+/// Not a bigger number. Retuning a slot count keeps the property that makes this
+/// dangerous — that the quantity bounded is not the quantity that runs out — and
+/// every retune has to be re-derived the first time a guest composites at a
+/// different geometry.
+///
+/// The bound belongs on the allocator: hold residents until `DEVICE_LOCAL`
+/// memory is genuinely exhausted, and let the allocation refuse. A refusal there
+/// is a *current*, attributable, self-healing failure — the draw that asked for
+/// more than the heap has is the one that fails, and the idle drain frees the
+/// space for its retry. A cap eviction is the opposite on all three counts: it
+/// destroys an earlier accepted result, attributes nothing, and breaks a
+/// *future* draw permanently. `MemoryProfile::device_local_bytes` is already
+/// measured from the device and already reachable here through `ctx.caps.memory`,
+/// so nothing needs a new constant — which is the point, because no fraction of
+/// the heap can be defended without first measuring what the engine's other
+/// consumers need, and this device does not account for those.
+///
+/// Two things have to land before that flip, in this order:
+///
+/// - **Incremental accounting.** `non_pinned_registry_len` and
+///   `non_pinned_registry_bytes` both walk the whole registry, on every admit.
+///   That is free while the cap holds n at ~320 and is a per-draw O(n) scan once
+///   it does not. Track both totals on register / unregister / pin / unpin
+///   instead. Pure refactor, testable without a GPU, and it must come first.
+/// - **A driven eviction.** No boot has ever produced one (`evicts=0`
+///   everywhere), so the walk and the `prior=cap_evicted` refusal it leads to
+///   are exercised only by the unit tests below. Whatever replaces this policy
+///   must be measured against a workload that actually reaches the bound, or the
+///   replacement inherits the same untested state.
 pub(crate) const REGISTRY_CAP: usize = 320;
 /// Wall-clock milliseconds a non-pinned resident may go untouched before the
 /// idle drain reclaims it. An actively-drawn target is touched every frame (and
