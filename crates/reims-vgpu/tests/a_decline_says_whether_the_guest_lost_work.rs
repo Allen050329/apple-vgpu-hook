@@ -46,6 +46,13 @@ enum Loss {
     /// truncated, a flag or an attribute ignored, a count clamped. No error
     /// reaches the guest, and the frame or the compute result is wrong.
     ///
+    /// Also covers a command that ran *nothing* and reported completion, which
+    /// does the guest the same harm from the only side it can see: it frees the
+    /// targets and reads the results either way. Nothing in this device has an
+    /// error channel back to the guest, so "the guest was not told" cannot be
+    /// what separates this class from [`Loss::Refused`] — what separates them is
+    /// whether the guest's own view of what happened is wrong.
+    ///
     /// A real GPU does not do this. This is the class the standing goal exists
     /// to eliminate, and every entry must name what would retire it.
     ExecutedModified,
@@ -91,7 +98,7 @@ struct Row {
 /// How many types may answer [`Loss::ExecutedModified`].
 ///
 /// Not a budget. A ratchet: see [`the_executed_modified_census_only_shrinks`].
-const EXECUTED_MODIFIED_CEILING: usize = 13;
+const EXECUTED_MODIFIED_CEILING: usize = 11;
 
 /// Every `impl Decline`/`impl Refusal` in the crate, and what its worst arm
 /// costs the guest.
@@ -358,10 +365,14 @@ const ROWS: &[Row] = &[
         file: "crates/reims-vgpu/src/model/state.rs",
         ty: "FailEvent",
         loss: Loss::ExecutedModified,
-        why: "an unrecognised root or child opcode is dropped while the \
-              packet's stamps retire, so the guest is told the work completed. \
-              Retired by identifying the opcode, or by withholding the stamp \
-              that says it ran",
+        why: "an unrecognised opcode runs nothing and the packet's completion \
+              stamp retires anyway — `write_stamp`'s own doc says that write is \
+              where \"the guest is told anything finished\", after which it may \
+              free the render targets. So the guest frees and reads on a \
+              completion nothing earned. **Withholding the stamp is not the \
+              retirement**: the guest waits on it, so a device that stopped \
+              stamping would hang rather than refuse. The retirement is \
+              identifying the opcode",
     },
     Row {
         file: "crates/reims-vgpu/src/model/state.rs",
@@ -667,10 +678,13 @@ const ROWS: &[Row] = &[
     Row {
         file: "crates/reims-vgpu/src/runtime/exec/mod.rs",
         ty: "IcbRecordDropped",
-        loss: Loss::ExecutedModified,
-        why: "a reset or copy of an indirect command buffer is dropped, so a \
-              later execute runs the commands that were supposed to have been \
-              cleared or replaced. Retired by implementing both records",
+        loss: Loss::Refused,
+        why: "the reset or copy record is abandoned outright — the blit arm \
+              logs and returns, applying no part of it. Its cost lands on a \
+              *later* command: an ICB the guest asked to clear or replace still \
+              holds what it held, and the next execute of it runs those. That \
+              is a refusal whose consequence outlives it, not a modified \
+              execution of this record, and it goes away by implementing both",
     },
     Row {
         file: "crates/reims-vgpu/src/runtime/exec/mod.rs",
@@ -683,18 +697,21 @@ const ROWS: &[Row] = &[
         file: "crates/reims-vgpu/src/runtime/exec/mod.rs",
         ty: "StreamDrawDrop",
         loss: Loss::ExecutedModified,
-        why: "a draw whose state could not be honoured — an unsupported \
-              colour subresource, a depth-stencil this rail cannot bind — is \
-              issued anyway against a different attachment or level. Retired by \
-              refusing the draw",
+        why: "a depth or stencil attachment that cannot be bound is left out \
+              and the pass renders without it; an unsupported colour \
+              subresource is noted and the attachment added anyway, so the pass \
+              draws to the wrong level or slice. The `Unbound` arm is not this \
+              — it keeps the draw out of `acc.draws` entirely. Retired by \
+              refusing the draw on the two arms that continue",
     },
     Row {
         file: "crates/reims-vgpu/src/runtime/exec/mod.rs",
         ty: "TextureFillDropped",
-        loss: Loss::ExecutedModified,
-        why: "a texture fill is dropped and the region keeps what it held, so \
-              the guest reads back content it believes it just wrote. Retired \
-              by implementing the fill",
+        loss: Loss::Refused,
+        why: "the fill arm logs and returns without executing any of it, so \
+              nothing partial lands; the region keeps what it held. A read-back \
+              afterwards sees stale content, which is what a refused write \
+              always leaves. Retired by implementing the fill",
     },
     Row {
         file: "crates/reims-vgpu/src/runtime/fence_exec.rs",
