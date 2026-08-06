@@ -1211,6 +1211,72 @@ pub(crate) const REGISTRY_CAP: usize = 320;
 /// `resample_peak_ms` reaching this value, both of which mean a resident
 /// survived only because the drain is throttled and had not reached it yet.
 pub(crate) const IDLE_TARGET_AGE_MS: u64 = 2000;
+/// Non-pinned population below which the idle drain destroys nothing.
+///
+/// The drain ages residents out on a wall clock with no reference to memory
+/// pressure, and its destroy is terminal. `REGISTRY_CAP` is the actual bound on
+/// the population; this drain is an optimisation on top of it, returning VRAM
+/// *earlier* than the cap would demand. Below this floor the cap has headroom
+/// nobody is competing for, so every destroy the drain performs there buys VRAM
+/// no one is waiting for at the cost of a resident the guest may sample —
+/// which is a trade with nothing on one side of it.
+///
+/// That is not hypothetical. On a driven x86/PCI boot the cap never bound at all
+/// (`evicts=0`, non-pinned peak 180-197 of 320) while the drain destroyed
+/// residents the guest went on to sample 44 times across 8 surfaces, every one
+/// reporting `prior=idle_drained` — and on the same boot `resample_peak_ms`
+/// read 2282 against a 2000 ms cutoff, so a resident was read *past* the age at
+/// which the drain destroys and survived only because the drain is throttled.
+///
+/// Half the cap rather than a new independent number: the quantity this gates is
+/// the same population `REGISTRY_CAP` bounds, so it is expressed in that bound
+/// and moves with it. A floor at half leaves the drain its whole reason for
+/// existing — a burst that reaches 260 still drains, down to here — while
+/// removing the destroys that happen when the registry is nowhere near its
+/// limit. The VRAM this holds is bounded by the same slot count as ever, and at
+/// the measured mix (~1.1 MiB a slot) is on the order of 170 MiB against a
+/// `DEVICE_LOCAL` heap measured in gigabytes.
+///
+/// It gates the resident destroys only. A gated pass still runs and still trims
+/// the recycle pools, because free-list images hold no guest content and giving
+/// them back costs nothing.
+///
+/// # What it bought and what it cost, both measured
+///
+/// Same driven x86/PCI boot and `web-content-probe --churn 1`, without the gate
+/// and with it:
+///
+/// ```text
+///                                  without      with
+///   t11sample_reclaimed_from_pages      44        30
+///   distinct mappings affected           8         3
+///   non-pinned peak                    180       261   (cap 320)
+///   peak_mib                           196       292
+///   evicts                               0         0
+///   resample_peak_ms                  2282      4076
+/// ```
+///
+/// A third fewer destroy-then-sample events and a third as many surfaces
+/// affected, for ~96 MiB and 81 slots of the cap's headroom. Both directions are
+/// real; this is a trade, not a free win, and the numbers are here so the next
+/// person can retune it against evidence rather than argue it.
+///
+/// **The reading that matters most is the last row.** `resample_peak_ms` went
+/// from 2282 to 4076 because residents that used to be destroyed at 2000 ms are
+/// now still there when the guest comes back for them — so the guest's real
+/// re-use interval on this workload reaches **4 s**, twice
+/// `IDLE_TARGET_AGE_MS`. The cutoff is not close to the working set, it is
+/// inside it, and every gap between 2 s and 4 s was previously a resident
+/// destroyed and re-served from somewhere else.
+///
+/// Two things this does not settle. The remaining 30 happen above the floor,
+/// where the drain still runs, so the gate reduces this class rather than
+/// closing it. And a peak of 261 against a cap of 320 leaves 59 slots where
+/// there were 140, so a heavier workload reaches `REGISTRY_CAP` sooner than it
+/// used to and starts paying cap evictions instead — a different terminal
+/// destroy. `evicts` staying 0 is what says that has not happened yet, and it is
+/// the reading to check before raising this floor.
+const IDLE_DRAIN_PRESSURE_FLOOR: usize = REGISTRY_CAP / 2;
 /// Minimum wall-clock spacing between reclaim passes. The poll path calls the
 /// drain ~244×/s; without this it would empty the whole registry in well under a
 /// second. At `IDLE_TARGET_DRAIN_MAX_PER_CALL` per pass this bounds reclaim to

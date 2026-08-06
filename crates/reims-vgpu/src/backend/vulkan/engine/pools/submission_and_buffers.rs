@@ -151,6 +151,15 @@ impl ResourcePools {
             return None;
         }
         self.last_drain_ms = now;
+        // Age alone is not a reason to destroy. Below the pressure floor the cap
+        // has headroom nobody is competing for, so a terminal destroy here buys
+        // VRAM no one is waiting for and can cost a resident the guest samples
+        // next — see `IDLE_DRAIN_PRESSURE_FLOOR`. An empty victim list rather
+        // than `None` so the pass still fires: `trim_recycle_pools` gives back
+        // free-list images, which hold no guest content.
+        if self.non_pinned_registry_len() <= IDLE_DRAIN_PRESSURE_FLOOR {
+            return Some(Vec::new());
+        }
         let cutoff = now - IDLE_TARGET_AGE_MS;
         let mut victims = Vec::new();
         for k in &self.registry_order {
