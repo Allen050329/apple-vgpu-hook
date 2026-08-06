@@ -74,47 +74,44 @@ fn source(rel: &str) -> String {
 /// A body gated on `test` is not product code, however the attribute spells it.
 #[test]
 fn a_test_module_body_is_blank_whatever_its_cfg_predicate_looks_like() {
-    // `#[cfg(all(test, feature = "backend-vulkan"))]`, the form that never
-    // matched. 1466 lines, the largest single block of the 1807.
-    let vulkan = source("reims-vgpu/src/runtime/draw/vulkan.rs");
-    let lines: Vec<&str> = vulkan.lines().collect();
-    for (n, needle) in [
-        (7298usize, "vec!["),
-        (7332, "let blank"),
-        (8219, "let mut cached"),
+    // Asserted on distinctive *body* content rather than line numbers, which
+    // shift under any edit above them and would make this test a tax on
+    // unrelated work — it had them, and the first reformat two files away broke
+    // it. Blanking keeps each item's header line so the offsets after it stay
+    // put, so a header is not evidence either way; only a body line is.
+    for (file, fixture, why) in [
+        // `#[cfg(all(test, feature = "backend-vulkan"))]`, the spelling that
+        // never matched. 1466 lines, the largest single block of the seven.
+        (
+            "reims-vgpu/src/runtime/draw/vulkan.rs",
+            "let blank = vec![0u8; (w * h * 4) as usize];",
+            "vulkan_split_tests",
+        ),
+        // A three-predicate `all`, in a module this host compiles but cannot run.
+        (
+            "reims-vgpu/src/runtime/draw/mod.rs",
+            "assert_eq!(from_object.lod_max_bits, 8.0f32.to_bits());",
+            "sampler_record_tests",
+        ),
+        (
+            "reims-vgpu/src/runtime/draw/mod.rs",
+            "MTLLoadAction{name} is in contract",
+            "load_action_contract_tests",
+        ),
+        // `pub(crate) mod` behind a test gate: the visibility must not stop the
+        // blanker reaching the body.
+        (
+            "reims-vgpu/src/runtime/decode/resource/mod.rs",
+            "pub(crate) const LEN: usize = w_smp::NEW_SAMPLER_TOTAL_LEN as usize;",
+            "sampler_desc",
+        ),
     ] {
-        let line = lines.get(n - 1).unwrap_or_else(|| panic!("line {n}"));
         assert!(
-            line.trim().is_empty(),
-            "vulkan_split_tests line {n} is still product to every scan here: {line:?} \
-             (it should contain {needle:?})"
+            !source(file).contains(fixture),
+            "{why} in {file} is a test body and every scan here is reading it as \
+             device behaviour — {fixture:?} survived the blanking"
         );
     }
-
-    // `#[cfg(all(test, feature = "backend-metal", target_os = "macos"))]` — a
-    // three-predicate `all`, and a module this host compiles but cannot run.
-    let draw = source("reims-vgpu/src/runtime/draw/mod.rs");
-    let draw_lines: Vec<&str> = draw.lines().collect();
-    for n in [2920usize, 4655, 4748, 4793] {
-        assert!(
-            draw_lines
-                .get(n - 1)
-                .is_some_and(|l| l.trim().is_empty() || l.trim() == "}"),
-            "draw/mod.rs line {n} is inside a test module and is still being scanned: {:?}",
-            draw_lines.get(n - 1)
-        );
-    }
-
-    // `pub(crate) mod` behind a test gate: the visibility must not stop the
-    // blanker finding the `mod`.
-    let resource = source("reims-vgpu/src/runtime/decode/resource/mod.rs");
-    assert!(
-        resource
-            .lines()
-            .nth(1078)
-            .is_some_and(|l| l.trim().is_empty()),
-        "a `pub(crate) mod` under a test cfg was not blanked"
-    );
 }
 
 /// Blanking a module must not take the file's remaining product code with it.

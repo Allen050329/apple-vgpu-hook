@@ -31,7 +31,9 @@ use crate::backend::vulkan::engine::{DrawError, DrawPreparationDecline};
 use crate::backend::vulkan::translate;
 #[cfg(feature = "backend-vulkan")]
 use crate::contract::endian::ld32;
-use crate::contract::pixel_format::{self, TexelLayout, MTL_FORMAT_BGRA8_UNORM, RGBA8_BPP, solid_rgba8};
+use crate::contract::pixel_format::{
+    self, solid_rgba8, TexelLayout, MTL_FORMAT_BGRA8_UNORM, RGBA8_BPP,
+};
 use crate::model::DeviceState;
 // `Decline::slug` on typed draw, coverage, and translation reasons.
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]

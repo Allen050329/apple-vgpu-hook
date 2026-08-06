@@ -9,32 +9,34 @@ use crate::contract::endian::{ld32, ld64};
 use crate::contract::pass_action::{
     MTL_LOAD_ACTION_CLEAR, MTL_LOAD_ACTION_LOAD, MTL_STORE_ACTION_STORE,
 };
-use crate::contract::pixel_format::{MTL_FORMAT_BGRA8_UNORM, RGBA8_BPP, f64_to_unorm8, solid_rgba8};
+use crate::contract::pixel_format::{
+    f64_to_unorm8, solid_rgba8, MTL_FORMAT_BGRA8_UNORM, RGBA8_BPP,
+};
 use crate::model::DeviceState;
 use crate::runtime::blit_exec::{self, BlitStatus};
 use crate::runtime::compute_exec::{self, ComputeStatus};
 use crate::runtime::decode::blit::{self, Kind as BlitKind};
 use crate::runtime::decode::compute::{self, Kind as ComputeKind};
 use crate::runtime::decode::event as event_decode;
+use crate::runtime::decode::fifo::{decode_exec_resource_table, ExecResourceDesc};
 use crate::runtime::decode::fifo::{
     CHILD_EXEC_INDIRECT_CMDBUF_COUNT, CHILD_EXEC_INDIRECT_CMDBUF_DESC_LEN,
     CHILD_EXEC_INDIRECT_CMDBUF_GVA, CHILD_EXEC_INDIRECT_CMDBUF_LENGTH,
     CHILD_EXEC_INDIRECT_HEADER_LEN, CHILD_EXEC_INDIRECT_RESOURCE_COUNT,
     CHILD_EXEC_INDIRECT_RESOURCE_DESC_LEN, CHILD_EXEC_INDIRECT_TASK_ID,
 };
-use crate::runtime::decode::fifo::{ExecResourceDesc, decode_exec_resource_table};
 use crate::runtime::decode::render::{
-    self, ColorAttachment, DepthAttachment, Kind as RenderKind, PASS_MAX_COLOR_ATTACHMENTS,
-    ScissorRect, Stage, StencilAttachment, decode_color_attachment, decode_depth_attachment,
-    decode_stencil_attachment, depth_stencil_is_bindable,
+    self, decode_color_attachment, decode_depth_attachment, decode_stencil_attachment,
+    depth_stencil_is_bindable, ColorAttachment, DepthAttachment, Kind as RenderKind, ScissorRect,
+    Stage, StencilAttachment, PASS_MAX_COLOR_ATTACHMENTS,
 };
 use crate::runtime::decode::stream::{
-    self, SEGMENT_TYPE_BLIT, SEGMENT_TYPE_COMPUTE, SEGMENT_TYPE_EVENT, SEGMENT_TYPE_INFO,
-    SEGMENT_TYPE_RENDER, decode_first_record, decode_next_record,
+    self, decode_first_record, decode_next_record, SEGMENT_TYPE_BLIT, SEGMENT_TYPE_COMPUTE,
+    SEGMENT_TYPE_EVENT, SEGMENT_TYPE_INFO, SEGMENT_TYPE_RENDER,
 };
 use crate::runtime::draw::{
-    self, BufferBind, EncodeStatus, IndexedDrawInfo, MAX_BUFFER_BIND_SLOTS, MAX_SAMPLER_BIND_SLOTS,
-    MAX_TEXTURE_BIND_SLOTS, SamplerBind, TextureBind,
+    self, BufferBind, EncodeStatus, IndexedDrawInfo, SamplerBind, TextureBind,
+    MAX_BUFFER_BIND_SLOTS, MAX_SAMPLER_BIND_SLOTS, MAX_TEXTURE_BIND_SLOTS,
 };
 use crate::runtime::fence_exec;
 use crate::runtime::gva_mem;
@@ -43,7 +45,7 @@ use crate::runtime::mapping_write;
 use crate::runtime::mipmap::{self, MipmapStatus};
 use crate::runtime::objects;
 use crate::runtime::plan::event_sync::{Domain as FenceDomain, FenceAction};
-use crate::runtime::task_slot::{TaskWordSite, resolve_task_word};
+use crate::runtime::task_slot::{resolve_task_word, TaskWordSite};
 use reims_vgpu_wire::ops::blit as wire_blit;
 use reims_vgpu_wire::ops::render as wire_render;
 use reims_vgpu_wire::ops::render_pass as wire_pass;
@@ -511,7 +513,7 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
 /// The census that measured it is gone; a correlation with no counter-examples
 /// over 19 135 trials is a finding, not a thing to keep re-deriving per frame.
 fn consume_resource_table(state: &mut DeviceState, task_id: u32, descs: &[ExecResourceDesc]) {
-    use crate::runtime::resource_validity::{ValiditySite, apply};
+    use crate::runtime::resource_validity::{apply, ValiditySite};
     let mut no_surface = 0u32;
     let mut unknown = 0u32;
     for d in descs {
@@ -861,7 +863,7 @@ fn handle_info_record<M: HostMemory + HostOps>(
     cmd_bytes: &[u8],
 ) {
     use crate::runtime::icb::{
-        INFO_OP_ICB_HOST_RESOURCE, apply_icb_host_resource_info, decode_icb_host_resource_info,
+        apply_icb_host_resource_info, decode_icb_host_resource_info, INFO_OP_ICB_HOST_RESOURCE,
     };
     let bytes = cmd_bytes;
     if opcode == INFO_OP_ICB_HOST_RESOURCE {
@@ -2102,19 +2104,13 @@ impl BindClass {
         use reims_vgpu_wire::ops::bind_limit;
         match (self, reach) {
             (BindClass::Buffer, r) if r <= bind_limit::SAMPLER => "render_bind_reach_buffer_le16",
-            (BindClass::Buffer, r) if r <= MAX_BUFFER_BIND_SLOTS => {
-                "render_bind_reach_buffer_le_table"
-            }
+            (BindClass::Buffer, r) if r <= MAX_BUFFER_BIND_SLOTS => "render_bind_reach_buffer_le_table",
             (BindClass::Buffer, _) => "render_bind_reach_buffer_over_table",
             (BindClass::Texture, r) if r <= bind_limit::SAMPLER => "render_bind_reach_texture_le16",
-            (BindClass::Texture, r) if r <= MAX_TEXTURE_BIND_SLOTS => {
-                "render_bind_reach_texture_le_table"
-            }
+            (BindClass::Texture, r) if r <= MAX_TEXTURE_BIND_SLOTS => "render_bind_reach_texture_le_table",
             (BindClass::Texture, _) => "render_bind_reach_texture_over_table",
             (BindClass::Sampler, r) if r <= bind_limit::SAMPLER => "render_bind_reach_sampler_le16",
-            (BindClass::Sampler, r) if r <= MAX_SAMPLER_BIND_SLOTS => {
-                "render_bind_reach_sampler_le_table"
-            }
+            (BindClass::Sampler, r) if r <= MAX_SAMPLER_BIND_SLOTS => "render_bind_reach_sampler_le_table",
             (BindClass::Sampler, _) => "render_bind_reach_sampler_over_table",
         }
     }
@@ -3023,8 +3019,8 @@ use report::{
 // to carry the same gate the items do.
 #[cfg(test)]
 use report::{
-    PASS_EXTENT_SLUGS, UNIMPL_TEST_LOCK, note_pass_extent_coverage, pass_extent_band,
-    reset_unimplemented_opcode_dedup_for_test,
+    note_pass_extent_coverage, pass_extent_band, reset_unimplemented_opcode_dedup_for_test,
+    PASS_EXTENT_SLUGS, UNIMPL_TEST_LOCK,
 };
 
 #[cfg(test)]
