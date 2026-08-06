@@ -334,6 +334,32 @@ const ROWS: &[Row] = &[
               indexed off the end.",
     },
     Row {
+        at: "reims-vgpu/src/runtime/compute_exec/mod.rs:318",
+        bound: "MAX_COMPUTE_BUFFER_SLOTS",
+        verdict: Verdict::ContractLimit,
+        why: "Metal's compute buffer argument table, 31, which is also exactly \
+              Apple's serializer's own buffer bound. The dispatch is refused \
+              rather than run with the binding absent — see \
+              `a_bind_past_the_argument_table_refuses_the_dispatch`.",
+    },
+    Row {
+        at: "reims-vgpu/src/runtime/compute_exec/mod.rs:365",
+        bound: "MAX_COMPUTE_TEXTURE_SLOTS",
+        verdict: Verdict::ContractLimit,
+        why: "Metal's compute texture argument table, 128, matching Apple's \
+              serializer. The narrower 31 this rail once refused at was the \
+              descriptor binding band, which `spirv_bind::widen_sampled_bands` \
+              widened to `[32,160)`; the constant's own doc records that.",
+    },
+    Row {
+        at: "reims-vgpu/src/runtime/compute_exec/mod.rs:397",
+        bound: "MAX_COMPUTE_SAMPLER_SLOTS",
+        verdict: Verdict::ContractLimit,
+        why: "Metal's sampler argument table, which is genuinely 16 — measured \
+              by asking Apple's serializer for 200 and reading back 16, the \
+              same basis `wire::ops::bind_limit::SAMPLER` carries.",
+    },
+    Row {
         at: "reims-vgpu/src/runtime/decode/resource/mod.rs:2471",
         bound: "MAX_COLOR_ATTACHMENTS",
         verdict: Verdict::WireField,

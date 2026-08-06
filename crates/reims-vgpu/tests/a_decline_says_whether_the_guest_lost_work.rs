@@ -91,7 +91,7 @@ struct Row {
 /// How many types may answer [`Loss::ExecutedModified`].
 ///
 /// Not a budget. A ratchet: see [`the_executed_modified_census_only_shrinks`].
-const EXECUTED_MODIFIED_CEILING: usize = 15;
+const EXECUTED_MODIFIED_CEILING: usize = 14;
 
 /// Every `impl Decline`/`impl Refusal` in the crate, and what its worst arm
 /// costs the guest.
@@ -424,12 +424,13 @@ const ROWS: &[Row] = &[
     Row {
         file: "crates/reims-vgpu/src/runtime/compute_exec/mod.rs",
         ty: "ComputeBindOverflow",
-        loss: Loss::ExecutedModified,
-        why: "the bind loop `continue`s past the slot and dispatches with that \
-              index unbound; nothing downstream refuses on its absence. The \
-              bound is Metal's own argument-table width, so a firing is a \
-              guest record Metal would also reject — but Metal raises, and this \
-              device draws. Retired by refusing the dispatch",
+        loss: Loss::Refused,
+        why: "the bind loop still `continue`s — there is no slot past the table \
+              to record into — but it now records the refusal, and \
+              `resolve_dispatch_dims_reported`, the gate both executors pass \
+              through, refuses the dispatch with \
+              `compute_dispatch_bind_past_table`. It used to dispatch with the \
+              index unbound and nothing downstream refused on its absence",
     },
     Row {
         file: "crates/reims-vgpu/src/runtime/compute_exec/mod.rs",

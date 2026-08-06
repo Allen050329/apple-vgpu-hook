@@ -141,7 +141,7 @@ pub const STAGE_IN_INDIRECT_ARGS_LEN: usize = 24;
 /// The rendered line is unchanged but for the trailing parenthetical, which the
 /// `k=v` shape has no room for and which this doc now carries instead.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ComputeBindOverflow {
+pub(crate) enum ComputeBindOverflow {
     Buffer { index: u32, arg: u32, cap: u32 },
     Texture { index: u32, arg: u32, cap: u32 },
     Sampler { index: u32, arg: u32, cap: u32 },
@@ -255,12 +255,47 @@ pub struct ComputeAccum {
     pub imageblock: Option<ImageblockDimensions>,
     /// Last decoded `0xdb` dispatch type (Metal serial/concurrent); 0 = serial.
     pub dispatch_type: u32,
+    /// A bind this accumulator could not hold, and so did not record.
+    ///
+    /// The three bind walks skip an index past their argument table — there is
+    /// no slot to put it in — and that used to be the whole of it: the walk
+    /// `continue`d and the dispatch went ahead with the guest's binding simply
+    /// absent, which is a wrong result rather than a refused one. Nothing
+    /// downstream refuses on a missing binding, because a kernel that does not
+    /// sample the slot is indistinguishable from one whose bind landed.
+    ///
+    /// Recording it here is what lets [`resolve_dispatch_dims_reported`] — the
+    /// one gate both dispatch executors pass through — refuse instead. Sticky
+    /// for the accumulator's life on purpose: the binding stays unrepresentable
+    /// until the guest clears that slot, and every dispatch in between would
+    /// run without it.
+    pub(crate) refused_bind: Option<ComputeBindOverflow>,
 }
 
 impl ComputeAccum {
     pub fn set_pipeline(&mut self, pipeline_ref: u32) {
         if pipeline_ref != 0 {
             self.pipeline_ref = pipeline_ref;
+        }
+    }
+
+    /// Retire a recorded refusal the guest has just cleared.
+    ///
+    /// A nil bind at the slot that overflowed says the guest no longer wants
+    /// anything there, so what this accumulator holds is once again what the
+    /// guest asked for and the dispatch is representable again. Without this
+    /// the sticky refusal would outlive the condition that caused it and refuse
+    /// every later dispatch in the encoder over a slot nobody is binding — a
+    /// remembered refusal gone stale, which is a class this tree already has a
+    /// scan for.
+    ///
+    /// Matched on the index alone. The three tables are disjoint slot spaces so
+    /// a clear could in principle name another class's slot, but only one
+    /// refusal is ever held and it carries the class it came from, so the pair
+    /// cannot be misread.
+    fn clear_refusal_at(&mut self, index: u32) {
+        if self.refused_bind.is_some_and(|r| r.parts().0 == index) {
+            self.refused_bind = None;
         }
     }
 
@@ -276,16 +311,18 @@ impl ComputeAccum {
                 // rail states on `ExecResult::buffer_unbinds` and applies in
                 // `exec::apply_binds`, over the same wire form.
                 self.buffers.retain(|b| b.index != index);
+                self.clear_refusal_at(index);
                 crate::runtime::drain::note_store_route("compute_unbind_buffer");
                 continue;
             }
             if index >= MAX_COMPUTE_BUFFER_SLOTS {
-                ComputeBindOverflow::Buffer {
+                let over = ComputeBindOverflow::Buffer {
                     index,
                     arg: e.ref_,
                     cap: MAX_COMPUTE_BUFFER_SLOTS,
-                }
-                .emit();
+                };
+                over.emit();
+                self.refused_bind.get_or_insert(over);
                 continue;
             }
             let bind = ComputeBufferBind {
@@ -321,16 +358,18 @@ impl ComputeAccum {
                 // the sharper case of the two, because `writeback_texture`
                 // lands the dispatch's result in the guest surface behind it.
                 self.textures.retain(|t| t.index != index);
+                self.clear_refusal_at(index);
                 crate::runtime::drain::note_store_route("compute_unbind_texture");
                 continue;
             }
             if index >= MAX_COMPUTE_TEXTURE_SLOTS {
-                ComputeBindOverflow::Texture {
+                let over = ComputeBindOverflow::Texture {
                     index,
                     arg: e.ref_,
                     cap: MAX_COMPUTE_TEXTURE_SLOTS,
-                }
-                .emit();
+                };
+                over.emit();
+                self.refused_bind.get_or_insert(over);
                 continue;
             }
             let bind = ComputeTextureBind {
@@ -351,16 +390,18 @@ impl ComputeAccum {
             if e.ref_ == 0 {
                 // Clears the slot; see `bind_buffers`.
                 self.samplers.retain(|s| s.index != index);
+                self.clear_refusal_at(index);
                 crate::runtime::drain::note_store_route("compute_unbind_sampler");
                 continue;
             }
             if index >= MAX_COMPUTE_SAMPLER_SLOTS {
-                ComputeBindOverflow::Sampler {
+                let over = ComputeBindOverflow::Sampler {
                     index,
                     arg: e.ref_,
                     cap: MAX_COMPUTE_SAMPLER_SLOTS,
-                }
-                .emit();
+                };
+                over.emit();
+                self.refused_bind.get_or_insert(over);
                 continue;
             }
             let bind = ComputeSamplerBind {
@@ -3158,6 +3199,24 @@ fn resolve_dispatch_dims_reported<M: HostMemory + HostOps>(
     cmd: &ComputeCommand,
     acc: &ComputeAccum,
 ) -> Result<DispatchDims, ComputeStatus> {
+    // A bind the accumulator could not hold refuses the dispatch here, before
+    // either executor reads the state. It is checked at this gate rather than
+    // at the bind because the bind walk has no dispatch to refuse — and a
+    // dispatch that runs with the guest's binding simply absent is a wrong
+    // result the guest is never told about, which is the one thing this device
+    // is not allowed to do. The slot is past Metal's own argument table, so a
+    // firing is a record Apple's serializer cannot emit; refusing costs a
+    // healthy zero and buys the guarantee.
+    if let Some(over) = acc.refused_bind {
+        let (index, arg, cap) = over.parts();
+        crate::observe::Emit::decline("compute_dispatch", &over)
+            .field("kind", format!("{:?}", cmd.kind))
+            .field("refused_index", index)
+            .field("refused_arg", arg)
+            .field("table", cap)
+            .fail_once(u64::from(index));
+        return Err(ComputeStatus::Unsupported("compute_dispatch_bind_past_table"));
+    }
     resolve_dispatch_dims(state, host, task_id, cmd).inspect_err(|e| {
         crate::observe::line(format!(
             "compute_resolve_dims fail {e:?} kind={:?} grid=[{},{},{}] tg=[{},{},{}] ntex={}",

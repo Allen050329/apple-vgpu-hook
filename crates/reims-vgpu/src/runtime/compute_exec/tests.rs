@@ -2404,3 +2404,79 @@ fn a_heap_texture_mirror_outlives_the_per_mapping_cap() {
         );
     }
 }
+
+/// A bind past the argument table refuses the dispatch, rather than letting it
+/// run with the guest's binding absent.
+///
+/// The bind walk has no dispatch to refuse, so it records instead, and
+/// `resolve_dispatch_dims_reported` — the one gate both executors pass through
+/// — is where the refusal lands. Driven through that function rather than
+/// asserting the field, because the field is bookkeeping and the refusal is the
+/// behaviour.
+///
+/// The dims themselves are deliberately resolvable here: a dispatch that would
+/// otherwise have succeeded is the only one that proves the refusal came from
+/// the bind and not from the grid.
+#[test]
+fn a_bind_past_the_argument_table_refuses_the_dispatch() {
+    let host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+
+    let mut cmd = ComputeCommand::default();
+    cmd.kind = Kind::DispatchThreadgroups;
+    cmd.grid = compute::Size3 { x: 4, y: 1, z: 1 };
+    cmd.threads_per_threadgroup = compute::Size3 { x: 8, y: 1, z: 1 };
+
+    let mut acc = ComputeAccum::default();
+    assert!(
+        resolve_dispatch_dims_reported(&mut state, &host, 1, &cmd, &acc).is_ok(),
+        "the dispatch resolves before any bind, so a later refusal is the bind's"
+    );
+
+    acc.bind_textures(
+        MAX_COMPUTE_TEXTURE_SLOTS + 3,
+        &[RefBinding { ref_: 9 }],
+    );
+    assert!(
+        acc.textures.is_empty(),
+        "the slot is past the table, so there was nowhere to record it"
+    );
+    let refused = resolve_dispatch_dims_reported(&mut state, &host, 1, &cmd, &acc)
+        .expect_err("a dispatch missing a binding the guest asked for is refused");
+    assert_eq!(
+        refused,
+        ComputeStatus::Unsupported("compute_dispatch_bind_past_table")
+    );
+
+    // Sticky: the binding stays unrepresentable, so the next dispatch is
+    // refused too rather than quietly running without it.
+    assert!(
+        resolve_dispatch_dims_reported(&mut state, &host, 1, &cmd, &acc).is_err(),
+        "one refused bind refuses every dispatch that would have used it"
+    );
+
+    // ...until the guest clears that slot, which makes what this accumulator
+    // holds equal to what the guest asked for again.
+    acc.bind_textures(
+        MAX_COMPUTE_TEXTURE_SLOTS + 3,
+        &[RefBinding { ref_: 0 }],
+    );
+    assert!(
+        resolve_dispatch_dims_reported(&mut state, &host, 1, &cmd, &acc).is_ok(),
+        "a nil bind at the refused slot retires the refusal with it"
+    );
+
+    // A clear at a different slot is not that slot, and must not lift it.
+    acc.bind_textures(
+        MAX_COMPUTE_TEXTURE_SLOTS + 5,
+        &[RefBinding { ref_: 9 }],
+    );
+    acc.bind_textures(
+        2,
+        &[RefBinding { ref_: 0 }],
+    );
+    assert!(
+        resolve_dispatch_dims_reported(&mut state, &host, 1, &cmd, &acc).is_err(),
+        "clearing an unrelated slot leaves the refused one refused"
+    );
+}
