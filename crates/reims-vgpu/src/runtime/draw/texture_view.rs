@@ -208,6 +208,21 @@ pub(crate) const MAX_TEXTURE_VIEW_CHAIN: usize = 8;
 /// already does, so it says nothing. That makes this a healthy zero, and a
 /// non-zero reading is the measured argument for threading the slice through.
 ///
+/// # The reading, and what it says about doing that work
+///
+/// **Zero.** Driven x86/PCI boot, `web-content-probe -n 10 --churn 1`: not one
+/// `slice_dropped` line over the whole run, against 10/10 visual-gate regions
+/// on colour. This guest binds no texture-array or cube view with a non-default
+/// slice range on this workload, so threading `slice_base`/`slice_count`
+/// through the draw and sample path would cost a `ViewResolve` field, every
+/// consumer of it, and a `baseArrayLayer`/`layerCount` on the sample view — for
+/// no measured benefit on the pathway that can measure it.
+///
+/// So it stays reported. The gap is real and the wrong texels really would reach
+/// the frame if a guest asked; the argument for closing it has to come from a
+/// workload that puts a non-zero reading here. `blit_exec` already consumes both
+/// fields, so that arm is the reference when one does.
+///
 /// Keyed by texture ref through [`crate::observe::state_changed`] rather than
 /// latched once: this runs per bind, so an undeduped line floods and a
 /// first-sight latch goes quiet after the first view and never reports the

@@ -1719,6 +1719,33 @@ impl ResourcePools {
     /// at every admission and `registry_pressure` still publishes both. They are
     /// worth more without the count than with it: `peak` and `peak_mib` now
     /// describe what the guest asked for rather than what a constant permitted.
+    ///
+    /// # The boot after the count came out
+    ///
+    /// Driven x86/PCI, `web-content-probe -n 10 --churn 1`, QEMU relinked,
+    /// nothing else running:
+    ///
+    /// ```text
+    ///   registry_pressure peak=223 peak_mib=203 resident_samples=12078
+    ///                     resample_peak_ms=1590/2000 slab_mib=45/200
+    ///                     sole_copy=108/44mib cs_sole_copy=2/1mib
+    /// ```
+    ///
+    /// Visual gate 10/10 regions on colour, `sampled_resident_missing=0`, and
+    /// `vram_reclaim_retry` absent — no allocation was refused, so the path that
+    /// now bounds this population was never asked to run. That is the expected
+    /// shape: the bound is a *pressure* mechanism and this workload applies none.
+    ///
+    /// **`sole_copy=108` of `peak=223` is the reading to keep.** Roughly half the
+    /// population is protected, so a reclaim arriving under real pressure would
+    /// still have ~115 slots and ~159 MiB to give back. It is that ratio, not the
+    /// peak, that says whether the retry has anything to work with — near 1 and
+    /// the copy-out sites are what needs attention.
+    ///
+    /// `peak` was 194 on the same probe while the count was still in place, and
+    /// `evicts` was 0 then, so 194 -> 223 is workload variance rather than the
+    /// count's absence: a walk that never removed anything cannot have been
+    /// holding the population down.
     fn recoverable_residents(&self) -> Vec<TargetIdentity> {
         self.registry_order
             .iter()
