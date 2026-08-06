@@ -2,16 +2,22 @@
 //!
 //! `a_decoder_survives_bytes_the_guest_could_write` fuzzes every `pub fn` on the
 //! parser surface that takes a `&[u8]`. That is the front door, and it is not
-//! the whole surface: **53 more `pub fn` on that surface and in `contract` take
-//! nothing but plain scalars**, and every one of those scalars is a field some
-//! byte-slice parser has already pulled out of a guest record. A `u32` opcode, a
-//! `u16` pixel format, a `u64` address, a mip level, a page shift, a count and
-//! an entry size. The byte-slice fuzzer reaches them only where a decoder
-//! happens to route to one, with whatever values that route happens to produce.
+//! the whole surface: **76 more `pub fn` across the decoders, `contract` and
+//! the Vulkan translation tables take nothing but plain scalars**, and every one
+//! of those scalars is a field some byte-slice parser has already pulled out of
+//! a guest record. A `u32` opcode, a `u16` pixel format, a `u64` address, a mip
+//! level, a page shift, a count and an entry size. The byte-slice fuzzer reaches
+//! them only where a decoder happens to route to one, with whatever values that
+//! route happens to produce.
 //!
-//! `contract` is in the population and not only the decoders, because `contract`
-//! *is* the decoded API contract — pixel formats, pass actions, extents, page
-//! geometry — and it is backend-independent, so it can be driven on both arms.
+//! Three trees, each for its own reason. The **decoders** are where the fields
+//! are lifted. **`contract`** *is* the decoded API contract — pixel formats,
+//! pass actions, extents, page geometry — and is backend-independent, so it
+//! drives on both arms. **`backend::vulkan::translate`** is where a guest
+//! ordinal becomes a host enum, which is the position `AGENTS.md` names as
+//! undefined behaviour on the Metal side; it is gated on the arm that compiles
+//! it, in the scan as well as in the table, so the two agree per arm instead of
+//! the table reading short.
 //!
 //! They are the arithmetic half of the parser. Between them these compute
 //! shifts, products, offsets and extents out of guest values, which is where a
@@ -21,7 +27,7 @@
 //!
 //! # What this drives
 //!
-//! Forty-nine of the 53 are called under `catch_unwind` against a cross-product
+//! Seventy-two of the 76 are called under `catch_unwind` against a cross-product
 //! of adversarial scalars. The assertion is only that it **returns** — any
 //! value, any `None`, any refusal is a pass. What fails is an unwind. The other
 //! four are [`EXEMPT`], which is a checked claim rather than a written one.
@@ -515,6 +521,193 @@ fn targets() -> Vec<ScalarTarget> {
                 );
             },
         },
+        #[cfg(feature = "backend-vulkan")]
+        ScalarTarget {
+            name: "blend::factor",
+            arity: 1,
+            run: &|v| {
+                let _ = reims_vgpu::backend::vulkan::translate::blend::factor(v[0] as u32);
+            },
+        },
+        #[cfg(feature = "backend-vulkan")]
+        ScalarTarget {
+            name: "blend::operation",
+            arity: 1,
+            run: &|v| {
+                let _ = reims_vgpu::backend::vulkan::translate::blend::operation(v[0] as u32);
+            },
+        },
+        #[cfg(feature = "backend-vulkan")]
+        ScalarTarget {
+            name: "pixel::translate",
+            arity: 1,
+            run: &|v| {
+                let _ = reims_vgpu::backend::vulkan::translate::pixel::translate(v[0] as u16);
+            },
+        },
+        #[cfg(feature = "backend-vulkan")]
+        ScalarTarget {
+            name: "pixel::is_srgb",
+            arity: 1,
+            run: &|v| {
+                let _ = reims_vgpu::backend::vulkan::translate::pixel::is_srgb(v[0] as u16);
+            },
+        },
+        #[cfg(feature = "backend-vulkan")]
+        ScalarTarget {
+            name: "pixel::sampled_pixels",
+            arity: 1,
+            run: &|v| {
+                let _ = reims_vgpu::backend::vulkan::translate::pixel::sampled_pixels(v[0] as u16);
+            },
+        },
+        #[cfg(feature = "backend-vulkan")]
+        ScalarTarget {
+            name: "pixel::color_attachment",
+            arity: 1,
+            run: &|v| {
+                let _ =
+                    reims_vgpu::backend::vulkan::translate::pixel::color_attachment(v[0] as u16);
+            },
+        },
+        #[cfg(feature = "backend-vulkan")]
+        ScalarTarget {
+            name: "pixel::storage_image_from_selector",
+            arity: 1,
+            run: &|v| {
+                let _ = reims_vgpu::backend::vulkan::translate::pixel::storage_image_from_selector(
+                    v[0] as u32,
+                );
+            },
+        },
+        #[cfg(feature = "backend-vulkan")]
+        ScalarTarget {
+            name: "pixel::storage_image",
+            arity: 1,
+            run: &|v| {
+                let _ = reims_vgpu::backend::vulkan::translate::pixel::storage_image(v[0] as u16);
+            },
+        },
+        #[cfg(feature = "backend-vulkan")]
+        ScalarTarget {
+            name: "pixel::resident_color",
+            arity: 1,
+            run: &|v| {
+                let _ =
+                    reims_vgpu::backend::vulkan::translate::pixel::resident_color(v[0] & 1 != 0);
+            },
+        },
+        #[cfg(feature = "backend-vulkan")]
+        ScalarTarget {
+            name: "pixel::has_identity_components",
+            arity: 1,
+            run: &|v| {
+                let _ = reims_vgpu::backend::vulkan::translate::pixel::has_identity_components(
+                    v[0] as u16,
+                );
+            },
+        },
+        #[cfg(feature = "backend-vulkan")]
+        ScalarTarget {
+            name: "raster::primitive_topology",
+            arity: 1,
+            run: &|v| {
+                let _ =
+                    reims_vgpu::backend::vulkan::translate::raster::primitive_topology(v[0] as u32);
+            },
+        },
+        #[cfg(feature = "backend-vulkan")]
+        ScalarTarget {
+            name: "raster::cull_mode",
+            arity: 1,
+            run: &|v| {
+                let _ = reims_vgpu::backend::vulkan::translate::raster::cull_mode(v[0] as u32);
+            },
+        },
+        #[cfg(feature = "backend-vulkan")]
+        ScalarTarget {
+            name: "raster::front_face_ccw",
+            arity: 1,
+            run: &|v| {
+                let _ = reims_vgpu::backend::vulkan::translate::raster::front_face_ccw(v[0] as u32);
+            },
+        },
+        #[cfg(feature = "backend-vulkan")]
+        ScalarTarget {
+            name: "raster::compare_function",
+            arity: 1,
+            run: &|v| {
+                let _ =
+                    reims_vgpu::backend::vulkan::translate::raster::compare_function(v[0] as u32);
+            },
+        },
+        #[cfg(feature = "backend-vulkan")]
+        ScalarTarget {
+            name: "raster::stencil_operation",
+            arity: 1,
+            run: &|v| {
+                let _ =
+                    reims_vgpu::backend::vulkan::translate::raster::stencil_operation(v[0] as u32);
+            },
+        },
+        #[cfg(feature = "backend-vulkan")]
+        ScalarTarget {
+            name: "raster::index_type",
+            arity: 1,
+            run: &|v| {
+                let _ = reims_vgpu::backend::vulkan::translate::raster::index_type(v[0] as u32);
+            },
+        },
+        #[cfg(feature = "backend-vulkan")]
+        ScalarTarget {
+            name: "raster::vk_front_face",
+            arity: 1,
+            run: &|v| {
+                let _ =
+                    reims_vgpu::backend::vulkan::translate::raster::vk_front_face(v[0] & 1 != 0);
+            },
+        },
+        #[cfg(feature = "backend-vulkan")]
+        ScalarTarget {
+            name: "sampler::filter",
+            arity: 1,
+            run: &|v| {
+                let _ = reims_vgpu::backend::vulkan::translate::sampler::filter(v[0] as u32);
+            },
+        },
+        #[cfg(feature = "backend-vulkan")]
+        ScalarTarget {
+            name: "sampler::mip_filter",
+            arity: 1,
+            run: &|v| {
+                let _ = reims_vgpu::backend::vulkan::translate::sampler::mip_filter(v[0] as u32);
+            },
+        },
+        #[cfg(feature = "backend-vulkan")]
+        ScalarTarget {
+            name: "sampler::address_mode",
+            arity: 1,
+            run: &|v| {
+                let _ = reims_vgpu::backend::vulkan::translate::sampler::address_mode(v[0] as u32);
+            },
+        },
+        #[cfg(feature = "backend-vulkan")]
+        ScalarTarget {
+            name: "sampler::border_color",
+            arity: 1,
+            run: &|v| {
+                let _ = reims_vgpu::backend::vulkan::translate::sampler::border_color(v[0] as u32);
+            },
+        },
+        #[cfg(feature = "backend-vulkan")]
+        ScalarTarget {
+            name: "vertex::attribute_format",
+            arity: 1,
+            run: &|v| {
+                let _ =
+                    reims_vgpu::backend::vulkan::translate::vertex::attribute_format(v[0] as u32);
+            },
+        },
     ]
 }
 
@@ -606,6 +799,15 @@ fn declared_scalar_parsers() -> BTreeSet<String> {
         // named there so the two harnesses agree on that file's surface.
         "crates/reims-vgpu/src/contract",
     ];
+    // Every guest ordinal that becomes a Vulkan enum passes through here, which
+    // is the position `AGENTS.md` calls out as undefined behaviour on the Metal
+    // side. Gated on the arm that compiles it, in the scan as well as in the
+    // table, so the two agree per arm rather than the table reading short on
+    // `backend-metal`.
+    #[cfg(feature = "backend-vulkan")]
+    const VULKAN_TREES: [&str; 1] = ["crates/reims-vgpu/src/backend/vulkan/translate"];
+    #[cfg(not(feature = "backend-vulkan"))]
+    const VULKAN_TREES: [&str; 0] = [];
     const FILES: [&str; 2] = [
         "crates/reims-vgpu/src/runtime/heap_query.rs",
         "crates/reims-vgpu/src/runtime/mtlb.rs",
@@ -613,6 +815,7 @@ fn declared_scalar_parsers() -> BTreeSet<String> {
     let root = source_scan::workspace_root();
     let mut files: Vec<std::path::PathBuf> = TREES
         .iter()
+        .chain(VULKAN_TREES.iter())
         .flat_map(|d| source_scan::rust_sources(&root.join(d)))
         .collect();
     files.extend(FILES.iter().map(|f| root.join(f)));
