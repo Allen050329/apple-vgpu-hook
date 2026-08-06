@@ -467,7 +467,9 @@ pub fn device_window_set_early_fb(
 /// window never fights the product present for the frame — and throttled to
 /// ~30 fps so it does not memcpy the FB every 4 ms.
 #[cfg(feature = "host-window")]
-pub(crate) fn publish_window_early_frame<M: crate::runtime::host::HostMemory>(
+pub(crate) fn publish_window_early_frame<
+    M: crate::runtime::host::HostMemory + crate::runtime::host::HostOps,
+>(
     slot: &BoundDevice,
     state: &crate::model::DeviceState,
     host: &M,

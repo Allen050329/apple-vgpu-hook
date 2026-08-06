@@ -651,6 +651,13 @@ pub struct FakeHost {
     pub stable_map_pages: bool,
     /// Number of HostOps page-import attempts (test proxy for import amplification).
     pub map_pages_calls: u64,
+    /// Half-open GPA ranges this host reports as **not** guest RAM, so a test
+    /// can model device memory — a PCI BAR — and not only mapped vs unmapped.
+    ///
+    /// Empty by default, which is exactly the previous behaviour: `is_ram_gpa`
+    /// answered a flat `true`, so nothing could exercise a caller's non-RAM arm.
+    /// Arm it with [`FakeHost::mark_non_ram`].
+    non_ram: Vec<(u64, u64)>,
     /// Scripted guest page-table edits, armed by [`FakeHost::arm_rewire`].
     rewires: std::cell::RefCell<Vec<Rewire>>,
     /// How many armed rewires have fired, so a test can assert its trigger hit.
@@ -809,6 +816,16 @@ impl Drop for FakeHost {
 impl FakeHost {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Report `[base, base + len)` as device memory rather than guest RAM, so
+    /// [`HostOps::is_ram_gpa`] answers `false` inside it.
+    ///
+    /// Models a PCI BAR. Reads and writes still work through this fixture —
+    /// the point is the *classification*, which is what production QEMU refuses
+    /// on (`MemTxAttrs.memory`), not whether bytes happen to be reachable here.
+    pub fn mark_non_ram(&mut self, base: u64, len: u64) {
+        self.non_ram.push((base, base.saturating_add(len)));
     }
 
     /// State that an agent outside this device wrote the page holding `gpa`,
@@ -1163,6 +1180,16 @@ impl HostMemory for FakeHost {
 impl HostOps for FakeHost {
     fn mono_ns(&self) -> u64 {
         self.mono_ns
+    }
+
+    /// Everything is RAM unless a test said otherwise through
+    /// [`FakeHost::mark_non_ram`], which keeps the default identical to the
+    /// flat `true` this fixture answered before.
+    fn is_ram_gpa(&self, gpa: u64) -> bool {
+        !self
+            .non_ram
+            .iter()
+            .any(|&(start, end)| gpa >= start && gpa < end)
     }
 
     fn enqueue(&mut self, action: HostAction) {

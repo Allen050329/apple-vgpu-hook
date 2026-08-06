@@ -420,7 +420,7 @@ fn paint_mapping_fragmented_pages_multi_import() {
     use crate::model::PAGE_SHIFT_X86;
     use crate::runtime::mapping_write::write_bgra8;
 
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut state = DeviceState::new(DeviceId(1), crate::model::PAGE_SHIFT_X86);
     let mut host = FakeHost::new();
     host.strict_linux_map = true;
     let page = 1u64 << PAGE_SHIFT_X86;
@@ -1264,5 +1264,63 @@ fn a_light_capture_leaves_no_stale_frame_behind() {
         present_content_verdict(&stale, 0),
         crate::runtime::drain::PresentContentVerdict::Black,
         "the retained frame is what used to be judged"
+    );
+}
+
+/// The EFI console paint refuses a framebuffer that is device memory, and
+/// still paints one that is guest RAM.
+///
+/// `efi_fb_start` is whatever the guest programmed into 0x1210, and for most of
+/// early boot that is the BAR1 GOP framebuffer this device itself exposes.
+/// Reading it through the address space cannot work: the QEMU shim sets
+/// `MemTxAttrs.memory`, so a translation resolving to device memory fails
+/// closed on purpose — a guest page entry aimed at one of our own BARs would
+/// otherwise re-enter this device's MMIO handler from inside a Rust call that
+/// already holds the device lock.
+///
+/// So this door is *expected* to be shut, and the caller has a second one
+/// (`copy_early_bar1`, which reads BAR1 through the host pointer the C shim
+/// registered). Discovering the closure by reading rows until one failed cost a
+/// live boot 465 completed reads per attempt on the ~30 Hz early-console
+/// cadence, threw all of them away, and put a
+/// `mem_qemu_read_gpa_callback_failed` line on the always-on fail channel where
+/// it read as a device fault rather than as expected control flow.
+///
+/// Both directions are asserted, because a pre-flight that simply refused
+/// everything would satisfy the first half alone — and this path is what paints
+/// the console once the kernel relocates it into system RAM.
+#[test]
+fn the_efi_console_paint_refuses_a_bar_backed_framebuffer_and_accepts_a_ram_one() {
+    let w = crate::model::EFI_BOOT_WIDTH;
+    let h = crate::model::EFI_BOOT_HEIGHT;
+    let stride = w * RGBA8_BPP;
+    let fb = 0x8000_0000u64;
+    let span = (h as u64) * (stride as u64);
+
+    let paint = |non_ram: bool| {
+        let mut state = DeviceState::new(DeviceId(1), crate::model::PAGE_SHIFT_X86);
+        state.gfx.efi_fb_start = fb;
+        state.gfx.efi_fb_stride = stride;
+        let mut host = FakeHost::new();
+        // Real bytes either way, so the two cases differ only in how the host
+        // classifies the span -- which is what production refuses on.
+        host.map_range(fb, span as usize, 0);
+        if non_ram {
+            host.mark_non_ram(fb, span);
+        }
+        let mut dst = vec![0u8; (stride as usize) * (h as usize)];
+        paint_efi_console(&state, &host, &mut dst, stride, w, h)
+    };
+
+    assert!(
+        !paint(true),
+        "a console framebuffer sitting in device memory must be refused, so the \
+         caller falls through to the BAR1 door instead of reading rows that \
+         cannot resolve"
+    );
+    assert!(
+        paint(false),
+        "a console framebuffer in guest RAM is the relocated-console case this \
+         path exists for, and must still paint"
     );
 }

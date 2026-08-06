@@ -575,7 +575,7 @@ pub fn copy_to_bgra8<M: HostMemory + crate::runtime::host::HostOps>(
 /// Used by product scanout fallback and by the pre-boundary host console when
 /// the guest relocates the kernel video console off BAR1 into system RAM
 /// (live serial: `console relocated to 0xf1000000` while BAR1 freezes).
-pub fn paint_efi_console<M: HostMemory>(
+pub fn paint_efi_console<M: HostMemory + crate::runtime::host::HostOps>(
     state: &DeviceState,
     host: &M,
     dst: &mut [u8],
@@ -605,6 +605,34 @@ pub fn paint_efi_console<M: HostMemory>(
         return false;
     }
     let row_bytes = (efi_w as usize) * (RGBA8_BPP as usize);
+    // Refuse a span that is not guest RAM before reading a byte of it, because
+    // this door is *expected* to be shut for most of early boot and the caller
+    // has another one for exactly that case.
+    //
+    // `efi_fb_start` is whatever the guest programmed into 0x1210. Early on
+    // that is the BAR1 GOP framebuffer this device exposes, which is device
+    // memory rather than RAM — and the QEMU shim reads with `MemTxAttrs.memory`
+    // set, so an address space read of it fails closed by design (a guest page
+    // entry aimed at our own BAR would otherwise re-enter this device's MMIO
+    // handler from inside a Rust call already holding the device lock). Only
+    // once the kernel relocates the console into system RAM does this path have
+    // anything it can read.
+    //
+    // Without the pre-flight the loop discovered that the expensive way: it read
+    // rows until one crossed out of RAM, then returned false and threw every
+    // row it had already copied away — measured at 465 completed reads per
+    // attempt, repeated on the ~30 Hz early-console cadence. It also put a
+    // `mem_qemu_read_gpa_callback_failed` line on the always-on fail channel,
+    // where it read as a device fault rather than as the first of two doors
+    // being shut. Both halves of the span are checked because the observed
+    // failure was a *crossing* — the base was readable and the far end was not.
+    let last_row = (efi_h.saturating_sub(1) as u64).saturating_mul(stride as u64);
+    let span_end = fb
+        .saturating_add(last_row)
+        .saturating_add((row_bytes as u64).saturating_sub(1));
+    if !host.is_ram_gpa(fb) || !host.is_ram_gpa(span_end) {
+        return false;
+    }
     for y in 0..efi_h {
         let gpa = fb + (y as u64) * (stride as u64);
         let dst_off = (y as usize) * (dst_stride as usize);
