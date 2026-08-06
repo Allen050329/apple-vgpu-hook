@@ -1188,6 +1188,18 @@ pub const OPCODE_USE_HEAP: u32 = 0x1b;
 /// only an align-1 view can take. Fixture `render_use_heap` (the stub heap's
 /// ref 6565, stages 2).
 ///
+/// # The record is two bytes longer than it is written, and `+6` is still right
+///
+/// This is the one record here whose *length* disagrees with its layout. The
+/// serializer sizes it as `count * 4 + 8` — the shape its `usage`-bearing
+/// sibling has — and then writes `count` at `+0`, `stages` at `+4` and the refs
+/// from `+6`, leaving the last two bytes untouched. Deriving the head from the
+/// record length therefore yields 8 and starts the refs two bytes late, reading
+/// every heap ref straddling two entries.
+///
+/// So a length is an upper bound on a head, never a measurement of one, and this
+/// is the record that shows it. Do not "correct" `+6` to `+8` from a size.
+///
 /// Decode consumes these opcodes through [`use_heap`] / [`use_resource`]
 /// (`0x1b` / `0x89`).
 ///
