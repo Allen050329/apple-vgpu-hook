@@ -2161,6 +2161,9 @@ pub fn counter_snapshot() -> CounterSnapshot {
     snap.registry_non_pinned_peak_bytes = reg_peak_bytes;
     snap.compute_storage_cap_evictions = eng.pools.compute_storage_cap_evictions();
     snap.resident_resample_peak_ms = eng.pools.resident_resample_peak_ms();
+    let (slab_held, slab_carved) = eng.pools.slab_held_bytes();
+    snap.slab_held_bytes = slab_held;
+    snap.slab_carved_bytes = slab_carved;
     snap
 }
 

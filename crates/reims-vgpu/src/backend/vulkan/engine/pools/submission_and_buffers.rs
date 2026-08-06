@@ -795,6 +795,12 @@ impl ResourcePools {
         self.compute_storage_cap_evictions
     }
 
+    /// `VkDeviceMemory` the image slab holds right now, and the carved half of
+    /// it, in bytes. See [`slab::SlabPool::held_bytes`] for what it covers.
+    pub(crate) fn slab_held_bytes(&self) -> (u64, u64) {
+        self.slab.held_bytes()
+    }
+
     /// The worst gap between a resident being touched and being read again, for
     /// the life of the pools. See
     /// [`ResourcePools::resident_resample_peak_ms`] for what it is the margin

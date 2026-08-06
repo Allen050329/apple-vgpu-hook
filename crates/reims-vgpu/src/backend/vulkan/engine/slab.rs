@@ -356,6 +356,38 @@ pub(crate) struct SlabPool {
 }
 
 impl SlabPool {
+    /// `VkDeviceMemory` bytes this pool is holding right now, and how many of
+    /// them are carved into live sub-allocations.
+    ///
+    /// The device-side figure this crate did not have. Every other memory
+    /// reading here is either cumulative-allocated (`vk_alloc_sites`, which only
+    /// ever grows and so cannot say what is held) or an *attachment* footprint
+    /// computed from geometry (`registry_non_pinned_peak_bytes`, which knows
+    /// nothing of tiling padding, slab rounding, or the empty blocks the pool
+    /// deliberately retains). Neither can answer "did that policy change cost
+    /// VRAM", which is the question every reclaim-policy decision here runs into.
+    ///
+    /// Exact for what it covers and honest about what it does not: this is the
+    /// DEVICE_LOCAL *image* slab only. HOST_VISIBLE staging (`host_slab`),
+    /// standalone compute-storage allocations, dma-buf imports and the present
+    /// path's own allocations are outside it. It is the pool the render-target
+    /// population actually lands in, which is why it is the one worth having
+    /// first.
+    ///
+    /// `held` counts whole blocks because that is what the driver has given
+    /// away — an empty block retained by `SLAB_KEEP_EMPTY` still occupies VRAM,
+    /// and a reader comparing `held` against `carved` is reading exactly the
+    /// retention this pool trades allocation cost for.
+    pub(crate) fn held_bytes(&self) -> (u64, u64) {
+        let mut held = 0u64;
+        let mut carved = 0u64;
+        for b in self.blocks.iter().flatten() {
+            held = held.saturating_add(b.plan.size());
+            carved = carved.saturating_add(b.plan.size().saturating_sub(b.plan.free_bytes()));
+        }
+        (held, carved)
+    }
+
     pub(crate) fn new() -> Self {
         Self {
             blocks: Vec::new(),

@@ -403,6 +403,21 @@ engine_counters! {
         /// the distribution this is the tail of. The bands alone could not tell
         /// a worst case of 1.0 s from one of 1.9 s against a 2 s cutoff.
         resident_resample_peak_ms,
+        /// `VkDeviceMemory` the DEVICE_LOCAL image slab holds right now, and the
+        /// carved half of it, in bytes.
+        ///
+        /// A *level*, not a total: this is what the device is holding at the
+        /// sample, and it can go down. Every other memory reading in this crate
+        /// is one of the two things that cannot answer "did that policy change
+        /// cost VRAM" — `vk_alloc_sites` is cumulative-allocated and only ever
+        /// grows, and `registry_non_pinned_peak_bytes` is an attachment
+        /// footprint computed from geometry, blind to tiling padding, slab
+        /// rounding and the empty blocks the pool deliberately retains.
+        ///
+        /// `held` minus `carved` is that retention: blocks the driver has given
+        /// this device that hold nothing.
+        slab_held_bytes,
+        slab_carved_bytes,
         /// The same high-water in attachment bytes, sampled from the same
         /// population at the same instant as `registry_non_pinned_peak`.
         ///
