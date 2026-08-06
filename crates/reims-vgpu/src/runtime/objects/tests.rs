@@ -832,6 +832,71 @@ fn a_task_with_no_object_list_resolves_nothing_not_its_neighbours_list() {
     assert_eq!(state.tasks[5].object_list_count, 0);
 }
 
+/// The probe and the named lookup must give the **same answer**. Only whether a
+/// miss is reportable differs.
+///
+/// This is the half a regression would break. `probe_list_entry` exists because
+/// `type4_probe_order` walks every live task asking who owns a surface, so it
+/// misses on every task before the owner — 18 `gva_read_refused` lines per
+/// driven boot, all of them the search working. Quietening that is only correct
+/// while it still *answers* identically; a probe that skipped the liveness test,
+/// or read a different address, would pass a "no line was emitted" check and
+/// still be wrong.
+///
+/// Same fixture as the test above: task 2 owns a readable list at pfn 1, task 5
+/// has a directory that maps nothing, and `5 >> 1 == 2` — so a probe that fell
+/// through to a neighbour's page table would answer `Some` for task 5.
+#[test]
+fn the_probe_and_the_named_lookup_answer_identically() {
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let dir_gpa = 2u64 << PAGE_SHIFT_X86;
+    let root_gpa = 3u64 << PAGE_SHIFT_X86;
+    let data_gpa = 4u64 << PAGE_SHIFT_X86;
+    host.map_range(dir_gpa, 0x20, 0);
+    host.map_range(root_gpa, 0x1000, 0);
+    host.map_range(data_gpa, 0x1000, 0);
+    let mut d = [0u8; 8];
+    st32(&mut d[DIRECTORY_ROOT_PFN as usize..], 3);
+    st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
+    let _ = host.write_gpa(dir_gpa, &d);
+    let mut pte = [0u8; 4];
+    st32(&mut pte, 4);
+    let _ = host.write_gpa(root_gpa + 4, &pte);
+    let mut entry = [0u8; OBJECT_LIST_ENTRY_LEN];
+    st32(
+        &mut entry[0..],
+        (OBJECT_TYPE_SURFACE as u32) | (0x40u32 << 8),
+    );
+    entry[4..12].copy_from_slice(&0xdead_0000u64.to_le_bytes());
+    let _ = host.write_gpa(data_gpa, &entry);
+
+    state.define_task(2, 0x1000, 2);
+    assert!(state.set_object_list(2, 1, 4));
+    state.define_task(5, 0x1000, 9);
+
+    for (task, ref_, what) in [
+        (2u32, 0u32, "the owner's own entry"),
+        (5, 0, "a task whose list does not translate"),
+        (2, 3, "a slot inside the list the guest never filled"),
+        (77, 0, "a task nothing defined"),
+    ] {
+        assert_eq!(
+            probe_list_entry(&state, &host, task, ref_),
+            lookup_list_entry(&state, &host, task, ref_),
+            "probe and named lookup disagree on {what} (task {task}, ref {ref_})"
+        );
+    }
+
+    // And the fixture is real in both directions, so the loop above cannot be
+    // passing by answering `None` to everything.
+    assert!(
+        probe_list_entry(&state, &host, 2, 0).is_some(),
+        "the owner must be found through the probe — that is what the search is for"
+    );
+    assert_eq!(probe_list_entry(&state, &host, 5, 0), None);
+}
+
 fn setup_type4_candidate(
     host: &mut FakeHost,
     state: &mut DeviceState,

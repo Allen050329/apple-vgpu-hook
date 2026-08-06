@@ -141,6 +141,33 @@ fn apply_delete_task(state: &mut DeviceState, payload: &[u8], channel: Option<u3
 }
 
 /// `CmdSetObjectList`, from either FIFO.
+///
+/// # The one `apply_*` in this file that recorded nothing
+///
+/// Every sibling emits an `off` line naming what it took from the packet; this
+/// one wrote two fields into the task and said nothing, and those two fields are
+/// the whole address of every object-list read the device then makes. So a
+/// driven boot reports
+///
+/// ```text
+/// object_list_entry_unreadable task=2 ref=32 gva=0x1180 list_pfn=1 list_count=1048576
+/// ```
+///
+/// — the same `list_pfn=1 list_count=1048576` for tasks 2, 3, 4 and 6, which is
+/// a one-million-entry object list at guest page 1 — and nothing in the log says
+/// whether the guest sent those words or this decode produced them. That is the
+/// question the line below exists to answer, and it cannot be answered by
+/// reading the source: both readings are consistent with a 12-byte payload of
+/// three `u32`s.
+///
+/// `plen` is on the line for the same reason. `packet_short` only refuses a
+/// payload *below* `SET_OBJECT_LIST_LEN`, so a longer one is accepted and its
+/// tail ignored — and a longer packet is what a wider field (a 64-bit page
+/// address, a byte length beside a count) would look like from here.
+///
+/// Emitted on the `OFF` channel and deduped per `(task, pfn, count)`: this is a
+/// lifecycle packet the guest re-sends, and the reading wanted is which distinct
+/// triples a boot produces, not how often.
 fn apply_set_object_list(state: &mut DeviceState, payload: &[u8], channel: Option<u32>) {
     if packet_short(
         "set_object_list",
@@ -153,7 +180,19 @@ fn apply_set_object_list(state: &mut DeviceState, payload: &[u8], channel: Optio
     let task_id = ld32(&payload[SET_OBJECT_LIST_TASK_ID..]);
     let pfn = ld32(&payload[SET_OBJECT_LIST_PFN..]);
     let count = ld32(&payload[SET_OBJECT_LIST_COUNT..]);
-    let _ = state.set_object_list(task_id, pfn, count);
+    let applied = state.set_object_list(task_id, pfn, count);
+    if crate::observe::first_sight(
+        "set_object_list",
+        (u64::from(task_id) << 48) ^ (u64::from(pfn) << 24) ^ u64::from(count),
+    ) {
+        crate::observe::off(format!(
+            "set_object_list site={} task={task_id} pfn={pfn:#x} count={count} \
+             applied={} plen={}",
+            packet_site(channel),
+            applied as u8,
+            payload.len()
+        ));
+    }
 }
 
 fn apply_define_task2<H: HostMemory + HostOps>(

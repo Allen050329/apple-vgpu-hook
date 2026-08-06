@@ -112,16 +112,38 @@ pub fn read_task_gva_by_id<M: HostMemory>(
     buf: &mut [u8],
     page_shift: u32,
 ) -> Result<(), MemError> {
-    let named = if let Some(task) = tasks.get(task_id) {
-        match read_task_gva(host, task, gva, buf, page_shift) {
-            Ok(()) => return Ok(()),
-            Err(e) => e,
-        }
-    } else {
-        MemError::NoSuchTask
+    let r = try_read_task_gva_by_id(host, tasks, task_id, gva, buf, page_shift);
+    if let Err(named) = r {
+        note_read_refusal(task_id, gva, named);
+    }
+    r
+}
+
+/// [`read_task_gva_by_id`] without the refusal line, for a caller whose miss is
+/// an **answer** rather than a failure.
+///
+/// There is exactly one such shape in this device and it is worth naming,
+/// because using the loud read for it put 18 lines per boot on the fail channel
+/// that meant nothing. `objects::type4_probe_order` walks the live tasks asking
+/// "does this one own surface N?", and a task that does not own it has no entry
+/// at that slot — so the walk *must* miss on every task before the owner. The
+/// miss is how the search works.
+///
+/// This is not a way to quieten a noisy path. The caller has to be able to say
+/// what the miss means, which is why it is a second function rather than a flag:
+/// a read whose failure the caller cannot interpret must stay on the loud one.
+pub fn try_read_task_gva_by_id<M: HostMemory>(
+    host: &M,
+    tasks: &TaskTable,
+    task_id: u32,
+    gva: u64,
+    buf: &mut [u8],
+    page_shift: u32,
+) -> Result<(), MemError> {
+    let Some(task) = tasks.get(task_id) else {
+        return Err(MemError::NoSuchTask);
     };
-    note_read_refusal(task_id, gva, named);
-    Err(named)
+    read_task_gva(host, task, gva, buf, page_shift)
 }
 
 /// Record a refused read, latched per `(reason, task, site)`.
@@ -1305,6 +1327,65 @@ mod tests {
     /// the wire can carry is the strongest case, and it would have been refused
     /// by a range check before, which is a different refusal wearing this one's
     /// name.
+    /// The quiet read must return exactly what the loud one returns.
+    ///
+    /// `try_read_task_gva_by_id` exists so a speculative caller does not put a
+    /// line on the fail channel for a miss that is its answer. That is only
+    /// sound while the two agree on the answer itself — a quiet read that took
+    /// a different path would silence a real refusal instead of an expected
+    /// one, which is the failure this split could introduce and nothing else
+    /// would catch.
+    #[test]
+    fn the_quiet_read_answers_exactly_as_the_reporting_one_does() {
+        let mut host = FakeHost::new();
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let dir_gpa = 2u64 << PAGE_SHIFT_X86;
+        let root_gpa = 3u64 << PAGE_SHIFT_X86;
+        let data_gpa = 4u64 << PAGE_SHIFT_X86;
+        host.map_range(dir_gpa, 0x20, 0);
+        host.map_range(root_gpa, 0x1000, 0);
+        host.map_range(data_gpa, 0x1000, 0);
+        let mut d = [0u8; 8];
+        st32(&mut d[DIRECTORY_ROOT_PFN as usize..], 3);
+        st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
+        host.write_gpa(dir_gpa, &d).unwrap();
+        let mut pte = [0u8; 4];
+        st32(&mut pte, 4);
+        host.write_gpa(root_gpa + 4, &pte).unwrap();
+        host.write_gpa(data_gpa, &[0xab; 8]).unwrap();
+        state.define_task(2, 0x1000, 2);
+
+        for (task, gva, what) in [
+            (2u32, 0x1000u64, "a page the task maps"),
+            (2, 0x2000, "a page the task does not map"),
+            (2, 0, "the null page"),
+            (77, 0x1000, "a task nothing defined"),
+        ] {
+            let mut loud = [0u8; 8];
+            let mut quiet = [0u8; 8];
+            let a = read_task_gva_by_id(&host, &state.tasks, task, gva, &mut loud, PAGE_SHIFT_X86);
+            let b = try_read_task_gva_by_id(
+                &host,
+                &state.tasks,
+                task,
+                gva,
+                &mut quiet,
+                PAGE_SHIFT_X86,
+            );
+            assert_eq!(a, b, "verdicts differ on {what}");
+            assert_eq!(loud, quiet, "bytes differ on {what}");
+        }
+
+        // The fixture reads something, so the loop cannot pass by refusing
+        // everything identically.
+        let mut buf = [0u8; 8];
+        assert!(
+            try_read_task_gva_by_id(&host, &state.tasks, 2, 0x1000, &mut buf, PAGE_SHIFT_X86)
+                .is_ok()
+        );
+        assert_eq!(buf, [0xab; 8]);
+    }
+
     #[test]
     fn a_read_for_an_undefined_task_word_still_reports_no_such_task() {
         let host = FakeHost::new();

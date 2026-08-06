@@ -843,12 +843,60 @@ fn list_entry_unreadable_detail(
     )
 }
 
-/// Lookup one object-list slot for `task_id` / `ref_`.
+/// What a missing object-list entry means to the caller that asked.
+///
+/// The read underneath is identical; only whether a miss is reportable differs,
+/// and only the caller knows. A driven boot measured 18 `gva_read_refused
+/// reason=gva_zero_pfn` lines on the fail channel — two per task for tasks 2
+/// through 10 — and every one of them was [`Self::Probe`] working exactly as
+/// designed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ListLookup {
+    /// The guest's own command named this ref against this task, so an entry
+    /// the device cannot read is guest work it cannot execute. Reportable.
+    Named,
+    /// This device is asking *whether* the task owns the ref. Every task that
+    /// does not own it misses, which is how the search finds the one that does —
+    /// so a miss here is the answer, not a failure, and reporting it would put a
+    /// line on the fail channel for each task the search correctly stepped over.
+    Probe,
+}
+
+/// Lookup one object-list slot for `task_id` / `ref_`, reporting a miss.
+///
+/// For a ref the guest named. A speculative caller wants [`probe_list_entry`];
+/// see [`ListLookup`] for why the distinction is the caller's to make.
 pub fn lookup_list_entry<M: HostMemory>(
     state: &DeviceState,
     host: &M,
     task_id: u32,
     ref_: u32,
+) -> Option<ListObjectEntry> {
+    list_entry(state, host, task_id, ref_, ListLookup::Named)
+}
+
+/// [`lookup_list_entry`] for a caller asking whether this task owns `ref_`.
+///
+/// Quiet on a miss. The object list really is where the guest said — a driven
+/// boot reads `set_object_list … pfn=0x1 count=1048576 plen=12` for **every**
+/// task including the one that then resolves 11 768 surfaces — so a task
+/// missing at this slot is a task without that object, which is what the search
+/// is asking.
+pub fn probe_list_entry<M: HostMemory>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    ref_: u32,
+) -> Option<ListObjectEntry> {
+    list_entry(state, host, task_id, ref_, ListLookup::Probe)
+}
+
+fn list_entry<M: HostMemory>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    ref_: u32,
+    lookup: ListLookup,
 ) -> Option<ListObjectEntry> {
     let task = state.tasks.get(task_id)?;
     if !task.active || task.object_list_count == 0 {
@@ -857,17 +905,28 @@ pub fn lookup_list_entry<M: HostMemory>(
     let off = list_object_entry_offset(ref_, task.object_list_count)?;
     let entry_gva = ((task.object_list_pfn as u64) << state.page_shift).checked_add(off)?;
     let mut raw = [0u8; OBJECT_LIST_ENTRY_LEN];
-    if gva_mem::read_task_gva_by_id(
-        host,
-        &state.tasks,
-        task_id,
-        entry_gva,
-        &mut raw,
-        state.page_shift,
-    )
-    .is_err()
-    {
-        note_list_entry_unreadable(task_id, ref_, task, entry_gva);
+    let read = match lookup {
+        ListLookup::Named => gva_mem::read_task_gva_by_id(
+            host,
+            &state.tasks,
+            task_id,
+            entry_gva,
+            &mut raw,
+            state.page_shift,
+        ),
+        ListLookup::Probe => gva_mem::try_read_task_gva_by_id(
+            host,
+            &state.tasks,
+            task_id,
+            entry_gva,
+            &mut raw,
+            state.page_shift,
+        ),
+    };
+    if read.is_err() {
+        if lookup == ListLookup::Named {
+            note_list_entry_unreadable(task_id, ref_, task, entry_gva);
+        }
         return None;
     }
     let e = decode_list_object_entry(&raw).ok()?;
@@ -1624,7 +1683,7 @@ fn type4_claimant_tasks<M: HostMemory>(state: &DeviceState, host: &M, surface_id
         .tasks
         .live_ids()
         .filter(|&task_id| {
-            lookup_list_entry(state, host, task_id, surface_id)
+            probe_list_entry(state, host, task_id, surface_id)
                 .is_some_and(|e| e.object_type == OBJECT_TYPE_SURFACE)
         })
         .collect()
@@ -1799,7 +1858,7 @@ fn resolve_type4_surface_ex<M: HostMemory>(
 
     for task_id in type4_probe_order(&state.tasks, hint) {
         // Count the guest-read cost of one active-task object-list probe.
-        let Some(entry) = lookup_list_entry(state, host, task_id, surface_id) else {
+        let Some(entry) = probe_list_entry(state, host, task_id, surface_id) else {
             continue;
         };
         if entry.object_type != OBJECT_TYPE_SURFACE {
