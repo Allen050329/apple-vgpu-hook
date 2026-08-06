@@ -937,40 +937,56 @@ pub(crate) struct ResidentTargetSlot {
     /// costs retained VRAM rather than a lost frame. Add sites as they are
     /// proven, never to make a number look better.
     ///
-    /// # What it costs, measured
+    /// # What it costs, measured as a controlled A/B
     ///
     /// The standing worry about protecting a class from reclaim is that it
-    /// becomes a population nothing can trim. Driven x86/PCI boot,
-    /// `web-content-probe -n 10 --churn 1`, quiesced host:
+    /// becomes a population nothing can trim. Both arms are the same build with
+    /// only the two reclaim predicates changed (the flag and its totals are
+    /// maintained in both, so the control reports the population it *would*
+    /// have protected). Driven x86/PCI boot each, `web-content-probe -n 10
+    /// --churn 1`, run on to a settled desktop, quiesced host:
     ///
     /// ```text
-    ///   registry_pressure  peak=262/320  evicts=0  peak_mib=209
-    ///                      sole_copy=173/44mib  cap_no_victim=0
-    ///                      slab_mib settled 59 carved / 208 held
-    ///   t11sample_reclaimed_from_pages   12      (36-44 before this field)
+    ///                                    gates off   gates on
+    ///   non-pinned peak (cap 320)              191        275
+    ///   sole_copy peak                     68/27mib  194/37mib
+    ///   cap_no_victim                            0          0
+    ///   evicts                                   0          0
+    ///   slab_mib peak held                     464        464
+    ///   slab_mib settled carved/held         45/72     52/208
+    ///   t11sample_reclaimed_from_pages (sum)    33         39
     /// ```
     ///
-    /// Three readings, and the third is the one that settles it:
+    /// - **`cap_no_victim=0` on both.** Not once did the capacity walk want a
+    ///   victim and find every candidate protected, so the ceiling this could
+    ///   have introduced was not approached, and `evicts` stayed 0 either way.
+    /// - **The protected set is small surfaces.** 194 slots is 71 % of the peak
+    ///   population but 37 MiB is 19 % of its bytes. A slot count alone would
+    ///   overstate this nearly fourfold, which is why the totals carry bytes.
+    /// - **Peak VRAM is identical (464 MiB held) and settled carved moves
+    ///   45 → 52 MiB.** Settled *held* is 72 → 208, so the slab retains more
+    ///   empty blocks; the bytes actually in use grow by about the 10 MiB the
+    ///   protected population accounts for.
+    /// - **Headroom is what this really spends.** The non-pinned peak goes
+    ///   191 → 275 of 320. A heavier workload therefore reaches `REGISTRY_CAP`
+    ///   sooner, and when it does the walk exceeds the cap rather than losing a
+    ///   frame — which is the designed behaviour, and `cap_no_victim` is the
+    ///   counter that will say it started.
     ///
-    /// - **`cap_no_victim=0`.** Not once did the capacity walk want a victim and
-    ///   find every candidate protected. The registry never exceeded its cap on
-    ///   account of this field, so the ceiling this could have introduced was not
-    ///   approached.
-    /// - **173 slots but 44 MiB.** 66 % of the peak population and 21 % of its
-    ///   bytes: the protected set is small surfaces. A slot count alone would
-    ///   have made this look three times worse than it is, which is why the
-    ///   totals carry bytes.
-    /// - **Settled VRAM did not move.** 59 MiB carved against the 64 MiB the
-    ///   ungated drain settled at in the experiment recorded on
-    ///   [`IDLE_TARGET_AGE_MS`]. The correctness this buys is close to free —
-    ///   where the population gate tried for the same class by holding 464 MiB.
+    /// ## This does **not** reduce `t11sample_reclaimed_from_pages`
     ///
-    /// `t11sample_reclaimed_from_pages` falls to 12 rather than 0, and that is
-    /// the intended shape rather than a residue. Every remaining one is a
-    /// resident this field says was copied out, so its guest pages hold its
-    /// content and the fall-through re-serves the right pixels — redundant work,
-    /// not a lost frame. Driving that to 0 is a throughput question for the drain
-    /// cutoff and has nothing to do with this field.
+    /// 33 against 39, i.e. no reduction and if anything slightly up inside the
+    /// run-to-run spread. An earlier revision of this doc claimed a fall from
+    /// "36-44" to 12; that was wrong. `t11sample_reclaimed_from_pages` is a
+    /// `store_routes` counter and therefore **per-window**, and the 12 was a
+    /// `sort -n | tail -1` over the samples — the busiest window read as a boot
+    /// total. Summed, the two arms are the same.
+    ///
+    /// That is consistent with what the field does rather than a
+    /// disappointment: the events it leaves are residents that *were* copied
+    /// out, and those are exactly the ones the gate still lets the drain take.
+    /// This field is a correctness change, and the table above is the argument
+    /// that it is affordable — not an argument that it is also an optimisation.
     ///
     /// # Every writer does pass through the two setters
     ///
