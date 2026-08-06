@@ -752,7 +752,6 @@ fn corpus(arity: usize) -> Vec<Vec<u64>> {
 /// No scalar-only parser unwinds on any decoded value.
 #[test]
 fn no_parser_panics_on_scalars_the_guest_could_decode() {
-    crate::source_scan::workspace_root();
     let mut failures: Vec<String> = Vec::new();
     let mut calls = 0usize;
     for target in targets() {
