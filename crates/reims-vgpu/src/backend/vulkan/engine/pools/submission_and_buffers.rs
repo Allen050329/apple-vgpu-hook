@@ -2763,6 +2763,70 @@ mod recycle_tests {
         );
     }
 
+    /// Re-keying an identity whose resident still owes a deferred writeback is
+    /// refused, not performed.
+    ///
+    /// One identity holds one slot, so a shape change destroys the old image —
+    /// and a pinned resident's pixels exist only there, having been accepted
+    /// from the guest and not yet landed in its pages. Every other removal in
+    /// this registry skips a pinned entry; this path did not, and the loss
+    /// surfaced later and elsewhere as `StorageReadResidentAbsent`.
+    ///
+    /// The unpinned half must keep working: a re-key of a resident that owes
+    /// nothing is an ordinary recreate.
+    ///
+    /// Fails without the fix: `compute_rekey_refusal` does not exist and the
+    /// destroy is unconditional.
+    #[test]
+    fn rekeying_a_pinned_compute_resident_is_refused_rather_than_dropped() {
+        use crate::observe::decline::Decline;
+        let mut pools = ResourcePools::new();
+        let pinned = admit_compute_resident(&mut pools, 1, 0, true);
+        let unpinned = admit_compute_resident(&mut pools, 2, 0, false);
+        let same = StorageImageKey {
+            width: 8,
+            height: 8,
+            format: StorageImageFormat::default(),
+            sampled_only: false,
+        };
+        let reshaped = StorageImageKey {
+            width: 16,
+            ..same
+        };
+
+        assert!(
+            pools.compute_rekey_refusal(&pinned, same).is_none(),
+            "the same shape is not a re-key, pinned or not"
+        );
+        assert!(
+            pools.compute_rekey_refusal(&unpinned, reshaped).is_none(),
+            "re-keying a resident that owes no writeback is an ordinary recreate"
+        );
+        let decline = pools
+            .compute_rekey_refusal(&pinned, reshaped)
+            .expect("re-keying a pinned resident must be refused");
+        assert_eq!(
+            decline.slug(),
+            "vk_compute_exec_resident_rekey_would_drop_pinned"
+        );
+        let fields = decline.fields();
+        let field = |name: &str| {
+            fields
+                .iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| v.clone())
+        };
+        assert_eq!(
+            (field("held_width"), field("wanted_width")),
+            (Some("8".to_string()), Some("16".to_string())),
+            "the refusal names both shapes, so a reader can tell which side moved"
+        );
+        assert!(
+            pools.compute_storage_registry.contains_key(&pinned),
+            "the refusal must leave the unflushed content in place"
+        );
+    }
+
     /// With every remaining resident pinned there is no victim, so the caller's
     /// sweep loop terminates and the registry soft-exceeds its cap rather than
     /// destroying content whose only copy is on the GPU. Same trade the sibling

@@ -153,11 +153,22 @@ impl ResourcePools {
         seed_generation: u32,
         counters: &EngineCounters,
     ) -> Result<ResidentStorageImageUse, DrawError> {
+        // A shape change re-keys the identity, and one identity holds one slot,
+        // so the old image is destroyed. Every other removal in this registry
+        // skips a pinned resident — the cap sweep and the age drain both do —
+        // because a pin means the content owes a deferred writeback and exists
+        // nowhere but that image. This path did not, so a re-shape between a
+        // Store and its flush discarded accepted guest output with nothing said,
+        // surfacing later and elsewhere as `StorageReadResidentAbsent`. Refuse
+        // instead: the pin clears when the writeback lands and the next dispatch
+        // re-keys normally, so this holds the request rather than ending it.
+        if let Some(decline) = self.compute_rekey_refusal(&identity, key) {
+            return Err(DrawError::ComputeExecution(decline));
+        }
         if self
             .compute_storage_registry
             .get(&identity)
-            .map(|resident| resident.slot.key != key)
-            .unwrap_or(false)
+            .is_some_and(|resident| resident.slot.key != key)
         {
             if let Some(old) = self.compute_storage_registry.remove(&identity) {
                 self.dispose(
@@ -232,6 +243,33 @@ impl ResourcePools {
             slot,
             layout: vk::ImageLayout::UNDEFINED,
             generation_match: false,
+        })
+    }
+
+    /// The refusal owed when `identity` is already held at a different image
+    /// shape by a resident that still owes a deferred writeback, or `None` when
+    /// the re-key is safe to perform.
+    ///
+    /// Split out from [`ResourcePools::acquire_resident_storage_image`] so the
+    /// pin check is unit-testable without a device, the same reason
+    /// `take_aged_storage_residents` is split from its disposal half.
+    pub(crate) fn compute_rekey_refusal(
+        &self,
+        identity: &ComputeStorageResidencyKey,
+        key: StorageImageKey,
+    ) -> Option<ComputeExecutionDecline> {
+        let held = self
+            .compute_storage_registry
+            .get(identity)
+            .filter(|resident| resident.pinned && resident.slot.key != key)?;
+        Some(ComputeExecutionDecline::ResidentRekeyWouldDropPinned {
+            identity: *identity,
+            held_width: held.slot.key.width,
+            held_height: held.slot.key.height,
+            held_format: held.slot.key.format,
+            wanted_width: key.width,
+            wanted_height: key.height,
+            wanted_format: key.format,
         })
     }
 
