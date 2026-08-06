@@ -309,6 +309,34 @@ fn clear_type4_fail(surface_id: u32, backed_gva: u64) {
 ///
 /// Silent when the latch is empty, because an empty latch is the expected state
 /// and this rides a one-second cadence.
+///
+/// # What a driven boot reads
+///
+/// x86/PCI, `web-content-probe -n 10 --churn 1`, 12 951 log lines, probe green.
+/// The identity closes exactly:
+///
+/// ```text
+///   type4_backing_fail        8
+///   type4_backing_recovered   7
+///   type4_backing_superseded  0
+///   outstanding n             1      8 = 7 + 0 + 1
+/// ```
+///
+/// Fifteen census lines for the boot, so the cadence costs nothing. The first
+/// reads `oldest_ms=294` and the last `oldest_ms=14317` — which is the argument
+/// for carrying the age at all, because one of those `n=1`s is a retry still in
+/// flight and the other is a surface that was never backed, and the count alone
+/// cannot tell them apart.
+///
+/// The standing reading, reproducible rather than incidental: two driven boots
+/// each end with exactly one outstanding refusal, both `sid=27`, both
+/// `reason=translate st=zero-pfn pte=0x0`, both a 2-3 page surface, at two
+/// different backings. Neither boot lost a pixel the probe could measure. What
+/// is *not* established is whether the guest abandoned the surface or the retry
+/// never came: [`clear_type4_fail`] fires at the next successful **use** of the
+/// backing, so for the last refusal of a boot "no line" and "no further use" are
+/// the same silence. Separating them needs a signal at the point of abandonment,
+/// which does not exist.
 pub(crate) fn type4_backing_outstanding_census() -> Option<String> {
     let now = crate::observe::elapsed_ms() as u64;
     let guard = type4_fail_latch().lock().unwrap_or_else(|e| e.into_inner());
