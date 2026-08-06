@@ -241,6 +241,17 @@ pub(crate) struct ResourcePools {
     /// Source of [`ResidentTargetSlot::use_seq`]. Monotonic for the life of the
     /// pools; at one bump per bind it cannot wrap in any realistic session.
     use_clock: u64,
+    /// Highest non-pinned resident population this device has held, and the
+    /// count of residents the capacity walk destroyed. Reported together as
+    /// `registry_non_pinned_peak` / `target_registry_cap_evictions`; see those
+    /// for why the pair is only interpretable together.
+    ///
+    /// Kept here rather than on `EngineCounters` for the reason the recycle
+    /// stats are: these are properties of the registry, which lives on this
+    /// struct under the engine lock, so there is nothing to synchronise and no
+    /// atomic to pay for. `engine::counter_snapshot` merges them in.
+    registry_non_pinned_peak: u64,
+    registry_cap_evictions: u64,
     /// Monotonic wall-clock milliseconds for the resident-target idle drain, fed
     /// from the poll heartbeat and each publish ([`Self::advance_registry_touch_and_drain`]).
     /// Each admit/hit/present stamps its slot's `last_touch_ms` with this value;

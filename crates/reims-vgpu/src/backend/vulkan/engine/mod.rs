@@ -26,6 +26,10 @@ mod facade_decline;
 mod host_slab;
 pub mod init_decline;
 mod pools;
+/// The ceiling `registry_non_pinned_peak` is read against. Re-exported because
+/// `pools` is private and the census that reports the band lives outside this
+/// module: a peak with no cap beside it is a number, not a reading.
+pub(crate) use pools::REGISTRY_CAP;
 pub mod reason;
 mod slab;
 pub mod stage_phase;
@@ -2116,6 +2120,9 @@ pub fn counter_snapshot() -> CounterSnapshot {
     snap.target_free_allocs = t_allocs;
     snap.target_recycle_admits = t_admits;
     snap.target_recycle_cap_drops = t_cap_drops;
+    let (reg_peak, reg_evictions) = eng.pools.registry_pressure_stats();
+    snap.registry_non_pinned_peak = reg_peak;
+    snap.target_registry_cap_evictions = reg_evictions;
     snap
 }
 

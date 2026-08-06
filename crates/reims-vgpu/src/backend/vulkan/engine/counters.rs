@@ -342,6 +342,38 @@ engine_counters! {
         target_free_allocs,
         target_recycle_admits,
         target_recycle_cap_drops,
+        /// High-water mark of the non-pinned resident population, against which
+        /// `REGISTRY_CAP` is the ceiling — read as a band, `peak/cap`.
+        ///
+        /// The reach, not the drops. `target_registry_cap_evictions` reading zero
+        /// says only that the cap did not bind on the workload that ran; it
+        /// cannot distinguish a peak of 40 from a peak of 319, and those are
+        /// opposite answers to whether the bound has headroom. This is the one
+        /// that separates them, which is why it exists as a peak rather than as
+        /// an instantaneous population: the cap's whole purpose is to survive a
+        /// compositing *burst*, and a burst that rises and drains between two
+        /// census samples is exactly what an instantaneous reading misses.
+        ///
+        /// Cumulative and never reset by the windowed reset, because the
+        /// question is "how close did this boot ever come", not "how close is it
+        /// now". `EngineCounters::reset_all` clears it for tests.
+        ///
+        /// Sampled where the cap is enforced, so every admission that could grow
+        /// the population is seen. Two prior readings are quoted in this
+        /// module's neighbours — a non-pinned peak of ~260 under a YouTube
+        /// page-load, and `reg=512/512 evicts=168` before pinned slots were
+        /// excluded — and **neither is reproducible today**: nothing in the tree
+        /// emitted them, so they are historical probe output rather than
+        /// something a boot can be asked for. That is the gap this closes.
+        registry_non_pinned_peak,
+        /// Residents destroyed by the capacity walk, cumulative.
+        ///
+        /// Paired with the peak above because the two are only interpretable
+        /// together, and this is the half that counts loss: a retired resident's
+        /// pixels existed only on the GPU and nothing recreates one except a
+        /// draw rendering into the same identity, so a non-zero reading here is
+        /// guest content destroyed rather than a cache asked to refill.
+        target_registry_cap_evictions,
     }
 }
 /// The `note_*` helpers: the increments that are not a bare `fetch_add(1)` at

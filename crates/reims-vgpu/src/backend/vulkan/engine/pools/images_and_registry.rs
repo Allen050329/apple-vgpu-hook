@@ -1062,6 +1062,26 @@ impl ResourcePools {
         self.registry_order.len().saturating_sub(pinned)
     }
 
+    /// Fold the current non-pinned population into the high-water band and
+    /// return it.
+    ///
+    /// Split from [`Self::evict_registry_to_cap`] for the same reason
+    /// [`Self::cap_eviction_victim`] is: that function is `unsafe` and needs a
+    /// live `DeviceContext` to dispose what it evicts, so nothing about it can
+    /// be exercised without a GPU — and an instrument that is never tested is
+    /// one that can silently read zero forever, which is the failure it exists
+    /// to prevent in the first place.
+    ///
+    /// Called at the top of the capacity walk, before any eviction: that is the
+    /// one point every admission passes through, and it is where the population
+    /// is at its highest. Sampling after the walk would record the cap back
+    /// rather than the demand that crossed it.
+    fn note_registry_reach(&mut self) -> usize {
+        let non_pinned = self.non_pinned_registry_len();
+        self.registry_non_pinned_peak = self.registry_non_pinned_peak.max(non_pinned as u64);
+        non_pinned
+    }
+
     /// Evict non-pinned resident targets (LRU, oldest at the front of
     /// `registry_order`) until the non-pinned population is at or below
     /// [`REGISTRY_CAP`]. Pinned slots (deferred render Stores whose only copy is
@@ -1081,7 +1101,7 @@ impl ResourcePools {
         counters: &EngineCounters,
         protect: Option<&TargetIdentity>,
     ) {
-        let mut non_pinned = self.non_pinned_registry_len();
+        let mut non_pinned = self.note_registry_reach();
         while non_pinned > REGISTRY_CAP {
             // Least-recently-used, for real. `registry_order` is insertion
             // order — nothing promotes an entry when a draw reuses it — so
@@ -1113,6 +1133,7 @@ impl ResourcePools {
                 break;
             };
             self.retire_resident(ctx, &victim, ResidentReclaim::CapEvicted, counters);
+            self.registry_cap_evictions += 1;
             non_pinned = non_pinned.saturating_sub(1);
         }
     }
@@ -1948,4 +1969,71 @@ mod pin_count_tests {
             "the touched target is stamped at the touch time"
         );
     }
+
+    /// The registry reach band records the highest population, and does not
+    /// fall back when residents go away.
+    ///
+    /// Without this the cap's own counter is uninterpretable. A boot reporting
+    /// `evicts=0` has said only that `REGISTRY_CAP` did not bind on the workload
+    /// that ran, and a peak of 40 and a peak of one-below-the-cap both satisfy
+    /// that — opposite answers to whether the bound has headroom. AGENTS.md
+    /// states the rule this implements: band the requested reach before widening
+    /// or narrowing any table.
+    ///
+    /// Two properties, because only the pair is a high-water mark. It has to
+    /// rise with the population, and it has to *stay* when the population drops
+    /// — an instrument that tracked the current value would report whatever the
+    /// registry happened to hold at census time and miss every burst, which is
+    /// the only thing the cap exists for.
+    ///
+    /// Pinned residents are excluded, matching what `REGISTRY_CAP` bounds, so a
+    /// pinned peer must not inflate the reading.
+    #[test]
+    fn the_registry_reach_band_holds_the_peak_and_ignores_pinned_residents() {
+        let mut pools = ResourcePools::new();
+        assert_eq!(
+            pools.registry_pressure_stats(),
+            (0, 0),
+            "a fresh pools has neither reach nor loss"
+        );
+
+        admit(&mut pools, surf(1), 10, 0);
+        admit(&mut pools, surf(2), 10, 0);
+        admit(&mut pools, surf(3), 10, 1); // pinned -- not what the cap bounds
+        assert_eq!(pools.note_registry_reach(), 2, "the pinned peer is excluded");
+        assert_eq!(
+            pools.registry_pressure_stats().0,
+            2,
+            "the band took the non-pinned population"
+        );
+
+        admit(&mut pools, surf(4), 10, 0);
+        assert_eq!(pools.note_registry_reach(), 3);
+        assert_eq!(pools.registry_pressure_stats().0, 3, "the band rose");
+
+        // Every non-pinned resident goes away, leaving only the pinned peer, so
+        // the non-pinned population returns to zero. A current-value reading
+        // would now report nothing at all and the burst above would be
+        // invisible — which is exactly the failure this band prevents.
+        for id in [surf(1), surf(2), surf(4)] {
+            pools.registry.remove(&id);
+            pools.registry_order.retain(|k| k != &id);
+        }
+        assert_eq!(
+            pools.note_registry_reach(),
+            0,
+            "the population really fell, and the pinned peer never counted"
+        );
+        assert_eq!(
+            pools.registry_pressure_stats().0,
+            3,
+            "the peak is a high-water mark, not the current population"
+        );
+        assert_eq!(
+            pools.registry_pressure_stats().1,
+            0,
+            "nothing was evicted, so the loss half stays zero"
+        );
+    }
+
 }

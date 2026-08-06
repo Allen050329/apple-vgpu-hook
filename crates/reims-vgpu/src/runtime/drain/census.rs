@@ -1477,7 +1477,37 @@ fn emit_engine_delta() {
         d.desc_pool_grow,
         d.gen_mismatch,
     ));
+    emit_registry_pressure(&now);
     emit_draw_phase();
+}
+
+/// How close the resident registry came to `REGISTRY_CAP`, and what the cap
+/// destroyed when it got there.
+///
+/// Separate from `engine_delta` because both fields are read **absolute**, and
+/// that line reports differences. A high-water mark deltas to nonsense — the
+/// difference between two peaks is not a peak, and reads as zero for the rest of
+/// the boot once the true maximum is behind the window — so it is taken from the
+/// snapshot rather than from `delta_since`.
+///
+/// Read the pair as a band. `evicts=0` on its own does not say the bound has
+/// headroom; it says the workload that ran did not cross it, which a peak of 40
+/// and a peak of 319 both satisfy. `peak` is what separates them, and it is the
+/// number to have before widening, narrowing, or removing the cap.
+///
+/// A non-zero `evicts` is not cache pressure. A retired resident's pixels lived
+/// only on the GPU, and nothing recreates one except a draw rendering into the
+/// same identity — so it counts guest content destroyed, and a draw that later
+/// samples one refuses through `vk_draw_exec_sampled_resident_missing` with
+/// `prior=cap_evicted`.
+#[cfg(feature = "backend-vulkan")]
+fn emit_registry_pressure(now: &crate::backend::vulkan::engine::CounterSnapshot) {
+    crate::observe::off(format!(
+        "registry_pressure (levels, not per-interval) peak={} cap={} evicts={}",
+        now.registry_non_pinned_peak,
+        crate::backend::vulkan::engine::REGISTRY_CAP,
+        now.target_registry_cap_evictions,
+    ));
 }
 
 /// The split of `drain_duty`'s `draw_us` that actually covers it, over the same

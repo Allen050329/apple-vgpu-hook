@@ -91,6 +91,8 @@ impl ResourcePools {
             registry_order: VecDeque::new(),
             reclaimed_recent: VecDeque::new(),
             use_clock: 0,
+            registry_non_pinned_peak: 0,
+            registry_cap_evictions: 0,
             idle_clock_ms: 0,
             last_drain_ms: 0,
             settled_drain_passes: 0,
@@ -750,6 +752,17 @@ impl ResourcePools {
     /// `(free_hits, free_allocs, recycle_admits, recycle_cap_drops)`.
     pub(crate) fn target_recycle_stats(&self) -> (u64, u64, u64, u64) {
         self.target_free.stats()
+    }
+
+    /// `(non_pinned_peak, cap_evictions)` for the resident registry — the reach
+    /// and the loss, which only answer the question together.
+    ///
+    /// Both are cumulative for the life of the pools. The peak is the reading
+    /// that makes a zero eviction count mean something: without it, a boot that
+    /// never came near `REGISTRY_CAP` and a boot that stopped one resident short
+    /// of it report identically.
+    pub(crate) fn registry_pressure_stats(&self) -> (u64, u64) {
+        (self.registry_non_pinned_peak, self.registry_cap_evictions)
     }
 
     /// Cumulative compute-storage recycle diagnostics: `(admits, cap_drops)`.
