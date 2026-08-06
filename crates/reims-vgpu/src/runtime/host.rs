@@ -853,10 +853,20 @@ impl Drop for FakeHost {
         #[cfg(not(target_os = "macos"))]
         {
             for r in self.ranges.drain(..) {
+                // The layout `alloc_block` allocated with, and no fallback.
+                // `dealloc` requires the *allocating* layout, so the `align = 1`
+                // fallback that used to sit here was undefined behaviour on the
+                // one path it could have run — and it could not run: alloc_block
+                // returns `None` when this exact layout cannot be built, so a
+                // block that exists proves it can. `unwrap_or` also evaluated
+                // that wrong layout on every drop, not only on failure.
                 let layout =
                     std::alloc::Layout::from_size_align(r.alloc_len, GUEST_PAGE_SIZE_ARM64E)
-                        .unwrap_or(std::alloc::Layout::from_size_align(r.alloc_len, 1).unwrap());
-                // SAFETY: ptr/alloc_len from alloc_block.
+                        .expect(
+                            "alloc_block built this layout; the block could not exist otherwise",
+                        );
+                // SAFETY: ptr and alloc_len come from alloc_block, and the
+                // layout is the one it allocated with.
                 unsafe { std::alloc::dealloc(r.ptr as *mut u8, layout) };
             }
         }
