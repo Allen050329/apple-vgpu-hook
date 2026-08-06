@@ -1016,17 +1016,49 @@ impl FreeTargetImage {
 /// the heap can be defended without first measuring what the engine's other
 /// consumers need, and this device does not account for those.
 ///
-/// One prerequisite is done: both readings now come off [`NonPinnedTotals`],
-/// maintained at the three sites that can change them, so the population is free
-/// to grow past this cap without turning every admit into an O(n) registry walk.
+/// # The driven eviction, and what it says about all of the above
 ///
-/// One is still open:
+/// The argument above was made without ever having seen this walk run —
+/// `evicts=0` on every boot ever measured. So it was driven: `REGISTRY_CAP`
+/// temporarily set to **32**, six times below the burst working set, same
+/// x86/PCI boot, same `web-content-probe --churn 1`.
 ///
-/// - **A driven eviction.** No boot has ever produced one (`evicts=0`
-///   everywhere), so the walk and the `prior=cap_evicted` refusal it leads to
-///   are exercised only by the unit tests below. Whatever replaces this policy
-///   must be measured against a workload that actually reaches the bound, or the
-///   replacement inherits the same untested state.
+/// ```text
+///   registry_pressure peak=33 cap=32 evicts=1591 peak_mib=73
+///   sampled_resident_missing                          0
+///   probe regions not measuring their declared colour 0
+/// ```
+///
+/// **1591 evictions, no measured loss.** Not one of them destroyed a resident
+/// that anything later sampled, and the desktop screenshotted intact. The LRU is
+/// why: `cap_eviction_victim` orders by `use_seq`, which
+/// [`ResourcePools::registry_note_sampled_use`] bumps on a *read* and not only on
+/// a render-into, so a resident that is still being sampled cannot become the
+/// minimum. At six times over the bound it still found only dead residents.
+///
+/// That is a negative result for the flip, and it is the reading that governs:
+/// the failure mode is real in the code and reachable in principle, and this
+/// workload cannot reach it. What survives is narrower than the case above:
+///
+/// - The cap is still expressed in the wrong quantity, and 320 slots is still
+///   ~350 MiB on one workload and 10 GiB on another. That is a reason to change
+///   what it measures, not a measured harm.
+/// - `evicts=1591` at cap 32 against `evicts=0` at cap 320 says the margin at
+///   320 is not thin in practice — the population that reached 197 was mostly
+///   *replaceable*, not live.
+/// - The remaining unknown is a workload whose live sampled set exceeds the cap.
+///   Nothing here produced one. Until something does, replacing this policy
+///   trades a failure mode measured at zero for one that has never been measured
+///   at all, which is the wrong direction.
+///
+/// So: keep the cap, keep the `peak_mib` instrument pointed at it, and treat a
+/// non-zero `evicts` **with** a non-zero `sampled_resident_missing` as the signal
+/// that reopens this. A non-zero `evicts` alone is not it, which is precisely
+/// what this run establishes.
+///
+/// The other prerequisite landed anyway and is worth keeping on its own terms:
+/// both readings come off [`NonPinnedTotals`], maintained at the three sites that
+/// can change them, so neither reading is an O(n) registry walk on every admit.
 pub(crate) const REGISTRY_CAP: usize = 320;
 /// Wall-clock milliseconds a non-pinned resident may go untouched before the
 /// idle drain reclaims it. An actively-drawn target is touched every frame (and
