@@ -16,6 +16,89 @@
 
 use super::*;
 
+/// Band how long a resident had gone untouched before something read it,
+/// against the cutoff that would have destroyed it.
+///
+/// The idle drain terminally destroys any non-pinned resident untouched for
+/// `IDLE_TARGET_AGE_MS`, and nothing recreates a resident's content — so a draw
+/// that samples one afterwards refuses permanently. What stops that today is
+/// that a resident being read is touched by the read
+/// ([`ResourcePools::registry_note_sampled_use`]), which only helps while the
+/// gaps between reads stay under the cutoff. A guest that renders a layer, has
+/// it occluded for longer than that, and then reveals it is the shape that loses
+/// it.
+///
+/// `sampled_resident_missing` reading zero cannot say whether that is far away
+/// or one slow frame away — it is a drop counter, and this project's own rule is
+/// that a drop counter reading zero is not a measurement: a gap that peaks at
+/// 50 ms and one that peaks at 1900 ms both report zero, and only one of them
+/// says the cutoff has headroom. This is the reach that separates them, in time
+/// rather than in slots, and it is the same instrument the bind tables already
+/// have as their `reach_route` bands.
+///
+/// Read `resident_resample_past_cutoff` as the alarm: a resident that was read
+/// after sitting longer than its own drain cutoff survived only because the
+/// drain is throttled to `IDLE_TARGET_DRAIN_MAX_PER_CALL` per pass and had not
+/// reached it yet. A non-zero reading there is the argument for changing the
+/// drain — it does not mean content was lost, it means the margin is gone.
+///
+/// Bands are fractions of `IDLE_TARGET_AGE_MS` rather than absolute
+/// milliseconds, so retuning the cutoff moves them with it and no reading is
+/// ever quoted against a bound it did not come from. Division rather than
+/// multiplication so a large gap cannot overflow the comparison.
+///
+/// # First reading, and it is not the comfortable one
+///
+/// Driven x86/PCI boot, `web-content-probe --churn 1`, whole run, against
+/// `IDLE_TARGET_AGE_MS` = 2000 ms:
+///
+/// ```text
+///   lt_eighth_cutoff   (<250 ms)      24643
+///   lt_quarter_cutoff  (250-499 ms)     413
+///   lt_half_cutoff     (500-999 ms)       5
+///   under_cutoff       (1000-1999 ms)     1
+///   past_cutoff        (>=2000 ms)        0
+/// ```
+///
+/// The distribution is overwhelmingly under an eighth of the cutoff, which is
+/// the answer that would have been assumed. The reading that matters is the
+/// **1**: one resample arrived after its resident had sat between 1000 and
+/// 1999 ms, so somewhere between half the budget and none of it was left. The
+/// drain destroys at `last_touch_ms <= now - cutoff` and is throttled to
+/// `IDLE_TARGET_DRAIN_MAX_PER_CALL` per pass, so that resident was not yet a
+/// victim — but it is not the case that this workload stays an order of
+/// magnitude clear of the cutoff, which is what `sampled_resident_missing=0`
+/// on its own invites you to conclude.
+///
+/// Finer bands past the half mark are what would say whether that one sample sat
+/// at 1.0 s or at 1.9 s, and those are very different margins. This does not
+/// resolve it; it establishes that the question is live.
+///
+/// # Reading the count against `resident_samples`
+///
+/// The band total is about **twice** `sampled_gpu_binds` (25062 against 12531 on
+/// the run above, exactly 2x). That is not a discrepancy:
+/// [`ResourcePools::registry_note_sampled_use`] is called from two sites per
+/// draw — the pre-pass loop that marks every sampled target before the render
+/// target is ensured, and the resolve loop that binds them — while
+/// `sampled_gpu_binds` increments once per bind. So these bands count *touches*
+/// and `resident_samples` counts *binds*. Do not divide one by the other and
+/// call the result a rate.
+fn resident_resample_band(idle_ms: u64) -> &'static str {
+    let cutoff = IDLE_TARGET_AGE_MS;
+    if idle_ms < cutoff / 8 {
+        "resident_resample_lt_eighth_cutoff"
+    } else if idle_ms < cutoff / 4 {
+        "resident_resample_lt_quarter_cutoff"
+    } else if idle_ms < cutoff / 2 {
+        "resident_resample_lt_half_cutoff"
+    } else if idle_ms < cutoff {
+        "resident_resample_under_cutoff"
+    } else {
+        "resident_resample_past_cutoff"
+    }
+}
+
 /// Everything a creation site knows about a resident it has just built.
 ///
 /// The stored [`ResidentTargetSlot`] is this plus what the registry owns and a
@@ -1396,6 +1479,9 @@ impl ResourcePools {
     /// Record that a draw is reading this resident as a **sampled source**, so
     /// both reclaim paths count it as in use.
     ///
+    /// See [`resident_resample_band`] for why this also bands how long the
+    /// resident had been sitting untouched before the read.
+    ///
     /// Reading a resident was not a use. `last_touch_ms` was refreshed by
     /// `registry_ensure` (a draw rendering *into* the target), by the present
     /// touch, and by nothing else — while the sampled-source resolve in
@@ -1427,8 +1513,10 @@ impl ResourcePools {
         self.use_clock += 1;
         let seq = self.use_clock;
         if let Some(slot) = self.registry.get_mut(identity) {
+            let idle_ms = touch.saturating_sub(slot.last_touch_ms);
             slot.last_touch_ms = touch;
             slot.use_seq = seq;
+            crate::runtime::drain::note_store_route(resident_resample_band(idle_ms));
         }
     }
 }
@@ -1801,6 +1889,38 @@ mod pin_count_tests {
         let victims = pools.plan_idle_drain(now, None).expect("pass due");
         assert_eq!(victims, vec![surf(1)], "only the aged non-pinned resident");
         assert_eq!(pools.idle_clock_ms, now, "clock advanced to wall time");
+    }
+
+    /// The resample bands are fractions of the drain cutoff, so retuning the
+    /// cutoff moves them with it and no reading is ever quoted against a bound
+    /// it did not come from.
+    ///
+    /// The boundary that matters is the last one. `past_cutoff` is exactly the
+    /// case where a resident was read after sitting longer than the age at which
+    /// the drain would have destroyed it, so it survived only because the drain
+    /// is throttled to `IDLE_TARGET_DRAIN_MAX_PER_CALL` per pass and had not
+    /// reached it. `IDLE_TARGET_AGE_MS` itself must therefore land in that band
+    /// and not under it: the drain's own comparison is `last_touch_ms <= cutoff`,
+    /// so a resident exactly at the cutoff is already a victim.
+    #[test]
+    fn the_resident_resample_bands_are_fractions_of_the_drain_cutoff() {
+        let c = IDLE_TARGET_AGE_MS;
+        for (idle, expected) in [
+            (0, "resident_resample_lt_eighth_cutoff"),
+            (c / 8 - 1, "resident_resample_lt_eighth_cutoff"),
+            (c / 8, "resident_resample_lt_quarter_cutoff"),
+            (c / 4, "resident_resample_lt_half_cutoff"),
+            (c / 2, "resident_resample_under_cutoff"),
+            (c - 1, "resident_resample_under_cutoff"),
+            (c, "resident_resample_past_cutoff"),
+            (u64::MAX, "resident_resample_past_cutoff"),
+        ] {
+            assert_eq!(
+                resident_resample_band(idle),
+                expected,
+                "idle_ms={idle} against cutoff={c}"
+            );
+        }
     }
 
     /// A resident that a draw only ever *samples* survives the idle drain.
