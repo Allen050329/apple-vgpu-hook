@@ -104,7 +104,7 @@ const ROWS: &[Row] = &[
               extension names, terminated rather than measured.",
     },
     Row {
-        at: "reims-vgpu/src/backend/vulkan/engine/pools/mod.rs:2199",
+        at: "reims-vgpu/src/backend/vulkan/engine/pools/mod.rs:2221",
         verdict: Verdict::CheckedBeforeReturn,
         why: "`staging_write_ptr` takes the write size and asks `slot_span_fits` \
               against the slot's own size before either arm forms a pointer. The \
