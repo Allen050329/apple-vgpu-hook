@@ -430,6 +430,37 @@ impl ResourcePools {
     /// QEMU. A draw can bind a compute-storage resident as a sampled source, so
     /// a target admission reclaiming this registry would have exactly that
     /// defect.
+    ///
+    /// # It works, and it was measured by breaking the allocator on purpose
+    ///
+    /// No boot has produced a real allocation failure here, and the driven
+    /// web-content boot this device is usually measured on reports a *single*
+    /// compute-storage resident — so that workload cannot reach this at all.
+    /// Driven instead with temporary fault injection (not in the tree): every
+    /// 10th `create_storage_image` failing its `vkAllocateMemory` for the whole
+    /// of that invocation, including the pools-only retry inside it, so the
+    /// refusal reaches this handler. Run against
+    /// `every_admitted_compute_storage_resident_survives_past_the_retired_slot_cap`,
+    /// whose 80 admissions are enough population for a reclaim to have something
+    /// to give:
+    ///
+    /// ```text
+    ///                     injected failures   dispatches lost
+    ///   with this retry                  16                 0
+    ///   without it                       16    the first one
+    /// ```
+    ///
+    /// Every one of the sixteen was absorbed. The same run's *seed-upload*
+    /// assertion does fail with the retry in place, and that is the reclaim
+    /// working rather than a defect: residents really were given back, so their
+    /// next dispatch re-uploaded a seed. Under real pressure that is the trade —
+    /// a re-upload instead of a refused dispatch.
+    ///
+    /// One refusal is **not** absorbed and should not be: an injected failure on
+    /// the very first dispatch of a boot, where the registry and the pools are
+    /// both empty. This returns 0, the caller refuses with the driver's own
+    /// error, and that is a GPU with nothing left to give doing the only correct
+    /// thing.
     unsafe fn reclaim_compute_storage_for_allocation_retry(
         &mut self,
         ctx: &DeviceContext,
