@@ -91,7 +91,7 @@ struct Row {
 /// How many types may answer [`Loss::ExecutedModified`].
 ///
 /// Not a budget. A ratchet: see [`the_executed_modified_census_only_shrinks`].
-const EXECUTED_MODIFIED_CEILING: usize = 14;
+const EXECUTED_MODIFIED_CEILING: usize = 13;
 
 /// Every `impl Decline`/`impl Refusal` in the crate, and what its worst arm
 /// costs the guest.
@@ -629,11 +629,12 @@ const ROWS: &[Row] = &[
     Row {
         file: "crates/reims-vgpu/src/runtime/draw/vulkan.rs",
         ty: "Type5ViewDecline",
-        loss: Loss::ExecutedModified,
-        why: "the read arm keeps the bytes it gathered before the fault and \
-              leaves the rest of the window at whatever the destination held, \
-              then binds it. Retired by discarding a short gather instead of \
-              binding it",
+        loss: Loss::Refused,
+        why: "all twelve arms return through one `fail` closure that answers \
+              `None`, and the sole caller propagates it with `?`, so a view \
+              this loader could not build is never bound — the `Read` arm drops \
+              the partly-filled `native` buffer with the early return rather \
+              than binding what it gathered",
     },
     Row {
         file: "crates/reims-vgpu/src/runtime/exec/mod.rs",
