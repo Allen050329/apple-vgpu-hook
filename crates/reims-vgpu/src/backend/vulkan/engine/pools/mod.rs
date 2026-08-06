@@ -252,6 +252,11 @@ pub(crate) struct ResourcePools {
     /// atomic to pay for. `engine::counter_snapshot` merges them in.
     registry_non_pinned_peak: u64,
     registry_cap_evictions: u64,
+    /// The live non-pinned population and what it occupies, maintained rather
+    /// than walked. Both readings come off this, and
+    /// `ResourcePools::registry_non_pinned_adjust` is the only writer — see
+    /// `ResourcePools::non_pinned_registry_len` for why it stopped being a walk.
+    registry_non_pinned: NonPinnedTotals,
     /// The same high-water in attachment bytes rather than slots, sampled from
     /// the same population at the same instant. See
     /// [`ResourcePools::non_pinned_registry_bytes`] for why a slot count cannot
@@ -742,6 +747,18 @@ pub(crate) fn slot_presentable(slot: &ResidentTargetSlot, width: u32, height: u3
     slot.content_ready && slot.scanout_order() && slot.width == width && slot.height == height
 }
 
+/// The non-pinned resident population, and the attachment bytes it holds.
+///
+/// One struct rather than two fields because the pair is only ever read
+/// together — `registry_pressure` reports both, and a count without its bytes is
+/// the reading `REGISTRY_CAP` was bounded by for as long as nobody could say
+/// what a slot costs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct NonPinnedTotals {
+    pub count: usize,
+    pub bytes: u64,
+}
+
 pub(crate) struct ResidentTargetSlot {
     pub image: vk::Image,
     pub memory: vk::DeviceMemory,
@@ -999,13 +1016,12 @@ impl FreeTargetImage {
 /// the heap can be defended without first measuring what the engine's other
 /// consumers need, and this device does not account for those.
 ///
-/// Two things have to land before that flip, in this order:
+/// One prerequisite is done: both readings now come off [`NonPinnedTotals`],
+/// maintained at the three sites that can change them, so the population is free
+/// to grow past this cap without turning every admit into an O(n) registry walk.
 ///
-/// - **Incremental accounting.** `non_pinned_registry_len` and
-///   `non_pinned_registry_bytes` both walk the whole registry, on every admit.
-///   That is free while the cap holds n at ~320 and is a per-draw O(n) scan once
-///   it does not. Track both totals on register / unregister / pin / unpin
-///   instead. Pure refactor, testable without a GPU, and it must come first.
+/// One is still open:
+///
 /// - **A driven eviction.** No boot has ever produced one (`evicts=0`
 ///   everywhere), so the walk and the `prior=cap_evicted` refusal it leads to
 ///   are exercised only by the unit tests below. Whatever replaces this policy

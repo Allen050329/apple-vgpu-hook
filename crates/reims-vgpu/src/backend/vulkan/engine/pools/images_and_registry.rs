@@ -354,6 +354,9 @@ impl ResourcePools {
         let old = self.registry.remove(identity);
         self.registry_order.retain(|k| k != identity);
         let old = old?;
+        if old.pin_count == 0 {
+            self.registry_non_pinned_adjust(Self::slot_attachment_bytes(&old), false);
+        }
         self.note_resident_reclaimed(identity, why);
         Some(old)
     }
@@ -422,6 +425,14 @@ impl ResourcePools {
             },
         );
         self.registry_order.push_back(identity.clone());
+        // Born unpinned (see the birth-state rule above), so it joins the
+        // non-pinned totals unconditionally.
+        let bytes = self
+            .registry
+            .get(identity)
+            .map(Self::slot_attachment_bytes)
+            .unwrap_or(0);
+        self.registry_non_pinned_adjust(bytes, true);
     }
 
     /// Drop the resident registered under `identity`, recording `why`, returning
@@ -990,18 +1001,28 @@ impl ResourcePools {
     /// content is not ready — callers must fall back to the synchronous
     /// Store. Unpin saturates at zero (a spurious unpin never underflows).
     pub(crate) fn pin_resident_target(&mut self, identity: &TargetIdentity, pinned: bool) -> bool {
-        if let Some(slot) = self.registry.get_mut(identity) {
-            if pinned {
-                if !slot.content_ready {
-                    return false;
-                }
-                slot.pin_count += 1;
-            } else {
-                slot.pin_count = slot.pin_count.saturating_sub(1);
-            }
-            return true;
+        let Some(slot) = self.registry.get_mut(identity) else {
+            return false;
+        };
+        if pinned && !slot.content_ready {
+            return false;
         }
-        false
+        // Counted pins, so only the 0 <-> 1 crossings change whether this slot is
+        // in the non-pinned totals. A second pin, or an unpin that leaves one
+        // holder, moves nothing — and a saturating unpin at zero must not add a
+        // slot that was already counted.
+        let before_non_pinned = slot.pin_count == 0;
+        if pinned {
+            slot.pin_count += 1;
+        } else {
+            slot.pin_count = slot.pin_count.saturating_sub(1);
+        }
+        let after_non_pinned = slot.pin_count == 0;
+        if before_non_pinned != after_non_pinned {
+            let bytes = Self::slot_attachment_bytes(slot);
+            self.registry_non_pinned_adjust(bytes, after_non_pinned);
+        }
+        true
     }
 
     /// Mark a resident ready after a draw stored into it.
@@ -1053,43 +1074,77 @@ impl ResourcePools {
     /// LRU-evictable (active) working set the `REGISTRY_CAP` bounds. Pinned slots
     /// are bounded separately (by the arming rail's own window cap) and excluded
     /// so a pinned burst cannot force the active set into eviction thrash.
+    ///
+    /// O(1). This and [`Self::non_pinned_registry_bytes`] each walked the whole
+    /// registry, on every admit — free only for as long as `REGISTRY_CAP` holds
+    /// the population near 320, which is the bound the byte measurement exists to
+    /// remove. [`Self::registry_non_pinned`] is maintained instead at the sites
+    /// that can change either total, and
+    /// `non_pinned_registry_totals_by_walk` is the walk kept as the thing to
+    /// check it against (test-only, so not linkable from here).
     fn non_pinned_registry_len(&self) -> usize {
-        let pinned = self
-            .registry
-            .values()
-            .filter(|slot| slot.pin_count > 0)
-            .count();
-        self.registry_order.len().saturating_sub(pinned)
+        self.registry_non_pinned.count
     }
 
-    /// Attachment bytes the same non-pinned set occupies: `w × h × texel` summed
+    /// Attachment bytes the same non-pinned set occupies: `w x h x texel` summed
     /// over every slot [`Self::non_pinned_registry_len`] counts.
     ///
     /// The number [`REGISTRY_CAP`]'s doc argues from — it says "slots are cheap;
     /// the real VRAM guard is per-image bytes", and then bounds the slots. It
-    /// also quotes ~516 MiB for a burst and a ~1005 MiB idle baseline, both from
+    /// also quoted ~516 MiB for a burst and a ~1005 MiB idle baseline, both from
     /// a `vram` census line that no longer exists anywhere in this crate, so
-    /// until this function there was nothing in the device that could say what a
+    /// until this counter there was nothing in the device that could say what a
     /// count of 320 costs. 320 slots is 5 MiB of 16x16 scratch or 10 GiB of 4K.
+    fn non_pinned_registry_bytes(&self) -> u64 {
+        self.registry_non_pinned.bytes
+    }
+
+    /// One slot's contribution to [`Self::non_pinned_registry_bytes`].
     ///
     /// Attachment footprint, not allocation footprint: it does not know tiling
     /// padding or the slab's rounding, and a format
     /// [`crate::backend::vulkan::translate::pixel::bytes_per_texel`] declines
     /// (block-compressed, multi-planar — neither of which a colour attachment
-    /// uses) contributes nothing rather than a guessed size. So it is a lower
-    /// bound on VRAM, which is the safe direction for a figure that exists to
-    /// decide whether a bound is too loose.
-    fn non_pinned_registry_bytes(&self) -> u64 {
-        self.registry
-            .values()
-            .filter(|slot| slot.pin_count == 0)
-            .filter_map(|slot| {
-                let texel = crate::backend::vulkan::translate::pixel::bytes_per_texel(
-                    slot.color_format,
-                )?;
-                Some(u64::from(slot.width) * u64::from(slot.height) * u64::from(texel))
-            })
-            .sum()
+    /// uses) contributes nothing rather than a guessed size. So the total is a
+    /// lower bound on VRAM, which is the safe direction for a figure that exists
+    /// to decide whether a bound is too loose.
+    fn slot_attachment_bytes(slot: &ResidentTargetSlot) -> u64 {
+        crate::backend::vulkan::translate::pixel::bytes_per_texel(slot.color_format)
+            .map(|texel| u64::from(slot.width) * u64::from(slot.height) * u64::from(texel))
+            .unwrap_or(0)
+    }
+
+    /// The same two totals recomputed from the registry, for the test that says
+    /// the maintained pair still agrees with it.
+    ///
+    /// Kept because the maintained pair has three writers and a fourth mutation
+    /// site would desync it in silence — a resident that stopped being counted
+    /// makes the population read smaller than it is, which is the direction that
+    /// lets the cap sit above its own bound. This is what a desync is diffed
+    /// against.
+    #[cfg(test)]
+    fn non_pinned_registry_totals_by_walk(&self) -> NonPinnedTotals {
+        let non_pinned = || self.registry.values().filter(|slot| slot.pin_count == 0);
+        NonPinnedTotals {
+            count: non_pinned().count(),
+            bytes: non_pinned().map(Self::slot_attachment_bytes).sum(),
+        }
+    }
+
+    /// Fold one slot into or out of the maintained non-pinned totals.
+    ///
+    /// Every change of "is this slot non-pinned" goes through here, so the count
+    /// and the bytes cannot move apart from each other, or be updated at two
+    /// sites and forgotten at a third.
+    fn registry_non_pinned_adjust(&mut self, slot_bytes: u64, joined: bool) {
+        let totals = &mut self.registry_non_pinned;
+        if joined {
+            totals.count += 1;
+            totals.bytes += slot_bytes;
+        } else {
+            totals.count = totals.count.saturating_sub(1);
+            totals.bytes = totals.bytes.saturating_sub(slot_bytes);
+        }
     }
 
     /// Fold the current non-pinned population into the high-water band and
@@ -1511,7 +1566,37 @@ mod pin_count_tests {
         let slot = pools.registry.get_mut(&id).expect("just registered");
         slot.content_ready = true;
         slot.last_touch_ms = last_touch_ms;
-        slot.pin_count = pin;
+        // Through the product path, not `slot.pin_count = pin`: pinning is what
+        // takes a resident out of the maintained non-pinned totals, and a helper
+        // that wrote the field itself would be the one mutation site the totals
+        // cannot see — which is the desync
+        // `the_maintained_non_pinned_totals_track_the_walk` exists to catch.
+        for _ in 0..pin {
+            assert!(pools.pin_resident_target(&id, true), "content is ready");
+        }
+    }
+
+    /// [`admit`] at an explicit geometry, so a test can build populations the
+    /// slot count cannot tell apart. Geometry is fixed at registration because
+    /// nothing in the product mutates a live slot's — a geometry change goes
+    /// through unregister + register — and the byte total relies on that.
+    fn admit_sized(
+        pools: &mut ResourcePools,
+        id: TargetIdentity,
+        last_touch_ms: u64,
+        pin: u32,
+        (width, height): (u32, u32),
+    ) {
+        let mut resident = new_resident(some_framebuffer(), vk::RenderPass::null());
+        resident.width = width;
+        resident.height = height;
+        pools.register_resident(&id, resident);
+        let slot = pools.registry.get_mut(&id).expect("just registered");
+        slot.content_ready = true;
+        slot.last_touch_ms = last_touch_ms;
+        for _ in 0..pin {
+            assert!(pools.pin_resident_target(&id, true), "content is ready");
+        }
     }
 
     /// The MRT-secondary arm builds no per-slot framebuffer, so the residents it
@@ -2013,34 +2098,27 @@ mod pin_count_tests {
     /// size, one of 16x16 scratch and one of 4K attachments, are indistinguishable
     /// to the slot band and four orders of magnitude apart in VRAM. A cap that
     /// cannot see that gap is the reason this counter exists.
-    ///
-    /// Fails without `non_pinned_registry_bytes`: with the byte band left at the
-    /// slot band's population, the two asserts on `.2` read the same number.
     #[test]
     fn the_registry_byte_band_separates_populations_the_slot_band_cannot() {
         const TEXEL: u64 = 4; // SCANOUT_FORMAT, the shape `new_resident` builds
+        const SMALL: (u32, u32) = (16, 16);
+        const UHD: (u32, u32) = (3840, 2160);
         let mut pools = ResourcePools::new();
         for i in 1..=3u32 {
-            admit(&mut pools, surf(i), 10, 0);
+            admit_sized(&mut pools, surf(i), 10, 0, SMALL);
         }
         pools.note_registry_reach();
         let (slots_small, _, bytes_small) = pools.registry_pressure_stats();
         assert_eq!(slots_small, 3);
         assert_eq!(bytes_small, 3 * 16 * 16 * TEXEL);
 
-        // The same slot count at 4K geometry. Pinned peers stay excluded from
-        // both bands, or the byte reading would count VRAM the cap never bounds.
+        // The same slot count at 4K geometry. Pinned peers stay out of both
+        // bands, or the byte reading would count VRAM the cap never bounds.
         let mut big = ResourcePools::new();
         for i in 1..=3u32 {
-            admit(&mut big, surf(i), 10, 0);
-            let slot = big.registry.get_mut(&surf(i)).expect("just admitted");
-            slot.width = 3840;
-            slot.height = 2160;
+            admit_sized(&mut big, surf(i), 10, 0, UHD);
         }
-        admit(&mut big, surf(9), 10, 1);
-        let pinned = big.registry.get_mut(&surf(9)).expect("just admitted");
-        pinned.width = 3840;
-        pinned.height = 2160;
+        admit_sized(&mut big, surf(9), 10, 1, UHD);
         big.note_registry_reach();
         let (slots_big, _, bytes_big) = big.registry_pressure_stats();
         assert_eq!(
@@ -2057,8 +2135,7 @@ mod pin_count_tests {
         // lower it, or a burst that drains between two census samples reads as
         // if it never happened.
         for i in 1..=3u32 {
-            big.registry.remove(&surf(i));
-            big.registry_order.retain(|k| k != &surf(i));
+            big.unregister_resident(&surf(i), ResidentReclaim::CapEvicted);
         }
         big.note_registry_reach();
         assert_eq!(
@@ -2066,6 +2143,71 @@ mod pin_count_tests {
             bytes_big,
             "the byte band holds its peak"
         );
+    }
+
+    /// The maintained non-pinned totals still say what a full walk would.
+    ///
+    /// They stopped being a walk so the population can grow past `REGISTRY_CAP`
+    /// without a per-admit O(n) scan, and the cost of that is three writers that
+    /// can fall out of step with the registry in silence. A slot that stopped
+    /// being counted makes the population read smaller than it is, which is the
+    /// direction that lets a bound sit above itself — so every transition is
+    /// driven here and diffed against the walk after each one.
+    ///
+    /// Counted pins are the part worth driving twice: only the 0 <-> 1 crossings
+    /// may move the totals, a second pin must not remove the slot again, and an
+    /// unpin that saturates at zero must not add a slot that is already there.
+    #[test]
+    fn the_maintained_non_pinned_totals_track_the_walk() {
+        let mut pools = ResourcePools::new();
+        let check = |pools: &ResourcePools, what: &str| {
+            assert_eq!(
+                pools.registry_non_pinned,
+                pools.non_pinned_registry_totals_by_walk(),
+                "maintained totals disagree with the walk after {what}"
+            );
+        };
+        check(&pools, "construction");
+
+        admit_sized(&mut pools, surf(1), 0, 0, (16, 16));
+        admit_sized(&mut pools, surf(2), 0, 0, (64, 32));
+        check(&pools, "two admits");
+        assert_eq!(pools.registry_non_pinned.count, 2);
+
+        // First pin removes it; the second must not remove it twice.
+        assert!(pools.pin_resident_target(&surf(1), true));
+        check(&pools, "first pin");
+        assert_eq!(pools.registry_non_pinned.count, 1);
+        assert!(pools.pin_resident_target(&surf(1), true));
+        check(&pools, "second pin");
+        assert_eq!(pools.registry_non_pinned.count, 1, "a second pin moves nothing");
+
+        // First unpin leaves a holder, so it stays out; the second returns it.
+        assert!(pools.pin_resident_target(&surf(1), false));
+        check(&pools, "first unpin");
+        assert_eq!(pools.registry_non_pinned.count, 1);
+        assert!(pools.pin_resident_target(&surf(1), false));
+        check(&pools, "second unpin");
+        assert_eq!(pools.registry_non_pinned.count, 2, "the last unpin returns it");
+
+        // A spurious unpin saturates at zero and must not add it again.
+        assert!(pools.pin_resident_target(&surf(1), false));
+        check(&pools, "unpin below zero");
+        assert_eq!(pools.registry_non_pinned.count, 2);
+
+        // Death, of a pinned slot and an unpinned one — only the unpinned one
+        // was ever in the totals.
+        assert!(pools.pin_resident_target(&surf(2), true));
+        check(&pools, "pinning the second");
+        pools.unregister_resident(&surf(2), ResidentReclaim::CapEvicted);
+        check(&pools, "unregistering a pinned resident");
+        pools.unregister_resident(&surf(1), ResidentReclaim::CapEvicted);
+        check(&pools, "unregistering an unpinned resident");
+        assert_eq!(pools.registry_non_pinned, NonPinnedTotals::default());
+
+        // And an unregister of something that was never there.
+        pools.unregister_resident(&surf(7), ResidentReclaim::CapEvicted);
+        check(&pools, "unregistering an absent identity");
     }
 
     /// The registry reach band records the highest population, and does not
@@ -2113,9 +2255,12 @@ mod pin_count_tests {
         // the non-pinned population returns to zero. A current-value reading
         // would now report nothing at all and the burst above would be
         // invisible — which is exactly the failure this band prevents.
+        // Through `unregister_resident`, not a hand-written map+order removal:
+        // that pair is what the maintained non-pinned totals hang off, and a
+        // test that wrote both itself would leave them counting residents that
+        // are gone.
         for id in [surf(1), surf(2), surf(4)] {
-            pools.registry.remove(&id);
-            pools.registry_order.retain(|k| k != &id);
+            pools.unregister_resident(&id, ResidentReclaim::CapEvicted);
         }
         assert_eq!(
             pools.note_registry_reach(),

@@ -92,6 +92,7 @@ impl ResourcePools {
             reclaimed_recent: VecDeque::new(),
             use_clock: 0,
             registry_non_pinned_peak: 0,
+            registry_non_pinned: NonPinnedTotals::default(),
             registry_non_pinned_peak_bytes: 0,
             registry_cap_evictions: 0,
             idle_clock_ms: 0,
