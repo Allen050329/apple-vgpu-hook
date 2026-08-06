@@ -22,11 +22,14 @@ pub(crate) use wire::{MAX_DEPTH, PTE_FLAG_MASK, PTE_PFN_MASK, PTE_SIZE};
 pub const DIRECTORY_ROOT_PFN: u32 = wire::DIRECTORY_ROOT_PFN as u32;
 pub const DIRECTORY_DEPTH: u32 = wire::DIRECTORY_DEPTH as u32;
 
-/// Largest span this device will resolve in one call.
-///
-/// A device policy bound rather than a property of the format, so it stays here:
-/// the guest's page table can describe more than this, and we decline instead.
-pub const MAX_SPAN_PAGES: u32 = 1 << 20;
+// No `MAX_SPAN_PAGES`. There was one, `1 << 20`, whose doc said the guest's page
+// table could describe a longer span and this device declined instead. No such
+// decline existed: the value was carried as a `Geometry` field, set from the
+// constant in both of the two geometries there are, compared against the same
+// constant by `validate_geometry`, and dropped by `wire_geometry` before the
+// walk ever saw it. A span of any length resolved, which is the faithful
+// behaviour — so the constant is gone rather than the behaviour, and this note
+// stands where a reader would otherwise "restore" a refusal that never ran.
 
 pub const PAGE_SHIFT_ARM64E: u32 = wire::ARM64E.page_shift;
 pub const PAGE_SIZE_ARM64E: u32 = wire::ARM64E.page_size() as u32;

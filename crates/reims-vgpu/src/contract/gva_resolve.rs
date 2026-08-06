@@ -17,7 +17,6 @@ pub struct Geometry {
     pub pte_flag_mask: u32,
     pub pte_pfn_mask: u32,
     pub max_depth: u32,
-    pub max_span_pages: u32,
 }
 
 pub const ARM64E_GEOMETRY: Geometry = Geometry {
@@ -31,7 +30,6 @@ pub const ARM64E_GEOMETRY: Geometry = Geometry {
     pte_flag_mask: PTE_FLAG_MASK,
     pte_pfn_mask: PTE_PFN_MASK,
     max_depth: ARM64E_MAX_DEPTH,
-    max_span_pages: MAX_SPAN_PAGES,
 };
 
 pub const X86_64_GEOMETRY: Geometry = Geometry {
@@ -45,7 +43,6 @@ pub const X86_64_GEOMETRY: Geometry = Geometry {
     pte_flag_mask: PTE_FLAG_MASK,
     pte_pfn_mask: PTE_PFN_MASK,
     max_depth: X86_64_MAX_DEPTH,
-    max_span_pages: MAX_SPAN_PAGES,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -275,8 +272,6 @@ pub fn validate_geometry(geometry: &Geometry) -> ResolveStatus {
         || geometry.pte_pfn_mask != PTE_PFN_MASK
         || geometry.max_depth == 0
         || geometry.max_depth > MAX_DEPTH
-        || geometry.max_span_pages == 0
-        || geometry.max_span_pages > MAX_SPAN_PAGES
     {
         return ResolveStatus::ErrUnsupportedGeometry;
     }
