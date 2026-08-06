@@ -636,6 +636,36 @@ pub const DEVICE_INFO_KEY_DUAL_PLANE_TEXTURES: u32 = 12;
 ///
 /// Read as a **byte**, not a word, so any value whose low byte is zero reads as
 /// false however large the `u32` is. Same for keys 8 and 9.
+///
+/// # It is served as a fixed 1, and unlike key 11 that is not an over-promise
+/// # to narrow
+///
+/// This key has no term in [`DeviceInfoLimits`], so no host reduction touches
+/// it, which is the shape key 11 had when it was authorising primitive types
+/// both backends refuse. The question is worth answering here rather than
+/// re-asking, because the answer is the opposite one and for a reason that
+/// generalises.
+///
+/// Key 11 was narrowed because *no host* this device runs on can execute those
+/// primitive types — the refusal is permanent, so the honest advertisement is
+/// the narrow one. Framebuffer read is not that: the Vulkan arm implements the
+/// attachment-0 fetch through a subpass input attachment, which is Vulkan 1.0
+/// core and needs no capability; the Metal arm serves an Apple GPU, whose
+/// families all have it. What is missing is only the fetch of a *secondary* MRT
+/// attachment, which `runtime::draw::vulkan` refuses by name as
+/// `draw_prepare_color_input_mrt_unsupported`.
+///
+/// So the gap is this device's to close, not to hide, and a `0` here would be
+/// the worse answer twice over: it would take away the fetch that works, and it
+/// would describe a GPU the guest is not running on. **The rule the pair
+/// establishes: narrow an advertisement when the host can never do the thing;
+/// leave it and name the refusal when the host can do it and this device has
+/// not finished the path.** A boolean cannot say "attachment 0 only", and
+/// inventing a narrower answer than the wire has room for is not fidelity.
+///
+/// `draw_prepare_color_input_mrt_unsupported` has never fired on any archived
+/// boot of this rig, driven or idle. That is the reading that makes leaving it
+/// open affordable rather than a bet.
 pub const DEVICE_INFO_KEY_FRAMEBUFFER_READ: u32 = 7;
 
 /// Wire key 8 — `isRGB10A2GammaSupported`. A byte, like key 7.

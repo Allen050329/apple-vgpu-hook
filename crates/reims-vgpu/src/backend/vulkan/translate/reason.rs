@@ -10,6 +10,31 @@
 //! [`TranslateReason::slug`]. The offending numeric value
 //! rides along so the fail-visible line carries the load-bearing field, and
 //! [`std::fmt::Display`] renders both.
+//!
+//! # Two classes of variant, and only one of them is this device's fault
+//!
+//! Several variants below already say they are "distinct from
+//! `UnknownPixelFormat`" — the format is understood, this rail just does not
+//! carry it. That distinction is the whole taxonomy, and it decides what the
+//! repair is:
+//!
+//! - **The value is out of contract.** `Unknown*` — an ordinal Apple's
+//!   serializer never emits. A real device rejects it too, so the refusal *is*
+//!   the correct behaviour and there is nothing to implement.
+//! - **The value is in contract and this backend has no path for it.**
+//!   `NoSampledLayout`, `NoColorAttachmentFormat`, `NoStorageImageFormat`,
+//!   `VertexStepFunctionPerPatch`, `FormatNotVertexBuffer`. The guest asked for
+//!   something legal and lost the work. These are gaps, and the repair is to
+//!   build the path — never to stop advertising the capability, unless *no host*
+//!   could ever serve it. [`crate::model::DEVICE_INFO_KEY_FRAMEBUFFER_READ`]
+//!   carries that rule and the pair of cases that establish it.
+//!
+//! **None of the second class has fired on any archived boot of this rig** —
+//! x86/PCI/Vulkan, driven under the window-drag and web-content probes as well
+//! as idle. Each names a real Metal feature this workload does not reach, which
+//! is the reading that makes leaving them open a measurement rather than a bet.
+//! It says nothing about the arm64 pathway, which this checkout cannot boot, and
+//! a firing is the signal that one has become worth building.
 
 use crate::observe::Decline;
 
