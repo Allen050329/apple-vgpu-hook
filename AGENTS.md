@@ -166,6 +166,13 @@ Four rules survive every sweep:
   divergence theoretical. When you find one, check whether its failure line is shared or copied — a
   copied one is the next divergence.
 
+**Do not hand-sweep the crate for bounds.** A bound can cost guest work in exactly three ways — an
+entry evicted, an entry never recorded, a run read only partway — and each has a test below that
+demands a written verdict for every site and fails on a new one. Two of the three were hand-swept
+first and the scans then found sites the sweeps had missed, in both cases sites that were *safe*,
+which is why a reader hunting for danger walked past them. Add your verdict to the table the failure
+names; do not re-derive the population.
+
 Prefer an instrument over a reading. Reading an audit against itself cannot see an opcode that is
 simply the wrong number, a length four bytes off, or a field two bytes too wide:
 
@@ -187,6 +194,8 @@ simply the wrong number, a length four bytes off, or a field two bytes too wide:
 | Does anything reach a Vulkan 1.3 core name the 1.2 floor forbids? | `crates/reims-vgpu/tests/nothing_reaches_past_the_vulkan_api_floor.rs` |
 | Does a stored refusal outlive the instant it described? | `crates/reims-vgpu/tests/a_remembered_refusal_says_whether_it_can_go_stale.rs` |
 | Does a cap drop an entry the device had already admitted? | `crates/reims-vgpu/tests/an_eviction_says_what_it_costs.rs` |
+| Does a cap stop one being recorded in the first place? | `crates/reims-vgpu/tests/a_bounded_insert_says_what_it_drops.rs` |
+| Does a cap stop a walk before the guest's data runs out? | `crates/reims-vgpu/tests/a_bounded_walk_says_what_it_skips.rs` |
 
 Do **not** answer that one by diffing `ls src/ops/` against a `grep` for
 `use reims_vgpu_wire` — that pair used to live here and it is wrong by 40 % on
