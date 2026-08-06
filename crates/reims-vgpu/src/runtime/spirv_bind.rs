@@ -389,6 +389,23 @@ struct Instruction {
 ///
 /// Decoding once also removes the re-decode from `propagate_derived`, which
 /// re-walks to a fixpoint and used to re-split every header on every pass.
+///
+/// # What a driven boot says about it, and what it cannot
+///
+/// Driven x86/PCI boot on the consolidated walk (web-content probe, 10 captures):
+/// `linux_m2v_async` 160, so 160 real guest shaders were translated and reflected
+/// through it; `m2v_reflect_malformed` and `spirv_reloc_unclassified_binding` both
+/// absent; 10 of 10 regions measured their declared colour. Against the boot
+/// before it (158 translations) the fail-channel reason ranking gained no new
+/// entry. That is the regression evidence that matters here — the reflectors'
+/// answers for well-formed modules are what must not move, and 160 shaders is a
+/// wider sample than the unit tests reach.
+///
+/// It says **nothing about the malformed cases**, and no boot can. This SPIR-V is
+/// the translator's own output rather than anything a guest sends, so a guest
+/// cannot drive a stream that fails this parse; only a translator bug produces
+/// one, which is exactly why the failure had to stop being a panic. The coverage
+/// for those is `tests::a_module_that_does_not_walk_reflects_nothing`.
 fn instructions(words: &[u32]) -> Option<Vec<Instruction>> {
     if words.len() < HEADER_WORDS {
         return None;
