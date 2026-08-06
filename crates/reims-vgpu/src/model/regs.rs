@@ -636,7 +636,9 @@ pub const DEVICE_INFO_KEY_DUAL_PLANE_TEXTURES: u32 = 12;
 /// for GL and the fifteen cannot arrive. The sysbus plugin's device forwards the
 /// serializer's answer, so on that pathway they can. Neither has been driven
 /// with a GL client here, and the unimplemented-opcode report is what would say
-/// so.
+/// so — a driven x86/PCI boot under `web-content-probe -n 10 --churn 1` emits
+/// none of it, which is the expected reading for the pathway where the guest's
+/// own device declines GL, and not evidence about the other one.
 pub const DEVICE_INFO_KEY_SERIALIZER_VERSION: u32 = 10;
 
 /// The value served for [`DEVICE_INFO_KEY_SERIALIZER_VERSION`].
@@ -657,6 +659,14 @@ pub const DEVICE_INFO_SERIALIZER_VERSION: u32 = 8;
 /// **bit `type`** of this value for any `type <= 8`, and answers `type < 5` when
 /// the key is absent. See [`crate::contract::draw::EXECUTABLE_PRIMITIVE_TYPES`]
 /// for what this device puts in it and why that is narrower than the capture.
+///
+/// Narrowing it changed nothing on the x86 pathway, as expected and no more
+/// than that: a driven boot after the change passed the colour gate on all ten
+/// captures with no `unknown_primitive_type` and no unimplemented-opcode line.
+/// The PCI plugin's `MTLDevice` has no getter for this key at all, so that boot
+/// exercises the guest *parsing* the narrower value and nothing reading it. The
+/// pathway where it is read is the sysbus one, which this checkout cannot
+/// drive.
 pub const DEVICE_INFO_KEY_PRIMITIVE_TYPE_MASK: u32 = 11;
 
 /// Whether protocol `version` enables two-plane textures.
