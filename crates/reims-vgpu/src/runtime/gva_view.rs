@@ -1492,11 +1492,11 @@ mod tests {
         assert_eq!(back, [5, 6, 7, 8]);
     }
 
-    /// A fragmented span handed to `map_fresh_span` must be declined in Rust,
-    /// exactly like `ensure_gva_view` — never a failing `map_pages` FFI call
-    /// whose -1 pollutes the always-on failure log as
+    /// A fragmented span handed to `map_fresh_span_within` must be declined in
+    /// Rust, exactly like `ensure_gva_view` — never a failing `map_pages` FFI
+    /// call whose -1 pollutes the always-on failure log as
     /// `qemu_map_pages_callback_failed`. The caller's per-run multi-import
-    /// fallback (rgba8 store / `write_span`) still lands the content.
+    /// fallback (rgba8 store / `write_span_within`) still lands the content.
     #[test]
     fn fragmented_map_fresh_span_declines_without_asking_map_pages() {
         let page_shift = PAGE_SHIFT_X86;

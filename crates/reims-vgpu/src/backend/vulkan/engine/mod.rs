@@ -703,8 +703,8 @@ pub fn resident_content_epoch(identity: &TargetIdentity) -> Option<u32> {
 ///   surface says the resident no longer holds the frame this window promised.
 ///   Declining is correct; the newer pass owns the surface now.
 /// - [`ResidentContent::Absent`] is not. Nothing may evict a pinned slot —
-///   `evict_registry_to_cap` and the idle drain both skip pinned slots by design
-///   — so an identity that has gone missing between the arm and the fence means
+///   the allocation-failure reclaim and the idle drain both skip pinned slots by
+///   design — so an identity that has gone missing between the arm and the fence means
 ///   the two spellings of it disagree: the arm pinned one `TargetIdentity` and
 ///   the flush rebuilt another. That is a lost frame *and* a leaked pin, and it
 ///   is the same defect shape as `74748d2` and `021e64b`, which is why it must
@@ -1034,7 +1034,7 @@ pub fn supports_sampled_r32f_linear_filter() -> bool {
 ///
 /// This is the resident-direct capture source: it performs only the GPU→host
 /// readback, with **no** guest-page scatter. `capture_present_frame`'s other
-/// source (`flush_intersecting` → `present_into_host_runs`) reads the same
+/// source — `flush_intersecting`, the deferred render-flush rail — reads the same
 /// resident but additionally scatters it into the fragmented guest pages — work
 /// the oracle does not need and which the deferred-writeback rail already
 /// performs on a genuine guest read. Errors (rather than swapping channels) on a
@@ -1100,7 +1100,7 @@ struct ReadbackOps {
 /// Async ring advance (retires only the one slot it reuses), NOT a whole-ring
 /// quiesce: this reads content that is already ready, not an UNDEFINED-layout
 /// seed, so the `ALL_COMMANDS → TRANSFER` barrier below orders the copy after
-/// every prior-submitted draw. `begin_entry_sync` would block this guest-drain
+/// every prior-submitted draw. A whole-ring quiesce would block this guest-drain
 /// readback behind an unrelated in-flight heavy draw — the `finish_us` tail. We
 /// wait only our own `fence` after submit, and the slot stays pending for the
 /// ring to retire later.

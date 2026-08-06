@@ -2733,7 +2733,7 @@ fn writeback_texture<M: HostMemory + HostOps>(
                 state, host, &window, &tex.bytes,
             );
             // Kept although the span is no longer needed here: the overflow is
-            // a real refusal with a name, and `write_linear_guest` would only
+            // a real refusal with a name, and `write_linear_guest_within` would only
             // return a bare `false` for it.
             let Some(_span) = row_stride.checked_mul(*height as u64) else {
                 crate::observe::fail(format!(

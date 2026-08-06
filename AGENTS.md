@@ -172,7 +172,8 @@ simply the wrong number, a length four bytes off, or a field two bytes too wide:
 | What is reachable but never runs? | `scripts/runtime-dead` — coverage-instrumented driven boot |
 | Does a decoder refuse or drop a record Apple emits? | `crates/reims-vgpu/tests/wire_fixtures_reach_the_decoders.rs` |
 | Is a wire family declared twice, or read by nobody? | `crates/reims-vgpu/tests/wire_families_have_a_consumer.rs` |
-| Does a doc comment name a symbol that no longer exists? | `cargo doc`'s intra-doc link pass |
+| Does a `[`link`]` in a doc comment name a symbol that no longer exists? | `cargo doc`'s intra-doc link pass |
+| Does a bare `` `name` `` in prose name one? Nothing else checks that form. | `scripts/stale-doc-names` |
 | Does a value travel as loose parameters when a type for it exists? | `scripts/scattered-struct` |
 | Is a validity rule written out at every site instead of beside its constant? | `scripts/scattered-bound` |
 | Does a decoded record fail a guard and vanish into a no-op catch-all? | `scripts/silent-arms` |

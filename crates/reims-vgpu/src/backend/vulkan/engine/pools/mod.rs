@@ -216,29 +216,26 @@ pub(crate) struct ResourcePools {
     /// **Not use order**, and it was documented as LRU while it was not. Nothing
     /// promotes an entry when a dispatch reuses it, so selecting the front
     /// evicted the oldest-*created* resident however hard the current chain was
-    /// reading it — the identical defect the sibling target registry carries a
-    /// test against
-    /// (`the_cap_walk_evicts_the_least_recently_used_not_the_oldest_created`).
-    /// Recency lives on the slot
-    /// ([`ResidentStorageImageSlot::last_touch_ms`]) and the cap sweep consults
-    /// it through `ResourcePools::compute_storage_eviction_victim`, which takes
-    /// the minimum stamp over this list rather than reordering it, so this order
-    /// now only makes ties deterministic.
+    /// reading it. That sweep is gone — the allocation bounds this population
+    /// now, see `ResourcePools::recoverable_compute_storage_residents` — and
+    /// what remains reads this order only to be deterministic, oldest-created
+    /// first. Recency still lives on the slot
+    /// ([`ResidentStorageImageSlot::last_touch_ms`]) for the age drain, which is
+    /// the one rule that still consults a stamp.
     compute_storage_order: VecDeque<ComputeStorageResidencyKey>,
     /// Identity-keyed resident target registry (workstream D).
     registry: HashMap<TargetIdentity, ResidentTargetSlot>,
     /// Insertion order for [`Self::registry`], oldest *created* at the front. A
-    /// `VecDeque` so the cap-eviction sweep's front pop / rotate-to-back is
-    /// O(1) — the sweep is then O(n), not the O(n²) a `Vec` front-`remove(0)`
-    /// would make it under a large pinned population (measured `reg=512` under
-    /// multi-4K load).
+    /// `VecDeque` because the retired cap-eviction sweep popped and rotated at
+    /// the front; what reads it now — `recoverable_residents` and the idle
+    /// drain — only walks it, so the container is no longer load-bearing and the
+    /// order is.
     ///
     /// **Not use order.** Nothing promotes an entry when a draw reuses it, so
     /// this alone would make a session-long resident the permanent front and the
-    /// first victim of every burst. Recency lives on the slot
-    /// ([`ResidentTargetSlot::last_touch_ms`]) and the sweep consults it through
-    /// `ResourcePools::cap_eviction_victim`, which takes the minimum stamp over
-    /// this list rather than reordering it — so a promotion stays off the
+    /// first candidate of every burst. Recency lives on the slot
+    /// ([`ResidentTargetSlot::last_touch_ms`]), which the idle drain reads
+    /// directly rather than reordering this list — so a promotion stays off the
     /// per-bind path while this order still makes ties deterministic.
     registry_order: VecDeque<TargetIdentity>,
     /// Recently reclaimed identities and which path took each, so a draw that

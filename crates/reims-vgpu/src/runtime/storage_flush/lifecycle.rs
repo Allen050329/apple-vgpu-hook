@@ -43,10 +43,11 @@ pub fn drop_windows(state: &mut DeviceState, mapping_id: u32, reason: &str) {
 /// `Resident` window's counted registry pin was never dropped. That is one leaked
 /// pin per composite Store on a surface the compositor repaints — and because the
 /// re-Store carries the *same* key, it is the same slot's `pin_count` climbing
-/// without bound. `evict_registry_to_cap` rotates pinned slots instead of
-/// evicting and the idle drain requires `pin_count == 0`, so a slot that gets
-/// there can never be reclaimed again: the "~260 stale residents (~516 MiB)
-/// pinned for the guest lifetime" shape, arrived at one frame at a time.
+/// without bound. Both paths that can give a resident back select it through
+/// `recoverable_residents`, which requires `pin_count == 0` — the
+/// allocation-failure reclaim and the idle drain — so a slot that gets there can
+/// never be reclaimed again: the "~260 stale residents (~516 MiB) pinned for the
+/// guest lifetime" shape, arrived at one frame at a time.
 ///
 /// Dropping rather than flushing is what makes the rail a deferral instead of a
 /// rescheduling — a compositor painting one surface re-Stores the identical range
@@ -125,9 +126,9 @@ pub(crate) fn release_window_pin(
 /// An `Owned` window holds nothing — its pixels are an `Arc` and dropping it is
 /// the release, so `None` here is the answer and not a miss. A `Resident` window
 /// holds a counted registry pin, and **every** exit that abandons the window has
-/// to drop it: `evict_registry_to_cap` and the idle drain both skip pinned slots
-/// by design, so a leaked pin strands a whole framebuffer for the guest lifetime
-/// rather than merely delaying a reclaim.
+/// to drop it: the allocation-failure reclaim and the idle drain both skip
+/// pinned slots by design, so a leaked pin strands a whole framebuffer for the
+/// guest lifetime rather than merely delaying a reclaim.
 #[cfg(feature = "backend-vulkan")]
 pub(super) fn release_window_pin_for_key(
     key: &crate::model::ComputeStorageResidencyKey,

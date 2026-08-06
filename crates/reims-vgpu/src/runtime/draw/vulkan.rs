@@ -3854,17 +3854,10 @@ enum M2vDrawSpan {
 /// process — after the first record of each kind it costs a `BTreeSet` lookup
 /// and a return, which is what makes it safe to leave on permanently.
 ///
-/// Reachability is not uniform and must be read that way. `import` requires the
-/// engine to have enabled a host-pointer import, and there is no longer any code
-/// that could: the whole `VK_EXT_external_memory_host` subsystem is deleted. So `import` is
-/// unreachable, and `rgba_not_import` is its complement's complement — with the
-/// import never allowed, `type11_cpu_store_fallback_allowed` is always true and
-/// that arm cannot be entered either. Both are kept as call sites so their
-/// absence is a *denominator* against the routes that do fire, not an
-/// acquittal; if either ever appears, the extension came back.
 /// The first-appearance line answers "is this route reachable" and cannot answer
-/// "how often". Both questions are live: reachability is what the denominator
-/// argument above needs, and the rate is what prices the route — `engine_delta`
+/// "how often". Both questions are live: reachability is what says a route the
+/// census reads zero for was offered at all, and the rate is what prices the
+/// route — `engine_delta`
 /// shows ~20 full-frame readbacks a second and the routes are what attribute
 /// them. So the dedup'd line stays and the rate is counted alongside it, into
 /// the same one-second window as `drain_duty`.

@@ -354,7 +354,8 @@ pub fn any_task_gva_page_resolves<M: HostMemory>(
 /// packed GPA runs ([`crate::runtime::gva_view::write_span_within`]). Fails closed when
 /// any page is unmapped or a run cannot be mapped — that walk is the whole
 /// bound on this write. Always-on: `gva_write fail reason=…`, carrying the
-/// check `write_span` actually refused on rather than a reason chosen here.
+/// check `write_span_within` actually refused on rather than a reason chosen
+/// here.
 ///
 /// `#[track_caller]` so the always-on lines can name **which** of the fifteen
 /// product call sites issued the write. The reason and the writer were both

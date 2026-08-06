@@ -479,7 +479,7 @@ pub fn flush_linear_one<M: HostMemory + HostOps>(
     let tight = (key.width as usize).saturating_mul(texel as usize);
 
     // Same hazard, same answer as the GVA rail: this window was armed against a
-    // page set at defer time and `write_linear_guest` walks fresh, so a span the
+    // page set at defer time and `write_linear_guest_within` walks fresh, so a span the
     // guest has since re-pointed sends a compute-storage image into whatever
     // owns those pages now. Observed on this rail as guest heap corruption — a
     // `pmap_page_protect` kernel panic and userspace SIGSEGVs inside libmalloc's
@@ -715,8 +715,8 @@ fn flush_render_one<M: HostMemory + HostOps>(
     if let Some(refusal) = mapping_window_refusal(state, host, key) {
         // Release the pin first. This arm returns before touching the frame, and
         // a `Resident` window holds a registry pin that nothing else will drop —
-        // `evict_registry_to_cap` and the idle drain both skip pinned slots by
-        // design, so a pin leaked here strands a whole framebuffer for the guest
+        // the allocation-failure reclaim and the idle drain both skip pinned
+        // slots by design, so a pin leaked here strands a whole framebuffer for the guest
         // lifetime. That is the "~260 stale residents (~516 MiB)" shape, and the
         // generation drift is not rare: one in 85 s on a driven boot.
         release_window_pin_for_key(key, source);

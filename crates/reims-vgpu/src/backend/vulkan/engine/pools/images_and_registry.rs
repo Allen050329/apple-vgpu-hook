@@ -1893,9 +1893,10 @@ impl ResourcePools {
     /// it.
     ///
     /// This site is safe for a reason that does not generalise: it runs inside
-    /// `registry_ensure_color`, at the same point `evict_registry_to_cap` has
-    /// always retired residents, before the caller holds anything and before any
-    /// sampled source has been resolved.
+    /// `registry_ensure_color`, at the one point in a draw where retiring a
+    /// resident has always been safe — before the caller holds anything and
+    /// before any sampled source has been resolved. The retired slot cap ran
+    /// here for the same reason.
     ///
     /// What generalises is the *pools* half — see
     /// [`Self::reclaim_pools_for_allocation_retry`]. Retiring live residents is

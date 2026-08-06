@@ -177,7 +177,8 @@ pub fn draw_instanced_wide<'a>(op: &Op<'a>) -> Result<&'a DrawInstancedWide, Wir
 ///
 /// **`reims_vgpu::runtime::decode::render` has no constant for `0x05`.** Its
 /// table runs `0x00, 0x01, 0x03, 0x06, 0x07, 0x09`, and `opcode_supported`
-/// accepts everything up to `OP_ACCEPTED_LAST` (`0x98`), so a `0x05` record
+/// accepts everything up to [`OPCODE_SET_VERTEX_BUFFER_OFFSET_STRIDE`]
+/// (`0xa6`), so a `0x05` record
 /// reaches the catch-all and becomes `Kind::OtherAccepted` — accepted, reported
 /// once by `note_unimplemented_render_opcode`, and executed by nothing. The
 /// guest's draw does not happen.

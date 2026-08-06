@@ -1354,9 +1354,10 @@ pub struct GuestRun {
 /// tight (`total_len == tight_row_bytes * height`); a nonzero value gives
 /// the guest row stride in texels for padded layouts, and the window then
 /// spans `(height-1) * stride_bytes + tight_row_bytes` (the final row needs
-/// only its texels — padding past the last row may not be mapped). The
-/// caller must have verified import coverage via `ensure_host_imports` for
-/// every run.
+/// only its texels — padding past the last row may not be mapped). Every run's
+/// [`GuestRun::host_ptr`]`..+`[`len`](GuestRun::len) must already be a live
+/// `HostOps::map_pages` alias when the source is built: the gather reads it
+/// directly and has nothing to check it against.
 #[derive(Clone, Debug)]
 pub struct GuestRunSource {
     pub runs: std::sync::Arc<Vec<GuestRun>>,

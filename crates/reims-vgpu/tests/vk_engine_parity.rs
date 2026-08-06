@@ -2225,7 +2225,6 @@ fn premult_one_omsa_gpu_blend_matches_software_oracle() {
 /// progressive multi-pass content stays on the resident image. Engine Clear
 /// (the default when neither `load_from_target` nor `target_rgba8` is set)
 /// would black the target.
-/// Product choice is also locked by `type11_load_ready_uses_resident_not_clear`.
 #[test]
 fn skip_readback_store_then_load_from_target_preserves_content() {
     let _g = engine_test_session();

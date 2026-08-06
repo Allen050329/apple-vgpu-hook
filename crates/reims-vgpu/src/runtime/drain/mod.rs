@@ -3150,7 +3150,7 @@ pub(crate) fn claim_display_vbl(last_us: &std::sync::atomic::AtomicU64, now_us: 
 }
 
 /// Pulse VBL at the phase-locked ~120 Hz cadence (grid interval
-/// `DISPLAY_VBL_MIN_INTERVAL_MS`; see `claim_display_vbl`).
+/// [`DISPLAY_VBL_MIN_INTERVAL_US`]; see [`claim_display_vbl`]).
 ///
 /// Writes pending bit 0, sets 0x1014 display bit, and raises MSI after ONLINE
 /// has been acked. The limiter is owned outside `DeviceState` so this locked

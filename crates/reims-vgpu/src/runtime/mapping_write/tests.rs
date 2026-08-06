@@ -1034,7 +1034,7 @@ fn fragmented_raw_rect_bulk_imports_runs_not_rows() {
         &mut state, &mut host, mid, 0, 2048, 6160, 4, 4, 4, &src, 16,
     ));
     // One successful import per maximal GPA run, and nothing else: the
-    // fragmented page list fails `is_single_packed_run` in Rust, so the
+    // fragmented page list gives `contig_run_count` above 1 in Rust, so the
     // packed-view fast path never spends a call the host can only refuse.
     // The old row loop took nine attempts for these four rows and scaled
     // with height.

@@ -1178,8 +1178,8 @@ pub(crate) unsafe fn execute_draw_inner(
     // multi-MiB allocations a second on the drain worker that `drain_duty`
     // shows pinned at duty 0.9+. The only thing that copy bought was a buffer
     // the `output_bgra` arm could swizzle in place; that swizzle now happens
-    // during the single copy into the mapped staging span
-    // (`write_staging_rgba_as_bgra`), so the pixels are touched once either way.
+    // during the single copy into the mapped staging span, so the pixels are
+    // touched once either way.
     let seed_bytes: Option<&[u8]> = if load_uses_gpu_content {
         None
     } else {

@@ -2127,7 +2127,7 @@ impl BindClass {
 /// suspect it and diff two census lines to find out.
 ///
 /// The compute rail reached the opposite conclusion about the identical loss:
-/// `compute_exec::note_compute_bind_overflow` puts a slot past
+/// `compute_exec`'s `ComputeBindOverflow` puts a slot past
 /// `MAX_COMPUTE_*_SLOTS` on the fail channel, deduped per `(table, index)`,
 /// with the comment "wrong compute output with no other symptom, previously
 /// silent". Two arms, one rule about one wire form, and the arm that a boot

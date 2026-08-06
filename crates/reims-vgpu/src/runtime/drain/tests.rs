@@ -198,9 +198,8 @@ use crate::runtime::host::{FakeHost, HostActionKind};
 /// `kb/pvg-display-contract.md` §8.1 measured every op6 payload as trailer-only.
 ///
 /// Every present test built this same eight-field `Packet` by hand; only the
-/// opcode and the named mapping ever differed. The one test that does not use
-/// this is `display_txn_probe_distinguishes_trailer_only_from_prefixed_payload`,
-/// which varies the payload length on purpose.
+/// opcode and the named mapping ever differed. A test that varies the payload
+/// length on purpose builds its own rather than calling this.
 fn present_packet(opcode: u16, mapping: u32) -> Packet {
     let len = display_txn_trailer_len(opcode);
     let mut payload = vec![0u8; len];

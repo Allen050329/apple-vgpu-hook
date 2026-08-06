@@ -1,6 +1,6 @@
 //! Off-VM compute regression suite for the internal Vulkan engine.
 //!
-//! Drives `engine::execute_compute` (the shipped entry) and asserts
+//! Drives `engine::execute_compute_request` (the shipped entry) and asserts
 //! **known-correct** buffer/image results (no external compute executor). Also
 //! locks warm-dispatch zero create/alloc. Requires a Vulkan ICD; skips cleanly
 //! if init fails.

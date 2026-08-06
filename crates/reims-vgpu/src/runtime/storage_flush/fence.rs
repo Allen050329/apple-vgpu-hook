@@ -708,8 +708,8 @@ pub fn flush_mapping_windows_before_fence<M: HostMemory + HostOps>(
     // lever.** The guest supplies a damage rect and this device carries it
     // verbatim (`OPCODE_SET_SCISSOR` -> `req.scissor`), so a damage-limited
     // writeback would be the decoded contract rather than a guess — but
-    // `note_store_damage_coverage` reads `store_damage_texels /
-    // store_attach_texels` at **99.34%** on a driven probe, with half the Stores
+    // a driven probe measured the damage rect covering **99.34%** of the
+    // attachment's texels, with half the Stores
     // carrying no scissor at all and the other half one that spans the
     // attachment. Partial scissors belong to the small draws *inside* a pass;
     // the Store that ends a full-screen composite declares the full screen. The

@@ -2664,7 +2664,8 @@ impl DeviceState {
     /// redefine and `delete_task` on teardown — owe exactly this: the views hold
     /// host pointers into pages the guest is about to recycle, so leaving one
     /// live is a read of memory that no longer belongs to the surface (the
-    /// WindowServer SIGSEGV class `write_span` documents). `retired_views` is
+    /// WindowServer SIGSEGV class [`crate::runtime::gva_view::write_span_within`]
+    /// documents). `retired_views` is
     /// drained by `mapper::flush_retired_views` through `HostOps::unmap_pages`.
     fn retire_task_gva_views(&mut self, task_id: u32) {
         let mut i = 0;
