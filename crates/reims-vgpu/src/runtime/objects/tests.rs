@@ -106,8 +106,8 @@ fn resolve_type11_from_list() {
 fn the_type4_decoder_refuses_what_it_cannot_decode_and_reports_why() {
     // Twelve planes against IOSurface's own ceiling of eight.
     let over_cap = Type4Builder::new(0x1000, 0x100, 0x4247_5241, 12).with_len(0x24); // 'BGRA'
-    // A legal plane count whose records the blob does not reach: `with_len`
-    // stops after plane 0, so planes 1..=3 are declared and unreachable.
+                                                                                     // A legal plane count whose records the blob does not reach: `with_len`
+                                                                                     // stops after plane 0, so planes 1..=3 are declared and unreachable.
     let short_records = Type4Builder::new(0x1000, 0x100, 0x4247_5241, 4).with_len(0x24);
 
     reset_type4_decode_drops();
@@ -708,6 +708,123 @@ fn apply_type4_backing_fail_latches_reason_and_rearms() {
 /// within a boot and across geometries, so a clean attach on a recycled id must
 /// re-arm the latch (it does, as the test above locks) without claiming that the
 /// earlier, different surface recovered.
+/// A refusal leaves the latch three ways, and all three are now countable.
+///
+/// Recovered, superseded, or still there. The third is the only one that can be
+/// lost guest work, and before `type4_backing_superseded` and
+/// `type4_backing_outstanding` it was indistinguishable from the second: a
+/// driven boot with five `type4_backing_fail` lines and four
+/// `type4_backing_recovered` lines gave a reader no way to tell a refusal the
+/// guest walked away from apart from one that never came back, short of
+/// hand-matching backing GVAs across the log. That is how this gap was found.
+///
+/// The identity is what makes the census readable, so it is what this asserts:
+/// every refusal that leaves the latch is accounted for by exactly one of the
+/// three, and the residue is the census line's `n`.
+#[test]
+fn every_type4_refusal_leaves_the_latch_recovered_superseded_or_counted() {
+    use crate::runtime::drain::store_route_count;
+
+    // Ids no other test in this module uses; the latch is process-global.
+    let sid = 0x4d2u32;
+    let gva = 0x4222000u64;
+    clear_type4_fail(sid, gva);
+
+    // Superseded: refused at `gva`, backed somewhere else. Not a recovery, and
+    // it used to be the silent one.
+    let before = store_route_count("type4_backing_superseded");
+    let recovered_before = store_route_count("type4_backing_recovered");
+    defer_type4_fail(
+        sid,
+        "translate",
+        Some(gva),
+        "type4_backing_fail probe".into(),
+    );
+    flush_type4_fail(sid);
+    clear_type4_fail(sid, gva + 0x1000);
+    assert_eq!(
+        store_route_count("type4_backing_superseded"),
+        before + 1,
+        "a refusal dropped because the surface backed elsewhere must be counted"
+    );
+    assert_eq!(
+        store_route_count("type4_backing_recovered"),
+        recovered_before,
+        "and must not be claimed as a recovery"
+    );
+
+    // Recovered: refused at `gva`, backed at `gva`. Counts on the other route
+    // and leaves the superseded count alone — the two must not double-count one
+    // refusal, which is what would make the identity stop holding.
+    let before = store_route_count("type4_backing_superseded");
+    let recovered_before = store_route_count("type4_backing_recovered");
+    defer_type4_fail(
+        sid,
+        "translate",
+        Some(gva),
+        "type4_backing_fail probe".into(),
+    );
+    flush_type4_fail(sid);
+    clear_type4_fail(sid, gva);
+    assert_eq!(
+        store_route_count("type4_backing_recovered"),
+        recovered_before + 1,
+        "an attach on the backing the refusal named is a recovery"
+    );
+    assert_eq!(
+        store_route_count("type4_backing_superseded"),
+        before,
+        "and is not also a supersede"
+    );
+}
+
+/// The census names an outstanding refusal, and says nothing when there is none.
+///
+/// `oldest_ms` is the field that distinguishes a retry caught mid-flight from a
+/// surface this device never backed, so a line without it would report the same
+/// thing in both cases — which is the state this replaced.
+#[test]
+fn the_outstanding_census_names_the_oldest_refusal_and_is_otherwise_silent() {
+    let sid = 0x4d3u32;
+    let gva = 0x4333000u64;
+    clear_type4_fail(sid, gva);
+
+    // Other tests in this module share the latch, so assert about *this* sid
+    // rather than about emptiness — a bare `is_none()` would be order-dependent.
+    let mine = |line: &Option<String>| {
+        line.as_deref()
+            .is_some_and(|l| l.contains(&format!("sid={sid}")))
+    };
+    assert!(
+        !mine(&type4_backing_outstanding_census()),
+        "nothing is latched for this surface yet"
+    );
+
+    defer_type4_fail(
+        sid,
+        "translate",
+        Some(gva),
+        "type4_backing_fail probe".into(),
+    );
+    flush_type4_fail(sid);
+    let line = type4_backing_outstanding_census().expect("a latched refusal must be censused");
+    assert!(
+        line.starts_with("type4_backing_outstanding n=") && line.contains("oldest_ms="),
+        "the line must carry both the count and the age: {line}"
+    );
+    assert!(
+        line.contains(&format!("gva={gva:#x}")) || !mine(&Some(line.clone())),
+        "when this surface is the oldest, the line must name its backing: {line}"
+    );
+
+    // Retiring it removes it from the census, by either route.
+    clear_type4_fail(sid, gva);
+    assert!(
+        !mine(&type4_backing_outstanding_census()),
+        "a recovered refusal is no longer outstanding"
+    );
+}
+
 #[test]
 fn a_type4_refusal_the_next_attach_resolves_is_reported_as_recovered() {
     fn log_mark() -> usize {
@@ -728,7 +845,12 @@ fn a_type4_refusal_the_next_attach_resolves_is_reported_as_recovered() {
 
     // A reported refusal naming this backing...
     let mark = log_mark();
-    defer_type4_fail(sid, "translate", Some(gva), "type4_backing_fail probe".into());
+    defer_type4_fail(
+        sid,
+        "translate",
+        Some(gva),
+        "type4_backing_fail probe".into(),
+    );
     flush_type4_fail(sid);
     assert!(
         log_since(mark).contains("type4_backing_fail probe"),
@@ -743,13 +865,21 @@ fn a_type4_refusal_the_next_attach_resolves_is_reported_as_recovered() {
         "a recycled surface id is not evidence that the earlier backing landed"
     );
     assert!(
-        !type4_fail_latch().lock().unwrap().contains_key(&(sid, "translate")),
+        !type4_fail_latch()
+            .lock()
+            .unwrap()
+            .contains_key(&(sid, "translate")),
         "the latch must still re-arm, or a later genuine failure goes unlogged"
     );
 
     // The same refusal, then an attach on the backing it named, is a recovery.
     let mark = log_mark();
-    defer_type4_fail(sid, "translate", Some(gva), "type4_backing_fail probe".into());
+    defer_type4_fail(
+        sid,
+        "translate",
+        Some(gva),
+        "type4_backing_fail probe".into(),
+    );
     flush_type4_fail(sid);
     clear_type4_fail(sid, gva);
     let log = log_since(mark);

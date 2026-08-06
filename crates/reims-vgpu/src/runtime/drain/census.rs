@@ -1366,6 +1366,13 @@ pub fn note_drain_tranche(drain_us: u64, publish_us: u64) {
         if let Some(routes) = take_store_routes() {
             crate::observe::off(routes);
         }
+        // Beside `store_routes` deliberately: the two are read against each
+        // other. `type4_backing_fail` lines equal `type4_backing_recovered +
+        // type4_backing_superseded` from that line plus this one's `n`, and a
+        // refusal that never recovered is only visible as the residue.
+        if let Some(outstanding) = crate::runtime::objects::type4_backing_outstanding_census() {
+            crate::observe::off(outstanding);
+        }
         // Onto the census cadence rather than a timer of its own, so a reader
         // pairing the footprint against `store_routes` is reading one clock.
         // The run dump rate-limits itself; this is the only caller.

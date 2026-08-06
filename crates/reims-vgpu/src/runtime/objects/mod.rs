@@ -156,9 +156,11 @@ fn defer_type4_fail(surface_id: u32, reason: &'static str, gva: Option<u64>, det
     let mut guard = type4_pending_latch()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    guard
-        .entry(surface_id)
-        .or_insert(PendingType4Fail { reason, gva, detail });
+    guard.entry(surface_id).or_insert(PendingType4Fail {
+        reason,
+        gva,
+        detail,
+    });
 }
 
 /// The search found no task that could back this surface: report the first
@@ -233,6 +235,7 @@ fn clear_type4_fail(surface_id: u32, backed_gva: u64) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(&surface_id);
+    let mut superseded = 0usize;
     let recovered: Vec<(&'static str, u64)> = {
         let mut guard = type4_fail_latch().lock().unwrap_or_else(|e| e.into_inner());
         // Every entry for this surface is dropped, exactly as before: the latch
@@ -245,11 +248,24 @@ fn clear_type4_fail(surface_id: u32, backed_gva: u64) {
             }
             if reported.gva == Some(backed_gva) {
                 out.push((*reason, reported.at_ms));
+            } else {
+                // Dropped without being claimed: this surface backed, but at a
+                // different address than the refusal named — the guest
+                // re-pointed it, so the refusal is moot rather than repaired.
+                // Counted because it used to be the *third* way a refusal could
+                // leave the latch and the only one that said nothing, which made
+                // an unpaired `type4_backing_fail` unreadable: a reader diffing
+                // the two line counts could not tell a refusal the guest walked
+                // away from apart from one that never came back.
+                superseded += 1;
             }
             false
         });
         out
     };
+    if superseded > 0 {
+        crate::runtime::drain::note_store_route_n("type4_backing_superseded", superseded as u64);
+    }
     // After the early return, not before it: this runs on every clean attach
     // (the per-present scanout path) and almost every one of those has nothing
     // latched, so the clock read stays off the hot path.
@@ -266,6 +282,49 @@ fn clear_type4_fail(surface_id: u32, backed_gva: u64) {
             now.saturating_sub(at_ms)
         ));
     }
+}
+
+/// The type-4 refusals still latched, for the census — or `None` if there are
+/// none.
+///
+/// # The reading this exists to make possible
+///
+/// A refusal leaves [`type4_fail_latch`] exactly three ways, and until this
+/// existed only one of them said so. It is *recovered* when the surface backs at
+/// the address the refusal named, which emits `type4_backing_recovered`. It is
+/// *superseded* when the surface backs somewhere else — the guest re-pointed it,
+/// so the refusal is moot — which [`clear_type4_fail`] now counts. Or it is
+/// still here, which is the only one that can be lost guest work, and it was the
+/// silence the other two were mistaken for.
+///
+/// The three add up: `type4_backing_fail` lines equal
+/// `type4_backing_recovered + type4_backing_superseded + n` from the last
+/// census window. That identity is the point — a reader who finds fewer
+/// recoveries than refusals now has a line to check instead of a hand-matched
+/// diff of backing GVAs, which is how this hole was found.
+///
+/// `oldest_ms` is the age of the longest-outstanding refusal, not a count. A
+/// boot ending with `n=1 oldest_ms=12` is a refusal caught mid-retry; the same
+/// boot with `oldest_ms=83000` is a surface this device never backed.
+///
+/// Silent when the latch is empty, because an empty latch is the expected state
+/// and this rides a one-second cadence.
+pub(crate) fn type4_backing_outstanding_census() -> Option<String> {
+    let now = crate::observe::elapsed_ms() as u64;
+    let guard = type4_fail_latch().lock().unwrap_or_else(|e| e.into_inner());
+    // The oldest entry is the one worth naming: it is the one least likely to
+    // be a retry still in flight, and a single line cannot carry them all.
+    let oldest = guard
+        .iter()
+        .min_by_key(|(_, reported)| reported.at_ms)
+        .map(|((sid, reason), reported)| (*sid, *reason, reported.gva, reported.at_ms))?;
+    let (sid, reason, gva, at_ms) = oldest;
+    Some(format!(
+        "type4_backing_outstanding n={} oldest_ms={} sid={sid} reason={reason} gva={}",
+        guard.len(),
+        now.saturating_sub(at_ms),
+        gva.map_or_else(|| "none".to_string(), |g| format!("{g:#x}"))
+    ))
 }
 
 /// Wire object type for surface / IOSurface backing (x86 Tahoe/Ventura).
@@ -1378,7 +1437,7 @@ fn apply_type4_backing<M: HostMemory>(
             defer_type4_fail(
                 surface_id,
                 "task_inactive",
-            Some(backing_base_gva),
+                Some(backing_base_gva),
                 format!("type4_backing_fail reason=task_inactive sid={surface_id} task={task_id}"),
             );
             return false;
@@ -1421,7 +1480,7 @@ fn apply_type4_backing<M: HostMemory>(
             defer_type4_fail(
                 surface_id,
                 "translate",
-            Some(backing_base_gva),
+                Some(backing_base_gva),
                 type4_translate_fail_detail(
                     surface_id,
                     task_id,
