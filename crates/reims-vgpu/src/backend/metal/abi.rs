@@ -18,8 +18,13 @@ pub const REIMS_VGPU_ERR_ARGS: i32 = 1;
 pub const REIMS_VGPU_ERR_TRANSLATE: i32 = 2;
 pub const REIMS_VGPU_ERR_EXECUTE: i32 = 3;
 
+// The two binding-band bases this backend encodes (class, index) into. They are
+// the device's bands, not the archived header's: the sampler base moved up so
+// the texture band could be Metal's whole 128-entry argument table. `const`
+// assertions in `backend::metal::constants` pin both to
+// `runtime::spirv_bind`'s, so the two arms cannot number a bind differently.
 pub const REIMS_VGPU_BINDING_TEXTURE_BASE: u32 = 32;
-pub const REIMS_VGPU_BINDING_SAMPLER_BASE: u32 = 64;
+pub const REIMS_VGPU_BINDING_SAMPLER_BASE: u32 = 160;
 
 pub const REIMS_VGPU_MTL_PRIMITIVE_TYPE_POINT: u32 = 0;
 pub const REIMS_VGPU_MTL_PRIMITIVE_TYPE_LINE: u32 = 1;

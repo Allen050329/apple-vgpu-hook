@@ -236,6 +236,22 @@ const RECORDED: &[Recorded] = &[
     // constant had: the sites do not agree on what happens after a refusal —
     // `draw::vulkan` skips the bind (`continue`), `draw::metal_icb` refuses the
     // whole record — so one predicate would have to return which.
+    // The descriptor binding band map. `COLOR_INPUT_BINDING_BASE` is the top of
+    // it, so it is the constant the other bands are checked against: three of
+    // the four `const` assertions that pin the map name it. Those assertions are
+    // the consolidation this instrument asks for rather than a violation of it —
+    // they sit beside the constants they relate, and a band that stops holding
+    // what a guest can send fails the build there. The compute rail's copy is
+    // the same relation for its own slot caps, stated where those caps live
+    // because that is the module that would widen one.
+    Recorded {
+        name: "COLOR_INPUT_BINDING_BASE",
+        why: "3 comparisons, all of them `const` assertions pinning the band map: two beside \
+              the band constants in `spirv_bind` and one beside the compute slot caps in \
+              `compute_exec`. Not consolidatable into a predicate — each is a distinct \
+              relation between two constants that can move independently, and the point of \
+              writing them out is that each names which pair it holds.",
+    },
     Recorded {
         name: "MAX_BUFFER_BIND_SLOTS",
         why: "8 comparisons across the three render bind paths. Metal's buffer argument \

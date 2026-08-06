@@ -61,9 +61,19 @@ fn translate_words(name: &str, stage: Stage) -> Vec<u32> {
     assert!(path.exists(), "missing reims-vgpu AIR fixture: {name}");
     let spv = metal2vulkan::translate(path.to_str().unwrap(), stage, &tmp)
         .unwrap_or_else(|e| panic!("translate {name}: {e}"));
-    spv.chunks_exact(4)
+    let mut words: Vec<u32> = spv
+        .chunks_exact(4)
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect()
+        .collect();
+    // The translator emits its own narrow bands; the device uses wider ones so
+    // the texture band can hold Metal's whole 128-entry argument table. In the
+    // product every translation reaches the engine through
+    // `m2v_cache::CachedShader::new`, which applies this once per shader. This
+    // helper calls the translator directly, so it has to apply it too — without
+    // this the module says binding 96 for a framebuffer-fetch input while the
+    // engine binds the input attachment at 192, and the shader reads zero.
+    reims_vgpu::runtime::spirv_bind::widen_sampled_bands(&mut words);
+    words
 }
 
 fn triangle_spirv() -> (Vec<u32>, Vec<u32>) {

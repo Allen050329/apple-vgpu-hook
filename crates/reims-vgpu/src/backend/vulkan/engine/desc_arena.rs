@@ -95,17 +95,25 @@ pub(crate) const DESC_BLOCK_MAX_SETS: u32 = 64;
 /// budget is per type. The compute path is single-stage and its three slot caps
 /// are all at or below these, so it stays under this.
 const MAX_SET_DESCRIPTORS_PER_TYPE: u32 = 2 * crate::runtime::draw::MAX_ANY_BIND_SLOTS;
-/// Per-type descriptor budget within one block, matched to `DESC_BLOCK_MAX_SETS`
-/// so a block of single-binding sets exhausts `max_sets` and per-type budget
-/// together. A draw that binds N sampled images consumes N of this type's
-/// budget; exhausting it before `max_sets` still triggers a clean grow.
-const DESC_BLOCK_PER_TYPE: u32 = DESC_BLOCK_MAX_SETS;
+/// Per-type descriptor budget within one block.
+///
+/// It used to be `DESC_BLOCK_MAX_SETS`, so a block of single-binding sets
+/// exhausted `max_sets` and per-type budget together. It cannot be any more: one
+/// set may now ask for [`MAX_SET_DESCRIPTORS_PER_TYPE`] = 256 sampled images (two
+/// stages × a 128-entry texture table), and a set that wants more of a type than
+/// a block holds cannot be served by *any* block — growing does not help, and the
+/// draw is dropped. So the budget follows the bind tables, and the tidy equality
+/// with `DESC_BLOCK_MAX_SETS` is what gives way.
+///
+/// The cost is per-block pool size, not per-draw work: a `VkDescriptorPool` sized
+/// for 256 descriptors of each type instead of 64. A draw that binds N sampled
+/// images still consumes exactly N of this type's budget, and exhausting it
+/// before `max_sets` still triggers a clean grow.
+const DESC_BLOCK_PER_TYPE: u32 = MAX_SET_DESCRIPTORS_PER_TYPE;
 /// Widening a bind table without widening a block is a dropped draw, not a
-/// slower one, so it fails the build here instead. There is no margin left: the
-/// widest class bound is 32, so this is 64 against 64, and the next widening of
-/// any of the three fails this assertion rather than dropping a draw at runtime.
-/// That is the assertion doing its job — raise [`DESC_BLOCK_PER_TYPE`] with the
-/// table, and note that it is no longer then equal to [`DESC_BLOCK_MAX_SETS`].
+/// slower one, so it fails the build here instead — and it did: raising the
+/// texture table to Apple's 128 tripped this assertion before it could drop a
+/// draw at runtime, which is the whole reason it is a `const` and not a comment.
 const _: () = assert!(DESC_BLOCK_PER_TYPE >= MAX_SET_DESCRIPTORS_PER_TYPE);
 
 /// A growable set of same-sized descriptor-pool blocks. `blocks[0]` is created

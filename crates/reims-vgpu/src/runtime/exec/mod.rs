@@ -2202,9 +2202,12 @@ impl crate::observe::Decline for BindSlotPastTable {
 // re-point what the census means, so this is a build gate rather than a test —
 // the same reason `reims_vgpu_wire::Wire::ASSERT_ALIGN_1` is one.
 //
-// Textures: Apple emits above the bound, so a reading is lost guest work and is
-// the argument for widening.
-const _: () = assert!(reims_vgpu_wire::ops::bind_limit::TEXTURE > MAX_TEXTURE_BIND_SLOTS);
+// Textures: the bound IS Apple's table now, so no texture bind an Apple guest
+// can emit is refused. This used to be `>`, and the gap it recorded — slots
+// 32..127, dropped because the descriptor binding band was 32 wide — is what
+// `spirv_bind::widen_sampled_bands` closed. A `<` here would mean this device
+// accepts a slot it cannot name; a `>` would mean the gap is back.
+const _: () = assert!(reims_vgpu_wire::ops::bind_limit::TEXTURE == MAX_TEXTURE_BIND_SLOTS);
 // Buffers: two independent derivations of one table size — Apple's serializer
 // truncates there and Metal's `REIMS_VGPU_METAL_MAX_BUFFERS` stops there.
 const _: () = assert!(reims_vgpu_wire::ops::bind_limit::BUFFER == MAX_BUFFER_BIND_SLOTS);

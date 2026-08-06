@@ -11,14 +11,16 @@ use crate::backend::metal::abi::{
 
 pub const REIMS_VGPU_METAL_MAX_ATTRS: usize = 31;
 pub const REIMS_VGPU_METAL_MAX_BUFFERS: usize = 31;
-/// The texture argument table.
+/// The texture argument table: Metal's own, and Apple's serializer's.
 ///
-/// 32, not Metal's own 128, because this backend names a bound resource by the
-/// flat descriptor binding the bands below define: a texture at index 32 would
-/// carry [`REIMS_VGPU_BINDING_SAMPLER_BASE`], sampler 0's number, and
-/// [`texture_index`](crate::backend::metal::util::texture_index) could not tell
-/// the two apart. The band assertion below is what holds the two in step.
-pub const REIMS_VGPU_METAL_MAX_TEXTURES: usize = 32;
+/// It was 32 — the width of the descriptor binding band, not a Metal fact —
+/// because a texture at index 32 would have carried
+/// [`REIMS_VGPU_BINDING_SAMPLER_BASE`], sampler 0's number, and
+/// [`texture_index`](crate::backend::metal::util::texture_index) could not have
+/// told the two apart. The sampler band moved up
+/// (`spirv_bind::widen_sampled_bands`) so the texture band is 128 wide, and the
+/// band assertion below is what holds the two in step.
+pub const REIMS_VGPU_METAL_MAX_TEXTURES: usize = 128;
 pub const REIMS_VGPU_METAL_MAX_SAMPLERS: usize = 16;
 /// Metal max color attachments per render pass / PSO.
 pub const REIMS_VGPU_METAL_MAX_COLOR_RTS: usize = 8;
@@ -70,3 +72,12 @@ const _: () =
 // part.
 const _: () =
     assert!(REIMS_VGPU_METAL_MAX_TEXTURES as u32 == crate::runtime::draw::MAX_TEXTURE_BIND_SLOTS);
+
+// This backend's two band bases are mirrors of `runtime::spirv_bind`'s, which is
+// where the widening that set them is written. A mirror that drifts would have
+// the two arms encode the same guest bind as two different descriptor bindings,
+// and nothing else in the toolchain compares them.
+const _: () =
+    assert!(REIMS_VGPU_BINDING_TEXTURE_BASE == crate::runtime::spirv_bind::TEXTURE_BINDING_BASE);
+const _: () =
+    assert!(REIMS_VGPU_BINDING_SAMPLER_BASE == crate::runtime::spirv_bind::SAMPLER_BINDING_BASE);

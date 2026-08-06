@@ -77,28 +77,115 @@ const SAMPLED_RESOURCE_BINDING_BASE: u32 = 32;
 const STORAGE_CLASS_UNIFORM_CONSTANT: u32 = 0;
 const STORAGE_CLASS_STORAGE_BUFFER: u32 = 12;
 
-/// metal2vulkan ColorInput band base: `air.render_target` INPUT params
-/// (framebuffer fetch, `dest_N`) emit `SubpassData` images at `96+N`. The band
-/// `[96,104)` (MRT ≤ 8) must survive BOTH fragment relocations unchanged — the
-/// engine binds the input attachment by this number. m2v-synthesized constexpr
-/// samplers currently also land here; they are unbindable either way, so
-/// preserving the band never makes them worse.
-pub const COLOR_INPUT_BINDING_BASE: u32 = 96;
-/// Fragment buffer band destination offset (`[0,32)` → `[104,136)`) — starts
-/// past the ColorInput band and ends before the relocated sampled bands
-/// (textures `[160,192)`, samplers `[192,224)`).
-pub const FRAG_BUFFER_BINDING_OFFSET: u32 = 104;
-/// Fragment sampled-resource destination offset (textures/samplers `[32,96)` → `+128`).
-pub const FRAG_SAMPLED_RESOURCE_BINDING_OFFSET: u32 = 128;
+// ---------------------------------------------------------------------------
+// Two numberings, and why they are not the same one
+// ---------------------------------------------------------------------------
+//
+// `metal2vulkan` emits its own bands, 32 apart, and they are the *input* to this
+// module. They are imported from the translator rather than re-declared, so a
+// change on that side fails this build instead of silently disagreeing.
+//
+// Those bands are too narrow: Metal's texture argument table is 128 entries and
+// Apple's serializer emits up to that (`bind_limit::TEXTURE`), so a texture at
+// index 40 would decorate binding 72 — the same number the translator gives
+// sampler 8. The device therefore uses a *wider* layout, and
+// [`widen_sampled_bands`] rewrites the translator's output into it once per
+// shader. Textures do not move (their base is the same in both), so every
+// consumer keyed on `TEXTURE_BINDING_BASE + metal_index` is unaffected; the
+// sampler and ColorInput bands move up out of the texture band's way.
+//
+//   class        translator emits   device uses      width
+//   buffers      [0, 32)            [0, 32)          32   (Metal's table is 31)
+//   textures     [32, 64)           [32, 160)        128  (Metal's table, exactly)
+//   samplers     [64, 96)           [160, 192)       32   (Metal's table is 16)
+//   ColorInput   [96, 104)          [192, 200)       8    (MRT ≤ 8)
+//
+// The rewrite is keyed on the SPIR-V *type* behind each variable
+// ([`variable_classes`]), never on the number, which is what lets it separate a
+// texture at 72 from a sampler at 72. That also means it repairs a module in
+// which the translator gave both the same binding: two variables that collided
+// as one number come out as two.
+pub use metal2vulkan::reflect::{
+    COLOR_INPUT_BINDING_BASE as M2V_COLOR_INPUT_BINDING_BASE,
+    SAMPLER_BINDING_BASE as M2V_SAMPLER_BINDING_BASE,
+    TEXTURE_BINDING_BASE as M2V_TEXTURE_BINDING_BASE,
+};
+
+/// Device texture band base (Metal texture index N → binding 32+N).
+///
+/// Equal to the translator's own base by construction, so no texture decoration
+/// is ever rewritten and every reflection lookup keyed on this number stays
+/// valid without translation.
+pub const TEXTURE_BINDING_BASE: u32 = M2V_TEXTURE_BINDING_BASE;
+/// Device sampler band base (Metal sampler index N → binding 160+N).
+///
+/// 160 rather than the translator's 64, so the texture band below it is 128 wide
+/// — exactly Metal's texture argument table, and exactly what Apple's serializer
+/// is entitled to emit.
+pub const SAMPLER_BINDING_BASE: u32 = 160;
+/// Device ColorInput band base: `air.render_target` INPUT params (framebuffer
+/// fetch, `dest_N`) emit `SubpassData` images, which the translator numbers from
+/// [`M2V_COLOR_INPUT_BINDING_BASE`]. The band (MRT ≤ 8) must survive BOTH
+/// fragment relocations unchanged — the engine binds the input attachment by
+/// this number. m2v-synthesized constexpr samplers currently also land here;
+/// they are unbindable either way, so preserving the band never makes them worse.
+pub const COLOR_INPUT_BINDING_BASE: u32 = 192;
+
+/// How far [`widen_sampled_bands`] moves a sampler or ColorInput decoration.
+///
+/// One offset for both bands, so their spacing is preserved and the widen is a
+/// single translation rather than a per-class table.
+pub const SAMPLED_TAIL_WIDEN_OFFSET: u32 = SAMPLER_BINDING_BASE - M2V_SAMPLER_BINDING_BASE;
+const _: () = assert!(
+    COLOR_INPUT_BINDING_BASE - M2V_COLOR_INPUT_BINDING_BASE == SAMPLED_TAIL_WIDEN_OFFSET,
+    "one offset moves both tail bands, so their spacing must be preserved"
+);
+// The texture band is exactly Metal's argument table, which is the whole point
+// of the widening: `runtime::draw::MAX_TEXTURE_BIND_SLOTS` reads its value from
+// this subtraction, and `runtime::exec` pins that against Apple's own table.
+const _: () = assert!(TEXTURE_BINDING_BASE == M2V_TEXTURE_BINDING_BASE);
+const _: () = assert!(SAMPLER_BINDING_BASE - TEXTURE_BINDING_BASE == 128);
+
+/// Fragment buffer band destination offset (`[0,32)` → `[256,288)`) — starts
+/// past every un-relocated band (which now end at [`COLOR_INPUT_BINDING_BASE`]
+/// + 8 = 200) and ends before the relocated sampled bands.
+pub const FRAG_BUFFER_BINDING_OFFSET: u32 = 256;
+/// Fragment sampled-resource destination offset (textures/samplers
+/// `[32,192)` → `+288`, so textures land in `[320,448)` and samplers in
+/// `[448,480)`), clear of the relocated fragment buffer band.
+pub const FRAG_SAMPLED_RESOURCE_BINDING_OFFSET: u32 = 288;
 /// Exclusive upper bound of the sampled-resource source band relocated by
-/// [`offset_fragment_sampled_resource_bindings`]: textures `[32,64)` + samplers
-/// `[64,96)`. Bindings at [`COLOR_INPUT_BINDING_BASE`] and above stay in place.
+/// [`offset_fragment_sampled_resource_bindings`]: textures `[32,160)` + samplers
+/// `[160,192)`. Bindings at [`COLOR_INPUT_BINDING_BASE`] and above stay in place.
 const SAMPLED_RESOURCE_BINDING_LIMIT: u32 = COLOR_INPUT_BINDING_BASE;
 
-/// metal2vulkan texture band base (Metal texture index N → binding 32+N).
-pub const TEXTURE_BINDING_BASE: u32 = 32;
-/// metal2vulkan sampler band base (Metal sampler index N → binding 64+N).
-pub const SAMPLER_BINDING_BASE: u32 = 64;
+// The band map, pinned at build time rather than in a test, because a band that
+// no longer holds what a guest can send is a silently mis-bound descriptor and
+// not a slow path. Each of these is one relation between two constants that can
+// move independently.
+//
+// Every Metal texture index Apple's serializer can emit lands inside the texture
+// band, and the last one is its last slot — no waste, no overflow.
+const _: () = assert!(
+    TEXTURE_BINDING_BASE + reims_vgpu_wire::ops::bind_limit::TEXTURE == SAMPLER_BINDING_BASE
+);
+// Every Metal sampler index it can emit lands inside the sampler band.
+const _: () = assert!(
+    SAMPLER_BINDING_BASE + reims_vgpu_wire::ops::bind_limit::SAMPLER <= COLOR_INPUT_BINDING_BASE
+);
+// The relocated fragment buffer band starts past every un-relocated band,
+// including the 8-entry ColorInput band at the top of them.
+const _: () = assert!(FRAG_BUFFER_BINDING_OFFSET >= COLOR_INPUT_BINDING_BASE + 8);
+// ...and ends before the relocated fragment sampled bands begin.
+const _: () = assert!(
+    BUFFER_BINDING_LIMIT - 1 + FRAG_BUFFER_BINDING_OFFSET
+        < TEXTURE_BINDING_BASE + FRAG_SAMPLED_RESOURCE_BINDING_OFFSET
+);
+// The widest relocated binding still fits a `u32`.
+const _: () = assert!(
+    (SAMPLED_RESOURCE_BINDING_LIMIT - 1).checked_add(FRAG_SAMPLED_RESOURCE_BINDING_OFFSET)
+        .is_some()
+);
 
 /// Image dimensionality declared by a translated SPIR-V sampled-image binding.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1103,6 +1190,44 @@ pub fn offset_fragment_buffer_bindings(words: &mut [u32]) -> usize {
     )
 }
 
+/// Rewrite a freshly translated module from the translator's narrow bands into
+/// the device's wide ones: sampler and ColorInput bindings +=
+/// [`SAMPLED_TAIL_WIDEN_OFFSET`]. Textures do not move.
+///
+/// Run once per shader, before anything reads a binding number and before either
+/// fragment relocation, so every consumer downstream sees one numbering.
+///
+/// # This is what makes texture indices 32..127 reachable
+///
+/// The translator's bands are 32 apart, so it decorates Metal texture 40 with
+/// binding 72 — the number it also gives sampler 8. Every index at or above 32
+/// was therefore refused upstream, and Apple's serializer emits up to 128
+/// (`bind_limit::TEXTURE`). Moving the two tail bands up leaves the texture band
+/// 128 wide, and the texture decorations are already correct in it.
+///
+/// # Why it cannot mis-file a binding
+///
+/// The class comes from the variable's SPIR-V type, not its number
+/// ([`variable_classes`]): a texture is an `OpTypeImage` whose `Dim` is not
+/// `SubpassData`, a sampler an `OpTypeSampler`, a ColorInput a `SubpassData`
+/// image. So the pass separates a texture at 72 from a sampler at 72 exactly.
+/// It also *repairs* a module in which the translator gave both the same number
+/// — two variables that arrived colliding leave as two — which is the one shape
+/// the narrow bands could not express at all.
+///
+/// The band predicate is the fallback for a variable the type walk could not
+/// name, and it is only consulted then; each such fallback is reported as
+/// `spirv_reloc_unclassified_binding`. Two driven boots covering 160 shader
+/// translations report none.
+pub fn widen_sampled_bands(words: &mut [u32]) -> usize {
+    relocate_by_class(
+        words,
+        &[BindingClass::Sampler, BindingClass::ColorInput],
+        |binding| binding >= M2V_SAMPLER_BINDING_BASE,
+        SAMPLED_TAIL_WIDEN_OFFSET,
+    )
+}
+
 /// Rewrite fragment SPIR-V: texture and sampler bindings +=
 /// [`FRAG_SAMPLED_RESOURCE_BINDING_OFFSET`] (source band `[32,96)`).
 ///
@@ -1168,10 +1293,29 @@ fn sampled_image_kind_from_shape(shape: &TextureShape) -> Option<SampledImageKin
 /// UN-relocated number). `None` when no binding matches or it carries no shape.
 fn texture_shape_for_binding(reflection: &ShaderReflection, binding: u32) -> Option<&TextureShape> {
     reflection.bindings.iter().find_map(|b| {
-        (b.descriptor.map(|d| d.binding) == Some(binding))
+        (is_texture_kind(b.kind) && b.descriptor.map(|d| d.binding) == Some(binding))
             .then_some(b.texture_shape.as_ref())
             .flatten()
     })
+}
+
+/// Whether a reflected resource is one of the kinds a `[[texture(n)]]` index
+/// names, as opposed to a sampler, a buffer, or a framebuffer-fetch input.
+///
+/// The kind is checked as well as the binding because reflection reports the
+/// *translator's* numbering, whose bands are 32 apart: Metal texture 64 and
+/// ColorInput 0 are both binding 96 there, and both carry a `texture_shape`. The
+/// SPIR-V has no such ambiguity — [`widen_sampled_bands`] separated the two —
+/// but a lookup into reflection still has to say which one it meant, and the
+/// kind is the field that says it.
+fn is_texture_kind(kind: ResourceKind) -> bool {
+    matches!(
+        kind,
+        ResourceKind::Texture
+            | ResourceKind::TextureArray
+            | ResourceKind::StorageImage
+            | ResourceKind::EmbeddedArgBufferTexture
+    )
 }
 
 /// How reflection describes descriptor `binding` for the sampled render path.
@@ -1302,7 +1446,7 @@ pub fn census_reflection_wellformed(reflection: &ShaderReflection, pipeline_ref:
                 }
                 (Some(descriptor), Some(_))
                     if descriptor.set != RESOURCE_DESCRIPTOR_SET
-                        || !(SAMPLER_BINDING_BASE..COLOR_INPUT_BINDING_BASE)
+                        || !(M2V_SAMPLER_BINDING_BASE..M2V_COLOR_INPUT_BINDING_BASE)
                             .contains(&descriptor.binding) =>
                 {
                     bad += 1;
@@ -1312,8 +1456,8 @@ pub fn census_reflection_wellformed(reflection: &ShaderReflection, pipeline_ref:
                          expected_set={RESOURCE_DESCRIPTOR_SET} expected_band={}..{}",
                         descriptor.set,
                         descriptor.binding,
-                        SAMPLER_BINDING_BASE,
-                        COLOR_INPUT_BINDING_BASE
+                        M2V_SAMPLER_BINDING_BASE,
+                        M2V_COLOR_INPUT_BINDING_BASE
                     ));
                 }
                 (Some(_), Some(_)) => {}
@@ -1522,6 +1666,9 @@ mod tests {
         }
     }
 
+    /// A reflected static sampler. `binding` is the translator's number, because
+    /// reflection is the translator's own output and `census_reflection_wellformed`
+    /// validates it against the translator's bands.
     fn static_sampler_binding(binding: u32) -> ResourceBinding {
         use metal2vulkan::reflect::{
             SamplerAddressMode, SamplerBorderColor, SamplerCompareFunction, SamplerCoordinates,
@@ -1530,7 +1677,7 @@ mod tests {
 
         ResourceBinding {
             kind: ResourceKind::StaticSampler,
-            metal_index: binding - SAMPLER_BINDING_BASE,
+            metal_index: binding - M2V_SAMPLER_BINDING_BASE,
             descriptor: Some(DescriptorLocation {
                 set: RESOURCE_DESCRIPTOR_SET,
                 binding,
@@ -1705,7 +1852,7 @@ mod tests {
         let mut static_reflection = empty_reflection(ShaderStage::Fragment);
         static_reflection
             .bindings
-            .push(static_sampler_binding(SAMPLER_BINDING_BASE + 1));
+            .push(static_sampler_binding(M2V_SAMPLER_BINDING_BASE + 1));
         assert_eq!(census_reflection_wellformed(&static_reflection, 0), 0);
         let mut missing_state = static_reflection.clone();
         missing_state.bindings[0].static_sampler = None;
@@ -1799,11 +1946,15 @@ mod tests {
         reason = "the test pins the binding-band contract constants"
     )]
     fn relocations_preserve_color_input_band_and_stay_collision_free() {
-        // The ColorInput band [96,104) (framebuffer-fetch SubpassData images,
-        // plus today's synthesized constexpr samplers) must survive BOTH
-        // fragment relocations unchanged, and the relocated buffer band
-        // [104,136) must not land on it — the engine binds the input
-        // attachment at its un-relocated 96+N number.
+        // The ColorInput band (framebuffer-fetch SubpassData images, plus
+        // today's synthesized constexpr samplers) must survive BOTH fragment
+        // relocations unchanged, and the relocated buffer band must not land on
+        // it — the engine binds the input attachment at its un-relocated number.
+        //
+        // These are DEVICE bindings, the numbering `widen_sampled_bands` leaves
+        // behind, because that is what the fragment relocations run on. The
+        // decorations carry no types, so this also exercises the band-predicate
+        // fallback that a variable the type walk cannot name falls back to.
         let decorate = |id: u32, binding: u32| {
             vec![
                 (4u32 << 16) | OP_DECORATE as u32,
@@ -1814,18 +1965,24 @@ mod tests {
         };
         let mut words = vec![0x0723_0203, 0x0001_0000, 0, 7, 0];
         words.extend(decorate(1, 1)); // fragment buffer → relocates
-        words.extend(decorate(2, 97)); // ColorInput band → stays
-        words.extend(decorate(3, 35)); // texture → sampled reloc
-        words.extend(decorate(4, 64)); // sampler → sampled reloc
+        words.extend(decorate(2, COLOR_INPUT_BINDING_BASE + 1)); // ColorInput → stays
+        words.extend(decorate(3, TEXTURE_BINDING_BASE + 3)); // texture → sampled reloc
+        words.extend(decorate(4, SAMPLER_BINDING_BASE)); // sampler → sampled reloc
 
         assert_eq!(offset_fragment_sampled_resource_bindings(&mut words), 2);
         assert_eq!(offset_fragment_buffer_bindings(&mut words), 1);
 
         let bindings = [words[8], words[12], words[16], words[20]];
         assert_eq!(bindings[0], 1 + FRAG_BUFFER_BINDING_OFFSET);
-        assert_eq!(bindings[1], 97);
-        assert_eq!(bindings[2], 35 + FRAG_SAMPLED_RESOURCE_BINDING_OFFSET);
-        assert_eq!(bindings[3], 64 + FRAG_SAMPLED_RESOURCE_BINDING_OFFSET);
+        assert_eq!(bindings[1], COLOR_INPUT_BINDING_BASE + 1);
+        assert_eq!(
+            bindings[2],
+            TEXTURE_BINDING_BASE + 3 + FRAG_SAMPLED_RESOURCE_BINDING_OFFSET
+        );
+        assert_eq!(
+            bindings[3],
+            SAMPLER_BINDING_BASE + FRAG_SAMPLED_RESOURCE_BINDING_OFFSET
+        );
         // All four distinct — no merged-set duplicate bindings.
         let mut sorted = bindings;
         sorted.sort_unstable();
@@ -1894,19 +2051,21 @@ mod tests {
         vec![0x0723_0203, 0x0001_0000, 0, 512, 0]
     }
 
-    /// The collision that bounds the texture table at 31.
+    /// The collision that used to bound the texture table, and the widen that
+    /// resolves it.
     ///
     /// metal2vulkan puts texture `N` at `32+N` and sampler `N` at `64+N`, so
-    /// texture 40 and sampler 8 are both binding 72 and the number cannot say
-    /// which is which. The SPIR-V type can, and this is the reading that says the
-    /// 32-wide band is a property of the numbering rather than of the
-    /// information available — a widened band has to be told apart this way.
+    /// texture 40 and sampler 8 are both binding 72 — one number for two
+    /// descriptors, which is a module the narrow bands cannot express at all.
+    /// The SPIR-V type tells them apart, and [`widen_sampled_bands`] acts on the
+    /// type: the two arrive as one number and leave as two. That is what makes
+    /// texture indices 32..127 reachable rather than merely countable.
     #[test]
-    fn a_texture_and_a_sampler_sharing_one_binding_are_told_apart_by_type() {
+    fn a_texture_and_a_sampler_sharing_one_binding_are_separated_by_the_widen() {
         const IMAGE: u32 = 10;
         const SAMPLER: u32 = 11;
-        const COLLIDING: u32 = TEXTURE_BINDING_BASE + 40;
-        const _: () = assert!(COLLIDING == SAMPLER_BINDING_BASE + 8);
+        const COLLIDING: u32 = M2V_TEXTURE_BINDING_BASE + 40;
+        const _: () = assert!(COLLIDING == M2V_SAMPLER_BINDING_BASE + 8);
 
         let mut words = module_header();
         words.extend(image_type(IMAGE, 1));
@@ -1917,7 +2076,33 @@ mod tests {
         let classes = variable_classes(&words);
         assert_eq!(classes[30], Some(BindingClass::Texture));
         assert_eq!(classes[31], Some(BindingClass::Sampler));
+
+        assert_eq!(widen_sampled_bands(&mut words), 1, "only the sampler moves");
+        let binding_of = |var: u32| {
+            let mut i = HEADER_WORDS;
+            let mut found = None;
+            while i < words.len() {
+                let wc = (words[i] >> 16) as usize;
+                if wc == 0 || i + wc > words.len() {
+                    break;
+                }
+                if (words[i] & 0xffff) as u16 == OP_DECORATE
+                    && words[i + 2] == DECORATION_BINDING
+                    && words[i + 1] == var
+                {
+                    found = Some(words[i + 3]);
+                }
+                i += wc;
+            }
+            found.expect("every descriptor here carries a Binding decoration")
+        };
+        // The texture keeps the translator's number, which is already correct in
+        // a 128-wide band; the sampler moves out from under it.
+        assert_eq!(binding_of(30), TEXTURE_BINDING_BASE + 40);
+        assert_eq!(binding_of(31), SAMPLER_BINDING_BASE + 8);
+        assert_ne!(binding_of(30), binding_of(31));
     }
+
 
     /// A framebuffer-fetch input is an `OpTypeImage` too, and the exclusion that
     /// keeps it un-relocated must not be its binding number: `Dim SubpassData`

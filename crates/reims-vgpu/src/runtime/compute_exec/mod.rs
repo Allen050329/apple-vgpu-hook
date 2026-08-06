@@ -49,9 +49,13 @@ use crate::runtime::objects;
 
 /// Cap on Metal compute buffer slots (matches backend `REIMS_VGPU_METAL_MAX_BUFFERS`).
 pub const MAX_COMPUTE_BUFFER_SLOTS: u32 = 31;
-/// Cap on compute texture stream indices (Metal bind = 32 + index).
-pub const MAX_COMPUTE_TEXTURE_SLOTS: u32 = 31;
-/// Cap on compute sampler stream indices (Metal bind = 64 + index).
+/// Cap on compute texture stream indices (Metal bind = `TEXTURE_BINDING_BASE +
+/// index`). Metal's compute texture argument table, and Apple's serializer's:
+/// this rail refused indices 31..127 only because the descriptor binding band
+/// was that narrow, which `spirv_bind::widen_sampled_bands` fixed.
+pub const MAX_COMPUTE_TEXTURE_SLOTS: u32 = 128;
+/// Cap on compute sampler stream indices (Metal bind = `SAMPLER_BINDING_BASE +
+/// index`). Metal's sampler argument table, which is genuinely 16.
 pub const MAX_COMPUTE_SAMPLER_SLOTS: u32 = 16;
 
 // The two caps above are what keeps a stream index inside its own descriptor

@@ -177,11 +177,33 @@ pub struct CachedShader {
 }
 
 impl CachedShader {
+    /// Materialize a freshly translated module, in the device's binding
+    /// numbering rather than the translator's.
+    ///
+    /// [`crate::runtime::spirv_bind::widen_sampled_bands`] runs exactly here,
+    /// once per shader on the translate miss path, because this is the one point
+    /// every consumer of a module goes through — both `spirv` and `words`, and
+    /// therefore every fragment relocation variant derived from `words`. Doing it
+    /// per draw would be a module rewrite on the hot path; doing it in only one
+    /// of the two representations would let the compute rail (which reads
+    /// `spirv`) and the render rail (which reads `words`) disagree about what
+    /// binding a texture has.
+    ///
+    /// `spirv` is rebuilt from the widened words for that reason: it is no longer
+    /// byte-identical to what the translator returned, and the bytes and the
+    /// words must not be allowed to drift apart.
     pub fn new(spirv: Vec<u8>, reflection: Arc<ShaderReflection>) -> Self {
-        let words: Vec<u32> = spirv
+        let mut words: Vec<u32> = spirv
             .chunks_exact(4)
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
+        let widened = crate::runtime::spirv_bind::widen_sampled_bands(&mut words);
+        let spirv = if widened == 0 {
+            // Nothing moved, so the translator's bytes already are the device's.
+            spirv
+        } else {
+            words.iter().flat_map(|w| w.to_le_bytes()).collect()
+        };
         Self {
             spirv,
             reflection,
@@ -778,53 +800,76 @@ mod tests {
         ))
     }
 
+    /// `CachedShader::new` widens the translator's bands, and `fragment_words`
+    /// relocates on top of that — in that order, for every representation.
     #[test]
     fn fragment_words_variants_match_direct_relocation_and_cache() {
-        // Minimal module: 5-word header + three OpDecorate Binding instructions,
-        // one in the buffer band and the low/high edges exercised in the
-        // sampled band. Binding 95 is the maximum relocated source and proves
-        // the now-infallible addition tops out at 223.
+        use crate::runtime::spirv_bind::{
+            FRAG_BUFFER_BINDING_OFFSET, FRAG_SAMPLED_RESOURCE_BINDING_OFFSET,
+            M2V_SAMPLER_BINDING_BASE, M2V_TEXTURE_BINDING_BASE, SAMPLED_TAIL_WIDEN_OFFSET,
+        };
+
+        // Minimal module: 5-word header + three OpDecorate Binding instructions
+        // in the TRANSLATOR's numbering, which is what a fresh translate hands
+        // over. One buffer, one texture, and the top of the translator's sampler
+        // band — the maximum source the widen has to carry.
+        const TOP_SAMPLER: u32 = M2V_SAMPLER_BINDING_BASE + 31;
         let decorate = |id: u32, binding: u32| vec![(4u32 << 16) | 71, id, 33, binding];
         let mut words: Vec<u32> = vec![0x0723_0203, 0x0001_0000, 0, 100, 0];
         words.extend(decorate(7, 3));
-        words.extend(decorate(8, 40));
-        words.extend(decorate(9, 95));
+        words.extend(decorate(8, M2V_TEXTURE_BINDING_BASE + 8));
+        words.extend(decorate(9, TOP_SAMPLER));
         let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let shader = synth_shader(Stage::Fragment, bytes);
-        assert_eq!(*shader.words, words);
 
-        // No flags → the base Arc, unrelocated.
+        // The stored module is the widened one: the sampler moved out of the
+        // texture band's way, the buffer and texture did not move at all.
+        let mut widened = words.clone();
+        let moved = crate::runtime::spirv_bind::widen_sampled_bands(&mut widened);
+        assert_eq!(moved, 1, "only the sampler band moves");
+        assert_eq!(*shader.words, widened);
+        assert_eq!(shader.words[8], 3);
+        assert_eq!(shader.words[12], M2V_TEXTURE_BINDING_BASE + 8);
+        assert_eq!(shader.words[16], TOP_SAMPLER + SAMPLED_TAIL_WIDEN_OFFSET);
+        // The bytes must not be allowed to disagree with the words.
+        let from_bytes: Vec<u32> = shader
+            .spirv
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(from_bytes, widened);
+
+        // No flags → the base Arc, un-relocated.
         let base = shader.fragment_words(false, false);
         assert!(Arc::ptr_eq(&base, &shader.words));
 
         // Both flags → sampled reloc first, then buffer band, matching the
         // historical per-draw mutation order.
-        let mut expect = words.clone();
+        let mut expect = widened.clone();
         let n = crate::runtime::spirv_bind::offset_fragment_sampled_resource_bindings(&mut expect);
         assert_eq!(n, 2);
         let n = crate::runtime::spirv_bind::offset_fragment_buffer_bindings(&mut expect);
         assert_eq!(n, 1);
         let both = shader.fragment_words(true, true);
         assert_eq!(*both, expect);
-        assert_eq!(
-            both[8],
-            3 + crate::runtime::spirv_bind::FRAG_BUFFER_BINDING_OFFSET
-        );
+        assert_eq!(both[8], 3 + FRAG_BUFFER_BINDING_OFFSET);
         assert_eq!(
             both[12],
-            40 + crate::runtime::spirv_bind::FRAG_SAMPLED_RESOURCE_BINDING_OFFSET
+            M2V_TEXTURE_BINDING_BASE + 8 + FRAG_SAMPLED_RESOURCE_BINDING_OFFSET
         );
         assert_eq!(
             both[16],
-            95 + crate::runtime::spirv_bind::FRAG_SAMPLED_RESOURCE_BINDING_OFFSET
+            TOP_SAMPLER + SAMPLED_TAIL_WIDEN_OFFSET + FRAG_SAMPLED_RESOURCE_BINDING_OFFSET
         );
-        assert_eq!(both[16], 223);
+        // Every relocated band stays clear of every un-relocated one.
+        assert!(both[8] > crate::runtime::spirv_bind::COLOR_INPUT_BINDING_BASE);
+        assert!(both[12] > both[8] && both[16] > both[12]);
 
         // Second call returns the cached variant (same allocation), and the
-        // base module is never mutated.
+        // stored (widened) module is never mutated by a relocation.
         let again = shader.fragment_words(true, true);
         assert!(Arc::ptr_eq(&both, &again));
-        assert_eq!(*shader.words, words);
+        assert_eq!(*shader.words, widened);
     }
 
     #[test]

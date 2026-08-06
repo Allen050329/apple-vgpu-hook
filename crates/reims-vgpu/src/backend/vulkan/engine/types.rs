@@ -354,10 +354,15 @@ pub struct DrawRequest {
 }
 
 /// Descriptor binding of the attachment-0 framebuffer-fetch input attachment.
-/// This is the metal2vulkan ColorInput band base (`dest_N` → `96+N`; only
-/// `dest_0` is supported — see `runtime::spirv_bind::COLOR_INPUT_BINDING_BASE`,
-/// kept equal by a unit test there). Both fragment relocations preserve it.
-pub const COLOR_INPUT_BINDING: u32 = 96;
+///
+/// This is the *device's* ColorInput band base, not the translator's: the band
+/// moved up when the texture band was widened to Metal's 128 entries
+/// (`runtime::spirv_bind::widen_sampled_bands` rewrites `dest_N` from the
+/// translator's `96+N` to `192+N`). Only `dest_0` is supported. Kept equal to
+/// `runtime::spirv_bind::COLOR_INPUT_BINDING_BASE` by a unit test there, because
+/// the two constants live on opposite sides of the runtime/engine layering.
+/// Both fragment relocations preserve it.
+pub const COLOR_INPUT_BINDING: u32 = 192;
 
 /// One MRT color attachment beyond the primary (slot 0). Persisted as its own
 /// registry resident so a later draw can sample it.

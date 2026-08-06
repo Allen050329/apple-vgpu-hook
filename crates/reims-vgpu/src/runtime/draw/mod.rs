@@ -131,40 +131,30 @@ pub const MAX_BUFFER_BIND_SLOTS: u32 = 31;
 /// A slot count, not a byte budget. Resource byte sizes follow the guest
 /// descriptor and page-table span; nothing here caps them.
 ///
-/// # The bound is the flat binding encoding, not a table
+/// # This is Apple's whole texture table, and nothing is refused below it
 ///
-/// The device names a bound resource by a single `u32` descriptor binding that
-/// packs class and index into bands 32 apart —
-/// [`crate::runtime::spirv_bind::TEXTURE_BINDING_BASE`] `= 32` and
-/// [`crate::runtime::spirv_bind::SAMPLER_BINDING_BASE`] `= 64`. So texture index
-/// 32 and sampler index 0 are both binding 64, and the *number* cannot say which
-/// is which. 32 is therefore the widest texture index this encoding can name.
+/// 128 is `reims_vgpu_wire::ops::bind_limit::TEXTURE` — the size of the argument
+/// table Apple's serializer truncates a plural texture bind at — so no texture
+/// bind an Apple guest can emit reaches this bound. A `const` assertion in
+/// [`crate::runtime::exec`] pins the two equal, and
+/// `render_texture_bind_slot_past_table` stays as the alarm for a stream that
+/// somehow does.
 ///
-/// On the Vulkan arm the numbering is not this crate's choice: `metal2vulkan`
-/// emits `OpDecorate Binding` at `TEXTURE_BINDING_BASE + N` with no clamp, so a
-/// module using texture 40 would decorate binding 72 — the same number it gives
-/// sampler 8. On the Metal arm the bands are this crate's own encoding, mirrored
-/// from an archived C backend header; nothing outside Rust reads them.
+/// It is also the width of the device's texture binding band, which is what used
+/// to make it 31. The device names a bound resource by one `u32` descriptor
+/// binding that packs class and index into bands, and `metal2vulkan` emits those
+/// bands 32 apart — so texture 40 and sampler 8 were both binding 72, and the
+/// *number* could not say which. Slots 32..127 were dropped for that reason
+/// alone.
 ///
-/// # What is still lost, and to what
-///
-/// Apple's texture table is 128 (`bind_limit::TEXTURE`), so indices 32..127
-/// remain unreachable and stay counted under
-/// `render_texture_bind_slot_past_table`. Recovering them is a re-band: every
-/// consumer keyed on the un-relocated `TEXTURE_BINDING_BASE + N` number moves
-/// with it (`storage_image_access`, `image_format`, `specialize_image_formats`,
-/// `reflected_sampled_kind`, `texture_shape_for_binding`, and the engine's
-/// descriptor writes). The class is recoverable twice over — a texture is an
-/// `OpTypeImage` and a sampler an `OpTypeSampler`, which
-/// `spirv_bind::variable_classes` already resolves, and the translator's own
-/// reflection carries `kind` and `metal_index` as separate fields — so what
-/// blocks it is the flat number, not missing information. Two things would make
-/// it affordable: the descriptor set layout is built from the bindings a draw
-/// actually provides rather than a dense table, so a wider *number* space costs
-/// no descriptors; and the relocation is cached per shader variant, so the
-/// classification is off the draw path. Nothing yet queries
-/// `maxPerStageDescriptorSampledImages`, which a widened band would need.
-pub const MAX_TEXTURE_BIND_SLOTS: u32 = 32;
+/// [`crate::runtime::spirv_bind::widen_sampled_bands`] removes it. The sampler
+/// and ColorInput bands move up out of the way once per shader, keyed on each
+/// variable's SPIR-V *type* rather than its number, leaving the texture band
+/// exactly 128 wide with the translator's own texture decorations already
+/// correct in it. So this constant is now the same fact twice — Apple's table
+/// and the band's width — and the `const` assertions beside
+/// `SAMPLER_BINDING_BASE` hold it to both.
+pub const MAX_TEXTURE_BIND_SLOTS: u32 = 128;
 
 /// Bind **index** cap for the sampler argument table.
 ///

@@ -2146,11 +2146,11 @@ fn a_plural_viewport_or_scissor_applies_one_and_counts_the_rest() {
 /// A bind past the table's last slot says how many slots it dropped, and
 /// which of the three tables lost them.
 ///
-/// Apple's serializer produces `setVertexTextures:withRange:` over a range
-/// of 40, and `MAX_TEXTURE_BIND_SLOTS` is 32 — the descriptor binding band's
-/// width, against a texture table whose real limit is 128. So the walk ends
-/// early on traffic a guest actually sends, and it used to end with a bare
-/// `break`.
+/// The counter no longer fires on anything Apple's serializer can write:
+/// `MAX_TEXTURE_BIND_SLOTS` is now 128, Apple's own table exactly. So the
+/// record here reaches past *that*, which only a guest writing its own stream
+/// can do — and the walk still has to say what it dropped rather than end with
+/// a bare `break`.
 /// The count is the argument for widening the tables, so it has to be the
 /// number of slots lost rather than one event — and it has to name the
 /// table, because the three do not lose the same thing. The sibling slugs
@@ -2160,7 +2160,8 @@ fn a_plural_viewport_or_scissor_applies_one_and_counts_the_rest() {
 fn a_bind_past_the_last_table_slot_reports_what_it_dropped() {
     use crate::runtime::drain::store_route_count;
 
-    const COUNT: u32 = 40;
+    // Past Apple's own table, which is the only way to reach this bound now.
+    const COUNT: u32 = MAX_TEXTURE_BIND_SLOTS + 9;
     let entry = render::REF_BIND_ENTRY_SIZE;
     let total = reims_vgpu_wire::OP_HEADER_LEN + render::BIND_ENTRIES + (COUNT as usize) * entry;
     let mut command = vec![0u8; total];
@@ -2182,7 +2183,7 @@ fn a_bind_past_the_last_table_slot_reports_what_it_dropped() {
 
     // The record itself must survive decode; a cap that refused it whole is
     // what this counter exists to distinguish from.
-    let c = render::decode(&command).expect("forty texture binds must decode");
+    let c = render::decode(&command).expect("an over-table texture run must decode");
     assert_eq!(c.ref_binds.len(), COUNT as usize);
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
@@ -2223,8 +2224,9 @@ fn a_bind_past_the_last_table_slot_reports_what_it_dropped() {
 /// gives the identical loss one — so the shape of the line is asserted here
 /// rather than left to whoever next reads the log.
 ///
-/// `apple_table` is the field that makes a reading actionable: 128 against a
-/// table of 32 says the serializer is entitled to emit what we dropped. And
+/// `apple_table` is the field that makes a reading actionable, and for textures
+/// it now reads equal to `table` — 128 against 128 — which is the line saying
+/// there is nothing left for an Apple guest to lose here. And
 /// `table=` is the *class's* own bound, so the two lines below carry different
 /// numbers for the same field — which is the point of splitting the constant.
 #[test]
@@ -2244,7 +2246,7 @@ fn a_bind_past_the_table_renders_a_fail_line_naming_the_table() {
     assert_eq!(
         line,
         "render_bind_overflow reason=render_texture_bind_slot_past_table \
-         stage=vertex index=32 slots=9 table=32 apple_table=128"
+         stage=vertex index=128 slots=9 table=128 apple_table=128"
     );
 
     // The slug is the class's, so a buffer drop cannot be mistaken for a
@@ -2324,6 +2326,81 @@ fn a_sampler_above_apples_table_but_inside_ours_still_binds() {
             .collect::<Vec<_>>(),
         vec![FIRST]
     );
+}
+
+/// A texture bind at an index past the old 32-wide band survives, and its
+/// descriptor binding is its own.
+///
+/// This is the slot class the device used to drop: Apple's serializer emits
+/// `setVertexTextures:withRange:` over ranges reaching 128, and everything from
+/// 32 up was refused because `metal2vulkan` numbers its bands 32 apart, so
+/// texture 68 and sampler 36 would have been one descriptor binding. Nothing
+/// about the *information* forced that — the SPIR-V type says which class a
+/// variable is — so `spirv_bind::widen_sampled_bands` moves the sampler band out
+/// of the way and the whole 128-entry table becomes reachable.
+///
+/// Asserted three ways, because each alone could pass while the slot is still
+/// lost: the accumulator keeps the bind, nothing is counted against the table,
+/// and the binding it will carry is below the sampler band rather than inside it.
+#[test]
+fn a_texture_bind_past_the_old_band_binds_and_keeps_its_own_descriptor() {
+    use crate::runtime::drain::store_route_count;
+    use crate::runtime::spirv_bind::{SAMPLER_BINDING_BASE, TEXTURE_BINDING_BASE};
+    use reims_vgpu_wire::ops::bind_limit;
+
+    // Past the old 32-wide band, inside Apple's table, and far enough in that
+    // the old numbering would have put it under a sampler.
+    const FIRST: u32 = 68;
+    const COUNT: u32 = 4;
+    const { assert!(FIRST >= 32 && FIRST + COUNT <= bind_limit::TEXTURE) };
+
+    let entry = render::REF_BIND_ENTRY_SIZE;
+    let total = reims_vgpu_wire::OP_HEADER_LEN + render::BIND_ENTRIES + (COUNT as usize) * entry;
+    let mut command = vec![0u8; total];
+    let op = wire_render::OPCODE_SET_VERTEX_TEXTURE;
+    st32(&mut command[0..], op);
+    st32(&mut command[4..], total as u32);
+    st32(
+        &mut command[reims_vgpu_wire::OP_HEADER_LEN + render::BIND_FIRST..],
+        FIRST,
+    );
+    st32(
+        &mut command[reims_vgpu_wire::OP_HEADER_LEN + render::BIND_COUNT..],
+        COUNT,
+    );
+    for i in 0..COUNT as usize {
+        let at = reims_vgpu_wire::OP_HEADER_LEN + render::BIND_ENTRIES + i * entry;
+        st32(&mut command[at..], 0x9000 + i as u32);
+    }
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let host = FakeHost::new();
+    let mut out = ExecResult::default();
+    let mut acc = StreamAccum::default();
+    let before = store_route_count(BindClass::Texture.past_table_route());
+    handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
+
+    assert_eq!(
+        acc.vertex_textures
+            .iter()
+            .map(|t| t.index)
+            .collect::<Vec<_>>(),
+        (FIRST..FIRST + COUNT).collect::<Vec<_>>(),
+        "every slot of a run past the old band must bind"
+    );
+    assert_eq!(
+        store_route_count(BindClass::Texture.past_table_route()),
+        before,
+        "and none of them may be counted as lost"
+    );
+    // Each one's descriptor binding stays inside the texture band, so no
+    // sampler can be reached by the same number.
+    for index in FIRST..FIRST + COUNT {
+        assert!(
+            TEXTURE_BINDING_BASE + index < SAMPLER_BINDING_BASE,
+            "texture {index} must not carry a sampler's binding"
+        );
+    }
 }
 
 /// The last slot of the texture band binds, and the same index in the buffer
