@@ -4587,3 +4587,90 @@ fn every_short_control_packet_names_itself() {
         );
     }
 }
+
+/// A wrapper packet dispatches on the low half of its first payload word, and
+/// the fact that it did is on the record.
+///
+/// The arm arrived with the initial import carrying no test and no doc, and it
+/// decides which handler every wrapped guest command reaches. These pin the
+/// behaviour as it is — deliberately, because which of the two readings of that
+/// word is right is not established (see `wrapper_inner_opcode`), and a test
+/// that asserted a *changed* behaviour would be asserting the guess.
+#[test]
+fn a_wrapper_dispatches_on_the_low_half_of_its_first_word() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    state.define_task(3, 0x1000, 2);
+
+    // The wrapped command is DeleteTask, whose payload is the task id. The
+    // opcode word and the id share the payload the way the handlers read it.
+    let mut payload = u32::from(ROOT_OP_DELETE_TASK).to_le_bytes().to_vec();
+    payload.extend_from_slice(&3u32.to_le_bytes());
+    process_root_packet(
+        &mut state,
+        &mut host,
+        &Packet {
+            opcode: ROOT_OP_WRAPPER,
+            stamp_count: 0,
+            total_size: PACKET_HEADER_LEN + 8,
+            completion_stamp: 0,
+            payload,
+            next_head: 0,
+        },
+    );
+
+    assert!(
+        !state
+            .fails
+            .iter()
+            .any(|e| matches!(e, FailEvent::UnknownRootOpcode { .. })),
+        "the wrapper's inner opcode must reach a handler, not the catch-all"
+    );
+}
+
+/// An upper half that is not zero is reported rather than assumed away.
+///
+/// Whichever reading is right, a firing is the interesting case: a nested packet
+/// header would put a stamp count there, and a 32-bit opcode would mean this
+/// device just dispatched the wrong command. Either way the low half is still
+/// what runs — refusing would break a guest that really is sending a nested
+/// header, and there is no reading yet that says which.
+#[test]
+fn a_wrapper_with_a_set_upper_half_still_dispatches_and_says_so() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    state.define_task(3, 0x1000, 2);
+
+    // Upper half 0x0007 — a plausible stamp count under the nested-header
+    // reading, and a nonsense opcode under the 32-bit one.
+    let word = (7u32 << 16) | u32::from(ROOT_OP_DELETE_TASK);
+    let mut payload = word.to_le_bytes().to_vec();
+    payload.extend_from_slice(&3u32.to_le_bytes());
+    process_root_packet(
+        &mut state,
+        &mut host,
+        &Packet {
+            opcode: ROOT_OP_WRAPPER,
+            stamp_count: 0,
+            total_size: PACKET_HEADER_LEN + 8,
+            completion_stamp: 0,
+            payload,
+            next_head: 0,
+        },
+    );
+
+    assert!(
+        !state
+            .fails
+            .iter()
+            .any(|e| matches!(e, FailEvent::UnknownRootOpcode { .. })),
+        "the low half still selects the handler"
+    );
+
+    // The emission itself is exercised by running this path — it renders through
+    // `Emit::decline`, whose slug is covered by `decline_slugs_are_unique`. It is
+    // deliberately not asserted from the fail log here: that file is
+    // process-global and every test in this binary appends to it, so a read is
+    // only meaningful with a distinguishing field and an `rfind`, and it is a
+    // weaker check than the dispatch assertion above.
+}

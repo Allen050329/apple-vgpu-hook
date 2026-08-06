@@ -1121,6 +1121,89 @@ fn reply_heap_texture_size_and_align<H: HostMemory + HostOps>(
     true
 }
 
+/// The opcode a `ROOT_OP_WRAPPER` packet carries in its first payload word.
+///
+/// # What is established, and what is not
+///
+/// **Established:** the framing opcode is a `u16` at `PACKET_OPCODE` with
+/// `PACKET_STAMP_COUNT` immediately after it at `+0x02`, so the header's own
+/// opcode field is 16 bits wide.
+///
+/// **Not established:** whether this payload word is one 32-bit opcode or a
+/// nested copy of that 16-bit header. The two readings disagree about the upper
+/// half — a nested header would put a stamp count there, which must be
+/// discarded, while a 32-bit opcode with a high bit set would be an opcode this
+/// device is silently renaming. Nothing in the tree settles it: the arm has no
+/// test, no doc, and arrived with the initial import.
+///
+/// A third reading is possible and makes the first two harder to believe. The
+/// handlers below read `packet.payload` from offset 0, and
+/// `DEVICE_INFO_TAHOE_KEY_TABLE_LEN` *is* 0 — so on a wrapped device-info packet
+/// this word would be read twice, once as the opcode and once as the guest's
+/// key-table length. Those cannot both be right for the same bytes.
+///
+/// So the low half is taken, which is what this device has always done, and the
+/// upper half is **reported rather than assumed**. Refusing on a non-zero upper
+/// half would break a guest that really is sending a nested header, and reading
+/// it as part of the opcode would break the other case; a reading is what
+/// decides which, and there is no reading — `unknown_root_opcode` appears in no
+/// archived boot log, so this arm's firing rate is unmeasured rather than known
+/// to be zero.
+///
+/// `fail_once` is keyed on the whole word, so a wrapper that carries the same
+/// inner opcode every time says so once.
+fn wrapper_inner_opcode(packet: &Packet) -> u16 {
+    let word = ld32(&packet.payload[0..]);
+    let low = word as u16;
+    if word >> 16 != 0 {
+        crate::observe::Emit::decline(
+            "root_wrapper_upper_half",
+            &WrapperUpperHalf {
+                word,
+                dispatched: low,
+            },
+        )
+        .field("payload_len", packet.payload.len())
+        .field("total_size", packet.total_size)
+        .fail_once(u64::from(word));
+    } else {
+        crate::observe::off(format!(
+            "root_wrapper inner=0x{low:04x} payload_len={} total_size={}",
+            packet.payload.len(),
+            packet.total_size
+        ));
+    }
+    low
+}
+
+/// A wrapper packet whose first payload word does not fit the opcode this
+/// device dispatches on.
+///
+/// A healthy-zero alarm on purpose: whichever of the two readings in
+/// [`wrapper_inner_opcode`] is right, a firing is the interesting case. If the
+/// word is a nested packet header then the upper half is a stamp count and this
+/// names the first guest seen to use one; if it is a 32-bit opcode then this
+/// device just dispatched the wrong command.
+#[derive(Debug, Clone, Copy)]
+struct WrapperUpperHalf {
+    word: u32,
+    dispatched: u16,
+}
+
+impl crate::observe::Decline for WrapperUpperHalf {
+    fn slug(&self) -> &'static str {
+        "root_wrapper_upper_half_set"
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("word", format!("0x{:08x}", self.word)),
+            ("dispatched", format!("0x{:04x}", self.dispatched)),
+            ("discarded", format!("0x{:04x}", self.word >> 16)),
+        ]
+    }
+}
+
 fn process_root_packet<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut H,
@@ -1129,7 +1212,7 @@ fn process_root_packet<H: HostMemory + HostOps>(
     let op = packet.opcode;
     let effective = if op == ROOT_OP_WRAPPER {
         if packet.payload.len() >= 4 {
-            ld32(&packet.payload[0..]) as u16
+            wrapper_inner_opcode(packet)
         } else {
             op
         }
