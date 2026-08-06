@@ -495,8 +495,59 @@ pub trait HostOps {
     /// True if `gpa` is guest RAM (not MMIO / ROM / unmapped). Product QEMU
     /// implements via `address_space_translate` + `memory_region_is_ram`.
     /// Default: true (fixtures / NullHost without a RAM map).
+    ///
+    /// **Answers for one address.** A caller holding a span must ask
+    /// [`HostOps::first_non_ram_page`] instead — see the sampling trap recorded
+    /// there.
     fn is_ram_gpa(&self, _gpa: u64) -> bool {
         true
+    }
+
+    /// The first page of `[gpa, gpa + len)` that is not guest RAM, or `None`
+    /// when every page of it is.
+    ///
+    /// # Two endpoints are not a span
+    ///
+    /// [`HostOps::is_ram_gpa`] answers about a single address, and a caller that
+    /// wants to know whether a *range* is readable has to ask about every page
+    /// of it. Testing the first and last byte reads as thorough and is not: a
+    /// guest-physical range is a walk through whatever regions the machine
+    /// happens to lay out, and one non-RAM page anywhere between two RAM
+    /// endpoints is enough for `read_gpa` to refuse. The EFI console capture
+    /// held exactly that shape — two `is_ram_gpa` calls vouching for an 8 MB
+    /// framebuffer span — and a driven x86 boot refused a row 375 rows into it,
+    /// after 375 completed reads, with the endpoints both answering RAM.
+    ///
+    /// Returning the offending page rather than a `bool` is what lets a refusal
+    /// name it. A caller that only needs the verdict tests `.is_none()`.
+    ///
+    /// Walks at `page_size` because that is the granularity every other RAM
+    /// check in this crate uses (`map_pages` checks its page list the same way),
+    /// and because a memory region finer than a guest page cannot back a
+    /// mapping this device would read through. Short-circuits on the first
+    /// failure, so the common "this door is shut" case costs one call and not
+    /// one per page.
+    fn first_non_ram_page(&self, gpa: u64, len: u64, page_size: usize) -> Option<u64> {
+        if len == 0 || page_size == 0 {
+            return None;
+        }
+        let step = page_size as u64;
+        let last = gpa.saturating_add(len - 1);
+        // Modulo rather than a `!(step - 1)` mask: nothing here requires
+        // `page_size` to be a power of two, and a caller that passed one that
+        // is not would get a silently wrong base from the mask.
+        let last_page = last - (last % step);
+        let mut page = gpa - (gpa % step);
+        while page <= last_page {
+            if !self.is_ram_gpa(page) {
+                return Some(page);
+            }
+            // An overflow here means the walk reached the top of the address
+            // space with every page so far answering RAM, so `None` — no
+            // offending page — is the right answer and not a lost check.
+            page = page.checked_add(step)?;
+        }
+        None
     }
 
     /// Ask the host to observe writes this device does not make to `gpas`.
@@ -1507,6 +1558,75 @@ pub fn read_u32<M: HostMemory>(mem: &M, gpa: u64) -> Result<u32, MemError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A span walk finds a hole its two endpoints cannot see.
+    ///
+    /// This is the whole reason [`HostOps::first_non_ram_page`] exists rather
+    /// than two [`HostOps::is_ram_gpa`] calls at the caller, and it is the shape
+    /// a driven boot hit: both ends of the EFI console framebuffer answered RAM
+    /// and a page 375 rows in did not.
+    #[test]
+    fn a_ram_span_with_an_interior_hole_is_not_vouched_for_by_its_endpoints() {
+        const PAGE: usize = 4096;
+        let base = 0x8000_0000u64;
+        let len = 64 * PAGE as u64;
+        let hole = base + 37 * PAGE as u64;
+
+        let mut host = FakeHost::new();
+        host.mark_non_ram(hole, PAGE as u64);
+
+        assert!(
+            host.is_ram_gpa(base) && host.is_ram_gpa(base + len - 1),
+            "the fixture must reproduce the trap: both endpoints answer RAM"
+        );
+        assert_eq!(
+            host.first_non_ram_page(base, len, PAGE),
+            Some(hole),
+            "the walk must find the interior page and name it"
+        );
+        assert_eq!(
+            host.first_non_ram_page(base, 37 * PAGE as u64, PAGE),
+            None,
+            "a span stopping short of the hole is entirely RAM"
+        );
+    }
+
+    /// The walk covers the page holding the last byte, and an unaligned base
+    /// does not shift the grid.
+    ///
+    /// A span ending one byte into a page still depends on that page, so an
+    /// off-by-one that stopped at the previous one would vouch for bytes it
+    /// never asked about.
+    #[test]
+    fn a_span_walk_covers_the_page_its_last_byte_falls_in() {
+        const PAGE: usize = 4096;
+        let base = 0x1_0000u64;
+        let mut host = FakeHost::new();
+        host.mark_non_ram(base + 2 * PAGE as u64, PAGE as u64);
+
+        assert_eq!(
+            host.first_non_ram_page(base, 2 * PAGE as u64 + 1, PAGE),
+            Some(base + 2 * PAGE as u64),
+            "one byte into the third page still needs the third page"
+        );
+        assert_eq!(
+            host.first_non_ram_page(base, 2 * PAGE as u64, PAGE),
+            None,
+            "stopping at the page boundary does not reach it"
+        );
+        assert_eq!(
+            host.first_non_ram_page(base + 8, 2 * PAGE as u64, PAGE),
+            Some(base + 2 * PAGE as u64),
+            "an unaligned base is floored to its own page and the span still \
+             ends where its last byte lands, so the same length now reaches one \
+             page further"
+        );
+        assert_eq!(
+            host.first_non_ram_page(base, 0, PAGE),
+            None,
+            "an empty span asks about nothing"
+        );
+    }
 
     /// The ABI header's action table agrees with [`HostActionKind`], and still
     /// leaves 7 retired.

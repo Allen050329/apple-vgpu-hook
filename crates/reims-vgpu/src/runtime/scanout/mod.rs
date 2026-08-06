@@ -624,13 +624,22 @@ pub fn paint_efi_console<M: HostMemory + crate::runtime::host::HostOps>(
     // attempt, repeated on the ~30 Hz early-console cadence. It also put a
     // `mem_qemu_read_gpa_callback_failed` line on the always-on fail channel,
     // where it read as a device fault rather than as the first of two doors
-    // being shut. Both halves of the span are checked because the observed
-    // failure was a *crossing* — the base was readable and the far end was not.
-    let last_row = (efi_h.saturating_sub(1) as u64).saturating_mul(stride as u64);
-    let span_end = fb
-        .saturating_add(last_row)
-        .saturating_add((row_bytes as u64).saturating_sub(1));
-    if !host.is_ram_gpa(fb) || !host.is_ram_gpa(span_end) {
+    // being shut.
+    //
+    // The pre-flight used to be two `is_ram_gpa` calls, on the span's first and
+    // last byte, and that is a two-point sample of eight megabytes rather than a
+    // check of it. A driven x86 boot refused a read 375 rows in — `address=
+    // 0x802bf200 len=7680`, exactly `fb + 375 * stride` — with both endpoints
+    // answering RAM, which is the sampled bound doing precisely what it looks
+    // like it cannot. `first_non_ram_page` walks every page and short-circuits,
+    // so the usual shut door still costs one call.
+    let span_len = (efi_h.saturating_sub(1) as u64)
+        .saturating_mul(stride as u64)
+        .saturating_add(row_bytes as u64);
+    if host
+        .first_non_ram_page(fb, span_len, 1usize << state.page_shift)
+        .is_some()
+    {
         return false;
     }
     for y in 0..efi_h {
@@ -639,14 +648,44 @@ pub fn paint_efi_console<M: HostMemory + crate::runtime::host::HostOps>(
         if dst_off + row_bytes > dst.len() {
             return false;
         }
-        if host
-            .read_gpa(gpa, &mut dst[dst_off..dst_off + row_bytes])
-            .is_err()
-        {
+        if let Err(error) = host.read_gpa(gpa, &mut dst[dst_off..dst_off + row_bytes]) {
+            // Every page of this row answered RAM a moment ago and the read
+            // refused anyway, so the two host doors disagree about the same
+            // bytes. A healthy zero: the pre-flight above is the whole reason
+            // this arm should be unreachable, and a firing says it is not — the
+            // walk is sampling something the read does not ask, or the layout
+            // moved between the two.
+            crate::observe::Emit::decline("console_efi_row", &ConsoleEfiRowRefused { row: y })
+                .field("gpa", format!("{gpa:#x}"))
+                .field("row_bytes", row_bytes)
+                .field("fb", format!("{fb:#x}"))
+                .field("error", format!("{error:?}"))
+                .fail_once(u64::from(y));
             return false;
         }
     }
     true
+}
+
+/// A console row whose pages the RAM walk vouched for and whose read refused.
+///
+/// Named rather than folded into the `mem_qemu_read_gpa_callback_failed` line
+/// the adapter already emits, because those two say different things: the
+/// adapter's line reports that a host callback said no, and this one reports
+/// that it contradicted the host callback consulted immediately before it.
+#[derive(Debug, Clone, Copy)]
+struct ConsoleEfiRowRefused {
+    row: u32,
+}
+
+impl crate::observe::Decline for ConsoleEfiRowRefused {
+    fn slug(&self) -> &'static str {
+        "console_efi_row_vouched_then_refused"
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        vec![("row", self.row.to_string())]
+    }
 }
 
 /// Why a console capture paint produced no pixels.

@@ -1324,3 +1324,50 @@ fn the_efi_console_paint_refuses_a_bar_backed_framebuffer_and_accepts_a_ram_one(
          path exists for, and must still paint"
     );
 }
+
+/// A framebuffer span with one non-RAM page in the middle is refused, even
+/// though both of its endpoints are RAM.
+///
+/// The pre-flight used to be two `is_ram_gpa` calls on the span's first and
+/// last byte, which is a two-point sample of eight megabytes. A driven x86 boot
+/// refused a row read 375 rows into the span with both endpoints answering RAM
+/// — `address=0x802bf200 len=7680`, exactly `fb + 375 * stride`.
+///
+/// The fixture discriminates because `FakeHost::read_gpa` serves any mapped
+/// range and consults `non_ram` not at all: under the endpoint pre-flight this
+/// paint *succeeds*, returning a frame with a row read out of a region the host
+/// says is not memory.
+#[test]
+fn the_efi_console_paint_refuses_a_span_whose_hole_is_not_at_either_end() {
+    let w = crate::model::EFI_BOOT_WIDTH;
+    let h = crate::model::EFI_BOOT_HEIGHT;
+    let stride = w * RGBA8_BPP;
+    let fb = 0x8000_0000u64;
+    let span = (h as u64) * (stride as u64);
+    let page = 1u64 << crate::model::PAGE_SHIFT_X86;
+
+    use crate::runtime::host::HostOps;
+
+    let mut state = DeviceState::new(DeviceId(1), crate::model::PAGE_SHIFT_X86);
+    state.gfx.efi_fb_start = fb;
+    state.gfx.efi_fb_stride = stride;
+
+    let mut host = FakeHost::new();
+    host.map_range(fb, span as usize, 0);
+    // The row the live boot refused, floored to its page. Deliberately neither
+    // the first nor the last page of the span.
+    let hole = (fb + 375 * stride as u64) / page * page;
+    host.mark_non_ram(hole, page);
+
+    assert!(
+        host.is_ram_gpa(fb) && host.is_ram_gpa(fb + span - 1),
+        "the fixture must reproduce the trap: both endpoints answer RAM"
+    );
+
+    let mut dst = vec![0u8; (stride as usize) * (h as usize)];
+    assert!(
+        !paint_efi_console(&state, &host, &mut dst, stride, w, h),
+        "a span with an interior non-RAM page must be refused before any row is \
+         read, not vouched for by its two endpoints"
+    );
+}
