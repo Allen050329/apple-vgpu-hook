@@ -2272,3 +2272,157 @@ fn copy_region_io_enrichment_dedups_per_page_and_direction() {
         shift
     ));
 }
+
+/// The copy path and the draw/sample path follow a type-8 view chain exactly
+/// as deep as each other.
+///
+/// Two arms consume this one wire form: `resolve_texture_backing_depth` here,
+/// and `runtime::draw::resolve_texture_view_reasoned` for sampling. They used
+/// to disagree — this one stopped after five hops on a number its own comment
+/// called "not a contract limit", the other after the contract's eight — so a
+/// guest chain of six sampled correctly and had its copy dropped as
+/// `tex_view_depth_cap`. Nothing about a copy justifies seeing a shallower
+/// chain than a sample does.
+///
+/// So the assertion is a comparison, not a threshold: both arms are driven at
+/// the deepest chain the contract admits and both must take it. A test that
+/// only pinned this arm at eight would pass again the moment the other one
+/// moved, which is the failure that produced the divergence in the first place.
+///
+/// The chain runs `MAX_TEXTURE_VIEW_CHAIN` views down to a type-11 base, each
+/// view a plain identity hop, so the only thing that can refuse it is depth.
+#[test]
+fn a_copy_follows_a_view_chain_as_deep_as_a_sample_does() {
+    use crate::runtime::draw::{resolve_texture_view_reasoned, MAX_TEXTURE_VIEW_CHAIN};
+
+    let (mut host, mut state) = blit_device();
+    install_buffer(&mut host, &mut state, 1, 1, 256);
+    let mapping_id = 9u32;
+    install_type11(&mut host, &mut state, 3, mapping_id, 0x20);
+
+    // Views live at refs `outermost` down to `base_view`, each viewing the next
+    // lower ref; the lowest views the type-11 at ref 3. The object list holds
+    // 16 entries, so the deepest legal chain has to fit under that.
+    let base_view = 4u32;
+    let outermost = base_view + MAX_TEXTURE_VIEW_CHAIN as u32 - 1;
+    assert!(outermost < 16, "the chain must fit the test object list");
+    for view_ref in base_view..=outermost {
+        let target = if view_ref == base_view {
+            3
+        } else {
+            view_ref - 1
+        };
+        install_type8_view(
+            &mut host,
+            &mut state,
+            view_ref,
+            target,
+            MTL_FORMAT_BGRA8_UNORM,
+            0,
+            None,
+        );
+    }
+
+    // The sample arm resolves the whole chain to the non-view base.
+    let resolved = resolve_texture_view_reasoned(&state, &host, 1, outermost)
+        .expect("the sample arm follows the contract's deepest chain");
+    assert_eq!(
+        resolved.base_texture_ref, 3,
+        "the sample arm must land on the type-11 base, not stop inside the chain"
+    );
+
+    // The copy arm must reach the same base, and land real pixels through it.
+    let pat = [0xaau8, 0xbb, 0xcc, 0xdd, 0x11, 0x22, 0x33, 0x44];
+    let src_gva = 1u64 << RESOURCE_PAGE_SHIFT;
+    write_task_gva_arm64e(&mut host, &state.tasks[1], src_gva, &pat);
+    let mut cmd = copy_cmd(CopyKind::BufferToTexture, 1, outermost);
+    cmd.source_offset = 0;
+    cmd.source_bytes_per_row = 8;
+    cmd.source_size = Size {
+        width: 2,
+        height: 1,
+        depth: 1,
+    };
+    assert_eq!(
+        execute_blit(&mut state, &mut host, 1, &cmd),
+        BlitStatus::Ok,
+        "the copy arm refused a chain the sample arm just followed"
+    );
+    let mut back = [0u8; 8];
+    assert!(mapping_write::read_rect_raw(
+        &mut state,
+        &mut host,
+        mapping_id,
+        mapping_write::Rect {
+            origin_x: 0,
+            origin_y: 0,
+            width: 2,
+            height: 1
+        },
+        &mut back,
+        8
+    ));
+    assert_eq!(
+        back, pat,
+        "the copy resolved to a base, but not the one holding the pixels"
+    );
+}
+
+/// ...and both refuse the same chain one hop past the contract.
+///
+/// The companion to the test above, and it is not redundant with it. Agreement
+/// has two edges, and pinning only the accepting one invites the divergence
+/// back from the other side: dropping this arm's bound entirely would make the
+/// deep-chain test pass while a chain the sample arm refuses became a copy this
+/// one silently followed. A guest chain is guest-built and may be cyclic, so
+/// "follows further than the contract" is not a generosity, it is a walk with
+/// no stop condition the other arm shares.
+///
+/// One hop past `MAX_TEXTURE_VIEW_CHAIN`, both arms must decline.
+#[test]
+fn a_copy_refuses_a_view_chain_the_sample_arm_also_refuses() {
+    use crate::runtime::draw::{resolve_texture_view_reasoned, MAX_TEXTURE_VIEW_CHAIN};
+
+    let (mut host, mut state) = blit_device();
+    install_buffer(&mut host, &mut state, 1, 1, 256);
+    install_type11(&mut host, &mut state, 3, 9, 0x20);
+
+    let base_view = 4u32;
+    let outermost = base_view + MAX_TEXTURE_VIEW_CHAIN as u32; // one view too many
+    assert!(outermost < 16, "the chain must fit the test object list");
+    for view_ref in base_view..=outermost {
+        let target = if view_ref == base_view {
+            3
+        } else {
+            view_ref - 1
+        };
+        install_type8_view(
+            &mut host,
+            &mut state,
+            view_ref,
+            target,
+            MTL_FORMAT_BGRA8_UNORM,
+            0,
+            None,
+        );
+    }
+
+    assert!(
+        resolve_texture_view_reasoned(&state, &host, 1, outermost).is_err(),
+        "the sample arm must refuse a chain past the contract depth"
+    );
+
+    let mut cmd = copy_cmd(CopyKind::BufferToTexture, 1, outermost);
+    cmd.source_offset = 0;
+    cmd.source_bytes_per_row = 8;
+    cmd.source_size = Size {
+        width: 2,
+        height: 1,
+        depth: 1,
+    };
+    assert_eq!(
+        execute_blit(&mut state, &mut host, 1, &cmd),
+        BlitStatus::Unsupported,
+        "the copy arm followed a chain the sample arm refused"
+    );
+}

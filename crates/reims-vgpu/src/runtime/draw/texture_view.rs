@@ -173,7 +173,24 @@ impl std::error::Error for TextureViewDecline {}
 
 /// Archive `REIMS_VGPU_RESOURCE_RESOLVE_MAX_VIEW_CHAIN` — nested type-8 views collapse
 /// to a non-view base (`apple_pv_gpu_resource_resolve_texture` chain walk).
-const MAX_TEXTURE_VIEW_CHAIN: usize = 8;
+///
+/// This is the decoded contract's own bound, not a budget of ours: a chain that
+/// needs a ninth hop is one the guest's own resolver would not have followed
+/// either, so refusing it is fidelity rather than a shortfall. That makes it the
+/// number **every** arm that walks a type-8 chain must use, and it is `pub(crate)`
+/// for exactly that reason. Two arms walk one: this module's
+/// [`resolve_texture_view_reasoned`] for the draw/sample path, and
+/// `blit_exec::resolve_texture_backing_depth` for copies. They used to disagree —
+/// blit stopped at five hops on a number its own comment called "not a contract
+/// limit" — so a six-deep chain sampled correctly and had its blit dropped as
+/// `tex_view_depth_cap`. Both now count hops against this constant.
+///
+/// It is also what terminates a guest-built cycle. `A views B views A` is
+/// expressible and neither walk carries a visited set; the chain simply runs out
+/// of hops and refuses visibly. A cycle is malformed, so a refusal is the right
+/// answer — the bound only has to stop the recursion, and the contract's own
+/// depth already does.
+pub(crate) const MAX_TEXTURE_VIEW_CHAIN: usize = 8;
 
 /// Report a slice range the render path decodes and does not apply.
 ///
