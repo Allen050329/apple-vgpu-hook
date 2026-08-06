@@ -954,6 +954,35 @@ pub fn retire_resident_storage_content(identity: &crate::model::ComputeStorageRe
     guard.pools.note_compute_storage_content_retired(identity);
 }
 
+/// A synchronous compute writeback landed this resident's output in the guest's
+/// own pages, so the image has stopped being the only place that output exists
+/// and the reclaim paths may take it.
+///
+/// The deferred rail already had this edge — `read_resident_storage` clears the
+/// flag when its flush lands — but the **synchronous** rail did not, and it is
+/// the common one. `mark_resident_storage_image` sets `gpu_only_content` after
+/// every executed dispatch, and on this rail nothing ever cleared it again: the
+/// bytes were read back, handed to `writeback_texture` and written to guest
+/// pages, and the resident stayed flagged as unreproducible for the life of the
+/// guest.
+///
+/// Every reclaim path refuses a sole copy — the idle drain, and
+/// `reclaim_compute_storage_for_allocation_retry` — so those residents were
+/// unreclaimable by anything. The registry only grew, and an allocation failure
+/// found nothing to give back at the one moment it needed something. That is
+/// the shape of the leak `retire_resident_storage_content` was written to stop
+/// for a *dead* cache entry, arriving instead through the live path.
+///
+/// Called after the writeback rather than after the readback, which is the
+/// stricter of the two and deliberately so: the readback only moves the bytes
+/// into a host `Vec`, and it is `writeback_texture` returning `Ok` that says a
+/// later reader can find them. Clearing at the readback would open a window
+/// where a reclaim takes a resident whose output reached nowhere.
+pub fn note_resident_storage_copied_out(identity: &crate::model::ComputeStorageResidencyKey) {
+    let mut guard = lock_engine();
+    guard.pools.note_compute_storage_copied_out(identity);
+}
+
 /// True when the device supports format-less storage-image writes
 /// (`shaderStorageImageWriteWithoutFormat`). The compute path needs this to
 /// composite a guest `BGRA8Unorm` storage surface into a `B8G8R8A8_UNORM` view

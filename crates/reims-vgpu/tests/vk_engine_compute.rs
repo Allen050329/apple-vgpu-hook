@@ -565,6 +565,100 @@ fn compute_storage_image_rgba8unorm_known_result() {
     assert_eq!(reset.storage_images, 1, "resident image is guest state");
 }
 
+/// The compute-storage registry retains every admitted resident past the slot
+/// count that used to bound it.
+///
+/// A device-level regression test for the property that retired
+/// `COMPUTE_STORAGE_REGISTRY_CAP = 64`: that population is bounded by the
+/// allocation refusing, not by a count, so admitting more identities than the old
+/// count allowed must destroy none of them. This registry's losses were the worse
+/// of the two — nothing recreates a compute-storage resident's contents, so one
+/// taken here costs a refused dispatch rather than a re-upload.
+///
+/// The observable is `compute_storage_seed_uploads`. A dispatch whose
+/// `seed_generation` matches the resident's `output_generation` skips the seed
+/// upload entirely; a dispatch that finds no resident must upload. So a zero here
+/// on the *first* identity admitted — the one an LRU sweep takes first — is the
+/// resident still being there after 79 later admissions.
+///
+/// Fails against the retired walk: the sweep starts at 64 admissions and the
+/// first identity is its first victim, so the re-dispatch uploads its seed.
+#[test]
+fn every_admitted_compute_storage_resident_survives_past_the_retired_slot_cap() {
+    let _g = engine_test_session();
+    let spvasm = &storage_image_write_red_kernel("Rgba8");
+    let Some(words) = assemble_spvasm(spvasm, "simg_retain") else {
+        return;
+    };
+    let (w, h) = (4u32, 4u32);
+    let seed = vec![0u8; (w * h * 4) as usize];
+    // 64 was the last value that count held, and it swept on *admission*, so 80
+    // clears it with margin. At 4x4 the whole set is a few hundred KiB, so no
+    // real allocation failure is in play and the only thing that could remove one
+    // of these is a count.
+    const ADMITS: u32 = 80;
+    let identity = |i: u32| ComputeStorageResidencyKey {
+        mapping_id: 0x900 + i,
+        map_generation: 3,
+        surface_offset: 0,
+        surface_bpr: w * 4,
+        span_end: (w * h * 4) as u64,
+        width: w,
+        height: h,
+        pixel_format: 0x46,
+        texture_ref: 0,
+    };
+    let request = |i: u32, seed_generation: u32| ComputeRequest {
+        spirv: words.clone(),
+        entry: "main".into(),
+        grid: [w, h, 1],
+        storage_buffers: vec![],
+        sampled_images: vec![],
+        samplers: vec![],
+        storage_images: vec![ComputeStorageImageResource {
+            binding: 0,
+            format: StorageImageFormat::Rgba8Unorm,
+            width: w,
+            height: h,
+            bytes: seed.clone(),
+            residency: Some(ComputeStorageResidency {
+                identity: identity(i),
+                seed_generation,
+                output_generation: 2,
+            }),
+            seed_skipped: false,
+            defer_readback: false,
+        }],
+    };
+
+    if engine_or_skip("compute_storage_retention", &request(0, 1)).is_none() {
+        return;
+    }
+    // The runtime takes this edge after `writeback_texture` lands the output in
+    // the guest's pages; this suite drives the engine directly, so it takes it
+    // here. Without it every resident stays flagged as the only copy of its
+    // contents, no reclaim path may select one, and the assertions below hold
+    // against *any* policy — including a slot count — which is exactly the
+    // vacuous pass this call removes.
+    engine::note_resident_storage_copied_out(&identity(0));
+    for i in 1..ADMITS {
+        engine::execute_compute_request(&request(i, 1)).expect("filler dispatch");
+        engine::note_resident_storage_copied_out(&identity(i));
+    }
+
+    // Every one of them, oldest first. The first assertion alone would pass a
+    // sweep that happened to spare the identity it was asked about.
+    for i in 0..ADMITS {
+        engine::reset_draw_counters();
+        engine::execute_compute_request(&request(i, 2)).expect("resident re-dispatch");
+        assert_eq!(
+            engine::counter_snapshot().compute_storage_seed_uploads,
+            0,
+            "resident {i} was destroyed by something other than an allocation failure"
+        );
+    }
+}
+
 /// Regression lock for the BGRA storage-composite R/B fix: a guest `BGRA8Unorm`
 /// storage surface composites through a format-less (`Unknown`) SPIR-V storage
 /// image viewed `B8G8R8A8_UNORM`, so a shader that writes logical red `(1,0,0,1)`

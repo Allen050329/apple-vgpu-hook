@@ -3989,6 +3989,14 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
         if let Err(e) = writeback_texture(state, host, task_id, t) {
             return e;
         }
+        // The output is in the guest's pages now, so the engine's image has
+        // stopped being the only copy and the reclaim paths may take it. The
+        // deferred branch above reaches the same edge through its own flush;
+        // without this one a synchronously-written resident stayed flagged
+        // unreproducible forever and no reclaim could ever touch it.
+        if let Some(candidate) = t.residency {
+            crate::backend::vulkan::engine::note_resident_storage_copied_out(&candidate.key);
+        }
         note_storage_residency_writeback(state, t);
     }
 
