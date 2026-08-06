@@ -1312,8 +1312,45 @@ pub(crate) const IDLE_TARGET_AGE_MS: u64 = 2000;
 /// closing it. And a peak of 261 against a cap of 320 leaves 59 slots where
 /// there were 140, so a heavier workload reaches `REGISTRY_CAP` sooner than it
 /// used to and starts paying cap evictions instead — a different terminal
-/// destroy. `evicts` staying 0 is what says that has not happened yet, and it is
-/// the reading to check before raising this floor.
+/// destroy. `evicts` staying 0 is what says that has not happened yet.
+///
+/// # Re-measured in device bytes, this gate should be reverted
+///
+/// **Every `peak_mib` figure above is the wrong quantity.** It is an attachment
+/// footprint computed from geometry; `SlabPool::held_bytes` measures the
+/// `VkDeviceMemory` actually held and is about 2x larger. Re-run as a controlled
+/// experiment — this constant temporarily set to 0, same boot, same probe:
+///
+/// ```text
+///                                   gate off   gate on
+///   slab_mib peak held (MiB)             456       584
+///   slab_mib SETTLED (MiB)                64       464
+///   t11sample_reclaimed_from_pages        36        26
+///   distinct mappings affected             5         3
+/// ```
+///
+/// The settled row is the verdict. **At rest this gate holds 464 MiB where the
+/// ungated drain holds 64 — 400 MiB, 7.25x.** The drain stops at the floor and
+/// the floor is 160 residents, so this is not "the drain still does its job down
+/// to here"; it is the drain not returning VRAM at all in steady state, which
+/// was its whole purpose. What that buys is a 28 % reduction in
+/// destroy-then-sample events, **none of which has been shown to lose guest
+/// work** — every one measured is a type-11 surface whose guest pages hold its
+/// content, and `web-content-probe` reports 0 regions off their declared colour
+/// both with the gate and without it.
+///
+/// 400 MiB of steady-state VRAM for a 28 % reduction in an event with no
+/// demonstrated harm is not a smart trade. Revert this gate and keep the
+/// instruments, which are what caught it. The genuinely unsound case is the MRT
+/// secondary attachment — never pinned, never written back, re-served from pages
+/// that never held it — and that class needs its own instrument rather than a
+/// blanket policy that pays VRAM on every surface to protect one that may not
+/// even be in the set.
+///
+/// The one reading that survives independent of the gate: `resample_peak_ms`
+/// rose 2282 → 4076 → 6520 as residents were allowed to live longer, which is
+/// how the guest's true 6-10 s re-use interval was found. See
+/// [`IDLE_TARGET_AGE_MS`].
 const IDLE_DRAIN_PRESSURE_FLOOR: usize = REGISTRY_CAP / 2;
 /// Minimum wall-clock spacing between reclaim passes. The poll path calls the
 /// drain ~244×/s; without this it would empty the whole registry in well under a
