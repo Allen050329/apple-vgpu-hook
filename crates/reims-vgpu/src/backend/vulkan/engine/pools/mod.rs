@@ -947,6 +947,38 @@ impl FreeTargetImage {
 /// working set once the burst ends. So this is sized to absorb the burst's *live*
 /// working set (measured non-pinned peak ~260 during a YouTube page-load), not to
 /// hold it forever. Slots are cheap; the real VRAM guard is per-image bytes.
+///
+/// # What a slot costs, and why that last sentence is the problem
+///
+/// This bounds slots and then says the resource is bytes. Both readings, x86/PCI
+/// Vulkan, `registry_pressure`:
+///
+/// ```text
+///                                   peak slots   peak_mib   MiB/slot
+///   idle + Safari window drag               41         74       1.80
+///   web-content-probe --churn 1            194        211       1.09
+/// ```
+///
+/// A burst quadruples the population and takes 58 % of this cap, and its
+/// residents are *smaller* than the idle set's — so at the burst's own mix, 320
+/// slots is reached at roughly **350 MiB**. That is where this cap starts
+/// destroying guest content, on a device whose `DEVICE_LOCAL` heap
+/// ([`crate::backend::vulkan::caps::memory_topology::MemoryProfile::device_local_bytes`])
+/// is measured in gigabytes. The same 320 slots at 4K would be 10 GiB. One
+/// constant cannot be both, because slot count is not the quantity that runs
+/// out.
+///
+/// And crossing it is not a cache miss. `evict_registry_to_cap` retires a
+/// resident whose pixels exist only on the GPU — `retire_resident` recycles the
+/// image without writing anything back — and nothing recreates a resident except
+/// a draw rendering into that identity, so every later draw sampling it refuses
+/// with `vk_draw_exec_sampled_resident_missing prior=cap_evicted` for the rest of
+/// the boot.
+///
+/// `evicts=0` on both boots above and on every boot measured before them, so
+/// nothing has yet paid this. The reading that matters is not the zero; it is
+/// that the margin between a measured burst and permanent loss is 126 slots, and
+/// that the number of slots says nothing about how much of the heap they hold.
 pub(crate) const REGISTRY_CAP: usize = 320;
 /// Wall-clock milliseconds a non-pinned resident may go untouched before the
 /// idle drain reclaims it. An actively-drawn target is touched every frame (and
