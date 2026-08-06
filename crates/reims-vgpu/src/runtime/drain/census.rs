@@ -1481,63 +1481,58 @@ fn emit_engine_delta() {
     emit_draw_phase();
 }
 
-/// How close the resident registry came to `REGISTRY_CAP`, and what the cap
-/// destroyed when it got there.
+/// How far the resident registries reached, and what the populations that
+/// cannot be given back cost.
 ///
-/// Separate from `engine_delta` because both fields are read **absolute**, and
+/// Separate from `engine_delta` because these fields are read **absolute**, and
 /// that line reports differences. A high-water mark deltas to nonsense — the
 /// difference between two peaks is not a peak, and reads as zero for the rest of
 /// the boot once the true maximum is behind the window — so it is taken from the
 /// snapshot rather than from `delta_since`.
 ///
-/// Read the pair as a band. `evicts=0` on its own does not say the bound has
-/// headroom; it says the workload that ran did not cross it, which a peak of 40
-/// and a peak of 319 both satisfy. `peak` is what separates them, and it is the
-/// number to have before widening, narrowing, or removing the cap.
+/// `peak` has no `cap` beside it any more, and that is the point: the
+/// resident-target population is bounded by the allocator refusing rather than by
+/// a slot count (see `ResourcePools::recoverable_residents`). Read `peak` against
+/// `peak_mib` — the pair is what says whether a count was ever a proxy for VRAM,
+/// and it answered no: 194 slots against 211 MiB on one workload and 41 against
+/// 74 MiB on another, a 1.65x spread in MiB per slot between two ordinary
+/// desktop workloads.
 ///
-/// A non-zero `evicts` is not cache pressure. A retired resident's pixels lived
-/// only on the GPU, and nothing recreates one except a draw rendering into the
-/// same identity — so it counts guest content destroyed, and a draw that later
-/// samples one refuses through `vk_draw_exec_sampled_resident_missing` with
-/// `prior=cap_evicted`.
+/// `sole_copy` is the half of that population the allocation-failure retry
+/// cannot hand back. Its ratio against `peak` is the reading that matters now:
+/// near 1 means a retry would find nothing to give, and the copy-out sites are
+/// what needs work.
 ///
 /// # Why `resident_samples` is on this line
 ///
-/// That refusal is the only harm reading this cap has, and it can only be
-/// reached from one place: the `SampledSource::Target` arm of the engine's
-/// sampled loop, which is also the sole increment of `sampled_gpu_binds`. So
-/// `sampled_gpu_binds` is the *denominator* of `sampled_resident_missing` — when
-/// it is zero, no draw bound a resident as a texture, nothing could have
-/// observed a destroyed one, and a zero missing-count is a null instrument
-/// rather than a pass.
+/// It is the *denominator* of `sampled_resident_missing`, which is raised from
+/// one place — the `SampledSource::Target` arm of the engine's sampled loop,
+/// also the sole increment of `sampled_gpu_binds`. When it is zero, no draw
+/// bound a resident as a texture, nothing could have observed a destroyed one,
+/// and a zero missing-count is a null instrument rather than a pass.
 ///
 /// This field exists because that denominator was once argued about from two
-/// boots that had never been compared. The cap was driven six times over its
-/// bound and reported `evicts=1591` against `sampled_resident_missing=0`; a
-/// later reading of `sampled_gpu_binds=0` — taken on a *different* workload —
-/// was used to call that pair a null instrument. Printing the denominator beside
-/// the pair settled it in one boot: `web-content-probe --churn 1` reports
-/// `resident_samples=11742`, so the arm does run, the zero was a real
-/// measurement, and the null-instrument objection was itself the unfounded claim.
+/// boots that had never been compared. The since-retired slot cap was driven six
+/// times over its bound and reported `evicts=1591` against
+/// `sampled_resident_missing=0`; a later reading of `sampled_gpu_binds=0` —
+/// taken on a *different* workload — was used to call that pair a null
+/// instrument. Printing the denominator beside the pair settled it in one boot:
+/// `web-content-probe --churn 1` reports `resident_samples=11742`, so the arm
+/// does run, the zero was a real measurement, and the null-instrument objection
+/// was itself the unfounded claim. The reading still matters: it is what says a
+/// draw would have noticed had anything gone missing.
 ///
-/// Which is the point of the field either way. `evicts=N missing=0` with
-/// `resident_samples=0` says the question was not asked; only
-/// `resident_samples>0` makes the zero mean anything — and now nobody has to
-/// join two boots to find out which they are looking at.
-///
-/// `compute_storage_evicts` is the sibling registry's loss count, on this line
-/// because it is the same quantity over the other population and had no emitter
-/// at all — a counter no boot could read is not an instrument.
+/// `compute_storage_evicts` is the sibling registry's loss count. That registry
+/// still has a slot cap and its evictions are terminal, so this is the one
+/// number on the line that counts destroyed guest work.
 #[cfg(feature = "backend-vulkan")]
 fn emit_registry_pressure(now: &crate::backend::vulkan::engine::CounterSnapshot) {
     crate::observe::off(format!(
-        "registry_pressure (levels, not per-interval) peak={} cap={} evicts={} peak_mib={} \
+        "registry_pressure (levels, not per-interval) peak={} peak_mib={} \
          resident_samples={} compute_storage_evicts={} resample_peak_ms={}/{} \
-         slab_mib={}/{} sole_copy={}/{}mib cap_no_victim={} \
+         slab_mib={}/{} sole_copy={}/{}mib \
          cs_sole_copy={}/{}mib cs_cap_no_victim={}",
         now.registry_non_pinned_peak,
-        crate::backend::vulkan::engine::REGISTRY_CAP,
-        now.target_registry_cap_evictions,
         now.registry_non_pinned_peak_bytes >> 20,
         now.sampled_gpu_binds,
         now.compute_storage_cap_evictions,
@@ -1547,7 +1542,6 @@ fn emit_registry_pressure(now: &crate::backend::vulkan::engine::CounterSnapshot)
         now.slab_held_bytes >> 20,
         now.registry_sole_copy_peak,
         now.registry_sole_copy_peak_bytes >> 20,
-        now.registry_cap_no_victim,
         now.compute_storage_sole_copy_peak,
         now.compute_storage_sole_copy_peak_bytes >> 20,
         now.compute_storage_cap_no_victim,

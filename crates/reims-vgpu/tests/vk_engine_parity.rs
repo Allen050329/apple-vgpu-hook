@@ -1182,12 +1182,21 @@ fn warm_non_store_zero_readback_seed_create_alloc() {
     assert_fullscreen_fragment_color("read_target", &px, 16, 16);
 }
 
-/// Deferred render Stores pin their resident target: the registry LRU sweep
-/// must skip a pinned slot even when the cap forces evictions, and the pin
-/// must refuse absent identities (the runtime then falls back to the
-/// synchronous Store).
+/// The resident registry retains every admitted target past the slot count that
+/// used to bound it, and a pin still refuses an absent identity.
+///
+/// This is a device-level regression test for the property that retired
+/// `REGISTRY_CAP`: the population is bounded by the allocator refusing, not by a
+/// count, so admitting more targets than the old cap allowed must destroy
+/// nothing. It used to assert the opposite half — that the LRU sweep evicted the
+/// oldest *unpinned* target while rotating over the pinned one — and the pinned
+/// half of that is preserved here, now as one case of "nothing is evicted"
+/// rather than as the exception to a sweep.
+///
+/// Fails against the retired walk: with a cap of 320 the `unpinned` target is
+/// the oldest non-pinned entry and is swept before the fillers run out.
 #[test]
-fn pinned_resident_target_survives_registry_cap_sweep() {
+fn every_admitted_resident_survives_past_the_retired_slot_cap() {
     let _g = engine_test_session();
     let (v, f) = triangle_spirv();
 
@@ -1230,15 +1239,14 @@ fn pinned_resident_target_survives_registry_cap_sweep() {
     make2.target_identity = Some(unpinned.clone());
     engine::execute_draw_request(&make2).expect("unpinned target draw");
 
-    // Blow past the non-pinned REGISTRY_CAP: the LRU sweep must evict the
-    // unpinned early target (the oldest non-pinned) but rotate over the pinned
-    // one. Derive the count from the LIVE cap rather than hard-coding it — this
-    // test previously fixed 70 fillers against a cap that was later retuned
-    // 64 -> 320, so no eviction ever fired and the "unpinned was evicted" assert
-    // below could not hold. `+16` clears the cap with margin so the oldest
-    // non-pinned is definitely swept.
-    let cap = engine::registry_cap() as u32;
-    for i in 0..(cap + 16) {
+    // Admit more distinct 16x16 targets than the retired count permitted. 320 was
+    // the last value that count held, and the walk ran on *admission*, so 336
+    // clears it with the margin that used to guarantee the oldest non-pinned
+    // entry was swept. At this geometry the whole set is a few MiB, so no real
+    // allocation failure is in play and the only thing that could remove one of
+    // these is a count.
+    const FILLERS: u32 = 336;
+    for i in 0..FILLERS {
         let mut filler = engine_req(&v, &f, 16, 16);
         filler.target_identity = Some(TargetIdentity::Surface {
             id: 0x700 + i,
@@ -1250,15 +1258,27 @@ fn pinned_resident_target_survives_registry_cap_sweep() {
     }
     assert!(
         engine::resident_content_ready(&pinned),
-        "pinned target evicted by the cap sweep"
+        "a pinned resident must survive any admission"
     );
     assert!(
-        !engine::resident_content_ready(&unpinned),
-        "unpinned early target should have been LRU-evicted"
+        engine::resident_content_ready(&unpinned),
+        "the oldest unpinned resident is still here: nothing evicts on a count"
     );
+    // Every filler is still resident too — the assert above alone would pass a
+    // walk that spared only the two named identities.
+    for i in 0..FILLERS {
+        let filler = TargetIdentity::Surface {
+            id: 0x700 + i,
+            width: 16,
+            height: 16,
+            generation: 1,
+        };
+        assert!(
+            engine::resident_content_ready(&filler),
+            "filler {i} was destroyed by something other than an allocation failure"
+        );
+    }
 
-    // Unpin → a further sweep may evict it (no assert on timing; just verify
-    // the unpin API keeps the slot registered right now).
     engine::unpin_resident_target(&pinned);
     assert!(engine::resident_content_ready(&pinned));
 }

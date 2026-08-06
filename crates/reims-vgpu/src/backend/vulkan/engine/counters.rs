@@ -342,53 +342,41 @@ engine_counters! {
         target_free_allocs,
         target_recycle_admits,
         target_recycle_cap_drops,
-        /// High-water mark of the non-pinned resident population, against which
-        /// `REGISTRY_CAP` is the ceiling — read as a band, `peak/cap`.
+        /// High-water mark of the non-pinned resident population, in slots.
         ///
-        /// The reach, not the drops. `target_registry_cap_evictions` reading zero
-        /// says only that the cap did not bind on the workload that ran; it
-        /// cannot distinguish a peak of 40 from a peak of 319, and those are
-        /// opposite answers to whether the bound has headroom. This is the one
-        /// that separates them, which is why it exists as a peak rather than as
-        /// an instantaneous population: the cap's whole purpose is to survive a
+        /// The demand, with no ceiling to read it against: this population is
+        /// bounded by the allocator refusing, not by a count — see
+        /// `ResourcePools::recoverable_residents`. A peak exists rather than an
+        /// instantaneous population because the interesting shape is a
         /// compositing *burst*, and a burst that rises and drains between two
         /// census samples is exactly what an instantaneous reading misses.
         ///
         /// Cumulative and never reset by the windowed reset, because the
-        /// question is "how close did this boot ever come", not "how close is it
+        /// question is "how far did this boot ever reach", not "where is it
         /// now". `EngineCounters::reset_all` clears it for tests.
         ///
-        /// Sampled where the cap is enforced, so every admission that could grow
-        /// the population is seen. Two prior readings are quoted in this
-        /// module's neighbours — a non-pinned peak of ~260 under a YouTube
-        /// page-load, and `reg=512/512 evicts=168` before pinned slots were
-        /// excluded — and **neither is reproducible today**: nothing in the tree
-        /// emitted them, so they are historical probe output rather than
-        /// something a boot can be asked for. That is the gap this closes.
+        /// Sampled at both admit paths, so every admission that could grow the
+        /// population is seen. Two prior readings are quoted in this module's
+        /// neighbours — a non-pinned peak of ~260 under a YouTube page-load, and
+        /// `reg=512/512 evicts=168` before pinned slots were excluded from the
+        /// since-retired count — and **neither is reproducible today**: nothing
+        /// in the tree emitted them, so they are historical probe output rather
+        /// than something a boot can be asked for. That is the gap this closes.
         registry_non_pinned_peak,
-        /// Residents destroyed by the capacity walk, cumulative.
-        ///
-        /// Paired with the peak above because the two are only interpretable
-        /// together, and this is the half that counts loss: a retired resident's
-        /// pixels existed only on the GPU and nothing recreates one except a
-        /// draw rendering into the same identity, so a non-zero reading here is
-        /// guest content destroyed rather than a cache asked to refill.
-        target_registry_cap_evictions,
         /// Compute-storage residents destroyed by `COMPUTE_STORAGE_REGISTRY_CAP`,
         /// cumulative.
         ///
-        /// The same quantity as `target_registry_cap_evictions` over the other
-        /// registry, and it counts the same thing: lost guest work. Nothing
-        /// recreates a compute-storage resident's content either, so a dispatch
-        /// that later reads a destroyed identity refuses with
-        /// `ResidentSampleAbsent` or `ResidentSeedGenerationLost`.
+        /// It counts lost guest work: nothing recreates a compute-storage
+        /// resident's content, so a dispatch that later reads a destroyed
+        /// identity refuses with `ResidentSampleAbsent` or
+        /// `ResidentSeedGenerationLost`.
         ///
         /// It exists because that sweep incremented nothing at all, which left
         /// its 64 unfalsifiable — the cap could have been biting on every
         /// compute-heavy boot and no counter, route or log line would have
         /// moved. Kept separate from the target count rather than summed with
-        /// it: the two registries are bounded by different constants over
-        /// different populations, and a boot needs to know which one bit.
+        /// it: the two registries are bounded differently over different
+        /// populations, and a boot needs to know which one bit.
         compute_storage_cap_evictions,
         /// Worst gap, in milliseconds, between a resident being touched and
         /// being read again — the margin against `IDLE_TARGET_AGE_MS`, the age
@@ -421,14 +409,13 @@ engine_counters! {
         /// The same high-water in attachment bytes, sampled from the same
         /// population at the same instant as `registry_non_pinned_peak`.
         ///
-        /// `REGISTRY_CAP` bounds slots while its own doc says "slots are cheap;
-        /// the real VRAM guard is per-image bytes" — so the cap does not measure
-        /// the resource it is defending. 320 slots is 5 MiB of 16x16 scratch or
-        /// 10 GiB of 4K, and nothing in this device could tell those apart until
-        /// this counter. A lower bound on VRAM (attachment footprint, no tiling
-        /// padding, and a format with no single texel size contributes nothing),
-        /// which is the safe direction for a figure that exists to decide
-        /// whether a bound is too loose.
+        /// A slot count once bounded this population, and this is the counter
+        /// that retired it: 320 slots is 5 MiB of 16x16 scratch or 10 GiB of 4K,
+        /// and nothing in this device could tell those apart until the bytes were
+        /// sampled beside the slots. A lower bound on VRAM (attachment
+        /// footprint, no tiling padding, and a format with no single texel size
+        /// contributes nothing), which is the safe direction for a figure that
+        /// exists to decide whether a bound measures the right quantity.
         registry_non_pinned_peak_bytes,
         /// High-water of the population both reclaim paths refuse to take
         /// because the image is the only place its pixels exist, in slots and in
@@ -437,24 +424,16 @@ engine_counters! {
         /// Read as a ratio against `registry_non_pinned_peak`. That ratio is the
         /// price of never losing a frame: near 0 the reclaim paths have their
         /// usual freedom and the protection costs nothing; near 1 they have
-        /// nothing left to take and the registry is a population that only grows
-        /// — at which point the copy-out sites, not `REGISTRY_CAP`, are what
-        /// needs work.
+        /// nothing left to take, the allocation-failure retry has nothing to
+        /// give back, and the copy-out sites are what needs work.
         registry_sole_copy_peak,
         registry_sole_copy_peak_bytes,
-        /// Times the capacity walk wanted a victim and every remaining resident
-        /// was pinned, protected, or the sole copy of its pixels, so
-        /// `REGISTRY_CAP` was exceeded rather than guest work destroyed.
-        ///
-        /// The half of the walk `target_registry_cap_evictions` cannot see. A
-        /// break out of that loop and a loop that never ran both leave the
-        /// eviction count flat, and only one of them means the cap is under
-        /// pressure it is deliberately declining to relieve.
-        registry_cap_no_victim,
-        /// The three above over the compute-storage registry. Separate rather
-        /// than summed for the reason `compute_storage_cap_evictions` is: the
-        /// two registries are bounded by different constants over different
-        /// populations, and a boot needs to know which one bit.
+        /// The two above over the compute-storage registry, plus the times that
+        /// registry's capacity walk wanted a victim and found every remaining
+        /// resident pinned or the sole copy of its pixels. Separate rather than
+        /// summed for the reason `compute_storage_cap_evictions` is: the two
+        /// registries are bounded differently over different populations, and a
+        /// boot needs to know which one bit.
         compute_storage_sole_copy_peak,
         compute_storage_sole_copy_peak_bytes,
         compute_storage_cap_no_victim,

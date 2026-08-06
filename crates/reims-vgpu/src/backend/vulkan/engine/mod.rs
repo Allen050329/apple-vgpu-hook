@@ -29,7 +29,7 @@ mod pools;
 /// The ceiling `registry_non_pinned_peak` is read against. Re-exported because
 /// `pools` is private and the census that reports the band lives outside this
 /// module: a peak with no cap beside it is a number, not a reading.
-pub(crate) use pools::{IDLE_TARGET_AGE_MS, REGISTRY_CAP};
+pub(crate) use pools::IDLE_TARGET_AGE_MS;
 pub mod reason;
 mod slab;
 pub mod stage_phase;
@@ -2132,14 +2132,6 @@ pub fn read_resident_storage(
     }
 }
 
-/// The non-pinned resident-target slot cap. Exposed so a test that must blow
-/// past the LRU sweep derives its filler count from the live value instead of
-/// hard-coding one — `vk_engine_parity` previously fixed 70 fillers against a
-/// cap later retuned to 320, so no eviction fired and its assert could not hold.
-pub fn registry_cap() -> usize {
-    pools::REGISTRY_CAP
-}
-
 /// Advance the wall-clock resident-target idle-drain clock to `now_ms`, keep the
 /// currently-presented target (`display`) alive, and reclaim aged non-pinned
 /// residents. Called from the poll heartbeat (so the clock keeps ticking when the
@@ -2184,14 +2176,12 @@ pub fn counter_snapshot() -> CounterSnapshot {
     snap.target_free_allocs = t_allocs;
     snap.target_recycle_admits = t_admits;
     snap.target_recycle_cap_drops = t_cap_drops;
-    let (reg_peak, reg_evictions, reg_peak_bytes) = eng.pools.registry_pressure_stats();
+    let (reg_peak, reg_peak_bytes) = eng.pools.registry_pressure_stats();
     snap.registry_non_pinned_peak = reg_peak;
-    snap.target_registry_cap_evictions = reg_evictions;
     snap.registry_non_pinned_peak_bytes = reg_peak_bytes;
-    let (sole_peak, sole_peak_bytes, cap_no_victim) = eng.pools.registry_sole_copy_stats();
+    let (sole_peak, sole_peak_bytes) = eng.pools.registry_sole_copy_stats();
     snap.registry_sole_copy_peak = sole_peak;
     snap.registry_sole_copy_peak_bytes = sole_peak_bytes;
-    snap.registry_cap_no_victim = cap_no_victim;
     let (cs_sole, cs_sole_bytes, cs_no_victim) = eng.pools.compute_storage_sole_copy_stats();
     snap.compute_storage_sole_copy_peak = cs_sole;
     snap.compute_storage_sole_copy_peak_bytes = cs_sole_bytes;
@@ -2212,16 +2202,42 @@ pub fn reset_draw_counters() {
 /// Test-only: destroy device, clear recreate budget, rebuild on next draw.
 pub fn test_reset_engine() {
     let mut g = lock_engine();
+    // A healthy `DeviceContext` is kept across the reset; only the pools, the
+    // caches and the owner's flags are rebuilt.
+    //
+    // This used to destroy the `VkDevice` and the `VkInstance` too, so a suite
+    // creating an instance per test churned one per reset — and on this host's
+    // driver the churn has a ceiling: past it `vkEnumeratePhysicalDevices`
+    // returns `ERROR_INITIALIZATION_FAILED` and every later init fails
+    // permanently. The failure lands wherever the count happens to run out, so
+    // it read as one test being fragile and moved to a different test whenever
+    // another was added ahead of it. Nothing about the *reset* needed a new
+    // instance: a fresh registry, a fresh cache set and a cleared recreate
+    // budget are what a test wants, and this is also the shape production runs
+    // in — one instance for the life of the process.
+    //
+    // A poisoned context is the exception. That is what the device-loss tests
+    // leave behind, its device really is gone, and reusing it would hand every
+    // later test a dead one — so it is torn down and the next `ensure` builds a
+    // replacement.
+    let poisoned = g.owner.poisoned;
     if let Some(mut ctx) = g.owner.ctx.take() {
         unsafe {
             g.caches.destroy_all(&ctx.device);
             g.pools.destroy_all(&ctx.device);
-            ctx.destroy();
         }
+        if poisoned {
+            unsafe { ctx.destroy() };
+            g.owner = ContextOwner::new();
+        } else {
+            g.owner = ContextOwner::new();
+            g.owner.ctx = Some(ctx);
+        }
+    } else {
+        g.owner = ContextOwner::new();
     }
     g.caches = ObjectCaches::new();
     g.pools = ResourcePools::new();
-    g.owner = ContextOwner::new();
     g.counters.reset_all();
 }
 

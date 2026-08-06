@@ -1479,23 +1479,19 @@ pub(crate) unsafe fn execute_draw_inner(
     let mut transient_depth: Option<(vk::Image, vk::DeviceMemory, vk::ImageView, vk::Framebuffer)> =
         None;
     // Mark everything this draw is about to read *before* resolving its own
-    // target, because resolving the target is what can take them away.
+    // target, so a reclaim between here and `prepare_sampled` cannot take one
+    // of this draw's own sampled sources.
     //
-    // `registry_ensure` below runs `evict_registry_to_cap`, and that walk's
-    // `protect` covers only the identity being resolved. So a draw arriving
-    // while the non-pinned population is at cap could evict one of its own
-    // sampled sources and then fail to find it a few hundred lines later — the
-    // gap between the `resident_content_ready` guard the resolver already
-    // performs and the lookup in `prepare_sampled`. Nothing about that race
-    // needs load to be heavy; heavy load only makes the registry sit at cap,
-    // which is when the walk evicts at all.
-    //
-    // Marking them used is enough to close it: the cap walk evicts the
-    // least-recently-used resident, and one this draw is about to read is by
-    // construction the most recently used thing in the registry. That reuses
-    // the recency the sampled resolve already records rather than threading a
-    // second protected set through `registry_ensure`, and it protects these
-    // residents from the idle drain in the same breath.
+    // The idle drain is what could: it destroys any resident untouched for
+    // `IDLE_TARGET_AGE_MS`, and it runs off the poll heartbeat on another
+    // thread, so a source last read a while ago is reachable right up to the
+    // lookup a few hundred lines below — the gap between the
+    // `resident_content_ready` guard the resolver already performs and
+    // `prepare_sampled`. Marking them used closes it, because both reclaim
+    // paths treat a marked resident as in use, and a source this draw is about
+    // to read is by construction the most recently used thing in the registry.
+    // It reuses the recency the sampled resolve already records rather than
+    // threading a protected set through `registry_ensure`.
     for s in &req.sampled_images {
         if let SampledSource::Target(identity) = &s.source {
             pools.registry_note_sampled_use(identity);
@@ -1512,7 +1508,6 @@ pub(crate) unsafe fn execute_draw_inner(
                 primary_pass,
                 gen,
                 output_bgra,
-                req.seed_from_target.as_ref(),
                 counters,
             )?;
             if load_uses_gpu_content && !t.content_ready {

@@ -249,20 +249,16 @@ pub(crate) struct ResourcePools {
     /// rather than guessed at. Diagnostic only — nothing reads it to decide
     /// anything.
     reclaimed_recent: VecDeque<(TargetIdentity, ResidentReclaim, u64)>,
-    /// Source of [`ResidentTargetSlot::use_seq`]. Monotonic for the life of the
-    /// pools; at one bump per bind it cannot wrap in any realistic session.
-    use_clock: u64,
-    /// Highest non-pinned resident population this device has held, and the
-    /// count of residents the capacity walk destroyed. Reported together as
-    /// `registry_non_pinned_peak` / `target_registry_cap_evictions`; see those
-    /// for why the pair is only interpretable together.
+    /// Highest non-pinned resident population this device has held, in slots.
+    /// Reported as `registry_pressure`'s `peak`, beside the bytes the same
+    /// sample occupied — the pair is what says a slot count was never a proxy
+    /// for VRAM. See [`ResourcePools::recoverable_residents`].
     ///
     /// Kept here rather than on `EngineCounters` for the reason the recycle
-    /// stats are: these are properties of the registry, which lives on this
+    /// stats are: this is a property of the registry, which lives on this
     /// struct under the engine lock, so there is nothing to synchronise and no
-    /// atomic to pay for. `engine::counter_snapshot` merges them in.
+    /// atomic to pay for. `engine::counter_snapshot` merges it in.
     registry_non_pinned_peak: u64,
-    registry_cap_evictions: u64,
     /// Longest a resident had gone untouched before something read it, in
     /// milliseconds of the idle clock, for the life of the pools.
     ///
@@ -285,7 +281,7 @@ pub(crate) struct ResourcePools {
     /// incrementing anything, so no boot could answer whether 64 had ever bound.
     /// Its loss is not a re-upload — a dispatch that later reads the identity
     /// refuses with `ResidentSampleAbsent` or `ResidentSeedGenerationLost` — so
-    /// this counts lost guest work, exactly as `registry_cap_evictions` does.
+    /// this counts lost guest work.
     compute_storage_cap_evictions: u64,
     /// The live non-pinned population and what it occupies, maintained rather
     /// than walked. Both readings come off this, and
@@ -305,30 +301,21 @@ pub(crate) struct ResourcePools {
     /// affordable. It is the one number that can turn "never lose a frame" into
     /// "hold every frame forever": a workload whose residents are all
     /// [`ResidentTargetSlot::gpu_only_content`] gives the reclaim paths nothing
-    /// to take, and the registry then grows until the allocator refuses. Read
-    /// the peak against `registry_non_pinned_peak` — a ratio near 1 means the
-    /// reclaim paths have stopped working and the copy-out sites, not the cap,
-    /// are what needs the attention.
+    /// to take, and the allocation-failure retry then has nothing to give back.
+    /// Read the peak against `registry_non_pinned_peak` — a ratio near 1 means
+    /// the reclaim paths have stopped working and the copy-out sites are what
+    /// needs the attention.
     registry_sole_copy: NonPinnedTotals,
     /// High-water of [`Self::registry_sole_copy`], in slots and in attachment
     /// bytes, sampled where every admission passes.
     registry_sole_copy_peak: NonPinnedTotals,
-    /// Times the capacity walk wanted a victim and every remaining resident was
-    /// pinned, protected, or the sole copy of its pixels — so `REGISTRY_CAP` was
-    /// deliberately exceeded rather than guest work destroyed.
-    ///
-    /// The counterpart to `registry_cap_evictions`: that one counts what the cap
-    /// took, this one counts what it declined to take. A boot where this rises
-    /// and `registry_cap_evictions` stays flat is the cap doing the right thing
-    /// under pressure; one where this rises without bound is the population
-    /// growing with nothing able to trim it, which is a VRAM ceiling coming.
-    registry_cap_no_victim: u64,
-    /// The compute-storage counterparts of [`Self::registry_sole_copy`],
-    /// [`Self::registry_sole_copy_peak`] and [`Self::registry_cap_no_victim`],
-    /// over the other registry. Kept separate rather than summed for the reason
-    /// `compute_storage_cap_evictions` is: the two registries are bounded by
-    /// different constants over different populations, and a boot needs to know
-    /// which one bit.
+    /// The compute-storage counterparts of [`Self::registry_sole_copy`] and
+    /// [`Self::registry_sole_copy_peak`], plus the times that registry's
+    /// capacity walk wanted a victim and found every remaining resident pinned
+    /// or the sole copy of its pixels. Kept separate rather than summed for the
+    /// reason `compute_storage_cap_evictions` is: the two registries are bounded
+    /// differently over different populations, and a boot needs to know which
+    /// one bit.
     compute_storage_sole_copy: NonPinnedTotals,
     compute_storage_sole_copy_peak: NonPinnedTotals,
     compute_storage_cap_no_victim: u64,
@@ -857,8 +844,8 @@ pub(crate) fn slot_presentable(slot: &ResidentTargetSlot, width: u32, height: u3
 ///
 /// One struct rather than two fields because the pair is only ever read
 /// together — `registry_pressure` reports both, and a count without its bytes is
-/// the reading `REGISTRY_CAP` was bounded by for as long as nobody could say
-/// what a slot costs.
+/// the reading a slot count was defended by for as long as nobody could say what
+/// a slot costs.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct NonPinnedTotals {
     pub count: usize,
@@ -957,9 +944,12 @@ pub(crate) struct ResidentTargetSlot {
     ///   t11sample_reclaimed_from_pages (sum)    33         39
     /// ```
     ///
-    /// - **`cap_no_victim=0` on both.** Not once did the capacity walk want a
-    ///   victim and find every candidate protected, so the ceiling this could
-    ///   have introduced was not approached, and `evicts` stayed 0 either way.
+    /// - **`cap_no_victim=0` on both.** Not once did the then-live capacity walk
+    ///   want a victim and find every candidate protected, so the ceiling this
+    ///   could have introduced was not approached, and `evicts` stayed 0 either
+    ///   way. Both counters are retired with the walk; what survives is the
+    ///   protected population itself, which the allocation-failure reclaim
+    ///   selects against with the same predicate.
     /// - **The protected set is small surfaces.** 194 slots is 71 % of the peak
     ///   population but 37 MiB is 19 % of its bytes. A slot count alone would
     ///   overstate this nearly fourfold, which is why the totals carry bytes.
@@ -968,10 +958,10 @@ pub(crate) struct ResidentTargetSlot {
     ///   empty blocks; the bytes actually in use grow by about the 10 MiB the
     ///   protected population accounts for.
     /// - **Headroom is what this really spends.** The non-pinned peak goes
-    ///   191 → 275 of 320. A heavier workload therefore reaches `REGISTRY_CAP`
-    ///   sooner, and when it does the walk exceeds the cap rather than losing a
-    ///   frame — which is the designed behaviour, and `cap_no_victim` is the
-    ///   counter that will say it started.
+    ///   191 → 275. That was headroom against a 320-slot count at the time; the
+    ///   count is gone, so what it now spends is what an allocation-failure
+    ///   reclaim would have to work with, and `registry_sole_copy_peak` against
+    ///   `registry_non_pinned_peak` is the ratio that says how much.
     ///
     /// ## This does **not** reduce `t11sample_reclaimed_from_pages`
     ///
@@ -1015,20 +1005,9 @@ pub(crate) struct ResidentTargetSlot {
     /// ([`ResourcePools::advance_registry_touch_and_drain`]) reclaims a non-pinned
     /// resident once its touch falls `IDLE_TARGET_AGE_MS` behind the current
     /// clock — so a burst's stale targets (a settled YouTube page's thumbnail RTs)
-    /// are reclaimed instead of pinning VRAM at the high `REGISTRY_CAP` for the
-    /// guest lifetime, while an actively-drawn target (touched every frame) never
-    /// ages out.
+    /// are reclaimed instead of pinning VRAM for the guest lifetime, while an
+    /// actively-drawn target (touched every frame) never ages out.
     pub last_touch_ms: u64,
-    /// Strictly increasing stamp of the last use, for the capacity walk's
-    /// least-recently-used choice.
-    ///
-    /// Separate from `last_touch_ms` because that clock is wall time fed from
-    /// the ~244 Hz poll heartbeat, so every use inside one tick shares a value.
-    /// The cap walk needs a total order, and ties there fall to the
-    /// oldest-*created* entry — which is exactly the session-long backdrop the
-    /// walk must stop taking. The drain still wants wall time (it asks how
-    /// *old* something is, not which came last), so the two are kept apart.
-    pub use_seq: u64,
 }
 
 impl ResidentTargetSlot {
@@ -1162,187 +1141,12 @@ impl FreeTargetImage {
     }
 }
 
-/// Cap on the **non-pinned** (LRU-evictable) resident-target population — the
-/// active render working set. Pinned slots (deferred-write windows, each holding
-/// content only on the GPU, bounded separately by the arming rail's own window
-/// cap — `draw::vulkan::GVA_DEFERRED_WINDOW_CAP` for the GVA Store rail)
-/// are **excluded** from this count
-/// (see the eviction loops): counting them would force the still-in-use active
-/// targets out whenever a compositing burst pins hundreds, thrashing exactly the
-/// targets a draw is about to reuse (measured `reg=512/512 evicts=168` under a
-/// YouTube page-load, ~320 pinned). Excluding them lets the active set keep its
-/// full cap regardless of the pinned burst, so a burst is *absorbed* (evicts≈0)
-/// instead of thrashing. Total registry is bounded by construction —
-/// `REGISTRY_CAP` non-pinned plus the pinned windows, which each arming rail caps
-/// itself. VRAM does not stay pinned at this ceiling: the idle drain
-/// ([`ResourcePools::advance_registry_touch_and_drain`]) reclaims a burst's stale
-/// leftovers ~2 s after last use, returning the resident set to the ~56 idle
-/// working set once the burst ends. So this is sized to absorb the burst's *live*
-/// working set (measured non-pinned peak ~260 during a YouTube page-load), not to
-/// hold it forever. Slots are cheap; the real VRAM guard is per-image bytes.
-///
-/// # What a slot costs, and why that last sentence is the problem
-///
-/// This bounds slots and then says the resource is bytes. Both readings, x86/PCI
-/// Vulkan, `registry_pressure`:
-///
-/// ```text
-///                                   peak slots   peak_mib   MiB/slot
-///   idle + Safari window drag               41         74       1.80
-///   web-content-probe --churn 1            194        211       1.09
-/// ```
-///
-/// A burst quadruples the population and takes 58 % of this cap, and its
-/// residents are *smaller* than the idle set's — so at the burst's own mix, 320
-/// slots is reached at roughly **350 MiB**. That is where this cap starts
-/// destroying guest content, on a device whose `DEVICE_LOCAL` heap
-/// ([`crate::backend::vulkan::caps::memory_topology::MemoryProfile::device_local_bytes`])
-/// is measured in gigabytes. The same 320 slots at 4K would be 10 GiB. One
-/// constant cannot be both, because slot count is not the quantity that runs
-/// out.
-///
-/// And crossing it is not a cache miss. `evict_registry_to_cap` retires a
-/// resident whose pixels exist only on the GPU — `retire_resident` recycles the
-/// image without writing anything back — and nothing recreates a resident except
-/// a draw rendering into that identity.
-///
-/// **The consequence is not the permanent refusal this used to claim, and the
-/// truth is worse.** `vk_draw_exec_sampled_resident_missing` is raised in the
-/// engine, but the type-11 sampled planner never gets that far: it asks
-/// `resident_content_ready` first (`draw::vulkan::resolve_sampled_source`) and,
-/// on `false`, falls through to the host cache and then to the surface's own
-/// guest pages. So a reclaimed `Surface` resident is *silently re-served from
-/// somewhere else* rather than refused.
-///
-/// For a surface whose pages the flush rails have written, that is correct and
-/// is the same principle `resolve_type11_load_seed` states — the cache is an
-/// accelerator, and a miss is a reason to read the pages. For a resident whose
-/// pixels were never written to those pages it is not: an **MRT secondary
-/// attachment** is never pinned, never read back, and still carries a real
-/// `Gva`/`Surface` identity, so reading its pages substitutes an unrelated
-/// earlier frame. The stale-resident branch immediately above that fall-through
-/// knows this — it merges the resident's half into the pages first and refuses
-/// when the merge does not land, because otherwise "the pages below hold only
-/// the guest's half, which for a composite the Store deliberately left GPU-side
-/// is nothing at all". A reclaimed resident has exactly that property and has
-/// nothing left to merge from.
-///
-/// `t11sample_reclaimed_from_pages` counts how often that fall-through is taken,
-/// and `sampled_resident_reclaimed` names the first one per mapping. Until that
-/// route reads non-zero, how much of this is reached is unmeasured — which is
-/// why it is reported rather than refused, since refusing would also reject the
-/// flushed-surface case that is the common one and works today.
-///
-/// `evicts=0` on both boots above and on every boot measured before them, so
-/// nothing has yet paid this. The reading that matters is not the zero; it is
-/// that the margin between a measured burst and permanent loss is 126 slots, and
-/// that the number of slots says nothing about how much of the heap they hold.
-///
-/// # What replaces it, and what that needs first
-///
-/// Not a bigger number. Retuning a slot count keeps the property that makes this
-/// dangerous — that the quantity bounded is not the quantity that runs out — and
-/// every retune has to be re-derived the first time a guest composites at a
-/// different geometry.
-///
-/// The bound belongs on the allocator: hold residents until `DEVICE_LOCAL`
-/// memory is genuinely exhausted, and let the allocation refuse. A refusal there
-/// is a *current*, attributable, self-healing failure — the draw that asked for
-/// more than the heap has is the one that fails, and the idle drain frees the
-/// space for its retry. A cap eviction is the opposite on all three counts: it
-/// destroys an earlier accepted result, attributes nothing, and breaks a
-/// *future* draw permanently. `MemoryProfile::device_local_bytes` is already
-/// measured from the device and already reachable here through `ctx.caps.memory`,
-/// so nothing needs a new constant — which is the point, because no fraction of
-/// the heap can be defended without first measuring what the engine's other
-/// consumers need, and this device does not account for those.
-///
-/// # The driven eviction, and what it says about all of the above
-///
-/// The argument above was made without ever having seen this walk run —
-/// `evicts=0` on every boot ever measured. So it was driven: `REGISTRY_CAP`
-/// temporarily set to **32**, six times below the burst working set, same
-/// x86/PCI boot, same `web-content-probe --churn 1`.
-///
-/// ```text
-///   registry_pressure peak=33 cap=32 evicts=1591 peak_mib=73
-///   sampled_resident_missing                          0
-///   probe regions not measuring their declared colour 0
-/// ```
-///
-/// **1591 evictions, no measured loss.** Not one of them destroyed a resident
-/// that anything later sampled, and the desktop screenshotted intact. The LRU is
-/// why: `cap_eviction_victim` orders by `use_seq`, which
-/// [`ResourcePools::registry_note_sampled_use`] bumps on a *read* and not only
-/// on a render-into, so a resident that is still being sampled cannot become the
-/// minimum.
-///
-/// # The denominator that reading needs, and why it was once doubted
-///
-/// `sampled_resident_missing` is raised at exactly one site, in the
-/// `SampledSource::Target` arm of the engine's sampled loop. So is the
-/// `registry_note_sampled_use` call the LRU explanation rests on, and so is the
-/// sole increment of `sampled_gpu_binds`. All three are the same arm — so if
-/// that arm never ran, a zero missing-count would be a null instrument rather
-/// than a pass, and the LRU could not have been what spared those victims.
-///
-/// That objection was raised here, on the strength of the `draw_phase` module
-/// doc's `sampled_gpu_binds=0`, and **it was wrong**. That zero was measured on
-/// a window-drag/Safari boot; the 1591-eviction run was `web-content-probe
-/// --churn 1`, a different workload, and generalising one to the other is
-/// exactly the step this file's own rules forbid.
-///
-/// Measured directly rather than inferred, driven x86/PCI, `web-content-probe
-/// --churn 1`, with the denominator now printed on the census line:
-///
-/// ```text
-///   registry_pressure peak=192 cap=320 evicts=0 peak_mib=220 resident_samples=11742
-/// ```
-///
-/// `resident_samples` rises monotonically 5 → 253 → 6009 → 11742 across the run.
-/// The Target arm runs about eleven thousand times on this workload, so
-/// `registry_note_sampled_use` fires that often, the LRU's read-recency
-/// protection is genuinely active, and `sampled_resident_missing=0` at cap 32
-/// was a real measurement against a real denominator. The original conclusion
-/// stands, and now on firmer ground than when it was drawn: the reason it could
-/// not be trusted before was that nothing reported how many resident samples had
-/// occurred, and both readings that bore on it came from boots nobody had
-/// compared.
-///
-/// # What survives, and what the signal is
-///
-/// - The cap is still expressed in the wrong quantity. 320 slots is ~350 MiB at
-///   the burst's mix and 10 GiB at 4K, on a heap measured in gigabytes. Nothing
-///   above touches that, and it is a reason to change what the bound measures
-///   rather than a measured harm.
-/// - `evicts=1591` at cap 32 against `evicts=0` at cap 320 (peak 192 of 320 on
-///   the run above) says the margin at 320 is not thin in practice: the
-///   population that reached 192 was mostly *replaceable*, not live, even though
-///   ~11742 resident samples were taken across it.
-/// - The remaining unknown is a workload whose live sampled set exceeds the cap.
-///   Nothing here produced one. Until something does, replacing this policy
-///   trades a failure mode measured at zero for one that has never been measured
-///   at all, which is the wrong direction.
-///
-/// So: keep the cap, keep the `peak_mib` instrument pointed at it, and treat a
-/// non-zero `evicts` **together with** a non-zero `sampled_resident_missing` as
-/// the signal that reopens this — read against `resident_samples`, which is what
-/// says the pair means anything at all. A non-zero `evicts` alone is not it.
-///
-/// The other prerequisite landed anyway and is worth keeping on its own terms:
-/// both readings come off [`NonPinnedTotals`], maintained at the three sites that
-/// can change them, so neither reading is an O(n) registry walk on every admit.
-///
-/// The other prerequisite landed anyway and is worth keeping on its own terms:
-/// both readings come off [`NonPinnedTotals`], maintained at the three sites that
-/// can change them, so neither reading is an O(n) registry walk on every admit.
-pub(crate) const REGISTRY_CAP: usize = 320;
 /// Wall-clock milliseconds a non-pinned resident may go untouched before the
 /// idle drain reclaims it. An actively-drawn target is touched every frame (and
 /// the presented target is touched every poll) so it never ages out, while a
 /// burst's stale targets (a settled page's thumbnail RTs) are reclaimed ~2 s
-/// after last use — so `REGISTRY_CAP` can be high enough to absorb a burst (no
-/// eviction thrash) without pinning that VRAM for the guest lifetime.
+/// after last use — so a burst is absorbed whole and its VRAM still comes back,
+/// which is what lets the population have no count bounding it at all.
 ///
 /// **Wall-clock, not publish-count:** the drain clock is fed from the poll
 /// heartbeat (`device_poll`, ~244 Hz), which ticks even when the guest stops
@@ -1388,8 +1192,9 @@ pub(crate) const REGISTRY_CAP: usize = 320;
 /// # A memory-pressure gate on the drain was tried, measured, and reverted
 ///
 /// The obvious answer to that last bullet — skip the drain while the population
-/// is below some fraction of `REGISTRY_CAP` — was implemented and measured on a
-/// driven x86/PCI boot with `web-content-probe --churn 1`, floor at half the cap:
+/// is below some fraction of the slot count that then bounded it — was
+/// implemented and measured on a driven x86/PCI boot with
+/// `web-content-probe --churn 1`, floor at half that count:
 ///
 /// ```text
 ///                                   gate off   gate on
@@ -1505,10 +1310,17 @@ const IDLE_DRAIN_INTERVAL_MS: u64 = 100;
 /// pass so a large stale set (a ~600-target burst) drains gradually instead of
 /// stalling one call with hundreds of image destroys.
 const IDLE_TARGET_DRAIN_MAX_PER_CALL: usize = 4;
-/// Cap for the separate compute-storage resident registry. Kept at its own value
-/// (independent of the target `REGISTRY_CAP` retune) — compute storage residents
-/// have their own pin lifecycle and working-set profile, and were never part of
-/// the deferred-present pin-burst class that motivated the target-cap change.
+/// Cap for the separate compute-storage resident registry.
+///
+/// The target registry's equivalent slot count is retired — that population is
+/// bounded by the allocator refusing, see
+/// [`ResourcePools::recoverable_residents`]. This one is **not**, and the reason
+/// is a gap rather than a decision: `reclaim_for_allocation_retry` gives back
+/// target residents and recycle pools and nothing from this registry, so removing
+/// this count would leave the population with only the age drain trimming it and
+/// nothing to hand back when an allocation fails. Its evictions are terminal and
+/// counted (`compute_storage_cap_evictions`); closing this needs the reclaim
+/// extended to this registry first.
 const COMPUTE_STORAGE_REGISTRY_CAP: usize = 64;
 /// Reclaimed identities remembered for [`ResourcePools::reclaimed_recent`].
 ///
@@ -2649,7 +2461,6 @@ mod resident_reuse_tests {
             pin_count: 0,
             gpu_only_content: false,
             last_touch_ms: 0,
-            use_seq: 0,
         }
     }
 

@@ -1207,8 +1207,11 @@ pub enum TargetIdentity {
 pub enum ResidentReclaim {
     /// The idle drain aged it out. A terminal destroy, not a recycle.
     IdleDrained,
-    /// The capacity walk evicted it to hold the non-pinned population at cap.
-    CapEvicted,
+    /// An allocation was refused and the reclaim retry gave it back, because it
+    /// was neither pinned nor the only copy of its pixels. A terminal destroy of
+    /// the image, but not of the pixels — the guest's own pages still hold them,
+    /// which is the predicate `ResourcePools::recoverable_residents` selects on.
+    AllocationReclaimed,
     /// `registry_ensure` replaced it for the same identity at a new geometry,
     /// generation or format.
     Recreated,
@@ -1218,7 +1221,7 @@ impl ResidentReclaim {
     pub fn slug(self) -> &'static str {
         match self {
             Self::IdleDrained => "idle_drained",
-            Self::CapEvicted => "cap_evicted",
+            Self::AllocationReclaimed => "allocation_reclaimed",
             Self::Recreated => "recreated",
         }
     }

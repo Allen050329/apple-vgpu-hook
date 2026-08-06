@@ -269,8 +269,8 @@ pub(crate) fn publish_window_frame(slot: &BoundDevice, state: &mut crate::model:
         crate::runtime::present_identity::surface_identity(state, mapping, width, height);
     // Keep the resident this present names alive across the idle sweep below,
     // then reclaim targets idle past the wall-clock age threshold so VRAM returns
-    // to the working-set baseline after a compositing burst instead of sitting at
-    // the high REGISTRY_CAP for the guest lifetime.
+    // to the working-set baseline after a compositing burst instead of being held
+    // for the guest lifetime.
     let now_ms = crate::observe::elapsed_ms() as u64;
     crate::backend::vulkan::engine::touch_resident_target(Some(&present_identity), now_ms);
     crate::backend::vulkan::engine::maintain_idle_residents(Some(&present_identity), now_ms);

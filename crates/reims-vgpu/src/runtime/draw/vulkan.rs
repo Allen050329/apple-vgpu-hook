@@ -6463,9 +6463,9 @@ pub(crate) fn read_resident_chain(state: &DeviceState, req: &DrawEncodeRequest) 
     }
 }
 
-/// Deferred GVA windows keep engine registry slots pinned (the LRU sweep
-/// skips pinned slots and soft-exceeds `REGISTRY_CAP=64`); arming past this
-/// count lands the oldest window first so pinned pressure stays bounded.
+/// Deferred GVA windows keep engine registry slots pinned, and a pinned slot is
+/// one no reclaim path may take — so nothing but this count bounds them. Arming
+/// past it lands the oldest window first, which is a flush and not a drop.
 ///
 /// Measured across every boot in a 72 MB accumulated log — Chess, Maps, the
 /// WebGL aquarium, page-downs, a title-bar drag, apple.com: the live population

@@ -90,14 +90,11 @@ impl ResourcePools {
             registry: HashMap::new(),
             registry_order: VecDeque::new(),
             reclaimed_recent: VecDeque::new(),
-            use_clock: 0,
             registry_non_pinned_peak: 0,
             registry_non_pinned: NonPinnedTotals::default(),
             registry_non_pinned_peak_bytes: 0,
             registry_sole_copy: NonPinnedTotals::default(),
             registry_sole_copy_peak: NonPinnedTotals::default(),
-            registry_cap_no_victim: 0,
-            registry_cap_evictions: 0,
             resident_resample_peak_ms: 0,
             compute_storage_cap_evictions: 0,
             compute_storage_sole_copy: NonPinnedTotals::default(),
@@ -443,14 +440,14 @@ impl ResourcePools {
     /// Advance the wall-clock idle-drain clock and reclaim a bounded number of
     /// non-pinned residents untouched for `IDLE_TARGET_AGE_MS`. Called from the
     /// poll heartbeat (ticks even when the guest stops publishing) and each
-    /// publish. This is the mechanism that lets `REGISTRY_CAP` sit high enough to
-    /// *absorb* a compositing burst (no eviction thrash) while still returning
+    /// publish. This is the mechanism that lets a compositing burst be *absorbed*
+    /// with no slot count trimming it, while still returning
     /// VRAM to the baseline working set once the burst ends — even on a static
     /// page where no further publishes occur: a burst's targets are all
     /// recently-touched (kept), and its stale leftovers age out ~2 s later. Pinned
     /// slots (deferred-write windows) are never drained — they leave via their own
     /// window lifecycle. Reclaimed images route through the same in-flight-safe
-    /// recycle/dispose path as an LRU eviction; they are NOT counted as
+    /// recycle/dispose path as an allocation-failure reclaim; they are NOT counted as
     /// `target_evicts` (that counter is the thrash signal, and idle reclamation is
     /// not thrash). On a fired pass it also trims the recycle pools
     /// ([`Self::trim_recycle_pools`]) — at idle those are pure retained VRAM.
@@ -803,37 +800,33 @@ impl ResourcePools {
         self.target_free.stats()
     }
 
-    /// `(non_pinned_peak, cap_evictions, non_pinned_peak_bytes)` for the
-    /// resident registry — the reach, the loss, and what the reach costs. None
-    /// of the three answers the question alone.
+    /// `(non_pinned_peak, non_pinned_peak_bytes)` for the resident registry —
+    /// the reach, and what the reach costs. Neither answers alone.
     ///
-    /// All three are cumulative for the life of the pools. The peak is the
-    /// reading that makes a zero eviction count mean something: without it, a
-    /// boot that never came near `REGISTRY_CAP` and a boot that stopped one
-    /// resident short of it report identically. The bytes are what say whether
-    /// the cap is measuring the resource it claims to protect — see
-    /// [`ResourcePools::non_pinned_registry_bytes`].
-    pub(crate) fn registry_pressure_stats(&self) -> (u64, u64, u64) {
+    /// Both are cumulative for the life of the pools. The bytes are what said a
+    /// slot count was never measuring the resource it claimed to protect, which
+    /// is the reading that retired that count — see
+    /// [`ResourcePools::non_pinned_registry_bytes`] and
+    /// [`ResourcePools::recoverable_residents`].
+    pub(crate) fn registry_pressure_stats(&self) -> (u64, u64) {
         (
             self.registry_non_pinned_peak,
-            self.registry_cap_evictions,
             self.registry_non_pinned_peak_bytes,
         )
     }
 
-    /// `(sole_copy_peak_slots, sole_copy_peak_bytes, cap_walks_with_no_victim)`
-    /// — what protecting unreproducible content costs, and how often that
-    /// protection is what stopped the capacity walk.
+    /// `(sole_copy_peak_slots, sole_copy_peak_bytes)` — what protecting
+    /// unreproducible content costs, in the two quantities that have to be read
+    /// together.
     ///
-    /// Returned together because neither half is readable alone: a peak with no
-    /// no-victim count cannot say whether the cap ever wanted those slots, and a
-    /// no-victim count with no peak cannot say how much was being held. See
+    /// This is the population the allocation-failure retry cannot give back, so
+    /// its peak against `registry_non_pinned_peak` is what says whether the
+    /// retry still has anything to work with. See
     /// [`ResourcePools::registry_sole_copy`].
-    pub(crate) fn registry_sole_copy_stats(&self) -> (u64, u64, u64) {
+    pub(crate) fn registry_sole_copy_stats(&self) -> (u64, u64) {
         (
             self.registry_sole_copy_peak.count as u64,
             self.registry_sole_copy_peak.bytes,
-            self.registry_cap_no_victim,
         )
     }
 

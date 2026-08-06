@@ -4,8 +4,8 @@
 //!
 //! A registry entry outlives any one submission. The guest names the same
 //! surface across frames, so an entry is keyed by `TargetIdentity`, held alive
-//! by a pin count, and reclaimed by an LRU cap walk rather than by a fence —
-//! which is why none of this sits with the ring in
+//! by a pin count, and reclaimed by an idle drain or an allocation failure
+//! rather than by a fence — which is why none of this sits with the ring in
 //! [`super::submission_and_buffers`].
 //!
 //! The two meet in one place: the idle-drain planner over there picks its
@@ -631,10 +631,10 @@ impl ResourcePools {
     /// hand back the slot that was removed.
     ///
     /// Split out from [`Self::retire_resident`] for the same reason
-    /// [`Self::cap_eviction_victim`] is split out of
-    /// [`Self::evict_registry_to_cap`]: retiring needs a live `DeviceContext` to
-    /// dispose what it removes, and the bookkeeping — which is the part that was
-    /// diverging — is worth testing without a GPU.
+    /// [`Self::recoverable_residents`] is split out of
+    /// [`Self::reclaim_for_allocation_retry`]: retiring needs a live
+    /// `DeviceContext` to dispose what it removes, and the bookkeeping — which
+    /// is the part that was diverging — is worth testing without a GPU.
     ///
     /// Every path that removes a live entry comes through here, including the
     /// idle drain in [`super::submission_and_buffers`], which disposes on its
@@ -702,17 +702,16 @@ impl ResourcePools {
     ///   `registry_mark_ready`, the type-11 LOAD gate and the idle drain each
     ///   read one of them, and an arm that guessed differently would be
     ///   answering a question the others think they already asked.
-    /// - **The LRU clocks belong to the registry.** `use_seq` comes from
-    ///   `use_clock`, which has to advance exactly once per registration or the
-    ///   cap walk's ordering ties break arbitrarily. A creation site does not
-    ///   own that counter and cannot see the other arm's registrations.
+    /// - **The idle-drain clock belongs to the registry.** `last_touch_ms` comes
+    ///   from `idle_clock_ms`, which the poll heartbeat advances. A creation site
+    ///   that stamped its own value would age against a different clock than the
+    ///   drain reads.
     /// - **`registry` and `registry_order` are written together.** They are one
     ///   structure split for lookup and for order. An entry in the map but not
     ///   the order is a resident no sweep can ever choose; one in the order but
     ///   not the map is a victim that frees nothing.
     fn register_resident(&mut self, identity: &TargetIdentity, new: NewResident) {
-        self.use_clock += 1;
-        let (last_touch_ms, use_seq) = (self.idle_clock_ms, self.use_clock);
+        let last_touch_ms = self.idle_clock_ms;
         self.registry.insert(
             identity.clone(),
             ResidentTargetSlot {
@@ -734,7 +733,6 @@ impl ResourcePools {
                 // not this identity's content.
                 gpu_only_content: false,
                 last_touch_ms,
-                use_seq,
             },
         );
         self.registry_order.push_back(identity.clone());
@@ -754,8 +752,8 @@ impl ResourcePools {
     /// registered.
     ///
     /// The recycling exit for a live registry entry: the two `registry_ensure*`
-    /// recreate arms and [`Self::evict_registry_to_cap`] all take it, and were
-    /// copies of one another before they did. The MRT-secondary path recorded
+    /// recreate arms and [`Self::reclaim_for_allocation_retry`] all take it, and
+    /// were copies of one another before they did. The MRT-secondary path recorded
     /// no reclaim reason at all, so a later draw whose sampled source that path
     /// had recreated could not be told "taken from under you" from "never
     /// existed", which is the whole point of
@@ -798,11 +796,14 @@ impl ResourcePools {
     /// Ensure a resident target exists for `identity` with the given geometry + pass.
     /// Image/memory persist across Load vs Clear render-pass changes; only the
     /// framebuffer is rebuilt when the pass handle differs.
-    /// `protect` shields one additional identity (a same-draw GPU seed
-    /// source) from the capacity sweep, exactly like a pinned slot.
+    ///
+    /// This used to take a `protect` identity — a same-draw GPU seed source to
+    /// shield from the capacity sweep the admission ran. Nothing is swept on
+    /// admission any more, so there is nothing to shield from and the parameter
+    /// is gone rather than ignored. See [`Self::recoverable_residents`].
     #[allow(
         clippy::too_many_arguments,
-        reason = "resident creation mirrors the target identity, format, seed, and protection set"
+        reason = "resident creation mirrors the target identity, geometry, pass and format"
     )]
     pub(crate) unsafe fn registry_ensure(
         &mut self,
@@ -813,7 +814,6 @@ impl ResourcePools {
         render_pass: vk::RenderPass,
         generation: u64,
         bgra: bool,
-        protect: Option<&TargetIdentity>,
         counters: &EngineCounters,
     ) -> Result<&ResidentTargetSlot, DrawError> {
         // Compatible geometry + gen + format: reuse image; rebuild FB if pass
@@ -827,11 +827,8 @@ impl ResourcePools {
                         .gpu_load_hits
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let touch = self.idle_clock_ms;
-                    self.use_clock += 1;
-                    let seq = self.use_clock;
                     let slot = self.registry.get_mut(&identity).unwrap();
                     slot.last_touch_ms = touch;
-                    slot.use_seq = seq;
                     return Ok(slot);
                 }
                 // Same image, new pass → recreate framebuffer only.
@@ -873,9 +870,10 @@ impl ResourcePools {
                 }
             }
         }
-        // Cap the *non-pinned* (evictable) population at REGISTRY_CAP, shielding
-        // the just-resolved `protect` identity from its own eviction.
-        self.evict_registry_to_cap(ctx, counters, protect);
+        // Census only: this population is bounded by the allocation below, which
+        // reclaims and retries on out-of-memory rather than trimming ahead of
+        // one. See `recoverable_residents`.
+        self.note_registry_reach();
         let usage = vk::ImageUsageFlags::COLOR_ATTACHMENT
             | vk::ImageUsageFlags::INPUT_ATTACHMENT
             | vk::ImageUsageFlags::TRANSFER_SRC
@@ -1050,11 +1048,8 @@ impl ResourcePools {
             // Geometry / gen / format mismatch → destroy and recreate.
             self.retire_resident(ctx, &identity, ResidentReclaim::Recreated, counters);
         }
-        // Cap the *non-pinned* population (skip pinned slots), same LRU
-        // discipline as the primary `registry_ensure` — pinned deferred windows
-        // are bounded separately and excluded from the cap count. No `protect`
-        // here: this color path has no just-resolved identity to shield.
-        self.evict_registry_to_cap(ctx, counters, None);
+        // Census only, as in the primary `registry_ensure`.
+        self.note_registry_reach();
         let usage = vk::ImageUsageFlags::COLOR_ATTACHMENT
             | vk::ImageUsageFlags::INPUT_ATTACHMENT
             | vk::ImageUsageFlags::TRANSFER_SRC
@@ -1436,15 +1431,15 @@ impl ResourcePools {
         }
     }
 
-    /// Count of registry residents NOT held by a deferred-write pin — the
-    /// LRU-evictable (active) working set the `REGISTRY_CAP` bounds. Pinned slots
-    /// are bounded separately (by the arming rail's own window cap) and excluded
-    /// so a pinned burst cannot force the active set into eviction thrash.
+    /// Count of registry residents NOT held by a deferred-write pin — the active
+    /// working set the reclaim paths may draw on. Pinned slots are bounded
+    /// separately (by the arming rail's own window cap) and excluded, so a pinned
+    /// burst does not read as reclaimable population.
     ///
     /// O(1). This and [`Self::non_pinned_registry_bytes`] each walked the whole
-    /// registry, on every admit — free only for as long as `REGISTRY_CAP` holds
-    /// the population near 320, which is the bound the byte measurement exists to
-    /// remove. [`Self::registry_non_pinned`] is maintained instead at the sites
+    /// registry, on every admit — affordable only while something held the
+    /// population near a few hundred, which nothing does now that the slot count
+    /// is gone. [`Self::registry_non_pinned`] is maintained instead at the sites
     /// that can change either total, and
     /// `non_pinned_registry_totals_by_walk` is the walk kept as the thing to
     /// check it against (test-only, so not linkable from here).
@@ -1460,9 +1455,9 @@ impl ResourcePools {
     /// Attachment bytes the same non-pinned set occupies: `w x h x texel` summed
     /// over every slot [`Self::non_pinned_registry_len`] counts.
     ///
-    /// The number [`REGISTRY_CAP`]'s doc argues from — it says "slots are cheap;
-    /// the real VRAM guard is per-image bytes", and then bounds the slots. It
-    /// also quoted ~516 MiB for a burst and a ~1005 MiB idle baseline, both from
+    /// The number that retired the slot count: that count claimed slots were
+    /// cheap and the real guard was per-image bytes, and then bounded the slots.
+    /// Its doc also quoted ~516 MiB for a burst and a ~1005 MiB idle baseline, both from
     /// a `vram` census line that no longer exists anywhere in this crate, so
     /// until this counter there was nothing in the device that could say what a
     /// count of 320 costs. 320 slots is 5 MiB of 16x16 scratch or 10 GiB of 4K.
@@ -1579,12 +1574,63 @@ impl ResourcePools {
     /// Every resident the device may destroy without losing guest work: not
     /// pinned, and not the only copy of its own pixels.
     ///
-    /// The same predicate `cap_eviction_victim` filters on, without its
-    /// least-recently-used choice and without `REGISTRY_CAP` — this answers
-    /// "what could be given back if it had to be", which is the question an
-    /// allocation failure asks. Split out from the reclaim so the selection is
-    /// testable without a device, for the reason [`Self::cap_eviction_victim`]
-    /// is.
+    /// This answers "what could be given back if it had to be", which is the
+    /// question an allocation failure asks — and, since the slot cap was retired,
+    /// it is the only question anything asks about this population. Split out
+    /// from the reclaim so the selection is testable without a device.
+    ///
+    /// # The resident-target population is bounded by the allocator, not a count
+    ///
+    /// A slot count used to bound it (`REGISTRY_CAP`, 320): crossing it retired
+    /// the least-recently-used resident this predicate admits. Two things retired
+    /// the count.
+    ///
+    /// **The quantity it bounded is not the quantity that runs out.** Both
+    /// readings, driven x86/PCI Vulkan, `registry_pressure`:
+    ///
+    /// ```text
+    ///                                   peak slots   peak_mib   MiB/slot
+    ///   idle + Safari window drag               41         74       1.80
+    ///   web-content-probe --churn 1            194        211       1.09
+    /// ```
+    ///
+    /// A burst quadruples the population and its residents are *smaller* than the
+    /// idle set's, so 320 slots was reached at roughly 350 MiB at the burst's mix
+    /// and would be 10 GiB at 4K, on a `DEVICE_LOCAL` heap
+    /// ([`crate::backend::vulkan::caps::memory_topology::MemoryProfile::device_local_bytes`])
+    /// measured in gigabytes. One constant could not be both.
+    ///
+    /// **And it could only ever have fired on residents in active use.** The idle
+    /// drain ([`ResourcePools::advance_registry_touch_and_drain`]) already
+    /// reclaims anything untouched for `IDLE_TARGET_AGE_MS`, at up to
+    /// `IDLE_TARGET_DRAIN_MAX_PER_CALL` per pass every `IDLE_DRAIN_INTERVAL_MS` —
+    /// about forty a second. So the standing population *is* the live
+    /// two-second working set, and a count crossing it means the guest is using
+    /// more targets than the count allowed, which is the worst moment to take one
+    /// away. Measured, it never came close: peak 194 of 320 under
+    /// `web-content-probe --churn 1`, `evicts=0` on every boot ever taken.
+    ///
+    /// # What bounds it now
+    ///
+    /// The allocation. [`ResourcePools::registry_ensure`] tries the recycle pool,
+    /// then `vkCreateImage` + [`ResourcePools::bind_image_slab`]; on an
+    /// out-of-memory result it calls [`Self::reclaim_for_allocation_retry`],
+    /// which gives back every recycle pool plus everything this function returns,
+    /// and retries once. If that still fails the draw refuses with the driver's
+    /// own error. That is a GPU refusing because its memory is full — current,
+    /// attributable, and self-healing, since the idle drain frees the space for
+    /// the next attempt — rather than a count destroying an earlier accepted
+    /// result in order to break a future draw.
+    ///
+    /// The sole-copy population was already exempt from the count and already
+    /// grew past it unbounded (the walk soft-exceeded rather than take one), so
+    /// the allocator was already the only bound on the half that *cannot* be
+    /// given back. This puts the half that can behind the same bound.
+    ///
+    /// [`Self::note_registry_reach`] still samples the population and its bytes
+    /// at every admission and `registry_pressure` still publishes both. They are
+    /// worth more without the count than with it: `peak` and `peak_mib` now
+    /// describe what the guest asked for rather than what a constant permitted.
     fn recoverable_residents(&self) -> Vec<TargetIdentity> {
         self.registry_order
             .iter()
@@ -1663,10 +1709,10 @@ impl ResourcePools {
     /// released.
     ///
     /// Out of device memory is the one refusal this device can still do
-    /// something about. `REGISTRY_CAP` bounds the population on a schedule of its
-    /// own and the idle drain returns VRAM on a 2 s timer, so at the moment an
-    /// allocation fails the registry is usually holding residents it was
-    /// entitled to drop and had simply not got to yet. Refusing the guest's draw
+    /// something about, and since the slot count was retired it is the only thing
+    /// bounding this population. The idle drain returns VRAM on a 2 s timer, so
+    /// at the moment an allocation fails the registry is usually holding
+    /// residents it was entitled to drop and had simply not got to yet. Refusing the guest's draw
     /// while still holding them is not "the GPU is out of memory"; it is this
     /// device declining to tidy up first, which is not what the hardware being
     /// emulated does.
@@ -1752,7 +1798,7 @@ impl ResourcePools {
         let mut freed = 0;
         for victim in &victims {
             if self
-                .retire_resident(ctx, victim, ResidentReclaim::CapEvicted, counters)
+                .retire_resident(ctx, victim, ResidentReclaim::AllocationReclaimed, counters)
                 .is_some()
             {
                 freed += 1;
@@ -1772,26 +1818,25 @@ impl ResourcePools {
         freed + trimmed
     }
 
-    /// Fold the current non-pinned population into the high-water band and
-    /// return it.
+    /// Fold the current non-pinned and sole-copy populations into their
+    /// high-water bands.
     ///
-    /// Split from [`Self::evict_registry_to_cap`] for the same reason
-    /// [`Self::cap_eviction_victim`] is: that function is `unsafe` and needs a
-    /// live `DeviceContext` to dispose what it evicts, so nothing about it can
-    /// be exercised without a GPU — and an instrument that is never tested is
-    /// one that can silently read zero forever, which is the failure it exists
-    /// to prevent in the first place.
+    /// Called from both admit paths, immediately before the allocation: that is
+    /// the one point every admission passes through, and it is where the
+    /// population is at its highest. It is a pure census — nothing here selects,
+    /// retires or refuses anything, and it takes neither a `DeviceContext` nor
+    /// `unsafe`, so it is exercisable without a GPU. An instrument that cannot be
+    /// tested is one that can silently read zero forever, which is the failure it
+    /// exists to prevent.
     ///
-    /// Called at the top of the capacity walk, before any eviction: that is the
-    /// one point every admission passes through, and it is where the population
-    /// is at its highest. Sampling after the walk would record the cap back
-    /// rather than the demand that crossed it.
-    /// Both bands are folded here, from the same sample, so `peak` and
-    /// `peak_bytes` describe one population rather than two moments — the two
-    /// together are what say whether a slot count is a sane proxy for VRAM.
-    fn note_registry_reach(&mut self) -> usize {
-        let non_pinned = self.non_pinned_registry_len();
-        self.registry_non_pinned_peak = self.registry_non_pinned_peak.max(non_pinned as u64);
+    /// Both bands are folded from the same sample, so `peak` and `peak_bytes`
+    /// describe one population rather than two moments — the two together are
+    /// what said that a slot count was never a sane proxy for VRAM, which is the
+    /// reading that retired the count. See [`Self::recoverable_residents`].
+    fn note_registry_reach(&mut self) {
+        self.registry_non_pinned_peak = self
+            .registry_non_pinned_peak
+            .max(self.non_pinned_registry_len() as u64);
         self.registry_non_pinned_peak_bytes = self
             .registry_non_pinned_peak_bytes
             .max(self.non_pinned_registry_bytes());
@@ -1799,70 +1844,6 @@ impl ResourcePools {
         // them describes one population and not two moments.
         self.registry_sole_copy_peak =
             Self::high_water(self.registry_sole_copy_peak, self.registry_sole_copy);
-        non_pinned
-    }
-
-    /// Evict non-pinned resident targets (LRU, oldest at the front of
-    /// `registry_order`) until the non-pinned population is at or below
-    /// [`REGISTRY_CAP`]. Pinned slots (deferred render Stores whose only copy is
-    /// on the GPU) and an optional `protect`ed identity rotate to the back
-    /// instead of evicting — they are bounded separately and must not count
-    /// toward the cap, or a pinned burst would force the active set out (thrash).
-    /// One full rotation is the budget. `registry_order` is a `VecDeque`, so each
-    /// front pop / rotate-to-back is O(1) and the whole sweep is O(n) — not the
-    /// O(n²) a `Vec` front-`remove(0)` per rotation would cost under a large
-    /// pinned population (`reg=512` measured under multi-4K load).
-    ///
-    /// Shared by both admit paths (`registry_ensure` passes the just-resolved
-    /// identity as `protect`; `registry_ensure_color` passes `None`).
-    unsafe fn evict_registry_to_cap(
-        &mut self,
-        ctx: &DeviceContext,
-        counters: &EngineCounters,
-        protect: Option<&TargetIdentity>,
-    ) {
-        let mut non_pinned = self.note_registry_reach();
-        while non_pinned > REGISTRY_CAP {
-            // Least-recently-used, for real. `registry_order` is insertion
-            // order — nothing promotes an entry when a draw reuses it — so
-            // popping its front evicted the oldest-*created* resident. A
-            // compositor backdrop is created early and lives for the whole
-            // session, which made it the permanent front and the first victim of
-            // every burst, however hard the current frame was reading it.
-            //
-            // Selecting the minimum `last_touch_ms` protects an in-use resident
-            // without giving up the hard bound: skipping recent entries instead
-            // would let a burst that touches more than `REGISTRY_CAP` targets
-            // inside `IDLE_TARGET_AGE_MS` evict nothing at all and grow the
-            // registry without limit. Here the cap always finds a victim while
-            // any evictable entry exists, and the victim is never more recently
-            // used than an alternative.
-            //
-            // Iterating `registry_order` rather than the map keeps the choice
-            // deterministic: `min_by_key` returns the first minimum, so ties
-            // fall to the oldest-created entry, which is what this walk did for
-            // every entry before. O(n) per eviction rather than O(1) amortised,
-            // and evictions are rare next to binds — the cost this avoids
-            // paying is a promotion on every sampled bind of every draw.
-            let victim = self.cap_eviction_victim(protect);
-            // Everything left is pinned, protected, or the sole copy of its
-            // pixels. Each of those is bounded by something other than this cap,
-            // so the registry soft-exceeds rather than dropping content that
-            // exists nowhere else — the trade this walk has always made for
-            // pinned slots, now extended to every slot for which it is true.
-            //
-            // Counted, because a break is otherwise indistinguishable from a
-            // walk that had nothing to do. `registry_cap_no_victim` rising while
-            // `registry_cap_evictions` stays flat is this working; rising
-            // without bound is a population nothing can trim.
-            let Some(victim) = victim else {
-                self.registry_cap_no_victim += 1;
-                break;
-            };
-            self.retire_resident(ctx, &victim, ResidentReclaim::CapEvicted, counters);
-            self.registry_cap_evictions += 1;
-            non_pinned = non_pinned.saturating_sub(1);
-        }
     }
 
     /// Refresh a resident's idle-drain timestamp to at least `now_ms`. Used by
@@ -1874,11 +1855,8 @@ impl ResourcePools {
             self.idle_clock_ms = now_ms;
         }
         let touch = self.idle_clock_ms;
-        self.use_clock += 1;
-        let seq = self.use_clock;
         if let Some(slot) = self.registry.get_mut(identity) {
             slot.last_touch_ms = touch;
-            slot.use_seq = seq;
         }
     }
 
@@ -1934,42 +1912,6 @@ impl ResourcePools {
             .map(|(_, why, _)| *why)
     }
 
-    /// The resident the capacity walk should evict next, or `None` when every
-    /// entry left is pinned, protected, or the sole copy of its pixels.
-    ///
-    /// `None` makes the walk exceed `REGISTRY_CAP` rather than destroy guest
-    /// work, which is the behaviour a GPU running out of memory has: it refuses
-    /// the next allocation, it does not silently drop a client's render target.
-    /// See [`ResidentTargetSlot::gpu_only_content`].
-    ///
-    /// Least-recently-used, chosen by `use_seq` — **not** by `last_touch_ms`,
-    /// which is the other reclaim path's clock. The two are deliberately
-    /// different: `last_touch_ms` is wall clock and answers "has this gone
-    /// untouched for `IDLE_TARGET_AGE_MS`", which is what the idle drain needs;
-    /// `use_seq` is a monotonic use counter and answers "which of these is
-    /// least recently used", which is the only question with an answer when
-    /// every entry was touched inside the same millisecond. A capacity walk on
-    /// the wall clock cannot order a burst that arrives faster than the clock
-    /// ticks, and a burst is exactly when it runs.
-    ///
-    /// Split out from [`Self::evict_registry_to_cap`] because that function
-    /// needs a live `DeviceContext` to dispose what it evicts, and the choice —
-    /// the part with the policy in it — is worth testing without a GPU.
-    ///
-    /// Iterates `registry_order` rather than the map so the result is
-    /// deterministic: `min_by_key` returns the first minimum, so equal stamps
-    /// fall to the oldest-created entry.
-    fn cap_eviction_victim(&self, protect: Option<&TargetIdentity>) -> Option<TargetIdentity> {
-        self.registry_order
-            .iter()
-            .filter_map(|k| self.registry.get(k).map(|slot| (k, slot)))
-            .filter(|(k, slot)| {
-                slot.pin_count == 0 && !slot.gpu_only_content && protect != Some(k)
-            })
-            .min_by_key(|(_, slot)| slot.use_seq)
-            .map(|(k, _)| k.clone())
-    }
-
     /// Record that a draw is reading this resident as a **sampled source**, so
     /// both reclaim paths count it as in use.
     ///
@@ -1998,18 +1940,15 @@ impl ResourcePools {
     /// closing the application that caused the pressure and why only a reboot
     /// clears it.
     ///
-    /// The stamp this writes is the one both reclaim paths read — the idle drain
-    /// compares it against `IDLE_TARGET_AGE_MS`, and the capacity walk evicts
-    /// the smallest — so recording a read here is what protects a resident from
-    /// each of them.
+    /// The stamp this writes is the one the idle drain reads — it compares
+    /// `last_touch_ms` against `IDLE_TARGET_AGE_MS` — so recording a read here is
+    /// what keeps a resident nothing draws into from aging out under one that
+    /// every frame samples.
     pub(crate) fn registry_note_sampled_use(&mut self, identity: &TargetIdentity) {
         let touch = self.idle_clock_ms;
-        self.use_clock += 1;
-        let seq = self.use_clock;
         if let Some(slot) = self.registry.get_mut(identity) {
             let idle_ms = touch.saturating_sub(slot.last_touch_ms);
             slot.last_touch_ms = touch;
-            slot.use_seq = seq;
             crate::runtime::drain::note_store_route(resident_resample_band(idle_ms));
             // The bands give the distribution; this gives the margin. They
             // answer different questions, and the bands alone could not say
@@ -2042,7 +1981,6 @@ mod pin_count_tests {
             pin_count: 0,
             gpu_only_content: false,
             last_touch_ms: 0,
-            use_seq: 0,
         }
     }
 
@@ -2339,16 +2277,13 @@ mod pin_count_tests {
         assert_eq!(slot.pin_count, 0, "no deferred window holds it yet");
     }
 
-    /// Registration writes the map and the order together, and stamps a use
-    /// sequence that strictly advances.
+    /// Registration writes the map and the order together.
     ///
     /// `registry` and `registry_order` are one structure split for lookup and
-    /// for order: an entry in the map alone is a resident no sweep can choose,
-    /// and one in the order alone is a victim that frees nothing. The sequence
-    /// is what `cap_eviction_victim` breaks ties on, so two registrations inside
-    /// one clock tick must still be ordered.
+    /// for order: an entry in the map alone is a resident no reclaim can choose,
+    /// and one in the order alone is a victim that frees nothing.
     #[test]
-    fn registration_writes_both_halves_and_advances_the_use_sequence() {
+    fn registration_writes_both_halves() {
         let mut pools = ResourcePools::new();
         pools.register_resident(
             &surf(1),
@@ -2367,11 +2302,6 @@ mod pin_count_tests {
         assert!(
             pools.registry.contains_key(&surf(1)) && pools.registry.contains_key(&surf(2)),
             "the map holds both"
-        );
-        assert!(
-            pools.registry.get(&surf(1)).unwrap().use_seq
-                < pools.registry.get(&surf(2)).unwrap().use_seq,
-            "the second registration is later even inside one clock tick"
         );
     }
 
@@ -2428,38 +2358,38 @@ mod pin_count_tests {
         );
     }
 
-    /// The capacity walk exceeds `REGISTRY_CAP` rather than destroy a resident
-    /// that is the only copy of its pixels — the behaviour a GPU out of memory
-    /// has, which is to refuse the next allocation rather than silently drop a
-    /// client's render target.
+    /// The allocation-failure reclaim offers up nothing whose only copy is on
+    /// the GPU, so a device out of memory refuses the next allocation rather
+    /// than silently dropping a client's render target.
     ///
-    /// Asserted on [`ResourcePools::cap_eviction_victim`] rather than on the
-    /// walk, because the walk is `unsafe` and needs a live `DeviceContext` to
-    /// dispose what it chooses; the choice is the part with the policy in it.
+    /// Asserted on [`ResourcePools::recoverable_residents`] rather than on
+    /// `reclaim_for_allocation_retry`, because that function is `unsafe` and
+    /// needs a live `DeviceContext` to dispose what it chooses; the selection is
+    /// the part with the policy in it.
     ///
-    /// Fails without the gate: `surf(1)` is returned as the victim.
+    /// Fails without the gate: `surf(1)` and `surf(2)` stay in the list after
+    /// they are marked ready.
     #[test]
-    fn the_capacity_walk_finds_no_victim_rather_than_destroy_the_only_copy() {
+    fn the_allocation_reclaim_offers_up_nothing_that_is_the_only_copy() {
         let mut pools = ResourcePools::new();
         admit(&mut pools, surf(1), 0, 0);
         admit(&mut pools, surf(2), 0, 0);
         assert_eq!(
-            pools.cap_eviction_victim(None),
-            Some(surf(1)),
-            "least recently used, while both are re-servable"
+            pools.recoverable_residents(),
+            vec![surf(1), surf(2)],
+            "both are re-servable from the guest's own pages"
         );
 
         pools.registry_mark_ready(&surf(1));
         assert_eq!(
-            pools.cap_eviction_victim(None),
-            Some(surf(2)),
-            "the walk moves past the sole copy to the one behind it"
+            pools.recoverable_residents(),
+            vec![surf(2)],
+            "the sole copy drops out; the one behind it is still offered"
         );
 
         pools.registry_mark_ready(&surf(2));
-        assert_eq!(
-            pools.cap_eviction_victim(None),
-            None,
+        assert!(
+            pools.recoverable_residents().is_empty(),
             "nothing left that can be destroyed without losing a frame"
         );
     }
@@ -2522,9 +2452,9 @@ mod pin_count_tests {
         // Death of a sole-copy slot and of a copied-out one. Only the first was
         // ever in the totals, and the guest replacing a resource is the one way
         // a sole-copy slot leaves the registry.
-        pools.unregister_resident(&surf(2), ResidentReclaim::CapEvicted);
+        pools.unregister_resident(&surf(2), ResidentReclaim::AllocationReclaimed);
         check(&pools, "unregistering the sole-copy slot");
-        pools.unregister_resident(&surf(1), ResidentReclaim::CapEvicted);
+        pools.unregister_resident(&surf(1), ResidentReclaim::AllocationReclaimed);
         check(&pools, "unregistering the copied-out slot");
         assert_eq!(pools.registry_sole_copy, NonPinnedTotals::default());
 
@@ -2853,87 +2783,23 @@ mod pin_count_tests {
         );
     }
 
-    /// The capacity walk evicts the least-recently-*used* resident, so a
-    /// backdrop a draw is reading is not taken merely for being old.
-    ///
-    /// `registry_order` is insertion order — nothing promotes an entry when a
-    /// draw reuses it — so popping its front evicted the oldest-*created*
-    /// resident, which for a session-long backdrop is permanently the front.
-    /// Choosing by `last_touch_ms` is what separates "created first" from "not
-    /// being used", and it keeps the cap hard: skipping recent entries instead
-    /// would let a burst touching more than `REGISTRY_CAP` targets inside the
-    /// age window evict nothing at all.
+    /// A pinned resident is never offered to the allocation-failure reclaim, and
+    /// a registry of nothing else offers an empty list — so the allocation
+    /// refuses rather than the device dropping content whose only copy is on the
+    /// GPU.
     #[test]
-    fn the_cap_walk_evicts_the_least_recently_used_not_the_oldest_created() {
-        let mut pools = ResourcePools::new();
-        // surf(1) is created first and is therefore the front of insertion
-        // order — the old victim — but it is the one being read.
-        admit(&mut pools, surf(1), 0, 0);
-        admit(&mut pools, surf(2), 0, 0);
-        admit(&mut pools, surf(3), 0, 0);
-        pools.idle_clock_ms = 5_000;
-        pools.registry_note_sampled_use(&surf(1));
-        assert_eq!(
-            pools.cap_eviction_victim(None),
-            Some(surf(2)),
-            "the least-recently-used resident is the victim, not the first created"
-        );
-        // Protection still applies, and the walk still finds someone else.
-        assert_eq!(
-            pools.cap_eviction_victim(Some(&surf(2))),
-            Some(surf(3)),
-            "a protected identity is passed over for the next-oldest use"
-        );
-    }
-
-    /// Uses inside one poll tick are still ordered against each other.
-    ///
-    /// `last_touch_ms` comes from the ~244 Hz poll heartbeat, so every use
-    /// between two ticks carries the same millisecond. Choosing the victim on
-    /// that alone leaves a tie, and the tie falls to the oldest-created entry —
-    /// which is precisely the session-long backdrop this walk must stop taking.
-    /// `use_seq` gives the total order, so a resident read this tick outranks
-    /// one last read several ticks ago even though the clock never moved
-    /// between them.
-    #[test]
-    fn uses_within_one_clock_tick_are_still_ordered() {
-        let mut pools = ResourcePools::new();
-        // Same wall-clock stamp on every slot: one poll tick.
-        admit(&mut pools, surf(1), 500, 0);
-        admit(&mut pools, surf(2), 500, 0);
-        pools.idle_clock_ms = 500;
-        // Read the oldest-created one last. The clock cannot express that.
-        pools.registry_note_sampled_use(&surf(2));
-        pools.registry_note_sampled_use(&surf(1));
-        assert_eq!(
-            pools.registry.get(&surf(1)).unwrap().last_touch_ms,
-            pools.registry.get(&surf(2)).unwrap().last_touch_ms,
-            "precondition: the wall clock cannot separate these two uses"
-        );
-        assert_eq!(
-            pools.cap_eviction_victim(None),
-            Some(surf(2)),
-            "the earlier use in the tick is the victim, not the earlier creation"
-        );
-    }
-
-    /// A pinned resident is never the victim, and a registry with nothing else
-    /// left reports no victim rather than dropping content whose only copy is on
-    /// the GPU — the soft-exceed the walk has always traded for.
-    #[test]
-    fn the_cap_walk_never_evicts_a_pinned_resident() {
+    fn the_allocation_reclaim_never_offers_a_pinned_resident() {
         let mut pools = ResourcePools::new();
         admit(&mut pools, surf(1), 0, 1);
         admit(&mut pools, surf(2), 0, 2);
-        assert_eq!(
-            pools.cap_eviction_victim(None),
-            None,
-            "every entry is pinned, so the cap soft-exceeds rather than evicting"
+        assert!(
+            pools.recoverable_residents().is_empty(),
+            "every entry is pinned, so there is nothing to give back"
         );
         admit(&mut pools, surf(3), 10, 0);
         assert_eq!(
-            pools.cap_eviction_victim(None),
-            Some(surf(3)),
+            pools.recoverable_residents(),
+            vec![surf(3)],
             "the one unpinned resident is the only candidate"
         );
     }
@@ -2975,7 +2841,7 @@ mod pin_count_tests {
         // Writing one would make `prior_reclaim` claim this device took a
         // resident that never existed — the exact confusion it exists to avoid.
         assert!(pools
-            .unregister_resident(&surf(3), ResidentReclaim::CapEvicted)
+            .unregister_resident(&surf(3), ResidentReclaim::AllocationReclaimed)
             .is_none());
         assert_eq!(pools.prior_reclaim(&surf(3)), None);
     }
@@ -2991,14 +2857,14 @@ mod pin_count_tests {
     fn the_reclaim_history_names_the_path_and_is_bounded() {
         let mut pools = ResourcePools::new();
         pools.note_resident_reclaimed(&surf(1), ResidentReclaim::IdleDrained);
-        pools.note_resident_reclaimed(&surf(2), ResidentReclaim::CapEvicted);
+        pools.note_resident_reclaimed(&surf(2), ResidentReclaim::AllocationReclaimed);
         assert_eq!(
             pools.prior_reclaim(&surf(1)),
             Some(ResidentReclaim::IdleDrained)
         );
         assert_eq!(
             pools.prior_reclaim(&surf(2)),
-            Some(ResidentReclaim::CapEvicted)
+            Some(ResidentReclaim::AllocationReclaimed)
         );
         assert_eq!(
             pools.prior_reclaim(&surf(3)),
@@ -3015,7 +2881,7 @@ mod pin_count_tests {
         // Bounded: the oldest record falls out rather than the history growing
         // without limit, and falling out reads as no record.
         for i in 0..RECLAIM_HISTORY as u32 {
-            pools.note_resident_reclaimed(&surf(1000 + i), ResidentReclaim::CapEvicted);
+            pools.note_resident_reclaimed(&surf(1000 + i), ResidentReclaim::AllocationReclaimed);
         }
         assert!(pools.reclaimed_recent.len() <= RECLAIM_HISTORY);
         assert_eq!(
@@ -3192,11 +3058,12 @@ mod pin_count_tests {
 
     /// The byte band is not the slot band scaled, and a boot needs both.
     ///
-    /// `REGISTRY_CAP` bounds slots while saying the resource it protects is
-    /// bytes. This drives the difference directly: two populations of the same
-    /// size, one of 16x16 scratch and one of 4K attachments, are indistinguishable
-    /// to the slot band and four orders of magnitude apart in VRAM. A cap that
-    /// cannot see that gap is the reason this counter exists.
+    /// A slot count once bounded this population while the resource it protected
+    /// was bytes. This drives the difference directly: two populations of the
+    /// same size, one of 16x16 scratch and one of 4K attachments, are
+    /// indistinguishable to the slot band and four orders of magnitude apart in
+    /// VRAM. That gap is why this counter exists, and it is what retired the
+    /// count — see [`ResourcePools::recoverable_residents`].
     #[test]
     fn the_registry_byte_band_separates_populations_the_slot_band_cannot() {
         const TEXEL: u64 = 4; // SCANOUT_FORMAT, the shape `new_resident` builds
@@ -3207,19 +3074,19 @@ mod pin_count_tests {
             admit_sized(&mut pools, surf(i), 10, 0, SMALL);
         }
         pools.note_registry_reach();
-        let (slots_small, _, bytes_small) = pools.registry_pressure_stats();
+        let (slots_small, bytes_small) = pools.registry_pressure_stats();
         assert_eq!(slots_small, 3);
         assert_eq!(bytes_small, 3 * 16 * 16 * TEXEL);
 
         // The same slot count at 4K geometry. Pinned peers stay out of both
-        // bands, or the byte reading would count VRAM the cap never bounds.
+        // bands, so the two readings describe one population.
         let mut big = ResourcePools::new();
         for i in 1..=3u32 {
             admit_sized(&mut big, surf(i), 10, 0, UHD);
         }
         admit_sized(&mut big, surf(9), 10, 1, UHD);
         big.note_registry_reach();
-        let (slots_big, _, bytes_big) = big.registry_pressure_stats();
+        let (slots_big, bytes_big) = big.registry_pressure_stats();
         assert_eq!(
             slots_big, slots_small,
             "the slot band cannot tell the two populations apart"
@@ -3234,11 +3101,11 @@ mod pin_count_tests {
         // lower it, or a burst that drains between two census samples reads as
         // if it never happened.
         for i in 1..=3u32 {
-            big.unregister_resident(&surf(i), ResidentReclaim::CapEvicted);
+            big.unregister_resident(&surf(i), ResidentReclaim::AllocationReclaimed);
         }
         big.note_registry_reach();
         assert_eq!(
-            big.registry_pressure_stats().2,
+            big.registry_pressure_stats().1,
             bytes_big,
             "the byte band holds its peak"
         );
@@ -3246,8 +3113,8 @@ mod pin_count_tests {
 
     /// The maintained non-pinned totals still say what a full walk would.
     ///
-    /// They stopped being a walk so the population can grow past `REGISTRY_CAP`
-    /// without a per-admit O(n) scan, and the cost of that is three writers that
+    /// They stopped being a walk so the population can grow without a per-admit
+    /// O(n) scan, and the cost of that is three writers that
     /// can fall out of step with the registry in silence. A slot that stopped
     /// being counted makes the population read smaller than it is, which is the
     /// direction that lets a bound sit above itself — so every transition is
@@ -3298,26 +3165,26 @@ mod pin_count_tests {
         // was ever in the totals.
         assert!(pools.pin_resident_target(&surf(2), true));
         check(&pools, "pinning the second");
-        pools.unregister_resident(&surf(2), ResidentReclaim::CapEvicted);
+        pools.unregister_resident(&surf(2), ResidentReclaim::AllocationReclaimed);
         check(&pools, "unregistering a pinned resident");
-        pools.unregister_resident(&surf(1), ResidentReclaim::CapEvicted);
+        pools.unregister_resident(&surf(1), ResidentReclaim::AllocationReclaimed);
         check(&pools, "unregistering an unpinned resident");
         assert_eq!(pools.registry_non_pinned, NonPinnedTotals::default());
 
         // And an unregister of something that was never there.
-        pools.unregister_resident(&surf(7), ResidentReclaim::CapEvicted);
+        pools.unregister_resident(&surf(7), ResidentReclaim::AllocationReclaimed);
         check(&pools, "unregistering an absent identity");
     }
 
     /// The registry reach band records the highest population, and does not
     /// fall back when residents go away.
     ///
-    /// Without this the cap's own counter is uninterpretable. A boot reporting
-    /// `evicts=0` has said only that `REGISTRY_CAP` did not bind on the workload
-    /// that ran, and a peak of 40 and a peak of one-below-the-cap both satisfy
-    /// that — opposite answers to whether the bound has headroom. AGENTS.md
-    /// states the rule this implements: band the requested reach before widening
-    /// or narrowing any table.
+    /// This is the whole instrument now that no count bounds the population: the
+    /// peak is what says how far a workload reached, and `peak_bytes` beside it
+    /// is what says whether a slot count could ever have stood for VRAM. It
+    /// answered no, which is what retired that count. AGENTS.md states the rule
+    /// this implements: band the requested reach before widening or narrowing any
+    /// table.
     ///
     /// Two properties, because only the pair is a high-water mark. It has to
     /// rise with the population, and it has to *stay* when the population drops
@@ -3325,29 +3192,29 @@ mod pin_count_tests {
     /// registry happened to hold at census time and miss every burst, which is
     /// the only thing the cap exists for.
     ///
-    /// Pinned residents are excluded, matching what `REGISTRY_CAP` bounds, so a
-    /// pinned peer must not inflate the reading.
+    /// Pinned residents are excluded — they are the population the reclaim paths
+    /// refuse to take — so a pinned peer must not inflate the reading.
     #[test]
     fn the_registry_reach_band_holds_the_peak_and_ignores_pinned_residents() {
         let mut pools = ResourcePools::new();
         assert_eq!(
             pools.registry_pressure_stats(),
-            (0, 0, 0),
-            "a fresh pools has neither reach, loss, nor footprint"
+            (0, 0),
+            "a fresh pools has neither reach nor footprint"
         );
 
         admit(&mut pools, surf(1), 10, 0);
         admit(&mut pools, surf(2), 10, 0);
-        admit(&mut pools, surf(3), 10, 1); // pinned -- not what the cap bounds
-        assert_eq!(pools.note_registry_reach(), 2, "the pinned peer is excluded");
+        admit(&mut pools, surf(3), 10, 1); // pinned -- excluded from the band
+        pools.note_registry_reach();
         assert_eq!(
             pools.registry_pressure_stats().0,
             2,
-            "the band took the non-pinned population"
+            "the band took the non-pinned population, excluding the pinned peer"
         );
 
         admit(&mut pools, surf(4), 10, 0);
-        assert_eq!(pools.note_registry_reach(), 3);
+        pools.note_registry_reach();
         assert_eq!(pools.registry_pressure_stats().0, 3, "the band rose");
 
         // Every non-pinned resident goes away, leaving only the pinned peer, so
@@ -3359,23 +3226,18 @@ mod pin_count_tests {
         // test that wrote both itself would leave them counting residents that
         // are gone.
         for id in [surf(1), surf(2), surf(4)] {
-            pools.unregister_resident(&id, ResidentReclaim::CapEvicted);
+            pools.unregister_resident(&id, ResidentReclaim::AllocationReclaimed);
         }
         assert_eq!(
-            pools.note_registry_reach(),
+            pools.non_pinned_registry_len(),
             0,
             "the population really fell, and the pinned peer never counted"
         );
+        pools.note_registry_reach();
         assert_eq!(
             pools.registry_pressure_stats().0,
             3,
             "the peak is a high-water mark, not the current population"
         );
-        assert_eq!(
-            pools.registry_pressure_stats().1,
-            0,
-            "nothing was evicted, so the loss half stays zero"
-        );
     }
-
 }
