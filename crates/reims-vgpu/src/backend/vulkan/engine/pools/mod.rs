@@ -958,10 +958,27 @@ pub(crate) struct ResidentTargetSlot {
     /// not a lost frame. Driving that to 0 is a throughput question for the drain
     /// cutoff and has nothing to do with this field.
     ///
-    /// Not established by that run: whether the host-window present path ever
-    /// composites into a resident without passing `registry_mark_ready*`. If it
-    /// does, such a slot is unprotected here — the same gap that existed before
-    /// this field, narrowed rather than closed.
+    /// # Every writer does pass through the two setters
+    ///
+    /// The protection is only as complete as that claim, so it was audited
+    /// rather than assumed. Every recorded GPU write whose destination is a
+    /// registry resident's image:
+    ///
+    /// - the draw pass itself (`exec::execute_draw_inner`'s
+    ///   `cmd_begin_render_pass`), and the two seed paths that precede it
+    ///   (`cmd_copy_buffer_to_image` from a host seed, `cmd_copy_image` from
+    ///   another resident) — all three covered by the one `registry_mark_ready`
+    ///   after the pass;
+    /// - the MRT secondary attachments, covered by the `registry_mark_ready_at`
+    ///   loop beside it.
+    ///
+    /// The host-window present path is **not** a writer and was the specific
+    /// worry: `window_present` reads residents as blit and clear *sources* and
+    /// writes only the swapchain image, which is never a registry resident. The
+    /// one thing it mutates on a resident is its tracked layout.
+    ///
+    /// Sampled and staging images are written on other paths, but they are not
+    /// registry residents and hold no identity a later draw could resolve.
     pub gpu_only_content: bool,
     /// Value of `ResourcePools::idle_clock_ms` (wall-clock ms) at this target's
     /// last use (admit, `registry_ensure` hit, or present touch). The idle drain
