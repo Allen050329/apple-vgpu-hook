@@ -177,17 +177,38 @@ impl ResourcePools {
                     memory_type_bits: req.memory_type_bits,
                 })
             })?;
-        let memory = allocate_memory_timed(
-            ctx,
-            &vk::MemoryAllocateInfo::default()
-                .allocation_size(req.size)
-                .memory_type_index(mt),
-            AllocSite::StorageImage,
-        )
-        .map_err(|e| {
-            ctx.device.destroy_image(image, None);
-            DrawError::VkCall(VkCall::new(VkOp::PoolsAllocStorageImage, e))
-        })?;
+        // A compute storage image takes a dedicated `vkAllocateMemory` rather
+        // than a slab suballocation, so it does not pass through
+        // `bind_image_slab` and does not inherit its out-of-memory retry. It
+        // gets the same one here, and for the same reason: a refusal costs the
+        // guest a dispatch, and this device is usually still holding recycle
+        // pools it was entitled to give back.
+        let alloc = |ctx: &DeviceContext| {
+            allocate_memory_timed(
+                ctx,
+                &vk::MemoryAllocateInfo::default()
+                    .allocation_size(req.size)
+                    .memory_type_index(mt),
+                AllocSite::StorageImage,
+            )
+        };
+        let memory = match alloc(ctx) {
+            Ok(m) => m,
+            Err(first)
+                if (first == vk::Result::ERROR_OUT_OF_DEVICE_MEMORY
+                    || first == vk::Result::ERROR_OUT_OF_HOST_MEMORY)
+                    && self.reclaim_pools_for_allocation_retry(ctx) > 0 =>
+            {
+                alloc(ctx).map_err(|_| {
+                    ctx.device.destroy_image(image, None);
+                    DrawError::VkCall(VkCall::new(VkOp::PoolsAllocStorageImage, first))
+                })?
+            }
+            Err(e) => {
+                ctx.device.destroy_image(image, None);
+                return Err(DrawError::VkCall(VkCall::new(VkOp::PoolsAllocStorageImage, e)));
+            }
+        };
         counters.note_alloc();
         ctx.device
             .bind_image_memory(image, memory, 0)
