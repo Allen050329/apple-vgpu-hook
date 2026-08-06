@@ -205,6 +205,9 @@ simply the wrong number, a length four bytes off, or a field two bytes too wide:
 | Is a bound named so those three can see it at all? | `crates/reims-vgpu/tests/a_bound_in_a_cut_is_named_like_one.rs` |
 | Is a product widened by a cast that comes too late to help? | `crates/reims-vgpu/tests/a_product_is_widened_before_it_is_taken.rs` |
 | Do the source scans read the product half, or its fixtures? | `crates/reims-vgpu/tests/the_source_scanner_reads_the_product_and_not_its_fixtures.rs` |
+| Can a guest record panic a parser instead of being refused? | `crates/reims-vgpu/tests/a_decoder_survives_bytes_the_guest_could_write.rs` |
+| Does a wire struct hold a field an out-of-range guest value makes UB? | `crates/reims-vgpu/tests/a_wire_struct_holds_only_all_bytes_valid_fields.rs` |
+| Does a C ABI entry report the wrong entry point when it panics? | `crates/reims-vgpu/tests/an_abi_entry_names_itself_when_it_panics.rs` |
 
 Do **not** answer that one by diffing `ls src/ops/` against a `grep` for
 `use reims_vgpu_wire` — that pair used to live here and it is wrong by 40 % on

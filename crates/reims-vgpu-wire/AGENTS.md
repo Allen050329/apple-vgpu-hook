@@ -46,7 +46,13 @@ These are load-bearing. A change that breaks one is wrong even if it compiles an
    and never `unwrap()` a view in library code.
 4. **No enums, `bool`, `char`, `NonZero*` or references in wire structs.** An out-of-range guest
    value in any of those is undefined behaviour, not a decode error. Store the raw scalar and expose
-   a fallible accessor.
+   a fallible accessor. Enforced by
+   `crates/reims-vgpu/tests/a_wire_struct_holds_only_all_bytes_valid_fields.rs`, which allows a
+   field only if it is a `le` scalar, `u8`/`i8`, an array of those, or another `Wire` type — so a
+   type it has not heard of fails rather than being assumed safe. Note what it adds over the
+   compiler: `ASSERT_ALIGN_1` already rejects a bare `u32`, a `char` and a `#[repr(u32)]` enum
+   because those are over-aligned, so the cases that actually reach this rule are the **align-1**
+   ones — `bool`, `NonZeroU8`, a `#[repr(u8)]` enum. All three compile.
 5. **`unsafe impl Wire` needs a comment** naming why both requirements hold. The existing ones are
    the template.
 6. **Never widen a field to make a value fit.** If a value does not fit, the layout is wrong;
