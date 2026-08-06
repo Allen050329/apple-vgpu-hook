@@ -176,14 +176,14 @@ const ROWS: &[Row] = &[
               which is the same 128 the serializer truncates a plural texture bind at.",
     },
     Row {
-        at: "reims-vgpu/src/backend/metal/render.rs:372",
+        at: "reims-vgpu/src/backend/metal/render.rs:396",
         bound: "REIMS_VGPU_METAL_MAX_BUFFERS",
         verdict: Verdict::ContractLimit,
         why: "Metal's buffer argument table, pinned to draw::MAX_BUFFER_BIND_SLOTS; \
               setVertexBuffer: at an index past it throws rather than returning.",
     },
     Row {
-        at: "reims-vgpu/src/backend/metal/render.rs:408",
+        at: "reims-vgpu/src/backend/metal/render.rs:432",
         bound: "REIMS_VGPU_METAL_MAX_ATTRS",
         verdict: Verdict::ContractLimit,
         why: "MTLVertexDescriptor.attributes is a 31-slot array; pinned to the \
@@ -191,7 +191,7 @@ const ROWS: &[Row] = &[
               the refusal the same width.",
     },
     Row {
-        at: "reims-vgpu/src/backend/metal/render.rs:421",
+        at: "reims-vgpu/src/backend/metal/render.rs:445",
         bound: "REIMS_VGPU_METAL_MAX_ATTRS",
         verdict: Verdict::ContractLimit,
         why: "The same 31-slot array, indexed by an attribute's own location \
@@ -199,7 +199,7 @@ const ROWS: &[Row] = &[
               not have.",
     },
     Row {
-        at: "reims-vgpu/src/backend/metal/render.rs:482",
+        at: "reims-vgpu/src/backend/metal/render.rs:506",
         bound: "MTL_VERTEX_STEP_FUNCTION_PER_INSTANCE",
         verdict: Verdict::NotABound,
         why: "An MTLVertexStepFunction ordinal, not a capacity. It is in this \
@@ -207,7 +207,7 @@ const ROWS: &[Row] = &[
               inside PER_INSTANCE.",
     },
     Row {
-        at: "reims-vgpu/src/backend/metal/render.rs:1600",
+        at: "reims-vgpu/src/backend/metal/render.rs:1624",
         bound: "REIMS_VGPU_METAL_MAX_COLOR_RTS",
         verdict: Verdict::WireField,
         why: "Metal's eight colour attachments, held equal by a const assertion to \
@@ -215,7 +215,7 @@ const ROWS: &[Row] = &[
               Apple's serialized render-pass record.",
     },
     Row {
-        at: "reims-vgpu/src/backend/metal/render.rs:1610",
+        at: "reims-vgpu/src/backend/metal/render.rs:1634",
         bound: "REIMS_VGPU_METAL_MAX_COLOR_RTS",
         verdict: Verdict::WireField,
         why: "The same eight, tested against a slot number rather than a count: a \
@@ -223,7 +223,7 @@ const ROWS: &[Row] = &[
               to have carried.",
     },
     Row {
-        at: "reims-vgpu/src/backend/metal/render.rs:1695",
+        at: "reims-vgpu/src/backend/metal/render.rs:1719",
         bound: "REIMS_VGPU_BACKEND_MAX_VIEWPORTS",
         verdict: Verdict::NeverReached,
         why: "The list is built in draw::mod from DrawEncodeRequest::viewport, an \
@@ -236,7 +236,7 @@ const ROWS: &[Row] = &[
               rendering, not this bound.",
     },
     Row {
-        at: "reims-vgpu/src/backend/metal/render.rs:1701",
+        at: "reims-vgpu/src/backend/metal/render.rs:1725",
         bound: "REIMS_VGPU_BACKEND_MAX_SCISSORS",
         verdict: Verdict::NeverReached,
         why: "The scissor twin of the viewport row above, unreachable for the same \

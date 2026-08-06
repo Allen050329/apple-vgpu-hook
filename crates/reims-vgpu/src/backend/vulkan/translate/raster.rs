@@ -11,7 +11,8 @@ use ash::vk;
 
 use super::reason::TranslateReason;
 use crate::backend::vulkan::engine::{
-    CullMode, IndexType, PrimitiveTopology, SamplerCompareFunction, StencilOp,
+    CullMode, DepthClipMode, FillMode, IndexType, PrimitiveTopology, SamplerCompareFunction,
+    StencilOp,
 };
 
 /// `MTLPrimitiveType` (SDK numeric values).
@@ -33,6 +34,24 @@ pub fn cull_mode(mtl: u32) -> Result<CullMode, TranslateReason> {
         1 => CullMode::Front,
         2 => CullMode::Back,
         other => return Err(TranslateReason::UnknownCullMode(other)),
+    })
+}
+
+/// `MTLTriangleFillMode` (SDK numeric values).
+pub fn fill_mode(mtl: u32) -> Result<FillMode, TranslateReason> {
+    Ok(match mtl {
+        0 => FillMode::Fill,
+        1 => FillMode::Lines,
+        other => return Err(TranslateReason::UnknownFillMode(other)),
+    })
+}
+
+/// `MTLDepthClipMode` (SDK numeric values).
+pub fn depth_clip_mode(mtl: u32) -> Result<DepthClipMode, TranslateReason> {
+    Ok(match mtl {
+        0 => DepthClipMode::Clip,
+        1 => DepthClipMode::Clamp,
+        other => return Err(TranslateReason::UnknownDepthClipMode(other)),
     })
 }
 
@@ -140,6 +159,29 @@ pub fn vk_cull_mode(mode: CullMode) -> vk::CullModeFlags {
     }
 }
 
+/// The polygon mode that rasterizes a Metal fill mode.
+///
+/// `LINE` requires `VkPhysicalDeviceFeatures::fillModeNonSolid`; the caller
+/// gates on it, because the alternative — quietly returning `FILL` — is the
+/// wireframe-rendered-solid bug this translation exists to prevent.
+pub fn vk_polygon_mode(mode: FillMode) -> vk::PolygonMode {
+    match mode {
+        FillMode::Fill => vk::PolygonMode::FILL,
+        FillMode::Lines => vk::PolygonMode::LINE,
+    }
+}
+
+/// Whether the pipeline sets `depthClampEnable`.
+///
+/// `true` requires `VkPhysicalDeviceFeatures::depthClamp`, gated at the caller
+/// for the same reason as [`vk_polygon_mode`].
+pub fn vk_depth_clamp_enable(mode: DepthClipMode) -> bool {
+    match mode {
+        DepthClipMode::Clip => false,
+        DepthClipMode::Clamp => true,
+    }
+}
+
 /// The Vulkan `FrontFace` that reproduces Metal front-face selection.
 ///
 /// Metal evaluates winding in its window space (origin top-left, Y down) and its
@@ -223,6 +265,15 @@ mod tests {
         assert_eq!(
             cull_mode(3).unwrap_err(),
             TranslateReason::UnknownCullMode(3)
+        );
+        for mtl in 0..=1u32 {
+            assert!(fill_mode(mtl).is_ok(), "fill {mtl}");
+            assert!(depth_clip_mode(mtl).is_ok(), "depth clip {mtl}");
+        }
+        assert_eq!(fill_mode(2).unwrap_err(), TranslateReason::UnknownFillMode(2));
+        assert_eq!(
+            depth_clip_mode(2).unwrap_err(),
+            TranslateReason::UnknownDepthClipMode(2)
         );
         assert!(!front_face_ccw(0).unwrap());
         assert!(front_face_ccw(1).unwrap());
@@ -339,6 +390,25 @@ mod tests {
             vk_topology(primitive_topology(4).unwrap()),
             vk::PrimitiveTopology::TRIANGLE_STRIP
         );
+    }
+
+    /// The two rasterization modes whose non-default arm needs a device
+    /// feature. Metal's default is 0 in both, and 0 must map to the spelling
+    /// that needs nothing — a table rotated here would make every draw in the
+    /// tree ask for a feature the host may not have.
+    #[test]
+    fn the_metal_default_raster_mode_needs_no_device_feature() {
+        assert_eq!(fill_mode(0), Ok(FillMode::Fill));
+        assert_eq!(vk_polygon_mode(FillMode::Fill), vk::PolygonMode::FILL);
+        assert_eq!(vk_polygon_mode(FillMode::Lines), vk::PolygonMode::LINE);
+        assert_eq!(depth_clip_mode(0), Ok(DepthClipMode::Clip));
+        assert!(!vk_depth_clamp_enable(DepthClipMode::Clip));
+        assert!(vk_depth_clamp_enable(DepthClipMode::Clamp));
+        // `Default` is what a draw that bound neither record carries, so it has
+        // to be the same answer as the Metal default rather than merely the
+        // first variant.
+        assert_eq!(FillMode::default(), FillMode::Fill);
+        assert_eq!(DepthClipMode::default(), DepthClipMode::Clip);
     }
 
     #[test]

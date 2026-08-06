@@ -420,19 +420,14 @@ pub struct ReimsVgpuScissor {
 
 /// The encoder raster state this device applies.
 ///
-/// Two of the five `MTLRenderCommandEncoder` raster setters, and only two.
-/// Depth clip mode, triangle fill mode and line width had slots here too, and
-/// no guest action could reach them: the one producer
-/// ([`crate::runtime::draw`]) hard-coded all three absent, because
-/// `runtime::exec` decodes those three records and *drops* them under
-/// `render_depth_clip_mode_dropped`, `render_fill_mode_dropped` and
-/// `render_line_width_dropped` — and the ICB descriptor drops its own
-/// inherit-flag equivalents the same way. Two mechanisms claimed the same three
-/// states and only the counted one ran.
+/// Four of the five `MTLRenderCommandEncoder` raster setters. Each state is a
+/// `has_` flag beside its raw Metal ordinal, so a word the stream never bound
+/// is not read at all — the ordinals have no reserved "unset" value, and 0 is
+/// a real mode in all four.
 ///
-/// Those counters are what says whether to build the other, and they are the
-/// place to add the fields back: a reading above zero is the measured argument,
-/// and re-plumbing a state is one `Option` on the request plus one setter here.
+/// The fifth is line width, which `setLineWidth:` puts on the wire and
+/// `MTLRenderCommandEncoder` has no public setter for; `runtime::exec` still
+/// counts it as `render_line_width_dropped`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct ReimsVgpuRasterState {
@@ -440,6 +435,26 @@ pub struct ReimsVgpuRasterState {
     pub cull_mode: u32,
     pub has_front_facing_winding: u32,
     pub front_facing_winding: u32,
+    pub has_fill_mode: u32,
+    pub fill_mode: u32,
+    pub has_depth_clip_mode: u32,
+    pub depth_clip_mode: u32,
+}
+
+impl ReimsVgpuRasterState {
+    /// Whether the stream bound any of these states, and so whether the record
+    /// is worth encoding at all.
+    ///
+    /// Here rather than at the producer because the answer is a property of
+    /// the struct: a field added without an arm in this `or` chain is a state
+    /// the guest set and the encoder never hears about, and this way there is
+    /// one place for that mistake instead of one per call site.
+    pub fn any_bound(&self) -> bool {
+        self.has_cull_mode != 0
+            || self.has_front_facing_winding != 0
+            || self.has_fill_mode != 0
+            || self.has_depth_clip_mode != 0
+    }
 }
 
 #[repr(C)]

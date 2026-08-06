@@ -5158,6 +5158,25 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 req.pipeline_ref,
                 "winding_unmapped",
             ),
+            // MTLTriangleFillMode / MTLDepthClipMode, both defaulting to 0.
+            // Unlike the two above, the non-default arm of each needs a device
+            // feature, so the engine may still decline the pipeline by name
+            // after this maps cleanly: the mapping says what the guest asked
+            // for, the capability check says whether the host can spell it.
+            fill_mode: raster_or_default(
+                req.fill_mode,
+                translate::raster::fill_mode,
+                crate::backend::vulkan::engine::FillMode::Fill,
+                req.pipeline_ref,
+                "fill_mode_unmapped",
+            ),
+            depth_clip: raster_or_default(
+                req.depth_clip_mode,
+                translate::raster::depth_clip_mode,
+                crate::backend::vulkan::engine::DepthClipMode::Clip,
+                req.pipeline_ref,
+                "depth_clip_mode_unmapped",
+            ),
             first_vertex: req.first_vertex,
             // Passed through. `decode::render`'s `wire_instance_count` is where
             // a zero instance count is decided, and it is decided once — a

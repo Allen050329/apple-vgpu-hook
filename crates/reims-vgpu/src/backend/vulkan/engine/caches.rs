@@ -13,8 +13,8 @@ use super::counters::EngineCounters;
 use super::digest::Digest128;
 use super::pools::{DeferredHandle, ResourcePools};
 use super::types::{
-    BlendKey, ColorWriteMask, CullMode, DrawError, PrimitiveTopology, SamplerStateKey,
-    VertexAttributeFormat, VertexStepFunction,
+    BlendKey, ColorWriteMask, CullMode, DepthClipMode, DrawError, FillMode, PrimitiveTopology,
+    SamplerStateKey, VertexAttributeFormat, VertexStepFunction,
 };
 use super::vk_call::{VkCall, VkOp};
 
@@ -183,6 +183,14 @@ pub(crate) struct PipelineKey {
     /// Metal front-facing winding (`true` = counter-clockwise), mapped to a
     /// Vulkan `FrontFace` by [`crate::backend::vulkan::translate::raster::vk_front_face`].
     pub front_face_ccw: bool,
+    /// Metal `MTLTriangleFillMode`, mapped to a `VkPolygonMode`. In the key
+    /// because Vulkan has no dynamic polygon mode below
+    /// `VK_EXT_extended_dynamic_state3`: a wireframe draw and a filled draw
+    /// sharing shaders need different pipelines.
+    pub fill_mode: FillMode,
+    /// Metal `MTLDepthClipMode`, mapped to `depthClampEnable`. In the key for
+    /// the same reason as [`Self::fill_mode`].
+    pub depth_clip: DepthClipMode,
     /// Depth-test pipeline state. Meaningful only when `pass.depth.is_some()`;
     /// otherwise all-default (test/write off) and no depth-stencil state is
     /// attached, so the color-only pipeline is byte-identical to the pre-depth
@@ -921,6 +929,32 @@ impl ObjectCaches {
             }
         }
 
+        // `MTLTriangleFillModeLines` and `MTLDepthClipModeClamp` are the two
+        // rasterization states whose non-default arm Vulkan makes optional:
+        // `VK_POLYGON_MODE_LINE` needs `fillModeNonSolid` and
+        // `depthClampEnable` needs `depthClamp`, and naming either without its
+        // feature makes the pipeline invalid. Same shape as the two checks
+        // above — capability question, typed decline, cached negatively.
+        //
+        // Refused rather than rasterized the other way, because the other way
+        // is a whole pass rendered wrong with nothing to say so: a wireframe
+        // filled in, or the geometry a clamped pass wanted kept discarded at
+        // the near plane.
+        if key.fill_mode != FillMode::default() && !ctx.features.fill_mode_non_solid {
+            let reason = super::reason::DrawReason::FillModeNonSolidUnsupported;
+            crate::observe::Emit::decline("vk_engine_pipeline", &reason).fail();
+            let err = DrawError::Unsupported(reason);
+            self.pipelines.insert_negative(key.clone(), err.clone());
+            return Err(err);
+        }
+        if key.depth_clip != DepthClipMode::default() && !ctx.features.depth_clamp {
+            let reason = super::reason::DrawReason::DepthClampUnsupported;
+            crate::observe::Emit::decline("vk_engine_pipeline", &reason).fail();
+            let err = DrawError::Unsupported(reason);
+            self.pipelines.insert_negative(key.clone(), err.clone());
+            return Err(err);
+        }
+
         // Resolve every attribute against what this device accepts as a vertex
         // buffer format. Vulkan makes the three-component 8/16-bit formats
         // optional, so the format the guest decoded is not automatically
@@ -1069,15 +1103,12 @@ impl ObjectCaches {
         let vp_state = vk::PipelineViewportStateCreateInfo::default()
             .viewport_count(1)
             .scissor_count(1);
-        // Cull mode and winding come from the guest. `polygon_mode(FILL)` does
-        // not: `MTLTriangleFillMode` is not decoded, so a guest asking for
-        // Lines renders filled. That is a recorded gap, not an assertion that
-        // the guest asked for FILL — `translate::coverage` lists
-        // `setTriangleFillMode:` as `NotOnTheWire` with what it would take to
-        // close (polygonMode LINE, gated on the `fillModeNonSolid` feature).
-        // Same for depth clipping, which has no `depth_clamp_enable` here.
+        // Cull mode, winding, fill mode and depth clip mode all come from the
+        // guest; the last two were refused above where the host cannot spell
+        // them, so reaching here means both are bindable.
         let raster = vk::PipelineRasterizationStateCreateInfo::default()
-            .polygon_mode(vk::PolygonMode::FILL)
+            .polygon_mode(translate::raster::vk_polygon_mode(key.fill_mode))
+            .depth_clamp_enable(translate::raster::vk_depth_clamp_enable(key.depth_clip))
             .cull_mode(translate::raster::vk_cull_mode(key.cull_mode))
             .front_face(translate::raster::vk_front_face(key.front_face_ccw))
             .line_width(1.0);

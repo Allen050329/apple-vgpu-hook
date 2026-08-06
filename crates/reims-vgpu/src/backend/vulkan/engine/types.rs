@@ -176,6 +176,36 @@ pub enum CullMode {
     Back,
 }
 
+/// Triangle rasterization mode (Metal `MTLTriangleFillMode`).
+///
+/// Metal has two: fill the interior, or rasterize the edges as lines. Vulkan
+/// spells the second as `VK_POLYGON_MODE_LINE`, which is gated on the
+/// `fillModeNonSolid` device feature — so unlike [`CullMode`] the non-default
+/// arm can be refused by the host, and `engine::caches` declines the pipeline
+/// rather than filling a wireframe.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Default)]
+pub enum FillMode {
+    #[default]
+    Fill,
+    Lines,
+}
+
+/// What happens to a fragment outside the depth range (Metal
+/// `MTLDepthClipMode`).
+///
+/// `Clip` discards it, which is Metal's default and Vulkan's unconditional
+/// behaviour with `depthClampEnable` clear. `Clamp` pins its depth to the near
+/// or far plane and keeps it — Vulkan's `depthClampEnable`, gated on the
+/// `depthClamp` device feature. A shadow-map or skybox pass that asked for
+/// `Clamp` and got `Clip` loses the geometry nearest the camera, so the absent
+/// feature is a refusal rather than a fallback.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Default)]
+pub enum DepthClipMode {
+    #[default]
+    Clip,
+    Clamp,
+}
+
 /// Per-draw depth-test state (Metal `MTLDepthStencilState` + depth attachment).
 /// When a `DrawRequest` carries `Some`, the engine attaches a transient
 /// D32_SFLOAT depth buffer to the pass and enables the depth test; `None` (the
@@ -353,6 +383,15 @@ pub struct DrawRequest {
     /// CounterClockwise), `false` = the Metal default clockwise. Only affects
     /// rasterization when `cull_mode` culls a face.
     pub front_face_ccw: bool,
+    /// Triangle fill mode (Metal `setTriangleFillMode:`). `Fill` (the default)
+    /// is Metal's own and needs no device feature; `Lines` names
+    /// `VK_POLYGON_MODE_LINE` and is refused where `fillModeNonSolid` is not
+    /// advertised.
+    pub fill_mode: FillMode,
+    /// Depth clip mode (Metal `setDepthClipMode:`). `Clip` (the default) is
+    /// Metal's own; `Clamp` sets `depthClampEnable` and is refused where the
+    /// `depthClamp` feature is not advertised.
+    pub depth_clip: DepthClipMode,
     /// Depth test + transient depth attachment. `None` (default) = no depth
     /// buffer, byte-identical to the pre-depth 2D path. Set only for a draw that
     /// bound a non-trivial `MTLDepthStencilState` (see `runtime::draw`).

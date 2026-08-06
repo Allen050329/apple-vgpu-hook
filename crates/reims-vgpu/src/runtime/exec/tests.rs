@@ -1829,6 +1829,8 @@ fn finish_stream_with_draws_skips_guest_clear_prelude() {
         blend_color: None,
         cull_mode: None,
         front_facing: None,
+        fill_mode: None,
+        depth_clip_mode: None,
         depth_bias: None,
         depth_stencil_ref: 0,
         stencil_ref: None,
@@ -1932,6 +1934,8 @@ fn nometal_draw_falls_back_to_type4_clear() {
         blend_color: None,
         cull_mode: None,
         front_facing: None,
+        fill_mode: None,
+        depth_clip_mode: None,
         depth_bias: None,
         depth_stencil_ref: 0,
         stencil_ref: None,
@@ -3173,6 +3177,11 @@ fn a_strided_vertex_bind_lands_in_the_table_and_still_reports_the_stride() {
 /// The two indirect draws are deliberately not in the default half. They
 /// have no default to be at -- an indirect draw is geometry the guest asked
 /// for, so every one is a loss and is counted unconditionally.
+///
+/// `setTriangleFillMode:` and `setDepthClipMode:` used to be the first two
+/// rows here and are not any more: both now reach a backend, and
+/// [`a_fill_mode_and_a_depth_clip_mode_reach_the_stream_state`] is what
+/// replaced their rows.
 #[test]
 fn every_decoded_but_unapplied_render_state_reaches_its_own_counter() {
     use crate::contract::endian::{st16, st64};
@@ -3182,25 +3191,14 @@ fn every_decoded_but_unapplied_render_state_reaches_its_own_counter() {
     // record of the same opcode must NOT count).
     type Writer = fn(&mut [u8]);
     let non_default: Writer = |p| st64(p, 2);
-    let at_default: Writer = |p| st64(p, 0);
+    // No `at_default` writer for the mode-shaped records any more: the only
+    // two whose default half this exercised were the fill mode and the depth
+    // clip mode, and both now reach a backend. The float pair below still has
+    // one.
     let float_non_default: Writer = |p| st32(p, 2.5f32.to_bits());
     let float_at_default: Writer = |p| st32(p, 1.0f32.to_bits());
 
     let cases: &[(u32, usize, Writer, Option<Writer>, &str)] = &[
-        (
-            wire_render::OPCODE_SET_TRIANGLE_FILL_MODE,
-            16,
-            non_default,
-            Some(at_default),
-            "render_fill_mode_dropped",
-        ),
-        (
-            wire_render::OPCODE_SET_DEPTH_CLIP_MODE,
-            16,
-            non_default,
-            Some(at_default),
-            "render_depth_clip_mode_dropped",
-        ),
         (
             wire_render::OPCODE_SET_LINE_WIDTH,
             12,
@@ -3528,6 +3526,67 @@ fn every_decoded_but_unapplied_render_state_reaches_its_own_counter() {
             );
         }
     }
+}
+
+/// `setTriangleFillMode:` and `setDepthClipMode:` land in the stream's state
+/// and travel to a draw, ordinal for ordinal.
+///
+/// Both records share one 16-byte wire form and one decode arm, so the opcode
+/// is the only thing that says which state a record sets — swapping the two
+/// arms compiles, renders, and wireframes a pass that asked to be clamped.
+/// Each is therefore driven on its own and the *other* slot asserted still
+/// unset.
+///
+/// The default value is latched too. A stream that sets Lines and then sets
+/// Fill again is asking for Fill, so an arm that skipped `mode == 0` — which
+/// is what the counter these replaced did, and correctly, since a counter is
+/// only interested in the non-default — would leave the rest of the pass
+/// wireframed.
+#[test]
+fn a_fill_mode_and_a_depth_clip_mode_reach_the_stream_state() {
+    use crate::contract::endian::st64;
+
+    let drive = |op: u32, mode: u64| {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let host = FakeHost::new();
+        let mut out = ExecResult::default();
+        let mut acc = StreamAccum::default();
+        let mut command = vec![0u8; wire_render::SET_MODE_TOTAL_LEN as usize];
+        st32(&mut command[0..], op);
+        st32(&mut command[4..], wire_render::SET_MODE_TOTAL_LEN);
+        st64(&mut command[reims_vgpu_wire::OP_HEADER_LEN..], mode);
+        handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
+        acc
+    };
+
+    for mode in [0u64, 1] {
+        let acc = drive(wire_render::OPCODE_SET_TRIANGLE_FILL_MODE, mode);
+        assert_eq!(acc.fill_mode, Some(mode as u32), "fill mode {mode}");
+        assert_eq!(acc.depth_clip_mode, None, "fill mode {mode} set the sibling");
+        let acc = drive(wire_render::OPCODE_SET_DEPTH_CLIP_MODE, mode);
+        assert_eq!(acc.depth_clip_mode, Some(mode as u32), "depth clip {mode}");
+        assert_eq!(acc.fill_mode, None, "depth clip {mode} set the sibling");
+    }
+
+    // The record's field is 64 bits wide and the backend takes 32. A word
+    // whose low half is zero must not arrive as the Metal default, which
+    // would render silently; it arrives as a value no `MTLTriangleFillMode`
+    // has, and the backend names it.
+    let acc = drive(wire_render::OPCODE_SET_TRIANGLE_FILL_MODE, 1u64 << 32);
+    assert_eq!(acc.fill_mode, Some(u32::MAX));
+
+    // And a draw carries them. `bind_snapshot` builds its `PendingDraw` with
+    // `..Default::default()`, so a field added to the accumulator and not to
+    // the snapshot reaches no draw at all and nothing else would say so.
+    let mut acc = drive(wire_render::OPCODE_SET_TRIANGLE_FILL_MODE, 1);
+    acc.depth_clip_mode = Some(1);
+    let pd = acc.bind_snapshot().expect("state is representable");
+    assert_eq!(pd.fill_mode, Some(1));
+    assert_eq!(pd.depth_clip_mode, Some(1));
+    let mut req = crate::runtime::draw::DrawEncodeRequest::default();
+    fill_draw_binds_from_pending(&mut req, &pd);
+    assert_eq!(req.fill_mode, Some(1));
+    assert_eq!(req.depth_clip_mode, Some(1));
 }
 
 /// Every command buffer the submission declares is visited, however many

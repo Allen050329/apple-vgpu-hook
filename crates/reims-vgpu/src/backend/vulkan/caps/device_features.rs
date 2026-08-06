@@ -155,6 +155,22 @@ pub struct DeviceFeatures {
     /// an extension, but not mandatory either — so it is asked rather than
     /// assumed, and the pipeline path declines by name where it is absent.
     pub dual_src_blend: bool,
+    /// `VkPhysicalDeviceFeatures::fillModeNonSolid` — whether a pipeline may
+    /// name `VK_POLYGON_MODE_LINE` or `_POINT`.
+    ///
+    /// `MTLTriangleFillModeLines` has no other spelling: the polygon mode is
+    /// Vulkan's only way to rasterize a triangle as its edges, and naming a
+    /// non-solid one on a device that does not advertise this makes the
+    /// pipeline invalid. Same shape as [`Self::dual_src_blend`] — optional
+    /// core, asked rather than assumed, declined by name where absent.
+    pub fill_mode_non_solid: bool,
+    /// `VkPhysicalDeviceFeatures::depthClamp` — whether a pipeline may set
+    /// `depthClampEnable`.
+    ///
+    /// This is what `MTLDepthClipModeClamp` asks for: a fragment outside the
+    /// depth range is clamped to it rather than discarded. Optional core like
+    /// the two above.
+    pub depth_clamp: bool,
 }
 
 impl DeviceFeatures {
@@ -179,6 +195,8 @@ impl DeviceFeatures {
             .shader_storage_image_extended_formats(self.storage_image_extended_formats)
             .shader_storage_image_write_without_format(self.storage_image_write_without_format)
             .dual_src_blend(self.dual_src_blend)
+            .fill_mode_non_solid(self.fill_mode_non_solid)
+            .depth_clamp(self.depth_clamp)
     }
 
     /// The Vulkan 1.2 features to enable.
@@ -312,6 +330,8 @@ pub unsafe fn query(
         robust_buffer_access: supported.robust_buffer_access == vk::TRUE,
         sampler_anisotropy: supported.sampler_anisotropy == vk::TRUE,
         dual_src_blend: supported.dual_src_blend == vk::TRUE,
+        fill_mode_non_solid: supported.fill_mode_non_solid == vk::TRUE,
+        depth_clamp: supported.depth_clamp == vk::TRUE,
         max_sampler_anisotropy: props.limits.max_sampler_anisotropy.max(1.0),
         max_image_dimension_2d: props
             .limits
@@ -371,6 +391,8 @@ mod tests {
             shader_output_viewport_index: true,
             mirror_clamp_to_edge: MirrorClampToEdge::Core12,
             dual_src_blend: true,
+            fill_mode_non_solid: true,
+            depth_clamp: true,
         }
     }
 
@@ -394,6 +416,32 @@ mod tests {
         // The default is "not supported", so a `DeviceFeatures` built without a
         // query never claims a capability it has not checked for.
         assert!(!DeviceFeatures::default().dual_src_blend);
+    }
+
+    /// The two rasterization features the guest's `setTriangleFillMode:` and
+    /// `setDepthClipMode:` records need, under the same rule as
+    /// `dualSrcBlend`: queried here, enabled here, and left clear where the
+    /// device says no so `vkCreateDevice` does not fail asking for them.
+    ///
+    /// Both are optional core with no extension rung, and both are consumed by
+    /// `engine::caches`, which declines the pipeline by name rather than
+    /// rasterizing the other way.
+    #[test]
+    fn the_raster_features_are_enabled_only_where_the_device_advertises_them() {
+        let all = all_supported().enabled_features();
+        assert_eq!(all.fill_mode_non_solid, vk::TRUE);
+        assert_eq!(all.depth_clamp, vk::TRUE);
+        let without = DeviceFeatures {
+            fill_mode_non_solid: false,
+            depth_clamp: false,
+            ..all_supported()
+        }
+        .enabled_features();
+        assert_eq!(without.fill_mode_non_solid, vk::FALSE);
+        assert_eq!(without.depth_clamp, vk::FALSE);
+        // Never claimed without a query, the same way `dual_src_blend` is not.
+        assert!(!DeviceFeatures::default().fill_mode_non_solid);
+        assert!(!DeviceFeatures::default().depth_clamp);
     }
 
     /// The 1.2 rung sets the core feature bit and asks for no extension.

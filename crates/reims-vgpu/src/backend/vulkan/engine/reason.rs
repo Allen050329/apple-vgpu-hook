@@ -65,6 +65,23 @@ pub enum DrawReason {
     /// including the ones that support it. Now it translates, and only a host
     /// that genuinely cannot run it declines — here, by name.
     DualSourceBlendUnsupported,
+    /// The guest asked for `MTLTriangleFillModeLines` and this device does not
+    /// advertise `VkPhysicalDeviceFeatures::fillModeNonSolid`, so no pipeline
+    /// on it can name `VK_POLYGON_MODE_LINE`.
+    ///
+    /// The alternative is rasterizing the wireframe filled, which is a whole
+    /// pass of wrong pixels the guest is never told about. Same reading as
+    /// [`Self::DualSourceBlendUnsupported`]: optional core feature, asked for
+    /// at device creation, declined by name where the host says no.
+    FillModeNonSolidUnsupported,
+    /// The guest asked for `MTLDepthClipModeClamp` and this device does not
+    /// advertise `VkPhysicalDeviceFeatures::depthClamp`, so no pipeline on it
+    /// can set `depthClampEnable`.
+    ///
+    /// Clipping instead discards every fragment the guest asked to keep at the
+    /// near and far planes, which is missing geometry rather than shifted
+    /// geometry — the sibling of the fill-mode refusal above.
+    DepthClampUnsupported,
     /// The device declines this vertex attribute format and no portable
     /// substitute fits. Carries the translation-layer reason so the two log
     /// lines agree on why.
@@ -126,6 +143,8 @@ impl crate::observe::Decline for DrawReason {
             Self::SamplerAnisotropyUnsupported => "sampler_anisotropy_unsupported",
             Self::SamplerMirrorClampToEdgeUnsupported => "sampler_mirror_clamp_to_edge_unsupported",
             Self::DualSourceBlendUnsupported => "dual_source_blend_unsupported",
+            Self::FillModeNonSolidUnsupported => "fill_mode_non_solid_unsupported",
+            Self::DepthClampUnsupported => "depth_clamp_unsupported",
             // Deliberately delegates: the translation layer already named the
             // exact format problem, and inventing a second slug here would make
             // the two log lines disagree about one event.
@@ -275,6 +294,8 @@ mod tests {
         DrawReason::SwapchainNoSurfaceFormat,
         DrawReason::SwapchainNoCompositeAlpha,
         DrawReason::DualSourceBlendUnsupported,
+        DrawReason::FillModeNonSolidUnsupported,
+        DrawReason::DepthClampUnsupported,
     ];
 
     /// The rule this enum exists to enforce: two checks sharing a slug means a

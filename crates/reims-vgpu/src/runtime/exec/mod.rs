@@ -100,6 +100,12 @@ struct PendingDraw {
     blend_color: Option<[f32; 4]>,
     cull_mode: Option<u32>,
     front_facing: Option<u32>,
+    /// `setTriangleFillMode:` — `MTLTriangleFillMode`, `None` where the stream
+    /// bound none and the Metal default (fill) applies.
+    fill_mode: Option<u32>,
+    /// `setDepthClipMode:` — `MTLDepthClipMode`, `None` for the Metal default
+    /// (clip).
+    depth_clip_mode: Option<u32>,
     depth_bias: Option<[f32; 3]>,
     depth_stencil_ref: u32,
     stencil_ref: Option<(u32, u32)>,
@@ -132,6 +138,12 @@ struct StreamAccum {
     blend_color: Option<[f32; 4]>,
     cull_mode: Option<u32>,
     front_facing: Option<u32>,
+    /// `setTriangleFillMode:` — `MTLTriangleFillMode`, `None` where the stream
+    /// bound none and the Metal default (fill) applies.
+    fill_mode: Option<u32>,
+    /// `setDepthClipMode:` — `MTLDepthClipMode`, `None` for the Metal default
+    /// (clip).
+    depth_clip_mode: Option<u32>,
     depth_bias: Option<[f32; 3]>,
     depth_stencil_ref: u32,
     stencil_ref: Option<(u32, u32)>,
@@ -194,6 +206,8 @@ impl StreamAccum {
             blend_color: self.blend_color,
             cull_mode: self.cull_mode,
             front_facing: self.front_facing,
+            fill_mode: self.fill_mode,
+            depth_clip_mode: self.depth_clip_mode,
             depth_bias: self.depth_bias,
             depth_stencil_ref: self.depth_stencil_ref,
             stencil_ref: self.stencil_ref,
@@ -1900,24 +1914,42 @@ fn handle_render_record<M: HostMemory + HostOps>(
         // These counters exist to price those arguments rather than to doubt
         // them. A large residency count is the cost of resolving per draw; a
         // large barrier count is what the pass-granularity submit is buying.
-        // Six render states this rail decodes and does not apply. Each reports
+        // The render states this rail decodes and does not apply. Each reports
         // only when the guest asked for something *other* than the API default,
         // because asking for the default is asking for what we already do — so
         // these are healthy zeros, and a non-zero reading is the measured
         // argument for implementing that state.
         //
-        // That distinction is the point of decoding them at all. All six used to
-        // reach `OtherAccepted`, and `0x7c` alone fires thousands of times per
-        // app render, so the one line it produced said a record had arrived and
-        // nothing about whether any of them mattered.
+        // That distinction is the point of decoding them at all. They all used
+        // to reach `OtherAccepted`, and `0x7c` alone fires thousands of times
+        // per app render, so the one line it produced said a record had arrived
+        // and nothing about whether any of them mattered.
+        //
+        // `SetRasterState` was two of them and is no longer here: the counters
+        // it raised are what argued for plumbing it, and both halves now reach
+        // a backend.
         RenderKind::SetRasterState => {
-            // `MTLTriangleFillModeFill` and `MTLDepthClipModeClip` are both 0.
-            if cmd.mode != 0 {
-                crate::runtime::drain::note_store_route(match cmd.opcode {
-                    wire_render::OPCODE_SET_TRIANGLE_FILL_MODE => "render_fill_mode_dropped",
-                    _ => "render_depth_clip_mode_dropped",
-                });
-            }
+            // Two selectors share the one-`NSUInteger` record; the opcode says
+            // which. Both are latched whatever the value, including the Metal
+            // default — a stream that sets Lines and then sets Fill again is
+            // asking for Fill, and dropping the second record would leave the
+            // rest of the pass wireframed.
+            //
+            // The ordinal is carried raw and translated per backend, the way
+            // `cull_mode` and `front_facing` beside it are: only the backend
+            // knows whether the host can spell the answer, so only the backend
+            // can refuse by name.
+            let slot = match cmd.opcode {
+                wire_render::OPCODE_SET_TRIANGLE_FILL_MODE => &mut acc.fill_mode,
+                _ => &mut acc.depth_clip_mode,
+            };
+            // The record's field is 64-bit and the ordinals are small, but a
+            // guest writes what it likes. `u32::MAX` is not a value of either
+            // Metal enum, so a wide word reaches the backend as an
+            // out-of-contract value that says its own name, rather than as its
+            // own low half — which for a multiple of 2^32 would be the
+            // *default*, the one answer that renders with nothing in the log.
+            *slot = Some(u32::try_from(cmd.mode).unwrap_or(u32::MAX));
         }
         RenderKind::SetFloatState => {
             // Both default to 1.0. Compared exactly rather than with a
@@ -3190,6 +3222,8 @@ fn fill_draw_binds_from_pending(req: &mut draw::DrawEncodeRequest, pd: &PendingD
     req.blend_color = pd.blend_color;
     req.cull_mode = pd.cull_mode;
     req.front_facing = pd.front_facing;
+    req.fill_mode = pd.fill_mode;
+    req.depth_clip_mode = pd.depth_clip_mode;
     req.depth_bias = pd.depth_bias;
     req.depth_stencil_ref = pd.depth_stencil_ref;
     req.stencil_ref = pd.stencil_ref;

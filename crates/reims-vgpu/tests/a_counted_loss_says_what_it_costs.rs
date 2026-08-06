@@ -7,11 +7,11 @@
 //! `drain::note_store_route("…_dropped")` — a name and a count, no type, and so
 //! no row in that census and no line on the fail channel either.
 //!
-//! Thirty-five slugs in this crate are spelled that way, and thirty of them
-//! name a decoded guest command or a decoded piece of render state that this
-//! device did not apply. They are exactly the `Loss::ExecutedModified` class,
-//! wearing a spelling the census cannot see — and there are nearly four times as
-//! many of them as the eight that census counts.
+//! Thirty-three slugs in this crate are spelled that way, and twenty-eight of
+//! them name a decoded guest command or a decoded piece of render state that
+//! this device did not apply. They are exactly the `Loss::ExecutedModified`
+//! class, wearing a spelling the census cannot see — and there are more than
+//! three times as many of them as the eight that census counts.
 //!
 //! # What this does not do
 //!
@@ -23,11 +23,10 @@
 //! reading would put the tree's most load-bearing number on the weakest
 //! evidence in it.
 //!
-//! Seventeen of the thirty-five are spelled inside a `match` arm rather than as
-//! a literal argument, which is why [`counter_arguments`] balances parentheses
-//! instead of reading a line. A line-based grep finds eighteen of them and
-//! reports a clean population; that is how this file's first draft undercounted
-//! by half.
+//! Most of them are spelled inside a `match` arm rather than as a literal
+//! argument, which is why [`counter_arguments`] balances parentheses instead of
+//! reading a line. A line-based grep finds about half and reports a clean
+//! population; that is how this file's first draft undercounted by half.
 //!
 //! So this is the second half of one question asked in its own file, and the
 //! honest reading of the standing goal's size is the two populations together.
@@ -44,9 +43,9 @@
 //!
 //! # The trap this is built around
 //!
-//! Every one of the thirty-five is argued at its own site, most with a boot
-//! reading beside it. That is not the same as the population being adjudicated:
-//! an eighteenth added tomorrow inherits nothing, appears in no census, and
+//! Every one of them is argued at its own site, most with a boot reading beside
+//! it. That is not the same as the population being adjudicated: one added
+//! tomorrow inherits nothing, appears in no census, and
 //! reads to a log reader as one more counter among the hundreds this device
 //! publishes. The five bound scans exist for the same reason, and this file
 //! borrows their shape — a verdict per site, a forbidden word in the vocabulary,
@@ -175,13 +174,6 @@ const ROWS: &[(&str, Counted, &str)] = &[
          guest changed behaviour",
     ),
     (
-        "render_fill_mode_dropped",
-        Counted::StateNotApplied,
-        "MTLTriangleFillModeLines where this device fills. The counter fires \
-         only past the API default, which is Fill == 0, so a guest asking for \
-         the default is asking for what already happens",
-    ),
-    (
         "render_line_width_dropped",
         Counted::StateNotApplied,
         "a line width other than 1.0, compared exactly rather than with a \
@@ -233,13 +225,6 @@ const ROWS: &[(&str, Counted, &str)] = &[
          them, so nothing is unwritten; the count is how many were folded. \
          Reported with `note_store_route_n` rather than per window, which is why \
          it is a volume and not an event",
-    ),
-    (
-        "render_depth_clip_mode_dropped",
-        Counted::StateNotApplied,
-        "MTLDepthClipModeClamp where this device clips. The SetRasterState \
-         sibling of the fill mode above, counted only past the API default, \
-         which is Clip == 0",
     ),
     (
         "render_tessellation_scale_dropped",
@@ -539,7 +524,7 @@ fn no_counted_loss_is_unread() {
 /// population without changing anything the guest sees.
 #[test]
 fn the_counted_loss_census_only_shrinks() {
-    const COUNTED_LOSS_CEILING: usize = 30;
+    const COUNTED_LOSS_CEILING: usize = 28;
     let losses = ROWS
         .iter()
         .filter(|(_, c, _)| matches!(c, Counted::StateNotApplied | Counted::WorkNotExecuted))

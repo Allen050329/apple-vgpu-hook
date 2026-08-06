@@ -46,14 +46,15 @@ pub(crate) use facade_decline::EngineFacadeDecline;
 pub use types::{
     BlendFactor, BlendOp, BlendStateResource, BufferContent, ColorWriteMask, ComputeBufferResource,
     ComputeOutput, ComputeRequest, ComputeResidentSampleBind, ComputeSampledImageResource,
-    ComputeStorageImageResource, ComputeStorageResidency, CullMode, DepthState, DrawError,
-    DrawOutput, DrawRequest, GuestDmaBuf, GuestPageWindow, GuestRun, GuestRunSource, IndexType,
-    IndexedDrawResource, PrimitiveTopology, SampledContentIdentity, SampledImageResource,
-    SampledSource, SamplerAddressMode, SamplerBorderColor, SamplerCompareFunction, SamplerFilter,
-    SamplerMipFilter, SamplerResource, ScissorResource, SecondaryColorTarget, SeedOrder,
-    StencilFaceOps, StencilOp, StencilState, StorageBufferResource, StorageImageFormat,
-    TargetIdentity, VertexAttributeFormat, VertexAttributeResource, VertexStepFunction,
-    ViewportResource, WindowPresentSource, COLOR_INPUT_BINDING,
+    ComputeStorageImageResource, ComputeStorageResidency, CullMode, DepthClipMode, DepthState,
+    DrawError, DrawOutput, DrawRequest, FillMode, GuestDmaBuf, GuestPageWindow, GuestRun,
+    GuestRunSource, IndexType, IndexedDrawResource, PrimitiveTopology, SampledContentIdentity,
+    SampledImageResource, SampledSource, SamplerAddressMode, SamplerBorderColor,
+    SamplerCompareFunction, SamplerFilter, SamplerMipFilter, SamplerResource, ScissorResource,
+    SecondaryColorTarget, SeedOrder, StencilFaceOps, StencilOp, StencilState,
+    StorageBufferResource, StorageImageFormat, TargetIdentity, VertexAttributeFormat,
+    VertexAttributeResource, VertexStepFunction, ViewportResource, WindowPresentSource,
+    COLOR_INPUT_BINDING,
 };
 pub(crate) use vk_call::{VkCall, VkOp};
 #[cfg(feature = "host-window")]

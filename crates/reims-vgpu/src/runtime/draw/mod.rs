@@ -630,6 +630,12 @@ pub struct DrawEncodeRequest {
     pub blend_color: Option<[f32; 4]>,
     pub cull_mode: Option<u32>,
     pub front_facing: Option<u32>,
+    /// `MTLTriangleFillMode` from `setTriangleFillMode:`, raw. `None` means the
+    /// stream bound none, so Metal's default (fill) stands.
+    pub fill_mode: Option<u32>,
+    /// `MTLDepthClipMode` from `setDepthClipMode:`, raw. `None` means Metal's
+    /// default (clip).
+    pub depth_clip_mode: Option<u32>,
     pub depth_bias: Option<[f32; 3]>,
     pub depth_stencil_ref: u32,
     pub stencil_ref: Option<(u32, u32)>,
@@ -1883,6 +1889,10 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
         cull_mode: 0,
         has_front_facing_winding: 0,
         front_facing_winding: 0,
+        has_fill_mode: 0,
+        fill_mode: 0,
+        has_depth_clip_mode: 0,
+        depth_clip_mode: 0,
     };
     if let Some(c) = req.cull_mode {
         raster.has_cull_mode = 1;
@@ -1892,7 +1902,19 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
         raster.has_front_facing_winding = 1;
         raster.front_facing_winding = f;
     }
-    let raster_opt = if raster.has_cull_mode != 0 || raster.has_front_facing_winding != 0 {
+    if let Some(f) = req.fill_mode {
+        raster.has_fill_mode = 1;
+        raster.fill_mode = f;
+    }
+    if let Some(d) = req.depth_clip_mode {
+        raster.has_depth_clip_mode = 1;
+        raster.depth_clip_mode = d;
+    }
+    // A record is worth encoding when the stream bound any one of the four.
+    // Spelled as a method on the struct rather than as an `||` chain here,
+    // because a field added to the struct and not to the chain is a state the
+    // guest set and this arm silently declines to send.
+    let raster_opt = if raster.any_bound() {
         Some(&raster)
     } else {
         None

@@ -1311,6 +1311,8 @@ pub(crate) unsafe fn execute_draw_inner(
         pass: pass_key,
         cull_mode: req.cull_mode,
         front_face_ccw: req.front_face_ccw,
+        fill_mode: req.fill_mode,
+        depth_clip: req.depth_clip,
         depth_test: req.depth.map(|d| d.test_enable).unwrap_or(false),
         depth_write: req.depth.map(|d| d.write_enable).unwrap_or(false),
         depth_compare: req

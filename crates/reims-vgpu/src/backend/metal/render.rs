@@ -153,11 +153,35 @@ fn apply_raster_state(
         "metal_render_winding_unsupported",
         "winding"
     );
+    let fill = optional!(
+        has_fill_mode,
+        fill_mode,
+        fill_mode,
+        "metal_render_fill_mode_unsupported",
+        "fill_mode"
+    );
+    let depth_clip = optional!(
+        has_depth_clip_mode,
+        depth_clip_mode,
+        depth_clip_mode,
+        "metal_render_depth_clip_mode_unsupported",
+        "depth_clip_mode"
+    );
     if let Some(cull) = cull {
         encoder.set_cull_mode(cull);
     }
     if let Some(front_facing) = front_facing {
         encoder.set_front_facing_winding(front_facing);
+    }
+    // Neither of these carries a host capability the way their Vulkan
+    // spellings do: `MTLTriangleFillMode` and `MTLDepthClipMode` are plain
+    // encoder state on every Metal device, so a converted value always
+    // applies.
+    if let Some(fill) = fill {
+        encoder.set_triangle_fill_mode(fill);
+    }
+    if let Some(depth_clip) = depth_clip {
+        encoder.set_depth_clip_mode(depth_clip);
     }
     Status::OK
 }

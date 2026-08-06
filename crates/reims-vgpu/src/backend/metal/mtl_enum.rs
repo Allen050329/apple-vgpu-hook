@@ -51,9 +51,10 @@
 
 use metal::{
     MTLAttributeFormat, MTLBlendFactor, MTLBlendOperation, MTLCompareFunction, MTLCullMode,
-    MTLIndexType, MTLLoadAction, MTLPixelFormat, MTLPrimitiveType, MTLSamplerAddressMode,
-    MTLSamplerBorderColor, MTLSamplerMinMagFilter, MTLSamplerMipFilter, MTLStencilOperation,
-    MTLStepFunction, MTLStoreAction, MTLVertexFormat, MTLVertexStepFunction, MTLWinding,
+    MTLDepthClipMode, MTLIndexType, MTLLoadAction, MTLPixelFormat, MTLPrimitiveType,
+    MTLSamplerAddressMode, MTLSamplerBorderColor, MTLSamplerMinMagFilter, MTLSamplerMipFilter,
+    MTLStencilOperation, MTLStepFunction, MTLStoreAction, MTLTriangleFillMode, MTLVertexFormat,
+    MTLVertexStepFunction, MTLWinding,
 };
 
 /// Define a checked ordinal to enum conversion, and prove it at compile time.
@@ -377,6 +378,20 @@ checked_ordinal! {
     /// `MTLWinding` for the render encoder's raster state.
     fn winding -> MTLWinding;
     [Clockwise, CounterClockwise]
+    apple_numbers_them_from_zero;
+}
+
+checked_ordinal! {
+    /// `MTLTriangleFillMode` for the render encoder's raster state.
+    fn fill_mode -> MTLTriangleFillMode;
+    [Fill, Lines]
+    apple_numbers_them_from_zero;
+}
+
+checked_ordinal! {
+    /// `MTLDepthClipMode` for the render encoder's raster state.
+    fn depth_clip_mode -> MTLDepthClipMode;
+    [Clip, Clamp]
     apple_numbers_them_from_zero;
 }
 

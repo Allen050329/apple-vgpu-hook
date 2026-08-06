@@ -116,6 +116,10 @@ pub enum TranslateReason {
     UnknownCullMode(u32),
     /// `MTLWinding` value outside the SDK enum.
     UnknownWinding(u32),
+    /// `MTLTriangleFillMode` value outside the SDK enum.
+    UnknownFillMode(u32),
+    /// `MTLDepthClipMode` value outside the SDK enum.
+    UnknownDepthClipMode(u32),
     /// `MTLSamplerMinMagFilter` value outside the SDK enum.
     UnknownSamplerFilter(u32),
     /// `MTLSamplerMipFilter` value outside the SDK enum.
@@ -162,6 +166,8 @@ impl crate::observe::Decline for TranslateReason {
             Self::UnknownStencilOperation(_) => "unknown_stencil_operation",
             Self::UnknownCullMode(_) => "unknown_cull_mode",
             Self::UnknownWinding(_) => "unknown_winding",
+            Self::UnknownFillMode(_) => "unknown_fill_mode",
+            Self::UnknownDepthClipMode(_) => "unknown_depth_clip_mode",
             Self::UnknownSamplerFilter(_) => "unknown_sampler_filter",
             Self::UnknownSamplerMipFilter(_) => "unknown_sampler_mip_filter",
             Self::UnknownSamplerAddressMode(_) => "unknown_sampler_address_mode",
@@ -198,6 +204,8 @@ impl TranslateReason {
             | Self::UnknownStencilOperation(v)
             | Self::UnknownCullMode(v)
             | Self::UnknownWinding(v)
+            | Self::UnknownFillMode(v)
+            | Self::UnknownDepthClipMode(v)
             | Self::UnknownSamplerFilter(v)
             | Self::UnknownSamplerMipFilter(v)
             | Self::UnknownSamplerAddressMode(v)
@@ -245,6 +253,8 @@ mod tests {
         TranslateReason::UnknownStencilOperation(0),
         TranslateReason::UnknownCullMode(0),
         TranslateReason::UnknownWinding(0),
+        TranslateReason::UnknownFillMode(0),
+        TranslateReason::UnknownDepthClipMode(0),
         TranslateReason::UnknownSamplerFilter(0),
         TranslateReason::UnknownSamplerMipFilter(0),
         TranslateReason::UnknownSamplerAddressMode(0),
@@ -284,12 +294,14 @@ mod tests {
                 TranslateReason::UnknownStencilOperation(_) => 13,
                 TranslateReason::UnknownCullMode(_) => 14,
                 TranslateReason::UnknownWinding(_) => 15,
-                TranslateReason::UnknownSamplerFilter(_) => 16,
-                TranslateReason::UnknownSamplerMipFilter(_) => 17,
-                TranslateReason::UnknownSamplerAddressMode(_) => 18,
-                TranslateReason::UnknownSamplerBorderColor(_) => 19,
-                TranslateReason::UnknownSwizzleSelector(_) => 20,
-                TranslateReason::FormatNotVertexBuffer(_) => 21,
+                TranslateReason::UnknownFillMode(_) => 16,
+                TranslateReason::UnknownDepthClipMode(_) => 17,
+                TranslateReason::UnknownSamplerFilter(_) => 18,
+                TranslateReason::UnknownSamplerMipFilter(_) => 19,
+                TranslateReason::UnknownSamplerAddressMode(_) => 20,
+                TranslateReason::UnknownSamplerBorderColor(_) => 21,
+                TranslateReason::UnknownSwizzleSelector(_) => 22,
+                TranslateReason::FormatNotVertexBuffer(_) => 23,
             }
         }
         let mut seen: Vec<usize> = ALL.iter().map(|r| index(*r)).collect();
