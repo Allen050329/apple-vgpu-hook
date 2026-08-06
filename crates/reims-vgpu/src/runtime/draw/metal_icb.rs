@@ -841,9 +841,18 @@ pub fn encode_icb_execute_and_writeback<M: HostMemory + HostOps>(
         tex.get_bytes(pixels.as_mut_ptr() as *mut _, (width as u64) * 4, region, 0);
         let wrote = if c.target_gva != 0 {
             // Shared texture is BGRA8; convert to RGBA for write_gva_rgba8.
-            for px in 0..(width * height) as usize {
-                let o = px * 4;
-                pixels.swap(o, o + 2);
+            //
+            // Walked over `need` — the length `tight_image_layout` just returned
+            // — rather than over a freshly computed `(width * height)`. That
+            // product is in `u32` and overflows at 65536×65536, which the check
+            // above does not prevent: it refuses a zero axis and asks
+            // `tight_image_layout` for the byte count, and that one widens to
+            // `u64` and checks, so it answers happily for geometries this
+            // multiplication cannot express. The same quantity twice, and only
+            // one of the two derivations right — which is the defect
+            // `tight_image_layout` itself was written to retire, one level up.
+            for texel in pixels[..need].chunks_exact_mut(RGBA8_BPP as usize) {
+                texel.swap(0, 2);
             }
             write_gva_rgba8(
                 state,

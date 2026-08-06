@@ -173,6 +173,12 @@ first and the scans then found sites the sweeps had missed, in both cases sites 
 which is why a reader hunting for danger walked past them. Add your verdict to the table the failure
 names; do not re-derive the population.
 
+All three filter by the constant's **name**, so a bound named for what it limits rather than for the
+fact that it limits used to be invisible to every one of them — not reported as unadjudicated,
+reported not at all. That hole is now held shut by a fourth test rather than by prose, which is what
+matters: the prose named one such constant and there were two. **Name a new bound with a `MAX` or a
+`CAP` and all three pick it up for free**; name it otherwise and the build tells you.
+
 Prefer an instrument over a reading. Reading an audit against itself cannot see an opcode that is
 simply the wrong number, a length four bytes off, or a field two bytes too wide:
 
@@ -196,6 +202,9 @@ simply the wrong number, a length four bytes off, or a field two bytes too wide:
 | Does a cap drop an entry the device had already admitted? | `crates/reims-vgpu/tests/an_eviction_says_what_it_costs.rs` |
 | Does a cap stop one being recorded in the first place? | `crates/reims-vgpu/tests/a_bounded_insert_says_what_it_drops.rs` |
 | Does a cap stop a walk before the guest's data runs out? | `crates/reims-vgpu/tests/a_bounded_walk_says_what_it_skips.rs` |
+| Is a bound named so those three can see it at all? | `crates/reims-vgpu/tests/a_bound_in_a_cut_is_named_like_one.rs` |
+| Is a product widened by a cast that comes too late to help? | `crates/reims-vgpu/tests/a_product_is_widened_before_it_is_taken.rs` |
+| Do the source scans read the product half, or its fixtures? | `crates/reims-vgpu/tests/the_source_scanner_reads_the_product_and_not_its_fixtures.rs` |
 
 Do **not** answer that one by diffing `ls src/ops/` against a `grep` for
 `use reims_vgpu_wire` — that pair used to live here and it is wrong by 40 % on

@@ -112,7 +112,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
             if c.width == 0 || c.height == 0 {
                 continue;
             }
-            let rgba = solid_rgba_local(c.width, c.height, &c.clear_color);
+            let rgba = solid_rgba8(c.width, c.height, &c.clear_color);
             let ok = if c.target_gva != 0 {
                 supersede_gva_window(state, host, c.target_gva, c.width, c.height, "clear_store");
                 write_gva_rgba8(
@@ -4639,7 +4639,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                             aw,
                             ah,
                             SampledSourceRequest::Bytes(
-                                std::sync::Arc::new(solid_rgba_local(aw, ah, &clear)),
+                                std::sync::Arc::new(solid_rgba8(aw, ah, &clear)),
                                 None,
                                 TexelLayout::Rgba8,
                             ),
@@ -5082,7 +5082,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 }
                 MTL_LOAD_ACTION_CLEAR => {
                     target_rgba8 =
-                        Some(std::sync::Arc::new(solid_rgba_local(w, h, &c0.clear_color)));
+                        Some(std::sync::Arc::new(solid_rgba8(w, h, &c0.clear_color)));
                 }
                 MTL_LOAD_ACTION_LOAD => {
                     // Which door this pass took, so a pass that ends with no

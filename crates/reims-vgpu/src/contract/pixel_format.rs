@@ -698,6 +698,52 @@ pub fn f64_to_unorm8(value: f64) -> u8 {
     }
 }
 
+/// A tightly-packed `w`×`h` RGBA8 image of one colour.
+///
+/// What this device hands back when it services a colour attachment's CLEAR
+/// itself, rather than encoding one. `clear` is the guest's `MTLClearColor`, so
+/// each channel goes through [`f64_to_unorm8`], which is where the out-of-range
+/// and NaN rules live.
+///
+/// # One definition, because the two it had disagreed
+///
+/// This was `runtime::exec::solid_rgba` and `runtime::draw::solid_rgba_local`,
+/// byte-identical bodies six call sites apart, and both carried the same defect:
+/// the buffer's length widened each axis before multiplying, so it cannot
+/// overflow on any host this runs on, while the fill counted texels in `u32` as
+/// `0..(w * h) as usize`, which overflows at 65536×65536. Only a zero
+/// axis is refused upstream of either; `MAX_SCANOUT_DIM` bounds the scanout
+/// registers and says nothing about a render target's geometry. A debug build
+/// panics there, taking the guest down; a release build wraps to a small count
+/// and returns a full-size buffer filled for a fraction of it — a clear that
+/// silently did not clear.
+///
+/// The fill therefore walks the buffer instead of counting texels. A
+/// `chunks_exact_mut` cannot describe a different image from the one that was
+/// allocated, where a second expression always can — the rule
+/// [`crate::contract::extent::tight_image_layout`] states for a length and its
+/// stride, one level down.
+///
+/// Here rather than in either caller because it is arithmetic both rails need
+/// and neither owns, and because `contract` is the tree that gets tested on
+/// every arm.
+pub fn solid_rgba8(w: u32, h: u32, clear: &[f64; 4]) -> Vec<u8> {
+    let px = [
+        f64_to_unorm8(clear[COMPONENT_R]),
+        f64_to_unorm8(clear[COMPONENT_G]),
+        f64_to_unorm8(clear[COMPONENT_B]),
+        f64_to_unorm8(clear[COMPONENT_A]),
+    ];
+    let n = (w as usize)
+        .saturating_mul(h as usize)
+        .saturating_mul(px.len());
+    let mut img = vec![0u8; n];
+    for texel in img.chunks_exact_mut(px.len()) {
+        texel.copy_from_slice(&px);
+    }
+    img
+}
+
 pub fn f16_to_f32(half_bits: u16) -> f32 {
     let sign = (u32::from(half_bits & F16_SIGN_MASK)) << F16_F32_SIGN_SHIFT;
     let exp = (u32::from(half_bits) >> F16_EXP_SHIFT) & F16_EXP_MASK;
@@ -1023,6 +1069,55 @@ pub fn convert_rgba8_to_row(format: u16, src_rgba: &[u8], pixels: u32, dst: &mut
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every byte of the buffer is the colour, at a geometry with no square
+    /// root and no power of two, so an off-by-one in either axis shows.
+    ///
+    /// The property the two deleted copies could not state: length and fill are
+    /// one derivation, so "as long as `w`×`h`×4" and "filled end to end" cannot
+    /// come apart. A fill that counted texts separately would satisfy the first
+    /// assertion and fail the second the moment the two expressions disagreed.
+    #[test]
+    fn a_solid_clear_fills_every_texel_it_allocates() {
+        let img = solid_rgba8(37, 11, &[1.0, 0.0, 0.5, 1.0]);
+        assert_eq!(img.len(), 37 * 11 * RGBA8_BPP as usize);
+        let expect = [UNORM8_MAX, UNORM8_MIN, f64_to_unorm8(0.5), UNORM8_MAX];
+        assert!(
+            img.chunks_exact(RGBA8_BPP as usize).all(|t| t == expect),
+            "a texel was left unwritten, so the fill and the length disagree"
+        );
+        assert_eq!(
+            img.chunks_exact(RGBA8_BPP as usize).count(),
+            37 * 11,
+            "the buffer holds a whole number of texels and exactly w*h of them"
+        );
+    }
+
+    /// A zero axis is an empty image, not a one-texel one.
+    ///
+    /// Both callers reach this with a colour attachment's decoded geometry, and
+    /// `chunks_exact_mut` over an empty buffer yields nothing — so the zero case
+    /// needs no special arm and must not grow one.
+    #[test]
+    fn a_clear_with_a_zero_axis_is_empty() {
+        assert!(solid_rgba8(0, 64, &[1.0; 4]).is_empty());
+        assert!(solid_rgba8(64, 0, &[1.0; 4]).is_empty());
+        assert!(solid_rgba8(0, 0, &[1.0; 4]).is_empty());
+    }
+
+    /// The clear colour travels channel by channel, in RGBA order.
+    ///
+    /// Pins the ordering against a transposition: four `f64_to_unorm8` calls in
+    /// a row are exactly the shape where a swap compiles and looks right.
+    #[test]
+    fn a_clear_colour_keeps_its_channel_order() {
+        let img = solid_rgba8(1, 1, &[0.0, 1.0, 0.0, 0.0]);
+        assert_eq!(
+            img,
+            vec![UNORM8_MIN, UNORM8_MAX, UNORM8_MIN, UNORM8_MIN],
+            "only green was asked for"
+        );
+    }
 
     #[test]
     fn bytes_per_pixel_matrix() {

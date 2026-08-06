@@ -31,7 +31,7 @@ use crate::backend::vulkan::engine::{DrawError, DrawPreparationDecline};
 use crate::backend::vulkan::translate;
 #[cfg(feature = "backend-vulkan")]
 use crate::contract::endian::ld32;
-use crate::contract::pixel_format::{self, TexelLayout, MTL_FORMAT_BGRA8_UNORM, RGBA8_BPP};
+use crate::contract::pixel_format::{self, TexelLayout, MTL_FORMAT_BGRA8_UNORM, RGBA8_BPP, solid_rgba8};
 use crate::model::DeviceState;
 // `Decline::slug` on typed draw, coverage, and translation reasons.
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
@@ -3822,11 +3822,11 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
             load_action = MTL_LOAD_ACTION_CLEAR;
             clear_color = cl.clear_color;
             if mapping_id == 0 {
-                seed = Some(solid_rgba_local(mw, mh, &cl.clear_color));
+                seed = Some(solid_rgba8(mw, mh, &cl.clear_color));
             }
         } else if att.load_action == MTL_LOAD_ACTION_CLEAR {
             if mapping_id == 0 {
-                seed = Some(solid_rgba_local(mw, mh, &att.clear_color));
+                seed = Some(solid_rgba8(mw, mh, &att.clear_color));
             }
         } else if att.load_action == MTL_LOAD_ACTION_LOAD && mapping_id == 0 {
             // GVA linear target: ephemeral host RT needs a CPU seed (archive
@@ -4296,20 +4296,6 @@ fn write_mapping_rgba8_rect<M: HostMemory + HostOps>(
     )
 }
 
-fn solid_rgba_local(w: u32, h: u32, clear: &[f64; 4]) -> Vec<u8> {
-    use crate::contract::pixel_format::f64_to_unorm8;
-    let r = f64_to_unorm8(clear[0]);
-    let g = f64_to_unorm8(clear[1]);
-    let b = f64_to_unorm8(clear[2]);
-    let a = f64_to_unorm8(clear[3]);
-    let px = [r, g, b, a];
-    let n = (w as usize).saturating_mul(h as usize).saturating_mul(4);
-    let mut img = vec![0u8; n];
-    for i in 0..(w * h) as usize {
-        img[i * 4..i * 4 + 4].copy_from_slice(&px);
-    }
-    img
-}
 
 /// Seed color RT LOAD from guest type-11 (BGRA→RGBA) or type-2/3/view linear RGBA.
 ///
