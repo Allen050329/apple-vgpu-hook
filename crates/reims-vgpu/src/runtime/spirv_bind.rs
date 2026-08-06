@@ -355,6 +355,61 @@ pub enum BufferAccess {
     AmbiguousBinding,
 }
 
+/// One instruction's header, decoded once.
+///
+/// `at` indexes the header word itself, so an operand `n` is `words[at + n]` and
+/// the instruction's last word is `words[at + word_count - 1]`.
+#[derive(Clone, Copy)]
+struct Instruction {
+    opcode: u16,
+    word_count: usize,
+    at: usize,
+}
+
+/// Decode every instruction header in a module body, or `None` if the stream is
+/// not one.
+///
+/// # Why the scans below take the output of this rather than `&[u32]`
+///
+/// A `&[Instruction]` only exists if the whole stream walked cleanly, so a scan
+/// holding one may index `words[at + n]` for any `n < word_count` without a
+/// bounds check, and cannot spin. That is not a new rule — it is the rule the
+/// provenance scans have always run under, taken from `descriptor_root` having
+/// been called first and having returned `Some`. Nothing recorded the
+/// dependency: `propagate_derived` and both escape scans re-walked the raw
+/// `&[u32]` with no guard of their own, and were correct only because that one
+/// guard, in another function, had already rejected every stream that would
+/// break them.
+///
+/// The cost of leaving it implicit is not a style point. `words[at + 1 ..
+/// at + word_count]` on a truncated final instruction panics, and a zero word
+/// count makes `i += word_count` spin forever — a device abort and a wedged
+/// guest, from a reflector whose contract is to fail closed. Making the
+/// entitlement a type means a scan cannot be reached without it.
+///
+/// Decoding once also removes the re-decode from `propagate_derived`, which
+/// re-walks to a fixpoint and used to re-split every header on every pass.
+fn instructions(words: &[u32]) -> Option<Vec<Instruction>> {
+    if words.len() < HEADER_WORDS {
+        return None;
+    }
+    let mut out = Vec::new();
+    let mut i = HEADER_WORDS;
+    while i < words.len() {
+        let word_count = (words[i] >> 16) as usize;
+        if word_count == 0 || i + word_count > words.len() {
+            return None;
+        }
+        out.push(Instruction {
+            opcode: (words[i] & 0xffff) as u16,
+            word_count,
+            at: i,
+        });
+        i += word_count;
+    }
+    Some(out)
+}
+
 /// The one descriptor variable declaring `wanted_binding` in `storage_class`,
 /// with the module's id bound.
 ///
@@ -363,29 +418,33 @@ pub enum BufferAccess {
 /// match: two variables sharing a binding means neither can be reflected, which
 /// is `Root::Ambiguous`.
 ///
-/// `None` is a module this reflector cannot parse at all — a header shorter
-/// than `HEADER_WORDS`, a zero id bound, an instruction whose word count is
-/// zero or runs past the end, or no variable on that binding. Every one of
-/// those must fail closed rather than reflect a guess.
+/// `None` is a module this reflector cannot parse at all — a zero id bound, or
+/// no variable on that binding. A stream whose instructions do not walk cleanly
+/// never reaches here at all: [`instructions`] rejects it, and its `None` is
+/// this one. Every case must fail closed rather than reflect a guess.
 enum Root {
     One { id: usize, bound: usize },
     Ambiguous,
 }
 
-fn descriptor_root(words: &[u32], wanted_binding: u32, storage_class: u32) -> Option<Root> {
+fn descriptor_root(
+    words: &[u32],
+    instrs: &[Instruction],
+    wanted_binding: u32,
+    storage_class: u32,
+) -> Option<Root> {
     let bound = *words.get(3)? as usize;
-    if words.len() < HEADER_WORDS || bound == 0 {
+    if bound == 0 {
         return None;
     }
     let mut bindings = vec![None; bound];
     let mut storage = vec![None; bound];
-    let mut i = HEADER_WORDS;
-    while i < words.len() {
-        let word_count = (words[i] >> 16) as usize;
-        let opcode = (words[i] & 0xffff) as u16;
-        if word_count == 0 || i + word_count > words.len() {
-            return None;
-        }
+    for &Instruction {
+        opcode,
+        word_count,
+        at: i,
+    } in instrs
+    {
         match opcode {
             OP_DECORATE if word_count >= 4 && words[i + 2] == DECORATION_BINDING => {
                 let id = words[i + 1] as usize;
@@ -401,7 +460,6 @@ fn descriptor_root(words: &[u32], wanted_binding: u32, storage_class: u32) -> Op
             }
             _ => {}
         }
-        i += word_count;
     }
     let mut roots = bindings.iter().enumerate().filter_map(|(id, binding)| {
         (*binding == Some(wanted_binding) && storage[id] == Some(storage_class)).then_some(id)
@@ -431,6 +489,7 @@ fn descriptor_root(words: &[u32], wanted_binding: u32, storage_class: u32) -> Op
 /// instruction shorter than that has no result operand.
 fn propagate_derived(
     words: &[u32],
+    instrs: &[Instruction],
     bound: usize,
     seed: Option<usize>,
     propagates: impl Fn(u16, usize, usize, &[bool]) -> bool,
@@ -441,10 +500,12 @@ fn propagate_derived(
     }
     loop {
         let mut changed = false;
-        let mut i = HEADER_WORDS;
-        while i < words.len() {
-            let word_count = (words[i] >> 16) as usize;
-            let opcode = (words[i] & 0xffff) as u16;
+        for &Instruction {
+            opcode,
+            word_count,
+            at: i,
+        } in instrs
+        {
             let marked = |id: u32| derived.get(id as usize).copied() == Some(true);
             let result_from = match opcode {
                 OP_COPY_OBJECT if word_count >= 4 => marked(words[i + 3]),
@@ -461,7 +522,6 @@ fn propagate_derived(
                     changed = true;
                 }
             }
-            i += word_count;
         }
         if !changed {
             break;
@@ -482,14 +542,20 @@ fn propagate_derived(
 /// escape scan below enumerates the opcodes it cares about. `storage_image_access`
 /// cannot seed its root for exactly that reason — see the note there.
 pub fn buffer_access(words: &[u32], wanted_binding: u32) -> Option<BufferAccess> {
-    let (root, bound) = match descriptor_root(words, wanted_binding, STORAGE_CLASS_STORAGE_BUFFER)?
-    {
+    let instrs = instructions(words)?;
+    let (root, bound) = match descriptor_root(
+        words,
+        &instrs,
+        wanted_binding,
+        STORAGE_CLASS_STORAGE_BUFFER,
+    )? {
         Root::One { id, bound } => (id, bound),
         Root::Ambiguous => return Some(BufferAccess::AmbiguousBinding),
     };
 
     let derived = propagate_derived(
         words,
+        &instrs,
         bound,
         Some(root),
         |opcode, word_count, i, derived| {
@@ -515,10 +581,12 @@ pub fn buffer_access(words: &[u32], wanted_binding: u32) -> Option<BufferAccess>
 
     let is_derived = |id: u32| derived.get(id as usize).copied() == Some(true);
     let mut unknown = false;
-    let mut i = HEADER_WORDS;
-    while i < words.len() {
-        let word_count = (words[i] >> 16) as usize;
-        let opcode = (words[i] & 0xffff) as u16;
+    for &Instruction {
+        opcode,
+        word_count,
+        at: i,
+    } in &instrs
+    {
         let writable = match opcode {
             OP_STORE | OP_COPY_MEMORY | OP_COPY_MEMORY_SIZED | OP_ATOMIC_STORE
                 if word_count >= 2 =>
@@ -562,7 +630,6 @@ pub fn buffer_access(words: &[u32], wanted_binding: u32) -> Option<BufferAccess>
         if opcode == OP_CONVERT_PTR_TO_U && word_count >= 4 && is_derived(words[i + 3]) {
             unknown = true;
         }
-        i += word_count;
     }
     Some(if unknown {
         BufferAccess::PointerEscape
@@ -585,24 +652,37 @@ pub fn buffer_access(words: &[u32], wanted_binding: u32) -> Option<BufferAccess>
 /// every storage image to `Unknown`. `buffer_access` seeds its root only because
 /// its scan enumerates instead.
 pub fn storage_image_access(words: &[u32], wanted_binding: u32) -> Option<StorageImageAccess> {
-    let (root, bound) =
-        match descriptor_root(words, wanted_binding, STORAGE_CLASS_UNIFORM_CONSTANT)? {
-            Root::One { id, bound } => (id, bound),
-            Root::Ambiguous => return Some(StorageImageAccess::AmbiguousBinding),
-        };
+    let instrs = instructions(words)?;
+    let (root, bound) = match descriptor_root(
+        words,
+        &instrs,
+        wanted_binding,
+        STORAGE_CLASS_UNIFORM_CONSTANT,
+    )? {
+        Root::One { id, bound } => (id, bound),
+        Root::Ambiguous => return Some(StorageImageAccess::AmbiguousBinding),
+    };
 
-    let derived = propagate_derived(words, bound, None, |opcode, word_count, i, _derived| {
-        opcode == OP_LOAD && word_count >= 4 && words[i + 3] as usize == root
-    });
+    let derived = propagate_derived(
+        words,
+        &instrs,
+        bound,
+        None,
+        |opcode, word_count, i, _derived| {
+            opcode == OP_LOAD && word_count >= 4 && words[i + 3] as usize == root
+        },
+    );
 
     let is_derived = |id: u32| derived.get(id as usize).copied() == Some(true);
     let mut read = false;
     let mut write = false;
     let mut unknown = false;
-    let mut i = HEADER_WORDS;
-    while i < words.len() {
-        let word_count = (words[i] >> 16) as usize;
-        let opcode = (words[i] & 0xffff) as u16;
+    for &Instruction {
+        opcode,
+        word_count,
+        at: i,
+    } in &instrs
+    {
         match opcode {
             OP_IMAGE_READ if word_count >= 5 && is_derived(words[i + 3]) => read = true,
             OP_IMAGE_WRITE if word_count >= 4 && is_derived(words[i + 1]) => write = true,
@@ -627,7 +707,6 @@ pub fn storage_image_access(words: &[u32], wanted_binding: u32) -> Option<Storag
             _ if words[i + 1..i + word_count].iter().copied().any(is_derived) => unknown = true,
             _ => {}
         }
-        i += word_count;
     }
     Some(if unknown || (!read && !write) {
         StorageImageAccess::Unknown
@@ -2469,6 +2548,48 @@ mod tests {
         let mut words = storage_buffer_module(1);
         words.extend([(3u32 << 16) | OP_STORE as u32, 4, 6]);
         assert_eq!(buffer_access(&words, 1), Some(BufferAccess::Writable));
+    }
+
+    /// A module the walk cannot finish reflects nothing, and does not take the
+    /// process with it.
+    ///
+    /// Both shapes are what [`instructions`] exists to reject, and both are
+    /// reached through a module that is otherwise perfectly reflectable — the
+    /// binding, the variable and the storage class are all present and correct,
+    /// so nothing but the malformed tail can be what turns the answer into
+    /// `None`.
+    ///
+    /// This pins a contract rather than proving a repair: before the walk was
+    /// consolidated the same two inputs also answered `None`, because
+    /// `descriptor_root` rejected them on the way past. What changes is where
+    /// that can be undone from. The provenance scans indexed
+    /// `words[at + 1 .. at + word_count]` with no guard of their own, so
+    /// removing or reordering `descriptor_root`'s left the first case aborting
+    /// the device on an out-of-range slice and the second spinning forever on
+    /// `i += 0`. Neither failure has a test that can run *after* it happens.
+    #[test]
+    fn a_module_that_does_not_walk_reflects_nothing() {
+        for (what, tail) in [
+            // Claims six words with two left in the module.
+            ("runs past the end", vec![(6u32 << 16) | OP_STORE as u32, 4]),
+            // A zero word count advances the cursor by nothing.
+            ("zero word count", vec![0u32, 4]),
+        ] {
+            let mut words = storage_buffer_module(1);
+            assert_eq!(
+                buffer_access(&words, 1),
+                Some(BufferAccess::ReadOnly),
+                "{what}: the module is reflectable before the tail is appended"
+            );
+            words.extend(tail);
+            assert_eq!(buffer_access(&words, 1), None, "{what}: buffer_access");
+            assert_eq!(
+                storage_image_access(&words, 1),
+                None,
+                "{what}: storage_image_access"
+            );
+            assert!(instructions(&words).is_none(), "{what}: instructions");
+        }
     }
 
     #[test]
