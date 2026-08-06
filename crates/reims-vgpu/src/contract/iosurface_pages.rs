@@ -371,7 +371,13 @@ pub fn device_desc_plane(desc: &[u8], plane_index: u32) -> Option<(DevicePlaneRe
         return None;
     }
     let plane_count = desc[DEVICE_DESC_PLANE_COUNT] as u32;
-    if plane_count == 0 || plane_count > 8 || plane_index >= plane_count {
+    // `TYPE4_PLANE_CAP` is `IOSurfaceGetPlaneCount`'s ceiling and lives beside
+    // the plane record it bounds; the literal 8 that stood here was the same
+    // rule written a second time, in a file that cannot see if the first moves.
+    if plane_count == 0
+        || plane_count > reims_vgpu_wire::device_desc::TYPE4_PLANE_CAP as u32
+        || plane_index >= plane_count
+    {
         return None;
     }
     let plane_off = DEVICE_DESC_PLANES + (plane_index as usize) * DEVICE_PLANE_DESC_LEN;
@@ -488,7 +494,15 @@ pub fn sample_window_from_device_desc(
                 } else if let Some(bpp) = format_bytes_per_pixel(pixel_format) {
                     let mut matches = 0u32;
                     let mut plane = DevicePlaneRecord::default();
-                    for p in 0..surf.plane_count.min(8) {
+                    // The plane record's own cap, not a repeat of its value.
+                    // `device_desc_plane` refuses any index at or above it, so a
+                    // literal here that drifted from it would either walk indices
+                    // that can only miss or stop short of planes the descriptor
+                    // holds.
+                    for p in 0..surf
+                        .plane_count
+                        .min(reims_vgpu_wire::device_desc::TYPE4_PLANE_CAP as u8)
+                    {
                         if let Some((cand, _)) = device_desc_plane(desc, p as u32) {
                             if cand.width == width
                                 && cand.height == height
