@@ -4272,6 +4272,143 @@ fn a_define_task_length_is_the_full_eight_byte_field_on_both_arms() {
     );
 }
 
+/// Send a device-info request and read back the pairs the guest would parse.
+///
+/// `max_key` is exclusive and `count` is a pair capacity — the two words the
+/// reply is bound by. Returns the reply page as (key, value) pairs, stopping at
+/// the zero terminator the way the guest's own walker does.
+#[cfg(test)]
+fn device_info_reply(max_key: u32, count: u32) -> Vec<(u32, u32)> {
+    const REPLY_PFN: u32 = 0x40;
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+
+    let mut payload = vec![0u8; DEVICE_INFO_TAHOE_REPLY_PFN + 4];
+    st32(&mut payload[DEVICE_INFO_TAHOE_MAX_KEY..], max_key);
+    st32(&mut payload[DEVICE_INFO_TAHOE_COUNT..], count);
+    st32(&mut payload[DEVICE_INFO_TAHOE_REPLY_PFN..], REPLY_PFN);
+    process_root_packet(
+        &mut state,
+        &mut host,
+        &Packet {
+            opcode: ROOT_OP_DEVICE_INFO_TAHOE,
+            stamp_count: 0,
+            total_size: PACKET_HEADER_LEN + payload.len() as u32,
+            completion_stamp: 0,
+            payload,
+            next_head: 0,
+        },
+    );
+
+    let page_size = 1usize << PAGE_SHIFT_ARM64E;
+    let gpa = pfn_to_gpa(REPLY_PFN, PAGE_SHIFT_ARM64E);
+    let mut out = Vec::new();
+    for i in 0..count.min((page_size / DEVICE_INFO_REPLY_PAIR_LEN) as u32) {
+        let mut pair = [0u8; DEVICE_INFO_REPLY_PAIR_LEN];
+        host.read_gpa(
+            gpa + u64::from(i) * DEVICE_INFO_REPLY_PAIR_LEN as u64,
+            &mut pair,
+        )
+        .expect("reply page is readable");
+        let key = ld32(&pair[0..4]);
+        if key == 0 {
+            break;
+        }
+        out.push((key, ld32(&pair[4..8])));
+    }
+    out
+}
+
+/// The guest's `max_key` is a parse ceiling, and it is exclusive.
+///
+/// The guest writes `highest_key_it_parses + 1` — 18, against a walker whose
+/// jump table ends at 17 — and a key at or above it is discarded on arrival. It
+/// used to be read as an opcode and never consulted, so the reply named every
+/// key in the table whatever the guest said it could take. That costs a pair
+/// slot per key on a reply the guest asks for exactly once.
+///
+/// Drive a ceiling of 4 and assert only keys 1..=3 come back, then the real 18
+/// and assert the reply stops at 17 — the boundary is what makes this a test of
+/// polarity rather than of filtering.
+#[test]
+fn the_device_info_reply_stops_below_the_guests_exclusive_parse_ceiling() {
+    let keys: Vec<u32> = device_info_reply(4, 512).into_iter().map(|p| p.0).collect();
+    assert_eq!(
+        keys,
+        vec![1, 2, 3],
+        "a ceiling of 4 admits keys strictly below it; a key 4 would be inclusive"
+    );
+
+    let full: Vec<u32> = device_info_reply(18, 512)
+        .into_iter()
+        .map(|p| p.0)
+        .collect();
+    assert_eq!(
+        full.last().copied(),
+        Some(DEVICE_INFO_KEY_BUFFER_WITH_IOSURFACE),
+        "the ceiling this guest sends admits every key its walker has an arm for"
+    );
+    assert!(
+        !full.contains(&18),
+        "and nothing above it: the guest discards those on arrival"
+    );
+}
+
+/// A device-info reply the guest's own `count` cut short says which keys it lost.
+///
+/// `count` is how many pairs the guest's buffer holds and it bounds the reply.
+/// Ask for fewer than the table offers and the tail is simply not written — and
+/// the guest issues this command once, frees the buffer, and answers every later
+/// reader from what it parsed, so there is no second, larger ask. Every key still
+/// offered at that point is one `max_key` says the guest parses, so a key dropped
+/// here is a capability it spends the rest of the boot without.
+///
+/// The loss used to be silent, which read exactly like a table with nothing more
+/// to say.
+#[test]
+fn a_device_info_reply_cut_short_by_the_guests_count_names_the_keys_it_lost() {
+    const CEILING: u32 = 18;
+    const ASKED: u32 = 5;
+    let carried = device_info_reply(CEILING, ASKED);
+    assert_eq!(
+        carried.len(),
+        ASKED as usize,
+        "a five-pair buffer carries five pairs"
+    );
+
+    // What the reply could not carry, derived rather than spelled out so this
+    // stays true when a key is added to either end of the table.
+    let dropped: Vec<u32> = DEVICE_INFO_CAPS
+        .iter()
+        .map(|&(key, _)| key)
+        .filter(|&key| key < CEILING)
+        .skip(ASKED as usize)
+        .collect();
+    assert!(
+        !dropped.is_empty(),
+        "a five-pair ask must drop keys the guest parses, or this proves nothing"
+    );
+
+    // The fail log is process-global and appended to by every test in this
+    // binary, so match this reply's own bound as well as the reason — a bare
+    // `find` on the reason returns whichever test emitted first.
+    let log = std::fs::read_to_string(crate::observe::fail_log_path()).expect("fail log");
+    let line = log
+        .lines()
+        .rfind(|l| {
+            l.contains("reason=reply_pairs_exhausted") && l.contains(&format!("count={ASKED}"))
+        })
+        .expect("a truncated device-info reply names itself, and the count that bound it");
+    assert!(
+        line.contains(&format!("wrote={ASKED}")),
+        "and how many pairs it managed: {line}"
+    );
+    assert!(
+        line.contains(&format!("dropped={dropped:?}")),
+        "and every key it could not carry: {line}"
+    );
+}
+
 /// `CmdGetComputeInfo` answers the keys the guest asked about, and its
 /// threadgroup limits are the host's rather than a fixed pair.
 ///

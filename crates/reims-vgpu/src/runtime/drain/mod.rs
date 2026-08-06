@@ -711,8 +711,23 @@ fn device_info_limits() -> crate::model::DeviceInfoLimits {
     }
 }
 
+/// Answer `CmdGetDeviceInfo` into the guest's reply page.
+///
+/// Two guest words bound this reply and they bound different things.
+/// `max_key` is the guest's parse ceiling, exclusive — see
+/// [`DEVICE_INFO_TAHOE_MAX_KEY`] for the polarity and what settles it — and
+/// `count` is how many 8-byte pairs its buffer holds. A key at or above the
+/// ceiling costs a pair slot for a value the guest discards on arrival; a pair
+/// past `count` would be written past the buffer.
+///
+/// The guest asks **once**, when its accelerator starts, and never again: it
+/// frees the reply buffer right after the single parse, and every later reader
+/// is served out of the struct that parse filled. So whatever this reply omits
+/// is omitted for the life of the boot, which is why the tail it could not carry
+/// is reported rather than dropped quietly.
 fn reply_device_info<H: HostMemory + HostOps>(
     host: &mut H,
+    max_key: u32,
     count: u32,
     reply_pfn: u32,
     page_shift: u32,
@@ -732,7 +747,17 @@ fn reply_device_info<H: HostMemory + HostOps>(
         return Err(MemError::BadArgs);
     }
     let limits = device_info_limits();
-    let caps = crate::model::device_info_caps(&limits, version);
+    let served = crate::model::device_info_caps(&limits, version);
+    // Withhold every key the guest just said it does not parse. This is not a
+    // reduction of what the device can do — a key the guest discards on arrival
+    // buys nothing, and the slot it occupies is one fewer for a key the guest
+    // *does* have an arm for, on a reply that is only ever asked for once.
+    let caps: Vec<(u32, u32)> = served
+        .iter()
+        .copied()
+        .filter(|&(key, _)| key < max_key)
+        .collect();
+    let above_ceiling = served.len() - caps.len();
     // Printed on every reply, not only when something changed. A host that
     // already meets the table reduces nothing, and then silence would be
     // indistinguishable from the derivation never having run — which is exactly
@@ -741,15 +766,21 @@ fn reply_device_info<H: HostMemory + HostOps>(
     // than the table's value, whether the cause was the host GPU or the
     // negotiated version; `version` is printed so key 12's answer can be
     // checked against the rung without a second log line.
-    let derived: Vec<String> = caps
+    //
+    // Zipped against the *unfiltered* answers: the parse ceiling decides which
+    // keys are sent, not what any of them says, so folding it in here would make
+    // a withheld key read as a derived one.
+    let derived: Vec<String> = served
         .iter()
         .zip(DEVICE_INFO_CAPS)
-        .filter(|((_, served), (_, table))| served != table)
-        .map(|((key, served), (_, table))| format!("key{key}={served}(was {table})"))
+        .filter(|((_, answer), (_, table))| answer != table)
+        .map(|((key, answer), (_, table))| format!("key{key}={answer}(was {table})"))
         .collect();
     crate::observe::off(format!(
-        "device_info version={} dual_plane={} host_samples={} host_d24s8={} host_threads={}x{}x{} host_tg_mem={} host_fp16={} derived=[{}]",
+        "device_info version={} max_key={} above_ceiling={} dual_plane={} host_samples={} host_d24s8={} host_threads={}x{}x{} host_tg_mem={} host_fp16={} derived=[{}]",
         version,
+        max_key,
+        above_ceiling,
         u8::from(crate::model::protocol_dual_plane_textures(version)),
         limits.max_sample_count,
         u8::from(limits.d24_stencil8),
@@ -767,6 +798,21 @@ fn reply_device_info<H: HostMemory + HostOps>(
     if count > max_pairs {
         crate::observe::fail(format!(
             "device_info cap reason=reply_page count={count} max_pairs={max_pairs} page={page_size:#x}"
+        ));
+    }
+    // The tail this reply could not carry, named key by key.
+    //
+    // Every key still in `caps` is one the guest's own `max_key` says it parses,
+    // so anything dropped here is a capability that guest spends the rest of the
+    // boot without — it asks once and there is no larger re-ask. A healthy boot
+    // never emits this: the guest's buffer is a whole page, 512 pairs against a
+    // table of a few dozen. A firing *is* the bug, which is the only reason a
+    // line that has never been seen is worth carrying.
+    if (n as usize) < caps.len() {
+        let dropped: Vec<u32> = caps[n as usize..].iter().map(|&(key, _)| key).collect();
+        crate::observe::fail(format!(
+            "device_info truncated reason=reply_pairs_exhausted max_key={max_key} count={count} max_pairs={max_pairs} wrote={n} have={} dropped={dropped:?}",
+            caps.len()
         ));
     }
     for i in 0..n {
@@ -861,7 +907,12 @@ fn reply_compute_info<H: HostMemory + HostOps>(
     };
     let mut wrote = 0u32;
     for (key, value) in compute_info_caps() {
-        if key > max_key {
+        // Exclusive, like its device-info twin: the guest writes
+        // `highest_key_it_parses + 1` here, and its parser's own table stops one
+        // below. It sends 5 against a table whose arms are keys 1..=4, so an
+        // inclusive read would spend a pair slot on a key 5 that guest discards.
+        // See `DEVICE_INFO_TAHOE_MAX_KEY`, which carries the argument for both.
+        if key >= max_key {
             continue;
         }
         if wrote >= count {
@@ -1018,9 +1069,17 @@ fn process_root_packet<H: HostMemory + HostOps>(
                 packet.payload.len(),
                 DEVICE_INFO_TAHOE_REPLY_PFN + 4,
             ) {
+                let max_key = ld32(&packet.payload[DEVICE_INFO_TAHOE_MAX_KEY..]);
                 let count = ld32(&packet.payload[DEVICE_INFO_TAHOE_COUNT..]);
                 let pfn = ld32(&packet.payload[DEVICE_INFO_TAHOE_REPLY_PFN..]);
-                let _ = reply_device_info(host, count, pfn, state.page_shift, state.gfx.version);
+                let _ = reply_device_info(
+                    host,
+                    max_key,
+                    count,
+                    pfn,
+                    state.page_shift,
+                    state.gfx.version,
+                );
             }
         }
         ROOT_OP_DEVICE_INFO_MONTEREY => {
@@ -1032,7 +1091,18 @@ fn process_root_packet<H: HostMemory + HostOps>(
             ) {
                 let count = ld32(&packet.payload[DEVICE_INFO_MONTEREY_COUNT..]);
                 let pfn = ld32(&packet.payload[DEVICE_INFO_MONTEREY_REPLY_PFN..]);
-                let _ = reply_device_info(host, count, pfn, state.page_shift, state.gfx.version);
+                // This record carries no parse ceiling — see
+                // `DEVICE_INFO_MONTEREY_COUNT` — so the reply names every key the
+                // table holds and the count alone bounds it, which is what this
+                // arm has always done.
+                let _ = reply_device_info(
+                    host,
+                    u32::MAX,
+                    count,
+                    pfn,
+                    state.page_shift,
+                    state.gfx.version,
+                );
             }
         }
         ROOT_OP_DEFINE_FIFO => {

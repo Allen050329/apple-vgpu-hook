@@ -400,8 +400,37 @@ pub const CHILD_REG_BASE_PFN: u64 = 0x10;
 pub const CHILD_RING_PFN_ENTRY_LEN: u64 = 4;
 
 pub const DEVICE_INFO_REPLY_PAIR_LEN: usize = 8;
+
+/// The guest's parse ceiling, and it is **exclusive**: it asks for every key
+/// strictly below this word.
+///
+/// The guest writes a literal here, and it is `highest_key_it_parses + 1` — 18
+/// against a walker whose jump table ends at 17. The sibling `CmdGetComputeInfo`
+/// carries the same field for the same reason and writes 5 against a table
+/// ending at 4, which is what settles the polarity: read inclusively, the
+/// compute reply would carry a key 5 that guest has no arm for.
+///
+/// It is a separate word from [`DEVICE_INFO_TAHOE_COUNT`] and means a different
+/// thing — this bounds *which* keys the reply may name, that one bounds *how
+/// many* pairs fit. A reply is correct only when it respects both.
+pub const DEVICE_INFO_TAHOE_MAX_KEY: usize = 0x00;
+
+/// How many 8-byte pairs the guest's reply buffer holds — its allocation size in
+/// bytes, shifted right by three. One page, so 512 on a 4 KiB guest.
+///
+/// The guest re-reads this word from its own staging copy to bound the walk, so
+/// it is never the host's to widen. The walk ends at whichever comes first, this
+/// many pairs or a key of 0.
 pub const DEVICE_INFO_TAHOE_COUNT: usize = 0x04;
 pub const DEVICE_INFO_TAHOE_REPLY_PFN: usize = 0x08;
+
+/// The older request carries no parse ceiling — the record is the count and the
+/// PFN and nothing before them.
+///
+/// A `max_key` here would sit at these same two offsets, so reading one that is
+/// not there would take the count for a ceiling and the PFN for a count. Nothing
+/// this device has driven issues this opcode, and no disassembly of its builder
+/// has been read, so the reply is bounded by the count alone and by nothing else.
 pub const DEVICE_INFO_MONTEREY_COUNT: usize = 0x00;
 pub const DEVICE_INFO_MONTEREY_REPLY_PFN: usize = 0x04;
 
@@ -799,8 +828,18 @@ pub fn device_info_caps(limits: &DeviceInfoLimits, version: u32) -> Vec<(u32, u3
 /// walker discards anything above 17 and stops at key 0. The higher keys are
 /// kept because they came from a live capture and a newer guest may read them —
 /// removing values whose meaning is not established would be trading one guess
-/// for another. `reply_device_info` writes the zero terminator, which is what
-/// stops the guest walking the rest of the page.
+/// for another. They are not *sent* to a guest that has not asked for them:
+/// every request carries the guest's own exclusive parse ceiling
+/// ([`DEVICE_INFO_TAHOE_MAX_KEY`]), and `reply_device_info` names only the keys
+/// below it. So this table is the set this device *can* answer, and the guest
+/// picks the prefix of it that it understands.
+///
+/// `reply_device_info` writes the zero terminator, which is the guest's other
+/// stopping condition — its walk ends at whichever comes first, that key or the
+/// pair count it sent. The terminator is not optional in practice: the guest
+/// does not zero its reply page before handing it over, so a reply that fills
+/// fewer pairs than the count without terminating leaves the walk reading
+/// whatever the page already held.
 ///
 /// # Every key at or below 17 is named, and that is a rule rather than tidiness
 ///
