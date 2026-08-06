@@ -18,6 +18,23 @@
 
 use super::*;
 
+/// A readback slot lent out to be read where it lies.
+///
+/// The three values travel together because reading the mapping needs all
+/// three: `token` to give the slot back, `ptr` to read from, and `slot_size` to
+/// know how far. The pointer used to travel with only the token, and the span
+/// the holder read came from its own request instead — correct, since
+/// `acquire_readback` rounds a request up to a bucket and records the bucket,
+/// but stated nowhere the holder could check. Carrying the extent beside the
+/// pointer is the same rule `staging_write_ptr` and `read_back_slot` answer
+/// through `slot_span_fits`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ReadbackLease {
+    pub token: u64,
+    pub ptr: usize,
+    pub slot_size: u64,
+}
+
 impl ResourcePools {
     pub(crate) fn guest_reset_counts(&self) -> (usize, usize, usize, usize) {
         let sampled = self.sampled_live.len() + self.sampled_free.len() + self.sampled_cache.len();
@@ -1799,7 +1816,7 @@ impl ResourcePools {
     ///
     /// Must be called before [`Self::seal_entry`], which is what would
     /// otherwise move the slot into the submitted entry's cleanup.
-    pub(crate) fn lease_readback(&mut self) -> Option<(u64, usize)> {
+    pub(crate) fn lease_readback(&mut self) -> Option<ReadbackLease> {
         let slot = self.readback_live.take()?;
         // Two refusals, and both send the caller to the copying path rather
         // than to a failure.
@@ -1824,9 +1841,13 @@ impl ResourcePools {
         // to decide whether a borrow is live, and it must never see the slot
         // gone while the count still says nobody has it.
         READBACK_LEASES_OUT.fetch_add(1, Ordering::AcqRel);
-        let mapped = slot.mapped;
+        let lease = ReadbackLease {
+            token,
+            ptr: slot.mapped,
+            slot_size: slot.size,
+        };
         self.readback_leased.push(LeasedReadback { token, slot });
-        Some((token, mapped))
+        Some(lease)
     }
 
     /// Take back every lease whose holder has finished and return its slot to

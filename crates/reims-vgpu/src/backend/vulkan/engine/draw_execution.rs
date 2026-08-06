@@ -106,6 +106,20 @@ pub enum DrawExecutionDecline {
         len: u64,
         slot_size: u64,
     },
+    /// A readback lease would have been read for more bytes than the slot it
+    /// lends holds.
+    ///
+    /// The third of the family, and the one furthest from its pointer. A lease
+    /// hands a caller the slot's host address to read *after* the engine lock
+    /// is dropped, and `LeasedFrame::bytes` builds a slice of the caller's
+    /// `len` over it. Its own slug rather than
+    /// [`Self::ReadBackBeyondSlot`]'s, because `fail_once` latches per reason
+    /// and these are two checks on two rails: sharing one would silence
+    /// whichever fired second.
+    LeaseBeyondSlot {
+        len: u64,
+        slot_size: u64,
+    },
 }
 
 impl Decline for DrawExecutionDecline {
@@ -133,6 +147,7 @@ impl Decline for DrawExecutionDecline {
             Self::UnsupportedTrackedLayout { .. } => "vk_draw_exec_unsupported_tracked_layout",
             Self::StagingWriteBeyondSlot { .. } => "vk_draw_exec_staging_write_beyond_slot",
             Self::ReadBackBeyondSlot { .. } => "vk_draw_exec_read_back_beyond_slot",
+            Self::LeaseBeyondSlot { .. } => "vk_draw_exec_lease_beyond_slot",
         }
     }
 
@@ -227,6 +242,10 @@ impl Decline for DrawExecutionDecline {
                 ("slot_size", slot_size.to_string()),
             ],
             Self::ReadBackBeyondSlot { len, slot_size } => vec![
+                ("len", len.to_string()),
+                ("slot_size", slot_size.to_string()),
+            ],
+            Self::LeaseBeyondSlot { len, slot_size } => vec![
                 ("len", len.to_string()),
                 ("slot_size", slot_size.to_string()),
             ],

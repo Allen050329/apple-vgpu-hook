@@ -1937,6 +1937,8 @@ impl Drop for SlowStagingWrite {
 
 mod images_and_registry;
 mod submission_and_buffers;
+/// The lease's own extent travels with its pointer; see [`ReadbackLease`].
+pub(crate) use submission_and_buffers::ReadbackLease;
 mod teardown;
 
 #[cfg(test)]
@@ -2547,8 +2549,23 @@ mod staging_mapping_tests {
             return;
         }
 
-        let (token, ptr) = pools.lease_readback().expect("a mapped cached slot leases");
-        assert_eq!(ptr, slot.mapped, "the lease must lend the slot's mapping");
+        let lease = pools.lease_readback().expect("a mapped cached slot leases");
+        let token = lease.token;
+        assert_eq!(
+            lease.ptr, slot.mapped,
+            "the lease must lend the slot's mapping"
+        );
+        // The extent travels with the pointer, and it is the slot's own — not
+        // whatever the acquirer asked for. A lease that reported the request
+        // would certify a span it had not measured.
+        assert_eq!(
+            lease.slot_size, slot.size,
+            "a lease must report the extent of what it lends"
+        );
+        assert!(
+            lease.slot_size >= 4096,
+            "a slot acquired for 4 KiB lends at least 4 KiB"
+        );
         assert_eq!(
             readback_leases_outstanding(),
             1,

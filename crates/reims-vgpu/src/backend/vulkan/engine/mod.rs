@@ -1149,23 +1149,23 @@ enum ReadbackResult {
 /// read — nothing is borrowing it — but it strands the slot for the process
 /// lifetime and makes every later teardown wait out its whole quiesce budget,
 /// which presents as a hang rather than as a leak. One guard covers all six.
-struct ReadbackLeaseGuard(Option<(u64, usize)>);
+struct ReadbackLeaseGuard(Option<pools::ReadbackLease>);
 
 impl ReadbackLeaseGuard {
-    fn new(lease: Option<(u64, usize)>) -> Self {
+    fn new(lease: Option<pools::ReadbackLease>) -> Self {
         Self(lease)
     }
 
     /// Take the lease out, so the caller owns the obligation from here on.
-    fn disarm(&mut self) -> Option<(u64, usize)> {
+    fn disarm(&mut self) -> Option<pools::ReadbackLease> {
         self.0.take()
     }
 }
 
 impl Drop for ReadbackLeaseGuard {
     fn drop(&mut self) {
-        if let Some((token, _)) = self.0.take() {
-            pools::return_readback_lease(token);
+        if let Some(lease) = self.0.take() {
+            pools::return_readback_lease(lease.token);
         }
     }
 }
@@ -1482,15 +1482,36 @@ unsafe fn copy_image_level0_to_host_delivered(
         // alone: the whole-frame memcpy the other arm pays is what the lease
         // exists to delete, and the phase reading near zero is how you tell it
         // happened.
-        Some((token, ptr)) => {
+        // The lease's own extent decides whether it can be read in place. It
+        // is the third refusal alongside `mapped == 0` and `!cached`, and like
+        // both of those the answer is the copying path — which asks
+        // `slot_span_fits` again on its own arm — rather than a failure. It
+        // cannot fire: `acquire_readback` rounds `rb_size` up to a bucket and
+        // records that bucket as the slot's size. It is here because that is a
+        // property of a call three frames up, and `bytes()` builds a slice of
+        // `len` over this pointer on the strength of it.
+        Some(lease) if !pools::slot_span_fits(rb_size, lease.slot_size) => {
+            crate::observe::Emit::decline(
+                "vk_engine_readback",
+                &draw_execution::DrawExecutionDecline::LeaseBeyondSlot {
+                    len: rb_size,
+                    slot_size: lease.slot_size,
+                },
+            )
+            .fail_once(0);
+            pools::return_readback_lease(lease.token);
+            pools::read_back_slot(ctx, &readback, rb_size, ops.map, ops.invalidate)
+                .map(ReadbackResult::Copied)
+        }
+        Some(lease) => {
             match pools::invalidate_slot_for_read(ctx, &readback, ops.invalidate) {
                 Ok(()) => Ok(ReadbackResult::Leased {
-                    token,
-                    ptr,
+                    token: lease.token,
+                    ptr: lease.ptr,
                     len: rb_size as usize,
                 }),
                 Err(e) => {
-                    pools::return_readback_lease(token);
+                    pools::return_readback_lease(lease.token);
                     Err(e)
                 }
             }
