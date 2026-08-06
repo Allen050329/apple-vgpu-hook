@@ -42,7 +42,7 @@
 //! vice versa, so no single compilation sees them all.
 
 mod source_scan;
-use source_scan::{blank_comments, blank_test_modules, rust_sources, workspace_root};
+use source_scan::guest_facing_sources;
 
 /// What is lost when this site drops an entry it had already admitted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -77,14 +77,15 @@ enum Cost {
     LosesGuestWork,
 }
 
-/// Every capacity-governed shrink in `src/`, and what it costs.
+/// Every capacity-governed shrink in the two guest-facing crates, and what it
+/// costs.
 ///
 /// Keyed by `(file, method)` with the number of sites that pair covers, so a new
 /// eviction added beside an existing one moves the count and fails rather than
 /// inheriting a verdict that was written about a different line.
 const COSTS: &[(&str, &str, usize, Cost, &str)] = &[
     (
-        "src/backend/vulkan/engine/caches.rs",
+        "reims-vgpu/src/backend/vulkan/engine/caches.rs",
         "pop_front",
         1,
         Cost::Recomputable,
@@ -93,14 +94,14 @@ const COSTS: &[(&str, &str, usize, Cost, &str)] = &[
          fidelity rather than losing it",
     ),
     (
-        "src/backend/vulkan/engine/caches.rs",
+        "reims-vgpu/src/backend/vulkan/engine/caches.rs",
         "remove",
         1,
         Cost::Recomputable,
         "the negative map entry displaced with its FIFO slot, same argument",
     ),
     (
-        "src/backend/vulkan/engine/caches.rs",
+        "reims-vgpu/src/backend/vulkan/engine/caches.rs",
         "retain",
         1,
         Cost::NotABound,
@@ -108,7 +109,7 @@ const COSTS: &[(&str, &str, usize, Cost, &str)] = &[
          the map still holds",
     ),
     (
-        "src/backend/vulkan/engine/dmabuf.rs",
+        "reims-vgpu/src/backend/vulkan/engine/dmabuf.rs",
         "swap_remove",
         1,
         Cost::RefusesInstead,
@@ -118,7 +119,7 @@ const COSTS: &[(&str, &str, usize, Cost, &str)] = &[
          an evicted import is re-exported from the same guest pages",
     ),
     (
-        "src/backend/vulkan/engine/mod.rs",
+        "reims-vgpu/src/backend/vulkan/engine/mod.rs",
         "truncate",
         1,
         Cost::NotABound,
@@ -126,7 +127,7 @@ const COSTS: &[(&str, &str, usize, Cost, &str)] = &[
          checking it is long enough; a length trim, not a population bound",
     ),
     (
-        "src/backend/vulkan/engine/pools/images_and_registry.rs",
+        "reims-vgpu/src/backend/vulkan/engine/pools/images_and_registry.rs",
         "pop_front",
         1,
         Cost::Observability,
@@ -135,7 +136,7 @@ const COSTS: &[(&str, &str, usize, Cost, &str)] = &[
          behaviour",
     ),
     (
-        "src/backend/vulkan/engine/pools/submission_and_buffers.rs",
+        "reims-vgpu/src/backend/vulkan/engine/pools/submission_and_buffers.rs",
         "remove",
         3,
         Cost::Recomputable,
@@ -145,7 +146,7 @@ const COSTS: &[(&str, &str, usize, Cost, &str)] = &[
          eviction through sampled_evict_route, so both bounds are counted",
     ),
     (
-        "src/model/lru_memo.rs",
+        "reims-vgpu/src/model/lru_memo.rs",
         "remove",
         1,
         Cost::Recomputable,
@@ -153,7 +154,7 @@ const COSTS: &[(&str, &str, usize, Cost, &str)] = &[
          recomputed from the guest bytes it was derived from",
     ),
     (
-        "src/model/state.rs",
+        "reims-vgpu/src/model/state.rs",
         "pop_front",
         1,
         Cost::Observability,
@@ -162,7 +163,7 @@ const COSTS: &[(&str, &str, usize, Cost, &str)] = &[
          what makes `wanted` read as a lower bound instead of an answer",
     ),
     (
-        "src/model/state.rs",
+        "reims-vgpu/src/model/state.rs",
         "remove",
         2,
         Cost::Observability,
@@ -170,7 +171,7 @@ const COSTS: &[(&str, &str, usize, Cost, &str)] = &[
          note_restored retiring an identity a store brought back",
     ),
     (
-        "src/runtime/compute_exec/mod.rs",
+        "reims-vgpu/src/runtime/compute_exec/mod.rs",
         "remove",
         1,
         Cost::Recomputable,
@@ -180,7 +181,7 @@ const COSTS: &[(&str, &str, usize, Cost, &str)] = &[
          just written — so the cost is a re-upload and never a wrong pixel",
     ),
     (
-        "src/runtime/drain/mod.rs",
+        "reims-vgpu/src/runtime/drain/mod.rs",
         "clear",
         1,
         Cost::Observability,
@@ -188,7 +189,7 @@ const COSTS: &[(&str, &str, usize, Cost, &str)] = &[
          a long boot keeps reporting; gates emission only",
     ),
     (
-        "src/runtime/gather_witness.rs",
+        "reims-vgpu/src/runtime/gather_witness.rs",
         "remove",
         1,
         Cost::FailsClosed,
@@ -198,7 +199,7 @@ const COSTS: &[(&str, &str, usize, Cost, &str)] = &[
          gw_rearm. The elision only ever narrows",
     ),
     (
-        "src/runtime/guest_dmabuf.rs",
+        "reims-vgpu/src/runtime/guest_dmabuf.rs",
         "swap_remove",
         1,
         Cost::Recomputable,
@@ -207,14 +208,14 @@ const COSTS: &[(&str, &str, usize, Cost, &str)] = &[
          is a page walk",
     ),
     (
-        "src/runtime/guest_dmabuf.rs",
+        "reims-vgpu/src/runtime/guest_dmabuf.rs",
         "remove",
         1,
         Cost::Recomputable,
         "the bucket entry dropped with it, same argument",
     ),
     (
-        "src/runtime/host_writes.rs",
+        "reims-vgpu/src/runtime/host_writes.rs",
         "pop_front",
         1,
         Cost::FailsClosed,
@@ -403,25 +404,7 @@ fn find_sites(sources: &[(String, String)]) -> Vec<Site> {
 
 #[test]
 fn every_capacity_governed_eviction_carries_a_cost() {
-    let root = workspace_root();
-    let src = root.join("crates/reims-vgpu/src");
-    let sources: Vec<(String, String)> = rust_sources(&src)
-        .into_iter()
-        // `*/tests.rs` is this crate's spelling for a unit-test module in its
-        // own file. Its fixtures shrink collections constantly and none of it
-        // is device behaviour.
-        .filter(|p| p.file_name().is_some_and(|n| n != "tests.rs"))
-        .map(|p| {
-            let raw = std::fs::read_to_string(&p).expect("read source");
-            let text = blank_test_modules(&blank_comments(&raw));
-            let rel = p
-                .strip_prefix(root.join("crates/reims-vgpu"))
-                .unwrap_or(&p)
-                .to_string_lossy()
-                .to_string();
-            (rel, text)
-        })
-        .collect();
+    let sources = guest_facing_sources();
 
     let sites = find_sites(&sources);
 
@@ -433,28 +416,28 @@ fn every_capacity_governed_eviction_carries_a_cost() {
     // bound vocabulary), so the check names one site per way.
     for (file, method, why) in [
         (
-            "src/runtime/host_writes.rs",
+            "reims-vgpu/src/runtime/host_writes.rs",
             "pop_front",
             "a single-word shouty bound (RING)",
         ),
         (
-            "src/backend/vulkan/engine/pools/submission_and_buffers.rs",
+            "reims-vgpu/src/backend/vulkan/engine/pools/submission_and_buffers.rs",
             "remove",
             "a bound spelled as a bare literal (32)",
         ),
         (
-            "src/runtime/guest_dmabuf.rs",
+            "reims-vgpu/src/runtime/guest_dmabuf.rs",
             "swap_remove",
             "a byte bound rather than an entry count",
         ),
         (
-            "src/runtime/compute_exec/mod.rs",
+            "reims-vgpu/src/runtime/compute_exec/mod.rs",
             "remove",
             "an eviction with no `if` above it at all — the count is computed \
              into a `take(n)`",
         ),
         (
-            "src/model/lru_memo.rs",
+            "reims-vgpu/src/model/lru_memo.rs",
             "remove",
             "a lowercase field bound (byte_cap)",
         ),

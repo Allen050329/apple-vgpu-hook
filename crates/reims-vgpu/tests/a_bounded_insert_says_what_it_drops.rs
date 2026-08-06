@@ -23,7 +23,7 @@
 //!
 //! The same thing its sibling asserts, in the same shape: not that a particular
 //! answer is right, but that the question was **asked**. Every insertion this
-//! crate gates on a capacity appears in [`DROPS`] with a verdict, and a new one
+//! workspace gates on a capacity appears in [`DROPS`] with a verdict, and a new one
 //! fails until its author writes the line.
 //!
 //! [`Drop_::LosesGuestWork`] exists for the same reason it does there — so an
@@ -42,7 +42,7 @@
 //! sides — `x.len()` compared against a bound, and `x.push`/`x.insert` inside
 //! the window. `bytes.len() < need` above `out.layouts.push(..)` does not match,
 //! because `bytes` is not `out.layouts`. That one condition is what takes this
-//! scan from unusable to four hits across the whole crate.
+//! scan from unusable to four hits across both guest-facing crates.
 //!
 //! # It found two that a hand sweep did not
 //!
@@ -56,7 +56,7 @@
 //! [`an_eviction_says_what_it_costs`]: ../an_eviction_says_what_it_costs/index.html
 
 mod source_scan;
-use source_scan::{blank_comments, blank_test_modules, rust_sources, workspace_root};
+use source_scan::guest_facing_sources;
 
 /// What is lost when this site declines to record something.
 ///
@@ -102,14 +102,15 @@ enum Drop_ {
     LosesGuestWork,
 }
 
-/// Every capacity-gated insertion in `src/`, and what a skip drops.
+/// Every capacity-gated insertion in the two guest-facing crates, and what a
+/// skip drops.
 ///
 /// Keyed by `(file, receiver)` with the number of sites, so a second insert
 /// added beside an existing one moves the count and fails rather than
 /// inheriting a verdict written about a different line.
 const DROPS: &[(&str, &str, usize, Drop_, &str)] = &[
     (
-        "src/runtime/decode/resource/mod.rs",
+        "reims-vgpu/src/runtime/decode/resource/mod.rs",
         "out.layouts",
         1,
         Drop_::Unencodable,
@@ -120,7 +121,7 @@ const DROPS: &[(&str, &str, usize, Drop_, &str)] = &[
          the whole pipeline as `stage_input_over_cap` if it is non-zero",
     ),
     (
-        "src/runtime/decode/resource/mod.rs",
+        "reims-vgpu/src/runtime/decode/resource/mod.rs",
         "out.attributes",
         1,
         Drop_::Unencodable,
@@ -128,7 +129,7 @@ const DROPS: &[(&str, &str, usize, Drop_, &str)] = &[
          `dropped_attributes` and the same pipeline refusal",
     ),
     (
-        "src/runtime/objects/mod.rs",
+        "reims-vgpu/src/runtime/objects/mod.rs",
         "seen",
         1,
         Drop_::Observability,
@@ -140,7 +141,7 @@ const DROPS: &[(&str, &str, usize, Drop_, &str)] = &[
          the exact error this probe exists to rule out",
     ),
     (
-        "src/backend/vulkan/engine/pools/images_and_registry.rs",
+        "reims-vgpu/src/backend/vulkan/engine/pools/images_and_registry.rs",
         "self.reclaimed_recent",
         1,
         Drop_::NotAGate,
@@ -267,22 +268,7 @@ fn find_sites(sources: &[(String, String)]) -> Vec<Site> {
 
 #[test]
 fn every_capacity_gated_insert_says_what_a_skip_drops() {
-    let root = workspace_root();
-    let src = root.join("crates/reims-vgpu/src");
-    let sources: Vec<(String, String)> = rust_sources(&src)
-        .into_iter()
-        .filter(|p| p.file_name().is_some_and(|n| n != "tests.rs"))
-        .map(|p| {
-            let raw = std::fs::read_to_string(&p).expect("read source");
-            let text = blank_test_modules(&blank_comments(&raw));
-            let rel = p
-                .strip_prefix(root.join("crates/reims-vgpu"))
-                .unwrap_or(&p)
-                .to_string_lossy()
-                .to_string();
-            (rel, text)
-        })
-        .collect();
+    let sources = guest_facing_sources();
 
     let sites = find_sites(&sources);
 
@@ -292,8 +278,14 @@ fn every_capacity_gated_insert_says_what_a_skip_drops() {
     // the bound vocabulary, and the receiver match — and an empty result is
     // indistinguishable from a healthy crate without it.
     for (file, receiver) in [
-        ("src/runtime/decode/resource/mod.rs", "out.layouts"),
-        ("src/runtime/decode/resource/mod.rs", "out.attributes"),
+        (
+            "reims-vgpu/src/runtime/decode/resource/mod.rs",
+            "out.layouts",
+        ),
+        (
+            "reims-vgpu/src/runtime/decode/resource/mod.rs",
+            "out.attributes",
+        ),
     ] {
         assert!(
             sites

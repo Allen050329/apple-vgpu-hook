@@ -63,7 +63,7 @@
 //! or `CAP` in the name and all three scans pick it up for free.
 
 mod source_scan;
-use source_scan::{blank_comments, blank_test_modules, rust_sources, workspace_root};
+use source_scan::guest_facing_sources;
 
 /// What a walk that stops at its bound fails to reach.
 #[allow(
@@ -109,12 +109,13 @@ enum Skip {
     LosesGuestWork,
 }
 
-/// Every capacity-bounded walk in `src/`, and what stopping there skips.
+/// Every capacity-bounded walk in the two guest-facing crates, and what
+/// stopping there skips.
 ///
 /// Keyed by `(file, bound)` with the number of sites that pair covers.
 const SKIPS: &[(&str, &str, usize, Skip, &str)] = &[
     (
-        "src/backend/metal/render.rs",
+        "reims-vgpu/src/backend/metal/render.rs",
         "REIMS_VGPU_METAL_MAX_ATTRS",
         1,
         Skip::RefusedUpstream,
@@ -128,7 +129,7 @@ const SKIPS: &[(&str, &str, usize, Skip, &str)] = &[
          MTLVertexDescriptor.attributes' own slot count",
     ),
     (
-        "src/backend/metal/render.rs",
+        "reims-vgpu/src/backend/metal/render.rs",
         "REIMS_VGPU_METAL_MAX_COLOR_RTS",
         2,
         Skip::RefusedUpstream,
@@ -138,7 +139,7 @@ const SKIPS: &[(&str, &str, usize, Skip, &str)] = &[
          longer colour list before reaching here",
     ),
     (
-        "src/backend/metal/stage_input.rs",
+        "reims-vgpu/src/backend/metal/stage_input.rs",
         "REIMS_VGPU_COMPUTE_STAGE_INPUT_MAX_LAYOUTS",
         2,
         Skip::Unencodable,
@@ -148,14 +149,14 @@ const SKIPS: &[(&str, &str, usize, Skip, &str)] = &[
          classifies Unencodable, reached from the Metal arm",
     ),
     (
-        "src/backend/metal/stage_input.rs",
+        "reims-vgpu/src/backend/metal/stage_input.rs",
         "REIMS_VGPU_COMPUTE_STAGE_INPUT_MAX_ATTRIBUTES",
         1,
         Skip::Unencodable,
         "the attribute half of the same mask and the same `const` assertion",
     ),
     (
-        "src/runtime/compute_exec/mod.rs",
+        "reims-vgpu/src/runtime/compute_exec/mod.rs",
         "REIMS_VGPU_COMPUTE_STAGE_INPUT_MAX_ATTRIBUTES",
         1,
         Skip::DeviceFilled,
@@ -163,14 +164,14 @@ const SKIPS: &[(&str, &str, usize, Skip, &str)] = &[
          the record's own over-cap count is what refuses the pipeline",
     ),
     (
-        "src/runtime/compute_exec/mod.rs",
+        "reims-vgpu/src/runtime/compute_exec/mod.rs",
         "REIMS_VGPU_COMPUTE_STAGE_INPUT_MAX_LAYOUTS",
         1,
         Skip::DeviceFilled,
         "the layout half of the same array",
     ),
     (
-        "src/backend/vulkan/engine/exec.rs",
+        "reims-vgpu/src/backend/vulkan/engine/exec.rs",
         "MAX_SECONDARY_ATTACH",
         2,
         Skip::RefusedUpstream,
@@ -180,7 +181,7 @@ const SKIPS: &[(&str, &str, usize, Skip, &str)] = &[
          the declaration, not these sites",
     ),
     (
-        "src/runtime/objects/mod.rs",
+        "reims-vgpu/src/runtime/objects/mod.rs",
         "TYPE4_PLANE_CAP",
         2,
         Skip::RefusedUpstream,
@@ -189,7 +190,7 @@ const SKIPS: &[(&str, &str, usize, Skip, &str)] = &[
          `.min`s are that refusal restated where the array is indexed",
     ),
     (
-        "src/runtime/objects/mod.rs",
+        "reims-vgpu/src/runtime/objects/mod.rs",
         "HEX_MAX",
         1,
         Skip::Observability,
@@ -197,14 +198,14 @@ const SKIPS: &[(&str, &str, usize, Skip, &str)] = &[
          a log line's length and nothing else",
     ),
     (
-        "src/runtime/drain/mod.rs",
+        "reims-vgpu/src/runtime/drain/mod.rs",
         "TAIL_DUMP_MAX",
         1,
         Skip::Observability,
         "how many trailing bytes a malformed-packet dump prints",
     ),
     (
-        "src/backend/vulkan/caps/api_floor.rs",
+        "reims-vgpu/src/backend/vulkan/caps/api_floor.rs",
         "MAX_USEFUL_API",
         1,
         Skip::Narrowing,
@@ -213,7 +214,7 @@ const SKIPS: &[(&str, &str, usize, Skip, &str)] = &[
          is that rule applied to the API version itself",
     ),
     (
-        "src/model/regs.rs",
+        "reims-vgpu/src/model/regs.rs",
         "PROTOCOL_VERSION_MAX",
         1,
         Skip::Narrowing,
@@ -222,7 +223,35 @@ const SKIPS: &[(&str, &str, usize, Skip, &str)] = &[
          what negotiation *is*",
     ),
     (
-        "src/backend/vulkan/engine/window_present.rs",
+        "reims-vgpu-wire/src/device_desc.rs",
+        "TYPE4_PLANE_CAP",
+        1,
+        Skip::DeviceFilled,
+        "the type-4 descriptor *builder*'s `Vec` reserve. It bounds the bytes the \
+         builder sets aside in its own fixed array and nothing else — its doc is \
+         explicit that `plane_count` is written through **unclamped**, including \
+         values over the cap, because a corrupt descriptor is a thing the device \
+         has to be tested against. So this caps the fixture's storage, never a \
+         decoded record",
+    ),
+    (
+        "reims-vgpu-wire/src/device_desc.rs",
+        "TYPE4_BUILDER_CAP",
+        1,
+        Skip::DeviceFilled,
+        "`with_len` clamping to the builder's own `[u8; TYPE4_BUILDER_CAP]`. The \
+         array is the bound, so the clamp is a bounds check on this device's \
+         storage rather than a policy about guest data",
+    ),
+    (
+        "reims-vgpu-wire/src/device_desc.rs",
+        "TYPE5_BUILDER_CAP",
+        1,
+        Skip::DeviceFilled,
+        "the type-5 builder's `with_len`, same array and same argument",
+    ),
+    (
+        "reims-vgpu/src/backend/vulkan/engine/window_present.rs",
         "caps_max",
         1,
         Skip::Narrowing,
@@ -232,7 +261,7 @@ const SKIPS: &[(&str, &str, usize, Skip, &str)] = &[
          inside the reported range. Nothing of the guest's is being read here",
     ),
     (
-        "src/runtime/compute_exec/mod.rs",
+        "reims-vgpu/src/runtime/compute_exec/mod.rs",
         "over_cap",
         1,
         Skip::NotAWalkBound,
@@ -338,22 +367,7 @@ fn find_sites(sources: &[(String, String)]) -> Vec<Site> {
 
 #[test]
 fn every_capacity_bounded_walk_says_what_it_skips() {
-    let root = workspace_root();
-    let src = root.join("crates/reims-vgpu/src");
-    let sources: Vec<(String, String)> = rust_sources(&src)
-        .into_iter()
-        .filter(|p| p.file_name().is_some_and(|n| n != "tests.rs"))
-        .map(|p| {
-            let raw = std::fs::read_to_string(&p).expect("read source");
-            let text = blank_test_modules(&blank_comments(&raw));
-            let rel = p
-                .strip_prefix(root.join("crates/reims-vgpu"))
-                .unwrap_or(&p)
-                .to_string_lossy()
-                .to_string();
-            (rel, text)
-        })
-        .collect();
+    let sources = guest_facing_sources();
 
     let sites = find_sites(&sources);
 
@@ -363,19 +377,26 @@ fn every_capacity_bounded_walk_says_what_it_skips() {
     // of each other and only source text sees them together.
     for (file, bound, why) in [
         (
-            "src/backend/metal/render.rs",
+            "reims-vgpu/src/backend/metal/render.rs",
             "REIMS_VGPU_METAL_MAX_ATTRS",
             "a `.take(` on the Metal arm",
         ),
         (
-            "src/backend/metal/stage_input.rs",
+            "reims-vgpu/src/backend/metal/stage_input.rs",
             "REIMS_VGPU_COMPUTE_STAGE_INPUT_MAX_LAYOUTS",
             "a `.min(` on the Metal arm",
         ),
         (
-            "src/backend/vulkan/engine/exec.rs",
+            "reims-vgpu/src/backend/vulkan/engine/exec.rs",
             "MAX_SECONDARY_ATTACH",
             "a `.take(` on the Vulkan arm",
+        ),
+        (
+            "reims-vgpu-wire/src/device_desc.rs",
+            "TYPE4_BUILDER_CAP",
+            "the whole of `reims-vgpu-wire` — a second crate that decodes guest \
+             bytes, and one a scan rooted at `reims-vgpu/src` reports as clean by \
+             construction",
         ),
     ] {
         assert!(

@@ -26,6 +26,42 @@ pub fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
+/// Every product source file in the workspace's two guest-facing crates, as
+/// `(path relative to `crates/`, text with comments and test modules blanked)`.
+///
+/// The set the bound scans mean by "this crate". It is **two** crates, not one:
+/// `reims-vgpu-wire` decodes guest bytes just as `reims-vgpu` does, so a
+/// capacity that cuts a decoded record is exactly as dangerous there, and a scan
+/// rooted at one crate's `src/` reports a clean tree for the other by
+/// construction — the directory-level version of the failure every one of those
+/// scans carries a self-check against.
+///
+/// Keys are relative to `crates/`, so they read `reims-vgpu/src/…` and
+/// `reims-vgpu-wire/src/…` and a verdict says which crate it is about.
+///
+/// `*/tests.rs` is this workspace's spelling for a unit-test module in its own
+/// file; its fixtures shrink and cap collections constantly and none of it is
+/// device behaviour, so it is dropped here rather than in each caller.
+pub fn guest_facing_sources() -> Vec<(String, String)> {
+    let root = workspace_root();
+    let crates = root.join("crates");
+    ["reims-vgpu", "reims-vgpu-wire"]
+        .into_iter()
+        .flat_map(|name| rust_sources(&crates.join(name).join("src")))
+        .filter(|p| p.file_name().is_some_and(|n| n != "tests.rs"))
+        .map(|p| {
+            let raw = std::fs::read_to_string(&p).expect("read source");
+            let text = blank_test_modules(&blank_comments(&raw));
+            let rel = p
+                .strip_prefix(&crates)
+                .unwrap_or(&p)
+                .to_string_lossy()
+                .to_string();
+            (rel, text)
+        })
+        .collect()
+}
+
 /// Every `.rs` file under `dir`, recursively, in a stable order.
 pub fn rust_sources(dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
