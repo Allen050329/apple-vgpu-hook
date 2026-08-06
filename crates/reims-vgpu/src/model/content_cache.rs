@@ -50,6 +50,26 @@
 //! carries, so a lookup descends an ordered map to one bucket and walks that,
 //! and [`CacheEntry::matches`] — the full identity compare — still decides every
 //! hit exactly as before.
+//!
+//! # Why the lookup key is borrowed and the entry is not
+//!
+//! "The full identity compare" was once a claim about the shape rather than
+//! about the keys. [`CacheEntry::Key`] had no lifetime, so a key could only hold
+//! what a caller could afford to build on every lookup — and for a cache of
+//! compiled shader objects that ruled out the shader. Three of the six keys were
+//! a 64-bit FNV digest of a blob beside its length, with no copy of the blob
+//! retained anywhere, so `matches` compared two digests and a hit was one
+//! collision away from handing the guest an `MTLFunction`, an
+//! `MTLComputePipelineState` or a reflection built from bytes it never
+//! submitted. Nothing would refuse and nothing would log.
+//!
+//! Splitting the key in two removes the class rather than moving its
+//! probability: the entry retains the blob, `Key<'a>` borrows the caller's, and
+//! `matches` compares content. The cost is one copy of each *distinct* blob for
+//! the life of the process, which is a fraction of the compiled object already
+//! retained beside it. `crate::backend::blob::BlobIdentity` is that pair;
+//! `crate::runtime::m2v_cache` is the same fix made earlier against its own
+//! table.
 
 #![cfg_attr(not(feature = "backend-metal"), allow(dead_code))]
 
@@ -64,14 +84,22 @@ use std::collections::BTreeMap;
 /// re-scan at all, so two callers that missed the same blob both pushed and the
 /// cache carried a duplicate.
 pub(crate) trait CacheEntry {
-    type Key;
-    /// The key this entry was filed under. An insert asks the entry for it
-    /// rather than taking it a second time from the caller, so the two cannot
-    /// disagree.
-    fn key(&self) -> &Self::Key;
+    /// The identity a lookup is made with, **borrowed**.
+    ///
+    /// Borrowed because the identity of a compiled GPU object is the blob that
+    /// produced it, and a lookup happens once per pipeline build: an owned key
+    /// would copy that blob to throw away on every hit. The entry retains its
+    /// own copy — see [`Self::lookup_key`] — so the two halves are separate
+    /// types by construction, and a key that is cheap to build cannot quietly
+    /// become the thing the cache stores.
+    type Key<'a>;
+    /// The identity this entry was filed under, borrowed from the entry's own
+    /// retained copy. An insert asks the entry for it rather than taking it a
+    /// second time from the caller, so the two cannot disagree.
+    fn lookup_key(&self) -> Self::Key<'_>;
     /// The full identity compare. This alone decides a hit; [`Self::bucket`]
     /// only narrows which entries are asked.
-    fn matches(&self, key: &Self::Key) -> bool;
+    fn matches(&self, key: &Self::Key<'_>) -> bool;
     /// A cheap `u64` that must be equal whenever [`Self::matches`] is true.
     ///
     /// Every key in this crate already carries one — the prefilter hash its
@@ -80,7 +108,7 @@ pub(crate) trait CacheEntry {
     /// is merely a longer walk; two keys that match but bucket differently is a
     /// lookup that misses, which is why the invariant is stated here rather than
     /// left to each implementor to rediscover.
-    fn bucket(key: &Self::Key) -> u64;
+    fn bucket(key: &Self::Key<'_>) -> u64;
 }
 
 /// A process-global content-keyed cache, retained for the life of the process.
@@ -105,7 +133,7 @@ impl<E: CacheEntry> ContentCache<E> {
         }
     }
 
-    pub(crate) fn find(&self, key: &E::Key) -> Option<&E> {
+    pub(crate) fn find(&self, key: &E::Key<'_>) -> Option<&E> {
         self.buckets
             .get(&E::bucket(key))?
             .iter()
@@ -116,8 +144,11 @@ impl<E: CacheEntry> ContentCache<E> {
     /// [`find`](Self::find) and this call — the lock is released in between
     /// while the caller builds the GPU object, so it can.
     pub(crate) fn insert_unique(&mut self, entry: E) -> &E {
-        let bucket = self.buckets.entry(E::bucket(entry.key())).or_default();
-        let slot = match bucket.iter().position(|e| e.matches(entry.key())) {
+        let bucket = self
+            .buckets
+            .entry(E::bucket(&entry.lookup_key()))
+            .or_default();
+        let slot = match bucket.iter().position(|e| e.matches(&entry.lookup_key())) {
             Some(raced) => raced,
             None => {
                 bucket.push(entry);
@@ -142,42 +173,54 @@ impl<E: CacheEntry> ContentCache<E> {
 mod tests {
     use super::*;
 
-    /// Stands in for the caches' real keys, which are all a content hash beside
-    /// the byte length it was taken over.
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    struct ProbeKey {
+    /// Stands in for the caches' real lookup keys: a content hash that picks the
+    /// bucket, beside the bytes it was taken over, borrowed from the caller.
+    #[derive(Clone, Copy)]
+    struct ProbeKey<'a> {
         hash: u64,
-        len: usize,
+        bytes: &'a [u8],
     }
 
     /// An entry with no GPU object in it, so the table itself can be driven
     /// without a device — which is what makes these tests runnable on a host
     /// that has no Metal.
+    ///
+    /// It retains its own copy of the bytes, exactly as the real entries do, so
+    /// `matches` can answer from content rather than from the digest.
     struct Probe {
-        key: ProbeKey,
+        hash: u64,
+        bytes: Vec<u8>,
         tag: u32,
     }
 
     impl CacheEntry for Probe {
-        type Key = ProbeKey;
-        fn key(&self) -> &ProbeKey {
-            &self.key
+        type Key<'a> = ProbeKey<'a>;
+        fn lookup_key(&self) -> ProbeKey<'_> {
+            ProbeKey {
+                hash: self.hash,
+                bytes: &self.bytes,
+            }
         }
-        fn matches(&self, key: &ProbeKey) -> bool {
-            self.key == *key
+        fn matches(&self, key: &ProbeKey<'_>) -> bool {
+            self.hash == key.hash && self.bytes == key.bytes
         }
-        /// Only the hash, exactly as the real keys do — the length is left to
+        /// Only the hash, exactly as the real keys do — the content is left to
         /// `matches`, so the collision test below shares one bucket.
-        fn bucket(key: &ProbeKey) -> u64 {
+        fn bucket(key: &ProbeKey<'_>) -> u64 {
             key.hash
         }
     }
 
     fn probe(hash: u64, tag: u32) -> Probe {
         Probe {
-            key: ProbeKey { hash, len: 8 },
+            hash,
+            bytes: vec![0xab; 8],
             tag,
         }
+    }
+
+    fn ask(hash: u64, bytes: &[u8]) -> ProbeKey<'_> {
+        ProbeKey { hash, bytes }
     }
 
     /// An insert that races another caller's insert must not add a second copy.
@@ -215,41 +258,43 @@ mod tests {
             cache.insert_unique(probe(i, i as u32));
         }
         assert_eq!(cache.len(), 1024, "the table never displaces an entry");
+        let bytes = vec![0xab; 8];
         assert_eq!(
-            cache.find(&ProbeKey { hash: 0, len: 8 }).map(|e| e.tag),
+            cache.find(&ask(0, &bytes)).map(|e| e.tag),
             Some(0),
             "the first object compiled is still there after 1023 later ones"
         );
-        assert_eq!(
-            cache.find(&ProbeKey { hash: 1023, len: 8 }).map(|e| e.tag),
-            Some(1023)
-        );
+        assert_eq!(cache.find(&ask(1023, &bytes)).map(|e| e.tag), Some(1023));
     }
 
-    /// The length is part of the key, not decoration beside it: two blobs whose
-    /// hashes collide must not share one compiled object. They share a bucket —
-    /// `bucket` is the hash alone — so this also pins that a bucket walk applies
-    /// the full compare rather than trusting the prefilter.
+    /// The content is the key and the digest only picks the bucket: two blobs
+    /// whose hashes collide must not share one compiled object.
+    ///
+    /// This is the hazard the borrowed-key half of [`CacheEntry`] exists for. A
+    /// natural 64-bit collision is not something a test can produce, so drive
+    /// the state one would produce — two different blobs filed under one bucket
+    /// — and ask through the real lookup. A `matches` that trusted the digest
+    /// would return the first entry for the second blob's bytes.
     #[test]
-    fn a_hash_collision_across_lengths_is_not_a_hit() {
+    fn a_digest_collision_between_different_blobs_is_not_a_hit() {
         let mut cache: ContentCache<Probe> = ContentCache::new();
+        let first = vec![0xab; 8];
+        let second = vec![0xcd; 8];
         cache.insert_unique(probe(7, 70));
-        assert!(cache.find(&ProbeKey { hash: 7, len: 8 }).is_some());
-        assert!(cache.find(&ProbeKey { hash: 7, len: 9 }).is_none());
+        assert!(cache.find(&ask(7, &first)).is_some());
+        assert!(
+            cache.find(&ask(7, &second)).is_none(),
+            "a blob that only collides is a miss, not somebody else's object"
+        );
 
         // Both live in bucket 7, and each still resolves to its own entry.
         cache.insert_unique(Probe {
-            key: ProbeKey { hash: 7, len: 9 },
+            hash: 7,
+            bytes: second.clone(),
             tag: 90,
         });
-        assert_eq!(
-            cache.find(&ProbeKey { hash: 7, len: 8 }).map(|e| e.tag),
-            Some(70)
-        );
-        assert_eq!(
-            cache.find(&ProbeKey { hash: 7, len: 9 }).map(|e| e.tag),
-            Some(90)
-        );
+        assert_eq!(cache.find(&ask(7, &first)).map(|e| e.tag), Some(70));
+        assert_eq!(cache.find(&ask(7, &second)).map(|e| e.tag), Some(90));
         assert_eq!(cache.len(), 2);
     }
 }

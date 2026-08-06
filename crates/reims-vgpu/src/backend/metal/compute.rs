@@ -1,9 +1,10 @@
 //! Compute encode path: PSO cache, binds, dispatch core, reflection.
 
+use crate::backend::blob::BlobKey;
 use crate::backend::hash::hash_bytes;
 use crate::backend::metal::abi::*;
 use crate::backend::metal::cache::{
-    compute_pso_insert, compute_pso_lookup, reflect_insert, reflect_lookup, BlobKey, ComputePsoKey,
+    compute_pso_insert, compute_pso_lookup, reflect_insert, reflect_lookup, ComputePsoKey,
 };
 use crate::backend::metal::constants::*;
 use crate::backend::metal::format::storage_image_format;
@@ -69,18 +70,15 @@ pub fn new_compute_pipeline_state(
     err: ErrOut<'_>,
 ) -> Result<ComputePipelineState, Status> {
     let key = ComputePsoKey {
-        mtlb: BlobKey {
-            hash: hash_bytes(mtlb),
-            len: mtlb.len(),
-        },
+        mtlb: BlobKey::new(mtlb),
         stage_hash: hash_compute_stage_input(stage_input),
-        has_stage_input: u8::from(stage_input.is_some()),
+        stage_input,
     };
     if let Some(hit) = compute_pso_lookup(&key) {
         return Ok(hit);
     }
     let pso = new_compute_pipeline_state_uncached(device, function, stage_input, err)?;
-    Ok(compute_pso_insert(key, pso))
+    Ok(compute_pso_insert(&key, pso))
 }
 
 fn compute_buffer_backing(buffer: &ReimsVgpuBuffer) -> Result<(*mut u8, usize, usize), Status> {
@@ -974,10 +972,7 @@ pub fn reflect_compute_textures_mtlb(
         return Err(Status::args("metal_compute_reflection_mtlb_empty"));
     }
 
-    let key = BlobKey {
-        hash: hash_bytes(mtlb),
-        len: mtlb.len(),
-    };
+    let key = BlobKey::new(mtlb);
     if let Some(cached) = reflect_lookup(&key) {
         clear_err(err);
         return Ok(cached);
@@ -1073,7 +1068,7 @@ pub fn reflect_compute_textures_mtlb(
         }
     }
 
-    reflect_insert(key, local.clone());
+    reflect_insert(&key, local.clone());
     clear_err(err);
     let _ = pso;
     Ok(local)
@@ -1158,13 +1153,7 @@ mod tests {
                 access: REIMS_VGPU_COMPUTE_TEXTURE_ACCESS_READ,
             })
             .collect();
-        reflect_insert(
-            BlobKey {
-                hash: hash_bytes(&mtlb),
-                len: mtlb.len(),
-            },
-            wide.clone(),
-        );
+        reflect_insert(&BlobKey::new(&mtlb), wide.clone());
 
         let mut err_buf = [0i8; 256];
         let served = reflect_compute_textures_mtlb(&mtlb, (err_buf.as_mut_ptr(), err_buf.len()))

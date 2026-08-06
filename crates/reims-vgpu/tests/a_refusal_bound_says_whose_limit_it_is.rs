@@ -161,7 +161,7 @@ struct Row {
 /// is the whole point of writing the verdict down.
 const ROWS: &[Row] = &[
     Row {
-        at: "reims-vgpu/src/backend/metal/compute.rs:514",
+        at: "reims-vgpu/src/backend/metal/compute.rs:512",
         bound: "REIMS_VGPU_METAL_MAX_SAMPLERS",
         verdict: Verdict::ContractLimit,
         why: "Metal's sampler argument table, pinned at the declaration to \
@@ -169,7 +169,7 @@ const ROWS: &[Row] = &[
               truncating a plural sampler bind at 16 per stage.",
     },
     Row {
-        at: "reims-vgpu/src/backend/metal/compute.rs:1041",
+        at: "reims-vgpu/src/backend/metal/compute.rs:1036",
         bound: "REIMS_VGPU_METAL_MAX_TEXTURES",
         verdict: Verdict::ContractLimit,
         why: "Metal's texture argument table, pinned to draw::MAX_TEXTURE_BIND_SLOTS, \

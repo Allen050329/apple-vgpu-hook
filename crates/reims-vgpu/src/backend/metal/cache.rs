@@ -1,8 +1,10 @@
 //! Process-global content-hash caches.
 
+use crate::backend::blob::{BlobIdentity, BlobKey};
 use crate::backend::hash::hash_u64;
 use crate::backend::metal::abi::{
-    ReimsVgpuComputeTextureUsage, ReimsVgpuDepthStencilState, ReimsVgpuSampler,
+    ReimsVgpuComputeStageInputDescriptor, ReimsVgpuComputeTextureUsage, ReimsVgpuDepthStencilState,
+    ReimsVgpuSampler,
 };
 use crate::backend::metal::constants::*;
 use crate::contract::fnv::FNV_OFFSET_BASIS;
@@ -12,7 +14,7 @@ use metal::{ComputePipelineState, DepthStencilState, Function, RenderPipelineSta
 use parking_lot::Mutex;
 
 pub struct FnEntry {
-    pub key: BlobKey,
+    pub blob: BlobIdentity,
     pub function: Function,
 }
 
@@ -228,29 +230,41 @@ pub struct RenderPsoEntry {
     pub vert_sampler_mask: u32,
 }
 
-/// A content hash and the length it was taken over.
-///
-/// The length is part of the key rather than a redundant field beside it: a
-/// 64-bit hash of a shader blob can collide, and two blobs of different lengths
-/// that collide would otherwise share one compiled object.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub struct BlobKey {
-    pub hash: u64,
-    pub len: usize,
-}
-
 /// What decides `MTLComputePipelineState` identity: the kernel blob, plus the
 /// stage-input descriptor the PSO is specialized against.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub struct ComputePsoKey {
-    pub mtlb: BlobKey,
+///
+/// Both halves are compared by content. The descriptor used to travel as a
+/// `stage_hash` beside a `has_stage_input` flag and nothing retained it, so two
+/// descriptors whose digests collided specialized one PSO — the same hole
+/// [`crate::backend::blob`] describes for the blob, over 1520 bytes of decoded
+/// guest record. It is `Copy` and this cache holds one per distinct pipeline, so
+/// retaining it costs less than the flag saved.
+#[derive(Clone, Copy)]
+pub struct ComputePsoKey<'a> {
+    pub mtlb: BlobKey<'a>,
+    /// Buckets with the blob's digest and decides nothing.
     pub stage_hash: u64,
-    pub has_stage_input: u8,
+    pub stage_input: Option<&'a ReimsVgpuComputeStageInputDescriptor>,
 }
 
 pub struct ComputePsoEntry {
-    pub key: ComputePsoKey,
+    pub mtlb: BlobIdentity,
+    pub stage_hash: u64,
+    pub stage_input: Option<ReimsVgpuComputeStageInputDescriptor>,
     pub pso: ComputePipelineState,
+}
+
+impl ComputePsoEntry {
+    fn stage_input_is(&self, key: &ComputePsoKey<'_>) -> bool {
+        match (&self.stage_input, key.stage_input) {
+            (None, None) => true,
+            (Some(mine), Some(theirs)) => {
+                crate::backend::metal::util::bytes_of(mine)
+                    == crate::backend::metal::util::bytes_of(theirs)
+            }
+            _ => false,
+        }
+    }
 }
 
 /// Every `MTLSamplerDescriptor` property this device sets, and nothing else, as
@@ -324,60 +338,66 @@ pub struct DepthStencilEntry {
 }
 
 pub struct ReflectEntry {
-    pub key: BlobKey,
+    pub blob: BlobIdentity,
     pub usages: Vec<ReimsVgpuComputeTextureUsage>,
 }
 
 impl CacheEntry for FnEntry {
-    type Key = BlobKey;
-    fn key(&self) -> &BlobKey {
-        &self.key
+    type Key<'a> = BlobKey<'a>;
+    fn lookup_key(&self) -> BlobKey<'_> {
+        self.blob.as_key()
     }
-    fn matches(&self, key: &BlobKey) -> bool {
-        self.key == *key
+    /// The blob's bytes, not its digest — see [`crate::backend::blob`].
+    fn matches(&self, key: &BlobKey<'_>) -> bool {
+        self.blob.is(key)
     }
-    /// The blob's content hash. `len` is left to `matches`, which is what
-    /// keeps two equal-hash blobs of different lengths distinct entries.
-    fn bucket(key: &BlobKey) -> u64 {
+    fn bucket(key: &BlobKey<'_>) -> u64 {
         key.hash
     }
 }
 
 impl CacheEntry for ComputePsoEntry {
-    type Key = ComputePsoKey;
-    fn key(&self) -> &ComputePsoKey {
-        &self.key
+    type Key<'a> = ComputePsoKey<'a>;
+    fn lookup_key(&self) -> ComputePsoKey<'_> {
+        ComputePsoKey {
+            mtlb: self.mtlb.as_key(),
+            stage_hash: self.stage_hash,
+            stage_input: self.stage_input.as_ref(),
+        }
     }
-    fn matches(&self, key: &ComputePsoKey) -> bool {
-        self.key == *key
+    fn matches(&self, key: &ComputePsoKey<'_>) -> bool {
+        self.mtlb.is(&key.mtlb) && self.stage_input_is(key)
     }
     /// The kernel blob's hash folded with the stage-input hash, so two PSOs
     /// specialized from one blob against different stage inputs do not pile
-    /// into one bucket.
-    fn bucket(key: &ComputePsoKey) -> u64 {
+    /// into one bucket. Both are prefilters; `matches` compares both records.
+    fn bucket(key: &ComputePsoKey<'_>) -> u64 {
         hash_u64(key.mtlb.hash, key.stage_hash)
     }
 }
 
 impl CacheEntry for RenderPsoEntry {
-    type Key = RenderPsoKey;
-    fn key(&self) -> &RenderPsoKey {
+    /// Borrowed, unlike the sampler and depth-stencil keys beside it: this one
+    /// is thirty-three fields wide, so an owned lookup key would copy every
+    /// array on every scan step.
+    type Key<'a> = &'a RenderPsoKey;
+    fn lookup_key(&self) -> &RenderPsoKey {
         &self.key
     }
-    fn matches(&self, key: &RenderPsoKey) -> bool {
+    fn matches(&self, key: &&RenderPsoKey) -> bool {
         self.key.equal(key)
     }
     /// The key hash the descriptor is already folded into. `equal` still
     /// decides the hit; this only chooses which entries it is asked about.
-    fn bucket(key: &RenderPsoKey) -> u64 {
+    fn bucket(key: &&RenderPsoKey) -> u64 {
         key.key_hash
     }
 }
 
 impl CacheEntry for SamplerCacheEntry {
-    type Key = SamplerDescriptorKey;
-    fn key(&self) -> &SamplerDescriptorKey {
-        &self.key
+    type Key<'a> = SamplerDescriptorKey;
+    fn lookup_key(&self) -> SamplerDescriptorKey {
+        self.key
     }
     fn matches(&self, key: &SamplerDescriptorKey) -> bool {
         self.key == *key
@@ -388,9 +408,9 @@ impl CacheEntry for SamplerCacheEntry {
 }
 
 impl CacheEntry for DepthStencilEntry {
-    type Key = DepthStencilKey;
-    fn key(&self) -> &DepthStencilKey {
-        &self.key
+    type Key<'a> = DepthStencilKey;
+    fn lookup_key(&self) -> DepthStencilKey {
+        self.key
     }
     fn matches(&self, key: &DepthStencilKey) -> bool {
         self.key.hash == key.hash && depth_stencil_eq(&self.key.desc, &key.desc)
@@ -401,14 +421,14 @@ impl CacheEntry for DepthStencilEntry {
 }
 
 impl CacheEntry for ReflectEntry {
-    type Key = BlobKey;
-    fn key(&self) -> &BlobKey {
-        &self.key
+    type Key<'a> = BlobKey<'a>;
+    fn lookup_key(&self) -> BlobKey<'_> {
+        self.blob.as_key()
     }
-    fn matches(&self, key: &BlobKey) -> bool {
-        self.key == *key
+    fn matches(&self, key: &BlobKey<'_>) -> bool {
+        self.blob.is(key)
     }
-    fn bucket(key: &BlobKey) -> u64 {
+    fn bucket(key: &BlobKey<'_>) -> u64 {
         key.hash
     }
 }
@@ -465,27 +485,38 @@ pub fn cache_levels() -> [usize; 6] {
     })
 }
 
-pub fn fn_cache_lookup(key: &BlobKey) -> Option<Function> {
+pub fn fn_cache_lookup(key: &BlobKey<'_>) -> Option<Function> {
     with_caches(|c| c.fn_cache.find(key).map(|e| e.function.clone()))
 }
 
-pub fn fn_cache_insert(key: BlobKey, function: Function) -> Function {
+pub fn fn_cache_insert(key: &BlobKey<'_>, function: Function) -> Function {
     with_caches(|c| {
         c.fn_cache
-            .insert_unique(FnEntry { key, function })
+            .insert_unique(FnEntry {
+                blob: BlobIdentity::of(key),
+                function,
+            })
             .function
             .clone()
     })
 }
 
-pub fn compute_pso_lookup(key: &ComputePsoKey) -> Option<ComputePipelineState> {
+pub fn compute_pso_lookup(key: &ComputePsoKey<'_>) -> Option<ComputePipelineState> {
     with_caches(|c| c.compute_pso.find(key).map(|e| e.pso.clone()))
 }
 
-pub fn compute_pso_insert(key: ComputePsoKey, pso: ComputePipelineState) -> ComputePipelineState {
+pub fn compute_pso_insert(
+    key: &ComputePsoKey<'_>,
+    pso: ComputePipelineState,
+) -> ComputePipelineState {
     with_caches(|c| {
         c.compute_pso
-            .insert_unique(ComputePsoEntry { key, pso })
+            .insert_unique(ComputePsoEntry {
+                mtlb: BlobIdentity::of(&key.mtlb),
+                stage_hash: key.stage_hash,
+                stage_input: key.stage_input.copied(),
+                pso,
+            })
             .pso
             .clone()
     })
@@ -494,7 +525,7 @@ pub fn compute_pso_insert(key: ComputePsoKey, pso: ComputePipelineState) -> Comp
 pub fn render_pso_lookup(key: &RenderPsoKey) -> Option<(RenderPipelineState, u32, u32)> {
     with_caches(|c| {
         c.render_pso
-            .find(key)
+            .find(&key)
             .map(|e| (e.pso.clone(), e.vert_sampler_mask, e.frag_sampler_mask))
     })
 }
@@ -550,13 +581,16 @@ fn depth_stencil_eq(a: &ReimsVgpuDepthStencilState, b: &ReimsVgpuDepthStencilSta
     crate::backend::metal::util::bytes_of(a) == crate::backend::metal::util::bytes_of(b)
 }
 
-pub fn reflect_lookup(key: &BlobKey) -> Option<Vec<ReimsVgpuComputeTextureUsage>> {
+pub fn reflect_lookup(key: &BlobKey<'_>) -> Option<Vec<ReimsVgpuComputeTextureUsage>> {
     with_caches(|c| c.reflect.find(key).map(|e| e.usages.clone()))
 }
 
-pub fn reflect_insert(key: BlobKey, usages: Vec<ReimsVgpuComputeTextureUsage>) {
+pub fn reflect_insert(key: &BlobKey<'_>, usages: Vec<ReimsVgpuComputeTextureUsage>) {
     with_caches(|c| {
-        c.reflect.insert_unique(ReflectEntry { key, usages });
+        c.reflect.insert_unique(ReflectEntry {
+            blob: BlobIdentity::of(key),
+            usages,
+        });
     })
 }
 

@@ -1,7 +1,7 @@
 //! MTLB sole-function load with content-hash cache.
 
-use crate::backend::hash::hash_bytes;
-use crate::backend::metal::cache::{fn_cache_insert, fn_cache_lookup, BlobKey};
+use crate::backend::blob::BlobKey;
+use crate::backend::metal::cache::{fn_cache_insert, fn_cache_lookup};
 use crate::backend::metal::util::{set_err, ErrOut, Status};
 use metal::{Device, Function};
 
@@ -12,15 +12,12 @@ pub fn load_only_function(
     err: ErrOut<'_>,
 ) -> Result<Function, Status> {
     validate_mtlb(mtlb, label, err)?;
-    let key = BlobKey {
-        hash: hash_bytes(mtlb),
-        len: mtlb.len(),
-    };
+    let key = BlobKey::new(mtlb);
     if let Some(hit) = fn_cache_lookup(&key) {
         return Ok(hit);
     }
     let function = load_only_function_uncached(device, mtlb, label, err)?;
-    Ok(fn_cache_insert(key, function))
+    Ok(fn_cache_insert(&key, function))
 }
 
 fn validate_mtlb(mtlb: &[u8], label: &str, err: ErrOut<'_>) -> Result<(), Status> {

@@ -79,7 +79,7 @@ struct Row {
 /// Every returned raw pointer, with a written verdict.
 const ROWS: &[Row] = &[
     Row {
-        at: "reims-vgpu/src/backend/metal/compute.rs:86",
+        at: "reims-vgpu/src/backend/metal/compute.rs:84",
         verdict: Verdict::PairedWithLength,
         why: "Returns (*mut u8, len, offset) for a compute buffer's backing; the \
               three checks above it relate offset and len to backing_len before \

@@ -36,6 +36,14 @@
 /// produce keys in a different keyspace without anything failing.
 pub mod hash;
 
+/// The identity of a shader blob, for the caches [`hash`] used to key on its
+/// digest alone.
+///
+/// Ungated for the same reason and by the same argument as [`hash`]: it names
+/// nothing from the `metal` crate, the thing worth testing is the byte compare,
+/// and a `cfg` here would put those tests on the arm a Linux host cannot run.
+pub mod blob;
+
 #[cfg(feature = "backend-metal")]
 // `Status` is 264 bytes — six inline `(key, value)` fields, no allocation — and
 // it is the `Err` of most of this module's functions, so `result_large_err` and
