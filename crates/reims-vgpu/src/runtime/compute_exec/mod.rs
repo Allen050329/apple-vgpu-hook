@@ -3277,9 +3277,17 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
     };
     let (grid_x, grid_y, grid_z) = (grid.x, grid.y, grid.z);
     let (tg_x, tg_y, tg_z) = (tg.x, tg.y, tg.z);
-    if tg_x == 0 || tg_y == 0 || tg_z == 0 || grid_x == 0 || grid_y == 0 || grid_z == 0 {
+    // Resolved here, before any staging, so a record with no work costs nothing
+    // — but computed by the same function that refuses the zero, because the two
+    // are one rule. See [`crate::contract::dispatch::workgroup_counts`] for why
+    // splitting them put an unreachable `.max(1)` on the quotients.
+    let Some([wg_x, wg_y, wg_z]) = crate::contract::dispatch::workgroup_counts(
+        [grid_x, grid_y, grid_z],
+        [tg_x, tg_y, tg_z],
+        dispatch_threads,
+    ) else {
         return ComputeStatus::BadGrid("compute_vk_zero_dims");
-    }
+    };
 
     // Stage buffers first (page_shift-correct). Texture staging follows kernel
     // translation because sampled-vs-storage access is a SPIR-V interface fact.
@@ -3513,18 +3521,6 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
         storage_count,
         storage_writeonly_count,
     ));
-
-    // Workgroup counts: DispatchThreadgroups already is groups; DispatchThreads
-    // is total threads → ceil-div by LocalSize.
-    let (wg_x, wg_y, wg_z) = if dispatch_threads {
-        (
-            grid_x.div_ceil(tg_x).max(1),
-            grid_y.div_ceil(tg_y).max(1),
-            grid_z.div_ceil(tg_z).max(1),
-        )
-    } else {
-        (grid_x, grid_y, grid_z)
-    };
 
     let mut storage_buffers = Vec::with_capacity(buffer_accesses.len());
     for s in &mut staged_bufs {
