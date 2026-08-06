@@ -6,7 +6,7 @@ use crate::backend::metal::cache::{
     DepthStencilKey, RenderPsoKey,
 };
 use crate::backend::metal::constants::*;
-use crate::backend::metal::format::{mtl_pixel_format_bpp, pixel_format_from_u32};
+use crate::backend::metal::format::mtl_pixel_format_bpp;
 use crate::backend::metal::function::load_only_function;
 use crate::backend::metal::hash::{hash_bytes, hash_u64};
 use crate::backend::metal::mtl_enum;
@@ -673,7 +673,16 @@ fn get_render_pipeline_state(
     for i in 0..key.color_count as usize {
         let slot = key.color_slot[i] as u64;
         if let Some(color) = pipeline_descriptor.color_attachments().object_at(slot) {
-            color.set_pixel_format(pixel_format_from_u32(key.color_formats[i]));
+            let Some(format) = mtl_enum::pixel_format(key.color_formats[i]) else {
+                set_err(
+                    err,
+                    format!("unknown color pixel format {}", key.color_formats[i]),
+                );
+                return Err(Status::args("metal_render_pso_color_format_undeclared")
+                    .field("slot", slot)
+                    .field("format", key.color_formats[i]));
+            };
+            color.set_pixel_format(format);
             let slot_blend = if key.color_blend_enable[i] != 0 {
                 Some(ReimsVgpuBlendState {
                     enable: 1,
@@ -703,12 +712,26 @@ fn get_render_pipeline_state(
         }
     }
     if key.depth_pixel_format != 0 {
-        pipeline_descriptor
-            .set_depth_attachment_pixel_format(pixel_format_from_u32(key.depth_pixel_format));
+        let Some(format) = mtl_enum::pixel_format(key.depth_pixel_format) else {
+            set_err(
+                err,
+                format!("unknown depth pixel format {}", key.depth_pixel_format),
+            );
+            return Err(Status::args("metal_render_pso_depth_format_undeclared")
+                .field("format", key.depth_pixel_format));
+        };
+        pipeline_descriptor.set_depth_attachment_pixel_format(format);
     }
     if key.stencil_pixel_format != 0 {
-        pipeline_descriptor
-            .set_stencil_attachment_pixel_format(pixel_format_from_u32(key.stencil_pixel_format));
+        let Some(format) = mtl_enum::pixel_format(key.stencil_pixel_format) else {
+            set_err(
+                err,
+                format!("unknown stencil pixel format {}", key.stencil_pixel_format),
+            );
+            return Err(Status::args("metal_render_pso_stencil_format_undeclared")
+                .field("format", key.stencil_pixel_format));
+        };
+        pipeline_descriptor.set_stencil_attachment_pixel_format(format);
     }
 
     let (pso, reflection) = device
@@ -985,7 +1008,21 @@ fn bind_sampled_images(
                     .field("len", image.data_len)
                     .field("required", need);
             }
-            (pixel_format_from_u32(image.pixel_format), image.data, bpr)
+            let Some(format) = mtl_enum::pixel_format(image.pixel_format) else {
+                set_err(
+                    err,
+                    format!(
+                        "native {} sampled image names no pixel format, binding {}",
+                        if fragment_stage { "fragment" } else { "vertex" },
+                        image.binding
+                    ),
+                );
+                return Status::args("metal_render_sampled_native_format_undeclared")
+                    .field("fragment", fragment_stage)
+                    .field("binding", image.binding)
+                    .field("format", image.pixel_format);
+            };
+            (format, image.data, bpr)
         } else {
             let Some(expected_len) = tight_image_bytes(
                 image.width,
@@ -1329,6 +1366,16 @@ fn validate_stencil_attachment(
     Ok(AttachmentActions { load, store })
 }
 
+/// `Ok(None)` is "the guest attached no depth buffer"; `Err` is "it attached one
+/// this device will not build". Those were the same answer while this returned a
+/// bare `Option`, and they must not be: a draw that silently loses its depth
+/// attachment renders with no depth test rather than refusing, which is guest
+/// work quietly executed wrong.
+///
+/// `validate_depth_attachment` pins the format to `DEPTH32_FLOAT` before the
+/// caller gets here, so the refusal below cannot fire today. It is the channel
+/// that matters — with it, relaxing that check upstream turns an unbuildable
+/// format into a named refusal instead of a missing attachment.
 fn configure_depth_attachment(
     device: &Device,
     pass: &RenderPassDescriptorRef,
@@ -1337,11 +1384,19 @@ fn configure_depth_attachment(
     width: u32,
     height: u32,
     actions: AttachmentActions,
-) -> Option<Texture> {
-    let depth = depth?;
+) -> Result<Option<Texture>, Status> {
+    let Some(depth) = depth else {
+        return Ok(None);
+    };
+    let Some(format) = mtl_enum::pixel_format(depth.pixel_format) else {
+        return Err(
+            Status::args("metal_render_depth_attachment_format_undeclared")
+                .field("format", depth.pixel_format),
+        );
+    };
     let descriptor = TextureDescriptor::new();
     descriptor.set_texture_type(MTLTextureType::D2);
-    descriptor.set_pixel_format(pixel_format_from_u32(depth.pixel_format));
+    descriptor.set_pixel_format(format);
     descriptor.set_width(width as u64);
     descriptor.set_height(height as u64);
     descriptor.set_storage_mode(MTLStorageMode::Shared);
@@ -1370,9 +1425,12 @@ fn configure_depth_attachment(
         att.set_clear_depth(depth.clear_depth);
         att.set_store_action(actions.store);
     }
-    Some(texture)
+    Ok(Some(texture))
 }
 
+/// Same split as [`configure_depth_attachment`]: `Ok(None)` is no stencil
+/// attachment, `Err` is one this device will not build.
+/// `validate_stencil_attachment` pins the format to `STENCIL8` upstream.
 fn configure_stencil_attachment(
     device: &Device,
     pass: &RenderPassDescriptorRef,
@@ -1381,11 +1439,19 @@ fn configure_stencil_attachment(
     width: u32,
     height: u32,
     actions: AttachmentActions,
-) -> Option<Texture> {
-    let stencil = stencil?;
+) -> Result<Option<Texture>, Status> {
+    let Some(stencil) = stencil else {
+        return Ok(None);
+    };
+    let Some(format) = mtl_enum::pixel_format(stencil.pixel_format) else {
+        return Err(
+            Status::args("metal_render_stencil_attachment_format_undeclared")
+                .field("format", stencil.pixel_format),
+        );
+    };
     let descriptor = TextureDescriptor::new();
     descriptor.set_texture_type(MTLTextureType::D2);
-    descriptor.set_pixel_format(pixel_format_from_u32(stencil.pixel_format));
+    descriptor.set_pixel_format(format);
     descriptor.set_width(width as u64);
     descriptor.set_height(height as u64);
     descriptor.set_storage_mode(MTLStorageMode::Shared);
@@ -1409,7 +1475,7 @@ fn configure_stencil_attachment(
         att.set_clear_stencil(stencil.clear_stencil);
         att.set_store_action(actions.store);
     }
-    Some(texture)
+    Ok(Some(texture))
 }
 
 /// One color render target for MRT encode (host RGBA8 seed/readback by default).
@@ -1650,7 +1716,13 @@ pub fn render_core_mrt(
                     .field("expected", need);
             }
         }
-        color_meta.push((c.slot, fmt, bpp, pixel_format_from_u32(fmt)));
+        let Some(mtl_format) = mtl_enum::pixel_format(fmt) else {
+            set_err(err, format!("color RT names no pixel format {fmt}"));
+            return Status::args("metal_render_color_format_undeclared")
+                .field("slot", c.slot)
+                .field("format", fmt);
+        };
+        color_meta.push((c.slot, fmt, bpp, mtl_format));
     }
 
     if primitive_indirect.is_none() && !indexed_indirect && vertex_count == 0 {
@@ -1819,7 +1891,10 @@ pub fn render_core_mrt(
         }
     }
 
-    let depth_texture = configure_depth_attachment(
+    // Both builders now separate "no attachment" from "an attachment this
+    // device will not build", and this function's channel is a bare `Status`,
+    // so the refusal is matched out rather than carried by `?`.
+    let depth_texture = match configure_depth_attachment(
         device,
         pass,
         &mut retained_tex,
@@ -1827,8 +1902,11 @@ pub fn render_core_mrt(
         width,
         height,
         depth_actions,
-    );
-    let stencil_texture = configure_stencil_attachment(
+    ) {
+        Ok(texture) => texture,
+        Err(status) => return status,
+    };
+    let stencil_texture = match configure_stencil_attachment(
         device,
         pass,
         &mut retained_tex,
@@ -1836,7 +1914,10 @@ pub fn render_core_mrt(
         width,
         height,
         stencil_actions,
-    );
+    ) {
+        Ok(texture) => texture,
+        Err(status) => return status,
+    };
 
     let queue = thread_queue(device);
     let command_buffer = queue.new_command_buffer().to_owned();

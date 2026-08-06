@@ -457,11 +457,20 @@ Do not hide warnings, skip an affected arm, or commit a dropped test
 count without calling it out — and **do not read "clippy clean" in a commit body as covering every
 arm**; it means the arms that commit ran.
 
-Two standing exceptions, both carried by `#[allow]`s at the module declarations that state the
-reason. `backend::metal::error::Status` is large by design — the payload is what makes each refusal
-name the check that refused, and it is `Copy` and compared by value at hundreds of sites — so
+One standing exception, carried by `#[allow]`s at the module declaration that states the reason.
+`backend::metal::error::Status` is large by design — the payload is what makes each refusal name the
+check that refused, and it is `Copy` and compared by value at hundreds of sites — so
 `result_large_err` and `large_enum_variant` are exempted there. **A new error type that is large for
-no such reason should still be boxed**, not added to the exemption. Separately, the
-`transmute::<u64, MTL*>` sites turn a guest-decoded ordinal into a `#[repr(u64)]` Metal enum, where
-an out-of-range value is undefined behavior rather than a decode error; they are greppable and
-nothing range-checks them yet. Do not add more.
+no such reason should still be boxed**, not added to the exemption.
+
+### Never transmute a guest ordinal into a Metal enum
+
+The `MTL*` types are fieldless `#[repr(u64)]` enums, so producing one whose discriminant is not a
+declared variant is **undefined behavior, not a decode error** — the same rule
+`reims-vgpu-wire`'s invariant 4 states for wire structs. A decoded guest value is an arbitrary
+`u32`, so `transmute` is never the conversion.
+
+`backend::metal::mtl_enum` is the only way across: name every variant, get `None` for anything
+else, turn that into a typed refusal. Add a table there rather than a cast, and read that module's
+doc first — two of these enums have interior holes, so a `<= max` range check is not a substitute,
+and `MTLStepFunction`'s names in `metal` 0.33 are not Apple's.

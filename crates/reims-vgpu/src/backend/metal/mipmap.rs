@@ -4,7 +4,7 @@
 //! native pixel format, runs the Metal blit encoder filter, and reads back
 //! every level as tightly packed native rows.
 
-use crate::backend::metal::format::pixel_format_from_u32;
+use crate::backend::metal::mtl_enum;
 use crate::backend::metal::runtime::{system_device, thread_queue};
 use crate::contract::pixel_format::{self, bytes_per_pixel};
 use metal::{
@@ -118,7 +118,12 @@ pub fn filterable_format(format: u16) -> Option<(MTLPixelFormat, u32)> {
         | pixel_format::MTL_FORMAT_BGRA8_UNORM_SRGB
         | pixel_format::MTL_FORMAT_RGBA16_FLOAT
         | pixel_format::MTL_FORMAT_RGBA32_FLOAT => {
-            Some((pixel_format_from_u32(format as u32), bpp))
+            // Every arm above is one of this device's own named format
+            // constants, so the conversion cannot decline here. It is written
+            // as a `?` rather than an unwrap because the caller's `None` already
+            // means "this device will not filter that format", which is the
+            // right answer for a code naming no format at all.
+            Some((mtl_enum::pixel_format(format as u32)?, bpp))
         }
         _ => None,
     }

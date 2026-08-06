@@ -51,9 +51,9 @@
 
 use metal::{
     MTLAttributeFormat, MTLBlendFactor, MTLBlendOperation, MTLCompareFunction, MTLCullMode,
-    MTLIndexType, MTLLoadAction, MTLPrimitiveType, MTLSamplerAddressMode, MTLSamplerBorderColor,
-    MTLSamplerMinMagFilter, MTLSamplerMipFilter, MTLStencilOperation, MTLStepFunction,
-    MTLStoreAction, MTLVertexFormat, MTLVertexStepFunction, MTLWinding,
+    MTLIndexType, MTLLoadAction, MTLPixelFormat, MTLPrimitiveType, MTLSamplerAddressMode,
+    MTLSamplerBorderColor, MTLSamplerMinMagFilter, MTLSamplerMipFilter, MTLStencilOperation,
+    MTLStepFunction, MTLStoreAction, MTLVertexFormat, MTLVertexStepFunction, MTLWinding,
 };
 
 /// Define a checked ordinal to enum conversion, and prove it at compile time.
@@ -559,3 +559,87 @@ const _: () = assert!(MTLStepFunction::PerPatch as u32 != 3);
 const _: () = assert!(MTLStepFunction::PerPatchControlPoint as u32 != 4);
 const _: () = assert!(MTLStepFunction::ThreadPositionInGridY as u32 != 6);
 const _: () = assert!(MTLStepFunction::ThreadPositionInGridXIndexed as u32 != 7);
+
+checked_ordinal! {
+    /// `MTLPixelFormat` for a colour, depth or stencil attachment.
+    ///
+    /// The last member of this class, and the one that stayed a `transmute`
+    /// longest: this enum is by far the sparsest here — 139 declared values
+    /// scattered over `0..=555` — so "not above the last variant" admits
+    /// hundreds of codes that name nothing, and an undeclared one is undefined
+    /// behaviour rather than a format Metal will reject. Guest attachment
+    /// records reach it directly, so the ordinal really is arbitrary.
+    ///
+    /// No `apple_numbers_them_from_zero` clause: the numbering is not
+    /// contiguous and is not meant to be. The compressed families sit in blocks
+    /// Apple spaces apart, and the depth/stencil group starts at 250 with
+    /// `X32_Stencil8` and `X24_Stencil8` above the pair they alias.
+    ///
+    /// This lists everything `metal` 0.33 declares rather than the subset
+    /// `crate::contract::pixel_format` sizes. The two are different questions —
+    /// this one is "can the Rust type hold this value at all", and answering it
+    /// with the narrower table would refuse formats this device hands to Metal
+    /// unexamined today. What each call site does with a format it cannot size
+    /// stays that call site's decision.
+    fn pixel_format -> MTLPixelFormat;
+    [
+        Invalid, A8Unorm, R8Unorm, R8Unorm_sRGB, R8Snorm, R8Uint, R8Sint, R16Unorm,
+        R16Snorm, R16Uint, R16Sint, R16Float, RG8Unorm, RG8Unorm_sRGB, RG8Snorm,
+        RG8Uint, RG8Sint, B5G6R5Unorm, A1BGR5Unorm, ABGR4Unorm, BGR5A1Unorm, R32Uint,
+        R32Sint, R32Float, RG16Unorm, RG16Snorm, RG16Uint, RG16Sint, RG16Float,
+        RGBA8Unorm, RGBA8Unorm_sRGB, RGBA8Snorm, RGBA8Uint, RGBA8Sint, BGRA8Unorm,
+        BGRA8Unorm_sRGB, RGB10A2Unorm, RGB10A2Uint, RG11B10Float, RGB9E5Float,
+        BGR10A2Unorm, RG32Uint, RG32Sint, RG32Float, RGBA16Unorm, RGBA16Snorm,
+        RGBA16Uint, RGBA16Sint, RGBA16Float, RGBA32Uint, RGBA32Sint, RGBA32Float,
+        BC1_RGBA, BC1_RGBA_sRGB, BC2_RGBA, BC2_RGBA_sRGB, BC3_RGBA, BC3_RGBA_sRGB,
+        BC4_RUnorm, BC4_RSnorm, BC5_RGUnorm, BC5_RGSnorm, BC6H_RGBFloat,
+        BC6H_RGBUfloat, BC7_RGBAUnorm, BC7_RGBAUnorm_sRGB, PVRTC_RGB_2BPP,
+        PVRTC_RGB_2BPP_sRGB, PVRTC_RGB_4BPP, PVRTC_RGB_4BPP_sRGB, PVRTC_RGBA_2BPP,
+        PVRTC_RGBA_2BPP_sRGB, PVRTC_RGBA_4BPP, PVRTC_RGBA_4BPP_sRGB, EAC_R11Unorm,
+        EAC_R11Snorm, EAC_RG11Unorm, EAC_RG11Snorm, EAC_RGBA8, EAC_RGBA8_sRGB,
+        ETC2_RGB8, ETC2_RGB8_sRGB, ETC2_RGB8A1, ETC2_RGB8A1_sRGB, ASTC_4x4_sRGB,
+        ASTC_5x4_sRGB, ASTC_5x5_sRGB, ASTC_6x5_sRGB, ASTC_6x6_sRGB, ASTC_8x5_sRGB,
+        ASTC_8x6_sRGB, ASTC_8x8_sRGB, ASTC_10x5_sRGB, ASTC_10x6_sRGB, ASTC_10x8_sRGB,
+        ASTC_10x10_sRGB, ASTC_12x10_sRGB, ASTC_12x12_sRGB, ASTC_4x4_LDR, ASTC_5x4_LDR,
+        ASTC_5x5_LDR, ASTC_6x5_LDR, ASTC_6x6_LDR, ASTC_8x5_LDR, ASTC_8x6_LDR,
+        ASTC_8x8_LDR, ASTC_10x5_LDR, ASTC_10x6_LDR, ASTC_10x8_LDR, ASTC_10x10_LDR,
+        ASTC_12x10_LDR, ASTC_12x12_LDR, ASTC_4x4_HDR, ASTC_5x4_HDR, ASTC_5x5_HDR,
+        ASTC_6x5_HDR, ASTC_6x6_HDR, ASTC_8x5_HDR, ASTC_8x6_HDR, ASTC_8x8_HDR,
+        ASTC_10x5_HDR, ASTC_10x6_HDR, ASTC_10x8_HDR, ASTC_10x10_HDR, ASTC_12x10_HDR,
+        ASTC_12x12_HDR, GBGR422, BGRG422, Depth16Unorm, Depth32Float, Stencil8,
+        Depth24Unorm_Stencil8, Depth32Float_Stencil8, X32_Stencil8, X24_Stencil8,
+        BGRA10_XR, BGRA10_XR_SRGB, BGR10_XR, BGR10_XR_SRGB,
+    ]
+}
+
+// `pixel_format` cannot carry `apple_numbers_them_from_zero` — its numbering is
+// sparse by design — so the accepted set is otherwise whatever `metal` 0.33
+// assigns, and a crate bump that renumbered it would move the set with every
+// assertion above still green. That is exactly the hole the clause closes for
+// the contiguous tables. These pin the same thing for this one: the anchor of
+// each block, read off `MTLPixelFormat.h`. They are claims about Apple's
+// numbers that the compiler checks against `metal`'s.
+const _: () = {
+    assert!(MTLPixelFormat::Invalid as u32 == 0);
+    assert!(MTLPixelFormat::A8Unorm as u32 == 1);
+    // The uncompressed run, which is what this device actually serves.
+    assert!(MTLPixelFormat::R8Unorm as u32 == 10);
+    assert!(MTLPixelFormat::RGBA8Unorm as u32 == 70);
+    assert!(MTLPixelFormat::BGRA8Unorm as u32 == 80);
+    assert!(MTLPixelFormat::RGBA32Float as u32 == 125);
+    // First compressed block, and the YUV pair that ends them.
+    assert!(MTLPixelFormat::BC1_RGBA as u32 == 130);
+    assert!(MTLPixelFormat::GBGR422 as u32 == 240);
+    // Depth/stencil. `X32_Stencil8` and `X24_Stencil8` sit *above* the pair they
+    // alias, which is why this group is listed in declaration order rather than
+    // by aspect.
+    assert!(MTLPixelFormat::Depth16Unorm as u32 == 250);
+    assert!(MTLPixelFormat::Depth32Float as u32 == 252);
+    assert!(MTLPixelFormat::Stencil8 as u32 == 253);
+    assert!(MTLPixelFormat::Depth24Unorm_Stencil8 as u32 == 255);
+    assert!(MTLPixelFormat::Depth32Float_Stencil8 as u32 == 260);
+    assert!(MTLPixelFormat::X32_Stencil8 as u32 == 261);
+    assert!(MTLPixelFormat::X24_Stencil8 as u32 == 262);
+    // The tail the const sweep's ceiling is measured from.
+    assert!(MTLPixelFormat::BGR10_XR_SRGB as u32 == 555);
+};
