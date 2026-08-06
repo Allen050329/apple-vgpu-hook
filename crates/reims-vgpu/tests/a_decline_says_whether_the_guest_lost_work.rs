@@ -670,6 +670,18 @@ const ROWS: &[Row] = &[
     },
     Row {
         file: "crates/reims-vgpu/src/runtime/exec/mod.rs",
+        ty: "BufferOffsetSlotPastTable",
+        loss: Loss::Refused,
+        why: "a `SetBufferOffset` naming a slot past the buffer table has \
+              nowhere to land, so the record returns without applying anything \
+              and sets `StreamAccum::unrepresentable`, which refuses the \
+              stream's later draws through `bind_snapshot`. The bound is Apple's \
+              own buffer table exactly, so a firing is a record Apple's \
+              serializer cannot emit; in a conforming stream the bind at that \
+              slot refused first, and this does not rely on that",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/runtime/exec/mod.rs",
         ty: "ChainAbandonDecline",
         loss: Loss::ExecutedModified,
         why: "the chain `break`s at the offending draw after landing the \

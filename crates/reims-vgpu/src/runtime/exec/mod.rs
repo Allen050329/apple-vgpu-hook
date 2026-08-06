@@ -1445,11 +1445,26 @@ fn handle_render_record<M: HostMemory + HostOps>(
                 // The slot is outside the table, so the bind that would have
                 // occupied it was already dropped by `apply_binds` and counted
                 // under `render_buffer_bind_slot_past_table`. This is the
-                // *second* record the guest spends on that slot, and it was
-                // silently ignored — so the bind counter under-reported how much
-                // of the stream the table bound costs. Counted separately rather
-                // than folded in, because these are different records.
+                // *second* record the guest spends on that slot. Counted
+                // separately rather than folded in, because these are different
+                // records.
+                //
+                // In a conforming stream the bind came first and already refused
+                // the draws — Metal requires a buffer bound at the index before
+                // `setVertexBufferOffset:atIndex:`. This does not rely on that:
+                // an offset record naming a slot this device has no table entry
+                // for is on its own a record it cannot carry, and a stream where
+                // the bind did *not* come first is exactly the one where relying
+                // on it would be wrong.
                 crate::runtime::drain::note_store_route("render_buffer_offset_slot_past_table");
+                let over = BufferOffsetSlotPastTable {
+                    stage: cmd.stage,
+                    index: cmd.first,
+                };
+                crate::observe::Emit::decline("render_buffer_offset", &over)
+                    .fail_once((u64::from(cmd.stage as u32) << 32) | u64::from(cmd.first));
+                acc.unrepresentable
+                    .get_or_insert(StreamRefusal::BufferOffset(over));
                 return;
             }
             let list = match cmd.stage {
@@ -2326,6 +2341,9 @@ fn note_draw_refused(refusal: StreamRefusal, pipeline_ref: u32, site: &'static s
     let emit = match refusal {
         StreamRefusal::Bind(over) => crate::observe::Emit::decline("render_draw", &over),
         StreamRefusal::Pass(drop) => crate::observe::Emit::decline("render_draw", &drop),
+        StreamRefusal::BufferOffset(over) => {
+            crate::observe::Emit::decline("render_draw", &over)
+        }
     };
     emit.field("site", site)
         .field("pipeline_ref", pipeline_ref)
@@ -2338,11 +2356,15 @@ impl StreamRefusal {
     /// Distinct per *condition* rather than per stream, so a guest that binds
     /// past the table on every frame gets one line and a guest that then also
     /// names a mip gets a second. The two arms cannot collide: the pass arm sets
-    /// the top bit, which the bind arm's `(stage, index)` pair cannot reach.
+    /// the top bit and the offset arm the one below it, neither of which the
+    /// bind arm's `(stage, index)` pair can reach.
     fn latch(self) -> u64 {
         match self {
             Self::Bind(over) => (u64::from(over.stage as u32) << 32) | u64::from(over.index),
             Self::Pass(drop) => 1 << 63 | drop.latch(),
+            Self::BufferOffset(over) => {
+                1 << 62 | (u64::from(over.stage as u32) << 32) | u64::from(over.index)
+            }
         }
     }
 }
@@ -2430,6 +2452,52 @@ enum StreamRefusal {
     /// Carried as the [`StreamDrawDrop`] arm that decoded it, so the refusal
     /// line names the same fields the pass census already reports.
     Pass(StreamDrawDrop),
+    /// A `SetBufferOffset` naming a slot past the buffer table.
+    ///
+    /// Its own variant rather than folded into [`Self::Bind`] because they are
+    /// different records with different counters, and sharing one would put two
+    /// checks behind one `reason=` slug and one `fail_once` latch.
+    BufferOffset(BufferOffsetSlotPastTable),
+}
+
+/// A `SetBufferOffset` record naming a slot the buffer table does not have.
+///
+/// The offset update has nowhere to land, and this used to be a census counter
+/// and nothing else — which is the same gap [`BindSlotPastTable`]'s own doc
+/// argues about for the bind: a route reading zero is simply absent from a
+/// one-second `OFF` line among a hundred others, so the first time a guest lost
+/// one, `/tmp/reims-vgpu-fail.log` said nothing.
+///
+/// The counter stays and says how much; this says which slot, once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BufferOffsetSlotPastTable {
+    stage: Stage,
+    /// The slot the record named. `cmd.first` is the whole of it — this wire
+    /// form updates one slot, so there is no run to report a length for.
+    index: u32,
+}
+
+impl crate::observe::Decline for BufferOffsetSlotPastTable {
+    fn slug(&self) -> &'static str {
+        "render_buffer_offset_slot_past_table"
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        vec![
+            (
+                "stage",
+                match self.stage {
+                    Stage::Vertex => "vertex",
+                    Stage::Fragment => "fragment",
+                    Stage::Unknown => "unknown",
+                }
+                .to_string(),
+            ),
+            ("index", self.index.to_string()),
+            ("table", BindClass::Buffer.table().to_string()),
+            ("apple_table", BindClass::Buffer.apple_table().to_string()),
+        ]
+    }
 }
 
 /// The [`StreamAccum`] state one bind record writes: the two stage tables a

@@ -3708,3 +3708,79 @@ fn a_bind_past_the_table_refuses_the_draws_that_would_read_it() {
         "the draw recorded before the refused bind still stands"
     );
 }
+
+/// A `SetBufferOffset` naming a slot past the buffer table refuses the stream's
+/// draws, and says which slot on the fail channel.
+///
+/// The second record a guest spends on an unreachable slot. It has always been
+/// counted and it has never been on the always-on failure path — the same gap
+/// [`BindSlotPastTable`]'s doc argues about for the bind itself: a census route
+/// reading zero is absent from its `OFF` line, so the first time a guest lost
+/// one, nothing said so.
+///
+/// Driven without a prior bind at that slot on purpose. In a conforming stream
+/// the bind came first and already refused, because Metal requires a buffer
+/// bound at the index before `setVertexBufferOffset:atIndex:` — and a stream
+/// where it did *not* come first is exactly the one where relying on that would
+/// be wrong. So this drives the case the reasoning does not cover.
+#[test]
+fn a_buffer_offset_past_the_table_refuses_the_stream() {
+    use crate::runtime::decode::render::{BUFFER_OFFSET_INDEX, BUFFER_OFFSET_PAYLOAD_LEN};
+    use crate::runtime::drain::store_route_count;
+
+    const FIRST: u32 = MAX_BUFFER_BIND_SLOTS + 1;
+
+    let total = OP_HEADER_LEN + BUFFER_OFFSET_PAYLOAD_LEN;
+    let mut command = vec![0u8; total];
+    let op = wire_render::OPCODE_SET_VERTEX_BUFFER_OFFSET;
+    st32(&mut command[0..], op);
+    st32(&mut command[4..], total as u32);
+    st32(&mut command[OP_HEADER_LEN + BUFFER_OFFSET_INDEX..], FIRST);
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let host = FakeHost::new();
+    let mut out = ExecResult::default();
+    let mut acc = StreamAccum {
+        pipeline_ref: 61,
+        ..Default::default()
+    };
+    assert!(
+        acc.bind_snapshot().is_ok(),
+        "nothing is refused before the record arrives"
+    );
+
+    let before = store_route_count("render_buffer_offset_slot_past_table");
+    handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
+
+    assert_eq!(
+        store_route_count("render_buffer_offset_slot_past_table"),
+        before + 1,
+        "the counter still says how much"
+    );
+    assert!(
+        matches!(
+            acc.bind_snapshot(),
+            Err(StreamRefusal::BufferOffset(over)) if over.index == FIRST
+        ),
+        "and the record now refuses the draws that would run without it"
+    );
+
+    // The two records that name an unreachable slot keep separate slugs, so a
+    // reader can tell the bind from the offset — and separate `fail_once`
+    // latches, so neither hides the other's first sighting.
+    let line = crate::observe::Emit::decline(
+        "render_buffer_offset",
+        &BufferOffsetSlotPastTable {
+            stage: render::Stage::Vertex,
+            index: FIRST,
+        },
+    )
+    .render();
+    assert_eq!(
+        line,
+        format!(
+            "render_buffer_offset reason=render_buffer_offset_slot_past_table \
+             stage=vertex index={FIRST} table=31 apple_table=31"
+        )
+    );
+}
