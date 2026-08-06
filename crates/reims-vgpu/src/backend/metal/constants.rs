@@ -31,6 +31,18 @@ pub const REIMS_VGPU_METAL_MAX_SAMPLERS: usize = 16;
 const _: () = assert!(REIMS_VGPU_METAL_MAX_SAMPLERS <= u32::BITS as usize);
 /// Metal max color attachments per render pass / PSO.
 pub const REIMS_VGPU_METAL_MAX_COLOR_RTS: usize = 8;
+// Two independent bases for one number, which is why both names stay: this is
+// Metal's attachment array, and `PASS_MAX_COLOR_ATTACHMENTS` is the width of the
+// colour-slot array in Apple's serialized render-pass record
+// (`wire::RENDER_PASS_COLOR_ATTACHMENTS`). They have to agree, and the failure if
+// they stop is quiet rather than loud: `fill_render_pso_key` clamps `color_count`
+// with `.min(REIMS_VGPU_METAL_MAX_COLOR_RTS)` because it indexes arrays of that
+// width, so a wire record carrying more slots than this table would lose the
+// extra attachments to that clamp with nothing said — a multi-target draw missing
+// its last render target. Pinned here rather than left to the clamp to notice.
+const _: () = assert!(
+    REIMS_VGPU_METAL_MAX_COLOR_RTS == crate::runtime::decode::render::PASS_MAX_COLOR_ATTACHMENTS
+);
 
 /// Metal `MTLBufferLayoutStrideDynamic` == `NSUIntegerMax`.
 pub const MTL_BUFFER_LAYOUT_STRIDE_DYNAMIC: u64 = u64::MAX;

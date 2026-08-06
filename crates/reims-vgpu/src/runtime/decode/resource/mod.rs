@@ -2374,6 +2374,14 @@ fn note_color_table_truncated(
 /// not to read. Same bound as `render::PASS_MAX_COLOR_ATTACHMENTS`, stated here
 /// because this is the pipeline-descriptor side of the same Metal limit.
 const MAX_COLOR_ATTACHMENTS: usize = 8;
+// The doc above says "same bound" and then writes the number again, which is the
+// one thing that cannot keep it true. The pass side derives its copy from the
+// wire record's own array width (`wire::RENDER_PASS_COLOR_ATTACHMENTS`), so this
+// pin makes the claim checkable: if Apple's record ever carries more slots, the
+// two sides part at compile time instead of this one refusing pipeline
+// descriptors the pass decoder happily accepts.
+const _: () =
+    assert!(MAX_COLOR_ATTACHMENTS == crate::runtime::decode::render::PASS_MAX_COLOR_ATTACHMENTS);
 
 /// Parse all color-attachment entries.
 ///
