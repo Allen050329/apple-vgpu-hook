@@ -460,3 +460,138 @@ fn the_three_known_stores_are_still_guarded() {
         );
     }
 }
+
+/// Budgets this crate is allowed to spend once and never refill.
+///
+/// Empty, and that is the finding: every budget here counts *consecutive*
+/// failures and resets on progress. A lifetime allowance can be right — but it
+/// says the device gives up permanently on evidence it gathered across the whole
+/// run, so it should be argued for in a line here rather than arrived at by
+/// forgetting the reset.
+const LIFETIME_BUDGETS: &[(&str, &str, &str)] = &[];
+
+/// A field compared against a `SCREAMING_CASE` bound, and whether anything ever
+/// lowers it.
+fn budget_sites(sources: &[(std::path::PathBuf, String)]) -> Vec<(String, String, String, bool)> {
+    let mut sites: Vec<(String, String, String, bool)> = Vec::new();
+    for (path, text) in sources {
+        let file = path.to_string_lossy().to_string();
+        for line in text.lines() {
+            let Some(at) = line.find("self.") else {
+                continue;
+            };
+            let rest = &line[at + "self.".len()..];
+            let field: String = rest
+                .chars()
+                .take_while(|c| c.is_lowercase() || c.is_numeric() || *c == '_')
+                .collect();
+            if field.is_empty() {
+                continue;
+            }
+            let after = rest[field.len()..].trim_start();
+            let Some(after) = after
+                .strip_prefix(">=")
+                .or_else(|| after.strip_prefix('>'))
+                .or_else(|| after.strip_prefix("<="))
+                .or_else(|| after.strip_prefix('<'))
+            else {
+                continue;
+            };
+            let bound: String = after
+                .trim_start()
+                .chars()
+                .take_while(|c| c.is_ascii_uppercase() || c.is_numeric() || *c == '_')
+                .collect();
+            // A bound is a named constant, not a literal and not a local.
+            if bound.len() < 4 || !bound.contains('_') {
+                continue;
+            }
+            // Anything that lowers the field is a refill: an explicit zeroing, a
+            // decrement, or a saturating subtraction.
+            let refilled = [
+                format!("self.{field} = 0"),
+                format!("self.{field} -="),
+                format!("self.{field} = self.{field}.saturating_sub"),
+            ]
+            .iter()
+            .any(|needle| text.contains(needle.as_str()));
+            if !sites
+                .iter()
+                .any(|(f, x, b, _)| *f == file && *x == field && *b == bound)
+            {
+                sites.push((file.clone(), field, bound, refilled));
+            }
+        }
+    }
+    sites
+}
+
+/// A budget that never refills is a permanent refusal counted out in advance.
+///
+/// `MAX_DEVICE_RECREATES` was one. It bounded device recreates *for the life of
+/// the process*, so a host driver that reset three times across a week of
+/// uptime — each recovered, each followed by hours of correct rendering — left
+/// the fourth incident refused and every draw after it refused with it. The
+/// bound was for a recreate *storm*, and a storm is consecutive failures; the
+/// fix was `note_work_completed`, not a bigger number.
+///
+/// This is the same question the `VERDICTS` scan asks, in the shape that scan
+/// cannot see: the state is a `u32`, not an error type in a field.
+#[test]
+fn every_budget_refills_or_argues_for_not_refilling() {
+    let root = workspace_root();
+    let src = root.join("crates/reims-vgpu/src");
+    let sources: Vec<(std::path::PathBuf, String)> = rust_sources(&src)
+        .into_iter()
+        .map(|p| {
+            let raw = std::fs::read_to_string(&p).expect("read source");
+            let text = blank_test_modules(&blank_comments(&raw));
+            let rel = p
+                .strip_prefix(root.join("crates/reims-vgpu"))
+                .unwrap_or(&p)
+                .to_string_lossy()
+                .to_string();
+            (std::path::PathBuf::from(rel), text)
+        })
+        .collect();
+
+    let sites = budget_sites(&sources);
+
+    // Self-check, as above: a scan that matches nothing reports a clean tree.
+    for known in [
+        ("recreate_count", "MAX_DEVICE_RECREATES"),
+        ("settled_drain_passes", "SETTLED_PASSES_FOR_BUFFER_TRIM"),
+    ] {
+        assert!(
+            sites
+                .iter()
+                .any(|(_, field, bound, _)| field == known.0 && bound == known.1),
+            "the scan cannot see {}, so its silence means nothing. Found: {:#?}",
+            known.0,
+            sites
+        );
+    }
+
+    let spent_forever: Vec<String> = sites
+        .iter()
+        .filter(|(_, _, _, refilled)| !refilled)
+        .filter(|(file, field, bound, _)| {
+            !LIFETIME_BUDGETS
+                .iter()
+                .any(|(f, x, b, ..)| f == file && x == field && b == bound)
+        })
+        .map(|(file, field, bound, _)| format!("{file} — self.{field} vs {bound}"))
+        .collect();
+
+    assert!(
+        spent_forever.is_empty(),
+        "these count against a bound and are never lowered, so once spent the \
+         refusal is permanent.\n\nIf the bound is meant to catch a *storm* — \
+         failures with no progress between them — reset the counter where \
+         progress is observed, as `ContextOwner::note_work_completed` and \
+         `settled_drain_passes` both do. If a lifetime allowance really is \
+         intended, add a line to LIFETIME_BUDGETS in {} saying why.\n\n{}",
+        file!(),
+        spent_forever.join("\n")
+    );
+}
