@@ -231,8 +231,16 @@ success hides a whole family of lost records behind a green run.
   `grep -v '^OFF '` first.
 - **A named reason on the fail channel is not automatically lost work.** Some report a repair that
   *succeeded*, fail-visible so the reliance stays measurable. Read the emitter.
-- **A counter and a fail line count different things.** Census counters are per-window and
-  cumulative; emitters dedupe. Do not quote one as the other.
+- **A counter and a fail line count different things.** Emitters dedupe; counters do not. Do not
+  quote one as the other.
+- **`store_routes` counters are per-window: sum the samples.** They reset each census interval, so
+  `sort -n | tail -1` returns the busiest window and reads like a boot total — three to four times
+  under the real one on a routine boot. The other census counters (`registry_pressure`'s `peak`,
+  `peak_mib`, `resample_peak_ms`) are cumulative high-waters, where the last sample *is* the answer
+  and summing is the error. Check which you have before quoting either: a per-window series
+  descends across a boot, a high-water never does. Where a route splits into sub-counters, the split
+  must add up (`no_state + texture + linear == unknown_object`), and that identity is the cheapest
+  way to catch the mistake.
 
 ## Support Matrix
 
