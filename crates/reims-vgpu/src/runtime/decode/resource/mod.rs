@@ -349,16 +349,50 @@ impl TextureLevelLayout {
             .checked_add(u64::from(tight_row))
     }
 
+    /// How many contiguous depth planes one array slice of this level holds.
+    ///
+    /// `depth` 0 and 1 both mean one plane, matching `TextureDescriptor`'s
+    /// "0 means 2D" encoding. **The one place that rule is written.** It used to
+    /// be written three times — here as `depth.max(1)`, again in
+    /// `blit_exec`'s caller as `if layout.depth == 0 { 1 } else { .. }`, and a
+    /// third time inside the stride helper that caller then passed the already
+    /// normalized value to — and only this copy carried the encoding it comes
+    /// from. Two of the three read as a defensive clamp on a decoded guest field,
+    /// which is the shape that fabricates a geometry the guest did not send the
+    /// day one of them is reached without the others.
+    pub fn planes(&self) -> u32 {
+        self.depth.max(1)
+    }
+
+    /// Contiguous Metal packing for one array slice / cube face of this level:
+    /// `row_stride * height * planes`.
+    ///
+    /// Zero height gives zero, which is the honest answer for a level with no
+    /// rows rather than the one-row stride a `height.max(1)` would invent. The
+    /// blit caller refuses a zero-height level by name (`tex_zero_geom`) before
+    /// it gets here, so that arm is unreachable through it today; it is written
+    /// this way so it stays right for a caller that does not.
+    pub fn slice_stride(&self) -> Option<u64> {
+        self.row_stride
+            .checked_mul(u64::from(self.height))?
+            .checked_mul(u64::from(self.planes()))
+    }
+
     /// Bytes from [`Self::offset`] that a reader of one whole array slice /
-    /// cube face of this level touches, when `depth` planes are packed
+    /// cube face of this level touches, with [`Self::planes`] packed
     /// contiguously inside the slice at `row_stride * height` each.
     ///
     /// Every plane below the last is walked in full; the last one ends at
     /// [`Self::read_span`], because the padding after its final row is no more
-    /// read here than it is in the 2D case. `depth` 0 and 1 both mean one
-    /// plane, matching `TextureDescriptor`'s "0 means 2D" encoding.
-    pub fn slice_read_span(&self, tight_row: u32, depth: u32) -> Option<u64> {
-        u64::from(depth.max(1) - 1)
+    /// read here than it is in the 2D case.
+    ///
+    /// Takes its plane count from `self` rather than from the caller. It used to
+    /// take a `depth` parameter, and its only production caller passed
+    /// `self.depth` with the encoding above already applied — a value the
+    /// receiver holds, travelling as a loose argument that a second caller could
+    /// get wrong with nothing to notice.
+    pub fn slice_read_span(&self, tight_row: u32) -> Option<u64> {
+        u64::from(self.planes() - 1)
             .checked_mul(self.row_stride)?
             .checked_mul(u64::from(self.height))?
             .checked_add(self.read_span(tight_row)?)

@@ -453,14 +453,6 @@ impl LinearTextureLevel {
     }
 }
 
-/// Contiguous Metal packing for one array slice / cube face at a mip level:
-/// `row_stride * height * depth` (depth planes sit inside the slice).
-fn derived_slice_stride(row_stride: u64, height: u32, depth: u32) -> Option<u64> {
-    let h = height.max(1) as u64;
-    let d = depth.max(1) as u64;
-    row_stride.checked_mul(h)?.checked_mul(d)
-}
-
 fn resolve_buffer<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -508,7 +500,15 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
     texture_ref: u32,
     level: u16,
     slice: u16,
-    depth: u32,
+    // How many texture-view hops deep this recursion is — **not** a texture's
+    // depth. It was spelled `depth`, and a local named `depth` further down held
+    // the level's plane count and shadowed it, so one word meant two unrelated
+    // things in one body and `LinearTextureLevel { depth }` took whichever was
+    // in scope at that line. Removing the local silently rebound that field to
+    // the view hop count, and only
+    // `whole_surface_0x13e_volume_rejects_multi_slice` noticed — by the refusal
+    // order changing, not by the field.
+    view_depth: u32,
 ) -> Result<TextureBacking, BlitStatus> {
     if texture_ref == 0 {
         return Err(br(BlitStatus::MissingResource, "tex_ref_zero"));
@@ -523,7 +523,7 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
     // the deepest view. A chain of MAX views arrives at its base at `depth ==
     // MAX`, so admitting that depth is what makes the two arms accept and
     // refuse the same chains.
-    if depth as usize > crate::runtime::draw::MAX_TEXTURE_VIEW_CHAIN {
+    if view_depth as usize > crate::runtime::draw::MAX_TEXTURE_VIEW_CHAIN {
         return Err(br(BlitStatus::Unsupported, "tex_view_depth_cap"));
     }
     let Some(entry) = objects::lookup_list_entry(state, host, task_id, texture_ref) else {
@@ -633,7 +633,7 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
             view.base_texture_ref,
             abs_level as u16,
             abs_slice as u16,
-            depth + 1,
+            view_depth + 1,
         )?;
         // Geometry constraints for non-2D types.
         match &backing {
@@ -899,10 +899,13 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
         ));
         return Err(br(BlitStatus::Bounds, "tex_zero_geom"));
     }
-    let depth = if layout.depth == 0 { 1 } else { layout.depth };
-    // Array-slice packing: contiguous images at this mip (row_stride × height × depth).
+    // Array-slice packing: contiguous images at this mip
+    // (row_stride × height × planes). `TextureLevelLayout` owns both the packing
+    // and the "depth 0 means one plane" encoding; this used to normalize the
+    // depth here and hand it to a helper that normalized it again.
     // Prefer level.size when it is an exact multiple of one-slice bytes (multi-slice alloc).
-    let one_slice = derived_slice_stride(layout.row_stride, layout.height, depth)
+    let one_slice = layout
+        .slice_stride()
         .ok_or_else(|| br(BlitStatus::Capacity, "tex_slice_stride"))?;
     if slice != 0 {
         // Bounds: selected slice must fit in allocation when known.
@@ -919,7 +922,7 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
         let tight_row = pixel_format::tight_row_bytes(layout.width, tex.pixel_format)
             .ok_or_else(|| br(BlitStatus::Unsupported, "tex_slice_tight_row"))?;
         let slice_read = layout
-            .slice_read_span(tight_row, depth)
+            .slice_read_span(tight_row)
             .ok_or_else(|| br(BlitStatus::Bounds, "tex_slice_read_span"))?;
         let slice_end = (slice as u64)
             .checked_mul(one_slice)
@@ -947,7 +950,7 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
         slice_index: slice as u32,
         width: layout.width,
         height: layout.height,
-        depth,
+        depth: layout.planes(),
         bpp,
         pixel_format: tex.pixel_format,
     }))

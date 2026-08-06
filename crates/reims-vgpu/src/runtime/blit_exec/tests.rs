@@ -1401,10 +1401,30 @@ fn an_unmeasurable_copy_region_refuses_rather_than_writing_unbounded() {
     );
 }
 
+/// The array-slice stride this rail charges, now read off the level layout that
+/// owns it rather than from three loose arguments.
+///
+/// Kept here as well as beside the method because this is the rail that reads
+/// it: `one_slice` is what a selected slice's offset is multiplied by, so a
+/// stride that gained or lost a plane would move every slice bound on this path.
 #[test]
 fn derived_slice_stride_2d() {
-    assert_eq!(derived_slice_stride(256, 32, 1), Some(256 * 32));
-    assert_eq!(derived_slice_stride(16, 4, 2), Some(16 * 4 * 2));
+    use crate::runtime::decode::resource::TextureLevelLayout;
+    let level = |row_stride: u64, height: u32, depth: u32| TextureLevelLayout {
+        offset: 0,
+        size: 0,
+        row_stride,
+        width: 1,
+        height,
+        depth,
+    };
+    assert_eq!(level(256, 32, 1).slice_stride(), Some(256 * 32));
+    assert_eq!(level(16, 4, 2).slice_stride(), Some(16 * 4 * 2));
+    assert_eq!(
+        level(16, 4, 0).slice_stride(),
+        Some(16 * 4),
+        "depth 0 is one plane, the same encoding `slice_read_span` reads"
+    );
 }
 
 /// Multi-mip linear texture + multi-level type-8 view selecting L1.

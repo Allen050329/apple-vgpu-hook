@@ -1876,32 +1876,47 @@ fn a_slice_read_span_charges_full_planes_and_a_tight_last_row() {
     };
 
     // Depth 0 and 1 are both one plane, and then this is exactly `read_span`.
+    // Read off the layout's own field now, so this asserts the encoding where
+    // `planes()` applies it rather than where a caller used to.
     let flat = layout.read_span(TIGHT).unwrap();
-    assert_eq!(layout.slice_read_span(TIGHT, 1), Some(flat));
-    assert_eq!(layout.slice_read_span(TIGHT, 0), Some(flat));
+    let at_depth = |depth: u32| {
+        TextureLevelLayout { depth, ..layout }
+            .slice_read_span(TIGHT)
+            .unwrap()
+    };
+    assert_eq!(at_depth(1), flat);
+    assert_eq!(at_depth(0), flat, "0 and 1 are both one plane");
 
     // Three whole planes, then the fourth's rows.
     let plane = STRIDE * HEIGHT as u64;
-    assert_eq!(layout.slice_read_span(TIGHT, 4), Some(3 * plane + flat));
+    assert_eq!(at_depth(4), 3 * plane + flat);
 
     // The stride form this replaced overcounts by exactly one row's padding,
-    // whatever the plane count.
+    // whatever the plane count. `slice_stride` is that form, so the two are
+    // compared against each other rather than against a re-spelled product.
     for depth in [1u32, 2, 4] {
+        let level = TextureLevelLayout { depth, ..layout };
         assert_eq!(
-            plane * u64::from(depth) - layout.slice_read_span(TIGHT, depth).unwrap(),
+            level.slice_stride().unwrap() - level.slice_read_span(TIGHT).unwrap(),
             STRIDE - TIGHT as u64
         );
     }
 
-    // Zero height has no rows, so no span — and must not underflow.
+    // A zero depth strides as one plane, for the same encoding reason.
     assert_eq!(
-        TextureLevelLayout {
-            height: 0,
-            ..layout
-        }
-        .slice_read_span(TIGHT, 4),
-        None
+        TextureLevelLayout { depth: 0, ..layout }.slice_stride(),
+        Some(plane)
     );
+
+    // Zero height has no rows, so no span — and must not underflow. Its stride
+    // is zero rather than one invented row, which is the half a `height.max(1)`
+    // used to get wrong.
+    let no_rows = TextureLevelLayout {
+        height: 0,
+        ..layout
+    };
+    assert_eq!(no_rows.slice_read_span(TIGHT), None);
+    assert_eq!(no_rows.slice_stride(), Some(0));
 }
 
 #[test]
