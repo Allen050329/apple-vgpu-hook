@@ -1785,10 +1785,21 @@ fn a_colour_attachment_write_mask_decodes_and_defaults_to_all() {
 
 /// The tag identification is an argument from `MTLRenderPipeline.h`'s
 /// property order, so it needs a standing check that it still holds. A
-/// value no four-bit mask can carry refuses by name rather than masking
-/// channels off on a guess.
+/// value no four-bit mask can carry refuses the pipeline rather than
+/// masking channels on a guess.
+///
+/// This used to keep `ColorWriteMask::default()` and log, on the argument
+/// that leaving the pre-decode behaviour in place was safer than
+/// introducing a new refusal. The argument does not survive reading what
+/// the default *is*: `all`, the widest mask there is, so a guest that
+/// masked a channel off got it written. And the value that gets here is
+/// one `MTLColorWriteMask` cannot hold, which means the tag mapping this
+/// entry was read through is wrong — the four bits are not a channel
+/// selection at all, they are four bits of some other property. Writing
+/// every channel from a field this decoder has misidentified is the guess;
+/// refusing is what a device that does not know what it is holding does.
 #[test]
-fn a_write_mask_outside_the_four_bits_refuses_by_name() {
+fn a_write_mask_outside_the_four_bits_refuses_the_pipeline() {
     use crate::contract::endian::st32;
     let off = 16usize;
     let mut buf = vec![0u8; off + 8 + 1 + 6];
@@ -1801,12 +1812,9 @@ fn a_write_mask_outside_the_four_bits_refuses_by_name() {
     st32(&mut buf[entry + 3..], 0x1234_5678);
 
     let cap = crate::observe::FailCapture::start();
-    let all = parse_color_attachments(&buf, buf.len(), off).expect("a well-formed table decodes");
-    assert!(
-        all[0].write_mask.bits == MTL_COLOR_WRITE_MASK_ALL,
-        "a refused mask leaves the attachment writing every channel, \
-         which is the pre-decode behaviour rather than a new failure"
-    );
+    let status = parse_color_attachments(&buf, buf.len(), off)
+        .expect_err("a mask outside the four bits is not a table this device can build");
+    assert_eq!(status, DecodeStatus::ErrUnsupported("res_color_write_mask_over"));
     let lines = cap.lines();
     assert!(
         lines
@@ -1815,6 +1823,12 @@ fn a_write_mask_outside_the_four_bits_refuses_by_name() {
                 && l.contains("value=305419896")),
         "the refusal names the value that refuted it: {lines:?}"
     );
+
+    // The four-bit neighbour of the same value still decodes, so the refusal
+    // is about the range and not about the tag being present.
+    st32(&mut buf[entry + 3..], MTL_COLOR_WRITE_MASK_ALL);
+    let ok = parse_color_attachments(&buf, buf.len(), off).expect("0xf is a mask Metal can hold");
+    assert_eq!(ok[0].write_mask.bits, MTL_COLOR_WRITE_MASK_ALL);
 }
 
 /// The measured case, from an x86/Vulkan boot in Dark appearance: a 27x27

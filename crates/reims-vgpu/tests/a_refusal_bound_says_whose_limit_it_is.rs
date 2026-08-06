@@ -334,7 +334,7 @@ const ROWS: &[Row] = &[
               indexed off the end.",
     },
     Row {
-        at: "reims-vgpu/src/runtime/decode/resource/mod.rs:2459",
+        at: "reims-vgpu/src/runtime/decode/resource/mod.rs:2471",
         bound: "MAX_COLOR_ATTACHMENTS",
         verdict: Verdict::WireField,
         why: "The declared colour-attachment count against the width of the slot \

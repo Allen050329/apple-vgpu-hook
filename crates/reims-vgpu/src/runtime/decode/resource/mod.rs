@@ -2306,14 +2306,26 @@ fn parse_one_color_entry(
     // `MTLColorWriteMask` is `all` — the same thing `ColorWriteMask::default()`
     // says, so the absent case needs no branch.
     if let Some(mask) = entry_tag_u32_present(bytes, entry, COLOR_ATTACHMENT_TAG_WRITE_MASK) {
-        if let Some(decoded) = ColorWriteMask::new(mask) {
-            out.write_mask = decoded;
-        } else if crate::observe::first_sight("color_write_mask_out_of_range", u64::from(mask)) {
-            crate::observe::Emit::decline("type7_color_attach", &ColorWriteMaskOutOfRange)
-                .field("slot", slot)
-                .field("value", mask)
-                .fail();
-        }
+        let Some(decoded) = ColorWriteMask::new(mask) else {
+            // `MTLColorWriteMask` is four bits, so a wider value is not a mask
+            // Apple's serializer can emit — the same class of malformed record
+            // as an attachment index past the table, and refused the same way.
+            //
+            // Keeping the default here instead was a wrong pixel rather than a
+            // refusal: the default is `all`, the *widest* mask there is, so a
+            // guest that masked a channel off got it written. There is no
+            // second-best to fall back to for the same reason the slot above
+            // has none — every representable mask is a mask the guest might
+            // have meant, and picking one is guessing which channels it wanted.
+            if crate::observe::first_sight("color_write_mask_out_of_range", u64::from(mask)) {
+                crate::observe::Emit::decline("type7_color_attach", &ColorWriteMaskOutOfRange)
+                    .field("slot", slot)
+                    .field("value", mask)
+                    .fail();
+            }
+            return Err(DecodeStatus::ErrUnsupported("res_color_write_mask_over"));
+        };
+        out.write_mask = decoded;
     }
     Ok(out)
 }

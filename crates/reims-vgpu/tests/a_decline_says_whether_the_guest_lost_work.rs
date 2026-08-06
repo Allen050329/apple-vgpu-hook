@@ -91,7 +91,7 @@ struct Row {
 /// How many types may answer [`Loss::ExecutedModified`].
 ///
 /// Not a budget. A ratchet: see [`the_executed_modified_census_only_shrinks`].
-const EXECUTED_MODIFIED_CEILING: usize = 16;
+const EXECUTED_MODIFIED_CEILING: usize = 15;
 
 /// Every `impl Decline`/`impl Refusal` in the crate, and what its worst arm
 /// costs the guest.
@@ -515,10 +515,12 @@ const ROWS: &[Row] = &[
     Row {
         file: "crates/reims-vgpu/src/runtime/decode/resource/mod.rs",
         ty: "ColorWriteMaskOutOfRange",
-        loss: Loss::ExecutedModified,
-        why: "a write mask wider than four bits is replaced with all-channels \
-              and the decode returns Ok, so the pipeline writes channels the \
-              guest may have masked off. Retired by refusing the record",
+        loss: Loss::Refused,
+        why: "a write mask wider than the four bits `MTLColorWriteMask` holds \
+              refuses the pipeline with `res_color_write_mask_over`, as the \
+              attachment-index check beside it does. It used to keep the \
+              default and return Ok — and the default is `all`, so a guest that \
+              masked a channel off got it written",
     },
     Row {
         file: "crates/reims-vgpu/src/runtime/decode/resource/mod.rs",
