@@ -393,11 +393,22 @@ impl Slot {
 /// outright, which is what the old doc itself named as the answer, and it is
 /// cheaper than a wider hash because a wider hash only moves the exponent.
 ///
-/// It is also the shape the rest of this crate already uses:
+/// It is also the shape the rest of this crate uses:
 /// [`crate::model::content_cache`] buckets by a `u64` prefilter and decides on
 /// `CacheEntry::matches`, and `runtime::guest_dmabuf` buckets by a digest of a
-/// page list and compares the list. This was the one digest-keyed cache in the
-/// crate that trusted its key.
+/// page list and compares the list.
+///
+/// This doc used to close by calling itself "the one digest-keyed cache in the
+/// crate that trusted its key", on the strength of a sweep run when it was
+/// fixed. **The sweep was wrong by three, and how it went wrong is the useful
+/// part.** `backend::metal::cache`'s `BlobKey` was a digest beside the blob's
+/// *length*, and its own doc argued that carrying the length made it an
+/// identity — so a reader auditing for "digest alone" read the length as the
+/// confirming compare and moved on. It is not one. It makes a collision need
+/// equal lengths, which narrows the population by a factor and removes nothing.
+/// Three caches keyed on it. When auditing this class, the question is not
+/// whether the key has a second field; it is whether **anything retained the
+/// bytes**.
 ///
 /// Borrowed rather than owned because a lookup happens per pipeline build and an
 /// owned key would allocate a copy of the AIR to throw away on every hit. Only

@@ -22,6 +22,7 @@ use crate::backend::metal::util::{
 use crate::contract::extent::tight_image_bytes;
 use crate::contract::fnv::FNV_OFFSET_BASIS;
 use crate::contract::vertex_step::{step_rate_in_contract, MTL_VERTEX_STEP_FUNCTION_PER_INSTANCE};
+use crate::runtime::decode::resource::MTL_COLOR_WRITE_MASK_ALL;
 use foreign_types::ForeignType;
 use metal::*;
 use std::ptr;
@@ -547,13 +548,53 @@ fn fill_render_pso_key(
     stencil_pixel_format: u32,
 ) -> RenderPsoKey {
     use crate::backend::metal::constants::REIMS_VGPU_METAL_MAX_COLOR_RTS;
+    // Exhaustive rather than `..Default::default()`, which is the difference
+    // between a field added to `RenderPsoKey` being a compile error here and
+    // being silently filled with a zero. The second is not a missing
+    // discriminator — it is worse: the stored key would carry the default while
+    // every later lookup key carried the same default, so the two would agree
+    // and two pipelines differing only in the new field would share one
+    // `MTLRenderPipelineState`. `RenderPsoKeyClone::clone_key` is exhaustive for
+    // the same reason.
     let mut key = RenderPsoKey {
+        // Overwritten at the bottom with the fold over every field below. Zero
+        // here would be a bucket, not a key, if that fold were ever removed.
+        key_hash: 0,
         vert_hash: hash_bytes(vert_mtlb),
         frag_hash: hash_bytes(frag_mtlb),
         vert_len: vert_mtlb.len(),
         frag_len: frag_mtlb.len(),
+        // Untruncated on purpose; see `REIMS_VGPU_METAL_MAX_ATTRS`.
         attr_count: attrs.len() as u32,
-        ..Default::default()
+        attr_location: [0; REIMS_VGPU_METAL_MAX_ATTRS],
+        attr_format: [0; REIMS_VGPU_METAL_MAX_ATTRS],
+        attr_offset: [0; REIMS_VGPU_METAL_MAX_ATTRS],
+        attr_buffer_index: [0; REIMS_VGPU_METAL_MAX_ATTRS],
+        attr_stride: [0; REIMS_VGPU_METAL_MAX_ATTRS],
+        attr_step_function: [0; REIMS_VGPU_METAL_MAX_ATTRS],
+        attr_step_rate: [0; REIMS_VGPU_METAL_MAX_ATTRS],
+        blend_enable: 0,
+        blend_src_rgb: 0,
+        blend_dst_rgb: 0,
+        blend_op_rgb: 0,
+        blend_src_alpha: 0,
+        blend_dst_alpha: 0,
+        blend_op_alpha: 0,
+        color_count: 0,
+        color_formats: [0; REIMS_VGPU_METAL_MAX_COLOR_RTS],
+        color_slot: [0; REIMS_VGPU_METAL_MAX_COLOR_RTS],
+        color_blend_enable: [0; REIMS_VGPU_METAL_MAX_COLOR_RTS],
+        color_blend_src_rgb: [0; REIMS_VGPU_METAL_MAX_COLOR_RTS],
+        color_blend_dst_rgb: [0; REIMS_VGPU_METAL_MAX_COLOR_RTS],
+        color_blend_op_rgb: [0; REIMS_VGPU_METAL_MAX_COLOR_RTS],
+        color_blend_src_alpha: [0; REIMS_VGPU_METAL_MAX_COLOR_RTS],
+        color_blend_dst_alpha: [0; REIMS_VGPU_METAL_MAX_COLOR_RTS],
+        color_blend_op_alpha: [0; REIMS_VGPU_METAL_MAX_COLOR_RTS],
+        // Every slot writes every channel until a `ColorRtKey` says otherwise;
+        // a zero here would describe a pipeline that writes no channel at all.
+        color_write_mask: [MTL_COLOR_WRITE_MASK_ALL; REIMS_VGPU_METAL_MAX_COLOR_RTS],
+        depth_pixel_format: 0,
+        stencil_pixel_format: 0,
     };
     for (i, attr) in attrs.iter().enumerate().take(REIMS_VGPU_METAL_MAX_ATTRS) {
         key.attr_location[i] = attr.location;
