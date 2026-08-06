@@ -2510,6 +2510,63 @@ mod pin_count_tests {
         );
     }
 
+    /// Every way this device can stop holding a resident answers whether it may
+    /// take the only copy of a frame — and the two that may not, do not.
+    ///
+    /// The two tests above each hold one selector. Neither notices a **third**
+    /// way to lose a resident being added, which is the shape the original
+    /// defect had: `pin_count == 0` was the predicate at two sites and both were
+    /// wrong for the same reason, and nothing compared them. The `match` here is
+    /// exhaustive over [`ResidentReclaim`], so a fourth variant does not compile
+    /// until its author has said which side of this it falls on.
+    ///
+    /// `Recreated` is the one exemption and it is not a weakening: the guest
+    /// asked `registry_ensure` for this identity at a different geometry,
+    /// generation or format, so the pixels being replaced are ones it has
+    /// declared it no longer wants. Losing those is the guest's own instruction,
+    /// not a policy of ours — and there is nothing to skip, because the
+    /// replacement is the point of the call.
+    #[test]
+    fn no_reclaim_cause_may_take_the_only_copy_of_a_frame() {
+        for cause in [
+            ResidentReclaim::IdleDrained,
+            ResidentReclaim::AllocationReclaimed,
+            ResidentReclaim::Recreated,
+        ] {
+            let mut pools = ResourcePools::new();
+            admit(&mut pools, surf(1), 10, 0);
+            // The sole-copy shape: rendered into and marked ready, never pinned,
+            // never stamped, never written back.
+            pools.registry_mark_ready(&surf(1));
+            pools.registry_touch_at(&surf(1), 10);
+            let aged = 10 + IDLE_TARGET_AGE_MS + 1;
+
+            match cause {
+                ResidentReclaim::IdleDrained => assert_eq!(
+                    pools.plan_idle_drain(aged, None),
+                    Some(Vec::new()),
+                    "the idle drain must not offer a sole copy at any age"
+                ),
+                ResidentReclaim::AllocationReclaimed => assert!(
+                    pools.recoverable_residents().is_empty(),
+                    "a device out of memory refuses the next allocation rather \
+                     than destroying a client's only render target"
+                ),
+                // Exempt, and the assertion says why rather than skipping: the
+                // slot is still the sole copy, and that is not what stops this
+                // cause — the guest asking for a different target is.
+                ResidentReclaim::Recreated => assert!(
+                    pools
+                        .registry
+                        .get(&surf(1))
+                        .is_some_and(|s| s.gpu_only_content),
+                    "the exemption is about who asked, not about the flag: the \
+                     slot this cause replaces is still marked as the only copy"
+                ),
+            }
+        }
+    }
+
     /// The maintained sole-copy totals agree with a walk of the registry at
     /// every transition, including the ones that move nothing.
     ///

@@ -1291,20 +1291,44 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                 // is nothing left to merge from — the image is destroyed — yet
                 // it takes this fall-through with no merge and no refusal.
                 //
-                // For most surfaces that is still correct: a type-11 surface's
-                // pages are its content, the flush rails write them, and reading
-                // them back is what `resolve_type11_load_seed` already calls "a
-                // cache miss is a reason to read them". It is *not* correct for
-                // a resident whose pixels were never written to those pages at
-                // all — an MRT secondary attachment is never pinned, never
-                // written back, and still carries a real `Gva`/`Surface`
-                // identity, so serving it from its pages substitutes an
-                // unrelated earlier frame.
+                // For most surfaces that is correct: a type-11 surface's pages
+                // are its content, the flush rails write them, and reading them
+                // back is what `resolve_type11_load_seed` already calls "a cache
+                // miss is a reason to read them".
                 //
-                // Reported rather than refused, because refusing would also
-                // reject the flushed-surface case that is the common one and
-                // works today. This is the reading that says how often the
-                // unsound case is reached; nothing in the tree could ask before.
+                // # The unsound case this line was added to count is closed
+                //
+                // It used to be reachable. A resident whose pixels were never
+                // written to those pages at all — an MRT secondary attachment,
+                // never pinned, never written back, and still carrying a real
+                // `Gva`/`Surface` identity — could be aged out, and serving it
+                // from its pages substituted an unrelated earlier frame.
+                //
+                // `ResidentTargetSlot::gpu_only_content` closed it at the
+                // reclaim end, which is the only end that can be closed: both
+                // selectors that choose a victim, `plan_idle_drain` and
+                // `recoverable_residents`, now skip such a slot at any age and
+                // any population, and the capacity walk exceeds its cap rather
+                // than take one. So **a resident that reaches this arm was, by
+                // construction, not the sole copy of its pixels when it was
+                // reclaimed** — something had copied them out, which is what
+                // cleared the flag.
+                //
+                // The guarantee therefore does not live here and cannot be
+                // asserted here; it lives beside those two selectors, held by
+                // `a_resident_that_is_the_only_copy_of_its_pixels_is_never_aged_out`,
+                // `the_capacity_walk_finds_no_victim_rather_than_destroy_the_only_copy`
+                // and `no_reclaim_cause_may_take_the_only_copy_of_a_frame` —
+                // the last of which is exhaustive over `ResidentReclaim`, so a
+                // fourth way to lose a resident has to answer this question
+                // before it compiles.
+                //
+                // What the line below still reports is a **cost**, not a
+                // soundness risk: this device paid for the reclaim by re-reading
+                // guest pages. It stays on the fail channel because the reclaim
+                // cutoff is a measured trade (see `IDLE_TARGET_AGE_MS`) and the
+                // reliance on it should stay visible, not because a firing means
+                // something was lost.
                 if !resident_ready {
                     if let Some((cause, since_ms)) =
                         crate::backend::vulkan::engine::resident_absent_after_reclaim(&resident_id)
@@ -1326,7 +1350,8 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                             crate::observe::fail(format!(
                                 "sampled_resident_reclaimed reason=sampled_resident_reclaimed \
                                  mid={mid} {w}x{h} prior={} since_reclaim_ms={since_ms} \
-                                 (this device destroyed the resident; sampling its guest pages instead)",
+                                 (reclaimed after its pixels were copied out; re-reading \
+                                 its guest pages costs an upload, not a frame)",
                                 cause.slug()
                             ));
                         }
