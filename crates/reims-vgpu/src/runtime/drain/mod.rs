@@ -1146,9 +1146,22 @@ fn reply_heap_texture_size_and_align<H: HostMemory + HostOps>(
 /// upper half is **reported rather than assumed**. Refusing on a non-zero upper
 /// half would break a guest that really is sending a nested header, and reading
 /// it as part of the opcode would break the other case; a reading is what
-/// decides which, and there is no reading — `unknown_root_opcode` appears in no
-/// archived boot log, so this arm's firing rate is unmeasured rather than known
-/// to be zero.
+/// decides which.
+///
+/// # The reading, and what it does and does not settle
+///
+/// A driven x86/PCI/Vulkan boot to the desktop, with the web-content probe
+/// driving Safari through ten captures, emitted **neither line — not the alarm
+/// and not the census** — against 6 869 `OFF` records on the same run, so the
+/// channel was working and this arm simply never ran. The guest on that pathway
+/// does not wrap.
+///
+/// That settles the *cost*: the ambiguity below loses no guest work on x86
+/// today, so it is not a bug waiting to bite this pathway. It settles nothing
+/// about the *encoding* — an arm that never runs cannot say which reading of its
+/// word is right, and the two remain live for any guest that does wrap. Leave
+/// both emissions in place; they are the only thing that will report the first
+/// one that does.
 ///
 /// `fail_once` is keyed on the whole word, so a wrapper that carries the same
 /// inner opcode every time says so once.
