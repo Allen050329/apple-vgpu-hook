@@ -85,9 +85,87 @@ pub fn tight_image_bytes(width: u32, height: u32, bytes_per_pixel: usize) -> Opt
         .ok()
 }
 
+/// [`tight_image_bytes`] together with the row stride it implies, as one pair.
+///
+/// For the callers that hand a buffer to a texel-copy API. Such a call is given
+/// a row stride and a region, and reads `stride * height` bytes from whatever
+/// pointer it receives — so the length of that allocation and the stride passed
+/// alongside it are not two facts but one, and deriving them separately is what
+/// lets them disagree.
+///
+/// They did. `runtime::draw::metal_icb` sized an ICB colour attachment's
+/// staging from the *guest* attachment's bytes-per-pixel while creating a
+/// BGRA8Unorm texture and passing `width * 4` as the stride, so for any format
+/// narrower than four bytes ([`crate::contract::pixel_format::R8_BPP`],
+/// [`crate::contract::pixel_format::RG8_BPP`]) Metal read past the end of the
+/// buffer and copied whatever followed it on the host heap into a render target
+/// the guest reads back. The writeback half of that same function computed the
+/// length correctly, ten lines away. One quantity, two derivations, and only
+/// one of them right.
+///
+/// Same `None` contract as [`tight_image_bytes`], and for the same reason: a
+/// zero on any axis is not a zero-length image, it is a geometry no caller here
+/// can act on.
+pub fn tight_image_layout(width: u32, height: u32, bytes_per_pixel: u32) -> Option<(u32, usize)> {
+    let total = tight_image_bytes(width, height, bytes_per_pixel as usize)?;
+    Some((width.checked_mul(bytes_per_pixel)?, total))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::contract::pixel_format::{R8_BPP, RG8_BPP, RGBA8_BPP};
+
+    /// The length a texel copy is allowed to read is exactly `stride * height`,
+    /// and both come from one call, so no caller can pair one format's stride
+    /// with another format's length.
+    ///
+    /// The regression this pins: an ICB colour attachment at `R8_BPP` sized its
+    /// staging `width * height * 1` while the texture was BGRA8Unorm and the
+    /// copy was told `width * 4`. At 1920x1080 that is a 2,073,600-byte
+    /// allocation read as 8,294,400 bytes — 6.2 MB of whatever followed it on
+    /// the host heap, copied into a surface the guest reads back.
+    #[test]
+    fn a_tight_image_layout_pairs_a_length_with_the_stride_that_reads_it() {
+        for bpp in [R8_BPP, RG8_BPP, RGBA8_BPP] {
+            let (stride, len) = tight_image_layout(1920, 1080, bpp).expect("valid geometry");
+            assert_eq!(stride, 1920 * bpp);
+            assert_eq!(
+                len,
+                stride as usize * 1080,
+                "the length must be exactly what a copy at this stride reads"
+            );
+        }
+        // The defect in one line: a BGRA8 copy's stride against an R8 length.
+        let (bgra_stride, _) = tight_image_layout(1920, 1080, RGBA8_BPP).expect("valid");
+        let (_, r8_len) = tight_image_layout(1920, 1080, R8_BPP).expect("valid");
+        assert!(
+            r8_len < bgra_stride as usize * 1080,
+            "pairing them across formats under-allocates, which is the bug"
+        );
+    }
+
+    /// A degenerate geometry is `None`, not a zero-length pair.
+    ///
+    /// Inherited from [`tight_image_bytes`] deliberately: a caller allocating a
+    /// staging buffer and a caller length-checking a guest buffer both need a
+    /// zero here to be unusable rather than trivially satisfied.
+    #[test]
+    fn a_tight_image_layout_refuses_a_degenerate_geometry() {
+        assert_eq!(tight_image_layout(0, 1080, RGBA8_BPP), None);
+        assert_eq!(tight_image_layout(1920, 0, RGBA8_BPP), None);
+        assert_eq!(tight_image_layout(1920, 1080, 0), None);
+        // A stride that does not fit a u32 is refused rather than wrapped:
+        // `1 << 30` texels at four bytes is exactly `1 << 32`, and the wrapping
+        // answer is a stride of *zero* — an allocation of nothing handed to a
+        // copy that still reads a full image.
+        assert_eq!(
+            (1u32 << 30).wrapping_mul(RGBA8_BPP),
+            0,
+            "the wrapping answer here is zero, which is what makes this the case to pin"
+        );
+        assert_eq!(tight_image_layout(1 << 30, 16, RGBA8_BPP), None);
+    }
 
     #[test]
     fn a_mip_level_halves_and_floors_at_one() {

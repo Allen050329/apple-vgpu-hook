@@ -783,14 +783,30 @@ pub fn encode_icb_execute_and_writeback<M: HostMemory + HostOps>(
     // Build color RT textures (seeded from mapping / clear).
     let mut color_tex: Vec<(u32, Texture, Vec<u8>)> = Vec::new();
     for c in &color_list {
-        let bpp = if c.format == 0 || c.format == MTL_FORMAT_BGRA8_UNORM {
-            RGBA8_BPP
-        } else {
-            pixel_format::bytes_per_pixel(c.format).unwrap_or(RGBA8_BPP)
+        // This path renders every colour attachment as BGRA8Unorm whatever the
+        // guest declared, and writes it back unconverted, so a narrower or
+        // wider attachment is reinterpreted rather than translated. Say so:
+        // the alternative is a well-formed frame in the wrong format, which is
+        // indistinguishable from a correct one until something samples it.
+        if c.format != 0 && c.format != MTL_FORMAT_BGRA8_UNORM {
+            crate::runtime::drain::census::note_store_route("icb_color_format_reinterpreted");
+            if crate::observe::first_sight("icb_color_not_bgra8", u64::from(c.format)) {
+                crate::observe::fail(format!(
+                    "icb_color_format_reinterpreted reason=icb_color_not_bgra8 \
+                     mapping={} format={:#x} rendered_as=bgra8_unorm",
+                    c.mapping_id, c.format
+                ));
+            }
+        }
+        // The texture below is BGRA8Unorm, so its staging length and the row
+        // stride `replace_region` is given must come from one place — see
+        // `contract::extent::tight_image_layout`, which carries what happened
+        // when they did not.
+        let Some((row_bytes, nbytes)) =
+            crate::contract::extent::tight_image_layout(width, height, RGBA8_BPP)
+        else {
+            return EncodeStatus::BadArgs("icb_color_target_degenerate_geometry");
         };
-        let nbytes = (width as usize)
-            .saturating_mul(height as usize)
-            .saturating_mul(bpp as usize);
         let mut seed = c
             .target_seed_rgba
             .clone()
@@ -814,7 +830,7 @@ pub fn encode_icb_execute_and_writeback<M: HostMemory + HostOps>(
                 depth: 1,
             },
         };
-        tex.replace_region(region, 0, seed.as_ptr() as *const _, (width as u64) * 4);
+        tex.replace_region(region, 0, seed.as_ptr() as *const _, u64::from(row_bytes));
         color_tex.push((c.mapping_id, tex, seed));
     }
 
@@ -867,10 +883,12 @@ pub fn encode_icb_execute_and_writeback<M: HostMemory + HostOps>(
     }
 
     // Writeback each color RT (type-11 mapping or type-2/3 GVA).
-    let need = (width as usize)
-        .saturating_mul(height as usize)
-        .saturating_mul(4);
-    let stride = width.saturating_mul(RGBA8_BPP);
+    // Same one derivation as the seed side above, so the two halves of this
+    // function cannot disagree about the layout of the buffer they share.
+    let Some((stride, need)) = crate::contract::extent::tight_image_layout(width, height, RGBA8_BPP)
+    else {
+        return EncodeStatus::BadArgs("icb_color_target_degenerate_geometry");
+    };
     let mut any_write = false;
     for (i, (mapping_id, tex, seed)) in color_tex.iter().enumerate() {
         let c = &color_list[i];
