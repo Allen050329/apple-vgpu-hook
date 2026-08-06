@@ -130,10 +130,18 @@ const ROWS: &[Row] = &[
         ty: "VertexFormatWidenDecline",
         loss: Loss::ExecutedModified,
         why: "a three-component vertex format the host does not offer is \
-              widened to four and the pipeline is built anyway; its own doc \
-              says the pipeline is not byte-for-byte what the guest asked for. \
-              Retired by refusing the pipeline, or by proving the widened read \
-              is identical for every format in the table",
+              widened to its mandatory four-component sibling and the pipeline \
+              is built anyway, with `resolve` checking only that the wider read \
+              stays inside the stride. **Not retirable by proving the read \
+              identical**, which is the obvious attempt: a shader input \
+              declared `vec4` over a three-component attribute takes \
+              `(x,y,z,1.0)` from the format the guest asked for and \
+              `(x,y,z,<whatever those four bytes hold>)` from the substitute, \
+              because the fourth component is now supplied rather than \
+              defaulted. Identical only where every consumer reads three \
+              components or fewer, which nothing here checks. Retired by \
+              refusing the pipeline, or by reading the shader's declared input \
+              width and widening only when it is three or under",
     },
     Row {
         file: "crates/reims-vgpu/src/backend/vulkan/engine/compute_execution.rs",
