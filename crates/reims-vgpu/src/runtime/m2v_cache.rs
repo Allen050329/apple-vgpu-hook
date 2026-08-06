@@ -365,6 +365,34 @@ fn stage_tag(stage: Stage) -> u8 {
     }
 }
 
+/// The cache key for a non-kernel shader: 64 bits of SipHash over stage + AIR.
+///
+/// # The key *is* the identity, and what that costs
+///
+/// [`Cache::entries`] is keyed on this `u64` and holds no copy of the AIR, so a
+/// lookup that lands on an entry returns it — there is no confirmation step. Two
+/// distinct AIR blobs colliding here would therefore hand the guest a shader it
+/// never compiled, silently and with no failure line, which is a worse outcome
+/// than any eviction this device can make. So the bound is worth stating rather
+/// than leaving for a reader to notice or to miss.
+///
+/// The bound is the birthday one, `n² / 2^65` for `n` distinct shaders. The
+/// population is not a function of uptime — the key is content, so `n` is the
+/// number of distinct shaders the guest's program set contains, and a driven
+/// x86 boot settles at **75** and stays there, per [`Cache`]'s own doc. At that
+/// `n` the probability is about `2e-16`, and it would take `n` in the hundreds
+/// of millions to reach one in a million. A guest cannot grow `n` faster than it
+/// can author shaders.
+///
+/// Confirming on hit is the fix if that ever stops being true, and it is not
+/// free: it means keeping every AIR blob alongside its SPIR-V, roughly doubling
+/// what this cache holds. Not worth paying against `2e-16` — but it is the
+/// answer, and it is cheaper than a wider hash because it removes the class
+/// rather than moving the exponent.
+///
+/// `air.hash()` writes a length prefix before the bytes, per `Hash for [u8]`, so
+/// two blobs of different lengths are not merely unlikely to collide on content
+/// — the length is in the digest too.
 fn air_key(stage: Stage, air: &[u8]) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     stage_tag(stage).hash(&mut h);
@@ -373,6 +401,11 @@ fn air_key(stage: Stage, air: &[u8]) -> u64 {
 }
 
 /// Kernel cache key includes LocalSize (SPIR-V workgroup size is baked at translate).
+///
+/// `local_size` is in the digest because the translator bakes the workgroup size
+/// into the SPIR-V, so one AIR blob dispatched at two sizes is two shaders. A
+/// key without it would be the collision [`air_key`] describes, except reachable
+/// by a guest doing something entirely ordinary rather than by chance.
 fn air_key_kernel(air: &[u8], local_size: [u32; 3]) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     stage_tag(Stage::Kernel).hash(&mut h);
@@ -960,6 +993,33 @@ mod tests {
         assert_ne!(air_key(Stage::Vertex, a), air_key(Stage::Vertex, b"other"));
         assert_eq!(air_key(Stage::Vertex, a), air_key(Stage::Vertex, a));
         assert_ne!(air_key_kernel(a, [16, 16, 1]), air_key_kernel(a, [8, 8, 1]));
+    }
+
+    /// Each `local_size` component alone changes the kernel key.
+    ///
+    /// The assertion above varies two components at once, so a digest that fed
+    /// only `local_size[0]` would satisfy it. That matters here more than the
+    /// usual thoroughness argument: the translator bakes the workgroup size into
+    /// the SPIR-V, so a key blind to one axis returns a shader compiled for a
+    /// different one — the guest's dispatch runs, produces wrong results, and
+    /// nothing anywhere reports a miss, because it was a *hit*.
+    ///
+    /// Also pinned: the same triple keys the same, so this cannot pass by
+    /// accident on a key that simply changes every call.
+    #[test]
+    fn every_local_size_axis_is_in_the_kernel_key() {
+        let air = b"kernel-air";
+        let base = [8u32, 8, 8];
+        assert_eq!(air_key_kernel(air, base), air_key_kernel(air, base));
+        for axis in 0..3 {
+            let mut moved = base;
+            moved[axis] += 1;
+            assert_ne!(
+                air_key_kernel(air, base),
+                air_key_kernel(air, moved),
+                "local_size[{axis}] does not reach the key: {base:?} vs {moved:?}"
+            );
+        }
     }
 
     /// Every decline is classified, and the split is by what the variant names.
