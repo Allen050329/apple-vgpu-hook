@@ -59,7 +59,21 @@ use source_scan::{blank_comments, rust_sources, workspace_root};
 /// the `metal` crate, so its two tests now run on every arm instead of none.
 /// Every further reduction should have that shape — a test that *runs* somewhere
 /// — and not a deletion.
-const METAL_ARM_TEST_FUNCTIONS: usize = 33;
+///
+/// # It went 33 → 28
+///
+/// `backend::metal::mipmap` was six tests, and five of them never reached
+/// `system_device()`: they walked an argument ladder — zero width, zero height,
+/// a level count of one, an integer format, a short level 0 — and checked which
+/// refusal came back. That is arithmetic over guest numbers, so it moved to
+/// `contract::mipmap` along with `MetalMipmapError` itself, and it now runs on
+/// every arm. The sixth stayed, because asking Metal to filter real pixels and
+/// checking the colour survived is the one question no other host can answer.
+///
+/// That is the shape to copy, and the second time it has paid: the reduction
+/// came from a *file* whose portable half was larger than its Metal half, not
+/// from picking off individual tests. Look for those.
+const METAL_ARM_TEST_FUNCTIONS: usize = 28;
 
 #[test]
 fn the_metal_arm_test_functions_are_counted_because_this_build_may_not_run_them() {

@@ -22,6 +22,11 @@ use crate::runtime::objects;
 
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 use crate::backend::metal::mipmap as metal_mip;
+// The refusal type is portable data and lives in `contract::mipmap` so its
+// checks can be executed on a host with no Apple linker. The import still
+// carries this gate, because only this arm can produce one.
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+use crate::contract::mipmap::MetalMipmapError;
 
 /// Outcome of a generateMipmaps attempt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,7 +56,7 @@ pub enum MipmapStatus {
     GuestIo,
     /// The exact Metal-side check that rejected generation.
     #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-    Metal(metal_mip::MetalMipmapError),
+    Metal(MetalMipmapError),
 }
 
 impl crate::observe::Refusal for MipmapStatus {
@@ -368,7 +373,7 @@ fn generate_via_metal(
     height: u32,
     levels: u32,
     level0: &[u8],
-) -> Result<Vec<(u32, u32, Vec<u8>)>, metal_mip::MetalMipmapError> {
+) -> Result<Vec<(u32, u32, Vec<u8>)>, MetalMipmapError> {
     metal_mip::generate_mipmaps_filtered(fmt, width, height, levels, level0).map(|chain| {
         chain
             .into_iter()
@@ -475,7 +480,7 @@ pub fn generate_mipmaps_linear<M: HostMemory + HostOps>(
     #[cfg(all(feature = "backend-metal", target_os = "macos"))]
     let chain = match generate_via_metal(fmt, l0_w, l0_h, levels as u32, &level0) {
         Ok(chain) => chain,
-        Err(error @ metal_mip::MetalMipmapError::NoDevice) => {
+        Err(error @ MetalMipmapError::NoDevice) => {
             // Correct but slower: retain the CPU box-filter fallback, and make
             // the missing Metal device visible as a typed degradation.
             crate::observe::Emit::decline("mipmap_metal_fallback", &error)
@@ -547,7 +552,7 @@ mod tests {
 
         #[cfg(all(feature = "backend-metal", target_os = "macos"))]
         {
-            let status = MipmapStatus::Metal(metal_mip::MetalMipmapError::Level0TooShort {
+            let status = MipmapStatus::Metal(MetalMipmapError::Level0TooShort {
                 len: 15,
                 expected: 16,
             });
