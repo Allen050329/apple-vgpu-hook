@@ -776,8 +776,10 @@ impl ResourcePools {
 
     /// Cumulative compute-storage recycle diagnostics: `(admits, cap_drops)`.
     /// A nonzero `cap_drops` means a per-key or global cap actively bounded the
-    /// pool (an all-new-geometry compute burst) — the "the cap is biting" signal
-    /// surfaced as `st_drop` on the `vram` census.
+    /// pool (an all-new-geometry compute burst) — the "the cap is biting" signal.
+    /// It used to say this reached a boot as `st_drop` on a `vram` census line;
+    /// that line is gone from the tree, and with it every way of asking a boot
+    /// for this. `#[cfg(test)]` is now the whole of its reach.
     #[cfg(test)]
     pub(crate) fn storage_recycle_stats(&self) -> (u64, u64) {
         let (_, _, admits, cap_drops) = self.storage_image_free.stats();
@@ -1244,8 +1246,9 @@ impl ResourcePools {
     /// full `vkAllocateMemory`.
     ///
     /// `vk_alloc_sites` puts 99.4 % of all allocation wall-clock in this pool —
-    /// 9 725 allocations at ~817 µs each over one 260 s boot — while the `vram`
-    /// census showed the free pool holding up to 133 MiB at the same time. A pool
+    /// 9 725 allocations at ~817 µs each over one 260 s boot — while a `vram`
+    /// census line, since deleted, showed the free pool holding up to 133 MiB at
+    /// the same time. Only the first half is reproducible today. A pool
     /// that is simultaneously full and missing is either holding the wrong
     /// buckets or being emptied behind the hot path, and the aggregate cannot
     /// tell those apart. The miss's own bucket plus the free pool's bucket

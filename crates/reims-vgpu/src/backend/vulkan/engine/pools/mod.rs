@@ -1136,8 +1136,10 @@ const SAMPLED_FREE_CAP_PER_KEY: usize = 4;
 /// **Global** cap on `sampled_free` across all keys. The per-key cap alone does
 /// not bound a *diverse* burst: a YouTube page-load evicts hundreds of distinct
 /// sampled geometries (thumbnails), each ≤ the per-key cap, so the pool grew to
-/// ~593 images (measured `vram sfree=593`), each pinning a slab sub-allocation so
-/// no block could ever empty (`block_frees=0`) — the VRAM-return stall. This
+/// ~593 images, each pinning a slab sub-allocation so no block could ever empty
+/// (`block_frees=0`) — the VRAM-return stall. The 593 came off a `vram sfree=`
+/// census line that no longer exists in the tree, so it is history rather than a
+/// number a boot can be asked for; `block_frees` is still live. This
 /// global cap keeps the recycle pool from exceeding the working set; evictions
 /// past it are destroyed (freeing their slab range) instead of cached.
 const SAMPLED_FREE_CAP_TOTAL: usize = 64;
@@ -1190,9 +1192,10 @@ const STORAGE_IMAGE_FREE_CAP_TOTAL: usize = 16;
 ///
 /// `total` is tested first and it is the one that matters. The per-key cap
 /// alone does not bound a *diverse* burst: hundreds of distinct keys, each on
-/// its own well under `per_key`, filled `sampled_free` to ~593 images (measured
-/// `vram sfree=593`), every one pinning a slab sub-allocation so no block could
-/// ever empty. `per_key` is the second bound, for one geometry churning.
+/// its own well under `per_key`, filled `sampled_free` to ~593 images, every one
+/// pinning a slab sub-allocation so no block could ever empty. The 593 is
+/// history — see `SAMPLED_FREE_CAP_TOTAL` for which half of that reading a boot
+/// can still produce. `per_key` is the second bound, for one geometry churning.
 ///
 /// A high `cap_drops` beside a high `allocs` is the reading that says a cap,
 /// rather than the workload, is what stopped the reuse.
