@@ -1380,17 +1380,17 @@ impl ResourcePools {
     /// is no slot to read yet, and it sets it to the default that counts for
     /// nothing.
     fn set_sole_copy(&mut self, identity: &TargetIdentity, sole: bool) -> bool {
-        let Some(slot) = self.registry.get(identity) else {
+        let Some(slot) = self.registry.get_mut(identity) else {
             return false;
         };
+        // Returning early on a no-op is what keeps the totals a population
+        // rather than a transition count: `registry_mark_ready` fires on every
+        // draw into an already-sole-copy slot.
         if slot.gpu_only_content == sole {
             return true;
         }
+        slot.gpu_only_content = sole;
         let bytes = Self::slot_attachment_bytes(slot);
-        self.registry
-            .get_mut(identity)
-            .expect("read one statement ago")
-            .gpu_only_content = sole;
         self.registry_sole_copy_adjust(bytes, sole);
         true
     }
