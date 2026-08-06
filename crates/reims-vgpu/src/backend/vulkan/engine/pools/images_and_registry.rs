@@ -1769,24 +1769,6 @@ mod pin_count_tests {
     /// Registers through the product path rather than writing the map and the
     /// order itself, so this helper cannot be the copy that keeps them in step
     /// by accident while the product one stops.
-    /// Put the registry above `IDLE_DRAIN_PRESSURE_FLOOR` with residents too
-    /// fresh to be selected.
-    ///
-    /// The drain destroys nothing below that floor, so without this a test about
-    /// victim *selection* is answered by the pressure gate instead and passes
-    /// for the wrong reason — or, as here, fails and says so. The filler is
-    /// touched at `now`, so it can never be a victim itself and cannot change
-    /// which resident a selection test expects.
-    fn under_drain_pressure(pools: &mut ResourcePools, now: u64) {
-        for i in 0..=IDLE_DRAIN_PRESSURE_FLOOR as u32 {
-            admit(pools, surf(100_000 + i), now, 0);
-        }
-        assert!(
-            pools.non_pinned_registry_len() > IDLE_DRAIN_PRESSURE_FLOOR,
-            "the filler must actually cross the floor"
-        );
-    }
-
     fn admit(pools: &mut ResourcePools, id: TargetIdentity, last_touch_ms: u64, pin: u32) {
         pools.register_resident(
             &id,
@@ -1938,9 +1920,6 @@ mod pin_count_tests {
                                            // now = 10 + AGE + 1 so slot 1's cutoff is crossed; a fresh slot is not.
         let now = 10 + IDLE_TARGET_AGE_MS + 1;
         admit(&mut pools, surf(3), now, 0); // fresh            -> kept
-        // Selection only runs above the pressure floor; below it the drain
-        // destroys nothing and this would assert against an empty list.
-        under_drain_pressure(&mut pools, now);
         let victims = pools.plan_idle_drain(now, None).expect("pass due");
         assert_eq!(victims, vec![surf(1)], "only the aged non-pinned resident");
         assert_eq!(pools.idle_clock_ms, now, "clock advanced to wall time");
@@ -1987,53 +1966,6 @@ mod pin_count_tests {
             pools.prior_reclaim_at(&surf(2)),
             None,
             "an identity never reclaimed has no stamp, and is not guessed at"
-        );
-    }
-
-    /// Below `IDLE_DRAIN_PRESSURE_FLOOR` the drain destroys nothing, however
-    /// aged the residents are — and it still fires the pass.
-    ///
-    /// Age alone was the whole condition, so a registry nowhere near
-    /// `REGISTRY_CAP` still had residents terminally destroyed on a 2 s timer.
-    /// Measured on a driven boot: the cap never bound (`evicts=0`, peak 180-197
-    /// of 320) while the drain destroyed residents the guest went on to sample
-    /// 44 times, every one `prior=idle_drained`.
-    ///
-    /// The pass must still fire — `Some(vec![])`, not `None` — because the
-    /// caller uses a fired pass to trim the recycle pools, and free-list images
-    /// hold no guest content so giving them back costs nothing. Returning `None`
-    /// would keep the residents *and* the free lists.
-    ///
-    /// Fails without the gate: the aged resident is selected.
-    #[test]
-    fn the_idle_drain_destroys_nothing_below_the_pressure_floor() {
-        let mut pools = ResourcePools::new();
-        admit(&mut pools, surf(1), 10, 0);
-        let now = 10 + IDLE_TARGET_AGE_MS + 1;
-
-        assert!(
-            pools.non_pinned_registry_len() <= IDLE_DRAIN_PRESSURE_FLOOR,
-            "precondition: this registry is nowhere near the cap"
-        );
-        assert_eq!(
-            pools.plan_idle_drain(now, None),
-            Some(Vec::new()),
-            "aged, unpinned, and past the cutoff — but the cap has headroom, so \
-             destroying it buys VRAM nobody is waiting for"
-        );
-        assert!(
-            pools.registry.contains_key(&surf(1)),
-            "and the resident is still there to be sampled"
-        );
-
-        // Cross the floor and the same resident is taken, so the gate is a
-        // pressure condition and not an off switch.
-        under_drain_pressure(&mut pools, now);
-        let later = now + IDLE_DRAIN_INTERVAL_MS + 1;
-        let victims = pools.plan_idle_drain(later, None).expect("pass due");
-        assert!(
-            victims.contains(&surf(1)),
-            "above the floor the drain does its job: {victims:?}"
         );
     }
 
@@ -2181,9 +2113,6 @@ mod pin_count_tests {
         admit(&mut pools, surf(1), 10, 0);
         admit(&mut pools, surf(2), 10, 0);
         let now = 10 + IDLE_TARGET_AGE_MS + 1;
-        // Above the pressure floor, so what spares `surf(1)` below is the
-        // sampled-use touch and not the gate that spares everything.
-        under_drain_pressure(&mut pools, now);
         // The drain's clock has to be current before a use can be recorded
         // against it; the real caller advances it from the poll heartbeat.
         pools.plan_idle_drain(now, None);
@@ -2382,9 +2311,6 @@ mod pin_count_tests {
         let mut pools = ResourcePools::new();
         admit(&mut pools, surf(1), 0, 0);
         let t0 = IDLE_TARGET_AGE_MS + 1;
-        // The drain destroys nothing below the pressure floor, so this test
-        // about throttling has to be above it to reach the throttle at all.
-        under_drain_pressure(&mut pools, t0);
         assert_eq!(pools.plan_idle_drain(t0, None), Some(vec![surf(1)]));
         // Simulate the dispose the real caller (advance_registry_touch_and_drain)
         // performs for each selected victim.
@@ -2418,9 +2344,6 @@ mod pin_count_tests {
         for i in 0..(IDLE_TARGET_DRAIN_MAX_PER_CALL as u32 + 5) {
             admit(&mut pools, surf(100 + i), 0, 0);
         }
-        // The per-pass bound only applies once the pressure floor is crossed —
-        // below it the batch is empty for a different reason entirely.
-        under_drain_pressure(&mut pools, IDLE_TARGET_AGE_MS + 1);
         let victims = pools
             .plan_idle_drain(IDLE_TARGET_AGE_MS + 1, None)
             .expect("pass due");

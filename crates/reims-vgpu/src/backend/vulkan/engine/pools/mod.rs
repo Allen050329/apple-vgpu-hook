@@ -1202,10 +1202,34 @@ pub(crate) const REGISTRY_CAP: usize = 320;
 /// - The reclaim runs on a timer with no reference to memory pressure at all.
 ///   On an idle desktop (~56 residents) it destroys terminally while freeing
 ///   VRAM nobody wants back, which is pure downside; the burst it was written
-///   for is the only time the risk buys anything. Gating the drain on the
-///   non-pinned *bytes* it is defending — `NonPinnedTotals` already carries
-///   them — is the change that keeps what this constant is for and drops what it
-///   costs.
+///   for is the only time the risk buys anything.
+///
+/// # A memory-pressure gate on the drain was tried, measured, and reverted
+///
+/// The obvious answer to that last bullet — skip the drain while the population
+/// is below some fraction of `REGISTRY_CAP` — was implemented and measured on a
+/// driven x86/PCI boot with `web-content-probe --churn 1`, floor at half the cap:
+///
+/// ```text
+///                                   gate off   gate on
+///   slab_mib peak held (MiB)             456       584
+///   slab_mib SETTLED (MiB)                64       464
+///   t11sample_reclaimed_from_pages        36        26
+///   distinct mappings affected             5         3
+/// ```
+///
+/// The settled row is the verdict: **at rest the gate held 464 MiB where the
+/// ungated drain holds 64 — 7.25x** — because the floor is where the drain stops,
+/// so in steady state it returned no VRAM at all, which was its whole purpose.
+/// What it bought was a 28 % cut in destroy-then-sample events, none of which was
+/// shown to lose guest work. Do not re-add it in slot or in byte form; a byte
+/// floor stops the drain at the same steady state for the same reason.
+///
+/// The class it was reaching for is real but narrower than a population gate can
+/// address: a resident whose content exists **only** in VRAM must never be aged
+/// out at all, at any population, while one the guest can re-serve from its own
+/// pages costs only redundant work when it is. That distinction is a property of
+/// the resident, not of how many of them there are.
 ///
 /// Reopen signal: `past_cutoff` non-zero in the `resident_resample_*` bands, or
 /// `resample_peak_ms` reaching this value, both of which mean a resident
@@ -1249,109 +1273,6 @@ pub(crate) const REGISTRY_CAP: usize = 320;
 /// because doing so needs its own before/after on VRAM, which `peak_mib` — the
 /// registry's attachment bytes, not the device's footprint — cannot supply.
 pub(crate) const IDLE_TARGET_AGE_MS: u64 = 2000;
-/// Non-pinned population below which the idle drain destroys nothing.
-///
-/// The drain ages residents out on a wall clock with no reference to memory
-/// pressure, and its destroy is terminal. `REGISTRY_CAP` is the actual bound on
-/// the population; this drain is an optimisation on top of it, returning VRAM
-/// *earlier* than the cap would demand. Below this floor the cap has headroom
-/// nobody is competing for, so every destroy the drain performs there buys VRAM
-/// no one is waiting for at the cost of a resident the guest may sample —
-/// which is a trade with nothing on one side of it.
-///
-/// That is not hypothetical. On a driven x86/PCI boot the cap never bound at all
-/// (`evicts=0`, non-pinned peak 180-197 of 320) while the drain destroyed
-/// residents the guest went on to sample 44 times across 8 surfaces, every one
-/// reporting `prior=idle_drained` — and on the same boot `resample_peak_ms`
-/// read 2282 against a 2000 ms cutoff, so a resident was read *past* the age at
-/// which the drain destroys and survived only because the drain is throttled.
-///
-/// Half the cap rather than a new independent number: the quantity this gates is
-/// the same population `REGISTRY_CAP` bounds, so it is expressed in that bound
-/// and moves with it. A floor at half leaves the drain its whole reason for
-/// existing — a burst that reaches 260 still drains, down to here — while
-/// removing the destroys that happen when the registry is nowhere near its
-/// limit. The VRAM this holds is bounded by the same slot count as ever, and at
-/// the measured mix (~1.1 MiB a slot) is on the order of 170 MiB against a
-/// `DEVICE_LOCAL` heap measured in gigabytes.
-///
-/// It gates the resident destroys only. A gated pass still runs and still trims
-/// the recycle pools, because free-list images hold no guest content and giving
-/// them back costs nothing.
-///
-/// # What it bought and what it cost, both measured
-///
-/// Same driven x86/PCI boot and `web-content-probe --churn 1`, without the gate
-/// and with it:
-///
-/// ```text
-///                                  without      with
-///   t11sample_reclaimed_from_pages      44        30
-///   distinct mappings affected           8         3
-///   non-pinned peak                    180       261   (cap 320)
-///   peak_mib                           196       292
-///   evicts                               0         0
-///   resample_peak_ms                  2282      4076
-/// ```
-///
-/// A third fewer destroy-then-sample events and a third as many surfaces
-/// affected, for ~96 MiB and 81 slots of the cap's headroom. Both directions are
-/// real; this is a trade, not a free win, and the numbers are here so the next
-/// person can retune it against evidence rather than argue it.
-///
-/// **The reading that matters most is the last row.** `resample_peak_ms` went
-/// from 2282 to 4076 because residents that used to be destroyed at 2000 ms are
-/// now still there when the guest comes back for them — so the guest's real
-/// re-use interval on this workload reaches **4 s**, twice
-/// `IDLE_TARGET_AGE_MS`. The cutoff is not close to the working set, it is
-/// inside it, and every gap between 2 s and 4 s was previously a resident
-/// destroyed and re-served from somewhere else.
-///
-/// Two things this does not settle. The remaining 30 happen above the floor,
-/// where the drain still runs, so the gate reduces this class rather than
-/// closing it. And a peak of 261 against a cap of 320 leaves 59 slots where
-/// there were 140, so a heavier workload reaches `REGISTRY_CAP` sooner than it
-/// used to and starts paying cap evictions instead — a different terminal
-/// destroy. `evicts` staying 0 is what says that has not happened yet.
-///
-/// # Re-measured in device bytes, this gate should be reverted
-///
-/// **Every `peak_mib` figure above is the wrong quantity.** It is an attachment
-/// footprint computed from geometry; `SlabPool::held_bytes` measures the
-/// `VkDeviceMemory` actually held and is about 2x larger. Re-run as a controlled
-/// experiment — this constant temporarily set to 0, same boot, same probe:
-///
-/// ```text
-///                                   gate off   gate on
-///   slab_mib peak held (MiB)             456       584
-///   slab_mib SETTLED (MiB)                64       464
-///   t11sample_reclaimed_from_pages        36        26
-///   distinct mappings affected             5         3
-/// ```
-///
-/// The settled row is the verdict. **At rest this gate holds 464 MiB where the
-/// ungated drain holds 64 — 400 MiB, 7.25x.** The drain stops at the floor and
-/// the floor is 160 residents, so this is not "the drain still does its job down
-/// to here"; it is the drain not returning VRAM at all in steady state, which
-/// was its whole purpose. What that buys is a 28 % reduction in
-/// destroy-then-sample events, **none of which has been shown to lose guest
-/// work** — every one measured is a type-11 surface whose guest pages hold its
-/// content, and `web-content-probe` reports 0 regions off their declared colour
-/// both with the gate and without it.
-///
-/// 400 MiB of steady-state VRAM for a 28 % reduction in an event with no
-/// demonstrated harm is not a smart trade. Revert this gate and keep the
-/// instruments, which are what caught it. The genuinely unsound case is the MRT
-/// secondary attachment — never pinned, never written back, re-served from pages
-/// that never held it — and that class needs its own instrument rather than a
-/// blanket policy that pays VRAM on every surface to protect one that may not
-/// even be in the set.
-///
-/// The one reading that survives independent of the gate: `resample_peak_ms`
-/// rose 2282 → 4076 → 6520 as residents were allowed to live longer, which is
-/// how the guest's true 6-10 s re-use interval was found. See
-/// [`IDLE_TARGET_AGE_MS`].
-const IDLE_DRAIN_PRESSURE_FLOOR: usize = REGISTRY_CAP / 2;
 /// Minimum wall-clock spacing between reclaim passes. The poll path calls the
 /// drain ~244×/s; without this it would empty the whole registry in well under a
 /// second. At `IDLE_TARGET_DRAIN_MAX_PER_CALL` per pass this bounds reclaim to
