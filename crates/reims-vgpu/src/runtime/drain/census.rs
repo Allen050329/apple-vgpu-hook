@@ -1500,14 +1500,41 @@ fn emit_engine_delta() {
 /// same identity — so it counts guest content destroyed, and a draw that later
 /// samples one refuses through `vk_draw_exec_sampled_resident_missing` with
 /// `prior=cap_evicted`.
+///
+/// # Why `resident_samples` is on this line
+///
+/// That refusal is the only harm reading this cap has, and it can only be
+/// reached from one place: the `SampledSource::Target` arm of the engine's
+/// sampled loop, which is also the sole increment of `sampled_gpu_binds`. So
+/// `sampled_gpu_binds` is the *denominator* of `sampled_resident_missing` — when
+/// it is zero, no draw bound a resident as a texture, nothing could have
+/// observed a destroyed one, and a zero missing-count is a null instrument
+/// rather than a pass.
+///
+/// This is not hypothetical. The cap was once driven six times over its bound on
+/// a compositing workload and reported `evicts=1591` against
+/// `sampled_resident_missing=0`, and that pair was read as evidence the LRU had
+/// protected the residents still being read. It could not have been: the LRU's
+/// recency bump (`registry_note_sampled_use`) is called from that same
+/// Target-only arm, and the same class of boot reports `sampled_gpu_binds=0`
+/// across every window measured. Neither the harm nor the protection against it
+/// was reachable on the workload that ran, so the experiment's success criterion
+/// could not have failed.
+///
+/// Emitting the denominator beside the pair is what stops that reading from
+/// being made again — `evicts=N missing=0` with `resident_samples=0` says the
+/// question was not asked, and only `resident_samples>0` makes the zero mean
+/// anything.
 #[cfg(feature = "backend-vulkan")]
 fn emit_registry_pressure(now: &crate::backend::vulkan::engine::CounterSnapshot) {
     crate::observe::off(format!(
-        "registry_pressure (levels, not per-interval) peak={} cap={} evicts={} peak_mib={}",
+        "registry_pressure (levels, not per-interval) peak={} cap={} evicts={} peak_mib={} \
+         resident_samples={}",
         now.registry_non_pinned_peak,
         crate::backend::vulkan::engine::REGISTRY_CAP,
         now.target_registry_cap_evictions,
         now.registry_non_pinned_peak_bytes >> 20,
+        now.sampled_gpu_binds,
     ));
 }
 
