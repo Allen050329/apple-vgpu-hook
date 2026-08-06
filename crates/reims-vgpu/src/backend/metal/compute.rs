@@ -946,28 +946,32 @@ pub fn compute_core(
     rc
 }
 
+/// The texture bindings a compute kernel's own reflection declares, as a list
+/// this function owns.
+///
+/// # Why the caller does not size this
+///
+/// This used to take `(*mut usage, usage_cap, *out_count)` and refuse with
+/// `..._capacity_exceeded` once the reflection named more bindings than the
+/// caller's buffer held. Both callers sized that buffer with a bare `32`, so a
+/// kernel declaring a 33rd texture had its whole dispatch refused — while
+/// [`REIMS_VGPU_METAL_MAX_TEXTURES`] is 128 and
+/// [`crate::runtime::draw::MAX_TEXTURE_BIND_SLOTS`] tells the rest of the device
+/// that 128 is bindable. That is a cap the guest cannot see, below the one it is
+/// told about, and losing a dispatch to it is not a limit any GPU has.
+///
+/// Nothing here crosses the C boundary — no shim names this function or
+/// `ReimsVgpuComputeTextureUsage` — so the out-pointer shape bought nothing, and
+/// the entry is already built as a `Vec` for [`reflect_insert`] regardless.
+/// Returning it leaves exactly one bound on this path: Metal's own 128-entry
+/// texture table, refused per *index* below.
 pub fn reflect_compute_textures_mtlb(
     mtlb: &[u8],
-    usages: *mut ReimsVgpuComputeTextureUsage,
-    usage_cap: usize,
-    out_usage_count: *mut usize,
     err: ErrOut<'_>,
-) -> Status {
-    if out_usage_count.is_null() {
-        set_err(err, "invalid compute texture reflection output");
-        return Status::args("metal_compute_reflection_count_output_missing");
-    }
-    if usages.is_null() && usage_cap != 0 {
-        set_err(err, "invalid compute texture reflection output");
-        return Status::args("metal_compute_reflection_usage_output_missing")
-            .field("usage_cap", usage_cap);
-    }
-    unsafe {
-        *out_usage_count = 0;
-    }
+) -> Result<Vec<ReimsVgpuComputeTextureUsage>, Status> {
     if mtlb.is_empty() {
         set_err(err, "compute MTLB is empty");
-        return Status::args("metal_compute_reflection_mtlb_empty");
+        return Err(Status::args("metal_compute_reflection_mtlb_empty"));
     }
 
     let key = BlobKey {
@@ -975,32 +979,17 @@ pub fn reflect_compute_textures_mtlb(
         len: mtlb.len(),
     };
     if let Some(cached) = reflect_lookup(&key) {
-        if cached.len() > usage_cap {
-            set_err(err, "too many compute texture bindings");
-            return Status::args("metal_compute_reflection_cached_capacity_exceeded")
-                .field("count", cached.len())
-                .field("capacity", usage_cap);
-        }
-        if !usages.is_null() && !cached.is_empty() {
-            unsafe {
-                ptr::copy_nonoverlapping(cached.as_ptr(), usages, cached.len());
-            }
-        }
-        unsafe {
-            *out_usage_count = cached.len();
-        }
         clear_err(err);
-        return Status::OK;
+        return Ok(cached);
     }
 
     let Some(device) = system_device() else {
         set_err(err, "MTLCreateSystemDefaultDevice returned nil");
-        return Status::execute("metal_compute_reflection_device_unavailable");
+        return Err(Status::execute(
+            "metal_compute_reflection_device_unavailable",
+        ));
     };
-    let function = match load_only_function(device, mtlb, "compute", err) {
-        Ok(f) => f,
-        Err(st) => return st,
-    };
+    let function = load_only_function(device, mtlb, "compute", err)?;
 
     // MTLPipelineOptionArgumentInfo == BindingInfo == 1
     let (pso, reflection) = match new_compute_pso_with_function_reflection(device, &function, 1) {
@@ -1010,14 +999,17 @@ pub fn reflect_compute_textures_mtlb(
                 .field("mtlb_hash", format!("{:#x}", key.hash))
                 .fail_once(key.hash);
             set_err(err, format!("compute reflection PSO failed: {e}"));
-            return Status::execute("metal_compute_reflection_pso_create_failed")
-                .field("mtlb_hash", key.hash);
+            return Err(
+                Status::execute("metal_compute_reflection_pso_create_failed")
+                    .field("mtlb_hash", key.hash),
+            );
         }
     };
     if reflection.is_null() {
         set_err(err, "compute pipeline reflection unavailable");
-        return Status::execute("metal_compute_reflection_unavailable")
-            .field("mtlb_hash", key.hash);
+        return Err(
+            Status::execute("metal_compute_reflection_unavailable").field("mtlb_hash", key.hash)
+        );
     }
 
     let bindings = reflection_bindings(reflection);
@@ -1038,8 +1030,10 @@ pub fn reflect_compute_textures_mtlb(
             BINDING_ACCESS_WRITE_ONLY => REIMS_VGPU_COMPUTE_TEXTURE_ACCESS_WRITE,
             other => {
                 set_err(err, format!("unsupported compute texture access {other}"));
-                return Status::args("metal_compute_reflection_texture_access_unsupported")
-                    .field("access", other);
+                return Err(
+                    Status::args("metal_compute_reflection_texture_access_unsupported")
+                        .field("access", other),
+                );
             }
         };
         for elem in 0..b.array_length {
@@ -1049,26 +1043,28 @@ pub fn reflect_compute_textures_mtlb(
                     err,
                     format!("compute texture index {texture_index} exceeds backend cap"),
                 );
-                return Status::args("metal_compute_reflection_texture_index_exceeded")
-                    .field("index", texture_index)
-                    .field("base", b.index)
-                    .field("limit", REIMS_VGPU_METAL_MAX_TEXTURES);
+                return Err(
+                    Status::args("metal_compute_reflection_texture_index_exceeded")
+                        .field("index", texture_index)
+                        .field("base", b.index)
+                        .field("limit", REIMS_VGPU_METAL_MAX_TEXTURES),
+                );
             }
             if seen[texture_index as usize] {
                 set_err(
                     err,
                     format!("duplicate compute texture binding {texture_index}"),
                 );
-                return Status::args("metal_compute_reflection_texture_binding_duplicate")
-                    .field("index", texture_index);
+                return Err(
+                    Status::args("metal_compute_reflection_texture_binding_duplicate")
+                        .field("index", texture_index),
+                );
             }
-            if local.len() >= REIMS_VGPU_METAL_MAX_TEXTURES || local.len() >= usage_cap {
-                set_err(err, "too many compute texture bindings");
-                return Status::args("metal_compute_reflection_texture_capacity_exceeded")
-                    .field("count", local.len())
-                    .field("backend_limit", REIMS_VGPU_METAL_MAX_TEXTURES)
-                    .field("caller_capacity", usage_cap);
-            }
+            // No length check on `local`: the index band above admits only
+            // `texture_index < REIMS_VGPU_METAL_MAX_TEXTURES` and `seen` refuses
+            // a repeat, so one push per distinct in-band index bounds this list
+            // at the table width by construction. The check that used to sit
+            // here compared the same width a second time and could not fire.
             seen[texture_index as usize] = true;
             local.push(ReimsVgpuComputeTextureUsage {
                 binding: REIMS_VGPU_BINDING_TEXTURE_BASE + texture_index as u32,
@@ -1078,17 +1074,9 @@ pub fn reflect_compute_textures_mtlb(
     }
 
     reflect_insert(key, local.clone());
-    if !usages.is_null() && !local.is_empty() {
-        unsafe {
-            ptr::copy_nonoverlapping(local.as_ptr(), usages, local.len());
-        }
-    }
-    unsafe {
-        *out_usage_count = local.len();
-    }
     clear_err(err);
     let _ = pso;
-    Status::OK
+    Ok(local)
 }
 
 unsafe fn msg_send_release(obj: *mut objc::runtime::Object) {
@@ -1148,6 +1136,48 @@ mod tests {
         assert_eq!(
             backing_refusal(&span),
             "metal_compute_test reason=metal_compute_backing_span_out_of_range class=args binding=7 len=5 offset=4 backing_len=8"
+        );
+    }
+
+    /// A reflection wider than any caller-side buffer is served whole.
+    ///
+    /// `reflect_compute_textures_mtlb` took an out-pointer and a capacity, and
+    /// both call sites passed a bare `32`; a kernel declaring a 33rd texture lost
+    /// its entire dispatch to `..._capacity_exceeded`, against the 128 the device
+    /// tells every other rail it binds. Drive the cached arm — which returns
+    /// before the function needs an `MTLDevice`, so this runs anywhere — with a
+    /// list well past the retired 32 and assert every entry comes back.
+    #[test]
+    fn a_reflection_past_the_retired_caller_capacity_is_served_whole() {
+        // Distinct from any real kernel blob, so this cannot collide with an
+        // entry another test in this process inserted.
+        let mtlb: Vec<u8> = (0..64u8).map(|b| b ^ 0xa5).collect();
+        let wide: Vec<ReimsVgpuComputeTextureUsage> = (0..REIMS_VGPU_METAL_MAX_TEXTURES as u32)
+            .map(|i| ReimsVgpuComputeTextureUsage {
+                binding: REIMS_VGPU_BINDING_TEXTURE_BASE + i,
+                access: REIMS_VGPU_COMPUTE_TEXTURE_ACCESS_READ,
+            })
+            .collect();
+        reflect_insert(
+            BlobKey {
+                hash: hash_bytes(&mtlb),
+                len: mtlb.len(),
+            },
+            wide.clone(),
+        );
+
+        let mut err_buf = [0i8; 256];
+        let served = reflect_compute_textures_mtlb(&mtlb, (err_buf.as_mut_ptr(), err_buf.len()))
+            .expect("a cached reflection is served without a device");
+        assert_eq!(
+            served.len(),
+            REIMS_VGPU_METAL_MAX_TEXTURES,
+            "every reflected binding is returned, not the first 32"
+        );
+        assert_eq!(
+            served.last().map(|u| u.binding),
+            wide.last().map(|u| u.binding),
+            "and the entries past the retired capacity are the ones reflected"
         );
     }
 }

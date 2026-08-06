@@ -874,26 +874,14 @@ fn apply_icb_compute_encoder_inheritance<M: HostMemory + HostOps>(
         } else {
             // --- Direct encoder binds (non-AB kernels; ICB-capable buffer-only PSO) ---
             if !acc.textures.is_empty() {
-                let mut usages = vec![
-                    crate::backend::metal::abi::ReimsVgpuComputeTextureUsage {
-                        binding: 0,
-                        access: 0,
-                    };
-                    32
-                ];
-                let mut usage_count = 0usize;
                 let mut err_buf = [0i8; 256];
-                let st = reflect_compute_textures_mtlb(
+                let usages = match reflect_compute_textures_mtlb(
                     &mtlb,
-                    usages.as_mut_ptr(),
-                    usages.len(),
-                    &mut usage_count,
                     (err_buf.as_mut_ptr(), err_buf.len()),
-                );
-                if !st.is_ok() {
-                    return Err(ComputeStatus::MetalBackend(st));
-                }
-                usages.truncate(usage_count);
+                ) {
+                    Ok(u) => u,
+                    Err(st) => return Err(ComputeStatus::MetalBackend(st)),
+                };
                 let mut staged_tex = Vec::new();
                 for t in &acc.textures {
                     if t.texture_ref == 0 {

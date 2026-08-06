@@ -4499,30 +4499,18 @@ fn execute_dispatch_metal<M: HostMemory + HostOps>(
     }
 
     // Texture reflection: access decides storage vs sampled materialization.
-    let mut usages = vec![
-        ReimsVgpuComputeTextureUsage {
-            binding: 0,
-            access: 0
-        };
-        32
-    ];
-    let mut usage_count = 0usize;
+    // The reflection owns its own list — no caller-side capacity, so a kernel
+    // declaring more bindings than some local buffer happened to hold is not a
+    // refused dispatch.
     let mut err_buf = [0i8; 256];
-    if !acc.textures.is_empty() {
-        let st = reflect_compute_textures_mtlb(
-            &mtlb,
-            usages.as_mut_ptr(),
-            usages.len(),
-            &mut usage_count,
-            (err_buf.as_mut_ptr(), err_buf.len()),
-        );
-        if !st.is_ok() {
-            return ComputeStatus::MetalBackend(st);
-        }
-        usages.truncate(usage_count);
+    let usages: Vec<ReimsVgpuComputeTextureUsage> = if acc.textures.is_empty() {
+        Vec::new()
     } else {
-        usages.clear();
-    }
+        match reflect_compute_textures_mtlb(&mtlb, (err_buf.as_mut_ptr(), err_buf.len())) {
+            Ok(u) => u,
+            Err(st) => return ComputeStatus::MetalBackend(st),
+        }
+    };
 
     let mut staged_tex: Vec<StagedTexture> = Vec::new();
     for t in &acc.textures {

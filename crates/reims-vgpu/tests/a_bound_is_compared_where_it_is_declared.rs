@@ -329,7 +329,8 @@ const RECORDED: &[Recorded] = &[
     },
     Recorded {
         name: "REIMS_VGPU_METAL_MAX_TEXTURES",
-        why: "index band in `util`, list capacity and a usage cap in `compute`",
+        why: "index band in `util`, and in `compute` the width of the `seen` array the \
+              reflection walk dedupes against",
     },
     Recorded {
         name: "REIMS_VGPU_METAL_MAX_SAMPLERS",
