@@ -21,7 +21,25 @@ pub const REIMS_VGPU_METAL_MAX_BUFFERS: usize = 31;
 /// (`spirv_bind::widen_sampled_bands`) so the texture band is 128 wide, and the
 /// band assertion below is what holds the two in step.
 pub const REIMS_VGPU_METAL_MAX_TEXTURES: usize = 128;
+/// The sampler argument table.
+///
+/// The only one of the three tables whose number stood alone. `MAX_ATTRS` is
+/// held equal to `decode::resource::MAX_VERTEX_ATTRS` and `MAX_BUFFERS` to
+/// `draw::MAX_BUFFER_BIND_SLOTS`, and both of those carry the derivation at
+/// their own declaration — so a reader of either arrives at a basis in one hop.
+/// This one was a bare `16` with a mask-width assertion under it, which bounds
+/// the number from above and says nothing about where it came from.
+///
+/// It is Apple's, and it is measured rather than asserted: their serializer
+/// truncates a plural sampler bind at 16 per stage, which
+/// [`bind_limit`](reims_vgpu_wire::ops::bind_limit::SAMPLER) captured by asking
+/// for 200 and reading back 16. The pin below is what makes that basis
+/// mechanical instead of a sentence — the capture and this table are one fact,
+/// and the failure if they part is a sampler this device refuses to bind and
+/// Apple's own driver would have.
 pub const REIMS_VGPU_METAL_MAX_SAMPLERS: usize = 16;
+const _: () =
+    assert!(REIMS_VGPU_METAL_MAX_SAMPLERS == reims_vgpu_wire::ops::bind_limit::SAMPLER as usize);
 /// The threadgroup-memory argument table.
 ///
 /// The one table here that is **not** also a serializer truncation limit.
