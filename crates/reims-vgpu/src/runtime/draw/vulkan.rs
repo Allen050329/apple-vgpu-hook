@@ -5132,7 +5132,12 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 "winding_unmapped",
             ),
             first_vertex: req.first_vertex,
-            instance_count: Some(req.instance_count.max(1)),
+            // Passed through. `decode::render`'s `wire_instance_count` is where
+            // a zero instance count is decided, and it is decided once — a
+            // second `.max(1)` here would re-apply that rule on this arm alone,
+            // so a change made at the decode site would appear to take effect
+            // everywhere while this path quietly kept the old answer.
+            instance_count: Some(req.instance_count),
             primitive_topology: raster_or_default(
                 Some(req.primitive_type),
                 translate::raster::primitive_topology,
@@ -5361,6 +5366,21 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
 
         // The engine ignores this when the draw is indexed (the index count
         // governs), but it still validates it, so it is passed either way.
+        //
+        // Unlike the instance count above, nothing upstream floors this one:
+        // `decode::render` narrows it to 32 bits and refuses an over-wide value
+        // by name, but a zero it decodes is a zero. So on a *non*-indexed draw
+        // this clamp is the guest's own `vertexCount:` overruled, and one vertex
+        // is drawn where none was asked for. Counted rather than changed,
+        // because which arm is right is not decidable from here: the engine
+        // validates the field it ignores, so passing a zero through would refuse
+        // indexed draws that are perfectly well formed.
+        //
+        // A firing is the signal, and it is the reading that would let this be
+        // scoped to the indexed case where the field is inert.
+        if req.vertex_count == 0 {
+            crate::runtime::drain::note_store_route("draw_vertex_count_zero");
+        }
         let vertex_count = req.vertex_count.max(1);
 
         // Decide FIRST whether a census line will be emitted at all; the

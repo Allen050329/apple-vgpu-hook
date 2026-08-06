@@ -69,8 +69,11 @@ fn narrow_count(value: u64) -> Result<u32, DecodeStatus> {
 /// Metal backend refuses the draw, the ICB path draws nothing.
 ///
 /// Because this is the single site, the count it guarantees is what let the
-/// three further `.max(1)`s downstream of it go: two in `runtime::exec` and one
-/// in `runtime::draw`, each re-applying a rule already applied here.
+/// four further `.max(1)`s downstream of it go: two in `runtime::exec`, one in
+/// `runtime::draw` and one in `runtime::draw::vulkan`, each re-applying a rule
+/// already applied here. The last of those outlived the sweep that claimed all
+/// of them, which is the failure mode a restatement has: it changes nothing
+/// until the rule it copies changes, and then it changes one arm.
 #[inline]
 fn wire_instance_count(value: u64) -> Result<u32, DecodeStatus> {
     let count = narrow_count(value)?;
