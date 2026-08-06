@@ -44,6 +44,15 @@ pub mod hash;
 /// and a `cfg` here would put those tests on the arm a Linux host cannot run.
 pub mod blob;
 
+/// `MTLRenderPipelineState` identity: the descriptor half, the shader half, and
+/// the compare that decides a cache hit.
+///
+/// Ungated for the third time by the same argument as [`hash`] and [`blob`], and
+/// this is the case that most needed it: the module's own tests had never
+/// executed on any host, and what they test is whether two different pipelines
+/// can be served as one.
+pub mod render_pso_key;
+
 #[cfg(feature = "backend-metal")]
 // `Status` is 264 bytes — six inline `(key, value)` fields, no allocation — and
 // it is the `Err` of most of this module's functions, so `result_large_err` and

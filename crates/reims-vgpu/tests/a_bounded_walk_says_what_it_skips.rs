@@ -127,10 +127,38 @@ const SKIPS: &[(&str, &str, usize, Skip, &str)] = &[
          DecodeStatus::ErrUnsupported(\"res_vertex_attr_count_over\") above \
          MAX_VERTEX_ATTRS rather than truncating, and a `const` assertion in \
          backend::metal::constants pins the two numbers equal — so `attrs` is \
-         never longer than the take. That pin is load-bearing beyond this walk: \
-         the key's hash and its PartialEq both index `0..attr_count` over arrays \
-         this wide, so a longer `attrs` would abort rather than truncate. 31 is \
-         MTLVertexDescriptor.attributes' own slot count",
+         never longer than the take. 31 is MTLVertexDescriptor.attributes' own \
+         slot count. This row used to add that the pin was load-bearing beyond \
+         the walk, because the key's hash and its equality both indexed \
+         `0..attr_count` over arrays this wide and a longer `attrs` would abort \
+         rather than truncate. It no longer is: those two walks moved to \
+         backend::render_pso_key and clamp themselves, and their rows are below",
+    ),
+    (
+        "reims-vgpu/src/backend/render_pso_key.rs",
+        "MAX_VERTEX_ATTRS",
+        1,
+        Skip::DeviceFilled,
+        "RenderPsoKey::active_attrs, the clamp the key's hash and its equality \
+         both walk to. It bounds an index into this device's own fixed-width \
+         arrays, not a read of the guest's attribute list — that list is \
+         refused above 31 by `parse_vertex_block` and truncated nowhere, and \
+         fill_render_pso_key never writes past the arrays regardless. What the \
+         clamp removes is an index panic: `attr_count` is stored untruncated on \
+         purpose, so the type itself permitted a count naming more slots than \
+         the arrays hold, held off only by a refusal in another module behind \
+         another crate feature. `attr_count` is still compared and folded \
+         exactly, so clamping the walk merges no two keys",
+    ),
+    (
+        "reims-vgpu/src/backend/render_pso_key.rs",
+        "PASS_MAX_COLOR_ATTACHMENTS",
+        1,
+        Skip::DeviceFilled,
+        "RenderPsoKey::active_colors, the attachment half of the same clamp over \
+         the same device-filled arrays. `color_count` is already `.min`ed by \
+         fill_render_pso_key, so unlike the attribute half this one has nothing \
+         to cut today; it is here so the two walks cannot diverge",
     ),
     (
         "reims-vgpu/src/backend/metal/render.rs",

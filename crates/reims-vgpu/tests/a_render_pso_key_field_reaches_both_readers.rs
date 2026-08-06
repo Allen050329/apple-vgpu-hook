@@ -138,10 +138,9 @@ fn key_fields(cache: &str) -> BTreeSet<String> {
 
 #[test]
 fn every_render_pso_key_field_reaches_both_readers() {
-    let cache = source("src/backend/metal/cache.rs");
-    let render = source("src/backend/metal/render.rs");
+    let key_module = source("src/backend/render_pso_key.rs");
 
-    let fields = key_fields(&cache);
+    let fields = key_fields(&key_module);
     // Self-check before believing anything: a scan that parsed zero fields would
     // report a perfectly covered key. The number is a floor, not a pin — adding
     // a field must not fail *here*, it must fail on the coverage assertions
@@ -154,29 +153,29 @@ fn every_render_pso_key_field_reaches_both_readers() {
     );
 
     let equal_body = between(
-        &cache,
+        &key_module,
         "pub fn equal(&self, other: &Self) -> bool {",
         "\n    }",
         "RenderPsoKey::equal",
     );
     let read_by_equal = fields_read(equal_body, "self");
 
-    // The fold runs inside `fill_render_pso_key` and ends by assigning its
-    // result, so the assignment is the terminator rather than a closing brace.
+    // The fold is `RenderPsoKey::rehash` and ends by assigning its result, so
+    // the assignment is the terminator rather than a closing brace.
     let hash_body = between(
-        &render,
+        &key_module,
         "let mut h = FNV_OFFSET_BASIS;",
-        "key.key_hash = h;",
+        "self.key_hash = h;",
         "the RenderPsoKey hash fold",
     );
-    let read_by_hash = fields_read(hash_body, "key");
+    let read_by_hash = fields_read(hash_body, "self");
 
     let missing_from_equal: Vec<&String> = fields.difference(&read_by_equal).collect();
     assert!(
         missing_from_equal.is_empty(),
         "these RenderPsoKey fields are never compared by `equal`, so two \
          pipelines differing only in one of them match in the cache. Add them to \
-         `equal` in src/backend/metal/cache.rs.\n\n{missing_from_equal:?}"
+         `equal` in src/backend/render_pso_key.rs.\n\n{missing_from_equal:?}"
     );
 
     // `key_hash` is the fold's output; everything else is its input.
@@ -189,8 +188,8 @@ fn every_render_pso_key_field_reaches_both_readers() {
          pipelines differing only in one of them share a bucket and rely \
          entirely on `equal` to tell them apart. That is true today and is not \
          the invariant: a field covered by one reader stops being covered the \
-         moment the other is narrowed. Fold them in `fill_render_pso_key` in \
-         src/backend/metal/render.rs.\n\n{missing_from_hash:?}"
+         moment the other is narrowed. Fold them in `RenderPsoKey::rehash` in \
+         src/backend/render_pso_key.rs.\n\n{missing_from_hash:?}"
     );
 
     // The other direction, cheap and worth having: a reader naming something the

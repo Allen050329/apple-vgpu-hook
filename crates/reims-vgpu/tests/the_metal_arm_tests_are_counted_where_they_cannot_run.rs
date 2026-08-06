@@ -73,7 +73,21 @@ use source_scan::{blank_comments, rust_sources, workspace_root};
 /// That is the shape to copy, and the second time it has paid: the reduction
 /// came from a *file* whose portable half was larger than its Metal half, not
 /// from picking off individual tests. Look for those.
-const METAL_ARM_TEST_FUNCTIONS: usize = 28;
+///
+/// # It went 28 → 26
+///
+/// The third time, and the one that was worth the most. `backend::metal::cache`
+/// declared `RenderPsoKey` — an `MTLRenderPipelineState`'s whole identity, and
+/// nothing in it named the `metal` crate — so its two tests, which ask whether
+/// two different pipelines can be served as one, had never executed on any
+/// machine. It moved to `backend::render_pso_key` and grew five more there.
+///
+/// What had pinned it inside the gate was two array widths spelled as
+/// `REIMS_VGPU_METAL_*` constants; each is `const`-asserted equal to a decoder
+/// bound that lives in an ungated module, and taking the widths from those was
+/// the whole of the move. Look for that shape too: a type held in here by a
+/// constant rather than by a dependency.
+const METAL_ARM_TEST_FUNCTIONS: usize = 26;
 
 #[test]
 fn the_metal_arm_test_functions_are_counted_because_this_build_may_not_run_them() {

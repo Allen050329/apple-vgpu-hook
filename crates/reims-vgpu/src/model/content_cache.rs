@@ -54,8 +54,8 @@
 //! # Why the lookup key is borrowed and the entry is not
 //!
 //! "The full identity compare" was once a claim about the shape rather than
-//! about the keys. [`CacheEntry::Key`] had no lifetime, so a key could only hold
-//! what a caller could afford to build on every lookup — and for a cache of
+//! about the keys. `CacheEntry`'s key type had no lifetime, so a key could only
+//! hold what a caller could afford to build on every lookup — and for a cache of
 //! compiled shader objects that ruled out the shader. Three of the six keys were
 //! a 64-bit FNV digest of a blob beside its length, with no copy of the blob
 //! retained anywhere, so `matches` compared two digests and a hit was one

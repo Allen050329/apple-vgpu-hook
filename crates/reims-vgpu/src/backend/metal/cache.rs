@@ -6,10 +6,9 @@ use crate::backend::metal::abi::{
     ReimsVgpuComputeStageInputDescriptor, ReimsVgpuComputeTextureUsage, ReimsVgpuDepthStencilState,
     ReimsVgpuSampler,
 };
-use crate::backend::metal::constants::*;
+use crate::backend::render_pso_key::{RenderPsoIdentity, RenderPsoLookup};
 use crate::contract::fnv::FNV_OFFSET_BASIS;
 use crate::model::content_cache::{CacheEntry, ContentCache};
-use crate::runtime::decode::resource::MTL_COLOR_WRITE_MASK_ALL;
 use metal::{ComputePipelineState, DepthStencilState, Function, RenderPipelineState, SamplerState};
 use parking_lot::Mutex;
 
@@ -18,211 +17,17 @@ pub struct FnEntry {
     pub function: Function,
 }
 
-/// Identity of a cached `MTLRenderPipelineState`.
+/// Where the identity of a cached `MTLRenderPipelineState` lives, and why it is
+/// not here.
 ///
-/// # The shader is identified by fingerprint, and the fingerprint is 64 bits
-///
-/// [`RenderPsoKey::equal`] compares `vert_hash`/`frag_hash` and the two lengths.
-/// **The shader bytes themselves are never compared** — they are not retained to
-/// compare against. So two distinct blobs of equal length whose
-/// [`crate::backend::hash::hash_bytes`] outputs collide are one pipeline as far as this
-/// cache is concerned, and a draw gets an `MTLRenderPipelineState` built from
-/// the other blob's shader. Nothing refuses; the frame is simply wrong.
-/// `render_key_hash_and_shader_lengths_are_identity_fields` pins that these
-/// really are the identity fields.
-///
-/// # The other backend has a written rule against exactly this
-///
-/// `backend::vulkan::engine::digest` opens "≥128-bit content digests for cache
-/// keys (never bare `DefaultHasher` u64 alone)", and
-/// `engine::pools::sampled_content_hash` quantifies why: once a cache matches a
-/// blob to a retained image "by this fingerprint alone — it no longer keeps a
-/// byte copy to `memcmp` against", the width has to make an accidental
-/// collision astronomically unlikely, which at 128 bits it puts at ~2^-116 over
-/// that cache. This cache meets that description and uses 64 bits of non-keyed
-/// FNV-1a. Neither site knew about the other.
-///
-/// # Every sibling hole has been fixed, and this is the last one
-///
-/// `runtime::m2v_cache` had the identical shape over AIR, and the three caches
-/// keyed on `crate::backend::blob::BlobKey` — functions, compute pipeline
-/// states, reflections — had it over `.mtlb`. All four now bucket on the digest
-/// and compare the bytes, which removes the class rather than moving the
-/// exponent, at one retained blob per distinct shader. The argument that it is
-/// affordable no longer needs making here: a `RenderPsoEntry` already retains an
-/// `MTLRenderPipelineState` compiled from these very blobs.
-///
-/// **The enabling step is done.** `render::fill_render_pso_key` — the only site
-/// in product code that builds one of these — used to close with
-/// `..Default::default()`, so a `vert_mtlb` field added to this struct would
-/// have been filled from `Default` at that site with nothing said. That literal
-/// is now exhaustive, as `render::RenderPsoKeyClone::clone_key` always was, and
-/// the compiler catches a new field at both.
-///
-/// What is left is to carry the bytes. `BlobIdentity`/`BlobKey` is the pair to
-/// carry them with, and the shape is the one the three siblings use: the entry
-/// retains, the lookup borrows. It wants one more move to be worth testing —
-/// this struct names nothing from the `metal` crate, so it belongs outside the
-/// gated tree for the reason [`crate::backend::hash`]'s declaration gives, and
-/// its two `#[test]`s below have never executed anywhere as a result. It reaches
-/// `REIMS_VGPU_METAL_MAX_ATTRS` and `REIMS_VGPU_METAL_MAX_COLOR_RTS` from a
-/// `constants` module that *does* name `metal`; both are `const`-asserted equal
-/// to a decoder bound in an ungated module, which is the seam to take.
-///
-/// What would settle the hazard's *size* rather than remove it: the live
-/// distinct-shader count sets the birthday bound and is a counter an Apple boot
-/// could read. Whether a collision is reachable at all is harder — equal-length
-/// collisions exist only above eight bytes, and finding one is a 2^32
-/// meet-in-the-middle, so this is not a hazard a test can demonstrate. The four
-/// fixes' tests do not try: each forces two entries into one bucket and asks
-/// through the real lookup, which is exactly the state a natural collision
-/// produces.
-pub struct RenderPsoKey {
-    pub key_hash: u64,
-    pub vert_hash: u64,
-    pub frag_hash: u64,
-    pub vert_len: usize,
-    pub frag_len: usize,
-    pub attr_count: u32,
-    pub attr_location: [u32; REIMS_VGPU_METAL_MAX_ATTRS],
-    pub attr_format: [u32; REIMS_VGPU_METAL_MAX_ATTRS],
-    pub attr_offset: [u32; REIMS_VGPU_METAL_MAX_ATTRS],
-    pub attr_buffer_index: [u32; REIMS_VGPU_METAL_MAX_ATTRS],
-    pub attr_stride: [u32; REIMS_VGPU_METAL_MAX_ATTRS],
-    /// Resolved step state, not the record's optionals: the caller has already
-    /// applied the absent-field defaults, so the presence bits that used to sit
-    /// beside these could only ever repeat what they had been folded into.
-    pub attr_step_function: [u32; REIMS_VGPU_METAL_MAX_ATTRS],
-    pub attr_step_rate: [u32; REIMS_VGPU_METAL_MAX_ATTRS],
-    pub blend_enable: u8,
-    pub blend_src_rgb: u32,
-    pub blend_dst_rgb: u32,
-    pub blend_op_rgb: u32,
-    pub blend_src_alpha: u32,
-    pub blend_dst_alpha: u32,
-    pub blend_op_alpha: u32,
-    /// Number of active color RTs (`0..=REIMS_VGPU_METAL_MAX_COLOR_RTS`). Slot
-    /// `i` uses `color_formats[i]` — backticked because a bare `[i]` is link
-    /// syntax, and rustdoc was reporting an unresolved link to `i`. The sibling
-    /// field below already spelled it this way.
-    pub color_count: u32,
-    pub color_formats: [u32; REIMS_VGPU_METAL_MAX_COLOR_RTS],
-    pub color_slot: [u8; REIMS_VGPU_METAL_MAX_COLOR_RTS],
-    /// Per-RT blend enable + factors (aligned with color_count entries).
-    pub color_blend_enable: [u8; REIMS_VGPU_METAL_MAX_COLOR_RTS],
-    pub color_blend_src_rgb: [u32; REIMS_VGPU_METAL_MAX_COLOR_RTS],
-    pub color_blend_dst_rgb: [u32; REIMS_VGPU_METAL_MAX_COLOR_RTS],
-    pub color_blend_op_rgb: [u32; REIMS_VGPU_METAL_MAX_COLOR_RTS],
-    pub color_blend_src_alpha: [u32; REIMS_VGPU_METAL_MAX_COLOR_RTS],
-    pub color_blend_dst_alpha: [u32; REIMS_VGPU_METAL_MAX_COLOR_RTS],
-    pub color_blend_op_alpha: [u32; REIMS_VGPU_METAL_MAX_COLOR_RTS],
-    /// Per-RT `MTLColorWriteMask`, in Metal's own bit order.
-    ///
-    /// Outside the `color_blend_*` group on purpose: the mask applies whether
-    /// or not the slot blends, so it is keyed and applied unconditionally
-    /// while the blend fields are only meaningful under
-    /// `color_blend_enable[i]`.
-    pub color_write_mask: [u32; REIMS_VGPU_METAL_MAX_COLOR_RTS],
-    pub depth_pixel_format: u32,
-    pub stencil_pixel_format: u32,
-}
-
-impl Default for RenderPsoKey {
-    fn default() -> Self {
-        Self {
-            key_hash: 0,
-            vert_hash: 0,
-            frag_hash: 0,
-            vert_len: 0,
-            frag_len: 0,
-            attr_count: 0,
-            attr_location: [0; REIMS_VGPU_METAL_MAX_ATTRS],
-            attr_format: [0; REIMS_VGPU_METAL_MAX_ATTRS],
-            attr_offset: [0; REIMS_VGPU_METAL_MAX_ATTRS],
-            attr_buffer_index: [0; REIMS_VGPU_METAL_MAX_ATTRS],
-            attr_stride: [0; REIMS_VGPU_METAL_MAX_ATTRS],
-            attr_step_function: [0; REIMS_VGPU_METAL_MAX_ATTRS],
-            attr_step_rate: [0; REIMS_VGPU_METAL_MAX_ATTRS],
-            blend_enable: 0,
-            blend_src_rgb: 0,
-            blend_dst_rgb: 0,
-            blend_op_rgb: 0,
-            blend_src_alpha: 0,
-            blend_dst_alpha: 0,
-            blend_op_alpha: 0,
-            color_count: 0,
-            color_formats: [0; REIMS_VGPU_METAL_MAX_COLOR_RTS],
-            color_slot: [0; REIMS_VGPU_METAL_MAX_COLOR_RTS],
-            color_blend_enable: [0; REIMS_VGPU_METAL_MAX_COLOR_RTS],
-            color_blend_src_rgb: [0; REIMS_VGPU_METAL_MAX_COLOR_RTS],
-            color_blend_dst_rgb: [0; REIMS_VGPU_METAL_MAX_COLOR_RTS],
-            color_blend_op_rgb: [0; REIMS_VGPU_METAL_MAX_COLOR_RTS],
-            color_blend_src_alpha: [0; REIMS_VGPU_METAL_MAX_COLOR_RTS],
-            color_blend_dst_alpha: [0; REIMS_VGPU_METAL_MAX_COLOR_RTS],
-            color_blend_op_alpha: [0; REIMS_VGPU_METAL_MAX_COLOR_RTS],
-            // `MTLColorWriteMaskAll`. Zero here would mean a default-built key
-            // describes a pipeline that writes no channel at all.
-            color_write_mask: [MTL_COLOR_WRITE_MASK_ALL; REIMS_VGPU_METAL_MAX_COLOR_RTS],
-            depth_pixel_format: 0,
-            stencil_pixel_format: 0,
-        }
-    }
-}
-
-impl RenderPsoKey {
-    pub fn equal(&self, other: &Self) -> bool {
-        if self.key_hash != other.key_hash
-            || self.vert_hash != other.vert_hash
-            || self.frag_hash != other.frag_hash
-            || self.vert_len != other.vert_len
-            || self.frag_len != other.frag_len
-            || self.attr_count != other.attr_count
-            || self.blend_enable != other.blend_enable
-            || self.blend_src_rgb != other.blend_src_rgb
-            || self.blend_dst_rgb != other.blend_dst_rgb
-            || self.blend_op_rgb != other.blend_op_rgb
-            || self.blend_src_alpha != other.blend_src_alpha
-            || self.blend_dst_alpha != other.blend_dst_alpha
-            || self.blend_op_alpha != other.blend_op_alpha
-            || self.color_count != other.color_count
-            || self.depth_pixel_format != other.depth_pixel_format
-            || self.stencil_pixel_format != other.stencil_pixel_format
-        {
-            return false;
-        }
-        for i in 0..self.color_count as usize {
-            if self.color_formats[i] != other.color_formats[i]
-                || self.color_slot[i] != other.color_slot[i]
-                || self.color_blend_enable[i] != other.color_blend_enable[i]
-                || self.color_blend_src_rgb[i] != other.color_blend_src_rgb[i]
-                || self.color_blend_dst_rgb[i] != other.color_blend_dst_rgb[i]
-                || self.color_blend_op_rgb[i] != other.color_blend_op_rgb[i]
-                || self.color_blend_src_alpha[i] != other.color_blend_src_alpha[i]
-                || self.color_blend_dst_alpha[i] != other.color_blend_dst_alpha[i]
-                || self.color_blend_op_alpha[i] != other.color_blend_op_alpha[i]
-                || self.color_write_mask[i] != other.color_write_mask[i]
-            {
-                return false;
-            }
-        }
-        for i in 0..self.attr_count as usize {
-            if self.attr_location[i] != other.attr_location[i]
-                || self.attr_format[i] != other.attr_format[i]
-                || self.attr_offset[i] != other.attr_offset[i]
-                || self.attr_buffer_index[i] != other.attr_buffer_index[i]
-                || self.attr_stride[i] != other.attr_stride[i]
-                || self.attr_step_function[i] != other.attr_step_function[i]
-                || self.attr_step_rate[i] != other.attr_step_rate[i]
-            {
-                return false;
-            }
-        }
-        true
-    }
-}
-
+/// [`crate::backend::render_pso_key`] owns `RenderPsoKey`, `RenderPsoLookup` and
+/// `RenderPsoIdentity`. It is out of this module because nothing in it names the
+/// `metal` crate and this module does not compile on a Linux host, so its tests
+/// — the ones asking whether two different pipelines can be served as one — ran
+/// nowhere while they sat here. This type is what is left: the identity beside
+/// the objects Metal built from it.
 pub struct RenderPsoEntry {
-    pub key: RenderPsoKey,
+    pub id: RenderPsoIdentity,
     pub pso: RenderPipelineState,
     pub frag_sampler_mask: u32,
     pub vert_sampler_mask: u32,
@@ -375,20 +180,15 @@ impl CacheEntry for ComputePsoEntry {
 }
 
 impl CacheEntry for RenderPsoEntry {
-    /// Borrowed, unlike the sampler and depth-stencil keys beside it: this one
-    /// is thirty-three fields wide, so an owned lookup key would copy every
-    /// array on every scan step.
-    type Key<'a> = &'a RenderPsoKey;
-    fn lookup_key(&self) -> &RenderPsoKey {
-        &self.key
+    type Key<'a> = RenderPsoLookup<'a>;
+    fn lookup_key(&self) -> RenderPsoLookup<'_> {
+        self.id.as_lookup()
     }
-    fn matches(&self, key: &&RenderPsoKey) -> bool {
-        self.key.equal(key)
+    fn matches(&self, key: &RenderPsoLookup<'_>) -> bool {
+        self.id.is(key)
     }
-    /// The key hash the descriptor is already folded into. `equal` still
-    /// decides the hit; this only chooses which entries it is asked about.
-    fn bucket(key: &&RenderPsoKey) -> u64 {
-        key.key_hash
+    fn bucket(key: &RenderPsoLookup<'_>) -> u64 {
+        key.bucket()
     }
 }
 
@@ -520,23 +320,23 @@ pub fn compute_pso_insert(
     })
 }
 
-pub fn render_pso_lookup(key: &RenderPsoKey) -> Option<(RenderPipelineState, u32, u32)> {
+pub fn render_pso_lookup(key: &RenderPsoLookup<'_>) -> Option<(RenderPipelineState, u32, u32)> {
     with_caches(|c| {
         c.render_pso
-            .find(&key)
+            .find(key)
             .map(|e| (e.pso.clone(), e.vert_sampler_mask, e.frag_sampler_mask))
     })
 }
 
 pub fn render_pso_insert(
-    key: RenderPsoKey,
+    key: &RenderPsoLookup<'_>,
     pso: RenderPipelineState,
     vert_mask: u32,
     frag_mask: u32,
 ) -> (RenderPipelineState, u32, u32) {
     with_caches(|c| {
         let entry = c.render_pso.insert_unique(RenderPsoEntry {
-            key,
+            id: RenderPsoIdentity::of(key),
             pso,
             frag_sampler_mask: frag_mask,
             vert_sampler_mask: vert_mask,
@@ -595,51 +395,6 @@ pub fn reflect_insert(key: &BlobKey<'_>, usages: Vec<ReimsVgpuComputeTextureUsag
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn render_key_compares_only_active_attachment_and_attribute_prefixes() {
-        let mut left = RenderPsoKey::default();
-        let mut right = RenderPsoKey::default();
-
-        left.color_formats[7] = 70;
-        right.color_formats[7] = 71;
-        left.attr_location[30] = 30;
-        right.attr_location[30] = 31;
-        assert!(left.equal(&right), "inactive cache-key tails are ignored");
-
-        left.color_count = 8;
-        right.color_count = 8;
-        assert!(
-            !left.equal(&right),
-            "an active attachment must affect equality"
-        );
-        right.color_formats[7] = left.color_formats[7];
-        left.attr_count = 31;
-        right.attr_count = 31;
-        assert!(
-            !left.equal(&right),
-            "an active attribute must affect equality"
-        );
-        right.attr_location[30] = left.attr_location[30];
-        assert!(left.equal(&right));
-    }
-
-    #[test]
-    fn render_key_hash_and_shader_lengths_are_identity_fields() {
-        let base = RenderPsoKey::default();
-        let mutations: [fn(&mut RenderPsoKey); 5] = [
-            |key| key.key_hash = 1,
-            |key| key.vert_hash = 1,
-            |key| key.frag_hash = 1,
-            |key| key.vert_len = 1,
-            |key| key.frag_len = 1,
-        ];
-        for mutate in mutations {
-            let mut changed = RenderPsoKey::default();
-            mutate(&mut changed);
-            assert!(!base.equal(&changed));
-        }
-    }
 
     #[test]
     fn depth_stencil_cache_key_covers_both_faces() {

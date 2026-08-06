@@ -1,10 +1,11 @@
 //! Render encode path: PSO cache, stage-in, textured, fixed-function state.
 
-use crate::backend::hash::{hash_bytes, hash_u64};
+use crate::backend::blob::BlobKey;
+use crate::backend::hash::hash_bytes;
 use crate::backend::metal::abi::*;
 use crate::backend::metal::cache::{
     depth_stencil_insert, depth_stencil_lookup, render_pso_insert, render_pso_lookup,
-    DepthStencilKey, RenderPsoKey,
+    DepthStencilKey,
 };
 use crate::backend::metal::constants::*;
 use crate::backend::metal::format::mtl_pixel_format_bpp;
@@ -19,8 +20,8 @@ use crate::backend::metal::util::{
     bytes_of, clear_err, sampler_index, set_err, texture_index, valid_buffer_binding, ErrOut,
     Status,
 };
+use crate::backend::render_pso_key::{RenderPsoKey, RenderPsoLookup};
 use crate::contract::extent::tight_image_bytes;
-use crate::contract::fnv::FNV_OFFSET_BASIS;
 use crate::contract::vertex_step::{step_rate_in_contract, MTL_VERTEX_STEP_FUNCTION_PER_INSTANCE};
 use crate::runtime::decode::resource::MTL_COLOR_WRITE_MASK_ALL;
 use foreign_types::ForeignType;
@@ -531,16 +532,13 @@ pub struct ColorRtKey {
 // Every argument is one component of the pipeline-state key, and the point of
 // the function is that the key is built from exactly these and nothing else.
 //
-// The two shader modules arrive as slices rather than as the four
-// `(hash, len)` words they contribute. Those words are each derived from one of
-// these two slices and are only correct paired with the slice they came from, so
-// deriving them here is what makes `hash_bytes(vert) , frag.len()` unspellable —
-// a mispairing that compiles, keys a pipeline nobody asked for, and then serves
-// it out of the cache to every draw with the same wrong key.
-#[allow(clippy::too_many_arguments)]
+// The two shader modules are not among them any more. They used to arrive here
+// as slices and leave as four `(hash, len)` words folded into the key, which is
+// the shape `backend::render_pso_key` explains was wrong: a digest with no
+// retained bytes decides two pipelines are one. They now travel to the cache as
+// `BlobKey`s beside this descriptor, so there is no pairing left for this
+// function to get wrong and no reason for it to see a shader at all.
 fn fill_render_pso_key(
-    vert_mtlb: &[u8],
-    frag_mtlb: &[u8],
     attrs: &[ReimsVgpuVertexAttr],
     blend: Option<&ReimsVgpuBlendState>,
     color_rts: &[ColorRtKey],
@@ -560,10 +558,6 @@ fn fill_render_pso_key(
         // Overwritten at the bottom with the fold over every field below. Zero
         // here would be a bucket, not a key, if that fold were ever removed.
         key_hash: 0,
-        vert_hash: hash_bytes(vert_mtlb),
-        frag_hash: hash_bytes(frag_mtlb),
-        vert_len: vert_mtlb.len(),
-        frag_len: frag_mtlb.len(),
         // Untruncated on purpose; see `REIMS_VGPU_METAL_MAX_ATTRS`.
         attr_count: attrs.len() as u32,
         attr_location: [0; REIMS_VGPU_METAL_MAX_ATTRS],
@@ -650,46 +644,7 @@ fn fill_render_pso_key(
     key.depth_pixel_format = depth_pixel_format;
     key.stencil_pixel_format = stencil_pixel_format;
 
-    let mut h = FNV_OFFSET_BASIS;
-    // Folded off the key's own fields rather than off parallel locals, so the
-    // hash cannot describe a key different from the one it is returned with.
-    h = hash_u64(h, key.vert_hash);
-    h = hash_u64(h, key.frag_hash);
-    h = hash_u64(h, key.vert_len as u64);
-    h = hash_u64(h, key.frag_len as u64);
-    h = hash_u64(h, key.attr_count as u64);
-    for i in 0..key.attr_count as usize {
-        h = hash_u64(h, key.attr_location[i] as u64);
-        h = hash_u64(h, key.attr_format[i] as u64);
-        h = hash_u64(h, key.attr_offset[i] as u64);
-        h = hash_u64(h, key.attr_buffer_index[i] as u64);
-        h = hash_u64(h, key.attr_stride[i] as u64);
-        h = hash_u64(h, key.attr_step_function[i] as u64);
-        h = hash_u64(h, key.attr_step_rate[i] as u64);
-    }
-    h = hash_u64(h, key.blend_enable as u64);
-    h = hash_u64(h, key.blend_src_rgb as u64);
-    h = hash_u64(h, key.blend_dst_rgb as u64);
-    h = hash_u64(h, key.blend_op_rgb as u64);
-    h = hash_u64(h, key.blend_src_alpha as u64);
-    h = hash_u64(h, key.blend_dst_alpha as u64);
-    h = hash_u64(h, key.blend_op_alpha as u64);
-    h = hash_u64(h, key.color_count as u64);
-    for i in 0..key.color_count as usize {
-        h = hash_u64(h, key.color_slot[i] as u64);
-        h = hash_u64(h, key.color_formats[i] as u64);
-        h = hash_u64(h, key.color_blend_enable[i] as u64);
-        h = hash_u64(h, key.color_blend_src_rgb[i] as u64);
-        h = hash_u64(h, key.color_blend_dst_rgb[i] as u64);
-        h = hash_u64(h, key.color_blend_op_rgb[i] as u64);
-        h = hash_u64(h, key.color_blend_src_alpha[i] as u64);
-        h = hash_u64(h, key.color_blend_dst_alpha[i] as u64);
-        h = hash_u64(h, key.color_blend_op_alpha[i] as u64);
-        h = hash_u64(h, key.color_write_mask[i] as u64);
-    }
-    h = hash_u64(h, key.depth_pixel_format as u64);
-    h = hash_u64(h, key.stencil_pixel_format as u64);
-    key.key_hash = h;
+    key.rehash();
     key
 }
 
@@ -698,12 +653,13 @@ fn get_render_pipeline_state(
     vertex: &Function,
     fragment: &Function,
     vertex_descriptor: Option<&VertexDescriptor>,
-    key: &RenderPsoKey,
+    lookup: &RenderPsoLookup<'_>,
     err: ErrOut<'_>,
 ) -> Result<(RenderPipelineState, u32, u32), Status> {
-    if let Some(hit) = render_pso_lookup(key) {
+    if let Some(hit) = render_pso_lookup(lookup) {
         return Ok(hit);
     }
+    let key = lookup.desc;
 
     let pipeline_descriptor = RenderPipelineDescriptor::new();
     pipeline_descriptor.set_vertex_function(Some(vertex));
@@ -789,57 +745,7 @@ fn get_render_pipeline_state(
     let vert_mask = render_reflection_sampler_mask(reflection_ptr, true);
     let frag_mask = render_reflection_sampler_mask(reflection_ptr, false);
 
-    Ok(render_pso_insert(
-        key.clone_key(),
-        pso,
-        vert_mask,
-        frag_mask,
-    ))
-}
-
-// RenderPsoKey is not Clone by default with arrays — add helper.
-trait RenderPsoKeyClone {
-    fn clone_key(&self) -> RenderPsoKey;
-}
-
-impl RenderPsoKeyClone for RenderPsoKey {
-    fn clone_key(&self) -> RenderPsoKey {
-        RenderPsoKey {
-            key_hash: self.key_hash,
-            vert_hash: self.vert_hash,
-            frag_hash: self.frag_hash,
-            vert_len: self.vert_len,
-            frag_len: self.frag_len,
-            attr_count: self.attr_count,
-            attr_location: self.attr_location,
-            attr_format: self.attr_format,
-            attr_offset: self.attr_offset,
-            attr_buffer_index: self.attr_buffer_index,
-            attr_stride: self.attr_stride,
-            attr_step_function: self.attr_step_function,
-            attr_step_rate: self.attr_step_rate,
-            blend_enable: self.blend_enable,
-            blend_src_rgb: self.blend_src_rgb,
-            blend_dst_rgb: self.blend_dst_rgb,
-            blend_op_rgb: self.blend_op_rgb,
-            blend_src_alpha: self.blend_src_alpha,
-            blend_dst_alpha: self.blend_dst_alpha,
-            blend_op_alpha: self.blend_op_alpha,
-            color_count: self.color_count,
-            color_formats: self.color_formats,
-            color_slot: self.color_slot,
-            color_blend_enable: self.color_blend_enable,
-            color_blend_src_rgb: self.color_blend_src_rgb,
-            color_blend_dst_rgb: self.color_blend_dst_rgb,
-            color_blend_op_rgb: self.color_blend_op_rgb,
-            color_blend_src_alpha: self.color_blend_src_alpha,
-            color_blend_dst_alpha: self.color_blend_dst_alpha,
-            color_blend_op_alpha: self.color_blend_op_alpha,
-            color_write_mask: self.color_write_mask,
-            depth_pixel_format: self.depth_pixel_format,
-            stencil_pixel_format: self.stencil_pixel_format,
-        }
-    }
+    Ok(render_pso_insert(lookup, pso, vert_mask, frag_mask))
 }
 
 fn bind_storage_buffers(
@@ -1846,8 +1752,6 @@ pub fn render_core_mrt(
         })
         .collect();
     let pso_key = fill_render_pso_key(
-        vert_mtlb,
-        frag_mtlb,
         attrs,
         blend,
         &color_rt_keys,
@@ -1860,12 +1764,19 @@ pub fn render_core_mrt(
             .map(|s| s.pixel_format)
             .unwrap_or(0),
     );
+    // The shaders join the descriptor here rather than inside it: the cache
+    // retains their bytes and compares them, so they must reach it as bytes.
+    let pso_lookup = RenderPsoLookup {
+        desc: &pso_key,
+        vert: BlobKey::new(vert_mtlb),
+        frag: BlobKey::new(frag_mtlb),
+    };
     let (pso, vert_sampler_mask, frag_sampler_mask) = match get_render_pipeline_state(
         device,
         &vertex,
         &fragment,
         vertex_descriptor.as_ref(),
-        &pso_key,
+        &pso_lookup,
         err,
     ) {
         Ok(v) => v,
