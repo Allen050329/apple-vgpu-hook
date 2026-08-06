@@ -85,6 +85,37 @@ pub fn tight_image_bytes(width: u32, height: u32, bytes_per_pixel: usize) -> Opt
         .ok()
 }
 
+/// [`tight_image_bytes`] for an array texture: `layers` slices, tightly packed.
+///
+/// Separate from [`tight_image_bytes`] rather than a `layers` parameter on it
+/// because most callers size a single 2D image and a `1` threaded through every
+/// one of them is a value that will eventually be wrong at one site. `layers ==
+/// 0` is `None` for the reason the other axes are: an array texture with no
+/// slices is a geometry no caller here can act on, and a `0` length passes every
+/// "does the guest's buffer hold this" check there is.
+///
+/// The checked multiply is the point. `width as usize * height as usize` already
+/// widens its operands, which reads as safe and is — but only just: two `u32`s
+/// at their maximum multiply to a hair under `u64::MAX`, so **one more factor
+/// overflows**, and both a layer count and a bytes-per-texel are exactly that
+/// third factor. `backend::vulkan::engine::exec`'s `validate_v1` had both, where
+/// an overflow panic would have aborted the process from inside the function
+/// whose whole job is to survive a malformed request.
+pub fn tight_layered_image_bytes(
+    width: u32,
+    height: u32,
+    layers: u32,
+    bytes_per_texel: usize,
+) -> Option<usize> {
+    if layers == 0 {
+        return None;
+    }
+    (tight_image_bytes(width, height, bytes_per_texel)? as u64)
+        .checked_mul(u64::from(layers))?
+        .try_into()
+        .ok()
+}
+
 /// [`tight_image_bytes`] together with the row stride it implies, as one pair.
 ///
 /// For the callers that hand a buffer to a texel-copy API. Such a call is given
@@ -140,8 +171,56 @@ mod tests {
         let (bgra_stride, _) = tight_image_layout(1920, 1080, RGBA8_BPP).expect("valid");
         let (_, r8_len) = tight_image_layout(1920, 1080, R8_BPP).expect("valid");
         assert!(
-            r8_len < bgra_stride as usize * 1080,
-            "pairing them across formats under-allocates, which is the bug"
+            bgra_stride as usize * 1080 > r8_len,
+            "pairing one format's stride with another's length reads past the end"
+        );
+    }
+
+    /// Two `u32` maxima all but exhaust a `u64`, so any third factor overflows.
+    ///
+    /// The measurement behind both this function and
+    /// [`tight_image_bytes`]: `u32::MAX * u32::MAX` is 18446744065119617025
+    /// against a `u64::MAX` of 18446744073709551615 — under it by less than nine
+    /// billion, which is to say by nothing. That is why widening the operands is
+    /// not the fix here and a checked multiply is: `w as usize * h as usize`
+    /// looks careful and survives only because nothing else is multiplied in.
+    /// A layer count or a bytes-per-texel is that something else.
+    #[test]
+    fn a_third_factor_is_refused_rather_than_wrapped() {
+        assert_eq!(
+            u64::from(u32::MAX) * u64::from(u32::MAX),
+            18_446_744_065_119_617_025,
+            "the headroom this function exists because of"
+        );
+        // Two axes alone still fit, at one byte per texel.
+        assert!(tight_image_bytes(u32::MAX, u32::MAX, 1).is_some());
+        // A third factor does not, however it arrives.
+        assert_eq!(tight_image_bytes(u32::MAX, u32::MAX, 2), None);
+        assert_eq!(
+            tight_layered_image_bytes(u32::MAX, u32::MAX, 2, 1),
+            None,
+            "a second layer is the same third factor"
+        );
+        assert_eq!(
+            tight_layered_image_bytes(65536, 65536, 1, 4),
+            Some(65536 * 65536 * 4),
+            "the geometry that wraps a u32 product is representable here"
+        );
+    }
+
+    /// A zero on any axis, including the layer count, is not a zero-length image.
+    ///
+    /// Every caller is a check of the form "does the guest's buffer hold this",
+    /// and a `Some(0)` passes all of them.
+    #[test]
+    fn a_layered_image_with_no_slices_has_no_length() {
+        assert_eq!(tight_layered_image_bytes(64, 64, 0, 4), None);
+        assert_eq!(tight_layered_image_bytes(0, 64, 6, 4), None);
+        assert_eq!(tight_layered_image_bytes(64, 0, 6, 4), None);
+        assert_eq!(tight_layered_image_bytes(64, 64, 6, 0), None);
+        assert_eq!(
+            tight_layered_image_bytes(64, 64, 6, 4),
+            Some(64 * 64 * 6 * 4)
         );
     }
 

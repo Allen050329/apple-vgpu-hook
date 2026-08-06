@@ -534,7 +534,27 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
         }
     }
     if let Some(target) = &req.target_rgba8 {
-        let expected = req.width as usize * req.height as usize * 4;
+        // The seed is one tightly-packed RGBA8 slice of the target, and the
+        // length is checked rather than taken. `w as usize * h as usize` widens
+        // its operands, which reads as safe and is — but only just: two u32
+        // maxima multiply to a hair under u64::MAX, so the bytes-per-texel is a
+        // third factor that overflows. A refusal rather than a clamp, because
+        // this length is what the next line compares the buffer against and a
+        // wrapped one would let a short buffer match.
+        let Some(expected) = crate::contract::extent::tight_image_bytes(
+            req.width,
+            req.height,
+            crate::contract::pixel_format::RGBA8_BPP as usize,
+        ) else {
+            return Err(DrawError::DrawValidation(
+                DrawValidationDecline::UnrepresentableImageBytes {
+                    width: req.width,
+                    height: req.height,
+                    layers: 1,
+                    bytes_per_texel: crate::contract::pixel_format::RGBA8_BPP,
+                },
+            ));
+        };
         if target.len() != expected {
             return Err(DrawError::DrawValidation(
                 DrawValidationDecline::TargetSeedLength {
@@ -812,7 +832,24 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
             ));
         };
         let texel = texel as usize;
-        let expected = image.width as usize * image.height as usize * image.layers as usize * texel;
+        // Four factors, so the widening the operands already carry is not
+        // enough — see the target-seed check above for why two of them exhaust
+        // a u64 on their own. `contract::extent` owns the checked form.
+        let Some(expected) = crate::contract::extent::tight_layered_image_bytes(
+            image.width,
+            image.height,
+            image.layers,
+            texel,
+        ) else {
+            return Err(DrawError::DrawValidation(
+                DrawValidationDecline::UnrepresentableImageBytes {
+                    width: image.width,
+                    height: image.height,
+                    layers: image.layers,
+                    bytes_per_texel: texel as u32,
+                },
+            ));
+        };
         match &image.source {
             SampledSource::Bytes(bytes) if bytes.len() != expected => {
                 return Err(DrawError::DrawValidation(
@@ -3264,6 +3301,65 @@ mod tests {
     fn guest_runs_tight_total_validates() {
         let req = guest_run_req(1240, 622, 1240 * 622 * 4, 0);
         assert!(validate_v1(&req).is_ok());
+    }
+
+    /// A geometry whose byte length has no `usize` is refused, not multiplied.
+    ///
+    /// Both sites took the product straight, and both had enough factors to
+    /// overflow: `w as usize * h as usize` widens its operands and still leaves
+    /// room for nothing else, because two `u32` maxima come within nine billion
+    /// of exhausting a `u64` by themselves. In a debug build that is a panic
+    /// raised **inside the validator**, from the request it was handed to
+    /// survive; in a release build it wraps, and the wrapped length is what the
+    /// very next line compares a buffer against, so a short buffer matches.
+    ///
+    /// Both arms are asserted here because they are different expressions in
+    /// different functions and only one of them has a layer count.
+    #[test]
+    fn a_geometry_with_no_representable_length_is_refused_by_name() {
+        let mut req = guest_run_req(1240, 622, 1240 * 622 * 4, 0);
+        // The sampled arm: four factors, and `layers` is the one that tips it.
+        // `arrayed`, because a non-array image with layers != 1 is refused
+        // earlier and would never reach the multiplication.
+        req.sampled_images[0].arrayed = true;
+        req.sampled_images[0].width = u32::MAX;
+        req.sampled_images[0].height = u32::MAX;
+        req.sampled_images[0].layers = u32::MAX;
+        assert_eq!(
+            validation_slug(&req),
+            "vk_draw_validate_unrepresentable_image_bytes"
+        );
+
+        // The target-seed arm, reached before the sampled one, so the geometry
+        // above is left at a size that validates.
+        let mut req = guest_run_req(1240, 622, 1240 * 622 * 4, 0);
+        req.width = u32::MAX;
+        req.height = u32::MAX;
+        req.target_rgba8 = Some(std::sync::Arc::new(vec![0u8; 4]));
+        assert_eq!(
+            validation_slug(&req),
+            "vk_draw_validate_unrepresentable_image_bytes"
+        );
+    }
+
+    /// The refusal must not have swallowed the length check it replaced.
+    ///
+    /// A `let Some(_) = … else { decline }` in front of a comparison is the
+    /// shape where the comparison quietly stops running, and the seed-length
+    /// check is the one thing standing between a short buffer and a read past
+    /// its end.
+    #[test]
+    fn a_representable_geometry_still_has_its_seed_length_checked() {
+        let mut req = guest_run_req(4, 4, 4 * 4 * 4, 0);
+        req.target_rgba8 = Some(std::sync::Arc::new(vec![0u8; 4 * 4 * 4]));
+        assert!(validate_v1(&req).is_ok(), "an exactly-sized seed is fine");
+
+        req.target_rgba8 = Some(std::sync::Arc::new(vec![0u8; 4 * 4 * 4 - 1]));
+        assert_eq!(
+            validation_slug(&req),
+            "vk_draw_validate_target_seed_length",
+            "a seed one byte short must still be caught"
+        );
     }
 
     /// The Safari content-layer case: width 1240, guest stride 1280 texels.
