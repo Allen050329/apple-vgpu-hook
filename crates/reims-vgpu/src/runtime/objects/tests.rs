@@ -825,6 +825,64 @@ fn the_outstanding_census_names_the_oldest_refusal_and_is_otherwise_silent() {
     );
 }
 
+/// A retried refusal and an abandoned one must not read the same.
+///
+/// The distinction the census exists to make, and the one it could not make for
+/// two sessions. A surface the device asks for every frame and is refused every
+/// frame is losing guest work; a surface it asked for once and never again is
+/// one the guest stopped presenting. Both sit in the latch as `n=1`.
+///
+/// The trap this pins: `note_type4_fail` refreshes its timestamp on a repeat, so
+/// `oldest_ms` alone reads **backwards** — a live retry holds it near zero and
+/// an abandoned refusal lets it grow with the clock. `attempts` is what makes
+/// the line state which of the two it is without anyone re-deriving that.
+#[test]
+fn a_retried_type4_refusal_counts_its_attempts_and_an_abandoned_one_does_not() {
+    let sid = 0x4d3u32;
+    let gva = 0x4188000u64;
+    clear_type4_fail(sid, gva);
+    let is_mine = |line: &Option<String>| {
+        line.as_ref()
+            .is_some_and(|l| l.contains(&format!("sid={sid} ")))
+    };
+
+    // Asked once and refused.
+    defer_type4_fail(sid, "translate", Some(gva), "first refusal".into());
+    flush_type4_fail(sid);
+    let line = type4_backing_outstanding_census().expect("a latched refusal is censused");
+    if is_mine(&Some(line.clone())) {
+        assert!(
+            line.contains("attempts=1"),
+            "one refusal is one attempt: {line}"
+        );
+        assert!(
+            line.contains("since_last_ms=") && line.contains("oldest_ms="),
+            "both ages travel, or `attempts` cannot be placed in time: {line}"
+        );
+    }
+
+    // Asked again and refused again, four more times. The fail channel stays
+    // quiet — this is the per-present path and one line a frame would flood it
+    // — so the count is the only thing saying the device is still trying.
+    for _ in 0..4 {
+        defer_type4_fail(sid, "translate", Some(gva), "retry refusal".into());
+        flush_type4_fail(sid);
+    }
+    let line = type4_backing_outstanding_census().expect("still latched");
+    if is_mine(&Some(line.clone())) {
+        assert!(
+            line.contains("attempts=5"),
+            "four retries after the first must be counted, not deduped away: {line}"
+        );
+    }
+
+    clear_type4_fail(sid, gva);
+    assert!(
+        !is_mine(&type4_backing_outstanding_census()),
+        "the latch re-arms once the surface backs"
+    );
+}
+
 #[test]
 fn a_type4_refusal_the_next_attach_resolves_is_reported_as_recovered() {
     fn log_mark() -> usize {

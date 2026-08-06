@@ -97,7 +97,16 @@ fn clear_type11_fail(task_id: u32, ref_: u32) {
 #[derive(Clone, Copy)]
 struct ReportedType4Fail {
     gva: Option<u64>,
-    at_ms: u64,
+    /// When this refusal was first raised. **Never refreshed**, so its age is
+    /// how long the surface has been unbacked.
+    first_at_ms: u64,
+    /// When the device last asked for this backing and was refused again. Its
+    /// age is how long since anything asked at all.
+    last_at_ms: u64,
+    /// How many times the device has asked and been refused, the first
+    /// included. The whole point of the pair: see
+    /// [`type4_backing_outstanding_census`].
+    attempts: u32,
 }
 
 type Type4FailLatch = std::collections::HashMap<(u32, &'static str), ReportedType4Fail>;
@@ -111,11 +120,26 @@ fn type4_fail_latch() -> &'static std::sync::Mutex<Type4FailLatch> {
 fn note_type4_fail(surface_id: u32, reason: &'static str, gva: Option<u64>, detail: String) {
     let at_ms = crate::observe::elapsed_ms() as u64;
     let mut guard = type4_fail_latch().lock().unwrap_or_else(|e| e.into_inner());
-    if guard
-        .insert((surface_id, reason), ReportedType4Fail { gva, at_ms })
-        .is_none()
-    {
-        crate::observe::fail(detail);
+    match guard.entry((surface_id, reason)) {
+        std::collections::hash_map::Entry::Occupied(mut slot) => {
+            // A repeat is the retry the design asks for, and it stays quiet on
+            // the fail channel — `apply_type4_backing` is the per-present path
+            // and one line per frame would flood. It is counted instead, which
+            // is what makes the silence readable.
+            let held = slot.get_mut();
+            held.gva = gva;
+            held.last_at_ms = at_ms;
+            held.attempts = held.attempts.saturating_add(1);
+        }
+        std::collections::hash_map::Entry::Vacant(slot) => {
+            slot.insert(ReportedType4Fail {
+                gva,
+                first_at_ms: at_ms,
+                last_at_ms: at_ms,
+                attempts: 1,
+            });
+            crate::observe::fail(detail);
+        }
     }
 }
 
@@ -247,7 +271,7 @@ fn clear_type4_fail(surface_id: u32, backed_gva: u64) {
                 return true;
             }
             if reported.gva == Some(backed_gva) {
-                out.push((*reason, reported.at_ms));
+                out.push((*reason, reported.first_at_ms));
             } else {
                 // Dropped without being claimed: this surface backed, but at a
                 // different address than the refusal named — the guest
@@ -303,9 +327,28 @@ fn clear_type4_fail(surface_id: u32, backed_gva: u64) {
 /// recoveries than refusals now has a line to check instead of a hand-matched
 /// diff of backing GVAs, which is how this hole was found.
 ///
-/// `oldest_ms` is the age of the longest-outstanding refusal, not a count. A
-/// boot ending with `n=1 oldest_ms=12` is a refusal caught mid-retry; the same
-/// boot with `oldest_ms=83000` is a surface this device never backed.
+/// # Reading the three numbers, because two of them used to say the opposite
+///
+/// `oldest_ms` is the age of the longest-outstanding refusal's **first** raise,
+/// `since_last_ms` the age of the most recent one, and `attempts` how many times
+/// the device has asked. Together they separate the two states a bare count
+/// cannot:
+///
+/// - `attempts` climbing, `since_last_ms` near zero — the device is asking every
+///   frame and being refused every frame. **This is the one that is lost guest
+///   work**, and every present for that surface is painting stale or black.
+/// - `attempts=1`, `since_last_ms` tracking `oldest_ms` — the device asked once,
+///   was refused, and **nothing has asked since**. `apply_type4_backing` is
+///   reached from the per-present path, so nothing asking means nothing is
+///   presenting that surface: the guest is done with it. Nothing is lost.
+///
+/// This carried one number, `oldest_ms`, and its doc read it exactly backwards —
+/// "`oldest_ms=12` is a refusal caught mid-retry; `oldest_ms=83000` is a surface
+/// this device never backed". [`note_type4_fail`] used a plain `insert`, so a
+/// retry *overwrote* the timestamp: an actively-retried refusal pins that age
+/// near zero forever, and a large one means the retries stopped. The sentence
+/// had it the wrong way round for both states, which is why the reading below
+/// went unmade across three boots.
 ///
 /// Silent when the latch is empty, because an empty latch is the expected state
 /// and this rides a one-second cadence.
@@ -328,15 +371,29 @@ fn clear_type4_fail(surface_id: u32, backed_gva: u64) {
 /// flight and the other is a surface that was never backed, and the count alone
 /// cannot tell them apart.
 ///
-/// The standing reading, reproducible rather than incidental: two driven boots
-/// each end with exactly one outstanding refusal, both `sid=27`, both
-/// `reason=translate st=zero-pfn pte=0x0`, both a 2-3 page surface, at two
-/// different backings. Neither boot lost a pixel the probe could measure. What
-/// is *not* established is whether the guest abandoned the surface or the retry
-/// never came: [`clear_type4_fail`] fires at the next successful **use** of the
-/// backing, so for the last refusal of a boot "no line" and "no further use" are
-/// the same silence. Separating them needs a signal at the point of abandonment,
-/// which does not exist.
+/// # The standing `sid=27` reading, and what it turned out to be
+///
+/// Three driven boots each ended with exactly one outstanding refusal, every
+/// time `sid=27`, `reason=translate st=zero-pfn pte=0x0`, a 2-3 page surface, at
+/// a different backing each boot. It was carried as an open question across two
+/// sessions: abandoned by the guest, or a retry that never came?
+///
+/// **Abandoned.** It is answerable from the third boot's own census series
+/// without any new signal, once `insert`'s refresh is accounted for. The 23
+/// `type4_backing_outstanding` lines run `oldest_ms` 204 → 22242 while `t` runs
+/// 401037 → 423075: the two deltas are **equal at every sample**, 22038 apiece.
+/// A timestamp that tracks wall clock exactly is a timestamp nothing refreshed,
+/// so the device asked once, at t=400833, and never again.
+///
+/// The surface agrees. `sid=27` is 93×21 and then 99×29 — a tooltip — set up at
+/// t≈26 s and untouched for the following six minutes. `zero-pfn` says the
+/// guest's own leaf PTE is empty: it took the backing away. Nothing presented it
+/// afterwards, which is why nothing asked again.
+///
+/// `attempts` is in the line so this costs a glance rather than an afternoon,
+/// and so the *other* state — a surface retried every frame and refused every
+/// frame — is not mistaken for it. That one is real lost work and this boot does
+/// not contain one.
 pub(crate) fn type4_backing_outstanding_census() -> Option<String> {
     let now = crate::observe::elapsed_ms() as u64;
     let guard = type4_fail_latch().lock().unwrap_or_else(|e| e.into_inner());
@@ -344,15 +401,22 @@ pub(crate) fn type4_backing_outstanding_census() -> Option<String> {
     // be a retry still in flight, and a single line cannot carry them all.
     let oldest = guard
         .iter()
-        .min_by_key(|(_, reported)| reported.at_ms)
-        .map(|((sid, reason), reported)| (*sid, *reason, reported.gva, reported.at_ms))?;
-    let (sid, reason, gva, at_ms) = oldest;
+        .min_by_key(|(_, reported)| reported.first_at_ms)
+        .map(|((sid, reason), reported)| (*sid, *reason, *reported))?;
+    let (sid, reason, held) = oldest;
     Some(format!(
-        "type4_backing_outstanding n={} oldest_ms={} sid={sid} reason={reason} gva={}",
+        "type4_backing_outstanding n={} oldest_ms={} since_last_ms={} attempts={} \
+         sid={sid} reason={reason} gva={}",
         guard.len(),
-        now.saturating_sub(at_ms),
-        gva.map_or_else(|| "none".to_string(), |g| format!("{g:#x}"))
+        now.saturating_sub(held.first_at_ms),
+        now.saturating_sub(held.last_at_ms),
+        held.attempts,
+        gva_text(held.gva),
     ))
+}
+
+fn gva_text(gva: Option<u64>) -> String {
+    gva.map_or_else(|| "none".to_string(), |g| format!("{g:#x}"))
 }
 
 /// Wire object type for surface / IOSurface backing (x86 Tahoe/Ventura).
