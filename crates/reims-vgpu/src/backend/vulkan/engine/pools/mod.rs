@@ -808,6 +808,20 @@ struct ResidentStorageImageSlot {
     /// object it belonged to. Not cleared by an unpin: `flush_storage_one`'s
     /// abort path and `lifecycle`'s window-cleared path both unpin without
     /// having written anything.
+    ///
+    /// # What it costs is not yet known on a workload that would show it
+    ///
+    /// Driven x86/PCI boot, `web-content-probe -n 10 --churn 1`, quiesced host:
+    /// `cs_sole_copy=1/0mib`, `cs_cap_no_victim=0`, `compute_storage_evicts=0`.
+    /// One protected resident under a megabyte, and the cap never wanted it.
+    ///
+    /// **Read that as "not exercised", not as "free".** A browser page is not a
+    /// compute workload, and one resident against a 64 cap says the registry was
+    /// nearly empty for the whole run. The reading that would mean something
+    /// comes from a guest doing sustained compute — a video decode or filter
+    /// chain — and `cs_sole_copy` against `COMPUTE_STORAGE_REGISTRY_CAP` is what
+    /// to look at when one is available. `cs_cap_no_victim` rising is the signal
+    /// that this protection has started to bind.
     gpu_only_content: bool,
     /// Value of `ResourcePools::idle_clock_ms` (wall-clock ms) at this resident's
     /// last use (admit or `acquire_resident_storage_image` hit). The idle drain
