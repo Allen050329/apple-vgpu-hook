@@ -596,6 +596,57 @@ pub const DEVICE_INFO_KEY_NATIVE_FP16: u32 = 9;
 /// [`protocol_dual_plane_textures`].
 pub const DEVICE_INFO_KEY_DUAL_PLANE_TEXTURES: u32 = 12;
 
+/// Wire key 7 — whether the guest may read the framebuffer inside a fragment
+/// shader (`isFramebufferReadSupported`).
+///
+/// Read as a **byte**, not a word, so any value whose low byte is zero reads as
+/// false however large the `u32` is. Same for keys 8 and 9.
+pub const DEVICE_INFO_KEY_FRAMEBUFFER_READ: u32 = 7;
+
+/// Wire key 8 — `isRGB10A2GammaSupported`. A byte, like key 7.
+pub const DEVICE_INFO_KEY_RGB10A2_GAMMA: u32 = 8;
+
+/// Wire key 13 — `linearTextureAlignmentBytes`, the alignment the guest applies
+/// when it builds a linear texture over a buffer.
+///
+/// **Arithmetic, not a boolean.** The guest computes with this number; absent,
+/// it uses 16. Whatever this device publishes is what the guest's rows are laid
+/// out on, so it is a promise about what this device can address rather than a
+/// capability it can decline later.
+///
+/// Distinct from [`crate::contract::iosurface_pages::ROW_BYTES_ALIGN`], which is
+/// an IOSurface row estimate for counting pages and is deliberately not a pitch.
+/// Do not relate the two: one is Metal's linear-texture rule and the other is
+/// IOSurface's allocator, and nothing says they are the same number.
+pub const DEVICE_INFO_KEY_LINEAR_TEXTURE_ALIGN: u32 = 13;
+
+/// Wire key 14 — one of the three terms of the guest's `supportsHeaps`.
+///
+/// The guest answers `supportsHeaps` with `key14 != 0 && key16 != 0 && f`, where
+/// `f` is a feature bool selected by the negotiated protocol version. So neither
+/// key alone turns heaps on and neither alone turns them off; what key 14
+/// separately means, if anything, is **not established**.
+pub const DEVICE_INFO_KEY_HEAPS: u32 = 14;
+
+/// Wire key 15 — the granularity `heapBufferSizeAndAlignWithLength:options:`
+/// rounds a heap buffer up to, and returns as its alignment.
+///
+/// Arithmetic again, and absent it is 256. This device publishes something
+/// *smaller* than that fallback, which is the direction that asks more of the
+/// host: a guest told 32 may place heap buffers 32 bytes apart.
+pub const DEVICE_INFO_KEY_HEAP_BUFFER_GRANULARITY: u32 = 15;
+
+/// Wire key 16 — whether a heap may back a texture.
+///
+/// Zero makes the guest's `[MTLHeap newTextureWithDescriptor:]` return nil
+/// outright, so this is the key that decides whether heap textures exist at all.
+/// Also the second term of `supportsHeaps`; see [`DEVICE_INFO_KEY_HEAPS`].
+pub const DEVICE_INFO_KEY_HEAP_TEXTURES: u32 = 16;
+
+/// Wire key 17 — `supportsBufferWithIOSurface`, gated on a protocol-version
+/// feature bool as well.
+pub const DEVICE_INFO_KEY_BUFFER_WITH_IOSURFACE: u32 = 17;
+
 /// Wire key 10 — the **serializer feature version**, and the widest-reaching
 /// number in this table after the protocol version itself.
 ///
@@ -742,6 +793,27 @@ pub fn device_info_caps(limits: &DeviceInfoLimits, version: u32) -> Vec<(u32, u3
 /// for another. `reply_device_info` writes the zero terminator, which is what
 /// stops the guest walking the rest of the page.
 ///
+/// # Every key at or below 17 is named, and that is a rule rather than tidiness
+///
+/// The guest's walker is a jump table with one arm per key, and each arm stores
+/// into a distinct field of a capability struct its Metal plugin then answers
+/// from. So a value here is not a description of this device — it is an
+/// **instruction to the guest** about what it may build, and one it cannot
+/// re-ask about later. Key 11 is what that costs when it is left as a number:
+/// it read `1023` from a capture for as long as this table existed, which
+/// authorised four primitive types both backends refuse, and nothing said so
+/// because the entry was a pair of integers.
+///
+/// A new entry at or below 17 therefore gets a `DEVICE_INFO_KEY_*` constant
+/// whose doc says what the guest does with it. Above 17 the guest discards the
+/// pair, so a bare number there promises nothing.
+///
+/// **Key 0 is not a key.** It terminates the walk and discards every remaining
+/// pair, so an entry keyed 0 would silently truncate this table at its position.
+/// `no_key_in_the_table_terminates_the_guest_walk` refuses one. A code span
+/// rather than a link: rustdoc documents no `cfg(test)` item, so a link to a
+/// test cannot resolve on any arm and reads as rot in the intra-doc pass.
+///
 /// The GPU-dependent subset is not served from here directly: see
 /// [`device_info_caps`].
 pub const DEVICE_INFO_CAPS: &[(u32, u32)] = &[
@@ -751,8 +823,8 @@ pub const DEVICE_INFO_CAPS: &[(u32, u32)] = &[
     (4, 1024),
     (5, 64),
     (6, 32768),
-    (7, 1),
-    (8, 1),
+    (DEVICE_INFO_KEY_FRAMEBUFFER_READ, 1),
+    (DEVICE_INFO_KEY_RGB10A2_GAMMA, 1),
     (9, 1),
     (
         DEVICE_INFO_KEY_SERIALIZER_VERSION,
@@ -763,11 +835,11 @@ pub const DEVICE_INFO_CAPS: &[(u32, u32)] = &[
         crate::contract::draw::EXECUTABLE_PRIMITIVE_TYPES,
     ),
     (12, 1),
-    (13, 256),
-    (14, 1),
-    (15, 32),
-    (16, 1),
-    (17, 1),
+    (DEVICE_INFO_KEY_LINEAR_TEXTURE_ALIGN, 256),
+    (DEVICE_INFO_KEY_HEAPS, 1),
+    (DEVICE_INFO_KEY_HEAP_BUFFER_GRANULARITY, 32),
+    (DEVICE_INFO_KEY_HEAP_TEXTURES, 1),
+    (DEVICE_INFO_KEY_BUFFER_WITH_IOSURFACE, 1),
     (18, 131079),
     (19, 1),
     (21, 1),
@@ -970,6 +1042,26 @@ mod tests {
                 served[&key], table[&key],
                 "key {key} must not depend on host"
             );
+        }
+    }
+
+    /// No entry is keyed 0, and no key repeats.
+    ///
+    /// Zero is the walk's terminator, not a key: the guest's jump table sends it
+    /// to a `ret`, so a `(0, x)` pair here would discard every pair after it and
+    /// the loss would be invisible from this side — the reply is well formed and
+    /// shorter than intended. A duplicate is the milder version of the same
+    /// thing: the later arm overwrites the earlier field with no complaint from
+    /// either end.
+    ///
+    /// Neither is expressible as a `const` assertion over a slice of tuples, so
+    /// this is a test rather than a build failure.
+    #[test]
+    fn no_key_in_the_table_terminates_the_guest_walk() {
+        let mut seen = std::collections::BTreeSet::new();
+        for &(key, _) in DEVICE_INFO_CAPS {
+            assert_ne!(key, 0, "key 0 ends the guest's walk; it cannot be an entry");
+            assert!(seen.insert(key), "key {key} appears twice");
         }
     }
 
