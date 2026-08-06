@@ -1121,7 +1121,8 @@ pub const MAX_VERTEX_LAYOUTS: usize = 31;
 /// Named for the same reason [`ColorAttachTableTruncated`] is, and it is the
 /// sibling this decoder was missing: the colour-attachment table 500 lines below
 /// has reported its truncation since it was written, while the two loops here
-/// bounded themselves with a bare `break` and an `if` and said nothing.
+/// bounded themselves with a bare `break` and an `if` and said nothing. That
+/// constant's doc carries the boot both were measured on; both read zero.
 struct VertexDescriptorTruncated {
     /// Which array overflowed.
     what: &'static str,
@@ -2313,7 +2314,15 @@ fn parse_one_color_entry(
 ///
 /// Named because the alternative is indistinguishable downstream from a guest
 /// that declared fewer attachments, which is the shape a wrong blend or a
-/// missing render target would arrive in.
+/// missing render target would arrive in. Each of the three now refuses the
+/// descriptor after emitting this, so the line stands beside a refusal rather
+/// than beside a pipeline that was built anyway.
+///
+/// A healthy zero on this workload. A driven x86/Vulkan boot — Safari window
+/// drag, 25 s, ~500 draws/s, desktop and window compositing on screen — read
+/// this, [`ColorAttachIndexOutOfRange`] and [`VertexDescriptorTruncated`] all
+/// unfired, with no `desc_decode` refusal from any exit. The refusals cost that
+/// boot nothing; a firing is the bug.
 struct ColorAttachTableTruncated {
     /// `None` when the section header itself did not fit, so the count was never
     /// readable and an unknown number of attachments were lost.
