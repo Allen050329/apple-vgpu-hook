@@ -88,6 +88,35 @@ pub const EFI_STRIDE_ALIGNMENT: u32 = 64;
 pub const EFI_DISPLAY_PORT_COUNT: u32 = 1;
 pub const EFI_BUILTIN_CONNECTED: u32 = 1;
 
+/// How many channel ids this device has state for, including the root FIFO.
+///
+/// # 32 has headroom, and that is measured rather than assumed
+///
+/// The guest driver does not allocate channels; it **enumerates** them, and
+/// every one comes from one of exactly two places:
+///
+/// * four fixed channels the accelerator creates at setup, with their ids as
+///   immediates — 1 `Exec`, 2 `Immediate`, 3 `Uploads`, 4 `Downloads` — alongside
+///   the root FIFO at 0, which does not use a child register block at all;
+/// * one per display pipe, at `pipe_index + 5`, where the pipe index is bounded
+///   by the driver's own `index <= 7`.
+///
+/// So the highest id this guest can ever ring is **12**, and no path allocates,
+/// reuses or pools an id. Command queues do not get their own: every queue binds
+/// the one accelerator-wide `Exec` channel, so the count does not scale with
+/// processes, Metal devices or submissions.
+///
+/// The pipe count is the only negotiated half, and it is negotiated *downwards*:
+/// the guest reads [`GFX_REG_EFI_DISPLAY_PORTS`] and clamps it into `1..=8`
+/// itself, so this device cannot widen the range by advertising more. At the
+/// [`EFI_DISPLAY_PORT_COUNT`] published here it creates channels 0..=5.
+///
+/// The bound is therefore not tight, and it is not load-bearing either — see
+/// [`accept_child_channel`] for what a refusal past it would cost. It is pinned
+/// from above by the three `u32` masks below and from *use* by the layout of the
+/// root page, which has room for `(page_size - CHILD_REG_BLOCK_OFFSET) /
+/// CHILD_REG_BLOCK_STRIDE` blocks — 153 on a 4 KiB page — and which the guest
+/// indexes with no bound check of its own.
 pub const MAX_CHANNELS: usize = 32;
 
 /// `active_child_mask`, `pending.child_mask` and `child_doorbell_rung` are each
@@ -125,15 +154,12 @@ pub const fn is_child_channel(channel_id: u32) -> bool {
 /// ring forever, which is a stalled channel rather than a dropped record and so
 /// does not even look like corruption from the guest's side.
 ///
-/// `MAX_CHANNELS` is a bound this device imposes, not one the protocol states.
-/// It is pinned from above by the three `u32` masks that carry one bit per
-/// channel (see the assert beside the constant), while the MMIO child register
-/// blocks — `0x400 + (ch - 1) * 0x14` inside a `GFX_MMIO_SIZE` of `0x4000` —
-/// have room for far more, and `DEVICE_INFO_CAPS` advertises no channel count
-/// for the guest to read. So nothing tells a guest that 32 is the limit, and
-/// nothing in this device could tell whether one has ever crossed it. That is
-/// what this reports, and widening the constant is a question for after a boot
-/// answers it rather than before.
+/// `MAX_CHANNELS` is a bound this device imposes, not one the protocol states,
+/// and nothing tells a guest what it is: `DEVICE_INFO_CAPS` advertises no
+/// channel count, and the register blocks the guest indexes are inside its own
+/// root page rather than in this device's MMIO window. What bounds a guest in
+/// practice is its own enumeration, which stops at id 12 — see
+/// [`MAX_CHANNELS`]. This report is what would say that reading had gone stale.
 ///
 /// Latched per channel id, so a guest hammering one out-of-range doorbell costs
 /// one line rather than one per ring; the census route counts every occurrence.

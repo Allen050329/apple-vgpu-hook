@@ -143,24 +143,49 @@ pub const INVENTORY: &[ClassInventory] = &[
 /// sat here as refused, and both selectors emit the moment their gate is on.
 ///
 /// The render encoder carries a second, larger instance, and this doc is where
-/// it is written down because nothing executable catches it yet. Eight of the
-/// rows below are structured as *"if the device supports OpenGL, emit; otherwise
-/// assert"* — the assertion the oracle observed is the else-branch of a
-/// capability test, and behind it each has a fixed opcode and body:
-/// `setAlphaTestReferenceValue:` `0x8a`, `setPointSize:` `0x8b`,
-/// `setClipPlane:p2:p3:p4:atIndex:` `0x8c`, `setViewportTransformEnabled:`
-/// `0x8f`, `setProvokingVertexMode:` `0x90`, `setPrimitiveRestartEnabled:index:`
-/// `0x91`, `setTriangleFrontFillMode:backFillMode:` `0x92`,
-/// `setTransformFeedbackState:` `0x93`.
+/// it is written down because nothing executable catches it yet. **Fifteen**
+/// selectors on it are structured as *"if the serializer supports OpenGL, emit;
+/// otherwise assert"* — the assertion the oracle observed is the else-branch of
+/// a capability test — and behind the gate each has a fixed opcode and a fixed
+/// body:
+///
+/// | opcode | selector | body |
+/// |---|---|---|
+/// | `0x8a` | `setAlphaTestReferenceValue:` | 4 |
+/// | `0x8b` | `setPointSize:` | 4 |
+/// | `0x8c` | `setClipPlane:p2:p3:p4:atIndex:` | 20 |
+/// | `0x8d` | `setVertexSamplerState:lodMinClamp:lodMaxClamp:lodBias:atIndex:` | 20 |
+/// | `0x8e` | `setFragmentSamplerState:lodMinClamp:lodMaxClamp:lodBias:atIndex:` | 20 |
+/// | `0x8f` | `setViewportTransformEnabled:` | 4 |
+/// | `0x90` | `setProvokingVertexMode:` | 4 |
+/// | `0x91` | `setPrimitiveRestartEnabled:index:` | 8 |
+/// | `0x92` | `setTriangleFrontFillMode:backFillMode:` | 4 |
+/// | `0x93` | `setTransformFeedbackState:` | 4 |
+/// | `0x94` | `setDepthCleared` | 0 |
+/// | `0x95` | `setStencilCleared` | 0 |
+/// | `0x96` | `setColorResolveTexture:slice:depthPlane:level:yInvert:atIndex:` | 16 |
+/// | `0x97` | `setDepthResolveTexture:slice:depthPlane:level:yInvert:` | 12 |
+/// | `0x98` | `setStencilResolveTexture:slice:depthPlane:level:yInvert:` | 12 |
+///
+/// A prior version of this paragraph listed eight. The seven it missed are the
+/// ones whose row is absent from `INVENTORY` for the reason this module's own
+/// doc now states — the manifest cannot see a selector, and its rule is that
+/// absent means non-existent.
 ///
 /// They stay `Excluded` here rather than being promoted on that reading: this
 /// crate's rule is that a row's opcode comes from a capture, and no capture has
 /// run with that gate on. What the reading does establish is that the *reason*
 /// is wrong — these are gated, not refused — so
 /// `every_capability_gated_selector_names_the_flag_that_unlocks_it` cannot see
-/// them, and a guest on an OpenGL-compatibility path would send eight render
-/// states this device does not decode. Two of them, primitive restart and
-/// two-sided fill mode, change what a draw produces. They would reach
+/// them.
+///
+/// **The gate is on.** The flag is the serializer's feature version, which the
+/// device publishes as `reims_vgpu::model::DEVICE_INFO_KEY_SERIALIZER_VERSION`
+/// and which unlocks OpenGL at rung 6; this device sends 8. So these fifteen are
+/// records a guest on an OpenGL-compatibility path *will* send and this device
+/// does not decode. Four of them change what a draw produces — primitive
+/// restart, two-sided fill mode, and the two sampler binds that carry an LOD
+/// bias — and three more name multisample resolve targets. They reach
 /// `runtime::exec`'s unimplemented-opcode report rather than vanish, which is
 /// the one part of this that is already right.
 pub const REFUSED_BY_SERIALIZER: &str =
