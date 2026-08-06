@@ -2287,3 +2287,57 @@ fn an_undeclared_dispatch_type_is_named_and_counted_before_it_becomes_serial() {
         "the line is deduped per value; the count is not"
     );
 }
+
+/// A stage-input the decoder had to truncate must refuse its pipeline, not
+/// arrive as "this kernel declares no stage-input".
+///
+/// The two were one `None` for as long as the caps could be crossed. The
+/// consequence is not only a wrong Metal PSO: on the Vulkan arm
+/// `dispatch_compute_vulkan` refuses any pipeline whose `stage_input.is_some()`,
+/// so collapsing `OverCap` into `Absent` is what lets an unsupported dispatch
+/// through the one guard that exists for it.
+#[test]
+fn a_truncated_stage_input_is_not_the_same_as_an_absent_one() {
+    use crate::runtime::decode::resource::{ComputeStageInputAttribute, ComputeStageInputLayout};
+
+    assert_eq!(classify_stage_input(None), StageInputVerdict::Absent);
+
+    let empty = ComputeStageInputDescriptor::default();
+    assert_eq!(
+        classify_stage_input(Some(&empty)),
+        StageInputVerdict::Absent,
+        "a block naming nothing is a kernel with no stage-input"
+    );
+
+    let mut used = ComputeStageInputDescriptor::default();
+    used.attributes.push(ComputeStageInputAttribute::default());
+    used.layouts.push(ComputeStageInputLayout::default());
+    assert_eq!(classify_stage_input(Some(&used)), StageInputVerdict::Use);
+
+    let mut dropped_attr = used.clone();
+    dropped_attr.dropped_attributes = 1;
+    assert_eq!(
+        classify_stage_input(Some(&dropped_attr)),
+        StageInputVerdict::OverCap,
+        "a dropped attribute refuses the pipeline"
+    );
+
+    let mut dropped_layout = used.clone();
+    dropped_layout.dropped_layouts = 1;
+    assert_eq!(
+        classify_stage_input(Some(&dropped_layout)),
+        StageInputVerdict::OverCap,
+        "a dropped layout refuses the pipeline"
+    );
+
+    // Both together, and with the entry lists empty — the ordering matters, or
+    // an over-cap block whose kept entries are all beyond the cap reads as
+    // absent, which is the collapse this test exists to forbid.
+    let mut all_dropped = ComputeStageInputDescriptor::default();
+    all_dropped.dropped_attributes = 3;
+    all_dropped.dropped_layouts = 2;
+    assert_eq!(
+        classify_stage_input(Some(&all_dropped)),
+        StageInputVerdict::OverCap
+    );
+}

@@ -55,8 +55,22 @@ const _: () = assert!(
 pub const REIMS_VGPU_COMPUTE_DISPATCH_KIND_THREADGROUPS: u32 = 0;
 pub const REIMS_VGPU_COMPUTE_DISPATCH_KIND_THREADS: u32 = 1;
 
-pub const REIMS_VGPU_COMPUTE_STAGE_INPUT_MAX_ATTRIBUTES: usize = 16;
-pub const REIMS_VGPU_COMPUTE_STAGE_INPUT_MAX_LAYOUTS: usize = 16;
+// These two size the mirror arrays below; they do not decide what a guest may
+// declare. The decoder's caps are the contract (`MTLStageInputOutputDescriptor`
+// is a 31-slot array on both sides), and this array must be wide enough to carry
+// everything the decoder admits or the handoff to Metal truncates what decode
+// kept. Spelled as literals because this file is the mirror of the backend
+// header, and pinned to the decoder so the two cannot drift apart silently.
+pub const REIMS_VGPU_COMPUTE_STAGE_INPUT_MAX_ATTRIBUTES: usize = 31;
+pub const REIMS_VGPU_COMPUTE_STAGE_INPUT_MAX_LAYOUTS: usize = 31;
+const _: () = assert!(
+    REIMS_VGPU_COMPUTE_STAGE_INPUT_MAX_ATTRIBUTES
+        == crate::runtime::decode::resource::MAX_COMPUTE_STAGE_INPUT_ATTRS
+);
+const _: () = assert!(
+    REIMS_VGPU_COMPUTE_STAGE_INPUT_MAX_LAYOUTS
+        == crate::runtime::decode::resource::MAX_COMPUTE_STAGE_INPUT_LAYOUTS
+);
 pub const REIMS_VGPU_COMPUTE_STAGE_INPUT_STRIDE_DYNAMIC: u64 = u64::MAX;
 
 pub const REIMS_VGPU_MTL_PIXEL_FORMAT_DEPTH32_FLOAT: u32 = 252;
@@ -171,9 +185,9 @@ pub struct ReimsVgpuComputeStageInputDescriptor {
 // asserted, kept literal on purpose: derived from the two caps they would stay
 // true across a cap change, and a cap change is exactly the edit that has to be
 // walked to the sites reading the arrays.
-const _: () = assert!(size_of::<ReimsVgpuComputeStageInputDescriptor>() == 800);
+const _: () = assert!(size_of::<ReimsVgpuComputeStageInputDescriptor>() == 1520);
 const _: () = assert!(offset_of!(ReimsVgpuComputeStageInputDescriptor, attributes) == 28);
-const _: () = assert!(offset_of!(ReimsVgpuComputeStageInputDescriptor, layouts) == 416);
+const _: () = assert!(offset_of!(ReimsVgpuComputeStageInputDescriptor, layouts) == 776);
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]

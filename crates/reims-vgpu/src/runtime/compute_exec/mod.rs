@@ -772,8 +772,42 @@ fn apply_record_inner<M: HostMemory + HostOps>(
 
 pub(crate) struct LoadedComputePipeline {
     pub kernel_func_ref: u32,
-    /// Product-ready stage-input (None if absent, dropped caps, or incomplete).
+    /// Product-ready stage-input. `None` means the descriptor declared none —
+    /// and only that. A descriptor whose entries exceeded the decoder's caps
+    /// refuses the pipeline (`stage_input_over_cap`) rather than landing here as
+    /// `None`, because the two are different guest programs.
     pub stage_input: Option<ComputeStageInputDescriptor>,
+}
+
+/// What a type-7's stage-input block means for the pipeline carrying it.
+///
+/// Three outcomes, and the whole point of naming them is that two of them are
+/// not the same: [`Self::Absent`] is a kernel that declares no per-thread input,
+/// and [`Self::OverCap`] is one that declares more than this decoder kept. They
+/// used to collapse into one `None`.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum StageInputVerdict {
+    /// No block, or a block naming neither an attribute nor a layout.
+    Absent,
+    /// Carry it to the backend.
+    Use,
+    /// The decoder dropped entries. Refuse the pipeline.
+    OverCap,
+}
+
+/// Classify a decoded stage-input block. Free function so the distinction above
+/// is testable without a device, a host or a resolvable descriptor.
+pub(crate) fn classify_stage_input(si: Option<&ComputeStageInputDescriptor>) -> StageInputVerdict {
+    let Some(si) = si else {
+        return StageInputVerdict::Absent;
+    };
+    if si.dropped_attributes != 0 || si.dropped_layouts != 0 {
+        return StageInputVerdict::OverCap;
+    }
+    if si.attributes.is_empty() && si.layouts.is_empty() {
+        return StageInputVerdict::Absent;
+    }
+    StageInputVerdict::Use
 }
 
 pub(crate) fn load_compute_pipeline<M: HostMemory + HostOps>(
@@ -810,17 +844,31 @@ pub(crate) fn load_compute_pipeline<M: HostMemory + HostOps>(
     };
     match decoded {
         ResourceDescriptor::ComputePipeline(cp) if cp.kernel_func_ref != 0 => {
-            let stage_input = cp.stage_input.and_then(|si| {
-                // Dropped entries mean the wire exceeded product/backend caps — fail closed
-                // by omitting stage-input rather than silently truncating.
-                if si.dropped_attributes != 0 || si.dropped_layouts != 0 {
-                    return None;
+            // A descriptor that named more entries than the decoder kept refuses
+            // the whole pipeline. Dropping only the stage-input is not "failing
+            // closed": `stage_input: None` is what a kernel declaring no
+            // per-thread input looks like, so the two become indistinguishable
+            // and the dispatch runs with its stage_in fetch silently absent. On
+            // the Vulkan arm it is worse than wrong output — `compute_linux`
+            // refuses any pipeline carrying a stage-input, and a dropped one
+            // walked straight past that refusal.
+            let stage_input = match classify_stage_input(cp.stage_input.as_ref()) {
+                StageInputVerdict::Absent => None,
+                StageInputVerdict::Use => cp.stage_input,
+                StageInputVerdict::OverCap => {
+                    let si = cp.stage_input.as_ref().expect("OverCap implies a block");
+                    return miss(
+                        "stage_input_over_cap",
+                        format!(
+                            "attrs={} dropped_attrs={} layouts={} dropped_layouts={}",
+                            si.attributes.len(),
+                            si.dropped_attributes,
+                            si.layouts.len(),
+                            si.dropped_layouts
+                        ),
+                    );
                 }
-                if si.attributes.is_empty() && si.layouts.is_empty() {
-                    return None;
-                }
-                Some(si)
-            });
+            };
             Some(LoadedComputePipeline {
                 kernel_func_ref: cp.kernel_func_ref,
                 stage_input,

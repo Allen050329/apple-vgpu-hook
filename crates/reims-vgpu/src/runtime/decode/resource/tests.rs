@@ -970,6 +970,71 @@ fn compute_pipeline_stage_input_fixture() {
     assert_eq!(si.dropped_layouts, 0);
 }
 
+/// The widest stage-input the wire can state survives decode whole.
+///
+/// `header0` carries both counts in 5-bit fields, so 31 attributes and 31
+/// layouts is the maximum a guest can ever declare — and the decoder's caps are
+/// sized to exactly that, which is what makes `dropped_*` unreachable. At the
+/// former caps of 16 this decoded 16 of each and set both drop counters to 15,
+/// and the loader then discarded the whole stage-input for it.
+#[test]
+fn a_stage_input_at_the_wire_count_field_maximum_loses_nothing() {
+    // The count field's whole range. Asserted against the mask rather than
+    // spelled 31 so this drives what the wire can say, not what the caps admit —
+    // the caps are pinned to the same mask at their declaration.
+    let n = COMPUTE_STAGE_INPUT_HEADER0_COUNT_MASK;
+    let ns = n as usize;
+
+    // Same 24-byte type-7 prefix as the fixture above (tag, declared length,
+    // then an empty first TLV record), so the stage-input block starts at 24.
+    const BLOCK: usize = 24;
+    let layout_section = BLOCK + COMPUTE_STAGE_INPUT_MIN_LEN;
+    let attr_section = layout_section + ns * COMPUTE_STAGE_INPUT_LAYOUT_ENTRY_SIZE;
+    let total = attr_section + ns * COMPUTE_STAGE_INPUT_ATTR_ENTRY_SIZE;
+    let mut b = vec![0u8; total];
+    st32(&mut b[0..], TYPE7_OBJECT_COMPUTE_PIPELINE);
+    st32(&mut b[4..], total as u32);
+    // word0, then header0: payload length (everything after word0) plus both
+    // count fields at their maximum.
+    st32(&mut b[BLOCK + COMPUTE_STAGE_INPUT_WORD0..], 1);
+    st32(
+        &mut b[BLOCK + COMPUTE_STAGE_INPUT_HEADER0..],
+        (total - BLOCK - 4) as u32
+            | (n << COMPUTE_STAGE_INPUT_HEADER0_ATTR_COUNT_SHIFT)
+            | (n << COMPUTE_STAGE_INPUT_HEADER0_LAYOUT_COUNT_SHIFT),
+    );
+    // Both section offsets are relative to header0, not to word0.
+    let base = BLOCK + COMPUTE_STAGE_INPUT_HEADER1_OFFSET_BASE;
+    st32(
+        &mut b[BLOCK + COMPUTE_STAGE_INPUT_HEADER1..],
+        (layout_section - base) as u32
+            | (((attr_section - base) as u32) << COMPUTE_STAGE_INPUT_HEADER1_ATTR_OFFSET_SHIFT),
+    );
+    for i in 0..n {
+        // Buffer index i in the low 5 bits, so each layout is distinguishable.
+        let e = layout_section + i as usize * COMPUTE_STAGE_INPUT_LAYOUT_ENTRY_SIZE;
+        st32(&mut b[e..], i);
+        st32(&mut b[e + COMPUTE_STAGE_INPUT_LAYOUT_STEP_RATE..], 1);
+        let a = attr_section + i as usize * COMPUTE_STAGE_INPUT_ATTR_ENTRY_SIZE;
+        st32(&mut b[a..], i);
+        st32(&mut b[a + COMPUTE_STAGE_INPUT_ATTR_OFFSET..], i * 4);
+    }
+
+    let si = decode_compute_pipeline_descriptor(&b)
+        .expect("type-7 decodes")
+        .stage_input
+        .expect("stage-input block");
+    assert_eq!(si.dropped_attributes, 0, "no attribute may be dropped");
+    assert_eq!(si.dropped_layouts, 0, "no layout may be dropped");
+    assert_eq!(si.attributes.len(), ns);
+    assert_eq!(si.layouts.len(), ns);
+    for i in 0..ns {
+        assert_eq!(si.layouts[i].buffer_index, i as u32);
+        assert_eq!(si.attributes[i].location, i as u32);
+        assert_eq!(si.attributes[i].offset, i as u32 * 4);
+    }
+}
+
 #[test]
 fn list_entry_and_buffer() {
     // Live list offset: ref * 12

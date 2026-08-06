@@ -677,9 +677,14 @@ pub struct ComputeStageInputDescriptor {
     pub index_buffer_index: u32,
     pub attributes: Vec<ComputeStageInputAttribute>,
     pub layouts: Vec<ComputeStageInputLayout>,
-    /// Attributes beyond [`MAX_COMPUTE_STAGE_INPUT_ATTRS`] (fail product handoff).
+    /// Attributes beyond [`MAX_COMPUTE_STAGE_INPUT_ATTRS`]. A healthy zero: the
+    /// cap is the width of the wire's own count field, so no descriptor can
+    /// state a count that reaches this. Nonzero refuses the pipeline
+    /// (`stage_input_over_cap`), which is the reading that says the count field
+    /// is wider than this decoder believes.
     pub dropped_attributes: u32,
-    /// Layouts beyond [`MAX_COMPUTE_STAGE_INPUT_LAYOUTS`] (fail product handoff).
+    /// Layouts beyond [`MAX_COMPUTE_STAGE_INPUT_LAYOUTS`]; same healthy zero and
+    /// same refusal as [`Self::dropped_attributes`].
     pub dropped_layouts: u32,
 }
 
@@ -690,9 +695,38 @@ pub struct ComputePipelineDescriptor {
     pub stage_input: Option<ComputeStageInputDescriptor>,
 }
 
-/// Caps matching `REIMS_VGPU_RESOURCE_MAX_COMPUTE_STAGE_INPUT_*` / backend ABI.
-pub const MAX_COMPUTE_STAGE_INPUT_ATTRS: usize = 16;
-pub const MAX_COMPUTE_STAGE_INPUT_LAYOUTS: usize = 16;
+/// Both counts are 5-bit fields of `header0`
+/// ([`COMPUTE_STAGE_INPUT_HEADER0_COUNT_MASK`] is `0x1f`, applied at both
+/// [`COMPUTE_STAGE_INPUT_HEADER0_ATTR_COUNT_SHIFT`] and
+/// [`COMPUTE_STAGE_INPUT_HEADER0_LAYOUT_COUNT_SHIFT`]), so 31 is not a cap this
+/// device chose — it is the largest number the wire can state. Sized to the
+/// field, the two `dropped_*` counters below become healthy zeros that no guest
+/// can make fire, which is the only bound shape that cannot lose a descriptor
+/// the guest was entitled to.
+///
+/// It agrees with Metal on both sides, which is why the field is 5 bits:
+/// `MTLStageInputOutputDescriptor.attributes` is the compute-stage counterpart
+/// of `MTLVertexDescriptor.attributes` and the same 31-slot array (see
+/// [`MAX_VERTEX_ATTRS`], which states it for the render stage), and `.layouts`
+/// is indexed by the kernel buffer-table index a layout names — 31 slots, the
+/// same number as [`crate::runtime::compute_exec::MAX_COMPUTE_BUFFER_SLOTS`].
+///
+/// These were 16, which is the width of the backend's mirror array and nothing
+/// else — and that array is sized *from* here. At 16 a descriptor naming 17
+/// attributes did not lose only the 17th: crossing the cap dropped the entire
+/// stage-input, so a kernel that fetches per-thread `stage_in` became one that
+/// declares none.
+pub const MAX_COMPUTE_STAGE_INPUT_ATTRS: usize = 31;
+/// The layout half of [`MAX_COMPUTE_STAGE_INPUT_ATTRS`]; same wire field width,
+/// same reasoning.
+pub const MAX_COMPUTE_STAGE_INPUT_LAYOUTS: usize = 31;
+// Both caps *are* the count field's range. Pinned here rather than in a test
+// because the two must not be able to disagree at all: widening the field
+// without widening the caps silently reintroduces the drop.
+const _: () =
+    assert!(MAX_COMPUTE_STAGE_INPUT_ATTRS == COMPUTE_STAGE_INPUT_HEADER0_COUNT_MASK as usize);
+const _: () =
+    assert!(MAX_COMPUTE_STAGE_INPUT_LAYOUTS == COMPUTE_STAGE_INPUT_HEADER0_COUNT_MASK as usize);
 
 // MetalSerializer compute stage-input compact block (offsets relative to block start).
 pub const COMPUTE_STAGE_INPUT_WORD0: usize = 0;
