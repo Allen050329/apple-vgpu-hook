@@ -511,6 +511,19 @@ const ROWS: &[Row] = &[
     },
     Row {
         file: "crates/reims-vgpu/src/runtime/decode/resource/mod.rs",
+        ty: "ColorAttachEntryShort",
+        loss: Loss::Refused,
+        why: "a colour-attachment entry whose `field_count` promises more fields \
+              than the descriptor holds. The walk used to `break` and continue, \
+              so every tag past the cut was *absent* rather than unreadable and \
+              `entry_tag_u32` supplied its default — opaque `ONE`/`ZERO` \
+              blending, no pixel format, a write mask of `all`. Now \
+              `res_color_entry_fields_short`, which is the entry level of the \
+              fault `note_color_table_truncated` already refuses three ways at \
+              the section level. Line latched, refusal not",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/runtime/decode/resource/mod.rs",
         ty: "ColorAttachDropped",
         loss: Loss::Refused,
         why: "a colour-attachment TLV tag outside `0x00..=0x09`. Those ten are \

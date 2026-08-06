@@ -1607,6 +1607,62 @@ fn a_colour_attachment_slot_past_the_array_refuses_instead_of_taking_a_position(
     );
 }
 
+/// An entry whose `field_count` outruns the descriptor is refused, not decoded
+/// down to the defaults for everything past the cut.
+///
+/// The walk used to `break` here and say nothing, so `entry_tag_u32` returned
+/// the absent-field default for every tag the record ended before: opaque
+/// `ONE`/`ZERO` blending and no pixel format, on an attachment the guest had
+/// described. Build an entry that claims three fields and delivers one and a
+/// half, and assert the refusal names the pair.
+#[test]
+fn a_colour_attachment_entry_shorter_than_its_field_count_is_refused() {
+    use crate::contract::endian::st32;
+    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+
+    let off = 16usize;
+    // Header (count + one offset), then `[3][01:4 <fmt>][02:4 <trunc>]` — the
+    // second field's length word is present and its four value bytes are not.
+    let entry_len = 1 + 6 + 2;
+    let mut buf = vec![0u8; off + 8 + entry_len];
+    st32(&mut buf[off..], 1);
+    st32(&mut buf[off + 4..], 8);
+    let entry = off + 8;
+    buf[entry] = 3;
+    buf[entry + 1] = COLOR_ATTACHMENT_TAG_PIXEL_FORMAT;
+    buf[entry + 2] = 4;
+    st32(&mut buf[entry + 3..], MTL_FORMAT_BGRA8_UNORM as u32);
+    buf[entry + 7] = COLOR_ATTACHMENT_TAG_BLEND_ENABLE;
+    buf[entry + 8] = 4;
+
+    let cap = crate::observe::FailCapture::start();
+    assert_eq!(
+        parse_color_attachments(&buf, buf.len(), off),
+        Err(DecodeStatus::ErrShort("res_color_entry_fields_short")),
+        "an entry that promises a field the record does not hold is refused"
+    );
+    let lines = cap.lines();
+    let short: Vec<&String> = lines
+        .iter()
+        .filter(|l| l.contains("reason=color_attachment_entry_short"))
+        .collect();
+    assert_eq!(short.len(), 1, "one line for the entry: {lines:?}");
+    assert!(
+        short[0].contains("fields=1/3"),
+        "the line separates an entry read part-way from one absent entirely: {}",
+        short[0]
+    );
+
+    // The refusal is not latched even though the line is, the same split the
+    // unread-tag sibling carries.
+    let cap2 = crate::observe::FailCapture::resume();
+    assert_eq!(
+        parse_color_attachments(&buf, buf.len(), off),
+        Err(DecodeStatus::ErrShort("res_color_entry_fields_short"))
+    );
+    assert!(cap2.lines().is_empty(), "the line is deduped: {:?}", cap2.lines());
+}
+
 /// A colour-attachment field this decoder does not read refuses the pipeline,
 /// and the shape line beside it is what makes a boot with *no* drops readable
 /// as a measurement rather than as silence.

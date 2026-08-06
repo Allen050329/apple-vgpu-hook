@@ -2111,6 +2111,40 @@ impl crate::observe::Decline for ColorAttachDropped {
     }
 }
 
+/// A colour-attachment entry whose `field_count` promised more fields than the
+/// descriptor holds.
+///
+/// Distinct from [`ColorAttachDropped`] beside it, and refused for a different
+/// reason. That one is a tag this decoder cannot name; this one is a tag it
+/// cannot *read*, because the record ends first. The consequence was the same
+/// and quieter: the walk stopped, `entry_tag_u32` found none of the tags past
+/// the cut, and each returned the absent-field default — opaque `ONE`/`ZERO`
+/// blending, no pixel format, a write mask of `all`. An attachment assembled
+/// from defaults the guest never sent.
+///
+/// The section level of this same fault refuses three ways already —
+/// `res_color_section_oob`, `res_color_entry_oob` and
+/// `res_color_reach_past_record`, all reported through
+/// `note_color_table_truncated`. This is the entry level of it.
+///
+/// `read` and `declared` are both carried because they separate the two shapes:
+/// `0/4` is an entry that is entirely absent, `3/4` is one cut mid-field, and
+/// only the second says the walk was reading real fields when it ran out.
+struct ColorAttachEntryShort {
+    read: usize,
+    declared: usize,
+}
+
+impl crate::observe::Decline for ColorAttachEntryShort {
+    fn slug(&self) -> &'static str {
+        "color_attachment_entry_short"
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        vec![("fields", format!("{}/{}", self.read, self.declared))]
+    }
+}
+
 const COLOR_ATTACHMENT_TAGS_CONSUMED: [u8; 10] = [
     COLOR_ATTACHMENT_TAG_INDEX,
     COLOR_ATTACHMENT_TAG_PIXEL_FORMAT,
@@ -2195,13 +2229,28 @@ fn note_color_entry_fields(bytes: &[u8], entry: usize, slot: u32) -> Result<(), 
     let mut shape = String::new();
     let mut shape_key: u64 = 0;
     let mut dropped: Vec<(u8, u8, u32)> = Vec::new();
-    for _ in 0..field_count {
+    let mut short = None;
+    for read in 0..field_count {
+        // A `[tag][len]` header, or a value, that runs past the descriptor. The
+        // entry's own `field_count` promised a field the record does not
+        // contain, so this is a malformed entry rather than a short one — and
+        // the fields *after* the break are unreadable, not absent.
+        //
+        // Both used to `break`, which left the walk quiet and let the parse
+        // below apply `entry_tag_u32`'s defaults for every tag past the cut: an
+        // attachment with opaque `ONE`/`ZERO` blending, no pixel format and a
+        // write mask of `all`, none of which the guest asked for. The section
+        // level of this same fault already refuses three ways
+        // (`res_color_section_oob`, `res_color_entry_oob`,
+        // `res_color_reach_past_record`); the entry level did not.
         if p + 2 > bytes.len() {
+            short = Some((read, p));
             break;
         }
         let tag = bytes[p];
         let field_len = bytes[p + 1] as usize;
         if p + 2 + field_len > bytes.len() {
+            short = Some((read, p));
             break;
         }
         let value = if field_len >= 4 {
@@ -2230,6 +2279,27 @@ fn note_color_entry_fields(bytes: &[u8], entry: usize, slot: u32) -> Result<(), 
              tags=[{shape}] unconsumed={}",
             dropped.len()
         ));
+    }
+    // Before the dropped-tag refusal, because a truncated entry is why a tag
+    // might be missing rather than a second, independent fault.
+    if let Some((read, at)) = short {
+        if crate::observe::first_sight(
+            "color_attachment_entry_short",
+            ((slot as u64) << 40) | ((read as u64) << 16) | (field_count as u64),
+        ) {
+            crate::observe::Emit::decline(
+                "type7_color_attach",
+                &ColorAttachEntryShort {
+                    read,
+                    declared: field_count,
+                },
+            )
+            .field("slot", slot)
+            .field("at", at)
+            .field("reach", bytes.len())
+            .fail();
+        }
+        return Err(DecodeStatus::ErrShort("res_color_entry_fields_short"));
     }
     let unread = !dropped.is_empty();
     for (tag, field_len, value) in dropped {
