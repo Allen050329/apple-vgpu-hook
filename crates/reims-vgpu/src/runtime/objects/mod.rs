@@ -1643,9 +1643,29 @@ pub fn replace_physical<H: HostMemory + crate::runtime::host::HostOps>(
 /// memory that is no longer the object's, and leaving it trusted served the
 /// guest a stale frame from bytes it had already rewired — with nothing refusing
 /// and nothing to read but these two counters. That is what they were added to
-/// measure, and they measured it: a driven x86/PCI boot under
-/// `web-content-probe` read 7 and 1 against 32 no-state, so the class is live on
-/// an ordinary browsing workload rather than theoretical.
+/// measure, and they measured it. Driven x86/PCI boot, `web-content-probe -n 10
+/// --churn 1`, run on to a settled desktop:
+///
+/// ```text
+///   replace_physical_unknown_object                 56
+///   replace_physical_unmapped_no_state              43
+///   replace_physical_unmapped_texture_invalidated   13
+///   replace_physical_unmapped_linear_invalidated     0
+/// ```
+///
+/// So roughly a quarter of the re-points reaching this branch find a live host
+/// copy. The class is intermittent across boots — an earlier one on the same
+/// image and probe read 8 — because it depends on which objects hold a host copy
+/// at the moment the packet arrives, and the events cluster late in a boot
+/// rather than during the probe.
+///
+/// **These are `store_routes` counters and they are per-window: sum the samples,
+/// do not take the maximum.** The series descends across a boot
+/// (`unknown_object` = 30, 12, 8), so a `sort -n | tail -1` reads the busiest
+/// window and calls it the total — which is how this measurement was first
+/// misreported as 37/32/7/1. The check that catches it is the arithmetic:
+/// `no_state + texture + linear` must equal `unknown_object`. It does above
+/// (43 + 13 = 56); on the maxima it did not (32 + 7 + 1 vs 37).
 ///
 /// `invalidate_object_host_copies` is the discharge, and it is the same one
 /// `delete_object` has always performed for the same two maps — the difference
