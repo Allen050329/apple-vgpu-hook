@@ -895,11 +895,33 @@ const COMPUTE_INFO_KEY_STATIC_THREADGROUP_MEMORY: u32 = 4;
 /// the threadgroup the guest builds from it is one the device rejects. They
 /// used to be the fixed triple `(1, 1024), (3, 32), (4, 0)`, whose own comment
 /// called itself conservative and deferred the real values to "once
-/// metal2vulkan encode lands". That has landed, and both are device limits.
+/// metal2vulkan encode lands". That has landed, and both are now read from the
+/// host device rather than fixed.
 ///
-/// `staticThreadgroupMemoryLength` is a property of the *pipeline*, not the
-/// device — the threadgroup memory the kernel declares — so no device limit
-/// answers it and it stays 0 until pipeline reflection carries it.
+/// # Two of the three are pipeline properties, and this answers a device limit
+///
+/// The request names a `pipeline_ref` and this function ignores it. That is
+/// exactly right for `threadExecutionWidth`, which is the SIMD width and is a
+/// property of the part; it is **not** right for the other two, and only one of
+/// them said so.
+///
+/// `staticThreadgroupMemoryLength` is the threadgroup memory the kernel
+/// declares, so no device limit answers it and it stays 0 until pipeline
+/// reflection carries it.
+///
+/// `maxTotalThreadsPerThreadgroup` is *also* per-pipeline in Metal — a
+/// register-heavy kernel reports less than the device maximum, and the canonical
+/// app pattern divides it by `threadExecutionWidth` to pick a threadgroup shape.
+/// So on the Metal arm this over-promises: the guest sizes a dispatch from the
+/// device number and the PSO this device builds from its kernel may refuse it.
+/// On the Vulkan arm there is nothing better to say — core Vulkan has no
+/// per-pipeline invocation limit, so `maxComputeWorkGroupInvocations` *is* the
+/// answer.
+///
+/// Not fixed, and deliberately: closing it means building the PSO on the query
+/// path to ask its own limit, which is Metal-arm-only work whose harm no boot
+/// this checkout can take would measure. The proxy that would rank it is a
+/// dispatch refused for threadgroup size on a driven arm64 boot.
 ///
 /// A 0 there is not a silent omission but it is not free either. The guest's own
 /// default for an unanswered key is also 0, so this reply and no reply are

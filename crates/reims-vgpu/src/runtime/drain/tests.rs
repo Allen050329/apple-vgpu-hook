@@ -4472,6 +4472,12 @@ fn a_device_info_reply_cut_short_by_the_guests_count_names_the_keys_it_lost() {
 /// Key 4, `staticThreadgroupMemoryLength`, is a property of the pipeline and
 /// not of the device, so no device limit answers it and it stays 0 — asserted
 /// so that stops being silent.
+///
+/// Read the name of this test narrowly. A device limit is the *right* answer for
+/// key 3 and the *available* one for key 1; `compute_info_caps`'s own doc
+/// records that key 1 is per-pipeline in Metal too, so the device number
+/// over-promises on that arm. What is asserted below is the pair of invariants
+/// that hold whichever number lands there.
 #[test]
 fn the_compute_info_reply_answers_device_limits_not_a_fixed_triple() {
     let caps = compute_info_caps();
