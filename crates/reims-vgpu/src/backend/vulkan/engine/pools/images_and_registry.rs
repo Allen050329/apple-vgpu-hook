@@ -903,6 +903,36 @@ impl ResourcePools {
                 counters,
             ) {
                 Ok(m) => m,
+                // Out of memory is the one refusal worth a second attempt: the
+                // registry and the recycle pools are usually holding VRAM this
+                // device was already entitled to give back, and refusing the
+                // draw while holding it is not the same thing as the heap being
+                // full. Once only, and only for this result — a retry on a
+                // driver error that is not about memory would just fail twice.
+                Err(error) if error.out_of_memory() => {
+                    let given_back = self.reclaim_for_allocation_retry(ctx, counters);
+                    match (given_back > 0)
+                        .then(|| {
+                            self.bind_image_slab(
+                                ctx,
+                                image,
+                                &ireq,
+                                VkOp::PoolsBindRegistryTarget,
+                                counters,
+                            )
+                        })
+                        .transpose()
+                    {
+                        Ok(Some(m)) => m,
+                        // Nothing to give back, or the heap really is full. The
+                        // draw refuses with the original error, which names the
+                        // allocation that failed.
+                        Ok(None) | Err(_) => {
+                            ctx.device.destroy_image(image, None);
+                            return Err(error);
+                        }
+                    }
+                }
                 Err(error) => {
                     ctx.device.destroy_image(image, None);
                     return Err(error);
@@ -1519,6 +1549,78 @@ impl ResourcePools {
             count: peak.count.max(now.count),
             bytes: peak.bytes.max(now.bytes),
         }
+    }
+
+    /// Every resident the device may destroy without losing guest work: not
+    /// pinned, and not the only copy of its own pixels.
+    ///
+    /// The same predicate `cap_eviction_victim` filters on, without its
+    /// least-recently-used choice and without `REGISTRY_CAP` — this answers
+    /// "what could be given back if it had to be", which is the question an
+    /// allocation failure asks. Split out from the reclaim so the selection is
+    /// testable without a device, for the reason [`Self::cap_eviction_victim`]
+    /// is.
+    fn recoverable_residents(&self) -> Vec<TargetIdentity> {
+        self.registry_order
+            .iter()
+            .filter(|k| {
+                self.registry
+                    .get(*k)
+                    .is_some_and(|slot| slot.pin_count == 0 && !slot.gpu_only_content)
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Give back everything the registry can spare, for a retry after the device
+    /// refused an allocation. Returns how many residents and pooled images were
+    /// released.
+    ///
+    /// Out of device memory is the one refusal this device can still do
+    /// something about. `REGISTRY_CAP` bounds the population on a schedule of its
+    /// own and the idle drain returns VRAM on a 2 s timer, so at the moment an
+    /// allocation fails the registry is usually holding residents it was
+    /// entitled to drop and had simply not got to yet. Refusing the guest's draw
+    /// while still holding them is not "the GPU is out of memory"; it is this
+    /// device declining to tidy up first, which is not what the hardware being
+    /// emulated does.
+    ///
+    /// Age is deliberately ignored. The drain cutoff is a throughput compromise,
+    /// and by this point throughput is already lost — what is left is whether the
+    /// draw survives at all. `pin_count` and `gpu_only_content` are still
+    /// honoured, so this can only ever cost re-reads, never a frame.
+    ///
+    /// The recycle pools go first and go completely, including the HOST_VISIBLE
+    /// buffer pools that `trim_recycle_pools` otherwise holds back behind
+    /// `SETTLED_PASSES_FOR_BUFFER_TRIM`: free-list entries hold no guest content
+    /// at all, so they are strictly cheaper to give back than any resident.
+    unsafe fn reclaim_for_allocation_retry(
+        &mut self,
+        ctx: &DeviceContext,
+        counters: &EngineCounters,
+    ) -> usize {
+        let trimmed = self.trim_recycle_pools(&ctx.device, usize::MAX, true);
+        let victims = self.recoverable_residents();
+        let mut freed = 0;
+        for victim in &victims {
+            if self
+                .retire_resident(ctx, victim, ResidentReclaim::CapEvicted, counters)
+                .is_some()
+            {
+                freed += 1;
+            }
+        }
+        // Always visible. A device that has had to do this is one whose next
+        // allocation is also likely to fail, and a silent recovery would leave
+        // the run before that failure looking healthy.
+        crate::observe::fail(format!(
+            "vram_reclaim_retry residents={freed} recycled={trimmed} held_bytes={}              sole_copy={} live={} (an allocation was refused; gave back everything \
+that is neither pinned nor the only copy of its pixels)",
+            self.slab.held_bytes().0,
+            self.registry_sole_copy.count,
+            self.registry.len(),
+        ));
+        freed + trimmed
     }
 
     /// Fold the current non-pinned population into the high-water band and
@@ -2318,6 +2420,65 @@ mod pin_count_tests {
         assert_eq!(
             pools.registry_sole_copy_peak, at_peak,
             "a high-water does not fall back with the population"
+        );
+    }
+
+    /// The set an allocation failure may give back is every resident that is
+    /// neither pinned nor the only copy of its pixels — with no reference to age.
+    ///
+    /// The drain's cutoff is a throughput compromise, and by the time the device
+    /// has refused an allocation the throughput is already lost; what is left is
+    /// whether the draw survives. So this selection deliberately takes residents
+    /// the drain would not have touched yet, while still honouring the two
+    /// conditions that would make a destroy a lost frame.
+    ///
+    /// The order is the registry's own, so a caller reclaiming a prefix of it
+    /// takes the oldest-created first.
+    #[test]
+    fn the_allocation_retry_may_reclaim_everything_that_is_not_a_sole_copy_or_pinned() {
+        let mut pools = ResourcePools::new();
+        let now = 10_000;
+        pools.idle_clock_ms = now;
+        admit(&mut pools, surf(1), now, 0); // fresh, recoverable -> yes
+        admit(&mut pools, surf(2), now, 1); // pinned             -> no
+        admit(&mut pools, surf(3), now, 0); // sole copy          -> no
+        admit(&mut pools, surf(4), 0, 0); // aged, recoverable  -> yes
+        pools.registry_mark_ready(&surf(3));
+
+        assert_eq!(
+            pools.recoverable_residents(),
+            vec![surf(1), surf(4)],
+            "freshness is not a reason to keep one when the alternative is refusing the draw"
+        );
+
+        // Copy the sole copy out and it joins the set; pin one of the two and it
+        // leaves. Both directions, so this is the predicate and not the order.
+        assert!(pools.registry_note_content_copied_out(&surf(3)));
+        assert!(pools.pin_resident_target(&surf(1), true));
+        assert_eq!(pools.recoverable_residents(), vec![surf(3), surf(4)]);
+    }
+
+    /// Only an out-of-memory result is worth a reclaim and a retry.
+    ///
+    /// The retry exists because out-of-memory describes how much is in use at an
+    /// instant rather than anything about the request, so giving memory back can
+    /// change the answer. Every other refusal would meet the same answer twice,
+    /// and device-lost is answered by recreating the context instead — retrying
+    /// an allocation against a lost device only fails again.
+    #[test]
+    fn only_an_out_of_memory_refusal_is_worth_retrying() {
+        use crate::backend::vulkan::engine::vk_call::{VkCall, VkOp};
+        let oom = |r| DrawError::VkCall(VkCall::new(VkOp::PoolsBindRegistryTarget, r));
+        assert!(oom(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY).out_of_memory());
+        assert!(
+            oom(vk::Result::ERROR_OUT_OF_HOST_MEMORY).out_of_memory(),
+            "this device's pools hold host allocations too"
+        );
+        assert!(!oom(vk::Result::ERROR_DEVICE_LOST).out_of_memory());
+        assert!(!oom(vk::Result::ERROR_INITIALIZATION_FAILED).out_of_memory());
+        assert!(
+            !DrawError::FenceTimeout.out_of_memory(),
+            "a non-Vulkan-call refusal is never an allocation failure"
         );
     }
 

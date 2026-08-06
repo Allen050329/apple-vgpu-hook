@@ -52,6 +52,33 @@ pub enum DrawError {
     DeviceLost(super::device_lost::DeviceLostDecline),
 }
 
+impl DrawError {
+    /// Whether this refusal is the device saying it has no memory left, as
+    /// opposed to refusing for any other reason.
+    ///
+    /// The one class worth retrying: it is a statement about how much memory is
+    /// in use at this instant rather than about the request, so giving memory
+    /// back can change the answer. Every other `DrawError` describes something
+    /// about the request or the driver that a second identical attempt would
+    /// meet again.
+    ///
+    /// Both Vulkan out-of-memory results count. `ERROR_OUT_OF_HOST_MEMORY` is
+    /// included because this device's pools hold host allocations too — the
+    /// HOST_VISIBLE staging and readback rings — so the same reclaim is the
+    /// right response to either. `ERROR_DEVICE_LOST` deliberately is not: it has
+    /// its own variant and is answered by recreating the context, and retrying
+    /// an allocation against a lost device would only fail again.
+    pub fn out_of_memory(&self) -> bool {
+        match self {
+            Self::VkCall(c) => {
+                c.result == ash::vk::Result::ERROR_OUT_OF_DEVICE_MEMORY
+                    || c.result == ash::vk::Result::ERROR_OUT_OF_HOST_MEMORY
+            }
+            _ => false,
+        }
+    }
+}
+
 impl std::fmt::Display for DrawError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

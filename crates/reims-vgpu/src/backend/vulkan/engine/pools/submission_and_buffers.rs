@@ -195,7 +195,7 @@ impl ResourcePools {
     /// full `vkAllocateMemory` on the upload hot path, so we only free them once
     /// idle has *settled* (see [`SETTLED_PASSES_FOR_BUFFER_TRIM`]). The image
     /// pools always trim — they refill via cheap slab suballocation.
-    unsafe fn trim_recycle_pools(
+    pub(super) unsafe fn trim_recycle_pools(
         &mut self,
         device: &ash::Device,
         max: usize,
