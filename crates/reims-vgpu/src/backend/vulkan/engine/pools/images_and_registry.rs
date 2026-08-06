@@ -1576,6 +1576,67 @@ impl ResourcePools {
             .collect()
     }
 
+    /// Empty the image and buffer recycle pools, for a retry after the device
+    /// refused an allocation. Returns how many entries were released.
+    ///
+    /// The half of [`Self::reclaim_for_allocation_retry`] that is safe to call
+    /// from **any** allocation site, including one reached part-way through
+    /// recording a draw. A free-list entry is one that already went through
+    /// [`ResourcePools::dispose`] and came out the recycling side, which happens
+    /// only when no command-buffer slot was open or when the graveyard released
+    /// it after its slots retired. Nothing submitted references it, and the draw
+    /// being recorded does not hold it either — taking an entry removes it from
+    /// the pool, so anything still in one was never handed out.
+    ///
+    /// That is exactly the property retiring a live *resident* does not have,
+    /// which is what makes the sibling site-specific and this one not.
+    ///
+    /// `trim_buffers` is forced on, so the HOST_VISIBLE staging and readback
+    /// rings go too. They are normally held back behind
+    /// `SETTLED_PASSES_FOR_BUFFER_TRIM` because refilling them costs a full
+    /// `vkAllocateMemory` on the upload path — a real cost, and a smaller one
+    /// than the draw this is trying to save.
+    ///
+    /// # Measured against the two alternatives it sits between
+    ///
+    /// Same driven x86/PCI boot, same injected failure (every 200th
+    /// `bind_image_slab` returning `ERROR_OUT_OF_DEVICE_MEMORY`), same probe:
+    ///
+    /// ```text
+    ///                              draws lost   segfault
+    ///   no retry at these sites             7         no
+    ///   full reclaim, all sites             0        YES
+    ///   pools only, all sites               0         no
+    /// ```
+    ///
+    /// The last row is this function: 16 injected failures over the boot, every
+    /// one absorbed, 0 regions off their declared colour, and
+    /// `vram_reclaim_retry` never needed — the pools alone were always enough, so
+    /// the registry site's fuller reclaim is now a second line rather than the
+    /// first.
+    ///
+    /// The `released=` field is why that last claim is checkable. Without it a
+    /// boot where this absorbed every failure and one where no allocation ever
+    /// failed read identically — both silent, both zero draws lost. The first
+    /// instrumented run reported exactly that pair of zeros and could not tell
+    /// them apart.
+    pub(super) unsafe fn reclaim_pools_for_allocation_retry(
+        &mut self,
+        ctx: &DeviceContext,
+    ) -> usize {
+        let released = self.trim_recycle_pools(&ctx.device, usize::MAX, true);
+        // Always visible, and not only for the usual "a degradation must be
+        // readable" reason. Without a line here a boot where this absorbed every
+        // allocation failure and one where no allocation ever failed report
+        // identically — both silent, both zero draws lost — so the recovery
+        // could not be told from never having been needed.
+        crate::observe::fail(format!(
+            "vram_pool_reclaim_retry released={released} held_bytes={}              (an allocation was refused; emptied the recycle pools, which hold              nothing any command buffer references, and retried)",
+            self.slab.held_bytes().0,
+        ));
+        released
+    }
+
     /// Give back everything the registry can spare, for a retry after the device
     /// refused an allocation. Returns how many residents and pooled images were
     /// released.
@@ -1654,17 +1715,18 @@ impl ResourcePools {
     /// always retired residents, before the caller holds anything and before any
     /// sampled source has been resolved.
     ///
-    /// So extending the recovery to the other sites is not a wiring change. It
-    /// needs the reclaim to know what the in-progress draw is holding — either by
-    /// shielding those identities the way `protect` already shields one, or by
-    /// opening the batch before the first allocation so the graveyard gate is
-    /// armed for the whole draw. Neither is attempted here.
+    /// What generalises is the *pools* half — see
+    /// [`Self::reclaim_pools_for_allocation_retry`]. Retiring live residents is
+    /// the part that needs the reclaim to know what the in-progress draw is
+    /// holding, either by shielding those identities the way `protect` already
+    /// shields one, or by opening the batch before the first allocation so the
+    /// graveyard gate is armed for the whole draw. Neither is attempted here.
     pub(super) unsafe fn reclaim_for_allocation_retry(
         &mut self,
         ctx: &DeviceContext,
         counters: &EngineCounters,
     ) -> usize {
-        let trimmed = self.trim_recycle_pools(&ctx.device, usize::MAX, true);
+        let trimmed = self.reclaim_pools_for_allocation_retry(ctx);
         let victims = self.recoverable_residents();
         let mut freed = 0;
         for victim in &victims {

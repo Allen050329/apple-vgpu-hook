@@ -670,7 +670,39 @@ impl ResourcePools {
     /// Returns the backing `VkDeviceMemory` (shared across the block's other
     /// images) for the pool's image struct; the image was bound at the slab
     /// offset, not offset 0.
+    ///
+    /// Out of memory gets one retry here, for every caller, after emptying the
+    /// recycle pools. Only the pools: this runs at four sites, one of them
+    /// part-way through recording a draw, and
+    /// [`ResourcePools::reclaim_pools_for_allocation_retry`] is the half of the
+    /// recovery that is safe there — a free-list entry is by construction one no
+    /// command buffer holds. Retiring live residents is not safe here, and is
+    /// done only by `registry_ensure_color`, which calls the fuller
+    /// [`ResourcePools::reclaim_for_allocation_retry`] itself; that function
+    /// records the segfault which established the difference.
     pub(super) unsafe fn bind_image_slab(
+        &mut self,
+        ctx: &DeviceContext,
+        image: vk::Image,
+        ireq: &vk::MemoryRequirements,
+        bind_op: VkOp,
+        counters: &EngineCounters,
+    ) -> Result<vk::DeviceMemory, DrawError> {
+        match self.bind_image_slab_once(ctx, image, ireq, bind_op, counters) {
+            // Once, and only for this result. A reclaim that frees nothing means
+            // there was nothing to free, so the original error is the honest one
+            // and a second attempt would only repeat it.
+            Err(error)
+                if error.out_of_memory() && self.reclaim_pools_for_allocation_retry(ctx) > 0 =>
+            {
+                self.bind_image_slab_once(ctx, image, ireq, bind_op, counters)
+                    .map_err(|_| error)
+            }
+            other => other,
+        }
+    }
+
+    unsafe fn bind_image_slab_once(
         &mut self,
         ctx: &DeviceContext,
         image: vk::Image,
