@@ -79,16 +79,42 @@ fn clear_type11_fail(task_id: u32, ref_: u32) {
 /// routed here — the caller's speculative per-task `continue`s (surface absent
 /// from this task or a non-surface object type) stay silent. Runs on the drain
 /// worker (off the QEMU main core).
-fn type4_fail_latch() -> &'static std::sync::Mutex<std::collections::HashSet<(u32, &'static str)>> {
-    use std::collections::HashSet;
-    use std::sync::{Mutex, OnceLock};
-    static SEEN: OnceLock<Mutex<HashSet<(u32, &'static str)>>> = OnceLock::new();
-    SEEN.get_or_init(|| Mutex::new(HashSet::new()))
+///
+/// # What the latch remembers, and why it is not just a set
+///
+/// The backing this device asked for, and when it asked. A refusal here is
+/// frequently **transient** — the guest had not finished mapping the surface
+/// when the per-present path first walked it, and the next attach resolves the
+/// same pages — and the log gave no way to tell that from a surface this device
+/// never managed to back. See [`clear_type4_fail`] for what the pair enables and
+/// what it measured.
+///
+/// `gva` is the backing base the refusal named, or `None` for the refusals
+/// raised before one can be computed (`sid_zero`, `page_size_zero`). It is the
+/// backing and not `surface_id` that identifies a recovery, because surface ids
+/// recycle within a boot and across geometries — the same caveat
+/// `apply_type4_backing`'s census line carries `gva0` for.
+#[derive(Clone, Copy)]
+struct ReportedType4Fail {
+    gva: Option<u64>,
+    at_ms: u64,
 }
 
-fn note_type4_fail(surface_id: u32, reason: &'static str, detail: String) {
+type Type4FailLatch = std::collections::HashMap<(u32, &'static str), ReportedType4Fail>;
+
+fn type4_fail_latch() -> &'static std::sync::Mutex<Type4FailLatch> {
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<Type4FailLatch>> = OnceLock::new();
+    SEEN.get_or_init(|| Mutex::new(Type4FailLatch::new()))
+}
+
+fn note_type4_fail(surface_id: u32, reason: &'static str, gva: Option<u64>, detail: String) {
+    let at_ms = crate::observe::elapsed_ms() as u64;
     let mut guard = type4_fail_latch().lock().unwrap_or_else(|e| e.into_inner());
-    if guard.insert((surface_id, reason)) {
+    if guard
+        .insert((surface_id, reason), ReportedType4Fail { gva, at_ms })
+        .is_none()
+    {
         crate::observe::fail(detail);
     }
 }
@@ -106,20 +132,33 @@ fn note_type4_fail(surface_id: u32, reason: &'static str, detail: String) {
 /// runs out of tasks. The first reason is kept rather than the last: it is the
 /// most specific one available, and the tail of a search is dominated by tasks
 /// that simply do not list the surface.
-fn type4_pending_latch(
-) -> &'static std::sync::Mutex<std::collections::HashMap<u32, (&'static str, String)>> {
-    use std::collections::HashMap;
+struct PendingType4Fail {
+    reason: &'static str,
+    gva: Option<u64>,
+    detail: String,
+}
+
+type Type4PendingLatch = std::collections::HashMap<u32, PendingType4Fail>;
+
+fn type4_pending_latch() -> &'static std::sync::Mutex<Type4PendingLatch> {
     use std::sync::{Mutex, OnceLock};
-    static PENDING: OnceLock<Mutex<HashMap<u32, (&'static str, String)>>> = OnceLock::new();
-    PENDING.get_or_init(|| Mutex::new(HashMap::new()))
+    static PENDING: OnceLock<Mutex<Type4PendingLatch>> = OnceLock::new();
+    PENDING.get_or_init(|| Mutex::new(Type4PendingLatch::new()))
 }
 
 /// Record why one task's probe refused, to be reported only if none succeeds.
-fn defer_type4_fail(surface_id: u32, reason: &'static str, detail: String) {
+///
+/// `gva` is the backing base the probe was walking, threaded through so a later
+/// clean attach on the *same* backing can be recognised as a recovery rather
+/// than guessed at from `surface_id`. `None` where the refusal precedes any
+/// computable address.
+fn defer_type4_fail(surface_id: u32, reason: &'static str, gva: Option<u64>, detail: String) {
     let mut guard = type4_pending_latch()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    guard.entry(surface_id).or_insert((reason, detail));
+    guard
+        .entry(surface_id)
+        .or_insert(PendingType4Fail { reason, gva, detail });
 }
 
 /// The search found no task that could back this surface: report the first
@@ -131,21 +170,102 @@ fn flush_type4_fail(surface_id: u32) {
             .unwrap_or_else(|e| e.into_inner());
         guard.remove(&surface_id)
     };
-    if let Some((reason, detail)) = pending {
-        note_type4_fail(surface_id, reason, detail);
+    if let Some(pending) = pending {
+        note_type4_fail(surface_id, pending.reason, pending.gva, pending.detail);
     }
 }
 
-/// Re-arm the type-4 fail latch for a surface that just backed cleanly, so a
-/// later genuine backing failure on the same surface is logged again, and drop
-/// the probe reasons the successful search left behind.
-fn clear_type4_fail(surface_id: u32) {
+/// Re-arm the type-4 fail latch for a surface that just backed cleanly, drop the
+/// probe reasons the successful search left behind, and — when the backing that
+/// landed is the one a refusal named — say so.
+///
+/// # A refusal here is usually a retry that then worked, and the log did not say
+///
+/// `type4_backing_fail reason=translate` reads as lost guest work: the surface
+/// could not be backed, so every present for it paints stale or black. It is
+/// frequently nothing of the sort. `st=zero-pfn pte=0x0` means the guest had not
+/// filled the leaf PTE when the per-present path walked it, and the refusal is
+/// what makes the device ask again next frame instead of substituting a guess.
+/// The retry is the design; a *silent* retry is what made the class unreadable.
+///
+/// Measured, driven x86/PCI, `web-content-probe -n 10 --churn 1` — six
+/// refusals, and every one recovered on the same backing:
+///
+/// ```text
+///   sid   refused at   backed at   delta
+///    11        23652       23673    21 ms
+///    72        49139       49146     7 ms
+///    73        49165       49171     6 ms
+///    48        51770       51771     1 ms
+/// ```
+///
+/// Each was confirmed the *same* backing by matching the refusal's `gva=`
+/// against the later attach's `gva0=`, not by surface id — ids recycle within a
+/// boot and across geometries, so "the same sid resolved a frame later" can be a
+/// different surface wearing the same number. That is why `gva` is threaded
+/// through the latch rather than reconstructed here, and why a mismatch claims
+/// nothing.
+///
+/// A prior session read this class as "the best-defined live failure class left"
+/// and queued work against it. It was six successful retries. The recovery line
+/// is what stops that from happening again, and a refusal that stays unpaired is
+/// now the signal that something really did not back.
+///
+/// # The emitter confirms it on its own output
+///
+/// The table above was reconstructed by hand from a log that did not carry the
+/// pairing. A second driven boot with this line in place produces it directly —
+/// three refusals, three recoveries, **no unpaired refusal**, matched on the
+/// backing:
+///
+/// ```text
+///   type4_backing_recovered sid=25 reason=translate gva=0x42ab000 after_ms=5
+///   type4_backing_recovered sid=25 reason=translate gva=0x4282000 after_ms=7
+///   type4_backing_recovered sid=46 reason=translate gva=0x93b1000 after_ms=20
+/// ```
+///
+/// Note the two `sid=25` at different backings: the id really does get reused
+/// inside one boot, and matching on it would have paired the second refusal with
+/// the first attach. `type4_translate_refused` and `type4_backing_recovered` sum
+/// to 3 and 3 across the census windows, so the counters agree with the lines.
+fn clear_type4_fail(surface_id: u32, backed_gva: u64) {
     type4_pending_latch()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(&surface_id);
-    let mut guard = type4_fail_latch().lock().unwrap_or_else(|e| e.into_inner());
-    guard.retain(|(s, _)| *s != surface_id);
+    let recovered: Vec<(&'static str, u64)> = {
+        let mut guard = type4_fail_latch().lock().unwrap_or_else(|e| e.into_inner());
+        // Every entry for this surface is dropped, exactly as before: the latch
+        // must re-arm or a later genuine failure on a recycled id goes unlogged.
+        // Only the ones whose backing matches are *claimed* as recoveries.
+        let mut out = Vec::new();
+        guard.retain(|(s, reason), reported| {
+            if *s != surface_id {
+                return true;
+            }
+            if reported.gva == Some(backed_gva) {
+                out.push((*reason, reported.at_ms));
+            }
+            false
+        });
+        out
+    };
+    // After the early return, not before it: this runs on every clean attach
+    // (the per-present scanout path) and almost every one of those has nothing
+    // latched, so the clock read stays off the hot path.
+    if recovered.is_empty() {
+        return;
+    }
+    let now = crate::observe::elapsed_ms() as u64;
+    for (reason, at_ms) in recovered {
+        crate::runtime::drain::note_store_route("type4_backing_recovered");
+        crate::observe::fail(format!(
+            "type4_backing_recovered sid={surface_id} reason={reason} gva={backed_gva:#x} \
+             after_ms={} (the earlier refusal for this backing was a retry; the guest \
+             finished mapping and it landed)",
+            now.saturating_sub(at_ms)
+        ));
+    }
 }
 
 /// Wire object type for surface / IOSurface backing (x86 Tahoe/Ventura).
@@ -1212,6 +1332,7 @@ fn apply_type4_backing<M: HostMemory>(
         defer_type4_fail(
             surface_id,
             "sid_zero",
+            None,
             format!(
                 "type4_backing_fail reason=sid_zero sid={surface_id} task={task_id} \
                  (0 is the unbound-mapping sentinel; backing it would store pixels \
@@ -1226,10 +1347,16 @@ fn apply_type4_backing<M: HostMemory>(
         defer_type4_fail(
             surface_id,
             "page_size_zero",
+            None,
             format!("type4_backing_fail reason=page_size_zero sid={surface_id} task={task_id} page_shift={page_shift}"),
         );
         return false;
     }
+    // The backing base this attempt is about. It identifies the refusal for
+    // `clear_type4_fail`, which is what lets a later clean attach on the *same*
+    // backing be recognised as a recovery — surface ids recycle, addresses do
+    // not.
+    let backing_base_gva = (surf.backing_pfn as u64) << page_shift;
     let page_count = ((surf.length.saturating_sub(1)) / page_size) + 1;
     // No host MiB budget: page count follows guest `surf.length` only.
     // Fail if zero or not host-addressable as a page-entry vector.
@@ -1237,6 +1364,7 @@ fn apply_type4_backing<M: HostMemory>(
         defer_type4_fail(
             surface_id,
             "page_count_oob",
+            Some(backing_base_gva),
             format!(
                 "type4_backing_fail reason=page_count_oob sid={surface_id} task={task_id} len={:#x} page_count={page_count}",
                 surf.length
@@ -1250,6 +1378,7 @@ fn apply_type4_backing<M: HostMemory>(
             defer_type4_fail(
                 surface_id,
                 "task_inactive",
+            Some(backing_base_gva),
                 format!("type4_backing_fail reason=task_inactive sid={surface_id} task={task_id}"),
             );
             return false;
@@ -1292,6 +1421,7 @@ fn apply_type4_backing<M: HostMemory>(
             defer_type4_fail(
                 surface_id,
                 "translate",
+            Some(backing_base_gva),
                 type4_translate_fail_detail(
                     surface_id,
                     task_id,
@@ -1309,6 +1439,7 @@ fn apply_type4_backing<M: HostMemory>(
             defer_type4_fail(
                 surface_id,
                 "pfn_oob",
+            Some(backing_base_gva),
                 format!("type4_backing_fail reason=pfn_oob sid={surface_id} task={task_id} page={i}/{page_count} gpa={gpa:#x} pfn={pfn:#x}"),
             );
             return false;
@@ -1319,6 +1450,7 @@ fn apply_type4_backing<M: HostMemory>(
             defer_type4_fail(
                 surface_id,
                 "entry_roundtrip",
+            Some(backing_base_gva),
                 format!("type4_backing_fail reason=entry_roundtrip sid={surface_id} task={task_id} page={i}/{page_count} gpa={gpa:#x} entry={entry:#x}"),
             );
             return false;
@@ -1380,6 +1512,7 @@ fn apply_type4_backing<M: HostMemory>(
         defer_type4_fail(
             surface_id,
             "map_surface",
+            Some(backing_base_gva),
             format!("type4_backing_fail reason=map_surface sid={surface_id} task={task_id} n={page_count}"),
         );
         return false;
@@ -1488,8 +1621,9 @@ fn apply_type4_backing<M: HostMemory>(
     }
 
     // Backing built cleanly — re-arm the fail latch so a later genuine failure
-    // on this surface (flapping backing) is logged again.
-    clear_type4_fail(surface_id);
+    // on this surface (flapping backing) is logged again, and report the earlier
+    // refusal for *this* backing as the recovery it turned out to be.
+    clear_type4_fail(surface_id, backing_base_gva);
     true
 }
 
@@ -1918,6 +2052,7 @@ fn resolve_type4_surface_ex<M: HostMemory>(
             defer_type4_fail(
                 surface_id,
                 crate::observe::ladder_slug!("", desc_read),
+                None,
                 format!(
                     "type4_backing_fail reason=desc_read sid={surface_id} task={task_id} desc_gva={:#x} desc_len={}",
                     entry.descriptor_gva, entry.descriptor_length
@@ -1930,6 +2065,7 @@ fn resolve_type4_surface_ex<M: HostMemory>(
             defer_type4_fail(
                 surface_id,
                 crate::observe::ladder_slug!("", desc_decode),
+                None,
                 format!(
                     "type4_backing_fail reason=desc_decode sid={surface_id} task={task_id} desc_len={} backing_pfn={:#x} length={:#x}",
                     desc.len(),

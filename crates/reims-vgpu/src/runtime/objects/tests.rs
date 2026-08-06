@@ -645,11 +645,11 @@ fn apply_type4_backing_fail_latches_reason_and_rearms() {
     state.page_shift = PAGE_SHIFT_X86;
     // A surface_id other type-4 tests do not touch (they use 3).
     let sid = 11u32;
-    clear_type4_fail(sid);
+    clear_type4_fail(sid, 0x20u64 << PAGE_SHIFT_X86);
     assert!(!type4_fail_latch()
         .lock()
         .unwrap()
-        .contains(&(sid, "task_inactive")));
+        .contains_key(&(sid, "task_inactive")));
     // Small valid length (page_count = 1) so the alloc-guard passes, then an
     // undefined/inactive task_id hits the `task_inactive` site — the drain
     // race where a decoded surface's owning task died before backing landed.
@@ -668,7 +668,7 @@ fn apply_type4_backing_fail_latches_reason_and_rearms() {
         !type4_fail_latch()
             .lock()
             .unwrap()
-            .contains(&(sid, "task_inactive")),
+            .contains_key(&(sid, "task_inactive")),
         "one task's probe is not a backing failure: the search has other \
          tasks to try, and reporting here is what put `reason=translate` \
          lines under surfaces that then backed cleanly"
@@ -680,17 +680,85 @@ fn apply_type4_backing_fail_latches_reason_and_rearms() {
         type4_fail_latch()
             .lock()
             .unwrap()
-            .contains(&(sid, "task_inactive")),
+            .contains_key(&(sid, "task_inactive")),
         "an exhausted search must report the first probe's reason slug"
     );
     // A clean backing on the same surface re-arms the latch.
-    clear_type4_fail(sid);
+    clear_type4_fail(sid, 0x20u64 << PAGE_SHIFT_X86);
     assert!(
         !type4_fail_latch()
             .lock()
             .unwrap()
-            .contains(&(sid, "task_inactive")),
+            .contains_key(&(sid, "task_inactive")),
         "clear_type4_fail must re-arm so a later failure logs again"
+    );
+}
+
+/// A refusal that the next attach resolves is reported as the recovery it is,
+/// and only when the backing that landed is the one the refusal named.
+///
+/// `type4_backing_fail reason=translate` reads as lost guest work and usually is
+/// not: `st=zero-pfn` means the guest had not finished mapping when the
+/// per-present path walked it, and the refusal exists so the device asks again
+/// rather than substituting a guess. Every one of the six on a driven boot
+/// recovered, within 1-21 ms, and nothing in the log said so — see
+/// [`super::clear_type4_fail`].
+///
+/// The match is on the **backing address**, never on `surface_id`: ids recycle
+/// within a boot and across geometries, so a clean attach on a recycled id must
+/// re-arm the latch (it does, as the test above locks) without claiming that the
+/// earlier, different surface recovered.
+#[test]
+fn a_type4_refusal_the_next_attach_resolves_is_reported_as_recovered() {
+    fn log_mark() -> usize {
+        crate::observe::redirect_logs_for_tests();
+        std::fs::read_to_string(crate::observe::fail_log_path())
+            .unwrap_or_default()
+            .len()
+    }
+    fn log_since(mark: usize) -> String {
+        let body = std::fs::read_to_string(crate::observe::fail_log_path()).unwrap_or_default();
+        body[mark.min(body.len())..].to_string()
+    }
+
+    // A surface id no other test in this module uses.
+    let sid = 0x4d1u32;
+    let gva = 0x4112000u64;
+    clear_type4_fail(sid, gva);
+
+    // A reported refusal naming this backing...
+    let mark = log_mark();
+    defer_type4_fail(sid, "translate", Some(gva), "type4_backing_fail probe".into());
+    flush_type4_fail(sid);
+    assert!(
+        log_since(mark).contains("type4_backing_fail probe"),
+        "the exhausted search must report the probe's reason"
+    );
+
+    // ...that a later attach on a *different* backing must not claim.
+    let mark = log_mark();
+    clear_type4_fail(sid, gva + 0x1000);
+    assert!(
+        !log_since(mark).contains("type4_backing_recovered"),
+        "a recycled surface id is not evidence that the earlier backing landed"
+    );
+    assert!(
+        !type4_fail_latch().lock().unwrap().contains_key(&(sid, "translate")),
+        "the latch must still re-arm, or a later genuine failure goes unlogged"
+    );
+
+    // The same refusal, then an attach on the backing it named, is a recovery.
+    let mark = log_mark();
+    defer_type4_fail(sid, "translate", Some(gva), "type4_backing_fail probe".into());
+    flush_type4_fail(sid);
+    clear_type4_fail(sid, gva);
+    let log = log_since(mark);
+    assert!(
+        log.contains("type4_backing_recovered")
+            && log.contains(&format!("sid={sid}"))
+            && log.contains("reason=translate")
+            && log.contains(&format!("gva={gva:#x}")),
+        "a refusal whose backing then landed must say so:\n{log}"
     );
 }
 
@@ -959,7 +1027,7 @@ fn resolve_type4_candidate_logs_descriptor_read_failure() {
     let mut host = FakeHost::new();
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
     let sid = 17u32;
-    clear_type4_fail(sid);
+    clear_type4_fail(sid, 0x20u64 << PAGE_SHIFT_X86);
     let _ = setup_type4_candidate(&mut host, &mut state, sid, 0x3000, 0x30);
 
     assert!(!resolve_type4_surface(&mut state, &host, sid));
@@ -967,10 +1035,10 @@ fn resolve_type4_candidate_logs_descriptor_read_failure() {
         type4_fail_latch()
             .lock()
             .unwrap()
-            .contains(&(sid, "desc_read")),
+            .contains_key(&(sid, "desc_read")),
         "surface-type candidate with unreadable descriptor must name desc_read"
     );
-    clear_type4_fail(sid);
+    clear_type4_fail(sid, 0x20u64 << PAGE_SHIFT_X86);
 }
 
 /// A readable but invalid type-4 descriptor used to fall through to the
@@ -981,7 +1049,7 @@ fn resolve_type4_candidate_logs_descriptor_decode_failure() {
     let mut host = FakeHost::new();
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
     let sid = 18u32;
-    clear_type4_fail(sid);
+    clear_type4_fail(sid, 0x20u64 << PAGE_SHIFT_X86);
     let data_gpa = setup_type4_candidate(&mut host, &mut state, sid, 0x80, 0x30);
     let bad_desc = vec![0u8; 0x30];
     let _ = host.write_gpa(data_gpa + 0x80, &bad_desc);
@@ -991,10 +1059,10 @@ fn resolve_type4_candidate_logs_descriptor_decode_failure() {
         type4_fail_latch()
             .lock()
             .unwrap()
-            .contains(&(sid, "desc_decode")),
+            .contains_key(&(sid, "desc_decode")),
         "surface-type candidate with invalid descriptor must name desc_decode"
     );
-    clear_type4_fail(sid);
+    clear_type4_fail(sid, 0x20u64 << PAGE_SHIFT_X86);
 }
 
 /// Live wire bytes (boot 093019 `compute_stage_tex type5 … args_hex`):
