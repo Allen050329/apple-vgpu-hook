@@ -2158,7 +2158,29 @@ mod pool_trim_order_tests {
 /// have the same shape and had the same hole — a `vkMapMemory` arm the driver
 /// bounds and a persistent-mapping arm that inherits nothing — so they ask this
 /// one question rather than each spelling it, and a third rail added later
-/// cannot spell it differently.
+/// cannot spell it differently. The readback *lease* asks it a third time, at
+/// its delivery site rather than here, because the pointer it lends is a `usize`
+/// the borrower reads after the engine lock is dropped.
+///
+/// # What a driven boot measured
+///
+/// All three rails are on the copying path, which a host that can import a
+/// dma-buf never takes — so the boot that exercises them is the one with
+/// `REIMS_VGPU_DMABUF=off`, per `AGENTS.md`. Driven with the window-drag probe
+/// against Safari, x86 PCI attach, over 37 census windows: `zc_buffer_gathered`
+/// 266 319 CPU gathers through [`staging_write_ptr`], `render_flush_leased`
+/// 7 172 leases, `swap_rb_kb` 281 227 KiB through the swizzling writer, and
+/// `render_flush_gpu_declined` 7 172 — every flush taking the copying route.
+/// `dma_buf_import=disabled_by_env` and one `backend_cannot_import`, with no
+/// `guest_dmabuf_*` counter present at all, which is what says nothing exported
+/// past the closed gate.
+///
+/// None of the three refusals fired, which is the expected reading rather than a
+/// null one: `acquire_staging` and `acquire_readback` round a request up to a
+/// power-of-two bucket and record the *bucket* as the slot's size, so every live
+/// caller's span is inside it. The number worth keeping is the traffic — a
+/// quarter of a million gathers and seven thousand leases went through the new
+/// comparison without one false refusal.
 ///
 /// Split out as a plain function so the rule is reachable without a Vulkan
 /// device, which is the same reason `ContextOwner::note_init_failure` is its
