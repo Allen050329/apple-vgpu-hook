@@ -84,29 +84,39 @@ fn resolve_type11_from_list() {
     assert_eq!((m.width, m.height, m.format), (64, 32, 0x50));
 }
 
-/// The type-4 decoder says so when it drops what the guest declared.
+/// The type-4 decoder refuses a descriptor it cannot decode as declared, and
+/// says which check refused.
 ///
-/// All three of these bounds are correct — IOSurface caps `getPlaneCount`
-/// at eight, a plane record the blob does not reach cannot be decoded, and
-/// the device descriptor's `allocSize` really is 32 bits. What was wrong is
-/// that each one applied in silence, so a surface whose ninth plane this
-/// device will never look at, or whose size it cannot express, reached every
-/// later reader as a surface that simply had eight planes and that size.
-/// Never Fail Silently: a bound the guest crossed is a bound worth naming.
+/// All three of these bounds are correct — IOSurface caps `getPlaneCount` at
+/// eight, a plane record the blob does not reach cannot be decoded, and the
+/// device descriptor's `allocSize` really is 32 bits.
+///
+/// Naming them was the first half. The second is that the first two must not
+/// publish a *partial* surface, which is what they did: truncating to the cap
+/// handed every later reader a surface that simply has eight planes, and
+/// defaulting an unreachable record handed them a 0x0 plane at pitch 0 in a slot
+/// the guest declared. Neither reads as a decode failure downstream — both are
+/// well-formed surfaces — so the loss appears as a layer that samples blank,
+/// which is what content that is genuinely empty also looks like. `None` reaches
+/// the caller's `type4_backing_fail reason=desc_decode`, which names the surface
+/// id.
+///
+/// Fails without the fix: both decodes return `Some`.
 #[test]
-fn the_type4_decoder_reports_what_it_drops() {
-    // `desc` reaches only plane 0's record, so planes 1..=7 are declared
-    // and unreachable, and plane 8+ is over the cap.
-    let built = Type4Builder::new(0x1000, 0x100, 0x4247_5241, 12).with_len(0x24); // 'BGRA'
-    let desc = built.bytes();
+fn the_type4_decoder_refuses_what_it_cannot_decode_and_reports_why() {
+    // Twelve planes against IOSurface's own ceiling of eight.
+    let over_cap = Type4Builder::new(0x1000, 0x100, 0x4247_5241, 12).with_len(0x24); // 'BGRA'
+    // A legal plane count whose records the blob does not reach: `with_len`
+    // stops after plane 0, so planes 1..=3 are declared and unreachable.
+    let short_records = Type4Builder::new(0x1000, 0x100, 0x4247_5241, 4).with_len(0x24);
 
     reset_type4_decode_drops();
     let cap = crate::observe::FailCapture::start();
-    let s = decode_type4_surface(desc).expect("type4 decodes");
-    assert_eq!(s.plane_count, TYPE4_PLANE_CAP as u8, "still clamped");
-    // Two distinct drops on this descriptor, so select by reason rather
-    // than by slug: the surplus planes over the cap, and — separately —
-    // the declared planes whose records the blob does not reach.
+    assert!(
+        decode_type4_surface(over_cap.bytes()).is_none(),
+        "a plane count past IOSurface's own ceiling is a malformed descriptor, \
+         and there is no correct prefix of it to publish"
+    );
     let over = cap
         .lines()
         .into_iter()
@@ -114,13 +124,17 @@ fn the_type4_decoder_reports_what_it_drops() {
         .expect("an over-cap plane count must be reported");
     assert!(
         over.contains("declared=12") && over.contains("cap=8"),
-        "the line must name what the guest asked for and what it got: {over}"
+        "the line must name what the guest asked for and what the device holds: {over}"
     );
 
     // Same reason twice is one line — the latch is what keeps a per-surface
-    // stream from flooding the always-on channel.
+    // stream from flooding the always-on channel. The *refusal* still applies
+    // every time; only the line is deduped.
     let cap2 = crate::observe::FailCapture::start();
-    let _ = decode_type4_surface(desc);
+    assert!(
+        decode_type4_surface(over_cap.bytes()).is_none(),
+        "the latch must not turn the second refusal into an acceptance"
+    );
     assert!(
         cap2.lines()
             .iter()
@@ -132,13 +146,20 @@ fn the_type4_decoder_reports_what_it_drops() {
     // A declared plane whose record the blob does not reach.
     reset_type4_decode_drops();
     let cap3 = crate::observe::FailCapture::start();
-    let _ = decode_type4_surface(desc);
+    assert!(
+        decode_type4_surface(short_records.bytes()).is_none(),
+        "a declared plane the blob does not reach must refuse the surface, \
+         not publish a 0x0 plane in its slot"
+    );
     let short = cap3
         .lines()
         .into_iter()
         .find(|l| l.contains("reason=plane_record_short"))
         .expect("an unreachable plane record must be reported");
-    assert!(short.contains("plane=1"), "{short}");
+    assert!(
+        short.contains("plane=1"),
+        "the line names the first plane that could not be reached: {short}"
+    );
 
     // A surface larger than the 32-bit `allocSize` field can express.
     reset_type4_decode_drops();

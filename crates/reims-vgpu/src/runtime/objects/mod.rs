@@ -580,6 +580,10 @@ fn type4_decode_drop_latch() -> &'static std::sync::Mutex<std::collections::Hash
 }
 
 fn note_type4_decode_drop(reason: &'static str, detail: String) {
+    // The latch is flood protection, so the magnitude has to live somewhere it
+    // survives: without this, a second malformed descriptor and a thousand of
+    // them read identically — one line, and nothing to ask.
+    crate::runtime::drain::census::note_store_route("type4_desc_refused");
     let fresh = {
         let mut guard = type4_decode_drop_latch()
             .lock()
@@ -616,12 +620,23 @@ pub fn decode_type4_surface(desc: &[u8]) -> Option<Type4Surface> {
     if backing_pfn == 0 || length == 0 {
         return None;
     }
-    let plane_count = (plane_count_raw as usize).min(TYPE4_PLANE_CAP) as u8;
+    // Both of the checks below refuse the descriptor rather than publish a
+    // partial one, and they refuse for the same reason the two above them do:
+    // what came back would not be the surface the guest described.
+    //
+    // The alternative was tried and is what these replace. Truncating to the cap
+    // published a surface that simply *has* eight planes, and defaulting an
+    // unreachable plane record published a 0x0 plane at pitch 0 in a slot the
+    // guest declared. Neither is a decode failure downstream — every later
+    // reader sees a well-formed surface — so the loss surfaces as a layer that
+    // samples blank, which is indistinguishable from content that is genuinely
+    // empty. `None` reaches the caller's existing
+    // `type4_backing_fail reason=desc_decode`, so the refusal is attributable to
+    // the surface id that could not be decoded.
     if plane_count_raw as usize > TYPE4_PLANE_CAP {
         // The bound itself is right — IOSurface's own `getPlaneCount` caps at
-        // eight — but dropping the surplus quietly is not. The guest declared
-        // planes this device will never look at, and every later reader sees a
-        // surface that simply has eight.
+        // eight — so a descriptor declaring more is malformed rather than
+        // merely large, and there is no correct prefix of it to keep.
         note_type4_decode_drop(
             "plane_count_over_cap",
             format!(
@@ -629,24 +644,23 @@ pub fn decode_type4_surface(desc: &[u8]) -> Option<Type4Surface> {
                  cap={TYPE4_PLANE_CAP} fmt={pixel_format:#x}"
             ),
         );
+        return None;
     }
+    let plane_count = plane_count_raw;
     let mut planes = [Type4Plane::default(); TYPE4_PLANE_CAP];
     for (i, plane) in planes.iter_mut().enumerate().take(plane_count as usize) {
-        match decode_type4_plane(desc, i) {
-            Some(p) => *plane = p,
-            // A declared plane whose record the blob does not reach. Leaving the
-            // default in place publishes a 0x0 plane as if the guest had asked
-            // for one, which reads downstream as a surface with no content
-            // rather than as a descriptor we could not decode.
-            None => note_type4_decode_drop(
+        let Some(p) = decode_type4_plane(desc, i) else {
+            note_type4_decode_drop(
                 "plane_record_short",
                 format!(
                     "type4_decode_drop reason=plane_record_short plane={i} \
                      planes={plane_count} desc_len={} fmt={pixel_format:#x}",
                     desc.len()
                 ),
-            ),
-        }
+            );
+            return None;
+        };
+        *plane = p;
     }
     let (width, height, bpr) = if plane_count > 0 {
         let p0 = planes[0];
