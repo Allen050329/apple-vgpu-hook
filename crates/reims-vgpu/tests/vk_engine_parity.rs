@@ -2632,13 +2632,16 @@ fn device_loss_named_and_recreate_bounded() {
         snap.device_lost
     );
 
-    // The cap is a permanent give-up: the engine this test leaves behind refuses
-    // every draw. Suite independence therefore rests entirely on
-    // `test_reset_engine` clearing the budget, which is what
-    // [`engine_test_session`] does for every other case. Pin that here, at the
-    // one site that manufactures the exhausted state — if the reset ever stops
-    // clearing it, the whole suite goes order-dependent, and it fails as a
-    // single unrelated case rather than as anything named "reset".
+    // The cap bounds a *storm* — losses with no guest work between them — and a
+    // draw that completes clears it (`ContextOwner::note_work_completed`), so
+    // the count this loop leaves behind depends on whether its last iteration
+    // drew successfully. Either way the engine can be left at the cap, refusing
+    // every draw, and suite independence rests on `test_reset_engine` clearing
+    // the budget, which is what [`engine_test_session`] does for every other
+    // case. Pin that here, at the one site that manufactures the exhausted state
+    // — if the reset ever stops clearing it, the whole suite goes
+    // order-dependent, and it fails as a single unrelated case rather than as
+    // anything named "reset".
     engine::test_reset_engine();
     assert_eq!(
         engine::device_recreate_count(),

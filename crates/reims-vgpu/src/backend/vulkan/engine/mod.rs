@@ -498,7 +498,13 @@ pub fn execute_draw_request(req: &DrawRequest) -> Result<DrawOutput, DrawError> 
     } = &mut *guard;
     let result = unsafe { exec::execute_draw_inner(owner, caches, pools, counters, req) };
     match result {
-        Ok(out) => Ok(out),
+        Ok(out) => {
+            // Guest work reached the GPU, so any recreate that got us here did
+            // its job and the storm budget starts over. See
+            // `ContextOwner::note_work_completed`.
+            guard.owner.note_work_completed();
+            Ok(out)
+        }
         Err(DrawError::DeviceLost(decline)) => {
             guard.counters.device_lost.fetch_add(1, Ordering::Relaxed);
             guard.owner.mark_device_lost();
@@ -587,7 +593,11 @@ pub fn execute_compute_request(req: &ComputeRequest) -> Result<ComputeOutput, Co
     let result =
         unsafe { exec_compute::execute_compute_inner(owner, caches, pools, counters, req) };
     match result {
-        Ok(out) => Ok(out),
+        Ok(out) => {
+            // Same as the draw arm: a dispatch that ran proves the device.
+            guard.owner.note_work_completed();
+            Ok(out)
+        }
         Err(DrawError::DeviceLost(decline)) => {
             guard.counters.device_lost.fetch_add(1, Ordering::Relaxed);
             guard.owner.mark_device_lost();

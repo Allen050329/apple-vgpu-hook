@@ -18,7 +18,19 @@ use crate::backend::vulkan::caps::memory_topology::{
 };
 use crate::backend::vulkan::caps::{DriverQuirk, HostGpuCaps};
 
-/// Max device recreates per process after DEVICE_LOST (named constant).
+/// Max device recreates **that produce no guest work between them**.
+///
+/// The bound is on a recreate *storm* — lost, rebuilt, lost again before
+/// anything ran — which is the case a device cannot get out of and where
+/// retrying forever is a spin. It is deliberately not a lifetime count. A GPU
+/// that resets is not a GPU that is finished, and a host driver that reset three
+/// times over a week of uptime would otherwise leave this device answering
+/// `RecreateCapExhausted` to every draw for as long as the guest ran, with hours
+/// of correct rendering between each of the three.
+///
+/// [`ContextOwner::note_work_completed`] is what makes the difference: one draw
+/// or dispatch that reaches the GPU on the rebuilt device says that recreate did
+/// its job, and the budget starts over. A storm never reaches it.
 pub const MAX_DEVICE_RECREATES: u32 = 3;
 
 /// Bounded fence wait (nanoseconds). Named constant — not env-gated.
@@ -1004,6 +1016,38 @@ impl ContextOwner {
         self.loss_events.fetch_add(1, Ordering::Relaxed);
         self.poisoned = true;
     }
+
+    /// Guest work reached the GPU on the current device.
+    ///
+    /// This is the only evidence that a recreate *worked*, and it is what turns
+    /// [`MAX_DEVICE_RECREATES`] from a lifetime allowance into a bound on a
+    /// storm. A device that was rebuilt and then executed a draw has recovered;
+    /// if it is lost again an hour later that is a new incident, not the fourth
+    /// step of the old one, and refusing it because of three resets the guest
+    /// never noticed is this device deciding to stop being a GPU.
+    ///
+    /// One completed submission is the whole threshold, and that is on purpose —
+    /// any larger number would be tuned rather than derived. It leaves the
+    /// pathological case of a host that loses the device after every single
+    /// draw recreating indefinitely, which is the right trade: that guest sees
+    /// slow progress instead of a display that never comes back. The churn stays
+    /// measurable either way — `EngineCounters::recreates` and `device_lost` are
+    /// both in the `cumulative` group, so they count every incident across the
+    /// boot and this reset does not touch them.
+    ///
+    /// Called on the success arm of every draw and dispatch, so it is on the hot
+    /// path — hence the branch, which is false on every call of a healthy boot.
+    pub(crate) fn note_work_completed(&mut self) {
+        if self.recreate_count == 0 {
+            return;
+        }
+        crate::observe::fail(format!(
+            "vk_device_recreate_proven recreates={} (guest work ran on the rebuilt device; \
+             the storm budget starts over)",
+            self.recreate_count
+        ));
+        self.recreate_count = 0;
+    }
 }
 
 /// Main-entry name for shader stages (stable ABI).
@@ -1373,5 +1417,78 @@ mod init_latch_tests {
             .vk_result(),
             Some(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)
         );
+    }
+}
+
+#[cfg(test)]
+mod recreate_budget_tests {
+    use super::*;
+
+    /// A storm — lost, rebuilt, lost again with nothing run in between — still
+    /// terminates. This is the case the budget exists for, and `ensure` answers
+    /// it without touching Vulkan, which is why the test runs on any host.
+    #[test]
+    fn a_storm_that_produces_no_work_still_exhausts_the_budget() {
+        let mut owner = ContextOwner::new();
+        owner.poisoned = true;
+        owner.recreate_count = MAX_DEVICE_RECREATES;
+        let counters = EngineCounters::default();
+
+        match owner.ensure(&counters) {
+            Ok(_) => panic!("an exhausted storm budget must refuse"),
+            Err(error) => assert_eq!(
+                error,
+                DrawError::DeviceLost(DeviceLostDecline::RecreateCapExhausted {
+                    cap: MAX_DEVICE_RECREATES,
+                })
+            ),
+        }
+    }
+
+    /// A recreate followed by guest work is a recreate that *worked*, and must
+    /// not be held against the next incident.
+    ///
+    /// Before this, `recreate_count` only ever rose. Three device losses over a
+    /// week of uptime — each recovered, each with hours of correct rendering
+    /// after it — left the fourth refused and every draw after that refused with
+    /// it, for as long as the guest ran.
+    #[test]
+    fn work_on_the_rebuilt_device_clears_the_storm_budget() {
+        let mut owner = ContextOwner::new();
+        owner.recreate_count = MAX_DEVICE_RECREATES;
+
+        owner.note_work_completed();
+
+        assert_eq!(
+            owner.recreate_count, 0,
+            "a recreate the guest drew through must not count against the next storm"
+        );
+
+        // And the budget is genuinely available again: at the cap this refuses
+        // without touching Vulkan, so reaching past that branch is the proof.
+        owner.poisoned = true;
+        let counters = EngineCounters::default();
+        let refusal = owner.ensure(&counters).err();
+        assert_ne!(
+            refusal,
+            Some(DrawError::DeviceLost(
+                DeviceLostDecline::RecreateCapExhausted {
+                    cap: MAX_DEVICE_RECREATES,
+                }
+            )),
+            "the cap branch must no longer be taken"
+        );
+    }
+
+    /// The healthy path costs a branch and nothing else. Every draw and dispatch
+    /// calls this, so an emission here would be one fail-log line per draw.
+    #[test]
+    fn a_device_that_was_never_lost_is_left_alone() {
+        let mut owner = ContextOwner::new();
+        assert_eq!(owner.recreate_count, 0);
+        owner.note_work_completed();
+        assert_eq!(owner.recreate_count, 0);
+        assert!(!owner.poisoned, "noting work must not change device state");
+        assert!(owner.init_error.is_none());
     }
 }
