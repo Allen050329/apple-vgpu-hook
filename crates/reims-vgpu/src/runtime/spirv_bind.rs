@@ -1,14 +1,23 @@
 //! SPIR-V set-0 binding relocation for metal2vulkan + the internal Vulkan engine (Linux product).
 //!
-//! metal2vulkan decorates every stage independently at DescriptorSet 0 (buffers
-//! `[0,32)`, textures `[32,64)`, samplers `[64,96)`, ColorInput / framebuffer
-//! fetch `[96,104)`). The engine builds one merged set 0 and rejects duplicate
-//! bindings. When vertex and fragment both bind the same Metal buffer index,
-//! fragment buffer decorations move by [`FRAG_BUFFER_BINDING_OFFSET`] (into
-//! `[104,136)`). When both stages sample textures, fragment sampled-resource
-//! decorations in `[32,96)` move by [`FRAG_SAMPLED_RESOURCE_BINDING_OFFSET`]
-//! (textures → `[160,192)`, samplers → `[192,224)`). The ColorInput band never
-//! moves — the engine binds the input attachment at its un-relocated number.
+//! metal2vulkan decorates every stage independently at DescriptorSet 0, in bands
+//! 32 apart. [`widen_sampled_bands`] rewrites those into the device's own, wider
+//! layout once per shader — buffers `[0,32)`, textures `[32,160)`, samplers
+//! `[160,192)`, ColorInput / framebuffer fetch `[192,200)` — because a 32-wide
+//! texture band cannot hold the 128 indices Apple's serializer emits. The two
+//! numberings and why they differ are laid out in full below the constants; read
+//! that before touching a band, because reflection stays in the translator's
+//! numbering while the SPIR-V moves to the device's.
+//!
+//! Everything after the widen is stated in device numbering. The engine builds
+//! one merged set 0 and rejects duplicate bindings, so a binding two stages both
+//! claim has to move. When vertex and fragment both bind the same Metal buffer
+//! index, fragment buffer decorations move by [`FRAG_BUFFER_BINDING_OFFSET`]
+//! (into `[256,288)`). When both stages sample textures, fragment
+//! sampled-resource decorations in `[32,192)` move by
+//! [`FRAG_SAMPLED_RESOURCE_BINDING_OFFSET`] (textures → `[320,448)`, samplers →
+//! `[448,480)`). The ColorInput band never moves — the engine binds the input
+//! attachment at its un-relocated number.
 //!
 //! Port of archive `reims-vgpu-backend-vulkan` `spirv.rs` relocation helpers only —
 //! structural SPIR-V `OpDecorate Binding` walks, no name heuristics.
@@ -1247,7 +1256,12 @@ pub fn widen_sampled_bands(words: &mut [u32]) -> usize {
 }
 
 /// Rewrite fragment SPIR-V: texture and sampler bindings +=
-/// [`FRAG_SAMPLED_RESOURCE_BINDING_OFFSET`] (source band `[32,96)`).
+/// [`FRAG_SAMPLED_RESOURCE_BINDING_OFFSET`].
+///
+/// The source band is the device's, not the translator's: textures `[32,160)`
+/// plus samplers `[160,192)`, i.e. everything below
+/// [`SAMPLED_RESOURCE_BINDING_LIMIT`]. This runs after [`widen_sampled_bands`],
+/// so a sampler here is already at 160+N.
 ///
 /// The ColorInput band ([`COLOR_INPUT_BINDING_BASE`]) is deliberately NOT
 /// relocated: the engine binds the framebuffer-fetch input attachment by its
@@ -1275,8 +1289,11 @@ pub fn offset_fragment_sampled_resource_bindings(words: &mut [u32]) -> usize {
 // path uses to write the `OpTypeImage`. The functions below read those facts
 // directly, so a consumer never re-walks the emitted SPIR-V. They are keyed on
 // the descriptor binding EXACTLY as reflection reports it — the UN-relocated
-// number (`TEXTURE_BINDING_BASE + metal_index`), before any fragment +128
-// relocation a merged-stage draw later applies.
+// number (`TEXTURE_BINDING_BASE + metal_index`), before the fragment
+// sampled-resource relocation a merged-stage draw later applies. Textures are
+// the one class where that number is the same in both numberings, which is why
+// these reflectors did not have to move when the bands widened; a sampler
+// lookup here is in the translator's `M2V_SAMPLER_BINDING_BASE` band.
 //
 // The `census_reflection_wellformed` guard runs once per translate (miss path)
 // and validates, on the live guest's own shaders, that the AIR-derived reflection

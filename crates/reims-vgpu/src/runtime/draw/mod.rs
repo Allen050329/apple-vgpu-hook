@@ -158,7 +158,7 @@ pub const MAX_TEXTURE_BIND_SLOTS: u32 = 128;
 
 /// Bind **index** cap for the sampler argument table.
 ///
-/// The sampler band is `[64, 96)` — [`crate::runtime::spirv_bind::SAMPLER_BINDING_BASE`]
+/// The sampler band is `[160, 192)` — [`crate::runtime::spirv_bind::SAMPLER_BINDING_BASE`]
 /// up to [`crate::runtime::spirv_bind::COLOR_INPUT_BINDING_BASE`] — so this is
 /// the same encoding bound [`MAX_TEXTURE_BIND_SLOTS`] documents, applied to the
 /// next band up.
