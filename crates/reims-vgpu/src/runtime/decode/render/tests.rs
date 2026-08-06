@@ -1973,6 +1973,20 @@ fn the_accepted_window_ends_where_apples_render_manifest_does() {
 /// evidence when the manifest's silence is what is being explained.** An
 /// opcode absent from a capture-derived roster can be an opcode nobody
 /// captured.
+///
+/// # Two decoded opcodes are deliberately outside this bijection
+///
+/// `OPCODE_USE_HEAPS_NO_STAGES` (`0x86`) and `OPCODE_USE_RESOURCES_NO_STAGES`
+/// (`0x87`) are decoded by this module and named in no manifest row, which the
+/// reverse direction above would ordinarily call a number no capture supports.
+/// They are the exception the manifest cannot express: the selectors behind them
+/// are declared on the encoder base class, and the manifest is built per class
+/// from each class's own method list, so no `PGSerializerRenderCommandEncoder`
+/// row can ever carry them however many captures run. See the inheritance caveat
+/// in [`reims_vgpu_wire::manifest`]. Adding them to the roster would fail this
+/// test for a reason that is about the instrument rather than about the device,
+/// so they stay out of it and are covered by
+/// `the_inherited_residency_opcodes_reach_the_residency_arm` instead.
 #[test]
 fn the_render_opcode_table_is_exactly_apples_render_manifest() {
     let device: &[(u32, &str)] = &[
@@ -2279,16 +2293,32 @@ fn the_render_opcode_table_is_exactly_apples_render_manifest() {
     );
 }
 
-/// Residency uses the wire opcodes Apple's serializer writes (`0x1b` /
-/// `0x89`), not the old barrier-neighbourhood numbers `0x86`/`0x87`.
+/// Residency is four opcodes in two pairs, and the pairs are not interchangeable.
+///
+/// `0x1b`/`0x89` are the `stages:`-qualified forms the render encoder declares
+/// itself; `0x86`/`0x87` are the unqualified ones it inherits. The four numbers
+/// must stay distinct, because their heads are three different sizes and reading
+/// one record with another's layout starts the refs in the wrong place —
+/// `a_residency_record_is_bounded_by_its_own_count` is what catches that, and it
+/// can only catch it while the opcodes disagree.
 #[test]
 fn the_residency_opcodes_are_the_ones_apples_serializer_writes() {
     use reims_vgpu_wire::ops::render as wire;
     assert_eq!(wire::OPCODE_USE_HEAP, 0x1b);
     assert_eq!(wire::OPCODE_USE_RESOURCE, 0x89);
-    // Barrier neighbourhood: nothing here may claim these as residency.
-    assert_ne!(wire::OPCODE_USE_HEAP, 0x86);
-    assert_ne!(wire::OPCODE_USE_RESOURCE, 0x87);
+    assert_eq!(wire::OPCODE_USE_HEAPS_NO_STAGES, 0x86);
+    assert_eq!(wire::OPCODE_USE_RESOURCES_NO_STAGES, 0x87);
+    let all = [
+        wire::OPCODE_USE_HEAP,
+        wire::OPCODE_USE_RESOURCE,
+        wire::OPCODE_USE_HEAPS_NO_STAGES,
+        wire::OPCODE_USE_RESOURCES_NO_STAGES,
+    ];
+    for (i, a) in all.iter().enumerate() {
+        for b in &all[i + 1..] {
+            assert_ne!(a, b, "two residency forms share one opcode");
+        }
+    }
 }
 
 /// The refs of a residency record start at a different offset on each form,
@@ -2306,6 +2336,16 @@ fn a_residency_record_is_bounded_by_its_own_count() {
             Kind::UseResource,
         ),
         (wire::OPCODE_USE_HEAP, USE_HEAP_REFS, Kind::UseHeap),
+        (
+            wire::OPCODE_USE_RESOURCES_NO_STAGES,
+            USE_RESOURCES_NO_STAGES_REFS,
+            Kind::UseResource,
+        ),
+        (
+            wire::OPCODE_USE_HEAPS_NO_STAGES,
+            USE_HEAPS_NO_STAGES_REFS,
+            Kind::UseHeap,
+        ),
     ] {
         let body = |count: u32, entries: usize| {
             let mut v = hdr(op, OP_HEADER_LEN + refs_at + entries * REF_BIND_ENTRY_SIZE);
@@ -2337,31 +2377,41 @@ fn a_residency_record_is_bounded_by_its_own_count() {
             DecodeStatus::ErrShort,
             "op {op:#x} accepted a count whose array cannot exist"
         );
-        // The head itself, with no room for the array at all.
+        // Shorter than the form's own head. Written against `refs_at` rather
+        // than a literal, because the four forms have three different head
+        // sizes and the smallest of them is four bytes — a literal 4 here is a
+        // *valid* empty `useHeaps:count:` record, not a truncated one.
         assert_eq!(
-            decode(&hdr(op, OP_HEADER_LEN + 4)).unwrap_err(),
+            decode(&hdr(op, OP_HEADER_LEN + refs_at - 1)).unwrap_err(),
             DecodeStatus::ErrShort,
-            "op {op:#x} accepted a record with no room for its refs"
+            "op {op:#x} accepted a record shorter than its own head"
         );
     }
 }
 
-/// `0x86` and `0x87` are claimed by no arm and stay visible.
+/// `0x86` and `0x87` reach the residency arm, not the catch-all.
 ///
-/// They are still inside the accepted window, so they decode — but as
-/// [`Kind::OtherAccepted`], which `runtime::exec` reports on the failure
-/// channel. The residency kinds had no executor arm at all, so reading them
-/// as residency was strictly worse than not decoding them: it removed them
-/// from the one net that would have named them.
+/// This test used to assert the opposite, and the reason it gave was sound at
+/// the time: the residency kinds had no executor arm, so reading these two as
+/// residency removed them from `Kind::OtherAccepted` — the one net that would
+/// have named them on the failure channel. Both halves of that have since
+/// changed. `runtime::exec` answers `UseResource`/`UseHeap` with
+/// `render_noop_residency_hint`, so the kind is a counter rather than a hole;
+/// and the numbers are not a guess but the two forms of residency a render
+/// encoder inherits from the encoder base class, which
+/// [`reims_vgpu_wire::ops::render::UseHeapsNoStages`] records.
+///
+/// So the net they belong in is the counter, and leaving them in the catch-all
+/// reported an implemented command as unimplemented while
+/// `render_noop_residency_hint` counted half its family.
 #[test]
-fn the_barrier_neighbourhood_opcodes_are_not_claimed_as_residency() {
-    for op in [0x86u32, 0x87] {
+fn the_inherited_residency_opcodes_reach_the_residency_arm() {
+    for (op, kind) in [
+        (wire::OPCODE_USE_HEAPS_NO_STAGES, Kind::UseHeap),
+        (wire::OPCODE_USE_RESOURCES_NO_STAGES, Kind::UseResource),
+    ] {
         let c = decode(&hdr(op, OP_HEADER_LEN + 16)).unwrap_or_else(|e| panic!("{op:#x}: {e:?}"));
-        assert_eq!(
-            c.kind,
-            Kind::OtherAccepted,
-            "{op:#x} is claimed by an arm again"
-        );
+        assert_eq!(c.kind, kind, "{op:#x} did not reach the residency arm");
     }
 }
 

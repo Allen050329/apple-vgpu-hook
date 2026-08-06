@@ -188,9 +188,11 @@ pub(crate) const VIEWPORTS_COUNT_LEN: usize = core::mem::size_of::<wire::SetView
 
 /// Residency record head: `count:u32` at `+0` on both forms.
 ///
-/// Wire opcodes are `wire::OPCODE_USE_HEAP` (`0x1b`) and
-/// `wire::OPCODE_USE_RESOURCE` (`0x89`); the old `0x86`/`0x87` pair is not
-/// residency (see `the_residency_opcodes_are_the_ones_apples_serializer_writes`).
+/// Four wire opcodes, in two pairs. `wire::OPCODE_USE_HEAP` (`0x1b`) and
+/// `wire::OPCODE_USE_RESOURCE` (`0x89`) are the `stages:`-qualified forms the
+/// render encoder declares itself; `wire::OPCODE_USE_HEAPS_NO_STAGES` (`0x86`)
+/// and `wire::OPCODE_USE_RESOURCES_NO_STAGES` (`0x87`) are the unqualified ones
+/// it inherits. All four reach this rail and all four count as one hint.
 #[cfg(test)]
 pub(crate) const RESIDENCY_COUNT: usize = core::mem::offset_of!(wire::UseResource, count);
 /// `useResource:` packs `usage` and `stages` into the word at `+4` as two
@@ -204,6 +206,14 @@ pub(crate) const USE_RESOURCE_REFS: usize = core::mem::size_of::<wire::UseResour
 /// numbers here, so both are the view's own size.
 #[cfg(test)]
 pub(crate) const USE_HEAP_REFS: usize = core::mem::size_of::<wire::UseHeap>();
+/// The inherited forms take no `stages:`, so `useHeaps:count:` is a bare count
+/// with its refs at `+4` and `useResources:count:usage:` puts them at `+8`.
+/// Three head sizes across four opcodes, which is why each reads its own.
+#[cfg(test)]
+pub(crate) const USE_HEAPS_NO_STAGES_REFS: usize = core::mem::size_of::<wire::UseHeapsNoStages>();
+#[cfg(test)]
+pub(crate) const USE_RESOURCES_NO_STAGES_REFS: usize =
+    core::mem::size_of::<wire::UseResourcesNoStages>();
 
 /// Multi-entry bind header: `first:u32 @0`, `count:u32 @4`, entries after it.
 #[cfg(test)]
@@ -1322,6 +1332,37 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
         wire::OPCODE_USE_HEAP => {
             // Heap form: no usage word, stages u16, refs at +6 (align-1).
             let (head, refs) = wire::use_heap(&op).map_err(|_| DecodeStatus::ErrShort)?;
+            out.kind = Kind::UseHeap;
+            out.count = head.count.get();
+            if out.count as usize != refs.len() {
+                return Err(DecodeStatus::ErrShort);
+            }
+            Ok(out)
+        }
+        // The two residency forms that take no `stages:`. A render encoder
+        // inherits them from the encoder base class, so they arrive on this rail
+        // as readily as the two above; without these arms they reached the
+        // `OtherAccepted` catch-all and were reported as unimplemented opcodes,
+        // which is a wrong answer twice over — they are implemented, by doing
+        // nothing, and `render_noop_residency_hint` was counting half its family.
+        //
+        // Separate arms rather than a shared one because the heads differ: four
+        // bytes here against the qualified pair's six and eight. Reading either
+        // with another's layout starts the refs in the wrong place, which is what
+        // the `count == refs.len()` check catches.
+        wire::OPCODE_USE_RESOURCES_NO_STAGES => {
+            let (head, refs) =
+                wire::use_resources_no_stages(&op).map_err(|_| DecodeStatus::ErrShort)?;
+            out.kind = Kind::UseResource;
+            out.count = head.count.get();
+            if out.count as usize != refs.len() {
+                return Err(DecodeStatus::ErrShort);
+            }
+            Ok(out)
+        }
+        wire::OPCODE_USE_HEAPS_NO_STAGES => {
+            let (head, refs) =
+                wire::use_heaps_no_stages(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::UseHeap;
             out.count = head.count.get();
             if out.count as usize != refs.len() {
