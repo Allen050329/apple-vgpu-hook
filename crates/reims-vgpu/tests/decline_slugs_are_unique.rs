@@ -31,10 +31,9 @@
 //! on this pathway can construct one.
 
 use std::collections::BTreeMap;
-use std::path::Path;
 
 mod source_scan;
-use source_scan::{blank_comments, close_brace, rust_sources, strip_attributes, workspace_root};
+use source_scan::{close_brace, decline_impls, strip_attributes};
 
 /// One `impl Decline`/`impl Refusal` block, identified by where it is written.
 ///
@@ -114,91 +113,39 @@ fn literals(body: &str) -> Vec<String> {
     out
 }
 
-/// The identifier immediately before `end` in `chars`, if any.
-fn ident_ending_at(chars: &[char], end: usize) -> String {
-    let mut start = end;
-    while start > 0 && (chars[start - 1].is_alphanumeric() || chars[start - 1] == '_') {
-        start -= 1;
-    }
-    chars[start..end].iter().collect()
-}
-
 /// Every slug literal in the crate, mapped to the impl blocks that spell it.
-fn slug_owners(root: &Path) -> BTreeMap<String, Vec<Owner>> {
-    let sources = rust_sources(&root.join("crates/reims-vgpu/src"));
-    assert!(
-        sources.len() > 50,
-        "walked {} files, which is not this crate",
-        sources.len()
-    );
-
+///
+/// The block-finding half lives in [`source_scan::decline_impls`], shared with
+/// `a_decline_says_whether_the_guest_lost_work`, which adjudicates the same
+/// population for a different property. Two copies of it would be two notions
+/// of what "every decline" means, and the one that went blind would be the one
+/// nobody was reading — each test's self-check would still pass over the
+/// population it could see.
+fn slug_owners() -> BTreeMap<String, Vec<Owner>> {
     let mut out: BTreeMap<String, Vec<Owner>> = BTreeMap::new();
-    for path in sources {
-        let raw = std::fs::read_to_string(&path).expect("crate source must be readable");
-        let text = blank_comments(&raw);
-        let chars: Vec<char> = text.chars().collect();
-        let rel_path = path
-            .strip_prefix(root)
-            .unwrap_or(&path)
-            .to_string_lossy()
-            .into_owned();
-
-        let mut at = 0usize;
-        while let Some(found) = text[at..].find("impl") {
-            let start = at + found;
-            at = start + "impl".len();
-            // A bare `impl` token, not the tail of an identifier.
-            let before_ok = start == 0 || !(text.as_bytes()[start - 1] as char).is_alphanumeric();
-            if !before_ok {
-                continue;
-            }
-            let Some(open_rel) = text[at..].find('{') else {
-                break;
-            };
-            let open = at + open_rel;
-            let header = &text[at..open];
-            // `impl<…> Trait for Type`: the trait is the identifier just before
-            // the last ` for `, so a fully-qualified path matches and a generic
-            // bound (`impl<T: Decline> Display for T`) does not.
-            let Some(for_rel) = header.rfind(" for ") else {
-                continue;
-            };
-            let head_chars: Vec<char> = header.chars().collect();
-            let for_idx = header[..for_rel].chars().count();
-            let trait_name = ident_ending_at(&head_chars, for_idx);
-            if trait_name != "Decline" && trait_name != "Refusal" {
-                continue;
-            }
-            let ty = header[for_rel + " for ".len()..].trim().to_string();
-
-            let open_chars = text[..open].chars().count();
-            let end = close_brace(&chars, open_chars);
-            let body: String = chars[open_chars..end].iter().collect();
-
-            for name in ["fn slug", "fn refusal"] {
-                let mut fat = 0usize;
-                while let Some(rel) = body[fat..].find(name) {
-                    let fn_start = fat + rel;
-                    fat = fn_start + name.len();
-                    let Some(brace_rel) = body[fat..].find('{') else {
-                        break;
-                    };
-                    let brace = fat + brace_rel;
-                    let body_chars: Vec<char> = body.chars().collect();
-                    let brace_ci = body[..brace].chars().count();
-                    let fn_end = close_brace(&body_chars, brace_ci);
-                    let fn_body =
-                        expand_ladder_slugs(&strip_attributes(&body_chars[brace_ci..fn_end]));
-                    for slug in literals(&fn_body) {
-                        out.entry(slug).or_default().push(Owner {
-                            file: rel_path.clone(),
-                            ty: ty.clone(),
-                        });
-                    }
-                    fat = fn_end;
+    for block in decline_impls() {
+        for name in ["fn slug", "fn refusal"] {
+            let mut fat = 0usize;
+            while let Some(rel) = block.body[fat..].find(name) {
+                let fn_start = fat + rel;
+                fat = fn_start + name.len();
+                let Some(brace_rel) = block.body[fat..].find('{') else {
+                    break;
+                };
+                let brace = fat + brace_rel;
+                let body_chars: Vec<char> = block.body.chars().collect();
+                let brace_ci = block.body[..brace].chars().count();
+                let fn_end = close_brace(&body_chars, brace_ci);
+                let fn_body =
+                    expand_ladder_slugs(&strip_attributes(&body_chars[brace_ci..fn_end]));
+                for slug in literals(&fn_body) {
+                    out.entry(slug).or_default().push(Owner {
+                        file: block.file.clone(),
+                        ty: block.ty.clone(),
+                    });
                 }
+                fat = fn_end;
             }
-            at = end;
         }
     }
     out
@@ -206,8 +153,7 @@ fn slug_owners(root: &Path) -> BTreeMap<String, Vec<Owner>> {
 
 #[test]
 fn no_two_checks_share_a_reason_slug() {
-    let root = workspace_root();
-    let owners = slug_owners(&root);
+    let owners = slug_owners();
 
     // Refuse a verdict until the scan has proved it can see the two impls that
     // spell the trait through its full path, which is the case the grep this
@@ -293,7 +239,7 @@ fn no_two_checks_share_a_reason_slug() {
 /// it once, for every slug the scan above already has in hand.
 #[test]
 fn every_slug_survives_the_documented_reason_grep() {
-    let owners = slug_owners(&workspace_root());
+    let owners = slug_owners();
     assert!(
         owners.len() > 500,
         "found {} slugs, which is not this crate's vocabulary",

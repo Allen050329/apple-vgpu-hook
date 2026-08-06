@@ -1,0 +1,964 @@
+//! Every typed decline says whether the guest lost work, and how.
+//!
+//! The decline vocabulary answers *what* refused — one slug per check, never
+//! shared — and that is the property `decline_slugs_are_unique` holds. It does
+//! not answer the question the standing goal is actually about: **did the guest
+//! lose work, and did this device execute something other than what the guest
+//! asked for?**
+//!
+//! `AGENTS.md` states the gap as advice to the reader:
+//!
+//! > A named reason on the fail channel is not automatically lost work. Some
+//! > report a repair that *succeeded*, fail-visible so the reliance stays
+//! > measurable. **Read the emitter.**
+//!
+//! Ninety-nine `impl Decline`/`impl Refusal` blocks is ninety-nine emitters to
+//! read, once per question, with no way to check the reading afterwards. So a
+//! boot log cannot be ranked by loss, and "which failure modes are left" —
+//! the thing this project is trying to drive to zero — is not a measurement
+//! anybody can take. This test makes it one: the population comes from a scan
+//! of the source, and each entry carries a written verdict that had to be
+//! reached by reading the caller.
+//!
+//! # The classes, worst first
+//!
+//! A type's verdict is the **worst** consequence any of its arms can carry, so
+//! a loss can never hide inside a type whose other arms are benign. That is a
+//! deliberate over-statement: this table is an upper bound on the harm each
+//! type can do, not a claim about the arm that fires most.
+//!
+//! # What a red here means
+//!
+//! Either a new decline type was added without saying what it costs the guest,
+//! or an existing one moved. Both want the same fix: read the emitter, write
+//! the verdict. Do not answer [`Loss::ExecutedModified`] to make a new type
+//! compile — that variant is a defect list, and
+//! [`the_executed_modified_census_only_shrinks`] is what stops it growing.
+
+mod source_scan;
+use source_scan::decline_impls;
+
+/// What the guest is left with when this decline fires.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Loss {
+    /// The device executed something **other than what the guest asked for**: a
+    /// record dropped out of a plural command while the rest ran, a table
+    /// truncated, a flag or an attribute ignored, a count clamped. No error
+    /// reaches the guest, and the frame or the compute result is wrong.
+    ///
+    /// A real GPU does not do this. This is the class the standing goal exists
+    /// to eliminate, and every entry must name what would retire it.
+    ExecutedModified,
+    /// The whole command was declined because this device does not implement
+    /// the feature. Honest — the guest is not lied to — but the work is lost,
+    /// and the fix is to implement it rather than to reclassify it.
+    Unimplemented,
+    /// The whole command was declined for a reason a real GPU also has: its
+    /// memory is full, the guest record is malformed, the request is outside
+    /// what the API can express. Refusing is the faithful answer.
+    Refused,
+    /// The host GPU, its driver, or the OS failed. No value of any constant in
+    /// this repository would have served the request.
+    HostFault,
+    /// Full fidelity kept. A cheaper rail declined and a correct slower one ran
+    /// instead — the copying path where an import was refused, the CPU gather
+    /// where the GPU could not reach guest pages. The reason must say which
+    /// rail was taken, because "refuses the fast rail" and "refuses the draw"
+    /// are different answers wearing similar words.
+    SlowPath,
+    /// The condition was detected and corrected. The guest's command executed
+    /// as asked; the line exists so the reliance on the repair stays visible.
+    Repaired,
+    /// Not a failure. Not-ready-yet, an intentionally unbound `ref == 0`,
+    /// ordering, or a census that borrows this vocabulary to name itself.
+    /// `AGENTS.md`: "Expected control flow should stay quiet."
+    Ordering,
+}
+
+/// One adjudicated decline type.
+struct Row {
+    /// Path relative to the workspace root, as the scan reports it.
+    file: &'static str,
+    /// The type the trait is implemented for.
+    ty: &'static str,
+    /// The worst consequence any arm of this type can carry.
+    loss: Loss,
+    /// Why, naming the arm that justifies the verdict and what the caller does
+    /// after it. For [`Loss::ExecutedModified`], also what would retire it.
+    why: &'static str,
+}
+
+/// How many types may answer [`Loss::ExecutedModified`].
+///
+/// Not a budget. A ratchet: see [`the_executed_modified_census_only_shrinks`].
+const EXECUTED_MODIFIED_CEILING: usize = 16;
+
+/// Every `impl Decline`/`impl Refusal` in the crate, and what its worst arm
+/// costs the guest.
+///
+/// Keyed by `(file, type)` rather than by type alone, because five distinct
+/// `DecodeStatus` types live in five modules and `Status` names two more.
+const ROWS: &[Row] = &[
+    Row {
+        file: "crates/reims-vgpu/src/backend/metal/error.rs",
+        ty: "Status",
+        loss: Loss::Refused,
+        why: "the Metal backend's own status; every non-ok class names an \
+              argument or execute check that stops the operation before it \
+              reaches the driver, and the caller returns rather than encoding",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/backend/metal/raw_metal.rs",
+        ty: "MetalPipelineDecline",
+        loss: Loss::Unimplemented,
+        why: "a compute pipeline Metal would not build with reflection; the \
+              dispatch is declined whole",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/backend/metal/raw_metal.rs",
+        ty: "MetalSamplerMaskOverflow",
+        loss: Loss::ExecutedModified,
+        why: "the emitter `continue`s past the sampler slot and finishes \
+              building the mask, so the shader samples a slot that never \
+              receives its default sampler. A healthy zero — the table this \
+              exceeds is Metal's own, so a firing means this backend's idea of \
+              it has parted from the driver's. Retired by deriving the bound \
+              from the driver rather than from a constant",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/backend/vulkan/engine/caches.rs",
+        ty: "VertexFormatWidenDecline",
+        loss: Loss::ExecutedModified,
+        why: "a three-component vertex format the host does not offer is \
+              widened to four and the pipeline is built anyway; its own doc \
+              says the pipeline is not byte-for-byte what the guest asked for. \
+              Retired by refusing the pipeline, or by proving the widened read \
+              is identical for every format in the table",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/backend/vulkan/engine/compute_execution.rs",
+        ty: "ComputeExecutionDecline",
+        loss: Loss::Refused,
+        why: "execute-time checks that resident state still matches what \
+              validation admitted; the dispatch does not run",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/backend/vulkan/engine/compute_validation.rs",
+        ty: "ComputeValidationDecline",
+        loss: Loss::Refused,
+        why: "structural checks on the dispatch request before any GPU work; \
+              the dispatch is declined whole",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/backend/vulkan/engine/context.rs",
+        ty: "PipelineCacheDecline",
+        loss: Loss::SlowPath,
+        why: "the pipeline cache failed to load, warm or persist; every draw \
+              still compiles and executes, from cold",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/backend/vulkan/engine/desc_arena.rs",
+        ty: "SetExceedsBlock",
+        loss: Loss::Refused,
+        why: "a descriptor set wants more of one type than an empty block \
+              holds, so growing the arena changes nothing; the draw is refused",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/backend/vulkan/engine/device_lost.rs",
+        ty: "DeviceLostDecline",
+        loss: Loss::HostFault,
+        why: "the driver returned ERROR_DEVICE_LOST or recreation failed",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/backend/vulkan/engine/dmabuf.rs",
+        ty: "DmaBufDecline",
+        loss: Loss::SlowPath,
+        why: "the guest-pages import was refused; the caller gathers the same \
+              bytes on the CPU into staging, which is the only rail on a host \
+              without the extension",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/backend/vulkan/engine/dmabuf.rs",
+        ty: "GuestWriteDecline",
+        loss: Loss::SlowPath,
+        why: "the GPU could not write the guest's pages directly; the frame \
+              lands through the copying writeback instead",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/backend/vulkan/engine/draw_execution.rs",
+        ty: "DrawExecutionDecline",
+        loss: Loss::Refused,
+        why: "execute-time disagreements between resident state and what \
+              validation admitted; the draw does not execute",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/backend/vulkan/engine/draw_preparation.rs",
+        ty: "DrawPreparationDecline",
+        loss: Loss::Refused,
+        why: "the draw could not be prepared — a missing pipeline, an MTLB \
+              that would not extract, a translation that failed; nothing runs",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/backend/vulkan/engine/draw_validation.rs",
+        ty: "DrawValidationDecline",
+        loss: Loss::Refused,
+        why: "structural checks on the draw request before any GPU work",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/backend/vulkan/engine/exec.rs",
+        ty: "BufferImportDecline",
+        loss: Loss::SlowPath,
+        why: "the vertex/index buffer could not be imported from guest pages; \
+              the bytes reach the GPU through the CPU gather instead",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/backend/vulkan/engine/exec.rs",
+        ty: "SampledImportDecline",
+        loss: Loss::SlowPath,
+        why: "the sampled texture could not be imported from guest pages; the \
+              texels are copied into staging instead",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/backend/vulkan/engine/facade_decline.rs",
+        ty: "EngineFacadeDecline",
+        loss: Loss::Refused,
+        why: "the façade's own state disagreed with the request — a presenter \
+              not attached, a resident that disappeared before it was pinned; \
+              the named operation does not proceed",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/backend/vulkan/engine/init_decline.rs",
+        ty: "InitDecline",
+        loss: Loss::Unimplemented,
+        why: "bring-up failed and the error is latched, so every later draw is \
+              refused with it. Not a per-command loss but the whole boot's; the \
+              retryable out-of-memory class is deliberately not latched",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/backend/vulkan/engine/pools/submission_and_buffers.rs",
+        ty: "ReadbackMemoryDegrade",
+        loss: Loss::SlowPath,
+        why: "the readback slot landed in uncached host memory; the bytes are \
+              correct and the copy out of it is roughly an order slower",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/backend/vulkan/engine/pools/teardown.rs",
+        ty: "ReadbackLeaseQuiesceExpired",
+        loss: Loss::HostFault,
+        why: "teardown waited out its quiesce window for lease holders that \
+              never returned, which is a broken invariant in the host layer \
+              rather than anything a guest asked for",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/backend/vulkan/engine/reason.rs",
+        ty: "DrawReason",
+        loss: Loss::Unimplemented,
+        why: "the draw names a feature this backend does not offer — a device \
+              feature bit not advertised, a Metal state with no Vulkan spelling \
+              here; the draw is refused whole",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/backend/vulkan/engine/reason.rs",
+        ty: "TargetReadDecline",
+        loss: Loss::Refused,
+        why: "the readback's identity is not in the registry, or its content \
+              is not ready; the read is refused and the caller is told which",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/backend/vulkan/engine/slab.rs",
+        ty: "SlabDecline",
+        loss: Loss::Refused,
+        why: "the suballocator refused a request an allocator may refuse — a \
+              zero size, an out-of-bounds or double release. `FreeListInvariant` \
+              poisons the block rather than risk aliasing two images",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/backend/vulkan/engine/types.rs",
+        ty: "DrawError",
+        loss: Loss::Unimplemented,
+        why: "the engine's outer error; it wraps the types adjudicated above \
+              and its worst arm is `Init`, which latches for the boot",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/backend/vulkan/engine/vk_call.rs",
+        ty: "VkCall",
+        loss: Loss::HostFault,
+        why: "a Vulkan entry point returned a failure; the op and the \
+              `vk::Result` are what the line carries",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/backend/vulkan/engine/window_present.rs",
+        ty: "SlateReason",
+        loss: Loss::Ordering,
+        why: "why the host window painted slate this frame — no source \
+              published, content not landed yet. The present succeeds; this \
+              names what there was to show, not a refusal",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/backend/vulkan/engine/window_present.rs",
+        ty: "StagingError",
+        loss: Loss::Refused,
+        why: "the CPU present fallback could not get a staging buffer; the \
+              frame degrades to slate on the host window. The host window is a \
+              development view, not the guest's own scanout",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/backend/vulkan/engine/window_present.rs",
+        ty: "WindowPresentDecline",
+        loss: Loss::Ordering,
+        why: "the swapchain has read suboptimal for many consecutive presents \
+              without converging; the present itself succeeds",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/backend/vulkan/translate/reason.rs",
+        ty: "TranslateReason",
+        loss: Loss::Unimplemented,
+        why: "a decoded Metal value has no Vulkan spelling this backend will \
+              emit; the command that carried it is refused rather than \
+              translated to something near it",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/contract/gva_resolve.rs",
+        ty: "ResolveStatus",
+        loss: Loss::Refused,
+        why: "the guest page-table walk faulted for a reason an MMU also has — \
+              an inactive task, a zero root, a malformed PTE",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/contract/iosurface_pages.rs",
+        ty: "Status",
+        loss: Loss::Refused,
+        why: "the IOSurface page list did not decode: a short descriptor, an \
+              address that is not a kernel VA, an internal field that \
+              contradicts the rest",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/contract/mipmap.rs",
+        ty: "MetalMipmapError",
+        loss: Loss::Refused,
+        why: "generation is refused for reasons Metal itself refuses — a zero \
+              dimension, a level count the API rejects, a buffer too short",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/host_window/present.rs",
+        ty: "WindowError",
+        loss: Loss::Unimplemented,
+        why: "the development host window could not come up. It is not the \
+              guest's scanout, so no guest command is lost with it",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/model/state.rs",
+        ty: "FailEvent",
+        loss: Loss::ExecutedModified,
+        why: "an unrecognised root or child opcode is dropped while the \
+              packet's stamps retire, so the guest is told the work completed. \
+              Retired by identifying the opcode, or by withholding the stamp \
+              that says it ran",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/model/state.rs",
+        ty: "PresentBacking",
+        loss: Loss::Ordering,
+        why: "a census of whether the presented resident was ever stored; the \
+              present executes either way",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/model/state.rs",
+        ty: "StateMutationDecline",
+        loss: Loss::Refused,
+        why: "a device-state mutation carrying a value outside its declared \
+              range; the mutator returns false and the state is not moved",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/observe/emit.rs",
+        ty: "Fake",
+        loss: Loss::Ordering,
+        why: "the fixture `observe::emit`'s own tests drive the line builder \
+              with; it names no check in the device",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/observe/panic.rs",
+        ty: "AbiPanic",
+        loss: Loss::HostFault,
+        why: "this device panicked inside a C ABI entry point; the catch turns \
+              it into an error code instead of unwinding into QEMU",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/qemu/host_ops.rs",
+        ty: "QemuHostDecline",
+        loss: Loss::HostFault,
+        why: "a host callback QEMU was to install is missing or failed",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/runtime/blit_exec/mod.rs",
+        ty: "BlitStatus",
+        loss: Loss::Unimplemented,
+        why: "`Unsupported` covers whole blit families this device does not \
+              implement — swizzled type-8 views, multisample, PVRTC rows; the \
+              blit is declined whole",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/runtime/census/present_proxy.rs",
+        ty: "MrtDrop",
+        loss: Loss::ExecutedModified,
+        why: "a multi-render-target draw is degraded to a single target and \
+              executed, so a later sample of the dropped attachment reads what \
+              was there before. Retired by carrying every attachment through \
+              the render pass",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/runtime/census/present_proxy.rs",
+        ty: "WindowPublishDrop",
+        loss: Loss::Ordering,
+        why: "a census of frames the window publisher skipped because the \
+              resident was not ready; the guest's own scanout is unaffected",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/runtime/census/view_swizzle_census.rs",
+        ty: "SwizzleDecline",
+        loss: Loss::Repaired,
+        why: "a non-identity swizzle the host could not bind directly was \
+              applied by rewriting every texel on the CPU. The output is what \
+              the guest asked for; the zero-copy property is what was lost",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/runtime/compute_exec/mod.rs",
+        ty: "ComputeBindOverflow",
+        loss: Loss::ExecutedModified,
+        why: "the bind loop `continue`s past the slot and dispatches with that \
+              index unbound; nothing downstream refuses on its absence. The \
+              bound is Metal's own argument-table width, so a firing is a \
+              guest record Metal would also reject — but Metal raises, and this \
+              device draws. Retired by refusing the dispatch",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/runtime/compute_exec/mod.rs",
+        ty: "ComputeSpirvDecline",
+        loss: Loss::Refused,
+        why: "the kernel module's header is short or misaligned; it cannot be \
+              reflected and the dispatch is refused",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/runtime/compute_exec/mod.rs",
+        ty: "ComputeStatus",
+        loss: Loss::Refused,
+        why: "the dispatch names a pipeline, buffer or texture that is not \
+              there, or a grid that is not describable; it does not run",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/runtime/decode/blit.rs",
+        ty: "BlitOptionError",
+        loss: Loss::Refused,
+        why: "the blit option word carries bits this decoder does not know, or \
+              aspect bits that contradict each other; the record is refused",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/runtime/decode/blit.rs",
+        ty: "DecodeStatus",
+        loss: Loss::Refused,
+        why: "a short or unknown blit record; nothing is executed from it",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/runtime/decode/compute.rs",
+        ty: "DecodeStatus",
+        loss: Loss::Refused,
+        why: "a short, unknown or unsupported compute record; nothing is \
+              executed from it",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/runtime/decode/event.rs",
+        ty: "DecodeStatus",
+        loss: Loss::Refused,
+        why: "a short, mis-lengthed or unknown event record; nothing is \
+              executed from it",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/runtime/decode/fifo.rs",
+        ty: "ResourceListDecodeError",
+        loss: Loss::Refused,
+        why: "the resource list's header or body does not match its declared \
+              structure; the whole invalidate/synchronize is abandoned rather \
+              than applied to the entries that did parse",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/runtime/decode/render/mod.rs",
+        ty: "DecodeStatus",
+        loss: Loss::Refused,
+        why: "a short, unknown, mis-lengthed or out-of-range render record. \
+              Note `OtherAccepted` is not a decode — it is the catch-all for \
+              'no arm claimed this', and reading it as success hides a family \
+              of lost records behind a green run",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/runtime/decode/resource/mod.rs",
+        ty: "ColorAttachDropped",
+        loss: Loss::ExecutedModified,
+        why: "a colour-attachment field is discarded and parsing continues, so \
+              the attachment is built without the value the guest set. Retired \
+              by refusing the pipeline as `ColorAttachIndexOutOfRange` beside \
+              it already does",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/runtime/decode/resource/mod.rs",
+        ty: "ColorAttachIndexOutOfRange",
+        loss: Loss::Refused,
+        why: "an attachment index past the table; the pipeline is refused \
+              whole with `ErrUnsupported`",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/runtime/decode/resource/mod.rs",
+        ty: "ColorAttachTableTruncated",
+        loss: Loss::Refused,
+        why: "the attachment section is incomplete; every path out of it \
+              refuses the pipeline rather than building the entries that fit",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/runtime/decode/resource/mod.rs",
+        ty: "ColorWriteMaskOutOfRange",
+        loss: Loss::ExecutedModified,
+        why: "a write mask wider than four bits is replaced with all-channels \
+              and the decode returns Ok, so the pipeline writes channels the \
+              guest may have masked off. Retired by refusing the record",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/runtime/decode/resource/mod.rs",
+        ty: "DecodeStatus",
+        loss: Loss::Refused,
+        why: "a short, unknown-typed or unsupported resource descriptor; the \
+              object is not created",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/runtime/decode/resource/mod.rs",
+        ty: "VertexDescriptorTruncated",
+        loss: Loss::Refused,
+        why: "an attribute or layout count past this device's table; the \
+              caller returns `Err` immediately after the line, so no partial \
+              descriptor is built",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/runtime/decode/stream.rs",
+        ty: "DecodeStatus",
+        loss: Loss::Refused,
+        why: "the stream's framing does not hold; the walk stops rather than \
+              guessing where the next record begins",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/runtime/decode/stream.rs",
+        ty: "SegmentDisposition",
+        loss: Loss::Ordering,
+        why: "which of walk/envelope/unknown a segment is. Only `Unknown` is a \
+              refusal, and it stops that segment alone",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/runtime/drain/mod.rs",
+        ty: "WrapperUpperHalf",
+        loss: Loss::ExecutedModified,
+        why: "the wrapper word's upper half is non-zero and the dispatch uses \
+              the lower half regardless, so a record is executed as an opcode \
+              the guest did not name. Retired by learning what the upper half \
+              selects, or by refusing the packet until it is known",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/runtime/draw/metal_icb.rs",
+        ty: "MetalIcbInheritanceDecline",
+        loss: Loss::Refused,
+        why: "a parent encoder state an ICB cannot inherit; the ICB execute is \
+              refused rather than run under the wrong state",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/runtime/draw/mod.rs",
+        ty: "EncodeStatus",
+        loss: Loss::Refused,
+        why: "the render encode could not start or complete — a missing \
+              pipeline or MTLB, a Metal failure, bad arguments",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/runtime/draw/mod.rs",
+        ty: "IndexLoadReason",
+        loss: Loss::Refused,
+        why: "the indexed draw's index bytes could not be loaded or validated; \
+              the draw is refused rather than issued over a partial buffer",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/runtime/draw/mod.rs",
+        ty: "MetalStateDecline",
+        loss: Loss::Refused,
+        why: "a sampler or depth-stencil state would not resolve or decode; \
+              the draw is refused",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/runtime/draw/render_target.rs",
+        ty: "RenderTargetRefusal",
+        loss: Loss::Refused,
+        why: "no rung resolved the attachment to something renderable. \
+              `LinearPastAllocation` is the sharp one: the rows would end past \
+              the allocation, and writing them is guest memory this device does \
+              not own",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/runtime/draw/texture_view.rs",
+        ty: "LinearLoadRefusal",
+        loss: Loss::Refused,
+        why: "a linear texture could not be loaded for sampling or seeding; \
+              the operation is refused",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/runtime/draw/texture_view.rs",
+        ty: "TextureViewDecline",
+        loss: Loss::Refused,
+        why: "the view chain would not resolve — a missing entry, an \
+              undecodable descriptor, a chain that cycles or overruns",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/runtime/draw/vulkan.rs",
+        ty: "SurfaceResidentArmDecline",
+        loss: Loss::SlowPath,
+        why: "the deferred resident window could not be armed; the caller \
+              takes the synchronous readback instead and the frame is correct",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/runtime/draw/vulkan.rs",
+        ty: "Type11SeedDecline",
+        loss: Loss::Ordering,
+        why: "which rung a type-11 seed came from, or that there was no entry \
+              to seed from; a census of the lookup, not a refusal",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/runtime/draw/vulkan.rs",
+        ty: "Type5ViewDecline",
+        loss: Loss::ExecutedModified,
+        why: "the read arm keeps the bytes it gathered before the fault and \
+              leaves the rest of the window at whatever the destination held, \
+              then binds it. Retired by discarding a short gather instead of \
+              binding it",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/runtime/exec/mod.rs",
+        ty: "BindSlotPastTable",
+        loss: Loss::ExecutedModified,
+        why: "the bind loop breaks at the first slot past the table, so the \
+              rest of a plural bind record never lands and the draws that \
+              follow run against the partial state. Retired by refusing the \
+              record",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/runtime/exec/mod.rs",
+        ty: "ChainAbandonDecline",
+        loss: Loss::ExecutedModified,
+        why: "the chain `break`s at the offending draw after landing the \
+              earlier image, so every later draw in the guest's list is \
+              dropped while the ones before it stand. Retired by refusing the \
+              whole chain, which is what makes the frame consistent",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/runtime/exec/mod.rs",
+        ty: "IcbRecordDropped",
+        loss: Loss::ExecutedModified,
+        why: "a reset or copy of an indirect command buffer is dropped, so a \
+              later execute runs the commands that were supposed to have been \
+              cleared or replaced. Retired by implementing both records",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/runtime/exec/mod.rs",
+        ty: "ResourceTableDecline",
+        loss: Loss::Ordering,
+        why: "`TailPopulated` counts resource-table fields this device does \
+              not read; it names what is unrecovered, and nothing is refused",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/runtime/exec/mod.rs",
+        ty: "StreamDrawDrop",
+        loss: Loss::ExecutedModified,
+        why: "a draw whose state could not be honoured — an unsupported \
+              colour subresource, a depth-stencil this rail cannot bind — is \
+              issued anyway against a different attachment or level. Retired by \
+              refusing the draw",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/runtime/exec/mod.rs",
+        ty: "TextureFillDropped",
+        loss: Loss::ExecutedModified,
+        why: "a texture fill is dropped and the region keeps what it held, so \
+              the guest reads back content it believes it just wrote. Retired \
+              by implementing the fill",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/runtime/fence_exec.rs",
+        ty: "FenceStatus",
+        loss: Loss::Refused,
+        why: "the fence or event operation names something this device's \
+              synchronisation model cannot express; it is declined whole",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/runtime/gather_witness.rs",
+        ty: "GatherWitnessFault",
+        loss: Loss::Repaired,
+        why: "the witness caught its own vouch breaking under audit and \
+              dropped the stale generation, so the next bind re-gathers. The \
+              line is what keeps the reliance on the elision measurable",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/runtime/heap_query.rs",
+        ty: "QueryError",
+        loss: Loss::Refused,
+        why: "the heap-size query could not be decoded or answered; the reply \
+              carries a zero requirement rather than a guess",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/runtime/host.rs",
+        ty: "DmaBufExportError",
+        loss: Loss::SlowPath,
+        why: "guest pages could not be exported as a dma-buf — most often \
+              because guest RAM is not fd-backed; every rail behind it copies \
+              instead, which is the only arm on most hosts",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/runtime/host.rs",
+        ty: "MemError",
+        loss: Loss::Refused,
+        why: "a guest memory read or write did not resolve; the caller is told \
+              rather than handed zeroes",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/runtime/icb/mod.rs",
+        ty: "DroppedVertexAttribute",
+        loss: Loss::ExecutedModified,
+        why: "an attribute location the pipeline has no input for is dropped \
+              and the draw is issued, so the shader reads whatever was bound \
+              before. Retired by refusing the draw",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/runtime/icb/mod.rs",
+        ty: "IcbFlagDropped",
+        loss: Loss::ExecutedModified,
+        why: "eight decoded create-descriptor flags reach no host setter, so \
+              the ICB is built with Metal's default where the guest set its \
+              own. Six of the eight default on at both ends, which is why each \
+              counter is a healthy zero and a non-zero reading names the flag \
+              to build a setter for",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/runtime/icb/mod.rs",
+        ty: "IcbStatus",
+        loss: Loss::Refused,
+        why: "the ICB operation names something missing or a Metal call that \
+              failed; the command slot does not execute",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/runtime/m2v_cache.rs",
+        ty: "M2vCacheDecline",
+        loss: Loss::Unimplemented,
+        why: "the shader could not be translated to SPIR-V; the draw is \
+              abandoned rather than issued against a different program",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/runtime/mapper/mod.rs",
+        ty: "MapperDecline",
+        loss: Loss::Refused,
+        why: "the capture's own fields contradict each other or name a kernel \
+              address that is not one; the mapping never attaches, so every \
+              later use of it fails visibly rather than reading elsewhere",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/runtime/mapping_write/mod.rs",
+        ty: "GpuWritebackDecline",
+        loss: Loss::SlowPath,
+        why: "the GPU could not write the guest's pages for this window; the \
+              copying writeback lands the same frame",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/runtime/mapping_write/mod.rs",
+        ty: "SurfaceWriteRefusal",
+        loss: Loss::Refused,
+        why: "the writeback has no mapping, or the geometry or format it \
+              would write does not match the one recorded; nothing is written",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/runtime/mipmap.rs",
+        ty: "MipmapStatus",
+        loss: Loss::Unimplemented,
+        why: "mip generation names a format or level shape this device does \
+              not build; the upper levels keep whatever they held",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/runtime/mtlb.rs",
+        ty: "MtlbDecline",
+        loss: Loss::Refused,
+        why: "the shader container did not parse — a missing wrapper, a \
+              truncated header, a blob that runs past its extent",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/runtime/scanout/mod.rs",
+        ty: "CaptureDecline",
+        loss: Loss::Refused,
+        why: "the scanout source could not be captured; the console paints \
+              nothing rather than stale or wrong pixels",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/runtime/scanout/mod.rs",
+        ty: "ConsoleEfiRowRefused",
+        loss: Loss::HostFault,
+        why: "the page walk said the row was readable and the read then \
+              refused, which is two host answers contradicting each other",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/runtime/spirv_bind.rs",
+        ty: "ImageFormatSpecializeError",
+        loss: Loss::Refused,
+        why: "the module's image bindings could not be specialised; the \
+              translation fails rather than binding an unspecialised format",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/runtime/spirv_bind.rs",
+        ty: "UnclassifiedBinding",
+        loss: Loss::Ordering,
+        why: "a `Binding` decoration whose variable the classifier could not \
+              name; the binding's own band still names it, so the descriptor \
+              lands where it belongs",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/runtime/spirv_layout.rs",
+        ty: "SpirvLayoutDecline",
+        loss: Loss::Refused,
+        why: "the module's layout could not be read or repaired; translation \
+              stops rather than emitting a module with wrong offsets",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/runtime/surface_cache/mod.rs",
+        ty: "GvaCapDecline",
+        loss: Loss::Ordering,
+        why: "the byte cap could not be enforced because every entry was \
+              protected, in flight or not guest-held. It is the cap that \
+              yields, not the guest's data: nothing is dropped and the map \
+              runs over until an entry becomes evictable",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/runtime/surface_cache/mod.rs",
+        ty: "LinearMaterializeDecline",
+        loss: Loss::SlowPath,
+        why: "the linear entry could not be materialised from the resident; \
+              the non-resident path writes the guest's pages instead",
+    },
+    Row {
+        file: "crates/reims-vgpu/src/runtime/task_slot.rs",
+        ty: "TaskWordDecode",
+        loss: Loss::Refused,
+        why: "the command's task word names a slot that is not live; the \
+              command is refused rather than applied to a neighbouring task",
+    },
+];
+
+/// Every `impl Decline`/`impl Refusal` in the crate has a verdict, and every
+/// verdict names an impl that still exists.
+#[test]
+fn every_decline_says_whether_the_guest_lost_work() {
+    let found = decline_impls();
+
+    // Refuse a verdict until the scan has proved it can see the two impls that
+    // spell the trait through its full path, which is the case a `grep -rn
+    // 'impl Decline for'` misses. A scan that has gone blind reports a small
+    // population every row of which is present, and reads exactly like a tidy
+    // tree.
+    for (file, ty) in [
+        ("crates/reims-vgpu/src/runtime/gather_witness.rs", "GatherWitnessFault"),
+        ("crates/reims-vgpu/src/runtime/mapping_write/mod.rs", "SurfaceWriteRefusal"),
+    ] {
+        assert!(
+            found.iter().any(|i| i.file == file && i.ty == ty),
+            "the scan did not find `{ty}` in {file}, which spells the trait \
+             through its full path — so its notion of `every decline` is a \
+             blind spot and not a measurement"
+        );
+    }
+    assert!(
+        found.len() > 50,
+        "found {} decline impls, which is not this crate's vocabulary",
+        found.len()
+    );
+
+    let mut unadjudicated: Vec<String> = Vec::new();
+    for i in &found {
+        if !ROWS.iter().any(|r| r.file == i.file && r.ty == i.ty) {
+            unadjudicated.push(format!("{} ({})", i.ty, i.file));
+        }
+    }
+
+    let mut stale: Vec<String> = Vec::new();
+    for r in ROWS {
+        if !found.iter().any(|i| i.file == r.file && i.ty == r.ty) {
+            stale.push(format!("{} ({})", r.ty, r.file));
+        }
+    }
+
+    // Both directions in one report, because the commonest cause of either is a
+    // rename, which produces one of each — and asserting them in sequence shows
+    // the author half the evidence and sends them to write a second verdict for
+    // a type that already has one.
+    let mut report = String::new();
+    if !unadjudicated.is_empty() {
+        report.push_str(&format!(
+            "\nthese declines do not say what the guest loses when they fire. \
+             Read the emitter — what the caller does *after* the decline is the \
+             answer, not the variant's name — and add a row:\n  {}",
+            unadjudicated.join("\n  ")
+        ));
+    }
+    if !stale.is_empty() {
+        report.push_str(&format!(
+            "\nthese verdicts name declines that no longer exist. A verdict \
+             left behind by a rename points at nothing and reads as \
+             adjudicated:\n  {}",
+            stale.join("\n  ")
+        ));
+    }
+    assert!(report.is_empty(), "{report}");
+
+    // One row per impl: a duplicate row is two verdicts about one type, and the
+    // reader has no way to know which was meant.
+    let mut keys: Vec<(&str, &str)> = ROWS.iter().map(|r| (r.file, r.ty)).collect();
+    keys.sort_unstable();
+    let before = keys.len();
+    keys.dedup();
+    assert_eq!(before, keys.len(), "a decline type carries two verdicts");
+}
+
+/// The list of places this device executes a command the guest did not ask for
+/// only ever gets shorter.
+///
+/// A ratchet rather than an assertion of zero, because it is not zero. What it
+/// buys is that the number cannot drift upwards while every individual commit
+/// looks reasonable: adding an eighteenth truncation is a decision somebody has
+/// to make on purpose, in this file, against a comment saying what the class
+/// costs.
+///
+/// **Lower this when you retire one.** It is the only counter in the tree that
+/// measures the standing goal directly.
+#[test]
+fn the_executed_modified_census_only_shrinks() {
+    let census: Vec<&Row> = ROWS
+        .iter()
+        .filter(|r| r.loss == Loss::ExecutedModified)
+        .collect();
+
+    assert!(
+        census.len() <= EXECUTED_MODIFIED_CEILING,
+        "{} decline types can execute a modified guest command, above the \
+         ceiling of {EXECUTED_MODIFIED_CEILING}. A GPU refuses; it does not \
+         quietly do something else:\n  {}",
+        census.len(),
+        census
+            .iter()
+            .map(|r| format!("{} ({}) — {}", r.ty, r.file, r.why))
+            .collect::<Vec<_>>()
+            .join("\n  ")
+    );
+
+    assert_eq!(
+        census.len(),
+        EXECUTED_MODIFIED_CEILING,
+        "the census is below its ceiling, which means one was retired and the \
+         ceiling was not lowered. Lower it to {} so the ground that was won \
+         cannot be given back",
+        census.len()
+    );
+}

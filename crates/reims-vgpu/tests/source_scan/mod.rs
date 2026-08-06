@@ -322,6 +322,112 @@ pub fn close_brace(chars: &[char], open: usize) -> usize {
     chars.len()
 }
 
+/// One `impl Decline for T` or `impl Refusal for T` block, and its body text.
+///
+/// The identity is `(file, ty)` rather than `ty` alone: five distinct
+/// `DecodeStatus` types live in five modules, and `Status` names two more, so
+/// the type name on its own merges checks that have nothing to do with each
+/// other.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DeclineImpl {
+    /// Path relative to the workspace root.
+    pub file: String,
+    /// The type the trait is implemented for.
+    pub ty: String,
+    /// Which of the two traits this block implements.
+    pub trait_name: String,
+    /// The block's body, comments blanked, braces included.
+    pub body: String,
+}
+
+/// Every `impl Decline`/`impl Refusal` block in `reims-vgpu`'s source.
+///
+/// Reading source text rather than compiled code is what makes this answer for
+/// the whole crate on either arm: a `#[cfg(feature = "backend-metal")]` decline
+/// is text on a Vulkan host, so it is seen here even though nothing on this
+/// pathway can construct one.
+///
+/// The obvious `grep -rn 'impl Decline for'` is not a substitute in either
+/// direction. It misses the two impls that spell the trait through its full
+/// path — `GatherWitnessFault` and `SurfaceWriteRefusal` both write
+/// `impl crate::observe::decline::Decline` — and it picks up one that does not
+/// exist, the `impl<T: Decline> Display for T` written inside a doc comment in
+/// `observe/decline.rs`. Matching the identifier immediately before the last
+/// ` for ` handles the first; blanking comments first handles the second.
+///
+/// Callers that depend on seeing the whole population should assert the
+/// fully-qualified two are present before believing a count, because a scan
+/// that has gone blind reports a small clean population and reads exactly like
+/// a tidy tree.
+pub fn decline_impls() -> Vec<DeclineImpl> {
+    let root = workspace_root();
+    let sources = rust_sources(&root.join("crates/reims-vgpu/src"));
+    assert!(
+        sources.len() > 50,
+        "walked {} files, which is not this crate",
+        sources.len()
+    );
+
+    let mut out = Vec::new();
+    for path in sources {
+        let raw = std::fs::read_to_string(&path).expect("crate source must be readable");
+        let text = blank_comments(&raw);
+        let chars: Vec<char> = text.chars().collect();
+        let file = path
+            .strip_prefix(&root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .into_owned();
+
+        let mut at = 0usize;
+        while let Some(found) = text[at..].find("impl") {
+            let start = at + found;
+            at = start + "impl".len();
+            // A bare `impl` token, not the tail of an identifier.
+            if start > 0 && (text.as_bytes()[start - 1] as char).is_alphanumeric() {
+                continue;
+            }
+            let Some(open_rel) = text[at..].find('{') else {
+                break;
+            };
+            let open = at + open_rel;
+            let header = &text[at..open];
+            // `impl<…> Trait for Type`: the trait is the identifier just before
+            // the last ` for `, so a fully-qualified path matches and a generic
+            // bound (`impl<T: Decline> Display for T`) does not.
+            let Some(for_rel) = header.rfind(" for ") else {
+                continue;
+            };
+            let head_chars: Vec<char> = header.chars().collect();
+            let for_idx = header[..for_rel].chars().count();
+            let trait_name = ident_ending_at(&head_chars, for_idx);
+            if trait_name != "Decline" && trait_name != "Refusal" {
+                continue;
+            }
+
+            let open_chars = text[..open].chars().count();
+            let end = close_brace(&chars, open_chars);
+            out.push(DeclineImpl {
+                file: file.clone(),
+                ty: header[for_rel + " for ".len()..].trim().to_string(),
+                trait_name: trait_name.to_string(),
+                body: chars[open_chars..end].iter().collect(),
+            });
+            at = end;
+        }
+    }
+    out
+}
+
+/// The identifier immediately before `end` in `chars`, if any.
+pub fn ident_ending_at(chars: &[char], end: usize) -> String {
+    let mut start = end;
+    while start > 0 && (chars[start - 1].is_alphanumeric() || chars[start - 1] == '_') {
+        start -= 1;
+    }
+    chars[start..end].iter().collect()
+}
+
 /// Remove `#[…]` attribute spans, whose own string literals are not the code's.
 ///
 /// `#[cfg(all(feature = "backend-metal", target_os = "macos"))]` is the case

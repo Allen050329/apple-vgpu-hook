@@ -195,6 +195,7 @@ simply the wrong number, a length four bytes off, or a field two bytes too wide:
 | Does a decoded record fail a guard and vanish into a no-op catch-all? | `scripts/silent-arms` |
 | Does a constant crossing the C boundary have the test this file asks for? | `scripts/abi-pins` |
 | Do two checks share a `reason=` slug, and so share `fail_once`'s latch? | `crates/reims-vgpu/tests/decline_slugs_are_unique.rs` |
+| Does a decline say whether the guest lost work, or just what refused? | `crates/reims-vgpu/tests/a_decline_says_whether_the_guest_lost_work.rs` |
 | Does a test pass only because of what ran before it? | `scripts/test-isolation` |
 | Is a Vulkan value spelled outside the `translate/` table that owns it? | `crates/reims-vgpu/tests/vulkan_state_enums_live_in_translate.rs` |
 | Does anything reach a Vulkan 1.3 core name the 1.2 floor forbids? | `crates/reims-vgpu/tests/nothing_reaches_past_the_vulkan_api_floor.rs` |
@@ -257,7 +258,9 @@ success hides a whole family of lost records behind a green run.
   begins with its own event name and an off-channel one begins with the literal `OFF `, so
   `grep -v '^OFF '` first.
 - **A named reason on the fail channel is not automatically lost work.** Some report a repair that
-  *succeeded*, fail-visible so the reliance stays measurable. Read the emitter.
+  *succeeded*, fail-visible so the reliance stays measurable. The reading is written down per type
+  in `a_decline_says_whether_the_guest_lost_work`, so look the slug's owning type up there before
+  re-deriving it from the emitter — and correct the row if the emitter disagrees.
 - **A counter and a fail line count different things.** Emitters dedupe; counters do not. Do not
   quote one as the other.
 - **`store_routes` counters are per-window: sum the samples.** They reset each census interval, so
