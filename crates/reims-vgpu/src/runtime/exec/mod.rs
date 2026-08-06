@@ -49,9 +49,6 @@ use reims_vgpu_wire::ops::render_pass as wire_pass;
 use reims_vgpu_wire::ops::tile as wire_tile;
 use std::sync::Arc;
 
-/// Max descriptors per ExecIndirect2 (wire table size), not a byte budget.
-const MAX_CMDBUFS: usize = 16;
-
 /// One stage's bind table as a draw sees it.
 ///
 /// `Arc` rather than a plain `Vec` because a render stream's draws share their
@@ -374,7 +371,18 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
         Vec::new()
     });
 
-    let n_cb = (cmdbuf_count as usize).min(MAX_CMDBUFS);
+    // Every command buffer the header declares, because `need` above already
+    // bounded how many there can be: the guest cannot claim a table longer than
+    // the descriptors it actually supplied, so `cmdbuf_count` is capped by
+    // `payload.len() / CHILD_EXEC_INDIRECT_CMDBUF_DESC_LEN` and `with_capacity`
+    // below cannot be talked into an allocation the payload does not back.
+    //
+    // A fixed ceiling used to sit here and truncate with `.min()`, above the
+    // check that already bounded the same number. Nothing derived it — a
+    // submission of 17 lost its last command buffer entirely, before the loop,
+    // with no fail line, which is a whole packet of guest draws vanishing into a
+    // silently shorter table.
+    let n_cb = cmdbuf_count as usize;
     let page_shift = state.page_shift;
     let mut streams = Vec::with_capacity(n_cb);
     for i in 0..n_cb {

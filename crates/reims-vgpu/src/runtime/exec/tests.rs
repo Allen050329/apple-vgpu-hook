@@ -3316,3 +3316,74 @@ fn every_decoded_but_unapplied_render_state_reaches_its_own_counter() {
         }
     }
 }
+
+/// Every command buffer the submission declares is visited, however many
+/// there are.
+///
+/// A fixed ceiling used to truncate the table with `.min()` before the loop
+/// started, so a guest submitting more than it dropped the remainder whole —
+/// no encode, no refusal, no line. That is the worst shape a loss can take:
+/// the report comes back well-formed and the missing draws are simply not in
+/// it, so nothing downstream can tell a short submission from a truncated one.
+///
+/// Nothing derived the ceiling. The payload-length check above the loop
+/// already bounds the count — the guest cannot declare a table longer than the
+/// descriptors it supplied — so the ceiling only ever cut submissions that
+/// were entirely well-formed.
+///
+/// The probe is the per-descriptor `len=0` skip line, because it fires from
+/// inside the loop body: one line per descriptor actually reached. Counting
+/// them measures how far the loop went, which is exactly what the ceiling
+/// changed. The count is deliberately above any round number a re-introduced
+/// ceiling would pick.
+#[test]
+fn every_declared_command_buffer_is_visited_not_just_the_first_sixteen() {
+    const N_CB: u32 = 33;
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+    state.define_task(3, 0x1_0000, 2);
+
+    let mut payload = vec![
+        0u8;
+        CHILD_EXEC_INDIRECT_HEADER_LEN as usize
+            + N_CB as usize * CHILD_EXEC_INDIRECT_CMDBUF_DESC_LEN as usize
+    ];
+    st32(&mut payload[CHILD_EXEC_INDIRECT_TASK_ID as usize..], 3);
+    st32(
+        &mut payload[CHILD_EXEC_INDIRECT_CMDBUF_COUNT as usize..],
+        N_CB,
+    );
+    // Distinct per-descriptor GVAs so the lines cannot be confused for one
+    // descriptor reported repeatedly. Length stays zero: this test is about
+    // which descriptors are reached, not what loading one does.
+    for i in 0..N_CB as usize {
+        let off = CHILD_EXEC_INDIRECT_HEADER_LEN as usize
+            + i * CHILD_EXEC_INDIRECT_CMDBUF_DESC_LEN as usize;
+        st64(
+            &mut payload[off + CHILD_EXEC_INDIRECT_CMDBUF_GVA as usize..],
+            0x1_0000 + i as u64,
+        );
+    }
+
+    let cap = crate::observe::sink::FailCapture::start();
+    let r = process_exec_indirect2(&mut state, &mut host, &payload);
+    assert_eq!(r.task_id, 3);
+    let visited: Vec<String> = cap
+        .lines()
+        .into_iter()
+        .filter(|l| l.split_whitespace().next() == Some("exec_cmdbuf"))
+        .collect();
+    assert_eq!(
+        visited.len(),
+        N_CB as usize,
+        "the loop stopped short of the declared table: {visited:?}"
+    );
+    // Name the last one explicitly, so a future truncation that happens to
+    // keep the count (by reporting something else per descriptor) still fails.
+    assert!(
+        visited
+            .iter()
+            .any(|l| l.contains(&format!("i={}", N_CB - 1))),
+        "the final declared command buffer was never reached: {visited:?}"
+    );
+}
