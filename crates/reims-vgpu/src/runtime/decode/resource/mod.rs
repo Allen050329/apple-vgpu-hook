@@ -1099,22 +1099,24 @@ pub const VERTEX_LAYOUT_TAG_STRIDE: u8 = 0x03;
 /// because the Vulkan arm decodes the same descriptor and must lose the same
 /// attributes or none.
 pub const MAX_VERTEX_ATTRS: usize = 31;
-/// `MTLVertexDescriptor.layouts` is the matching 31-slot array. A layout naming
-/// a buffer index at or above this contributes no stride, and every attribute
-/// pointing at it then reads at stride 0 — every vertex fetching the same
-/// element. See [`VertexDescriptorTruncated`].
+/// `MTLVertexDescriptor.layouts` is the matching 31-slot array, so it has no
+/// subscript at or above this and a layout naming one cannot be built. See
+/// [`VertexDescriptorTruncated`].
 pub const MAX_VERTEX_LAYOUTS: usize = 31;
 
 /// A vertex descriptor that named more attributes or layout buffer indices than
-/// [`MAX_VERTEX_ATTRS`] / [`MAX_VERTEX_LAYOUTS`] admit.
+/// [`MAX_VERTEX_ATTRS`] / [`MAX_VERTEX_LAYOUTS`] admit — which is to say, more
+/// than `MTLVertexDescriptor` has slots for.
 ///
-/// Both losses are silent downstream and neither is recoverable. A dropped
-/// attribute is indistinguishable from a guest that declared fewer, so the draw
-/// runs with a stage input the shader expects and never receives. A dropped
-/// layout is worse than indistinguishable: the attributes that named its buffer
-/// fall through to `stride = 0`, which is a well-formed pipeline that fetches
-/// element zero for every vertex — geometry collapsed to a point, with nothing
-/// refusing.
+/// This is the line beside the refusal, not beside a truncation. Truncating is
+/// what [`parse_vertex_block`] used to do, and neither loss was recoverable or
+/// even visible downstream: a dropped attribute is indistinguishable from a
+/// guest that declared fewer, so the draw runs with a stage input the shader
+/// expects and never receives; a dropped layout is worse, because the attributes
+/// that named its buffer fell through to `stride = 0` — a well-formed pipeline
+/// that fetches element zero for every vertex, geometry collapsed to a point,
+/// with nothing refusing. The block now returns `Err` in both cases and the
+/// pipeline load reports `desc_decode` on top of this line.
 ///
 /// Named for the same reason [`ColorAttachTableTruncated`] is, and it is the
 /// sibling this decoder was missing: the colour-attachment table 500 lines below
@@ -1806,15 +1808,20 @@ pub fn parse_vertex_block(
         let declared_step_rate =
             entry_tag_u32_present(bytes, block_end, entry, VERTEX_LAYOUT_TAG_STEP_RATE);
         if (buffer_index as usize) >= MAX_VERTEX_LAYOUTS {
-            // Every attribute naming this buffer falls through to stride 0 below,
-            // which draws every vertex from element zero. Say so; a zero stride
-            // is a valid pipeline and nothing further down can tell it from one
-            // the guest asked for.
+            // `MTLVertexDescriptor.layouts` has no such subscript, so this is a
+            // descriptor no Apple driver produces and one this decoder cannot
+            // implement. Refusing the pipeline is the only outcome that does not
+            // guess: keeping the block dropped the stride, every attribute naming
+            // this buffer fell through to 0, and a zero stride is a *valid*
+            // pipeline that fetches element zero for every vertex — geometry
+            // collapsed to a point, indistinguishable downstream from a guest
+            // that asked for it.
             note_vertex_truncated(
                 "layout_buffer_index",
                 buffer_index as usize,
                 MAX_VERTEX_LAYOUTS,
             );
+            return Err(DecodeStatus::ErrUnsupported("res_vertex_layout_buffer_oob"));
         } else if stride != 0 {
             strides[buffer_index as usize] = stride;
             have_stride[buffer_index as usize] = true;
@@ -1829,12 +1836,14 @@ pub fn parse_vertex_block(
     let attr_count = ld32(&bytes[attr_section..]) as usize;
     let mut attrs = Vec::new();
     if attr_count > MAX_VERTEX_ATTRS {
+        // Same refusal as the layout bound above, for the same reason: keeping
+        // the first 31 leaves the shader with stage inputs it declares and never
+        // receives, and a draw missing an attribute is indistinguishable from a
+        // guest that declared fewer.
         note_vertex_truncated("attribute_count", attr_count, MAX_VERTEX_ATTRS);
+        return Err(DecodeStatus::ErrUnsupported("res_vertex_attr_count_over"));
     }
     for i in 0..attr_count {
-        if attrs.len() >= MAX_VERTEX_ATTRS {
-            break;
-        }
         let offloc = attr_section + 4 + i * 4;
         if offloc + 4 > block_end {
             return Err(DecodeStatus::ErrShort("res_vertex_attr_offset_oob"));

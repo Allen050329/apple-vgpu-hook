@@ -155,34 +155,30 @@ fn a_declared_zero_step_rate_is_not_a_missing_one() {
     assert_eq!(attrs[0].step_rate(), 3);
 }
 
-/// A layout naming a buffer index past `MAX_VERTEX_LAYOUTS` contributes no
-/// stride, so its attributes fetch element zero for every vertex — and the
-/// decoder used to reach that state without saying anything.
+/// A layout naming a buffer index past `MAX_VERTEX_LAYOUTS` refuses the whole
+/// descriptor, and says which index did it.
 ///
-/// The stride-0 outcome is the loss being pinned here; the decline is what makes
-/// it distinguishable from a guest that asked for stride 0. Its sibling
-/// `color_attachment_table_truncated` has reported the same class since it was
-/// written, and these two loops did not.
+/// `MTLVertexDescriptor.layouts` has no such subscript, so there is nothing to
+/// build and every choice but refusing is a guess. The decoder used to keep the
+/// block with that layout's stride dropped, which left the attributes naming it
+/// at stride 0 — a *valid* pipeline drawing every vertex from element zero, and
+/// indistinguishable downstream from a guest that asked for stride 0. The
+/// decline line is what tells the two apart.
 #[test]
-fn a_layout_buffer_index_past_the_bound_reports_the_stride_it_drops() {
+fn a_layout_buffer_index_past_the_bound_refuses_the_descriptor() {
     let cap = crate::observe::FailCapture::start();
 
     let past = vertex_block_on_buffer(&[], MAX_VERTEX_LAYOUTS as u32);
-    let attrs = parse_vertex_block(&past, 0, past.len()).expect("decodes past the bound");
-    assert_eq!(attrs.len(), 1, "the attribute is still decoded");
     assert_eq!(
-        attrs[0].buffer_index, MAX_VERTEX_LAYOUTS as u32,
-        "and still names the buffer the guest gave it"
-    );
-    assert_eq!(
-        attrs[0].stride, 0,
-        "but no stride survived, which is the loss the line below has to name"
+        parse_vertex_block(&past, 0, past.len()),
+        Err(DecodeStatus::ErrUnsupported("res_vertex_layout_buffer_oob")),
+        "an unbuildable layout refuses rather than dropping its stride"
     );
     assert_eq!(
         cap.one("res_vertex_block"),
         "res_vertex_block reason=vertex_descriptor_truncated \
          what=layout_buffer_index declared=31 max=31",
-        "the drop reaches the fail log instead of vanishing"
+        "and names the index it refused on"
     );
 
     // The in-range control: the same block one index lower keeps its stride,
@@ -201,27 +197,52 @@ fn a_layout_buffer_index_past_the_bound_reports_the_stride_it_drops() {
     );
 }
 
-/// A descriptor naming more attributes than `MAX_VERTEX_ATTRS` loses the
-/// surplus, and now says how many it was asked for.
+/// A descriptor naming more attributes than `MAX_VERTEX_ATTRS` refuses, and
+/// says how many it was asked for.
 ///
-/// Driven through the `Decline` rendering rather than a 32-attribute fixture:
-/// the count is read straight off the wire word, so what needs pinning is that
-/// both numbers reach the line — a report naming only the bound cannot say how
-/// much was lost.
+/// `MTLVertexDescriptor.attributes` has 31 slots, so a count above that is a
+/// descriptor that cannot be built. Keeping the first 31 left the shader
+/// declaring stage inputs it would never receive, with the draw looking exactly
+/// like one from a guest that declared fewer — so the surplus is refused, and
+/// the line carries both numbers because a report naming only the bound cannot
+/// say how much was asked for.
 #[test]
-fn an_attribute_count_past_the_bound_names_both_numbers() {
-    use crate::observe::Decline as _;
+fn an_attribute_count_past_the_bound_refuses_and_names_both_numbers() {
+    let cap = crate::observe::FailCapture::start();
 
-    let decline = VertexDescriptorTruncated {
-        what: "attribute_count",
-        declared: 64,
-        max: MAX_VERTEX_ATTRS,
-    };
-    assert_eq!(decline.slug(), "vertex_descriptor_truncated");
+    // Overwrite the count word of a well-formed one-attribute block. The count
+    // is read straight off the wire, so no surplus entries need to exist for the
+    // decoder to be told about them — which is also the case that must not be
+    // allowed to decode as "31 attributes, fine".
+    let mut over = vertex_block_on_buffer(&[], 0);
+    let attr_rel = u32::from_le_bytes(over[3..7].try_into().unwrap()) as usize;
+    let declared = MAX_VERTEX_ATTRS as u32 + 1;
+    st32(&mut over[attr_rel..], declared);
     assert_eq!(
-        crate::observe::Emit::decline("res_vertex_block", &decline).render(),
-        "res_vertex_block reason=vertex_descriptor_truncated \
-         what=attribute_count declared=64 max=31"
+        parse_vertex_block(&over, 0, over.len()),
+        Err(DecodeStatus::ErrUnsupported("res_vertex_attr_count_over")),
+        "a count past the array refuses rather than keeping the first 31"
+    );
+    assert_eq!(
+        cap.one("res_vertex_block"),
+        format!(
+            "res_vertex_block reason=vertex_descriptor_truncated \
+             what=attribute_count declared={declared} max={MAX_VERTEX_ATTRS}"
+        ),
+        "and both numbers reach the line"
+    );
+
+    // At the bound exactly, the same block decodes — the entries the count
+    // promises past the first are absent, so this also pins that the refusal is
+    // on the count and the short block is a separate (structural) error.
+    let mut at = vertex_block_on_buffer(&[], 0);
+    st32(&mut at[attr_rel..], MAX_VERTEX_ATTRS as u32);
+    assert!(
+        !matches!(
+            parse_vertex_block(&at, 0, at.len()),
+            Err(DecodeStatus::ErrUnsupported("res_vertex_attr_count_over"))
+        ),
+        "the bound itself is not over it"
     );
 }
 
