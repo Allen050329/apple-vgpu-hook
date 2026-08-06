@@ -489,6 +489,28 @@ pub const TEXTURE_LEVEL_DEPTH: usize = 32;
 pub const TEXTURE_DESC_PIXEL_FORMAT: usize = 86;
 #[cfg(test)]
 pub(crate) const TEXTURE_DESC_BASE_LEN: usize = 116;
+/// Mip level records this device will read from a texture descriptor.
+///
+/// A **corruption guard, not a capacity choice** — the same kind of bound as
+/// `wire::device_desc::TYPE4_PLANE_CAP`, and it is written here because nothing
+/// else in this file said so. A pyramid of 16 levels has a base of 2^15 = 32768
+/// pixels in its largest dimension, which is above every Metal texture-size
+/// limit, so a descriptor declaring more levels than this describes a texture
+/// Metal cannot create. It is a malformed record rather than a larger one, and
+/// no size of this constant makes it decodable.
+///
+/// So it does not bound guest work, and it is not the thing that bounds the
+/// decode loop either: that loop stops on `bytes.len()`, so the descriptor's own
+/// length already limits how many level records can be read. This sits above
+/// that check and can only bite a declaration the payload would not have
+/// satisfied anyway.
+///
+/// Both consumers fail visibly rather than quietly. The decoder emits
+/// `texture_desc_levels_over_cap` and leaves `mipmap_level_count` at the
+/// declared value while `levels` holds fewer, so a dropped level reads as a drop
+/// and not as an absence. `runtime::mipmap` then refuses the generation as
+/// `IncompleteLayout` — through `levels.len() < levels`, which subsumes its
+/// explicit `levels > TEXTURE_MAX_MIP_LEVELS` test for exactly that reason.
 pub const TEXTURE_MAX_MIP_LEVELS: usize = 16;
 
 /// Vertex attribute from a type-7 render-pipeline vertex-input block.
