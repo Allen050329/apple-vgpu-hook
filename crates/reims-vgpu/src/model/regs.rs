@@ -569,6 +569,69 @@ pub const DEVICE_INFO_KEY_NATIVE_FP16: u32 = 9;
 /// [`protocol_dual_plane_textures`].
 pub const DEVICE_INFO_KEY_DUAL_PLANE_TEXTURES: u32 = 12;
 
+/// Wire key 10 — the **serializer feature version**, and the widest-reaching
+/// number in this table after the protocol version itself.
+///
+/// The guest's Metal plugin passes this value straight into the command-stream
+/// serializer's initialiser, which clamps it to 8 and turns it into five
+/// independent feature bools by *rung*:
+///
+/// | rung | feature |
+/// |---|---|
+/// | `>= 3` | reflection serialization |
+/// | `>= 5` | shared textures |
+/// | `>= 6` | **OpenGL** |
+/// | `>= 7` | IOSurface texture with rotation |
+/// | `>= 8` | correct base vertex |
+///
+/// Absent, the plugin takes a two-argument initialiser and every rung is off.
+///
+/// So one number moves five gates at once, and lowering it to close one closes
+/// every rung above it. That is why [`DEVICE_INFO_SERIALIZER_VERSION`] is a
+/// named constant with this table beside it rather than a literal in
+/// [`DEVICE_INFO_CAPS`].
+///
+/// # The OpenGL rung is on, and this device decodes none of what it unlocks
+///
+/// At `>= 6` the serializer's render encoder stops asserting on fifteen
+/// GL-shaped selectors and emits them instead, `0x8a`..=`0x98`:
+/// alpha-test reference, point size, clip plane, vertex/fragment sampler with
+/// an LOD *bias*, viewport-transform enable, provoking-vertex mode, primitive
+/// restart, two-sided fill mode, transform-feedback state, depth/stencil
+/// "cleared", and the three colour/depth/stencil **resolve texture** setters.
+/// `runtime::decode::render` has an arm for none of them; all fifteen are inside
+/// the accepted opcode window, so each becomes `Kind::OtherAccepted` and is
+/// reported once by the unimplemented-opcode path and executed by nothing.
+///
+/// Reachability is not the same on the two pathways, and the difference is in
+/// the guest, not here. The PCI plugin's `MTLDevice` answers `supportsOpenGL`
+/// with a hardcoded no whatever this key says, so nothing selects that device
+/// for GL and the fifteen cannot arrive. The sysbus plugin's device forwards the
+/// serializer's answer, so on that pathway they can. Neither has been driven
+/// with a GL client here, and the unimplemented-opcode report is what would say
+/// so.
+pub const DEVICE_INFO_KEY_SERIALIZER_VERSION: u32 = 10;
+
+/// The value served for [`DEVICE_INFO_KEY_SERIALIZER_VERSION`].
+///
+/// 8 is the serializer's own ceiling — it clamps anything higher — so this is
+/// "every rung on", which is what the capture carried and what a real device
+/// sends. It is *not* narrowed to the rungs this device implements, and the
+/// reason is the coupling above: the OpenGL rung sits at 6, under the base-vertex
+/// rung at 8, so declining OpenGL by lowering this number would also tell the
+/// guest to apply its incorrect-base-vertex workaround and to stop using shared
+/// textures. Which of those trades is right needs a driven boot on the sysbus
+/// pathway that this checkout cannot take.
+pub const DEVICE_INFO_SERIALIZER_VERSION: u32 = 8;
+
+/// Wire key 11 — bitmask of the `MTLPrimitiveType` values the guest may draw.
+///
+/// Not a count and not a maximum: the guest's `supportsPrimitiveType:` tests
+/// **bit `type`** of this value for any `type <= 8`, and answers `type < 5` when
+/// the key is absent. See [`crate::contract::draw::EXECUTABLE_PRIMITIVE_TYPES`]
+/// for what this device puts in it and why that is narrower than the capture.
+pub const DEVICE_INFO_KEY_PRIMITIVE_TYPE_MASK: u32 = 11;
+
 /// Whether protocol `version` enables two-plane textures.
 ///
 /// The guest driver switches the negotiated version into a feature struct, and
@@ -654,8 +717,14 @@ pub const DEVICE_INFO_CAPS: &[(u32, u32)] = &[
     (7, 1),
     (8, 1),
     (9, 1),
-    (10, 8),
-    (11, 1023),
+    (
+        DEVICE_INFO_KEY_SERIALIZER_VERSION,
+        DEVICE_INFO_SERIALIZER_VERSION,
+    ),
+    (
+        DEVICE_INFO_KEY_PRIMITIVE_TYPE_MASK,
+        crate::contract::draw::EXECUTABLE_PRIMITIVE_TYPES,
+    ),
     (12, 1),
     (13, 256),
     (14, 1),

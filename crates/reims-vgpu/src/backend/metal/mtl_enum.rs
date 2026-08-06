@@ -427,6 +427,26 @@ checked_ordinal! {
     [Point, Line, LineStrip, Triangle, TriangleStrip]
     apple_numbers_them_from_zero;
 }
+// The primitive types this rail can encode are exactly the ones the device
+// tells the guest it may draw.
+//
+// `contract::draw::EXECUTABLE_PRIMITIVE_TYPES` leaves this device as
+// device-info key 11, which the guest reads as a *permission* mask — a bit set
+// there without an arm above is a draw the guest was invited to make and this
+// rail then refuses. A `const` block rather than a `#[test]` for the reason
+// stated inside `checked_ordinal!`: this file's tests run on Apple hosts only,
+// and the cross-compiled Metal arm evaluates this one from Linux. The Vulkan
+// translator carries the same pin as a test, because its arms are not `const`.
+const _: () = {
+    let mut mtl = 0u32;
+    while mtl <= 8 {
+        assert!(
+            primitive_type(mtl).is_some() == crate::contract::draw::primitive_type_executable(mtl),
+            "a primitive type this device advertises has no Metal arm, or vice versa",
+        );
+        mtl += 1;
+    }
+};
 
 checked_ordinal! {
     /// `MTLSamplerMinMagFilter` for a sampler's minification or magnification.

@@ -188,6 +188,24 @@ mod tests {
         );
     }
 
+    /// Every primitive type this device *advertises* has an arm here.
+    ///
+    /// [`crate::contract::draw::EXECUTABLE_PRIMITIVE_TYPES`] is what the guest
+    /// reads as permission, so a bit set there without an arm here is a draw the
+    /// guest was invited to make and this rail refuses. Both directions are
+    /// asserted: an arm without the bit would be a type this device can execute
+    /// and has told the guest not to use.
+    #[test]
+    fn the_advertised_primitive_types_are_the_executable_ones() {
+        for mtl in 0..=8u32 {
+            assert_eq!(
+                primitive_topology(mtl).is_ok(),
+                crate::contract::draw::primitive_type_executable(mtl),
+                "primitive type {mtl}: advertisement and translation disagree"
+            );
+        }
+    }
+
     /// Every SDK value in range maps, and the first one past the end declines
     /// by its own slug rather than a shared one.
     #[test]
