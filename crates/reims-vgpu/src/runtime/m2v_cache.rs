@@ -63,6 +63,74 @@ pub enum M2vCacheDecline {
     },
 }
 
+impl M2vCacheDecline {
+    /// Whether a second attempt at the same AIR could answer differently.
+    ///
+    /// Every entry in this cache is keyed by the AIR blob's content, so a
+    /// refusal that is *about the AIR* is reached again by every later ask and
+    /// is worth remembering: a module whose datalayout is missing, whose layout
+    /// repair fails, or whose requested threadgroup is degenerate refuses the
+    /// same way forever.
+    ///
+    /// The scratch writes are not about the AIR. `translate_air` and
+    /// `translate_kernel_air` each begin by writing the blob to a fixed path
+    /// under [`tmp_dir`], and that write fails for reasons belonging to the host
+    /// filesystem at that instant — no space, no descriptors, a transient I/O
+    /// error. Remembering one turns "the host could not spare a scratch file
+    /// just then" into "this shader never renders again", and because the cache
+    /// is unbounded and nothing evicts, "again" means for the life of the
+    /// process. It is the same rule
+    /// [`crate::backend::vulkan::engine::types::DrawError::out_of_memory`]
+    /// states for the object caches.
+    ///
+    /// The translate declines are deliberately *not* here even though
+    /// metal2vulkan also touches the filesystem. Their detail is an opaque
+    /// string from the tool, so telling a disk failure from a malformed module
+    /// would mean matching on its prose — and re-running a full translation on
+    /// every draw of a genuinely untranslatable shader costs far more than the
+    /// scratch write does. The split is by what the variant *names*, not by what
+    /// its message happens to say.
+    fn is_transient(&self) -> bool {
+        match self {
+            Self::VertexScratchWrite { .. }
+            | Self::FragmentScratchWrite { .. }
+            | Self::KernelScratchWrite { .. } => true,
+            Self::VertexTranslate { .. }
+            | Self::FragmentTranslate { .. }
+            | Self::KernelTranslate { .. }
+            | Self::ReflectionDatalayoutMissing { .. }
+            | Self::LayoutRepair { .. }
+            | Self::TranslationPending { .. }
+            | Self::KernelLocalSizeZero { .. } => false,
+        }
+    }
+}
+
+/// Hand a stored failure to its caller, and drop it if a later ask could get a
+/// different answer.
+///
+/// This is where the retry is armed, and it is the only point in the cache's
+/// life cycle where arming one is safe. The async admission
+/// ([`ensure_cached_async_keyed`]) cannot do it: its caller re-polls the same
+/// guest packet until it answers `true`, so an arm that removed the entry and
+/// re-queued would translate, fail, remove, re-queue — and the packet at the
+/// channel head would never advance. Here the error is already on its way to
+/// the caller, so this draw fails whatever we do; all that changes is that the
+/// *next* draw finds no entry and translates again.
+///
+/// The cost while the host stays unable is one re-translation per draw of that
+/// shader. The alarm is fail-visible and `fail_once`-deduped by key, so a
+/// persistent one names itself once rather than per attempt.
+fn forget_if_transient(cache: &mut Cache, key: u64, error: &M2vCacheDecline) {
+    if !error.is_transient() {
+        return;
+    }
+    cache.entries.remove(&key);
+    crate::observe::Emit::decline("m2v_transient_failure_forgotten", error)
+        .field("key", key)
+        .fail_once(key);
+}
+
 fn log_token(detail: &str) -> String {
     detail.replace(char::is_whitespace, "_")
 }
@@ -465,6 +533,13 @@ fn ensure_cached_async_keyed(
     {
         let mut c = global().lock().unwrap_or_else(|e| e.into_inner());
         match c.entries.get(&key) {
+            // A stored failure resolves the ask, transient or not, and that is
+            // load-bearing: the caller holds the guest packet at the channel
+            // head and re-polls until this answers `true`, so an arm that
+            // re-queued instead would never let the packet advance. The retry
+            // is armed where the error is *consumed* — see the `Entry::Failed`
+            // arm of [`translate_cached_reflected`] — which costs the failing
+            // draw its failure and leaves the next draw a clean cache.
             Some(Entry::Ready(_)) | Some(Entry::Failed(_)) => return true,
             Some(Entry::Loading) => return false,
             None => {}
@@ -654,7 +729,10 @@ pub fn translate_cached_reflected(
                 }
                 return Ok(shader);
             }
-            Some(Entry::Failed(e)) => return Err(e),
+            Some(Entry::Failed(e)) => {
+                forget_if_transient(&mut c, key, &e);
+                return Err(e);
+            }
             Some(Entry::Loading) => {
                 return Err(M2vCacheDecline::TranslationPending {
                     stage: stage_name(stage),
@@ -714,7 +792,10 @@ pub fn translate_cached_kernel_reflected(
                 }
                 return Ok(shader);
             }
-            Some(Entry::Failed(e)) => return Err(e),
+            Some(Entry::Failed(e)) => {
+                forget_if_transient(&mut c, key, &e);
+                return Err(e);
+            }
             Some(Entry::Loading) => {
                 return Err(M2vCacheDecline::TranslationPending { stage: "kernel" })
             }
@@ -879,6 +960,135 @@ mod tests {
         assert_ne!(air_key(Stage::Vertex, a), air_key(Stage::Vertex, b"other"));
         assert_eq!(air_key(Stage::Vertex, a), air_key(Stage::Vertex, a));
         assert_ne!(air_key_kernel(a, [16, 16, 1]), air_key_kernel(a, [8, 8, 1]));
+    }
+
+    /// Every decline is classified, and the split is by what the variant names.
+    ///
+    /// The scratch writes are the host filesystem at one instant; everything
+    /// else is a property of the AIR blob this cache is keyed by, and is reached
+    /// again by every later ask.
+    #[test]
+    fn only_the_scratch_writes_are_transient() {
+        let detail = || "ENOSPC".to_string();
+        for transient in [
+            M2vCacheDecline::VertexScratchWrite { detail: detail() },
+            M2vCacheDecline::FragmentScratchWrite { detail: detail() },
+            M2vCacheDecline::KernelScratchWrite { detail: detail() },
+        ] {
+            assert!(transient.is_transient(), "{transient:?} is about the host");
+        }
+        for permanent in [
+            M2vCacheDecline::VertexTranslate { detail: detail() },
+            M2vCacheDecline::FragmentTranslate { detail: detail() },
+            M2vCacheDecline::KernelTranslate { detail: detail() },
+            M2vCacheDecline::ReflectionDatalayoutMissing { stage: "vertex" },
+            M2vCacheDecline::TranslationPending { stage: "vertex" },
+            M2vCacheDecline::KernelLocalSizeZero {
+                local_size: [0, 1, 1],
+            },
+        ] {
+            assert!(!permanent.is_transient(), "{permanent:?} is about the AIR");
+        }
+    }
+
+    /// A scratch-write failure fails the draw that met it and then gets out of
+    /// the way. The cache is unbounded and nothing evicts, so before this the
+    /// entry answered every later draw of that shader for the life of the
+    /// process — a full stop for one moment when the host had no room for a
+    /// temp file.
+    #[test]
+    fn a_transient_failure_is_forgotten_once_it_has_been_answered() {
+        let _guard = test_lock();
+        reset_for_test();
+        let air = b"air-whose-scratch-write-failed";
+        let key = air_key(Stage::Vertex, air);
+        let stored = M2vCacheDecline::VertexScratchWrite {
+            detail: "No space left on device".to_string(),
+        };
+        global()
+            .lock()
+            .unwrap()
+            .entries
+            .insert(key, Entry::Failed(stored.clone()));
+
+        // The admission still resolves, so the guest packet advances rather
+        // than re-polling a translation that keeps failing.
+        assert!(
+            ensure_cached_async(air, Stage::Vertex, 7),
+            "a stored failure must resolve the ask, or the packet never advances"
+        );
+
+        // This draw gets the real reason, unchanged.
+        let Err(err) = translate_cached_reflected(air, Stage::Vertex, 7) else {
+            panic!("a stored failure still fails its draw");
+        };
+        assert_eq!(err, stored);
+
+        // And the next draw finds a clean cache and translates again.
+        assert!(
+            !global().lock().unwrap().entries.contains_key(&key),
+            "the transient failure outlived the instant it described"
+        );
+        reset_for_test();
+    }
+
+    /// The converse, so the test above cannot pass by forgetting everything. A
+    /// module that cannot be translated is reached again by every later ask, and
+    /// re-running metal2vulkan per draw to rediscover that would cost far more
+    /// than the answer is worth.
+    #[test]
+    fn a_failure_about_the_module_is_kept() {
+        let _guard = test_lock();
+        reset_for_test();
+        let air = b"air-that-cannot-be-translated";
+        let key = air_key(Stage::Vertex, air);
+        let stored = M2vCacheDecline::VertexTranslate {
+            detail: "unsupported instruction".to_string(),
+        };
+        global()
+            .lock()
+            .unwrap()
+            .entries
+            .insert(key, Entry::Failed(stored.clone()));
+
+        let Err(err) = translate_cached_reflected(air, Stage::Vertex, 7) else {
+            panic!("an untranslatable module still fails its draw");
+        };
+        assert_eq!(err, stored);
+        assert!(
+            matches!(
+                global().lock().unwrap().entries.get(&key),
+                Some(Entry::Failed(kept)) if *kept == stored
+            ),
+            "a verdict about the AIR is reached again, so it is kept"
+        );
+        reset_for_test();
+    }
+
+    /// The kernel lookup is a second copy of the same `Entry::Failed` arm, so it
+    /// gets the same question asked of it.
+    #[test]
+    fn the_kernel_lookup_forgets_a_transient_failure_too() {
+        let _guard = test_lock();
+        reset_for_test();
+        let air = b"kernel-air-whose-scratch-write-failed";
+        let local_size = [16u32, 16, 1];
+        let key = air_key_kernel(air, local_size);
+        let stored = M2vCacheDecline::KernelScratchWrite {
+            detail: "No space left on device".to_string(),
+        };
+        global()
+            .lock()
+            .unwrap()
+            .entries
+            .insert(key, Entry::Failed(stored.clone()));
+
+        let Err(err) = translate_cached_kernel_reflected(air, local_size, 7) else {
+            panic!("a stored failure still fails its dispatch");
+        };
+        assert_eq!(err, stored);
+        assert!(!global().lock().unwrap().entries.contains_key(&key));
+        reset_for_test();
     }
 
     #[test]
