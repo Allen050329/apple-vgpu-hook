@@ -62,6 +62,7 @@ pub mod decline;
 pub mod emit;
 pub mod footprint;
 pub mod ladder;
+pub mod panic;
 pub mod phase_clock;
 pub mod sink;
 

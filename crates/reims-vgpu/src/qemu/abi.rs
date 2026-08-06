@@ -130,6 +130,7 @@ pub unsafe extern "C" fn reims_vgpu_qemu_device_create(
     out: *mut ReimsVgpuQemuDevice,
 ) -> c_int {
     unwind_safe(
+        "reims_vgpu_qemu_device_create",
         || {
             if out.is_null() {
                 return REIMS_VGPU_QEMU_ERR_ARGS;
@@ -178,6 +179,7 @@ pub unsafe extern "C" fn reims_vgpu_qemu_device_create(
 #[no_mangle]
 pub unsafe extern "C" fn reims_vgpu_qemu_device_reset(handle: u64) -> c_int {
     unwind_safe(
+        "reims_vgpu_qemu_device_reset",
         || {
             if handle == 0 {
                 return REIMS_VGPU_QEMU_ERR_ARGS;
@@ -196,6 +198,7 @@ pub unsafe extern "C" fn reims_vgpu_qemu_device_reset(handle: u64) -> c_int {
 #[no_mangle]
 pub unsafe extern "C" fn reims_vgpu_qemu_device_destroy(handle: u64) -> c_int {
     unwind_safe(
+        "reims_vgpu_qemu_device_destroy",
         || {
             if handle == 0 {
                 return REIMS_VGPU_QEMU_ERR_ARGS;
@@ -230,6 +233,7 @@ pub unsafe extern "C" fn reims_vgpu_qemu_window_start(
     height: u32,
 ) -> c_int {
     unwind_safe(
+        "reims_vgpu_qemu_window_start",
         || {
             if handle == 0 {
                 return REIMS_VGPU_QEMU_ERR_ARGS;
@@ -253,6 +257,7 @@ pub unsafe extern "C" fn reims_vgpu_qemu_window_start(
 #[no_mangle]
 pub unsafe extern "C" fn reims_vgpu_qemu_window_run_main(handle: u64) -> c_int {
     unwind_safe(
+        "reims_vgpu_qemu_window_run_main",
         || {
             if handle == 0 {
                 return REIMS_VGPU_QEMU_ERR_ARGS;
@@ -275,6 +280,7 @@ pub unsafe extern "C" fn reims_vgpu_qemu_window_run_main(handle: u64) -> c_int {
 #[no_mangle]
 pub unsafe extern "C" fn reims_vgpu_qemu_window_stop(handle: u64) -> c_int {
     unwind_safe(
+        "reims_vgpu_qemu_window_stop",
         || {
             if handle == 0 {
                 return REIMS_VGPU_QEMU_ERR_ARGS;
@@ -305,6 +311,7 @@ pub unsafe extern "C" fn reims_vgpu_qemu_window_set_early_fb(
     height: u32,
 ) -> c_int {
     unwind_safe(
+        "reims_vgpu_qemu_window_set_early_fb",
         || {
             if handle == 0 || ptr.is_null() {
                 return REIMS_VGPU_QEMU_ERR_ARGS;
@@ -324,6 +331,7 @@ pub unsafe extern "C" fn reims_vgpu_qemu_window_set_early_fb(
 #[no_mangle]
 pub unsafe extern "C" fn reims_vgpu_qemu_backend_name(buf: *mut c_char, buf_len: usize) -> c_int {
     unwind_safe(
+        "reims_vgpu_qemu_backend_name",
         || {
             if buf.is_null() || buf_len == 0 {
                 return REIMS_VGPU_QEMU_ERR_ARGS;
@@ -339,7 +347,11 @@ pub unsafe extern "C" fn reims_vgpu_qemu_backend_name(buf: *mut c_char, buf_len:
 /// ABI version getter (no allocation).
 #[no_mangle]
 pub unsafe extern "C" fn reims_vgpu_qemu_abi_version() -> u32 {
-    unwind_safe(|| REIMS_VGPU_QEMU_ABI_VERSION, 0)
+    unwind_safe(
+        "reims_vgpu_qemu_abi_version",
+        || REIMS_VGPU_QEMU_ABI_VERSION,
+        0,
+    )
 }
 
 /// Gfx MMIO read. SAFETY: out_val non-null.
@@ -351,6 +363,7 @@ pub unsafe extern "C" fn reims_vgpu_qemu_gfx_read(
     out_val: *mut u64,
 ) -> c_int {
     unwind_safe(
+        "reims_vgpu_qemu_gfx_read",
         || {
             if handle == 0 || out_val.is_null() {
                 return REIMS_VGPU_QEMU_ERR_ARGS;
@@ -379,6 +392,7 @@ pub unsafe extern "C" fn reims_vgpu_qemu_gfx_write(
     size: u32,
 ) -> c_int {
     unwind_safe(
+        "reims_vgpu_qemu_gfx_write",
         || {
             if handle == 0 {
                 return REIMS_VGPU_QEMU_ERR_ARGS;
@@ -402,6 +416,7 @@ pub unsafe extern "C" fn reims_vgpu_qemu_iosfc_read(
     out_val: *mut u64,
 ) -> c_int {
     unwind_safe(
+        "reims_vgpu_qemu_iosfc_read",
         || {
             if handle == 0 || out_val.is_null() {
                 return REIMS_VGPU_QEMU_ERR_ARGS;
@@ -429,6 +444,7 @@ pub unsafe extern "C" fn reims_vgpu_qemu_iosfc_write(
     size: u32,
 ) -> c_int {
     unwind_safe(
+        "reims_vgpu_qemu_iosfc_write",
         || {
             if handle == 0 {
                 return REIMS_VGPU_QEMU_ERR_ARGS;
@@ -448,6 +464,7 @@ pub unsafe extern "C" fn reims_vgpu_qemu_iosfc_write(
 #[no_mangle]
 pub unsafe extern "C" fn reims_vgpu_qemu_device_drain(handle: u64) -> c_int {
     unwind_safe(
+        "reims_vgpu_qemu_device_drain",
         || {
             if handle == 0 {
                 return REIMS_VGPU_QEMU_ERR_ARGS;
@@ -467,6 +484,7 @@ pub unsafe extern "C" fn reims_vgpu_qemu_device_drain(handle: u64) -> c_int {
 #[no_mangle]
 pub unsafe extern "C" fn reims_vgpu_qemu_device_poll(handle: u64) -> c_int {
     unwind_safe(
+        "reims_vgpu_qemu_device_poll",
         || {
             if handle == 0 {
                 return REIMS_VGPU_QEMU_ERR_ARGS;
@@ -490,6 +508,7 @@ pub unsafe extern "C" fn reims_vgpu_qemu_device_pop_action(
     out: *mut HostAction,
 ) -> c_int {
     unwind_safe(
+        "reims_vgpu_qemu_device_pop_action",
         || {
             if handle == 0 || out.is_null() {
                 return REIMS_VGPU_QEMU_ERR_ARGS;
@@ -532,6 +551,7 @@ pub unsafe extern "C" fn reims_vgpu_qemu_console_feed(
     out_generation: *mut u32,
 ) -> c_int {
     unwind_safe(
+        "reims_vgpu_qemu_console_feed",
         || {
             if handle == 0 || out_kind.is_null() {
                 return REIMS_VGPU_QEMU_ERR_ARGS;
@@ -594,6 +614,7 @@ pub unsafe extern "C" fn reims_vgpu_qemu_scanout_may_paint(
     out_may: *mut u32,
 ) -> c_int {
     unwind_safe(
+        "reims_vgpu_qemu_scanout_may_paint",
         || {
             if handle == 0 || out_may.is_null() {
                 return REIMS_VGPU_QEMU_ERR_ARGS;
@@ -625,6 +646,7 @@ pub unsafe extern "C" fn reims_vgpu_qemu_efi_console_copy(
     height: u32,
 ) -> c_int {
     unwind_safe(
+        "reims_vgpu_qemu_efi_console_copy",
         || {
             if handle == 0 || dst.is_null() || width == 0 || height == 0 {
                 return REIMS_VGPU_QEMU_ERR_ARGS;
@@ -662,6 +684,7 @@ pub unsafe extern "C" fn reims_vgpu_qemu_scanout_copy(
 ) -> c_int {
     use crate::runtime::scanout::ScanoutCopyResult;
     unwind_safe(
+        "reims_vgpu_qemu_scanout_copy",
         || {
             if handle == 0 || dst.is_null() || width == 0 || height == 0 || dst_stride == 0 {
                 return REIMS_VGPU_QEMU_ERR_ARGS;
@@ -691,6 +714,7 @@ pub unsafe extern "C" fn reims_vgpu_qemu_cursor_glyph_info(
     out: *mut CursorGlyphInfo,
 ) -> c_int {
     unwind_safe(
+        "reims_vgpu_qemu_cursor_glyph_info",
         || {
             if handle == 0 || out.is_null() {
                 return REIMS_VGPU_QEMU_ERR_ARGS;
@@ -718,6 +742,7 @@ pub unsafe extern "C" fn reims_vgpu_qemu_cursor_glyph_copy(
     count: usize,
 ) -> c_int {
     unwind_safe(
+        "reims_vgpu_qemu_cursor_glyph_copy",
         || {
             if handle == 0 || out_argb.is_null() || count == 0 {
                 return REIMS_VGPU_QEMU_ERR_ARGS;

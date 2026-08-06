@@ -24,7 +24,7 @@ fn exactly_one_backend_name() {
 
 #[test]
 fn panic_does_not_escape() {
-    let v = unwind_safe(|| panic!("boom"), 42i32);
+    let v = unwind_safe("reims_vgpu_qemu_device_tests", || panic!("boom"), 42i32);
     assert_eq!(v, 42);
 }
 

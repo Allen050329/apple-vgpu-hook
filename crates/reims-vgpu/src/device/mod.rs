@@ -724,13 +724,29 @@ pub fn backend_name() -> &'static str {
     }
 }
 
-pub fn unwind_safe<T, F>(f: F, on_panic: T) -> T
+/// Run one C ABI entry body, turning a panic into `on_panic` rather than
+/// letting it unwind into QEMU's C frames.
+///
+/// `entry` is the C symbol this body belongs to, and it is what the record
+/// names — a panic here is the largest thing this device can drop (the whole
+/// call, not one refused record), so it goes through the always-on failure path
+/// like any other loss of guest work. See [`crate::observe::panic`] for why the
+/// location needs a hook and why arming it lives on this path.
+///
+/// Every caller must pass its own symbol name;
+/// `tests/an_abi_entry_names_itself_when_it_panics.rs` checks that none of them
+/// names a neighbour.
+pub fn unwind_safe<T, F>(entry: &'static str, f: F, on_panic: T) -> T
 where
     F: FnOnce() -> T + std::panic::UnwindSafe,
 {
+    crate::observe::panic::arm();
     match catch_unwind(AssertUnwindSafe(f)) {
         Ok(v) => v,
-        Err(_) => on_panic,
+        Err(payload) => {
+            crate::observe::panic::report(entry, payload.as_ref());
+            on_panic
+        }
     }
 }
 
