@@ -380,7 +380,7 @@ cargo test -p reims-vgpu --no-default-features --features backend-metal -- --tes
 `backend-metal` is Apple-only; run that arm only on Apple hosts. Run the feature matrix from the
 repo root when cfgs, features, backend boundaries, or shared Rust code change:
 
-**On a non-Apple host, the 39 test functions under `backend/metal/` do not run, and nothing in the
+**On a non-Apple host, the test functions under `backend/metal/` do not run, and nothing in the
 output says so.** This is worse than the fixture gap below, which at least reports `ignored`: these
 tests are `cfg`-ed out of the arm you can run, so a Linux session's green count simply does not
 include them and reads exactly like a clean tree. The cross-compiled clippy and `cargo check`
@@ -388,6 +388,12 @@ commands above *compile* them, which is why a code warning there is still caught
 `cargo test --target aarch64-apple-darwin … --no-run` fails at the **link** step (no Apple linker,
 no macOS SDK), so no binary is ever produced. Do not read "compiles on the Metal arm" as "its tests
 passed"; nobody on a Linux host has run them.
+
+How many there are is pinned by
+`crates/reims-vgpu/tests/the_metal_arm_tests_are_counted_where_they_cannot_run.rs`, which runs on
+the arm you *can* build, so adding or deleting one of them stops being invisible here. This
+paragraph used to carry the number itself and it was wrong by four — a bare `grep` for `#[test]`
+counts the sentences that say "a `const` assertion rather than a `#[test]`". Read the constant.
 
 Where a file under `backend/metal/` is pure logic, you can still execute its tests: copy it to
 `/tmp`, strip the `//!` module doc if it links outside the file, and build with bare
