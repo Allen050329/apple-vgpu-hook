@@ -414,16 +414,10 @@ impl ResourcePools {
     /// band. Called at the top of the capacity walk — the one point every
     /// admission passes — for the reason [`Self::note_registry_reach`] is.
     fn note_compute_storage_reach(&mut self) {
-        self.compute_storage_sole_copy_peak = NonPinnedTotals {
-            count: self
-                .compute_storage_sole_copy_peak
-                .count
-                .max(self.compute_storage_sole_copy.count),
-            bytes: self
-                .compute_storage_sole_copy_peak
-                .bytes
-                .max(self.compute_storage_sole_copy.bytes),
-        };
+        self.compute_storage_sole_copy_peak = Self::high_water(
+            self.compute_storage_sole_copy_peak,
+            self.compute_storage_sole_copy,
+        );
     }
 
     /// Record that something read this resident, refreshing its reclaim stamp.
@@ -483,6 +477,15 @@ impl ResourcePools {
         resident.gpu_only_content = sole;
         let bytes = Self::storage_slot_bytes(resident);
         Self::fold_totals(&mut self.compute_storage_sole_copy, bytes, sole);
+        // Same reason as the sibling's: this population grows on
+        // `mark_resident_storage_image` and the capacity walk that also folds it
+        // runs on admission, so sampling only there lags by a dispatch.
+        if sole {
+            self.compute_storage_sole_copy_peak = Self::high_water(
+                self.compute_storage_sole_copy_peak,
+                self.compute_storage_sole_copy,
+            );
+        }
         true
     }
 
@@ -1497,7 +1500,25 @@ impl ResourcePools {
         slot.gpu_only_content = sole;
         let bytes = Self::slot_attachment_bytes(slot);
         self.registry_sole_copy_adjust(bytes, sole);
+        // Folded here rather than only at the capacity walk, because that walk
+        // runs on admission and this population grows on `registry_mark_ready` —
+        // a peak sampled only at the other event lags by a draw, and can miss
+        // one entirely for a burst that marks more than it admits.
+        if sole {
+            self.registry_sole_copy_peak =
+                Self::high_water(self.registry_sole_copy_peak, self.registry_sole_copy);
+        }
         true
+    }
+
+    /// Per-field maximum of two population readings. Both fields advance from the
+    /// same sample, so the pair keeps describing one population rather than two
+    /// moments.
+    fn high_water(peak: NonPinnedTotals, now: NonPinnedTotals) -> NonPinnedTotals {
+        NonPinnedTotals {
+            count: peak.count.max(now.count),
+            bytes: peak.bytes.max(now.bytes),
+        }
     }
 
     /// Fold the current non-pinned population into the high-water band and
@@ -1525,10 +1546,8 @@ impl ResourcePools {
             .max(self.non_pinned_registry_bytes());
         // Sampled from the same instant as the two above, so the ratio between
         // them describes one population and not two moments.
-        self.registry_sole_copy_peak = NonPinnedTotals {
-            count: self.registry_sole_copy_peak.count.max(self.registry_sole_copy.count),
-            bytes: self.registry_sole_copy_peak.bytes.max(self.registry_sole_copy.bytes),
-        };
+        self.registry_sole_copy_peak =
+            Self::high_water(self.registry_sole_copy_peak, self.registry_sole_copy);
         non_pinned
     }
 
@@ -2262,6 +2281,44 @@ mod pin_count_tests {
         // rather than inventing a subtraction.
         assert!(!pools.registry_note_content_copied_out(&surf(1)));
         check(&pools, "a copy-out for an absent identity");
+    }
+
+    /// The sole-copy high-water rises on the mark that grows the population, not
+    /// only at the capacity walk that also samples it.
+    ///
+    /// That walk runs on *admission* while this population grows on
+    /// `registry_mark_ready`, so a peak folded only there lags by a draw — and a
+    /// burst that marks more residents than it admits can retreat below its own
+    /// maximum before the next sample, which a high-water would then never
+    /// report. This reading is what says whether protecting the class is
+    /// affordable, so under-reporting is the dangerous direction.
+    ///
+    /// Fails without the fold in `set_sole_copy`: the peak stays at zero.
+    #[test]
+    fn the_sole_copy_high_water_rises_when_the_population_does() {
+        let mut pools = ResourcePools::new();
+        admit_sized(&mut pools, surf(1), 0, 0, (64, 64));
+        admit_sized(&mut pools, surf(2), 0, 0, (64, 64));
+        assert_eq!(pools.registry_sole_copy_peak, NonPinnedTotals::default());
+
+        pools.registry_mark_ready(&surf(1));
+        pools.registry_mark_ready(&surf(2));
+        let at_peak = pools.registry_sole_copy;
+        assert_eq!(at_peak.count, 2);
+        assert_eq!(
+            pools.registry_sole_copy_peak, at_peak,
+            "the high-water saw the population at its maximum"
+        );
+
+        // The population retreats with no admission in between, which is exactly
+        // the shape a walk-sampled peak misses.
+        assert!(pools.registry_note_content_copied_out(&surf(1)));
+        assert!(pools.registry_note_content_copied_out(&surf(2)));
+        assert_eq!(pools.registry_sole_copy, NonPinnedTotals::default());
+        assert_eq!(
+            pools.registry_sole_copy_peak, at_peak,
+            "a high-water does not fall back with the population"
+        );
     }
 
     /// A non-pinned resident untouched for `IDLE_TARGET_AGE_MS` is selected; a
