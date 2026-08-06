@@ -778,9 +778,19 @@ const ROWS: &[Row] = &[
         file: "crates/reims-vgpu/src/runtime/icb/mod.rs",
         ty: "DroppedVertexAttribute",
         loss: Loss::ExecutedModified,
-        why: "an attribute location the pipeline has no input for is dropped \
-              and the draw is issued, so the shader reads whatever was bound \
-              before. Retired by refusing the draw",
+        why: "**verdict confirmed against the emitter, description was not.** \
+              This is not about a location the pipeline has no input for. Both \
+              arms fire when a word off the guest's type-7 descriptor is not a \
+              declared `MTLVertexFormat` or `MTLVertexStepFunction` variant: the \
+              attribute is skipped, the remaining ones are encoded, and \
+              `Some(vd)` is returned as long as one survived. So the pipeline is \
+              built with a `[[stage_in]]` struct missing a field and the shader \
+              reads whatever occupies it — wrong geometry, not an error, which \
+              is what the emitter's own doc says. Retired by returning `None` \
+              when any attribute was dropped rather than when all were, which \
+              needs the caller's `None` path checked first: it means `no vertex \
+              descriptor`, and building the pipeline without one is not a \
+              refusal either",
     },
     Row {
         file: "crates/reims-vgpu/src/runtime/icb/mod.rs",
