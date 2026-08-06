@@ -47,6 +47,11 @@ pub enum PacketFault {
     ChildTailRead,
     /// Guest write failed: child ring head writeback.
     ChildHeadWriteback,
+    /// This device snapshotted less of the ring than the packet's own published
+    /// `total_size`. Unlike every other variant here this accuses the host, not
+    /// the guest, and it is a healthy zero — `packet_snapshot_len` cannot
+    /// produce a snapshot that reaches it.
+    ShortSnapshot,
 }
 
 impl PacketFault {
@@ -64,6 +69,7 @@ impl PacketFault {
             Self::ChildSnapRead => "packet_child_snap_read",
             Self::ChildTailRead => "packet_child_tail_read",
             Self::ChildHeadWriteback => "packet_child_head_writeback",
+            Self::ShortSnapshot => "packet_short_snapshot",
         }
     }
 }
@@ -3579,6 +3585,7 @@ mod fail_vocabulary_tests {
             PacketFault::ChildSnapRead,
             PacketFault::ChildTailRead,
             PacketFault::ChildHeadWriteback,
+            PacketFault::ShortSnapshot,
         ];
         let mut slugs: Vec<&str> = ALL.iter().map(|f| f.slug()).collect();
         slugs.sort_unstable();

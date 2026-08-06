@@ -230,10 +230,93 @@ fn packet_bytes(opcode: u16, stamp_value: u32, payload: &[u8]) -> Vec<u8> {
 #[test]
 fn decode_basic_packet() {
     let p = packet_bytes(ROOT_OP_DEFINE_FIFO, 7, &1u32.to_le_bytes());
-    let dec = decode_packet(&p, 0, p.len() as u32).unwrap();
+    let dec = decode_packet(&p, 0, p.len() as u32, RING).unwrap();
     assert_eq!(dec.opcode, ROOT_OP_DEFINE_FIFO);
     assert_eq!(dec.completion_stamp, 7);
     assert_eq!(dec.next_head, p.len() as u32);
+}
+
+/// A ring capacity comfortably larger than any packet these tests build, so a
+/// `BadSize` in one of them is about the packet and never about the ring.
+const RING: u32 = 4096;
+
+/// A packet the producer has not finished publishing is control flow, and a
+/// size the ring could never hold is a fault. The two must not answer alike.
+///
+/// `packet_snapshot_len` deliberately snaps only the header when the packet is
+/// still being written, so measuring the declared `total_size` against the
+/// *snapshot* said "bad size" for a perfectly well-formed packet whose producer
+/// was mid-write — a `packet_bad_size` line on the always-on channel for a
+/// healthy guest, and `Incomplete` unreachable behind it. The ring's capacity is
+/// what bounds a sane size, so that is what it is measured against.
+#[test]
+fn a_packet_still_being_written_is_incomplete_and_an_impossible_one_is_a_fault() {
+    let full = packet_bytes(ROOT_OP_DEFINE_FIFO, 7, &1u32.to_le_bytes());
+
+    // What the drain loop actually holds for a mid-write packet: the header
+    // alone, because that is all `packet_snapshot_len` lets it read.
+    let header_only = &full[..PACKET_HEADER_LEN as usize];
+    let published = PACKET_HEADER_LEN; // the producer stopped after the header
+    assert_eq!(
+        packet_snapshot_len(header_only, published, RING),
+        PACKET_HEADER_LEN,
+        "an unpublished packet may only be snapped as far as its header"
+    );
+    let err = decode_packet(header_only, 0, published, RING).unwrap_err();
+    assert_eq!(err, PacketError::Incomplete);
+    assert_eq!(
+        err.fault(),
+        None,
+        "a producer mid-write must not reach the always-on failure channel"
+    );
+
+    // A declared size the ring itself could never hold is the guest's error,
+    // and still reads as one.
+    let mut impossible = full.clone();
+    impossible[PACKET_TOTAL_SIZE..PACKET_TOTAL_SIZE + 4]
+        .copy_from_slice(&(RING + 1).to_le_bytes());
+    assert_eq!(
+        packet_snapshot_len(&impossible, RING, RING),
+        PACKET_HEADER_LEN,
+        "a size past the ring is never snapped at face value"
+    );
+    let err = decode_packet(&impossible, 0, RING, RING).unwrap_err();
+    assert_eq!(err, PacketError::BadSize);
+    assert_eq!(err.fault(), Some(PacketFault::BadSize));
+
+    // And the whole packet, published, still decodes.
+    assert_eq!(
+        packet_snapshot_len(&full, full.len() as u32, RING),
+        full.len() as u32
+    );
+    assert!(decode_packet(&full, 0, full.len() as u32, RING).is_ok());
+}
+
+/// Both rings decide how much to snapshot with the same function.
+///
+/// They used to decide it inline, and the two copies had already parted — the
+/// root ring's carried an extra arm its own caller made unreachable. A
+/// divergence here is not visible in a boot: both spellings return the same
+/// length for every packet a healthy guest writes, and differ only on the
+/// malformed ones nothing produces.
+#[test]
+fn the_snapshot_rule_reads_the_same_for_both_rings() {
+    let full = packet_bytes(ROOT_OP_DEFINE_FIFO, 3, &[0u8; 16]);
+    let total = full.len() as u32;
+    for available in [0, PACKET_HEADER_LEN, total - 1, total, total + 8] {
+        for capacity in [PACKET_HEADER_LEN, total - 1, total, RING] {
+            let want = if total <= capacity && available >= total {
+                total
+            } else {
+                PACKET_HEADER_LEN
+            };
+            assert_eq!(
+                packet_snapshot_len(&full, available, capacity),
+                want,
+                "available={available} capacity={capacity}"
+            );
+        }
+    }
 }
 
 #[test]

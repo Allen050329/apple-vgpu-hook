@@ -507,6 +507,10 @@ pub enum PacketError {
     ShortHeader,
     BadSize,
     Incomplete,
+    /// The snapshot was shorter than the packet's own published `total_size`.
+    /// Not reachable through [`packet_snapshot_len`]; a reading means this
+    /// device under-snapped, so unlike [`Self::BadSize`] it accuses the host.
+    ShortSnapshot,
 }
 
 impl PacketError {
@@ -524,11 +528,52 @@ impl PacketError {
         match self {
             Self::ShortHeader | Self::Incomplete => None,
             Self::BadSize => Some(PacketFault::BadSize),
+            Self::ShortSnapshot => Some(PacketFault::ShortSnapshot),
         }
     }
 }
 
-fn decode_packet(bytes: &[u8], head: u32, available: u32) -> Result<Packet, PacketError> {
+/// How many bytes of the ring a packet at the consumer pointer has to be
+/// snapshotted into before [`decode_packet`] can classify it.
+///
+/// The whole packet when the header's `total_size` is both sane and already
+/// published; otherwise the header alone, which is all `decode_packet` needs in
+/// order to say *which* of those two it was — and all that can safely be read,
+/// since an unpublished or nonsense `total_size` names bytes the producer has
+/// not written.
+///
+/// Shared by both drain loops rather than spelled at each, because a second copy
+/// of this is a second definition of "sane" — and the two copies had already
+/// parted: the root ring's carried an extra `else if available >=
+/// PACKET_HEADER_LEN` arm that its own caller had made unreachable one line
+/// earlier, and the child ring's did not.
+fn packet_snapshot_len(header: &[u8], available: u32, ring_capacity: u32) -> u32 {
+    let total_size = ld32(&header[PACKET_TOTAL_SIZE..]);
+    if total_size >= PACKET_HEADER_LEN && total_size <= ring_capacity && available >= total_size {
+        total_size
+    } else {
+        PACKET_HEADER_LEN
+    }
+}
+
+/// Decode one packet out of a ring snapshot taken at [`packet_snapshot_len`].
+///
+/// `ring_capacity` is what bounds a sane `total_size`, and it is a parameter
+/// rather than `bytes.len()` for the reason [`PacketError::Incomplete`] exists.
+/// The snapshot is *deliberately* short of `total_size` whenever the producer
+/// has not published the whole packet, so measuring the declared size against
+/// the snapshot conflates "the guest declared a size this ring could never hold"
+/// with "we only snapped the header because the packet is still being written".
+/// Those are opposite answers — one is a fault, the other is control flow that
+/// must stay quiet — and reading the second as the first put a
+/// `packet_bad_size` line on the always-on channel for a healthy producer
+/// mid-write, while making `Incomplete` unreachable.
+fn decode_packet(
+    bytes: &[u8],
+    head: u32,
+    available: u32,
+    ring_capacity: u32,
+) -> Result<Packet, PacketError> {
     if available < PACKET_HEADER_LEN {
         return Err(PacketError::ShortHeader);
     }
@@ -540,11 +585,20 @@ fn decode_packet(bytes: &[u8], head: u32, available: u32) -> Result<Packet, Pack
     let total_size = ld32(&bytes[PACKET_TOTAL_SIZE..]);
     let completion_stamp = ld32(&bytes[PACKET_COMPLETION_STAMP..]);
 
-    if total_size < PACKET_HEADER_LEN || total_size as usize > bytes.len() {
+    // A size the ring itself could never hold is the guest's error.
+    if total_size < PACKET_HEADER_LEN || total_size > ring_capacity {
         return Err(PacketError::BadSize);
     }
+    // A size the producer has not finished publishing is not.
     if available < total_size {
         return Err(PacketError::Incomplete);
+    }
+    // Past both, `packet_snapshot_len` took its first arm and the snapshot is
+    // the whole packet. A short one here is this device mis-snapping, not
+    // anything the guest did, so it is its own fault rather than a `BadSize`
+    // charged to the guest — and a healthy boot never reaches it.
+    if (bytes.len() as u32) < total_size {
+        return Err(PacketError::ShortSnapshot);
     }
     let stamps_bytes = stamp_count as u32 * PACKET_STAMP_LEN;
     let min_payload_off = PACKET_HEADER_LEN + stamps_bytes;
@@ -1080,18 +1134,7 @@ pub fn drain_main_fifo<H: HostMemory + HostOps>(state: &mut DeviceState, host: &
                 break;
             }
         };
-        let total_size = ld32(&header[PACKET_TOTAL_SIZE..]);
-        let snap_len = if total_size >= PACKET_HEADER_LEN
-            && total_size <= ring_size
-            && available >= total_size
-        {
-            total_size
-        } else if available >= PACKET_HEADER_LEN {
-            // incomplete or bad — try decode to classify
-            PACKET_HEADER_LEN
-        } else {
-            break;
-        };
+        let snap_len = packet_snapshot_len(&header, available, ring_size);
         let snap = match read_ring_bytes(
             host,
             base,
@@ -1121,6 +1164,7 @@ pub fn drain_main_fifo<H: HostMemory + HostOps>(state: &mut DeviceState, host: &
                 .fifo_read
                 .load(std::sync::atomic::Ordering::Acquire),
             available,
+            ring_size,
         ) {
             Ok(packet) => {
                 process_root_packet(state, host, &packet);
@@ -2776,15 +2820,7 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
                 break;
             }
         };
-        let total_size = ld32(&header[PACKET_TOTAL_SIZE..]);
-        let snap_len = if total_size >= PACKET_HEADER_LEN
-            && total_size <= ring_length
-            && available >= total_size
-        {
-            total_size
-        } else {
-            PACKET_HEADER_LEN
-        };
+        let snap_len = packet_snapshot_len(&header, available, ring_length);
         let snap = match read_child_ring_bytes(
             host,
             &page_gpas,
@@ -2819,7 +2855,7 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
             state.pending.child_mask |= bit;
             break;
         }
-        match decode_packet(&snap, head, available) {
+        match decode_packet(&snap, head, available, ring_length) {
             Ok(packet) => {
                 if process_child_packet(state, host, channel_id, &packet)
                     == ChildPacketDisposition::Deferred
