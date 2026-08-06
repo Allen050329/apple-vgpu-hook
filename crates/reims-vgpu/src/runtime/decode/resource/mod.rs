@@ -3188,14 +3188,44 @@ pub fn compute_icb_layout(max_kernel: u16, max_kernel_tg: u16) -> IcbCommandLayo
     }
 }
 
-/// Number of kernel-threadgroup-memory length slots implied by layout offsets.
-pub fn icb_layout_kernel_tg_slot_count(layout: &IcbCommandLayout) -> u16 {
-    let start = layout.threadgroup_memory_length_offset;
-    let end = layout.command_arguments_offset;
+/// How many `stride`-sized entries the layout region `[start, end)` holds.
+///
+/// The four ICB tables — vertex/fragment/object/mesh/kernel binds, object-TG
+/// lengths, kernel-TG lengths, attribute strides — each pick their own two
+/// endpoints out of [`IcbCommandLayout`], and then all four ask this same
+/// question of them. It used to be written out at each of the four, which is
+/// four chances for one of them to answer differently.
+///
+/// **The answer is `u32` because the endpoints are.** The layout's offsets are
+/// the 32-bit words of the guest's own layout blob, so a region can name more
+/// than `u16::MAX` entries and the count has to be able to say so. All four
+/// used to narrow the quotient to `u16` on the way out, which wraps rather than
+/// saturates: a table of 65 537 entries answered 1, and the caller then read
+/// one entry and dropped the rest, or — at
+/// [`crate::runtime::icb`]'s attribute-stride readers, which bounds-check the
+/// guest's index against this count — refused a perfectly good index for being
+/// past a table it had just been told was one entry long.
+///
+/// A well-formed descriptor cannot reach that: the create body declares each
+/// bind count in a single byte (see `reims_vgpu_wire::ops::icb::NewIcbBody`),
+/// so a guest whose layout agrees with its own create body stays under 256. The
+/// layout blob is a separate copy from the create body and nothing here checks
+/// the two against each other, so the width is not left resting on that
+/// agreement.
+pub(crate) fn icb_layout_table_len(start: u32, end: u32, stride: usize) -> u32 {
     if end <= start {
         return 0;
     }
-    ((end - start) / ICB_TG_MEMORY_STRIDE as u32) as u16
+    (end - start) / stride as u32
+}
+
+/// Number of kernel-threadgroup-memory length slots implied by layout offsets.
+pub fn icb_layout_kernel_tg_slot_count(layout: &IcbCommandLayout) -> u32 {
+    icb_layout_table_len(
+        layout.threadgroup_memory_length_offset,
+        layout.command_arguments_offset,
+        ICB_TG_MEMORY_STRIDE,
+    )
 }
 
 /// Number of attribute-stride table entries implied by layout offsets.
@@ -3203,7 +3233,7 @@ pub fn icb_layout_kernel_tg_slot_count(layout: &IcbCommandLayout) -> u16 {
 /// Table is `[attribute_stride_offset, next_region)` in u64 slots, where
 /// `next_region` is the earliest of object-TG / kernel-TG / command-args that
 /// lies strictly after the stride table start.
-pub fn icb_layout_attribute_stride_slot_count(layout: &IcbCommandLayout) -> u16 {
+pub fn icb_layout_attribute_stride_slot_count(layout: &IcbCommandLayout) -> u32 {
     let start = layout.attribute_stride_offset;
     if start == 0 {
         return 0;
@@ -3217,10 +3247,7 @@ pub fn icb_layout_attribute_stride_slot_count(layout: &IcbCommandLayout) -> u16 
     .filter(|&e| e > start)
     .min()
     .unwrap_or(start);
-    if end <= start {
-        return 0;
-    }
-    ((end - start) / ICB_ATTRIBUTE_STRIDE_ENTRY_SIZE as u32) as u16
+    icb_layout_table_len(start, end, ICB_ATTRIBUTE_STRIDE_ENTRY_SIZE)
 }
 
 /// Decode type-7 ICB create descriptor (tag 0x36, length 0x58).

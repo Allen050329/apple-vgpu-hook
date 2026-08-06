@@ -2186,3 +2186,62 @@ fn the_undrivable_type7_subtypes_are_the_pipeline_pair_and_nothing_claims_them()
         );
     }
 }
+
+/// A layout table longer than `u16::MAX` entries reports its real length.
+///
+/// Every one of these counts used to narrow the quotient of two 32-bit layout
+/// offsets to `u16` on the way out, which wraps: the 65 537-entry table below
+/// answered 1. The callers then either read one entry of a table the guest
+/// filled, or — at the attribute-stride readers, which bounds-check the guest's
+/// index against this count — refused every index from 1 up as past the end.
+///
+/// A guest whose layout agrees with its own create body cannot get here; the
+/// body declares each count in one byte. The layout blob is a separate copy and
+/// nothing checks the two against each other, which is why the count is not
+/// left resting on that agreement.
+#[test]
+fn a_layout_table_past_u16_reports_its_real_length() {
+    let entries = u32::from(u16::MAX) + 2;
+
+    // Kernel-TG lengths: [threadgroup_memory_length_offset, command_arguments_offset).
+    let tg_start = 0x100u32;
+    let mut layout = IcbCommandLayout {
+        threadgroup_memory_length_offset: tg_start,
+        command_arguments_offset: tg_start + entries * ICB_TG_MEMORY_STRIDE as u32,
+        ..Default::default()
+    };
+    assert_eq!(
+        icb_layout_kernel_tg_slot_count(&layout),
+        entries,
+        "kernel-TG count wrapped instead of reporting {entries}"
+    );
+
+    // Attribute strides: [attribute_stride_offset, earliest region after it).
+    layout = IcbCommandLayout {
+        attribute_stride_offset: tg_start,
+        command_arguments_offset: tg_start + entries * ICB_ATTRIBUTE_STRIDE_ENTRY_SIZE as u32,
+        ..Default::default()
+    };
+    assert_eq!(
+        icb_layout_attribute_stride_slot_count(&layout),
+        entries,
+        "attribute-stride count wrapped instead of reporting {entries}"
+    );
+
+    // The shared rule underneath both, at each stride this crate uses.
+    for stride in [
+        ICB_TG_MEMORY_STRIDE,
+        ICB_ATTRIBUTE_STRIDE_ENTRY_SIZE,
+        ICB_BUFFER_BIND_STRIDE,
+    ] {
+        assert_eq!(
+            icb_layout_table_len(tg_start, tg_start + entries * stride as u32, stride),
+            entries,
+            "stride {stride:#x} wrapped"
+        );
+        // An end at or below the start is an empty table, never a huge one from
+        // a wrapped subtraction.
+        assert_eq!(icb_layout_table_len(tg_start, tg_start, stride), 0);
+        assert_eq!(icb_layout_table_len(tg_start, tg_start - 8, stride), 0);
+    }
+}

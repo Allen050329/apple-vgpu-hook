@@ -30,14 +30,14 @@ use crate::model::DeviceState;
 use crate::runtime::decode::resource::TYPE7_OBJECT_ICB;
 use crate::runtime::decode::resource::{
     decode_type7_descriptor, icb_layout_attribute_stride_slot_count,
-    icb_layout_kernel_tg_slot_count, Descriptor as ResourceDescriptor, IcbCommandLayout,
-    IndirectCommandBufferDescriptor, ICB_ATTRIBUTE_STRIDE_ENTRY_SIZE, ICB_BUFFER_BIND_STRIDE,
-    ICB_CMD_TYPE_CONCURRENT_DISPATCH_THREADGROUPS, ICB_CMD_TYPE_CONCURRENT_DISPATCH_THREADS,
-    ICB_CMD_TYPE_DRAW, ICB_CMD_TYPE_DRAW_INDEXED, ICB_CMD_TYPE_DRAW_INDEXED_PATCHES,
-    ICB_CMD_TYPE_DRAW_MESH_THREADGROUPS, ICB_CMD_TYPE_DRAW_MESH_THREADS, ICB_CMD_TYPE_DRAW_PATCHES,
-    ICB_CONCURRENT_DISPATCH_ARGS_LEN, ICB_DRAW_INDEXED_PATCHES_ARGS_LEN, ICB_DRAW_MESH_ARGS_LEN,
-    ICB_DRAW_PATCHES_ARGS_LEN, ICB_TESSELLATION_FACTOR_LEN, ICB_TG_MEMORY_STRIDE,
-    OBJECT_TYPE_TYPE7,
+    icb_layout_kernel_tg_slot_count, icb_layout_table_len, Descriptor as ResourceDescriptor,
+    IcbCommandLayout, IndirectCommandBufferDescriptor, ICB_ATTRIBUTE_STRIDE_ENTRY_SIZE,
+    ICB_BUFFER_BIND_STRIDE, ICB_CMD_TYPE_CONCURRENT_DISPATCH_THREADGROUPS,
+    ICB_CMD_TYPE_CONCURRENT_DISPATCH_THREADS, ICB_CMD_TYPE_DRAW, ICB_CMD_TYPE_DRAW_INDEXED,
+    ICB_CMD_TYPE_DRAW_INDEXED_PATCHES, ICB_CMD_TYPE_DRAW_MESH_THREADGROUPS,
+    ICB_CMD_TYPE_DRAW_MESH_THREADS, ICB_CMD_TYPE_DRAW_PATCHES, ICB_CONCURRENT_DISPATCH_ARGS_LEN,
+    ICB_DRAW_INDEXED_PATCHES_ARGS_LEN, ICB_DRAW_MESH_ARGS_LEN, ICB_DRAW_PATCHES_ARGS_LEN,
+    ICB_TESSELLATION_FACTOR_LEN, ICB_TG_MEMORY_STRIDE, OBJECT_TYPE_TYPE7,
 }; // ICB_TG_MEMORY_STRIDE: object + kernel TG length tables
 #[cfg(test)]
 use crate::runtime::decode::resource::{
@@ -628,7 +628,7 @@ pub fn decode_render_command_slot(
     let mut buffers = Vec::new();
     let push_binds = |buffers: &mut Vec<IcbRenderBufferBind>,
                       base_off: u32,
-                      count: u16,
+                      count: u32,
                       stage: IcbRenderBindStage| {
         if base_off == 0 || count == 0 {
             return;
@@ -668,13 +668,13 @@ pub fn decode_render_command_slot(
     push_binds(
         &mut buffers,
         layout.vertex_buffer_bind_offset,
-        max_vertex_binds,
+        u32::from(max_vertex_binds),
         IcbRenderBindStage::Vertex,
     );
     push_binds(
         &mut buffers,
         layout.fragment_buffer_bind_offset,
-        max_fragment_binds,
+        u32::from(max_fragment_binds),
         IcbRenderBindStage::Fragment,
     );
     // Object/mesh bind table sizes from layout offsets (setupCommandLayout order).
@@ -844,13 +844,12 @@ pub fn decode_render_command_slot(
 }
 
 /// Object-TG length table slot count between layout offsets.
-fn icb_layout_object_tg_slot_count(layout: &IcbCommandLayout) -> u16 {
-    let start = layout.object_threadgroup_memory_length_offset;
-    let end = layout.threadgroup_memory_length_offset;
-    if end <= start {
-        return 0;
-    }
-    ((end - start) / ICB_TG_MEMORY_STRIDE as u32) as u16
+fn icb_layout_object_tg_slot_count(layout: &IcbCommandLayout) -> u32 {
+    icb_layout_table_len(
+        layout.object_threadgroup_memory_length_offset,
+        layout.threadgroup_memory_length_offset,
+        ICB_TG_MEMORY_STRIDE,
+    )
 }
 
 /// Read tessellation-factor table at `tessellationFactorOffset` (host RE).
@@ -893,11 +892,8 @@ fn write_tessellation_factor(
 }
 
 /// Bind-table slot count between two layout offsets (`count × 0x14`).
-fn icb_layout_stage_bind_count(start: u32, end: u32) -> u16 {
-    if end <= start {
-        return 0;
-    }
-    ((end - start) / ICB_BUFFER_BIND_STRIDE as u32) as u16
+fn icb_layout_stage_bind_count(start: u32, end: u32) -> u32 {
+    icb_layout_table_len(start, end, ICB_BUFFER_BIND_STRIDE)
 }
 
 /// Encode one render Draw / DrawIndexed command slot (tests / fixtures).
@@ -1301,14 +1297,16 @@ pub fn materialize_metal_icb(
     mtl_desc.set_max_vertex_buffer_bind_count(desc.max_vertex_buffer_bind_count as u64);
     mtl_desc.set_max_fragment_buffer_bind_count(desc.max_fragment_buffer_bind_count as u64);
     mtl_desc.set_max_kernel_buffer_bind_count(desc.max_kernel_buffer_bind_count as u64);
-    // Prefer create-body count; fall back to layout-implied TG slot count.
-    let max_tg = desc
-        .max_kernel_threadgroup_memory_bind_count
+    // Prefer create-body count; fall back to layout-implied TG slot count. The
+    // create-body count widens to meet the layout's: the body declares it in a
+    // byte, the layout implies it from two 32-bit offsets, and the wider of the
+    // two is what Metal is told.
+    let max_tg = u32::from(desc.max_kernel_threadgroup_memory_bind_count)
         .max(icb_layout_kernel_tg_slot_count(&desc.layout));
     if max_tg > 0 {
         crate::backend::metal::raw_metal::set_max_kernel_threadgroup_memory_bind_count(
             mtl_desc.as_ref(),
-            max_tg as u64,
+            u64::from(max_tg),
         );
     }
     // Mesh / object bind counts from create body (macOS 14+).
@@ -1599,7 +1597,7 @@ pub fn apply_icb_host_resource_info<M: HostMemory + HostOps>(
 /// `has_attribute_stride` with stride 0 is rare; product uses non-zero for has).
 fn read_attribute_stride(layout: &IcbCommandLayout, slot: &[u8], index: u32) -> (u64, bool) {
     let slots = icb_layout_attribute_stride_slot_count(layout);
-    if slots == 0 || index >= slots as u32 || layout.attribute_stride_offset == 0 {
+    if slots == 0 || index >= slots || layout.attribute_stride_offset == 0 {
         return (0, false);
     }
     let off = layout.attribute_stride_offset as usize
@@ -1626,7 +1624,7 @@ fn write_attribute_stride(
 ) -> Result<(), IcbStatus> {
     use crate::contract::endian::st64;
     let slots = icb_layout_attribute_stride_slot_count(layout);
-    if slots == 0 || index >= slots as u32 || layout.attribute_stride_offset == 0 {
+    if slots == 0 || index >= slots || layout.attribute_stride_offset == 0 {
         return Err(IcbStatus::Args("icb_attribute_stride_no_slot"));
     }
     let off = layout.attribute_stride_offset as usize
