@@ -2229,8 +2229,31 @@ mod pool_trim_order_tests {
 /// `zc_buffer_gathered` CPU gathers through [`staging_write_ptr`],
 /// `render_flush_leased` leases, `swap_rb_kb` through the swizzling writer, and
 /// one `render_flush_gpu_declined` per lease, every flush taking the copying
-/// route. No such boot has been run against this rail, so no traffic figures are
-/// quoted here rather than a stale one being read as current.
+/// route.
+///
+/// That boot has now been run — `fdd7b96f`, x86 PCI attach, Safari window-drag
+/// probe, 25 s, quiesced machine, one `vk_caps`. It took: `disabled_by_env` on
+/// the capability line and one off-channel `no_backend_import`. Traffic, summed
+/// across the 44 per-window `store_routes` samples:
+///
+/// | route | count |
+/// |---|---:|
+/// | `zc_buffer_gathered` | 273 850 |
+/// | `zc_buffer_imported` | **0** |
+/// | `render_flush_leased` | 7 404 |
+/// | `render_flush_gpu_declined` | 7 404 |
+/// | `render_flush_gpu_direct` | **0** |
+/// | `swap_rb_kb` | 273 112 |
+///
+/// The two zeros are the gate holding: nothing bound an import past it. The two
+/// 7 404s are the identity this doc predicted — one decline per lease — and
+/// they are the cheapest check that the reading is of the boot it claims,
+/// because no other pairing in the census produces it.
+///
+/// Later commits changed which *name* a writeback decline carries and added a
+/// device-local detiling path, but that path is behind the same import gate and
+/// cannot run here, so these counts still describe the copying rails as they
+/// stand. A timing would not have survived that qualifier; counts do.
 ///
 /// The three refusals not firing is the expected reading rather than a null one:
 /// `acquire_staging` and `acquire_readback` round a request up to a power-of-two
