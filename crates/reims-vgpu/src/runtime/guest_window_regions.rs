@@ -22,6 +22,33 @@
 //! gated tree is logic nobody on a Linux host ever runs — and it is what lets
 //! the tests below run on every arm instead of on none.
 //!
+//! # What a driven boot measured
+//!
+//! x86 PCI attach, Safari window-drag probe, 25 s, quiesced machine, one
+//! `vk_caps` so one boot. Against the same probe on the build that refused
+//! scattered windows outright:
+//!
+//! - `render_flush_gpu_declined` 23 → **0**, and `render_flush_leased` → 0. The
+//!   writeback no longer falls back for a full-screen surface, which is what
+//!   this module exists to make possible.
+//! - Armed deferred-writeback windows peaked at 656 → **288**. §5's target is
+//!   zero on a UMA host; this is progress toward it and not arrival.
+//! - `gpu_writeback_too_many_regions` never fired, so
+//!   `MAX_GUEST_COPY_REGIONS` is not binding at 1080p.
+//! - The desktop renders correctly — wallpaper, dock and a Safari window, no
+//!   banding or tearing. One screenshot of a near-static desktop is evidence
+//!   against gross corruption and is *not* a regression gate.
+//!
+//! **It did not pay in throughput.** Present cadence fell (median 18.95 → 16.50
+//! Hz) and `fence_us` rose (median 592 → 945 µs) — roughly what ~500 copy
+//! rectangles per flush costs the GPU against one. So the honest state is: the
+//! rail is correct, the decline is gone, the deferred window count halved, and
+//! the frame is slower. Whoever picks this up should treat the region count as
+//! the thing to attack — coalescing across runs, or a linear scratch so the
+//! second hop is `vkCmdCopyBuffer` with 507 plain ranges instead of ~1500
+//! rectangles — rather than assuming the widening was a mistake. Timings are
+//! wall clock on a shared machine and are upper bounds; the counts above are not.
+//!
 //! # What the caller still owes
 //!
 //! Padding is skipped, not written. A guest row pitch wider than the frame
