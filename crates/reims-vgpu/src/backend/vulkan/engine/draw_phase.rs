@@ -177,14 +177,23 @@
 //! on with nothing read and nothing compared. `sampled_gather_skips` counts it
 //! working.
 //!
-//! What the counters that came with it establish is that the witness is not the
-//! half that fails. On a driven x86/PCI drag, 73 windows:
-//! `sampled_gather_unvouched` is **0** and `sampled_gather_unretained` is 6296.
-//! Every gather on that boot had a vouch and could not spend it, because no
-//! image answered to its `(key, identity)`. So the remaining lever here is
-//! retention in the sampled cache, not the witness and not the guest — see
-//! [`super::counters::EngineCounters::sampled_gather_unvouched`] for the
-//! reading and for the `gw_*` misreading it closes.
+//! Which half fails is **not yet established**. A driven x86/PCI drag over 73
+//! windows read `sampled_gather_unvouched` at **0** against
+//! `sampled_gather_unretained` at 6296, and that was taken to mean every gather
+//! had a vouch it could not spend — so the lever was retention rather than the
+//! witness. The zero was structural: the emitter was handed
+//! `resource.identity.is_some()`, and the producer names every window the
+//! witness is asked about, so the arm could not fire on any bind of any boot.
+//! The counter now takes the witness's own
+//! [`crate::runtime::gather_witness::GatherVouch`], which makes the question
+//! answerable for the first time; see
+//! [`super::counters::EngineCounters::sampled_gather_unvouched`].
+//!
+//! What still stands is the shape of the cost — 424 MB/s of re-gather with the
+//! elision firing on a minority of binds — and that a `Fresh` vouch makes the
+//! following miss compulsory rather than a fault. Whether the 6296 are mostly
+//! compulsory or mostly lost images decides whether there is anything here to
+//! fix at all, and one driven boot answers it.
 //!
 //! # And none of it holds when the guest is quiet
 //!

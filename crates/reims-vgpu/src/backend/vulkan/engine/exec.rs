@@ -768,7 +768,7 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
         }
         if req.sampled_images.iter().any(|img| match &img.source {
             SampledSource::Target(identity) => identity == seed_identity,
-            SampledSource::Bytes(_) | SampledSource::GuestRuns(_) => false,
+            SampledSource::Bytes(_) | SampledSource::GuestRuns(..) => false,
         }) {
             return Err(DrawError::DrawValidation(
                 DrawValidationDecline::SeedAlsoSampled,
@@ -1062,7 +1062,7 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
                 }
             }
             SampledSource::Bytes(_) => {}
-            SampledSource::GuestRuns(src) => {
+            SampledSource::GuestRuns(src, _) => {
                 // The zero-copy gather uploads a single array layer into a
                 // single-depth image (`layer_count: 1`, `depth: 1` below), so
                 // it serves any shape that is one layer deep: plain 2D, a
@@ -2059,7 +2059,7 @@ pub(crate) unsafe fn execute_draw_inner(
                     .sampled_gpu_binds
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
-            SampledSource::GuestRuns(src) => {
+            SampledSource::GuestRuns(src, vouch) => {
                 // The producer vouches for this identity only when both halves
                 // of the guest-write witness say the window's bytes cannot have
                 // moved since the gather that filled the retained image: no
@@ -2083,7 +2083,13 @@ pub(crate) unsafe fn execute_draw_inner(
                 // opposite fixes: no vouch to spend, or a vouch with nothing
                 // left to spend it on. Taken here because this is the only point
                 // holding both the witness's answer and the cache's.
-                counters.note_sampled_gather_unskipped(resource.identity.is_some());
+                //
+                // The witness's answer is `vouch` and never `resource.identity`.
+                // Asking the identity was the same question the *producer* had
+                // already answered structurally — it names every window it is
+                // asked about — so the "no vouch" half read zero on every bind
+                // of every boot.
+                counters.note_sampled_gather_unskipped(*vouch);
                 let img = pools.acquire_sampled(ctx, SampledKey::of(resource), counters)?;
                 // Everything from here to the end of this arm moves bytes;
                 // everything above it in `AcquireSampled` decides which image
@@ -3643,7 +3649,11 @@ mod tests {
                     // A fixture over a dummy host address names no guest
                     // RAM, so there is no reference an import could bind.
                     pages: None,
-                }),
+                },
+                // No witness ran for a synthetic source, so nothing vouches:
+                // the gather is the only disposition this fixture can take.
+                crate::runtime::gather_witness::GatherVouch::Fresh,
+                ),
                 format: crate::backend::vulkan::translate::pixel::vk_texel_layout(
                     crate::contract::pixel_format::TexelLayout::Bgra8,
                 ),

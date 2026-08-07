@@ -1458,11 +1458,24 @@ const RECLAIM_HISTORY: usize = 256;
 /// next: with no byte pressure at all, a 256-entry cache is *still* evicting
 /// 4791 times on the count cap. Entries are being written, never hit and
 /// dropped. That is the signature of a key that does not repeat rather than of a
-/// cache that is too small — the vouched `(key, generation)` an entry is
-/// retained under not being the one the next bind looks it up with. That is a
-/// **lead and not a finding**: nothing here has confirmed it, and
-/// `runtime::gather_witness`'s generation handling is where it would be
-/// confirmed or killed. Do not raise either constant on the strength of it.
+/// cache that is too small.
+///
+/// `runtime::gather_witness` was read to confirm or kill that, and it did
+/// neither — it found the reason the question was open. A `(key, generation)`
+/// *is* held across binds for as long as both witness halves say the bytes have
+/// not moved, so an unchanged window's key does repeat by construction. But
+/// every other verdict spends a fresh generation, and a bind holding one is
+/// **compelled** to miss: the identity names bytes no image was ever built from.
+/// So a miss is only a cache failure when the witness vouched, and the counter
+/// that was supposed to say which — `sampled_gather_unvouched` — was reading a
+/// structural zero. The rows above cannot distinguish a cache dropping live
+/// entries from a guest rewriting the window every frame, and neither can any
+/// reading taken before that counter was fixed.
+///
+/// Do not raise either constant on the strength of the eviction count. Both
+/// causes evict identically: a compulsory miss admits a new entry under its
+/// fresh identity just as a lost one does, so 4791 evictions is what a
+/// perfectly-behaved cache also looks like when the content really is changing.
 const SAMPLED_CACHE_CAP: usize = 64;
 const SAMPLED_CACHE_BYTE_CAP: usize = 128 * 1024 * 1024;
 /// Max recycled sampled slots retained per geometry key in `sampled_free`. A

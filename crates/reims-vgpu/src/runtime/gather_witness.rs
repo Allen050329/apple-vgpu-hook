@@ -31,6 +31,16 @@
 //! generation, and the engine's `(key, generation)` lookup misses, so the bytes
 //! are read.
 //!
+//! **A spent generation makes the next lookup miss by construction, and that is
+//! the witness working rather than a cache failing.** [`note_gather`] hands both
+//! facts back together in a [`GatherOutcome`] for exactly this reason: the
+//! identity is what the engine binds and retains on, and the [`GatherVouch`]
+//! beside it is whether that identity could ever have named a retained image.
+//! An engine that has only the identity cannot tell a compulsory miss from a
+//! lost one — it once tried, by asking whether the identity was present at all,
+//! and that question has one answer. Every window this witness is asked about
+//! gets an entry, so it names every one of them.
+//!
 //! Verdicts, through [`crate::runtime::drain::note_store_route`]:
 //!
 //! | route | meaning |
@@ -304,11 +314,6 @@ impl GatherWitness {
         );
     }
 
-    /// The generation currently vouched for `key`'s bytes.
-    fn vouched_identity(&self, key: &GatherKey) -> Option<u64> {
-        self.entries.get(key).map(|entry| entry.generation)
-    }
-
     /// The host-write epoch recorded at the previous bind of `key`, if any.
     fn previous_pages_epoch(&self, key: &GatherKey) -> Option<u64> {
         self.entries.get(key).map(|entry| entry.pages_epoch)
@@ -460,13 +465,27 @@ pub enum ContentAudit {
     Disagreed,
 }
 
-/// One bind's two answers: what the witness decided, and what the audit found.
+/// One bind's answers: what the witness decided, what the audit found, and the
+/// generation the window is left naming.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct GatherObservation {
     /// The decision, from the two witness halves alone.
     pub verdict: GatherVerdict,
     /// The check on it, on the binds where the fold ran.
     pub audit: ContentAudit,
+    /// The generation this window names *after* the bind — the one the entry
+    /// carried in, where it survived, and `fresh_generation` where it did not.
+    ///
+    /// Returned rather than looked back up so the identity has no absent case to
+    /// spell. Reading it back out of the map produced an `Option` that was
+    /// `Some` on every path through [`observe`], which is how
+    /// `sampled_gather_unvouched` came to be a counter that could not fire.
+    pub generation: u64,
+    /// Whether [`Self::generation`] is the one the entry carried in or one spent
+    /// this bind. Decided beside the assignment that spends it, never
+    /// re-derived from [`Self::verdict`] — a `Disagreed` audit vouches and still
+    /// spends, so the two do not agree.
+    pub vouch: GatherVouch,
 }
 
 /// The one way this witness can be wrong.
@@ -500,11 +519,36 @@ impl crate::observe::decline::Decline for GatherWitnessFault {
     }
 }
 
+/// One bind's answer to the engine: what to bind on, and whether it is worth
+/// anything.
+///
+/// Both halves are always present. The type exists so they travel together —
+/// carrying the identity alone is what let the engine ask "is there an identity"
+/// and read the answer as "did the witness vouch".
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GatherOutcome {
+    /// What the engine looks the retained image up under, and retains under.
+    pub identity: GatheredIdentity,
+    /// Whether that identity can name an image the cache already holds.
+    pub vouch: GatherVouch,
+}
+
 /// Record one zero-copy sampled gather against the guest-write witness, and
 /// report it to the census.
 ///
 /// Called from the producers with the window already resolved, so it adds a
 /// page-set compare and one content fold and changes no behaviour.
+///
+/// # Why this does not return an `Option`
+///
+/// It used to, and the `Option` was `Some` on every path: the identity was read
+/// back with `vouched_identity`, which answered "is this window tracked", and
+/// [`observe`] leaves an entry for every key it is given — the re-point branch
+/// inserts one and returns, the overflow evictor never evicts the key it was
+/// asked about, and the surviving branch holds a `&mut` to one. The engine spent
+/// a boot counting `identity.is_some()` as the witness's verdict and read the
+/// resulting zero as "the witness never refused a gather". It cannot refuse
+/// through this return value at all; [`GatherVouch`] is where the verdict lives.
 #[must_use = "the identity is what lets the engine skip the gather; dropping it \
               silently keeps the copy"]
 pub fn note_gather<M: crate::runtime::host::HostOps>(
@@ -513,7 +557,7 @@ pub fn note_gather<M: crate::runtime::host::HostOps>(
     rail: GatherRail,
     key: GatherKey,
     window: GatherWindow<'_>,
-) -> Option<GatheredIdentity> {
+) -> GatherOutcome {
     use crate::runtime::drain::{note_store_route, note_store_route_n};
 
     let span = window.span;
@@ -583,20 +627,60 @@ pub fn note_gather<M: crate::runtime::host::HostOps>(
             .fail_once(key.content_key());
         }
     }
-    state
-        .gather_witness
-        .vouched_identity(&key)
-        .map(|generation| GatheredIdentity {
+    GatherOutcome {
+        identity: GatheredIdentity {
             key: key.content_key(),
-            generation,
-        })
+            generation: seen.generation,
+        },
+        vouch: seen.vouch,
+    }
+}
+
+/// Whether this bind's identity names bytes some earlier gather already moved,
+/// or one minted for bytes nothing has ever gathered.
+///
+/// The distinction decides whether a lookup miss is a fault at all, and it is
+/// not recoverable from the identity: a `Fresh` identity is by construction one
+/// no cache entry can have been retained under, so it *must* miss and the gather
+/// that follows is the witness working. Only a `Vouched` identity that misses
+/// says an image was lost.
+///
+/// Carried beside [`GatheredIdentity`] rather than folded into it because the
+/// identity is what the engine *binds on* and this is what it *reports* — a
+/// `Fresh` bind still retains under its new identity, which is exactly what lets
+/// the next quiet bind hit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GatherVouch {
+    /// Both halves said the bytes cannot have moved since the gather that filled
+    /// the retained image, so the identity is one the cache may already hold.
+    Vouched,
+    /// Either half saw a write, the window was re-pointed, or no token could
+    /// answer — the generation was spent this bind and names bytes no retained
+    /// image was ever built from.
+    Fresh,
+}
+
+impl GatherVouch {
+    /// True only for [`GatherVouch::Vouched`], so a caller cannot spell the
+    /// question as "is there an identity" — there always is.
+    pub fn is_vouched(self) -> bool {
+        matches!(self, Self::Vouched)
+    }
 }
 
 /// What the engine may bind a retained image on without looking at a byte.
 ///
-/// Only produced when both halves of the witness agree the window's bytes cannot
-/// have moved since the gather that filled that image: the hypervisor saw no
-/// guest store into the pages, and this device wrote none of them either.
+/// Produced on **every** bind, not only vouched ones — the generation is what
+/// separates the two. Where both halves agree the window's bytes cannot have
+/// moved (no guest store into the pages, and no write by this device either) the
+/// generation is the one the previous gather retained under, and the engine's
+/// lookup hits. Where either half saw a write the generation is spent, so the
+/// lookup misses, the bytes are read, and the new identity is what the retain
+/// lands under — which is what makes the *following* quiet bind hit.
+///
+/// [`GatherVouch`] says which of the two this is. Do not reconstruct it from the
+/// identity's presence: an absent identity would mean the witness was never
+/// asked, and that is not a case [`note_gather`] can return.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GatheredIdentity {
     /// Stable name for the window, in the device-wide sampled-identity keyspace.
@@ -670,6 +754,11 @@ fn observe<M: crate::runtime::host::HostOps>(
         return GatherObservation {
             verdict: GatherVerdict::Rearmed,
             audit: ContentAudit::Skipped,
+            generation: fresh_generation,
+            // The other place a generation is assigned, and the only one that
+            // assigns unconditionally: a re-pointed window has no previous bind
+            // of these pages to have vouched for them.
+            vouch: GatherVouch::Fresh,
         };
     }
 
@@ -729,13 +818,29 @@ fn observe<M: crate::runtime::host::HostOps>(
     // audit did not just catch them out. A `Disagreed` audit is not only an
     // alarm: the vouch it refutes is live, so dropping the generation here is
     // what stops the next bind serving the stale image again.
-    if !vouched || matches!(audit, ContentAudit::Disagreed) {
+    //
+    // This one expression decides both what the entry names and what the caller
+    // is told the name is worth. Re-deriving the second from `verdict` would get
+    // a `Disagreed` audit wrong — that arm vouches and still spends the
+    // generation — and a reader comparing the two spellings could not tell which
+    // was the rule.
+    let kept = vouched && !matches!(audit, ContentAudit::Disagreed);
+    if !kept {
         entry.generation = fresh_generation;
     }
     entry.gen = gen;
     entry.pages_epoch = pages_epoch;
     entry.last_seen = witness.binds;
-    GatherObservation { verdict, audit }
+    GatherObservation {
+        verdict,
+        audit,
+        generation: entry.generation,
+        vouch: if kept {
+            GatherVouch::Vouched
+        } else {
+            GatherVouch::Fresh
+        },
+    }
 }
 
 #[cfg(test)]
@@ -873,6 +978,12 @@ mod tests {
     /// Held while both halves vouch, and replaced by every other verdict — the
     /// bytes being unchanged is not the question, because a bind where either
     /// half saw a write is a bind whose bytes nothing has vouched for.
+    ///
+    /// Asserted on the observation the bind returns rather than by reading the
+    /// map back, because that read is what the engine used to do and it cannot
+    /// come back absent: every arm here leaves an entry, so an `Option` from it
+    /// is `Some` whatever the verdict was. The [`GatherVouch`] beside each
+    /// generation is the part that varies, and it is checked at every step.
     #[test]
     fn the_vouched_generation_outlives_a_quiet_bind_and_no_other_kind() {
         let mut host = crate::runtime::host::FakeHost::new();
@@ -880,16 +991,17 @@ mod tests {
         let mut buf = vec![0xa5u8; PAGE];
         let runs = [run_over(&buf)];
 
-        observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs), QUIET, 10);
-        assert_eq!(w.vouched_identity(&KEY), Some(10));
+        let first = observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs), QUIET, 10);
+        assert_eq!((first.generation, first.vouch), (10, GatherVouch::Fresh));
 
-        // Quiet at both halves: the same bytes, so the same generation.
-        observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs), QUIET, 11);
-        assert_eq!(w.vouched_identity(&KEY), Some(10));
+        // Quiet at both halves: the same bytes, so the same generation, and the
+        // only bind of the four that names an image an earlier gather filled.
+        let quiet = observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs), QUIET, 11);
+        assert_eq!((quiet.generation, quiet.vouch), (10, GatherVouch::Vouched));
 
         // A host write into the pages, with the bytes unchanged. Unchanged is
         // not enough: this device wrote them, so nothing vouches for them.
-        observe(
+        let host_wrote = observe(
             &mut w,
             &mut host,
             KEY,
@@ -901,16 +1013,19 @@ mod tests {
             12,
         );
         assert_eq!(
-            w.vouched_identity(&KEY),
-            Some(12),
+            (host_wrote.generation, host_wrote.vouch),
+            (12, GatherVouch::Fresh),
             "a generation survived a write to its own pages"
         );
 
         // A guest store, likewise.
         buf[3] ^= 0xff;
         host.guest_wrote_page(GPAS[0]);
-        observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs), QUIET, 13);
-        assert_eq!(w.vouched_identity(&KEY), Some(13));
+        let guest_wrote = observe(&mut w, &mut host, KEY, one_page(&GPAS, &runs), QUIET, 13);
+        assert_eq!(
+            (guest_wrote.generation, guest_wrote.vouch),
+            (13, GatherVouch::Fresh)
+        );
     }
 
     /// A window whose bytes and pages both stand still, bound twice: the whole
@@ -1002,13 +1117,9 @@ mod tests {
         let runs = [run_over(&buf)];
         // Rearm, then seed a fold the next audit can compare against.
         bind_quietly(&mut w, &mut host, &GPAS, &runs, 1);
-        assert_eq!(
-            bind_to_next_audit(&mut w, &mut host, &GPAS, &runs).audit,
-            ContentAudit::Seeded
-        );
-        let vouched_gen = w
-            .vouched_identity(&KEY)
-            .expect("a vouched window has a generation");
+        let seeded = bind_to_next_audit(&mut w, &mut host, &GPAS, &runs);
+        assert_eq!(seeded.audit, ContentAudit::Seeded);
+        let vouched_gen = seeded.generation;
 
         // No `guest_wrote_page` and no host write recorded: the bytes move with
         // both halves of the witness none the wiser.
@@ -1021,10 +1132,20 @@ mod tests {
         );
         assert_eq!(caught.audit, ContentAudit::Disagreed);
         assert_ne!(
-            w.vouched_identity(&KEY),
-            Some(vouched_gen),
+            caught.generation, vouched_gen,
             "the refuted generation survived the audit that refuted it, so the \
              next bind serves the stale image again"
+        );
+        // The one bind where the verdict and the vouch disagree, and the reason
+        // the engine is told the vouch rather than the verdict: this bind
+        // vouches and still spends its generation, so an engine deriving
+        // "vouched" from the verdict would count a guaranteed miss as a
+        // retention failure.
+        assert_eq!(
+            caught.vouch,
+            GatherVouch::Fresh,
+            "a generation the audit just spent was reported as one the cache \
+             could still be holding an image under"
         );
     }
 

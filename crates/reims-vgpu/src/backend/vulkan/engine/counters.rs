@@ -264,7 +264,7 @@ engine_counters! {
         /// `unretained` is a vouch this device could not spend because no image
         /// answered to it.
         ///
-        /// # The first boot answered it, and the witness is not the problem
+        /// # The first boot's zero was the instrument, not the witness
         ///
         /// Driven x86/PCI Safari drag, quiesced, one `vk_caps`, 73 census
         /// windows with a gather in them:
@@ -274,20 +274,33 @@ engine_counters! {
         /// sampled_gather_unretained  6296   (== gathers 6292 + imports 4)
         /// ```
         ///
-        /// **Zero, in every window of a whole boot.** The witness vouches for
-        /// every guest-run bind it is asked about; not one gather on that boot
-        /// happened because it refused. So the ~2.3 MB-per-bind traffic this
-        /// rail moves is entirely a *retention* result — the vouch is issued and
-        /// then has nothing to name, because no image under `(key, identity)`
-        /// survived to the next bind.
+        /// That zero was read as "the witness vouches for every guest-run bind
+        /// it is asked about; not one gather happened because it refused", and
+        /// the rail's whole cost was attributed to retention on the strength of
+        /// it. **It proved nothing.** The emitter was fed
+        /// `resource.identity.is_some()`, which is not the witness's verdict but
+        /// the producer's: `note_gather` returned `Option<GatheredIdentity>` and
+        /// built it by reading the generation back out of the witness map, which
+        /// holds an entry for every key `observe` is handed. There was no path
+        /// through it that returned `None`. The counter could not fire, and a
+        /// counter that cannot fire reading zero is exactly the "a drop counter
+        /// reading zero is not a measurement" trap.
         ///
-        /// This refutes the reading it was built to test. `gw_refused_host_write`
-        /// runs ~144 a window against `gw_refused_guest_store` at 0, which
-        /// invites the conclusion that this device's own writes are refuting the
-        /// windows it samples; on the gather rail they are not, because the
-        /// refusals never reach it. Those `gw_*` tallies are runtime-side and
-        /// span every rail, and subtracting them from an engine-side per-bind
-        /// count is the trap this split exists to close.
+        /// It now takes [`crate::runtime::gather_witness::GatherVouch`], decided
+        /// beside the assignment that spends the generation, so `unvouched`
+        /// means the witness spent one and the following miss was compulsory.
+        /// **The split is therefore unmeasured**: the numbers above stand only
+        /// as "every unskipped bind had an identity", which is true by
+        /// construction. A driven boot is what fills this section in.
+        ///
+        /// One reading survives, because it never depended on the broken half.
+        /// `gw_refused_host_write` runs ~144 a window against
+        /// `gw_refused_guest_store` at 0, which invites the conclusion that this
+        /// device's own writes are refuting the windows it samples. Those `gw_*`
+        /// tallies are runtime-side and span every rail, so subtracting them
+        /// from an engine-side per-bind count is invalid whichever way the split
+        /// reads — which is the trap this pair exists to close, and the reason
+        /// it has to be taken engine-side at all.
         ///
         /// The skip rate is a property of the workload and not of the rail, so
         /// do not carry a number for it: one boot's drag ran 23 windows at 0%
@@ -615,13 +628,22 @@ impl EngineCounters {
 
     /// Record why a guest-run sampled bind is about to move bytes, taken at the
     /// one site that already knows both halves: the elision lookup returned
-    /// nothing, and `vouched` says whether it was even given something to look
-    /// up. Call exactly once per bind that falls through the skip, before the
-    /// import/gather disposition is decided — the two questions are independent
-    /// and the identity in [`EngineCounters::sampled_gather_unvouched`] holds
-    /// only if this is not also called on the skip path.
-    pub fn note_sampled_gather_unskipped(&self, vouched: bool) {
-        let field = if vouched {
+    /// nothing, and `vouch` says whether the identity it looked up could ever
+    /// have matched. Call exactly once per bind that falls through the skip,
+    /// before the import/gather disposition is decided — the two questions are
+    /// independent and the identity in
+    /// [`EngineCounters::sampled_gather_unvouched`] holds only if this is not
+    /// also called on the skip path.
+    ///
+    /// Takes the witness's own verdict rather than a `bool` the caller derives.
+    /// The caller derived it from `identity.is_some()` for one boot, which is
+    /// not the witness's answer but the producer's, and the producer names every
+    /// window it is handed.
+    pub fn note_sampled_gather_unskipped(
+        &self,
+        vouch: crate::runtime::gather_witness::GatherVouch,
+    ) {
+        let field = if vouch.is_vouched() {
             &self.sampled_gather_unretained
         } else {
             &self.sampled_gather_unvouched
@@ -666,6 +688,7 @@ impl EngineCounters {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::gather_witness::GatherVouch;
 
     #[test]
     fn note_helpers_update_event_and_byte_counters_together() {
@@ -717,10 +740,10 @@ mod tests {
     fn the_unskipped_reason_is_exactly_one_counter_per_bind() {
         let counters = EngineCounters::default();
         for _ in 0..3 {
-            counters.note_sampled_gather_unskipped(true);
+            counters.note_sampled_gather_unskipped(GatherVouch::Vouched);
         }
         for _ in 0..5 {
-            counters.note_sampled_gather_unskipped(false);
+            counters.note_sampled_gather_unskipped(GatherVouch::Fresh);
         }
 
         let s = counters.snapshot();

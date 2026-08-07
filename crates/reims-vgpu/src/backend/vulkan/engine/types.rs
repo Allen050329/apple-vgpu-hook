@@ -1473,11 +1473,18 @@ pub enum SampledSource {
     Target(TargetIdentity),
     /// Zero-copy guest origin: the GPU gathers the texel bytes from imported
     /// guest RAM inside the draw's own command buffer (two-hop: imported
-    /// buffer → pooled scratch → image). No CPU read, no hash, no sampled
-    /// cache — the copy re-executes every draw, so guest CPU writes are
-    /// observed at execute time (at least as fresh as the CPU path's
+    /// buffer → pooled scratch → image). No CPU read and no hash — guest CPU
+    /// writes are observed at execute time (at least as fresh as the CPU path's
     /// encode-time read).
-    GuestRuns(GuestRunSource),
+    ///
+    /// The gather is elided where a retained image already answers to the bind's
+    /// identity, which is what [`crate::runtime::gather_witness::GatherVouch`]
+    /// says is possible. `Fresh` means the identity was minted this bind and no
+    /// retained image can match it, so the copy runs and the result is retained
+    /// for the next bind to hit; carrying it lets the engine report *why* a
+    /// gather happened instead of inferring it from the identity being present,
+    /// which it always is.
+    GuestRuns(GuestRunSource, crate::runtime::gather_witness::GatherVouch),
 }
 
 /// One packed-contiguous guest-RAM span (a direct RAMBlock alias from

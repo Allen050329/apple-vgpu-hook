@@ -687,13 +687,18 @@ pub(super) enum SampledSourceRequest {
     /// imported guest RAM inside the draw CB — no CPU read, no memo, no
     /// hash. Carries the native texel layout the image is created with.
     /// Guest-RAM runs the engine gathers from, the byte layout of those texels,
-    /// and — when both halves of the guest-write witness vouch for them — the
-    /// identity that lets the engine bind a retained image instead of gathering
-    /// at all (see [`crate::runtime::gather_witness`]).
+    /// the identity that lets the engine bind a retained image instead of
+    /// gathering at all, and what the guest-write witness says that identity is
+    /// worth (see [`crate::runtime::gather_witness`]).
+    ///
+    /// The identity is not optional on this rail: every window that reaches here
+    /// went through the witness, and the witness names every window it is asked
+    /// about. The vouch beside it is the part that varies.
     GuestRuns(
         crate::backend::vulkan::engine::GuestRunSource,
         TexelLayout,
-        Option<LinearSampleIdentity>,
+        LinearSampleIdentity,
+        crate::runtime::gather_witness::GatherVouch,
     ),
 }
 
@@ -2683,7 +2688,7 @@ fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
     // Fixed per-texture window: the walk covers exactly the bound span.
     let (gpas, runs) = task_gva_guest_run_window(state, host, task_id, gva, span)?;
     let page = state.page_size() as usize;
-    let vouched = crate::runtime::gather_witness::note_gather(
+    let seen = crate::runtime::gather_witness::note_gather(
         state,
         host,
         crate::runtime::gather_witness::GatherRail::Linear,
@@ -2706,7 +2711,8 @@ fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
                 pages: guest_page_window(host, gpas, page as u64, gva % page as u64, span),
             },
             native,
-            vouched.map(LinearSampleIdentity::from),
+            LinearSampleIdentity::from(seen.identity),
+            seen.vouch,
         ),
     ))
 }
@@ -2762,7 +2768,7 @@ pub(super) fn try_type11_sample_zero_copy<M: HostMemory + HostOps>(
     }
     let (gpas, runs) = mapping_window_guest_runs(state, host, mid, base_off, span)?;
     let page = state.page_size() as usize;
-    let vouched = crate::runtime::gather_witness::note_gather(
+    let seen = crate::runtime::gather_witness::note_gather(
         state,
         host,
         crate::runtime::gather_witness::GatherRail::Type11,
@@ -2782,7 +2788,8 @@ pub(super) fn try_type11_sample_zero_copy<M: HostMemory + HostOps>(
             pages: guest_page_window(host, gpas, page as u64, base_off % page as u64, span),
         },
         native,
-        vouched.map(LinearSampleIdentity::from),
+        LinearSampleIdentity::from(seen.identity),
+        seen.vouch,
     ))
 }
 
@@ -2843,7 +2850,7 @@ fn try_type5_sample_zero_copy<M: HostMemory + HostOps>(
     }
     let (gpas, runs) = mapping_window_guest_runs(state, host, mid, base_off, span)?;
     let page = state.page_size() as usize;
-    let vouched = crate::runtime::gather_witness::note_gather(
+    let seen = crate::runtime::gather_witness::note_gather(
         state,
         host,
         crate::runtime::gather_witness::GatherRail::Type5,
@@ -2863,7 +2870,8 @@ fn try_type5_sample_zero_copy<M: HostMemory + HostOps>(
             pages: guest_page_window(host, gpas, page as u64, base_off % page as u64, span),
         },
         native,
-        vouched.map(LinearSampleIdentity::from),
+        LinearSampleIdentity::from(seen.identity),
+        seen.vouch,
     ))
 }
 
@@ -4884,10 +4892,10 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         }
                         crate::backend::vulkan::engine::SampledSource::Target(identity)
                     }
-                    SampledSourceRequest::GuestRuns(src, native, identity) => {
+                    SampledSourceRequest::GuestRuns(src, native, identity, vouch) => {
                         sampled_format = native;
-                        bytes_identity = identity;
-                        crate::backend::vulkan::engine::SampledSource::GuestRuns(src)
+                        bytes_identity = Some(identity);
+                        crate::backend::vulkan::engine::SampledSource::GuestRuns(src, vouch)
                     }
                 };
                 let base_off = if frag_stage && separate_sampled {
