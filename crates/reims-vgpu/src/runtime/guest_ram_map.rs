@@ -187,6 +187,30 @@ pub fn imports() -> Vec<Arc<GuestRamImport>> {
         .unwrap_or_default()
 }
 
+/// Resolve on the first call of a boot, then run `body` against the result.
+///
+/// The one place the resolution is built, so no entry point can hold a second
+/// copy of "have we asked the host yet".
+fn with_map<H: HostOps + ?Sized, R>(host: &mut H, body: impl FnOnce(&Resolved) -> R) -> R {
+    let mut guard = MAP.lock().unwrap_or_else(|p| p.into_inner());
+    if guard.is_none() {
+        *guard = Some(resolve(host));
+    }
+    body(guard.as_ref().expect("just resolved"))
+}
+
+/// The refusal the whole rail is standing on, if there is one.
+///
+/// An entry point that judges the *shape* of what it was given must ask this
+/// first. The order is not cosmetic: on a host with no import every window
+/// refuses, and one told it was too fragmented sends a reader hunting for a
+/// contiguity problem that a contiguous window would not have fixed either —
+/// which is exactly what a driven `REIMS_VGPU_GUEST_IMPORT=off` boot logged
+/// before [`reference_for_pages`] asked.
+fn standing_refusal<H: HostOps + ?Sized>(host: &mut H) -> Option<MapRefusal> {
+    with_map(host, |resolved| resolved.refusal)
+}
+
 /// Turn a guest physical address and a length into a bindable reference.
 ///
 /// The whole guest-memory rail goes through here. Building the imports on the
@@ -196,29 +220,23 @@ pub fn reference<H: HostOps + ?Sized>(
     gpa: u64,
     len: u64,
 ) -> Result<GuestRef, MapRefusal> {
-    let mut guard = MAP.lock().unwrap_or_else(|p| p.into_inner());
-    let resolved = match guard.as_mut() {
-        Some(resolved) => resolved,
-        None => {
-            *guard = Some(resolve(host));
-            guard.as_mut().expect("just resolved")
+    with_map(host, |resolved| {
+        if let Some(refusal) = resolved.refusal {
+            return Err(report_once(refusal));
         }
-    };
-    if let Some(refusal) = resolved.refusal {
-        return Err(report_once(refusal));
-    }
-    let import = resolved
-        .imports
-        .iter()
-        .find(|i| i.contains_gpa(gpa))
-        .ok_or(MapRefusal::GpaNotInAnyImport { gpa })
-        .map_err(report_once)?;
-    // `slice_for_gpa` emits its own named refusal on the fail channel, so the
-    // wrapper forwards the reason rather than adding a second line for it.
-    let slice = import
-        .slice_for_gpa(gpa, len)
-        .map_err(MapRefusal::OutsideImport)?;
-    GuestRef::new(Arc::clone(import), slice).map_err(MapRefusal::OutsideImport)
+        let import = resolved
+            .imports
+            .iter()
+            .find(|i| i.contains_gpa(gpa))
+            .ok_or(MapRefusal::GpaNotInAnyImport { gpa })
+            .map_err(report_once)?;
+        // `slice_for_gpa` emits its own named refusal on the fail channel, so
+        // the wrapper forwards the reason rather than adding a second line.
+        let slice = import
+            .slice_for_gpa(gpa, len)
+            .map_err(MapRefusal::OutsideImport)?;
+        GuestRef::new(Arc::clone(import), slice).map_err(MapRefusal::OutsideImport)
+    })
 }
 
 /// One stretch of a scattered window: where it starts in the window, and the
@@ -267,6 +285,9 @@ pub fn references_for_runs<H: HostOps + ?Sized>(
     in_page: u64,
     len: u64,
 ) -> Result<Vec<GuestWindowRun>, MapRefusal> {
+    if let Some(refusal) = standing_refusal(host) {
+        return Err(report_once(refusal));
+    }
     if gpas.is_empty() || page_size == 0 || len == 0 {
         return Err(report_once(MapRefusal::Scattered {
             pages: gpas.len(),
@@ -325,6 +346,9 @@ pub fn reference_for_pages<H: HostOps + ?Sized>(
     in_page: u64,
     len: u64,
 ) -> Result<GuestRef, MapRefusal> {
+    if let Some(refusal) = standing_refusal(host) {
+        return Err(report_once(refusal));
+    }
     let Some(&first) = gpas.first() else {
         return Err(report_once(MapRefusal::Scattered {
             pages: 0,
@@ -843,6 +867,46 @@ mod tests {
                 lines,
                 vec!["OFF guest_ram_map reason=guest_ram_map_no_backend_import"],
                 "one statement about the host, not one per run"
+            );
+        });
+    }
+
+    /// Both page-list entry points answer a host with no import the same way.
+    ///
+    /// They consume one wire form — a decoded page list — and until the
+    /// `standing_refusal` gate went in they disagreed about a host, not about
+    /// their input: `references_for_runs` reached `reference` and got
+    /// `NoBackendImport` on the off channel, while `reference_for_pages`
+    /// judged contiguity first and put `guest_ram_map_scattered` on the
+    /// **fail** channel — a claim of lost guest work naming a cause that was
+    /// not the cause. A driven `REIMS_VGPU_GUEST_IMPORT=off` boot logged
+    /// exactly one of those lines, which is what this pins.
+    ///
+    /// The assertion is that the two arms agree, not that either says a
+    /// particular thing, because a divergence is what the fail log cannot
+    /// survive.
+    #[test]
+    fn both_page_list_arms_name_the_host_and_not_the_window() {
+        const PAGE: u64 = 4096;
+        // Scattered on purpose: this is the input that used to reach the
+        // contiguity refusal before anything asked whether an import existed.
+        let gpas: Vec<u64> = vec![0x1000, 0x2000, 0x9000, 0x20000];
+        with_granularity(None, || {
+            let capture = crate::observe::FailCapture::start();
+            let mut host = two_spans();
+
+            let narrow = reference_for_pages(&mut host, &gpas, PAGE, 0, PAGE).unwrap_err();
+            let wide = references_for_runs(&mut host, &gpas, PAGE, 0, PAGE).unwrap_err();
+            assert_eq!(
+                narrow, wide,
+                "one page list, one host, two entry points: the reason cannot depend on which asked"
+            );
+            assert_eq!(narrow, MapRefusal::NoBackendImport);
+
+            assert_eq!(
+                capture.lines(),
+                vec!["OFF guest_ram_map reason=guest_ram_map_no_backend_import"],
+                "a host that cannot import has not lost guest work to fragmentation"
             );
         });
     }
