@@ -58,6 +58,30 @@ fi
 command -v llvm-profdata >/dev/null || { echo "runtime-dead: need llvm-profdata" >&2; exit 1; }
 command -v llvm-cov >/dev/null || { echo "runtime-dead: need llvm-cov" >&2; exit 1; }
 
+# The pids of processes that really are a qemu-system-x86_64, read from
+# /proc/<pid>/exe rather than matched against a command line.
+#
+# `ps -eo pid,args | grep '[q]emu-system-x86_64'` matches any argv holding that
+# string, and two things in this script's own critical path do: the boot script
+# re-runs qemu-build, whose ninja link step spawns `cc ... -o
+# .../qemu-system-x86_64 ...` for a 119 MB binary, and qemu-build then makes four
+# short-lived `qemu-system-x86_64 -device help` probes. The pid loop polls every
+# two seconds and both windows fall inside it. Latching the linker gives a pid
+# that never writes a profile at all, so the guard below reported the boot's own
+# profile "missing" for a boot whose raw was on disk, complete, with a total
+# count of 4.3 billion. An argv match cannot tell a compiler writing that name
+# from a process running it; the exe link can.
+qemu_pids() {
+    local proc pid exe
+    for proc in /proc/[0-9]*; do
+        pid="${proc#/proc/}"
+        exe="$(readlink "$proc/exe" 2>/dev/null)" || continue
+        case "$exe" in
+            */qemu-system-x86_64|*/qemu-system-x86_64' (deleted)') echo "$pid" ;;
+        esac
+    done
+}
+
 rm -rf "$OUT_DIR"
 mkdir -p "$OUT_DIR"
 QEMU_BIN="$REPO_ROOT/vendor/qemu/build/qemu-system-x86_64"
@@ -85,12 +109,13 @@ echo "runtime-dead: profile runtime $PROFILE_RT"
 # immediately, and every later step then measures — or SIGTERMs — the OLD,
 # uninstrumented VM. Refuse rather than guess which one is ours.
 #
-# `|| true` because the healthy case is grep finding nothing, which is exit 1 —
-# and under `set -o pipefail` that is the whole pipeline's status, so `set -e`
-# aborted the run here whenever no VM was up. The script therefore only got past
-# this guard when the very condition it refuses on was true, and it exited after
-# its one banner line with status 0 every other time.
-stale="$(ps -eo pid,args | grep '[q]emu-system-x86_64' | awk '{print $1}' || true)"
+# This used to be a `ps | grep | awk` pipeline, and the healthy case — grep
+# finding nothing — is exit 1, which under `set -o pipefail` is the whole
+# pipeline's status. `set -e` therefore aborted the run here whenever no VM was
+# up: the script got past this guard only when the condition it refuses on was
+# true, and exited after its one banner line with status 0 every other time. A
+# function that emits nothing and returns 0 has no such edge.
+stale="$(qemu_pids)"
 if [ -n "$stale" ]; then
     echo "runtime-dead: a qemu-system-x86_64 is already running (pid $(echo "$stale" | tr '\n' ' '))." >&2
     echo "runtime-dead: it holds localhost:2222; this boot would fail and the run" >&2
@@ -120,9 +145,14 @@ rm -f /tmp/reims-vgpu-fail.log
 echo "runtime-dead: booting (instrumented) ..."
 "$REPO_ROOT/vm/boot-x86.sh" --device reims-vgpu-pci --testing > "$OUT_DIR/boot.log" 2>&1 &
 
+# Provisional: enough to notice the boot never started, and to have something to
+# kill on the refusal paths below. The pid the *measurement* is named after is
+# re-sampled once the guest answers, because the boot script re-runs qemu-build
+# and its four `-device help` probes are real qemu-system-x86_64 processes that
+# exit before the device runs.
 qemu_pid=""
 for _ in $(seq 1 180); do
-    qemu_pid="$(ps -eo pid,args | grep '[q]emu-system-x86_64' | awk '{print $1}' | head -1 || true)"
+    qemu_pid="$(qemu_pids | head -1)"
     [ -n "$qemu_pid" ] && break
     sleep 2
 done
@@ -151,6 +181,22 @@ if [ "$guest_up" -eq 0 ]; then
     kill -TERM "$qemu_pid" 2>/dev/null || true
     exit 1
 fi
+
+# A guest that answers SSH is a guest whose QEMU is the only one alive: the build
+# finished long before, and qemu-build's `-device help` probes are gone. So this
+# is the moment the boot's pid is unambiguous, and the name the profile is
+# checked under below comes from here rather than from the race above.
+mapfile -t live < <(qemu_pids)
+if [ "${#live[@]}" -ne 1 ]; then
+    echo "runtime-dead: expected exactly one qemu-system-x86_64 with the guest up," >&2
+    echo "runtime-dead: found ${#live[@]} (${live[*]:-none}). Which of them wrote the" >&2
+    echo "runtime-dead: measurement is then a guess, and guessing it wrong is how this" >&2
+    echo "runtime-dead: reported a complete profile as missing. Refusing the run." >&2
+    kill -TERM "$qemu_pid" 2>/dev/null || true
+    exit 1
+fi
+qemu_pid="${live[0]}"
+echo "runtime-dead: measuring QEMU pid $qemu_pid"
 
 # SSH answering is not the app being ready. The boot reverts to a snapshot, so
 # sshd is listening within seconds while the window server is still restoring
@@ -259,9 +305,18 @@ fi
 # entire crate — 3360 functions, TOTAL 0.00 % — never executed, on a boot that
 # had drawn a desktop and driven Safari for 25 seconds. A list like that is
 # indistinguishable from a kill list, so refuse by name.
+#
+# Size is the wrong test for it, though, and was only ever a proxy: a probe's
+# dump is 4 310 352 bytes of records that are all misses, exactly as large as the
+# measurement. `llvm-profdata show` prints `Maximum function count:`, which is 0
+# for every one of them and 225 055 584 for a driven boot — so ask for the
+# property that matters rather than for a file that exists.
 boot_raw="$OUT_DIR/reims-$qemu_pid.profraw"
-if [ ! -s "$boot_raw" ]; then
-    echo "runtime-dead: the boot's own profile is missing or empty ($boot_raw)." >&2
+boot_max=0
+[ -s "$boot_raw" ] && boot_max="$(llvm-profdata show "$boot_raw" 2>/dev/null |
+    sed -n 's/^Maximum function count: *\([0-9]*\)$/\1/p' | head -1)"
+if [ -z "$boot_max" ] || [ "$boot_max" -eq 0 ]; then
+    echo "runtime-dead: the boot's own profile is missing, empty, or all zero ($boot_raw)." >&2
     echo "runtime-dead: QEMU pid $qemu_pid did not complete the atexit profile write," >&2
     echo "runtime-dead: so nothing here measured the device. The other raw files are" >&2
     echo "runtime-dead: build scripts and the boot script's own QEMU probes; their" >&2

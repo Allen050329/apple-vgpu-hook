@@ -123,48 +123,57 @@ instantiation, so a mangled name reading zero may be one monomorphization of a
 function that ran under another. Check the demangled name against
 `by-file.txt`'s per-file numbers before concluding a whole function is cold.
 
-## Known broken as of 2026-08-07: the boot's own profile writes zero bytes
+## It was never the profile: the script could not name its own QEMU
 
-Two consecutive runs on this host refused to write a report, both at the same
-guard: `the boot's own profile is missing or empty`. The guard is doing its job
-— the run is genuinely unmeasured — but the instrument does not currently
-produce a reading, so **do not read this tool's silence as "nothing is dead"**.
+Three runs refused to write a report at the guard `the boot's own profile is
+missing or empty`, and the guard was wrong every time. The last of those runs
+left `reims-996479.profraw` on disk, 4 310 352 bytes, `Maximum function count:
+225055584`, `Total count: 4331733340` — a complete measurement of the boot it
+had just declared unmeasured.
 
-What has been ruled out, so the next attempt does not re-cover it:
+The cause is the pid, not the profile. The script found QEMU with
 
-- **The profile runtime is linked and works.** The boot script's own short-lived
-  `qemu-system-x86_64` probe invocations each wrote a complete 4 310 352-byte
-  table into the same directory on the same run. Whatever is wrong is specific
-  to the QEMU that ran the device.
-- **It is not the boot script's `SIGKILL`.** `vm/boot-x86.sh`'s `kill_qemu` does
-  `SIGTERM`, `sleep 2`, then `SIGKILL`, which would truncate the write exactly
-  like this — but it announces itself with `boot-x86.sh: killing qemu pid=`, and
-  that line is in neither run's `boot.log`. That fuse never fired.
-- **It is not an undriven boot.** The second run drove Safari for 29 seconds of
-  real compositing (`seconds below 100 Hz: 29/29`) and failed identically.
-- **It is not the probe failing to start.** That was a real and separate bug,
-  fixed below; fixing it did not change this symptom.
-- **It is not the exit path.** The obvious suspect was QEMU leaving through
-  `qemu_system_killed` rather than returning from `main`, so the script now
-  stops it with a QMP `quit` and falls back to a signal only if that fails. The
-  `quit` went through, QEMU logged a clean `qemu exited`, and the profile was
-  still zero bytes. Worth keeping anyway — `quit` is the correct shutdown — but
-  it is not the bug.
-- **It is not a crash at exit.** No coredump was produced by any of the three
-  runs, and `vm/boot-x86.sh` reported `capture-then-revert (qemu exited)`.
-- **It is not disk space or inodes.** `/tmp` is a 47 G tmpfs at 5 % with 1 % of
-  inodes used.
+```sh
+ps -eo pid,args | grep '[q]emu-system-x86_64' | awk '{print $1}' | head -1
+```
 
-What that leaves is narrow and worth stating precisely, because it is the whole
-remaining search space: **the writer ran.** Nothing but the profile runtime
-creates that file, and it opens it truncating — so a zero-length file means the
-handler was entered, the `fopen` succeeded, and the write did not complete. The
-same binary, in the same directory, on the same run, writes a complete
-4 310 352-byte table from the boot script's short-lived probe invocations. The
-difference between those and the one that fails is that the failing process ran
-the device: a live Vulkan instance, a host-window thread, and 30 seconds of
-guest work. The baseline below also predates this host's LLVM 22, so a toolchain
-change remains a candidate that has not been tested.
+which matches any process whose **argv** contains that string, not any process
+that **is** it. Three things in this script's own critical path qualify, and all
+three fall inside the loop's two-second polling window:
+
+- the boot script re-runs `qemu-build`, whose ninja link step spawns
+  `cc ... -o .../qemu-system-x86_64 ...` — a link of a 119 MB binary is not
+  brief;
+- `qemu-build` then makes four short-lived `qemu-system-x86_64 -device help`
+  probes;
+- anything else on the machine mentioning the name — a shell running a command
+  that contains it matches too, which is how this was finally caught.
+
+`head -1` returns whichever came first, and none of those writes a profile under
+the pid the script then went looking for. So `$OUT_DIR/reims-$qemu_pid.profraw`
+did not exist, and the guard reported the boot's own profile missing while it sat
+in the same directory under its real name.
+
+Three changes, and the shape of each matters more than the fix:
+
+- **`qemu_pids()` reads `/proc/<pid>/exe`.** An argv match cannot tell a compiler
+  writing that name from a process running it; the exe link can. Same helper now
+  backs the stale-VM guard, which had the identical flaw.
+- **The measurement pid is sampled after the guest answers SSH**, when the build
+  is long finished and the probes are gone, and the run refuses unless exactly
+  one QEMU is alive. The early loop survives only to notice a boot that never
+  started and to have something to kill on the refusal paths.
+- **The guard tests counts, not bytes.** A probe's dump is 4 310 352 bytes of
+  records that are all misses — exactly as large as the measurement, and it
+  passed `-s` every time. `llvm-profdata show | Maximum function count:` reads 0
+  for every probe and 225 055 584 for a driven boot, so ask for the property that
+  matters rather than for a file that exists.
+
+Two things ruled out earlier remain ruled out, and were never the problem: the
+QMP `quit` path (worth keeping — it is the correct shutdown — but the profile is
+written under SIGTERM too, which is how the run that proved this was stopped),
+and the toolchain. This host is rustc 1.97 / LLVM 22.1.6 with compiler-rt 22 and
+`llvm-profdata` 22.1.8, and it writes complete profiles.
 
 ## The app has to have a window before the probe starts
 
@@ -195,6 +204,20 @@ crates/reims-vgpu/src   2826 functions   1066 never ran   (62.3% ran)
 regions 56.77%   functions 64.78%   lines 56.42%
 ```
 
+Second run, `006d2216` — the first since the host-pointer import landed, and the
+first the pid fix above let through — same pathway, same drive:
+
+```
+crates/reims-vgpu/src   3450 functions   1413 never ran   (59.0% ran)
+regions 53.65%   functions 61.13%   lines 53.33%
+```
+
+The two are not directly comparable: the crate grew by 624 counted functions
+between them, and the second boot ran at a tenth of the first's present rate
+because it was taken minutes after a full instrumented rebuild. Coverage is a
+count and survives that; the drive log's `us=` fields do not, and nothing here
+should be read as a timing.
+
 Files at 0.00% function coverage: `runtime/icb/mod.rs`, `runtime/fence_exec.rs`,
 `runtime/mipmap.rs`, `runtime/heap_query.rs`, `runtime/plan/event_sync.rs`,
 `backend/vulkan/engine/draw_preparation.rs`.
@@ -216,3 +239,28 @@ reaches it, and each named the guest action that would take it:
 Two of the six (`icb`, `draw_preparation`) are healthy-zero alarms; the other
 four are real opcodes this one workload does not issue. That ratio is the point:
 the instrument's yield is a map of the contract, not a list of things to cut.
+
+## The three caches the in-place plan reserved for measurement are all live
+
+`.agents/guest-memory-in-place-plan.md` §5 names three modules as "needs
+measurement before you touch it — do not delete on inspection", on the theory
+that referencing guest RAM in place removes their reason to exist. The second
+baseline above is that measurement, and it refuses all three:
+
+| module | regions | functions | verdict |
+|---|---|---|---|
+| `runtime/gva_view.rs` | 80.35% | 26/28 | live — the highest-covered of the three |
+| `runtime/surface_cache/mod.rs` | 72.13% | 49/62 | live |
+| `runtime/m2v_cache.rs` | 62.97% | 40/65 | live |
+
+Every one of them is executing on a driven boot *after* the host-pointer import
+landed, so the import did not strand them. Their cold halves are worth reading
+one day, but the modules are not deletions and the question of whether they are
+should not be re-opened without a boot that says otherwise.
+
+One reading next to them is the same shape and is *not* a finding:
+`runtime/storage_flush/` is 21–98% across its modules on this host, which is a
+discrete RTX 5080. The plan's §5 claim is about a **UMA** host, where the armed
+window count should go to zero. This boot cannot measure that, and its non-zero
+coverage is the dGPU rail working as designed rather than evidence against the
+claim.
