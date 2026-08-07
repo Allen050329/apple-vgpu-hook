@@ -4041,8 +4041,10 @@ pub fn try_display_online<H: HostMemory + HostOps>(state: &mut DeviceState, host
         if crate::observe::first_sight("display_online_mask_unreadable", gpa) {
             crate::observe::fail(format!(
                 "display_online_mask_unreadable gpa={:#x} \
-                 (the shared enable mask the guest published cannot be read; \
-                 the ONLINE handshake is spending its tries against nothing)",
+                 (the shared enable mask the guest published cannot be read, so \
+                 the ONLINE handshake polls forever without ever pulsing; it \
+                 spends no tries and will never reach the cap, so this line is \
+                 the only trace it leaves)",
                 gpa + DISPLAY_SHARED_ENABLE_MASK
             ));
         }
