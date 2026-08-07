@@ -1,11 +1,30 @@
 //! Global MTLDevice, per-thread command queues, native color format TLS, host buffers.
 //!
-//! `new_buffer_from_host` is the only `newBufferWithBytesNoCopy` left, and it
-//! aliases **host** allocations — the CPU-staged vertex/fragment/compute byte
-//! vectors this crate owns. It is not a guest-RAM alias and must not become
-//! one: the type-11 attachment cache that did alias guest pages
-//! (`mach_vm_remap` view → no-copy MTLBuffer → linear texture view) is deleted,
-//! because a page the host GPU can read is one it can write.
+//! `new_buffer_from_host` is the only `newBufferWithBytesNoCopy` left. Every
+//! caller it has today passes **host** allocations — the CPU-staged
+//! vertex/fragment/compute byte vectors this crate owns.
+//!
+//! # Aliasing guest RAM here is permitted, and is how this arm reaches the rail
+//!
+//! `newBufferWithBytesNoCopy` is what MoltenVK implements
+//! `VK_EXT_external_memory_host` *over*, so it is the Metal-direct spelling of
+//! the one primitive that spans Linux, Windows and macOS. Guest RAM reaching
+//! the GPU through it is the intended design, not a violation: see
+//! [`crate::runtime::guest_ram`], whose `GuestRamImport`/`GuestSlice` pair is
+//! the bound, sized to one RAMBlock with a single bounds-checking constructor.
+//!
+//! An earlier type-11 attachment cache did alias guest pages here
+//! (`mach_vm_remap` view → no-copy MTLBuffer → linear texture view) and was
+//! deleted. It is worth being exact about why, because the reason is not the
+//! aliasing: that cache retained a remap view per fragmented map until
+//! teardown, leaking a VA reservation each time. A RAMBlock-wide import has no
+//! remap view to retain.
+//!
+//! **No importer is wired here yet.** Nothing in this module turns a
+//! `GuestSlice` into an `MTLBuffer`, because no caller would use one — the
+//! staged `Vec` is filled from guest RAM further up, and the seam worth cutting
+//! is there rather than here. Landing an importer without that consumer would
+//! be untestable dead code on an arm no Linux host can run.
 
 use metal::{Buffer, CommandQueue, Device, MTLResourceOptions};
 use once_cell::sync::OnceCell;
@@ -51,6 +70,43 @@ pub fn thread_queue(device: &Device) -> CommandQueue {
         queue
     })
 }
+
+/// Apple Silicon's virtual page. `newBufferWithBytesNoCopy` measures both the
+/// base pointer and the length against it and returns nil for anything else,
+/// which [`new_buffer_from_host`] reports as `None`.
+///
+/// Spelled out rather than read from `sysconf` because this is a compile-time
+/// claim about the *guest* geometry below, and `sysconf` cannot be one. The
+/// runtime path still asks `sysconf` for the page it actually aligns against —
+/// that is the host's answer for the host's pointer, and it stays a query.
+const APPLE_SILICON_PAGE: u32 = 16 * 1024;
+
+/// A guest arm64e page satisfies Metal's no-copy alignment on its own.
+///
+/// This is the fact that makes the Metal-direct arm of the guest-RAM import
+/// cheap: an offset that is guest-page-aligned is already Apple-page-aligned,
+/// so nothing has to round a `GuestSlice` outward to bind it, and no rounding
+/// means no chance of a bound that reaches past the RAMBlock.
+///
+/// Two independently-derived values, which is the only thing a `const`
+/// assertion is worth: the left comes from `reims-vgpu-wire`'s `ARM64E`
+/// descriptor, decoded from Apple's own page-table geometry; the right is the
+/// Apple Silicon platform page. Neither is written in terms of the other, so if
+/// either moves — a guest page shift that is no longer 14, or an Apple page
+/// that is no longer 16 KiB — this stops compiling instead of silently handing
+/// Metal a base it will refuse.
+///
+/// A `#[test]` cannot hold this. Nothing under `backend/metal/` runs its tests
+/// on a non-Apple host; they are `cfg`-ed out and the green count does not say
+/// so. `rustc` evaluates a `const` assertion on every arm that *compiles* the
+/// file, including the cross-compiled `--target aarch64-apple-darwin` clippy
+/// run, so this one is checked from Linux and a `#[test]` beside it would not
+/// be.
+const _: () = assert!(
+    crate::contract::gva::PAGE_SIZE_ARM64E.is_multiple_of(APPLE_SILICON_PAGE),
+    "a guest arm64e page must be a whole number of Apple Silicon pages, or a \
+     guest-page-aligned base is not a valid newBufferWithBytesNoCopy base"
+);
 
 fn no_copy_buffer_length_status(requested_len: usize, actual_len: u64) -> Status {
     if actual_len == requested_len as u64 {

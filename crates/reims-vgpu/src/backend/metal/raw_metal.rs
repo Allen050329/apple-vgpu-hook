@@ -378,8 +378,12 @@ pub unsafe fn new_buffer_with_data(
 /// them. `bytes` and `length` must both be page-aligned or Metal returns nil,
 /// which this reports as `None` rather than as a `Buffer` that is not one.
 ///
-/// AGENTS.md forbids aliasing guest RAM this way; the one permitted caller
-/// passes bytes this process owns.
+/// Aliasing guest RAM through this call is permitted: it is the Metal-direct
+/// spelling of the host-pointer import, and MoltenVK implements
+/// `VK_EXT_external_memory_host` over exactly this message. What bounds such a
+/// caller is [`crate::runtime::guest_ram`]'s type pair, not this function —
+/// which is why the safety contract above is the whole of what this one
+/// promises, and callers passing guest bytes owe that module's rules on top.
 pub unsafe fn new_buffer_no_copy(
     device: &DeviceRef,
     bytes: *mut std::ffi::c_void,
