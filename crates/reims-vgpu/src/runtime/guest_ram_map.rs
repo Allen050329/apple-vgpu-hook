@@ -72,7 +72,20 @@ pub enum MapRefusal {
     /// length, so a surface assembled from four stretches is four of them, and
     /// no consumer takes several yet. Named and counted because how often it
     /// fires is what says whether widening them is worth doing.
-    Scattered { pages: usize, first: u64 },
+    ///
+    /// `runs` is what says *how much* widening would cost, and it is the number
+    /// to read before building it. "Scattered" is one word for both a window in
+    /// two stretches — where a second bind is obviously worth it — and a window
+    /// in five hundred, where each run is a couple of pages and the region list
+    /// starts to rival the copy it replaces. `pages` alone cannot tell those
+    /// apart, and a count of *refusals* tells them apart even less: both read as
+    /// one line here. Sampled at the point of refusal, so it bands the reach
+    /// actually requested rather than the reach some other rail asked for.
+    Scattered {
+        pages: usize,
+        runs: usize,
+        first: u64,
+    },
 }
 
 impl crate::observe::Decline for MapRefusal {
@@ -99,8 +112,9 @@ impl crate::observe::Decline for MapRefusal {
             }
             Self::NoUsableRegion { spans } => vec![("spans", spans.to_string())],
             Self::GpaNotInAnyImport { gpa } => vec![("gpa", format!("{gpa:#x}"))],
-            Self::Scattered { pages, first } => vec![
+            Self::Scattered { pages, runs, first } => vec![
                 ("pages", pages.to_string()),
+                ("runs", runs.to_string()),
                 ("first", format!("{first:#x}")),
             ],
             Self::OutsideImport(inner) => inner.fields(),
@@ -203,6 +217,7 @@ pub fn reference_for_pages<H: HostOps + ?Sized>(
     let Some(&first) = gpas.first() else {
         return Err(report_once(MapRefusal::Scattered {
             pages: 0,
+            runs: 0,
             first: 0,
         }));
     };
@@ -213,6 +228,7 @@ pub fn reference_for_pages<H: HostOps + ?Sized>(
     if !contiguous {
         return Err(report_once(MapRefusal::Scattered {
             pages: gpas.len(),
+            runs: crate::runtime::gva_view::contig_run_count(gpas, page_size),
             first,
         }));
     }
@@ -507,7 +523,9 @@ mod tests {
             let after = reference(&mut host, 0x2000, 8).expect("inside");
             assert_ne!(before.import().id(), after.import().id());
             assert!(matches!(
-                after.import().resolve(&before.import().slice(0, 8).unwrap()),
+                after
+                    .import()
+                    .resolve(&before.import().slice(0, 8).unwrap()),
                 Err(GuestRamError::SliceForeignImport { .. })
             ));
         });
@@ -541,6 +559,68 @@ mod tests {
                 lines,
                 vec!["OFF guest_ram_map reason=guest_ram_map_no_backend_import"],
                 "a host without the extension has not lost guest work"
+            );
+        });
+    }
+
+    /// The `runs` a `Scattered` refusal reports is the coalescer's answer, not
+    /// a second count that agrees with it today.
+    ///
+    /// This number decides whether widening the bind to N ranges is worth
+    /// building, and how expensive it would be — a window in two stretches and
+    /// a window in five hundred both refuse identically without it. So it is
+    /// asserted against `gva_view::contig_run_count` on the same input rather
+    /// than against a literal: a hand-written expectation here would be a
+    /// second implementation of the coalescing rule, and the one that drifts is
+    /// always the copy nothing else reads.
+    #[test]
+    fn a_scattered_refusal_reports_the_run_count_the_coalescer_finds() {
+        const PAGE: u64 = 4096;
+        // Nine pages in four stretches: 3 + 1 + 2 + 3.
+        let gpas: Vec<u64> = vec![
+            0x1000, 0x2000, 0x3000, // run 1
+            0x9000, // run 2
+            0x20000, 0x21000, // run 3
+            0x50000, 0x51000, 0x52000, // run 4
+        ];
+        let expected = crate::runtime::gva_view::contig_run_count(&gpas, PAGE);
+        assert_eq!(expected, 4, "fixture must actually be four stretches");
+
+        with_granularity(Some(PAGE), || {
+            let capture = crate::observe::FailCapture::start();
+            let mut host = two_spans();
+            let err = reference_for_pages(&mut host, &gpas, PAGE, 0, 8).unwrap_err();
+            assert_eq!(
+                err,
+                MapRefusal::Scattered {
+                    pages: gpas.len(),
+                    runs: expected,
+                    first: 0x1000,
+                }
+            );
+            let line = capture.one(EVENT);
+            assert!(line.contains("reason=guest_ram_map_scattered"), "{line}");
+            assert!(
+                line.contains("runs=4"),
+                "the run count reaches the log: {line}"
+            );
+            assert!(line.contains("pages=9"), "{line}");
+        });
+
+        // One stretch is not scattered, so it must not refuse for this reason —
+        // otherwise `runs` would be reporting on a population that includes the
+        // case the widening is supposed to leave alone.
+        let contiguous: Vec<u64> = (0..4).map(|i| 0x1000 + i * PAGE).collect();
+        assert_eq!(
+            crate::runtime::gva_view::contig_run_count(&contiguous, PAGE),
+            1
+        );
+        with_granularity(Some(PAGE), || {
+            let mut host = two_spans();
+            let out = reference_for_pages(&mut host, &contiguous, PAGE, 0, 8);
+            assert!(
+                !matches!(out, Err(MapRefusal::Scattered { .. })),
+                "one contiguous stretch must not refuse as scattered"
             );
         });
     }

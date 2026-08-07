@@ -210,6 +210,7 @@ fn a_refused_page_list_does_not_report_itself_as_a_host_without_the_import() {
     let scattered = GpuWritebackDecline::GuestRefRefused {
         refusal: MapRefusal::Scattered {
             pages: 32,
+            runs: 9,
             first: 0x39bb_6a000,
         },
     };
