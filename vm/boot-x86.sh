@@ -297,15 +297,15 @@ fi
 # --- Build the QEMU command line ------------------------------------------------
 # q35 + OVMF + AppleSMC + SATA OpenCore/HDD. Display is attached below.
 #
-# Guest RAM is memfd-backed rather than an anonymous mapping, because a dma-buf
-# can only be made over pages that have a backing fd. That is what lets the host
-# GPU read and write a guest resource in place instead of the device staging
-# every byte through the CPU in both directions; without it the device still
-# runs, and `dmabuf_for_pages` refuses every call with `not_memfd`.
+# Guest RAM is memfd-backed rather than an anonymous mapping. The GPU rail no
+# longer needs it — guest pages reach the host GPU by importing the RAMBlock
+# mapping QEMU already holds, which works over an ordinary `-m` allocation — but
+# `storage_flush/fence.rs` records that a *shared* memfd is what makes uffd
+# minor-fault mode applicable, and that reasoning is independent of how the GPU
+# reads the pages.
 #
 # `share=on` is required rather than tidy: a private mapping is copy-on-write,
 # so the GPU's view and the guest's would diverge the first time either wrote.
-# The memfd backend also seals the fd against shrinking, which udmabuf demands.
 QEMU_ARGS=(
   -enable-kvm
   -m "$RAM"

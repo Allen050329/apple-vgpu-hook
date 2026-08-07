@@ -21,7 +21,14 @@
 extern "C" {
 #endif
 
-/* v17: ReimsVgpuHostOps.guest_ram_regions — where guest RAM lives in this
+/* v18: ReimsVgpuHostOps.dmabuf_for_pages and every REIMS_VGPU_DMABUF_* removed.
+ *      v17's spans replaced the mechanism outright: guest pages reach the host
+ *      GPU by importing the RAMBlock mapping QEMU already holds, on Linux,
+ *      Windows and macOS alike, rather than through a Linux-only udmabuf fd.
+ *      Removed rather than left in place — a half-retired rail with two
+ *      spellings is the divergence class AGENTS.md warns about, and a caller
+ *      that can still ask for an fd eventually will.
+ * v17: ReimsVgpuHostOps.guest_ram_regions — where guest RAM lives in this
  *      process, as stable (gpa_base, host_va, len) spans that hold for the VM's
  *      lifetime. Guest pages reach the host GPU by importing the mapping QEMU
  *      already holds over a RAMBlock, once, after which a resource is an
@@ -84,50 +91,13 @@ extern "C" {
  *     thread so IRQ pulses reach the guest mid-drain — ack fast).
  * v6: ReimsVgpuHostOps.is_ram_gpa (reject non-RAM PFNs on mapper / map_pages paths).
  * v5: ReimsVgpuQemuCreateInfo.guest_page_shift (12 = x86 Tahoe, 14 = arm64e). */
-#define REIMS_VGPU_QEMU_ABI_VERSION 17u
+#define REIMS_VGPU_QEMU_ABI_VERSION 18u
 
 #define REIMS_VGPU_QEMU_OK 0
 #define REIMS_VGPU_QEMU_ERR_ARGS 1
 #define REIMS_VGPU_QEMU_ERR_STATE 2
 #define REIMS_VGPU_QEMU_ERR_PANIC 3
 #define REIMS_VGPU_QEMU_EMPTY 4
-
-/*
- * Why dmabuf_for_pages refused, when it did. Negative so one return value
- * carries both an owned fd (>= 0) and a named refusal, and distinct per check
- * because these are four different hosts and four different things to do about
- * them — a missing /dev/udmabuf is a permission fix, a non-fd-backed guest RAM
- * is a boot-argument fix, and a run list past the bound is a fragmentation
- * property of the guest's own allocation that no host change addresses.
- */
-#define REIMS_VGPU_DMABUF_ERR_ARGS -1
-/* No /dev/udmabuf: not a Linux host, module absent, or no permission. */
-#define REIMS_VGPU_DMABUF_ERR_UNSUPPORTED -2
-/*
- * Guest RAM has no backing fd. A plain `-m` allocation is an anonymous mapping
- * and nothing can be exported from it; the boot scripts pass
- * `-object memory-backend-memfd,share=on` so this does not fire.
- */
-#define REIMS_VGPU_DMABUF_ERR_NOT_MEMFD -3
-/* A GPA in the list does not translate to guest RAM. */
-#define REIMS_VGPU_DMABUF_ERR_NOT_RAM -4
-/* A GPA in the list is not aligned to the page size the caller named. */
-#define REIMS_VGPU_DMABUF_ERR_ALIGNMENT -5
-/*
- * The caller's page size is not a whole multiple of the host page size, so its
- * pages cannot be named as udmabuf ranges without rounding to cover bytes the
- * caller did not ask for.
- */
-#define REIMS_VGPU_DMABUF_ERR_PAGE_SIZE -6
-/*
- * After coalescing adjacent pages, the run list is longer than
- * REIMS_VGPU_DMABUF_MAX_RUNS. Named separately from a failed create because it
- * is the one refusal that says "this guest allocation is scattered", which is a
- * property of the workload rather than of the host.
- */
-#define REIMS_VGPU_DMABUF_ERR_TOO_FRAGMENTED -7
-/* UDMABUF_CREATE_LIST itself failed — most often the kernel's size bound. */
-#define REIMS_VGPU_DMABUF_ERR_CREATE -8
 
 /*
  * Why guest_ram_regions refused, when it did. Negative so one return value
@@ -155,15 +125,6 @@ typedef struct ReimsVgpuGuestRamRegion {
     uint64_t host_va;
     uint64_t len;
 } ReimsVgpuGuestRamRegion;
-
-/*
- * Longest run list one dma-buf may carry, matching the Linux udmabuf driver's
- * `list_limit` module parameter default (drivers/dma-buf/udmabuf.c). The kernel
- * refuses a longer list, so refusing it here names the reason instead of
- * surfacing an opaque ioctl failure. Adjacent pages coalesce first, so this
- * bounds *runs*, not pages: a contiguous surface of any size is one run.
- */
-#define REIMS_VGPU_DMABUF_MAX_RUNS 1024u
 
 /*
  * Largest scanout / surface edge the device accepts, in pixels.
@@ -307,24 +268,6 @@ typedef struct ReimsVgpuHostOps {
      */
     int (*is_ram_gpa)(void *ctx, uint64_t gpa);
     /*
-     * Export `count` page-aligned guest GPAs, each `page_size` bytes, as ONE
-     * Linux dma-buf. Returns an owned fd (>= 0) the caller must close, or a
-     * negative REIMS_VGPU_DMABUF_ERR_* code naming the check that refused.
-     *
-     * This is how the host GPU reaches guest memory without a CPU copy in
-     * either direction. It is deliberately NOT map_pages with a different
-     * return type: map_pages hands back a host pointer, and a host pointer
-     * imported into a GPU is unbounded, unrevocable and unmediated. A dma-buf
-     * is bounded to the ranges named here, revoked by closing the fd, and
-     * referenced through the kernel. Only the second is admissible over guest
-     * RAM, and only the second is offered.
-     *
-     * Absent (NULL) on any shim that cannot do this, which callers must read as
-     * a refusal rather than as a reason to reach for map_pages instead.
-     */
-    int (*dmabuf_for_pages)(void *ctx, const uint64_t *gpas, size_t count,
-                            size_t page_size);
-    /*
      * Where guest RAM lives in this process. Writes at most `max` spans into
      * `out` and returns the total number this host has, which may be greater
      * than `max` — that is how a caller learns its array was short rather than
@@ -361,10 +304,11 @@ typedef struct ReimsVgpuHostOps {
      * is never recycled for other memory. 0 if the view is a transient mapping
      * that unmap_pages tears down.
      *
-     * This is a claim about a CPU-side pointer and nothing else. No rail
-     * imports a host pointer into the GPU; guest pages reach it through
-     * dmabuf_for_pages, whose fd carries its own lifetime and needs no promise
-     * from this flag. Default (absent field / older shim) must be treated as 0.
+     * This is a claim about a CPU-side *view* and nothing else. It says nothing
+     * about the GPU rail: guest RAM reaches the GPU by importing the spans
+     * guest_ram_regions names, which are QEMU's own RAMBlock mappings and never
+     * a view this call built. Default (absent field / older shim) must be
+     * treated as 0.
      */
     int map_pages_stable;
     /*

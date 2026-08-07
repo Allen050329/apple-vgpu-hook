@@ -561,7 +561,7 @@ pub fn flush_batched_draws() {
 /// the guest was told it was safe.
 ///
 /// A no-op unless a guest-reading command buffer was actually recorded, so a
-/// host that cannot export dma-bufs never pays for it. See
+/// host that cannot import guest RAM never pays for it. See
 /// [`pools::ResourcePools::quiesce_guest_reads`] for why the wait retires the
 /// whole ring rather than the fences carrying the reads.
 pub fn quiesce_guest_reads() {
@@ -1685,12 +1685,12 @@ pub fn read_target_leased(identity: &TargetIdentity) -> Result<Option<LeasedFram
     }
 }
 
-/// Where in the guest's own pages a resident's frame lands, and the dma-buf that
-/// reaches them.
+/// Where in the guest's own pages a resident's frame lands, as a bounded
+/// reference the engine can bind.
 ///
 /// Built by the runtime, which is the only side that knows a mapping's page list
 /// and its row pitch; the engine takes it as given and checks only what it can
-/// see — that the resident matches the extent and that the window is long enough.
+/// see — that the resident matches the extent and that the range is long enough.
 pub struct GuestPageTarget {
     /// The bounded reference to the guest bytes the frame lands in, covering
     /// the extent this copy names and nothing more.

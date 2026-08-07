@@ -411,87 +411,6 @@ impl crate::observe::Decline for GuestRamRegionsError {
 
 crate::observe::decline::decline_display!(GuestRamRegionsError);
 
-/// Which check refused a dma-buf export of guest pages.
-///
-/// One variant per negative `REIMS_VGPU_DMABUF_ERR_*` code in the shared ABI
-/// header, plus the two failures that are Rust's own: a shim too old to offer
-/// the callback, and a code this build does not recognise. Each is a different
-/// thing to do about it — a missing `/dev/udmabuf` is a host permission fix, a
-/// non-fd-backed guest RAM is a boot-argument fix, and a run list past the
-/// bound is a fragmentation property of the guest's allocation that no host
-/// change addresses — so they do not share a slug.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DmaBufExportError {
-    /// The shim offers no `dmabuf_for_pages`. Every pre-v16 shim, and every
-    /// fixture host.
-    CallbackMissing,
-    /// The shim rejected the argument list before looking at any page.
-    Args,
-    /// No `/dev/udmabuf`: not a Linux host, module absent, or no permission.
-    Unsupported,
-    /// Guest RAM has no backing fd, so nothing can be exported from it. A
-    /// plain `-m` allocation lands here; the boot scripts pass
-    /// `-object memory-backend-memfd,share=on` so it does not.
-    NotMemfd,
-    /// A GPA in the list does not translate to guest RAM.
-    NotRam,
-    /// A GPA in the list is not aligned to the page size named.
-    Alignment,
-    /// The page size is not a whole multiple of the host page size.
-    PageSize,
-    /// After coalescing adjacent pages, more runs than one dma-buf may carry.
-    TooFragmented,
-    /// `UDMABUF_CREATE_LIST` itself failed — most often the kernel's size bound.
-    Create,
-    /// A negative code this build has no name for, which means the shim is
-    /// newer than the staticlib. Carried rather than folded into another
-    /// variant so the number itself reaches the log.
-    UnknownCode(i32),
-}
-
-impl DmaBufExportError {
-    /// Map a negative shim return to the check it names.
-    pub fn from_code(code: i32) -> Self {
-        match code {
-            crate::qemu::abi::REIMS_VGPU_DMABUF_ERR_ARGS => Self::Args,
-            crate::qemu::abi::REIMS_VGPU_DMABUF_ERR_UNSUPPORTED => Self::Unsupported,
-            crate::qemu::abi::REIMS_VGPU_DMABUF_ERR_NOT_MEMFD => Self::NotMemfd,
-            crate::qemu::abi::REIMS_VGPU_DMABUF_ERR_NOT_RAM => Self::NotRam,
-            crate::qemu::abi::REIMS_VGPU_DMABUF_ERR_ALIGNMENT => Self::Alignment,
-            crate::qemu::abi::REIMS_VGPU_DMABUF_ERR_PAGE_SIZE => Self::PageSize,
-            crate::qemu::abi::REIMS_VGPU_DMABUF_ERR_TOO_FRAGMENTED => Self::TooFragmented,
-            crate::qemu::abi::REIMS_VGPU_DMABUF_ERR_CREATE => Self::Create,
-            other => Self::UnknownCode(other),
-        }
-    }
-}
-
-impl crate::observe::Decline for DmaBufExportError {
-    fn slug(&self) -> &'static str {
-        match self {
-            Self::CallbackMissing => "dmabuf_export_callback_missing",
-            Self::Args => "dmabuf_export_args",
-            Self::Unsupported => "dmabuf_export_unsupported",
-            Self::NotMemfd => "dmabuf_export_not_memfd",
-            Self::NotRam => "dmabuf_export_not_ram",
-            Self::Alignment => "dmabuf_export_alignment",
-            Self::PageSize => "dmabuf_export_page_size",
-            Self::TooFragmented => "dmabuf_export_too_fragmented",
-            Self::Create => "dmabuf_export_create",
-            Self::UnknownCode(_) => "dmabuf_export_unknown_code",
-        }
-    }
-
-    fn fields(&self) -> Vec<(&'static str, String)> {
-        match self {
-            Self::UnknownCode(code) => vec![("code", code.to_string())],
-            _ => Vec::new(),
-        }
-    }
-}
-
-crate::observe::decline::decline_display!(DmaBufExportError);
-
 /// Services the device cannot provide itself (time, wake, action enqueue,
 /// guest CPU / KVA access for the IOSurface mapper path).
 pub trait HostOps {
@@ -529,37 +448,15 @@ pub trait HostOps {
     /// [`HostOps::unmap_pages`] is a no-op, and the address is never recycled
     /// for unrelated memory.
     ///
-    /// This is a claim about a CPU-side pointer only. Nothing imports a host
-    /// pointer into the GPU on any rail — the GPU reaches guest pages through
-    /// [`HostOps::dmabuf_for_pages`], whose fd carries its own lifetime and
-    /// needs no promise from this flag.
+    /// This is a claim about a CPU-side *view* only, and says nothing about the
+    /// GPU rail: guest RAM reaches the GPU by importing the spans
+    /// [`HostOps::guest_ram_regions`] names, which are QEMU's own RAMBlock
+    /// mappings and never a view this call built.
     ///
     /// Default `false` — the conservative answer, so a host that has not
     /// declared stability keeps the portable CPU writeback.
     fn map_pages_stable(&self) -> bool {
         false
-    }
-
-    /// Export `gpas` — page-aligned guest page bases, each `page_size` bytes —
-    /// as one Linux dma-buf the host GPU can read and write directly.
-    ///
-    /// This is the only mechanism by which guest memory reaches the GPU without
-    /// a CPU copy, and it is deliberately not [`HostOps::map_pages`] with a
-    /// different return type. That call yields a host pointer; a host pointer
-    /// imported into a GPU is unbounded by anything the guest asked for, cannot
-    /// be revoked once handed over, and is trusted rather than kernel-mediated.
-    /// A dma-buf is bounded to the ranges named here, revoked by closing the
-    /// fd, and referenced through the kernel. Only the second is admissible
-    /// over guest RAM.
-    ///
-    /// Default: unavailable. A host that cannot export says so by name, and the
-    /// caller takes the staged copy rather than reaching for `map_pages`.
-    fn dmabuf_for_pages(
-        &mut self,
-        _gpas: &[u64],
-        _page_size: usize,
-    ) -> Result<std::os::fd::OwnedFd, DmaBufExportError> {
-        Err(DmaBufExportError::CallbackMissing)
     }
 
     /// Where guest RAM lives in this process, as stable spans held for the VM's

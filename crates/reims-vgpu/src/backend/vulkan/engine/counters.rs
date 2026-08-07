@@ -231,7 +231,7 @@ engine_counters! {
         sampled_gather_skips,
         sampled_gather_skip_bytes,
         /// Sampled binds the GPU read straight out of the guest's own pages
-        /// through an imported dma-buf — no CPU gather, no staging scratch.
+        /// through the imported RAMBlock — no CPU gather, no staging scratch.
         ///
         /// The third disposition of a `SampledSource::GuestRuns` bind, ranked
         /// against `sampled_gather_skips` (bound a retained image, moved
@@ -245,7 +245,7 @@ engine_counters! {
         draw_cover_loaded_full_scissor,
         draw_cover_loaded_partial_scissor,
         /// Vertex/storage buffer binds the draw pointed straight at the guest's
-        /// own pages through an imported dma-buf, with no copy in either
+        /// own pages through the imported RAMBlock, with no copy in either
         /// direction. Ranked against `buffer_snapshot_binds` and the
         /// `stage_phase` `runs_*` bars, which are what the CPU still gathers.
         buffer_guest_imports,
@@ -256,8 +256,8 @@ engine_counters! {
         sampled_cache_misses,
         sampled_gpu_binds,
         /// Batched-draw guest-run buffer binds the CPU had to gather, because
-        /// the host could not export the pages or the span sits at an offset
-        /// this device will not bind at.
+        /// the host could not import the pages' RAMBlock or the span sits at an
+        /// offset this device will not bind at.
         ///
         /// A subset of the `stage_phase` `runs_*` bars, distinguished by *when*
         /// the bytes were read: a batched CB reads them at record time and an

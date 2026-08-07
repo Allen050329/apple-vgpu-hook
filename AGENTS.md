@@ -78,7 +78,7 @@ Anything crossing the boundary lives twice, once in Rust and once in
 `crates/reims-vgpu/include/reims_vgpu_qemu_abi.h`, and nothing else in the toolchain compares the
 two: Rust does not `#include` the header and the shims do not read Rust. Every constant that crosses
 gets a test, using `qemu::abi::header_define` — see `the_abi_header_agrees_on_the_version`,
-`..._on_the_entry_point_return_codes`, `..._on_the_dmabuf_codes` and
+`..._on_the_entry_point_return_codes`, `..._on_the_guest_ram_codes` and
 `..._on_the_host_action_layout`. Add one with any new shared constant; a drift here is a bug on
 exactly one pathway.
 
@@ -333,60 +333,76 @@ success hides a whole family of lost records behind a green run.
 arm64 and x86 are both first-class. Metal and Vulkan are both first-class where the host supports
 them.
 
-The Vulkan backend must support all four memory/DMA cells:
+The Vulkan backend must support all four memory/import cells:
 
-| | DMA available | No DMA available |
+| | Host-pointer import available | No import available |
 |---|---|---|
-| Unified memory | Apple M-series / MoltenVK, Intel/AMD iGPU on Mesa | Unified-memory hosts with no sharing mechanism |
-| Discrete memory | Discrete GPUs with a working sharing path | Discrete GPUs that require copy crossings |
+| Unified memory | Apple M-series / MoltenVK, Intel/AMD iGPU on Mesa | Unified-memory hosts without the extension |
+| Discrete memory | Discrete GPUs that import and then copy into VRAM | Discrete GPUs that stage every crossing |
+
+On a unified host the import *is* the rail: a `GuestSlice` binds directly and there is no
+device-local mirror. On a discrete host the device-local resource is the working memory and the
+import is its backing store, so the copy between them is GPU-side and correct rather than a
+fallback. `caps::memory_topology` decides which, from two structural signals — do not add a third
+classifier and do not branch on vendor or driver name. A misclassification must stay a
+**performance** bug: nothing may branch on topology in a way that changes what the guest observes.
 
 Vulkan 1.2 is the baseline. Anything above Vulkan 1.2 must have a fallback or a capability-gated
 path. Gate on capabilities, not vendor names, driver names, or API-version assumptions.
 
-**Host-pointer imports over guest RAM are forbidden.** `VK_EXT_external_memory_host` must never be
-asked for, and Metal's `newBufferWithBytesNoCopy` may alias only this process's own bytes. Importing
-a host pointer over guest RAM gives the host GPU read *and write* access to the guest VM's memory,
-and that is a property of the mechanism rather than of how much of it is used — so the bound is
-"never requested", not a budget.
+### Guest RAM reaches the GPU by importing a host pointer, sized to a RAMBlock
 
-**Neither invariant is machine-checked.** A source scan used to assert that neither name appeared in
-the crate; it was a text grep and went with the rest of them. Nothing has replaced it, so this rule
-is enforced by review: a change that touches extension selection, `VkImportMemory*`, or Metal buffer
-creation must be read against this paragraph. If either name is ever reintroduced, the reviewer is
-the only thing standing in front of it.
+The GPU reads and writes guest memory through the mapping QEMU already holds over each RAMBlock,
+imported once and held for the VM's lifetime. The primitive is per platform and the three converge:
+`VK_EXT_external_memory_host` on Linux and Windows, the same extension through MoltenVK on macOS,
+and `newBufferWithBytesNoCopy` on the Metal-direct arm — which is what MoltenVK implements the
+extension over.
 
-**A dma-buf is the one mechanism that is allowed, and it is not that one wearing a new name.** The
-GPU reaches guest pages through `VK_EXT_external_memory_dma_buf`, gated on
-`caps::external_memory::DmaBufImport`. Three properties are why, and a proposal that loses any of
-them is the banned mechanism again:
+Portability is why. dma-buf is a Linux kernel object and there is no Windows equivalent —
+`VK_KHR_external_memory_win32` moves NT handles for GPU-allocated or D3D resources, not arbitrary
+host pointers. One primitive spans all three targets and it is the host-pointer import.
 
-- **Bounded by construction.** The fd names an explicit list of page ranges chosen when it was
-  created. A page not named then is not reachable through it — there is no pointer to stray from
-  and no surrounding mapping to reach.
-- **Revocable.** Closing the fd and freeing the `VkDeviceMemory` ends the access. A host-pointer
-  import has no such handle, which is why "how much of it is used" was never the question.
-- **Kernel-mediated.** The importing driver takes a reference on pages the kernel is tracking,
-  rather than being handed a raw address it must trust.
+**The bound is a type, and there is no scanner behind it.** A host-pointer import carries no bound
+of its own, so the whole remaining safety argument is `runtime/guest_ram.rs`: a `GuestRamImport` is
+sized to one RAMBlock exactly, `GuestSlice` has that one constructor, and the constructor
+bounds-checks with checked arithmetic. A slice's absolute position is obtainable only by presenting
+it back to the import that made it, which is also where the cross-import check lives. The threat
+this bounds is not the guest reaching its own RAM — it authored the shaders — it is a stray *past*
+the RAMBlock into this process's own memory.
+
+Nothing scans for violations and nothing should. Read that module's doc before adding an import
+site; if you find yourself needing a raw offset or a per-slice host pointer, the answer is a new
+method on the import, not a field on the slice.
+
+**The import is never required.** A host without the extension reaches a negative rung, asks for
+nothing at `vkCreateDevice`, and runs every guest-memory rail through the copying path. Those rails
+are not a legacy arm: they are the only arm on such a host, and they are the arm a discrete GPU
+takes regardless, because there the copy into VRAM is the point. Both halves are gated — the
+capability at `caps::host_pointer`, and the reference at `runtime/guest_ram_map.rs`, which refuses
+by name when no backend published a granularity.
+
+**Page recycling is unchanged and still load-bearing.** The guest reassigning a GPA to a different
+allocation while we hold a reference over it is the PTE-corruption class
+`runtime/storage_flush/guards.rs` exists for. It applied to the dma-buf and it applies here.
+
+**The pinning difference is real; do not gloss it.** A udmabuf fd made the pages it named
+unswappable and unmigratable, and closing it revoked the GPU's access. `VK_EXT_external_memory_host`
+promises neither in its specification. amdgpu and the NVIDIA driver call `get_user_pages` at import
+time in practice, but that is an observation about two drivers. We traded a kernel-enforced pin and
+a revocation handle for a primitive that exists on all three hosts. If a host is ever observed
+migrating a page under a live import, that is a real defect with a measurement — it belongs in
+`kb/`, not in a retrofitted guarantee here.
+
+Guest RAM no longer has to be **fd-backed**: the import is over an ordinary mapping, so a plain `-m`
+allocation works. `memory-backend-memfd,share=on` stays in the boot scripts for a different reason —
+`storage_flush/fence.rs` records that the shared memfd is what makes uffd minor-fault mode
+applicable — and that reasoning is independent of how the GPU reaches the pages.
 
 So the deferred-flush rail — the device's largest cost — is retired by writing into guest pages
 directly, which is what `storage_flush` always said would retire it. Read that module's own
 qualifier and the routes that are *not* blocked before assuming a window is safe to skip. Note that
 `runtime/gva_view.rs::ensure_gva_view` hands back a host pointer but is not a window resolver — it
 requires the span to be one contiguous page run and returns `None` otherwise.
-
-Two consequences that are easy to miss. Guest RAM must be **fd-backed** for any of this to work
-(`memory-backend-memfd,share=on` in the boot scripts); a plain `-m` allocation refuses every export
-with `not_memfd` and the device silently falls back to copying, which is why that refusal is
-fail-visible. And a dma-buf **pins** the pages it names — they stop being swappable or migratable —
-so every cache holding one is bounded by *pinned bytes*, not by entry count. `runtime/guest_dmabuf.rs`
-carries that bound and its basis.
-
-**Neither extension is ever required.** A host that lacks them creates a device that asks for
-neither and runs every guest-memory rail through the copying path, so the copying rails are not a
-legacy arm — they are the only arm on most hosts and must keep working. Both halves are gated:
-the import site on `HostGpuCaps::dma_buf_import`, and the export in `runtime/guest_dmabuf.rs` on the
-rung `caps::external_memory` publishes, because exporting first and declining after pins guest pages
-for nothing.
 
 ### Environment overrides
 
@@ -399,9 +415,9 @@ measured from the device, and binding an extension a host does not advertise fai
 while importing a handle type it declines is undefined behavior inside the driver. Add a switch as a
 new refusal reason, never as a new permission.
 
-`REIMS_VGPU_DMABUF=off` is the one that matters for verification: it takes a capable host down to the
-`disabled_by_env` rung, which is how the copying rails get exercised without hunting for hardware
-that lacks the extension.
+`REIMS_VGPU_GUEST_IMPORT=off` is the one that matters for verification: it takes a capable host down
+to the `disabled_by_env` rung, which is how the copying rails get exercised without hunting for
+hardware that lacks the extension.
 
 ## Verification
 
@@ -417,9 +433,10 @@ Pick the pathway your change affects.
 Where the import works, every guest window takes it, and the copying rails run zero times — so a
 green boot says nothing about them, and they are the only rails on a host without the extension. A
 change touching guest-memory upload, writeback or bind needs the boot a second time with
-`REIMS_VGPU_DMABUF=off`. Confirm it took: `vk_caps` reports `dma_buf_import=disabled_by_env`, and
-`guest_dmabuf_export off reason=backend_cannot_import` appears once. `guest_dmabuf_*` counters
-should then read zero — a non-zero one means an export ran past a closed gate.
+`REIMS_VGPU_GUEST_IMPORT=off`. Confirm it took: `vk_caps` reports
+`host_pointer_import=disabled_by_env`, and `OFF guest_ram_map reason=guest_ram_map_no_backend_import`
+appears once. Nothing may then report a bound import — a non-zero import count means a bind ran past
+a closed gate.
 
 ### An undriven boot measures an idle device
 

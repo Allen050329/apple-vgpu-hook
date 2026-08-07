@@ -49,23 +49,6 @@ pub struct ReimsVgpuHostOps {
     pub unmap_pages: Option<unsafe extern "C" fn(ctx: *mut c_void, ptr: *mut c_void, len: usize)>,
     /// 1 = guest RAM, 0 = not RAM. Optional (None → treat as RAM for unit fixtures).
     pub is_ram_gpa: Option<unsafe extern "C" fn(ctx: *mut c_void, gpa: u64) -> i32>,
-    /// Export `count` page-aligned GPAs as one Linux dma-buf. Returns an owned
-    /// fd (>= 0) or a negative `REIMS_VGPU_DMABUF_ERR_*` code.
-    ///
-    /// Deliberately not `map_pages` with a different return type. `map_pages`
-    /// yields a host pointer, and a host pointer imported into a GPU is
-    /// unbounded by anything the guest asked for, cannot be revoked, and is
-    /// trusted rather than kernel-mediated. A dma-buf is none of those, which
-    /// is the entire reason guest pages may reach the GPU through this and not
-    /// through that.
-    pub dmabuf_for_pages: Option<
-        unsafe extern "C" fn(
-            ctx: *mut c_void,
-            gpas: *const u64,
-            count: usize,
-            page_size: usize,
-        ) -> i32,
-    >,
     /// Write at most `max` guest-RAM spans into `out` and return the total this
     /// host has — a return greater than `max` says the array was short — or a
     /// negative `REIMS_VGPU_GUEST_RAM_ERR_*`.
@@ -96,12 +79,12 @@ pub struct ReimsVgpuHostOps {
     /// contiguous run gets the same direct HVA, but a fragmented one gets a
     /// packed `mach_vm_remap` view, and a bare pointer cannot say which it is.
     ///
-    /// This used to also license retaining the pointer inside a cached
-    /// `VK_EXT_external_memory_host` import, which is where the stronger
-    /// promise came from — MMIO could claim 1 only because it never released a
-    /// view at all, so every fragmented map leaked a VA reservation until
-    /// teardown. Nothing imports guest pages now, `unmap_pages` on that shim
-    /// really deallocates, and the flag is back to the narrow claim above.
+    /// It used to also license retaining the pointer inside a cached host-pointer
+    /// import, which is where the stronger promise came from — MMIO could claim
+    /// 1 only because it never released a view at all, so every fragmented map
+    /// leaked a VA reservation until teardown. The GPU rail does not read this
+    /// flag and must not: it imports the spans `guest_ram_regions` names, which
+    /// are RAMBlock mappings neither shim built and neither releases.
     pub map_pages_stable: c_int,
     /// Register `count` page-aligned GPAs as one guest-write-tracked set and
     /// return a non-zero opaque token, or 0 when the host has no dirty bitmap.
@@ -170,7 +153,6 @@ impl ReimsVgpuHostOps {
             guest_write_gen: None,
             guest_written_pages: None,
             is_ram_gpa: None,
-            dmabuf_for_pages: None,
             guest_ram_regions: None,
             notify_actions: None,
         }
@@ -540,33 +522,6 @@ impl HostOps for QemuHost<'_> {
 
     fn map_pages_stable(&self) -> bool {
         self.ops.map_pages_stable != 0
-    }
-
-    fn dmabuf_for_pages(
-        &mut self,
-        gpas: &[u64],
-        page_size: usize,
-    ) -> Result<std::os::fd::OwnedFd, crate::runtime::host::DmaBufExportError> {
-        use crate::runtime::host::DmaBufExportError;
-        if gpas.is_empty() || page_size == 0 {
-            return Err(DmaBufExportError::Args);
-        }
-        let f = self
-            .ops
-            .dmabuf_for_pages
-            .ok_or(DmaBufExportError::CallbackMissing)?;
-        // SAFETY: QEMU owns ctx and keeps it valid for the device lifetime;
-        // `gpas` is valid for `count` reads for the duration of the call.
-        let rc = unsafe { f(self.ops.ctx, gpas.as_ptr(), gpas.len(), page_size) };
-        if rc < 0 {
-            return Err(DmaBufExportError::from_code(rc));
-        }
-        // The shim created this fd and does not retain it, so ownership is
-        // ours from here and the `OwnedFd` is what closes it. A refusal never
-        // reaches this arm, so no path both takes the fd and closes it.
-        //
-        // SAFETY: `rc` is a live fd the shim just created and no longer holds.
-        Ok(unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(rc) })
     }
 
     fn guest_ram_regions(

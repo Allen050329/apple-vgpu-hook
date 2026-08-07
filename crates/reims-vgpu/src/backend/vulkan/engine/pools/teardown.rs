@@ -142,13 +142,10 @@ impl ResourcePools {
             device.destroy_image(t.image, None);
         }
         self.registry_order.clear();
-        // Every fence above was waited, so nothing can still be copying into an
-        // imported window. Freeing them here is what ends the GPU's access to
-        // the guest pages they name — the revocation the dma-buf carve-out rests
-        // on, and the one release that must happen even when the teardown is
-        // otherwise giving up.
-        // Freeing these is what ends the GPU's access to guest RAM, so it runs
-        // on every teardown path including the ones that are giving up.
+        // Every fence above was waited, so nothing can still be reading or
+        // writing an imported RAMBlock. Freeing the memory is what ends the
+        // GPU's access to guest RAM, so it runs on every teardown path
+        // including the ones that are otherwise giving up.
         self.host_ram_imports.destroy_all(device);
         // Free every slab block now that all slab-backed images are destroyed.
         self.slab.destroy_all(device);

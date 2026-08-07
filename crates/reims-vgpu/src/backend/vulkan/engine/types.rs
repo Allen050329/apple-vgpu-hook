@@ -37,7 +37,7 @@ pub enum DrawError {
     TargetRead(super::reason::TargetReadDecline),
     /// A resident's frame could not be copied straight into the guest's pages,
     /// so the flush owes the CPU route instead.
-    /// See [`super::dmabuf::GuestWriteDecline`].
+    /// See [`super::host_ram::GuestWriteDecline`].
     GuestPageWrite(super::host_ram::GuestWriteDecline),
     /// A specific Vulkan call that returned an error, typed by *(rail,
     /// operation)*. Former `Vulkan(String)` sites move here so the log names

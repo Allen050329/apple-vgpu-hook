@@ -64,7 +64,7 @@ use std::slice;
 /// [[host-window]]). The symbol is always present; when the staticlib was built
 /// without the `host-window` feature it returns `REIMS_VGPU_QEMU_ERR_STATE` so the C
 /// shim falls back to QEMU's own display.
-pub const REIMS_VGPU_QEMU_ABI_VERSION: u32 = 17;
+pub const REIMS_VGPU_QEMU_ABI_VERSION: u32 = 18;
 
 #[repr(C)]
 pub struct ReimsVgpuQemuCreateInfo {
@@ -89,24 +89,6 @@ pub const REIMS_VGPU_QEMU_ERR_STATE: c_int = 2;
 pub const REIMS_VGPU_QEMU_ERR_PANIC: c_int = 3;
 /// pop_action: queue empty (not a hard failure).
 pub const REIMS_VGPU_QEMU_EMPTY: c_int = 4;
-
-/// Why `dmabuf_for_pages` refused, when it did. Negative so one return value
-/// carries both an owned fd (>= 0) and a named refusal. Each has a twin in
-/// `include/reims_vgpu_qemu_abi.h` and nothing in the toolchain compares the
-/// two, so each is pinned by `the_abi_header_agrees_on_the_dmabuf_codes`.
-pub const REIMS_VGPU_DMABUF_ERR_ARGS: c_int = -1;
-pub const REIMS_VGPU_DMABUF_ERR_UNSUPPORTED: c_int = -2;
-pub const REIMS_VGPU_DMABUF_ERR_NOT_MEMFD: c_int = -3;
-pub const REIMS_VGPU_DMABUF_ERR_NOT_RAM: c_int = -4;
-pub const REIMS_VGPU_DMABUF_ERR_ALIGNMENT: c_int = -5;
-pub const REIMS_VGPU_DMABUF_ERR_PAGE_SIZE: c_int = -6;
-pub const REIMS_VGPU_DMABUF_ERR_TOO_FRAGMENTED: c_int = -7;
-pub const REIMS_VGPU_DMABUF_ERR_CREATE: c_int = -8;
-
-/// Longest run list one dma-buf may carry, matching the Linux udmabuf driver's
-/// `list_limit` module parameter default. Adjacent pages coalesce before this
-/// bound applies, so it bounds *runs*, not pages.
-pub const REIMS_VGPU_DMABUF_MAX_RUNS: usize = 1024;
 
 /// Why `guest_ram_regions` refused, when it did. Negative so one return carries
 /// both a span count and a named refusal.
@@ -993,80 +975,23 @@ mod tests {
         assert_eq!(std::mem::offset_of!(GuestRamRegion, len), 16);
     }
 
-    /// Every dma-buf refusal code exists twice — once here, once in the shim
-    /// header — and nothing in the build compares them. A drift makes the shim
-    /// say "guest RAM is not fd-backed" and the staticlib hear "this list is
-    /// too fragmented", which sends a reader to the wrong fix on exactly one
-    /// pathway. This is the only thing that would catch it.
-    #[test]
-    fn the_abi_header_agrees_on_the_dmabuf_codes() {
-        for (name, ours) in [
-            ("REIMS_VGPU_DMABUF_ERR_ARGS", REIMS_VGPU_DMABUF_ERR_ARGS),
-            (
-                "REIMS_VGPU_DMABUF_ERR_UNSUPPORTED",
-                REIMS_VGPU_DMABUF_ERR_UNSUPPORTED,
-            ),
-            (
-                "REIMS_VGPU_DMABUF_ERR_NOT_MEMFD",
-                REIMS_VGPU_DMABUF_ERR_NOT_MEMFD,
-            ),
-            (
-                "REIMS_VGPU_DMABUF_ERR_NOT_RAM",
-                REIMS_VGPU_DMABUF_ERR_NOT_RAM,
-            ),
-            (
-                "REIMS_VGPU_DMABUF_ERR_ALIGNMENT",
-                REIMS_VGPU_DMABUF_ERR_ALIGNMENT,
-            ),
-            (
-                "REIMS_VGPU_DMABUF_ERR_PAGE_SIZE",
-                REIMS_VGPU_DMABUF_ERR_PAGE_SIZE,
-            ),
-            (
-                "REIMS_VGPU_DMABUF_ERR_TOO_FRAGMENTED",
-                REIMS_VGPU_DMABUF_ERR_TOO_FRAGMENTED,
-            ),
-            ("REIMS_VGPU_DMABUF_ERR_CREATE", REIMS_VGPU_DMABUF_ERR_CREATE),
-        ] {
-            assert_eq!(
-                header_define_i32(name),
-                ours,
-                "the shim header and the staticlib disagree on {name}"
-            );
-            assert!(
-                ours < 0,
-                "{name} must be negative so an fd of 0 is a success"
-            );
-        }
-        assert_eq!(
-            header_define("REIMS_VGPU_DMABUF_MAX_RUNS") as usize,
-            REIMS_VGPU_DMABUF_MAX_RUNS,
-        );
-    }
 
     /// Every code the header defines maps to its own variant. A code that fell
     /// through to `UnknownCode` would still log a number, but the reader would
     /// be told the shim is newer than the staticlib when in fact the mapping
     /// simply forgot an arm.
     #[test]
-    fn every_dmabuf_code_maps_to_its_own_named_check() {
+    fn every_guest_ram_code_maps_to_its_own_named_check() {
         use crate::observe::Decline as _;
-        use crate::runtime::host::DmaBufExportError;
-        let codes = [
-            REIMS_VGPU_DMABUF_ERR_ARGS,
-            REIMS_VGPU_DMABUF_ERR_UNSUPPORTED,
-            REIMS_VGPU_DMABUF_ERR_NOT_MEMFD,
-            REIMS_VGPU_DMABUF_ERR_NOT_RAM,
-            REIMS_VGPU_DMABUF_ERR_ALIGNMENT,
-            REIMS_VGPU_DMABUF_ERR_PAGE_SIZE,
-            REIMS_VGPU_DMABUF_ERR_TOO_FRAGMENTED,
-            REIMS_VGPU_DMABUF_ERR_CREATE,
-        ];
+        use crate::runtime::host::GuestRamRegionsError;
         let mut slugs = Vec::new();
-        for code in codes {
-            let mapped = DmaBufExportError::from_code(code);
+        for code in [
+            REIMS_VGPU_GUEST_RAM_ERR_ARGS,
+            REIMS_VGPU_GUEST_RAM_ERR_NO_RAM,
+        ] {
+            let mapped = GuestRamRegionsError::from_code(code);
             assert!(
-                !matches!(mapped, DmaBufExportError::UnknownCode(_)),
+                !matches!(mapped, GuestRamRegionsError::UnknownCode(_)),
                 "{code} has no named arm"
             );
             slugs.push(mapped.slug());
@@ -1074,11 +999,11 @@ mod tests {
         let count = slugs.len();
         slugs.sort_unstable();
         slugs.dedup();
-        assert_eq!(slugs.len(), count, "two dma-buf codes share a slug");
+        assert_eq!(slugs.len(), count, "two guest-RAM codes share a slug");
         // A code past the end is the one case that *should* be unknown, and it
         // must carry the number rather than swallow it.
-        let future = DmaBufExportError::from_code(-99);
-        assert_eq!(future, DmaBufExportError::UnknownCode(-99));
+        let future = GuestRamRegionsError::from_code(-99);
+        assert_eq!(future, GuestRamRegionsError::UnknownCode(-99));
         assert!(future.to_string().contains("code=-99"));
     }
 

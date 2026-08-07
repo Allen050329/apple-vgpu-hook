@@ -26,16 +26,16 @@ use super::vk_call::{VkCall, VkOp};
 ///
 /// Two origins, and the offset is what distinguishes them. A pooled staging slot
 /// always starts at zero — the pool carved it for this content alone. A guest
-/// window import starts wherever the guest's own span sits inside the first page
-/// its dma-buf names, because a dma-buf covers whole pages and the guest's
-/// allocator does not.
+/// span starts wherever it sits inside its RAMBlock's import, which spans the
+/// whole block and starts at the device's import granularity, while the guest's
+/// allocator is aligned to neither.
 ///
 /// Deliberately not a [`BufferSlot`]. A slot is a *pool* object: `acquire_staging`
-/// enters it in `staging_live` and the ring recycles it at retire. An import
-/// belongs to [`super::dmabuf::ImportCache`] and is revoked by freeing its
-/// memory, so a type that could be mistaken for a slot would eventually be
-/// handed to the staging free list — where it would be reissued as scratch over
-/// the guest's live pages.
+/// enters it in `staging_live` and the ring recycles it at retire. An imported
+/// RAMBlock belongs to [`super::host_ram::HostRamImports`] and lives as long as
+/// the device does, so a type that could be mistaken for a slot would eventually
+/// be handed to the staging free list — where it would be reissued as scratch
+/// over the guest's live pages.
 #[derive(Clone, Copy)]
 struct BoundBuffer {
     buffer: vk::Buffer,
@@ -56,11 +56,12 @@ impl From<BufferSlot> for BoundBuffer {
 /// byte allocation, or the same guest span) resolve to ONE buffer and at most
 /// one copy.
 ///
-/// A `GuestRuns` span is bound **directly out of the guest's pages** where the
-/// host can export them as a dma-buf and the span sits at an offset the device
+/// A `GuestRuns` span is bound **directly out of the guest's pages** where this
+/// device can import their RAMBlock and the span sits at an offset the device
 /// will accept — no copy at all, not even a GPU one. Otherwise the CPU gathers
 /// the runs into a pooled staging span, which is what this arm did
-/// unconditionally before and is still what every host without an exporter does.
+/// unconditionally before and is still what every host without
+/// `VK_EXT_external_memory_host` does.
 ///
 /// The direct bind reads guest RAM when the command buffer *executes*, which is
 /// after this device would otherwise have told the guest the packet finished.
@@ -105,18 +106,18 @@ unsafe fn stage_buffer_content(
         BufferContent::GuestRuns(src) => {
             // The bytes are already in memory the device can address. Bind them.
             //
-            // Note what this is *not*. This arm once resolved each run through a
-            // `VK_EXT_external_memory_host` import and bound that, and the whole
-            // mechanism is banned: an imported host pointer is one the GPU can
-            // *write*, over a mapping it can stray within, with no handle to
-            // revoke it by. A dma-buf names an explicit page list, ends when the
-            // memory is freed, and is tracked by the kernel.
+            // What keeps this safe is not the mechanism — a host pointer is one
+            // the GPU can write and can stray within — but the bound the
+            // reference carries. `src.pages` is a
+            // [`crate::runtime::guest_ram::GuestRef`], which no call site can
+            // construct without the range check against the RAMBlock it names,
+            // and freeing the import is what ends the access.
             if let Some(bound) = unsafe { import_guest_buffer_window(ctx, pools, src) } {
                 pools.note_guest_read_recorded();
                 counters.note_buffer_guest_import(src.total_len);
                 bound
             } else {
-                // No exporter, or an offset this device will not bind at. The
+                // No import on this host, or an offset it will not bind at. The
                 // CPU gathers the runs into the mapped staging span, with no
                 // intermediate `cpu_bytes()` heap Vec (this is the
                 // deferred-submit hot path, ~4.8 binds/draw under compositing).
@@ -220,10 +221,10 @@ crate::observe::decline::decline_display!(BufferImportDecline);
 /// The two arms are the same `vkCmdCopyBufferToImage` over a different buffer,
 /// and the whole difference is whether the CPU moved the texels first.
 enum GuestTexels {
-    /// The buffer **is** the guest's pages, reached through a dma-buf import.
-    /// Nothing copied them into it: the GPU reads the bytes where the guest
-    /// wrote them, and `offset` is where inside the fd's whole-page extent the
-    /// first texel sits.
+    /// The buffer **is** the guest's pages, reached through the host-pointer
+    /// import over their RAMBlock. Nothing copied them into it: the GPU reads
+    /// the bytes where the guest wrote them, and `offset` is where the first
+    /// texel sits inside that import.
     ///
     /// The read happens when the command buffer executes rather than when it is
     /// recorded, which is later than the guest's fence would otherwise allow —
@@ -231,10 +232,11 @@ enum GuestTexels {
     /// what makes that legal.
     Imported { buffer: vk::Buffer, offset: u64 },
     /// The CPU packed the texels into a pooled staging span, because this host
-    /// could not export the pages (no `/dev/udmabuf`, guest RAM with no backing
-    /// fd, a run list the exporter refused) or the copy could not name them at
-    /// the offset they sit at. Always available, which is why the import is
-    /// allowed to decline for any reason at all.
+    /// could not reach the pages (no `VK_EXT_external_memory_host`, the rail
+    /// switched off, a driver that declined the pointer, or a run list that is
+    /// not one contiguous stretch) or the copy could not name them at the offset
+    /// they sit at. Always available, which is why the import is allowed to
+    /// decline for any reason at all.
     Scratch(BufferSlot),
 }
 
@@ -377,9 +379,9 @@ unsafe fn import_sampled_guest_window(
 /// A check that sent a guest-sourced sampled bind back to the CPU gather before
 /// the import itself was ever asked.
 ///
-/// Separate from [`super::dmabuf::DmaBufDecline`] because these are properties
-/// of the *copy* this arm wants to record, not of the fd or the device: the same
-/// window would import fine for a caller that named it differently.
+/// Separate from [`super::host_ram::HostRamDecline`] because these are
+/// properties of the *copy* this arm wants to record, not of the import or the
+/// device: the same span would bind fine for a caller that named it differently.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SampledImportDecline {
     /// The first texel does not sit at an offset `vkCmdCopyBufferToImage` can
@@ -1873,18 +1875,16 @@ pub(crate) unsafe fn execute_draw_inner(
                 // accumulates, so a draw binding several gathers charges each
                 // half of each bind to its own bar.
                 phase.enter(super::draw_phase::Phase::SampledUpload);
-                // First ask whether the bytes have to move at all. A dma-buf
-                // over the guest's own pages is a buffer the copy can name, so
-                // where the host can export one this arm moves nothing on the
-                // CPU and the `memcpy` below never runs.
+                // First ask whether the bytes have to move at all. The RAMBlock
+                // import is a buffer the copy can name, so where this device
+                // can make one this arm moves nothing on the CPU and the
+                // `memcpy` below never runs.
                 //
-                // Note what this is *not*. The gather used to happen on the
-                // device out of per-run `VK_EXT_external_memory_host` imports,
-                // and that mechanism is banned: an imported host pointer is one
-                // the GPU can write, and these runs are guest RAM. A dma-buf
-                // names an explicit page list, is revoked by freeing it, and is
-                // tracked by the kernel — which is why it is the one import
-                // allowed over guest memory.
+                // The import is over guest RAM, which the GPU can write as well
+                // as read. What keeps the copy inside the guest's own bytes is
+                // the `GuestRef` in `src.pages`: it is range-checked against its
+                // RAMBlock at construction and there is no other way to name a
+                // byte in one.
                 let source = match unsafe { import_sampled_guest_window(ctx, pools, src) } {
                     Some(imported) => {
                         // The read is now the command buffer's, at execute time.
@@ -3265,8 +3265,8 @@ mod tests {
                     }]),
                     total_len,
                     row_length_texels,
-                    // A fixture over a dummy host address has no guest
-                    // pages, so there is nothing a dma-buf could cover.
+                    // A fixture over a dummy host address names no guest
+                    // RAM, so there is no reference an import could bind.
                     pages: None,
                 }),
                 format: crate::backend::vulkan::translate::pixel::vk_texel_layout(

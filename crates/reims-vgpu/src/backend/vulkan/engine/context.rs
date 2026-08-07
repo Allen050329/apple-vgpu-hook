@@ -614,8 +614,6 @@ impl DeviceContext {
         // pre-1.2 spelling of mirror-clamp-to-edge, on a device that has the
         // extension but not the core feature.
         enabled_device_extensions.extend(features.required_extensions());
-        // Only the `Supported` rung names any, so a host without dma-buf does
-        // not fail device creation asking for an extension it does not have.
         // Only the `Supported` rung names `VK_EXT_external_memory_host`, so a
         // host without it gets a device rather than a failed `vkCreateDevice`.
         enabled_device_extensions.extend(host_pointer.rung.required_extensions());
@@ -898,7 +896,8 @@ impl DeviceContext {
     }
 
     /// Escape hatch for a caller that has already built a [`MemoryRequest`]
-    /// (the dmabuf import path, which must match a foreign allocation).
+    /// (the host-pointer import path, which must intersect what
+    /// `vkGetMemoryHostPointerPropertiesEXT` named for the pointer).
     pub(crate) fn memory_type_with(&self, type_bits: u32, req: &MemoryRequest) -> Option<u32> {
         select_memory_type(&self.memory_properties, type_bits, req)
     }
