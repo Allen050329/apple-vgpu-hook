@@ -322,6 +322,22 @@ enum StreamDrawDrop {
         depth_plane: u32,
         resolve_texture_ref: u32,
     },
+    /// A pass declaring more render-target array layers than this device draws.
+    ///
+    /// Layered rendering: one draw is broadcast to the layers its vertex stage
+    /// selects with `[[render_target_array_index]]`, and this device binds the
+    /// attachment whole and draws into layer 0. So it is
+    /// [`Self::ColorSubresourceUnsupported`] again with the coordinate chosen
+    /// per draw instead of per pass — geometry meant for layer 3 lands on top
+    /// of layer 0's content, and layers 1..n keep whatever they held through a
+    /// `Clear` the guest asked to apply to all of them.
+    ///
+    /// It counted rather than refused for as long as the two arms beside it did,
+    /// on an argument they no longer make: rendering it anyway is wrong content
+    /// written over right content in a layer the pass did not name, and nothing
+    /// downstream can tell, because a pass that touched only layer 0 is exactly
+    /// what a guest that asked for one layer also produces.
+    PassArrayLengthUnsupported { length: u64 },
 }
 
 impl crate::observe::Decline for StreamDrawDrop {
@@ -330,6 +346,7 @@ impl crate::observe::Decline for StreamDrawDrop {
             Self::Unbound { .. } => "stream_draw_dropped_unbound",
             Self::DepthStencilUnsupported { .. } => "stream_depth_stencil_unsupported",
             Self::ColorSubresourceUnsupported { .. } => "stream_color_subresource_unsupported",
+            Self::PassArrayLengthUnsupported { .. } => "stream_pass_array_length_unsupported",
         }
     }
 
@@ -362,6 +379,9 @@ impl crate::observe::Decline for StreamDrawDrop {
                 ("plane", depth_plane.to_string()),
                 ("resolve", format!("{resolve_texture_ref:#x}")),
             ],
+            Self::PassArrayLengthUnsupported { length } => {
+                vec![("length", length.to_string())]
+            }
         }
     }
 }
@@ -418,6 +438,10 @@ impl StreamDrawDrop {
                     | u64::from(slice) << 16
                     | u64::from(depth_plane)
             }
+            // The layer count itself: a guest asking for 6 layers and one asking
+            // for 2 are different readings, and how many a pass declares is the
+            // whole of what this arm has to say.
+            Self::PassArrayLengthUnsupported { length } => length,
         }
     }
 }
@@ -1711,8 +1735,18 @@ fn handle_render_record<M: HostMemory + HostOps>(
             // there. `0` is a pass that named none, which leaves the arming
             // below with nowhere to write.
             acc.visibility_buffer_ref = cmd.pass_visibility_result_buffer_ref;
+            // Refused rather than drawn into layer 0, the decision the colour
+            // subresource arm below already made for the same shape of loss:
+            // the layer a draw selects is a coordinate the pass did not name,
+            // so rendering anyway lands geometry meant for one layer on top of
+            // another's correct content.
             if cmd.pass_render_target_array_length > 1 {
-                crate::runtime::drain::note_store_route("render_pass_array_length_dropped");
+                let drop = note_pass_array_length_unsupported(
+                    task_id,
+                    cmd.pass_render_target_array_length,
+                );
+                acc.unrepresentable
+                    .get_or_insert(StreamRefusal::Pass(drop));
             }
             if cmd.pass_render_target_width != 0 || cmd.pass_render_target_height != 0 {
                 note_pass_target_extent();
@@ -3827,8 +3861,8 @@ use report::{
     is_indexed_draw_opcode, note_clear_dropped, note_color_subresource_unsupported,
     note_compute_refusal, note_depth_stencil_unsupported, note_draw_encode_fail,
     note_empty_scissor, note_indexed_draw_without_buffer, note_store_action_no_attachment,
-    note_indirect_draw_refused, note_pass_extent_for_slot, note_pass_target_extent,
-    note_stream_draw_drops,
+    note_indirect_draw_refused, note_pass_array_length_unsupported, note_pass_extent_for_slot,
+    note_pass_target_extent, note_stream_draw_drops,
     note_unimplemented_render_opcode, note_unnamed_icb_execute,
 };
 // The unimplemented-opcode latch is test-only on both sides, so its import has

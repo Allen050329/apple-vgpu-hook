@@ -114,11 +114,16 @@ const ROWS: &[(&str, Counted, &str)] = &[
     ),
     (
         "render_pass_array_length_dropped",
-        Counted::StateNotApplied,
+        Counted::BesideATypedDecline,
         "layered rendering: the pass declares a render-target array length above \
-         1 and this device renders one layer. Decoded from the same record as \
-         the extent count beside it, so it shares that record's proof of being \
-         reached",
+         1 and this device draws into layer 0. Raised by \
+         `note_pass_array_length_unsupported`, which returns the \
+         `StreamDrawDrop::PassArrayLengthUnsupported` its caller records as \
+         `StreamRefusal::Pass` — so the pass is refused and the loss census \
+         holds the verdict. The count keeps its old name so a boot series \
+         spanning the change stays comparable; it is now the refusal's volume. \
+         Decoded from the same record as the extent count beside it, so it \
+         shares that record's proof of being reached",
     ),
     (
         "render_pass_rate_map_dropped",
@@ -449,12 +454,20 @@ fn no_counted_loss_is_unread() {
 /// and the count is pinned so that adding one is a decision rather than a diff.
 ///
 /// **Lower this when you retire one**, exactly as
-/// `EXECUTED_MODIFIED_CEILING` asks. Retiring means applying the state or
-/// executing the work — not renaming the slug, which would move it out of this
-/// population without changing anything the guest sees.
+/// `EXECUTED_MODIFIED_CEILING` asks. Retiring means applying the state,
+/// executing the work, or **refusing rather than doing something else** — not
+/// renaming the slug, which would move it out of this population without
+/// changing anything the guest sees.
+///
+/// The third way is why `Counted::BesideATypedDecline` is not in this filter.
+/// A count beside a refusal is not guest work this device silently did not do:
+/// the guest is told, and told in a typed decline whose own census
+/// (`a_decline_says_whether_the_guest_lost_work`) prices what it costs. That
+/// is a strictly better place for the pass to be than rendered into the wrong
+/// subresource or the wrong layer with a counter going up.
 #[test]
 fn the_counted_loss_census_only_shrinks() {
-    const COUNTED_LOSS_CEILING: usize = 19;
+    const COUNTED_LOSS_CEILING: usize = 18;
     let losses = ROWS
         .iter()
         .filter(|(_, c, _)| matches!(c, Counted::StateNotApplied | Counted::WorkNotExecuted))

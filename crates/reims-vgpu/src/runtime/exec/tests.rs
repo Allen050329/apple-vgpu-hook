@@ -850,6 +850,94 @@ fn an_unsupported_depth_attachment_is_named_not_just_dropped() {
     );
 }
 
+/// A pass declaring more render-target array layers than this device draws
+/// refuses the stream's draws.
+///
+/// Layered rendering picks the layer per draw, from the vertex stage's
+/// `[[render_target_array_index]]`, and this device binds the attachment whole
+/// and draws into layer 0. So geometry the guest aimed at layer 3 lands on top
+/// of layer 0's content and layers 1..n keep whatever they held through a
+/// `Clear` the guest asked to apply to all of them — the same shape of loss the
+/// colour subresource arm below refuses, with the coordinate chosen per draw
+/// instead of per pass.
+///
+/// This counted and rendered anyway until the arms beside it stopped doing so.
+#[test]
+fn a_pass_declaring_more_array_layers_than_this_device_draws_refuses_the_draws() {
+    use crate::contract::endian::st32;
+    use crate::runtime::decode::render::{PASS_ATTACH_TEXREF, PASS_COLOR_ATTACH_OFF};
+
+    // A full-length record, not the `PASS_MIN_PAYLOAD` one the arms below use:
+    // the array length is read only from the whole `RenderPassBody`, and a
+    // short record falls into the per-attachment views that do not reach it.
+    // The offset comes from `offset_of!` for the reason the device's own
+    // constants do, so a wire rename fails the build here too.
+    const ARRAY_LENGTH_AT: usize = OP_HEADER_LEN
+        + core::mem::offset_of!(wire_pass::RenderPassBody, render_target_array_length);
+
+    let pass = |layers: u32| {
+        let total = OP_HEADER_LEN + wire_pass::RENDER_PASS_TOTAL_LEN as usize;
+        let mut cmd = vec![0u8; total];
+        st32(&mut cmd[0..], wire_pass::OPCODE_RENDER_PASS);
+        st32(&mut cmd[4..], total as u32);
+        let slot = OP_HEADER_LEN + PASS_COLOR_ATTACH_OFF;
+        st32(&mut cmd[slot + PASS_ATTACH_TEXREF..], 77);
+        st32(&mut cmd[ARRAY_LENGTH_AT..], layers);
+        cmd
+    };
+    let run = |cmd: &[u8]| {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let host = FakeHost::new();
+        let mut out = ExecResult::default();
+        let mut acc = StreamAccum::default();
+        handle_render_record(
+            &mut state,
+            &host,
+            1,
+            wire_pass::OPCODE_RENDER_PASS,
+            cmd,
+            &mut out,
+            &mut acc,
+        );
+        acc
+    };
+
+    // One layer is the API default and is what this device draws, so nothing is
+    // refused. Zero is the same statement written the other way — a pass that
+    // did not set the property at all.
+    for layers in [0u32, 1] {
+        assert!(
+            run(&pass(layers)).bind_snapshot().is_ok(),
+            "layers={layers} is what this device draws; nothing is refused"
+        );
+    }
+
+    for layers in [2u32, 6] {
+        assert!(
+            matches!(
+                run(&pass(layers)).bind_snapshot(),
+                Err(StreamRefusal::Pass(
+                    StreamDrawDrop::PassArrayLengthUnsupported { .. }
+                ))
+            ),
+            "layers={layers}: a pass this device would draw only layer 0 of must \
+             refuse its draws rather than land geometry meant for another layer \
+             on top of layer 0's content"
+        );
+    }
+
+    let log = std::fs::read_to_string(crate::observe::fail_log_path()).expect("fail log");
+    assert!(
+        log.contains("stream_pass_array_length_unsupported"),
+        "a pass declaring layers this device does not draw said nothing"
+    );
+    assert!(
+        log.contains("length=6"),
+        "the line must carry the declared layer count: 2 layers and 6 are \
+         different readings, and it is the whole of what this arm reports"
+    );
+}
+
 /// A colour attachment naming a mip, a slice or a depth plane refuses the
 /// stream's draws.
 ///

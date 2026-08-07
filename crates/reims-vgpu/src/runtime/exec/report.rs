@@ -409,6 +409,25 @@ pub(super) fn note_pass_target_extent() {
     crate::runtime::drain::note_store_route("render_pass_target_extent_unapplied");
 }
 
+/// A pass declaring more render-target array layers than this device draws.
+/// See [`StreamDrawDrop::PassArrayLengthUnsupported`].
+///
+/// The census route keeps the name it had while this was a bare count, so a
+/// boot series spanning the change stays comparable: what moved is that the
+/// pass is now refused, and the route's verdict in the counted-loss census
+/// moved with it.
+///
+/// Deduped on the declared layer count, because that is what varies between
+/// two guests asking for this and it is the whole of what the arm reports.
+pub(super) fn note_pass_array_length_unsupported(task_id: u32, length: u64) -> StreamDrawDrop {
+    crate::runtime::drain::note_store_route("render_pass_array_length_dropped");
+    let drop = StreamDrawDrop::PassArrayLengthUnsupported { length };
+    crate::observe::Emit::decline("stream_pass", &drop)
+        .field("task", task_id)
+        .fail_once(drop.latch());
+    drop
+}
+
 /// A colour attachment naming a mip, a slice, a depth plane or a multisample
 /// resolve target this device renders past.
 /// See [`StreamDrawDrop::ColorSubresourceUnsupported`].

@@ -731,11 +731,13 @@ const ROWS: &[Row] = &[
         file: "crates/reims-vgpu/src/runtime/exec/mod.rs",
         ty: "StreamDrawDrop",
         loss: Loss::Refused,
-        why: "the two arms that used to continue no longer do: a dropped \
-              depth/stencil attachment and an unbindable colour subresource \
-              both set `StreamAccum::unrepresentable`, and `bind_snapshot` \
+        why: "the three arms that used to continue no longer do: a dropped \
+              depth/stencil attachment, an unbindable colour subresource and a \
+              pass declaring more render-target array layers than this device \
+              draws all set `StreamAccum::unrepresentable`, and `bind_snapshot` \
               refuses the stream's draws rather than running the pass without \
-              depth or into the base level. The `Unbound` arm keeps the draw \
+              depth, into the base level, or into layer 0. The `Unbound` arm \
+              keeps the draw \
               out of `acc.draws` entirely, and its ambiguity is now closed \
               structurally rather than by a rate: \
               `a_pipeline_reaches_the_latch_by_one_wire_form` pins that exactly \
