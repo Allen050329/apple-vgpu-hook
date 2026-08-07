@@ -189,6 +189,15 @@ pub(crate) struct ResourcePools {
     readback_live: Option<BufferSlot>,
     /// Extra live readbacks (compute multi-image / multi-buffer).
     readback_multi_live: Vec<BufferSlot>,
+    /// Device-local buffer the guest-page writeback detiles a frame into before
+    /// scattering it into the guest's stretches.
+    ///
+    /// One slot, not a pool keyed by size: this rail writes one frame at a time
+    /// inside a single command buffer, and a boot's frames are all the same
+    /// geometry until the display mode changes. It is grown and never shrunk,
+    /// so a mode change up costs one reallocation and a mode change down costs
+    /// nothing. `None` until the first frame that takes the linear path.
+    guest_scratch: Option<BufferSlot>,
     /// Readback slots handed to a reader that is consuming their mapping with
     /// the engine unlocked; see [`ResourcePools::lease_readback`].
     ///
@@ -1822,9 +1831,14 @@ pub(crate) enum AllocSite {
     Readback,
     ReadbackMulti,
     SlabBlock,
+    /// The guest-page writeback's device-local detiling scratch. One
+    /// allocation per geometry for the life of the device, so a count above a
+    /// handful means the frame size is changing every flush and the grow rule
+    /// is thrashing rather than settling.
+    GuestScratch,
 }
 
-const ALLOC_SITE_N: usize = 7;
+const ALLOC_SITE_N: usize = 8;
 
 impl AllocSite {
     const fn idx(self) -> usize {
@@ -1836,6 +1850,7 @@ impl AllocSite {
             AllocSite::Readback => 4,
             AllocSite::ReadbackMulti => 5,
             AllocSite::SlabBlock => 6,
+            AllocSite::GuestScratch => 7,
         }
     }
 }
@@ -1848,6 +1863,7 @@ const ALLOC_SITE_NAMES: [&str; ALLOC_SITE_N] = [
     "readback",
     "readback_multi",
     "slab_block",
+    "guest_scratch",
 ];
 
 static ALLOC_SITE_COUNT: [std::sync::atomic::AtomicU64; ALLOC_SITE_N] =

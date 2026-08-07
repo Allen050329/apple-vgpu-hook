@@ -89,6 +89,7 @@ impl ResourcePools {
             readback_free: HashMap::new(),
             readback_live: None,
             readback_multi_live: Vec::new(),
+            guest_scratch: None,
             readback_leased: Vec::new(),
             sampled_free: FreePool::new(SAMPLED_FREE_CAP_PER_KEY, SAMPLED_FREE_CAP_TOTAL),
             sampled_live: Vec::new(),
@@ -1767,6 +1768,98 @@ impl ResourcePools {
             coherent: kind.coherent,
             cached: kind.cached,
         })
+    }
+
+    /// The device-local buffer the guest-page writeback detiles a frame into,
+    /// at least `size` bytes, creating or growing it if it is short.
+    ///
+    /// # Why this is one slot and not a pool
+    ///
+    /// The readback pools are keyed by size because many readbacks of many
+    /// geometries are live at once. This buffer has exactly one user, which
+    /// holds the engine lock for the whole of its command buffer, so there is
+    /// never a second live claim on it. Bucketing to a power of two the way
+    /// those pools do would round a 1080p frame's 8.29 MB up to 16 MB of VRAM
+    /// for nothing; the exact requirement is allocated instead, and a smaller
+    /// frame reuses a larger buffer rather than causing a second allocation.
+    ///
+    /// # Safety
+    ///
+    /// The caller must have no submission in flight naming the previous buffer:
+    /// a grow destroys it. The writeback rail waits its fence before returning,
+    /// so its next call cannot overlap its previous one.
+    pub(crate) unsafe fn acquire_guest_scratch(
+        &mut self,
+        ctx: &DeviceContext,
+        size: u64,
+        counters: &EngineCounters,
+    ) -> Result<vk::Buffer, DrawError> {
+        if let Some(slot) = self.guest_scratch {
+            if slot.size >= size {
+                return Ok(slot.buffer);
+            }
+            release_buffer_slot(&ctx.device, &mut self.host_slab, slot);
+            self.guest_scratch = None;
+        }
+        let buffer = ctx
+            .device
+            .create_buffer(
+                &vk::BufferCreateInfo::default()
+                    .size(size)
+                    // Destination of the image copy, source of the scatter.
+                    .usage(vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::TRANSFER_SRC)
+                    .sharing_mode(vk::SharingMode::EXCLUSIVE),
+                None,
+            )
+            .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::GuestScratchCreate, e)))?;
+        counters.note_create();
+        let req = ctx.device.get_buffer_memory_requirements(buffer);
+        // A hard `DeviceLocal` rather than `DeviceLocalPreferred`: the whole
+        // point of this buffer is that the detiling hop stays on the GPU's own
+        // memory so the hop that does cross the bus is a linear read. Placed in
+        // host memory it would be two crossings instead of one and strictly
+        // worse than the rectangle path it replaces — a decline, not a degrade.
+        let mt = ctx
+            .memory_type_for(req.memory_type_bits, MemoryClass::DeviceLocal)
+            .ok_or({
+                DrawError::Unsupported(reason::DrawReason::NoDeviceLocalMemoryForGuestScratch {
+                    memory_type_bits: req.memory_type_bits,
+                })
+            })?;
+        let memory = allocate_memory_timed(
+            ctx,
+            &vk::MemoryAllocateInfo::default()
+                .allocation_size(req.size)
+                .memory_type_index(mt),
+            AllocSite::GuestScratch,
+        )
+        .map_err(|e| {
+            ctx.device.destroy_buffer(buffer, None);
+            DrawError::VkCall(VkCall::new(VkOp::GuestScratchAlloc, e))
+        })?;
+        counters.note_alloc();
+        ctx.device
+            .bind_buffer_memory(buffer, memory, 0)
+            .map_err(|e| {
+                ctx.device.free_memory(memory, None);
+                ctx.device.destroy_buffer(buffer, None);
+                DrawError::VkCall(VkCall::new(VkOp::GuestScratchBind, e))
+            })?;
+        self.guest_scratch = Some(BufferSlot {
+            buffer,
+            memory,
+            // The requirement and not the request: a driver may need more than
+            // was asked for, and recording the smaller number would re-grow a
+            // buffer that is already big enough on the very next frame.
+            size: req.size,
+            // Device-local memory is not host-visible on the topology this
+            // exists for, and nothing here reads it with the CPU.
+            mapped: 0,
+            backing: BufferBacking::Dedicated,
+            coherent: false,
+            cached: false,
+        });
+        Ok(buffer)
     }
 
     pub(crate) unsafe fn acquire_readback(

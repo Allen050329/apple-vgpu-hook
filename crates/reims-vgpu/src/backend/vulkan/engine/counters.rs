@@ -308,6 +308,26 @@ engine_counters! {
         /// through `begin_entry` would put a diagnostic in the signature of the
         /// device's hottest slot claim.
         batch_readback_joins,
+        /// Guest-page writebacks that detiled through the device-local scratch
+        /// and scattered with plain buffer copies — one region per guest
+        /// stretch instead of up to three rectangles per stretch.
+        ///
+        /// Read as a share of `guest_write_linear + guest_write_rects`. A boot
+        /// where the second term dominates is one whose guest pitches carry row
+        /// padding, the single case the linear form cannot express: a run's
+        /// bytes then include padding this copy must not write, and a buffer
+        /// copy has no way to skip it.
+        guest_write_linear,
+        /// Guest-page writebacks that went straight to guest RAM as image-copy
+        /// rectangles, because the window's rows carry padding.
+        guest_write_rects,
+        /// Copy regions submitted by the two above, summed.
+        ///
+        /// The number the linear path exists to reduce, and the one to quote
+        /// against `MAX_GUEST_COPY_REGIONS`. Divide by the writeback count for
+        /// regions per frame: a 1080p window is ~507 stretches, so ~507 here
+        /// means every frame took the linear path and ~1500 means none did.
+        guest_write_regions,
     }
 
     cumulative {

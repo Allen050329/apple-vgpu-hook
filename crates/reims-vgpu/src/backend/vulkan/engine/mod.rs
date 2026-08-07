@@ -1730,13 +1730,34 @@ impl GuestPageTarget {
             .fold(0u64, u64::saturating_add)
     }
 
+    /// Guest bytes between the starts of two consecutive rows.
+    fn pitch_bytes(&self) -> u64 {
+        u64::from(self.row_length_texels.max(self.width)) * 4
+    }
+
     /// The window's byte layout, for planning copy rectangles.
     fn geometry(&self) -> crate::runtime::guest_window_regions::WindowGeometry {
         crate::runtime::guest_window_regions::WindowGeometry {
-            pitch_bytes: u64::from(self.row_length_texels.max(self.width)) * 4,
+            pitch_bytes: self.pitch_bytes(),
             width_texels: self.width,
             height_texels: self.height,
         }
+    }
+
+    /// Whether the window's rows carry no padding, so every byte from the first
+    /// texel to the last is a texel byte.
+    ///
+    /// This is the precondition for the linear path, and it is a statement
+    /// about the *contract* rather than about a workload: when it holds, window
+    /// byte `o` is the frame's byte `o` under a tight packing, so a scratch
+    /// buffer detiled at that packing can be scattered by byte range with no
+    /// row or format arithmetic left to do. When it does not hold, a run's
+    /// bytes include padding that must not be written
+    /// ([`crate::runtime::guest_window_regions`] states why), and a
+    /// `VkBufferCopy` has no way to skip it — so that window takes the
+    /// rectangle path, which does.
+    fn rows_are_dense(&self) -> bool {
+        self.pitch_bytes() == u64::from(self.width) * 4
     }
 }
 
@@ -1811,8 +1832,41 @@ pub fn copy_target_to_guest_pages(
         ));
     }
     unsafe {
-        let copies = plan_guest_copies(ctx, pools, dst)?;
-        copy_image_level0_to_buffer(ctx, pools, counters, &snap, &copies)?;
+        // Dense rows are the common case and the cheap one; a padded pitch
+        // falls to the rectangle path, which is the only form that can leave
+        // the padding unwritten. Both land the same guest bytes.
+        let plan = if dst.rows_are_dense() {
+            let scratch = pools.acquire_guest_scratch(ctx, need, counters)?;
+            let scatter = plan_guest_linear_copies(ctx, pools, dst)?;
+            counters.guest_write_linear.fetch_add(1, Ordering::Relaxed);
+            GuestCopyPlan::Linear {
+                scratch,
+                // `buffer_row_length(0)` is Vulkan's "tightly packed", which is
+                // exactly what dense means. Passing `row_length_texels` would
+                // be the same number whenever it is set and an invalid one
+                // (below `width`) if the guest ever understated it.
+                detile: ash::vk::BufferImageCopy::default()
+                    .buffer_offset(0)
+                    .buffer_row_length(0)
+                    .buffer_image_height(0)
+                    .image_subresource(color_subresource_layers())
+                    .image_offset(ash::vk::Offset3D { x: 0, y: 0, z: 0 })
+                    .image_extent(ash::vk::Extent3D {
+                        width: dst.width,
+                        height: dst.height,
+                        depth: 1,
+                    }),
+                scatter,
+            }
+        } else {
+            let plan = GuestCopyPlan::Rectangles(plan_guest_copies(ctx, pools, dst)?);
+            counters.guest_write_rects.fetch_add(1, Ordering::Relaxed);
+            plan
+        };
+        counters
+            .guest_write_regions
+            .fetch_add(plan.regions(), Ordering::Relaxed);
+        copy_image_level0_to_buffer(ctx, pools, counters, &snap, &plan)?;
         pools.registry_set_layout(identity, ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
         counters.note_target_read(u64::from(dst.width) * u64::from(dst.height) * 4);
     }
@@ -1838,6 +1892,108 @@ pub fn copy_target_to_guest_pages(
 /// region list would land part of the frame and leave the rest holding the
 /// previous one, which is the silent loss this crate's rules exist to stop.
 const MAX_GUEST_COPY_REGIONS: usize = 8192;
+
+/// How one frame gets from a resident image into the guest's stretches.
+///
+/// Two shapes, chosen by whether the guest's rows carry padding
+/// ([`GuestPageTarget::rows_are_dense`]), and they land byte-identical guest
+/// memory — the choice is a cost decision and never a visible one.
+enum GuestCopyPlan {
+    /// Straight from the image into guest RAM, as image-copy rectangles.
+    ///
+    /// The only form that can express "write these texels and not the padding
+    /// between their rows", which is why a padded window must take it.
+    Rectangles(Vec<(ash::vk::Buffer, Vec<ash::vk::BufferImageCopy>)>),
+    /// Detile the whole frame once into a device-local scratch, then scatter
+    /// it with plain byte ranges.
+    ///
+    /// # Why the extra hop is cheaper than the copy it removes
+    ///
+    /// The rectangle form makes the bus-crossing pass do two jobs at once:
+    /// detile an optimal-tiled image *and* write ~1500 part-row rectangles to
+    /// system memory, the largest of which is one 16 KiB stretch. Splitting
+    /// them lets each run at its own best shape — the detile is one rectangle
+    /// against device-local memory, and the crossing becomes ~507 linear reads
+    /// with no row or format semantics for the driver to interpret per region.
+    ///
+    /// The frame is written twice instead of once, but only one of those
+    /// writes crosses the bus, which is the one that was ever expensive on a
+    /// discrete host.
+    Linear {
+        scratch: ash::vk::Buffer,
+        /// The one rectangle that fills the scratch, tightly packed.
+        detile: ash::vk::BufferImageCopy,
+        /// One byte range per guest stretch, grouped by the buffer it lands in.
+        scatter: Vec<(ash::vk::Buffer, Vec<ash::vk::BufferCopy>)>,
+    },
+}
+
+impl GuestCopyPlan {
+    /// Copy regions this plan will submit, for the census.
+    ///
+    /// The detiling rectangle counts: it is a region the driver consumes, and
+    /// leaving it out would make the linear path's total read as exactly the
+    /// stretch count when it is one more than that.
+    fn regions(&self) -> u64 {
+        match self {
+            Self::Rectangles(groups) => groups.iter().map(|(_, r)| r.len() as u64).sum(),
+            Self::Linear { scatter, .. } => {
+                1 + scatter.iter().map(|(_, r)| r.len() as u64).sum::<u64>()
+            }
+        }
+    }
+}
+
+/// Bind every run and turn it into one byte range each, grouped by the buffer
+/// it lands in.
+///
+/// Only valid for a dense window: the caller has checked
+/// [`GuestPageTarget::rows_are_dense`], which is what makes window byte `o`
+/// and scratch byte `o` the same byte. Nothing in a `VkBufferCopy` carries row
+/// or format semantics, so that identity is the whole of the arithmetic here —
+/// which is why this planner has no geometry and no rectangles.
+///
+/// Grouped for the reason [`plan_guest_copies`] groups: two runs need not share
+/// an import, and one `vkCmdCopyBuffer` names exactly one destination buffer.
+unsafe fn plan_guest_linear_copies(
+    ctx: &context::DeviceContext,
+    pools: &mut pools::ResourcePools,
+    dst: &GuestPageTarget,
+) -> Result<Vec<(ash::vk::Buffer, Vec<ash::vk::BufferCopy>)>, DrawError> {
+    use host_ram::GuestWriteDecline;
+    // One region per run here, against up to three in the rectangle path, so
+    // the same ceiling binds later — but it is still checked, because the
+    // failure it prevents (a truncated list landing part of a frame) is
+    // identical in both.
+    if dst.runs.len() > MAX_GUEST_COPY_REGIONS {
+        return Err(DrawError::GuestPageWrite(
+            GuestWriteDecline::TooManyRegions {
+                limit: MAX_GUEST_COPY_REGIONS,
+                runs: dst.runs.len(),
+            },
+        ));
+    }
+    let mut grouped: Vec<(ash::vk::Buffer, Vec<ash::vk::BufferCopy>)> = Vec::new();
+    for run in &dst.runs {
+        let bound = unsafe { pools.bind_guest_ram(ctx, &run.guest) }
+            .map_err(|inner| DrawError::GuestPageWrite(GuestWriteDecline::Import { inner }))?;
+        let copy = ash::vk::BufferCopy::default()
+            // `head` is what the granularity rounding added in front of the
+            // byte the caller asked for, so the run's first requested byte
+            // sits here — the same re-basing the rectangle path does.
+            .dst_offset(bound.offset + bound.head)
+            .src_offset(run.window_offset)
+            // `requested` and not `bound_len`: the latter is rounded out to the
+            // import's granularity, and copying it would write guest bytes
+            // either side of the window that this frame was never given.
+            .size(run.guest.requested());
+        match grouped.iter_mut().find(|(b, _)| *b == bound.buffer) {
+            Some((_, copies)) => copies.push(copy),
+            None => grouped.push((bound.buffer, vec![copy])),
+        }
+    }
+    Ok(grouped)
+}
 
 /// Bind every run and turn it into copy rectangles, grouped by the buffer they
 /// land in.
@@ -1908,7 +2064,7 @@ unsafe fn copy_image_level0_to_buffer(
     pools: &mut pools::ResourcePools,
     counters: &counters::EngineCounters,
     snap: &ResidentReadSnapshot,
-    copies: &[(ash::vk::Buffer, Vec<ash::vk::BufferImageCopy>)],
+    plan: &GuestCopyPlan,
 ) -> Result<(), DrawError> {
     let submit_started = std::time::Instant::now();
     // Appended to a recording batch where there is one, for the reason
@@ -1982,15 +2138,53 @@ unsafe fn copy_image_level0_to_buffer(
     }
     // One call per buffer, all of them into the same command buffer, so the
     // whole frame is still one submission and one fence however many RAMBlocks
-    // it touched.
-    for (buffer, regions) in copies {
-        ctx.device.cmd_copy_image_to_buffer(
-            cb,
-            snap.image,
-            ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-            *buffer,
-            regions,
-        );
+    // it touched — and, on the linear plan, however many hops it takes.
+    match plan {
+        GuestCopyPlan::Rectangles(groups) => {
+            for (buffer, regions) in groups {
+                ctx.device.cmd_copy_image_to_buffer(
+                    cb,
+                    snap.image,
+                    ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    *buffer,
+                    regions,
+                );
+            }
+        }
+        GuestCopyPlan::Linear {
+            scratch,
+            detile,
+            scatter,
+        } => {
+            let one = [*detile];
+            ctx.device.cmd_copy_image_to_buffer(
+                cb,
+                snap.image,
+                ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                *scratch,
+                &one,
+            );
+            // The scatter reads what the detile just wrote, and both are
+            // transfer-stage work in one command buffer, where nothing orders
+            // them by itself. A global memory barrier rather than a buffer one
+            // because there is exactly one buffer in flight between the two
+            // and no other access to exclude.
+            let detiled = [ash::vk::MemoryBarrier::default()
+                .src_access_mask(ash::vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(ash::vk::AccessFlags::TRANSFER_READ)];
+            ctx.device.cmd_pipeline_barrier(
+                cb,
+                ash::vk::PipelineStageFlags::TRANSFER,
+                ash::vk::PipelineStageFlags::TRANSFER,
+                ash::vk::DependencyFlags::empty(),
+                &detiled,
+                &[],
+                &[],
+            );
+            for (buffer, regions) in scatter {
+                ctx.device.cmd_copy_buffer(cb, *scratch, *buffer, regions);
+            }
+        }
     }
     if let Some(probe) = ctx.timestamps.as_ref() {
         ctx.device.cmd_write_timestamp(
@@ -2574,6 +2768,76 @@ mod guest_page_target_tests {
             target(32, 4, 0).extent_end(),
             target(32, 4, 32).extent_end()
         );
+    }
+
+    /// The linear path is taken exactly when the window has no inter-row
+    /// padding, whichever way the guest spelt the pitch.
+    ///
+    /// A guest that understates the row length is the case to watch: the pitch
+    /// is `max(row_length, width)`, so such a window *is* dense, and the
+    /// detiling copy must therefore not pass `row_length_texels` through as
+    /// `bufferRowLength` — a value below `width` is invalid there. It passes
+    /// zero, which is Vulkan's own spelling of the tight packing this predicate
+    /// just established.
+    #[test]
+    fn a_window_is_dense_exactly_when_its_rows_carry_no_padding() {
+        assert!(target(64, 4, 64).rows_are_dense(), "pitch equal to width");
+        assert!(target(64, 4, 0).rows_are_dense(), "zero means tight");
+        assert!(
+            target(64, 4, 32).rows_are_dense(),
+            "an understated row length still yields a width pitch"
+        );
+        assert!(
+            !target(64, 4, 65).rows_are_dense(),
+            "one texel of padding per row is padding"
+        );
+    }
+
+    /// A dense window's texels fill it end to end, which is the identity the
+    /// linear path's arithmetic rests on: window byte `o` is scratch byte `o`
+    /// only if there is no byte in between that belongs to neither.
+    ///
+    /// Asserted as the relation `extent == pitch * height` rather than against
+    /// a literal, so it keeps holding whatever geometry a later reader adds.
+    #[test]
+    fn a_dense_window_is_exactly_its_rows_end_to_end() {
+        for (w, h) in [(64u32, 4u32), (1920, 1080), (1, 1)] {
+            let t = target(w, h, 0);
+            assert!(t.rows_are_dense());
+            assert_eq!(
+                t.extent_end(),
+                t.pitch_bytes() * u64::from(h),
+                "{w}x{h} leaves no gap between the last texel and the extent"
+            );
+        }
+        // The padded case is the contrast: its extent stops short of the last
+        // row's padding, so its bytes are *not* contiguous texels and a byte
+        // range over one would write bytes this frame was never given.
+        let padded = target(64, 4, 65);
+        assert!(padded.extent_end() < padded.pitch_bytes() * 4);
+    }
+
+    /// The census counts the detiling rectangle, because the driver consumes it
+    /// like any other region.
+    ///
+    /// Leaving it out would make a linear boot's `guest_write_regions` read as
+    /// exactly the stretch count, which is the number a reader would then
+    /// compare against `MAX_GUEST_COPY_REGIONS` — one short, every frame.
+    #[test]
+    fn the_region_census_counts_every_region_a_plan_submits() {
+        let null = ash::vk::Buffer::null();
+        let rects = GuestCopyPlan::Rectangles(vec![
+            (null, vec![ash::vk::BufferImageCopy::default(); 3]),
+            (null, vec![ash::vk::BufferImageCopy::default(); 2]),
+        ]);
+        assert_eq!(rects.regions(), 5, "every group's rectangles, summed");
+
+        let linear = GuestCopyPlan::Linear {
+            scratch: null,
+            detile: ash::vk::BufferImageCopy::default(),
+            scatter: vec![(null, vec![ash::vk::BufferCopy::default(); 507])],
+        };
+        assert_eq!(linear.regions(), 508, "507 stretches plus the detile");
     }
 }
 
