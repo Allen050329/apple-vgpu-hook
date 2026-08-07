@@ -27,9 +27,10 @@
 
 use foreign_types::{ForeignType, ForeignTypeRef};
 use metal::{
-    BlitCommandEncoderRef, Buffer, BufferRef, CommandBufferRef, CommandQueueRef,
+    ArgumentEncoder, BlitCommandEncoderRef, Buffer, BufferRef, CommandBufferRef, CommandQueueRef,
     ComputeCommandEncoderRef, ComputePipelineState, DeviceRef, FunctionRef,
-    IndirectCommandBufferRef, IndirectComputeCommandRef, IndirectRenderCommandRef, MTLDispatchType,
+    IndirectCommandBuffer, IndirectCommandBufferDescriptorRef, IndirectCommandBufferRef,
+    IndirectComputeCommandRef, IndirectRenderCommandRef, MTLDispatchType,
     MTLIndexType, MTLPixelFormat, MTLPrimitiveType, MTLRegion, MTLResourceOptions, MTLSize,
     MTLTextureType, NSInteger, NSRange, NSUInteger, RenderCommandEncoderRef,
     RenderPassDescriptorRef, RenderPipelineDescriptorRef, Texture, TextureDescriptorRef, TextureRef,
@@ -450,6 +451,39 @@ pub fn new_compute_command_encoder_with_dispatch_type(
         let ptr: *mut Object =
             msg_send![command_buffer, computeCommandEncoderWithDispatchType: dispatch_type];
         (!ptr.is_null()).then(|| ComputeCommandEncoderRef::from_ptr(ptr as *mut _))
+    }
+}
+
+/// `newIndirectCommandBufferWithDescriptor:maxCommandCount:options:`, with the
+/// nil an exhausted device returns.
+///
+/// This one is sized by the guest's own `maxCommandCount`, so its nil is
+/// squarely the out-of-memory case.
+pub fn new_indirect_command_buffer(
+    device: &DeviceRef,
+    descriptor: &IndirectCommandBufferDescriptorRef,
+    max_command_count: NSUInteger,
+    options: MTLResourceOptions,
+) -> Option<IndirectCommandBuffer> {
+    unsafe {
+        let ptr: *mut Object = msg_send![
+            device,
+            newIndirectCommandBufferWithDescriptor: descriptor
+            maxCommandCount: max_command_count
+            options: options
+        ];
+        (!ptr.is_null()).then(|| IndirectCommandBuffer::from_ptr(ptr as *mut _))
+    }
+}
+
+/// `[MTLFunction newArgumentEncoderWithBufferIndex:]`, with its nil.
+pub fn new_argument_encoder(
+    function: &FunctionRef,
+    buffer_index: NSUInteger,
+) -> Option<ArgumentEncoder> {
+    unsafe {
+        let ptr: *mut Object = msg_send![function, newArgumentEncoderWithBufferIndex: buffer_index];
+        (!ptr.is_null()).then(|| ArgumentEncoder::from_ptr(ptr as *mut _))
     }
 }
 

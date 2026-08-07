@@ -862,7 +862,13 @@ fn apply_icb_compute_encoder_inheritance<M: HostMemory + HostOps>(
             }
 
             // Encode argument buffer.
-            let arg_enc = function.new_argument_encoder(ab_layout.buffer_index);
+            let arg_enc = crate::backend::metal::raw_metal::new_argument_encoder(
+                &function,
+                ab_layout.buffer_index,
+            )
+            .ok_or(ComputeStatus::MetalFailed(
+                "compute_session_argument_encoder_unavailable",
+            ))?;
             let ab_len = arg_enc.encoded_length();
             if ab_len == 0 {
                 return Err(ComputeStatus::MetalFailed(

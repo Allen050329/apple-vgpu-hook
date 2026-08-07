@@ -1334,11 +1334,14 @@ pub fn materialize_metal_icb(
     }
 
     let options = MTLResourceOptions::from_bits_truncate(desc.options as u64);
-    let icb = device.new_indirect_command_buffer_with_descriptor(
+    let Some(icb) = crate::backend::metal::raw_metal::new_indirect_command_buffer(
+        device,
         &mtl_desc,
         desc.max_command_count as u64,
         options,
-    );
+    ) else {
+        return Err(IcbStatus::MetalFailed("icb_materialize_allocation_failed"));
+    };
     let _ = TYPE7_OBJECT_ICB;
     Ok(icb)
 }

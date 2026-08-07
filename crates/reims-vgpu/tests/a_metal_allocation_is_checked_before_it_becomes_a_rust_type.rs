@@ -69,6 +69,10 @@ const NIL_RETURNING: &[&str] = &[
     ".new_blit_command_encoder(",
     ".new_compute_command_encoder(",
     ".compute_command_encoder_with_dispatch_type(",
+    // Also `NonNull`-wrapped, and the first of these is sized by the guest's own
+    // `maxCommandCount`, so its nil is squarely the out-of-memory case.
+    ".new_indirect_command_buffer_with_descriptor(",
+    ".new_argument_encoder(",
 ];
 
 /// Files outside `src/backend/metal/` that also reach metal-0.33 directly.
@@ -79,6 +83,7 @@ const NIL_RETURNING: &[&str] = &[
 const EXTRA_SCANNED: &[&str] = &[
     "src/runtime/draw/metal_icb.rs",
     "src/runtime/compute_session.rs",
+    "src/runtime/icb/mod.rs",
 ];
 
 /// A call left unconverted, and why.
