@@ -1961,6 +1961,17 @@ pub fn render_core_mrt(
                 return Status::args("metal_render_visibility_result_mode_unsupported")
                     .field("mode", q.mode);
             };
+            // A **healthy-zero alarm**, not a guest-reachable refusal: no guest
+            // action takes this path. `runtime::exec`'s
+            // `SetVisibilityResultMode` arm builds a `VisibilityArming` only
+            // where the decoded mode is non-zero, so a query struct exists
+            // exactly where the stream armed one. A firing means that invariant
+            // stopped holding above this backend, and running the pass unarmed
+            // instead would report zero fragments visible for a draw nobody
+            // asked about — the one wrong answer occlusion culling acts on.
+            //
+            // So it is not a never-taken branch to delete: it is the thing that
+            // says the caller broke.
             if mode == MTLVisibilityResultMode::Disabled {
                 set_err(err, "visibility query armed with the disabling mode");
                 return Status::args("metal_render_visibility_result_mode_disabled");
