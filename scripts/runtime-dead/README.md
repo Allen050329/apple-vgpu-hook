@@ -370,3 +370,32 @@ function.
 
 The same caution retires the 26-versus-70 figure in the `--import-off` section
 above, and it is the reason that section diffs at file granularity.
+
+### What a healthy `--import-off` fail channel looks like
+
+Rank the fail channel of that boot and the top entry is alarming and fine. Filter
+the `OFF` records first (`grep -v '^OFF '`, per `AGENTS.md` — off-channel lines
+carry `reason=` too and invert the queue), and the first paired run gave:
+
+| count | reason | reading |
+|---|---|---|
+| 30 | `gpuwb_guest_ref_refused` | every one `via=guest_ram_map_no_backend_import`. The GPU writeback declined because no backend published a granularity and the CPU rail ran. `mapping_write`'s own doc predicts this exact line being ranked to the top and says why it restates the inner check |
+| 30 | `sync_exec_lock_hold` | 250 ms threshold, hit at 313–378 ms with 1–4 draws. A coverage-instrumented build with every guest window on the copying path is slow; treat as an artifact of this build, not a reading about the device |
+| 12 | `sampled_resident_reclaimed` | |
+| 8 | `lin_rung_blank_with_host_entry` | all `host_blank=1 backing=Same`, which the record's own legend defines as "the cache agrees and nothing was lost" over pages the entry still covers |
+
+**No lost guest work anywhere in it.** That is the point of writing it down: a
+reader who runs `--import-off` for the first time meets thirty records whose
+name says the host cannot import guest RAM, on a run where they turned that off
+themselves.
+
+Two counting traps live in these lines, both cheap to fall into:
+
+- `lin_rung_blank_with_host_entry` greps 13 times and is 8 records. Five are
+  `OFF store_routes` census lines carrying it as a *counter name*. Summed as
+  `AGENTS.md` requires — the samples are per window — the route fired 9 times
+  across 5 windows, busiest window 5, against 8 deduped fail lines.
+- `grep -c 'backing=Same'` returns 16 for those 8 records, because each record's
+  explanatory parenthetical contains the string `backing=Same` while defining
+  it. Match the field with its neighbour (`host_blank=[01] backing=`) or you are
+  counting the legend.
