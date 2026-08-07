@@ -665,11 +665,25 @@ pub enum GpuWritebackDecline {
     /// The page walk refused: these are no longer provably the mapping's pages.
     /// The copying rail refuses for the same reason and reports it.
     PagesNotOurs,
-    /// This host cannot reach the window's bytes as a GPU import. Either no
-    /// backend published an import granularity, or
-    /// [`crate::runtime::guest_ram_map`] refused these pages — and it names
-    /// which, so this variant does not restate a reason it does not know.
+    /// No backend published an import granularity, so this host cannot reach
+    /// guest RAM as a GPU import at all. A statement about the host, identical
+    /// for every mapping, and the state every copying rail exists for.
     NoGuestImport,
+    /// The host can import, but this window's pages did not become a reference.
+    /// Carries the check [`crate::runtime::guest_ram_map`] refused on.
+    ///
+    /// It carries it rather than pointing at it. That module reports each
+    /// distinct refusal **once per boot** — `report_once` latches on
+    /// `first_sight` — while this decline is reached once per flush, so a boot
+    /// where every 1080p writeback is refused prints twenty of these against a
+    /// single `guest_ram_map` line elsewhere in the log. Nothing relates the
+    /// two, and the reader's obvious move — ranking `reason=` on the fail
+    /// channel — puts the twenty at the top under a name that says the host
+    /// cannot import, on a host whose `vk_caps` says `supported`. Restating the
+    /// inner check is the cheaper error.
+    GuestRefRefused {
+        refusal: crate::runtime::guest_ram_map::MapRefusal,
+    },
     /// The engine declined or the copy failed; the inner error names which.
     Engine {
         inner: crate::backend::vulkan::engine::DrawError,
@@ -690,6 +704,7 @@ impl crate::observe::Decline for GpuWritebackDecline {
             Self::PageUnbacked { .. } => "gpuwb_page_unbacked",
             Self::PagesNotOurs => "gpuwb_pages_not_ours",
             Self::NoGuestImport => "gpuwb_no_guest_import",
+            Self::GuestRefRefused { .. } => "gpuwb_guest_ref_refused",
             // The engine's own slug, so a driver that refuses the pointer and a
             // resident in the wrong channel order stay as distinguishable here
             // as they are where they were decided.
@@ -700,6 +715,14 @@ impl crate::observe::Decline for GpuWritebackDecline {
     fn fields(&self) -> Vec<(&'static str, String)> {
         match self {
             Self::NotWritable | Self::PagesNotOurs | Self::NoGuestImport => Vec::new(),
+            // `via` before the inner fields, so the check that refused reads
+            // first and its own `pages=` / `first=` qualify it rather than
+            // looking like this rail's own numbers.
+            Self::GuestRefRefused { refusal } => {
+                let mut f = vec![("via", crate::observe::Decline::slug(refusal).to_string())];
+                f.extend(crate::observe::Decline::fields(refusal));
+                f
+            }
             Self::GeometryMoved {
                 latched_width,
                 latched_height,
@@ -943,15 +966,14 @@ pub fn write_bgra8_from_resident_gpu<M: HostMemory + HostOps>(
     // it would let the two rails land different guest memory for one frame.
     let pitch = u64::from(plan.row_length_texels.max(mw)) * 4;
     let extent = u64::from(mh.saturating_sub(1)) * pitch + u64::from(mw) * 4;
-    let Ok(guest) = crate::runtime::guest_ram_map::reference_for_pages(
+    let guest = crate::runtime::guest_ram_map::reference_for_pages(
         host,
         &gpas,
         page_size,
         plan.in_page,
         extent,
-    ) else {
-        return Err(GpuWritebackDecline::NoGuestImport);
-    };
+    )
+    .map_err(|refusal| GpuWritebackDecline::GuestRefRefused { refusal })?;
     let target = crate::backend::vulkan::engine::GuestPageTarget {
         guest,
         row_length_texels: plan.row_length_texels,

@@ -185,6 +185,77 @@ fn a_geometry_the_copy_cannot_express_declines_by_name() {
     );
 }
 
+/// "This host cannot import" and "these pages would not resolve" are different
+/// findings and must not share a name.
+///
+/// They did. Both `granularity()` returning `None` and any refusal from
+/// `guest_ram_map::reference_for_pages` returned `NoGuestImport`, so a driven
+/// x86 boot printed twenty `gpuwb_no_guest_import` lines — one per 1080p
+/// mapping — on a host whose `vk_caps` said `host_pointer_import=supported`.
+/// The real cause was `Scattered`, reported by `guest_ram_map` exactly once for
+/// the whole boot because `report_once` latches on `first_sight`. Ranking the
+/// fail channel by `reason=`, which is the documented way to read that log, put
+/// the twenty at the top under a name that contradicted the capability line and
+/// pointed at the host instead of at the page list.
+///
+/// So the inner check travels on every record. The two `assert_ne!`s are the
+/// regression: a future edit that folds these back together fails here rather
+/// than in six months on a boot nobody is reading closely.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn a_refused_page_list_does_not_report_itself_as_a_host_without_the_import() {
+    use crate::observe::Decline;
+    use crate::runtime::guest_ram_map::MapRefusal;
+
+    let scattered = GpuWritebackDecline::GuestRefRefused {
+        refusal: MapRefusal::Scattered {
+            pages: 32,
+            first: 0x39bb_6a000,
+        },
+    };
+    assert_ne!(
+        scattered.slug(),
+        GpuWritebackDecline::NoGuestImport.slug(),
+        "a refused page list must not read as a host that cannot import"
+    );
+
+    // The check that refused, and its own numbers, on this record rather than
+    // on one line elsewhere in the log.
+    let fields = scattered.fields();
+    assert_eq!(
+        fields
+            .iter()
+            .find(|(k, _)| *k == "via")
+            .map(|(_, v)| v.as_str()),
+        Some("guest_ram_map_scattered")
+    );
+    assert_eq!(
+        fields
+            .iter()
+            .find(|(k, _)| *k == "pages")
+            .map(|(_, v)| v.as_str()),
+        Some("32")
+    );
+
+    // The host-wide statement keeps its own name and stays fieldless: it is
+    // identical for every mapping, so there is nothing per-record to carry.
+    assert_eq!(
+        GpuWritebackDecline::NoGuestImport.slug(),
+        "gpuwb_no_guest_import"
+    );
+    assert!(GpuWritebackDecline::NoGuestImport.fields().is_empty());
+
+    // A different inner check must reach the log differently, or carrying it
+    // buys nothing.
+    let not_in_import = GpuWritebackDecline::GuestRefRefused {
+        refusal: MapRefusal::GpaNotInAnyImport { gpa: 0x1000 },
+    };
+    assert_ne!(
+        not_in_import.fields().iter().find(|(k, _)| *k == "via"),
+        scattered.fields().iter().find(|(k, _)| *k == "via")
+    );
+}
+
 /// The gap walk is what both writeback paths subtract their skipped ranges
 /// with, so it is tested on its own: an off-by-one here is a row of pixels
 /// written into a page the guest owns, or a row of the guest's own bytes
