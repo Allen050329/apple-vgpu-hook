@@ -911,7 +911,7 @@ pub fn write_bgra8_from_resident_gpu<M: HostMemory + HostOps>(
     // list is read: this can invalidate the mapping — that is exactly what its
     // own drift check does — and every value taken after it is taken against
     // whatever it left behind.
-    crate::runtime::storage_flush::flush_intersecting(state, host, mapping_id, base_off, span_end);
+    crate::runtime::render_writeback::settle_guest_writes();
     // Nothing below can land a frame on a host whose GPU cannot import guest
     // RAM, so the walks below are skipped rather than run and discarded. Asked
     // *after* `flush_intersecting` and not before it: that call is a side effect
@@ -1016,51 +1016,6 @@ pub fn write_bgra8_from_resident_gpu<M: HostMemory + HostOps>(
     Ok(span_end - base_off)
 }
 
-/// Land every deferred window overlapping the sample window a BGRA8 writeback
-/// of this mapping would cover.
-///
-/// The same flush [`write_bgra8_uncached`] and its siblings make on their own
-/// behalf, exposed so a caller can make it *before* it acquires the bytes it
-/// intends to write.
-///
-/// `write_bgra8_uncached`'s frame is borrowed from the engine's readback buffer
-/// under a lease, and a lease holder must not re-enter the engine: a teardown
-/// waiting for that lease to come back holds the engine lock, so a holder that
-/// asks for it stalls until the teardown's quiesce budget expires and then
-/// reads freed memory. A deferred flush reached from inside the write is
-/// exactly such a re-entry — `flush_render_one` reads a resident. Running the
-/// flush first leaves the writer's own call nothing to find, because nothing
-/// between the two arms a window: only a guest Store does, and no guest command
-/// is decoded inside a writeback.
-///
-/// Answers false for a geometry that has no sample window, which is the same
-/// geometry the writeback itself would refuse.
-pub fn flush_windows_under_bgra8_write<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
-    host: &mut M,
-    mapping_id: u32,
-    width: u32,
-    height: u32,
-) -> bool {
-    // Ahead of both early returns below, and not only ahead of the
-    // `flush_intersecting` that would settle it anyway. A CPU write is about to
-    // land in these pages, and the writeback rail's own copy is submitted rather
-    // than waited — so a copy still executing would overwrite what this caller
-    // is about to write. That is true whether or not this mapping still has a
-    // geometry to compute a window from, which is exactly what the two early
-    // returns give up on.
-    #[cfg(feature = "backend-vulkan")]
-    crate::backend::vulkan::engine::quiesce_guest_writes();
-    let Some(m) = state.mappings.get(&mapping_id) else {
-        return false;
-    };
-    let (mw, mh, format) = mapping_write_geometry(m, width, height);
-    let Some((base_off, _, span_end)) = type11_sample_window(m, mw, mh, format) else {
-        return false;
-    };
-    crate::runtime::storage_flush::flush_intersecting(state, host, mapping_id, base_off, span_end);
-    true
-}
 
 /// The geometry and pixel format a writeback to this mapping must land in.
 ///
@@ -1150,7 +1105,7 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
     };
     // Deferred-writeback flush-on-access: land pending resident content in
     // these pages before touching them.
-    crate::runtime::storage_flush::flush_intersecting(state, host, mapping_id, base_off, span_end);
+    crate::runtime::render_writeback::settle_guest_writes();
     // Taken after the flush, because the flush can invalidate this mapping, and
     // once for the whole frame, because the loop below writes a row at a time.
     let Some(vouched) = vouch_for_write(state, host, mapping_id, "bgra8") else {
@@ -1579,7 +1534,7 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
     // contiguous, and landing after puts an older frame on top of this one —
     // which `mapper::write_mapping_bytes_only` states as its own reason for
     // flushing here.
-    crate::runtime::storage_flush::flush_intersecting(state, host, mapping_id, base_off, span_end);
+    crate::runtime::render_writeback::settle_guest_writes();
     // One proof for the whole image: the changed-span loop below writes each
     // differing row separately, and the walk is a translation per page.
     let Some(vouched) = vouch_for_write(state, host, mapping_id, "rgba8_changed") else {
@@ -1776,7 +1731,7 @@ pub fn write_raw_rows<M: HostMemory + HostOps>(
     }
     // Deferred-writeback flush-on-access (coarse: whole mapping — this entry
     // resolves its window only later and is off the hot compute path).
-    crate::runtime::storage_flush::flush_intersecting(state, host, mapping_id, 0, u64::MAX);
+    crate::runtime::render_writeback::settle_guest_writes();
     let Some(m) = state.mappings.get(&mapping_id) else {
         return refuse(mapping_id, SurfaceWriteRefusal::MappingAbsent);
     };
@@ -1858,7 +1813,7 @@ pub fn read_raw_rows<M: HostMemory + HostOps>(
     }
     // Deferred-writeback flush-on-access (coarse: whole mapping — this entry
     // resolves its window only later and is off the hot compute path).
-    crate::runtime::storage_flush::flush_intersecting(state, host, mapping_id, 0, u64::MAX);
+    crate::runtime::render_writeback::settle_guest_writes();
     let Some(m) = state.mappings.get(&mapping_id) else {
         return false;
     };
@@ -2032,7 +1987,7 @@ pub fn read_rect_raw_at<M: HostMemory + HostOps>(
     // `flush_intersecting` returns immediately when nothing is armed, so this
     // costs a map-empty check per read. It must also precede `contig_for_span`:
     // the flush writes through the mapping and can retire the cached view.
-    crate::runtime::storage_flush::flush_intersecting(state, host, mapping_id, base_off, span_end);
+    crate::runtime::render_writeback::settle_guest_writes();
     let Some(m) = state.mappings.get(&mapping_id) else {
         return false;
     };
@@ -2340,7 +2295,7 @@ fn write_rect_raw_at_impl<M: HostMemory + HostOps>(
     // surfaces only. Safe to call from inside a flush — the storage rail reaches
     // this function through `write_full_rect_raw_at`, and `flush_intersecting`
     // removes intersecting windows up front so the nested call finds nothing.
-    crate::runtime::storage_flush::flush_intersecting(state, host, mapping_id, base_off, span_end);
+    crate::runtime::render_writeback::settle_guest_writes();
     let Some(vouched) = vouch_for_write(state, host, mapping_id, "rect_raw") else {
         return false;
     };

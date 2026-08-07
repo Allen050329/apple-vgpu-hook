@@ -53,10 +53,6 @@ enum ComputeImageDst {
     /// bytes crossed device→host. It is gone with the import: a buffer the GPU
     /// can write, backed by guest pages, is the exposure this removal is about.
     Readback(BufferSlot),
-    /// No post-dispatch copy at all: the pinned resident storage image stays
-    /// the authoritative content until the caller flushes it to guest pages
-    /// (`read_resident_storage`). Requires a residency identity.
-    Deferred,
 }
 
 pub(crate) fn validate_compute(req: &ComputeRequest) -> Result<(), DrawError> {
@@ -435,17 +431,13 @@ pub(crate) unsafe fn execute_compute_inner(
             counters.note_compute_storage_seed_upload(resource.bytes.len() as u64);
             Some(staging)
         };
-        let dst = if resource.defer_readback && resource.residency.is_some() {
-            ComputeImageDst::Deferred
-        } else {
-            // The dispatch's output crosses device→host and the runtime writes
-            // the guest pages, so it lands in a readback buffer here.
-            ComputeImageDst::Readback(pools.acquire_readback_extra(
-                ctx,
-                resource.bytes.len() as u64,
-                counters,
-            )?)
-        };
+        // The dispatch's output crosses device→host and the runtime writes the
+        // guest pages, so it lands in a readback buffer.
+        let dst = ComputeImageDst::Readback(pools.acquire_readback_extra(
+            ctx,
+            resource.bytes.len() as u64,
+            counters,
+        )?);
         simg_slots.push(PreparedStorageImage {
             binding: resource.binding,
             slot: img,
@@ -848,10 +840,6 @@ pub(crate) unsafe fn execute_compute_inner(
         );
         let dst_buffer = match &prepared.dst {
             ComputeImageDst::Readback(slot) => slot.buffer,
-            // Deferred: no copy at all — the barrier above still lands the
-            // image in TRANSFER_SRC_OPTIMAL, matching the layout the registry
-            // records post-fence (mark_resident_storage_image).
-            ComputeImageDst::Deferred => continue,
         };
         // The pooled readback is always tightly packed from texel zero. The
         // offset and row length were the imported window's, and it had a
@@ -925,10 +913,8 @@ pub(crate) unsafe fn execute_compute_inner(
     // (read_resident_storage) waits it before copying, and the owed
     // descriptor-set/pool cleanup is stashed until a later wait proves the CB
     // retired (drain_pending_compute_cleanup).
-    let all_writeback_deferred = storage_slots.iter().all(|(_, _, _, writable)| !writable)
-        && simg_slots
-            .iter()
-            .all(|p| matches!(p.dst, ComputeImageDst::Deferred));
+    let all_writeback_deferred =
+        storage_slots.iter().all(|(_, _, _, writable)| !writable) && simg_slots.is_empty();
     // Park the owed cleanup (descriptor set + transient pool slots) on this
     // ring slot in every mode; whichever entry retires the slot drains it. A
     // failed wait below leaves the slot pending, so no path ever reuses an
@@ -979,22 +965,8 @@ pub(crate) unsafe fn execute_compute_inner(
         });
     }
     let mut images = Vec::with_capacity(simg_slots.len());
-    let mut images_deferred = Vec::with_capacity(simg_slots.len());
     for prepared in &simg_slots {
-        let readback = match &prepared.dst {
-            ComputeImageDst::Deferred => {
-                // The pinned resident stays authoritative; the caller flushes
-                // it to guest pages on access (read_resident_storage).
-                if let Some(residency) = prepared.residency {
-                    pools.pin_resident_storage(&residency.identity, true);
-                }
-                counters.note_compute_deferred_writeback(prepared.len as u64);
-                images.push(Vec::new());
-                images_deferred.push(true);
-                continue;
-            }
-            ComputeImageDst::Readback(slot) => slot,
-        };
+        let ComputeImageDst::Readback(readback) = &prepared.dst;
         let out = crate::backend::vulkan::engine::pools::read_back_slot(
             ctx,
             readback,
@@ -1004,7 +976,6 @@ pub(crate) unsafe fn execute_compute_inner(
         )?;
         counters.note_readback(prepared.len as u64);
         images.push(out);
-        images_deferred.push(false);
     }
 
     // Cleanup was parked on the ring slot right after submit; nothing left
@@ -1017,7 +988,6 @@ pub(crate) unsafe fn execute_compute_inner(
     Ok(ComputeOutput {
         buffers,
         images,
-        images_deferred,
     })
 }
 
@@ -1171,7 +1141,6 @@ mod tests {
                 bytes: vec![0; 4],
                 residency: None,
                 seed_skipped: false,
-                defer_readback: false,
             }],
             ..Default::default()
         };

@@ -1175,9 +1175,8 @@ pub fn write_stamp<H: HostMemory + HostOps>(
     // the render targets and its allocator may hand those pages to anything, and
     // no later check can tell that memory apart from the target it used to be —
     // which is why the page-set guard passed on 810 of 810 landings and the heap
-    // corruption continued. See `storage_flush::flush_all_windows_before_fence`,
-    // which the root completion stamp in `drain_main_fifo` shares.
-    crate::runtime::storage_flush::flush_all_windows_before_fence(state, host);
+    // corruption continued.
+    crate::runtime::render_writeback::settle_guest_writes();
     // The stamp word ordered behind the copies by the GPU rather than by this
     // thread blocking. Tried before either quiesce because when it takes,
     // neither is owed: its leading barrier names every command submitted before
@@ -1890,7 +1889,7 @@ pub fn drain_main_fifo<H: HostMemory + HostOps>(state: &mut DeviceState, host: &
                         // The root stamp is a completion the guest waits on, so
                         // every deferred rail owes guest RAM its bytes here, not
                         // only at `write_stamp`'s child slots.
-                        crate::runtime::storage_flush::flush_all_windows_before_fence(state, host);
+    crate::runtime::render_writeback::settle_guest_writes();
                         // Root slot 0 stays on the blocking rail, and the
                         // measurement is the reason rather than caution. Routing
                         // it through the GPU rail as well was booted and scored
@@ -3124,38 +3123,6 @@ fn process_child_packet<H: HostMemory + HostOps>(
                 // gone; on Map the PFNs are fresh and the map-notify guest
                 // flush is forbidden (PTE-corruption class). The encode cache
                 // preserves the content for samples (wallpaper-retain).
-                if gva != 0 && length != 0 && !state.gva_deferred_flush.is_empty() {
-                    let hi = gva.saturating_add(length);
-                    let overlapped: Vec<u64> = state
-                        .gva_deferred_flush
-                        .iter()
-                        .filter(|(&wgva, e)| {
-                            // This task's windows only. A GVA means nothing
-                            // outside the address space that named it, so the
-                            // overlap test is an overlap only once the task
-                            // matches — and both sides are slot ids
-                            // (`task_slot::resolve_task_word` on one, the
-                            // unshifted `MapMemory2`/`UnmapMemory` word on the
-                            // other). The `>> 1` arms this replaces also matched
-                            // slots `task_id / 2`, `2 * task_id` and
-                            // `2 * task_id + 1`: live, unrelated tasks whose
-                            // pending frames were then landed cache-only and so
-                            // never reached guest RAM.
-                            e.task_id == task_id && wgva < hi && gva < wgva.saturating_add(e.span())
-                        })
-                        .map(|(&wgva, _)| wgva)
-                        .collect();
-                    for wgva in overlapped {
-                        let trigger = if packet.opcode == CHILD_OP_UNMAP_MEMORY {
-                            "unmap"
-                        } else {
-                            "remap"
-                        };
-                        crate::runtime::storage_flush::flush_gva_exact(
-                            state, host, wgva, false, trigger,
-                        );
-                    }
-                }
                 // There is deliberately no host_cache→guest GVA flush on
                 // MapMemory2. One existed and was disabled after
                 // serial-20260714-035023: PTE Corruption (freelist-shaped
@@ -3185,14 +3152,12 @@ fn process_child_packet<H: HostMemory + HostOps>(
                 // (fingerprint compare in mapper::resolve). A second delete
                 // with no resolve between is genuinely dead: tear down fully.
                 let mode = if state.mapping_backing_condemned(object_id) {
-                    crate::runtime::storage_flush::drop_windows(state, object_id, "delete_backing");
                     let _ = state.unmap_surface(object_id);
                     "dead"
                 } else if state.condemn_surface_backing(object_id) {
                     "condemn"
                 } else {
                     // No resolved pages ⇒ nothing a stale delete could hurt.
-                    crate::runtime::storage_flush::drop_windows(state, object_id, "delete_backing");
                     let _ = state.unmap_surface(object_id);
                     "unmapped"
                 };
@@ -3219,7 +3184,6 @@ fn process_child_packet<H: HostMemory + HostOps>(
                     Ok(cmd) => {
                         let mut bumped = 0u32;
                         let mut miss = 0u32;
-                        let mut windows_dropped = 0u32;
                         for rec in &cmd.records {
                             let outcome = apply(
                                 state,
@@ -3229,8 +3193,6 @@ fn process_child_packet<H: HostMemory + HostOps>(
                                 ValiditySite::InvalidateResources,
                             );
                             bumped = bumped.saturating_add(outcome.bumped);
-                            windows_dropped =
-                                windows_dropped.saturating_add(outcome.windows_dropped);
                             if outcome.missed {
                                 miss = miss.saturating_add(1);
                             }
@@ -3255,7 +3217,7 @@ fn process_child_packet<H: HostMemory + HostOps>(
                         // on a healthy boot.
                         if crate::observe::draw_log_enabled() {
                             crate::observe::line(format!(
-                            "map_family op=InvalidateResources opcode={:#x} ch={channel_id} plen={plen} task={} count={} oid={oid:#x} flags={flags:#x} clr_h={} set_h={} clr_g={} set_g={} pageon={pageon} bumped={bumped} miss={miss} windows_dropped={windows_dropped}",
+                            "map_family op=InvalidateResources opcode={:#x} ch={channel_id} plen={plen} task={} count={} oid={oid:#x} flags={flags:#x} clr_h={} set_h={} clr_g={} set_g={} pageon={pageon} bumped={bumped} miss={miss}",
                             packet.opcode,
                             cmd.task_id,
                             cmd.count,
@@ -3309,21 +3271,12 @@ fn process_child_packet<H: HostMemory + HostOps>(
                         // (render/compute/linear-alias) into guest pages first
                         // — the only host-visible choke point for guest CPU
                         // reads (boot-25 black-wallpaper class).
-                        let mut flushed = 0u32;
-                        let mut flush_ok = true;
-                        for &oid in &cmd.object_ids {
-                            let (ok, n) =
-                                crate::runtime::storage_flush::flush_mapping_for_guest_read(
-                                    state, host, oid,
-                                );
-                            flush_ok &= ok;
-                            flushed = flushed.saturating_add(n);
-                            // The declaration itself is the read witness: the
-                            // guest CPU load that follows leaves no trace the
-                            // device can see, so a flush landed for a declared
-                            // read must not be scored as unread.
-                            crate::runtime::storage_flush::note_render_flush_pages_read(state, oid);
-                        }
+                        // The guest is about to CPU-read these mappings, so
+                        // every guest-page write this device submitted has to
+                        // have executed first.
+                        crate::runtime::render_writeback::settle_guest_writes();
+                        let flushed = 0u32;
+                        let flush_ok = true;
                         let oid = cmd.object_ids.first().copied().unwrap_or(0);
                         // Count into the always-on teardown-churn proxy; the
                         // per-event census floods to ~49k/session under a
@@ -3699,7 +3652,6 @@ pub fn drain_iosfc<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut 
                     // Deferred-writeback: DROP, never write — same recycled-page
                     // hazard as DeleteIOSurfaceBacking2 (the unmap request
                     // trails the guest release; writing risks PTE corruption).
-                    crate::runtime::storage_flush::drop_windows(state, mapping_id, "mapper_unmap");
                     if let Some(c) = cap {
                         if c.request_type == MAPPER_REQUEST_UNMAP {
                             let _ = crate::runtime::mapper::apply_capture(state, &c, mapping_id);
@@ -4606,11 +4558,8 @@ pub fn drain_pending<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mu
     // so nothing aliases them anymore).
     crate::runtime::mapper::flush_retired_views(state, host);
     // Unpin engine residents of linear cache entries dropped by task/object
-    // deletes this drain (they become LRU-evictable instead of leaking).
-    crate::runtime::storage_flush::retire_linear_residents(state);
-    // Land GVA render-Store windows whose task died this drain (cache-only —
-    // the GVA walk went with the task) and unpin their residents.
-    crate::runtime::storage_flush::retire_gva_windows(state, host);
+    // deletes this drain, so they become LRU-evictable instead of leaking.
+    crate::runtime::render_writeback::retire_linear_residents(state);
 }
 
 #[cfg(test)]

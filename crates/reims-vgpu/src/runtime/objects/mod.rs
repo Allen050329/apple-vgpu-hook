@@ -1886,7 +1886,6 @@ pub fn replace_physical<H: HostMemory + crate::runtime::host::HostOps>(
     // so taking it here changes no outcome — it changes whether the loss has a
     // name. `drop_windows` reports each one against this packet instead of
     // letting it disappear into a generation mismatch nothing attributes.
-    crate::runtime::storage_flush::drop_windows(state, target, "replace_physical");
     let had = state.invalidate_mapping_pages(target);
     crate::runtime::drain::note_store_route(if had {
         "replace_physical_dropped"

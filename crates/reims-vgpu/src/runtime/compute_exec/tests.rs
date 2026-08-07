@@ -68,21 +68,6 @@ fn compute_spirv_declines_are_distinct_and_log_safe() {
     }
 }
 
-#[cfg(feature = "backend-vulkan")]
-#[test]
-fn compute_defer_readback_follows_gpu_only_content_gate() {
-    assert!(
-        compute_defer_readback_allowed(true, true, true),
-        "native Vulkan keeps the deferred storage-writeback rail"
-    );
-    assert!(
-        !compute_defer_readback_allowed(false, true, true),
-        "portability-subset storage output must write guest pages synchronously"
-    );
-    assert!(!compute_defer_readback_allowed(true, false, true));
-    assert!(!compute_defer_readback_allowed(true, true, false));
-}
-
 /// A type-5 view names its IOSurface plane on the wire (record `+0x20`, the
 /// `newTextureWithDescriptor:iosurface:plane:` argument). When two planes share
 /// geometry and bytes-per-element the geometry scan cannot separate them and

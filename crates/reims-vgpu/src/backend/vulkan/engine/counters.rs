@@ -734,12 +734,6 @@ impl EngineCounters {
             .fetch_add(bytes, Ordering::Relaxed);
     }
 
-    pub fn note_compute_deferred_writeback(&self, bytes: u64) {
-        self.compute_deferred_writebacks
-            .fetch_add(1, Ordering::Relaxed);
-        self.compute_deferred_writeback_bytes
-            .fetch_add(bytes, Ordering::Relaxed);
-    }
 
     pub fn note_compute_deferred_flush(&self, bytes: u64) {
         self.compute_deferred_flushes

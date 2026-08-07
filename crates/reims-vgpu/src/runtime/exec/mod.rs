@@ -3871,7 +3871,6 @@ fn apply_clear<M: HostMemory + HostOps>(
     let h = c0.height;
     let rgba = solid_rgba8(w, h, &att.clear_color);
     if c0.target_gva != 0 {
-        draw::supersede_gva_window(state, host, c0.target_gva, w, h, "clear_store");
         return draw::write_gva_rgba8(
             state,
             host,

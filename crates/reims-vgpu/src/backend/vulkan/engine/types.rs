@@ -1158,18 +1158,12 @@ pub struct ComputeOutput {
     /// device→host boundary after dispatch.
     pub buffers: Vec<ComputeBufferOutput>,
     /// Image readbacks in request order (same length as `storage_images`).
-    /// Empty only for a deferred image (see `images_deferred`).
     ///
     /// A third case used to leave this empty too: the dispatch copied into an
     /// imported view of the caller's guest window and `images_direct` said so,
     /// so the caller skipped its own writeback. That window is gone, and with
     /// it the flag — every non-deferred image now comes back through here.
     pub images: Vec<Vec<u8>>,
-    /// Per image (request order): true when the readback was deferred — the
-    /// pinned resident storage image is authoritative, no bytes crossed the
-    /// device→host boundary, and the caller owns flushing it to guest pages
-    /// before any host-side access of that window (`read_resident_storage`).
-    pub images_deferred: Vec<bool>,
 }
 
 #[derive(Debug)]
@@ -1207,14 +1201,6 @@ pub struct ComputeStorageImageResource {
     /// visibly (never seed the zero placeholder) if the resident image is
     /// gone by acquire time.
     pub seed_skipped: bool,
-    /// Deferred writeback: skip the post-dispatch GPU→host readback entirely —
-    /// the resident storage image (requires `residency`) stays the
-    /// authoritative copy, pinned against LRU eviction until the caller
-    /// flushes it to guest pages via [`read_resident_storage`]
-    /// (`crate::backend::vulkan::engine::read_resident_storage`). The matching
-    /// `ComputeOutput::images` entry stays empty with `images_deferred` true.
-    /// Ignored (conservative readback) when `residency` is `None`.
-    pub defer_readback: bool,
 }
 
 /// Bind request for a sampled input whose window content the engine already

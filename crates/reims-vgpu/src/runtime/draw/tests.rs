@@ -1498,75 +1498,7 @@ fn attachment_alias_resident_chain_selection() {
     ));
 }
 
-/// A sampled bind takes the deferred window's resident target only for
-/// the exact window content: same geometry and an owner gate the
-/// post-flush cache layer would also pass. Mismatches must flush.
-#[cfg(feature = "backend-vulkan")]
-#[test]
-fn deferred_gva_sample_eligibility_rules() {
-    let win = crate::model::GvaDeferredEntry {
-        task_id: 1,
-        texture_ref: 7,
-        producer_object_type: 2,
-        width: 32,
-        height: 16,
-        row_stride: 128,
-        format: MTL_FORMAT_BGRA8_UNORM,
-        armed_seq: 0,
-        armed_stamp_seq: 0,
-        pages: Default::default(),
-        alloc_gen: 0,
-    };
-    assert!(
-        deferred_gva_sample_eligible(&win, 32, 16, 2),
-        "exact geometry + same object type binds the resident"
-    );
-    assert!(
-        deferred_gva_sample_eligible(&win, 32, 16, 0),
-        "unknown sampler type retains the cache-layer owner behavior"
-    );
-    assert!(
-        !deferred_gva_sample_eligible(&win, 16, 16, 2),
-        "geometry mismatch must land the window instead"
-    );
-    assert!(
-        !deferred_gva_sample_eligible(&win, 32, 8, 2),
-        "height mismatch must land the window instead"
-    );
-    assert!(
-        deferred_gva_sample_eligible(&win, 32, 16, OBJECT_TYPE_TEXTURE_VARIANT),
-        "type-2/type-3 wrappers share linear texture storage"
-    );
-    assert!(
-        !deferred_gva_sample_eligible(&win, 32, 16, OBJECT_TYPE_TEXTURE_VIEW),
-        "unrelated object-type transitions must land the window instead"
-    );
-}
 
-#[cfg(feature = "backend-vulkan")]
-#[test]
-fn gva_cache_owner_object_type_transitions_are_named() {
-    assert!(gva_cache_owner_allows_object_type(
-        0,
-        OBJECT_TYPE_TEXTURE_VARIANT
-    ));
-    assert!(gva_cache_owner_allows_object_type(
-        OBJECT_TYPE_TEXTURE,
-        OBJECT_TYPE_TEXTURE
-    ));
-    assert!(gva_cache_owner_allows_object_type(
-        OBJECT_TYPE_TEXTURE,
-        OBJECT_TYPE_TEXTURE_VARIANT
-    ));
-    assert!(gva_cache_owner_allows_object_type(
-        OBJECT_TYPE_TEXTURE_VARIANT,
-        OBJECT_TYPE_TEXTURE
-    ));
-    assert!(!gva_cache_owner_allows_object_type(
-        OBJECT_TYPE_TEXTURE,
-        OBJECT_TYPE_TEXTURE_VIEW
-    ));
-}
 
 /// Vulkan-arm only: `AttachmentAliasSample` and its resolver are
 /// `backend-vulkan` items.

@@ -84,6 +84,8 @@ pub mod plan;
 /// The resident identity a type-11 guest surface renders into.
 #[cfg(feature = "backend-vulkan")]
 pub mod present_identity;
+/// Land a render Store's frame in the guest's pages, at the Store.
+pub mod render_writeback;
 /// The guest's per-resource validity quad, from both of its producers.
 pub mod resource_validity;
 /// The split of [`chain_phase`]'s largest *undivided* column, `sampled_us`.
@@ -95,9 +97,6 @@ pub mod spirv_bind;
 mod spirv_layout;
 /// How wide a translated vertex shader's stage-in reads are, per `Location`.
 pub mod spirv_vertex_input;
-/// Bounded structural evaluation of vertex clip positions (coverage proof).
-/// Deferred compute-writeback flush (flush-on-access; resident authoritative).
-pub mod storage_flush;
 /// Host surface cache (Linux/Vulkan discrete-GPU present, kb §8.5).
 pub mod surface_cache;
 /// The wire task word a command payload carries → a live task slot.

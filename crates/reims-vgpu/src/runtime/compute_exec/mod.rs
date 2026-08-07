@@ -1327,20 +1327,6 @@ struct ComputeStorageResidencyCandidate {
     seed_generation: u32,
 }
 
-/// Deferred-readback policy for a compute storage output. Deferring keeps the
-/// dispatch result GPU-resident-only (guest pages stale until a flush choke
-/// point), which is only a safe authority when the device grants
-/// `deferred_gpu_only_content` — portability-subset (MoltenVK) devices must
-/// write guest pages synchronously instead.
-#[cfg(feature = "backend-vulkan")]
-fn compute_defer_readback_allowed(
-    deferred_gpu_only_content: bool,
-    has_residency: bool,
-    writeback_deferrable: bool,
-) -> bool {
-    deferred_gpu_only_content && has_residency && writeback_deferrable
-}
-
 /// Bound on mirror entries per mapping: a ping-pong canvas needs 2, planar
 /// layouts a few more; anything beyond is assumed to be stale-key debris.
 ///
@@ -2364,7 +2350,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             reason = "the Vulkan resident-window block below assigns it"
         )
     )]
-    let mut have_bytes = false;
+    let have_bytes = false;
     // Resident-authoritative window (deferred linear writeback): consume the
     // engine resident without bytes when possible; otherwise flush it into the
     // entry first — falling through to the raw guest read would silently serve
@@ -2396,35 +2382,6 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             stage_format
         ));
     }
-    #[cfg(feature = "backend-vulkan")]
-    if let Some((key, resident_gen, None)) = resident {
-        // A bytes consumer (format-mismatched view, non-vulkan reuse):
-        // land the resident into the cache entry (and any owed guest
-        // write) through the one flush path, then serve the bytes.
-        if crate::runtime::storage_flush::flush_linear_one(state, host, &key, resident_gen) {
-            if let Some(cached) = crate::runtime::surface_cache::get_linear_texture(state, &window)
-            {
-                bytes.copy_from_slice(cached);
-                have_bytes = true;
-                crate::observe::off(format!(
-                        "compute_linear_flush task={task_id} ref={texture_ref} gva={gva:#x} fmt={:#x} dims={w}x{h} gen={resident_gen}",
-                        stage_format
-                    ));
-            }
-        }
-        if !have_bytes {
-            // Deferred content is unrecoverable — name the loss, clear
-            // the marker, and fall back to the coherent stale seed.
-            // (flush_linear_one already fail-logged the engine loss.)
-            crate::observe::fail(format!(
-                    "compute_stage_tex linear_resident_lost task={task_id} ref={texture_ref} gva={gva:#x} fmt={:#x} dims={w}x{h} gen={resident_gen}",
-                    stage_format
-                ));
-            if let Some(e) = state.host_linear_textures.get_mut(&(task_id, stage_ref)) {
-                e.resident_gen = 0;
-            }
-        }
-    }
     if serve.is_some() || have_bytes {
         // Engine resident serves this window; no cache/guest read.
     } else if let Some(cached) = crate::runtime::surface_cache::get_linear_texture(state, &window) {
@@ -2434,16 +2391,9 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             stage_format, layout.row_stride
         ));
     } else {
-        // Deferred-writeback flush-on-access: the bulk/row reads below walk
-        // raw task GVAs and bypass the mapping-keyed hooks — land any
-        // resident-authoritative window aliasing the sampled span first.
-        crate::runtime::storage_flush::flush_intersecting_task_gva(
-            state,
-            host,
-            task_id,
-            gva,
-            layout.row_stride.saturating_mul(h as u64),
-        );
+        // The bulk/row reads below walk raw task GVAs; a Store's
+        // guest-page write is submitted and not waited on.
+        crate::runtime::render_writeback::settle_guest_writes();
         if read_linear_texture_bulk(
             state,
             host,
@@ -3679,7 +3629,6 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
     // `deferred_gpu_only_content` capability (off on portability-subset /
     // MoltenVK, where guest pages stay authoritative and the writeback runs
     // synchronously in this call).
-    let deferred_content_allowed = vk_engine::deferred_gpu_only_content_allowed();
     for t in &mut staged_tex {
         if t.is_storage {
             let Some(selector) = t.storage_selector else {
@@ -3762,21 +3711,6 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
                         .unwrap_or(0)
                 ));
             }
-            // Deferred writeback: a resident type-11 output skips the engine
-            // readback and the CPU guest writeback entirely — the pinned
-            // resident is authoritative and every host access of the window
-            // flushes first (storage_flush choke points). Linear windows only
-            // carry `residency` when their defer gate passed at stage time
-            // (cache-only + non-mirrorable), so residency alone qualifies
-            // them. Direct writeback is moot when deferring.
-            let defer_readback = compute_defer_readback_allowed(
-                deferred_content_allowed,
-                t.residency.is_some(),
-                matches!(
-                    t.writeback,
-                    TextureWriteback::Type11 { .. } | TextureWriteback::Linear { .. }
-                ),
-            );
             storage_images.push(ComputeStorageImageResource {
                 binding: t.binding,
                 format: shader_fmt,
@@ -3793,7 +3727,6 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
                     }
                 }),
                 seed_skipped: t.serve.and_then(ResidentServe::seed_generation).is_some(),
-                defer_readback,
             });
         } else {
             let Some(sampled_fmt) = mtl_to_engine_sampled(t.pixel_format) else {
@@ -3888,18 +3821,13 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
             return ComputeStatus::MetalFailed("compute_vk_engine_run");
         }
     };
-    if out.buffers.len() != buffer_writable_count
-        || out.images.len() != storage_count
-        || out.images_deferred.len() != storage_count
-    {
+    if out.buffers.len() != buffer_writable_count || out.images.len() != storage_count {
         crate::observe::fail(format!(
-            "compute_linux readback count mismatch pipe={} buf={}/{} img={}/{} deferred={}/{}",
+            "compute_linux readback count mismatch pipe={} buf={}/{} img={}/{}",
             acc.pipeline_ref,
             out.buffers.len(),
             buffer_writable_count,
             out.images.len(),
-            storage_count,
-            out.images_deferred.len(),
             storage_count
         ));
         return ComputeStatus::MetalFailed("compute_vk_readback_count");
@@ -3907,7 +3835,6 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
     let vk_engine::ComputeOutput {
         buffers: output_buffers,
         images: output_images,
-        images_deferred: output_images_deferred,
     } = out;
     for buffer in output_buffers {
         let Some(s) = staged_bufs
@@ -3934,137 +3861,11 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
             return e;
         }
     }
-    for ((t, bytes), deferred) in staged_tex
+    for (t, bytes) in staged_tex
         .iter_mut()
         .filter(|texture| texture.is_storage)
         .zip(output_images)
-        .zip(output_images_deferred)
     {
-        if deferred {
-            // Deferred linear window: the pinned resident is the whole story —
-            // today's sync path never wrote guest pages either (cache-only),
-            // so the only bookkeeping is the cache entry's resident marker.
-            if let (
-                Some(candidate),
-                TextureWriteback::Linear {
-                    texture_ref,
-                    gva,
-                    pixel_format,
-                    row_stride,
-                    width,
-                    height,
-                    ..
-                },
-            ) = (t.residency, &t.writeback)
-            {
-                let generation = next_mapping_content_generation(candidate.seed_generation);
-                let window = crate::runtime::surface_cache::LinearWindow {
-                    task_id,
-                    texture_ref: *texture_ref,
-                    gva: *gva,
-                    pixel_format: *pixel_format,
-                    width: *width,
-                    height: *height,
-                    row_stride: *row_stride,
-                };
-                if !crate::runtime::surface_cache::note_linear_texture_resident(
-                    state, &window, generation,
-                ) {
-                    crate::observe::fail(format!(
-                        "compute_writeback_deferred fail reason=linear_note task={task_id} ref={texture_ref} gva={gva:#x} fmt={pixel_format:#x} dims={width}x{height} gen={generation}"
-                    ));
-                    return ComputeStatus::MetalFailed("compute_vk_deferred_linear_note");
-                }
-                // The sync path writes guest pages when the GVA is mapped —
-                // record the flush obligation with a defer-time page index so
-                // aliased raw-GVA readers land the content first. Any prior
-                // obligation for this identity is superseded content. Pages
-                // resolve fully at the defer edge (never at sample time —
-                // the boot-19 guard-v1 regression).
-                let key = candidate.key;
-                state.disarm_linear_deferred_window(&key);
-                let span = key.span_end;
-                // The window is armed whatever the guest has notified: `pages`
-                // is the reading that matters here and it comes from the page
-                // tables — an empty index is a window over memory nothing
-                // resolves.
-                let mut pages = std::collections::HashSet::new();
-                pages.extend(crate::runtime::gva_mem::task_gva_page_gpa_set(
-                    host,
-                    &state.tasks,
-                    task_id,
-                    *gva,
-                    span,
-                    state.page_shift,
-                ));
-                let indexed = pages.len();
-                state.arm_linear_deferred_window(key, generation, pages);
-                crate::observe::off(format!(
-                    "compute_writeback_deferred kind=linear pipe={} bind={} task={task_id} ref={texture_ref} gva={gva:#x} {width}x{height} fmt={pixel_format:#x} gen={generation} pages={indexed}",
-                    acc.pipeline_ref,
-                    t.binding,
-                ));
-                continue;
-            }
-            // The pinned engine resident is authoritative; guest pages are now
-            // stale until a flush choke point lands the content
-            // (storage_flush::flush_intersecting). Keep the protocol
-            // bookkeeping the CPU write would do, then register the window in
-            // the deferred-flush map.
-            let (Some(candidate), TextureWriteback::Type11 { mapping_id, .. }) =
-                (t.residency, &t.writeback)
-            else {
-                crate::observe::fail(format!(
-                    "compute_writeback_deferred fail reason=missing_identity pipe={} bind={}",
-                    acc.pipeline_ref, t.binding
-                ));
-                return ComputeStatus::MetalFailed("compute_vk_deferred_identity");
-            };
-            let key = candidate.key;
-            let generation = next_mapping_content_generation(candidate.seed_generation);
-            // Superseded stale windows intersecting this one are dead content:
-            // drop them (never flush over the newer output) and release their
-            // pins — except our own *storage* identity, which the engine
-            // re-pinned.
-            //
-            // The `victim != key` exemption is about that re-pin, so it applies
-            // only to a compute window. A render window can sit at the very same
-            // key — same mapping, geometry, format and plane window — while its
-            // pixels are in a target resident the engine has not touched, so
-            // skipping it there would leak a display-sized pin for the boot.
-            // `release_window_pin` picks the registry from the owner.
-            for (victim, victim_owner) in
-                state.take_deferred_flush_windows(*mapping_id, key.surface_offset, key.span_end)
-            {
-                let ours = victim == key
-                    && matches!(victim_owner, crate::model::DeferredOwner::Storage { .. });
-                if !ours {
-                    crate::observe::off(format!(
-                        "compute_writeback_deferred supersede mapping={mapping_id} victim={}x{} fmt={:#x} owner={}",
-                        victim.width,
-                        victim.height,
-                        victim.pixel_format,
-                        crate::runtime::storage_flush::owner_slug(&victim_owner)
-                    ));
-                    crate::runtime::storage_flush::release_window_pin(&victim, &victim_owner);
-                }
-            }
-            state.compute_deferred_flush.insert(
-                key,
-                crate::model::DeferredOwner::Storage {
-                    generation,
-                    armed_stamp_seq: state.completion_stamp_seq,
-                },
-            );
-            state.index_deferred_alias_pages(*mapping_id);
-            let _ = state.mark_mapping_written(*mapping_id);
-            note_storage_residency_writeback(state, t);
-            crate::observe::off(format!(
-                "compute_writeback_deferred pipe={} bind={} mapping={mapping_id} {}x{} fmt={:#x} gen={generation}",
-                acc.pipeline_ref, t.binding, key.width, key.height, key.pixel_format
-            ));
-            continue;
-        }
         t.bytes = bytes;
         if let Err(e) = writeback_texture(state, host, task_id, t) {
             return e;

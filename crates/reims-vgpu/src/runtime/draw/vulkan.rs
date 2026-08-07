@@ -114,7 +114,6 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
             }
             let rgba = solid_rgba8(c.width, c.height, &c.clear_color);
             let ok = if c.target_gva != 0 {
-                supersede_gva_window(state, host, c.target_gva, c.width, c.height, "clear_store");
                 write_gva_rgba8(
                     state,
                     host,
@@ -187,10 +186,9 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
     // which of those a record hit depends on whether an identity resolved, and
     // that is not a condition the Store block can re-derive.
     let mut draw_bgra = false;
-    // GVA Store landed as a deferred-writeback window (resident authoritative).
-    let mut gva_store_armed = false;
-    // Type-11 composite Store landed the same way: the pinned engine resident is
-    // the only copy of the frame until a guest-side reader flushes the window.
+    // Type-11 composite Store: the frame was written into the mapping's guest
+    // pages by `store_surface_resident`, so this encode owes the caller nothing
+    // further.
     let mut surface_store_armed = false;
     if req.pipeline_ref != 0 && (req.vertex_count > 0 || req.indexed.is_some()) {
         req.chain_resident_established = false;
@@ -215,31 +213,22 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                 ));
             }
             Ok(M2vDrawSpan::ResidentGvaStore) => {
-                if arm_gva_deferred_store(state, host, req) {
-                    note_type11_store_route("gva_deferred");
-                    gva_store_armed = true;
-                    crate::observe::line(format!(
-                        "linux_m2v_draw ok resident_gva_store pipe={} {}x{} gva={:#x}",
-                        req.pipeline_ref,
-                        pass_w,
-                        pass_h,
-                        req.colors.first().map(|c| c.target_gva).unwrap_or(0)
-                    ));
-                } else {
-                    // Arm gate failed (unwalkable span / pin refusal): land
-                    // synchronously from the resident the draw just produced.
-                    // read_resident_chain fail-logs a lost resident.
-                    note_type11_store_route("gva_deferred_sync");
-                    draw_rgba = read_resident_chain(state, req);
-                    crate::observe::line(format!(
-                        "linux_m2v_draw ok resident_gva_store_sync_fallback pipe={} {}x{} gva={:#x} rgba={}",
-                        req.pipeline_ref,
-                        pass_w,
-                        pass_h,
-                        req.colors.first().map(|c| c.target_gva).unwrap_or(0),
-                        draw_rgba.is_some() as u8
-                    ));
-                }
+                // Landed from the resident the draw just produced, in this call.
+                // This Store used to arm a deferred window instead; the window
+                // rail is gone, and on a driven boot this route armed 88 windows
+                // in 51 seconds against the surface rail's 21 314, so what it
+                // deferred was never where the cost was.
+                // `read_resident_chain` fail-logs a lost resident.
+                note_type11_store_route("gva_store_sync");
+                draw_rgba = read_resident_chain(state, req);
+                crate::observe::line(format!(
+                    "linux_m2v_draw ok resident_gva_store pipe={} {}x{} gva={:#x} rgba={}",
+                    req.pipeline_ref,
+                    pass_w,
+                    pass_h,
+                    req.colors.first().map(|c| c.target_gva).unwrap_or(0),
+                    draw_rgba.is_some() as u8
+                ));
             }
             Ok(M2vDrawSpan::ResidentSurfaceStore) => {
                 // Into the same `t11_store_us` bucket the synchronous and `Owned`
@@ -253,11 +242,11 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                     .colors
                     .first()
                     .map(|c0| (c0.mapping_id, c0.width, c0.height, c0.format));
-                let armed = c0_store.and_then(|(mid, cw, ch, _)| {
-                    arm_surface_resident_store(state, host, req, mid, cw, ch)
-                });
-                match (armed, c0_store) {
-                    (Some(epoch), Some((mid, cw, ch, fmt))) => {
+                let stored = c0_store
+                    .map(|(mid, cw, ch, _)| store_surface_resident(state, host, req, mid, cw, ch))
+                    .unwrap_or(false);
+                match (stored, c0_store) {
+                    (true, Some((mid, cw, ch, fmt))) => {
                         note_type11_store_route("surface_resident");
                         // The same two publishes the `Owned` rail performs at arm
                         // time, for the same reason: `dense_frame_seq` gates
@@ -269,7 +258,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                         }
                         surface_store_armed = true;
                         crate::observe::line(format!(
-                            "linux_m2v_draw ok resident_surface_store pipe={} {}x{} mid={mid} epoch={epoch}",
+                            "linux_m2v_draw ok resident_surface_store pipe={} {}x{} mid={mid}",
                             req.pipeline_ref, pass_w, pass_h
                         ));
                     }
@@ -319,12 +308,6 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
     // A resident render-pass chain intermediate: the exec loop reads
     // `chain_resident_established` and arms the next record's LoadFromTarget.
     if req.chain_resident_established {
-        return (EncodeStatus::Ok, None);
-    }
-
-    // Deferred GVA Store: the window is armed and the resident holds the
-    // authoritative pixels — the contract Store lands on first access.
-    if gva_store_armed {
         return (EncodeStatus::Ok, None);
     }
 
@@ -401,66 +384,6 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                     {
                         let _span = StoreCostSpan::new("t11_convert_us");
                         reorder_rb_in_place(&mut bgra, draw_bgra, true);
-                    }
-                    // Deferred writeback: publish the frame to `surface_cache`
-                    // — the source every other consumer already reads, so the
-                    // Load seed and the present capture see exactly what they
-                    // would have — and arm a window instead of scattering the
-                    // frame into the mapping's guest pages now.
-                    //
-                    // That scatter is the cost. `write_bgra8` converts every row
-                    // to the mapping's native format and then copies it out, per
-                    // row when the mapping's pages are fragmented: ~8 MB of CPU
-                    // work per Store, at the 28-111 Stores/s `store_routes`
-                    // measures, on the drain worker `drain_duty` shows at duty
-                    // 0.93-0.99. Nothing on the host-window present path reads
-                    // those pages, so most of that work is owed to a guest reader
-                    // that may never come.
-                    //
-                    // The capability gate lives in `surface_store_defer_eligible`,
-                    // which this reaches through `prepare_surface_deferred_window`;
-                    // a denial arrives here as the `Err(bgra)` the sync route below
-                    // needs anyway.
-                    match arm_surface_deferred_store_with(
-                        state,
-                        host,
-                        req,
-                        c0.mapping_id,
-                        c0.width,
-                        c0.height,
-                        bgra,
-                    ) {
-                        Ok(epoch) => {
-                            note_type11_store_route("surface_deferred");
-                            {
-                                let _span = StoreCostSpan::new("t11_publish_us");
-                                publish_surface_store(
-                                    state,
-                                    host,
-                                    c0.mapping_id,
-                                    c0.width,
-                                    c0.height,
-                                    c0.format,
-                                );
-                            }
-                            stamp_type11_resident(state, host, req, writeback_guest, epoch);
-                            // `None`, not the frame. This route is reached only
-                            // under `writeback_guest`, which `multi_draw_store_plan`
-                            // grants solely to the **last** record of a packet — so
-                            // the returned pixels have no next record to seed
-                            // (`exec` feeds `chain_rgba` into record N+1's
-                            // `target_seed_rgba` at line 1609), and every other
-                            // reader of `chain_rgba` is an abandon arm inside a loop
-                            // that has just ended. Returning the buffer forced this
-                            // arm to clone it; returning nothing lets the arm own it.
-                            return (EncodeStatus::Ok, None);
-                        }
-                        // Refused before consuming the frame, and handed it back, so
-                        // the synchronous route below still has it. A `Result` rather
-                        // than a `bool` because a moved buffer cannot be un-moved:
-                        // the type is what makes "refused" and "still have the
-                        // pixels" the same statement.
-                        Err(returned) => bgra = returned,
                     }
                     note_type11_store_route("cpu_portability");
                     // `write_bgra8`, not `write_rgba8_image_changed`: the frame is
@@ -552,14 +475,6 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                     false
                 }
             } else if c0.target_gva != 0 {
-                supersede_gva_window(
-                    state,
-                    host,
-                    c0.target_gva,
-                    c0.width,
-                    c0.height,
-                    "sync_store",
-                );
                 // Bounded to the pages resolved before the GPU round trip
                 // above. `None` only when that walk could not name the span,
                 // which is the pre-existing behaviour for a target this device
@@ -816,22 +731,6 @@ pub(super) fn fragment_attachment_alias_sample<'a>(
     }
 }
 
-/// A deferred GVA window may serve a sampled bind directly from its resident
-/// target only when the sampled view is the exact window content: descriptor
-/// geometry equals the window geometry, and the same storage-family gate that
-/// would let the post-flush cache layer serve this object type accepts it. Any
-/// mismatch must land the window (flush path) instead.
-pub(super) fn deferred_gva_sample_eligible(
-    win: &crate::model::GvaDeferredEntry,
-    desc_width: u32,
-    desc_height: u32,
-    sampler_object_type: u8,
-) -> bool {
-    win.width == desc_width
-        && win.height == desc_height
-        && gva_cache_owner_allows_object_type(win.producer_object_type, sampler_object_type)
-}
-
 /// The object-list entry and descriptor bytes behind a sampled `texture_ref`,
 /// reporting when the ref names something that is not a texture.
 ///
@@ -880,74 +779,6 @@ pub(super) fn sampled_texture_descriptor<M: HostMemory>(
     Some((entry, bytes))
 }
 
-/// Bind a still-deferred GVA render Store's resident target for a type-2/3
-/// sampled bind instead of flushing it to guest memory and re-uploading.
-///
-/// Value-equal to the flush path: a flush lands the resident RGBA into the
-/// `host_gva_surfaces` layer, and the sample would serve that layer back
-/// (BGRA→RGBA swap) — so binding the resident directly yields the same texels
-/// whenever the descriptor geometry matches the window and the cache owner
-/// gate would accept the layer. Mismatches fall through to the flush path.
-/// The window stays armed: the contract Store still lands on first guest
-/// access, and the resident stays authoritative for further samples.
-fn try_sample_deferred_gva<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
-    host: &mut M,
-    task_id: u32,
-    texture_ref: u32,
-) -> Option<(u32, u32, u32, SampledSourceRequest)> {
-    use crate::backend::vulkan::engine;
-    if state.gva_deferred_flush.is_empty() {
-        return None;
-    }
-    let (entry, desc_bytes) = sampled_texture_descriptor(state, host, task_id, texture_ref)?;
-    let tex = decode_texture_descriptor(&desc_bytes).ok()?;
-    let (gva, layout) = tex.level_gva(0, state.page_shift)?;
-    // Every rung below this point declines to a bare `None`, and the caller then
-    // reads guest pages — so which of four different situations produced the
-    // fall-through is invisible at the call site, and the four are not equally
-    // safe. A window that is armed but whose resident is not ready is the one
-    // that matters: the window's existence is itself the statement that guest
-    // pages are stale. Named per (gva, geometry, reason), transition-keyed.
-    let decline = |reason: &str, win_geom: (u32, u32)| {
-        let mut subject = std::hash::DefaultHasher::new();
-        std::hash::Hash::hash(&(gva, layout.width, layout.height), &mut subject);
-        let mut st = std::hash::DefaultHasher::new();
-        std::hash::Hash::hash(&(reason, win_geom), &mut st);
-        if crate::observe::state_changed(
-            "gva_sample_rung",
-            std::hash::Hasher::finish(&subject),
-            std::hash::Hasher::finish(&st),
-        ) {
-            crate::observe::off(format!(
-                "gva_sample_rung reason={reason} task={task_id} ref={texture_ref} gva={gva:#x} desc={}x{} win={}x{}",
-                layout.width, layout.height, win_geom.0, win_geom.1,
-            ));
-        }
-        None::<(u32, u32, u32, SampledSourceRequest)>
-    };
-    let Some(win) = state.gva_deferred_flush.get(&gva) else {
-        return decline("no_window", (0, 0));
-    };
-    let win_geom = (win.width, win.height);
-    if !deferred_gva_sample_eligible(win, layout.width, layout.height, entry.object_type) {
-        let reason = if win.width != layout.width || win.height != layout.height {
-            "window_geometry"
-        } else {
-            "owner_object_type"
-        };
-        return decline(reason, win_geom);
-    }
-    // From the window, not from a walk: this bind must reach the slot the window
-    // pinned, and the address may already belong to something else.
-    let id = crate::runtime::storage_flush::gva_window_identity(gva, win);
-    if !engine::resident_content_ready(&id) {
-        // The window says guest pages are stale and the resident says it has
-        // nothing — the two together mean this sample has no correct source.
-        return decline("resident_not_ready", win_geom);
-    }
-    Some((win_geom.0, win_geom.1, 0, SampledSourceRequest::Target(id)))
-}
 
 /// Resolve a sampled texture ref to `(width, height, mapping_id, source)`.
 ///
@@ -1411,7 +1242,6 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                         generation: host_gen,
                     });
                     note_type11_sample_rung("t11rung_host_cache", guest_write);
-                    crate::runtime::storage_flush::note_render_flush_cache_read(state, mid);
                     return Some((
                         w,
                         h,
@@ -1428,7 +1258,6 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                 // same pixels — so it stays quiet, like the type-2/3 rail's.
                 if let Some(src) = try_type11_sample_zero_copy(state, host, mid, w, h) {
                     note_type11_sample_rung("t11rung_zero_copy", guest_write);
-                    crate::runtime::storage_flush::note_render_flush_pages_read(state, mid);
                     return Some((w, h, mid, src));
                 }
                 // The memo skips the convert/alloc on unchanged content and
@@ -1436,7 +1265,6 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                 // its census (T11Memo hit / T11Guest fill) is emitted internally.
                 if let Some((rgba, identity)) = load_type11_rgba_memoized(state, host, mid) {
                     note_type11_sample_rung("t11rung_guest_memo", guest_write);
-                    crate::runtime::storage_flush::note_render_flush_pages_read(state, mid);
                     return Some((
                         w,
                         h,
@@ -1468,13 +1296,6 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
 
     // Type-2/3: GVA-keyed encode, then texture_ref with **descriptor** geom match.
     if is_linear_tex {
-        // A still-deferred GVA render Store is GPU-resident and authoritative;
-        // bind the resident target directly instead of flushing + re-uploading
-        // (the gvadefer A/B showed 99% of windows were consumed by exactly this
-        // sample path — readback relocation, not elimination).
-        if let Some(v) = try_sample_deferred_gva(state, host, task_id, texture_ref) {
-            return Some(v);
-        }
         // Zero-copy gather for large Vulkan-native linear textures: replaces
         // the CPU host-cache/memo byte paths below for eligible formats (the
         // lin_memo full-window re-read + memcmp per bind was the dominant
@@ -1944,15 +1765,6 @@ fn resolve_type11_load_seed<M: HostMemory + HostOps>(
                 })
         };
     note_type11_load_seed(state, mapping_id, w, h, served.as_ref().map(|s| s.2));
-    match served.as_ref().map(|s| s.2) {
-        Some(Type11SeedRung::Cache) => {
-            crate::runtime::storage_flush::note_render_flush_cache_read(state, mapping_id)
-        }
-        Some(Type11SeedRung::GuestPages) => {
-            crate::runtime::storage_flush::note_render_flush_pages_read(state, mapping_id)
-        }
-        _ => {}
-    }
     served.map(|(bytes, order, _)| (bytes, order))
 }
 
@@ -2528,7 +2340,7 @@ fn mapping_window_guest_runs<M: HostMemory + HostOps>(
     if !guest_run_alias_available(host) {
         return None;
     }
-    let _ = crate::runtime::storage_flush::flush_intersecting(state, host, mid, 0, u64::MAX);
+    crate::runtime::render_writeback::settle_guest_writes();
     let gpas = mapper::mapping_page_gpas(state, host, mid)?;
     let page = state.page_size();
     if (gpas.len() as u64).saturating_mul(page) < base_off.checked_add(span)? {
@@ -2577,13 +2389,7 @@ fn try_buffer_zero_copy_resolved<M: HostMemory + HostOps>(
     // Same coherence rule as the CPU read: land any resident-authoritative
     // writeback aliasing the span before the GPU reads the pages (the CPU
     // flush completes before this draw's submit).
-    crate::runtime::storage_flush::flush_intersecting_task_gva(
-        state,
-        host,
-        task_id,
-        gva + offset,
-        span,
-    );
+    crate::runtime::render_writeback::settle_guest_writes();
     // Walk exactly the bound range. Resolving the whole backing and slicing out
     // the bind would translate every page of the allocation to serve one bind,
     // and would refuse a bind whose allocation has an unmapped tail page even
@@ -2705,7 +2511,7 @@ fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
     // Same coherence rule as the CPU loaders: land any resident-authoritative
     // writeback aliasing the span before the GPU reads the pages (the CPU
     // flush completes before this draw's submit).
-    crate::runtime::storage_flush::flush_intersecting_task_gva(state, host, task_id, gva, span);
+    crate::runtime::render_writeback::settle_guest_writes();
     // Fixed per-texture window: the walk covers exactly the bound span.
     let (gpas, runs) = task_gva_guest_run_window(state, host, task_id, gva, span)?;
     let page = state.page_size() as usize;
@@ -3020,7 +2826,7 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
     }
     // Same coherence rule as the general loader: land any resident-
     // authoritative writeback aliasing the sampled span before reading it.
-    crate::runtime::storage_flush::flush_intersecting_task_gva(state, host, task_id, gva, span);
+    crate::runtime::render_writeback::settle_guest_writes();
     let mut scratch = std::mem::take(&mut state.guest_linear_scratch);
     scratch.resize(native_len, 0);
     let read = gva_mem::read_task_gva_by_id(
@@ -3290,12 +3096,6 @@ pub(super) fn load_linear_from_host_caches<M: HostMemory + HostOps>(
     let h = layout.height;
     if w == 0 || h == 0 {
         return None;
-    }
-    // A deferred GVA render Store at this base is the authoritative content and
-    // the guest's pages do not have it yet — land it before the readers below,
-    // which read those pages.
-    if state.gva_deferred_flush.contains_key(&gva) {
-        crate::runtime::storage_flush::flush_gva_exact(state, host, gva, true, "gva_sample");
     }
     // Two cache rungs that used to sit here are deliberately absent; both were
     // measured dead before removal, so do not restore either.
@@ -3853,26 +3653,6 @@ fn note_load_seed_outcome(
     }
 }
 
-#[inline]
-fn gva_cache_linear_texture_type(object_type: u8) -> bool {
-    matches!(
-        object_type,
-        OBJECT_TYPE_TEXTURE | OBJECT_TYPE_TEXTURE_VARIANT
-    )
-}
-
-/// A GVA cache is keyed by decoded linear texture storage. Type-2 and type-3
-/// wrappers may alias the same GVA allocation, so a matching GVA+geometry cache
-/// entry can serve either tag. Other nonzero object-type transitions remain
-/// separate resource classes and fall through to current ref/guest backing.
-#[inline]
-pub(super) fn gva_cache_owner_allows_object_type(producer_type: u8, current_type: u8) -> bool {
-    producer_type == 0
-        || current_type == 0
-        || producer_type == current_type
-        || (gva_cache_linear_texture_type(producer_type)
-            && gva_cache_linear_texture_type(current_type))
-}
 
 /// Store type-2/3 encode into texture_ref + GVA host caches (BGRA).
 ///
@@ -5588,12 +5368,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // `ResidentSurfaceStore` is reached, so a record that armed here as well
         // would skip its readback and never arm anything. Stated rather than
         // derived, because the derivation is a property of two other blocks.
-        // `surface_store_defer_eligible` asks the capability gate itself, so it
-        // is not repeated here.
-        if renders_into_surface_identity
-            && !resources.skip_readback
-            && surface_store_defer_eligible(state, req).is_some()
-        {
+        if renders_into_surface_identity && !resources.skip_readback {
             resources.skip_readback = true;
             surface_resident_store = true;
         }
@@ -6800,513 +6575,57 @@ pub(crate) fn read_resident_chain(state: &DeviceState, req: &DrawEncodeRequest) 
         }
     }
 }
-
-/// Deferred GVA windows keep engine registry slots pinned, and a pinned slot is
-/// one no reclaim path may take — so nothing but this count bounds them. Arming
-/// past it lands the oldest window first, which is a flush and not a drop.
+/// Land a type-11 render Store's frame in the guest's pages, from the resident
+/// the draw just rendered into.
 ///
-/// Measured across every boot in a 72 MB accumulated log — Chess, Maps, the
-/// WebGL aquarium, page-downs, a title-bar drag, apple.com: the live population
-/// never exceeded the one window being armed, and nothing was ever evicted, so
-/// **this cap has never bound**. That is what `flush_all_windows_before_fence`
-/// forces — every completion stamp lands every window first, so windows cannot
-/// accumulate across a fence, only within one drain tranche. 16 is therefore not
-/// justified by that reading; it is unfalsified by it. Retiring the cap needs a
-/// workload that arms several Stores between two stamps, and the ordering
-/// machinery it drives (`gva_deferred_seq`, `take_oldest_gva_deferred_window`)
-/// is only reachable at a population above one.
+/// The Store never reads the frame back off the GPU: the copy's destination is
+/// the guest's own pages, recorded into the engine's command stream and ordered
+/// against the guest by the completion stamp. See
+/// [`crate::runtime::render_writeback`] for what this replaced, and why the
+/// deferred window it used to arm bought nothing on any measured workload.
 ///
-/// If it ever does bind, each forced landing says so as
-/// `gva_deferred_flush ... trigger=window_cap`.
-const GVA_DEFERRED_WINDOW_CAP: usize = 16;
-
-/// Bound on live type-11 render windows. Each one pins a display-sized target
-/// resident, so an unbounded population is the "~260 stale residents
-/// (~516 MiB) pinned for the guest lifetime" shape. Sized like the GVA cap: a
-/// composite touches a handful of layers, so this is headroom, not a working
-/// set the guest routinely exceeds.
-///
-/// Same logs, same verdict: the live population reached only the window being
-/// armed, and nothing was ever evicted. "A composite touches a handful of
-/// layers" predicted a population of a few; the measured one is one. See the
-/// note on `GVA_DEFERRED_WINDOW_CAP` for why, and for what would change the
-/// answer. If it ever does bind, `evict_render_windows_to_cap` emits
-/// `surface_window_cap_evicted`.
-const SURFACE_DEFERRED_WINDOW_CAP: usize = 16;
-
-/// Defer gate for a type-11 (surface) render Store.
-///
-/// All gates are protocol-shape checks, never content: the later flush has to
-/// be able to replay the synchronous Store *exactly*, so anything the sync
-/// route would have needed must be resolvable now. In particular the mapping's
-/// plane window must resolve, because the deferred window's guest byte range —
-/// which is what every reader intersects against to decide whether to flush —
-/// comes from it. A window with no range would be armed and then never found
-/// by a reader, which is the silent-stale-read failure this rail exists to
-/// avoid.
-fn surface_store_defer_eligible(
-    state: &DeviceState,
-    req: &DrawEncodeRequest,
-) -> Option<crate::model::ComputeStorageResidencyKey> {
-    let c0 = req.colors.first()?;
-    if c0.mapping_id == 0 {
-        return None;
-    }
-    // The engine-level gate every deferred-writeback rail asks, so one switch
-    // turns them all off together.
-    if !crate::backend::vulkan::engine::deferred_gpu_only_content_allowed() {
-        return None;
-    }
-    let (w, h) = (c0.width, c0.height);
-    if w == 0 || h == 0 {
-        return None;
-    }
-    let m = state.mappings.get(&c0.mapping_id)?;
-    // The sync route calls `write_rgba8_image_changed`, which refuses unless
-    // the mapping's latched geometry equals the draw's. Deferring a Store that
-    // is going to be refused just moves the refusal somewhere it reads as a
-    // lost flush, so gate on the same thing up front.
-    let (surface_offset, surface_bpr, span_end) =
-        crate::runtime::mapping_write::type11_sample_window(m, w, h, c0.format)?;
-    Some(crate::model::ComputeStorageResidencyKey {
-        mapping_id: c0.mapping_id,
-        map_generation: m.map_generation,
-        surface_offset,
-        surface_bpr,
-        span_end,
-        width: w,
-        height: h,
-        pixel_format: c0.format,
-        texture_ref: 0,
-    })
-}
-
-/// Arm the deferred window for a type-11 render Store, so the CPU writeback
-/// into the mapping's guest pages happens on demand instead of every Store.
-///
-/// The caller has already read the target back and refreshed
-/// `surface_cache` with this frame, so the pixels the flush will write are the
-/// ones every other consumer already sees. **Only the guest-page copy is
-/// deferred** — the readback, the cache, the Load seed and the present capture
-/// are untouched, which is what keeps this rail out of the front-buffer
-/// resolve problem that a resident-authoritative type-11 Load would reopen (see
-/// the note at the type-11 Load arm).
-///
-/// The index is the mapping-keyed one the compute rail already uses, so every
-/// guest-page reader drains this window through the `flush_intersecting` choke
-/// point it already calls — no new trigger sites, and no way to cover one rail
-/// and miss the other.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the arm names the frame it is deferring and the geometry it was drawn at"
-)]
-fn arm_surface_deferred_store_with<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
-    host: &mut M,
-    req: &DrawEncodeRequest,
-    mapping_id: u32,
-    width: u32,
-    height: u32,
-    bgra: Vec<u8>,
-) -> Result<u32, Vec<u8>> {
-    let Some(key) = prepare_surface_deferred_window(state, host, req, mapping_id, width, height)
-    else {
-        return Err(bgra);
-    };
-    // Referenced twice, copied never: the Load seed and the present capture read
-    // it through `surface_cache`, and the window below owns it so the writeback
-    // it defers can always be performed.
-    //
-    // This used to allocate a second frame and swizzle into it — 776 us per
-    // Store, 84 % of everything `draw_phase` could not attribute. The Store's
-    // attachment is a BGRA `Surface` resident now, so the readback arrives in
-    // this order and the whole pass is gone rather than moved.
-    let frame = std::sync::Arc::new(bgra);
-    crate::runtime::surface_cache::store_shared(
-        state,
-        mapping_id,
-        width,
-        height,
-        std::sync::Arc::clone(&frame),
-    );
-    // Captured here, not re-read at the end: this is the epoch at which these
-    // exact pixels became the mapping's content. Anything below — an eviction
-    // flush landing a sibling window, which writes guest pages and replaces the
-    // one-per-mapping cache entry — advances the epoch past it, and the
-    // resident stamped with the captured value then reads as stale. That is the
-    // intended direction: a stale stamp costs a CPU seed, a fresh-looking one
-    // costs a wrong frame.
-    let published_epoch = state.note_surface_content_published(mapping_id);
-    evict_render_windows_to_cap(state, host);
-    Ok(finish_surface_deferred_window(
-        state,
-        req,
-        key,
-        crate::model::RenderWindowSource::Owned(frame),
-        published_epoch,
-    ))
-}
-
-/// Arm the deferred window for a type-11 render Store that **skipped its
-/// readback**: the pinned engine resident holds the frame, and no CPU copy of it
-/// exists anywhere.
-///
-/// This is the rail that removes the cost rather than rescheduling it.
-/// `surface_flush / surface_deferred` measures 0.138, so ~86 % of these windows
-/// are never flushed at all — and [`arm_surface_deferred_store_with`] still pays
-/// a whole-framebuffer GPU→host readback per Store to own bytes that nobody
-/// reads. `draw_phase` prices that at `wait_us` + `readback_us` = 565 ms per
-/// second of wall clock, 68 % of `draw_us`, and `skip_readback` returns from
-/// `execute_draw_inner` before `Phase::Wait`, so both fall together.
-///
-/// Fail-closed at every gate, and the caller must treat `None` as "take the
-/// synchronous route" rather than as a loss:
-///
-/// - **The pin.** [`crate::backend::vulkan::engine::pin_resident_target`] refuses
-///   an absent or not-content_ready slot, and without the pin the LRU sweep or the
-///   idle drain could reclaim the only copy of the frame.
-/// - **The epoch.** `note_surface_content_published` returns 0 for a mapping that
-///   is gone, and 0 is the value that means "nothing published since attach" — a
-///   window carrying it would compare equal to an unstamped resident, which is the
-///   `None == None` hazard [`type11_resident_is_current`] exists to refuse.
-/// - **The cession.** The host cache must stop answering for this geometry before
-///   the window is armed, or the present capture keeps serving the *previous*
-///   frame from bytes this Store superseded.
+/// `false` means the frame is not in the guest's pages and the caller must
+/// materialize it the slow way — read the resident back and run the synchronous
+/// Store block. That is a cost, never a lost frame.
 ///
 /// The identity is [`type11_store_identity`] — the same call that produced the
-/// draw's `target_identity` — so the slot pinned and stamped is the slot the draw
-/// rendered into. Deriving it a second way here is how a pin ends up protecting
-/// an image the frame is not in.
-fn arm_surface_resident_store<M: HostMemory + HostOps>(
+/// draw's `target_identity` — so the image read here is the image the draw
+/// rendered into. Deriving it a second way is how a writeback ends up
+/// publishing a frame the draw is not in.
+fn store_surface_resident<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     req: &DrawEncodeRequest,
     mapping_id: u32,
     width: u32,
     height: u32,
-) -> Option<u32> {
-    // Before any early return below: the union belongs to the draws that just
-    // ran whether or not this arm goes on to succeed, and leaving it un-reset on
-    // a declined arm would fold this pass into the next window's reading.
+) -> bool {
+    // The union belongs to the draws that just ran whether or not the write
+    // below succeeds, and leaving it un-reset on a refused write would fold this
+    // pass into the next Store's reading.
     note_pass_scissor_union(width, height);
-    let identity = type11_store_identity(state, req, true)?;
-    let key = prepare_surface_deferred_window(state, host, req, mapping_id, width, height)?;
-    // The slot this arm pins and the slot the flush will look up have to be the
-    // same slot. Geometry no longer separates them: both spellings read color0's
-    // declared extent, because that is the only extent a draw request carries.
-    // It used to carry a second one, and a record whose pass extent differed
-    // from its attachment pinned one identity and handed the window another —
-    // the flush found no slot, the frame was lost, and the pin leaked for the
-    // guest's lifetime because eviction skips pinned slots.
-    //
-    // `map_generation` is the axis still live here, and it can move *inside* the
-    // arm: `prepare_surface_deferred_window` below lands intersecting windows,
-    // and a writeback re-resolves the mapping. Taking the identity before that
-    // step and the key after it is what this compares.
-    //
-    // That is the defect shape of `74748d2` and `021e64b` a third time, so it is
-    // closed the same way: one spelling, checked, never two reconciled.
-    // Declining is free here — the caller treats `None` as "take the synchronous
-    // route", which pays a readback and loses nothing.
-    if crate::runtime::storage_flush::render_window_identity(&key) != identity {
-        crate::observe::Emit::decline(
-            "surface_resident_arm",
-            &SurfaceResidentArmDecline::IdentitySplit,
-        )
-        .field("mid", mapping_id)
-        .field("key_geom", format!("{}x{}", key.width, key.height))
-        .field("pass_geom", format!("{width}x{height}"))
-        .fail_once(u64::from(mapping_id));
-        return None;
-    }
-    if !crate::backend::vulkan::engine::pin_resident_target(&identity) {
-        crate::observe::Emit::decline(
-            "surface_resident_arm",
-            &SurfaceResidentArmDecline::PinRefused,
-        )
-        .field("mid", mapping_id)
-        .field("geom", format!("{width}x{height}"))
-        .fail_once(u64::from(mapping_id));
-        return None;
-    }
-    // Ordered against `evict_render_windows_to_cap` deliberately. That call can
-    // land a sibling window, and a landing writes guest pages through
-    // `write_bgra8`, whose tail republishes this mapping's cache entry. Ceding
-    // after it means the cession is the last word; ceding before would let a
-    // sibling at this same geometry put its own plane's bytes back under the
-    // present capture, which then serves them instead of the resident.
-    let published_epoch = state.note_surface_content_published(mapping_id);
-    evict_render_windows_to_cap(state, host);
-    if published_epoch == 0
-        || !crate::runtime::surface_cache::cede_surface_to_resident(
-            state, mapping_id, width, height,
-        )
-    {
-        crate::backend::vulkan::engine::unpin_resident_target(&identity);
-        crate::observe::Emit::decline(
-            "surface_resident_arm",
-            &SurfaceResidentArmDecline::NoEpoch {
-                epoch: published_epoch,
-            },
-        )
-        .field("mid", mapping_id)
-        .field("geom", format!("{width}x{height}"))
-        .fail_once(u64::from(mapping_id));
-        return None;
-    }
-    // The resident's stamp and the window's copy of the epoch are the two halves
-    // of one witness, and both have to be written before any other draw can clear
-    // the stamp. `stamp_resident_content_epoch` refuses a slot that is not
-    // content_ready — which the pin above already established — so a false here
-    // means the slot went away between the two calls under the engine lock.
-    if !crate::backend::vulkan::engine::stamp_resident_content_epoch(&identity, published_epoch) {
-        crate::backend::vulkan::engine::unpin_resident_target(&identity);
-        crate::observe::Emit::decline(
-            "surface_resident_arm",
-            &SurfaceResidentArmDecline::StampRefused,
-        )
-        .field("mid", mapping_id)
-        .field("geom", format!("{width}x{height}"))
-        .fail_once(u64::from(mapping_id));
-        return None;
-    }
-    // The guest half of the same witness, written here rather than by the
-    // caller because this rail returns straight out of `encode_draw` — it never
-    // reaches `stamp_type11_resident`, and it is where nearly all type-11
-    // Stores go.
-    crate::runtime::mapper::stamp_guest_write_gen(state, host, mapping_id);
-    // Paired with `note_resident_window_flushed` at the readback. Stamped here
-    // rather than in `finish_surface_deferred_window`, which also serves the
-    // `Owned` route, whose frame is already in host memory and owes no round
-    // trip to time.
-    crate::runtime::drain::note_resident_window_armed();
-    Some(finish_surface_deferred_window(
-        state,
-        req,
-        key,
-        crate::model::RenderWindowSource::Resident {
-            epoch: published_epoch,
-        },
-        published_epoch,
-    ))
-}
-
-/// Why a type-11 Store that skipped its readback could not arm a
-/// resident-backed window, and therefore had to materialize its frame and take
-/// the synchronous route.
-///
-/// Typed rather than one slug for three checks: the three have different fixes —
-/// a refused pin is a registry-state question, a zero epoch is a mapping that
-/// went away mid-draw, a refused stamp is a slot evicted between two engine-lock
-/// acquisitions — and a single `reason=arm_failed` would name none of them. Every
-/// arm is recoverable and none of them loses guest work, so these are declines and
-/// not losses.
-enum SurfaceResidentArmDecline {
-    PinRefused,
-    NoEpoch {
-        epoch: u32,
-    },
-    StampRefused,
-    /// The slot this arm would pin is not the slot the flush would look up —
-    /// the pass extent and the attachment geometry disagree. Unlike the other
-    /// three this is not a state question about the registry; it is the window
-    /// and the resident being named differently, and arming through it loses the
-    /// frame and leaks the pin.
-    IdentitySplit,
-}
-
-impl crate::observe::Decline for SurfaceResidentArmDecline {
-    fn slug(&self) -> &'static str {
-        match self {
-            Self::PinRefused => "surface_resident_pin_refused",
-            Self::NoEpoch { .. } => "surface_resident_no_epoch",
-            Self::StampRefused => "surface_resident_stamp_refused",
-            Self::IdentitySplit => "surface_resident_identity_split",
-        }
-    }
-
-    fn fields(&self) -> Vec<(&'static str, String)> {
-        match self {
-            Self::PinRefused | Self::StampRefused | Self::IdentitySplit => Vec::new(),
-            Self::NoEpoch { epoch } => vec![("epoch", epoch.to_string())],
-        }
-    }
-}
-
-/// The part of arming a type-11 render window that does not depend on where the
-/// frame lives: the protocol-shape gate, the supersede rule, and landing the
-/// sibling windows that cover guest bytes this Store does not write.
-///
-/// Shared by both rails on purpose. These three steps are what make the window
-/// *findable and exclusive* — the guest byte range every reader intersects
-/// against, with nothing stale left inside it — and a rail that reimplemented one
-/// of them slightly differently is how one kind of window ends up covered by a
-/// trigger the other kind misses.
-fn prepare_surface_deferred_window<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
-    host: &mut M,
-    req: &DrawEncodeRequest,
-    mapping_id: u32,
-    width: u32,
-    height: u32,
-) -> Option<crate::model::ComputeStorageResidencyKey> {
-    let key = surface_store_defer_eligible(state, req)?;
-    if key.mapping_id != mapping_id || key.width != width || key.height != height {
-        return None;
-    }
-    // Supersede — do not flush — the window this Store fully covers. The rule and
-    // the reason it is sound live with the release, in
-    // `storage_flush::supersede_covered_render_windows`, because taking a window
-    // and dropping its hold are one act and this site used to do only the first.
-    for (old, unpinned) in
-        crate::runtime::storage_flush::supersede_covered_render_windows(state, &key)
-    {
-        crate::observe::line(format!(
-            "surface_deferred_superseded mapping={} {}x{} fmt={:#x} unpinned={}",
-            old.mapping_id,
-            old.width,
-            old.height,
-            old.pixel_format,
-            unpinned.is_some() as u8
-        ));
-    }
-    // Whatever still intersects covers guest bytes this Store does *not* write —
-    // a different plane window on the same mapping — so it has to land.
-    //
-    // Each of those windows names its own frame, so unlike the first cut of this
-    // rail the order against the cache refresh in the caller no longer matters.
-    if !crate::runtime::storage_flush::flush_intersecting(
-        state,
-        host,
-        key.mapping_id,
-        key.surface_offset,
-        key.span_end,
+    let Some(identity) = type11_store_identity(state, req, true) else {
+        return false;
+    };
+    if !crate::runtime::render_writeback::store_render_frame(
+        state, host, mapping_id, &identity, width, height,
     ) {
-        // A window that would not land is a window whose guest bytes are now
-        // unknown; arming over it would attribute its loss to this Store.
-        return None;
+        return false;
     }
-    Some(key)
+    // The guest half of the write witness, recorded here rather than by the
+    // caller because this rail returns straight out of `encode_draw` — it never
+    // reaches `stamp_type11_resident`, and it is where nearly all type-11 Stores
+    // go.
+    crate::runtime::mapper::stamp_guest_write_gen(state, host, mapping_id);
+    true
 }
 
-/// Insert the prepared window and index it for the readers that must flush it.
-///
-/// Returns the epoch, so both rails report the same thing to
-/// [`stamp_type11_resident`] on the caller's side.
-///
-/// Takes no `host` and runs no eviction: the population cap has to be pressed
-/// *before* the caller's last write to shared state, because landing a window
-/// writes guest pages and republishes this mapping's one cache entry. Each rail
-/// therefore calls [`evict_render_windows_to_cap`] where its own last write is,
-/// and the two orders differ — which is exactly why this function cannot own it.
-fn finish_surface_deferred_window(
-    state: &mut DeviceState,
-    req: &DrawEncodeRequest,
-    key: crate::model::ComputeStorageResidencyKey,
-    source: crate::model::RenderWindowSource,
-    published_epoch: u32,
-) -> u32 {
-    state.surface_deferred_seq = state.surface_deferred_seq.wrapping_add(1);
-    let armed_seq = state.surface_deferred_seq;
-    let resident = matches!(source, crate::model::RenderWindowSource::Resident { .. });
-    state.compute_deferred_flush.insert(
-        key,
-        crate::model::DeferredOwner::Render {
-            armed_seq,
-            armed_stamp_seq: state.completion_stamp_seq,
-            source,
-        },
-    );
-    // Raw task-GVA reads that alias these physical pages flush through
-    // `flush_intersecting_task_gva`, which finds the mapping via this index.
-    state.index_deferred_alias_pages(key.mapping_id);
-    crate::observe::line(format!(
-        "surface_writeback_deferred mapping={} {}x{} fmt={:#x} pipe={} windows={} resident={}",
-        key.mapping_id,
-        key.width,
-        key.height,
-        key.pixel_format,
-        req.pipeline_ref,
-        state.compute_deferred_flush.len(),
-        resident as u8,
-    ));
-    published_epoch
-}
 
-/// Live [`crate::model::DeferredOwner::Render`] windows, for the population cap.
-fn render_window_count(state: &DeviceState) -> usize {
-    state
-        .compute_deferred_flush
-        .values()
-        .filter(|o| matches!(o, crate::model::DeferredOwner::Render { .. }))
-        .count()
-}
 
-/// Land render windows oldest-first until the population is back under
-/// [`SURFACE_DEFERRED_WINDOW_CAP`].
-///
-/// Through the normal choke point rather than taking entries directly:
-/// `flush_intersecting` runs the fixpoint that drags in siblings overlapping the
-/// same guest bytes, and taking one window out from under that would leave those
-/// siblings holding stale ranges.
-///
-/// A window can legitimately survive its flush — a condemned backing holds its
-/// obligation for `mapper::resolve` to settle — so this steps over it and tries
-/// the next oldest. Stopping there would wedge the cap behind one stuck mapping
-/// for every other mapping, and a window owns the frame it deferred, so the
-/// leak would be a full framebuffer per stuck key.
-///
-/// The order is taken once and walked. Re-deriving "the oldest" after a refusal
-/// returns the same stuck window forever, which is the bug this replaced.
-fn evict_render_windows_to_cap<M: HostMemory + HostOps>(state: &mut DeviceState, host: &mut M) {
-    for (mid, lo, hi) in render_windows_oldest_first(state) {
-        let before = render_window_count(state);
-        if before < SURFACE_DEFERRED_WINDOW_CAP {
-            return;
-        }
-        crate::runtime::storage_flush::flush_intersecting(state, host, mid, lo, hi);
-        // Forcing a window to land early is the cap taking work off the guest's
-        // own schedule, so it says so — this is the surface rail's counterpart
-        // to `gva_deferred_flush trigger=window_cap` and `compute_mirror_evicted`.
-        // The fixpoint drags in siblings overlapping the same guest bytes, so
-        // one pass can land more than the window it was aimed at; report what
-        // actually left rather than one per pass.
-        crate::observe::off(format!(
-            "surface_window_cap_evicted mid={mid} off={lo} end={hi} live={before} \
-             cap={SURFACE_DEFERRED_WINDOW_CAP} landed={}",
-            before.saturating_sub(render_window_count(state)),
-        ));
-    }
-}
 
-/// Guest byte ranges of the live render windows, oldest first, for the cap's
-/// eviction order. Compute windows are never chosen — they are bounded by their
-/// own dispatches, and evicting one here would land content this cap was not
-/// sized for.
-///
-/// The whole order rather than just the minimum, because a window can
-/// legitimately refuse to land: a condemned backing holds its obligation for
-/// `mapper::resolve` to settle, and one boot held one for 121 s. Stopping at the
-/// oldest would wedge the cap behind it for *every other mapping*, and since a
-/// window now owns the frame it deferred that is a full framebuffer per stuck
-/// key — the "~260 stale residents pinned for the guest lifetime" shape. Step
-/// over it instead.
-fn render_windows_oldest_first(state: &DeviceState) -> Vec<(u32, u64, u64)> {
-    let mut live: Vec<(u64, u32, u64, u64)> = state
-        .compute_deferred_flush
-        .iter()
-        .filter_map(|(k, o)| match o {
-            crate::model::DeferredOwner::Render { armed_seq, .. } => {
-                Some((*armed_seq, k.mapping_id, k.surface_offset, k.span_end))
-            }
-            _ => None,
-        })
-        .collect();
-    live.sort_unstable_by_key(|(seq, ..)| *seq);
-    live.into_iter()
-        .map(|(_, mid, lo, hi)| (mid, lo, hi))
-        .collect()
-}
+
+
+
 
 /// Defer gate for the final/single record of a GVA render Store: the record
 /// may keep its pixels on the engine registry resident and land guest bytes
@@ -7330,236 +6649,7 @@ fn gva_store_defer_eligible(req: &DrawEncodeRequest) -> bool {
     pixel_format::tight_row_bytes(c0.width, c0.format).is_some_and(|t| c0.row_stride >= t)
 }
 
-/// Any host-side writer of the guest window at `gva` supersedes the deferred
-/// Store window there: a later flush of the old window would clobber the
-/// strictly-newer bytes. Same geometry drops the obligation (the new write
-/// fully covers the window; its bytes were never observable without a flush,
-/// which would have taken it); different geometry lands the old identity
-/// first, preserving the sync serialization (old bytes, then new bytes).
-pub(crate) fn supersede_gva_window<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
-    host: &mut M,
-    gva: u64,
-    width: u32,
-    height: u32,
-    by: &str,
-) {
-    let Some(old) = state.gva_deferred_flush.get(&gva) else {
-        return;
-    };
-    if old.width == width && old.height == height {
-        // The identity the OLD window pinned, which is the only slot this unpin
-        // may release: the caller's geometry says the two windows describe one
-        // region, but the resident behind the old one was created under the
-        // generation that window stored, not under whatever the address names
-        // now.
-        let old_identity = crate::runtime::storage_flush::gva_window_identity(gva, old);
-        let _ = state.take_gva_deferred_window(gva);
-        crate::backend::vulkan::engine::unpin_resident_target(&old_identity);
-        crate::observe::line(format!(
-            "gva_deferred_superseded gva={gva:#x} {width}x{height} by={by}"
-        ));
-    } else {
-        crate::runtime::storage_flush::flush_gva_exact(state, host, gva, true, by);
-    }
-}
 
-/// How often does a GVA render target's address change hands between arms?
-///
-/// The page list behind the span is the allocation's identity and needs no
-/// heuristic to say so: identical pages means literally the same guest memory,
-/// so sharing an image is correct; different pages means a different allocation
-/// and sharing would be a wrong-content bug. `gva_alloc_generation` puts that
-/// same hash in the resident's registry key, so the two now get separate images;
-/// this counts the arms where that separation is what stands between them.
-///
-/// Deliberately kept independent of the key it scores. It reads its own
-/// `gva_resident_backing` history rather than the identity, because a census
-/// that consults the mechanism it is measuring cannot report the day the
-/// mechanism stops working.
-///
-/// Free at this call site by construction — `arm_gva_deferred_store` has just
-/// walked the span to build `pages`, so this adds a hash and a map probe rather
-/// than a page walk.
-///
-/// # Measured: it happens, at 5.6 % of arms, and it is not the icon rate
-///
-/// One driven 14-round x86/Vulkan boot:
-///
-/// ```text
-/// gvares_same_alloc 59 138   gvares_aliased 3 487   gvares_regeom 3 112
-/// aliased geometries: 64x64 x227, 1938x42 x32, 675x52 x23, ...
-/// ```
-///
-/// So the address reuse is real and common: about one GVA render-target arm in
-/// eighteen lands at an address a *different* guest allocation held, and the
-/// geometry that dominates is 64x64 — a folder icon exactly, the same geometry
-/// the Finder icon class corrupts at. That boot ran the shared-image key, so
-/// each of those 3 487 arms bound the previous allocation's image.
-///
-/// **It is nevertheless not sufficient for the visible defect.** That boot
-/// scored 14 of 14 rounds CLEAN with 3 487 aliased arms in it. Binding another
-/// allocation's image is a contract violation on its own terms and worth
-/// removing, but no claim that removing it fixes the icon rate is supported by
-/// this measurement.
-///
-/// The same boot also broke the gate it was run under. `b820520` had found that
-/// driving the VM for 600 s before the icon harness produced 14 of 14 corrupt,
-/// and offered that as a repro; this boot did exactly that and produced 14 of 14
-/// clean. Pooled over five 14-round boots on this branch's fixed binary the
-/// picture is 0, 0, 0, 14, 0 corrupt — **all-or-nothing per boot**, never
-/// mixed. Whatever decides it latches once per boot and then holds for every
-/// round, which is why single-boot round counts have been so misleading here and
-/// why 8-of-14 and 1-of-14 boots were recorded on one binary earlier.
-///
-/// Scoring anything on this class therefore needs boots, not rounds. A change
-/// that is measured on one boot has measured the latch, not the change.
-fn note_gva_resident_aliasing(
-    state: &mut DeviceState,
-    gva: u64,
-    width: u32,
-    height: u32,
-    pages: &std::collections::HashSet<u64>,
-) {
-    // The same hash `gva_alloc_generation` puts in the registry key, so the
-    // census and the identity cannot disagree about what "same allocation"
-    // means — and unconditional, because a census that the bisection knob could
-    // silence would stop measuring exactly when the control arm needs it.
-    let hash = gva_page_set_hash(pages);
-    let prev = state
-        .gva_resident_backing
-        .insert(gva, (width, height, hash));
-    let Some((pw, ph, phash)) = prev else {
-        crate::runtime::drain::note_store_route("gvares_first");
-        return;
-    };
-    if (pw, ph) != (width, height) {
-        // A different geometry was always a different registry key, so the two
-        // never shared an image and this is not the address-reuse case.
-        crate::runtime::drain::note_store_route("gvares_regeom");
-        return;
-    }
-    if phash == hash {
-        crate::runtime::drain::note_store_route("gvares_same_alloc");
-        return;
-    }
-    crate::runtime::drain::note_store_route("gvares_aliased");
-    if crate::observe::first_sight("gva_resident_aliased", gva ^ ((width as u64) << 32)) {
-        crate::observe::fail(format!(
-            "gva_resident_aliased gva={gva:#x} {width}x{height} pages={} \
-             (same address and geometry, different guest allocation)",
-            pages.len()
-        ));
-    }
-}
-
-/// Arm the deferred-writeback window for a GVA render Store that just
-/// executed into the registry resident (`M2vDrawSpan::ResidentGvaStore`).
-///
-/// Returns `false` when a gate fails (unwalkable span, pin refusal) — the
-/// caller then lands the Store synchronously from a resident readback, and
-/// the sync site's supersede handling covers any older window at this GVA.
-fn arm_gva_deferred_store<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
-    host: &mut M,
-    req: &DrawEncodeRequest,
-) -> bool {
-    let Some(identity) = gva_chain_identity(req) else {
-        return false;
-    };
-    let Some(c0) = req.colors.first() else {
-        return false;
-    };
-    if !crate::backend::vulkan::engine::deferred_gpu_only_content_allowed() {
-        return false;
-    }
-    let gva = c0.target_gva;
-    let span = (c0.row_stride as u64).saturating_mul(c0.height as u64);
-    // Defer-time physical page index: raw task-GVA reads aliasing these pages
-    // flush first (`storage_flush::flush_intersecting_task_gva`). A span that
-    // does not fully walk cannot be guarded — Store synchronously.
-    let pages = gva_mem::task_gva_page_gpa_set(
-        host,
-        &state.tasks,
-        req.task_id,
-        gva,
-        span,
-        state.page_shift,
-    );
-    if (pages.len() as u64) < gva_mem::pages_spanned(gva, span, state.page_size()) {
-        return false;
-    }
-    note_gva_resident_aliasing(state, gva, c0.width, c0.height, &pages);
-    // Supersede any previous window at this GVA before pinning. Same geometry
-    // drops the obligation; different geometry is a distinct identity whose
-    // resident is intact, so it lands first.
-    //
-    // The unpin the helper performs releases the identity the OLD window
-    // pinned, which is not always the one pinned below: a re-render of the same
-    // allocation gives both the same generation and the unpin is undone by the
-    // pin, while an address handed to a second allocation gives two identities
-    // and the first one's slot correctly stops being held for a buffer that no
-    // longer exists there.
-    supersede_gva_window(state, host, gva, c0.width, c0.height, "rearm");
-    if !crate::backend::vulkan::engine::pin_resident_target(&identity) {
-        return false;
-    }
-    // Each forced landing names itself as `gva_deferred_flush trigger=window_cap`,
-    // so the cap is fail-visible without a counter beside it.
-    while state.gva_deferred_flush.len() >= GVA_DEFERRED_WINDOW_CAP {
-        let Some((old_gva, old_entry)) = state.take_oldest_gva_deferred_window() else {
-            break;
-        };
-        let _ = crate::runtime::storage_flush::flush_gva_one(
-            state,
-            host,
-            old_gva,
-            &old_entry,
-            true,
-            "window_cap",
-        );
-    }
-    let producer_object_type = objects::lookup_list_entry(state, host, req.task_id, c0.texture_ref)
-        .map(|entry| entry.object_type)
-        .unwrap_or(0);
-    // Stale encodes must not serve while the resident is authoritative —
-    // host-path consumers flush first; anything else misses (fail-safe).
-    crate::runtime::surface_cache::evict_gva(state, gva);
-    if c0.texture_ref != 0 {
-        crate::runtime::surface_cache::evict_texture(state, c0.texture_ref);
-    }
-    state.gva_deferred_seq = state.gva_deferred_seq.wrapping_add(1);
-    let armed_seq = state.gva_deferred_seq;
-    state.arm_gva_deferred_window(
-        gva,
-        crate::model::GvaDeferredEntry {
-            task_id: req.task_id,
-            texture_ref: c0.texture_ref,
-            producer_object_type,
-            width: c0.width,
-            height: c0.height,
-            row_stride: c0.row_stride,
-            format: c0.format,
-            armed_seq,
-            armed_stamp_seq: state.completion_stamp_seq,
-            pages,
-            // The generation the pinned identity above was built with, not a
-            // hash of the `pages` walked here. The two normally agree; when a
-            // remap lands between the draw's walk and this one they do not, and
-            // the value that finds the pinned slot is the one the draw used.
-            alloc_gen: req.gva_alloc_gen,
-        },
-    );
-    crate::observe::line(format!(
-        "gva_writeback_deferred gva={gva:#x} {}x{} fmt={:#x} pipe={} windows={}",
-        c0.width,
-        c0.height,
-        c0.format,
-        req.pipeline_ref,
-        state.gva_deferred_flush.len()
-    ));
-    true
-}
 
 #[cfg(all(test, feature = "backend-vulkan"))]
 mod vulkan_split_tests {
@@ -7940,98 +7030,7 @@ mod vulkan_split_tests {
         );
     }
 
-    /// A refused arm must hand the frame back intact, because the synchronous
-    /// route is the next thing to run and those are the only pixels it has.
-    ///
-    /// The `Result<u32, Vec<u8>>` exists for this. With a `bool` the buffer had
-    /// to be borrowed, which forced the success path to clone a whole frame —
-    /// ~4.7 MB at ~200 Stores/s, measured at 152 ms/s of `t11_convert_us`. Moving
-    /// it in makes the refusal responsible for giving it back, and an `Err` built
-    /// with the wrong buffer (or an empty one) would not fail to compile: it
-    /// would write a blank or truncated frame into the guest's pages on every
-    /// refusal, which is the black-layer class.
-    #[test]
-    fn a_refused_deferred_arm_returns_the_frame_it_was_given() {
-        let mut state = DeviceState::new(DeviceId(0), PAGE_SHIFT_X86);
-        let mut host = FakeHost::new();
-        let frame: Vec<u8> = (0..(8 * 4 * 4)).map(|i| (i % 251) as u8).collect();
-        let original = frame.clone();
 
-        // A bare request against empty state: no surface window is eligible, so
-        // the arm refuses at its first gate, before touching the frame.
-        let req = DrawEncodeRequest::default();
-        let out = arm_surface_deferred_store_with(&mut state, &mut host, &req, 7, 8, 4, frame);
-
-        match out {
-            Ok(epoch) => panic!("expected a refusal from empty state, armed at epoch {epoch}"),
-            Err(returned) => assert_eq!(
-                returned, original,
-                "the refusal must return the same pixels it was handed"
-            ),
-        }
-    }
-
-    /// Both sides absent must not read as agreement.
-    ///
-    /// `Option<u32> == Option<u32>` makes `None == None` true, so a bare
-    /// equality here would let a mapping with no entry match an image that was
-    /// never stamped, and the pass would `LoadFromTarget` out of undefined
-    /// memory instead of seeding. That is the black-layer class, arrived at
-    /// from a new direction: a whole compositing layer renders as a sharp
-    /// axis-aligned rectangle of garbage or black.
-    /// The registry key for a GVA resident is `(gva, width, height)`, so the
-    /// only thing that can tell two allocations at one address apart is the
-    /// guest memory behind them. The census has to separate three cases that
-    /// look identical from the address alone, and must not call a re-render of
-    /// the same buffer an aliased reuse — that would report the common case as
-    /// the defect and make the counter useless.
-    #[test]
-    fn a_second_arm_is_aliased_only_when_the_guest_pages_changed() {
-        use crate::runtime::drain::store_route_count;
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-        let a: std::collections::HashSet<u64> = [0x1000, 0x2000, 0x3000].into_iter().collect();
-        // Same pages, different traversal order: the set is the identity.
-        let a_reordered: std::collections::HashSet<u64> =
-            [0x3000, 0x1000, 0x2000].into_iter().collect();
-        let b: std::collections::HashSet<u64> = [0x1000, 0x2000, 0x9000].into_iter().collect();
-
-        let (f0, s0, x0) = (
-            store_route_count("gvares_first"),
-            store_route_count("gvares_same_alloc"),
-            store_route_count("gvares_aliased"),
-        );
-
-        super::note_gva_resident_aliasing(&mut state, 0x8000, 64, 64, &a);
-        assert_eq!(
-            store_route_count("gvares_first"),
-            f0 + 1,
-            "nothing to compare against yet"
-        );
-
-        super::note_gva_resident_aliasing(&mut state, 0x8000, 64, 64, &a_reordered);
-        assert_eq!(
-            (store_route_count("gvares_same_alloc"), store_route_count("gvares_aliased")),
-            (s0 + 1, x0),
-            "the same buffer re-rendered shares its image correctly, and walk order is not a change"
-        );
-
-        super::note_gva_resident_aliasing(&mut state, 0x8000, 64, 64, &b);
-        assert_eq!(
-            store_route_count("gvares_aliased"),
-            x0 + 1,
-            "different guest pages at the same address and geometry is a different \
-             allocation inheriting the previous one's image"
-        );
-
-        // A geometry change makes a different registry key, so the two residents
-        // are distinct and nothing is inherited.
-        super::note_gva_resident_aliasing(&mut state, 0x8000, 32, 32, &a);
-        assert_eq!(
-            store_route_count("gvares_aliased"),
-            x0 + 1,
-            "a different geometry is a different key and must not be scored as aliasing"
-        );
-    }
 
     /// One guest page-table entry pointing GVA page 1 at `pfn`, on a task the
     /// GVA walker will accept. Returns the state the walk reads its task from;
@@ -8129,51 +7128,6 @@ mod vulkan_split_tests {
         );
     }
 
-    /// A deferred window binds, flushes and unpins the resident it armed — even
-    /// after the address stops resolving to the pages it was armed on.
-    ///
-    /// The window exists because the guest may reuse the address before the
-    /// flush runs, so the identity has to be rebuilt from the window rather than
-    /// from a fresh walk. A walk taken at flush time names whatever lives there
-    /// now; the registry lookup then misses the slot the window is holding
-    /// pinned, and the deferred frame is lost to a `deferred_flush_lost` instead
-    /// of landing in guest memory.
-    #[test]
-    fn a_deferred_window_rebuilds_the_identity_it_armed_after_the_backing_moves() {
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-        let mut host = FakeHost::new();
-        map_one_gva_page(&mut host, 4);
-        state.define_task(1, 0x1_0000, 2);
-
-        let mut req = one_page_gva_request();
-        req.gva_alloc_gen = super::gva_alloc_generation(&state, &mut host, &req);
-        let armed = super::gva_chain_identity(&req).expect("a GVA color0 has a chain identity");
-        let window = crate::model::GvaDeferredEntry {
-            task_id: req.task_id,
-            texture_ref: 7,
-            producer_object_type: 2,
-            width: 8,
-            height: 8,
-            row_stride: 32,
-            format: 0x46,
-            armed_seq: 1,
-            armed_stamp_seq: 0,
-            pages: std::collections::HashSet::new(),
-            alloc_gen: req.gva_alloc_gen,
-        };
-
-        map_one_gva_page(&mut host, 5);
-        assert_ne!(
-            super::gva_alloc_generation(&state, &mut host, &req),
-            window.alloc_gen,
-            "the fixture must actually move the backing, or this passes for the wrong reason"
-        );
-        assert_eq!(
-            crate::runtime::storage_flush::gva_window_identity(0x1000, &window),
-            armed,
-            "the window must still name the resident it pinned"
-        );
-    }
 
     /// The set of pages is the identity; the order a walk reports them in is
     /// not, and one page of difference is a different allocation.
@@ -8696,77 +7650,6 @@ mod vulkan_split_tests {
         );
     }
 
-    /// One window that refuses to land must not wedge the cap for every other
-    /// mapping.
-    ///
-    /// A condemned backing holds its obligation for `mapper::resolve` to settle —
-    /// one boot held one for 121 s across 13015 flush attempts — and the eviction
-    /// loop used to re-derive "the oldest" each pass and stop when it did not
-    /// shrink. That returns the same stuck window forever, so the population
-    /// grows without bound past the cap. It was survivable while a window was
-    /// just a key; now that a window owns the frame it deferred, it leaks a whole
-    /// framebuffer per stuck key.
-    #[test]
-    fn a_stuck_oldest_window_does_not_wedge_the_cap_for_the_others() {
-        use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-        let mut host = FakeHost::new();
-
-        let arm = |state: &mut DeviceState, mid: u32, seq: u64| {
-            let gpa = 0xA000_0000u64 + (mid as u64) * 0x10_0000;
-            state.map_surface(mid);
-            {
-                let m = state.mappings.get_mut(&mid).unwrap();
-                m.mapped = true;
-                m.map_generation = 1;
-                m.page_entries = vec![
-                    (((gpa >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID,
-                ];
-            }
-            state.compute_deferred_flush.insert(
-                crate::model::ComputeStorageResidencyKey {
-                    mapping_id: mid,
-                    map_generation: 1,
-                    surface_offset: 0,
-                    surface_bpr: 64,
-                    span_end: 256,
-                    width: 4,
-                    height: 4,
-                    pixel_format: crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM,
-                    texture_ref: 0,
-                },
-                crate::model::DeferredOwner::Render {
-                    armed_seq: seq,
-                    armed_stamp_seq: 0,
-                    source: crate::model::RenderWindowSource::Owned(std::sync::Arc::new(
-                        vec![0u8; 4 * 4 * 4],
-                    )),
-                },
-            );
-        };
-
-        // The oldest window sits on a condemned backing, so its flush is held.
-        arm(&mut state, 1, 1);
-        assert!(state.condemn_surface_backing(1), "mapping 1 must condemn");
-        assert!(state.mapping_backing_condemned(1));
-        // Fill past the cap with windows that can land.
-        for i in 0..SURFACE_DEFERRED_WINDOW_CAP {
-            arm(&mut state, 2 + i as u32, 2 + i as u64);
-        }
-        let before = render_window_count(&state);
-        assert!(before > SURFACE_DEFERRED_WINDOW_CAP);
-
-        evict_render_windows_to_cap(&mut state, &mut host);
-
-        assert!(
-            render_window_count(&state) < before,
-            "the stuck oldest must be stepped over, not stopped on"
-        );
-        assert!(
-            state.mapping_backing_condemned(1),
-            "and the held window's mapping is left for the resolve to settle"
-        );
-    }
 
     #[test]
     fn m2v_draw_runtime_failure_returns_a_typed_decline() {

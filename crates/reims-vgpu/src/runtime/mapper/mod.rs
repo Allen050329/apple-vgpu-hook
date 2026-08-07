@@ -686,7 +686,6 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
         // The condemned backing really died and the id now carries a new
         // surface: drop the prior incarnation's deferred windows before any
         // access could flush old content through the new pages.
-        crate::runtime::storage_flush::drop_windows(state, mapping_id, "incarnation_changed");
     } else if reprieved {
         // Stale trailing delete on a live incarnation — the exact black-band
         // trigger. Only note when content was actually at stake (an armed
@@ -858,7 +857,6 @@ fn fail_closed_surface_page_collision(
     path: &str,
 ) {
     note_surface_page_collision(mapping_id, gpa, owner, mine_pages, path);
-    crate::runtime::storage_flush::drop_windows(state, mapping_id, "surface_page_collision");
     let _ = state.invalidate_mapping_pages(mapping_id);
 }
 
@@ -2300,13 +2298,7 @@ pub fn write_mapping_bytes_only<H: HostMemory + HostOps>(
     }
     // Deferred-writeback flush-on-access: land any pending resident content
     // in these pages first so this write applies on top of it, not under it.
-    crate::runtime::storage_flush::flush_intersecting(
-        state,
-        host,
-        mapping_id,
-        off,
-        off.saturating_add(buf.len() as u64),
-    );
+    crate::runtime::render_writeback::settle_guest_writes();
     // Exact-window residency invalidation: guest pages in this range no
     // longer mirror any resident storage image (disjoint windows survive).
     state.invalidate_storage_residency_window(
@@ -2351,13 +2343,7 @@ pub fn read_mapping_bytes<H: HostMemory + HostOps>(
     }
     // Deferred-writeback flush-on-access: this read must observe the resident
     // content, not the stale pre-dispatch guest bytes.
-    crate::runtime::storage_flush::flush_intersecting(
-        state,
-        host,
-        mapping_id,
-        off,
-        off.saturating_add(buf.len() as u64),
-    );
+    crate::runtime::render_writeback::settle_guest_writes();
     copy_mapping_runs(
         state,
         host,

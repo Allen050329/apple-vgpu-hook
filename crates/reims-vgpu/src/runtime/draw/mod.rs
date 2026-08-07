@@ -3751,17 +3751,6 @@ pub(crate) fn load_vulkan_sampler<M: HostMemory + HostOps>(
     vulkan_sampler_resource(sampler_ref, binding, &sampler)
 }
 
-/// Metal-direct builds never arm GVA windows — nothing to supersede.
-#[cfg(not(feature = "backend-vulkan"))]
-pub(crate) fn supersede_gva_window<M: HostMemory + HostOps>(
-    _state: &mut DeviceState,
-    _host: &mut M,
-    _gva: u64,
-    _width: u32,
-    _height: u32,
-    _by: &str,
-) {
-}
 
 /// Store encode RGBA8 into **texture_ref** host cache as BGRA (not surface_id).
 #[cfg(test)]
@@ -3859,7 +3848,6 @@ pub fn writeback_chain_rgba<M: HostMemory + HostOps>(
         return lost("readback_short");
     }
     if gva != 0 {
-        supersede_gva_window(state, host, gva, w, h, "chain_land");
         // The refusal is carried out, not collapsed. `write_gva_rgba8`'s own doc
         // asks for exactly this — "a caller has to be able to tell 'the guest
         // tore this target down' from a write that genuinely lost content" — and
@@ -4568,12 +4556,9 @@ fn seed_color_load<M: HostMemory + HostOps>(
     width: u32,
     height: u32,
 ) -> Option<Vec<u8>> {
-    // A deferred GVA Store window here can only be a geometry mismatch (the
-    // request-build path skips the seed for a matching window): land it so
-    // the cache/guest reads below serve the Store's bytes, not stale ones.
-    if target_gva != 0 && state.gva_deferred_flush.contains_key(&target_gva) {
-        crate::runtime::storage_flush::flush_gva_exact(state, host, target_gva, true, "load_seed");
-    }
+    // The guest reads below may be served by pages a Store wrote through the
+    // GPU, whose copy is submitted and not waited on.
+    crate::runtime::render_writeback::settle_guest_writes();
     // Discrete GPU: exact target GVA is the strongest identity across object-ref
     // recycling. Fall back to the type-2/3 texture namespace, never the
     // unrelated type-4 surface_id namespace. Guest memory is last.

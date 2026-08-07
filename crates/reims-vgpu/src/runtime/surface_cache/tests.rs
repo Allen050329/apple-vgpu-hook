@@ -362,17 +362,6 @@ fn linear_resident_retires_on_task_and_object_delete() {
     assert!(note_linear_texture_resident(&mut st, &win, 2));
     // A pending guest-flush obligation dies with the entry (boot-16 rule:
     // never write guest pages at a lifetime boundary).
-    let obligation_key = crate::model::ComputeStorageResidencyKey::linear(
-        6,
-        21,
-        0x30_2000,
-        32,
-        64,
-        4,
-        2,
-        MTL_FORMAT_RGBA16_FLOAT,
-    );
-    st.arm_linear_deferred_window(obligation_key, 2, std::collections::HashSet::new());
     assert!(st.delete_task(6));
     assert_eq!(st.retired_linear_residents.len(), 1);
     let key = st.retired_linear_residents[0];
@@ -380,12 +369,8 @@ fn linear_resident_retires_on_task_and_object_delete() {
     assert_eq!(key.map_generation, 6);
     assert_eq!(key.texture_ref, 21);
     assert_eq!(key.surface_offset, 0x30_2000);
-    crate::runtime::storage_flush::retire_linear_residents(&mut st);
+    crate::runtime::render_writeback::retire_linear_residents(&mut st);
     assert!(st.retired_linear_residents.is_empty());
-    assert!(
-        st.linear_deferred_flush.is_empty(),
-        "retire must drop the guest-flush obligation"
-    );
 
     st.define_task(6, 0x1000, 1);
     st.insert_object(6, 21);

@@ -254,17 +254,13 @@ pub fn capture_present_frame(
     // path — kb tahoe-x86-host-reims_vgpu §8.5); otherwise the resident below.
     // There is no guest-page fallback any more — see the note at the resident
     // capture for why it was deleted rather than kept as a second vein.
-    let from_host_cache = if let Some(cached) =
-        crate::runtime::surface_cache::get(state, mapping_id, width, height)
-    {
-        buf.copy_from_slice(cached);
-        true
-    } else {
-        false
-    };
-    if from_host_cache {
-        crate::runtime::storage_flush::note_render_flush_cache_read(state, mapping_id);
-    }
+    let from_host_cache =
+        if let Some(cached) = crate::runtime::surface_cache::get(state, mapping_id, width, height) {
+            buf.copy_from_slice(cached);
+            true
+        } else {
+            false
+        };
     // Resident-direct capture — the ONLY GPU-content capture source.
     //
     // The proxies need the finished frame's BYTES; they do not need those bytes
@@ -891,7 +887,7 @@ fn paint_mapping<M: HostMemory + crate::runtime::host::HostOps>(
     // raw contig view below, which bypasses the hooked readers — land any
     // resident-authoritative window (compute or render Store) first.
     //
-    let _ = crate::runtime::storage_flush::flush_intersecting(state, host, mapping_id, 0, u64::MAX);
+    crate::runtime::render_writeback::settle_guest_writes();
 
     let Some(m) = state.mappings.get(&mapping_id) else {
         return fail(CaptureDecline::NoMapping);
