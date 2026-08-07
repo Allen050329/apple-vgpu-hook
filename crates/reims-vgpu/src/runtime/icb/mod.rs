@@ -1392,6 +1392,13 @@ pub fn resolve_icb_record<M: HostMemory + HostOps>(
             Ok(rec.desc.clone())
         }
         slot => {
+            // A refreshed descriptor starts with no command memory, and that
+            // drops whatever `bind_icb_command_memory` had recorded for this
+            // ref. Unobservable today because nothing binds it, but whoever
+            // finds the wire record that does has to decide here whether a
+            // create-body change invalidates the buffer too — the guest may
+            // have changed only `maxCommandCount` and still be filling the
+            // same slots.
             let command_memory = None;
             let rec = IcbRecord {
                 desc: desc.clone(),
@@ -1582,6 +1589,67 @@ pub fn decode_icb_host_resource_info(bytes: &[u8]) -> Result<IcbHostResourceInfo
         reply_buffer_ref,
         reply_offset,
     })
+}
+
+/// The check [`decode_icb_command_range`] fails when an ICB has no command
+/// memory bound, named here because [`icb_fill_outcome`] compares against it.
+///
+/// Spelled once so the raise site and the arm that classifies it cannot drift:
+/// a literal in both places reads as two independent facts, and a rename of one
+/// silently turns the classification into a forward.
+pub const ICB_FILL_NO_COMMAND_MEMORY: &str = "icb_fill_no_command_memory";
+
+/// What an ICB execute does with the outcome of filling its slots from the
+/// guest's command memory, decided once for every pathway.
+///
+/// # Why this is not spelled at the call sites
+///
+/// It was, twice — the render arm in `runtime::draw::metal_icb` and the compute
+/// arm in `runtime::compute_session` each carried
+/// `Ok(()) | Err(IcbStatus::Missing(_)) => {}`. Two copies of one rule, and the
+/// wildcard is what made them wrong: [`decode_icb_command_range`] raises
+/// `Missing` under two different slugs, and only one of them was argued for.
+///
+/// # What each outcome means
+///
+/// - `Ok(())` — slots were filled from guest memory and the execute replays
+///   the guest's own commands.
+/// - [`ICB_FILL_NO_COMMAND_MEMORY`] — the ICB is registered but nothing bound
+///   the buffer holding its command slots, so the execute runs an ICB with no
+///   commands in it and **every command the guest encoded into it is lost**.
+///   Control flow is unchanged — an empty execute is a no-op, and refusing here
+///   would additionally skip the attachment writeback the caller does after —
+///   but the loss is now counted and fail-visible instead of being swallowed as
+///   an "empty shell" case. That phrase came from a reading in which opcode
+///   `0x1d1` bound command memory; it is an info query, and since it stopped
+///   being treated as a bind **no decode path binds command memory at all**
+///   ([`bind_icb_command_memory`]'s only caller is
+///   [`associate_icb_backing_buffer_ref`], which nothing outside tests calls).
+///   So this is not a rare shape — it is what every ICB execute meets today,
+///   and a counter reading zero here means no guest reached the rail rather
+///   than that the rail worked.
+/// - anything else — forwarded to the caller, which declines by the slug of the
+///   check that refused. `icb_fill_not_cached` reaches this arm and is
+///   unreachable in practice: both call sites run `resolve_metal_icb` first,
+///   and [`resolve_icb_record`] inserts a record for every ref it is asked
+///   about. It forwards rather than being swallowed because a fill against an
+///   ICB the registry has never seen is a different loss from an empty one.
+pub fn icb_fill_outcome(
+    outcome: Result<(), IcbStatus>,
+    task_id: u32,
+    icb_ref: u32,
+) -> Result<(), IcbStatus> {
+    match outcome {
+        Err(IcbStatus::Missing(slug)) if slug == ICB_FILL_NO_COMMAND_MEMORY => {
+            crate::runtime::drain::note_store_route("icb_executed_without_command_memory");
+            crate::observe::Emit::decline("icb_execute_empty", &IcbStatus::Missing(slug))
+                .field("task", task_id)
+                .field("icb", icb_ref)
+                .fail_once(u64::from(icb_ref));
+            Ok(())
+        }
+        other => other,
+    }
 }
 
 /// Register guest command-memory GVA for an ICB (backing buffer for CPU fills).
@@ -1920,7 +1988,7 @@ pub fn decode_icb_command_range<M: HostMemory + HostOps>(
             .ok_or(IcbStatus::Missing("icb_fill_not_cached"))?;
         let mem = rec
             .command_memory
-            .ok_or(IcbStatus::Missing("icb_fill_no_command_memory"))?;
+            .ok_or(IcbStatus::Missing(ICB_FILL_NO_COMMAND_MEMORY))?;
         (
             rec.desc.layout,
             rec.desc.max_kernel_buffer_bind_count,

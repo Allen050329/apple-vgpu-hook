@@ -676,7 +676,7 @@ pub fn encode_icb_execute_and_writeback<M: HostMemory + HostOps>(
 ) -> EncodeStatus {
     use crate::backend::metal::runtime::{system_device, thread_queue};
     use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
-    use crate::runtime::icb::{fill_icb_from_command_memory, resolve_metal_icb, IcbStatus};
+    use crate::runtime::icb::{fill_icb_from_command_memory, resolve_metal_icb};
     use metal::*;
 
     if icb_ref == 0 {
@@ -719,18 +719,23 @@ pub fn encode_icb_execute_and_writeback<M: HostMemory + HostOps>(
     if range_location.saturating_add(range_length) > size {
         return EncodeStatus::BadArgs("icb_exec_range_past_size");
     }
-    // Best-effort fill from bound command memory (Missing = empty shell / host-filled).
-    match fill_icb_from_command_memory(
-        state,
-        host,
+    // Fill the host ICB's slots from the guest's command memory. What an
+    // unfilled ICB costs, and which outcomes an execute may carry on from, is
+    // `icb_fill_outcome`'s to say — the compute arm asks the same function, so
+    // the two cannot answer it differently.
+    match crate::runtime::icb::icb_fill_outcome(
+        fill_icb_from_command_memory(
+            state,
+            host,
+            req.task_id,
+            icb_ref,
+            range_location,
+            range_length,
+        ),
         req.task_id,
         icb_ref,
-        range_location,
-        range_length,
     ) {
-        // `Missing` is the empty-shell / host-filled case named above: control
-        // flow, not a refusal, so it stays out of the log.
-        Ok(()) | Err(IcbStatus::Missing(_)) => {}
+        Ok(()) => {}
         Err(e) => return render_icb_declined(e, req.task_id, icb_ref),
     }
 

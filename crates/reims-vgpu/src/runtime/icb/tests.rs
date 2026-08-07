@@ -4949,3 +4949,64 @@ fn a_render_icb_stage_declaring_no_binds_refuses_index_zero() {
         assert!(refuse_render_bind_past_declared_max(stage, 0, &desc).is_err());
     }
 }
+
+/// An execute that filled no slots says so, and one that met a different
+/// refusal still forwards it.
+///
+/// The rule this pins used to be a wildcard — `Err(IcbStatus::Missing(_)) => {}`
+/// — copied into the render arm and the compute arm. It swallowed both slugs
+/// `decode_icb_command_range` raises under `Missing`, and only one of them had
+/// been argued for. The four cases below are the whole vocabulary that reaches
+/// this function: filled, unfilled, the other `Missing`, and everything else.
+#[test]
+fn an_icb_execute_that_filled_no_slots_is_counted_and_not_swallowed() {
+    use crate::runtime::drain::store_route_count;
+    const ROUTE: &str = "icb_executed_without_command_memory";
+
+    let quiet = store_route_count(ROUTE);
+    assert_eq!(
+        icb_fill_outcome(Ok(()), 1, 9),
+        Ok(()),
+        "a filled ICB is carried on from"
+    );
+    assert_eq!(
+        store_route_count(ROUTE),
+        quiet,
+        "a filled ICB costs the guest nothing and must not count"
+    );
+
+    // The unfilled case: control flow is unchanged so the caller still does its
+    // writeback, but the lost commands are now counted.
+    assert_eq!(
+        icb_fill_outcome(
+            Err(IcbStatus::Missing(ICB_FILL_NO_COMMAND_MEMORY)),
+            1,
+            9
+        ),
+        Ok(()),
+        "an empty execute is a no-op, not a reason to skip the writeback"
+    );
+    assert_eq!(
+        store_route_count(ROUTE),
+        quiet + 1,
+        "the commands the guest encoded into this ICB were lost, and it says so"
+    );
+
+    // The other `Missing` slug, and a variant from another class. Both forward,
+    // so the caller declines by the name of the check that actually refused.
+    for other in [
+        IcbStatus::Missing("icb_fill_not_cached"),
+        IcbStatus::Args("icb_fill_zero_command_size"),
+    ] {
+        assert_eq!(
+            icb_fill_outcome(Err(other), 1, 9),
+            Err(other),
+            "{other:?} names a different loss and must not be swallowed"
+        );
+    }
+    assert_eq!(
+        store_route_count(ROUTE),
+        quiet + 1,
+        "a forwarded refusal is not an empty execute"
+    );
+}

@@ -280,7 +280,6 @@ impl ComputeSession {
             use crate::runtime::compute_exec::read_buffer_window;
             use crate::runtime::icb::{
                 export_icb_writeback_job, fill_icb_from_command_memory, resolve_metal_icb,
-                IcbStatus,
             };
             use metal::MTLResourceOptions;
 
@@ -302,12 +301,15 @@ impl ComputeSession {
                         return ComputeStatus::Unsupported("icb_range_exceeds_size");
                     }
                     // Buffer-backed fills: re-decode guest ICB command memory into host slots.
-                    // Missing command memory is ok (empty ICB / host-API fills already applied).
-                    match fill_icb_from_command_memory(state, host, task_id, icb_ref, loc, len) {
-                        // `Missing` here is the empty-shell case the comment
-                        // above describes, so it stays control flow and out of
-                        // the log; everything else forwards its own reason.
-                        Ok(()) | Err(IcbStatus::Missing(_)) => {}
+                    // `icb_fill_outcome` owns what an unfilled ICB costs and
+                    // which outcomes an execute carries on from; the render arm
+                    // in `runtime::draw::metal_icb` asks the same function.
+                    match crate::runtime::icb::icb_fill_outcome(
+                        fill_icb_from_command_memory(state, host, task_id, icb_ref, loc, len),
+                        task_id,
+                        icb_ref,
+                    ) {
+                        Ok(()) => {}
                         Err(e) => return e.into(),
                     }
                     // Parent-encoder inheritance after slot fill, before execute
