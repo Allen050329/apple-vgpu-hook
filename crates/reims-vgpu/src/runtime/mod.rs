@@ -46,6 +46,9 @@ pub mod gpa_map;
 /// export to.
 #[cfg(feature = "backend-vulkan")]
 pub mod guest_dmabuf;
+/// The bound on every GPU reference to guest RAM — one import per RAMBlock,
+/// and the only type that can name a byte inside one.
+pub mod guest_ram;
 /// Task GVA → guest RAM reads.
 pub mod gva_mem;
 /// Task-GVA HostOps views (MapMemory2 / UnmapMemory lifecycle).
