@@ -81,7 +81,15 @@ const CAPABILITY_STORAGE_IMAGE_WRITE_WITHOUT_FORMAT: u32 = 34;
 /// SPIR-V `Decoration Binding`.
 const DECORATION_BINDING: u32 = 33;
 const HEADER_WORDS: usize = 5;
-const BUFFER_BINDING_LIMIT: u32 = 32;
+/// First binding of the translator's sampled-resource band, and therefore the
+/// exclusive end of its buffer band — the two are the same number because the
+/// bands abut.
+///
+/// A second constant used to spell this `BUFFER_BINDING_LIMIT: u32 = 32` on the
+/// line above, which read as Apple's buffer bind limit and was not one: that is
+/// `reims_vgpu_wire::ops::bind_limit::BUFFER`, and it is **31**. Nothing here
+/// bounds how many buffers a guest may bind; this only says where one band stops
+/// and the next starts, which is a fact about our own translated layout.
 const SAMPLED_RESOURCE_BINDING_BASE: u32 = 32;
 const STORAGE_CLASS_UNIFORM_CONSTANT: u32 = 0;
 const STORAGE_CLASS_STORAGE_BUFFER: u32 = 12;
@@ -187,7 +195,7 @@ const _: () = assert!(
 const _: () = assert!(FRAG_BUFFER_BINDING_OFFSET >= COLOR_INPUT_BINDING_BASE + 8);
 // ...and ends before the relocated fragment sampled bands begin.
 const _: () = assert!(
-    BUFFER_BINDING_LIMIT - 1 + FRAG_BUFFER_BINDING_OFFSET
+    SAMPLED_RESOURCE_BINDING_BASE - 1 + FRAG_BUFFER_BINDING_OFFSET
         < TEXTURE_BINDING_BASE + FRAG_SAMPLED_RESOURCE_BINDING_OFFSET
 );
 // The widest relocated binding still fits a `u32`.
@@ -1290,7 +1298,7 @@ pub fn offset_fragment_buffer_bindings(words: &mut [u32]) -> usize {
     relocate_by_class(
         words,
         &[BindingClass::Buffer],
-        |binding| binding < BUFFER_BINDING_LIMIT,
+        |binding| binding < SAMPLED_RESOURCE_BINDING_BASE,
         FRAG_BUFFER_BINDING_OFFSET,
     )
 }
