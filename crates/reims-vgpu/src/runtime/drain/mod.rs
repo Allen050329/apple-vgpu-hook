@@ -683,24 +683,51 @@ fn packet_snapshot_len(header: &[u8], available: u32, ring_capacity: u32) -> u32
 /// the two readings — which is the point. It says the records are about
 /// ordering without saying which direction they order in.
 ///
-/// The records have shape. `w0` is small and repeats — 1, 2, 4 — and `w1`
-/// ranges from 1 to 0x5da and is larger for the commands that appear later in
-/// the boot. That is the profile of `{u32 index, u32 value}` with a monotonic
-/// value, which is exactly the pair [`write_stamp`] already takes for the
-/// header's own `completion_stamp` — `stamp_slot_index` masks an index out of a
-/// word and `stamp_slot_offset` places it in the stamp page.
+/// # What the records are: a wait, established by RE
 ///
-/// **That is a resemblance, not a decode, and the difference decides whether
-/// this is a bug.** If a record is a stamp to *retire*, this device is leaving
-/// the guest waiting on values it never writes. If it is a stamp to *wait on*,
-/// this device is running commands ahead of work they were ordered behind. If
-/// it is neither, the skip is right. Nothing here has established which, and
-/// guessing between "write it" and "wait for it" would be picking one of two
-/// opposite behaviours from the same bytes. The next step is RE of the
-/// producer, not a heuristic fitted to the ten rows above.
+/// Each record is `{u32 stamp_index, u32 stamp_value}` and means **"do not
+/// execute this command until stamp slot `stamp_index` has reached
+/// `stamp_value`"**. Apple's host acts on them, before dispatch. The alternative
+/// reading — an extra completion stamp to *signal* — is positively excluded
+/// rather than merely disfavoured, because the signal has a different home and a
+/// different producer: the guest's command allocator has one method that appends
+/// these 8 bytes and bumps the header's count, and a separate one that writes a
+/// stamp value into the header's own `completion_stamp` field and appends
+/// nothing. Wait goes in the record array; signal goes in the header. They
+/// cannot be the same thing.
 ///
-/// What the reading does settle is that the question is worth answering: a
-/// zero here would have closed it, and it is not zero.
+/// Details that a first implementation gets wrong without being told:
+///
+/// * The comparison is a **signed wrapping** difference — satisfied iff
+///   `(current - stamp_value) as i32 >= 0`. A plain `>=` is wrong once a slot
+///   wraps.
+/// * `stamp_index` is an index into the same stamp space [`write_stamp`] writes,
+///   one slot per FIFO, root at 0. It is range-checked against the device's FIFO
+///   count, so it is an index and not a mask — the observed 1, 2, 4 are just the
+///   child FIFOs this workload created.
+/// * The wait is **per-FIFO**, not device-wide. The awaited stamp is published
+///   by *another* channel's drain, so a single-threaded drain that blocks here
+///   deadlocks itself. The shape that works is to defer the channel and move on.
+/// * The guest pre-filters dependencies it can already see satisfied, so the
+///   ~10 % measured above is genuinely-unsatisfied-at-submit-time rather than
+///   noise, and a record naming the submitting channel's own slot should never
+///   appear.
+/// * The count is bounded at 64 by the host, which refuses above it.
+///
+/// **So skipping them is an ordering bug, and the opcode list above is exactly
+/// its blast radius.** The stamps do eventually get written, so this is not a
+/// hang; it is work running ahead of the work it was ordered behind.
+/// `CHILD_OP_DELETE_TASK`, `CHILD_OP_DELETE_OBJECT` and
+/// `CHILD_OP_UNMAP_MEMORY` tear down memory the GPU may still be sourcing, which
+/// makes ignoring their records a use-after-free of guest pages — the same class
+/// as the completion-stamp ordering [`write_stamp`] already carries a flush for,
+/// and which its doc records having caused heap corruption once.
+///
+/// Nothing is implemented here yet, and the reason is in the third bullet: this
+/// device's drain does not have a per-channel deferral to hang a wait on, and
+/// adding one is not a change to make in the same commit that identified the
+/// field. Until it exists, this line is the record that the gap is known and
+/// measured rather than unseen.
 fn note_packet_stamp_records(opcode: u16, stamp_count: u16, bytes: &[u8]) {
     if stamp_count == 0 {
         note_store_route("packet_stamps_none");
