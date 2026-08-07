@@ -7,9 +7,9 @@
 //! `drain::note_store_route("…_dropped")` — a name and a count, no type, and so
 //! no row in that census and no line on the fail channel either.
 //!
-//! Thirty-one slugs in this crate are spelled that way, and twenty-six of
-//! them name a decoded guest command or a decoded piece of render state that
-//! this device did not apply. They are exactly the `Loss::ExecutedModified`
+//! Thirty slugs in this crate are spelled that way, and twenty-five of them
+//! name a decoded guest command or a decoded piece of render state that this
+//! device did not apply. They are exactly the `Loss::ExecutedModified`
 //! class, wearing a spelling the census cannot see — and there are more than
 //! three times as many of them as the eight that census counts.
 //!
@@ -101,14 +101,6 @@ const ROWS: &[(&str, Counted, &str)] = &[
          layout. Fires only under `has_attribute_stride`. Before this arm \
          existed the whole record was refused and the buffer never bound at \
          all, so the count is the distance still left rather than a regression",
-    ),
-    (
-        "render_sampler_lod_dropped",
-        Counted::StateNotApplied,
-        "the sampler bind applies and the per-entry LOD clamp pair does not, \
-         because `SamplerBind` carries no clamps and neither backend is asked \
-         for any. Same history as the stride above: the record used to reach no \
-         arm and leave the slot unbound",
     ),
     (
         "render_store_action_override_dropped",
@@ -507,7 +499,7 @@ fn no_counted_loss_is_unread() {
 /// population without changing anything the guest sees.
 #[test]
 fn the_counted_loss_census_only_shrinks() {
-    const COUNTED_LOSS_CEILING: usize = 26;
+    const COUNTED_LOSS_CEILING: usize = 25;
     let losses = ROWS
         .iter()
         .filter(|(_, c, _)| matches!(c, Counted::StateNotApplied | Counted::WorkNotExecuted))

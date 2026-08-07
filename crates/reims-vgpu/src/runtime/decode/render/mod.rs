@@ -591,6 +591,12 @@ pub struct Command {
     pub texture_ref: u32,
     /// Multi-entry texture/sampler refs for slots first..first+count.
     pub ref_binds: Vec<u32>,
+    /// `(lodMinClamp, lodMaxClamp)` as raw `f32` bits, one per entry of
+    /// [`Self::ref_binds`], for the two sampler-bind opcodes that carry them.
+    /// Empty for every other record, including the plain sampler bind — an
+    /// empty list is "the record declared no clamps", which is not the same as
+    /// a pair that happens to be `(0.0, 0.0)`.
+    pub sampler_lod_binds: Vec<(u32, u32)>,
     pub sampler_ref: u32,
     pub primitive_type: u32,
     pub vertex_start: u32,
@@ -940,8 +946,8 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             Ok(out)
         }
         wire::OPCODE_SET_VERTEX_SAMPLER_LOD | wire::OPCODE_SET_FRAGMENT_SAMPLER_LOD => {
-            // LOD clamps are not lifted (nothing applies them), but the bind
-            // itself is read through the wire layout rather than dropped.
+            // Both halves are lifted: the refs into `ref_binds` and the
+            // per-entry clamps into `sampler_lod_binds` beside them.
             let (head, entries) =
                 wire::sampler_lod_binds(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::SetSampler;
@@ -961,8 +967,15 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
                 _ => return Err(DecodeStatus::ErrShort),
             }
             out.ref_binds.clear();
+            out.sampler_lod_binds.clear();
             for e in entries {
                 out.ref_binds.push(e.sampler_ref.get());
+                // Carried as bits. The clamps are per *entry* — the wire doc
+                // says so and `render_set_vertex_samplers_lod_range` binds two
+                // slots with four distinct values — so they are pushed beside
+                // the refs rather than lifted to a per-record pair.
+                out.sampler_lod_binds
+                    .push((e.lod_min_clamp.get().to_bits(), e.lod_max_clamp.get().to_bits()));
             }
             if let Some(&r) = out.ref_binds.first() {
                 out.sampler_ref = r;

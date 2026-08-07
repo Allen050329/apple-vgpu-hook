@@ -2725,6 +2725,84 @@ fn a_decoded_record_that_no_arm_applies_names_what_happened_instead() {
     assert!(log.contains("reason=render_icb_execute_unnamed"));
 }
 
+/// A sampler bind's own LOD clamps reach the slot they were sent for.
+///
+/// `setVertexSamplerStates:lodMinClamps:lodMaxClamps:withRange:` and its
+/// fragment sibling carry a clamp pair **per entry**, so one sampler object
+/// bound at two slots can be clamped differently at each — that is the whole
+/// reason the pair rides on the bind rather than on the object. The record used
+/// to be read for its refs and counted for its clamps, so both slots sampled
+/// the object's own range.
+///
+/// The two-slot form is what this drives, because the one-slot form cannot
+/// tell a per-entry pair from a per-record one — the reading the wire module
+/// warns about at `SamplerLodBind`.
+#[test]
+fn a_sampler_bind_carries_its_own_lod_clamps_per_slot() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let host = FakeHost::new();
+    let mut out = ExecResult::default();
+    let mut acc = StreamAccum::default();
+    let head = OP_HEADER_LEN;
+
+    // Head (first, count) then two 12-byte entries: ref, lodMin, lodMax.
+    let entry = render::SAMPLER_LOD_BIND_ENTRY_SIZE;
+    let total = head + render::BIND_ENTRIES + 2 * entry;
+    let op = wire_render::OPCODE_SET_FRAGMENT_SAMPLER_LOD;
+    let mut command = vec![0u8; total];
+    st32(&mut command[0..], op);
+    st32(&mut command[4..], total as u32);
+    st32(&mut command[head + render::BIND_FIRST..], 2);
+    st32(&mut command[head + render::BIND_COUNT..], 2);
+    let e0 = head + render::BIND_ENTRIES;
+    st32(&mut command[e0..], 0x51);
+    st32(&mut command[e0 + 4..], 0.25f32.to_bits());
+    st32(&mut command[e0 + 8..], 0.75f32.to_bits());
+    let e1 = e0 + entry;
+    st32(&mut command[e1..], 0x51); // the *same* sampler object
+    st32(&mut command[e1 + 4..], 0.5f32.to_bits());
+    st32(&mut command[e1 + 8..], 0.875f32.to_bits());
+    handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
+
+    let binds: Vec<_> = acc.fragment_samplers.as_ref().clone();
+    assert_eq!(binds.len(), 2, "both slots bound");
+    assert_eq!(
+        (binds[0].index, binds[1].index),
+        (2, 3),
+        "slots first..first+count"
+    );
+    assert_eq!(
+        binds[0].lod_clamp,
+        Some((0.25f32.to_bits(), 0.75f32.to_bits()))
+    );
+    assert_eq!(
+        binds[1].lod_clamp,
+        Some((0.5f32.to_bits(), 0.875f32.to_bits())),
+        "one sampler object, two slots, two clamps — a per-record pair would \
+         put slot 2's range here"
+    );
+    assert!(
+        acc.vertex_samplers.as_ref().is_empty(),
+        "the fragment opcode must not fill the vertex table"
+    );
+
+    // The plain bind carries no clamps, and `None` there is not `(0.0, 0.0)`:
+    // it means the sampler object's own range stands.
+    let mut acc = StreamAccum::default();
+    let total = head + render::BIND_ENTRIES + render::REF_BIND_ENTRY_SIZE;
+    let op = wire_render::OPCODE_SET_FRAGMENT_SAMPLER;
+    let mut command = vec![0u8; total];
+    st32(&mut command[0..], op);
+    st32(&mut command[4..], total as u32);
+    st32(&mut command[head + render::BIND_FIRST..], 0);
+    st32(&mut command[head + render::BIND_COUNT..], 1);
+    st32(&mut command[head + render::BIND_ENTRIES..], 0x51);
+    handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
+    let binds: Vec<_> = acc.fragment_samplers.as_ref().clone();
+    assert_eq!(binds.len(), 1);
+    assert_eq!(binds[0].lod_clamp, None);
+}
+
 /// An indirect draw reaches the draw list with the counts its buffer holds.
 ///
 /// Both forms used to raise a counter and reach

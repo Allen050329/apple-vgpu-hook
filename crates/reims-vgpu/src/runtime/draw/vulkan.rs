@@ -4825,36 +4825,49 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             }
         }
         {
-            let mut push_smp =
-                |index: u32, sampler_ref: u32, frag_stage: bool| -> Result<(), DrawError> {
-                    let base_off = if frag_stage && separate_sampled {
-                        FRAG_SAMPLED_RESOURCE_BINDING_OFFSET
-                    } else {
-                        0
-                    };
-                    let smp_bind = SAMPLER_BINDING_BASE + index + base_off;
-                    if sampler_binds.insert(smp_bind) {
-                        let sampler = if sampler_ref != 0 {
-                            load_vulkan_sampler(state, host, req.task_id, sampler_ref, smp_bind)
-                                .map_err(DrawError::DrawPreparation)?
-                        } else {
-                            crate::backend::vulkan::engine::SamplerResource::normalized_default(
-                                smp_bind,
-                            )
-                        };
-                        samplers.push(sampler);
-                    }
-                    Ok(())
+            let mut push_smp = |index: u32,
+                                sampler_ref: u32,
+                                lod_clamp: Option<(u32, u32)>,
+                                frag_stage: bool|
+             -> Result<(), DrawError> {
+                let base_off = if frag_stage && separate_sampled {
+                    FRAG_SAMPLED_RESOURCE_BINDING_OFFSET
+                } else {
+                    0
                 };
+                let smp_bind = SAMPLER_BINDING_BASE + index + base_off;
+                if sampler_binds.insert(smp_bind) {
+                    let mut sampler = if sampler_ref != 0 {
+                        load_vulkan_sampler(state, host, req.task_id, sampler_ref, smp_bind)
+                            .map_err(DrawError::DrawPreparation)?
+                    } else {
+                        crate::backend::vulkan::engine::SamplerResource::normalized_default(
+                            smp_bind,
+                        )
+                    };
+                    // A bind record's own clamps override the sampler object's.
+                    // That is what `setVertexSamplerStates:lodMinClamps:
+                    // lodMaxClamps:withRange:` means: one sampler state bound
+                    // at several slots, each clamped differently, without
+                    // creating a sampler object per clamp. The compute rail
+                    // applies the override in exactly this position.
+                    if let Some((min_bits, max_bits)) = lod_clamp {
+                        sampler.lod_min = min_bits;
+                        sampler.lod_max = max_bits;
+                    }
+                    samplers.push(sampler);
+                }
+                Ok(())
+            };
             // Stream sampler slots (often index 0 while texture is 3 for logo).
             for s in &req.vertex_samplers {
                 if s.sampler_ref != 0 {
-                    push_smp(s.index, s.sampler_ref, false)?;
+                    push_smp(s.index, s.sampler_ref, s.lod_clamp, false)?;
                 }
             }
             for s in &req.fragment_samplers {
                 if s.sampler_ref != 0 {
-                    push_smp(s.index, s.sampler_ref, true)?;
+                    push_smp(s.index, s.sampler_ref, s.lod_clamp, true)?;
                 }
             }
         }

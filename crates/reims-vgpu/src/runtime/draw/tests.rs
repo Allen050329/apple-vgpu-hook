@@ -1892,6 +1892,7 @@ fn a_live_bind_past_its_table_is_reported_and_a_cleared_one_is_not() {
         vertex_samplers: vec![SamplerBind {
             index: MAX_SAMPLER_BIND_SLOTS - 1,
             sampler_ref: 11,
+            lod_clamp: None,
         }],
         ..Default::default()
     };
@@ -1932,6 +1933,7 @@ fn a_live_bind_past_its_table_is_reported_and_a_cleared_one_is_not() {
                 fragment_samplers: vec![SamplerBind {
                     index: MAX_SAMPLER_BIND_SLOTS,
                     sampler_ref: 11,
+            lod_clamp: None,
                 }],
                 ..Default::default()
             },
@@ -1969,6 +1971,7 @@ fn a_live_bind_past_its_table_is_reported_and_a_cleared_one_is_not() {
         vertex_samplers: vec![SamplerBind {
             index: MAX_SAMPLER_BIND_SLOTS + 4,
             sampler_ref: 0,
+            lod_clamp: None,
         }],
         ..Default::default()
     };

@@ -564,6 +564,17 @@ pub struct TextureBind {
 pub struct SamplerBind {
     pub index: u32,
     pub sampler_ref: u32,
+    /// `(lodMinClamp, lodMaxClamp)` as raw `f32` bits, when the bind record
+    /// carried its own pair — `setVertexSamplerStates:lodMinClamps:
+    /// lodMaxClamps:withRange:` and its fragment sibling. `None` leaves the
+    /// sampler object's own clamps in force, which is what
+    /// `setVertexSamplerStates:` alone means.
+    ///
+    /// Bits rather than `f32` so the value crosses the two backends the way
+    /// the compute rail's `ComputeSamplerBind` already sends it, and so a bind
+    /// carrying a NaN clamp is the guest's NaN rather than one this device
+    /// invented by rounding.
+    pub lod_clamp: Option<(u32, u32)>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1811,7 +1822,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
                         );
                     default_sampler(REIMS_VGPU_BINDING_SAMPLER_BASE + s.index)
                 });
-            vtx_samps.push(sampler);
+            vtx_samps.push(with_bind_lod_clamp(sampler, s.lod_clamp));
         }
     }
     for s in &req.fragment_samplers {
@@ -1827,7 +1838,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
                         );
                     default_sampler(REIMS_VGPU_BINDING_SAMPLER_BASE + s.index)
                 });
-            frag_samps.push(sampler);
+            frag_samps.push(with_bind_lod_clamp(sampler, s.lod_clamp));
         }
     }
 
@@ -2855,6 +2866,37 @@ fn load_depth_stencil_state<M: HostMemory + HostOps>(
             write_mask: d.back_face.write_mask,
         },
     })
+}
+
+/// Apply a bind record's own LOD clamps over whatever the sampler object
+/// declared.
+///
+/// `setVertexSamplerStates:lodMinClamps:lodMaxClamps:withRange:` and its
+/// fragment sibling let one sampler state be bound at several slots with a
+/// different clamp at each, which is the whole reason the pair rides on the
+/// bind rather than on the object. `None` leaves the object's own clamps in
+/// force, which is what the plain `setVertexSamplerStates:` means.
+///
+/// Both spellings are written, because [`ReimsVgpuSampler`] carries the clamp
+/// twice — `lod_min_bits` beside the rest of the descriptor, and
+/// `clamp_lod_min_bits` under `has_lod_clamp` — and [`sampler_record`] fills
+/// both from one value for exactly that reason. Writing one of the two would
+/// hand the shim a descriptor that disagrees with itself.
+///
+/// [`ReimsVgpuSampler`]: crate::backend::metal::abi::ReimsVgpuSampler
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+fn with_bind_lod_clamp(
+    mut sampler: crate::backend::metal::abi::ReimsVgpuSampler,
+    lod_clamp: Option<(u32, u32)>,
+) -> crate::backend::metal::abi::ReimsVgpuSampler {
+    if let Some((min_bits, max_bits)) = lod_clamp {
+        sampler.lod_min_bits = min_bits;
+        sampler.lod_max_bits = max_bits;
+        sampler.has_lod_clamp = 1;
+        sampler.clamp_lod_min_bits = min_bits;
+        sampler.clamp_lod_max_bits = max_bits;
+    }
+    sampler
 }
 
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]

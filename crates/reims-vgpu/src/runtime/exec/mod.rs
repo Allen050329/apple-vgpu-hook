@@ -1419,13 +1419,21 @@ fn handle_render_record<M: HostMemory + HostOps>(
         }
         RenderKind::SetBuffer => {
             if cmd.has_attribute_stride {
-                // Same shape as `render_sampler_lod_dropped` below, and it was
-                // the same bug: `0xa5` sits above the old accepted window, so a
-                // guest that negotiated `supportsDynamicAttributeStride` had
-                // every strided vertex bind refused and the buffer never bound.
-                // The bind is applied now; the per-entry stride is not, because
+                // Same shape as the sampler LOD bind below, and it was the same
+                // bug: `0xa5` sits above the old accepted window, so a guest
+                // that negotiated `supportsDynamicAttributeStride` had every
+                // strided vertex bind refused and the buffer never bound. The
+                // bind is applied now; the per-entry stride is not, because
                 // `BufferBind` carries none and the vertex fetch layout is
                 // pipeline state neither backend is asked to re-declare.
+                //
+                // The sampler sibling has since been carried the rest of the
+                // way — `SamplerBind::lod_clamp` — and that is the shape this
+                // one would take: a field on the bind, applied over whatever
+                // the pipeline declared. It is the harder half, because a
+                // stride is baked into the graphics pipeline on both backends
+                // where a clamp is per-descriptor, so closing it means the
+                // stride joining the pipeline key.
                 crate::runtime::drain::note_store_route("render_vertex_attribute_stride_dropped");
             }
             // Slots first..first+n from the archive layout's entry array.
@@ -1549,18 +1557,20 @@ fn handle_render_record<M: HostMemory + HostOps>(
             out.texture_unbinds = out.texture_unbinds.saturating_add(cleared);
         }
         RenderKind::SetSampler => {
-            if cmd.has_sampler_lod {
-                // The bind itself is applied below; what is not applied is the
-                // per-entry LOD clamp pair the guest sent with it, because
-                // `SamplerBind` carries no clamps and neither backend is asked
-                // for any. Until this commit the whole record was dropped —
-                // `0x80`/`0x71` reached no arm — so the slot stayed unbound;
-                // binding it with default clamps is the closer answer, and this
-                // counter is the distance still left.
-                crate::runtime::drain::note_store_route("render_sampler_lod_dropped");
-            }
+            // The two LOD forms carry a clamp pair per entry; the plain forms
+            // carry none, and `sampler_lod_binds` is empty for them. Zipped
+            // rather than indexed into inside the builder, so a record whose
+            // two lists ever disagreed in length binds the slots it has refs
+            // for and clamps only those it has clamps for, instead of
+            // panicking or pairing a slot with another slot's clamp.
+            let entries: Vec<(u32, Option<(u32, u32)>)> = cmd
+                .ref_binds
+                .iter()
+                .enumerate()
+                .map(|(i, &r)| (r, cmd.sampler_lod_binds.get(i).copied()))
+                .collect();
             let cleared = apply_binds(
-                &cmd.ref_binds,
+                &entries,
                 cmd.first,
                 BindTarget {
                     stage: cmd.stage,
@@ -1572,8 +1582,12 @@ fn handle_render_record<M: HostMemory + HostOps>(
                     refused: &mut acc.unrepresentable,
                 },
                 |b| b.index,
-                |index, sampler_ref| {
-                    (sampler_ref != 0).then_some(SamplerBind { index, sampler_ref })
+                |index, (sampler_ref, lod_clamp)| {
+                    (sampler_ref != 0).then_some(SamplerBind {
+                        index,
+                        sampler_ref,
+                        lod_clamp,
+                    })
                 },
             );
             out.sampler_unbinds = out.sampler_unbinds.saturating_add(cleared);
