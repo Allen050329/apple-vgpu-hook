@@ -1990,13 +1990,83 @@ fn handle_render_record<M: HostMemory + HostOps>(
             }
         }
         RenderKind::SetStoreAction => {
-            // No default to compare against: this record *overrides* what the
-            // render-pass descriptor said for that attachment, so every one of
-            // them is a change this rail is not making. The precise signal would
-            // compare against the pass's own store action, which this arm does
-            // not have; the count is the upper bound and is what says whether
-            // reaching for it is worth it.
-            crate::runtime::drain::note_store_route("render_store_action_override_dropped");
+            // `setColorStoreAction:atIndex:` and its depth and stencil siblings
+            // replace what the render-pass descriptor declared for one
+            // attachment. All three of those declared actions are honoured —
+            // colour in `encode_draw_chain`'s writeback loop, depth and stencil
+            // through `draw::depth_stencil` — so dropping the override was a
+            // real loss in both directions, and the expensive one is a pass
+            // declared `DontCare` and overridden to `Store`: content the guest
+            // asked to keep and never got back.
+            //
+            // The store action is a `u16` in every attachment struct, so a mode
+            // that does not fit is not narrowed into a different action; it is
+            // left alone and named, the same reading `SetIntState` takes of its
+            // own low half.
+            let Ok(action) = u16::try_from(cmd.mode) else {
+                crate::runtime::drain::note_store_route("render_store_action_out_of_range");
+                crate::observe::fail(format!(
+                    "render_store_action fail reason=render_store_action_out_of_range \
+                     op={:#x} mode={} index={}",
+                    cmd.opcode, cmd.mode, cmd.first
+                ));
+                return;
+            };
+            match cmd.opcode {
+                wire_render::OPCODE_SET_COLOR_STORE_ACTION => {
+                    // By pass slot, which is what the record's index names and
+                    // what `color_slots` is keyed by — not by position, since a
+                    // pass declaring slots 0 and 3 has two entries.
+                    match acc
+                        .color_slots
+                        .iter_mut()
+                        .find(|(slot, _)| *slot == cmd.first)
+                    {
+                        Some((_, att)) => att.store_action = action,
+                        // A slot the pass never declared. The override has
+                        // nothing to override and inventing an attachment for it
+                        // would give the draw a target the guest did not ask
+                        // for, so it is named instead.
+                        None => {
+                            crate::runtime::drain::note_store_route(
+                                "render_store_action_slot_undeclared",
+                            );
+                            crate::observe::fail(format!(
+                                "render_store_action fail \
+                                 reason=render_store_action_slot_undeclared \
+                                 index={} declared={}",
+                                cmd.first,
+                                acc.color_slots.len()
+                            ));
+                        }
+                    }
+                }
+                // Neither of these carries an index: there is one depth and one
+                // stencil attachment, so the record names only the action.
+                wire_render::OPCODE_SET_DEPTH_STORE_ACTION => {
+                    match acc.depth_attach.as_mut() {
+                        Some(d) => d.store_action = action,
+                        None => note_store_action_no_attachment("depth", action),
+                    }
+                }
+                wire_render::OPCODE_SET_STENCIL_STORE_ACTION => {
+                    match acc.stencil_attach.as_mut() {
+                        Some(s) => s.store_action = action,
+                        None => note_store_action_no_attachment("stencil", action),
+                    }
+                }
+                // Not a catch-all standing in for the stencil arm: the decoder
+                // maps exactly three opcodes to this kind, so a fourth reaching
+                // here means the decoder grew an arm this one did not, and the
+                // guest's store action lands on nothing.
+                op => {
+                    crate::runtime::drain::note_store_route("render_store_action_opcode_unknown");
+                    crate::observe::fail(format!(
+                        "render_store_action fail reason=render_store_action_opcode_unknown \
+                         op={op:#x} action={action}"
+                    ));
+                }
+            }
         }
         RenderKind::SetVertexAmplification => {
             // Amplification makes one vertex invocation produce several views,
@@ -2078,13 +2148,18 @@ fn handle_render_record<M: HostMemory + HostOps>(
             }
         }
         RenderKind::SetStoreActionOptions => {
-            // The options sibling of the store action beside it, and unapplied
-            // for the same reason: this rail does not honour the store action
-            // either, so there is nothing for an option on it to modify. No
-            // default to compare against — `MTLStoreActionOptionNone` is 0, but
-            // a guest that writes 0 is still overriding whatever the pass
-            // descriptor said, exactly as `render_store_action_override_dropped`
-            // argues for the action.
+            // The options sibling of the store action beside it, which *is*
+            // applied now — this is the half that is not. `MTLStoreActionOptions`
+            // carries `CustomSamplePositions`, asking that a multisample resolve
+            // use the pass's programmable sample positions, and this device
+            // neither sets those (`render_pass_sample_positions_dropped`) nor
+            // renders at more than one sample per pixel, where the option means
+            // nothing. Applying it here would be recording a number no resolve
+            // reads.
+            //
+            // No default to compare against — `MTLStoreActionOptionNone` is 0,
+            // but a guest that writes 0 is still overriding whatever the pass
+            // descriptor said.
             crate::runtime::drain::note_store_route("render_store_action_options_dropped");
         }
         RenderKind::DrawPatches => {
@@ -3538,7 +3613,7 @@ mod report;
 use report::{
     is_indexed_draw_opcode, note_clear_dropped, note_color_subresource_unsupported,
     note_compute_refusal, note_depth_stencil_unsupported, note_draw_encode_fail,
-    note_empty_scissor, note_indexed_draw_without_buffer,
+    note_empty_scissor, note_indexed_draw_without_buffer, note_store_action_no_attachment,
     note_indirect_draw_refused, note_pass_extent_for_slot, note_pass_target_extent,
     note_stream_draw_drops,
     note_unimplemented_render_opcode, note_unnamed_icb_execute,

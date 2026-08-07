@@ -559,3 +559,22 @@ pub(super) fn note_indirect_draw_refused(
             .fail_once(u64::from(cmd.indirect_buffer_ref));
     }
 }
+
+/// A depth or stencil store-action override arriving for an attachment the
+/// render pass never declared.
+///
+/// The override has nothing to override. Naming it rather than returning
+/// quietly, because the two ways to get here are very different: a guest that
+/// sets a depth store action on a colour-only pass is doing something odd, and a
+/// pass whose depth attachment this device failed to decode is a bug here — and
+/// only the second loses the guest a depth buffer it expected back.
+pub(super) fn note_store_action_no_attachment(which: &'static str, action: u16) {
+    crate::runtime::drain::note_store_route(match which {
+        "depth" => "render_store_action_no_depth_attachment",
+        _ => "render_store_action_no_stencil_attachment",
+    });
+    crate::observe::fail(format!(
+        "render_store_action fail reason=render_store_action_no_{which}_attachment \
+         action={action}"
+    ));
+}

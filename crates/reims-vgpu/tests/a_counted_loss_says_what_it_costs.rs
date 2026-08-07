@@ -94,19 +94,15 @@ enum Counted {
 /// Keyed by the slug, which is the one name that cannot move when a line does.
 const ROWS: &[(&str, Counted, &str)] = &[
     (
-        "render_store_action_override_dropped",
-        Counted::StateNotApplied,
-        "a SetStoreAction record overrides what the pass descriptor said for an \
-         attachment, and this rail honours neither. No default to compare \
-         against, so every record counts and the number is an upper bound on \
-         the loss rather than the loss",
-    ),
-    (
         "render_store_action_options_dropped",
         Counted::StateNotApplied,
-        "the options sibling of the same record. Unapplied for the stronger \
-         reason: the action it would modify is itself unapplied, so there is \
-         nothing for an option on it to change",
+        "the options sibling of the same record, and now the only half of it \
+         still dropped: the action is applied. MTLStoreActionOptions carries \
+         CustomSamplePositions, which asks that a multisample resolve use the \
+         pass's programmable sample positions — state this device also does not \
+         set (render_pass_sample_positions_dropped), and which means nothing at \
+         one sample per pixel. So the loss is real but is the same loss as its \
+         sibling row rather than a second one",
     ),
     (
         "render_vertex_amplification_dropped",
@@ -417,7 +413,7 @@ fn every_counted_loss_says_what_it_costs() {
     // directory carries: a scan that matched no counter argument would report
     // an empty population as fully adjudicated.
     assert!(
-        found.len() >= 27,
+        found.len() >= 26,
         "the scan found only {} counter-only loss slugs, so it is not parsing \
          `note_store_route` arguments and its verdict means nothing: {found:?}",
         found.len()
@@ -473,7 +469,7 @@ fn no_counted_loss_is_unread() {
 /// population without changing anything the guest sees.
 #[test]
 fn the_counted_loss_census_only_shrinks() {
-    const COUNTED_LOSS_CEILING: usize = 22;
+    const COUNTED_LOSS_CEILING: usize = 21;
     let losses = ROWS
         .iter()
         .filter(|(_, c, _)| matches!(c, Counted::StateNotApplied | Counted::WorkNotExecuted))

@@ -2133,6 +2133,94 @@ fn dropped_clear_logs_once_per_reason_target() {
     ));
 }
 
+/// A store-action override reaches the attachment it names.
+///
+/// `setColorStoreAction:atIndex:` replaces what the render-pass descriptor
+/// declared for one attachment, and this device honours that declared action in
+/// `encode_draw_chain`'s writeback loop. So dropping the override lost work in
+/// both directions, and the expensive direction is the one asserted here: a pass
+/// declared `DontCare` and overridden to `Store` is content the guest asked to
+/// keep and never got back.
+///
+/// The record is applied **by pass slot, not by position**. The fixture declares
+/// slots 0 and 3 with the *unwanted* one first, so a rail indexing into the
+/// vector would write the override onto slot 0 and this would fail rather than
+/// pass by coincidence.
+#[test]
+fn a_store_action_override_reaches_the_slot_it_names() {
+    use crate::contract::pass_action::MTL_STORE_ACTION_DONT_CARE;
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let host = FakeHost::new();
+    let mut out = ExecResult::default();
+    let mut acc = StreamAccum::default();
+    let att = |texture_ref: u32| ColorAttachment {
+        texture_ref,
+        resolve_texture_ref: 0,
+        level: 0,
+        slice: 0,
+        depth_plane: 0,
+        load_action: MTL_LOAD_ACTION_CLEAR,
+        store_action: MTL_STORE_ACTION_DONT_CARE,
+        clear_color: [0.0; 4],
+    };
+    acc.color_slots.push((0, att(90)));
+    acc.color_slots.push((3, att(93)));
+
+    let record = |action: u32, index: u32| {
+        let total = reims_vgpu_wire::OP_HEADER_LEN + 8;
+        let mut c = vec![0u8; total];
+        st32(&mut c[0..], wire_render::OPCODE_SET_COLOR_STORE_ACTION);
+        st32(&mut c[4..], total as u32);
+        st32(&mut c[reims_vgpu_wire::OP_HEADER_LEN..], action);
+        st32(&mut c[reims_vgpu_wire::OP_HEADER_LEN + 4..], index);
+        c
+    };
+
+    let command = record(MTL_STORE_ACTION_STORE as u32, 3);
+    handle_render_record(
+        &mut state,
+        &host,
+        1,
+        wire_render::OPCODE_SET_COLOR_STORE_ACTION,
+        &command,
+        &mut out,
+        &mut acc,
+    );
+    assert_eq!(
+        acc.color_slots[1].1.store_action, MTL_STORE_ACTION_STORE,
+        "the override must reach the attachment at pass slot 3"
+    );
+    assert_eq!(
+        acc.color_slots[0].1.store_action, MTL_STORE_ACTION_DONT_CARE,
+        "slot 0 is at position 0 and was not named; a rail indexing by \
+         position would have written it instead"
+    );
+
+    // A slot the pass never declared has nothing to override, and says so
+    // rather than inventing an attachment the guest did not ask for.
+    let before = crate::runtime::drain::store_route_count("render_store_action_slot_undeclared");
+    let command = record(MTL_STORE_ACTION_STORE as u32, 5);
+    handle_render_record(
+        &mut state,
+        &host,
+        1,
+        wire_render::OPCODE_SET_COLOR_STORE_ACTION,
+        &command,
+        &mut out,
+        &mut acc,
+    );
+    assert_eq!(
+        crate::runtime::drain::store_route_count("render_store_action_slot_undeclared") - before,
+        1,
+        "an override for an undeclared slot must name itself"
+    );
+    assert_eq!(
+        acc.color_slots.len(),
+        2,
+        "and must not add an attachment the pass never declared"
+    );
+}
+
 /// A plural scissor record reaches the accumulator whole.
 ///
 /// Before `0x83`/`0x76` were decoded the record reached no arm at all, so a
@@ -3629,7 +3717,6 @@ fn every_decoded_but_unapplied_render_state_reaches_its_own_counter() {
     // (opcode, total length, payload writer, route, whether a default-valued
     // record of the same opcode must NOT count).
     type Writer = fn(&mut [u8]);
-    let non_default: Writer = |p| st64(p, 2);
     // No `at_default` writer for the mode-shaped records any more: the only
     // two whose default half this exercised were the fill mode and the depth
     // clip mode, and both now reach a backend. The float pair below still has
@@ -3651,15 +3738,6 @@ fn every_decoded_but_unapplied_render_state_reaches_its_own_counter() {
             float_non_default,
             Some(float_at_default),
             "render_tessellation_scale_dropped",
-        ),
-        (
-            wire_render::OPCODE_SET_DEPTH_STORE_ACTION,
-            16,
-            non_default,
-            // No default to compare against: the record overrides the pass
-            // descriptor, so even a zero is a change this rail is not making.
-            None,
-            "render_store_action_override_dropped",
         ),
         (
             wire_render::OPCODE_SET_VISIBILITY_RESULT_MODE,
