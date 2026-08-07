@@ -139,9 +139,12 @@ const ROWS: &[(&str, usize, Guarded, &str)] = &[
     ),
     (
         "reims-vgpu/src/runtime/blit_exec/mod.rs",
-        9,
+        10,
         Guarded::EmitsOnly,
-        "five `note_*` reporters over their own sets, and their calls. Two answer \
+        "six `note_*` reporters over their own sets, and their calls. The sixth \
+         is `note_extent_cut`, whose latch guards only the line: both of its \
+         counters are raised before it, and the caller clamps whether or not \
+         the line is written. Two answer \
          `bool` and both callers discard it — `let _ =` at the tex_wrong_type \
          site, and the t2t_overlap site returns BlitStatus::Overlap \
          unconditionally *after* the call rather than from inside it. \

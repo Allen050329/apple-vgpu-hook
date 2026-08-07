@@ -2122,10 +2122,14 @@ fn blit_geometry_helpers_clamp_bpp_and_aspect() {
 
     // clamp_extent: zero stays a no-op extent; over-max clamps to max;
     // in-range and exactly-max pass through unchanged.
-    assert_eq!(clamp_extent(0, 100), 0, "zero is a Metal no-op extent");
-    assert_eq!(clamp_extent(50, 100), 50, "in-range passes through");
-    assert_eq!(clamp_extent(150, 100), 100, "over-max clamps to max");
-    assert_eq!(clamp_extent(100, 100), 100, "exactly max passes through");
+    assert_eq!(clamp_extent("t", "w", 0, 100), 0, "zero is a Metal no-op extent");
+    assert_eq!(clamp_extent("t", "w", 50, 100), 50, "in-range passes through");
+    assert_eq!(clamp_extent("t", "w", 150, 100), 100, "over-max clamps to max");
+    assert_eq!(
+        clamp_extent("t", "w", 100, 100),
+        100,
+        "exactly max passes through"
+    );
 
     // texture_storage_bpp: full-texel storage size per format; unknown fails.
     assert_eq!(texture_storage_bpp(MTL_FORMAT_BGRA8_UNORM), Ok(4));
