@@ -707,10 +707,18 @@ pub struct FakeHost {
     ///
     /// Empty by default, which is exactly the previous behaviour: `is_ram_gpa`
     /// answered a flat `true`, so nothing could exercise a caller's non-RAM arm.
-    /// Arm it with [`FakeHost::mark_non_ram`].
-    non_ram: Vec<(u64, u64)>,
+    /// Arm it with [`FakeHost::mark_non_ram`] or, for a range that stops being
+    /// RAM partway through a loop, [`FakeHost::arm_unmap_on_read`].
+    ///
+    /// Interior-mutable for the second of those: the fixture has to be able to
+    /// change this answer from `&self`, because the loop that observes the
+    /// change holds the host immutably — which is also the product's position.
+    non_ram: std::cell::RefCell<Vec<(u64, u64)>>,
     /// Scripted guest page-table edits, armed by [`FakeHost::arm_rewire`].
     rewires: std::cell::RefCell<Vec<Rewire>>,
+    /// Scripted mid-loop retractions of guest RAM, armed by
+    /// [`FakeHost::arm_unmap_on_read`]: `(on_read_gpa, on_read_len, base, end)`.
+    unmap_on_read: std::cell::RefCell<Vec<(u64, u64, u64, u64)>>,
     /// How many armed rewires have fired, so a test can assert its trigger hit.
     rewires_fired: std::cell::Cell<u64>,
     /// Live [`HostOps::track_guest_writes`] sets, keyed by issued token.
@@ -886,7 +894,30 @@ impl FakeHost {
     /// the point is the *classification*, which is what production QEMU refuses
     /// on (`MemTxAttrs.memory`), not whether bytes happen to be reachable here.
     pub fn mark_non_ram(&mut self, base: u64, len: u64) {
-        self.non_ram.push((base, base.saturating_add(len)));
+        self.non_ram
+            .borrow_mut()
+            .push((base, base.saturating_add(len)));
+    }
+
+    /// Stop answering RAM for `[base, base + len)` once a read touches
+    /// `[on_read_gpa, on_read_gpa + on_read_len)`.
+    ///
+    /// The guest half of a race this device cannot close: a caller pre-flights a
+    /// span, finds it all RAM, and then copies it a row at a time while the
+    /// guest is free to unmap it underneath. A `Rewire` models the guest editing
+    /// its page tables mid-loop; this models it retracting the memory, which
+    /// `Rewire` cannot express because `non_ram` is not page-table bytes.
+    ///
+    /// Fires from `read_gpa`, the same point and for the same reason: it is the
+    /// one operation every guest-memory loop performs, so the change lands
+    /// between two iterations without the loop knowing.
+    pub fn arm_unmap_on_read(&mut self, on_read_gpa: u64, on_read_len: u64, base: u64, len: u64) {
+        self.unmap_on_read.borrow_mut().push((
+            on_read_gpa,
+            on_read_len,
+            base,
+            base.saturating_add(len),
+        ));
     }
 
     /// State that an agent outside this device wrote the page holding `gpa`,
@@ -970,6 +1001,7 @@ impl FakeHost {
     /// performs — so the edit lands between two iterations without the loop
     /// knowing anything about it, which is exactly the guest's position.
     fn fire_rewires(&self, gpa: u64, len: usize) {
+        self.fire_unmaps(gpa, len);
         if self.rewires.borrow().is_empty() {
             return;
         }
@@ -991,6 +1023,29 @@ impl FakeHost {
             self.poke(r.pte_gpa, &r.bytes);
             self.rewires_fired.set(self.rewires_fired.get() + 1);
         }
+    }
+
+    /// Retract any armed range whose trigger window this read touches.
+    ///
+    /// Ordered *before* the read it triggers on rather than after, because the
+    /// case being modelled is a read that fails: the guest unmapped the page and
+    /// the caller's read of it is the operation that discovers so.
+    fn fire_unmaps(&self, gpa: u64, len: usize) {
+        if self.unmap_on_read.borrow().is_empty() {
+            return;
+        }
+        let end = gpa.saturating_add(len as u64);
+        let mut retracted: Vec<(u64, u64)> = Vec::new();
+        self.unmap_on_read
+            .borrow_mut()
+            .retain(|&(on_gpa, on_len, base, range_end)| {
+                let hit = gpa < on_gpa.saturating_add(on_len) && on_gpa < end;
+                if hit {
+                    retracted.push((base, range_end));
+                }
+                !hit
+            });
+        self.non_ram.borrow_mut().extend(retracted);
     }
 
     /// Write `bytes` at `gpa` through a live range, from `&self`.
@@ -1168,6 +1223,16 @@ impl HostMemory for FakeHost {
         let mut done = 0usize;
         while done < buf.len() {
             let addr = gpa.checked_add(done as u64).ok_or(MemError::Overflow)?;
+            // A span this fixture calls non-RAM refuses the read, because that
+            // is what the product host does: the QEMU shim reads with
+            // `MemTxAttrs.memory` set, so an address-space read of device memory
+            // — this device's own BAR, most of all — fails closed by design.
+            // Answering bytes for one would let a test pass through a door the
+            // product keeps shut. `QemuReadGpaCallbackFailed` is the error the
+            // shim reports for it.
+            if !self.is_ram_gpa(addr) {
+                return Err(MemError::QemuReadGpaCallbackFailed(-1));
+            }
             // Bounce views alias guest pages until unmap.
             if let Some((bptr, off, max)) = self.bounce_slot(addr) {
                 let n = (buf.len() - done).min(max);
@@ -1249,6 +1314,7 @@ impl HostOps for FakeHost {
     fn is_ram_gpa(&self, gpa: u64) -> bool {
         !self
             .non_ram
+            .borrow()
             .iter()
             .any(|&(start, end)| gpa >= start && gpa < end)
     }

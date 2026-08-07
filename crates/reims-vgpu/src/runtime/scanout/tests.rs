@@ -1337,6 +1337,62 @@ fn the_efi_console_paint_refuses_a_bar_backed_framebuffer_and_accepts_a_ram_one(
 /// range and consults `non_ram` not at all: under the endpoint pre-flight this
 /// paint *succeeds*, returning a frame with a row read out of a region the host
 /// says is not memory.
+/// A row that stops being RAM *during* the copy is named apart from a row the
+/// two host doors genuinely disagree about.
+///
+/// The pre-flight walks the whole span and finds it all RAM; the copy then takes
+/// eight megabytes a row at a time while an early-boot guest is relocating its
+/// console out of this device's BAR1. The guest is entitled to retract the
+/// memory mid-copy and this device cannot close that race — so the read fails,
+/// and the question is only which of the two things it says.
+///
+/// `console_efi_row_vouched_then_refused` is documented as a healthy zero: the
+/// pre-flight is the whole reason that arm should be unreachable, so a firing is
+/// a defect in one of the two host doors. It had one slug, and the first driven
+/// boot to read it read this benign case instead — which is how a healthy-zero
+/// alarm stops being one. Asking the walk again about the failing row alone is
+/// what separates them, and the two carry different slugs so the benign one
+/// cannot spend the other's `fail_once` latch.
+#[test]
+fn a_console_row_that_leaves_ram_mid_copy_is_not_the_two_doors_disagreeing() {
+    let w = crate::model::EFI_BOOT_WIDTH;
+    let h = crate::model::EFI_BOOT_HEIGHT;
+    let stride = w * RGBA8_BPP;
+    let fb = 0x8000_0000u64;
+    let span = (h as u64) * (stride as u64);
+    let page = 1u64 << crate::model::PAGE_SHIFT_X86;
+
+    let mut state = DeviceState::new(DeviceId(1), crate::model::PAGE_SHIFT_X86);
+    state.gfx.efi_fb_start = fb;
+    state.gfx.efi_fb_stride = stride;
+
+    let mut host = FakeHost::new();
+    host.map_range(fb, span as usize, 0);
+    // The row the live boot refused. Reading row 0 retracts it, so the
+    // pre-flight — which ran before any read — vouched for a span that is no
+    // longer all RAM by the time the copy reaches row 867.
+    let victim = fb + 867 * stride as u64;
+    host.arm_unmap_on_read(fb, stride as u64, victim / page * page, page);
+
+    let mut dst = vec![0u8; (stride as usize) * (h as usize)];
+    assert!(
+        !paint_efi_console(&state, &host, &mut dst, stride, w, h),
+        "a row that stopped being RAM must still refuse the paint"
+    );
+
+    let log = std::fs::read_to_string(crate::observe::fail_log_path()).expect("fail log");
+    assert!(
+        log.contains("console_efi_row_left_ram_mid_copy"),
+        "a row the guest retracted mid-copy must say so"
+    );
+    assert!(
+        !log.contains("console_efi_row_vouched_then_refused"),
+        "it must not be reported as the two host doors disagreeing, which is \
+         the arm that is supposed to be a healthy zero"
+    );
+    assert!(log.contains("row=867"), "the line must name the row");
+}
+
 #[test]
 fn the_efi_console_paint_refuses_a_span_whose_hole_is_not_at_either_end() {
     let w = crate::model::EFI_BOOT_WIDTH;

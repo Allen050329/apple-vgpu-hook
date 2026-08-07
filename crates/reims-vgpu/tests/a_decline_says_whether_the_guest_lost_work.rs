@@ -886,7 +886,15 @@ const ROWS: &[Row] = &[
         ty: "ConsoleEfiRowRefused",
         loss: Loss::HostFault,
         why: "the page walk said the row was readable and the read then \
-              refused, which is two host answers contradicting each other",
+              refused. `VouchedThenRefused` is two host answers contradicting \
+              each other about bytes that still answer RAM, and is the host \
+              fault this row prices. `LeftRamMidCopy` is the same read failing \
+              because the guest unmapped the row between the pre-flight and the \
+              copy — an early-boot guest relocating its console off BAR1 may do \
+              that at any moment, the console falls back to its other door, and \
+              nothing is lost. The two are told apart by asking the walk again \
+              and they carry different slugs, so the benign one cannot spend the \
+              other's latch",
     },
     Row {
         file: "crates/reims-vgpu/src/runtime/spirv_bind.rs",

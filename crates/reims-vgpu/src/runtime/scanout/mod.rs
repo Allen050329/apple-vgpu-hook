@@ -655,13 +655,30 @@ pub fn paint_efi_console<M: HostMemory + crate::runtime::host::HostOps>(
             return false;
         }
         if let Err(error) = host.read_gpa(gpa, &mut dst[dst_off..dst_off + row_bytes]) {
-            // Every page of this row answered RAM a moment ago and the read
-            // refused anyway, so the two host doors disagree about the same
-            // bytes. A healthy zero: the pre-flight above is the whole reason
-            // this arm should be unreachable, and a firing says it is not — the
-            // walk is sampling something the read does not ask, or the layout
-            // moved between the two.
-            crate::observe::Emit::decline("console_efi_row", &ConsoleEfiRowRefused { row: y })
+            // Every page of this row answered RAM before the loop started and
+            // the read refused anyway. The pre-flight named two ways that can
+            // happen — the walk samples something the read does not ask, or the
+            // layout moved between the two — and only the first is a defect.
+            // Asking the walk again, about this row alone, is what tells them
+            // apart, and it costs one call on a path that is about to return
+            // false anyway.
+            //
+            // The second is a race this device cannot close and should not try
+            // to: the span is eight megabytes copied a row at a time while an
+            // early-boot guest is relocating its console out of our BAR1 into
+            // system RAM, so the guest is entitled to unmap it mid-copy. The
+            // caller falls back to the other door. What matters is that it stop
+            // being reported as the first, which is a **healthy zero** — this
+            // one is not, and a boot has now read it.
+            let moved = host
+                .first_non_ram_page(gpa, row_bytes as u64, 1usize << state.page_shift)
+                .is_some();
+            let decline = if moved {
+                ConsoleEfiRowRefused::LeftRamMidCopy { row: y }
+            } else {
+                ConsoleEfiRowRefused::VouchedThenRefused { row: y }
+            };
+            crate::observe::Emit::decline("console_efi_row", &decline)
                 .field("gpa", format!("{gpa:#x}"))
                 .field("row_bytes", row_bytes)
                 .field("fb", format!("{fb:#x}"))
@@ -673,24 +690,45 @@ pub fn paint_efi_console<M: HostMemory + crate::runtime::host::HostOps>(
     true
 }
 
-/// A console row whose pages the RAM walk vouched for and whose read refused.
+/// A console row the RAM walk vouched for and whose read refused, and which of
+/// the two reasons for that the walk gives when asked a second time.
 ///
 /// Named rather than folded into the `mem_qemu_read_gpa_callback_failed` line
-/// the adapter already emits, because those two say different things: the
-/// adapter's line reports that a host callback said no, and this one reports
-/// that it contradicted the host callback consulted immediately before it.
+/// the adapter already emits, because those say different things: the adapter's
+/// line reports that a host callback said no, and these report that it
+/// contradicted the host callback consulted before it.
+///
+/// Two slugs rather than one because only one of them is a defect, and a single
+/// slug would have let the benign one spend the other's `fail_once` latch and
+/// its claim to being a healthy zero. That is not hypothetical: this was one
+/// slug documented as unreachable, and the first boot that read it read the
+/// benign case.
 #[derive(Debug, Clone, Copy)]
-struct ConsoleEfiRowRefused {
-    row: u32,
+enum ConsoleEfiRowRefused {
+    /// The row still answers RAM. The two host doors disagree about the same
+    /// bytes, which is a defect in one of them — the pre-flight walk is the
+    /// whole reason this arm should be unreachable.
+    VouchedThenRefused { row: u32 },
+    /// The row no longer answers RAM. The guest unmapped it between the
+    /// pre-flight and this row's turn in the copy, which an early-boot guest
+    /// relocating its console off this device's BAR1 is entitled to do at any
+    /// moment. Nothing is wrong here; the caller falls back to the other door.
+    LeftRamMidCopy { row: u32 },
 }
 
 impl crate::observe::Decline for ConsoleEfiRowRefused {
     fn slug(&self) -> &'static str {
-        "console_efi_row_vouched_then_refused"
+        match self {
+            Self::VouchedThenRefused { .. } => "console_efi_row_vouched_then_refused",
+            Self::LeftRamMidCopy { .. } => "console_efi_row_left_ram_mid_copy",
+        }
     }
 
     fn fields(&self) -> Vec<(&'static str, String)> {
-        vec![("row", self.row.to_string())]
+        let row = match self {
+            Self::VouchedThenRefused { row } | Self::LeftRamMidCopy { row } => row,
+        };
+        vec![("row", row.to_string())]
     }
 }
 
