@@ -17,9 +17,10 @@
 
 Crate-wide slug uniqueness — the one property no single `impl` can see, and the
 one that decides whether `Emit::fail_once`'s latch silences a second check — is
-enforced by `tests/decline_slugs_are_unique.rs`. That every slug actually
-reaches a sink at some call site remains the author's obligation; nothing checks
-it.
+the author's obligation. A source scan used to check it; it is gone. So is any
+check that a slug actually reaches a sink at some call site. Prefix a new slug
+with the rail that owns it and the collision becomes unlikely by construction
+rather than by audit.
 
 Pure layers may return a typed decline without logging it. The product boundary
 that decides the command really failed owns emission through `Emit`; expected

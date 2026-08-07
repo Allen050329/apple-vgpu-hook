@@ -20,10 +20,10 @@
 //! hand-bumped `(types, slugs)` baseline, which is what made shrinking this crate
 //! expensive. Both went in `db80389`.
 //!
-//! `tests/decline_slugs_are_unique.rs` reads the `Decline`/`Refusal` impls
-//! directly for the one property that is genuinely crate-wide and not visible from
-//! any single impl: **no two checks share a slug**. That is a scan of the code, so
-//! it cannot drift from it, and it restates none of it.
+//! One property is genuinely crate-wide and not visible from any single impl:
+//! **no two checks share a slug**. A source scan over the `Decline`/`Refusal`
+//! impls used to check it and is gone, so it is now the author's obligation —
+//! prefix a slug with the rail that owns it and a collision stops being likely.
 //!
 //! # Adding a decline type
 //!

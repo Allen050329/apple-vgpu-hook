@@ -1,5 +1,9 @@
-//! `repr(C)` ABI types matching `host/archive/.../reims-vgpu-backend-vulkan/reims_vgpu_backend.h` (archived).
-//! C ABI type mirrors for reims_vgpu_backend.h (Metal encode path).
+//! `repr(C)` types for the Metal encode path.
+//!
+//! These began as mirrors of a C backend header that is no longer part of this
+//! tree, and no C or Objective-C translation unit reads them today — the
+//! `repr(C)` layout is what the encode path and its hashes are written against,
+//! which is why the size and offset pins below stay.
 //!
 //! The layout pins below are `const` assertions rather than `#[test]`s, for the
 //! reason spelled out in [`crate::backend::metal::constants`]: this module is
@@ -32,31 +36,20 @@ pub const REIMS_VGPU_MTL_PRIMITIVE_TYPE_LINE_STRIP: u32 = 2;
 pub const REIMS_VGPU_MTL_PRIMITIVE_TYPE_TRIANGLE: u32 = 3;
 pub const REIMS_VGPU_MTL_PRIMITIVE_TYPE_TRIANGLE_STRIP: u32 = 4;
 
-pub const REIMS_VGPU_MTL_DISPATCH_TYPE_SERIAL: u32 = 0;
-pub const REIMS_VGPU_MTL_DISPATCH_TYPE_CONCURRENT: u32 = 1;
+// `contract::dispatch` is where the shared decode/exec path reads this pair, so
+// it is the definition and these are aliases. This module is
+// `backend-metal`-gated, so a value spelled only here is unreachable from the
+// code that accepts the field off the wire; deriving rather than re-spelling is
+// what stops the two names from parting.
+pub const REIMS_VGPU_MTL_DISPATCH_TYPE_SERIAL: u32 =
+    crate::contract::dispatch::MTL_DISPATCH_TYPE_SERIAL;
+pub const REIMS_VGPU_MTL_DISPATCH_TYPE_CONCURRENT: u32 =
+    crate::contract::dispatch::MTL_DISPATCH_TYPE_CONCURRENT;
 
-// The same pair is declared in `contract::dispatch`, which is where the shared
-// decode/exec path reads it: this module is `backend-metal`-gated, so a value
-// spelled only here is unreachable from the code that accepts the field off the
-// wire. These names stay because this file is a mirror of an archived C header
-// and the mirror is the provenance. The assertions are what stop the two
-// spellings from parting, which nothing else in the toolchain would notice —
-// and `rustc` evaluates them on every arm that compiles this file, including
-// the cross-compiled `--target aarch64-apple-darwin` clippy run.
-const _: () = assert!(
-    REIMS_VGPU_MTL_DISPATCH_TYPE_SERIAL == crate::contract::dispatch::MTL_DISPATCH_TYPE_SERIAL
-);
-const _: () = assert!(
-    REIMS_VGPU_MTL_DISPATCH_TYPE_CONCURRENT
-        == crate::contract::dispatch::MTL_DISPATCH_TYPE_CONCURRENT
-);
-
-// Kept as mirror, deliberately unused by Rust. The dispatch kind reaches
-// `compute::compute_core` as a `bool` and never becomes an ordinal on this
-// side: it is produced as a `bool`, and widening it to `{0, 1}` to cross a call
-// put it beside `dispatch_type`, which is also `{0, 1}`. Deleting these two
-// would make the mirror disagree with the archived header, which is the one
-// thing this file is for.
+// The dispatch kind reaches `compute::compute_core` as a `bool` and never
+// becomes an ordinal on this side: it is produced as a `bool`, and widening it
+// to `{0, 1}` to cross a call put it beside `dispatch_type`, which is also
+// `{0, 1}`. Named here so the encode path has the spelling if it ever needs it.
 pub const REIMS_VGPU_COMPUTE_DISPATCH_KIND_THREADGROUPS: u32 = 0;
 pub const REIMS_VGPU_COMPUTE_DISPATCH_KIND_THREADS: u32 = 1;
 
@@ -64,55 +57,29 @@ pub const REIMS_VGPU_COMPUTE_DISPATCH_KIND_THREADS: u32 = 1;
 // declare. The decoder's caps are the contract (`MTLStageInputOutputDescriptor`
 // is a 31-slot array on both sides), and this array must be wide enough to carry
 // everything the decoder admits or the handoff to Metal truncates what decode
-// kept. Spelled as literals because this file is the mirror of the backend
-// header, and pinned to the decoder so the two cannot drift apart silently.
-pub const REIMS_VGPU_COMPUTE_STAGE_INPUT_MAX_ATTRIBUTES: usize = 31;
-pub const REIMS_VGPU_COMPUTE_STAGE_INPUT_MAX_LAYOUTS: usize = 31;
-const _: () = assert!(
-    REIMS_VGPU_COMPUTE_STAGE_INPUT_MAX_ATTRIBUTES
-        == crate::runtime::decode::resource::MAX_COMPUTE_STAGE_INPUT_ATTRS
-);
-const _: () = assert!(
-    REIMS_VGPU_COMPUTE_STAGE_INPUT_MAX_LAYOUTS
-        == crate::runtime::decode::resource::MAX_COMPUTE_STAGE_INPUT_LAYOUTS
-);
+// kept. Derived from the decoder so the array cannot be sized under it.
+pub const REIMS_VGPU_COMPUTE_STAGE_INPUT_MAX_ATTRIBUTES: usize =
+    crate::runtime::decode::resource::MAX_COMPUTE_STAGE_INPUT_ATTRS;
+pub const REIMS_VGPU_COMPUTE_STAGE_INPUT_MAX_LAYOUTS: usize =
+    crate::runtime::decode::resource::MAX_COMPUTE_STAGE_INPUT_LAYOUTS;
 pub const REIMS_VGPU_COMPUTE_STAGE_INPUT_STRIDE_DYNAMIC: u64 = u64::MAX;
 
 pub const REIMS_VGPU_MTL_PIXEL_FORMAT_DEPTH32_FLOAT: u32 = 252;
 pub const REIMS_VGPU_MTL_PIXEL_FORMAT_STENCIL8: u32 = 253;
-pub const REIMS_VGPU_MTL_LOAD_ACTION_DONT_CARE: u32 = 0;
-pub const REIMS_VGPU_MTL_LOAD_ACTION_LOAD: u32 = 1;
-pub const REIMS_VGPU_MTL_LOAD_ACTION_CLEAR: u32 = 2;
-pub const REIMS_VGPU_MTL_STORE_ACTION_DONT_CARE: u32 = 0;
-pub const REIMS_VGPU_MTL_STORE_ACTION_STORE: u32 = 1;
-
-// The same five ordinals are declared in `contract::pass_action`, as the `u16`
-// the render-pass attachment prefix carries them in — same reason as the
-// dispatch pair above, with one more edge: the encode path *converts* between
-// the two spellings, so until these assertions existed the only thing claiming
-// they agreed was an identity `match` in `runtime::draw`, on the Metal arm
-// alone. The width is the whole difference between the two families, which is
-// why each cast narrows the mirror rather than widening the contract — an
-// ordinal that stopped fitting `u16` would fail here instead of truncating
-// silently at the call.
-const _: () = assert!(
-    REIMS_VGPU_MTL_LOAD_ACTION_DONT_CARE as u16
-        == crate::contract::pass_action::MTL_LOAD_ACTION_DONT_CARE
-);
-const _: () = assert!(
-    REIMS_VGPU_MTL_LOAD_ACTION_LOAD as u16 == crate::contract::pass_action::MTL_LOAD_ACTION_LOAD
-);
-const _: () = assert!(
-    REIMS_VGPU_MTL_LOAD_ACTION_CLEAR as u16 == crate::contract::pass_action::MTL_LOAD_ACTION_CLEAR
-);
-const _: () = assert!(
-    REIMS_VGPU_MTL_STORE_ACTION_DONT_CARE as u16
-        == crate::contract::pass_action::MTL_STORE_ACTION_DONT_CARE
-);
-const _: () = assert!(
-    REIMS_VGPU_MTL_STORE_ACTION_STORE as u16
-        == crate::contract::pass_action::MTL_STORE_ACTION_STORE
-);
+// `contract::pass_action` declares these five as the `u16` the render-pass
+// attachment prefix carries them in, and the encode path converts between the
+// two widths. Widening the contract's `u16` here is the conversion, so there is
+// one definition and no second spelling to drift from it.
+pub const REIMS_VGPU_MTL_LOAD_ACTION_DONT_CARE: u32 =
+    crate::contract::pass_action::MTL_LOAD_ACTION_DONT_CARE as u32;
+pub const REIMS_VGPU_MTL_LOAD_ACTION_LOAD: u32 =
+    crate::contract::pass_action::MTL_LOAD_ACTION_LOAD as u32;
+pub const REIMS_VGPU_MTL_LOAD_ACTION_CLEAR: u32 =
+    crate::contract::pass_action::MTL_LOAD_ACTION_CLEAR as u32;
+pub const REIMS_VGPU_MTL_STORE_ACTION_DONT_CARE: u32 =
+    crate::contract::pass_action::MTL_STORE_ACTION_DONT_CARE as u32;
+pub const REIMS_VGPU_MTL_STORE_ACTION_STORE: u32 =
+    crate::contract::pass_action::MTL_STORE_ACTION_STORE as u32;
 
 pub const REIMS_VGPU_COMPUTE_TEXTURE_ACCESS_READ: u32 = 0;
 pub const REIMS_VGPU_COMPUTE_TEXTURE_ACCESS_READ_WRITE: u32 = 1;

@@ -2457,7 +2457,13 @@ fn note_entry_tlv_fields(kind: &'static str, bytes: &[u8], entry: usize, consume
         p += 2 + len as usize;
     }
     // No benign list: see this function's doc for why it refuses nothing.
-    let _unknown = report_tlv_shape(kind, field_count as usize, seen.into_iter(), consumed_tags, &[]);
+    let _unknown = report_tlv_shape(
+        kind,
+        field_count as usize,
+        seen.into_iter(),
+        consumed_tags,
+        &[],
+    );
 }
 
 /// The half [`note_pipeline_tlv_fields`] and [`note_entry_tlv_fields`] share:
@@ -2466,7 +2472,7 @@ fn note_entry_tlv_fields(kind: &'static str, bytes: &[u8], entry: usize, consume
 /// `kind` is folded into both latches over its whole length rather than its
 /// first byte. `render` and `render_mesh` share a first byte, so a first-byte
 /// key would have let the two branches' drops silence each other — the same
-/// class of collision `decline_slugs_are_unique` exists to stop one level up.
+/// class of collision as two checks sharing a decline slug, one level down.
 fn report_tlv_shape(
     kind: &'static str,
     field_count: usize,

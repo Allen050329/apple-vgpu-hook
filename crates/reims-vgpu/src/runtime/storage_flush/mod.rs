@@ -68,9 +68,10 @@
 //!   one here means someone believed in an obligation that cannot exist, so each
 //!   reports `deferred_flush_lost … reason=no_backend`.
 //!
-//! `tests/deferred_windows_are_armed_only_under_backend_vulkan.rs` holds the
-//! premise: a new arm site outside a `backend-vulkan` gate turns those three
-//! silent stubs into silent losses, and nothing else would notice.
+//! The premise those three stubs rest on is that **every arm site sits under a
+//! `backend-vulkan` gate.** A new one outside such a gate turns them from
+//! unreachable into silent losses. A source scan used to hold that premise;
+//! nothing does now, so check the gate when adding an arm site.
 
 pub(crate) mod access;
 pub(crate) mod fence;

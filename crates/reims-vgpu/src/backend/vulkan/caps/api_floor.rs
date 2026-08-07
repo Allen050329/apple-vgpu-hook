@@ -32,10 +32,10 @@
 //!
 //! A capability promoted into 1.3 core must therefore be reached through its
 //! `KHR`/`EXT` form, gated on runtime presence, with the 1.2 path still
-//! implemented and tested. `tests/nothing_reaches_past_the_vulkan_api_floor.rs`
-//! fails when a 1.3-core feature struct or promoted entry point appears in the
-//! crate, and names the extension each must be reached through. Read what that
-//! test says it does *not* cover before treating it as complete: ash gives the
+//! implemented and tested. A source scan used to fail when a 1.3-core feature
+//! struct or promoted entry point appeared in the crate; it is gone, so this is
+//! a review obligation now. One trap it could never see anyway, and neither can
+//! a reader skimming for `vk::` names: ash gives the
 //! `synchronization2` family one token for both spellings, so only the entry
 //! points separate correct extension use from 1.3-core use there.
 

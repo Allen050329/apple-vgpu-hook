@@ -95,13 +95,9 @@ impl ExecFault {
 /// carries a large buffer; `plen` always reports the true length, so a reader
 /// can tell an echo that was cut from one that was complete.
 ///
-/// The `_MAX` is load-bearing rather than decoration: it is what puts this
-/// constant inside the vocabulary the three bound scans share, so the walk
-/// direction adjudicates it alongside every other cut.
-/// `a_bound_in_a_cut_is_named_like_one` fails if it is renamed without one.
-/// Without it this cut was invisible to every one of them, and — unlike the one
-/// other constant in that position — invisible to the prose recording the gap
-/// as well.
+/// The `_MAX` says this is a cut and not a size: the echo stops here whether or
+/// not the record has run out, which is why `plen` carries the true length
+/// beside it.
 const UNKNOWN_OPCODE_ECHO_WORDS_MAX: usize = 4;
 
 /// Fail-visible protocol event (unknown/malformed). Never invents semantics.
@@ -419,7 +415,10 @@ impl TaskTable {
     /// probes in `runtime::objects` depend on that order deciding which of
     /// several claimant tasks a surface resolves against.
     pub fn live(&self) -> impl Iterator<Item = (u32, &TaskEntry)> {
-        self.0.iter().filter(|(_, t)| t.active).map(|(&id, t)| (id, t))
+        self.0
+            .iter()
+            .filter(|(_, t)| t.active)
+            .map(|(&id, t)| (id, t))
     }
 
     /// [`Self::live`] without the entries.
@@ -2711,7 +2710,8 @@ impl DeviceState {
         self.host_linear_textures.retain(|&(t, _), _| t != task_id);
         // New directory ⇒ old GVA HostOps views alias the wrong PT — retire.
         self.retire_task_gva_views(task_id);
-        self.tasks.define(task_id, TaskEntry::define(length, directory_pfn));
+        self.tasks
+            .define(task_id, TaskEntry::define(length, directory_pfn));
     }
 
     /// Retire every GVA HostOps view registered under `task_id`.
@@ -3132,7 +3132,8 @@ impl DeviceState {
     pub fn attach_mapping_internal(&mut self, mapping_id: u32, mapping_internal: u64) -> bool {
         self.max_mapping_id_seen = self.max_mapping_id_seen.max(mapping_id);
         if !crate::model::is_mapping_id(mapping_id) {
-            StateMutationDecline::AttachMappingIdSentinel { mapping_id }.emit(u64::from(mapping_id));
+            StateMutationDecline::AttachMappingIdSentinel { mapping_id }
+                .emit(u64::from(mapping_id));
             return false;
         }
         if mapping_internal == 0 {

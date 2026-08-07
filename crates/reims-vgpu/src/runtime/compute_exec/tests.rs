@@ -268,12 +268,12 @@ fn compute_bind_overflow_drops_the_bind_but_keeps_in_cap_and_unbinds() {
 /// Each argument table renders its own `reason=`, and the line keeps the shape
 /// the log has always carried.
 ///
-/// The slugs used to live inside a `format!` string, where
-/// `decline_slugs_are_unique` could not read them — a later decline spelling
-/// one of them would have shared this path's `fail_once` latch and silenced one
-/// of the two for the boot, with nothing failing. They are `slug()` bodies now,
-/// so that test sees them; this one pins that moving them did not change what a
-/// reader greps for, and that the three tables stay distinguishable.
+/// The slugs used to live inside a `format!` string, where a later decline
+/// spelling one of them would have shared this path's `fail_once` latch and
+/// silenced one of the two for the boot, with nothing failing. They are
+/// `slug()` bodies now, where a reader looking for the vocabulary will find
+/// them; this pins that moving them did not change what a reader greps for, and
+/// that the three tables stay distinguishable.
 ///
 /// There were four. The threadgroup-memory table left this enum when its cap
 /// did: it is bounded by a Metal argument table rather than by the protocol, so
@@ -2433,10 +2433,7 @@ fn a_bind_past_the_argument_table_refuses_the_dispatch() {
         "the dispatch resolves before any bind, so a later refusal is the bind's"
     );
 
-    acc.bind_textures(
-        MAX_COMPUTE_TEXTURE_SLOTS + 3,
-        &[RefBinding { ref_: 9 }],
-    );
+    acc.bind_textures(MAX_COMPUTE_TEXTURE_SLOTS + 3, &[RefBinding { ref_: 9 }]);
     assert!(
         acc.textures.is_empty(),
         "the slot is past the table, so there was nowhere to record it"
@@ -2457,24 +2454,15 @@ fn a_bind_past_the_argument_table_refuses_the_dispatch() {
 
     // ...until the guest clears that slot, which makes what this accumulator
     // holds equal to what the guest asked for again.
-    acc.bind_textures(
-        MAX_COMPUTE_TEXTURE_SLOTS + 3,
-        &[RefBinding { ref_: 0 }],
-    );
+    acc.bind_textures(MAX_COMPUTE_TEXTURE_SLOTS + 3, &[RefBinding { ref_: 0 }]);
     assert!(
         resolve_dispatch_dims_reported(&mut state, &host, 1, &cmd, &acc).is_ok(),
         "a nil bind at the refused slot retires the refusal with it"
     );
 
     // A clear at a different slot is not that slot, and must not lift it.
-    acc.bind_textures(
-        MAX_COMPUTE_TEXTURE_SLOTS + 5,
-        &[RefBinding { ref_: 9 }],
-    );
-    acc.bind_textures(
-        2,
-        &[RefBinding { ref_: 0 }],
-    );
+    acc.bind_textures(MAX_COMPUTE_TEXTURE_SLOTS + 5, &[RefBinding { ref_: 9 }]);
+    acc.bind_textures(2, &[RefBinding { ref_: 0 }]);
     assert!(
         resolve_dispatch_dims_reported(&mut state, &host, 1, &cmd, &acc).is_err(),
         "clearing an unrelated slot leaves the refused one refused"

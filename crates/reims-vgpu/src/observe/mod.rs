@@ -45,14 +45,14 @@
 //! emitters, and the silence it produced had already been written up as a
 //! finding about the device before the collision was noticed.
 //!
-//! `tests/decline_slugs_are_unique.rs` holds that door shut. It reads every
-//! `slug()` and `refusal()` body in the crate — 655 distinct slugs across 85
-//! impls today, no duplicate — and fails on two shapes: one slug claimed by two
-//! impls, and one slug returned by two arms of the same impl. Both are the same
-//! defect at different radii. A `gate` module used to check this alongside a
-//! 2 700-line restatement of the vocabulary and was removed whole in `db80389`;
-//! the check came back without the restatement, so it cannot drift from the
-//! arms it reads.
+//! **Nothing checks this.** A source scan over every `slug()` and `refusal()`
+//! body used to, and it went with the rest of them; a `gate` module before that
+//! checked it alongside a 2 700-line restatement of the vocabulary and was
+//! removed whole in `db80389`. Two shapes are the defect, at different radii:
+//! one slug claimed by two impls, and one slug returned by two arms of the same
+//! impl. Prefix every slug with the rail that owns it — that is what makes a
+//! collision unlikely by construction, since the audit that would catch one is
+//! gone.
 //!
 //! The judgement no gate can make stays with the author: do **not** log
 //! speculative returns (a resolver legitimately answering "not ready yet" every

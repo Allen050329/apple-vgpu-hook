@@ -490,8 +490,8 @@ impl ScissorRect {
 /// One entry of a multi-slot buffer bind record.
 ///
 /// A struct rather than the `(u32, u64)` tuple this used to be, because the
-/// stride is a third value travelling with the same two and `scripts/scattered-struct`
-/// exists for exactly that. The pair had already outgrown the tuple: the
+/// stride is a third value travelling with the same two. The pair had already
+/// outgrown the tuple: the
 /// twenty-byte `setVertexBuffers:offsets:attributeStrides:withRange:` entry
 /// carries all three, and the decoder was reading the first two and stepping
 /// over the third.
@@ -1062,8 +1062,10 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
                 // says so and `render_set_vertex_samplers_lod_range` binds two
                 // slots with four distinct values — so they are pushed beside
                 // the refs rather than lifted to a per-record pair.
-                out.sampler_lod_binds
-                    .push((e.lod_min_clamp.get().to_bits(), e.lod_max_clamp.get().to_bits()));
+                out.sampler_lod_binds.push((
+                    e.lod_min_clamp.get().to_bits(),
+                    e.lod_max_clamp.get().to_bits(),
+                ));
             }
             if let Some(&r) = out.ref_binds.first() {
                 out.sampler_ref = r;

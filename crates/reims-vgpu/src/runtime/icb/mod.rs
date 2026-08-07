@@ -262,9 +262,9 @@ impl IcbRenderBindStage {
 /// Its only production caller is therefore `backend-metal`-gated and this is
 /// dead code on a Vulkan build — deliberately, because gating the rule to match
 /// would take its tests off the one host that runs them. That the gated caller
-/// still calls it is held by
-/// `tests/an_icb_bind_index_is_bounded_before_it_reaches_metal.rs`, which reads
-/// source and so sees across the `cfg`.
+/// still calls it was held by a source scan that could see across the `cfg`;
+/// nothing does now, so a Metal-arm change that drops the call would leave this
+/// function green and the bind unbounded.
 #[cfg_attr(
     not(all(feature = "backend-metal", target_os = "macos")),
     allow(dead_code)
@@ -1541,7 +1541,8 @@ pub fn resolve_metal_icb<M: HostMemory + HostOps>(
 ///
 /// The three constants below are the wire crate's, aliased rather than spelled,
 /// so this file cannot drift from the declaration the fixtures pin.
-pub const INFO_OP_ICB_HOST_RESOURCE: u32 = reims_vgpu_wire::ops::info::OPCODE_ICB_HOST_RESOURCE_INFO;
+pub const INFO_OP_ICB_HOST_RESOURCE: u32 =
+    reims_vgpu_wire::ops::info::OPCODE_ICB_HOST_RESOURCE_INFO;
 pub const INFO_OP_ICB_HOST_RESOURCE_RECORD_LEN: u32 = reims_vgpu_wire::ops::info::QUERY_TOTAL_LEN;
 pub const INFO_OP_ICB_HOST_RESOURCE_PAYLOAD_LEN: usize =
     std::mem::size_of::<reims_vgpu_wire::ops::info::Query>();
@@ -2075,7 +2076,8 @@ pub fn fill_icb_from_command_memory<M: HostMemory + HostOps>(
     range_location: u64,
     range_length: u64,
 ) -> Result<(), IcbStatus> {
-    for fill in decode_icb_command_range(state, host, task_id, icb_ref, range_location, range_length)?
+    for fill in
+        decode_icb_command_range(state, host, task_id, icb_ref, range_location, range_length)?
     {
         match fill {
             IcbCommandFill::Compute(f) => fill_compute_command(state, host, task_id, icb_ref, &f)?,

@@ -733,9 +733,9 @@ pub fn backend_name() -> &'static str {
 /// like any other loss of guest work. See [`crate::observe::panic`] for why the
 /// location needs a hook and why arming it lives on this path.
 ///
-/// Every caller must pass its own symbol name;
-/// `tests/an_abi_entry_names_itself_when_it_panics.rs` checks that none of them
-/// names a neighbour.
+/// Every caller must pass its own symbol name. A copied call site that still
+/// names its neighbour reports the wrong entry point for a panic, and nothing
+/// checks for it — a source scan used to.
 pub fn unwind_safe<T, F>(entry: &'static str, f: F, on_panic: T) -> T
 where
     F: FnOnce() -> T + std::panic::UnwindSafe,

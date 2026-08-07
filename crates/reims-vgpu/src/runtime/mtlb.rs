@@ -46,9 +46,8 @@ use crate::runtime::{gva_mem, objects};
 ///
 /// Public because [`extract_air`] is, and everything that function does happens
 /// *after* it finds this: a caller that wants to reach the wrapper-header
-/// arithmetic — the fuzz harness in
-/// `tests/a_decoder_survives_bytes_the_guest_could_write.rs` is the one — must
-/// be able to name the magic rather than write the four bytes out a second time.
+/// arithmetic must be able to name the magic rather than write the four bytes
+/// out a second time.
 pub const AIR_WRAP_MAGIC: [u8; 4] = [0xde, 0xc0, 0x17, 0x0b];
 const WRAPPER_HEADER_LEN: usize = 0x14;
 

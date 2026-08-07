@@ -1354,30 +1354,14 @@ impl FreeTargetImage {
 /// counts here (6, 5, 0) are small enough that only the 12000 arm's zero is
 /// clearly outside run-to-run noise.
 ///
-/// # This is the crate's only eviction bound that is an age, and the scans do
-/// not read it by name
+/// # This is the crate's only eviction bound that is an age
 ///
-/// `an_eviction_says_what_it_costs` finds a removal and then looks for a
-/// capacity token within twenty lines, asking `source_scan::is_bound` about
-/// each. `IDLE_TARGET_AGE_MS` carries none of that vocabulary, so this constant
-/// is not what puts its removal sites in that table — their own `*_CAP_*` and
-/// `*_MAX_*` neighbours are. The verdicts there are therefore about the right
-/// lines for a reason that has nothing to do with this bound, and a future
-/// age-governed removal with no such neighbour would be absent from the
-/// population rather than reported as unadjudicated.
-///
-/// **Do not close that by adding `AGE` to `source_scan::BOUND_WORDS`.** It was
-/// tried: the four scans stay green, because every site an age governs today is
-/// already reached another way, so the word buys nothing now — and `is_bound`
-/// matches by `contains`, so `AGE` is also inside `PAGE`, `STORAGE`, `USAGE`,
-/// `IMAGE` and `MESSAGE`. It would silently reclassify `PAGE_SHIFT_ARM64E` and
-/// `STORAGE_IMAGE_FREE_CAP_TOTAL` as policy bounds the first time one of them
-/// landed near a removal or inside a `.take(..)`, which is the same
-/// false-positive trade that got a `max_` prefix reverted within the hour.
-///
-/// A second age-based eviction is the thing to watch for. If one appears, give
-/// it a name carrying `LIMIT` — the bound *is* a limit on idle age — rather
-/// than widening the vocabulary to a substring of five unrelated words.
+/// Every other bound governing a removal here is a capacity — a count of
+/// entries or bytes. This one is a deadline, and the difference matters when
+/// reasoning about what a reading means: a capacity bound firing says the
+/// working set outgrew the table, while this one firing says only that time
+/// passed. A second age-based eviction is the thing to watch for; give it a
+/// name carrying `LIMIT`, because the bound *is* a limit on idle age.
 pub(crate) const IDLE_TARGET_AGE_MS: u64 = 2000;
 /// Minimum wall-clock spacing between reclaim passes. The poll path calls the
 /// drain ~244×/s; without this it would empty the whole registry in well under a
@@ -1458,8 +1442,8 @@ const TARGET_FREE_CAP_TOTAL: usize = 32;
 /// framebuffer.
 ///
 /// **What the eviction costs is settled; what the number should be is not.**
-/// `an_eviction_says_what_it_costs` records this site as `Cost::Recomputable`,
-/// and the key is why: `(TargetKey, render_pass)` is geometry plus pass
+/// The eviction is recomputable rather than lossy, and the key is why:
+/// `(TargetKey, render_pass)` is geometry plus pass
 /// identity, carrying no guest resource id, so a slot here is scratch for one
 /// draw rather than any resource's content. Evicting one costs an image
 /// creation, never a pixel.

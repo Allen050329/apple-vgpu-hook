@@ -28,8 +28,7 @@
 ///
 /// The cost is a Vulkan build compiling twenty lines of arithmetic it never
 /// calls, which is not a reason to hide a test from the only machine that can
-/// run it. `scripts/dead-state` takes the intersection of both arms, so it does
-/// not read as dead.
+/// run it.
 ///
 /// It stays out of `contract::fnv` for the reason its own doc gives: the fold
 /// here is not the shared one, and a caller reaching for the wrong one would

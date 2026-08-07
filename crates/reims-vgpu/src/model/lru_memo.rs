@@ -64,12 +64,8 @@ impl<K: Ord + Clone, V> LruBytesMemo<K, V> {
     /// exists; `len_without_is_empty` is a hard error at `-D warnings` on this
     /// crate.
     ///
-    /// The `allow` is what keeps `scripts/dead-state` at zero. Without it this
-    /// is the one standing entry in that instrument's output, and a report that
-    /// is always there is a report nobody reads — the next genuinely dead item
-    /// would land beside it and look like the same known noise. Removing the
-    /// `allow` is not a way to delete this method; `len` has callers, so
-    /// deleting it fails the clippy arms instead.
+    /// Removing the `allow` is not a way to delete this method; `len` has
+    /// callers, so deleting it fails the clippy arms instead.
     #[allow(
         dead_code,
         reason = "exists to satisfy clippy::len_without_is_empty beside `len`, not for a caller"

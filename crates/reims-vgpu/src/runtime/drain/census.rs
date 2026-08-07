@@ -1242,12 +1242,9 @@ impl DoorbellCensus {
 /// `offsets=` states how many distinct ones there were, so a truncated tail is
 /// visible rather than implied.
 ///
-/// The `_MAX` is load-bearing rather than decoration: it is what puts this
-/// constant inside the vocabulary the three bound scans share, so the walk
-/// direction adjudicates it alongside every other cut instead of passing over
-/// it. `a_bound_in_a_cut_is_named_like_one` fails if it is renamed without one.
-/// Under its previous name it *was* that scan's documented blind spot — and the
-/// blind spot turned out to have a second occupant nobody had written down.
+/// The `_MAX` says this is a cut and not a size: the walk stops here whether or
+/// not the guest's data has run out, so a reader who wants the true count reads
+/// `offsets=` and not the length of what was printed.
 const DOORBELL_OFFSETS_REPORTED_MAX: usize = 4;
 
 static DOORBELL: std::sync::LazyLock<DoorbellCensus> =

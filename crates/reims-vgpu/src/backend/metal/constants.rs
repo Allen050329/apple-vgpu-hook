@@ -93,7 +93,6 @@ const _: () = assert!(
 
 /// Metal `MTLBufferLayoutStrideDynamic` == `NSUIntegerMax`.
 pub const MTL_BUFFER_LAYOUT_STRIDE_DYNAMIC: u64 = u64::MAX;
-const _: () = assert!(MTL_BUFFER_LAYOUT_STRIDE_DYNAMIC == u64::MAX);
 
 // The three binding bands do not overlap. A `const` assertion rather than a
 // `#[test]`, for the reason the buffer-bind-limit pin below spells out.

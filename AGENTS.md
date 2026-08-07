@@ -66,12 +66,21 @@ A shim that calls two queries and branches on the pair has reconstructed a rule,
 violation as writing one. Export the answer, not the inputs — and delete the inputs, because a shim
 that can still assemble its own answer eventually will.
 
+Once a `reims_vgpu_qemu_*` entry point is wrapped in the shared `reims-vgpu-shim.c`, that wrapper is
+the only caller; neither device shim may reach the raw entry point. This has cost twice, both times
+on who owns the host console — `reims_vgpu_qemu_scanout_may_paint` assembled shim-side from two
+other queries, and `reims_vgpu_qemu_console_feed` called raw by the arm64 shim, which read a failed
+call as "not early". A test used to check this by parsing the C; it was a source grep and is gone.
+Each shim is built for a different host, so a re-inlined call fails on whichever pathway is not
+being booted — check both shims by hand when you touch one.
+
 Anything crossing the boundary lives twice, once in Rust and once in
-`crates/reims-vgpu/include/reims_vgpu_qemu_abi.h`, and nothing in the toolchain compares the two:
-Rust does not include the header and the shims do not read Rust. Every constant that crosses gets a
-test, using `qemu::abi::header_define` — see `the_abi_header_agrees_on_the_version`,
-`..._on_the_scanout_bound` and `..._on_the_console_feed_kinds`. Add one with any new shared
-constant; a drift here is a bug on exactly one pathway.
+`crates/reims-vgpu/include/reims_vgpu_qemu_abi.h`, and nothing else in the toolchain compares the
+two: Rust does not `#include` the header and the shims do not read Rust. Every constant that crosses
+gets a test, using `qemu::abi::header_define` — see `the_abi_header_agrees_on_the_version`,
+`..._on_the_entry_point_return_codes`, `..._on_the_dmabuf_codes` and
+`..._on_the_host_action_layout`. Add one with any new shared constant; a drift here is a bug on
+exactly one pathway.
 
 ### Never Fail Silently
 
@@ -99,6 +108,61 @@ without noticing.
 Behavior changes need tests that fail without the change. Bug fixes need a focused synthetic case
 or proxy test for the bug class. Run Rust tests serially with `-- --test-threads=1`; GPU-touching
 tests are not safe to run in parallel.
+
+### Do Not Validate By Grepping Source
+
+**No test, script, or gate may read this repository's own Rust source as text and assert on what it
+finds.** No `read_to_string` over `src/`, no regex for a call shape, no walking `src/` to build a
+census of sites, no verdict table keyed by file and line that a new match must be added to.
+
+This crate accumulated forty such scanners — 17,000 lines, more than the behavioural suite — and
+retired all of them at once. They fail in three ways that no amount of care fixes:
+
+- **They test spelling, not behavior.** A scanner proves a `push` sits near a `len()` comparison. It
+  cannot prove the guest keeps its work, which is the only thing that matters. A rename satisfies
+  one; a real regression walks past it.
+- **They are wrong in the direction that reads as thorough.** One scan here was off by 40 % because
+  `use ops::{texture_view as w_view}` never puts the family name after the token `ops::`. It
+  reported a clean sweep of a population it could not see, and its output looked identical to a
+  correct one.
+- **Their verdict tables become the work.** A table demanding a written line per site turns every
+  edit into a documentation exercise against the scanner rather than against the device, and the
+  lines go stale the moment the code they describe moves.
+
+What to do instead, in order of preference:
+
+1. **Make the invariant unrepresentable.** A bound that must not be exceeded belongs in a type or a
+   constructor, not in a scan looking for places that forgot to check it.
+2. **Derive, don't duplicate and compare.** If two constants must agree, make one `= the other`. A
+   scanner that checks two spellings match is solving a problem you created by having two spellings.
+3. **Assert the relation where the constant is declared.** See below.
+4. **Write a behavioural test** that fails when the guest loses work.
+
+If none of those can reach it, the invariant goes in a doc comment next to the code and is enforced
+by review. An unenforced rule that is honestly unenforced beats a scanner that reports success on a
+population it cannot see.
+
+One narrow thing is not covered by this ban: reading the **C header** at
+`crates/reims-vgpu/include/reims_vgpu_qemu_abi.h` to compare its `#define`s against the Rust
+constants, because Rust genuinely cannot `#include` it and the two spellings have no other
+comparison. That is `qemu::abi::header_define` and its `#[cfg(test)]` tests — it parses one
+`#define` by name out of an `include_str!`, and it is not licence to grep the C shims for call
+shapes. Coverage-instrumented tools that observe a real boot (`scripts/runtime-dead`) are also
+fine; they measure execution, not text.
+
+### Inline `const` Assertions
+
+A `const _: () = assert!(..)` is the right tool for a **relation between two independently-derived
+values** — that a table is wide enough for the mask indexing it, that two binding bands do not
+overlap, that five bit-masks tile a word, that an external crate's enum discriminant still matches
+the ordinal this device decodes. `rustc` evaluates these on every arm that compiles the file,
+including the cross-compiled `--target aarch64-apple-darwin` clippy run, which is why they reach
+Metal code no Linux host can run tests for.
+
+**Declaring a constant and then asserting it equals what you just declared it to be is not a
+check.** `pub const X: u64 = u64::MAX;` followed by `assert!(X == u64::MAX)` proves nothing. Nor
+does hand-copying a value and asserting the copy equals the original: write `pub const X: u32 =
+other::X;` and there is nothing left to drift.
 
 ### Do Not Overfit Fixes
 
@@ -158,8 +222,8 @@ Four rules survive every sweep:
   path.** If you can name it, it stays. Deleting one loses guest work silently the first time a
   guest takes it.
 - **A zero can be an artifact of where it is sampled.** Find a census field's sampling point before
-  cutting it; `scripts/constant-fields/README.md` lists the ways a constant reading is legitimate.
-  A zero hit rate on one pathway is not a dead cache either — page shift alone changes it. The same
+  cutting it. A zero hit rate on one pathway is not a dead cache either — page shift alone changes
+  it. The same
   trap applies to a *check*, where it is easier to miss: a guard that tests two endpoints of a range
   reads as thorough and samples two bytes of it. Ask what granularity the underlying answer varies
   at, and walk the range at that granularity or ask the host for a span verdict.
@@ -175,73 +239,29 @@ Four rules survive every sweep:
   attachment prefix had a four-term admission rule written by hand three times, and two of the three
   copies were missing a different term. Count the terms before reading what they say.
 
-**Do not hand-sweep the crate for bounds.** A bound can cost guest work in exactly three ways — an
-entry evicted, an entry never recorded, a run read only partway — and each has a test below that
-demands a written verdict for every site and fails on a new one. Two of the three were hand-swept
-first and the scans then found sites the sweeps had missed, in both cases sites that were *safe*,
-which is why a reader hunting for danger walked past them. Add your verdict to the table the failure
-names; do not re-derive the population.
+**Bounds are the class most often swept, and sweeping is not how you find them.** A bound can cost
+guest work in four ways — an entry evicted, an entry never recorded, a run read only partway, and a
+**bitmask standing in for a set**, where `mask |= 1u32 << index` bounds the membership to 32 with
+nothing declared anywhere and a shift past the width *wraps* in release rather than failing. A fifth
+has no number at all: **a slot holding one decoded record**, where `acc.x = Some(rec)` in a decode
+arm is a capacity of one and the second record the guest sends drops the first.
 
-All three filter by the constant's **name**, so a bound named for what it limits rather than for the
-fact that it limits used to be invisible to every one of them — not reported as unadjudicated,
-reported not at all. That hole is now held shut by a fourth test rather than by prose, which is what
-matters: the prose named one such constant and there were two. **Name a new bound with a `MAX` or a
-`CAP` and all three pick it up for free**; name it otherwise and the build tells you.
+None of these is found reliably by looking for them, which is why the scanners that used to be
+listed here are gone. Make them unrepresentable instead: put the bound in the type that carries the
+collection, give the mask a width pinned by a `const` assertion against the table it indexes, and
+where a latch must not be overwritten, make the second write a typed refusal rather than an
+assignment. Then a new site cannot be added without meeting the rule, and nothing has to go hunting.
 
-There is a fourth way, and it has no constant at all to name: a **bitmask standing in for a set**.
-`mask |= 1u32 << index` bounds the set to 32 members with nothing declared anywhere, and it does not
-fail like the other three — a shift past the width panics in debug and *wraps* in release, so the
-write lands on another member's bit and the set reports the wrong slots from then on. It has its own
-test below; adding a mask means writing down what bounds the shift and where the width is pinned.
-
-A fifth, with no number of any kind: **a slot that holds one decoded record**. `acc.x = Some(rec)`
-in a decode arm is a capacity of one, and where the record is *work* rather than encoder state the
-second one the guest sends drops the first, silently. Its test below wants a written verdict per
-field, because the two cases look identical and only the Metal selector tells them apart: ask
-whether sending the record twice makes Metal do the thing twice. Its population is found by two
-name-matches **and a closure over composition** — a struct holding an accumulator is one — and the
-closure is the half that catches a wrapper neither name reaches.
-
-Prefer an instrument over a reading. Reading an audit against itself cannot see an opcode that is
-simply the wrong number, a length four bytes off, or a field two bytes too wide:
+Prefer an instrument over a reading, where an instrument that is not a source grep exists. Reading
+an audit against itself cannot see an opcode that is simply the wrong number, a length four bytes
+off, or a field two bytes too wide:
 
 | Question | Instrument |
 |---|---|
-| What compiles but is never referenced? | `scripts/dead-state/dead-state.sh` |
 | What is reachable but never runs? | `scripts/runtime-dead` — coverage-instrumented driven boot |
 | Does a decoder refuse or drop a record Apple emits? | `crates/reims-vgpu/tests/wire_fixtures_reach_the_decoders.rs` |
-| Is a wire family declared twice, or read by nobody? | `crates/reims-vgpu/tests/wire_families_have_a_consumer.rs` |
 | Does a `[`link`]` in a doc comment name a symbol that no longer exists? | `cargo doc`'s intra-doc link pass |
-| Does a bare `` `name` `` in prose name one? Nothing else checks that form. | `scripts/stale-doc-names` |
-| Does a value travel as loose parameters when a type for it exists? | `scripts/scattered-struct` |
-| Is a validity rule written out at every site instead of beside its constant? | `scripts/scattered-bound` |
-| Does a decoded record fail a guard and vanish into a no-op catch-all? | `scripts/silent-arms` |
-| Does a constant crossing the C boundary have the test this file asks for? | `scripts/abi-pins` |
-| Do two checks share a `reason=` slug, and so share `fail_once`'s latch? | `crates/reims-vgpu/tests/decline_slugs_are_unique.rs` |
-| Does a decline say whether the guest lost work, or just what refused? | `crates/reims-vgpu/tests/a_decline_says_whether_the_guest_lost_work.rs` |
-| Does a test pass only because of what ran before it? | `scripts/test-isolation` |
-| Is a Vulkan value spelled outside the `translate/` table that owns it? | `crates/reims-vgpu/tests/vulkan_state_enums_live_in_translate.rs` |
-| Does anything reach a Vulkan 1.3 core name the 1.2 floor forbids? | `crates/reims-vgpu/tests/nothing_reaches_past_the_vulkan_api_floor.rs` |
-| Does a stored refusal outlive the instant it described? | `crates/reims-vgpu/tests/a_remembered_refusal_says_whether_it_can_go_stale.rs` |
-| Does a cap drop an entry the device had already admitted? | `crates/reims-vgpu/tests/an_eviction_says_what_it_costs.rs` |
-| Does a cap stop one being recorded in the first place? | `crates/reims-vgpu/tests/a_bounded_insert_says_what_it_drops.rs` |
-| Does a cap stop a walk before the guest's data runs out? | `crates/reims-vgpu/tests/a_bounded_walk_says_what_it_skips.rs` |
-| Is a bound named so those three can see it at all? | `crates/reims-vgpu/tests/a_bound_in_a_cut_is_named_like_one.rs` |
-| Does a bitmask used as a set say what bounds it and how wide it is? | `crates/reims-vgpu/tests/a_mask_used_as_a_set_says_how_wide_it_is.rs` |
-| Does a slot holding one decoded record say what a second one does to it? | `crates/reims-vgpu/tests/a_latched_record_says_whether_a_second_one_replaces_it.rs` |
-| Could a draw be lost because a second pipeline opcode has no exec arm? | `crates/reims-vgpu/tests/a_pipeline_reaches_the_latch_by_one_wire_form.rs` |
-| Does an arm test some of an attachment's subresource coordinates and not the rest? | `crates/reims-vgpu/tests/an_attachment_subresource_is_admitted_by_one_rule.rs` |
-| Is a product widened by a cast that comes too late to help? | `crates/reims-vgpu/tests/a_product_is_widened_before_it_is_taken.rs` |
-| Do the source scans read the product half, or its fixtures? | `crates/reims-vgpu/tests/the_source_scanner_reads_the_product_and_not_its_fixtures.rs` |
-| Can a guest record panic a parser instead of being refused? | `crates/reims-vgpu/tests/a_decoder_survives_bytes_the_guest_could_write.rs` |
-| Does a wire struct hold a field an out-of-range guest value makes UB? | `crates/reims-vgpu/tests/a_wire_struct_holds_only_all_bytes_valid_fields.rs` |
-| Does a C ABI entry report the wrong entry point when it panics? | `crates/reims-vgpu/tests/an_abi_entry_names_itself_when_it_panics.rs` |
-
-Do **not** answer that one by diffing `ls src/ops/` against a `grep` for
-`use reims_vgpu_wire` — that pair used to live here and it is wrong by 40 % on
-this tree, because a family imported as `ops::{texture_view as w_view, ..}`
-never puts its own name after the token `ops::`. The test above parses the brace
-group, and refuses to report anything until it has proved it can see one.
+| Does a constant crossing the C boundary still match the header? | the `header_define` tests in `src/qemu/abi.rs` |
 
 ```sh
 RUSTDOCFLAGS="-A rustdoc::private_intra_doc_links" cargo doc -p reims-vgpu \
@@ -295,9 +315,8 @@ success hides a whole family of lost records behind a green run.
   begins with its own event name and an off-channel one begins with the literal `OFF `, so
   `grep -v '^OFF '` first.
 - **A named reason on the fail channel is not automatically lost work.** Some report a repair that
-  *succeeded*, fail-visible so the reliance stays measurable. The reading is written down per type
-  in `a_decline_says_whether_the_guest_lost_work`, so look the slug's owning type up there before
-  re-deriving it from the emitter — and correct the row if the emitter disagrees.
+  *succeeded*, fail-visible so the reliance stays measurable. Read the emitting type's own doc
+  before concluding a reading is a loss.
 - **A counter and a fail line count different things.** Emitters dedupe; counters do not. Do not
   quote one as the other.
 - **`store_routes` counters are per-window: sum the samples.** They reset each census interval, so
@@ -328,8 +347,13 @@ path. Gate on capabilities, not vendor names, driver names, or API-version assum
 asked for, and Metal's `newBufferWithBytesNoCopy` may alias only this process's own bytes. Importing
 a host pointer over guest RAM gives the host GPU read *and write* access to the guest VM's memory,
 and that is a property of the mechanism rather than of how much of it is used — so the bound is
-"never requested", not a budget. Both invariants are enforced by
-`crates/reims-vgpu/tests/guest_ram_isolation.rs`.
+"never requested", not a budget.
+
+**Neither invariant is machine-checked.** A source scan used to assert that neither name appeared in
+the crate; it was a text grep and went with the rest of them. Nothing has replaced it, so this rule
+is enforced by review: a change that touches extension selection, `VkImportMemory*`, or Metal buffer
+creation must be read against this paragraph. If either name is ever reintroduced, the reviewer is
+the only thing standing in front of it.
 
 **A dma-buf is the one mechanism that is allowed, and it is not that one wearing a new name.** The
 GPU reaches guest pages through `VK_EXT_external_memory_dma_buf`, gated on
@@ -461,11 +485,11 @@ commands above *compile* them, which is why a code warning there is still caught
 no macOS SDK), so no binary is ever produced. Do not read "compiles on the Metal arm" as "its tests
 passed"; nobody on a Linux host has run them.
 
-How many there are is pinned by
-`crates/reims-vgpu/tests/the_metal_arm_tests_are_counted_where_they_cannot_run.rs`, which runs on
-the arm you *can* build, so adding or deleting one of them stops being invisible here. This
-paragraph used to carry the number itself and it was wrong by four — a bare `grep` for `#[test]`
-counts the sentences that say "a `const` assertion rather than a `#[test]`". Read the constant.
+Nothing counts them any more — a source scan used to, and went with the rest. Do not try to restore
+the count with a `grep` for `#[test]`: that is what the scan did, and it was wrong by four, because
+the prose in those files says "a `const` assertion rather than a `#[test]`" and the grep counted the
+sentences. The gap is real and unclosed: work on `backend/metal/` needs an Apple host to be tested
+at all.
 
 Where a file under `backend/metal/` is pure logic, **move it out of the gated tree** rather than
 working around the gate — `backend::hash` is the worked example, and its two tests now run on every

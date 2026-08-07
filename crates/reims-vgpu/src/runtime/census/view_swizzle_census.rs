@@ -118,9 +118,9 @@ mod tests {
     ///
     /// Bare, `cpu_remap` and `resident_direct_bind` say nothing about which
     /// subsystem refused — the same argument that prefixed the slate reasons.
-    /// This asserts the prefix only; crate-wide distinctness is
-    /// `tests/decline_slugs_are_unique.rs`'s job, and naming the rail is what
-    /// keeps a slug distinct for a reason rather than by luck.
+    /// This asserts the prefix only; crate-wide distinctness is unchecked, and
+    /// naming the rail is what keeps a slug distinct for a reason rather than
+    /// by luck.
     #[test]
     fn both_swizzle_slugs_name_their_rail() {
         use crate::observe::Decline as _;

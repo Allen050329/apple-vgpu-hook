@@ -1716,8 +1716,8 @@ fn handle_render_record<M: HostMemory + HostOps>(
         // flag in the same block, so the flag was true whenever the arm was
         // reached and the guard could not fail. It was not free: the match's last
         // arm is a bare `_ => {}`, so the shape said a guest could set a cull mode
-        // this device then discarded, and `scripts/silent-arms` had to suppress
-        // all five as presence-guards to stay quiet. A record too short to hold
+        // this device then discarded, when no such loss was possible. A record
+        // too short to hold
         // the field never gets here at all — the wire view refuses it and
         // `decode` returns `ErrShort` before a kind is assigned.
         RenderKind::SetBlendColor => {

@@ -130,13 +130,12 @@ pub const STAGE_IN_INDIRECT_ARGS_LEN: usize = 24;
 /// `(slug, discriminant)` in one process-global set, which is the same dedup
 /// with the same shape.
 ///
-/// Keeping a private one had a cost beyond the duplication.
-/// `decline_slugs_are_unique` reads `slug()` and `refusal()` bodies, so the four
-/// slugs below were **invisible to it** while they lived inside a format string:
-/// a future decline spelling `sampler_index_overflow` would have shared this
-/// path's latch and silenced one of the two for the life of the boot, and
-/// nothing would have failed. That is the exact shape the collision test was
-/// written about.
+/// Keeping a private one had a cost beyond the duplication. The four slugs
+/// below lived inside a format string, where nobody looking for this crate's
+/// decline vocabulary would find them: a future decline spelling
+/// `sampler_index_overflow` would have shared this path's latch and silenced
+/// one of the two for the life of the boot, and nothing would have failed. They
+/// are `slug()` bodies now for that reason.
 ///
 /// The rendered line is unchanged but for the trailing parenthetical, which the
 /// `k=v` shape has no room for and which this doc now carries instead.
@@ -3215,7 +3214,9 @@ fn resolve_dispatch_dims_reported<M: HostMemory + HostOps>(
             .field("refused_arg", arg)
             .field("table", cap)
             .fail_once(u64::from(index));
-        return Err(ComputeStatus::Unsupported("compute_dispatch_bind_past_table"));
+        return Err(ComputeStatus::Unsupported(
+            "compute_dispatch_bind_past_table",
+        ));
     }
     resolve_dispatch_dims(state, host, task_id, cmd).inspect_err(|e| {
         crate::observe::line(format!(

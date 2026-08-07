@@ -414,8 +414,8 @@ pub const CHILD_REG_HEAD: u64 = 0x04;
 ///
 /// Whether ignoring it is correct is **not established**. It is named `CONTROL`
 /// from the register block's shape rather than from a decoded write, and no
-/// boot on this rig has sampled what the guest puts in it. `dead-state` reports
-/// it on both arms every run; this comment is the triage, not a licence to cut.
+/// boot on this rig has sampled what the guest puts in it. This comment is the
+/// triage, not a licence to cut.
 #[allow(dead_code)] // named on purpose and read by nothing — see above.
 pub const CHILD_REG_CONTROL: u64 = 0x08;
 pub const CHILD_REG_STAMP_INDEX: u64 = 0x0c;
@@ -1362,11 +1362,11 @@ mod tests {
     /// guard before believing anything: a scan that matches nothing must fail,
     /// not pass.
     ///
-    /// Beside the constant rather than in `tests/qemu_shims_agree.rs`, where the
-    /// other shim-agreement scans live, because `model::regs` is a private
-    /// module — an integration test cannot name `CURSOR_MAX_DIM`, and widening
-    /// the crate's public surface to be testable is the wrong trade. Nothing
-    /// here is backend-gated, so one arm executing it is enough.
+    /// Beside the constant rather than in an integration test, because
+    /// `model::regs` is a private module — an integration test cannot name
+    /// `CURSOR_MAX_DIM`, and widening the crate's public surface to be testable
+    /// is the wrong trade. Nothing here is backend-gated, so one arm executing
+    /// it is enough.
     #[test]
     fn the_cursor_bound_matches_the_sprite_size_qemu_will_allocate() {
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))

@@ -601,8 +601,9 @@ pub(super) fn note_clear_dropped(reason: &'static str, tex_ref: u32, detail: &st
 /// Latched per buffer ref, not per task: a guest re-issues the same indirect
 /// draw every frame, and one line per distinct buffer is what says whether any
 /// guest asks for this at all. The latch guards only the line — the draw is
-/// refused every time, which is the rule
-/// `a_dedup_latch_guards_only_its_own_line` exists to hold.
+/// refused every time. A latch that guarded the refusal as well as the line
+/// would turn the second draw into a silent accept, which is the failure to
+/// watch for whenever a dedup latch sits next to a decision.
 pub(super) fn note_indirect_draw_refused(
     task_id: u32,
     cmd: &crate::runtime::decode::render::Command,

@@ -170,8 +170,8 @@ impl RenderPsoKey {
     ///
     /// Folded off the key's own fields rather than off parallel locals, so the
     /// hash cannot describe a key different from the one it is stored with.
-    /// `a_render_pso_key_field_reaches_both_readers` reads this body and
-    /// [`Self::equal`] as text and requires every declared field in both.
+    /// Every declared field must appear here *and* in [`Self::equal`]: a field
+    /// in one and not the other is a latent bug, not half a fix.
     pub fn rehash(&mut self) {
         let mut h = FNV_OFFSET_BASIS;
         h = hash_u64(h, self.attr_count as u64);
@@ -423,9 +423,10 @@ mod tests {
     }
 
     /// Descriptor state that differs puts two pipelines in different buckets as
-    /// well as making them compare unequal. Both halves are required — see
-    /// `a_render_pso_key_field_reaches_both_readers` for why either alone is a
-    /// latent bug rather than a sufficient one.
+    /// well as making them compare unequal. Both halves are required: a field
+    /// only in the hash splits buckets that should share one, and a field only
+    /// in the compare lets two different pipelines collide in a bucket and then
+    /// be told apart too late.
     #[test]
     fn a_differing_descriptor_changes_the_bucket_and_the_compare() {
         let shader: Vec<u8> = (0..16u8).collect();

@@ -25,9 +25,9 @@
 //! * [`DriverQuirk`] — the only place driver identity may change behavior.
 //!
 //! **Vulkan 1.2 is the baseline on every supported host.** See [`api_floor`]
-//! for why the API version is a floor check and nothing more;
-//! `tests/nothing_reaches_past_the_vulkan_api_floor.rs` scans the crate to keep
-//! it true.
+//! for why the API version is a floor check and nothing more. Nothing enforces
+//! it automatically — a 1.3-core feature struct or promoted entry point must be
+//! caught in review.
 //!
 //! # Rules for adding a capability gate
 //!
