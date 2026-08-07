@@ -55,6 +55,20 @@ pub enum DrawPreparationDecline {
         pipeline_ref: u32,
         bind: crate::runtime::draw::PastTableBind,
     },
+    /// The guest's colour list names more than one render target and one of the
+    /// secondary attachments cannot be built, so the whole draw is refused.
+    ///
+    /// The alternative is what this device used to do: drop every secondary and
+    /// execute the draw against slot 0 alone. That writes a frame the guest has
+    /// no way to know is wrong — a fragment shader's `location` 1.. outputs go
+    /// nowhere and a later pass sampling that attachment reads whatever was
+    /// there before. See
+    /// [`crate::runtime::census::present_proxy::MrtDrop`] for which checks bail
+    /// and why the Metal arm is the one that settled it.
+    SecondaryTargetUnbuildable {
+        pipeline_ref: u32,
+        refusal: crate::runtime::census::present_proxy::SecondaryMrtRefusal,
+    },
     VertexBufferMissing {
         index: u32,
         buffer_ref: u32,
@@ -239,6 +253,13 @@ impl Decline for DrawPreparationDecline {
             }
             Self::GeometryUnsupported { .. } => "draw_prepare_geometry_unsupported",
             Self::BindSlotPastTable { .. } => "draw_prepare_bind_slot_past_table",
+            // One slug for all five `MrtDrop` reasons, with the reason carried
+            // as a field. Delegating to `reason.slug()` the way the AIR-extract
+            // arms do would make this refusal share `fail_once`'s latch with the
+            // `note_secondary_mrt_drop` census that emits the same five slugs,
+            // and the census fires first — so the refusal would be silent for
+            // exactly the geometry the census had already reported.
+            Self::SecondaryTargetUnbuildable { .. } => "draw_prepare_secondary_target_unbuildable",
             Self::VertexBufferMissing { .. } => "draw_prepare_vertex_buffer_missing",
             Self::FragmentBufferMissing { .. } => "draw_prepare_fragment_buffer_missing",
             Self::VertexAttributeFormat { .. } => "draw_prepare_vertex_attribute_format",
@@ -350,6 +371,16 @@ impl Decline for DrawPreparationDecline {
             } => vec![
                 ("task_id", task_id.to_string()),
                 ("pipeline_ref", pipeline_ref.to_string()),
+            ],
+            Self::SecondaryTargetUnbuildable {
+                pipeline_ref,
+                refusal,
+            } => vec![
+                ("pipeline_ref", pipeline_ref.to_string()),
+                ("slot", refusal.slot.to_string()),
+                // The census slug, so one grep finds both the refusal and the
+                // `note_secondary_mrt_drop` line that reports the same check.
+                ("mrt_reason", refusal.reason.slug().to_string()),
             ],
             Self::BindSlotPastTable { pipeline_ref, bind } => vec![
                 ("pipeline_ref", pipeline_ref.to_string()),
@@ -711,6 +742,13 @@ mod tests {
                 width: 8192,
                 height: 4096,
             },
+            DrawPreparationDecline::SecondaryTargetUnbuildable {
+                pipeline_ref: 2,
+                refusal: crate::runtime::census::present_proxy::SecondaryMrtRefusal {
+                    slot: 1,
+                    reason: crate::runtime::census::present_proxy::MrtDrop::GeometryMismatch,
+                },
+            },
             DrawPreparationDecline::VertexBufferMissing {
                 index: 1,
                 buffer_ref: 5,
@@ -900,7 +938,7 @@ mod tests {
         slugs.sort_unstable();
         let before = slugs.len();
         slugs.dedup();
-        assert_eq!(before, 41, "the draw-preparation reason census moved");
+        assert_eq!(before, 42, "the draw-preparation reason census moved");
         assert_eq!(before, slugs.len(), "duplicate draw-preparation slug");
     }
 

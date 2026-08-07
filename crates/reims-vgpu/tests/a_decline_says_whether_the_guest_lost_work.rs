@@ -108,13 +108,13 @@ struct Row {
 /// which is the opposite of what it is for. Raising it for a *new* modification
 /// is the thing it forbids.
 ///
-/// It has been **lowered** five times — 9, 8, 7, 6, 5, 4, one per entry below —
-/// and all five have the shape a lowering is supposed to have: the modification
+/// It has been **lowered** six times — 9, 8, 7, 6, 5, 4, 3, one per entry below
+/// — and all six have the shape a lowering is supposed to have: the modification
 /// was not reclassified, it was made impossible. The count is spelled out
 /// against the sequence because it had already drifted once: it read "twice"
 /// with three entries listed, the third having been added without it.
 ///
-/// Two of the five were found the same way, which is worth saying because it is
+/// Three of the six were found the same way, which is worth saying because it is
 /// a method and not a coincidence: **the other arm already answered.** Where two
 /// arms consume one wire form or one bound, the one that silently modifies is
 /// usually the one with no channel to refuse through, and the fix is to give it
@@ -148,7 +148,19 @@ struct Row {
 ///   normally the wrong way to move this number — the doc above says so — and
 ///   this is the exception the rule needs stated: the entry is removed because
 ///   the *code path* is, not because the verdict was inconvenient.
-const EXECUTED_MODIFIED_CEILING: usize = 4;
+/// * `MrtDrop` — `build_secondary_targets` returned a bare `Vec::new()` for
+///   five different refusals, and the caller could not tell that from the
+///   `Vec::new()` meaning "the guest declared one render target". So it took
+///   the single-RT path for both and executed the draw: a guest that asked for
+///   N attachments got 1, its fragment shader's `location` 1.. outputs went
+///   nowhere, and a later pass sampling that attachment read whatever was in
+///   those pages before. It now returns a `Result` and the draw is refused.
+///   **The other arm again**: `backend::metal::render` attaches every entry of
+///   the same colour list at its own slot number and has never degraded, so
+///   the two arms disagreed about one wire form and only the silent one needed
+///   deciding. Like `DroppedVertexAttribute`, the type survives its own
+///   reclassification — nothing was deleted and no verdict was argued away.
+const EXECUTED_MODIFIED_CEILING: usize = 3;
 
 /// Every `impl Decline`/`impl Refusal` in the crate, and what its worst arm
 /// costs the guest.
@@ -478,11 +490,15 @@ const ROWS: &[Row] = &[
     Row {
         file: "crates/reims-vgpu/src/runtime/census/present_proxy.rs",
         ty: "MrtDrop",
-        loss: Loss::ExecutedModified,
-        why: "a multi-render-target draw is degraded to a single target and \
-              executed, so a later sample of the dropped attachment reads what \
-              was there before. Retired by carrying every attachment through \
-              the render pass",
+        loss: Loss::Unimplemented,
+        why: "a secondary colour attachment the Vulkan arm cannot build refuses \
+              the whole draw through \
+              `DrawPreparationDecline::SecondaryTargetUnbuildable`. It used to \
+              degrade the draw to a single target and execute it, so a later \
+              sample of the dropped attachment read what was there before. The \
+              remaining fix is to implement the attachment — non-contiguous \
+              slots have a Vulkan spelling (`VK_ATTACHMENT_UNUSED`) and the \
+              Metal arm already carries every slot — not to reclassify it",
     },
     Row {
         file: "crates/reims-vgpu/src/runtime/census/present_proxy.rs",

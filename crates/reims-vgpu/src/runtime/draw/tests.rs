@@ -4192,7 +4192,8 @@ fn a_secondary_mrt_slot_binds_its_own_blend() {
     let mut host = crate::runtime::host::FakeHost::new();
     let secs = build_secondary_targets(
         &state, &mut host, 1, &colors, &pipeline, &primary, 64, 64, [0.0; 4],
-    );
+    )
+    .expect("a contiguous, geometry-matching, resolvable secondary builds");
     assert_eq!(secs.len(), 1, "one secondary attachment expected");
     let blend = secs[0].blend.expect(
         "slot 1 declares blending_enabled — before this fix every secondary \
@@ -4221,13 +4222,170 @@ fn a_secondary_mrt_slot_binds_its_own_blend() {
     let mut host = crate::runtime::host::FakeHost::new();
     let secs = build_secondary_targets(
         &state, &mut host, 1, &colors, &unblended, &primary, 64, 64, [0.0; 4],
-    );
+    )
+    .expect("the same secondary builds whether or not its slot blends");
     assert_eq!(secs.len(), 1);
     assert!(
         secs[0].blend.is_none(),
         "slot 1 declares no blend; it must not inherit slot 0's"
     );
     let _ = &mut state;
+}
+
+/// A secondary colour attachment this device cannot build refuses the draw.
+///
+/// Every arm here used to `return Vec::new()`, which the caller could not tell
+/// from the `Vec::new()` that means "the guest declared one render target" — so
+/// it took the single-RT path and **executed the draw**. The guest asked for two
+/// attachments and got one, its fragment shader's `location` 1 output went
+/// nowhere, and a later pass sampling that attachment read whatever was in those
+/// pages before. Nothing the guest can observe distinguished that from a draw it
+/// had only ever asked one target for.
+///
+/// The last case is the one that makes the rest meaningful: a genuine single-RT
+/// draw must still be `Ok(empty)`, or "refuse when you cannot build it" would
+/// have been bought by refusing draws that were never MRT at all.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn an_unbuildable_secondary_refuses_the_draw_rather_than_dropping_to_single_rt() {
+    use crate::runtime::census::present_proxy::MrtDrop;
+    use crate::runtime::decode::resource::{PipelineColorAttachment, RenderPipelineDescriptor};
+
+    let state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let pipeline = RenderPipelineDescriptor {
+        color_attachments: vec![
+            PipelineColorAttachment {
+                slot: 0,
+                ..PipelineColorAttachment::default()
+            },
+            PipelineColorAttachment {
+                slot: 1,
+                ..PipelineColorAttachment::default()
+            },
+        ],
+        ..RenderPipelineDescriptor::default()
+    };
+    let primary = crate::backend::vulkan::engine::TargetIdentity::Gva {
+        gva: 0x1000,
+        width: 64,
+        height: 64,
+        generation: 0,
+    };
+    let slot0 = ColorRtRequest {
+        slot: 0,
+        texture_ref: 10,
+        target_gva: 0x1000,
+        width: 64,
+        height: 64,
+        format: MTL_FORMAT_BGRA8_UNORM,
+        ..ColorRtRequest::default()
+    };
+    // A secondary that builds, so each case below differs from it in exactly the
+    // one field its reason names.
+    let good_slot1 = ColorRtRequest {
+        slot: 1,
+        texture_ref: 11,
+        target_gva: 0x2000,
+        width: 64,
+        height: 64,
+        format: crate::contract::pixel_format::MTL_FORMAT_RG16_FLOAT,
+        ..ColorRtRequest::default()
+    };
+
+    let build = |slot1: &ColorRtRequest| {
+        let mut host = crate::runtime::host::FakeHost::new();
+        build_secondary_targets(
+            &state,
+            &mut host,
+            1,
+            &[slot0.clone(), slot1.clone()],
+            &pipeline,
+            &primary,
+            64,
+            64,
+            [0.0; 4],
+        )
+    };
+
+    // The control: this exact list builds, so every refusal below is caused by
+    // the one field it changes and not by the fixture.
+    assert!(
+        build(&good_slot1).is_ok(),
+        "the unmodified fixture must build, or the cases below prove nothing"
+    );
+
+    for (reason, slot1) in [
+        (
+            // Slot 2 where the render pass maps location 1 → attachment 1.
+            MrtDrop::NonContiguousSlot,
+            ColorRtRequest {
+                slot: 2,
+                ..good_slot1.clone()
+            },
+        ),
+        (
+            MrtDrop::GeometryMismatch,
+            ColorRtRequest {
+                width: 32,
+                ..good_slot1.clone()
+            },
+        ),
+        (
+            // No engine mapping, so the layout would have to be guessed.
+            MrtDrop::UnknownFormat,
+            ColorRtRequest {
+                format: 0xfff0,
+                ..good_slot1.clone()
+            },
+        ),
+        (
+            // Neither a linear GVA nor a surface mapping names a resident.
+            MrtDrop::NoIdentity,
+            ColorRtRequest {
+                target_gva: 0,
+                mapping_id: 0,
+                ..good_slot1.clone()
+            },
+        ),
+        (
+            // Resolves to the primary's own resident: a pass that reads and
+            // writes one image through two attachments.
+            MrtDrop::AliasesPrimary,
+            ColorRtRequest {
+                target_gva: 0x1000,
+                ..good_slot1.clone()
+            },
+        ),
+    ] {
+        let refusal = build(&slot1)
+            .expect_err(&format!("{reason:?} must refuse the draw, not drop to single-RT"));
+        assert_eq!(refusal.reason, reason, "the refusal names the check that bailed");
+        assert_eq!(
+            refusal.slot, slot1.slot,
+            "the refusal names the guest's own slot number, so a reader knows \
+             which attachment of the list failed"
+        );
+    }
+
+    // A guest that declared one render target is not an MRT draw and must not be
+    // refused: `Ok(empty)` is the classic single-RT path, byte-identical.
+    let mut host = crate::runtime::host::FakeHost::new();
+    let single = build_secondary_targets(
+        &state,
+        &mut host,
+        1,
+        std::slice::from_ref(&slot0),
+        &pipeline,
+        &primary,
+        64,
+        64,
+        [0.0; 4],
+    )
+    .expect("a single-attachment draw is not a refusal");
+    assert!(
+        single.is_empty(),
+        "one colour attachment produces no secondaries"
+    );
 }
 
 #[cfg(feature = "backend-vulkan")]

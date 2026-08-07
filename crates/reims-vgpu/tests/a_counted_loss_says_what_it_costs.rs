@@ -282,16 +282,11 @@ const ROWS: &[(&str, Counted, &str)] = &[
          scratch storage, priced on its own rather than with the binds it sits \
          beside",
     ),
-    (
-        "mrt_secondary_dropped",
-        Counted::BesideATypedDecline,
-        "the `dropped` half of the MRT census, raised when an MRT draw arrived \
-         and every secondary attachment was refused. `MrtDrop` carries the \
-         verdict in the loss census; this and `mrt_secondary_built` beside it \
-         are what separate 'we render every attachment' from 'we render none', \
-         which the `mrt_drop_*` reasons cannot say because the whole feature is \
-         silent when no MRT draw arrives",
-    ),
+    // `mrt_secondary_dropped` was here, `Counted::BesideATypedDecline`. It is
+    // retired the way the ceiling below asks for — the draw it counted is now
+    // refused whole rather than degraded to single-RT and executed — and the
+    // counter is `mrt_secondary_refused`, which names no loss and so belongs to
+    // no population this file scans. See [`FLOOR`].
     (
         "replace_physical_dropped",
         Counted::NotALoss,
@@ -404,6 +399,23 @@ fn counter_only_slugs() -> Vec<String> {
     out
 }
 
+/// How few counter-only loss slugs mean the parser broke rather than the device
+/// improved.
+///
+/// It is a floor and not a pin, because the two ways it can move are not
+/// symmetric. A counter *added* raises the population and must not fail a scan
+/// whose job is to notice that the parse still works; a counter *retired* lowers
+/// it, and lowering this is then a deliberate line in a commit rather than a
+/// diff nobody reads.
+///
+/// Lowered once, 24 → 23: `mrt_secondary_dropped` became
+/// `mrt_secondary_refused` when a multi-render-target draw with an unbuildable
+/// secondary stopped being degraded to single-RT and executed. A `_refused` slug
+/// names no loss, so it leaves this population — but the rename followed the
+/// behaviour rather than standing in for it, which is the distinction the
+/// ceiling below is written to protect.
+const FLOOR: usize = 23;
+
 #[test]
 fn every_counted_loss_says_what_it_costs() {
     let found = counter_only_slugs();
@@ -412,9 +424,10 @@ fn every_counted_loss_says_what_it_costs() {
     // directory carries: a scan that matched no counter argument would report
     // an empty population as fully adjudicated.
     assert!(
-        found.len() >= 24,
-        "the scan found only {} counter-only loss slugs, so it is not parsing \
-         `note_store_route` arguments and its verdict means nothing: {found:?}",
+        found.len() >= FLOOR,
+        "the scan found only {} counter-only loss slugs, fewer than the {FLOOR} \
+         this scan is known to reach, so it is not parsing `note_store_route` \
+         arguments and its verdict means nothing: {found:?}",
         found.len()
     );
 

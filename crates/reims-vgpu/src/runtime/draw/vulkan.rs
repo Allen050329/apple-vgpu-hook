@@ -3972,15 +3972,32 @@ fn note_type11_store_route(route: &'static str) {
 }
 
 /// Build the engine's secondary MRT attachments (slot 1..) from a draw's color
-/// list. Empty result ⇒ the classic single-RT path (no regression). A fragment
-/// shader that writes `location` 1.. has those outputs rendered rather than
-/// discarded; each secondary persists as a registry resident keyed by its
-/// protocol identity, exactly as slot 0 does.
+/// list. `Ok(empty)` ⇒ the guest declared a single render target and this is the
+/// classic single-RT path. A fragment shader that writes `location` 1.. has
+/// those outputs rendered rather than discarded; each secondary persists as a
+/// registry resident keyed by its protocol identity, exactly as slot 0 does.
 ///
-/// Conservative by construction — any ambiguity yields an empty vector rather
-/// than a guessed attachment: requires a resident primary, contiguous slots
-/// (0,1,2,… matching the shader's `location`s), matching framebuffer geometry,
-/// a known color-renderable format, and a resolvable identity.
+/// Strict by construction — any ambiguity is an `Err` and the caller refuses the
+/// draw, rather than a guessed attachment: requires a resident primary,
+/// contiguous slots (0,1,2,… matching the shader's `location`s), matching
+/// framebuffer geometry, a known color-renderable format, and a resolvable
+/// identity.
+///
+/// # Why `Err` and not an empty vector
+///
+/// The empty vector used to mean both "the guest asked for one target" and
+/// "the guest asked for several and this device could not build them", and the
+/// caller could not tell those apart — so it took the single-RT path for both
+/// and **executed the draw**. A guest that asks for N render targets then gets
+/// 1, with no error anywhere it can see: the shader's `location` 1.. outputs
+/// are discarded and a later pass sampling that attachment reads whatever was
+/// in those pages before. Refusing is what a GPU does with a render pass it
+/// cannot build.
+///
+/// The Metal arm is what settled the question rather than an argument about
+/// what Vulkan ought to do: `backend::metal::render` attaches every entry of
+/// this same colour list at its own slot number and has never degraded, so the
+/// two arms disagreed about one wire form and only one of them was silent.
 #[allow(
     clippy::too_many_arguments,
     reason = "every argument is a distinct wire-derived input to the attachment set"
@@ -3995,10 +4012,14 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
     fb_w: u32,
     fb_h: u32,
     blend_constants: [f32; 4],
-) -> Vec<crate::backend::vulkan::engine::SecondaryColorTarget> {
+) -> Result<
+    Vec<crate::backend::vulkan::engine::SecondaryColorTarget>,
+    crate::runtime::census::present_proxy::SecondaryMrtRefusal,
+> {
     use crate::backend::vulkan::engine::{SecondaryColorTarget, TargetIdentity};
+    use crate::runtime::census::present_proxy::SecondaryMrtRefusal;
     if colors.len() <= 1 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let mut out = Vec::new();
     for (i, c) in colors.iter().enumerate().skip(1) {
@@ -4010,7 +4031,10 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
                 c.width,
                 c.height,
             );
-            return Vec::new();
+            return Err(SecondaryMrtRefusal {
+                slot: c.slot,
+                reason: crate::runtime::census::present_proxy::MrtDrop::NonContiguousSlot,
+            });
         }
         // MRT requires every attachment to share the framebuffer geometry.
         if c.width != fb_w || c.height != fb_h {
@@ -4019,7 +4043,10 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
                 c.width,
                 c.height,
             );
-            return Vec::new();
+            return Err(SecondaryMrtRefusal {
+                slot: c.slot,
+                reason: crate::runtime::census::present_proxy::MrtDrop::GeometryMismatch,
+            });
         }
         // Unknown wire format stays unknown — never guess a secondary layout —
         // and a known format whose sRGB qualifier this attachment cannot carry
@@ -4040,7 +4067,10 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
                     c.width,
                     c.height,
                 );
-                return Vec::new();
+                return Err(SecondaryMrtRefusal {
+                    slot: c.slot,
+                    reason: crate::runtime::census::present_proxy::MrtDrop::UnknownFormat,
+                });
             }
         };
         // Identity mirrors the primary namespaces: type-2/3 linear GVA, else
@@ -4079,17 +4109,25 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
                 c.width,
                 c.height,
             );
-            return Vec::new();
+            return Err(SecondaryMrtRefusal {
+                slot: c.slot,
+                reason: crate::runtime::census::present_proxy::MrtDrop::NoIdentity,
+            });
         };
         // A secondary aliasing the primary target is a degenerate feedback loop
-        // the engine rejects — bail to the safe single-RT path.
+        // the engine rejects, and a pass that reads and writes one image through
+        // two attachments has no correct rendering — so the draw is refused
+        // rather than run with the alias quietly removed.
         if identity == *primary {
             crate::runtime::census::present_proxy::note_secondary_mrt_drop(
                 crate::runtime::census::present_proxy::MrtDrop::AliasesPrimary,
                 c.width,
                 c.height,
             );
-            return Vec::new();
+            return Err(SecondaryMrtRefusal {
+                slot: c.slot,
+                reason: crate::runtime::census::present_proxy::MrtDrop::AliasesPrimary,
+            });
         }
         // Same three-into-two collapse as the primary slot below: a secondary
         // attachment's DontCare reaches the engine as "no seed", which its pass
@@ -4150,7 +4188,7 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
             color_write_mask,
         });
     }
-    out
+    Ok(out)
 }
 
 /// Translate one decoded vertex attribute's Metal format to the engine's.
@@ -5809,8 +5847,8 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         });
         // True MRT: render every color attachment (slot 1.. as engine secondary
         // residents) instead of dropping the shader's secondary outputs. Gated
-        // on a resident primary + resolvable secondaries (empty ⇒ single-RT,
-        // byte-identical).
+        // on a resident primary; an `Ok(empty)` is the guest's own single-RT
+        // draw and is byte-identical to the classic path.
         if let Some(primary_id) = resources.target_identity.clone() {
             let secs = build_secondary_targets(
                 state,
@@ -5823,19 +5861,32 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 h,
                 req.blend_color.unwrap_or([0.0; 4]),
             );
-            // Second half of the census: `built` vs `dropped` separates "the
+            // Second half of the census: `built` vs `refused` separates "the
             // guest issued an MRT draw and we render every attachment" from
-            // "it issued one and every attachment was refused", which the
+            // "it issued one and an attachment could not be built", which the
             // `mrt_drop_*` reasons alone cannot say because the whole feature
-            // is silent when no MRT draw arrives.
+            // is silent when no MRT draw arrives. Counted before the refusal
+            // returns, so the denominator survives the early exit.
             if req.colors.len() > 1 {
-                crate::runtime::drain::note_store_route(if secs.is_empty() {
-                    "mrt_secondary_dropped"
+                crate::runtime::drain::note_store_route(if secs.is_err() {
+                    "mrt_secondary_refused"
                 } else {
                     "mrt_secondary_built"
                 });
             }
-            resources.secondary_targets = secs;
+            // A secondary attachment this device cannot build refuses the draw.
+            // Executing it against slot 0 alone would render a frame whose
+            // `location` 1.. outputs went nowhere, and nothing downstream — not
+            // the guest, not this log — could tell that from a draw the guest
+            // had only ever asked one target for.
+            resources.secondary_targets = secs.map_err(|refusal| {
+                DrawError::DrawPreparation(
+                    crate::backend::vulkan::engine::DrawPreparationDecline::SecondaryTargetUnbuildable {
+                        pipeline_ref: req.pipeline_ref,
+                        refusal,
+                    },
+                )
+            })?;
         }
         // The engine's own typed `DrawError` (a `vk_*` VkCall slug, a
         // `DrawReason` refusal, an interim `_untyped`) propagates unchanged so
@@ -8802,7 +8853,8 @@ mod vulkan_split_tests {
         let gen_of = |host: &mut FakeHost| {
             let secs = super::build_secondary_targets(
                 &state, host, 1, &colors, &pipeline, &primary, 8, 8, [0.0; 4],
-            );
+            )
+            .expect("slot 1 is a resolvable secondary");
             assert_eq!(secs.len(), 1, "slot 1 is a resolvable secondary");
             match secs[0].identity {
                 TargetIdentity::Gva { generation, .. } => generation,
