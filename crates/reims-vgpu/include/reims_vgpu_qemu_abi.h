@@ -21,7 +21,25 @@
 extern "C" {
 #endif
 
-/* v16: ReimsVgpuHostOps.dmabuf_for_pages — a run of guest pages as one Linux
+/* v17: ReimsVgpuHostOps.guest_ram_regions — where guest RAM lives in this
+ *      process, as stable (gpa_base, host_va, len) spans that hold for the VM's
+ *      lifetime. Guest pages reach the host GPU by importing the mapping QEMU
+ *      already holds over a RAMBlock, once, after which a resource is an
+ *      (offset, len) inside that import rather than a page list somebody has to
+ *      export. So the device needs the block, not a view of the pages it
+ *      happens to want this frame.
+ *
+ *      It is deliberately NOT map_pages with a different return type.
+ *      map_pages answers "give me a view of these specific pages" and one shim
+ *      builds a transient mapping the caller must release; this answers "where
+ *      does guest RAM live" and never allocates, never releases and never
+ *      changes its answer.
+ *
+ *      The shim exports the spans and nothing else — not whether this host can
+ *      import them, not which primitive the backend would use, not how the
+ *      ranges coalesced. A caller holding those three can rebuild the rule, and
+ *      per AGENTS.md it eventually will.
+ * v16: ReimsVgpuHostOps.dmabuf_for_pages — a run of guest pages as one Linux
  *      dma-buf fd, so the host GPU can read and write those pages directly
  *      instead of through a CPU copy in each direction. The shim answers with
  *      the fd or with a named REIMS_VGPU_DMABUF_ERR_* code; it never exports
@@ -66,7 +84,7 @@ extern "C" {
  *     thread so IRQ pulses reach the guest mid-drain — ack fast).
  * v6: ReimsVgpuHostOps.is_ram_gpa (reject non-RAM PFNs on mapper / map_pages paths).
  * v5: ReimsVgpuQemuCreateInfo.guest_page_shift (12 = x86 Tahoe, 14 = arm64e). */
-#define REIMS_VGPU_QEMU_ABI_VERSION 16u
+#define REIMS_VGPU_QEMU_ABI_VERSION 17u
 
 #define REIMS_VGPU_QEMU_OK 0
 #define REIMS_VGPU_QEMU_ERR_ARGS 1
@@ -110,6 +128,33 @@ extern "C" {
 #define REIMS_VGPU_DMABUF_ERR_TOO_FRAGMENTED -7
 /* UDMABUF_CREATE_LIST itself failed — most often the kernel's size bound. */
 #define REIMS_VGPU_DMABUF_ERR_CREATE -8
+
+/*
+ * Why guest_ram_regions refused, when it did. Negative so one return value
+ * carries both a span count (>= 0) and a named refusal, and distinct per check
+ * because the two say different things about where to look: bad arguments are a
+ * caller bug on this build, and an address space with no writable RAM span in
+ * it is a machine that was never given any — a `-M` without memory, or a call
+ * made before the board finished wiring its RAM up.
+ */
+#define REIMS_VGPU_GUEST_RAM_ERR_ARGS -1
+#define REIMS_VGPU_GUEST_RAM_ERR_NO_RAM -2
+
+/*
+ * One span of guest RAM: where it starts in guest physical address space, where
+ * this process mapped it, and how long it is. `host_va` is a host pointer
+ * carried as a uint64_t so the two declarations have one layout on every target
+ * the shims build for.
+ *
+ * Rust `runtime::guest_ram::GuestRamRegion` is the other declaration, and
+ * `qemu::abi::the_abi_header_agrees_on_the_guest_ram_region_layout` is the only
+ * thing that compares them.
+ */
+typedef struct ReimsVgpuGuestRamRegion {
+    uint64_t gpa_base;
+    uint64_t host_va;
+    uint64_t len;
+} ReimsVgpuGuestRamRegion;
 
 /*
  * Longest run list one dma-buf may carry, matching the Linux udmabuf driver's
@@ -279,6 +324,29 @@ typedef struct ReimsVgpuHostOps {
      */
     int (*dmabuf_for_pages)(void *ctx, const uint64_t *gpas, size_t count,
                             size_t page_size);
+    /*
+     * Where guest RAM lives in this process. Writes at most `max` spans into
+     * `out` and returns the total number this host has, which may be greater
+     * than `max` — that is how a caller learns its array was short rather than
+     * silently importing part of the guest's memory. Or a negative
+     * REIMS_VGPU_GUEST_RAM_ERR_* naming the check that refused.
+     *
+     * The spans are stable for the VM's lifetime: they are the mappings QEMU
+     * made when it created the RAMBlocks, not a view built for this call.
+     * Nothing is allocated and there is nothing to release.
+     *
+     * Adjacent flat-view ranges that are contiguous in *both* address spaces
+     * are coalesced, so an ordinary machine answers with one or two spans no
+     * matter how many MemoryRegion slices the board built. Only writable RAM is
+     * reported: ROM and ROMD ranges are RAM-backed but the guest cannot store
+     * into them, and a device that wrote them through the GPU would be writing
+     * bytes the guest believes are fixed.
+     *
+     * Absent (NULL) on any shim that cannot answer, which callers must read as
+     * a refusal rather than as a reason to reach for map_pages instead.
+     */
+    int (*guest_ram_regions)(void *ctx, ReimsVgpuGuestRamRegion *out,
+                             size_t max);
     /*
      * Safe from any thread; schedules the HostAction-delivery BH (the queue
      * drained via reims_vgpu_qemu_device_pop_action). Distinct from schedule_bh,

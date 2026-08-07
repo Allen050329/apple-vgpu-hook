@@ -64,7 +64,7 @@ use std::slice;
 /// [[host-window]]). The symbol is always present; when the staticlib was built
 /// without the `host-window` feature it returns `REIMS_VGPU_QEMU_ERR_STATE` so the C
 /// shim falls back to QEMU's own display.
-pub const REIMS_VGPU_QEMU_ABI_VERSION: u32 = 16;
+pub const REIMS_VGPU_QEMU_ABI_VERSION: u32 = 17;
 
 #[repr(C)]
 pub struct ReimsVgpuQemuCreateInfo {
@@ -107,6 +107,16 @@ pub const REIMS_VGPU_DMABUF_ERR_CREATE: c_int = -8;
 /// `list_limit` module parameter default. Adjacent pages coalesce before this
 /// bound applies, so it bounds *runs*, not pages.
 pub const REIMS_VGPU_DMABUF_MAX_RUNS: usize = 1024;
+
+/// Why `guest_ram_regions` refused, when it did. Negative so one return carries
+/// both a span count and a named refusal.
+///
+/// Same two-copies problem as everything else crossing this boundary, and
+/// `the_abi_header_agrees_on_the_guest_ram_codes` is the only comparison. A
+/// drift here reads as "this machine has no RAM" for what was an argument bug,
+/// on exactly one pathway.
+pub const REIMS_VGPU_GUEST_RAM_ERR_ARGS: c_int = -1;
+pub const REIMS_VGPU_GUEST_RAM_ERR_NO_RAM: c_int = -2;
 
 fn copy_host_ops(ops: *const ReimsVgpuHostOps) -> Option<ReimsVgpuHostOps> {
     if ops.is_null() {
@@ -912,6 +922,75 @@ mod tests {
                 "{name} has drifted from the staticlib's value"
             );
         }
+    }
+
+    /// Both guest-RAM refusal codes exist twice and nothing in the build
+    /// compares them. A drift makes the shim say "bad arguments" and the
+    /// staticlib hear "this machine has no RAM" — which is the difference
+    /// between a caller bug on this build and a board that was never given
+    /// memory, and it would send a reader to the wrong half of the tree.
+    ///
+    /// The consequence is larger than for most codes on this boundary: this
+    /// call is the door to every guest-memory import, so a refusal it
+    /// misattributes is the device running its copying rails for a whole boot
+    /// with the wrong explanation in the log.
+    #[test]
+    fn the_abi_header_agrees_on_the_guest_ram_codes() {
+        for (name, ours) in [
+            (
+                "REIMS_VGPU_GUEST_RAM_ERR_ARGS",
+                REIMS_VGPU_GUEST_RAM_ERR_ARGS,
+            ),
+            (
+                "REIMS_VGPU_GUEST_RAM_ERR_NO_RAM",
+                REIMS_VGPU_GUEST_RAM_ERR_NO_RAM,
+            ),
+        ] {
+            assert_eq!(
+                header_define_i32(name),
+                ours,
+                "{name} has drifted from the staticlib's value"
+            );
+        }
+    }
+
+    /// The shim writes `ReimsVgpuGuestRamRegion`s straight through the caller's
+    /// array, so the C declaration and Rust's `#[repr(C)] GuestRamRegion` are
+    /// one struct written down twice.
+    ///
+    /// A field reordered on one side is not a decode error here — it is a host
+    /// address read as a length and imported as a span, which is the one
+    /// failure the bound in `runtime::guest_ram` cannot catch, because the
+    /// numbers it checks would all be self-consistent. Hence the field names
+    /// and their order, not just the size.
+    #[test]
+    fn the_abi_header_agrees_on_the_guest_ram_region_layout() {
+        use crate::runtime::guest_ram::GuestRamRegion;
+
+        const HEADER: &str = include_str!("../../include/reims_vgpu_qemu_abi.h");
+        let body = HEADER
+            .split_once("typedef struct ReimsVgpuGuestRamRegion {")
+            .expect("the header must declare ReimsVgpuGuestRamRegion")
+            .1
+            .split_once('}')
+            .expect("the declaration must be closed")
+            .0;
+        let fields: Vec<&str> = body
+            .split(';')
+            .map(str::trim)
+            .filter(|f| !f.is_empty())
+            .collect();
+        assert_eq!(
+            fields,
+            vec!["uint64_t gpa_base", "uint64_t host_va", "uint64_t len"],
+            "the C declaration must stay the one Rust's #[repr(C)] GuestRamRegion lays out"
+        );
+
+        assert_eq!(std::mem::size_of::<GuestRamRegion>(), 24);
+        assert_eq!(std::mem::align_of::<GuestRamRegion>(), 8);
+        assert_eq!(std::mem::offset_of!(GuestRamRegion, gpa_base), 0);
+        assert_eq!(std::mem::offset_of!(GuestRamRegion, host_va), 8);
+        assert_eq!(std::mem::offset_of!(GuestRamRegion, len), 16);
     }
 
     /// Every dma-buf refusal code exists twice — once here, once in the shim

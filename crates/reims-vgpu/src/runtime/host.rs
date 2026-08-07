@@ -341,6 +341,76 @@ impl HostAction {
     }
 }
 
+/// Which check refused the guest-RAM span enumeration.
+///
+/// One variant per negative `REIMS_VGPU_GUEST_RAM_ERR_*` code in the shared ABI
+/// header, plus the failures that are Rust's own: a shim too old to offer the
+/// callback, a code this build does not recognise, and an answer that did not
+/// fit the array twice running.
+///
+/// This is the door to every guest-memory import, so a refusal here is not a
+/// slow path — it is the device running its copying rails for the whole boot.
+/// The variants stay distinct because they send a reader to different places: a
+/// missing callback is a shim/staticlib version mismatch, an empty address space
+/// is a machine wiring problem, and a short array is ours.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GuestRamRegionsError {
+    /// The shim offers no `guest_ram_regions`. Every pre-v17 shim, and every
+    /// fixture host.
+    CallbackMissing,
+    /// The shim rejected the arguments, or had more spans than its return value
+    /// could carry.
+    Args,
+    /// The system address space holds no writable RAM span. A machine with no
+    /// memory, or a call made before the board finished wiring its RAM up.
+    NoRam,
+    /// The shim reported more spans than the array we grew to hold them, twice
+    /// running. The retry sizes itself from the first answer, so this means the
+    /// span count changed underneath us — which for RAMBlock mappings it must
+    /// not.
+    StillTruncated { total: usize, capacity: usize },
+    /// A negative code this build has no name for, which means the shim is
+    /// newer than the staticlib. Carried rather than folded into another
+    /// variant so the number itself reaches the log.
+    UnknownCode(i32),
+}
+
+impl GuestRamRegionsError {
+    /// Map a negative shim return to the check it names.
+    pub fn from_code(code: i32) -> Self {
+        match code {
+            crate::qemu::abi::REIMS_VGPU_GUEST_RAM_ERR_ARGS => Self::Args,
+            crate::qemu::abi::REIMS_VGPU_GUEST_RAM_ERR_NO_RAM => Self::NoRam,
+            other => Self::UnknownCode(other),
+        }
+    }
+}
+
+impl crate::observe::Decline for GuestRamRegionsError {
+    fn slug(&self) -> &'static str {
+        match self {
+            Self::CallbackMissing => "guest_ram_regions_callback_missing",
+            Self::Args => "guest_ram_regions_args",
+            Self::NoRam => "guest_ram_regions_no_ram",
+            Self::StillTruncated { .. } => "guest_ram_regions_still_truncated",
+            Self::UnknownCode(_) => "guest_ram_regions_unknown_code",
+        }
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        match self {
+            Self::StillTruncated { total, capacity } => vec![
+                ("total", total.to_string()),
+                ("capacity", capacity.to_string()),
+            ],
+            Self::UnknownCode(code) => vec![("code", code.to_string())],
+            _ => Vec::new(),
+        }
+    }
+}
+
+crate::observe::decline::decline_display!(GuestRamRegionsError);
+
 /// Which check refused a dma-buf export of guest pages.
 ///
 /// One variant per negative `REIMS_VGPU_DMABUF_ERR_*` code in the shared ABI
@@ -490,6 +560,28 @@ pub trait HostOps {
         _page_size: usize,
     ) -> Result<std::os::fd::OwnedFd, DmaBufExportError> {
         Err(DmaBufExportError::CallbackMissing)
+    }
+
+    /// Where guest RAM lives in this process, as stable spans held for the VM's
+    /// lifetime.
+    ///
+    /// The whole guest-memory import rail starts here: the backend imports each
+    /// span once and every later reference is a
+    /// [`crate::runtime::guest_ram::GuestSlice`] inside one of them. Called at
+    /// device init and not again — the answer does not change, and re-importing
+    /// pays the driver's page pinning for an answer that is already known.
+    ///
+    /// Deliberately not [`HostOps::map_pages`] with a different return type.
+    /// That call answers about specific pages and on the sysbus shim may build a
+    /// transient `mach_vm_remap` view the caller has to release; this one never
+    /// allocates and never releases.
+    ///
+    /// Default: unavailable. A host that cannot answer says so by name, and the
+    /// caller runs the copying rails rather than reaching for `map_pages`.
+    fn guest_ram_regions(
+        &mut self,
+    ) -> Result<Vec<crate::runtime::guest_ram::GuestRamRegion>, GuestRamRegionsError> {
+        Err(GuestRamRegionsError::CallbackMissing)
     }
 
     /// True if `gpa` is guest RAM (not MMIO / ROM / unmapped). Product QEMU

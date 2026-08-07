@@ -5,7 +5,9 @@
 //! enqueues [`crate::runtime::host::HostAction`]s for a QEMU BH to apply on
 //! the main loop.
 
-use crate::runtime::host::{HostAction, HostActionKind, HostMemory, HostOps, MemError};
+use crate::runtime::host::{
+    GuestRamRegionsError, HostAction, HostActionKind, HostMemory, HostOps, MemError,
+};
 use std::collections::VecDeque;
 use std::os::raw::{c_int, c_void};
 
@@ -62,6 +64,21 @@ pub struct ReimsVgpuHostOps {
             gpas: *const u64,
             count: usize,
             page_size: usize,
+        ) -> i32,
+    >,
+    /// Write at most `max` guest-RAM spans into `out` and return the total this
+    /// host has — a return greater than `max` says the array was short — or a
+    /// negative `REIMS_VGPU_GUEST_RAM_ERR_*`.
+    ///
+    /// The spans are the mappings QEMU already holds over its RAMBlocks, stable
+    /// for the VM's lifetime, so nothing is allocated and nothing is released.
+    /// That is what separates this from `map_pages`, which answers about
+    /// specific pages and on one shim builds a transient view the caller owns.
+    pub guest_ram_regions: Option<
+        unsafe extern "C" fn(
+            ctx: *mut c_void,
+            out: *mut crate::runtime::guest_ram::GuestRamRegion,
+            max: usize,
         ) -> i32,
     >,
     /// Schedule the HostAction-delivery BH (pop_action consumer). Safe from any
@@ -154,6 +171,7 @@ impl ReimsVgpuHostOps {
             guest_written_pages: None,
             is_ram_gpa: None,
             dmabuf_for_pages: None,
+            guest_ram_regions: None,
             notify_actions: None,
         }
     }
@@ -551,6 +569,51 @@ impl HostOps for QemuHost<'_> {
         Ok(unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(rc) })
     }
 
+    fn guest_ram_regions(
+        &mut self,
+    ) -> Result<Vec<crate::runtime::guest_ram::GuestRamRegion>, GuestRamRegionsError> {
+        /// Spans the first call asks for.
+        ///
+        /// An x86 machine with a PCI hole has two RAMBlocks and a vmapple one
+        /// has one, so this is already several times the answer. It is a first
+        /// guess and not a bound: a host with more spans reports its total and
+        /// gets asked again at that size, which is why nothing here is a cap
+        /// that could silently import part of the guest's memory.
+        const FIRST_TRY: usize = 8;
+
+        let f = self
+            .ops
+            .guest_ram_regions
+            .ok_or(GuestRamRegionsError::CallbackMissing)?;
+        let mut buf = vec![crate::runtime::guest_ram::GuestRamRegion::default(); FIRST_TRY];
+        // SAFETY: QEMU owns ctx and keeps it valid for the device lifetime;
+        // `buf` is valid for `len` writes of the shared `#[repr(C)]` struct for
+        // the duration of the call.
+        let mut rc = unsafe { f(self.ops.ctx, buf.as_mut_ptr(), buf.len()) };
+        if rc < 0 {
+            return Err(GuestRamRegionsError::from_code(rc));
+        }
+        let mut total = rc as usize;
+        if total > buf.len() {
+            buf.resize(total, crate::runtime::guest_ram::GuestRamRegion::default());
+            // SAFETY: as above, with the array the shim's own total sized.
+            rc = unsafe { f(self.ops.ctx, buf.as_mut_ptr(), buf.len()) };
+            if rc < 0 {
+                return Err(GuestRamRegionsError::from_code(rc));
+            }
+            let retried = rc as usize;
+            if retried > buf.len() {
+                return Err(GuestRamRegionsError::StillTruncated {
+                    total: retried,
+                    capacity: buf.len(),
+                });
+            }
+            total = retried;
+        }
+        buf.truncate(total);
+        Ok(buf)
+    }
+
     fn unmap_pages(&mut self, ptr: usize, len: usize) {
         if ptr == 0 || len == 0 {
             return;
@@ -714,6 +777,160 @@ mod tests {
             *out = std::ptr::null_mut();
         }
         0
+    }
+
+    /// How many spans [`counting_ram_regions`] claims, and how many times it has
+    /// been asked. Process-global, which the suite's serial convention
+    /// (`--test-threads=1`) makes safe; each test that uses them sets both.
+    static FAKE_RAM_SPANS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static FAKE_RAM_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    /// A shim with [`FAKE_RAM_SPANS`] spans that honours `max` and reports its
+    /// true total — the contract the header states, including the case where
+    /// the total is larger than the array it was given.
+    unsafe extern "C" fn counting_ram_regions(
+        _ctx: *mut c_void,
+        out: *mut crate::runtime::guest_ram::GuestRamRegion,
+        max: usize,
+    ) -> i32 {
+        use std::sync::atomic::Ordering::Relaxed;
+        FAKE_RAM_CALLS.fetch_add(1, Relaxed);
+        let total = FAKE_RAM_SPANS.load(Relaxed);
+        for i in 0..total.min(max) {
+            // SAFETY: the caller's contract is that `out` is writable for `max`
+            // entries, and `i < max`.
+            unsafe {
+                *out.add(i) = crate::runtime::guest_ram::GuestRamRegion {
+                    gpa_base: (i as u64) << 32,
+                    host_va: 0x7f00_0000_0000 + ((i as u64) << 32),
+                    len: 0x1000,
+                };
+            }
+        }
+        total as i32
+    }
+
+    /// A shim that always claims one more span than it was asked for, whatever
+    /// the array size. The retry cannot converge against it.
+    unsafe extern "C" fn always_short_ram_regions(
+        _ctx: *mut c_void,
+        _out: *mut crate::runtime::guest_ram::GuestRamRegion,
+        max: usize,
+    ) -> i32 {
+        (max + 1) as i32
+    }
+
+    unsafe extern "C" fn no_ram_regions(
+        _ctx: *mut c_void,
+        _out: *mut crate::runtime::guest_ram::GuestRamRegion,
+        _max: usize,
+    ) -> i32 {
+        crate::qemu::abi::REIMS_VGPU_GUEST_RAM_ERR_NO_RAM
+    }
+
+    unsafe extern "C" fn future_code_ram_regions(
+        _ctx: *mut c_void,
+        _out: *mut crate::runtime::guest_ram::GuestRamRegion,
+        _max: usize,
+    ) -> i32 {
+        -99
+    }
+
+    fn ram_regions_with(
+        callback: Option<
+            unsafe extern "C" fn(
+                *mut c_void,
+                *mut crate::runtime::guest_ram::GuestRamRegion,
+                usize,
+            ) -> i32,
+        >,
+    ) -> Result<Vec<crate::runtime::guest_ram::GuestRamRegion>, GuestRamRegionsError> {
+        let mut ops = ReimsVgpuHostOps::null();
+        ops.guest_ram_regions = callback;
+        let mut actions = VecDeque::new();
+        let prompt = parking_lot::Mutex::new(VecDeque::new());
+        QemuHost::new(&ops, &mut actions, &prompt).guest_ram_regions()
+    }
+
+    /// A shim older than v17 has no such callback, and that is a named refusal
+    /// rather than an empty answer. An empty `Vec` would read as "this machine
+    /// has no RAM", which is a different thing to go fix.
+    #[test]
+    fn a_shim_without_the_callback_refuses_by_name() {
+        assert_eq!(
+            ram_regions_with(None),
+            Err(GuestRamRegionsError::CallbackMissing)
+        );
+    }
+
+    /// The ordinary machine: fewer spans than the first array, answered in one
+    /// call. Two calls here would be two address-space walks per boot for
+    /// nothing.
+    #[test]
+    fn a_machine_that_fits_the_first_array_is_asked_once() {
+        use std::sync::atomic::Ordering::Relaxed;
+        FAKE_RAM_SPANS.store(2, Relaxed);
+        FAKE_RAM_CALLS.store(0, Relaxed);
+        let regions = ram_regions_with(Some(counting_ram_regions)).expect("two spans");
+        assert_eq!(regions.len(), 2);
+        assert_eq!(FAKE_RAM_CALLS.load(Relaxed), 1);
+        assert_eq!(regions[0].gpa_base, 0);
+        assert_eq!(regions[1].gpa_base, 1 << 32);
+        assert_eq!(regions[1].host_va, 0x7f00_0000_0000 + (1 << 32));
+    }
+
+    /// More spans than the first array: the caller learns its array was short
+    /// from the total, grows to it, and comes back with every span.
+    ///
+    /// This is the case that must not silently truncate. A device that imported
+    /// the first eight spans and dropped the rest would run the copying rails
+    /// for part of the guest's RAM with nothing in the log saying which part —
+    /// the "no silent caps" rule in `AGENTS.md`, at the one call that decides
+    /// how much of guest memory the GPU can reach at all.
+    #[test]
+    fn a_machine_with_more_spans_than_the_first_array_still_gets_all_of_them() {
+        use std::sync::atomic::Ordering::Relaxed;
+        FAKE_RAM_SPANS.store(21, Relaxed);
+        FAKE_RAM_CALLS.store(0, Relaxed);
+        let regions = ram_regions_with(Some(counting_ram_regions)).expect("21 spans");
+        assert_eq!(regions.len(), 21, "the answer must not be capped");
+        assert_eq!(FAKE_RAM_CALLS.load(Relaxed), 2, "one probe, one full read");
+        assert_eq!(regions[20].gpa_base, 20 << 32);
+        assert!(
+            regions.iter().all(|r| r.len == 0x1000),
+            "the grown array must be filled, not left at its default"
+        );
+    }
+
+    /// A shim whose total keeps growing does not loop and does not truncate: it
+    /// refuses, naming both numbers. RAMBlock mappings do not change, so this is
+    /// a shim defect rather than a race to retry through.
+    #[test]
+    fn a_total_that_never_converges_is_refused_rather_than_retried() {
+        assert_eq!(
+            ram_regions_with(Some(always_short_ram_regions)),
+            // The probe of 8 was answered 9, the retry of 9 answered 10, and
+            // the second answer is where it stops. The numbers reported are the
+            // retry's, which is the pair that shows the total moved.
+            Err(GuestRamRegionsError::StillTruncated {
+                total: 10,
+                capacity: 9,
+            })
+        );
+    }
+
+    /// Each negative code keeps its own check, and a code this build has no name
+    /// for carries the number rather than being folded into a neighbour.
+    #[test]
+    fn each_refusal_code_keeps_its_own_check() {
+        assert_eq!(
+            ram_regions_with(Some(no_ram_regions)),
+            Err(GuestRamRegionsError::NoRam)
+        );
+        assert_eq!(
+            ram_regions_with(Some(future_code_ram_regions)),
+            Err(GuestRamRegionsError::UnknownCode(-99))
+        );
     }
 
     #[test]

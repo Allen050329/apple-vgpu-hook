@@ -78,12 +78,21 @@ use crate::observe::{Decline, Emit};
 /// `map_pages` answers "give me a view of these specific pages" and may build a
 /// transient one the caller must release; this answers "where does guest RAM
 /// live, for the lifetime of the VM".
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// `#[repr(C)]` and three `u64`s because the shim writes these directly through
+/// the caller's array: this declaration and `ReimsVgpuGuestRamRegion` in
+/// `include/reims_vgpu_qemu_abi.h` are one struct, and
+/// `crate::qemu::abi::tests::the_abi_header_agrees_on_the_guest_ram_region_layout`
+/// is the only thing that compares them. The host address is a `u64` rather
+/// than a `usize` so the layout does not depend on the target the shim happened
+/// to be built for.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GuestRamRegion {
     /// First guest physical address this block backs.
     pub gpa_base: u64,
     /// Host virtual address QEMU mapped it at. Stable for the VM's lifetime.
-    pub host_va: usize,
+    pub host_va: u64,
     /// Length in bytes, in both address spaces.
     pub len: u64,
 }
@@ -145,7 +154,7 @@ pub enum GuestRamError {
     /// `host_va + len` or `gpa_base + len` leaves its address space. A RAMBlock
     /// cannot wrap, so this is a malformed answer from the shim rather than a
     /// large one.
-    RegionWraps { host_va: usize, len: u64 },
+    RegionWraps { host_va: u64, len: u64 },
     /// The backend reported an import granularity that is zero or not a power of
     /// two. Every alignment computation below assumes a power of two mask, so
     /// this is refused rather than worked around.
@@ -313,7 +322,8 @@ impl GuestRamImport {
             host_va: region.host_va,
             len: region.len,
         };
-        let host_end = (region.host_va as u64)
+        let host_end = region
+            .host_va
             .checked_add(region.len)
             .ok_or(wraps)
             .map_err(GuestRamError::report)?;
@@ -330,10 +340,10 @@ impl GuestRamImport {
             align,
             len: region.len,
         };
-        let host_base = align_up_u64(region.host_va as u64, align)
+        let host_base = align_up_u64(region.host_va, align)
             .ok_or(unsatisfiable)
             .map_err(GuestRamError::report)?;
-        let head = host_base - region.host_va as u64;
+        let head = host_base - region.host_va;
         let len = region
             .len
             .checked_sub(head)
@@ -781,7 +791,7 @@ mod tests {
         assert!(matches!(
             GuestRamImport::new(
                 GuestRamRegion {
-                    host_va: usize::MAX - 0xfff,
+                    host_va: u64::MAX - 0xfff,
                     len: 0x4000,
                     ..ok
                 },
