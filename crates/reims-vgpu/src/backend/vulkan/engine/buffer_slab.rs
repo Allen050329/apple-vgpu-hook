@@ -1,4 +1,5 @@
-//! Offset suballocator for the HOST_VISIBLE upload (staging) buffers.
+//! Offset suballocator for pooled linear buffers, in one memory class per
+//! instance ([`SlabKind`]).
 //!
 //! The staging recycle pool hits ~99.6 % of the time, so what it costs is
 //! decided entirely by its misses — and a miss used to be a full
@@ -12,12 +13,29 @@
 //! happens under the engine lock on the first composite after idle, which is
 //! the cold-window hitch.
 //!
-//! So this module does for upload buffers what [`super::slab`] does for
+//! So this module does for pooled buffers what [`super::slab`] does for
 //! DEVICE_LOCAL images: sub-allocate many buffer binds out of a few large
 //! blocks. A miss becomes `vkCreateBuffer` + [`BlockPlan::carve`] +
-//! `vkBindBufferMemory` — no allocation, and no `vkMapMemory` either, because
-//! the block is mapped once when it is created and every sub-allocation is a
-//! pointer into that one mapping.
+//! `vkBindBufferMemory` — no allocation, and for an upload block no
+//! `vkMapMemory` either, because the block is mapped once when it is created
+//! and every sub-allocation is a pointer into that one mapping.
+//!
+//! # Why the memory class is a field and not a second module
+//!
+//! Two consumers want the same allocator over different memory. Staging wants
+//! [`MemoryClass::Upload`], mapped for its lifetime, because the CPU writes it.
+//! The draw-time guest gather wants [`MemoryClass::DeviceLocal`] and never maps
+//! anything, because its whole point is that the bytes land in memory the draw
+//! reads without crossing the bus again. Everything else — the size classes, the
+//! empty-block policy, the poisoning safety net, the per-class spare budget — is
+//! decided by the *size distribution* of pooled linear buffers, and both
+//! consumers draw from the same distribution: the gather's destinations are the
+//! same `BufferContent::GuestRuns` spans that would otherwise have been staged.
+//!
+//! So [`SlabKind`] carries only what genuinely differs — the class, whether a
+//! block is mapped, and the names its allocations and failures report under —
+//! and a second spelling of the allocator cannot drift from this one because
+//! there is not one.
 //!
 //! # Why this is a separate pool from [`super::slab::SlabPool`]
 //!
@@ -55,7 +73,7 @@
 //! What remains is priced honestly by the same census: the buckets that still
 //! cost something are the misses that landed on a new block, so the residual
 //! *is* the block allocations and nothing else. That is what
-//! [`HOST_SLAB_IDLE_KEEP_EMPTY`]'s trim gate then went after — three driven
+//! [`BUFFER_SLAB_IDLE_KEEP_EMPTY`]'s trim gate then went after — three driven
 //! boots, compared at the common miss count of 1 024 so no scaling is involved:
 //!
 //! ```text
@@ -80,6 +98,70 @@ use super::types::DrawError;
 use super::vk_call::{VkCall, VkOp};
 use crate::backend::vulkan::caps::MemoryClass;
 
+/// Which memory a [`BufferSlabPool`] instance suballocates, and the names it
+/// reports under.
+///
+/// Everything a caller needs to know about the difference is derived here, so
+/// no other site branches on it. The pool asks this for its class and its
+/// mapping policy; a token carries it so a release cannot be routed to the
+/// other pool.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SlabKind {
+    /// Host-visible blocks, mapped once for the block's life, that CPU staging
+    /// writes are copied into.
+    Upload,
+    /// Device-local blocks the GPU gathers scattered guest RAM into. Never
+    /// mapped: on a discrete host this memory is not host-visible at all, and on
+    /// a unified one a mapping would still be a host address nothing here reads.
+    DeviceLocal,
+}
+
+impl SlabKind {
+    fn memory_class(self) -> MemoryClass {
+        match self {
+            Self::Upload => MemoryClass::Upload,
+            Self::DeviceLocal => MemoryClass::DeviceLocal,
+        }
+    }
+
+    /// Whether a block is mapped for its life. Exactly the classes whose carves
+    /// hand back a usable [`BufferSlabToken::mapped`].
+    fn maps_blocks(self) -> bool {
+        matches!(self, Self::Upload)
+    }
+
+    /// `vk_alloc_sites` bucket for a block allocation of this kind.
+    fn alloc_site(self) -> AllocSite {
+        match self {
+            Self::Upload => AllocSite::StagingBlock,
+            Self::DeviceLocal => AllocSite::GuestGatherBlock,
+        }
+    }
+
+    /// Slug the `off`-channel block events and the fail-channel poisonings
+    /// carry, so one boot's log separates the two pools without a reader having
+    /// to infer which is which from the sizes.
+    fn tag(self) -> &'static str {
+        match self {
+            Self::Upload => "buffer_slab_upload",
+            Self::DeviceLocal => "buffer_slab_device",
+        }
+    }
+
+    /// The refusal when no memory type this device offers satisfies both the
+    /// bind's requirements and this kind's class.
+    fn no_memory_type(self, memory_type_bits: u32) -> DrawError {
+        DrawError::Unsupported(match self {
+            Self::Upload => {
+                super::reason::DrawReason::NoHostVisibleMemoryForStaging { memory_type_bits }
+            }
+            Self::DeviceLocal => {
+                super::reason::DrawReason::NoDeviceLocalMemoryForGuestGather { memory_type_bits }
+            }
+        })
+    }
+}
+
 /// Block size for the large size class.
 ///
 /// Derived from the two measured quantities this allocator trades between. The
@@ -93,7 +175,7 @@ use crate::backend::vulkan::caps::MemoryClass;
 /// blocks holds it. Going larger would buy fewer allocations at the price of a
 /// worse single stall and more resident host RAM, which on an iGPU is shared
 /// guest RAM.
-const HOST_SLAB_SIZE: u64 = 16 << 20;
+const BUFFER_SLAB_SIZE: u64 = 16 << 20;
 
 /// Carves strictly below this bind from the **small** class. Same reasoning as
 /// [`super::slab`]'s split: the staging bucket histogram is strongly bimodal
@@ -101,12 +183,12 @@ const HOST_SLAB_SIZE: u64 = 16 << 20;
 /// multi-MiB frame-sized ones), and mixed first-fit lets a stable small carve
 /// sit in the middle of a large block and stop it ever emptying. 128 KiB is
 /// above the small cluster's top bucket and below every frame-sized upload.
-const HOST_SMALL_CLASS_MAX: u64 = 128 << 10;
+const BUFFER_SMALL_CLASS_MAX: u64 = 128 << 10;
 
 /// Block size for the small class. 2 MiB holds 32 max-size (64 KiB) small
 /// carves, or hundreds of the 64-byte to 8 KiB ones that dominate the histogram
 /// by count — the whole small working set in one block, at ~2 ms to allocate.
-const HOST_SMALL_SLAB_SIZE: u64 = 2 << 20;
+const BUFFER_SMALL_SLAB_SIZE: u64 = 2 << 20;
 
 /// Fully-empty shared blocks per size class that a *settled idle* keeps rather
 /// than returning to the driver.
@@ -118,7 +200,7 @@ const HOST_SMALL_SLAB_SIZE: u64 = 2 << 20;
 /// stop the first composite after idle re-paying a block allocation, and no
 /// more. Mid-session retention is not this number's business: nothing is freed
 /// until idle settles.
-pub(crate) const HOST_SLAB_IDLE_KEEP_EMPTY: usize = 1;
+pub(crate) const BUFFER_SLAB_IDLE_KEEP_EMPTY: usize = 1;
 
 /// The size classes only segregate anything while these hold, and a later edit
 /// to one constant that breaks one of them would show up as fragmentation
@@ -127,20 +209,28 @@ pub(crate) const HOST_SLAB_IDLE_KEEP_EMPTY: usize = 1;
 const _: () = {
     // A small block must hold many small carves, or the class buys nothing over
     // giving each small carve its own block.
-    assert!(HOST_SMALL_SLAB_SIZE / HOST_SMALL_CLASS_MAX >= 16);
+    assert!(BUFFER_SMALL_SLAB_SIZE / BUFFER_SMALL_CLASS_MAX >= 16);
     // The large class must be able to host a carve that is not small, or every
     // non-small carve goes dedicated.
-    assert!(HOST_SLAB_SIZE > HOST_SMALL_CLASS_MAX);
+    assert!(BUFFER_SLAB_SIZE > BUFFER_SMALL_CLASS_MAX);
 };
 
 /// A live sub-allocation: which block, at what offset, backed by which
 /// `VkDeviceMemory`, and where in the block's single persistent mapping it
 /// starts.
 #[derive(Clone, Copy)]
-pub(crate) struct HostSlabToken {
+pub(crate) struct BufferSlabToken {
     block: u32,
     offset: u64,
     size: u64,
+    /// Which pool made this carve.
+    ///
+    /// Carried rather than remembered by the call site because the two pools
+    /// share a token type and a release into the wrong one would return a range
+    /// to a block that never held it — an overlap, which is the aliasing this
+    /// module's whole safety net exists to stop. [`BufferSlabPool::release`]
+    /// checks it, so routing is the token's answer and not a caller's.
+    pub kind: SlabKind,
     /// Bind target for `vkBindBufferMemory`, shared with every other carve in
     /// the same block. Never passed to `vkFreeMemory` by the holder.
     pub memory: vk::DeviceMemory,
@@ -152,14 +242,14 @@ pub(crate) struct HostSlabToken {
     pub mapped: usize,
 }
 
-impl HostSlabToken {
+impl BufferSlabToken {
     /// Bind offset for `vkBindBufferMemory`.
     pub(crate) fn offset(&self) -> u64 {
         self.offset
     }
 }
 
-struct HostBlock {
+struct SlabBlock {
     memory: vk::DeviceMemory,
     plan: BlockPlan,
     mem_type: u32,
@@ -167,12 +257,14 @@ struct HostBlock {
     /// mapped for the block's life. Vulkan permits a memory object to stay
     /// mapped until it is freed, and `vkFreeMemory` unmaps implicitly — which is
     /// what makes a carve's `mapped` free to hand out.
+    ///
+    /// Zero on a [`SlabKind::DeviceLocal`] block, which is never mapped.
     base: usize,
-    /// A carve larger than [`HOST_SLAB_SIZE`] got a block of exactly its own
+    /// A carve larger than [`BUFFER_SLAB_SIZE`] got a block of exactly its own
     /// size; never shared, and freed the moment it empties.
     dedicated: bool,
-    /// Small-size-class block ([`HOST_SMALL_SLAB_SIZE`], holds only carves
-    /// below [`HOST_SMALL_CLASS_MAX`]).
+    /// Small-size-class block ([`BUFFER_SMALL_SLAB_SIZE`], holds only carves
+    /// below [`BUFFER_SMALL_CLASS_MAX`]).
     small: bool,
     /// Set once the free-list invariant is seen violated: the block is leaked
     /// (never carved from, never freed) so a logic bug cannot alias two live
@@ -180,14 +272,68 @@ struct HostBlock {
     poisoned: bool,
 }
 
-/// Block pool for HOST_VISIBLE upload memory.
+/// Every buffer slab this device holds, one per [`SlabKind`].
+///
+/// One field on the pools rather than two, so a release site borrows the pair
+/// and routing stays the token's answer. A site holding just one of them could
+/// only route by guessing, and the wrong guess inserts an overlap into a live
+/// block's free list.
+pub(crate) struct BufferSlabs {
+    upload: BufferSlabPool,
+    gather: BufferSlabPool,
+}
+
+impl BufferSlabs {
+    pub(crate) fn new() -> Self {
+        Self {
+            upload: BufferSlabPool::new(SlabKind::Upload),
+            gather: BufferSlabPool::new(SlabKind::DeviceLocal),
+        }
+    }
+
+    /// The host-visible pool every CPU-written staging buffer is carved from.
+    pub(crate) fn upload(&mut self) -> &mut BufferSlabPool {
+        &mut self.upload
+    }
+
+    /// The device-local pool the draw-time guest gather's destinations are
+    /// carved from.
+    pub(crate) fn gather(&mut self) -> &mut BufferSlabPool {
+        &mut self.gather
+    }
+
+    /// Return a carve to whichever pool made it.
+    pub(crate) unsafe fn release(&mut self, device: &ash::Device, token: BufferSlabToken) {
+        match token.kind {
+            SlabKind::Upload => self.upload.release(device, token),
+            SlabKind::DeviceLocal => self.gather.release(device, token),
+        }
+    }
+
+    /// Free fully-empty shared blocks in both pools beyond `keep` spares per
+    /// size class, returning the total freed.
+    pub(crate) unsafe fn trim_empty_blocks(&mut self, device: &ash::Device, keep: usize) -> usize {
+        self.upload.trim_empty_blocks(device, keep) + self.gather.trim_empty_blocks(device, keep)
+    }
+
+    /// Destroy every remaining block in both pools (device teardown).
+    pub(crate) unsafe fn destroy_all(&mut self, device: &ash::Device) {
+        self.upload.destroy_all(device);
+        self.gather.destroy_all(device);
+    }
+}
+
+/// Block pool for one memory class of pooled linear buffers.
 ///
 /// Safety net, as in [`super::slab`]: every mutation is followed by a
 /// [`BlockPlan::well_formed`] check, and a violation fail-logs and poisons the
 /// block. An allocator bug degrades to a leak plus a fresh block rather than to
-/// two staging buffers silently writing the same bytes.
-pub(crate) struct HostSlabPool {
-    blocks: Vec<Option<HostBlock>>,
+/// two buffers silently sharing the same bytes.
+pub(crate) struct BufferSlabPool {
+    /// The memory this instance suballocates. Fixed at construction: a pool
+    /// mixing classes could hand a carve of one to a bind that needs the other.
+    kind: SlabKind,
+    blocks: Vec<Option<SlabBlock>>,
     block_allocs: u64,
     block_frees: u64,
     sub_allocs: u64,
@@ -195,9 +341,10 @@ pub(crate) struct HostSlabPool {
     invariant_violations: u64,
 }
 
-impl HostSlabPool {
-    pub(crate) fn new() -> Self {
+impl BufferSlabPool {
+    pub(crate) fn new(kind: SlabKind) -> Self {
         Self {
+            kind,
             blocks: Vec::new(),
             block_allocs: 0,
             block_frees: 0,
@@ -218,14 +365,10 @@ impl HostSlabPool {
         ctx: &DeviceContext,
         req: &vk::MemoryRequirements,
         counters: &EngineCounters,
-    ) -> Result<HostSlabToken, DrawError> {
+    ) -> Result<BufferSlabToken, DrawError> {
         let mem_type = ctx
-            .memory_type_for(req.memory_type_bits, MemoryClass::Upload)
-            .ok_or({
-                DrawError::Unsupported(super::reason::DrawReason::NoHostVisibleMemoryForStaging {
-                    memory_type_bits: req.memory_type_bits,
-                })
-            })?;
+            .memory_type_for(req.memory_type_bits, self.kind.memory_class())
+            .ok_or_else(|| self.kind.no_memory_type(req.memory_type_bits))?;
         let size = req.size;
         if size == 0 {
             return Err(DrawError::Slab(SlabDecline::ZeroSize {
@@ -238,11 +381,11 @@ impl HostSlabPool {
         // requirement is the whole constraint.
         let align = req.alignment.max(1);
 
-        if size > HOST_SLAB_SIZE {
+        if size > BUFFER_SLAB_SIZE {
             return self.new_block(ctx, size, mem_type, align, size, true, false, counters);
         }
 
-        let want_small = size < HOST_SMALL_CLASS_MAX;
+        let want_small = size < BUFFER_SMALL_CLASS_MAX;
         for i in 0..self.blocks.len() {
             let hit = match &mut self.blocks[i] {
                 Some(b)
@@ -262,10 +405,11 @@ impl HostSlabPool {
                 }
                 let b = self.blocks[i].as_ref().expect("just carved");
                 self.sub_allocs += 1;
-                return Ok(HostSlabToken {
+                return Ok(BufferSlabToken {
                     block: i as u32,
                     offset,
                     size,
+                    kind: self.kind,
                     memory: b.memory,
                     mapped: b.base + offset as usize,
                 });
@@ -273,9 +417,9 @@ impl HostSlabPool {
         }
 
         let block_size = if want_small {
-            HOST_SMALL_SLAB_SIZE
+            BUFFER_SMALL_SLAB_SIZE
         } else {
-            HOST_SLAB_SIZE
+            BUFFER_SLAB_SIZE
         };
         self.new_block(
             ctx, block_size, mem_type, align, size, false, want_small, counters,
@@ -293,27 +437,35 @@ impl HostSlabPool {
         dedicated: bool,
         small: bool,
         counters: &EngineCounters,
-    ) -> Result<HostSlabToken, DrawError> {
+    ) -> Result<BufferSlabToken, DrawError> {
         let memory = allocate_memory_timed(
             ctx,
             &vk::MemoryAllocateInfo::default()
                 .allocation_size(block_size)
                 .memory_type_index(mem_type),
-            AllocSite::StagingBlock,
+            self.kind.alloc_site(),
         )
         .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::PoolsAllocStaging, e)))?;
         counters.note_alloc();
         self.block_allocs += 1;
-        let base = match ctx
-            .device
-            .map_memory(memory, 0, block_size, vk::MemoryMapFlags::empty())
-        {
-            Ok(p) => p as usize,
-            Err(e) => {
-                ctx.device.free_memory(memory, None);
-                self.block_frees += 1;
-                return Err(DrawError::VkCall(VkCall::new(VkOp::PoolsMapStaging, e)));
+        // A device-local block is never mapped, so it has no host base and every
+        // carve's `mapped` is zero. That is not a degraded upload block: nothing
+        // on the gather path reads these bytes with the CPU, and on a discrete
+        // host the memory is not host-visible for a mapping to be possible.
+        let base = if self.kind.maps_blocks() {
+            match ctx
+                .device
+                .map_memory(memory, 0, block_size, vk::MemoryMapFlags::empty())
+            {
+                Ok(p) => p as usize,
+                Err(e) => {
+                    ctx.device.free_memory(memory, None);
+                    self.block_frees += 1;
+                    return Err(DrawError::VkCall(VkCall::new(VkOp::PoolsMapStaging, e)));
+                }
             }
+        } else {
+            0
         };
         let mut plan = BlockPlan::new(block_size);
         let offset = match plan.carve(carve, align) {
@@ -330,7 +482,7 @@ impl HostSlabPool {
                 }));
             }
         };
-        let idx = self.insert_block(HostBlock {
+        let idx = self.insert_block(SlabBlock {
             memory,
             plan,
             mem_type,
@@ -345,8 +497,9 @@ impl HostSlabPool {
         // `sub_allocs` climbing while `block_allocs` stays flat is the whole
         // claim of this module in one line.
         crate::observe::off(format!(
-            "host_slab ev=alloc size={block_size} dedicated={} small={} block_allocs={} \
+            "{} ev=alloc size={block_size} dedicated={} small={} block_allocs={} \
              block_frees={} sub_allocs={} sub_frees={} resident_mb={} live_kb={} violations={}",
+            self.kind.tag(),
             dedicated as u8,
             small as u8,
             self.block_allocs,
@@ -357,16 +510,17 @@ impl HostSlabPool {
             self.live_bytes() >> 10,
             self.invariant_violations,
         ));
-        Ok(HostSlabToken {
+        Ok(BufferSlabToken {
             block: idx,
             offset,
             size: carve,
+            kind: self.kind,
             memory,
             mapped: base + offset as usize,
         })
     }
 
-    fn insert_block(&mut self, block: HostBlock) -> u32 {
+    fn insert_block(&mut self, block: SlabBlock) -> u32 {
         if let Some(i) = self.blocks.iter().position(Option::is_none) {
             self.blocks[i] = Some(block);
             i as u32
@@ -378,13 +532,30 @@ impl HostSlabPool {
 
     /// Return a carve to its block. The caller has already destroyed the
     /// `VkBuffer` bound to it and must never `vkFreeMemory` the token's memory.
-    pub(crate) unsafe fn release(&mut self, device: &ash::Device, token: HostSlabToken) {
+    pub(crate) unsafe fn release(&mut self, device: &ash::Device, token: BufferSlabToken) {
         let idx = token.block as usize;
+        if token.kind != self.kind {
+            // Block indices are per pool, so this token names a range in *this*
+            // pool's block `idx` that belongs to a different allocation
+            // entirely. Releasing it would insert an overlap into a live block's
+            // free list — the aliasing the poisoning net below exists to stop,
+            // arriving from outside where the net cannot see it. Refuse instead.
+            crate::observe::Emit::decline(
+                self.kind.tag(),
+                &SlabDecline::ReleaseWrongPool {
+                    token_kind: token.kind.tag(),
+                    pool_kind: self.kind.tag(),
+                    block: token.block,
+                },
+            )
+            .fail_once(u64::from(token.block));
+            return;
+        }
         match self.release_preflight(token.block, token.offset, token.size) {
             Ok(true) => {}
             Ok(false) => return,
             Err(decline) => {
-                crate::observe::Emit::decline("host_slab", &decline)
+                crate::observe::Emit::decline(self.kind.tag(), &decline)
                     .fail_once(u64::from(token.block));
                 return;
             }
@@ -436,8 +607,9 @@ impl HostSlabPool {
         device.free_memory(b.memory, None);
         self.block_frees += 1;
         crate::observe::off(format!(
-            "host_slab ev=free block_allocs={} block_frees={} sub_allocs={} sub_frees={} \
+            "{} ev=free block_allocs={} block_frees={} sub_allocs={} sub_frees={} \
              resident_mb={} live_kb={}",
+            self.kind.tag(),
             self.block_allocs,
             self.block_frees,
             self.sub_allocs,
@@ -454,7 +626,7 @@ impl HostSlabPool {
     /// that gate is the whole policy. Measured on the boot that first ran this
     /// allocator, freeing on the release that empties a block cost 13 block
     /// allocations against 10 frees in five minutes — the working set crossing
-    /// [`HOST_SLAB_SIZE`] and back — and each of those allocations is a 20-30 ms
+    /// [`BUFFER_SLAB_SIZE`] and back — and each of those allocations is a 20-30 ms
     /// stall under the engine lock (`staging_write_slow kind=acquire us=30734`).
     /// So a shared block is held for as long as the workload is live and
     /// returned once idle settles, which is the same trade
@@ -531,7 +703,7 @@ impl HostSlabPool {
                 size: b.plan.size(),
                 free_bytes: b.plan.free_bytes(),
             };
-            crate::observe::Emit::decline("host_slab", &decline).fail_once(idx as u64);
+            crate::observe::Emit::decline(self.kind.tag(), &decline).fail_once(idx as u64);
             return false;
         }
         false
@@ -555,7 +727,7 @@ mod tests {
     /// This is the policy the first live run of this allocator bought. Freeing
     /// on the release that empties a block read `block_allocs=13` against
     /// `block_frees=10` in five minutes — a working set crossing
-    /// [`HOST_SLAB_SIZE`] and back — and every one of those ten re-crossings is
+    /// [`BUFFER_SLAB_SIZE`] and back — and every one of those ten re-crossings is
     /// a 20-30 ms `vkAllocateMemory` under the engine lock, which is precisely
     /// the stall this module exists to remove. So the empty↔full cycle must cost
     /// nothing, and the trim must still be able to give the block back.
@@ -570,11 +742,11 @@ mod tests {
             }
         };
         let counters = EngineCounters::default();
-        let mut pool = HostSlabPool::new();
+        let mut pool = BufferSlabPool::new(SlabKind::Upload);
         // Half a large block: big enough to be large-class, small enough that
         // two fit, so a second carve after the release can only mean reuse.
         let req = vk::MemoryRequirements {
-            size: HOST_SLAB_SIZE / 2,
+            size: BUFFER_SLAB_SIZE / 2,
             alignment: 256,
             memory_type_bits: u32::MAX,
         };
@@ -621,7 +793,7 @@ mod tests {
     #[test]
     fn empty_block_victims_keeps_the_first_n() {
         let block = |free: bool| {
-            Some(HostBlock {
+            Some(SlabBlock {
                 memory: vk::DeviceMemory::null(),
                 plan: {
                     let mut p = BlockPlan::new(1024);
@@ -637,7 +809,8 @@ mod tests {
                 poisoned: false,
             })
         };
-        let pool = HostSlabPool {
+        let pool = BufferSlabPool {
+            kind: SlabKind::Upload,
             blocks: vec![block(true), block(false), block(true), block(true)],
             block_allocs: 4,
             block_frees: 0,
@@ -657,8 +830,9 @@ mod tests {
         let mut plan = BlockPlan::new(4096);
         let off = plan.carve(256, 256).expect("carve fits");
         assert_eq!(off, 0);
-        let pool = HostSlabPool {
-            blocks: vec![Some(HostBlock {
+        let pool = BufferSlabPool {
+            kind: SlabKind::Upload,
+            blocks: vec![Some(SlabBlock {
                 memory: vk::DeviceMemory::null(),
                 plan,
                 mem_type: 0,
@@ -689,7 +863,7 @@ mod tests {
     #[test]
     fn the_empty_spare_budget_is_per_size_class() {
         let block = |small: bool| {
-            Some(HostBlock {
+            Some(SlabBlock {
                 memory: vk::DeviceMemory::null(),
                 plan: BlockPlan::new(1024),
                 mem_type: 0,
@@ -700,7 +874,8 @@ mod tests {
             })
         };
         // Two of each class, all empty: one of each survives, the other two go.
-        let pool = HostSlabPool {
+        let pool = BufferSlabPool {
+            kind: SlabKind::Upload,
             blocks: vec![block(true), block(false), block(true), block(false)],
             block_allocs: 4,
             block_frees: 0,
@@ -719,7 +894,7 @@ mod tests {
     #[test]
     fn dedicated_and_poisoned_blocks_are_not_spares() {
         let block = |dedicated: bool, poisoned: bool| {
-            Some(HostBlock {
+            Some(SlabBlock {
                 memory: vk::DeviceMemory::null(),
                 plan: BlockPlan::new(1024),
                 mem_type: 0,
@@ -729,7 +904,8 @@ mod tests {
                 poisoned,
             })
         };
-        let pool = HostSlabPool {
+        let pool = BufferSlabPool {
+            kind: SlabKind::Upload,
             blocks: vec![block(true, false), block(false, true), block(false, false)],
             block_allocs: 3,
             block_frees: 0,
@@ -748,10 +924,11 @@ mod tests {
     fn release_preflight_refuses_missing_block_and_double_release() {
         let mut plan = BlockPlan::new(4096);
         let off = plan.carve(256, 1).expect("carve fits");
-        let pool = HostSlabPool {
+        let pool = BufferSlabPool {
+            kind: SlabKind::Upload,
             blocks: vec![
                 None,
-                Some(HostBlock {
+                Some(SlabBlock {
                     memory: vk::DeviceMemory::null(),
                     plan,
                     mem_type: 0,

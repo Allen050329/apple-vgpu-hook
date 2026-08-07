@@ -51,24 +51,98 @@ impl From<BufferSlot> for BoundBuffer {
     }
 }
 
+/// One draw-time buffer window the GPU assembles out of the guest's own pages
+/// before the render pass, because the window is not one contiguous stretch of
+/// guest physical memory and a bind must name one range.
+///
+/// Recorded rather than executed at plan time: the copies belong in the draw's
+/// own command buffer, ahead of the pass that reads them, so they cost one
+/// submission with the draw instead of a submit and a fence of their own.
+struct PendingGuestGather {
+    /// Device-local destination, which is what the draw actually binds.
+    dst: vk::Buffer,
+    /// One entry per import the window's stretches resolved against, each with
+    /// its copy regions.
+    ///
+    /// Grouped because two stretches need not share an import — a window
+    /// straddling two RAMBlocks resolves against two `VkBuffer`s — and one
+    /// `vkCmdCopyBuffer` names exactly one source. Ordinary machines have one
+    /// RAMBlock and this is a single-entry `Vec`, but the grouping is what makes
+    /// the two-block case land the whole window instead of the part that
+    /// happened to be first.
+    sources: Vec<(vk::Buffer, Vec<vk::BufferCopy>)>,
+}
+
+impl PendingGuestGather {
+    /// Copy regions across every source, which is what the census counts.
+    fn regions(&self) -> u64 {
+        self.sources.iter().map(|(_, r)| r.len() as u64).sum()
+    }
+}
+
+/// The largest number of copy regions one guest buffer window may be gathered
+/// with before it goes back to the CPU.
+///
+/// Not a correctness bound — the CPU gather reads the same bytes through the
+/// same runs, so exceeding this costs throughput and nothing else. It is a cost
+/// bound, and it is derived from the distribution rather than chosen: a driven
+/// boot measured this rail at 3-4 stretches for 42 windows, 5-8 for 4 322, 9-32
+/// for 370 716 and above 32 for 1 261. 64 sits above the band that carries
+/// 98.5 % of the traffic with a full band of headroom, and a window past it is
+/// one whose per-region overhead has started to compete with the memcpy it is
+/// replacing.
+///
+/// `zc_buf_gather_wide` counts what it turns away, so this being wrong in either
+/// direction is visible rather than silent.
+const MAX_GUEST_GATHER_REGIONS: usize = 64;
+
+/// The one bind range a window's stretches amount to, when they amount to one.
+///
+/// A single run starting at window byte zero *is* the whole window:
+/// [`crate::runtime::guest_ram_map::references_for_runs`] guarantees the runs
+/// ascend and tile the window exactly, so one of them covering byte zero leaves
+/// nothing else to name. Anything longer has to be gathered, because a vertex,
+/// index or storage bind names one contiguous range.
+fn single_run(
+    runs: &[crate::runtime::guest_ram_map::GuestWindowRun],
+) -> Option<&crate::runtime::guest_ram::GuestRef> {
+    match runs {
+        [only] if only.window_offset == 0 => Some(&only.guest),
+        _ => None,
+    }
+}
+
 /// Stage one draw-time buffer content into something the draw can bind,
 /// deduplicating within the draw: several binds sharing one content (an `Arc`'d
 /// byte allocation, or the same guest span) resolve to ONE buffer and at most
 /// one copy.
 ///
-/// A `GuestRuns` span is bound **directly out of the guest's pages** where this
-/// device can import their RAMBlock and the span sits at an offset the device
-/// will accept — no copy at all, not even a GPU one. Otherwise the CPU gathers
-/// the runs into a pooled staging span, which is what this arm did
-/// unconditionally before and is still what every host without
-/// `VK_EXT_external_memory_host` does.
+/// A `GuestRuns` span has three dispositions on a host that can import guest
+/// RAM, in decreasing order of what they cost:
 ///
-/// The direct bind reads guest RAM when the command buffer *executes*, which is
+/// 1. **Bound in place.** The window is one GPA-contiguous stretch sitting at an
+///    offset the device will bind at, so the draw reads the guest's bytes where
+///    the guest wrote them. Nothing is copied in either direction.
+/// 2. **Gathered by the GPU.** The window is several stretches, so one
+///    `vkCmdCopyBuffer` per stretch assembles it into device-local memory ahead
+///    of the render pass. The bus is crossed once, by the engine that was going
+///    to read those bytes anyway.
+/// 3. **Gathered by the CPU.** Everything else, and the only arm on a host
+///    without `VK_EXT_external_memory_host`. A `memcpy` per stretch into mapped
+///    staging.
+///
+/// Arm 2 exists because arm 1 turned out to be unreachable on a real workload:
+/// the guest backs a surface in 16 KiB physically-contiguous granules, so a
+/// driven boot put 98.5 % of these windows at 9-32 stretches and **none at all**
+/// at one. See [`crate::runtime::draw::vulkan`]'s `guest_page_window` for the
+/// measurement and what it cost — 3.6 GB/s of CPU `memcpy`, two thirds of every
+/// draw's staging phase.
+///
+/// Arms 1 and 2 both read guest RAM when the command buffer *executes*, which is
 /// after this device would otherwise have told the guest the packet finished.
 /// [`super::quiesce_guest_reads`], called from `write_stamp`, is what makes that
 /// ordering a rule rather than a short window; `snapshot_volatile` records that
-/// the runtime asked for a stable snapshot, which only the CPU arm still gives
-/// it.
+/// the runtime asked for a stable snapshot, which only arm 3 still gives it.
 #[allow(
     clippy::too_many_arguments,
     reason = "buffer staging carries the Vulkan context, pools, binding, and lifetime sets"
@@ -81,6 +155,7 @@ unsafe fn stage_buffer_content(
     usage: vk::BufferUsageFlags,
     snapshot_volatile: bool,
     slots_by_content: &mut std::collections::HashMap<(usize, u64), BoundBuffer>,
+    gathers: &mut Vec<PendingGuestGather>,
 ) -> Result<BoundBuffer, DrawError> {
     let key = match content {
         BufferContent::Bytes(b) => (std::sync::Arc::as_ptr(b) as usize, b.len() as u64),
@@ -115,6 +190,15 @@ unsafe fn stage_buffer_content(
             if let Some(bound) = unsafe { import_guest_buffer_window(ctx, pools, src) } {
                 pools.note_guest_read_recorded();
                 counters.note_buffer_guest_import(src.total_len);
+                bound
+            } else if let Some((bound, pending)) =
+                unsafe { gather_guest_buffer_window(ctx, pools, counters, src, usage)? }
+            {
+                // The copies read guest RAM when the CB executes, exactly as a
+                // direct bind does, so this owes the same quiesce.
+                pools.note_guest_read_recorded();
+                counters.note_buffer_guest_gather(src.total_len, pending.regions());
+                gathers.push(pending);
                 bound
             } else {
                 // No import on this host, or an offset it will not bind at. The
@@ -158,7 +242,7 @@ unsafe fn import_guest_buffer_window(
     if !ctx.caps.host_pointer.is_available() {
         return None;
     }
-    let guest_ref = src.pages.as_ref()?;
+    let guest_ref = single_run(src.pages.as_ref()?)?;
     let bound = match unsafe { pools.bind_guest_ram(ctx, guest_ref) } {
         Ok(bound) => bound,
         Err(inner) => {
@@ -190,18 +274,130 @@ unsafe fn import_guest_buffer_window(
     })
 }
 
+/// Assemble a scattered guest buffer window into device-local memory with one
+/// GPU copy per stretch, or say why the CPU still has to gather it.
+///
+/// Returns the buffer the draw binds together with the copies its command buffer
+/// owes. `Ok(None)` is a routing answer and never a lost draw — the caller's CPU
+/// gather reads the same bytes through the same runs — so every check here is a
+/// counted decline rather than an error.
+///
+/// # Why the destination is device-local and not a staging slot
+///
+/// A staging slot is host-visible, which on a discrete host means system memory.
+/// Gathering into one would have the GPU read guest RAM across the bus, write
+/// the result back across it, and then read it a third time when the draw runs —
+/// three crossings against the CPU gather's one, so it would be *slower* than
+/// the path it replaces. Device-local makes it one crossing and leaves the
+/// draw's own reads in VRAM, which is where the win is.
+///
+/// # Safety
+///
+/// `ctx` must own the device `pools` holds every live import against.
+unsafe fn gather_guest_buffer_window(
+    ctx: &super::context::DeviceContext,
+    pools: &mut ResourcePools,
+    counters: &EngineCounters,
+    src: &super::types::GuestRunSource,
+    usage: vk::BufferUsageFlags,
+) -> Result<Option<(BoundBuffer, PendingGuestGather)>, DrawError> {
+    if !ctx.caps.host_pointer.is_available() {
+        return Ok(None);
+    }
+    let Some(runs) = src.pages.as_ref() else {
+        return Ok(None);
+    };
+    if runs.len() > MAX_GUEST_GATHER_REGIONS {
+        crate::runtime::drain::note_store_route("zc_buf_gather_wide");
+        return Ok(None);
+    }
+    // Plan before acquiring, so a window that turns out not to be gatherable
+    // does not take a destination slot out of the pool to abandon it.
+    let mut sources: Vec<(vk::Buffer, Vec<vk::BufferCopy>)> = Vec::new();
+    let mut covered = 0u64;
+    for run in runs.iter() {
+        let bound = match unsafe { pools.bind_guest_ram(ctx, &run.guest) } {
+            Ok(bound) => bound,
+            Err(inner) => {
+                crate::observe::Emit::decline("vk_buffer_gather", &inner).fail_once(0);
+                return Ok(None);
+            }
+        };
+        let copy = gather_region(&bound, run);
+        covered = covered.saturating_add(copy.size);
+        super::group_by_buffer(&mut sources, bound.buffer, copy);
+    }
+    // The runs tile the window exactly, so this holds by construction — but a
+    // short gather would hand the draw a buffer whose tail is whatever the
+    // previous user of the slot left there, which is wrong pixels rather than
+    // slow ones. Checked here because this is the last place that can see it.
+    if covered != src.total_len {
+        crate::observe::Emit::decline(
+            "vk_buffer_gather",
+            &BufferImportDecline::GatherShort {
+                covered,
+                want: src.total_len,
+            },
+        )
+        .fail_once(src.total_len);
+        return Ok(None);
+    }
+    let slot = {
+        let _s = stage_phase::Span::open(stage_phase::Part::Acquire);
+        pools.acquire_guest_gather(ctx, src.total_len, usage, counters)?
+    };
+    Ok(Some((
+        BoundBuffer::from(slot),
+        PendingGuestGather {
+            dst: slot.buffer,
+            sources,
+        },
+    )))
+}
+
+/// The copy one stretch of a scattered window contributes.
+///
+/// Both offsets are re-based and neither is the number nearest to hand, which is
+/// what makes this worth its own function:
+///
+/// * The **source** is `offset + head`, not `offset`. A bound range is rounded
+///   out to the import's granularity, and `head` is what that rounding added in
+///   front of the byte the guest actually named. Reading from `offset` would
+///   start the stretch up to a granule early — the whole window shifted, which
+///   is a wrong draw and not a failed one.
+/// * The **size** is `requested()`, not `bound_len()`. The bound length is the
+///   same rounding at the other end, so copying it would read guest bytes past
+///   the window and write them past the destination's own end.
+/// * The **destination** is the stretch's offset *within the window*, which is
+///   the one thing a consumer may not compute for itself and the reason
+///   [`crate::runtime::guest_ram_map::GuestWindowRun`] carries it.
+fn gather_region(
+    bound: &super::host_ram::BoundGuestRam,
+    run: &crate::runtime::guest_ram_map::GuestWindowRun,
+) -> vk::BufferCopy {
+    vk::BufferCopy::default()
+        .src_offset(bound.offset + bound.head)
+        .dst_offset(run.window_offset)
+        .size(run.guest.requested())
+}
+
 /// A check that sent a guest buffer span back to the CPU gather.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BufferImportDecline {
     /// The span does not start at an offset this device will bind a vertex or
     /// storage buffer at. See [`super::context::DeviceContext::guest_bind_offset_align`].
     BindOffsetAlignment { offset: u64, align: u64 },
+    /// The window's stretches did not add up to the window. A healthy zero:
+    /// `references_for_runs` tiles exactly, so a firing means the runs and the
+    /// length reached here from different windows.
+    GatherShort { covered: u64, want: u64 },
 }
 
 impl crate::observe::Decline for BufferImportDecline {
     fn slug(&self) -> &'static str {
         match self {
             Self::BindOffsetAlignment { .. } => "buffer_import_bind_offset_alignment",
+            Self::GatherShort { .. } => "buffer_gather_short",
         }
     }
 
@@ -209,6 +405,9 @@ impl crate::observe::Decline for BufferImportDecline {
         match self {
             Self::BindOffsetAlignment { offset, align } => {
                 vec![("offset", offset.to_string()), ("align", align.to_string())]
+            }
+            Self::GatherShort { covered, want } => {
+                vec![("covered", covered.to_string()), ("want", want.to_string())]
             }
         }
     }
@@ -351,7 +550,12 @@ unsafe fn import_sampled_guest_window(
     if !ctx.caps.host_pointer.is_available() {
         return None;
     }
-    let guest_ref = src.pages.as_ref()?;
+    // One stretch only. The buffer rail assembles a scattered window with a GPU
+    // copy per stretch; this rail does not, because its whole traffic for a boot
+    // (211 gathers, 254 MB) is two orders of magnitude below what the buffer
+    // rail moves in a second, and a second copy pool to serve it would be paid
+    // for by nothing.
+    let guest_ref = single_run(src.pages.as_ref()?)?;
     let bound = match unsafe { pools.bind_guest_ram(ctx, guest_ref) } {
         Ok(bound) => bound,
         Err(inner) => {
@@ -1369,6 +1573,11 @@ pub(crate) unsafe fn execute_draw_inner(
     let no_vertex_fetch = draw_has_no_invocations(req);
     let mut slots_by_content: std::collections::HashMap<(usize, u64), BoundBuffer> =
         std::collections::HashMap::new();
+    // Filled by whichever binds below are scattered guest windows, and drained
+    // in the record phase ahead of the render pass. Deduplicated for free:
+    // `slots_by_content` returns an already-planned window's buffer without
+    // reaching the gather again, so a stream bound twice is copied once.
+    let mut guest_gathers: Vec<PendingGuestGather> = Vec::new();
     let mut vertex_bufs = Vec::new();
     for resource in &req.vertex_attributes {
         let needs_shift = !no_vertex_fetch
@@ -1428,6 +1637,7 @@ pub(crate) unsafe fn execute_draw_inner(
                 vk::BufferUsageFlags::VERTEX_BUFFER,
                 batch_eligible,
                 &mut slots_by_content,
+                &mut guest_gathers,
             )?
         };
         vertex_bufs.push((resource.binding, slot));
@@ -1464,6 +1674,7 @@ pub(crate) unsafe fn execute_draw_inner(
             vk::BufferUsageFlags::STORAGE_BUFFER,
             batch_eligible,
             &mut slots_by_content,
+            &mut guest_gathers,
         )?;
         storage_slots.push((resource.binding, slot));
     }
@@ -2382,6 +2593,46 @@ pub(crate) unsafe fn execute_draw_inner(
         );
     }
 
+    // Scattered guest buffer windows, assembled into their device-local
+    // destinations before anything reads them.
+    //
+    // No HOST→TRANSFER barrier: the source is the guest's own RAM through the
+    // RAMBlock import and nothing in this process wrote it, and the destination
+    // is device-local memory only the GPU touches. What the copies *do* owe is
+    // a barrier before the draw reads them, which follows the loop — one for
+    // all of them, because a per-buffer barrier would submit N of them to
+    // express the same dependency.
+    for gather in &guest_gathers {
+        for (source, copies) in &gather.sources {
+            ctx.device.cmd_copy_buffer(cb, *source, gather.dst, copies);
+        }
+    }
+    if !guest_gathers.is_empty() {
+        // `ALL_GRAPHICS` rather than the exact stages: a gathered window is
+        // bound as a vertex stream or as a storage buffer, and a storage bind is
+        // readable from every shader stage of the pass. Naming them individually
+        // would be a list that has to be revisited whenever a new bind kind
+        // reaches this rail, for a dependency the driver resolves against the
+        // pass it actually recorded.
+        let barrier = [vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(
+                vk::AccessFlags::VERTEX_ATTRIBUTE_READ
+                    | vk::AccessFlags::INDEX_READ
+                    | vk::AccessFlags::UNIFORM_READ
+                    | vk::AccessFlags::SHADER_READ,
+            )];
+        ctx.device.cmd_pipeline_barrier(
+            cb,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::ALL_GRAPHICS,
+            vk::DependencyFlags::empty(),
+            &barrier,
+            &[],
+            &[],
+        );
+    }
+
     // Guest-sourced sampled uploads: one buffer→image copy over either the
     // guest's imported pages or the scratch the CPU packed them into, differing
     // from the CPU-origin loop above only in `row_length_texels` striding over
@@ -3144,6 +3395,121 @@ mod tests {
         for offset in [4u64, 8, 12, 100] {
             assert!(!offset.is_multiple_of(GUEST_IMPORT_COPY_OFFSET_ALIGN));
         }
+    }
+
+    /// One import over a plausible RAMBlock, for building references the
+    /// planners can be asked about. The host address is compared and never
+    /// dereferenced, which is what lets a unit test hold one.
+    fn window_runs(
+        stretches: &[(u64, u64, u64)],
+    ) -> Vec<crate::runtime::guest_ram_map::GuestWindowRun> {
+        use crate::runtime::guest_ram::{GuestRamImport, GuestRamRegion, GuestRef};
+        let import = std::sync::Arc::new(
+            GuestRamImport::new(
+                GuestRamRegion {
+                    gpa_base: 0x1_0000_0000,
+                    host_va: 0x7f00_0000_0000,
+                    len: 0x10_0000,
+                },
+                1,
+            )
+            .expect("region is aligned and non-empty"),
+        );
+        stretches
+            .iter()
+            .map(
+                |&(window_offset, offset, len)| crate::runtime::guest_ram_map::GuestWindowRun {
+                    window_offset,
+                    guest: GuestRef::new(
+                        std::sync::Arc::clone(&import),
+                        import.slice(offset, len).expect("inside the import"),
+                    )
+                    .expect("the slice came from this import"),
+                },
+            )
+            .collect()
+    }
+
+    /// A one-stretch window starting at window byte zero is the whole window, so
+    /// it binds in place. Anything else has to be assembled.
+    ///
+    /// The offset half is the one that can be silently wrong: a lone run that
+    /// does *not* start at zero names a suffix of the window, and binding it
+    /// would hand the draw the guest's bytes shifted forward — a wrong draw
+    /// rather than a failed one. `references_for_runs` cannot produce that
+    /// shape, and this is what keeps the reliance on that written down.
+    #[test]
+    fn only_a_lone_stretch_covering_byte_zero_binds_in_place() {
+        assert!(single_run(&window_runs(&[(0, 0, 64)])).is_some());
+        assert!(
+            single_run(&window_runs(&[(16, 16, 48)])).is_none(),
+            "a lone run starting past window byte zero is a suffix, not a window"
+        );
+        assert!(
+            single_run(&window_runs(&[(0, 0, 32), (32, 4096, 32)])).is_none(),
+            "two stretches are two ranges and a bind names one"
+        );
+        assert!(single_run(&window_runs(&[])).is_none());
+    }
+
+    /// The two re-basings a gather region does, at the values that make them
+    /// visible.
+    ///
+    /// Both failure modes here are silent: reading from `offset` instead of
+    /// `offset + head` shifts the whole window forward by up to a granule, and
+    /// copying `bound_len` instead of `requested` reads guest bytes the window
+    /// never named and writes them past the destination's end. Neither produces
+    /// an error — they produce wrong vertices. So the stretch is deliberately
+    /// misaligned on both sides: a 24-byte request inside a 4096-granular
+    /// import, which rounds out to a `head` of 24 and a bound length of 4096.
+    #[test]
+    fn a_gather_region_reads_the_requested_bytes_and_not_the_rounding() {
+        use crate::runtime::guest_ram::{GuestRamImport, GuestRamRegion, GuestRef};
+        let import = std::sync::Arc::new(
+            GuestRamImport::new(
+                GuestRamRegion {
+                    gpa_base: 0x1_0000_0000,
+                    host_va: 0x7f00_0000_0000,
+                    len: 0x10_0000,
+                },
+                4096,
+            )
+            .expect("region is aligned and non-empty"),
+        );
+        let slice = import.slice(4096 + 24, 100).expect("inside the import");
+        assert_eq!(slice.head(), 24, "the granularity rounding went in front");
+        assert_eq!(slice.requested(), 100);
+        assert_eq!(slice.bound_len(), 4096, "and out to the granule at the end");
+
+        let run = crate::runtime::guest_ram_map::GuestWindowRun {
+            window_offset: 512,
+            guest: GuestRef::new(std::sync::Arc::clone(&import), slice)
+                .expect("the slice came from this import"),
+        };
+        let bound = super::super::host_ram::BoundGuestRam {
+            buffer: {
+                use ash::vk::Handle;
+                vk::Buffer::from_raw(0x99)
+            },
+            offset: 4096,
+            len: 4096,
+            head: 24,
+        };
+        let copy = gather_region(&bound, &run);
+        assert_eq!(
+            copy.src_offset, 4120,
+            "the copy must start at the byte the guest named, not at the granule \
+             the bound range was rounded back to"
+        );
+        assert_eq!(
+            copy.size, 100,
+            "the copy must move the bytes the window asked for, not the granule \
+             the bound range was rounded out to"
+        );
+        assert_eq!(
+            copy.dst_offset, 512,
+            "the stretch lands where it sits in the window"
+        );
     }
 
     /// A pooled staging slot binds at zero and a guest window import does not,

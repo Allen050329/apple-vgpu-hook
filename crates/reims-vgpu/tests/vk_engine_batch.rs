@@ -535,3 +535,139 @@ fn sampled_guest_runs_land_the_guest_bytes_the_shader_samples() {
         }
     }
 }
+
+/// **The draw-time buffer gather, end to end.**
+///
+/// A guest vertex or storage window is almost never one GPA-contiguous stretch
+/// — the guest backs a surface in 16 KiB granules, so a driven boot put 98.5 %
+/// of these windows at 9-32 stretches and *none* at one. A rail that could only
+/// bind a lone stretch therefore never fired: `zc_buffer_imported` read 0
+/// against 371 422 CPU gathers, and that memcpy was two thirds of every draw.
+///
+/// So a scattered window is now assembled by the GPU, one `vkCmdCopyBuffer`
+/// region per stretch, into a device-local destination the draw binds. This
+/// drives that path with a real host-pointer import and a genuinely scattered
+/// window — three stretches whose order inside the import is *not* their order
+/// in the window, so a planner that ignored `window_offset` would reassemble
+/// them wrong rather than merely differently.
+///
+/// What it asserts is the disposition, because that is what regressed to zero
+/// before: the bind must be gathered by the GPU in three regions, and must not
+/// reach either the CPU snapshot or the in-place bind. The draw completing
+/// without a device loss is the rest of it — the copies, the barrier and the
+/// pooled device-local destination are all recorded into the draw's own command
+/// buffer and submitted with it.
+///
+/// Skips rather than fails where the host cannot import guest RAM: on such a
+/// host the CPU gather is the only rail and there is nothing here to measure.
+#[test]
+fn a_scattered_guest_buffer_window_is_gathered_by_the_gpu_in_one_region_per_stretch() {
+    use reims_vgpu::runtime::guest_ram::{granularity, GuestRamImport, GuestRamRegion, GuestRef};
+    use reims_vgpu::runtime::guest_ram_map::GuestWindowRun;
+
+    let _guard = engine_test_lock().lock().unwrap();
+    let (vert, frag) = triangle_spirv();
+    let identity = TargetIdentity::Surface {
+        id: 990_407,
+        width: W,
+        height: H,
+        generation: 1,
+    };
+
+    // The device publishes the import granularity when it is created, and it is
+    // what a `GuestRamImport` must be built against — so one draw has to run
+    // before the window can be described at all.
+    let warm = batch_req(&vert, &frag, &identity, false, half_scissor(true));
+    if let Err(e) = engine::execute_draw_request(&warm) {
+        let msg = e.to_string();
+        if skip_if_no_gpu(&msg) {
+            eprintln!("skipping: {msg}");
+            return;
+        }
+        panic!("warm-up draw: {msg}");
+    }
+    let Some(align) = granularity() else {
+        eprintln!(
+            "skipping: this host cannot import guest RAM, so the CPU gather is the only rail"
+        );
+        engine::test_quiesce_ring();
+        return;
+    };
+
+    // A host allocation standing in for a RAMBlock: aligned to the granularity
+    // the device published, because that is the bound `GuestRamImport` enforces
+    // and the alignment the driver will actually accept for the import.
+    const STRETCH: u64 = 256;
+    let block_len = align * 4;
+    let backing = vec![0xA5u8; (block_len + align) as usize];
+    let base = (backing.as_ptr() as u64).next_multiple_of(align);
+    let import = std::sync::Arc::new(
+        GuestRamImport::new(
+            GuestRamRegion {
+                gpa_base: 0x1_0000_0000,
+                host_va: base,
+                len: block_len,
+            },
+            align,
+        )
+        .expect("an aligned, non-empty region"),
+    );
+
+    // Deliberately out of order inside the import: window byte 0 comes from the
+    // *third* granule, and window byte 512 from the first. The copies have to
+    // put each stretch where `window_offset` says, not where it sits in RAM.
+    let placement = [(0u64, align * 2), (STRETCH, align), (STRETCH * 2, 0u64)];
+    let mut pages = Vec::new();
+    let mut runs = Vec::new();
+    for (window_offset, import_offset) in placement {
+        pages.push(GuestWindowRun {
+            window_offset,
+            guest: GuestRef::new(
+                std::sync::Arc::clone(&import),
+                import
+                    .slice(import_offset, STRETCH)
+                    .expect("inside the import"),
+            )
+            .expect("the slice came from this import"),
+        });
+        runs.push(GuestRun {
+            host_ptr: (base + import_offset) as usize,
+            len: STRETCH,
+        });
+    }
+
+    let before = engine::counter_snapshot();
+    let mut req = batch_req(&vert, &frag, &identity, false, half_scissor(true));
+    req.storage_buffers.push(StorageBufferResource {
+        binding: 0,
+        content: BufferContent::GuestRuns(GuestRunSource {
+            runs: std::sync::Arc::new(runs),
+            total_len: STRETCH * 3,
+            row_length_texels: 0,
+            pages: Some(std::sync::Arc::new(pages)),
+        }),
+    });
+    engine::execute_draw_request(&req).expect("the gathered draw");
+    // Flush the batch this draw opened, so the copies and the pass it recorded
+    // are actually submitted and waited before anything is claimed about them.
+    engine::read_target(&identity).expect("read_target flushes the batch");
+
+    let d = engine::counter_snapshot().delta_since(&before);
+    assert_eq!(
+        d.buffer_guest_gathers, 1,
+        "the scattered window must be assembled by the GPU: {d:?}"
+    );
+    assert_eq!(
+        d.buffer_guest_gather_regions, 3,
+        "one copy region per stretch: {d:?}"
+    );
+    assert_eq!(
+        d.buffer_guest_imports, 0,
+        "three stretches are not one bind range: {d:?}"
+    );
+    assert_eq!(
+        d.buffer_snapshot_binds, 0,
+        "the CPU must not have gathered a window the GPU could reach: {d:?}"
+    );
+    engine::test_quiesce_ring();
+}

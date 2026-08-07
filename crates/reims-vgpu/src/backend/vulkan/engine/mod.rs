@@ -7,6 +7,7 @@
 
 #![allow(unsafe_op_in_unsafe_fn)]
 
+mod buffer_slab;
 mod caches;
 mod compute_execution;
 mod compute_validation;
@@ -23,7 +24,6 @@ mod exec;
 mod exec_compute;
 mod facade_decline;
 mod host_ram;
-mod host_slab;
 pub mod init_decline;
 mod pools;
 /// The ceiling `registry_non_pinned_peak` is read against. Re-exported because
@@ -1987,12 +1987,38 @@ unsafe fn plan_guest_linear_copies(
             // import's granularity, and copying it would write guest bytes
             // either side of the window that this frame was never given.
             .size(run.guest.requested());
-        match grouped.iter_mut().find(|(b, _)| *b == bound.buffer) {
-            Some((_, copies)) => copies.push(copy),
-            None => grouped.push((bound.buffer, vec![copy])),
-        }
+        group_by_buffer(&mut grouped, bound.buffer, copy);
     }
     Ok(grouped)
+}
+
+/// Add one stretch's copy to the group for `buffer`, opening a group if this is
+/// the first stretch to name it.
+///
+/// # Why every guest-memory planner groups
+///
+/// Two stretches of one window need not resolve against the same import: a
+/// window straddling two RAMBlocks gives two `VkBuffer`s, and one `vkCmdCopy*`
+/// names exactly one. Ordinary machines have one RAMBlock, so every group list
+/// is a single entry and a planner that ignored this would look correct on every
+/// host anyone runs — while landing, on a two-block machine, whichever part of
+/// the window happened to come first.
+///
+/// One implementation because there are now four planners (the writeback's
+/// rectangle and linear forms, the draw-time buffer gather, and any that
+/// follows) and this is precisely the shape `AGENTS.md` warns about: a rule
+/// written by hand N times, where the copies diverge in the arm nobody boots.
+/// Generic over the copy type — `VkBufferCopy` and `VkBufferImageCopy` group
+/// identically because the grouping is about the buffer, not the copy.
+pub(super) fn group_by_buffer<C>(
+    groups: &mut Vec<(ash::vk::Buffer, Vec<C>)>,
+    buffer: ash::vk::Buffer,
+    copy: C,
+) {
+    match groups.iter_mut().find(|(b, _)| *b == buffer) {
+        Some((_, copies)) => copies.push(copy),
+        None => groups.push((buffer, vec![copy])),
+    }
 }
 
 /// Bind every run and turn it into copy rectangles, grouped by the buffer they
@@ -2050,10 +2076,7 @@ unsafe fn plan_guest_copies(
                     height: r.height,
                     depth: 1,
                 });
-            match grouped.iter_mut().find(|(b, _)| *b == bound.buffer) {
-                Some((_, regions)) => regions.push(region),
-                None => grouped.push((bound.buffer, vec![region])),
-            }
+            group_by_buffer(&mut grouped, bound.buffer, region);
         }
     }
     Ok(grouped)
@@ -2605,6 +2628,50 @@ pub fn test_poison_and_flush() {
     g.counters.device_lost.fetch_add(1, Ordering::Relaxed);
     g.owner.mark_device_lost();
     g.flush_device_derived();
+}
+
+#[cfg(test)]
+mod group_by_buffer_tests {
+    use super::*;
+    use ash::vk::Handle;
+
+    fn buffer(raw: u64) -> ash::vk::Buffer {
+        ash::vk::Buffer::from_raw(raw)
+    }
+
+    /// The case every host anyone develops on hides: a window whose stretches
+    /// resolve against two RAMBlocks needs two `vkCmdCopy*` calls, and a planner
+    /// that kept one region list would submit whichever import came first and
+    /// leave the rest of the window holding stale bytes.
+    ///
+    /// Order matters as much as the split. Regions inside one group must stay in
+    /// the order they were planned, because that order is the window's byte
+    /// order and a copy list is what reconstructs it.
+    #[test]
+    fn stretches_split_by_import_and_keep_their_order_inside_each() {
+        let mut groups: Vec<(ash::vk::Buffer, Vec<u32>)> = Vec::new();
+        // Interleaved on purpose: a real two-block window alternates as the
+        // guest's allocator walks across the boundary and back.
+        for (buf, region) in [(1, 10), (2, 20), (1, 11), (2, 21), (1, 12)] {
+            group_by_buffer(&mut groups, buffer(buf), region);
+        }
+        assert_eq!(groups.len(), 2, "two imports, two copy calls");
+        assert_eq!(groups[0].0, buffer(1), "groups appear in first-seen order");
+        assert_eq!(groups[0].1, vec![10, 11, 12]);
+        assert_eq!(groups[1].0, buffer(2));
+        assert_eq!(groups[1].1, vec![20, 21]);
+    }
+
+    /// The ordinary machine: one RAMBlock, one group, and no per-stretch call.
+    #[test]
+    fn one_import_stays_one_group() {
+        let mut groups: Vec<(ash::vk::Buffer, Vec<u32>)> = Vec::new();
+        for region in 0..5 {
+            group_by_buffer(&mut groups, buffer(7), region);
+        }
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].1.len(), 5);
+    }
 }
 
 #[cfg(test)]

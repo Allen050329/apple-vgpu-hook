@@ -9,15 +9,15 @@ use std::hash::{Hash, Hasher};
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
+use super::buffer_slab::{BufferSlabToken, BUFFER_SLAB_IDLE_KEEP_EMPTY};
 use super::compute_execution::ComputeExecutionDecline;
 use super::context::{DeviceContext, FENCE_TIMEOUT_NS};
 use super::counters::EngineCounters;
 use super::desc_arena::{DescriptorArena, DESC_BLOCK_MAX_SETS};
 use super::device_lost::{DeviceLostDecline, DeviceLostOp};
-use super::host_slab::{HostSlabToken, HOST_SLAB_IDLE_KEEP_EMPTY};
 use super::types::{DrawError, ResidentReclaim, StorageImageFormat, TargetIdentity};
 use super::vk_call::{VkCall, VkOp};
-use super::{color_subresource_range, host_ram, host_slab, reason, slab, types};
+use super::{buffer_slab, color_subresource_range, host_ram, reason, slab, types};
 use crate::backend::vulkan::caps::{MappedMemoryKind, MemoryClass};
 use crate::backend::vulkan::translate;
 use crate::model::ComputeStorageResidencyKey;
@@ -85,9 +85,9 @@ pub(crate) enum BufferBacking {
     /// range to the carve first.
     Dedicated,
     /// The slot holds a sub-range of a shared HOST_VISIBLE block; releasing it
-    /// returns the range to [`host_slab::HostSlabPool`] and must never
+    /// returns the range to [`buffer_slab::BufferSlabPool`] and must never
     /// call `vkFreeMemory`.
-    HostSlab(HostSlabToken),
+    Slab(BufferSlabToken),
 }
 
 /// Give a buffer slot back: destroy its handle, then release its memory by
@@ -100,13 +100,16 @@ pub(crate) enum BufferBacking {
 /// No in-flight command buffer may still reference `slot.buffer`.
 pub(crate) unsafe fn release_buffer_slot(
     device: &ash::Device,
-    host_slab: &mut host_slab::HostSlabPool,
+    slabs: &mut buffer_slab::BufferSlabs,
     slot: BufferSlot,
 ) {
     device.destroy_buffer(slot.buffer, None);
     match slot.backing {
         BufferBacking::Dedicated => device.free_memory(slot.memory, None),
-        BufferBacking::HostSlab(token) => host_slab.release(device, token),
+        // Routed by the token's own kind and never by the call site: a
+        // `BufferSlot` does not say which pool carved it, and the two pools'
+        // block indices mean different things.
+        BufferBacking::Slab(token) => slabs.release(device, token),
     }
 }
 
@@ -172,6 +175,17 @@ pub(crate) struct ResourcePools {
     staging_free: HashMap<u64, Vec<BufferSlot>>,
     /// In-use staging slots returned after submit/wait.
     staging_live: Vec<BufferSlot>,
+    /// Size-bucketed free DEVICE_LOCAL buffers the draw-time guest gather
+    /// assembles scattered windows into, and the in-use ones the ring returns
+    /// after submit/wait.
+    ///
+    /// A second pair rather than a flag on the staging pool: these are a
+    /// different memory class, and a slot handed to the wrong one would either
+    /// put a CPU write into memory the host cannot address or put a gather
+    /// destination in system RAM, which is the arrangement
+    /// `gather_guest_buffer_window` exists to avoid.
+    gather_free: HashMap<u64, Vec<BufferSlot>>,
+    gather_live: Vec<BufferSlot>,
     /// Staging free-list hits / misses and the miss bucket histogram; see
     /// `note_staging_miss`. Measure-only.
     staging_hits: u64,
@@ -382,7 +396,7 @@ pub(crate) struct ResourcePools {
     /// different measurement: a staging miss cost ~0.4-0.6 ms of
     /// `vkAllocateMemory` whatever its size, and the pool takes ~1 500 of them
     /// a boot, clustered on the first composite after idle.
-    host_slab: host_slab::HostSlabPool,
+    slabs: buffer_slab::BufferSlabs,
     /// Every RAMBlock this device has imported as a host pointer. Not a cache:
     /// one entry per span the shim reported, held for the device's life, with
     /// no eviction — see `host_ram` for why adding one would be a mistake.
@@ -567,6 +581,7 @@ impl ResourcePools {
 pub(crate) struct PendingGpuCleanup {
     dsets: Vec<(vk::DescriptorSet, vk::DescriptorPool)>,
     staging: Vec<BufferSlot>,
+    gather: Vec<BufferSlot>,
     readback: Vec<BufferSlot>,
     sampled: Vec<SampledSlot>,
     storage_images: Vec<StorageImageSlot>,
@@ -1822,7 +1837,7 @@ pub(crate) enum AllocSite {
     /// A HOST_VISIBLE upload block, not one staging buffer.
     ///
     /// Every staging bind is a sub-allocation out of one of these
-    /// ([`host_slab`]), so this counts blocks: a boot that once read
+    /// ([`buffer_slab`]), so this counts blocks: a boot that once read
     /// `staging=242:134:273` (count:MiB:ms) should read a single-digit count
     /// here. The name changed with the meaning deliberately — a reader
     /// comparing a new `staging_block` figure against an old `staging` one
@@ -1836,9 +1851,14 @@ pub(crate) enum AllocSite {
     /// handful means the frame size is changing every flush and the grow rule
     /// is thrashing rather than settling.
     GuestScratch,
+    /// A DEVICE_LOCAL block the draw-time guest gather carves its destinations
+    /// from, not one destination. Same relationship to `guest_gather` binds that
+    /// [`Self::StagingBlock`] has to staging ones, and read the same way: a
+    /// single-digit count for a whole boot is the allocator working.
+    GuestGatherBlock,
 }
 
-const ALLOC_SITE_N: usize = 8;
+const ALLOC_SITE_N: usize = 9;
 
 impl AllocSite {
     const fn idx(self) -> usize {
@@ -1851,6 +1871,7 @@ impl AllocSite {
             AllocSite::ReadbackMulti => 5,
             AllocSite::SlabBlock => 6,
             AllocSite::GuestScratch => 7,
+            AllocSite::GuestGatherBlock => 8,
         }
     }
 }
@@ -1864,6 +1885,7 @@ const ALLOC_SITE_NAMES: [&str; ALLOC_SITE_N] = [
     "readback_multi",
     "slab_block",
     "guest_scratch",
+    "guest_gather_block",
 ];
 
 static ALLOC_SITE_COUNT: [std::sync::atomic::AtomicU64; ALLOC_SITE_N] =
@@ -2503,7 +2525,7 @@ mod staging_mapping_tests {
     /// A cold burst of staging acquires costs a handful of `vkAllocateMemory`,
     /// not one per acquire.
     ///
-    /// This is the whole claim of [`host_slab`]. The staging pool
+    /// This is the whole claim of [`buffer_slab`]. The staging pool
     /// hits ~99.6 % of the time, so what it costs is decided by its misses, and
     /// a miss used to be a full allocation — measured at a ~0.4-0.6 ms floor
     /// whatever the size (a 64-byte miss read 421 us). Every acquire below is a

@@ -195,6 +195,8 @@ pub enum VkOp {
     PoolsCreateStaging,
     /// `vkAllocateMemory` for a staging slot.
     PoolsAllocStaging,
+    PoolsCreateGuestGather,
+    PoolsBindGuestGather,
     /// `vkBindBufferMemory` for a staging slot.
     PoolsBindStaging,
     /// `vkMapMemory` of a staging slot to upload guest bytes.
@@ -425,6 +427,8 @@ impl Decline for VkCall {
             VkOp::PoolsSubmitBatch => "vk_pools_submit_batch",
             VkOp::PoolsCreateStaging => "vk_pools_create_staging",
             VkOp::PoolsAllocStaging => "vk_pools_alloc_staging",
+            VkOp::PoolsCreateGuestGather => "vk_pools_create_guest_gather",
+            VkOp::PoolsBindGuestGather => "vk_pools_bind_guest_gather",
             VkOp::PoolsBindStaging => "vk_pools_bind_staging",
             VkOp::PoolsMapStaging => "vk_pools_map_staging",
             VkOp::PoolsCreateReadback => "vk_pools_create_readback",
@@ -589,6 +593,8 @@ mod tests {
         VkOp::PoolsSubmitBatch,
         VkOp::PoolsCreateStaging,
         VkOp::PoolsAllocStaging,
+        VkOp::PoolsCreateGuestGather,
+        VkOp::PoolsBindGuestGather,
         VkOp::PoolsBindStaging,
         VkOp::PoolsMapStaging,
         VkOp::PoolsCreateReadback,

@@ -2314,66 +2314,69 @@ pub(super) fn task_gva_guest_run_window<M: HostMemory + HostOps>(
     Some((gpas, runs))
 }
 
-/// The bounded guest-memory reference behind a set of runs, when this host can
-/// import guest RAM and the pages are one bindable stretch.
+/// The bounded guest-memory references behind a set of runs, one per maximal
+/// GPA-contiguous stretch, when this host can import guest RAM at all.
 ///
 /// `None` is the routing answer for every host that cannot import — no
 /// `VK_EXT_external_memory_host`, an operator who turned the rail off, a shim
-/// that cannot say where guest RAM lives, or a page list that is not one bind
-/// range — and the caller gathers on the CPU exactly as it did before. Every
-/// refusal is named on the always-on sink by
-/// [`crate::runtime::guest_ram_map`], so a fall back to the copy is never
-/// silent.
+/// that cannot say where guest RAM lives, or a GPA the imports do not cover —
+/// and the caller gathers on the CPU exactly as it did before. Every refusal is
+/// named on the always-on sink by [`crate::runtime::guest_ram_map`], so a fall
+/// back to the copy is never silent.
 ///
-/// # Why the refusal is counted as well as reported
+/// # Why this asks for runs rather than one bind range
 ///
-/// `guest_ram_map` deduplicates its refusals per boot — one line however many
-/// times a reason is reached — which is right for the log and useless for
-/// sizing this rail. A driven boot put `zc_buffer_gathered` at 342 492 against
-/// `zc_buffer_imported` at **zero**: every draw-time buffer bind on a host whose
-/// `vk_caps` said `host_pointer_import=supported` fell back to the CPU gather,
-/// and the one deduplicated line could not say whether that was one cause or
-/// four, nor whether the windows missing a single bind range were missing it by
-/// two stretches or by five hundred.
+/// It asked for one, and a driven boot priced what that cost. `zc_buffer_gathered`
+/// read 371 422 against `zc_buffer_imported` at **zero** on a host whose
+/// `vk_caps` said `host_pointer_import=supported`, and the banded census said
+/// why with no ambiguity left in it: not one window in the boot was refused for
+/// a missing import, a declined pointer, an unbacked GPA or a range outside
+/// one. Every single one was refused for being scattered, 98.5 % of them into
+/// 9-32 stretches, and **nothing at all** at one or two. The guest backs a
+/// surface in 16 KiB physically-contiguous granules, so a rail that takes only
+/// one stretch is not a rail that rarely fires — it is one that cannot fire.
 ///
-/// Those are different fixes. Two stretches is a gather the GPU could do in two
-/// copy regions; five hundred is not obviously worth taking off the CPU. So the
-/// class is counted here, and the stretch count banded, on the census rather
-/// than the fail channel — nothing here is a new loss of guest work, it is the
-/// existing loss made countable.
+/// The bytes have to be gathered somewhere regardless: a vertex or storage bind
+/// must name one contiguous range and these windows are not one in GPA space.
+/// So the only question was whether the CPU or the GPU does it, and the CPU was
+/// answering it at 3.6 GB/s of `memcpy` — 105 ms per second of wall clock, two
+/// thirds of every draw's staging phase. Handing the runs to the caller lets it
+/// submit one `VkBufferCopy` per stretch into device-local memory instead, which
+/// crosses the bus once where the CPU path crossed it once and paid a full
+/// core's memcpy on top.
 ///
-/// # Four call sites, and only one of them is worth a fix
+/// # Four call sites, and the counters are shared
 ///
-/// This function serves the draw-time buffer rail and three sampled ones, so a
-/// reader sizing the gather that these counters argue for will find both
-/// populations here and should not spend the effort twice. From the same boot,
-/// through `engine_delta`:
+/// This serves the draw-time buffer rail and three sampled ones. From the boot
+/// above, through `engine_delta`:
 ///
 /// | rail | gathers | bytes the CPU moved |
 /// |---|---:|---:|
 /// | buffer (`stage_phase`'s `runs`) | 15 758 per second | 3.6 GB **per second** |
 /// | sampled (`sampled_gathers`) | 211 for the boot | 254 MB for the boot |
 ///
-/// So the sampled rail is around two orders of magnitude off being the problem,
-/// even though its gathers are individually large (~1.2 MB each, they are
-/// textures). It is also the *easier* one to widen — its consumer already
-/// records a GPU copy into a command buffer, where the buffer rail's binds the
-/// span straight into the draw — which is exactly the trap: the tractable one
-/// and the expensive one are not the same rail.
-///
-/// `sampled_guest_imports` reads 4, for 8 192 bytes, against
-/// `buffer_guest_imports` at 0. Those four are single-page windows that happened
-/// to be one stretch, which is the same story the bands above tell.
+/// So a reading of `zc_buf_runs_*` is both populations, and the sampled one is
+/// around two orders of magnitude smaller. Only the buffer rail consumes the
+/// runs; the sampled rail binds a one-run window directly and otherwise still
+/// gathers on the CPU, which its own volume does not justify changing.
 fn guest_page_window<M: HostOps>(
     host: &mut M,
     gpas: Vec<u64>,
     page: u64,
     head_offset: u64,
     span: u64,
-) -> Option<crate::runtime::guest_ram::GuestRef> {
+) -> Option<std::sync::Arc<Vec<crate::runtime::guest_ram_map::GuestWindowRun>>> {
     use crate::runtime::guest_ram_map::MapRefusal;
-    match crate::runtime::guest_ram_map::reference_for_pages(host, &gpas, page, head_offset, span) {
-        Ok(reference) => Some(reference),
+    match crate::runtime::guest_ram_map::references_for_runs(host, &gpas, page, head_offset, span) {
+        Ok(runs) => {
+            // Banded on the way through as well as on the refusals below,
+            // because the count is what decides whether a window binds straight
+            // into the draw (one run) or costs a copy region per stretch — and
+            // a rail whose regions grew without anyone noticing would read here
+            // first.
+            crate::runtime::drain::note_store_route(band_runs(runs.len()));
+            Some(std::sync::Arc::new(runs))
+        }
         Err(refusal) => {
             crate::runtime::drain::note_store_route(match refusal {
                 MapRefusal::NoBackendImport => "zc_buf_no_import",
@@ -2381,22 +2384,36 @@ fn guest_page_window<M: HostOps>(
                 MapRefusal::NoUsableRegion { .. } => "zc_buf_no_region",
                 MapRefusal::GpaNotInAnyImport { .. } => "zc_buf_gpa_unbacked",
                 MapRefusal::OutsideImport(_) => "zc_buf_outside_import",
-                // Banded, not exact: the decision this feeds is how many copy
-                // regions a GPU gather would cost, and that is a question about
-                // the order of magnitude. An exact count would also need an
-                // unbounded set of static strings, which `note_store_route`
-                // does not take.
-                MapRefusal::Scattered { runs, .. } => match runs {
-                    0..=1 => "zc_buf_scattered_1",
-                    2 => "zc_buf_scattered_2",
-                    3..=4 => "zc_buf_scattered_3_4",
-                    5..=8 => "zc_buf_scattered_5_8",
-                    9..=32 => "zc_buf_scattered_9_32",
-                    _ => "zc_buf_scattered_gt32",
-                },
+                // `references_for_runs` reaches this only for a window it could
+                // not tile at all — an empty page list, a zero length, an
+                // overflowing range. A merely scattered window is now a success
+                // with several runs, counted above.
+                MapRefusal::Scattered { .. } => "zc_buf_untileable",
             });
             None
         }
+    }
+}
+
+/// Band a window's stretch count for the census.
+///
+/// Banded, not exact: what these decide is how many copy regions a window costs
+/// the GPU gather, which is a question about the order of magnitude. An exact
+/// count would also need an unbounded set of static strings, which
+/// `note_store_route` does not take.
+///
+/// The bands are the ones a driven boot was first measured in, kept so a later
+/// reading is comparable with that one: 42 windows at 3-4 stretches, 4 322 at
+/// 5-8, **370 716 at 9-32** and 1 261 above — and nothing at all at one or two,
+/// which is what made the single-reference rail unreachable.
+fn band_runs(runs: usize) -> &'static str {
+    match runs {
+        0..=1 => "zc_buf_runs_1",
+        2 => "zc_buf_runs_2",
+        3..=4 => "zc_buf_runs_3_4",
+        5..=8 => "zc_buf_runs_5_8",
+        9..=32 => "zc_buf_runs_9_32",
+        _ => "zc_buf_runs_gt32",
     }
 }
 

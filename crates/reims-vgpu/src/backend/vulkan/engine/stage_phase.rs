@@ -46,18 +46,24 @@
 //!
 //! The `runs` row's fix is therefore not "move fewer bytes" — the bytes are the
 //! guest's vertex data and every one of them is needed. It is to stop the *CPU*
-//! moving them. Those bytes are already reachable by the GPU: the host-pointer
-//! import covers the whole RAMBlock, so a gather is `vkCmdCopyBuffer` out of the
-//! import into a pooled destination, and `guest_page_window`'s census says the
-//! windows need **9 to 32 regions** to express (98.5 % of them), against the 507
-//! the guest-page writeback already submits per frame without difficulty.
+//! moving them, which is what `exec`'s `gather_guest_buffer_window` now does:
+//! the host-pointer import covers the whole RAMBlock, so a scattered window is
+//! one `vkCmdCopyBuffer` per stretch out of that import into a device-local
+//! destination, recorded ahead of the draw's own render pass.
 //!
-//! The reason no bind takes that path today is not the mechanism but the shape:
-//! `GuestRunSource::pages` is a single `GuestRef`, so a window that is not one
-//! GPA-contiguous stretch has nowhere to go and falls to this memcpy —
-//! `zc_buffer_imported` was **0** against `zc_buffer_gathered` 371 422 on the
-//! same boot. `guest_ram_map::references_for_runs` is the widening that already
-//! exists for the writeback.
+//! What had kept every bind on this memcpy was the shape and not the mechanism:
+//! `GuestRunSource::pages` was a single `GuestRef`, so a window that is not one
+//! GPA-contiguous stretch had nowhere to go — and none of them is one, because
+//! the guest backs a surface in 16 KiB granules. `zc_buffer_imported` read **0**
+//! against `zc_buffer_gathered` 371 422 on the same boot. It is a list of
+//! stretches now, from `guest_ram_map::references_for_runs`.
+//!
+//! So a reading of `runs_us` on a host that can import is no longer this rail's
+//! whole traffic: it is the windows the gather turned away plus every window on
+//! a host without `VK_EXT_external_memory_host`, and `buffer_guest_gathers`
+//! beside it is the rest. Read both. A `runs_us` that has not moved on a capable
+//! host means the gather is declining, and `zc_buf_gather_wide` and the
+//! `zc_buf_runs_*` bands say why.
 //!
 //! Timings here are wall clock on a shared machine and are upper bounds; the
 //! counts and byte totals are not.

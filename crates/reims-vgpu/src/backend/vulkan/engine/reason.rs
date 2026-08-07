@@ -151,6 +151,8 @@ pub enum DrawReason {
     NoDeviceLocalMemoryForDepth { memory_type_bits: u32 },
     /// No device-local memory type for the guest writeback's detiling scratch.
     NoDeviceLocalMemoryForGuestScratch { memory_type_bits: u32 },
+    /// No device-local memory type for a draw-time guest gather destination.
+    NoDeviceLocalMemoryForGuestGather { memory_type_bits: u32 },
     /// `VK_KHR_swapchain` is not enabled on the engine device.
     SwapchainUnavailable,
     /// The engine's queue family cannot present to the host window's surface.
@@ -201,6 +203,9 @@ impl crate::observe::Decline for DrawReason {
             Self::NoDeviceLocalMemoryForDepth { .. } => "no_device_local_memory_for_depth",
             Self::NoDeviceLocalMemoryForGuestScratch { .. } => {
                 "no_device_local_memory_for_guest_scratch"
+            }
+            Self::NoDeviceLocalMemoryForGuestGather { .. } => {
+                "no_device_local_memory_for_guest_gather"
             }
             Self::SwapchainUnavailable => "swapchain_unavailable",
             Self::QueueCannotPresent { .. } => "queue_cannot_present",
@@ -254,7 +259,8 @@ impl std::fmt::Display for DrawReason {
             | Self::NoDeviceLocalMemoryForSlab { memory_type_bits }
             | Self::NoDeviceLocalMemoryForMrtSecondary { memory_type_bits }
             | Self::NoDeviceLocalMemoryForDepth { memory_type_bits }
-            | Self::NoDeviceLocalMemoryForGuestScratch { memory_type_bits } => {
+            | Self::NoDeviceLocalMemoryForGuestScratch { memory_type_bits }
+            | Self::NoDeviceLocalMemoryForGuestGather { memory_type_bits } => {
                 write!(f, " memory_type_bits={memory_type_bits:#x}")
             }
             Self::QueueCannotPresent { queue_family } => write!(f, " queue_family={queue_family}"),

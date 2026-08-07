@@ -1491,19 +1491,34 @@ pub struct GuestRunSource {
     /// Guest row stride in texels for the buffer→image copy
     /// (`bufferRowLength`); 0 = tight rows.
     pub row_length_texels: u32,
-    /// The same bytes [`Self::runs`] cover, as a bounded reference into this
-    /// process's import of the RAMBlock behind them.
+    /// The same bytes [`Self::runs`] cover, as bounded references into this
+    /// process's import of the RAMBlock behind them — one per maximal
+    /// GPA-contiguous stretch, ascending, tiling the window exactly.
     ///
     /// Separate from [`GuestRun`] because a run is a *host-pointer* span the CPU
-    /// gather walks, while this is an offset the GPU binds. Keeping both lets one
-    /// source feed either without reconstructing the other's view.
+    /// gather walks, while these are offsets the GPU binds or copies from.
+    /// Keeping both lets one source feed either without reconstructing the
+    /// other's view.
+    ///
+    /// # Why a list and not one reference
+    ///
+    /// It was one, and a driven boot found the consequence: the guest backs a
+    /// surface in 16 KiB physically-contiguous granules, so a draw-time buffer
+    /// window is 9-32 stretches 98.5 % of the time and **never** one. A single
+    /// reference could therefore only ever be `None`, and every bind on a host
+    /// whose `vk_caps` said `host_pointer_import=supported` still fell to the
+    /// CPU gather — 371 422 of them against 0 imports. A one-element list is
+    /// still the direct bind, and a longer one is a GPU copy per stretch, which
+    /// is what [`crate::backend::vulkan::engine::exec`] does with it.
     ///
     /// `None` is the honest answer for a synthetic source — a test fixture over
-    /// a host `Vec` has no guest pages — for a host that cannot import, and for
-    /// a page list that is not one contiguous bind range. The gather path needs
-    /// only [`GuestRun::host_ptr`] and is unaffected either way; this is what
-    /// lets the GPU read the same bytes with no CPU gather at all.
-    pub pages: Option<crate::runtime::guest_ram::GuestRef>,
+    /// a host `Vec` has no guest pages — and for a host that cannot import at
+    /// all. The CPU gather path needs only [`GuestRun::host_ptr`] and is
+    /// unaffected either way.
+    ///
+    /// `Arc` because a source is cloned per bind and these are shared, immutable
+    /// and never rebuilt.
+    pub pages: Option<std::sync::Arc<Vec<crate::runtime::guest_ram_map::GuestWindowRun>>>,
 }
 
 /// Producer-assigned identity + generation for CPU-sourced sampled content.

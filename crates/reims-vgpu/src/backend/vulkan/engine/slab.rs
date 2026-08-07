@@ -286,7 +286,7 @@ const SMALL_SLAB_SIZE: u64 = 8 << 20;
 /// straight back — so the small working set, which
 /// [`MemBlock::small`] describes as the *stable* one, re-paid an 8 MiB
 /// `vkAllocateMemory` on its next carve. That is the allocation this budget
-/// exists to prevent. [`super::host_slab`] reached the same conclusion first and
+/// exists to prevent. [`super::buffer_slab`] reached the same conclusion first and
 /// states it at its own `empty_block_victims`.
 const SLAB_KEEP_EMPTY: usize = 2;
 
@@ -368,7 +368,7 @@ impl SlabPool {
     /// VRAM", which is the question every reclaim-policy decision here runs into.
     ///
     /// Exact for what it covers and honest about what it does not: this is the
-    /// DEVICE_LOCAL *image* slab only. HOST_VISIBLE staging (`host_slab`),
+    /// DEVICE_LOCAL *image* slab only. HOST_VISIBLE staging (`buffer_slab`),
     /// standalone compute-storage allocations, imported guest RAM and the present
     /// path's own allocations are outside it. It is the pool the render-target
     /// population actually lands in, which is why it is the one worth having
@@ -726,7 +726,7 @@ impl SlabPool {
     /// size class**, not `keep` in total.
     ///
     /// Same rule and same reason as
-    /// [`super::host_slab::HostSlabPool::empty_block_victims`], which is where
+    /// [`super::buffer_slab::BufferSlabPool::empty_block_victims`], which is where
     /// it was written down first. Pure — split out so the selection is
     /// unit-testable without a device.
     fn empty_block_victims(&self, keep: usize) -> Vec<usize> {
@@ -823,6 +823,15 @@ pub enum SlabDecline {
         offset: u64,
         size: u64,
     },
+    /// A [`super::buffer_slab::BufferSlabToken`] was handed to a pool of a
+    /// different [`super::buffer_slab::SlabKind`] than the one that carved it.
+    /// Block indices are per pool, so accepting it would insert an overlap into
+    /// a live block's free list.
+    ReleaseWrongPool {
+        token_kind: &'static str,
+        pool_kind: &'static str,
+        block: u32,
+    },
 }
 
 impl crate::observe::Decline for SlabDecline {
@@ -837,6 +846,7 @@ impl crate::observe::Decline for SlabDecline {
             Self::ReleaseRangeOverflow { .. } => "vk_slab_release_range_overflow",
             Self::ReleaseRangeOutOfBounds { .. } => "vk_slab_release_range_out_of_bounds",
             Self::ReleaseRangeAlreadyFree { .. } => "vk_slab_release_range_already_free",
+            Self::ReleaseWrongPool { .. } => "vk_slab_release_wrong_pool",
         }
     }
 
@@ -898,6 +908,15 @@ impl crate::observe::Decline for SlabDecline {
                 ("size", size.to_string()),
                 ("block_size", block_size.to_string()),
             ],
+            Self::ReleaseWrongPool {
+                token_kind,
+                pool_kind,
+                block,
+            } => vec![
+                ("token_kind", (*token_kind).to_string()),
+                ("pool_kind", (*pool_kind).to_string()),
+                ("block", block.to_string()),
+            ],
         }
     }
 }
@@ -918,7 +937,7 @@ mod tests {
     /// the stable one, re-paid a `vkAllocateMemory` on its next carve. That is
     /// the allocation the budget exists to prevent.
     ///
-    /// The same assertions `host_slab`'s `the_empty_spare_budget_is_per_size_class`
+    /// The same assertions `buffer_slab`'s `the_empty_spare_budget_is_per_size_class`
     /// makes, on the allocator that did not have them.
     #[test]
     fn the_empty_spare_budget_is_per_size_class() {

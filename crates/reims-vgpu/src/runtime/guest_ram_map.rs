@@ -166,6 +166,34 @@ struct Resolved {
     refusal: Option<MapRefusal>,
 }
 
+impl Resolved {
+    /// Turn one guest physical address and length into a bindable reference.
+    ///
+    /// The single implementation, so the one-span and the whole-window entry
+    /// points cannot disagree about which import owns a GPA or which refusal a
+    /// miss earns. Takes no lock of its own — the caller is already inside
+    /// [`with_map`], which is what lets a scattered window resolve every run
+    /// under one acquisition.
+    ///
+    /// [`Self::refusal`] is **not** re-checked here: an entry point asks it once
+    /// before walking, and asking again per run would emit the same standing
+    /// refusal N times for one window.
+    fn reference(&self, gpa: u64, len: u64) -> Result<GuestRef, MapRefusal> {
+        let import = self
+            .imports
+            .iter()
+            .find(|i| i.contains_gpa(gpa))
+            .ok_or(MapRefusal::GpaNotInAnyImport { gpa })
+            .map_err(report_once)?;
+        // `slice_for_gpa` emits its own named refusal on the fail channel, so
+        // the wrapper forwards the reason rather than adding a second line.
+        let slice = import
+            .slice_for_gpa(gpa, len)
+            .map_err(MapRefusal::OutsideImport)?;
+        GuestRef::new(Arc::clone(import), slice).map_err(MapRefusal::OutsideImport)
+    }
+}
+
 /// Forget every import.
 ///
 /// Called when the backend tears its device down. The next reference rebuilds,
@@ -230,18 +258,7 @@ pub fn reference<H: HostOps + ?Sized>(
         if let Some(refusal) = resolved.refusal {
             return Err(report_once(refusal));
         }
-        let import = resolved
-            .imports
-            .iter()
-            .find(|i| i.contains_gpa(gpa))
-            .ok_or(MapRefusal::GpaNotInAnyImport { gpa })
-            .map_err(report_once)?;
-        // `slice_for_gpa` emits its own named refusal on the fail channel, so
-        // the wrapper forwards the reason rather than adding a second line.
-        let slice = import
-            .slice_for_gpa(gpa, len)
-            .map_err(MapRefusal::OutsideImport)?;
-        GuestRef::new(Arc::clone(import), slice).map_err(MapRefusal::OutsideImport)
+        resolved.reference(gpa, len)
     })
 }
 
@@ -284,6 +301,15 @@ pub struct GuestWindowRun {
 /// the consumer's region array, and a cap in this function would silently hand
 /// back a partial window — the failure mode that loses guest work quietly. A
 /// consumer that cannot issue N copies must refuse by name on the count it got.
+///
+/// # One lock for the whole window
+///
+/// The resolution is behind a mutex, and this runs on the draw-time buffer rail
+/// at ~16 000 windows a second of ~16 runs each. Resolving each run through
+/// [`reference`] would take and drop that mutex a quarter of a million times a
+/// second for an answer that cannot change inside one call, so the walk happens
+/// inside a single [`with_map`] instead. [`reference`] keeps its own lock for
+/// the callers that resolve exactly one span.
 pub fn references_for_runs<H: HostOps + ?Sized>(
     host: &mut H,
     gpas: &[u64],
@@ -291,9 +317,6 @@ pub fn references_for_runs<H: HostOps + ?Sized>(
     in_page: u64,
     len: u64,
 ) -> Result<Vec<GuestWindowRun>, MapRefusal> {
-    if let Some(refusal) = standing_refusal(host) {
-        return Err(report_once(refusal));
-    }
     if gpas.is_empty() || page_size == 0 || len == 0 {
         return Err(report_once(MapRefusal::Scattered {
             pages: gpas.len(),
@@ -311,33 +334,39 @@ pub fn references_for_runs<H: HostOps + ?Sized>(
         first: gpas[0],
     })?;
 
-    let mut out = Vec::new();
-    for run in crate::runtime::gva_view::contig_page_runs(gpas, page_size) {
-        let run_start = (run.start as u64) * page_size;
-        let run_end = (run.end as u64) * page_size;
-        // Clip to the window: the first run usually starts before it (the
-        // window begins `in_page` bytes in) and the last usually ends after it.
-        let start = run_start.max(window_start);
-        let end = run_end.min(window_end);
-        if start >= end {
-            continue;
+    with_map(host, |resolved| {
+        if let Some(refusal) = resolved.refusal {
+            return Err(report_once(refusal));
         }
-        // Within a run the GPAs are contiguous by construction, so one add
-        // reaches any byte of it.
-        let gpa = gpas[run.start] + (start - run_start);
-        out.push(GuestWindowRun {
-            window_offset: start - window_start,
-            guest: reference(host, gpa, end - start)?,
-        });
-    }
-    if out.is_empty() {
-        return Err(report_once(MapRefusal::Scattered {
-            pages: gpas.len(),
-            runs: 0,
-            first: gpas[0],
-        }));
-    }
-    Ok(out)
+        let mut out = Vec::new();
+        for run in crate::runtime::gva_view::contig_page_runs(gpas, page_size) {
+            let run_start = (run.start as u64) * page_size;
+            let run_end = (run.end as u64) * page_size;
+            // Clip to the window: the first run usually starts before it (the
+            // window begins `in_page` bytes in) and the last usually ends after
+            // it.
+            let start = run_start.max(window_start);
+            let end = run_end.min(window_end);
+            if start >= end {
+                continue;
+            }
+            // Within a run the GPAs are contiguous by construction, so one add
+            // reaches any byte of it.
+            let gpa = gpas[run.start] + (start - run_start);
+            out.push(GuestWindowRun {
+                window_offset: start - window_start,
+                guest: resolved.reference(gpa, end - start)?,
+            });
+        }
+        if out.is_empty() {
+            return Err(report_once(MapRefusal::Scattered {
+                pages: gpas.len(),
+                runs: 0,
+                first: gpas[0],
+            }));
+        }
+        Ok(out)
+    })
 }
 
 /// [`reference`] for a decoded page list: `len` bytes starting `in_page` bytes

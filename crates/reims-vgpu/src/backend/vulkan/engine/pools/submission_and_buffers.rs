@@ -79,6 +79,8 @@ impl ResourcePools {
         Self {
             staging_free: HashMap::new(),
             staging_live: Vec::new(),
+            gather_free: HashMap::new(),
+            gather_live: Vec::new(),
             staging_hits: 0,
             staging_misses: 0,
             staging_miss_bins: [0; STAGING_BUCKET_BINS],
@@ -125,7 +127,7 @@ impl ResourcePools {
             target_free: FreePool::new(TARGET_FREE_CAP_PER_KEY, TARGET_FREE_CAP_TOTAL),
             open_batch: None,
             slab: slab::SlabPool::new(),
-            host_slab: host_slab::HostSlabPool::new(),
+            slabs: buffer_slab::BufferSlabs::new(),
             host_ram_imports: host_ram::HostRamImports::default(),
             guest_reads_in_flight: false,
             initialized: false,
@@ -242,14 +244,26 @@ impl ResourcePools {
                 let Some(slot) = pop_largest_pool_entry(&mut self.staging_free) else {
                     break;
                 };
-                release_buffer_slot(device, &mut self.host_slab, slot);
+                release_buffer_slot(device, &mut self.slabs, slot);
                 buf_trimmed += 1;
             }
             while buf_trimmed < max {
                 let Some(slot) = pop_largest_pool_entry(&mut self.readback_free) else {
                     break;
                 };
-                release_buffer_slot(device, &mut self.host_slab, slot);
+                release_buffer_slot(device, &mut self.slabs, slot);
+                buf_trimmed += 1;
+            }
+            // The gather pool is under the same budget and the same settled-idle
+            // gate as the two above, for the same reason: its refill is a slab
+            // carve that only costs anything when it lands on a new block, and
+            // trimming it mid-workload would buy back VRAM at the price of that
+            // block allocation under the engine lock.
+            while buf_trimmed < max {
+                let Some(slot) = pop_largest_pool_entry(&mut self.gather_free) else {
+                    break;
+                };
+                release_buffer_slot(device, &mut self.slabs, slot);
                 buf_trimmed += 1;
             }
             // Returning the carves above is what lets an upload block empty;
@@ -262,8 +276,8 @@ impl ResourcePools {
             // working set, and what a quiet desktop keeps is one spare block per
             // size class — tens of MiB against the ~177 MiB of frozen staging
             // this trim was written for.
-            self.host_slab
-                .trim_empty_blocks(device, HOST_SLAB_IDLE_KEEP_EMPTY);
+            self.slabs
+                .trim_empty_blocks(device, BUFFER_SLAB_IDLE_KEEP_EMPTY);
             // The standalone (non-slab) compute-storage recycle pool re-allocs via
             // a full `vkAllocateMemory` on the next dispatch — like the buffer
             // pools above and unlike the slab-backed image pools (cheap
@@ -1028,6 +1042,7 @@ impl ResourcePools {
         PendingGpuCleanup {
             dsets,
             staging: std::mem::take(&mut self.staging_live),
+            gather: std::mem::take(&mut self.gather_live),
             readback,
             sampled: std::mem::take(&mut self.sampled_live),
             storage_images: std::mem::take(&mut self.storage_image_live),
@@ -1282,6 +1297,10 @@ impl ResourcePools {
             let bucket = Self::bucket(slot.size);
             self.staging_free.entry(bucket).or_default().push(slot);
         }
+        for slot in pending.gather.drain(..) {
+            let bucket = Self::bucket(slot.size);
+            self.gather_free.entry(bucket).or_default().push(slot);
+        }
         for slot in pending.readback.drain(..) {
             let bucket = Self::bucket(slot.size);
             self.readback_free.entry(bucket).or_default().push(slot);
@@ -1463,13 +1482,14 @@ impl ResourcePools {
         // lands in a block this bind can legally use; `mt` stays here because
         // the slot still has to report that type's caching.
         let token = self
-            .host_slab
+            .slabs
+            .upload()
             .acquire(ctx, &req, counters)
             .inspect_err(|_| ctx.device.destroy_buffer(buffer, None))?;
         ctx.device
             .bind_buffer_memory(buffer, token.memory, token.offset())
             .map_err(|e| {
-                self.host_slab.release(&ctx.device, token);
+                self.slabs.release(&ctx.device, token);
                 ctx.device.destroy_buffer(buffer, None);
                 DrawError::VkCall(VkCall::new(VkOp::PoolsBindStaging, e))
             })?;
@@ -1482,7 +1502,7 @@ impl ResourcePools {
             // the pool's whole point is that the allocation outlives the bind,
             // and now so does the mapping of the block behind it.
             mapped: token.mapped,
-            backing: BufferBacking::HostSlab(token),
+            backing: BufferBacking::Slab(token),
             // `MemoryClass::Upload` requires HOST_COHERENT, so a staging write
             // needs no flush and the persistent mapping above is sound.
             coherent: true,
@@ -1493,6 +1513,85 @@ impl ResourcePools {
         };
         self.staging_live.push(slot);
         self.note_staging_miss(bucket, miss_started.elapsed().as_micros() as u64);
+        Ok(slot)
+    }
+
+    /// A DEVICE_LOCAL buffer of at least `size` bytes for the draw-time guest
+    /// gather to assemble a scattered window into.
+    ///
+    /// Same shape as [`Self::acquire_staging`] — power-of-two buckets, a free
+    /// list, a slab carve on a miss, and the ring returns it when the fence
+    /// retires — because it has the same lifetime and the same size
+    /// distribution. What differs is the memory: these are read by the draw and
+    /// never by the CPU, so they carry no mapping and come from the
+    /// device-local slab.
+    ///
+    /// # Why the usage superset matches staging's
+    ///
+    /// A gather destination stands in for exactly the slot the CPU gather would
+    /// have taken, and a draw deduplicates its binds by content — the same
+    /// window bound as a vertex stream and as a storage buffer resolves to one
+    /// buffer. So a slot must be legal for either, or the free list would have
+    /// to be keyed by usage and would miss on the crossover.
+    pub(crate) unsafe fn acquire_guest_gather(
+        &mut self,
+        ctx: &DeviceContext,
+        size: u64,
+        usage: vk::BufferUsageFlags,
+        counters: &EngineCounters,
+    ) -> Result<BufferSlot, DrawError> {
+        let bucket = Self::bucket(size.max(4));
+        if let Some(list) = self.gather_free.get_mut(&bucket) {
+            if let Some(slot) = list.pop() {
+                self.gather_live.push(slot);
+                return Ok(slot);
+            }
+        }
+        let buffer = ctx
+            .device
+            .create_buffer(
+                &vk::BufferCreateInfo::default()
+                    .size(bucket)
+                    .usage(
+                        usage
+                            | vk::BufferUsageFlags::TRANSFER_DST
+                            | vk::BufferUsageFlags::VERTEX_BUFFER
+                            | vk::BufferUsageFlags::INDEX_BUFFER
+                            | vk::BufferUsageFlags::STORAGE_BUFFER,
+                    )
+                    .sharing_mode(vk::SharingMode::EXCLUSIVE),
+                None,
+            )
+            .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::PoolsCreateGuestGather, e)))?;
+        counters.note_create();
+        let req = ctx.device.get_buffer_memory_requirements(buffer);
+        let token = self
+            .slabs
+            .gather()
+            .acquire(ctx, &req, counters)
+            .inspect_err(|_| ctx.device.destroy_buffer(buffer, None))?;
+        ctx.device
+            .bind_buffer_memory(buffer, token.memory, token.offset())
+            .map_err(|e| {
+                self.slabs.release(&ctx.device, token);
+                ctx.device.destroy_buffer(buffer, None);
+                DrawError::VkCall(VkCall::new(VkOp::PoolsBindGuestGather, e))
+            })?;
+        let slot = BufferSlot {
+            buffer,
+            memory: token.memory,
+            size: bucket,
+            // Device-local blocks are not mapped, and nothing on this rail reads
+            // these bytes with the CPU. A non-zero value here would be a host
+            // address into memory that may not be host-visible at all.
+            mapped: 0,
+            backing: BufferBacking::Slab(token),
+            // Neither field is consulted for a slot the CPU never touches: both
+            // decide flush and invalidate behaviour on the mapped paths.
+            coherent: false,
+            cached: false,
+        };
+        self.gather_live.push(slot);
         Ok(slot)
     }
 
@@ -1798,7 +1897,7 @@ impl ResourcePools {
             if slot.size >= size {
                 return Ok(slot.buffer);
             }
-            release_buffer_slot(&ctx.device, &mut self.host_slab, slot);
+            release_buffer_slot(&ctx.device, &mut self.slabs, slot);
             self.guest_scratch = None;
         }
         let buffer = ctx
@@ -3470,6 +3569,7 @@ mod recycle_tests {
             pending: Some(PendingGpuCleanup {
                 dsets: Vec::new(),
                 staging: Vec::new(),
+                gather: Vec::new(),
                 readback: Vec::new(),
                 sampled: Vec::new(),
                 storage_images: Vec::new(),

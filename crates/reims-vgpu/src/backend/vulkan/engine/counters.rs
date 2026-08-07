@@ -250,6 +250,19 @@ engine_counters! {
         /// `stage_phase` `runs_*` bars, which are what the CPU still gathers.
         buffer_guest_imports,
         buffer_guest_import_bytes,
+        /// Vertex/storage buffer binds the GPU assembled out of the guest's own
+        /// pages, one `VkBufferCopy` per GPA-contiguous stretch, into a
+        /// device-local destination the draw then binds.
+        ///
+        /// The disposition between `buffer_guest_imports` (nothing copied) and
+        /// the `stage_phase` `runs_*` bars (the CPU copied). Bytes are what the
+        /// copies name, which is what the CPU no longer moves; regions divided
+        /// by gathers is the mean stretch count, which is the number that says
+        /// whether `MAX_GUEST_GATHER_REGIONS` still has headroom over the
+        /// workload.
+        buffer_guest_gathers,
+        buffer_guest_gather_bytes,
+        buffer_guest_gather_regions,
         sampled_cache_hits,
         sampled_identity_hits,
         sampled_cache_hit_bytes,
@@ -483,6 +496,14 @@ impl EngineCounters {
         self.buffer_guest_imports.fetch_add(1, Ordering::Relaxed);
         self.buffer_guest_import_bytes
             .fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub fn note_buffer_guest_gather(&self, bytes: u64, regions: u64) {
+        self.buffer_guest_gathers.fetch_add(1, Ordering::Relaxed);
+        self.buffer_guest_gather_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+        self.buffer_guest_gather_regions
+            .fetch_add(regions, Ordering::Relaxed);
     }
 
     /// Record how much of its target one draw could have written.
