@@ -451,7 +451,7 @@ SSH on `localhost:2222` (`macos-vm` in `~/.ssh/config`) for its whole life, so a
 its own boot:
 
 ```sh
-pkill -f 'qemu-system-x86_64.*reims-vgpu'; rm -f /tmp/reims-vgpu-fail.log
+pkill -f 'qemu-system-x86_6[4].*reims-vgpu'; rm -f /tmp/reims-vgpu-fail.log
 vm/boot-x86.sh --device reims-vgpu-pci --testing &     # ~7 min before its own hard kill
 until [ -f /tmp/reims-vgpu-fail.log ] && ssh macos-vm true; do sleep 5; done
 scripts/window-drag-probe/window-drag-probe.sh --seconds 25 --app Safari
@@ -459,6 +459,14 @@ scripts/window-drag-probe/window-drag-probe.sh --seconds 25 --app Safari
 
 That produces real window-server compositing, against 0 draws/s idle. The probe refuses a verdict if
 the window never moved, so a run that produced no motion cannot be mistaken for a slow device.
+
+**Bracket one character of every `pkill -f` pattern**, as `x86_6[4]` does above and as
+`reims_vgp[u]-` does further down. `pkill -f` matches against whole command lines, and the shell
+running the `pkill` has the pattern in *its* command line, so an unbracketed pattern matches the
+process issuing it and the shell kills itself before `pkill` ever reaches QEMU. The bracket changes
+the pattern text without changing what it matches. The failure is easy to misread as "the command
+worked": the shell dies with status 144 and the surviving QEMU then holds `localhost:2222`, so the
+*next* boot dies on the `hostfwd` rule for the reason described below. Two symptoms, one cause.
 
 **Wait on the fail log, not on SSH alone.** The previous boot's QEMU outlives its script by long
 enough to still hold `localhost:2222`, and a new boot that loses that race dies on the `hostfwd` rule
