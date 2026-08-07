@@ -274,6 +274,16 @@ success hides a whole family of lost records behind a green run.
 
 ### Reading the fail log
 
+- **Count the boots before ranking anything.** The device appends and never truncates, so a log you
+  did not just create may hold several boots of several builds. `grep -c vk_caps` is the boot count:
+  one line per device creation. This is not the check below for "a boot's log and not the test
+  suite's", and it fails in the opposite direction — the log *is* a real boot's, it is also three
+  other boots'. It inflates in a way that reads as a finding rather than as noise, because
+  `first_sight` latches per process: one refusal seen once per boot arrives as N identical-keyed
+  lines and looks like a decoder failing thousands of times. A stale log ranked this way named two
+  documented healthy-zero decoders as firing ~96 000 times between them; a clean driven boot on the
+  same tree put both at zero. **`rm -f /tmp/reims-vgpu-fail.log` before the boot** and the question
+  never arises.
 - **Volume is not alarm.** Most records are on the `OFF` channel, and the highest-volume tags are a
   1 Hz heartbeat. That is cadence working, not an over-eager emitter.
 - **Absence of a decode line proves nothing.** Every decoder in `decode/` is silent on success and

@@ -109,6 +109,14 @@ echo "runtime-dead: building (instrumented) ..."
 }
 rm -f "$OUT_DIR"/reims-*.profraw
 
+# The device appends to this and never truncates it, so a run that leaves the
+# previous boot's records in place produces a log holding several boots of
+# several builds. Nothing in a merged log says where one ends: `first_sight`
+# latches per process, so the same refusal reappears once per boot and reads as
+# a decoder failing thousands of times rather than as one line seen N times.
+# A reader who ranks `reason=` on that file is ranking history.
+rm -f /tmp/reims-vgpu-fail.log
+
 echo "runtime-dead: booting (instrumented) ..."
 "$REPO_ROOT/vm/boot-x86.sh" --device reims-vgpu-pci --testing > "$OUT_DIR/boot.log" 2>&1 &
 
