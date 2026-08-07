@@ -1335,6 +1335,64 @@ fn a_level_record_the_body_does_not_reach_is_reported_not_dropped() {
     );
 }
 
+/// The type-7 header states its payload length twice, and a record where the
+/// two disagree says so.
+///
+/// The declared length at `+4` covers the header plus the payload padded to
+/// four; the fourth header word is the same payload unpadded. The second was
+/// called `word3` and carried no doc, which made a field with a derivable
+/// meaning look like one nobody had identified.
+///
+/// Most fixtures in this file leave the word zero and so trip the line — that is
+/// why it reports rather than refuses, and why a future promotion to a refusal
+/// has to fix the fixtures first rather than only measure a boot.
+#[test]
+fn a_type7_header_states_its_payload_length_twice_and_says_when_they_disagree() {
+    use crate::contract::endian::st32;
+
+    // A minimal classic pipeline: header, then a one-field TLV block of seven
+    // bytes, padded to eight by the declared length.
+    let mut b = vec![0u8; 16 + 8];
+    let blen = b.len() as u32;
+    st32(&mut b[0..], TYPE7_OBJECT_RENDER_PIPELINE);
+    st32(&mut b[4..], blen);
+    st32(&mut b[8..], 3);
+    st32(&mut b[12..], 7);
+    b[16] = 1;
+    b[17] = PIPELINE_TAG_VERTEX_FUNC;
+    b[18] = 4;
+    st32(&mut b[19..], 5);
+
+    let cap = crate::observe::FailCapture::start();
+    let d = decode_render_pipeline_descriptor(&b).expect("decodes");
+    assert_eq!(d.serialized_payload_len, 7);
+    assert_eq!(d.vertex_func_ref, 5);
+    assert!(
+        !cap.lines()
+            .iter()
+            .any(|l| l.contains("type7_payload_len_disagrees")),
+        "7 rounds up to 8 and 16 + 8 is the declared length, so the two agree: \
+         {:?}",
+        cap.lines()
+    );
+
+    // One byte too long to round up to the same padded length.
+    st32(&mut b[12..], 9);
+    let cap2 = crate::observe::FailCapture::resume();
+    decode_render_pipeline_descriptor(&b).expect("still decodes: nothing is refused");
+    let lines = cap2.lines();
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("type7_payload_len_disagrees")
+                && l.contains("payload=9")
+                && l.contains("declared=24")
+                && l.contains("expected=28")),
+        "a disagreement must name both lengths and what the declared one would \
+         have to be: {lines:?}"
+    );
+}
+
 #[test]
 fn compact_render_pipeline_funcs() {
     use crate::contract::endian::st32;

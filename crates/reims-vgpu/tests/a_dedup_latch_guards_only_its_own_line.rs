@@ -174,7 +174,7 @@ const ROWS: &[(&str, usize, Guarded, &str)] = &[
     ),
     (
         "reims-vgpu/src/runtime/decode/resource/mod.rs",
-        12,
+        13,
         Guarded::EmitsOnly,
         "the type-7 colour-attachment, pipeline-block and vertex-descriptor \
          reporters. Four sites \
@@ -188,7 +188,10 @@ const ROWS: &[(&str, usize, Guarded, &str)] = &[
          scan's helpers, and it too decides only whether a line is written. The \
          twelfth is `type7_vertex_block_inferred`, whose whole function body is \
          the guarded `observe::off` — its caller decides which offset the vertex \
-         block comes from before calling it, and calls it only to say so",
+         block comes from before calling it, and calls it only to say so. The \
+         thirteenth is `type7_payload_len_disagrees`, the same shape: the \
+         function returns early when the two header lengths agree and the latch \
+         guards only the line for when they do not",
     ),
     (
         "reims-vgpu/src/runtime/drain/mod.rs",

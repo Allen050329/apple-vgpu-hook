@@ -653,7 +653,20 @@ pub struct PipelineColorAttachment {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RenderPipelineDescriptor {
     pub object_id: u32,
-    pub word3: u32,
+    /// The fourth header word: the serialized property list's length **before**
+    /// the four-byte padding the declared length includes.
+    ///
+    /// It was called `word3` and carried no doc for as long as it has been
+    /// decoded, which made it indistinguishable from a field nobody had
+    /// identified. It is not: the header is `objType`, declared length, the new
+    /// object's ref, and this — and the declared length is exactly
+    /// [`TYPE7_FIRST_TLVS`] plus this rounded up to four.
+    ///
+    /// That relation is checkable from the header alone, which is what
+    /// [`note_type7_payload_len`] does. Nothing else reads the field: the walks
+    /// below bound themselves on the *declared* length, which is the larger of
+    /// the two and the one that describes the bytes actually present.
+    pub serialized_payload_len: u32,
     pub vertex_func_ref: u32,
     pub fragment_func_ref: u32,
     /// Object-stage function ref (mesh SPI shape: tag `0x01`).
@@ -2346,9 +2359,10 @@ pub fn decode_render_pipeline_descriptor(
     }
     let mut out = RenderPipelineDescriptor {
         object_id: ld32(&bytes[8..]),
-        word3: ld32(&bytes[12..]),
+        serialized_payload_len: ld32(&bytes[12..]),
         ..Default::default()
     };
+    note_type7_payload_len("render", out.serialized_payload_len, declared);
     let (fields, consumed) = decode_compact_tlv_record(bytes, TYPE7_FIRST_TLVS)?;
     let tag01 = compact_tlv_u32(&fields, PIPELINE_TAG_VERTEX_FUNC).unwrap_or(0);
     let tag02 = compact_tlv_u32(&fields, PIPELINE_TAG_FRAGMENT_FUNC).unwrap_or(0);
@@ -2411,6 +2425,54 @@ pub fn decode_render_pipeline_descriptor(
         }
     }
     Ok(out)
+}
+
+/// The two lengths in a type-7 header disagree about the same payload.
+///
+/// The header states the payload's length twice: the declared length at `+4`
+/// covers the header and the payload padded to four bytes, and
+/// [`RenderPipelineDescriptor::serialized_payload_len`] at `+0xc` is the same
+/// payload unpadded. So `declared == TYPE7_FIRST_TLVS + round_up_4(payload)`
+/// always, and a record where it does not hold is one whose two halves were
+/// written by different ideas of how long it is.
+///
+/// Reported rather than refused, and not because the check is soft. This is a
+/// *newly readable* relation — the field carried no name until it was
+/// identified, so nothing has ever compared the two on live traffic — and this
+/// file's own rule is that a refusal needs its zero measured first. The
+/// colour-attachment walk is the worked example: it reported for as long as it
+/// took to read `unconsumed=0` off driven boots, and only then refused.
+///
+/// Latched on the pair, so a repeating malformed shape names itself once.
+///
+/// **It reads zero on a driven x86/Vulkan boot**, across the twelve distinct
+/// pipeline shapes that boot produces. That is the confirmation the field is
+/// what this doc says: a relation derived from the header holding on every real
+/// record is a stronger reading than any single value would have been.
+///
+/// Promoting it to a refusal needs one more step than a boot, and this is the
+/// trap: most synthetic fixtures in this file leave the word zero, so they trip
+/// the relation and a refusal would fail them wholesale. The fixtures have to
+/// state a payload length first. A reader who measures only the boot will
+/// conclude the promotion is free, and it is not.
+fn note_type7_payload_len(kind: &'static str, payload: u32, declared: usize) {
+    let padded = (payload as usize).next_multiple_of(4);
+    if TYPE7_FIRST_TLVS.checked_add(padded) == Some(declared) {
+        return;
+    }
+    if crate::observe::first_sight(
+        "type7_payload_len_disagrees",
+        ((payload as u64) << 32) | declared as u64,
+    ) {
+        crate::observe::fail(format!(
+            "type7_payload_len kind={kind} reason=type7_payload_len_disagrees \
+             payload={payload} padded={padded} declared={declared} \
+             expected={} (the header states its payload length twice and the \
+             two do not agree; nothing is refused, the walks below bound \
+             themselves on the declared length)",
+            TYPE7_FIRST_TLVS + padded
+        ));
+    }
 }
 
 /// A vertex descriptor found without the wire having said where it starts.
