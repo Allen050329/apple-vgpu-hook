@@ -152,13 +152,52 @@ if [ "$guest_up" -eq 0 ]; then
     exit 1
 fi
 
+# SSH answering is not the app being ready. The boot reverts to a snapshot, so
+# sshd is listening within seconds while the window server is still restoring
+# sessions and $DRIVE_APP has no window yet — and the probe's first act is to
+# read that window's frame. It then exits in about a second with "could not read
+# ... window frame (pos '' size '')", which is not the "window never moved"
+# refusal below but a failure to start at all.
+#
+# That cost a whole ten-minute run: the probe failed, `|| true` swallowed it,
+# the boot was stopped seconds after reaching the desktop, and the only thing
+# that reported a problem was the all-zero guard at the very end. So wait for
+# the window to exist before driving, and make its absence fatal here.
+echo "runtime-dead: waiting for $DRIVE_APP to present a window ..."
+app_ready=0
+for _ in $(seq 1 60); do
+    if ssh -o ConnectTimeout=4 -o BatchMode=yes macos-vm \
+        "osascript -e 'tell application \"$DRIVE_APP\" to activate' \
+                   -e 'delay 1' \
+                   -e 'tell application \"System Events\" to tell process \"$DRIVE_APP\" to get position of window 1'" \
+        >/dev/null 2>&1; then
+        app_ready=1
+        break
+    fi
+    sleep 2
+done
+if [ "$app_ready" -eq 0 ]; then
+    echo "runtime-dead: $DRIVE_APP never presented a window, so nothing would have" >&2
+    echo "runtime-dead: driven the device and this run cannot measure it." >&2
+    kill -TERM "$qemu_pid" 2>/dev/null || true
+    exit 1
+fi
+
 # An undriven boot reaches the desktop and sits there, and its zeros are the
 # idle device's. The probe refuses a verdict if the window never moved, so a run
 # that produced no compositing cannot be mistaken for one that did.
 echo "runtime-dead: driving the guest (${DRIVE_SECONDS}s, $DRIVE_APP) ..."
+drive_ok=1
 "$REPO_ROOT/scripts/window-drag-probe/window-drag-probe.sh" \
-    --seconds "$DRIVE_SECONDS" --app "$DRIVE_APP" > "$OUT_DIR/drive.log" 2>&1 || true
+    --seconds "$DRIVE_SECONDS" --app "$DRIVE_APP" > "$OUT_DIR/drive.log" 2>&1 || drive_ok=0
 tail -1 "$OUT_DIR/drive.log"
+if [ "$drive_ok" -eq 0 ]; then
+    echo "runtime-dead: the drag probe refused a verdict — see $OUT_DIR/drive.log." >&2
+    echo "runtime-dead: coverage from an undriven boot is the idle device's, and its" >&2
+    echo "runtime-dead: zeros read exactly like a kill list. Refusing the run." >&2
+    kill -TERM "$qemu_pid" 2>/dev/null || true
+    exit 1
+fi
 
 echo "runtime-dead: stopping QEMU (SIGTERM — the profile is written at exit) ..."
 kill -TERM "$qemu_pid" 2>/dev/null || true

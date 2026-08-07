@@ -123,6 +123,53 @@ instantiation, so a mangled name reading zero may be one monomorphization of a
 function that ran under another. Check the demangled name against
 `by-file.txt`'s per-file numbers before concluding a whole function is cold.
 
+## Known broken as of 2026-08-07: the boot's own profile writes zero bytes
+
+Two consecutive runs on this host refused to write a report, both at the same
+guard: `the boot's own profile is missing or empty`. The guard is doing its job
+— the run is genuinely unmeasured — but the instrument does not currently
+produce a reading, so **do not read this tool's silence as "nothing is dead"**.
+
+What has been ruled out, so the next attempt does not re-cover it:
+
+- **The profile runtime is linked and works.** The boot script's own short-lived
+  `qemu-system-x86_64` probe invocations each wrote a complete 4 310 352-byte
+  table into the same directory on the same run. Whatever is wrong is specific
+  to the QEMU that ran the device.
+- **It is not the boot script's `SIGKILL`.** `vm/boot-x86.sh`'s `kill_qemu` does
+  `SIGTERM`, `sleep 2`, then `SIGKILL`, which would truncate the write exactly
+  like this — but it announces itself with `boot-x86.sh: killing qemu pid=`, and
+  that line is in neither run's `boot.log`. That fuse never fired.
+- **It is not an undriven boot.** The second run drove Safari for 29 seconds of
+  real compositing (`seconds below 100 Hz: 29/29`) and failed identically.
+- **It is not the probe failing to start.** That was a real and separate bug,
+  fixed below; fixing it did not change this symptom.
+
+The remaining suspect is QEMU's `SIGTERM` path reaching process exit without
+running `atexit` handlers, on a build with a live Vulkan device and host-window
+thread. The file is created and left at zero length, which is what a skipped or
+interrupted writer looks like. The baseline below was taken on an older
+toolchain — this host is now LLVM 22 — so a toolchain change is the other
+candidate, and neither has been confirmed.
+
+## The app has to have a window before the probe starts
+
+SSH answering is not the guest being ready. The boot reverts to a snapshot, so
+`sshd` is listening within seconds while the window server is still restoring
+sessions and the drive app has no window yet. The probe's first act is to read
+that window's frame, so it exited in about a second with
+
+```
+window-drag-probe: could not read Safari's window frame (pos '' size '')
+```
+
+which is **not** the "window never moved" refusal — it is a failure to start at
+all. `|| true` swallowed it, the boot was stopped seconds after reaching the
+desktop, and the only thing that reported a problem was the all-zero guard ten
+minutes later. The script now waits for the app to present a window before
+driving, and treats both that timeout and a probe failure as fatal where they
+happen rather than as a report to refuse at the end.
+
 ## Baseline
 
 First run, `7a7ffec` + the console-paint verdict, x86 / Vulkan / host-window,
