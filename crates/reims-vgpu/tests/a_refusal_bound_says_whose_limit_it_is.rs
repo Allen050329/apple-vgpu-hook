@@ -212,7 +212,7 @@ const ROWS: &[Row] = &[
               inside PER_INSTANCE.",
     },
     Row {
-        at: "reims-vgpu/src/backend/metal/render.rs:1652",
+        at: "reims-vgpu/src/backend/metal/render.rs:1678",
         bound: "REIMS_VGPU_METAL_MAX_COLOR_RTS",
         verdict: Verdict::WireField,
         why: "Metal's eight colour attachments, held equal by a const assertion to \
@@ -220,7 +220,7 @@ const ROWS: &[Row] = &[
               Apple's serialized render-pass record.",
     },
     Row {
-        at: "reims-vgpu/src/backend/metal/render.rs:1662",
+        at: "reims-vgpu/src/backend/metal/render.rs:1688",
         bound: "REIMS_VGPU_METAL_MAX_COLOR_RTS",
         verdict: Verdict::WireField,
         why: "The same eight, tested against a slot number rather than a count: a \
@@ -228,7 +228,7 @@ const ROWS: &[Row] = &[
               to have carried.",
     },
     Row {
-        at: "reims-vgpu/src/backend/metal/render.rs:1747",
+        at: "reims-vgpu/src/backend/metal/render.rs:1773",
         bound: "REIMS_VGPU_BACKEND_MAX_VIEWPORTS",
         verdict: Verdict::ContractLimit,
         why: "Metal's own array width: MSL declares [[viewport_array_index]] as 0 \
@@ -240,7 +240,7 @@ const ROWS: &[Row] = &[
               Metal's rather than a ceiling this device picked.",
     },
     Row {
-        at: "reims-vgpu/src/backend/metal/render.rs:1753",
+        at: "reims-vgpu/src/backend/metal/render.rs:1779",
         bound: "REIMS_VGPU_BACKEND_MAX_SCISSORS",
         verdict: Verdict::ContractLimit,
         why: "The scissor twin of the viewport row above and the same limit for the \

@@ -16,5 +16,6 @@ pub mod mipmap;
 pub mod pass_action;
 pub mod pixel_format;
 pub mod vertex_step;
+pub mod visibility;
 
 pub(crate) use checked::*;

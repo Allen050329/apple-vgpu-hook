@@ -1580,7 +1580,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
         ReimsVgpuViewport, REIMS_VGPU_BINDING_SAMPLER_BASE, REIMS_VGPU_BINDING_TEXTURE_BASE,
         REIMS_VGPU_MTL_PIXEL_FORMAT_DEPTH32_FLOAT, REIMS_VGPU_MTL_PIXEL_FORMAT_STENCIL8,
     };
-    use crate::backend::metal::render::{render_core_mrt, ColorRt};
+    use crate::backend::metal::render::{render_core_mrt, ColorRt, VisibilityQuery};
     use crate::backend::metal::util::ErrOut;
 
     if req.colors.is_empty() {
@@ -2282,6 +2282,13 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
 
     let mut err_buf = [0i8; 256];
     let err: ErrOut<'_> = (err_buf.as_mut_ptr(), err_buf.len());
+    // The guest's offset stays here: the backend answers one draw at a time and
+    // `runtime::exec` sums the answers per offset, which is the same split the
+    // Vulkan rail takes for the same reason.
+    let mut visibility = req.visibility.map(|arming| VisibilityQuery {
+        mode: arming.mode,
+        samples: None,
+    });
     let st = render_core_mrt(
         &vert,
         &frag,
@@ -2313,8 +2320,15 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
         stencil_attach_api.as_mut(),
         blend_opt,
         &mut color_rts,
+        visibility.as_mut(),
         err,
     );
+    // Read before the status is matched, the way `runtime::exec` reads the
+    // field it lands in: the backend only fills `samples` on a pass that ran to
+    // completion, so a refusal leaves the query unanswered and says so.
+    if let Some(query) = visibility.as_ref() {
+        req.visibility_samples = query.samples;
+    }
     // Keep owned storage live through render_core_mrt (ReimsVgpu* hold raw pointers).
     let _ = (
         &vtx_storage,

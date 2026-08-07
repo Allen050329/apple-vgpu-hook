@@ -1500,6 +1500,31 @@ pub struct ColorRt<'a> {
     pub write_mask: u32,
 }
 
+/// The occlusion query a draw is armed with, and the answer the pass recorded.
+///
+/// In and out in one struct because the two halves are one question — "how was
+/// this draw armed, and what did the hardware count" — and the shape a caller
+/// gets wrong is passing the mode and forgetting to read the answer back.
+///
+/// The offset the guest gave stays with the caller. This pass writes into a
+/// host buffer of its own at offset 0 and hands the scalar back, because
+/// `render_core_mrt` encodes exactly one draw per pass: a Metal pass spanning
+/// several draws that share one guest offset becomes N of these, summed above
+/// the backends, the same way the Vulkan rail's per-`DrawRequest` query pool
+/// does.
+pub struct VisibilityQuery {
+    /// `MTLVisibilityResultMode` as the guest sent it. `Disabled` (`0`) is
+    /// refused rather than executed: a query struct exists only where the
+    /// stream armed one, so a disarming ordinal here is a caller defect and
+    /// running the pass unarmed would report a count of zero for a draw that
+    /// was never asked about.
+    pub mode: u32,
+    /// Out: samples the draw passed, or `None` where the pass did not run to
+    /// completion. Never written on any refusal path, so a caller that keeps
+    /// `None` knows the query is unanswered rather than answered zero.
+    pub samples: Option<u64>,
+}
+
 /// Resolve Metal loadAction for a color attachment. Archive
 /// `reims_vgpu_backend_metal` (fresh Shared RT every job):
 /// `loadAction = target_rgba8 ? Load : Clear` — guest Load without a CPU seed
@@ -1631,6 +1656,7 @@ pub fn render_core_mrt(
     stencil_attachment: Option<&mut ReimsVgpuStencilAttachment>,
     blend: Option<&ReimsVgpuBlendState>,
     colors: &mut [ColorRt<'_>],
+    visibility: Option<&mut VisibilityQuery>,
     err: ErrOut<'_>,
 ) -> Status {
     use crate::backend::metal::constants::REIMS_VGPU_METAL_MAX_COLOR_RTS;
@@ -1923,10 +1949,48 @@ pub fn render_core_mrt(
         Err(status) => return status,
     };
 
+    // Armed before the encoder exists, because `visibilityResultBuffer` is a
+    // property of the pass descriptor and Metal reads it when the encoder is
+    // created. Both refusals below are therefore reachable without an encoder
+    // to end.
+    let visibility_mode = match visibility.as_ref() {
+        None => None,
+        Some(q) => {
+            let Some(mode) = mtl_enum::visibility_result_mode(q.mode) else {
+                set_err(err, format!("unsupported visibility result mode {}", q.mode));
+                return Status::args("metal_render_visibility_result_mode_unsupported")
+                    .field("mode", q.mode);
+            };
+            if mode == MTLVisibilityResultMode::Disabled {
+                set_err(err, "visibility query armed with the disabling mode");
+                return Status::args("metal_render_visibility_result_mode_disabled");
+            }
+            Some(mode)
+        }
+    };
+    // One `u64` at offset 0: this pass encodes one draw, so the buffer holds
+    // exactly the one result the guest asked for. Shared so the CPU can read it
+    // after the command buffer completes without a blit.
+    let visibility_buffer = visibility_mode.map(|_| {
+        device.new_buffer(
+            core::mem::size_of::<u64>() as u64,
+            MTLResourceOptions::StorageModeShared,
+        )
+    });
+    if let Some(buffer) = visibility_buffer.as_ref() {
+        // Metal does not document the buffer as zeroed, and the count is an
+        // accumulation the GPU adds into.
+        unsafe { core::ptr::write_bytes(buffer.contents() as *mut u8, 0, size_of::<u64>()) };
+        pass.set_visibility_result_buffer(Some(buffer));
+    }
+
     let queue = thread_queue(device);
     let command_buffer = queue.new_command_buffer().to_owned();
     let encoder = command_buffer.new_render_command_encoder(pass);
     encoder.set_render_pipeline_state(&pso);
+    if let Some(mode) = visibility_mode {
+        encoder.set_visibility_result_mode(mode, 0);
+    }
     apply_blend_color(encoder, blend);
     let rc = apply_raster_state(encoder, raster, err);
     if !rc.is_ok() {
@@ -2168,6 +2232,14 @@ pub fn render_core_mrt(
         let detail = command_buffer_error_description(&command_buffer);
         set_err(err, format!("Metal command buffer failed: {detail}"));
         return Status::execute("metal_render_command_buffer_failed");
+    }
+
+    // Read after the completion check, not before it: a command buffer that
+    // errored ran no query, and answering the guest out of an untouched Shared
+    // buffer would report zero fragments visible for a draw that never
+    // rasterized — the one wrong answer occlusion culling acts on.
+    if let (Some(query), Some(buffer)) = (visibility, visibility_buffer.as_ref()) {
+        query.samples = Some(unsafe { core::ptr::read_unaligned(buffer.contents() as *const u64) });
     }
 
     for (i, c) in colors.iter_mut().enumerate() {

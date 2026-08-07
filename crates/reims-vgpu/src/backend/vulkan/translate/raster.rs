@@ -443,6 +443,36 @@ mod tests {
         assert_eq!(DepthClipMode::default(), DepthClipMode::Clip);
     }
 
+    /// One Apple enum, spelled once here and once in
+    /// `backend::metal::mtl_enum::visibility_result_mode`, with nothing in the
+    /// toolchain comparing them. A mode this arm records and that one refuses
+    /// is a guest that culls correctly on one host and reads a stale word on
+    /// the other, so both are held to [`crate::contract::visibility`] — this
+    /// one as a test, the Metal one as a `const` block, because its tests run
+    /// on no machine anybody edits from.
+    #[test]
+    fn the_recorded_visibility_modes_are_the_ones_the_contract_names() {
+        use crate::contract::visibility::{
+            visibility_result_mode_recordable, VISIBILITY_RESULT_MODE_DISABLED,
+            VISIBILITY_RESULT_MODE_SWEEP_END,
+        };
+        for mtl in 0..VISIBILITY_RESULT_MODE_SWEEP_END {
+            let recorded = matches!(visibility_result_mode(mtl), Ok(Some(_)));
+            assert_eq!(
+                recorded,
+                visibility_result_mode_recordable(mtl),
+                "ordinal {mtl}: this arm and the device contract disagree about \
+                 whether an occlusion query armed with it is recorded"
+            );
+        }
+        // The disarming ordinal is `Ok(None)` rather than a refusal: it is the
+        // absence of a query, which is a thing a stream legitimately says.
+        assert_eq!(
+            visibility_result_mode(VISIBILITY_RESULT_MODE_DISABLED),
+            Ok(None)
+        );
+    }
+
     #[test]
     fn index_types_map_by_width() {
         assert_eq!(index_type(0), Some(IndexType::U16));

@@ -3134,12 +3134,16 @@ fn finish_stream<M: HostMemory + HostOps>(
                         let slot = visibility_counts.entry(arming.offset).or_default();
                         *slot = slot.saturating_add(samples);
                     }
-                    // Armed and unanswered: the backend that ran this draw does
-                    // not record occlusion queries, so the guest will read its
-                    // own stale word and cull on it. Detected here rather than
-                    // in each backend because the question is the same on all
-                    // three pathways — "was the query the guest armed actually
-                    // run" — and the Metal arm has no visibility rail at all.
+                    // Armed and unanswered: the draw that ran did not record the
+                    // query, so the guest will read its own stale word and cull
+                    // on it. Both backends record one now, so what is left here
+                    // is the refusal cases — a Vulkan host without
+                    // `occlusionQueryPrecise` asked for a counting query, a mode
+                    // ordinal neither table converts, an encode that failed
+                    // before the pass ran — and any draw form whose encoder does
+                    // not carry the arming at all. Detected here rather than in
+                    // each backend because the question is the same on all three
+                    // pathways: was the query the guest armed actually run.
                     (Some(arming), None) => {
                         crate::runtime::drain::note_store_route("visibility_query_unanswered");
                         if crate::observe::first_sight(

@@ -54,7 +54,7 @@ use metal::{
     MTLDepthClipMode, MTLIndexType, MTLLoadAction, MTLPixelFormat, MTLPrimitiveType,
     MTLSamplerAddressMode, MTLSamplerBorderColor, MTLSamplerMinMagFilter, MTLSamplerMipFilter,
     MTLStencilOperation, MTLStepFunction, MTLStoreAction, MTLTriangleFillMode, MTLVertexFormat,
-    MTLVertexStepFunction, MTLWinding,
+    MTLVertexStepFunction, MTLVisibilityResultMode, MTLWinding,
 };
 
 /// Define a checked ordinal to enum conversion, and prove it at compile time.
@@ -394,6 +394,43 @@ checked_ordinal! {
     [Clip, Clamp]
     apple_numbers_them_from_zero;
 }
+
+checked_ordinal! {
+    /// `MTLVisibilityResultMode` for an occlusion query armed on a draw.
+    ///
+    /// `Disabled` is listed because it is a declared variant and the ordinal a
+    /// guest sends to disarm; the render encoder decides what to do with it.
+    fn visibility_result_mode -> MTLVisibilityResultMode;
+    [Disabled, Boolean, Counting]
+    apple_numbers_them_from_zero;
+}
+// The modes this table converts are exactly the ones the device's contract says
+// both backends record, plus the disarming ordinal the render encoder refuses
+// by name.
+//
+// A `const` block rather than a `#[test]`, for the reason `checked_ordinal!`
+// states and `primitive_type` below relies on: this file's tests run on Apple
+// hosts only, and the cross-compiled Metal arm evaluates this one from Linux.
+// The Vulkan translator carries the same pin as a test, so the two spellings of
+// one Apple enum cannot drift apart on a host that can only build one of them.
+const _: () = {
+    use crate::contract::visibility::{
+        visibility_result_mode_recordable, VISIBILITY_RESULT_MODE_DISABLED,
+        VISIBILITY_RESULT_MODE_SWEEP_END,
+    };
+    let mut mtl = 0u32;
+    while mtl < VISIBILITY_RESULT_MODE_SWEEP_END {
+        let converts = visibility_result_mode(mtl).is_some();
+        let contract =
+            visibility_result_mode_recordable(mtl) || mtl == VISIBILITY_RESULT_MODE_DISABLED;
+        assert!(
+            converts == contract,
+            "the Metal visibility-mode table and the device contract disagree \
+             about which occlusion query modes exist",
+        );
+        mtl += 1;
+    }
+};
 
 checked_ordinal! {
     /// `MTLCompareFunction` for a depth or stencil test.
