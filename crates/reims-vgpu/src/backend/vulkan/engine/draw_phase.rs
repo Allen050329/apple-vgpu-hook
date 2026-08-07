@@ -123,6 +123,15 @@
 //!   scans a `SAMPLED_CACHE_CAP`-bounded list of **64** entries and moves one to
 //!   the back. That cannot be the ~100 us per bind the arithmetic demands.
 //!
+//! **Do not read the third bullet as "the content path never fires".** A later
+//! driven x86/Vulkan boot under a 30 s Safari *drag*, 42 census windows, reads
+//! `sampled_cache_hits=26697` against `sampled_identity_hits=75994` — the
+//! content fallback carries about a quarter of all hits, moving 277 MB at
+//! ~10 KB a hit. The windows above and these are different workloads, and both
+//! readings stand; what does not stand is concluding from the zeros here that
+//! the content rail is dead and can go. It is load-bearing, and
+//! `ResidentSampledSlot::content` is what makes taking it safe.
+//!
 //! What is left is `SampledSource::GuestRuns`, and the reason it was invisible
 //! is that it incremented no counter of its own. That arm calls
 //! `acquire_sampled`, then `acquire_staging`, then `write_staging_from_runs` —

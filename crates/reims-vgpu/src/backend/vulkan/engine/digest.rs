@@ -1,15 +1,26 @@
 //! ≥128-bit content digests for cache keys (never bare DefaultHasher u64 alone).
 //!
-//! # This rule is this backend's, and the other backend does not follow it
+//! # A digest is a bucket, and width is not what makes it safe
 //!
-//! Stated here so the asymmetry is visible from the side that has the rule.
-//! `backend::metal::cache::RenderPsoKey` identifies a shader by a 64-bit
-//! non-keyed FNV-1a fingerprint plus its length and never compares the bytes —
-//! the same "matches by fingerprint alone" shape that
-//! `engine::pools::sampled_content_hash` argues needs 128 bits. That struct's
-//! doc carries the full account, including why it was recorded rather than
-//! changed. Do not read the rule above as crate-wide: it holds on the Vulkan arm
-//! only, and a reader who assumes otherwise will mis-price a Metal cache.
+//! This doc used to record an asymmetry — that the Metal arm identified shaders
+//! by a 64-bit fingerprint and never compared the bytes, while this arm's rule
+//! was 128 bits — and to send readers to that struct for "why it was recorded
+//! rather than changed". Both halves have since gone the other way, and a reader
+//! who follows the old account will go looking for a hazard that is not there.
+//!
+//! [`crate::backend::blob`] removed the class from the Metal caches by retaining
+//! the blob and comparing it, and [`crate::backend::render_pso_key`] carries the
+//! same account for pipeline state. `engine::pools`'s sampled cache followed:
+//! its 128-bit content fingerprint now picks a candidate and
+//! `ResidentSampledSlot::content` decides the hit.
+//!
+//! So the rule this module's name states is a *bucketing* rule, not an identity
+//! rule. Where a digest still stands alone as an identity — `ObjectCaches`
+//! files `vk::ShaderModule` under a bare [`Digest128`] of the SPIR-V words and
+//! retains none of them, and [`Digest128`] is the shader half of
+//! `PipelineKey` and `ComputePipelineKey` — the width is all that is holding it,
+//! and that is the shape the two modules above argue against. Widening is not
+//! the answer there either; retaining the words is.
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};

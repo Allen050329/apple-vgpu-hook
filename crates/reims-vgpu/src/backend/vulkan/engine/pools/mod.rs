@@ -676,8 +676,11 @@ impl SampledSlot {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum SampledFingerprint {
     /// 128-bit digest of the retained content (see [`sampled_content_hash`]).
-    /// This *is* the match key on the content-fallback path — no byte copy is
-    /// kept, so a hit binds the retained image without a full-frame `memcmp`.
+    ///
+    /// It picks the candidate and decides nothing on its own. The bytes it was
+    /// taken over are retained beside it in `ResidentSampledSlot::content`, and
+    /// that compare is what answers — see that field for why the digest is not
+    /// allowed to be the identity.
     Content(u128),
     /// No digest exists, because the content was gathered straight from guest
     /// RAM into a staging buffer and never materialised as CPU bytes. Such an
@@ -707,8 +710,40 @@ pub(crate) enum SampledRetainContent {
 struct ResidentSampledSlot {
     slot: SampledSlot,
     fingerprint: SampledFingerprint,
-    /// Byte length of the content this slot was admitted with, kept only for the
-    /// LRU byte-cap accounting (the bytes themselves are not retained).
+    /// The bytes [`SampledFingerprint::Content`]'s digest was taken over, so a
+    /// content match is decided by comparing them rather than by the digest
+    /// alone. `None` exactly when the fingerprint is
+    /// [`SampledFingerprint::Gathered`], which has no CPU bytes to retain and is
+    /// reachable only by identity.
+    ///
+    /// # Why the digest is not the identity
+    ///
+    /// This used to hold nothing and `find_cached_sampled` bound the retained
+    /// image on a 128-bit fingerprint match alone. Two distinct textures of the
+    /// same geometry and format whose digests collided were one entry: a draw
+    /// sampled pixels the guest never uploaded, with nothing to refuse and
+    /// nothing to log. The standing argument was the birthday bound — about
+    /// `2^-116` across a 64-entry cache — and that arithmetic is right and is
+    /// the wrong shape, for the reason [`crate::backend::blob`] gives for the
+    /// Metal caches it removed the same class from: it prices a failure this
+    /// device cannot observe if it ever happens, and a wider digest only moves
+    /// the exponent.
+    ///
+    /// The cost the copy was dropped for was a "cold full-frame `memcmp` on
+    /// every hit", which assumed entries are frames. A driven x86/Vulkan boot
+    /// under a 30 s Safari drag says otherwise: 26 697 content-path hits moving
+    /// 277 MB, which is **10 KB per hit**, beside a guest-gather rail the same
+    /// boot runs at 842 MB/s. The compare is not measurable against it.
+    ///
+    /// Retaining is a refcount bump and not a copy — the `Arc` already exists on
+    /// the retire path — and it costs no new budget: `sampled_cache_bytes` has
+    /// always summed `content_len` against `SAMPLED_CACHE_BYTE_CAP`, so the
+    /// cache was already charging itself for bytes it did not hold. Holding
+    /// them makes that accounting honest.
+    content: Option<std::sync::Arc<Vec<u8>>>,
+    /// Byte length of the content this slot was admitted with, for the LRU
+    /// byte-cap accounting. Still carried separately because a `Gathered` entry
+    /// has a length but no bytes.
     content_len: usize,
     /// Producer identity of the retained content; lets a same-identity,
     /// same-generation rebind skip the content hash + compare entirely.

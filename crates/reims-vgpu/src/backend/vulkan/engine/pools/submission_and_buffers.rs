@@ -2230,13 +2230,13 @@ impl ResourcePools {
             return Some(handles);
         }
         let content_hash = sampled_content_hash(content);
-        // 128-bit fingerprint match binds the retained image directly — the
-        // former full-frame `entry.content == content` compare (a cold DRAM
-        // read of the retained copy on every hit) is dropped in favour of the
-        // wider digest.
+        // The digest narrows the walk to one candidate; the retained bytes are
+        // what decide the hit. `ResidentSampledSlot::content` carries why the
+        // digest is not allowed to answer on its own.
         let found = self.sampled_cache.iter().position(|entry| {
             entry.slot.key() == key
                 && entry.fingerprint == SampledFingerprint::Content(content_hash)
+                && entry.content.as_deref().is_some_and(|b| b == content)
         });
         let Some(index) = found else {
             counters
@@ -2271,9 +2271,13 @@ impl ResourcePools {
         content: &SampledRetainContent,
         identity: Option<crate::backend::vulkan::engine::SampledContentIdentity>,
     ) {
-        let (fingerprint, content_len) = match content {
+        let (fingerprint, retained, content_len) = match content {
+            // The `Arc` is cloned rather than the bytes copied: the retire path
+            // already holds one, so recognising this entry by content later
+            // costs a refcount here and no new allocation.
             SampledRetainContent::Bytes(bytes) => (
                 SampledFingerprint::Content(sampled_content_hash(bytes)),
+                Some(bytes.clone()),
                 bytes.len(),
             ),
             // Nothing hashed the bytes, so nothing can recognise this image by
@@ -2284,20 +2288,31 @@ impl ResourcePools {
                     self.sampled_live.push(slot);
                     return;
                 }
-                (SampledFingerprint::Gathered, *len)
+                (SampledFingerprint::Gathered, None, *len)
             }
         };
         if content_len > SAMPLED_CACHE_BYTE_CAP {
             self.sampled_live.push(slot);
             return;
         }
-        // Deduplication is by fingerprint, and `Gathered` entries are equal to
-        // each other under it, so they dedupe by identity instead — two windows
-        // that gathered different pixels must not collapse into one image.
+        // Deduplication asks the same question a lookup does, so it has to
+        // answer it the same way: a fingerprint match proposes a duplicate and
+        // something else confirms it. Collapsing two entries here is exactly as
+        // wrong as returning the wrong one from `find_cached_sampled` — the
+        // survivor then answers for content it was not built from.
         let duplicate = self.sampled_cache.iter_mut().find(|entry| {
             entry.slot.key() == slot.key()
                 && entry.fingerprint == fingerprint
-                && (fingerprint != SampledFingerprint::Gathered || entry.identity == identity)
+                && match fingerprint {
+                    // Every `Gathered` fingerprint is equal to every other, so
+                    // identity is the only thing separating two windows that
+                    // gathered different pixels.
+                    SampledFingerprint::Gathered => entry.identity == identity,
+                    // The bytes decide, as on the lookup path.
+                    SampledFingerprint::Content(_) => {
+                        entry.content.as_deref() == retained.as_deref()
+                    }
+                }
         });
         if let Some(existing) = duplicate {
             if identity.is_some() {
@@ -2311,6 +2326,7 @@ impl ResourcePools {
         self.sampled_cache.push(ResidentSampledSlot {
             slot,
             fingerprint,
+            content: retained,
             content_len,
             identity,
             last_touch_ms: touch,
@@ -2555,6 +2571,79 @@ mod recycle_tests {
         }
     }
 
+    /// Two different textures filed under one digest stay two textures.
+    ///
+    /// A natural 128-bit collision is not something a test can produce, so this
+    /// builds the state one would produce — an entry whose `Content` digest
+    /// equals the incoming blob's while its retained bytes differ — and asks the
+    /// lookup. That is the whole of what `ResidentSampledSlot::content` buys,
+    /// and without it this bind returns the wrong image with nothing to log.
+    #[test]
+    fn a_collided_digest_over_different_bytes_is_not_a_sampled_hit() {
+        let mut pools = ResourcePools::new();
+        let counters = EngineCounters::default();
+
+        let retained: Vec<u8> = (0..64u8).collect();
+        let incoming: Vec<u8> = (0..64u8).map(|b| b ^ 0x5a).collect();
+        assert_ne!(retained, incoming, "the two blobs must differ");
+
+        let slot = null_slot(8, 8);
+        let key = slot.key();
+        // File the retained blob under the *incoming* blob's digest. This is the
+        // collision, forced rather than found.
+        pools.sampled_cache.push(ResidentSampledSlot {
+            slot,
+            fingerprint: SampledFingerprint::Content(sampled_content_hash(&incoming)),
+            content: Some(std::sync::Arc::new(retained.clone())),
+            content_len: retained.len(),
+            identity: None,
+            last_touch_ms: 0,
+        });
+
+        assert!(
+            pools
+                .find_cached_sampled(key, &incoming, None, &counters)
+                .is_none(),
+            "equal digests over different bytes must not bind the retained image"
+        );
+        assert!(
+            pools
+                .find_cached_sampled(key, &retained, None, &counters)
+                .is_none(),
+            "the retained bytes do not hash to the digest they were filed under, \
+             so they are not a hit either — the digest still gates the walk"
+        );
+    }
+
+    /// The bytes decide a hit, and equal bytes are one entry however the blob
+    /// reached the cache. This is the half the compare must not cost: a genuine
+    /// re-present of identical content still hits.
+    #[test]
+    fn the_same_bytes_under_their_own_digest_are_a_sampled_hit() {
+        let mut pools = ResourcePools::new();
+        let counters = EngineCounters::default();
+
+        let content: Vec<u8> = (0..64u8).map(|b| b.wrapping_mul(7)).collect();
+        let slot = null_slot(8, 8);
+        let key = slot.key();
+        pools.sampled_cache.push(ResidentSampledSlot {
+            slot,
+            fingerprint: SampledFingerprint::Content(sampled_content_hash(&content)),
+            content: Some(std::sync::Arc::new(content.clone())),
+            content_len: content.len(),
+            identity: None,
+            last_touch_ms: 0,
+        });
+
+        let copy = content.clone();
+        assert!(
+            pools
+                .find_cached_sampled(key, &copy, None, &counters)
+                .is_some(),
+            "identical content must still hit, or the compare has cost a real reuse"
+        );
+    }
+
     /// A *diverse* burst — many distinct geometries, each ≤ the per-key cap —
     /// must not grow `sampled_free` past the GLOBAL cap: this is the measured
     /// VRAM-return stall (`sfree=593` pinning every slab block). Each distinct
@@ -2745,6 +2834,10 @@ mod recycle_tests {
             pools.sampled_cache.push(ResidentSampledSlot {
                 slot: null_slot(w, h),
                 fingerprint: SampledFingerprint::Content(((w as u128) << 64) | h as u128),
+                // This test only ages entries out; nothing here looks one up by
+                // content, so the geometry stands in for a digest and there are
+                // no bytes to retain beside it.
+                content: None,
                 content_len: len,
                 identity: None,
                 last_touch_ms: touch,
