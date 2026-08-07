@@ -1622,42 +1622,57 @@ fn exec_copy_buffer_to_buffer<M: HostMemory + HostOps>(
     }
 }
 
-/// A copy extent the guest asked for, cut down to what the texture can hold.
+/// A copy extent the guest asked for, checked against what the texture holds.
 ///
-/// **A truncation here is a smaller copy reported as `Ok`.** The guest asked
-/// Metal to move a W x H region and got fewer texels, with no status saying so;
-/// the texels outside the cut keep whatever the destination held before. Metal
-/// itself does not do this — a region reaching past a texture is a validation
-/// failure there, not a clipped copy — and the origin check a few lines above
-/// each caller already refuses that shape as `t2t_origin_oob`. So the origin
-/// and the extent, two halves of one region out of one wire record, are handled
-/// opposite ways.
+/// `None` means the region reaches past the edge and the caller must refuse.
 ///
-/// Reported rather than refused, and only until the zero is measured. That is
-/// the licence `note_pipeline_tlv_fields` took: this rail runs on every boot,
-/// nothing has ever said whether the cut fires, and turning it into a refusal
-/// blind would risk declining live blits. `kind` and `axis` name the caller and
-/// the dimension so a firing says which of the nine sites cut what.
-fn clamp_extent(kind: &'static str, axis: &'static str, requested: u64, max: u64) -> u64 {
+/// **This used to clamp**, at nine sites here plus three destination-side cuts
+/// in the texture-to-texture path that did not even come through it, and it
+/// reported nothing. A truncation there was a smaller copy returned as `Ok`:
+/// the guest asked Metal to move a W x H region, got fewer texels, and the
+/// texels outside the cut kept whatever the destination held before, with no
+/// status saying so.
+///
+/// Three things say refusing is the faithful answer, and no one of them would
+/// have been enough alone:
+///
+/// * **Metal refuses.** A region reaching past a texture is a validation
+///   failure there, not a clipped copy. Emulating the clip emulates a device
+///   Apple does not ship.
+/// * **The origin check beside every call site already refuses**
+///   (`t2t_origin_oob` and its siblings). Origin and extent are two halves of
+///   one region out of one wire record and were handled opposite ways — which
+///   is exactly the divergence `AGENTS.md` says to look for by diffing two arms
+///   that consume one wire form, and which nobody had diffed.
+/// * **The cut never fires.** Measured before it was changed, on a driven x86
+///   boot with Safari composited on a Ventura desktop: `blit_extent_fits` 66,
+///   `blit_extent_cut` **0**. The path is reached and the clamp is not.
+///
+/// The counters stay, and `blit_extent_cut` keeps its name so a boot series
+/// spanning this change stays comparable — it is now the refusal's volume
+/// rather than a silent truncation's. A firing is a workload this rig has not
+/// seen, and it will be loud instead of a wrong texture.
+fn copy_extent(kind: &'static str, axis: &'static str, requested: u64, max: u64) -> Option<u64> {
     if requested == 0 {
-        // Metal size 0 is a no-op extent; keep 0.
-        0
+        // Metal size 0 is a no-op extent; keep 0. The callers below turn an
+        // all-zero extent into `ZeroExtent`, which is not a refusal.
+        Some(0)
     } else if requested > max {
-        note_extent_cut(kind, axis, requested, max);
-        max
+        note_extent_over(kind, axis, requested, max);
+        None
     } else {
         crate::runtime::drain::note_store_route("blit_extent_fits");
-        requested
+        Some(requested)
     }
 }
 
-/// The always-on half of [`clamp_extent`], shared with the destination-side
-/// cuts in the texture-to-texture path that do not go through it.
+/// The always-on half of [`copy_extent`], shared with the destination-side
+/// checks in the texture-to-texture path that do not go through it.
 ///
 /// Latched per `(kind, axis)` rather than per size: what a reader needs first is
-/// which copy is being cut, and a per-size latch on a window drag would emit
-/// once per distinct window width.
-fn note_extent_cut(kind: &'static str, axis: &'static str, requested: u64, max: u64) {
+/// which copy was refused and on which dimension, and a per-size latch on a
+/// window drag would emit once per distinct window width.
+fn note_extent_over(kind: &'static str, axis: &'static str, requested: u64, max: u64) {
     crate::runtime::drain::note_store_route("blit_extent_cut");
     let key = kind
         .bytes()
@@ -1667,7 +1682,7 @@ fn note_extent_cut(kind: &'static str, axis: &'static str, requested: u64, max: 
         return;
     }
     crate::observe::fail(format!(
-        "blit_extent reason=blit_extent_cut kind={kind} axis={axis}          requested={requested} copied={max} (the guest asked to copy past the          edge of a texture and this device copied less and reported Ok; Metal          refuses the region instead, and the origin check beside this one          already does)"
+        "blit_extent reason=blit_extent_over kind={kind} axis={axis}          requested={requested} available={max} (the guest asked to copy past          the edge of a texture; Metal refuses that region and so does this,          where it used to copy less and report Ok)"
     ));
 }
 
@@ -2044,12 +2059,22 @@ fn exec_copy_buffer_to_texture<M: HostMemory + HostOps>(
     if ox > dst.width() as u64 || oy > dst.height() as u64 || oz > dst.depth() as u64 {
         return br(BlitStatus::Bounds, "b2t_origin_oob");
     }
-    let copy_w = clamp_extent("b2t", "w", cmd.source_size.width, dst.width() as u64 - ox);
-    let copy_h = clamp_extent("b2t", "h", cmd.source_size.height, dst.height() as u64 - oy);
+    // Refused rather than clipped, and the origin check directly above is why
+    // the two now agree: one wire record names a region, and both halves of it
+    // are checked the same way.
+    let (Some(copy_w), Some(copy_h)) = (
+        copy_extent("b2t", "w", cmd.source_size.width, dst.width() as u64 - ox),
+        copy_extent("b2t", "h", cmd.source_size.height, dst.height() as u64 - oy),
+    ) else {
+        return br(BlitStatus::Bounds, "b2t_extent_oob");
+    };
     let copy_d = if cmd.source_size.depth == 0 {
         0
     } else {
-        clamp_extent("b2t", "d", cmd.source_size.depth, dst.depth() as u64 - oz)
+        match copy_extent("b2t", "d", cmd.source_size.depth, dst.depth() as u64 - oz) {
+            Some(d) => d,
+            None => return br(BlitStatus::Bounds, "b2t_extent_oob"),
+        }
     };
     if copy_w == 0 || copy_h == 0 || copy_d == 0 {
         return BlitStatus::ZeroExtent;
@@ -2283,12 +2308,22 @@ fn exec_copy_texture_to_buffer<M: HostMemory + HostOps>(
     if ox > src.width() as u64 || oy > src.height() as u64 || oz > src.depth() as u64 {
         return br(BlitStatus::Bounds, "t2b_origin_oob");
     }
-    let copy_w = clamp_extent("t2b", "w", cmd.source_size.width, src.width() as u64 - ox);
-    let copy_h = clamp_extent("t2b", "h", cmd.source_size.height, src.height() as u64 - oy);
+    // Refused rather than clipped, and the origin check directly above is why
+    // the two now agree: one wire record names a region, and both halves of it
+    // are checked the same way.
+    let (Some(copy_w), Some(copy_h)) = (
+        copy_extent("t2b", "w", cmd.source_size.width, src.width() as u64 - ox),
+        copy_extent("t2b", "h", cmd.source_size.height, src.height() as u64 - oy),
+    ) else {
+        return br(BlitStatus::Bounds, "t2b_extent_oob");
+    };
     let copy_d = if cmd.source_size.depth == 0 {
         0
     } else {
-        clamp_extent("t2b", "d", cmd.source_size.depth, src.depth() as u64 - oz)
+        match copy_extent("t2b", "d", cmd.source_size.depth, src.depth() as u64 - oz) {
+            Some(d) => d,
+            None => return br(BlitStatus::Bounds, "t2b_extent_oob"),
+        }
     };
     if copy_w == 0 || copy_h == 0 || copy_d == 0 {
         return BlitStatus::ZeroExtent;
@@ -2525,28 +2560,32 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
     {
         return br(BlitStatus::Bounds, "t2t_origin_oob");
     }
-    let mut copy_w = clamp_extent("t2t_src", "w", cmd.source_size.width, src.width() as u64 - sox);
-    // The destination half of the same region. Cut separately from the source
-    // and, before this, with no instrument at all — `clamp_extent` reported
-    // nothing and these three did not even go through it, so a copy cut to fit
-    // the *destination* was the quieter of two quiet paths.
-    if copy_w > dst.width() as u64 - dox {
-        note_extent_cut("t2t_dst", "w", copy_w, dst.width() as u64 - dox);
-    }
-    copy_w = copy_w.min(dst.width() as u64 - dox);
-    let mut copy_h = clamp_extent("t2t_src", "h", cmd.source_size.height, src.height() as u64 - soy);
-    if copy_h > dst.height() as u64 - doy {
-        note_extent_cut("t2t_dst", "h", copy_h, dst.height() as u64 - doy);
-    }
-    copy_h = copy_h.min(dst.height() as u64 - doy);
+    // One region, checked against both textures. The source and destination
+    // halves are separate `kind`s so a refusal says which end was too small,
+    // and the destination half used to have no instrument at all — it did not
+    // even come through the extent helper, which made it the quieter of two
+    // quiet paths.
+    let (Some(copy_w), Some(_)) = (
+        copy_extent("t2t_src", "w", cmd.source_size.width, src.width() as u64 - sox),
+        copy_extent("t2t_dst", "w", cmd.source_size.width, dst.width() as u64 - dox),
+    ) else {
+        return br(BlitStatus::Bounds, "t2t_extent_oob");
+    };
+    let (Some(copy_h), Some(_)) = (
+        copy_extent("t2t_src", "h", cmd.source_size.height, src.height() as u64 - soy),
+        copy_extent("t2t_dst", "h", cmd.source_size.height, dst.height() as u64 - doy),
+    ) else {
+        return br(BlitStatus::Bounds, "t2t_extent_oob");
+    };
     let copy_d = if cmd.source_size.depth == 0 {
         0
     } else {
-        let mut d = clamp_extent("t2t_src", "d", cmd.source_size.depth, src.depth() as u64 - soz);
-        if d > dst.depth() as u64 - doz {
-            note_extent_cut("t2t_dst", "d", d, dst.depth() as u64 - doz);
-        }
-        d = d.min(dst.depth() as u64 - doz);
+        let (Some(d), Some(_)) = (
+            copy_extent("t2t_src", "d", cmd.source_size.depth, src.depth() as u64 - soz),
+            copy_extent("t2t_dst", "d", cmd.source_size.depth, dst.depth() as u64 - doz),
+        ) else {
+            return br(BlitStatus::Bounds, "t2t_extent_oob");
+        };
         d
     };
     if any_t11 && copy_d > 1 {

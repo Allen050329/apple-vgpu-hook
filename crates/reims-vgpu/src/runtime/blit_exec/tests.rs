@@ -604,6 +604,67 @@ fn copy_type11_to_type11_writes_dst_pages() {
     assert_eq!(back, src_pat, "dest pages hold blit content (one copy)");
 }
 
+/// A region whose *extent* reaches past a texture is refused, in each of the
+/// three copy executors, exactly as its *origin* already was.
+///
+/// This is the diff the two arms needed. One wire record names an origin and a
+/// size; the origin check refused out of range while the extent check clamped
+/// and returned `Ok`, so the same malformed region got opposite treatment
+/// depending on which half of it was wrong. The origin cases live in
+/// `copy_executor_reason_slugs_name_distinct_sites` above; these are their
+/// counterparts, deliberately built the same way so the pair reads as one
+/// property.
+#[test]
+fn an_extent_past_the_edge_is_refused_like_an_origin_past_the_edge() {
+    let (mut host, mut state) = blit_device();
+    install_type11(&mut host, &mut state, 3, 3, 0x20); // 2×2 BGRA, mid 3
+    install_type11(&mut host, &mut state, 4, 4, 0x21); // 2×2 BGRA, mid 4
+    install_buffer(&mut host, &mut state, 5, 5, 4096);
+
+    // Origin in range, extent past the edge: 3 wide out of a 2-wide texture.
+    // Before this, each of these copied 2 and answered Ok.
+    let over = Size {
+        width: 3,
+        height: 1,
+        depth: 1,
+    };
+
+    let mut cmd = copy_cmd(CopyKind::TextureToTexture, 3, 4);
+    cmd.source_size = over;
+    assert_eq!(
+        execute_blit(&mut state, &mut host, 1, &cmd),
+        BlitStatus::Bounds
+    );
+    assert_eq!(blit_fail_reason(), "t2t_extent_oob");
+
+    let mut cmd = copy_cmd(CopyKind::TextureToBuffer, 3, 5);
+    cmd.source_size = over;
+    assert_eq!(
+        execute_blit(&mut state, &mut host, 1, &cmd),
+        BlitStatus::Bounds
+    );
+    assert_eq!(blit_fail_reason(), "t2b_extent_oob");
+
+    let mut cmd = copy_cmd(CopyKind::BufferToTexture, 5, 3);
+    cmd.source_size = over;
+    assert_eq!(
+        execute_blit(&mut state, &mut host, 1, &cmd),
+        BlitStatus::Bounds
+    );
+    assert_eq!(blit_fail_reason(), "b2t_extent_oob");
+
+    // An extent that exactly fills the target is not past the edge. The bound
+    // is inclusive, and a refusal here would decline every full-surface copy —
+    // which is most of them.
+    let mut cmd = copy_cmd(CopyKind::TextureToTexture, 3, 4);
+    cmd.source_size = Size {
+        width: 2,
+        height: 2,
+        depth: 1,
+    };
+    assert_eq!(execute_blit(&mut state, &mut host, 1, &cmd), BlitStatus::Ok);
+}
+
 /// The reason channel names *which* collapsed check fired inside each of the
 /// rectangular copy executors (texture↔texture, texture→buffer, buffer→texture),
 /// distinguishes distinct causes, and is reset to empty by a subsequent success —
@@ -2120,16 +2181,30 @@ fn blit_geometry_helpers_clamp_bpp_and_aspect() {
         MTL_BLIT_OPTION_STENCIL_FROM_DEPTH_STENCIL,
     };
 
-    // clamp_extent: zero stays a no-op extent; over-max clamps to max;
-    // in-range and exactly-max pass through unchanged.
-    assert_eq!(clamp_extent("t", "w", 0, 100), 0, "zero is a Metal no-op extent");
-    assert_eq!(clamp_extent("t", "w", 50, 100), 50, "in-range passes through");
-    assert_eq!(clamp_extent("t", "w", 150, 100), 100, "over-max clamps to max");
+    // copy_extent: zero stays a no-op extent; in-range and exactly-max pass
+    // through unchanged; over-max is `None`, which every caller turns into
+    // `BlitStatus::Bounds` rather than into a smaller copy.
     assert_eq!(
-        clamp_extent("t", "w", 100, 100),
-        100,
-        "exactly max passes through"
+        copy_extent("t", "w", 0, 100),
+        Some(0),
+        "zero is a Metal no-op extent, not a refusal"
     );
+    assert_eq!(
+        copy_extent("t", "w", 50, 100),
+        Some(50),
+        "in-range passes through"
+    );
+    assert_eq!(
+        copy_extent("t", "w", 100, 100),
+        Some(100),
+        "exactly max passes through — the bound is inclusive"
+    );
+    assert_eq!(
+        copy_extent("t", "w", 101, 100),
+        None,
+        "one past the edge refuses; it used to return 100 and copy less"
+    );
+    assert_eq!(copy_extent("t", "w", 150, 100), None, "and so does far past");
 
     // texture_storage_bpp: full-texel storage size per format; unknown fails.
     assert_eq!(texture_storage_bpp(MTL_FORMAT_BGRA8_UNORM), Ok(4));
