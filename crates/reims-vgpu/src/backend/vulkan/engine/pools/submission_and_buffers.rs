@@ -660,6 +660,27 @@ impl ResourcePools {
     /// images/buffers — destroying them before its flush would be a
     /// use-after-free at submit). A zero mask means nothing can be reading
     /// anything.
+    ///
+    /// # The one recording state this does *not* cover
+    ///
+    /// A slot claimed by `begin_entry` and being recorded into, which is neither
+    /// `pending` yet nor an `open_batch`, is in neither set — so a
+    /// [`Self::dispose`] while it records destroys immediately, on an object the
+    /// open command buffer already names.
+    ///
+    /// That is sound today only because **nothing runs in that gap**: every
+    /// non-batch caller claims the slot, records, submits and seals inside one
+    /// call, so no host code can reach a dispose in between. It is a property of
+    /// those callers and not of this function, and the compiler cannot see it.
+    ///
+    /// A caller that wants to record several independent units of work into one
+    /// submission — the shape the guest-page writeback would take to stop paying
+    /// a fence per window — reopens exactly this gap, because its per-unit
+    /// bookkeeping (`unpin_resident_target`, which is what permits eviction)
+    /// would run while later units are still recording. Such a caller must
+    /// either do all of its bookkeeping after the submit, or make its recording
+    /// slot visible here the way `open_batch` is. Do not assume the graveyard
+    /// covers it: it covers the two states above, and this is a third.
     fn open_slot_mask(&self) -> SlotMask {
         let mut mask: SlotMask = 0;
         for (index, slot) in self.slots.iter().enumerate() {
