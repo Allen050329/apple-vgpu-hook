@@ -18,11 +18,14 @@ This measures the whole crate instead, at function granularity, from one boot.
 ```sh
 scripts/runtime-dead/runtime-dead.sh              # ~10 min
 scripts/runtime-dead/runtime-dead.sh --seconds 40 --app Safari
+scripts/runtime-dead/runtime-dead.sh --import-off # the copying rails; see below
 ```
 
 Needs `llvm-profdata`, `llvm-cov`, and a `libclang_rt.profile-x86_64.a` whose
 LLVM major matches `rustc --version --verbose`. Outputs land in
-`/tmp/reims-vgpu-runtime-dead/`:
+`/tmp/reims-vgpu-runtime-dead/` — or, under `--import-off`, in
+`/tmp/reims-vgpu-runtime-dead-import-off/`, because the two reports exist to be
+diffed and a run that overwrote the other would destroy the comparison:
 
 | file | what |
 |---|---|
