@@ -200,13 +200,18 @@ const ROWS: &[(&str, usize, Guarded, &str)] = &[
     ),
     (
         "reims-vgpu/src/runtime/drain/mod.rs",
-        10,
+        11,
         Guarded::EmitsOnly,
         "packet and doorbell reporters plus cursor_glyph_fail and its six \
          callers. cursor_glyph_fail is the best-shaped site in the tree and \
          worth copying: it consumes the latch internally and **always returns \
          `false`**, so `return cursor_glyph_fail(..)` reads as a latch deciding \
-         a result and cannot be one. Its doc says so at the declaration",
+         a result and cannot be one. Its doc says so at the declaration. The \
+         eleventh is `note_packet_stamp_records`, which sits on the hottest \
+         path any latch in this tree guards — once per decoded packet — and is \
+         still emit-only: the two counters beside it are raised before the \
+         latch is consulted, so the denominator counts every packet and only \
+         the shape line dedupes",
     ),
     (
         "reims-vgpu/src/runtime/draw/metal_icb.rs",

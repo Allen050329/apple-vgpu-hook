@@ -4672,3 +4672,59 @@ fn a_pipe_index_that_looks_like_an_opcode_is_still_a_pipe_index() {
         "and the second word is the page, not a task id"
     );
 }
+
+/// The stamp records between a packet's header and its payload are skipped, and
+/// the payload the decoder hands on begins after them rather than at `+0x0C`.
+///
+/// Nothing in this crate reads those records. `note_packet_stamp_records` is the
+/// line that says so on a live boot; this pins the two properties that line's
+/// reading depends on — that the offset arithmetic is right, so a non-zero count
+/// is a real skipped record and not a mis-parse, and that a record's presence
+/// does not disturb the payload every handler goes on to read.
+#[test]
+fn a_packets_stamp_records_are_skipped_and_the_payload_starts_after_them() {
+    const STAMPS: u16 = 3;
+    let payload = [0xAAu32, 0xBB];
+    let stamps_len = STAMPS as usize * PACKET_STAMP_LEN as usize;
+    let total = PACKET_HEADER_LEN as usize + stamps_len + payload.len() * 4;
+
+    let mut v = vec![0u8; total];
+    v[0..2].copy_from_slice(&ROOT_OP_DEFINE_FIFO.to_le_bytes());
+    v[2..4].copy_from_slice(&STAMPS.to_le_bytes());
+    v[4..8].copy_from_slice(&(total as u32).to_le_bytes());
+    v[8..12].copy_from_slice(&9u32.to_le_bytes());
+    // Distinguishable record bytes: if the payload slice began at +0x0C these
+    // would show up as the payload's first words.
+    for i in 0..stamps_len / 4 {
+        let at = PACKET_HEADER_LEN as usize + i * 4;
+        v[at..at + 4].copy_from_slice(&(0xF0u32 + i as u32).to_le_bytes());
+    }
+    for (i, w) in payload.iter().enumerate() {
+        let at = PACKET_HEADER_LEN as usize + stamps_len + i * 4;
+        v[at..at + 4].copy_from_slice(&w.to_le_bytes());
+    }
+
+    let dec = decode_packet(&v, 0, total as u32, RING).unwrap();
+    assert_eq!(dec.stamp_count, STAMPS, "the count is carried, not consumed");
+    assert_eq!(
+        dec.payload.len(),
+        payload.len() * 4,
+        "the payload excludes the records"
+    );
+    assert_eq!(
+        ld32(&dec.payload[0..]),
+        0xAA,
+        "and starts at the first byte after them, not at +0x0C"
+    );
+
+    // A packet declaring more records than it has room for is the guest's
+    // error, not a short read of ours.
+    let mut liar = v.clone();
+    liar[2..4].copy_from_slice(&u16::MAX.to_le_bytes());
+    assert_eq!(
+        decode_packet(&liar, 0, total as u32, RING).unwrap_err(),
+        PacketError::BadSize,
+        "a stamp count the packet cannot hold is refused before any record is \
+         reached, which is what bounds the skip without a constant"
+    );
+}

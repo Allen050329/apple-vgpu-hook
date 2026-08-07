@@ -129,8 +129,10 @@ fn packet_site(channel: Option<u32>) -> String {
 /// page its shared state lives on.
 ///
 /// Reachable from both dispatch tables because it is one command in one flat
-/// opcode space — see [`crate::model::regs::ROOT_OP_SETUP_SHARED_STATE`], which
+/// opcode space — see `ROOT_OP_SETUP_SHARED_STATE`'s own declaration, which
 /// carries what established that and what the root arm used to do instead.
+/// (Not a doc link: `model::regs` is a private module, so no path to the
+/// constant resolves from here.)
 /// `channel` is `None` for the root channel, matching `apply_delete_task` and
 /// the other handlers both tables share.
 fn apply_setup_shared_state<H: HostMemory + HostOps>(
@@ -608,6 +610,108 @@ fn packet_snapshot_len(header: &[u8], available: u32, ring_capacity: u32) -> u32
     }
 }
 
+/// The per-packet stamp records this device skips, reported once per shape.
+///
+/// A packet header declares `stamp_count`, and that many 8-byte records sit
+/// between the header and the payload. **Nothing in this crate reads them.**
+/// `stamp_count` is used at exactly two places: here, to find where the payload
+/// starts, and in `FailEvent::UnknownChildOpcode`, to help a reader tell a
+/// 24-byte packet with one stamp from one with three payload words. The records'
+/// own bytes have never been decoded, and until this line existed nothing said
+/// how often any arrived.
+///
+/// That is the shape of an unmeasured loss rather than a known-benign skip, and
+/// the two are not distinguishable by reading the code — which is the whole
+/// argument for an instrument. If the records carry a wait-for-stamp dependency,
+/// a packet whose records this device ignores runs before the work it was told
+/// to wait for, and the corruption that follows has no line anywhere to explain
+/// it. If they are completion stamps to retire, ignoring them strands the guest.
+/// If they are neither, the skip is correct and this line is what says so.
+///
+/// So: **report, do not refuse.** Refusing every packet that carries one would
+/// decline live guest traffic on a guess, and this file's own rule is that a
+/// refusal needs its zero measured first — the same licence
+/// `note_pipeline_tlv_fields` took and `note_color_entry_fields` took before it.
+///
+/// Latched per `(opcode, stamp_count)`, so a command that always carries the
+/// same number of records says so once and a *new* count reports. The first
+/// record's two words ride along because they are what would identify the
+/// format; a reader with a non-zero count and no words has to go back to the
+/// ring for them.
+///
+/// Off-channel and behind the `stamp_count > 0` guard, so a boot where no
+/// packet carries a record pays one comparison per packet and emits nothing.
+/// **That silence is not a measurement** — it reads the same as this function
+/// never being reached — so the count of packets *offered* to it is what a
+/// reader needs beside it, which is `note_store_route`'s `packet_stamps_none`.
+///
+/// # The first reading, and it is not a healthy zero
+///
+/// Driven x86/PCI/Vulkan boot, Safari composited on a Ventura desktop:
+///
+/// ```text
+/// packet_stamps_none     31168
+/// packet_stamps_present   3426      ~10 % of all decoded packets
+///
+/// opcode=0x04 count=1  w0=0x2 w1=0x4
+/// opcode=0x06 count=1  w0=0x1 w1=0x7
+/// opcode=0x06 count=2  w0=0x1 w1=0x5
+/// opcode=0x20 count=1  w0=0x2 w1=0x5da
+/// opcode=0x22 count=1  w0=0x4 w1=0x1
+/// opcode=0x25 count=1  w0=0x1 w1=0x69
+/// opcode=0x35 count=1  w0=0x1 w1=0xe7
+/// opcode=0x37 count=1  w0=0x2 w1=0xe
+/// opcode=0x37 count=2  w0=0x4 w1=0x4
+/// opcode=0x3b count=1  w0=0x1 w1=0x19
+/// ```
+///
+/// So this is live traffic, not a dormant field: about one packet in ten
+/// carries a record, across ten commands including cursor, present, delete-task
+/// and unmap.
+///
+/// The records have shape. `w0` is small and repeats — 1, 2, 4 — and `w1`
+/// ranges from 1 to 0x5da and is larger for the commands that appear later in
+/// the boot. That is the profile of `{u32 index, u32 value}` with a monotonic
+/// value, which is exactly the pair [`write_stamp`] already takes for the
+/// header's own `completion_stamp` — `stamp_slot_index` masks an index out of a
+/// word and `stamp_slot_offset` places it in the stamp page.
+///
+/// **That is a resemblance, not a decode, and the difference decides whether
+/// this is a bug.** If a record is a stamp to *retire*, this device is leaving
+/// the guest waiting on values it never writes. If it is a stamp to *wait on*,
+/// this device is running commands ahead of work they were ordered behind. If
+/// it is neither, the skip is right. Nothing here has established which, and
+/// guessing between "write it" and "wait for it" would be picking one of two
+/// opposite behaviours from the same bytes. The next step is RE of the
+/// producer, not a heuristic fitted to the ten rows above.
+///
+/// What the reading does settle is that the question is worth answering: a
+/// zero here would have closed it, and it is not zero.
+fn note_packet_stamp_records(opcode: u16, stamp_count: u16, bytes: &[u8]) {
+    if stamp_count == 0 {
+        note_store_route("packet_stamps_none");
+        return;
+    }
+    note_store_route("packet_stamps_present");
+    if !crate::observe::first_sight(
+        "packet_stamp_records",
+        (u64::from(opcode) << 16) | u64::from(stamp_count),
+    ) {
+        return;
+    }
+    let at = PACKET_HEADER_LEN as usize;
+    let (w0, w1) = if bytes.len() >= at + PACKET_STAMP_LEN as usize {
+        (ld32(&bytes[at..]), ld32(&bytes[at + 4..]))
+    } else {
+        (0, 0)
+    };
+    crate::observe::off(format!(
+        "packet_stamp_records opcode={opcode:#x} count={stamp_count} w0={w0:#x} w1={w1:#x} \
+         (this device skips these records to reach the payload and has never \
+          decoded them; the count beside packet_stamps_none is the denominator)"
+    ));
+}
+
 /// Decode one packet out of a ring snapshot taken at [`packet_snapshot_len`].
 ///
 /// `ring_capacity` is what bounds a sane `total_size`, and it is a parameter
@@ -657,6 +761,7 @@ fn decode_packet(
     if total_size < min_payload_off {
         return Err(PacketError::BadSize);
     }
+    note_packet_stamp_records(opcode, stamp_count, bytes);
     let payload = bytes[min_payload_off as usize..total_size as usize].to_vec();
     Ok(Packet {
         opcode,
