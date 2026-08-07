@@ -206,7 +206,10 @@ impl ResourcePools {
             }
             Err(e) => {
                 ctx.device.destroy_image(image, None);
-                return Err(DrawError::VkCall(VkCall::new(VkOp::PoolsAllocStorageImage, e)));
+                return Err(DrawError::VkCall(VkCall::new(
+                    VkOp::PoolsAllocStorageImage,
+                    e,
+                )));
             }
         };
         counters.note_alloc();
@@ -404,9 +407,7 @@ impl ResourcePools {
     /// oldest-created first. Nothing selects a single victim any more: the
     /// reclaim takes the whole set at once, because by the time it runs the
     /// question is whether the dispatch survives at all.
-    pub(super) fn recoverable_compute_storage_residents(
-        &self,
-    ) -> Vec<ComputeStorageResidencyKey> {
+    pub(super) fn recoverable_compute_storage_residents(&self) -> Vec<ComputeStorageResidencyKey> {
         self.compute_storage_order
             .iter()
             .filter(|identity| {
@@ -572,11 +573,7 @@ impl ResourcePools {
     /// [`ResidentStorageImageSlot::gpu_only_content`] and keep the maintained
     /// totals in step. The single writer of that field on a live slot, for the
     /// reason [`Self::set_sole_copy`] is on the sibling registry.
-    fn set_compute_sole_copy(
-        &mut self,
-        identity: &ComputeStorageResidencyKey,
-        sole: bool,
-    ) -> bool {
+    fn set_compute_sole_copy(&mut self, identity: &ComputeStorageResidencyKey, sole: bool) -> bool {
         let Some(resident) = self.compute_storage_registry.get_mut(identity) else {
             return false;
         };
@@ -3319,7 +3316,10 @@ mod pin_count_tests {
         assert_eq!(pools.registry_non_pinned.count, 1);
         assert!(pools.pin_resident_target(&surf(1), true));
         check(&pools, "second pin");
-        assert_eq!(pools.registry_non_pinned.count, 1, "a second pin moves nothing");
+        assert_eq!(
+            pools.registry_non_pinned.count, 1,
+            "a second pin moves nothing"
+        );
 
         // First unpin leaves a holder, so it stays out; the second returns it.
         assert!(pools.pin_resident_target(&surf(1), false));
@@ -3327,7 +3327,10 @@ mod pin_count_tests {
         assert_eq!(pools.registry_non_pinned.count, 1);
         assert!(pools.pin_resident_target(&surf(1), false));
         check(&pools, "second unpin");
-        assert_eq!(pools.registry_non_pinned.count, 2, "the last unpin returns it");
+        assert_eq!(
+            pools.registry_non_pinned.count, 2,
+            "the last unpin returns it"
+        );
 
         // A spurious unpin saturates at zero and must not add it again.
         assert!(pools.pin_resident_target(&surf(1), false));

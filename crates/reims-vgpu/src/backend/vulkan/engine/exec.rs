@@ -1288,9 +1288,7 @@ pub(crate) unsafe fn execute_draw_inner(
                 },
             ));
         }
-        Some(mode) => Some(crate::backend::vulkan::translate::raster::vk_query_control_flags(
-            mode,
-        )),
+        Some(mode) => Some(crate::backend::vulkan::translate::raster::vk_query_control_flags(mode)),
     };
     let pipeline_key = PipelineKey {
         vert: vert_digest,
@@ -2499,9 +2497,10 @@ pub(crate) unsafe fn execute_draw_inner(
             let ci = vk::QueryPoolCreateInfo::default()
                 .query_type(vk::QueryType::OCCLUSION)
                 .query_count(1);
-            let pool = ctx.device.create_query_pool(&ci, None).map_err(|e| {
-                DrawError::VkCall(VkCall::new(VkOp::ExecCreateQueryPool, e))
-            })?;
+            let pool = ctx
+                .device
+                .create_query_pool(&ci, None)
+                .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ExecCreateQueryPool, e)))?;
             ctx.device.cmd_reset_query_pool(cb, pool, 0, 1);
             Some((pool, flags))
         }

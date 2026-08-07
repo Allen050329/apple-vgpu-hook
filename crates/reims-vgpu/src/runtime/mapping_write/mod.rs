@@ -966,7 +966,11 @@ pub fn write_bgra8_from_resident_gpu<M: HostMemory + HostOps>(
     // it would let the two rails land different guest memory for one frame.
     let pitch = u64::from(plan.row_length_texels.max(mw)) * 4;
     let extent = u64::from(mh.saturating_sub(1)) * pitch + u64::from(mw) * 4;
-    let guest = crate::runtime::guest_ram_map::reference_for_pages(
+    // Every run, not one range. The guest backs a surface in 16 KiB granules
+    // with no relation to each other, so a full-screen window is ~507 stretches
+    // and asking for a single contiguous reference refused every 1080p flush of
+    // a driven boot.
+    let runs = crate::runtime::guest_ram_map::references_for_runs(
         host,
         &gpas,
         page_size,
@@ -975,7 +979,7 @@ pub fn write_bgra8_from_resident_gpu<M: HostMemory + HostOps>(
     )
     .map_err(|refusal| GpuWritebackDecline::GuestRefRefused { refusal })?;
     let target = crate::backend::vulkan::engine::GuestPageTarget {
-        guest,
+        runs,
         row_length_texels: plan.row_length_texels,
         width: mw,
         height: mh,

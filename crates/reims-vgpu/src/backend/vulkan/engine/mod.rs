@@ -43,21 +43,19 @@ pub(crate) use counters::{CounterSnapshot, EngineCounters};
 pub(crate) use draw_phase::take_window as draw_phase_window;
 pub(crate) use draw_preparation::DrawPreparationDecline;
 pub(crate) use facade_decline::EngineFacadeDecline;
+pub use types::viewport_slot_count;
 pub use types::{
     BlendFactor, BlendOp, BlendStateResource, BufferContent, ColorWriteMask, ComputeBufferResource,
     ComputeOutput, ComputeRequest, ComputeResidentSampleBind, ComputeSampledImageResource,
     ComputeStorageImageResource, ComputeStorageResidency, CullMode, DepthClipMode, DepthState,
-    DrawError, DrawOutput, DrawRequest, FillMode, GuestRun,
-    GuestRunSource, IndexType, IndexedDrawResource, PrimitiveTopology, SampledContentIdentity,
-    SampledImageResource, SampledSource, SamplerAddressMode, SamplerBorderColor,
-    SamplerCompareFunction, SamplerFilter, SamplerMipFilter, SamplerResource, ScissorResource,
-    SecondaryColorTarget, SeedOrder, StencilFaceOps, StencilOp, StencilState,
-    StorageBufferResource, StorageImageFormat, TargetIdentity, VertexAttributeFormat,
-    VertexAttributeResource, VertexStepFunction, ViewportResource, VisibilityResultMode,
-    WindowPresentSource,
-    COLOR_INPUT_BINDING,
+    DrawError, DrawOutput, DrawRequest, FillMode, GuestRun, GuestRunSource, IndexType,
+    IndexedDrawResource, PrimitiveTopology, SampledContentIdentity, SampledImageResource,
+    SampledSource, SamplerAddressMode, SamplerBorderColor, SamplerCompareFunction, SamplerFilter,
+    SamplerMipFilter, SamplerResource, ScissorResource, SecondaryColorTarget, SeedOrder,
+    StencilFaceOps, StencilOp, StencilState, StorageBufferResource, StorageImageFormat,
+    TargetIdentity, VertexAttributeFormat, VertexAttributeResource, VertexStepFunction,
+    ViewportResource, VisibilityResultMode, WindowPresentSource, COLOR_INPUT_BINDING,
 };
-pub use types::viewport_slot_count;
 pub(crate) use vk_call::{VkCall, VkOp};
 #[cfg(feature = "host-window")]
 pub(crate) use window_present::{WindowCpuFrame, WindowPresentOutcome};
@@ -1506,19 +1504,17 @@ unsafe fn copy_image_level0_to_host_delivered(
             pools::read_back_slot(ctx, &readback, rb_size, ops.map, ops.invalidate)
                 .map(ReadbackResult::Copied)
         }
-        Some(lease) => {
-            match pools::invalidate_slot_for_read(ctx, &readback, ops.invalidate) {
-                Ok(()) => Ok(ReadbackResult::Leased {
-                    token: lease.token,
-                    ptr: lease.ptr,
-                    len: rb_size as usize,
-                }),
-                Err(e) => {
-                    pools::return_readback_lease(lease.token);
-                    Err(e)
-                }
+        Some(lease) => match pools::invalidate_slot_for_read(ctx, &readback, ops.invalidate) {
+            Ok(()) => Ok(ReadbackResult::Leased {
+                token: lease.token,
+                ptr: lease.ptr,
+                len: rb_size as usize,
+            }),
+            Err(e) => {
+                pools::return_readback_lease(lease.token);
+                Err(e)
             }
-        }
+        },
         None => pools::read_back_slot(ctx, &readback, rb_size, ops.map, ops.invalidate)
             .map(ReadbackResult::Copied),
     };
@@ -1692,9 +1688,14 @@ pub fn read_target_leased(identity: &TargetIdentity) -> Result<Option<LeasedFram
 /// and its row pitch; the engine takes it as given and checks only what it can
 /// see — that the resident matches the extent and that the range is long enough.
 pub struct GuestPageTarget {
-    /// The bounded reference to the guest bytes the frame lands in, covering
-    /// the extent this copy names and nothing more.
-    pub guest: crate::runtime::guest_ram::GuestRef,
+    /// The guest bytes the frame lands in, one bindable reference per
+    /// contiguous stretch, ascending and tiling the window exactly.
+    ///
+    /// A `Vec` because the guest backs a surface in 16 KiB granules that are
+    /// unrelated to each other, so a 1920x1080 window is ~507 stretches and one
+    /// range would name 1/507th of the frame. `references_for_runs` is the only
+    /// producer and it guarantees the tiling; see its doc for what that buys.
+    pub runs: Vec<crate::runtime::guest_ram_map::GuestWindowRun>,
     /// Guest row pitch in **texels** (`bufferRowLength`). Rows past the first
     /// start this far apart, which is how a padded guest pitch is honoured
     /// without the inter-row bytes ever being written.
@@ -1714,6 +1715,28 @@ impl GuestPageTarget {
         let pitch = u64::from(self.row_length_texels.max(self.width)) * 4;
         let rows_before = u64::from(self.height.saturating_sub(1));
         rows_before * pitch + u64::from(self.width) * 4
+    }
+
+    /// Guest bytes the runs actually name, summed.
+    ///
+    /// Each run's `requested` and not its `bound_len`: the latter is rounded
+    /// out to the import's granularity, so summing it would claim coverage of
+    /// bytes past the window and turn a short window into one that passes the
+    /// check below.
+    fn window_bytes(&self) -> u64 {
+        self.runs
+            .iter()
+            .map(|r| r.guest.requested())
+            .fold(0u64, u64::saturating_add)
+    }
+
+    /// The window's byte layout, for planning copy rectangles.
+    fn geometry(&self) -> crate::runtime::guest_window_regions::WindowGeometry {
+        crate::runtime::guest_window_regions::WindowGeometry {
+            pitch_bytes: u64::from(self.row_length_texels.max(self.width)) * 4,
+            width_texels: self.width,
+            height_texels: self.height,
+        }
     }
 }
 
@@ -1781,19 +1804,15 @@ pub fn copy_target_to_guest_pages(
         ));
     }
     let need = dst.extent_end();
-    if need > dst.guest.requested() {
+    let have = dst.window_bytes();
+    if need > have {
         return Err(DrawError::GuestPageWrite(
-            GuestWriteDecline::WindowTooSmall {
-                need,
-                have: dst.guest.requested(),
-            },
+            GuestWriteDecline::WindowTooSmall { need, have },
         ));
     }
     unsafe {
-        let bound = pools
-            .bind_guest_ram(ctx, &dst.guest)
-            .map_err(|inner| DrawError::GuestPageWrite(GuestWriteDecline::Import { inner }))?;
-        copy_image_level0_to_buffer(ctx, pools, counters, &snap, bound.buffer, dst, bound)?;
+        let copies = plan_guest_copies(ctx, pools, dst)?;
+        copy_image_level0_to_buffer(ctx, pools, counters, &snap, &copies)?;
         pools.registry_set_layout(identity, ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
         counters.note_target_read(u64::from(dst.width) * u64::from(dst.height) * 4);
     }
@@ -1806,14 +1825,90 @@ pub fn copy_target_to_guest_pages(
 ///
 /// `buffer` must be bound to memory covering `dst`'s extent, and `snap` must
 /// name a live image belonging to `ctx`.
+/// The largest number of copy rectangles this rail will submit for one frame.
+///
+/// Derived, not chosen. The guest backs a surface in 16 KiB physically
+/// contiguous granules, and a stretch yields at most three rectangles — a
+/// leading part-row, the whole rows between merged into one, and a trailing
+/// part-row. So the ceiling is `3 * extent / 16 KiB`, which for a 4K BGRA frame
+/// (33.2 MB, 2025 stretches) is 6075. 8192 clears that with room and is still
+/// far below anything a driver struggles to consume.
+///
+/// A window past it declines by name rather than being truncated: a partial
+/// region list would land part of the frame and leave the rest holding the
+/// previous one, which is the silent loss this crate's rules exist to stop.
+const MAX_GUEST_COPY_REGIONS: usize = 8192;
+
+/// Bind every run and turn it into copy rectangles, grouped by the buffer they
+/// land in.
+///
+/// Grouped because two runs need not share an import: a window straddling two
+/// RAMBlocks resolves against two `VkBuffer`s, and one `vkCmdCopyImageToBuffer`
+/// names exactly one. Ordinary machines have one RAMBlock and this is a
+/// single-entry `Vec`, but the grouping is what makes the two-block case land
+/// the whole frame instead of the part that happened to be first.
+unsafe fn plan_guest_copies(
+    ctx: &context::DeviceContext,
+    pools: &mut pools::ResourcePools,
+    dst: &GuestPageTarget,
+) -> Result<Vec<(ash::vk::Buffer, Vec<ash::vk::BufferImageCopy>)>, DrawError> {
+    use host_ram::GuestWriteDecline;
+    let geom = dst.geometry();
+    let mut grouped: Vec<(ash::vk::Buffer, Vec<ash::vk::BufferImageCopy>)> = Vec::new();
+    let mut total = 0usize;
+    for run in &dst.runs {
+        let bound = unsafe { pools.bind_guest_ram(ctx, &run.guest) }
+            .map_err(|inner| DrawError::GuestPageWrite(GuestWriteDecline::Import { inner }))?;
+        // `head` is what the granularity rounding added in front of the byte the
+        // caller asked for, so the run's first requested byte sits here.
+        let base = bound.offset + bound.head;
+        let start = run.window_offset;
+        let end = start.saturating_add(run.guest.requested());
+        for r in crate::runtime::guest_window_regions::plan_regions(&geom, start, end) {
+            total += 1;
+            if total > MAX_GUEST_COPY_REGIONS {
+                return Err(DrawError::GuestPageWrite(
+                    GuestWriteDecline::TooManyRegions {
+                        limit: MAX_GUEST_COPY_REGIONS,
+                        runs: dst.runs.len(),
+                    },
+                ));
+            }
+            let region = ash::vk::BufferImageCopy::default()
+                // The rectangle's own offset is in window bytes; `- start`
+                // re-bases it onto this run, which is what `base` names.
+                .buffer_offset(base + (r.window_offset - start))
+                // In texels. This is the buffer-side row stride, and it is what
+                // makes a merged multi-row rectangle name consecutive guest
+                // rows — valid because within one run the guest bytes are
+                // contiguous, so consecutive rows really are `pitch` apart.
+                .buffer_row_length(dst.row_length_texels)
+                .image_subresource(color_subresource_layers())
+                .image_offset(ash::vk::Offset3D {
+                    x: r.x as i32,
+                    y: r.y as i32,
+                    z: 0,
+                })
+                .image_extent(ash::vk::Extent3D {
+                    width: r.width,
+                    height: r.height,
+                    depth: 1,
+                });
+            match grouped.iter_mut().find(|(b, _)| *b == bound.buffer) {
+                Some((_, regions)) => regions.push(region),
+                None => grouped.push((bound.buffer, vec![region])),
+            }
+        }
+    }
+    Ok(grouped)
+}
+
 unsafe fn copy_image_level0_to_buffer(
     ctx: &context::DeviceContext,
     pools: &mut pools::ResourcePools,
     counters: &counters::EngineCounters,
     snap: &ResidentReadSnapshot,
-    buffer: ash::vk::Buffer,
-    dst: &GuestPageTarget,
-    bound: host_ram::BoundGuestRam,
+    copies: &[(ash::vk::Buffer, Vec<ash::vk::BufferImageCopy>)],
 ) -> Result<(), DrawError> {
     let submit_started = std::time::Instant::now();
     // Appended to a recording batch where there is one, for the reason
@@ -1885,25 +1980,18 @@ unsafe fn copy_image_level0_to_buffer(
         ctx.device
             .cmd_write_timestamp(cb, ash::vk::PipelineStageFlags::TRANSFER, probe.pool, 1);
     }
-    let region = [ash::vk::BufferImageCopy::default()
-        .buffer_offset(bound.offset + bound.head)
-        // In texels, and only meaningful when the guest's pitch is wider than
-        // the frame. Zero means tight rows, which is what the guest's own row
-        // pitch reduces to whenever it equals `width * 4`.
-        .buffer_row_length(dst.row_length_texels)
-        .image_subresource(color_subresource_layers())
-        .image_extent(ash::vk::Extent3D {
-            width: dst.width,
-            height: dst.height,
-            depth: 1,
-        })];
-    ctx.device.cmd_copy_image_to_buffer(
-        cb,
-        snap.image,
-        ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-        buffer,
-        &region,
-    );
+    // One call per buffer, all of them into the same command buffer, so the
+    // whole frame is still one submission and one fence however many RAMBlocks
+    // it touched.
+    for (buffer, regions) in copies {
+        ctx.device.cmd_copy_image_to_buffer(
+            cb,
+            snap.image,
+            ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            *buffer,
+            regions,
+        );
+    }
     if let Some(probe) = ctx.timestamps.as_ref() {
         ctx.device.cmd_write_timestamp(
             cb,
@@ -2443,7 +2531,13 @@ mod guest_page_target_tests {
         );
         let slice = import.slice(0, 1 << 20).expect("inside");
         GuestPageTarget {
-            guest: GuestRef::new(import, slice).expect("its own import"),
+            // One run covering the whole window: this fixture is about the
+            // extent arithmetic, and a contiguous window is exactly what
+            // `references_for_runs` returns a single run for.
+            runs: vec![crate::runtime::guest_ram_map::GuestWindowRun {
+                window_offset: 0,
+                guest: GuestRef::new(import, slice).expect("its own import"),
+            }],
             row_length_texels,
             width,
             height,

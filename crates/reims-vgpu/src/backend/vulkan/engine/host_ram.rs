@@ -365,6 +365,15 @@ pub enum GuestWriteDecline {
     /// independently-derived numbers, and a disagreement between them is a
     /// frame that would land under the wrong pitch.
     WindowTooSmall { need: u64, have: u64 },
+    /// The window needs more copy rectangles than this rail will submit.
+    ///
+    /// Carries `runs` as well as the limit because the two say different
+    /// things: a window that is merely large and one that is pathologically
+    /// fragmented both hit the ceiling, and only the second is a reason to
+    /// revisit how runs are coalesced. Declining rather than truncating — a
+    /// partial region list lands part of the frame and leaves the rest holding
+    /// the previous one.
+    TooManyRegions { limit: usize, runs: usize },
     /// The import itself declined; the inner reason names the step.
     Import { inner: HostRamDecline },
 }
@@ -376,6 +385,7 @@ impl Decline for GuestWriteDecline {
             Self::NotScanoutOrder => "gpu_writeback_not_scanout_order",
             Self::GeometryMoved { .. } => "gpu_writeback_geometry_moved",
             Self::WindowTooSmall { .. } => "gpu_writeback_window_too_small",
+            Self::TooManyRegions { .. } => "gpu_writeback_too_many_regions",
             // The inner decline's own slug, so a driver that refuses the pointer
             // and a range that is too short stay as distinguishable here as they
             // are at the import site.
@@ -398,6 +408,9 @@ impl Decline for GuestWriteDecline {
             ],
             Self::WindowTooSmall { need, have } => {
                 vec![("need", need.to_string()), ("have", have.to_string())]
+            }
+            Self::TooManyRegions { limit, runs } => {
+                vec![("limit", limit.to_string()), ("runs", runs.to_string())]
             }
             Self::Import { inner } => inner.fields(),
         }

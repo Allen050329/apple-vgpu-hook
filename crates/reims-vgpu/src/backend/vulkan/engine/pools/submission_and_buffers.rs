@@ -398,9 +398,7 @@ impl ResourcePools {
                 // `ResidentStorageImageSlot::gpu_only_content`.
                 self.compute_storage_registry
                     .get(*k)
-                    .is_some_and(|r| {
-                        !r.pinned && !r.gpu_only_content && r.last_touch_ms <= cutoff
-                    })
+                    .is_some_and(|r| !r.pinned && !r.gpu_only_content && r.last_touch_ms <= cutoff)
             })
             .take(max)
             .copied()
@@ -3068,10 +3066,7 @@ mod recycle_tests {
         assert_eq!(pools.compute_storage_sole_copy.count, 1);
         assert!(pools.remove_compute_storage_resident(&b).is_some());
         check(&pools, "removing a sole-copy resident");
-        assert_eq!(
-            pools.compute_storage_sole_copy,
-            NonPinnedTotals::default()
-        );
+        assert_eq!(pools.compute_storage_sole_copy, NonPinnedTotals::default());
 
         assert!(
             !pools.note_compute_storage_copied_out(&b),
@@ -3196,10 +3191,7 @@ mod recycle_tests {
             format: StorageImageFormat::default(),
             sampled_only: false,
         };
-        let reshaped = StorageImageKey {
-            width: 16,
-            ..same
-        };
+        let reshaped = StorageImageKey { width: 16, ..same };
 
         assert!(
             pools.compute_rekey_refusal(&pinned, same).is_none(),

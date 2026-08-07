@@ -987,29 +987,28 @@ impl ObjectCaches {
         let mut shader_inputs: Option<VertexInputWidths> = None;
         let mut attribute_formats = Vec::with_capacity(key.attrs.len());
         for attr in &key.attrs {
-            let binding = match ctx.vertex_formats.resolve(
-                attr.format,
-                attr.offset,
-                attr.stride,
-                || {
-                    shader_inputs
-                        .get_or_insert_with(|| VertexInputWidths::from_spirv(vert_spirv))
-                        .at(attr.location)
-                },
-            ) {
-                Ok(binding) => binding,
-                Err(translate_reason) => {
-                    let err = DrawError::Unsupported(super::reason::DrawReason::VertexFormat(
-                        translate_reason,
-                    ));
-                    crate::observe::Emit::decline("vk_engine_vertex_format", &translate_reason)
-                        .fail_once(
-                            (u64::from(attr.location) << 32) | u64::from(translate_reason.value()),
-                        );
-                    self.pipelines.insert_negative(key.clone(), err.clone());
-                    return Err(err);
-                }
-            };
+            let binding =
+                match ctx
+                    .vertex_formats
+                    .resolve(attr.format, attr.offset, attr.stride, || {
+                        shader_inputs
+                            .get_or_insert_with(|| VertexInputWidths::from_spirv(vert_spirv))
+                            .at(attr.location)
+                    }) {
+                    Ok(binding) => binding,
+                    Err(translate_reason) => {
+                        let err = DrawError::Unsupported(super::reason::DrawReason::VertexFormat(
+                            translate_reason,
+                        ));
+                        crate::observe::Emit::decline("vk_engine_vertex_format", &translate_reason)
+                            .fail_once(
+                                (u64::from(attr.location) << 32)
+                                    | u64::from(translate_reason.value()),
+                            );
+                        self.pipelines.insert_negative(key.clone(), err.clone());
+                        return Err(err);
+                    }
+                };
             if let Some(narrow) = binding.widened_from {
                 // Fail-visible because a widened attribute is a device-specific
                 // difference from what the guest asked for, even though
