@@ -272,8 +272,7 @@ fn a_packet_still_being_written_is_incomplete_and_an_impossible_one_is_a_fault()
     // A declared size the ring itself could never hold is the guest's error,
     // and still reads as one.
     let mut impossible = full.clone();
-    impossible[PACKET_TOTAL_SIZE..PACKET_TOTAL_SIZE + 4]
-        .copy_from_slice(&(RING + 1).to_le_bytes());
+    impossible[PACKET_TOTAL_SIZE..PACKET_TOTAL_SIZE + 4].copy_from_slice(&(RING + 1).to_le_bytes());
     assert_eq!(
         packet_snapshot_len(&impossible, RING, RING),
         PACKET_HEADER_LEN,

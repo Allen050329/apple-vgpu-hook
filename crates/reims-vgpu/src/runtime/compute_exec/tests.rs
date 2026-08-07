@@ -2092,7 +2092,10 @@ fn bulk_linear_helpers_fall_back_on_fragmented_span() {
     ));
     // The fallback primitive still lands bytes across the fragmented span.
     let payload = [0xABu8; 8];
-    assert!(gva_mem::write_task_gva_product(&mut state, &mut host, 1, gva, &payload).is_ok());
+    assert!(
+        gva_mem::write_task_gva_product_within(&mut state, &mut host, 1, gva, &payload, None)
+            .is_ok()
+    );
 }
 
 /// A staged compute buffer records the pages it resolved to, and the writeback

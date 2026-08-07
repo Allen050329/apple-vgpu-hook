@@ -1078,8 +1078,8 @@ mod tests {
         // Write 4 bytes at end of page0 + 4 at start of page1 (crosses gap).
         let gva = page - 4;
         assert!(
-            crate::runtime::gva_mem::write_task_gva_product(
-                &mut state, &mut host, 1, gva, &payload
+            crate::runtime::gva_mem::write_task_gva_product_within(
+                &mut state, &mut host, 1, gva, &payload, None
             )
             .is_ok(),
             "multi-import product write must succeed across fragmented PFNs"
@@ -1374,12 +1374,13 @@ mod tests {
             .len();
         // pt_fixture wires PTE[0] only, so page 1 of this two-page span is
         // unresolved. `page - 4` straddles the boundary.
-        assert!(crate::runtime::gva_mem::write_task_gva_product(
+        assert!(crate::runtime::gva_mem::write_task_gva_product_within(
             &mut state,
             &mut host,
             1,
             page - 4,
-            &[0u8; 8]
+            &[0u8; 8],
+            None
         )
         .is_err());
         let body = std::fs::read_to_string(crate::observe::fail_log_path()).unwrap_or_default();

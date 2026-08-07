@@ -1469,12 +1469,16 @@ fn reply_compute_info<H: HostMemory + HostOps>(
         st32(&mut pair[0..4], key);
         st32(&mut pair[4..8], value);
         let off = (wrote as u64) * DEVICE_INFO_REPLY_PAIR_LEN as u64;
-        if crate::runtime::gva_mem::write_task_gva_product(
+        if crate::runtime::gva_mem::write_task_gva_product_within(
             state,
             host,
             task_id,
             reply_gva + off,
             &pair,
+            // One reply pair at a fixed offset, not a row loop: the span is
+            // re-derived from `wrote` rather than from a destination that can
+            // move, and the packet being retired is what authorises it.
+            None,
         )
         .is_err()
         {
@@ -1488,12 +1492,14 @@ fn reply_compute_info<H: HostMemory + HostOps>(
     if wrote < count {
         let sentinel = [0u8; DEVICE_INFO_REPLY_PAIR_LEN];
         let off = (wrote as u64) * DEVICE_INFO_REPLY_PAIR_LEN as u64;
-        let _ = crate::runtime::gva_mem::write_task_gva_product(
+        let _ = crate::runtime::gva_mem::write_task_gva_product_within(
             state,
             host,
             task_id,
             reply_gva + off,
             &sentinel,
+            // The terminating pair of the same reply, on the same authority.
+            None,
         );
     }
     // Success census — the reply landed. Route to `off()` so it stays always-on
@@ -1554,12 +1560,15 @@ fn reply_heap_texture_size_and_align<H: HostMemory + HostOps>(
         }
     };
     let reply = requirement.encode();
-    if crate::runtime::gva_mem::write_task_gva_product(
+    if crate::runtime::gva_mem::write_task_gva_product_within(
         state,
         host,
         task_id,
         request.reply_gva,
         &reply,
+        // A single completion stamp for the packet being retired, which is
+        // what authorises it. No loop, so no window to capture.
+        None,
     )
     .is_err()
     {
