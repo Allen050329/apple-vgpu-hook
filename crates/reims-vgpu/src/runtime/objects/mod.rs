@@ -1952,6 +1952,16 @@ pub fn replace_physical<H: HostMemory + crate::runtime::host::HostOps>(
 /// `no_state + texture + linear` must equal `unknown_object`. It does above
 /// (43 + 13 = 56); on the maxima it did not (32 + 7 + 1 vs 37).
 ///
+/// Re-taken on the host-pointer-import tree, same probe, 54 windows summed:
+/// `17 + 7 + 0 = 24 == 24`, alongside `replace_physical_dropped` 19 and
+/// `_no_pages` 5. So the identity survives the guest-memory rail change, which
+/// is the plan's §7 line for it.
+///
+/// **A window drag cannot check this.** A `window-drag-probe` boot reads all
+/// four at zero, so the identity holds as `0 == 0` and proves nothing —
+/// verifying it needs `web-content-probe --churn 1`, which is what produced
+/// both readings above.
+///
 /// `invalidate_object_host_copies` is the discharge, and it is the same one
 /// `delete_object` has always performed for the same two maps — the difference
 /// being that a delete also unnames the object while a re-point only moves its
