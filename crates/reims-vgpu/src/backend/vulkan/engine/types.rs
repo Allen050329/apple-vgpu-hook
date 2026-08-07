@@ -785,11 +785,26 @@ impl BufferContent {
     /// out of guest RAM (same freshness as the CPU staging path's encode-time
     /// read).
     ///
-    /// Every `GuestRuns` bind is a CPU gather now — the GPU has no way to reach
-    /// guest pages — but the hot path does that gather straight into mapped
-    /// staging with `write_staging_from_runs`, which is what avoids the
-    /// intermediate heap `Vec` this builds. Callers here are diagnostics and
-    /// coverage proofs, which want the bytes as a slice.
+    /// **Nothing in the product calls this.** Both call sites are `#[cfg(test)]`,
+    /// and that is the whole story of the method: it materializes a fragmented
+    /// gather into one contiguous `Vec` so a test can compare it against what
+    /// the guest laid out. It is not a rail, and the heap `Vec` it builds is
+    /// not a cost the device pays.
+    ///
+    /// It claimed the opposite until the host-pointer import landed — "every
+    /// `GuestRuns` bind is a CPU gather now, the GPU has no way to reach guest
+    /// pages". That was true when written and is now contradicted by the
+    /// `GuestRuns` doc a few lines above, on this same type: a draw-time buffer
+    /// bind is gathered by `vkCmdCopyBuffer` inside the draw's own command
+    /// buffer and never crosses the CPU. `write_staging_from_runs` does still
+    /// exist, but on the sampled rail, where `stage_phase` records it as zero
+    /// on a host that can import.
+    ///
+    /// Two doc comments on one type disagreeing is the divergence class
+    /// `AGENTS.md` warns about. This one earns a paragraph rather than a
+    /// deletion because the false half was the one a reader met first on
+    /// arriving at the method, and what it told them was that the gather does
+    /// not exist.
     pub fn cpu_bytes(&self) -> std::borrow::Cow<'_, [u8]> {
         match self {
             Self::Bytes(b) => std::borrow::Cow::Borrowed(b.as_slice()),
