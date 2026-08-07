@@ -45,9 +45,7 @@ use crate::runtime::decode::resource::{
 }; // slot-encoder fixtures only
 use crate::runtime::host::{HostMemory, HostOps};
 use crate::runtime::objects;
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
 use std::collections::HashMap;
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
 use std::sync::OnceLock;
 
 /// A refusal on the indirect-command-buffer rail.
@@ -1336,6 +1334,71 @@ pub fn materialize_metal_icb(
 }
 
 // ---------------------------------------------------------------------------
+// ICB registry: (task_id, icb_ref) → what the guest declared. Backend-free.
+// ---------------------------------------------------------------------------
+
+/// What the guest said about one ICB, with nothing of the host in it.
+///
+/// The descriptor and the command-memory span are the whole input to
+/// [`decode_icb_command_range`], and that decode is the same on all three
+/// pathways — so this lives here rather than inside the Metal object cache,
+/// which is the only reason the Vulkan arm can hold ICB state at all.
+///
+/// Split out because the two halves have different lifetimes as well as
+/// different portability: a descriptor change re-materializes the host object
+/// but does not by itself say the guest re-pointed its command memory.
+#[derive(Clone)]
+struct IcbRecord {
+    desc: IndirectCommandBufferDescriptor,
+    /// Guest ICB backing buffer (the command slots the guest filled).
+    command_memory: Option<IcbCommandMemory>,
+}
+
+fn icb_registry() -> &'static parking_lot::Mutex<HashMap<(u32, u32), IcbRecord>> {
+    static REGISTRY: OnceLock<parking_lot::Mutex<HashMap<(u32, u32), IcbRecord>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| parking_lot::Mutex::new(HashMap::new()))
+}
+
+/// Load the guest's ICB descriptor and record it, on every pathway.
+///
+/// Returns the descriptor the caller should build against. When the create body
+/// no longer matches what was recorded, the recorded command memory is dropped
+/// with it: a re-created ICB of a different shape is not the one whose slots the
+/// old span held, and decoding the old bytes at the new layout would read
+/// whatever happened to be at those offsets rather than refusing.
+pub fn resolve_icb_record<M: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    icb_ref: u32,
+) -> Result<IndirectCommandBufferDescriptor, IcbStatus> {
+    let desc = load_icb_descriptor(state, host, task_id, icb_ref)?;
+    let mut reg = icb_registry().lock();
+    match reg.get_mut(&(task_id, icb_ref)) {
+        Some(rec)
+            if rec.desc.max_command_count == desc.max_command_count
+                && rec.desc.command_types == desc.command_types =>
+        {
+            Ok(rec.desc.clone())
+        }
+        slot => {
+            let command_memory = None;
+            let rec = IcbRecord {
+                desc: desc.clone(),
+                command_memory,
+            };
+            match slot {
+                Some(existing) => *existing = rec,
+                None => {
+                    reg.insert((task_id, icb_ref), rec);
+                }
+            }
+            Ok(desc)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Host ICB cache: (task_id, icb_ref) → filled Metal ICB + retained resources
 // ---------------------------------------------------------------------------
 
@@ -1350,8 +1413,6 @@ struct HostIcbEntry {
     retained_buffers: Vec<metal::Buffer>,
     /// GVA writeback descriptors for buffers bound into filled commands.
     writebacks: Vec<IcbWriteback>,
-    /// Guest ICB backing buffer (CPU-filled command slots).
-    command_memory: Option<IcbCommandMemory>,
     /// True once at least one host fill or guest-memory fill has landed.
     has_fills: bool,
 }
@@ -1377,14 +1438,16 @@ fn icb_cache() -> &'static parking_lot::Mutex<HashMap<(u32, u32), HostIcbEntry>>
     CACHE.get_or_init(|| parking_lot::Mutex::new(HashMap::new()))
 }
 
-/// Drop all cached host ICBs (tests / task teardown).
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+/// Drop every recorded ICB and every cached host ICB (tests / task teardown).
+///
+/// One entry point for both maps: they are keyed alike and a registry entry
+/// outliving its host object would name a descriptor no `MTLIndirectCommandBuffer`
+/// was built from. On the Vulkan arm there is no second map to clear.
 pub fn clear_icb_cache() {
+    icb_registry().lock().clear();
+    #[cfg(all(feature = "backend-metal", target_os = "macos"))]
     icb_cache().lock().clear();
 }
-
-#[cfg(feature = "backend-vulkan")]
-pub fn clear_icb_cache() {}
 
 /// Resolve guest ICB ref → host Metal ICB, reusing the per-(task,ref) cache.
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
@@ -1400,7 +1463,10 @@ pub fn resolve_metal_icb<M: HostMemory + HostOps>(
     ),
     IcbStatus,
 > {
-    let desc = load_icb_descriptor(state, host, task_id, icb_ref)?;
+    // The registry owns the descriptor and decides when a create body has
+    // changed enough to invalidate what was recorded against it, so the host
+    // object is materialized from the same answer the portable decode reads.
+    let desc = resolve_icb_record(state, host, task_id, icb_ref)?;
     let mut cache = icb_cache().lock();
     if let Some(entry) = cache.get(&(task_id, icb_ref)) {
         // Descriptor must still match the create body we materialize from.
@@ -1420,7 +1486,6 @@ pub fn resolve_metal_icb<M: HostMemory + HostOps>(
             retained_psos_render: Vec::new(),
             retained_buffers: Vec::new(),
             writebacks: Vec::new(),
-            command_memory: None,
             has_fills: false,
         },
     );
@@ -1453,8 +1518,7 @@ pub fn resolve_metal_icb<M: HostMemory + HostOps>(
 /// decline by name — and the device separately never writes the answer the
 /// guest asked for, though `runtime::heap_query` shows the pattern for that.
 /// The rail is dormant, which is why the wrong reading survived: `runtime::icb`
-/// reads 0.00% on a driven boot and `bind_icb_command_memory` returns
-/// `icb_bind_memory_no_vulkan_path` on the entire Vulkan arm.
+/// reads 0.00% on a driven boot.
 pub const INFO_OP_ICB_HOST_RESOURCE: u32 = 0x1d1;
 pub const INFO_OP_ICB_HOST_RESOURCE_RECORD_LEN: u32 = 0x18;
 pub const INFO_OP_ICB_HOST_RESOURCE_PAYLOAD_LEN: usize = 0x10;
@@ -1505,20 +1569,12 @@ pub fn bind_icb_command_memory(
     if icb_ref == 0 || mem.gva == 0 || mem.byte_len == 0 {
         return Err(IcbStatus::Args("icb_bind_memory_bad_args"));
     }
-    #[cfg(feature = "backend-vulkan")]
-    {
-        let _ = (task_id, icb_ref, mem);
-        Err(IcbStatus::NoMetal("icb_bind_memory_no_vulkan_path"))
-    }
-    #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-    {
-        let mut cache = icb_cache().lock();
-        let entry = cache
-            .get_mut(&(task_id, icb_ref))
-            .ok_or(IcbStatus::Missing("icb_bind_memory_not_cached"))?;
-        entry.command_memory = Some(mem);
-        Ok(())
-    }
+    let mut reg = icb_registry().lock();
+    let rec = reg
+        .get_mut(&(task_id, icb_ref))
+        .ok_or(IcbStatus::Missing("icb_bind_memory_not_cached"))?;
+    rec.command_memory = Some(mem);
+    Ok(())
 }
 
 /// Associate ICB command memory from a type-1 buffer object-list ref (sync path).
@@ -1536,8 +1592,11 @@ pub fn associate_icb_backing_buffer_ref<M: HostMemory + HostOps>(
     if icb_ref == 0 || buffer_ref == 0 {
         return Err(IcbStatus::Args("icb_associate_ref_zero"));
     }
-    // Materialize host ICB + layout from type-7 create if needed.
-    let (desc, _) = resolve_metal_icb(state, host, task_id, icb_ref)?;
+    // Record the type-7 create layout if it is not already recorded. This used
+    // to materialize the host `MTLIndirectCommandBuffer` as a side effect, which
+    // is why associating a backing buffer refused outright on the Vulkan arm —
+    // the association is guest bookkeeping and needs no host object at all.
+    let desc = resolve_icb_record(state, host, task_id, icb_ref)?;
     let (gva, buf_size) = type1_buffer_gva_size(state, host, task_id, buffer_ref)?;
     let need = (desc.layout.command_size as u64).saturating_mul(desc.max_command_count as u64);
     if need == 0 {
@@ -1661,7 +1720,6 @@ fn type1_buffer_gva_size<M: HostMemory + HostOps>(
     )
 }
 
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
 /// Convert absolute bind VA → offset into type-1 allocation (`handle << page_shift`).
 ///
 /// PGSerializer stores `base+offset` in the bind VA field (not a separate offset).
@@ -1687,7 +1745,6 @@ fn offset_from_wire_va<M: HostMemory + HostOps>(
     Ok(off)
 }
 
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
 /// Resolve wire VAs on a compute fill into type-1 bind offsets (mutates in place).
 pub fn resolve_compute_fill_offsets<M: HostMemory + HostOps>(
     state: &DeviceState,
@@ -1703,7 +1760,6 @@ pub fn resolve_compute_fill_offsets<M: HostMemory + HostOps>(
     Ok(())
 }
 
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
 /// Resolve wire VAs on a render fill into type-1 bind / index offsets (mutates in place).
 pub fn resolve_render_fill_offsets<M: HostMemory + HostOps>(
     state: &DeviceState,
@@ -1799,19 +1855,33 @@ pub fn resolve_render_fill_offsets<M: HostMemory + HostOps>(
     Ok(())
 }
 
+/// One decoded, offset-resolved ICB command slot, ready for a backend to apply.
+///
+/// [`decode_icb_command_range`] returns these; what a backend does with one is
+/// the only part of ICB execute that is backend-specific. The Metal arm fills a
+/// real `MTLIndirectCommandBuffer` from them, the Vulkan arm replays them as
+/// draws. Empty slots are not represented — the decoders skip them.
+#[derive(Clone, Debug)]
+pub enum IcbCommandFill {
+    Compute(IcbComputeFill),
+    Render(IcbRenderFill),
+}
+
 /// Decode guest command memory into host ICB fills for the given index range.
 ///
-/// Called from execute when the ICB has registered command memory. Dispatches
-/// compute vs render fills from wire `commandTypes` / slot command-type tags.
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-pub fn fill_icb_from_command_memory<M: HostMemory + HostOps>(
+/// Dispatches compute vs render fills from wire `commandTypes` / slot
+/// command-type tags, and resolves every wire VA into a type-1 bind offset, so
+/// the result names only refs and offsets. Nothing here touches a backend: this
+/// is the half of ICB execute that is the same on all three pathways, and it is
+/// portable so that the Vulkan arm has something to replay.
+pub fn decode_icb_command_range<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &M,
     task_id: u32,
     icb_ref: u32,
     range_location: u64,
     range_length: u64,
-) -> Result<(), IcbStatus> {
+) -> Result<Vec<IcbCommandFill>, IcbStatus> {
     use crate::runtime::decode::resource::{
         MTL_INDIRECT_CMD_CONCURRENT_DISPATCH, MTL_INDIRECT_CMD_CONCURRENT_DISPATCH_THREADS,
         MTL_INDIRECT_CMD_DRAW, MTL_INDIRECT_CMD_DRAW_INDEXED,
@@ -1821,20 +1891,20 @@ pub fn fill_icb_from_command_memory<M: HostMemory + HostOps>(
     use crate::runtime::gva_mem;
 
     let (layout, max_kernel, max_vertex, max_fragment, command_types, max_cmds, mem) = {
-        let cache = icb_cache().lock();
-        let entry = cache
+        let reg = icb_registry().lock();
+        let rec = reg
             .get(&(task_id, icb_ref))
             .ok_or(IcbStatus::Missing("icb_fill_not_cached"))?;
-        let mem = entry
+        let mem = rec
             .command_memory
             .ok_or(IcbStatus::Missing("icb_fill_no_command_memory"))?;
         (
-            entry.desc.layout,
-            entry.desc.max_kernel_buffer_bind_count,
-            entry.desc.max_vertex_buffer_bind_count,
-            entry.desc.max_fragment_buffer_bind_count,
-            entry.desc.command_types,
-            entry.desc.max_command_count as u64,
+            rec.desc.layout,
+            rec.desc.max_kernel_buffer_bind_count,
+            rec.desc.max_vertex_buffer_bind_count,
+            rec.desc.max_fragment_buffer_bind_count,
+            rec.desc.command_types,
+            rec.desc.max_command_count as u64,
             mem,
         )
     };
@@ -1872,6 +1942,7 @@ pub fn fill_icb_from_command_memory<M: HostMemory + HostOps>(
             | MTL_INDIRECT_CMD_DRAW_MESH_THREADS)
         != 0;
 
+    let mut out = Vec::new();
     for i in range_location..end {
         let off = (i as usize) * (layout.command_size as usize);
         let slot = &bytes[off..off + layout.command_size as usize];
@@ -1880,7 +1951,7 @@ pub fn fill_icb_from_command_memory<M: HostMemory + HostOps>(
             if let Some(mut fill) = decode_compute_command_slot(&layout, slot, max_kernel)? {
                 fill.command_index = i as u32;
                 resolve_compute_fill_offsets(state, host, task_id, &mut fill)?;
-                fill_compute_command(state, host, task_id, icb_ref, &fill)?;
+                out.push(IcbCommandFill::Compute(fill));
                 continue;
             }
         }
@@ -1890,8 +1961,31 @@ pub fn fill_icb_from_command_memory<M: HostMemory + HostOps>(
             {
                 fill.command_index = i as u32;
                 resolve_render_fill_offsets(state, host, task_id, &mut fill)?;
-                fill_render_command(state, host, task_id, icb_ref, &fill)?;
+                out.push(IcbCommandFill::Render(fill));
             }
+        }
+    }
+    Ok(out)
+}
+
+/// Fill a host `MTLIndirectCommandBuffer` from the guest's command memory.
+///
+/// The decode is [`decode_icb_command_range`]; this is only the Metal half that
+/// applies each decoded slot.
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+pub fn fill_icb_from_command_memory<M: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    icb_ref: u32,
+    range_location: u64,
+    range_length: u64,
+) -> Result<(), IcbStatus> {
+    for fill in decode_icb_command_range(state, host, task_id, icb_ref, range_location, range_length)?
+    {
+        match fill {
+            IcbCommandFill::Compute(f) => fill_compute_command(state, host, task_id, icb_ref, &f)?,
+            IcbCommandFill::Render(f) => fill_render_command(state, host, task_id, icb_ref, &f)?,
         }
     }
     Ok(())
