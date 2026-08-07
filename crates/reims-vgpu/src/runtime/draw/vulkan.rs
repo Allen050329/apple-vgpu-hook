@@ -4727,6 +4727,11 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             fetch0
         };
         crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Sampled);
+        // The four `sampled_phase` spans below divide this phase's `sampled_us`,
+        // the same way `bind_phase` divides `binds_us`. Counted here rather than
+        // where a span opens, so a draw that samples nothing is still in the
+        // denominator.
+        crate::runtime::sampled_phase::note_sampled();
         // Sampled textures + samplers (metal2vulkan bands: textures 32+N, samplers 64+M).
         // Texture and sampler **indices are independent** (live logo SPIR-V: image
         // binding 35 = texture(3), sampler binding 64 = sampler(0)). Pairing
@@ -4744,90 +4749,111 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 if texture_ref == 0 {
                     return Ok(());
                 }
-                // Measure-only setup_tex sub-split (off-main-core): time the full
-                // per-bind resolution (guest object-list + descriptor reads +
-                // resolve + surface ensure) vs the post-resolve stats scan, so a
-                // boot log names which half of the ~800us/draw to cut.
-                let texture_entry =
-                    objects::lookup_list_entry(state, host, req.task_id, texture_ref);
-                // A type-8 view's channel remap. Resolved here rather than in
-                // the loaders because it describes how the bind READS the
-                // texture, not what the texture contains: the engine hands it
-                // to the image view as a component mapping and the hardware
-                // applies it at sample time, so the texels stay untouched and
-                // the bind keeps whatever content rail it was already on.
-                let view_swizzle = resolve_texture_view(state, host, req.task_id, texture_ref)
-                    .and_then(|view| view.swizzle)
-                    .filter(|plan| !pixel_format::swizzle_is_identity(plan));
-                let attachment_alias = frag_stage
-                    .then(|| fragment_attachment_alias_sample(req, index, texture_ref))
-                    .flatten();
-                let (tw, th, loaded) = if let Some((aw, ah, alias)) = attachment_alias {
-                    match alias {
-                        AttachmentAliasSample::Clear(clear) => (
-                            aw,
-                            ah,
-                            SampledSourceRequest::Bytes(
-                                std::sync::Arc::new(solid_rgba8(aw, ah, &clear)),
-                                None,
-                                TexelLayout::Rgba8,
+                // The two guest reads this bind needs before anything can decide
+                // where its texels come from. `sampled_phase::Part::Lookup` is
+                // this pair and nothing else, so the object-list walk is priced
+                // against the resolve below rather than summed into it.
+                let (texture_entry, view_swizzle) = {
+                    let _s = crate::runtime::sampled_phase::Span::open(
+                        crate::runtime::sampled_phase::Part::Lookup,
+                    );
+                    let texture_entry =
+                        objects::lookup_list_entry(state, host, req.task_id, texture_ref);
+                    // A type-8 view's channel remap. Resolved here rather than in
+                    // the loaders because it describes how the bind READS the
+                    // texture, not what the texture contains: the engine hands it
+                    // to the image view as a component mapping and the hardware
+                    // applies it at sample time, so the texels stay untouched and
+                    // the bind keeps whatever content rail it was already on.
+                    let view_swizzle = resolve_texture_view(state, host, req.task_id, texture_ref)
+                        .and_then(|view| view.swizzle)
+                        .filter(|plan| !pixel_format::swizzle_is_identity(plan));
+                    (texture_entry, view_swizzle)
+                };
+                // Where the texels come from, which is the part with the cache
+                // behind it. Scoped to a block so it closes at the resolve and
+                // not at the end of the bind: everything after it — the
+                // reflection read, the shape fold, the pushes — is deliberately
+                // unbracketed, and a span held to the closure's end would
+                // swallow it and make the four parts look like they summed.
+                // A bind that declines from inside here charges its remainder
+                // to `Resolve`, because the span commits on `Drop`.
+                let (tw, th, loaded) = {
+                    let _s = crate::runtime::sampled_phase::Span::open(
+                        crate::runtime::sampled_phase::Part::Resolve,
+                    );
+                    let attachment_alias = frag_stage
+                        .then(|| fragment_attachment_alias_sample(req, index, texture_ref))
+                        .flatten();
+                    if let Some((aw, ah, alias)) = attachment_alias {
+                        match alias {
+                            AttachmentAliasSample::Clear(clear) => (
+                                aw,
+                                ah,
+                                SampledSourceRequest::Bytes(
+                                    std::sync::Arc::new(solid_rgba8(aw, ah, &clear)),
+                                    None,
+                                    TexelLayout::Rgba8,
+                                ),
                             ),
-                        ),
-                        AttachmentAliasSample::Seed(seed) => (
-                            aw,
-                            ah,
-                            SampledSourceRequest::Bytes(
-                                std::sync::Arc::new(seed.to_vec()),
-                                None,
-                                TexelLayout::Rgba8,
+                            AttachmentAliasSample::Seed(seed) => (
+                                aw,
+                                ah,
+                                SampledSourceRequest::Bytes(
+                                    std::sync::Arc::new(seed.to_vec()),
+                                    None,
+                                    TexelLayout::Rgba8,
+                                ),
                             ),
-                        ),
-                        AttachmentAliasSample::ResidentChain => {
-                            let identity = render_chain_identity(state, req).ok_or({
-                                DrawError::DrawPreparation(
-                                    DrawPreparationDecline::AttachmentAliasIdentityMissing {
-                                        index,
-                                        texture_ref,
-                                    },
+                            AttachmentAliasSample::ResidentChain => {
+                                let identity = render_chain_identity(state, req).ok_or({
+                                    DrawError::DrawPreparation(
+                                        DrawPreparationDecline::AttachmentAliasIdentityMissing {
+                                            index,
+                                            texture_ref,
+                                        },
+                                    )
+                                })?;
+                                if !crate::backend::vulkan::engine::resident_content_ready(
+                                    &identity,
+                                ) {
+                                    return Err(DrawError::DrawPreparation(
+                                        DrawPreparationDecline::AttachmentAliasResidentNotReady {
+                                            index,
+                                            texture_ref,
+                                            width: identity.width(),
+                                            height: identity.height(),
+                                        },
+                                    ));
+                                }
+                                (
+                                    identity.width(),
+                                    identity.height(),
+                                    SampledSourceRequest::Target(identity),
                                 )
-                            })?;
-                            if !crate::backend::vulkan::engine::resident_content_ready(&identity) {
-                                return Err(DrawError::DrawPreparation(
-                                    DrawPreparationDecline::AttachmentAliasResidentNotReady {
-                                        index,
-                                        texture_ref,
-                                        width: identity.width(),
-                                        height: identity.height(),
-                                    },
-                                ));
                             }
-                            (
-                                identity.width(),
-                                identity.height(),
-                                SampledSourceRequest::Target(identity),
-                            )
                         }
+                    } else {
+                        let Some(loaded) = resolve_sampled_source(
+                            state,
+                            host,
+                            req.task_id,
+                            texture_ref,
+                            texture_entry,
+                        ) else {
+                            let detail = sample_miss_detail(state, host, req.task_id, texture_ref);
+                            return Err(DrawError::DrawPreparation(
+                                DrawPreparationDecline::TextureResolveMissing {
+                                    stage: if frag_stage { "fragment" } else { "vertex" },
+                                    index,
+                                    texture_ref,
+                                    detail,
+                                },
+                            ));
+                        };
+                        let (rw, rh, _mid, src) = loaded;
+                        (rw, rh, src)
                     }
-                } else {
-                    let Some(loaded) = resolve_sampled_source(
-                        state,
-                        host,
-                        req.task_id,
-                        texture_ref,
-                        texture_entry,
-                    ) else {
-                        let detail = sample_miss_detail(state, host, req.task_id, texture_ref);
-                        return Err(DrawError::DrawPreparation(
-                            DrawPreparationDecline::TextureResolveMissing {
-                                stage: if frag_stage { "fragment" } else { "vertex" },
-                                index,
-                                texture_ref,
-                                detail,
-                            },
-                        ));
-                    };
-                    let (rw, rh, _mid, src) = loaded;
-                    (rw, rh, src)
                 };
                 let mut bytes_identity = None;
                 // Byte layout of a CPU-origin bind. Default RGBA8; a source that
@@ -4989,6 +5015,12 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 Ok(())
             };
             // Stream sampler slots (often index 0 while texture is 3 for logo).
+            // Both loops share one span rather than one per bind: the fix here
+            // is a sampler object cache, which is the same fix whichever stage
+            // asked, so two bars would be two views of one lever.
+            let _s = crate::runtime::sampled_phase::Span::open(
+                crate::runtime::sampled_phase::Part::Samplers,
+            );
             for s in &req.vertex_samplers {
                 if s.sampler_ref != 0 {
                     push_smp(s.index, s.sampler_ref, s.lod_clamp, false)?;
@@ -5000,58 +5032,69 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 }
             }
         }
-        // AIR constexpr samplers carry their immutable state in reflection. Bind
-        // those exact values before the residual SPIR-V scan provisions defaults
-        // for translator-generated sampler-less read helpers.
-        for (reflection, frag_stage) in
-            [(&v_shader.reflection, false), (&f_shader.reflection, true)]
+        // One span over both walks below, because they answer the same question
+        // — which sampler bindings nothing has provisioned yet — and have the
+        // same fix: answer it once per translated shader in `m2v_cache` rather
+        // than once per draw. Two bars here would not be separately actionable.
         {
-            for reflected in &reflection.bindings {
-                if reflected.kind != metal2vulkan::reflect::ResourceKind::StaticSampler {
-                    continue;
-                }
-                let Some(descriptor) = reflected.descriptor else {
-                    return Err(DrawError::DrawPreparation(
-                        DrawPreparationDecline::StaticSamplerReflectionDescriptorMissing {
-                            stage: if frag_stage { "fragment" } else { "vertex" },
-                        },
-                    ));
-                };
-                let Some(state) = reflected.static_sampler else {
-                    return Err(DrawError::DrawPreparation(
-                        DrawPreparationDecline::StaticSamplerReflectionStateMissing {
-                            stage: if frag_stage { "fragment" } else { "vertex" },
-                            binding: descriptor.binding,
-                        },
-                    ));
-                };
-                let binding = descriptor.binding
-                    + if frag_stage && separate_sampled {
-                        FRAG_SAMPLED_RESOURCE_BINDING_OFFSET
-                    } else {
-                        0
+            let _s = crate::runtime::sampled_phase::Span::open(
+                crate::runtime::sampled_phase::Part::Reflect,
+            );
+            // AIR constexpr samplers carry their immutable state in reflection. Bind
+            // those exact values before the residual SPIR-V scan provisions defaults
+            // for translator-generated sampler-less read helpers.
+            for (reflection, frag_stage) in
+                [(&v_shader.reflection, false), (&f_shader.reflection, true)]
+            {
+                for reflected in &reflection.bindings {
+                    if reflected.kind != metal2vulkan::reflect::ResourceKind::StaticSampler {
+                        continue;
+                    }
+                    let Some(descriptor) = reflected.descriptor else {
+                        return Err(DrawError::DrawPreparation(
+                            DrawPreparationDecline::StaticSamplerReflectionDescriptorMissing {
+                                stage: if frag_stage { "fragment" } else { "vertex" },
+                            },
+                        ));
                     };
-                if sampler_binds.insert(binding) {
-                    let sampler = reflected_static_sampler_resource(
-                        if frag_stage { "fragment" } else { "vertex" },
-                        binding,
-                        state,
-                    )
-                    .map_err(DrawError::DrawPreparation)?;
-                    samplers.push(sampler);
+                    let Some(state) = reflected.static_sampler else {
+                        return Err(DrawError::DrawPreparation(
+                            DrawPreparationDecline::StaticSamplerReflectionStateMissing {
+                                stage: if frag_stage { "fragment" } else { "vertex" },
+                                binding: descriptor.binding,
+                            },
+                        ));
+                    };
+                    let binding = descriptor.binding
+                        + if frag_stage && separate_sampled {
+                            FRAG_SAMPLED_RESOURCE_BINDING_OFFSET
+                        } else {
+                            0
+                        };
+                    if sampler_binds.insert(binding) {
+                        let sampler = reflected_static_sampler_resource(
+                            if frag_stage { "fragment" } else { "vertex" },
+                            binding,
+                            state,
+                        )
+                        .map_err(DrawError::DrawPreparation)?;
+                        samplers.push(sampler);
+                    }
                 }
             }
-        }
-        // Reflect the residual shader interface and provision defaults only
-        // where explicit guest or constexpr state did not already win.
-        for binding in crate::runtime::spirv_bind::sampler_bindings(&v_words)
-            .into_iter()
-            .chain(crate::runtime::spirv_bind::sampler_bindings(&f_words))
-        {
-            if sampler_binds.insert(binding) {
-                samplers.push(
-                    crate::backend::vulkan::engine::SamplerResource::normalized_default(binding),
-                );
+            // Reflect the residual shader interface and provision defaults only
+            // where explicit guest or constexpr state did not already win.
+            for binding in crate::runtime::spirv_bind::sampler_bindings(&v_words)
+                .into_iter()
+                .chain(crate::runtime::spirv_bind::sampler_bindings(&f_words))
+            {
+                if sampler_binds.insert(binding) {
+                    samplers.push(
+                        crate::backend::vulkan::engine::SamplerResource::normalized_default(
+                            binding,
+                        ),
+                    );
+                }
             }
         }
         crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Seed);

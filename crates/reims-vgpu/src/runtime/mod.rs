@@ -86,6 +86,8 @@ pub mod plan;
 pub mod present_identity;
 /// The guest's per-resource validity quad, from both of its producers.
 pub mod resource_validity;
+/// The split of [`chain_phase`]'s largest *undivided* column, `sampled_us`.
+pub mod sampled_phase;
 /// Guest surface → host BGRA8 for the QEMU console.
 pub mod scanout;
 /// SPIR-V set-0 binding relocation for metal2vulkan + internal Vulkan engine (Linux).
@@ -108,4 +110,3 @@ pub mod texture;
 #[cfg(test)]
 pub(crate) use host::FakeHost;
 pub(crate) use host::{HostAction, HostOps};
-

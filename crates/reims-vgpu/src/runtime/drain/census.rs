@@ -1623,6 +1623,24 @@ fn emit_chain_phase() {
     // Under `chain_phase`, dividing its largest column the same way
     // `draw_phase` divides its `engine_us`.
     emit_bind_phase();
+    emit_sampled_phase();
+}
+
+/// The split of `chain_phase`'s `sampled_us`, over the same window.
+///
+/// Emitted immediately after `bind_phase`, in the same relationship both have to
+/// the column above them. `sampled_us` is what was left once `binds_us` had
+/// `bind_phase` and `engine_us` had `draw_phase`. The four are not claimed to
+/// sum to it — see [`crate::runtime::sampled_phase`] for what they deliberately
+/// leave out and why a computed remainder is worse than none.
+fn emit_sampled_phase() {
+    let Some(w) = crate::runtime::sampled_phase::take_window() else {
+        return;
+    };
+    crate::observe::off(format!(
+        "sampled_phase sampled={} lookup_us={} resolve_us={} samplers_us={} reflect_us={}",
+        w.sampled, w.lookup_us, w.resolve_us, w.samplers_us, w.reflect_us,
+    ));
 }
 
 /// The split of `drain_duty`'s `draw_us`, over the same window.
