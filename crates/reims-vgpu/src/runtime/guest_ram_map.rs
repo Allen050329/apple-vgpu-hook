@@ -207,7 +207,13 @@ fn with_map<H: HostOps + ?Sized, R>(host: &mut H, body: impl FnOnce(&Resolved) -
 /// contiguity problem that a contiguous window would not have fixed either —
 /// which is exactly what a driven `REIMS_VGPU_GUEST_IMPORT=off` boot logged
 /// before [`reference_for_pages`] asked.
-fn standing_refusal<H: HostOps + ?Sized>(host: &mut H) -> Option<MapRefusal> {
+///
+/// Public because it is also the cheap early-out: a rail whose next step is an
+/// `O(pages)` walk should ask this before paying for one it is going to throw
+/// away. That caller must ask *this* rather than re-reading
+/// [`crate::runtime::guest_ram::granularity`], which is the same answer for one
+/// of the four refusals and silence for the other three.
+pub fn standing_refusal<H: HostOps + ?Sized>(host: &mut H) -> Option<MapRefusal> {
     with_map(host, |resolved| resolved.refusal)
 }
 

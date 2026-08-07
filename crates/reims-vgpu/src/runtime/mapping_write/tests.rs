@@ -188,24 +188,40 @@ fn a_geometry_the_copy_cannot_express_declines_by_name() {
 /// "This host cannot import" and "these pages would not resolve" are different
 /// findings and must not share a name.
 ///
-/// They did. Both `granularity()` returning `None` and any refusal from
-/// `guest_ram_map::reference_for_pages` returned `NoGuestImport`, so a driven
-/// x86 boot printed twenty `gpuwb_no_guest_import` lines — one per 1080p
-/// mapping — on a host whose `vk_caps` said `host_pointer_import=supported`.
-/// The real cause was `Scattered`, reported by `guest_ram_map` exactly once for
-/// the whole boot because `report_once` latches on `first_sight`. Ranking the
-/// fail channel by `reason=`, which is the documented way to read that log, put
-/// the twenty at the top under a name that contradicted the capability line and
-/// pointed at the host instead of at the page list.
+/// They did, twice, from opposite directions, and the fix for the first is
+/// what made the second reachable.
 ///
-/// So the inner check travels on every record. The two `assert_ne!`s are the
-/// regression: a future edit that folds these back together fails here rather
-/// than in six months on a boot nobody is reading closely.
+/// Originally both `granularity()` returning `None` and any refusal from
+/// `guest_ram_map` returned `NoGuestImport`, so a driven x86 boot printed
+/// twenty `gpuwb_no_guest_import` lines — one per 1080p mapping — on a host
+/// whose `vk_caps` said `host_pointer_import=supported`. The real cause was
+/// `Scattered`, reported by `guest_ram_map` exactly once for the whole boot
+/// because `report_once` latches on `first_sight`. Ranking the fail channel by
+/// `reason=`, the documented way to read that log, put the twenty at the top
+/// under a name that contradicted the capability line.
+///
+/// Splitting them fixed that and left two spellings of "this host cannot
+/// import" — a granularity read here and the resolution over in
+/// `guest_ram_map` — which is the divergence class in its own right. So the
+/// distinction now rides on `via=` rather than on the slug: one variant, one
+/// authority (`guest_ram_map::standing_refusal`), and the inner check named on
+/// every record.
+///
+/// The `assert_ne!`s are the regression. What must never come back is two
+/// records that a `reason=` ranking cannot tell apart — whichever field
+/// carries the difference.
 #[cfg(feature = "backend-vulkan")]
 #[test]
 fn a_refused_page_list_does_not_report_itself_as_a_host_without_the_import() {
     use crate::observe::Decline;
     use crate::runtime::guest_ram_map::MapRefusal;
+
+    let via = |d: &GpuWritebackDecline| {
+        d.fields()
+            .into_iter()
+            .find(|(k, _)| *k == "via")
+            .map(|(_, v)| v)
+    };
 
     let scattered = GpuWritebackDecline::GuestRefRefused {
         refusal: MapRefusal::Scattered {
@@ -214,22 +230,24 @@ fn a_refused_page_list_does_not_report_itself_as_a_host_without_the_import() {
             first: 0x39bb_6a000,
         },
     };
+    let no_import = GpuWritebackDecline::GuestRefRefused {
+        refusal: MapRefusal::NoBackendImport,
+    };
     assert_ne!(
-        scattered.slug(),
-        GpuWritebackDecline::NoGuestImport.slug(),
+        via(&scattered),
+        via(&no_import),
         "a refused page list must not read as a host that cannot import"
     );
-
-    // The check that refused, and its own numbers, on this record rather than
-    // on one line elsewhere in the log.
-    let fields = scattered.fields();
     assert_eq!(
-        fields
-            .iter()
-            .find(|(k, _)| *k == "via")
-            .map(|(_, v)| v.as_str()),
-        Some("guest_ram_map_scattered")
+        via(&no_import).as_deref(),
+        Some("guest_ram_map_no_backend_import"),
+        "the host-wide statement still names itself, on the record rather than \
+         on one line elsewhere in the log"
     );
+
+    // The check that refused, and its own numbers, on this record.
+    let fields = scattered.fields();
+    assert_eq!(via(&scattered).as_deref(), Some("guest_ram_map_scattered"));
     assert_eq!(
         fields
             .iter()
@@ -237,24 +255,15 @@ fn a_refused_page_list_does_not_report_itself_as_a_host_without_the_import() {
             .map(|(_, v)| v.as_str()),
         Some("32")
     );
-
-    // The host-wide statement keeps its own name and stays fieldless: it is
-    // identical for every mapping, so there is nothing per-record to carry.
-    assert_eq!(
-        GpuWritebackDecline::NoGuestImport.slug(),
-        "gpuwb_no_guest_import"
-    );
-    assert!(GpuWritebackDecline::NoGuestImport.fields().is_empty());
+    // A host-wide fact has nothing per-record to carry beyond its own name.
+    assert_eq!(no_import.fields().len(), 1);
 
     // A different inner check must reach the log differently, or carrying it
     // buys nothing.
     let not_in_import = GpuWritebackDecline::GuestRefRefused {
         refusal: MapRefusal::GpaNotInAnyImport { gpa: 0x1000 },
     };
-    assert_ne!(
-        not_in_import.fields().iter().find(|(k, _)| *k == "via"),
-        scattered.fields().iter().find(|(k, _)| *k == "via")
-    );
+    assert_ne!(via(&not_in_import), via(&scattered));
 }
 
 /// The gap walk is what both writeback paths subtract their skipped ranges

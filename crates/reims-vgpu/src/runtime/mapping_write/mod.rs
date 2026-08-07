@@ -665,12 +665,12 @@ pub enum GpuWritebackDecline {
     /// The page walk refused: these are no longer provably the mapping's pages.
     /// The copying rail refuses for the same reason and reports it.
     PagesNotOurs,
-    /// No backend published an import granularity, so this host cannot reach
-    /// guest RAM as a GPU import at all. A statement about the host, identical
-    /// for every mapping, and the state every copying rail exists for.
-    NoGuestImport,
-    /// The host can import, but this window's pages did not become a reference.
-    /// Carries the check [`crate::runtime::guest_ram_map`] refused on.
+    /// This window's pages did not become a reference. Carries the check
+    /// [`crate::runtime::guest_ram_map`] refused on — including the one that
+    /// says nothing about the window at all, that this host cannot import guest
+    /// RAM. There is deliberately no separate variant for that: the early-out
+    /// above and the walk below now ask one function, so they cannot name the
+    /// same host two ways, and `via=` says which check answered either way.
     ///
     /// It carries it rather than pointing at it. That module reports each
     /// distinct refusal **once per boot** — `report_once` latches on
@@ -703,7 +703,6 @@ impl crate::observe::Decline for GpuWritebackDecline {
             Self::PageListShort { .. } => "gpuwb_page_list_short",
             Self::PageUnbacked { .. } => "gpuwb_page_unbacked",
             Self::PagesNotOurs => "gpuwb_pages_not_ours",
-            Self::NoGuestImport => "gpuwb_no_guest_import",
             Self::GuestRefRefused { .. } => "gpuwb_guest_ref_refused",
             // The engine's own slug, so a driver that refuses the pointer and a
             // resident in the wrong channel order stay as distinguishable here
@@ -714,7 +713,7 @@ impl crate::observe::Decline for GpuWritebackDecline {
 
     fn fields(&self) -> Vec<(&'static str, String)> {
         match self {
-            Self::NotWritable | Self::PagesNotOurs | Self::NoGuestImport => Vec::new(),
+            Self::NotWritable | Self::PagesNotOurs => Vec::new(),
             // `via` before the inner fields, so the check that refused reads
             // first and its own `pages=` / `first=` qualify it rather than
             // looking like this rail's own numbers.
@@ -919,12 +918,19 @@ pub fn write_bgra8_from_resident_gpu<M: HostMemory + HostOps>(
     // this rail owes whether or not it goes on to write anything, and the
     // copying arm that takes over from this decline expects the state it leaves.
     //
-    // Not a second gate — `guest_ram_map::reference_for_pages` still decides,
-    // and would decline these same pages a few hundred microseconds later. This
-    // only declines sooner, and on the pathways where the answer never changes
-    // that is a page-table walk per flush for the life of the process.
-    if crate::runtime::guest_ram::granularity().is_none() {
-        return Err(GpuWritebackDecline::NoGuestImport);
+    // Not a second gate — it is the *same* gate, asked earlier.
+    // `references_for_runs` below opens with the identical question and would
+    // decline these same pages a few hundred microseconds later; this only
+    // declines sooner, and on a pathway where the answer never changes that
+    // saves a page-table walk per flush for the life of the process.
+    //
+    // Asked through `standing_refusal` rather than by re-reading the
+    // granularity latch, because the latch is only one of the four things that
+    // refuse here — a shim that cannot say where guest RAM lives and a machine
+    // whose every span failed the bound both leave a granularity published, and
+    // used to walk the whole page list before finding that out.
+    if let Some(refusal) = crate::runtime::guest_ram_map::standing_refusal(host) {
+        return Err(GpuWritebackDecline::GuestRefRefused { refusal });
     }
     // Timed on its own because it is the largest `O(pages)` step left and its
     // fix is not the other one's. `vouch_for_write` re-walks every page of the
