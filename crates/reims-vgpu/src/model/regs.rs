@@ -550,7 +550,36 @@ pub const DISPLAY_HEIGHT_MM: u16 = 300;
 /// delivered.
 pub const DISPLAY_REFRESH_HZ: u32 = 120;
 pub const DISPLAY_PRODUCT_NAME: &[u8] = b"QEMU display\0";
-/// Archive: ~30s of ONLINE asserts at ~200ms (poll_ctr % 50, 4ms poll).
+/// How many unacked ONLINE pulses this device sends before it stops.
+///
+/// Archive: ~30s of ONLINE asserts at ~200ms (poll_ctr % 50, 4ms poll), which
+/// is where the number comes from — it is Apple's cadence and Apple's span, not
+/// a budget chosen here.
+///
+/// # Why a bound that gives up is the right answer here, unlike most
+///
+/// A bound that stops this device serving a guest request is normally the thing
+/// to remove: the standing goal is that a bound may refuse, never silently do
+/// less. This one is kept, and the distinction is what it is counting.
+///
+/// It does not bound a *resource*. It bounds how long an **unanswered
+/// handshake** keeps interrupting a guest that is not listening. Every pulse
+/// writes the shared pending word and raises a display IRQ, and
+/// `try_display_online` only reaches the increment once the guest has already
+/// set the enable bit — so passing the cap means 150 pulses were delivered to a
+/// guest that enabled and acked none. Removing the cap does not recover any
+/// guest work; it delivers a 5 Hz IRQ stream to a wedged consumer forever.
+///
+/// It is also not permanent, which is the property that makes it safe:
+/// `apply_setup_shared_state` zeroes `online_tries` and `poll_ctr`, so the
+/// guest's own `setupSharedState` re-registration hands the handshake a fresh
+/// span. The guest has a way back that costs it nothing.
+///
+/// And it is loud. `display_online_abandoned` names the crossing, and the state
+/// this cap *cannot* reach — a guest that never enables at all — has its own
+/// `display_online_never_enabled` report, whose wait derives from this constant
+/// times [`DISPLAY_ONLINE_POLL_DIVISOR`] so the two halves of the handshake time
+/// out alike.
 pub const DISPLAY_ONLINE_MAX_TRIES: u32 = 150;
 pub const DISPLAY_ONLINE_POLL_DIVISOR: u32 = 50;
 
