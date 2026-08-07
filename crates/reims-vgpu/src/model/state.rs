@@ -1749,6 +1749,13 @@ pub struct DeviceState {
     /// [`crate::runtime::gather_witness`] — it selects no behaviour.
     #[cfg(feature = "backend-vulkan")]
     pub gather_witness: crate::runtime::gather_witness::GatherWitness,
+    /// Draw-time buffer binds resolved once per reference and held. Reached
+    /// only through [`DeviceState::retire_bound_buffers_for_task`] and
+    /// [`DeviceState::retire_bound_buffers_in_range`] from the packet handlers,
+    /// so the retirement rules live in one place rather than at each opcode.
+    /// See [`crate::runtime::bound_buffers`].
+    #[cfg(feature = "backend-vulkan")]
+    pub bound_buffers: crate::runtime::bound_buffers::BoundBuffers,
     /// Monotonic source for every sampled-content generation this device
     /// hands the engine. Read only through
     /// [`DeviceState::next_sampled_content_generation`].
@@ -2017,6 +2024,8 @@ impl DeviceState {
             guest_linear_memo: LruBytesMemo::new(GUEST_LINEAR_MEMO_BYTE_CAP),
             #[cfg(feature = "backend-vulkan")]
             gather_witness: crate::runtime::gather_witness::GatherWitness::default(),
+            #[cfg(feature = "backend-vulkan")]
+            bound_buffers: crate::runtime::bound_buffers::BoundBuffers::default(),
             sampled_content_gen: 0,
             host_writes: crate::runtime::host_writes::HostWrites::default(),
             guest_linear_scratch: Vec::new(),
@@ -2232,7 +2241,47 @@ impl DeviceState {
             .unwrap_or(SurfaceWriteKind::Unknown)
     }
 
+    /// Drop every held bind resolution for one task.
+    ///
+    /// The answer for every packet after which a reference may name different
+    /// bytes: a new page-table root, a new object list, a deleted object, a
+    /// deleted task, and a replaced physical page. Each is rare against the
+    /// draw rate, so the whole task goes rather than the machinery that would
+    /// map an object id back to the references resolved through it.
+    ///
+    /// Ungated so the packet handlers stay free of `cfg`; on a build with no
+    /// Vulkan engine nothing can hold a resolution and this is a no-op.
+    pub fn retire_bound_buffers_for_task(&mut self, task_id: u32) {
+        #[cfg(feature = "backend-vulkan")]
+        {
+            self.bound_buffers.retire_task(task_id);
+        }
+        #[cfg(not(feature = "backend-vulkan"))]
+        {
+            let _ = task_id;
+        }
+    }
+
+    /// Drop the held bind resolutions for `task_id` covering `[gva, gva+len)`.
+    ///
+    /// The map/unmap answer, which names the exact range the guest moved. See
+    /// [`Self::retire_bound_buffers_for_task`] for the gating.
+    pub fn retire_bound_buffers_in_range(&mut self, task_id: u32, gva: u64, len: u64) {
+        #[cfg(feature = "backend-vulkan")]
+        {
+            self.bound_buffers.retire_range(task_id, gva, len);
+        }
+        #[cfg(not(feature = "backend-vulkan"))]
+        {
+            let _ = (task_id, gva, len);
+        }
+    }
+
     pub fn reset(&mut self) {
+        // Held bind resolutions name guest addresses under a device that is
+        // going away; nothing about them survives a reset.
+        #[cfg(feature = "backend-vulkan")]
+        self.bound_buffers.clear();
         // A translation hold that is still standing here never resolved. The
         // hold itself is control flow — the FIFO is parked until an AIR module
         // finishes loading and the packet is retried, not consumed — so it is

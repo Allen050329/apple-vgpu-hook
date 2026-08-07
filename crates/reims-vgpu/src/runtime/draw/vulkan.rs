@@ -2372,8 +2372,7 @@ fn try_buffer_zero_copy_resolved<M: HostMemory + HostOps>(
     task_id: u32,
     backing: &BufferBacking,
     offset: u64,
-) -> Option<crate::backend::vulkan::engine::BufferContent> {
-    use crate::backend::vulkan::engine;
+) -> Option<crate::runtime::bound_buffers::BoundBuffer> {
     let (gva, size) = (backing.gva, backing.size);
     if offset >= size {
         return None;
@@ -2402,12 +2401,28 @@ fn try_buffer_zero_copy_resolved<M: HostMemory + HostOps>(
     } else {
         "zc_buffer_gathered"
     });
-    Some(engine::BufferContent::GuestRuns(engine::GuestRunSource {
+    Some(crate::runtime::bound_buffers::BoundBuffer {
+        gva: gva + offset,
+        span,
         runs: std::sync::Arc::new(runs),
-        total_len: span,
-        row_length_texels: 0,
         pages,
-    }))
+    })
+}
+
+/// The engine's view of a held resolution.
+///
+/// One spelling for the fresh walk and the lookup, so a resolution cannot mean
+/// one thing on the draw that built it and another on every draw after.
+fn bound_buffer_content(
+    bound: &crate::runtime::bound_buffers::BoundBuffer,
+) -> crate::backend::vulkan::engine::BufferContent {
+    use crate::backend::vulkan::engine;
+    engine::BufferContent::GuestRuns(engine::GuestRunSource {
+        runs: std::sync::Arc::clone(&bound.runs),
+        total_len: bound.span,
+        row_length_texels: 0,
+        pages: bound.pages.clone(),
+    })
 }
 
 /// Load one draw-time buffer bind: the zero-copy rail when allowed and
@@ -2422,14 +2437,26 @@ fn load_buffer_content<M: HostMemory + HostOps>(
     offset: u64,
     allow_zero_copy: bool,
 ) -> Option<crate::backend::vulkan::engine::BufferContent> {
+    // A held resolution answers before anything is resolved at all: the walk
+    // below produces the same runs until the guest moves the addresses, and it
+    // announces every such move. This is the whole point of the registry — see
+    // `crate::runtime::bound_buffers`.
+    if allow_zero_copy {
+        if let Some(bound) = state.bound_buffers.get(task_id, buffer_ref, offset) {
+            let content = bound_buffer_content(bound);
+            crate::runtime::drain::note_store_route("zc_buffer_held");
+            return Some(content);
+        }
+    }
     // Resolve the backing (object-list entry + descriptor) ONCE and share it
     // between the zero-copy attempt and the CPU fallback. Sub-floor binds used
     // to walk the task PT twice — once in the failed ZC attempt, once in the
     // CPU read.
     let backing = resolve_buffer_backing(state, host, task_id, buffer_ref)?;
     if allow_zero_copy {
-        if let Some(content) = try_buffer_zero_copy_resolved(state, host, task_id, &backing, offset)
-        {
+        if let Some(bound) = try_buffer_zero_copy_resolved(state, host, task_id, &backing, offset) {
+            let content = bound_buffer_content(&bound);
+            state.bound_buffers.insert(task_id, buffer_ref, offset, bound);
             return Some(content);
         }
     }

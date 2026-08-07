@@ -191,6 +191,11 @@ fn apply_delete_task(state: &mut DeviceState, payload: &[u8], channel: Option<u3
     } else {
         0
     };
+    // The task's GVA space goes with it, so every bind resolution keyed on it
+    // names bytes that are no longer this task's. Here rather than at the two
+    // call sites: the root and child FIFOs both reach this, and a rule written
+    // twice is the one that diverges.
+    state.retire_bound_buffers_for_task(task_id);
     let ok = state.delete_task(task_id);
     crate::observe::off(format!(
         "delete_task site={} task={task_id} ok={} plen={}",
@@ -240,6 +245,9 @@ fn apply_set_object_list(state: &mut DeviceState, payload: &[u8], channel: Optio
     let task_id = ld32(&payload[SET_OBJECT_LIST_TASK_ID..]);
     let pfn = ld32(&payload[SET_OBJECT_LIST_PFN..]);
     let count = ld32(&payload[SET_OBJECT_LIST_COUNT..]);
+    // A new object list re-points every reference on this task, so no
+    // resolution keyed by reference survives it. Both FIFOs reach this.
+    state.retire_bound_buffers_for_task(task_id);
     let applied = state.set_object_list(task_id, pfn, count);
     if crate::observe::first_sight(
         "set_object_list",
@@ -274,6 +282,11 @@ fn apply_define_task2<H: HostMemory + HostOps>(
     // class registered rather than leaving the bit unaccounted for.
     let task_id = raw_id >> DEFINE_TASK_ID_SHIFT;
     let kernel_task = raw_id & 1 != 0;
+    // The page-table root is replaced here, so every GVA this task resolved
+    // through the old one may translate elsewhere now. Keyed on the shifted
+    // `task_id`, not `raw_id` — the registry is keyed the way the draw path
+    // keys it, and `raw_id` is the wrong number by a factor of two.
+    state.retire_bound_buffers_for_task(task_id);
     state.define_task(task_id, length, dir);
     // Capture directory + root/depth so one boot shows the page-table identity.
     let Some(slot) = state.tasks.get(task_id) else {
@@ -2802,6 +2815,9 @@ fn process_child_packet<H: HostMemory + HostOps>(
             if !packet_short("delete_object", Some(channel_id), packet.payload.len(), 8) {
                 let task_id = ld32(&packet.payload[0..]);
                 let id = ld32(&packet.payload[4..]);
+                // Which references resolved through this object is not knowable
+                // from the packet, so the task's resolutions go together.
+                state.retire_bound_buffers_for_task(task_id);
                 let _ = state.delete_object(task_id, id);
             }
         }
@@ -3009,6 +3025,12 @@ fn process_child_packet<H: HostMemory + HostOps>(
                 if let Some(cmd) =
                     crate::runtime::decode::fifo::decode_replace_physical(&packet.payload)
                 {
+                    // The GPA behind this object's GVAs changes here, so any
+                    // held bind resolution on the task names the old frames.
+                    // The packet names an object, not a range, and which
+                    // references resolved through it is not recorded — so the
+                    // task's resolutions go together.
+                    state.retire_bound_buffers_for_task(cmd.task_id);
                     crate::runtime::objects::replace_physical(
                         state,
                         host,
@@ -3108,6 +3130,10 @@ fn process_child_packet<H: HostMemory + HostOps>(
                 // views so the next ensure_gva_view re-walks. Does not invent
                 // PTEs and does not destroy host_gva_surfaces content.
                 if gva != 0 && length != 0 {
+                    // Held bind resolutions over this range name pages the guest
+                    // has just remapped. Retired by range, which is exactly what
+                    // this notify carries.
+                    state.retire_bound_buffers_in_range(task_id, gva, length);
                     let n = crate::runtime::gva_view::retire_gva_views_overlapping(
                         state, task_id, gva, length,
                     );
