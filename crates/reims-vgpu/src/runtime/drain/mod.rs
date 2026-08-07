@@ -545,15 +545,60 @@ pub(crate) fn present_content_verdict(frame_bgra: &[u8], max_rgb: u8) -> Present
     }
 }
 
+/// One `{stamp_index, stamp_value}` record from a packet's record array.
+///
+/// The record means **"do not execute this packet until stamp slot `index` has
+/// reached `value`"** — a wait, not a signal. See [`note_packet_stamp_records`]
+/// for how that reading was established and what the alternative would have been.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StampWait {
+    /// Index into the same stamp space [`write_stamp`] writes: one slot per
+    /// FIFO, root at 0. Carried raw, exactly as the guest wrote it, so the
+    /// masking [`stamp_slot_index`] applies happens at the one place that
+    /// resolves a slot rather than twice with two chances to differ.
+    pub index: u32,
+    pub value: u32,
+}
+
+impl StampWait {
+    /// Whether stamp slot [`Self::index`] standing at `current` satisfies this
+    /// wait.
+    ///
+    /// The comparison is a **signed wrapping difference**, not `current >=
+    /// self.value`. Stamp values are free-running `u32` counters the guest
+    /// increments per submission, so a slot that has been live long enough
+    /// wraps through zero; a plain `>=` then reads every wait on the far side of
+    /// the wrap as unsatisfied and stalls the channel permanently. The signed
+    /// difference is correct for any pair less than 2^31 apart, which is the
+    /// same window the rest of this protocol's counters assume.
+    pub fn satisfied_by(self, current: u32) -> bool {
+        current.wrapping_sub(self.value) as i32 >= 0
+    }
+}
+
 /// Parsed FIFO packet (main + child share framing).
+///
+/// `stamp_waits` is the record array between header and payload, decoded. The
+/// header's own count is not carried beside it: the two would be one fact
+/// written twice, and the arm that read the count without the records is the
+/// one this field exists to retire. Ask for [`Self::stamp_count`] where the
+/// wire count is what a reader wants.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Packet {
     pub opcode: u16,
-    pub stamp_count: u16,
+    pub stamp_waits: Vec<StampWait>,
     pub total_size: u32,
     pub completion_stamp: u32,
     pub payload: Vec<u8>,
     pub next_head: u32,
+}
+
+impl Packet {
+    /// The header's `stamp_count` as decoded. Never truncates: the count is a
+    /// `u16` on the wire and [`decode_packet`] parses exactly that many records.
+    pub fn stamp_count(&self) -> u16 {
+        self.stamp_waits.len() as u16
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -610,23 +655,21 @@ fn packet_snapshot_len(header: &[u8], available: u32, ring_capacity: u32) -> u32
     }
 }
 
-/// The per-packet stamp records this device skips, reported once per shape.
+/// The per-packet stamp records, reported once per shape.
 ///
 /// A packet header declares `stamp_count`, and that many 8-byte records sit
-/// between the header and the payload. **Nothing in this crate reads them.**
-/// `stamp_count` is used at exactly two places: here, to find where the payload
-/// starts, and in `FailEvent::UnknownChildOpcode`, to help a reader tell a
-/// 24-byte packet with one stamp from one with three payload words. The records'
-/// own bytes have never been decoded, and until this line existed nothing said
-/// how often any arrived.
+/// between the header and the payload. This device used to skip straight over
+/// them to reach the payload; they are now decoded into [`Packet::stamp_waits`]
+/// and evaluated by [`note_packet_stamp_waits`].
 ///
-/// That is the shape of an unmeasured loss rather than a known-benign skip, and
-/// the two are not distinguishable by reading the code — which is the whole
-/// argument for an instrument. If the records carry a wait-for-stamp dependency,
-/// a packet whose records this device ignores runs before the work it was told
-/// to wait for, and the corruption that follows has no line anywhere to explain
-/// it. If they are completion stamps to retire, ignoring them strands the guest.
-/// If they are neither, the skip is correct and this line is what says so.
+/// A skip whose consequence nobody had measured is the shape of an unmeasured
+/// loss rather than a known-benign skip, and the two are not distinguishable by
+/// reading the code — which is the whole argument for an instrument. If the
+/// records carry a wait-for-stamp dependency, a packet whose records this device
+/// ignores runs before the work it was told to wait for, and the corruption that
+/// follows has no line anywhere to explain it. If they are completion stamps to
+/// retire, ignoring them strands the guest. If they are neither, the skip is
+/// correct and this line is what says so.
 ///
 /// So: **report, do not refuse.** Refusing every packet that carries one would
 /// decline live guest traffic on a guess, and this file's own rule is that a
@@ -723,34 +766,113 @@ fn packet_snapshot_len(header: &[u8], available: u32, ring_capacity: u32) -> u32
 /// as the completion-stamp ordering [`write_stamp`] already carries a flush for,
 /// and which its doc records having caused heap corruption once.
 ///
-/// Nothing is implemented here yet, and the reason is in the third bullet: this
-/// device's drain does not have a per-channel deferral to hang a wait on, and
-/// adding one is not a change to make in the same commit that identified the
-/// field. Until it exists, this line is the record that the gap is known and
-/// measured rather than unseen.
-fn note_packet_stamp_records(opcode: u16, stamp_count: u16, bytes: &[u8]) {
-    if stamp_count == 0 {
+/// The records are now decoded into [`Packet::stamp_waits`] and evaluated by
+/// [`note_packet_stamp_waits`] at both drain sites. This line stays because the
+/// *shape* census and the *verdict* census answer different questions: this one
+/// says which commands carry records and how many, once per shape, and is what
+/// a reader compares a new workload against.
+fn note_packet_stamp_records(opcode: u16, waits: &[StampWait]) {
+    if waits.is_empty() {
         note_store_route("packet_stamps_none");
         return;
     }
     note_store_route("packet_stamps_present");
     if !crate::observe::first_sight(
         "packet_stamp_records",
-        (u64::from(opcode) << 16) | u64::from(stamp_count),
+        (u64::from(opcode) << 16) | waits.len() as u64,
     ) {
         return;
     }
-    let at = PACKET_HEADER_LEN as usize;
-    let (w0, w1) = if bytes.len() >= at + PACKET_STAMP_LEN as usize {
-        (ld32(&bytes[at..]), ld32(&bytes[at + 4..]))
-    } else {
-        (0, 0)
-    };
+    let count = waits.len();
+    let first = waits[0];
     crate::observe::off(format!(
-        "packet_stamp_records opcode={opcode:#x} count={stamp_count} w0={w0:#x} w1={w1:#x} \
-         (this device skips these records to reach the payload and has never \
-          decoded them; the count beside packet_stamps_none is the denominator)"
+        "packet_stamp_records opcode={opcode:#x} count={count} w0={:#x} w1={:#x} \
+         (wait: do not execute until stamp[w0] has reached w1)",
+        first.index, first.value
     ));
+}
+
+/// Evaluate a packet's stamp waits against the slots this device has published,
+/// and report every one that is not yet satisfied.
+///
+/// Returns the number of unsatisfied waits, which is the number of orderings
+/// this device is about to violate by executing the packet anyway. Zero is the
+/// healthy reading and the one a driven boot is expected to produce for most
+/// packets, because the drain reaches the producing channel first far more often
+/// than not.
+///
+/// **This reports; it does not hold.** Holding is the correct behaviour and it
+/// needs a per-channel deferral keyed on a stamp rather than on translation
+/// readiness — the shape is in [`note_packet_stamp_records`]'s third bullet, and
+/// the number this function produces is what says how much that machinery buys.
+/// A device that stalled a channel on an unmet wait before anyone had measured
+/// how many waits go unmet would be trading a known ordering slip for an unknown
+/// stall risk.
+///
+/// The current value is read back out of the stamp page rather than cached
+/// beside [`write_stamp`]. The page is where the guest reads it, so it is the
+/// only copy whose staleness cannot be this device's own bug, and a cache keyed
+/// by slot would be one more bounded structure to keep honest for four bytes.
+fn note_packet_stamp_waits<H: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &H,
+    channel: Option<u32>,
+    packet: &Packet,
+) -> u32 {
+    if packet.stamp_waits.is_empty() {
+        return 0;
+    }
+    let mut unmet = 0u32;
+    for wait in &packet.stamp_waits {
+        let index = stamp_slot_index(wait.index);
+        let Some(off) = stamp_slot_offset(index, state.page_size()) else {
+            // An index past the stamp page is a slot this device could never
+            // write, so no drain can ever satisfy it. That is the guest naming a
+            // FIFO the device does not have, not an ordering slip.
+            unmet += 1;
+            if crate::observe::first_sight("packet_stamp_wait_slot", u64::from(index)) {
+                crate::observe::fail(format!(
+                    "packet_stamp_wait_unresolvable reason=stamp_slot_out_of_range \
+                     opcode={:#x} index={index} slots={} \
+                     (the awaited slot is past the stamp page, so no drain can satisfy it)",
+                    packet.opcode,
+                    stamp_slot_count(state.page_size()),
+                ));
+            }
+            continue;
+        };
+        if state.gfx.fifo_base_page == 0 {
+            unmet += 1;
+            continue;
+        }
+        let gpa = state.pfn_gpa(state.gfx.fifo_base_page) + off;
+        let Ok(current) = crate::runtime::host::read_u32(host, gpa) else {
+            unmet += 1;
+            continue;
+        };
+        if wait.satisfied_by(current) {
+            note_store_route("packet_stamp_wait_met");
+            continue;
+        }
+        unmet += 1;
+        note_store_route("packet_stamp_wait_unmet");
+        if crate::observe::first_sight(
+            "packet_stamp_wait_unmet",
+            (u64::from(packet.opcode) << 32) | u64::from(index),
+        ) {
+            crate::observe::fail(format!(
+                "packet_stamp_wait_unmet opcode={:#x} {} index={index} awaited={:#x} \
+                 current={current:#x} behind={} \
+                 (this device executes the packet anyway, so it runs ahead of the \
+                  work it was ordered behind)",
+                packet.opcode,
+                packet_site(channel),
+                wait.value,
+                wait.value.wrapping_sub(current),
+            ));
+        }
+    }
+    unmet
 }
 
 /// Decode one packet out of a ring snapshot taken at [`packet_snapshot_len`].
@@ -802,11 +924,23 @@ fn decode_packet(
     if total_size < min_payload_off {
         return Err(PacketError::BadSize);
     }
-    note_packet_stamp_records(opcode, stamp_count, bytes);
+    // Past that check every record is inside `total_size`, and `total_size` is
+    // inside the snapshot, so the walk reads only bytes the producer published.
+    // Walking the span rather than indexing by record number keeps the stride
+    // out of the arithmetic: `chunks_exact` yields exactly `stamp_count`
+    // records because the span above is exactly that many strides long.
+    let stamp_waits: Vec<StampWait> = bytes[PACKET_HEADER_LEN as usize..min_payload_off as usize]
+        .chunks_exact(PACKET_STAMP_LEN as usize)
+        .map(|rec| StampWait {
+            index: ld32(rec),
+            value: ld32(&rec[4..]),
+        })
+        .collect();
+    note_packet_stamp_records(opcode, &stamp_waits);
     let payload = bytes[min_payload_off as usize..total_size as usize].to_vec();
     Ok(Packet {
         opcode,
-        stamp_count,
+        stamp_waits,
         total_size,
         completion_stamp,
         payload,
@@ -1506,6 +1640,7 @@ pub fn drain_main_fifo<H: HostMemory + HostOps>(state: &mut DeviceState, host: &
             ring_size,
         ) {
             Ok(packet) => {
+                note_packet_stamp_waits(state, host, None, &packet);
                 process_root_packet(state, host, &packet);
                 state
                     .gfx
@@ -3010,7 +3145,7 @@ fn process_child_packet<H: HostMemory + HostOps>(
                 channel: channel_id,
                 opcode: packet.opcode,
                 total_size: packet.total_size,
-                stamp_count: packet.stamp_count,
+                stamp_count: packet.stamp_count(),
                 payload: packet.payload.clone(),
             });
         }
@@ -3163,6 +3298,7 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
         }
         match decode_packet(&snap, head, available, ring_length) {
             Ok(packet) => {
+                note_packet_stamp_waits(state, host, Some(channel_id), &packet);
                 if process_child_packet(state, host, channel_id, &packet)
                     == ChildPacketDisposition::Deferred
                 {

@@ -203,7 +203,7 @@ const ROWS: &[(&str, usize, Guarded, &str)] = &[
     ),
     (
         "reims-vgpu/src/runtime/drain/mod.rs",
-        11,
+        13,
         Guarded::EmitsOnly,
         "packet and doorbell reporters plus cursor_glyph_fail and its six \
          callers. cursor_glyph_fail is the best-shaped site in the tree and \
@@ -214,7 +214,12 @@ const ROWS: &[(&str, usize, Guarded, &str)] = &[
          path any latch in this tree guards — once per decoded packet — and is \
          still emit-only: the two counters beside it are raised before the \
          latch is consulted, so the denominator counts every packet and only \
-         the shape line dedupes",
+         the shape line dedupes. The twelfth and thirteenth are the two lines \
+         in `note_packet_stamp_waits`, and they are the sharpest case of the \
+         rule in the tree: that function's *return value* is the count of \
+         unmet waits, and it is accumulated outside both latched blocks. A \
+         latch pulled up around the `unmet += 1` would make the caller's \
+         verdict depend on whether this shape had been seen before",
     ),
     (
         "reims-vgpu/src/runtime/draw/metal_icb.rs",

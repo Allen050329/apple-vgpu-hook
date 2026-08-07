@@ -207,7 +207,7 @@ fn present_packet(opcode: u16, mapping: u32) -> Packet {
     payload[off..off + 4].copy_from_slice(&mapping.to_le_bytes());
     Packet {
         opcode,
-        stamp_count: 0,
+        stamp_waits: Vec::new(),
         total_size: PACKET_HEADER_LEN + len as u32,
         completion_stamp: 0,
         payload,
@@ -553,7 +553,7 @@ fn delete_task_root_clears_active_task() {
         &mut host,
         &Packet {
             opcode: ROOT_OP_DELETE_TASK,
-            stamp_count: 0,
+            stamp_waits: Vec::new(),
             total_size: PACKET_HEADER_LEN + 4,
             completion_stamp: 0,
             payload: 3u32.to_le_bytes().to_vec(),
@@ -608,7 +608,7 @@ fn replace_physical_drops_the_cached_page_list() {
     payload[4..8].copy_from_slice(&7u32.to_le_bytes()); // {task 0, object 7}
     let pkt = Packet {
         opcode: CHILD_OP_REPLACE_PHYSICAL,
-        stamp_count: 0,
+        stamp_waits: Vec::new(),
         total_size: PACKET_HEADER_LEN + 8,
         completion_stamp: 0,
         payload,
@@ -673,7 +673,7 @@ fn replace_physical_routes_through_the_texture_ref_when_no_mapping_owns_the_id()
     payload[4..8].copy_from_slice(&12u32.to_le_bytes()); // object 12
     let pkt = Packet {
         opcode: CHILD_OP_REPLACE_PHYSICAL,
-        stamp_count: 0,
+        stamp_waits: Vec::new(),
         total_size: PACKET_HEADER_LEN + 8,
         completion_stamp: 0,
         payload,
@@ -714,7 +714,7 @@ fn replace_physical_does_not_fall_back_when_the_named_mapping_is_merely_empty() 
     payload[4..8].copy_from_slice(&7u32.to_le_bytes()); // {task 0, object 7}
     let pkt = Packet {
         opcode: CHILD_OP_REPLACE_PHYSICAL,
-        stamp_count: 0,
+        stamp_waits: Vec::new(),
         total_size: PACKET_HEADER_LEN + 8,
         completion_stamp: 0,
         payload,
@@ -744,7 +744,7 @@ fn a_short_replace_physical_is_reported_and_drops_nothing() {
     }
     let pkt = Packet {
         opcode: CHILD_OP_REPLACE_PHYSICAL,
-        stamp_count: 0,
+        stamp_waits: Vec::new(),
         total_size: PACKET_HEADER_LEN + 4,
         completion_stamp: 0,
         payload: vec![0u8; 4],
@@ -777,7 +777,7 @@ fn delete_iosurface_backing_condemns_then_second_delete_tears_down() {
             2,
             &Packet {
                 opcode: CHILD_OP_DELETE_IOSURFACE_BACKING2,
-                stamp_count: 0,
+                stamp_waits: Vec::new(),
                 total_size: PACKET_HEADER_LEN + payload.len() as u32,
                 completion_stamp: 0,
                 payload,
@@ -1031,7 +1031,7 @@ fn free_fifo_clears_translation_scheduler_state() {
         &mut host,
         &Packet {
             opcode: ROOT_OP_FREE_FIFO,
-            stamp_count: 0,
+            stamp_waits: Vec::new(),
             total_size: PACKET_HEADER_LEN + 4,
             completion_stamp: 0,
             payload: 1u32.to_le_bytes().to_vec(),
@@ -1924,7 +1924,7 @@ fn display_lifecycle_events_are_always_logged() {
     payload[CHILD_SHARED_STATE_PFN..CHILD_SHARED_STATE_PFN + 4].copy_from_slice(&pfn.to_le_bytes());
     let setup = Packet {
         opcode: CHILD_OP_SETUP_SHARED_STATE,
-        stamp_count: 0,
+        stamp_waits: Vec::new(),
         total_size: PACKET_HEADER_LEN + CHILD_SHARED_STATE_LEN as u32,
         completion_stamp: 0,
         payload,
@@ -1936,7 +1936,7 @@ fn display_lifecycle_events_are_always_logged() {
     // Guest ack.
     let ack = Packet {
         opcode: CHILD_OP_ONLINE_ACK,
-        stamp_count: 0,
+        stamp_waits: Vec::new(),
         total_size: PACKET_HEADER_LEN,
         completion_stamp: 0,
         payload: vec![],
@@ -3113,7 +3113,7 @@ fn unmap_memory_retains_gva_host_cache_for_sample() {
     st64(&mut unmap_pl[12..20], 0x10000);
     let unmap = Packet {
         opcode: CHILD_OP_UNMAP_MEMORY,
-        stamp_count: 0,
+        stamp_waits: Vec::new(),
         total_size: PACKET_HEADER_LEN + 20,
         completion_stamp: 0,
         payload: unmap_pl,
@@ -3155,7 +3155,7 @@ fn invalidate_resources_bumps_mapping_content_generation() {
         4,
         &Packet {
             opcode: CHILD_OP_INVALIDATE_RESOURCES,
-            stamp_count: 0,
+            stamp_waits: Vec::new(),
             total_size: PACKET_HEADER_LEN + 16,
             completion_stamp: 0,
             payload: pl,
@@ -3209,7 +3209,7 @@ fn map_memory2_does_not_flush_gva_host_cache_on_wire() {
         2,
         &Packet {
             opcode: CHILD_OP_MAP_MEMORY2,
-            stamp_count: 0,
+            stamp_waits: Vec::new(),
             total_size: PACKET_HEADER_LEN + 20,
             completion_stamp: 0,
             payload: pl,
@@ -3269,7 +3269,7 @@ fn synchronize_resources_does_not_write_guest_pages() {
         4,
         &Packet {
             opcode: CHILD_OP_SYNCHRONIZE_RESOURCES,
-            stamp_count: 0,
+            stamp_waits: Vec::new(),
             total_size: PACKET_HEADER_LEN + 12,
             completion_stamp: 0,
             payload: pl,
@@ -3310,7 +3310,7 @@ fn invalidate_without_clr_host_does_not_bump_generation() {
         4,
         &Packet {
             opcode: CHILD_OP_INVALIDATE_RESOURCES,
-            stamp_count: 0,
+            stamp_waits: Vec::new(),
             total_size: PACKET_HEADER_LEN + 16,
             completion_stamp: 0,
             payload: pl,
@@ -3606,7 +3606,7 @@ fn the_display_flush_fence_is_a_named_command_and_not_a_defect() {
     let mut host = FakeHost::new();
     let fence = |plen: usize| Packet {
         opcode: CHILD_OP_FLUSH_CHANNEL_EVENT,
-        stamp_count: 0,
+        stamp_waits: Vec::new(),
         total_size: PACKET_HEADER_LEN + plen as u32,
         completion_stamp: 0,
         payload: vec![0u8; plen],
@@ -3658,7 +3658,7 @@ fn an_overlong_display_transaction_alarms_once_per_shape() {
     let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
     let packet = |opcode: u16, plen: usize| Packet {
         opcode,
-        stamp_count: 0,
+        stamp_waits: Vec::new(),
         total_size: PACKET_HEADER_LEN + plen as u32,
         completion_stamp: 0,
         payload: vec![0u8; plen],
@@ -3720,7 +3720,7 @@ fn the_overlong_alarm_dumps_the_tail_and_explains_the_right_command() {
     let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_ARM64E);
     let packet = |opcode: u16, payload: Vec<u8>| Packet {
         opcode,
-        stamp_count: 0,
+        stamp_waits: Vec::new(),
         total_size: PACKET_HEADER_LEN + payload.len() as u32,
         completion_stamp: 0,
         payload,
@@ -4292,7 +4292,7 @@ fn device_info_reply(max_key: u32, count: u32) -> Vec<(u32, u32)> {
         &mut host,
         &Packet {
             opcode: ROOT_OP_DEVICE_INFO_TAHOE,
-            stamp_count: 0,
+            stamp_waits: Vec::new(),
             total_size: PACKET_HEADER_LEN + payload.len() as u32,
             completion_stamp: 0,
             payload,
@@ -4525,7 +4525,7 @@ fn every_short_control_packet_names_itself() {
     let mut host = FakeHost::new();
     let short = |opcode: u16, len: usize| Packet {
         opcode,
-        stamp_count: 0,
+        stamp_waits: Vec::new(),
         total_size: PACKET_HEADER_LEN + len as u32,
         completion_stamp: 0,
         payload: vec![0u8; len],
@@ -4609,7 +4609,7 @@ fn root_opcode_one_sets_up_the_display_shared_state() {
         &mut host,
         &Packet {
             opcode: ROOT_OP_SETUP_SHARED_STATE,
-            stamp_count: 0,
+            stamp_waits: Vec::new(),
             total_size: PACKET_HEADER_LEN + CHILD_SHARED_STATE_LEN as u32,
             completion_stamp: 0,
             payload,
@@ -4653,7 +4653,7 @@ fn a_pipe_index_that_looks_like_an_opcode_is_still_a_pipe_index() {
         &mut host,
         &Packet {
             opcode: ROOT_OP_SETUP_SHARED_STATE,
-            stamp_count: 0,
+            stamp_waits: Vec::new(),
             total_size: PACKET_HEADER_LEN + CHILD_SHARED_STATE_LEN as u32,
             completion_stamp: 0,
             payload,
@@ -4673,16 +4673,58 @@ fn a_pipe_index_that_looks_like_an_opcode_is_still_a_pipe_index() {
     );
 }
 
-/// The stamp records between a packet's header and its payload are skipped, and
-/// the payload the decoder hands on begins after them rather than at `+0x0C`.
+/// A stamp wait is decided by a signed wrapping difference, so a slot that has
+/// wrapped past `u32::MAX` still satisfies the waits behind it.
 ///
-/// Nothing in this crate reads those records. `note_packet_stamp_records` is the
-/// line that says so on a live boot; this pins the two properties that line's
-/// reading depends on — that the offset arithmetic is right, so a non-zero count
-/// is a real skipped record and not a mis-parse, and that a record's presence
-/// does not disturb the payload every handler goes on to read.
+/// Every assertion here that mentions the wrap is one a plain `current >= value`
+/// gets backwards, and getting it backwards is not a slow path: it reports every
+/// wait on the far side of the wrap as unmet forever, because the slot only ever
+/// climbs further away. A slot ticking once per submission reaches the wrap on a
+/// long-lived channel, so this is a property of running for a while rather than
+/// of any unusual guest.
 #[test]
-fn a_packets_stamp_records_are_skipped_and_the_payload_starts_after_them() {
+fn a_stamp_wait_is_decided_by_a_signed_wrapping_difference() {
+    let wait = |value| StampWait { index: 1, value };
+
+    assert!(wait(5).satisfied_by(5), "reaching the value satisfies it");
+    assert!(wait(5).satisfied_by(6), "and so does passing it");
+    assert!(!wait(5).satisfied_by(4), "one short does not");
+
+    // The slot has wrapped; the awaited value has not. `4 >= 0xFFFF_FFFE` is
+    // false, and the wait is nonetheless long satisfied.
+    assert!(
+        wait(0xFFFF_FFFE).satisfied_by(4),
+        "a slot six ticks past the wrap satisfies a wait two before it"
+    );
+    assert!(
+        !wait(4).satisfied_by(0xFFFF_FFFE),
+        "and the reverse pair is still unsatisfied, which a plain unsigned \
+         compare also gets backwards"
+    );
+
+    // The window the signed difference is correct over, at both ends.
+    assert!(
+        wait(0).satisfied_by(0x7FFF_FFFF),
+        "just inside the window ahead"
+    );
+    assert!(
+        !wait(0).satisfied_by(0x8000_0000),
+        "and 2^31 ahead reads as behind, which is the documented limit rather \
+         than a bug: the protocol has no way to tell that apart from 2^31 behind"
+    );
+}
+
+/// The stamp records between a packet's header and its payload are decoded in
+/// order, and the payload the decoder hands on begins after them rather than at
+/// `+0x0C`.
+///
+/// Both halves matter and they fail differently. A record read at the wrong
+/// stride yields a wait naming a slot nobody writes, which
+/// `note_packet_stamp_waits` reports as permanently unmet forever after; a
+/// payload that began at `+0x0C` would hand every handler the record bytes as
+/// its first words.
+#[test]
+fn a_packets_stamp_records_are_decoded_and_the_payload_starts_after_them() {
     const STAMPS: u16 = 3;
     let payload = [0xAAu32, 0xBB];
     let stamps_len = STAMPS as usize * PACKET_STAMP_LEN as usize;
@@ -4705,7 +4747,29 @@ fn a_packets_stamp_records_are_skipped_and_the_payload_starts_after_them() {
     }
 
     let dec = decode_packet(&v, 0, total as u32, RING).unwrap();
-    assert_eq!(dec.stamp_count, STAMPS, "the count is carried, not consumed");
+    assert_eq!(
+        dec.stamp_count(),
+        STAMPS,
+        "the count is carried, not consumed"
+    );
+    assert_eq!(
+        dec.stamp_waits,
+        vec![
+            StampWait {
+                index: 0xF0,
+                value: 0xF1
+            },
+            StampWait {
+                index: 0xF2,
+                value: 0xF3
+            },
+            StampWait {
+                index: 0xF4,
+                value: 0xF5
+            },
+        ],
+        "each record is one {{index, value}} pair read at an 8-byte stride"
+    );
     assert_eq!(
         dec.payload.len(),
         payload.len() * 4,
