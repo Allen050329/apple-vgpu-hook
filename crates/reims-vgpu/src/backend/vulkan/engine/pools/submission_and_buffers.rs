@@ -44,38 +44,35 @@ impl ResourcePools {
         (self.registry.len(), self.targets.len(), sampled, storage)
     }
 
-    /// The guest page-window import cache. `&mut` because every use of it can
-    /// import or evict; there is no read-only question to ask of it.
-    pub(crate) fn dmabuf_imports_mut(&mut self) -> &mut dmabuf::ImportCache {
-        &mut self.dmabuf_imports
-    }
-
-    /// The bindable buffer over `window`'s guest pages, importing it if this is
-    /// the first ask, and retiring whatever the pinned-bytes bound displaced.
+    /// The bindable range `guest_ref` names, importing its RAMBlock if this is
+    /// the first reference into it.
     ///
-    /// This is the only way to reach [`dmabuf::ImportCache::get_or_import`]
-    /// that is safe for a caller which submits without waiting: a displaced
-    /// import goes to the graveyard, so its `vkFreeMemory` lands after every
-    /// command buffer that could still be copying out of it has retired.
+    /// Unlike [`Self::import_guest_window`] there is nothing to displace: an
+    /// import is per RAMBlock and lives as long as the device, so no caller can
+    /// find the buffer it just bound freed underneath a submission in flight.
     ///
     /// # Safety
     ///
     /// `ctx` must own the device every live import was made against.
-    pub(crate) unsafe fn import_guest_window(
+    pub(crate) unsafe fn bind_guest_ram(
         &mut self,
         ctx: &DeviceContext,
-        window: &std::sync::Arc<types::GuestDmaBuf>,
-        size: u64,
-    ) -> Result<dmabuf::ImportedDmaBuf, dmabuf::DmaBufDecline> {
-        let mut displaced = Vec::new();
-        let result = unsafe {
-            self.dmabuf_imports
-                .get_or_import(ctx, window, size, &mut displaced)
-        };
-        for import in displaced {
-            unsafe { self.dispose(&ctx.device, DeferredHandle::DmaBufImport(import)) };
-        }
-        result
+        guest_ref: &crate::runtime::guest_ram::GuestRef,
+    ) -> Result<host_ram::BoundGuestRam, host_ram::HostRamDecline> {
+        unsafe { self.host_ram_imports.bind(ctx, guest_ref) }
+    }
+
+    /// How many RAMBlocks are imported, and how many bytes they cover.
+    ///
+    /// The count is the reading that says whether the model held: one or two
+    /// for a whole boot. A count that tracks the workload is a per-resource
+    /// import, which the extension does not guarantee works and which pays the
+    /// driver's page pinning for an answer that never changes.
+    pub(crate) fn host_ram_import_census(&self) -> (usize, u64) {
+        (
+            self.host_ram_imports.len(),
+            self.host_ram_imports.imported_bytes(),
+        )
     }
 
     pub(crate) fn new() -> Self {
@@ -128,7 +125,7 @@ impl ResourcePools {
             open_batch: None,
             slab: slab::SlabPool::new(),
             host_slab: host_slab::HostSlabPool::new(),
-            dmabuf_imports: dmabuf::ImportCache::default(),
+            host_ram_imports: host_ram::HostRamImports::default(),
             guest_reads_in_flight: false,
             initialized: false,
         }

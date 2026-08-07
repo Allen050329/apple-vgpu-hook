@@ -269,14 +269,14 @@ pub(crate) struct DeviceContext {
     /// physical device, and the previous code re-queried it through the loader
     /// on every single allocation.
     pub memory_properties: vk::PhysicalDeviceMemoryProperties,
-    /// `VK_KHR_external_memory_fd` entry points, loaded only where
-    /// [`HostGpuCaps::dma_buf_import`] resolved to `Supported` — which is also
-    /// the only rung on which the extension was enabled, so loading it on any
-    /// other would resolve entry points the device was never asked for.
+    /// `VK_EXT_external_memory_host` entry points, loaded only where
+    /// [`HostGpuCaps::host_pointer`] resolved to `Supported` — which is also the
+    /// only rung on which the extension was enabled, so loading it on any other
+    /// would resolve entry points the device was never asked for.
     ///
-    /// `None` is the answer on every host without dma-buf, and
-    /// [`super::dmabuf::import_buffer`] declines by name when it sees one.
-    pub external_memory_fd: Option<ash::khr::external_memory_fd::Device>,
+    /// `None` is the answer on every host without the extension, and the import
+    /// site declines by name when it sees one.
+    pub external_memory_host: Option<ash::ext::external_memory_host::Device>,
     /// Queue family used for all engine submits (graphics draws + compute).
     pub gq: u32,
     /// True when `gq` supports both GRAPHICS and COMPUTE (required for engine compute).
@@ -526,20 +526,28 @@ impl DeviceContext {
         // shader buffer access (index fetch, attachment access, and
         // encoder-level suspects remain open).
         let enabled = features.enabled_features();
-        // Whether guest pages can reach this device as a dma-buf import. Asked
-        // alongside the other capability queries, and — like them — the only
-        // producer of the extension strings its answer requires.
-        let dma_buf_import = crate::backend::vulkan::caps::external_memory::query(
-            &instance,
-            pd,
-            &has_device_extension,
-        );
-        // Published for the guest-page export side, which decides whether to ask
-        // the host for a dma-buf at all and has no device context to read. Set
-        // here rather than at the end of this function so a later failure leaves
-        // the export side knowing the answer too — it is a property of the
-        // physical device, and nothing below can change it.
-        crate::backend::vulkan::caps::external_memory::latch(dma_buf_import);
+        // Whether guest RAM can reach this device as a host-pointer import over
+        // whole RAMBlocks, and at what granularity. Same shape as the query
+        // above and for the same reason: the answer is the only producer of the
+        // extension string it requires.
+        let host_pointer =
+            crate::backend::vulkan::caps::host_pointer::query(&instance, pd, &has_device_extension);
+        // Published for `runtime::guest_ram_map`, which builds the imports and
+        // has no device context to read the granularity from. A negative rung
+        // withdraws it rather than publishing zero, so the absence of a number
+        // is itself the gate and no site can act on a granularity from a device
+        // that declined the handle type.
+        match host_pointer.rung {
+            crate::backend::vulkan::caps::HostPointerImport::Supported => {
+                crate::runtime::guest_ram::latch_granularity(host_pointer.min_alignment);
+            }
+            _ => crate::runtime::guest_ram::forget_granularity(),
+        }
+        // Every import this process holds names a `VkDeviceMemory` that dies
+        // with the device below. Dropping them here, before the new one exists,
+        // is what makes a recreate rebuild against fresh identities instead of
+        // resolving a stale slice against a handle that is gone.
+        crate::runtime::guest_ram_map::reset();
         let portability_subset = has_device_extension(vk::KHR_PORTABILITY_SUBSET_NAME);
         let vertex_attribute_divisor = has_device_extension(vk::KHR_VERTEX_ATTRIBUTE_DIVISOR_NAME);
         #[cfg(feature = "host-window")]
@@ -608,7 +616,9 @@ impl DeviceContext {
         enabled_device_extensions.extend(features.required_extensions());
         // Only the `Supported` rung names any, so a host without dma-buf does
         // not fail device creation asking for an extension it does not have.
-        enabled_device_extensions.extend(dma_buf_import.required_extensions());
+        // Only the `Supported` rung names `VK_EXT_external_memory_host`, so a
+        // host without it gets a device rather than a failed `vkCreateDevice`.
+        enabled_device_extensions.extend(host_pointer.rung.required_extensions());
         // These three are built in `caps` too. They are bound to locals here
         // only because `push_next` borrows them for the lifetime of `dci`.
         let mut en16 = features.enabled_16bit_storage();
@@ -665,17 +675,19 @@ impl DeviceContext {
         let caps = HostGpuCaps {
             memory: classify_memory(&memory_properties),
             quirks: DriverQuirk::for_portability_subset(portability_subset),
-            dma_buf_import,
+            host_pointer,
             portability_subset,
             device_api_version: props.api_version,
             device_type: props.device_type,
         };
         // Loaded from the same answer that enabled the extension, so the two
         // cannot disagree about whether these entry points are legal to call.
-        let external_memory_fd = caps
-            .dma_buf_import
+        // Loaded from the same answer that enabled the extension, so the two
+        // cannot disagree about whether these entry points are legal to call.
+        let external_memory_host = caps
+            .host_pointer
             .is_available()
-            .then(|| ash::khr::external_memory_fd::Device::new(&instance, &device));
+            .then(|| ash::ext::external_memory_host::Device::new(&instance, &device));
         let device_name = CStr::from_ptr(props.device_name.as_ptr())
             .to_string_lossy()
             .into_owned();
@@ -743,7 +755,7 @@ impl DeviceContext {
             device,
             caps,
             memory_properties,
-            external_memory_fd,
+            external_memory_host,
             gq,
             compute_capable,
             storage_image_write_without_format: storage_image_write_without_format_bgra,

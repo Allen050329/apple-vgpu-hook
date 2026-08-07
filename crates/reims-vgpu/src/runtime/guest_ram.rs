@@ -550,6 +550,114 @@ impl GuestSlice {
     }
 }
 
+/// The import granularity the active backend published, or 0 before any
+/// backend has created a device that can import at all.
+///
+/// # Why this is a latch and not a parameter
+///
+/// The granularity is measured from the GPU — `minImportedHostPointerAlignment`
+/// on Vulkan, the host page size on the Metal-direct arm — and it is needed by
+/// [`crate::runtime::guest_ram_map`], which runs on the runtime side and holds
+/// no device context. The alternative is threading a number from the backend
+/// through every decode path that might name guest memory, which is how a site
+/// ends up with a default nobody measured.
+///
+/// Zero means *no backend has said it can import*, which is the honest answer
+/// on a host without the extension and the one the map treats as "run the
+/// copying rails". A backend that resolves a negative capability rung must not
+/// publish, so the absence of a number is itself the gate.
+static GRANULARITY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Publish the granularity a freshly created device resolved to.
+///
+/// Called once per device creation, including each recreate, so a rebuilt
+/// device republishes rather than leaving the previous one's answer standing. A
+/// backend whose capability rung refused must call [`forget_granularity`]
+/// instead — publishing a number from a device that declined the handle type is
+/// how the map would build imports nothing can bind.
+///
+/// Refuses a granularity that is not a power of two: every alignment
+/// computation here masks with `align - 1`, and a non-power-of-two would make
+/// those masks name arbitrary bytes rather than refusing.
+pub fn latch_granularity(align: u64) {
+    if align == 0 || !align.is_power_of_two() {
+        Emit::decline(EVENT, &GuestRamError::AlignmentNotPowerOfTwo { align }).fail();
+        forget_granularity();
+        return;
+    }
+    GRANULARITY.store(align, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Withdraw the published granularity: no device can import guest RAM.
+pub fn forget_granularity() {
+    GRANULARITY.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The published granularity, or `None` when no backend can import.
+///
+/// `Relaxed` on both sides: this gates whether an optimization is attempted, and
+/// a reader that sees the previous value takes the copying path for one window.
+/// Nothing here orders access to any other memory.
+pub fn granularity() -> Option<u64> {
+    match GRANULARITY.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => None,
+        align => Some(align),
+    }
+}
+
+/// A bounded guest-memory reference a backend can bind: the import that owns
+/// the bytes, and the slice inside it.
+///
+/// This is what replaces a page list plus an exported fd. Producing one costs a
+/// range check and an `Arc` clone — no ioctl, no allocation, no kernel
+/// reference per page — which is why nothing caches them.
+///
+/// The pair travels together because neither half is usable alone: a
+/// [`GuestSlice`] carries no absolute offset by construction, and the import is
+/// the only thing that can turn one into a [`BoundRange`].
+#[derive(Clone, Debug)]
+pub struct GuestRef {
+    import: std::sync::Arc<GuestRamImport>,
+    slice: GuestSlice,
+}
+
+impl GuestRef {
+    /// Pair a slice with the import that made it.
+    ///
+    /// Refuses a mismatched pair up front rather than at bind time, so a
+    /// mis-plumbed call site fails where it is written instead of one layer
+    /// down inside the backend.
+    pub fn new(
+        import: std::sync::Arc<GuestRamImport>,
+        slice: GuestSlice,
+    ) -> Result<Self, GuestRamError> {
+        import.resolve(&slice)?;
+        Ok(Self { import, slice })
+    }
+
+    /// The import to bind against. The backend keys its device handle on
+    /// [`GuestRamImport::id`] and imports [`GuestRamImport::host_base`] once.
+    pub fn import(&self) -> &std::sync::Arc<GuestRamImport> {
+        &self.import
+    }
+
+    /// The checked byte range inside that import.
+    pub fn bound(&self) -> Result<BoundRange, GuestRamError> {
+        self.import.resolve(&self.slice)
+    }
+
+    /// Bytes between the start of the bound range and the first byte the caller
+    /// asked for.
+    pub fn head(&self) -> u64 {
+        self.slice.head()
+    }
+
+    /// Bytes the caller asked for.
+    pub fn requested(&self) -> u64 {
+        self.slice.requested()
+    }
+}
+
 /// What a backend binds: a byte range inside one import, already checked.
 ///
 /// Produced only by [`GuestRamImport::resolve`], so holding one is proof the

@@ -17,7 +17,7 @@ use super::device_lost::{DeviceLostDecline, DeviceLostOp};
 use super::host_slab::{HostSlabToken, HOST_SLAB_IDLE_KEEP_EMPTY};
 use super::types::{DrawError, ResidentReclaim, StorageImageFormat, TargetIdentity};
 use super::vk_call::{VkCall, VkOp};
-use super::{color_subresource_range, dmabuf, host_slab, reason, slab, types};
+use super::{color_subresource_range, host_ram, host_slab, reason, slab, types};
 use crate::backend::vulkan::caps::{MappedMemoryKind, MemoryClass};
 use crate::backend::vulkan::translate;
 use crate::model::ComputeStorageResidencyKey;
@@ -378,7 +378,10 @@ pub(crate) struct ResourcePools {
     /// here rather than beside its one consumer so it is destroyed by the same
     /// teardown that destroys every other device object, and so the bound is
     /// enforced against the pool that owns it. See [`dmabuf::ImportCache`].
-    dmabuf_imports: dmabuf::ImportCache,
+    /// Every RAMBlock this device has imported as a host pointer. Not a cache:
+    /// one entry per span the shim reported, held for the device's life, with
+    /// no eviction — see `host_ram` for why adding one would be a mistake.
+    host_ram_imports: host_ram::HostRamImports,
     /// Whether any command buffer recorded or submitted since the last quiesce
     /// **reads** guest RAM when it executes.
     ///
@@ -498,12 +501,6 @@ pub(crate) enum DeferredHandle {
     RenderPass(vk::RenderPass),
     ShaderModule(vk::ShaderModule),
     Sampler(vk::Sampler),
-    /// A guest page-window import displaced from [`dmabuf::ImportCache`]
-    /// by its pinned-bytes bound. Freeing the `VkDeviceMemory` is what revokes
-    /// the GPU's reach into those guest pages, and an in-flight command buffer
-    /// may still be copying out of it, so the revocation waits for the ring
-    /// exactly like every image destroy does.
-    DmaBufImport(dmabuf::ImportedDmaBuf),
 }
 
 impl ResourcePools {
@@ -551,7 +548,6 @@ impl ResourcePools {
             DeferredHandle::RenderPass(rp) => device.destroy_render_pass(rp, None),
             DeferredHandle::ShaderModule(s) => device.destroy_shader_module(s, None),
             DeferredHandle::Sampler(s) => device.destroy_sampler(s, None),
-            DeferredHandle::DmaBufImport(import) => unsafe { import.destroy(device) },
         }
     }
 }

@@ -154,14 +154,24 @@ unsafe fn import_guest_buffer_window(
     pools: &mut ResourcePools,
     src: &super::types::GuestRunSource,
 ) -> Option<BoundBuffer> {
-    if !ctx.caps.dma_buf_import.is_available() {
+    if !ctx.caps.host_pointer.is_available() {
         return None;
     }
-    let window = src.pages.as_ref()?;
-    let offset = u64::from(window.head_offset);
+    let guest_ref = src.pages.as_ref()?;
+    let bound = match unsafe { pools.bind_guest_ram(ctx, guest_ref) } {
+        Ok(bound) => bound,
+        Err(inner) => {
+            crate::observe::Emit::decline("vk_buffer_import", &inner).fail_once(0);
+            return None;
+        }
+    };
+    // The imported buffer spans the whole RAMBlock, so the span's first byte is
+    // the bound range's start plus whatever widening it to the device's import
+    // granularity added at the front.
+    let offset = bound.offset + bound.head;
     // Unlike the sampled rail's copy offset, this one is a *bind*: the device
     // publishes the alignment it will accept and there is no arm that can
-    // renegotiate it. A guest span that lands elsewhere in its page is gathered.
+    // renegotiate it. A guest span that lands elsewhere is gathered.
     if !offset.is_multiple_of(ctx.guest_bind_offset_align) {
         crate::observe::Emit::decline(
             "vk_buffer_import",
@@ -173,28 +183,10 @@ unsafe fn import_guest_buffer_window(
         .fail_once(offset % ctx.guest_bind_offset_align);
         return None;
     }
-    let mapped = (window.gpas.len() as u64).saturating_mul(u64::from(window.page_size));
-    if offset.saturating_add(src.total_len) > mapped {
-        crate::observe::Emit::decline(
-            "vk_buffer_import",
-            &BufferImportDecline::WindowTooSmall {
-                need: offset + src.total_len,
-                have: mapped,
-            },
-        )
-        .fail_once(0);
-        return None;
-    }
-    match unsafe { pools.import_guest_window(ctx, &window.dmabuf, mapped) } {
-        Ok(import) => Some(BoundBuffer {
-            buffer: import.buffer,
-            offset,
-        }),
-        Err(inner) => {
-            crate::observe::Emit::decline("vk_buffer_import", &inner).fail_once(0);
-            None
-        }
-    }
+    Some(BoundBuffer {
+        buffer: bound.buffer,
+        offset,
+    })
 }
 
 /// A check that sent a guest buffer span back to the CPU gather.
@@ -203,15 +195,12 @@ enum BufferImportDecline {
     /// The span does not start at an offset this device will bind a vertex or
     /// storage buffer at. See [`super::context::DeviceContext::guest_bind_offset_align`].
     BindOffsetAlignment { offset: u64, align: u64 },
-    /// The page list does not reach the end of the span it was resolved for.
-    WindowTooSmall { need: u64, have: u64 },
 }
 
 impl crate::observe::Decline for BufferImportDecline {
     fn slug(&self) -> &'static str {
         match self {
             Self::BindOffsetAlignment { .. } => "buffer_import_bind_offset_alignment",
-            Self::WindowTooSmall { .. } => "buffer_import_window_too_small",
         }
     }
 
@@ -219,9 +208,6 @@ impl crate::observe::Decline for BufferImportDecline {
         match self {
             Self::BindOffsetAlignment { offset, align } => {
                 vec![("offset", offset.to_string()), ("align", align.to_string())]
-            }
-            Self::WindowTooSmall { need, have } => {
-                vec![("need", need.to_string()), ("have", have.to_string())]
             }
         }
     }
@@ -360,11 +346,20 @@ unsafe fn import_sampled_guest_window(
     pools: &mut ResourcePools,
     src: &super::types::GuestRunSource,
 ) -> Option<GuestTexels> {
-    if !ctx.caps.dma_buf_import.is_available() {
+    if !ctx.caps.host_pointer.is_available() {
         return None;
     }
-    let window = src.pages.as_ref()?;
-    let offset = u64::from(window.head_offset);
+    let guest_ref = src.pages.as_ref()?;
+    let bound = match unsafe { pools.bind_guest_ram(ctx, guest_ref) } {
+        Ok(bound) => bound,
+        Err(inner) => {
+            crate::observe::Emit::decline("vk_sampled_import", &inner).fail_once(0);
+            return None;
+        }
+    };
+    // As on the buffer rail: the buffer spans the RAMBlock, so the first texel
+    // sits at the bound range's start plus the granularity widening.
+    let offset = bound.offset + bound.head;
     if !offset.is_multiple_of(GUEST_IMPORT_COPY_OFFSET_ALIGN) {
         crate::observe::Emit::decline(
             "vk_sampled_import",
@@ -373,31 +368,10 @@ unsafe fn import_sampled_guest_window(
         .fail_once(offset % GUEST_IMPORT_COPY_OFFSET_ALIGN);
         return None;
     }
-    let mapped = (window.gpas.len() as u64).saturating_mul(u64::from(window.page_size));
-    // The window is whole pages and the span starts inside the first one, so a
-    // span reaching past the last page is a page list that never covered it.
-    // Refusing beats binding a buffer the copy reads off the end of.
-    if offset.saturating_add(src.total_len) > mapped {
-        crate::observe::Emit::decline(
-            "vk_sampled_import",
-            &SampledImportDecline::WindowTooSmall {
-                need: offset + src.total_len,
-                have: mapped,
-            },
-        )
-        .fail_once(0);
-        return None;
-    }
-    match unsafe { pools.import_guest_window(ctx, &window.dmabuf, mapped) } {
-        Ok(import) => Some(GuestTexels::Imported {
-            buffer: import.buffer,
-            offset,
-        }),
-        Err(inner) => {
-            crate::observe::Emit::decline("vk_sampled_import", &inner).fail_once(0);
-            None
-        }
-    }
+    Some(GuestTexels::Imported {
+        buffer: bound.buffer,
+        offset,
+    })
 }
 
 /// A check that sent a guest-sourced sampled bind back to the CPU gather before
@@ -411,25 +385,18 @@ enum SampledImportDecline {
     /// The first texel does not sit at an offset `vkCmdCopyBufferToImage` can
     /// name. See [`GUEST_IMPORT_COPY_OFFSET_ALIGN`].
     CopyOffsetAlignment { offset: u64 },
-    /// The page list does not reach the end of the texel span it was resolved
-    /// for.
-    WindowTooSmall { need: u64, have: u64 },
 }
 
 impl crate::observe::Decline for SampledImportDecline {
     fn slug(&self) -> &'static str {
         match self {
             Self::CopyOffsetAlignment { .. } => "sampled_import_copy_offset_alignment",
-            Self::WindowTooSmall { .. } => "sampled_import_window_too_small",
         }
     }
 
     fn fields(&self) -> Vec<(&'static str, String)> {
         match self {
             Self::CopyOffsetAlignment { offset } => vec![("offset", offset.to_string())],
-            Self::WindowTooSmall { need, have } => {
-                vec![("need", need.to_string()), ("have", have.to_string())]
-            }
         }
     }
 }
@@ -1172,7 +1139,6 @@ pub(crate) unsafe fn execute_draw_inner(
         // deliberately does not bump: it records into the open batch's CB, which
         // still names every import the draws before it were handed and has not
         // been submitted, so nothing may free one out from under it.
-        pools.dmabuf_imports_mut().begin_recording();
         pools.begin_entry(ctx, counters)?
     };
     phase.enter(super::draw_phase::Phase::Pipeline);
@@ -3215,20 +3181,20 @@ mod tests {
     /// rail runs at all on a given host: it is a device limit against a guest
     /// allocator's choices, and neither side is under this device's control. A
     /// boot where the rail moves nothing has to be able to say whether that is
-    /// because the host cannot export, or because every span this guest hands
+    /// because the host cannot import, or because every span this guest hands
     /// over lands mid-alignment.
+    ///
+    /// The short-window refusals that used to sit beside this one are gone,
+    /// unrepresentable rather than untested: the range comes from a
+    /// `GuestRef`, whose bound is checked where it is built and cannot be
+    /// skipped, so there is no longer a way for a bind to name bytes past the
+    /// end of what was resolved.
     #[test]
     fn every_buffer_import_decline_names_its_own_check() {
-        let declines = [
-            BufferImportDecline::BindOffsetAlignment {
-                offset: 40,
-                align: 64,
-            },
-            BufferImportDecline::WindowTooSmall {
-                need: 8192,
-                have: 4096,
-            },
-        ];
+        let declines = [BufferImportDecline::BindOffsetAlignment {
+            offset: 40,
+            align: 64,
+        }];
         let slugs: Vec<_> = declines.iter().map(|d| d.slug()).collect();
         let unique: std::collections::HashSet<_> = slugs.iter().collect();
         assert_eq!(slugs.len(), unique.len(), "slugs collide: {slugs:?}");
@@ -3237,11 +3203,15 @@ mod tests {
             assert!(decline.slug().starts_with("buffer_import_"));
         }
         // The two rails refuse for different reasons and must not share a slug
-        // with each other either — a sampled window and a buffer span can fail
-        // the same way and still need different fixes.
+        // with each other either — a sampled bind and a buffer bind can fail the
+        // same way and still need different fixes.
         assert_ne!(
-            BufferImportDecline::WindowTooSmall { need: 1, have: 0 }.slug(),
-            SampledImportDecline::WindowTooSmall { need: 1, have: 0 }.slug()
+            BufferImportDecline::BindOffsetAlignment {
+                offset: 1,
+                align: 2
+            }
+            .slug(),
+            SampledImportDecline::CopyOffsetAlignment { offset: 1 }.slug()
         );
     }
 
@@ -3250,18 +3220,12 @@ mod tests {
     ///
     /// They route to the same place — the CPU gather — so nothing downstream
     /// tells them apart, and a shared slug would leave "this host never imports
-    /// a sampled window" with no way to say whether the exporter is missing, the
-    /// page list is short, or every window this guest hands over lands on an odd
-    /// offset. Those are three different fixes.
+    /// a sampled window" with no way to say whether the device cannot import at
+    /// all or every window this guest hands over lands on an odd offset. Those
+    /// are different fixes.
     #[test]
     fn every_sampled_import_decline_names_its_own_check() {
-        let declines = [
-            SampledImportDecline::CopyOffsetAlignment { offset: 12 },
-            SampledImportDecline::WindowTooSmall {
-                need: 8192,
-                have: 4096,
-            },
-        ];
+        let declines = [SampledImportDecline::CopyOffsetAlignment { offset: 12 }];
         let slugs: Vec<_> = declines.iter().map(|d| d.slug()).collect();
         let unique: std::collections::HashSet<_> = slugs.iter().collect();
         assert_eq!(slugs.len(), unique.len(), "slugs collide: {slugs:?}");

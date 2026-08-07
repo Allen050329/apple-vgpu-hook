@@ -15,7 +15,6 @@ mod counters;
 mod desc_arena;
 mod device_lost;
 mod digest;
-mod dmabuf;
 mod draw_execution;
 mod draw_phase;
 mod draw_preparation;
@@ -23,6 +22,7 @@ pub(crate) mod draw_validation;
 mod exec;
 mod exec_compute;
 mod facade_decline;
+mod host_ram;
 mod host_slab;
 pub mod init_decline;
 mod pools;
@@ -47,7 +47,7 @@ pub use types::{
     BlendFactor, BlendOp, BlendStateResource, BufferContent, ColorWriteMask, ComputeBufferResource,
     ComputeOutput, ComputeRequest, ComputeResidentSampleBind, ComputeSampledImageResource,
     ComputeStorageImageResource, ComputeStorageResidency, CullMode, DepthClipMode, DepthState,
-    DrawError, DrawOutput, DrawRequest, FillMode, GuestDmaBuf, GuestPageWindow, GuestRun,
+    DrawError, DrawOutput, DrawRequest, FillMode, GuestRun,
     GuestRunSource, IndexType, IndexedDrawResource, PrimitiveTopology, SampledContentIdentity,
     SampledImageResource, SampledSource, SamplerAddressMode, SamplerBorderColor,
     SamplerCompareFunction, SamplerFilter, SamplerMipFilter, SamplerResource, ScissorResource,
@@ -1692,17 +1692,9 @@ pub fn read_target_leased(identity: &TargetIdentity) -> Result<Option<LeasedFram
 /// and its row pitch; the engine takes it as given and checks only what it can
 /// see — that the resident matches the extent and that the window is long enough.
 pub struct GuestPageTarget {
-    /// The dma-buf over the pages. Held by `Arc` because the import cache keeps
-    /// it alive for as long as it names the window, and cloned rather than
-    /// consumed because the runtime's own cache keeps the original.
-    pub window: std::sync::Arc<GuestDmaBuf>,
-    /// Bytes the fd covers, which is whole pages and therefore at or past
-    /// `offset` plus the frame's extent.
-    pub mapped_bytes: u64,
-    /// Byte offset of the frame's first texel inside the dma-buf. Nonzero
-    /// whenever the surface does not start on a page boundary, which is what a
-    /// buffer→image copy expresses natively and a bound buffer cannot.
-    pub offset: u64,
+    /// The bounded reference to the guest bytes the frame lands in, covering
+    /// the extent this copy names and nothing more.
+    pub guest: crate::runtime::guest_ram::GuestRef,
     /// Guest row pitch in **texels** (`bufferRowLength`). Rows past the first
     /// start this far apart, which is how a padded guest pitch is honoured
     /// without the inter-row bytes ever being written.
@@ -1721,7 +1713,7 @@ impl GuestPageTarget {
     fn extent_end(&self) -> u64 {
         let pitch = u64::from(self.row_length_texels.max(self.width)) * 4;
         let rows_before = u64::from(self.height.saturating_sub(1));
-        self.offset + rows_before * pitch + u64::from(self.width) * 4
+        rows_before * pitch + u64::from(self.width) * 4
     }
 }
 
@@ -1757,7 +1749,7 @@ pub fn copy_target_to_guest_pages(
     identity: &TargetIdentity,
     dst: &GuestPageTarget,
 ) -> Result<(), DrawError> {
-    use dmabuf::GuestWriteDecline;
+    use host_ram::GuestWriteDecline;
     let mut guard = lock_engine();
     let EngineState {
         ref mut owner,
@@ -1766,9 +1758,9 @@ pub fn copy_target_to_guest_pages(
         ..
     } = &mut *guard;
     let ctx = owner.ensure(counters)?;
-    if !ctx.caps.dma_buf_import.is_available() {
+    if !ctx.caps.host_pointer.is_available() {
         return Err(DrawError::GuestPageWrite(GuestWriteDecline::Unsupported {
-            rung: ctx.caps.dma_buf_import,
+            rung: ctx.caps.host_pointer.rung,
         }));
     }
     unsafe { pools.ensure_init(ctx, counters)? };
@@ -1789,23 +1781,19 @@ pub fn copy_target_to_guest_pages(
         ));
     }
     let need = dst.extent_end();
-    if need > dst.mapped_bytes {
+    if need > dst.guest.requested() {
         return Err(DrawError::GuestPageWrite(
             GuestWriteDecline::WindowTooSmall {
                 need,
-                have: dst.mapped_bytes,
+                have: dst.guest.requested(),
             },
         ));
     }
     unsafe {
-        // The whole window, not `need`: one window is one buffer whatever part
-        // of it this copy names, so the next flush of the same surface reuses
-        // the import instead of making a second one over the same pages.
-        pools.dmabuf_imports_mut().begin_recording();
-        let import = pools
-            .import_guest_window(ctx, &dst.window, dst.mapped_bytes)
+        let bound = pools
+            .bind_guest_ram(ctx, &dst.guest)
             .map_err(|inner| DrawError::GuestPageWrite(GuestWriteDecline::Import { inner }))?;
-        copy_image_level0_to_buffer(ctx, pools, counters, &snap, import.buffer, dst)?;
+        copy_image_level0_to_buffer(ctx, pools, counters, &snap, bound.buffer, dst, bound)?;
         pools.registry_set_layout(identity, ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
         counters.note_target_read(u64::from(dst.width) * u64::from(dst.height) * 4);
     }
@@ -1825,6 +1813,7 @@ unsafe fn copy_image_level0_to_buffer(
     snap: &ResidentReadSnapshot,
     buffer: ash::vk::Buffer,
     dst: &GuestPageTarget,
+    bound: host_ram::BoundGuestRam,
 ) -> Result<(), DrawError> {
     let submit_started = std::time::Instant::now();
     // Appended to a recording batch where there is one, for the reason
@@ -1897,7 +1886,7 @@ unsafe fn copy_image_level0_to_buffer(
             .cmd_write_timestamp(cb, ash::vk::PipelineStageFlags::TRANSFER, probe.pool, 1);
     }
     let region = [ash::vk::BufferImageCopy::default()
-        .buffer_offset(dst.offset)
+        .buffer_offset(bound.offset + bound.head)
         // In texels, and only meaningful when the guest's pitch is wider than
         // the frame. Zero means tight rows, which is what the guest's own row
         // pitch reduces to whenever it equals `width * 4`.
@@ -1929,9 +1918,10 @@ unsafe fn copy_image_level0_to_buffer(
     // released to `HOST` with `HOST_READ`, which is what makes it visible to a
     // CPU access after the fence signals.
     //
-    // Cache maintenance beyond that is the exporter's. `udmabuf` hands the
-    // importer references to ordinary system pages, and a PCIe write to system
-    // memory is snooped, so there is no invalidate for this side to issue.
+    // Cache maintenance beyond that is the driver's. A host-pointer import
+    // names ordinary system pages this process already has mapped, and a PCIe
+    // write to system memory is snooped, so there is no invalidate for this
+    // side to issue.
     let host_visible = [ash::vk::MemoryBarrier::default()
         .src_access_mask(ash::vk::AccessFlags::TRANSFER_WRITE)
         .dst_access_mask(ash::vk::AccessFlags::HOST_READ)];
@@ -2007,24 +1997,22 @@ unsafe fn copy_image_level0_to_buffer(
     Ok(())
 }
 
-/// Guest memory the device can currently reach through imported dma-bufs, and
-/// how many windows that is.
+/// Guest memory the device can currently reach through host-pointer imports,
+/// and how many RAMBlocks that is.
 ///
 /// # Nothing calls this, so the number it computes is in no log
 ///
-/// Kept rather than deleted, because it is the only thing in the tree that can
-/// answer "how much guest RAM can the device reach right now" on the *importer*
-/// side. `runtime::guest_dmabuf` emits its own totals on every miss
-/// (`guest_dmabuf_pinned_kb_sum`, `guest_dmabuf_windows_sum`), so the exporter
-/// side of the isolation rail is measurable and this side is not — and the two
-/// are not the same population, because an export the runtime has cached can
-/// still be declined by the backend before it becomes an import. Wiring this
-/// into the census is a new emission, which is a behaviour change owed a driven
-/// boot; recorded here so the asymmetry is not mistaken for coverage.
+/// Kept because it is the only thing in the tree that can answer "how much
+/// guest RAM can the device reach right now", and because the *count* is the
+/// reading that says whether the one-import-per-RAMBlock model held: it should
+/// be one or two for a whole boot, and a count that tracks the workload is the
+/// per-resource import the model exists to avoid. Wiring it into the census is
+/// a new emission, which is a behaviour change owed a driven boot; recorded
+/// here so the gap is not mistaken for coverage.
 pub fn guest_import_census() -> (u64, usize) {
-    let mut guard = lock_engine();
-    let cache = guard.pools.dmabuf_imports_mut();
-    (cache.imported_bytes(), cache.len())
+    let guard = lock_engine();
+    let (count, bytes) = guard.pools.host_ram_import_census();
+    (bytes, count)
 }
 
 /// The `srcAccessMask` a resident color target's readback must drain.
@@ -2438,15 +2426,24 @@ mod engine_lock_census_tests {
 mod guest_page_target_tests {
     use super::*;
 
-    fn target(width: u32, height: u32, row_length_texels: u32, offset: u64) -> GuestPageTarget {
-        let (read, _write) = std::io::pipe().expect("a pipe for a placeholder fd");
+    /// A target over a synthetic import large enough that the bound under test
+    /// is the extent arithmetic and not the import's own length.
+    fn target(width: u32, height: u32, row_length_texels: u32) -> GuestPageTarget {
+        use crate::runtime::guest_ram::{GuestRamImport, GuestRamRegion, GuestRef};
+        let import = std::sync::Arc::new(
+            GuestRamImport::new(
+                GuestRamRegion {
+                    gpa_base: 0,
+                    host_va: 0x7f00_0000_0000,
+                    len: 1 << 30,
+                },
+                4096,
+            )
+            .expect("a plausible RAMBlock"),
+        );
+        let slice = import.slice(0, 1 << 20).expect("inside");
         GuestPageTarget {
-            window: std::sync::Arc::new(GuestDmaBuf {
-                id: 1,
-                fd: std::os::fd::OwnedFd::from(read),
-            }),
-            mapped_bytes: u64::MAX,
-            offset,
+            guest: GuestRef::new(import, slice).expect("its own import"),
             row_length_texels,
             width,
             height,
@@ -2466,22 +2463,12 @@ mod guest_page_target_tests {
     fn the_write_bound_ends_at_the_last_texel_and_not_a_row_pitch_past_it() {
         // 8 rows of 4 texels at a 16-texel pitch: 7 full pitches plus one packed
         // row, not 8 full pitches.
-        let padded = target(4, 8, 16, 0);
+        let padded = target(4, 8, 16);
         assert_eq!(padded.extent_end(), 7 * 16 * 4 + 4 * 4);
         // A tight frame is the same expression with the pitch equal to the
         // width, which reduces to the whole frame.
-        let tight = target(4, 8, 4, 0);
+        let tight = target(4, 8, 4);
         assert_eq!(tight.extent_end(), 4 * 8 * 4);
-    }
-
-    /// A frame that does not start on a page boundary is bounded from where it
-    /// actually starts. Dropping the offset here would under-report the reach by
-    /// exactly the amount the copy writes past the end of the export.
-    #[test]
-    fn the_write_bound_includes_the_offset_into_the_window() {
-        let at_zero = target(64, 64, 64, 0);
-        let shifted = target(64, 64, 64, 512);
-        assert_eq!(shifted.extent_end(), at_zero.extent_end() + 512);
     }
 
     /// A zero row length means tight rows, which is what `bufferRowLength`
@@ -2490,8 +2477,8 @@ mod guest_page_target_tests {
     #[test]
     fn a_zero_row_length_is_a_tight_pitch_and_not_a_zero_one() {
         assert_eq!(
-            target(32, 4, 0, 0).extent_end(),
-            target(32, 4, 32, 0).extent_end()
+            target(32, 4, 0).extent_end(),
+            target(32, 4, 32).extent_end()
         );
     }
 }

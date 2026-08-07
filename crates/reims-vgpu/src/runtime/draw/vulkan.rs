@@ -2316,29 +2316,24 @@ pub(super) fn task_gva_guest_run_window<M: HostMemory + HostOps>(
     Some((gpas, runs))
 }
 
-/// The page window behind a set of runs, when this host can export a dma-buf
-/// over it.
+/// The bounded guest-memory reference behind a set of runs, when this host can
+/// import guest RAM and the pages are one bindable stretch.
 ///
-/// `None` is the routing answer for every host that cannot — no
-/// `/dev/udmabuf`, guest RAM without a backing fd, a run list too scattered to
-/// name — and the caller gathers on the CPU exactly as it did before. The
-/// refusal is logged once per reason by the cache, so a fall back to the copy
-/// is never silent.
+/// `None` is the routing answer for every host that cannot import — no
+/// `VK_EXT_external_memory_host`, an operator who turned the rail off, a shim
+/// that cannot say where guest RAM lives, or a page list that is not one bind
+/// range — and the caller gathers on the CPU exactly as it did before. Every
+/// refusal is named on the always-on sink by
+/// [`crate::runtime::guest_ram_map`], so a fall back to the copy is never
+/// silent.
 fn guest_page_window<M: HostOps>(
     host: &mut M,
     gpas: Vec<u64>,
     page: u64,
     head_offset: u64,
-) -> Option<std::sync::Arc<crate::backend::vulkan::engine::GuestPageWindow>> {
-    let dmabuf = crate::runtime::guest_dmabuf::dmabuf_for(host, &gpas, page as u32)?;
-    Some(std::sync::Arc::new(
-        crate::backend::vulkan::engine::GuestPageWindow {
-            gpas,
-            page_size: page as u32,
-            head_offset: head_offset as u32,
-            dmabuf,
-        },
-    ))
+    span: u64,
+) -> Option<crate::runtime::guest_ram::GuestRef> {
+    crate::runtime::guest_ram_map::reference_for_pages(host, &gpas, page, head_offset, span).ok()
 }
 
 /// Coalesce GPA-contiguous stretches of `window` into packed host-VA runs
@@ -2488,9 +2483,9 @@ fn try_buffer_zero_copy_resolved<M: HostMemory + HostOps>(
     // though the bind itself resolves.
     let (gpas, runs) = task_gva_guest_run_window(state, host, task_id, gva + offset, span)?;
     let page = state.page_size();
-    let pages = guest_page_window(host, gpas, page, (gva + offset) % page);
+    let pages = guest_page_window(host, gpas, page, (gva + offset) % page, span);
     crate::runtime::drain::note_store_route(if pages.is_some() {
-        "zc_buffer_dmabuf"
+        "zc_buffer_imported"
     } else {
         "zc_buffer_gathered"
     });
@@ -2627,7 +2622,7 @@ fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
                 runs: std::sync::Arc::new(runs),
                 total_len: span,
                 row_length_texels,
-                pages: guest_page_window(host, gpas, page as u64, gva % page as u64),
+                pages: guest_page_window(host, gpas, page as u64, gva % page as u64, span),
             },
             native,
             vouched.map(LinearSampleIdentity::from),
@@ -2703,7 +2698,7 @@ pub(super) fn try_type11_sample_zero_copy<M: HostMemory + HostOps>(
             runs: std::sync::Arc::new(runs),
             total_len: span,
             row_length_texels,
-            pages: guest_page_window(host, gpas, page as u64, base_off % page as u64),
+            pages: guest_page_window(host, gpas, page as u64, base_off % page as u64, span),
         },
         native,
         vouched.map(LinearSampleIdentity::from),
@@ -2784,7 +2779,7 @@ fn try_type5_sample_zero_copy<M: HostMemory + HostOps>(
             runs: std::sync::Arc::new(runs),
             total_len: span,
             row_length_texels,
-            pages: guest_page_window(host, gpas, page as u64, base_off % page as u64),
+            pages: guest_page_window(host, gpas, page as u64, base_off % page as u64, span),
         },
         native,
         vouched.map(LinearSampleIdentity::from),

@@ -664,10 +664,11 @@ pub enum GpuWritebackDecline {
     /// The page walk refused: these are no longer provably the mapping's pages.
     /// The copying rail refuses for the same reason and reports it.
     PagesNotOurs,
-    /// This host cannot export the window as a dma-buf. Latched and reported by
-    /// [`crate::runtime::guest_dmabuf`], which knows whether the reason is the
-    /// host or this window.
-    NoDmaBuf,
+    /// This host cannot reach the window's bytes as a GPU import. Either no
+    /// backend published an import granularity, or
+    /// [`crate::runtime::guest_ram_map`] refused these pages — and it names
+    /// which, so this variant does not restate a reason it does not know.
+    NoGuestImport,
     /// The engine declined or the copy failed; the inner error names which.
     Engine {
         inner: crate::backend::vulkan::engine::DrawError,
@@ -687,8 +688,8 @@ impl crate::observe::Decline for GpuWritebackDecline {
             Self::PageListShort { .. } => "gpuwb_page_list_short",
             Self::PageUnbacked { .. } => "gpuwb_page_unbacked",
             Self::PagesNotOurs => "gpuwb_pages_not_ours",
-            Self::NoDmaBuf => "gpuwb_no_dmabuf",
-            // The engine's own slug, so a driver that refuses the fd and a
+            Self::NoGuestImport => "gpuwb_no_guest_import",
+            // The engine's own slug, so a driver that refuses the pointer and a
             // resident in the wrong channel order stay as distinguishable here
             // as they are where they were decided.
             Self::Engine { inner } => crate::observe::Decline::slug(inner),
@@ -697,7 +698,7 @@ impl crate::observe::Decline for GpuWritebackDecline {
 
     fn fields(&self) -> Vec<(&'static str, String)> {
         match self {
-            Self::NotWritable | Self::PagesNotOurs | Self::NoDmaBuf => Vec::new(),
+            Self::NotWritable | Self::PagesNotOurs | Self::NoGuestImport => Vec::new(),
             Self::GeometryMoved {
                 latched_width,
                 latched_height,
@@ -889,17 +890,17 @@ pub fn write_bgra8_from_resident_gpu<M: HostMemory + HostOps>(
     // whatever it left behind.
     crate::runtime::storage_flush::flush_intersecting(state, host, mapping_id, base_off, span_end);
     // Nothing below can land a frame on a host whose GPU cannot import guest
-    // pages, so the walks below are skipped rather than run and discarded. Asked
+    // RAM, so the walks below are skipped rather than run and discarded. Asked
     // *after* `flush_intersecting` and not before it: that call is a side effect
     // this rail owes whether or not it goes on to write anything, and the
     // copying arm that takes over from this decline expects the state it leaves.
     //
-    // Not a second gate — `guest_dmabuf::dmabuf_for` still decides, and would
-    // decline these same pages a few hundred microseconds later. This only
-    // declines sooner, and on the pathways where the answer never changes that
-    // is a page-table walk per flush for the life of the process.
-    if !crate::runtime::guest_dmabuf::export_available() {
-        return Err(GpuWritebackDecline::NoDmaBuf);
+    // Not a second gate — `guest_ram_map::reference_for_pages` still decides,
+    // and would decline these same pages a few hundred microseconds later. This
+    // only declines sooner, and on the pathways where the answer never changes
+    // that is a page-table walk per flush for the life of the process.
+    if crate::runtime::guest_ram::granularity().is_none() {
+        return Err(GpuWritebackDecline::NoGuestImport);
     }
     // Timed on its own because it is the largest `O(pages)` step left and its
     // fix is not the other one's. `vouch_for_write` re-walks every page of the
@@ -935,14 +936,23 @@ pub fn write_bgra8_from_resident_gpu<M: HostMemory + HostOps>(
         };
         gpas.push(gpa);
     }
-    let Some(window) = crate::runtime::guest_dmabuf::dmabuf_for(host, &gpas, page_size as u32)
-    else {
-        return Err(GpuWritebackDecline::NoDmaBuf);
+    // The extent this copy names, and nothing past it. Padding after the final
+    // row belongs to the surface's plane but is not texels this call was given,
+    // and the copying rail does not write it either — a request that included
+    // it would let the two rails land different guest memory for one frame.
+    let pitch = u64::from(plan.row_length_texels.max(mw)) * 4;
+    let extent = u64::from(mh.saturating_sub(1)) * pitch + u64::from(mw) * 4;
+    let Ok(guest) = crate::runtime::guest_ram_map::reference_for_pages(
+        host,
+        &gpas,
+        page_size,
+        plan.in_page,
+        extent,
+    ) else {
+        return Err(GpuWritebackDecline::NoGuestImport);
     };
     let target = crate::backend::vulkan::engine::GuestPageTarget {
-        window,
-        mapped_bytes: gpas.len() as u64 * page_size,
-        offset: plan.in_page,
+        guest,
         row_length_texels: plan.row_length_texels,
         width: mw,
         height: mh,

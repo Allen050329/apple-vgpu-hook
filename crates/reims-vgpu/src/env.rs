@@ -26,10 +26,16 @@
 //! Reading it is how a caller notices an operator asked for something the host
 //! cannot give and says so, rather than ignoring the request in silence.
 
-/// Guest pages reach the GPU as a dma-buf import. Setting this off makes the
-/// device take the copying rails on a host that could have imported —
-/// see [`crate::backend::vulkan::caps::external_memory`].
-pub const DMABUF: &str = "REIMS_VGPU_DMABUF";
+/// Guest RAM reaches the GPU as a host-pointer import over whole RAMBlocks.
+/// Setting this off makes the device take the copying rails on a host that
+/// could have imported — see
+/// [`crate::backend::vulkan::caps::host_pointer`].
+///
+/// This is the switch that matters for verification. Where the import works
+/// every guest window takes it and the copying rails run zero times, so a green
+/// boot says nothing about them — and they are the only rails on a host without
+/// the extension, and the rails a discrete GPU takes regardless.
+pub const GUEST_IMPORT: &str = "REIMS_VGPU_GUEST_IMPORT";
 
 /// Verbose per-draw logging on top of the always-on fail sink.
 pub const DRAW_LOG: &str = "REIMS_VGPU_DRAW_LOG";
@@ -188,7 +194,7 @@ mod tests {
     /// by grepping their own environment.
     #[test]
     fn every_name_carries_the_crate_prefix() {
-        for name in [DMABUF, DRAW_LOG] {
+        for name in [DRAW_LOG, GUEST_IMPORT] {
             assert!(name.starts_with("REIMS_VGPU_"), "{name}");
             assert!(
                 name.bytes()
