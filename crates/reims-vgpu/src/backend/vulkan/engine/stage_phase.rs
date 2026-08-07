@@ -14,7 +14,7 @@
 //! |---|---|---|
 //! | `acquire` | [`ResourcePools::acquire_staging`] | pool sizing; a miss creates a buffer and allocates memory |
 //! | `bytes` | `write_staging` from a `BufferContent::Bytes` | **the second copy** — those bytes were already assembled out of guest RAM by `load_buffer_content`, which `bind_phase` charges separately |
-//! | `runs` | `write_staging_from_runs` | moving fewer bytes; this arm is already one copy, guest RAM straight into mapped staging |
+//! | `runs` | `write_staging_from_runs` | **taking the copy off the CPU** — it is one copy, but it is the CPU's; see below |
 //! | `swap` | `write_staging_swap_rb` on a seed | nothing — it is the copy that had to happen, with a byte exchange folded in |
 //! | `shift` | the `base_instance` prefix a Constant-step vertex stream needs | keeping those binds off the CPU path |
 //!
@@ -28,6 +28,39 @@
 //! an allocation per bind. Whether the *other* arm is still paying that is what
 //! `bytes_us` against `runs_us` answers, and the byte counters beside them say
 //! at what rate.
+//!
+//! # That lever has now been costed, and it is the wrong one
+//!
+//! A driven Safari drag, x86/PCI, quiesced, one `vk_caps`, one census second:
+//!
+//! ```text
+//! bytes_us=448     bytes_n=3498    bytes_b=9 606 736
+//! runs_us=104719   runs_n=15758    runs_b=3 627 029 280
+//! ```
+//!
+//! So the second copy the paragraph above suspects is **0.4 % of the phase**,
+//! and `runs` is 93 % of it: 105 ms of CPU memcpy per second, moving **3.6 GB/s**
+//! out of guest RAM. Against a `draw_phase` whose whole second is ~156 ms, that
+//! one memcpy is 67 % of every draw's cost. Chasing `bytes` would have been a
+//! rounding error, which is exactly what the split was built to prevent.
+//!
+//! The `runs` row's fix is therefore not "move fewer bytes" — the bytes are the
+//! guest's vertex data and every one of them is needed. It is to stop the *CPU*
+//! moving them. Those bytes are already reachable by the GPU: the host-pointer
+//! import covers the whole RAMBlock, so a gather is `vkCmdCopyBuffer` out of the
+//! import into a pooled destination, and `guest_page_window`'s census says the
+//! windows need **9 to 32 regions** to express (98.5 % of them), against the 507
+//! the guest-page writeback already submits per frame without difficulty.
+//!
+//! The reason no bind takes that path today is not the mechanism but the shape:
+//! `GuestRunSource::pages` is a single `GuestRef`, so a window that is not one
+//! GPA-contiguous stretch has nowhere to go and falls to this memcpy —
+//! `zc_buffer_imported` was **0** against `zc_buffer_gathered` 371 422 on the
+//! same boot. `guest_ram_map::references_for_runs` is the widening that already
+//! exists for the writeback.
+//!
+//! Timings here are wall clock on a shared machine and are upper bounds; the
+//! counts and byte totals are not.
 //!
 //! # Why the call sites and not the pool
 //!
