@@ -51,6 +51,31 @@
 //! | `gw_unarmed` | no token, or a generation not yet readable — no answer |
 //! | `gw_rearm` | the window's page set changed, so nothing to compare against |
 //!
+//! # The half that refuses is `gw_refused_host_write`, by 368 to 1
+//!
+//! A driven x86/PCI Safari drag, quiesced, 166 census windows:
+//!
+//! ```text
+//! gw_vouched             6050
+//! gw_refused_host_write  5156
+//! gw_refused_guest_store   14
+//! gw_unarmed              212
+//! gw_rearm                128
+//! gw_audit_unsound          0
+//! ```
+//!
+//! The guest hardly writes the windows it samples. **This device writes them**,
+//! and every such write costs the next bind a full re-gather — 68 % of that
+//! rail's misses on the same boot, against 32 % that were a retained image the
+//! cache had dropped. So the witness is not being over-cautious and the cache
+//! is not the lever; the device is writing a surface into guest pages through
+//! the deferred writeback and then reading those same pages back to sample
+//! them. `gw_audit_unsound` at 0 says it is at least sound while doing it.
+//!
+//! Both halves are load-bearing and neither may be weakened to raise the vouch
+//! rate: dropping the host-write half would vouch for exactly these 5156 binds,
+//! and they are the ones whose bytes really did move.
+//!
 //! # A device-wide `gw_refused_guest_store` is the hypervisor rail, not the guest
 //!
 //! This counter reads in the low hundreds over a whole driven boot. A boot where

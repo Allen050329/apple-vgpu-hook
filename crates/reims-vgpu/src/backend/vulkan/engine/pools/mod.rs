@@ -1476,6 +1476,20 @@ const RECLAIM_HISTORY: usize = 256;
 /// causes evict identically: a compulsory miss admits a new entry under its
 /// fresh identity just as a lost one does, so 4791 evictions is what a
 /// perfectly-behaved cache also looks like when the content really is changing.
+///
+/// # With the counter fixed, the answer is 68 % compulsory
+///
+/// A driven boot on the repaired instrument put the gather rail's misses at
+/// `unvouched` 5389 against `unretained` 2524. Two thirds of them are binds the
+/// witness had already spent the generation for, so this constant could not
+/// have reached them at any value — which is why the table above reads flat and
+/// why the flatness was never evidence about the cache. The remaining third is
+/// genuinely this cache's, and it is a third of a rail rather than a rail.
+///
+/// The cause is upstream of both: `gw_refused_host_write` 5156 against
+/// `gw_refused_guest_store` 14 on that boot. See
+/// [`EngineCounters::sampled_gather_unvouched`] for the reading and its
+/// qualifiers, and prefer removing the write to enlarging the cache.
 const SAMPLED_CACHE_CAP: usize = 64;
 const SAMPLED_CACHE_BYTE_CAP: usize = 128 * 1024 * 1024;
 /// Max recycled sampled slots retained per geometry key in `sampled_free`. A

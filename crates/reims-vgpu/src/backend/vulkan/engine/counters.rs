@@ -289,18 +289,64 @@ engine_counters! {
         /// It now takes [`crate::runtime::gather_witness::GatherVouch`], decided
         /// beside the assignment that spends the generation, so `unvouched`
         /// means the witness spent one and the following miss was compulsory.
-        /// **The split is therefore unmeasured**: the numbers above stand only
-        /// as "every unskipped bind had an identity", which is true by
-        /// construction. A driven boot is what fills this section in.
         ///
-        /// One reading survives, because it never depended on the broken half.
-        /// `gw_refused_host_write` runs ~144 a window against
-        /// `gw_refused_guest_store` at 0, which invites the conclusion that this
-        /// device's own writes are refuting the windows it samples. Those `gw_*`
-        /// tallies are runtime-side and span every rail, so subtracting them
-        /// from an engine-side per-bind count is invalid whichever way the split
-        /// reads — which is the trap this pair exists to close, and the reason
-        /// it has to be taken engine-side at all.
+        /// # The measured split, and it is mostly not the cache
+        ///
+        /// Driven x86/PCI Safari drag, quiesced, one `vk_caps`, 166 census
+        /// windows, 25 s of real compositing:
+        ///
+        /// ```text
+        /// sampled_gather_unvouched   5389   68.1%
+        /// sampled_gather_unretained  2524   31.9%
+        ///                            ----
+        ///                            7913  == gathers 7909 + imports 4
+        /// sampled_gather_skips       3526   (of 11 439 guest-run binds)
+        /// ```
+        ///
+        /// Both arms fire and the identity holds exactly, so the instrument is
+        /// non-vacuous for the first time. **Roughly two thirds of this rail's
+        /// re-gathers are compulsory**: the witness spent the generation, so no
+        /// retained image could have answered and no size of sampled cache
+        /// reaches them. Only the 2524 are a cache result. That is the reverse
+        /// of what the structural zero was read as, and it is consistent with
+        /// the `SAMPLED_CACHE_CAP` A/B, where four times the entries and six
+        /// times the bytes left the miss rate where it started.
+        ///
+        /// The 9876 count-cap evictions on the same boot are not evidence of a
+        /// cache too small either. A compulsory miss admits an entry under its
+        /// fresh identity exactly as a lost one does, and nothing ever looks
+        /// that entry up again, so most of the churn is the rail working.
+        ///
+        /// # What spends the generation is this device, not the guest
+        ///
+        /// Same boot, the witness's own verdict routes:
+        ///
+        /// ```text
+        /// gw_vouched             6050
+        /// gw_refused_host_write  5156
+        /// gw_refused_guest_store   14
+        /// gw_unarmed              212
+        /// gw_rearm                128
+        /// gw_audit_unsound          0
+        /// ```
+        ///
+        /// 368:1. The guest barely writes the windows it samples; **this device
+        /// writes them**, and each write is what forces the next bind to read
+        /// 1.4 MB back out of guest RAM. The deferred writeback rail puts a
+        /// render target into guest pages and this rail gathers those same pages
+        /// back, so the two largest byte movers in the device are feeding each
+        /// other. `gw_audit_unsound` at 0 says the witness is sound while it
+        /// does so — nothing vouched had moved.
+        ///
+        /// Read the ratio, not an attribution. These `gw_*` tallies count
+        /// `note_gather` calls (window resolutions) while the two counters above
+        /// count binds, so the populations differ even though all three
+        /// [`crate::runtime::gather_witness::GatherRail`] variants are sampled
+        /// rails and no other caller exists. Subtracting one from the other is
+        /// still invalid, which is why the split had to be taken engine-side.
+        /// One workload, one boot, one pathway: x86/PCI on a discrete GPU, where
+        /// the render target lives in VRAM and the writeback is real. A unified
+        /// host has no such round trip to make.
         ///
         /// The skip rate is a property of the workload and not of the rail, so
         /// do not carry a number for it: one boot's drag ran 23 windows at 0%

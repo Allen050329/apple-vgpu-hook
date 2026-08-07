@@ -189,11 +189,20 @@
 //! answerable for the first time; see
 //! [`super::counters::EngineCounters::sampled_gather_unvouched`].
 //!
-//! What still stands is the shape of the cost — 424 MB/s of re-gather with the
-//! elision firing on a minority of binds — and that a `Fresh` vouch makes the
-//! following miss compulsory rather than a fault. Whether the 6296 are mostly
-//! compulsory or mostly lost images decides whether there is anything here to
-//! fix at all, and one driven boot answers it.
+//! The boot that answered it put the split at **5389 compulsory against 2524
+//! retention losses** — 68/32, the reverse of the reading above. Two thirds of
+//! this rail cannot be reached by any cache, because the witness had spent the
+//! generation and no retained image could have matched. And what spends it is
+//! this device: `gw_refused_host_write` 5156 against `gw_refused_guest_store`
+//! 14 on the same boot. The deferred writeback puts a render target into guest
+//! pages and this rail gathers those same pages back at 1.4 MB a bind.
+//!
+//! So the lever here is neither the witness nor the cache. It is that a window
+//! this device just wrote is re-read from guest RAM instead of bound from the
+//! image it was written out of — which is what `SampledSource::Target` is for,
+//! and that arm is never taken. See
+//! [`super::counters::EngineCounters::sampled_gather_unvouched`] for the full
+//! reading and its qualifiers.
 //!
 //! # And none of it holds when the guest is quiet
 //!
